@@ -6,9 +6,10 @@
 
 #![cfg(unix)]
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::headless_boot;
+use crate::patience::Patience;
 
 use aterm_types::control_verbs::TURN_ECHO_CAP_MS;
 use headless_boot::{Instance, boot_session, ctl, ctl_ok, field, status, type_line};
@@ -208,13 +209,15 @@ pub(crate) fn start(
     type_line(inst, sid, &line);
     ctl_ok(inst, &[&format!("@{sid}"), "await", "match", "^❯", HANG_MS]);
     if claude {
-        let deadline = Instant::now() + HANG;
+        let mut patience = Patience::new(HANG);
         loop {
             let s = status(inst, sid);
             if field(&s, "program") == Some("claude") && field(&s, "agent") != Some("-") {
                 break;
             }
-            assert!(Instant::now() < deadline, "never read as Claude Code: {s}");
+            if let Some(why) = patience.spent() {
+                panic!("never read as Claude Code ({why}): {s}");
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -247,25 +250,27 @@ fn composer(inst: &Instance, sid: &str) -> String {
 
 /// Once the session holds the follow-up's line, unread.
 fn typed(inst: &Instance, sid: &str) {
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     loop {
         let s = status(inst, sid);
         if field(&s, "input_bytes") == Some("8") {
             return;
         }
-        assert!(Instant::now() < deadline, "the line was never typed: {s}");
+        if let Some(why) = patience.spent() {
+            panic!("the line was never typed ({why}): {s}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// The composer row once it reads `want`, or what it last read when the one-minute hang
-/// detector ends: the stand-in reads its input in chunks, so a verdict can land while the
+/// The composer row once it reads `want`, or what it last read when the hang detector
+/// ([`Patience`]) ends: the stand-in reads its input in chunks, so a verdict can land while the
 /// rest of a line it keeps is still being drawn.
 fn composer_settles(inst: &Instance, sid: &str, want: &str) -> String {
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     loop {
         let row = composer(inst, sid);
-        if row == want || Instant::now() >= deadline {
+        if row == want || patience.spent().is_some() {
             return row;
         }
         std::thread::sleep(Duration::from_millis(20));

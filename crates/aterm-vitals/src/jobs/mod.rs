@@ -455,7 +455,7 @@ pub struct TtyMode {
     pub canonical: bool,
     /// `ECHO`.
     pub echo: bool,
-    /// When the word was read, host ms.
+    /// When the word was read, host ms. Zero means a screen change invalidated it for naming a wait.
     pub stamped_ms: u64,
 }
 

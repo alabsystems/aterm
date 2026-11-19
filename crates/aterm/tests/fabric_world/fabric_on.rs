@@ -1321,12 +1321,11 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     let dead: i32 = managed_pid.parse().expect("pid");
     // SAFETY: a signal to a pid this test's fake launchd started and still records.
     assert_eq!(unsafe { libc::kill(dead, libc::SIGKILL) }, 0);
-    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut patience = crate::patience::Patience::new(std::time::Duration::from_secs(60));
     while harness::alive(dead) {
-        assert!(
-            std::time::Instant::now() < gone_by,
-            "the killed broker {dead} lingers"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("the killed broker {dead} lingers ({why})");
+        }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     std::fs::remove_file(&calls).expect("reset");
@@ -1426,12 +1425,12 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         "the fake launchd reaped the broker"
     );
     let pid: i32 = managed_pid.parse().expect("pid");
-    let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut patience = crate::patience::Patience::new(std::time::Duration::from_secs(60));
     let gone = loop {
         if !harness::alive(pid) {
             break true;
         }
-        if std::time::Instant::now() >= gone_by {
+        if patience.spent().is_some() {
             break false;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));

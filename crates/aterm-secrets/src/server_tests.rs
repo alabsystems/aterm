@@ -6,6 +6,8 @@ use crate::envelope::{Locker, Unsigned, endorse, sign, signer_public, test_armor
 use crate::transport::{self, Fetched, Source};
 
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
+/// The format a server with no format mark reads its records at.
+const ONE: crate::membership_log::Reading = crate::membership_log::Reading::ONE;
 const OLD: [u8; 32] = [7u8; 32];
 const NEW: [u8; 32] = [8u8; 32];
 const STRANGER: [u8; 32] = [9u8; 32];
@@ -6197,7 +6199,7 @@ fn a_store_with_no_genesis_takes_posted_records_only_with_the_genesis_that_roots
 
 /// A POST that adds a record to a store puts only that record on the end of its file, and a
 /// restart reads the file back, even one whose last append a power loss cut short. Before,
-/// each POST that added one rewrote the whole file (up to `MAX_RECORDS_STREAM`), so a key
+/// each POST that added one rewrote the whole file (up to its store's capacity), so a key
 /// once seated (a removed Mac's among them) posting one waiting record at a time wrote about
 /// n²/2 bytes. The next POST after such a restart writes the file whole, not onto the torn
 /// bytes, so a second restart keeps every record.
@@ -6528,6 +6530,7 @@ fn a_peers_silent_endpoints_are_dialled_for_one_budget_alone() {
                 stored: 0,
                 silent: true,
                 whole: false,
+                later: Vec::new(),
             }
         },
     );
@@ -6551,6 +6554,7 @@ fn a_peers_silent_endpoints_are_dialled_for_one_budget_alone() {
                 stored: usize::from(dialled == 3),
                 silent: dialled < 3,
                 whole: dialled == 3,
+                later: Vec::new(),
             }
         },
     );
@@ -7471,7 +7475,7 @@ fn expanded_server_custody_fences_old_writers_and_reopens_for_append() {
         204
     );
     assert!(fsx::write_atomic(&legacy, &earlier, 0o600).is_err());
-    assert!(fsx::read_owned(&legacy, crate::membership_log::MAX_RECORDS_STREAM).is_err());
+    assert!(fsx::read_owned(&legacy, crate::membership_log::Reading::ONE.capacity()).is_err());
     let current = crate::records_storage::data_path(&legacy).unwrap();
     let inode = fsx::stamp(&current).unwrap().ino;
     let later = founded.mint(20_001, "after-fence");
@@ -8320,7 +8324,7 @@ fn a_changed_cold_records_read_keeps_the_previous_slot_retryable() {
         fsx::write_atomic(&path, &encode_records([&founded.genesis, &first]), 0o600).unwrap();
         let mut state = State::default();
         if existing_slot {
-            look_at_records(&mut state, "team", &path, None).unwrap();
+            look_at_records(&mut state, "team", &path, None, ONE).unwrap();
         }
         let before = state.records.get("team").map(|slot| {
             (
@@ -8338,14 +8342,15 @@ fn a_changed_cold_records_read_keeps_the_previous_slot_retryable() {
             0o600,
         )
         .unwrap();
-        let outcome = look_at_records_with(&mut state, "team", &path, Some(&[[99; 32]]), || {
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap()
-                .write_all(b"!")
-                .unwrap();
-        });
+        let outcome =
+            look_at_records_with(&mut state, "team", &path, Some(&[[99; 32]]), ONE, || {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"!")
+                    .unwrap();
+            });
         assert!(matches!(outcome, Err(fsx::Unread::Failed(_))));
         match before {
             Some((bytes, keys, stamp, on_file, wake)) => {
@@ -8359,7 +8364,7 @@ fn a_changed_cold_records_read_keeps_the_previous_slot_retryable() {
             None => assert!(!state.records.contains_key("team")),
         }
         // Failed did not memoize the changed file. A fresh read accepts its valid prefix.
-        look_at_records(&mut state, "team", &path, None).unwrap();
+        look_at_records(&mut state, "team", &path, None, ONE).unwrap();
         let slot = &state.records["team"];
         assert!(slot.store.complete_bytes(next.id()).is_some());
         assert_eq!(slot.on_file, None, "the trailing byte is not on-file proof");
@@ -8368,7 +8373,7 @@ fn a_changed_cold_records_read_keeps_the_previous_slot_retryable() {
 
 #[test]
 fn a_cold_records_file_past_the_bound_is_refused_whole_and_retried_after_change() {
-    use crate::membership_log::{MAX_RECORDS_STREAM, encode_records};
+    use crate::membership_log::{Reading, encode_records};
 
     let root = aterm_tempfile::tempdir().unwrap();
     let path = root.path().join("team.records");
@@ -8379,11 +8384,11 @@ fn a_cold_records_file_past_the_bound_is_refused_whole_and_retried_after_change(
         .write(true)
         .open(&path)
         .unwrap()
-        .set_len(MAX_RECORDS_STREAM as u64 + 1)
+        .set_len(Reading::ONE.capacity() as u64 + 1)
         .unwrap();
     let mut state = State::default();
     assert!(matches!(
-        look_at_records(&mut state, "team", &path, None),
+        look_at_records(&mut state, "team", &path, None, ONE),
         Err(fsx::Unread::Refused(_))
     ));
     let slot = &state.records["team"];
@@ -8394,11 +8399,11 @@ fn a_cold_records_file_past_the_bound_is_refused_whole_and_retried_after_change(
     assert_eq!(slot.stamp, fsx::stamp(&path));
     assert_eq!(slot.on_file, None);
     let reads = fsx::reads_of(&path);
-    look_at_records(&mut state, "team", &path, None).unwrap();
+    look_at_records(&mut state, "team", &path, None, ONE).unwrap();
     assert_eq!(fsx::reads_of(&path), reads, "stable refusal is remembered");
 
     fsx::write_atomic(&path, &bytes, 0o600).unwrap();
-    look_at_records(&mut state, "team", &path, None).unwrap();
+    look_at_records(&mut state, "team", &path, None, ONE).unwrap();
     let slot = &state.records["team"];
     assert_eq!(slot.store.encode(), bytes);
     assert_eq!(slot.on_file, Some(1));
@@ -8416,14 +8421,14 @@ fn a_dormant_records_slot_reopens_the_same_file_after_its_trust_changes() {
     };
     fsx::write_atomic(&path, founded.genesis.bytes(), 0o600).unwrap();
     let mut state = State::default();
-    look_at_records(&mut state, "team", &path, Some(&[[99; 32]])).unwrap();
+    look_at_records(&mut state, "team", &path, Some(&[[99; 32]]), ONE).unwrap();
     let stamp = state.records["team"].stamp;
     assert!(state.records["team"].store.log().is_none());
     assert!(state.records["team"].store.is_empty());
     let reads = fsx::reads_of(&path);
-    look_at_records(&mut state, "team", &path, Some(&[[99; 32]])).unwrap();
+    look_at_records(&mut state, "team", &path, Some(&[[99; 32]]), ONE).unwrap();
     assert_eq!(fsx::reads_of(&path), reads);
-    look_at_records(&mut state, "team", &path, Some(&[*signer])).unwrap();
+    look_at_records(&mut state, "team", &path, Some(&[*signer]), ONE).unwrap();
     let slot = &state.records["team"];
     assert_eq!(slot.stamp, stamp, "the file itself did not change");
     assert!(slot.store.log().is_some());

@@ -729,7 +729,11 @@ fn complete_title_refresh_keeps_parked_and_native_fallbacks() {
     app.observe_title_drift(parked, Instant::now() + Duration::from_secs(1));
     let ws = &app.windows[&wid];
     assert_eq!(ws.tab_chrome_titles[&parked], "parked-label");
-    assert_eq!(ws.tooltips_pushed.len(), ws.tab_set.shown_len());
+    assert_eq!(ws.tooltips_pushed.len(), ws.strip_tab_count());
+    assert!(
+        ws.strip_tab_count() < ws.tab_set.shown_len(),
+        "the Workers page is in the organizer"
+    );
     assert!(ws.tab_set.tabs().len() > ws.tab_set.shown_len());
     assert!(
         ws.tab_chrome_titles_by_tab

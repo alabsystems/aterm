@@ -565,8 +565,8 @@ fn first_result_selects_for_keyboard_open_only_and_later_results_preserve_choice
 fn pointer_or_navigation_control_cancels_deferred_keyboard_selection() {
     // A pool of one account, so the read card holds a choice above Account settings, the item
     // a key reaches before the read, on every platform: where signing in by hand is unavailable
-    // (Windows, ATERM-KI-1105-14) the empty pool's pin item is disabled, and Account settings
-    // would also be the keyboard's first choice.
+    // (`accounts::manual_signin_capability`) the empty pool's pin item is disabled, and Account
+    // settings would also be the keyboard's first choice.
     let roster = accounts::Roster {
         rows: vec![accounts::Row {
             label: "work".into(),

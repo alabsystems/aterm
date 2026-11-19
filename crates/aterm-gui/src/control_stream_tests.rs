@@ -66,6 +66,19 @@ fn place(
     proven: Proven,
     row: &str,
 ) -> Result<(), String> {
+    place_as(handle, contract_no, duties, conn, proven, row, None)
+}
+
+/// [`place`] for a claim that states `login=<login>`, the tab's own account.
+fn place_as(
+    handle: &SessionHandle,
+    contract_no: u32,
+    duties: &[Duty],
+    conn: u64,
+    proven: Proven,
+    row: &str,
+    login: Option<&str>,
+) -> Result<(), String> {
     let now = crate::metrics::now_us();
     if contract_no == 2 {
         let holder = format!("codex-alab@{}", std::process::id());
@@ -87,6 +100,7 @@ fn place(
         panic!("the roster admits {holder}");
     };
     claim.contract = contract_no;
+    claim.login = login.map(str::to_string);
     claim.scopes = contract::Scopes::for_test(duties);
     if !duties.is_empty() {
         // What it asked for is what it was granted; a grant of no duty keeps the read's ask.
@@ -131,6 +145,10 @@ struct Service {
     proof: Mutex<Option<crate::harness_claim::ClaimProof>>,
     /// Every claim line a `claim` record had served, as it was built.
     lines: Mutex<Vec<String>>,
+    /// What the land check reads of the claimant's repository and of `sys left`: unread and
+    /// unchecked, so nothing agrees, until a test says otherwise.
+    repo: Mutex<aterm_agent::harness::repo_work::RepoRead>,
+    left: Mutex<aterm_agent::harness::leftover::LeftRead>,
 }
 
 /// The version the stand-in proof admits: no claim and no record states it.
@@ -203,9 +221,9 @@ impl Service {
             .contains(&id)
     }
 
-    /// `claim <sid> <contract> <duty,…|-> [other] [<row id>]`, on the connection that sent it:
-    /// `other` proves another claimant, and a row id claims under that registry row and not
-    /// claude-code-alab's.
+    /// `claim <sid> <contract> <duty,…|-> [other] [login=<label>] [<row id>]`, on the connection
+    /// that sent it: `other` proves another claimant, `login=` states the tab's account, and a
+    /// row id claims under that registry row and not claude-code-alab's.
     fn claim(&self, line: &str) -> String {
         let words: Vec<&str> = line.split(' ').collect();
         let handle = self.handle(words[1]);
@@ -221,14 +239,15 @@ impl Service {
         } else {
             running()
         };
+        let login = rest.iter().find_map(|word| word.strip_prefix("login="));
         let row = rest
             .iter()
-            .find(|word| **word != "other")
+            .find(|word| **word != "other" && !word.starts_with("login="))
             .copied()
             .unwrap_or("claude-code-alab");
         let conn = super::super::serving_connection().expect("serving a connection");
         super::super::note_connection_claim();
-        match place(&handle, contract_no, &duties, conn, proven, row) {
+        match place_as(&handle, contract_no, &duties, conn, proven, row, login) {
             Ok(()) => "OK claim".to_string(),
             Err(refusal) => format!("ERR {}", refusal.trim_end()),
         }
@@ -312,13 +331,46 @@ impl LaneService for Service {
                 descriptor: aterm_control::hangup::serving_fd() == Some(stream.as_raw_fd()),
                 direct: super::super::SERVING_DIRECT.with(std::cell::Cell::get),
             });
+        // The land check runs in line over the service's reads, where the window runs it on a
+        // thread of its own, so its mark is made before the record's acknowledgement.
+        let repo = |_: &str, _: &Proven| {
+            self.repo
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        };
+        let left = |_: &str| {
+            self.left
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        };
         super::serve(
             &request,
             &self.store,
             stream,
             buffered,
-            &|| self.clock.load(Ordering::Acquire),
-            &|handle, rest| self.claim_line(handle, rest),
+            &super::Services {
+                now_ms: &|| self.clock.load(Ordering::Acquire),
+                claims: &|handle, rest| self.claim_line(handle, rest),
+                post: &|_| {},
+                landed: &|handle, proven| {
+                    let posture = self
+                        .store
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .harness_posture();
+                    super::finish_landed(
+                        handle,
+                        proven,
+                        &super::LandReads {
+                            repo: &repo,
+                            left: &left,
+                            posture,
+                        },
+                    );
+                },
+            },
         );
     }
 
@@ -338,6 +390,11 @@ impl LaneService for Service {
 struct Client {
     stream: CtlStream,
     reader: BufReader<CtlStream>,
+    /// The records aterm sent as the stream opened: its `hand` and its `policy`.
+    opening: Vec<Record>,
+    /// aterm's own records heard since, oldest first, while the client waited for something
+    /// else ([`Self::ack`]) or for one of them ([`Self::own`]).
+    heard: std::collections::VecDeque<Record>,
 }
 
 impl Client {
@@ -370,10 +427,79 @@ impl Client {
             .unwrap_or_else(|| panic!("who answered {reply}"))
     }
 
-    /// Open `sid`'s stream, which must open: the reply's `(epoch, acked, in)`.
+    /// Open `sid`'s stream, which must open: the reply's `(epoch, acked, in)`. The `hand` and
+    /// the `policy` aterm sends as every stream opens are read too, numbered after `in`, and
+    /// kept in [`Self::opening`].
     fn open(&mut self, sid: &str) -> StreamReply {
         let reply = self.request(&format!("stream @{sid} v=1"));
-        StreamReply::parse(&reply).unwrap_or_else(|error| panic!("{reply}: {error}"))
+        let opened = StreamReply::parse(&reply).unwrap_or_else(|error| panic!("{reply}: {error}"));
+        self.opened(&opened);
+        opened
+    }
+
+    /// Read the two records aterm sends as a stream opens, after the `OK` that said `opened`.
+    fn opened(&mut self, opened: &StreamReply) {
+        let hand = self.own();
+        assert!(
+            matches!(hand.body, Body::Hand { .. }) && hand.seq == opened.sent + 1,
+            "the opening hand: {hand:?}"
+        );
+        let policy = self.own();
+        assert_eq!(
+            (policy.seq, policy.body.clone()),
+            (opened.sent + 2, Body::Policy),
+            "the opening policy"
+        );
+        self.opening = vec![hand, policy];
+    }
+
+    /// The next line as a record of aterm's: `Ok` for one of its own, `Err` with the line for
+    /// anything else (an acknowledgement, the end, a line that is no record).
+    fn next_record(&mut self) -> Result<Record, String> {
+        let line = self.line();
+        match Record::read(line.as_bytes()) {
+            Ok(decoded) if !matches!(decoded.record.body, Body::Ack { .. }) => Ok(decoded.record),
+            _ => Err(line),
+        }
+    }
+
+    /// aterm's next own record: the oldest heard, else the next line, which must be one (a
+    /// read that times out is the hang detector).
+    fn own(&mut self) -> Record {
+        if let Some(record) = self.heard.pop_front() {
+            return record;
+        }
+        self.next_record()
+            .unwrap_or_else(|line| panic!("{line} is no record of aterm's own"))
+    }
+
+    /// The acknowledgement that comes next, aterm's own records before it kept in
+    /// [`Self::heard`]: the `seq` acknowledged and its `dropped`.
+    fn ack(&mut self) -> (u64, Option<String>) {
+        loop {
+            match self.next_record() {
+                Ok(own) => self.heard.push_back(own),
+                Err(reply) => {
+                    let decoded = Record::read(reply.as_bytes())
+                        .unwrap_or_else(|error| panic!("{reply} is no record: {error}"));
+                    let Body::Ack { dropped } = decoded.record.body else {
+                        panic!("{reply} is no acknowledgement");
+                    };
+                    return (decoded.record.seq, dropped.map(|why| why.word()));
+                }
+            }
+        }
+    }
+
+    /// What the stream ends on, aterm's own records before it kept in [`Self::heard`]: `<EOF>`
+    /// for a closed stream.
+    fn end(&mut self) -> String {
+        loop {
+            match self.next_record() {
+                Ok(own) => self.heard.push_back(own),
+                Err(line) => return line,
+            }
+        }
     }
 
     /// Send record `seq` and read its acknowledgement: the `seq` acknowledged and its `dropped`.
@@ -386,13 +512,7 @@ impl Client {
     fn raw(&mut self, line: &str) -> (u64, Option<String>) {
         self.send(line);
         self.send("\n");
-        let reply = self.line();
-        let decoded = Record::read(reply.as_bytes())
-            .unwrap_or_else(|error| panic!("{reply} is no record: {error}"));
-        let Body::Ack { dropped } = decoded.record.body else {
-            panic!("{reply} is no acknowledgement");
-        };
-        (decoded.record.seq, dropped.map(|why| why.word()))
+        self.ack()
     }
 }
 
@@ -430,6 +550,8 @@ impl Rig {
                 version: Some(ADMITTED.to_string()),
             })),
             lines: Mutex::new(Vec::new()),
+            repo: Mutex::new(aterm_agent::harness::repo_work::RepoRead::Unread),
+            left: Mutex::new(aterm_agent::harness::leftover::LeftRead::Unchecked),
         });
         lanes.publish(Arc::clone(&service) as Arc<dyn LaneService>);
         started.activate();
@@ -446,6 +568,8 @@ impl Rig {
         let mut client = Client {
             stream: client,
             reader,
+            opening: Vec::new(),
+            heard: std::collections::VecDeque::new(),
         };
         client.send(&format!("AUTH {auth}\n"));
         // A fleet peer is served only the fleet's verbs; any other line closes its connection.
@@ -518,9 +642,14 @@ impl Rig {
     }
 }
 
-/// A record of a kind the grant `state` covers and this aterm does not apply yet.
-fn goal() -> Body {
-    Body::Goal { text: None }
+/// A record of a kind the grant `state` covers and this aterm does not apply yet: a `msg`
+/// (HX-15h applies it, and names another kind here).
+fn unapplied() -> Body {
+    Body::Msg {
+        turn: None,
+        by: alab_wire::record::By::Harness,
+        text: "the stream split".to_string(),
+    }
 }
 
 fn title() -> Body {
@@ -542,7 +671,7 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
     let opened = first.open(ONE);
     assert_eq!(opened.epoch, crate::control_auth::process_instance_id());
     assert_eq!((opened.acked, opened.sent), (0, 0));
-    assert_eq!(first.record(1, goal()), (1, None));
+    assert_eq!(first.record(1, unapplied()), (1, None));
     assert_eq!(first.record(2, Body::Beat), (2, None));
     assert_eq!(first.record(3, title()), (3, None));
     drop(first);
@@ -554,6 +683,10 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
     let reopened = again.open(ONE);
     assert_eq!(reopened.epoch, opened.epoch);
     assert_eq!(reopened.acked, 3, "the kept acked, not a fresh stream's");
+    assert_eq!(
+        reopened.sent, 2,
+        "aterm's two opening records of the first stream, in the same epoch"
+    );
     let before = rig.state(ONE);
     assert_eq!(
         again.record(2, Body::Beat),
@@ -567,7 +700,7 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
         "a resent record is applied once"
     );
     assert_eq!(resent.dropped, before.dropped + 2);
-    assert_eq!(again.record(4, goal()), (4, None), "acked+1 is taken");
+    assert_eq!(again.record(4, unapplied()), (4, None), "acked+1 is taken");
     assert_eq!(rig.state(ONE).acked, 4);
 
     // A new epoch (another aterm instance) starts `in` at 0 and keeps what was acknowledged;
@@ -580,9 +713,9 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         meta.stream.as_mut().expect("the stream's state").sent = 7;
-        let same = meta.open_stream(&running(), &opened.epoch);
+        let same = meta.open_stream(&running(), &opened.epoch, id);
         assert_eq!((same.acked, same.sent), (4, 7));
-        let next = meta.open_stream(&running(), "p1-another");
+        let next = meta.open_stream(&running(), "p1-another", id);
         assert_eq!((next.acked, next.sent), (4, 0));
         assert_eq!(next.epoch, "p1-another");
     }
@@ -598,7 +731,7 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
     let fresh = stranger.open(ONE);
     assert_eq!((fresh.acked, fresh.sent), (0, 0));
     assert_eq!(
-        stranger.record(1, goal()),
+        stranger.record(1, unapplied()),
         (1, None),
         "its first record is not a resend"
     );
@@ -719,9 +852,18 @@ fn a_claim_gone_before_the_ok_closes_with_no_line() {
     let request = Request::parse(format!("stream @{ONE} v=1"));
     // The lane's serial for a connection that holds no claim, as `Serving::enter` sets it.
     super::super::SERVING_CONNECTION.with(|serving| serving.set(Some(u64::MAX - 3)));
-    super::serve(&request, &store, &server, Vec::new(), &|| 0, &|_, _| {
-        String::new()
-    });
+    super::serve(
+        &request,
+        &store,
+        &server,
+        Vec::new(),
+        &super::Services {
+            now_ms: &|| 0,
+            claims: &|_, _| String::new(),
+            post: &|_| {},
+            landed: &|_, _| {},
+        },
+    );
     super::super::SERVING_CONNECTION.with(|serving| serving.set(None));
     drop(server);
     let mut reply = String::new();
@@ -777,12 +919,15 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
         resets_ms: None,
     };
     assert_eq!(client.record(6, wall), (6, Some("scope".to_string())));
-    assert_eq!(client.record(7, goal()), (7, None));
+    assert_eq!(client.record(7, unapplied()), (7, None));
     assert_eq!(rig.state(ONE).unapplied, 1, "the granted record was taken");
 
     // The budget: the burst is 500 at one instant. The two lines over the bound spent none of
     // it, and neither does a resend; five records did.
-    assert_eq!(client.record(7, goal()), (7, Some("applied".to_string())));
+    assert_eq!(
+        client.record(7, unapplied()),
+        (7, Some("applied".to_string()))
+    );
     let burst = u64::from(RATE_BURST);
     for seq in 8..=burst + 2 {
         assert_eq!(client.record(seq, Body::Beat), (seq, None));
@@ -809,13 +954,13 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
     // record dropped in between took nothing of what had come back.
     rig.service.clock.store(1_019, Ordering::Release);
     assert_eq!(
-        client.record(over + 1, goal()),
+        client.record(over + 1, unapplied()),
         (over + 1, Some("rate".to_string()))
     );
     rig.service.clock.store(1_020, Ordering::Release);
-    assert_eq!(client.record(over + 2, goal()), (over + 2, None));
+    assert_eq!(client.record(over + 2, unapplied()), (over + 2, None));
     assert_eq!(
-        client.record(over + 3, goal()),
+        client.record(over + 3, unapplied()),
         (over + 3, Some("rate".to_string()))
     );
     // A sender a little over the rate (a record every 19 ms) keeps nearly all of them.
@@ -825,7 +970,7 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
             .clock
             .store(1_020 + step * 19, Ordering::Release);
         let seq = over + 3 + step;
-        match client.record(seq, goal()) {
+        match client.record(seq, unapplied()) {
             (acked, None) if acked == seq => taken += 1,
             (acked, Some(why)) if acked == seq && why == "rate" => {}
             other => panic!("record {seq}: {other:?}"),
@@ -840,23 +985,17 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
 #[test]
 fn a_line_past_the_bound_is_discarded_as_it_arrives() {
     let (client, server) = CtlStream::pair().expect("real control socket pair");
-    server
-        .set_read_timeout(Some(SETTLE))
-        .expect("bound server reads");
+    let revoked = aterm_uds::stop::Stop::new();
+    let bell = revoked.bell().expect("the claim's stop descriptor");
     const RUN: usize = 16 * LINE_MAX;
     let writer = std::thread::spawn(move || {
         let mut client = client;
         client.write_all(&vec![b'x'; RUN]).expect("the long line");
         client.write_all(b"\nnext\n").expect("the line after it");
     });
+    let owed = aterm_uds::ready::Doorbell::new().expect("the stream's doorbell");
     let mut lines = super::Lines::new(Vec::new());
-    // A tick is no line: the reader's clock runs beside the bytes.
-    let line = |lines: &mut super::Lines| loop {
-        match lines.next(&server) {
-            super::Line::Tick => {}
-            line => return line,
-        }
-    };
+    let line = |lines: &mut super::Lines| lines.next(&server, &revoked, bell, owed.fd(), None);
     assert!(matches!(line(&mut lines), super::Line::Over));
     assert!(
         lines.buffer.capacity() <= 2 * (LINE_MAX + super::CHUNK),
@@ -871,56 +1010,47 @@ fn a_line_past_the_bound_is_discarded_as_it_arrives() {
     assert!(matches!(line(&mut lines), super::Line::Ended));
 }
 
-/// The reader's tick is a deadline over its whole wait, not over one read: a peer that keeps
-/// sending bytes with no newline, each well inside the tick, still has its claim looked at. While
-/// the claim stands on its connection the stream stays open; once the claim is placed on another
-/// connection the stream closes, though no line was ever completed and no read ever timed out.
 #[test]
-fn bytes_with_no_newline_do_not_put_off_the_look_at_the_claim() {
+fn a_move_of_the_same_claim_ends_a_stream_with_an_unfinished_line() {
     let rig = Rig::new(1);
-    let mut dripper = rig.claimant(ONE, "state");
-    let id = dripper.id();
-    dripper.open(ONE);
-    let drip = Duration::from_millis(20);
-    assert!(
-        drip * 4 < super::TICK,
-        "each byte arrives well inside a tick"
-    );
+    let mut client = rig.claimant(ONE, "state");
+    let id = client.id();
+    client.open(ONE);
+    client
+        .stream
+        .write_all(b"unfinished")
+        .expect("partial line");
 
-    // The claim stands: several ticks of dripping close nothing.
-    let until = Instant::now() + super::TICK * 4;
-    while Instant::now() < until {
-        dripper.stream.write_all(b" ").expect("the stream is open");
-        std::thread::sleep(drip);
-    }
-    assert!(
-        !rig.service.released(id),
-        "a dripping claimant keeps its stream"
-    );
-    assert_eq!(rig.lanes.census().streams, 1);
-
-    // The claim leaves for another connection while the drip goes on.
     let handle = rig.service.handle(ONE);
+    let successor = u64::MAX - 9;
     place(
         &handle,
         4,
         &[Duty::State],
-        u64::MAX - 9,
+        successor,
         running(),
         "claude-code-alab",
     )
     .expect("a claim placed elsewhere");
-    let deadline = Instant::now() + SETTLE;
-    while !rig.service.released(id) {
-        assert!(
-            Instant::now() < deadline,
-            "a stream whose claim left stayed open behind bytes with no newline"
-        );
-        // The write fails once the stream closed; that is the end the loop waits for.
-        let _ = dripper.stream.write_all(b" ");
-        std::thread::sleep(drip);
-    }
+    rig.ended(id);
+    assert!(rig.service.has_live_claim(successor));
     rig.lanes_free();
+}
+
+#[test]
+fn a_revoked_stream_leaves_a_complete_buffered_line_unread() {
+    let (_client, server) = CtlStream::pair().expect("real control socket pair");
+    let revoked = aterm_uds::stop::Stop::new();
+    let bell = revoked.bell().unwrap();
+    assert!(revoked.set());
+    let owed = aterm_uds::ready::Doorbell::new().expect("the stream's doorbell");
+    owed.ring();
+    let mut lines = super::Lines::new(b"buffered\n".to_vec());
+    assert!(matches!(
+        lines.next(&server, &revoked, bell, owed.fd(), None),
+        super::Line::Revoked
+    ));
+    assert_eq!(lines.buffer, b"buffered\n");
 }
 
 /// A `stream` verb is served or refused here, never forwarded to a sibling and never a wait;
@@ -1017,11 +1147,12 @@ fn a_stream_verb_is_never_relayed_and_a_full_pool_keeps_the_claim() {
     let opened = second.line();
     let opened = StreamReply::parse(&opened).unwrap_or_else(|error| panic!("{opened}: {error}"));
     assert_eq!(opened.acked, 0);
-    let ack = second.line();
-    let ack = Record::read(ack.as_bytes()).unwrap_or_else(|error| panic!("{ack}: {error}"));
+    // aterm's opening records come before the acknowledgement: they are written before any
+    // line is read.
+    second.opened(&opened);
     assert_eq!(
-        (ack.record.seq, ack.record.body),
-        (1, Body::Ack { dropped: None }),
+        second.ack(),
+        (1, None),
         "the record sent with the verb was read"
     );
     assert!(
@@ -1064,19 +1195,23 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
     let mut gapped = rig.claimant(ONE, "state");
     let id = gapped.id();
     gapped.open(ONE);
-    assert_eq!(gapped.record(1, goal()), (1, None));
-    assert_eq!(gapped.record(2, goal()), (2, None), "acked+1 keeps it open");
+    assert_eq!(gapped.record(1, unapplied()), (1, None));
+    assert_eq!(
+        gapped.record(2, unapplied()),
+        (2, None),
+        "acked+1 keeps it open"
+    );
     gapped.send(
         &Record {
             seq: 4,
             ms: 0,
-            body: goal(),
+            body: unapplied(),
         }
         .line()
         .expect("a record line"),
     );
     gapped.send("\n");
-    assert_eq!(gapped.line(), "<EOF>", "a gap is closed, not acknowledged");
+    assert_eq!(gapped.end(), "<EOF>", "a gap is closed, not acknowledged");
     rig.ended(id);
     assert_eq!(rig.state(ONE).acked, 2, "the gapped record was not taken");
 
@@ -1095,7 +1230,11 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
     ] {
         assert_eq!(stray.raw(line), (seq, usage.clone()), "{line:?}");
     }
-    assert_eq!(stray.record(6, goal()), (6, None), "the record behind them");
+    assert_eq!(
+        stray.record(6, unapplied()),
+        (6, None),
+        "the record behind them"
+    );
     let state = rig.state(ONE);
     assert_eq!((state.acked, state.dropped, state.unapplied), (6, 3, 3));
     drop(stray);
@@ -1112,7 +1251,7 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
     // A gap still closes, with the unread lines counted in what it is a gap from.
     back.send(r#"{"k":"beat","seq":8,"ms":0}"#);
     back.send("\n");
-    assert_eq!(back.line(), "<EOF>");
+    assert_eq!(back.end(), "<EOF>");
     rig.ended(id);
     assert_eq!(rig.state(ONE).acked, 6);
 
@@ -1130,7 +1269,7 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
         "claude-code-alab",
     )
     .expect("a renewal in place");
-    assert_eq!(moved.record(7, goal()), (7, None));
+    assert_eq!(moved.record(7, unapplied()), (7, None));
     // The claim placed on another connection: the stream ends at its next look.
     let elsewhere = u64::MAX - 7;
     place(
@@ -1142,7 +1281,7 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
         "claude-code-alab",
     )
     .expect("a claim placed elsewhere");
-    assert_eq!(moved.line(), "<EOF>");
+    assert_eq!(moved.end(), "<EOF>");
     rig.ended(id);
     let now = crate::metrics::now_us();
     let meta = handle
@@ -1166,7 +1305,7 @@ fn title_unknown_and_unapplied_records_are_acked_and_counted_in_meta() {
     let rig = Rig::new(2);
     let mut client = rig.claimant(ONE, "state");
     let quiet = "stream_epoch=- stream_acked=0 stream_in=0 stream_dropped=0 stream_unknown=0 \
-                 stream_unapplied=0 stream_titles=0 questions=";
+                 stream_unapplied=0 stream_titles=0 stream_took=0 stream_refused=0 questions=";
     assert!(rig.meta(ONE).contains(quiet), "{}", rig.meta(ONE));
     let epoch = client.open(ONE).epoch;
 
@@ -1175,14 +1314,16 @@ fn title_unknown_and_unapplied_records_are_acked_and_counted_in_meta() {
         client.raw(r#"{"k":"hx99-later","seq":2,"ms":0,"run":"rm -rf /"}"#),
         (2, None)
     );
-    assert_eq!(client.record(3, goal()), (3, None));
-    assert_eq!(client.record(4, goal()), (4, None));
+    assert_eq!(client.record(3, unapplied()), (3, None));
+    assert_eq!(client.record(4, unapplied()), (4, None));
     assert_eq!(client.record(5, Body::Beat), (5, None));
 
     let meta = rig.meta(ONE);
+    // `in` counts aterm's two opening records.
     let counted = format!(
-        " supervisor_proven=1 stream_epoch={epoch} stream_acked=5 stream_in=0 stream_dropped=0 \
-         stream_unknown=1 stream_unapplied=2 stream_titles=1 questions="
+        " supervisor_proven=1 stream_epoch={epoch} stream_acked=5 stream_in=2 stream_dropped=0 \
+         stream_unknown=1 stream_unapplied=2 stream_titles=1 stream_took=0 stream_refused=0 \
+         questions="
     );
     assert!(meta.contains(&counted), "{meta}");
     let state = rig.state(ONE);
@@ -1204,3 +1345,15 @@ mod state;
 /// The `claim` record and the re-exec grace of a stream's claim.
 #[path = "control_stream_claim_tests.rs"]
 mod claim;
+
+/// aterm's own records on the stream (`hand`, `policy`, `restart`) and the harness's answers.
+#[path = "control_stream_own_tests.rs"]
+mod own;
+
+#[cfg(test)]
+#[path = "control_stream_kinds_tests.rs"]
+mod kinds;
+
+/// The `act`, `need`, `clear`, `land`, `model` and `upgrade` records.
+#[path = "control_stream_acts_tests.rs"]
+mod acts;

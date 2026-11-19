@@ -4,6 +4,65 @@
 use super::*;
 
 #[test]
+fn compact_group_accumulators_project_the_same_weighted_values_as_agg() {
+    let mut full = Agg::default();
+    let mut compact = CompactAgg::default();
+    for (v, weight, over) in [
+        (1.0, 1_000, false),
+        (7.0, 5_000, true),
+        (f64::NAN, 1_000, true),
+        (f64::INFINITY, 1_000, true),
+        (-2.0, 3_000, false),
+        (4.0, u32::MAX, false),
+        (9.0, 0, true),
+    ] {
+        full.add(v, weight, over);
+        compact.add(v, weight, over);
+        assert_eq!(compact.cell(), full.cell());
+    }
+    let mut right = Agg::default();
+    let mut compact_right = CompactAgg::default();
+    for (v, weight, over) in [(2.0, 1_000, true), (8.0, 5_000, false)] {
+        right.add(v, weight, over);
+        compact_right.add(v, weight, over);
+    }
+    full.merge(&right);
+    compact.merge(compact_right);
+    assert_eq!(
+        compact.cell(),
+        full.cell(),
+        "discarding count/min retains the fields the picture reads"
+    );
+    assert_eq!(std::mem::size_of::<CompactAgg>(), 24);
+}
+
+#[test]
+fn group_slots_share_bucket_clipping_without_extending_overlaps() {
+    let (w, end) = slot_weight(Taken::at(9_500, 1_000), 0, 10_000, i64::MIN);
+    assert_eq!((w, end), (1_000, 10_000));
+    assert_eq!(
+        slot_weight(Taken::at(9_750, 1_000), 0, 10_000, end),
+        (0, end)
+    );
+    assert_eq!(
+        slot_weight(Taken::at(10_500, 1_000), 1, 10_000, end),
+        (1_000, 11_000)
+    );
+    assert_eq!(
+        slot_weight(Taken::at(-500, 1_000), -1, 10_000, i64::MIN),
+        (1_000, 0)
+    );
+    assert_eq!(
+        slot_weight(Taken::at(59_500, 5_000), 0, 60_000, i64::MIN),
+        (3_000, 60_000)
+    );
+    assert_eq!(
+        slot_weight(Taken::at(599_500, 5_000), 0, 600_000, i64::MIN),
+        (3_000, 600_000)
+    );
+}
+
+#[test]
 fn streamed_slots_keep_windows_empty_bands_and_clone_position() {
     const BANDS: [ScaleBand; 4] = [
         ScaleBand {

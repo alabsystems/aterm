@@ -2779,6 +2779,69 @@ fn a_standing_row_parks_only_when_every_incomplete_row_has_a_standing_cause() {
     );
 }
 
+/// A FULL TABLE IS A SETTLED `sync.requests` THAT KEEPS ITS PASSES (ATERM-KI-1116-3474): where
+/// the lab's table refused the passes for its capacity, the apply says so and ends the row
+/// changed, not failed and not standing aside, so the converge pass is complete and nothing parks
+/// the runner, whose recheck goes on for every row; the pass after it runs the passes again,
+/// which take in what needs no append, and no failure is journaled.
+/// NEGATIVE CONTROL: the apply standing aside for its inputs once the table is full (the row
+/// parking as a standing cause) leaves the pass incomplete and waiting for input.
+#[test]
+fn a_full_table_is_a_settled_requests_row_that_keeps_its_passes() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let mut ports = Inert::new(scratch.path());
+    let full = aterm_secrets::need::full::Full {
+        bound: aterm_secrets::need::full::Bound::Table,
+        records: 8192,
+        needs_unposted: 1,
+    };
+    let said = format!("0 posted, 0 answered, 1 decided here; {}", full.line());
+    let passed = said.clone();
+    ports.pass_requests = Some(Box::new(move || Ok(passed.clone())));
+    *ports.requests.lock().unwrap() =
+        RequestsRead::Due(format!("needs: 1 waiting; {}", full.line()));
+    let failures = || {
+        let journal = aterm_converge::FileJournal::under(scratch.path()).path();
+        std::fs::read_to_string(&journal)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| aterm_json::from_str::<aterm_json::Value>(l).unwrap())
+            .filter(|l| l["id"].as_str() == Some(REQUESTS) && l.get("failed").is_some())
+            .count()
+    };
+
+    for pass in 1..=2 {
+        let met = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        let requests = row(&met.rows, REQUESTS);
+        assert_eq!(requests.outcome, Outcome::Changed, "{requests:?}");
+        assert_eq!(requests.stood_aside, None, "{requests:?}");
+        assert_eq!(
+            requests.detail.as_deref(),
+            Some(said.as_str()),
+            "{requests:?}"
+        );
+        let alone = Pass {
+            due: Due::NotDue,
+            rows: vec![requests.clone()],
+            unrecorded: None,
+        };
+        assert!(
+            alone.complete(),
+            "pass {pass}: the row is settled: {requests:?}"
+        );
+        assert!(
+            !alone.waits_for_input(),
+            "pass {pass}: the row parks no runner: {requests:?}"
+        );
+        assert_eq!(
+            ports.applies().iter().filter(|a| **a == "requests").count(),
+            pass,
+            "every pass runs the passes against the full table"
+        );
+    }
+    assert_eq!(failures(), 0, "no failure journaled");
+}
+
 /// A count of gits by subcommand, for [`cost::line`]'s own laws: each `(word, n)` of
 /// [`crate::port::GIT_WORDS`] counted `n` times.
 fn git_by(counts: &[(&str, u64)]) -> crate::port::GitBy {
@@ -4044,6 +4107,9 @@ pub(crate) mod owed_clone {
             execution: Option<repository_refresh::Execution>,
         ) -> Result<crate::clone_tuning::Tuned, String> {
             self.inner.tune_clones(execution)
+        }
+        fn fabric_needs_node(&self) -> bool {
+            self.inner.fabric_needs_node()
         }
         fn fabric(&self) -> Result<FabricRead, String> {
             self.inner.fabric()

@@ -6,13 +6,16 @@
 
 use super::{
     census::{self, Event},
-    discovery::{Hints, MemoryScope, Outcome, REMEMBERED_MAX, REMEMBERED_NAME, Remembered},
+    discovery::{
+        Hints, Judgement, MemoryScope, Outcome, REMEMBERED_MAX, REMEMBERED_NAME, Remembered,
+    },
     moved::{Moves, Source, Subject},
     report::{AuthenticatedConnection, RepairRound, bounded_failure},
 };
 use crate::{
     Result,
     control::{Endpoint, Failure, Repair, Side},
+    credentials::handoff::Owing,
 };
 use aterm_net::lan::{Cancellation, Connection, Heard, Multicast, RecheckedListener, Scope};
 use aterm_secrets::commons::hearing::Said;
@@ -142,6 +145,53 @@ impl Drop for Ended {
         }
     }
 }
+
+/// How long after a read of this Mac's selection ended the next may begin
+/// ([`Transport::check_selection`]): the first wait of a failed endpoint's backoff. The read is
+/// this Mac's own and no peer hears of it.
+const SELECTION_GAP: Duration = super::discovery::BACKOFF_FIRST;
+
+/// What reads whether this Mac's selection lists short now (`Endpoint::listed_short`); none
+/// where it could not be read.
+type SelectionRead = Arc<dyn Fn() -> Option<bool> + Send + Sync>;
+
+/// A transport's reads of this Mac's selection ([`Transport::check_selection`]), one at a time,
+/// each on a thread of its own: a read waits for its admissions as a round's selection does,
+/// which the serving loop must not.
+#[derive(Default)]
+struct Selection {
+    /// The read in flight: its thread, which returns what it read, and the flag its end raises
+    /// before it rings the transport's doorbell ([`Ended`]).
+    check: Option<(JoinHandle<Option<bool>>, Arc<AtomicBool>)>,
+    /// No read begins before this ([`SELECTION_GAP`] after the last ended); none before the
+    /// first.
+    due: Option<Instant>,
+    /// What reads in the endpoint's place (tests).
+    #[cfg(test)]
+    read: Option<SelectionRead>,
+}
+
+/// A transport's judgements, with no round, of the takes this Mac may owe its seats
+/// ([`Transport::check_takes`]): one batch at a time, on a thread of its own, since a judgement
+/// waits for the credentials store's admissions as a round's handoff does, which the serving
+/// loop must not.
+#[derive(Default)]
+struct Takes {
+    /// The batch in flight: its thread, which returns what each seat's judgement told, the flag
+    /// its end raises before it rings the transport's doorbell ([`Ended`]), and the immutable
+    /// requests it judges. A fallback keeps the same requests as a successful read.
+    check: Option<(
+        JoinHandle<Vec<(Judgement, Owing)>>,
+        Arc<AtomicBool>,
+        Vec<Judgement>,
+    )>,
+    /// What judges in the endpoint's place (tests).
+    #[cfg(test)]
+    judge: Option<TakeJudge>,
+}
+
+/// What judges whether this Mac owes a seat a round in which it takes (`Endpoint::owed_take`).
+type TakeJudge = Arc<dyn Fn(astream_wire::sync::Actor) -> Owing + Send + Sync>;
 
 impl Worker {
     fn start(
@@ -288,6 +338,12 @@ impl Worker {
                     completed_at_ms,
                     dropped_before: 0,
                 };
+                // A round this side stopped hands its scheduler none of its reports and no
+                // authentication (`begin_round` clears them), while what it did to its scan's
+                // state stays: a restart of the cycle it took up, the turns it counted and what its
+                // list trade took into its report, so no later round reports that restart again.
+                // What it reported stays in its report, which the census reads
+                // (`census::own_round`).
                 if control.stopped {
                     repair.begin_round();
                 }
@@ -444,6 +500,7 @@ impl Memory {
             .unwrap_or_default()
     }
     fn write(&self, entries: &[Remembered]) {
+        census::count(Event::RememberedWrite);
         let bytes = Remembered::encode(&self.scope, entries);
         // One that fails is kept again at the next change or refresh ([`Hints::remembered`]).
         let _kept = aterm_uds::private_file::write_private(&self.dir, &self.name, &bytes);
@@ -563,6 +620,12 @@ pub(super) struct Transport {
     /// Its look at what of this Mac's Commons state moved ([`Self::watching`]), which its dials
     /// then offer ([`Hints::moved`]); it looks at nothing until its owner gives it one.
     moves: Moves,
+    /// Its reads of this Mac's selection while a seat's run of short lists is spent
+    /// ([`Self::check_selection`]).
+    selection: Selection,
+    /// Its judgements of the takes it may owe seats whose handoff could not tell
+    /// ([`Self::check_takes`]).
+    takes: Takes,
     /// A LAN attachment's stand-in (tests): while it reads false each address refreshed is one no
     /// bind reaches (its checks refuse it, as an attachment that changed since its address was
     /// read), and once it reads true it is the loopback ([`Self::standing_in`]).
@@ -718,6 +781,8 @@ impl Transport {
             failure: None,
             doorbell: Doorbell::new().ok().map(Arc::new),
             moves: Moves::default(),
+            selection: Selection::default(),
+            takes: Takes::default(),
             #[cfg(test)]
             stand_in: None,
             #[cfg(test)]
@@ -1006,7 +1071,7 @@ impl Transport {
                     // moved here before it began, unless its membership or table exchange broke
                     // off ([`Hints::settle`]).
                     if success {
-                        self.hints.settle(actor, target, started, &repair);
+                        self.hints.settle(actor, target, started, &repair, now);
                     }
                 }
                 // What a round said of its table, as the network observation will read it,
@@ -1024,24 +1089,31 @@ impl Transport {
                         report.control.as_ref().err().map(|failure| failure.cause),
                         report.cancelled,
                     );
-                    self.hints.finish(address, repair, outcome, now);
-                } else if let Some(actor) = repair.authenticated_actor().filter(|_| success)
-                    && let Some(connection) = &report.connection
-                    && !unvouched()
-                {
-                    // A peer that dialled in and completed a round is up: its endpoints here
-                    // whose dials failed drop their backoff as one this side dialled would, and
-                    // its address leads its beacons. A healthy endpoint's audit keeps this
-                    // side's own clock (`Hints::vouch`).
-                    self.hints.vouch(connection.peer.ip(), actor, now);
+                    if let Some(verdict) = self.hints.finish(address, repair, outcome, now) {
+                        census::own_round(&verdict, Some(&report));
+                    }
+                } else if let Some(actor) = repair.authenticated_actor().filter(|_| success) {
+                    census::inbound(actor);
+                    if let Some(connection) = &report.connection
+                        && !unvouched()
+                    {
+                        // A peer that dialled in and completed a round is up: its endpoints here
+                        // whose dials failed drop their backoff as one this side dialled would,
+                        // and its address leads its beacons. A healthy endpoint's audit keeps
+                        // this side's own clock (`Hints::vouch`).
+                        self.hints.vouch(connection.peer.ip(), actor, now);
+                    }
                 }
                 self.retain_report(report);
             }
             Err(_) => {
                 // A worker that panicked asked its peer nothing this side can tell of.
-                if let Some(address) = worker.target {
-                    self.hints
-                        .finish(address, Repair::default(), Outcome::Unasked, now);
+                if let Some(address) = worker.target
+                    && let Some(verdict) =
+                        self.hints
+                            .finish(address, Repair::default(), Outcome::Unasked, now)
+                {
+                    census::own_round(&verdict, None);
                 }
                 self.retain_report(RepairRound::panicked(worker.target));
             }
@@ -1056,6 +1128,15 @@ impl Transport {
         }
         while let Some(worker) = self.workers.pop() {
             self.finish(worker, Instant::now());
+        }
+        // A read of the selection in flight ends by itself, within its admissions' bound, and
+        // tells a transport that has stopped nothing: it is joined, as a round is, so nothing
+        // of this transport reads this Mac's state once its owner lets go of it.
+        if let Some((task, _)) = self.selection.check.take() {
+            let _ = task.join();
+        }
+        if let Some((task, ..)) = self.takes.check.take() {
+            let _ = task.join();
         }
     }
     /// Read what waits in `link`'s multicast socket, at most [`HEARD`] datagrams: a hearing
@@ -1151,7 +1232,10 @@ impl Transport {
     /// peers sent, the expiry of endpoints and presence heard ([`Hints::expire_presence`]) and
     /// the remembered endpoints' refresh, which nothing waits for, ride on the owner's polled
     /// round (`super::POLL`, the same two seconds as [`SEATS`]), so each comes at most that much
-    /// late; so does the look at what moved here that no watch told ([`Self::look_soon`]).
+    /// late; so does the look at what moved here that no watch told ([`Self::look_soon`]), and
+    /// the next read of this Mac's selection while a seat's run of short lists is spent
+    /// ([`Self::check_selection`]) and the next judgement of a take a seat's handoff could not
+    /// tell ([`Self::check_takes`]), whose ends ring the doorbell.
     pub(super) fn next_due(&self, now: Instant) -> Instant {
         let mut due = self.rotate;
         if !self.links.is_empty() {
@@ -1206,6 +1290,153 @@ impl Transport {
                 Subject::Table(_) | Subject::Control | Subject::Members => None,
             };
             self.hints.moved(subject, held, sources, now);
+        }
+        // A policy that selects more than it did leaves every seat holding lists of this Mac's
+        // that leave out what it selects now: each is owed a round that lists it
+        // ([`Hints::relist_all`]).
+        if self.moves.widened() {
+            self.hints.relist_all(now);
+        }
+    }
+
+    /// Read this Mac's selection while a seat's run of short lists has spent its owed rounds
+    /// ([`Hints::spent`]), and tell the dial scheduler once it reads whole
+    /// ([`Hints::relist_spent`]). Such a seat holds lists of this Mac's that may leave out a
+    /// table its selection takes once it reads whole, no round is owed it, and nothing but the
+    /// selection says when a round would list whole: without the read a write to that table at
+    /// the seat waits for the pair's next audit.
+    ///
+    /// A turn takes a read that ended and, where one is due and none is in flight, begins the
+    /// next on a thread of its own, whose end rings the doorbell. The read is the one a round's
+    /// selection makes, with no peer (`crate::replica::Replica::listed_short`). One that finds
+    /// the selection short, or cannot read it, tells nothing, and the next begins
+    /// [`SELECTION_GAP`] after it ended, at the owner's polled round (`super::POLL`) at the
+    /// latest. A transport with no endpoint reads nothing. No read begins while no seat's run is
+    /// spent, which is every Mac whose rounds list whole.
+    fn check_selection(&mut self, now: Instant) {
+        if let Some((task, _)) = self
+            .selection
+            .check
+            .take_if(|(task, ended)| ended.load(Ordering::Acquire) || task.is_finished())
+        {
+            self.selection.due = Some(now + SELECTION_GAP);
+            // A read that panicked, like one that could not read, tells nothing.
+            if task.join().ok().flatten() == Some(false) {
+                self.hints.relist_spent(now);
+            }
+        }
+        if self.selection.check.is_some()
+            || self.selection.due.is_some_and(|due| now < due)
+            || !self.hints.spent(now)
+        {
+            return;
+        }
+        #[cfg(test)]
+        let seam = self.selection.read.clone();
+        #[cfg(not(test))]
+        let seam: Option<SelectionRead> = None;
+        let read: SelectionRead = match (seam, &self.endpoint) {
+            (Some(read), _) => read,
+            (None, Some(endpoint)) => {
+                let endpoint = endpoint.clone();
+                Arc::new(move || endpoint.listed_short())
+            }
+            (None, None) => return,
+        };
+        let ended = Arc::new(AtomicBool::new(false));
+        let end = Ended {
+            ended: ended.clone(),
+            bell: self.doorbell.clone(),
+        };
+        let spawned = thread::Builder::new()
+            .name("commons-selection".into())
+            .spawn(move || {
+                let _end = end;
+                read()
+            });
+        match spawned {
+            Ok(task) => self.selection.check = Some((task, ended)),
+            // No thread now: the next turn past the gap tries again.
+            Err(_) => self.selection.due = Some(now + SELECTION_GAP),
+        }
+    }
+
+    /// Judge again, with no round, whether this Mac owes a seat a round in which it takes the
+    /// seat's credential Offer, where the seat's last round ended with a handoff that could not
+    /// tell (`Owing::Unknown`: this Mac's credentials store busy, its administrator unreadable)
+    /// and the judgement is due ([`Hints::judging`]), and tell the dial scheduler what each
+    /// judgement told ([`Hints::judged`]). Nothing the seat does tells this Mac when its own
+    /// state reads again: without the judgement the take, and the holder's value, waits for the
+    /// pair's next round, at rest their audit.
+    ///
+    /// A turn takes a batch that ended and, where seats are due and none is in flight, begins the
+    /// next on a thread of its own, whose end rings the doorbell. Each judgement is the one a
+    /// handoff that answered the seat makes as it ends, with no peer
+    /// (`crate::credentials::handoff::owed_take`). A batch that panicked or could not start
+    /// tells each of its seats that it could not tell, so the judgements stay bounded
+    /// ([`Hints::judged`]). The due ones come at the owner's polled round (`super::POLL`) at the
+    /// latest. A transport with no endpoint judges nothing, and none is due on a Mac whose
+    /// handoffs tell.
+    fn check_takes(&mut self, now: Instant) {
+        if let Some((task, _, requests)) = self
+            .takes
+            .check
+            .take_if(|(task, ended, _)| ended.load(Ordering::Acquire) || task.is_finished())
+        {
+            let judged = task.join().unwrap_or_else(|_| {
+                requests
+                    .into_iter()
+                    .map(|request| (request, Owing::Unknown))
+                    .collect()
+            });
+            for (request, owing) in judged {
+                self.hints.judged(request, owing, now);
+            }
+        }
+        if self.takes.check.is_some() {
+            return;
+        }
+        let requests = self.hints.judging(now);
+        if requests.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        let seam = self.takes.judge.clone();
+        #[cfg(not(test))]
+        let seam: Option<TakeJudge> = None;
+        let judge: TakeJudge = match (seam, &self.endpoint) {
+            (Some(judge), _) => judge,
+            (None, Some(endpoint)) => {
+                let endpoint = endpoint.clone();
+                Arc::new(move |seat| endpoint.owed_take(seat))
+            }
+            (None, None) => return,
+        };
+        let ended = Arc::new(AtomicBool::new(false));
+        let end = Ended {
+            ended: ended.clone(),
+            bell: self.doorbell.clone(),
+        };
+        let judging = requests.clone();
+        let spawned = thread::Builder::new()
+            .name("commons-takes".into())
+            .spawn(move || {
+                let _end = end;
+                judging
+                    .into_iter()
+                    .map(|request| {
+                        let owing = judge(request.seat());
+                        (request, owing)
+                    })
+                    .collect()
+            });
+        match spawned {
+            Ok(task) => self.takes.check = Some((task, ended, requests)),
+            Err(_) => {
+                for request in requests {
+                    self.hints.judged(request, Owing::Unknown, now);
+                }
+            }
         }
     }
 
@@ -1278,6 +1509,8 @@ impl Transport {
             memory.write(&remembered);
         }
         self.look(now);
+        self.check_selection(now);
+        self.check_takes(now);
         let mut index = 0;
         let mut after_accept = None;
         while index < self.links.len() {
@@ -1371,8 +1604,12 @@ impl Transport {
                 ) {
                     Ok(worker) => self.workers.push(worker),
                     Err(error) => {
-                        self.hints
-                            .finish(address, Repair::default(), Outcome::Busy, now);
+                        if let Some(verdict) =
+                            self.hints
+                                .finish(address, Repair::default(), Outcome::Busy, now)
+                        {
+                            census::own_round(&verdict, None);
+                        }
                         return Err(error);
                     }
                 }

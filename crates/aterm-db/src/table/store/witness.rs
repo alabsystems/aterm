@@ -24,6 +24,10 @@ impl Witness {
         }
         Ok(Self { count, hash })
     }
+    /// The hash chained over every receipt the witness counts.
+    pub const fn hash(self) -> Digest {
+        self.hash
+    }
     pub fn bytes(self) -> [u8; 40] {
         let mut bytes = [0; 40];
         bytes[..8].copy_from_slice(&self.count.to_le_bytes());

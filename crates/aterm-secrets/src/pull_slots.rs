@@ -12,7 +12,7 @@ use std::sync::{
 use std::sync::{Condvar, Mutex, PoisonError};
 
 /// How many peers' records a server reads at once (the server's `pull_from_peer`): each body is
-/// up to [`crate::membership_log::MAX_RECORDS_STREAM`]. Frames reuse exact known owners or verify
+/// up to [`crate::membership_log::REPLY_CAP`]. Frames reuse exact known owners or verify
 /// as they arrive, and the completed response enters the server's `apply_records`. A pass asks
 /// its peers (up to [`crate::discover::MAX_CANDIDATES`]) for their envelopes at once, which finds
 /// the dark ones in one budget, and holds this many records bodies: one read while another is

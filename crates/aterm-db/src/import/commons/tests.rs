@@ -67,6 +67,7 @@ fn structural_fallback_keeps_noncanonical_and_foreign_records_refused() {
             key: "item".into(),
             value: Some(json!(true)),
         }],
+        said: None,
     };
     for payload in [
         trailing,
@@ -659,6 +660,7 @@ fn signed_unknown_fields_cannot_smuggle_secrets_into_import_projection() {
             key: key.clone(),
             value: Some(value),
         }],
+        said: None,
     };
     let bootstrap = lab.bootstrap(0);
     let session = Session::open(&bootstrap).unwrap();

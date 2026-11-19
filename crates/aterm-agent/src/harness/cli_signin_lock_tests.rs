@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
-#![cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "some helpers serve only the tests gated `cfg(unix)`"
-    )
-)]
-
 use std::cell::{Cell, RefCell};
 
 use super::*;
@@ -270,7 +260,6 @@ fn fixture(tag: &str, renewal: bool) -> (Tmp, Env, AccountsCmd) {
     (tmp, env, form)
 }
 
-#[cfg(unix)]
 #[test]
 fn bounded_background_refusal_and_manual_provider_cleanup_share_machine_exclusion() {
     for renewal in [false, true] {
@@ -304,7 +293,6 @@ fn bounded_background_refusal_and_manual_provider_cleanup_share_machine_exclusio
 
 /// An explicit manual command owns a FIFO place independently of terminal or
 /// agent markers. This scheduling control starts no provider and changes no auth rules.
-#[cfg(unix)]
 #[test]
 fn manual_fifo_waiting_is_independent_of_terminal_and_agent_markers() {
     for tty in [false, true] {
@@ -335,7 +323,6 @@ fn manual_fifo_waiting_is_independent_of_terminal_and_agent_markers() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn closing_the_actual_scope_at_queue_observation_starts_no_provider() {
     let (_tmp, env, _) = fixture("claude-signin-cancel-queued", false);
@@ -369,7 +356,6 @@ fn closing_the_actual_scope_at_queue_observation_starts_no_provider() {
 /// What a person's wait outlasted is what they go by: the sign-in they waited for renewed another
 /// row, which moves the store's clock and so every parent captured before it, and theirs still
 /// runs. Without the capture under the lock it is refused with nothing run.
-#[cfg(unix)]
 #[test]
 fn a_person_goes_by_what_the_sign_in_they_waited_for_left() {
     for renewal in [false, true] {
@@ -391,7 +377,6 @@ fn a_person_goes_by_what_the_sign_in_they_waited_for_left() {
 
 /// What a person waited for may be the very sign-in they came to make, so nothing runs a second
 /// time. The test above is its control: a renewal of another row runs theirs.
-#[cfg(unix)]
 #[test]
 fn a_person_is_not_signed_in_again_over_a_renewal_they_waited_for() {
     for renewal in [false, true] {
@@ -418,7 +403,6 @@ fn a_person_is_not_signed_in_again_over_a_renewal_they_waited_for() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn claude_signin_failures_release_the_machine_lock() {
     for renewal in [false, true] {
@@ -444,7 +428,6 @@ fn claude_signin_failures_release_the_machine_lock() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn an_unopenable_signin_lock_starts_no_claude_flow() {
     for renewal in [false, true] {
@@ -480,7 +463,6 @@ fn an_unopenable_signin_lock_starts_no_claude_flow() {
     }
 }
 
-#[cfg(unix)]
 struct Published<'a> {
     host: &'a LockHost,
     store: accounts::Store,
@@ -490,7 +472,6 @@ struct Published<'a> {
     bytes: Vec<u8>,
 }
 
-#[cfg(unix)]
 impl Write for Published<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.bytes.extend_from_slice(bytes);
@@ -513,7 +494,6 @@ impl Write for Published<'_> {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn a_claude_fallback_keeps_the_lock_until_the_new_binding_is_published() {
     let (_tmp, env, form) = fixture("claude-fallback-lock", true);
@@ -555,7 +535,6 @@ fn a_claude_fallback_keeps_the_lock_until_the_new_binding_is_published() {
 
 /// A non-TTY caller can acquire inside the existing bounded ladder after contention.
 /// It must observe the completed renewal instead of treating its old capture as current.
-#[cfg(unix)]
 #[test]
 fn a_non_tty_sign_in_rechecks_the_renewal_that_ended_its_contention() {
     for contended in [false, true] {

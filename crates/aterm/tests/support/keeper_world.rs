@@ -180,8 +180,8 @@ pub fn keeper_cli(root: &Path, args: &[&str]) -> String {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = cmd.spawn().expect("spawn aterm keeper");
-    let out = child_output::wait_and_read(child, std::time::Instant::now() + HANG * 2)
-        .unwrap_or_else(|| panic!("aterm keeper {args:?} did not exit in time"));
+    let out = child_output::wait_and_read(child, HANG * 2)
+        .unwrap_or_else(|why| panic!("aterm keeper {args:?} was killed before it exited: {why}"));
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 

@@ -34,6 +34,8 @@ pub(crate) struct TabStripMetadata {
     /// The connection-mark role.
     pub(crate) conn: Option<TabConnRole>,
     pub(crate) closable: bool,
+    /// This window displays the numbered local session panel.
+    pub(crate) panel_numbers: bool,
     /// Who drives: the tab's team marks, `↳` before a worker's title and `⇉N` after a manager's
     /// ([`team_title`]).
     pub(crate) team: TabTeam,
@@ -96,6 +98,12 @@ pub(crate) fn team_titles<'a>(
 }
 
 impl TabStripMetadata {
+    /// The macOS tab strip advertises position shortcuts only when it owns those digits.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn tab_number(self, index: usize) -> Option<usize> {
+        (!self.panel_numbers && index < 9).then(|| index + 1)
+    }
+
     #[must_use]
     pub(crate) const fn from_presentation(
         presentation: &crate::tab_model::TabPresentation,
@@ -109,6 +117,7 @@ impl TabStripMetadata {
             ),
             conn: presentation.conn,
             closable: presentation.closable,
+            panel_numbers: false,
             team: TabTeam::NONE,
         }
     }
@@ -259,6 +268,26 @@ const SYSTEM_STATE_ICON: &[TabIconPrimitive] = &[
         from: [13.0, 13.0],
         to: [13.0, 3.0],
         width: 2.25,
+    },
+];
+
+/// Three rows of falling length, the deck's rows read as bars: System State's bars stand, these
+/// lie.
+const SYSTEM_RESOURCES_ICON: &[TabIconPrimitive] = &[
+    TabIconPrimitive::Line {
+        from: [2.5, 4.0],
+        to: [13.5, 4.0],
+        width: 2.0,
+    },
+    TabIconPrimitive::Line {
+        from: [2.5, 8.0],
+        to: [10.0, 8.0],
+        width: 2.0,
+    },
+    TabIconPrimitive::Line {
+        from: [2.5, 12.0],
+        to: [6.5, 12.0],
+        width: 2.0,
     },
 ];
 
@@ -427,6 +456,34 @@ const TABLES_ICON: &[TabIconPrimitive] = &[
     },
 ];
 
+/// A fleet identity card with a portrait and two lines of text.
+const REGISTRY_ICON: &[TabIconPrimitive] = &[
+    TabIconPrimitive::RoundedRect {
+        rect: [1.25, 2.75, 13.5, 10.5],
+        radius: 1.75,
+        width: 1.25,
+    },
+    TabIconPrimitive::Dot {
+        center: [5.25, 6.75],
+        radius: 1.35,
+    },
+    TabIconPrimitive::Line {
+        from: [3.5, 10.25],
+        to: [7.0, 10.25],
+        width: 1.5,
+    },
+    TabIconPrimitive::Line {
+        from: [9.25, 6.5],
+        to: [12.5, 6.5],
+        width: 1.25,
+    },
+    TabIconPrimitive::Line {
+        from: [9.25, 9.5],
+        to: [11.5, 9.5],
+        width: 1.25,
+    },
+];
+
 const RECOVERY_ICON: &[TabIconPrimitive] = &[
     TabIconPrimitive::RoundedRect {
         rect: [2.0, 1.5, 12.0, 13.0],
@@ -473,6 +530,8 @@ pub(crate) const fn tab_icon_primitives(kind: TabIconKind) -> &'static [TabIconP
         TabIconKind::Recovery => RECOVERY_ICON,
         TabIconKind::Workers => WORKERS_ICON,
         TabIconKind::Tables => TABLES_ICON,
+        TabIconKind::Registry => REGISTRY_ICON,
+        TabIconKind::SystemResources => SYSTEM_RESOURCES_ICON,
     }
 }
 
@@ -561,6 +620,8 @@ pub(crate) struct TabSizing<'a> {
     pub(crate) grow: u16,
     /// Each tab's wanted width in columns, title and chrome (`pixel_band::tab_wants`).
     pub(crate) wants: &'a [u16],
+    /// Columns reserved for the master's New Tab button; zero in auxiliary windows.
+    new_tab_cols: u16,
 }
 
 impl<'a> TabSizing<'a> {
@@ -570,10 +631,11 @@ impl<'a> TabSizing<'a> {
         cap: MAX_CHIP_COLS,
         grow: MAX_CHIP_COLS,
         wants: &[],
+        new_tab_cols: NEW_TAB_W,
     };
 
     /// The sizing of a window whose cells are `cell_w` device px at `scale`.
-    pub(crate) fn at(cell_w: usize, scale: f32, wants: &'a [u16]) -> Self {
+    pub(crate) fn at(cell_w: usize, scale: f32, wants: &'a [u16], new_tab: bool) -> Self {
         let scale = if scale.is_finite() && scale > 0.0 {
             scale
         } else {
@@ -588,6 +650,7 @@ impl<'a> TabSizing<'a> {
             cap,
             grow: cols(TAB_GROW_DIP).max(cap),
             wants,
+            new_tab_cols: if new_tab { NEW_TAB_W } else { 0 },
         }
     }
 
@@ -798,6 +861,7 @@ const PLAIN_TAB: TabStripMetadata = TabStripMetadata {
     busy: false,
     attention: ChipLevel::Off,
     conn: None,
+    panel_numbers: false,
     team: TabTeam::NONE,
     closable: true,
 };
@@ -921,8 +985,12 @@ fn layout_segments_seated(
     } else {
         0
     };
-    let plus_room = cols > lead + NEW_TAB_W;
-    let avail = if plus_room { cols - NEW_TAB_W } else { cols };
+    let plus_room = sizing.new_tab_cols > 0 && cols > lead + sizing.new_tab_cols;
+    let avail = if plus_room {
+        cols - sizing.new_tab_cols
+    } else {
+        cols
+    };
     let solo = tab_count == 1 && SOLO_TITLE_BAND;
     let mut x: u16 = lead;
     if tab_count > 0 {
@@ -1084,7 +1152,15 @@ pub(crate) fn layout_segments_with_version_sized(
     } else {
         LONE_CHIP_COLS
     };
-    let version = version_rung_that_fits(cols, tab_count, seat, show_update, slot, lone);
+    let version = version_rung_that_fits(
+        cols,
+        tab_count,
+        seat,
+        show_update,
+        slot,
+        lone,
+        sizing.new_tab_cols,
+    );
     let laid_cols = version.map_or(cols, |(_, w)| cols - w);
     let mut segments =
         layout_segments_seated(laid_cols, tab_count, active, show_update, seat, sizing);
@@ -1199,6 +1275,7 @@ fn version_rung_that_fits(
     show_update: bool,
     slot: VersionSlotCols,
     lone: u16,
+    new_tab_cols: u16,
 ) -> Option<(crate::menu::VersionRung, u16)> {
     [
         (crate::menu::VersionRung::Full, slot.full),
@@ -1213,10 +1290,10 @@ fn version_rung_that_fits(
         } else {
             0
         };
-        if inner <= lead + NEW_TAB_W {
+        if inner <= lead + new_tab_cols {
             return false;
         }
-        let band = inner - NEW_TAB_W - lead;
+        let band = inner - new_tab_cols - lead;
         match tab_count {
             0 => true,
             1 => band >= lone,
@@ -1327,6 +1404,9 @@ enum StripRole {
     /// The leading `↻` update-ready alert.
     Update,
 }
+
+/// No session is selected on the top strip while an organizer page is frontmost.
+pub(crate) const NO_SELECTED_TAB: usize = usize::MAX;
 
 /// Whether the in-grid strip paints itself as a distinct chrome band.
 pub(crate) const STRIP_IS_CHROME_BAND: bool = !cfg!(target_os = "macos");
@@ -2196,6 +2276,8 @@ pub(crate) struct StripRenameField<'a> {
     pub tab: usize,
     /// The field's text.
     pub text: &'a str,
+    /// The title is selected when the edit begins.
+    pub selected_all: bool,
     /// Caret position in `text`, as a byte offset on a char boundary.
     pub cursor: usize,
 }
@@ -2354,33 +2436,31 @@ fn paint_strip_impl(
                     put(row, c, ' ', band_role);
                 }
                 let title = titles.get(i).map(String::as_str).unwrap_or("");
-                if let Some(edit) = paint.rename.filter(|edit| edit.tab == i) {
-                    let start = usize::from(seg.start_col) + SOLO_EDGE_COLS;
-                    let end = usize::from(seg.end_col).saturating_sub(SOLO_EDGE_COLS);
-                    if start < end {
-                        rename_caret = paint_rename_field(
-                            row,
-                            start..end,
-                            edit.text,
-                            edit.cursor,
-                            title,
-                            palette,
-                            strip_cell(' ', &colors, band_role).bg,
-                            None,
-                        );
-                    }
-                    continue;
-                }
                 let (title, subtitle) = solo_band_text(title, paint.subtitle, span as usize);
                 let width = strip_display_cells(&title)
                     + subtitle
                         .as_ref()
                         .map_or(0, |s| SOLO_GAP_COLS + strip_display_cells(s));
                 let start = seg.start_col + (span.saturating_sub(width as u16)) / 2;
-                let mut col = put_text(row, start, seg.end_col, &title, title_role);
+                let mut col = start + strip_display_cells(&title) as u16;
                 let item = metadata.and_then(|items| items.get(i)).copied();
-                if item.is_some_and(TabStripMetadata::is_app_tab) {
-                    embolden_title(row, start, col);
+                if let Some(edit) = paint.rename.filter(|edit| edit.tab == i) {
+                    let end = if subtitle.is_some() {
+                        col.saturating_add(1)
+                    } else {
+                        seg.end_col.saturating_sub(SOLO_EDGE_COLS as u16)
+                    };
+                    rename_caret = paint_rename_field(
+                        row,
+                        usize::from(start)..usize::from(end),
+                        edit,
+                        strip_cell(' ', &colors, title_role),
+                    );
+                } else {
+                    put_text(row, start, seg.end_col, &title, title_role);
+                    if item.is_some_and(TabStripMetadata::is_app_tab) {
+                        embolden_title(row, start, col);
+                    }
                 }
                 if let Some(subtitle) = subtitle {
                     col = col.saturating_add(SOLO_GAP_COLS as u16);
@@ -2421,10 +2501,7 @@ fn paint_strip_impl(
                     put(row, seg.start_col, '│', StripRole::Separator);
                 }
                 let editing = paint.rename.filter(|edit| edit.tab == i);
-                let item = metadata
-                    .and_then(|items| items.get(i))
-                    .copied()
-                    .filter(|_| editing.is_none());
+                let item = metadata.and_then(|items| items.get(i)).copied();
                 let layout = tab_content_layout(seg, item.unwrap_or(PLAIN_TAB));
                 if let (Some(icon_start), Some(kind)) =
                     (layout.icon_start, item.and_then(|item| item.icon))
@@ -2458,12 +2535,8 @@ fn paint_strip_impl(
                     rename_caret = paint_rename_field(
                         row,
                         usize::from(layout.title_start)..usize::from(layout.title_end),
-                        edit.text,
-                        edit.cursor,
-                        raw,
-                        palette,
-                        strip_cell(' ', &colors, tab_role).bg,
-                        is_active.then_some(colors.accent),
+                        edit,
+                        strip_cell(' ', &colors, tab_role),
                     );
                 } else {
                     let label = labels.get_mut(i).and_then(Option::take).unwrap_or_else(|| {
@@ -2901,37 +2974,30 @@ const RENAME_SCROLL_RIGHT: char = '›';
 const STRIP_OVERFLOW_LEFT: char = RENAME_SCROLL_LEFT;
 const STRIP_OVERFLOW_RIGHT: char = RENAME_SCROLL_RIGHT;
 
-/// Paint the inline session-rename field across `field` (a column range of `row`), inset in a
-/// strip cell of `ground`: underlined in `underline` (the active tab's accent), else, where the
-/// well's fill stands under 3:1 off `ground` and so does not show where the field is, in the
-/// edge every faint text field draws ([`aterm_messages::ink::well_edge`]).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the field's geometry, contents and the two tones it is drawn between"
-)]
+/// Paint the text and selection in the tab label's own cells. Reverse the existing inks
+/// under a selection or block cursor, keeping the chip's material and font.
 fn paint_rename_field(
     row: &mut [RenderCell],
     field: std::ops::Range<usize>,
-    text: &str,
-    cursor: usize,
-    placeholder: &str,
-    palette: ChromePalette,
-    ground: [u8; 3],
-    underline: Option<[u8; 3]>,
+    edit: StripRenameField<'_>,
+    style: RenderCell,
 ) -> Option<usize> {
     let width = field.len();
     if width == 0 || field.end > row.len() {
         return None;
     }
-    let c = crate::chrome_band::band_colors(palette);
-    let edge = underline.or_else(|| aterm_messages::ink::well_edge(c.field_bg, ground, c.value));
-    let well = |ch: char, fg: [u8; 3], bg: [u8; 3]| {
-        let mut cell = crate::chrome_band::cell(ch, fg, bg, false, false);
-        if let Some(ink) = edge {
-            cell.underline = UnderlineStyle::Single;
-            cell.underline_color = Some(ink);
+    let StripRenameField {
+        text,
+        cursor,
+        selected_all,
+        ..
+    } = edit;
+    let cell = |ch, selected| {
+        let mut c = RenderCell { ch, ..style };
+        if selected {
+            std::mem::swap(&mut c.fg, &mut c.bg);
         }
-        cell
+        c
     };
     let chars: Vec<(char, usize)> = text
         .chars()
@@ -2944,9 +3010,6 @@ fn paint_rename_field(
         .get(..cursor.min(text.len()))
         .map_or(chars.len(), |head| head.chars().count())
         .min(chars.len());
-    for cell in &mut row[field.clone()] {
-        *cell = well(' ', c.value, c.field_bg);
-    }
     let caret_cells = chars.get(caret).map_or(1, |&(_, w)| w).min(width);
     let mut scroll = caret;
     let mut budget = width - caret_cells;
@@ -2964,15 +3027,17 @@ fn paint_rename_field(
         if col + w > field.end {
             break;
         }
-        let (ink, ground) = if index == caret {
+        if index == caret {
             caret_col = Some(col);
-            (c.field_bg, c.caret)
+        }
+        let selected = if selected_all {
+            index < chars.len()
         } else {
-            (c.value, c.field_bg)
+            index == caret
         };
-        row[col] = well(ch, ink, ground);
+        row[col] = cell(ch, selected);
         if w == 2 {
-            let mut tail = well(' ', ink, ground);
+            let mut tail = cell(' ', selected);
             tail.wide = true;
             row[col + 1] = tail;
             pair_ends_field = col + 2 == field.end;
@@ -2985,38 +3050,21 @@ fn paint_rename_field(
         col += w;
         index += 1;
     }
-    if chars.is_empty() {
-        let mut col = field.start + 2;
-        for raw in placeholder.chars() {
-            let ch = strip_char(raw);
-            let w = usize::from(strip_char_cells(ch));
-            if col + w > field.end {
-                break;
-            }
-            row[col] = well(ch, c.label, c.field_bg);
-            if w == 2 {
-                let mut tail = well(' ', c.label, c.field_bg);
-                tail.wide = true;
-                row[col + 1] = tail;
-            }
-            col += w;
-        }
-    }
     if scroll > 0 && caret != scroll {
         // The first visible char loses its lead cell to the marker; if it was wide,
         // blank its orphaned continuation too.
         if chars.get(scroll).is_some_and(|&(_, w)| w == 2) && field.start + 1 < field.end {
-            row[field.start + 1] = well(' ', c.value, c.field_bg);
+            row[field.start + 1] = cell(' ', false);
         }
-        row[field.start] = well(RENAME_SCROLL_LEFT, c.label, c.field_bg);
+        row[field.start] = cell(RENAME_SCROLL_LEFT, selected_all);
     }
     if index < chars.len() && !caret_on_last_cell {
         // When a wide pair ends exactly at the field edge, the marker replaces its
         // continuation, so blank the lead as well.
         if pair_ends_field && field.end >= 2 && field.end - 2 >= field.start {
-            row[field.end - 2] = well(' ', c.value, c.field_bg);
+            row[field.end - 2] = cell(' ', false);
         }
-        row[field.end - 1] = well(RENAME_SCROLL_RIGHT, c.label, c.field_bg);
+        row[field.end - 1] = cell(RENAME_SCROLL_RIGHT, selected_all);
     }
     caret_col
 }
@@ -3809,7 +3857,11 @@ pub(crate) mod pixel_band {
     impl BandInput<'_> {
         /// Return the selected tab index clamped into range.
         fn selected(&self) -> usize {
-            self.active.min(self.titles.len().saturating_sub(1))
+            if self.active == NO_SELECTED_TAB {
+                self.active
+            } else {
+                self.active.min(self.titles.len().saturating_sub(1))
+            }
         }
     }
 

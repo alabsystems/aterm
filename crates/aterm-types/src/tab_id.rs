@@ -10,15 +10,15 @@
 //! (`s-1a2b3c4d5e6f70819203`), which [`TabId::parse`] refuses: a cold restore gives such a tab a
 //! minted ID and records the `s-` one as the ID it had. A shell still running in such a tab holds
 //! the `s-` text in its environment, which nothing can rewrite, so the readers of a request from
-//! a still-running shell (a requester's `sid=`, a local `@<sid>` selector, a keeper's link) also
-//! take it ([`is_legacy`]). Requester metadata can carry that exact legacy ID over the fleet;
-//! it does not become a canonical tab ID, and nothing mints it.
+//! this Mac's own shells (a local `@<sid>` selector, a keeper's link, an owned resource binding)
+//! also take it ([`is_legacy`]). It does not become a canonical tab ID, nothing mints it, and
+//! fleet requester and activity attribution require the current form.
 //!
 //! [`TabId::parse`] reads the canonical form. Its text grammar (the alphabet, lengths and
 //! [`is_tab_id`]) is [`alab_policy::tab_id`]'s, shared with the reply readers; this module builds
-//! the ID on it. Local request and requester-metadata readers use
-//! [`crate::control_request::Sid`] or [`crate::control_verbs::is_minted_sid`] to also accept the
-//! exact legacy form. Both grammars are strict: lower case only, exact lengths, and none of
+//! the ID on it. Local request and resource readers use [`crate::control_request::Sid`] to also
+//! accept the exact legacy form; [`crate::control_verbs::is_minted_sid`] stays current-only.
+//! Both grammars are strict: lower case only, exact lengths, and none of
 //! Crockford's aliases (`i`, `l`, `o`, `u`) in the `t` form. One spelling per ID also keeps two
 //! IDs from folding onto one file name on a case-insensitive volume.
 

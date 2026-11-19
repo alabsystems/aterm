@@ -67,9 +67,14 @@ fn conflict_inventory_defers_until_all_primary_proofs_reach_recovery() {
     round.active_table.set(Some(scope.digest()));
     for (retained, incomplete) in [(BATCH, true), (BATCH + 1, false), (BATCH + 1, false)] {
         // The peer declines its own inventory, so this call ends after the
-        // local readiness/proof response without another application batch.
+        // local readiness/proof response without another application batch. On the
+        // `atdb/7` and `atdb/8` wire that response is the whole list, which shows what the
+        // recovery store offers.
         let mut stream = Cursor::new(vec![0]);
-        let mut repair = Repair::default();
+        let mut repair = Repair {
+            tables: Tables::ProofList,
+            ..Repair::default()
+        };
         let mut report = Report::default();
         assert!(
             !round
@@ -84,13 +89,18 @@ fn conflict_inventory_defers_until_all_primary_proofs_reach_recovery() {
                 .unwrap()
         );
         let bytes = stream.into_inner();
-        let offered = receive_inventory::<81>(&mut Cursor::new(&bytes[1..]), MAX_PROOFS).unwrap();
+        let offered =
+            receive_inventory::<81>(&mut Cursor::new(&bytes[1..]), LISTED_PROOFS).unwrap();
         assert_eq!(offered, (!incomplete).then(|| expected.clone()));
         assert_eq!(
             repair.deferral.unwrap().retaining_primary_conflicts,
             incomplete
         );
         assert!(report.recovery);
+        assert!(
+            !report.listed_short(),
+            "a table served from its recovery store lists nothing short"
+        );
         let session = Session::observe(&bootstrap).unwrap();
         let recovery = directory
             .recovery()
@@ -145,8 +155,15 @@ fn a_primary_that_keeps_advancing_through_retention_defers_the_conflict_inventor
                 .unwrap();
         }
     };
+    // A hand-made `atdb/7` and `atdb/8` proof list: an available, empty inventory.
     let mut stream = Cursor::new(vec![1, 0, 0, 0, 0]);
-    let (mut repair, mut report) = (Repair::default(), Report::default());
+    let (mut repair, mut report) = (
+        Repair {
+            tables: Tables::ProofList,
+            ..Repair::default()
+        },
+        Report::default(),
+    );
     let went_on = crate::table::store::with_each_replay_observed(overtake, || {
         round.conflicts(
             &mut stream,
@@ -973,6 +990,20 @@ fn selection(
     BTreeSet<&'static str>,
     bool,
 ) {
+    let (selected, report, region, tables, enrolled) = selection_reported(primary);
+    (selected, report.recovery, region, tables, enrolled)
+}
+
+/// [`selection`], with the selection's whole report.
+fn selection_reported(
+    primary: Primary,
+) -> (
+    std::result::Result<(), String>,
+    Report,
+    bool,
+    BTreeSet<&'static str>,
+    bool,
+) {
     let lab = Lab::new(&[Role::Writer]);
     let bootstrap = lab.bootstrap(0);
     let directory = Directory::new(&lab.paths[0], bootstrap.trust());
@@ -1024,7 +1055,7 @@ fn selection(
         let mut round = replica.round(None).unwrap();
         if let Err(error) = round.select_tables(None, &mut Report::default()) {
             let first = format!("the first selection: {error}");
-            return (Err(first), false, false, BTreeSet::new(), false);
+            return (Err(first), Report::default(), false, BTreeSet::new(), false);
         }
         assert!(
             recovery_enrolled(),
@@ -1080,16 +1111,13 @@ fn selection(
             "another"
         }
     };
-    (
-        selected,
-        report.recovery,
-        round
-            .commons
-            .as_ref()
-            .is_some_and(|(directory, _)| directory.is_recovery()),
-        round.tables.keys().map(name).collect(),
-        recovery_enrolled(),
-    )
+    let region = round
+        .commons
+        .as_ref()
+        .is_some_and(|(directory, _)| directory.is_recovery());
+    let tables = round.tables.keys().map(name).collect();
+    drop(round);
+    (selected, report, region, tables, recovery_enrolled())
 }
 
 /// One selection places a round in its storage region and names its tables: a healthy primary
@@ -1207,4 +1235,147 @@ fn a_selection_reads_the_primary_catalog_once() {
         "CONTROL: the selection names the catalog and its table"
     );
     assert_eq!(now - opens, 1, "the selection's store opens");
+}
+
+/// A round's report says when the tables its side listed may leave out some its selection takes
+/// (`Report::listed_short`): its selection could not read the primary catalog and fell back to
+/// the recovery region's tables, or its writer could not take up its ring tables and listed none.
+/// The peer reads those lists as this side leaving the tables out and passes it over for writes
+/// to them, so this side owes the peer a round once its lists are whole. A selection in the
+/// primary, its rings taken up, lists whole, as does one whose catalog is absent and enrolled.
+/// MUTANT (`RINGS_DROP_UNTOLD`): the dropped rings are not told. MUTANT (`FALLBACK_UNTOLD`): the
+/// fallback is not told.
+#[test]
+fn a_round_whose_selection_falls_back_or_drops_its_rings_lists_short() {
+    let short = |primary: Primary, rings_refused: bool| {
+        crate::replica::RINGS_REFUSED.with(|flag| flag.set(rings_refused));
+        let (selected, report, region, _, _) = selection_reported(primary);
+        crate::replica::RINGS_REFUSED.with(|flag| flag.set(false));
+        assert_eq!(selected, Ok(()), "{primary:?}");
+        (report.listed_short(), region)
+    };
+    assert_eq!(short(Primary::Healthy, false), (false, false));
+    assert_eq!(short(Primary::Absent, false), (false, false));
+    assert_eq!(short(Primary::Excluded, false), (false, false));
+    for mutant in [false, true] {
+        crate::replica::FALLBACK_UNTOLD.with(|flag| flag.set(mutant));
+        let fallen = [
+            short(Primary::Damaged, false),
+            short(Primary::AbsentBesideStorage, false),
+        ];
+        crate::replica::FALLBACK_UNTOLD.with(|flag| flag.set(false));
+        assert_eq!(fallen, [(!mutant, true); 2], "mutant {mutant}");
+    }
+    for mutant in [false, true] {
+        crate::replica::RINGS_DROP_UNTOLD.with(|flag| flag.set(mutant));
+        // The writer runs where no catalog is enrolled yet.
+        let dropped = short(Primary::Absent, true);
+        crate::replica::RINGS_DROP_UNTOLD.with(|flag| flag.set(false));
+        assert_eq!(dropped, (!mutant, false), "mutant {mutant}");
+    }
+}
+
+/// A read of the selection with no peer (`Replica::listed_short`) tells what a round's report
+/// would of its lists, and tells when they are whole again with no round between: the dial
+/// scheduler asks it once the rounds a short list owed a seat are spent. Over one Mac's primary
+/// catalog and a declared table: the selection reads whole; with the catalog's storage moved
+/// away it falls back to the recovery region and reads short; with the storage back it reads
+/// whole again. Where no catalog is enrolled yet the selection's writer takes up the ring
+/// tables: a writer that cannot reads short, and once it can the same replica reads whole.
+#[test]
+fn a_read_of_the_selection_with_no_peer_tells_when_it_lists_whole_again() {
+    let short = |replica: &Replica| replica.listed_short().map_err(|error| error.to_string());
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    let config = lab.paths[0].home.join("config.toml");
+    let policy = crate::catalog::policy::Policy::default();
+    let session = Session::open(&bootstrap).unwrap();
+    directory
+        .ring_subscriptions(&session, &policy, SELECTION_NOW)
+        .unwrap();
+    directory
+        .open_application(&session, "selection", "rows", 1)
+        .unwrap();
+    let catalog = directory.path(directory.catalog_scope()).unwrap();
+    let moved = lab._home.path().join("moved-catalog");
+    drop(session);
+    let mut replica = Replica::commons(lab.paths[0].clone(), config).unwrap();
+    replica.ring_clock = Some(SELECTION_NOW);
+    assert_eq!(short(&replica), Ok(false), "CONTROL: the primary reads");
+    std::fs::rename(&catalog, &moved).unwrap();
+    assert_eq!(short(&replica), Ok(true), "the recovery region stands in");
+    std::fs::rename(&moved, &catalog).unwrap();
+    assert_eq!(short(&replica), Ok(false), "whole again, with no round");
+
+    // No catalog enrolled yet: the selection's writer takes up the ring tables.
+    let lab = Lab::new(&[Role::Writer]);
+    let config = lab.paths[0].home.join("config.toml");
+    let mut replica = Replica::commons(lab.paths[0].clone(), config).unwrap();
+    replica.ring_clock = Some(SELECTION_NOW);
+    crate::replica::RINGS_REFUSED.with(|flag| flag.set(true));
+    let refused = short(&replica);
+    crate::replica::RINGS_REFUSED.with(|flag| flag.set(false));
+    assert_eq!(refused, Ok(true), "the writer could not take up the rings");
+    assert_eq!(short(&replica), Ok(false), "whole once it can");
+}
+
+/// A ring whose old period's storage cannot be deleted (a directory left open to others, which
+/// retirement refuses to remove) still lists its window: the selection's writer lists the held
+/// window table it holds storage for and its list is whole (`Report::rings_unlisted` false), and
+/// the census counts the retirement unfinished (`Event::Unretired`), which the next writer pass
+/// tries again.
+/// MUTANT (`crate::catalog::ring::RETIRE_FAILURE_STOPS`): the failed retirement fails the
+/// writer's listing, every ring's tables are left out, and the round lists short.
+#[test]
+fn a_ring_whose_old_period_cannot_be_deleted_still_lists_its_window() {
+    use crate::catalog::ring::{CLAIMS, RETIRE_FAILURE_STOPS};
+    use std::os::unix::fs::PermissionsExt as _;
+    let day = SELECTION_NOW / CLAIMS.period_s;
+    for mutant in [false, true] {
+        let lab = Lab::new(&[Role::Writer]);
+        let bootstrap = lab.bootstrap(0);
+        let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+        let policy = crate::catalog::policy::Policy::default();
+        let session = Session::open(&bootstrap).unwrap();
+        let old = SELECTION_NOW - 3 * CLAIMS.period_s;
+        directory
+            .ring_subscriptions(&session, &policy, old)
+            .unwrap();
+        directory
+            .enroll_ring(&session, &CLAIMS, day - 3, old)
+            .unwrap();
+        directory
+            .enroll_ring(&session, &CLAIMS, day, SELECTION_NOW)
+            .unwrap();
+        let doomed = directory
+            .path(CLAIMS.scope(bootstrap.trust(), day - 3).unwrap())
+            .unwrap();
+        std::fs::set_permissions(&doomed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(session);
+        let window = CLAIMS.scope(bootstrap.trust(), day).unwrap().digest();
+        let mut replica =
+            Replica::commons(lab.paths[0].clone(), lab.paths[0].home.join("config.toml")).unwrap();
+        replica.ring_clock = Some(SELECTION_NOW);
+        RETIRE_FAILURE_STOPS.with(|flag| flag.set(mutant));
+        let unretired =
+            || crate::runtime::census::cadence_here().get(crate::runtime::census::Event::Unretired);
+        let before = unretired();
+        let mut round = replica.round(None).unwrap();
+        let mut report = Report::default();
+        let selected = round.select_tables(None, &mut report);
+        RETIRE_FAILURE_STOPS.with(|flag| flag.set(false));
+        selected.unwrap();
+        let listed = round.tables.contains_key(&window);
+        drop(round);
+        assert!(doomed.exists(), "CONTROL: the old period was not deleted");
+        if mutant {
+            assert!(!listed, "MUTANT: the window dropped");
+            assert!(report.rings_unlisted, "MUTANT: it lists short");
+            continue;
+        }
+        assert!(listed, "the window is listed");
+        assert!(!report.listed_short(), "{report:?}");
+        assert_eq!(unretired() - before, 1, "the retirement counts unfinished");
+    }
 }

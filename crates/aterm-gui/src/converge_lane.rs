@@ -13,6 +13,9 @@
 
 #![cfg_attr(not(unix), allow(dead_code))]
 
+#[cfg(unix)]
+use aterm_secrets::converge::{RefreshRequest, RefreshVersion, RepositoryRequest, RepositoryWork};
+
 static PASS_ENDED: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 pub(crate) fn on_pass_ended(ended: fn()) {
@@ -44,14 +47,25 @@ pub(crate) fn env_set(name: &str) -> bool {
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaneWake {
-    Network(crate::network_moved::Woke),
+    Timer,
+    Network(crate::network_moved::Woke, RefreshVersion),
     /// An input look called for this work: with what moved the inputs' mark in the looks that
     /// called for work since the snapshot before, as classes, and how many such looks there were.
-    Inputs(
-        aterm_secrets::converge::RepositoryWork,
-        aterm_secrets::converge::MarkMoved,
-        u32,
-    ),
+    Inputs(RepositoryRequest, aterm_secrets::converge::MarkMoved, u32),
+}
+
+#[cfg(unix)]
+impl LaneWake {
+    fn network(
+        woke: crate::network_moved::Woke,
+        inputs: &mut aterm_secrets::client::ConvergenceInputs,
+    ) -> Self {
+        if woke == crate::network_moved::Woke::Timer {
+            Self::Timer
+        } else {
+            Self::Network(woke, inputs.refresh_observation().version)
+        }
+    }
 }
 
 /// Start the lane: a pass at once, then maintenance, transient retry or input movement as its
@@ -83,9 +97,16 @@ pub(crate) fn spawn_lane() -> bool {
                         )
                     },
                 );
-                let _ = inputs.snapshot();
+                let initial = inputs.snapshot();
+                let maintenance = RepositoryRequest::Refresh(RefreshRequest::ensure(
+                    None,
+                    initial.refresh.version,
+                ));
                 let clock = std::time::Instant::now();
                 lane(
+                    initial
+                        .repositories
+                        .map_or(maintenance, |request| maintenance.merge(request)),
                     &mut window_pass(&exe),
                     &mut |line| aterm_log::info!("{line}"),
                     &mut |every| until_moved(&mut moved, &mut wake, &mut inputs, every),
@@ -110,12 +131,8 @@ pub(crate) fn spawn_lane() -> bool {
 /// One pass of the lane ([`lane`]): started under its trigger, its work and its start's note, it
 /// says how the pass ended.
 #[cfg(unix)]
-type LanePass<'a> = dyn FnMut(
-        &str,
-        aterm_secrets::converge::RepositoryWork,
-        &aterm_secrets::converge::StartNote,
-    ) -> Ended
-    + 'a;
+type LanePass<'a> =
+    dyn FnMut(&str, RepositoryRequest, &aterm_secrets::converge::StartNote) -> Ended + 'a;
 
 /// The lane's rounds: a window pass at once ([`aterm_secrets::converge::WINDOW`]), then, each
 /// time `wait` waited out the recheck or bounded retry, or was woken by a move, another;
@@ -128,22 +145,24 @@ type LanePass<'a> = dyn FnMut(
 /// pass before it ended; a network move; an input, with what moved the inputs' mark).
 #[cfg(unix)]
 fn lane(
+    mut request: RepositoryRequest,
     pass: &mut LanePass<'_>,
     log: &mut dyn FnMut(&str),
     wait: &mut dyn FnMut(Option<std::time::Duration>) -> Option<LaneWake>,
     now_ms: &mut dyn FnMut() -> u64,
 ) {
-    use aterm_secrets::converge::{Causes, MarkMoved, RepositoryWork, StartNote};
+    use aterm_secrets::converge::{Causes, MarkMoved, StartNote};
     let mut retry = aterm_secrets::converge::RunnerRetry::default();
     let mut said = None;
-    let mut work = RepositoryWork::Refresh;
+    let maintenance =
+        RepositoryRequest::Refresh(RefreshRequest::ensure(None, RefreshVersion::default()));
     let mut note = StartNote {
         causes: Causes::FIRST,
         ..StartNote::default()
     };
     loop {
         retry.started();
-        let ended = pass(aterm_secrets::converge::WINDOW, work, &note);
+        let ended = pass(aterm_secrets::converge::WINDOW, request, &note);
         let ended_ms = now_ms();
         retry.reaped(ended.last(), ended_ms);
         if said.as_ref() != Some(&ended) {
@@ -162,11 +181,11 @@ fn lane(
         let (cause, moved) = loop {
             match wait(every) {
                 None => return,
-                Some(LaneWake::Network(crate::network_moved::Woke::Timer)) => {
+                Some(LaneWake::Timer) => {
                     let cause = match ended {
                         Ended::Standing => continue,
                         Ended::Ran => {
-                            work = RepositoryWork::Refresh;
+                            request = maintenance;
                             Causes::TIMER
                         }
                         Ended::Unfinished => Causes::RETRY_UNFINISHED,
@@ -174,19 +193,24 @@ fn lane(
                     };
                     break (cause, (MarkMoved::default(), 0));
                 }
-                Some(LaneWake::Network(woke)) => {
-                    work = RepositoryWork::Refresh;
+                Some(LaneWake::Network(woke, observed)) => {
+                    let fresh = RepositoryRequest::Refresh(RefreshRequest::after(None, observed));
+                    request = if ended == Ended::Ran {
+                        fresh
+                    } else {
+                        request.merge(fresh)
+                    };
                     log(&moved_line(woke));
                     break (Causes::NETWORK, (MarkMoved::default(), 0));
                 }
                 Some(LaneWake::Inputs(requested, classes, looks)) => {
-                    // An unfinished request still owes its original stronger policy.
-                    work = if ended == Ended::Ran {
+                    // Keep unfinished work and its original evidence through the next child.
+                    request = if ended == Ended::Ran {
                         requested
                     } else {
-                        work.max(requested)
+                        request.merge(requested)
                     };
-                    let cause = match requested {
+                    let cause = match requested.work() {
                         RepositoryWork::Repair => Causes::INPUT_REPAIR,
                         RepositoryWork::Refresh => Causes::INPUT_REFRESH,
                     };
@@ -216,22 +240,19 @@ fn until_moved(
         // original retry/maintenance deadline while semantic snapshots produce no work.
         let now = std::time::Instant::now();
         if let Some(woke) = moved.take_at(now) {
-            return Some(LaneWake::Network(woke));
+            return Some(LaneWake::network(woke, inputs));
         }
         if deadline.is_some_and(|at| now >= at) {
-            return Some(LaneWake::Network(crate::network_moved::Woke::Timer));
+            return Some(LaneWake::Timer);
         }
         let bell = match wake.arm() {
             Ok(bell) => bell,
             Err(generation) => {
                 let snapshot = inputs.snapshot();
-                let work = snapshot
-                    .repositories
-                    .map(|request| request.work())
-                    .or_else(|| {
-                        (snapshot.identity == aterm_secrets::client::IdentityDebt::Changed)
-                            .then_some(aterm_secrets::converge::RepositoryWork::Repair)
-                    });
+                let work = snapshot.repositories.or_else(|| {
+                    (snapshot.identity == aterm_secrets::client::IdentityDebt::Changed)
+                        .then_some(RepositoryRequest::Repair)
+                });
                 // Retain the semantic debt in this same synchronous lane before releasing
                 // the event generation. Newer events during capture/child stay outstanding.
                 wake.acknowledge(generation);
@@ -243,14 +264,15 @@ fn until_moved(
             }
         };
         match moved.wait_until(&[&bell], deadline) {
-            Ok(Some(woke)) => return Some(LaneWake::Network(woke)),
+            Ok(Some(woke)) => return Some(LaneWake::network(woke, inputs)),
             Ok(None) => continue, // input bell, not cancellation of the lane
             Err(_) => {
-                return Some(LaneWake::Network(moved.wait(
+                let woke = moved.wait(
                     deadline.map_or(every.unwrap_or(crate::secrets_join::MEND_EVERY), |at| {
                         at.saturating_duration_since(std::time::Instant::now())
                     }),
-                )));
+                );
+                return Some(LaneWake::network(woke, inputs));
             }
         }
     }
@@ -327,13 +349,8 @@ impl Ended {
 #[cfg(unix)]
 fn window_pass(
     exe: &std::path::Path,
-) -> impl FnMut(
-    &str,
-    aterm_secrets::converge::RepositoryWork,
-    &aterm_secrets::converge::StartNote,
-) -> Ended
-+ '_ {
-    move |trigger, work, note| pass(exe, trigger, work, note)
+) -> impl FnMut(&str, RepositoryRequest, &aterm_secrets::converge::StartNote) -> Ended + '_ {
+    move |trigger, request, note| pass(exe, trigger, request, note)
 }
 
 /// Run one pass for `trigger` from `exe`, started under `note`
@@ -343,13 +360,13 @@ fn window_pass(
 fn pass(
     exe: &std::path::Path,
     trigger: &str,
-    work: aterm_secrets::converge::RepositoryWork,
+    request: RepositoryRequest,
     note: &aterm_secrets::converge::StartNote,
 ) -> Ended {
     pass_starting(
         || {
             aterm_secrets::converge::noting(note, || {
-                aterm_secrets::converge::start(exe, trigger, work)
+                aterm_secrets::converge::start_requested(exe, trigger, request)
             })
         },
         pass_ended,

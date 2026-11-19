@@ -7,6 +7,24 @@ use std::path::Path;
 use super::{Adoption, Found, Learned, Record, Slot, Vaulted};
 use crate::identity::{LoadError, Source, VaultEntry};
 
+/// A home these tests name and never touch, absolute on this platform: `/h` on unix, `C:\h` on
+/// windows, where a path with no drive is not absolute and so names no token file.
+fn named_home() -> &'static Path {
+    Path::new(if cfg!(windows) { r"C:\h" } else { "/h" })
+}
+
+/// The absolute path `parts` name from the root `named_home` sits in, as agh.toml spells it:
+/// `/h/.secrets/x` on unix.
+fn absolute(parts: &[&str]) -> String {
+    let root = named_home().parent().expect("the root");
+    parts
+        .iter()
+        .fold(root.to_path_buf(), |path, part| path.join(part))
+        .to_str()
+        .expect("UTF-8")
+        .to_string()
+}
+
 fn adopted(slot: Slot, login: &str, fingerprint: &str) -> Vaulted {
     Vaulted {
         slot,
@@ -268,7 +286,7 @@ fn the_subsets_keep_the_most_tokens_dev_first() {
 fn an_absent_token_is_asked_of_the_vault_by_its_entry() {
     use crate::identity::Profile;
     use crate::policy::Tier;
-    let home = Path::new("/h");
+    let home = named_home();
     let named = |text: &str| {
         let source = crate::config::token_source(text, home).expect("a token_file");
         Profile::new("w", source, Tier::Dev)
@@ -277,42 +295,98 @@ fn an_absent_token_is_asked_of_the_vault_by_its_entry() {
         super::token_step(&named("~/.secrets/gh_access_token")),
         Some(Slot::Dev.sync_step())
     );
-    let other = super::token_step(&named("/h/.secrets/gh_access_token_org")).expect("a step");
+    let other = super::token_step(&named(&absolute(&["h", ".secrets", "gh_access_token_org"])))
+        .expect("a step");
     assert!(
         other.starts_with("aterm secrets sync applies the vault's current entries, ")
             && other.contains(" aterm secrets need entry:gh_access_token_org ")
             && !other.contains("~/.secrets"),
         "{other}"
     );
-    assert_eq!(super::token_step(&named("/h/tokens/w.token")), None);
+    assert_eq!(
+        super::token_step(&named(&absolute(&["h", "tokens", "w.token"]))),
+        None
+    );
 }
 
 /// A `token_file` under `~/.secrets` is a vault entry, judged from its text alone; any other path
 /// is a file of the person's own, and a path deeper inside `~/.secrets` names nothing.
 #[test]
 fn a_secrets_path_names_a_vault_entry_and_nothing_else_there() {
-    let home = Path::new("/h");
+    let home = named_home();
     let entry = |name: &str| Some(Source::Entry(VaultEntry::new(name, home)));
     assert_eq!(
         crate::config::token_source("~/.secrets/x", home),
         entry("x")
     );
     assert_eq!(
-        crate::config::token_source("/h/.secrets/x", home),
+        crate::config::token_source(&absolute(&["h", ".secrets", "x"]), home),
         entry("x")
     );
+    let own = absolute(&["h", "tokens", "x"]);
     assert_eq!(
-        crate::config::token_source("/h/tokens/x", home),
-        Some(Source::File("/h/tokens/x".into()))
+        crate::config::token_source(&own, home),
+        Some(Source::File(own.into()))
     );
+    let elsewhere = absolute(&["elsewhere", ".secrets", "x"]);
     assert_eq!(
-        crate::config::token_source("/elsewhere/.secrets/x", home),
-        Some(Source::File("/elsewhere/.secrets/x".into()))
+        crate::config::token_source(&elsewhere, home),
+        Some(Source::File(elsewhere.into()))
     );
     for deeper in ["~/.secrets/a/b", "~/.secrets", "~/.secrets/../x/y"] {
         assert_eq!(crate::config::token_source(deeper, home), None, "{deeper}");
     }
     assert_eq!(crate::config::token_source("relative", home), None);
+}
+
+/// Windows reads a name in any case and `\\?\C:\…` as `C:\…`, and drops a trailing dot or space:
+/// each other spelling of a path in `~/.secrets` is still the vault entry, never a file there,
+/// and one the comparison key cannot place (Windows may resolve it into `~/.secrets`) names
+/// nothing. A path elsewhere in another case stays a file of the person's own.
+#[cfg(windows)]
+#[test]
+fn a_secrets_path_in_another_spelling_is_still_the_vault_entry() {
+    let home = named_home();
+    let entry = |name: &str| Some(Source::Entry(VaultEntry::new(name, home)));
+    for spelled in [
+        r"C:\H\.secrets\gh_access_token",
+        r"c:\h\.SECRETS\gh_access_token",
+        r"\\?\C:\h\.secrets\gh_access_token",
+        r"\\?\c:\H\.Secrets\gh_access_token",
+        "C:/h/.secrets/gh_access_token",
+    ] {
+        assert_eq!(
+            crate::config::token_source(spelled, home),
+            entry("gh_access_token"),
+            "{spelled}"
+        );
+    }
+    for unplaced in [
+        r"C:\h\.secrets.\gh_access_token",
+        r"C:\h\.secrets \gh_access_token",
+        r"C:\h\x\..\.secrets\gh_access_token",
+        r"C:\h\.\.secrets\gh_access_token",
+        r"C:\H\.SECRETS\a\b",
+        r"C:\H\.SECRETS",
+        r"C:\SECRET~1\gh_access_token",
+    ] {
+        assert_eq!(
+            crate::config::token_source(unplaced, home),
+            None,
+            "{unplaced}"
+        );
+    }
+    for own in [
+        r"C:\H\Tokens\x",
+        r"\\?\C:\elsewhere\.secrets\x",
+        r"D:\h\.secrets\x",
+    ] {
+        assert_eq!(
+            crate::config::token_source(own, home),
+            Some(Source::File(own.into())),
+            "{own}"
+        );
+    }
 }
 
 /// A vault entry reads from the store and never from the file an older build wrote under

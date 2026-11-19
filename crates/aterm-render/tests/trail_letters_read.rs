@@ -523,9 +523,10 @@ pub struct Replay {
     pub letters: bool,
     /// Whether each judged letter reads its own reading too ([`Letter::own`]).
     pub own: bool,
-    /// The host's bloom: `Some(unheld)` blooms each frame as the GPU does
+    /// The host's bloom: `Some(unheld)` blooms each frame the replay draws as the GPU does
     /// (`aterm_render::bloom`), over text that holds it too when `unheld`
-    /// (a negative control); `None` draws none, as a CPU frame.
+    /// (a negative control); `None` draws none, as a CPU frame. [`Replay::present`] draws only
+    /// the frames something reads, so a frame nothing reads takes no bloom.
     pub bloom: Option<bool>,
     /// Whether each frame counts the page's pixels it shades ([`Judged::shade`]).
     pub shade: bool,
@@ -535,9 +536,10 @@ pub struct Replay {
     pub rail: bool,
     /// Whether each frame reads the letter under the caret ([`Judged::caret`]).
     pub caret: bool,
-    /// Whether each frame takes the host's post passes as the GUI runs them over the
-    /// over-text stream (`post_process`): the bloom unless the frame holds it, at the page's
-    /// share of its strength, then the SDR crown at the default boost.
+    /// Whether each frame the replay draws takes the host's post passes as the GUI runs them over
+    /// the over-text stream (`post_process`): the bloom unless the frame holds it, at the page's
+    /// share of its strength, then the SDR crown at the default boost. Like the bloom, a frame
+    /// nothing reads is not drawn and takes none.
     pub post: bool,
     /// Whether each frame reads where the companion's body lies ([`Judged::coat`]).
     pub coat: bool,
@@ -1010,20 +1012,42 @@ impl Replay {
             self.fx.set_pet_old_path(law, true);
         }
         self.fx.apply(&mut self.term, &mut input, cw, ch);
-        let mut frame = self.rend.render_input(&input);
-        if let Some(unheld) = self.bloom
-            && (unheld || !input.bloom_gate.held())
-        {
-            aterm_render::bloom::apply(
-                &mut frame,
-                &input.cursor_glow_add,
-                input.rows,
-                aterm_render::bloom::BloomParams::default(),
-            )
-            .expect("the frame blooms");
+        // The frame the effects drew, rendered only where something reads its pixels: the letters,
+        // the caret's letter, the shade, the air, the rail, a kept or dumped frame. Where the
+        // companion lies ([`Replay::coat`]) reads the knock layer's rects, the grid and the clean
+        // twin, none of them this render's, so a replay that reads nothing else draws no frame;
+        // nor does a frame a replay that keeps a few ([`Replay::keep`]) leaves out.
+        let (w, h) = self.rend.frame_size(rows, cols);
+        let reads_frame = self.letters
+            || self.caret
+            || self.shade
+            || self.air
+            || self.rail
+            || self.keep.contains(&self.ms)
+            || self.dump.iter().any(|(at, _)| *at == self.ms);
+        let mut drawn = reads_frame.then(|| self.rend.render_input(&input));
+        if let Some(frame) = drawn.as_mut() {
+            assert_eq!(
+                (frame.width, frame.height),
+                (w, h),
+                "fixture: the frame is the renderer's frame size"
+            );
+            if let Some(unheld) = self.bloom
+                && (unheld || !input.bloom_gate.held())
+            {
+                aterm_render::bloom::apply(
+                    frame,
+                    &input.cursor_glow_add,
+                    input.rows,
+                    aterm_render::bloom::BloomParams::default(),
+                )
+                .expect("the frame blooms");
+            }
         }
-        let place = self.rend.fx_frame(frame.width, frame.height, rows);
-        if self.post {
+        let place = self.rend.fx_frame(w, h, rows);
+        if self.post
+            && let Some(frame) = drawn.as_mut()
+        {
             use aterm_render::{bloom, hdr};
             let bg = self.look.bg;
             // The GPU's bloom source (`fx_gpu::bloom_source`): the over-text stream with each
@@ -1082,12 +1106,12 @@ impl Replay {
                         strength: bloom::BLOOM_STRENGTH * hdr::light_page_bloom_share(bg),
                         radius: bloom::BLOOM_RADIUS,
                     };
-                    bloom::apply_kept_off(&mut frame, blur, input.rows, params, mask.as_ref())
+                    bloom::apply_kept_off(frame, blur, input.rows, params, mask.as_ref())
                         .expect("the frame blooms");
                 }
             }
             let budget = hdr::sdr_glow_budget(hdr::packed_luma(bg), SDR_BOOST);
-            bloom::sdr_crown(&mut frame, crown, input.rows, budget).expect("the frame is crowned");
+            bloom::sdr_crown(frame, crown, input.rows, budget).expect("the frame is crowned");
         }
         let mut coat = Coat::default();
         if self.coat {
@@ -1163,8 +1187,6 @@ impl Replay {
                     })
                 };
                 let page = self.look.bg & 0x00FF_FFFF;
-                let w = frame.width;
-                let h = frame.pixels.len() / w;
                 let clean = &self.clean.as_ref().expect("rendered above").px;
                 let off_page = |c: u32| {
                     [16u32, 8, 0].iter().any(|&sh| {
@@ -1228,9 +1250,11 @@ impl Replay {
         }
         if let Some(i) = self.dump.iter().position(|(at, _)| *at == self.ms) {
             let (_, path) = self.dump.remove(i);
+            let frame = drawn.as_ref().expect("fixture: a dumped frame is drawn");
             std::fs::write(&path, frame.to_png()).expect("dump");
         }
         if self.keep.contains(&self.ms) {
+            let frame = drawn.as_ref().expect("fixture: a kept frame is drawn");
             let kept = Kept {
                 ms: self.ms,
                 px: frame.pixels.clone(),
@@ -1249,13 +1273,14 @@ impl Replay {
                 None => self.kept.push(kept),
             }
         }
-        let w = frame.width;
+        // Read only by the readers that draw the frame (`reads_frame`).
+        let px: &[u32] = drawn.as_ref().map_or(&[], |f| &f.pixels);
         let CleanFrame {
             px: clean, plans, ..
         } = self.clean.as_mut().expect("rendered above");
         let clean = &*clean;
         let pair = Pair {
-            frame: &frame.pixels,
+            frame: px,
             clean,
             w,
             cw,
@@ -1317,8 +1342,7 @@ impl Replay {
         if self.shade {
             let page = self.look.bg & 0x00FF_FFFF;
             let bar = SHADE_SHARE * luma(page);
-            shade = frame
-                .pixels
+            shade = px
                 .iter()
                 .zip(clean.iter())
                 .filter(|&(&f, &c)| c & 0x00FF_FFFF == page && luma(f & 0x00FF_FFFF) < bar)
@@ -1339,9 +1363,9 @@ impl Replay {
                         continue;
                     }
                     let (x0, y0) = (col * cw, row * ch);
-                    for y in y0..(y0 + ch).min(frame.pixels.len() / w) {
+                    for y in y0..(y0 + ch).min(h) {
                         for x in x0..(x0 + cw).min(w) {
-                            let (f, c) = (frame.pixels[y * w + x], clean[y * w + x]);
+                            let (f, c) = (px[y * w + x], clean[y * w + x]);
                             if c & 0x00FF_FFFF == page && luma(f & 0x00FF_FFFF) > bar {
                                 air += 1;
                             }
@@ -1353,7 +1377,6 @@ impl Replay {
         let mut rail = Vec::new();
         if self.rail {
             let (row, col) = caret;
-            let h = frame.pixels.len() / w;
             let band = (
                 (row + 1) * ch + RAIL_BAND.start,
                 (row + 1) * ch + RAIL_BAND.end,
@@ -1381,7 +1404,7 @@ impl Replay {
                         .clone()
                         .map(|dy| top + dy)
                         .filter(|&y| y < h)
-                        .map(|y| lift(frame.pixels[y * w + x], clean[y * w + x]))
+                        .map(|y| lift(px[y * w + x], clean[y * w + x]))
                         .max()
                         .unwrap_or(0),
                 );

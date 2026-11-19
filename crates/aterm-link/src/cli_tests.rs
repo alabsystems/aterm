@@ -452,3 +452,41 @@ fn a_symlinked_token_file_is_refused() {
         "the symlink was followed: {refused:?}"
     );
 }
+
+/// **THE BROKER VERB KEEPS THE FILES ITS JOB'S DEFINITIONS NAME.** `aterm link broker <root>/bus.sock`
+/// hands `aterm_uds::job_log::keep` `<root>/broker.out` and `<root>/broker.err` as soon as it knows
+/// its socket, before anything it checks can fail: driven here to a lifeline that is no
+/// descriptor, it ends as a usage error having asked for exactly the files the plist names, which
+/// hold the unit's. Serving takes what that kept (`serve_broker`), so the verb cannot skip it.
+/// NEGATIVE CONTROL: a broker on a relative socket (no root of a job) hands `keep` nothing; a
+/// test's run keeps nothing (its output is not those files).
+#[test]
+fn the_broker_verb_keeps_the_files_its_jobs_definitions_name() {
+    use aterm_uds::job_log::seam;
+    let root = std::path::PathBuf::from("/nonexistent/aterm-fabric-job-log");
+    let p = crate::enable::Paths {
+        home: "/Users//example".into(),
+        login_home: None,
+        root: root.clone(),
+        aterm: "/Users//example/.local/bin/aterm".to_string(),
+        fleet: "local".to_string(),
+        config: None,
+        rendezvous: None,
+        durability: None,
+    };
+    let sock = root.join("bus.sock").to_string_lossy().into_owned();
+    let words = |sock: &str| vec![sock.to_string(), "--lifeline-fd".into(), "x".into()];
+    assert_eq!(seam::asked(), None);
+    assert_eq!(broker(&words("bus.sock")), ExitCode::from(2));
+    assert_eq!(seam::asked(), Some(vec![]), "a relative socket is no job's");
+    assert_eq!(broker(&words(&sock)), ExitCode::from(2));
+    let asked = seam::asked().expect("the broker asked to keep its log");
+    assert_eq!(asked, seam::plist_outputs(&p.plist_text()).files());
+    let unit = seam::unit_outputs(&p.unit_text()).files();
+    assert!(!unit.is_empty() && unit.iter().all(|file| asked.contains(file)));
+    let kept = crate::enable::keep_broker_log(&sock);
+    assert!(
+        !kept.stdout() && !kept.stderr(),
+        "a test's output is no job log"
+    );
+}

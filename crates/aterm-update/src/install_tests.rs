@@ -5503,7 +5503,18 @@ fn with_automatic_checks_off_the_launch_sweep_takes_each_left_bundle_once_its_ho
             },
         )
     };
-    crate::spawn_background_check_in(false, &sweep, 1, std::sync::Arc::new(|| None), None, None);
+    crate::spawn_background_check_in(
+        false,
+        &sweep,
+        1,
+        std::sync::Arc::new(|| None),
+        None,
+        None,
+        crate::Wakes {
+            sleeps: crate::Sleeps::Unheard,
+            network: None,
+        },
+    );
     // The sweep's thread now holds the only `sleep`, so its channel closes when it ends.
     drop(sweep);
 

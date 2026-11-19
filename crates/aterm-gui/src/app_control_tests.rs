@@ -102,6 +102,8 @@ fn a_split_native_views_viewport_is_below_its_subtab_title_row() {
 
 #[test]
 fn wire_requests_become_stable_owned_targets() {
+    assert_eq!(parse_open("app tables").unwrap(), OpenRequest::Tables);
+    assert_eq!(parse_open("app aRegistry").unwrap(), OpenRequest::Registry);
     assert_eq!(parse_open("app about").unwrap(), OpenRequest::About);
     assert_eq!(
         parse_open("app system-state").unwrap(),
@@ -1876,4 +1878,414 @@ fn the_control_surface_refuses_only_cloud_storage_opens() {
     }
     let cloud = uri(&home.join("Library/CloudStorage/provider/notes.md"));
     assert!(crate::App::refuse_file_provider_open_in(&cloud, None).is_ok());
+}
+
+/// ONLY A PERSON'S PRESS STARTS CPU POLICY FROM THE PAGE: the System Resources page's Collect CPU
+/// Policy is refused to `act` by its prefix and to a control client's click as it is dispatched,
+/// each in the row's words, and starts nothing; a person's own press of it starts one collection,
+/// bound to the page's view, after which the page draws Collect idle and Cancel live, and a
+/// person's Cancel ends it.
+/// CONTROL: an action id outside the prefix, the CPU document's Copy, is pressed by `act` and is
+/// no person-only press of a control client's.
+#[cfg(target_os = "macos")]
+#[test]
+fn only_a_persons_press_starts_cpu_policy_from_the_page() {
+    use crate::cpu_policy_authorization::{Origin, active_for_test, slot_for_test};
+    use crate::native_app::ActionInvocation;
+    use crate::native_resources::{CPU_POLICY_CANCEL, CPU_POLICY_COLLECT, CPU_POLICY_PREFIX};
+    const WID: WindowId = WindowId(0);
+    const WORDS: &str = "System Resources ▸ CPU's policy buttons";
+    let _slot = slot_for_test();
+    let mut app = App::headless_for_test();
+    app.open_resources_tab().expect("the page opens");
+    app.vitals.snapshot = Some(std::sync::Arc::new(crate::stats_deck::tests::snapshot()));
+    app.publish_resources();
+    let (_, view) = app.active_native_view(WID).expect("the page is in front");
+    let enabled = |app: &App, key: &str| {
+        app.compiled_native_ui(WID)
+            .expect("the page compiles")
+            .semantic(&UiKey::new(key))
+            .unwrap_or_else(|| panic!("the page draws {key}"))
+            .state
+            .is_none_or(|state| state.enabled)
+    };
+    assert!(
+        enabled(&app, CPU_POLICY_COLLECT) && !enabled(&app, CPU_POLICY_CANCEL),
+        "PRECONDITION: Collect is live and Cancel idle"
+    );
+
+    let refused = app
+        .act_app(ActRequest {
+            view,
+            ui_key: CPU_POLICY_COLLECT.into(),
+            action: CPU_POLICY_COLLECT.into(),
+            value: None,
+        })
+        .expect_err("act presses no CPU policy button");
+    assert!(
+        refused.contains(WORDS) && refused.contains("in the window"),
+        "{refused}"
+    );
+    assert!(!app.cpu_policy_pending(), "act starts nothing");
+
+    let press = |app: &mut App| {
+        app.dispatch_native_control_action(
+            WID,
+            view,
+            UiKey::new(CPU_POLICY_COLLECT),
+            ActionInvocation {
+                id: ActionId::new(CPU_POLICY_COLLECT),
+                value: None,
+            },
+            false,
+        )
+    };
+    let refused = app
+        .with_controller_mark(true, press)
+        .expect_err("a control client's click is refused");
+    assert!(
+        refused.contains(WORDS) && refused.contains("person's own click or key"),
+        "{refused}"
+    );
+    assert!(
+        !app.cpu_policy_pending(),
+        "a control client's click starts nothing"
+    );
+
+    let copy = "resources/doc/cpu/copy";
+    assert!(!copy.starts_with(CPU_POLICY_PREFIX));
+    assert!(
+        app.act_app(ActRequest {
+            view,
+            ui_key: copy.into(),
+            action: copy.into(),
+            value: None,
+        })
+        .is_ok(),
+        "CONTROL: act presses the CPU document's Copy"
+    );
+    assert_eq!(
+        app.with_controller_mark(true, |app| app
+            .person_only_press_refusal(&ActionId::new(copy))),
+        None,
+        "CONTROL: Copy is no person-only press"
+    );
+
+    assert_eq!(press(&mut app), Ok(EventResult::Handled));
+    assert!(
+        app.cpu_policy_pending(),
+        "a person's press starts the collection"
+    );
+    assert_eq!(
+        active_for_test().map(|op| op.origin().clone()),
+        Some(Origin::View { window: WID, view }),
+        "bound to the page's view"
+    );
+    assert!(
+        !enabled(&app, CPU_POLICY_COLLECT) && enabled(&app, CPU_POLICY_CANCEL),
+        "while it is pending Collect is idle and Cancel live"
+    );
+
+    let op = active_for_test().expect("the page's operation");
+    assert_eq!(
+        app.dispatch_native_control_action(
+            WID,
+            view,
+            UiKey::new(CPU_POLICY_CANCEL),
+            ActionInvocation {
+                id: ActionId::new(CPU_POLICY_CANCEL),
+                value: None,
+            },
+            false,
+        ),
+        Ok(EventResult::Handled)
+    );
+    assert!(
+        op.cancelled_for_test(),
+        "a person's Cancel ends the collection"
+    );
+}
+
+/// A MACOS CONFIGURATION ACTION IS A PERSON'S AND RUNS ITS STEP: the System Resources page's
+/// Apply… of a row (Power and sleep, on a fixture ALab Mac that sleeps after 10 minutes) is
+/// refused to `act` by its prefix, and to a control client's click and an accessibility client's
+/// press as they are dispatched, each in the section's words, and starts nothing; a person's own
+/// press starts one root step bound to the page's view, whose sudo runs this aterm's `machines
+/// here apply --plain --only power`, and whose password request raises the (headless) sheet on
+/// the page's window, standing for the view, in words that name the power change.
+/// CONTROLS: an action outside the prefix (the CPU document's Copy) is no person-only press; the
+/// page behind a terminal tab refuses the step by the view's admission, and bringing the terminal
+/// in front withdrew the sheet and cancelled the step.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_macos_configuration_action_is_a_persons_and_runs_its_step() {
+    use crate::askpass::AskpassRequest;
+    use crate::askpass_sheet::SheetOrigin;
+    use crate::cpu_policy_authorization::{Origin, Refusal, read_identity, slot_for_test};
+    use crate::native_app::ActionInvocation;
+    use crate::native_resources::MACOS_APPLY_PREFIX;
+    use crate::resources_macos::MacosPage;
+    use crate::root_step_authorization::{
+        OwnedOperation, active_for_test, sudo_args, vacate_for_test,
+    };
+    use aterm_types::macos_setup::root_only::Step;
+    use std::sync::Arc;
+    const WID: WindowId = WindowId(0);
+    const WORDS: &str = "System Resources ▸ macOS configuration's buttons";
+    let _slot = slot_for_test();
+    vacate_for_test();
+    let mut app = App::headless_for_test();
+    let terminal = app.windows[&WID].tab_set.active().expect("a tab").id;
+    app.open_resources_tab().expect("the page opens");
+    let (instance, view) = app.active_native_view(WID).expect("the page is in front");
+    app.native_runtime.publish_resources(
+        instance,
+        Arc::new(crate::resources_macos::tests::snapshot(
+            crate::resources_macos::tests::UNDER,
+        )),
+        None,
+    );
+    app.native_runtime.resources_macos(
+        instance,
+        MacosPage {
+            reading: Some((Arc::new(crate::resources_macos::tests::differing()), 1)),
+            alab: true,
+            pending: None,
+            said: None,
+        },
+    );
+    let apply = format!("{MACOS_APPLY_PREFIX}power");
+    assert!(
+        app.compiled_native_ui(WID)
+            .expect("the page compiles")
+            .semantic(&UiKey::new(apply.clone()))
+            .is_some(),
+        "PRECONDITION: the page offers Apply… for Power and sleep"
+    );
+
+    let refused = app
+        .act_app(ActRequest {
+            view,
+            ui_key: apply.clone(),
+            action: apply.clone(),
+            value: None,
+        })
+        .expect_err("act presses no macOS configuration button");
+    assert!(
+        refused.contains(WORDS) && refused.contains("in the window"),
+        "{refused}"
+    );
+    assert!(active_for_test().is_none(), "act starts nothing");
+
+    let press = |app: &mut App| {
+        app.dispatch_native_control_action(
+            WID,
+            view,
+            UiKey::new(apply.clone()),
+            ActionInvocation {
+                id: ActionId::new(apply.clone()),
+                value: None,
+            },
+            false,
+        )
+    };
+    for refused in [
+        app.with_controller_mark(true, press)
+            .expect_err("a control client's click is refused"),
+        app.with_assistive_source(press)
+            .expect_err("an accessibility client's press is refused"),
+    ] {
+        assert!(
+            refused.contains(WORDS) && refused.contains("person's own click or key"),
+            "{refused}"
+        );
+    }
+    assert!(
+        active_for_test().is_none(),
+        "no client's press starts a step"
+    );
+
+    let copy = "resources/doc/cpu/copy";
+    assert!(!copy.starts_with(MACOS_APPLY_PREFIX));
+    assert_eq!(
+        app.with_controller_mark(true, |app| app
+            .person_only_press_refusal(&ActionId::new(copy))),
+        None,
+        "CONTROL: Copy is no person-only press"
+    );
+
+    assert_eq!(press(&mut app), Ok(EventResult::Handled));
+    let op = active_for_test().expect("a person's press starts the step");
+    assert_eq!(op.step(), Step::Power);
+    assert_eq!(app.root_step_pending(), Some(Step::Power));
+    let exe = std::path::Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+    assert_eq!(
+        sudo_args(exe, op.step(), None),
+        [
+            "-k",
+            "-A",
+            "--",
+            "/Applications/aterm.app/Contents/MacOS/aterm",
+            "machines",
+            "here",
+            "apply",
+            "--plain",
+            "--only",
+            "power",
+        ]
+        .map(std::ffi::OsString::from),
+        "sudo runs this aterm's compiled single-step plan"
+    );
+
+    // The worker binds the sudo it spawned before sudo may ask; this process stands in for it.
+    op.bind_sudo_for_test(read_identity(std::process::id()).expect("this process reads"));
+    let (owned, ticket) = crate::root_step_authorization::request(std::process::id() as i32)
+        .expect("the bound sudo's one request")
+        .expect("this root step's");
+    let (reply, answer) = std::sync::mpsc::channel();
+    let owned = OwnedOperation::RootStep(owned);
+    let (message, details) = owned.sheet_words();
+    assert!(
+        message.contains("power and sleep settings") && details.contains("--only power"),
+        "{message} / {details}"
+    );
+    app.present_askpass_sheet(AskpassRequest {
+        ticket: Arc::clone(&ticket),
+        attribute_from: 0,
+        owned: Some(owned),
+        exact: false,
+        command: "aterm machines here apply --plain --only power".into(),
+        purpose: None,
+        invoker: "System Resources".into(),
+        reply,
+    });
+    assert!(
+        matches!(answer.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "the sheet is raised, not refused"
+    );
+    assert_eq!(
+        app.askpass_sheet
+            .as_ref()
+            .map(|sheet| sheet.origin_for_test()),
+        Some((WID, SheetOrigin::View(view))),
+        "it hangs on the page's window and stands for its view"
+    );
+    assert_eq!(
+        active_for_test().map(|op| op.origin_for_test()),
+        Some(Origin::View { window: WID, view })
+    );
+
+    let back = app.windows[&WID]
+        .tab_set
+        .tabs()
+        .iter()
+        .position(|tab| tab.id == terminal)
+        .expect("the terminal tab");
+    app.switch_tab_in(WID, back);
+    assert!(
+        app.askpass_sheet.is_none(),
+        "CONTROL: the sheet goes with the view"
+    );
+    assert!(
+        op.cancelled_for_test(),
+        "CONTROL: and the step is cancelled"
+    );
+    vacate_for_test();
+    assert_eq!(
+        app.start_root_step(WID, view, Step::Power, None),
+        Err(Refusal::NotInFront),
+        "CONTROL: the page behind a terminal tab starts no step"
+    );
+    assert!(active_for_test().is_none());
+}
+
+/// ONLY A PERSON'S PRESS RUNS A SPOTLIGHT CONTROL (SD-96): each of the Spotlight document's
+/// buttons (Apply scope…, Pause and Resume indexing, Rebuild index…, Keep a folder out…), live on a
+/// page whose scope and indexing give it work, is refused to `act` by its prefix in the row's
+/// words, and to a control client's click, an accessibility client's press and a relayed press as
+/// they are dispatched, starting nothing; a person's own press of it starts its root step.
+/// CONTROL: an action outside the prefix (the CPU document's Copy) is no person-only press, and
+/// `act` handles it.
+#[cfg(target_os = "macos")]
+#[test]
+fn only_a_persons_press_runs_a_spotlight_control() {
+    use crate::app_resources::tests::{applied, press_spotlight, spotlight_page, unapplied};
+    use crate::cpu_policy_authorization::slot_for_test;
+    use crate::native_resources::{SPOTLIGHT_CONTROL_PREFIX, spotlight_control_word};
+    use crate::root_step_authorization::{active_for_test, vacate_for_test};
+    use aterm_types::macos_setup::root_only::Step;
+    use aterm_vitals::spotlight::Indexing;
+    const WORDS: &str = "System Resources ▸ Spotlight's buttons";
+    let _slot = slot_for_test();
+    vacate_for_test();
+    let cases: [(
+        Step,
+        fn() -> crate::resources_spotlight::ScopeListing,
+        Indexing,
+    ); 5] = [
+        (Step::SpotlightScope, unapplied, Indexing::Enabled),
+        (Step::SpotlightPause, applied, Indexing::Enabled),
+        (Step::SpotlightResume, applied, Indexing::Disabled),
+        (Step::SpotlightRebuild, applied, Indexing::Enabled),
+        (Step::SpotlightKeepOut, applied, Indexing::Enabled),
+    ];
+    for (step, list, data) in cases {
+        let mut app = App::headless_for_test();
+        app.folder_picker = |_, _| Some(std::path::PathBuf::from("/Users//t/Desktop/Shots"));
+        let view = spotlight_page(&mut app, list, data, None);
+        let id = format!("{SPOTLIGHT_CONTROL_PREFIX}{}", spotlight_control_word(step));
+        assert!(
+            app.compiled_native_ui(WindowId(0))
+                .expect("the page compiles")
+                .semantic(&UiKey::new(id.clone()))
+                .is_some(),
+            "PRECONDITION: the page offers {id}"
+        );
+        let refused = app
+            .act_app(ActRequest {
+                view,
+                ui_key: id.clone(),
+                action: id.clone(),
+                value: None,
+            })
+            .expect_err("act presses no Spotlight button");
+        assert_eq!(Some(refused.clone()), super::person_only_refusal(&id));
+        assert!(
+            refused.contains(WORDS) && refused.contains("in the window"),
+            "{refused}"
+        );
+        let press = |app: &mut App| press_spotlight(app, view, step);
+        for refused in [
+            app.with_controller_mark(true, press)
+                .expect_err("a control client's click is refused"),
+            app.with_assistive_source(press)
+                .expect_err("an accessibility client's press is refused"),
+            app.with_origin_mark(aterm_window::event::InputOrigin::Relayed, press)
+                .expect_err("a relayed press is refused"),
+        ] {
+            assert!(
+                refused.contains(WORDS) && refused.contains("person's own click or key"),
+                "{refused}"
+            );
+        }
+        assert!(
+            active_for_test().is_none(),
+            "{step:?}: no client's press runs it"
+        );
+        assert_eq!(press(&mut app), Ok(EventResult::Handled));
+        assert_eq!(
+            active_for_test().map(|op| op.step()),
+            Some(step),
+            "{step:?}: a person's press runs it"
+        );
+        vacate_for_test();
+    }
+
+    let copy = "resources/doc/cpu/copy";
+    assert!(!copy.starts_with(SPOTLIGHT_CONTROL_PREFIX));
+    assert_eq!(
+        super::person_only_refusal(copy),
+        None,
+        "CONTROL: Copy is no person-only press"
+    );
 }

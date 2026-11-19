@@ -25,7 +25,7 @@ use crate::stats_plan::{
     DeckSizePref, FOLD_GAUGE_R, FoldedGauge, FullKind, FullPlan, GaugeSlot, HeaderPlan, HeaderText,
     KeyItem, Label, Meter, Rows, StateLabel, Strip,
 };
-use crate::stats_skyline::{self as skyline, BoxValue, Skyline};
+use crate::stats_skyline::{self as skyline, BoxHeat, BoxValue, Skyline};
 use crate::stats_steam as steam;
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
@@ -39,12 +39,17 @@ const SLOT_FOOT: f64 = 6.0;
 /// paints ([`DeckRows::PAINTED`]), four each until A4's step N5 paints five (73.5 pt).
 pub(crate) const FOLDED_PT: f64 = DeckRows::PAINTED.folded_pt();
 
+/// The Full table's height in points, as the deck paints it where no terminal cells hold it (the
+/// System Resources page's head): the same planner call [`FOLDED_PT`] reads, so the rows the
+/// planner adds reach the page with no page edit.
+pub(crate) const FULL_PT: f64 = DeckRows::PAINTED.full_table_pt();
+
 /// Which form the stats bars take (`[sys] stats_bars`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum StatsBars {
     /// The three bars at full size under the titlebar (the default).
     Deck,
-    /// The three bars as light lanes in the window's bottom pad: no terminal row, ever.
+    /// Compact resource lanes below the titlebar.
     Sill,
     /// No bars.
     Off,
@@ -95,17 +100,12 @@ impl StatsBars {
     pub(crate) const fn shown(self) -> bool {
         !matches!(self, Self::Off)
     }
-
-    /// Whether the form takes room from the grid: the Deck's band in the head.
-    pub(crate) const fn takes_room(self) -> bool {
-        matches!(self, Self::Deck)
-    }
 }
 
 /// The Deck's height in device pixels at `scale` in the window's form `deck`, or 0 when the
 /// Deck is not the stats bars' form.
 pub(crate) fn deck_px(form: StatsBars, deck: DeckForm, scale: f64, cell_px: usize) -> usize {
-    if !(form.takes_room() && scale.is_finite() && scale > 0.0) {
+    if !(form == StatsBars::Deck && scale.is_finite() && scale > 0.0) {
         return 0;
     }
     let folded = (FOLDED_PT * scale).round() as usize;
@@ -129,12 +129,13 @@ pub(crate) fn reserved_deck_px(
     scale: f64,
     cell_px: usize,
 ) -> usize {
-    deck_px(form, deck, scale, cell_px)
-        + if form.takes_room() && scale.is_finite() && scale > 0.0 {
-            bands_px(scale)
-        } else {
-            0
+    match form {
+        StatsBars::Deck if scale.is_finite() && scale > 0.0 => {
+            deck_px(form, deck, scale, cell_px) + bands_px(scale)
         }
+        StatsBars::Sill => crate::stats_sill::compact_height(scale),
+        _ => 0,
+    }
 }
 
 /// An attached window's chrome headroom in device pixels.
@@ -358,8 +359,7 @@ impl crate::App {
 pub(crate) struct DeckGeom {
     /// Card width (the frame's width).
     pub(crate) w: f32,
-    /// Card height ([`deck_px`], or for the sill the bottom pad less the
-    /// drop-target border, [`crate::stats_sill::sill_card_px`]).
+    /// Height of the resource panel in device pixels.
     pub(crate) h: f32,
     /// The window's side pad.
     pub(crate) pad: f32,
@@ -381,6 +381,9 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) network_target: crate::network_deck::Target,
     /// The span the Disk close-up's used-space chart draws (Tab).
     pub(crate) disk_span: crate::stats_lens::DiskSpan,
+    /// Whether the App's CPU policy collection is pending: the CPU card's key line says so in
+    /// place of the key that starts one. Only a surface that takes the CPU keys draws that line.
+    pub(crate) cpu_policy_pending: bool,
     /// The lab's account rows ([`crate::lab_deck`]), drawn on the network band's Shared State
     /// line; absent where the network band is.
     pub(crate) lab: Option<&'a crate::lab_deck::LabDeck>,
@@ -440,7 +443,7 @@ const STRIP_SPECS: [MultiScaleSpec; 4] = [
 /// a strip's boxes cut from the last minute's readings ([`ResourceView::heat_multi_scale`]):
 /// three of the background cadence, v2 §5.4's gap rule, so a strip read while aterm was behind
 /// other apps keeps its readings and a longer gap stays unread.
-const SLOT_COVER_MS: i64 = 15_000;
+const SLOT_COVER_MS: i64 = aterm_vitals::model::STRIP_COVER_MS;
 
 /// The scope bar's segments as shares of the row's capacity (§6), each
 /// `0..=1`.
@@ -566,6 +569,10 @@ mod event_buffer_tests;
 #[path = "stats_slot_rect_tests.rs"]
 mod slot_rect_tests;
 
+#[cfg(test)]
+#[path = "stats_history_tests.rs"]
+mod history_tests;
+
 /// Everything one row draws, read from the snapshot.
 #[derive(Clone, Debug, PartialEq)]
 struct RowWords {
@@ -578,6 +585,9 @@ struct RowWords {
     /// `heat_now`.
     live_peak: Option<f32>,
     live_over: f32,
+    /// The live box's state ([`aterm_vitals::model::HeatCell::state`]): a held amount's % takes
+    /// its ink ([`holds_amount`]).
+    live_state: Option<State>,
     pct: Txt,
     /// The sentence in the strip's place (§6.2, §6.6), or "reading…": its
     /// forms, longest first (rule F).
@@ -760,6 +770,7 @@ impl DeckWords {
                 heat_now: None,
                 live_peak: None,
                 live_over: 0.0,
+                live_state: None,
                 pct: Txt::new(words::pct(None), m),
                 strip_text: Some(vec![Txt::new("reading\u{2026}", m)]),
                 multi_scale: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
@@ -837,6 +848,13 @@ impl RowWords {
             clauses(words::details(res, snap, loc)),
         ];
         let (live_peak, live_over) = view.live_box(snap.at_unix_ms);
+        let multi_scale = STRIP_SPECS.map(|spec| {
+            view.heat_multi_scale(spec, snap.at_unix_ms, SLOT_COVER_MS, &snap.time_gaps)
+        });
+        let live_state = multi_scale[0]
+            .iter()
+            .find(|s| s.slot.is_live_now)
+            .map_or(view.state, |s| s.cell.state);
         Self {
             res,
             name: Txt::new(words::resource_name(res), m),
@@ -844,17 +862,23 @@ impl RowWords {
             heat_now: view.heat_now.filter(|h| !h.is_nan()),
             live_peak: live_peak.filter(|h| !h.is_nan()),
             live_over,
+            live_state,
             pct: Txt::new(words::pct(view.heat_now), m),
             strip_text,
-            multi_scale: STRIP_SPECS.map(|spec| {
-                view.heat_multi_scale(spec, snap.at_unix_ms, SLOT_COVER_MS, &snap.time_gaps)
-            }),
+            multi_scale,
             bar: bar_fill(res, &view, snap, panes),
             run,
             state,
             details,
         }
     }
+}
+
+/// Whether `res` holds an amount rather than measuring a rate of work: Memory and Disk, whose
+/// strip boxes and % take their ink from the row's state, not its level (SD-80). A full but calm
+/// disk or memory is quiet; CPU, GPU, Network, Tokens and Processes keep the heat ramp.
+const fn holds_amount(res: Resource) -> bool {
+    matches!(res, Resource::Memory | Resource::Disk)
 }
 
 /// The scope bar's fills, 0.144.0's as main draws them (the owner, 2026-10-26: "the bar of "this
@@ -1473,9 +1497,10 @@ impl<'a> Deck<'a> {
         }
     }
 
-    /// One row's strip: every box by [`skyline::skyline_box`], the live box's column the 10 s
+    /// One row's strip: every box by [`skyline::skyline_box_in`], the live box's column the 10 s
     /// mean `live.0` (the %), its tick the 10 s max and its cap the 10 s over share (`live.1`,
-    /// [`ResourceView::live_box`]); a gap's box its gap mark.
+    /// [`ResourceView::live_box`]); a gap's box its gap mark. A `held` amount's boxes take the
+    /// ink of their state ([`BoxHeat::State`]), every other row's the heat of their height.
     fn strip(
         &mut self,
         strip: &Strip,
@@ -1483,6 +1508,7 @@ impl<'a> Deck<'a> {
         cell_h: f64,
         slots: &[HeatSlot],
         live: (Option<f32>, BoxValue),
+        held: bool,
     ) {
         let cap_room = self.cap_room();
         self.note(
@@ -1508,6 +1534,13 @@ impl<'a> Deck<'a> {
         let band = fine_band_slots(&spec_slots).unwrap_or(0..0);
         let clip = (lag != 0.0).then(|| self.fine_band_span(strip)).flatten();
         let mut clipped = false;
+        let heat = |slot: &HeatSlot| {
+            if held {
+                BoxHeat::State(slot.cell.state)
+            } else {
+                BoxHeat::Height
+            }
+        };
         for &(idx, x, cw, is_live_now) in &rects {
             if is_live_now {
                 continue;
@@ -1539,7 +1572,14 @@ impl<'a> Deck<'a> {
                 max: slot_data.cell.max,
                 over: slot_data.cell.over,
             };
-            let sky = skyline::skyline_box((x, y, cw, h), value, self.s, &self.inks, self.ic);
+            let sky = skyline::skyline_box_in(
+                (x, y, cw, h),
+                value,
+                heat(&slot_data),
+                self.s,
+                &self.inks,
+                self.ic,
+            );
             self.skyline(&sky, radius);
             self.note_cap(sky.cap, if clipped { clip } else { None }, band_of(idx));
         }
@@ -1554,7 +1594,14 @@ impl<'a> Deck<'a> {
                 max: live_box.max.or(slot_data.cell.max),
                 over: live_box.over,
             };
-            let mut sky = skyline::skyline_box((x, y, cw, h), value, self.s, &self.inks, self.ic);
+            let mut sky = skyline::skyline_box_in(
+                (x, y, cw, h),
+                value,
+                heat(&slot_data),
+                self.s,
+                &self.inks,
+                self.ic,
+            );
             // A live box whose readings stopped draws its marks toward the ground.
             if !self.live.fresh {
                 let ground = self.inks.ground;
@@ -2350,11 +2397,18 @@ impl<'a> Deck<'a> {
                     max: row.live_peak,
                     over: row.live_over,
                 };
-                self.strip(&t.strip, top, rows.cell, slots, (live_heat, live_box));
+                let held = holds_amount(row.res);
+                self.strip(&t.strip, top, rows.cell, slots, (live_heat, live_box), held);
             }
         }
         if let Some(col) = t.pct {
+            // A held amount's % follows its live box: words at rest, its state's words in one.
             let (ink, bold) = match row.heat_now {
+                Some(_) if holds_amount(row.res) => match row.live_state {
+                    Some(State::Critical) => (self.inks.critical_text, true),
+                    Some(State::Warn) => (self.inks.warn_text, true),
+                    _ => (self.inks.words, true),
+                },
                 Some(h) => (self.inks.heat_text[usize::from(ink::heat_step(h))], true),
                 None => (self.inks.words2, false),
             };
@@ -3303,9 +3357,40 @@ pub(crate) fn prims_fp(prims: &[DrawPrim]) -> u64 {
     state.finish() | 1
 }
 
+/// The visible resource surface in window pixels. Only the top band crosses side columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResourceSpan {
+    pub(crate) x: i64,
+    pub(crate) width: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StripCrop {
+    source_x: u32,
+    frame_x: u32,
+    width: u32,
+}
+
+impl ResourceSpan {
+    /// The intersection of the window-space strip and the renderer's terminal frame.
+    fn frame_crop(self, frame_x: i64, frame_w: u32) -> Option<StripCrop> {
+        if self.x == frame_x && self.width == frame_w {
+            return None;
+        }
+        let start = self.x.max(frame_x);
+        let end = (self.x + i64::from(self.width)).min(frame_x + i64::from(frame_w));
+        Some(StripCrop {
+            source_x: (start - self.x).clamp(0, i64::from(self.width)) as u32,
+            frame_x: (start - frame_x).clamp(0, i64::from(frame_w)) as u32,
+            width: end.saturating_sub(start).max(0) as u32,
+        })
+    }
+}
+
 /// The stats card's inputs for a window, read off the App.
 pub(crate) struct DeckFrame {
     pub(crate) form: StatsBars,
+    pub(crate) span: ResourceSpan,
     pub(crate) network_place: Option<crate::network_deck::PlaceCaption>,
     /// The sill's plate alpha ([`DeckInput::plate`]).
     pub(crate) plate: Option<u8>,
@@ -3346,10 +3431,36 @@ impl crate::App {
             .saturating_add(self.win_pad(wid))
     }
 
+    /// Horizontal bounds of the full or compact resource header in client pixels.
+    pub(crate) fn resource_span(&self, wid: crate::WindowId, form: StatsBars) -> ResourceSpan {
+        let frame_w = self.terminal_frame_width_px(wid);
+        if form != StatsBars::Off {
+            let width = self.windows.get(&wid).and_then(|ws| ws.win_px).map_or_else(
+                || {
+                    u32::try_from(frame_w.saturating_add(self.win_side_inset_px(wid)))
+                        .unwrap_or(u32::MAX)
+                },
+                |size| size.width,
+            );
+            ResourceSpan { x: 0, width }
+        } else {
+            ResourceSpan {
+                x: self.frame_origin(wid).0,
+                width: u32::try_from(frame_w).unwrap_or(u32::MAX),
+            }
+        }
+    }
+
     /// Geometry for the network close-up when the resource deck itself is hidden.
     pub(crate) fn network_lens_frame(&self, wid: crate::WindowId) -> Option<DeckFrame> {
         let ws = self.windows.get(&wid)?;
-        let (cw, _) = self.win_cell_size(wid);
+        if ws
+            .win_px
+            .is_some_and(|size| size.width == 0 || size.height == 0)
+        {
+            return None;
+        }
+        let span = self.resource_span(wid, StatsBars::Off);
         let pad = self.win_pad(wid);
         let preferences = crate::native_appearance::current_preferences();
         let palette = self.chrome_palette(crate::app_render::ChromeSurface::Header);
@@ -3357,10 +3468,11 @@ impl crate::App {
         let inks = cached_inks(band.bar_bg, band.value, band.accent);
         Some(DeckFrame {
             form: StatsBars::Off,
+            span,
             network_place: crate::network_deck::capture_place_caption(),
             plate: None,
             geom: DeckGeom {
-                w: (ws.cols as usize * cw + 2 * pad) as f32,
+                w: span.width as f32,
                 h: 0.0,
                 pad: pad as f32,
                 scale: ws.scale as f32,
@@ -3369,7 +3481,7 @@ impl crate::App {
             dy: 0,
             tab_panes: self.deck_tab_panes(wid),
             tab_label: self.deck_tab(wid).1,
-            tab_count: ws.tab_set.tabs().len(),
+            tab_count: ws.strip_tab_count(),
             inks,
             lens_inks: inks,
             dwc: preferences.differentiate_without_color,
@@ -3386,18 +3498,22 @@ impl crate::App {
             return None;
         }
         let ws = self.windows.get(&wid)?;
-        if !stats_drawn_on(ws) {
+        if !stats_drawn_on(ws)
+            || ws
+                .win_px
+                .is_some_and(|size| size.width == 0 || size.height == 0)
+        {
             return None;
         }
         if ws.cols == 0 {
             return None;
         }
-        let (cw, _) = self.win_cell_size(wid);
         let pad = self.win_pad(wid);
-        let w = ws.cols as usize * cw + 2 * pad;
+        let span = self.resource_span(wid, form);
+        let w = span.width as usize;
         let (tab_key, tab_label) = self.deck_tab(wid);
         let tab_panes = self.deck_tab_panes(wid);
-        let tab_count = ws.tab_set.tabs().len();
+        let tab_count = ws.strip_tab_count();
         let prefs = crate::native_appearance::current_preferences();
         let (dwc, contrast) = (prefs.differentiate_without_color, prefs.high_contrast);
         let palette = self.chrome_palette(crate::app_render::ChromeSurface::Header);
@@ -3411,6 +3527,7 @@ impl crate::App {
                 let (live, needle) = self.deck_live_now(wid);
                 Some(DeckFrame {
                     form,
+                    span,
                     network_place: crate::network_deck::capture_place_caption(),
                     plate: None,
                     geom: DeckGeom {
@@ -3434,16 +3551,8 @@ impl crate::App {
                 })
             }
             StatsBars::Sill => {
-                let sill = crate::stats_sill::sill_px(pad, ws.scale);
-                if sill == 0 {
-                    return None;
-                }
-                let frame_h = self.stats_frame_h(wid);
-                // The card stops where the drop-target border begins.
-                let card_h = crate::stats_sill::sill_card_px(sill, w, frame_h);
-                if card_h == 0 {
-                    return None;
-                }
+                let rows = self.deck_rows_px(wid)?;
+                let card_h = rows.len();
                 let (floor, value, accent) = self.sill_floor(tab_key);
                 let translucent = self.config.background_opacity_or_default() < 1.0
                     || self.config.wallpaper.is_some();
@@ -3454,6 +3563,7 @@ impl crate::App {
                 });
                 Some(DeckFrame {
                     form,
+                    span,
                     network_place: ws
                         .stats_lens
                         .open
@@ -3467,7 +3577,7 @@ impl crate::App {
                         scale: ws.scale as f32,
                         font_px: self.win_font_px(wid),
                     },
-                    dy: u32::try_from(frame_h.saturating_sub(pad)).unwrap_or(0),
+                    dy: u32::try_from(rows.start).unwrap_or(0),
                     tab_panes,
                     tab_label,
                     tab_count,
@@ -3514,8 +3624,8 @@ impl crate::App {
     pub(crate) fn stats_card_point(&self, wid: crate::WindowId) -> Option<(f64, f64)> {
         let f = self.deck_frame(wid)?;
         let (x, y) = self.windows.get(&wid).map(|ws| ws.last_cursor_px)?;
-        let (ox, oy) = self.frame_origin(wid);
-        let (fx, fy) = (x - ox as f64, y - oy as f64);
+        let (_, oy) = self.frame_origin(wid);
+        let (fx, fy) = (x - f.span.x as f64, y - oy as f64);
         let top = f64::from(f.dy);
         ((top..top + f64::from(f.geom.h)).contains(&fy) && (0.0..f64::from(f.geom.w)).contains(&fx))
             .then_some((fx, fy - top))
@@ -3560,6 +3670,7 @@ impl crate::App {
             .map(|s| s.seq)
             .hash(&mut h);
         f.form.hash(&mut h);
+        f.span.width.hash(&mut h);
         for v in [f.geom.w, f.geom.h, f.geom.pad, f.geom.scale, f.geom.font_px] {
             v.to_bits().hash(&mut h);
         }
@@ -3584,6 +3695,7 @@ impl crate::App {
             network_place: f.network_place.as_ref(),
             network_target: crate::network_deck::Target::Overview,
             disk_span: crate::stats_lens::DiskSpan::Day,
+            cpu_policy_pending: false,
             lab: (f.form == StatsBars::Deck).then_some(self.lab_deck.as_ref()),
             fleet: (f.form == StatsBars::Deck)
                 .then_some(self.fleet_field.as_deref())
@@ -3695,7 +3807,21 @@ impl crate::App {
     /// it moved ([`patch_live`]).
     pub(crate) fn splice_stats_deck(&mut self, wid: crate::WindowId) {
         self.splice_stats_lens(wid);
-        let Some(f) = self.deck_frame(wid) else {
+        let frame = self.deck_frame(wid);
+        let crop = frame.as_ref().and_then(|f| {
+            f.span.frame_crop(
+                self.frame_origin(wid).0,
+                self.terminal_frame_width_px(wid) as u32,
+            )
+        });
+        self.rasterize_stats_deck(wid, frame);
+        if let Some(mut ws) = self.windows.get_mut(&wid) {
+            ws.project_resource_strip(crop);
+        }
+    }
+
+    fn rasterize_stats_deck(&mut self, wid: crate::WindowId, frame: Option<DeckFrame>) {
+        let Some(f) = frame else {
             if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
                 let ws = &mut **route_guard_ws;
                 ws.deck_card = None;
@@ -3736,6 +3862,7 @@ impl crate::App {
         let (card_base, card_live) = ws.deck_live_card.get();
         if let Some(card) = ws.deck_card.as_mut()
             && card.fp == fp
+            && (card.pw, card.ph, card.dy) == (f.span.width, f.geom.h as u32, f.dy)
         {
             card.geom = key;
             ws.deck_live_card.set((base, live));
@@ -3761,13 +3888,8 @@ impl crate::App {
             return;
         }
         ws.deck_live_card.set((base, live));
-        let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
-            &prims,
-            f.geom.w as u32,
-            f.geom.h as u32,
-            1.0,
-            [0, 0, 0, 0],
-        );
+        let (pw, ph) = (f.span.width, f.geom.h as u32);
+        let rgba = crate::tray_raster::rasterize_tray_pixels(&prims, pw, ph, 1.0, [0, 0, 0, 0]);
         ws.deck_card = Some(crate::SettingsCard {
             scrim: None,
             rgba,
@@ -3801,7 +3923,7 @@ impl crate::App {
             ws.deck_fold = None;
             return;
         }
-        let cards: Vec<&crate::SettingsCard> = [ws.deck_card.as_ref(), ws.lens_card.as_ref(), top]
+        let cards: Vec<&crate::SettingsCard> = [ws.frame_deck_card(), ws.lens_card.as_ref(), top]
             .into_iter()
             .flatten()
             .collect();
@@ -3824,6 +3946,79 @@ impl crate::App {
             return;
         }
         ws.deck_fold = fold_cards(&cards, fp);
+    }
+}
+
+impl crate::WindowState {
+    /// The part of the strip the terminal's own tray composites under its other cards.
+    pub(crate) fn frame_deck_card(&self) -> Option<&crate::SettingsCard> {
+        self.frame_resource_strip
+            .as_ref()
+            .map(|(_, card)| card)
+            .or(self.deck_card.as_ref())
+    }
+
+    fn project_resource_strip(&mut self, crop: Option<StripCrop>) {
+        let Some((crop, full)) = crop.zip(self.deck_card.as_ref()) else {
+            if self.frame_resource_strip.take().is_some()
+                && let Some(card) = &self.deck_card
+            {
+                self.deck_motion.card_changed((0, card.ph));
+            }
+            return;
+        };
+        let changed = self
+            .frame_resource_strip
+            .as_ref()
+            .is_none_or(|(was, card)| *was != crop || (card.ph, card.dy) != (full.ph, full.dy));
+        if changed {
+            self.deck_motion.card_changed((0, full.ph));
+        }
+        let (serial, delta) = self.deck_motion.clone().stamp();
+        let (was, card) = self.frame_resource_strip.get_or_insert_with(|| {
+            (
+                crop,
+                crate::SettingsCard {
+                    rgba: Vec::new(),
+                    pw: 0,
+                    ph: 0,
+                    dx: 0,
+                    dy: 0,
+                    fp: 0,
+                    geom: 0,
+                    scrim: None,
+                    raster_fingerprint_once: std::sync::OnceLock::new(),
+                    serial: 0,
+                    delta: None,
+                },
+            )
+        });
+        // A recording validates the card's geometry even if the source slid sideways and
+        // its visible width, display offset and the full strip's pixels all stayed the same.
+        let geometry = aterm_hash::fnv1a_64_u64_le(full.geom, u64::from(crop.source_x));
+        if !changed && card.serial == serial {
+            card.geom = geometry;
+            return;
+        }
+        let rows = delta
+            .filter(|delta| !changed && card.serial == delta.since)
+            .map_or((0, full.ph), |delta| delta.rows);
+        let stride = crop.width as usize * 4;
+        card.rgba.resize(stride * full.ph as usize, 0);
+        for y in rows.0..rows.1.min(full.ph) {
+            let y = y as usize;
+            let src = (y * full.pw as usize + crop.source_x as usize) * 4;
+            card.rgba[y * stride..(y + 1) * stride].copy_from_slice(&full.rgba[src..src + stride]);
+        }
+        *was = crop;
+        card.pw = crop.width;
+        card.ph = full.ph;
+        card.dx = crop.frame_x;
+        card.dy = full.dy;
+        card.fp = full.fp;
+        card.geom = geometry;
+        card.serial = serial;
+        card.raster_fingerprint_once = std::sync::OnceLock::new();
     }
 }
 
@@ -4091,9 +4286,9 @@ impl crate::App {
         let loc = host_locale(self.vitals.snapshot.as_deref());
         let (ox, oy) = self.frame_origin(wid);
         let bounds = aterm_a11y::model::Rect {
-            x0: ox as f64,
+            x0: f.span.x as f64,
             y0: oy as f64 + f64::from(f.dy),
-            x1: ox as f64 + f64::from(f.geom.w),
+            x1: f.span.x as f64 + f64::from(f.span.width),
             y1: oy as f64 + f64::from(f.dy) + f64::from(f.geom.h),
         };
         let lens = self

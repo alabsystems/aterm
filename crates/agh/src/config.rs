@@ -698,10 +698,20 @@ impl Rows<'_> {
                 ),
                 Some(path) if token_source(path, self.home).is_none() => faults.push(
                     "L1",
-                    format!(
-                        "profile {name}: token_file names a path inside ~/.secrets, which holds \
-                         only vault entries: name one as ~/.secrets/NAME"
-                    ),
+                    if cfg!(windows) {
+                        format!(
+                            "profile {name}: token_file names a path inside ~/.secrets, which \
+                             holds only vault entries, or one spelled so that Windows may read \
+                             it there (a . or .. part, a trailing dot or space, an 8.3 short \
+                             name): name a vault entry as ~/.secrets/NAME, and a token file by \
+                             its plain path"
+                        )
+                    } else {
+                        format!(
+                            "profile {name}: token_file names a path inside ~/.secrets, which \
+                             holds only vault entries: name one as ~/.secrets/NAME"
+                        )
+                    },
                 ),
                 Some(_) => {}
             }
@@ -1212,12 +1222,32 @@ pub fn file_id(path: &Path) -> Option<(u64, u64)> {
 /// code reads them; any other absolute or `~/` path is a token file of the person's own, read
 /// in place. `None` for a path that is neither absolute nor `~/`, and for one deeper inside
 /// `~/.secrets`, which holds no file agh reads. Judged from the text alone: nothing is statted.
+///
+/// On windows a path is placed by the key Windows compares names by
+/// ([`aterm_path::windows_key`]): without case, and `\\?\C:\…` as `C:\…`, so no other spelling
+/// of `~/.secrets` names a file there. A path that key cannot place (a `.` or `..` part, a
+/// trailing dot or space, an 8.3 short name, each of which Windows may resolve into
+/// `~/.secrets`) is `None` too; a home it cannot place is compared as written.
 #[must_use]
 pub fn token_source(text: &str, home: &Path) -> Option<Source> {
     let path = expand(text, home)?;
     let vault = home.join(aterm_types::vault_entry::SECRETS_DIR);
     if home.as_os_str().is_empty() {
         return Some(Source::File(path));
+    }
+    #[cfg(windows)]
+    if let Some(vault_key) = aterm_path::windows_key(&vault) {
+        let path_key = aterm_path::windows_key(&path)?;
+        if !aterm_path::key_under(&path_key, &vault_key) {
+            return Some(Source::File(path));
+        }
+        let rest = path_key[vault_key.len()..].trim_start_matches('\\');
+        return match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) if !rest.is_empty() && !rest.contains('\\') => {
+                Some(Source::Entry(crate::identity::VaultEntry::new(name, home)))
+            }
+            _ => None,
+        };
     }
     let Ok(rest) = path.strip_prefix(&vault) else {
         return Some(Source::File(path));
@@ -1249,13 +1279,13 @@ pub fn expand(path: &str, home: &Path) -> Option<PathBuf> {
 /// `read_config_in` gives a refused file (such as the chmods that make it private, or the link
 /// to replace), else `agh policy check`.
 pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         load_private(dirs, false)
             .map(|snapshot| snapshot.map(|(validated, _)| validated))
             .map_err(|refusal| refusal.error)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = dirs;
         Ok(None)
@@ -1263,8 +1293,8 @@ pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
 }
 
 /// [`load`] for AghHost (design §10.3): the same file and the same rules, with each profile's
-/// `legacy_loose` honoured. `Ok(None)` when agh.toml is missing, and always `Ok(None)` off
-/// unix.
+/// `legacy_loose` honoured. `Ok(None)` when agh.toml is missing, and always `Ok(None)` on a
+/// host with no private files (neither unix nor windows).
 ///
 /// # Errors
 ///
@@ -1293,11 +1323,11 @@ pub struct HostConfigRefusal {
 pub fn load_for_host_faults(
     dirs: &Dirs,
 ) -> std::result::Result<Option<Validated>, HostConfigRefusal> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         load_private(dirs, true).map(|snapshot| snapshot.map(|(validated, _)| validated))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = dirs;
         Ok(None)
@@ -1309,11 +1339,11 @@ pub(crate) fn load_routing_snapshot(
     dirs: &Dirs,
     honour_loose: bool,
 ) -> std::result::Result<Option<(Validated, AghConfig)>, HostConfigRefusal> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         load_private(dirs, honour_loose)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (dirs, honour_loose);
         Ok(None)
@@ -1380,6 +1410,63 @@ fn make_private_level(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `std::fs::create_dir_all(dir)`, the folders above a private one agh makes (its config
+/// folder's parent, the rate book's state root). On windows an elevated process makes nothing
+/// there (`aterm_uds::private_file::ELEVATED`): a folder it made would be Administrators', which
+/// the user's own processes then refuse, so where `dir` is missing it is refused before anything
+/// is made, and where it is there it is left as it is.
+///
+/// # Errors
+///
+/// `create_dir_all`'s; on windows in an elevated process, `PermissionDenied` with
+/// `ELEVATED`'s text where `dir` is missing, or the look's own error.
+#[cfg(any(unix, windows))]
+pub(crate) fn make_parents(dir: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if elevated() {
+        return match std::fs::symlink_metadata(dir) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                aterm_uds::private_file::ELEVATED,
+            )),
+            Err(e) => Err(e),
+        };
+    }
+    std::fs::create_dir_all(dir)
+}
+
+/// Whether this process runs elevated ([`make_parents`]); on a thread inside
+/// [`as_elevated_for_tests`], as that says.
+#[cfg(windows)]
+fn elevated() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(elevated) = ELEVATED_HERE.with(std::cell::Cell::get) {
+        return elevated;
+    }
+    aterm_uds::elevation::is_elevated()
+}
+
+#[cfg(all(windows, any(test, debug_assertions)))]
+thread_local! {
+    /// What [`elevated`] answers on this thread, where a test said.
+    static ELEVATED_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `f` run with this thread's agh taken to be elevated (`elevated`), as [`make_parents`] reads
+/// it; aterm-uds' own checks still read the real token. Tests: the process need not be elevated.
+#[cfg(all(windows, any(test, debug_assertions)))]
+pub fn as_elevated_for_tests<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ELEVATED_HERE.with(|here| here.set(self.0));
+        }
+    }
+    let _reset = Reset(ELEVATED_HERE.with(|here| here.replace(Some(true))));
+    f()
+}
+
 /// agh.toml's text with `repo` added to `caller`'s `writers` row (`add`), or removed from it,
 /// in either form the rows take: `[[writers]]` tables or an array of inline tables
 /// (`writers = [{..}]`). A row's `repos` is edited in the text itself, so every comment,
@@ -1400,7 +1487,7 @@ fn make_private_level(dir: &Path) -> std::io::Result<()> {
 /// and when that `repos` holds an entry that is not a string (which the edit would otherwise
 /// drop). Refused, with nothing edited, when an inline row with no `repos` would gain one, or
 /// when the edited text does not read back as that one edit (a layout the edit cannot follow).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn edit_writers(text: &str, caller: &str, repo: &Slug, add: bool) -> Result<String> {
     use crate::error::{Error, Kind};
     use aterm_toml::edit::{ArrayOfTables, DocumentMut, Item, Table, TableLike, Value};
@@ -1514,11 +1601,11 @@ pub(crate) fn edit_writers(text: &str, caller: &str, repo: &Slug, add: bool) -> 
 
 /// One `writers` row as `edit_writers` compares it: its `caller`, and its `repos` with each
 /// entry that is no string as `None` (`None` for a `repos` that is missing or no array).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 type WriterSummary = (Option<String>, Option<Vec<Option<String>>>);
 
 /// A document's `writers` rows, in either form; `None` when `writers` is neither.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn writer_rows(doc: &aterm_toml::edit::DocumentMut) -> Option<Vec<WriterSummary>> {
     use aterm_toml::edit::{Item, TableLike};
     let summary = |row: &dyn TableLike| -> WriterSummary {
@@ -1548,7 +1635,7 @@ fn writer_rows(doc: &aterm_toml::edit::DocumentMut) -> Option<Vec<WriterSummary>
 
 /// `rows` with `wanted` added to `caller`'s row (a new row when it has none), or removed from
 /// it (the row with its last entry): what `edit_writers`'s text must read back as.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn with_edit(
     mut rows: Vec<WriterSummary>,
     caller: &str,
@@ -1588,14 +1675,14 @@ fn with_edit(
 }
 
 /// A new row's `repos`: `[wanted]`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn new_repos(wanted: &str) -> aterm_toml::edit::Value {
     use aterm_toml::edit::{Array, Value};
     Value::from(std::iter::once(wanted).collect::<Array>())
 }
 
 /// `text` with a first `[[writers]]` row for `caller` appended at its end, after a blank line.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn append_writers_row(text: &str, caller: &str, wanted: &str) -> String {
     use aterm_toml::edit::Value;
     use std::fmt::Write as _;
@@ -1619,7 +1706,7 @@ fn append_writers_row(text: &str, caller: &str, wanted: &str) -> String {
 /// lines an edit wrote follow the file's; `edited` as it is otherwise (a file of LF lines, of
 /// mixed lines, or of one line). Every bare LF of such an `edited` is one the edit wrote, since
 /// `original` holds none; the rows it writes hold no multi-line string.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn follow_crlf(original: &str, edited: String) -> String {
     let bytes = original.as_bytes();
     let mut ends = original.match_indices('\n').map(|(at, _)| at).peekable();
@@ -1641,7 +1728,7 @@ fn follow_crlf(original: &str, edited: String) -> String {
 }
 
 /// What `edit_repos` made of a row's `repos`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum Repos {
     /// The edit changes nothing.
     Unchanged,
@@ -1654,7 +1741,7 @@ enum Repos {
 }
 
 /// The edit of one row's `repos` in `text`, which the row was parsed from.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn edit_repos(
     text: &str,
     row: &dyn aterm_toml::edit::TableLike,
@@ -1706,7 +1793,7 @@ fn edit_repos(
 
 /// The whitespace before the value that starts at `start`, when nothing else precedes it on
 /// its line; two spaces otherwise.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn indent_before(text: &str, start: usize) -> &str {
     let line = text[..start].rfind('\n').map_or(0, |at| at + 1);
     let lead = &text[line..start];
@@ -1718,7 +1805,7 @@ fn indent_before(text: &str, start: usize) -> &str {
 }
 
 /// Whether the trivia between an array's last value and its `]` holds the trailing comma.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn trivia_has_comma(trivia: &str) -> bool {
     let mut in_comment = false;
     for c in trivia.chars() {
@@ -1736,7 +1823,7 @@ fn trivia_has_comma(trivia: &str) -> bool {
 /// `text` with `entry` (one value's TOML) as the last element of `array`, which was parsed
 /// from `text` (see `edit_writers` for the layout). `None` when `array` carries no source
 /// spans.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn splice_push(text: &str, array: &aterm_toml::edit::Array, entry: &str) -> Option<String> {
     let span = array.span()?;
     let close = span.end.checked_sub(1)?;
@@ -1779,7 +1866,7 @@ fn splice_push(text: &str, array: &aterm_toml::edit::Array, entry: &str) -> Opti
 /// only value on that line, and otherwise the element and the comma beside it. `array` was
 /// parsed from `text`, or from a text that differs from it only after that element. `None`
 /// when `array` carries no source spans.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn splice_remove(text: &str, array: &aterm_toml::edit::Array, at: usize) -> Option<String> {
     let span = array.get(at)?.span()?;
     let blank = |b: u8| b == b' ' || b == b'\t';
@@ -1821,10 +1908,11 @@ fn splice_remove(text: &str, array: &aterm_toml::edit::Array, at: usize) -> Opti
     Some(out)
 }
 
-/// `load` on unix: agh.toml through `read_private`, of origin `File`. With `honour_loose`
-/// (`load_for_host`), each profile row's `legacy_loose` is copied onto its profile; without it
-/// (`load`), every profile's is false whatever the row says.
-#[cfg(unix)]
+/// `load` on unix and windows: agh.toml through `read_private` (on Windows a file and folder of
+/// the user's under a protected access list of the user and SYSTEM alone), of origin `File`.
+/// With `honour_loose` (`load_for_host`), each profile row's `legacy_loose` is copied onto its
+/// profile; without it (`load`), every profile's is false whatever the row says.
+#[cfg(any(unix, windows))]
 fn load_private(
     dirs: &Dirs,
     honour_loose: bool,
@@ -1895,7 +1983,7 @@ pub(crate) fn invalid(why: String, next: impl Into<String>) -> crate::error::Err
 }
 
 /// What reading an agh.toml found.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) enum ConfigText {
     /// No such file.
     Missing,
@@ -1929,7 +2017,7 @@ pub(crate) struct Counts {
 
 /// What [`judge`] found: the parsed file's row counts, the rows as written, and the
 /// validated file or its faults.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct Judgement {
     /// The row counts.
     pub(crate) counts: Counts,
@@ -1940,7 +2028,7 @@ pub(crate) struct Judgement {
     pub(crate) verdict: std::result::Result<Validated, Vec<ConfigFault>>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Judgement {
     /// No rows, and `faults`.
     fn faults(faults: Vec<ConfigFault>) -> Judgement {
@@ -1953,7 +2041,7 @@ impl Judgement {
 }
 
 /// `text` parsed and validated.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn judge(text: &str, home: &Path) -> Judgement {
     match parse(text) {
         Err(fault) => Judgement::faults(vec![fault]),
@@ -1971,7 +2059,7 @@ pub(crate) fn judge(text: &str, home: &Path) -> Judgement {
 }
 
 /// What a read of agh.toml found, as the checks report it (`policy check`, `auth status`).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn faults_of(read: ConfigText, home: &Path) -> Option<Judgement> {
     let fault = |rule, what| Some(Judgement::faults(vec![ConfigFault { rule, what }]));
     match read {
@@ -1989,7 +2077,7 @@ pub(crate) fn faults_of(read: ConfigText, home: &Path) -> Option<Judgement> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl ConfigFault {
     /// `faults` as one text: each `{rule}: {what}`, joined with `; `.
     #[must_use]
@@ -2007,46 +2095,106 @@ impl ConfigFault {
 }
 
 /// `name` in the agh directory `dir` (`Dirs::config`), by [`read_config_in`]'s rules.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn read_config(dir: &Path, name: &str, home: &Path) -> ConfigText {
     read_config_in(dir, name, home, Some(dir))
 }
 
 /// `name` in `dir`, read with `read_private`; remedies write paths under `home` as `~/…`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn read_config_in(
     dir: &Path,
     name: &str,
     home: &Path,
     agh_dir: Option<&Path>,
 ) -> ConfigText {
-    use crate::identity::{Held, PrivateFix, private_fix, symlink_remedy, tilde};
     use aterm_uds::private_file::{PrivateFileError, read_private};
-    let held = Held::Config(agh_dir);
     match read_private(dir, name, CONFIG_MAX) {
         Ok(bytes) => String::from_utf8(bytes).map_or(ConfigText::NotUtf8, ConfigText::Text),
         Err(PrivateFileError::Missing) => ConfigText::Missing,
-        Err(error) => {
-            let file = dir.join(name);
-            let remedy = match &error {
-                PrivateFileError::NotPrivate(_) | PrivateFileError::Writable(_) => {
-                    match private_fix(dir, &file, home, held) {
-                        PrivateFix::Fix(fix) => Some(fix),
-                        PrivateFix::NotAFile => {
-                            Some(format!("{} must be a regular file", tilde(&file, home)))
-                        }
-                        PrivateFix::NoChmod => Some(keep_elsewhere(dir, name, home, held)),
-                        PrivateFix::Unseen => None,
-                    }
+        Err(error @ PrivateFileError::Io(_)) => ConfigText::Io(error.to_string()),
+        Err(error) => ConfigText::Refused {
+            remedy: refused_remedy(dir, name, home, agh_dir, &error),
+            error: error.to_string(),
+        },
+    }
+}
+
+/// The remedy for `name` in `dir` that `read_private` refused with `error` (neither missing nor
+/// unreadable), on unix: the chmods that make it private, where none of this user's does the
+/// file to keep elsewhere, the link to replace; `None` when there is none to give.
+#[cfg(unix)]
+fn refused_remedy(
+    dir: &Path,
+    name: &str,
+    home: &Path,
+    agh_dir: Option<&Path>,
+    error: &aterm_uds::private_file::PrivateFileError,
+) -> Option<String> {
+    use crate::identity::{Held, PrivateFix, private_fix, symlink_remedy, tilde};
+    use aterm_uds::private_file::PrivateFileError;
+    let held = Held::Config(agh_dir);
+    let file = dir.join(name);
+    match error {
+        PrivateFileError::NotPrivate(_) | PrivateFileError::Writable(_) => {
+            match private_fix(dir, &file, home, held) {
+                PrivateFix::Fix(fix) => Some(fix),
+                PrivateFix::NotAFile => {
+                    Some(format!("{} must be a regular file", tilde(&file, home)))
                 }
-                PrivateFileError::Symlink => Some(symlink_remedy(dir, name, home, held)),
-                PrivateFileError::Io(_) => return ConfigText::Io(error.to_string()),
-                PrivateFileError::Missing | PrivateFileError::Malformed(_) => None,
-            };
-            ConfigText::Refused {
-                error: error.to_string(),
-                remedy,
+                PrivateFix::NoChmod => Some(keep_elsewhere(dir, name, home, held)),
+                PrivateFix::Unseen => None,
             }
+        }
+        PrivateFileError::Symlink => Some(symlink_remedy(dir, name, home, held)),
+        PrivateFileError::Io(_) | PrivateFileError::Missing | PrivateFileError::Malformed(_) => {
+            None
+        }
+    }
+}
+
+/// [`refused_remedy`] on windows, which has no mode for a chmod to change: a file or folder
+/// another account can open is made the user's alone (a protected access list of the user and
+/// SYSTEM, which agh gives each folder and file it makes). In agh's own folder that is the
+/// remedy, since agh reads the file only there (`--config` is `policy check`'s alone and
+/// changes no file that routes); a file `--config` named elsewhere may instead be kept in a
+/// folder that is the user's alone, such as agh's, and named again. A link or junction (a
+/// reparse point) is replaced by what it names.
+#[cfg(windows)]
+fn refused_remedy(
+    dir: &Path,
+    name: &str,
+    home: &Path,
+    agh_dir: Option<&Path>,
+    error: &aterm_uds::private_file::PrivateFileError,
+) -> Option<String> {
+    use crate::identity::tilde;
+    use aterm_uds::private_file::PrivateFileError;
+    let file = tilde(&dir.join(name), home);
+    let folder = tilde(dir, home);
+    let alone = "yours alone (a protected access list of you and SYSTEM, as agh gives what it \
+                 makes)";
+    match error {
+        PrivateFileError::NotPrivate(_) | PrivateFileError::Writable(_) => Some(match agh_dir {
+            Some(agh_dir) if agh_dir == dir => {
+                format!("make {file} and its folder {folder} {alone}: agh reads {name} only there")
+            }
+            Some(agh_dir) => format!(
+                "make {file} and its folder {folder} {alone}, or keep {name} in a folder of \
+                 yours alone, such as {}, and pass --config with its path",
+                tilde(agh_dir, home)
+            ),
+            None => format!(
+                "make {file} and its folder {folder} {alone}, or keep {name} in a folder of \
+                 yours alone and pass --config with its path"
+            ),
+        }),
+        PrivateFileError::Symlink => Some(format!(
+            "{file} or its folder {} is a link or a junction: replace it with what it names",
+            tilde(dir, home)
+        )),
+        PrivateFileError::Io(_) | PrivateFileError::Missing | PrivateFileError::Malformed(_) => {
+            None
         }
     }
 }

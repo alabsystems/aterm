@@ -12,7 +12,7 @@ use crate::{App, WindowId};
 /// Which surface presents a live edit, and so who owns the text: the macOS `NSTextField`'s field editor, or this state for the in-grid field [`crate::tab_bar`] paints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenameSurface {
-    /// The macOS strip's `NSTextField` overlay.
+    /// The macOS chip's editable title label.
     Native,
     /// The cell-drawn field the in-grid strip paints over the tab's title; `text`/`cursor` are the field.
     InGrid,
@@ -29,12 +29,16 @@ pub(crate) struct TabRenameEdit {
     pub surface: RenameSurface,
     /// The metadata field the commit writes: the title pin (Rename Session…, the double-click) or the role (Window ▸ Set Role…).
     pub field: MetaField,
-    /// The text the field opened holding: the stored value, empty when unset. A commit of it
+    /// The text the field opened holding: the visible title or the stored value of another field. A commit of it
     /// (trimmed) states nothing, whoever touched or settles the edit and whatever another
     /// writer pinned while it was open ([`App::commit_session_rename`]).
     pub seed: String,
-    /// The in-grid field's text: seeded from the stored value (empty when unset), changed only through [`crate::app_search::apply_field_edit`], the find bar's reducer.
+    /// Clearing a fallback title leaves any concurrent writer’s pin alone.
+    pub opened_unpinned: bool,
+    /// The in-grid label's editable text.
     pub text: String,
+    /// Whether all text in the in-grid label is selected.
+    pub selected_all: bool,
     /// Caret position in [`Self::text`], a byte offset on a char boundary.
     pub cursor: usize,
     /// The first control client that opened the field or changed its text
@@ -98,7 +102,7 @@ impl App {
         self.begin_session_meta_edit(window, tab, MetaField::Title)
     }
 
-    /// [`Self::begin_session_rename`] for any presentation field: seeded with the field's stored value, placeheld with the resolved label (title) or the field's name (role), and writing that field on commit.
+    /// Edit the visible session title or the stored value of another presentation field.
     pub(crate) fn begin_session_meta_edit(
         &mut self,
         window: WindowId,
@@ -136,7 +140,7 @@ impl App {
         if live.is_some() {
             self.settle_rename_edit(window);
         }
-        let seed = self
+        let stored = self
             .pool
             .get(session)
             .map(|s| s.ctx.clone())
@@ -145,26 +149,30 @@ impl App {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .presentation_value(field.wire_name())
-            })
-            .unwrap_or_default();
-        let placeholder = match field {
-            MetaField::Title => self
+            });
+        let opened_unpinned = field == MetaField::Title && stored.is_none();
+        let seed = if opened_unpinned {
+            let title = self
                 .tab_titles(window)
                 .get(index)
                 .cloned()
-                .unwrap_or_default(),
-            _ => field.wire_name().to_string(),
+                .unwrap_or_default();
+            crate::session_timeline::sanitize_presentation_line(&title, field.cap())
+        } else {
+            stored.unwrap_or_default()
         };
-        // A worker's editor stands over the chip that stands for it.
-        let chip = self
-            .windows
-            .get(&window)
-            .and_then(|ws| ws.tab_set.chip_of(tab))
-            .unwrap_or(tab);
+        let placeholder = if field == MetaField::Title {
+            ""
+        } else {
+            field.wire_name()
+        };
+        let Some(chip) = self.windows.get(&window).and_then(|ws| ws.title_chip(tab)) else {
+            return false;
+        };
         let native = match self._toolbars.get(&window) {
             Some(handle) => self
                 .apprt
-                .begin_tab_rename(handle, chip, session, &seed, &placeholder),
+                .begin_tab_rename(handle, chip, session, &seed, placeholder),
             None => false,
         };
         let surface = if native {
@@ -187,6 +195,8 @@ impl App {
                 tab,
                 surface,
                 field,
+                opened_unpinned,
+                selected_all: !seed.is_empty(),
                 seed: seed.clone(),
                 text: seed,
                 cursor,
@@ -294,7 +304,29 @@ impl App {
             return false;
         };
         let state = &mut *rename_scope;
-        if apply_field_edit(&mut state.text, &mut state.cursor, edit) {
+        let mut edit = edit;
+        let mut replaced_selection = false;
+        if std::mem::take(&mut state.selected_all) {
+            use SearchEdit::*;
+            match edit {
+                MoveCharLeft | MoveWordLeft => edit = MoveStart,
+                MoveCharRight | MoveWordRight => edit = MoveEnd,
+                MoveStart | MoveEnd | MoveTo(_) => {}
+                Insert(ref value)
+                    if value
+                        .chars()
+                        .all(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')) =>
+                {
+                    state.selected_all = true;
+                }
+                _ => {
+                    replaced_selection = !state.text.is_empty();
+                    state.text.clear();
+                    state.cursor = 0;
+                }
+            }
+        }
+        if apply_field_edit(&mut state.text, &mut state.cursor, edit) || replaced_selection {
             state.controller = state.controller.or(touching);
         }
         let canonical =
@@ -371,15 +403,18 @@ impl App {
             aterm_log::info!("rename commit dropped: session {session} is no longer being edited");
             return;
         }
-        let (field, controller, opened) = self
+        let Some(edit) = self
             .windows
             .get(&window)
             .and_then(|ws| ws.rename_edit.as_ref())
-            .map_or((MetaField::Title, None, String::new()), |edit| {
-                (edit.field, edit.controller, edit.seed.clone())
-            });
+        else {
+            return;
+        };
+        let (field, controller) = (edit.field, edit.controller);
+        let unstated =
+            text.trim() == edit.seed.trim() || (text.trim().is_empty() && edit.opened_unpinned);
         self.end_session_rename_editor(window);
-        if text.trim() == opened.trim() {
+        if unstated {
             if let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) {
                 crate::session_timeline::note_unstated_meta_write(&ctx, field);
             }

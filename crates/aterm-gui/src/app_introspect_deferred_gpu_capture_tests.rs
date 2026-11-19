@@ -31,6 +31,8 @@ fn capture(
                 session: None,
                 want_bytes: true,
                 want_metadata: false,
+                whole_client: false,
+                presentation: None,
                 frame_metadata: Arc::new(OnceLock::new()),
                 cancel: cancel.clone(),
                 reply,

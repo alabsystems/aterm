@@ -20,7 +20,7 @@ use crate::{
         account_names,
         journal::{
             self,
-            event::{Event, Window},
+            event::{Event, ModelBucket, Window},
             seen::{Seen, Usage, WindowQuota},
         },
         mail,
@@ -554,9 +554,13 @@ fn usage_json(lab: &LabView, q: &WindowQuota, now: u64) -> Value {
             "by": mac(lab, by),
         }),
     };
+    // A model's own week's row names its model's bucket and holds that model's wall alone
+    // (FL-271); `walls_account` says whether the wall is one every session meets.
     json!({
         "pk": q.pk,
         "window": q.window.word(),
+        "model": q.model.map(ModelBucket::word),
+        "walls_account": q.wall.as_ref().map(|_| q.walls_account()),
         "usage": usage,
         "wall": q.wall.as_ref().map(|w| json!({
             "until": w.until, "seen": at(w.t, now), "by": mac(lab, &w.uuid),
@@ -636,6 +640,7 @@ fn event_json(lab: &LabView, event: &Event) -> Value {
         "slug": event.account.and_then(|a| slug_of(lab, a.as_str())),
         "name": event.account.and_then(|a| name_of(lab, a.as_str())),
         "window": event.window.map(Window::word),
+        "model": event.model.map(ModelBucket::word),
         "used_pct_x10": event.pct_x10,
         "reset": event.reset,
         "until": event.until,

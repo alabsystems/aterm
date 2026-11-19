@@ -421,7 +421,7 @@ pub(crate) fn prove_guarded<S: Read + Write + ?Sized>(
         let size: usize = Some(response.get("authority")?)
             .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|s| s.parse().ok())
-            .filter(|size| *size <= crate::membership_log::MAX_RECORDS_STREAM)
+            .filter(|size| *size <= crate::membership_log::REPLY_CAP)
             .ok_or_else(|| Error::new("the member's authority size is out of bounds"))?;
         let mut records = vec![0; size];
         stream.read_exact(&mut records)?;

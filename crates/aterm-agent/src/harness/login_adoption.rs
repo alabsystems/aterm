@@ -222,8 +222,10 @@ impl Baselines {
     /// On Unix the store's directory is already private ([`accounts::Store::ensure`] makes it
     /// mode 0700). On Windows a write first makes the baselines' own folder, private at its
     /// birth, as that mode does: a protected list of the user and SYSTEM alone
-    /// ([`aterm_uds::private_file::ensure_private_dir`], which an elevated process may not
-    /// make). Where that fails nothing is kept, and the step says so once.
+    /// ([`aterm_uds::private_file::ensure_private_dir`]; an elevated process makes it too, in a
+    /// store that is there and the user's own, else
+    /// [`aterm_uds::private_file::ELEVATED_PARENT`]). Where that fails nothing is kept, and the
+    /// step says so once.
     fn keep(&self, dir: &Path) -> std::io::Result<()> {
         let dir = baselines_dir(dir);
         if self.0.is_empty() {

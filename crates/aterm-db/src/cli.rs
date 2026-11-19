@@ -570,6 +570,7 @@ pub fn run(words: &[String]) -> Result<Value> {
                     key: key.clone(),
                     value: Some(value),
                 }],
+                said: None,
             })?;
             json!({"machine":key,"name":name,"operation":hex::encode_lower(&id),"request":hex::encode_lower(&request)})
         }
@@ -643,6 +644,7 @@ pub fn run(words: &[String]) -> Result<Value> {
                     key,
                     value,
                 }],
+                said: None,
             })?;
             receipt(id, request)
         }

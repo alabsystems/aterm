@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use aterm_spec::wait::MUST_HAPPEN;
 use aterm_uds::spawnfd::{Stdio, Tether as _};
 
+use crate::patience::Patience;
 use crate::{launch_isolation, standin};
 
 /// The stand-in window's [`standin::ENV`] word: it starts a tethered and a plain helper, the
@@ -262,7 +263,8 @@ fn play_parent() -> ! {
 /// How [`play_parity`] spawns a case.
 #[derive(Clone, Copy)]
 enum Column {
-    /// Untethered, at the head of a group of its own (the collector's, `deadline::output_until`).
+    /// Untethered, at the head of a group of its own (the collector's,
+    /// `deadline::output_while_process_progressing`).
     Plain,
     /// Tethered in the stand-in's own group, by a spawn no collector puts at the head of one: on
     /// Linux tied by its parent-death signal alone, on macOS run through its tether.
@@ -297,12 +299,17 @@ fn play_parity() -> ! {
                 if matches!(column, Column::Leader) {
                     cmd.tether();
                 }
-                aterm_uds::deadline::output_until(&mut cmd, Instant::now() + MUST_HAPPEN).map_err(
-                    |e| match e {
-                        aterm_uds::deadline::RunError::Spawn(e) => Ok(e),
-                        e => Err(e.to_string()),
-                    },
+                aterm_uds::deadline::output_while_process_progressing(
+                    &mut cmd,
+                    MUST_HAPPEN,
+                    "a parity case",
                 )
+                .map_err(|e| match e {
+                    aterm_uds::deadline::ProgressError::Run(
+                        aterm_uds::deadline::RunError::Spawn(e),
+                    ) => Ok(e),
+                    e => Err(e.to_string()),
+                })
             }
         };
         match ran {
@@ -408,21 +415,22 @@ fn a_group_seen_empty_is_never_signalled_again() {
     );
 }
 
-/// Whether `exit` (an [`aterm_uds::exitwatch::exit_fd`]) reports its process's exit within `hang`.
-fn exits_within(exit: &OwnedFd, hang: Duration) -> bool {
+/// Whether `exit` (an [`aterm_uds::exitwatch::exit_fd`]) reports its process's exit before a
+/// [`Patience`] over `window` is spent. A helper and its watcher leave this binary's tree once
+/// their starter is killed, so the reading is of what else it runs: never less than `window`.
+fn exits_within(exit: &OwnedFd, window: Duration) -> bool {
     let mut fd = libc::pollfd {
         fd: exit.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
-    let deadline = Instant::now() + hang;
+    let mut patience = Patience::new(window);
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
         // SAFETY: one live `pollfd`, which `poll` reads and writes and does not retain.
-        match unsafe { libc::poll(&mut fd, 1, ms) } {
+        match unsafe { libc::poll(&mut fd, 1, 100) } {
             1.. => return true,
-            0 => return false,
+            0 if patience.spent().is_some() => return false,
+            0 => {}
             _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
             _ => panic!("poll: {}", std::io::Error::last_os_error()),
         }
@@ -579,14 +587,14 @@ impl Started {
             .expect("the tethered helper's watcher")
     }
 
-    /// Whether `line` is said within `hang`.
-    fn says_within(&self, line: &str, hang: Duration) -> bool {
-        let deadline = Instant::now() + hang;
+    /// Whether `line` is said before a [`Patience`] over `window` is spent.
+    fn says_within(&self, line: &str, window: Duration) -> bool {
+        let mut patience = Patience::new(window);
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.said.recv_timeout(left) {
+            match self.said.recv_timeout(Duration::from_millis(100)) {
                 Ok(said) if said == line => return true,
                 Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) if patience.spent().is_none() => {}
                 Err(_) => return false,
             }
         }
@@ -667,14 +675,18 @@ fn start_parent_with(entry: &str, helper: &str, then_exec: bool, hold: Hold) -> 
         }
     });
     let (mut tethered, mut plain, mut ran) = (None, None, Vec::new());
-    let deadline = Instant::now() + aterm_spec::wait::FIRST_EXEC;
+    let mut patience = Patience::new(aterm_spec::wait::FIRST_EXEC);
     while tethered.is_none_or(|pid| !ran.contains(&pid))
         || plain.is_none_or(|pid| !ran.contains(&pid))
     {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let line: String = said
-            .recv_timeout(left)
-            .expect("both helpers said they ran, by pid");
+        let line: String = match said.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => match patience.spent() {
+                None => continue,
+                Some(why) => panic!("both helpers said they ran, by pid: {why}"),
+            },
+            Err(e) => panic!("both helpers said they ran, by pid: {e}"),
+        };
         let mut words = line.split_whitespace();
         let (Some(word), Some(pid)) = (
             words.next(),
@@ -1302,7 +1314,7 @@ fn a_tethered_spawn_that_cannot_run_fails_as_a_plain_one_does() {
         std::os::unix::fs::symlink(name, dir.path().join("loop").join(name))
             .expect("a link to itself");
     }
-    let out = aterm_uds::deadline::output_until(
+    let out = aterm_uds::deadline::output_while_process_progressing(
         aterm_uds::spawnfd::command(standin::exe())
             .args(standin::argv(
                 "tether_live::a_tethered_spawn_that_cannot_run_fails_as_a_plain_one_does",
@@ -1314,7 +1326,8 @@ fn a_tethered_spawn_that_cannot_run_fails_as_a_plain_one_does() {
                 "PATH",
                 own_path(tool.parent().expect("the tool's folder").as_os_str()),
             ),
-        Instant::now() + MUST_HAPPEN,
+        MUST_HAPPEN,
+        "the parity stand-in",
     )
     .expect("run the stand-in");
     assert_eq!(out.status.code(), Some(0), "the stand-in: {out:?}");
@@ -1368,13 +1381,14 @@ fn a_tether_whose_parent_is_not_its_own_starts_nothing() {
     let aterm = launch_isolation::aterm_executable();
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
     for stranger in ["1".to_string(), std::process::id().to_string()] {
-        let out = aterm_uds::deadline::output_until(
+        let out = aterm_uds::deadline::output_while_process_progressing(
             aterm_uds::spawnfd::command("/bin/sh")
                 .args(["-c", "\"$@\"; exit $?", "sh"])
                 .arg(&aterm)
                 .args([aterm_uds::tether::VERB, stranger.as_str()])
                 .args(["/bin/sh", "/bin/sh", "-c", "echo ran"]),
-            Instant::now() + MUST_HAPPEN,
+            MUST_HAPPEN,
+            format!("the tether verb told pid {stranger}"),
         )
         .expect("run the front door's tether verb from a shell");
         assert_eq!(

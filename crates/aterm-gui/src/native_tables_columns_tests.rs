@@ -93,6 +93,7 @@ fn machines_and_disks() -> Snapshot {
     snapshot.sheets.push(disks);
     snapshot.listed.push(crate::tables_store::Listed {
         name: "disk",
+        family: snapshot.listed.first().map_or("", |listed| listed.family),
         title: "Disks",
         singular: "Disk",
         face: aterm_db::typed::Face::Owner,

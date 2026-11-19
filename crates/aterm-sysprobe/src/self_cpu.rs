@@ -9,6 +9,13 @@
 //! read interval. Quantization bounds do not bound that publication lag. Thread names describe
 //! observations, not ownership or a cause. Missing threads and names remain missing; this reader
 //! neither distributes a process remainder nor computes shares.
+//!
+//! [`read_asking`] also reads, for the threads its caller selects, the dispatch queue each was
+//! draining at the cut: the kernel's thread identifier record names the thread's queue slot,
+//! and the slot, the queue's label address (at the offset libdispatch exports in
+//! `dispatch_queue_offsets`) and the label are copied from this process's own memory through
+//! the kernel (`mach_vm_read_overwrite`), so a queue freed or a thread gone meanwhile answers
+//! [`Queue::Unread`] or a stale label, never a fault.
 
 use std::fmt;
 use std::time::Instant;
@@ -42,6 +49,33 @@ pub struct CpuCounter {
     pub precision_ns: u64,
 }
 
+/// One thread's published cumulative CPU split by mode, from the record its sum came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuSplit {
+    /// User-mode CPU, nanoseconds, published at whole microseconds.
+    pub user_ns: u64,
+    /// Kernel-mode CPU on the thread's behalf, nanoseconds, published at whole microseconds.
+    pub system_ns: u64,
+}
+
+/// The dispatch queue a thread was draining at a cut, as [`read_asking`] read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Queue {
+    /// Its queue slot held no queue (it drained none at the cut), or it has no slot.
+    None,
+    /// The queue's label: whole UTF-8 of at most [`LABEL_MAX`] bytes with its NUL, no control
+    /// character.
+    Label(String),
+    /// A queue whose label is absent or empty.
+    Unlabelled,
+    /// A copy of the slot, the queue or its label was refused, the label was malformed or
+    /// longer than [`LABEL_MAX`], or libdispatch's offsets table was not one this reads.
+    Unread,
+}
+
+/// The most label bytes [`read_asking`] copies for one queue, its NUL included.
+pub const LABEL_MAX: usize = 64;
+
 /// One successfully identified thread at this cut.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadReading {
@@ -51,6 +85,12 @@ pub struct ThreadReading {
     pub name: Option<String>,
     /// Published cumulative user plus system CPU; absent when unread or outside the numeric range.
     pub cpu: Option<CpuCounter>,
+    /// The user and system parts of [`Self::cpu`], read from the same record; present exactly
+    /// when `cpu` is, and they sum to its `ns`.
+    pub split: Option<CpuSplit>,
+    /// The dispatch queue it was draining, where the cut asked for it ([`read_asking`]); `None`
+    /// where it did not.
+    pub queue: Option<Queue>,
 }
 
 /// What one bounded census could observe, independent of how much CPU its threads used.
@@ -167,6 +207,10 @@ impl fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
+/// Whether [`read`] reads this process on this OS: macOS alone. Elsewhere it reads nothing and
+/// answers [`ReadError::Unsupported`] at once.
+pub const READS: bool = cfg!(target_os = "macos");
+
 /// Read this process alone, without starting a worker, opening a GUI API or changing policy.
 ///
 /// # Errors
@@ -174,13 +218,30 @@ impl std::error::Error for ReadError {}
 /// invalid clock or counter conversion, or failed Mach cleanup. Thread read failures instead
 /// remain visible in the successful cut's coverage and optional counters.
 pub fn read(epoch: Instant) -> Result<Cut, ReadError> {
+    read_asking(epoch, &mut |_, _| false)
+}
+
+/// [`read`], reading also the dispatch queue ([`ThreadReading::queue`]) of each thread `ask`
+/// selects, given its unique id and its CPU counter at this cut: at most four bounded copies
+/// from this process's own memory for each (its queue slot's word, the queue's label address,
+/// and the label in at most two pieces, split where it crosses a 4 KiB boundary), through the
+/// kernel, which refuses an unmapped or protected address rather than faulting. A thread not
+/// selected reads no queue.
+///
+/// # Errors
+/// As [`read`]'s; a queue that cannot be read is [`Queue::Unread`] on its thread, never an
+/// error of the cut.
+pub fn read_asking(
+    epoch: Instant,
+    ask: &mut dyn FnMut(u64, Option<CpuCounter>) -> bool,
+) -> Result<Cut, ReadError> {
     #[cfg(target_os = "macos")]
     {
-        macos::read(epoch)
+        macos::read(epoch, ask)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = epoch;
+        let _ = (epoch, ask);
         Err(ReadError::Unsupported)
     }
 }
@@ -190,8 +251,8 @@ pub fn read(epoch: Instant) -> Result<Cut, ReadError> {
 pub const SDK_ROWS: &[(&str, i64)] = macos::SDK_ROWS;
 
 #[cfg(any(target_os = "macos", test))]
-fn thread_counter(user_ns: u64, system_ns: u64) -> Result<CpuCounter, ReadError> {
-    Ok(CpuCounter {
+fn thread_counter(user_ns: u64, system_ns: u64) -> Result<(CpuCounter, CpuSplit), ReadError> {
+    let counter = CpuCounter {
         ns: user_ns
             .checked_add(system_ns)
             .ok_or(ReadError::CounterOverflow)?,
@@ -199,7 +260,8 @@ fn thread_counter(user_ns: u64, system_ns: u64) -> Result<CpuCounter, ReadError>
         // microseconds; THREAD_EXTENDED_INFO converts them to ns. The published sum loses less
         // than 2 us to that representation. No bound on unpublished running CPU follows.
         precision_ns: 2_000,
-    })
+    };
+    Ok((counter, CpuSplit { user_ns, system_ns }))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -232,6 +294,60 @@ fn thread_name(bytes: &[u8; 64]) -> Option<String> {
     }
     let name = std::str::from_utf8(&bytes[..end]).ok()?;
     (!name.is_empty() && !name.chars().any(char::is_control)).then(|| name.to_owned())
+}
+
+/// No copy of a label crosses a boundary of this span, the least page size of any Mac, so a
+/// label that ends before an unmapped page reads whole.
+#[cfg(any(target_os = "macos", test))]
+const LABEL_SPAN: u64 = 4096;
+
+/// The queue of the thread whose queue slot is at `slot` (`0`: none): the slot's word is the
+/// queue, the word `label_at` bytes into the queue is its label's address, and the label's
+/// bytes run to its NUL. `word` and `bytes` copy from this process's memory and answer `None`
+/// or `false` where the kernel refused; no copy of the label crosses a [`LABEL_SPAN`] boundary.
+#[cfg(any(target_os = "macos", test))]
+fn queue_at(
+    slot: u64,
+    label_at: u64,
+    word: &mut dyn FnMut(u64) -> Option<u64>,
+    bytes: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+) -> Queue {
+    if slot == 0 {
+        return Queue::None;
+    }
+    let Some(queue) = word(slot) else {
+        return Queue::Unread;
+    };
+    if queue == 0 {
+        return Queue::None;
+    }
+    let Some(label) = queue.checked_add(label_at).and_then(&mut *word) else {
+        return Queue::Unread;
+    };
+    if label == 0 {
+        return Queue::Unlabelled;
+    }
+    let mut buf = [0u8; LABEL_MAX];
+    let mut got = 0;
+    while got < LABEL_MAX {
+        let Some(at) = label.checked_add(got as u64) else {
+            return Queue::Unread;
+        };
+        let to_boundary = usize::try_from(LABEL_SPAN - at % LABEL_SPAN).unwrap_or(LABEL_MAX);
+        let n = to_boundary.min(LABEL_MAX - got);
+        if !bytes(at, &mut buf[got..got + n]) {
+            return Queue::Unread;
+        }
+        if let Some(nul) = buf[got..got + n].iter().position(|b| *b == 0) {
+            return match std::str::from_utf8(&buf[..got + nul]) {
+                Ok("") => Queue::Unlabelled,
+                Ok(label) if !label.chars().any(char::is_control) => Queue::Label(label.to_owned()),
+                _ => Queue::Unread,
+            };
+        }
+        got += n;
+    }
+    Queue::Unread
 }
 
 #[cfg(any(target_os = "macos", test))]

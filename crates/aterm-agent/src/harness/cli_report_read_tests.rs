@@ -348,6 +348,7 @@ fn combined_reports_age_cached_journal_quota_at_the_command_clock() {
     let window = |name: &str, reset, wall_until| WindowSeen {
         window: name.into(),
         sub: None,
+        model: None,
         figure: Some(Figure::Used {
             pct_x10: 1000,
             reset,

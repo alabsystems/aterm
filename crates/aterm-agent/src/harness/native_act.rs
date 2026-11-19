@@ -960,6 +960,26 @@ pub struct AskedRelaunchIntent {
     pub ask: String,
 }
 
+/// A fresh move where the host binds nothing its record's predecessor can be succeeded from: it
+/// was recreated since it settled that predecessor (the new host epoch holds no settlement of the
+/// old one, and no host can prove the old predecessor any more), every operation of its epoch
+/// ended owing nothing with nothing a later asked move succeeds, or its settlement is one nothing
+/// that runs can inherit (a person quit the vendor it placed and resumed the conversation by hand,
+/// another conversation is current in that vendor, or the built-in relaunch continuity it was
+/// settled under broke). The host qualifies the move only from its own current-epoch passive
+/// registration of the live vendor, never by reviving the predecessor. The binding names that
+/// registration; it is data the host checks against its own store, never a mutation capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskedReentryIntent {
+    /// The passive observation binding the host issued for this exact live vendor in its
+    /// current epoch ([`super::native_observe::Request::Register`]).
+    pub observation: super::native_observe::ObservationBinding,
+    /// The exact source-owned restart ask of a Memory restart's re-entry, which the host further
+    /// requires a scoped checked-producer authorization for, as for [`AskedRelaunchIntent`];
+    /// `None` for an upgrade's.
+    pub ask: Option<String>,
+}
+
 /// Mutually exclusive typed succession purposes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AskedIntent {
@@ -967,15 +987,102 @@ pub enum AskedIntent {
     Upgrade(AskedUpgradeIntent),
     /// Fresh live restart, additionally requiring scoped checked-producer authorization.
     Relaunch(AskedRelaunchIntent),
+    /// Fresh upgrade, or Memory restart where it names an ask, re-entering a host that binds no
+    /// succession, qualified by the host's own current-epoch registration.
+    Reentry(AskedReentryIntent),
 }
 
 impl AskedIntent {
-    /// The exact passive predecessor name, not an authority token.
+    /// The exact passive predecessor name, not an authority token; a re-entry names none.
     #[must_use]
-    pub fn predecessor(&self) -> &str {
+    pub fn predecessor(&self) -> Option<&str> {
         match self {
-            Self::Upgrade(intent) => &intent.predecessor,
-            Self::Relaunch(intent) => &intent.predecessor,
+            Self::Upgrade(intent) => Some(&intent.predecessor),
+            Self::Relaunch(intent) => Some(&intent.predecessor),
+            Self::Reentry(_) => None,
+        }
+    }
+
+    /// The exact source-owned restart ask of a Memory restart (a relaunch duty's intent, which the
+    /// host qualifies only with a scoped checked-producer authorization); `None` for an upgrade.
+    #[must_use]
+    pub fn relaunch_ask(&self) -> Option<&str> {
+        match self {
+            Self::Relaunch(intent) => Some(&intent.ask),
+            Self::Reentry(intent) => intent.ask.as_deref(),
+            Self::Upgrade(_) => None,
+        }
+    }
+
+    /// Whether every word this intent names is in its canonical shape.
+    fn canonical(&self) -> bool {
+        match self {
+            Self::Upgrade(_) | Self::Relaunch(_) => self
+                .predecessor()
+                .is_some_and(|predecessor| aterm_codec::hex::is_lower(predecessor, 32)),
+            Self::Reentry(intent) => {
+                aterm_codec::hex::is_lower(&intent.observation.id, 32)
+                    && aterm_codec::hex::is_lower(&intent.observation.host_epoch, 32)
+                    && aterm_codec::hex::is_lower(&intent.observation.capability, 64)
+                    && intent.ask.as_deref().is_none_or(relaunch_ask_word)
+            }
+        }
+    }
+}
+
+/// Whether `ask` is a restart ask the wire carries: bounded, non-empty, on one line.
+fn relaunch_ask_word(ask: &str) -> bool {
+    !ask.is_empty() && ask.len() <= 256 && !ask.contains(['\r', '\n', '\0'])
+}
+
+/// The restart ask a Memory restart's prepare carries hex-encoded (`asked-ask=`).
+fn parse_relaunch_ask(encoded: &str) -> Option<String> {
+    let ask = text_blob(encoded, 256)?;
+    relaunch_ask_word(&ask).then_some(ask)
+}
+
+/// What a host's current epoch admits after a passive predecessor ([`Request::Succession`]): data
+/// about its own operation table, read before any tell promises a move, never an admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Succession {
+    /// It settled the predecessor named, whose resulting vendor still runs in the foreground as
+    /// qualification requires: an asked move naming that predecessor. Never the answer where none
+    /// was named.
+    Predecessor,
+    /// It binds nothing in its epoch (recreated since, every operation of its epoch ended owing
+    /// nothing with nothing a later asked move succeeds, or its settlement is one nothing that
+    /// runs can inherit: its vendor or shell ended or replaced, another conversation current in
+    /// it, the built-in relaunch continuity it was settled under broken): a re-entry from its own
+    /// current-epoch registration ([`AskedIntent::Reentry`]).
+    Reentry,
+    /// Its epoch is bound otherwise, by the stage named (one [`stage_word`]): another operation
+    /// is in flight, unresolved or still owes something (its terminal append, a receipt flight, an
+    /// account lineage), it settled another predecessor, or the named one's live vendor is not
+    /// now what qualification requires yet can be again (out of the foreground, unread, a foreign
+    /// claim on Relaunch live now). Neither move is admitted until that changes or the host is
+    /// recreated; the stage is data for the wait log, never a grant.
+    Bound(String),
+}
+
+/// Whether `stage` is a host stage a [`Succession::Bound`] answer carries: one bounded word of
+/// lowercase letters, digits and hyphens.
+#[must_use]
+pub fn stage_word(stage: &str) -> bool {
+    !stage.is_empty()
+        && stage.len() <= 64
+        && stage
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+impl Succession {
+    /// Its one wire word.
+    #[must_use]
+    pub const fn word(&self) -> &'static str {
+        match self {
+            Self::Predecessor => "predecessor",
+            Self::Reentry => "reentry",
+            Self::Bound(_) => "bound",
         }
     }
 }
@@ -1152,14 +1259,23 @@ impl Prepare {
     /// current source, person sequence or producer, and grants no execution authority.
     #[must_use]
     pub fn asked_restart_shape(&self) -> bool {
-        matches!(
-            (&self.asked, self.duty),
-            (Some(AskedIntent::Upgrade(_)), Scope::Upgrade)
-                | (Some(AskedIntent::Relaunch(_)), Scope::Relaunch)
-        ) && self
+        let relaunch = self
             .asked
             .as_ref()
-            .is_some_and(|asked| aterm_codec::hex::is_lower(asked.predecessor(), 32))
+            .and_then(AskedIntent::relaunch_ask)
+            .is_some();
+        matches!(
+            (&self.asked, self.duty, relaunch),
+            (
+                Some(AskedIntent::Upgrade(_) | AskedIntent::Reentry(_)),
+                Scope::Upgrade,
+                false
+            ) | (
+                Some(AskedIntent::Relaunch(_) | AskedIntent::Reentry(_)),
+                Scope::Relaunch,
+                true
+            )
+        ) && self.asked.as_ref().is_some_and(AskedIntent::canonical)
             && matches!(
                 self.plan,
                 NativePlan::Restart {
@@ -1168,19 +1284,29 @@ impl Prepare {
                     ..
                 }
             )
-            && (!matches!(self.asked, Some(AskedIntent::Relaunch(_)))
+            && (!relaunch
                 || matches!(&self.plan, NativePlan::Restart { forward, .. }
                     if forward.settles.is_none() && !matches!(forward.account_intent.as_deref(), Some(super::accounts_pool::ExecutionIntent::Token { .. }))))
     }
 
     /// Required constructor capability; this is not an admission qualification.
     #[must_use]
-    pub const fn constructor(&self) -> Constructor {
+    pub fn constructor(&self) -> Constructor {
         match &self.asked {
-            Some(AskedIntent::Upgrade(_)) => Constructor::AskedUpgrade,
-            Some(AskedIntent::Relaunch(_)) => Constructor::AskedRelaunch,
+            Some(asked) if asked.relaunch_ask().is_some() => Constructor::AskedRelaunch,
+            Some(_) => Constructor::AskedUpgrade,
             None => self.plan.constructor(),
         }
+    }
+
+    /// Whether this prepare is a Memory restart's (a relaunch duty's asked intent), which the host
+    /// admits only under a scoped checked-producer authorization.
+    #[must_use]
+    pub fn checked_relaunch(&self) -> bool {
+        self.asked
+            .as_ref()
+            .and_then(AskedIntent::relaunch_ask)
+            .is_some()
     }
 }
 
@@ -1291,6 +1417,11 @@ pub enum Request {
     /// Discover the host's complete-recipient writer protocol separately from
     /// frozen Info fields and signed bundle reader capabilities.
     RecipientWriterSupport,
+    /// Read which asked move this host's current epoch admits after the named passive
+    /// predecessor, or after none for a record whose native operations never completed one
+    /// (`predecessor=-`), whose next asked move can only re-enter ([`Reply::Succession`]),
+    /// without claiming, preparing or moving anything. The frozen Info reply is unchanged.
+    Succession(Option<String>),
     /// Admit a complete plan, atomically with its actor and revision.
     Prepare(Box<Prepare>),
     /// Seal this exact original OwnImage preparation against future admission. A fresh
@@ -1428,6 +1559,13 @@ impl Request {
             "rejection-domain" => Self::RejectionDomain,
             "cancel-support" => Self::CancelSupport,
             "recipient-writer-support" => Self::RecipientWriterSupport,
+            "succession" => match take(&mut words, "predecessor")? {
+                "-" => Self::Succession(None),
+                predecessor if aterm_codec::hex::is_lower(predecessor, 32) => {
+                    Self::Succession(Some(predecessor.to_owned()))
+                }
+                _ => return None,
+            },
             "prepare" | "cancel-prepare" => {
                 let id = take(&mut words, "id")?.to_string();
                 if !aterm_codec::hex::is_lower(&id, 32) {
@@ -1498,8 +1636,43 @@ impl Request {
                     },
                     _ => return None,
                 };
-                let asked = match words.remove("asked-predecessor") {
+                let reentry = match words.remove("asked-reentry") {
                     None => None,
+                    Some(encoded)
+                        if matches!(
+                            &plan,
+                            NativePlan::Restart {
+                                observation: None,
+                                cold: None,
+                                ..
+                            }
+                        ) =>
+                    {
+                        let super::native_observe::Request::Refresh(observation) =
+                            super::native_observe::Request::parse(&text_blob(
+                                encoded,
+                                MAX_REQUEST,
+                            )?)?
+                        else {
+                            return None;
+                        };
+                        let ask = match (duty, words.remove("asked-relaunch")) {
+                            (Scope::Upgrade, None) => None,
+                            (Scope::Relaunch, Some("memory")) => {
+                                Some(parse_relaunch_ask(take(&mut words, "asked-ask")?)?)
+                            }
+                            _ => return None,
+                        };
+                        Some(AskedIntent::Reentry(AskedReentryIntent {
+                            observation,
+                            ask,
+                        }))
+                    }
+                    Some(_) => return None,
+                };
+                let asked = match words.remove("asked-predecessor") {
+                    None => reentry,
+                    Some(_) if reentry.is_some() => return None,
                     Some(predecessor)
                         if aterm_codec::hex::is_lower(predecessor, 32)
                             && matches!(
@@ -1517,10 +1690,7 @@ impl Request {
                                 Some(AskedIntent::Upgrade(AskedUpgradeIntent { predecessor }))
                             }
                             Some(kind) if duty == Scope::Relaunch => {
-                                let ask = text_blob(take(&mut words, "asked-ask")?, 256)?;
-                                if ask.is_empty() || ask.contains(['\r', '\n', '\0']) {
-                                    return None;
-                                }
+                                let ask = parse_relaunch_ask(take(&mut words, "asked-ask")?)?;
                                 if kind != "memory" {
                                     return None;
                                 }
@@ -1688,6 +1858,13 @@ impl Request {
             Self::RejectionDomain => out.push_str("rejection-domain"),
             Self::CancelSupport => out.push_str("cancel-support"),
             Self::RecipientWriterSupport => out.push_str("recipient-writer-support"),
+            Self::Succession(None) => out.push_str("succession predecessor=-"),
+            Self::Succession(Some(predecessor)) => {
+                if !aterm_codec::hex::is_lower(predecessor, 32) {
+                    return None;
+                }
+                write!(out, "succession predecessor={predecessor}").ok()?;
+            }
             Self::Prepare(_) | Self::CancelPrepare(_) => {
                 let p = match self {
                     Self::Prepare(prepare) => &**prepare,
@@ -1722,12 +1899,36 @@ impl Request {
                 if let Some(seq) = p.expected_human_seq {
                     write!(out, " human-seq={seq}").ok()?;
                 }
-                if let Some(asked) = &p.asked {
-                    write!(out, " asked-predecessor={}", asked.predecessor()).ok()?;
-                    if let AskedIntent::Relaunch(intent) = asked {
+                match &p.asked {
+                    None => {}
+                    Some(AskedIntent::Reentry(intent)) => {
                         write!(
                             out,
-                            " asked-relaunch=memory asked-ask={}",
+                            " asked-reentry={}",
+                            aterm_codec::hex::encode_lower(
+                                super::native_observe::Request::Refresh(intent.observation.clone())
+                                    .encode()?
+                                    .as_bytes()
+                            )
+                        )
+                        .ok()?;
+                        if let Some(ask) = &intent.ask {
+                            write!(
+                                out,
+                                " asked-relaunch=memory asked-ask={}",
+                                aterm_codec::hex::encode_lower(ask.as_bytes())
+                            )
+                            .ok()?;
+                        }
+                    }
+                    Some(AskedIntent::Upgrade(intent)) => {
+                        write!(out, " asked-predecessor={}", intent.predecessor).ok()?;
+                    }
+                    Some(AskedIntent::Relaunch(intent)) => {
+                        write!(
+                            out,
+                            " asked-predecessor={} asked-relaunch=memory asked-ask={}",
+                            intent.predecessor,
                             aterm_codec::hex::encode_lower(intent.ask.as_bytes())
                         )
                         .ok()?;
@@ -1926,6 +2127,14 @@ pub enum Reply {
         /// an absent row must never be probed by creating an ordinary foreign claim.
         own_image: Vec<String>,
     },
+    /// What this host's current epoch `epoch` admits after the predecessor a
+    /// [`Request::Succession`] named, or after none. Data only: it grants no admission.
+    Succession {
+        /// The host process epoch the answer is this host's own for.
+        epoch: String,
+        /// The asked move it admits now.
+        admits: Succession,
+    },
     /// The same operation is still waiting for its already-started predecessors.
     Pending(Binding),
     /// The same retained operation may now begin its exact mutation.
@@ -1939,8 +2148,11 @@ pub enum Reply {
     /// A private builtin completion also retained this positively observed new child for
     /// later crash admission. The frozen external OwnImage receipt is unchanged.
     RestartCommitted(Box<super::native_observe::SavedObservation>),
-    /// Historical cold completion retains the executed account intent even without a new watch.
-    ColdRestartCommitted {
+    /// A private builtin restart's completion naming the account intent its Execute admitted,
+    /// even without a new watch: a cold restart's, which its helper's resolution selected,
+    /// always; a warm one's where that Execute readmitted its stored login's new credential
+    /// generation in place of its command's intent (`accounts_pool::execution_readmission`).
+    AdmittedRestartCommitted {
         claim: ClaimOutcome,
         observation: Option<Box<super::native_observe::SavedObservation>>,
         intent: Box<super::accounts_pool::ExecutionIntent>,
@@ -2010,6 +2222,24 @@ pub fn closed_reply(id: &str) -> Option<String> {
     aterm_codec::hex::is_lower(id, 32).then(|| format!("OK native-act state=closed id={id}\n"))
 }
 
+/// The host's [`Reply::Succession`] line for its current epoch `epoch`, or `None` for a malformed
+/// epoch or bound stage ([`stage_word`]).
+#[must_use]
+pub fn succession_reply(epoch: &str, admits: &Succession) -> Option<String> {
+    if !aterm_codec::hex::is_lower(epoch, 32) {
+        return None;
+    }
+    let word = admits.word();
+    match admits {
+        Succession::Predecessor | Succession::Reentry => Some(format!(
+            "OK native-act state=succession epoch={epoch} admits={word}\n"
+        )),
+        Succession::Bound(stage) => stage_word(stage).then(|| {
+            format!("OK native-act state=succession epoch={epoch} admits={word} why={stage}\n")
+        }),
+    }
+}
+
 impl Reply {
     /// Parse a complete reply. Unknown fields are refused rather than guessed into a grant.
     #[must_use]
@@ -2056,6 +2286,28 @@ impl Reply {
                     _ => return None,
                 };
                 Self::RecipientWriterSupport(support)
+            }
+            "succession" => {
+                let epoch = words.next()?.strip_prefix("epoch=")?;
+                if !aterm_codec::hex::is_lower(epoch, 32) {
+                    return None;
+                }
+                let admits = match words.next()?.strip_prefix("admits=")? {
+                    "predecessor" => Succession::Predecessor,
+                    "reentry" => Succession::Reentry,
+                    "bound" => {
+                        let stage = words.next()?.strip_prefix("why=")?;
+                        if !stage_word(stage) {
+                            return None;
+                        }
+                        Succession::Bound(stage.to_owned())
+                    }
+                    _ => return None,
+                };
+                Self::Succession {
+                    epoch: epoch.to_owned(),
+                    admits,
+                }
             }
             "rejection-domain" => {
                 let domain = words.next()?.strip_prefix("domain=")?;
@@ -2154,7 +2406,7 @@ impl Reply {
                                     )?)?,
                                 )),
                             };
-                            Self::ColdRestartCommitted {
+                            Self::AdmittedRestartCommitted {
                                 claim: outcome,
                                 observation,
                                 intent: Box::new(intent),
@@ -2316,7 +2568,9 @@ pub fn commit<S: std::io::Read + std::io::Write>(
         &Request::Commit(binding.clone(), phase, version.to_string()),
     ) {
         Ok(
-            Reply::Committed(_) | Reply::RestartCommitted(_) | Reply::ColdRestartCommitted { .. },
+            Reply::Committed(_)
+            | Reply::RestartCommitted(_)
+            | Reply::AdmittedRestartCommitted { .. },
         ) => Decision::Committed,
         Ok(Reply::Decision(decision)) => decision,
         Ok(Reply::Closed(id)) if id == binding.id => Decision::Closed,

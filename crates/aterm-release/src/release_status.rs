@@ -600,6 +600,7 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
     let latest_release_event = release_events.latest.unwrap_or(aterm_json::Value::Null);
     let latest_verification_event = events.latest.unwrap_or(aterm_json::Value::Null);
     let op_status = operational_status(logs.as_deref());
+    let pump = pump_status(&dir, &mut crate::release_steps::started_of);
     let value = aterm_json::Value::Object(aterm_json::Map::from([
         ("schema".to_string(), aterm_json::Value::Number(1u64.into())),
         (
@@ -712,6 +713,7 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
             aterm_json::Value::Number((rejected_log_lines as u64).into()),
         ),
         ("timeline".to_string(), timeline),
+        ("pump".to_string(), pump),
     ]));
     if json {
         println!("{value}");
@@ -803,6 +805,7 @@ fn text_status(value: &aterm_json::Value) -> String {
         };
         lines.push(format!("observations: incomplete{detail}"));
     }
+    lines.extend(pump_lines(&value["pump"]));
     lines.join("\n")
 }
 
@@ -826,6 +829,116 @@ fn timeline_line(timeline: &aterm_json::Value) -> Option<String> {
         words.push(format!("{fresh} units fresh / {compiled} compiled"));
     }
     Some(words.join(", "))
+}
+
+/// The release pump's memory beside the journal ([`aterm_release::pump::MEMORY_FILE`]), read
+/// without the pump: what it does now and since when, whether that pump still runs (its pid with
+/// the process start it recorded, which a later process given the pid does not have), its last
+/// run, and the red line it holds. `null` where no pump kept a memory here.
+fn pump_status(dir: &Path, started_of: &mut dyn FnMut(u32) -> Option<String>) -> aterm_json::Value {
+    use aterm_release::pump::{MEMORY_FILE, Memory};
+    let path = dir.join(MEMORY_FILE);
+    let unknown = |reason: String| aterm_json::json!({"state": "unknown", "reason": reason, "memory": path.display().to_string()});
+    let text = match crate::durable::read_regular_text(&path, 1024 * 1024) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return aterm_json::Value::Null;
+        }
+        Err(error) => return unknown(error.to_string()),
+    };
+    let memory: Memory = match aterm_toml::from_str(&text) {
+        Ok(memory) => memory,
+        Err(error) => return unknown(format!("{MEMORY_FILE} does not read: {error}")),
+    };
+    let state = match &memory.doing {
+        None => "unknown",
+        Some(doing)
+            if !doing.started.is_empty()
+                && started_of(doing.pid).as_deref() == Some(doing.started.as_str()) =>
+        {
+            "running"
+        }
+        Some(_) => "not-running",
+    };
+    let doing = memory.doing.as_ref();
+    let last = memory.last.as_ref().map(|last| {
+        aterm_json::json!({
+            "run": last.verb.args(&[]).join(" "),
+            "code": last.code,
+            "final_line": last.last.clone(),
+            "at": last.at,
+        })
+    });
+    let red = memory.red.as_ref().map(|red| {
+        aterm_json::json!({
+            "version": red.version.clone(),
+            "head": red.head.clone(),
+            "input_hash": red.hash.clone(),
+            "at": red.at,
+            "final_line": red.last.clone(),
+        })
+    });
+    aterm_json::json!({
+        "state": state,
+        "pid": doing.map(|doing| doing.pid),
+        "reason": doing.map(|doing| doing.reason.clone()),
+        "since": doing.map(|doing| doing.since),
+        "last": last,
+        "red": red,
+        "memory": path.display().to_string(),
+    })
+}
+
+/// The pump's lines of the text status ([`pump_status`]).
+fn pump_lines(pump: &aterm_json::Value) -> Vec<String> {
+    let at = |field: &aterm_json::Value| {
+        field
+            .as_u64()
+            .map_or_else(|| "?".to_string(), aterm_types::rfc3339::format_rfc3339)
+    };
+    let mut lines = Vec::new();
+    match pump["state"].as_str() {
+        None => return lines,
+        Some("running") => lines.push(format!(
+            "pump: running (pid {}) since {}: {}",
+            pump["pid"],
+            at(&pump["since"]),
+            pump["reason"].as_str().unwrap_or("?")
+        )),
+        Some("not-running") => lines.push(format!(
+            "pump: not running (pid {} has ended); its last word, at {}: {}",
+            pump["pid"],
+            at(&pump["since"]),
+            pump["reason"].as_str().unwrap_or("?")
+        )),
+        Some(_) => lines.push(format!(
+            "pump: unknown ({})",
+            pump["reason"]
+                .as_str()
+                .unwrap_or("its memory records nothing of what it does")
+        )),
+    }
+    let last = &pump["last"];
+    if !last.is_null() {
+        lines.push(format!(
+            "pump last run: {} exit {} at {}: {}",
+            last["run"].as_str().unwrap_or("?"),
+            last["code"],
+            at(&last["at"]),
+            last["final_line"].as_str().unwrap_or("")
+        ));
+    }
+    let red = &pump["red"];
+    if !red.is_null() {
+        lines.push(format!(
+            "pump red: v{} at {} (input hash {}) at {}",
+            red["version"].as_str().unwrap_or("?"),
+            red["head"].as_str().unwrap_or("its start"),
+            red["input_hash"].as_str().unwrap_or("?"),
+            at(&red["at"])
+        ));
+    }
+    lines.into_iter().map(scrub_controls).collect()
 }
 
 fn operational_status(logs: Option<&Path>) -> aterm_json::Value {

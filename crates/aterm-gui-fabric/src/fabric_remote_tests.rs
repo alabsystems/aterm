@@ -267,11 +267,12 @@ fn a_local_off_lifts_a_nodes_hold_once_that_node_may_drive_this_mac_no_more() {
 fn a_drives_requester_is_kept_apart_from_its_driver_for_the_guard() {
     let driver = mac(7, "m7.local");
     let asked = Requester::of(
-        Some("s-0123456789abcdef0123"),
+        Some("tqn5r6e0148"),
         Some("claude"),
         Some("Opus 5.5"),
         Some("team"),
     );
+    assert_eq!(asked.sid(), Some("tqn5r6e0148"));
     assert_eq!(serving_requester(), None);
     {
         let _driving = DrivingAs::requested(driver.clone(), asked.clone());
@@ -288,9 +289,9 @@ fn a_drives_requester_is_kept_apart_from_its_driver_for_the_guard() {
     assert_eq!(serving_requester(), None);
 }
 
-/// A REQUESTER'S SID SHAPE IS THE ONE ATERM MINTS: `aterm_types`' copy of the check answers as
-/// `aterm_session::is_minted_sid` does, for a minted id and for each near miss, and for the exact
-/// `s-` and 20 lower-case hex digits a tab opened before the `t` form keeps, which both take.
+/// A LIVE REQUESTER NAMES A CURRENT TAB ID: its check follows the canonical tab-ID grammar.
+/// Local session and control readers separately keep the exact `s-` and 20 lower-case hex ID
+/// of a tab this Mac still holds; that local identity is no fleet requester.
 /// NEGATIVE CONTROLS: the loose `s-` forms 1853feba2aa retired (a short hex run, a name), and a
 /// legacy ID upper case, a digit short or long, or with a letter outside hex, which neither takes.
 #[test]
@@ -328,19 +329,56 @@ fn requester_sid_shape_matches_minted_sid() {
     for case in &cases {
         assert_eq!(
             aterm_types::control_verbs::is_minted_sid(case),
+            aterm_types::tab_id::is_tab_id(case),
+            "current requester: {case:?}"
+        );
+        assert_eq!(
             aterm_session::is_minted_sid(case),
-            "{case:?}"
+            aterm_types::control_request::Sid::parse(case).is_some(),
+            "local session: {case:?}"
         );
     }
     assert!(aterm_types::control_verbs::is_minted_sid(minted.as_str()));
+    let requester = Requester::of(Some(minted.as_str()), None, None, None);
+    assert_eq!(requester.sid(), Some(minted.as_str()));
+    assert_eq!(
+        Requester::parse(&requester.line()).expect("a current requester"),
+        requester
+    );
+    assert_eq!(
+        SessionId::parse(legacy)
+            .expect("a local legacy session")
+            .as_str(),
+        legacy
+    );
+    assert_eq!(
+        aterm_types::control_request::Sid::parse(legacy)
+            .expect("a local legacy control target")
+            .as_str(),
+        legacy
+    );
+    assert!(aterm_session::is_minted_sid(legacy));
     assert!(
-        aterm_types::control_verbs::is_minted_sid(legacy),
-        "a legacy tab's exact ID"
+        !aterm_types::control_verbs::is_minted_sid(legacy),
+        "a local legacy ID is no current requester ID"
+    );
+    assert_eq!(Requester::of(Some(legacy), None, None, None).sid(), None);
+    assert!(
+        Requester::parse(&format!(
+            "requester sid={legacy} program=- model=- account=-\n"
+        ))
+        .is_err(),
+        "a legacy sid on the live requester wire is refused"
     );
     for word in retired {
         assert!(
             !aterm_types::control_verbs::is_minted_sid(word),
             "CONTROL: {word:?}"
+        );
+        assert!(
+            !aterm_session::is_minted_sid(word)
+                && aterm_types::control_request::Sid::parse(word).is_none(),
+            "LOCAL CONTROL: {word:?}"
         );
     }
 }

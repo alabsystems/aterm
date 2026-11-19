@@ -3634,6 +3634,35 @@ fn driving(places: &Places) -> Option<Vec<String>> {
     )
 }
 
+/// Every member this Mac's listener lets drive it now ([`driving`]), each with the key its books
+/// bind it to and the book entry it is dialed at: none while a grant names any and this Mac
+/// cannot read its deny list or its log, as no listener admits one then. A unit source asks only
+/// these (DC-24b): a member that may start a plain shell here may also hand this Mac's builds a
+/// unit.
+#[must_use]
+pub fn admitted_members() -> Vec<(Peer, aterm_net::fleet::NodeKey)> {
+    Places::here().map_or_else(|_| Vec::new(), |places| admitted_members_in(&places))
+}
+
+/// [`admitted_members`] of the fleet state at `places`.
+fn admitted_members_in(places: &Places) -> Vec<(Peer, aterm_net::fleet::NodeKey)> {
+    let Some(nodes) = driving(places) else {
+        return Vec::new();
+    };
+    let keys = Keyring::read(&places.state);
+    member::bound_peers(&places.state)
+        .into_iter()
+        .filter_map(|peer| {
+            let node = peer.node.as_deref()?;
+            let key = keys.bound(node)?;
+            nodes
+                .iter()
+                .any(|admitted| admitted == node)
+                .then_some((peer, key))
+        })
+        .collect()
+}
+
 /// The drive grants aterm.toml names that admit now ([`configured_grants`] where this Mac's fleet
 /// state is of the vault configured now, none where it is of another:
 /// [`crate::fleet_vault::grants_in_effect`], as every listener reads them).
@@ -3784,14 +3813,30 @@ fn others_listed(places: &Places, book: &[Peer]) -> Vec<Peer> {
 /// [`copy_first`]).
 /// # Errors
 /// `what` names more than one peer, or names the issuer otherwise while no book here says which
-/// other members it names.
+/// other members it names, or the registry refuses a registry label ([`LabelRefused`]).
 fn named_here(
     places: &Places,
     book: &[Peer],
     what: &str,
     unread: Option<&Missed>,
 ) -> Result<Option<Peer>, String> {
-    if let Some(node) = registry_label_node(places, what, None)? {
+    named_here_by(places, book, what, unread, Labels::Registry)
+}
+
+/// [`named_here`], a registry label read as `labels` says: by [`Labels::Book`], as every other
+/// word is.
+/// # Errors
+/// As [`named_here`].
+fn named_here_by(
+    places: &Places,
+    book: &[Peer],
+    what: &str,
+    unread: Option<&Missed>,
+    labels: Labels,
+) -> Result<Option<Peer>, String> {
+    if labels == Labels::Registry
+        && let Some(node) = registry_label_node(places, what, None)?
+    {
         return Ok(book
             .iter()
             .find(|peer| peer.node.as_deref() == Some(&node))
@@ -5221,7 +5266,21 @@ fn roster_identities(places: &Places) -> Result<Vec<member::PeerIdentity>, Strin
 /// This machine's own node, where `word` names it ([`member::names_node`]). Also matches `[fleet]
 /// machine` in aterm.toml and the locally assigned primary name. A registry label uses the
 /// two-sided binding before any older roster or signed primary name can name this machine.
+/// # Errors
+/// The roster cannot be read, or the registry refuses a registry label ([`LabelRefused`]).
 fn names_this_machine(places: &Places, word: &str) -> Result<Option<String>, String> {
+    names_this_machine_by(places, word, Labels::Registry)
+}
+
+/// [`names_this_machine`], a registry label read as `labels` says: by [`Labels::Book`], by this
+/// machine's own names alone, as every other word is.
+/// # Errors
+/// As [`names_this_machine`].
+fn names_this_machine_by(
+    places: &Places,
+    word: &str,
+    labels: Labels,
+) -> Result<Option<String>, String> {
     let Some(own) = own_node(places) else {
         return Ok(None);
     };
@@ -5235,7 +5294,9 @@ fn names_this_machine(places: &Places, word: &str) -> Result<Option<String>, Str
     if word.is_empty() {
         return Ok(None);
     }
-    if let Some(node) = registry_label_node(places, word, None)? {
+    if labels == Labels::Registry
+        && let Some(node) = registry_label_node(places, word, None)?
+    {
         return Ok((node == own).then_some(own));
     }
     let vault_paths = vault_paths_for(places);
@@ -5299,7 +5360,19 @@ fn this_machine_alone(
     word: &str,
     unread: Option<&Missed>,
 ) -> Result<Option<String>, String> {
-    let Some(own) = names_this_machine(places, word)? else {
+    this_machine_alone_by(places, word, unread, Labels::Registry)
+}
+
+/// [`this_machine_alone`], a registry label read as `labels` says ([`names_this_machine_by`]).
+/// # Errors
+/// As [`this_machine_alone`].
+fn this_machine_alone_by(
+    places: &Places,
+    word: &str,
+    unread: Option<&Missed>,
+    labels: Labels,
+) -> Result<Option<String>, String> {
+    let Some(own) = names_this_machine_by(places, word, labels)? else {
         return Ok(None);
     };
     let book = member::read_peers(&places.state).unwrap_or_default();
@@ -7877,9 +7950,21 @@ enum Bound {
 /// The book cannot be read, or `what` names more than one peer, or an entry with no node at the
 /// place of more than one node.
 fn bound_peer(places: &Places, what: &str, unread: Option<&Missed>) -> Result<Bound, Failure> {
+    bound_peer_by(places, what, unread, Labels::Registry)
+}
+
+/// [`bound_peer`], a registry label read as `labels` says ([`named_here_by`]).
+/// # Errors
+/// As [`bound_peer`].
+fn bound_peer_by(
+    places: &Places,
+    what: &str,
+    unread: Option<&Missed>,
+    labels: Labels,
+) -> Result<Bound, Failure> {
     let bound = member::bound_peers(&places.state);
     let book = member::read_peers(&places.state).map_err(failed)?;
-    let Some(peer) = named_here(places, &book, what, unread).map_err(failed)? else {
+    let Some(peer) = named_here_by(places, &book, what, unread, labels).map_err(failed)? else {
         return Ok(Bound::Nobody);
     };
     Ok(match &peer.node {
@@ -7928,31 +8013,237 @@ fn bound_peer(places: &Places, what: &str, unread: Option<&Missed>) -> Result<Bo
 /// machine's issuer answers to is left as it is while no copy of its book is held or its read
 /// before brought none to keep (`unread`), so [`named_here`] refuses it as it does every word that
 /// names the issuer loosely: a member that joined since may answer to it.
+///
+/// A registry label (`m2`) binds the seat the registry names by `by` ([`registry_label_node`]).
+/// Where the registry gives no answer for it at all ([`LabelRefused::gave_no_answer`]: it is
+/// unread, its history here is incomplete, or no seat here can be bound to the node its row
+/// names), the label binds the one Mac the book, the copy and the roster name by it
+/// ([`book_label_node`]), that node's Mac where the registry's row named one; never where the
+/// registry names another Mac, none, or two, nor once `by` has passed: no time is left to ask the
+/// Mac the book names, and its silence would be blamed for this Mac's unanswered registry.
 /// # Errors
-/// The book cannot be read, a registry label cannot be resolved by `by`, or `what` is a short name
-/// of more than one peer ([`member::several_short`]).
+/// The book cannot be read; the registry refuses a registry label other than by giving no answer,
+/// or gives none once `by` has passed; the book names more than one Mac by a label the registry
+/// gave no answer for, or another Mac than the one its row names; or `what` is a short name of
+/// more than one peer ([`member::several_short`]).
 fn host_word(
     places: &Places,
     what: &str,
     unread: Option<&Missed>,
     by: Instant,
-) -> Result<String, String> {
+) -> Result<HostWord, String> {
     if member::is_node_word(what) {
-        return Ok(what.to_owned());
+        return Ok(HostWord::of(what.to_owned()));
     }
-    if let Some(node) = registry_label_node(places, what, Some(by))? {
-        return Ok(node);
+    bind_host_word(
+        places,
+        what,
+        unread,
+        by,
+        registry_label_node(places, what, Some(by)),
+    )
+}
+
+/// [`host_word`] for `what`, a word that is no node's, once `registry` is what the registry
+/// said of it ([`registry_label_node`]).
+/// # Errors
+/// As [`host_word`].
+fn bind_host_word(
+    places: &Places,
+    what: &str,
+    unread: Option<&Missed>,
+    by: Instant,
+    registry: Result<Option<String>, LabelRefused>,
+) -> Result<HostWord, String> {
+    match registry {
+        Ok(Some(node)) => Ok(HostWord::of(node)),
+        Ok(None) => {
+            host_word_among(places, what, unread, &roster_identities(places)?).map(HostWord::of)
+        }
+        Err(refused) if refused.gave_no_answer() && Instant::now() >= by => Err(format!(
+            "{}; the time this was given ran out before any Mac was asked, so none was: try again",
+            refused.cause()
+        )),
+        Err(refused) if refused.gave_no_answer() => book_label_node(places, what, unread, refused),
+        Err(refused) => Err(refused.into()),
     }
-    host_word_among(places, what, unread, &roster_identities(places)?)
+}
+
+/// [`host_word`] once more, after the issuer's book was read again ([`copy_again`]): a label the
+/// registry gave no answer for (`before`) is read by the book again, the registry not twice.
+/// # Errors
+/// As [`host_word`].
+fn host_word_again(
+    places: &Places,
+    what: &str,
+    by: Instant,
+    before: HostWord,
+) -> Result<HostWord, String> {
+    match before.unanswered {
+        Some(refused) => book_label_node(places, what, None, refused),
+        None => host_word(places, what, None, by),
+    }
+}
+
+/// What a drive's or a read's word binds ([`host_word`]).
+#[derive(Debug)]
+struct HostWord {
+    /// The word to bind: a node id, an entry's address and port where it has no node, or the word
+    /// itself, read as every verb reads it.
+    word: String,
+    /// Why the registry gave no answer for it, where it is a registry label read by the book
+    /// instead ([`book_label_node`]): every later read of [`Self::word`] reads the label so
+    /// ([`Self::labels`]), never the registry again, and a label no book here names is refused
+    /// with this cause ([`Self::lead`]), never asked of DNS as a host.
+    unanswered: Option<LabelRefused>,
+}
+
+impl HostWord {
+    /// A word bound as every verb reads it, a registry label by the registry.
+    const fn of(word: String) -> Self {
+        Self {
+            word,
+            unanswered: None,
+        }
+    }
+
+    /// Where a later read of [`Self::word`] reads a registry label from.
+    const fn labels(&self) -> Labels {
+        if self.unanswered.is_some() {
+            Labels::Book
+        } else {
+            Labels::Registry
+        }
+    }
+
+    /// What leads a refusal of a word that names no Mac: for a label the registry gave no answer
+    /// for, why, cause first; for any other word, nothing.
+    fn lead(&self) -> String {
+        self.unanswered
+            .as_ref()
+            .map_or_else(String::new, |refused| format!("{}; ", refused.cause()))
+    }
+}
+
+/// What the registry label `what` binds by the book, the copy and the roster alone, read as every
+/// other word is ([`host_word_among`], [`this_machine_alone`], [`named_here`], with
+/// [`Labels::Book`]), for a drive or a read whose registry gave no answer for it (`refused`,
+/// [`host_word`]): the one Mac it names, by its whole node id (an entry with no node by its
+/// address and port), said on stderr before the drive or read as `target=<label>
+/// node=<principal> transport=<id> by=book` (`node=-` where no key here binds it). Where the
+/// registry's row named a node no seat here could be bound to ([`LabelRefused::registry_node`]),
+/// the book's Mac must be that node's. Each Mac signs its own book name, and the registry may give
+/// the same word to another Mac, so a word two Macs answer to here is refused, never picked. A
+/// label no book here names stays as typed, with `refused`, so the caller reads its issuer's book
+/// again as for every word that names no Mac ([`copy_again`], [`host_word_again`]) and refuses it
+/// with the registry's cause. A removal never reads a label this way ([`removal_seat_at`]).
+///
+/// The fleet handshake that carried each book record authenticates it today; once one-mesh wave
+/// D deletes that handshake (FL-247), this read accepts a record only from a node key the
+/// membership log seats.
+/// # Errors
+/// The book or the roster cannot be read; `what` names more than one Mac, this machine among them,
+/// or names this machine's issuer loosely while no book here lists its members; or it names
+/// another Mac than the node the registry's row names.
+fn book_label_node(
+    places: &Places,
+    what: &str,
+    unread: Option<&Missed>,
+    refused: LabelRefused,
+) -> Result<HostWord, String> {
+    let identities = roster_identities(places)?;
+    let word = host_word_among_by(places, what, unread, &identities, Labels::Book)?;
+    let node = if word != what {
+        word
+    } else if let Some(own) = this_machine_alone_by(places, what, unread, Labels::Book)? {
+        own
+    } else {
+        let book = member::read_peers(&places.state).map_err(|e| e.to_string())?;
+        match named_here_by(places, &book, what, unread, Labels::Book)? {
+            Some(peer) => peer.node.clone().unwrap_or_else(|| peer.target()),
+            None => {
+                return Ok(HostWord {
+                    word: what.to_owned(),
+                    unanswered: Some(refused),
+                });
+            }
+        }
+    };
+    let label = registry_label(what).unwrap_or_else(|| aterm_codec::tty::one_line(what, 80));
+    let principal = key_here(places, &node).map(member::node_principal);
+    if let Some(row) = refused.registry_node()
+        && principal.as_deref().and_then(|p| p.strip_prefix("n-")) != Some(row)
+    {
+        return Err(format!(
+            "{}; the book names `{label}` {}, not the Mac of node n-{row} the registry's row \
+             names, so nothing was asked of either: use a node id",
+            refused.cause(),
+            principal.map_or_else(
+                || format!("{node}, whose key no book here binds"),
+                |principal| format!("{principal} ({node})")
+            )
+        ));
+    }
+    say_target(format!(
+        "target={label} node={} transport={node} by=book",
+        principal.as_deref().unwrap_or("-")
+    ));
+    Ok(HostWord {
+        word: node,
+        unanswered: Some(refused),
+    })
+}
+
+/// The node key this Mac binds to `node`: its own, or the one its book and copy bind
+/// ([`member::bound_peers`]).
+fn key_here(places: &Places, node: &str) -> Option<NodeKey> {
+    own_identity(places)
+        .filter(|me| me.node() == node)
+        .map(|me| me.key())
+        .or_else(|| {
+            member::bound_peers(&places.state)
+                .into_iter()
+                .find(|peer| peer.node.as_deref() == Some(node))
+                .and_then(|peer| peer.key)
+        })
+}
+
+/// Where a verb reads a word that parses as a registry label ([`registry_label`]) from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Labels {
+    /// The registry's two-sided binding, before any name the book holds ([`registry_label_node`]):
+    /// every verb's.
+    Registry,
+    /// The book, the copy and the roster alone, as every other word is read: a drive's or a
+    /// read's once the registry gave no answer for the label ([`book_label_node`]).
+    Book,
+}
+
+/// Says on stderr which Mac a word named for a drive, a read or a removal, and by which source:
+/// the record a person reads before the act.
+fn say_target(line: String) {
+    #[cfg(test)]
+    SAID_TARGETS.with_borrow_mut(|said| said.push(line.clone()));
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Each line [`say_target`] said on this thread, for a test to read.
+    static SAID_TARGETS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A registry label is authority only where its owner cell and the seat's signed facts
-/// agree. Transport ids from an older book are selected by key, never by a host name.
+/// agree. Transport ids from an older book are selected by key, never by a host name. A drive's,
+/// a read's, a grant's or `peers rm`'s word ([`LabelFor::Reach`]).
+/// # Errors
+/// As [`registry_target_until`].
 fn registry_label_node(
     places: &Places,
     word: &str,
     by: Option<Instant>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, LabelRefused> {
     let Some(label) = registry_label(word) else {
         return Ok(None);
     };
@@ -7960,6 +8251,7 @@ fn registry_label_node(
         places,
         &label,
         by.unwrap_or_else(|| after_now(REGISTRY_READ)),
+        LabelFor::Reach,
     )
     .map(|seat| seat.map(|seat| seat.transport))
 }
@@ -7986,26 +8278,129 @@ struct RegistryTarget {
 /// the word is resolved, so a slow registry leaves the connection less of it.
 const REGISTRY_READ: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The refusal of a label this Mac's registry could not be read for, saying what to do: a label
-/// names a Mac only where the registry and the signed seats agree (one-mesh B2), so the word is
-/// read no other way, while a node a book holds needs no registry.
-fn registry_unread(word: &str, why: &dyn std::fmt::Display) -> String {
-    format!(
-        "{word}: registry unread: {why}; a label names a Mac only where this Mac's registry and \
-         the signed seats agree, so nothing was done: try again, or name the Mac by the node \
-         `aterm fleet peers` lists for it (`aterm db commons-status` shows this Mac's Commons)"
-    )
+/// Why B2's resolver named no seat for a word ([`registry_target_until`]), each with its words,
+/// cause first. The first three are no answer at all: a drive or a read then reads the label by
+/// the book ([`host_word`]), and a removal refuses ([`removal_seat_at`]). The rest are the
+/// registry's or the seats' own answer, which every verb refuses.
+#[derive(Debug)]
+enum LabelRefused {
+    /// The registry could not be read: this Mac's Commons serves no table read, or the read ran
+    /// out of time.
+    Unread(String),
+    /// The registry's history here is incomplete.
+    Incomplete(String),
+    /// The membership log cannot be read, or no membership is acknowledged here, so no seat can
+    /// be bound. For a label, `node` is the node its one live registry row names, the only Mac
+    /// the book may then name by it ([`book_label_node`]): the registry did answer which Mac
+    /// the label is, and only the seat binding it is unread.
+    NoMembership { said: String, node: Option<String> },
+    /// No live registry row carries the label, or no standing seat binds the node id.
+    Absent(String),
+    /// The label's row has its label or node cell missing, raw or conflicted.
+    Conflicted(String),
+    /// Two live rows carry the label, or the registry and the seats disagree on it: no standing
+    /// seat, or more than one, holds the row's node, or the one that does is another Mac's; or,
+    /// for a removal, the row's Mac holds another standing seat beside it ([`LabelFor::Removal`]).
+    Disputed(String),
 }
 
-fn registry_target(places: &Places, word: &str) -> Result<Option<RegistryTarget>, String> {
-    registry_target_until(places, word, after_now(REGISTRY_READ))
+impl LabelRefused {
+    /// Whether the registry gave no answer at all for the word, as against an answer that names
+    /// another Mac, none, or two.
+    const fn gave_no_answer(&self) -> bool {
+        matches!(
+            self,
+            Self::Unread(_) | Self::Incomplete(_) | Self::NoMembership { .. }
+        )
+    }
+
+    /// The node the label's one live registry row names where no seat here could be bound to it
+    /// ([`Self::NoMembership`]): the Mac the book must name by the label, if it names one.
+    fn registry_node(&self) -> Option<&str> {
+        match self {
+            Self::NoMembership { node, .. } => node.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Its cause, without what a verb that refuses says to do instead.
+    fn cause(&self) -> &str {
+        match self {
+            Self::Unread(cause)
+            | Self::Incomplete(cause)
+            | Self::NoMembership { said: cause, .. }
+            | Self::Absent(cause)
+            | Self::Conflicted(cause)
+            | Self::Disputed(cause) => cause,
+        }
+    }
 }
 
+/// What a registry label names a seat for ([`resolve_registry_label`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LabelFor {
+    /// A drive, a read, a grant or `peers rm`: the standing seat that holds the row's node.
+    /// Another standing seat of the same Mac (a second home on it, an enrollment not folded yet)
+    /// holds another node and is no dispute.
+    Reach,
+    /// A removal ([`removal_seat_at`]): the seat that holds the row's node, and only where it is
+    /// the row's Mac's one standing seat. A removal takes out one seat's recipient and the writer
+    /// successors below it, never a second account on that Mac or that Mac back with a new key
+    /// while its old seat stands (whose node the row's write-once node cell may still name): such
+    /// a seat would stay in, and every new epoch wrap to it, while the person believes the Mac is
+    /// out. Each is removed by its own node id.
+    Removal,
+}
+
+impl std::fmt::Display for LabelRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Only a verb that refuses a label the registry gave no answer for says this: a
+            // removal, a grant, `peers rm`. A node a book holds needs no registry.
+            Self::Unread(cause) => write!(
+                f,
+                "{cause}; this verb names a Mac by a label only where this Mac's registry and \
+                 the signed seats agree, so nothing was done: try again, or name the Mac by the \
+                 node `aterm fleet peers` lists for it (`aterm db commons-status` shows this \
+                 Mac's Commons)"
+            ),
+            Self::Incomplete(cause) => write!(f, "{cause}; use a node id"),
+            Self::NoMembership { said, .. }
+            | Self::Absent(said)
+            | Self::Conflicted(said)
+            | Self::Disputed(said) => f.write_str(said),
+        }
+    }
+}
+
+impl From<LabelRefused> for String {
+    fn from(refused: LabelRefused) -> Self {
+        refused.to_string()
+    }
+}
+
+/// The standing seat a removal's `word` names ([`registry_target_until`],
+/// [`LabelFor::Removal`]), read by the registry's own budget.
+/// # Errors
+/// As [`registry_target_until`].
+fn registry_target(places: &Places, word: &str) -> Result<Option<RegistryTarget>, LabelRefused> {
+    registry_target_until(places, word, after_now(REGISTRY_READ), LabelFor::Removal)
+}
+
+/// The standing seat `word` names by `by`: for a node id, the one standing seat that binds it;
+/// for a registry label, the one its live registry row's node selects for what `purpose` does
+/// with it ([`resolve_registry_label`]), said on stderr. `None` where `word` is neither, or this
+/// Mac holds no vault.
+/// # Errors
+/// [`LabelRefused`]: for a label, the registry is unread or its history incomplete; the
+/// membership log is unread or no membership is acknowledged; or no standing seat, or more than
+/// one, binds the node id, or the registry names no seat for the label.
 fn registry_target_until(
     places: &Places,
     word: &str,
     by: Instant,
-) -> Result<Option<RegistryTarget>, String> {
+    purpose: LabelFor,
+) -> Result<Option<RegistryTarget>, LabelRefused> {
     let explicit = member::is_node_id(word);
     let label = if explicit { None } else { registry_label(word) };
     if !explicit && label.is_none() {
@@ -8015,25 +8410,91 @@ fn registry_target_until(
     let Some(paths) = vault_paths_for(places) else {
         return Ok(None);
     };
-    let registry = (!explicit)
-        .then(|| {
-            aterm_db::alab::Registry::at(paths.clone()).view_until(by.min(after_now(REGISTRY_READ)))
-        })
-        .transpose()
-        .map_err(|why| registry_unread(word, &why))?;
-    if registry.as_ref().is_some_and(|view| !view.complete) {
-        return Err(format!(
-            "{word}: registry history incomplete; use a node id"
-        ));
-    }
-    let records = aterm_secrets::client::load_acknowledged_and_ahead(&paths)
+    let claims;
+    let seat = if explicit {
+        claims = standing_seats(places, &paths, word, None);
+        let claims = claims
+            .as_deref()
+            .map_err(|said| LabelRefused::NoMembership {
+                said: said.clone(),
+                node: None,
+            })?;
+        let matches: Vec<_> = claims
+            .iter()
+            .filter(|seat| seat.transport == word || format!("n-{}", seat.node) == word)
+            .collect();
+        match matches.as_slice() {
+            [seat] => *seat,
+            none_or_many => {
+                let said = format!("{word}: no unique standing seat binds this node id");
+                return Err(if none_or_many.is_empty() {
+                    LabelRefused::Absent(said)
+                } else {
+                    LabelRefused::Disputed(said)
+                });
+            }
+        }
+    } else {
+        let registry = aterm_db::alab::Registry::at(paths.clone())
+            .view_until(by.min(after_now(REGISTRY_READ)))
+            .map_err(|why| LabelRefused::Unread(format!("{word}: registry unread: {why}")))?;
+        if !registry.complete {
+            return Err(LabelRefused::Incomplete(format!(
+                "{word}: registry history incomplete"
+            )));
+        }
+        // The seats are read whole or not at all; the registry's rows are judged either way, so
+        // an unread membership never stands in for the registry's own answer.
+        claims = standing_seats(
+            places,
+            &paths,
+            word,
+            registry
+                .owned
+                .get(aterm_db::alab::registry::MACHINE_FACTS.name),
+        );
+        let machines =
+            aterm_db::typed::cell::project(&aterm_db::alab::registry::MACHINE, &registry.cells);
+        resolve_registry_label(
+            word,
+            &machines,
+            claims.as_deref().map_err(String::as_str),
+            purpose,
+        )?
+    };
+    let target = RegistryTarget {
+        actor: seat.actor,
+        node: format!("n-{}", seat.node),
+        name: seat.name.clone(),
+        transport: seat.transport.clone(),
+    };
+    say_target(format!(
+        "target={word} node={} log_name={} actor={} transport={}",
+        target.node,
+        aterm_codec::tty::one_line(&target.name, 80),
+        aterm_codec::hex::encode_lower(&target.actor),
+        target.transport
+    ));
+    Ok(Some(target))
+}
+
+/// Every standing seat of the membership log the vault at `paths` acknowledged (and the records
+/// ahead of it do not hold out): its actor, node, log name, machine by `facts` ([`seat_machine`])
+/// and the transport id this Mac reaches it by.
+/// # Errors
+/// The log cannot be read, or no membership is acknowledged: why, cause first, for
+/// [`LabelRefused::NoMembership`].
+fn standing_seats(
+    places: &Places,
+    paths: &aterm_secrets::client::Paths,
+    word: &str,
+    facts: Option<&aterm_db::typed::owned::OwnedRead>,
+) -> Result<Vec<LabelSeat>, String> {
+    let records = aterm_secrets::client::load_acknowledged_and_ahead(paths)
         .map_err(|why| format!("{word}: membership unread: {why}"))?;
     let Some(log) = records.acknowledged.log() else {
-        return Err(format!("{word}: no acknowledged membership; use a node id"));
+        return Err(format!("{word}: no acknowledged membership"));
     };
-    let facts = registry
-        .as_ref()
-        .and_then(|view| view.owned.get(aterm_db::alab::registry::MACHINE_FACTS.name));
     let book = member::bound_peers(&places.state);
     let own = own_identity(places);
     let mut claims = Vec::new();
@@ -8070,43 +8531,7 @@ fn registry_target_until(
                 .unwrap_or_else(|| member::node_principal(key)),
         });
     }
-    let transport = if explicit {
-        let matches: Vec<_> = claims
-            .iter()
-            .filter(|seat| seat.transport == word || format!("n-{}", seat.node) == word)
-            .collect();
-        let [seat] = matches.as_slice() else {
-            return Err(format!(
-                "{word}: no unique standing seat binds this node id"
-            ));
-        };
-        seat.transport.clone()
-    } else {
-        let registry = registry
-            .as_ref()
-            .ok_or_else(|| format!("{word}: registry unread"))?;
-        let machines =
-            aterm_db::typed::cell::project(&aterm_db::alab::registry::MACHINE, &registry.cells);
-        resolve_registry_label(word, &machines, &claims)?
-    };
-    let seat = claims
-        .iter()
-        .find(|seat| seat.transport == transport)
-        .ok_or_else(|| format!("{word}: resolved seat is absent"))?;
-    let target = RegistryTarget {
-        actor: seat.actor,
-        node: format!("n-{}", seat.node),
-        name: seat.name.clone(),
-        transport,
-    };
-    eprintln!(
-        "target={word} node={} log_name={} actor={} transport={}",
-        target.node,
-        aterm_codec::tty::one_line(&target.name, 80),
-        aterm_codec::hex::encode_lower(&target.actor),
-        target.transport
-    );
-    Ok(Some(target))
+    Ok(claims)
 }
 
 /// The seat a person's removal names where B2's resolver named it ([`removal_seat`]): its actor,
@@ -8132,16 +8557,19 @@ pub(crate) fn removal_seat(
 
 /// [`removal_seat`] over `places`: `None` where `word` is neither a node id nor a registry label,
 /// which the removal resolves by word; else the one standing seat B2's resolver names. A word the
-/// resolver refuses is refused, never resolved again by word: the log label `m12` can be another
-/// Mac than the one the registry calls `m12`.
+/// resolver refuses is refused, never resolved again by word, nor by the book where the registry
+/// gave no answer, as a drive's or a read's is ([`book_label_node`]): the log label `m12` can be
+/// another Mac than the one the registry calls `m12`, a removal of the wrong seat rotates every
+/// audience key, and a node id always names the seat. A label names a seat for a removal only
+/// where it is its Mac's one standing seat ([`LabelFor::Removal`]).
 ///
 /// # Errors
 /// `word` is a node id or a registry label and the vault `places` reads is not `paths`'s, or
 /// [`registry_target`] refuses it: the membership log is unread or no membership is
 /// acknowledged; no single standing seat binds the node id; for a label, the registry is unread
 /// or its history incomplete, no live registry row carries the label or more than one does, that
-/// row's label or node cell is missing, raw or conflicted, or the registry and the seats disagree
-/// on the label.
+/// row's label or node cell is missing, raw or conflicted, the registry and the seats disagree
+/// on the label, or the row's Mac holds more than one standing seat.
 fn removal_seat_at(
     places: &Places,
     paths: &aterm_secrets::client::Paths,
@@ -8186,11 +8614,23 @@ fn seat_machine(facts: Option<&aterm_db::typed::owned::OwnedRead>, uuid: &str) -
         .map(str::to_owned)
 }
 
-fn resolve_registry_label(
+/// The one standing seat of `seats` the label `word` names in the registry's `machines` for what
+/// `purpose` does with it: the seat that holds the node of the one live row carrying the label,
+/// bound by its signed facts to that row's Mac, and for a removal that Mac's one standing seat
+/// ([`LabelFor::Removal`]). The rows are judged before the seats: `seats` unread (`Err`, why)
+/// leaves the registry's own answer standing, and where that answer is one Mac's node, says which.
+/// # Errors
+/// [`LabelRefused`] naming the rows and the seats: no live row carries the label (`Absent`), its
+/// label or node cell is missing, raw or conflicted (`Conflicted`), the seats are unread
+/// (`NoMembership`, with the row's node), or two rows carry it, or no seat or more than one holds
+/// the row's node, or the one that does is another Mac's, or for a removal that Mac holds another
+/// standing seat beside it (`Disputed`).
+fn resolve_registry_label<'a>(
     word: &str,
     machines: &aterm_db::typed::cell::Projection,
-    seats: &[LabelSeat],
-) -> Result<String, String> {
+    seats: Result<&'a [LabelSeat], &str>,
+    purpose: LabelFor,
+) -> Result<&'a LabelSeat, LabelRefused> {
     use aterm_json::Value;
     let rows: Vec<_> = machines
         .rows
@@ -8228,61 +8668,97 @@ fn resolve_registry_label(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let seats = seats
-            .iter()
-            .map(|seat| {
-                format!(
-                    "n-{} name={} mac={}",
-                    seat.node,
-                    aterm_codec::tty::one_line(&seat.name, 80),
-                    seat.mac.as_deref().unwrap_or("unset")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{word}: registry [{rows}]; signed seats [{seats}]")
+        let seats = seats.map_or_else(
+            |_| "unread".to_owned(),
+            |seats| {
+                let seats = seats
+                    .iter()
+                    .map(|seat| {
+                        format!(
+                            "n-{} name={} mac={}",
+                            seat.node,
+                            aterm_codec::tty::one_line(&seat.name, 80),
+                            seat.mac.as_deref().unwrap_or("unset")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("[{seats}]")
+            },
+        );
+        format!("{word}: registry [{rows}]; signed seats {seats}")
     };
-    let [(pk, row)] = rows.as_slice() else {
-        return Err(format!(
-            "{}; label is absent or ambiguous; use a node id",
-            sides()
-        ));
+    let (pk, row) = match rows.as_slice() {
+        [] => {
+            return Err(LabelRefused::Absent(format!(
+                "{}; no live registry row carries the label; use a node id",
+                sides()
+            )));
+        }
+        [(pk, row)] => (pk, row),
+        many => {
+            return Err(LabelRefused::Disputed(format!(
+                "{}; {} live registry rows carry the label; use a node id",
+                sides(),
+                many.len()
+            )));
+        }
     };
-    if ["label", "node"].iter().any(|column| {
-        row.raw.contains(*column)
-            || row
-                .fields
-                .get(*column)
-                .is_none_or(aterm_db::typed::cell::Field::conflicted)
-    }) {
-        return Err(format!(
+    let node = row.get("node").and_then(Value::as_str);
+    let Some(node) = node.filter(|_| {
+        !["label", "node"].iter().any(|column| {
+            row.raw.contains(*column)
+                || row
+                    .fields
+                    .get(*column)
+                    .is_none_or(aterm_db::typed::cell::Field::conflicted)
+        })
+    }) else {
+        return Err(LabelRefused::Conflicted(format!(
             "{}; label binding is missing or conflicted; use a node id",
             sides()
-        ));
-    }
-    let node = row.get("node").and_then(Value::as_str);
-    let agreeing: Vec<_> = seats
-        .iter()
-        .filter(|seat| Some(seat.node.as_str()) == node && seat.mac.as_deref() == Some(pk.as_str()))
-        .collect();
-    if agreeing.len() != 1
-        || seats
-            .iter()
-            .filter(|seat| Some(seat.node.as_str()) == node)
-            .count()
-            != 1
-        || seats
-            .iter()
-            .filter(|seat| seat.mac.as_deref() == Some(pk.as_str()))
-            .count()
-            != 1
-    {
-        return Err(format!(
+        )));
+    };
+    let seats = seats.map_err(|why| LabelRefused::NoMembership {
+        said: format!(
+            "{why}, so no signed seat here binds n-{node}, the node the registry's row {pk} names"
+        ),
+        node: Some(node.to_owned()),
+    })?;
+    // The row's node selects the seat. Another seat of the same Mac (a second home on it, an
+    // enrollment not folded yet) holds another node and is no dispute; a node no seat holds, two
+    // seats hold, or another Mac's seat holds by its signed facts, is.
+    let holding: Vec<&LabelSeat> = seats.iter().filter(|seat| seat.node == node).collect();
+    let [seat] = holding.as_slice() else {
+        return Err(LabelRefused::Disputed(format!(
             "{}; registry and seat disagree; use a node id",
             sides()
-        ));
+        )));
+    };
+    if seat.mac.as_deref() != Some(pk.as_str()) {
+        return Err(LabelRefused::Disputed(format!(
+            "{}; registry and seat disagree; use a node id",
+            sides()
+        )));
     }
-    Ok(agreeing[0].transport.clone())
+    if purpose == LabelFor::Removal {
+        let of_mac: Vec<String> = seats
+            .iter()
+            .filter(|seat| seat.mac.as_deref() == Some(pk.as_str()))
+            .map(|seat| format!("n-{}", seat.node))
+            .collect();
+        if of_mac.len() > 1 {
+            return Err(LabelRefused::Disputed(format!(
+                "{}; {} standing seats are the registry's Mac {pk} ({}): a removal by its label \
+                 would take out one and leave the rest in, so nothing was done: remove each by \
+                 its node id",
+                sides(),
+                of_mac.len(),
+                of_mac.join(", ")
+            )));
+        }
+    }
+    Ok(seat)
 }
 
 #[cfg(test)]
@@ -8298,9 +8774,22 @@ fn host_word_among(
     unread: Option<&Missed>,
     identities: &[member::PeerIdentity],
 ) -> Result<String, String> {
+    host_word_among_by(places, what, unread, identities, Labels::Registry)
+}
+
+/// [`host_word_among`], a registry label read as `labels` says.
+/// # Errors
+/// As [`host_word_among`].
+fn host_word_among_by(
+    places: &Places,
+    what: &str,
+    unread: Option<&Missed>,
+    identities: &[member::PeerIdentity],
+    labels: Labels,
+) -> Result<String, String> {
     let book = member::read_peers(&places.state).map_err(|e| e.to_string())?;
     let others = others_listed(places, &book);
-    if names_this_machine(places, what)?.is_some()
+    if names_this_machine_by(places, what, labels)?.is_some()
         || !member::all_named_with(&book, &others, identities, what).is_empty()
         || (loosely_named_issuer(places, &book, what)?.is_some()
             && (unread.is_some() || uncopied_issuer(places, &book).is_some()))
@@ -8952,24 +9441,25 @@ fn drive_fleet_proven_in(
         (after_now(check), check),
     );
     // A Mac's short name (`m102`) binds the one peer it names, by its whole node id.
-    let mut word = host_word(places, host, unread.as_ref(), deadline.0)?;
-    if let Some(own) = this_machine_alone(places, &word, unread.as_ref()).map_err(|why| {
-        aterm_ctl::DriveRefused {
+    let mut said = host_word(places, host, unread.as_ref(), deadline.0)?;
+    if let Some(own) = this_machine_alone_by(places, &said.word, unread.as_ref(), said.labels())
+        .map_err(|why| aterm_ctl::DriveRefused {
             again: unread.as_ref().is_some_and(|missed| missed.silent),
             unserved: unread.as_ref().is_some_and(|missed| missed.unserved),
             ..aterm_ctl::DriveRefused::once(why)
-        }
-    })? {
+        })?
+    {
         return Err(itself(&own));
     }
-    let named = |word: &str, unread: Option<&Missed>| -> Result<_, aterm_ctl::DriveRefused> {
+    let named = |said: &HostWord, unread: Option<&Missed>| -> Result<_, aterm_ctl::DriveRefused> {
         let known = known_peers(places).map_err(failure_words)?;
-        let bound = bound_peer(places, word, unread).map_err(failure_words)?;
+        let bound =
+            bound_peer_by(places, &said.word, unread, said.labels()).map_err(failure_words)?;
         Ok((known.keys, bound))
     };
     let (mut keys, mut bound) =
-        named(&word, unread.as_ref()).map_err(|refused| {
-            match silent_issuer(places, &word, unread.as_ref()) {
+        named(&said, unread.as_ref()).map_err(|refused| {
+            match silent_issuer(places, &said.word, unread.as_ref()) {
                 Some(missed) => aterm_ctl::DriveRefused {
                     again: true,
                     unserved: missed.unserved,
@@ -8979,7 +9469,7 @@ fn drive_fleet_proven_in(
             }
         })?;
     if matches!(bound, Bound::Nobody) {
-        if let Some(own) = at_own_place(places, &word) {
+        if let Some(own) = at_own_place(places, &said.word) {
             return Err(format!(
                 "`{}` is this machine itself (node {}): its own sessions are driven here with \
                  `aterm ctl`, never over the fleet",
@@ -8991,11 +9481,13 @@ fn drive_fleet_proven_in(
         if !read {
             match copy_again(places, &secret, Some(&me), (after_now(check), check)) {
                 Ok(true) => {
-                    word = host_word(places, host, None, deadline.0)?;
-                    if let Some(own) = this_machine_alone(places, &word, None)? {
+                    said = host_word_again(places, host, deadline.0, said)?;
+                    if let Some(own) =
+                        this_machine_alone_by(places, &said.word, None, said.labels())?
+                    {
                         return Err(itself(&own));
                     }
-                    (keys, bound) = named(&word, None)?;
+                    (keys, bound) = named(&said, None)?;
                 }
                 Ok(false) => {}
                 Err(why) => unread = Some(why),
@@ -9019,10 +9511,13 @@ fn drive_fleet_proven_in(
                     again: true,
                     ..aterm_ctl::DriveRefused::once(why)
                 })?;
+            // A label the registry gave no answer for, which no book here names either, is
+            // refused with the registry's cause first.
+            let lead = said.lead();
             if let Some(missed) = unread {
                 let why = format!(
-                    "{}, so no book here says which Mac `{shown}` is: a drive goes only to a node \
-                     a book holds",
+                    "{lead}{}, so no book here says which Mac `{shown}` is: a drive goes only to \
+                     a node a book holds",
                     missed.why
                 );
                 if missed.silent {
@@ -9048,8 +9543,8 @@ fn drive_fleet_proven_in(
             return Err(aterm_ctl::DriveRefused {
                 left: own_node(places).map(aterm_ctl::Left::Book),
                 ..aterm_ctl::DriveRefused::once(format!(
-                    "`{shown}` is no Mac this machine's book records (`aterm fleet peers`): a \
-                     drive goes only to a node the book holds, named by its host, its short \
+                    "{lead}`{shown}` is no Mac this machine's book records (`aterm fleet peers`): \
+                     a drive goes only to a node the book holds, named by its host, its short \
                      name (`m102`), node id or the address and port it lists, never to \
                      whichever member answers at an address"
                 ))
@@ -9464,15 +9959,15 @@ fn survey_fleet_read_in(
             (after_now(check), check),
         );
         // A Mac's short name (`m102`) reads the one peer it names, by its whole node id.
-        let mut word = host_word(places, what, missed.as_ref(), deadline.0)?;
-        if let Some(own) = this_machine_alone(places, &word, missed.as_ref()).map_err(|why| {
-            aterm_ctl::FleetRefused {
+        let mut said = host_word(places, what, missed.as_ref(), deadline.0)?;
+        if let Some(own) = this_machine_alone_by(places, &said.word, missed.as_ref(), said.labels())
+            .map_err(|why| aterm_ctl::FleetRefused {
                 why,
                 unserved: missed
                     .as_ref()
                     .is_some_and(|missed| missed.silent && missed.unserved),
-            }
-        })? {
+            })?
+        {
             return Err(itself(&own).into());
         }
         let mut keys = known.keys;
@@ -9480,16 +9975,16 @@ fn survey_fleet_read_in(
             let known = known_peers(places).map_err(failure_words)?;
             keys = known.keys;
         }
-        let mut bound = bound_peer(places, &word, missed.as_ref()).map_err(|refused| {
-            aterm_ctl::FleetRefused {
-                unserved: silent_issuer(places, &word, missed.as_ref())
+        let mut bound = bound_peer_by(places, &said.word, missed.as_ref(), said.labels()).map_err(
+            |refused| aterm_ctl::FleetRefused {
+                unserved: silent_issuer(places, &said.word, missed.as_ref())
                     .is_some_and(|missed| missed.unserved),
                 why: failure_words(refused),
-            }
-        })?;
+            },
+        )?;
         let mut unread = None;
         if matches!(bound, Bound::Nobody) {
-            if let Some(own) = at_own_place(places, &word) {
+            if let Some(own) = at_own_place(places, &said.word) {
                 return Err(itself(&own).into());
             }
             if read {
@@ -9499,11 +9994,14 @@ fn survey_fleet_read_in(
                     Ok(true) => {
                         let known = known_peers(places).map_err(failure_words)?;
                         keys = known.keys;
-                        word = host_word(places, what, None, deadline.0)?;
-                        if let Some(own) = this_machine_alone(places, &word, None)? {
+                        said = host_word_again(places, what, deadline.0, said)?;
+                        if let Some(own) =
+                            this_machine_alone_by(places, &said.word, None, said.labels())?
+                        {
                             return Err(itself(&own).into());
                         }
-                        bound = bound_peer(places, &word, None).map_err(failure_words)?;
+                        bound = bound_peer_by(places, &said.word, None, said.labels())
+                            .map_err(failure_words)?;
                     }
                     Ok(false) => {}
                     Err(why) => unread = Some(why),
@@ -9517,10 +10015,16 @@ fn survey_fleet_read_in(
         }
         let peer = match bound {
             Bound::Node(peer) | Bound::Unbound(peer) | Bound::ByHand(peer) => peer,
-            // A node's word no book here binds is never asked of DNS or multicast DNS as a host.
-            Bound::Nobody if member::is_node_word(what) => {
+            // A node's word no book here binds, or a label the registry gave no answer for that
+            // no book here names, is never asked of DNS or multicast DNS as a host: the label is
+            // refused with the registry's cause first.
+            Bound::Nobody if member::is_node_word(what) || said.unanswered.is_some() => {
                 return Err(aterm_ctl::FleetRefused {
-                    why: names_no_peer(places, what, unread.as_ref()),
+                    why: format!(
+                        "{}{}",
+                        said.lead(),
+                        names_no_peer(places, what, unread.as_ref())
+                    ),
                     unserved: unread
                         .as_ref()
                         .is_some_and(|missed| missed.silent && missed.unserved),

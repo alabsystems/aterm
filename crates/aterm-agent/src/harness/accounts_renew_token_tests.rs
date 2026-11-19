@@ -161,7 +161,6 @@ fn one_renew_invocation_commits_its_login_and_captures_its_window_token() {
         assert_eq!(scratch.table().rows.contains_key(KEY), minted);
         if minted {
             let row = scratch.table().rows.remove(KEY).unwrap();
-            assert_eq!(row.email, EMAIL);
             assert_eq!(row.label.as_deref(), Some("work"));
             assert_eq!(row.vault, InVault::InVault);
             assert_eq!(

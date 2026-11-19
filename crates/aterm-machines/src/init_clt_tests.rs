@@ -745,8 +745,11 @@ fn a_mac_with_the_tools_still_gets_the_one_password_for_what_is_owed() {
         );
         let source = Path::new("/Applications/aterm.app");
         sys.running_app = Some(source.to_owned());
-        let image = install::test_image(0x0100_000c, &[b"same current code"]);
+        // A release of the broker's team, whose Info.plist states its build.
+        let info = install::test_info(1_790_120_495);
+        let image = install::test_release("ABCDE12345", 0, &info);
         sys.file("/Applications/aterm.app/Contents/MacOS/aterm", &image)
+            .file("/Applications/aterm.app/Contents/Info.plist", &info)
             .file(lan::IMAGE_EXECUTABLE, &image)
             .file(lan::PLIST_PATH, install::plist_text(source).as_bytes());
         assert!(crate::items::lan::reading(&sys).unwrap().unwrap().current());
@@ -2580,8 +2583,11 @@ fn the_root_halfs_exit_says_why_the_tab_install_did_not_finish() {
     let mut fake = console();
     fake.running_app = Some("/Applications/aterm.app".into());
     let sys = Arc::new(fake);
-    let image = aterm_uds::lan::install::test_image(0x0100_000c, &[b"this build"]);
+    // A release of the broker's team, whose Info.plist states its build.
+    let info = aterm_uds::lan::install::test_info(1_790_120_495);
+    let image = aterm_uds::lan::install::test_release("ABCDE12345", 0, &info);
     sys.file("/Applications/aterm.app/Contents/MacOS/aterm", &image)
+        .file("/Applications/aterm.app/Contents/Info.plist", &info)
         .file(aterm_uds::lan::IMAGE_EXECUTABLE, &image)
         .file(
             aterm_uds::lan::PLIST_PATH,
@@ -2959,9 +2965,10 @@ fn only_a_persons_run_owes_a_new_folder_in_a_scoped_home() {
         "/usr/bin/mdutil -s /System/Volumes/Data",
         Ran::ok("/System/Volumes/Data:\n\tIndexing enabled.\n"),
     );
+    // Setup's password scoped this home and the rest of the volume: every folder it keeps out.
     sys.file(
         crate::init_spotlight::SCOPE_RECEIPT,
-        b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/My Projects\n",
+        crate::init_spotlight::tests::FULL,
     );
     let hold = || {
         Unbidden::new(Some(MARK.into()), Some(asker()), || {
@@ -3151,4 +3158,345 @@ fn a_step_root_already_failed_at_is_not_asked_for_by_itself() {
         assert!(item.apply(&sys, &ctx(&[])).is_ok(), "{why}");
         assert_eq!(asked(&sys), [root.clone()], "{why}");
     }
+}
+
+/// An update the running broker did not adopt by itself rides the next elevation: a run nobody
+/// asked for plans no password and asks none for it alone, while it still reads owed (the run
+/// is not finished, and the steps row says the helper is on another build, names the reason the
+/// broker recorded for this source, and does not say setup tried it as root and failed). A
+/// person's own run asks for it, and so does a run that asks for another step beside it. Beside
+/// a step root already refused (developer mode), the row names that step alone as tried as root,
+/// and the helper's renewal apart from it. The renewal is said to come from the next password
+/// for the root steps, or `aterm init`, never from one asked for any step (the naming rule's own
+/// elevation does not renew it).
+/// MUTANTS (run): an `asks` that asks for every owed step asks the automatic run; a row that
+/// names every owed step as tried names the helper's renewal among them.
+/// NEGATIVE CONTROL: a refusal another source's names no reason.
+#[test]
+fn an_update_the_broker_did_not_adopt_asks_no_password_by_itself() {
+    use crate::root_steps::Owed;
+    use aterm_types::macos_setup::refused::DEVELOPER_MODE;
+    use aterm_uds::lan::{ADOPTION_REFUSED, adoption::Refusal};
+    const SOURCE: &str = "/Applications/aterm.app";
+    let root = format!("{} --root-steps-only", argv());
+    let made = |owed: Vec<Owed>, person: bool| {
+        let record = Unbidden::new(Some(MARK.into()), Some(asker()), || {
+            crate::init::Holds::NONE
+        });
+        let item =
+            item(Found::Present("healthy".into())).with_owed(Box::new(move |_| owed.clone()));
+        if person {
+            item.explicit(record)
+        } else {
+            item.unbidden(record)
+        }
+    };
+    let reason = "the bundle is on another volume than the broker's image";
+    let mac = |source: &str| {
+        let mut sys = console();
+        sys.running_app = Some(SOURCE.into());
+        sys.on(&root, Ran::ok("")).file(
+            ADOPTION_REFUSED,
+            Refusal::new(
+                Path::new(source),
+                "0.206.0+gabc1234",
+                aterm_uds::lan::adoption::Kind::Definite,
+                reason,
+            )
+            .text()
+            .unwrap()
+            .as_bytes(),
+        );
+        sys
+    };
+
+    let sys = mac(SOURCE);
+    let automatic = made(vec![Owed::LanBrokerAdoption], false);
+    assert!(!matches!(automatic.read(&sys).0, Probe::Change { .. }));
+    assert!(automatic.apply(&sys, &ctx(&[])).is_ok());
+    assert!(asked(&sys).is_empty());
+    assert!(!marked(&sys));
+    assert_eq!(automatic.owed_now(&sys), [Owed::LanBrokerAdoption]);
+    assert!(!automatic.finished_in_place(&sys));
+    let Probe::Deferred { why } = automatic.steps().probe(&sys, &ctx(&[])) else {
+        panic!("the steps row reads the step owed");
+    };
+    assert!(why.contains(reason), "{why}");
+    assert!(why.contains("another build"), "{why}");
+    assert!(!why.contains("already tried"), "{why}");
+    assert!(
+        why.contains("asks for its root steps, or a person's own `aterm init`")
+            && !why.contains("any step"),
+        "{why}"
+    );
+
+    // Beside developer mode, which root's record refused: that step alone is named as tried.
+    let sys = mac(SOURCE);
+    sys.on(
+        "/usr/sbin/DevToolsSecurity -status",
+        Ran::ok("Developer mode is currently disabled.\n"),
+    )
+    .file(DEVELOPER_MODE, b"off\n");
+    let mixed = made(vec![Owed::Debugger, Owed::LanBrokerAdoption], false);
+    assert!(!matches!(mixed.read(&sys).0, Probe::Change { .. }));
+    assert!(mixed.apply(&sys, &ctx(&[])).is_ok());
+    assert!(asked(&sys).is_empty());
+    let Probe::Deferred { why } = mixed.steps().probe(&sys, &ctx(&[])) else {
+        panic!("the steps row reads the steps owed");
+    };
+    let tried = why
+        .split_once("already tried")
+        .and_then(|(_, rest)| rest.split_once("; so aterm"))
+        .map(|(tried, _)| tried)
+        .unwrap_or_else(|| panic!("names what root tried: {why}"));
+    assert!(tried.contains(Owed::Debugger.plain()), "{why}");
+    assert!(!tried.contains(Owed::LanBrokerAdoption.plain()), "{why}");
+    assert!(why.contains(reason), "{why}");
+
+    let sys = mac("/Users//a/aterm.app");
+    let Probe::Deferred { why } = made(vec![Owed::LanBrokerAdoption], false)
+        .steps()
+        .probe(&sys, &ctx(&[]))
+    else {
+        panic!("the steps row reads the step owed");
+    };
+    assert!(!why.contains(reason) && why.contains("no reason"), "{why}");
+
+    for (why, owed, person) in [
+        ("a person's own run", vec![Owed::LanBrokerAdoption], true),
+        (
+            "beside a step that asks",
+            vec![Owed::NameRule, Owed::LanBrokerAdoption],
+            false,
+        ),
+    ] {
+        let sys = mac(SOURCE);
+        let item = made(owed, person);
+        assert!(matches!(item.read(&sys).0, Probe::Change { .. }), "{why}");
+        assert!(item.apply(&sys, &ctx(&[])).is_ok(), "{why}");
+        assert_eq!(asked(&sys), [root.clone()], "{why}");
+    }
+}
+
+/// Why a no-verdict must stall in a boot (`aterm_types::macos_setup::refused`): in the Mac Setup
+/// tab, a root half that exits 0 having left developer mode off leaves the step owed after the
+/// tab's one password, which is the tab's unfinished end, so the account's ask never reads
+/// finished and comes back by itself until root's record stands for the step. NEGATIVE CONTROL:
+/// a root half that left nothing owed ends the tab with no unfinished end.
+#[test]
+fn a_tab_whose_root_half_left_developer_mode_owed_ends_unfinished() {
+    use crate::root_steps::Owed;
+    let root = format!("{} --root-steps-only", argv());
+    for (left, end) in [
+        (vec![Owed::Debugger], Some(Unfinished::StepsOwed)),
+        (Vec::new(), None),
+    ] {
+        let sys = Arc::new(console());
+        sys.on(&root, Ran::ok(""));
+        let (tab_item, _, tab) = in_tab(&sys, Found::Present("installed".into()));
+        let seen = Arc::clone(&sys);
+        let ran = root.clone();
+        let tab_item = tab_item.with_owed(Box::new(move |_: &dyn System| {
+            if seen.calls().contains(&ran) {
+                left.clone()
+            } else {
+                vec![Owed::Debugger]
+            }
+        }));
+        let (row, steps) = with_steps(&sys, &tab_item, Mode::Apply);
+        assert_eq!(asked(&sys), std::slice::from_ref(&root), "{row:?}");
+        assert_eq!(tab.unfinished(), end, "{row:?} {steps:?}");
+    }
+}
+
+/// A naming rule the person removed with its own revert is theirs: no run nobody typed owes it
+/// (a run aterm decided, the Mac Setup tab whether its window opened it or the person pressed
+/// Finish setup), nor a person's `--check`, so none asks for it; a person's own typed run that
+/// applies owes it and tells the root half to put it back, beside another step; alone, the rule
+/// is the naming-permission repair (`--name-rule-only`), which puts it back with no flag.
+/// NEGATIVE CONTROLS: with no marker the same runs owe the rule; a person's apply without the
+/// marker carries the flag all the same, which the root half reads only where the removal
+/// stands. Run: the retain in `own_owed` removed makes the run aterm decided ask; the flag left
+/// off the argv fails the person's apply.
+#[test]
+fn a_rule_the_person_removed_is_owed_only_to_their_own_typed_run() {
+    use crate::root_steps::{Owed, REMOVED_RULE};
+    let root = format!("{} --root-steps-only", argv());
+    let restore = format!("{root} {RESTORE_NAME_RULE}");
+    let mac = |removed: bool| {
+        let sys = console();
+        sys.on(&root, Ran::ok("")).on(&restore, Ran::ok(""));
+        if removed {
+            sys.file(REMOVED_RULE, b"the rule\n");
+        }
+        sys
+    };
+    let record = || {
+        Unbidden::new(Some(MARK.into()), Some(asker()), || {
+            crate::init::Holds::NONE
+        })
+    };
+    let rule = || Found::Present("installed".into());
+    let owing =
+        |item: CommandLineTools| item.with_owed(Box::new(|_: &dyn System| vec![Owed::NameRule]));
+    type Made<'a> = Box<dyn Fn() -> CommandLineTools + 'a>;
+    let made: [(&str, Made<'_>); 4] = [
+        (
+            "a run aterm decided",
+            Box::new(|| owing(item(rule())).unbidden(record())),
+        ),
+        (
+            "the automatic tab",
+            Box::new(|| owing(item(rule())).in_tab(Tab::new(Arc::new(|_| {})))),
+        ),
+        (
+            "the tab the person's press opened",
+            Box::new(|| {
+                owing(item(rule()))
+                    .in_tab(Tab::new(Arc::new(|_| {})))
+                    .with_explicit_tab(true)
+            }),
+        ),
+        (
+            "a person's --check",
+            Box::new(|| owing(item(rule())).explicit(record())),
+        ),
+    ];
+    for (why, made) in &made {
+        let sys = mac(true);
+        let item = made();
+        assert!(!item.owed_now(&sys).contains(&Owed::NameRule), "{why}");
+        assert!(item.apply(&sys, &ctx(&[])).is_ok(), "{why}");
+        assert!(asked(&sys).is_empty(), "{why}: {:?}", sys.calls());
+
+        let sys = mac(false);
+        assert!(made().owed_now(&sys).contains(&Owed::NameRule), "{why}");
+    }
+
+    // A person's own typed run that applies puts it back, removal or not, beside another step.
+    for removed in [true, false] {
+        let sys = mac(removed);
+        let item = item(rule())
+            .with_owed(Box::new(|_: &dyn System| {
+                vec![Owed::NameRule, Owed::LanBroker]
+            }))
+            .explicit(record())
+            .scoping_new_folders(true);
+        assert!(item.owed_now(&sys).contains(&Owed::NameRule), "{removed}");
+        assert!(
+            matches!(item.read(&sys).0, Probe::Change { .. }),
+            "{removed}"
+        );
+        assert_eq!(item.root_plan(), RootPlan::StepsOnly, "{removed}");
+        let applied = item.apply(&sys, &ctx(&[]));
+        assert!(applied.is_ok(), "{removed}: {applied:?}");
+        assert_eq!(
+            asked(&sys),
+            std::slice::from_ref(&restore),
+            "{removed}: {:?}",
+            sys.calls()
+        );
+    }
+    // Alone, the rule is the naming-permission repair, which puts it back with no flag.
+    let repair = format!("{} --name-rule-only", argv());
+    let sys = mac(true);
+    sys.on(&repair, Ran::ok(""));
+    let item = owing(item(rule()))
+        .explicit(record())
+        .scoping_new_folders(true);
+    assert!(matches!(item.read(&sys).0, Probe::Change { .. }));
+    assert_eq!(item.root_plan(), RootPlan::NameRuleOnly);
+    let applied = item.apply(&sys, &ctx(&[]));
+    assert!(applied.is_ok(), "{applied:?}");
+    assert_eq!(asked(&sys), [repair], "{:?}", sys.calls());
+}
+
+/// Developer mode turned off after the window saw it on is the person's in a run aterm decided
+/// too, before the account's first finish: this Mac's record beside the account's `aterm.toml`
+/// (`aterm_types::macos_setup::debugger_record::beside_on`) says so, and the run leaves the mode
+/// as it reads. NEGATIVE CONTROLS: no record, one first seen off and set by no one aterm knows,
+/// one another account owns, another Mac's record (a synced or migrated config folder), the
+/// record from before records named their Mac, and no record of this Mac where its UUID could
+/// not be read leave developer mode owed; a person's typed run sets it up whatever the record
+/// says. Run: `leaves_developer_mode` that reads no record fails it, and a record name that
+/// leaves out the Mac leaves developer mode off on another Mac's word.
+#[test]
+fn developer_mode_the_window_saw_turned_off_is_left_by_a_run_aterm_decided() {
+    use crate::root_steps::Owed;
+    use aterm_types::macos_setup::debugger_record::beside_on;
+    const CONFIG: &str = "/Users//alice/.config/aterm/aterm.toml";
+    const BEFORE: &str = "/Users//alice/.config/aterm/privacy-debugger-observed";
+    const HERE: &str = "6A1E64F2-1C3B-4D5E-8F90-0A1B2C3D4E5F";
+    const THERE: &str = "0F9E8D7C-6B5A-4F3E-2D1C-0B9A8F7E6D5C";
+    let here = beside_on(Path::new(CONFIG), Some(HERE));
+    let there = beside_on(Path::new(CONFIG), Some(THERE)).unwrap();
+    let mine = here.clone().unwrap();
+    let mac = |records: &[(&Path, &str, u32)]| {
+        let sys = console();
+        for &(path, text, uid) in records {
+            let path = path.to_str().unwrap();
+            sys.file(path, text.as_bytes()).stat_of(
+                path,
+                Stat {
+                    uid,
+                    gid: 20,
+                    mode: 0o644,
+                    dir: false,
+                    symlink: false,
+                    len: text.len() as u64,
+                },
+            );
+        }
+        sys
+    };
+    let made_at = |person: bool, observed: Option<PathBuf>| {
+        let record = Unbidden::new(Some(MARK.into()), Some(asker()), || {
+            crate::init::Holds::NONE
+        })
+        .observing(observed);
+        let item = item(Found::Present("installed".into()))
+            .with_owed(Box::new(|_: &dyn System| vec![Owed::Debugger]));
+        if person {
+            item.explicit(record)
+        } else {
+            item.unbidden(record)
+        }
+    };
+    let made = |person: bool| made_at(person, here.clone());
+    for text in [
+        "enabled 1790000000 outside\n",
+        "disabled 1790000000 aterm\n",
+    ] {
+        assert!(
+            made(false).owed_now(&mac(&[(&mine, text, 501)])).is_empty(),
+            "{text}"
+        );
+        assert_eq!(
+            made(true).owed_now(&mac(&[(&mine, text, 501)])),
+            [Owed::Debugger],
+            "{text}"
+        );
+    }
+    let on = "enabled 1790000000 outside\n";
+    for (why, sys) in [
+        ("no record", mac(&[])),
+        (
+            "first seen off, set by no one aterm knows",
+            mac(&[(&mine, "disabled 1790000000 unknown\n", 501)]),
+        ),
+        ("another account's file", mac(&[(&mine, on, 502)])),
+        ("another Mac's record", mac(&[(&there, on, 501)])),
+        (
+            "the record from before records named their Mac",
+            mac(&[(Path::new(BEFORE), on, 501)]),
+        ),
+    ] {
+        assert_eq!(made(false).owed_now(&sys), [Owed::Debugger], "{why}");
+    }
+    assert_eq!(beside_on(Path::new(CONFIG), None), None);
+    assert_eq!(
+        made_at(false, None).owed_now(&mac(&[(&mine, on, 501), (Path::new(BEFORE), on, 501)])),
+        [Owed::Debugger],
+        "this Mac's UUID unread: no record is this Mac's"
+    );
 }

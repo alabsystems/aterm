@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use aterm_agent::harness::alab_roster::chosen_captured;
 use aterm_spec::interp::State;
 
 /// Exercise the real read transition, admitted cache observation and both consumer decisions.
@@ -93,6 +94,9 @@ pub(crate) fn project(state: &State, action: &str) -> State {
     next.insert("sheet", i64::from(source.permits_sheet()));
     next.insert("revision", revision);
     next.insert("exposed", captured.map_or(0, |p| i64::from(p.source.0[0])));
+    // A sync with no source named, on this observation: whether it goes on.
+    let chosen = chosen_captured(&source, Cli::Claude, None, None, false);
+    next.insert("synced", i64::from(chosen.is_ok()));
     next.insert(
         "naming",
         match source.machine_name() {
@@ -136,6 +140,23 @@ fn source_availability_conforms_and_rejects_unknown_as_absent() {
     assert!(!model.successors("Project", &unread).contains(&wrong));
     assert!(!model.check_invariant("PendingRead", &wrong));
     assert!(!model.check_invariant("SheetAdmission", &wrong));
+
+    // A lab not read yet refuses no sync (the removed refusal ended every sync with no source
+    // named on "no sheet is read meanwhile").
+    let mut refused = project(&unread, "Project");
+    refused.insert("synced", 0);
+    assert!(!model.successors("Project", &unread).contains(&refused));
+    assert!(!model.check_invariant("PendingSyncs", &refused));
+    let projected = project(&unread, "Project");
+    assert_eq!(
+        (
+            projected["pending"],
+            projected["sheet"],
+            projected["synced"]
+        ),
+        (1, 0, 1),
+        "a pending lab admits no sheet and goes on"
+    );
 
     let mut same_visible = model.init_state();
     same_visible.insert("held", 2);

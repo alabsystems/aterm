@@ -127,6 +127,7 @@ fn vv_says_trust_by_its_trust_line_and_stock_by_its_absence() {
 fn stock_is_said_only_where_nothing_marks_trust() {
     let named = |vv: &str| Resolved {
         real: PathBuf::from("/x/cargo"),
+        rustup_proxy: false,
         rustup: None,
         identity: Identity::Known(parse_vv(vv).unwrap()),
     };
@@ -245,6 +246,31 @@ fn picked_follows_rustups_order_and_names_only_a_match() {
     );
 }
 
+#[test]
+fn the_default_toolchain_uses_toml_semantics() {
+    let home = scratch("default-settings");
+    let file = home.join("settings.toml");
+    for text in [
+        "default_toolchain = 'trust' # selected toolchain\n",
+        "\"default_toolchain\" = \"trust\"\n",
+        "default_toolchain = \"tr\\u0075st\"\n",
+    ] {
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(default_toolchain(&home).as_deref(), Some("trust"), "{text}");
+    }
+    for text in [
+        "default_toolchain = trust\n",
+        "default_toolchain = \"trust\"\ndefault_toolchain = \"stable\"\n",
+        "default_toolchain = \"trust\"\n[broken\n",
+        "default_toolchain = 12\n",
+        "default_toolchain = \"\"\n",
+        "[overrides]\ndefault_toolchain = \"trust\"\n",
+    ] {
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(default_toolchain(&home), None, "{text}");
+    }
+}
+
 /// A copy that is not a rustup proxy is itself: its `-vV` names it, Trust or stock, and
 /// anything that does not answer as a Rust tool is not known, never Trust.
 #[cfg(unix)]
@@ -257,6 +283,7 @@ fn a_plain_copy_is_named_by_its_own_vv() {
         let got = resolve(&ask("rustc", &at, &dir));
         assert_eq!(got.is_trust(), trust, "{got:?}");
         assert_eq!(got.rustup, None);
+        assert!(!got.rustup_proxy);
         assert_eq!(got.real, std::fs::canonicalize(&at).unwrap());
     }
     let at = dir.join("bin").join("cargo");
@@ -319,6 +346,7 @@ fn a_rustup_proxy_is_resolved_through_rustup_which() {
     };
 
     let got = resolve(&base);
+    assert!(got.rustup_proxy);
     assert_eq!(
         got.rustup,
         Some(Rustup {
@@ -363,6 +391,7 @@ fn a_rustup_proxy_is_resolved_through_rustup_which() {
         got,
         Resolved {
             real: target.clone(),
+            rustup_proxy: true,
             rustup: None,
             identity: Identity::Unknown {
                 why: "`rustup which --toolchain nonexist rustc`: error: toolchain 'nonexist' is not installed".into(),
@@ -490,6 +519,46 @@ fn a_proxy_is_known_by_its_file() {
         Some(theirs),
         "the bytes of the rustup beside the file"
     );
+}
+
+#[test]
+fn proxy_detection_uses_the_platforms_executable_names() {
+    let dir = scratch("platform-proxy");
+    for (windows, suffix) in [(false, ""), (true, ".exe")] {
+        let bin = dir.join(if windows { "windows" } else { "unix" });
+        std::fs::create_dir_all(&bin).unwrap();
+        let cargo = bin.join(format!("cargo{suffix}"));
+        let rustup = bin.join(format!("rustup{suffix}"));
+        std::fs::write(&cargo, b"proxy bytes").unwrap();
+        assert_eq!(rustup_proxy_for(&cargo, &cargo, windows), None);
+        std::fs::copy(&cargo, &rustup).unwrap();
+        assert_eq!(
+            rustup_proxy_for(&cargo, &cargo, windows),
+            Some(rustup.clone())
+        );
+        if windows == cfg!(windows) {
+            assert_eq!(rustup_proxy(&cargo, &cargo), Some(rustup.clone()));
+        }
+        for name in [format!("rustup{suffix}"), format!("rustup-init{suffix}")] {
+            let canonical = bin.join(name);
+            assert_eq!(
+                rustup_proxy_for(&cargo, &canonical, windows),
+                Some(canonical)
+            );
+        }
+        std::fs::write(&cargo, b"other bytes").unwrap();
+        assert_eq!(rustup_proxy_for(&cargo, &cargo, windows), None);
+    }
+    let uppercase = dir.join("RUSTUP.EXE");
+    assert_eq!(
+        rustup_proxy_for(&uppercase, &uppercase, true),
+        Some(uppercase.clone())
+    );
+    assert_eq!(rustup_proxy_for(&uppercase, &uppercase, false), None);
+    for name in ["rustup.exe.bak", "rustup-init.exe.bak", "not-rustup.exe"] {
+        let path = dir.join(name);
+        assert_eq!(rustup_proxy_for(&path, &path, true), None);
+    }
 }
 
 /// A plain copy (not rustup's proxy) is asked as it will run, `+<toolchain>` and all, since a

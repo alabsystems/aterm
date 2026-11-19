@@ -13,7 +13,7 @@ use aterm_spec::wait::{MUST_HAPPEN, within};
 use atpkg::activate::atomic_symlink;
 use atpkg::flow::{VendorFetchError, VendorGet};
 use atpkg::store::Layout;
-use atpkg::vendor_direct::watch::{ConcurrentVendorGetFn, HeadWatch};
+use atpkg::vendor_direct::watch::{ConcurrentVendorGetFn, HeadWatch, Rest};
 
 struct Fixture {
     layout: Layout,
@@ -52,10 +52,18 @@ fn modeled_pending(state: &BTreeMap<&'static str, i64>) -> usize {
         .count()
 }
 
-const HINT_SLICE: Duration = Duration::from_millis(20);
+/// A watch whose head rounds ring `rest`: a moved head's worker, and each round's last.
+fn ringing(watch: HeadWatch) -> (HeadWatch, Rest) {
+    let mut watch = watch;
+    let rest = Rest::inert();
+    watch.bind_ring(rest.ringer());
+    (watch, rest)
+}
 
+/// Harvest `watch` each time its round rings `rest`, until `arrived`; a missing ring fails the
+/// test after [`MUST_HAPPEN`] (a hang detector).
 fn harvest_until(
-    watch: &mut HeadWatch,
+    (watch, rest): (&mut HeadWatch, &Rest),
     layout: &Layout,
     now: SystemTime,
     get: &Arc<ConcurrentVendorGetFn<'static>>,
@@ -67,7 +75,7 @@ fn harvest_until(
         if arrived(watch, offers) {
             return Some(());
         }
-        watch.park_for_hint(HINT_SLICE);
+        let _ = rest.wait(Some(MUST_HAPPEN));
         offers.extend(watch.check_pending(layout, now, get));
         arrived(watch, offers).then_some(())
     });
@@ -120,7 +128,7 @@ fn ready_codex_offer_is_harvested_while_claude_is_still_in_flight() {
     };
     let model = atpkg_vendor_pending_check_model();
     let mut projected = model.init_state();
-    let mut watch = HeadWatch::new(&[]);
+    let (mut watch, rest) = ringing(HeadWatch::new(&[]));
     let mut first_offers = watch.check_pending(&fixture.layout, at(0), &get);
     assert!(model.fire("StartFirst", &mut projected));
     assert!(model.fire("StartSecond", &mut projected));
@@ -128,7 +136,7 @@ fn ready_codex_offer_is_harvested_while_claude_is_still_in_flight() {
     assert!(watch.pending_count() <= modeled_pending(&projected));
 
     harvest_until(
-        &mut watch,
+        (&mut watch, &rest),
         &fixture.layout,
         at(0),
         &get,
@@ -153,7 +161,7 @@ fn ready_codex_offer_is_harvested_while_claude_is_still_in_flight() {
     ready.notify_all();
     let mut second_offers = Vec::new();
     harvest_until(
-        &mut watch,
+        (&mut watch, &rest),
         &fixture.layout,
         at(0),
         &get,
@@ -191,12 +199,12 @@ fn unreachable_single_head_keeps_its_retry_deadline() {
     };
     let model = atpkg_vendor_pending_check_model();
     let mut projected = model.init_state();
-    let mut watch = HeadWatch::new(&[String::from("codex")]);
+    let (mut watch, rest) = ringing(HeadWatch::new(&[String::from("codex")]));
     assert!(watch.check_pending(&fixture.layout, at(0), &get).is_empty());
     assert!(model.fire("StartFirst", &mut projected));
     let mut failed_offers = Vec::new();
     harvest_until(
-        &mut watch,
+        (&mut watch, &rest),
         &fixture.layout,
         at(0),
         &get,
@@ -219,7 +227,7 @@ fn unreachable_single_head_keeps_its_retry_deadline() {
     );
     let mut offers = watch.check_pending(&fixture.layout, at(60), &get);
     harvest_until(
-        &mut watch,
+        (&mut watch, &rest),
         &fixture.layout,
         at(60),
         &get,

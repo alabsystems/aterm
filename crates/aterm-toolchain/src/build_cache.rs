@@ -2432,6 +2432,140 @@ pub fn selected_outputs(
     })
 }
 
+/// A producer's selected intermediate-directory value before Cargo expands its templates.
+/// This observation grants no directory creation or cache custody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedBuildDirHint {
+    /// An absolute path, or a value beginning with an absolute-producing Cargo template.
+    /// Config-relative values retain their defining file's base.
+    pub value: PathBuf,
+    /// Initial manifest readings, when known, for resolving a `{workspace-root}` template.
+    /// A caller must establish that every reading selects the same workspace; this value
+    /// alone grants no ownership of either the workspace or the build directory.
+    pub manifests: Option<Vec<PathBuf>>,
+}
+
+/// Read a producer's explicit intermediates with the same alias, CLI, environment and config
+/// precedence as [`selected_outputs`], retaining valid Cargo templates for its caller to
+/// resolve or protect through a known ancestor. Unlike custody, this read may observe a
+/// working directory outside HOME and needs no readable manifest: neither observation grants
+/// creation there. Queries and known absence return `Ok(None)`.
+///
+/// # Errors
+/// The command's explicit intermediate choice cannot be established, including an output
+/// graph this reader cannot read or a frontend whose separate output grammar is unresolved.
+pub fn selected_build_dir_hint(
+    args: &[String],
+    tool: Tool,
+    m: &Machine<'_>,
+    alias: &dyn Fn(&str) -> UserAlias,
+) -> Result<Option<SelectedBuildDirHint>, String> {
+    let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
+    let metadata_target = |words: &[String]| miri_metadata_target(words, tool, m);
+    let miri = Miri {
+        env: m.env,
+        metadata_target: &metadata_target,
+    };
+    let (words, unresolved_alias) = match reading(&args[at..], tool, alias, &miri) {
+        Outcome::Read(reading) if reading.query => return Ok(None),
+        Outcome::Read(reading) => (reading.line, false),
+        Outcome::Refused => return Ok(None),
+        Outcome::Untold { line, .. } => (line, true),
+    };
+    let words = if tool == Tool::Tippy {
+        words
+    } else {
+        without_directory(&words)
+    };
+    let cwd = m
+        .cwd
+        .ok_or("Cargo build-directory lookup has no working directory")?;
+    let home = m.home.unwrap_or(cwd);
+    let root = m.root.map_or_else(|| cache_root(home), Path::to_path_buf);
+    let line =
+        Line::parse_for_intermediates(&words, tool, home, &root, in_lane(&args[at..], tool, m.env));
+    if line.as_ref().is_some_and(|line| {
+        line.query
+            || line.verb_at.is_some_and(|at| words[at] == "clean")
+            || line
+                .alias
+                .as_deref()
+                .is_some_and(|verb| builtin_command(verb, tool))
+    }) {
+        return Ok(None);
+    }
+    let configs: Vec<&str> = match &line {
+        Some(line) => line.configs.iter().map(String::as_str).collect(),
+        None => metadata_configs(&words).map(|(_, value)| value).collect(),
+    };
+    let value = selected_intermediate_value(&configs, tool, m)?;
+    let Some(value) = value else { return Ok(None) };
+    let Some(line) = line else {
+        return Err("the explicit Cargo build-directory command cannot be established".into());
+    };
+    if unresolved_alias || line.alias.is_some() || line.trust || tool == Tool::Cargo {
+        return Err("the explicit Cargo build-directory frontend cannot be established".into());
+    }
+    Ok(Some(SelectedBuildDirHint {
+        value,
+        manifests: cache_manifests_for(&line, tool, m, false),
+    }))
+}
+
+/// Intermediate selection is independent of final targets and owner discovery. The shared
+/// graph reader still judges build-directory values and includes, but ignores other outputs.
+fn selected_intermediate_value(
+    configs: &[&str],
+    tool: Tool,
+    m: &Machine<'_>,
+) -> Result<Option<PathBuf>, String> {
+    let cwd = m
+        .cwd
+        .ok_or("Cargo build-directory lookup has no working directory")?;
+    let refused =
+        || "the explicit Cargo build-directory configuration cannot be established".to_owned();
+    let mut selected = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for value in configs {
+        let outputs =
+            cache_config_outputs_read(value, m, TargetRead::Ignore, tool != Tool::Cargo, &mut seen)
+                .map_err(|()| refused())?;
+        if let Some(path) = outputs.intermediates {
+            selected = Some(configured_build_dir(path));
+        }
+    }
+    selected = selected.or_else(|| cargo_var(BUILD_DIR_ENV, tool, m).map(PathBuf::from));
+    let homes = package_homes(tool, m);
+    let homes = if homes.is_empty() {
+        vec![None]
+    } else {
+        homes.iter().map(|home| Some(home.as_path())).collect()
+    };
+    let mut agreed = None;
+    for home in homes {
+        let outputs =
+            discovered_config_outputs_read(cwd, home, m, true, tool != Tool::Cargo, false, true)
+                .map_err(|()| refused())?;
+        let chosen = selected
+            .clone()
+            .or_else(|| outputs.intermediates.map(configured_build_dir));
+        if agreed.as_ref().is_some_and(|prior| prior != &chosen) {
+            return Err(refused());
+        }
+        agreed = Some(chosen);
+    }
+    agreed
+        .flatten()
+        .map(|path| {
+            let value = path
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "Cargo build-dir is not UTF-8")?;
+            cargo_build_dir_hint_value(cwd, value).map(|hint| PathBuf::from(hint.value))
+        })
+        .transpose()
+}
+
 /// The `target` Targo builds a line into where nothing names another ([`workspace_target`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceTarget {
@@ -2736,13 +2870,14 @@ fn resolve_discovered_outputs(
     let mut resolved = None;
     for home in homes {
         let outputs = discovered_config_outputs(cwd, home, m, target.is_some(), true, false)?;
+        let discovered_build = outputs
+            .intermediates
+            .map(|selected| selected.base.join(selected.value));
         let selected = (
             target
                 .clone()
                 .or_else(|| outputs.target.map(|p| p.base.join(p.value))),
-            intermediates
-                .clone()
-                .or_else(|| outputs.intermediates.map(|p| p.base.join(p.value))),
+            intermediates.clone().or(discovered_build),
         );
         if resolved.as_ref().is_some_and(|prior| prior != &selected) {
             return Err(());
@@ -2750,6 +2885,17 @@ fn resolve_discovered_outputs(
         resolved = Some(selected);
     }
     resolved.ok_or(())
+}
+
+/// A selected intermediate value retains its definition base, except that Cargo expands a
+/// leading absolute-producing template before applying that base. Custody never accepts a
+/// template and keeps its original path reading.
+fn configured_build_dir(selected: ConfiguredPath) -> PathBuf {
+    if absolute_build_template(&selected.value) {
+        PathBuf::from(selected.value)
+    } else {
+        selected.base.join(selected.value)
+    }
 }
 
 /// The outputs the configs Targo walks select ([`config_walk`], then `home`): Targo visits the
@@ -2782,18 +2928,30 @@ fn discovered_config_outputs(
     follow_includes: bool,
     nearest_only: bool,
 ) -> Result<ConfigOutputs, ()> {
+    discovered_config_outputs_read(
+        cwd,
+        home,
+        m,
+        target_known,
+        follow_includes,
+        nearest_only,
+        false,
+    )
+}
+
+fn discovered_config_outputs_read(
+    cwd: &Path,
+    home: Option<&Path>,
+    m: &Machine<'_>,
+    target_known: bool,
+    follow_includes: bool,
+    nearest_only: bool,
+    intermediates_only: bool,
+) -> Result<ConfigOutputs, ()> {
     let mut selected = ConfigOutputs::default();
     for dir in config_folders(cwd, m, home.map(Path::to_path_buf)) {
-        let legacy = dir.join("config");
-        let (file, text) = match config_file(&legacy, m)? {
-            Some(text) => (legacy, text),
-            None => {
-                let file = dir.join("config.toml");
-                let Some(text) = config_file(&file, m)? else {
-                    continue;
-                };
-                (file, text)
-            }
+        let Some((file, text)) = directory_config(&dir, m)? else {
+            continue;
         };
         if text.len() > CONFIG_GRAPH_MAX_BYTES {
             return Err(());
@@ -2823,7 +2981,11 @@ fn discovered_config_outputs(
             Some(file),
             cwd,
             m,
-            open_target,
+            if intermediates_only {
+                TargetRead::Ignore
+            } else {
+                TargetRead::from_selection(open_target)
+            },
             if follow_includes {
                 Includes::Follow
             } else {
@@ -2838,6 +3000,7 @@ fn discovered_config_outputs(
             selected.intermediates = outputs.intermediates;
         }
         selected.artifact |= outputs.artifact;
+        selected.non_macos_target |= outputs.non_macos_target;
         // A reader of one output stops at the nearest file that selects it.
         let found = if target_known {
             selected.intermediates.is_some()
@@ -2849,6 +3012,163 @@ fn discovered_config_outputs(
         }
     }
     Ok(selected)
+}
+
+/// Cargo prefers the extensionless config when both names stand in one folder.
+fn directory_config(dir: &Path, m: &Machine<'_>) -> Result<Option<(PathBuf, String)>, ()> {
+    let legacy = dir.join("config");
+    if let Some(text) = config_file(&legacy, m)? {
+        return Ok(Some((legacy, text)));
+    }
+    let file = dir.join("config.toml");
+    Ok(config_file(&file, m)?.map(|text| (file, text)))
+}
+
+/// Whether adding a macOS SDK is safe for an already expanded command at `m.cwd`.
+/// Every observed target must be an exact supported macOS triple. This deliberately keeps
+/// compiler SDK discovery where an overridden setting names another platform, rather than
+/// reconstructing target precedence. Unknown, unreadable or refused configuration also keeps
+/// the compiler's discovery. The existing bounded config graph reads files, inline `--config`
+/// values and includes, under one cumulative read/text budget for this observer. Words
+/// belonging to a program or test binary are not Cargo settings.
+#[must_use]
+pub fn macos_sdk_platform(args: &[String], tool: Tool, m: &Machine<'_>) -> bool {
+    macos_sdk_platform_budgeted(args, tool, m, ConfigGraphBudget::default())
+}
+
+fn macos_sdk_platform_budgeted(
+    args: &[String],
+    tool: Tool,
+    m: &Machine<'_>,
+    budget: ConfigGraphBudget,
+) -> bool {
+    // This observer is optional. Bound its total work without changing the graph budgets or
+    // cycle sets used by existing output-directory consumers. Every actual read, including a
+    // missing file or a repeated include in another graph, consumes the same allowance.
+    let cumulative = std::cell::RefCell::new(budget);
+    let exhausted = std::cell::Cell::new(false);
+    let source = m.read;
+    let read = |path: &Path| {
+        if exhausted.get() {
+            return Err(());
+        }
+        {
+            let mut budget = cumulative.borrow_mut();
+            if budget.text_bytes >= CONFIG_GRAPH_MAX_BYTES || budget.attempt_read().is_err() {
+                exhausted.set(true);
+                return Err(());
+            }
+        }
+        let text = source(path)?;
+        if let Some(text) = &text
+            && cumulative.borrow_mut().retain_text(text).is_err()
+        {
+            exhausted.set(true);
+            return Err(());
+        }
+        Ok(text)
+    };
+    let observed = Machine { read: &read, ..*m };
+    let m = &observed;
+    let Some(cwd) = m.cwd else {
+        return false;
+    };
+    for name in ["CARGO_BUILD_TARGET", "TARGO_BUILD_TARGET"] {
+        if (m.env)(name).is_some_and(|target| target.to_str().is_none_or(|s| !macos_target(s))) {
+            return false;
+        }
+    }
+    let own = &args[..own_words(args, tool)];
+    let mut words = own.iter().map(String::as_str);
+    while let Some(word) = words.next() {
+        if word == "--config" {
+            if words.next().is_none() {
+                return false;
+            }
+            continue;
+        }
+        let target = if word == "--target" {
+            let Some(target) = words.next() else {
+                return false;
+            };
+            Some(target)
+        } else {
+            word.strip_prefix("--target=")
+        };
+        if target.is_some_and(|target| !macos_target(target)) {
+            return false;
+        }
+    }
+    let includes = if tool == Tool::Cargo {
+        Includes::Refuse
+    } else {
+        Includes::Follow
+    };
+    // Read every discovered layer: target-dir selection and its nearest-only shortcuts say
+    // nothing about the platform selected in a farther config or an included file.
+    for dir in config_folders(cwd, m, package_homes(tool, m)) {
+        let Ok(config) = directory_config(&dir, m) else {
+            return false;
+        };
+        let Some((file, text)) = config else {
+            continue;
+        };
+        let Ok(outputs) = config_graph_outputs(
+            text,
+            Some(file),
+            cwd,
+            m,
+            TargetRead::Validate,
+            includes,
+            &mut std::collections::BTreeSet::new(),
+        ) else {
+            return false;
+        };
+        if exhausted.get() || outputs.non_macos_target {
+            return false;
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, value) in metadata_configs(own) {
+        // Inline values bypass Machine::read; charge their text before either CLI parser.
+        // A file spelling is charged too, conservatively, in addition to its file's bytes.
+        if cumulative.borrow_mut().retain_text(value).is_err() {
+            return false;
+        }
+        let Ok(outputs) = cache_config_outputs(value, m, false, tool != Tool::Cargo, &mut seen)
+        else {
+            return false;
+        };
+        // A CLI path read may fall back to parsing its spelling as inline TOML. Budget
+        // refusal must remain sticky even where that ordinary fallback succeeds.
+        if exhausted.get() || outputs.non_macos_target {
+            return false;
+        }
+    }
+    true
+}
+
+fn macos_target(target: &str) -> bool {
+    matches!(target, "aarch64-apple-darwin" | "x86_64-apple-darwin")
+}
+
+/// Observe all target definitions without changing the graph's output-directory semantics.
+fn non_macos_target(config: &aterm_toml::Value) -> bool {
+    config.get("build").is_some_and(|build| {
+        let Some(build) = build.as_table() else {
+            return true;
+        };
+        build.get("target").is_some_and(|target| match target {
+            aterm_toml::Value::String(target) => !macos_target(target),
+            aterm_toml::Value::Array(targets) => {
+                targets.is_empty()
+                    || targets
+                        .iter()
+                        .any(|target| target.as_str().is_none_or(|s| !macos_target(s)))
+            }
+            _ => true,
+        })
+    })
 }
 
 /// Read CLI config outputs with their definition's path bases, as Targo's `cli_args_as_table`
@@ -2870,6 +3190,22 @@ fn cache_config_outputs(
     follow_includes: bool,
     file_seen: &mut std::collections::BTreeSet<PathBuf>,
 ) -> Result<ConfigOutputs, ()> {
+    cache_config_outputs_read(
+        value,
+        m,
+        TargetRead::from_selection(select_target),
+        follow_includes,
+        file_seen,
+    )
+}
+
+fn cache_config_outputs_read(
+    value: &str,
+    m: &Machine<'_>,
+    target_read: TargetRead,
+    follow_includes: bool,
+    file_seen: &mut std::collections::BTreeSet<PathBuf>,
+) -> Result<ConfigOutputs, ()> {
     let cwd = m.cwd.ok_or(())?;
     let includes = if follow_includes {
         Includes::Follow
@@ -2884,7 +3220,7 @@ fn cache_config_outputs(
     };
     match read {
         Ok(Some(text)) => {
-            config_graph_outputs(text, Some(file), cwd, m, select_target, includes, file_seen)
+            config_graph_outputs(text, Some(file), cwd, m, target_read, includes, file_seen)
         }
         _ if !value.is_empty() && stands(&file) => Err(()),
         _ => {
@@ -2897,7 +3233,7 @@ fn cache_config_outputs(
                 None,
                 cwd,
                 m,
-                select_target,
+                target_read,
                 includes,
                 file_seen,
             )
@@ -2933,6 +3269,23 @@ fn sets_no_inline_table(value: &str) -> bool {
 const CONFIG_GRAPH_MAX_READS: usize = 1024;
 const CONFIG_GRAPH_MAX_BYTES: usize = 16 * 1024 * 1024;
 const CONFIG_GRAPH_MAX_PENDING: usize = 2 * CONFIG_GRAPH_MAX_READS;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetRead {
+    Select,
+    Validate,
+    Ignore,
+}
+
+impl TargetRead {
+    fn from_selection(selected: bool) -> Self {
+        if selected {
+            Self::Select
+        } else {
+            Self::Validate
+        }
+    }
+}
 
 /// One graph's resource policy, shared by CLI output resolution and discovered-output scans.
 /// Missing optional files consume attempts; text counts cumulatively before another layer runs.
@@ -2973,6 +3326,7 @@ struct ConfigOutputs {
     target: Option<ConfiguredPath>,
     intermediates: Option<ConfiguredPath>,
     artifact: bool,
+    non_macos_target: bool,
 }
 
 /// One layer's output values, as written, each with its defining file (`None` for an inline
@@ -3007,8 +3361,8 @@ enum Includes {
 /// boolean replace an earlier one, so only the winning value is judged among those, and it must
 /// be a non-empty string with no control character; a list or a table meets any other value with
 /// an error, and a float or a date Targo cannot load, so one anywhere in the graph is refused.
-/// A target is returned only where `select_target`, though it is judged either way: Targo's
-/// `build_config` loads the whole `build` table, an outranked target with it. Only a returned
+/// A target is judged in the ordinary output reading and returned in `TargetRead::Select`.
+/// The intermediate-only projection ignores unrelated target and artifact fields. Only a returned
 /// value's definition base is taken, as Targo's `Definition::root` is asked only where a path is
 /// resolved. A nonempty `include` is read as `includes` says ([`Includes`]).
 ///
@@ -3023,7 +3377,7 @@ fn config_graph_outputs(
     file: Option<PathBuf>,
     cwd: &Path,
     m: &Machine<'_>,
-    select_target: bool,
+    target_read: TargetRead,
     includes: Includes,
     file_seen: &mut std::collections::BTreeSet<PathBuf>,
 ) -> Result<ConfigOutputs, ()> {
@@ -3049,6 +3403,7 @@ fn config_graph_outputs(
     let mut target = None;
     let mut intermediates = None;
     let mut artifact = false;
+    let mut non_macos = false;
     while let Some(step) = pending.pop() {
         match step {
             ConfigStep::Outputs(outputs) => {
@@ -3078,9 +3433,15 @@ fn config_graph_outputs(
             }
             ConfigStep::Layer(text, file) => {
                 let config = config_toml(&text).ok_or(())?;
-                let layer_target = config_layer_value(&config, "target-dir")?;
+                non_macos |= non_macos_target(&config);
+                let layer_target = if target_read == TargetRead::Ignore {
+                    None
+                } else {
+                    config_layer_value(&config, "target-dir")?
+                };
                 let layer_intermediates = config_layer_value(&config, "build-dir")?;
-                let layer_artifact = config_layer_value(&config, "artifact-dir")?.is_some();
+                let layer_artifact = target_read != TargetRead::Ignore
+                    && config_layer_value(&config, "artifact-dir")?.is_some();
                 let own_target = layer_target.is_some();
                 if own_target || layer_intermediates.is_some() || layer_artifact {
                     pending.push(ConfigStep::Outputs(LayerOutputs {
@@ -3142,9 +3503,10 @@ fn config_graph_outputs(
         Ok(Some(ConfiguredPath { base, value }))
     };
     Ok(ConfigOutputs {
-        target: winner(target, select_target)?,
+        target: winner(target, target_read == TargetRead::Select)?,
         intermediates: winner(intermediates, true)?,
         artifact,
+        non_macos_target: non_macos,
     })
 }
 
@@ -3199,7 +3561,11 @@ pub enum InitialManifest {
 /// ancestor and package.workspace lookup are separate operations with their own grammar.
 #[must_use]
 pub fn initial_manifest(m: &Machine<'_>, native: bool) -> InitialManifest {
-    let (Some(home), Some(cwd)) = (m.home, m.cwd) else {
+    initial_manifest_for(m, native, true)
+}
+
+fn initial_manifest_for(m: &Machine<'_>, native: bool, managed: bool) -> InitialManifest {
+    let Some(cwd) = m.cwd else {
         return InitialManifest::Absent;
     };
     let names: &[&str] = if native {
@@ -3209,7 +3575,7 @@ pub fn initial_manifest(m: &Machine<'_>, native: bool) -> InitialManifest {
     };
     for directory in cwd
         .ancestors()
-        .take_while(|p| p.starts_with(home) && *p != home)
+        .take_while(|p| !managed || m.home.is_some_and(|home| p.starts_with(home) && *p != home))
     {
         for name in names {
             let path = directory.join(name);
@@ -3251,12 +3617,21 @@ pub fn initial_manifest_readings(
 }
 
 fn cache_manifests(line: &Line, tool: Tool, m: &Machine<'_>) -> Option<Vec<PathBuf>> {
+    cache_manifests_for(line, tool, m, true)
+}
+
+fn cache_manifests_for(
+    line: &Line,
+    tool: Tool,
+    m: &Machine<'_>,
+    managed: bool,
+) -> Option<Vec<PathBuf>> {
     if let Some(path) = line.manifest_path.as_deref() {
         return Some(vec![absolute(PathBuf::from(path), m.cwd?)?]);
     }
     let mut manifests = Vec::new();
     for &native in manifest_modes(tool, Some(line)) {
-        let InitialManifest::Readable(path) = initial_manifest(m, native) else {
+        let InitialManifest::Readable(path) = initial_manifest_for(m, native, managed) else {
             return None;
         };
         if !manifests.contains(&path) {
@@ -3491,6 +3866,12 @@ pub fn cargo_build_dir_hint_with(m: &Machine<'_>) -> Result<Option<CargoBuildDir
             (selected.base, selected.value)
         }
     };
+    cargo_build_dir_hint_value(&base, value).map(Some)
+}
+
+/// Validate one effective intermediate value and preserve the base Cargo applies after
+/// expanding its templates. Both command-line and captured native plans use this reading.
+fn cargo_build_dir_hint_value(base: &Path, value: String) -> Result<CargoBuildDirHint, String> {
     if value.is_empty() {
         return Err("Cargo build-dir is empty".into());
     }
@@ -3515,17 +3896,21 @@ pub fn cargo_build_dir_hint_with(m: &Machine<'_>) -> Result<Option<CargoBuildDir
     }
     // Cargo expands templates before applying the config base. Leading absolute-producing
     // templates therefore keep their spelling; a hash stays relative to that original base.
-    let named = if value.starts_with("{workspace-root}") || value.starts_with("{cargo-cache-home}")
-    {
+    let named = if absolute_build_template(&value) {
         PathBuf::from(&value)
     } else {
         base.join(&value)
     };
     let path = (!templated && named.is_absolute()).then(|| named.clone());
-    Ok(Some(CargoBuildDirHint {
+    Ok(CargoBuildDirHint {
         value: named.into_os_string(),
         path,
-    }))
+    })
+}
+
+/// Templates Cargo expands to an absolute prefix before applying a relative config base.
+fn absolute_build_template(value: &str) -> bool {
+    value.starts_with("{workspace-root}") || value.starts_with("{cargo-cache-home}")
 }
 
 /// A configuration can select a target without an argv or environment target. When this
@@ -4031,16 +4416,38 @@ impl Line {
         root: &Path,
         unverified: bool,
     ) -> Option<Self> {
+        Self::parse_with_manifest_policy(args, tool, home, root, unverified, true)
+    }
+
+    fn parse_for_intermediates(
+        args: &[String],
+        tool: Tool,
+        home: &Path,
+        root: &Path,
+        unverified: bool,
+    ) -> Option<Self> {
+        Self::parse_with_manifest_policy(args, tool, home, root, unverified, false)
+    }
+
+    fn parse_with_manifest_policy(
+        args: &[String],
+        tool: Tool,
+        home: &Path,
+        root: &Path,
+        unverified: bool,
+        managed: bool,
+    ) -> Option<Self> {
         let manifest_ok = |v: &str| {
             let p = Path::new(v);
             !v.is_empty()
-                && !v.contains("..")
-                && !v.contains("//")
-                && !v.contains("/./")
-                && !v.ends_with("/.")
-                && !has_brace(p)
-                && !p.starts_with(root)
-                && (!v.starts_with('/') || p.starts_with(home))
+                && (!managed
+                    || (!v.contains("..")
+                        && !v.contains("//")
+                        && !v.contains("/./")
+                        && !v.ends_with("/.")
+                        && !has_brace(p)
+                        && !p.starts_with(root)
+                        && (!v.starts_with('/') || p.starts_with(home))))
         };
         let mut verb = (tool == Tool::Tippy).then_some("tippy");
         let mut verb_at = None;
@@ -4777,3 +5184,7 @@ fn read_input(path: &Path, manifest: bool) -> Result<Option<String>, ()> {
 #[cfg(test)]
 #[path = "build_cache_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "build_cache_sdk_tests.rs"]
+mod sdk_tests;

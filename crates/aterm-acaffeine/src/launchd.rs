@@ -175,6 +175,24 @@ pub(crate) fn label_of(text: &str, installed: &str, dev_prefix: &str) -> bool {
             })
 }
 
+/// Keep the mug job's log bounded where this process's standard error is it
+/// ([`aterm_uds::job_log::keep`]): [`Paths::log_file`], the plist's `StandardErrorPath` (it names
+/// no standard output, which launchd sends to `/dev/null`). The first thing `aterm acaffeine
+/// serve` does once it knows its login's paths, handing what it kept to the mug it serves (its
+/// `ServeContext`, which nothing else can fill); a run whose standard error is anything else
+/// keeps nothing.
+#[cfg(unix)]
+pub fn keep_log(paths: &Paths) -> aterm_uds::job_log::Kept {
+    aterm_uds::job_log::keep(&[paths.log_file()])
+}
+
+/// One line of the mug's log, dated ([`aterm_uds::job_log::line`]): what `serve` says of its
+/// start, its refusals and its ends.
+#[cfg(unix)]
+pub fn say(line: std::fmt::Arguments<'_>) {
+    aterm_uds::job_log::line(line);
+}
+
 /// Render the launchd plist for `label` running `program acaffeine serve` ([`EXIT_RESTART`]).
 #[must_use]
 pub fn plist_text(label: &str, program: &Path, log: &Path, bundle_id: Option<&str>) -> String {

@@ -55,6 +55,7 @@ pub(crate) fn file(
             prover_root: prover.bin.parent().unwrap().display().to_string(),
             trustc: prover.trustc.clone(),
             head: commit.into(),
+            date: "2026-11-17T00:00:00Z".into(),
             ..Provenance::default()
         }),
         ..Facts::default()

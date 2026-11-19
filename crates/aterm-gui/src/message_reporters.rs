@@ -4412,6 +4412,128 @@ pub(crate) fn disk_settings_entry(notes: &[String]) -> Entry {
     entry.log_line(format!("disk-settings-off notes={}", notes.len()))
 }
 
+/// The key every record of a memory starvation episode takes (SD-05's `system/<kind>`).
+pub(crate) const STARVING_KEY: &str = "system/starving";
+
+/// Builds the record of a memory starvation episode opening or ending
+/// ([`aterm_vitals::starving`]): a fact for later, never an Entry or a Now, in fixed words and
+/// numbers. The opening names the rule and what the machine read (pushed out, read back, the
+/// headroom of its memory, the compressor's fill where read); the end, how long it lasted and the
+/// worst it read. Each names the largest holders by footprint as the newest process sweep named
+/// them (its age where a sweep stalled since), each by its program's plain name (else `-`), its
+/// size, its pid and its tab's number (`Tab 3`; a tab of any other name is `a tab`). The
+/// aterm.log line of the same edge is written first, by the probe thread
+/// (`memory_starving::line`).
+pub(crate) fn starving_record(edge: &aterm_vitals::starving::Edge) -> Message {
+    use aterm_vitals::starving::Edge;
+    let gib = |b: u64| format!("{:.1} GiB", b as f64 / f64::from(1u32 << 30));
+    let mibps = |b: f64| format!("{} MiB/s", (b.max(0.0) / 1_048_576.0).round() as u64);
+    let (msg, e) = match edge {
+        Edge::Opened(e) => {
+            let l = &e.at_open;
+            let title = match e.why {
+                aterm_vitals::starving::Why::Thrash => {
+                    "Memory is starving: pages are pushed out of RAM and read back"
+                }
+                aterm_vitals::starving::Why::Wall => {
+                    "Memory is starving: the compressor is near its wall"
+                }
+                aterm_vitals::starving::Why::Kernel => {
+                    "Memory is starving: the kernel's level is critical while pages move"
+                }
+                aterm_vitals::starving::Why::Stall => {
+                    "Memory is starving: every task stalls on memory"
+                }
+            };
+            let mut msg = Message::new(tags::SYSTEM, Severity::Info, title).line(format!(
+                "{} pushed out, {} read back; {} of {} free to hand out",
+                l.push_bps.map_or_else(|| "none read".to_owned(), mibps),
+                l.refault_bps.map_or_else(|| "none read".to_owned(), mibps),
+                l.headroom.map_or_else(|| "none read".to_owned(), gib),
+                gib(l.ram)
+            ));
+            if let Some(w) = l.wall_permille {
+                msg = msg.line(format!(
+                    "the compressor at {}.{} % of its segments",
+                    w / 10,
+                    w % 10
+                ));
+            }
+            if let Some((_, full)) = l.stall {
+                msg = msg.line(format!(
+                    "every task stalled for {} % of the reading",
+                    (full * 100.0).round() as u64
+                ));
+            }
+            (msg, e)
+        }
+        Edge::Ended(e) => {
+            let mut msg = Message::new(
+                tags::SYSTEM,
+                Severity::Info,
+                format!(
+                    "Memory starvation ended after {}",
+                    aterm_uds::process::held_age(e.for_ms().unwrap_or(0))
+                ),
+            )
+            .line(format!(
+                "at worst {} pushed out, {} read back, {} free to hand out",
+                mibps(e.worst.push_bps),
+                mibps(e.worst.refault_bps),
+                e.worst.headroom.map_or_else(|| "none read".to_owned(), gib)
+            ));
+            if let Some(w) = e.worst.wall_permille {
+                msg = msg.line(format!(
+                    "the compressor at most at {}.{} % of its segments",
+                    w / 10,
+                    w % 10
+                ));
+            }
+            (msg, e)
+        }
+    };
+    let held: Vec<String> = e
+        .holders
+        .iter()
+        .map(|h| {
+            let at = match (h.label.as_deref().and_then(tab_number), h.scope) {
+                (Some(n), _) => format!(" in Tab {n}"),
+                (None, aterm_vitals::RowScope::Tab(_)) => " in a tab".to_owned(),
+                (None, aterm_vitals::RowScope::SelfProc) => " (aterm)".to_owned(),
+                (None, _) => String::new(),
+            };
+            format!(
+                "{} {} (pid {}){at}",
+                aterm_vitals::sys::exe_word(&h.name),
+                gib(h.bytes),
+                h.pid
+            )
+        })
+        .collect();
+    let msg = if held.is_empty() {
+        msg.line("no process sweep named the largest holders")
+    } else {
+        let msg = msg.line(format!("largest: {}", held.join(", ")));
+        match e.holders_age_ms {
+            Some(age) if age >= 1000 => msg.line(format!(
+                "as the sweep {} before named them",
+                aterm_uds::process::held_age(age)
+            )),
+            _ => msg,
+        }
+    };
+    msg.record().key(STARVING_KEY)
+}
+
+/// The number of a tab's label `Tab <n>`, the name aterm gives an unparked tab; `None` for any
+/// other label (a parked tab's carries a title its program may have chosen).
+fn tab_number(label: &str) -> Option<u32> {
+    label
+        .strip_prefix("Tab ")
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.parse().ok())
+}
+
 /// The key every record of macOS's program check's backed-up episodes takes (leftover §6.5's `program-check.` stem).
 pub(crate) const PROGRAM_CHECK_EPISODE_KEY: &str = "program-check.episode";
 

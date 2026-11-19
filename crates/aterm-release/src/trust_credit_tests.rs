@@ -3,7 +3,12 @@
 
 use super::*;
 
-const HEADER: &str = r#"{"schema":"trust.obligations.v1","package":"alpha","lane":"advisory"}"#;
+pub(crate) const HEADER: &str = concat!(
+    r#"{"schema":"trust.obligations.v1","package":"alpha","lane":"advisory","policy":"strict","#,
+    r#""selection":"--lib","seal":{"absent":"A8"},"targo_trust_commit":"5062eed55","#,
+    r#""profile":"test","outcome":"measured","vector":"digest","coverage_complete":true,"concluded":true,"degraded_anchors":0}"#,
+);
+const FUNCTION: &str = r#"{"fn":"alpha::f","source":null}"#;
 
 /// A record of `lines`, the n-th line's key made `alpha::f#n` (Trust writes one line per
 /// key).
@@ -11,14 +16,20 @@ fn record(lines: &[&str]) -> String {
     let keyed: Vec<String> = lines
         .iter()
         .enumerate()
-        .map(|(i, l)| l.replacen("\"alpha::f#1\"", &format!("\"alpha::f#{}\"", i + 1), 1))
+        .map(|(i, l)| {
+            l.replacen(
+                "\"alpha::f#0000000000000001\"",
+                &format!("\"alpha::f#{:016x}\"", i + 1),
+                1,
+            )
+        })
         .collect();
     record_raw(&keyed.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 /// A record of `lines` exactly as given.
 fn record_raw(lines: &[&str]) -> String {
-    let mut s = format!("{HEADER}\n{{\"fn\":\"alpha::f\",\"source\":null}}\n");
+    let mut s = format!("{HEADER}\n{FUNCTION}\n");
     for l in lines {
         s.push_str(l);
         s.push('\n');
@@ -28,8 +39,13 @@ fn record_raw(lines: &[&str]) -> String {
 
 /// An obligation line as targo 0.11.0 writes it: no grade fields.
 fn old(status: &str) -> String {
+    let stop = match status {
+        "proved" | "failed" => "solved",
+        "timeout" => "wall-backstop",
+        _ => "unclassified",
+    };
     format!(
-        r#"{{"key":"alpha::f#1","kind":"overflow","status":"{status}","stop":null,"file":"src/lib.rs","line":1,"col":0}}"#
+        r#"{{"key":"alpha::f#0000000000000001","kind":"overflow","status":"{status}","stop":"{stop}","file":"src/lib.rs","line":1,"col":0}}"#
     )
 }
 
@@ -40,13 +56,15 @@ fn graded(status: &str, encoding: &str, discharge: &str) -> String {
 
 /// An obligation line with premises.
 fn graded_with(status: &str, encoding: &str, discharge: &str, premises: &[&str]) -> String {
+    let base = old(status);
     let premises = premises
         .iter()
         .map(|p| format!("\"{p}\""))
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"col":0,"discharge":"{discharge}","encoding":"{encoding}","file":"src/lib.rs","key":"alpha::f#1","kind":"overflow","line":1,"premises":[{premises}],"status":"{status}","stop":null}}"#
+        r#"{},"encoding":"{encoding}","discharge":"{discharge}","premises":[{premises}]}}"#,
+        base.strip_suffix('}').unwrap()
     )
 }
 
@@ -63,6 +81,125 @@ fn epoch(floor: u64) -> Epoch {
         mapped: "unvalidated-encoder".into(),
         calculus_floor: floor,
         why: "test".into(),
+    }
+}
+
+#[test]
+fn the_credit_header_accepts_historical_fields_and_rejects_damaged_headers() {
+    // The original version used a string seal and predated policy, commit, coverage
+    // conclusion and degraded-anchor counts.
+    let original = concat!(
+        r#"{"schema":"trust.obligations.v1","package":"alpha","lane":"advisory","#,
+        r#""selection":"--lib","seal":"old-seal","profile":"test","outcome":"measured","#,
+        r#""vector":"digest","coverage_complete":true}"#,
+    );
+    let row = old("proved");
+    let text = format!("{original}\n{FUNCTION}\n{row}\n");
+    assert_eq!(tally(&text).unwrap().proved, 1);
+    assert_eq!(tally(HEADER).unwrap(), Tally::default());
+    for invalid in [
+        r#"["trust.obligations.v1","alpha","advisory","--lib","old-seal","test","measured","digest",true]"#.into(),
+        HEADER.replace(r#","selection":"--lib""#, ""),
+        HEADER.replace(r#","seal":{"absent":"A8"}"#, ""),
+        HEADER.replace(r#""package":"alpha""#, r#""package":null"#),
+        HEADER.replace(r#""concluded":true"#, r#""concluded":null"#),
+        HEADER.replace(r#""degraded_anchors":0"#, r#""degraded_anchors":-1"#),
+        HEADER.replace(
+            r#""coverage_complete":true"#,
+            r#""coverage_complete":"true""#,
+        ),
+        HEADER.replace(
+            r#""lane":"advisory""#,
+            r#""lane":"advisory","unknown":true"#,
+        ),
+    ] {
+        let text = format!("{invalid}\n{FUNCTION}\n{row}\n");
+        let why = tally(&text).expect_err(&invalid);
+        assert!(why.contains("line 1"), "{why}");
+    }
+}
+
+#[test]
+fn only_complete_body_records_contribute_credit() {
+    let proof = calculus("proved");
+    let complete = format!("{HEADER}\n{FUNCTION}\n{proof}\n");
+    assert_eq!(tally(&complete).unwrap().calculus, 1);
+    let closure = complete.replace("alpha::f", "alpha::f::{closure#0}");
+    assert_eq!(tally(&closure).unwrap().calculus, 1);
+    let no_location = complete.replace(
+        r#""file":"src/lib.rs","line":1,"col":0"#,
+        r#""file":null,"line":null,"col":null"#,
+    );
+    assert_eq!(tally(&no_location).unwrap().calculus, 1);
+    let reject = |invalid: &str| {
+        // A damaged row invalidates the record even if a subsequent row carries good credit.
+        let text = format!("{HEADER}\n{FUNCTION}\n{invalid}\n{proof}\n");
+        let why = tally(&text).expect_err(invalid);
+        assert!(why.contains("line 3"), "{invalid}: {why}");
+        why
+    };
+    let mixed = proof.replace(r#""key":"#, r#""fn":"alpha::g","key":"#);
+    let why = reject(&mixed);
+    assert!(why.contains("function") && why.contains("key"), "{why}");
+    let missing_kind = proof.replace(r#","kind":"overflow""#, "");
+    let why = reject(&missing_kind);
+    assert!(why.contains("obligation") && why.contains("kind"), "{why}");
+    for invalid in [
+        "{}".to_string(),
+        "".into(),
+        r#"["alpha::f",null]"#.into(),
+        r#"{"status":"proved"}"#.into(),
+        r#"{"fn":null}"#.into(),
+        r#"{"fn":"alpha::g","source":false}"#.into(),
+        r#"{"fn":"alpha::g","extra":0}"#.into(),
+        proof.replace(r#""key":"#, r#""compile_error":"E","key":"#),
+        proof.replace(r#","stop":"solved""#, ""),
+        proof.replace(r#""stop":"solved""#, r#""stop":null"#),
+        proof.replace(r#""file":"src/lib.rs""#, r#""file":42"#),
+        proof.replace(r#""line":1"#, r#""line":-1"#),
+        proof.replace(r#""col":0"#, r#""col":4294967296"#),
+        proof.replace(r#""col":0"#, r#""col":0,"extra":true"#),
+        proof.replace("alpha::f#", "alpha::g#"),
+        proof.replace("#0000000000000001", "#1"),
+        proof.replace("#0000000000000001", "#000000000000000A"),
+        proof.replace(r#""encoding":"proven-calculus""#, r#""encoding":null"#),
+        old("proved").replace(
+            r#""col":0"#,
+            r#""col":0,"encoding":null,"discharge":null,"premises":null"#,
+        ),
+    ] {
+        reject(&invalid);
+    }
+    let missing_function = format!("{HEADER}\n{proof}\n");
+    assert!(tally(&missing_function).unwrap_err().contains("line 2"));
+}
+
+#[test]
+fn compile_errors_precede_functions_in_key_order() {
+    let error = r#"{"compile_error":"src/lib.rs#E1","code":"E1","message":"bad type","file":"src/lib.rs","line":1,"col":2}"#;
+    let second = error.replace("E1", "E2");
+    let proof = calculus("proved");
+    let valid = format!("{HEADER}\n{error}\n{second}\n{FUNCTION}\n{proof}\n");
+    assert_eq!(tally(&valid).unwrap().calculus, 1);
+    let only_errors = format!("{HEADER}\n{error}\n{second}\n");
+    assert_eq!(tally(&only_errors).unwrap(), Tally::default());
+    for (body, line) in [
+        (format!("{FUNCTION}\n{error}"), 3),
+        (format!("{second}\n{error}"), 3),
+        (format!("{error}\n{error}"), 3),
+        (error.replace(r#","message":"bad type""#, ""), 2),
+        (error.replace(r#""code":"E1""#, r#""code":2"#), 2),
+        (
+            error.replace(
+                r#""message":"bad type""#,
+                r#""message":"bad type","extra":true"#,
+            ),
+            2,
+        ),
+    ] {
+        let text = format!("{HEADER}\n{body}\n{FUNCTION}\n{proof}\n");
+        let why = tally(&text).expect_err(&body);
+        assert!(why.contains(&format!("line {line}")), "{why}");
     }
 }
 
@@ -96,10 +233,13 @@ fn an_ungraded_record_counts_zero_and_says_ungraded() {
         line,
         "proved (calculus): 0 of 2 proved [credit epoch 1, floor 0; ungraded: the prover stated no grade on any of 2 proved]"
     );
-    assert!(judge(&epoch(0), &c).is_empty(), "0 holds a floor of 0");
+    assert!(
+        judge(Some(&epoch(0)), &c).is_empty(),
+        "0 holds a floor of 0"
+    );
     // Negative control: the same ungraded record fails a floor above 0, since an
     // ungraded proof is no calculus credit.
-    let failed = judge(&epoch(1), &c);
+    let failed = judge(Some(&epoch(1)), &c);
     assert_eq!(failed.len(), 1);
     assert!(failed[0].contains("CREDIT-REGRESSED 0"), "{failed:?}");
 }
@@ -162,7 +302,7 @@ fn calculus_counts_only_proven_calculus_proofs() {
     );
     let mut c = Credit::default();
     c.add("alpha", Some(Ok(t)));
-    assert!(judge(&epoch(1), &c).is_empty());
+    assert!(judge(Some(&epoch(1)), &c).is_empty());
     assert_eq!(
         c.line(Some(&epoch(1))),
         "proved (calculus): 1 of 2 proved [credit epoch 1, floor 1; graded]"
@@ -196,8 +336,15 @@ fn the_counter_reads_the_vf5_calculus_authority_from_the_record() {
         c.line(Some(&epoch(0))),
         "proved (calculus): 2 of 3 proved [credit epoch 1, floor 0; graded]"
     );
-    assert!(judge(&epoch(2), &c).is_empty(), "2 holds a floor of 2");
-    assert_eq!(judge(&epoch(3), &c).len(), 1, "and fails a floor of 3");
+    assert!(
+        judge(Some(&epoch(2)), &c).is_empty(),
+        "2 holds a floor of 2"
+    );
+    assert_eq!(
+        judge(Some(&epoch(3)), &c).len(),
+        1,
+        "and fails a floor of 3"
+    );
 
     for bad in [
         graded_with(
@@ -363,8 +510,80 @@ fn a_line_trust_would_not_write_is_refused() {
 }
 
 #[test]
+fn a_proved_obligation_must_have_a_solved_stop() {
+    let historical = old("proved");
+    let calculus = calculus("proved");
+    assert_eq!(
+        tally(&record(&[&historical, &calculus])).unwrap(),
+        Tally {
+            proved: 2,
+            graded: 1,
+            calculus: 1,
+        }
+    );
+    for (row, stop) in [
+        (&calculus, "wall-backstop"),
+        (&historical, "not-dispatched"),
+    ] {
+        let damaged = row.replace(r#""stop":"solved""#, &format!(r#""stop":"{stop}""#));
+        let why = tally(&record(&[&damaged])).expect_err("a proved obligation must be solved");
+        assert!(why.contains("line 3") && why.contains(stop), "{why}");
+    }
+
+    // Trust's Lean writer fails the file closed when its theorem does not elaborate.
+    let failed = concat!(
+        r#"{"fn":"<file>","source":null}"#,
+        "\n",
+        r#"{"key":"<file>#ce7ef7696ca036b6","kind":"lean:file","status":"failed","stop":"solver-incomplete","#,
+        r#""file":"Rejected.lean","line":1,"col":1,"encoding":"ungraded","discharge":"ungraded","#,
+        r#""premises":[],"basis":"unproved_fail_closed"}"#,
+    );
+    assert_eq!(
+        tally(&format!("{HEADER}\n{failed}\n")),
+        Ok(Tally::default())
+    );
+}
+
+#[test]
+fn failure_basis_must_agree_with_the_credited_status() {
+    fn with_basis(row: &str, value: &str) -> String {
+        format!(r#"{},"basis":{value}}}"#, row.strip_suffix('}').unwrap())
+    }
+    let proof = calculus("proved");
+    let failed = graded("failed", UNGRADED, UNGRADED);
+    for (row, value) in [
+        (&proof, r#""refuted""#),
+        (&proof, r#""unproved_fail_closed""#),
+        (&failed, r#""unknown""#),
+        (&failed, "null"),
+        (&failed, "false"),
+    ] {
+        let text = record(&[&with_basis(row, value)]);
+        let why = tally(&text).expect_err("inconsistent proof record");
+        assert!(why.contains("line 3"), "{why}");
+    }
+    for value in [r#""refuted""#, r#""unproved_fail_closed""#] {
+        assert_eq!(
+            tally(&record(&[&with_basis(&failed, value)])),
+            Ok(Tally::default())
+        );
+    }
+    // The pre-basis writer omitted the field even on graded and failed rows.
+    assert_eq!(
+        tally(&record(&[&failed, &old("failed")])),
+        Ok(Tally::default())
+    );
+    assert_eq!(
+        tally(&record(&[&with_basis(&proof, "null")]))
+            .unwrap()
+            .calculus,
+        1
+    );
+}
+
+#[test]
 fn a_grade_nobody_can_read_is_refused_not_ungraded() {
-    let half = r#"{"key":"alpha::f#1","status":"proved","encoding":"proven-calculus"}"#;
+    let half = r#"{"key":"alpha::f#0000000000000001","kind":"assert","status":"proved","stop":"solved","encoding":"proven-calculus"}"#;
     assert!(tally(&record(&[half])).unwrap_err().contains("together"));
     let unknown = graded("proved", "proven-by-vibes", "assumed");
     assert!(
@@ -382,7 +601,18 @@ fn a_grade_nobody_can_read_is_refused_not_ungraded() {
     assert!(tally(&other).unwrap_err().contains("schema"));
     let mut c = Credit::default();
     c.add("alpha", Some(tally(&record(&[half]))));
-    let failed = judge(&epoch(0), &c);
+    assert!(
+        c.line(None)
+            .contains("incomplete count from readable records")
+    );
+    c.add("beta", Some(tally(&record(&[&calculus("proved")]))));
+    assert_eq!(c.total.calculus, 1);
+    let failed = judge(Some(&epoch(2)), &c);
+    assert_eq!(
+        failed.len(),
+        1,
+        "an incomplete count cannot establish a regression"
+    );
     assert!(
         failed[0].starts_with("alpha CREDIT-UNREADABLE"),
         "{failed:?}"
@@ -397,8 +627,8 @@ fn a_check_that_left_no_record_is_named_and_counts_zero() {
         c.line(Some(&epoch(0))),
         "proved (calculus): 0 of 0 proved [credit epoch 1, floor 0; ungraded: no trust.obligations.v1 record; no record: alpha]"
     );
-    assert!(judge(&epoch(0), &c).is_empty());
-    assert_eq!(judge(&epoch(2), &c).len(), 1);
+    assert!(judge(Some(&epoch(0)), &c).is_empty());
+    assert_eq!(judge(Some(&epoch(2)), &c).len(), 1);
 }
 
 #[test]
@@ -453,5 +683,97 @@ fn the_record_path_is_targo_trusts() {
     assert_eq!(
         record_path(Path::new("/t"), "a.b"),
         Path::new("/t/trust/obligations/a_b.ndjson")
+    );
+}
+
+#[test]
+fn the_standalone_floor_counts_each_physical_record_once() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let ledger = root.join(EPOCHS);
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    std::fs::write(ledger, "1\tproved\tunvalidated-encoder\t2\ttwo proofs\n").unwrap();
+
+    let text = record(&[&calculus("proved")]);
+    let one = root.join("one.ndjson");
+    let link = root.join("hardlink.ndjson");
+    std::fs::write(&one, &text).unwrap();
+    std::fs::hard_link(&one, &link).unwrap();
+    for alias in [one.clone(), root.join("./one.ndjson"), link] {
+        assert_eq!(run_cmd(root, &[one.clone(), alias]), 1);
+    }
+
+    // Two independent files for the same package still meet the floor.
+    let second = root.join("second.ndjson");
+    std::fs::write(&second, &text).unwrap();
+    assert_eq!(run_cmd(root, &[one.clone(), second.clone()]), 0);
+
+    // A trailing slash requests a directory. Its open error must survive the good reads.
+    let mut directory = one.clone().into_os_string();
+    directory.push("/");
+    assert_eq!(run_cmd(root, &[one, second, PathBuf::from(directory)]), 1);
+}
+
+#[test]
+fn a_changed_record_behind_an_alias_refuses_the_count() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.ndjson");
+    let alias = dir.path().join("alias.ndjson");
+    std::fs::write(&first, record(&[&calculus("proved")])).unwrap();
+    std::fs::hard_link(&first, &alias).unwrap();
+    let mut credit = Credit::default();
+    let mut files = BTreeMap::new();
+    count_file(&mut credit, &mut files, &first);
+    std::fs::write(&alias, record(&[&old("proved")])).unwrap();
+    count_file(&mut credit, &mut files, &alias);
+    assert_eq!(credit.total.calculus, 1);
+    assert_eq!(credit.refused.len(), 1);
+    assert!(judge(Some(&epoch(1)), &credit)[0].contains("CREDIT-UNREADABLE"));
+}
+
+#[test]
+fn the_live_grade_record_must_name_the_package_being_checked() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let target = dir.path();
+    let path = record_path(target, "beta");
+    assert!(read_record(target, "beta").is_none());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let alpha = record(&[&calculus("proved"), &old("proved")]);
+    std::fs::write(&path, &alpha).unwrap();
+    let why = read_record(target, "beta").unwrap().unwrap_err();
+    assert!(
+        why.contains(path.to_str().unwrap())
+            && why.contains(r#""alpha""#)
+            && why.contains(r#""beta""#),
+        "{why}"
+    );
+
+    // The standalone command takes arbitrary paths, including renamed records.
+    let ledger = target.join(EPOCHS);
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    std::fs::write(
+        ledger,
+        "1\tproved\tunvalidated-encoder\t1\tone calculus proof\n",
+    )
+    .unwrap();
+    assert_eq!(run_cmd(target, std::slice::from_ref(&path)), 0);
+
+    std::fs::write(&path, alpha.replace(r#","package":"alpha""#, "")).unwrap();
+    let why = read_record(target, "beta").unwrap().unwrap_err();
+    assert!(
+        why.contains(path.to_str().unwrap())
+            && why.contains(r#""beta""#)
+            && why.contains("missing"),
+        "{why}"
+    );
+
+    std::fs::write(&path, alpha.replace("alpha", "beta")).unwrap();
+    assert_eq!(
+        read_record(target, "beta").unwrap().unwrap(),
+        Tally {
+            proved: 2,
+            calculus: 1,
+            graded: 1
+        }
     );
 }

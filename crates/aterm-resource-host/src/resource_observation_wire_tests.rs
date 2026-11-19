@@ -99,6 +99,10 @@ fn an_early_done_or_a_missing_middle_terminal_cannot_advance_the_cursor() {
 #[test]
 fn duplicate_originals_sessions_and_unknown_counters_do_not_become_ownership() {
     let mut duplicate = observed(SESSION);
+    assert!(
+        decode(duplicate.frames()).is_ok(),
+        "the unmodified observation is valid"
+    );
     duplicate.originals.push(duplicate.originals[0].clone());
     assert!(decode(duplicate.frames()).is_err());
     let mut reused = observed(SESSION);

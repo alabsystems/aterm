@@ -2279,6 +2279,88 @@ fn guarded_probe_reply(retention: ReplyRetention) -> ControlReply {
     )
 }
 
+#[test]
+fn presentation_custody_ends_at_ack_or_disconnect_before_artifact_quarantine() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    for end in ["ack", "disconnect", "invalidated"] {
+        let (lease, owner) = crate::presentation_lease::Lease::with_wake(|| {});
+        let receipt = crate::presentation_lease::Receipt {
+            window: 0,
+            serial: 1,
+            surface: 1,
+            width: 744,
+            height: 528,
+        };
+        let held = lease.pin(receipt).unwrap();
+        lease.confirm(receipt).unwrap();
+        let alive = Arc::new(AtomicBool::new(true));
+        let reply = guarded_probe_reply(ReplyRetention::new(WireProbe {
+            alive: Arc::clone(&alive),
+            prepared: Arc::new(AtomicBool::new(false)),
+            fail_prepare: false,
+        }))
+        .retaining_presentation(owner);
+        let (mut client, server) = CtlStream::pair().unwrap();
+        let mut outbox = control_lanes::Outbox::default();
+        // The capture's owner, rather than an artifact wall budget, controls this interval.
+        outbox.attach_within(reply, std::time::Duration::ZERO);
+        assert!(outbox.deliver(&server, false).unwrap());
+        assert!(held.blocks(receipt));
+        let nonce = outbox.nonce_for_test().unwrap();
+        if end == "disconnect" {
+            drop(client);
+            assert_eq!(
+                await_ack(&mut outbox, &server),
+                ArtifactAckOutcome::AcknowledgementQuarantined
+            );
+            assert!(
+                alive.load(Ordering::Acquire),
+                "artifact retention is still quarantined"
+            );
+        } else {
+            if end == "invalidated" {
+                assert!(!held.blocks(crate::presentation_lease::Receipt {
+                    surface: 2,
+                    ..receipt
+                }));
+            }
+            writeln!(
+                client,
+                "{}{nonce}",
+                aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX
+            )
+            .unwrap();
+            assert_eq!(
+                await_ack(&mut outbox, &server),
+                ArtifactAckOutcome::PeerAcknowledged
+            );
+            let mut reader = BufReader::new(&client);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap(); // image
+            line.clear();
+            reader.read_line(&mut line).unwrap(); // challenge
+            line.clear();
+            reader.read_line(&mut line).unwrap(); // settled validity
+            if end == "ack" {
+                assert_eq!(
+                    line,
+                    format!("OK presentation-released {}\n", receipt.wire_fields())
+                );
+            } else {
+                assert!(
+                    line.starts_with("ERR presentation lease invalid:"),
+                    "{line}"
+                );
+            }
+            assert!(!alive.load(Ordering::Acquire));
+        }
+        assert!(lease.receipt().is_err(), "{end}: pixel custody is over");
+        assert!(!held.blocks(receipt));
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn detached_peer_drain_preserves_unrelated_timeout_errors() {
@@ -6447,7 +6529,7 @@ fn escalated_op_fences_argument_dependent_seams() {
     }
     let band = super::control_media::invoke_refusal("ShowSystemResourcesHere").expect("refused");
     assert!(
-        band.contains("(View \u{25b8} Show System Resources Here)"),
+        band.contains("(View \u{25b8} Expand System Resources Here)"),
         "the row's own place, not the Agents menu's: {band}"
     );
     let lens = super::control_media::invoke_refusal("ToggleStatsLens").expect("refused");
@@ -6518,6 +6600,35 @@ fn dispatch_authorization_applies_the_escalated_op() {
         ("write", write, "pointer", "move 1 2", true),
         ("write", write, "pointer", "wheel dy=3", true),
         ("read", read, "controls", "front", true),
+        ("read", read, "image", "shot.png", true),
+        (
+            "read",
+            read,
+            "image",
+            "--presentation-lease shot.png",
+            false,
+        ),
+        (
+            "write",
+            write,
+            "image",
+            "--presentation-lease shot.png",
+            false,
+        ),
+        (
+            "config",
+            cfg,
+            "image",
+            "shot.png --presentation-lease",
+            false,
+        ),
+        (
+            "owner",
+            owner,
+            "image",
+            "--presentation-lease shot.png",
+            true,
+        ),
         ("write", write, "invoke", "Copy", false),
         ("write", write, "act", SETTINGS_ACT, false),
         ("write", write, "pointer", "click", false),
@@ -6693,6 +6804,7 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
         "harness/session/7/land-at",
         "harness/session/7/land-cancel",
         "harness/session/7/show",
+        crate::native_settings::tabs_page::TABS_CLOSE_IDLE,
     ]
     .into_iter()
     .chain(every.iter().map(String::as_str))
@@ -6722,6 +6834,15 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
     }
 
     let mut app = crate::App::headless_for_test();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Tabs));
+    assert_eq!(
+        app.front_control_surface(),
+        if crate::native_settings::tabs_page::CAN_CLOSE_IDLE_TABS {
+            FrontControlSurface::OwnerSettings
+        } else {
+            FrontControlSurface::NativeSettings
+        }
+    );
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Harness));
     assert_eq!(
         app.front_control_surface(),
@@ -19313,7 +19434,8 @@ fn a_claim_is_proven_under_the_contract_it_names_or_stands_on() {
         assert_eq!(held_contract(&h.ctx, "kimi-alab@4242"), None);
         release_connection_claims_of(&h, 10);
         // A contract 4 claim outlives its connection by the re-exec grace; a release ends it.
-        if contract == UNIVERSAL {
+        // Off Unix there is no grace (`control::reexec_grace_us`), and the close ends it.
+        if contract == UNIVERSAL && cfg!(unix) {
             assert_eq!(held_contract(&h.ctx, standing), Some(contract));
             assert!(crate::session_timeline::release_supervisor(
                 &h.ctx,
@@ -23851,21 +23973,18 @@ fn a_drives_close_named_after_its_verb_is_told_the_form() {
 fn fleet_drive_without_requester_line_is_refused() {
     use aterm_types::control_verbs::Requester;
     let asked = Requester::of(Some("tqn5r6e0148"), Some("claude"), None, None);
-    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
-        let requester = Requester::of(Some(sid), Some("claude"), None, None);
-        let (mut near, mut far) = CtlStream::pair().expect("a pair");
-        far.write_all(format!("{}survey\n", requester.line()).as_bytes())
-            .expect("the lines");
-        let read = read_requester(&mut near).expect("the requester");
-        assert_eq!(read.sid(), Some(sid), "the whole session ID is retained");
-        assert_eq!(read, requester);
-        let mut rest = [0u8; 7];
-        near.read_exact(&mut rest).expect("the request behind it");
-        assert_eq!(&rest, b"survey\n");
-    }
+    assert_eq!(asked.sid(), Some("tqn5r6e0148"));
+    let (mut near, mut far) = CtlStream::pair().expect("a pair");
+    far.write_all(format!("{}survey\n", asked.line()).as_bytes())
+        .expect("the lines");
+    assert_eq!(read_requester(&mut near), Ok(asked.clone()));
+    let mut rest = [0u8; 7];
+    near.read_exact(&mut rest).expect("the request behind it");
+    assert_eq!(&rest, b"survey\n");
     for sent in [
         "survey\n".to_owned(),
         "@s-0123456789abcdef0123 turn hello\n".to_owned(),
+        "requester sid=s-0123456789abcdef0123 program=- model=- account=-\n".to_owned(),
         "requester sid=s-0123456789abcdef012 program=- model=- account=-\n".to_owned(),
         "requester sid=- program=- model=-\n".to_owned(),
         format!(

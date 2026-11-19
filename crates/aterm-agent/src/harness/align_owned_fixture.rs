@@ -2,9 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! A stand-in `claude auth login` for the owned capture's tests ([`super::capture_bounded_owned`]):
-//! a provider that waits for ever, as Claude Code waits at its paste prompt once nothing answers
-//! it, or one that signs in and exits by itself, with a second process left in its group holding
-//! its stdout, as an opener closing its browser would, each proven by its pid and its birth.
+//! a provider that waits until it is ended or the test binary that started it is gone, as Claude
+//! Code waits at its paste prompt once nothing answers it, or one that signs in and exits by
+//! itself, with a second process left in its group holding its stdout, as an opener closing its
+//! browser would, each proven by its pid and its birth.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -55,8 +56,9 @@ impl Born {
 
 /// The stand-in in a folder of its own: run as [`Provider::program`], it starts a `sleep` in its
 /// group, which inherits its stdout, and says that one's pid (`member`), then its own (`pid`).
-/// One made by [`Provider::new`] then waits for ever; at `SIGTERM` it says `termed` and exits,
-/// leaving the `sleep` to its group's end. One made by [`Provider::signing_in`] prints
+/// One made by [`Provider::new`] then waits until its parent, the test binary that started it,
+/// is gone ([`aterm_uds::stand_in_loop::while_parent_alive`]); at `SIGTERM` it says `termed` and
+/// exits, leaving the `sleep` to its group's end. One made by [`Provider::signing_in`] prints
 /// [`SIGNED_IN`] and exits 0. Dropped, it `SIGKILL`s whichever of the two still reads the birth
 /// it was proven with, so a failing run leaves neither behind.
 pub(in crate::harness) struct Provider {
@@ -70,16 +72,31 @@ pub(in crate::harness) struct Provider {
 pub(in crate::harness) const SIGNED_IN: &[u8] = b"signed in\n";
 
 impl Provider {
-    /// The stand-in that waits for ever, laid out for the test `tag`.
+    /// The stand-in that waits until it is ended or its parent is gone, laid out for the test
+    /// `tag`. Its loop names its parent by `$PPID`
+    /// ([`aterm_uds::stand_in_loop::while_parent_alive`]), the same text in every run, which is
+    /// the test binary: each capture that runs it spawns [`Self::program`] itself.
     pub(in crate::harness) fn new(tag: &str) -> Self {
-        Self::with_tail(tag, "while :; do '{sleep}' 0.1; done\n")
+        Self::with_tail(
+            tag,
+            &format!(
+                "{}\n",
+                aterm_uds::stand_in_loop::while_parent_alive("'{sleep}' 0.1")
+            ),
+        )
     }
 
-    /// Leaves stdin unread until the test cooperatively releases its input gate.
+    /// Leaves stdin unread until the test cooperatively releases its input gate, or its parent,
+    /// the test binary, is gone (as [`Self::new`]'s).
     pub(in crate::harness) fn unread_input(tag: &str) -> Self {
         Self::with_tail(
             tag,
-            "while [ ! -e \"$d/release-input\" ]; do '{sleep}' 0.1; done\nIFS= read -r answer\nexit 0\n",
+            &format!(
+                "{}\nIFS= read -r answer\nexit 0\n",
+                aterm_uds::stand_in_loop::while_parent_alive(
+                    "[ -e \"$d/release-input\" ] && break; '{sleep}' 0.1"
+                )
+            ),
         )
     }
 

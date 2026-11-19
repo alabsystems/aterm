@@ -3,6 +3,7 @@
 
 use aterm_digest::Sha256;
 
+// The script compiler tracks this module by content in its dep-info.
 #[path = "../aterm-update-core/src/pins.rs"]
 #[allow(dead_code)]
 mod pins;
@@ -53,7 +54,6 @@ fn main() {
     );
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=../aterm-update-core/src/pins.rs");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // The dev `aterm-gui.exe`'s main-thread stack, as crates/aterm/build.rs reserves

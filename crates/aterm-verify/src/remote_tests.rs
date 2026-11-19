@@ -678,23 +678,37 @@ fn a_tag_or_blob_in_the_control_namespace_never_becomes_a_commit_observation() {
     }
 }
 
-/// A GITHUB PUSH IS ONE WRITE: agh's write makes every check its dry run makes before it sends,
-/// and each agh push re-verifies the pushed history while the expected ref is free to move, so
-/// no rehearsal comes first.
+/// A GITHUB PUSH IS ONE WRITE, MADE THROUGH THE WRITER: agh's write makes every check its dry
+/// run makes before it sends, and each agh push re-verifies the pushed history while the
+/// expected ref is free to move, so no rehearsal comes first. The push goes through the writer
+/// it is handed ([`run_mutation`] in production), never the remote's reader, whose deadline
+/// would end it, and names no `--timeout`, so agh bounds each git child of its write by its 60 s
+/// no-progress window and ends a stalled one itself instead of hanging, settling its intent
+/// Unknown once the pack may have gone, unless a re-read finds the push landed, which stays open
+/// until it is reconciled. NEGATIVE CONTROL: the reader is handed no push.
 #[cfg(unix)]
 #[test]
 fn github_push_is_one_write_of_the_exact_graph_and_lease() {
     let root = aterm_tempfile::tempdir().unwrap();
     for before in [Some(BEFORE), None] {
         let calls = Cell::new(0);
-        let run = |tool, args: &[OsString]| {
-            if let Some(out) = url(tool, args) {
-                return Ok(out);
-            }
+        let read = |tool, args: &[OsString]| {
+            Ok(url(tool, args).unwrap_or_else(|| panic!("the reader ran {tool:?} {args:?}")))
+        };
+        let write = |tool, args: &[OsString]| {
+            assert_eq!(tool, Tool::Agh);
             calls.set(calls.get() + 1);
-            assert_eq!(&args[..3], words(&["repo", "push", "fixture/repo"]));
-            assert_eq!(args[3], root.path().as_os_str());
-            assert!(args.iter().all(|word| word != "--dry-run"), "{args:?}");
+            let index = args
+                .iter()
+                .position(|word| word == "--input")
+                .expect("structured input");
+            let mut asked = words(&["repo", "push", "fixture/repo"]);
+            asked.extend([
+                root.path().as_os_str().to_owned(),
+                "--input".into(),
+                args[index + 1].clone(),
+            ]);
+            assert_eq!(args, asked);
             assert_eq!(
                 input(args),
                 json!([{"ref":"refs/aterm/record","before":before.unwrap_or(ZERO),"after":AFTER}])
@@ -702,13 +716,118 @@ fn github_push_is_one_write_of_the_exact_graph_and_lease() {
             Ok(out(0, ""))
         };
         assert!(matches!(
-            Remote::open(root.path(), "origin", &run)
+            Remote::open(root.path(), "origin", &read)
                 .unwrap()
-                .push_with(WriteRunner(&run), "refs/aterm/record", before, AFTER),
+                .push_with(WriteRunner(&write), "refs/aterm/record", before, AFTER),
             Ok(Pushed::Done)
         ));
         assert_eq!(calls.get(), 1);
     }
+}
+
+/// The writer that runs each write as `run` answers it: every write it is handed starts, so a
+/// failure of `run` is one of unknown outcome ([`Failed::Ended`]).
+#[cfg(unix)]
+fn writer<'a>(run: &'a Runner<'a>) -> impl Fn(Tool, &[OsString]) -> Result<Output, Failed> + 'a {
+    move |tool, args| run(tool, args).map_err(Failed::Ended)
+}
+
+/// A PUSH WHOSE WRITE STARTED NO CHILD SENT NOTHING: a writer's refusal before it started
+/// ([`Failed::Unstarted`], as [`run_mutation`] answers once the run took an interrupt) is a push
+/// that sent nothing ([`Pushed::Unsent`]) carrying the refusal's words, over a local remote and
+/// over GitHub, never a failure of unknown outcome, which is never made again. NEGATIVE CONTROL:
+/// a writer's failure after its child started ([`Failed::Ended`]) stays an error.
+#[cfg(unix)]
+#[test]
+fn a_push_whose_write_started_no_child_sent_nothing() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let refused = "Git remote write: interrupted before the write started; nothing was sent";
+    for github in [false, true] {
+        for failed in [
+            Failed::Unstarted(refused.to_owned()),
+            Failed::Ended("Git remote write stalled".to_owned()),
+        ] {
+            let read = |tool, args: &[OsString]| {
+                if github {
+                    return Ok(url(tool, args).expect("the reader reads the remote's URLs"));
+                }
+                Ok(out(0, "../origin.git\n"))
+            };
+            let writes = Cell::new(0);
+            let write = |_: Tool, _: &[OsString]| {
+                writes.set(writes.get() + 1);
+                Err(failed.clone())
+            };
+            let pushed = Remote::open(root.path(), "origin", &read)
+                .unwrap()
+                .push_with(WriteRunner(&write), "refs/heads/main", Some(BEFORE), AFTER);
+            match (&failed, pushed) {
+                (Failed::Unstarted(_), Ok(Pushed::Unsent(why))) => assert_eq!(why, refused),
+                (Failed::Ended(said), Err(why)) => assert_eq!(&why, said),
+                (failed, pushed) => {
+                    panic!("github {github}: {failed:?} came to {:?}", pushed.err())
+                }
+            }
+            assert_eq!(writes.get(), 1, "one write was handed over");
+        }
+    }
+}
+
+/// A GITHUB PUSH WHOSE INPUT COULD NOT BE WRITTEN SENT NOTHING: where the directory for agh's
+/// input file cannot be made, or the input cannot be written in it (its name taken by a
+/// directory), the writer is never handed the push and no child started, so the push is one that
+/// sent nothing ([`Pushed::Unsent`], saying so), made again as one, never an error of unknown
+/// outcome. NEGATIVE CONTROL: a directory the input can be written in hands the writer its one
+/// push.
+#[cfg(unix)]
+#[test]
+fn a_github_push_whose_input_could_not_be_written_sent_nothing() {
+    type Scratch<'a> = &'a dyn Fn() -> std::io::Result<aterm_tempfile::TempDir>;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let read =
+        |tool, args: &[OsString]| Ok(url(tool, args).expect("the reader reads the remote's URLs"));
+    let remote = Remote::open(root.path(), "origin", &read).unwrap();
+    let writes = Cell::new(0);
+    let write = |tool, _: &[OsString]| {
+        assert_eq!(tool, Tool::Agh);
+        writes.set(writes.get() + 1);
+        Ok(out(0, ""))
+    };
+    let unmade =
+        || -> std::io::Result<aterm_tempfile::TempDir> { Err(std::io::Error::other("no room")) };
+    let taken = || -> std::io::Result<aterm_tempfile::TempDir> {
+        let dir = aterm_tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("push.json"))?;
+        Ok(dir)
+    };
+    for (scratch, what) in [(&unmade as Scratch<'_>, "unmade"), (&taken, "taken")] {
+        match remote.push_from(
+            WriteRunner(&write),
+            scratch,
+            "refs/heads/main",
+            Some(BEFORE),
+            AFTER,
+        ) {
+            Ok(Pushed::Unsent(why)) => assert!(
+                why.starts_with("Agh remote write: its input could not be written: ")
+                    && why.ends_with("; nothing was sent"),
+                "{what}: {why}"
+            ),
+            pushed => panic!("{what}: the push came to {:?}", pushed.err()),
+        }
+        assert_eq!(writes.get(), 0, "{what}: the writer was handed nothing");
+    }
+    assert!(matches!(
+        remote.push_from(
+            WriteRunner(&write),
+            &aterm_tempfile::tempdir,
+            "refs/heads/main",
+            Some(BEFORE),
+            AFTER
+        ),
+        Ok(Pushed::Done)
+    ));
+    assert_eq!(writes.get(), 1, "the writer was handed the push");
 }
 
 /// A write agh refused for the expected ref is a rejection; any other failure with no typed
@@ -729,7 +848,12 @@ fn a_rejected_write_is_typed_and_an_untyped_failure_never_replays() {
         };
         let result = Remote::open(root.path(), "origin", &run)
             .unwrap()
-            .push_with(WriteRunner(&run), "refs/heads/main", Some(BEFORE), AFTER);
+            .push_with(
+                WriteRunner(&writer(&run)),
+                "refs/heads/main",
+                Some(BEFORE),
+                AFTER,
+            );
         if code == 9 {
             assert!(matches!(result, Ok(Pushed::Rejected(_))))
         } else {
@@ -751,32 +875,45 @@ fn diagnosed(error: &agh::error::Error) -> Output {
     result
 }
 
+/// What a GitHub push of main over [`BEFORE`] comes to where agh's write answers `answer`.
+#[cfg(unix)]
+fn pushed_when_agh_answers(root: &Path, answer: Output) -> Result<Pushed, String> {
+    let run = move |tool, args: &[OsString]| {
+        if let Some(result) = url(tool, args) {
+            return Ok(result);
+        }
+        Ok(Output {
+            status: answer.status,
+            stdout: answer.stdout.clone(),
+            stderr: answer.stderr.clone(),
+        })
+    };
+    Remote::open(root, "origin", &run).unwrap().push_with(
+        WriteRunner(&writer(&run)),
+        "refs/heads/main",
+        Some(BEFORE),
+        AFTER,
+    )
+}
+
 /// ONLY AGH'S OWN WORD THAT NOTHING WAS SENT LETS A WRITE BE MADE AGAIN: a could-not-run, rate
-/// or server failure whose one diagnostic names no side effect is [`Pushed::Unsent`]. NEGATIVE
+/// or server failure, or a stop agh took before it dispatched git (interrupted, which agh settles
+/// never sent), whose one diagnostic names no side effect is [`Pushed::Unsent`]. NEGATIVE
 /// CONTROLS: the same failure with an unknown or applied side effect, for another repository,
-/// with a second diagnostic, with an exit its diagnostic does not name, and a refusal of any
-/// other kind, stay errors.
+/// with a second diagnostic, or with an exit its diagnostic does not name, stays an error, and a
+/// refusal of any other kind is never made again.
 #[cfg(unix)]
 #[test]
 fn only_agh_saying_it_sent_nothing_lets_the_write_be_made_again() {
     use agh::error::{Error, Kind, SideEffect};
     let root = aterm_tempfile::tempdir().unwrap();
-    let pushed = |refused: Output| {
-        let run = move |tool, args: &[OsString]| {
-            if let Some(result) = url(tool, args) {
-                return Ok(result);
-            }
-            Ok(Output {
-                status: refused.status,
-                stdout: refused.stdout.clone(),
-                stderr: refused.stderr.clone(),
-            })
-        };
-        Remote::open(root.path(), "origin", &run)
-            .unwrap()
-            .push_with(WriteRunner(&run), "refs/heads/main", Some(BEFORE), AFTER)
-    };
-    for kind in [Kind::CouldNotRun, Kind::RateLimited, Kind::Server] {
+    let pushed = |answer: Output| pushed_when_agh_answers(root.path(), answer);
+    for kind in [
+        Kind::CouldNotRun,
+        Kind::RateLimited,
+        Kind::Server,
+        Kind::Interrupted,
+    ] {
         let error = Error::new(kind, "the network went away before the send");
         assert!(
             matches!(pushed(diagnosed(&error)), Ok(Pushed::Unsent(_))),
@@ -808,7 +945,114 @@ fn only_agh_saying_it_sent_nothing_lets_the_write_be_made_again() {
         Kind::Failed,
     ] {
         let error = Error::new(kind, "not a failure another attempt cures");
-        assert!(pushed(diagnosed(&error)).is_err(), "{kind:?}");
+        assert!(
+            !matches!(pushed(diagnosed(&error)), Ok(Pushed::Unsent(_))),
+            "{kind:?}"
+        );
+    }
+}
+
+/// A TYPED REFUSAL WITH NO EFFECT IS A REFUSAL, NEVER A PUSH OF UNKNOWN OUTCOME: agh's one
+/// diagnostic, for this repository or naming none, with no side effect and of a kind another
+/// attempt does not cure (an authentication failure, exit 4, as a revoked token's 401 at agh's
+/// login binding gives before any intent is opened; a permission, gate, usage, input or subject
+/// refusal; GitHub's rejection of the push it received, a branch rule's `[remote rejected]` or
+/// the workflow scope, which agh words as a refusal or a forbidden write that wrote nothing), is
+/// [`Pushed::Refused`] carrying agh's words, which leaves nothing to settle.
+/// NEGATIVE CONTROLS: the same refusal with an unknown or applied side effect, for another
+/// repository, with a second diagnostic, or under an exit its diagnostic does not name stays an
+/// error of unknown outcome, as does an unknown outcome that names no side effect; an
+/// expected-ref conflict stays a rejection; and a stop agh took before it dispatched git (a
+/// signal sent to agh itself, or its watcher's lost bell: interrupted, exit 130, no side effect)
+/// is a push that sent nothing, never a refusal.
+#[cfg(unix)]
+#[test]
+fn a_typed_refusal_with_no_effect_is_refused_never_unknown() {
+    use agh::error::{Error, Kind, SideEffect};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let pushed = |answer: Output| pushed_when_agh_answers(root.path(), answer);
+    for kind in [
+        Kind::Unauthenticated,
+        Kind::Forbidden,
+        Kind::Refused,
+        Kind::Usage,
+        Kind::Invalid,
+        Kind::Failed,
+    ] {
+        let error = Error::new(kind, "GitHub answered 401 for the routed writer's login");
+        for refused in [
+            error.clone(),
+            error.clone().with_repo("fixture/repo".to_owned()),
+        ] {
+            match pushed(diagnosed(&refused)) {
+                Ok(Pushed::Refused(why)) => assert!(
+                    why.contains(&format!("exited Some({})", kind.exit()))
+                        && why.contains("GitHub answered 401"),
+                    "{kind:?}: {why}"
+                ),
+                Ok(_) => panic!("{kind:?}: not a refusal"),
+                Err(why) => panic!("{kind:?}: of unknown outcome: {why}"),
+            }
+        }
+        for effect in [SideEffect::Unknown, SideEffect::Applied] {
+            let sent = error.clone().with_side_effect(effect);
+            assert!(pushed(diagnosed(&sent)).is_err(), "{kind:?} {effect:?}");
+        }
+        let theirs = error.clone().with_repo("other/repo".to_owned());
+        assert!(pushed(diagnosed(&theirs)).is_err(), "{kind:?} elsewhere");
+        let mut twice = diagnosed(&error);
+        let again = twice.stderr.clone();
+        twice.stderr.extend(again);
+        assert!(pushed(twice).is_err(), "{kind:?} with two diagnostics");
+        let mut other_exit = diagnosed(&error);
+        other_exit.status = exit_status(3);
+        assert!(pushed(other_exit).is_err(), "{kind:?} under another exit");
+    }
+    let unknown = Error::new(
+        Kind::OutcomeUnknown,
+        "a write was sent and no answer was read",
+    );
+    assert!(pushed(diagnosed(&unknown)).is_err());
+    let conflict = Error::new(Kind::Conflict, "the expected ref moved");
+    assert!(matches!(
+        pushed(diagnosed(&conflict)),
+        Ok(Pushed::Rejected(_))
+    ));
+    for stopped in [
+        Error::new(Kind::Interrupted, "native Git operation interrupted"),
+        Error::new(Kind::Interrupted, "native Git operation interrupted")
+            .with_repo("fixture/repo".to_owned()),
+    ] {
+        match pushed(diagnosed(&stopped)) {
+            Ok(Pushed::Unsent(why)) => assert!(why.contains("exited Some(130)"), "{why}"),
+            Ok(Pushed::Refused(why)) => panic!("a stop before dispatch is no refusal: {why}"),
+            Ok(_) => panic!("a stop before dispatch sent nothing"),
+            Err(why) => panic!("a stop before dispatch is of no unknown outcome: {why}"),
+        }
+    }
+    for (rejected, words) in [
+        (
+            Error::refused(
+                "GitHub refused the push: !\trefs/heads/main:refs/heads/main\t[remote rejected] \
+                 (push declined due to repository rule violations)",
+            ),
+            "[remote rejected] (push declined due to repository rule violations)",
+        ),
+        (
+            Error::new(
+                Kind::Forbidden,
+                "git push needs the workflow scope: refusing to allow an OAuth App to create or \
+                 update workflow",
+            ),
+            "needs the workflow scope",
+        ),
+    ] {
+        let rejected = rejected.with_repo("fixture/repo".to_owned());
+        match pushed(diagnosed(&rejected)) {
+            Ok(Pushed::Refused(why)) => assert!(why.contains(words), "{why}"),
+            Ok(_) => panic!("GitHub's rejection is a refusal: {words}"),
+            Err(why) => panic!("GitHub's rejection is of no unknown outcome: {why}"),
+        }
     }
 }
 
@@ -885,7 +1129,7 @@ fn only_exact_structured_presend_intent_refusals_allow_observation() {
         Ok(refused_out(&valid))
     };
     assert!(matches!(Remote::open(root.path(), "origin", &run).unwrap()
-        .push_with(WriteRunner(&run), "refs/heads/main", Some(BEFORE), AFTER),
+        .push_with(WriteRunner(&writer(&run)), "refs/heads/main", Some(BEFORE), AFTER),
         Ok(Pushed::Blocked { intent, .. }) if intent.as_str() == INTENT));
     assert_eq!(calls.get(), 1);
 }
@@ -916,14 +1160,64 @@ fn observing_a_foreign_intent_never_writes_and_requires_its_exact_identity() {
         Ok(out(0, &doc.to_string()))
     };
     let intent = agh::IntentId::parse(INTENT).unwrap();
-    Remote::open(root.path(), "origin", &run)
+    let ended = Remote::open(root.path(), "origin", &run)
         .unwrap()
         .wait_for_intent(&intent, &|| {
             pauses.set(pauses.get() + 1);
             Ok(())
-        })
-        .unwrap();
+        });
+    assert_eq!(ended, Ok(IntentWait::Closed));
     assert_eq!((reads.get(), pauses.get()), (3, 2));
+    // Open with its writer gone (`closable`): the wait ends at once, and says that it ended
+    // there, not on the intent closed, so the caller knows the next push's reconciliation
+    // answers for it.
+    let mut gone = document.clone();
+    let Value::Object(fields) = &mut gone else {
+        unreachable!()
+    };
+    fields.insert("closable".into(), json!(true));
+    let run =
+        |tool, args: &[OsString]| Ok(url(tool, args).unwrap_or_else(|| out(0, &gone.to_string())));
+    assert_eq!(
+        Remote::open(root.path(), "origin", &run)
+            .unwrap()
+            .wait_for_intent(&intent, &|| panic!("a closable intent is not waited on")),
+        Ok(IntentWait::Reconcilable)
+    );
+    // Open, recording no writer (`"writer": null`) and settled with an unknown outcome: no wait
+    // or later write closes it, so the wait ends at once on it held. CONTROLS, each waited on:
+    // the same intent not yet settled (its agh may still be writing), one an agh that prints no
+    // `writer` showed, and one that records its writer.
+    for (writer, settled, held) in [
+        (Some(Value::Null), json!("unknown"), true),
+        (Some(Value::Null), Value::Null, false),
+        (None, json!("unknown"), false),
+        (Some(json!({"boot": "fixture"})), json!("unknown"), false),
+    ] {
+        let mut doc = document.clone();
+        let Value::Object(fields) = &mut doc else {
+            unreachable!()
+        };
+        if let Some(writer) = writer {
+            fields.insert("writer".into(), writer);
+        }
+        fields.insert("settled".into(), settled);
+        let run = |tool, args: &[OsString]| {
+            Ok(url(tool, args).unwrap_or_else(|| out(0, &doc.to_string())))
+        };
+        let ticks = Cell::new(0);
+        let ended = Remote::open(root.path(), "origin", &run)
+            .unwrap()
+            .wait_for_intent(&intent, &|| {
+                ticks.set(ticks.get() + 1);
+                Err("still open".into())
+            });
+        if held {
+            assert_eq!((ended, ticks.get()), (Ok(IntentWait::Held), 0), "{doc}");
+        } else {
+            assert_eq!((ended, ticks.get()), (Err("still open".into()), 1), "{doc}");
+        }
+    }
     for (field, value) in [
         ("id", json!("67-000000000000")),
         ("repo", json!("other/repo")),
@@ -1016,7 +1310,12 @@ fn local_transport_allows_only_the_file_protocol_even_if_configuration_changes()
     let remote = Remote::open(root.path(), "origin", &run).unwrap();
     assert_eq!(remote.fetch("refs/heads/main"), Ok(Some(BEFORE.into())));
     assert!(matches!(
-        remote.push_with(WriteRunner(&run), "refs/heads/main", Some(BEFORE), AFTER),
+        remote.push_with(
+            WriteRunner(&writer(&run)),
+            "refs/heads/main",
+            Some(BEFORE),
+            AFTER
+        ),
         Ok(Pushed::Done)
     ));
     assert_eq!(operations.get(), 3);

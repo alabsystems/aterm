@@ -317,6 +317,19 @@ fn a_guest_never_takes_a_long_leg() {
     assert!(host.arm() && host.hears_sleep(), "outside a guest it arms");
 }
 
+/// The guest flag's reading ([`aterm_sysprobe::hv_vmm_present`]) makes a guest only where it
+/// reads yes: a host's no, and no reading at all (off macOS, or a kernel with no such name), are
+/// hosts, which arm.
+/// MUTANT: `guest_from` answering false (every guest arms one long leg, and its resume, which
+/// nothing posts, waits out the leg); answering `probe().is_some()` (every Mac is a guest);
+/// answering `probe() != Some(false)` (no reading is a guest).
+#[test]
+fn only_a_reading_of_yes_is_a_guest() {
+    assert!(guest_from(|| Some(true)), "a guest");
+    assert!(!guest_from(|| Some(false)), "a host");
+    assert!(!guest_from(|| None), "no reading");
+}
+
 /// A wait nothing tells of this process's sleeps reads its clocks at least every 5 s, as every
 /// wait did before one-leg waits, so a wake nothing posted still reaches a check within 8 s with
 /// the 3 s settle: a host that never asked (a macOS terminal session, the only checker on a Mac

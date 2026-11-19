@@ -3,26 +3,14 @@
 
 //! Tier-1 for `HarnessLoginWall` (aterm-spec `harness_login_wall_model`).
 
-// The two walks that read the real renewal (`real_renewal_is_clean`) run only on Unix, where a
-// person's renewal takes its turn in the manual sign-in queue; off Unix their helpers go unused.
-#![cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "the walks that read the real renewal run only on Unix"
-    )
-)]
-
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-#[cfg(unix)]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use alab_policy::words::RULE_CONTINUE;
 use aterm_agent::harness::align::Captured;
-#[cfg(unix)]
 use aterm_agent::harness::cli::{AccountsCmd, Env, run_accounts};
 use aterm_agent::harness::cli::{AccountsHost, RenewBrowser};
 use aterm_agent::harness::upgrade::{
@@ -805,9 +793,7 @@ impl AccountsHost for Recording {
 }
 
 /// Whether `accounts renew` signs its row in to a staging home and checks it there alone. A
-/// person's renewal takes its turn in the manual sign-in queue, which only Unix has
-/// (`accounts::manual_signin_capability`), so the walks that read this run there.
-#[cfg(unix)]
+/// person's renewal takes its turn in the manual sign-in queue.
 fn real_renewal_is_clean() -> bool {
     let tmp = aterm_tempfile::Builder::new()
         .prefix("aterm-conf-login-wall-renew-")
@@ -920,7 +906,6 @@ fn defective() -> Vec<(&'static str, Model)> {
     .collect()
 }
 
-#[cfg(unix)]
 #[test]
 fn the_real_code_conforms_to_the_login_wall_model() {
     let model = harness_login_wall_model();
@@ -1143,7 +1128,6 @@ fn a_person_told_to_close_aterms_dialog_breaks_its_law() {
 /// `NoBrowserOpenedByAterm` and disagrees with the real code. Negative control: the arm's pin
 /// check (`turn_end.rs`, the `WallKind::Auth` arm's `reading.login_pin.why()`) taken out, the
 /// real code types `/login` over the pin, and the walk fails where `TellNow` is enabled.
-#[cfg(unix)]
 #[test]
 fn a_pinned_sign_in_method_conforms_to_the_login_wall_model() {
     let base = harness_login_wall_model();

@@ -99,6 +99,8 @@ fn the_grammar_takes_every_metric_with_its_unit() {
         "sys swap<1MiB",
         "sys decompress<100/s",
         "sys thrash=no",
+        "sys starving=no",
+        "sys starving!=yes and mem!=critical",
         "sys tab.mem<2GB",
         "sys aterm.mem<4GiB",
         "sys thermal=nominal",
@@ -130,6 +132,8 @@ fn refusals_name_what_is_wrong() {
         "sys mem<normal,warn",
         "sys mem=calm",
         "sys thrash<yes",
+        "sys starving>no",
+        "sys starving=maybe",
         "sys bogus<1",
         "sys cpu<25% gpu<10%",
         "sys cpu<25% and",
@@ -632,6 +636,48 @@ fn ordered_levels_compare_by_rank() {
     assert!(evaluate(&machine("sys thrash=no"), &s, &[]).holds);
 }
 
+/// `starving` reads whether a memory starvation episode is open at the snapshot, the detector's
+/// verdict and not the snapshot's own rates: a snapshot whose rates are calm reads `yes` while an
+/// episode is open, and one whose rates run hot reads `no` while none is. With no counters it is
+/// unsampled, refused when named; before the first rates it warms. NEGATIVE CONTROL: the same
+/// snapshot with the episode dropped holds `starving=no`.
+#[test]
+fn the_starving_term_reads_the_open_episode() {
+    let mut s = snap(0.1);
+    let o = evaluate(&machine("sys starving=no"), &s, &[]);
+    assert!(o.holds, "{o:?}");
+    assert_eq!(o.values, ["starving=no"]);
+    s.starving = Some(Box::new(crate::starving::Episode {
+        why: crate::starving::Why::Thrash,
+        opened_ns: 1,
+        opened_unix_ms: 1,
+        at_open: crate::starving::Look::default(),
+        worst: crate::starving::Worst::default(),
+        holders: Vec::new(),
+        holders_age_ms: None,
+        ended: None,
+    }));
+    let o = evaluate(&machine("sys starving=no"), &s, &[]);
+    assert!(!o.holds);
+    assert_eq!(o.values, ["starving=yes"]);
+    assert!(evaluate(&machine("sys starving=yes"), &s, &[]).holds);
+    assert!(evaluate(&machine("sys starving!=no"), &s, &[]).holds);
+    s.mem.as_mut().unwrap().rates = None;
+    assert!(
+        evaluate(&machine("sys starving=yes"), &s, &[]).holds,
+        "an open episode answers before the rates"
+    );
+    s.starving = None;
+    let o = evaluate(&machine("sys starving=no"), &s, &[]);
+    assert_eq!(o.values, ["starving=warming"]);
+    s.mem.as_mut().unwrap().sample.counters = None;
+    let o = evaluate(&machine("sys starving=no"), &s, &[]);
+    assert_eq!(
+        o.refused.as_deref(),
+        Some("ERR unavailable starving why=not_sampled\n")
+    );
+}
+
 /// `thermal` ranks the level 0 to 3 and prints the OS's own word where the level is exact
 /// and the counter heuristic's where not; either word set names the same rank, and the
 /// retired `throttle` is refused. Control: the code before A2 S3 refused `thermal` and
@@ -1078,6 +1124,9 @@ fn spotlight(cpu_mc: i64, read_bps: u64, volumes: &[(&str, bool)]) -> Snapshot {
         shares: Vec::new(),
         volumes: None,
         volumes_age_ms: None,
+        store: None,
+        store_age_ms: None,
+        store_stale_ms: None,
         state: State::Idle,
     }
     .with_volumes(Some(&read), 60_000);

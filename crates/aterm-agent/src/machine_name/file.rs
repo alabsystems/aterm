@@ -139,6 +139,13 @@ pub struct MachineName {
     /// the row only once it says something else ([`crate::machine_name::follow_registry`]), so
     /// the row still holding the value a rename replaced undoes nothing.
     pub row: RowSeen,
+    /// The first name was made while this Mac's lab registry could not be read yet
+    /// ([`crate::machine_name::RegistryNameRead::Pending`]), and nothing changed it since (a
+    /// rename, a nickname, an undo or a followed number or nickname clears it,
+    /// [`MachineName::made_own`]): the first read that finds the registry settles it as a first
+    /// read then would have, its bound row's number and nickname taking the name's place whoever
+    /// wrote them, or the name standing where no row binds this Mac.
+    pub registry_unread: bool,
     /// A migration that has not finished.
     pub migration: Option<Migration>,
     /// The newest [`FLEETS_MAX`] fleets' kept claims, newest first.
@@ -164,9 +171,18 @@ impl MachineName {
             nick,
             nick_class: NickClass::Auto,
             row: RowSeen::Never,
+            registry_unread: false,
             migration: None,
             fleets: Vec::new(),
         }
+    }
+
+    /// This name as a change made it, which is the name's own from then on: no later registry
+    /// read replaces it as a first name ([`MachineName::registry_unread`]).
+    #[must_use]
+    pub fn made_own(mut self) -> Self {
+        self.registry_unread = false;
+        self
     }
 
     /// The NAME: `m8`, or `unnumbered` while unnumbered.
@@ -408,6 +424,8 @@ struct Wire {
     row_seen: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     row_nick: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    registry_unread: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     migration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -550,6 +568,7 @@ impl Wire {
                 RowSeen::Saw(Some(nick)) => Some(nick.as_str().to_owned()),
                 RowSeen::Never | RowSeen::Saw(None) => None,
             },
+            registry_unread: name.registry_unread,
             migration: name
                 .migration
                 .map(|migration| migration_word(migration).to_owned()),
@@ -653,6 +672,7 @@ impl Wire {
                         .transpose()?,
                 ),
             },
+            registry_unread: self.registry_unread,
             migration: self
                 .migration
                 .map(|word| match word.as_str() {

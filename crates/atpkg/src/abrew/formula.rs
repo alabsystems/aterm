@@ -163,7 +163,7 @@ pub fn version_chain_syntax(token: &str) -> bool {
 /// One `MAJOR_MINOR_PATCH_REGEX` component of a
 /// cask version (`^([^.,:]+)(?:.([^.,:]+)…` — the
 /// separators are single arbitrary characters).
-fn cask_mmp(version: &str) -> [String; 3] {
+pub(crate) fn cask_mmp(version: &str) -> [String; 3] {
     let mut out = [String::new(), String::new(), String::new()];
     let mut rest = version;
     for slot in &mut out {
@@ -360,7 +360,412 @@ fn apply_chain_arg_method(cur: &str, seg: &str) -> Option<String> {
     }
 }
 
+/// Ruby `String#to_i`: optional sign and leading
+/// digits, else 0.
+fn ruby_to_i(s: &str) -> i64 {
+    let s = s.trim_start();
+    let (sign, s) = match s.strip_prefix('-') {
+        Some(r) => (-1i64, r),
+        None => (1i64, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        0
+    } else {
+        sign * digits.parse::<i64>().unwrap_or(i64::MAX)
+    }
+}
+
+/// One branch of a version ternary: a plain chain
+/// or integer arithmetic on a chain's `to_i`
+/// (optionally parenthesized).
+fn version_ternary_branch_syntax(branch: &str) -> bool {
+    let b = branch.trim();
+    let b = b
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .map(str::trim)
+        .unwrap_or(b);
+    for op in [" + ", " - "] {
+        if let Some((lhs, rhs)) = b.rsplit_once(op) {
+            return rhs.trim().chars().all(|c| c.is_ascii_digit())
+                && lhs
+                    .trim()
+                    .strip_suffix(".to_i")
+                    .is_some_and(version_chain_syntax);
+        }
+    }
+    version_chain_syntax(b) || b.strip_suffix(".to_i").is_some_and(version_chain_syntax)
+}
+
+/// Which string predicate a version condition
+/// calls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VersionPred {
+    Ends,
+    Starts,
+    Includes,
+}
+
+/// `<recv>.end_with?("lit")` and friends over an
+/// evaluable version chain: (receiver, predicate,
+/// literal) — syntax only.
+fn version_pred_parts(cond: &str) -> Option<(String, VersionPred, String)> {
+    let cond = cond.trim();
+    let (recv, pred, args) = if let Some((r, a)) = cond.split_once(".end_with?(") {
+        (r, VersionPred::Ends, a)
+    } else if let Some((r, a)) = cond.split_once(".start_with?(") {
+        (r, VersionPred::Starts, a)
+    } else if let Some((r, a)) = cond.split_once(".include?(") {
+        (r, VersionPred::Includes, a)
+    } else {
+        return None;
+    };
+    let (lit, tail) = chain_str_arg(args)?;
+    if tail.trim() != ")" || !version_chain_syntax(recv.trim()) {
+        return None;
+    }
+    Some((recv.trim().to_string(), pred, lit))
+}
+
+fn version_pred_value(version: &str, recv: &str, pred: VersionPred, lit: &str) -> Option<bool> {
+    let recv = cask_version_token(version, recv)?;
+    Some(match pred {
+        VersionPred::Ends => recv.ends_with(lit),
+        VersionPred::Starts => recv.starts_with(lit),
+        VersionPred::Includes => recv.contains(lit),
+    })
+}
+
+/// The parts of a `<pred> ? a : b` version ternary:
+/// (receiver, predicate, literal, then-branch,
+/// else-branch). `None` outside the shape (syntax
+/// only; receivers and branches must be evaluable
+/// version chains).
+fn version_ternary_parts(token: &str) -> Option<(String, VersionPred, String, String, String)> {
+    let (cond, rest) = token.split_once(" ? ")?;
+    let (then, els) = rest.split_once(" : ")?;
+    let (recv, pred, lit) = version_pred_parts(cond)?;
+    if !version_ternary_branch_syntax(then) || !version_ternary_branch_syntax(els) {
+        return None;
+    }
+    Some((
+        recv,
+        pred,
+        lit,
+        then.trim().to_string(),
+        els.trim().to_string(),
+    ))
+}
+
+/// Whether `token` is a version ternary
+/// interpolation (syntax only), e.g. insomnia's
+/// check-URL major probe.
+#[must_use]
+pub fn version_ternary_syntax(token: &str) -> bool {
+    version_ternary_parts(token).is_some()
+}
+
+fn version_ternary_branch(version: &str, branch: &str) -> Option<String> {
+    let b = branch.trim();
+    let b = b
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .map(str::trim)
+        .unwrap_or(b);
+    for (op, neg) in [(" + ", false), (" - ", true)] {
+        if let Some((lhs, rhs)) = b.rsplit_once(op)
+            && let Ok(n) = rhs.trim().parse::<i64>()
+            && let Some(chain) = lhs.trim().strip_suffix(".to_i")
+            && version_chain_syntax(chain)
+        {
+            let v = ruby_to_i(&cask_version_token(version, chain)?);
+            return Some((if neg { v - n } else { v + n }).to_string());
+        }
+    }
+    if let Some(chain) = b.strip_suffix(".to_i")
+        && version_chain_syntax(chain)
+    {
+        return Some(ruby_to_i(&cask_version_token(version, chain)?).to_string());
+    }
+    cask_version_token(version, b)
+}
+
+fn version_ternary_value(version: &str, token: &str) -> Option<String> {
+    let (recv, pred, lit, then, els) = version_ternary_parts(token)?;
+    let truth = version_pred_value(version, &recv, pred, &lit)?;
+    version_ternary_branch(version, if truth { &then } else { &els })
+}
+
+/// `"-beta.0" if version.include?("-")`: a plain
+/// quoted literal kept only when the version
+/// predicate holds. Parts: (literal, negate, recv,
+/// predicate, pred literal) — syntax only.
+fn version_conditional_string_parts(
+    token: &str,
+) -> Option<(String, bool, String, VersionPred, String)> {
+    let token = token.trim();
+    if !token.starts_with('"') {
+        return None;
+    }
+    let (lit, tail) = chain_str_arg(token)?;
+    if lit.contains("#{") {
+        return None;
+    }
+    let tail = tail.trim();
+    let (negate, cond) = if let Some(c) = tail.strip_prefix("if ") {
+        (false, c)
+    } else if let Some(c) = tail.strip_prefix("unless ") {
+        (true, c)
+    } else {
+        return None;
+    };
+    let (recv, pred, pred_lit) = version_pred_parts(cond)?;
+    Some((lit, negate, recv, pred, pred_lit))
+}
+
+/// Whether `token` is a quoted conditional-string
+/// version interpolation (syntax only).
+#[must_use]
+pub fn version_conditional_string_syntax(token: &str) -> bool {
+    version_conditional_string_parts(token).is_some()
+}
+
+fn version_conditional_string_value(version: &str, token: &str) -> Option<String> {
+    let (lit, negate, recv, pred, pred_lit) = version_conditional_string_parts(token)?;
+    let truth = version_pred_value(version, &recv, pred, &pred_lit)?;
+    Some(if truth != negate { lit } else { String::new() })
+}
+
+/// `<head>.split("s")[.map { |x| x.rjust(n, "p") }]
+/// .join("j")` version pipelines (jpki's download
+/// URL zero-pads each dotted part), or the same
+/// split read at one index (`.first`, `[n]`, …).
+/// The head is any evaluable version chain; Ruby
+/// `split` drops trailing empty fields,
+/// `rjust`/`ljust` cycle the padding string.
+/// `None` outside this shape.
+fn version_split_map_join(version: &str, token: &str) -> Option<String> {
+    let (head, rest) = token.split_once(".split(")?;
+    let cur = cask_version_token(version, head.trim())?;
+    let (sep, rest) = chain_str_arg(rest)?;
+    let rest = rest.trim().strip_prefix(')')?.trim();
+    let mut parts: Vec<String> = if sep.is_empty() {
+        cur.chars().map(|c| c.to_string()).collect()
+    } else {
+        cur.split(&sep).map(str::to_string).collect()
+    };
+    while parts.last().is_some_and(|p| p.is_empty()) {
+        parts.pop();
+    }
+    // A range slice (`[3..4]`, `[2...5]`, `[1..]`):
+    // Ruby clamps the end, an end before the start
+    // is empty, a start past the end is nil (outside).
+    let rest = if rest.starts_with('[')
+        && rest
+            .find(']')
+            .is_some_and(|close| rest[..close].contains(".."))
+    {
+        let close = rest.find(']')?;
+        let inner = rest[1..close].trim();
+        let (a_s, excl, b_s) = match inner.split_once("...") {
+            Some((a, b)) => (a, true, b),
+            None => {
+                let (a, b) = inner.split_once("..")?;
+                (a, false, b)
+            }
+        };
+        let a: usize = a_s.trim().parse().ok()?;
+        if a > parts.len() {
+            return None;
+        }
+        let end = if b_s.trim().is_empty() {
+            parts.len()
+        } else {
+            let b: usize = b_s.trim().parse().ok()?;
+            if excl {
+                b.min(parts.len())
+            } else {
+                (b + 1).min(parts.len())
+            }
+        };
+        parts = if end >= a {
+            parts[a..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        rest[close + 1..].trim()
+    } else {
+        rest
+    };
+    let rest = if let Some(r) = rest.strip_prefix(".each_with_index.map") {
+        // `{ |n, i| (i < 1 || n.length > 1) ? n :
+        // n.rjust(W, "P") }`: zero-pad single-char
+        // parts after the first (silentknight's
+        // no-dot filename version).
+        let r = r.trim().strip_prefix('{')?.trim();
+        let r = r.strip_prefix('|')?;
+        let (params, r) = r.split_once('|')?;
+        let mut pit = params.split(',');
+        let var = pit.next()?.trim();
+        let idx_name = pit.next()?.trim();
+        if pit.next().is_some()
+            || var.is_empty()
+            || idx_name.is_empty()
+            || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || !idx_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        let (body, r) = r.split_once('}')?;
+        let body = body.trim().strip_prefix('(')?.trim_start();
+        let body = body
+            .strip_prefix(idx_name)?
+            .trim_start()
+            .strip_prefix("< 1 ||")?
+            .trim_start();
+        let body = body
+            .strip_prefix(var)?
+            .trim_start()
+            .strip_prefix(".length > 1)")?
+            .trim_start();
+        let body = body
+            .strip_prefix('?')?
+            .trim_start()
+            .strip_prefix(var)?
+            .trim_start()
+            .strip_prefix(':')?
+            .trim_start();
+        let body = body
+            .strip_prefix(var)?
+            .trim_start()
+            .strip_prefix(".rjust(")?;
+        let (width, body) = body.split_once(',')?;
+        let width: usize = width.trim().parse().ok()?;
+        let (pad, body) = chain_str_arg(body)?;
+        if pad.is_empty() || body.trim() != ")" {
+            return None;
+        }
+        let pad: Vec<char> = pad.chars().collect();
+        for (i, part) in parts.iter_mut().enumerate() {
+            let len = part.chars().count();
+            if i >= 1 && len <= 1 && len < width {
+                let fill: String = (0..width - len).map(|k| pad[k % pad.len()]).collect();
+                *part = format!("{fill}{part}");
+            }
+        }
+        r.trim()
+    } else if let Some(r) = rest.strip_prefix(".map") {
+        let r = r.trim().strip_prefix('{')?.trim();
+        let r = r.strip_prefix('|')?;
+        let (var, r) = r.split_once('|')?;
+        let var = var.trim();
+        if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        let r = r.trim().strip_prefix(var)?.trim();
+        let (right, r) = if let Some(r) = r.strip_prefix(".rjust(") {
+            (true, r)
+        } else if let Some(r) = r.strip_prefix(".ljust(") {
+            (false, r)
+        } else {
+            return None;
+        };
+        let (width, r) = r.split_once(',')?;
+        let width: usize = width.trim().parse().ok()?;
+        let (pad, r) = chain_str_arg(r)?;
+        if pad.is_empty() {
+            return None;
+        }
+        let r = r.trim().strip_prefix(')')?.trim().strip_prefix('}')?;
+        let pad: Vec<char> = pad.chars().collect();
+        for part in &mut parts {
+            let len = part.chars().count();
+            if len < width {
+                let fill: String = (0..width - len).map(|i| pad[i % pad.len()]).collect();
+                *part = if right {
+                    format!("{fill}{part}")
+                } else {
+                    format!("{part}{fill}")
+                };
+            }
+        }
+        r.trim()
+    } else {
+        rest
+    };
+    // One-index terminals (`.first`, `[2]`, …): a
+    // missing field is Ruby nil, interpolating as "".
+    let index_tail = rest
+        .strip_prefix('.')
+        .or_else(|| rest.strip_prefix("&."))
+        .unwrap_or(rest);
+    let index = match index_tail {
+        "first" => Some(0usize),
+        "second" => Some(1),
+        "third" => Some(2),
+        "fourth" => Some(3),
+        "fifth" => Some(4),
+        "last" => None,
+        _ => {
+            if index_tail == "join" {
+                return Some(parts.join(""));
+            }
+            if index_tail.starts_with(".join(") || index_tail.starts_with("join(") {
+                let rest = if rest.starts_with("&.join(") {
+                    &rest["&.join(".len()..]
+                } else {
+                    rest.strip_prefix(".join(")?
+                };
+                let (joiner, rest) = chain_str_arg(rest)?;
+                if rest.trim() != ")" {
+                    return None;
+                }
+                return Some(parts.join(&joiner));
+            }
+            let bracketed = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']'))?;
+            Some(bracketed.trim().parse().ok()?)
+        }
+    };
+    let picked = match index {
+        Some(i) => parts.get(i),
+        None => parts.last(),
+    };
+    Some(picked.cloned().unwrap_or_default())
+}
+
 pub fn cask_version_token(version: &str, token: &str) -> Option<String> {
+    if token.contains(".split(")
+        && let Some(v) = version_split_map_join(version, token)
+    {
+        return Some(v);
+    }
+    if let Some(v) = version_ternary_value(version, token) {
+        return Some(v);
+    }
+    if let Some(v) = version_conditional_string_value(version, token) {
+        return Some(v);
+    }
+    // A terminal character index
+    // (`version.csv.second[0]`): Ruby `String#[]`
+    // with an integer counts characters, negative
+    // from the end; out of range is nil ("").
+    if let Some(open) = token.rfind('[')
+        && token.ends_with(']')
+        && let Ok(idx) = token[open + 1..token.len() - 1].trim().parse::<i64>()
+    {
+        let base = cask_version_token(version, &token[..open])?;
+        let chars: Vec<char> = base.chars().collect();
+        let idx = if idx < 0 {
+            idx.checked_add(i64::try_from(chars.len()).ok()?)?
+        } else {
+            idx
+        };
+        let idx = usize::try_from(idx).unwrap_or(usize::MAX);
+        return Some(chars.get(idx).map_or_else(String::new, char::to_string));
+    }
     if !version_chain_syntax(token) {
         // Arg-taking tails (`version.tr(",", "-")`):
         // evaluate segment-wise, plain methods by
@@ -376,6 +781,26 @@ pub fn cask_version_token(version: &str, token: &str) -> Option<String> {
         let mut cur = version.to_string();
         let mut plain: Vec<&str> = Vec::new();
         for seg in &parts[1..] {
+            // `….csv.join("sep")`: split the current
+            // value on commas and rejoin.
+            if plain.last() == Some(&"csv")
+                && let Some(sep) = seg
+                    .strip_prefix("join(\"")
+                    .and_then(|r| r.strip_suffix("\")"))
+                    .or_else(|| {
+                        seg.strip_prefix("join('")
+                            .and_then(|r| r.strip_suffix("')"))
+                    })
+            {
+                plain.pop();
+                if !plain.is_empty() {
+                    let joined = format!("version.{}", plain.join("."));
+                    cur = cask_version_token(&cur, &joined)?;
+                    plain.clear();
+                }
+                cur = cur.split(',').collect::<Vec<_>>().join(sep);
+                continue;
+            }
             if seg.contains('(') {
                 if !plain.is_empty() {
                     let joined = format!("version.{}", plain.join("."));
@@ -567,6 +992,9 @@ pub enum JsonKey {
 /// can take (see `tap::parse_json_shape`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonShape {
+    /// `strategy :json, &:to_s` — the root value's
+    /// Ruby `to_s`.
+    RootToS,
     /// `json["a"]`, `json.dig("a", "b")` — the value.
     Dig(Vec<JsonKey>),
     /// `….delete("v")` — value with chars removed.
@@ -576,6 +1004,89 @@ pub enum JsonShape {
     DigSplitFirst(Vec<JsonKey>, String),
     /// `….[](regex, 1)` / `….match(regex)` first capture.
     DigRegex(Vec<JsonKey>),
+    /// `….scan(regex).map { |match| … }` over a dug
+    /// string (scan-indexed parts).
+    DigScan(Vec<JsonKey>, Vec<PagePart>),
+    /// `….match(regex)&.captures` — every
+    /// participating capture as a version.
+    DigCaptures(Vec<JsonKey>),
+    /// `….map { |_, item| item["k"] }` over a dug
+    /// object's values.
+    ValuesKey(Vec<JsonKey>, String),
+    /// `….join(".")` over a dug array.
+    DigJoin(Vec<JsonKey>, String),
+    /// `….map { |key, item| <key guards> item["k"]… }`
+    /// over a dug object's entries (document order).
+    EntriesMap(Vec<JsonKey>, Box<MapGuard>),
+    /// Nested `each` loops taking the first inner
+    /// field matching the block regex, rendered
+    /// over its captures (unity's downloads scan).
+    NestedFirstMatch {
+        outer: Vec<JsonKey>,
+        inner: Vec<JsonKey>,
+        field: String,
+        render: Box<JsonRender>,
+    },
+    /// `<v> = <dig> [|| <dig>…]; match = v&.match(regex)`;
+    /// rendered over the match (quarkclouddrive's
+    /// fallback download URL).
+    DigMatch {
+        paths: Vec<Vec<JsonKey>>,
+        render: Box<JsonRender>,
+    },
+    /// Several named dig matches (each with any
+    /// `||=` fallback attempts), rendered from their
+    /// captures in one final template.
+    MultiMatch {
+        matches: Vec<JsonMultiMatch>,
+        render: Vec<JsonMultiPart>,
+    },
+    /// `version = nil; <dig>.filter_map { |_k, item|
+    /// match = item.dig(…)&.match(regex); next unless
+    /// match; version = <render>; break }; version`
+    /// over a dug object's values (expressvpn).
+    EntriesFirstMatch {
+        path: Vec<JsonKey>,
+        dig: Vec<JsonKey>,
+        render: Box<JsonRender>,
+    },
+    /// `<outer>.map { |item| item<dig>&.filter_map {
+    /// |a| a[field]&.[](regex, 1) } }.flatten`: every
+    /// inner first capture (rnote).
+    NestedCollect {
+        outer: Vec<JsonKey>,
+        inner: Vec<JsonKey>,
+        field: String,
+    },
+    /// `<outer>.map { |g| g<inner>&.map { |item|
+    /// <guarded projection> } }&.flatten`: a guarded
+    /// map over each outer item's dug array.
+    NestedMap {
+        outer: Vec<JsonKey>,
+        inner: Vec<JsonKey>,
+        guard: Box<MapGuard>,
+    },
+    /// `<outer>.map { |o| o<inner>&.map { |i|
+    /// guards; next o["outer"] unless i["inner"];
+    /// "#{o["outer"]},#{i["inner"]}" } }` (gimp's
+    /// release/build list).
+    NestedTemplate {
+        outer: Vec<JsonKey>,
+        inner: Vec<JsonKey>,
+        guards: Vec<JsonGuard>,
+        outer_field: String,
+        inner_field: String,
+    },
+    /// A guarded map with a trailing `&.max`:
+    /// the single lexicographic maximum (Ruby
+    /// `Array#max` on strings).
+    MapGuardedMax(Vec<JsonKey>, Box<MapGuard>),
+    /// `….map { |key, item| <guards on item> key }`:
+    /// the entry keys whose values pass the guards.
+    EntriesKeys(Vec<JsonKey>, Vec<JsonGuard>),
+    /// `….to_s.sub(/pat/flags, "literal")` — plain
+    /// (non-backreference) replacement.
+    DigSubPlain(Vec<JsonKey>, String, String, String),
     /// `….map { |item| item["k"] }` (item key `None` =
     /// the item itself).
     MapKey(Vec<JsonKey>, Option<String>),
@@ -608,12 +1119,25 @@ pub enum JsonLocal {
     DigCaptureLit(Vec<JsonKey>, String, String),
     /// `<dig> || <dig> || …`: the first present dig.
     DigOr(Vec<Vec<JsonKey>>),
+    /// `(<dig> || <dig>)&.tail`: the first present
+    /// dig with a string tail transform.
+    DigOrTail(Vec<Vec<JsonKey>>, JsonTail),
     /// A dig with a string tail transform
     /// (`&.tr("v", "")`).
     DigTail(Vec<JsonKey>, JsonTail),
     /// `….sub(/pat/flags, "tmpl")` (first
     /// substitution, backref template).
     DigSubRe(Vec<JsonKey>, String, String, String),
+    /// `<field>.split(line).map { split(col) }`
+    /// then `.find { first.end_with?(suffix) }`:
+    /// the found row, joined by U+001F for a
+    /// `LocalMd5Field` render part.
+    SplitRowsFind {
+        path: Vec<JsonKey>,
+        line_sep: String,
+        field_sep: String,
+        first_suffix: String,
+    },
 }
 
 /// One part of a `:json` template string.
@@ -622,10 +1146,18 @@ pub enum JsonPart {
     Lit(String),
     /// `match[N]` of the body's regex match.
     Cap(usize),
+    /// `match[N].tr("from", "to")`.
+    CapTr(usize, String, String),
     /// A body local by index.
     Local(usize),
+    /// `Digest::MD5.hexdigest(<local>[N])` over a
+    /// `SplitRowsFind` local's field.
+    LocalMd5Field(usize, usize),
     /// `item["k"]` in a map body.
     Field(String),
+    /// A dig from the document root in a map body
+    /// (`json["shortrev"]`).
+    RootDig(Vec<JsonKey>),
 }
 
 /// A trailing transform on a single rendered
@@ -634,6 +1166,7 @@ pub enum JsonPart {
 pub enum JsonTail {
     None,
     ToS,
+    Strip,
     Tr(String, String),
     Sub(String, String),
     DeletePrefix(String),
@@ -648,6 +1181,36 @@ pub enum JsonRender {
     /// One value (a local index, a match capture,
     /// or a map item field) plus its tail chain.
     Value(JsonValue, JsonTail),
+    /// `match[N] ? A : B` (`present` = `.present?`,
+    /// which also drops empty captures).
+    CapFork {
+        cap: usize,
+        present: bool,
+        then: Box<JsonRender>,
+        els: Box<JsonRender>,
+    },
+    /// `(match[A] == match[B]) ? A-expr : B-expr`.
+    CapEqFork {
+        a: usize,
+        b: usize,
+        then: Box<JsonRender>,
+        els: Box<JsonRender>,
+    },
+    /// `(localA == localB) ? A-expr : B-expr`.
+    LocalEqFork {
+        a: usize,
+        b: usize,
+        then: Box<JsonRender>,
+        els: Box<JsonRender>,
+    },
+    /// `<render>.gsub(/pat/flags, "repl")` with a
+    /// literal (backslash-free) replacement.
+    GsubRegex {
+        inner: Box<JsonRender>,
+        pat: String,
+        flags: String,
+        repl: String,
+    },
 }
 
 /// A single-value source for `JsonRender::Value`.
@@ -669,6 +1232,9 @@ pub struct JsonTemplate {
     /// when `map`, else the base object itself).
     pub path: Vec<JsonKey>,
     pub map: bool,
+    /// The map iterates the dug object's values
+    /// (`….values&.filter_map`), not an array.
+    pub values: bool,
     pub locals: Vec<JsonLocal>,
     /// Locals guarded `blank?`: a missing/empty one
     /// skips the item (or yields nothing).
@@ -679,7 +1245,65 @@ pub struct JsonTemplate {
     /// Skip unless this local matches the regex.
     pub local_match_guard: Option<usize>,
     pub guards: Vec<JsonGuard>,
+    /// `find { … }` element selections applied in
+    /// order from the root to reach the base value
+    /// (non-map bodies only).
+    pub finds: Vec<JsonFind>,
+    /// Finds that must resolve (`next unless x` =
+    /// truthy, `next if x.blank?` = non-blank).
+    pub require_find: Vec<(usize, bool)>,
     pub render: JsonRender,
+}
+
+/// One named match in a `MultiMatch` json body:
+/// its attempts in fallback order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonMultiMatch {
+    pub attempts: Vec<JsonMatchAttempt>,
+}
+
+/// One `<dig>&.match(<regex>)` attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonMatchAttempt {
+    pub path: Vec<JsonKey>,
+    pub regex: JsonMatchRegex,
+}
+
+/// The regex a `JsonMatchAttempt` matches with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonMatchRegex {
+    /// The block's declared `regex`.
+    Block,
+    /// A literal regex (source, flags).
+    Literal(String, String),
+}
+
+/// One part of a `MultiMatch` final template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonMultiPart {
+    Lit(String),
+    /// Capture `1` of match `0`.
+    Cap(usize, usize),
+}
+
+/// One `&.find { |v| <cond> }` over the array at
+/// `path` (dug from the previous base).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonFind {
+    pub path: Vec<JsonKey>,
+    pub cond: JsonFindCond,
+    /// Take the version-maximum by this field
+    /// (`.select { cond }.max_by { Version.new }`)
+    /// instead of the first match.
+    pub max_by: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonFindCond {
+    /// `v["f"] == lit`
+    FieldEq(String, JsonLit),
+    /// `v.dig(…)&.start_with?("lit")`
+    DigStartsWith(Vec<JsonKey>, String),
 }
 
 /// A guarded map body reduced to data: the projection
@@ -736,6 +1360,27 @@ pub enum JsonCond {
     MatchLit(String, String),
     /// `item["f"]&.include?("lit")`.
     Includes(String, String),
+    /// `item["f"].blank?`
+    FieldBlank(String),
+    /// `item.dig(…).blank?`
+    DigBlank(Vec<JsonKey>),
+    /// `item["f"].match?(/pat/flags)` — a literal
+    /// regex in the block.
+    MatchRe(String, String, String),
+    /// `item["f"]&.any? { |v| v =~ /pat/flags }`.
+    AnyMatchRe(String, String, String),
+    /// `[lit, …].include?(item["f"])`.
+    FieldIn(String, Vec<JsonLit>),
+    /// `item["f"]&.any? { |e| e["a"] == lit && … }`:
+    /// some element object satisfies every equality.
+    AnyEq(String, Vec<(String, JsonLit)>),
+    /// `key.match?(/pat/flags)` on an object-entry
+    /// map's key (entries maps only).
+    KeyMatchRe(String, String),
+    /// `item.dig(…)` truthy (present, not `false`).
+    DigTruthy(Vec<JsonKey>),
+    /// `item["f"]&.end_with?("lit")`.
+    EndsWith(String, String),
 }
 
 /// A literal in a guard comparison.
@@ -743,6 +1388,7 @@ pub enum JsonCond {
 pub enum JsonLit {
     Str(String),
     Bool(bool),
+    Int(i64),
 }
 
 /// An `:xml` strategy block reduced to data.
@@ -762,6 +1408,63 @@ pub enum XmlShape {
     /// A statement body over XPath queries (see
     /// `XmlTemplate`).
     Template(Box<XmlTemplate>),
+    /// Two mapped lists zipped pairwise
+    /// (`versions.zip(builds).map { |v, b| … }`):
+    /// parts read Local(0) = a-item, Local(1) =
+    /// b-item.
+    ZipPair {
+        a: XmlMap,
+        b: XmlMap,
+        parts: Vec<XmlPart>,
+    },
+    /// Two mapped lists reduced to their extremes:
+    /// the version list's `max_by { Version.new }`
+    /// and the build list's lexical `max`, joined
+    /// with a comma (oxygen's build feed).
+    TwoListExtreme {
+        versions: XmlMap,
+        builds: XmlMap,
+    },
+    /// One element's text holds a JSON document;
+    /// the version is one string key of it
+    /// (adobe-creative-cloud's feature-entry data).
+    TextJsonKey {
+        path: XmlPathQ,
+        key: String,
+    },
+    /// Map over items matching a child element's
+    /// text against the spec regex; when capture 1's
+    /// leading digits equal the checked unit's own
+    /// `version.csv.first.major` (and a CSV second
+    /// part exists), render `cap1,csv_second`, else
+    /// bare `cap1` (endnote's update feed).
+    ChildMatchOwnFork {
+        path: XmlPathQ,
+        child: String,
+    },
+    /// One element's text is a URL; the version is
+    /// rendered from the spec regex matched against
+    /// that URL's merged response header (canon).
+    HeaderHop {
+        path: XmlPathQ,
+        header: String,
+        parts: Vec<XmlPart>,
+    },
+    /// The `max_by` child-text element of a list
+    /// gives a version (literal-regex capture of one
+    /// child) and a second XML document URL (another
+    /// child); the spec regex matches a text in the
+    /// second document and both render (turbotax).
+    HopMatch {
+        path: XmlPathQ,
+        max_child: String,
+        version_child: String,
+        pat: String,
+        flags: String,
+        url_child: String,
+        path2: XmlPathQ,
+        parts: Vec<XmlPart>,
+    },
 }
 
 /// One XPath step: a tag (bare or `prefix:local`)
@@ -780,26 +1483,43 @@ pub enum XmlPred {
     ChildTextEq(String, String),
     /// `[@attr='v']`
     AttrEq(String, String),
+    /// `[contains(@attr,'v')]`
+    AttrContains(String, String),
     /// `[@a='v' and not(@b) and …]`: each attribute
     /// must equal its value, or be absent (`None`).
     AttrAll(Vec<(String, Option<String>)>),
+    /// `[1]`: the 1-based position among the
+    /// step's candidates for each context node.
+    Index(usize),
+    /// `[Child[text()='k']/following-sibling::*[1][text()='v']]`: a
+    /// child with text `child_text` whose next sibling element's
+    /// text is `text`.
+    SiblingAfterChild {
+        child: String,
+        child_text: String,
+        text: String,
+    },
 }
 
-/// An XPath path: `//a/b` (descendant first step)
-/// or `/a/b` (absolute from the root element).
+/// An XPath path: `//a/b` (descendant first step),
+/// `/a/b` (absolute from the root element), or `a/b`
+/// (relative child steps, only under an element local).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XmlPathQ {
     pub absolute: bool,
+    pub relative: bool,
     pub steps: Vec<XmlStep>,
 }
 
 /// A named value an `:xml` template body reads:
 /// the first matching element's text, optionally
-/// its next sibling element's.
+/// its next sibling element's. `from` indexes
+/// `XmlTemplate::elems` for `item.elements[…]` reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XmlLocal {
     pub path: XmlPathQ,
     pub next: bool,
+    pub from: Option<usize>,
 }
 
 /// How one mapped element projects to a string.
@@ -807,6 +1527,8 @@ pub struct XmlLocal {
 pub enum XmlProj {
     /// `item.text&.strip`
     Text,
+    /// `item.text&.strip&.delete_suffix("s")`
+    TextDeleteSuffix(String),
     /// `item.next_element&.text&.strip`
     NextText,
     /// `item.attributes["k"]`
@@ -816,6 +1538,18 @@ pub enum XmlProj {
     /// `match = item.text&.match(regex)` + render
     /// (`true` reads the next sibling's text).
     TextMatch(bool),
+    /// `match = item.attributes["k"]&.match(regex)`
+    /// + render.
+    AttrMatch(String),
+    /// A match over a child element's attribute,
+    /// skipping items whose named child's text
+    /// includes the literal (macgamestore's beta
+    /// filter): (child, attr, skip child, skip text).
+    ChildAttrMatch {
+        child: String,
+        attr: String,
+        skip_child: Option<(String, String)>,
+    },
 }
 
 /// One per-item local in an xml map body.
@@ -851,12 +1585,20 @@ pub enum XmlPart {
     LocalStrip(usize),
     /// `match[N]` (MatchData indexing).
     Cap(usize),
+    /// `match[N].tr("from", "to")`.
+    CapTr(usize, String, String),
 }
 
 /// What an `:xml` template body returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XmlRender {
     Template(Vec<XmlPart>),
+    /// `match[N].present? ? A : B` in a map match.
+    CapPresentFork {
+        cap: usize,
+        then: Vec<XmlPart>,
+        els: Vec<XmlPart>,
+    },
     /// One local's value, optionally stripped.
     LocalValue(usize, bool),
     /// `match[N]` of the body's regex match.
@@ -870,10 +1612,18 @@ pub enum XmlRender {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XmlTemplate {
     pub locals: Vec<XmlLocal>,
+    /// Element locals (`item = xml.elements[…]`);
+    /// `next` reads the next sibling element instead.
+    pub elems: Vec<XmlLocal>,
     pub require: Vec<usize>,
+    /// Element locals that must exist (`next unless item`).
+    pub require_elems: Vec<usize>,
     /// The local the block regex matches
     /// (`match = <local>.match(regex)`).
     pub match_local: Option<usize>,
+    /// `<name> ||= <read>` fallbacks: (dst, src)
+    /// local indexes; dst takes src's value when nil.
+    pub or_pairs: Vec<(usize, usize)>,
     pub map: Option<XmlMap>,
     pub render: XmlRender,
 }
@@ -900,10 +1650,75 @@ pub enum PagePart {
     Cap(usize),
     /// `match[N].tr("from", "to")`
     CapTr(usize, String, String),
+    /// `#{<template> if match[N]}`: the inner
+    /// template, only when the capture participates.
+    CondCap(usize, Vec<PagePart>),
+    /// `match[N].split("", L).join(sep)`
+    /// (`L == 0` = `chars.join(sep)`).
+    CapSplitJoin(usize, usize, String),
+    /// `match[N].delete_prefix("p")`
+    CapDeletePrefix(usize, String),
+    /// `match[N].sub(/pat/flags, 'tmpl')`
+    /// (backreference template).
+    CapSubBackref(usize, String, String, String),
+    /// `match[N][.tr(a, b)].split(sep).map(&:to_i).join(j)`
+    /// (the to_i map optional when a tr precedes).
+    CapNormInts(usize, Option<(String, String)>, String, String, bool),
+}
+
+/// One length arm of a `ScanSplitFork`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageSplitArm {
+    pub len: usize,
+    pub parts: Vec<PageSplitPart>,
+}
+
+/// One part of a `PageSplitArm` template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageSplitPart {
+    Lit(String),
+    /// The split field at this index.
+    Field(usize),
+}
+
+/// One part of a two-match template: a literal,
+/// or capture `cap` of match `which` (0 or 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TwoPart {
+    Lit(String),
+    Cap(usize, usize),
+}
+
+/// An enumerable condition over one match's
+/// captures (indexes in the shape's own space).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageCond {
+    CapEq(usize, usize),
+    CapNe(usize, usize),
+    CapEqLit(usize, String),
+    /// `match[N].blank?`
+    CapBlank(usize),
+    /// `match[N].present?`
+    CapPresent(usize),
+    /// bare `match[N]` (participating capture).
+    CapTruthy(usize),
+    /// `match[A] == match[B].tr(from, to)`
+    CapTrEq(usize, usize, String, String),
+    /// `match[N].include?("lit")`
+    CapIncludes(usize, String),
+    /// `match[N].count("c") >= K`
+    CapCountGe(usize, char, usize),
+    /// `match[A] == match[B][/pat/flags]` (the whole
+    /// sub-match of capture B).
+    CapEqSub(usize, usize, String, String),
+    And(Box<PageCond>, Box<PageCond>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageShape {
+    /// `strategy :page_match, &:strip` — the whole
+    /// page, stripped.
+    PageStrip,
     /// `match[0].tr("from", "to")` (also written
     /// `match.first.tr(…)`): Ruby `String#tr` of the
     /// regex's first capture.
@@ -939,6 +1754,96 @@ pub enum PageShape {
     /// `match = page.match(regex)` + template
     /// (indexes are MatchData indexes, 0 = whole).
     MatchTemplate(Vec<PagePart>),
+    /// Scan-space fork: `<cond> ? A : B` or
+    /// if/else, arms as template parts.
+    ScanFork {
+        cond: PageCond,
+        then: Vec<PagePart>,
+        els: Vec<PagePart>,
+    },
+    /// MatchData-space fork after `page.match`.
+    MatchFork {
+        cond: PageCond,
+        then: Vec<PagePart>,
+        els: Vec<PagePart>,
+    },
+    /// `match[0] = match[0].tr(a, b)` then
+    /// `match.compact.join(sep)`.
+    ScanTrCompactJoin(String, String, String),
+    /// `match[0].split("", N).join(sep)`: at most
+    /// N char pieces (last keeps the remainder).
+    ScanSplitChars(usize, String),
+    /// `scan.map(&:first)[.uniq].min_by/max_by {
+    /// Version.new }`: the extreme first capture
+    /// by version order (`true` = min).
+    ScanExtreme(bool),
+    /// A scan fork whose items are first skipped
+    /// when a capture matches a literal regex
+    /// (`next if match[N]&.match?(/…/)`).
+    ScanGuardedFork {
+        skip_cap: usize,
+        skip_pat: String,
+        skip_flags: String,
+        cond: PageCond,
+        then: Vec<PagePart>,
+        els: Vec<PagePart>,
+    },
+    /// `parse_json(match[N])` then a dig.
+    MatchJsonDig { cap: usize, path: Vec<JsonKey> },
+    /// `page.split(/pat/).filter_map { |section|
+    /// [next if section.match?(skip)] section[regex, 1] }`
+    SplitCapture {
+        pat: String,
+        flags: String,
+        skip: Option<(String, String)>,
+    },
+    /// `page.split(/pat/).map { |section|
+    /// section.scan(regex).map { |match| "…" } }
+    /// .flatten`: the block regex scans each
+    /// split section in isolation.
+    SplitScan {
+        pat: String,
+        flags: String,
+        parts: Vec<PagePart>,
+    },
+    /// `page.scan(/pat/).filter_map { |row|
+    /// match = row[0].match(regex); <fork over
+    /// match> }`: the block regex matches within
+    /// each scanned section's first capture.
+    SectionMatch {
+        pat: String,
+        flags: String,
+        cond: PageCond,
+        then: Vec<PagePart>,
+        els: Vec<PagePart>,
+    },
+    /// `<capture>.split(sep)` rendered by the arm
+    /// for its field count; an unmatched count
+    /// re-emits the previous arm's value (the
+    /// body's local persists across iterations).
+    ScanSplitFork {
+        sep: String,
+        arms: Vec<PageSplitArm>,
+    },
+    /// `page.split("sep").first[a..b].chars.join("j")`
+    /// (no regex): chars `start..start+len` of the
+    /// first split segment, joined.
+    SplitHeadChars {
+        sep: String,
+        start: usize,
+        len: usize,
+        join: String,
+    },
+    /// Two literal `page.match(/…/)` locals and a
+    /// template over both matches' captures
+    /// (no block regex).
+    TwoMatch {
+        a_pat: String,
+        a_flags: String,
+        b_pat: String,
+        b_flags: String,
+        parts: Vec<TwoPart>,
+    },
     /// `match.first.sub(/pat/flags, '\1.\2')`: first
     /// regex match replaced by a backreference
     /// template (`\1`..`\9`, `\0` whole, `\\`).
@@ -1076,6 +1981,38 @@ pub struct GhRelBlock {
     /// assets yield nothing, this literal regex
     /// (source, flags) captures from the tag instead.
     pub fallback_tag: Option<(String, String)>,
+    /// `next <local> if match.blank?`: an asset whose
+    /// text does not match yields the local instead.
+    pub blank_emit_local: bool,
+    /// `json[0...N].map`: only the first N releases.
+    pub limit: Option<usize>,
+    /// Per-asset `next if <cap form> != <own form>`
+    /// guards (free-gpgmail's major/suffix pins).
+    pub own_guards: Vec<GhRelMatchGuard>,
+}
+
+/// One transform over a capture or an own-version
+/// csv field inside a `GhRelMatchGuard`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhRelXform {
+    Id,
+    /// `.split("sep").first`.
+    SplitFirst(String),
+    /// `&.sub(/pat/flags, "rep")` (searched, literal
+    /// replacement without backrefs).
+    SubRe(String, String, String),
+}
+
+/// `next if match[cap]<xform> != version.csv.n<xform>`:
+/// the asset is skipped unless both sides read equal
+/// (nil compares unequal to any string).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhRelMatchGuard {
+    pub cap: usize,
+    pub cap_xform: GhRelXform,
+    /// Own-version csv field index (0 = first).
+    pub own_csv: usize,
+    pub own_xform: GhRelXform,
 }
 
 /// An asset-existence test over asset names.
@@ -1087,7 +2024,19 @@ pub enum GhRelAny {
     NameEndsWith(String),
 }
 
-/// A release-level `release[field]&.[](re, 1)` local.
+/// How a release-level ghrel local reads its field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhRelLocalOp {
+    /// `&.[](re, 1)`: first capture of `lit` (or the
+    /// livecheck regex when `lit` is `None`).
+    Capture,
+    /// The field verbatim.
+    Field,
+    /// `&.delete_prefix("lit")` on the field.
+    DeletePrefix(String),
+}
+
+/// A release-level local over one release field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhRelCapture {
     /// `"name"` or `"tag_name"`.
@@ -1095,6 +2044,10 @@ pub struct GhRelCapture {
     /// A literal regex (source, flags); `None` reads
     /// the livecheck's own regex.
     pub lit: Option<(String, String)>,
+    pub op: GhRelLocalOp,
+    /// `next if <local>.blank?` skips the release
+    /// when the local reads blank.
+    pub blank_guard: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1138,6 +2091,9 @@ pub enum GhRelThen {
         then: Vec<GhRelPart>,
         els: Vec<GhRelPart>,
     },
+    /// `match.to_a.compact.drop(1).join("sep")`: every
+    /// participating capture joined.
+    CompactJoin(String),
 }
 
 /// One operand of a render template.
@@ -1181,6 +2137,12 @@ pub struct GitBlock {
     /// (`next if malformed_tags.include?(tag)`).
     pub skip_tags: Vec<String>,
     pub op: GitOp,
+    /// A `match = tag.match(regex)` body rendering
+    /// over all captures (supersedes `op`).
+    pub match_template: Option<Vec<LatestPart>>,
+    /// `match[1].split(sep).include?(lit)` skips
+    /// the tag.
+    pub skip_split_contains: Option<(String, String)>,
 }
 
 /// The transform a reduced `:git` block applies to a
@@ -1224,6 +2186,13 @@ pub struct LatestBlock {
     /// before the assets map (blank-guarded); renders
     /// read it as `LatestPart::Local`.
     pub pre_capture: Option<LatestPre>,
+    /// The match reads the pre-capture local itself
+    /// (`match = tag&.match(regex)` after a transform).
+    pub match_pre: bool,
+    /// `assets = json["assets"]&.select { %w[…]
+    /// .include?(asset["name"]) }` with a count guard:
+    /// (names, required count).
+    pub asset_pick: Option<(Vec<String>, usize)>,
 }
 
 /// A `:github_latest` pre-capture local: one field's
@@ -1245,6 +2214,8 @@ pub struct LatestPre {
 pub enum LatestPreOp {
     Tr(String, String),
     DeletePrefix(String),
+    /// `&.sub(/pat/flags, "rep")` (backref-free).
+    SubRe(String, String, String),
 }
 
 /// What a reduced `:github_latest` block returns
@@ -1286,15 +2257,25 @@ pub enum LatestRender {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LatestPart {
     Cap(usize),
+    /// `match[n].tr("from", "to")`.
+    CapTr(usize, String, String),
     Lit(String),
     /// The `LatestPre` local.
     Local,
+    /// `<picked>.map { |a| a["updated_at"] }.max
+    /// .gsub(/\D/, "")`: the newest picked asset's
+    /// update timestamp, digits only.
+    AssetsMaxUpdatedDigits,
 }
 
 /// One side of a latest `EqElse` comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LatestOp {
     Cap(usize),
+    /// `match[n].tr("from", "to")`.
+    CapTr(usize, String, String),
+    /// `Version.new(match[n]).major_minor_patch.to_s`.
+    CapMmp(usize),
     Local,
 }
 
@@ -1341,8 +2322,19 @@ pub enum HeaderShape {
     ScanFlatten(Vec<PagePart>),
     /// `headers[h]` verbatim.
     Bare,
+    /// `all_headers.each` first match: the first
+    /// response whose `header` value matches,
+    /// rendered as a MatchData template.
+    AllTemplate(Vec<PagePart>),
     /// `match[2] ? "#{match[1]},#{match[2]}" : match[1]`.
     CsvOpt,
+    /// A guarded-match fork over captures
+    /// (MatchData indexes).
+    Fork {
+        cond: PageCond,
+        then: Vec<PagePart>,
+        els: Vec<PagePart>,
+    },
 }
 
 /// A `:sparkle` strategy block reduced to data.
@@ -1379,6 +2371,9 @@ pub struct SparkleBlock {
     /// a block parameter or not); without one the
     /// oracle errors, so planning refuses.
     pub needs_spec_regex: bool,
+    /// `next version if item.<field> == "lit"`: yield
+    /// the package's own version instead of `expr`.
+    pub own_if: Option<(SpField, String)>,
     pub expr: SpExpr,
 }
 
@@ -1426,6 +2421,17 @@ pub enum SpPart {
     FieldSplit(SpField, String, bool),
     /// `item.field[regex, N]` inline in the template.
     FieldIndex(SpField, usize),
+    /// `item.field.sub("a", "b")` inline in the
+    /// template (first literal replacement).
+    FieldSub(SpField, String, String),
+    /// `(item.field.count("c") >= min) ? item.field :
+    /// "#{item.field}<suffix>"` as a named local.
+    CountPad {
+        field: SpField,
+        needle: String,
+        min: usize,
+        suffix: String,
+    },
 }
 
 /// The enumerable expression shapes a reduced
@@ -1446,6 +2452,8 @@ pub enum SpExpr {
     FieldDeleteSuffix(SpField, String),
     /// `item.field[regex, N]` (optionally safe-nav).
     FieldIndex(SpField, usize),
+    /// `item.field[regex, N]&.tr("a", "b")`.
+    FieldIndexTr(SpField, usize, String, String),
     /// `match.captures.join(",")` over the match of
     /// the regex against a field.
     CapturesJoin(SpField),
@@ -1490,6 +2498,58 @@ pub enum SpExpr {
         from: Option<SpField>,
         blank: Vec<SpPart>,
         parts: Vec<SpPart>,
+    },
+    /// `next <blank> if match.nil? ||
+    /// match[cap].blank?` before the `parts`
+    /// template (a missing match counts blank).
+    CapBlankElse {
+        from: Option<SpField>,
+        cap: usize,
+        blank: Vec<SpPart>,
+        parts: Vec<SpPart>,
+    },
+    /// `match = <local>&.match(/literal/)` (blank
+    /// guarded) over a find-selected item's field,
+    /// rendered as a template (plistedit-pro).
+    LitMatch {
+        field: SpField,
+        pat: String,
+        flags: String,
+        parts: Vec<SpPart>,
+    },
+    /// `if match.blank?` yields the package's own
+    /// version when `item.field == version.csv.first`,
+    /// else the `blank` render; a match renders
+    /// `parts` (soundsource@test).
+    BlankOwnElse {
+        from: SpField,
+        field: SpField,
+        blank: Vec<SpPart>,
+        parts: Vec<SpPart>,
+    },
+    /// Compare the dotless short version with the
+    /// dotless filename capture: equal renders the
+    /// short version, a longer filename appends its
+    /// extra digits as a new component, otherwise
+    /// the item is skipped (moom).
+    DotlessFork {
+        short: SpField,
+        url: SpField,
+        cap: usize,
+    },
+    /// All items' field values, sorted as versions
+    /// and deduplicated, keeping the first of each
+    /// patch bucket (`patch - patch % bucket`)
+    /// in ascending order (commander).
+    ThrottleUniq { field: SpField, bucket: i64 },
+    /// `item.field.scan(regex).map do |match|
+    /// if a == b … else … end end`.
+    ScanEqElse {
+        from: SpField,
+        a: SpOp,
+        b: SpOp,
+        then: Vec<SpPart>,
+        els: Vec<SpPart>,
     },
 }
 
@@ -1546,6 +2606,14 @@ pub enum YamlShape {
     RootMatch {
         key: String,
         render: YamlRender,
+    },
+    /// `yaml[path]&.map { |item| <guards> item[key] }`:
+    /// each dug item's scalar (raw spelling, so a
+    /// trailing `.to_s` is already satisfied).
+    MapKey {
+        path: Vec<JsonKey>,
+        key: String,
+        guards: Vec<JsonGuard>,
     },
 }
 
@@ -2993,19 +4061,52 @@ impl Cask {
     }
 }
 
-/// Homebrew-shaped version comparison.
+/// Homebrew-shaped version comparison (a faithful
+/// port of brew's `Version` token classes and
+/// comparison loop, with the `PkgVersion` revision
+/// suffix compared last).
 #[must_use]
 pub fn version_cmp(a: &str, b: &str) -> Ordering {
     let (a_main, a_rev) = split_revision(a);
     let (b_main, b_rev) = split_revision(b);
-    let at = tokens(&a_main);
-    let bt = tokens(&b_main);
-    for i in 0..at.len().max(bt.len()) {
-        let x = at.get(i).map_or("", String::as_str);
-        let y = bt.get(i).map_or("", String::as_str);
-        let ord = token_cmp(x, y);
-        if ord != Ordering::Equal {
-            return ord;
+    if a_main == b_main {
+        return a_rev.cmp(&b_rev);
+    }
+    let head = |v: &str| v == "HEAD" || v.starts_with("HEAD-");
+    match (head(&a_main), head(&b_main)) {
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (true, true) => return a_rev.cmp(&b_rev),
+        (false, false) => {}
+    }
+    let lt = brew_tokens(&a_main);
+    let rt = brew_tokens(&b_main);
+    let max = lt.len().max(rt.len());
+    let (mut l, mut r) = (0usize, 0usize);
+    while l < max {
+        let a_tok = lt.get(l).unwrap_or(&BrewTok::Null);
+        let b_tok = rt.get(r).unwrap_or(&BrewTok::Null);
+        if brew_tok_cmp(a_tok, b_tok) == Ordering::Equal {
+            l += 1;
+            r += 1;
+            continue;
+        }
+        let (a_num, b_num) = (
+            matches!(a_tok, BrewTok::Num(_)),
+            matches!(b_tok, BrewTok::Num(_)),
+        );
+        if a_num && !b_num {
+            if brew_tok_cmp(a_tok, &BrewTok::Null) == Ordering::Greater {
+                return Ordering::Greater;
+            }
+            l += 1;
+        } else if !a_num && b_num {
+            if brew_tok_cmp(b_tok, &BrewTok::Null) == Ordering::Greater {
+                return Ordering::Less;
+            }
+            r += 1;
+        } else {
+            return brew_tok_cmp(a_tok, b_tok);
         }
     }
     a_rev.cmp(&b_rev)
@@ -3024,65 +4125,225 @@ pub(super) fn split_revision(v: &str) -> (String, u64) {
     (v.to_string(), 0)
 }
 
-fn tokens(v: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut digits: Option<bool> = None;
-    for c in v.chars() {
-        if matches!(c, '.' | '-' | '_' | '+') || c.is_whitespace() {
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-            digits = None;
-            continue;
+/// One brew `Version::Token`: composite tokens keep
+/// their raw text (for the lexical `super` compare)
+/// and their first digit run as the revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrewTok {
+    Null,
+    Num(u128),
+    Str(String),
+    Alpha(String, u128),
+    Beta(String, u128),
+    Pre(String, u128),
+    Rc(String, u128),
+    Patch(String, u128),
+    Post(String, u128),
+}
+
+impl BrewTok {
+    fn raw(&self) -> &str {
+        match self {
+            BrewTok::Null => "",
+            BrewTok::Num(_) => "",
+            BrewTok::Str(s)
+            | BrewTok::Alpha(s, _)
+            | BrewTok::Beta(s, _)
+            | BrewTok::Pre(s, _)
+            | BrewTok::Rc(s, _)
+            | BrewTok::Patch(s, _)
+            | BrewTok::Post(s, _) => s,
         }
-        let d = c.is_ascii_digit();
-        if digits.is_some_and(|was| was != d) && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-        }
-        digits = Some(d);
-        cur.push(c);
     }
-    if !cur.is_empty() {
-        out.push(cur);
+
+    fn is_composite(&self) -> bool {
+        matches!(
+            self,
+            BrewTok::Alpha(..)
+                | BrewTok::Beta(..)
+                | BrewTok::Pre(..)
+                | BrewTok::Rc(..)
+                | BrewTok::Patch(..)
+                | BrewTok::Post(..)
+        )
+    }
+
+    /// Position in brew's alpha < beta < pre < rc <
+    /// patch/post ordering (`None` for non-composites).
+    fn class_rank(&self) -> Option<u8> {
+        match self {
+            BrewTok::Alpha(..) => Some(0),
+            BrewTok::Beta(..) => Some(1),
+            BrewTok::Pre(..) => Some(2),
+            BrewTok::Rc(..) => Some(3),
+            BrewTok::Patch(..) | BrewTok::Post(..) => Some(4),
+            _ => None,
+        }
+    }
+}
+
+/// Case-insensitive ASCII prefix match at `pos`,
+/// returning the end position after an optional
+/// digit run (`Some` also requires the run when
+/// `need_digits`).
+fn brew_word(bytes: &[u8], pos: usize, word: &str, need_digits: bool) -> Option<usize> {
+    let w = word.as_bytes();
+    if bytes.len() < pos + w.len()
+        || !bytes[pos..pos + w.len()]
+            .iter()
+            .zip(w)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    {
+        return None;
+    }
+    let mut end = pos + w.len();
+    let start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if need_digits && end == start {
+        return None;
+    }
+    Some(end)
+}
+
+/// The length of the brew `SCAN_PATTERN` match at
+/// `pos` (alternatives tried in union order).
+fn brew_scan_len(bytes: &[u8], pos: usize) -> Option<usize> {
+    for (word, need) in [
+        ("alpha", false),
+        ("a", true),
+        ("beta", false),
+        ("b", true),
+        ("pre", false),
+        ("rc", false),
+        ("p", false),
+    ] {
+        if let Some(e) = brew_word(bytes, pos, word, need) {
+            return Some(e - pos);
+        }
+    }
+    // PostToken: any one char + "post" + digits.
+    if pos < bytes.len()
+        && let Some(e) = brew_word(bytes, pos + 1, "post", true)
+    {
+        return Some(e - pos);
+    }
+    let c = *bytes.get(pos)?;
+    if c.is_ascii_digit() || c.is_ascii_alphabetic() {
+        let pred: fn(&u8) -> bool = if c.is_ascii_digit() {
+            u8::is_ascii_digit
+        } else {
+            u8::is_ascii_alphabetic
+        };
+        let mut end = pos + 1;
+        while end < bytes.len() && pred(&bytes[end]) {
+            end += 1;
+        }
+        return Some(end - pos);
+    }
+    None
+}
+
+/// Whole-string classification (`Token.create` order).
+fn brew_classify(s: &str) -> BrewTok {
+    let b = s.as_bytes();
+    let rev = {
+        let digits: String = s
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse::<u128>().unwrap_or(0)
+    };
+    let full = |word: &str, need: bool| brew_word(b, 0, word, need) == Some(b.len());
+    if full("alpha", false) || full("a", true) {
+        BrewTok::Alpha(s.to_string(), rev)
+    } else if full("beta", false) || full("b", true) {
+        BrewTok::Beta(s.to_string(), rev)
+    } else if full("rc", false) {
+        BrewTok::Rc(s.to_string(), rev)
+    } else if full("pre", false) {
+        BrewTok::Pre(s.to_string(), rev)
+    } else if full("p", false) {
+        BrewTok::Patch(s.to_string(), rev)
+    } else if brew_word(b, 1, "post", true) == Some(b.len()) && !b.is_empty() {
+        BrewTok::Post(s.to_string(), rev)
+    } else if !b.is_empty() && b.iter().all(u8::is_ascii_digit) {
+        BrewTok::Num(s.parse().unwrap_or(u128::MAX))
+    } else {
+        BrewTok::Str(s.to_string())
+    }
+}
+
+fn brew_tokens(v: &str) -> Vec<BrewTok> {
+    let bytes = v.as_bytes();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        match brew_scan_len(bytes, pos) {
+            Some(len) => {
+                out.push(brew_classify(&v[pos..pos + len]));
+                pos += len;
+            }
+            None => pos += 1,
+        }
     }
     out
 }
 
-fn prerelease_rank(t: &str) -> Option<u8> {
-    match t.to_ascii_lowercase().as_str() {
-        "alpha" | "a" => Some(0),
-        "beta" | "b" => Some(1),
-        "pre" | "preview" => Some(2),
-        "rc" => Some(3),
-        _ => None,
-    }
-}
-
-fn token_cmp(x: &str, y: &str) -> Ordering {
-    if x == y {
-        return Ordering::Equal;
-    }
-    let xn = (!x.starts_with('+'))
-        .then(|| x.parse::<u128>().ok())
-        .flatten();
-    let yn = (!y.starts_with('+'))
-        .then(|| y.parse::<u128>().ok())
-        .flatten();
-    match (xn, yn) {
-        (Some(a), Some(b)) => a.cmp(&b),
-        (None, Some(0)) | (Some(0), None) if x.is_empty() || y.is_empty() => Ordering::Equal,
-        // Brew's NumericToken outranks every string token
-        // (including the composite pre-release tokens), so a
-        // numeric token always wins this position.
-        (Some(_), None) => Ordering::Greater,
-        (None, Some(_)) => Ordering::Less,
-        (None, None) => match (prerelease_rank(x), prerelease_rank(y)) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => x.cmp(y),
-        },
+/// Brew's `Token#<=>` over token classes.
+fn brew_tok_cmp(x: &BrewTok, y: &BrewTok) -> Ordering {
+    use BrewTok as T;
+    match (x, y) {
+        (T::Null, T::Null) => Ordering::Equal,
+        (T::Null, T::Num(v)) => {
+            if *v == 0 {
+                Ordering::Equal
+            } else {
+                Ordering::Less
+            }
+        }
+        (T::Null, T::Alpha(..) | T::Beta(..) | T::Pre(..) | T::Rc(..)) => Ordering::Greater,
+        (T::Null, _) => Ordering::Less,
+        (T::Num(v), T::Null) => {
+            if *v == 0 {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            }
+        }
+        (_, T::Null) => brew_tok_cmp(y, x).reverse(),
+        (T::Num(a), T::Num(b)) => a.cmp(b),
+        (T::Num(_), _) => Ordering::Greater,
+        (_, T::Num(_)) => Ordering::Less,
+        _ => {
+            // StringToken family vs string token:
+            // same composite class compares revisions,
+            // cross-class by brew's ordering (patch vs
+            // post falls back to lexical, like `super`).
+            let same_class = std::mem::discriminant(x) == std::mem::discriminant(y);
+            if same_class && x.is_composite() {
+                let rev = |t: &BrewTok| match t {
+                    T::Alpha(_, r)
+                    | T::Beta(_, r)
+                    | T::Pre(_, r)
+                    | T::Rc(_, r)
+                    | T::Patch(_, r)
+                    | T::Post(_, r) => *r,
+                    _ => 0,
+                };
+                return rev(x).cmp(&rev(y));
+            }
+            let patch_post = matches!(
+                (x, y),
+                (T::Patch(..), T::Post(..)) | (T::Post(..), T::Patch(..))
+            );
+            if !patch_post && let (Some(a), Some(b)) = (x.class_rank(), y.class_rank()) {
+                return a.cmp(&b);
+            }
+            x.raw().cmp(y.raw())
+        }
     }
 }
 

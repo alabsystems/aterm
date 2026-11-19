@@ -293,7 +293,7 @@ impl Take {
                 std::thread::sleep(duration);
                 delay_s.set(started.elapsed().as_secs_f64());
             },
-            || Settled::read(self.inst.pid(), self.inst.ctl.budget()),
+            || Settled::read(self.inst.pid(), self.inst.ctl.take_budget()?),
         );
         if scene == RssScene::Idle {
             eprintln!(

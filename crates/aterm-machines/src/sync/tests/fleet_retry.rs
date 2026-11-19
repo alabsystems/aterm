@@ -88,19 +88,22 @@ impl HeldClone {
 enum Fault {
     Fleet,
     FleetThenFabric,
-    Fabric,
+    Fabric(FleetRead),
 }
 
-fn coordination_before_clone_finishes(fault: Fault) {
+fn coordination_before_clone_finishes(fault: Fault, fabric_needs_node: bool) {
     let repair_failure = matches!(fault, Fault::FleetThenFabric);
-    let fleet_current = matches!(fault, Fault::Fabric);
+    let fabric_only = matches!(fault, Fault::Fabric(_));
     let scratch = aterm_tempfile::tempdir().unwrap();
     let clone = HeldClone::new();
     let held = || None;
     let owed = |_: Option<&crate::init_github::RepositoryReadback>| clone.owed();
     let effect = |_| clone.run();
     let ports = owed_clone::Hooked {
-        inner: Inert::new(scratch.path()),
+        inner: Inert {
+            fabric_needs_node,
+            ..Inert::new(scratch.path())
+        },
         held: &held,
         owed: &owed,
         clone: &effect,
@@ -112,12 +115,20 @@ fn coordination_before_clone_finishes(fault: Fault) {
         from: "the node is missing".into(),
         to: "the node runs".into(),
     };
-    if fleet_current {
-        *ports.inner.fleet.lock().unwrap() = FleetRead::Current("already joined".into());
+    let first_fleet_outcome = if let Fault::Fabric(fleet) = fault {
+        let outcome = if matches!(fleet, FleetRead::Blocked(_)) {
+            Outcome::Blocked
+        } else {
+            Outcome::Ok
+        };
+        *ports.inner.fleet.lock().unwrap() = fleet;
         *ports.inner.renewed.lock().unwrap() = Err("the broker was briefly busy".into());
+        outcome
     } else {
         *ports.inner.fleet_done.lock().unwrap() = Err("the issuer was briefly full".into());
-    }
+        Outcome::Failed
+    };
+    let node_runs = if fabric_only { 1 } else { 2 };
     let mut waits = 0;
     let mut clock = Clock {
         now: 0,
@@ -144,15 +155,19 @@ fn coordination_before_clone_finishes(fault: Fault) {
                 "same admitted pass"
             );
             assert!(!ports.inner.applies().contains(&"requests"));
-            *ports.inner.fleet_done.lock().unwrap() = Ok(FleetDone::Synced("joined".into()));
-            *ports.inner.node.lock().unwrap() = NodeRead::Due {
-                from: "the node lacks the new fleet".into(),
-                to: "the node serves the new fleet".into(),
-            };
-            *ports.inner.fabric.lock().unwrap() = FabricRead::Due {
-                from: "the fleet changed".into(),
-                to: "the broker serves the new fleet".into(),
-            };
+            if !fabric_only {
+                *ports.inner.fleet_done.lock().unwrap() = Ok(FleetDone::Synced("joined".into()));
+                *ports.inner.node.lock().unwrap() = NodeRead::Due {
+                    from: "the node lacks the new fleet".into(),
+                    to: "the node serves the new fleet".into(),
+                };
+                if fabric_needs_node {
+                    *ports.inner.fabric.lock().unwrap() = FabricRead::Due {
+                        from: "the fleet changed".into(),
+                        to: "the broker serves the new fleet".into(),
+                    };
+                }
+            }
             if repair_failure {
                 *ports.inner.renewed.lock().unwrap() = Err("the broker was briefly busy".into());
             } else {
@@ -163,6 +178,13 @@ fn coordination_before_clone_finishes(fault: Fault) {
         }),
     };
     let mut fleet_events = Vec::new();
+    let mut node_events = Vec::new();
+    let mut fabric_events = Vec::new();
+    let release_after = if fabric_needs_node || fabric_only {
+        FABRIC
+    } else {
+        NODE
+    };
     let mut released = false;
     let pass = ran(run_pass_waiting(
         &ports,
@@ -173,7 +195,13 @@ fn coordination_before_clone_finishes(fault: Fault) {
             if row.id == FLEET {
                 fleet_events.push(row.outcome);
             }
-            if row.id == FABRIC && clone.calls.load(Ordering::SeqCst) > 0 && !released {
+            if row.id == NODE {
+                node_events.push(row.outcome);
+            }
+            if row.id == FABRIC {
+                fabric_events.push(row.outcome);
+            }
+            if row.id == release_after && clone.calls.load(Ordering::SeqCst) > 0 && !released {
                 if row.outcome == Outcome::Failed {
                     assert!(repair_failure);
                     assert!(!clone.finished.load(Ordering::SeqCst));
@@ -192,7 +220,7 @@ fn coordination_before_clone_finishes(fault: Fault) {
                         .iter()
                         .filter(|&&k| k == "node")
                         .count(),
-                    2
+                    node_runs
                 );
                 assert!(try_lock(scratch.path()).unwrap().is_none());
                 released = true;
@@ -207,14 +235,20 @@ fn coordination_before_clone_finishes(fault: Fault) {
     assert!(released);
     assert_eq!(
         fleet_events,
-        if fleet_current {
-            vec![Outcome::Ok, Outcome::Ok]
-        } else if repair_failure {
-            vec![Outcome::Failed, Outcome::Changed, Outcome::Ok]
+        if fabric_only {
+            vec![first_fleet_outcome]
         } else {
             vec![Outcome::Failed, Outcome::Changed]
         }
     );
+    assert_eq!(node_events, vec![Outcome::Changed; node_runs]);
+    if !fabric_needs_node {
+        assert_eq!(
+            fabric_events,
+            [Outcome::Changed],
+            "the independent broker runs once"
+        );
+    }
     assert_eq!(
         ports
             .inner
@@ -222,15 +256,19 @@ fn coordination_before_clone_finishes(fault: Fault) {
             .iter()
             .filter(|&&k| k == "fleet")
             .count(),
-        if fleet_current { 0 } else { 2 }
+        if fabric_only { 0 } else { 2 }
     );
+    let fleet_outcome = if fabric_only {
+        first_fleet_outcome
+    } else {
+        Outcome::Changed
+    };
     for id in [FLEET, NODE, FABRIC, CLONE] {
-        let expected =
-            if (repair_failure && matches!(id, FLEET | NODE)) || (fleet_current && id == FLEET) {
-                Outcome::Ok
-            } else {
-                Outcome::Changed
-            };
+        let expected = if id == FLEET {
+            fleet_outcome
+        } else {
+            Outcome::Changed
+        };
         assert_eq!(row(&pass.rows, id).outcome, expected, "{id}");
         assert_eq!(pass.rows.iter().filter(|row| row.id == id).count(), 1);
     }
@@ -244,31 +282,42 @@ fn coordination_before_clone_finishes(fault: Fault) {
             .find(|row| row.id == FLEET)
             .unwrap()
             .outcome,
-        if repair_failure || fleet_current {
-            Outcome::Ok
-        } else {
-            Outcome::Changed
-        }
+        fleet_outcome
     );
     let history = std::fs::read_to_string(FileJournal::under(scratch.path()).path()).unwrap();
     assert!(history.lines().any(
-        |line| line.contains(if fleet_current { FABRIC } else { FLEET }) && line.contains("failed")
+        |line| line.contains(if fabric_only { FABRIC } else { FLEET }) && line.contains("failed")
     ));
 }
 
 #[test]
 fn fleet_and_its_node_and_fabric_finish_before_a_long_clone_is_released() {
-    coordination_before_clone_finishes(Fault::Fleet);
+    for fabric_needs_node in [true, false] {
+        coordination_before_clone_finishes(Fault::Fleet, fabric_needs_node);
+    }
 }
 
 #[test]
 fn a_transient_dependent_repair_also_retries_before_the_clone_finishes() {
-    coordination_before_clone_finishes(Fault::FleetThenFabric);
+    coordination_before_clone_finishes(Fault::FleetThenFabric, true);
 }
 
 #[test]
 fn a_fabric_fault_retries_beside_a_clone_when_the_fleet_is_already_current() {
-    coordination_before_clone_finishes(Fault::Fabric);
+    coordination_before_clone_finishes(
+        Fault::Fabric(FleetRead::Current("already joined".into())),
+        true,
+    );
+}
+
+#[test]
+fn a_fabric_retry_leaves_the_preserved_fleet_row_alone() {
+    coordination_before_clone_finishes(
+        Fault::Fabric(FleetRead::Blocked(
+            "this Mac joined another fleet by hand".into(),
+        )),
+        true,
+    );
 }
 
 #[test]

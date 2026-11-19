@@ -82,6 +82,14 @@ thread_local! {
     /// MUTANT, on for one test thread: a look keeps when it found each subject moved for as long
     /// as the transport runs ([`Moves::take`]), one entry for every subject that ever moved.
     pub(super) static MOVES_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT, on for one test thread: a look never tells that the configuration's policy
+    /// selects more than it did ([`Look::widened`]), so no seat is owed a round for it.
+    pub(super) static WIDENED_UNTOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT, on for one test thread: every change of the configuration's stamp tells a
+    /// widening ([`Look::widened`]), whatever its policy says, so an unrelated setting's edit
+    /// owes every seat a round.
+    pub(super) static WIDENED_BY_STAMP: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// The membership records as a look last read them.
@@ -120,6 +128,13 @@ pub(super) struct Look {
     /// The Commons configuration, whose subscription policy says which held tables this Mac's
     /// rounds list (`crate::catalog::policy::Policy`), and its stamp as the last look read it.
     config: (PathBuf, Option<FileStamp>),
+    /// The policy the configuration gave when a look last read it whole; none until one did. A
+    /// look reads it again only where the stamp changed, and keeps this one where that read
+    /// fails.
+    policy: Option<crate::catalog::policy::Policy>,
+    /// A [`Self::moved`] since the transport last asked ([`Moves::widened`]) found the policy
+    /// selecting what the one before it did not ([`Self::reread_policy`]).
+    widened: bool,
     /// Each held store's witnessed length (`crate::table::store::held_lengths`), by table and
     /// region, with when this Mac took it up as far as a look tells ([`Self::held_since`]). A
     /// store a later look does not list keeps its entry here.
@@ -142,6 +157,8 @@ impl Look {
             journal: journal.into(),
             trust,
             config: (config.into(), FileStamp::of(config)),
+            policy: crate::catalog::policy::Policy::read(config).ok(),
+            widened: false,
             tables: None,
             control: None,
             members: None,
@@ -168,12 +185,15 @@ impl Look {
         let unstamped = CONFIG_UNSTAMPED.with(std::cell::Cell::get);
         #[cfg(not(test))]
         let unstamped = false;
-        if stamp != self.config.1 && !unstamped {
+        let changed = stamp != self.config.1;
+        if changed && !unstamped {
             let now = Instant::now();
             for (_, found) in self.tables.iter_mut().flat_map(BTreeMap::values_mut) {
                 *found = now;
             }
         }
+        // Kept until the transport takes it ([`Moves::widened`]).
+        self.widened |= changed && self.reread_policy();
         self.config.1 = stamp;
         if let Ok(held) = crate::table::store::held_lengths(&self.paths) {
             let first = self.tables.is_none();
@@ -218,6 +238,33 @@ impl Look {
             moved.insert(Subject::Members);
         }
         moved
+    }
+
+    /// Read the configuration's policy again, whose stamp changed: whether it selects what the
+    /// last one read did not, sharing enabled where it was not or a table excluded no more. A
+    /// read that fails keeps the last policy and tells nothing, and the first read, with no
+    /// policy before it, tells nothing.
+    ///
+    /// The rounds this Mac had with each seat before the change listed what the old policy
+    /// selected, and a seat that read those lists as this Mac leaving a table out passes this
+    /// Mac over for writes to it until a round lists it (`super::discovery::may_take`): the
+    /// transport owes each such seat that round (`super::discovery::Hints::relist_all`).
+    fn reread_policy(&mut self) -> bool {
+        let Ok(new) = crate::catalog::policy::Policy::read(&self.config.0) else {
+            return false;
+        };
+        let old = self.policy.replace(new.clone());
+        #[cfg(test)]
+        if WIDENED_UNTOLD.with(std::cell::Cell::get) {
+            return false;
+        }
+        #[cfg(test)]
+        if WIDENED_BY_STAMP.with(std::cell::Cell::get) {
+            return old.is_some();
+        }
+        old.is_some_and(|old| {
+            new.enabled && (!old.enabled || old.excluded.difference(&new.excluded).next().is_some())
+        })
     }
 
     /// By how much the last [`Self::moved`] found `subject` grown: a table's witnessed records
@@ -399,6 +446,15 @@ impl Moves {
         if self.look.is_some() && self.sources.len() < MAX_SOURCES {
             self.sources.push((subject, actor, began, count));
         }
+    }
+
+    /// Whether a look since the last call found the configuration's policy selecting what it did
+    /// not before ([`Look::widened`]), told once: the next call says false until a look finds it
+    /// again.
+    pub(super) fn widened(&mut self) -> bool {
+        self.look
+            .as_mut()
+            .is_some_and(|look| std::mem::take(&mut look.widened))
     }
 
     /// When this Mac took up a store of `table` here, as its look tells ([`Look::held_since`]);

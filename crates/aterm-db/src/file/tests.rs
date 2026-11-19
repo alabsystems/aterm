@@ -18,7 +18,7 @@ use crate::{
         registry::{ACCOUNT, ACCOUNT_OBS, ADDRESS, MACHINE, PREFERENCE},
     },
     att, generation,
-    table::tests::{Lab, repair_commons_among, repair_commons_among_first},
+    table::tests::{Lab, repair_commons_among, repair_commons_among_first, repair_commons_first},
     typed::{grid, grid::tests::put, keys},
 };
 use aterm_file::{File, Name, Recorded, Root, Why, Word, cli};
@@ -40,9 +40,13 @@ pub(super) fn state_ring(lab: &Lab, n: usize, changes: Vec<crate::database::Chan
     let session = crate::table::Session::open(&bootstrap).unwrap();
     let directory = crate::catalog::Directory::new(&lab.paths[n], bootstrap.trust());
     let request = crate::typed::request_id(APPLICATION, ROLE, &changes).unwrap();
-    let payload = crate::database::Command::Write { request, changes }
-        .encode()
-        .unwrap();
+    let payload = crate::database::Command::Write {
+        request,
+        changes,
+        said: None,
+    }
+    .encode()
+    .unwrap();
     directory
         .append_journal(&session, t, t, &payload)
         .unwrap()
@@ -227,6 +231,7 @@ impl Stand {
             cli: Word::new("claude").unwrap(),
             sub: None,
             window: Some(Window::Week),
+            model: None,
             pct_x10: Some(u16::try_from(w7d).unwrap()),
             reset: Some(reset / 1000),
             res: None,
@@ -276,7 +281,12 @@ impl Stand {
         tracker
             .append_log(&MEASURE, &[metric("4", NOW - 60_000)])
             .unwrap();
-        let note = json!({"about": "tk-05", "text": "a log outside the ring", "at": NOW});
+        let note = json!({
+            "on": "package",
+            "about": "tk-05",
+            "text": "a log outside the ring",
+            "at": NOW,
+        });
         tracker
             .append_log(&NOTE, &[note.as_object().unwrap().clone()])
             .unwrap();
@@ -1225,6 +1235,7 @@ fn a_files_class_fits_its_collection_and_takes_only_its_writers_intents() {
         ms: NOW,
         by: "harness".to_owned(),
         session: None,
+        said: None,
         born: false,
         edits: if revert.is_some() {
             Vec::new()
@@ -1236,6 +1247,7 @@ fn a_files_class_fits_its_collection_and_takes_only_its_writers_intents() {
                 value: json!("running"),
                 text: "running".to_owned(),
                 expected: Vec::new(),
+                judged: aterm_file::outbox::Judged::Text,
             }]
         },
         revert,
@@ -1687,10 +1699,11 @@ fn files_left_by_another_replica_are_replaced_by_this_ones_read() {
 /// `Kept(Behind)`; a projection too large to take at a key is not made again at that key (once
 /// the status records `held` for it, a pass there writes nothing and still says why), and a
 /// pass whose key moved projects again, while one whose key stands keeps it still. The files
-/// ahead are another copy of the lab's, projected from a registry record this Mac's replica
-/// lacks: the registry's files, and `ai/limits`, whose frontier is the registry's read it names
-/// accounts by, are behind them, while the journal ring's files and `lab/tracker`'s logs, whose
-/// window and table hold the same records in both copies, are not, and their key stands. The
+/// ahead were projected from a read one record further along the registry's store than this
+/// Mac's replica has counted (their sidecars say so): the registry's files, and `ai/limits`,
+/// whose frontier is the registry's read it names accounts by, are behind them, while the
+/// journal ring's files and `lab/tracker`'s logs, whose sidecars are this read's, are not, and
+/// their key stands. The
 /// projection too large is the status `aterm_file::File::record` leaves for one: the read's key
 /// as the one too large ([`aterm_file::State::kept_key`]), and the snapshot kept at an earlier
 /// read's key; a registry record moves the keys of the registry's files and the view's, and
@@ -1736,23 +1749,18 @@ fn a_kept_snapshot_is_not_projected_again_until_its_key_moves() {
 
     let stand = Stand::new();
     all(&stand, &stand.pass(false), Word::Live, None);
-    let fork = stand.lab.fork();
-    Registry::at(fork.paths[SEAT].clone())
-        .write(vec![machine_row("m8")])
-        .unwrap();
-    let ahead = materialize::pass(
-        &fork.paths[SEAT],
-        &fork._home.path().join("aterm.toml"),
-        None,
-        &Pass {
-            read_by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-            vault_wait: materialize::VAULT_WAIT,
-            again: false,
-            now_ms: NOW,
-        },
-    );
-    every(&ahead, Word::Live, None);
-    copy_tree(super::root(&fork.paths[SEAT]).path(), stand.root().path());
+    // The snapshots ahead: each of a registry file's, and the view's, read one record further
+    // along the same store than this Mac's replica has counted.
+    for file in super::FILES.iter().filter(|file| !apart(file)) {
+        let mut ahead = stand.file(file).frontier().expect("a frontier");
+        assert!(!ahead.stores.is_empty(), "{}", file.name);
+        for store in &mut ahead.stores {
+            store.count += 1;
+            store.hash = [0xa5; 32];
+        }
+        aterm_uds::atomic_file::write(&stand.root().frontier(&file.file()), &ahead.encode(), 0o600)
+            .unwrap();
+    }
     let before = views();
     let behind = stand.pass(false);
     assert_eq!(views(), before, "a read behind the snapshot makes no view");
@@ -1982,8 +1990,10 @@ fn env() -> write::Env<'static> {
         session: Some("s-test"),
         now_ms: NOW,
         attempt: aterm_spec::wait::MUST_HAPPEN,
+        journal: None,
         json: false,
         stdin: None,
+        said: None,
         editor: &|_, _, _| Err("a test opens no editor".to_owned()),
         say: &|_| {},
     }
@@ -2042,6 +2052,7 @@ pub(super) fn publish_pass(paths: &Paths, config: &std::path::Path) -> Vec<publi
         &publish::Pass {
             by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             now_ms: NOW,
+            journal: None,
         },
     )
 }
@@ -2625,12 +2636,14 @@ fn a_follow_up_is_compared_with_its_own_register_of_the_intent_it_follows() {
             revert: None,
             edits: Vec::new(),
             resolves: None,
+            said: None,
         },
         op: Some(mine.clone()),
         ms: NOW,
         seen: true,
         generation: Some(1),
         source: None,
+        at: None,
         left: std::collections::BTreeMap::from([
             (format!("{pk}.label"), vec![peer.clone()]),
             (format!("{pk}.nickname"), vec![mine.clone()]),
@@ -2647,6 +2660,7 @@ fn a_follow_up_is_compared_with_its_own_register_of_the_intent_it_follows() {
         value: json!("Heron"),
         text: "Heron".to_owned(),
         expected: vec![format!("{}{earlier}", aterm_file::outbox::INTENT)],
+        judged: aterm_file::outbox::Judged::Text,
     };
     assert_eq!(super::against(&outbox, &nickname), Some(vec![mine]));
     let label = aterm_file::Edit {
@@ -2822,6 +2836,7 @@ fn the_write_verbs_queue_follow_bear_retire_and_revert() {
                     value: json!("says the Mac itself"),
                     text: "says the Mac itself".to_owned(),
                     expected: Vec::new(),
+                    judged: aterm_file::outbox::Judged::Text,
                 }],
             },
             NOW,
@@ -3301,6 +3316,606 @@ fn held_id(stand: &Stand, op: &str) -> String {
         .find(|done| done.op.as_deref() == Some(op))
         .map(|done| done.intent.id)
         .unwrap_or_else(|| panic!("no marker for {op}"))
+}
+
+/// The lines of `spool`'s file, each as written.
+fn spooled(spool: &crate::alab::journal::Spool) -> Vec<String> {
+    match std::fs::read_to_string(spool.dir().join(crate::alab::journal::spool::SPOOL)) {
+        Ok(text) => text.lines().map(str::to_owned).collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+/// SF-08c's exit test: the publisher notes what it published in `ai/events`
+/// (docs/DESIGN-shared-files-2026-11-11.md §5, "Provenance"; §10 file 5). `aterm file set`
+/// queues one write of `lab/machines` and runs no publisher of its own. The publisher's pass,
+/// handed a journal spool (a scratch one here; the upkeep's and the verb's own hand it on in
+/// `alab::upkeep::tests::the_owners_pass_publishes_a_queued_write_and_then_materializes_it` and
+/// [`each_verb_notes_what_its_write_does`]), signs the
+/// intent and appends exactly one `decided` event to the spool: the operation's first 8 bytes,
+/// the verb (`set`) and the intent's `by` word (`person`), at the marker's time. It is
+/// value-free, carrying no account, cell value, row, session, intent id or whole digest, and its
+/// keys are only the closed vocabulary's. It fits the event bound, as does the longest
+/// `decided` any intent makes. A second pass signs and notes nothing, and a publish with no
+/// spool notes nothing anywhere. This Mac's journal
+/// flusher publishes the event in the ring, and the materializer's next pass projects it as the
+/// one `decided` row of `ai/events`. The release before the shared files (v0.201.0) drops it
+/// whole, as it drops every kind and key it does not know, and this build reads it back.
+///
+/// NEGATIVE CONTROL, observed: with `Work::done` making no note (its `self.note(…)` call
+/// removed), the pass publishes and the spool stays empty: `` left: 0 right: 1 `` at `one
+/// decided event`.
+#[test]
+fn a_publish_notes_its_decision_in_ai_events() {
+    use crate::alab::journal::{
+        Event, Kind, Presence, Source, Spool,
+        event::{MAX_EVENT, Word as EventWord},
+        flush,
+    };
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config) = (stand.paths(), &stand.config);
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = Spool::at(scratch.path().join("alab"));
+    let publish_noting = |journal: Option<&Spool>| {
+        publish::pass(
+            paths,
+            config,
+            None,
+            &publish::Pass {
+                by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                now_ms: NOW,
+                journal,
+            },
+        )
+    };
+    let queue_only = write::Env {
+        attempt: Duration::ZERO,
+        ..env()
+    };
+    let (answer, _) = run_verb(
+        paths,
+        config,
+        &["set", "lab/machines", "m7", "note", "noted elsewhere"],
+        &queue_only,
+    )
+    .unwrap();
+    assert!(answer.starts_with("queued "), "{answer}");
+    let id = id_of(&answer);
+
+    // THE PUBLISHER signs it and notes one `decided`.
+    let outcomes = publish_noting(Some(&spool));
+    let Answer::Published { op: Some(op) } = answer_of(&outcomes, &id) else {
+        panic!("{outcomes:?}")
+    };
+    assert!(
+        outcomes.iter().all(|outcome| outcome.problem.is_none()),
+        "{outcomes:?}"
+    );
+    let lines = spooled(&spool);
+    assert_eq!(lines.len(), 1, "one decided event: {lines:?}");
+    let line = &lines[0];
+    assert!(line.len() <= MAX_EVENT, "{} bytes: {line}", line.len());
+    let event = Event::from_line(line.as_bytes()).expect("this build reads its own note");
+    assert_eq!(
+        (
+            event.kind,
+            event.account,
+            event.cli.as_str(),
+            event.src,
+            event.t
+        ),
+        (Kind::Decided, None, "aterm", Source::File, NOW / 1000)
+    );
+    assert_eq!(
+        (
+            event.op.as_ref().map(EventWord::as_str),
+            event.via.map(crate::alab::journal::Via::word),
+            event.program.as_ref().map(EventWord::as_str),
+        ),
+        (Some(&op[..16]), Some("set"), Some("person")),
+        "the operation's first 8 bytes, the verb and the intent's word"
+    );
+    let value: Value = aterm_json::from_str(line).unwrap();
+    let keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["c", "k", "op", "pg", "src", "t", "via"]);
+    for word in [
+        "noted elsewhere",
+        "s-test",
+        "m7",
+        stand.machine.as_str(),
+        id.as_str(),
+        op.as_str(),
+    ] {
+        assert!(!line.contains(word), "{word} in {line}");
+    }
+    // The release before the shared files drops it whole; this build reads it.
+    assert!(!read_by_0_201(&value));
+    assert_eq!(Event::from_value(&value), Some(event));
+
+    // The longest `decided` an intent can make fits the event bound: a twenty-byte `by` (the
+    // most `aterm file --by` takes) on a resolve, at the last second a clock can say.
+    let longest = aterm_file::Intent {
+        id: id.clone(),
+        file: super::MACHINES.file(),
+        ms: NOW,
+        by: "a".repeat(20),
+        session: None,
+        born: false,
+        revert: None,
+        edits: Vec::new(),
+        resolves: Some(id.clone()),
+        said: None,
+    };
+    let longest = publish::decided(&longest, &op, u64::MAX).expect("a decided");
+    let mut buf = [0; MAX_EVENT];
+    assert!(longest.encode(&mut buf).is_some(), "{longest:?}");
+
+    // A second pass signs and notes nothing; a pass with no spool notes nowhere.
+    publish_noting(Some(&spool));
+    assert_eq!(spooled(&spool).len(), 1);
+    let (answer, _) = run_verb(
+        paths,
+        config,
+        &["set", "lab/machines", "m7", "note", "noted nowhere"],
+        &queue_only,
+    )
+    .unwrap();
+    let unnoted = id_of(&answer);
+    let outcomes = publish_noting(None);
+    assert!(matches!(
+        answer_of(&outcomes, &unnoted),
+        Answer::Published { op: Some(_) }
+    ));
+    assert_eq!(spooled(&spool).len(), 1);
+
+    // THE FLUSHER publishes it: its first pass takes the spool and writes the week's first
+    // record, and a routine pass later the event goes out.
+    let t = NOW / 1000;
+    flush::pass(paths, &spool, &Presence::default, false, t).unwrap();
+    let flushed = flush::pass(
+        paths,
+        &spool,
+        &Presence::default,
+        false,
+        t + crate::alab::journal::book::ROUTINE_S,
+    )
+    .unwrap();
+    assert!(
+        matches!(flushed, flush::Flushed::Wrote { events: 1, .. }),
+        "{flushed:?}"
+    );
+
+    // THE MATERIALIZER projects it as the one `decided` row of `ai/events`.
+    all(&stand, &stand.pass(true), Word::Live, None);
+    let events = stand.file(&super::EVENTS).read();
+    let decided: Vec<_> = events
+        .rows()
+        .iter()
+        .filter(|row| row.cell("kind") == "decided")
+        .collect();
+    assert_eq!(decided.len(), 1, "{:?}", events.rows());
+    assert_eq!(
+        (
+            decided[0].cell("op"),
+            decided[0].cell("via"),
+            decided[0].cell("program"),
+            decided[0].cell("account"),
+            decided[0].cell("src"),
+        ),
+        (&op[..16], "set", "person", "", "file")
+    );
+    assert_eq!(decided[0].values.get("at"), Some(&json!(NOW)));
+}
+
+/// `ai/limits` joins two Macs' readings of one window only within the wider of their resets'
+/// resolutions (`limits::SAME_RESET_MS`, the measurement in its doc): exact readings within a
+/// minute, a reading to the hour with any within an hour, a row that names no resolution (one a
+/// build before `ai/usage` version 3 wrote) within an hour. So the measured refill, a five-hour
+/// reset moved by 600 s after one Mac read the old window spent, is a new instance, which the
+/// spent reading does not join; and the fold is the set's, whatever order the readings come in.
+///
+/// NEGATIVE CONTROL, observed: with every reading taking the hour (`tolerance_ms` returning
+/// `SAME_RESET_MS`), the refilled account folds as spent: `` left: (Some(1000),
+/// Some(1764018600000)) right: (Some(20), Some(1764018600000)) `` at `a refill ten minutes on`.
+#[test]
+fn two_readings_are_one_window_only_within_their_resets_resolutions() {
+    use super::limits::{self, Reading, Seats};
+    const KEY: &str = "ac-00000000000000a1";
+    const R: u64 = 1_764_018_000_000;
+    let reading = |mac: char, percent: u64, reset: u64, res: Option<&str>| {
+        let mut row = aterm_file::Row {
+            pk: format!("{KEY}.{}", mac.to_string().repeat(32)),
+            live: true,
+            ..aterm_file::Row::default()
+        };
+        for (column, value) in [
+            ("account", json!(KEY)),
+            ("w5h", json!(percent)),
+            ("w5h_reset", json!(reset)),
+            ("wall", json!("none")),
+            ("read_at", json!(NOW)),
+        ] {
+            row.values.insert(column.to_owned(), value);
+        }
+        if let Some(res) = res {
+            row.values.insert("w5h_res".to_owned(), json!(res));
+        }
+        Reading::of_row(&row).expect("a usage row's key")
+    };
+    let five_hour = |readings: &[Reading]| {
+        let folded = limits::fold(readings, &Seats::default())[KEY].windows[0];
+        let mut reversed = readings.to_vec();
+        reversed.reverse();
+        assert_eq!(
+            limits::fold(&reversed, &Seats::default())[KEY].windows[0],
+            folded,
+            "the fold is the set's"
+        );
+        folded
+    };
+    let minute = 60_000;
+    let hour = 3_600_000;
+    for (case, readings, expected) in [
+        (
+            "a refill ten minutes on",
+            vec![
+                reading('a', 1000, R, Some("exact")),
+                reading('b', 20, R + 10 * minute, Some("exact")),
+            ],
+            (Some(20), Some(R + 10 * minute)),
+        ),
+        (
+            "two exact readings a minute apart",
+            vec![
+                reading('a', 1000, R, Some("exact")),
+                reading('b', 20, R + minute, Some("exact")),
+            ],
+            (Some(1000), Some(R + minute)),
+        ),
+        (
+            "an exact reading 50 minutes before one to the hour",
+            vec![
+                reading('a', 1000, R - 50 * minute, Some("exact")),
+                reading('b', 20, R, Some("hour")),
+            ],
+            (Some(1000), Some(R)),
+        ),
+        (
+            "a row that names no resolution",
+            vec![
+                reading('a', 1000, R, None),
+                reading('b', 20, R + 10 * minute, Some("exact")),
+            ],
+            (Some(1000), Some(R + 10 * minute)),
+        ),
+        (
+            "an exact reading past an hour from one to the hour",
+            vec![
+                reading('a', 1000, R - hour - minute, Some("exact")),
+                reading('b', 20, R, Some("hour")),
+            ],
+            (Some(20), Some(R)),
+        ),
+        (
+            "a reading to the hour joins two exact ones it lies between",
+            vec![
+                reading('a', 1000, R, Some("exact")),
+                reading('b', 20, R + 40 * minute, Some("hour")),
+                reading('c', 30, R + 80 * minute, Some("exact")),
+            ],
+            (Some(1000), Some(R + 80 * minute)),
+        ),
+    ] {
+        assert_eq!(five_hour(&readings), expected, "{case}");
+    }
+}
+
+/// The `decided` events `spool` holds, in the order they were noted.
+fn decided_in(spool: &crate::alab::journal::Spool) -> Vec<crate::alab::journal::Event> {
+    spooled(spool)
+        .iter()
+        .filter_map(|line| crate::alab::journal::Event::from_line(line.as_bytes()))
+        .filter(|event| event.kind == crate::alab::journal::Kind::Decided)
+        .collect()
+}
+
+/// Each write verb's publish is noted by what its write does (`publish::via`), through the
+/// verb's own publisher pass and the spool its [`write::Env::journal`] names: `set`, `revert`,
+/// `add`, `rm` and a person's `resolve … mine`, one `decided` each, each naming its own
+/// operation. The shapes no verb of `lab/machines` writes are read off built intents: a Mac's
+/// statement of its own row is `state`, a lifecycle edit back to `live` a `set`, one to `ended`
+/// a `rm`, and a revert or a resolve says so whatever its edits.
+///
+/// NEGATIVE CONTROL, observed: with `via`'s lifecycle branch removed, `rm` is noted as a `set`:
+/// `` left: Some(Set) right: Some(Rm) `` at `rm`.
+#[test]
+fn each_verb_notes_what_its_write_does() {
+    use crate::alab::journal::{Spool, Via};
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config) = (stand.paths(), &stand.config);
+    let machine = stand.machine.clone();
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = Spool::at(scratch.path().join("alab"));
+    let noting = write::Env {
+        journal: Some(&spool),
+        ..env()
+    };
+    let noted = |list: &[&str], via: Via| -> String {
+        let before = decided_in(&spool).len();
+        let (answer, _) = run_verb(paths, config, list, &noting).unwrap();
+        assert!(answer.starts_with("published "), "{list:?}: {answer}");
+        let op = op_of(&answer);
+        all(&stand, &stand.pass(false), Word::Live, None);
+        let decided = decided_in(&spool);
+        assert_eq!(decided.len(), before + 1, "{list:?}: one note");
+        let event = decided[before];
+        assert_eq!(event.via, Some(via), "{}", list[0]);
+        assert_eq!(
+            event.op.as_ref().map(crate::alab::journal::Word::as_str),
+            Some(&op[..16])
+        );
+        op
+    };
+    let set = noted(&["set", "lab/machines", "m7", "note", "one"], Via::Set);
+    noted(&["revert", "lab/machines", &set], Via::Revert);
+    noted(
+        &["add", "lab/machines", "label=m9", "status=planned"],
+        Via::Add,
+    );
+    noted(&["rm", "lab/machines", "m9"], Via::Rm);
+    // A write whose register moved is held, and a person keeps their side.
+    Registry::at(paths.clone())
+        .write(vec![vec![put(&MACHINE, &machine, "note", json!("theirs"))]])
+        .unwrap();
+    let (held, code) = run_verb(
+        paths,
+        config,
+        &["set", "lab/machines", "m7", "note", "mine"],
+        &noting,
+    )
+    .unwrap();
+    assert_eq!(code, aterm_file::exit::CONFLICT, "{held}");
+    all(&stand, &stand.pass(false), Word::Live, None);
+    noted(
+        &["resolve", "lab/machines", &id_of(&held), "mine"],
+        Via::Resolve,
+    );
+    assert_eq!(decided_in(&spool).len(), 5, "a held write is noted by none");
+
+    let edit = |key: &str, column: &str, value: Value| aterm_file::Edit {
+        key: key.to_owned(),
+        column: column.to_owned(),
+        elem: None,
+        text: value.to_string(),
+        value,
+        expected: Vec::new(),
+        judged: aterm_file::outbox::Judged::Text,
+    };
+    let intent = |edits: Vec<aterm_file::Edit>| aterm_file::Intent {
+        id: "0".repeat(32),
+        file: super::MACHINES.file(),
+        ms: NOW,
+        by: "person".to_owned(),
+        session: None,
+        born: false,
+        revert: None,
+        edits,
+        resolves: None,
+        said: None,
+    };
+    let lifecycle = crate::typed::LIFECYCLE;
+    for (shape, built, via) in [
+        (
+            "a Mac's own row",
+            intent(vec![edit("claude.@self", "label", json!("m7"))]),
+            Via::State,
+        ),
+        (
+            "a row made live again",
+            intent(vec![edit(&machine, lifecycle, json!("live"))]),
+            Via::Set,
+        ),
+        (
+            "a row ended",
+            intent(vec![edit(&machine, lifecycle, json!("ended"))]),
+            Via::Rm,
+        ),
+        (
+            "a plain cell",
+            intent(vec![edit(&machine, "note", json!("x"))]),
+            Via::Set,
+        ),
+        (
+            "a revert",
+            aterm_file::Intent {
+                revert: Some(set.clone()),
+                ..intent(Vec::new())
+            },
+            Via::Revert,
+        ),
+        (
+            "a resolve of a born row",
+            aterm_file::Intent {
+                born: true,
+                resolves: Some("1".repeat(32)),
+                ..intent(vec![edit("", "label", json!("m9"))])
+            },
+            Via::Resolve,
+        ),
+        (
+            "a born row",
+            aterm_file::Intent {
+                born: true,
+                ..intent(vec![edit("", "label", json!("m9"))])
+            },
+            Via::Add,
+        ),
+    ] {
+        assert_eq!(publish::via(&built), via, "{shape}");
+        let decided = publish::decided(&built, &set, NOW).expect("a decided");
+        assert_eq!(decided.via, Some(via), "{shape}");
+    }
+}
+
+/// A pass killed anywhere notes each publish once (`Work::done`), its note dated by the marker's
+/// time whichever pass writes it, so a note made again is the same event. Each pass runs at its
+/// own clock, a minute after the one before: a pass killed after it signed is noted by the next
+/// at that pass's time, when its marker is written; one killed after its marker is noted by
+/// the next at the marker's time; one killed after its note leaves the same event noted twice,
+/// which the flusher publishes once. Another pass that recovers a marked intent while this one
+/// is about to (`seam::before_next_claim`) notes it, and this pass, whose marker finds it gone
+/// from the outbox, does not note it again. The flusher's routine pass publishes one event per
+/// operation, and `ai/events` holds one `decided` row each.
+///
+/// NEGATIVE CONTROLS, observed: with the recovery noting at its pass's clock (`pass.now_ms` for
+/// `done.ms`), the marker's note is dated a minute late: `` left: [1800000180] right:
+/// [1800000120] `` at `AfterMarker`; with the note made whatever the marker found (`queued &&`
+/// removed), the recovered intent is noted twice: `` left: 2 right: 1 `` at `noted by the pass
+/// that recovered it`.
+#[test]
+fn a_pass_killed_anywhere_notes_each_publish_once() {
+    use crate::alab::journal::{Presence, Spool, Word as EventWord, flush};
+    use publish::seam::Stop;
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config) = (stand.paths(), &stand.config);
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = Spool::at(scratch.path().join("alab"));
+    let publish_at = |now_ms: u64| {
+        publish::pass(
+            paths,
+            config,
+            None,
+            &publish::Pass {
+                by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                now_ms,
+                journal: Some(&spool),
+            },
+        )
+    };
+    let queue_only = write::Env {
+        attempt: Duration::ZERO,
+        ..env()
+    };
+    let queue = |note: &str| {
+        let (answer, _) = run_verb(
+            paths,
+            config,
+            &["set", "lab/machines", "m7", "note", note],
+            &queue_only,
+        )
+        .unwrap();
+        assert!(answer.starts_with("queued "), "{answer}");
+        id_of(&answer)
+    };
+    let times = |op: &str| -> Vec<u64> {
+        decided_in(&spool)
+            .iter()
+            .filter(|event| event.op.as_ref().map(EventWord::as_str) == Some(&op[..16]))
+            .map(|event| event.t)
+            .collect()
+    };
+    let marked_ms = |id: &str| {
+        stand
+            .file(&super::MACHINES)
+            .outbox()
+            .done
+            .into_iter()
+            .find(|done| done.intent.id == id)
+            .map(|done| done.ms)
+    };
+    let mut clock = NOW;
+    let mut ops = Vec::new();
+    for (stop, note) in [
+        (Stop::AfterSign, "signed"),
+        (Stop::AfterMarker, "marked"),
+        (Stop::AfterNote, "noted"),
+    ] {
+        let id = queue(note);
+        publish::seam::kill_at(stop);
+        let killed = clock;
+        let outcomes = publish_at(killed);
+        assert!(
+            matches!(answer_of(&outcomes, &id), Answer::Queued { .. }),
+            "{stop:?}: {outcomes:?}"
+        );
+        clock += 60_000;
+        let Answer::Published { op: Some(op) } = answer_of(&publish_at(clock), &id) else {
+            panic!("{stop:?}: not published")
+        };
+        let (at, count) = match stop {
+            Stop::AfterSign => (clock, 1),
+            Stop::AfterMarker => (killed, 1),
+            Stop::AfterNote => (killed, 2),
+        };
+        assert_eq!(marked_ms(&id), Some(at), "{stop:?}: the marker's time");
+        assert_eq!(times(&op), vec![at / 1000; count], "{stop:?}");
+        assert!(stand.file(&super::MACHINES).outbox().queued.is_empty());
+        clock += 60_000;
+        ops.push(op);
+    }
+    // Another pass recovers a marked intent while this one is about to.
+    let id = queue("recovered");
+    publish::seam::kill_at(Stop::AfterMarker);
+    let marked = clock;
+    publish_at(marked);
+    let (other_paths, other_config, other_spool) = (paths.clone(), config.clone(), spool.clone());
+    let recovered = clock + 30_000;
+    publish::seam::before_next_claim(move || {
+        drop(publish::pass(
+            &other_paths,
+            &other_config,
+            None,
+            &publish::Pass {
+                by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                now_ms: recovered,
+                journal: Some(&other_spool),
+            },
+        ));
+    });
+    clock += 60_000;
+    let Answer::Published { op: Some(op) } = answer_of(&publish_at(clock), &id) else {
+        panic!("the recovered intent is published")
+    };
+    assert_eq!(times(&op).len(), 1, "noted by the pass that recovered it");
+    assert_eq!(times(&op), [marked / 1000]);
+    ops.push(op);
+
+    // The flusher publishes one event per operation, and ai/events holds one row each.
+    let t = clock / 1000;
+    flush::pass(paths, &spool, &Presence::default, false, t).unwrap();
+    let flushed = flush::pass(
+        paths,
+        &spool,
+        &Presence::default,
+        false,
+        t + crate::alab::journal::book::ROUTINE_S,
+    )
+    .unwrap();
+    assert!(
+        matches!(flushed, flush::Flushed::Wrote { events: 4, .. }),
+        "{flushed:?}"
+    );
+    all(&stand, &stand.pass(true), Word::Live, None);
+    let events = stand.file(&super::EVENTS).read();
+    let mut decided: Vec<&str> = events
+        .rows()
+        .iter()
+        .filter(|row| row.cell("kind") == "decided")
+        .map(|row| row.cell("op"))
+        .collect();
+    decided.sort_unstable();
+    let mut expected: Vec<&str> = ops.iter().map(|op| &op[..16]).collect();
+    expected.sort_unstable();
+    assert_eq!(decided, expected);
 }
 
 /// A person's `outbox drop` of an intent a pass has read but not yet claimed wins: the pass
@@ -5041,13 +5656,18 @@ fn read_by_0_201(event: &Value) -> bool {
 /// `ai/usage` and `ai/events` from the ring, holds a row the peer wrote at this Mac's key inert
 /// (in no file, counted in the status), and folds `ai/limits`: the peer's hour-resolution
 /// reading and this Mac's exact one of one week are one instance (the largest percent at the
-/// latest reset), whichever Mac's clock read last; a later week replaces them.
+/// latest reset), whichever Mac's clock read last; a later week replaces them. A wall of a
+/// model's own week shows its model's bucket in `ai/events`' `model` column (FL-269), and the
+/// older peer drops that event, whose key it lacks; the peer's `ai/usage` row's Fable wall
+/// reaches `ai/limits`' `model_walls` past the pass's guards, beside no wall of the account's,
+/// and rotation reads it from the file on disk (`file::rotation`).
 ///
 /// NEGATIVE CONTROLS, observed: with the fold ordered by the reading Mac's clock
 /// (`limits::seam::fold_by_clock` held across the pass), this Mac's later-read 55% wins over the
 /// peer's 60%: `` left: Some(550) right: Some(600) ``; with `owned::read_owned` keeping a row at
 /// any machine's key, not only its signer's, the peer's row at this Mac's key replaces this
-/// Mac's own: `` left: "990" right: "550" ``.
+/// Mac's own: `` left: "990" right: "550" ``; with `materialize::guard_computed` withholding
+/// the `model_walls` cell, the peer's Fable wall is lost: `` left: None ``.
 #[test]
 fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_merge_by_reset_and_a_foreign_row_is_inert()
  {
@@ -5065,9 +5685,22 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
     let t = NOW / 1000;
     let (peer, me, old) = (uuid_of(lab, PEER), uuid_of(lab, SEAT), uuid_of(lab, OLD));
 
-    // The peer, on this build: its login, its reading of the week to the hour (60% at RESET),
-    // a row at this Mac's key, and events of the words only this build has.
+    // The peer, on this build: its login, its reading of the week to the hour (60% at RESET)
+    // with its standing wall of Fable's own week in `model_walls` (FL-269), a row at this Mac's
+    // key, and events of the words only this build has.
+    let fable_until = RESET + 86_400_000;
     let mut record = Stand::ring_rows(&ada, &peer, 600, RESET, 1);
+    for change in &mut record {
+        if change.collection == USAGE.name
+            && let Some(row) = change.value.as_mut().and_then(Value::as_object_mut)
+        {
+            row.insert("r".into(), json!(USAGE.version));
+            row.insert(
+                "model_walls".into(),
+                json!([{"bucket": "seven_day_overage_included", "until": fable_until}]),
+            );
+        }
+    }
     record.push(ring_row(
         &USAGE,
         &format!("{ada}.{me}"),
@@ -5083,6 +5716,7 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
         cli: EventWord::new("claude").unwrap(),
         sub: None,
         window: None,
+        model: None,
         pct_x10: None,
         reset: None,
         res: None,
@@ -5102,15 +5736,24 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
         cli: EventWord::new("aterm").unwrap(),
         src: Source::File,
         op: EventWord::new("0123456789abcdef"),
-        via: EventWord::new("set"),
+        via: Some(crate::alab::journal::Via::Set),
         program: EventWord::new("claude"),
         ..event(Kind::Decided)
+    };
+    // A wall of Fable's own week names its model's bucket (FL-269), a key the older peer lacks.
+    let model_wall = Event {
+        window: Some(crate::alab::journal::Window::WeekModel),
+        model: Some(crate::alab::journal::ModelBucket::Fable),
+        until: Some(t + 86_400),
+        src: Source::Statusline,
+        ..event(Kind::Wall)
     };
     let batch: Vec<Value> = [
         event(Kind::SessionStart),
         event(Kind::SignInBlocked),
         event(Kind::NoRoute),
         decided,
+        model_wall,
     ]
     .iter()
     .map(Event::to_value)
@@ -5255,11 +5898,22 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
         "sign-in-blocked",
         "no-route",
         "decided",
+        "wall",
         "session-end",
         "quota",
     ] {
         assert!(kinds.contains(&kind), "{kind}: {kinds:?}");
     }
+    let walled = events
+        .rows()
+        .iter()
+        .find(|row| row.cell("kind") == "wall")
+        .unwrap();
+    assert_eq!(
+        (walled.cell("window"), walled.cell("model")),
+        ("7d-model", "seven_day_overage_included"),
+        "a model's wall names its model"
+    );
     let decided = events
         .rows()
         .iter()
@@ -5298,6 +5952,30 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
         "the older peer states no reading"
     );
     assert_eq!(week.cell("account_slug"), "claude-fb-alpha");
+    // The peer's Fable wall: in `model_walls` past the pass's guards, apart from the account's
+    // own `wall`, and read back from the file on disk as rotation reads it.
+    let fable_wall = json!([{"bucket": "seven_day_overage_included", "until": fable_until}]);
+    assert_eq!(
+        week.values.get("model_walls"),
+        Some(&fable_wall),
+        "{week:?}"
+    );
+    assert_eq!(week.cell("wall"), "none");
+    let rotation = super::rotation(stand.paths());
+    assert_eq!(
+        rotation.model_walls.get(&ada),
+        Some(
+            &[("seven_day_overage_included".to_owned(), fable_until)]
+                .into_iter()
+                .collect()
+        ),
+        "{rotation:?}"
+    );
+    assert_eq!(
+        rotation.walls.get(&ada),
+        None,
+        "no wall of the account's own"
+    );
 
     // A LATER WEEK: the peer reads the next instance at 3%, and it replaces both readings.
     state_ring(
@@ -5315,6 +5993,655 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
     assert_eq!(
         next.values.get("w7d_reset").and_then(Value::as_u64),
         Some(RESET + 7 * 86_400_000)
+    );
+}
+
+/// A shared file of the version 2 fixture generation's Macs (`att::said_tests::SAID`), whose
+/// records say who made them.
+const SAID_FILE: Type = Type {
+    name: "lab/said",
+    about: "the lab's Macs, in a generation that takes version 2 records",
+    class: Class::Owner,
+    store: Store::Table {
+        family: &att::said_tests::SAID,
+        collection: &MACHINE,
+    },
+    computed: Computed::Machines,
+    handles: &["label", "nickname"],
+};
+
+/// The files a pass over the fixture generation publishes.
+const SAID_FILES: [Type; 1] = [SAID_FILE];
+
+/// AN OUTBOX INTENT KEEPS ITS ATTESTED PRINCIPAL (TK-03; design §7, finding 5): what the
+/// author's verb read in its own process of who made the write (its aterm session and agent,
+/// from its lineage, never its environment; `said::here`), with its reason and evidence, is
+/// kept in the intent from the moment it is accepted, and the record that publishes it carries
+/// exactly that, whichever process publishes it: another agent's verb draining the outbox, or
+/// the owner's minute pass, neither of which states anything of its own.
+///
+/// * The verb's intent keeps the statement, and so does its done marker once it is published.
+///   The registry takes version 1 records only, so its record carries none (the builds that
+///   read it would refuse one).
+/// * In a generation that takes version 2 records, one pass publishes two agents' intents, and
+///   each record carries its own intent's principal, reason and evidence; another Mac reads them
+///   from the signed record.
+///
+/// IN-TEST NEGATIVE CONTROLS: an intent that states no principal (one a build before version 2
+/// queued) is signed stating none, never the publisher's or another intent's; one whose
+/// statement breaks its rules is held, never signed with it dropped, where the generation takes
+/// statements, and signed as any other where it takes none (the registry).
+///
+/// NEGATIVE CONTROL, observed: with the publisher stating who made a record from its own
+/// process (`said::here` in `Writer::settle`, in place of the intent's statement), the first
+/// agent's record names the publisher, and the test fails at `the record carries the author's
+/// statement`.
+#[test]
+fn an_outbox_intent_keeps_its_attested_principal() {
+    use crate::{
+        att::said_tests::SAID,
+        said::Said,
+        typed::{
+            grid::tests::{MC, machine},
+            values::{Evidence, Principal},
+        },
+    };
+    let agent = |session: &str, program: &str| Said {
+        principal: Principal {
+            session: Some(session.to_owned()),
+            program: Some(program.to_owned()),
+            ..Principal::default()
+        },
+        reason: Some(format!("{program} edits a Mac")),
+        evidence: vec![Evidence::note(&format!("{program} saw it"))],
+    };
+    let a = agent("s-aaaaaaaaaaaaaaaaaaaa", "claude");
+    let b = agent("tqn5r6e0148", "codex");
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config) = (stand.paths(), &stand.config);
+
+    // The author's verb queues, and its own attempt publishes nothing.
+    let quiet = write::Env {
+        said: Some(&a),
+        attempt: Duration::ZERO,
+        ..env()
+    };
+    let (answer, _) = run_verb(
+        paths,
+        config,
+        &["set", "lab/machines", "m7", "note", "kept"],
+        &quiet,
+    )
+    .unwrap();
+    let id = id_of(&answer);
+    let queued = stand.file(&super::MACHINES).outbox().queued;
+    let intent = queued.iter().find(|intent| intent.id == id).unwrap();
+    assert_eq!(intent.said, Some(a.to_value()), "the intent keeps it");
+    // Another process publishes it, stating nothing of its own.
+    let Answer::Published { .. } = answer_of(&publish_pass(paths, config), &id) else {
+        panic!("published")
+    };
+    let done = stand.file(&super::MACHINES).outbox().done;
+    let marker = done.iter().find(|done| done.intent.id == id).unwrap();
+    assert_eq!(
+        marker.intent.said,
+        Some(a.to_value()),
+        "its marker keeps it"
+    );
+    let request = |id: &str| {
+        let mut request = [0; 16];
+        assert!(aterm_codec::hex::decode_into(id.as_bytes(), &mut request));
+        Some(request)
+    };
+    let registry = att::Handle::at(paths.clone(), &att::REGISTRY)
+        .history()
+        .unwrap();
+    let entry = registry
+        .iter()
+        .find(|entry| entry.request == request(&id))
+        .unwrap();
+    assert_eq!(
+        entry.said, None,
+        "the registry takes version 1 records only"
+    );
+    // A statement the registry would not carry never holds its write, not even one this build
+    // refuses (a later build's statement is no reason to stop).
+    let unjudged = stand
+        .file(&super::MACHINES)
+        .write(
+            &seam::owner().saying(json!({"principal": {}})).unwrap(),
+            aterm_file::Draft {
+                born: false,
+                revert: None,
+                edits: vec![aterm_file::Edit {
+                    key: stand.machine.clone(),
+                    column: "location".to_owned(),
+                    elem: None,
+                    value: json!("rack c"),
+                    text: "rack c".to_owned(),
+                    expected: Vec::new(),
+                    judged: aterm_file::outbox::Judged::Text,
+                }],
+            },
+            NOW,
+        )
+        .unwrap()
+        .id
+        .clone();
+    let Answer::Published { .. } = answer_of(&publish_pass(paths, config), &unjudged) else {
+        panic!("published")
+    };
+
+    // A generation that takes version 2 records, a row in it.
+    application_declare(paths, &SAID);
+    let row = att::Handle::at(paths.clone(), &SAID)
+        .commit_owner(|_| Ok(((), vec![machine(MC)])))
+        .unwrap()
+        .1
+        .operations[0];
+    let born = vec![aterm_codec::hex::encode_lower(&row)];
+    let edit = |column: &str, value: &str, expected: &[String]| aterm_file::Edit {
+        key: MC.to_owned(),
+        column: column.to_owned(),
+        elem: None,
+        value: json!(value),
+        text: value.to_owned(),
+        expected: expected.to_vec(),
+        judged: aterm_file::outbox::Judged::Text,
+    };
+    let draft = |edits| aterm_file::Draft {
+        born: false,
+        revert: None,
+        edits,
+    };
+    let file = File::at(&super::root(paths), &SAID_FILE.file());
+    let saying = |said: Value| seam::owner().saying(said).unwrap();
+    let queue =
+        |act: &aterm_file::OwnerAct, edits| file.write(act, draft(edits), NOW).unwrap().id.clone();
+    let by_a = queue(
+        &saying(a.to_value()),
+        vec![edit("note", "kept by claude", &[])],
+    );
+    let unsaid = queue(&seam::owner(), vec![edit("status", "parked", &born)]);
+    let by_b = queue(
+        &saying(b.to_value()),
+        vec![edit("location", "rack b", &born)],
+    );
+    let malformed = queue(
+        &saying(json!({"principal": {}})),
+        vec![edit("note", "said by nobody", &[])],
+    );
+
+    // One pass publishes every intent of the file, stating nothing of its own.
+    let outcomes = publish::pass_over(
+        paths,
+        config,
+        &SAID_FILES,
+        &publish::Pass {
+            by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            now_ms: NOW,
+            journal: None,
+        },
+    );
+    for id in [&by_a, &unsaid, &by_b] {
+        let Answer::Published { .. } = answer_of(&outcomes, id) else {
+            panic!("{id}: {outcomes:?}")
+        };
+    }
+    let Answer::Held { why } = answer_of(&outcomes, &malformed) else {
+        panic!("held: {outcomes:?}")
+    };
+    assert!(why.contains("statement of who made it"), "{why}");
+
+    // The signed records say it, here and on another Mac: the catalog, then this table, are
+    // repaired first, so the round reaches it whatever order it takes the lab's tables in.
+    let trust = stand.lab.bootstrap(SEAT).trust();
+    let clocks = [NOW / 1000; 2];
+    let members = [0, SEAT];
+    repair_commons_among_first(
+        &stand.lab,
+        1,
+        &members,
+        &clocks,
+        crate::catalog::scope(trust).digest(),
+    );
+    repair_commons_among_first(
+        &stand.lab,
+        2,
+        &members,
+        &clocks,
+        SAID.descriptor(trust).unwrap().scope.digest(),
+    );
+    for at in [SEAT, 0] {
+        let history = att::Handle::at(stand.lab.paths[at].clone(), &SAID)
+            .history()
+            .unwrap();
+        let said_by = |id: &str| {
+            history
+                .iter()
+                .find(|entry| entry.request == request(id))
+                .unwrap_or_else(|| panic!("Mac {at} holds {id}"))
+                .said
+                .clone()
+        };
+        assert_eq!(
+            said_by(&by_a),
+            Some(a.clone()),
+            "the record carries the author's statement"
+        );
+        assert_eq!(said_by(&by_b), Some(b.clone()));
+        assert_eq!(said_by(&unsaid), None, "no statement is filled in");
+    }
+}
+
+/// Declare `compiled` on Mac `paths` and enroll its store.
+fn application_declare(paths: &Paths, compiled: &'static att::Compiled) {
+    crate::documents::application::with_store(
+        paths,
+        true,
+        |bootstrap| compiled.descriptor(bootstrap.trust()),
+        |_, _, _| Ok(()),
+    )
+    .unwrap();
+}
+
+/// A READ THAT HOLDS A RECORD THIS BUILD REFUSES SAYS HOW MANY AND WHOSE (TK-03; design §7,
+/// finding 2 as re-planned 2026-11-15). A record this build cannot decode is inert, not a stop:
+/// this Mac keeps writing, and its reads lack that record's cells. So whenever a read holds
+/// such records, one sentence (`typed::refused_words`) says how many, and each one's signer and
+/// why, and history, diff and a shared file's status print it. Here Mac 0 signs two registry
+/// records this build refuses, one a later build's encoding (`"v":3`), one not canonical, and
+/// Mac 1 reads them: its view stays complete, its view, history, diff and `aterm file status`
+/// each say `2 records held here are not read`, naming Mac 0 and each reason, and it still
+/// publishes a write.
+///
+/// IN-TEST NEGATIVE CONTROL: before Mac 0 signs them, the same reads say nothing (`null`, and no
+/// sentence in the status line).
+///
+/// NEGATIVE CONTROL, observed: with `Log::refusals` naming no record, the test fails at `the
+/// view says how many and whose`; with the materializer's projection leaving `refused` out, at
+/// `the status says it` (`left: Null`).
+#[test]
+fn a_read_that_holds_a_record_this_build_refuses_says_how_many_and_whose() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config) = (stand.paths(), &stand.config);
+    let root = super::root(paths);
+    let table = |words: &[&str]| -> Value {
+        let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+        match att::command::run(paths, &words, &mut |_, _| panic!("no editor"), &mut |_| {})
+            .unwrap()
+        {
+            att::command::Output::Json(json) => json,
+            att::command::Output::Text(text) => panic!("{text}"),
+        }
+    };
+    let first = table(&["history", "alab/registry"])["operations"][0]["operation"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reads = |stand: &Stand| {
+        stand.pass(false);
+        let view = att::Handle::at(paths.clone(), &att::REGISTRY)
+            .view()
+            .unwrap();
+        let status: Value =
+            aterm_json::from_str(&verb(&root, &["status", super::MACHINES.name, "--json"]))
+                .unwrap();
+        (
+            view,
+            table(&["history", "alab/registry"])["refused"].clone(),
+            table(&["diff", "alab/registry", &first, "head"])["refused"].clone(),
+            status["refused"].clone(),
+            verb(&root, &["status", super::MACHINES.name]),
+        )
+    };
+
+    // Nothing refused: nothing said.
+    let (view, history, diff, status, line) = reads(&stand);
+    assert_eq!(view.refused_words(), None);
+    assert_eq!(
+        (history, diff, status),
+        (Value::Null, Value::Null, Value::Null)
+    );
+    assert!(!line.contains("not read"), "{line}");
+
+    // Mac 0 signs two records this build refuses.
+    let write = |request: u8, note: &str| {
+        crate::database::Command::Write {
+            request: [request; 16],
+            changes: vec![grid::tests::put(
+                &MACHINE,
+                &stand.machine,
+                "note",
+                json!(note),
+            )],
+            said: None,
+        }
+        .encode()
+        .unwrap()
+    };
+    let later = String::from_utf8(write(1, "a later build's"))
+        .unwrap()
+        .replace("\"v\":1", "\"v\":3");
+    let loose = format!(
+        "{{ {}",
+        String::from_utf8(write(2, "not canonical"))
+            .unwrap()
+            .strip_prefix('{')
+            .unwrap()
+    );
+    repair_commons_among(&stand.lab, 3, &[0, SEAT], &[NOW / 1000; 2]);
+    for payload in [later, loose] {
+        att::said_tests::sign_raw(&stand.lab.paths[0], &att::REGISTRY, payload.as_bytes());
+    }
+    repair_commons_among(&stand.lab, 3, &[0, SEAT], &[NOW / 1000; 2]);
+
+    let (view, history, diff, status, line) = reads(&stand);
+    assert!(view.complete, "the read is complete all the same");
+    assert_eq!(view.refused.len(), 2);
+    let signer: String = keys::uuid32(&stand.lab.machine(0))
+        .chars()
+        .take(8)
+        .collect();
+    let said = view
+        .refused_words()
+        .expect("the view says how many and whose");
+    assert!(
+        said.starts_with("2 records held here are not read: "),
+        "{said}"
+    );
+    for why in [
+        "unsupported database application schema",
+        "typed table payload is not canonical",
+    ] {
+        assert!(
+            said.contains(&format!("1 signed by {signer} ({why})")),
+            "{said}"
+        );
+    }
+    assert_eq!(history, json!(said), "history says it");
+    assert_eq!(diff, json!(said), "diff says it");
+    assert_eq!(status, json!(said), "the status says it");
+    assert!(line.contains(&format!(" \u{b7} {said}")), "{line}");
+
+    // And Mac 1 still writes.
+    let quiet = write::Env {
+        attempt: Duration::ZERO,
+        ..env()
+    };
+    let (answer, _) = run_verb(
+        paths,
+        config,
+        &["set", "lab/machines", "m7", "location", "rack d"],
+        &quiet,
+    )
+    .unwrap();
+    let Answer::Published { .. } = answer_of(&publish_pass(paths, config), &id_of(&answer)) else {
+        panic!("published: {answer}")
+    };
+}
+
+/// A read of `file` that says `word`, with a snapshot of `rows` (none where `rows` is `None`).
+fn rotation_read(file: &Type, word: Word, rows: Option<Vec<aterm_file::Row>>) -> aterm_file::Read {
+    aterm_file::Read {
+        status: aterm_file::Status {
+            word,
+            why: None,
+            state: None,
+            problem: None,
+            queued: 0,
+            held: 0,
+        },
+        snapshot: rows.map(|rows| aterm_file::Snapshot {
+            name: file.file(),
+            kind: file.kind().to_owned(),
+            ext: super::types::TSV.to_owned(),
+            rev: 1,
+            complete: true,
+            at_ms: NOW,
+            columns: Vec::new(),
+            handles: Vec::new(),
+            rows,
+        }),
+    }
+}
+
+/// A snapshot row `pk`, live or not, with `values` and the face cells `cells`.
+fn rotation_row(
+    pk: &str,
+    live: bool,
+    values: &[(&str, Value)],
+    cells: &[(&str, &str)],
+) -> aterm_file::Row {
+    aterm_file::Row {
+        pk: pk.to_owned(),
+        live,
+        cells: cells
+            .iter()
+            .map(|(column, text)| ((*column).to_owned(), (*text).to_owned()))
+            .collect(),
+        values: values
+            .iter()
+            .map(|(column, value)| ((*column).to_owned(), value.clone()))
+            .collect(),
+    }
+}
+
+/// THE ROTATION READER (SF-09): what rotation and sign-in read of the shared files is this Mac's
+/// own `ai/links` ranks, each account's latest stated wall end in `ai/limits` (a sub-account's
+/// row counting for its account) and each model's own (FL-269: by its bucket, beside the
+/// account's, a bucket word this build does not know as `seven_day_other`'s; an older build's
+/// `7d-model` is neither), and each account's newest blocked attempt among the live
+/// `ai/logins` rows of every Mac, keyed by account. A `none` wall, a wall with no end, another
+/// Mac's link, a dead link or login row and a login row with no time say nothing; a file whose
+/// word is `off` and a missing registry snapshot contribute nothing, and leave the other parts
+/// as they were. `rotation` reads the same from the files on disk, keeps it while no file's
+/// mark moves, and reads again once one does.
+/// NEGATIVE CONTROL: with `Rotation::of_reads` keeping every Mac's link rows rather than this
+/// Mac's (`filter(|p| &p.machine == me)` dropped), the rank names the other Mac's rank for `a`:
+/// `` left: {"ac-a": 1, …} right: {"ac-a": 2, …} ``.
+#[test]
+fn rotation_reads_this_macs_link_ranks_each_accounts_wall_and_its_newest_blocked_attempt() {
+    use super::{ACCOUNTS, LIMITS, LINKS, LOGINS, MACHINES, Rotation};
+    use std::collections::BTreeMap;
+    const UUID_1: &str = "0123456789abcdef0123456789abcdef";
+    const UUID_2: &str = "fedcba9876543210fedcba9876543210";
+    let at = |offset: u64| NOW + offset;
+    let account = |pk: &str| rotation_row(pk, true, &[], &[]);
+    let accounts = vec![account("ac-a"), account("ac-b"), account("ac-c")];
+    let machines = vec![
+        rotation_row("mc-here", true, &[], &[("here", "yes")]),
+        rotation_row("mc-other", true, &[], &[]),
+    ];
+    let link = |pk: &str, machine: &str, account: &str, rank: Option<u64>, live: bool| {
+        let mut values = vec![("machine", json!(machine)), ("account", json!(account))];
+        if let Some(rank) = rank {
+            values.push(("rank", json!(rank)));
+        }
+        rotation_row(pk, live, &values, &[])
+    };
+    let links = vec![
+        link("pf-a", "mc-here", "ac-a", Some(2), true),
+        link("pf-a-again", "mc-here", "ac-a", Some(5), true),
+        link("pf-b", "mc-here", "ac-b", Some(1), true),
+        link("pf-c", "mc-here", "ac-c", None, true),
+        link("pf-c-dead", "mc-here", "ac-c", Some(0), false),
+        link("pf-other", "mc-other", "ac-a", Some(1), true),
+    ];
+    let wall = |pk: &str, account: &str, wall: &str, until: Option<u64>| {
+        let mut values = vec![("account", json!(account)), ("wall", json!(wall))];
+        if let Some(until) = until {
+            values.push(("wall_until", json!(until)));
+        }
+        rotation_row(pk, true, &values, &[])
+    };
+    // Each model's own weekly wall stands apart from the account's (FL-269): by its bucket, a
+    // sub-account's for its account, the latest end kept and one with no end left out.
+    let modeled = |pk: &str, account: &str, wall: &str, walls: &[(&str, Option<u64>)]| {
+        let walls: Vec<_> = walls
+            .iter()
+            .map(|(bucket, until)| match until {
+                Some(until) => json!({"bucket": bucket, "until": until}),
+                None => json!({"bucket": bucket}),
+            })
+            .collect();
+        rotation_row(
+            pk,
+            true,
+            &[
+                ("account", json!(account)),
+                ("wall", json!(wall)),
+                ("model_walls", json!(walls)),
+            ],
+            &[],
+        )
+    };
+    let fable = "seven_day_overage_included";
+    let limits = vec![
+        wall("ac-a", "ac-a", "7d", Some(at(5_000))),
+        // A sub-account of `a` walled to an earlier end, and one of `b` walled at all.
+        wall("sa-a1", "ac-a", "5h", Some(at(1_000))),
+        wall("sa-b1", "ac-b", "5h", Some(at(3_000))),
+        wall("ac-b", "ac-b", "none", Some(at(9_000))),
+        wall("ac-c", "ac-c", "5h", None),
+        // An older build's `7d-model`, which names no model: no account's wall, and no model's.
+        wall("sa-c1", "ac-c", "7d-model", Some(at(8_000))),
+        modeled(
+            "sa-a2",
+            "ac-a",
+            "none",
+            &[(fable, Some(at(6_000))), ("seven_day_opus", None)],
+        ),
+        modeled("sa-a3", "ac-a", "none", &[(fable, Some(at(4_000)))]),
+        modeled(
+            "sa-b2",
+            "ac-b",
+            "none",
+            &[
+                ("seven_day_sonnet", Some(at(7_000))),
+                ("seven_day_other", Some(at(7_500))),
+                // A word this build does not know: a week of a model it names no bucket of.
+                ("seven_day_haiku", Some(at(8_500))),
+            ],
+        ),
+    ];
+    let login = |account: &str, uuid: &str, attempt: &str, when: Option<u64>, live: bool| {
+        let mut values = vec![("account", json!(account)), ("attempt", json!(attempt))];
+        if let Some(when) = when {
+            values.push(("attempt_at", json!(when)));
+        }
+        rotation_row(&format!("{account}.{uuid}"), live, &values, &[])
+    };
+    let logins = vec![
+        login("ac-a", UUID_1, "blocked", Some(at(100)), true),
+        login("ac-a", UUID_2, "blocked", Some(at(200)), true),
+        login("ac-b", UUID_1, "failed", Some(at(300)), true),
+        login("ac-c", UUID_1, "blocked", Some(at(400)), false),
+        login("ac-c", UUID_2, "blocked", None, true),
+    ];
+    let reads = |word: [Word; 5], machines_here: bool| {
+        [
+            rotation_read(&ACCOUNTS, word[0], Some(accounts.clone())),
+            rotation_read(&LINKS, word[1], Some(links.clone())),
+            rotation_read(&MACHINES, word[2], machines_here.then(|| machines.clone())),
+            rotation_read(&LIMITS, word[3], Some(limits.clone())),
+            rotation_read(&LOGINS, word[4], Some(logins.clone())),
+        ]
+    };
+    let of = |[accounts, links, machines, limits, logins]: [aterm_file::Read; 5]| {
+        Rotation::of_reads(&accounts, &links, &machines, &limits, &logins)
+    };
+    let map = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), *value))
+            .collect()
+    };
+    let expected = Rotation {
+        rank: map(&[("ac-a", 2), ("ac-b", 1)]),
+        walls: map(&[("ac-a", at(5_000)), ("ac-b", at(3_000))]),
+        model_walls: [
+            ("ac-a".to_owned(), map(&[(fable, at(6_000))])),
+            (
+                "ac-b".to_owned(),
+                map(&[
+                    ("seven_day_sonnet", at(7_000)),
+                    ("seven_day_other", at(8_500)),
+                ]),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        blocked: map(&[("ac-a", at(200))]),
+    };
+    let live = [Word::Live; 5];
+    assert_eq!(of(reads(live, true)), expected);
+    // A held snapshot still answers.
+    assert_eq!(of(reads([Word::Held; 5], true)), expected);
+    // `ai/limits` off: no wall, the rest as it was.
+    let limits_off = [Word::Live, Word::Live, Word::Live, Word::Off, Word::Live];
+    assert_eq!(
+        of(reads(limits_off, true)),
+        Rotation {
+            walls: BTreeMap::new(),
+            model_walls: BTreeMap::new(),
+            ..expected.clone()
+        }
+    );
+    // A registry file off, or no `lab/machines` snapshot here: no rank, the rest as it was.
+    let links_off = [Word::Live, Word::Off, Word::Live, Word::Live, Word::Live];
+    let no_rank = Rotation {
+        rank: BTreeMap::new(),
+        ..expected.clone()
+    };
+    assert_eq!(of(reads(links_off, true)), no_rank);
+    assert_eq!(of(reads(live, false)), no_rank);
+    // No snapshot of any file: nothing.
+    let none = [&ACCOUNTS, &LINKS, &MACHINES, &LIMITS, &LOGINS]
+        .map(|file| rotation_read(file, Word::Never, None));
+    assert_eq!(of(none), Rotation::default());
+
+    // THE FILES ON DISK: the same facts, kept while no mark moves.
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&home.path().join("m9"));
+    let root = super::root(&paths);
+    let put = |file: &Type, word: Word, rows: &[aterm_file::Row], rev: u64| {
+        let name = file.file();
+        std::fs::create_dir_all(root.state_dir(&name)).unwrap();
+        let mut read = rotation_read(file, word, Some(rows.to_vec()));
+        let snapshot = read.snapshot.as_mut().unwrap();
+        snapshot.rev = rev;
+        aterm_secrets::fsx::write_atomic(&root.snapshot(&name), &snapshot.encode(), 0o600).unwrap();
+        let state = aterm_file::State {
+            word: Some(word),
+            rev,
+            ..aterm_file::State::default()
+        };
+        aterm_secrets::fsx::write_atomic(&root.state(&name), &state.encode(), 0o600).unwrap();
+    };
+    assert_eq!(*super::rotation(&paths), Rotation::default());
+    put(&ACCOUNTS, Word::Live, &accounts, 1);
+    put(&LINKS, Word::Live, &links, 1);
+    put(&MACHINES, Word::Live, &machines, 1);
+    put(&LIMITS, Word::Live, &limits, 1);
+    put(&LOGINS, Word::Live, &logins, 1);
+    let first = super::rotation(&paths);
+    assert_eq!(*first, expected);
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &super::rotation(&paths)),
+        "nothing moved: the kept read answers"
+    );
+    put(&LIMITS, Word::Off, &limits, 2);
+    let moved = super::rotation(&paths);
+    assert_eq!(
+        *moved,
+        Rotation {
+            walls: BTreeMap::new(),
+            model_walls: BTreeMap::new(),
+            ..expected
+        }
     );
 }
 
@@ -5548,6 +6875,7 @@ fn a_logs_file_shows_a_commit_a_command_and_evidence_as_their_types_admit_them()
         commit: COMMIT.to_owned(),
     };
     let note = json!({
+        "on": "package",
         "about": "tk-05",
         "text": format!("landed at {COMMIT}"),
         "evidence": [evidence.to_value()],
@@ -5593,4 +6921,325 @@ fn a_logs_file_shows_a_commit_a_command_and_evidence_as_their_types_admit_them()
     let row = measures.rows().iter().find(|row| row.pk == measured[0]);
     assert_eq!(row.unwrap().cell("commit"), COMMIT);
     assert_eq!(row.unwrap().cell("source"), SOURCE);
+}
+
+/// The tracker's packages as the publication repo held them (`testdata/publication-384b3a9f`):
+/// every column a TSV of the corpus has, its key `id` the table's own.
+const PACKAGE_COLUMNS: [crate::typed::Column; 17] = {
+    use crate::typed::{Column, Ty};
+    const PROSE: Ty = Ty::Prose(16 * 1024);
+    [
+        Column::new("lane", PROSE).null(),
+        Column::new("order", PROSE).null(),
+        Column::new("goal", PROSE).null(),
+        Column::new("title", PROSE).null(),
+        Column::new("outcome", PROSE).null(),
+        Column::new("repo", PROSE).null(),
+        Column::new("owns", PROSE).null(),
+        Column::new("depends", PROSE).null(),
+        Column::new("exit_command", PROSE).null(),
+        Column::new("exit_expect", PROSE).null(),
+        Column::new("size", PROSE).null(),
+        Column::new("state", PROSE).null(),
+        Column::new("claimed_by", PROSE).null(),
+        Column::new("claimed_on", PROSE).null(),
+        Column::new("done_on", PROSE).null(),
+        Column::new("evidence", PROSE).null(),
+        Column::new(
+            crate::typed::LIFECYCLE,
+            Ty::Enum(crate::alab::registry::LIFE),
+        ),
+    ]
+};
+
+crate::att_collection!(
+    /// The packages of a tracker family the owner writes: the corpus' columns, no computed or
+    /// claimed one, so a pass after one record patches the last projection (package TK-09).
+    PACKAGE = crate::typed::Collection {
+        name: "package",
+        version: 1,
+        kind: crate::typed::Kind::Cells,
+        writers: crate::typed::Writers::Owner,
+        prefix: "",
+        derive: crate::typed::Derive::Word,
+        columns: &PACKAGE_COLUMNS,
+        unique: &[],
+        max_row: 0,
+        authority: None,
+    }
+);
+
+/// A table generation holding [`PACKAGE`], under a family of its own no release compiles.
+const PACKAGES_TABLE: crate::typed::Table = crate::typed::Table {
+    application: "lab",
+    role: "packages",
+    collections: &[&PACKAGE],
+    faces: &[],
+    self_quota: crate::alab::registry::SELF_QUOTA,
+    ends: &[],
+};
+
+/// [`PACKAGES_TABLE`], compiled.
+const PACKAGES: att::Compiled = att::Compiled {
+    table: &PACKAGES_TABLE,
+    title: "Packages",
+    version: 1,
+    birth: |_, _, _| Err(crate::Error::new("a package's key is its id")),
+    guard: |_, _| Ok(None),
+    seeded: |_, _| false,
+    generation: 1,
+    successor: None,
+    records: 1,
+    rows_apart: false,
+};
+
+/// The packages file.
+const PACKAGES_FILE: Type = Type {
+    name: "lab/packages",
+    about: "the tracker's packages",
+    class: Class::Owner,
+    store: Store::Table {
+        family: &PACKAGES,
+        collection: &PACKAGE,
+    },
+    computed: Computed::None,
+    handles: &[],
+};
+
+const PACKAGES_FILES: [Type; 1] = [PACKAGES_FILE];
+
+/// The corpus' rows, each a map of its non-empty cells by column, the key left out.
+fn package_corpus() -> Vec<std::collections::BTreeMap<String, String>> {
+    let text = std::fs::read_to_string(
+        aterm_tempfile::manifest_dir().join("testdata/publication-384b3a9f/packages.tsv"),
+    )
+    .unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    lines
+        .map(|line| {
+            header
+                .iter()
+                .zip(line.split('\t'))
+                .filter(|(name, value)| **name != "id" && !value.is_empty())
+                // A value the guards refuse (a credential-shaped digest) is left out: the
+                // owner's write refuses it, and it is not what is measured here.
+                .filter(|(_, value)| aterm_value_guard::prose(value, 16 * 1024).is_ok())
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        })
+        .collect()
+}
+
+/// The changes that write the live package keyed `pk` with `cells`.
+fn package(
+    pk: &str,
+    cells: &std::collections::BTreeMap<String, String>,
+) -> Vec<crate::database::Change> {
+    cells
+        .iter()
+        .map(|(column, value)| put(&PACKAGE, pk, column, json!(value)))
+        .chain([put(&PACKAGE, pk, crate::typed::LIFECYCLE, json!("live"))])
+        .collect()
+}
+
+/// A lab whose two Macs declared the packages family and wrote `rows` into it, each every other
+/// row, and whose second Mac, the one whose files are read, holds every row. Within the counts
+/// a table generation is declared with today (`table::store::WRITER_BYTES`, `WRITER_RECORDS`):
+/// two writers hold a 5000-row corpus no one writer may, and each commit writes
+/// [`PACKAGE_BATCH`] rows, so no one write outlasts its admission minute.
+fn packages_lab(rows: Vec<Vec<crate::database::Change>>) -> (Lab, PathBuf) {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let config = lab._home.path().join("aterm.toml");
+    let trust = lab.bootstrap(SEAT).trust();
+    application_declare(&lab.paths[0], &PACKAGES);
+    repair_commons_first(&lab, 1, crate::catalog::scope(trust).digest());
+    application_declare(&lab.paths[SEAT], &PACKAGES);
+    let mut halves: [Vec<Vec<crate::database::Change>>; 2] = [Vec::new(), Vec::new()];
+    for (n, row) in rows.into_iter().enumerate() {
+        halves[n % 2].push(row);
+    }
+    for (mac, half) in halves.into_iter().enumerate() {
+        let handle = att::Handle::at(lab.paths[mac].clone(), &PACKAGES);
+        let mut half = half.into_iter().peekable();
+        while half.peek().is_some() {
+            let batch: Vec<_> = half.by_ref().take(PACKAGE_BATCH).collect();
+            handle.commit_owner(|_| Ok(((), batch))).unwrap();
+        }
+    }
+    repair_commons_first(&lab, 1, PACKAGES.descriptor(trust).unwrap().scope.digest());
+    (lab, config)
+}
+
+/// How many rows one commit of [`packages_lab`] writes.
+const PACKAGE_BATCH: usize = 500;
+
+/// One pass over the packages file; `again` projects though nothing moved.
+fn packages_pass(paths: &Paths, config: &std::path::Path, again: bool) -> Outcome {
+    let mut outcomes = materialize::pass_over(
+        paths,
+        config,
+        &PACKAGES_FILES,
+        &Pass {
+            read_by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            vault_wait: materialize::VAULT_WAIT,
+            again,
+            now_ms: NOW,
+        },
+    );
+    assert_eq!(outcomes.len(), 1);
+    let outcome = outcomes.remove(0);
+    assert_eq!(
+        (outcome.word, outcome.why, outcome.problem.as_deref()),
+        (Word::Live, None, None),
+        "{:?}",
+        outcome.detail
+    );
+    outcome
+}
+
+/// A 5000-ROW PACKAGES FAMILY HAS A FACE (package TK-09, docs/DESIGN-lab-tracker-2026-11-14.md
+/// §7, finding 16): the corpus' packages, cycled to 5000 rows, whose cells pass amacs's grid
+/// bound, project to a snapshot that is written and read back, and to a face within it
+/// (`aterm_file::MAX_FACE_BYTES`) that leaves out its widest columns until it fits, here
+/// `outcome` and `owns`, whose cells the snapshot keeps. The baseline of that revision reads
+/// back, every column's cells in it.
+///
+/// NEGATIVE CONTROL, observed: with `aterm_file::snapshot::face_columns` keeping every column,
+/// the face passes the bound and is not written: `` left: Missing right: Written ``.
+#[test]
+fn a_5000_row_packages_family_has_a_face() {
+    const ROWS: usize = 5000;
+    let corpus = package_corpus();
+    let (lab, config) = packages_lab(
+        (0..ROWS)
+            .map(|n| package(&format!("p{n:05}"), &corpus[n % corpus.len()]))
+            .collect(),
+    );
+    let paths = &lab.paths[SEAT];
+    packages_pass(paths, &config, false);
+
+    let root = super::root(paths);
+    let name = PACKAGES_FILE.file();
+    let file = File::at(&root, &name);
+    let read = file.read();
+    let snapshot = read.snapshot.as_ref().expect("the snapshot reads back");
+    assert_eq!(snapshot.rows.len(), ROWS);
+    let whole: usize = snapshot
+        .rows
+        .iter()
+        .map(|row| row.cells.values().map(|cell| cell.len() + 1).sum::<usize>())
+        .sum();
+    assert!(
+        whole as u64 > aterm_file::MAX_FACE_BYTES,
+        "every column's cells would pass the face's bound: {whole}"
+    );
+    assert_eq!(
+        snapshot.rows[0].cell("outcome"),
+        corpus[0]["outcome"],
+        "the snapshot keeps the column the face leaves out"
+    );
+    assert_eq!(file.face(), aterm_file::Face::Written);
+    let face = file.face_bytes().unwrap().unwrap();
+    assert!(
+        face.len() as u64 <= aterm_file::MAX_FACE_BYTES,
+        "{}",
+        face.len()
+    );
+    let face = String::from_utf8(face).unwrap();
+    let header: Vec<&str> = face.lines().next().unwrap().split('\t').collect();
+    assert_eq!(
+        header[..header.len() - 1],
+        PACKAGE_COLUMNS
+            .iter()
+            .map(|column| column.name)
+            .filter(|name| !["outcome", "owns"].contains(name))
+            .collect::<Vec<_>>(),
+        "the widest columns are left out"
+    );
+    assert!(
+        header.last().unwrap().starts_with("=pk@"),
+        "the key stays: {header:?}"
+    );
+    assert_eq!(face.lines().count(), ROWS + 1, "one line a row");
+    let rev = file.state().unwrap().rev;
+    let baseline = super::face::Baseline::decode(&file.baseline(rev).expect("a baseline"))
+        .expect("the baseline reads back");
+    assert_eq!(baseline.grid.rows.len(), ROWS);
+    assert!(!baseline.header.iter().any(|cell| cell.contains("outcome")));
+    assert!(baseline.grid.rows[0].1.contains_key("outcome"));
+}
+
+/// A MATERIALIZER PASS AFTER ONE RECORD AT 20000 ROWS TOUCHES O(Δ) ROWS (package TK-09, design
+/// §7, finding 16): after a pass over a 20000-row packages file, one record that changes one row
+/// and adds another is followed by a pass that projects, lays out and renders those two rows
+/// and no other (the rows `materialize::ROWS` and `aterm_file::snapshot::test_rows_touched`
+/// count), and what it writes is what a pass projecting every row writes: the snapshot, the
+/// face and the baseline of the next revision, compared with a pass of another process' caches
+/// (every cache of this one dropped).
+///
+/// NEGATIVE CONTROL, observed: with `materialize::patched` answering `None`, the second pass
+/// projects every row: `` the pass after one record touched 120006 rows ``.
+#[test]
+fn materialize_pass_after_one_record_at_20000_touches_o_delta_rows() {
+    const ROWS: usize = 20_000;
+    let row = |n: usize, state: &str| {
+        let mut cells = std::collections::BTreeMap::new();
+        cells.insert("title".to_owned(), format!("package {n}"));
+        cells.insert("lane".to_owned(), format!("lane {}", n % 7));
+        cells.insert("state".to_owned(), state.to_owned());
+        cells
+    };
+    let (lab, config) = packages_lab(
+        (0..ROWS)
+            .map(|n| package(&format!("p{n:05}"), &row(n, "open")))
+            .collect(),
+    );
+    let paths = &lab.paths[SEAT];
+    let touched = || materialize::ROWS.get() + aterm_file::snapshot::test_rows_touched();
+    let before = touched();
+    packages_pass(paths, &config, false);
+    let first = touched() - before;
+    assert!(first >= ROWS, "the first pass projects every row: {first}");
+
+    // One record: one row changed, one added.
+    let mut changes = package("p00042", &row(42, "done"));
+    changes.extend(package("p99999", &row(99_999, "open")));
+    att::Handle::at(paths.clone(), &PACKAGES)
+        .commit_owner(|_| Ok(((), vec![changes])))
+        .unwrap();
+    let delta = 2;
+    let before = touched();
+    packages_pass(paths, &config, false);
+    let after = touched() - before;
+    assert!(
+        after <= 8 * delta,
+        "the pass after one record touched {after} rows"
+    );
+
+    let file = File::at(&super::root(paths), &PACKAGES_FILE.file());
+    let snapshot = file.read().snapshot.unwrap();
+    assert_eq!(snapshot.rows.len(), ROWS + 1);
+    let changed = snapshot.rows.iter().find(|row| row.pk == "p00042").unwrap();
+    assert_eq!(changed.cell("state"), "done");
+    let state = file.state().unwrap();
+    let written = (
+        file.face_bytes().unwrap().unwrap(),
+        file.baseline(state.rev).unwrap(),
+    );
+
+    // The same records projected whole, as another process with none of these caches would:
+    // a projection that differed would be a new revision, and its face and baseline other bytes.
+    materialize::forget_for_test();
+    crate::documents::log::forget_for_test();
+    aterm_file::file::forget_for_test();
+    packages_pass(paths, &config, true);
+    let whole = file.state().unwrap();
+    assert_eq!(
+        (whole.rev, &whole.snapshot),
+        (state.rev, &state.snapshot),
+        "the snapshot"
+    );
+    assert_eq!(file.face_bytes().unwrap().unwrap(), written.0, "the face");
+    assert_eq!(file.baseline(state.rev).unwrap(), written.1, "the baseline");
 }

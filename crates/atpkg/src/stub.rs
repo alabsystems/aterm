@@ -326,7 +326,7 @@ pub(crate) fn co_located_atpkg_path() -> PathBuf {
 }
 
 fn running_exe() -> io::Result<PathBuf> {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     {
         if let Some(exe) = CURRENT_EXE.with(|e| e.borrow().clone()) {
             return Ok(exe);
@@ -342,7 +342,7 @@ pub(crate) fn is_running_image(candidate: &Path) -> bool {
     if running.as_deref() != Some(candidate) {
         return false;
     }
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     if CURRENT_EXE.with(|e| e.borrow().is_some()) {
         return true;
     }
@@ -351,14 +351,14 @@ pub(crate) fn is_running_image(candidate: &Path) -> bool {
         .is_some_and(|pid| aterm_uds::process::image_matches_file(pid, candidate) == Some(true))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 thread_local! {
     static CURRENT_EXE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f` with `exe` as the path this process runs from on this thread ([`running_exe`]).
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn with_current_exe<R>(exe: &Path, f: impl FnOnce() -> R) -> R {
     let prior = CURRENT_EXE.with(|e| e.replace(Some(exe.to_path_buf())));
     let out = f();

@@ -130,14 +130,12 @@ pub const REQUESTER_ACCOUNT_BYTES: usize = 64;
 /// keys at their longest fit with room to spare.
 pub const REQUESTER_LINE_MAX: usize = 256;
 
-/// Whether `s` is a session ID aterm minted, in either form: a tab ID
-/// ([`crate::tab_id::is_tab_id`], `t` and 10 Crockford base32 characters), or a legacy tab's `s-`
-/// and 20 lowercase hex digits ([`crate::tab_id::is_legacy`]), which a shell opened before the `t`
-/// form still holds until aterm restores or closes its tab. The same answer as
-/// `aterm_session::is_minted_sid`.
+/// Whether `s` is a current tab ID ([`crate::tab_id::is_tab_id`]): `t` and 10 lower-case
+/// Crockford base32 characters. Fleet requester and activity readers take this form; a local
+/// reader of a running shell's legacy ID uses [`crate::control_request::Sid::parse`] instead.
 #[must_use]
 pub fn is_minted_sid(s: &str) -> bool {
-    crate::tab_id::is_tab_id(s) || crate::tab_id::is_legacy(s)
+    crate::tab_id::is_tab_id(s)
 }
 
 /// `raw` (a program, or a model as a footer shows it: `Opus 5.5`) as a requester names it: trimmed,
@@ -198,9 +196,10 @@ pub struct Requester {
 }
 
 impl Requester {
-    /// A requester of these parts, each one that does not fit its shape left out: a `sid` aterm
-    /// did not mint, a `program` or `model` [`requester_token`] does not take, an `account` that
-    /// is not one visible line of at most [`REQUESTER_ACCOUNT_BYTES`] bytes percent-encoded.
+    /// A requester of these parts, each one that does not fit its shape left out: a `sid` outside
+    /// the current tab-ID grammar, a `program` or `model` [`requester_token`] does not take, an
+    /// `account` that is not one visible line of at most [`REQUESTER_ACCOUNT_BYTES`] bytes
+    /// percent-encoded.
     #[must_use]
     pub fn of(
         sid: Option<&str>,
@@ -219,7 +218,7 @@ impl Requester {
         }
     }
 
-    /// The requesting session's ID, including the exact legacy ID a still-running tab holds.
+    /// The requesting session's current tab ID (`t` and 10 Crockford base32 characters).
     #[must_use]
     pub fn sid(&self) -> Option<&str> {
         self.sid.as_deref()
@@ -282,9 +281,7 @@ impl Requester {
             return Err("a requester line names sid, program, model and account, and nothing more");
         }
         if sid.is_some_and(|sid| !is_minted_sid(sid)) {
-            return Err(
-                "a requester's sid= is a tab ID (`t` and 10 base32 characters) or an exact legacy ID (`s-` and 20 lowercase hex digits)",
-            );
+            return Err("a requester's sid= is a tab ID (`t` and 10 of 0-9 a-z without i l o u)");
         }
         if [program, model]
             .into_iter()
@@ -2408,7 +2405,7 @@ pub const VERBS: &[VerbSpec] = &[
          inspection reports once the sample has landed and the window's next once-a-second \
          read has adopted it. It supplies no frame or presentation \
          correspondence. `tabs` prints each tab's \
-         one-based `index=` (`tab <N>` / `tab close <N>`), matching its Cmd-<N> shortcut.",
+         one-based `index=` (`tab <N>` / `tab close <N>`). The session panel has its own stable session numbers.",
     ),
     v(
         "cast",
@@ -2771,7 +2768,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         App,
-        "render/latency counters [reset|percentiles|cadence]",
+        "render/latency counters [reset|percentiles|commons|cadence]",
         "— `cadence` reads output-hold index sizes and the selected session's live latch on \
          the UI owner. It neither services holds nor resets counters. `ordered` and `indexed` \
          count the two indexes; `pooled` says the selected session exists in the pool. \
@@ -2808,7 +2805,21 @@ pub const VERBS: &[VerbSpec] = &[
          on macOS and Linux, Commons repair's counts in this process since it started, which no \
          `reset` clears (`commons_rounds_out= commons_rounds_in= commons_rounds_quiet= \
          commons_owner_ticks= commons_beacons= commons_announces= commons_signature_checks= \
-         commons_deadline_spawns=`), and the accounts' upkeep's counts in this process since it \
+         commons_deadline_spawns= commons_remembered_writes=`, then its ledgers, each the words \
+         counted at least once with their counts, `none` before any: `commons_next=` what each \
+         round this Mac dialled did to its peer's schedule, `rest` until its audit or why not \
+         (`transferred`, `owes-follow-up`, `owes-lead`, `owes-differing`, `sweeping`, `auditing`, \
+         `pushed`, `unsettled`, `owes-round` where this Mac owes its peer a round due sooner, \
+         which the walk dials as `owed`, `deferred`, `deferred-quota`, `unfinished`, `busy`, \
+         `failed`, `unasked`); `commons_dials=` the turn that chose each dial (`follow-up`, \
+         `lead`, `audit`, `scan`, `walk` to offer what moved here, `owed` for a round this Mac \
+         owed its peer) and what it was besides (`probe`, `met-again`, `away`, `sweep-restarted`, \
+         `sweep-discarded`); `commons_turns=` the table turn each took (`pushed`, `batch`, \
+         `retry`, `led`, `hinted`, `visit`, `regular`); `commons_asks=` why it asked which tables \
+         differ (`first`, `gap`, `audit`, `asked`, `peer`); `commons_loops=` how serving loops \
+         opened and why they ended (`opened-serving`, `opened-presence`, `refresh`, `vault`, \
+         `witnessed`, `refused`, `stopped`); then `commons_expired= commons_seat_busy= \
+         commons_run_max=`), and the accounts' upkeep's counts in this process since it \
          started, which no `reset` clears either: its passes, whatever each came to (one that \
          only renews logins and one the accounts' off switch ends are among them), and of them \
          those the window's accounts' keeper made, those a session's thread made and those the \
@@ -2832,6 +2843,11 @@ pub const VERBS: &[VerbSpec] = &[
          accounts_receipt_admissions= accounts_duty_runs= accounts_duty_skips= \
          accounts_duty_kept= accounts_duty_poisoned= accounts_admission_reads= \
          accounts_admission_records= accounts_admission_bytes= accounts_observation_reads=`). \
+         `metrics commons` prints, for each peer seat, \
+         `commons_seats=<seat>:<n>/<n>/…` (`<seat>` the first 6 bytes of its machine in hex once a \
+         contact named it, else `actor-` and its seat's), each seat's counts in one order: `out`, \
+         the `commons_next` words, the `commons_dials` words, `inbound`, `expired`, \
+         `busy-dialled`, `busy-served`, `run`, `run_max`; `--json` names each count. \
          `echo_*` is the child round trip; `input_*` is key to the next content present (or a \
          proven prediction, when `input_predicted=` > 0). Its start uses native arrival when \
          available, otherwise dispatch time. `key_queue` and `key_write` include only observed \
@@ -3381,6 +3397,7 @@ pub const VERBS: &[VerbSpec] = &[
         form(Word("info")).op(Read),
         form(Word("constructors")).op(Read),
         form(Word("cancel-support")).op(Read),
+        form(Word("settled")).op(Read),
         // Opaque data custody only; its private kernel owner checks grant no
         // execution, SDK access or PTY input, including while work is held.
         form(Word("runtime-data")).op(Read),
@@ -3524,7 +3541,7 @@ pub const VERBS: &[VerbSpec] = &[
         "drive a window's tabs (new|N|next|prev|close [N]|move <from> <to>)",
         "— flagless drives the front window; `@<sid> tab …` drives the window hosting `<sid>`. \
          `N`, `<from>`, `<to>` and `<active>` in `OK <active> <count>` are one-based (`inspect \
-         app/v1 tabs` `index=`), matching the Cmd-<N> shortcuts; 0 is a usage error. Refuses \
+         app/v1 tabs` `index=`). Zero is a usage error. The left-hand session panel assigns numbers by session. Refuses \
          closing a tab with a running job (`ERR close refused (a \
          running job armed the last-tab confirm)` or `ERR close refused (a running job in that \
          tab)`) or an uncheckpointed native doc (`--headless` never refuses).",
@@ -3545,20 +3562,25 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "open a tab app: `open app mail|about|settings|tables|navigator [split|dock]`",
+        "open an app in the front window with `open app NAME`",
         concat!(
             "From a tab not in front of the person (another tab shows, or aterm is behind \
              another app) an open answers `ERR desk refused behind: …` and brings nothing up; \
              a close is answered as ever. \
              `open app settings [/route]` selects a Settings page; `open app system-state` \
-             opens setup; `open app markdown|editor <local-file-uri>` opens a document; \
+             opens setup. `open app tables` browses stored tables. `open app registry` \
+             opens aRegistry for fleet machines, their assigned AI accounts and signed observations. \
+             `open app system-resources` opens System Resources in the front \
+             window, one view a window, and `open app system-resources \
+             section=macos-configuration` scrolls it to its macOS configuration section. \
+             `open app markdown|editor <local-file-uri>` opens a document. \
              `open app navigator [split]` lists every live session of every window, in a \
              tab or as the active tab's left pane, and replies `app navigator split` where \
-             it split. `open app navigator dock` shows that list as a 30-cell column inside \
-             the front window, as View > Show Navigator does (window chrome: the window keeps \
-             its size and its terminals give up the columns), and replies `app navigator \
-             dock`; a window too narrow to keep its least grid beside the column, or one with \
-             no area (minimized), answers `ERR navigator not shown: …` and changes nothing. \
+             it split. `open app navigator dock` opens the front window's session list on the \
+             left, even with a single session, and replies `app navigator dock`. The window keeps \
+             its size. \
+             A window too narrow to keep its least grid beside the panel, or one with no area \
+             (minimized), can answer `ERR navigator not shown: …`. \
              `open <target> [close]` opens or \
              closes a front-window surface (",
             open_targets!(),
@@ -4523,7 +4545,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "OK 1 verdict=<word> session=<sid|-> fleet=<yes|no>: may the asking process see a secret",
+        "OK 1 verdict=<word> session=<sid|-> fleet=<yes|no> program=<agent|->: may the asker see a secret",
         "— Owner-only and local (never a fleet peer's): whether the process asking may be shown a \
          secret in plaintext, decided by the session of this instance its process lineage leads \
          to, never by its environment. One line, `verdict=` the first of: `remote` (asked through \
@@ -4536,7 +4558,9 @@ pub const VERBS: &[VerbSpec] = &[
          plaintext only on `allowed`; no view of the owner's tables shows a secret. \
          `fleet=yes` where another Mac is behind the question (the bridge or a fleet driver \
          asked, or a fleet driver was admitted to type into that session): a sign-in started \
-         there opens nothing on this Mac's desk.",
+         there opens nothing on this Mac's desk. `program=` names the agent (`claude`, `codex`, \
+         …) nearest the asking process in its own lineage up to the session's shell, `-` where \
+         none runs there: what `aterm file` states as the principal of a record it writes.",
     ),
     va(
         "survey",

@@ -10,10 +10,13 @@
 //!
 //! This crate is below the broker's server (`aterm-lan`), so the server and the reading of
 //! macOS's answer come from above: the `aterm` executable [`provide`]s them once, at start. A
-//! process that provided none (a test binary, a tool) has no direct path, as before. The path is
-//! taken only where no broker answers its socket: a broker that answers in another protocol
-//! or refuses this process is a broker, and its own words stand. It serves LAN uses, never a
-//! question about the broker itself (`super::Arrivals`, which hears a broker arrive).
+//! process that provided none (a test binary, a tool) has no direct path, as before. A release's
+//! LAN use takes the path only where no broker answers its socket: a broker that answers in
+//! another protocol or refuses this process is a broker, and its own words stand. A development
+//! build on a real Mac, which owns no broker and which a team broker never admits, takes it
+//! first, and dials the broker only where macOS's allowance for it does not stand
+//! (`super::install::development_here`). It serves LAN uses, never a question about the broker
+//! itself (`super::Arrivals`, which hears a broker arrive).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -92,6 +95,13 @@ fn current() -> Option<&'static dyn Direct> {
 #[must_use]
 pub fn record() -> Option<PathBuf> {
     current().and_then(|direct| direct.record())
+}
+
+/// macOS's allowance for this thread's direct path ([`Direct::allowed`]): its words, or why there
+/// is none; `None` where this process has no direct path. Asks nothing.
+#[must_use]
+pub fn allowed() -> Option<Result<String, String>> {
+    current().map(|direct| direct.allowed())
 }
 
 /// The near end of an in-process session and macOS's allowance in words, when this process has a

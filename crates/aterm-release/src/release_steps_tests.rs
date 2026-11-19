@@ -4025,9 +4025,16 @@ fn an_early_refusal_settles_owned_warmups_and_their_groups() {
     use std::os::fd::AsFd as _;
     let temp = aterm_tempfile::tempdir().unwrap();
     let program = temp.path().join("warming-verifier");
+    // The test spawns the stand-in itself, so its `$PPID` is this test binary, which it hands its
+    // inner shell as `$1`: the inner loop ends once the binary is gone, and the text is the same
+    // in every run, so on macOS each run links the one cached file of it
+    // (`aterm_tempfile::stand_in`), whose first exec macOS assesses once.
     aterm_tempfile::stand_in(
         &program,
-        "#!/bin/sh\n/bin/sh -c 'printf \"ready\\n\"; while :; do /bin/sleep 60; done' &\nwait\n",
+        &format!(
+            "#!/bin/sh\n/bin/sh -c 'printf \"ready\\n\"; {}' sh \"$PPID\" &\nwait\n",
+            aterm_uds::stand_in_loop::while_lives("\"$1\"", "/bin/sleep 60")
+        ),
     )
     .unwrap();
     for warming in [true, false] {
@@ -9120,4 +9127,252 @@ fn step_one_reads_the_released_shim_verdict_as_a_pass_a_red_or_unanswered() {
         found(Verdict::Undecided),
         Err(super::InputFinding::Unanswered(row.to_owned()))
     );
+}
+
+/// A rustup holding the toolchains `held` with the release's stds each, which installs one it is
+/// asked for only where `installs`; every call is logged.
+struct HeldRustup {
+    held: std::cell::RefCell<Vec<String>>,
+    installs: bool,
+    calls: std::cell::RefCell<Vec<String>>,
+}
+
+impl aterm_verify::provision::stock::Rustup for HeldRustup {
+    fn run(
+        &self,
+        _homes: &aterm_verify::provision::stock::Homes,
+        _tool: &std::path::Path,
+        args: &[String],
+        toolchain: Option<&str>,
+    ) -> Result<String, String> {
+        self.calls
+            .borrow_mut()
+            .push(format!("rustup {}", args.join(" ")));
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        let held = |t: &str| self.held.borrow().iter().any(|h| h == t);
+        match a.as_slice() {
+            ["toolchain", "list"] => Ok(self.held.borrow().join("\n")),
+            ["target", "list", "--installed"] if toolchain.is_some_and(held) => {
+                Ok(aterm_verify::provision::stock::RELEASE_TARGETS.join("\n"))
+            }
+            ["toolchain", "install", name, ..] if self.installs => {
+                self.held.borrow_mut().push((*name).to_string());
+                Ok(String::new())
+            }
+            _ => Err(format!("offline: {}", a.join(" "))),
+        }
+    }
+}
+
+/// REAL'S STOCK STEP READS THE CANDIDATE COMMIT'S LOCK, AND ONLY A REAL RUN INSTALLS: for a
+/// commit whose `trust.lock` names `1.99.1` while the working tree's (HEAD's) names another, a
+/// dry run asks rustup only `list` reads, changes nothing and answers the plan a real run would
+/// carry out for `1.99.1`; a real run installs that release by name and says what it installed;
+/// once it is in place both answer `None`. A commit with no lock is a plain refusal, the tree's,
+/// asked of no rustup; no homes is COULD NOT RUN asking to set HOME and retry; a home with no
+/// rustup the row resolves and an install that fails are COULD NOT RUN naming `verify provision
+/// rustup`. NEGATIVE CONTROLS: a
+/// `stock_toolchain_of` whose dry and real branches are swapped installs in the dry call, and
+/// the plan-only-reads assertion fails; one that reads HEAD's lock (`stock_toolchain_at(git,
+/// "HEAD")`, the release this rustup holds) plans nothing, and the planned leg's unwrap fails.
+#[test]
+fn the_stock_step_reads_the_candidates_lock_and_only_a_real_run_installs() {
+    use super::*;
+    use aterm_verify::provision::stock::{Homes, release_install};
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = GitCli::new(&repo);
+    let run = |args: &[&str]| crate::ledger::git_ok(&git, args).unwrap();
+    run(&["init", "-q"]);
+    let commit = |lock: Option<&str>| {
+        let path = repo.join(atpkg::trust_lock::LOCK_FILE);
+        match lock {
+            Some(release) => std::fs::write(
+                &path,
+                atpkg::trust_lock::render_body(&atpkg::trust_lock::TrustLock {
+                    build: 27009,
+                    tree_root: "b".repeat(64),
+                    compiler_commit: "5".repeat(40),
+                    receipt: "SEED-MINT sha256:00".into(),
+                    stock_toolchain: release.into(),
+                }),
+            )
+            .unwrap(),
+            None => std::fs::remove_file(&path).unwrap(),
+        }
+        std::fs::write(repo.join("n"), format!("{lock:?}")).unwrap();
+        run(&["add", "-A"]);
+        run(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        run(&["rev-parse", "HEAD"]).stdout_utf8().trim().to_string()
+    };
+    let candidate = commit(Some("1.99.1"));
+    let lockless = commit(None);
+    commit(Some("1.88.0"));
+
+    let rustup_home = dir.path().join(".rustup");
+    std::fs::create_dir_all(&rustup_home).unwrap();
+    std::fs::write(rustup_home.join("settings.toml"), "").unwrap();
+    let bin = dir.path().join("bin/rustup");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(&bin, "#!/bin/false\n").unwrap();
+    let homes = |rustup: Option<&Path>| Homes {
+        home: dir.path().to_path_buf(),
+        rustup_home: rustup_home.clone(),
+        cargo_home: dir.path().join(".cargo"),
+        lookup: aterm_uds::host::Lookup {
+            named: rustup.map(|r| r.as_os_str().to_owned()),
+            tooling: Some(dir.path().join("tooling.noindex")),
+            path: None,
+        },
+    };
+    let found = homes(Some(&bin));
+    let rustup = |installs| HeldRustup {
+        held: std::cell::RefCell::new(vec!["1.88.0".into()]),
+        installs,
+        calls: std::cell::RefCell::new(Vec::new()),
+    };
+    let install = release_install("1.99.1");
+    let mut said = Vec::new();
+
+    let fake = rustup(true);
+    let planned = stock_toolchain_of(&git, &candidate, Some(&found), &fake, true, &mut |l| {
+        said.push(l.to_string());
+    })
+    .unwrap()
+    .unwrap_or_else(|| panic!("the candidate's release is planned: {:?}", fake.calls));
+    assert!(
+        fake.calls.borrow().iter().all(|c| c.contains(" list")),
+        "the plan only reads: {:?}",
+        fake.calls
+    );
+    assert_eq!(*fake.held.borrow(), ["1.88.0"], "a dry run changes nothing");
+    assert!(
+        planned.starts_with("a real run puts the stock release 1.99.1")
+            && planned.contains(&install),
+        "{planned}"
+    );
+    assert!(said.is_empty(), "{said:?}");
+
+    let acquired = stock_toolchain_of(&git, &candidate, Some(&found), &fake, false, &mut |l| {
+        said.push(l.to_string());
+    })
+    .unwrap()
+    .unwrap_or_else(|| panic!("the candidate's release is installed: {:?}", fake.calls));
+    assert!(
+        fake.calls.borrow().contains(&install),
+        "installed by name: {:?}",
+        fake.calls
+    );
+    assert!(
+        fake.held.borrow().iter().any(|t| t == "1.99.1"),
+        "{:?}",
+        fake.held
+    );
+    assert!(
+        acquired.starts_with("put the stock release 1.99.1") && acquired.contains(&install),
+        "{acquired}"
+    );
+    assert_eq!(said, [format!("completed command: {install}")]);
+    for dry in [true, false] {
+        assert_eq!(
+            stock_toolchain_of(&git, &candidate, Some(&found), &fake, dry, &mut |_| {}),
+            Ok(None),
+            "in place (dry: {dry})"
+        );
+    }
+
+    let asked = fake.calls.borrow().len();
+    let refused =
+        stock_toolchain_of(&git, &lockless, Some(&found), &fake, false, &mut |_| {}).unwrap_err();
+    assert!(
+        !refused.could_not_run && refused.why.contains("carries no trust.lock"),
+        "{refused:?}"
+    );
+    assert_eq!(fake.calls.borrow().len(), asked, "no rustup was asked");
+
+    let unavailable = |refusal: Refusal, why: &str| {
+        assert!(
+            refusal.could_not_run && refusal.why.contains(why),
+            "{refusal:?}"
+        );
+    };
+    for dry in [true, false] {
+        let homeless = stock_toolchain_of(&git, &candidate, None, &rustup(true), dry, &mut |_| {})
+            .unwrap_err();
+        assert_eq!(homeless.remedy, "set HOME and retry", "{homeless:?}");
+        unavailable(homeless, "cannot resolve the rustup row's homes");
+        let refusal = stock_toolchain_of(
+            &git,
+            &candidate,
+            Some(&homes(None)),
+            &rustup(true),
+            dry,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            refusal.remedy.contains(crate::gates::X86_SLICE_REMEDIES),
+            "{refusal:?}"
+        );
+        unavailable(refusal, "no rustup to drive");
+    }
+    let offline = rustup(false);
+    let failed = stock_toolchain_of(&git, &candidate, Some(&found), &offline, false, &mut |_| {})
+        .unwrap_err();
+    assert!(
+        failed.remedy.contains(crate::gates::X86_SLICE_REMEDIES),
+        "{failed:?}"
+    );
+    unavailable(failed, "did not put the stock release 1.99.1");
+    assert!(
+        offline.calls.borrow().contains(&install),
+        "{:?}",
+        offline.calls
+    );
+}
+
+/// A FREEZE WHOSE SEAL MET A STOCK RELEASE NOT IN PLACE NAMES WHAT PUTS IT THERE: the freeze's
+/// refusal (a dry run's, which installs nothing, or a real run's whose acquisition did not hold)
+/// names, of the clone, what puts that release in place, then the same run again; any other
+/// refusal names the run again alone. NEGATIVE CONTROL: a `frozen_cutter_refusal` that keeps the
+/// retry alone fails the stock remedy's assertion.
+#[test]
+fn a_freeze_whose_seal_met_an_absent_stock_release_names_what_puts_it_there() {
+    use super::*;
+
+    let gap = crate::build_inputs::stock_gap(
+        "1.99.1",
+        "resolve 1.99.1 sysroot: error: toolchain '1.99.1-aarch64-apple-darwin' is not installed",
+    );
+    let other = "resolve the macOS SDK: xcrun failed".to_string();
+    let repo = Path::new("/clones/aterm release");
+    let retry = "from '/clones/aterm release' run `targo --unverified ship release --dry-run`";
+    let refused = frozen_cutter_refusal(&gap, repo, retry);
+    assert_eq!(
+        refused.why,
+        format!("cannot exec R's frozen cutter ({gap})")
+    );
+    let checkout = crate::trust_lock::checkout_stock_toolchain().ok();
+    assert_eq!(
+        refused.remedy,
+        format!(
+            "{} (this checkout: '/clones/aterm release'); then {retry}",
+            crate::buildplan::stock_release_remedy("1.99.1", checkout.as_deref())
+        )
+    );
+    assert!(
+        refused.remedy.contains(crate::gates::X86_SLICE_REMEDIES),
+        "{refused:?}"
+    );
+    assert_eq!(frozen_cutter_refusal(&other, repo, retry).remedy, retry);
 }

@@ -59,10 +59,21 @@ fn main() {
         .expect("release this exact original birth");
     assert!(running.is_original_child());
     assert_eq!(running.child_mut().id(), pid);
+    assert!(
+        running
+            .child_mut()
+            .finish_tether_while(MUST_HAPPEN, || Ok(()))
+            .is_err(),
+        "a still-owned, unreaped child cannot discharge its watcher"
+    );
     observer
         .observe()
         .expect("independent exec status observation");
     assert!(running.child_mut().wait().unwrap().success());
+    running
+        .child_mut()
+        .finish_tether_while(MUST_HAPPEN, || Ok(()))
+        .expect("original released watcher retired after owning reap");
     assert_eq!(
         std::fs::read(&marker).unwrap(),
         b"requested program really executed\n"
@@ -89,6 +100,10 @@ fn main() {
         || cancelled_child.child_mut().try_wait().unwrap(),
     );
     assert!(!cancelled.exists());
+    cancelled_child
+        .child_mut()
+        .finish_tether_while(MUST_HAPPEN, || Ok(()))
+        .expect("withdrawal retains the already armed original watcher");
     until_within(MUST_HAPPEN, "cancelled cohort and watcher ended", || {
         (group_presence(cancelled_pid) == ProcessPresence::Absent).then_some(())
     });
@@ -154,6 +169,10 @@ fn main() {
         std::io::ErrorKind::PermissionDenied
     );
     assert!(!stopped.exists());
+    stopped_child
+        .child_mut()
+        .finish_tether_while(MUST_HAPPEN, || Ok(()))
+        .expect("stopped prepared watcher retired without target exec");
     until_within(MUST_HAPPEN, "stopped prepared cohort ended", || {
         (group_presence(stopped_pid) == ProcessPresence::Absent).then_some(())
     });
@@ -174,6 +193,10 @@ fn main() {
     let controlled_pid = controlled.child_mut().id();
     controlled.kill_group().unwrap();
     assert!(!controlled.child_mut().wait().unwrap().success());
+    controlled
+        .child_mut()
+        .finish_tether_while(MUST_HAPPEN, || Ok(()))
+        .expect("split pending exec observer cannot lose native watcher custody");
     observer.observe().unwrap();
     until_within(MUST_HAPPEN, "root controlled cohort ended", || {
         (group_presence(controlled_pid) == ProcessPresence::Absent).then_some(())
@@ -191,6 +214,10 @@ fn main() {
             assert!(spawned.is_original_child());
             let pid = spawned.child_mut().id();
             spawned.child_mut().wait().unwrap();
+            spawned
+                .child_mut()
+                .finish_tether_while(MUST_HAPPEN, || Ok(()))
+                .expect("target exec error retains its original armed watcher");
             until_within(MUST_HAPPEN, "failed-exec helper and watcher ended", || {
                 (group_presence(pid) == ProcessPresence::Absent).then_some(())
             });

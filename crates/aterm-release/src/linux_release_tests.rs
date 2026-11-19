@@ -92,6 +92,250 @@ fn a_worker_imports_the_unclaimed_reservation_without_a_remote_ref() {
     );
 }
 
+/// A rustup that holds the release `held` names with the release's stds, or nothing, and
+/// installs a toolchain only where `installs`: each call it is asked is logged in `log`.
+struct FixedRustup<'a> {
+    /// The release this rustup's home holds; an install that answers puts its release here, so
+    /// the acquisition's look after its steps (`still missing after provisioning`) finds it.
+    held: std::cell::RefCell<Option<String>>,
+    installs: bool,
+    log: &'a std::cell::RefCell<Vec<String>>,
+}
+
+impl aterm_verify::provision::stock::Rustup for FixedRustup<'_> {
+    fn run(
+        &self,
+        _homes: &aterm_verify::provision::stock::Homes,
+        _tool: &Path,
+        args: &[String],
+        _toolchain: Option<&str>,
+    ) -> Result<String, String> {
+        self.log
+            .borrow_mut()
+            .push(format!("rustup {}", args.join(" ")));
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        let held = self.held.borrow().clone();
+        match (a.as_slice(), held) {
+            (["toolchain", "list"], held) => Ok(held.map(|t| format!("{t}\n")).unwrap_or_default()),
+            (["target", "list", "--installed"], Some(_)) => {
+                Ok(aterm_verify::provision::stock::RELEASE_TARGETS.join("\n"))
+            }
+            (["toolchain", "install", release, ..], _) if self.installs => {
+                *self.held.borrow_mut() = Some((*release).to_string());
+                Ok(String::new())
+            }
+            _ => Err(format!("offline: {}", a.join(" "))),
+        }
+    }
+}
+
+/// THE WORKER'S STOCK PRELUDE PUTS THE CLAIM COMMIT'S RELEASE IN PLACE BEFORE ANY BUILD, AND A
+/// WORKER THAT CANNOT HAVE IT REFUSES, NEVER DROPPING THE VERIFIER: `worker_stock` runs the rustup
+/// row's release part for the release the claim commit's lock names (by name, through the rustup
+/// the row resolves), then probes that release for the std of its native target's own triple,
+/// x86_64's or aarch64's, and answers only then; a release this rustup lacks is installed
+/// first, and one it lacks and cannot install, no rustup at all, and a probe that still refuses
+/// (the release's shim directory rejected) each refuse the worker with what failed, naming `verify
+/// provision rustup` on this host first and the release's own install line only after it. What
+/// `run_worker` itself adds, this host's homes and rustup and `require_rustup_target_in` on the
+/// take's captured stock context as the probe, runs only on a native Linux host and is not
+/// covered here. NEGATIVE CONTROLS: a
+/// `worker_stock` that ignores a failed acquisition (`let _ = run_release(…)`) probes after it,
+/// so the offline leg answers `Ok` and its `unwrap_err` fails; one that probes
+/// `LinuxTarget::X86_64.triple()` whatever its native target fails the aarch64 leg's probe
+/// assertion.
+#[test]
+fn the_workers_stock_prelude_puts_the_claims_release_in_place_or_refuses() {
+    use aterm_verify::provision::stock::Homes;
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const STOCK: &str = "1.99.1";
+    let dir = scratch();
+    let rustup_home = dir.path().join(".rustup");
+    fs::create_dir_all(&rustup_home).unwrap();
+    fs::write(rustup_home.join("settings.toml"), "").unwrap();
+    let bin = dir.path().join("bin/rustup");
+    fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    fs::write(&bin, "#!/bin/false\n").unwrap();
+    let homes = |rustup: Option<&Path>| Homes {
+        home: dir.path().to_path_buf(),
+        rustup_home: rustup_home.clone(),
+        cargo_home: dir.path().join(".cargo"),
+        lookup: aterm_uds::host::Lookup {
+            named: rustup.map(|r| r.as_os_str().to_owned()),
+            tooling: Some(dir.path().join("tooling.noindex")),
+            path: None,
+        },
+    };
+    let (found, none) = (homes(Some(&bin)), homes(None));
+    let install = aterm_verify::provision::stock::release_install(STOCK);
+    let calls = &std::cell::RefCell::new(Vec::<String>::new());
+    let run = |native: LinuxTarget,
+               homes: &Homes,
+               rustup: FixedRustup<'_>,
+               probed: Result<(), String>| {
+        calls.borrow_mut().clear();
+        worker_stock(STOCK, COMMIT, native, homes, &rustup, |stock, triple| {
+            calls.borrow_mut().push(format!("probe {stock} {triple}"));
+            probed
+        })
+    };
+    let held = |installs| FixedRustup {
+        held: std::cell::RefCell::new(Some(STOCK.into())),
+        installs,
+        log: calls,
+    };
+    let lacking = |installs| FixedRustup {
+        held: std::cell::RefCell::new(None),
+        installs,
+        log: calls,
+    };
+    let remedy = |refused: &str| {
+        let provision = refused
+            .find(&format!(
+                "Run `{}` in a checkout on this host",
+                crate::gates::X86_SLICE_REMEDIES
+            ))
+            .unwrap_or_else(|| panic!("the route that places the copy: {refused}"));
+        let bare = refused
+            .find(&format!(
+                "or, where a rustup the row accepts is in place, `{install}`"
+            ))
+            .unwrap_or_else(|| panic!("the release's own install line: {refused}"));
+        assert!(provision < bare, "{refused}");
+        assert!(
+            refused.contains(&format!(
+                "the stock release {STOCK} the claim commit 0123456789ab's"
+            )),
+            "{refused}"
+        );
+    };
+
+    for native in [LinuxTarget::X86_64, LinuxTarget::Aarch64] {
+        assert_eq!(run(native, &found, held(false), Ok(())), Ok(()));
+        assert_eq!(
+            calls.borrow().last().cloned(),
+            Some(format!("probe {STOCK} {}", native.triple())),
+            "this host's own triple is probed: {:?}",
+            calls.borrow()
+        );
+    }
+
+    assert_eq!(
+        run(LinuxTarget::Aarch64, &found, lacking(true), Ok(())),
+        Ok(())
+    );
+    let order = calls.borrow().clone();
+    let installed = order
+        .iter()
+        .position(|c| *c == install)
+        .unwrap_or_else(|| panic!("the release is installed by name: {order:?}"));
+    assert!(
+        installed < order.len() - 1 && order.last().is_some_and(|c| c.starts_with("probe")),
+        "installed, then probed: {order:?}"
+    );
+
+    let offline = run(LinuxTarget::Aarch64, &found, lacking(false), Ok(())).unwrap_err();
+    assert!(
+        calls.borrow().contains(&install) && !calls.borrow().iter().any(|c| c.starts_with("probe")),
+        "the install was tried, and nothing is probed after it failed: {:?}",
+        calls.borrow()
+    );
+    assert!(offline.contains("offline: toolchain install"), "{offline}");
+    remedy(&offline);
+
+    let absent = run(LinuxTarget::Aarch64, &none, held(false), Ok(())).unwrap_err();
+    assert!(calls.borrow().is_empty(), "{:?}", calls.borrow());
+    assert!(absent.contains("no rustup to drive"), "{absent}");
+    remedy(&absent);
+
+    let shim = "release rustup shim directory is group/other-writable (mode 775): /x/bin";
+    let rejected = run(
+        LinuxTarget::Aarch64,
+        &found,
+        held(false),
+        Err(shim.to_string()),
+    )
+    .unwrap_err();
+    assert!(rejected.contains(shim), "{rejected}");
+    remedy(&rejected);
+}
+
+/// THE STATIC BOOTSTRAP VERIFIER IS LEFT OUT ONLY WHERE THE HOST HAS NO STATIC C LIBRARY, AND
+/// EVERY OTHER FAILURE REFUSES THE WORKER: where `cc -print-file-name=libc.a` answers the bare
+/// name (it finds none) the step is left out with that answer and the build never runs; where it
+/// names a library that is there, the build runs, and its success is the verifier while its
+/// failure (a compile error on the stock release, a smoke run install.sh would not read, a pair
+/// that does not write) refuses, naming the library and why; a probe that does not answer (no
+/// `cc`, an exit that is not success) refuses with the build never run. NEGATIVE CONTROLS: a step that drops a
+/// failed build (`build().ok()`) answers left out and the failing build's `unwrap_err` fails; one
+/// that reads an unanswered probe as no library answers left out and the unanswered leg's
+/// `unwrap_err` fails.
+#[test]
+fn only_a_host_without_a_static_c_library_leaves_the_verifier_out() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let dir = scratch();
+    let libc = dir.path().join("libc.a");
+    fs::write(&libc, b"!<arch>\n").unwrap();
+    let said = |status: i32, stdout: &str, stderr: &str| {
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(status << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    };
+    let triple = LinuxTarget::Aarch64.triple();
+    let built = dir.path().join("aterm-bootstrap-verify");
+    let ran = std::cell::Cell::new(0);
+    let build = |result: Result<PathBuf, String>| {
+        let ran = &ran;
+        move || {
+            ran.set(ran.get() + 1);
+            result
+        }
+    };
+
+    assert_eq!(
+        bootstrap_verifier_step(triple, said(0, "libc.a\n", ""), build(Ok(built.clone()))),
+        Ok(VerifierStep::LeftOut("libc.a".into()))
+    );
+    assert_eq!(ran.get(), 0, "no static C library: nothing is built");
+
+    let found = format!("{}\n", libc.display());
+    assert_eq!(
+        bootstrap_verifier_step(triple, said(0, &found, ""), build(Ok(built.clone()))),
+        Ok(VerifierStep::Built(built.clone()))
+    );
+    assert_eq!(ran.get(), 1);
+    let failed = bootstrap_verifier_step(
+        triple,
+        said(0, &found, ""),
+        build(Err(
+            "stock cargo build -p aterm-bootstrap-verify failed (exit 101)".into(),
+        )),
+    )
+    .unwrap_err();
+    assert_eq!(ran.get(), 2);
+    assert!(
+        failed.contains(&libc.display().to_string())
+            && failed.contains("failed (exit 101)")
+            && failed.contains(triple),
+        "{failed}"
+    );
+
+    for unanswered in [
+        Err("no `cc` on /usr/bin:/bin:/usr/sbin:/sbin".to_string()),
+        said(1, "", "cc: error: unrecognized command-line option"),
+    ] {
+        let refused =
+            bootstrap_verifier_step(triple, unanswered, build(Ok(built.clone()))).unwrap_err();
+        assert!(
+            refused.contains("cannot tell whether it has the static C library"),
+            "{refused}"
+        );
+    }
+    assert_eq!(ran.get(), 2, "an unanswered probe builds nothing");
+}
+
 fn scratch() -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix("aterm-linux-handoff-")
@@ -181,6 +425,29 @@ fn verifier_fixture(dir: &Path, target: LinuxTarget, interpreter: bool) -> Verif
     verifier
 }
 
+/// The worker's record that it left `target`'s static verifier out (its C compiler found no
+/// static C library), as [`record_verifier_step`] writes it.
+fn left_out_fixture(dir: &Path, target: LinuxTarget) -> VerifierLeftOut {
+    let line = record_verifier_step(
+        dir,
+        target,
+        "0.100.0",
+        100,
+        &"a".repeat(40),
+        VerifierStep::LeftOut("libc.a".into()),
+    )
+    .unwrap();
+    assert!(line.contains("recorded in"), "{line}");
+    aterm_toml::from_str(
+        &fs::read_to_string(left_out_path(
+            dir,
+            &pin::asset_name("0.100.0", target.arch()),
+        ))
+        .unwrap(),
+    )
+    .unwrap()
+}
+
 /// `ship pin-verifier` writes install.sh's four lines and the committed record from a
 /// cut's receipts, and the pair passes `pin::check`; a record this checkout's ledger
 /// does not claim, or of another interface, writes nothing.
@@ -267,6 +534,7 @@ fn a_workers_static_verifier_is_staged_and_pinned() {
     for t in TARGETS {
         fixture(source.path(), t);
     }
+    left_out_fixture(source.path(), LinuxTarget::X86_64);
     let verifier = verifier_fixture(source.path(), LinuxTarget::Aarch64, false);
     let mut handoff = Handoff::new(source.path(), &[], &[]).unwrap();
     handoff
@@ -420,10 +688,12 @@ fn a_verifier_that_is_not_the_receipts_static_build_is_refused() {
     ] {
         fs::remove_file(source.path().join(file)).unwrap();
     }
+    left_out_fixture(source.path(), LinuxTarget::Aarch64);
     handoff
         .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
         .unwrap();
     assert!(handoff.verifiers.is_empty());
+    fs::remove_file(left_out_path(source.path(), &verifier.asset)).unwrap();
     verifier_fixture(source.path(), LinuxTarget::Aarch64, false);
     assert!(
         handoff
@@ -460,6 +730,7 @@ fn imports_both_architectures_and_binds_signed_manifest_fields() {
     let dist = scratch();
     for t in TARGETS {
         fixture(source.path(), t);
+        left_out_fixture(source.path(), t);
     }
     let mut handoff = Handoff::new(source.path(), &[], &[]).unwrap();
     handoff
@@ -574,6 +845,7 @@ fn explicit_native_subset_is_honest_and_default_refuses_missing_worker() {
     let source = scratch();
     let dist = scratch();
     fixture(source.path(), LinuxTarget::Aarch64);
+    left_out_fixture(source.path(), LinuxTarget::Aarch64);
     assert!(
         Handoff::new(source.path(), &[], &[])
             .unwrap()
@@ -608,6 +880,7 @@ fn resume_refuses_changed_provenance_and_tampered_staged_bytes() {
     let source = scratch();
     let dist = scratch();
     let mut artifact = fixture(source.path(), LinuxTarget::Aarch64);
+    left_out_fixture(source.path(), LinuxTarget::Aarch64);
     let mut handoff =
         Handoff::new(source.path(), std::slice::from_ref(&artifact.target), &[]).unwrap();
     handoff
@@ -790,17 +1063,37 @@ fn workers_must_build_a_declared_target_once() {
     );
 }
 
+/// Only this cut's valid pair counts as already built, and only beside exactly one answer for its
+/// static bootstrap verifier: the verifier's valid pair, or the worker's record that it left it
+/// out. The executable's pair alone (a built verifier whose copy failed) or with both is built
+/// again. NEGATIVE CONTROL: a `pair_is_current` that reads the executable's pair alone counts it
+/// current and the pair-alone assertion fails.
 #[test]
 fn only_this_cuts_valid_pair_counts_as_already_built() {
     let dir = scratch();
     let target = LinuxTarget::Aarch64;
     let commit = "a".repeat(40);
-    assert!(
-        !pair_is_current(dir.path(), target, "0.100.0", 100, &commit),
-        "nothing there"
-    );
+    let current = || pair_is_current(dir.path(), target, "0.100.0", 100, &commit);
+    assert!(!current(), "nothing there");
     fixture(dir.path(), target);
-    assert!(pair_is_current(dir.path(), target, "0.100.0", 100, &commit));
+    assert!(
+        !current(),
+        "the executable's pair alone: its verifier's copy failed, so the worker runs again"
+    );
+    let verifier = verifier_fixture(dir.path(), target, false);
+    assert!(current(), "with the verifier's pair");
+    left_out_fixture(dir.path(), target);
+    assert!(!current(), "with both answers");
+    for file in [
+        verifier.asset.clone(),
+        format!("{}.handoff.toml", verifier.asset),
+    ] {
+        fs::remove_file(dir.path().join(file)).unwrap();
+    }
+    assert!(
+        current(),
+        "with the worker's record that it left the verifier out"
+    );
     assert!(!pair_is_current(
         dir.path(),
         target,
@@ -828,6 +1121,117 @@ fn only_this_cuts_valid_pair_counts_as_already_built() {
     fs::write(&asset, bytes).unwrap();
     assert!(!pair_is_current(
         dir.path(),
+        target,
+        "0.100.0",
+        100,
+        &commit
+    ));
+}
+
+/// A BUILT VERIFIER IS NEVER DROPPED FROM THE RELEASE WITHOUT A WORD: the cutter takes back a
+/// worker's verifier pair, else its record that it left the verifier out (asked only where the
+/// pair did not come back), and where neither comes back it refuses the worker naming both
+/// reasons. The import then publishes none for an architecture only beside that record: with
+/// neither the pair nor the record it refuses, naming what to copy, and with both, or with a
+/// verifier file but no receipt beside the record, it refuses too; a record of another cut is
+/// refused. NEGATIVE CONTROLS: a `fetch_verifier` that reads a record that did not come back as
+/// left out answers `Ok` and the neither leg's `unwrap_err` fails; a `verifier_pairs` that goes
+/// on without the record (the earlier rule) imports none and the missing leg's `unwrap_err`
+/// fails.
+#[test]
+fn a_built_verifier_that_did_not_come_back_refuses_and_only_a_record_leaves_it_out() {
+    let triple = LinuxTarget::Aarch64.triple();
+    let asked = std::cell::Cell::new(0);
+    let record = |result: Result<(), String>| {
+        let asked = &asked;
+        move || {
+            asked.set(asked.get() + 1);
+            result
+        }
+    };
+    assert_eq!(
+        fetch_verifier(triple, || Ok(()), record(Ok(()))),
+        Ok(VerifierFetch::Built)
+    );
+    assert_eq!(asked.get(), 0, "a pair that came back asks for no record");
+    assert_eq!(
+        fetch_verifier(triple, || Err("scp exit status: 1".into()), record(Ok(()))),
+        Ok(VerifierFetch::LeftOut)
+    );
+    let neither = fetch_verifier(
+        triple,
+        || Err("scp exit status: 255".into()),
+        record(Err("scp exit status: 1".into())),
+    )
+    .unwrap_err();
+    assert!(
+        neither.contains(triple)
+            && neither.contains("exit status: 255")
+            && neither.contains("exit status: 1")
+            && neither.contains("never dropped"),
+        "{neither}"
+    );
+
+    let source = scratch();
+    let dist = scratch();
+    let commit = "a".repeat(40);
+    let target = LinuxTarget::Aarch64;
+    fixture(source.path(), target);
+    let mut handoff = Handoff::new(source.path(), &[triple.into()], &[]).unwrap();
+    let missing = handoff
+        .import(dist.path(), "0.100.0", 100, &commit)
+        .unwrap_err();
+    let asset = pin::asset_name("0.100.0", target.arch());
+    assert!(
+        missing.contains("Linux bootstrap verifier missing for")
+            && missing.contains(&format!("{asset}.left-out.toml"))
+            && missing.contains(&format!("{asset}.handoff.toml")),
+        "{missing}"
+    );
+
+    let recorded = left_out_fixture(source.path(), target);
+    assert_eq!(recorded.static_c_library, "libc.a");
+    assert_eq!(recorded.validate("0.100.0", 100, &commit), Ok(()));
+    handoff
+        .import(dist.path(), "0.100.0", 100, &commit)
+        .unwrap();
+    assert!(handoff.verifiers.is_empty());
+
+    fs::write(source.path().join(&asset), b"stray").unwrap();
+    let stray = Handoff::new(source.path(), &[triple.into()], &[])
+        .unwrap()
+        .import(dist.path(), "0.100.0", 100, &commit)
+        .unwrap_err();
+    assert!(stray.contains("no receipt beside"), "{stray}");
+    fs::remove_file(source.path().join(&asset)).unwrap();
+
+    verifier_fixture(source.path(), target, false);
+    let both = Handoff::new(source.path(), &[triple.into()], &[])
+        .unwrap()
+        .import(dist.path(), "0.100.0", 100, &commit)
+        .unwrap_err();
+    assert!(both.contains("both its pair"), "{both}");
+
+    let other = scratch();
+    fixture(other.path(), target);
+    left_out_fixture(other.path(), target);
+    let mut foreign: VerifierLeftOut = recorded.clone();
+    foreign.build_number = 101;
+    fs::write(
+        left_out_path(other.path(), &asset),
+        aterm_toml::to_string(&foreign).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        Handoff::new(other.path(), &[triple.into()], &[])
+            .unwrap()
+            .import(dist.path(), "0.100.0", 100, &commit)
+            .unwrap_err()
+            .contains("left-out record has mismatched"),
+        "another cut's record"
+    );
+    assert!(!pair_is_current(
+        other.path(),
         target,
         "0.100.0",
         100,

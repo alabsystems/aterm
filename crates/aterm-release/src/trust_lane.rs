@@ -577,6 +577,11 @@ pub fn gate_list(
                 "the package {name:?} {version:?} cannot go in an argv"
             ));
         }
+        if !aterm_capacity::epoch_recipe::cargo_semver(version) {
+            return Err(format!(
+                "targo metadata lists an invalid Cargo version for {name}: {version:?}"
+            ));
+        }
         let spec = format!("{name}@{version}");
         if members.contains(id) {
             let has_lib = pkg
@@ -682,8 +687,8 @@ pub fn gate_list(
 
 /// Returns floor or [`QUEUED_FORKS`] package names that no longer exist in `libs`.
 #[must_use]
-pub fn vanished(libs: &[Lib], floors: &str) -> Vec<String> {
-    let present: BTreeSet<&str> = libs.iter().map(|l| l.name.as_str()).collect();
+pub fn vanished<'a>(libs: impl IntoIterator<Item = &'a str>, floors: &str) -> Vec<String> {
+    let present: BTreeSet<&str> = libs.into_iter().collect();
     let named = floors
         .lines()
         .filter(|l| !l.starts_with('#'))
@@ -701,19 +706,31 @@ pub struct Selected {
     pub decision: Decision,
 }
 
-/// Selects `names` (or all of `libs` when `None`) and assigns each row's pre-check status.
+/// An explicit package selects its feature and version rows. A remeasurement names
+/// the exact rows to replace in a whole-tree receipt.
+pub enum Selection<'a> {
+    All,
+    Packages(&'a [String]),
+    Pending(&'a [String]),
+}
+
+/// Selects libraries and assigns each row's pre-check status.
 ///
 /// # Errors
 /// Returns an error if any requested name matches neither a workspace member nor a fork.
-pub fn select(libs: &[Lib], names: Option<&[String]>) -> Result<Vec<Selected>, String> {
-    let chosen: Vec<&Lib> = match names {
-        None => libs.iter().collect(),
-        Some(names) => {
+pub fn select(libs: &[Lib], selection: Selection<'_>) -> Result<Vec<Selected>, String> {
+    let chosen: Vec<&Lib> = match selection {
+        Selection::All => libs.iter().collect(),
+        Selection::Packages(names) | Selection::Pending(names) => {
             let mut out = Vec::new();
             for want in names {
                 let hits: Vec<&Lib> = libs
                     .iter()
-                    .filter(|l| &l.name == want || package_identity(&l.name) == want)
+                    .filter(|l| {
+                        &l.name == want
+                            || (matches!(selection, Selection::Packages(_))
+                                && package_identity(&l.name) == want)
+                    })
                     .collect();
                 if hits.is_empty() {
                     return Err(format!(
@@ -2050,7 +2067,7 @@ impl Stored {
     }
 }
 
-/// The line a stored log ends with where [`store_log`] left `bytes` of output out of it, in
+/// The note a stored log includes where [`store_log`] left `bytes` of output out of it, in
 /// `lines` lines, once it held `cap` compressed bytes, keeping the output's last `tail` bytes.
 /// It names nothing the judge reads ([`trust_facts::judged`]), and starts on a line of its own.
 pub(crate) fn left_out_note(bytes: u64, lines: u64, cap: u64, tail: u64) -> String {
@@ -2059,7 +2076,7 @@ pub(crate) fn left_out_note(bytes: u64, lines: u64, cap: u64, tail: u64) -> Stri
     )
 }
 
-/// The line a stored log ends with where [`store_log`] stopped reading the output while a
+/// The note a stored log includes where [`store_log`] stopped reading the output while a
 /// process still held it open ([`Stored::stopped`]). It names nothing the judge reads, and
 /// starts on a line of its own.
 pub(crate) fn stopped_note() -> String {
@@ -2192,7 +2209,9 @@ fn read_line<R: CheckOutput, W: Write>(
 /// all of it ([`LaunchRefusal`]). A read of `from` that failed ends the storing there, leaving
 /// the frame unended ([`Stored::read_failed`]), so every reader of the stored log fails rather
 /// than take it for the whole output; where `from` stopped while a process still held it open
-/// ([`CheckOutput::cut_short`]), the stored log ends with [`stopped_note`].
+/// ([`CheckOutput::cut_short`]), the stored log includes [`stopped_note`]. Both notes precede
+/// a retained, unterminated final line of exactly [`trust_facts::LINE_MAX`] bytes, so their
+/// leading newline cannot make that line too long to judge.
 pub(crate) fn store_log_with<R: CheckOutput>(
     from: R,
     to: impl Write,
@@ -2213,14 +2232,30 @@ pub(crate) fn store_log_with<R: CheckOutput>(
     let max_line = usize::try_from(trust_facts::LINE_MAX + 1).unwrap_or(usize::MAX);
     let mut refusal = LaunchRefusal::default();
     let mut stored = Stored::default();
-    // Past the cap, the last lines read, each with whether the judge reads it, held until they
-    // fall out of the last `tail` bytes (a judged one is then written, another left out) or the
-    // output ends (all are written).
-    let mut last: VecDeque<(Vec<u8>, bool)> = VecDeque::new();
-    let mut last_bytes: u64 = 0;
+    // Each held line starts at its byte offset in the output past the cap. An omitted,
+    // overlong line advances that offset just as a retained line does.
+    let mut last: VecDeque<(u64, Vec<u8>, bool)> = VecDeque::new();
+    let mut past_cap = 0u64;
     let mut line = Vec::new();
     let mut piece = Vec::new();
+    let mut unterminated = Vec::new();
+    let mut write_line = |sink: &mut LogSink<_>, line: &mut Vec<u8>| {
+        if len64(line) == trust_facts::LINE_MAX && !line.ends_with(b"\n") {
+            unterminated = std::mem::take(line);
+        } else {
+            sink.write(line);
+        }
+    };
     'lines: loop {
+        let tail_start = past_cap.saturating_sub(tail);
+        while let Some((_, mut out, keep)) = last.pop_front_if(|(start, ..)| *start < tail_start) {
+            if keep {
+                write_line(&mut sink, &mut out);
+            } else {
+                stored.left_out = stored.left_out.saturating_add(len64(&out));
+                stored.lines_left_out = stored.lines_left_out.saturating_add(1);
+            }
+        }
         line.clear();
         if read_line(&mut from, &mut line, max_line, &mut sink).is_err() {
             stored.read_failed = true;
@@ -2235,23 +2270,12 @@ pub(crate) fn store_log_with<R: CheckOutput>(
         if len64(&line) <= trust_facts::LINE_MAX {
             // A line the judge reads as one.
             if under {
-                sink.write(&line);
+                write_line(&mut sink, &mut line);
             } else if !failed {
                 let keep = judged(&line);
-                last_bytes = last_bytes.saturating_add(len64(&line));
-                last.push_back((std::mem::take(&mut line), keep));
-                while last_bytes > tail {
-                    let Some((out, keep)) = last.pop_front() else {
-                        break;
-                    };
-                    last_bytes = last_bytes.saturating_sub(len64(&out));
-                    if keep {
-                        sink.write(&out);
-                    } else {
-                        stored.left_out = stored.left_out.saturating_add(len64(&out));
-                        stored.lines_left_out = stored.lines_left_out.saturating_add(1);
-                    }
-                }
+                let start = past_cap;
+                past_cap = past_cap.saturating_add(len64(&line));
+                last.push_back((start, std::mem::take(&mut line), keep));
             }
             continue;
         }
@@ -2296,6 +2320,9 @@ pub(crate) fn store_log_with<R: CheckOutput>(
         if (whole || cut) && !sink.failed() {
             stored.left_out = stored.left_out.saturating_add(left);
             stored.lines_left_out = stored.lines_left_out.saturating_add(1);
+            if whole {
+                past_cap = past_cap.saturating_add(left);
+            }
         }
     }
     stored.refused = refusal.found;
@@ -2304,8 +2331,8 @@ pub(crate) fn store_log_with<R: CheckOutput>(
         let _ = sink.enc.flush();
         return stored;
     }
-    for (out, _) in last {
-        sink.write(&out);
+    for (_, mut out, _) in last {
+        write_line(&mut sink, &mut out);
     }
     if stored.left_out > 0 {
         sink.write(left_out_note(stored.left_out, stored.lines_left_out, cap, tail).as_bytes());
@@ -2314,6 +2341,7 @@ pub(crate) fn store_log_with<R: CheckOutput>(
     if stored.stopped {
         sink.write(stopped_note().as_bytes());
     }
+    sink.write(&unterminated);
     let _ = sink.enc.finish();
     stored
 }
@@ -2753,20 +2781,27 @@ struct Prepared {
     load_start: String,
     /// All library row names in the resolved graph ([`seed_rows`]).
     libraries: BTreeSet<String>,
+    /// All versioned receipt names in the graph, including rows this run skips.
+    library_specs: BTreeSet<String>,
     _lock: RunLock,
 }
 
 /// What a filing run read before its checks: the tree and why it may not file.
 struct Filing {
-    why_not: String,
-    start: Option<(String, String)>,
+    start: Result<(String, String), &'static str>,
     prover: String,
+    packages: trust_facts::build_files::Packages,
 }
 
 /// Why a run stopped before the judge spoke.
 enum Stop {
     /// This host refuses libraries for memory, and the run was asked to stop then.
     Narrowed(Vec<String>),
+    /// The credit ledger or a grade record prevented per-library judgment.
+    Credit {
+        summary: String,
+        failures: Vec<String>,
+    },
     /// Nothing was decided: why.
     CouldNotRun(String),
 }
@@ -2793,8 +2828,13 @@ fn run_on(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Outcome {
             };
             let judged = match usable.and_then(|()| claim_disk(cfg, &prep.root, bench, out)) {
                 Ok(disk) => {
-                    let judged =
-                        check_and_conclude(cfg, &prep, bench, out).map_err(Stop::CouldNotRun);
+                    let mut compiler_exits = Vec::new();
+                    let judged = check_and_conclude(cfg, &prep, bench, out, &mut compiler_exits);
+                    if judged.is_err() {
+                        for line in compiler_exits {
+                            let _ = writeln!(out, "{line}");
+                        }
+                    }
                     if let Some(disk) = disk {
                         let claimed = disk.estimate;
                         let took = disk.finish();
@@ -2821,6 +2861,11 @@ fn run_on(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Outcome {
     match ran {
         Ok(outcome) => outcome,
         Err(Stop::Narrowed(lines)) => Outcome::Narrowed(lines),
+        Err(Stop::Credit { summary, failures }) => {
+            let _ = writeln!(out, "trust: {summary}");
+            let _ = writeln!(out, "VERDICT: FAIL — {}", failures.join("; "));
+            Outcome::Fail(failures)
+        }
         Err(Stop::CouldNotRun(why)) => {
             let _ = writeln!(out, "trust: COULD NOT RUN — {why}");
             Outcome::CouldNotRun(why)
@@ -2853,9 +2898,12 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     if let Some(note) = note {
         let _ = writeln!(out, "trust: {note}");
     }
-    if let Some(note) = legacy_root_note(cfg).or_else(|| indexed_root_note(cfg, &root)) {
+    if let Some(note) = legacy_root_note(cfg) {
         let _ = writeln!(out, "trust: {note}");
     }
+    aterm_uds::backup::Backups::SYSTEM
+        .build_dir(&root)
+        .map_err(|e| format!("prepare build root {}: {e}", root.display()))?;
     let logdir = root.join("logs");
     owner_dirs(&logdir).map_err(|e| format!("{}: {e}", logdir.display()))?;
     if mine.as_ref() == Some(&root) {
@@ -2952,24 +3000,17 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         .map_err(|e| format!("targo metadata printed no JSON: {e}"))?;
     let repo = cfg.repo.clone();
     let libs = gate_list(&meta, &|m| profile_rows_for(m, &repo))?;
-    let gone = if files {
+    if files {
+        // Refuse an unreadable ratchet before starting the whole-tree checks.
         let floors = cfg.repo.join(trust_facts::RATCHET);
-        let text = crate::durable::read_text(&floors)
+        crate::durable::read_text(&floors)
             .map_err(|e| format!("the floors {}: {e}", floors.display()))?;
-        vanished(&libs, &text)
-    } else {
-        Vec::new()
-    };
+    }
     let filing = files.then(|| {
         let start = tree_state(&cfg.repo);
         let prover_id = trust_facts::prover_identity(&driver.bin);
         Filing {
-            why_not: match &start {
-                Some(_) => String::new(),
-                None => "the checkout is not HEAD's bytes (an edit git's config hides included), \
-                         or not a git checkout, so no tree is what it verified"
-                    .into(),
-            },
+            packages: trust_facts::build_files::Packages::from_metadata(&meta, &repo),
             start,
             prover: prover_id
                 .as_ref()
@@ -2977,32 +3018,27 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
                 .unwrap_or_default(),
         }
     });
-    let (names, only): (Option<Vec<String>>, String) = match &cfg.scope {
-        Scope::WholeTree => (None, String::new()),
-        Scope::Packages(p) => (Some(p.clone()), p.join(" ")),
+    let (selected, only) = match &cfg.scope {
+        Scope::WholeTree => (select(&libs, Selection::All)?, String::new()),
+        Scope::Packages(p) => (select(&libs, Selection::Packages(p))?, p.join(" ")),
         Scope::Remeasure => {
-            let why = filing
-                .as_ref()
-                .map(|f| f.why_not.clone())
-                .unwrap_or_default();
-            if !why.is_empty() {
+            if let Some(why) = filing.as_ref().and_then(|f| f.start.as_ref().err()) {
                 return Err(Stop::CouldNotRun(format!(
                     "--remeasure completes the stored facts of this tree, and this run would file none: {why}"
                 )));
             }
             let prover = trust_facts::Prover::at(&driver.bin);
-            let pending = trust_facts::pending_for(&git, &prover, "HEAD")
+            let pending = trust_facts::pending_for(&git, &prover, "HEAD", cfg.try_refused)
                 .map_err(|e| format!("--remeasure: {e}"))?
-                .map_err(|why| format!("--remeasure: no stored facts to complete: {why}"))?;
+                .map_err(|why| format!("--remeasure: {why}"))?;
             let only = if pending.is_empty() {
                 "--remeasure: nothing left undecided".into()
             } else {
                 format!("--remeasure: {}", pending.join(" "))
             };
-            (Some(pending), only)
+            (select(&libs, Selection::Pending(&pending))?, only)
         }
     };
-    let selected = select(&libs, names.as_deref())?;
     let (mem, memtotal) = bench.memory();
     let reach = bench.reach();
     let cores = aterm_cores::available_parallelism().map_or(1, std::num::NonZero::get);
@@ -3054,9 +3090,6 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         ("load-start", load_start.clone()),
     ] {
         push_kv(&mut plan, k, &v);
-    }
-    for v in &gone {
-        push_kv(&mut plan, "vanished", v);
     }
     for s in &selected {
         if s.decision == Decision::Ambiguous
@@ -3114,6 +3147,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
             ));
         }
     }
+    let (libraries, library_specs) = libs.into_iter().map(|lib| (lib.name, lib.spec)).unzip();
     Ok(Prepared {
         driver,
         logdir,
@@ -3129,7 +3163,8 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         costs_path,
         costs,
         load_start,
-        libraries: libs.iter().map(|l| l.name.clone()).collect(),
+        libraries,
+        library_specs,
         root,
         _lock: lock,
     })
@@ -3188,17 +3223,31 @@ fn clear_receipt(path: &Path, directory: bool) -> std::io::Result<()> {
     }
 }
 
-/// The logs and sidecars in `logdir` (`<name>@<version>.log…`) of the libraries `work` checks,
-/// at a version other than the one it checks, each with whether it is a report directory: a
-/// library's version bump would otherwise leave its earlier version's logs there for good, and
-/// no run reads them. Only a regular file, or a report directory, is named; anything else stays.
+const RECEIPT_FILES: &[&str] = &[
+    "",
+    trust_facts::STORED_SUFFIX,
+    ".rc",
+    ".pace",
+    ".trustd",
+    ".trustd-lost",
+    ".budget",
+    crate::trust_oblig::RECORD_SUFFIX,
+    ".oblig.err",
+];
+
+/// Owned receipts for rows this run checks whose version has left the resolved graph.
+/// Another current version keeps its receipts even when only its sibling is selected.
 ///
 /// # Errors
 /// `logdir` could not be read.
-fn earlier_versions(logdir: &Path, work: &[&Selected]) -> std::io::Result<Vec<(PathBuf, bool)>> {
-    let now: BTreeMap<&str, String> = work
+fn earlier_versions(
+    logdir: &Path,
+    work: &[&Selected],
+    library_specs: &BTreeSet<String>,
+) -> std::io::Result<Vec<(PathBuf, bool)>> {
+    let rows: BTreeSet<&str> = work
         .iter()
-        .map(|s| (s.lib.name.as_str(), format!("{}.log", s.lib.spec)))
+        .filter_map(|s| s.lib.spec.rsplit_once('@').map(|(row, _)| row))
         .collect();
     let mut out = Vec::new();
     for entry in fs::read_dir(logdir)? {
@@ -3206,20 +3255,29 @@ fn earlier_versions(logdir: &Path, work: &[&Selected]) -> std::io::Result<Vec<(P
         let Ok(file) = entry.file_name().into_string() else {
             continue;
         };
-        let Some(log) = file.split_once('@').and_then(|(name, _)| now.get(name)) else {
+        let Some((spec, suffix)) = file.rsplit_once(".log") else {
             continue;
         };
-        if file.starts_with(log.as_str()) {
+        let report = suffix == ".report";
+        if !report && !RECEIPT_FILES.contains(&suffix) {
             continue;
         }
-        let Some((_, rest)) = file.split_once(".log") else {
+        let Some((row, version)) = spec.rsplit_once('@') else {
             continue;
         };
+        if !rows.contains(row) || !aterm_capacity::epoch_recipe::cargo_semver(version) {
+            continue;
+        }
+        // A current prerelease's log may have annotations whose names also spell a
+        // valid longer version. Keep everything in that current log's namespace.
+        if file.match_indices(".log").any(|(at, marker)| {
+            let suffix = &file[at + marker.len()..];
+            (suffix.is_empty() || suffix.starts_with('.')) && library_specs.contains(&file[..at])
+        }) {
+            continue;
+        }
         let kind = entry.file_type()?;
-        let report = rest == ".report";
-        if (rest.is_empty() || rest.starts_with('.'))
-            && ((report && kind.is_dir()) || (!report && kind.is_file()))
-        {
+        if (report && kind.is_dir()) || (!report && kind.is_file()) {
             out.push((entry.path(), report));
         }
     }
@@ -3232,7 +3290,8 @@ fn check_and_conclude(
     prep: &Prepared,
     bench: &mut dyn Bench,
     out: &mut dyn Write,
-) -> Result<Outcome, String> {
+    compiler_exits: &mut Vec<String>,
+) -> Result<Outcome, Stop> {
     let work = work(prep);
     for stale in [".trustd-grants", ".trustd-seen"] {
         clear_receipt(&prep.logdir.join(stale), false)
@@ -3240,24 +3299,14 @@ fn check_and_conclude(
     }
     for s in &work {
         let log = prep.logdir.join(format!("{}.log", s.lib.spec));
-        for ext in [
-            "",
-            trust_facts::STORED_SUFFIX,
-            ".rc",
-            ".pace",
-            ".trustd",
-            ".trustd-lost",
-            ".budget",
-            ".oblig.tsv",
-            ".oblig.err",
-        ] {
+        for ext in RECEIPT_FILES {
             clear_receipt(Path::new(&format!("{}{ext}", log.display())), false)
                 .map_err(|e| format!("compiler receipt namespace could not be cleared: {e}"))?;
         }
         clear_receipt(Path::new(&format!("{}.report", log.display())), true)
             .map_err(|e| format!("compiler receipt namespace could not be cleared: {e}"))?;
     }
-    for (path, directory) in earlier_versions(&prep.logdir, &work)
+    for (path, directory) in earlier_versions(&prep.logdir, &work, &prep.library_specs)
         .map_err(|e| format!("compiler receipt namespace could not be read: {e}"))?
     {
         clear_receipt(&path, directory)
@@ -3287,6 +3336,7 @@ fn check_and_conclude(
         })
         .collect();
     let mut new_costs: BTreeMap<String, Cost> = BTreeMap::new();
+    let mut grades = BTreeMap::new();
     let mut credit = crate::trust_credit::Credit::default();
     // Each check's mean load, for the run's provenance.
     let mut loads: Vec<f64> = Vec::new();
@@ -3319,6 +3369,20 @@ fn check_and_conclude(
                 // Ended by the run's stop, it decides nothing: only what it measured is kept.
                 return;
             }
+            // A receipt error can prevent the judge from printing its per-library table.
+            // Keep the observed process status independently of the sidecars it will read.
+            let budget_note = if f.over_budget { " (over budget)" } else { "" };
+            let daemon_note = if f.trustd_lost {
+                " (trustd went away)"
+            } else {
+                ""
+            };
+            compiler_exits.push(format!(
+                "trust: {} compiler status {}{budget_note}{daemon_note}, log {}",
+                f.job.name,
+                f.ended.code,
+                trust_facts::stored_log(&f.job.log).display()
+            ));
             let mut probe = || checks.probe_trustd();
             if let Some(l) = f.load {
                 loads.push(l);
@@ -3327,12 +3391,23 @@ fn check_and_conclude(
                 receipt_errors.push(format!("{}: {error}", f.job.name));
             }
             // Read before the slot runs another check: the package's graded record.
-            credit.add(
-                &f.job.name,
-                crate::trust_credit::read_record(&f.job.target, package_identity(&f.job.name)),
-            );
+            let record =
+                crate::trust_credit::read_record(&f.job.target, package_identity(&f.job.name));
+            match record.transpose() {
+                Ok(tally) => {
+                    grades.insert(
+                        f.job.name.clone(),
+                        tally.map_or(
+                            trust_facts::GradeEvidence::Absent,
+                            trust_facts::GradeEvidence::Measured,
+                        ),
+                    );
+                    credit.add(&f.job.name, tally.map(Ok));
+                }
+                Err(why) => credit.add(&f.job.name, Some(Err(why))),
+            }
             if let Some(r) = &reducer
-                && let Err(error) = r.send(&f.job)
+                && let Err(error) = r.send(&f.job, f.ended.code)
             {
                 receipt_errors.push(error.to_string());
             }
@@ -3350,26 +3425,52 @@ fn check_and_conclude(
             if let Err(error) = &ran {
                 why.push_str(&format!("; slot execution also ended: {error}"));
             }
-            return Err(why);
+            return Err(why.into());
         }
         ran?;
     }
+    // Use the working ledger at judgment time: it may have changed while the compiler ran.
+    let git = GitCli::new(&cfg.repo);
+    let measured = if matches!(cfg.scope, Scope::Remeasure) {
+        let (head, _) = prep
+            .files
+            .as_ref()
+            .and_then(|file| file.start.as_ref().ok())
+            .ok_or_else(|| "--remeasure has no starting commit for the stored facts".to_string())?;
+        Some(head.as_str())
+    } else {
+        None
+    };
+    let epoch = trust_facts::working_credit_epoch(&git, &cfg.repo, measured);
+    let epoch = match epoch {
+        Ok(epoch) if credit.refused.is_empty() => epoch,
+        refused => {
+            let observed = refused.as_ref().map(Option::as_ref).map_err(String::as_str);
+            let summary = credit.line_for_epoch(observed);
+            let grades = crate::trust_credit::judge(observed.ok().flatten(), &credit);
+            let failures = refused.err().into_iter().chain(grades).collect();
+            return Err(Stop::Credit { summary, failures });
+        }
+    };
     let mut plan = prep.plan.clone();
     plan.push_str(&format!("trustd {}\n", trustd::socket().display()));
     let load_end = load_word(bench.load());
     push_kv(&mut plan, "load-end", &load_end);
     if let Some(f) = &prep.files {
-        let mut why = f.why_not.clone();
-        if why.is_empty() && tree_state(&cfg.repo) != f.start {
-            why = "the checkout changed during the run (an edit or a commit)".into();
-        }
-        let git = GitCli::new(&cfg.repo);
+        let why = match &f.start {
+            Err(why) => *why,
+            Ok(start) => match tree_state(&cfg.repo) {
+                Ok(end) if *start == end => "",
+                Ok(_) => "HEAD changed during the run; run again at the commit to measure",
+                Err(why) => why,
+            },
+        };
         let store = crate::gates::receipt_store(&git)
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let (head, tree) = f.start.clone().unwrap_or_else(|| ("-".into(), "-".into()));
+        let (head, tree) = f.start.clone().unwrap_or_else(|_| ("-".into(), "-".into()));
         for (k, v) in [
-            ("file", why),
+            ("file", why.to_owned()),
             ("store", store),
             ("commit", head),
             ("tree", tree),
@@ -3417,6 +3518,9 @@ fn check_and_conclude(
     crate::durable::write_fresh(&prep.plan_path, &plan)
         .map_err(|e| format!("{}: {e}", prep.plan_path.display()))?;
     let mut parsed = Plan::parse(&plan)?;
+    if let (Some(file), Some(filing)) = (&mut parsed.file, &prep.files) {
+        file.packages.clone_from(&filing.packages);
+    }
     let update = if cfg.update_ratchet {
         Update {
             reason: cfg.reason.as_deref(),
@@ -3425,10 +3529,20 @@ fn check_and_conclude(
     } else {
         Update::NONE
     };
-    let git = GitCli::new(&cfg.repo);
-    let done = trust_facts::conclude(&git, &cfg.repo, &mut parsed, update)
-        .map_err(|e| format!("the judge could not conclude: {e}"))?;
-    if cfg.update_ratchet && !new_costs.is_empty() {
+    let floors =
+        trust_facts::FloorInputs::read(&parsed.ratchet, &parsed.memory, update).map_err(|e| {
+            format!("the judge could not conclude: proof floor inputs could not be read: {e}")
+        })?;
+    let done = trust_facts::conclude(
+        &git,
+        &cfg.repo,
+        &mut parsed,
+        &floors,
+        &grades,
+        epoch.as_ref(),
+    )
+    .map_err(|e| format!("the judge could not conclude: {e}"))?;
+    if cfg.update_ratchet && done.floors_accepted && !new_costs.is_empty() {
         let history = prep
             .costs_path
             .as_deref()
@@ -3445,6 +3559,7 @@ fn check_and_conclude(
             out,
         );
     }
+    drop(floors);
     for l in &done.said {
         let _ = writeln!(out, "{l}");
     }
@@ -3452,57 +3567,16 @@ fn check_and_conclude(
     if let Some(l) = &done.facts_line {
         let _ = writeln!(out, "{l}");
     }
+    let _ = writeln!(out, "trust: {}", done.credit_line);
     if !done.verdict.tail.is_empty() {
         let _ = writeln!(out, "{}", done.verdict.tail);
     }
-    Ok(with_credit(
-        Outcome::of(&done.verdict),
-        &cfg.repo,
-        &credit,
-        out,
-    ))
-}
-
-/// The "proved (calculus)" counter over this run's records, judged against the current credit
-/// epoch ([`crate::trust_credit`]): a regression or an unreadable record or ledger fails a run
-/// that would pass, and joins a failing run's list.
-fn with_credit(
-    outcome: Outcome,
-    repo: &Path,
-    credit: &crate::trust_credit::Credit,
-    out: &mut dyn Write,
-) -> Outcome {
-    let (line, failed) = match crate::trust_credit::current_epoch(repo) {
-        Ok(Some(e)) => (
-            credit.line(Some(&e)),
-            crate::trust_credit::judge(&e, credit),
-        ),
-        Ok(None) => (credit.line(None), Vec::new()),
-        Err(why) => (
-            credit.line(None),
-            vec![format!("credit epoch CREDIT-UNREADABLE {why}")],
-        ),
-    };
-    let _ = writeln!(out, "trust: {line}");
-    for f in &failed {
-        let _ = writeln!(out, "trust: {f}");
-    }
-    if failed.is_empty() {
-        return outcome;
-    }
-    match outcome {
-        Outcome::Pass => Outcome::Fail(failed),
-        Outcome::Fail(mut v) => {
-            v.extend(failed);
-            Outcome::Fail(v)
-        }
-        other => other,
-    }
+    Ok(Outcome::of(&done.verdict))
 }
 
 /// Background worker that reduces `--obligations` proof reports off the slot-polling thread.
 struct Reducer {
-    tx: Option<std::sync::mpsc::Sender<Job>>,
+    tx: Option<std::sync::mpsc::Sender<(Job, i32)>>,
     skip: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<Vec<ReductionError>>>,
 }
@@ -3546,7 +3620,7 @@ impl std::fmt::Display for ReductionError {
 
 impl Reducer {
     fn start(repo: PathBuf) -> Reducer {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let (tx, rx) = std::sync::mpsc::channel();
         let skip = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let skipping = std::sync::Arc::clone(&skip);
         let thread = std::thread::spawn(move || reduce_reports(rx, &repo, &skipping));
@@ -3557,12 +3631,12 @@ impl Reducer {
         }
     }
 
-    fn send(&self, job: &Job) -> Result<(), ReductionError> {
+    fn send(&self, job: &Job, exit: i32) -> Result<(), ReductionError> {
         let closed = || ReductionError::Queue(job.log.clone());
         self.tx
             .as_ref()
             .ok_or_else(closed)?
-            .send(job.clone())
+            .send((job.clone(), exit))
             .map_err(|_| closed())
     }
 
@@ -3588,14 +3662,14 @@ impl Drop for Reducer {
 }
 
 fn reduce_reports(
-    jobs: std::sync::mpsc::Receiver<Job>,
+    jobs: std::sync::mpsc::Receiver<(Job, i32)>,
     repo: &Path,
     skip: &std::sync::atomic::AtomicBool,
 ) -> Vec<ReductionError> {
     let mut errors = Vec::new();
-    for job in jobs {
+    for (job, exit) in jobs {
         if !skip.load(std::sync::atomic::Ordering::SeqCst)
-            && let Err(error) = reduce_report(&job, repo)
+            && let Err(error) = reduce_report(&job, repo, exit)
         {
             errors.push(error);
         }
@@ -3604,7 +3678,7 @@ fn reduce_reports(
 }
 
 /// The resource [`Cost`] of `f` under the prover `driver` names: what a check that finished
-/// took (its log has a summary, a whole one, and no transport failure), or what one cut short
+/// took (a verdict exit, a whole summary, and no transport failure), or what one cut short
 /// took before it ended ([`Cut`]: at its budget, by the run's stop, or by itself), each figure
 /// then the least it would have taken. `None` for a cut check whose peak was not read.
 fn cost_of(f: &Finished, driver: &Driver) -> std::io::Result<Option<Cost>> {
@@ -3615,7 +3689,7 @@ fn cost_of(f: &Finished, driver: &Driver) -> std::io::Result<Option<Cost>> {
     } else {
         let log = trust_facts::open_log(&f.job.log)?;
         let m = trust_facts::Measured::of_log(log, &f.ended.code.to_string())?;
-        (m.summary.is_empty() || !m.ended.is_empty() || m.transport).then_some(Cut::Failed)
+        (m.transport || !m.ended.is_empty() || m.floor_counts().is_err()).then_some(Cut::Failed)
     };
     Ok(cost_when_cut(f, driver, cut))
 }
@@ -3674,14 +3748,7 @@ fn write_cost_file(path: &Path, header: &str, all: &CostRows, out: &mut dyn Writ
         }
         text.push('\n');
     }
-    let tmp = path.with_extension(format!("tsv.{}", std::process::id()));
-    let written = path
-        .parent()
-        .map_or(Ok(()), fs::create_dir_all)
-        .and_then(|()| write_new_temp(&tmp, text.as_bytes()))
-        .and_then(|()| fs::rename(&tmp, path));
-    if let Err(e) = written {
-        let _ = fs::remove_file(&tmp);
+    if let Err(e) = write_state_text(path, &text) {
         let _ = writeln!(
             out,
             "trust: the cost history was not written ({}: {e}); the next run orders by what it holds",
@@ -3692,7 +3759,7 @@ fn write_cost_file(path: &Path, header: &str, all: &CostRows, out: &mut dyn Writ
 
 /// Reduces `job`'s `--obligations` proof report beside its log and removes the raw directory
 /// on success.
-fn reduce_report(job: &Job, repo: &Path) -> Result<(), ReductionError> {
+fn reduce_report(job: &Job, repo: &Path, exit: i32) -> Result<(), ReductionError> {
     let Some(report) = &job.report else {
         return Ok(());
     };
@@ -3708,7 +3775,15 @@ fn reduce_report(job: &Job, repo: &Path) -> Result<(), ReductionError> {
             crate::trust_oblig::RECORD_SUFFIX
         )),
     };
-    if let Err(why) = crate::trust_oblig::write_record(&args) {
+    if let Err(mut why) = crate::trust_oblig::write_record(&args) {
+        if exit != 0 {
+            let context = match trust_facts::last_targo_message(&job.log) {
+                Ok(Some(message)) => format!("last stored Targo message: {message}"),
+                Ok(None) => format!("log: {}", trust_facts::stored_log(&job.log).display()),
+                Err(error) => format!("could not read the completed check log: {error}"),
+            };
+            why = format!("proof command exited {exit}; {context}; {why}");
+        }
         let diagnostic_path = PathBuf::from(format!("{}.oblig.err", job.log.display()));
         let diagnostic = crate::durable::write_fresh(
             &diagnostic_path,
@@ -3729,14 +3804,20 @@ fn reduce_report(job: &Job, repo: &Path) -> Result<(), ReductionError> {
     Ok(())
 }
 
-/// Returns `(HEAD, HEAD^{tree})` when `repo` is strictly clean, or `None` otherwise.
-fn tree_state(repo: &Path) -> Option<(String, String)> {
-    if !crate::clean::strictly_clean(repo)? {
-        return None;
+/// The commit and its tree in a clean checkout, or why they could not be established.
+fn tree_state(repo: &Path) -> Result<(String, String), &'static str> {
+    if !crate::clean::strictly_clean(repo)
+        .ok_or("Git could not inspect the checkout and its index")?
+    {
+        return Err(
+            "the checkout failed the clean-tree check; use a clean checkout without hidden index entries",
+        );
     }
     let git = GitCli::new(repo);
-    let rev = |r: &str| crate::ledger::rev_parse(&git, r).ok();
-    Some((rev("HEAD")?, rev("HEAD^{tree}")?))
+    let head = crate::ledger::rev_parse(&git, "HEAD").map_err(|_| "Git could not resolve HEAD")?;
+    let tree = crate::ledger::rev_parse(&git, &format!("{head}^{{tree}}"))
+        .map_err(|_| "Git could not read the tree of the measured commit")?;
+    Ok((head, tree))
 }
 
 /// The disk a run claims (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT): its target
@@ -4205,14 +4286,7 @@ fn keep_in_record(record: &Path, reached: &[(i32, u64)]) -> bool {
         if rec.kept.len() == before {
             return Ok(());
         }
-        let mut name = std::ffi::OsString::from(".new");
-        name.push(record.file_name().unwrap_or_default());
-        let new = record.with_file_name(name);
-        write_new_temp(&new, rec.text().as_bytes())
-            .and_then(|()| fs::rename(&new, record))
-            .inspect_err(|_| {
-                let _ = fs::remove_file(&new);
-            })
+        trust_facts::write_staged_text(&[(record, Some(&rec.text()))])
     });
     kept.inspect_err(|e| {
         eprintln!(
@@ -4298,21 +4372,17 @@ fn driver_ceiling(
         let row = format!("{key}{}", if takes { "yes" } else { "no" });
         rows.push(&row);
         let body = format!("{CEILING_CACHE_HEADER}\n{}\n", rows.join("\n"));
-        let tmp = cache.with_extension(format!("tsv.{}", std::process::id()));
-        let written = cache
-            .parent()
-            .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| write_new_temp(&tmp, body.as_bytes()))
-            .and_then(|()| fs::rename(&tmp, &cache));
-        if written.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
+        let _ = write_state_text(&cache, &body);
     }
     takes
 }
 
-fn write_new_temp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    crate::durable::write_fresh(tmp, bytes)
+/// Creates the parent if needed and atomically replaces one lane state file.
+fn write_state_text(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    trust_facts::write_staged_text(&[(path, Some(text))])
 }
 
 /// Returns this host's RAM in bytes and whether it was read from Linux `MemTotal`.
@@ -4356,7 +4426,7 @@ pub(crate) const OWN_ROOT: &str = "target-trust.noindex";
 const LEGACY_ROOT: &str = "target-trust";
 
 /// Fallback target-root subdirectory name under the user's cache directory.
-const CACHE_DIR: &str = "aterm-trust-lane";
+const CACHE_DIR: &str = "aterm-trust-lane.noindex";
 
 /// macOS fallback target-root path under `$HOME` with `.noindex` Spotlight exclusion.
 const MAC_CACHE_DIR: &str = "Library/Caches/aterm-trust-lane.noindex";
@@ -4421,25 +4491,6 @@ fn legacy_root_note(cfg: &Config) -> Option<String> {
                 legacy.display()
             )
         })
-}
-
-/// Returns a warning on macOS when an explicit `--target-root` has no `*.noindex` component.
-fn indexed_root_note(cfg: &Config, root: &Path) -> Option<String> {
-    let skipped = |p: &Path| {
-        p.components().any(|c| {
-            c.as_os_str()
-                .to_string_lossy()
-                .ends_with(atpkg::build_cache::NOINDEX)
-        })
-    };
-    (cfg!(target_os = "macos") && cfg.target_root.is_some() && !skipped(root)).then(|| {
-        format!(
-            "the target root {} is in no folder named *.noindex, so Spotlight indexes every \
-             file this run writes there: name it {}",
-            root.display(),
-            atpkg::build_cache::noindex(&root.display().to_string())
-        )
-    })
 }
 
 /// The checkout as the file system names it: what keys its fallback root.
@@ -5197,7 +5248,7 @@ impl Checks for RealChecks<'_> {
 
     fn start(&mut self, job: &mut Job) -> std::io::Result<Box<dyn Check>> {
         let target = self.root.join(format!("j{}", job.slot));
-        owner_dirs(&target)?;
+        aterm_uds::backup::Backups::SYSTEM.build_dir(&target)?;
         // The slot is not held, so a stamp left in it is spent; the first stamp a reap of
         // this check's record finds must be that reap's own ([`reap_stale_checks`]).
         if let Err(e) = fs::remove_file(target.join(aterm_uds::deadline::EXEC_STAMP))
@@ -5270,7 +5321,9 @@ impl Checks for RealChecks<'_> {
         // run's: a slot whose record is left is held ([`slot_held`]).
         let record = self.root.join(format!(".check.{}", job.slot));
         let written = crate::durable::open_create_new(&record)?.write_all(rec.text().as_bytes());
-        let spawned = written.and_then(|()| cmd.spawn());
+        let spawned = written
+            .and_then(|()| clear_slot_grade(&target, package_identity(&job.name)))
+            .and_then(|()| cmd.spawn());
         // The pipe's writers are the check's alone from here, so its output ends with them.
         drop(cmd);
         let mut child = match spawned {
@@ -5357,6 +5410,40 @@ impl Checks for RealChecks<'_> {
 
     fn load(&self) -> Option<f64> {
         aterm_sysprobe::load_average().map(|l| l[0])
+    }
+}
+
+/// Clear this package's grade after claiming the slot. Trust can finish without replacing it.
+/// An entry left by an earlier check must never direct cleanup outside the slot.
+fn clear_slot_grade(target: &Path, package: &str) -> std::io::Result<()> {
+    use aterm_dirfd::{AtFlags, FileType, Mode, OFlags, fstatat, openat, unlinkat};
+    use std::io::{Error, ErrorKind};
+
+    let grade = crate::trust_credit::record_path(Path::new(""), package);
+    let remove = || -> std::io::Result<()> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut dir = openat(aterm_dirfd::CWD, target, flags, Mode::empty())?;
+        let mut parts = grade.iter();
+        let name = parts
+            .next_back()
+            .expect("record_path always appends an NDJSON file name");
+        for part in parts {
+            dir = openat(&dir, part, flags, Mode::empty())?;
+        }
+        let entry = fstatat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if !FileType::from_raw_mode(entry.st_mode).is_file() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "unexpected grade entry; preserved",
+            ));
+        }
+        unlinkat(&dir, name, AtFlags::empty())?;
+        Ok(())
+    };
+    match remove() {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        result => result
+            .map_err(|e| Error::new(e.kind(), format!("{}: {e}", target.join(grade).display()))),
     }
 }
 

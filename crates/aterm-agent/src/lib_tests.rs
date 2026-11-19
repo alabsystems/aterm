@@ -800,6 +800,13 @@ fn a_read_only_connection_refuses_every_mutating_subform() {
         "metrics percentiles json",
         "metrics --json percentiles",
         "metrics json percentiles --json",
+        "metrics commons",
+        "@s-1 metrics commons",
+        "metrics commons --json",
+        "metrics json commons",
+        "metrics cadence",
+        "@s-1 metrics cadence",
+        "metrics cadence --json",
     ];
     let mutations = [
         "@s-1 meta set attention held",
@@ -811,6 +818,9 @@ fn a_read_only_connection_refuses_every_mutating_subform() {
         "metrics --json reset",
         "metrics reset --json",
         "metrics json reset --json",
+        "metrics commons reset",
+        "metrics reset commons",
+        "metrics cadence reset",
     ];
     let replies = b"OK\n".repeat(reads.len() + mutations.len());
     let mut ro = RelayClient::new(RecordingTransport::new(&replies)).reads_only();

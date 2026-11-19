@@ -165,7 +165,7 @@ fn the_watch_rests_long_only_while_nothing_is_followed() {
 /// A RING ENDS THE REST before its deadline, and the rest takes it: one heard before a five
 /// minutes' rest ends it at once, and the next rest, given no time, runs to its deadline unrung.
 /// A ring that reaches a parked rest is [`ParkBell`]'s own test
-/// (`park_bell::tests::a_ring_reaches_a_parked_waiter`). NEGATIVE CONTROL: a rest that reads the
+/// (`aterm_uds::park_bell::tests::a_ring_reaches_a_parked_waiter`). NEGATIVE CONTROL: a rest that reads the
 /// ring without taking it answers rung again.
 #[test]
 fn a_ring_ends_the_rest_once() {

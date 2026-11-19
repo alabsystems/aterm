@@ -435,6 +435,7 @@ fn select(
         state,
         &enrolled,
         Some(&source.label),
+        accounts::ModelWeek::Unread,
         &Point::LoginEnded,
         seat.now,
     );

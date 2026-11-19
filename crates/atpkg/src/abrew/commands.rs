@@ -17085,10 +17085,22 @@ mod livecheck {
                         _ => pkg.stable_url.as_str(),
                     };
                     let path = url.split(['?', '#']).next().unwrap_or(url);
-                    let lower = path.to_ascii_lowercase();
-                    (lower.ends_with(".zip")
-                        || (cfg!(target_os = "macos") && lower.ends_with(".dmg")))
-                        && (!s.strategy_block || s.plist_block.is_some())
+                    let lower = path.trim_end_matches('/').to_ascii_lowercase();
+                    let seg = lower.rsplit('/').next().unwrap_or(&lower);
+                    let ext = seg.rsplit_once('.').map(|(_, e)| e);
+                    let container_native = match ext {
+                        Some("zip") => true,
+                        Some("dmg") => cfg!(target_os = "macos"),
+                        Some(
+                            "pkg" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar"
+                            | "exe" | "msi" | "deb" | "rpm" | "jar" | "war",
+                        ) => false,
+                        // Extension-less containers are
+                        // sniffed by content, but only when
+                        // declared apps name a plist to read.
+                        _ => !pkg.apps.is_empty(),
+                    };
+                    container_native && (!s.strategy_block || s.plist_block.is_some())
                 });
                 if enabled && native {
                     // Falls through to the remaining skips.
@@ -17257,6 +17269,196 @@ mod livecheck {
         out
     }
 
+    /// Split-search direction for a prefix: the
+    /// boundary moves within the LAST unbounded
+    /// quantifier's span, so its greediness decides
+    /// (`href=.*?v?` and `…VooVMeeting[._-].+?v?`
+    /// are both shortest-first; a trailing fixed
+    /// `v?` does not count).
+    fn prefix_lazy(s: &str) -> bool {
+        let b = s.as_bytes();
+        let mut class = false;
+        let mut i = 0usize;
+        let mut lazy = false;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 1,
+                b'[' => class = true,
+                b']' => class = false,
+                b'*' | b'+' if !class => lazy = b.get(i + 1) == Some(&b'?'),
+                b'{' if !class && b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                    if let Some(close) = s[i..].find('}') {
+                        lazy = b.get(i + close + 1) == Some(&b'?');
+                        i += close;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        lazy
+    }
+
+    /// Ruby `\h`/`\H` hex classes: outside a class
+    /// they become bracket expressions; `\h` inside
+    /// a class inlines its ranges (a nested bracket
+    /// would not compile). `\H` inside a class has
+    /// no such inline form and is left to fail.
+    fn translate_hex_classes(pat: &str) -> String {
+        let bytes = pat.as_bytes();
+        let mut out = String::with_capacity(pat.len());
+        let mut class = false;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if i + 1 < bytes.len() => {
+                    match bytes[i + 1] {
+                        b'h' => out.push_str(if class { "0-9A-Fa-f" } else { "[0-9A-Fa-f]" }),
+                        b'H' if !class => out.push_str("[^0-9A-Fa-f]"),
+                        _ => {
+                            out.push(bytes[i] as char);
+                            out.push(bytes[i + 1] as char);
+                        }
+                    }
+                    i += 2;
+                }
+                b'[' => {
+                    class = true;
+                    out.push('[');
+                    i += 1;
+                }
+                b']' => {
+                    class = false;
+                    out.push(']');
+                    i += 1;
+                }
+                b => {
+                    // Copy one UTF-8 char.
+                    let s = &pat[i..];
+                    let c = s.chars().next().unwrap_or(b as char);
+                    out.push(c);
+                    i += c.len_utf8();
+                }
+            }
+        }
+        out
+    }
+
+    /// MD5 hex digest (Ruby `Digest::MD5.hexdigest`).
+    fn md5_hex(input: &[u8]) -> String {
+        const S: [[u32; 4]; 4] = [
+            [7, 12, 17, 22],
+            [5, 9, 14, 20],
+            [4, 11, 16, 23],
+            [6, 10, 15, 21],
+        ];
+        const K: [u32; 64] = [
+            0xd76a_a478,
+            0xe8c7_b756,
+            0x2420_70db,
+            0xc1bd_ceee,
+            0xf57c_0faf,
+            0x4787_c62a,
+            0xa830_4613,
+            0xfd46_9501,
+            0x6980_98d8,
+            0x8b44_f7af,
+            0xffff_5bb1,
+            0x895c_d7be,
+            0x6b90_1122,
+            0xfd98_7193,
+            0xa679_438e,
+            0x49b4_0821,
+            0xf61e_2562,
+            0xc040_b340,
+            0x265e_5a51,
+            0xe9b6_c7aa,
+            0xd62f_105d,
+            0x0244_1453,
+            0xd8a1_e681,
+            0xe7d3_fbc8,
+            0x21e1_cde6,
+            0xc337_07d6,
+            0xf4d5_0d87,
+            0x455a_14ed,
+            0xa9e3_e905,
+            0xfcef_a3f8,
+            0x676f_02d9,
+            0x8d2a_4c8a,
+            0xfffa_3942,
+            0x8771_f681,
+            0x6d9d_6122,
+            0xfde5_380c,
+            0xa4be_ea44,
+            0x4bde_cfa9,
+            0xf6bb_4b60,
+            0xbebf_bc70,
+            0x289b_7ec6,
+            0xeaa1_27fa,
+            0xd4ef_3085,
+            0x0488_1d05,
+            0xd9d4_d039,
+            0xe6db_99e5,
+            0x1fa2_7cf8,
+            0xc4ac_5665,
+            0xf429_2244,
+            0x432a_ff97,
+            0xab94_23a7,
+            0xfc93_a039,
+            0x655b_59c3,
+            0x8f0c_cc92,
+            0xffef_f47d,
+            0x8584_5dd1,
+            0x6fa8_7e4f,
+            0xfe2c_e6e0,
+            0xa301_4314,
+            0x4e08_11a1,
+            0xf753_7e82,
+            0xbd3a_f235,
+            0x2ad7_d2bb,
+            0xeb86_d391,
+        ];
+        let mut state: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+        let bitlen = (input.len() as u64).wrapping_mul(8);
+        let mut data = input.to_vec();
+        data.push(0x80);
+        while data.len() % 64 != 56 {
+            data.push(0);
+        }
+        data.extend_from_slice(&bitlen.to_le_bytes());
+        for chunk in data.chunks_exact(64) {
+            let mut m = [0u32; 16];
+            for (i, word) in chunk.chunks_exact(4).enumerate() {
+                m[i] = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+            }
+            let (mut a, mut b, mut c, mut d) = (state[0], state[1], state[2], state[3]);
+            for i in 0..64 {
+                let (f, g) = match i / 16 {
+                    0 => ((b & c) | (!b & d), i),
+                    1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                    2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                    _ => (c ^ (b | !d), (7 * i) % 16),
+                };
+                let sum = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
+                a = d;
+                d = c;
+                c = b;
+                b = b.wrapping_add(sum.rotate_left(S[i / 16][i % 4]));
+            }
+            state[0] = state[0].wrapping_add(a);
+            state[1] = state[1].wrapping_add(b);
+            state[2] = state[2].wrapping_add(c);
+            state[3] = state[3].wrapping_add(d);
+        }
+        let mut out = String::with_capacity(32);
+        for word in state {
+            for byte in word.to_le_bytes() {
+                out.push_str(&format!("{byte:02x}"));
+            }
+        }
+        out
+    }
+
     fn lc_regex(pattern: &str, flags: &str) -> Result<LcRegex, Outside> {
         let mut src = String::from("(?m)");
         if flags.contains('i') {
@@ -17265,11 +17467,10 @@ mod livecheck {
         if flags.contains('m') {
             src.push_str("(?s)");
         }
-        src.push_str(
-            &ruby_pattern_translate(pattern, flags.contains('x'))
-                .replace("\\h", "[0-9A-Fa-f]")
-                .replace("\\H", "[^0-9A-Fa-f]"),
-        );
+        src.push_str(&translate_hex_classes(&ruby_pattern_translate(
+            pattern,
+            flags.contains('x'),
+        )));
         let compile = |p: &str| {
             aterm_regex::RegexBuilder::new(p)
                 .size_limit(1024 * 1024)
@@ -17307,7 +17508,7 @@ mod livecheck {
                     if quantified {
                         return Err(Outside);
                     }
-                    let lazy = ["*?", "+?", "??", "}?"].iter().any(|e| prefix.ends_with(e));
+                    let lazy = prefix_lazy(&prefix);
                     let group_lazy = ["*?", "+?", "??", "}?"].iter().any(|e| sub.ends_with(e));
                     (
                         Some(compile(&flag_prefix(&sub))?),
@@ -17340,17 +17541,48 @@ mod livecheck {
             .iter()
             .skip(1)
             .map(|span| {
-                if span.quantified {
+                // A greedy repeated group (`(…)*`/`+`):
+                // Ruby keeps its LAST iteration. Split
+                // with the repetitions folded into the
+                // prefix and one final iteration as the
+                // body; the greedy search then lands on
+                // the last iteration (no split at all
+                // when it never iterated).
+                let repeated = if span.quantified {
+                    let q = body.as_bytes().get(span.close + 1).copied();
+                    let after_q = body.as_bytes().get(span.close + 2).copied();
+                    if !matches!(q, Some(b'*' | b'+')) || matches!(after_q, Some(b'?' | b'+')) {
+                        return None;
+                    }
+                    true
+                } else {
+                    false
+                };
+                let prefix = if repeated {
+                    // The body supplies the mandatory
+                    // iteration, so the folded prefix
+                    // repetition is `*` even for `+`.
+                    let mut text = body[..span.close + 2].to_string();
+                    text.replace_range(span.close + 1..span.close + 2, "*");
+                    rebalance_prefix(&text)
+                } else {
+                    rebalance_prefix(&body[..span.open])
+                };
+                let suffix = if repeated {
+                    rebalance_suffix(&body[span.close + 2..])
+                } else {
+                    rebalance_suffix(&body[span.suffix_at.min(body.len())..])
+                };
+                let sub = &body[span.inner_start..span.close];
+                let body_full = compile(&anchored(sub)).ok()?;
+                if repeated && body_full.find("").is_some() {
                     return None;
                 }
-                let prefix = rebalance_prefix(&body[..span.open]);
-                let suffix = rebalance_suffix(&body[span.suffix_at.min(body.len())..]);
-                let sub = &body[span.inner_start..span.close];
-                let lazy = ["*?", "+?", "??", "}?"].iter().any(|e| prefix.ends_with(e));
+                let lazy = prefix_lazy(&prefix);
                 let group_lazy = ["*?", "+?", "??", "}?"].iter().any(|e| sub.ends_with(e));
                 Some(GroupSplit {
                     body: compile(&flag_prefix(sub)).ok()?,
-                    body_full: compile(&anchored(sub)).ok()?,
+                    body_full,
                     pre_full: if prefix.is_empty() {
                         None
                     } else {
@@ -17567,10 +17799,10 @@ mod livecheck {
                 b'[' => in_class = true,
                 b']' => in_class = false,
                 b'(' if !in_class => {
-                    if let Some(marker) = group_marker(prefix, i) {
-                        if marker > 0 {
-                            stack.push((i, marker));
-                        }
+                    if let Some(marker) = group_marker(prefix, i)
+                        && marker > 0
+                    {
+                        stack.push((i, marker));
                     }
                 }
                 b')' if !in_class => {
@@ -17667,10 +17899,42 @@ mod livecheck {
         lazy_group: bool,
         m: &str,
     ) -> Option<String> {
+        extract_split_limited(
+            pre_full,
+            body,
+            body_full,
+            post_full,
+            lazy_prefix,
+            lazy_group,
+            m,
+            512,
+        )
+    }
+
+    fn extract_split_limited(
+        pre_full: Option<&aterm_regex::Regex>,
+        body: &aterm_regex::Regex,
+        body_full: Option<&aterm_regex::Regex>,
+        post_full: Option<&aterm_regex::Regex>,
+        lazy_prefix: bool,
+        lazy_group: bool,
+        m: &str,
+        exhaustive_limit: usize,
+    ) -> Option<String> {
         let full = |re: &aterm_regex::Regex, s: &str| re.find(s).is_some();
-        if m.len() <= 512 {
-            let mut bounds: Vec<usize> = m.char_indices().map(|(i, _)| i).collect();
-            bounds.push(m.len());
+        // A `None` pre/post means that pattern part is
+        // literally empty, so the capture starts at 0 /
+        // ends at the match end — not unconstrained
+        // (`(\d)(\d+)` on "154" must yield "1", never
+        // the "5" a greedy free start finds).
+        if m.len() <= exhaustive_limit {
+            let mut bounds: Vec<usize> = if pre_full.is_none() {
+                vec![0]
+            } else {
+                let mut b: Vec<usize> = m.char_indices().map(|(i, _)| i).collect();
+                b.push(m.len());
+                b
+            };
             if !lazy_prefix {
                 bounds.reverse();
             }
@@ -17685,8 +17949,13 @@ mod livecheck {
                 if gm.start() != 0 {
                     continue;
                 }
-                let mut ends: Vec<usize> = rest.char_indices().map(|(i, _)| i).collect();
-                ends.push(rest.len());
+                let mut ends: Vec<usize> = if post_full.is_none() {
+                    vec![rest.len()]
+                } else {
+                    let mut e: Vec<usize> = rest.char_indices().map(|(i, _)| i).collect();
+                    e.push(rest.len());
+                    e
+                };
                 if !lazy_group {
                     ends.reverse();
                 }
@@ -17714,7 +17983,11 @@ mod livecheck {
         // order; ends are the body-full matches from
         // each start (captures are short), in group
         // order.
-        let mut starts: Vec<usize> = body.find_iter(m).map(|mm| mm.start()).collect();
+        let mut starts: Vec<usize> = if pre_full.is_none() {
+            vec![0]
+        } else {
+            body.find_iter(m).map(|mm| mm.start()).collect()
+        };
         if !lazy_prefix {
             starts.reverse();
         }
@@ -17726,14 +17999,19 @@ mod livecheck {
             }
             let rest = &m[s0..];
             let cap = rest.len().min(256);
-            let mut ends: Vec<usize> = rest[..rest.floor_char_boundary(cap)]
-                .char_indices()
-                .map(|(i, _)| i)
-                .filter(|&j| j > 0)
-                .collect();
-            if cap == rest.len() {
-                ends.push(rest.len());
-            }
+            let mut ends: Vec<usize> = if post_full.is_none() {
+                vec![rest.len()]
+            } else {
+                let mut e: Vec<usize> = rest[..rest.floor_char_boundary(cap)]
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .filter(|&j| j > 0)
+                    .collect();
+                if cap == rest.len() {
+                    e.push(rest.len());
+                }
+                e
+            };
             if !lazy_group {
                 ends.reverse();
             }
@@ -17764,6 +18042,23 @@ mod livecheck {
             re.lazy_prefix,
             re.lazy_group,
             m,
+        )
+    }
+
+    /// Group 1 with a larger exhaustive-split
+    /// budget, for shapes whose capture is itself
+    /// a long section of the page.
+    fn extract_group_limited(re: &LcRegex, m: &str, limit: usize) -> Option<String> {
+        let g = re.group1.as_ref()?;
+        extract_split_limited(
+            re.pre_full.as_ref(),
+            g,
+            re.group1_full.as_ref(),
+            re.post_full.as_ref(),
+            re.lazy_prefix,
+            re.lazy_group,
+            m,
+            limit,
         )
     }
 
@@ -17911,6 +18206,25 @@ mod livecheck {
             }
             SpExpr::BlankElse { blank, parts, .. } => {
                 parts_ok(blank, false) && parts_ok(parts, false)
+            }
+            SpExpr::CapBlankElse {
+                cap, blank, parts, ..
+            } => cap_ok(*cap, false) && parts_ok(blank, false) && parts_ok(parts, false),
+            SpExpr::FieldIndexTr(_, n, ..) => cap_ok(*n, false),
+            SpExpr::LitMatch { parts, .. } => parts_ok(parts, false),
+            SpExpr::BlankOwnElse { blank, parts, .. } => {
+                parts_ok(blank, false) && parts_ok(parts, false)
+            }
+            SpExpr::DotlessFork { cap, .. } => cap_ok(*cap, false),
+            SpExpr::ScanEqElse {
+                a, b, then, els, ..
+            } => {
+                use super::super::formula::SpOp;
+                let op_ok = |o: &SpOp| match o {
+                    SpOp::Cap(n) => cap_ok(*n, true),
+                    SpOp::Field(_) => true,
+                };
+                op_ok(a) && op_ok(b) && parts_ok(then, true) && parts_ok(els, true)
             }
             SpExpr::Scan { parts, .. } => parts_ok(parts, true),
             _ => true,
@@ -18701,6 +19015,9 @@ mod livecheck {
         /// The checked unit's `version.major_minor`, for
         /// guarded `:json` map conditions.
         major_minor: String,
+        /// The checked unit's own version (a sparkle
+        /// block's bare `version`).
+        own_version: String,
         /// The `:extract_plist` block shape (a block-less
         /// strategy keeps `None` with the strat set).
         plist: Option<super::super::formula::PlistBlock>,
@@ -19088,6 +19405,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -19129,6 +19447,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -19164,7 +19483,7 @@ mod livecheck {
         if !host_ok {
             return None;
         }
-        fn seg<'a>(rest: &'a str) -> Option<(&'a str, &'a str)> {
+        fn seg(rest: &str) -> Option<(&str, &str)> {
             let name = rest.split('/').next().filter(|n| !n.is_empty())?;
             Some((name, &rest[name.len()..]))
         }
@@ -19177,9 +19496,9 @@ mod livecheck {
             let (name, tail) = seg(rest)?;
             if !tail.starts_with('/') {
                 // Falls to the generic segment below.
-                match path.strip_prefix('/') {
-                    Some(r) => seg(r)?.0,
-                    None => return None,
+                {
+                    let r = path.strip_prefix('/')?;
+                    seg(r)?.0
                 }
             } else {
                 name
@@ -19190,9 +19509,9 @@ mod livecheck {
             if tail.starts_with('/') {
                 name
             } else {
-                match path.strip_prefix('/') {
-                    Some(r) => seg(r)?.0,
-                    None => return None,
+                {
+                    let r = path.strip_prefix('/')?;
+                    seg(r)?.0
                 }
             }
         } else {
@@ -19246,6 +19565,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -19285,10 +19605,7 @@ mod livecheck {
                 Some((p, f)) => (Some(lc_regex(p, f)?), false),
                 None => (
                     Some(lc_regex(
-                        &format!(
-                            "{}(\\d+(?:\\.\\d+)*)\\.t",
-                            format!("{}-", ruby_regex_escape(package))
-                        ),
+                        &format!("{}-(\\d+(?:\\.\\d+)*)\\.t", ruby_regex_escape(package)),
                         "i",
                     )?),
                     true,
@@ -19321,6 +19638,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -19495,6 +19813,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -19626,6 +19945,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -19705,6 +20025,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -19821,6 +20142,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -19990,6 +20312,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -20037,6 +20360,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -20047,6 +20371,7 @@ mod livecheck {
         url: &str,
         spec: Option<&LivecheckSpec>,
         candidates: Vec<&'static str>,
+        own_version: &str,
     ) -> Result<UrlPlan, Outside> {
         let ua = spec_ua(spec);
         let ghrel_block = if strat == Strat::GithubReleases {
@@ -20064,6 +20389,15 @@ mod livecheck {
                 }
                 if let Some(l) = b.pre_capture.as_ref().and_then(|c| c.lit.as_ref()) {
                     lits.push(l);
+                }
+                for g in &b.own_guards {
+                    for xf in [&g.cap_xform, &g.own_xform] {
+                        if let super::super::formula::GhRelXform::SubRe(pat, flags, _) = xf
+                            && lc_regex(pat, flags).is_err()
+                        {
+                            return Err(Outside);
+                        }
+                    }
                 }
                 if let Some((pat, flags)) = match &b.asset_any {
                     Some(super::super::formula::GhRelAny::NameMatch(p, f)) => Some((p, f)),
@@ -20139,7 +20473,7 @@ mod livecheck {
             };
             let parts_ok = |parts: &[LatestPart], scan: bool| {
                 parts.iter().all(|p| match p {
-                    LatestPart::Cap(n) => {
+                    LatestPart::Cap(n) | LatestPart::CapTr(n, ..) => {
                         if scan {
                             scan_ok(*n)
                         } else {
@@ -20147,6 +20481,7 @@ mod livecheck {
                         }
                     }
                     LatestPart::Lit(_) | LatestPart::Local => true,
+                    LatestPart::AssetsMaxUpdatedDigits => b.asset_pick.is_some(),
                 })
             };
             let ok = match &b.render {
@@ -20160,7 +20495,9 @@ mod livecheck {
                 } => {
                     use super::super::formula::LatestOp;
                     let op_ok = |o: &LatestOp| match o {
-                        LatestOp::Cap(n) => md_ok(*n),
+                        LatestOp::Cap(n) | LatestOp::CapTr(n, ..) | LatestOp::CapMmp(n) => {
+                            md_ok(*n)
+                        }
                         LatestOp::Local => true,
                     };
                     op_ok(a) && op_ok(bb) && parts_ok(then, false) && parts_ok(els, false)
@@ -20182,6 +20519,15 @@ mod livecheck {
             {
                 return Err(Outside);
             }
+            if let Some(pre) = &b.pre_capture {
+                for op in &pre.ops {
+                    if let super::super::formula::LatestPreOp::SubRe(pat, flags, _) = op
+                        && lc_regex(pat, flags).is_err()
+                    {
+                        return Err(Outside);
+                    }
+                }
+            }
         }
         // Every capture a ghrel render reads must have
         // working extraction machinery.
@@ -20198,25 +20544,30 @@ mod livecheck {
                     _ => true,
                 })
             };
-            let ok = match &b.then {
-                GhRelThen::Template(parts) => parts_ok(parts),
-                GhRelThen::EqElse {
-                    a,
-                    b: bb,
-                    then,
-                    els,
-                } => {
-                    let op_ok = |o: &GhRelOp| match o {
-                        GhRelOp::Cap(n) => cap_ok(*n),
-                        GhRelOp::Local | GhRelOp::Tag => true,
-                    };
-                    op_ok(a) && op_ok(bb) && parts_ok(then) && parts_ok(els)
-                }
-                GhRelThen::TruthyElse { cap, then, els } => {
-                    cap_ok(*cap) && parts_ok(then) && parts_ok(els)
-                }
-                _ => true,
-            };
+            let guards_ok = b.own_guards.iter().all(|g| cap_ok(g.cap));
+            let ok = guards_ok
+                && match &b.then {
+                    GhRelThen::CompactJoin(_) => {
+                        re.has_group && re.extra_groups.iter().all(Option::is_some)
+                    }
+                    GhRelThen::Template(parts) => parts_ok(parts),
+                    GhRelThen::EqElse {
+                        a,
+                        b: bb,
+                        then,
+                        els,
+                    } => {
+                        let op_ok = |o: &GhRelOp| match o {
+                            GhRelOp::Cap(n) => cap_ok(*n),
+                            GhRelOp::Local | GhRelOp::Tag => true,
+                        };
+                        op_ok(a) && op_ok(bb) && parts_ok(then) && parts_ok(els)
+                    }
+                    GhRelThen::TruthyElse { cap, then, els } => {
+                        cap_ok(*cap) && parts_ok(then) && parts_ok(els)
+                    }
+                    _ => true,
+                };
             if !ok {
                 return Err(Outside);
             }
@@ -20258,6 +20609,7 @@ mod livecheck {
             post_json: None,
             headers: Vec::new(),
             major_minor: String::new(),
+            own_version: own_version.to_string(),
             plist: None,
             apps: Vec::new(),
         })))
@@ -20360,6 +20712,7 @@ mod livecheck {
         spec: Option<&LivecheckSpec>,
         url: &str,
         major_minor: &str,
+        own_version: &str,
     ) -> Result<UrlPlan, Outside> {
         let explicit = spec.and_then(|s| s.strategy.as_deref());
         let spec_regex = || -> Result<Option<LcRegex>, Outside> {
@@ -20411,6 +20764,7 @@ mod livecheck {
                 post_json: None,
                 headers: Vec::new(),
                 major_minor: major_minor.to_string(),
+                own_version: own_version.to_string(),
                 plist: None,
                 apps: Vec::new(),
             }))
@@ -20418,6 +20772,22 @@ mod livecheck {
         if let Some(sym) = explicit {
             match sym {
                 "page_match" => {
+                    // `&:strip`, split-head and two-match
+                    // shapes need no block regex.
+                    if matches!(
+                        spec.and_then(|sp| sp.page_block.as_ref()).map(|b| &b.shape),
+                        Some(
+                            super::super::formula::PageShape::PageStrip
+                                | super::super::formula::PageShape::SplitHeadChars { .. },
+                        )
+                    ) || matches!(
+                        spec.and_then(|sp| sp.page_block.as_ref()).map(|b| &b.shape),
+                        Some(
+                            super::super::formula::PageShape::TwoMatch { a_pat, .. },
+                        ) if !a_pat.is_empty()
+                    ) {
+                        return Ok(run(Strat::PageMatch, url.to_string(), None, None));
+                    }
                     return Ok(match spec_regex()? {
                         Some(re) => run(Strat::PageMatch, url.to_string(), Some(re), None),
                         None => UrlPlan::Raised(
@@ -20446,7 +20816,24 @@ mod livecheck {
                     }
                     return Ok(match git_match(url) {
                         Some(processed) => {
-                            let mut plan = run(Strat::Git, processed, Some(git_regex(spec)?), None);
+                            let re = git_regex(spec)?;
+                            if let Some(parts) =
+                                block.as_ref().and_then(|b| b.match_template.as_ref())
+                            {
+                                use super::super::formula::LatestPart;
+                                let ok = parts.iter().all(|p| match p {
+                                    LatestPart::Cap(0) | LatestPart::CapTr(0, ..) => true,
+                                    LatestPart::Cap(1) | LatestPart::CapTr(1, ..) => re.has_group,
+                                    LatestPart::Cap(g) | LatestPart::CapTr(g, ..) => {
+                                        re.extra_groups.get(g - 2).is_some_and(Option::is_some)
+                                    }
+                                    _ => true,
+                                });
+                                if !ok {
+                                    return Err(Outside);
+                                }
+                            }
+                            let mut plan = run(Strat::Git, processed, Some(re), None);
                             if let UrlPlan::Run(rp) = &mut plan {
                                 rp.git = block;
                             }
@@ -20462,7 +20849,7 @@ mod livecheck {
                         Strat::GithubReleases
                     };
                     return Ok(if github_repo(url).is_some() {
-                        github_plan(strat, url, spec, candidates)?
+                        github_plan(strat, url, spec, candidates, own_version)?
                     } else {
                         UrlPlan::SkipUrl
                     });
@@ -20519,6 +20906,14 @@ mod livecheck {
                     let Some(block) = spec.and_then(|sp| sp.xml_block.clone()) else {
                         return Err(Outside);
                     };
+                    if let super::super::formula::XmlShape::HopMatch { pat, flags, .. } =
+                        &block.shape
+                    {
+                        match lc_regex(pat, flags) {
+                            Ok(lre) if lre.has_group => {}
+                            _ => return Err(Outside),
+                        }
+                    }
                     let re = spec_regex()?;
                     let mut plan = run(Strat::Xml, url.to_string(), re, None);
                     if let UrlPlan::Run(rp) = &mut plan {
@@ -20535,9 +20930,22 @@ mod livecheck {
                     // time.
                     let plan_guard = match &block.shape {
                         super::super::formula::JsonShape::MapGuarded(_, guard) => Some(guard),
+                        super::super::formula::JsonShape::MapGuardedMax(_, guard) => Some(guard),
+                        super::super::formula::JsonShape::EntriesMap(_, guard) => Some(guard),
                         super::super::formula::JsonShape::ValuesMap(_, _, guard) => Some(guard),
+                        super::super::formula::JsonShape::NestedMap { guard, .. } => Some(guard),
                         _ => None,
                     };
+                    fn guard_cond_ok(c: &super::super::formula::JsonCond) -> bool {
+                        use super::super::formula::JsonCond;
+                        match c {
+                            JsonCond::KeyMatchRe(pat, flags)
+                            | JsonCond::MatchRe(_, pat, flags)
+                            | JsonCond::AnyMatchRe(_, pat, flags) => lc_regex(pat, flags).is_ok(),
+                            JsonCond::Or(cs) => cs.iter().all(guard_cond_ok),
+                            _ => true,
+                        }
+                    }
                     if let Some(guard) = plan_guard {
                         if let super::super::formula::MapCapture::Literal(pat, flags) =
                             &guard.capture
@@ -20547,8 +20955,173 @@ mod livecheck {
                         if let Some((pat, flags, _)) = &guard.sub {
                             lc_regex(pat, flags)?;
                         }
+                        if !guard.guards.iter().all(|g| guard_cond_ok(&g.cond)) {
+                            return Err(Outside);
+                        }
+                    }
+                    if let super::super::formula::JsonShape::NestedTemplate { guards, .. } =
+                        &block.shape
+                        && !guards.iter().all(|g| guard_cond_ok(&g.cond))
+                    {
+                        return Err(Outside);
+                    }
+                    // Entry-key guard regexes must
+                    // compile at plan time.
+                    if let super::super::formula::JsonShape::EntriesKeys(_, guards) = &block.shape {
+                        fn keys_cond_ok(c: &super::super::formula::JsonCond) -> bool {
+                            use super::super::formula::JsonCond;
+                            match c {
+                                JsonCond::KeyMatchRe(pat, flags)
+                                | JsonCond::MatchRe(_, pat, flags)
+                                | JsonCond::AnyMatchRe(_, pat, flags) => {
+                                    lc_regex(pat, flags).is_ok()
+                                }
+                                JsonCond::Or(cs) => cs.iter().all(keys_cond_ok),
+                                _ => true,
+                            }
+                        }
+                        if !guards.iter().all(|g| keys_cond_ok(&g.cond)) {
+                            return Err(Outside);
+                        }
+                    }
+                    if let super::super::formula::JsonShape::EntriesMap(_, guard) = &block.shape {
+                        fn key_cond_ok(c: &super::super::formula::JsonCond) -> bool {
+                            use super::super::formula::JsonCond;
+                            match c {
+                                JsonCond::KeyMatchRe(pat, flags)
+                                | JsonCond::MatchRe(_, pat, flags)
+                                | JsonCond::AnyMatchRe(_, pat, flags) => {
+                                    lc_regex(pat, flags).is_ok()
+                                }
+                                JsonCond::Or(cs) => cs.iter().all(key_cond_ok),
+                                _ => true,
+                            }
+                        }
+                        if !guard.guards.iter().all(|g| key_cond_ok(&g.cond)) {
+                            return Err(Outside);
+                        }
                     }
                     let re = spec_regex()?;
+                    // Scan/captures shapes read captures
+                    // by scan or whole-match indexing.
+                    match &block.shape {
+                        super::super::formula::JsonShape::DigScan(_, parts) => {
+                            let ok = re.as_ref().is_some_and(|r| {
+                                page_parts_caps_ok(parts, &|n| match n + 1 {
+                                    1 => r.has_group,
+                                    g => r.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                                })
+                            });
+                            if !ok {
+                                return Err(Outside);
+                            }
+                        }
+                        super::super::formula::JsonShape::DigCaptures(_) => {
+                            let ok = re.as_ref().is_some_and(|r| {
+                                r.has_group && r.extra_groups.iter().all(Option::is_some)
+                            });
+                            if !ok {
+                                return Err(Outside);
+                            }
+                        }
+                        _ => {}
+                    }
+                    if let super::super::formula::JsonShape::MultiMatch { matches, render } =
+                        &block.shape
+                    {
+                        use super::super::formula::{JsonMatchRegex, JsonMultiPart};
+                        let cap_supported = |r: &LcRegex, n: usize| match n {
+                            0 => true,
+                            1 => r.has_group,
+                            g => r.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                        };
+                        let mut needed: Vec<Vec<usize>> = vec![Vec::new(); matches.len()];
+                        let mut parts_ok = true;
+                        for part in render {
+                            if let JsonMultiPart::Cap(m, n) = part {
+                                match needed.get_mut(*m) {
+                                    Some(caps) => caps.push(*n),
+                                    None => parts_ok = false,
+                                }
+                            }
+                        }
+                        let attempts_ok = matches.iter().enumerate().all(|(m, spec)| {
+                            spec.attempts.iter().all(|attempt| match &attempt.regex {
+                                JsonMatchRegex::Block => re.as_ref().is_some_and(|r| {
+                                    needed[m].iter().all(|n| cap_supported(r, *n))
+                                }),
+                                JsonMatchRegex::Literal(pat, flags) => lc_regex(pat, flags)
+                                    .is_ok_and(|r| needed[m].iter().all(|n| cap_supported(&r, *n))),
+                            })
+                        });
+                        if !parts_ok || !attempts_ok {
+                            return Err(Outside);
+                        }
+                    }
+                    let nested_render = match &block.shape {
+                        super::super::formula::JsonShape::NestedFirstMatch { render, .. }
+                        | super::super::formula::JsonShape::DigMatch { render, .. }
+                        | super::super::formula::JsonShape::EntriesFirstMatch { render, .. } => {
+                            Some(render)
+                        }
+                        super::super::formula::JsonShape::NestedCollect { .. } => {
+                            if !re.as_ref().is_some_and(|r| r.has_group) {
+                                return Err(Outside);
+                            }
+                            None
+                        }
+                        _ => None,
+                    };
+                    if let Some(render) = nested_render {
+                        use super::super::formula::{JsonPart, JsonRender, JsonValue};
+                        fn nested_caps_ok(
+                            render: &JsonRender,
+                            cap_ok: &dyn Fn(usize) -> bool,
+                        ) -> bool {
+                            match render {
+                                JsonRender::Template(parts) => parts.iter().all(|p| match p {
+                                    JsonPart::Cap(n) | JsonPart::CapTr(n, ..) => cap_ok(*n),
+                                    _ => true,
+                                }),
+                                JsonRender::GsubRegex {
+                                    inner, pat, flags, ..
+                                } => {
+                                    lc_regex(pat, flags).is_ok_and(|re| !re.whole.is_match(""))
+                                        && nested_caps_ok(inner, cap_ok)
+                                }
+                                JsonRender::Value(JsonValue::Cap(n), _) => cap_ok(*n),
+                                JsonRender::CapFork { cap, then, els, .. } => {
+                                    cap_ok(*cap)
+                                        && nested_caps_ok(then, cap_ok)
+                                        && nested_caps_ok(els, cap_ok)
+                                }
+                                JsonRender::CapEqFork { a, b, then, els } => {
+                                    cap_ok(*a)
+                                        && cap_ok(*b)
+                                        && nested_caps_ok(then, cap_ok)
+                                        && nested_caps_ok(els, cap_ok)
+                                }
+                                JsonRender::LocalEqFork { then, els, .. } => {
+                                    nested_caps_ok(then, cap_ok) && nested_caps_ok(els, cap_ok)
+                                }
+                                _ => true,
+                            }
+                        }
+                        let ok = match &re {
+                            Some(re) => {
+                                let cap_ok = |n: usize| match n {
+                                    0 => true,
+                                    1 => re.has_group,
+                                    g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                                };
+                                nested_caps_ok(render, &cap_ok)
+                            }
+                            None => false,
+                        };
+                        if !ok {
+                            return Err(Outside);
+                        }
+                    }
                     if let super::super::formula::JsonShape::Template(tmpl) = &block.shape {
                         use super::super::formula::{JsonLocal, JsonPart, JsonRender, JsonValue};
                         for local in &tmpl.locals {
@@ -20567,17 +21140,67 @@ mod livecheck {
                                 r.extra_groups.get(g - 2).is_some_and(Option::is_some)
                             }),
                         };
-                        let caps_ok = match &tmpl.render {
-                            JsonRender::Template(parts) => parts.iter().all(|p| match p {
-                                JsonPart::Cap(n) => cap_ok(*n),
+                        fn render_caps_ok(
+                            render: &JsonRender,
+                            cap_ok: &dyn Fn(usize) -> bool,
+                        ) -> bool {
+                            match render {
+                                JsonRender::Template(parts) => parts.iter().all(|p| match p {
+                                    JsonPart::Cap(n) | JsonPart::CapTr(n, ..) => cap_ok(*n),
+                                    _ => true,
+                                }),
+                                JsonRender::GsubRegex {
+                                    inner, pat, flags, ..
+                                } => {
+                                    lc_regex(pat, flags).is_ok_and(|re| !re.whole.is_match(""))
+                                        && render_caps_ok(inner, cap_ok)
+                                }
+                                JsonRender::Value(JsonValue::Cap(n), _) => cap_ok(*n),
+                                JsonRender::CapFork { cap, then, els, .. } => {
+                                    cap_ok(*cap)
+                                        && render_caps_ok(then, cap_ok)
+                                        && render_caps_ok(els, cap_ok)
+                                }
+                                JsonRender::CapEqFork { a, b, then, els } => {
+                                    cap_ok(*a)
+                                        && cap_ok(*b)
+                                        && render_caps_ok(then, cap_ok)
+                                        && render_caps_ok(els, cap_ok)
+                                }
+                                JsonRender::LocalEqFork { then, els, .. } => {
+                                    render_caps_ok(then, cap_ok) && render_caps_ok(els, cap_ok)
+                                }
                                 _ => true,
-                            }),
-                            JsonRender::Value(JsonValue::Cap(n), _) => cap_ok(*n),
-                            _ => true,
-                        };
+                            }
+                        }
+                        let caps_ok = render_caps_ok(&tmpl.render, &cap_ok);
                         if !caps_ok {
                             return Err(Outside);
                         }
+                        // Literal guard regexes must
+                        // compile (lookaheads delegate).
+                        let guards_ok = tmpl.guards.iter().all(|g| {
+                            fn cond_ok(c: &super::super::formula::JsonCond) -> bool {
+                                use super::super::formula::JsonCond;
+                                match c {
+                                    JsonCond::MatchRe(_, pat, flags)
+                                    | JsonCond::AnyMatchRe(_, pat, flags) => {
+                                        lc_regex(pat, flags).is_ok()
+                                    }
+                                    JsonCond::Or(cs) => cs.iter().all(cond_ok),
+                                    _ => true,
+                                }
+                            }
+                            cond_ok(&g.cond)
+                        });
+                        if !guards_ok {
+                            return Err(Outside);
+                        }
+                    }
+                    if let super::super::formula::JsonShape::DigSubPlain(_, pat, flags, _) =
+                        &block.shape
+                    {
+                        lc_regex(pat, flags)?;
                     }
                     let mut plan = run(Strat::Json, url.to_string(), re, None);
                     if let UrlPlan::Run(rp) = &mut plan {
@@ -20588,14 +21211,28 @@ mod livecheck {
                 "extract_plist" => {
                     // Zip and (on macOS, via the install
                     // path's read-only mount) dmg
-                    // containers are native; the URL's
-                    // extension is the plan-time evidence,
-                    // pkg delegates (installer-gated).
+                    // containers are native; pkg delegates
+                    // (installer-gated). The URL's
+                    // extension is the plan-time evidence
+                    // when it names one of those; an
+                    // extension-less download URL is
+                    // admitted and decided by content
+                    // sniffing at run time (plan_urls
+                    // still requires app artifacts then).
                     let path = url.split(['?', '#']).next().unwrap_or(url);
-                    let lower = path.to_ascii_lowercase();
-                    if !(lower.ends_with(".zip")
-                        || (cfg!(target_os = "macos") && lower.ends_with(".dmg")))
-                    {
+                    let lower = path.trim_end_matches('/').to_ascii_lowercase();
+                    let seg = lower.rsplit('/').next().unwrap_or(&lower);
+                    let ext = seg.rsplit_once('.').map(|(_, e)| e);
+                    let refuse = match ext {
+                        Some("zip") => false,
+                        Some("dmg") => !cfg!(target_os = "macos"),
+                        Some(
+                            "pkg" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar"
+                            | "exe" | "msi" | "deb" | "rpm" | "jar" | "war",
+                        ) => true,
+                        _ => false,
+                    };
+                    if refuse {
                         return Err(Outside);
                     }
                     let sp = spec.and_then(|sp| sp.plist_block.clone());
@@ -20713,13 +21350,41 @@ mod livecheck {
                             }
                         };
                         let parts_ok = |parts: &[PagePart], scan: bool| {
-                            parts.iter().all(|p| match p {
-                                PagePart::Cap(n) | PagePart::CapTr(n, ..) => cap_ok(*n, scan),
-                                _ => true,
-                            })
+                            page_parts_caps_ok(parts, &|n| cap_ok(n, scan))
                         };
                         let ok = match &block.shape {
-                            HeaderShape::Template(parts) => parts_ok(parts, false),
+                            HeaderShape::Template(parts) | HeaderShape::AllTemplate(parts) => {
+                                parts_ok(parts, false)
+                            }
+                            HeaderShape::Fork { cond, then, els } => {
+                                fn cond_ok(
+                                    cond: &super::super::formula::PageCond,
+                                    cap_ok: &dyn Fn(usize) -> bool,
+                                ) -> bool {
+                                    use super::super::formula::PageCond;
+                                    match cond {
+                                        PageCond::CapEq(a, b) | PageCond::CapNe(a, b) => {
+                                            cap_ok(*a) && cap_ok(*b)
+                                        }
+                                        PageCond::CapTrEq(a, b, ..) => cap_ok(*a) && cap_ok(*b),
+                                        PageCond::CapEqSub(a, b, pat, flags) => {
+                                            cap_ok(*a) && cap_ok(*b) && lc_regex(pat, flags).is_ok()
+                                        }
+                                        PageCond::CapEqLit(a, _)
+                                        | PageCond::CapIncludes(a, _)
+                                        | PageCond::CapCountGe(a, ..)
+                                        | PageCond::CapBlank(a)
+                                        | PageCond::CapPresent(a)
+                                        | PageCond::CapTruthy(a) => cap_ok(*a),
+                                        PageCond::And(a, b) => {
+                                            cond_ok(a, cap_ok) && cond_ok(b, cap_ok)
+                                        }
+                                    }
+                                }
+                                cond_ok(cond, &|n| cap_ok(n, false))
+                                    && parts_ok(then, false)
+                                    && parts_ok(els, false)
+                            }
                             HeaderShape::ScanTemplate(parts) => parts_ok(parts, true),
                             HeaderShape::ScanFlatten(_) => re.as_ref().is_some_and(|r| {
                                 r.has_group && r.extra_groups.iter().all(Option::is_some)
@@ -20753,6 +21418,15 @@ mod livecheck {
                         && spec.and_then(|sp| sp.regex.as_ref()).is_none()
                     {
                         return Err(Outside);
+                    }
+                    if let Some(block) = &block
+                        && let super::super::formula::SpExpr::LitMatch { pat, flags, .. } =
+                            &block.expr
+                    {
+                        match lc_regex(pat, flags) {
+                            Ok(lre) if sparkle_caps_ok(block, &lre) => {}
+                            _ => return Err(Outside),
+                        }
                     }
                     if block.is_none() && spec.is_some_and(|s| s.regex.is_some()) {
                         return Ok(UrlPlan::Raised(
@@ -21194,6 +21868,77 @@ mod livecheck {
         format!("{}.{}", nums[0], nums[1])
     }
 
+    /// Substitute `#{version...}` interpolations in
+    /// every XPath predicate value of an `:xml` block
+    /// against the checked unit's own version (brew
+    /// evaluates the path literal when the DSL loads).
+    fn xml_block_substitute_versions(
+        block: &mut super::super::formula::XmlBlock,
+        own: &str,
+        is_cask: bool,
+    ) -> Option<()> {
+        use super::super::formula::{XmlPathQ, XmlPred, XmlShape};
+        fn sub_path(path: &mut XmlPathQ, own: &str, is_cask: bool) -> Option<()> {
+            for step in &mut path.steps {
+                match &mut step.pred {
+                    None | Some(XmlPred::Index(_)) => {}
+                    Some(XmlPred::TextEq(v)) => {
+                        *v = substitute_version_tokens(v, own, is_cask)?;
+                    }
+                    Some(XmlPred::ChildTextEq(_, v))
+                    | Some(XmlPred::AttrEq(_, v))
+                    | Some(XmlPred::AttrContains(_, v)) => {
+                        *v = substitute_version_tokens(v, own, is_cask)?;
+                    }
+                    Some(XmlPred::AttrAll(terms)) => {
+                        for (_, want) in terms.iter_mut() {
+                            if let Some(v) = want {
+                                *v = substitute_version_tokens(v, own, is_cask)?;
+                            }
+                        }
+                    }
+                    Some(XmlPred::SiblingAfterChild {
+                        child_text, text, ..
+                    }) => {
+                        *child_text = substitute_version_tokens(child_text, own, is_cask)?;
+                        *text = substitute_version_tokens(text, own, is_cask)?;
+                    }
+                }
+            }
+            Some(())
+        }
+        match &mut block.shape {
+            XmlShape::Texts(_) | XmlShape::TextsRegex(_) => {}
+            XmlShape::Template(tmpl) => {
+                for local in tmpl.locals.iter_mut().chain(tmpl.elems.iter_mut()) {
+                    sub_path(&mut local.path, own, is_cask)?;
+                }
+                if let Some(map) = &mut tmpl.map {
+                    sub_path(&mut map.path, own, is_cask)?;
+                }
+            }
+            XmlShape::ZipPair { a, b, .. } => {
+                sub_path(&mut a.path, own, is_cask)?;
+                sub_path(&mut b.path, own, is_cask)?;
+            }
+            XmlShape::TwoListExtreme { versions, builds } => {
+                sub_path(&mut versions.path, own, is_cask)?;
+                sub_path(&mut builds.path, own, is_cask)?;
+            }
+            XmlShape::TextJsonKey { path, .. } | XmlShape::ChildMatchOwnFork { path, .. } => {
+                sub_path(path, own, is_cask)?;
+            }
+            XmlShape::HeaderHop { path, .. } => {
+                sub_path(path, own, is_cask)?;
+            }
+            XmlShape::HopMatch { path, path2, .. } => {
+                sub_path(path, own, is_cask)?;
+                sub_path(path2, own, is_cask)?;
+            }
+        }
+        Some(())
+    }
+
     fn plan_urls(
         spec: Option<&LivecheckSpec>,
         urls: Vec<String>,
@@ -21208,19 +21953,27 @@ mod livecheck {
         // every plan compiles the final pattern.
         let substituted: Option<LivecheckSpec> = match spec {
             Some(sp)
-                if sp.regex.as_ref().is_some_and(|r| {
-                    r.contains("#{") || r.contains(super::super::formula::MAJOR_MINOR_SENTINEL)
-                }) =>
+                if sp.xml_block.is_some()
+                    || sp.regex.as_ref().is_some_and(|r| {
+                        r.contains("#{") || r.contains(super::super::formula::MAJOR_MINOR_SENTINEL)
+                    }) =>
             {
                 let mut owned = sp.clone();
-                owned.regex = Some(
-                    substitute_version_tokens(
-                        owned.regex.as_deref().unwrap(),
-                        own_version,
-                        is_cask,
-                    )
-                    .ok_or(Outside)?,
-                );
+                if owned.regex.as_ref().is_some_and(|r| {
+                    r.contains("#{") || r.contains(super::super::formula::MAJOR_MINOR_SENTINEL)
+                }) {
+                    owned.regex = Some(
+                        substitute_version_tokens(
+                            owned.regex.as_deref().unwrap(),
+                            own_version,
+                            is_cask,
+                        )
+                        .ok_or(Outside)?,
+                    );
+                }
+                if let Some(xb) = &mut owned.xml_block {
+                    xml_block_substitute_versions(xb, own_version, is_cask).ok_or(Outside)?;
+                }
                 Some(owned)
             }
             _ => None,
@@ -21235,9 +21988,24 @@ mod livecheck {
                 continue;
             }
             seen.push(original.clone());
-            let mut plan = plan_url(spec, &fetch, &major_minor_of(own_version))?;
+            let mut plan = plan_url(spec, &fetch, &major_minor_of(own_version), own_version)?;
             if let UrlPlan::Run(rp) = &mut plan {
                 if rp.strat == Strat::ExtractPlist {
+                    // An extension-less container is
+                    // only admitted when app artifacts
+                    // name the plists to read; without
+                    // them the download is most likely
+                    // an installer package (delegated).
+                    let p = rp
+                        .url
+                        .split(['?', '#'])
+                        .next()
+                        .unwrap_or(&rp.url)
+                        .trim_end_matches('/')
+                        .to_ascii_lowercase();
+                    if apps.is_empty() && !p.ends_with(".zip") && !p.ends_with(".dmg") {
+                        return Err(Outside);
+                    }
                     rp.apps = apps.to_vec();
                 }
                 // A reduced page block runs only on the
@@ -21304,34 +22072,78 @@ mod livecheck {
                         }
                         super::super::formula::PageShape::ScanTemplate(parts) => {
                             rp.re.as_ref().is_some_and(|re| {
-                                parts.iter().all(|p| match p {
-                                    super::super::formula::PagePart::Cap(n)
-                                    | super::super::formula::PagePart::CapTr(n, ..) => {
-                                        // Scan index n is capture n+1.
-                                        match n + 1 {
-                                            1 => re.has_group,
-                                            g => re
-                                                .extra_groups
-                                                .get(g - 2)
-                                                .is_some_and(Option::is_some),
-                                        }
-                                    }
-                                    _ => true,
+                                // Scan index n is capture n+1.
+                                page_parts_caps_ok(parts, &|n| match n + 1 {
+                                    1 => re.has_group,
+                                    g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
                                 })
                             })
                         }
+                        super::super::formula::PageShape::ScanFork { cond, then, els }
+                        | super::super::formula::PageShape::MatchFork { cond, then, els } => {
+                            let scan = matches!(
+                                &pb.shape,
+                                super::super::formula::PageShape::ScanFork { .. }
+                            );
+                            let cap_ok = |re: &LcRegex, n: usize| match if scan { n + 1 } else { n }
+                            {
+                                0 => true,
+                                // Beyond the last group the
+                                // capture is always nil.
+                                g if g > re.group_count => true,
+                                1 => re.has_group,
+                                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                            };
+                            fn cond_caps(
+                                cond: &super::super::formula::PageCond,
+                                out: &mut Vec<usize>,
+                            ) {
+                                use super::super::formula::PageCond;
+                                match cond {
+                                    PageCond::CapEq(a, b) | PageCond::CapNe(a, b) => {
+                                        out.push(*a);
+                                        out.push(*b);
+                                    }
+                                    PageCond::CapTrEq(a, b, ..) => {
+                                        out.push(*a);
+                                        out.push(*b);
+                                    }
+                                    PageCond::CapEqSub(a, b, ..) => {
+                                        out.push(*a);
+                                        out.push(*b);
+                                    }
+                                    PageCond::CapEqLit(a, _)
+                                    | PageCond::CapIncludes(a, _)
+                                    | PageCond::CapCountGe(a, ..)
+                                    | PageCond::CapBlank(a)
+                                    | PageCond::CapPresent(a)
+                                    | PageCond::CapTruthy(a) => out.push(*a),
+                                    PageCond::And(a, b) => {
+                                        cond_caps(a, out);
+                                        cond_caps(b, out);
+                                    }
+                                }
+                            }
+                            let mut caps = Vec::new();
+                            cond_caps(cond, &mut caps);
+                            page_cond_lits_ok(cond)
+                                && rp.re.as_ref().is_some_and(|re| {
+                                    caps.iter().all(|n| cap_ok(re, *n))
+                                        && [then, els].iter().all(|parts| {
+                                            page_parts_caps_ok(parts, &|n| cap_ok(re, n))
+                                        })
+                                })
+                        }
+                        super::super::formula::PageShape::ScanTrCompactJoin(..) => rp
+                            .re
+                            .as_ref()
+                            .is_some_and(|re| re.extra_groups.iter().all(Option::is_some)),
                         super::super::formula::PageShape::MatchTemplate(parts) => {
                             rp.re.as_ref().is_some_and(|re| {
-                                parts.iter().all(|p| match p {
-                                    super::super::formula::PagePart::Cap(n)
-                                    | super::super::formula::PagePart::CapTr(n, ..) => match *n {
-                                        0 => true,
-                                        1 => re.has_group,
-                                        g => {
-                                            re.extra_groups.get(g - 2).is_some_and(Option::is_some)
-                                        }
-                                    },
-                                    _ => true,
+                                page_parts_caps_ok(parts, &|n| match n {
+                                    0 => true,
+                                    1 => re.has_group,
+                                    g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
                                 })
                             })
                         }
@@ -21344,6 +22156,126 @@ mod livecheck {
                             Some((pat, flags)) => lc_regex(pat, flags).is_ok_and(|re| re.has_group),
                             None => true,
                         },
+                        super::super::formula::PageShape::ScanGuardedFork {
+                            skip_cap,
+                            skip_pat,
+                            skip_flags,
+                            cond,
+                            then,
+                            els,
+                        } => rp.re.as_ref().is_some_and(|re| {
+                            let cap_ok = |n: usize| match n + 1 {
+                                1 => re.has_group,
+                                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                            };
+                            lc_regex(skip_pat, skip_flags).is_ok()
+                                && page_cond_lits_ok(cond)
+                                && cap_ok(*skip_cap)
+                                && page_parts_caps_ok(then, &cap_ok)
+                                && page_parts_caps_ok(els, &cap_ok)
+                        }),
+                        super::super::formula::PageShape::MatchJsonDig { cap, .. } => {
+                            rp.re.as_ref().is_some_and(|re| match *cap {
+                                0 => true,
+                                1 => re.has_group,
+                                g => re.extra_groups.get(g - 2).is_some_and(Option::is_some),
+                            })
+                        }
+                        super::super::formula::PageShape::SplitCapture { pat, flags, skip } => {
+                            lc_regex(pat, flags).is_ok()
+                                && skip.as_ref().is_none_or(|(p, f)| lc_regex(p, f).is_ok())
+                        }
+                        super::super::formula::PageShape::SplitScan { pat, flags, parts } => {
+                            // String#split would interleave
+                            // delimiter captures; only
+                            // capture-free delimiters reduce.
+                            lc_regex(pat, flags).is_ok_and(|re| re.group_count == 0)
+                                && rp.re.as_ref().is_some_and(|re| {
+                                    page_parts_caps_ok(parts, &|n| match n + 1 {
+                                        1 => re.has_group,
+                                        g => {
+                                            re.extra_groups.get(g - 2).is_some_and(Option::is_some)
+                                        }
+                                    })
+                                })
+                        }
+                        super::super::formula::PageShape::SectionMatch {
+                            pat,
+                            flags,
+                            cond,
+                            then,
+                            els,
+                        } => {
+                            use super::super::formula::PageCond;
+                            let mut caps = Vec::new();
+                            let mut stack = vec![cond];
+                            while let Some(c) = stack.pop() {
+                                match c {
+                                    PageCond::CapEq(a, b)
+                                    | PageCond::CapNe(a, b)
+                                    | PageCond::CapTrEq(a, b, ..)
+                                    | PageCond::CapEqSub(a, b, ..) => {
+                                        caps.push(*a);
+                                        caps.push(*b);
+                                    }
+                                    PageCond::CapEqLit(a, _)
+                                    | PageCond::CapBlank(a)
+                                    | PageCond::CapPresent(a)
+                                    | PageCond::CapTruthy(a)
+                                    | PageCond::CapIncludes(a, _)
+                                    | PageCond::CapCountGe(a, ..) => caps.push(*a),
+                                    PageCond::And(a, b) => {
+                                        stack.push(a);
+                                        stack.push(b);
+                                    }
+                                }
+                            }
+                            lc_regex(pat, flags).is_ok_and(|re| re.has_group)
+                                && page_cond_lits_ok(cond)
+                                && rp.re.as_ref().is_some_and(|re| {
+                                    let cap_ok = |n: usize| match n {
+                                        0 => true,
+                                        g if g > re.group_count => true,
+                                        1 => re.has_group,
+                                        g => {
+                                            re.extra_groups.get(g - 2).is_some_and(Option::is_some)
+                                        }
+                                    };
+                                    caps.iter().all(|n| cap_ok(*n))
+                                        && [then, els]
+                                            .iter()
+                                            .all(|parts| page_parts_caps_ok(parts, &cap_ok))
+                                })
+                        }
+                        super::super::formula::PageShape::ScanSplitFork { .. } => {
+                            rp.re.as_ref().is_some_and(|re| re.has_group)
+                        }
+                        super::super::formula::PageShape::TwoMatch {
+                            a_pat,
+                            a_flags,
+                            b_pat,
+                            b_flags,
+                            parts,
+                        } => {
+                            use super::super::formula::TwoPart;
+                            let check = |pat: &str, flags: &str, which: usize| {
+                                lc_regex(pat, flags).is_ok_and(|re| {
+                                    parts.iter().all(|p| match p {
+                                        TwoPart::Cap(w, n) if *w == which => match *n {
+                                            0 => true,
+                                            1 => re.has_group,
+                                            g => re
+                                                .extra_groups
+                                                .get(g - 2)
+                                                .is_some_and(Option::is_some),
+                                        },
+                                        _ => true,
+                                    })
+                                })
+                            };
+                            (a_pat.is_empty() || check(a_pat, a_flags, 0))
+                                && check(b_pat, b_flags, 1)
+                        }
                         _ => true,
                     };
                     match (
@@ -21351,7 +22283,13 @@ mod livecheck {
                             rp.strat,
                             Strat::PageMatch | Strat::Sourceforge | Strat::Gnome
                         ),
-                        rp.re.as_ref().is_some_and(|re| re.has_group),
+                        rp.re.as_ref().is_some_and(|re| re.has_group)
+                            || matches!(
+                                pb.shape,
+                                super::super::formula::PageShape::PageStrip
+                                    | super::super::formula::PageShape::SplitHeadChars { .. }
+                                    | super::super::formula::PageShape::TwoMatch { .. }
+                            ),
                         sub_ok,
                     ) {
                         (true, true, true) => rp.page_block = Some(pb),
@@ -21893,9 +22831,12 @@ mod livecheck {
             Strat::GithubLatest => {
                 github_latest_versions(&rp.url, rp.re.as_ref().unwrap(), rp.latest.as_ref())
             }
-            Strat::GithubReleases => {
-                github_releases_versions(&rp.url, rp.re.as_ref().unwrap(), rp.ghrel_block.as_ref())
-            }
+            Strat::GithubReleases => github_releases_versions(
+                &rp.url,
+                rp.re.as_ref().unwrap(),
+                rp.ghrel_block.as_ref(),
+                &rp.own_version,
+            ),
             Strat::HeaderMatch => header_versions(
                 &rp.url,
                 rp.re.as_ref(),
@@ -21912,7 +22853,77 @@ mod livecheck {
                 !rp.uncompressed,
                 rp.sparkle_block.as_ref(),
                 rp.re.as_ref(),
+                &rp.own_version,
             ),
+            Strat::PageMatch
+                if matches!(
+                    rp.page_block.as_ref().map(|b| &b.shape),
+                    Some(
+                        super::super::formula::PageShape::PageStrip
+                            | super::super::formula::PageShape::SplitHeadChars { .. },
+                    )
+                ) =>
+            {
+                match page_fetch(
+                    &rp.url,
+                    rp.ua.as_deref(),
+                    post.as_ref(),
+                    &rp.headers,
+                    !rp.uncompressed,
+                ) {
+                    Ok((content, fin)) => {
+                        let v = match rp.page_block.as_ref().map(|b| &b.shape) {
+                            Some(super::super::formula::PageShape::SplitHeadChars {
+                                sep,
+                                start,
+                                len,
+                                join,
+                            }) => {
+                                let head = if sep.is_empty() {
+                                    content.as_str()
+                                } else {
+                                    content.split(sep.as_str()).next().unwrap_or_default()
+                                };
+                                head.chars()
+                                    .skip(*start)
+                                    .take(*len)
+                                    .map(|c| c.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(join)
+                            }
+                            _ => content.trim().to_string(),
+                        };
+                        Found::Versions(vec![v], Some(fin))
+                    }
+                    Err(msgs) => Found::Messages(msgs),
+                }
+            }
+            Strat::PageMatch
+                if matches!(
+                    rp.page_block.as_ref().map(|b| &b.shape),
+                    Some(
+                        super::super::formula::PageShape::TwoMatch { a_pat, .. },
+                    ) if !a_pat.is_empty()
+                ) =>
+            {
+                match page_fetch(
+                    &rp.url,
+                    rp.ua.as_deref(),
+                    post.as_ref(),
+                    &rp.headers,
+                    !rp.uncompressed,
+                ) {
+                    Ok((content, fin)) => Found::Versions(
+                        rp.page_block
+                            .as_ref()
+                            .and_then(|b| page_two_match_found(&b.shape, &content, None))
+                            .into_iter()
+                            .collect(),
+                        Some(fin),
+                    ),
+                    Err(msgs) => Found::Messages(msgs),
+                }
+            }
             Strat::PageMatch => page_versions_block(
                 &rp.url,
                 rp.re.as_ref().unwrap(),
@@ -22527,11 +23538,16 @@ mod livecheck {
     /// browser agent and renders bare; a literal is itself.
     fn spec_ua(spec: Option<&LivecheckSpec>) -> (Option<String>, Option<String>, bool) {
         match spec.and_then(|s| s.user_agent.as_deref()) {
-            Some(":browser") => (
+            Some(":browser") | Some(":fake") => (
                 Some(browser_user_agent()),
                 Some("browser".to_string()),
                 true,
             ),
+            // `:curl` sends no `--user-agent` at all
+            // (the empty agent is the sentinel the
+            // fetch honors); `:default` is brew's.
+            Some(":curl") => (Some(String::new()), Some("curl".to_string()), true),
+            Some(":default") => (Some(brew_user_agent()), Some("default".to_string()), true),
             Some(lit) => (Some(lit.to_string()), Some(lit.to_string()), false),
             None => (None, None, false),
         }
@@ -22705,14 +23721,14 @@ mod livecheck {
     fn rp_post<'a>(rp: &'a RunPlan) -> Option<PostData<'a>> {
         if let Some(form) = &rp.post_form {
             Some(PostData::Form(form))
-        } else if let Some(json) = &rp.post_json {
-            Some(if json == "{}" {
-                PostData::Empty
-            } else {
-                PostData::Json(json)
-            })
         } else {
-            None
+            rp.post_json.as_ref().map(|json| {
+                if json == "{}" {
+                    PostData::Empty
+                } else {
+                    PostData::Json(json)
+                }
+            })
         }
     }
 
@@ -22755,6 +23771,7 @@ mod livecheck {
     ) -> Result<(String, String), Vec<String>> {
         let mut args: Vec<String> = [
             "--fail-with-body",
+            "--globoff",
             "--location",
             "--max-redirs",
             "10",
@@ -22770,6 +23787,9 @@ mod livecheck {
         .iter()
         .map(|a| a.to_string())
         .collect();
+        if ua.is_empty() {
+            args.retain(|a| a != "--user-agent" && !a.is_empty());
+        }
         if compressed {
             args.push("--compressed".to_string());
         }
@@ -22951,6 +23971,167 @@ mod livecheck {
                 // Single-match template: `page.match`
                 // groups over the whole content
                 // (index 0 is the whole match).
+                if let super::super::formula::PageShape::MatchJsonDig { cap, path } = &block.shape {
+                    let found = search_groups(re, &content)
+                        .and_then(|groups| groups.get(*cap).cloned().flatten())
+                        .and_then(|text| aterm_json::from_str::<aterm_json::Value>(&text).ok())
+                        .and_then(|root| json_dig_path(&root, path).and_then(json_interp));
+                    return Found::Versions(found.into_iter().collect(), Some(fin));
+                }
+                if let super::super::formula::PageShape::ScanExtreme(min) = &block.shape {
+                    let vals: Vec<String> = re
+                        .whole
+                        .find_iter(&content)
+                        .filter_map(|m| extract_groups(re, m.as_str()).into_iter().next().flatten())
+                        .collect();
+                    let found = if *min {
+                        vals.into_iter().min_by(|a, b| lc_cmp(false, a, b))
+                    } else {
+                        vals.into_iter().max_by(|a, b| lc_cmp(false, a, b))
+                    };
+                    return Found::Versions(found.into_iter().collect(), Some(fin));
+                }
+                if let super::super::formula::PageShape::TwoMatch { .. } = &block.shape {
+                    // Handled in run_strat (no block
+                    // regex to unwrap here).
+                    let found = page_two_match_found(&block.shape, &content, Some(re));
+                    return Found::Versions(found.into_iter().collect(), Some(fin));
+                }
+                if let super::super::formula::PageShape::SplitCapture { pat, flags, skip } =
+                    &block.shape
+                {
+                    let mut out: Vec<String> = Vec::new();
+                    if let Ok(split_re) = lc_regex(pat, flags) {
+                        let skip_re = skip.as_ref().and_then(|(p, f)| lc_regex(p, f).ok());
+                        let mut sections: Vec<&str> = Vec::new();
+                        let mut start = 0usize;
+                        for m in split_re.whole.find_iter(&content) {
+                            sections.push(&content[start..m.start()]);
+                            start = m.end();
+                        }
+                        sections.push(&content[start..]);
+                        for section in sections {
+                            if skip_re.as_ref().is_some_and(|r| r.whole.is_match(section)) {
+                                continue;
+                            }
+                            if let Some(cap) = search_group1(re, section)
+                                && !out.contains(&cap)
+                            {
+                                out.push(cap);
+                            }
+                        }
+                    }
+                    return Found::Versions(out, Some(fin));
+                }
+                if let super::super::formula::PageShape::SplitScan { pat, flags, parts } =
+                    &block.shape
+                {
+                    let mut out: Vec<String> = Vec::new();
+                    if let Ok(split_re) = lc_regex(pat, flags) {
+                        let mut sections: Vec<&str> = Vec::new();
+                        let mut start = 0usize;
+                        for m in split_re.whole.find_iter(&content) {
+                            sections.push(&content[start..m.start()]);
+                            start = m.end();
+                        }
+                        sections.push(&content[start..]);
+                        for section in sections {
+                            for m in re.whole.find_iter(section) {
+                                let groups = extract_groups(re, m.as_str());
+                                let v = page_render_parts(parts, &groups);
+                                if !out.contains(&v) {
+                                    out.push(v);
+                                }
+                            }
+                        }
+                    }
+                    return Found::Versions(out, Some(fin));
+                }
+                if let super::super::formula::PageShape::SectionMatch {
+                    pat,
+                    flags,
+                    cond,
+                    then,
+                    els,
+                } = &block.shape
+                {
+                    let mut out: Vec<String> = Vec::new();
+                    if let Ok(section_re) = lc_regex(pat, flags) {
+                        for m in section_re.whole.find_iter(&content) {
+                            let Some(section) =
+                                extract_group_limited(&section_re, m.as_str(), 65_536)
+                            else {
+                                continue;
+                            };
+                            let Some(groups) = search_groups(re, &section) else {
+                                continue;
+                            };
+                            let v = page_render_parts(
+                                if page_cond_eval(cond, &groups) {
+                                    then
+                                } else {
+                                    els
+                                },
+                                &groups,
+                            );
+                            if !out.contains(&v) {
+                                out.push(v);
+                            }
+                        }
+                    }
+                    return Found::Versions(out, Some(fin));
+                }
+                if let super::super::formula::PageShape::ScanSplitFork { sep, arms } = &block.shape
+                {
+                    use super::super::formula::PageSplitPart;
+                    let mut out: Vec<String> = Vec::new();
+                    let mut last: Option<String> = None;
+                    for m in re.whole.find_iter(&content) {
+                        let Some(cap) = extract_group(re, m.as_str()) else {
+                            continue;
+                        };
+                        let mut fields: Vec<&str> = cap.split(sep.as_str()).collect();
+                        while fields.last().is_some_and(|f| f.is_empty()) {
+                            fields.pop();
+                        }
+                        if let Some(arm) = arms.iter().find(|a| a.len == fields.len()) {
+                            let mut rendered = String::new();
+                            for part in &arm.parts {
+                                match part {
+                                    PageSplitPart::Lit(s) => rendered.push_str(s),
+                                    PageSplitPart::Field(i) => {
+                                        rendered.push_str(fields.get(*i).unwrap_or(&""));
+                                    }
+                                }
+                            }
+                            last = Some(rendered);
+                        }
+                        if let Some(v) = &last
+                            && !out.contains(v)
+                        {
+                            out.push(v.clone());
+                        }
+                    }
+                    return Found::Versions(out, Some(fin));
+                }
+                if let super::super::formula::PageShape::MatchFork { cond, then, els } =
+                    &block.shape
+                {
+                    return match search_groups(re, &content) {
+                        Some(groups) => Found::Versions(
+                            vec![page_render_parts(
+                                if page_cond_eval(cond, &groups) {
+                                    then
+                                } else {
+                                    els
+                                },
+                                &groups,
+                            )],
+                            Some(fin),
+                        ),
+                        None => Found::Versions(Vec::new(), Some(fin)),
+                    };
+                }
                 if let super::super::formula::PageShape::MatchTemplate(parts) = &block.shape {
                     return match search_groups(re, &content) {
                         Some(groups) => {
@@ -23016,6 +24197,51 @@ mod livecheck {
                             let groups = extract_groups(re, m.as_str());
                             Some(page_render_parts(parts, &groups))
                         }
+                        super::super::formula::PageShape::ScanGuardedFork {
+                            skip_cap,
+                            skip_pat,
+                            skip_flags,
+                            cond,
+                            then,
+                            els,
+                        } => {
+                            let groups = extract_groups(re, m.as_str());
+                            let skip = groups.get(*skip_cap).cloned().flatten().is_some_and(|s| {
+                                lc_regex(skip_pat, skip_flags).is_ok_and(|r| r.whole.is_match(&s))
+                            });
+                            if skip {
+                                None
+                            } else {
+                                Some(page_render_parts(
+                                    if page_cond_eval(cond, &groups) {
+                                        then
+                                    } else {
+                                        els
+                                    },
+                                    &groups,
+                                ))
+                            }
+                        }
+                        super::super::formula::PageShape::ScanFork { cond, then, els } => {
+                            let groups = extract_groups(re, m.as_str());
+                            Some(page_render_parts(
+                                if page_cond_eval(cond, &groups) {
+                                    then
+                                } else {
+                                    els
+                                },
+                                &groups,
+                            ))
+                        }
+                        super::super::formula::PageShape::ScanTrCompactJoin(from, to, sep) => {
+                            let mut groups = extract_groups(re, m.as_str());
+                            if let Some(Some(g0)) = groups.first_mut() {
+                                *g0 = ruby_tr(g0, from, to);
+                            }
+                            let parts: Vec<&str> =
+                                groups.iter().flatten().map(String::as_str).collect();
+                            Some(parts.join(sep))
+                        }
                         _ => None,
                     };
                     if let Some(v) = multi {
@@ -23041,6 +24267,104 @@ mod livecheck {
         }
     }
 
+    /// Plan-time capture check over template parts,
+    /// recursing into conditional parts; `sub`
+    /// patterns must also compile.
+    fn page_parts_caps_ok(
+        parts: &[super::super::formula::PagePart],
+        cap_ok: &dyn Fn(usize) -> bool,
+    ) -> bool {
+        use super::super::formula::PagePart;
+        parts.iter().all(|p| match p {
+            PagePart::Cap(n)
+            | PagePart::CapTr(n, ..)
+            | PagePart::CapSplitJoin(n, ..)
+            | PagePart::CapNormInts(n, ..)
+            | PagePart::CapDeletePrefix(n, ..) => cap_ok(*n),
+            PagePart::CondCap(n, inner) => cap_ok(*n) && page_parts_caps_ok(inner, cap_ok),
+            PagePart::CapSubBackref(n, pat, flags, _) => cap_ok(*n) && lc_regex(pat, flags).is_ok(),
+            PagePart::Lit(_) => true,
+        })
+    }
+
+    /// Literal regexes inside a page condition must
+    /// compile at plan time.
+    fn page_cond_lits_ok(cond: &super::super::formula::PageCond) -> bool {
+        use super::super::formula::PageCond;
+        match cond {
+            PageCond::CapEqSub(.., pat, flags) => lc_regex(pat, flags).is_ok(),
+            PageCond::And(a, b) => page_cond_lits_ok(a) && page_cond_lits_ok(b),
+            _ => true,
+        }
+    }
+
+    fn page_two_match_found(
+        shape: &super::super::formula::PageShape,
+        content: &str,
+        block_re: Option<&LcRegex>,
+    ) -> Option<String> {
+        use super::super::formula::{PageShape, TwoPart};
+        let PageShape::TwoMatch {
+            a_pat,
+            a_flags,
+            b_pat,
+            b_flags,
+            parts,
+        } = shape
+        else {
+            return None;
+        };
+        let rb = lc_regex(b_pat, b_flags).ok()?;
+        let ga = if a_pat.is_empty() {
+            search_groups(block_re?, content)?
+        } else {
+            search_groups(&lc_regex(a_pat, a_flags).ok()?, content)?
+        };
+        let both = [ga, search_groups(&rb, content)?];
+        let mut out = String::new();
+        for part in parts {
+            match part {
+                TwoPart::Lit(s) => out.push_str(s),
+                TwoPart::Cap(w, n) => {
+                    if let Some(Some(g)) = both.get(*w).and_then(|gs| gs.get(*n)) {
+                        out.push_str(g);
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn page_cond_eval(cond: &super::super::formula::PageCond, groups: &[Option<String>]) -> bool {
+        use super::super::formula::PageCond;
+        let get = |n: usize| groups.get(n).cloned().flatten();
+        let blank = |n: usize| get(n).as_deref().is_none_or(|s| s.trim().is_empty());
+        match cond {
+            PageCond::CapEq(a, b) => get(*a) == get(*b),
+            PageCond::CapNe(a, b) => get(*a) != get(*b),
+            PageCond::CapEqLit(a, lit) => get(*a).as_deref() == Some(lit.as_str()),
+            PageCond::CapBlank(a) => blank(*a),
+            PageCond::CapPresent(a) => !blank(*a),
+            PageCond::CapTruthy(a) => get(*a).is_some(),
+            PageCond::CapTrEq(a, b, from, to) => get(*a) == get(*b).map(|v| ruby_tr(&v, from, to)),
+            PageCond::CapEqSub(a, b, pat, flags) => {
+                let sub = get(*b).and_then(|s| {
+                    lc_regex(pat, flags)
+                        .ok()
+                        .and_then(|re| re.whole.find(&s).map(|m| m.as_str().to_string()))
+                });
+                get(*a) == sub
+            }
+            PageCond::CapIncludes(a, lit) => {
+                get(*a).as_deref().is_some_and(|s| s.contains(lit.as_str()))
+            }
+            PageCond::CapCountGe(a, c, k) => get(*a)
+                .as_deref()
+                .is_some_and(|s| s.matches(*c).count() >= *k),
+            PageCond::And(a, b) => page_cond_eval(a, groups) && page_cond_eval(b, groups),
+        }
+    }
+
     /// Render page template parts against one
     /// match's groups (missing captures interpolate
     /// empty, as Ruby nil does).
@@ -23061,6 +24385,82 @@ mod livecheck {
                 PagePart::CapTr(n, from, to) => {
                     if let Some(Some(g)) = groups.get(*n) {
                         out.push_str(&ruby_tr(g, from, to));
+                    }
+                }
+                PagePart::CondCap(n, inner) => {
+                    if groups.get(*n).is_some_and(Option::is_some) {
+                        out.push_str(&page_render_parts(inner, groups));
+                    }
+                }
+                PagePart::CapSplitJoin(n, limit, sep) => {
+                    if let Some(Some(g)) = groups.get(*n) {
+                        let chars: Vec<char> = g.chars().collect();
+                        let pieces: Vec<String> = if *limit == 0 {
+                            chars.iter().map(|c| c.to_string()).collect()
+                        } else {
+                            let mut p: Vec<String> = chars[..chars.len().min(limit - 1)]
+                                .iter()
+                                .map(|c| c.to_string())
+                                .collect();
+                            if chars.len() >= *limit {
+                                p.push(chars[limit - 1..].iter().collect());
+                            }
+                            p
+                        };
+                        out.push_str(&pieces.join(sep));
+                    }
+                }
+                PagePart::CapNormInts(n, tr, sep, join, ints) => {
+                    if let Some(Some(g)) = groups.get(*n) {
+                        let v = match tr {
+                            Some((a, b)) => ruby_tr(g, a, b),
+                            None => g.clone(),
+                        };
+                        // Ruby `split(sep)` drops
+                        // trailing empty fields; `to_i`
+                        // takes the leading integer
+                        // (0 when there is none).
+                        let mut pieces: Vec<String> = if sep.is_empty() {
+                            v.chars().map(|c| c.to_string()).collect()
+                        } else {
+                            v.split(sep.as_str()).map(str::to_string).collect()
+                        };
+                        while pieces.last().is_some_and(|p| p.is_empty()) {
+                            pieces.pop();
+                        }
+                        let pieces: Vec<String> = if *ints {
+                            pieces
+                                .iter()
+                                .map(|p| {
+                                    let t = p.trim_start();
+                                    let (sign, digits_src) = match t.strip_prefix('-') {
+                                        Some(r) => ("-", r),
+                                        None => ("", t.strip_prefix('+').unwrap_or(t)),
+                                    };
+                                    let digits: String = digits_src
+                                        .chars()
+                                        .take_while(|c| c.is_ascii_digit())
+                                        .collect();
+                                    let sign = if digits.is_empty() { "" } else { sign };
+                                    let n: i64 = format!("{sign}{digits}").parse().unwrap_or(0);
+                                    n.to_string()
+                                })
+                                .collect()
+                        } else {
+                            pieces
+                        };
+                        out.push_str(&pieces.join(join));
+                    }
+                }
+                PagePart::CapDeletePrefix(n, p) => {
+                    if let Some(Some(g)) = groups.get(*n) {
+                        out.push_str(g.strip_prefix(p.as_str()).unwrap_or(g));
+                    }
+                }
+                PagePart::CapSubBackref(n, pat, flags, tmpl) => {
+                    if let Some(Some(g)) = groups.get(*n) {
+                        let lit = lc_regex(pat, flags).ok();
+                        out.push_str(&sub_backref_apply(g, tmpl, lit.as_ref()));
                     }
                 }
             }
@@ -23336,12 +24736,41 @@ mod livecheck {
                 }
                 Ok((!parts.is_empty()).then(|| parts.join(sep)))
             }
+            PageShape::ScanSplitChars(n, sep) => {
+                // Ruby `split("", n)`: chars, at most
+                // n pieces, the last keeps the rest.
+                let chars: Vec<char> = v.chars().collect();
+                if chars.is_empty() {
+                    return Ok(None);
+                }
+                let mut parts: Vec<String> = chars[..chars.len().min(*n - 1)]
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect();
+                if chars.len() >= *n {
+                    parts.push(chars[*n - 1..].iter().collect());
+                }
+                Ok(Some(parts.join(sep)))
+            }
             // Multi-capture shapes are applied in the
             // scan loop, never per single capture.
             PageShape::ScanJoin(_)
             | PageShape::ScanCsvOpt
             | PageShape::ScanCsvOptTr(..)
             | PageShape::ScanTemplate(_)
+            | PageShape::ScanFork { .. }
+            | PageShape::MatchFork { .. }
+            | PageShape::ScanTrCompactJoin(..)
+            | PageShape::PageStrip
+            | PageShape::ScanGuardedFork { .. }
+            | PageShape::MatchJsonDig { .. }
+            | PageShape::SplitHeadChars { .. }
+            | PageShape::SplitCapture { .. }
+            | PageShape::SplitScan { .. }
+            | PageShape::SectionMatch { .. }
+            | PageShape::ScanSplitFork { .. }
+            | PageShape::TwoMatch { .. }
+            | PageShape::ScanExtreme(_)
             | PageShape::MatchTemplate(_)
             | PageShape::DirWalk(_)
             | PageShape::HopScan(_)
@@ -23569,33 +24998,72 @@ mod livecheck {
         cond: &super::super::formula::JsonCond,
         item: &aterm_json::Value,
         rp: &RunPlan,
+        entry_key: Option<&str>,
     ) -> bool {
         use super::super::formula::{JsonCond, JsonLit};
         let field = |name: &str| item.get(name);
-        let eq = |name: &str, lit: &JsonLit| match (field(name), lit) {
+        let lit_eq = |v: Option<&aterm_json::Value>, lit: &JsonLit| match (v, lit) {
             (Some(v), JsonLit::Str(s)) => v.as_str() == Some(s.as_str()),
             (Some(v), JsonLit::Bool(b)) => v.as_bool() == Some(*b),
+            (Some(v), JsonLit::Int(n)) => v.as_f64() == Some(*n as f64),
             _ => false,
         };
+        let eq = |name: &str, lit: &JsonLit| lit_eq(field(name), lit);
         match cond {
             JsonCond::Eq(name, lit) => eq(name, lit),
             JsonCond::Ne(name, lit) => !eq(name, lit),
             JsonCond::Truthy(name) => {
                 matches!(field(name), Some(v) if !v.is_null() && v.as_bool() != Some(false))
             }
-            JsonCond::Or(parts) => parts.iter().any(|p| eval_json_cond(p, item, rp)),
+            JsonCond::Or(parts) => parts.iter().any(|p| eval_json_cond(p, item, rp, entry_key)),
+            JsonCond::FieldIn(name, lits) => lits.iter().any(|lit| lit_eq(field(name), lit)),
+            JsonCond::AnyEq(name, pairs) => {
+                field(name).and_then(|v| v.as_array()).is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|el| pairs.iter().all(|(f, lit)| lit_eq(el.get(f.as_str()), lit)))
+                })
+            }
+            JsonCond::KeyMatchRe(pat, flags) => {
+                entry_key.is_some_and(|k| lc_regex(pat, flags).is_ok_and(|re| re.whole.is_match(k)))
+            }
             JsonCond::StartsWithMajorMinor(name) => field(name)
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| s.starts_with(&rp.major_minor)),
             JsonCond::DowncaseIncludes(name, lit) => field(name)
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| s.to_lowercase().contains(lit.as_str())),
-            JsonCond::Includes(name, lit) => field(name)
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| s.contains(lit.as_str())),
+            JsonCond::Includes(name, lit) => match field(name) {
+                Some(v) => {
+                    v.as_str().is_some_and(|s| s.contains(lit.as_str()))
+                        || v.as_array()
+                            .is_some_and(|a| a.iter().any(|e| e.as_str() == Some(lit.as_str())))
+                }
+                None => false,
+            },
             JsonCond::MatchLit(name, lit) => field(name)
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| s.contains(lit.as_str())),
+            JsonCond::FieldBlank(name) => json_value_blank(field(name)),
+            JsonCond::DigBlank(path) => json_value_blank(json_dig_path(item, path)),
+            JsonCond::DigTruthy(path) => {
+                matches!(json_dig_path(item, path), Some(v) if !v.is_null() && v.as_bool() != Some(false))
+            }
+            JsonCond::EndsWith(name, lit) => field(name)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.ends_with(lit.as_str())),
+            JsonCond::MatchRe(name, pat, flags) => field(name)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| lc_regex(pat, flags).is_ok_and(|re| re.whole.is_match(s))),
+            JsonCond::AnyMatchRe(name, pat, flags) => {
+                field(name).and_then(|v| v.as_array()).is_some_and(|items| {
+                    lc_regex(pat, flags).is_ok_and(|re| {
+                        items
+                            .iter()
+                            .any(|el| el.as_str().is_some_and(|s| re.whole.is_match(s)))
+                    })
+                })
+            }
             JsonCond::NoneMatch(name, inner) => {
                 let Some(re) = &rp.re else {
                     return true;
@@ -23849,10 +25317,25 @@ mod livecheck {
         }
     }
 
+    /// Ruby `blank?` over a JSON value.
+    fn json_value_blank(v: Option<&aterm_json::Value>) -> bool {
+        match v {
+            None => true,
+            Some(v) => {
+                v.is_null()
+                    || v.as_bool() == Some(false)
+                    || v.as_str().is_some_and(|s| s.trim().is_empty())
+                    || v.as_array().is_some_and(Vec::is_empty)
+                    || v.as_object().is_some_and(|o| o.is_empty())
+            }
+        }
+    }
+
     fn json_apply_tail(s: &str, tail: &super::super::formula::JsonTail) -> String {
         use super::super::formula::JsonTail;
         match tail {
             JsonTail::None | JsonTail::ToS => s.to_string(),
+            JsonTail::Strip => s.trim().to_string(),
             JsonTail::Tr(from, to) => ruby_tr(s, from, to),
             JsonTail::Sub(from, to) => s.replacen(from.as_str(), to, 1),
             JsonTail::DeletePrefix(p) => s
@@ -23870,14 +25353,15 @@ mod livecheck {
     fn json_template_one(
         tmpl: &super::super::formula::JsonTemplate,
         base: &aterm_json::Value,
+        root: &aterm_json::Value,
         rp: &RunPlan,
         lit_res: &[Option<LcRegex>],
     ) -> Result<Option<String>, Found> {
-        use super::super::formula::{JsonLocal, JsonPart, JsonRender, JsonTail, JsonValue};
+        use super::super::formula::JsonLocal;
         if tmpl
             .guards
             .iter()
-            .any(|g| eval_json_cond(&g.cond, base, rp) != g.unless)
+            .any(|g| eval_json_cond(&g.cond, base, rp, None) != g.unless)
         {
             return Ok(None);
         }
@@ -23926,6 +25410,30 @@ mod livecheck {
                     .iter()
                     .find_map(|p| json_dig_path(base, p).filter(|v| !v.is_null()))
                     .cloned(),
+                JsonLocal::DigOrTail(paths, tail) => paths
+                    .iter()
+                    .find_map(|p| json_dig_path(base, p).filter(|v| !v.is_null()))
+                    .and_then(|v| v.as_str())
+                    .map(|v| aterm_json::Value::String(json_apply_tail(v, tail))),
+                JsonLocal::SplitRowsFind {
+                    path,
+                    line_sep,
+                    field_sep,
+                    first_suffix,
+                } => json_dig_path(base, path)
+                    .and_then(|v| v.as_str())
+                    .and_then(|text| {
+                        text.split(line_sep.as_str()).find_map(|line| {
+                            let mut fields: Vec<&str> = line.split(field_sep.as_str()).collect();
+                            while fields.last().is_some_and(|f| f.is_empty()) {
+                                fields.pop();
+                            }
+                            fields
+                                .first()
+                                .is_some_and(|f| f.ends_with(first_suffix.as_str()))
+                                .then(|| aterm_json::Value::String(fields.join("\u{1f}")))
+                        })
+                    }),
                 JsonLocal::DigCaptureLit(path, ..) => {
                     let s = json_dig_path(base, path).and_then(|v| v.as_str());
                     match (s, lit_res.get(i).and_then(Option::as_ref)) {
@@ -23972,21 +25480,107 @@ mod livecheck {
             }
             None => None,
         };
+        json_render_eval(&tmpl.render, base, root, &locals, groups.as_deref(), rp)
+    }
+
+    fn json_render_eval(
+        render: &super::super::formula::JsonRender,
+        base: &aterm_json::Value,
+        root: &aterm_json::Value,
+        locals: &[Option<aterm_json::Value>],
+        groups: Option<&[Option<String>]>,
+        rp: &RunPlan,
+    ) -> Result<Option<String>, Found> {
+        use super::super::formula::{JsonPart, JsonRender, JsonTail, JsonValue};
         let cap = |n: usize| -> String {
             groups
-                .as_ref()
                 .and_then(|g| g.get(n))
                 .cloned()
                 .flatten()
                 .unwrap_or_default()
         };
-        match &tmpl.render {
+        let cap_participates =
+            |n: usize| groups.and_then(|g| g.get(n)).is_some_and(Option::is_some);
+        match render {
+            JsonRender::GsubRegex {
+                inner,
+                pat,
+                flags,
+                repl,
+            } => {
+                let Some(s) = json_render_eval(inner, base, root, locals, groups, rp)? else {
+                    return Ok(None);
+                };
+                let Ok(re) = lc_regex(pat, flags) else {
+                    return Ok(None);
+                };
+                let mut out = String::new();
+                let mut last = 0usize;
+                for m in re.whole.find_iter(&s) {
+                    if m.start() < last {
+                        continue;
+                    }
+                    out.push_str(&s[last..m.start()]);
+                    out.push_str(repl);
+                    last = m.end();
+                    if m.start() == m.end() {
+                        if let Some(c) = s[last..].chars().next() {
+                            out.push(c);
+                            last += c.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                out.push_str(&s[last..]);
+                Ok(Some(out))
+            }
+            JsonRender::CapFork {
+                cap: n,
+                present,
+                then,
+                els,
+            } => {
+                let take = cap_participates(*n) && (!*present || !cap(*n).trim().is_empty());
+                json_render_eval(
+                    if take { then } else { els },
+                    base,
+                    root,
+                    locals,
+                    groups,
+                    rp,
+                )
+            }
+            JsonRender::CapEqFork { a, b, then, els } => {
+                let take = cap(*a) == cap(*b);
+                json_render_eval(
+                    if take { then } else { els },
+                    base,
+                    root,
+                    locals,
+                    groups,
+                    rp,
+                )
+            }
+            JsonRender::LocalEqFork { a, b, then, els } => {
+                let get = |i: usize| locals.get(i).cloned().flatten();
+                let take = get(*a) == get(*b);
+                json_render_eval(
+                    if take { then } else { els },
+                    base,
+                    root,
+                    locals,
+                    groups,
+                    rp,
+                )
+            }
             JsonRender::Template(parts) => {
                 let mut out = String::new();
                 for part in parts {
                     match part {
                         JsonPart::Lit(s) => out.push_str(s),
                         JsonPart::Cap(n) => out.push_str(&cap(*n)),
+                        JsonPart::CapTr(n, from, to) => out.push_str(&ruby_tr(&cap(*n), from, to)),
                         JsonPart::Local(i) => {
                             if let Some(Some(v)) = locals.get(*i)
                                 && let Some(s) = json_interp(v)
@@ -23994,8 +25588,28 @@ mod livecheck {
                                 out.push_str(&s);
                             }
                         }
+                        JsonPart::LocalMd5Field(pos, field) => {
+                            let value = locals
+                                .get(*pos)
+                                .and_then(Option::as_ref)
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.split('\u{1f}').nth(*field));
+                            let Some(value) = value else {
+                                return Err(Found::Raised(
+                                    "no implicit conversion of nil into String".to_string(),
+                                ));
+                            };
+                            out.push_str(&md5_hex(value.as_bytes()));
+                        }
                         JsonPart::Field(k) => {
                             if let Some(v) = base.get(k)
+                                && let Some(s) = json_interp(v)
+                            {
+                                out.push_str(&s);
+                            }
+                        }
+                        JsonPart::RootDig(path) => {
+                            if let Some(v) = json_dig_path(root, path)
                                 && let Some(s) = json_interp(v)
                             {
                                 out.push_str(&s);
@@ -24022,12 +25636,7 @@ mod livecheck {
                     }
                     JsonValue::Local(i) => locals.get(*i).cloned().flatten(),
                     JsonValue::Cap(n) => {
-                        let s = cap(*n);
-                        let present = groups
-                            .as_ref()
-                            .and_then(|g| g.get(*n))
-                            .is_some_and(Option::is_some);
-                        present.then_some(aterm_json::Value::String(s))
+                        cap_participates(*n).then_some(aterm_json::Value::String(cap(*n)))
                     }
                     JsonValue::Field(k) => base.get(k).cloned(),
                 };
@@ -24045,18 +25654,7 @@ mod livecheck {
                         None => return Ok(None),
                     }
                 };
-                Ok(Some(match tail {
-                    JsonTail::None | JsonTail::ToS => s,
-                    JsonTail::Tr(from, to) => ruby_tr(&s, from, to),
-                    JsonTail::Sub(from, to) => s.replacen(from.as_str(), to, 1),
-                    JsonTail::DeletePrefix(p) => {
-                        s.strip_prefix(p.as_str()).map_or(s.clone(), str::to_string)
-                    }
-                    JsonTail::DeleteSuffix(p) => {
-                        s.strip_suffix(p.as_str()).map_or(s.clone(), str::to_string)
-                    }
-                    JsonTail::DeleteChars(cs) => s.chars().filter(|c| !cs.contains(*c)).collect(),
-                }))
+                Ok(Some(json_apply_tail(&s, tail)))
             }
         }
     }
@@ -24080,16 +25678,91 @@ mod livecheck {
                 })
                 .collect();
         let mut out = Vec::new();
-        if tmpl.map {
-            if let Some(items) = json_dig_path(root, &tmpl.path).and_then(|v| v.as_array()) {
-                for item in items {
-                    if let Some(v) = json_template_one(tmpl, item, rp, &lit_res)? {
-                        out.push(v);
+        if !tmpl.finds.is_empty() {
+            use super::super::formula::{JsonFindCond, JsonLit};
+            let mut base = Some(root.clone());
+            for (i, find) in tmpl.finds.iter().enumerate() {
+                base = base.as_ref().and_then(|b| {
+                    json_dig_path(b, &find.path)
+                        .and_then(|v| v.as_array())
+                        .and_then(|items| {
+                            let mut candidates = items.iter().filter(|item| match &find.cond {
+                                JsonFindCond::FieldEq(field, lit) => {
+                                    let v = item.get(field);
+                                    match (v, lit) {
+                                        (Some(v), JsonLit::Str(s)) => {
+                                            v.as_str() == Some(s.as_str())
+                                        }
+                                        (Some(v), JsonLit::Bool(b)) => v.as_bool() == Some(*b),
+                                        (Some(v), JsonLit::Int(n)) => v.as_f64() == Some(*n as f64),
+                                        _ => false,
+                                    }
+                                }
+                                JsonFindCond::DigStartsWith(path, lit) => json_dig_path(item, path)
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|s| s.starts_with(lit.as_str())),
+                            });
+                            match &find.max_by {
+                                None => candidates.next(),
+                                Some(field) => candidates.fold(None, |best, item| {
+                                    let version = |v: &aterm_json::Value| {
+                                        v.get(field).and_then(json_interp).unwrap_or_default()
+                                    };
+                                    match best {
+                                        None => Some(item),
+                                        Some(current)
+                                            if version_cmp(&version(item), &version(current))
+                                                == std::cmp::Ordering::Greater =>
+                                        {
+                                            Some(item)
+                                        }
+                                        other => other,
+                                    }
+                                }),
+                            }
+                        })
+                        .cloned()
+                });
+                if let Some((_, nonblank)) = tmpl.require_find.iter().find(|(idx, _)| *idx == i) {
+                    let ok = match &base {
+                        None => false,
+                        Some(v) => {
+                            !v.is_null()
+                                && v.as_bool() != Some(false)
+                                && (!*nonblank || !json_value_blank(Some(v)))
+                        }
+                    };
+                    if !ok {
+                        return Ok(out);
                     }
                 }
             }
+            if let Some(base) = &base
+                && let Some(v) = json_template_one(tmpl, base, root, rp, &lit_res)?
+            {
+                out.push(v);
+            }
+            return Ok(out);
+        }
+        if tmpl.map {
+            let items: Vec<&aterm_json::Value> = if tmpl.values {
+                json_dig_path(root, &tmpl.path)
+                    .and_then(|v| v.as_object())
+                    .map(|obj| obj.values().collect())
+                    .unwrap_or_default()
+            } else {
+                json_dig_path(root, &tmpl.path)
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().collect())
+                    .unwrap_or_default()
+            };
+            for item in items {
+                if let Some(v) = json_template_one(tmpl, item, root, rp, &lit_res)? {
+                    out.push(v);
+                }
+            }
         } else if let Some(base) = json_dig_path(root, &tmpl.path)
-            && let Some(v) = json_template_one(tmpl, base, rp, &lit_res)?
+            && let Some(v) = json_template_one(tmpl, base, root, rp, &lit_res)?
         {
             out.push(v);
         }
@@ -24118,7 +25791,10 @@ mod livecheck {
         // compile-checked at plan time; rebuild them.
         let shape_guard = match &block.shape {
             JsonShape::MapGuarded(_, guard) => Some(guard),
+            JsonShape::MapGuardedMax(_, guard) => Some(guard),
+            JsonShape::EntriesMap(_, guard) => Some(guard),
             JsonShape::ValuesMap(_, _, guard) => Some(guard),
+            JsonShape::NestedMap { guard, .. } => Some(guard),
             _ => None,
         };
         let lit_re = match shape_guard {
@@ -24188,6 +25864,7 @@ mod livecheck {
         fn apply_json_guard(
             guard: &super::super::formula::MapGuard,
             item: &aterm_json::Value,
+            entry_key: Option<&str>,
             rp: &RunPlan,
             regex_capture: &impl Fn(&str) -> Result<Option<String>, Found>,
             lit_re: Option<&LcRegex>,
@@ -24196,7 +25873,7 @@ mod livecheck {
             if guard
                 .guards
                 .iter()
-                .any(|g| eval_json_cond(&g.cond, item, rp) != g.unless)
+                .any(|g| eval_json_cond(&g.cond, item, rp, entry_key) != g.unless)
             {
                 return Ok(None);
             }
@@ -24231,6 +25908,236 @@ mod livecheck {
         let versions: Result<Vec<String>, Found> = (|| {
             let mut out: Vec<String> = Vec::new();
             match &block.shape {
+                JsonShape::NestedFirstMatch {
+                    outer,
+                    inner,
+                    field,
+                    render,
+                } => {
+                    if let Some(re) = &rp.re
+                        && let Some(items) = dig(&root, outer).and_then(|v| v.as_array())
+                    {
+                        'outer: for item in items {
+                            let Some(els) = dig(item, inner).and_then(|v| v.as_array()) else {
+                                continue;
+                            };
+                            for el in els {
+                                let Some(text) = el.get(field).and_then(|v| v.as_str()) else {
+                                    continue;
+                                };
+                                if let Some(groups) = search_groups(re, text) {
+                                    out.extend(json_render_eval(
+                                        render,
+                                        el,
+                                        &root,
+                                        &[],
+                                        Some(&groups),
+                                        rp,
+                                    )?);
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+                JsonShape::MultiMatch { matches, render } => {
+                    use super::super::formula::{JsonMatchRegex, JsonMultiPart};
+                    let mut all_groups: Vec<Vec<Option<String>>> = Vec::new();
+                    for spec in matches {
+                        let mut found = None;
+                        for attempt in &spec.attempts {
+                            let Some(text) = dig(&root, &attempt.path).and_then(|v| v.as_str())
+                            else {
+                                continue;
+                            };
+                            let groups = match &attempt.regex {
+                                JsonMatchRegex::Block => {
+                                    rp.re.as_ref().and_then(|re| search_groups(re, text))
+                                }
+                                JsonMatchRegex::Literal(pat, flags) => lc_regex(pat, flags)
+                                    .ok()
+                                    .and_then(|re| search_groups(&re, text)),
+                            };
+                            if groups.is_some() {
+                                found = groups;
+                                break;
+                            }
+                        }
+                        let Some(groups) = found else {
+                            all_groups.clear();
+                            break;
+                        };
+                        all_groups.push(groups);
+                    }
+                    if all_groups.len() == matches.len() {
+                        let mut rendered = String::new();
+                        for part in render {
+                            match part {
+                                JsonMultiPart::Lit(s) => rendered.push_str(s),
+                                JsonMultiPart::Cap(m, n) => {
+                                    if let Some(s) = all_groups
+                                        .get(*m)
+                                        .and_then(|g| g.get(*n))
+                                        .cloned()
+                                        .flatten()
+                                    {
+                                        rendered.push_str(&s);
+                                    }
+                                }
+                            }
+                        }
+                        out.push(rendered);
+                    }
+                }
+                JsonShape::DigMatch { paths, render } => {
+                    if let Some(re) = &rp.re {
+                        // `||` chains: first truthy dug
+                        // value (Ruby keeps "" — only
+                        // nil/false fall through).
+                        let mut text: Option<String> = None;
+                        for path in paths {
+                            if let Some(v) = dig(&root, path)
+                                && !matches!(
+                                    v,
+                                    aterm_json::Value::Null | aterm_json::Value::Bool(false)
+                                )
+                            {
+                                text = scalar(v)?;
+                                break;
+                            }
+                        }
+                        if let Some(groups) = text.as_deref().and_then(|t| search_groups(re, t)) {
+                            out.extend(json_render_eval(
+                                render,
+                                &root,
+                                &root,
+                                &[],
+                                Some(&groups),
+                                rp,
+                            )?);
+                        }
+                    }
+                }
+                JsonShape::EntriesFirstMatch {
+                    path,
+                    dig: inner_dig,
+                    render,
+                } => {
+                    if let Some(re) = &rp.re
+                        && let Some(obj) = dig(&root, path).and_then(|v| v.as_object())
+                    {
+                        for item in obj.values() {
+                            let Some(text) = dig(item, inner_dig).and_then(|v| v.as_str()) else {
+                                continue;
+                            };
+                            if let Some(groups) = search_groups(re, text) {
+                                out.extend(json_render_eval(
+                                    render,
+                                    item,
+                                    &root,
+                                    &[],
+                                    Some(&groups),
+                                    rp,
+                                )?);
+                                break;
+                            }
+                        }
+                    }
+                }
+                JsonShape::NestedCollect {
+                    outer,
+                    inner,
+                    field,
+                } => {
+                    if let Some(re) = &rp.re
+                        && let Some(items) = dig(&root, outer).and_then(|v| v.as_array())
+                    {
+                        for item in items {
+                            let Some(els) = dig(item, inner).and_then(|v| v.as_array()) else {
+                                continue;
+                            };
+                            for el in els {
+                                if let Some(g) = el
+                                    .get(field)
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|t| search_group1(re, t))
+                                {
+                                    out.push(g);
+                                }
+                            }
+                        }
+                    }
+                }
+                JsonShape::NestedMap {
+                    outer,
+                    inner,
+                    guard,
+                } => {
+                    if let Some(items) = dig(&root, outer).and_then(|v| v.as_array()) {
+                        for item in items {
+                            let Some(els) = dig(item, inner).and_then(|v| v.as_array()) else {
+                                continue;
+                            };
+                            for el in els {
+                                if let Some(v) = apply_json_guard(
+                                    guard,
+                                    el,
+                                    None,
+                                    rp,
+                                    &regex_capture,
+                                    lit_re.as_ref(),
+                                    sub_re.as_ref(),
+                                )? {
+                                    out.push(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                JsonShape::NestedTemplate {
+                    outer,
+                    inner,
+                    guards,
+                    outer_field,
+                    inner_field,
+                } => {
+                    if let Some(items) = dig(&root, outer).and_then(|v| v.as_array()) {
+                        for item in items {
+                            let Some(els) = dig(item, inner).and_then(|v| v.as_array()) else {
+                                continue;
+                            };
+                            for el in els {
+                                if guards
+                                    .iter()
+                                    .any(|g| eval_json_cond(&g.cond, el, rp, None) == g.unless)
+                                {
+                                    continue;
+                                }
+                                let Some(outer_v) = item.get(outer_field).and_then(json_interp)
+                                else {
+                                    continue;
+                                };
+                                let inner_v = el.get(inner_field);
+                                let truthy = matches!(
+                                    inner_v,
+                                    Some(v) if !v.is_null() && v.as_bool() != Some(false)
+                                );
+                                if truthy {
+                                    let rendered =
+                                        inner_v.and_then(json_interp).unwrap_or_default();
+                                    out.push(format!("{outer_v},{rendered}"));
+                                } else {
+                                    out.push(outer_v);
+                                }
+                            }
+                        }
+                    }
+                }
+                JsonShape::RootToS => {
+                    if let Some(s) = json_interp(&root) {
+                        out.push(s);
+                    }
+                }
                 JsonShape::Dig(path) => {
                     if let Some(v) = dig(&root, path).and_then(|v| scalar(v).transpose()) {
                         out.push(v?);
@@ -24255,6 +26162,144 @@ mod livecheck {
                         && let Some(cap) = regex_capture(&s)?
                     {
                         out.push(cap);
+                    }
+                }
+                JsonShape::ValuesKey(path, key) => {
+                    if let Some(obj) = dig(&root, path).and_then(|v| v.as_object()) {
+                        for v in obj.values() {
+                            if let Some(item) = v.get(key)
+                                && let Some(s) = scalar(item)?
+                            {
+                                out.push(s);
+                            }
+                        }
+                    }
+                }
+                JsonShape::DigJoin(path, sep) => {
+                    fn join_val(v: &aterm_json::Value, sep: &str) -> String {
+                        match v.as_array() {
+                            Some(items) => items
+                                .iter()
+                                .map(|e| join_val(e, sep))
+                                .collect::<Vec<_>>()
+                                .join(sep),
+                            None => json_interp(v).unwrap_or_default(),
+                        }
+                    }
+                    if let Some(items) = dig(&root, path).and_then(|v| v.as_array()) {
+                        out.push(
+                            items
+                                .iter()
+                                .map(|e| join_val(e, sep))
+                                .collect::<Vec<_>>()
+                                .join(sep),
+                        );
+                    }
+                }
+                JsonShape::EntriesKeys(path, guards) => {
+                    if let Some(obj) = dig(&root, path).and_then(|v| v.as_object()) {
+                        let order = json_object_key_order(&content, path);
+                        let keys: Vec<String> = match &order {
+                            Some(keys) => keys
+                                .iter()
+                                .filter(|k| obj.contains_key(*k))
+                                .cloned()
+                                .collect(),
+                            None => obj.keys().cloned().collect(),
+                        };
+                        for k in keys {
+                            let Some(item) = obj.get(&k) else { continue };
+                            if guards.iter().any(|g| {
+                                eval_json_cond(&g.cond, item, rp, Some(k.as_str())) != g.unless
+                            }) {
+                                continue;
+                            }
+                            out.push(k);
+                        }
+                    }
+                }
+                JsonShape::EntriesMap(path, guard) => {
+                    if let Some(obj) = dig(&root, path).and_then(|v| v.as_object()) {
+                        // Document order, like ValuesMap.
+                        let order = json_object_key_order(&content, path);
+                        let keys: Vec<String> = match &order {
+                            Some(keys) => keys
+                                .iter()
+                                .filter(|k| obj.contains_key(*k))
+                                .cloned()
+                                .collect(),
+                            None => obj.keys().cloned().collect(),
+                        };
+                        for k in keys {
+                            let Some(item) = obj.get(&k) else { continue };
+                            if let Some(v) = apply_json_guard(
+                                guard,
+                                item,
+                                Some(k.as_str()),
+                                rp,
+                                &regex_capture,
+                                lit_re.as_ref(),
+                                sub_re.as_ref(),
+                            )? {
+                                out.push(v);
+                            }
+                        }
+                    }
+                }
+                JsonShape::MapGuardedMax(path, guard) => {
+                    if let Some(items) = dig(&root, path).and_then(|v| v.as_array()) {
+                        let mut best: Option<String> = None;
+                        for item in items {
+                            if let Some(v) = apply_json_guard(
+                                guard,
+                                item,
+                                None,
+                                rp,
+                                &regex_capture,
+                                lit_re.as_ref(),
+                                sub_re.as_ref(),
+                            )? && best.as_deref().is_none_or(|b| v.as_str() > b)
+                            {
+                                best = Some(v);
+                            }
+                        }
+                        out.extend(best);
+                    }
+                }
+                JsonShape::DigSubPlain(path, pat, flags, replacement) => {
+                    if let Some(v) = dig(&root, path)
+                        && let Some(s) = json_interp(v)
+                        && let Ok(lit) = lc_regex(pat, flags)
+                    {
+                        out.push(match lit.whole.find(&s) {
+                            Some(m) => {
+                                format!("{}{}{}", &s[..m.start()], replacement, &s[m.end()..])
+                            }
+                            None => s,
+                        });
+                    }
+                }
+                JsonShape::DigCaptures(path) => {
+                    if let Some(v) = dig(&root, path)
+                        && let Some(s) = scalar(v)?
+                        && let Some(re) = &rp.re
+                        && let Some(groups) = search_groups(re, &s)
+                    {
+                        out.extend(groups.into_iter().skip(1).flatten());
+                    }
+                }
+                JsonShape::DigScan(path, parts) => {
+                    if let Some(v) = dig(&root, path)
+                        && let Some(s) = scalar(v)?
+                        && let Some(re) = &rp.re
+                    {
+                        for m in re.whole.find_iter(&s) {
+                            let groups = extract_groups(re, m.as_str());
+                            let rendered = page_render_parts(parts, &groups);
+                            if !out.contains(&rendered) {
+                                out.push(rendered);
+                            }
+                        }
                     }
                 }
                 JsonShape::FirstKey(key) => {
@@ -24291,6 +26336,7 @@ mod livecheck {
                             if let Some(v) = apply_json_guard(
                                 guard,
                                 item,
+                                None,
                                 rp,
                                 &regex_capture,
                                 lit_re.as_ref(),
@@ -24322,6 +26368,7 @@ mod livecheck {
                                 if let Some(v) = apply_json_guard(
                                     guard,
                                     item,
+                                    None,
                                     rp,
                                     &regex_capture,
                                     lit_re.as_ref(),
@@ -24640,16 +26687,20 @@ mod livecheck {
     ) -> bool {
         use super::super::formula::XmlPred;
         let node = &nodes[idx];
-        let tag_ok = if step.tag.contains(':') {
-            node.name == step.tag
+        let tag = step
+            .tag
+            .strip_prefix("following-sibling::")
+            .unwrap_or(&step.tag);
+        let tag_ok = if tag.contains(':') {
+            node.name == tag
         } else {
-            xml_local_name(&node.name) == step.tag
+            xml_local_name(&node.name) == tag
         };
         if !tag_ok {
             return false;
         }
         match &step.pred {
-            None => true,
+            None | Some(XmlPred::Index(_)) => true,
             Some(XmlPred::TextEq(v)) => &node.text == v,
             Some(XmlPred::ChildTextEq(child, v)) => node.children.iter().any(|c| {
                 let cn = &nodes[*c];
@@ -24665,6 +26716,26 @@ mod livecheck {
                 } else {
                     xml_local_name(a) == attr.as_str()
                 }) && val == v
+            }),
+            Some(XmlPred::AttrContains(attr, v)) => node.attrs.iter().any(|(a, val)| {
+                (if attr.contains(':') {
+                    a == attr
+                } else {
+                    xml_local_name(a) == attr.as_str()
+                }) && val.contains(v.as_str())
+            }),
+            Some(XmlPred::SiblingAfterChild {
+                child,
+                child_text,
+                text,
+            }) => node.children.iter().any(|c| {
+                let cn = &nodes[*c];
+                (if child.contains(':') {
+                    &cn.name == child
+                } else {
+                    xml_local_name(&cn.name) == child.as_str()
+                }) && &cn.text == child_text
+                    && xml_next_element(nodes, *c).is_some_and(|n| &nodes[n].text == text)
             }),
             Some(XmlPred::AttrAll(terms)) => terms.iter().all(|(attr, want)| {
                 let got = node.attrs.iter().find_map(|(a, val)| {
@@ -24683,6 +26754,43 @@ mod livecheck {
         }
     }
 
+    /// One step's candidates from a context node:
+    /// its children, or its following siblings for
+    /// a `following-sibling::` step, positionally
+    /// narrowed by an `[n]` predicate.
+    fn xml_step_candidates(
+        nodes: &[XmlNode],
+        idx: usize,
+        step: &super::super::formula::XmlStep,
+    ) -> Vec<usize> {
+        let mut candidates: Vec<usize> = if step.tag.starts_with("following-sibling::") {
+            let parent = nodes[idx].parent;
+            match nodes[parent].children.iter().position(|s| *s == idx) {
+                Some(pos) => nodes[parent].children[pos + 1..]
+                    .iter()
+                    .copied()
+                    .filter(|i| xml_step_matches(nodes, *i, step))
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            nodes[idx]
+                .children
+                .iter()
+                .copied()
+                .filter(|i| xml_step_matches(nodes, *i, step))
+                .collect()
+        };
+        if let Some(super::super::formula::XmlPred::Index(n)) = &step.pred {
+            candidates = n
+                .checked_sub(1)
+                .and_then(|i| candidates.get(i).copied())
+                .into_iter()
+                .collect();
+        }
+        candidates
+    }
+
     fn xml_query_all(nodes: &[XmlNode], path: &super::super::formula::XmlPathQ) -> Vec<usize> {
         if path.steps.is_empty() {
             return Vec::new();
@@ -24699,14 +26807,40 @@ mod livecheck {
                 .filter(|i| xml_step_matches(nodes, *i, &path.steps[0]))
                 .collect()
         };
+        if let Some(super::super::formula::XmlPred::Index(n)) = &path.steps[0].pred {
+            current.retain(|&i| {
+                let parent = nodes[i].parent;
+                nodes[parent]
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|c| xml_step_matches(nodes, *c, &path.steps[0]))
+                    .nth(n.wrapping_sub(1))
+                    == Some(i)
+            });
+        }
         for step in &path.steps[1..] {
             let mut next = Vec::new();
             for i in current {
-                for c in &nodes[i].children {
-                    if xml_step_matches(nodes, *c, step) {
-                        next.push(*c);
-                    }
-                }
+                next.extend(xml_step_candidates(nodes, i, step));
+            }
+            current = next;
+        }
+        current
+    }
+
+    /// Relative child steps from one element
+    /// (`item.elements["key…/sub"]`).
+    fn xml_query_from(
+        nodes: &[XmlNode],
+        start: usize,
+        steps: &[super::super::formula::XmlStep],
+    ) -> Vec<usize> {
+        let mut current = vec![start];
+        for step in steps {
+            let mut next = Vec::new();
+            for i in current {
+                next.extend(xml_step_candidates(nodes, i, step));
             }
             current = next;
         }
@@ -24756,9 +26890,92 @@ mod livecheck {
                         out.push_str(g);
                     }
                 }
+                XmlPart::CapTr(n, a, b) => {
+                    if let Some(Some(g)) = groups.and_then(|g| g.get(*n)) {
+                        out.push_str(&ruby_tr(g, a, b));
+                    }
+                }
             }
         }
         out
+    }
+
+    fn xml_query_doc(nodes: &[XmlNode], path: &super::super::formula::XmlPathQ) -> Vec<usize> {
+        if path.relative {
+            xml_query_from(nodes, 0, &path.steps)
+        } else {
+            xml_query_all(nodes, path)
+        }
+    }
+
+    fn xml_zip_versions(
+        a: &super::super::formula::XmlMap,
+        b: &super::super::formula::XmlMap,
+        parts: &[super::super::formula::XmlPart],
+        content: &str,
+    ) -> Result<Vec<String>, String> {
+        use super::super::formula::XmlProj;
+        let nodes = xml_dom_parse(content)?;
+        let project = |map: &super::super::formula::XmlMap| -> Vec<Option<String>> {
+            xml_query_doc(&nodes, &map.path)
+                .iter()
+                .map(|item| match &map.proj {
+                    XmlProj::Text => Some(nodes[*item].text.trim().to_string()),
+                    XmlProj::TextDeleteSuffix(suffix) => Some(
+                        nodes[*item]
+                            .text
+                            .trim()
+                            .strip_suffix(suffix.as_str())
+                            .unwrap_or(nodes[*item].text.trim())
+                            .to_string(),
+                    ),
+                    XmlProj::NextText => {
+                        xml_next_element(&nodes, *item).map(|n| nodes[n].text.trim().to_string())
+                    }
+                    XmlProj::Attr(attr) => xml_attr_value(&nodes, *item, attr).map(str::to_string),
+                    _ => None,
+                })
+                .collect()
+        };
+        let a_values = project(a);
+        let b_values = project(b);
+        let mut out = Vec::new();
+        for i in 0..a_values.len() {
+            let locals = vec![
+                a_values.get(i).cloned().flatten(),
+                b_values.get(i).cloned().flatten(),
+            ];
+            out.push(xml_render_parts(parts, &locals, None));
+        }
+        Ok(out)
+    }
+
+    fn xml_two_list_extreme_versions(
+        versions_map: &super::super::formula::XmlMap,
+        builds_map: &super::super::formula::XmlMap,
+        content: &str,
+        rp: &RunPlan,
+    ) -> Result<Vec<String>, String> {
+        let nodes = xml_dom_parse(content)?;
+        let Some(re) = &rp.re else {
+            return Ok(Vec::new());
+        };
+        let versions: Vec<String> = xml_query_doc(&nodes, &versions_map.path)
+            .iter()
+            .filter_map(|item| search_group1(re, nodes[*item].text.trim()))
+            .collect();
+        let builds: Vec<String> = xml_query_doc(&nodes, &builds_map.path)
+            .iter()
+            .map(|item| nodes[*item].text.trim().to_string())
+            .collect();
+        let version = versions.iter().max_by(|a, b| version_cmp(a, b));
+        let build = builds.iter().max();
+        match (version, build) {
+            (Some(v), Some(b)) if !v.trim().is_empty() && !b.trim().is_empty() => {
+                Ok(vec![format!("{v},{b}")])
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     fn xml_template_versions(
@@ -24778,7 +26995,7 @@ mod livecheck {
         };
         let mut out: Vec<String> = Vec::new();
         if let Some(map) = &tmpl.map {
-            for item in xml_query_all(&nodes, &map.path) {
+            for item in xml_query_doc(&nodes, &map.path) {
                 if !map.locals.is_empty() {
                     use super::super::formula::XmlItemLocal;
                     let values: Vec<Option<String>> = map
@@ -24804,8 +27021,25 @@ mod livecheck {
                     }
                     continue;
                 }
+                let child_named = |name: &str| {
+                    nodes[item].children.iter().copied().find(|c| {
+                        if name.contains(':') {
+                            nodes[*c].name == name
+                        } else {
+                            xml_local_name(&nodes[*c].name) == name
+                        }
+                    })
+                };
                 let proj: Option<String> = match &map.proj {
                     XmlProj::Text => Some(nodes[item].text.trim().to_string()),
+                    XmlProj::TextDeleteSuffix(suffix) => Some(
+                        nodes[item]
+                            .text
+                            .trim()
+                            .strip_suffix(suffix.as_str())
+                            .unwrap_or(nodes[item].text.trim())
+                            .to_string(),
+                    ),
                     XmlProj::NextText => text_of(item, true).map(|t| t.trim().to_string()),
                     XmlProj::Attr(attr) => xml_attr_value(&nodes, item, attr).map(str::to_string),
                     XmlProj::AttrCapture(attr) => {
@@ -24816,6 +27050,80 @@ mod livecheck {
                             Some(re) => search_group1(re, v),
                             None => None,
                         }
+                    }
+                    XmlProj::AttrMatch(attr) => {
+                        let Some(text) = xml_attr_value(&nodes, item, attr) else {
+                            continue;
+                        };
+                        let Some(re) = &rp.re else { continue };
+                        let Some(groups) = search_groups(re, text) else {
+                            continue;
+                        };
+                        Some(match &tmpl.render {
+                            XmlRender::CapValue(n) => match groups.get(*n).cloned().flatten() {
+                                Some(v) => v,
+                                None => continue,
+                            },
+                            XmlRender::Template(parts) => {
+                                xml_render_parts(parts, &[], Some(&groups))
+                            }
+                            XmlRender::CapPresentFork { cap, then, els } => {
+                                let present = groups
+                                    .get(*cap)
+                                    .cloned()
+                                    .flatten()
+                                    .is_some_and(|s| !s.trim().is_empty());
+                                xml_render_parts(
+                                    if present { then } else { els },
+                                    &[],
+                                    Some(&groups),
+                                )
+                            }
+                            _ => continue,
+                        })
+                    }
+                    XmlProj::ChildAttrMatch {
+                        child,
+                        attr,
+                        skip_child,
+                    } => {
+                        if let Some((skip, lit)) = skip_child
+                            && child_named(skip).is_some_and(|c| nodes[c].text.contains(lit))
+                        {
+                            continue;
+                        }
+                        let Some(child_idx) = child_named(child) else {
+                            continue;
+                        };
+                        let Some(text) = xml_attr_value(&nodes, child_idx, attr) else {
+                            continue;
+                        };
+                        let Some(re) = &rp.re else { continue };
+                        let Some(groups) = search_groups(re, text) else {
+                            continue;
+                        };
+                        Some(match &tmpl.render {
+                            XmlRender::CapValue(n) => match groups.get(*n).cloned().flatten() {
+                                Some(v) => v,
+                                None => continue,
+                            },
+                            XmlRender::Template(parts) => {
+                                xml_render_parts(parts, &[], Some(&groups))
+                            }
+                            XmlRender::CapPresentFork { cap, then, els } => {
+                                let present = groups
+                                    .get(*cap)
+                                    .cloned()
+                                    .flatten()
+                                    .is_some_and(|s| !s.trim().is_empty());
+                                xml_render_parts(
+                                    if present { then } else { els },
+                                    &[],
+                                    Some(&groups),
+                                )
+                            }
+                            _ => continue,
+                        })
                     }
                     XmlProj::TextMatch(next) => {
                         let Some(text) = text_of(item, *next) else {
@@ -24833,6 +27141,18 @@ mod livecheck {
                             XmlRender::Template(parts) => {
                                 xml_render_parts(parts, &[], Some(&groups))
                             }
+                            XmlRender::CapPresentFork { cap, then, els } => {
+                                let present = groups
+                                    .get(*cap)
+                                    .cloned()
+                                    .flatten()
+                                    .is_some_and(|s| !s.trim().is_empty());
+                                xml_render_parts(
+                                    if present { then } else { els },
+                                    &[],
+                                    Some(&groups),
+                                )
+                            }
                             _ => continue,
                         })
                     }
@@ -24848,15 +27168,40 @@ mod livecheck {
             }
             return Ok(out);
         }
-        let locals: Vec<Option<String>> = tmpl
-            .locals
+        let elems: Vec<Option<usize>> = tmpl
+            .elems
             .iter()
-            .map(|local| {
-                xml_query_all(&nodes, &local.path)
-                    .first()
-                    .and_then(|idx| text_of(*idx, local.next))
+            .map(|elem| {
+                let first = xml_query_all(&nodes, &elem.path).first().copied()?;
+                if elem.next {
+                    xml_next_element(&nodes, first)
+                } else {
+                    Some(first)
+                }
             })
             .collect();
+        if tmpl.require_elems.iter().any(|i| elems[*i].is_none()) {
+            return Ok(out);
+        }
+        let mut locals: Vec<Option<String>> = tmpl
+            .locals
+            .iter()
+            .map(|local| match local.from {
+                Some(e) => elems.get(e).copied().flatten().and_then(|start| {
+                    xml_query_from(&nodes, start, &local.path.steps)
+                        .first()
+                        .and_then(|idx| text_of(*idx, local.next))
+                }),
+                None => xml_query_all(&nodes, &local.path)
+                    .first()
+                    .and_then(|idx| text_of(*idx, local.next)),
+            })
+            .collect();
+        for (dst, src) in &tmpl.or_pairs {
+            if locals[*dst].is_none() {
+                locals[*dst] = locals[*src].clone();
+            }
+        }
         let blank = |v: &Option<String>| v.as_ref().is_none_or(|s| s.trim().is_empty());
         if tmpl.require.iter().any(|i| blank(&locals[*i])) {
             return Ok(out);
@@ -24883,12 +27228,196 @@ mod livecheck {
                 }
             }),
             XmlRender::CapValue(n) => groups.as_ref().and_then(|g| g.get(*n).cloned().flatten()),
+            XmlRender::CapPresentFork { cap, then, els } => {
+                let present = groups
+                    .as_ref()
+                    .and_then(|g| g.get(*cap).cloned().flatten())
+                    .is_some_and(|s| !s.trim().is_empty());
+                Some(xml_render_parts(
+                    if present { then } else { els },
+                    &locals,
+                    groups.as_deref(),
+                ))
+            }
             XmlRender::Projection => None,
         };
         if let Some(v) = version {
             out.push(v);
         }
         Ok(out)
+    }
+
+    fn xml_text_json_versions(
+        path: &super::super::formula::XmlPathQ,
+        key: &str,
+        content: &str,
+    ) -> Result<Vec<String>, String> {
+        let nodes = xml_dom_parse(content)?;
+        let Some(first) = xml_query_doc(&nodes, path).first().copied() else {
+            return Ok(Vec::new());
+        };
+        let text = nodes[first].text.trim().to_string();
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Ok(root) = aterm_json::from_slice::<aterm_json::Value>(text.as_bytes()) else {
+            return Err("Content could not be parsed as JSON.".to_string());
+        };
+        let Some(obj) = root.as_object() else {
+            return Ok(Vec::new());
+        };
+        Ok(obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default())
+    }
+
+    fn xml_own_fork_versions(
+        path: &super::super::formula::XmlPathQ,
+        child: &str,
+        content: &str,
+        rp: &RunPlan,
+    ) -> Result<Vec<String>, String> {
+        let nodes = xml_dom_parse(content)?;
+        let own_major =
+            super::super::formula::cask_version_token(&rp.own_version, "version.csv.first.major");
+        let own_second =
+            super::super::formula::cask_version_token(&rp.own_version, "version.csv.second");
+        let mut out = Vec::new();
+        for item in xml_query_doc(&nodes, path) {
+            let Some(child_idx) = nodes[item].children.iter().copied().find(|c| {
+                if child.contains(':') {
+                    nodes[*c].name == child
+                } else {
+                    xml_local_name(&nodes[*c].name) == child
+                }
+            }) else {
+                continue;
+            };
+            let text = nodes[child_idx].text.trim();
+            let Some(re) = &rp.re else { continue };
+            let Some(groups) = search_groups(re, text) else {
+                continue;
+            };
+            let Some(cap1) = groups.get(1).cloned().flatten() else {
+                continue;
+            };
+            let digits: String = cap1.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let major = (!digits.is_empty()).then_some(digits);
+            if major.is_some() && major == own_major {
+                if let Some(second) = &own_second {
+                    out.push(format!("{cap1},{second}"));
+                    continue;
+                }
+            }
+            out.push(cap1);
+        }
+        Ok(out)
+    }
+
+    fn xml_header_hop_versions(
+        path: &super::super::formula::XmlPathQ,
+        header: &str,
+        parts: &[super::super::formula::XmlPart],
+        content: &str,
+        rp: &RunPlan,
+    ) -> Result<Vec<String>, String> {
+        let nodes = xml_dom_parse(content)?;
+        let Some(first) = xml_query_doc(&nodes, path).first().copied() else {
+            return Ok(Vec::new());
+        };
+        let url = nodes[first].text.trim().to_string();
+        if url.is_empty() {
+            return Ok(Vec::new());
+        }
+        let text = page_headers_text(&url, None, None, &[]);
+        let merged = merge_response_headers(&text);
+        let (Some(re), Some(value)) = (&rp.re, merged.get(header)) else {
+            return Ok(Vec::new());
+        };
+        let Some(groups) = search_groups(re, value) else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![xml_render_parts(parts, &[], Some(&groups))])
+    }
+
+    fn xml_hop_match_versions(
+        shape: &super::super::formula::XmlShape,
+        content: &str,
+        rp: &RunPlan,
+    ) -> Result<Vec<String>, String> {
+        use super::super::formula::XmlShape;
+        let XmlShape::HopMatch {
+            path,
+            max_child,
+            version_child,
+            pat,
+            flags,
+            url_child,
+            path2,
+            parts,
+        } = shape
+        else {
+            return Ok(Vec::new());
+        };
+        let nodes = xml_dom_parse(content)?;
+        let child_text = |nodes: &[XmlNode], item: usize, child: &str| -> Option<String> {
+            nodes[item]
+                .children
+                .iter()
+                .copied()
+                .find(|c| {
+                    if child.contains(':') {
+                        nodes[*c].name == child
+                    } else {
+                        xml_local_name(&nodes[*c].name) == child
+                    }
+                })
+                .map(|c| nodes[c].text.clone())
+        };
+        let mut best: Option<(usize, String)> = None;
+        for item in xml_query_doc(&nodes, path) {
+            let key = child_text(&nodes, item, max_child).unwrap_or_default();
+            if best.as_ref().is_none_or(|(_, k)| key > *k) {
+                best = Some((item, key));
+            }
+        }
+        let Some((elem, _)) = best else {
+            return Ok(Vec::new());
+        };
+        let Ok(lre) = lc_regex(pat, flags) else {
+            return Ok(Vec::new());
+        };
+        let version = child_text(&nodes, elem, version_child).and_then(|t| search_group1(&lre, &t));
+        let url = child_text(&nodes, elem, url_child).map(|t| t.trim().to_string());
+        let (Some(version), Some(url)) = (version, url) else {
+            return Ok(Vec::new());
+        };
+        if url.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (content2, _) = page_fetch(&url, None, None, &[], true)
+            .map_err(|msgs| msgs.into_iter().next().unwrap_or_default())?;
+        if content2.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let nodes2 = xml_dom_parse(&content2)?;
+        let Some(first) = xml_query_doc(&nodes2, path2).first().copied() else {
+            return Ok(Vec::new());
+        };
+        let text = nodes2[first].text.trim().to_string();
+        let Some(re) = &rp.re else {
+            return Ok(Vec::new());
+        };
+        let Some(groups) = search_groups(re, &text) else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![xml_render_parts(
+            parts,
+            &[Some(version)],
+            Some(&groups),
+        )])
     }
 
     fn xml_versions(rp: &RunPlan) -> Found {
@@ -24917,10 +27446,59 @@ mod livecheck {
                 Err(msg) => Found::Raised(msg),
             };
         }
+        if let XmlShape::ZipPair { a, b, parts } = &block.shape {
+            return match xml_zip_versions(a, b, parts, &content) {
+                Ok(vs) => Found::Versions(vs, Some(fin)),
+                Err(msg) => Found::Raised(msg),
+            };
+        }
+        if let XmlShape::TwoListExtreme { versions, builds } = &block.shape {
+            return match xml_two_list_extreme_versions(versions, builds, &content, rp) {
+                Ok(vs) => Found::Versions(vs, Some(fin)),
+                Err(msg) => Found::Raised(msg),
+            };
+        }
+        if let XmlShape::TextJsonKey { path, key } = &block.shape {
+            return match xml_text_json_versions(path, key, &content) {
+                Ok(vs) => Found::Versions(vs, Some(fin)),
+                Err(msg) => Found::Raised(msg),
+            };
+        }
+        if let XmlShape::ChildMatchOwnFork { path, child } = &block.shape {
+            return match xml_own_fork_versions(path, child, &content, rp) {
+                Ok(vs) => Found::Versions(vs, Some(fin)),
+                Err(msg) => Found::Raised(msg),
+            };
+        }
+        if let XmlShape::HeaderHop {
+            path,
+            header,
+            parts,
+        } = &block.shape
+        {
+            return match xml_header_hop_versions(path, header, parts, &content, rp) {
+                Ok(vs) => Found::Versions(vs, Some(fin)),
+                Err(msg) => Found::Raised(msg),
+            };
+        }
+        if let XmlShape::HopMatch { .. } = &block.shape {
+            return match xml_hop_match_versions(&block.shape, &content, rp) {
+                Ok(vs) => Found::Versions(vs, Some(fin)),
+                Err(msg) => Found::Raised(msg),
+            };
+        }
         let (path, is_regex) = match &block.shape {
             XmlShape::Texts(p) => (p, false),
             XmlShape::TextsRegex(p) => (p, true),
-            XmlShape::Template(_) => unreachable!(),
+            XmlShape::Template(_)
+            | XmlShape::ZipPair { .. }
+            | XmlShape::TwoListExtreme { .. }
+            | XmlShape::TextJsonKey { .. }
+            | XmlShape::ChildMatchOwnFork { .. }
+            | XmlShape::HeaderHop { .. }
+            | XmlShape::HopMatch { .. } => {
+                unreachable!()
+            }
         };
         let texts = match xml_element_texts(&content, path) {
             Ok(t) => t,
@@ -25388,6 +27966,61 @@ mod livecheck {
             }
             return Found::Versions(versions, Some(fin));
         }
+        if let YamlShape::MapKey { path, key, guards } = &block.shape {
+            fn dig_y<'x>(
+                node: &'x YNode,
+                path: &[super::super::formula::JsonKey],
+            ) -> Option<&'x YNode> {
+                use super::super::formula::JsonKey;
+                let mut cur = node;
+                for k in path {
+                    cur = match (k, cur) {
+                        (JsonKey::Key(name), YNode::Map(entries)) => {
+                            &entries.iter().find(|(ek, _)| ek == name)?.1
+                        }
+                        (JsonKey::Idx(i), YNode::Seq(items)) => items.get(*i)?,
+                        _ => return None,
+                    };
+                }
+                Some(cur)
+            }
+            fn to_value(node: &YNode) -> aterm_json::Value {
+                match node {
+                    YNode::Scalar(s, _) => aterm_json::Value::String(s.clone()),
+                    YNode::Null => aterm_json::Value::Null,
+                    YNode::Seq(items) => {
+                        aterm_json::Value::Array(items.iter().map(to_value).collect())
+                    }
+                    YNode::Map(entries) => {
+                        let mut m = aterm_json::Map::new();
+                        for (k, v) in entries {
+                            m.insert(k.clone(), to_value(v));
+                        }
+                        aterm_json::Value::Object(m)
+                    }
+                }
+            }
+            let mut versions: Vec<String> = Vec::new();
+            if let Some(YNode::Seq(items)) = dig_y(&root, path) {
+                for item in items {
+                    let v = to_value(item);
+                    if guards
+                        .iter()
+                        .any(|g| eval_json_cond(&g.cond, &v, rp, None) != g.unless)
+                    {
+                        continue;
+                    }
+                    if let YNode::Map(entries) = item
+                        && let Some(YNode::Scalar(s, _)) =
+                            entries.iter().find(|(ek, _)| ek == key).map(|(_, x)| x)
+                        && !versions.contains(s)
+                    {
+                        versions.push(s.clone());
+                    }
+                }
+            }
+            return Found::Versions(versions, Some(fin));
+        }
         enum YApply<'a> {
             Plain,
             Regex,
@@ -25399,7 +28032,7 @@ mod livecheck {
             YamlShape::DigRegex(p) => (p, YApply::Regex),
             YamlShape::DigSplitFirst(p, sep) => (p, YApply::SplitFirst(sep)),
             YamlShape::DigTail(p, t) => (p, YApply::Tail(t)),
-            YamlShape::FilesMap { .. } | YamlShape::RootMatch { .. } => {
+            YamlShape::FilesMap { .. } | YamlShape::RootMatch { .. } | YamlShape::MapKey { .. } => {
                 return Found::Versions(Vec::new(), Some(fin));
             }
         };
@@ -25569,6 +28202,98 @@ mod livecheck {
         }
     }
 
+    /// The end of a zip whose server appended bytes
+    /// after its end-of-central-directory record
+    /// (brew's unzip ignores them; our strict zip
+    /// reader does not). Only a non-ZIP64 record
+    /// whose declared central directory ends exactly
+    /// at the record qualifies, and a record already
+    /// ending at EOF means nothing to trim.
+    fn zip_trimmed_end(path: &std::path::Path) -> Option<u64> {
+        use std::io::{Read, Seek, SeekFrom};
+        const EOCD_LEN: u64 = 22;
+        const TAIL: u64 = 1024 * 1024 + 65_557;
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len < EOCD_LEN {
+            return None;
+        }
+        let window = len.min(TAIL);
+        let start = len - window;
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = vec![0u8; usize::try_from(window).ok()?];
+        file.read_exact(&mut tail).ok()?;
+        let u16_at = |pos: usize, off: usize| -> Option<u16> {
+            tail.get(pos + off..pos + off + 2)
+                .and_then(|s| <[u8; 2]>::try_from(s).ok())
+                .map(u16::from_le_bytes)
+        };
+        let u32_at = |pos: usize, off: usize| -> Option<u32> {
+            tail.get(pos + off..pos + off + 4)
+                .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                .map(u32::from_le_bytes)
+        };
+        let mut appended: Option<u64> = None;
+        for pos in (0..=tail.len().saturating_sub(EOCD_LEN as usize)).rev() {
+            if tail[pos..pos + 4] != *b"PK\x05\x06" {
+                continue;
+            }
+            let (disk, cd_disk, disk_entries, entries) = (
+                u16_at(pos, 4)?,
+                u16_at(pos, 6)?,
+                u16_at(pos, 8)?,
+                u16_at(pos, 10)?,
+            );
+            let (cd_size, cd_offset, comment_len) = (
+                u64::from(u32_at(pos, 12)?),
+                u64::from(u32_at(pos, 16)?),
+                u64::from(u16_at(pos, 20)?),
+            );
+            if disk != 0
+                || cd_disk != 0
+                || disk_entries != entries
+                || entries == u16::MAX
+                || cd_size == u64::from(u32::MAX)
+                || cd_offset == u64::from(u32::MAX)
+            {
+                continue;
+            }
+            let pos_abs = start + pos as u64;
+            if cd_offset.checked_add(cd_size) != Some(pos_abs) {
+                continue;
+            }
+            let end = pos_abs + EOCD_LEN + comment_len;
+            if end == len {
+                return None;
+            }
+            if end < len {
+                appended.get_or_insert(end);
+            }
+        }
+        appended
+    }
+
+    /// Drop server-appended bytes after a zip's end
+    /// record in the scratch download, if any.
+    fn zip_trim_appended_bytes(path: &std::path::Path) {
+        if let Some(end) = zip_trimmed_end(path)
+            && let Ok(file) = std::fs::OpenOptions::new().write(true).open(path)
+        {
+            let _ = file.set_len(end);
+        }
+    }
+
+    /// Zip extraction options for the read-only
+    /// scratch tree: app bundles routinely contain
+    /// relative framework symlinks, admitted only
+    /// when they resolve inside the tree.
+    fn plist_zip_options() -> crate::extract::ExtractOptions {
+        crate::extract::ExtractOptions {
+            symlinks: crate::extract::SymlinkPolicy::InRoot,
+            ..crate::extract::ExtractOptions::default()
+        }
+    }
+
     /// The `:extract_plist` strategy for zip and dmg
     /// containers: download, extract, and read the
     /// declared apps' `Info.plist` versions (XML or
@@ -25595,19 +28320,24 @@ mod livecheck {
             return Found::Versions(Vec::new(), None);
         }
         let scratch = ScratchDir(dir.clone());
-        let is_dmg = rp
-            .url
-            .split(['?', '#'])
-            .next()
-            .unwrap_or(&rp.url)
-            .to_ascii_lowercase()
-            .ends_with(".dmg");
-        let archive = dir.join(if is_dmg {
-            "download.dmg"
-        } else {
-            "download.zip"
+        let archive = dir.join("download.bin");
+        // Brew downloads with its default user-agent
+        // unless the spec overrides it (`:curl`
+        // sends none); some hosts refuse curl's.
+        let mut dl_headers = rp.headers.clone();
+        let has_ua = dl_headers.iter().any(|h| {
+            h.split(':')
+                .next()
+                .is_some_and(|n| n.trim().eq_ignore_ascii_case("user-agent"))
         });
-        if let Err(e) = fetch::curl_to_file(&rp.url, &archive, &[]) {
+        if !has_ua {
+            let ua = rp.ua.clone().unwrap_or_else(brew_user_agent);
+            if !ua.is_empty() {
+                dl_headers.push(format!("User-Agent: {ua}"));
+            }
+        }
+        let dl_hrefs: Vec<&str> = dl_headers.iter().map(String::as_str).collect();
+        if let Err(e) = fetch::curl_to_file(&rp.url, &archive, &dl_hrefs) {
             let msg = e.trim().to_string();
             return Found::Messages(vec![if msg.is_empty() {
                 "curl: download failed".to_string()
@@ -25616,17 +28346,43 @@ mod livecheck {
             }]);
         }
         let root = dir.join("extracted");
-        let extracted = if is_dmg {
-            fetch::extract_dmg(&archive, &root).is_ok()
-        } else {
+        // Container by content (brew sniffs the
+        // download): zip magic, else dmg on macOS;
+        // a xar (pkg) payload is never unpacked here.
+        let head = std::fs::File::open(&archive)
+            .and_then(|mut f| {
+                use std::io::Read;
+                let mut buf = [0u8; 4];
+                let n = f.read(&mut buf)?;
+                buf[..n].try_into().map_err(std::io::Error::other)
+            })
+            .unwrap_or([0; 4]);
+        if &head == b"xar!" {
+            return Found::Versions(Vec::new(), None);
+        }
+        let url_dmg = rp
+            .url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(&rp.url)
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .ends_with(".dmg");
+        let is_zip = head[..2] == *b"PK";
+        let extracted = if is_zip && !url_dmg {
+            zip_trim_appended_bytes(&archive);
             crate::extract::extract_zip_tree(
                 &archive,
                 &root,
                 crate::install::UNSIGNED_SIZE_CAP,
                 crate::install::MAX_ENTRIES,
-                crate::extract::ExtractOptions::default(),
+                plist_zip_options(),
             )
             .is_ok()
+        } else if cfg!(target_os = "macos") {
+            fetch::extract_dmg(&archive, &root).is_ok()
+        } else {
+            false
         };
         if !extracted {
             return Found::Versions(Vec::new(), None);
@@ -26003,6 +28759,52 @@ mod livecheck {
             if block.is_some_and(|b| b.skip_tags.iter().any(|s| s == tag)) {
                 continue;
             }
+            if let Some(parts) = block.and_then(|b| b.match_template.as_ref()) {
+                use super::super::formula::LatestPart;
+                let Some(whole) = re.whole.find(tag) else {
+                    continue;
+                };
+                let caps = extract_groups(re, whole.as_str());
+                let md = |n: usize| -> Option<&str> {
+                    if n == 0 {
+                        Some(whole.as_str())
+                    } else {
+                        caps.get(n - 1).and_then(|o| o.as_deref())
+                    }
+                };
+                if let Some((sep, lit)) = block.and_then(|b| b.skip_split_contains.as_ref())
+                    && md(1).is_some_and(|c1| c1.split(sep.as_str()).any(|p| p == lit.as_str()))
+                {
+                    continue;
+                }
+                let v = if let [LatestPart::Cap(n)] = parts.as_slice() {
+                    let Some(v) = md(*n) else { continue };
+                    v.to_string()
+                } else {
+                    let mut s = String::new();
+                    for part in parts {
+                        match part {
+                            LatestPart::Cap(n) => {
+                                if let Some(g) = md(*n) {
+                                    s.push_str(g);
+                                }
+                            }
+                            LatestPart::CapTr(n, from, to) => {
+                                if let Some(g) = md(*n) {
+                                    s.push_str(&ruby_tr(g, from, to));
+                                }
+                            }
+                            LatestPart::Lit(l) => s.push_str(l),
+                            LatestPart::Local | LatestPart::AssetsMaxUpdatedDigits => {}
+                        }
+                    }
+                    s
+                };
+                if !versions.contains(&v) {
+                    versions.push(v);
+                }
+                continue;
+            }
             if let Some(cap) = search_group1(re, tag) {
                 let v = match block {
                     Some(b) => git_op_apply(&b.op, &cap, gsub_re.as_ref()),
@@ -26155,6 +28957,14 @@ mod livecheck {
                                     *v = stripped.to_string();
                                 }
                             }
+                            LatestPreOp::SubRe(pat, flags, rep) => match lc_regex(pat, flags) {
+                                Ok(r) => {
+                                    if let Some(m) = r.whole.find(v.as_str()) {
+                                        *v = format!("{}{}{}", &v[..m.start()], rep, &v[m.end()..]);
+                                    }
+                                }
+                                Err(_) => return out,
+                            },
                         }
                     }
                 }
@@ -26165,15 +28975,40 @@ mod livecheck {
             }
             None => None,
         };
-        // The texts the match/capture reads.
-        let texts: Vec<&str> = match block.source {
-            LatestSource::AssetName => release.assets.iter().map(|a| a.name.as_str()).collect(),
-            LatestSource::AssetDownloadUrl => release
-                .assets
-                .iter()
-                .map(|a| a.browser_download_url.as_str())
-                .collect(),
-            src => field_of(src).into_iter().collect(),
+        // Asset pick (recaf): the named assets and
+        // their count gate come before any render.
+        let picked_max_updated: Option<String> = match &block.asset_pick {
+            Some((names, count)) => {
+                let picked: Vec<&str> = release
+                    .assets
+                    .iter()
+                    .filter(|a| names.iter().any(|n| n == &a.name))
+                    .map(|a| a.updated_at.as_str())
+                    .collect();
+                if picked.len() != *count {
+                    return out;
+                }
+                picked
+                    .into_iter()
+                    .max()
+                    .map(|s| s.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
+            }
+            None => None,
+        };
+        // The texts the match/capture reads (the
+        // transformed local itself for `match_pre`).
+        let texts: Vec<&str> = if block.match_pre {
+            local.as_deref().into_iter().collect()
+        } else {
+            match block.source {
+                LatestSource::AssetName => release.assets.iter().map(|a| a.name.as_str()).collect(),
+                LatestSource::AssetDownloadUrl => release
+                    .assets
+                    .iter()
+                    .map(|a| a.browser_download_url.as_str())
+                    .collect(),
+                src => field_of(src).into_iter().collect(),
+            }
         };
         let render_parts = |parts: &[LatestPart], groups: &[Option<String>]| -> Option<String> {
             let mut s = String::new();
@@ -26184,10 +29019,20 @@ mod livecheck {
                             s.push_str(g);
                         }
                     }
+                    LatestPart::CapTr(n, from, to) => {
+                        if let Some(Some(g)) = groups.get(*n) {
+                            s.push_str(&ruby_tr(g, from, to));
+                        }
+                    }
                     LatestPart::Lit(l) => s.push_str(l),
                     LatestPart::Local => {
                         if let Some(l) = &local {
                             s.push_str(l);
+                        }
+                    }
+                    LatestPart::AssetsMaxUpdatedDigits => {
+                        if let Some(d) = &picked_max_updated {
+                            s.push_str(d);
                         }
                     }
                 }
@@ -26197,6 +29042,18 @@ mod livecheck {
         let op_val = |op: &LatestOp, groups: &[Option<String>]| -> Option<String> {
             match op {
                 LatestOp::Cap(n) => groups.get(*n).cloned().flatten(),
+                LatestOp::CapTr(n, from, to) => groups
+                    .get(*n)
+                    .cloned()
+                    .flatten()
+                    .map(|g| ruby_tr(&g, from, to)),
+                LatestOp::CapMmp(n) => groups.get(*n).cloned().flatten().map(|g| {
+                    super::super::formula::cask_mmp(&g)
+                        .into_iter()
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                }),
                 LatestOp::Local => local.clone(),
             }
         };
@@ -26289,8 +29146,9 @@ mod livecheck {
         url: &str,
         re: &LcRegex,
         block: Option<&super::super::formula::GhRelBlock>,
+        own_version: &str,
     ) -> Found {
-        github_releases_versions_with(url, re, block, |slug| {
+        github_releases_versions_with(url, re, block, own_version, |slug| {
             let github = github_client()?;
             // Brew reads one default page of `/releases`.
             let opts = agh::page::ListOpts {
@@ -26307,6 +29165,7 @@ mod livecheck {
         url: &str,
         re: &LcRegex,
         block: Option<&super::super::formula::GhRelBlock>,
+        own_version: &str,
         read: impl FnOnce(&agh::Slug) -> agh::Result<Vec<agh::model::ReleaseObject>>,
     ) -> Found {
         let Some((user, repo)) = github_repo(url) else {
@@ -26336,6 +29195,9 @@ mod livecheck {
                     source: GhRelSource::TagName,
                     then: GhRelThen::Identity,
                     fallback_tag: None,
+                    blank_emit_local: false,
+                    limit: None,
+                    own_guards: Vec::new(),
                 };
                 &default_block
             }
@@ -26360,6 +29222,56 @@ mod livecheck {
             }
             _ => None,
         };
+        // Own-guard `sub` regexes, aligned with
+        // (cap, own) sides of each guard.
+        let mut guard_res: Vec<(Option<LcRegex>, Option<LcRegex>)> = Vec::new();
+        for g in &block.own_guards {
+            let mut pair = (None, None);
+            for (slot, xf) in [(&mut pair.0, &g.cap_xform), (&mut pair.1, &g.own_xform)] {
+                if let super::super::formula::GhRelXform::SubRe(pat, flags, _) = xf {
+                    match lc_regex(pat, flags) {
+                        Ok(r) => *slot = Some(r),
+                        Err(_) => return Found::Versions(Vec::new(), None),
+                    }
+                }
+            }
+            guard_res.push(pair);
+        }
+        let apply_xform = |v: Option<String>,
+                           xf: &super::super::formula::GhRelXform,
+                           sub_re: Option<&LcRegex>|
+         -> Option<String> {
+            use super::super::formula::GhRelXform;
+            match xf {
+                GhRelXform::Id => v,
+                GhRelXform::SplitFirst(sep) => v.and_then(|s| {
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s.split(sep.as_str()).next().unwrap_or_default().to_string())
+                    }
+                }),
+                GhRelXform::SubRe(_, _, rep) => v.map(|s| match sub_re {
+                    Some(r) => match r.whole.find(&s) {
+                        Some(m) => {
+                            let mut out = String::with_capacity(s.len());
+                            out.push_str(&s[..m.start()]);
+                            out.push_str(rep);
+                            out.push_str(&s[m.end()..]);
+                            out
+                        }
+                        None => s,
+                    },
+                    None => s,
+                }),
+            }
+        };
+        // Ruby `String#split` drops trailing empty
+        // fields (`"7.2,2023.3,".csv.third` is nil).
+        let mut own_csv: Vec<&str> = own_version.split(',').collect();
+        while own_csv.last().is_some_and(|p| p.is_empty()) {
+            own_csv.pop();
+        }
         let pre_lit = block.pre_capture.as_ref().and_then(|c| c.lit.as_ref());
         let pre_owned: Option<LcRegex> = match pre_lit {
             Some((pat, flags)) => match lc_regex(pat, flags) {
@@ -26399,7 +29311,7 @@ mod livecheck {
         match read(&slug) {
             Ok(releases) => {
                 let mut versions: Vec<String> = Vec::new();
-                for release in &releases {
+                for release in releases.iter().take(block.limit.unwrap_or(usize::MAX)) {
                     if (block.skip_draft && release.draft)
                         || (block.skip_prerelease && release.prerelease)
                         || (block.require_prerelease && !release.prerelease)
@@ -26441,19 +29353,28 @@ mod livecheck {
                             continue;
                         }
                     }
-                    // The release-level pre-capture local
-                    // (its blank guard skips the release).
+                    // The release-level local (its blank
+                    // guard, when declared, skips the release).
                     let local: Option<String> = match &block.pre_capture {
                         Some(pc) => {
+                            use super::super::formula::GhRelLocalOp;
                             let text = match pc.field.as_str() {
                                 "name" => release.name.as_deref(),
                                 _ => Some(release.tag_name.as_str()),
                             };
-                            let pre = pre_owned.as_ref().unwrap_or(re);
-                            match text.and_then(|t| search_group1(pre, t)) {
-                                Some(v) if !v.is_empty() => Some(v),
-                                _ => continue,
+                            let v: Option<String> = match &pc.op {
+                                GhRelLocalOp::Capture => {
+                                    let pre = pre_owned.as_ref().unwrap_or(re);
+                                    text.and_then(|t| search_group1(pre, t))
+                                }
+                                GhRelLocalOp::Field => text.map(str::to_string),
+                                GhRelLocalOp::DeletePrefix(lit) => text
+                                    .map(|t| t.strip_prefix(lit.as_str()).unwrap_or(t).to_string()),
+                            };
+                            if pc.blank_guard && v.as_deref().is_none_or(|s| s.is_empty()) {
+                                continue;
                             }
+                            v
                         }
                         None => None,
                     };
@@ -26545,6 +29466,51 @@ mod livecheck {
                                     let truthy = groups.get(*cap).is_some_and(Option::is_some);
                                     render(if truthy { then } else { els }, &groups)
                                 }),
+                            GhRelThen::CompactJoin(sep) => {
+                                search_groups(re, text).and_then(|groups| {
+                                    let joined = groups[1..]
+                                        .iter()
+                                        .flatten()
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(sep);
+                                    (!joined.is_empty()).then_some(joined)
+                                })
+                            }
+                        };
+                        // Own-version match guards and the
+                        // `next <local> if match.blank?` emit.
+                        let v = match v {
+                            Some(val) => {
+                                let pass = block.own_guards.is_empty()
+                                    || search_groups(re, text).is_some_and(|groups| {
+                                        block.own_guards.iter().zip(&guard_res).all(
+                                            |(g, (cap_re, own_re))| {
+                                                let lhs = apply_xform(
+                                                    groups.get(g.cap).cloned().flatten(),
+                                                    &g.cap_xform,
+                                                    cap_re.as_ref(),
+                                                );
+                                                let rhs = apply_xform(
+                                                    own_csv
+                                                        .get(g.own_csv)
+                                                        .map(|s| (*s).to_string()),
+                                                    &g.own_xform,
+                                                    own_re.as_ref(),
+                                                );
+                                                lhs == rhs
+                                            },
+                                        )
+                                    });
+                                pass.then_some(val)
+                            }
+                            None if block.blank_emit_local
+                                && block.source != GhRelSource::PreCaptureOnly
+                                && re.whole.find(text).is_none() =>
+                            {
+                                local.clone()
+                            }
+                            other => other,
                         };
                         if let Some(v) = v {
                             found_here += 1;
@@ -26606,8 +29572,23 @@ mod livecheck {
         headers: &[String],
     ) -> Found {
         use super::super::formula::HeaderShape;
-        let merged = page_headers(url, ua, post, headers);
+        let text = page_headers_text(url, ua, post, headers);
+        let merged = merge_response_headers(&text);
         if let Some(block) = block {
+            if let HeaderShape::AllTemplate(parts) = &block.shape {
+                let mut versions: Vec<String> = Vec::new();
+                if let Some(re) = re {
+                    for set in response_header_sets(&text) {
+                        if let Some(v) = set.get(&block.header)
+                            && let Some(groups) = search_groups(re, v)
+                        {
+                            versions.push(page_render_parts(parts, &groups));
+                            break;
+                        }
+                    }
+                }
+                return Found::Versions(versions, None);
+            }
             let value = merged.get(&block.header);
             let mut versions: Vec<String> = Vec::new();
             match (&block.shape, value) {
@@ -26617,6 +29598,20 @@ mod livecheck {
                         && let Some(groups) = search_groups(re, v)
                     {
                         versions.push(page_render_parts(parts, &groups));
+                    }
+                }
+                (HeaderShape::Fork { cond, then, els }, Some(v)) => {
+                    if let Some(re) = re
+                        && let Some(groups) = search_groups(re, v)
+                    {
+                        versions.push(page_render_parts(
+                            if page_cond_eval(cond, &groups) {
+                                then
+                            } else {
+                                els
+                            },
+                            &groups,
+                        ));
                     }
                 }
                 (HeaderShape::CsvOpt, Some(v)) => {
@@ -26675,17 +29670,20 @@ mod livecheck {
 
     /// `curl_headers` shape: HEAD first, GET retry when no
     /// wanted header arrived; failures yield no headers.
-    fn page_headers(
+    /// The chosen attempt's raw header dump (every
+    /// response in the redirect chain).
+    fn page_headers_text(
         url: &str,
         spec_ua: Option<&str>,
         post: Option<&PostData<'_>>,
         headers: &[String],
-    ) -> std::collections::BTreeMap<String, String> {
+    ) -> String {
         let ua = spec_ua.map(str::to_string).unwrap_or_else(brew_user_agent);
-        let mut last_merged = std::collections::BTreeMap::new();
+        let mut last_text = String::new();
         for extra in [&[][..], &["--request", "GET"][..]] {
             let mut args: Vec<String> = vec![
                 "--fail".into(),
+                "--globoff".into(),
                 "--location".into(),
                 "--silent".into(),
                 "--show-error".into(),
@@ -26698,6 +29696,9 @@ mod livecheck {
                 "--user-agent".into(),
                 ua.clone(),
             ];
+            if ua.is_empty() {
+                args.retain(|a| a != "--user-agent" && !a.is_empty());
+            }
             match post {
                 // A POST fetch dumps headers instead
                 // of a HEAD request.
@@ -26774,11 +29775,35 @@ mod livecheck {
             if (merged.contains_key("location") || merged.contains_key("content-disposition"))
                 && !(400..500).contains(&last_status)
             {
-                return merged;
+                return text.into_owned();
             }
-            last_merged = merged;
+            last_text = text.into_owned();
         }
-        last_merged
+        last_text
+    }
+
+    /// Per-response header sets of a header dump, in
+    /// chain order (brew's `all_headers`).
+    fn response_header_sets(text: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+        let mut sets: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with("HTTP/") {
+                sets.push(std::collections::BTreeMap::new());
+                continue;
+            }
+            let Some(set) = sets.last_mut() else {
+                continue;
+            };
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim().to_lowercase();
+            if name.is_empty() || name.contains(' ') {
+                continue;
+            }
+            set.insert(name, value.trim().to_string());
+        }
+        sets
     }
 
     fn merge_response_headers(text: &str) -> std::collections::BTreeMap<String, String> {
@@ -26811,11 +29836,12 @@ mod livecheck {
         compressed: bool,
         block: Option<&super::super::formula::SparkleBlock>,
         re: Option<&LcRegex>,
+        own: &str,
     ) -> Found {
         match page_fetch(url, ua, post, headers, compressed) {
             Ok((content, fin)) => {
                 let versions = match block {
-                    Some(block) => sparkle_block_versions(&content, block, re),
+                    Some(block) => sparkle_block_versions(&content, block, re, own),
                     None => sparkle_newest(&content).into_iter().collect(),
                 };
                 Found::Versions(versions, Some(fin))
@@ -26847,8 +29873,14 @@ mod livecheck {
         item: &SparkleItem,
         block: &super::super::formula::SparkleBlock,
         re: Option<&LcRegex>,
+        own: &str,
     ) -> Vec<String> {
         use super::super::formula::SpExpr;
+        if let Some((field, lit)) = &block.own_if
+            && sparkle_field(item, *field).as_deref() == Some(lit.as_str())
+        {
+            return vec![own.to_string()];
+        }
         for field in &block.present {
             if sparkle_field(item, *field).is_none_or(|v| v.trim().is_empty()) {
                 return Vec::new();
@@ -26882,6 +29914,14 @@ mod livecheck {
                     return Vec::new();
                 };
                 one(search_groups(re, &v).and_then(|g| g.get(*n).cloned().flatten()))
+            }
+            SpExpr::FieldIndexTr(f, n, a, b) => {
+                let (Some(re), Some(v)) = (re, sparkle_field(item, *f)) else {
+                    return Vec::new();
+                };
+                one(search_groups(re, &v)
+                    .and_then(|g| g.get(*n).cloned().flatten())
+                    .map(|v| sparkle_tr(&v, a, b)))
             }
             SpExpr::CapturesJoin(f) => {
                 let (Some(re), Some(v)) = (re, sparkle_field(item, *f)) else {
@@ -27009,6 +30049,128 @@ mod livecheck {
                     None => one(sparkle_render(item, blank, None, None, re)),
                 }
             }
+            SpExpr::CapBlankElse {
+                from,
+                cap,
+                blank,
+                parts,
+            } => {
+                let groups = match (from, re) {
+                    (Some(f), Some(re)) => {
+                        sparkle_field(item, *f).and_then(|v| search_groups(re, &v))
+                    }
+                    _ => None,
+                };
+                let cap_blank = match &groups {
+                    None => true,
+                    Some(g) => g
+                        .get(*cap)
+                        .cloned()
+                        .flatten()
+                        .is_none_or(|s| s.trim().is_empty()),
+                };
+                if cap_blank {
+                    one(sparkle_render(item, blank, groups.as_deref(), None, re))
+                } else {
+                    one(sparkle_render(item, parts, groups.as_deref(), None, re))
+                }
+            }
+            SpExpr::LitMatch {
+                field,
+                pat,
+                flags,
+                parts,
+            } => {
+                let Ok(lre) = lc_regex(pat, flags) else {
+                    return Vec::new();
+                };
+                let Some(v) = sparkle_field(item, *field) else {
+                    return Vec::new();
+                };
+                let Some(groups) = search_groups(&lre, &v) else {
+                    return Vec::new();
+                };
+                one(sparkle_render(item, parts, Some(&groups), None, Some(&lre)))
+            }
+            SpExpr::BlankOwnElse {
+                from,
+                field,
+                blank,
+                parts,
+            } => {
+                let groups = match re {
+                    Some(re) => sparkle_field(item, *from).and_then(|v| search_groups(re, &v)),
+                    None => None,
+                };
+                match groups {
+                    Some(g) => one(sparkle_render(item, parts, Some(&g), None, re)),
+                    None => {
+                        let own_first = own.split(',').next().unwrap_or(own);
+                        if sparkle_field(item, *field).as_deref() == Some(own_first) {
+                            vec![own.to_string()]
+                        } else {
+                            one(sparkle_render(item, blank, None, None, re))
+                        }
+                    }
+                }
+            }
+            SpExpr::DotlessFork { short, url, cap } => {
+                let Some(short_v) = sparkle_field(item, *short) else {
+                    return Vec::new();
+                };
+                let dotless = short_v.replace('.', "");
+                if dotless.trim().is_empty() {
+                    return Vec::new();
+                }
+                let (Some(re), Some(url_v)) = (re, sparkle_field(item, *url)) else {
+                    return Vec::new();
+                };
+                let Some(file_raw) =
+                    search_groups(re, &url_v).and_then(|g| g.get(*cap).cloned().flatten())
+                else {
+                    return Vec::new();
+                };
+                let file = file_raw.replace('.', "");
+                if file.trim().is_empty() {
+                    return Vec::new();
+                }
+                if dotless == file {
+                    vec![short_v]
+                } else if dotless.chars().count() < file.chars().count() {
+                    let extra = file.strip_prefix(dotless.as_str()).unwrap_or(&file);
+                    vec![format!("{short_v}.{extra}")]
+                } else {
+                    Vec::new()
+                }
+            }
+            SpExpr::ThrottleUniq { .. } => Vec::new(),
+            SpExpr::ScanEqElse {
+                from,
+                a,
+                b,
+                then,
+                els,
+            } => {
+                use super::super::formula::SpOp;
+                let (Some(re), Some(v)) = (re, sparkle_field(item, *from)) else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                for m in re.whole.find_iter(&v) {
+                    let groups = extract_groups(re, m.as_str());
+                    let op_val = |op: &SpOp| -> Option<String> {
+                        match op {
+                            SpOp::Cap(n) => groups.get(*n).cloned().flatten(),
+                            SpOp::Field(f) => sparkle_field(item, *f),
+                        }
+                    };
+                    let parts = if op_val(a) == op_val(b) { then } else { els };
+                    if let Some(s) = sparkle_render(item, parts, Some(&groups), None, Some(re)) {
+                        out.push(s);
+                    }
+                }
+                out
+            }
             SpExpr::Scan { from, parts } => {
                 let (Some(re), Some(v)) = (re, sparkle_field(item, *from)) else {
                     return Vec::new();
@@ -27062,6 +30224,22 @@ mod livecheck {
                     out.push_str(if v.is_empty() { fb } else { &v });
                 }
                 SpPart::Local => out.push_str(local.unwrap_or_default()),
+                SpPart::CountPad {
+                    field,
+                    needle,
+                    min,
+                    suffix,
+                } => {
+                    if let Some(v) = sparkle_field(item, *field) {
+                        // Ruby `count` is a character-set count.
+                        if v.chars().filter(|c| needle.contains(*c)).count() >= *min {
+                            out.push_str(&v);
+                        } else {
+                            out.push_str(&v);
+                            out.push_str(suffix);
+                        }
+                    }
+                }
                 SpPart::FieldSplit(f, sep, last) => {
                     if let Some(v) = sparkle_field(item, *f) {
                         let seg = if *last {
@@ -27070,6 +30248,11 @@ mod livecheck {
                             v.split(sep.as_str()).next()
                         };
                         out.push_str(seg.unwrap_or_default());
+                    }
+                }
+                SpPart::FieldSub(f, a, b) => {
+                    if let Some(v) = sparkle_field(item, *f) {
+                        out.push_str(&v.replacen(a.as_str(), b, 1));
                     }
                 }
                 SpPart::FieldIndex(f, n) => {
@@ -27093,6 +30276,7 @@ mod livecheck {
         content: &str,
         block: &super::super::formula::SparkleBlock,
         re: Option<&LcRegex>,
+        own: &str,
     ) -> Vec<String> {
         use super::super::formula::SpChannel;
         let items = sparkle_sorted_items(content);
@@ -27113,17 +30297,43 @@ mod livecheck {
                         _ => false,
                     }))
         };
+        if let super::super::formula::SpExpr::ThrottleUniq { field, bucket } = &block.expr {
+            let mut versions: Vec<String> = items
+                .iter()
+                .filter(|it| gated(it))
+                .filter_map(|it| sparkle_field(it, *field))
+                .collect();
+            versions.sort_by(|a, b| version_cmp(a, b));
+            versions.dedup();
+            let mut out: Vec<String> = Vec::new();
+            let mut throttled: Option<i64> = None;
+            for v in versions {
+                let patch_s = v.split('.').nth(2).unwrap_or("0");
+                let patch: i64 = {
+                    let digits: String =
+                        patch_s.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    digits.parse().unwrap_or(0)
+                };
+                let cur = patch - patch.rem_euclid(*bucket);
+                if throttled == Some(cur) {
+                    continue;
+                }
+                throttled = Some(cur);
+                out.push(v);
+            }
+            return out;
+        }
         let mut out: Vec<String> = Vec::new();
         if block.all {
             for item in items.iter().filter(|it| gated(it)) {
-                for v in sparkle_eval(item, block, re) {
+                for v in sparkle_eval(item, block, re, own) {
                     if !out.contains(&v) {
                         out.push(v);
                     }
                 }
             }
         } else if let Some(item) = items.iter().rev().find(|it| gated(it)) {
-            for v in sparkle_eval(item, block, re) {
+            for v in sparkle_eval(item, block, re, own) {
                 if !out.contains(&v) {
                     out.push(v);
                 }

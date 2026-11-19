@@ -68,10 +68,24 @@ mod gl_shaders;
 mod gl_source;
 #[cfg(target_os = "macos")]
 mod metal;
-/// The quiet-commit probe's entry point and types (`benches/quiet_commit.rs`).
+/// The quiet-commit probe's entry points and types (`benches/quiet_commit.rs`).
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
-pub use metal::quiet_probe::{QuietCommit, QuietTake, quiet_commit_probe};
+pub use metal::quiet_probe::{
+    QuietArm, QuietCommit, QuietHost, QuietKeep, QuietMark, QuietSetup, QuietTake, SETTLE,
+    quiet_commit_probe, quiet_keeper,
+};
+/// The quiet-commit grid's plan, records and validity controls: the bench's own file, mounted
+/// here only for its unit tests, so no build without tests compiles it into this library.
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../benches/quiet/plan.rs"]
+mod quiet_plan;
+/// Its unit tests, mounted here and not from the file itself: cargo builds a harness-less bench
+/// with `--cfg test`, so a test module the file mounted would build into the bench, its test
+/// functions dropped.
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../benches/quiet/plan_tests.rs"]
+mod quiet_plan_tests;
 /// Launch Metal warm types (`metal/warm.rs`).
 #[cfg(target_os = "macos")]
 pub use metal::warm::{FirstFrameKnobs, FirstFrameWarm};

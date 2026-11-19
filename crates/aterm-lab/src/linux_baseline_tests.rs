@@ -265,6 +265,94 @@ fn the_slowest_present_is_named_by_the_item_it_ended_in() {
 }
 
 #[test]
+fn a_docked_terminal_span_and_paste_target_are_window_pixels() {
+    let dims = "OK 24 80 scale=1.00 surface_w=1014 surface_h=528 frame_w=744 frame_h=528 offset_x=270 offset_y=0 cell_w=9 cell_h=20 pad=12 pad_bottom=12 grid_w=720 grid_h=480";
+    let geometry = NativeGeometry::parse(dims).unwrap();
+    assert_eq!(
+        geometry.row_span(dims, 1, 7).unwrap(),
+        ((284, 66), (343, 66))
+    );
+    assert_eq!(geometry.grid_midpoint(dims).unwrap(), (642, 276));
+    assert_eq!(geometry.frame_point(1, 0).unwrap(), (271, 0));
+    assert_eq!(geometry.right_midpoint(-2).unwrap(), (1012, 264));
+    assert_eq!(geometry.right_midpoint(0).unwrap(), (1014, 264));
+    assert_eq!(geometry.right_midpoint(6).unwrap(), (1020, 264));
+    assert_ne!(
+        geometry.grid_midpoint(dims).unwrap().0,
+        200,
+        "the old paste point lies on the dock"
+    );
+
+    let scaled = "OK 24 80 scale=1.50 surface_w=1577 surface_h=820 frame_w=1156 frame_h=792 offset_x=420 offset_y=9 cell_w=14 cell_h=30 pad=18 pad_bottom=18 grid_w=1120 grid_h=720";
+    let geometry = NativeGeometry::parse(scaled).unwrap();
+    assert_eq!(
+        geometry.row_span(scaled, 1, 7).unwrap(),
+        ((440, 108), (534, 108))
+    );
+    assert_eq!(geometry.grid_midpoint(scaled).unwrap(), (998, 423));
+    assert_eq!(geometry.right_midpoint(-2).unwrap(), (1575, 410));
+    assert_eq!(
+        geometry.scale, 1.5,
+        "pixels are already physical; the seat alone scales their delta"
+    );
+}
+
+#[test]
+fn native_geometry_refuses_unread_or_ambiguous_sizes_and_cropped_targets() {
+    let dims = "OK 24 80 scale=1 surface_w=744 surface_h=528 frame_w=744 frame_h=528 offset_x=0 offset_y=0 cell_w=9 cell_h=20 pad=12 pad_bottom=12 grid_w=720 grid_h=480";
+    for broken in [
+        dims.replacen("OK", "ERR", 1),
+        dims.replace("surface_w=744", ""),
+        dims.replace("surface_w=744", "surface_w=0"),
+        dims.replace("frame_h=528", "frame_h=-1"),
+        dims.replace("offset_x=0", "offset_x=wrong"),
+        dims.replace("scale=1", "scale=NaN"),
+        dims.replace("scale=1", "scale=0"),
+        format!("{dims} surface_w=744"),
+        format!("{dims} scale=1"),
+    ] {
+        assert!(NativeGeometry::parse(&broken).is_err(), "{broken}");
+    }
+    let geometry = NativeGeometry::parse(dims).unwrap();
+    assert_eq!(geometry.row_span(dims, 1, 7).unwrap(), ((14, 66), (73, 66)));
+    assert_eq!(geometry.grid_midpoint(dims).unwrap(), (372, 276));
+    assert!(geometry.row_span(dims, 24, 7).is_err());
+    assert!(geometry.row_span(dims, 1, 81).is_err());
+    assert!(geometry.row_span(dims, 1, 0).is_err());
+    assert!(
+        geometry
+            .row_span(&dims.replace("cell_h=20", "cell_h=0"), 1, 7)
+            .is_err()
+    );
+    assert!(
+        geometry
+            .row_span(&dims.replace("grid_h=480", "grid_h=600"), 1, 7)
+            .is_err()
+    );
+    assert!(
+        geometry
+            .grid_midpoint(&dims.replace("grid_w=720", "grid_w=-1"))
+            .is_err()
+    );
+    assert!(geometry.right_midpoint(i32::MAX).is_err());
+
+    let cropped = dims
+        .replace("offset_x=0", "offset_x=-4")
+        .replace("offset_y=0", "offset_y=-2");
+    let geometry = NativeGeometry::parse(&cropped).unwrap();
+    assert!(
+        geometry.frame_point(1, 2).is_err(),
+        "an off-window point cannot silently clamp"
+    );
+    assert!(geometry.frame_point(4, 1).is_err());
+    assert_eq!(geometry.frame_point(4, 2).unwrap(), (0, 0));
+    assert!(
+        geometry.frame_point(744, 2).is_err(),
+        "the frame's exclusive boundary"
+    );
+}
+
+#[test]
 fn the_replies_are_kept_without_what_moves_with_time_or_edits() {
     let dims = "OK 24 80 1120 720 session=0 cell_w=14 cell_h=30 font_px=23.00 scale=1.50 window=0 window_rows=24 window_cols=80 composed_rows=24 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1157 surface_h=792 offset_x=18 offset_y=54 band_left=0 band_right=0 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=2 pad_bottom=18 head=34 tab_rows=1 viewers=1 visible_viewers=1 geometry=settled present_retry_state=idle";
     assert_eq!(

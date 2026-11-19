@@ -107,6 +107,37 @@ fn a_headless_launch_of_the_installed_app_takes_no_part() {
     assert!(takes_part(false, false));
 }
 
+/// NEGATIVE CONTROL (run by hand, restored): with `asks_restart` comparing by `!=` instead of
+/// `>`, the older window's ask below fails.
+#[test]
+fn only_a_newer_window_of_the_keepers_own_place_asks_it_to_restart() {
+    assert!(asks_restart("0.203.0", "0.198.0", true), "newer");
+    assert!(
+        asks_restart("1.20261117.1", "0.203.0", true),
+        "a calendar version is newer than every legacy one"
+    );
+    assert!(asks_restart("1.20261117.2", "1.20261117.1", true));
+    assert!(
+        !asks_restart("0.198.0", "0.203.0", true),
+        "an older window would restart the keeper into the build it is replaced by"
+    );
+    assert!(!asks_restart("0.203.0", "0.203.0", true), "the same build");
+    for unparsable in ["test", "", "0.203.0+gabc1234", "0.203.1", "v0.203.0"] {
+        assert!(
+            !asks_restart(unparsable, "0.198.0", true),
+            "own version {unparsable:?}"
+        );
+        assert!(
+            !asks_restart("0.203.0", unparsable, true),
+            "keeper version {unparsable:?}"
+        );
+    }
+    assert!(
+        !asks_restart("0.203.0", "0.198.0", false),
+        "a window off the job's place: launchd would restart the keeper from another file"
+    );
+}
+
 #[test]
 fn with_the_keeper_off_nothing_registers() {
     let recovery = boot(Some(false), false, false, None);
@@ -1186,6 +1217,7 @@ fn a_meta_is_sent_once_a_link_takes_it_and_again_only_when_it_moves() {
             },
         )]),
         pump: false,
+        healthy: false,
     });
     let last = || state.lock().expect("state").tracked[&7].last.clone();
     let build = |meta, fabric: &crate::fabric::KeeperCarry| {
@@ -1825,6 +1857,7 @@ fn seen(ops: Vec<LinkOp>) -> Vec<(&'static str, u64, u64)> {
             LinkOp::Meta { rdev, .. } => Some(("META", rdev, 0)),
             LinkOp::Pending { pid } => Some(("PENDING", u64::from(pid), 0)),
             LinkOp::Bye { .. } => Some(("BYE", 0, 0)),
+            LinkOp::AskRestart => Some(("ASK_RESTART", 0, 0)),
         })
         .collect()
 }
@@ -2206,6 +2239,61 @@ fn a_pending_waits_for_older_lifecycle_ops_and_a_bye_ends_them() {
     );
 }
 
+/// The window asks its keeper to restart only once it booted healthy ([`boot_healthy`]): its
+/// live link is told [`LinkOp::AskRestart`] then, once, and a candidate's link, started at its
+/// Commit, is told at once, behind the registrations it buffered. The asks themselves, on the
+/// connection the link has and on each it makes later, are `aterm-keeper`'s
+/// `a_window_link_asks_each_keeper_it_reaches_to_restart_once_it_booted_healthy`.
+///
+/// NEGATIVE CONTROL (run by hand, restored): with `go_live_in` telling the link whatever
+/// `healthy` says, a candidate that never booted healthy asks at its Commit, and the last
+/// assertion fails.
+#[cfg(unix)]
+#[test]
+fn a_window_asks_its_keeper_to_restart_only_once_it_booted_healthy() {
+    let link = TestLink::stalled(7, 70);
+    link.release(7);
+    assert_eq!(
+        seen(link.drain()),
+        [("RELEASE", 70, 0)],
+        "nothing asks before the checkpoint"
+    );
+    link.boot_healthy();
+    assert_eq!(seen(link.drain()), [("ASK_RESTART", 0, 0)]);
+    link.boot_healthy();
+    assert!(seen(link.drain()).is_empty(), "told once");
+
+    let mut armed = State {
+        phase: Phase::Armed,
+        buffered: Vec::new(),
+        owed: VecDeque::new(),
+        tracked: BTreeMap::new(),
+        pump: false,
+        healthy: false,
+    };
+    boot_healthy_in(&mut armed);
+    assert!(armed.healthy && armed.buffered.is_empty());
+    armed.buffered.push((7, LinkOp::Release { rdev: 70 }));
+    let (live, far) = KeeperLink::stalled();
+    go_live_in(&mut armed, live);
+    assert_eq!(
+        seen(far.drain()),
+        [("RELEASE", 70, 0), ("ASK_RESTART", 0, 0)],
+        "a candidate's link is told at its Commit"
+    );
+    let (live, far) = KeeperLink::stalled();
+    let mut unhealthy = State {
+        phase: Phase::Armed,
+        buffered: Vec::new(),
+        owed: VecDeque::new(),
+        tracked: BTreeMap::new(),
+        pump: false,
+        healthy: false,
+    };
+    go_live_in(&mut unhealthy, live);
+    assert!(seen(far.drain()).is_empty(), "nor before the checkpoint");
+}
+
 /// A quit's BYE names the master of each session it carries ([`bye`]), which the keeper keeps
 /// past it (`aterm_keeper::core::KeeperCore::bye_keeping`).
 ///
@@ -2462,6 +2550,7 @@ fn quits_releases_are_written_before_its_bye_and_the_keeper_closes_on_them() {
         owed: VecDeque::new(),
         tracked: BTreeMap::new(),
         pump: false,
+        healthy: false,
     });
     let mut rdevs = Vec::new();
     for (id, (sh, birth)) in (10..).zip(&shells) {
@@ -2596,6 +2685,7 @@ fn a_quit_carries_a_session_only_once_the_keeper_holds_its_master() {
         owed: VecDeque::new(),
         tracked: BTreeMap::new(),
         pump: false,
+        healthy: false,
     };
     let Phase::Live(link) = &state.phase else {
         unreachable!("the test's link is live")
@@ -2678,6 +2768,7 @@ fn an_adoption_never_placed_lifts_the_fence_once_the_keeper_reads_its_release() 
         owed: VecDeque::new(),
         tracked: BTreeMap::new(),
         pump: false,
+        healthy: false,
     }));
     // The claim's own drop, over this test's link in place of the process's.
     claims_release_to(Some(Arc::clone(&state)));
@@ -2729,6 +2820,7 @@ fn a_session_with_no_journal_lifts_the_fence_once_the_keeper_drops_the_old_one()
         owed: VecDeque::new(),
         tracked: BTreeMap::new(),
         pump: false,
+        healthy: false,
     };
     // What `register` sends for the placed session ([`register_unix`]), its journal off.
     register_in(
@@ -2810,6 +2902,7 @@ fn a_session_gone_before_the_keeper_read_its_journal_frame_still_lifts_the_fence
             owed: VecDeque::new(),
             tracked: BTreeMap::new(),
             pump: false,
+            healthy: false,
         };
         let (_region, custody) = journal_region();
         // What `register_unix` sends: the journal's first region with the receipt it binds to

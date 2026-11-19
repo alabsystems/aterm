@@ -1594,3 +1594,40 @@ fn a_death_between_the_phase_one_pair_renames_recovers_forward() {
     assert!(!std::path::Path::new(&transaction).exists());
     drop(lock);
 }
+
+/// THE X86 SLICE ROW NAMES EACH OF ITS GAPS WITH ITS OWN FIX: the stock target and Rosetta are
+/// both asked, so a missing toolchain no longer hides a Rosetta that does not run; the
+/// toolchain's gap alone carries the rustup row's fix, Rosetta's alone its own, and both together
+/// name both, the toolchain's first. NEGATIVE CONTROL: a verdict that names the target alone when
+/// both fail (as `x86_slice_check` did) loses Rosetta's fix and the both-fail assertion fails.
+#[cfg(unix)]
+#[test]
+fn the_x86_slice_names_each_gap_with_its_own_fix() {
+    let missing = || Err(Error::new("x86_64-apple-darwin target missing"));
+    let refused = || Err("Rosetta refused".to_string());
+    assert!(matches!(
+        x86_slice_verdict("1.99.1", Ok(()), Ok(())),
+        Check::Pass(_)
+    ));
+    let toolchain = x86_slice_verdict("1.99.1", missing(), Ok(()));
+    assert!(
+        matches!(&toolchain, Check::Fail { fix, .. } if fix == gates::X86_SLICE_REMEDIES),
+        "{toolchain:?}"
+    );
+    let rosetta = x86_slice_verdict("1.99.1", Ok(()), refused());
+    assert!(
+        matches!(&rosetta, Check::Fail { fix, .. } if fix.contains("--install-rosetta")),
+        "{rosetta:?}"
+    );
+    let both = x86_slice_verdict("1.99.1", missing(), refused());
+    match &both {
+        Check::Fail { what, fix } => assert!(
+            what.contains("target missing")
+                && what.contains("Rosetta does not run")
+                && fix.starts_with(gates::X86_SLICE_REMEDIES)
+                && fix.contains("--install-rosetta"),
+            "{what} / {fix}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}

@@ -515,7 +515,7 @@ fn vault_fill_status_reads_the_log_this_mac_holds() {
     assert_eq!(number(&json["bytes"]), Some(log.held_bytes()));
     assert_eq!(
         number(&json["bound"]),
-        Some(crate::membership_log::MAX_RECORDS_STREAM)
+        Some(crate::membership_log::Reading::ONE.capacity())
     );
     assert_eq!(
         json["classes"].as_object().map(aterm_json::Map::len),

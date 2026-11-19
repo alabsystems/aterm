@@ -266,7 +266,7 @@ fn land_rounds_heard(
                 heard(line);
                 said.borrow_mut().push(line.to_owned());
             },
-            remote: &remote_step,
+            remote: &live_remote,
             pause: &no_retry,
         },
     );

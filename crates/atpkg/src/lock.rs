@@ -623,7 +623,9 @@ fn open_store_lock(path: &Path) -> Result<StoreLock, StoreLockError> {
 /// The lock file at `path`, created `0600` if it is missing and never truncated (a lock
 /// file is a rendezvous, not data: the FileLock discipline), opened IN the directory
 /// that is at `path`'s parent now: that directory is opened without following a link,
-/// then the file by name inside it (`openat`).
+/// then the file by name inside it (`openat`). A missing file is created exclusively
+/// (`O_EXCL`) and, where another opener created it first, opened as it is: macOS 27.0.1
+/// answers `ENOENT` to one of two `O_CREAT` opens racing for a name neither finds.
 #[cfg(unix)]
 fn open_lock_file(path: &Path) -> io::Result<File> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -644,18 +646,14 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
             dir
         })?;
     let name = std::ffi::CString::new(name.as_bytes())?;
-    let file = aterm_uds::kept_out(|| {
+    let open = |create: libc::c_int| {
         // SAFETY: `dir` is open for the call and `name` is NUL-terminated; the mode
         // is the variadic argument `O_CREAT` reads.
         let fd = unsafe {
             libc::openat(
                 dir.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW
-                    | libc::O_NONBLOCK,
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | create,
                 libc::c_uint::from(0o600_u16),
             )
         };
@@ -664,6 +662,15 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         }
         // SAFETY: `openat` just returned `fd`, which nothing else owns.
         Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    };
+    let file = aterm_uds::kept_out(|| match open(0) {
+        Err(missing) if missing.kind() == io::ErrorKind::NotFound => {
+            match open(libc::O_CREAT | libc::O_EXCL) {
+                Err(taken) if taken.kind() == io::ErrorKind::AlreadyExists => open(0),
+                made => made,
+            }
+        }
+        opened => opened,
     })?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(

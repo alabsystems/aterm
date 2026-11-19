@@ -28,6 +28,9 @@ pub mod fleet;
 #[cfg(unix)]
 pub mod fleet_member;
 
+/// The `built` op's wire: a shared dependency unit asked for by key and sent file by file.
+pub mod built;
+
 /// Physical-link locality for applications that require LAN-only transport.
 #[cfg(unix)]
 pub mod lan;

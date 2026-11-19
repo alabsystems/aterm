@@ -867,6 +867,7 @@ fn the_journal_is_off_not_read_silent_or_held() {
                     WindowSeen {
                         window: "7d".into(),
                         sub: None,
+                        model: None,
                         figure: Some(alab_seen::Figure::Used {
                             pct_x10: 160,
                             reset: Some(reset),
@@ -879,6 +880,7 @@ fn the_journal_is_off_not_read_silent_or_held() {
                     WindowSeen {
                         window: "5h".into(),
                         sub: None,
+                        model: None,
                         figure: Some(alab_seen::Figure::Used {
                             pct_x10: 30,
                             reset: Some(NOW + H),
@@ -891,6 +893,7 @@ fn the_journal_is_off_not_read_silent_or_held() {
                     WindowSeen {
                         window: "7d".into(),
                         sub: Some("sa-00000000000000ff".into()),
+                        model: None,
                         figure: Some(alab_seen::Figure::Used {
                             pct_x10: 990,
                             reset: Some(reset),

@@ -699,6 +699,9 @@ pub(crate) fn accounts_until(
             crate::catalog::State::Conflict => {
                 Some("Account catalog declarations conflict; automatic access is withheld")
             }
+            crate::catalog::State::Kept => {
+                Some("Account catalog generation is sealed; its records are kept, unwritten")
+            }
             crate::catalog::State::Excluded => {
                 Some("Account catalog is excluded by local sharing policy")
             }

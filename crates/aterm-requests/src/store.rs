@@ -20,6 +20,7 @@ use crate::record::{
     Unclean, Verb, Via, WhySrc, is_node_word, is_token,
 };
 use crate::why::Why;
+use aterm_types::control_request::Sid;
 use aterm_types::control_verbs::{REQUEST_WHY_BYTES, REQUESTER_ACCOUNT_BYTES};
 use aterm_uds::line_log::{self, Held, Identity};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1699,8 +1700,9 @@ impl Store {
         }
     }
 
-    /// Record tab `tab`, which `by`'s spawn made, as request `id`'s (`joined` where the spawn
-    /// named it with `req=`, [`Self::join`]): the first moves it to running. `root` is the folder
+    /// Record local tab `tab`, including an exact legacy ID, as request `id`'s after `by`'s
+    /// spawn made it. The first tab moves the request to running. `joined` says the spawn named
+    /// it with `req=` ([`Self::join`]). `root` is the folder
     /// the spawn opened in, as the host judged it ([`crate::claim::normal`] form): in the same append, a `root`
     /// where the request has not recorded it and holds fewer than [`MAX_ROOTS`].
     ///
@@ -1726,7 +1728,7 @@ impl Store {
             .requests
             .get(id)
             .is_some_and(|request| request.end.is_none());
-        if !live || !aterm_types::control_verbs::is_minted_sid(tab) {
+        if !live || Sid::parse(tab).is_none() {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         let rec = |body| Rec {
@@ -1814,7 +1816,7 @@ impl Store {
         }
         let tab = ask
             .tab
-            .filter(|tab| aterm_types::control_verbs::is_minted_sid(tab))
+            .filter(|tab| Sid::parse(tab).is_some())
             .map(str::to_owned);
         let alone = ask.born_ms.and_then(|born| {
             let (mut mine, mut others) = (Vec::new(), Vec::new());
@@ -1901,10 +1903,7 @@ impl Store {
                     path: born.path.clone(),
                     src: born.src,
                     by: request.open.by.clone(),
-                    tab: born
-                        .tab
-                        .clone()
-                        .filter(|tab| aterm_types::control_verbs::is_minted_sid(tab)),
+                    tab: born.tab.clone().filter(|tab| Sid::parse(tab).is_some()),
                     born_ms: Some(born.born_ms),
                     alone: born.alone,
                 }),
@@ -1937,7 +1936,7 @@ impl Store {
             };
             if request.claim(&hit.path).is_none()
                 || request.touched.contains(&hit.path)
-                || !aterm_types::control_verbs::is_minted_sid(&hit.tab)
+                || Sid::parse(&hit.tab).is_none()
                 || !seen.insert((hit.id.as_str(), hit.path.as_str()))
             {
                 continue;

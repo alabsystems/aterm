@@ -3,7 +3,6 @@
 
 //! Tests for [`super`] and its conformance bind to `harness_capture_worker_lifecycle_model`.
 
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -352,6 +351,317 @@ fn a_write_to_a_stdin_nobody_reads_ends_at_its_cancellation() {
     assert_eq!(ended, Ok(Ended::Stopped));
 }
 
+/// The role a run of this binary plays in a Windows owned-capture test, and the scratch folder
+/// it works in.
+#[cfg(windows)]
+const JOB_ROLE: &str = "ATERM_TEST_ALIGN_JOB_ROLE";
+#[cfg(windows)]
+const JOB_DIR: &str = "ATERM_TEST_ALIGN_JOB_DIR";
+
+/// This binary run as one test, `name`, playing `role` in `dir`.
+#[cfg(windows)]
+fn rerun(name: &str, role: &str, dir: &Path) -> Command {
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("this test binary"));
+    cmd.args([
+        "--exact",
+        &format!("harness::align::tests::{name}"),
+        "--quiet",
+        "--test-threads=1",
+        "--nocapture",
+    ])
+    .env(JOB_ROLE, role)
+    .env(JOB_DIR, dir);
+    cmd
+}
+
+/// A stand-in's part: hold `dir/<held>` open so nothing else can open it (no sharing), say so
+/// in `dir/<held>.ready`, and park; only this process's end lets the file go.
+#[cfg(windows)]
+fn hold_and_park(dir: &Path, held: &str) -> ! {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(dir.join(held))
+        .expect("the stand-in holds its file");
+    std::fs::write(dir.join(format!("{held}.ready")), b"").expect("the stand-in says so");
+    std::thread::sleep(Duration::from_secs(aterm_spec::wait::PARKED_SECS));
+    std::process::exit(0);
+}
+
+/// Whether nothing holds `dir/<held>` any more: it can be removed.
+#[cfg(windows)]
+fn released(dir: &Path, held: &str) -> bool {
+    std::fs::remove_file(dir.join(held)).is_ok()
+}
+
+/// AN OWNED CAPTURE'S CHILD ENDS WITH THE PROCESS THAT HOLDS IT, AND SO DOES WHAT THE CHILD
+/// STARTED (Windows): a capturer process runs an owned capture of a holder, which starts a leaf
+/// of its own, and each of the two holds a file nothing else may open. Killed by its own
+/// handle, the capturer leaves nothing running: its end closes the kill-on-close job its child
+/// was born in, and both files come free. CONTROL: while the capturer lives, neither file can
+/// be removed. NEGATIVE CONTROL (run as a temporary mutant, reverted): an owned child spawned
+/// outside a job keeps both files held past the capturer's end.
+#[cfg(windows)]
+#[test]
+fn an_owned_captures_child_ends_with_the_process_that_holds_it() {
+    const NAME: &str = "an_owned_captures_child_ends_with_the_process_that_holds_it";
+    if let (Some(role), Some(dir)) = (std::env::var_os(JOB_ROLE), std::env::var_os(JOB_DIR)) {
+        let dir = PathBuf::from(dir);
+        match role.to_str() {
+            Some("capturer") => {
+                let _ = capture_bounded_owned(
+                    rerun(NAME, "holder", &dir),
+                    Duration::from_secs(aterm_spec::wait::PARKED_SECS),
+                    1024,
+                );
+                std::process::exit(0);
+            }
+            Some("holder") => {
+                let mut leaf = rerun(NAME, "leaf", &dir);
+                leaf.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                // Left running: only its job ends it.
+                std::mem::forget(leaf.spawn().expect("the holder starts its leaf"));
+                hold_and_park(&dir, "holder");
+            }
+            Some("leaf") => hold_and_park(&dir, "leaf"),
+            other => panic!("no such role: {other:?}"),
+        }
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let mut capturer = rerun(NAME, "capturer", &dir);
+    capturer
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut capturer = capturer.spawn().expect("the capturer starts");
+    aterm_spec::wait::until_while_descendants_work(
+        "the holder and its leaf hold their files",
+        || (dir.join("holder.ready").exists() && dir.join("leaf.ready").exists()).then_some(()),
+    );
+    assert!(
+        !released(&dir, "holder") && !released(&dir, "leaf"),
+        "CONTROL: while the capturer lives, both files are held"
+    );
+    capturer
+        .kill()
+        .expect("the capturer is ended by its own handle");
+    capturer.wait().expect("the capturer is reaped");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the capturer's end ends its capture's child and what that child started",
+        || (released(&dir, "holder") && released(&dir, "leaf")).then_some(()),
+    );
+}
+
+/// AN OWNED CAPTURE ANSWERS ITS CHILD'S OWN EXIT EVEN WHILE SOMETHING THE CHILD LEFT HOLDS ITS
+/// OUTPUT (Windows): a child prints, starts a leaf that inherits its stdout and holds a file,
+/// and exits 0. The capture, given an hour, answers that exit with what the child printed once
+/// the leaf has had its grace to leave, and ends the leaf, whose file comes free. NEGATIVE
+/// CONTROL (run as a temporary mutant, reverted): without the look at the child's own exit, the
+/// leaf's hold on the output keeps the capture waiting past the hang detector.
+#[cfg(windows)]
+#[test]
+fn an_owned_capture_answers_its_childs_exit_and_ends_what_it_left() {
+    const NAME: &str = "an_owned_capture_answers_its_childs_exit_and_ends_what_it_left";
+    if let (Some(role), Some(dir)) = (std::env::var_os(JOB_ROLE), std::env::var_os(JOB_DIR)) {
+        let dir = PathBuf::from(dir);
+        match role.to_str() {
+            Some("child") => {
+                let mut leaf = rerun(NAME, "leaf", &dir);
+                // The leaf inherits this process's stdout, the capture's pipe.
+                leaf.stdin(Stdio::null()).stderr(Stdio::null());
+                std::mem::forget(leaf.spawn().expect("the child starts its leaf"));
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the leaf holds its file",
+                    || dir.join("leaf.ready").exists().then_some(()),
+                );
+                print!("printed by the child");
+                std::io::Write::flush(&mut std::io::stdout()).expect("the child's words are out");
+                std::process::exit(0);
+            }
+            Some("leaf") => hold_and_park(&dir, "leaf"),
+            other => panic!("no such role: {other:?}"),
+        }
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let cmd = rerun(NAME, "child", &dir);
+    let (done, answer) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = done.send(capture_bounded_owned(
+            cmd,
+            Duration::from_secs(3600),
+            1 << 16,
+        ));
+    });
+    let got = answer
+        .recv_timeout(HANG_DETECTOR)
+        .expect("the capture answers its child's exit, not its leaf's");
+    worker.join().unwrap();
+    let got = got.expect("the child ran");
+    assert_eq!(got.code, Some(0));
+    assert!(
+        String::from_utf8_lossy(&got.stdout).contains("printed by the child"),
+        "{:?}",
+        String::from_utf8_lossy(&got.stdout)
+    );
+    assert!(
+        released(&dir, "leaf"),
+        "the leaf the child left was ended with its job"
+    );
+}
+
+/// A WATCHED OWNED CAPTURE ASKS ITS WATCH WHILE WHAT ITS CHILD LEFT HAS ITS GRACE, AND A STOP
+/// ENDS THAT GRACE (Windows): a child starts a leaf that inherits its stdout and holds a file,
+/// prints and exits 0; the watch, asked twice after that exit (a cancelled scope, say), asks for
+/// a stop. The capture, given an hour, answers the exit with what the child printed, and the leaf
+/// is ended with its job, whose file comes free. NEGATIVE CONTROL (run as a temporary mutant,
+/// reverted): with no look at the watch during the grace, the watch is asked once at most after
+/// the exit, and the leaf keeps the capture for the whole grace.
+#[cfg(windows)]
+#[test]
+fn a_watched_owned_capture_asks_its_watch_during_its_childs_grace() {
+    const NAME: &str = "a_watched_owned_capture_asks_its_watch_during_its_childs_grace";
+    if let (Some(role), Some(dir)) = (std::env::var_os(JOB_ROLE), std::env::var_os(JOB_DIR)) {
+        let dir = PathBuf::from(dir);
+        match role.to_str() {
+            Some("child") => {
+                let mut leaf = rerun(NAME, "leaf", &dir);
+                // The leaf inherits this process's stdout, the capture's pipe.
+                leaf.stdin(Stdio::null()).stderr(Stdio::null());
+                std::mem::forget(leaf.spawn().expect("the child starts its leaf"));
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the leaf holds its file",
+                    || dir.join("leaf.ready").exists().then_some(()),
+                );
+                std::fs::write(dir.join("child.pid"), std::process::id().to_string())
+                    .expect("the child names itself");
+                print!("printed by the child");
+                std::io::Write::flush(&mut std::io::stdout()).expect("the child's words are out");
+                std::process::exit(0);
+            }
+            Some("leaf") => hold_and_park(&dir, "leaf"),
+            other => panic!("no such role: {other:?}"),
+        }
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let cmd = rerun(NAME, "child", &dir);
+    let watched = dir.clone();
+    let (done, answer) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        // The capture holds the child's handle until it answers, so its id names no other
+        // process meanwhile.
+        let mut after_exit = 0usize;
+        let ended = capture_bounded_owned_watching(cmd, Duration::from_secs(3600), 1 << 16, |_| {
+            let exited = std::fs::read_to_string(watched.join("child.pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                .is_some_and(|pid| !aterm_uds::process::pid_alive(pid));
+            after_exit += usize::from(exited);
+            after_exit >= 2
+        });
+        let _ = done.send((ended, after_exit));
+    });
+    let (ended, after_exit) = answer
+        .recv_timeout(HANG_DETECTOR)
+        .expect("the capture answers its child's exit");
+    worker.join().unwrap();
+    assert!(
+        after_exit >= 2,
+        "the watch is asked during the grace: {after_exit}"
+    );
+    let Ok(Ended::Exited(got)) = ended else {
+        panic!("the exit is the answer: {ended:?}");
+    };
+    assert_eq!(got.code, Some(0));
+    assert!(
+        String::from_utf8_lossy(&got.stdout).contains("printed by the child"),
+        "{:?}",
+        String::from_utf8_lossy(&got.stdout)
+    );
+    assert!(
+        released(&dir, "leaf"),
+        "the leaf the child left was ended with its job"
+    );
+}
+
+/// AN OWNED CAPTURE'S GRACE AFTER ITS CHILD'S EXIT NEVER RUNS PAST ITS DEADLINE (Windows): what
+/// is left of the deadline bounds the grace where it is less than `LEFT_GRACE`. NEGATIVE CONTROL
+/// (run as a temporary mutant, reverted): a grace of `LEFT_GRACE` whatever is left.
+#[cfg(windows)]
+#[test]
+fn an_owned_captures_grace_ends_by_its_deadline() {
+    assert_eq!(settle_grace(Duration::from_secs(3600)), LEFT_GRACE);
+    assert_eq!(settle_grace(Duration::from_secs(1)), Duration::from_secs(1));
+    assert_eq!(settle_grace(Duration::ZERO), Duration::ZERO);
+}
+
+/// A CAPTURE HANDS ITS CHILD WINDOWS' OWN PROCESS VARIABLES, AND NOTHING ELSE OF THIS
+/// PROCESS'S (Windows): owned or not, the child sees each of `WINDOWS_PASS` as this process has
+/// it, and `COMPUTERNAME`, which this process has (CONTROL) and the capture does not pass, not
+/// at all. NEGATIVE CONTROL (run as a temporary mutant, reverted): without the pass, the child
+/// sees no `SystemRoot`.
+#[cfg(windows)]
+#[test]
+fn a_capture_hands_its_child_the_windows_variables_it_needs() {
+    const NAME: &str = "a_capture_hands_its_child_the_windows_variables_it_needs";
+    const UNPASSED: &str = "COMPUTERNAME";
+    if std::env::var_os(JOB_ROLE).is_some_and(|role| role == "printer") {
+        for name in WINDOWS_PASS.iter().chain([&UNPASSED]) {
+            match std::env::var_os(name) {
+                Some(value) => println!("ATERM-ENV {name}={}", value.to_string_lossy()),
+                None => println!("ATERM-ENV {name} unset"),
+            }
+        }
+        std::io::Write::flush(&mut std::io::stdout()).expect("the printer's words are out");
+        std::process::exit(0);
+    }
+    assert!(
+        std::env::var_os(UNPASSED).is_some(),
+        "CONTROL: this process has {UNPASSED}"
+    );
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let expected: Vec<String> = WINDOWS_PASS
+        .iter()
+        .map(|name| match std::env::var_os(name) {
+            Some(value) => format!("ATERM-ENV {name}={}", value.to_string_lossy()),
+            None => format!("ATERM-ENV {name} unset"),
+        })
+        .chain([format!("ATERM-ENV {UNPASSED} unset")])
+        .collect();
+    assert!(
+        expected
+            .iter()
+            .any(|line| line.starts_with("ATERM-ENV SystemRoot=")),
+        "CONTROL: this process has SystemRoot"
+    );
+    for owned in [false, true] {
+        let cmd = rerun(NAME, "printer", tmp.path());
+        let got = if owned {
+            capture_bounded_owned(cmd, HANG_DETECTOR, 1 << 16)
+        } else {
+            capture_bounded(cmd, HANG_DETECTOR, 1 << 16)
+        }
+        .expect("the printer ran");
+        assert_eq!(got.code, Some(0), "owned {owned}");
+        let printed: Vec<String> = String::from_utf8_lossy(&got.stdout)
+            .lines()
+            .filter(|line| line.starts_with("ATERM-ENV "))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(printed, expected, "owned {owned}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_slow_spawn_spends_the_budget() {
@@ -493,7 +803,12 @@ fn a_descendant_holding_stdout_is_killed_with_its_process_group() {
 fn a_group_still_forking_at_the_deadline_is_killed_whole() {
     let (pgid, _) = capture_a_hanging_group(
         "forking-group",
-        "echo \"$$ $(\"$ATERM_TEST_PS\" -o pgid= -p $$)\" > \"$PGIDF\"; while :; do \"$ATERM_TEST_SLEEP\" \"$HANG_S\" & kill -KILL $!; done",
+        &format!(
+            "echo \"$$ $(\"$ATERM_TEST_PS\" -o pgid= -p $$)\" > \"$PGIDF\"; {}",
+            aterm_uds::stand_in_loop::while_alive(
+                "\"$ATERM_TEST_SLEEP\" \"$HANG_S\" & kill -KILL $!"
+            )
+        ),
     );
     assert!(
         group_emptied(pgid),
@@ -919,7 +1234,7 @@ fn an_owned_capture_past_its_deadline_ends_its_child_by_proof_then_its_group() {
         true,
         None,
     )
-    .expect_err("a provider that waits for ever is an error, not a wait");
+    .expect_err("a provider that waits while the test runs is an error, not a wait");
     assert!(why.contains("deadline"), "{why}");
     let [leader, member] = provider.said();
     assert!(
@@ -998,7 +1313,7 @@ fn a_capture_budget_counts_the_time_its_host_slept() {
                      budget its host slept through"
                 )
             })
-            .expect_err("a provider that waits for ever is an error, not a wait");
+            .expect_err("a provider that waits while the test runs is an error, not a wait");
         assert!(
             why.contains(&format!("ran past its {} ms deadline", HOUR.as_millis())),
             "owned={owned}: {why}"

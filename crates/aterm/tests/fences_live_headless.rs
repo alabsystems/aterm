@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
 use crate::live_ctl::Ctl;
+use crate::patience::Patience;
 use crate::{child_output, headless_boot};
 
 use headless_boot::{
@@ -29,9 +30,9 @@ const HANG_MS: &str = "timeout=60000";
 
 /// Wait for the process-name resolver before asserting supervisor behavior.
 fn await_program(inst: &Instance, sid: &str, wanted: &str) {
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     let mut last = status(inst, sid);
-    while field(&last, "program") != Some(wanted) && Instant::now() < deadline {
+    while field(&last, "program") != Some(wanted) && patience.spent().is_none() {
         std::thread::sleep(Duration::from_millis(20));
         last = status(inst, sid);
     }
@@ -137,12 +138,14 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         std::thread::spawn(move || {
             headless_boot::until_served(|| {
                 let child = cmd.spawn().expect("spawn the await");
-                child_output::wait_and_read(child, Instant::now() + Duration::from_secs(150) + HANG)
+                child_output::wait_and_read(child, Duration::from_secs(150) + HANG)
                     .expect("the await exits after its own timeout")
             })
         })
     };
     let started = Instant::now();
+    // A wall bound the product sets: the await keeps its own 150 s timeout, so one that arms
+    // later than this leaves too little of it for box B to land in.
     let armed_by = started + Duration::from_secs(120);
     let mut samples: Vec<(Duration, Duration, usize)> = Vec::new();
     let timeline = |samples: &[(Duration, Duration, usize)]| {
@@ -235,8 +238,8 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         &[&format!("@{sid}"), "key", &format!("if-gen={gen_b}"), "1"],
     );
     assert!(reply.starts_with("OK seq="), "{reply}");
-    let deadline = Instant::now() + HANG;
-    while Instant::now() < deadline && std::fs::read(&keylog).unwrap_or_default().is_empty() {
+    let mut patience = Patience::new(HANG);
+    while std::fs::read(&keylog).unwrap_or_default().is_empty() && patience.spent().is_none() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(
@@ -309,8 +312,8 @@ fn a_refused_act_types_nothing() {
     );
     let reply = ctl_ok(&inst, &[&format!("@{sid}"), "key", "act=approve", "1"]);
     assert!(reply.starts_with("OK seq="), "{reply}");
-    let deadline = Instant::now() + HANG;
-    while Instant::now() < deadline && std::fs::read(&keylog).unwrap_or_default().is_empty() {
+    let mut patience = Patience::new(HANG);
+    while std::fs::read(&keylog).unwrap_or_default().is_empty() && patience.spent().is_none() {
         std::thread::sleep(Duration::from_millis(20));
     }
     ctl_ok(
@@ -387,8 +390,8 @@ fn a_keyed_turn_its_fence_skipped_gives_its_id_to_the_retry() {
         Some("turn"),
         "the fenced skip gave the sequence back: {typed}"
     );
-    let deadline = Instant::now() + HANG;
-    while Instant::now() < deadline && std::fs::read(&keylog).unwrap_or_default().len() < 2 {
+    let mut patience = Patience::new(HANG);
+    while std::fs::read(&keylog).unwrap_or_default().len() < 2 && patience.spent().is_none() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(
@@ -421,11 +424,10 @@ fn request(reader: &mut BufReader<std::os::unix::net::UnixStream>, line: &str) -
 
 /// Poll the session's roster row until `supervisor=` reads `want`.
 fn supervisor_until(inst: &Instance, sid: &str, want: &str) -> String {
-    let deadline = Instant::now() + HANG;
-    let mut row = String::new();
-    while Instant::now() < deadline {
+    let mut patience = Patience::new(HANG);
+    loop {
         let roster = ctl_ok(inst, &["sessions"]);
-        row = roster
+        let row = roster
             .lines()
             .find(|l| l.contains(sid))
             .unwrap_or_default()
@@ -433,9 +435,11 @@ fn supervisor_until(inst: &Instance, sid: &str, want: &str) -> String {
         if field(&row, "supervisor") == Some(want) {
             return row;
         }
+        if let Some(why) = patience.spent() {
+            panic!("supervisor={want} not reached ({why}); last row: {row}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("supervisor={want} not reached; last row: {row}");
 }
 
 #[test]
@@ -519,9 +523,9 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
             "ttl=400",
         ],
     );
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     let mut since = changes().split_off(before);
-    while !since.iter().any(|v| v == "value=-") && Instant::now() < deadline {
+    while !since.iter().any(|v| v == "value=-") && patience.spent().is_none() {
         std::thread::sleep(Duration::from_millis(50));
         since = changes().split_off(before);
     }
@@ -665,14 +669,11 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         status(&inst, &sid),
         ctl_ok(&inst, &[&format!("@{sid}"), "text"])
     );
-    let deadline = Instant::now() + HANG;
-    let mut got = Vec::new();
-    while Instant::now() < deadline {
-        got = std::fs::read(&keylog).unwrap_or_default();
-        if got.contains(&b'1') {
-            break;
-        }
+    let mut patience = Patience::new(HANG);
+    let mut got = std::fs::read(&keylog).unwrap_or_default();
+    while !got.contains(&b'1') && patience.spent().is_none() {
         std::thread::sleep(Duration::from_millis(30));
+        got = std::fs::read(&keylog).unwrap_or_default();
     }
     assert_eq!(got, b"1", "exactly the approving 1: {:?}", ctl.requests);
 }

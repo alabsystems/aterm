@@ -3,7 +3,7 @@
 
 //! Failed builds use actual Cargo diagnostics and never infer success from stdout.
 
-use atpkg_publish::artifact::tools::{HostTools, Queue, Ran, Run, Tools};
+use atpkg_publish::artifact::tools::{HostTools, Ran, Run, Tools};
 
 use super::*;
 
@@ -65,14 +65,18 @@ fn actual_cargo_compiler_errors_are_persisted_and_shown_by_the_failed_pack() {
         ],
     );
     run.cwd = Some(work.path().to_path_buf());
-    // The bound is the build's own time: the build claims this Mac's capacity and waits its
-    // turn first (behind a landing's test binaries, most of a minute), which says how busy the
-    // Mac is and nothing of the build, so the wait of a claim in its checkout is not counted.
+    // This probe waits for a real compiler diagnostic. Use the runner's process-progress
+    // hang detector: a loaded build may keep working for more than a minute. A Queue would
+    // instead select the elapsed build-time budget used for committed package qualification.
     run.deadline = Some(Duration::from_secs(60));
-    run.queue = Some(Queue::of(work.path()));
     run.env.push((
         "CARGO_TARGET_DIR".into(),
         work.path().join("target.noindex").into_os_string(),
+    ));
+    // This dependency-free fixture needs no shared package cache or personal Cargo config.
+    run.env.push((
+        "CARGO_HOME".into(),
+        work.path().join("cargo-home").into_os_string(),
     ));
     let output = HostTools.run(&run).expect("the actual Trust Cargo driver");
     assert!(!output.success());

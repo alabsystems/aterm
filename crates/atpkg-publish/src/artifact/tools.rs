@@ -25,9 +25,11 @@ pub struct Run {
     pub env_remove: Vec<String>,
     /// Variables set for it.
     pub env: Vec<(String, OsString)>,
-    /// A hang detector: the runner owns termination and cleanup past it.
+    /// Without a queue, a process-progress inactivity window; with a queue, an elapsed
+    /// build-time budget excluding admission waits. The runner owns termination and cleanup.
     pub deadline: Option<Duration>,
-    /// The build queue [`Run::deadline`] does not count ([`Queue`]); `None` counts every second.
+    /// Select the committed build-time budget clock ([`Queue`]). `None` uses the
+    /// process-progress hang detector for a bounded run.
     pub queue: Option<Queue>,
 }
 

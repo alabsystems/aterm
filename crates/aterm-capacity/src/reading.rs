@@ -468,6 +468,23 @@ pub trait Machine {
     /// Every process now; `None` where the platform has no sweep.
     fn procs(&self) -> Option<Procs>;
 
+    /// Live old build-slot reservations. Injected machines have no external pool.
+    fn legacy_slots(
+        &self,
+        ledger: &crate::Ledger,
+        cores: u32,
+    ) -> crate::build_slot_wait::held::HeldSlots {
+        let _ = (ledger, cores);
+        crate::build_slot_wait::held::HeldSlots::default()
+    }
+
+    /// Native ancestry in the old slot observer's identity domain. Unknown never
+    /// exempts an old holder from accounting.
+    fn legacy_lineage(&self, pid: u32) -> Vec<aterm_sysprobe::slots::Holder> {
+        let _ = pid;
+        Vec::new()
+    }
+
     /// One actual CPU counter point; unsupported/injected machines report unknown by default.
     fn cpu_point(&self) -> Option<crate::CpuPoint> {
         None
@@ -757,6 +774,23 @@ impl Machine for Live {
         Some(Procs::of(
             sweep.procs.iter().map(Proc::of_reading).collect(),
         ))
+    }
+
+    fn legacy_slots(
+        &self,
+        ledger: &crate::Ledger,
+        cores: u32,
+    ) -> crate::build_slot_wait::held::HeldSlots {
+        #[cfg(unix)]
+        if ledger.is_account() {
+            return crate::build_slot_wait::held::read(cores);
+        }
+        let _ = (ledger, cores);
+        crate::build_slot_wait::held::HeldSlots::default()
+    }
+
+    fn legacy_lineage(&self, pid: u32) -> Vec<aterm_sysprobe::slots::Holder> {
+        crate::build_slot_wait::held::lineage(pid)
     }
 
     fn waits(&self) -> Vec<aterm_toolchain::waits::Waiting> {

@@ -3214,8 +3214,12 @@ fn run_accounts_source_table_with_catalog(
     let mut text = Vec::new();
     // The lab every account the table names is named under, read once.
     let lab = super::alab_roster::current();
+    // Where the lab is not read yet no source table is read: each pool lists this Mac's own
+    // roster, and one status line says why.
+    let mut lab_pending = None;
     for current in cli.map_or_else(|| Cli::ALL.to_vec(), |cli| vec![cli]) {
         let local = local_source_table(env, current);
+        let pending = super::accounts_sync::lab_pending(current, env);
         if let Some(catalog) = catalog {
             let own = own_email(current, env.home.as_deref());
             let roster = local
@@ -3233,7 +3237,27 @@ fn run_accounts_source_table_with_catalog(
             shared.push(aterm_json::json!({"cli":current.id(), "catalog":super::account_catalog::report(catalog, current, here)}));
             shared_text.push_str(&super::account_catalog::text(catalog, current, here));
         }
-        match super::accounts_sync::account_source_table(current, env, None) {
+        let loaded = match pending {
+            Some(why) => {
+                let listed = local
+                    .as_ref()
+                    .is_some_and(|local| !local.records.roster.rows.is_empty());
+                lab_pending.get_or_insert(why);
+                if cli.is_none() && !listed {
+                    continue;
+                }
+                Ok(super::accounts_sync::CliFleet {
+                    cli: current,
+                    roster: super::accounts_sync::FleetRoster {
+                        source: super::alab_roster::SOURCE.to_owned(),
+                        ..super::accounts_sync::FleetRoster::default()
+                    },
+                    held: Vec::new(),
+                })
+            }
+            None => super::accounts_sync::account_source_table(current, env, None),
+        };
+        match loaded {
             Ok(fleet) => {
                 let (table, rows) = source_table_rows(current, &fleet, local, lab.as_deref());
                 let source = fleet.roster.source.clone();
@@ -3261,6 +3285,9 @@ fn run_accounts_source_table_with_catalog(
         let mut value = aterm_json::json!({
             "kind":"account-source-table", "schema":SOURCE_TABLE_SCHEMA, "pools":tables,
         });
+        if let (Some(why), Some(object)) = (&lab_pending, value.as_object_mut()) {
+            object.insert("lab_pending".into(), Value::from(why.clone()));
+        }
         if catalog.is_some()
             && let Some(object) = value.as_object_mut()
         {
@@ -3299,6 +3326,9 @@ fn run_accounts_source_table_with_catalog(
                 readiness
             );
             let _ = writeln!(out, "  source: {source}");
+        }
+        if let Some(why) = &lab_pending {
+            let _ = writeln!(out, "lab: {why}");
         }
         if cli.is_none()
             && let Some(catalog) = catalog
@@ -8969,7 +8999,7 @@ fn upgrade_line_with(
         (
             (!matches!(row.phase, super::upgrade::Phase::Done))
                 .then(|| now.saturating_sub(row.behind_since)),
-            (!row.wait.is_empty()).then(|| now.saturating_sub(row.wait_since)),
+            row.waited_for(now),
         )
     });
     if !json {
@@ -9299,14 +9329,6 @@ pub trait AccountsHost {
     #[cfg(unix)]
     fn session_logins(&self, env: &Env) -> Vec<super::accounts_tokens::SessionLogin> {
         super::accounts_tokens::session_logins(env)
-    }
-
-    /// The report's one fleet read for the peers that use a token
-    /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.10): the fleet survey's own client
-    /// ([`crate::fleet_member::survey_fleet`]), bounded as `aterm ctl survey --fleet` is, in a
-    /// run; none on any other host, so the report says "peers not read".
-    fn fleet_survey(&self) -> Option<aterm_ctl::FleetRead> {
-        None
     }
 
     /// This aterm's own survey rows, for the report's sessions and their routes (§5.10): its
@@ -9785,11 +9807,7 @@ impl AccountsHost for LiveAccounts {
     }
 
     fn auth_status(&self, login: &str) -> Result<Captured, String> {
-        let user_home = std::env::var_os("HOME").map(PathBuf::from);
-        let prog = user_home
-            .as_deref()
-            .map(super::accounts_sync::resolve_claude_program)
-            .unwrap_or_else(|| PathBuf::from("claude"));
+        let prog = live_claude_program();
         match &self.work {
             Some(scope) => auth_status_of_scoped(
                 prog.as_os_str(),
@@ -9806,11 +9824,7 @@ impl AccountsHost for LiveAccounts {
     }
 
     fn login(&self, dir: Option<&str>) -> Result<i32, String> {
-        let user_home = std::env::var_os("HOME").map(PathBuf::from);
-        let prog = user_home
-            .as_deref()
-            .map(super::accounts_sync::resolve_claude_program)
-            .unwrap_or_else(|| PathBuf::from("claude"));
+        let prog = live_claude_program();
         login_flow_of(prog.as_os_str(), dir)
     }
 
@@ -9855,17 +9869,6 @@ impl AccountsHost for LiveAccounts {
         }
     }
 
-    #[cfg(unix)]
-    fn fleet_survey(&self) -> Option<aterm_ctl::FleetRead> {
-        crate::fleet_member::survey_fleet(&aterm_ctl::FleetAsk {
-            host: None,
-            within: aterm_ctl::FLEET_WITHIN,
-            holder: None,
-            by: None,
-        })
-        .ok()
-    }
-
     fn local_survey(&self, env: &Env) -> Option<Vec<String>> {
         let sock = env.sock.clone()?;
         let exe = std::env::current_exe().ok()?;
@@ -9895,11 +9898,7 @@ impl AccountsHost for LiveAccounts {
         email: &str,
         browser: &RenewBrowser,
     ) -> Result<RenewalExit, RenewalFailure> {
-        let user_home = std::env::var_os("HOME").map(PathBuf::from);
-        let prog = user_home
-            .as_deref()
-            .map(super::accounts_sync::resolve_claude_program)
-            .unwrap_or_else(|| PathBuf::from("claude"));
+        let prog = live_claude_program();
         renew_flow_of_with_work(
             prog.as_os_str(),
             home,
@@ -9916,11 +9915,7 @@ impl AccountsHost for LiveAccounts {
     }
 
     fn status_in_home(&self, home: &str) -> Result<Captured, String> {
-        let user_home = std::env::var_os("HOME").map(PathBuf::from);
-        let prog = user_home
-            .as_deref()
-            .map(super::accounts_sync::resolve_claude_program)
-            .unwrap_or_else(|| PathBuf::from("claude"));
+        let prog = live_claude_program();
         match &self.work {
             Some(scope) => status_in_home_within_scoped(
                 prog.as_os_str(),
@@ -10611,8 +10606,8 @@ impl std::fmt::Display for RenewalFailure {
 /// its own: it waits at its paste prompt once its opener gives up (MEASURED,
 /// `docs/measured/mailbox-signin-cloudflare-2026-11-01.md`). So the run is an owned capture
 /// ([`super::align::capture_bounded_owned`]): `within` ends it, and so does every other way the
-/// wait for it stops (on Unix this process's own end too; elsewhere nothing ties the run to this
-/// process, ATERM-KI-1115-62853), and so, on every platform, does the failure its opener records
+/// wait for it stops, this process's own end too (on Unix by its tether, on Windows by the
+/// kill-on-close job it is born in), and so, on every platform, does the failure its opener records
 /// in its outcome file ([`super::align::capture_bounded_owned_watching`]). A hosted OAuth code
 /// arrives through the same private channel and is written once to the waiting CLI's stdin.
 pub(super) fn capture_unattended_renewal(
@@ -11014,20 +11009,52 @@ fn auth_status_within(
     super::align::capture_bounded(cmd, budget, MAX_AUTH_STDOUT)
 }
 
-/// Why `claude auth status --json` is not run with neither USER nor LOGNAME in the environment: [`LoginCheck::CouldNotRun`]'s reason, word for word.
+/// Why `claude auth status --json` is not run with no variable that names the account in the environment ([`ACCOUNT_NAMES`]): [`LoginCheck::CouldNotRun`]'s reason, word for word.
+#[cfg(not(windows))]
 pub const AUTH_CHECK_NO_USER: &str = "USER is not set";
+/// Why `claude auth status --json` is not run with no variable that names the account in the environment ([`ACCOUNT_NAMES`]): [`LoginCheck::CouldNotRun`]'s reason, word for word.
+#[cfg(windows)]
+pub const AUTH_CHECK_NO_USER: &str = "USERNAME is not set";
 
-/// The variables the check after a sign-in ([`auth_status_of`], [`status_in_home_within`]) hands through to the `claude` it runs, as they are: USER and LOGNAME, and the reroute stub's markers.
+/// The variables that name the account a sign-in's `claude` runs as: one set to something is
+/// enough, and each that is set is handed through as it is ([`auth_check_env`]). Unix names it
+/// USER and LOGNAME. Windows names it USERNAME, which every logon session has (a process started
+/// from Explorer, cmd.exe or PowerShell) and which neither of Unix's two stands for there.
+#[cfg(not(windows))]
+const ACCOUNT_NAMES: [&str; 2] = ["USER", "LOGNAME"];
+/// The variables that name the account a sign-in's `claude` runs as: one set to something is
+/// enough, and each that is set is handed through as it is ([`auth_check_env`]). Unix names it
+/// USER and LOGNAME. Windows names it USERNAME, which every logon session has (a process started
+/// from Explorer, cmd.exe or PowerShell) and which neither of Unix's two stands for there.
+#[cfg(windows)]
+const ACCOUNT_NAMES: [&str; 3] = ["USER", "LOGNAME", "USERNAME"];
+
+/// The `claude` this machine's own sign-ins and checks run ([`LiveAccounts`]): the one
+/// [`super::accounts_sync::resolve_claude_program`] finds from the user's home, or `claude` on
+/// `PATH` where there is no home. The home is `HOME`; Windows sets none and names it
+/// `USERPROFILE` ([`aterm_types::dirs::home_dir`]).
+fn live_claude_program() -> PathBuf {
+    #[cfg(not(windows))]
+    let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    #[cfg(windows)]
+    let user_home = aterm_types::dirs::home_dir();
+    user_home
+        .as_deref()
+        .map(super::accounts_sync::resolve_claude_program)
+        .unwrap_or_else(|| PathBuf::from("claude"))
+}
+
+/// The variables the check after a sign-in ([`auth_status_of`], [`status_in_home_within`]) hands through to the `claude` it runs, as they are: those of [`ACCOUNT_NAMES`], and the reroute stub's markers.
 pub(super) fn auth_check_env(
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Vec<(&'static str, OsString)>, String> {
-    let named = ["USER", "LOGNAME"]
+    let named = ACCOUNT_NAMES
         .into_iter()
         .any(|name| var(name).is_some_and(|value| !value.is_empty()));
     if !named {
         return Err(AUTH_CHECK_NO_USER.to_string());
     }
-    Ok(["USER", "LOGNAME"]
+    Ok(ACCOUNT_NAMES
         .into_iter()
         .chain(atpkg::hooks::AGENTS_MARKERS.iter().copied())
         .filter_map(|name| var(name).map(|value| (name, value)))
@@ -11346,6 +11373,12 @@ pub struct SurveyAccount {
     pub enrolled: bool,
     /// Its condition now; [`accounts::Condition::Limited`] names when its wall ends.
     pub condition: accounts::Condition,
+    /// Each model's own weekly wall standing on it now, by its bucket (Fable's
+    /// `seven_day_overage_included`, Opus's, Sonnet's), with when it ends, Unix seconds
+    /// ([`accounts::Account::model_walls`]). It walls that model's sessions alone, never the
+    /// account, so no [`Self::condition`] says it: a session of that model ranks the row after
+    /// every row with that model's room ([`accounts::ModelWeek`]).
+    pub model_walls: BTreeMap<String, i64>,
     /// The five-hour window used, in percent, while it runs.
     pub five_hour_pct: Option<u32>,
     /// When the five-hour window resets, while it runs, Unix seconds. Where its read named no reset,
@@ -11759,6 +11792,10 @@ pub fn survey_accounts(
                 class: row.class,
                 enrolled: here,
                 condition: survey_condition(base, &reading, now),
+                model_walls: account
+                    .model_walls(now)
+                    .map(|(bucket, until)| (bucket.to_owned(), until))
+                    .collect(),
                 five_hour_pct: reading.five_hour.map(|(pct, _)| pct),
                 five_hour_reset: reading.five_hour.map(|(_, reset)| reset),
                 five_hour_reset_named: reading.five_hour_named,
@@ -12485,7 +12522,10 @@ fn next_on(
     let mut to_note = None;
     let mut none = None;
     let mut not = Vec::new();
-    for (label, verdict) in accounts::candidates(roster, state, enrolled, me.flatten(), &point, now)
+    // `next:` is no session's: no model is read ([`accounts::ModelWeek::Unread`]).
+    let unread = accounts::ModelWeek::Unread;
+    for (label, verdict) in
+        accounts::candidates(roster, state, enrolled, me.flatten(), unread, &point, now)
     {
         match verdict {
             Ok(_) => match roster
@@ -14049,6 +14089,7 @@ fn left_words_for(cli: Cli, named: &RowName, reader: Reader) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reader {
     Person,
+    #[cfg(unix)]
     Log,
 }
 
@@ -14057,6 +14098,7 @@ impl Reader {
     fn names(self, named: &RowName) -> &str {
         match self {
             Self::Person => &named.shown,
+            #[cfg(unix)]
             Self::Log => &named.logged,
         }
     }
@@ -14660,32 +14702,29 @@ fn with_token_section(
     code
 }
 
-/// The report's vault tokens section (§5.10): each account's token, peers' use from one bounded fleet read where this Mac's table keeps a token, each offer noted
-/// once per pair and asked of the lab where its account has no verified token in use
-/// ([`super::accounts_token_view::ask_lab`]), and the sessions this aterm's survey names.
+/// The report's vault tokens section (§5.10): each account's token, each offer noted once per
+/// pair and asked of the lab where its account has no verified token in use
+/// ([`super::accounts_token_view::ask_lab`]), and the sessions this aterm's survey names. It reads
+/// no other Mac: which Macs run on a token is each one's own `ai/logins` row
+/// (`docs/DESIGN-shared-files-2026-11-11.md` §6). First, with a vault or not, a table an earlier
+/// build wrote with an address or a survey's peers in it is written again without them
+/// ([`super::accounts_tokens::rewrite_stale`]): a Mac that has left its vault keeps none of them
+/// on disk either.
 #[cfg(unix)]
 pub(super) fn token_report(
     env: &Env,
     host: &dyn AccountsHost,
 ) -> super::accounts_token_view::Report {
-    use super::accounts_token_view::{self as view, Peers, PeersShown, Report};
-    let (Some(store), Some(vault)) = (env.accounts_store_for(Cli::Claude), host.token_vault())
-    else {
+    use super::accounts_token_view::{self as view, Report};
+    let Some(store) = env.accounts_store_for(Cli::Claude) else {
+        return Report::NoVault;
+    };
+    let _ = super::accounts_tokens::rewrite_stale(&store);
+    let Some(vault) = host.token_vault() else {
         return Report::NoVault;
     };
     let now = host.now().max(env.now);
     let at = u64::try_from(now).unwrap_or(0);
-    let kept = super::accounts_tokens::read_table(&store).is_ok_and(|table| !table.rows.is_empty());
-    let peers = if kept {
-        host.fleet_survey()
-            .map_or(Peers::NotRead, |read| view::peers_of(&read, at))
-    } else {
-        Peers::NotRead
-    };
-    let shown = match &peers {
-        Peers::Read { .. } if view::note_peers(&store, &peers).is_ok() => PeersShown::Read,
-        _ => PeersShown::NotRead,
-    };
     let logins = host.session_logins(env);
     let roster = env.accounts_roster_for(Cli::Claude);
     let lab = super::alab_roster::current();
@@ -14715,7 +14754,6 @@ pub(super) fn token_report(
     });
     Report::Accounts {
         accounts,
-        peers: shown,
         sessions,
         steps,
     }
@@ -14739,6 +14777,10 @@ pub(super) struct ReportedAccounts {
     /// The address this Mac's default home's login file names now, which the catalog's `local`
     /// says this Mac runs where no row lists it ([`super::account_catalog::Here`]).
     pub(super) own: Option<String>,
+    /// Why the lab, which may name this Mac, is not read yet, where it is not: the report's one
+    /// status line after the rows says so ([`write_combined_accounts_report`]). Read once with
+    /// the list's origin, so the two never disagree.
+    pub(super) lab_pending: Option<String>,
 }
 
 /// One account-list observation, with local execution state and shared proposals.
@@ -14777,6 +14819,10 @@ pub(super) fn write_accounts_report(
     AccountReport { local, catalog }
 }
 
+/// The local report `local_out`, and after it what the journal says of its rows, the shared
+/// catalog, and, where the lab is not read yet ([`ReportedAccounts::lab_pending`]), one status
+/// line saying why the roster stands as it is. A report that failed says what it says, with no
+/// status line after it.
 fn write_combined_accounts_report(
     cli: Cli,
     now: i64,
@@ -14799,7 +14845,8 @@ fn write_combined_accounts_report(
             )
         })
         .filter(|(rows, _)| !rows.is_empty());
-    if catalog.is_none() && lab.is_none() {
+    let pending = local.and_then(|local| local.lab_pending.as_deref());
+    if catalog.is_none() && lab.is_none() && pending.is_none() {
         let _ = out.write_all(local_out);
         return;
     }
@@ -14824,10 +14871,16 @@ fn write_combined_accounts_report(
                     super::alab_seen::rows_json(rows, names, now),
                 );
             }
+            if let Some(why) = pending {
+                object.insert("lab_pending".into(), Value::from(why));
+            }
         }
         let _ = writeln!(out, "{value}");
     } else {
         let _ = out.write_all(local_out);
+        if let Some(why) = pending {
+            let _ = writeln!(out, "lab: {why}");
+        }
         if let Some((rows, names)) = &lab {
             let _ = write!(out, "{}", super::alab_seen::rows_text(rows, names, now));
         }
@@ -14977,6 +15030,21 @@ fn write_accounts_report_snapshot(
     // and worker lines, its outlook and its journal section name each account alike.
     let lab = super::alab_roster::current();
     let own_address = own_email(cli, env.home.as_deref());
+    // Where the rows come from (Claude Code's, where a roster lists them), and why the lab is not
+    // read yet where it is not, from one look at the lab.
+    let origin = (cli == Cli::Claude && !own).then(|| {
+        super::accounts_sync::fleet_origin(
+            &env.accounts_store(),
+            env.home.as_deref(),
+            env.config.as_deref(),
+            path,
+        )
+    });
+    let lab_pending = match &origin {
+        Some(super::accounts_sync::FleetOrigin::AlabPending(why)) => Some(why.clone()),
+        Some(_) => None,
+        None => super::accounts_sync::lab_pending(cli, env),
+    };
     if own && !json {
         let _ = write!(out, "{}", accounts_none_listed(cli, path, roster_present));
         let name = own_login_name(cli, env.home.as_deref(), lab.as_deref())
@@ -14988,6 +15056,7 @@ fn write_accounts_report_snapshot(
             state,
             enrolled: BTreeSet::new(),
             own: own_address,
+            lab_pending,
         });
     }
     if own {
@@ -15003,14 +15072,6 @@ fn write_accounts_report_snapshot(
         .accounts_store_for(cli)
         .and_then(|store| store.signing_in());
     let said = (&state, &logins, signing_in.as_deref());
-    let origin = (cli == Cli::Claude && !own).then(|| {
-        super::accounts_sync::fleet_origin(
-            &env.accounts_store(),
-            env.home.as_deref(),
-            env.config.as_deref(),
-            path,
-        )
-    });
     let (policy, rotation) = rotation_beside(cli, env, path);
     // Where a default row's refusal is read: the store's default login.
     let default_login = env
@@ -15111,10 +15172,15 @@ fn write_accounts_report_snapshot(
             env.now,
         );
         // Where the rows come from, where a fleet writes them: found on this Mac, a source a
-        // sync was handed, a configured source or the vault.
-        if let Some(origin) =
-            origin.filter(|origin| *origin != super::accounts_sync::FleetOrigin::Roster)
-        {
+        // sync was handed, a configured source or the vault. A lab not read yet says why on the
+        // report's own `lab:` line, once ([`write_combined_accounts_report`]).
+        if let Some(origin) = origin.filter(|origin| {
+            !matches!(
+                origin,
+                super::accounts_sync::FleetOrigin::Roster
+                    | super::accounts_sync::FleetOrigin::AlabPending(_)
+            )
+        }) {
             text.push_str(&format!("list: {}\n", origin.words()));
         }
         write!(out, "{text}")
@@ -15125,6 +15191,7 @@ fn write_accounts_report_snapshot(
         state,
         enrolled,
         own: own_address,
+        lab_pending,
     })
 }
 
@@ -15714,6 +15781,9 @@ fn add_listed(
                      written, so the lab's preferences still order the pool"
                 );
             }
+            if let Some(why) = &added.lab_pending {
+                let _ = writeln!(out, "lab: {why}");
+            }
             for fleet in &added.fleets {
                 let _ = writeln!(
                     out,
@@ -15756,6 +15826,8 @@ struct Added {
     dir_held_files: bool,
     /// The fleet files the row was listed in too, so the next sync keeps it.
     fleets: Vec<PathBuf>,
+    /// Why the lab is not read yet, where it is not ([`super::accounts_sync::ManualRosterPlan`]).
+    lab_pending: Option<String>,
 }
 
 fn file_mode(path: &Path) -> Option<u32> {
@@ -15990,6 +16062,7 @@ fn accounts_add_admitted(
         rows: written,
         listed_own,
         dir_held_files,
+        lab_pending: plan.as_ref().and_then(|plan| plan.lab_pending.clone()),
         fleets: plan
             .into_iter()
             .filter_map(|plan| plan.fleet)
@@ -17394,17 +17467,17 @@ impl Renewal {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OpenerStage {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Executable,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     AccountDirectory,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     HelperDirectory,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     TemporaryLink,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Publication,
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     Platform,
 }
 
@@ -17427,17 +17500,17 @@ impl OpenerError {
 impl std::fmt::Display for OpenerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let stage = match self.stage {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             OpenerStage::Executable => "executable",
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             OpenerStage::AccountDirectory => "account directory",
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             OpenerStage::HelperDirectory => "helper directory",
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             OpenerStage::TemporaryLink => "temporary link",
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             OpenerStage::Publication => "link publication",
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             OpenerStage::Platform => "platform",
         };
         match self.kind {
@@ -17447,9 +17520,29 @@ impl std::fmt::Display for OpenerError {
     }
 }
 
+/// The opener's file name in the accounts store's `bin`: [`super::open_url::OPENER`], with the
+/// platform's executable suffix (`aterm-open-url.exe` on Windows, which starts an image only by
+/// a name that ends so).
+pub(super) fn opener_file_name() -> String {
+    format!(
+        "{}{}",
+        super::open_url::OPENER,
+        std::env::consts::EXE_SUFFIX
+    )
+}
+
 /// Publish `<accounts store>/bin/aterm-open-url` after checking its target is an executable
 /// regular file. Callers hold the machine's sign-in lock through setup and the provider run.
 /// This checks filesystem readiness, not the success of a later exec; failures retain the old link.
+///
+/// On Unix the opener is a symbolic link to the executable. On Windows, where a symbolic link
+/// needs a right a standard user lacks, it is `bin/aterm-open-url.exe`, a hard link of the
+/// executable's file (an argv0 alias, as the installer lays aterm's own beside `aterm.exe`), or
+/// a copy of it where the volume or the image's access list refuses a link: a second name of the
+/// very image this process published, so an update that replaces the executable since leaves
+/// the opener the build its renewal runs with, and the next publication names the new one. An
+/// opener already that file is left as it is; one that is running, which Windows will not
+/// replace, is renamed aside first and removed once nothing runs it.
 pub(super) fn opener_link(
     store: &accounts::Store,
     host: &dyn AccountsHost,
@@ -17495,13 +17588,192 @@ pub(super) fn opener_link(
         }
         Ok(link)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        opener_link_windows(store, host)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (store, host);
         Err(OpenerError::new(
             OpenerStage::Platform,
             io::ErrorKind::Unsupported,
         ))
+    }
+}
+
+/// [`opener_link`]'s Windows arm: a hard link of the executable's file, or a copy of it.
+#[cfg(windows)]
+fn opener_link_windows(
+    store: &accounts::Store,
+    host: &dyn AccountsHost,
+) -> Result<PathBuf, OpenerError> {
+    use std::io::Read as _;
+    let fail = |stage| move |error: io::Error| OpenerError::new(stage, error.kind());
+    let exe = host.current_exe().ok_or(OpenerError {
+        stage: OpenerStage::Executable,
+        kind: None,
+    })?;
+    let exe = std::fs::canonicalize(exe).map_err(fail(OpenerStage::Executable))?;
+    let metadata = std::fs::metadata(&exe).map_err(fail(OpenerStage::Executable))?;
+    if !metadata.is_file() {
+        return Err(OpenerError::new(
+            OpenerStage::Executable,
+            io::ErrorKind::InvalidInput,
+        ));
+    }
+    // Windows starts an image, never a script or a file of other bytes: one that does not begin
+    // as an image does (`MZ`) would fail the provider's start of its opener.
+    let mut head = [0u8; 2];
+    std::fs::File::open(&exe)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .map_err(fail(OpenerStage::Executable))?;
+    if head != *b"MZ" {
+        return Err(OpenerError::new(
+            OpenerStage::Executable,
+            io::ErrorKind::InvalidData,
+        ));
+    }
+    let bin = store.dir.join("bin");
+    aterm_types::fs_restricted::ensure_private_dir(&store.dir)
+        .map_err(fail(OpenerStage::AccountDirectory))?;
+    let name = opener_file_name();
+    let link = bin.join(&name);
+    // The opener's folder is the user's alone (the user and SYSTEM under a protected list, made
+    // so at its creation, or narrowed where it is the user's; another account's folder or a
+    // reparse point is refused): no other account adds an image or a library the opener would
+    // load from beside itself, or replaces the opener before the provider starts it. A narrowing
+    // passes the folder's new entries on to what in it takes entries from it, and an opener an
+    // earlier publication left there is a second name of an aterm image elsewhere, whose list
+    // that would change: its name goes first (one that runs stays, and is set aside below).
+    if matches!(
+        aterm_uds::private_file::judge_private_dir(&bin),
+        Ok(aterm_uds::private_file::PrivateDir::Open(_))
+    ) {
+        let _ = std::fs::remove_file(&link);
+    }
+    aterm_uds::private_file::ensure_private_dir(&bin)
+        .map_err(fail(OpenerStage::HelperDirectory))?;
+    let same = |a: &Path, b: &Path| match (
+        aterm_uds::line_log::identity_at(a),
+        aterm_uds::line_log::identity_at(b),
+    ) {
+        (Ok(a), Ok(b)) => a.dev == b.dev && a.ino == b.ino,
+        _ => false,
+    };
+    // The names an earlier publication set aside while an opener ran from them: each goes once
+    // nothing runs it (Windows refuses the removal of a running image's last name till then).
+    // And the temporary a publication that ended before its rename left (`.<opener>.<pid>.exe`):
+    // each goes once the process it names has ended, never one a publication still running
+    // makes. Both go at every publication, the opener already there or not.
+    let aside_prefix = format!(".{}.", super::open_url::OPENER);
+    if let Ok(entries) = std::fs::read_dir(&bin) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let Some(rest) = file_name.strip_prefix(&aside_prefix) else {
+                continue;
+            };
+            let left_by_the_dead = rest
+                .strip_suffix(std::env::consts::EXE_SUFFIX)
+                .and_then(|pid| pid.parse::<u32>().ok())
+                .is_some_and(|pid| {
+                    pid != std::process::id() && !aterm_uds::process::pid_alive(pid)
+                });
+            if rest.ends_with(".retired") || left_by_the_dead {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    // A copy an earlier publication made (where a link was refused) of these same bytes is
+    // already the opener: it is kept, never copied again.
+    if same(&exe, &link) || same_bytes(&exe, &link) {
+        return Ok(link);
+    }
+    let temp = bin.join(format!(
+        ".{}.{}{}",
+        super::open_url::OPENER,
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    let _ = std::fs::remove_file(&temp);
+    if std::fs::hard_link(&exe, &temp).is_err() {
+        std::fs::copy(&exe, &temp).map_err(fail(OpenerStage::TemporaryLink))?;
+    }
+    let published = std::fs::rename(&temp, &link).or_else(|error| {
+        // Only a file of its own there is set aside: a folder, a link or a junction under the
+        // opener's name is left as it is, and the publication fails.
+        let is_file = std::fs::symlink_metadata(&link).is_ok_and(|meta| {
+            use std::os::windows::fs::MetadataExt as _;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            meta.is_file() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        });
+        if !is_file {
+            return Err(error);
+        }
+        let aside = aterm_uds::rand::hex_token::<8>().map(|nonce| {
+            bin.join(format!(
+                "{aside_prefix}{}.{nonce}.retired",
+                std::process::id()
+            ))
+        })?;
+        std::fs::rename(&link, &aside)?;
+        let moved = std::fs::rename(&temp, &link);
+        if moved.is_ok() {
+            let _ = std::fs::remove_file(&aside);
+        } else {
+            // A failure retains the old opener under its name.
+            let _ = std::fs::rename(&aside, &link);
+        }
+        moved
+    });
+    if let Err(error) = published {
+        let _ = std::fs::remove_file(&temp);
+        return Err(OpenerError::new(OpenerStage::Publication, error.kind()));
+    }
+    Ok(link)
+}
+
+/// Whether `link` is a plain file of its own (opened as itself: a reparse point is no copy)
+/// holding exactly `exe`'s bytes: the copy an earlier publication made where the volume or the
+/// image's access list refused a link ([`opener_link_windows`]). Any read that fails answers no.
+#[cfg(windows)]
+fn same_bytes(exe: &Path, link: &Path) -> bool {
+    use std::io::Read as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const CHUNK: usize = 1 << 16;
+    let open = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    };
+    let (Ok(mut ours), Ok(mut theirs)) = (open(exe), open(link)) else {
+        return false;
+    };
+    let (Ok(own), Ok(copy)) = (ours.metadata(), theirs.metadata()) else {
+        return false;
+    };
+    if !copy.is_file()
+        || copy.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || copy.len() != own.len()
+    {
+        return false;
+    }
+    let mut a = vec![0u8; CHUNK];
+    let mut b = vec![0u8; CHUNK];
+    loop {
+        let Ok(read) = ours.read(&mut a) else {
+            return false;
+        };
+        if read == 0 {
+            return theirs.read(&mut b[..1]).is_ok_and(|more| more == 0);
+        }
+        if theirs.read_exact(&mut b[..read]).is_err() || a[..read] != b[..read] {
+            return false;
+        }
     }
 }
 
@@ -24038,7 +24310,7 @@ impl LiveClaim {
 
 /// The harness claims of a `sessions` reply body, in row order: only rows whose holder names a
 /// harness ([`LiveClaim::harness`]). The body is this Mac's own, so a tab still under its legacy
-/// `s-` ID is read as one ([`aterm_types::control_verbs::is_minted_sid`]).
+/// `s-` ID is read as one ([`aterm_types::control_request::Sid::parse`]).
 fn live_claims_of(body: &str) -> Vec<LiveClaim> {
     let mut out = Vec::new();
     for row in body.lines() {
@@ -24339,16 +24611,19 @@ pub const LAUNCH_FLAG: &str = "--launch";
 /// `<args>` in this process's directory and environment carries from its start
 /// ([`super::tap::launch_value`]), or `None`. atpkg's managed twin asks it inside an aterm tab and
 /// puts `--settings <value>` ahead of the launch's own arguments; the verb reads no stdin, prints
-/// that value and nothing else, and always exits 0, so a launch never fails for it. First, on
-/// Unix, it notes the Claude home the launch serves from (`note_launch_home`) and settles the
+/// that value and nothing else, and always exits 0, so a launch never fails for it. First it
+/// notes, on Unix, the Claude home the launch serves from (`note_launch_home`) and settles the
 /// launch's folder trust ([`settle_launch_trust`]): the one step a launch may wait on, for a
 /// folder Claude Code holds no trust record for, and at most
 /// [`super::launch_trust::DEADLINE`] past the two reads of its window, each bounded by
-/// [`super::launch_trust::SESSION_WAIT`]. A launch the twin says has no terminal on its output
-/// (`atpkg::launch_tap::STDOUT_TTY_ENV` is `0`) is not settled: Claude Code prints and exits
-/// there and draws no dialog, and a tool shell inside a tab launches that way under the tab's
-/// policy. A twin laid before it said so is settled as a terminal's launch.
-fn launch_tap_value(args: &[String]) -> Option<String> {
+/// [`super::launch_trust::SESSION_WAIT`]. A launch whose output is no terminal is not settled:
+/// Claude Code prints and exits there and draws no dialog, and a tool shell inside a tab
+/// launches that way under the tab's policy. `stdout_terminal` says whether it is one where the
+/// verb's own standard output is the launch's (the `.cmd` twin's `--into` ask,
+/// [`write_launch_words`]); `None` reads what the `sh` twin says
+/// (`atpkg::launch_tap::STDOUT_TTY_ENV` is `0` for none), and a twin laid before it said so is
+/// settled as a terminal's launch.
+fn launch_tap_value(args: &[String], stdout_terminal: Option<bool>) -> Option<String> {
     let env = Env::from_process().ok()?;
     #[cfg(unix)]
     note_launch_home(&env);
@@ -24363,11 +24638,12 @@ fn launch_tap_value(args: &[String]) -> Option<String> {
     #[cfg(not(unix))]
     let account_home: Option<PathBuf> = None;
     let no_harness = std::env::var_os("ATERM_NO_HARNESS").is_some_and(|v| !v.is_empty());
-    #[cfg(unix)]
     if let Some(sid) = sid.as_deref().filter(|sid| !sid.is_empty()) {
         let build = super::launch_trust::twin_store_build();
-        let no_terminal =
-            std::env::var_os(atpkg::launch_tap::STDOUT_TTY_ENV).is_some_and(|said| said == "0");
+        let no_terminal = stdout_terminal.map_or_else(
+            || std::env::var_os(atpkg::launch_tap::STDOUT_TTY_ENV).is_some_and(|said| said == "0"),
+            |terminal| !terminal,
+        );
         let _ = settle_launch_trust(
             &env,
             &policy,
@@ -24423,7 +24699,6 @@ fn launch_tap_value(args: &[String]) -> Option<String> {
 /// Autopilot word and trusted folder), which `seen` reads only for a folder that holds no trust
 /// record. What it did, and a step it had to skip unread, is booked in the session's ledger and
 /// journal under the aterm state root; it prints nothing.
-#[cfg(unix)]
 fn settle_launch_trust(
     env: &Env,
     policy: &SupervisorConfig,
@@ -24451,6 +24726,26 @@ fn settle_launch_trust(
         &mut book,
         super::launch_trust::DEADLINE,
     )
+}
+
+/// `aterm harness tap --launch --into <folder> -- <args>` (`atpkg::launch_tap::INTO_FLAG`), the
+/// `.cmd` twin's ask: [`launch_tap_value`]'s value written to `<folder>` as the twin's words for
+/// it (`atpkg::launch_tap::cmd_words`), in `atpkg::launch_tap::INTO_VALUE` through a temporary
+/// file renamed over it, so the twin reads whole words or none. Nothing is written for no value,
+/// one the twin cannot carry, an empty `<folder>` (the twin made none) or one that is not there;
+/// the verb prints nothing and exits 0 either way.
+fn write_launch_words(into: &Path, value: Option<&str>) {
+    if into.as_os_str().is_empty() || !into.is_dir() {
+        return;
+    }
+    let Some(words) = value.and_then(atpkg::launch_tap::cmd_words) else {
+        return;
+    };
+    let file = into.join(atpkg::launch_tap::INTO_VALUE);
+    let tmp = into.join(format!("{}.tmp", atpkg::launch_tap::INTO_VALUE));
+    if std::fs::write(&tmp, words).is_err() || std::fs::rename(&tmp, &file).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Note the Claude home this launch serves from ([`super::claude_homes`]), before it serves
@@ -24502,9 +24797,21 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
         ["tap", flag] if *flag == super::tap::CARRY_FLAG => return run_tap_carrying(),
         ["tap", flag, _] if *flag == super::tap::LEGACY_CHAIN_FLAG => return run_tap_carrying(),
         ["tap", LAUNCH_FLAG, "--", ..] => {
-            if let Some(value) = launch_tap_value(&args[3..]) {
+            if let Some(value) = launch_tap_value(&args[3..], None) {
                 let _ = writeln!(io::stdout().lock(), "{value}");
             }
+            return ExitCode::SUCCESS;
+        }
+        [
+            "tap",
+            LAUNCH_FLAG,
+            atpkg::launch_tap::INTO_FLAG,
+            into,
+            "--",
+            ..,
+        ] => {
+            let value = launch_tap_value(&args[5..], Some(io::stdout().is_terminal()));
+            write_launch_words(Path::new(into), value.as_deref());
             return ExitCode::SUCCESS;
         }
         _ => {}

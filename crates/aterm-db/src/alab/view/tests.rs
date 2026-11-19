@@ -824,3 +824,106 @@ mod placements {
         assert_eq!(theirs[0].why, Why::Borrow);
     }
 }
+
+#[test]
+fn inventory_joins_configured_accounts_and_only_maximal_signed_facts() {
+    use crate::alab::registry::MACHINE_FACTS;
+    use astream_wire::sync::Header;
+
+    let (machine_key, mut held) = machine("m12");
+    let (first, first_fields) = account("ada", "claude");
+    let (second, second_fields) = account("ada", "codex");
+    held.extend(first_fields);
+    held.extend(second_fields);
+    held.extend(prefer(&machine_key, &second, Some(2)));
+    held.extend(prefer(&machine_key, &first, Some(1)));
+    let mut view = crate::typed::View::empty_for_test();
+    view.cells = cells(held);
+
+    // The second signer saw the first report despite its own clock running behind.
+    // The third report saw neither. Its missing time cannot stand in for an ordering.
+    let mut owned = OwnedRead::default();
+    for (id, parents, at, chip) in [
+        (1, vec![], Some(900), "old"),
+        (2, vec![[1; 32]], Some(100), "new"),
+        (3, vec![], None, "independent"),
+    ] {
+        let actor = [id; 48];
+        let uuid = [id; 16];
+        view.causal
+            .insert(Header {
+                id: [id; 32],
+                actor,
+                sequence: 1,
+                previous: None,
+                parents,
+            })
+            .unwrap();
+        let row = OwnedRow {
+            machine: uuid,
+            actor,
+            rank: (0, 1, 1),
+            operation: [id; 32],
+            value: json!({
+                "mac": "mc-old",
+                "merged_into": &machine_key,
+                "chip": chip,
+                "at": at,
+                "label": "not-the-writer",
+                "n": 1
+            }),
+        };
+        owned.rows.insert(keys::uuid32(&uuid), row);
+    }
+    view.owned.insert(MACHINE_FACTS.name, owned);
+
+    let inventory = inventory::machines(&view);
+    let [row] = inventory.as_slice() else {
+        panic!("expected one machine")
+    };
+    assert_eq!(row.name, "m12");
+    assert_eq!(row.status, "active");
+    assert_eq!(
+        row.assignments,
+        vec![
+            (first, "claude ada@example.test".to_owned()),
+            (second, "oai ada@example.test".to_owned()),
+        ]
+    );
+    assert_eq!(row.observations.len(), 2);
+    assert_eq!(row.observations[0].writer, keys::uuid32(&[2; 16]));
+    assert_eq!(row.observations[0].at_ms, Some(100));
+    assert_eq!(row.observations[0].summary, "new");
+    assert_eq!(row.observations[1].writer, keys::uuid32(&[3; 16]));
+    assert_eq!(row.observations[1].at_ms, None);
+}
+
+#[test]
+fn inventory_retains_unlabelled_and_conflicted_machine_identities() {
+    let (key, base) = machine("m5");
+    let mut book = Book::new();
+    let first = book.write(1, &[], base);
+    for (actor, status, label) in [(2, "lost", "m6"), (3, "active", "m7")] {
+        book.write(
+            actor,
+            &[first],
+            vec![
+                put(&MACHINE, &key, "label", json!(label)),
+                put(&MACHINE, &key, "status", json!(status)),
+            ],
+        );
+    }
+    let other = keys::machine_pk("unlabelled");
+    book.write(4, &[], vec![put(&MACHINE, &other, "row", json!("live"))]);
+    let mut view = crate::typed::View::empty_for_test();
+    view.cells = book.cells();
+
+    let inventory = inventory::machines(&view);
+    let row = inventory.iter().find(|row| row.key == key).unwrap();
+    assert_eq!(row.name, key);
+    assert_eq!(row.status, "Status conflict");
+    let row = inventory.iter().find(|row| row.key == other).unwrap();
+    assert_eq!(row.name, other);
+    assert_eq!(row.status, "Status not recorded");
+    assert!(row.assignments.is_empty() && row.observations.is_empty());
+}

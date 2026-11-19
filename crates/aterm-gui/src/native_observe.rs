@@ -499,6 +499,33 @@ impl Evidence {
         Reply::Registered(self.binding.clone())
     }
 
+    /// Whether this live registration still names exactly `live`'s vendor under its shell in
+    /// `context`'s host epoch, alive and in the foreground under every guard its refresh holds it to, for a
+    /// re-entry's qualification ([`crate::native_act`]'s asked upgrade into a recreated host).
+    /// Unlike [`Self::refresh`] it changes nothing: a refused request never invalidates, renews
+    /// or freezes a crash witness it does not own.
+    fn admits_reentry(
+        &self,
+        Live { vendor, shell }: Live<'_>,
+        context: &Context,
+        master: i32,
+        now_us: u64,
+        kernel: &dyn Kernel,
+    ) -> bool {
+        matches!(self.reservation, ReservationOwner::Live { .. })
+            && self.registration.host_epoch == context.host_epoch
+            && self.binding.host_epoch == context.host_epoch
+            && self.registration.vendor == *vendor
+            && self.registration.shell == *shell
+            && self.unexpired(now_us)
+            && !self.refresh_closed.load(Ordering::Acquire)
+            && self.guards(context, master, kernel)
+            && self.death.exited() == Some(false)
+            && kernel.process(vendor.pid).as_ref() == Some(vendor)
+            && kernel.process(shell.pid).as_ref() == Some(shell)
+            && kernel.foreground(master) == Some(vendor.group)
+    }
+
     /// Freshly prove the same retained death and exact named group quiescence after any
     /// predecessor drain. Detached descendants outside this cohort are not universally proved.
     pub(crate) fn reprove_with(
@@ -521,6 +548,14 @@ impl Evidence {
         self.current(context, master, now_us, kernel)
             && kernel.foreground(master) == Some(self.shell().group)
     }
+}
+
+/// The vendor and its shell a re-entry names as running now, held to a registration's own
+/// ([`Store::admits_reentry`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Live<'a> {
+    pub(crate) vendor: &'a Process,
+    pub(crate) shell: &'a Process,
 }
 
 #[derive(Debug)]
@@ -1183,7 +1218,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    fn register_with(
+    pub(crate) fn register_with(
         &mut self,
         registration: &Registration,
         context: &Context,
@@ -1239,6 +1274,24 @@ impl Store {
             .map_or(Reply::Unknown, |record| {
                 record.refresh(context, master, now_us, kernel)
             })
+    }
+
+    /// Whether `binding` names this store's own live registration of exactly `live`'s vendor
+    /// under its shell in the current host epoch ([`Evidence::admits_reentry`]). Data for a re-entry's
+    /// qualification only: no witness is lent, renewed or invalidated.
+    pub(crate) fn admits_reentry(
+        &self,
+        binding: &ObservationBinding,
+        live: Live<'_>,
+        context: &Context,
+        master: i32,
+        now_us: u64,
+        kernel: &dyn Kernel,
+    ) -> bool {
+        self.entries.iter().any(|record| {
+            record.binding == *binding
+                && record.admits_reentry(live, context, master, now_us, kernel)
+        })
     }
 
     /// A positive retained-death witness plus current guards, never a native mutation grant.

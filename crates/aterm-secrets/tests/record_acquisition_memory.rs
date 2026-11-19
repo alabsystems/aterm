@@ -13,7 +13,7 @@ use aterm_secrets::{
     commons::binding::Request,
     envelope, fsx,
     membership_log::{
-        Body, Draft, Entrant, EpochAudience, Inserted, Log, MAX_RECORD, MAX_RECORDS_STREAM, Record,
+        Body, Draft, Entrant, EpochAudience, Inserted, Log, MAX_RECORD, REPLY_CAP, Record,
         RecordId, decode_records, test_record_decode_attempts,
     },
     text::{Audience, Entry},
@@ -290,7 +290,7 @@ fn send_answer(
         Framing::Length | Framing::ShortLength | Framing::OversizedLength => {
             let declared = match framing {
                 Framing::ShortLength => bytes.len() + 19,
-                Framing::OversizedLength => MAX_RECORDS_STREAM + 1,
+                Framing::OversizedLength => REPLY_CAP + 1,
                 _ => bytes.len(),
             };
             write!(stream, "Content-Length: {declared}\r\n\r\n")?;
@@ -309,7 +309,7 @@ fn send_answer(
             if matches!(framing, Framing::OversizedChunk) {
                 // The announced next chunk exceeds the real response limit.
                 // No huge fixture allocation or transmission is needed.
-                write!(stream, "{:x}\r\n", MAX_RECORDS_STREAM + 1)?;
+                write!(stream, "{:x}\r\n", REPLY_CAP + 1)?;
             } else {
                 stream.write_all(match framing {
                     Framing::BadChunk => b"not-hex\r\n",
@@ -681,7 +681,7 @@ fn transport_failure_after_layout(framing: Framing, status: u16) {
     );
     let failed = http
         .get(&format!("{}/records?have=", fixture.host.url()))
-        .limit(MAX_RECORDS_STREAM)
+        .limit(REPLY_CAP)
         .send_phased(&[])
         .unwrap_err();
     assert_eq!(failed.phase, aterm_http::Phase::Answered);
@@ -693,7 +693,7 @@ fn transport_failure_after_layout(framing: Framing, status: u16) {
             assert!(matches!(&failed.error, aterm_http::Error::Protocol(_)))
         }
         Framing::OversizedLength | Framing::OversizedChunk => assert!(
-            matches!(&failed.error, aterm_http::Error::TooLarge { limit } if *limit == MAX_RECORDS_STREAM)
+            matches!(&failed.error, aterm_http::Error::TooLarge { limit } if *limit == REPLY_CAP)
         ),
         _ => unreachable!(),
     }

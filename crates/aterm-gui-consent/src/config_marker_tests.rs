@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::{Flush, read_marker, remove_marker, write_marker};
+use super::{Flush, create_marker, read_marker, remove_marker, take_free_name, write_marker};
 
 fn scratch(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -118,6 +118,49 @@ fn the_parent_directory_is_created_on_demand() {
     write_marker(&marker, "ok", 64, Flush::Durable).unwrap();
     assert_eq!(read_marker(&marker, 64).as_deref(), Some("ok"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A marker made only where none stands lands whole where nothing is there and leaves no
+/// temporary file beside it; where a marker stands, however recently another writer put it
+/// there, it is left as it is.
+#[test]
+fn a_created_marker_never_lands_over_one_that_stands() {
+    let root = aterm_tempfile::TempDir::new().expect("a private marker fixture");
+    let marker = root.path().join("observed");
+    assert!(create_marker(&marker, "first", 64, Flush::Ordered).unwrap());
+    assert_eq!(read_marker(&marker, 64).as_deref(), Some("first"));
+    assert!(!create_marker(&marker, "second", 64, Flush::Ordered).unwrap());
+    assert_eq!(read_marker(&marker, 64).as_deref(), Some("first"));
+    assert_eq!(
+        std::fs::read_dir(root.path()).unwrap().count(),
+        1,
+        "no temporary file is left"
+    );
+}
+
+/// On a volume that takes no hard link (an SMB home refuses `link(2)`), a marker made only where
+/// none stands still lands where nothing is there, and still leaves one that stands as it is.
+/// NEGATIVE CONTROL: returning the link's refusal as the error saves nothing on such a volume.
+#[test]
+fn a_volume_with_no_hard_links_still_takes_a_free_name_and_leaves_a_taken_one() {
+    let root = aterm_tempfile::TempDir::new().expect("a private marker fixture");
+    let refused = |_: &std::path::Path, _: &std::path::Path| {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    };
+    let marker = root.path().join("observed");
+    let tmp = root.path().join("observed.tmp");
+    std::fs::write(&tmp, "first").unwrap();
+    assert!(
+        take_free_name(&tmp, &marker, refused).unwrap(),
+        "a free name is taken"
+    );
+    assert_eq!(read_marker(&marker, 64).as_deref(), Some("first"));
+    std::fs::write(&tmp, "second").unwrap();
+    assert!(
+        !take_free_name(&tmp, &marker, refused).unwrap(),
+        "a taken name is left"
+    );
+    assert_eq!(read_marker(&marker, 64).as_deref(), Some("first"));
 }
 
 /// A failed exclusive create owns no temporary file to remove. CONTROL:

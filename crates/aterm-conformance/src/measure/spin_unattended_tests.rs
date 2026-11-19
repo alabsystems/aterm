@@ -24,54 +24,142 @@ const TRAIL: &str = "OK 1\ntrail style=\"rainbow\" resolved=rainbow-kitty focuse
                      pet_deep=true word_icons=none resting=false attended=false sight=visible \
                      lane_term=none";
 
-/// The opening `metrics` line, read just after `metrics reset`: the reads' own wakes, no fire.
-const OPENED: &str = "OK frames=0 past_deadline_arms=0 event_wakes=2 timer_wakes=0 \
-                      os_window_events=0 os_window_events_by_kind=none \
-                      deadline_fires_by_owner=none";
+/// The `metrics` line read just after the readiness wait's last read, since the `metrics reset`
+/// just before it: that read's own wake, a desk mark, and no fire yet.
+const READY: &str = "OK frames=0 past_deadline_arms=0 event_wakes=1 timer_wakes=0 \
+                     os_window_events=0 os_window_events_by_kind=none desk_activity=1 \
+                     deadline_fires_by_owner=none max_wake_late_ms=0.40 max_turn_ms=2.10 \
+                     wakes_by_variant=TrailStatus:1";
 
-/// A closing `metrics` line: `frames` frames, `fires` as `deadline_fires_by_owner` pairs (their
-/// sum the timer wakes), `events` window events (focus changes) and `wakes` loop wakes since the
-/// reset.
+/// The `metrics` line as the window opened, the settle after [`READY`]: a reading and its frame,
+/// and the journal's settle capture and the facts' read the ready read owed, with no mark more.
+const OPENED: &str = "OK frames=1 past_deadline_arms=0 event_wakes=4 timer_wakes=3 \
+                      os_window_events=0 os_window_events_by_kind=none desk_activity=1 \
+                      deadline_fires_by_owner=crash_journal:1,disk_facts:1,system_vitals:1 \
+                      max_wake_late_ms=0.40 max_turn_ms=2.10 \
+                      wakes_by_variant=TrailStatus:1,Vitals:1";
+
+/// What a window did from [`OPENED`] to its close, which [`Window::line`] adds to that line's
+/// counts as the closing `metrics` line holds them, since the reset.
+#[derive(Clone, Copy)]
+struct Window<'a> {
+    /// Frames presented.
+    frames: u64,
+    /// `deadline_fires_by_owner` pairs; their sum is the timer wakes.
+    fires: &'a str,
+    /// Window events since the reset (focus changes).
+    events: u64,
+    /// Loop wakes.
+    wakes: u64,
+    /// Desk marks.
+    marks: u64,
+    /// The latest `max_wake_late_ms` and `max_turn_ms` since the reset.
+    late_ms: (&'a str, &'a str),
+    /// The census since the reset.
+    census: &'a str,
+}
+
+impl Window<'_> {
+    /// The closing line, from [`OPENED`]'s counts and this window's.
+    fn line(self) -> String {
+        let counted = |key: &str| uint_field(OPENED, key).expect("an OPENED count");
+        let mut fires: Vec<(String, u64)> = field(OPENED, "deadline_fires_by_owner")
+            .expect("OPENED's fires")
+            .split(',')
+            .filter_map(|pair| {
+                let (owner, n) = pair.split_once(':')?;
+                Some((owner.to_string(), n.parse().ok()?))
+            })
+            .collect();
+        let mut timer_wakes = 0;
+        for pair in self.fires.split(',').filter(|pair| !pair.is_empty()) {
+            let (owner, n) = pair.split_once(':').expect("owner:count");
+            let n: u64 = n.parse().expect("a count");
+            timer_wakes += n;
+            match fires.iter_mut().find(|(o, _)| o == owner) {
+                Some((_, total)) => *total += n,
+                None => fires.push((owner.to_string(), n)),
+            }
+        }
+        let fires = fires
+            .iter()
+            .map(|(owner, n)| format!("{owner}:{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let kinds = if self.events == 0 {
+            "none".to_string()
+        } else {
+            format!("focus:{}", self.events)
+        };
+        format!(
+            "OK frames={} past_deadline_arms=1 event_wakes={} timer_wakes={} \
+             os_window_events={} os_window_events_by_kind={kinds} desk_activity={} \
+             deadline_fires_by_owner={fires} max_wake_late_ms={} max_turn_ms={} \
+             wakes_by_variant={}",
+            counted("frames") + self.frames,
+            counted("event_wakes") + self.wakes,
+            counted("timer_wakes") + timer_wakes,
+            self.events,
+            counted("desk_activity") + self.marks,
+            self.late_ms.0,
+            self.late_ms.1,
+            self.census
+        )
+    }
+}
+
+/// A window of `frames` frames, `fires`, `events` window events and `wakes` loop wakes, with one
+/// desk mark (a host note's) and a loop on its timers.
+fn window(frames: u64, fires: &str, events: u64, wakes: u64) -> Window<'_> {
+    Window {
+        frames,
+        fires,
+        events,
+        wakes,
+        marks: 1,
+        late_ms: ("0.40", "2.10"),
+        census: "Vitals:14,HostNote.ProgramCheckUnstuck:1,TrailStatus:1",
+    }
+}
+
+/// [`window`]'s closing line.
 fn ended(frames: u64, fires: &str, events: u64, wakes: u64) -> String {
-    let kinds = if events == 0 {
-        "none".to_string()
-    } else {
-        format!("focus:{events}")
-    };
-    let timer_wakes: u64 = fires
-        .split(',')
-        .filter_map(|pair| pair.split_once(':')?.1.parse::<u64>().ok())
-        .sum();
-    format!(
-        "OK frames={frames} past_deadline_arms=1 event_wakes={wakes} timer_wakes={timer_wakes} \
-         os_window_events={events} os_window_events_by_kind={kinds} \
-         deadline_fires_by_owner={fires}"
-    )
+    window(frames, fires, events, wakes).line()
 }
 
-/// A quiet window's close: 12 readings and the band's poll once, a frame each, and the crash
-/// journal's timers.
+/// A quiet window's close: 12 readings and the band's poll once, a frame each, and the journal's
+/// settle and the facts' read its host note owes.
 fn quiet() -> String {
-    ended(13, "system_vitals:13,crash_journal:4", 0, 40)
+    ended(13, "system_vitals:13,crash_journal:1,disk_facts:1", 0, 40)
 }
 
-/// The decision of a 60 s window the bench's clock read as at most 60.15 s.
-fn take_with(
+/// The decision of a 60 s window the bench's clock read as at most 60.15 s, opened on `opened`.
+fn decide_all(
     ended: &str,
-    opened_trail: &str,
+    ready_trail: &str,
     ended_trail: &str,
+    opened: &str,
 ) -> Result<UnattendedDecision, CouldNotRun> {
     decide(
         &ROW,
         &UnattendedReadings {
             at_least: Duration::from_secs(60),
             at_most: Duration::from_millis(60_150),
-            opened: OPENED,
+            ready_trail,
+            ready: READY,
+            opened,
             ended,
-            opened_trail,
             ended_trail,
         },
     )
+}
+
+fn take_with(
+    ended: &str,
+    ready_trail: &str,
+    ended_trail: &str,
+) -> Result<UnattendedDecision, CouldNotRun> {
+    decide_all(ended, ready_trail, ended_trail, OPENED)
 }
 
 fn take(ended: &str) -> Result<UnattendedDecision, CouldNotRun> {
@@ -94,6 +182,10 @@ fn fired(blink: u64, live: u64, timer_wakes: u64) -> UnattendedCounts {
         frames: 0,
         wakes: 0,
         arms: 0,
+        journal: 0,
+        facts: 0,
+        marks: 1,
+        late: Duration::ZERO,
     }
 }
 
@@ -119,6 +211,10 @@ fn the_bounds_count_the_slots_each_period_has_in_the_window() {
             frames_max: 15,
             frames_late_max: 15,
             wakes_max: 180,
+            journal_max: 2,
+            facts_max: 1,
+            journal_spilled: 0,
+            facts_spilled: 0,
         }
     );
     assert_eq!(
@@ -132,6 +228,10 @@ fn the_bounds_count_the_slots_each_period_has_in_the_window() {
             frames_max: 35,
             frames_late_max: 48,
             wakes_max: 233,
+            journal_max: 2,
+            facts_max: 1,
+            journal_spilled: 0,
+            facts_spilled: 0,
         },
         "a blink that ran for part of the window"
     );
@@ -174,6 +274,10 @@ fn the_bounds_count_the_slots_each_period_has_in_the_window() {
             frames_max: 2,
             frames_late_max: 2,
             wakes_max: 180,
+            journal_max: 2,
+            facts_max: 1,
+            journal_spilled: 0,
+            facts_spilled: 0,
         },
         "a window of no length holds at most the slot it opens on"
     );
@@ -194,7 +298,7 @@ fn a_quiet_unattended_window_passes() {
             decision.counts.blink,
             decision.counts.timer_wakes
         ),
-        (13, 13, 0, 17)
+        (13, 13, 0, 15)
     );
     let shown = decision.to_string();
     assert!(
@@ -202,14 +306,21 @@ fn a_quiet_unattended_window_passes() {
         "{shown}"
     );
     assert!(
-        shown.contains("opened=[focused=true attended=false sight=visible"),
+        shown.contains(
+            "marks=1 late=2.5ms journal=1 journal_max=2 journal_spilled=0 facts=1 facts_max=1 \
+             facts_spilled=0"
+        ),
+        "the settle's reading and the ready read's own work owe the window nothing: {shown}"
+    );
+    assert!(
+        shown.contains("ready=[focused=true attended=false sight=visible"),
         "{shown}"
     );
     assert!(!shown.contains("why="), "{shown}");
     assert_eq!(
         verdict(&ended(
             126,
-            "blink:113,system_vitals:13,crash_journal:4",
+            "blink:113,system_vitals:13,crash_journal:1",
             0,
             200
         )),
@@ -265,7 +376,7 @@ fn a_reading_cadence_that_fell_behind_is_undecided_not_a_pass() {
     for (what, fires) in [
         ("ten readings", "system_vitals:10"),
         ("two slots missed beside the poll", "system_vitals:11"),
-        ("no reading", "crash_journal:4"),
+        ("no reading", "crash_journal:1"),
     ] {
         let decision = take(&ended(10, fires, 0, 40)).expect("decided");
         assert_eq!(
@@ -438,7 +549,8 @@ fn a_frameless_poller_fails_on_its_wakes() {
 }
 
 /// A window event in the window refuses the take, as does an edge whose window is not focused,
-/// unattended, on glass and with its pet asleep or not drawn; a pet the window does not draw is
+/// unattended, on glass and with its pet asleep or not drawn: the readiness wait's last read,
+/// which stands for the opening edge, or the closing read. A pet the window does not draw is
 /// still; a build whose replies lack the fields leaves the take unanswered.
 #[test]
 fn a_window_event_refuses_the_take() {
@@ -463,13 +575,16 @@ fn a_window_event_refuses_the_take() {
     ] {
         let lost = TRAIL.replacen(from, to, 1);
         for (edge, result) in [
-            ("opened", take_with(&quiet(), &lost, TRAIL)),
-            ("ended", take_with(&quiet(), TRAIL, &lost)),
+            (
+                "as the readiness wait read it, before its settle",
+                take_with(&quiet(), &lost, TRAIL),
+            ),
+            ("as its window ended", take_with(&quiet(), TRAIL, &lost)),
         ] {
             match result {
                 Err(CouldNotRun::Refused(why)) => assert!(
-                    why.contains(&format!("read {off} as its window {edge}")),
-                    "{from} -> {to} at {edge}: {why}"
+                    why.contains(&format!("read {off} {edge}")),
+                    "{from} -> {to} {edge}: {why}"
                 ),
                 other => panic!("{from} -> {to} at {edge}: {other:?}"),
             }
@@ -495,6 +610,308 @@ fn a_window_event_refuses_the_take() {
             "ctl metrics does not report os_window_events".into()
         ))
     );
+}
+
+/// The crash journal and the disk facts fire for the desk marks, never on their own: two journal
+/// fires a mark at most (a capture deferred to its write interval, and its settle) and one read
+/// of the panes' facts. One host note's are a pass, and past them each fails by its owner's name;
+/// a window with no mark owes none, whatever its census names, a wake that only observes owing
+/// nothing (a surface ready to draw, a reading). Lines that lack the marks or the lateness leave
+/// the take unanswered.
+#[test]
+fn the_journal_and_the_facts_fire_only_for_the_marks_that_owe_them() {
+    let with = |fires: &str, marks: u64, census: &str| {
+        let fires = if fires.is_empty() {
+            "system_vitals:13".to_string()
+        } else {
+            format!("system_vitals:13,{fires}")
+        };
+        take(
+            &Window {
+                marks,
+                census,
+                ..window(13, &fires, 0, 40)
+            }
+            .line(),
+        )
+    };
+    let note = "Vitals:14,HostNote.ProgramCheckUnstuck:1,TrailStatus:1";
+    let owed = with("crash_journal:1,disk_facts:1", 1, note).expect("decided");
+    assert_eq!(owed.verdict, Disposition::Pass, "{owed}");
+    assert_eq!(
+        (owed.counts.journal, owed.counts.facts, owed.counts.marks),
+        (1, 1, 1),
+        "the settle's fires are the ready read's own, outside the window"
+    );
+    assert_eq!((owed.bounds.journal_max, owed.bounds.facts_max), (2, 1));
+    assert_eq!(
+        with("crash_journal:2,disk_facts:1", 1, note).map(|d| d.verdict),
+        Ok(Disposition::Pass),
+        "a capture deferred to its write interval, and its settle"
+    );
+    for (fires, lane, n, max) in [
+        ("crash_journal:4,disk_facts:1", "crash_journal", 4, 2),
+        ("crash_journal:1,disk_facts:4", "disk_facts", 4, 1),
+        ("crash_journal:3", "crash_journal", 3, 2),
+        ("disk_facts:2", "disk_facts", 2, 1),
+    ] {
+        let decision = with(fires, 1, note).expect("decided");
+        assert_eq!(decision.verdict, Disposition::Fail, "{fires}: {decision}");
+        assert!(
+            decision.why.contains(&format!(
+                "{lane} fired {n} times, past the {max} its 1 desk marks in the settle and the \
+                 window owe"
+            )) && decision.why.ends_with("work no mark asked"),
+            "{fires}: {decision}"
+        );
+    }
+    let observed = "Vitals:14,GpuSurfaceReady:13,HostNote.DiskLooked:1,TrailStatus:1";
+    for (what, census) in [
+        ("readings alone", "Vitals:14,TrailStatus:1"),
+        ("observations", observed),
+    ] {
+        let alone = with("crash_journal:1", 0, census).expect("decided");
+        assert_eq!(alone.verdict, Disposition::Fail, "{what}: {alone}");
+        assert!(
+            alone
+                .why
+                .contains("crash_journal fired 1 times, past the 0"),
+            "{what}: {alone}"
+        );
+        assert_eq!(
+            with("", 0, census).map(|d| d.verdict),
+            Ok(Disposition::Pass),
+            "{what}, no fire"
+        );
+    }
+    assert_eq!(
+        with("crash_journal:4,disk_facts:2", 2, note).map(|d| d.verdict),
+        Ok(Disposition::Pass),
+        "two marks"
+    );
+    let unmarked = quiet().replace(" desk_activity=2", "");
+    assert!(!unmarked.contains("desk_activity"), "{unmarked}");
+    assert_eq!(
+        take(&unmarked),
+        Err(CouldNotRun::Unanswered(
+            "ctl metrics does not report desk_activity".into()
+        ))
+    );
+    let unread = READY.replace(" desk_activity=1", "");
+    assert_eq!(
+        decide(
+            &ROW,
+            &UnattendedReadings {
+                at_least: Duration::from_secs(60),
+                at_most: Duration::from_millis(60_150),
+                ready_trail: TRAIL,
+                ready: &unread,
+                opened: OPENED,
+                ended: &quiet(),
+                ended_trail: TRAIL,
+            },
+        ),
+        Err(CouldNotRun::Unanswered(
+            "ctl metrics does not report desk_activity".into()
+        )),
+        "the line the marks count from"
+    );
+    let unturned = quiet().replace(" max_turn_ms=2.10", "");
+    assert_eq!(
+        take(&unturned),
+        Err(CouldNotRun::Unanswered(
+            "ctl metrics does not report max_wake_late_ms and max_turn_ms".into()
+        ))
+    );
+}
+
+/// A mark in the settle may book its work in the window, so it owes there: a host note in the
+/// settle beside the window's admits four journal fires and two reads, and no more.
+#[test]
+fn a_mark_in_the_settle_owes_its_work_in_the_window() {
+    let noted = OPENED.replacen("desk_activity=1", "desk_activity=2", 1);
+    let close = |fires: &str| {
+        Window {
+            marks: 2,
+            ..window(13, fires, 0, 40)
+        }
+        .line()
+    };
+    let owed = decide_all(
+        &close("system_vitals:13,crash_journal:4,disk_facts:2"),
+        TRAIL,
+        TRAIL,
+        &noted,
+    )
+    .expect("decided");
+    assert_eq!(owed.verdict, Disposition::Pass, "{owed}");
+    assert_eq!(
+        (
+            owed.counts.marks,
+            owed.bounds.journal_max,
+            owed.bounds.facts_max
+        ),
+        (2, 4, 2)
+    );
+    for (fires, lane, n, max) in [
+        ("crash_journal:5,disk_facts:2", "crash_journal", 5, 4),
+        ("crash_journal:4,disk_facts:3", "disk_facts", 3, 2),
+    ] {
+        let decision = decide_all(
+            &close(&format!("system_vitals:13,{fires}")),
+            TRAIL,
+            TRAIL,
+            &noted,
+        )
+        .expect("decided");
+        assert_eq!(decision.verdict, Disposition::Fail, "{fires}: {decision}");
+        assert!(
+            decision.why.contains(&format!(
+                "{lane} fired {n} times, past the {max} its 2 desk marks in the settle and the \
+                 window owe"
+            )),
+            "{fires}: {decision}"
+        );
+    }
+}
+
+/// The work the marks before the settle owe ends inside it on a loop that ran less late than its
+/// steps leave room for: the journal's `k`th step of 2 s and the lateness lands in the window
+/// from `k·(2 s + late) ≥ 5 s`, its second from 0.5 s late and both from 3 s, and the facts' one
+/// of 1 s from 4 s. Up to the first, journal or facts fires past the window's marks fail; past
+/// it, fires by no more than the steps that may land there leave the take undecided, the late
+/// loop named, and more still fail it, as does the other lane's breach. The lateness is the
+/// closing line's slowest timer wake and longest turn together.
+#[test]
+fn work_owed_before_the_settle_is_no_evidence_on_a_late_loop() {
+    for (steps, step, late_us, n) in [
+        (2, MIN_WRITE_INTERVAL, 499_999, 0),
+        (2, MIN_WRITE_INTERVAL, 500_000, 1),
+        (2, MIN_WRITE_INTERVAL, 2_999_999, 1),
+        (2, MIN_WRITE_INTERVAL, 3_000_000, 2),
+        (2, MIN_WRITE_INTERVAL, u64::MAX, 2),
+        (1, FACTS_EVERY, 3_999_999, 0),
+        (1, FACTS_EVERY, 4_000_000, 1),
+        (0, FACTS_EVERY, 4_000_000, 0),
+        (2, Duration::ZERO, 0, 0),
+    ] {
+        assert_eq!(
+            spilled(steps, step, Duration::from_micros(late_us)),
+            n,
+            "{steps} steps of {step:?} on a loop {late_us} µs late"
+        );
+    }
+    assert_eq!(
+        late("OK max_wake_late_ms=249.99 max_turn_ms=250.00"),
+        Some(Duration::from_micros(499_990))
+    );
+    let on = |late_ms: (&'static str, &'static str), fires: &str| {
+        take(
+            &Window {
+                marks: 0,
+                late_ms,
+                ..window(13, &format!("system_vitals:13,{fires}"), 0, 40)
+            }
+            .line(),
+        )
+        .expect("decided")
+    };
+    let on_time = on(("249.99", "250.00"), "crash_journal:1");
+    assert_eq!(on_time.verdict, Disposition::Fail, "{on_time}");
+    assert!(
+        on_time
+            .why
+            .contains("crash_journal fired 1 times, past the 0")
+            && on_time.why.ends_with("work no mark asked"),
+        "{on_time}"
+    );
+    let late_loop = on(("250.00", "250.00"), "crash_journal:1");
+    assert_eq!(late_loop.verdict, Disposition::Unproved, "{late_loop}");
+    assert_eq!(late_loop.bounds.journal_spilled, 1, "{late_loop}");
+    assert!(
+        late_loop.why.contains(
+            "crash_journal fired 1 times, past the 0 its 0 desk marks in the settle and the \
+             window owe (2 a mark: a capture and its settle), by no more than the 1 the marks \
+             before the settle may book there on a loop that ran up to 500ms late"
+        ) && late_loop.why.ends_with("no evidence"),
+        "{late_loop}"
+    );
+    let past = on(("250.00", "250.00"), "crash_journal:2");
+    assert_eq!(past.verdict, Disposition::Fail, "{past}");
+    assert!(
+        past.why.contains(
+            "crash_journal fired 2 times, past the 0 its 0 desk marks in the settle and the \
+             window owe (2 a mark: a capture and its settle) and the 1 the marks before the \
+             settle may book there on a loop that ran up to 500ms late: work no mark asked"
+        ),
+        "{past}"
+    );
+    assert_eq!(
+        on(("3000.00", "0.00"), "crash_journal:2").verdict,
+        Disposition::Unproved,
+        "both of the journal's steps"
+    );
+    let rearmed = on(("3000.00", "0.00"), "crash_journal:24");
+    assert_eq!(
+        rearmed.verdict,
+        Disposition::Fail,
+        "a journal re-armed every 2.5 s fails however late its loop ran: {rearmed}"
+    );
+    assert!(
+        rearmed.why.contains("crash_journal fired 24 times"),
+        "{rearmed}"
+    );
+    for (late_ms, fires, verdict) in [
+        (("250.00", "250.00"), "disk_facts:1", Disposition::Fail),
+        (("3999.99", "0.00"), "disk_facts:1", Disposition::Fail),
+        (
+            ("3000.00", "1000.00"),
+            "disk_facts:1",
+            Disposition::Unproved,
+        ),
+        (("3000.00", "1000.00"), "disk_facts:2", Disposition::Fail),
+        (("3000.00", "1000.00"), "disk_facts:12", Disposition::Fail),
+    ] {
+        assert_eq!(
+            on(late_ms, fires).verdict,
+            verdict,
+            "{fires} at {late_ms:?}"
+        );
+    }
+    let both = on(("250.00", "250.00"), "crash_journal:1,disk_facts:1");
+    assert_eq!(both.verdict, Disposition::Fail, "{both}");
+    assert!(
+        both.why.contains("disk_facts fired 1 times, past the 0")
+            && !both.why.contains("crash_journal"),
+        "the journal's excess is no evidence, the facts' still a breach: {both}"
+    );
+}
+
+/// A window event from the reset before the readiness wait's last read to the window's end
+/// refuses the take, wherever it came: the closing line's count holds the settle's, so one there
+/// refuses as one in the window does.
+#[test]
+fn a_window_event_in_the_settle_refuses_the_take() {
+    let touched = OPENED.replacen(
+        "os_window_events=0 os_window_events_by_kind=none",
+        "os_window_events=1 os_window_events_by_kind=focus:1",
+        1,
+    );
+    match decide_all(
+        &ended(13, "system_vitals:13", 1, 40),
+        TRAIL,
+        TRAIL,
+        &touched,
+    ) {
+        Err(CouldNotRun::Refused(why)) => assert!(
+            why.contains(
+                "took 1 event other than a redraw (focus:1) from just before the \
+                          readiness wait's last read"
+            ),
+            "{why}"
+        ),
+        other => panic!("one event in the settle: {other:?}"),
+    }
 }
 
 /// The unattended scene runs at the shipped motion, rest and effect defaults: its head writes

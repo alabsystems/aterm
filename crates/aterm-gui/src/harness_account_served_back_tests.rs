@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Served evidence after a strike lifts a stale signed-out word through the one writer
-//! ([`WorkerIdle::served_back`]): a served point ([`WorkerIdle::claude_login_seen`]), a break's
-//! served turn dated by its reply ([`IdleHost::login_served_at`]) and a usage-tap reading
-//! ([`WorkerIdle::tap_lifts`]) on the struck row's own stored login, dated after the strike. A
-//! lift is no sign-in ([`accounts::note_served_back`]): the ledger records the word's return
-//! (`auth`), never `signed-in`, and the login's renewal and notice stand. Claude Code's `Please
-//! run /login` after a Cloudflare 403 struck an account on `m16` on 2026-11-13 while its login
-//! served all day, and nothing lifted the word: the tap fold leaves the word alone, and a cruise
-//! break's turn under background work was told no served point. A turn end
-//! ([`WorkerIdle::login_served`]) is no such evidence: the TurnEnd point is asked at idle points
-//! no turn worked to, so it lifts nothing.
+//! Served evidence after a strike is a served reading of the struck row's own stored login
+//! ([`WorkerIdle::served_seen`], [`accounts::observe_served`]), dated by its own evidence: a
+//! served point ([`WorkerIdle::claude_login_seen`]), a break's served turn dated by its reply
+//! ([`IdleHost::login_served_at`]) and a usage-tap reading ([`WorkerIdle::tap_served`]). The
+//! login verdict folds it against the strike by date (plan package UB-04): a reading newer than
+//! the strike reads the row signed in, and nothing lifts the strike, which stays on record. It is
+//! no sign-in: the ledger records the word's return (`auth`), never `signed-in`, and the login's
+//! renewal and notice stand. Claude Code's `Please run /login` after a Cloudflare 403 struck an
+//! account on `m16` on 2026-11-13 while its login served all day, and the stored word held: the
+//! tap fold left the word alone, and a cruise break's turn under background work was told no
+//! served point. A turn end's own time ([`WorkerIdle::login_served`]) is no such evidence: the
+//! TurnEnd point is asked at idle points no turn worked to. The replies its process's transcript
+//! already holds are, each dated by its row ([`WorkerIdle::transcript_served`]), so the first look
+//! of a build that keeps the fold reads the service an older build's strike stood against. A wall
+//! is dated by its first sighting on its process's screen ([`WorkerIdle::wall_sighted`]), and a
+//! wall that process draws after it ran a turn or served is a new one.
 
 use super::*;
 
@@ -114,9 +119,181 @@ fn an_idle_tabs_turn_end_never_lifts_another_tabs_strike() {
     assert_eq!(due(&a), ["main"]);
 }
 
-/// A SERVED POINT ([`LoginSeen::Served`]) ON THE STRUCK ROW'S OWN STORED LOGIN LIFTS IT THROUGH
-/// THE SAME WRITER, recording the word's return and no sign-in, and does nothing at the strike's
-/// own second.
+/// AN IDLE TAB'S OLD WALL, ASKED AGAIN, NEVER STRIKES A LOGIN THAT SERVED SINCE (the m16 shape):
+/// `s-tab-a`'s wall struck `main` and its screen still shows it; `s-tab-b` on the same login then
+/// served a point, so `main` reads signed in. Hours later `s-tab-a`, idle, is asked its LoginEnded
+/// point again on account news: the wall is dated by its first sighting on that process's screen
+/// ([`WorkerIdle::wall_sighted`]), so it renews nothing, `main` stays signed in and no login end
+/// is recorded again. Negative control: a wall dated when it is asked strikes `main` again.
+#[test]
+fn an_idle_tabs_old_wall_asked_again_never_strikes_a_login_that_served_since() {
+    let a = Accts::new();
+    std::fs::write(a.roster_path(), roster_text(&a.login_dir("work-2"))).unwrap();
+    std::fs::write(a.tmp.path().join("home").join(".claude.json"), OWN_PROFILE).unwrap();
+    a.spawn("s-tab-a", ACCT_TALK_A, "main");
+    a.spawn("s-tab-b", ACCT_TALK_B, "main");
+    let mut cfg = on();
+    cfg.set("accounts", "off").unwrap();
+    let tab_a = a.worker("s-tab-a", &cfg);
+    let tab_b = a.worker("s-tab-b", &cfg);
+    assert_eq!(tab_a.account(AccountPoint::LoginEnded), None);
+    assert_eq!(
+        a.state().account("main").auth,
+        accounts::Auth::SignedOut,
+        "PRECONDITION: s-tab-a's wall struck it"
+    );
+    a.now.store(ACCT_NOW + 60, Ordering::SeqCst);
+    tab_b.login_seen(LoginSeen::Served);
+    assert_eq!(
+        a.state().account("main").auth,
+        accounts::Auth::Ok,
+        "PRECONDITION: s-tab-b served since"
+    );
+    let ledger = a.ledger();
+    for later in [3_600, 5 * 3_600, 8 * 3_600] {
+        a.now.store(ACCT_NOW + later, Ordering::SeqCst);
+        let _ = tab_a.account(AccountPoint::LoginEnded);
+        assert_eq!(
+            a.state().account("main").auth,
+            accounts::Auth::Ok,
+            "asked again {later} s after the wall"
+        );
+    }
+    assert_eq!(a.ledger(), ledger, "nothing recorded");
+}
+
+/// A WALL ITS PROCESS DRAWS AFTER IT RAN A TURN IS A NEW ONE, DATED WHEN IT IS SEEN: `s-tab-a`'s
+/// wall struck `main` and `s-tab-b` served since, so `s-tab-a`'s old wall, asked again with no
+/// turn run, strikes nothing. Then the login really ends: `s-tab-a`'s process runs a turn
+/// ([`IdleHost::turn_ran`]) and draws its wall again. That wall is first sighted now, newer than
+/// `s-tab-b`'s service, and strikes `main` and ends its login, told at its point
+/// ([`LoginSeen::Lost`]) or asked at its account point ([`AccountPoint::LoginEnded`]) alike.
+/// NEGATIVE CONTROL (run): a sighting kept across the turn dates the new wall by the old one,
+/// and `main` stays signed in.
+#[test]
+fn a_wall_drawn_after_its_process_ran_a_turn_strikes_a_login_that_served_since() {
+    let a = Accts::new();
+    std::fs::write(a.roster_path(), roster_text(&a.login_dir("work-2"))).unwrap();
+    std::fs::write(a.tmp.path().join("home").join(".claude.json"), OWN_PROFILE).unwrap();
+    a.spawn("s-tab-a", ACCT_TALK_A, "main");
+    a.spawn("s-tab-b", ACCT_TALK_B, "main");
+    let mut cfg = on();
+    cfg.set("accounts", "off").unwrap();
+    let tab_a = a.worker("s-tab-a", &cfg);
+    let tab_b = a.worker("s-tab-b", &cfg);
+    assert_eq!(tab_a.account(AccountPoint::LoginEnded), None);
+    a.now.store(ACCT_NOW + 60, Ordering::SeqCst);
+    tab_b.login_seen(LoginSeen::Served);
+    a.now.store(ACCT_NOW + 3_600, Ordering::SeqCst);
+    let _ = tab_a.account(AccountPoint::LoginEnded);
+    assert_eq!(
+        a.state().account("main").auth,
+        accounts::Auth::Ok,
+        "PRECONDITION: the old wall, asked again with no turn run, strikes nothing"
+    );
+    assert_eq!(a.ledger(), ["auth", "login-ended", "auth"], "PRECONDITION");
+    tab_a.turn_ran();
+    a.now.store(ACCT_NOW + 3_700, Ordering::SeqCst);
+    tab_a.login_seen(LoginSeen::Lost);
+    assert_eq!(
+        a.state().account("main").auth,
+        accounts::Auth::SignedOut,
+        "the wall drawn after the turn strikes"
+    );
+    assert_eq!(
+        a.ledger(),
+        ["auth", "login-ended", "auth", "auth", "login-ended"]
+    );
+    a.now.store(ACCT_NOW + 3_760, Ordering::SeqCst);
+    tab_b.login_seen(LoginSeen::Served);
+    assert_eq!(a.state().account("main").auth, accounts::Auth::Ok);
+    tab_a.turn_ran();
+    a.now.store(ACCT_NOW + 7_200, Ordering::SeqCst);
+    let _ = tab_a.account(AccountPoint::LoginEnded);
+    assert_eq!(
+        a.state().account("main").auth,
+        accounts::Auth::SignedOut,
+        "asked at its account point, the new wall strikes too"
+    );
+    assert_eq!(a.ledger().last(), Some(&"login-ended"), "{:?}", a.ledger());
+    assert_eq!(due(&a), ["main"]);
+}
+
+/// A TURN END ON A STRUCK ROW READS THE REPLY ITS PROCESS ALREADY WROTE
+/// ([`WorkerIdle::transcript_served`]): an hour after `main`'s strike, its process's transcript
+/// holds a reply from before the strike, which says nothing after it, so `main` stays signed out
+/// and the log says why. Once it holds one written half an hour after the strike, the next turn
+/// end records that reply as a served reading dated by its row: `main` reads signed in, the
+/// ledger records the word's return and no sign-in, and its sign-in is no longer due.
+/// NEGATIVE CONTROL (run): a turn end that reads no transcript leaves `main` signed out.
+#[test]
+fn a_turn_end_on_a_struck_row_folds_the_reply_its_process_wrote_since() {
+    let (a, idle) = struck(OWN_PROFILE);
+    a.now.store(ACCT_NOW + 3_600, Ordering::SeqCst);
+    a.replied(ACCT_TALK_A, ACCT_NOW - 50);
+    let _ = idle.account(AccountPoint::TurnEnd);
+    assert_eq!(a.state().account("main").auth, accounts::Auth::SignedOut);
+    assert!(
+        said(&idle).is_some_and(|s| s.contains("not after its strike")),
+        "{:?}",
+        said(&idle)
+    );
+    a.replied(ACCT_TALK_A, ACCT_NOW + 1_800);
+    let _ = idle.account(AccountPoint::TurnEnd);
+    assert_eq!(a.state().account("main").auth, accounts::Auth::Ok);
+    assert_eq!(a.state().account("main").auth_at, Some(ACCT_NOW + 1_800));
+    assert_eq!(a.ledger(), ["auth", "login-ended", "auth"]);
+    assert!(due(&a).is_empty(), "{:?}", due(&a));
+}
+
+/// THE FIRST LOOK ON A STRIKE AN OLDER BUILD RECORDED READS THE SERVICE ITS PROCESS WROTE SINCE:
+/// `state.json` holds `main`'s word signed out at the wall and no ledger (the build that struck
+/// it kept none), and `logins.json` a served clock that build's idle points re-stamped since,
+/// with no turn worked to them. On this build's first turn-end point, with no reply in its
+/// process's transcript since the wall, the re-stamped clock reads nothing and `main` stays
+/// signed out; once the transcript holds a reply written after the wall, the next turn end reads
+/// `main` signed in, with no new turn served. NEGATIVE CONTROL (run): a turn end that reads no
+/// transcript leaves `main` signed out on the older build's records.
+#[test]
+fn the_first_look_on_an_older_builds_strike_reads_the_service_its_process_wrote() {
+    let a = Accts::new();
+    std::fs::write(a.roster_path(), roster_text(&a.login_dir("work-2"))).unwrap();
+    std::fs::write(a.tmp.path().join("home").join(".claude.json"), OWN_PROFILE).unwrap();
+    a.spawn("s-old", ACCT_TALK_A, "main");
+    a.store()
+        .transact_logins(ACCT_NOW, &mut None, |state, logins| {
+            let main = state.accounts.entry("main".into()).or_default();
+            main.auth = accounts::Auth::SignedOut;
+            main.auth_at = Some(ACCT_NOW);
+            let binding = logins.labels.entry("main".into()).or_default();
+            binding.ended_at = Some(ACCT_NOW);
+            binding.served_at = Some(ACCT_NOW + 3_000);
+            Ok(Vec::new())
+        })
+        .expect("the older build's records");
+    assert!(
+        a.state().account("main").login.kept_nothing(),
+        "PRECONDITION: no ledger"
+    );
+    let mut cfg = on();
+    cfg.set("accounts", "off").unwrap();
+    let idle = a.worker("s-old", &cfg);
+    a.now.store(ACCT_NOW + 3_600, Ordering::SeqCst);
+    let _ = idle.account(AccountPoint::TurnEnd);
+    assert_eq!(
+        a.state().account("main").auth,
+        accounts::Auth::SignedOut,
+        "CONTROL: a re-stamped served clock reads nothing"
+    );
+    a.replied(ACCT_TALK_A, ACCT_NOW + 1_800);
+    let _ = idle.account(AccountPoint::TurnEnd);
+    assert_eq!(a.state().account("main").auth, accounts::Auth::Ok);
+    assert_eq!(a.ledger(), ["auth"]);
+}
+
+/// A SERVED POINT ([`LoginSeen::Served`]) ON THE STRUCK ROW'S OWN STORED LOGIN IS NEWER EVIDENCE
+/// THAN THE STRIKE, so the row reads signed in, recording the word's return and no sign-in; a
+/// point in the strike's own second decides nothing.
 #[test]
 fn a_served_point_after_a_strike_signs_its_own_login_back_in() {
     let (a, idle) = struck(OWN_PROFILE);
@@ -241,7 +418,7 @@ fn served_evidence_whose_login_file_names_another_account_lifts_nothing() {
         "PRECONDITION"
     );
     let before = a.ledger_len();
-    assert!(!idle.served_back(&seat, &roster, &look, "main", a.clock(), "test"));
+    assert!(!idle.served_seen(&seat, &roster, &look, "main", a.clock(), "test"));
     assert_eq!(a.state().account("main").auth, accounts::Auth::SignedOut);
     assert_eq!(a.ledger_len(), before);
     assert!(
@@ -256,12 +433,13 @@ fn served_evidence_whose_login_file_names_another_account_lifts_nothing() {
 /// bot check, and the login served for hours while its row stayed signed out): a lost login the
 /// host is told ends `main`'s login and makes its sign-in due; the sign-in is blocked, a later
 /// look stamps the word again, and the sign-in is blocked again. A point its own stored-login
-/// process then serves signs it in with no hand edit: the word is ok, the blocked sign-in is
-/// dropped, its end is no longer the login's and aterm's sign-in ladder has nothing due. No
-/// credential changed, so the heal is no sign-in: the login's renewal (an in-place sign-in three
-/// days before) and its unset notice stand, and the ledger records the word's return, never
-/// `signed-in`. Negative controls: a served point under a profile naming another account changes
-/// nothing, and a lost login after the heal ends the login again.
+/// process then serves signs it in with no hand edit: the served reading is the newest evidence,
+/// so the word is ok, the blocked sign-in is dropped and aterm's sign-in ladder has nothing due,
+/// while the login's end stays on record as the evidence it was. No credential changed, so the
+/// heal is no sign-in: the login's renewal (an in-place sign-in three days before) and its unset
+/// notice stand, and the ledger records the word's return, never `signed-in`. Negative
+/// controls: a served point under a profile naming another account changes nothing, and a lost
+/// login after the heal ends the login again.
 #[test]
 fn a_login_ended_with_its_sign_in_blocked_heals_by_its_own_served_point() {
     const BOT_CHECK: &str = "mailbox: the sign-in did not finish; it met Cloudflare's bot \
@@ -363,7 +541,7 @@ fn a_login_ended_with_its_sign_in_blocked_heals_by_its_own_served_point() {
     );
     profile(OWN_PROFILE);
     idle.login_seen(LoginSeen::Served);
-    assert_eq!(facts(), (accounts::Auth::Ok, false, None), "healed");
+    assert_eq!(facts(), (accounts::Auth::Ok, false, Some(ended)), "healed");
     assert_eq!(due(&a), Vec::<String>::new());
     assert_eq!(a.ledger().last(), Some(&"auth"), "{:?}", a.ledger());
     assert!(!a.ledger().contains(&"signed-in"), "{:?}", a.ledger());
@@ -457,8 +635,8 @@ mod tap {
             .collect()
     }
 
-    /// A TAP READING SERVED AFTER THE STRIKE ON THE ROW'S OWN STORED LOGIN LIFTS IT: the same
-    /// process's next reading, its API time grown, records `main` signed in again, the word's
+    /// A TAP READING SERVED AFTER THE STRIKE ON THE ROW'S OWN STORED LOGIN IS NEWER EVIDENCE: the
+    /// same process's next reading, its API time grown, reads `main` signed in again, the word's
     /// return on the ledger and no sign-in. Negative control: the fold alone (as before) leaves
     /// the word.
     #[test]
@@ -475,6 +653,46 @@ mod tap {
         assert_eq!(auth(&w, "main"), accounts::Auth::Ok);
         assert_eq!(kinds(&w), ["auth", "login-ended", "auth"]);
         assert_eq!(said(&idle), None);
+    }
+
+    /// A READING WHOSE API TIME GREW ENDS ITS PROCESS'S WALL SIGHTING: the process served, so a
+    /// wall it shows after that is a new one, dated when it is seen, though its row's login reads
+    /// signed in and the reading tells it nothing new ([`WorkerIdle::tap_step`]). CONTROL: a
+    /// reading whose windows moved with no calls since keeps the sighting. NEGATIVE CONTROL
+    /// (run): a tap step that never ends the sighting dates the later wall by the first.
+    #[test]
+    fn a_tap_reading_whose_api_time_grew_ends_its_processs_wall_sighting() {
+        let (w, idle) = tapped(OWN_PROFILE);
+        w.tap(10, 42, None);
+        assert!(step(&idle).is_some_and(|s| s.starts_with("reading")));
+        let snap = idle
+            .kept
+            .lock()
+            .unwrap()
+            .snapshot
+            .clone()
+            .expect("its process");
+        let sighted = |at: i64| {
+            idle.kept.lock().unwrap().account.wall_sighting.sighted(
+                &snap,
+                at,
+                account_process_matches,
+            )
+        };
+        let first = w.clock();
+        assert_eq!(sighted(first), first);
+        w.later(60);
+        w.tap(10, 44, None);
+        assert!(step(&idle).is_some_and(|s| s.starts_with("reading")));
+        assert_eq!(sighted(w.clock()), first, "CONTROL: no calls since");
+        w.later(60);
+        w.tap(20, 45, None);
+        assert!(step(&idle).is_some_and(|s| s.starts_with("reading")));
+        assert_eq!(
+            sighted(w.clock()),
+            w.clock(),
+            "a wall after its calls is new"
+        );
     }
 
     /// A READING WHOSE WINDOWS MOVED WHILE ITS PROCESS MADE NO CALLS IS NO SERVICE: its API time

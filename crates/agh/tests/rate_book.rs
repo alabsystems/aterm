@@ -117,8 +117,9 @@ fn no_book_is_inert() {
     assert!(book.refuse_before_send("anonymous", "core", NOW).is_none());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod files {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Arc;
 
@@ -267,7 +268,11 @@ mod files {
     }
 
     /// A registry whose one record names `pid`, started at `start` in boot `boot`, as a
-    /// release line's holder: what a cutter writes when it takes its fleet line.
+    /// release line's holder: what a cutter writes when it takes its fleet line. The cut-tree
+    /// tests below are unix's by nature: a release is cut on unix, and `rate::in_cut_tree`
+    /// reads the kernel's process tree there; off unix it is `false`, so a read on windows is
+    /// never the cutter's.
+    #[cfg(unix)]
     fn line_record(registry: &std::path::Path, pid: u32, boot: &str, start: u64) {
         std::fs::create_dir_all(registry).unwrap();
         let identity = aterm_ctl::release_holder::Identity {
@@ -284,6 +289,7 @@ mod files {
     }
 
     /// This test process, as the kernel names it: its pid, boot and start.
+    #[cfg(unix)]
     fn this_process() -> (u32, String, u64) {
         let pid = std::process::id();
         let start = aterm_uds::process::read_process_start(i32::try_from(pid).unwrap())
@@ -294,6 +300,7 @@ mod files {
         (pid, boot, start)
     }
 
+    #[cfg(unix)]
     const AT_THE_RESERVE: [(&str, &str); 3] = [
         ("x-ratelimit-limit", "5000"),
         ("x-ratelimit-remaining", "995"),
@@ -306,6 +313,7 @@ mod files {
     /// that changed hands), and with one of another boot, the same read is refused at the
     /// reserve and nothing is sent.
     #[test]
+    #[cfg(unix)]
     fn a_read_in_a_cuts_own_tree_spends_the_reserve_and_a_stale_or_forged_record_does_not() {
         let (pid, boot, start) = this_process();
         let other_boot = if boot.starts_with('0') { "1" } else { "0" };
@@ -362,6 +370,7 @@ mod files {
     /// refuses the cut's tree as it refuses everyone (the wait for the reset is the release's),
     /// and an anonymous read at the reserve is sent with the record and without it.
     #[test]
+    #[cfg(unix)]
     fn a_cuts_record_changes_neither_a_spent_allowance_nor_an_anonymous_read() {
         let (pid, boot, start) = this_process();
         for recorded in [true, false] {
@@ -429,6 +438,7 @@ mod files {
     /// reserve exits 11 `rate_limited`, and exits 0 once a release-line record names this
     /// process as its holder. NEGATIVE CONTROL: the same command with a record of another start.
     #[test]
+    #[cfg(unix)]
     fn the_agh_command_in_a_cuts_tree_reads_past_the_reserve() {
         let (pid, boot, start) = this_process();
         let run = |start: Option<u64>| {
@@ -544,12 +554,30 @@ mod files {
         );
     }
 
+    #[cfg(unix)]
     fn mode(path: &std::path::Path) -> u32 {
         std::fs::metadata(path)
             .expect("metadata")
             .permissions()
             .mode()
             & 0o777
+    }
+
+    /// The book's folder and its file are private: on unix 0700 and 0600; on windows the user's
+    /// under a protected list of the user and SYSTEM, which `judge_private_dir` and
+    /// `read_private` admit.
+    fn assert_private(dir: &std::path::Path, name: &str) {
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(dir), 0o700);
+            assert_eq!(mode(&dir.join(name)), 0o600);
+        }
+        #[cfg(windows)]
+        {
+            use aterm_uds::private_file::{PrivateDir, judge_private_dir, read_private};
+            assert_eq!(judge_private_dir(dir).expect("judged"), PrivateDir::Private);
+            read_private(dir, name, 64 * 1024).expect("a private file");
+        }
     }
 
     #[test]
@@ -560,8 +588,7 @@ mod files {
         book.record("anonymous", &snapshot("search", 9, NOW + 60));
         book.record("anonymous", &snapshot("core", 41, NOW + 60));
         book.record("anonymous", &snapshot("core", 40, NOW + 60));
-        assert_eq!(mode(&dirs.rate()), 0o700);
-        assert_eq!(mode(&dirs.rate().join("anonymous.json")), 0o600);
+        assert_private(&dirs.rate(), "anonymous.json");
         assert_eq!(
             book.read("anonymous"),
             vec![
@@ -603,6 +630,9 @@ mod files {
         assert!(book.refuse_before_send("anonymous", "core", NOW).is_none());
     }
 
+    /// Unix's by nature: a mode bit. `an_open_rate_folder_disables_the_book_and_stays_open` is
+    /// windows'.
+    #[cfg(unix)]
     #[test]
     fn a_loose_rate_directory_disables_the_book_and_stays_loose() {
         let root = common::scratch("rate-loose");
@@ -619,6 +649,64 @@ mod files {
         assert_eq!(mode(&rate), 0o755);
         assert!(book.read("anonymous").is_empty());
         assert!(book.refuse_before_send("anonymous", "core", NOW).is_none());
+    }
+
+    /// The rate folder, in a private state folder, opened to Everyone: nothing is written there,
+    /// nothing read, and its access list is left as it was (agh narrows no folder of the book).
+    #[cfg(windows)]
+    #[test]
+    fn an_open_rate_folder_disables_the_book_and_stays_open() {
+        use aterm_uds::acl::{Descriptor, Parts};
+        let root = common::scratch("rate-open");
+        let dirs = Dirs::under(root.path());
+        let rate = dirs.rate();
+        std::fs::create_dir_all(dirs.state.parent().expect("the state root")).expect("the root");
+        aterm_uds::private_file::create_private_dir(&dirs.state).expect("a private state folder");
+        std::fs::create_dir(&rate).expect("the rate folder");
+        common::open_to_everyone(&rate);
+        let list = || {
+            Descriptor::of_path(&rate, Parts::DACL)
+                .and_then(|d| d.to_sddl(Parts::DACL))
+                .expect("the folder's access list")
+        };
+        let before = list();
+        let book = RateBook::at(rate.clone());
+        book.record("anonymous", &snapshot("core", 0, NOW + 60));
+        assert!(!rate.join("anonymous.json").exists());
+        assert_eq!(list(), before);
+        assert!(book.read("anonymous").is_empty());
+        assert!(book.refuse_before_send("anonymous", "core", NOW).is_none());
+    }
+
+    /// An elevated process (as agh takes this thread to be) makes no folder for the book where
+    /// its state root is missing: a snapshot is not recorded, and a background read is refused
+    /// before anything is sent, so the folders stay the user's to make.
+    #[cfg(windows)]
+    #[test]
+    fn an_elevated_process_makes_no_state_folder_for_the_book() {
+        let root = common::scratch("rate-elevated");
+        let fake = agh_fake::FakeGithub::start();
+        common::canonical_tokens(root.path(), &fake, true, false);
+        let dirs = Dirs::under(root.path());
+        let book = RateBook::at(dirs.rate());
+        let transport = Arc::new(ScriptedTransport::new());
+        transport.answer(200, &[], b"{}");
+        let refused = agh::config::as_elevated_for_tests(|| {
+            book.record("anonymous", &snapshot("core", 0, NOW + 60));
+            authenticated(&transport, book.clone(), root.path(), 1000)
+                .call(&repo_get())
+                .expect_err("refused")
+        });
+        assert!(
+            refused.why.contains(aterm_uds::private_file::ELEVATED),
+            "{}",
+            refused.why
+        );
+        assert!(transport.requests().is_empty(), "nothing is sent");
+        assert!(
+            !root.path().join("state").exists(),
+            "nothing is made above the book"
+        );
     }
 
     #[test]

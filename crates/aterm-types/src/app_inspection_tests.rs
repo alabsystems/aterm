@@ -190,6 +190,28 @@ fn open_request_is_parsed_but_not_canonicalized_or_authorized() {
     assert!(parse_open_app("app system-state /extra").is_err());
     assert_eq!(parse_open_app("app tables"), Ok(OpenAppRequest::Tables));
     assert!(parse_open_app("app tables /extra").is_err());
+    for name in ["registry", "aRegistry", "aregistry"] {
+        assert_eq!(
+            parse_open_app(&format!("app {name}")),
+            Ok(OpenAppRequest::Registry)
+        );
+        assert!(parse_open_app(&format!("app {name} /extra")).is_err());
+    }
+    assert_eq!(
+        parse_open_app("app system-resources"),
+        Ok(OpenAppRequest::SystemResources { section: None })
+    );
+    assert_eq!(
+        parse_open_app("app system-resources section=macos-configuration"),
+        Ok(OpenAppRequest::SystemResources {
+            section: Some(super::ResourcesSection::MacosConfiguration)
+        })
+    );
+    assert!(matches!(
+        parse_open_app("app system-resources x"),
+        Err(ParseError::Usage(_))
+    ));
+    assert!(parse_open_app("app system-resources section=bogus").is_err());
     assert_eq!(
         parse_open_app("app navigator"),
         Ok(OpenAppRequest::Navigator { split: false })

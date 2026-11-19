@@ -1888,6 +1888,7 @@ fn me(label: &str) -> Me<'_> {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     }
 }
 

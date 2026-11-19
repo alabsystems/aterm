@@ -336,3 +336,40 @@ fn a_malformed_command_never_decodes() {
     }
     assert!(decode_command(&format!("{cwd} {}", hex_word("true"))).is_some());
 }
+
+/// A quiet refusal names one to [`QUIET_MAX_SECS`] seconds, however long the server's spacing
+/// has left, and its reader takes back exactly those lines: 1 to 300, no leading zero, nothing
+/// after. NEGATIVE CONTROL: a reader without the range check takes 301 and 999.
+#[test]
+fn a_quiet_refusal_names_a_bounded_wait_and_reads_back_only_that() {
+    assert_eq!(quiet_refusal(0), "ERR askpass refused quiet 1\n");
+    assert_eq!(quiet_refusal(42), "ERR askpass refused quiet 42\n");
+    assert_eq!(quiet_refusal(300), "ERR askpass refused quiet 300\n");
+    assert_eq!(quiet_refusal(301), "ERR askpass refused quiet 300\n");
+    assert_eq!(quiet_refusal(u64::MAX), "ERR askpass refused quiet 300\n");
+    for secs in [0, 1, 42, 300, 301, u64::MAX] {
+        let line = quiet_refusal(secs);
+        assert_eq!(
+            quiet_refusal_secs(line.trim_end_matches('\n').as_bytes()),
+            Some(secs.clamp(1, QUIET_MAX_SECS)),
+            "{line:?}"
+        );
+    }
+    for line in [
+        "ERR askpass refused quiet 0",
+        "ERR askpass refused quiet 301",
+        "ERR askpass refused quiet 999",
+        "ERR askpass refused quiet 042",
+        "ERR askpass refused quiet 1000",
+        "ERR askpass refused quiet ",
+        "ERR askpass refused quiet +4",
+        "ERR askpass refused quiet 4 ",
+        "ERR askpass refused quiet 4\n",
+        "ERR askpass refused quiet 42; x",
+        "ERR askpass refused quiet",
+        "ERR askpass refused a recent prompt was cancelled or left unanswered; retry in 12s",
+        "ERR askpass refused quiet\u{0663}",
+    ] {
+        assert_eq!(quiet_refusal_secs(line.as_bytes()), None, "{line:?}");
+    }
+}

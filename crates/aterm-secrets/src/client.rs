@@ -128,6 +128,7 @@ pub use entry::{
 };
 #[path = "client/mailbox_index.rs"]
 mod mailbox_index;
+pub use crate::records_storage::RecordsGeneration;
 pub(crate) use entry::read_claude_token_until;
 #[cfg(any(test, debug_assertions))]
 pub use fleet::test_without_roster_wait;
@@ -497,6 +498,25 @@ impl Paths {
     /// requires a larger reader capacity than this build supports.
     pub fn records_data_file(&self) -> crate::Result<PathBuf> {
         crate::records_storage::reader_path(&self.records_file())
+    }
+
+    /// The rewrite generation of the records entry (`records_storage::rewrite::generation`): how
+    /// many rewrites (a prune at a final checkpoint, a shed of superseded bodies) made what it
+    /// holds, 0 for one never rewritten, and which rewrite the last was, by its header's
+    /// SHA-256. A rewrite drops records, so a place kept in the records (the mesh egress's
+    /// members cursor, `aterm_mesh::egress::MembersCursor`, which reads this before each use of
+    /// its place) holds only while this is the generation it was kept under, and is placed
+    /// again when it differs. The number alone is not compared: a rewrite made again after a
+    /// power cut took its pin back, and a vault left and joined again, reach a number a second
+    /// time under another header. Only a Mac that reads format 2 rewrites its records file
+    /// (taking a served root, `persist_stored`), which no running build does, so it is 0 with
+    /// no rewrite named.
+    ///
+    /// # Errors
+    /// The pin cannot be read, or begins as a rewrite's and is not exactly one.
+    #[cfg(unix)]
+    pub fn records_generation(&self) -> crate::Result<RecordsGeneration> {
+        crate::records_storage::rewrite::generation(&self.records_file())
     }
 
     /// The crossed mark beside [`Self::records_file`] ([`crate::crossing::Mark`]): stored once
@@ -1237,7 +1257,7 @@ impl StateLock {
     /// every writer out, so with nothing to finish one read serves the whole recovery, as it
     /// does every take: only a step that wrote makes the next read afresh.
     fn recovered(self, paths: &Paths) -> crate::Result<Self> {
-        crate::records_storage::recover_pending(&paths.records_file())?;
+        recover_records_entry(paths)?;
         let mut reads = Reads::new(paths);
         if retained_history::recover_enrollment(&reads)? {
             reads = Reads::new(paths);
@@ -5582,14 +5602,28 @@ fn records_store_selected(
         }
         return Ok((
             name,
-            crate::membership_log::Store::with_compiled(Some(network)),
+            crate::membership_log::Store::with_compiled(Some(network))
+                .read_at(records_reading(reads.paths())?),
         ));
     }
     let store = match config {
         Some(config) => store.under(&reads.lineage(config)),
         _ => store,
     };
-    Ok((name, store))
+    Ok((name, store.read_at(records_reading(reads.paths())?)))
+}
+
+/// The format this Mac reads its records at (`crate::membership_log::follow::reading`):
+/// format 2 once its format mark names it, on a build that reads it; format 1 on every other,
+/// which looks for no mark (and on Windows, where a member stores none).
+fn records_reading(paths: &Paths) -> crate::Result<crate::membership_log::Reading> {
+    #[cfg(unix)]
+    return crate::membership_log::follow::reading(&format_mark(paths));
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        Ok(crate::membership_log::Reading::ONE)
+    }
 }
 
 /// The record store name `config`'s vault keeps and an empty store for it
@@ -5625,8 +5659,8 @@ fn records_store_for(
 /// before its first records file). A pinned layout with missing data is an error. A file this
 /// build refuses as a whole keeps the records it still takes
 /// ([`crate::membership_log::Store::recover`]), and the next write
-/// replaces it, so one refused record never stops this Mac taking records. A file past
-/// [`crate::membership_log::MAX_RECORDS_STREAM`] (a build that bounded its store by count alone
+/// replaces it, so one refused record never stops this Mac taking records. A file past its
+/// store's capacity ([`crate::membership_log::Store::capacity`]; a build that bounded its store by count alone
 /// could write one) keeps the records its first that many bytes hold. These are the raw records,
 /// a missing file read as none: an authority decision reads [`load_acknowledged_records`].
 ///
@@ -5763,11 +5797,187 @@ pub fn save_records(paths: &Paths, records: &[u8]) -> crate::Result<usize> {
 
 pub(crate) fn save_records_unlocked(paths: &Paths, records: &[u8]) -> crate::Result<usize> {
     let mut store = load_records(paths)?;
-    let added = store.ingest(records)?;
+    let added = ingest_as_read(&mut store, records)?;
     if added > 0 {
         write_records(paths, &store)?;
     }
     Ok(added)
+}
+
+/// [`crate::membership_log::Store::ingest`] of `records` as `store` reads them: a store that
+/// reads format 2 (its Mac's format mark names it on a build that reads it) takes version-2
+/// records and the roots a rooted source hands after its records
+/// ([`crate::membership_log::Store::ingest_served`]); every other store reads format-1
+/// records alone, as ever.
+///
+/// # Errors
+/// As [`crate::membership_log::Store::ingest`]; for a store that reads format 2, as
+/// [`crate::membership_log::store::decode_reply`] and
+/// [`crate::membership_log::Store::ingest_served`].
+pub(crate) fn ingest_as_read(
+    store: &mut crate::membership_log::Store,
+    records: &[u8],
+) -> crate::Result<usize> {
+    if !store.reading().admits_two() {
+        return store.ingest(records);
+    }
+    let (decoded, served) = crate::membership_log::store::decode_reply(
+        records,
+        crate::membership_log::MAX_HELD_RECORDS,
+        store.reading(),
+    )?;
+    store.ingest_served(decoded, served.as_ref())
+}
+
+/// Finish or undo a storage transition of the records entry that a writer left cut short
+/// ([`crate::records_storage::recover_pending`]). A Mac that reads format 2 recovers a rewrite
+/// too (`records_storage::rewrite::recover`: by the pin, under the entry's writer lock), and
+/// holds a rewritten layout to its pin as a format-2 reader does; every other Mac's recovery
+/// refuses such a layout, as its readers do.
+fn recover_records_entry(paths: &Paths) -> crate::Result<()> {
+    let entry = paths.records_file();
+    #[cfg(unix)]
+    if records_reading(paths)?.admits_two() {
+        if crate::records_storage::absent(&entry)? {
+            return Ok(());
+        }
+        return crate::records_storage::rewrite::recover(&entry);
+    }
+    crate::records_storage::recover_pending(&entry)
+}
+
+/// Write `store`, which reads format 2, to the records entry where the ordinary writer does
+/// not ([`persist_records`]): a store whose log is rooted at a final checkpoint, or any store
+/// at an entry a rewrite made. `false` where neither holds (a whole log at an entry never
+/// rewritten, and every store that reads format 1): the ordinary writer writes it.
+///
+/// - Where the entry's file begins with the frame this store's log is rooted by (or with none,
+///   for a whole log at a rewritten entry), the store is written to that file as a records
+///   file is: its new records on the end where the file holds exactly the rest
+///   ([`records_cache::held_on_file`]), the file whole otherwise
+///   ([`crate::membership_log::Store::write_stored`]), under the entry's writer lock and only
+///   while the entry is of the generation selected (`records_storage::rewrite::write_path`).
+/// - Where the store took a root its file does not hold (a served root,
+///   [`crate::membership_log::Store::ingest_served`]), the entry is rewritten to the store
+///   (`records_storage::rewrite::rewrite`, as the prune at that root): from exactly the bytes
+///   read here, every record of which the store holds or dropped, so a record another writer
+///   appended since is never dropped unseen. An entry that holds nothing is first written
+///   empty by the ordinary writer, which a rewrite then replaces.
+///
+/// The caller owns a records write's guards ([`write_records`]).
+///
+/// # Errors
+/// The entry cannot be recovered, selected or read; it holds a record the store neither holds
+/// nor dropped, or a frame of roots a whole store lacks (the store was read before another
+/// writer's rewrite: read again); the file would pass the format's capacity; or the write or
+/// the rewrite fails, leaving the entry what its pin says.
+#[cfg(unix)]
+fn persist_stored(paths: &Paths, store: &crate::membership_log::Store) -> crate::Result<bool> {
+    use crate::membership_log::stored::KEPT_MAGIC;
+    use crate::records_storage::rewrite;
+    if store.reading() != crate::membership_log::Reading::Format(crate::crossing::FORMAT_TWO) {
+        return Ok(false);
+    }
+    let entry = paths.records_file();
+    let frame = store.kept_frame()?;
+    let absent = crate::records_storage::absent(&entry)?;
+    if !absent {
+        rewrite::recover(&entry)?;
+    }
+    let generation = if absent {
+        0
+    } else {
+        rewrite::data_path(&entry)?.generation
+    };
+    if frame.is_none() && generation == 0 {
+        return Ok(false);
+    }
+    let capacity = store.capacity();
+    let lead = frame.as_ref().map_or(0, Vec::len);
+    if store.stored_len()? > capacity {
+        return Err(Error::new(
+            "this Mac's membership records and their roots pass what a records file holds",
+        ));
+    }
+    if generation > 0 {
+        let target = rewrite::write_path(&entry, generation)?;
+        let began = read_lead(&target, lead.max(KEPT_MAGIC.len()))?;
+        let same = match &frame {
+            Some(frame) => began == *frame,
+            None => !began.starts_with(KEPT_MAGIC),
+        };
+        if same {
+            if let Some(stamp) = fsx::stamp_if_present(&target)?
+                && let Some(held) = records_cache::held_on_file(stamp, store)
+                && let Ok(length) = store.held_len_from(held)
+            {
+                if length == 0 {
+                    return Ok(true);
+                }
+                let mut suffix = Vec::with_capacity(length);
+                store.write_held_from(held, &mut suffix)?;
+                if append_records(&target, &stamp, &suffix).is_ok() {
+                    return Ok(true);
+                }
+            }
+            write_record_file(&target, |writer| store.write_stored(writer))?;
+            return Ok(true);
+        }
+    }
+    let Some(root) = store
+        .log()
+        .and_then(crate::membership_log::Log::newest_root)
+        .map(|root| root.id)
+        .filter(|_| frame.is_some())
+    else {
+        return Err(Error::new(
+            "this Mac's membership records file holds roots its store was read without; \
+             read it again",
+        ));
+    };
+    if absent {
+        let target = records_file_for_write(paths, store)?;
+        write_record_file(&target, |_| Ok(()))?;
+    }
+    let from = rewrite::data_path(&entry)?;
+    let before = fsx::read_private(&from.path, capacity)?
+        .ok_or_else(|| Error::new("this Mac's membership records file is missing"))?;
+    let on_file = records_store(paths)?
+        .1
+        .recovering_stored(before.as_slice())?;
+    let known = |id: &crate::membership_log::RecordId| store.log().is_some_and(|log| log.knows(id));
+    if !on_file
+        .log()
+        .is_none_or(|log| log.records().all(|record| known(record.id())))
+    {
+        return Err(Error::new(
+            "this Mac's membership records file holds a record its store was read without; \
+             read it again",
+        ));
+    }
+    rewrite::rewrite(
+        &entry,
+        rewrite::Predecessor::of(before.as_slice()),
+        rewrite::What::Checkpoint(root),
+        &|out| store.write_stored(out),
+    )?;
+    Ok(true)
+}
+
+/// The first `len` bytes of the file at `path`, or as many as it holds.
+#[cfg(unix)]
+fn read_lead(path: &Path, len: usize) -> crate::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let Some(mut reader) = fsx::open_owned_reader(path)? else {
+        return Ok(Vec::new());
+    };
+    let mut began = Vec::with_capacity(len);
+    reader
+        .file()
+        .take(len as u64)
+        .read_to_end(&mut began)
+        .map_err(|e| Error::new(format!("membership record read failed: {e}")))?;
+    Ok(began)
 }
 
 /// Buffer small signed records without collecting the complete stream. Flush before the
@@ -5812,6 +6022,12 @@ fn write_record_buffered(
 /// the cut, read as such, and the next writer, finding bytes on file that are not exactly
 /// records it holds, replaces the file whole.
 fn persist_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::Result<()> {
+    // A store that reads format 2 and is rooted, or whose entry a rewrite made, is written as
+    // a rewritten file is ([`persist_stored`]); no store of a running build reads format 2.
+    #[cfg(unix)]
+    if persist_stored(paths, store)? {
+        return Ok(());
+    }
     let target = records_file_for_write(paths, store)?;
     if let Some(stamp) = fsx::stamp_if_present(&target)?
         && let Some(held) = records_cache::held_on_file(stamp, store)
@@ -5882,6 +6098,7 @@ fn append_records(path: &Path, stamp: &fsx::FileStamp, suffix: &[u8]) -> crate::
     )
 )]
 fn write_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::Result<()> {
+    reads_marked_format(paths, store)?;
     retained_history::validate_write(paths, store)?;
     let crosses = crate::crossing::past_legacy(
         store
@@ -5893,32 +6110,127 @@ fn write_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::
     #[cfg(test)]
     if crosses && crate::crossing::faults(mark.path()).mark_after_take {
         persist_records(paths, store)?;
-        records_written(paths, store);
+        records_written(paths, store, WRITTEN_UNDER);
         return mark.store();
     }
     if crosses {
         mark.store()?;
     }
     persist_records(paths, store)?;
-    records_written(paths, store);
+    records_written(paths, store, WRITTEN_UNDER);
     retained_history::acknowledge(paths, store)
 }
 
+/// The rewrite generation [`write_records`] writes a store under, which its hook hands on
+/// ([`crate::membership_log::store::Written::generation`]): that of an entry never rewritten,
+/// the only one [`persist_records`] writes (`crate::records_storage::write_path` refuses a
+/// rewritten pin, so a write that returned was of no rewritten entry). The writer of a
+/// rewritten file (`crate::records_storage::rewrite` "Not yet") writes only under the
+/// generation it read its store under, and hands that one.
+const WRITTEN_UNDER: RecordsGeneration = RecordsGeneration {
+    number: 0,
+    rewrite: None,
+};
+
+/// Refuse a write of the records file from `store` where this Mac's format mark names a later
+/// format than `store` reads: a Mac that followed its vault into format 2
+/// (`crate::membership_log::follow`) and then runs a build that reads none (one before the
+/// reader, which this build is while [`crate::commons::hearing::READS_FORMAT`] names no
+/// release). Such a build reads the followed file as its format-1 records up to the first
+/// version-2 record, a torn tail to it ([`load_records`]), and a write of that store would
+/// replace the file with them, losing every record past it this Mac alone held. So it writes
+/// nothing: the file stays as the build that reads it left it, until aterm is updated. A Mac
+/// with no format mark (every Mac while no build stores one) is asked only whether the mark is
+/// there.
+///
+/// # Errors
+/// As said; or the mark cannot be read ([`crate::crossing::FormatMark::stored`]).
+fn reads_marked_format(paths: &Paths, store: &crate::membership_log::Store) -> crate::Result<()> {
+    let mark = format_mark(paths);
+    let format = mark.stored()?;
+    if format == crate::crossing::FORMAT_ONE
+        || store.reading() == crate::membership_log::Reading::Format(format)
+    {
+        return Ok(());
+    }
+    // MUTANT (`crate::crossing::Faults::writes_unread_format`): the write goes on.
+    #[cfg(all(test, unix))]
+    if crate::crossing::faults(mark.path()).writes_unread_format {
+        return Ok(());
+    }
+    Err(Error::new(format!(
+        "this Mac's membership records are in format {format}, which this build of aterm does \
+         not read: its records file is left as it is until aterm is updated"
+    )))
+}
+
+/// Whether this Mac's membership records ride the mesh's members lane: only while its format
+/// mark names format 1 (ATERM-KI-1116-1471). The lane states no records bound, so the HTTP
+/// fence's `409` never sees it: a Mac whose mark names a later format neither feeds it (its
+/// records-file writes reach no hook, [`records_written`], and the mesh reads it an empty log,
+/// [`mesh_members`]) nor takes from it ([`ingest_mesh_records`]), whatever its build reads, so
+/// no format-1 Mac is handed a format-2 Mac's records over the mesh, or hands it its own. Its
+/// table lanes are not this fence's. Every Mac is asked only whether the mark is there, and
+/// none stores one while [`crate::commons::hearing::READS_FORMAT`] names no release.
+///
+/// The mesh asks it too, at each repair round: a Mac whose lane is shut leaves the membership
+/// unit out of the round (`aterm_mesh::stores::Stores::members_lane`), so a format-1 neighbour
+/// does not read its empty lane as a log that lacks every record and offer them all again.
+///
+/// # Errors
+/// The mark cannot be read ([`crate::crossing::FormatMark::stored`]).
+pub fn members_lane_open(paths: &Paths) -> crate::Result<bool> {
+    let mark = format_mark(paths);
+    let open = mark.stored()? == crate::crossing::FORMAT_ONE;
+    // MUTANT (`crate::crossing::Faults::lane_past_mark`): open whatever the mark names.
+    #[cfg(all(test, unix))]
+    let open = open || crate::crossing::faults(mark.path()).lane_past_mark;
+    Ok(open)
+}
+
+/// This Mac's membership store as the mesh's members lane reads it: [`load_records`], and an
+/// empty store where its format mark names a later format than 1 ([`members_lane_open`]), so
+/// the lane holds, offers and sends none of a format-2 Mac's records.
+///
+/// # Errors
+/// As [`load_records`]; or the format mark cannot be read.
+pub fn mesh_members(paths: &Paths) -> crate::Result<crate::membership_log::Store> {
+    if members_lane_open(paths)? {
+        load_records(paths)
+    } else {
+        Ok(records_store(paths)?.1)
+    }
+}
+
 /// The records file holds `store` durably: hand it to the process's hook
-/// ([`crate::membership_log::store::on_written`]).
-fn records_written(paths: &Paths, store: &crate::membership_log::Store) {
+/// ([`crate::membership_log::store::on_written`]), which feeds the mesh's members lane, where
+/// that lane carries this Mac's records ([`members_lane_open`]). A Mac whose format mark names
+/// a later format, or cannot be read, hands it nothing. `generation` is the rewrite generation
+/// of the records entry `store` was written under, which names the order its records are in.
+fn records_written(
+    paths: &Paths,
+    store: &crate::membership_log::Store,
+    generation: RecordsGeneration,
+) {
+    if !members_lane_open(paths).unwrap_or(false) {
+        return;
+    }
     crate::membership_log::store::written(&crate::membership_log::store::Written {
         paths_dir: &paths.dir,
         store,
+        generation,
     });
 }
 
 /// Ingest `records` the mesh delivered into `paths.records_file()` under the client state lock
 /// ([`crate::membership_log::Store::ingest_classified`]), writing the file only where a record
-/// entered the store (held or waiting), and say what became of each one.
+/// entered the store (held or waiting), and say what became of each one. A Mac whose format
+/// mark names a later format than 1 takes none of them ([`members_lane_open`]): each is refused
+/// for good, and its records file is not read.
 ///
 /// # Errors
-/// The state lock cannot be taken, or `paths.records_file()` cannot be read or written.
+/// The state lock cannot be taken, the format mark cannot be read, or `paths.records_file()`
+/// cannot be read or written.
 pub fn ingest_mesh_records(
     paths: &Paths,
     records: Vec<crate::membership_log::Record>,
@@ -5929,6 +6241,19 @@ pub fn ingest_mesh_records(
     )>,
 > {
     let _lock = StateLock::take(paths)?;
+    if !members_lane_open(paths)? {
+        let why = "this Mac's membership records are past format 1: the mesh's members lane \
+                   brings it none";
+        return Ok(records
+            .iter()
+            .map(|record| {
+                (
+                    *record.id(),
+                    crate::membership_log::store::MemberVerdict::Refused(why.to_owned()),
+                )
+            })
+            .collect());
+    }
     let mut store = load_records(paths)?;
     let before = store.inventory();
     let verdicts = store.ingest_classified(records);
@@ -5947,6 +6272,34 @@ fn records_file_for_write(
         &paths.records_file(),
         crate::crossing::past_legacy(store.len()) || records_marked_crossed(paths)?,
     )
+}
+
+/// Ready the records entry for a write of `store` that other files are written ahead of (a
+/// join bundle's configuration, `admit::write_log_bundle`), and refuse here what that write
+/// would refuse of the entry: [`records_file_for_write`], which makes a records file a layout
+/// where the store needs one. An entry a rewrite made is refused by that format-1 selection,
+/// so where `store` reads format 2 and the entry is rewritten, the entry is recovered and
+/// selected as the store's writer selects it ([`persist_stored`]:
+/// `records_storage::rewrite::write_path` under the entry's generation). No store of a running
+/// build reads format 2.
+///
+/// # Errors
+/// As [`records_file_for_write`]; for a rewritten entry, as `records_storage::rewrite::recover`
+/// and `records_storage::rewrite::write_path`.
+fn ready_records_entry(paths: &Paths, store: &crate::membership_log::Store) -> crate::Result<()> {
+    #[cfg(unix)]
+    if store.reading() == crate::membership_log::Reading::Format(crate::crossing::FORMAT_TWO) {
+        use crate::records_storage::rewrite;
+        let entry = paths.records_file();
+        if !crate::records_storage::absent(&entry)? {
+            rewrite::recover(&entry)?;
+            let generation = rewrite::data_path(&entry)?.generation;
+            if generation > 0 {
+                return rewrite::write_path(&entry, generation).map(drop);
+            }
+        }
+    }
+    records_file_for_write(paths, store).map(drop)
 }
 
 /// This Mac's crossed mark ([`Paths::crossed_file`]).
@@ -5977,6 +6330,33 @@ pub fn records_marked_format(paths: &Paths) -> crate::Result<u32> {
     format_mark(paths).stored()
 }
 
+/// The bound a Mac that stated `stated` states when it asks again a member that refused it for
+/// the member's later records format ([`crate::ErrorKind::LaterFormat`]): `stated` at format 2
+/// ([`crate::crossing::RecordsBound::at_format`]), and only for a Mac that stated format 1 on a
+/// build that reads format 2 ([`crate::crossing::FormatMark::follows`]). `None` for every
+/// other, which asks nobody again: a build that reads no format 2 (every running one) looks
+/// for no mark and states nothing new. `None` too for a seatless Mac ([`Seat::Seatless`]): it
+/// takes its seat's records at the format its own mark names (`seat_ask`), so a member that
+/// handed it format-2 records would have signed for a Mac that takes none of them, and its
+/// records pass follows its vault first. Stating format 2 stores no mark; the Mac's mark is
+/// stored only on a seat's signed version-2 record in the bundle it is then handed
+/// (`admit::checked_log_bundle`, `crate::membership_log::follow`).
+#[must_use]
+pub fn later_records_bound(
+    paths: &Paths,
+    stated: crate::crossing::RecordsBound,
+) -> Option<crate::crossing::RecordsBound> {
+    #[cfg(unix)]
+    if stated.format == crate::crossing::FORMAT_ONE
+        && format_mark(paths).follows()
+        && seat(paths) != Seat::Seatless
+    {
+        return Some(stated.at_format(crate::crossing::FORMAT_TWO));
+    }
+    let _ = (paths, stated);
+    None
+}
+
 /// What this Mac states of its records ([`crate::crossing::RecordsBound`]), its log as `store`
 /// holds it: the version-1 bound until its format mark is stored ([`format_mark`]).
 ///
@@ -5989,6 +6369,9 @@ pub fn records_bound(
     crate::crossing::stated(&crossing_mark(paths), &format_mark(paths), store)
 }
 
+#[cfg(all(test, unix))]
+#[path = "client/follow_tests.rs"]
+mod follow_tests;
 #[cfg(test)]
 #[path = "client/mesh_records_tests.rs"]
 mod mesh_records_tests;
@@ -6104,9 +6487,7 @@ fn retain_commons_records_with(
         let bytes = wires
             .iter()
             .try_fold(0usize, |n, wire| n.checked_add(wire.len()));
-        if wires.len() > store.budgets().held
-            || bytes.is_none_or(|n| n > crate::membership_log::MAX_RECORDS_STREAM)
-        {
+        if wires.len() > store.budgets().held || bytes.is_none_or(|n| n > store.capacity()) {
             return Err(Error::of_kind(
                 crate::ErrorKind::Refused,
                 "Commons membership batch exceeds the record or byte bound",
@@ -6365,12 +6746,25 @@ impl RecordsPass {
 /// to take the store's lock and ingest what came.
 const TAKE_RESERVE: Duration = Duration::from_millis(300);
 
+/// The records one server sent and the roots it served beside them
+/// ([`crate::membership_log::Store::ingest_served`]).
+type ServedBatch = (
+    Vec<crate::membership_log::Record>,
+    Option<crate::membership_log::Served>,
+);
+
 /// What a records pass ([`sync_records_until`]) makes of the records one server sent: what it
 /// sent, frame by frame, whether the pass offers the store all of it, and the batch it offers.
 struct RecordsJudged {
     stream: crate::membership_log::untaken::Sent,
     whole: bool,
     batch: Option<Vec<crate::membership_log::Record>>,
+    /// The roots the server served beside the records
+    /// ([`crate::membership_log::Served`]), which only a pull that reads format 2 asks for
+    /// (`transport::Pull::takes_served`): kept with the whole stream alone, since a root is
+    /// taken with every record its reply brought or not at all
+    /// ([`crate::membership_log::Store::ingest_served`]).
+    served: Option<crate::membership_log::Served>,
 }
 
 /// Judge the whole decoded stream, or its readable descendant-closed subset, against the
@@ -6378,8 +6772,9 @@ struct RecordsJudged {
 fn judge_received_records(
     local_store: &crate::membership_log::Store,
     vault_name: &str,
-    received: crate::membership_log::untaken::ReceivedFrames,
+    mut received: crate::membership_log::untaken::ReceivedFrames,
 ) -> RecordsJudged {
+    let served = received.take_served();
     let batch_valid = |records: &[crate::membership_log::Record]| {
         local_store.clone().ingest_records(records.to_vec()).is_ok()
             || crate::membership_log::Store::for_vault(vault_name)
@@ -6402,6 +6797,7 @@ fn judge_received_records(
     RecordsJudged {
         stream: received.into_sent(),
         whole,
+        served: served.filter(|_| whole && batch.is_some()),
         batch,
     }
 }
@@ -6540,7 +6936,13 @@ fn records_until(
     Ok(pass)
 }
 
-/// One records pass of [`records_until`], asking as `ask` says.
+/// One records pass of [`records_until`], asking as `ask` says: what its sources sent at the
+/// format this Mac states is taken first ([`records_pass_taking`]), and only then is a source
+/// that refused the pull for a later format asked again stating it ([`follow_later_format`]).
+/// The order is the guard: the evidence a format mark is stored on is a record signed by a seat
+/// this Mac's log holds *now*, so the log must first hold what this very pass brought it, a
+/// `Remove` of that seat among it. A pass that followed says more follow and is not fresh, so
+/// its caller asks again at the format this Mac now states.
 fn records_pass(
     paths: &Paths,
     wait: Option<Duration>,
@@ -6549,6 +6951,61 @@ fn records_pass(
     deadline: Option<Instant>,
     posts_by: Option<Instant>,
     ask: Ask<'_>,
+) -> crate::Result<RecordsPass> {
+    let mut later = Vec::new();
+    let pass = records_pass_taking(
+        paths,
+        wait,
+        extra_peers,
+        browsed,
+        deadline,
+        posts_by,
+        ask,
+        &mut later,
+    );
+    #[cfg(unix)]
+    if let Some(followed) = follow_later_format(paths, &later, deadline)? {
+        return Ok(RecordsPass {
+            added: followed + pass.as_ref().map_or(0, |pass| pass.added),
+            untaken: pass.as_ref().is_ok_and(|pass| pass.untaken),
+            unstated: true,
+            more: true,
+            source_short: true,
+        });
+    }
+    pass
+}
+
+/// The vault name a records pass judges a fresh store under ([`judge_received_records`]).
+fn records_vault_name(config: &Config) -> &str {
+    if alab_vault(config) {
+        crate::ALAB_VAULT
+    } else if config.name != crate::ALAB_VAULT {
+        config.name.as_str()
+    } else {
+        ""
+    }
+}
+
+/// [`records_pass`]'s taking of what its sources sent at the format this Mac states. `later`
+/// is left naming the servers that refused the pull beside a bound stating a later records
+/// format ([`crate::ErrorKind::LaterFormat`]), and only where the pass took every batch it
+/// verified (it returns `Ok`) or verified none (no source answered): a pass that failed
+/// holding a verified batch leaves `later` empty, so nothing is followed on a log that lacks
+/// what its sources just sent.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a records pass's seven inputs, and what it leaves for the follow after it"
+)]
+fn records_pass_taking(
+    paths: &Paths,
+    wait: Option<Duration>,
+    extra_peers: &[String],
+    browsed: Option<Found<'_>>,
+    deadline: Option<Instant>,
+    posts_by: Option<Instant>,
+    ask: Ask<'_>,
+    later: &mut Vec<String>,
 ) -> crate::Result<RecordsPass> {
     use crate::membership_log::untaken::{Named, Noted, Sent};
 
@@ -6601,6 +7058,7 @@ fn records_pass(
             total,
             sub_ref,
             bound,
+            local_store.reading(),
         )
     };
     // A bounded pass browses for peers by its own deadline, not a fixed probe of its own.
@@ -6616,13 +7074,7 @@ fn records_pass(
             PeerUse::Records,
         )
     };
-    let vault_name = if alab_vault(&config) {
-        crate::ALAB_VAULT
-    } else if config.name != crate::ALAB_VAULT {
-        config.name.as_str()
-    } else {
-        ""
-    };
+    let vault_name = records_vault_name(&config);
     // What a non-empty answer brings: the whole stream as its batch when it verifies, else the
     // records of it this build reads that descend from none it cannot read, when those verify.
     // A server of a newer build sends a record of a kind this build does not know beside records
@@ -6643,7 +7095,7 @@ fn records_pass(
         let peer_named: Vec<(&String, Named)> = peers.iter().map(|url| (url, named(url))).collect();
         // Every peer is asked at once, sharing one deadline, as [`fan_out::RECORDS`] reads them:
         // any LAN host can advertise up to [`crate::discover::MAX_CANDIDATES`] of them, and read
-        // whole at once, each up to [`crate::membership_log::MAX_RECORDS_STREAM`], they could
+        // whole at once, each up to [`crate::membership_log::REPLY_CAP`], they could
         // have a pass hold up to a gigabyte of records nothing had verified. The deadline is read
         // here, on this thread, where a test sets it ([`servers_within`]).
         let fetched = match bounded::budget(pulls_by, servers_within(PROBE_DEADLINE)) {
@@ -6662,7 +7114,15 @@ fn records_pass(
                     within,
                     |url, left, limit| {
                         let sub = read_only.subscriber_for(url, sub_ref);
-                        transport::fetch_records_within(url, ids(url), left, sub, bound, limit)
+                        transport::fetch_records_within(
+                            url,
+                            ids(url),
+                            left,
+                            sub,
+                            bound,
+                            limit,
+                            local_store.reading(),
+                        )
                     },
                     |url, read| match read? {
                         transport::Pulled::Fetched(answer) => Ok(PeerRecords::of(answer, judge)),
@@ -6725,6 +7185,44 @@ fn records_pass(
             (primary, peers, peer_batches)
         }
     };
+    // The servers that refused this pull beside a bound stating a later records format than
+    // this Mac's, and no other refusal: `records_pass` asks each again stating that format
+    // (`follow_later_format`) once this pass has taken what the rest sent.
+    let refused_later: Vec<String> = {
+        // MUTANT (`crate::crossing::Faults::later_on_any_refusal`): any refusal.
+        #[cfg(all(test, unix))]
+        let any_refusal = crate::crossing::faults(format_mark(paths).path()).later_on_any_refusal;
+        #[cfg(not(all(test, unix)))]
+        let any_refusal = false;
+        std::iter::once((primary_url.as_str(), primary.as_ref().err()))
+            .chain(
+                peer_batches
+                    .iter()
+                    .map(|(url, _, fetched)| (url.as_str(), fetched.as_ref().err())),
+            )
+            .filter(|(_, refused)| {
+                refused.is_some_and(|e| {
+                    e.kind() == crate::ErrorKind::LaterFormat
+                        || (any_refusal && e.kind() == crate::ErrorKind::Refused)
+                })
+            })
+            .map(|(url, _)| url.to_owned())
+            .collect()
+    };
+    // MUTANT (`crate::crossing::Faults::follow_before_take`): the follow first, before this
+    // pass takes anything, and nothing else taken by a pass that followed.
+    #[cfg(all(test, unix))]
+    if crate::crossing::faults(format_mark(paths).path()).follow_before_take
+        && let Some(added) = follow_later_format(paths, &refused_later, deadline)?
+    {
+        return Ok(RecordsPass {
+            added,
+            untaken: false,
+            unstated: true,
+            more: true,
+            source_short: true,
+        });
+    }
     if let Ask::All(Some(heard)) = ask {
         // A peer served this vault's records where it answered a `200` or a `204`, each naming
         // its boot id; a `404` (it holds no such vault) names none. One that names the source's
@@ -6809,14 +7307,13 @@ fn records_pass(
     // read or write that fails returns before any note, and the same records come again. Each
     // with whether the pass offered the store all of it.
     let mut sent: Vec<(String, Sent, bool)> = Vec::new();
-    // The batch what `url` sent brings, once `sent` notes it.
-    let mut offered =
-        |url: &str, judged: RecordsJudged| -> Option<Vec<crate::membership_log::Record>> {
-            sent.push((url.to_owned(), judged.stream, judged.whole));
-            judged.batch
-        };
+    // The batch what `url` sent brings, with the roots it served, once `sent` notes it.
+    let mut offered = |url: &str, judged: RecordsJudged| -> Option<ServedBatch> {
+        sent.push((url.to_owned(), judged.stream, judged.whole));
+        judged.batch.map(|batch| (batch, judged.served))
+    };
     // Each batch, with whether a server that states its log crossed sent it.
-    let mut verified_batches: Vec<(Vec<crate::membership_log::Record>, bool)> = Vec::new();
+    let mut verified_batches: Vec<(ServedBatch, bool)> = Vec::new();
     // Each server that lacks this Mac's frontier, with the boot id its answer carried and what
     // it stated of its records.
     let mut push_urls: Vec<(String, Option<String>, transport::ReplyBound)> = Vec::new();
@@ -6929,6 +7426,8 @@ fn records_pass(
     }
     if !any_answered && let Some(err) = primary_err {
         note(&local_store);
+        // No source answered, so the pass holds no batch it verified and did not take.
+        *later = refused_later;
         return Err(err);
     }
     let lock = bounded::take(paths, deadline)?;
@@ -6968,12 +7467,12 @@ fn records_pass(
         // What crossed logs' servers sent a Mac that has not crossed: taken after the rest, and
         // only where it grows the complete log.
         let mut from_crossed_logs = Vec::new();
-        for (batch, from_crossed) in verified_batches {
+        for ((batch, served), from_crossed) in verified_batches {
             if from_crossed && !crossed_before {
-                from_crossed_logs.push(batch);
+                from_crossed_logs.push((batch, served));
                 continue;
             }
-            match store.ingest_records(batch) {
+            match store.ingest_served(batch, served.as_ref()) {
                 Ok(brought) => {
                     any_ingested = true;
                     taught_by_crossed |= from_crossed && brought > 0;
@@ -6989,14 +7488,16 @@ fn records_pass(
             // every complete record past the ids this pull named, so its records wait here only on
             // records this store can never take (`membership_log::untaken`), and the pass notes
             // them untaken whether it holds them waiting or leaves them out.
+            // A root taken drops records the store held complete, so what the log knows is
+            // counted, held or dropped (a whole log's is its held count).
             let complete = |store: &crate::membership_log::Store| {
                 store
                     .log()
-                    .map_or(0, crate::membership_log::Log::held_count)
+                    .map_or(0, crate::membership_log::Log::known_count)
             };
             let mut taught = store.clone();
-            for batch in from_crossed_logs {
-                match taught.ingest_records(batch) {
+            for (batch, served) in from_crossed_logs {
+                match taught.ingest_served(batch, served.as_ref()) {
                     Ok(_) => any_ingested = true,
                     Err(err) => last_ingest_err = Some(err),
                 }
@@ -7121,6 +7622,7 @@ fn records_pass(
             }
         }
     }
+    *later = refused_later;
     Ok(RecordsPass {
         added,
         untaken,
@@ -7128,6 +7630,104 @@ fn records_pass(
         more,
         source_short,
     })
+}
+
+/// Follow a vault into records format 2 (`crate::membership_log::follow`), for a records pass
+/// of a Mac that states format 1 and whose pull each of `later` refused beside a bound stating
+/// a later format ([`crate::ErrorKind::LaterFormat`]), once that pass took what its other
+/// sources sent ([`records_pass`]). Each is asked again, stating format 2 with no mark stored,
+/// for what it holds past this Mac's store as the pass left it: all at once under one deadline,
+/// as a pass reads its peers ([`fan_out::RECORDS`]), each answer decoded and verified as it is
+/// read and judged against a copy of the store, off the state lock. Under the lock, the first
+/// whose records give a copy of the store the lock holds a version-2 record signed by a seat
+/// that store holds is followed: the format mark is stored, and then the records file takes
+/// the copy. `Some` of how many records that added; `None` where none was followed (no mark is
+/// stored and the file is as it was), which is every pass of a build that reads no format 2
+/// ([`crate::crossing::FormatMark::follows`]): it asks no source again.
+///
+/// # Errors
+/// This Mac's store, configuration or marks cannot be read; the state lock cannot be taken;
+/// or, once a source's answer held the evidence, the mark cannot be stored (the file is as it
+/// was) or the file cannot be written (this Mac then states format 2 and holds the records it
+/// held).
+#[cfg(unix)]
+fn follow_later_format(
+    paths: &Paths,
+    later: &[String],
+    deadline: Option<Instant>,
+) -> crate::Result<Option<usize>> {
+    use crate::crossing::{FORMAT_ONE, FORMAT_TWO};
+    use crate::membership_log::Reading;
+    let format = format_mark(paths);
+    if later.is_empty() || !format.follows() {
+        return Ok(None);
+    }
+    // The store as the pass left it, with what its sources sent at format 1.
+    let local_store = load_records(paths)?;
+    let bound = records_bound(paths, &local_store)?;
+    if bound.format != FORMAT_ONE {
+        return Ok(None);
+    }
+    let config = configured(paths)?;
+    let vault_name = records_vault_name(&config);
+    let have = local_store.have();
+    let pulls_by = deadline.map(|by| {
+        by.checked_sub(TAKE_RESERVE)
+            .filter(|cut| *cut > Instant::now())
+            .unwrap_or(by)
+    });
+    let Ok(within) = bounded::budget(pulls_by, servers_within(PROBE_DEADLINE)) else {
+        return Ok(None);
+    };
+    // Only a server whose own bound is format 2's answers this with records
+    // (`transport::check_records_reply`), and what it states is no evidence. Its records are
+    // read as a follow copy reads them, and judged against one.
+    let copy = local_store.clone().read_at(Reading::Follow);
+    let answers = fan_out::reads_within(
+        fan_out::RECORDS,
+        later,
+        within,
+        |url, left, limit| {
+            transport::fetch_records_within(
+                url,
+                &have,
+                left,
+                None,
+                bound.at_format(FORMAT_TWO),
+                limit,
+                Reading::Follow,
+            )
+        },
+        |_, read| match read {
+            Ok(transport::Pulled::Fetched(answer)) if answer.received.byte_len() > 0 => {
+                let crossed = answer.bound.crossed();
+                let judged = judge_received_records(&copy, vault_name, answer.received);
+                judged.batch.map(|batch| (batch, judged.served, crossed))
+            }
+            _ => None,
+        },
+    );
+    for (batch, served, taught) in answers.into_iter().flatten().flatten() {
+        let lock = bounded::take(paths, deadline)?;
+        // The store as the lock holds it: another writer may have followed, or grown it.
+        let store = load_records(paths)?;
+        let Ok(Some(followed)) =
+            crate::membership_log::follow::follow_records(&format, &store, batch, served.as_ref())
+        else {
+            drop(lock);
+            continue;
+        };
+        let added = followed.added();
+        followed.take(&format, |store| {
+            if taught {
+                write_taught_by_crossed(paths, &crossing_mark(paths), store)
+            } else {
+                write_records(paths, store)
+            }
+        })?;
+        return Ok(Some(added));
+    }
+    Ok(None)
 }
 
 /// Write `store`, which holds a record a crossed log's server taught this Mac
@@ -7200,7 +7800,7 @@ const REPOST_AGAIN: Duration = Duration::from_secs(60 * 60);
 /// (`X-Aterm-Records-Need`), keyed by records file and server URL: a server that judged such a
 /// post and still lacks a frontier could not take all of it (a record its build refuses, a store
 /// at its bound), and posting it the same records again, up to
-/// [`crate::membership_log::MAX_RECORDS_STREAM`] each time, would not change that. It is posted
+/// [`crate::membership_log::REPLY_CAP`] each time, would not change that. It is posted
 /// nothing more while the frontier stands, and once it moves only the records past what the
 /// server judged (what this Mac minted or heard since), not the whole store on each record minted
 /// anywhere in the swarm.
@@ -9069,8 +9669,15 @@ fn apply_configured_log(
 /// The subscriber counts its passes and says them in `log` as its 1st, 2nd, 4th ... 256th pass
 /// ends and then as each 256th does ([`crate::pass_counts`]): on a running Mac,
 /// `grep 'pass counts' ~/.config/aterm/secrets/systems.alab.aterm-secrets.log`.
+///
+/// It takes what keeping the subscriber's log kept ([`crate::service::keep_log`]): nothing else
+/// makes one, so `aterm secrets watch` cannot watch without keeping it.
 #[cfg(unix)]
-pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
+pub fn watch(
+    paths: &Paths,
+    log: &(dyn Fn(&str) + Sync),
+    _kept: aterm_uds::job_log::Kept,
+) -> crate::Result<()> {
     beside_the_approver(
         |stop| approver_loop(paths, log, stop),
         || subscriber_loop(paths, log),

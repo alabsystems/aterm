@@ -5,7 +5,7 @@ use super::*;
 fn sample() -> Submission {
     Submission {
         binding: Binding {
-            session: "s-a912afd80a5a598f9ace".into(),
+            session: "tqn5r6e0148".into(),
             attempt: [2; 16],
         },
         peer_pid: 1,
@@ -38,6 +38,14 @@ fn cancel_is_bound_to_attempt_and_session() {
     assert!(Cancel::decode(&bytes, &b).is_ok());
     for other in [
         Binding {
+            session: "t0123456789".into(),
+            ..b.clone()
+        },
+        Binding {
+            session: "s-a912afd80a5a598f9ace".into(),
+            ..b.clone()
+        },
+        Binding {
             session: "s-a912afd80a5a598f9acf".into(),
             ..b.clone()
         },
@@ -46,6 +54,13 @@ fn cancel_is_bound_to_attempt_and_session() {
             ..b.clone()
         },
     ] {
+        assert!(
+            Cancel {
+                binding: other.clone()
+            }
+            .encode()
+            .is_ok()
+        );
         assert!(Cancel::decode(&bytes, &other).is_err())
     }
     for session in [
@@ -64,7 +79,7 @@ fn cancel_is_bound_to_attempt_and_session() {
         };
         assert!(malformed.encode().is_err());
     }
-    // Exact spelling remains distinct: a `t` ID never matches an earlier `s-` one.
+    // Distinct valid current IDs do not match, even with the same attempt.
     let minted = Binding {
         session: "t0000000001".into(),
         ..b.clone()
@@ -79,7 +94,7 @@ fn cancel_is_bound_to_attempt_and_session() {
 /// admitted and the journal then refused.
 #[test]
 fn a_binding_session_is_an_exact_local_session_id() {
-    for session in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+    for session in ["tqn5r6e0148", "t0123456789", "s-0123456789abcdef0123"] {
         let mut s = sample();
         s.binding.session = session.into();
         let encoded = s.encode().unwrap();
@@ -91,7 +106,7 @@ fn a_binding_session_is_an_exact_local_session_id() {
         .unwrap();
         assert!(Cancel::decode(&bytes, &s.binding).is_ok(), "{session}");
         assert!(
-            crate::control_verbs::is_minted_sid(session),
+            crate::control_request::Sid::parse(session).is_some(),
             "the journal names {session}"
         );
     }
@@ -123,6 +138,18 @@ fn a_binding_session_is_an_exact_local_session_id() {
     let mut patched = encoded.clone();
     patched[at..at + 11].copy_from_slice(b"s-acdeacde0");
     assert!(Submission::decode(&patched).is_err(), "CONTROL decode");
+    // An exact legacy local binding also reads back only with its original lower-case text.
+    s.binding.session = "s-0123456789abcdef0123".into();
+    let mut patched = s.encode().unwrap();
+    let at = patched
+        .windows(22)
+        .position(|w| w == b"s-0123456789abcdef0123")
+        .unwrap();
+    patched[at + 12] = b'A';
+    assert!(
+        Submission::decode(&patched).is_err(),
+        "CONTROL legacy decode"
+    );
 }
 #[test]
 fn started_and_finished_are_separate_from_queue() {

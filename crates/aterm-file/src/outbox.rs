@@ -11,9 +11,12 @@
 //!   `intent:<id>` for the write of an intent queued before it. One that keeps a person's side
 //!   of a held intent names it (`resolves`), so the held one is resolved once, whatever a crash
 //!   between the two writes leaves.
-//! - **No refused value.** An intent's values are held to the credential and phone guard
-//!   ([`aterm_value_guard`]) before it is accepted, whichever writer offers it (§5, rule 6), and
-//!   a read shows [`aterm_value_guard::REFUSED`] for any such text another build left here.
+//! - **No refused value.** An intent's values are held to the guard of their column's family
+//!   ([`Judged`], which the writer that knows the column's type gives each edit) before it is
+//!   accepted, whichever writer offers it (§5, rule 6), and a read shows
+//!   [`aterm_value_guard::REFUSED`] for any such text another build left here. A free-text
+//!   column refuses a credential's shape or a phone number; the lab tracker's prose, command,
+//!   path and commit columns refuse only a real secret, so a commit's full hash stands there.
 //! - **Three files**, all JSON Lines beside the snapshot: `<leaf>.outbox.jsonl` (queued),
 //!   `<leaf>.held.jsonl` (held: its register moved, or this build refuses it; shown as
 //!   `⚠ mine ‖ theirs`, never applied and never dropped but by a person's word) and
@@ -34,7 +37,7 @@
 //! nothing here: it settles each edit against the verified log.
 
 use crate::{
-    File, Frontier, Name,
+    At, File, Frontier, Name,
     snapshot::{Column, PK, Row, Snapshot, Source},
 };
 use aterm_json::{Map, Value};
@@ -59,6 +62,54 @@ pub const BETWEEN: &str = " ‖ ";
 /// The most done markers kept.
 pub const DONE_KEPT: usize = 1_024;
 
+/// How the outbox judges an edit's strings: the guard its column's family applies to that
+/// column's type, as the table does (docs/DESIGN-lab-tracker-2026-11-14.md §7, finding 34). The
+/// writer that queues an intent knows the column's type and says which; this crate knows no
+/// schema. The publisher still runs the table's own rules on whatever is queued.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Judged {
+    /// Free text, and every column whose writer says nothing else: a value shaped like a
+    /// credential ([`aterm_value_guard::credential_shaped`], a run of 40 token characters
+    /// included) or holding a phone number ([`aterm_value_guard::phone_shaped`]) is refused.
+    #[default]
+    Text,
+    /// A prose, command, path, commit or digest column (aterm-db's `Ty::Prose`, `Ty::Command`,
+    /// `Ty::Path`, `Ty::Commit`, `Ty::Digest`), or a list or record that holds one: only a real
+    /// secret ([`aterm_value_guard::secret_shaped`]) is refused, so a commit's full hash, a
+    /// digest, a long path or an issue id stands.
+    Secret,
+}
+
+impl Judged {
+    /// The word an intent's line keeps for it; none for [`Self::Text`], which a line that says
+    /// nothing is.
+    const SECRET: &'static str = "secret";
+
+    /// Whether `text` is a value no intent may carry in a column judged so, and no read lays over
+    /// a snapshot (§5, rule 6).
+    #[must_use]
+    pub fn refuses(self, text: &str) -> bool {
+        match self {
+            Self::Text => {
+                aterm_value_guard::credential_shaped(text) || aterm_value_guard::phone_shaped(text)
+            }
+            Self::Secret => aterm_value_guard::secret_shaped(text),
+        }
+    }
+
+    /// Whether any string of `value`, an object's keys included, is one [`Self::refuses`].
+    fn refuses_any(self, value: &Value) -> bool {
+        match value {
+            Value::String(text) => self.refuses(text),
+            Value::Array(items) => items.iter().any(|item| self.refuses_any(item)),
+            Value::Object(object) => object
+                .iter()
+                .any(|(key, field)| self.refuses(key) || self.refuses_any(field)),
+            _ => false,
+        }
+    }
+}
+
 /// One cell an intent writes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Edit {
@@ -73,6 +124,8 @@ pub struct Edit {
     pub text: String,
     /// The candidates the author observed: 64-hex operation digests, or `intent:<id>`.
     pub expected: Vec<String>,
+    /// The guard its column's family holds its strings to.
+    pub judged: Judged,
 }
 
 /// What a writer asks for, before it is given an id.
@@ -103,6 +156,11 @@ pub struct Intent {
     /// The held intent whose author's side this one keeps (`resolve <id> mine`): that held
     /// intent is resolved from the moment this one is written.
     pub resolves: Option<String>,
+    /// What its author's verb stated of who made it, why and on what evidence, read when the
+    /// intent was accepted, in the author's own process ([`OwnerAct::saying`]): aterm-db's
+    /// statement (`said::Said`), which the publisher signs into the record as it is, whichever
+    /// process publishes it, and never fills in from its own. At most [`MAX_SAID`] bytes.
+    pub said: Option<Value>,
 }
 
 /// A held intent.
@@ -128,6 +186,11 @@ pub struct Done {
     pub generation: Option<u32>,
     /// The replica the snapshot here was read from when the marker was written, lower-case hex.
     pub source: Option<String>,
+    /// The store its record was appended to and that store's witness count after the append
+    /// (the publisher's), or after a read that held the record (the materializer's stamp of a
+    /// marker without it, [`crate::File::stamp_done`]); `None` on a line of an earlier build,
+    /// which no frontier holds until a read stamps it.
+    pub at: Option<At>,
     /// Each register it writes, by stored key, and the candidates (operation digests) the
     /// register held once it was settled: what an edit that follows this intent was written
     /// against. Kept once the marker is seen.
@@ -136,19 +199,23 @@ pub struct Done {
 
 impl Done {
     /// Whether a snapshot projected from `frontier` holds what this marker's intent wrote:
-    /// nothing was signed; the frontier names its operation; or the frontier was read from a
-    /// later table generation (a roll restates every row as new records, so the operation is
-    /// never named again) or from another replica than the one the snapshot here was, which
-    /// never holds it.
+    /// nothing was signed; the frontier's entry for the store the record was appended to has
+    /// counted at least as far as [`Self::at`] says ([`Frontier::holds`]); or the frontier was
+    /// read from a later table generation (a roll restates every row as new records, or, in
+    /// a family that keeps its records, a read of the later generation holds the sealed
+    /// one's rows and entries; either way the snapshot holds what the operation wrote) or
+    /// from another replica than the one the snapshot here
+    /// was, which never holds it. A marker that does not say where its record was appended is
+    /// held by no frontier until a read that holds the record stamps it.
     #[must_use]
     pub fn projected(&self, frontier: Option<&Frontier>) -> bool {
-        let Some(op) = self.op.as_deref() else {
+        if self.op.is_none() {
             return true;
-        };
+        }
         let Some(frontier) = frontier else {
             return false;
         };
-        digest(op).is_some_and(|op| frontier.ids.contains(&op))
+        self.at.is_some_and(|at| frontier.holds(&at))
             || self
                 .generation
                 .is_some_and(|generation| frontier.generation > generation)
@@ -167,6 +234,9 @@ pub struct Mark {
     pub op: Option<String>,
     /// The table generation the pass settled it in.
     pub generation: u32,
+    /// The store the record was appended to and its witness count after the append
+    /// ([`Done::at`]); `None` where nothing was signed.
+    pub at: Option<At>,
     /// Each register it writes and the candidates it held once settled ([`Done::left`]).
     pub left: BTreeMap<String, Vec<String>>,
 }
@@ -280,7 +350,12 @@ impl From<io::Error> for Refused {
 pub struct OwnerAct {
     by: String,
     session: Option<String>,
+    said: Option<Value>,
 }
+
+/// Most bytes an intent's statement of who made it takes ([`Intent::said`]): a record's body
+/// limit, which no record that carries it passes anyway.
+pub const MAX_SAID: usize = 64 * 1024;
 
 fn session_word(text: &str) -> bool {
     !text.is_empty()
@@ -295,6 +370,20 @@ impl OwnerAct {
         (crate::name::part(by) && session.is_none_or(session_word)).then(|| Self {
             by: by.to_owned(),
             session: session.map(str::to_owned),
+            said: None,
+        })
+    }
+
+    /// This act, its intents carrying `said`: what the verb's own process read of who made it,
+    /// why and on what evidence (aterm-db's `said::Said`, checked there before it is given
+    /// here). An object of at most [`MAX_SAID`] bytes; `None` where it is not one.
+    #[must_use]
+    pub fn saying(mut self, said: Value) -> Option<Self> {
+        let fits = said.is_object()
+            && aterm_json::to_vec(&said).is_ok_and(|bytes| bytes.len() <= MAX_SAID);
+        fits.then(|| {
+            self.said = Some(said);
+            self
         })
     }
 
@@ -335,6 +424,9 @@ fn edit_json(edit: &Edit) -> Value {
                 .collect(),
         ),
     );
+    if edit.judged == Judged::Secret {
+        object.insert("judged".to_owned(), Value::from(Judged::SECRET));
+    }
     Value::Object(object)
 }
 
@@ -358,6 +450,13 @@ fn edit_of(value: &Value) -> Option<Edit> {
             .iter()
             .map(|digest| digest.as_str().map(str::to_owned))
             .collect::<Option<_>>()?,
+        // A word this build does not know leaves the line unread, kept as it is: read as free
+        // text and written back, it would lose what its writer said.
+        judged: match value.get("judged") {
+            None | Some(Value::Null) => Judged::Text,
+            Some(word) if word.as_str() == Some(Judged::SECRET) => Judged::Secret,
+            Some(_) => return None,
+        },
     })
 }
 
@@ -392,6 +491,9 @@ impl Intent {
         }
         if let Some(resolves) = &self.resolves {
             object.insert("resolves".to_owned(), Value::from(resolves.as_str()));
+        }
+        if let Some(said) = &self.said {
+            object.insert("said".to_owned(), said.clone());
         }
         object.insert(
             "edits".to_owned(),
@@ -428,6 +530,12 @@ impl Intent {
             resolves: match value.get("resolves") {
                 None | Some(Value::Null) => None,
                 Some(id) => Some(id.as_str().filter(|id| is_id(id))?.to_owned()),
+            },
+            // Kept as written, whatever it is: the publisher judges it, and holds an intent
+            // whose statement it refuses rather than signing it stating none.
+            said: match value.get("said") {
+                None | Some(Value::Null) => None,
+                Some(said) => Some(said.clone()),
             },
         })
     }
@@ -538,6 +646,7 @@ fn done_of(value: &Value, file: &Name) -> Option<Done> {
             .and_then(Value::as_str)
             .filter(|source| digest(source).is_some())
             .map(str::to_owned),
+        at: value.get("at").and_then(at_of),
         left: match value.get("left") {
             None | Some(Value::Null) => BTreeMap::new(),
             Some(left) => left
@@ -546,6 +655,14 @@ fn done_of(value: &Value, file: &Name) -> Option<Done> {
                 .map(|(key, ops)| Some((key.clone(), digests_of(ops)?)))
                 .collect::<Option<_>>()?,
         },
+    })
+}
+
+/// A marker's `at`: `{"store": <64 hex>, "count": <n>}`; `None` where it is not one.
+fn at_of(value: &Value) -> Option<At> {
+    Some(At {
+        store: digest(value.get("store")?.as_str()?)?,
+        count: value.get("count")?.as_u64()?,
     })
 }
 
@@ -568,6 +685,15 @@ fn done_line(done: &Done) -> String {
     }
     if let Some(source) = &done.source {
         object.insert("source".to_owned(), Value::from(source.as_str()));
+    }
+    if let Some(at) = &done.at {
+        let mut stamp = Map::new();
+        stamp.insert(
+            "store".to_owned(),
+            Value::from(aterm_codec::hex::encode_lower(&at.store)),
+        );
+        stamp.insert("count".to_owned(), Value::from(at.count));
+        object.insert("at".to_owned(), Value::Object(stamp));
     }
     if !done.left.is_empty() {
         let left: Map = done
@@ -594,27 +720,21 @@ fn resolved<'a>(queued: &'a [Intent], done: &'a [Done]) -> impl Fn(&str) -> bool
     }
 }
 
-/// Whether `text` is a value no intent may carry and no read lays over a snapshot: shaped like a
-/// credential or holding a phone number (§5, rule 6).
-fn refused(text: &str) -> bool {
-    aterm_value_guard::credential_shaped(text) || aterm_value_guard::phone_shaped(text)
+/// Whether any string of `edit` (its text, value or set element) is one its column's guard
+/// refuses ([`Judged::refuses`]).
+fn refused(edit: &Edit) -> bool {
+    edit.judged.refuses(&edit.text)
+        || edit.judged.refuses_any(&edit.value)
+        || edit
+            .elem
+            .as_deref()
+            .is_some_and(|elem| edit.judged.refuses(elem))
 }
 
-/// Whether any string of `value` is [`refused`].
-fn refuses(value: &Value) -> bool {
-    match value {
-        Value::String(text) => refused(text),
-        Value::Array(items) => items.iter().any(refuses),
-        Value::Object(object) => object
-            .iter()
-            .any(|(key, field)| refused(key) || refuses(field)),
-        _ => false,
-    }
-}
-
-/// The text a read shows for an edit: [`aterm_value_guard::REFUSED`] for one the guard refuses.
+/// The text a read shows for an edit: [`aterm_value_guard::REFUSED`] for one its column's guard
+/// refuses.
 fn shown_text(edit: &Edit) -> &str {
-    if refused(&edit.text) || refuses(&edit.value) {
+    if refused(edit) {
         aterm_value_guard::REFUSED
     } else {
         &edit.text
@@ -738,7 +858,7 @@ fn mark(snapshot: &mut Snapshot, held: &Held) {
 /// This Mac's intents a read lays over the published snapshot, in the order it lays them: each
 /// published one the snapshot does not hold (`frontier`, what it was projected from, does not
 /// show it projected), then each waiting one. A held one is only marked, never laid.
-fn laid<'a>(outbox: &'a Outbox, frontier: impl FnOnce() -> Option<Frontier>) -> Vec<&'a Intent> {
+fn laid(outbox: &Outbox, frontier: impl FnOnce() -> Option<Frontier>) -> Vec<&Intent> {
     let unseen: Vec<&Done> = outbox
         .done
         .iter()
@@ -914,11 +1034,12 @@ impl File {
 #[cfg(any(unix, windows))]
 mod write {
     use super::{
-        Accepted, DONE_KEPT, Done, Draft, Dropped, Edit, Held, INTENT, Intent, Lines, MAX_BYTES,
-        MAX_EDITS, MAX_INTENTS, Mark, OwnerAct, Refused, SELF, body, done_line, done_of, held_line,
-        held_of, intent_line, is_id, lines, refused, refuses, resolved,
+        Accepted, At, DONE_KEPT, Done, Draft, Dropped, Edit, Held, INTENT, Intent, Lines,
+        MAX_BYTES, MAX_EDITS, MAX_INTENTS, Mark, OwnerAct, Refused, SELF, body, done_line, done_of,
+        held_line, held_of, intent_line, is_id, lines, refused, resolved,
     };
-    use crate::File;
+    use crate::{File, Frontier, outbox::digest};
+    use aterm_json::Value;
     use std::{
         io,
         path::Path,
@@ -988,14 +1109,14 @@ mod write {
                     "an expected candidate is an operation digest or `intent:<id>`",
                 ));
             }
-            if refused(&edit.text)
-                || refuses(&edit.value)
-                || edit.elem.as_deref().is_some_and(refused)
-            {
-                return Err(Refused::Malformed(
-                    "a value shaped like a credential or a phone number is never written to a \
-                     shared file",
-                ));
+            if refused(edit) {
+                return Err(Refused::Malformed(match edit.judged {
+                    super::Judged::Text => {
+                        "a value shaped like a credential or a phone number is never written to \
+                         a free-text column of a shared file"
+                    }
+                    super::Judged::Secret => "a secret is never written to a shared file",
+                }));
             }
         }
         Ok(())
@@ -1090,6 +1211,7 @@ mod write {
             &self,
             by: &str,
             session: Option<&str>,
+            said: Option<&Value>,
             draft: Draft,
             now_ms: u64,
         ) -> io::Result<Intent> {
@@ -1103,6 +1225,7 @@ mod write {
                 revert: draft.revert,
                 edits: draft.edits,
                 resolves: None,
+                said: said.cloned(),
             })
         }
 
@@ -1136,12 +1259,13 @@ mod write {
             &self,
             by: &str,
             session: Option<&str>,
+            said: Option<&Value>,
             draft: Draft,
             mine: bool,
             now_ms: u64,
         ) -> Result<Accepted, Refused> {
             well_formed(&draft, mine)?;
-            let intent = self.intent(by, session, draft, now_ms)?;
+            let intent = self.intent(by, session, said, draft, now_ms)?;
             let _lock = self.outbox_lock()?;
             let (mut queued, mut held, _) = self.stored()?;
             let mut held_changed = false;
@@ -1190,7 +1314,14 @@ mod write {
             draft: Draft,
             now_ms: u64,
         ) -> Result<Accepted, Refused> {
-            self.accept_intent(&act.by, act.session.as_deref(), draft, false, now_ms)
+            self.accept_intent(
+                &act.by,
+                act.session.as_deref(),
+                act.said.as_ref(),
+                draft,
+                false,
+                now_ms,
+            )
         }
 
         /// Accept this Mac's statement of its own row, every key `<pk>.@self`: the latest per
@@ -1204,7 +1335,7 @@ mod write {
             if !crate::name::part(by) {
                 return Err(Refused::Malformed("`by` is one word [a-z][a-z0-9-]{0,19}"));
             }
-            self.accept_intent(by, None, draft, true, now_ms)
+            self.accept_intent(by, None, None, draft, true, now_ms)
         }
 
         /// Claim the queued intent `id` for signing: `None` where it is no longer waiting (a
@@ -1241,6 +1372,7 @@ mod write {
                     source: self
                         .frontier()
                         .map(|frontier| aterm_codec::hex::encode_lower(&frontier.source)),
+                    at: mark.at,
                     left: mark.left.clone(),
                 });
                 self.put_done(&done)?;
@@ -1352,7 +1484,13 @@ mod write {
             now_ms: u64,
         ) -> Result<Option<Accepted>, Refused> {
             well_formed(&draft, false)?;
-            let mut intent = self.intent(&act.by, act.session.as_deref(), draft, now_ms)?;
+            let mut intent = self.intent(
+                &act.by,
+                act.session.as_deref(),
+                act.said.as_ref(),
+                draft,
+                now_ms,
+            )?;
             intent.resolves = Some(id.to_owned());
             let _lock = self.outbox_lock()?;
             let (mut queued, mut held, done) = self.stored()?;
@@ -1376,9 +1514,63 @@ mod write {
             Ok(Some(accepted))
         }
 
+        /// Stamp where a read that holds its record found it ([`Done::at`]) on each unseen
+        /// marker whose `at` names no store of `frontier`: one an earlier build wrote without
+        /// it, or one written under a home whose custody this read no longer names (a
+        /// succession's successor reads its own store). `holds` says whether the read holds an
+        /// operation. A marker is stamped with the read's one store and its count, so a
+        /// snapshot projected from this read, or from one that extends it, holds it; a read of
+        /// two stores (a recovery read combined with its primary) stamps nothing, since it
+        /// cannot say which of the two holds the record, and the marker waits for a read of one
+        /// (until then a read lays the write over the snapshot, as for any unseen marker). The
+        /// caller passes only the newest home's read: a fenced home's would re-stamp a marker
+        /// the snapshot's frontier already holds.
+        /// Whether a marker was stamped.
+        ///
+        /// # Errors
+        /// A local file could not be read or written.
+        pub fn stamp_done(
+            &self,
+            frontier: &Frontier,
+            holds: impl Fn(&[u8; 32]) -> bool,
+        ) -> io::Result<bool> {
+            let [store] = frontier.stores.as_slice() else {
+                return Ok(false);
+            };
+            let stamps = |line: &Done| {
+                !line.seen
+                    && line
+                        .at
+                        .is_none_or(|at| !frontier.stores.iter().any(|s| s.digest == at.store))
+                    && line
+                        .op
+                        .as_deref()
+                        .and_then(digest)
+                        .is_some_and(|op| holds(&op))
+            };
+            if !self.stored()?.2.read.iter().any(|line| stamps(line)) {
+                return Ok(false);
+            }
+            let _lock = self.outbox_lock()?;
+            let (_, _, mut done) = self.stored()?;
+            let mut changed = false;
+            for line in done.read.iter_mut().filter(|line| stamps(line)) {
+                line.at = Some(At {
+                    store: store.digest,
+                    count: store.count,
+                });
+                changed = true;
+            }
+            if changed {
+                self.put_done(&done)?;
+            }
+            Ok(changed)
+        }
+
         /// Note which done markers the snapshot now holds ([`Done::projected`]): the overlay
         /// leaves those out. A marked line keeps who made the intent and what its registers held
-        /// and drops its edits; the newest [`DONE_KEPT`] markers stay, and one whose intent is
+        /// and drops its edits and its statement of who made it (`said`, up to [`MAX_SAID`]
+        /// bytes, which the signed record carries); the newest [`DONE_KEPT`] markers stay, and one whose intent is
         /// still queued always does. A held line a later intent resolves goes.
         ///
         /// # Errors
@@ -1411,6 +1603,7 @@ mod write {
                 {
                     line.seen = true;
                     line.intent.edits.clear();
+                    line.intent.said = None;
                     changed = true;
                 }
             }
@@ -1453,3 +1646,7 @@ mod write {
 pub use write::Claim;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use write::seam;
+
+#[cfg(test)]
+#[path = "outbox_tests.rs"]
+mod tests;

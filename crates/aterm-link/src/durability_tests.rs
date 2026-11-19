@@ -546,7 +546,6 @@ fn a_power_loss_under_relaxed_moves_the_generation_with_lineage() {
         let witnessed = LogWitness {
             high: opened.broker.head(),
             id: Some(opened.broker.log_identity()),
-            met: None,
         };
         assert_eq!(witnessed.high, 10);
         h.shutdown();
@@ -758,7 +757,6 @@ fn a_reader_older_than_the_lineage_window_forgets() {
             generation,
             ..first
         }),
-        met: None,
     };
     assert_eq!(
         witness(first.generation + 1).continues(Some(now), Some(&lineage)),
@@ -797,7 +795,6 @@ fn a_legacy_mark_alone_moves_the_generation_with_lineage() {
     let witnessed = crate::state::LogWitness {
         high: 3,
         id: Some(first),
-        met: None,
     };
     for (n, mark, tier) in [
         (2, legacy_mark_text(&test_boot(1)), Durability::Relaxed),

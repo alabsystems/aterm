@@ -421,6 +421,156 @@ fn a_package_campaign_publishes_from_native_qualification_and_repeats_the_same_i
 }
 
 #[test]
+fn codex_protocol_freezes_real_signed_inputs_and_rechecks_them_on_publish_and_resume() {
+    use atpkg_publish::artifact::{pkgdoc, upload};
+    use atpkg_publish::package_campaign::{Campaign, Intent};
+    let w = world("codex-campaign-protocol");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root =
+        |_| atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|e| e.to_string());
+    let journal = w.root.join("first-campaign");
+    let mut first = Campaign::open(&journal, &intent).unwrap();
+    let before = writes(&w.host.calls());
+    first
+        .prepare_protocol(&w.ctx, &request, &w.tools, &inputs, &signed_root)
+        .unwrap();
+    let frame = |state: &Path| {
+        use std::os::unix::fs::PermissionsExt as _;
+        let file = state.join("codex-protocol-input.json");
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        let bytes = read(&file);
+        let json: aterm_json::Value = aterm_json::from_slice(&bytes).unwrap();
+        (json, atpkg::sha256_bytes(&bytes))
+    };
+    let (input, hash) = frame(&journal);
+    assert_eq!(input["relation"].as_str(), Some("first"));
+    assert!(input["predecessor"].is_null());
+    assert_eq!(writes(&w.host.calls()), before);
+    first.expect_protocol(&hash).unwrap();
+    first
+        .publish_package(
+            &w.ctx,
+            &request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            None,
+            &mut Log::capture("first"),
+        )
+        .unwrap();
+    first
+        .prepare_protocol(&w.ctx, &request, &w.tools, &inputs, &signed_root)
+        .unwrap();
+    let (completed, _) = frame(&journal);
+    assert_eq!(completed["relation"].as_str(), Some("already-selected"));
+    assert_eq!(completed["predecessor"], completed["successor"]);
+
+    let new_root = regular_release(&w, "next", "0.6.0");
+    let new_build = ALAB + 1;
+    let new_pkg = package::read_package(
+        &new_root,
+        "codex",
+        atpkg_publish::triple::AARCH64_APPLE_DARWIN,
+    )
+    .unwrap();
+    let new_intent = Intent::from_package(&w.ctx, "codex", new_build, &new_pkg).unwrap();
+    let mut new_request = w.request(&new_root, new_build);
+    new_request.toolchain = None;
+    let state = w.root.join("second-campaign");
+    let mut campaign = Campaign::open(&state, &new_intent).unwrap();
+    let before = writes(&w.host.calls());
+    campaign
+        .prepare_protocol(&w.ctx, &new_request, &w.tools, &inputs, &signed_root)
+        .unwrap();
+    let (pair, hash) = frame(&state);
+    assert_eq!(writes(&w.host.calls()), before);
+    assert_eq!(pair["relation"].as_str(), Some("upgrade"));
+    assert_eq!(pair["predecessor"], input["successor"]);
+    assert_eq!(
+        pair["successor"]["source"].as_str(),
+        Some(new_pkg.source.as_str())
+    );
+    assert_eq!(
+        pair["successor"]["executable_sha256"].as_str(),
+        Some(
+            atpkg::sha256_file(&new_root.join("bin/codex"))
+                .unwrap()
+                .as_str()
+        )
+    );
+    assert!(campaign.expect_protocol(&"f".repeat(64)).is_err());
+    campaign.expect_protocol(&hash).unwrap();
+
+    let public = w.ctx.public_slug("codex-alab");
+    let tag = upload::tag("codex", ALAB);
+    let name = pkgdoc::manifest_name("codex", ALAB);
+    let sig = pkgdoc::sig_name("codex", ALAB);
+    let original = w.host.asset(&public, &tag, &name).unwrap();
+    let replacement = [original.as_slice(), b"\n# separately signed replacement\n"].concat();
+    let select_manifest = |bytes: &[u8]| {
+        w.host.put_asset(&public, &tag, &name, bytes);
+        w.host.put_asset(&public, &tag, &sig, w.keys.sign(bytes));
+    };
+    let publish = |campaign: &mut Campaign| {
+        campaign.publish_package(
+            &w.ctx,
+            &new_request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            None,
+            &mut Log::capture("new pin"),
+        )
+    };
+    select_manifest(&replacement);
+    let stale = publish(&mut campaign).unwrap_err();
+    assert!(
+        stale.to_string().contains("signed Codex manifest changed"),
+        "{stale}"
+    );
+    assert!(
+        w.host
+            .asset(&w.ctx.index_slug(), "atpkg-index-73", QUAD_FILES[0])
+            .is_none()
+    );
+
+    select_manifest(&original);
+    let mut index = campaign_index(&w);
+    index.delta.pins.insert("codex".into(), new_build);
+    let mut stop = StopAfterRetention(campaign.retention(&w.ctx));
+    atpkg_publish::channel::index::publish_with_observer(
+        &w.ctx,
+        &index,
+        &mut Log::capture("interrupted"),
+        &mut stop,
+    )
+    .unwrap_err();
+    assert!(stop.0.into_retained().is_some());
+    drop(campaign);
+    let mut resumed = Campaign::open(&state, &new_intent).unwrap();
+    let missing = publish(&mut resumed).unwrap_err();
+    assert!(
+        missing.to_string().contains("--expect-codex-protocol"),
+        "{missing}"
+    );
+    resumed.expect_protocol(&hash).unwrap();
+    select_manifest(&replacement);
+    let stale = publish(&mut resumed).unwrap_err();
+    assert!(
+        stale.to_string().contains("signed Codex manifest changed"),
+        "{stale}"
+    );
+    assert!(
+        w.host
+            .asset(&w.ctx.index_slug(), "atpkg-index-73", QUAD_FILES[0])
+            .is_none()
+    );
+    select_manifest(&original);
+    assert_eq!(publish(&mut resumed).unwrap().index_build, 73);
+}
+
+#[test]
 fn a_campaign_that_loses_its_index_race_retires_the_attempt_and_plans_over_the_winner() {
     use atpkg_publish::package_campaign::{Campaign, Observation, Outcome};
 
@@ -1497,21 +1647,25 @@ fn regular_campaign_package(w: &World) -> PathBuf {
         &w.keys
             .index_toml(71, &[("codex", "aterm")], &[("codex", LIVE_CODEX)]),
     );
-    put(&w.source.join("VERSION"), b"0.5.0\n");
+    regular_release(w, "regular", "0.5.0")
+}
+
+fn regular_release(w: &World, name: &str, version: &str) -> PathBuf {
+    put(&w.source.join("VERSION"), format!("{version}\n").as_bytes());
     put(
         &w.source.join("alab/versions.toml"),
-        b"[[release]]\nversion = '0.5.0'\nbaseline = '0.167.1'\n",
+        format!("[[release]]\nversion = '{version}'\nbaseline = '0.167.1'\n").as_bytes(),
     );
     git(&w.source, &["add", "."]);
     git(&w.source, &["commit", "-q", "-m", "regular release"]);
     git(&w.source, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
     let lay = Lay {
-        version: "0.5.0".into(),
+        version: version.into(),
         source: git(&w.source, &["rev-parse", "HEAD"]),
         baseline: Some("0.167.1".into()),
         ..w.lay()
     };
-    let root = w.package("regular", &lay);
+    let root = w.package(name, &lay);
     let record = root.join("alab-build.json");
     let mut value: aterm_json::Value = aterm_json::from_slice(&read(&record)).unwrap();
     value

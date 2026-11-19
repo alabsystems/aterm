@@ -23,6 +23,13 @@
 //! Mac that comes back on an older build would write the file; only a member gone from the
 //! roster stops counting, and the vault's own list of readers still counts it
 //! (`crate::client::fleet_in_place`).
+//!
+//! A member this device never meets can be heard through another member (tracker LT-04C): a
+//! member signs its version with the time it signed ([`report_at`], 136 bytes), a device keeps
+//! the newest such report of every roster member to hand to its peers ([`Reports`]), and
+//! [`Ledger::relay`] counts one for the gates above from the time its member signed it. A
+//! relayed report is no contact: it neither starts nor extends the watch. The 80-byte
+//! [`report`] and the `heard` file keep their formats.
 
 use super::{
     binding::Binding,
@@ -67,6 +74,28 @@ pub const READS_CHECKPOINTS: Version = Version(0, 203, 0);
 /// Exact wire size of a signed [`report`].
 pub const REPORT_LEN: usize = 4 + 12 + 64;
 const REPORT_DOMAIN: &[u8] = b"aterm/commons/version-report/1\0";
+/// Exact wire size of a time-signed report ([`report_at`]).
+pub const REPORT2_LEN: usize = 4 + 48 + 12 + 8 + 64;
+const REPORT2_DOMAIN: &[u8] = b"aterm/commons/version-report/2\0";
+/// How far past this device's clock a time-signed report's time may be: one signed further
+/// ahead is refused, so a member's fast clock makes its report count at most this much longer
+/// than [`RECENT`]. A report's time is trusted no closer than this: one stamped within it after
+/// the report a ledger holds does not replace that one ([`Ledger::relay`]).
+pub const AHEAD: u64 = 10 * 60 * 1000;
+/// A member signs its version again this long after its last time-signed report.
+pub const REFRESH: u64 = DAY_MS;
+/// The least time between two of one member's time-signed reports that a device keeps: a
+/// member moves what every device keeps of it at most 24 times a day.
+pub const STEP: u64 = 60 * 60 * 1000;
+/// The least time between two writes of the kept reports' file (`<commons>/reports`).
+pub const PERSIST: u64 = 60 * 60 * 1000;
+/// The most reports one side offers a peer in one round; the rest follow in later rounds.
+pub const RELAY_BATCH: usize = 256;
+/// The least release a peer must report in a repair round ([`report`]) for time-signed reports
+/// to be traded with it after that round, so an older peer receives the bytes it always did.
+/// A build stamped with this release from before the trade existed does not answer one: the
+/// trade is best effort, after everything else in the round.
+pub const RELAYS: Version = Version(0, 207, 0);
 const MAGIC: &str = "aterm-commons-heard 1";
 const MAX_FILE: usize = 1 << 20;
 
@@ -145,6 +174,130 @@ pub fn reported(wire: &[u8], network: [u8; 16], actor: &Actor) -> Result<Version
         ));
     }
     Ok(version)
+}
+
+fn signed_at(network: [u8; 16], actor: &Actor, version: Version, signed_ms: u64) -> Vec<u8> {
+    let mut message = REPORT2_DOMAIN.to_vec();
+    message.extend_from_slice(&network);
+    message.extend_from_slice(actor);
+    message.extend_from_slice(&version.bytes());
+    message.extend_from_slice(&signed_ms.to_le_bytes());
+    message
+}
+
+/// Sign `version` as `actor`, whose writer key `seed` must hold, with the time of signing
+/// (Unix milliseconds on the signer's clock): `"ACV2"`, the actor, the version, the time and the
+/// signature. Its signing domain is not [`report`]'s, so neither signature stands for the other.
+pub fn report_at(
+    seed: &[u8; 32],
+    network: [u8; 16],
+    actor: &Actor,
+    version: Version,
+    signed_ms: u64,
+) -> Result<[u8; REPORT2_LEN]> {
+    let key = Ed25519KeyPair::from_seed_unchecked(seed)
+        .map_err(|_| Error::new("invalid Commons writer key"))?;
+    if key.public_key().as_ref() != &actor[..32] {
+        return Err(Error::new("version report key is not this writer's"));
+    }
+    let mut wire = [0; REPORT2_LEN];
+    wire[..4].copy_from_slice(b"ACV2");
+    wire[4..52].copy_from_slice(actor);
+    wire[52..64].copy_from_slice(&version.bytes());
+    wire[64..72].copy_from_slice(&signed_ms.to_le_bytes());
+    wire[72..].copy_from_slice(
+        key.sign(&signed_at(network, actor, version, signed_ms))
+            .as_ref(),
+    );
+    Ok(wire)
+}
+
+/// The actor, version and signed time a time-signed report's bytes name; nothing is verified.
+fn fields(wire: &[u8]) -> Option<(Actor, Version, u64)> {
+    if wire.len() != REPORT2_LEN || &wire[..4] != b"ACV2" {
+        return None;
+    }
+    let word = |at: usize| u32::from_le_bytes(wire[at..at + 4].try_into().unwrap());
+    Some((
+        wire[4..52].try_into().unwrap(),
+        Version(word(52), word(56), word(60)),
+        u64::from_le_bytes(wire[64..72].try_into().unwrap()),
+    ))
+}
+
+/// Whether a report signed at `signed_ms` counts at `now_ms`: signed within [`RECENT`], and no
+/// more than [`AHEAD`] past this clock.
+fn timely(signed_ms: u64, now_ms: u64) -> bool {
+    signed_ms.saturating_add(RECENT) > now_ms && signed_ms <= now_ms.saturating_add(AHEAD)
+}
+
+/// A time-signed report whose signature verified under a member's binding ([`relayed`], its
+/// only constructor).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relayed {
+    network: [u8; 16],
+    authority: [u8; 32],
+    actor: Actor,
+    version: Version,
+    signed_ms: u64,
+    wire: [u8; REPORT2_LEN],
+}
+
+impl Relayed {
+    /// The member that signed it.
+    pub fn actor(&self) -> Actor {
+        self.actor
+    }
+    /// The version it signed.
+    pub fn version(&self) -> Version {
+        self.version
+    }
+    /// When it signed, by its own clock (Unix milliseconds).
+    pub fn signed_ms(&self) -> u64 {
+        self.signed_ms
+    }
+    /// The bytes it signed and sent, as [`report_at`] made them.
+    pub fn wire(&self) -> &[u8; REPORT2_LEN] {
+        &self.wire
+    }
+}
+
+/// The time-signed report `member` made in `wire`, whoever handed it over. It is refused unless
+/// it is [`REPORT2_LEN`] bytes of `"ACV2"`, names `member`'s own actor, was signed within
+/// [`RECENT`] of `now_ms` and no more than [`AHEAD`] past it, and, checked last, carries the
+/// actor's signature for `member`'s network.
+pub fn relayed(wire: &[u8], member: &Binding, now_ms: u64) -> Result<Relayed> {
+    let Some((actor, version, signed_ms)) = fields(wire) else {
+        return Err(Error::new("invalid Commons relayed version report"));
+    };
+    if actor != member.actor() {
+        return Err(Error::new(
+            "Commons relayed version report is not this member's",
+        ));
+    }
+    if !timely(signed_ms, now_ms) {
+        return Err(Error::new(
+            "Commons relayed version report was not signed within the last 7 days",
+        ));
+    }
+    let network = *member.network();
+    if !crate::ed25519::verifies(
+        &actor[..32],
+        &signed_at(network, &actor, version, signed_ms),
+        &wire[72..],
+    ) {
+        return Err(Error::new(
+            "Commons relayed version report signature did not verify",
+        ));
+    }
+    Ok(Relayed {
+        network,
+        authority: *member.authority(),
+        actor,
+        version,
+        signed_ms,
+        wire: wire.try_into().unwrap(),
+    })
 }
 
 /// What one contact said about the peer's version.
@@ -455,6 +608,45 @@ impl Ledger {
         added || before != entry.version
     }
 
+    /// Count a member's time-signed report that reached this device through any member. It
+    /// counts only for this ledger's network and authority, never for the local writer, and only
+    /// while it is signed within [`RECENT`] of `now_ms` and no more than [`AHEAD`] past it. The
+    /// member is heard from the time it signed, or from `now_ms` where it signed later, so the
+    /// ledger holds no time ahead of this clock and a later round with the member still
+    /// replaces what this wrote ([`Self::record`]). Its version replaces the one held only when
+    /// that time is more than [`AHEAD`] later than the held report's. So an older report never
+    /// replaces a newer one, relayed or heard directly, and neither does one stamped within
+    /// [`AHEAD`] after a round with the member: its signer's clock may run that fast, so it may
+    /// have been signed before the round. Two reports a device keeps of one member are [`STEP`]
+    /// apart, so the later of them always counts. This is no contact: the watch neither starts
+    /// nor grows by it. Whether this changed a version or added a member.
+    pub fn relay(&mut self, report: &Relayed, now_ms: u64) -> bool {
+        if report.network != self.trust.network
+            || report.authority != self.trust.authority
+            || self.local == Some(report.actor)
+            || !timely(report.signed_ms, now_ms)
+        {
+            return false;
+        }
+        let at_ms = report.signed_ms.min(now_ms);
+        let added = !self.heard.contains_key(&report.actor);
+        if added && self.heard.len() >= MAX_BINDINGS {
+            return false;
+        }
+        let entry = self.heard.entry(report.actor).or_insert(Entry {
+            at_ms,
+            version: None,
+            said_ms: 0,
+        });
+        let before = entry.version;
+        entry.at_ms = entry.at_ms.max(at_ms);
+        if at_ms > entry.said_ms.saturating_add(AHEAD) {
+            entry.version = Some(report.version);
+            entry.said_ms = at_ms;
+        }
+        added || before != entry.version
+    }
+
     /// Start the clock on a member of the current roster this device never heard: it is silent
     /// only [`SILENT`] after this, and until it is heard it holds the gate for [`RECENT`] as a
     /// member heard without a report. Whether it was new.
@@ -641,6 +833,13 @@ impl Gate<'_> {
         )))
     }
 }
+
+mod relay;
+pub use relay::{
+    ANSWER_MAX, GIVE_MAX, LAST_MAX, Mark, OFFER_MAX, Offer, Reports, Tag, answer_flight,
+    give_flight, last_flight, offer_flight, read_answer, read_give, read_last, read_offer, tag,
+    taken,
+};
 
 #[cfg(test)]
 mod tests;

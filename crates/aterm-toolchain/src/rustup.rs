@@ -9,6 +9,32 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/// The top-level rustup settings used to identify its default host and toolchain.
+/// Other settings, including directory overrides, are left to rustup.
+pub struct Settings {
+    /// An explicitly selected host triple.
+    pub default_host_triple: Option<String>,
+    /// The default toolchain's name or channel.
+    pub default_toolchain: Option<String>,
+}
+
+/// Parse a complete TOML settings document. Invalid syntax, duplicate keys and non-string
+/// values for the settings we consume yield no settings rather than a partial answer.
+#[must_use]
+pub fn parse_settings(text: &str) -> Option<Settings> {
+    let document: aterm_toml::Value = aterm_toml::from_str(text).ok()?;
+    let table = document.as_table()?;
+    let string = |key| match table.get(key) {
+        Some(aterm_toml::Value::String(value)) => Some(Some(value.clone())),
+        Some(_) => None,
+        None => Some(None),
+    };
+    Some(Settings {
+        default_host_triple: string("default_host_triple")?,
+        default_toolchain: string("default_toolchain")?,
+    })
+}
+
 /// Rustup's home: a non-empty `$RUSTUP_HOME`, else `<home>/.rustup`.
 #[must_use]
 pub fn rustup_home(env_rustup_home: Option<&OsStr>, home: &Path) -> PathBuf {
@@ -113,20 +139,9 @@ pub fn default_host_from_env() -> String {
 
 /// The top-level `default_host_triple = "…"` of rustup's `settings.toml`, if it names one.
 fn settings_host(settings: &str) -> Option<String> {
-    settings
-        .lines()
-        .map(str::trim)
-        .take_while(|l| !l.starts_with('['))
-        .find_map(|l| {
-            l.strip_prefix("default_host_triple")?
-                .trim_start()
-                .strip_prefix('=')?
-                .trim()
-                .strip_prefix('"')?
-                .strip_suffix('"')
-                .filter(|host| !host.is_empty())
-                .map(str::to_string)
-        })
+    parse_settings(settings)?
+        .default_host_triple
+        .filter(|host| !host.is_empty())
 }
 
 pub use crate::stock_pin::STOCK_PIN;

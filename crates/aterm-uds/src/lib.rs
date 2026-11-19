@@ -457,6 +457,9 @@ pub mod hangup;
 /// Which live processes of this uid hold a descriptor for one device (the PTY keeper's holder scan), or use a path under a set of directories (the disk watch's check before it removes a build directory whole).
 pub mod holders;
 pub mod host;
+/// The log of every job aterm installs, kept bounded by the job's own process: each job's verb keeps the files its definition names that are its standard output or error, and writes its diagnostics there dated.
+#[cfg(unix)]
+pub mod job_log;
 /// Whether this user's default keychain is unlocked, read with no dialog: work nobody asked for runs no keychain-reading program while it is not.
 pub mod keychain;
 /// aterm's own LAN traffic, through the root LAN broker on macOS (`docs/DESIGN-lan-broker-2026-11-05.md`).
@@ -483,6 +486,8 @@ pub mod nofollow;
 pub mod output;
 /// Who holds a file's owner lock (the PTY keeper reads a dead window's crash marker with it).
 pub mod ownerlock;
+/// A condition-variable bell a background thread waits on until a deadline or a ring.
+pub mod park_bell;
 /// The partition lane's cut: in a debug build, `ATERM_DEBUG_PARTITION` names the `ip:port`s the one TCP connect funnel, [`connect_tcp`], refuses to dial (fleet dials, a loopback-scope `lan::Connection`, vault requests, atpkg's peer fetches; [`partition::check`]); a LAN-scope `lan::Connection` and a direct `TcpStream` connect are not cut.
 pub mod partition;
 /// The kernel's record of a socket peer: its uid and (Darwin) audit token.
@@ -584,6 +589,9 @@ pub fn raised_soft_nofile_target(soft: u64, hard: u64) -> Option<u64> {
 }
 /// Pure-Rust, read-only SQLite 3 B-tree and WAL snapshot reader (`#![forbid(unsafe_code)]`), paired with [`foreign_db::read_bytes`].
 pub mod sqlite_read;
+/// Test support (test and debug builds, Unix): a stand-in's shell loop that ends by itself once its test binary is gone ([`stand_in_loop::while_alive`], [`stand_in_loop::while_parent_alive`]), for a stand-in leading a group or a session of its own, which no signal to the binary's group reaches.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub mod stand_in_loop;
 /// A verb's answer on stdout, where a reader that closed the pipe (`| head -1`) ends the answer instead of panicking the process.
 pub mod stdout;
 /// A latched stop a thread sleeps on between rounds and is woken by at once ([`stop::Stop`]), in place of a flag it reads every few milliseconds.
@@ -598,6 +606,12 @@ pub mod test_binary;
 pub mod tether;
 /// What a run read and compared while a thread's scope was armed (file stamps, listings, owners' standings, watched generations, wall and monotonic bounds), whether running it again could answer otherwise ([`trace::Trace::stands`]), and when it may stop standing on its own ([`trace::Trace::horizon`]).
 pub mod trace;
+
+/// A scratch world's words (`aterm_types::world`), mounted from that crate's own `std`-only file,
+/// so the LAN client's ask of the root broker (`lan::install`) reads the same mark
+/// ([`world::MARKER`]) and sends nothing from a world.
+#[path = "../../aterm-types/src/world_words.rs"]
+pub mod world;
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod retained_image_store;

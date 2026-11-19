@@ -1807,7 +1807,7 @@ fn prune_opts(dir: &Path) -> Opts {
         human_grace_s: 0,
         hand_back: false,
         background: false,
-        aterm_state: None,
+        aterm_state: Some(dir.join("aterm-state")),
         ask: false,
         usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
@@ -2100,6 +2100,112 @@ fn a_registry_vouches_only_for_a_state_root_of_its_own_kind() {
             "registry private = {private_registry}, state private = {private_state}"
         );
     }
+}
+
+/// A settled Codex record of a tab this window's graph does not hold stays while another running
+/// window of the same state root publishes that tab (this test process's own record stands in
+/// for that window), however long it went unwritten.
+/// NEGATIVE CONTROL: once that window's record is gone (it quit), the same graph entry speaks for
+/// nothing and the record is removed, as this window's graph alone would have removed it while
+/// the tab ran.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn a_codex_record_another_running_window_holds_is_kept() {
+    const HERE: &str = "t0c0c0c0c0c";
+    const ELSEWHERE: &str = "t0d0d0d0d0d";
+    let dir = scratch("codex-prune-across");
+    let opts = prune_opts(&dir);
+    let root = opts.aterm_state.clone().expect("a state root");
+    let own = registry(&dir, &[HERE]);
+    let other = dir.join("other").join("graph");
+    std::fs::create_dir_all(&other).expect("other graph");
+    std::fs::write(
+        other.join(ELSEWHERE),
+        "sock /y/aterm-2.sock\nnonce 00\npid 2\n",
+    )
+    .expect("entry");
+    let record = crate::harness::graph_records::record(
+        &crate::harness::graph_records::drive_folder(&root),
+        std::slice::from_ref(&other),
+    )
+    .expect("the other window's record");
+    let path = filed(
+        &opts,
+        ELSEWHERE,
+        Phase::Done,
+        Request::None,
+        super::super::STATE_KEEP_S + 3_600,
+    );
+    let known_live = [HERE.to_string()];
+    prune(&opts, now_s(), registry_life(Some(&own), &known_live));
+    assert!(path.exists(), "a tab another window runs lost its record");
+    crate::harness::graph_records::forget(&record);
+    prune(&opts, now_s(), registry_life(Some(&own), &known_live));
+    assert!(
+        !path.exists(),
+        "a tab no running window holds kept its record"
+    );
+}
+
+/// Two windows of different aterm state roots that share one harness state see each other's
+/// records beside the agent records they share: a settled Codex record of a tab this window's
+/// graph does not hold stays while a window of another aterm state root publishes that tab and
+/// records itself in every records folder its roots resolve (`graph_records::folders_of`, as a
+/// window's publisher does; this test process's own records stand in for that window), however
+/// long it went unwritten.
+/// NEGATIVE CONTROL: that window's record kept beside its own aterm state root's drive journals
+/// only speaks for nothing to this harness state's prune, and the record is removed.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn a_window_of_another_aterm_state_root_sharing_the_harness_state_keeps_its_record() {
+    use crate::harness::graph_records;
+    const HERE: &str = "t0e0e0e0e0e";
+    const ELSEWHERE: &str = "t0f0f0f0f0f";
+    let dir = scratch("codex-prune-shared-harness");
+    let opts = prune_opts(&dir);
+    let other_root = dir.join("other-aterm-state");
+    assert_ne!(opts.aterm_state.as_deref(), Some(other_root.as_path()));
+    let own = registry(&dir, &[HERE]);
+    let other = dir.join("other").join("graph");
+    std::fs::create_dir_all(&other).expect("other graph");
+    std::fs::write(
+        other.join(ELSEWHERE),
+        "sock /y/aterm-2.sock\nnonce 00\npid 2\n",
+    )
+    .expect("entry");
+    let records: Vec<PathBuf> = graph_records::folders_of(Some(&other_root), Some(&opts.state))
+        .iter()
+        .map(|folder| {
+            graph_records::record(folder, std::slice::from_ref(&other))
+                .expect("the other window's record")
+        })
+        .collect();
+    let path = filed(
+        &opts,
+        ELSEWHERE,
+        Phase::Done,
+        Request::None,
+        super::super::STATE_KEEP_S + 3_600,
+    );
+    let known_live = [HERE.to_string()];
+    prune(&opts, now_s(), registry_life(Some(&own), &known_live));
+    assert!(
+        path.exists(),
+        "a tab a window sharing the harness state runs lost its record"
+    );
+    let (drive, beside) = records.split_first().expect("a record");
+    assert_eq!(
+        drive.parent(),
+        Some(graph_records::drive_folder(&other_root).as_path())
+    );
+    for record in beside {
+        graph_records::forget(record);
+    }
+    prune(&opts, now_s(), registry_life(Some(&own), &known_live));
+    assert!(
+        !path.exists(),
+        "a record kept beside another aterm state root only spoke for the shared harness state"
+    );
 }
 
 #[test]

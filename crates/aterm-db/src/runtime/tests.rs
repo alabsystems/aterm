@@ -1002,6 +1002,322 @@ fn the_hearing_ledger_keeps_a_version_at_its_round_and_the_contact_that_came_aft
     assert!(!record_contacts(&mut ledger, &contacts, 100_000, now));
 }
 
+/// What a round's trade of version reports leaves in this Mac's store reaches its contact
+/// ledger at the next hearing tick, with no round between the two Macs: the member the
+/// checkpoint gate held as unheard is counted from the time it signed, in the ledger and in
+/// `<commons>/heard`, and that is no contact, so the watch does not start (the kept file's watch
+/// line stays `0 0`, where a tick with a round of that member's own starts it). The first tick
+/// gives the store its roster, signs this Mac's own report into it and keeps it in
+/// `<commons>/reports`; a hearing opened afterwards reads that report back and signs no other.
+///
+/// NEGATIVE CONTROL: with `Hearing::hear_relayed` recording each report as a contact
+/// (`Ledger::record` at the signed time, in place of `Ledger::relay`), the watch starts:
+/// `` left: Some("1794984691439 1794984691458") right: Some("0 0") ``.
+#[test]
+fn relayed_reports_reach_the_ledger_at_the_hearing_tick_without_counting_as_contact() {
+    use aterm_secrets::commons::{
+        hearing::{CHECKPOINTS, Entry, Hold, RELAYS, Reports, Version},
+        roster::Role,
+    };
+    let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+    // Mac 2 runs the tick; Mac 1 is the member it has no round with.
+    let (signer, local) = (lab.bootstrap(0), lab.bootstrap(1));
+    let member = signer.request().unwrap().binding().clone();
+    let own = local.request().unwrap().binding().clone();
+    let reports = Arc::new(Mutex::new(Reports::new(local.trust(), &own)));
+    let mut hearing = Hearing::open(&local, &own, reports.clone());
+    let tick = |hearing: &mut Hearing, contacts: &[transport::Contact]| {
+        let resolved = std::cell::OnceCell::new();
+        hearing.tick(&lab.paths[1], &local, &resolved, contacts, Instant::now());
+    };
+    let watch = || {
+        let kept = std::fs::read_to_string(local.heard_file()).unwrap();
+        kept.lines().nth(2).map(str::to_owned)
+    };
+    let unheard = vec![(member.actor(), Hold::Unheard)];
+
+    tick(&mut hearing, &[]);
+    let now_ms = aterm_time::unix_millis().unwrap();
+    let (kept, _) = reports.lock().unwrap().since(0);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        (kept[0].actor(), kept[0].version()),
+        (own.actor(), Version::own())
+    );
+    assert_eq!(
+        hearing.ledger.holding_below([&member], now_ms, CHECKPOINTS),
+        unheard
+    );
+
+    // A round with some other peer leaves Mac 1's report in the store.
+    let wire = signer
+        .device()
+        .with_seed(|seed| {
+            hearing::report_at(seed, local.trust().network, &member.actor(), RELAYS, now_ms)
+        })
+        .unwrap();
+    {
+        let mut store = reports.lock().unwrap();
+        let binding = store.screen(&wire, now_ms).unwrap();
+        assert!(store.accept(hearing::relayed(&wire, &binding, now_ms).unwrap(), now_ms));
+    }
+    tick(&mut hearing, &[]);
+    let heard = Entry {
+        at_ms: now_ms,
+        version: Some(RELAYS),
+        said_ms: now_ms,
+    };
+    assert_eq!(hearing.ledger.entry(&member.actor()), Some(&heard));
+    assert!(
+        hearing
+            .ledger
+            .holding_below([&member], now_ms, CHECKPOINTS)
+            .is_empty()
+    );
+    let read = Ledger::read(&local);
+    assert_eq!(read.entry(&member.actor()), Some(&heard));
+    assert_eq!(watch().as_deref(), Some("0 0"));
+
+    // A hearing opened afterwards reads this Mac's own report from the file and keeps it.
+    let again = Arc::new(Mutex::new(Reports::new(local.trust(), &own)));
+    let mut reopened = Hearing::open(&local, &own, again.clone());
+    tick(&mut reopened, &[]);
+    let (read_back, _) = again.lock().unwrap().since(0);
+    assert_eq!(read_back, kept);
+
+    // A round with Mac 1 itself, which the relayed report was not, starts the watch, and what
+    // that round reported replaces what the relayed report said.
+    let at = Instant::now();
+    let contact = transport::Contact {
+        actor: member.actor(),
+        at,
+        lease: discovery::Hints::promise(),
+        said: Said::Version(Version::own()),
+        said_at: at,
+        clock: None,
+        clock_at: at,
+    };
+    tick(&mut hearing, &[contact]);
+    assert_ne!(watch().as_deref(), Some("0 0"));
+    assert_eq!(
+        hearing.ledger.entry(&member.actor()).unwrap().version,
+        Some(Version::own())
+    );
+}
+
+/// Mac 2 of a lab of two writers, for its hearing tick: its store of kept reports, and Mac 1
+/// as the member it hears of.
+struct Listening {
+    lab: crate::table::tests::Lab,
+    local: Bootstrap,
+    own: aterm_secrets::commons::binding::Binding,
+    member: aterm_secrets::commons::binding::Binding,
+    reports: Arc<Mutex<hearing::Reports>>,
+}
+
+impl Listening {
+    fn new() -> Self {
+        let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer; 2]);
+        let local = lab.bootstrap(1);
+        let own = local.request().unwrap().binding().clone();
+        let member = lab.bootstrap(0).request().unwrap().binding().clone();
+        let reports = Arc::new(Mutex::new(hearing::Reports::new(local.trust(), &own)));
+        Self {
+            lab,
+            local,
+            own,
+            member,
+            reports,
+        }
+    }
+
+    fn hearing(&self) -> Hearing {
+        Hearing::open(&self.local, &self.own, self.reports.clone())
+    }
+
+    /// One tick of `hearing` at `now`, with `contacts` as the rounds since the last.
+    fn tick(&self, hearing: &mut Hearing, contacts: &[transport::Contact], now: Instant) {
+        let resolved = std::cell::OnceCell::new();
+        hearing.tick(&self.lab.paths[1], &self.local, &resolved, contacts, now);
+    }
+
+    /// Mac 1's report of `version` stamped `signed_ms`, left in the store as by a round with
+    /// some other peer.
+    fn hand(&self, version: hearing::Version, signed_ms: u64) {
+        let now_ms = aterm_time::unix_millis().unwrap();
+        let wire = self
+            .lab
+            .bootstrap(0)
+            .device()
+            .with_seed(|seed| {
+                hearing::report_at(
+                    seed,
+                    self.local.trust().network,
+                    &self.member.actor(),
+                    version,
+                    signed_ms,
+                )
+            })
+            .unwrap();
+        let mut store = self.reports.lock().unwrap();
+        let binding = store.screen(&wire, now_ms).unwrap();
+        assert!(store.accept(hearing::relayed(&wire, &binding, now_ms).unwrap(), now_ms));
+    }
+
+    /// A round with Mac 1 that ended at `at` and reported `version`.
+    fn contact(&self, version: hearing::Version, at: Instant) -> transport::Contact {
+        transport::Contact {
+            actor: self.member.actor(),
+            at,
+            lease: discovery::Hints::promise(),
+            said: Said::Version(version),
+            said_at: at,
+            clock: None,
+            clock_at: at,
+        }
+    }
+
+    /// The members whose reports `<commons>/reports` holds, as a store that starts now reads it.
+    fn filed(&self) -> std::collections::BTreeSet<astream_wire::sync::Actor> {
+        let now_ms = aterm_time::unix_millis().unwrap();
+        let mut read = hearing::Reports::new(self.local.trust(), &self.own);
+        read.set_roster([&self.member, &self.own], now_ms);
+        read.load(&self.local, now_ms);
+        let (kept, _) = read.since(0);
+        kept.iter().map(hearing::Relayed::actor).collect()
+    }
+}
+
+/// What a round with a member said stands against a relayed report of that member stamped
+/// minutes later, when both reach the same hearing tick: the tick records its rounds before it
+/// counts relayed reports. Mac 1's clock runs nine minutes fast; it signed a release, went back
+/// to a build that neither reads checkpoints nor stopped writing secret files, and a round two
+/// seconds before the tick heard that build. Its earlier report, left in the store by another
+/// peer, does not replace what the round said, and the checkpoint gate holds.
+///
+/// NEGATIVE CONTROL: with `Hearing::tick` counting relayed reports before it records its
+/// rounds, the report sets the version at the tick's time and the round, two seconds earlier,
+/// is dropped: `` left: Some(Version(0, 207, 0)) right: Some(Version(0, 202, 0)) ``.
+#[test]
+fn a_round_with_a_member_stands_against_its_relayed_report_in_the_same_tick() {
+    use hearing::{CHECKPOINTS, Hold, RELAYS, Version};
+    let lab = Listening::new();
+    let mut hearing = lab.hearing();
+    lab.tick(&mut hearing, &[], Instant::now());
+
+    let older = Version(0, 202, 0);
+    let now_ms = aterm_time::unix_millis().unwrap();
+    lab.hand(RELAYS, now_ms + 9 * 60 * 1000);
+    let now = Instant::now();
+    let heard = now.checked_sub(Duration::from_secs(2)).unwrap();
+    lab.tick(&mut hearing, &[lab.contact(older, heard)], now);
+
+    let actor = lab.member.actor();
+    assert_eq!(hearing.ledger.entry(&actor).unwrap().version, Some(older));
+    let now_ms = aterm_time::unix_millis().unwrap();
+    assert_eq!(
+        hearing
+            .ledger
+            .holding_below([&lab.member], now_ms, CHECKPOINTS),
+        vec![(actor, Hold::Older(Some(older)))]
+    );
+    assert!(!hearing.ledger.writes_no_secret_file(&lab.member, now_ms));
+}
+
+/// What the store took since `<commons>/reports` was last written is written when the hearing
+/// ends, as it does when its serving loop does. The first tick writes this Mac's own report;
+/// a report a round then brings is counted at the next tick, which writes no file inside the
+/// hour; the file holds it once the hearing is dropped, so the store that starts next keeps it
+/// and offers it on.
+///
+/// NEGATIVE CONTROL: with `Hearing`'s `Drop` writing nothing, the file still holds only this
+/// Mac's own report after the hearing ended: `` assertion `left == right` failed `` with a
+/// left set of one actor and a right set of two.
+#[test]
+fn reports_taken_since_the_last_write_are_kept_when_the_hearing_ends() {
+    use std::collections::BTreeSet;
+    let lab = Listening::new();
+    let (own, member) = (lab.own.actor(), lab.member.actor());
+    let mut hearing = lab.hearing();
+    lab.tick(&mut hearing, &[], Instant::now());
+    assert_eq!(lab.filed(), BTreeSet::from([own]));
+
+    lab.hand(hearing::RELAYS, aterm_time::unix_millis().unwrap());
+    lab.tick(&mut hearing, &[], Instant::now());
+    assert!(hearing.ledger.entry(&member).is_some());
+    assert_eq!(lab.filed(), BTreeSet::from([own]));
+
+    drop(hearing);
+    assert_eq!(lab.filed(), BTreeSet::from([own, member]));
+}
+
+/// While the hearing runs, `<commons>/reports` is written at most once in
+/// [`hearing::PERSIST`], however many [`KEEP`] ticks find the store changed: a report taken
+/// after the first tick's write is not in the file at the next `KEEP` tick, nor at one a
+/// millisecond short of the hour, and is in it at the `KEEP` tick after that, past the hour.
+///
+/// NEGATIVE CONTROL: with `Hearing::keep_reports` writing at every `KEEP` tick that finds a
+/// change, the file holds the report ten minutes after the first write:
+/// `` assertion `left == right` failed: a KEEP tick inside the hour `` with a left set of two
+/// actors and a right set of one.
+#[test]
+fn the_kept_reports_file_is_written_at_most_once_an_hour_while_the_hearing_runs() {
+    use std::collections::BTreeSet;
+    let lab = Listening::new();
+    let (own, member) = (lab.own.actor(), lab.member.actor());
+    let hour = Duration::from_millis(hearing::PERSIST);
+    let mut hearing = lab.hearing();
+    let start = Instant::now();
+    lab.tick(&mut hearing, &[], start);
+    assert_eq!(lab.filed(), BTreeSet::from([own]));
+
+    lab.hand(hearing::RELAYS, aterm_time::unix_millis().unwrap());
+    lab.tick(&mut hearing, &[], start + KEEP);
+    assert_eq!(
+        lab.filed(),
+        BTreeSet::from([own]),
+        "a KEEP tick inside the hour"
+    );
+    let short = start + hour - Duration::from_millis(1);
+    lab.tick(&mut hearing, &[], short);
+    assert_eq!(lab.filed(), BTreeSet::from([own]));
+    lab.tick(&mut hearing, &[], short + KEEP);
+    assert_eq!(lab.filed(), BTreeSet::from([own, member]));
+}
+
+/// The store gets the current roster at any tick that has a contact, not only every [`KEEP`]:
+/// a round is how a new member is first met, and its report is wanted from then. A store whose
+/// roster fell behind the journal's (here it lacks Mac 1) keeps that roster through a tick with
+/// no contact inside `KEEP`, and has the journal's after a tick with one.
+///
+/// NEGATIVE CONTROL: with `Hearing::tick` giving the store its roster only when `KEEP` is due,
+/// the store still lacks the member after the tick with a contact: `` left: [false] right:
+/// [true] ``.
+#[test]
+fn a_tick_with_a_contact_gives_the_store_the_current_roster() {
+    let lab = Listening::new();
+    let mut hearing = lab.hearing();
+    lab.tick(&mut hearing, &[], Instant::now());
+    let now_ms = aterm_time::unix_millis().unwrap();
+    let wanted = || {
+        let offered = [(hearing::tag(&lab.member.actor()), now_ms)];
+        lab.reports.lock().unwrap().want(&offered, now_ms)
+    };
+    assert_eq!(wanted(), [true]);
+    lab.reports.lock().unwrap().set_roster([&lab.own], now_ms);
+    assert_eq!(wanted(), [false]);
+
+    lab.tick(&mut hearing, &[], Instant::now());
+    assert_eq!(wanted(), [false]);
+    let at = Instant::now();
+    lab.tick(
+        &mut hearing,
+        &[lab.contact(hearing::Version::own(), at)],
+        at,
+    );
+    assert_eq!(wanted(), [true]);
+}
+
 #[test]
 fn missing_configuration_is_default_on_but_never_bootstraps_a_vault() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1662,6 +1978,7 @@ fn rounds_in_a_minute(round: Duration, next: Option<Duration>) -> (usize, usize)
     let (mut rounds, mut ticks) = (0, 0);
     let served: std::result::Result<(), Status> = serve_paced(
         &mut (),
+        LoopKind::Repair,
         simulated,
         || simulated() >= start + Duration::from_secs(60),
         idle,
@@ -1720,37 +2037,87 @@ fn an_idle_serving_loop_ticks_only_at_its_rounds_and_its_deadlines() {
     assert_eq!(ticks, 600, "a deadline always due ticks once a TICK");
 }
 
+/// The words of the serving loops' ledger (`census::Loop`) the calling thread counted between
+/// two of its readings, with how many of each.
+fn loops_between(before: &census::Cadence, after: &census::Cadence) -> Vec<(&'static str, u64)> {
+    let [.., (_, before)] = before.ledgers();
+    let [.., (_, after)] = after.ledgers();
+    after
+        .into_iter()
+        .filter_map(|(word, count)| {
+            let was = before
+                .iter()
+                .find(|(seen, _)| *seen == word)
+                .map_or(0, |(_, count)| *count);
+            (count > was).then_some((word, count - was))
+        })
+        .collect()
+}
+
 /// A tick that ends a serving loop ends it there, with what it came to: [`Flow::End`] as
 /// `Ok(())`, a refusal as itself, and no wait or tick after it: the round that ends it is the
-/// second tick, after one idle wait.
+/// second tick, after one idle wait. The census counts the loop's opening, by its kind, and why
+/// it ended, once each (`census::Loop`); a loop whose stop is set ends as stopped.
+///
+/// NEGATIVE CONTROLS (2026-11-15), each planted in `serve_paced`: with every `Ok` end counted as
+/// `vault`, the refresh case read `[("opened-serving", 1), ("vault", 1)]`; with a presence loop
+/// counted as a serving one, it read `[("opened-serving", 1), ("refresh", 1)]`.
 #[test]
 fn a_tick_that_ends_the_loop_ends_it_at_once() {
-    for (ends, outcome) in [
-        (Ok(Flow::End), Ok(())),
-        (Err(Status::Disabled), Err(Status::Disabled)),
+    for (ends, outcome, end) in [
+        (Ok(Flow::End(LoopEnd::Refresh)), Ok(()), "refresh"),
+        (Ok(Flow::End(LoopEnd::Vault)), Ok(()), "vault"),
+        (Ok(Flow::End(LoopEnd::Witnessed)), Ok(()), "witnessed"),
+        (Err(Status::Disabled), Err(Status::Disabled), "refused"),
     ] {
-        let start = Instant::now();
-        SIMULATED.with(|now| now.set(Some(start)));
-        let mut ticks = 0;
-        let mut waits = 0;
-        let served = serve_paced(
-            &mut (),
-            simulated,
-            || false,
-            |state, floor, until| {
-                waits += 1;
-                idle(state, floor, until);
-            },
-            |(), _, due| {
-                ticks += 1;
-                if due {
-                    ends.clone()
-                } else {
-                    Ok(Flow::Serve(None))
-                }
-            },
-        );
-        assert_eq!(served, outcome);
-        assert_eq!((ticks, waits), (2, 1));
+        for (kind, opened) in [
+            (LoopKind::Repair, "opened-serving"),
+            (LoopKind::Presence, "opened-presence"),
+        ] {
+            let start = Instant::now();
+            SIMULATED.with(|now| now.set(Some(start)));
+            let mut ticks = 0;
+            let mut waits = 0;
+            let before = census::cadence_here();
+            let served = serve_paced(
+                &mut (),
+                kind,
+                simulated,
+                || false,
+                |state, floor, until| {
+                    waits += 1;
+                    idle(state, floor, until);
+                },
+                |(), _, due| {
+                    ticks += 1;
+                    if due {
+                        ends.clone()
+                    } else {
+                        Ok(Flow::Serve(None))
+                    }
+                },
+            );
+            assert_eq!(served, outcome);
+            assert_eq!((ticks, waits), (2, 1));
+            assert_eq!(
+                loops_between(&before, &census::cadence_here()),
+                [(opened, 1), (end, 1)],
+                "{kind:?} ending {end}"
+            );
+        }
     }
+    let before = census::cadence_here();
+    let served: std::result::Result<(), Status> = serve_paced(
+        &mut (),
+        LoopKind::Repair,
+        simulated,
+        || true,
+        idle,
+        |(), _, _| unreachable!("a stopped loop ticks never"),
+    );
+    assert_eq!(served, Ok(()));
+    assert_eq!(
+        loops_between(&before, &census::cadence_here()),
+        [("opened-serving", 1), ("stopped", 1)]
+    );
 }

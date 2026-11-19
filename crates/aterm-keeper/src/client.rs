@@ -3,7 +3,7 @@
 
 //! The window's side of AKP1: [`KeeperClient`] and [`KeeperLink`].
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::io;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -15,8 +15,8 @@ use aterm_uds::CtlStream;
 use crate::frameio::{Incoming, read_frame, write_frame};
 use crate::identity::{CheckError, Identity, IdentityPolicy};
 use crate::wire::{
-    CAP_JOURNAL, CAP_KEEPS, CAP_LINK, CAP_SENDS_BYE, CAP_SYNC, COMPANION_JOURNAL, Frame,
-    JournalOffer, MarkerRef, MasterHeader, PROTO, PeerClass, RefuseCode,
+    CAP_JOURNAL, CAP_KEEPS, CAP_LINK, CAP_RESTARTS, CAP_SENDS_BYE, CAP_SYNC, COMPANION_JOURNAL,
+    Frame, JournalOffer, MarkerRef, MasterHeader, PROTO, PeerClass, RefuseCode,
 };
 
 /// One OFFER as the window receives it.
@@ -94,6 +94,8 @@ pub struct KeeperClient {
     /// a window sends companions only to one that states [`CAP_JOURNAL`], and SYNC only to one
     /// that states [`CAP_SYNC`].
     keeper_caps: Cell<u8>,
+    /// The version the keeper's WELCOME stated (unset before it).
+    keeper_version: OnceCell<String>,
     /// The number of the last SYNC written on this connection ([`Self::sync`]).
     syncs: Cell<u64>,
     /// The highest SYNC number the keeper wrote back ([`Self::drain`] reads it): every frame
@@ -118,6 +120,7 @@ impl KeeperClient {
             frame_wait: timeout,
             policy: identity.policy(),
             keeper_caps: Cell::new(0),
+            keeper_version: OnceCell::new(),
             syncs: Cell::new(0),
             synced: Cell::new(0),
             retiring: RefCell::new(Vec::new()),
@@ -140,6 +143,18 @@ impl KeeperClient {
     #[must_use]
     pub const fn keeper_keeps(&self) -> bool {
         self.keeper_caps.get() & CAP_KEEPS != 0
+    }
+
+    /// Whether the keeper's WELCOME stated it honours RESTART_WHEN_SAFE ([`CAP_RESTARTS`]).
+    #[must_use]
+    pub const fn keeper_restarts(&self) -> bool {
+        self.keeper_caps.get() & CAP_RESTARTS != 0
+    }
+
+    /// The version the keeper's WELCOME stated; empty before it.
+    #[must_use]
+    pub fn keeper_version(&self) -> &str {
+        self.keeper_version.get().map_or("", String::as_str)
     }
 
     /// Ask the keeper to confirm when it has read every frame written so far.
@@ -168,9 +183,16 @@ impl KeeperClient {
         self.synced.get()
     }
 
-    fn welcomed(&self, identity: Option<IdentityPolicy>, caps: Option<u8>) -> io::Result<()> {
+    fn welcomed(
+        &self,
+        identity: Option<IdentityPolicy>,
+        caps: Option<u8>,
+        version: String,
+    ) -> io::Result<()> {
         self.served(identity)?;
         self.keeper_caps.set(caps.unwrap_or(0));
+        // A connection reads one WELCOME.
+        let _ = self.keeper_version.set(version);
         Ok(())
     }
 
@@ -261,9 +283,10 @@ impl KeeperClient {
                 offers,
                 identity,
                 caps,
+                version,
                 ..
             }) => {
-                self.welcomed(identity, caps)?;
+                self.welcomed(identity, caps, version)?;
                 offers
             }
             other => return Err(protocol(format!("expected WELCOME, got {other:?}"))),
@@ -350,8 +373,9 @@ impl KeeperClient {
                 offers: 0,
                 identity,
                 caps,
+                version,
                 ..
-            }) => self.welcomed(identity, caps),
+            }) => self.welcomed(identity, caps, version),
             other => Err(protocol(format!(
                 "expected an empty WELCOME, got {other:?}"
             ))),
@@ -701,6 +725,12 @@ pub enum LinkOp {
         /// dropped the one an offer of the master carried (an adopted session with no journal).
         receipt: Option<std::sync::Arc<CompanionReceipt>>,
     },
+    /// The window passed its boot-health checkpoint: from now on a window's link
+    /// ([`KeeperLink::start_window`]) asks the keeper of its connection, and of each later one
+    /// behind that connection's replays, to restart when safe wherever its [`AskRestart`] says
+    /// so. Before it, the link asks no keeper: a build that has not shown it boots healthy keeps
+    /// the keeper that can still reopen it after a crash.
+    AskRestart,
 }
 
 /// Queue bound for ordinary ops.
@@ -1095,6 +1125,27 @@ struct LinkPeer {
     /// The shortest pause between the worker's tries at a keeper it lost ([`LINK_POLL`] but for
     /// [`KeeperLink::start_retrying`]); see [`wait_for`].
     retry: Duration,
+    /// Whether to ask each keeper this link reaches to restart ([`KeeperLink::start_window`]).
+    ask_restart: Option<AskRestart>,
+}
+
+/// A window's judgment of the keeper a connection reached: given the version its WELCOME stated
+/// and whether it states [`CAP_RESTARTS`], whether to ask it to restart
+/// ([`Frame::RestartWhenSafe`]), which a link does once on each connection once it was told
+/// [`LinkOp::AskRestart`].
+pub type AskRestart = fn(&str, bool) -> bool;
+
+/// Ask the keeper on `c` to restart when safe, once, if `peer` would.
+/// # Errors
+/// The write failing: the connection's end.
+fn ask_restart(peer: &LinkPeer, c: &KeeperClient) -> io::Result<()> {
+    if peer
+        .ask_restart
+        .is_some_and(|ask| ask(c.keeper_version(), c.keeper_restarts()))
+    {
+        c.send(&Frame::RestartWhenSafe, None)?;
+    }
+    Ok(())
 }
 
 impl KeeperLink {
@@ -1133,10 +1184,6 @@ impl KeeperLink {
         journal: bool,
         retry: Duration,
     ) -> io::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel(LINK_QUEUE + WAITED_ROOM);
-        let room = std::sync::Arc::new(Room::default());
-        let ended = Ended(std::sync::Arc::clone(&room));
-        let (bell, door) = doorbell()?;
         let peer = LinkPeer {
             path,
             identity,
@@ -1144,7 +1191,43 @@ impl KeeperLink {
             marker,
             journal,
             retry,
+            ask_restart: None,
         };
+        Self::spawn(peer, booted)
+    }
+
+    /// A window's link ([`Self::start_marked`]) that, once told [`LinkOp::AskRestart`], also asks
+    /// each keeper it reaches to restart when `ask` says so of that keeper's WELCOME
+    /// ([`AskRestart`]): once per connection, on the connection it has when told, and behind
+    /// the replays (REGISTERs, COMPANIONs, METAs, owed RELEASEs) on each it makes after.
+    /// # Errors
+    /// The worker's doorbell (a socket pair) not being made, or the thread failing to spawn.
+    pub fn start_window(
+        path: PathBuf,
+        identity: Identity,
+        build: String,
+        marker: Option<MarkerRef>,
+        booted: Option<KeeperClient>,
+        journal: bool,
+        ask: AskRestart,
+    ) -> io::Result<Self> {
+        let peer = LinkPeer {
+            path,
+            identity,
+            build,
+            marker,
+            journal,
+            retry: LINK_POLL,
+            ask_restart: Some(ask),
+        };
+        Self::spawn(peer, booted)
+    }
+
+    fn spawn(peer: LinkPeer, booted: Option<KeeperClient>) -> io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel(LINK_QUEUE + WAITED_ROOM);
+        let room = std::sync::Arc::new(Room::default());
+        let ended = Ended(std::sync::Arc::clone(&room));
+        let (bell, door) = doorbell()?;
         let custody = std::sync::Arc::new(Custody {
             caps: std::sync::atomic::AtomicU8::new(
                 booted.as_ref().map_or(0, |c| c.keeper_caps.get()),
@@ -1437,6 +1520,8 @@ enum Send {
     Companion(u64),
     CompanionRelease(u64),
     Frame(Frame),
+    /// [`LinkOp::AskRestart`]: the RESTART_WHEN_SAFE [`ask_restart`] judges.
+    AskRestart,
 }
 
 /// The shortest pause between a link worker's tries at a keeper it lost, while it holds a master
@@ -1487,6 +1572,8 @@ fn link_worker(
     if let Some(c) = &client {
         settle_owed(&mut owed, c.synced());
     }
+    // Told [`LinkOp::AskRestart`]: each connection from then on asks its keeper.
+    let mut asking = false;
     // The held masters whose REGISTER the keeper refused on this connection.
     let mut refused: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut backoff = Duration::from_millis(50);
@@ -1624,6 +1711,10 @@ fn link_worker(
                 entry.journal = HeldJournal::Released { read };
                 peer.journal.then_some(Send::CompanionRelease(rdev))
             }
+            LinkOp::AskRestart => {
+                asking = true;
+                Some(Send::AskRestart)
+            }
         });
         if send.is_none() && held.is_empty() && owed.is_empty() {
             if let Some(ack) = ack {
@@ -1633,7 +1724,7 @@ fn link_worker(
         }
         let fresh = client.is_none();
         if fresh && !heard && (ack.is_some() || std::time::Instant::now() >= next_try) {
-            client = reconnect(peer, &mut held, &metas, &mut owed);
+            client = reconnect(peer, &mut held, &metas, &mut owed, asking);
             refused.clear();
             stated.now(client.as_ref(), &held, &refused);
             if client.is_some() {
@@ -1651,7 +1742,15 @@ fn link_worker(
             continue;
         };
         let mut sent = match &send {
-            Send::Register(_) | Send::Companion(_) | Send::CompanionRelease(_) if fresh => Ok(()),
+            // A connection this turn made replayed them, and asked its keeper.
+            Send::Register(_)
+            | Send::Companion(_)
+            | Send::CompanionRelease(_)
+            | Send::AskRestart
+                if fresh =>
+            {
+                Ok(())
+            }
             Send::Frame(Frame::Meta { .. }) if fresh => Ok(()),
             Send::Register(rdev) => match held.get(rdev) {
                 Some(h) => c.register(&h.master, h.header, h.tag.clone()),
@@ -1673,6 +1772,7 @@ fn link_worker(
                 _ => Ok(()),
             },
             Send::Frame(frame) => c.send(frame, None),
+            Send::AskRestart => ask_restart(peer, c),
         };
         if sent.is_ok()
             && let Some((rdev, owe)) = must_reach.take()
@@ -1898,13 +1998,16 @@ fn send_companion_release(
     send_fenced(c, read, || c.companion_release(rdev))
 }
 
+/// Connect to the keeper again and replay what it must hold; with `asking`
+/// ([`LinkOp::AskRestart`]), ask it last to restart when safe ([`ask_restart`]).
 fn reconnect(
     peer: &LinkPeer,
     held: &mut Held,
     metas: &std::collections::BTreeMap<u64, Vec<u8>>,
     owed: &mut Owed,
+    asking: bool,
 ) -> Option<KeeperClient> {
-    let out = reconnect_inner(peer, held, metas, owed);
+    let out = reconnect_inner(peer, held, metas, owed, asking);
     if out.is_none() {
         unconfirm_companions(held);
     }
@@ -1916,6 +2019,7 @@ fn reconnect_inner(
     held: &mut Held,
     metas: &std::collections::BTreeMap<u64, Vec<u8>>,
     owed: &mut Owed,
+    asking: bool,
 ) -> Option<KeeperClient> {
     unconfirm_companions(held);
     let c = KeeperClient::connect(&peer.path, &peer.identity, Duration::from_secs(2)).ok()?;
@@ -1960,6 +2064,9 @@ fn reconnect_inner(
         for owe in owed.values_mut() {
             owe.sync = Some((n, now));
         }
+    }
+    if asking {
+        ask_restart(peer, &c).ok()?;
     }
     Some(c)
 }

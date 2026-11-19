@@ -21,50 +21,20 @@
 //! ([`crate::dirs::runs_under_private_state_root`]), so a release build in a world reads its
 //! HOME's vault, and `[swarm]` in [`LANES_OFF`] keeps it from listening.
 //!
-//! verify measure's world, the GUI smoke's sandbox and the perf arena's windowed lanes take
-//! both. The lab's worlds (`aterm-lab`'s `instance::World`) carry the marker at this folder and
-//! keep their own tables, which have no `[swarm]` table, and two of its drives (`commons_lan`,
-//! `commons_startup`) remove the marker to drive the local-network lanes themselves.
+//! verify measure's world, the GUI smoke's sandbox, the perf arena's windowed lanes and the
+//! headless images a macOS release link's layout probe measures (`crates/aterm/build.rs`, laid
+//! out by `probe_world` in `crates/aterm/src/macho_order.rs`) take both. That probe runs in a
+//! wrapper that links no crate, so the words it needs ([`MARKER`], [`state_home`] and
+//! [`LANES_OFF`]) live in a `std`-only file of their own (`world_words.rs`), which it mounts by
+//! `#[path]` and this module re-exports. The lab's worlds (`aterm-lab`'s `instance::World`) carry
+//! the marker at this folder and keep their own tables, which have no `[swarm]` table, and two of
+//! its drives (`commons_lan`, `commons_startup`) remove the marker to drive the local-network
+//! lanes themselves.
 
-use std::path::{Path, PathBuf};
+#[path = "world_words.rs"]
+mod words;
 
-/// The environment variable whose presence says an aterm runs in a scratch world. The lanes that
-/// reach the local network read it raw (`std::env::var_os`), not through [`crate::dev_seam!`], so
-/// it holds in a release bundle too. A build with development seams also takes it as its state
-/// root ([`crate::dirs`]); [`state_home`] is where a build without them keeps its state under the
-/// world's HOME, so both keep it in one folder.
-pub const MARKER: &str = "ATERM_STATE_HOME";
-
-/// [`MARKER`]'s value for a world whose HOME is `home`: the platform's per-user state folder
-/// under it ([`crate::dirs::resolve_state_dir`] with no override and no `XDG_STATE_HOME`), or
-/// `None` where the platform keeps state outside HOME (Windows) or keeps none.
-#[must_use]
-pub fn state_home(home: &Path) -> Option<PathBuf> {
-    crate::dirs::resolve_state_dir(
-        None,
-        crate::dirs::StatePlatform {
-            home: Some(home.to_path_buf()),
-            ..crate::dirs::StatePlatform::default()
-        },
-    )
-}
-
-/// The `aterm.toml` tables a world turns its automatic lanes off with, each the product's own
-/// switch for one lane:
-/// - `[update]`: no update check, download or apply;
-/// - `[packages]`: no package loop;
-/// - `[machine] universal_control = "leave"`: the Mac's own preferences left alone;
-/// - `[keeper]`: no keeper job in the login's launchd domain, which a lasting bundle's window
-///   would share with the person's own windows of it and leave running after the world ends;
-/// - `[swarm]`: no part in the swarm: no `_alab._tcp` browse, no fleet reads and no vault
-///   sharing, each a use of the person's real LAN.
-///
-/// Tables only, no root keys, so a world may put its own root keys and tables before it.
-pub const LANES_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
-                             [packages]\nenabled = false\n\
-                             [machine]\nuniversal_control = \"leave\"\n\
-                             [keeper]\nenabled = false\n\
-                             [swarm]\nenabled = false\n";
+pub use words::{LANES_OFF, MARKER, state_home};
 
 #[cfg(test)]
 #[path = "world_tests.rs"]

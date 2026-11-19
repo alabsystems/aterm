@@ -165,7 +165,8 @@ fn registry_schemas_keep_secrets_and_addresses_out() {
         assert!(
             crate::database::Command::Write {
                 request: [0; 16],
-                changes: row
+                changes: row,
+                said: None
             }
             .encode()
             .unwrap()
@@ -623,6 +624,7 @@ fn seeding_reserves_causal_joins_within_the_remaining_automatic_quota() {
         crate::database::Command::Write {
             request: [u8::try_from(n).unwrap(); 16],
             changes: birth(&format!("vm-peer-{n}")),
+            said: None,
         }
         .encode()
         .unwrap()

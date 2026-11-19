@@ -87,6 +87,53 @@ fn version_ordering_common_shapes() {
     assert_eq!(version_cmp("1.0pre1", "1.0rc1"), Ordering::Less);
 }
 
+/// Oracle-probed brew `Version#<=>` pairs (brew ruby,
+/// r476): composite tokens bind their digit run as a
+/// revision (`pre042` is one token; `pre-043` is
+/// `pre` rev 0 then `43`), so the hyphenated form
+/// sorts below the fused one.
+#[test]
+fn version_ordering_brew_tokens() {
+    use Ordering::{Equal, Greater, Less};
+    let cases: &[(&str, &str, Ordering)] = &[
+        ("0.5.0-pre-043", "0.5.0-pre042", Less),
+        ("0.5.0-pre43", "0.5.0-pre042", Greater),
+        ("1.0-a-2", "1.0-a1", Less),
+        ("1.0a2", "1.0a1", Greater),
+        ("1.0", "1.0.1", Less),
+        ("1.0-alpha", "1.0", Less),
+        ("1.0a1", "1.0", Less),
+        ("1.0a", "1.0a1", Less),
+        ("1.0b2", "1.0b10", Less),
+        ("1.0rc1", "1.0", Less),
+        ("1.0rc1", "1.0rc2", Less),
+        ("1.0p1", "1.0", Greater),
+        ("1.0.post1", "1.0", Greater),
+        ("1.0p1", "1.0.post1", Greater),
+        ("1.0-alpha", "1.0-beta", Less),
+        ("1.0-beta", "1.0-pre1", Less),
+        ("1.0-pre1", "1.0rc1", Less),
+        ("1.0-preview1", "1.0", Less),
+        ("1.0-1", "1.0", Greater),
+        ("1.0-0", "1.0", Equal),
+        ("HEAD", "999", Greater),
+        ("HEAD-abc", "HEAD-def", Equal),
+        ("1.0+build", "1.0", Greater),
+        ("1.0foo", "1.0bar", Greater),
+        ("1.0foo", "1.0", Greater),
+        ("1.0.0.0", "1.0", Equal),
+        ("10.15", "11", Less),
+        ("1.0A1", "1.0a1", Equal),
+        ("1.0_ALPHA", "1.0_alpha2", Less),
+        ("1.0-pre", "1.0-pre1", Less),
+        ("1.0-pre", "1.0-pre0", Equal),
+    ];
+    for (a, b, want) in cases {
+        assert_eq!(version_cmp(a, b), *want, "{a} vs {b}");
+        assert_eq!(version_cmp(b, a), want.reverse(), "{b} vs {a}");
+    }
+}
+
 #[test]
 fn native_bottles_require_complete_supported_api_metadata() {
     let mut value: Value = aterm_json::from_str(r#"{"name":"demo","bottle":{"stable":{"files":{"all":{"url":"https://example.invalid/demo.tar.gz","sha256":"hash","cellar":":any_skip_relocation"}}}}}"#).unwrap();
@@ -421,5 +468,7 @@ fn formula_parse_from_api_shape() {
         f.bottle_for(&["arm64_tahoe".to_string()]).unwrap().sha256,
         "def"
     );
-    assert_ne!(token_cmp("+10", "10"), Ordering::Equal);
+    // Brew's scan skips separator characters, so a
+    // leading `+` carries no token of its own.
+    assert_eq!(version_cmp("+10", "10"), Ordering::Equal);
 }

@@ -446,9 +446,12 @@ fn strict_codec_rejects_truncation_bad_tags_bounds_and_extra_documents() {
     assert_eq!(decode(&bad), Err(Error::Trailing));
 }
 
+/// One named change to an observation.
+type Edit = (&'static str, fn(&mut Observation));
+
 #[test]
 fn restored_transitions_require_every_source_counter_and_wake_qualification() {
-    let cases: [(&str, fn(&mut Observation)); 12] = [
+    let cases: [Edit; 12] = [
         ("process generation", |o| {
             o.process.as_mut().unwrap().start += 1
         }),

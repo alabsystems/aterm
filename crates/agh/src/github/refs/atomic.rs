@@ -24,9 +24,9 @@ use crate::slug::Slug;
 use crate::wire::{Method, Origin, WireBody};
 use crate::write::{Effect, Ensured, Outcome, WriteOp};
 
-/// One repository-wide intent bucket: an unknown batch blocks another batch,
-/// including one whose inputs differ, until a complete origin observation
-/// reconciles its dead writer's intent.
+/// The unchanged durable key, also understood by older clients. Current native
+/// writers can validate independent ordinary ref domains; unknown declarations
+/// and API/control/observation-guarded batches retain repository-wide exclusion.
 pub(crate) const ATOMIC_KEY: &str = "atomic refs";
 const ZERO: &str = "0000000000000000000000000000000000000000";
 const MAX_UPDATES: usize = 128;
@@ -187,7 +187,7 @@ impl Refs<'_> {
         intents: &dyn IntentStore,
     ) -> Result<Outcome<Ensured<AtomicRefBatch>>> {
         self.write_checks(permit)?;
-        self.reconcile_dead_writer(permit, intents, false)?;
+        self.reconcile_dead_writer(permit, intents, false, None)?;
         let node = self.atomic_node(permit, batch)?;
         let mut input = batch.variables(&node);
         let digest = Sha256Digest::of(&crate::github::encode_body(&input)?).to_string();
@@ -276,9 +276,17 @@ impl Refs<'_> {
         permit: &Permit,
         intents: &dyn IntentStore,
         native: bool,
+        draft: Option<&crate::journal::IntentDraft>,
     ) -> Result<()> {
+        let domain = draft.map_or(
+            crate::journal::ConflictDomain::Global,
+            crate::journal::ConflictDomain::draft,
+        );
         for intent in intents.open()?.into_iter().filter(|i| {
-            i.op == WriteOp::RefUpdateAtomic && i.key == ATOMIC_KEY && i.slug == self.slug
+            i.op == WriteOp::RefUpdateAtomic
+                && i.key == ATOMIC_KEY
+                && i.slug == self.slug
+                && domain.contains(i)
         }) {
             if !intent.writer.as_ref().is_some_and(|writer| writer.dead()) {
                 continue;
@@ -286,7 +294,7 @@ impl Refs<'_> {
             // The frontend may have registered and released a child after the
             // open() snapshot. Once it is dead, refresh the durable custody:
             // that frontend can no longer append another child registration.
-            let Some(current) = intents.latest(intent.op, &intent.key)? else {
+            let Some(current) = intents.refresh(&intent)? else {
                 continue;
             };
             if !current.open || current.intent.id != intent.id || current.intent.slug != self.slug {

@@ -173,8 +173,14 @@ fn without_an_allowance_or_beside_a_broker_there_is_no_direct_path() {
     // A broker that speaks another protocol at the socket: Outdated, though macOS allowed
     // this code.
     let socket = root.path().join("run").join("broker.sock");
-    let server =
-        crate::server::Server::bind(&socket, Admission::SameUid, crate::bonjour::system()).unwrap();
+    let server = crate::server::Server::bind(
+        &socket,
+        Admission::SameUid,
+        None,
+        crate::bonjour::system(),
+        crate::store::Store::Unserved,
+    )
+    .unwrap();
     std::thread::spawn(move || {
         let _ = server.run();
     });

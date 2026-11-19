@@ -266,6 +266,7 @@ fn a_history_line_carries_its_events_window_figure_and_reset() {
             cli: Word::new("claude").expect("a CLI word"),
             sub: sub.map(|key| Word::new(key).expect("a workspace key")),
             window: Some(Window::Week),
+            model: None,
             pct_x10: Some(370),
             reset: Some(900),
             res: None,
@@ -342,6 +343,7 @@ fn week_quota(t: u64, reset: Option<u64>) -> aterm_db::alab::journal::Event {
         cli: Word::new("claude").expect("a CLI word"),
         sub: None,
         window: Some(Window::Week),
+        model: None,
         pct_x10: Some(320),
         reset,
         res: None,
@@ -360,7 +362,7 @@ fn week_quota(t: u64, reset: Option<u64>) -> aterm_db::alab::journal::Event {
 
 /// A HISTORY LINE SAYS THE RESET ITS READING NAMES: a quota event's `r=` in RFC 3339, so `accounts
 /// history` (its text and its `--json` lines, both `history_line`) shows which window a figure is
-/// of; a wall's too, the reset it stands until.
+/// of; a wall's too, the reset it stands until, and a model's own week's wall its model (`m=`).
 /// NEGATIVE CONTROL: a reading that names no reset prints no `r=`, and with `detail` not
 /// printing the reset the first assertion fails (`… "7d 32.0%"`).
 #[test]
@@ -381,8 +383,49 @@ fn a_history_line_says_the_reset_its_reading_names() {
         "7d r=2026-11-16T16:00:00Z",
         "a wall's end"
     );
+    // A model's own week's wall names its model, so two models' walls read as two (FL-271).
+    let opus = aterm_db::alab::journal::Event {
+        window: Some(aterm_db::alab::journal::Window::WeekModel),
+        model: Some(aterm_db::alab::journal::ModelBucket::Opus),
+        ..wall
+    };
+    assert_eq!(
+        detail(&view, &opus),
+        "7d-model m=seven_day_opus r=2026-11-16T16:00:00Z"
+    );
     let none = detail(&view, &week_quota(100, None));
     assert!(!none.contains("r="), "CONTROL: {none}");
+}
+
+/// A MODEL'S OWN WEEK'S WALL REACHES THE HARNESS BY ITS MODEL (FL-271): the snapshot the deck and
+/// the lens read holds a Fable wall as Fable's week, which walls no account.
+/// NEGATIVE CONTROL, run: with `harness_seen` dropping the model (`model: None`), the wall reads
+/// as an unnamed week's: `` left: [("7d-model", None, false)] ``.
+#[test]
+fn a_models_own_week_wall_reaches_the_harness_by_its_model() {
+    use aterm_db::alab::journal::{ModelBucket, Window, event::Kind};
+    let wall = aterm_db::alab::journal::Event {
+        kind: Kind::Wall,
+        window: Some(Window::WeekModel),
+        model: Some(ModelBucket::Fable),
+        pct_x10: None,
+        until: Some(RESET),
+        ..week_quota(RESET - 3_600, None)
+    };
+    let seen = Seen::of_events(&[(PEER.to_owned(), wall)], RESET - 60);
+    let held = harness_seen(&Names::of(&LabView::default(), &seen, || None), &seen);
+    let windows = &held.accounts["ac-00000000000000a2"].windows;
+    assert_eq!(
+        windows
+            .iter()
+            .map(|w| (w.name(), w.model.as_deref(), w.walls_account()))
+            .collect::<Vec<_>>(),
+        [(
+            "Fable week".to_owned(),
+            Some("seven_day_overage_included"),
+            false
+        )]
+    );
 }
 
 /// THIS MAC IS NEVER A PEER: a record its own seat wrote (a seat the registry binds to no live

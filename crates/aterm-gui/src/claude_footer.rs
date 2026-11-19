@@ -8633,8 +8633,8 @@ const ACCOUNT_WAIT: &str = "once its account can be checked";
 
 /// [`up_wait`]'s words for a move whose account admission refused for `kind`: [`ACCOUNT_WAIT`] for
 /// what clears by itself, a login's and a usage limit's own words for those, and none for what
-/// waits on a person's act no word here names (an identity, a new token, a pin, another Mac's
-/// custody).
+/// waits on a person's act no word here names (an identity, a retained login's account listed
+/// again, a new token, a pin, another Mac's custody).
 const fn account_wait(kind: aterm_agent::harness::accounts_pool::RefusalKind) -> &'static str {
     use aterm_agent::harness::accounts_pool::RefusalKind;
     match kind {
@@ -8643,6 +8643,7 @@ const fn account_wait(kind: aterm_agent::harness::accounts_pool::RefusalKind) ->
         RefusalKind::Limited => "after the usage limit",
         RefusalKind::Unattributed
         | RefusalKind::Integrity
+        | RefusalKind::Retained
         | RefusalKind::Token
         | RefusalKind::Pin
         | RefusalKind::Lease

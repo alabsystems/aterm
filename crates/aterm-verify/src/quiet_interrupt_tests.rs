@@ -421,7 +421,8 @@ fn stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         let child = run(&cmd, ctx.exec_env());
         r.decide_child(&child, "the stage child");
     } else {
-        note(&dir.join("ran"), &spec.title);
+        let mark = if spec.id.timed() { "ran" } else { "prepared" };
+        note(&dir.join(mark), &spec.title);
         r.pass("ran");
     }
     r
@@ -561,6 +562,10 @@ fn one_interrupt_in_a_timed_stages_wait_ends_the_run() {
         );
         let asked = std::fs::read_to_string(dir.path().join("admissions")).unwrap_or_default();
         assert_eq!(asked.lines().count(), 1, "{word}: one wait: {asked}");
+        assert!(
+            dir.path().join("prepared").exists(),
+            "{word}: the untimed AppKit preparation must reach the timing barrier"
+        );
         assert!(
             !dir.path().join("ran").exists(),
             "{word}: a timed stage ran after the interrupt"

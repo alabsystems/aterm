@@ -548,7 +548,7 @@ pub(crate) const EDIT_WINDOW_COLORSPACE: &str = "window_colorspace";
 pub(crate) const EDIT_RESTORE_SESSION: &str = "restore_session";
 /// Opt-in shell custody, read at launch.
 pub(crate) const EDIT_KEEPER_ENABLED: &str = "keeper.enabled";
-/// Windows born with the navigator docked beside the terminal (`[navigator] dock`, on by
+/// Main window born with the navigator docked beside the terminal (`[navigator] dock`, on by
 /// default outside a scratch world), read when a window opens or is restored.
 pub(crate) const EDIT_NAVIGATOR_DOCK: &str = "navigator.dock";
 /// Session activity on disk (on by default), read at launch.
@@ -617,7 +617,7 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     },
     NestedLeaf {
         key: EDIT_NAVIGATOR_DOCK,
-        label: "Show the navigator in new windows",
+        label: "Show the main navigator",
         kind: EditKind::Bool,
     },
     NestedLeaf {
@@ -3313,8 +3313,8 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
              wins."
         }
         EDIT_NAVIGATOR_DOCK => {
-            "Windows opened or restored from now on start with the navigator beside the \
-             terminal. View > Show Navigator shows or hides it in one window."
+            "Show sessions and open windows in the left pane of the main window. \
+             View > Show Navigator saves the choice for each window."
         }
         EDIT_KEEPER_ENABLED => {
             "Each launch starts the PTY keeper if none runs. Turning this off takes effect next launch; `aterm keeper stop` ends the one running. Reopening a saved layout alone starts new shells."

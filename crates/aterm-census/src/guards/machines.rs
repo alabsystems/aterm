@@ -21,14 +21,16 @@ const ROOT_TOOLS: &[&str] = &[
 const AGENT_PATH: &str = "aterm_machines::agent";
 const INSTALLER_PROBE: &str = "crates/aterm-gui/src/clt_install/probe.rs";
 
-/// The admitted-name rule's two paths (`aterm_machines::root_steps`), as aterm-types holds them so
-/// the window can stat them with no root and no dependency on aterm-machines: data, each the
-/// whole of one `pub const` line, never an argv.
-const RULE_PATHS: (&str, [&str; 2]) = (
+/// The admitted-name rule's three paths (`aterm_machines::root_steps`: the rule, root's refusal
+/// of it, the person's removal of it), as aterm-types holds them so the window can stat them with
+/// no root and no dependency on aterm-machines: data, each the whole of one `pub const` line,
+/// never an argv.
+const RULE_PATHS: (&str, [&str; 3]) = (
     "crates/aterm-types/src/macos_setup.rs",
     [
         r#"pubconstADMITTED_NAME_RULE:&str="/private/etc/sudoers.d/aterm-admitted-name";"#,
         r#"pubconstADMITTED_NAME_RULE_REFUSED:&str="/private/etc/sudoers.d/.aterm-admitted-name.refused";"#,
+        r#"pubconstADMITTED_NAME_RULE_REMOVED:&str="/private/etc/sudoers.d/.aterm-admitted-name.removed";"#,
     ],
 );
 
@@ -55,7 +57,7 @@ pub(super) const MACHINES_ROOT_DOOR: Rule = Rule {
           crates/atpkg/src/platform/unix.rs, which installs as the user with no administrator. \
           The GUI installer probe may only compare softwareupdate's and installer's executable \
           identities in a closed boolean helper, without binding or executing either path. \
-          aterm-types may hold the admitted-name rule's two paths as whole `pub const` lines, \
+          aterm-types may hold the admitted-name rule's three paths as whole `pub const` lines, \
           which the window stats and never runs, and the mac lab lane's `sudo_asks_script` may \
           name visudo and /etc/sudoers.d in the tart guest's script it builds",
     scope: &[MACHINES_CRATE],

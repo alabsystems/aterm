@@ -8,23 +8,29 @@ use super::*;
 use crate::window_presence::Heard;
 
 /// A WAKE RINGS EACH LONG REST THAT MUST NOT SLEEP THROUGH IT, AND THE WINDOW: the presence's
-/// beat hears a wake (it writes now), the services watch's rest is rung (it reads now), and the
-/// window is sent its wake. NEGATIVE CONTROL: leave either ring out of `wall_moved_on` and its
-/// place in the assert fails (the presence's wait is due, the services rest unrung).
+/// beat hears a wake (it writes now), the services watch's rest is rung (it reads now), the
+/// package lane's rest hears a wake (it judges its clocks now), and the window is sent its wake.
+/// NEGATIVE CONTROL: leave any ring out of `wall_moved_on` and its place in the assert fails (the
+/// presence's wait is due, the services rest unrung, the package lane's rest unwoken).
 #[test]
-fn a_wake_rings_the_presence_the_services_watch_and_the_window() {
+fn a_wake_rings_the_presence_the_services_watch_the_package_lane_and_the_window() {
     let presence = Presence::new();
     let services = ParkBell::new(false);
+    let lane = atpkg::vendor_direct::watch::Rest::inert();
     let sent = Cell::new(false);
-    wall_moved_on(&presence, &services, || sent.set(true));
+    wall_moved_on(&presence, &services, Some(&lane.wall_ringer()), || {
+        sent.set(true);
+    });
     assert_eq!(
         (
             sent.get(),
             presence.wait(Duration::ZERO),
             services_watch::rest_on(&services, Duration::ZERO),
+            lane.take().is_some_and(|told| told.woke),
         ),
-        (true, Heard::Woke, true),
-        "(the window hears the wake, the presence writes, the services watch reads)"
+        (true, Heard::Woke, true, true),
+        "(the window hears the wake, the presence writes, the services watch reads, the \
+         package lane judges its clocks)"
     );
 }
 

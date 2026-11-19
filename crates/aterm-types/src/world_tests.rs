@@ -7,6 +7,7 @@ use super::*;
 #[cfg(unix)]
 #[test]
 fn the_marker_names_the_platforms_state_folder_under_the_worlds_home() {
+    use std::path::{Path, PathBuf};
     let home = Path::new("/w/home");
     #[cfg(target_os = "macos")]
     let want = "/w/home/Library/Application Support/aterm";

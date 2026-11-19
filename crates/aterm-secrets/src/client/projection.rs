@@ -144,8 +144,13 @@ impl ConvergenceInputs {
         }
     }
 
+    /// Sample the shared refresh boundary without consuming an input transition.
+    pub fn refresh_observation(&mut self) -> RefreshObservation {
+        (self.refresh)()
+    }
+
     pub fn snapshot(&mut self) -> ConvergenceSnapshot {
-        let refresh = (self.refresh)();
+        let refresh = self.refresh_observation();
         ConvergenceSnapshot {
             refresh,
             repositories: (self.observe)(refresh),

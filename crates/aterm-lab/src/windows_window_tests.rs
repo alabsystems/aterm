@@ -228,13 +228,6 @@ fn a_hold_off_the_monitors_puts_the_frames_nearest_pixel_at_an_offset() {
             ch,
         )
     };
-    let view = WestonView {
-        x: 0,
-        y: 0,
-        width: cw,
-        height: ch,
-        format: "XRGB8888".into(),
-    };
     assert!(held_at(&rgba(&window), &framed, ox, oy, 0..0).is_err());
     let mut held = window.clone();
     let (put, span) = off_monitors_as_framed(&mut held, (cw, ch), &on, &framed, (ox, oy));
@@ -251,10 +244,13 @@ fn a_hold_off_the_monitors_puts_the_frames_nearest_pixel_at_an_offset() {
         )
     );
     assert_eq!(held_at(&rgba(&held), &framed, ox, oy, 0..0), Ok((4, 6)));
-    assert_eq!(bands_held(&rgba(&held), &framed, &view, (ox, oy)), Ok(12));
+    assert_eq!(
+        nearest_frame_bands_held(&rgba(&held), &framed, (ox, oy)),
+        Ok(12)
+    );
     // The band column 0 is on the primary: a wrong pixel there still fails.
     held[(2 * cw) * 3] ^= 1;
-    assert!(bands_held(&rgba(&held), &framed, &view, (ox, oy)).is_err());
+    assert!(nearest_frame_bands_held(&rgba(&held), &framed, (ox, oy)).is_err());
 }
 
 #[test]

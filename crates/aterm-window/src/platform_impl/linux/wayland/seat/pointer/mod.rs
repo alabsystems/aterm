@@ -59,6 +59,28 @@ impl WinitState {
         for event in events {
             let window_id = wayland::make_wid(event.surface);
 
+            if !self.outside_releases.is_empty() {
+                // An enter after the grab ends identifies the surface under the release.
+                // A subsequent motion or button starts a new pointer action.
+                match event.kind {
+                    PointerKind::Enter { .. } => {
+                        let scale = self
+                            .windows
+                            .get_mut()
+                            .get(&window_id)
+                            .map_or(1.0, |w| w.lock().unwrap().scale_factor());
+                        let point = LogicalPosition::new(event.position.0, event.position.1)
+                            .to_physical(scale);
+                        self.outside_releases.entered(seat, window_id, point);
+                    },
+                    PointerKind::Motion { .. }
+                    | PointerKind::Press { .. }
+                    | PointerKind::Release { .. } => {
+                        self.outside_releases.stop_observing(seat);
+                    },
+                    _ => {},
+                }
+            }
             let mut window = match self.windows.get_mut().get_mut(&window_id) {
                 Some(window) => window.lock().unwrap(),
                 None => {
@@ -109,9 +131,22 @@ impl WinitState {
                     } else {
                         ElementState::Released
                     };
-                    self.events_sink.push_window_event(
+                    let release = match kind {
+                        PointerKind::Release { serial, .. } if button == MouseButton::Left => {
+                            let (x, y) = event.position;
+                            let size = window.inner_size();
+                            (x < 0.0
+                                || y < 0.0
+                                || x >= f64::from(size.width)
+                                || y >= f64::from(size.height))
+                            .then(|| self.outside_releases.released(seat, *serial, window_id))
+                        },
+                        _ => None,
+                    };
+                    self.events_sink.push_tagged(
                         WindowEvent::MouseInput { device_id, state, button },
                         window_id,
+                        release,
                     );
                 },
                 PointerKind::Axis { horizontal, vertical, .. } => {

@@ -140,6 +140,11 @@ fn front(app: &App, wid: WindowId) -> String {
     )
 }
 
+fn remembered_terminal(app: &App, wid: WindowId) -> u64 {
+    let window = &app.windows[&wid];
+    window.layouts[window.tabs.active].focus()
+}
+
 fn layout_titles(wl: &restore::WindowLayout) -> Vec<String> {
     wl.restored_tabs
         .iter()
@@ -200,6 +205,61 @@ fn a_cold_drain_lands_the_front_tab_second_and_ends_as_recorded() {
         "{}",
         app.structural_invariant_violation().unwrap_or_default()
     );
+}
+
+#[test]
+fn cold_restore_keeps_the_remembered_terminal_on_insert_behind_settings() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![window(
+        &["A", "B", "C", "D"],
+        3,
+    )]));
+    assert!(!slice(&mut app));
+    assert!(!slice(&mut app));
+    assert_eq!(titles(&app, wid), ["A", "D"]);
+    let d = app.front_terminal(wid).expect("D is in front").session;
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let settings = app.windows[&wid].tab_set.active_id();
+    assert_eq!(remembered_terminal(&app, wid), d);
+
+    assert!(!slice(&mut app));
+    assert_eq!(app.windows[&wid].layouts.len(), 3, "B landed before D");
+    assert_eq!(app.windows[&wid].tab_set.active_id(), settings);
+    assert_eq!(remembered_terminal(&app, wid), d, "D moved to slot two");
+
+    drain(&mut app);
+    assert_eq!(app.windows[&wid].tab_set.active_id(), settings);
+    assert_eq!(remembered_terminal(&app, wid), d, "C also landed before D");
+}
+
+#[test]
+fn cold_restore_keeps_the_remembered_terminal_on_graft_behind_settings() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let mut layout = window(&["A"], 0);
+    layout.restored_tabs[0].root = restore::RestoredSplitTree::Split {
+        axis: restore::SplitKind::Vertical,
+        ratio: 0.375,
+        first: Box::new(leaf("A")),
+        second: Box::new(leaf("B")),
+    };
+    layout.restored_tabs[0].focused_path = vec![restore::RestoreBranch::First];
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![layout]));
+    assert!(!slice(&mut app));
+    assert_eq!(app.windows[&wid].layouts[0].len(), 1, "graft is pending");
+
+    let newer = app.next_session_id;
+    app.install_new_tab(wid, crate::stub_session(newer));
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let settings = app.windows[&wid].tab_set.active_id();
+    assert_eq!(remembered_terminal(&app, wid), newer);
+
+    drain(&mut app);
+    let window = &app.windows[&wid];
+    assert_eq!(window.layouts[0].len(), 2, "the bootstrap split landed");
+    assert_eq!(window.tab_set.active_id(), settings);
+    assert_eq!(remembered_terminal(&app, wid), newer);
 }
 
 /// A shell the restore places keeps the grid it came with while its window may hold another (a
@@ -360,7 +420,8 @@ fn the_drain_takes_windows_in_turn_and_a_closed_window_owes_nothing() {
     assert!(!app.windows.contains_key(&second), "not made again");
     assert_eq!(app.windows.len(), 2, "window 0 and the third");
     let third = *app.windows.keys().last().expect("the third window");
-    assert_eq!(titles(&app, third), ["X", "Y"]);
+    assert_eq!(titles(&app, WindowId(0)), ["A", "B", "X"]);
+    assert_eq!(titles(&app, third), ["Y"]);
     assert_eq!(front(&app, third), "Y");
 }
 
@@ -1554,7 +1615,33 @@ fn the_restore_s_close_sweeps_no_layout_of_a_seamless_successor() {
 /// task row the layout keeps, and the relaunched tab, at a prompt its shell titles by its folder,
 /// is named by it.
 #[test]
-fn a_restored_worker_is_titled_by_its_line_with_its_task_file_gone() {
+fn local_panel_original_topic_a_restored_worker_is_titled_by_its_line_with_its_task_file_gone() {
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
+
+    fn panel(app: &mut App, wid: WindowId) {
+        let size = app.window_frame_px_for(wid, 32, 140);
+        {
+            let mut window = app.windows.get_mut(&wid).unwrap();
+            window.win_px = Some(size);
+            window.occluded = false;
+        }
+        app.set_dock(wid, 30)
+            .expect("show the panel in the restored window");
+        app.publish_navigators(Instant::now());
+        assert!(app.visible_session_organizer(wid).is_some());
+    }
+
+    #[track_caller]
+    fn row(app: &mut App, session: u64) -> std::sync::Arc<crate::navigator::NavRow> {
+        app.publish_navigators(Instant::now());
+        let tree = app.navigator_tree().unwrap();
+        tree.entries[tree.index_of(session).expect("local session is listed")]
+            .row
+            .clone()
+    }
+
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     const LINE: &str = "Fix the flaky title test";
     let wid = WindowId(0);
     let mut app = App::headless_for_test();
@@ -1576,6 +1663,8 @@ fn a_restored_worker_is_titled_by_its_line_with_its_task_file_gone() {
             b"\n  Fix the flaky title test\nthen run verify\n",
         ));
     app.on_task_changed(w1);
+    panel(&mut app, wid);
+    assert_eq!(row(&mut app, w1).original_topic.as_deref(), Some(LINE));
 
     assert!(matches!(
         app.close_window_logical(wid),
@@ -1625,6 +1714,117 @@ fn a_restored_worker_is_titled_by_its_line_with_its_task_file_gone() {
         LINE,
         "the restored worker is named by its line, not its folder or its agent"
     );
+    panel(&mut next, wid);
+    let restored = row(&mut next, session);
+    assert_eq!(restored.original_topic.as_deref(), Some(LINE));
+    let shortcut = restored.shortcut.expect("parked terminal has a shortcut");
+    let ctx = next.pool.get(session).unwrap().ctx.clone();
+    for (pgid, program, title) in [
+        (540, "claude", "Review parser output"),
+        (550, "zsh", "Shell after exit"),
+        (560, "codex-alab", "Inspecting an invariant"),
+    ] {
+        {
+            let mut timeline = ctx.timeline.lock().unwrap();
+            timeline.note_foreground_group(pgid);
+            timeline.set_program(pgid, Some(program.into()));
+        }
+        {
+            let mut terminal = crate::term_lock(&term);
+            if program == "zsh" {
+                terminal.process(b"\x1b]133;D;0\x07");
+                terminal.process(&crate::app_workers_tests::prompt_in("~/workspace"));
+            } else {
+                terminal.process(&crate::app_workers_tests::line_starts(program));
+                terminal.process(format!("\x1b]2;{title}\x07").as_bytes());
+            }
+        }
+        next.on_program_resolved(session);
+        let row = row(&mut next, session);
+        assert_eq!(row.original_topic.as_deref(), Some(LINE));
+        assert_eq!(row.panel_title(), LINE);
+        if program != "zsh" {
+            assert_eq!(row.title, title, "the organizer keeps the program's title");
+        }
+        assert_eq!(row.program.as_deref(), Some(program));
+        assert_eq!(row.shortcut, Some(shortcut));
+    }
+    assert!(
+        next.write_session_title_pin(session, "Proof bench")
+            .unwrap()
+    );
+    let renamed = row(&mut next, session);
+    assert!(renamed.named);
+    assert_eq!(renamed.panel_title(), "Proof bench");
+    assert_eq!(renamed.original_topic.as_deref(), Some(LINE));
+    next.write_session_meta_field(
+        session,
+        crate::session_timeline::MetaField::Role,
+        "Proof reviewer",
+        aterm_slog::Actor::Human,
+    )
+    .unwrap();
+    let role = row(&mut next, session);
+    assert_eq!(role.panel_title(), "Proof reviewer");
+    assert_eq!(role.original_topic.as_deref(), Some(LINE));
+
+    let shell = next.windows[&wid]
+        .tab_set
+        .tabs()
+        .iter()
+        .find_map(|t| {
+            next.view_store
+                .get(t.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+                .filter(|id| *id != session)
+        })
+        .expect("the other terminal");
+    next.write_session_title_pin(shell, "").unwrap();
+    let plain = next.pool.get(shell).unwrap();
+    {
+        let mut terminal = crate::term_lock(&plain.term);
+        terminal.process(&crate::app_workers_tests::line_starts("printf"));
+        terminal.process(b"\x1b]2;Rust REPL\x07");
+    }
+    {
+        let mut tl = plain.ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(600);
+        tl.set_program(600, Some("zsh".into()));
+    }
+    next.on_program_resolved(shell);
+    let bare = row(&mut next, shell);
+    assert_eq!(bare.original_topic, None);
+    assert!(!bare.named);
+    assert_eq!(bare.panel_title(), "Rust REPL");
+    assert_eq!(bare.program.as_deref(), Some("zsh"));
+
+    let key = match shortcut {
+        1 => KeyCode::Digit1,
+        2 => KeyCode::Digit2,
+        n => panic!("two terminals offered shortcut {n}"),
+    };
+    let digit = SmolStr::new(shortcut.to_string());
+    next.windows.get_mut(&wid).unwrap().mods = if cfg!(target_os = "macos") {
+        ModifiersState::SUPER
+    } else {
+        ModifiersState::CONTROL | ModifiersState::SHIFT
+    };
+    for state in [ElementState::Pressed, ElementState::Released] {
+        next.on_key(
+            wid,
+            KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(key),
+                Key::Character(digit.clone()),
+                Some(digit.clone()),
+                KeyLocation::Standard,
+                state,
+                false,
+            ),
+        );
+    }
+    assert_eq!(next.focused_session_id(wid), Some(session));
+    assert_eq!(next.pool.get(session).unwrap().ctx.self_id, ctx.self_id);
 }
 
 /// A finished restore's deferred sweep keeps a last-window quit's published result, whether

@@ -73,6 +73,10 @@ use std::time::Duration;
 
 use crate::process::{Birth, EndControl, EndRefusal, Ended, Identity, Lineage, end_proven};
 
+#[cfg(unix)]
+#[path = "tether_receipt.rs"]
+pub(crate) mod receipt;
+
 /// The verb a tethered spawn runs this executable with: `<exe> __tether <parent pid> <program>
 /// <argv0> [args…]`.
 pub const VERB: &str = "__tether";
@@ -639,7 +643,7 @@ pub unsafe fn hold_parent_of(parent: i32) -> Result<(), String> {
     if parent <= 1 || !parent_is(parent) {
         return Err(not_parent(parent));
     }
-    hold(parent)
+    hold(parent).map(|_| ())
 }
 
 /// The executable a tethered spawn runs through, once its `main` called [`entry`]. A macOS
@@ -808,12 +812,35 @@ fn serve(rest: &[OsString]) -> ExitCode {
     let status = exec_status();
     #[cfg(target_vendor = "apple")]
     let own_path = std::env::var_os(OWN_PATH_VAR).is_some();
-    if let Err(why) = hold(parent) {
-        eprintln!(
-            "aterm: {} was not started: {why}",
-            Path::new(program).display()
-        );
-        return ExitCode::from(UNTETHERED);
+    let watcher = match hold(parent) {
+        Ok(watcher) => watcher,
+        Err(why) => {
+            eprintln!(
+                "aterm: {} was not started: {why}",
+                Path::new(program).display()
+            );
+            return ExitCode::from(UNTETHERED);
+        }
+    };
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    let _ = watcher;
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    if let Some(status) = &status {
+        use std::io::Write as _;
+        // This private lane belongs to the actual spawned tether, and closes
+        // at its target exec. Relay only its own fork's complete arming frame.
+        let Some(watcher) = watcher else {
+            return ExitCode::from(UNTETHERED);
+        };
+        let Ok(copy) = status.try_clone() else {
+            return ExitCode::from(UNTETHERED);
+        };
+        if std::fs::File::from(copy)
+            .write_all(&receipt::encode(watcher))
+            .is_err()
+        {
+            return ExitCode::from(UNTETHERED);
+        }
     }
     if let Err(why) = crate::spawnfd::entry_barrier::before_exec() {
         eprintln!("aterm: target entry was not released: {why}");
@@ -935,16 +962,16 @@ fn parent_is(parent: i32) -> bool {
 /// session) a watcher left behind ([`leave_watcher`]), which ends that group when the parent exits
 /// or execs (an exec from Linux 6.9, [`parent_end`]).
 #[cfg(target_os = "linux")]
-fn hold(parent: i32) -> Result<(), String> {
+fn hold(parent: i32) -> Result<Option<Identity>, String> {
     bind(parent).map_err(|e| match e.raw_os_error() {
         Some(libc::ESRCH) => not_parent(parent),
         _ => format!("PR_SET_PDEATHSIG: {e}"),
     })?;
     // SAFETY: `getpgrp` and `getpid` take nothing and cannot fail.
     if unsafe { libc::getpgrp() != libc::getpid() } {
-        return Ok(());
+        return Ok(None);
     }
-    leave_watcher(parent)
+    leave_watcher(parent).map(Some)
 }
 
 /// The variable a Linux tethered spawn that runs through its tether ([`route`]) names the thread
@@ -956,9 +983,9 @@ pub(crate) const THREAD_VAR: &str = "ATERM_TETHER_THREAD";
 
 /// No death tie here: only a check that `parent` is still this process's parent.
 #[cfg(all(unix, not(target_os = "linux"), not(target_vendor = "apple")))]
-fn hold(parent: i32) -> Result<(), String> {
+fn hold(parent: i32) -> Result<Option<Identity>, String> {
     if parent_is(parent) {
-        Ok(())
+        Ok(None)
     } else {
         Err(not_parent(parent))
     }
@@ -1106,11 +1133,11 @@ impl Spawners {
 /// Tie this process to `parent` before its exec: the check that `parent` is still this process's
 /// parent, then a watcher left behind ([`leave_watcher`]).
 #[cfg(target_vendor = "apple")]
-fn hold(parent: i32) -> Result<(), String> {
+fn hold(parent: i32) -> Result<Option<Identity>, String> {
     if !parent_is(parent) {
         return Err(not_parent(parent));
     }
-    leave_watcher(parent)
+    leave_watcher(parent).map(Some)
 }
 
 /// Leave the watcher behind: read this process, the child it will exec into, as the watcher will
@@ -1119,7 +1146,7 @@ fn hold(parent: i32) -> Result<(), String> {
 /// no child of its own to wait for); wait for it to arm, then check `parent` is still this
 /// process's parent, so the watch it armed is on the right process.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-fn leave_watcher(parent: i32) -> Result<(), String> {
+fn leave_watcher(parent: i32) -> Result<Identity, String> {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
     let null = std::fs::OpenOptions::new()
@@ -1174,20 +1201,13 @@ fn leave_watcher(parent: i32) -> Result<(), String> {
     {}
     drop(arming);
     drop(null);
-    let mut byte = [0_u8; 1];
-    let said = loop {
-        match armed.read(&mut byte) {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            said => break said,
-        }
-    };
+    let mut frame = [0_u8; receipt::FRAME_LEN];
+    let said = armed.read_exact(&mut frame);
     if !parent_is(parent) {
         return Err(not_parent(parent));
     }
-    match said {
-        Ok(1) => Ok(()),
-        _ => Err("its watcher did not arm".to_string()),
-    }
+    said.map_err(|error| format!("its watcher did not arm: {error}"))?;
+    receipt::decode(&frame).map_err(|error| format!("its watcher did not arm: {error}"))
 }
 
 /// One `EVFILT_PROC` change for `pid`'s `notes`, with a receipt.
@@ -1253,7 +1273,7 @@ unsafe fn child_exit_notice(kq: i32, child: i32, patience: Duration) -> ChildExi
 /// The watcher: a session of its own (`setsid`; one it cannot lead exits, unarmed, and the tether
 /// starts nothing), stdio on `/dev/null` and every other descriptor the tether held closed but
 /// `arming` ([`hold_nothing_but`]: a transparent spawn's, and the spawn's exec status), a kqueue watch on `parent`'s exit and exec and on the
-/// `watched` child's exit, the arming byte, then a wait. The child's exit ends it; the parent's
+/// `watched` child's exit, its native arming frame, then a wait. The child's exit ends it; the parent's
 /// exit or exec ends the child first, as [`end_once_run`] ends one, with the live reads and
 /// `kill(2)` ([`EndControlLive`]), the child's [`Proof`] read by [`read_lineage`] and
 /// [`thread_ran`]. A child whose exit came first reads as gone there (a zombie reads nothing, a
@@ -1331,7 +1351,7 @@ unsafe fn watch(
         {
             libc::_exit(1);
         }
-        if libc::write(arming, [1_u8].as_ptr().cast(), 1) != 1 {
+        if !receipt::arm(arming) {
             libc::_exit(1);
         }
         libc::close(arming);
@@ -1502,7 +1522,7 @@ fn child_exit_notice(exit: &std::os::fd::OwnedFd, patience: Duration) -> ChildEx
 /// watcher, holds it, and the child waits on this arming. It holds a group leader's group by that
 /// pidfd where the kernel signals a group by one (Linux 6.9, `group::GroupPidfd`), else by its
 /// anchor ([`anchored`], `group::GroupLive`); then it leads a session of its own, opens a
-/// descriptor of the parent's end ([`parent_end`]), writes the arming byte, and waits. The
+/// descriptor of the parent's end ([`parent_end`]), writes its native arming frame, and waits. The
 /// parent's exit or exec ends a leader's group once the child reads started or exited
 /// ([`end_group_once_ready`]), then the child alone by its proof ([`end_once_run`]), with the live
 /// reads and `kill(2)`; the child's exit first leaves a leader's group watched while it holds a
@@ -1545,7 +1565,7 @@ unsafe fn watch(
         let exit = match pidfd_open(child, 0) {
             Ok(exit) => exit,
             Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
-                let armed = libc::write(arming, [1_u8].as_ptr().cast(), 1) == 1;
+                let armed = receipt::arm(arming);
                 leave(None, i32::from(!armed));
             }
             Err(_) => leave(None, 1),
@@ -1570,12 +1590,12 @@ unsafe fn watch(
         let gone = match parent_end(parent) {
             Ok(gone) => gone,
             Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {
-                let armed = libc::write(arming, [1_u8].as_ptr().cast(), 1) == 1;
+                let armed = receipt::arm(arming);
                 leave(anchor.as_ref(), i32::from(!armed));
             }
             Err(_) => leave(anchor.as_ref(), 1),
         };
-        if libc::write(arming, [1_u8].as_ptr().cast(), 1) != 1 {
+        if !receipt::arm(arming) {
             leave(anchor.as_ref(), 1);
         }
         libc::close(arming);

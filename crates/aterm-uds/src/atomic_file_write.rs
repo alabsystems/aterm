@@ -405,7 +405,9 @@ pub mod publication_seam {
         }
     }
 
-    pub(super) fn failure() -> Option<io::Error> {
+    /// This thread's failure, where a guard installed one: the careful writer's and, on
+    /// Windows, `private_file`'s writer through a held folder take it before their rename.
+    pub(crate) fn failure() -> Option<io::Error> {
         FAILURE.with(|failure| failure.get().map(io::Error::from))
     }
 }
@@ -424,7 +426,6 @@ fn temp_component(name: &str, salt: &str) -> String {
     format!(".{name}.tmp.{}.{salt}", std::process::id())
 }
 
-#[cfg(unix)]
 pub(crate) fn fresh_temp_component(name: &str) -> io::Result<String> {
     Ok(temp_component(
         name,
@@ -657,63 +658,6 @@ pub fn write_secured_with<T>(
     .map_err(|failure| failure.error)?;
     landed?;
     Ok(captured)
-}
-
-/// [`write`] of a private file on Windows: the temporary is made with `descriptor`
-/// ([`create_temp_secured`]), so `path` has its owner and access list from the rename on.
-/// # Errors
-/// As [`write`].
-#[cfg(windows)]
-pub(crate) fn write_secured(
-    path: &Path,
-    bytes: &[u8],
-    descriptor: crate::acl::Descriptor,
-) -> io::Result<()> {
-    write_captured_context(
-        path,
-        MakeTemp::Secured(descriptor),
-        |writer| writer.write_all(bytes),
-        |_| Ok(()),
-        || Ok(()),
-        WriteFlush {
-            mode: Some(Flush::Durable),
-            diagnose: false,
-        },
-        best_effort(Flush::dir),
-    )
-    .map_err(|failure| failure.error)?
-    .1
-}
-
-/// [`write_entry_flushed`] of a private file on Windows: the temporary is made with
-/// `descriptor` ([`create_temp_secured`]).
-/// # Errors
-/// As [`write_entry_flushed`].
-#[cfg(windows)]
-pub(crate) fn write_entry_secured(
-    path: &Path,
-    bytes: &[u8],
-    descriptor: crate::acl::Descriptor,
-    flush: Flush,
-) -> io::Result<()> {
-    let (_, landed) = write_captured_context(
-        path,
-        MakeTemp::Secured(descriptor),
-        |writer| writer.write_all(bytes),
-        |_| Ok(()),
-        || Ok(()),
-        WriteFlush {
-            mode: Some(flush),
-            diagnose: true,
-        },
-        |flush, dir| {
-            flush
-                .dir_diagnosed(dir)
-                .map_err(|error| write_error("flush directory", dir, error))
-        },
-    )
-    .map_err(WriteFailure::into_io)?;
-    landed
 }
 
 /// A new temporary beside `path`, named with a fresh `salt` and made by `open`, which fails

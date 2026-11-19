@@ -9,7 +9,10 @@
 //!
 //! Each read is one store read, one projection ([`View::of`] what `Resolved::read` resolves:
 //! what stands now, the quota, and the records a roll archived) and one pass over the log's
-//! eligible records in history order, looking only at the changes to the cells asked for.
+//! eligible records in history order, looking only at the changes to the cells asked for. A
+//! family that keeps its records adds, on every read, one store read and one projection for
+//! each sealed generation before the handle's, and one pass over a sealed log where a read
+//! asks it for its records ("A family that keeps its records" below).
 //!
 //! **A cell** is a typed cell's stored key, or an owned or log collection's row key, whose value
 //! is the whole row. A write is listed only where a reader keeps it: every write to a typed
@@ -76,8 +79,32 @@
 //! write observed (the record `super::archived_records` names for each: the first that archived
 //! it). An archived row is in no unseen list: it is its key's own Mac's write of an earlier
 //! generation, which that Mac's later writes followed.
+//!
+//! **A family that keeps its records** (`super::keeps_records`, tracker TK-41). Its roll
+//! carries no history and archives no row: a sealed generation's log stays where it is, and an
+//! owned row or a log entry signed into it is in no later log (`super::kept`). So each read
+//! here opens the sealed generations before the one the handle reaches ([`Handle::earlier`])
+//! and reads each as that generation reads its own log, under its own table, quota and
+//! signers:
+//! - What stands at an owned or log key is the family's row there: the head's view over the
+//!   sealed generations' rows (`kept::overlay`), so a row no later generation wrote again, and
+//!   every log entry, stands from the sealed log that holds it.
+//! - A cell that is an owned or log key lists each sealed generation's writes there before
+//!   this log's, by generation, each as a signed record of its own log ([`Source::Sealed`]):
+//!   its operation, value, writer, machine and clocks are the record's own.
+//! - What a sealed record wrote ([`Handle::wrote`]) is read in the log it was signed into: what
+//!   it replaced, had not seen and what has written its cells since are that log's writes, as
+//!   the signed graph of that log says, since a later generation's writes are of another log.
+//!   Whether each write stands is the family's head's answer.
+//!
+//! A typed cell's writes are listed by [`Handle::cell_values`] and [`Handle::writes`] as
+//! before: a restated register's candidates under [`Source::Restated`], at the record that
+//! restated them, so those two and [`Handle::wrote`] of the sealed record that wrote one
+//! (which lists it as that record, [`Source::Sealed`]) name its writer and clocks
+//! differently. Nor does a write of a later generation list a sealed row as the one it
+//! replaced.
 
-use super::{EntryKind, Handle, Inert, Mac, Macs, Resolved, View, decode};
+use super::{Compiled, EntryKind, Handle, Inert, Mac, Macs, Resolved, View, kept};
 use crate::{
     Error, Result,
     alab::{self, registry},
@@ -107,6 +134,13 @@ use std::{
 pub enum Source {
     /// A record of this generation's log: the writer, machine and clocks are its own.
     Log,
+    /// A record of a sealed generation's own log, in a family that keeps its records
+    /// (`super::kept`): the writer, machine and clocks are its own, as that log gave them, and
+    /// it is authenticated here under its own signer's signature.
+    Sealed {
+        /// The generation whose log holds the record.
+        generation: u32,
+    },
     /// A write of an earlier generation that a roll's carried history states
     /// (`alab::history`): the clocks are the ones that generation's log gave it, as its roller
     /// stated them. So are a typed cell's writer and machine; an owned row's are its archived
@@ -229,7 +263,11 @@ impl Handle {
     /// with each of those cells it wrote ([`Written`]), in history order as
     /// [`Self::cell_values`] lists one cell's: what [`Self::cell_values`] and [`Self::wrote`]
     /// answer for those cells, read in one observation of the store that gives up at `read_by`,
-    /// so the values, what stands and the Macs that wrote them are of one moment.
+    /// so the values, what stands and the Macs that wrote them are of one moment. In a family
+    /// that keeps its records, a sealed generation's write to one of these cells is listed as
+    /// the roll restated it, as [`Self::cell_values`] lists it; [`Self::wrote`] of that
+    /// operation reads it in its own log, so the two differ there (the module's "A family
+    /// that keeps its records").
     ///
     /// # Errors
     /// As [`Self::view_until`]: the store is busy past `read_by`, among others; `collection` is
@@ -240,7 +278,6 @@ impl Handle {
         keys: &[&str],
         read_by: Instant,
     ) -> Result<Vec<Written>> {
-        let table = self.compiled.table;
         super::reopened(read_by, || {
             application::observe_store_within(
                 &self.paths,
@@ -248,9 +285,14 @@ impl Handle {
                 read_by,
                 &|| crate::admission::deadline().min(read_by),
                 |session, store, scope| {
-                    over(table, session, store, scope, &|reader| {
-                        reader.writes(collection, keys)
-                    })
+                    over(
+                        self.compiled,
+                        &self.earlier(),
+                        session,
+                        store,
+                        scope,
+                        &|reader| reader.writes(collection, keys),
+                    )
                 },
             )
         })
@@ -258,7 +300,9 @@ impl Handle {
 
     /// Every value the cell `key` of `collection` held, each with the write that put it there:
     /// the writes an earlier generation's roll carried first, by generation, then this log's in
-    /// history order (causal clock, then digest), each operation once. A secret is listed with
+    /// history order (causal clock, then digest), each operation once. At an owned or log key
+    /// of a family that keeps its records, the writes each sealed generation's log holds there
+    /// come first too, by generation ([`Source::Sealed`]). A secret is listed with
     /// no value ([`Held::withheld`]), and a string no other surface shows as the refusal mark
     /// ([`Held::refused`]).
     ///
@@ -276,7 +320,9 @@ impl Handle {
     /// # Errors
     /// As [`Self::cell_values`], or `operation` is no eligible write of this table's log here:
     /// one this Mac does not hold, a refused revert, or a write of an earlier generation, which
-    /// a roll carried as history and not as a record.
+    /// a roll carried as history and not as a record. A record of a sealed generation of a
+    /// family that keeps its records is no such write: it is read from the log it was signed
+    /// into (the module's "A family that keeps its records").
     pub fn wrote(&self, operation: Digest) -> Result<Vec<Wrote>> {
         self.reading(|reader| reader.wrote(&operation))
     }
@@ -291,35 +337,68 @@ impl Handle {
     }
 
     fn reading<T>(&self, read: impl Fn(&Reader<'_>) -> Result<T>) -> Result<T> {
-        let table = self.compiled.table;
         super::reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                over(table, session, store, scope, &read)
+                over(self.compiled, &self.earlier(), session, store, scope, &read)
             })
         })
     }
 }
 
-/// `read` over one observation of `table`'s store: its log, the head's view and the history its
-/// rolls carried.
+/// `read` over one observation of `compiled`'s store: its log, read with the records its
+/// generation takes, the head's view and the history its rolls carried; and, where `earlier`
+/// names the sealed generations of a family that keeps its records ([`Handle::earlier`]), each
+/// of those as this Mac stores it, read as that generation reads its own log, with the head's
+/// view laid over their rows (`kept::overlay`).
+///
+/// # Errors
+/// As `Resolved::read`; this Mac stores no log of a sealed generation (`kept::sealed`), or its
+/// storage cannot be read.
 fn over<T>(
-    table: &'static Table,
+    compiled: &'static Compiled,
+    earlier: &[&'static Compiled],
     session: &Session<'_>,
     store: &Store,
     scope: Scope,
     read: &impl Fn(&Reader<'_>) -> Result<T>,
 ) -> Result<T> {
-    let log = Log::read_with(session, store, scope, decode)?;
-    let resolved = Resolved::read(table, session, &log)?;
-    let view = View::of(table, &log, &resolved);
+    let table = compiled.table;
+    let log = Log::read_with(session, store, scope, compiled.decoder())?;
     let resolve = owned::commons::historical(session);
+    // Each sealed generation: its log, and its own view of it.
+    let mut sealed = Vec::with_capacity(earlier.len());
+    let mut rows = Vec::with_capacity(earlier.len());
+    for generation in kept::sealed(session, earlier)? {
+        let log = generation.log(session)?;
+        let (resolved, view) = generation.view(session, &log)?;
+        rows.push(generation.rows_of(&log, &resolved, &view));
+        sealed.push((generation.compiled, log, resolved, view));
+    }
+    let resolved = Resolved::read(table, session, &log)?.over(rows);
+    let view = View::of(table, &log, &resolved);
+    let sealed: Vec<Reader<'_>> = sealed
+        .iter()
+        .map(|(compiled, log, resolved, view)| Reader {
+            table: compiled.table,
+            generation: Some(compiled.generation),
+            log,
+            carried: alab::history::carried(view, &resolve, None),
+            view,
+            resolved,
+            resolve: &resolve,
+            sealed: &[],
+            archived: OnceCell::new(),
+        })
+        .collect();
     read(&Reader {
         table,
+        generation: None,
         log: &log,
         carried: alab::history::carried(&view, &resolve, None),
         view: &view,
+        resolved: &resolved,
         resolve: &resolve,
-        archive: &|| super::archived_records(&resolved, &within(&view)),
+        sealed: &sealed,
         archived: OnceCell::new(),
     })
 }
@@ -346,17 +425,26 @@ impl Record {
     }
 }
 
-/// One read of a table: its log, the head's view and the history its rolls carried.
+/// One read of a table: its log, the head's view and the history its rolls carried; or one
+/// sealed generation of a family that keeps its records, read the same way from its own log.
 struct Reader<'a> {
     table: &'static Table,
+    /// The sealed generation this reads; `None` for the generation the handle reaches.
+    generation: Option<u32>,
     log: &'a Log,
+    /// The view of `log`: the handle's generation's over the sealed generations' rows, or a
+    /// sealed generation's own.
     view: &'a View,
+    /// What `view` resolved.
+    resolved: &'a Resolved,
     resolve: &'a dyn Fn(&Digest, &Actor) -> Option<[u8; 16]>,
     carried: alab::history::Carried,
+    /// The sealed generations before the handle's, oldest first, in a family that keeps its
+    /// records; empty for any other family and in a sealed generation's own reader.
+    sealed: &'a [Reader<'a>],
     /// The records a roll archived, each with the operation of this log that archived it
-    /// (`super::archived_records` of the view's resolution over [`within`]).
-    archive: &'a dyn Fn() -> Vec<(Digest, owned::Op)>,
-    /// What `archive` read, once an owned key asks for it.
+    /// (`super::archived_records` of the view's resolution over [`within`]), once an owned key
+    /// asks for them.
     archived: OnceCell<Vec<(Digest, owned::Op)>>,
 }
 
@@ -507,7 +595,9 @@ fn restored(value: &Value) -> &Value {
 /// a restatement's candidates at their record's place.
 const fn place(held: &Held) -> (u8, u32, Hlc, Digest, Digest) {
     match held.source {
-        Source::Carried { generation, .. } | Source::Stated { generation, .. } => {
+        Source::Carried { generation, .. }
+        | Source::Stated { generation, .. }
+        | Source::Sealed { generation } => {
             (0, generation, held.hlc, held.operation, held.operation)
         }
         Source::Restated { by } => (1, 0, held.hlc, by, held.operation),
@@ -545,6 +635,8 @@ impl Reader<'_> {
     /// each carried one under the operation its register names (a revert that restored a
     /// register stands as itself); the row an owned key holds; a log key's first entry. A claim
     /// cell's candidate may be a row's re-entry, which wrote nothing there ([`Self::reassert`]).
+    /// An owned row or a log entry may stand from a sealed generation's log, in a family that
+    /// keeps its records.
     fn standing(&self, collection: &str, key: &str) -> BTreeSet<Digest> {
         let declared = self.table.collection(collection);
         match declared.map(|declared| declared.kind) {
@@ -556,17 +648,17 @@ impl Reader<'_> {
                 .map(|row| row.operation)
                 .into_iter()
                 .collect(),
-            Some(Kind::Log) => {
-                let within = within(self.view);
-                declared
-                    .map(|declared| owned::read_log(declared, &within, self.resolve))
-                    .unwrap_or_default()
-                    .entries
-                    .iter()
-                    .filter(|entry| format!("{}.{}", keys::uuid32(&entry.machine), entry.n) == key)
-                    .map(|entry| entry.operation)
-                    .collect()
-            }
+            // The view's own read (`owned::read_log` of the operations within quota), over
+            // the sealed generations' entries where the family keeps its records.
+            Some(Kind::Log) => self
+                .view
+                .logs
+                .get(collection)
+                .into_iter()
+                .flat_map(|read| &read.entries)
+                .filter(|entry| owned::log_entry_key(&entry.machine, entry.n) == key)
+                .map(|entry| entry.operation)
+                .collect(),
             _ => self
                 .view
                 .cells
@@ -589,6 +681,40 @@ impl Reader<'_> {
         }
     }
 
+    /// Where a record of this reader's log is: this generation's log, or a sealed one's.
+    const fn source(&self) -> Source {
+        match self.generation {
+            Some(generation) => Source::Sealed { generation },
+            None => Source::Log,
+        }
+    }
+
+    /// The writes at the owned or log key `key` of `collection` that this reader's log holds
+    /// and a reader keeps, in its history order; none where this generation declares no such
+    /// collection of rows. `standing` is what stands at the key at the family's head.
+    fn rows_at(
+        &self,
+        collection: &str,
+        key: &str,
+        standing: &BTreeSet<Digest>,
+    ) -> Result<Vec<Held>> {
+        let rows = self
+            .table
+            .collection(collection)
+            .is_some_and(|declared| declared.kind != Kind::Cells);
+        if !rows {
+            return Ok(Vec::new());
+        }
+        let wanted = Wanted::from([((collection, key), standing.clone())]);
+        Ok(self
+            .records(&wanted)?
+            .remove(&(collection.to_owned(), key.to_owned()))
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|record| record.held)
+            .collect())
+    }
+
     /// What `operation`, clocked `hlc` and signed by `machine`, wrote with `change`: itself, or,
     /// where it is a roll's restatement, each candidate its carried register lists.
     fn held(
@@ -607,7 +733,7 @@ impl Reader<'_> {
             let shown = show(value);
             Held {
                 operation: id,
-                source: Source::Log,
+                source: self.source(),
                 actor: operation.header.actor,
                 machine,
                 authored_ms: operation.authored_ms,
@@ -853,7 +979,7 @@ impl Reader<'_> {
             return Vec::new();
         }
         self.archived
-            .get_or_init(|| (self.archive)())
+            .get_or_init(|| super::archived_records(self.resolved, &within(self.view)))
             .iter()
             .filter_map(|(by, record)| {
                 let machine = (self.resolve)(&record.roster, &record.actor);
@@ -962,6 +1088,15 @@ impl Reader<'_> {
                 out.push(held);
             }
         }
+        // An owned row or a log entry of a sealed generation is in no later log: each is read
+        // from the log it was signed into, as its signed record.
+        for sealed in self.sealed {
+            for held in sealed.rows_at(collection, key, &standing)? {
+                if seen.insert(held.operation) {
+                    out.push(held);
+                }
+            }
+        }
         out.sort_by_key(place);
         Ok(out)
     }
@@ -1020,7 +1155,7 @@ impl Reader<'_> {
             let mut seen = BTreeSet::new();
             for record in records {
                 let own: BTreeSet<Digest> = record.held.iter().map(|held| held.operation).collect();
-                let logged = record.held.iter().any(|held| held.source == Source::Log);
+                let logged = record.held.iter().any(|held| held.source == self.source());
                 if !logged {
                     // A roll's restatement: each candidate it lists is a write of an earlier
                     // generation, listed under its own operation.
@@ -1106,7 +1241,31 @@ impl Reader<'_> {
         Ok(out.into_iter().map(|(_, written)| written).collect())
     }
 
+    /// [`Handle::wrote`]: `operation` read in the log that holds it, this one or, in a family
+    /// that keeps its records, a sealed generation's, with what stands judged at this reader,
+    /// the family's head.
     fn wrote(&self, operation: &Digest) -> Result<Vec<Wrote>> {
+        if self.log.eligible_record(operation).is_none()
+            && let Some(sealed) = self
+                .sealed
+                .iter()
+                .find(|sealed| sealed.log.eligible_record(operation).is_some())
+        {
+            // What stands is the head's whole answer: a sealed generation's own restatement
+            // lists candidates of a still earlier log, which stand where the head says so.
+            return sealed.wrote_in(operation, &|collection, key| self.standing(collection, key));
+        }
+        self.wrote_in(operation, &|collection, key| self.standing(collection, key))
+    }
+
+    /// What `operation`, a record of this reader's log, wrote at each of its cells, with what
+    /// that replaced, had not seen and what has written there since, all of this log;
+    /// `standing` says what stands at a cell at the family's head.
+    fn wrote_in(
+        &self,
+        operation: &Digest,
+        standing: &dyn Fn(&str, &str) -> BTreeSet<Digest>,
+    ) -> Result<Vec<Wrote>> {
         let (_, command) = self.log.eligible_record(operation).ok_or_else(|| {
             Error::new(
                 "no eligible write with that digest in this table here (see `aterm db table history`)",
@@ -1125,7 +1284,7 @@ impl Reader<'_> {
             .iter()
             .map(|change| {
                 let cell = (change.collection.as_str(), change.key.as_str());
-                (cell, self.standing(cell.0, cell.1))
+                (cell, standing(cell.0, cell.1))
             })
             .collect();
         for row in archived.values().flatten() {

@@ -245,39 +245,50 @@ impl Drawn {
         ((x0.min(w), (x0 + cw).min(w)), (y0.min(h), (y0 + ch).min(h)))
     }
 
+    /// Frame cell `at`'s pixels row by row, each packed big-endian, so that packed pixels order
+    /// as their RGBA bytes do, and the cell's width in pixels.
+    fn cell_pixels(&self, at: (usize, usize)) -> (Vec<u32>, usize) {
+        let ((x0, x1), (y0, y1)) = self.cell_rect(at);
+        let w = self.size.0;
+        let mut pixels = Vec::with_capacity((x1 - x0) * (y1 - y0));
+        for y in y0..y1 {
+            for p in self.rgba[(y * w + x0) * 4..(y * w + x1) * 4]
+                .as_chunks::<4>()
+                .0
+            {
+                pixels.push(u32::from_be_bytes(*p));
+            }
+        }
+        (pixels, x1 - x0)
+    }
+
     /// Frame cell `at`'s ground: its most common colour.
     fn ground(&self, at: (usize, usize)) -> [u8; 4] {
-        let ((x0, x1), (y0, y1)) = self.cell_rect(at);
-        let mut pixels: Vec<[u8; 4]> = (y0..y1)
-            .flat_map(|y| (x0..x1).map(move |x| self.px(x, y)))
-            .collect();
-        pixels.sort_unstable();
-        pixels
-            .chunk_by(|a, b| a == b)
-            .max_by_key(|run| run.len())
-            .map_or([0; 4], |run| run[0])
+        most_common(self.cell_pixels(at).0).to_be_bytes()
     }
 
     /// What frame cell `at`'s glyph inks, or `None` where every pixel is its ground.
     fn ink(&self, at: (usize, usize)) -> Option<Ink> {
-        let ((x0, x1), (y0, y1)) = self.cell_rect(at);
-        let ground = self.ground(at);
-        let far = |x: usize, y: usize| {
-            let p = self.px(x, y);
-            (0..3)
-                .map(|i| u32::from(p[i].abs_diff(ground[i])))
-                .max()
-                .unwrap_or(0)
-        };
-        let pixels = || (y0..y1).flat_map(move |y| (x0..x1).map(move |x| (x, y)));
-        let top = pixels()
-            .map(|(x, y)| far(x, y))
-            .max()
-            .filter(|&top| top > 0)?;
+        let ((x0, _), (y0, _)) = self.cell_rect(at);
+        let (pixels, w) = self.cell_pixels(at);
+        let ground = most_common(pixels.clone()).to_be_bytes();
+        let mut far = Vec::with_capacity(pixels.len());
+        let mut top = 0;
+        for pixel in pixels {
+            let p = pixel.to_be_bytes();
+            let d = u32::from(p[0].abs_diff(ground[0]))
+                .max(u32::from(p[1].abs_diff(ground[1])))
+                .max(u32::from(p[2].abs_diff(ground[2])));
+            top = top.max(d);
+            far.push(d);
+        }
+        if top == 0 {
+            return None;
+        }
         let (mut xs, mut ys) = ((usize::MAX, 0), (usize::MAX, 0));
         let (mut touched, mut partial) = (0, 0);
-        for (x, y) in pixels() {
-            let d = far(x, y);
+        for (index, &d) in far.iter().enumerate() {
+            let (x, y) = (x0 + index % w, y0 + index / w);
             if 2 * d >= top {
                 xs = (xs.0.min(x), xs.1.max(x));
                 ys = (ys.0.min(y), ys.1.max(y));
@@ -312,6 +323,24 @@ impl Drawn {
                     })
             })
     }
+}
+
+/// The most common of `pixels`, the greatest of those tied; 0 where there are none.
+fn most_common(mut pixels: Vec<u32>) -> u32 {
+    pixels.sort_unstable();
+    let (mut most, mut run_most) = (0, 0);
+    let mut at = 0;
+    while at < pixels.len() {
+        let mut end = at + 1;
+        while end < pixels.len() && pixels[end] == pixels[at] {
+            end += 1;
+        }
+        if end - at >= run_most {
+            (most, run_most) = (pixels[at], end - at);
+        }
+        at = end;
+    }
+    most
 }
 
 /// What [`drawn_at_2x`] reads of a 2x frame against its 1x frame, over the frame cells that
@@ -583,9 +612,9 @@ pub(crate) fn scripted_app_with_sink(sink: std::sync::Arc<aterm_session::sink::S
     app.kitty_cursor_enabled_cache = None;
     app.recompute_sparkle();
     let mut ws = app.windows.get_mut(&WindowId(0)).expect("window");
-    ws.present = Some(crate::PresentTarget::Cpu {
+    ws.replace_present(Some(crate::PresentTarget::Cpu {
         surface: crate::present::CpuSurface::Scripted(Default::default()),
-    });
+    }));
     drop(ws);
     app
 }

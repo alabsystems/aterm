@@ -1012,6 +1012,9 @@ pub struct Child {
     handle: Handle,
     usage: Option<Rusage>,
     custody: Arc<()>,
+    /// Only this actual routed spawn's forked watcher, filled by its private
+    /// exec observer even when that observer is split from the Child.
+    watcher: Option<crate::tether::receipt::Receipt>,
 }
 
 /// A child's exit status and the resources it and the descendants it reaped used.
@@ -1050,6 +1053,34 @@ impl fmt::Debug for Child {
 }
 
 impl Child {
+    /// Wait for this actual spawn's original tether watcher to retire, after
+    /// reaping the original child and settling any protected group members.
+    /// Ordinary wait/try_wait do not wait for that watcher: its live group may
+    /// legitimately outlast the leader. This operation sends no signal.
+    ///
+    /// `check` runs on this thread between observations for caller cancellation.
+    /// Unread/incomparable progress disarms the inactivity window; only native
+    /// absence or changed birth establishes closure, never exec or pipe EOF.
+    /// # Errors
+    /// Child custody/reap, private watcher observation, native identity or
+    /// cancellation is unavailable, or a comparable inactivity window closes.
+    pub fn finish_tether_while(
+        &mut self,
+        inactivity: std::time::Duration,
+        check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.handle.require_custody()?;
+        if self.handle.status.is_none() {
+            return Err(io::Error::other(
+                "reap the original child before its tether watcher",
+            ));
+        }
+        match &self.watcher {
+            Some(watcher) => watcher.finish(inactivity, check),
+            None => Ok(()),
+        }
+    }
+
     /// Parent-private handle identity, stable across moves. A retained receipt
     /// prevents allocation reuse; replacing a Child cannot replace this binding.
     pub(super) fn custody_key(&self) -> Arc<()> {
@@ -1455,6 +1486,7 @@ impl Command {
     fn start_pending(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<PendingChild> {
         let (pid, [stdin, stdout, stderr], status) =
             self.launch(fallback, needs_stdin, false, false)?;
+        let watcher = status.as_ref().map(|status| status.watcher.clone());
         Ok(PendingChild {
             status,
             child: Child {
@@ -1469,6 +1501,7 @@ impl Command {
                 },
                 usage: None,
                 custody: Arc::new(()),
+                watcher,
             },
         })
     }
@@ -1840,14 +1873,17 @@ unsafe extern "C" {
 const SIG_SETMASK: i32 = 2;
 
 /// A routed spawn's exec status ([`crate::tether::STATUS_VAR`]): a pipe whose write end the spawn
-/// hands its tether, open across that exec alone, and whose read end tells the program's exec:
-/// its end once every write end closed (this process's after the spawn, the tether's at the
-/// program's exec, its watcher's as it arms), or the four bytes of the `errno` its exec failed
-/// with. Elsewhere there is none.
+/// hands its tether, open across that exec alone. The direct tether first relays
+/// its own fork's complete native arming frame, then its target exec closes the
+/// lane or appends the four bytes of the exec's errno. The frame is retained by
+/// this actual Child; neither EOF nor the frame proves watcher retirement.
+/// Elsewhere there is none.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 struct ExecStatus {
     read: std::io::PipeReader,
     write: OwnedFd,
+    watcher: crate::tether::receipt::Receipt,
+    framed: bool,
 }
 
 /// No routed spawn has an exec status off macOS and Linux.
@@ -1877,6 +1913,8 @@ impl ExecStatus {
         Ok(Self {
             read: Self::above_stdio(OwnedFd::from(read))?.into(),
             write: Self::above_stdio(OwnedFd::from(write))?,
+            watcher: crate::tether::receipt::Receipt::default(),
+            framed: false,
         })
     }
 
@@ -1897,15 +1935,82 @@ impl ExecStatus {
         Ok(unsafe { OwnedFd::from_raw_fd(above) })
     }
 
+    /// The original arming frame precedes entry-barrier readiness, so a prepared
+    /// child can retain its watcher even if entry is withdrawn without exec.
+    fn watcher_ready(&mut self) -> io::Result<()> {
+        Self::read_watcher(&mut self.read, &self.watcher, &mut self.framed)
+    }
+
+    fn read_watcher(
+        read: &mut std::io::PipeReader,
+        watcher: &crate::tether::receipt::Receipt,
+        framed: &mut bool,
+    ) -> io::Result<()> {
+        if *framed {
+            return Ok(());
+        }
+        let mut frame = [0; crate::tether::receipt::FRAME_LEN];
+        let identity = read
+            .read_exact(&mut frame)
+            .and_then(|()| crate::tether::receipt::decode(&frame));
+        watcher.record(
+            identity
+                .as_ref()
+                .copied()
+                .map_err(|error| io::Error::new(error.kind(), error.to_string())),
+        );
+        identity?;
+        *framed = true;
+        Ok(())
+    }
+
+    /// Read only an already available complete frame after readiness failed.
+    /// Do not await target exec or extend that failed operation. Closing our
+    /// writer prevents our own descriptor from hiding an early tether EOF;
+    /// nonblocking reads also refuse an incomplete frame from a still-live
+    /// helper. The original readiness error and actual Child remain owned.
+    fn watcher_after_readiness_failure(self) {
+        let Self {
+            mut read,
+            write,
+            watcher,
+            framed,
+        } = self;
+        drop(write);
+        if framed {
+            return;
+        }
+        let mut frame = [0; crate::tether::receipt::FRAME_LEN];
+        let identity = set_nonblocking(read.as_raw_fd(), true)
+            .and_then(|()| read.read_exact(&mut frame))
+            .and_then(|()| crate::tether::receipt::decode(&frame));
+        watcher.record(identity);
+    }
+
     /// Once the tether was started: this process's write end closed, the read end read to its end.
     /// `Ok` when the program's exec closed the tether's (or the tether ended before it, which its
     /// status tells); its exec's error when the tether wrote one.
     fn after_fork(self) -> io::Result<()> {
-        let Self { mut read, write } = self;
+        // The spawning parent's write end must close before an early failed
+        // tether can make an incomplete arming frame reach EOF.
+        let Self {
+            mut read,
+            write,
+            watcher,
+            mut framed,
+        } = self;
         drop(write);
-        let mut said = Vec::with_capacity(4);
+        Self::read_watcher(&mut read, &watcher, &mut framed)?;
+        // One optional target-exec errno after the complete native frame.
+        // Overflow is a protocol error, never an accepted success prefix.
+        let limit = 4;
+        let mut said = Vec::with_capacity(limit + 1);
         loop {
-            match read.read_to_end(&mut said) {
+            let room = (limit + 1).saturating_sub(said.len());
+            if room == 0 {
+                break;
+            }
+            match (&mut read).take(room as u64).read_to_end(&mut said) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
                 Ok(_) => break,
@@ -1913,10 +2018,13 @@ impl ExecStatus {
         }
         #[cfg(all(target_os = "macos", debug_assertions))]
         exec_status_control::after_read()?;
-        match <[u8; 4]>::try_from(said.as_slice()) {
-            Ok(errno) => Err(io::Error::from_raw_os_error(i32::from_ne_bytes(errno))),
-            Err(_) if said.is_empty() => Ok(()),
-            Err(_) => Err(io::Error::new(
+        match said.len() {
+            0 => Ok(()),
+            4 => {
+                let errno = said[..].try_into().expect("four-byte errno");
+                Err(io::Error::from_raw_os_error(i32::from_ne_bytes(errno)))
+            }
+            _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("the tether's exec status read {} bytes", said.len()),
             )),
@@ -1988,6 +2096,7 @@ impl Command {
                 },
                 usage: None,
                 custody: Arc::new(()),
+                watcher: None,
             },
         })
     }
@@ -2347,6 +2456,7 @@ impl Command {
         )?;
         drop(plan);
         let [stdin, stdout, stderr] = ours;
+        let watcher = status.as_ref().map(|status| status.watcher.clone());
         Ok(PendingChild {
             status,
             child: Child {
@@ -2361,6 +2471,7 @@ impl Command {
                 },
                 usage: None,
                 custody: Arc::new(()),
+                watcher,
             },
         })
     }
@@ -2558,6 +2669,9 @@ impl Drop for PreparedCohort {
         {
             let _killed = spawned.child_mut().kill();
             let _waited = spawned.child_mut().wait();
+            let _closed = spawned
+                .child_mut()
+                .finish_tether_while(std::time::Duration::from_secs(60), || Ok(()));
         }
     }
 }
@@ -2569,8 +2683,23 @@ impl PendingChild {
         mut barrier: super::entry_barrier::Parent,
     ) -> Result<PreparedCohort, super::SpawnFailure> {
         let Self { child, status } = self;
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        let mut status = status;
         let spawned = seal(child);
         if let Err(error) = barrier.ready() {
+            #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+            if let Some(status) = status.take() {
+                status.watcher_after_readiness_failure();
+            }
+            return Err(super::SpawnFailure::Unbound {
+                spawned: Box::new(spawned),
+                error,
+            });
+        }
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        if let Some(status) = &mut status
+            && let Err(error) = status.watcher_ready()
+        {
             return Err(super::SpawnFailure::Unbound {
                 spawned: Box::new(spawned),
                 error,
@@ -2609,7 +2738,17 @@ impl Command {
                 // Ordinary spawning supplies no cancellation receipt. Keep its established
                 // owning wait before reporting the target's exec-status error.
                 let _waited = child.wait();
-                Err(error)
+                // Target exec may fail after the original watcher armed.
+                // This no-signal closure observes that same private receipt.
+                match child.finish_tether_while(std::time::Duration::from_secs(60), || Ok(())) {
+                    Ok(()) => Err(error),
+                    Err(closure) => Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; original tether watcher retirement unavailable: {closure}"
+                        ),
+                    )),
+                }
             }
         }
     }

@@ -1186,6 +1186,13 @@ fn appkit_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
     } else {
         "memory"
     };
+    if role == "s" && kind == "quiet" && !dir.join("s-prepared").exists() {
+        // Let both real preparation stages finish before testing contention for timed work.
+        std::fs::write(dir.join("s-prepared"), "ready for quiet").unwrap();
+        until_within(MUST_HAPPEN, "R holds the quiet machine", || {
+            dir.join("r-redraw").exists().then_some(())
+        });
+    }
     let mark = dir.join(format!("waiting-{role}-{kind}"));
     crate::admit_in(
         &Ledger::at(dir.join("ledger")),
@@ -1310,11 +1317,16 @@ fn a_timed_stage_claims_memory_only_on_its_runs_quiet_machine() {
                 .expect("a stand-in run"),
         )
     };
+    let mut s = spawn("s");
+    until_within(
+        MUST_HAPPEN,
+        "S finished preparing its AppKit executables",
+        || dir.path().join("s-prepared").exists().then_some(()),
+    );
     let mut r = spawn("r");
     until_within(MUST_HAPPEN, "R's redraw on its quiet machine", || {
         dir.path().join("r-redraw").exists().then_some(())
     });
-    let mut s = spawn("s");
     until_within(MUST_HAPPEN, "S waiting for the quiet machine", || {
         dir.path().join("waiting-s-quiet").exists().then_some(())
     });

@@ -52,6 +52,7 @@ fn used_at(t: u64) -> Event {
         cli: Word::new("claude").unwrap(),
         sub: None,
         window: None,
+        model: None,
         pct_x10: None,
         reset: None,
         res: None,
@@ -163,6 +164,7 @@ pub(crate) fn flush_step(run: &mut Run) -> Option<Flush> {
     let payload = Command::Write {
         request: typed::request_id(APPLICATION, ROLE, &planned.changes).unwrap(),
         changes: planned.changes.clone(),
+        said: None,
     }
     .encode()
     .unwrap();

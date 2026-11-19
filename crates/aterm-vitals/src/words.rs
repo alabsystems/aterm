@@ -490,6 +490,55 @@ pub fn rate_mb(bytes_per_s: f64) -> String {
     format!("{} MB/s", rate_figure(bytes_per_s / 1e6))
 }
 
+/// A measured byte rate in decimal units, retaining positive sub-byte rates. Invalid input
+/// stays unread rather than becoming a zero.
+pub(crate) fn unit_rate_bps(bytes_per_s: f64) -> Option<String> {
+    if !bytes_per_s.is_finite() || bytes_per_s < 0.0 {
+        return None;
+    }
+    let (divisor, unit) = if bytes_per_s >= 1e9 {
+        (1e9, "GB/s")
+    } else if bytes_per_s >= 1e6 {
+        (1e6, "MB/s")
+    } else if bytes_per_s >= 1e3 {
+        (1e3, "KB/s")
+    } else {
+        (1.0, "B/s")
+    };
+    let value = bytes_per_s / divisor;
+    let figure = if value == 0.0 {
+        "0".into()
+    } else if value < 1.0 {
+        value.to_string()
+    } else if value >= 1e6 {
+        format!("{value:.1e}")
+    } else {
+        format!("{value:.1}").trim_end_matches(".0").to_owned()
+    };
+    Some(format!("{figure} {unit}"))
+}
+
+fn unit_rate_clause(label: &str, rate: &crate::units::Rate, prio: u8) -> Clause {
+    let Some(level) = rate.level else {
+        return Clause::new(prio, vec![format!("{label} warming")]);
+    };
+    let Some(mean) = unit_rate_bps(level.mean) else {
+        return Clause::new(prio, vec![format!("{label} not read")]);
+    };
+    let short = format!("{label} {mean}");
+    let mean = format!("{short}, 10 s mean");
+    let peak = rate.peak.and_then(unit_rate_bps);
+    let full = match (peak, rate.basis) {
+        (Some(peak), CapBasis::Learning) => {
+            format!("{mean}, observed 7-day sustained peak {peak}, peak learning")
+        }
+        (Some(peak), _) => format!("{mean}, 7-day sustained peak {peak}"),
+        (None, CapBasis::Learning) => format!("{mean}, peak learning"),
+        (None, _) => format!("{mean}, peak not read"),
+    };
+    Clause::new(prio, vec![full, mean, short])
+}
+
 /// Format bytes in decimal units to three significant digits.
 #[must_use]
 pub fn bytes_dec(bytes: u64) -> String {
@@ -1274,14 +1323,15 @@ fn disk_states(snap: &Snapshot, loc: &Locale) -> Vec<DiskSaid> {
     out
 }
 
-struct JobSaid {
+struct ProcessSaid {
     state: State,
     mark: Mark,
     ink: InkKind,
     words: String,
+    compact: Option<(&'static str, &'static str)>,
 }
 
-fn job_marks(snap: &Snapshot) -> Vec<JobSaid> {
+fn job_marks(snap: &Snapshot) -> Vec<ProcessSaid> {
     let Some(jobs) = snap.jobs.as_deref() else {
         return Vec::new();
     };
@@ -1306,14 +1356,43 @@ fn job_marks(snap: &Snapshot) -> Vec<JobSaid> {
     .filter_map(|(state, words)| words.map(|words| (state, words)))
     .map(|(state, words)| {
         let (mark, ink) = state_mark(Resource::Processes, state);
-        JobSaid {
+        ProcessSaid {
             state,
             mark,
             ink,
             words,
+            compact: None,
         }
     })
     .collect()
+}
+
+fn processes_marks(snap: &Snapshot) -> Vec<ProcessSaid> {
+    let room = snap
+        .facts
+        .process_room
+        .filter(|room| room.near())
+        .map(|room| {
+            let limit = match room.limit() {
+                crate::room::Limit::Processes => "process limit",
+                crate::room::Limit::UserProcesses => "per-user process limit",
+                crate::room::Limit::Threads => "thread limit",
+                crate::room::Limit::Files => "open-file limit",
+            };
+            let (mark, ink) = state_mark(Resource::Processes, State::Warn);
+            ProcessSaid {
+                state: State::Warn,
+                mark,
+                ink,
+                words: format!(
+                    "near the {limit}: {} of {}",
+                    grouped(room.count()),
+                    grouped(room.cap())
+                ),
+                compact: Some(("near limit", "Processes near limit")),
+            }
+        });
+    room.into_iter().chain(job_marks(snap)).collect()
 }
 
 fn times_words(n: u64) -> String {
@@ -1366,19 +1445,18 @@ pub fn state(res: Resource, snap: &Snapshot, loc: &Locale) -> Option<StateWords>
             (top.state, top.forms, top.word, top.label)
         }
         Resource::Processes => {
-            let marks = job_marks(snap);
+            let marks = processes_marks(snap);
             let first = marks.first()?;
             let mut clauses = vec![first.words.clone()];
             if marks.len() > 1 {
                 let all: Vec<&str> = marks.iter().map(|m| m.words.as_str()).collect();
                 clauses.insert(0, all.join(", "));
             }
-            (
-                first.state,
-                clauses,
-                first.words.clone(),
-                first.words.clone(),
-            )
+            let (word, label) = first.compact.map_or_else(
+                || (first.words.clone(), first.words.clone()),
+                |(word, label)| (word.to_owned(), label.to_owned()),
+            );
+            (first.state, clauses, word, label)
         }
         Resource::Cpu => {
             // The machine's thermal level, not the CPU's: its words say "thermal", never "CPU"
@@ -1530,9 +1608,11 @@ fn gpu_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
                 .said(format!("GPU reset {} since {t}.", times_words(n))),
         );
     }
-    let gpu = snap.facts.gpu.as_ref();
+    let gpu = snap.gpu_sample();
     if let Some(c) = gpu.and_then(|g| g.cores) {
-        out.push(Clause::new(0, vec![format!("{c} GPU cores")]));
+        out.push(
+            Clause::new(0, vec![format!("{c} GPU cores")]).said(format!("Across {c} GPU cores.")),
+        );
     }
     if let Some(b) = gpu.and_then(|g| g.in_use_bytes) {
         out.push(Clause::new(
@@ -1599,6 +1679,12 @@ fn memory_details(snap: &Snapshot) -> Vec<Clause> {
             vec![format!("swapping {} MiB/s", rate_lone(r / MIB))],
         ));
     }
+    if let Some(bytes) = m.compressed {
+        out.push(Clause::new(2, vec![format!("compressed {}", mem(bytes))]));
+    }
+    if let Some(churn) = &snap.units.churn {
+        out.push(unit_rate_clause("compressor churn", churn, 2));
+    }
     if m.cached > 0 {
         out.push(Clause::new(
             2,
@@ -1625,6 +1711,10 @@ fn disk_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
                 .said(s.spoken)
         })
         .collect();
+    if let Some(home) = snap.units.home_disk() {
+        out.push(unit_rate_clause("home device writing", &home.write, 2));
+        out.push(unit_rate_clause("home device reading", &home.read, 2));
+    }
     if let Some(f) = facts.filling.filter(|f| !f.outranks_level()) {
         let d = duration_approx(f.secs);
         out.push(Clause::new(
@@ -1726,6 +1816,26 @@ fn network_learning(snap: &Snapshot) -> Option<Clause> {
     )
 }
 
+/// Keep the measured latency in the state clause so folding cannot hide why a quiet link is slow.
+fn degraded_network(srtt_ms: Option<f32>) -> Clause {
+    let mut clause = match srtt_ms.filter(|ms| ms.is_finite() && *ms >= 250.0) {
+        Some(ms) => {
+            let rtt = rtt_word(ms);
+            Clause::new(
+                0,
+                vec![format!("high TCP latency: {rtt}"), format!("{rtt} RTT")],
+            )
+            .said(format!("High TCP latency: {rtt}."))
+        }
+        None => Clause::new(0, vec!["link degraded".into(), "degraded".into()])
+            .said("Network link degraded.".into()),
+    };
+    clause.keep = true;
+    clause.mark = Some(Mark::Dot);
+    clause.ink = InkKind::Warn;
+    clause
+}
+
 fn network_details(snap: &Snapshot) -> Vec<Clause> {
     let view = &snap.resources[Resource::Network.index()];
     let mut out: Vec<Clause> = network_learning(snap).into_iter().collect();
@@ -1738,13 +1848,7 @@ fn network_details(snap: &Snapshot) -> Vec<Clause> {
                     .inked(InkKind::Warn)
                     .said("Network offline, no active link.".into()),
             ),
-            NetState::Degraded => out.push(
-                Clause::new(0, vec!["link degraded".into(), "degraded".into()])
-                    .kept()
-                    .marked(Some(Mark::Dot))
-                    .inked(InkKind::Warn)
-                    .said("Network link degraded.".into()),
-            ),
+            NetState::Degraded => out.push(degraded_network(net.srtt_ms)),
             NetState::Online | NetState::Idle => {}
         }
     }
@@ -1768,7 +1872,10 @@ fn network_details(snap: &Snapshot) -> Vec<Clause> {
         };
         out.push(Clause::new(0, forms).marked(Some(mark)).said(said));
     }
-    if let Some(ms) = snap.net.as_ref().and_then(|n| n.srtt_ms) {
+    if let Some(ms) = snap.net.as_ref().and_then(|n| {
+        n.srtt_ms
+            .filter(|ms| n.state != NetState::Degraded || *ms < 250.0)
+    }) {
         let rtt = rtt_word(ms);
         out.push(
             Clause::new(1, vec![format!("{rtt} RTT"), rtt.clone()])
@@ -1883,7 +1990,7 @@ fn yours_of(room: &TaskRoom) -> Option<(u64, u64)> {
 }
 
 fn processes_details(snap: &Snapshot) -> Vec<Clause> {
-    let mut out: Vec<Clause> = job_marks(snap)
+    let mut out: Vec<Clause> = processes_marks(snap)
         .into_iter()
         .enumerate()
         .map(|(i, m)| {
@@ -2052,16 +2159,20 @@ pub fn gpu_source(snap: &Snapshot) -> Option<String> {
     Some(line)
 }
 
-const SPOKEN_UNITS: [(&str, &str, &str); 13] = [
+const SPOKEN_UNITS: [(&str, &str, &str); 17] = [
     ("TB", "terabytes", "terabyte"),
     ("GB", "gigabytes", "gigabyte"),
     ("MB", "megabytes", "megabyte"),
     ("kB", "kilobytes", "kilobyte"),
     ("GiB", "gibibytes", "gibibyte"),
     ("MiB", "mebibytes", "mebibyte"),
+    ("KiB", "kibibytes", "kibibyte"),
     ("MB/s", "megabytes per second", "megabyte per second"),
     ("GB/s", "gigabytes per second", "gigabyte per second"),
     ("MiB/s", "mebibytes per second", "mebibyte per second"),
+    ("KB/s", "kilobytes per second", "kilobyte per second"),
+    ("B/s", "bytes per second", "byte per second"),
+    ("s", "seconds", "second"),
     ("GB/min", "gigabytes per minute", "gigabyte per minute"),
     ("MB/min", "megabytes per minute", "megabyte per minute"),
     ("min", "minutes", "minute"),
@@ -2452,9 +2563,12 @@ pub fn row_sentence(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale)
             None => format!("{name}: {amount}."),
         });
         if res == Resource::Gpu
-            && let Some(source) = gpu_source(snap)
+            && let Some(name) = snap
+                .gpu_sample()
+                .and_then(|gpu| gpu.name.as_deref())
+                .filter(|name| !name.is_empty())
         {
-            out.push(format!("{}.", speak(&source)));
+            out.push(format!("{}.", speak(name)));
         }
         out.extend(learning.as_ref().map(|c| c.spoken.clone()));
     }
@@ -2764,13 +2878,7 @@ fn glance_network_details(snap: &Snapshot) -> Vec<Clause> {
                     .inked(InkKind::Warn)
                     .said("Network offline.".into()),
             ),
-            NetState::Degraded => out.push(
-                Clause::new(0, vec!["degraded".into()])
-                    .kept()
-                    .marked(Some(Mark::Dot))
-                    .inked(InkKind::Warn)
-                    .said("Network degraded.".into()),
-            ),
+            NetState::Degraded => out.push(degraded_network(net.srtt_ms)),
             NetState::Online => {
                 let forms = match link_word {
                     Some(lk) => vec![format!("Online \u{b7} {lk}"), "Online".into()],
@@ -2814,7 +2922,10 @@ fn glance_network_details(snap: &Snapshot) -> Vec<Clause> {
             );
         }
     }
-    if let Some(ms) = snap.net.as_ref().and_then(|n| n.srtt_ms) {
+    if let Some(ms) = snap.net.as_ref().and_then(|n| {
+        n.srtt_ms
+            .filter(|ms| n.state != NetState::Degraded || *ms < 250.0)
+    }) {
         let rtt = rtt_word(ms);
         out.push(
             Clause::new(1, vec![format!("{rtt} RTT"), rtt.clone()])

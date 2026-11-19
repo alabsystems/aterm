@@ -167,8 +167,8 @@ mod retained_cohort_tests;
 pub use admit::{
     Alone, CREDIT_MAX, Claim, Error, Forced, Holder, Pace, Polled, QuietStart, Relief, Reserve,
     Short, Shortfall, Spared, Waiter, admit, admit_relieved, admit_until, admit_with,
-    covered_memory, covering, covering_disk, gib, heavy_queue, never, reserved, span, spared,
-    tree_roots,
+    covered_memory, covering, covering_command, covering_disk, gib, heavy_queue, never, reserved,
+    span, spared, tree_roots,
 };
 #[cfg(unix)]
 pub use cohort_environment::capacity_cohort_environment;
@@ -222,20 +222,8 @@ pub(crate) fn open_regular_reader_with_meta(
     };
     #[cfg(windows)]
     let (file, meta) = {
-        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
+        let file = open_windows_reader(path)?;
         let meta = file.metadata()?;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "refusing symlink",
-            ));
-        }
         (file, meta)
     };
     #[cfg(not(any(unix, windows)))]
@@ -258,6 +246,54 @@ pub(crate) fn open_regular_reader_with_meta(
         ));
     }
     Ok((file, meta))
+}
+
+/// Windows' open for [`open_regular_reader_with_meta`]: `path`'s last name opened to read relative
+/// to its folder through `aterm-dirfd`, never following a reparse point there (`InvalidInput`, as
+/// a symlink is refused). A file whose delete is pending is `NotFound`, as the file another
+/// process unlinked is on unix: a file deleted while a handle of it is open, as a claim's file is
+/// from its holder's delete until that delete's handle closes, refuses every open of its name
+/// with `STATUS_DELETE_PENDING`, which `CreateFileW` would flatten into the `ERROR_ACCESS_DENIED`
+/// of a real refusal.
+#[cfg(windows)]
+fn open_windows_reader(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_TRAVERSE`: open names relative to the folder.
+    const FILE_TRAVERSE: u32 = 0x0020;
+    /// `FILE_READ_ATTRIBUTES`.
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    /// `FILE_FLAG_BACKUP_SEMANTICS`: what lets `CreateFileW` open a folder.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    };
+    let folder = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let folder = std::fs::OpenOptions::new()
+        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(folder)?;
+    match aterm_dirfd::openat(
+        &folder,
+        name,
+        aterm_dirfd::OFlags::RDONLY | aterm_dirfd::OFlags::NOFOLLOW,
+        aterm_dirfd::Mode::empty(),
+    ) {
+        Ok(handle) => Ok(std::fs::File::from(handle)),
+        Err(aterm_dirfd::Errno::DELETE_PENDING) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the file's delete is pending",
+        )),
+        Err(aterm_dirfd::Errno::LOOP | aterm_dirfd::Errno::FOREIGN_REPARSE) => Err(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "refusing symlink"),
+        ),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Open a regular file for reading without following a symlink at `path` or blocking on a FIFO.
@@ -414,6 +450,9 @@ pub struct Need {
     pub alone: bool,
     /// Its memory covers the builds its holder's tree starts ([`Self::covers`]).
     pub covers: bool,
+    /// The public command front explicitly covers nested commands with its own CPU
+    /// grant, including when the caller selected zero memory. Requires its live marker.
+    pub command_cover: bool,
     /// Its disk is scratch ([`Self::scratch`]): space its writes may return by its claim's end.
     pub scratch: bool,
     /// It LEADS the waiters ([`Self::leads`]).
@@ -703,6 +742,15 @@ impl Need {
     #[must_use]
     pub const fn covers(mut self) -> Need {
         self.covers = true;
+        self
+    }
+
+    /// Cover an explicitly budgeted command and the builds it starts. A zero-memory
+    /// command may reuse this CPU grant only through its original, live cover marker.
+    #[must_use]
+    pub const fn covers_command(mut self) -> Need {
+        self.covers = true;
+        self.command_cover = true;
         self
     }
 

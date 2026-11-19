@@ -175,7 +175,7 @@ fn a_grant_nobody_asked_for_is_offered_and_completes_the_stage() {
             .filter(|row| ![
                 "Local Network access",
                 "Mac naming permission",
-                "Home folders in Spotlight",
+                "Spotlight indexing",
                 "Network authorization",
                 "Network helper"
             ]
@@ -839,6 +839,7 @@ fn broker_custody_and_network_membership_are_required_independently_of_app_conse
         Unavailable::Outdated {
             ours: PROTOCOL,
             theirs: PROTOCOL + 1,
+            build: "0.1.0+gfixture".into(),
         },
         Unavailable::Refused("the peer is not root".into()),
         Unavailable::Unchecked("the peer check did not finish".into()),
@@ -917,4 +918,150 @@ fn unread_required_setup_evidence_never_completes_the_permissions_stage() {
         assert_eq!(row.status, UNREAD, "{row:?}");
         assert!(super::super::row_ready(row), "{row:?}");
     }
+}
+
+/// FL-188: the Spotlight indexing row says how FL-127's scope stands, in the words System State
+/// shows: Off and the scope in place; Needs your password only where setup's automatic ask owes
+/// it; newcomers and folders an apply already failed to keep out read in place, as FL-127's
+/// rule has it (nothing automatic waits on them, so nothing here waits or asks), never a password
+/// card each time a folder is made, and `aterm init`'s Permissions stage says so in the row's
+/// own words, done. No switch governs the row: with Permissions off an owed scope still needs
+/// the person.
+/// NEGATIVE CONTROL: the same owed reading for Network helper, which Permissions governs, reads
+/// Differs with Permissions off.
+#[test]
+fn spotlight_indexing_asks_only_where_setup_asks_and_no_switch_mutes_it() {
+    use aterm_types::macos_setup::spotlight_scope::State;
+    use aterm_types::macos_setup::{
+        SPOTLIGHT_OFF, SPOTLIGHT_OWED, SPOTLIGHT_SCOPED, spotlight_newcomers, spotlight_refused,
+    };
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    let folders: BTreeSet<PathBuf> = ["/Users//a/trust", "/Users//a/aterm"]
+        .map(PathBuf::from)
+        .into();
+    let none = BTreeSet::new();
+    let indexed = State::Indexed {
+        folders: folders.clone(),
+        asks: false,
+    };
+    let said = |state: &State, asks: bool, refused: &BTreeSet<PathBuf>| {
+        let (standing, now, _) = additional::spotlight(state, asks, refused, None);
+        (standing, now)
+    };
+    assert_eq!(
+        said(&State::Disabled, true, &none),
+        (Standing::InPlace, SPOTLIGHT_OFF.into())
+    );
+    assert_eq!(
+        said(&State::Scoped(9), false, &none),
+        (Standing::InPlace, SPOTLIGHT_SCOPED.into())
+    );
+    assert_eq!(
+        said(&indexed, true, &none),
+        (Standing::NeedsYou, SPOTLIGHT_OWED.into())
+    );
+    assert_eq!(
+        said(&indexed, false, &none),
+        (Standing::InPlace, spotlight_newcomers(2)),
+        "a newcomer asks for no password by itself, and nothing waits on it"
+    );
+    assert_eq!(
+        said(&indexed, true, &folders),
+        (Standing::InPlace, spotlight_refused(2)),
+        "folders an apply already failed to keep out are not asked for again"
+    );
+
+    // `aterm init`'s Permissions stage reads a newcomer as done, in the row's own words.
+    let (standing, now, note) = additional::spotlight(&indexed, false, &none, None);
+    let mut g = grants();
+    let index = additional::index(Access::SpotlightScope).expect("an additional requirement");
+    let mut seen = Observation::unknown(Subject::Access(Access::SpotlightScope));
+    seen.standing = standing;
+    seen.now = Some(now.clone());
+    seen.note = note;
+    g.additional[index] = Some(seen);
+    for acquiring in [false, true] {
+        let g = Grants {
+            acquiring,
+            ..g.clone()
+        };
+        let rows = stage_rows(&g, &[]);
+        let row = rows
+            .iter()
+            .find(|row| row.name == Access::SpotlightScope.name())
+            .expect("the stage lists the scope");
+        assert_eq!(row.status, "ok", "acquiring {acquiring}: {row:?}");
+        assert!(
+            row.detail.starts_with(&now)
+                && row.detail.contains("Made since setup scoped Spotlight"),
+            "{row:?}"
+        );
+    }
+
+    let mut off = Selection::all();
+    off.set(Setting::Permissions, false);
+    let owed_row = |access: Access| {
+        let mut g = grants();
+        let index = additional::index(access).expect("an additional requirement");
+        let mut seen = Observation::unknown(Subject::Access(access));
+        seen.standing = Standing::NeedsYou;
+        seen.now = Some(SPOTLIGHT_OWED.into());
+        g.additional[index] = Some(seen);
+        observation(access, &g, off).standing
+    };
+    assert_eq!(owed_row(Access::SpotlightScope), Standing::NeedsYou);
+    assert_eq!(
+        owed_row(Access::NetworkHelper),
+        Standing::Differs,
+        "NEGATIVE CONTROL: a row Permissions governs differs with it off"
+    );
+}
+
+/// SD-96: indexing off by the person's own pause (their record says Paused) reads Paused by you,
+/// in place, its note naming where Resume indexing is; the record makes no other reading paused.
+/// CONTROLS: indexing off with no record, or with a record of a Resume, reads Off, left as found;
+/// a Paused record over a reading that says indexing is on reads that reading's own word.
+#[test]
+fn spotlight_indexing_reads_paused_by_you_only_off_by_the_persons_pause() {
+    use aterm_types::macos_setup::spotlight_scope::{Mark, PauseRecord, State};
+    use aterm_types::macos_setup::{SPOTLIGHT_OFF, SPOTLIGHT_PAUSED, SPOTLIGHT_SCOPED};
+    use std::collections::BTreeSet;
+    let none = BTreeSet::new();
+    let paused = PauseRecord {
+        mark: Mark::Paused,
+        at_unix_ms: 1_763_300_000_000,
+    };
+    let resumed = PauseRecord {
+        mark: Mark::Resumed,
+        ..paused
+    };
+    let (standing, now, note) = additional::spotlight(&State::Disabled, true, &none, Some(&paused));
+    assert_eq!(
+        (standing, now.as_str()),
+        (Standing::InPlace, SPOTLIGHT_PAUSED)
+    );
+    assert!(
+        note.is_some_and(|note| note.contains("Resume indexing")),
+        "the note says how to resume"
+    );
+    let said = |state: &State, record: Option<&PauseRecord>| {
+        let (standing, now, _) = additional::spotlight(state, false, &none, record);
+        (standing, now)
+    };
+    assert_eq!(
+        said(&State::Disabled, None),
+        (Standing::InPlace, SPOTLIGHT_OFF.into()),
+        "CONTROL: off, no record"
+    );
+    assert_eq!(
+        said(&State::Disabled, Some(&resumed)),
+        (Standing::InPlace, SPOTLIGHT_OFF.into()),
+        "CONTROL: off after a resume"
+    );
+    assert_eq!(
+        said(&State::Scoped(9), Some(&paused)),
+        (Standing::InPlace, SPOTLIGHT_SCOPED.into()),
+        "CONTROL: on, whatever the record says"
+    );
 }

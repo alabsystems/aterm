@@ -8,6 +8,11 @@ use std::path::PathBuf;
 
 const SOURCE: &str = "/Applications/aterm.app";
 const SOURCE_EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
+const SOURCE_INFO: &str = "/Applications/aterm.app/Contents/Info.plist";
+/// The team this build's release names.
+const TEAM: &str = "ABCDE12345";
+/// The build this release's `Info.plist` states.
+const OURS: u64 = 1_790_120_495;
 const PRINT: &str = "/bin/launchctl print system/systems.alab.aterm-lan";
 
 #[cfg(unix)]
@@ -66,15 +71,17 @@ record_remove() {{ printf 'remove:%s\n' "$1"; }}
     }
 }
 
+/// This build's executable: a release of [`TEAM`] sealing its `Info.plist`, which states [`OURS`].
 fn this_build() -> Vec<u8> {
-    install::test_image(0x0100_000c, &[b"this build"])
+    install::test_release(TEAM, 0, &install::test_info(OURS))
 }
 
 fn from_app() -> Fake {
     let mut sys = Fake::root();
     sys.born(std::process::id(), 123);
     sys.running_app = Some(PathBuf::from(SOURCE));
-    sys.file(SOURCE_EXE, &this_build());
+    sys.file(SOURCE_EXE, &this_build())
+        .file(SOURCE_INFO, &install::test_info(OURS));
     sys.stat_of(
         SOURCE,
         crate::port::Stat {
@@ -418,51 +425,52 @@ fn a_running_broker_is_replaced_by_exchange_and_restarted() {
     }
 }
 
-/// A release executable of `team` whose code is `page`: one CodeDirectory that names
-/// [`install::BUNDLE_ID`] and the team ([`install::CodeDirectories::signer`]).
-fn release(team: &str, page: u8) -> Vec<u8> {
-    let identifier = install::BUNDLE_ID;
-    let ident_at = 52_u32;
-    let team_at = ident_at + identifier.len() as u32 + 1;
-    let mut body = Vec::new();
-    for word in [0x20400_u32, 0, 0, ident_at, 0, 0, 0, 0, 0, 0, team_at] {
-        body.extend_from_slice(&word.to_be_bytes());
-    }
-    for text in [identifier, team] {
-        body.extend_from_slice(text.as_bytes());
-        body.push(0);
-    }
-    body.push(page);
-    install::test_image(0x0100_000c, &[&body])
+/// The image's `Info.plist`.
+fn image_info() -> String {
+    format!("{}/{}", lan::IMAGE_BUNDLE, install::BUNDLE_INFO)
 }
 
-/// A Mac has one broker: a copy of a release (a cut's bundle) reads the serving broker the
-/// installed app holds in place, owing nothing and waiting on nothing, so it asks no password
-/// to move the job between two bundles of one signer. An elevation that runs anyway installs
-/// the bundle it runs from, as every elevation does.
-/// NEGATIVE CONTROLS: where the bundle the job names is gone the copy owes the broker, and so
-/// does a copy with no team signature (a development build).
+/// launchd's listing of the broker's job: with a pid where `pid`, else none.
+fn listed(pid: bool) -> Ran {
+    if pid {
+        Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n")
+    } else {
+        Ran::exit(113, "Could not find service")
+    }
+}
+
+/// A Mac has one broker, and its image only moves up. A copy of this release reads the image
+/// another bundle of it made in place (any bundle's plist is this build's), owing nothing and
+/// ready, though the bundle the plist names is gone. A development build owes nothing outside a
+/// VM guest and is ready while a team image serves, and in a guest it owes the broker as before.
+/// An older build beside a newer image keeps it while launchd lists its pid, whatever its hello
+/// says, and asks for a change only where launchd lists none.
+/// NEGATIVE CONTROLS (run): without the probe's Development arm the development build asks for a
+/// change; without the Kept pid rule the older build asks to replace the newer image.
 #[test]
-fn a_serving_broker_another_bundle_of_this_signer_holds_owes_nothing() {
+fn a_mac_has_one_broker_and_its_image_only_moves_up() {
     const COPY: &str = "/Users//alice/aterm/dist/cut-app/aterm.app";
     let copy_exe = format!("{COPY}/{}", install::BUNDLE_EXECUTABLE);
-    let team = "ABCDE12345";
-    // The install of the bundle at `holder`, read from the copy.
-    let from_copy = |holder: &str, copy: &[u8]| {
+    let copy_info = format!("{COPY}/{}", install::BUNDLE_INFO);
+    let ctx = ctx(&[]);
+    // The install the bundle `holder` made, its image of build `image`, read from a copy whose
+    // executable is `copy`, of build `ours`.
+    let from_copy = |holder: &str, copy: &[u8], ours: u64, image: u64, pid: bool| {
         let mut sys = from_app();
         sys.running_app = Some(PathBuf::from(COPY));
-        sys.file(SOURCE_EXE, &release(team, 1))
-            .file(&copy_exe, copy)
-            .file(lan::IMAGE_EXECUTABLE, &release(team, 1))
+        sys.file(&copy_exe, copy)
+            .file(&copy_info, &install::test_info(ours))
+            .file(
+                lan::IMAGE_EXECUTABLE,
+                &install::test_release(TEAM, 1, &install::test_info(image)),
+            )
+            .file(&image_info(), &install::test_info(image))
             .file(
                 lan::PLIST_PATH,
                 install::plist_text(Path::new(holder)).as_bytes(),
             );
-        sys.on(
-            PRINT,
-            Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
-        )
-        .on(PRINT_DISABLED, disabled_list("enabled"));
+        sys.on(PRINT, listed(pid))
+            .on(PRINT_DISABLED, disabled_list("enabled"));
         sys.on_lan_broker(Ok(lan::BrokerHello {
             protocol: lan::PROTOCOL,
             build: aterm_stamp::build_id(),
@@ -470,35 +478,215 @@ fn a_serving_broker_another_bundle_of_this_signer_holds_owes_nothing() {
         }));
         sys
     };
+    let release =
+        |page: u8, build: u64| install::test_release(TEAM, page, &install::test_info(build));
+
+    // The image a copy of this very build made, from a bundle since deleted.
+    let copied = install::test_release(TEAM, 1, &install::test_info(OURS));
+    let copy = from_copy("/Users//alice/gone/aterm.app", &copied, OURS, OURS, true);
+    let reads = reading(&copy).unwrap().unwrap();
+    assert!(reads.current() && !reads.owed(), "{reads:?}");
+    assert_eq!(ready(&copy), Ok(true));
+    assert!(matches!(
+        LanBroker::default().probe(&copy, &ctx),
+        Probe::Ok { .. }
+    ));
+
+    // A development build: nothing owed and ready on a real Mac, though a team image serves.
+    let development = install::test_image(0x0100_000c, &[b"a development build"]);
+    for guest in [None, Some(false)] {
+        let mut sys = from_copy(SOURCE, &development, OURS, OURS, true);
+        sys.vm_guest = guest;
+        let reads = reading(&sys).unwrap().unwrap();
+        assert_eq!(reads.image, install::Part::Development, "{guest:?}");
+        assert!(!reads.owed(), "{guest:?}");
+        assert_eq!(ready(&sys), Ok(true), "{guest:?}");
+        assert!(
+            matches!(LanBroker::default().probe(&sys, &ctx), Probe::NotApplicable { ref why } if why == DEVELOPMENT),
+            "{guest:?}"
+        );
+        assert!(
+            !crate::root_steps::owed(&sys).contains(&crate::root_steps::Owed::LanBroker),
+            "{guest:?}"
+        );
+    }
+    let mut guest = from_copy(SOURCE, &development, OURS, OURS, true);
+    guest.vm_guest = Some(true);
+    assert!(reading(&guest).unwrap().unwrap().owed());
+    assert!(matches!(
+        LanBroker::default().probe(&guest, &ctx),
+        Probe::Change { .. }
+    ));
+    assert!(crate::root_steps::owed(&guest).contains(&crate::root_steps::Owed::LanBroker));
+
+    // An older build beside a newer image keeps it while launchd lists its pid, whatever the
+    // hello says.
+    let kept = from_copy(SOURCE, &release(2, OURS - 20), OURS - 20, OURS, true);
+    kept.lan_broker_now(Err(lan::Unavailable::Unchecked(
+        "trustd did not answer".into(),
+    )
+    .to_string()));
+    let reads = reading(&kept).unwrap().unwrap();
+    assert!(
+        matches!(reads.image, install::Part::Kept { image, ours, .. } if image == OURS && ours == OURS - 20),
+        "{reads:?}"
+    );
+    assert!(!reads.owed() && reads.in_place());
+    assert!(
+        matches!(LanBroker::default().probe(&kept, &ctx), Probe::Ok { ref now } if now.contains("pid 77")),
+    );
+    assert_eq!(ready(&kept), Ok(true));
+    let stopped = from_copy(SOURCE, &release(2, OURS - 20), OURS - 20, OURS, false);
+    assert!(matches!(
+        LanBroker::default().probe(&stopped, &ctx),
+        Probe::Change { .. }
+    ));
+    assert_eq!(ready(&stopped), Ok(false));
+}
+
+/// This build beside a newer image of its signer (build `OURS + 20`) that wrote the plist
+/// `plist` (none where `None`), launchd's `launchctl print` of the job answering `listing`.
+fn beside_a_newer_image(plist: Option<&[u8]>, listing: Ran) -> Fake {
+    let sys = from_app();
+    sys.file(
+        lan::IMAGE_EXECUTABLE,
+        &install::test_release(TEAM, 3, &install::test_info(OURS + 20)),
+    )
+    .file(&image_info(), &install::test_info(OURS + 20));
+    if let Some(plist) = plist {
+        sys.file(lan::PLIST_PATH, plist);
+    }
+    sys.on(PRINT, listing)
+        .on(PRINT_DISABLED, disabled_list("enabled"));
+    sys.on_lan_broker(Ok(lan::BrokerHello {
+        protocol: lan::PROTOCOL,
+        build: "0.300.0+gfeedbee".into(),
+        direct: None,
+    }));
+    sys
+}
+
+/// An older build never replaces a newer image on what launchd cannot say: where `launchctl
+/// print` fails the probe measures nothing and nothing is owed, and where launchd holds the job
+/// with no pid (between two of its starts) the image is kept and ready. Whatever plist the newer
+/// build wrote (one this build would not write, or none) owes this build nothing: the reading,
+/// the root steps, the probe and readiness agree, so no Mac password is asked at every launch.
+/// At the effect, an install round that finds such an image held by launchd publishes and changes
+/// nothing. NEGATIVE CONTROLS (run): with the probe reading a failed or pid-less listing as none,
+/// it asks to replace the newer image; without the effect's own reading the round publishes this
+/// build's older image over it.
+#[test]
+fn an_older_build_never_replaces_a_newer_image_on_what_launchd_cannot_say() {
     let ctx = ctx(&[]);
-    let takes_it = |sys: &Fake| {
-        let Probe::Change { to, .. } = LanBroker::default().probe(sys, &ctx) else {
-            panic!("an elevation installs its own bundle");
-        };
-        assert!(to.ends_with(&format!("clone of {COPY}")), "{to}");
+    let current = install::plist_text(Path::new(SOURCE)).into_bytes();
+    let owes = |sys: &Fake| {
+        let owed = crate::root_steps::owed(sys);
+        owed.contains(&crate::root_steps::Owed::LanBroker)
+            || owed.contains(&crate::root_steps::Owed::LanBrokerAdoption)
     };
 
-    let held = from_copy(SOURCE, &release(team, 2));
-    let reads = reading(&held).unwrap().unwrap();
-    assert_eq!(reads.held_by.as_deref(), Some(Path::new(SOURCE)));
-    assert!(reads.current() && !reads.owed());
-    assert_eq!(ready(&held), Ok(true));
-    takes_it(&held);
+    let unsaid = beside_a_newer_image(Some(&current), Ran::exit(5, "Operation not permitted"));
+    assert!(
+        matches!(LanBroker::default().probe(&unsaid, &ctx), Probe::Unusable { ref why } if why.contains("could not say")),
+    );
+    assert!(!owes(&unsaid));
 
-    for (why, sys) in [
-        (
-            "the bundle the job names is gone",
-            from_copy("/Users//alice/gone/aterm.app", &release(team, 2)),
-        ),
-        (
-            "a copy with no team signature",
-            from_copy(SOURCE, &this_build()),
-        ),
+    let restarting = beside_a_newer_image(
+        Some(&current),
+        Ran::ok("system/systems.alab.aterm-lan = {\n\tstate = waiting\n}\n"),
+    );
+    assert!(
+        matches!(LanBroker::default().probe(&restarting, &ctx), Probe::Ok { ref now } if now.contains("loaded")),
+    );
+    assert_eq!(ready(&restarting), Ok(true));
+    assert!(!owes(&restarting));
+
+    for plist in [
+        Some(b"<plist>the newer build's own</plist>".as_slice()),
+        None,
     ] {
+        let sys = beside_a_newer_image(plist, listed(true));
         let reads = reading(&sys).unwrap().unwrap();
-        assert!(reads.owed() && reads.held_by.is_none(), "{why}: {reads:?}");
-        assert_eq!(ready(&sys), Ok(false), "{why}");
-        takes_it(&sys);
+        assert!(
+            matches!(reads.image, install::Part::Kept { .. }) && !reads.owed() && reads.in_place(),
+            "{reads:?}"
+        );
+        assert!(!owes(&sys), "{reads:?}");
+        assert_eq!(ready(&sys), Ok(true), "{reads:?}");
+        assert!(matches!(
+            LanBroker::default().probe(&sys, &ctx),
+            Probe::Ok { .. }
+        ));
+    }
+
+    let held = beside_a_newer_image(Some(&current), listed(true));
+    let newer = held.written(lan::IMAGE_EXECUTABLE);
+    let applied = LanBroker::default().apply(&held, &ctx);
+    let calls = held.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("exchange ") || call.starts_with("rename ")),
+        "{calls:?}"
+    );
+    applied.unwrap();
+    assert!(job_changes(&held).is_empty(), "{calls:?}");
+    assert_eq!(held.written(lan::IMAGE_EXECUTABLE), newer);
+}
+
+/// A newer image launchd holds no job for (none loaded, or one a newer build's own restart booted
+/// out) is loaded in place: the probe asks to load it, never to replace it, and the effect
+/// publishes nothing over it, keeps the plist a build wrote (the newer build's, whatever it
+/// says), writes this build's only where none is, and loads and starts the job with no
+/// `bootout`, so a newer build's own restart is never taken down. NEGATIVE CONTROLS (run):
+/// without the effect's load in place the round clones this build's bundle for nothing and then
+/// refuses, loading nothing; with the effect's earlier reading, which let a job launchd holds none
+/// of be replaced, this build's older image is published over the newer one.
+#[test]
+fn a_newer_image_launchd_holds_no_job_for_is_loaded_in_place() {
+    let ctx = ctx(&[]);
+    let theirs = b"<plist>the newer build's own</plist>".to_vec();
+    for plist in [Some(theirs.clone()), None] {
+        let sys = beside_a_newer_image(plist.as_deref(), listed(false));
+        sys.on(PRINT, listed(false))
+            .on(PRINT, listed(true))
+            .on(BOOTSTRAP, Ran::ok(""))
+            .on(
+                "/bin/launchctl kickstart system/systems.alab.aterm-lan",
+                Ran::ok(""),
+            );
+        let newer = sys.written(lan::IMAGE_EXECUTABLE);
+        assert!(
+            matches!(LanBroker::default().probe(&sys, &ctx), Probe::Change { ref to, .. } if to.contains("loaded in place")),
+            "{plist:?}"
+        );
+        let applied = LanBroker::default().apply(&sys, &ctx);
+        let calls = sys.calls();
+        assert!(
+            !calls.iter().any(|call| call.starts_with("exchange ")
+                || call.starts_with("rename ")
+                || call.starts_with("clone ")),
+            "{calls:?}"
+        );
+        applied.unwrap();
+        assert_eq!(
+            job_changes(&sys),
+            vec![
+                BOOTSTRAP.to_owned(),
+                "/bin/launchctl kickstart system/systems.alab.aterm-lan".to_owned()
+            ],
+            "{calls:?}"
+        );
+        assert_eq!(sys.written(lan::IMAGE_EXECUTABLE), newer);
+        assert_eq!(
+            sys.written(lan::PLIST_PATH),
+            Some(plist.unwrap_or_else(|| install::plist_text(Path::new(SOURCE)).into_bytes())),
+            "a build's plist stays; this build's is written only where none is"
+        );
+        assert!(
+            !crate::root_steps::owed(&sys).contains(&crate::root_steps::Owed::LanBroker),
+            "a kept image owes this build nothing"
+        );
     }
 }
 
@@ -714,22 +902,38 @@ fn a_switch_off_during_the_root_run_ends_it() {
 
 /// A staging step that keeps failing in a way a retained root run retries (the app-copy check
 /// unanswered or not run) ends the run after [`ROUNDS`] rounds with that step's reason, as a
-/// refused launch does. MUTANT: a retried staging error that counts no round retries until the
-/// test's hang detector stops the run.
+/// refused launch does. A check unanswered or not run may be the Mac's state or the bundle's,
+/// which one run cannot tell apart: the run's no-verdict is pending and asks again; one
+/// [`adoption::STALL`] later in the same boot stalls the step for that boot; one after a restart
+/// is the build's own. MUTANT: a retried staging error that counts no round retries until the
+/// test's hang detector stops the run. Run: a no-verdict taken as the run's own failure
+/// (`unserved == rounds` alone) records the key at once and fails it.
 #[test]
 fn a_staging_step_that_keeps_failing_ends_the_root_run_with_its_reason() {
+    use crate::root_steps::{Owed, refused};
+    use aterm_types::macos_setup::refused::LAN_BROKER;
+    const SESSION: &str = "/usr/sbin/sysctl -n kern.bootsessionuuid";
+    const BOOT: &str = "01234567-89AB-CDEF-0123-456789ABCDEF\n";
+    const BOOT_WORD: &str = "0123456789abcdef0123456789abcdef";
+    const LATER_BOOT: &str = "11111111-2222-3333-4444-555555555555\n";
     for failed in [
         CheckError::Unanswered("the trust service did not answer".into()),
         CheckError::Unchecked("trust service unavailable".into()),
     ] {
-        let sys = from_app();
+        let mut sys = from_app();
         let check = failed.clone();
         sys.app_check(move |_, _| Err(check.clone()));
+        let boot = std::sync::Arc::new(std::sync::Mutex::new(BOOT));
+        let reads = boot.clone();
+        sys.simulate(move |_, command| {
+            (command.display() == SESSION).then(|| Ran::ok(*reads.lock().unwrap()))
+        });
         stop_after_many_sleeps(&sys);
         let item = LanBroker {
             retained_root_run: true,
             ..LanBroker::default()
         };
+        let key = refusal_key(&sys).unwrap();
         let why = item.apply(&sys, &ctx(&[])).unwrap_err();
         assert!(why.contains(&failed.to_string()), "{failed:?}: {why}");
         assert!(!why.contains("stopped"), "{why}");
@@ -743,12 +947,39 @@ fn a_staging_step_that_keeps_failing_ends_the_root_run_with_its_reason() {
             "{calls:?}"
         );
         assert!(job_changes(&sys).is_empty(), "{calls:?}");
-        // A check unanswered or not run may be the Mac's state or the bundle's, which this
-        // run cannot tell apart: nothing is recorded, and the step is asked for again.
-        assert!(
-            sys.written(aterm_types::macos_setup::refused::LAN_BROKER)
-                .is_none()
+        let pending = format!("no-verdict {} {BOOT_WORD} {key}\n", sys.now);
+        assert_eq!(
+            sys.written(LAN_BROKER).as_deref(),
+            Some(pending.as_bytes()),
+            "{failed:?}"
         );
+        assert!(!refused(&sys, Owed::LanBroker), "{failed:?}");
+        sys.now += adoption::STALL.as_secs() - 1;
+        item.apply(&sys, &ctx(&[])).unwrap_err();
+        assert_eq!(
+            sys.written(LAN_BROKER).as_deref(),
+            Some(pending.as_bytes()),
+            "a second just short of the stall is still pending: {failed:?}"
+        );
+        assert!(!refused(&sys, Owed::LanBroker), "{failed:?}");
+        sys.now += 1;
+        item.apply(&sys, &ctx(&[])).unwrap_err();
+        let stalled = format!("stalled {BOOT_WORD} {key}\n");
+        assert_eq!(
+            sys.written(LAN_BROKER).as_deref(),
+            Some(stalled.as_bytes()),
+            "{failed:?}"
+        );
+        assert!(refused(&sys, Owed::LanBroker), "{failed:?}");
+        *boot.lock().unwrap() = LATER_BOOT;
+        assert!(!refused(&sys, Owed::LanBroker), "another boot asks again");
+        item.apply(&sys, &ctx(&[])).unwrap_err();
+        assert_eq!(
+            sys.written(LAN_BROKER),
+            Some(format!("{key}\n").into_bytes()),
+            "{failed:?}"
+        );
+        assert!(refused(&sys, Owed::LanBroker), "{failed:?}");
     }
 }
 
@@ -819,11 +1050,12 @@ fn a_launch_launchd_keeps_refusing_ends_the_root_run_with_its_reason() {
 /// A broker install that fails for good (the strict check refuses this bundle's clone) is
 /// recorded with the bundle and build it failed for, so a run nobody asked for does not ask the
 /// Mac password for it again (`root_steps::refused`); the apply that succeeds removes the
-/// record. NEGATIVE CONTROLS: nothing stands before any apply; a stopped run and a job
-/// switched off record nothing (an unanswered check and a refused launch are held by the two
-/// tests above), and neither does a run whose job did not serve only in its last round, the
-/// rounds before it lost to an unanswered check; the record does not stand for another build
-/// of the bundle (of the same length) or for the same build in another bundle.
+/// record, its pending and stalled lines with it. NEGATIVE CONTROLS: nothing stands before any
+/// apply; a stopped run and a job switched off record nothing (an unanswered check and a
+/// refused launch are held by the two tests above); a run whose job did not serve only in its
+/// last round, the rounds before it lost to an unanswered check, gave no verdict and stands for
+/// nothing; the record does not stand for another build of the bundle (of the same length) or
+/// for the same build in another bundle.
 #[test]
 fn a_broker_root_could_not_install_is_recorded_until_an_apply_succeeds() {
     use crate::root_steps::{Owed, refused};
@@ -867,8 +1099,12 @@ fn a_broker_root_could_not_install_is_recorded_until_an_apply_succeeds() {
     }
 
     // The check goes unanswered in every round but the last, whose published job launchd
-    // refuses once: one launch of a bundle the Mac was too busy to check says nothing of it.
+    // refuses once: one launch of a bundle the Mac was too busy to check gives no verdict.
     let late = from_app();
+    late.on(
+        "/usr/sbin/sysctl -n kern.bootsessionuuid",
+        Ran::ok("01234567-89AB-CDEF-0123-456789ABCDEF\n"),
+    );
     let checks = std::sync::atomic::AtomicU32::new(0);
     late.app_check(move |_, _| {
         if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 < ROUNDS {
@@ -903,7 +1139,17 @@ fn a_broker_root_could_not_install_is_recorded_until_an_apply_succeeds() {
             .count(),
         1
     );
-    assert!(late.written(LAN_BROKER).is_none());
+    assert_eq!(
+        late.written(LAN_BROKER),
+        Some(
+            format!(
+                "no-verdict {} 0123456789abcdef0123456789abcdef {key}\n",
+                late.now
+            )
+            .into_bytes()
+        )
+    );
+    assert!(!refused(&late, Owed::LanBroker));
 
     // A stop ends the run with nothing said of the bundle.
     let stopped = from_app();
@@ -918,25 +1164,28 @@ fn a_broker_root_could_not_install_is_recorded_until_an_apply_succeeds() {
     assert!(why.contains("switched off"), "{why}");
     assert!(off.written(LAN_BROKER).is_none());
 
-    // The install that succeeds removes the record, whatever keys it held.
+    // The install that succeeds removes the record, whatever lines it held.
     let sys = from_app();
-    sys.file(LAN_BROKER, format!("{key}\nan older build\n").as_bytes())
-        .on(PRINT, Ran::exit(113, "Could not find service"))
-        .on(
-            PRINT,
-            Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
-        )
-        .on(PRINT_DISABLED, disabled_list("enabled"))
-        .on(BOOTSTRAP, Ran::ok(""))
-        .on(
-            "/bin/launchctl kickstart system/systems.alab.aterm-lan",
-            Ran::ok(""),
-        )
-        .on_lan_broker(Ok(lan::BrokerHello {
-            protocol: lan::PROTOCOL,
-            build: aterm_stamp::build_id(),
-            direct: None,
-        }));
+    sys.file(
+        LAN_BROKER,
+        format!("{key}\nan older build\nno-verdict 1 b1 {key}\nstalled b1 {key}\n").as_bytes(),
+    )
+    .on(PRINT, Ran::exit(113, "Could not find service"))
+    .on(
+        PRINT,
+        Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
+    )
+    .on(PRINT_DISABLED, disabled_list("enabled"))
+    .on(BOOTSTRAP, Ran::ok(""))
+    .on(
+        "/bin/launchctl kickstart system/systems.alab.aterm-lan",
+        Ran::ok(""),
+    )
+    .on_lan_broker(Ok(lan::BrokerHello {
+        protocol: lan::PROTOCOL,
+        build: aterm_stamp::build_id(),
+        direct: None,
+    }));
     assert!(refused(&sys, Owed::LanBroker));
     LanBroker::default().apply(&sys, &ctx).unwrap();
     assert!(sys.written(LAN_BROKER).is_none());

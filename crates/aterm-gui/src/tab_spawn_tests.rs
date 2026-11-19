@@ -2846,3 +2846,22 @@ fn replayed_input_goes_to_the_spawn_that_was_newest_when_it_was_typed() {
     });
     app.tab_spawns.in_flight.clear();
 }
+
+#[test]
+fn new_tab_from_an_auxiliary_window_keeps_its_origin_and_lands_in_the_main_strip() {
+    let mut app = App::headless_for_test();
+    let home = WindowId(0);
+    let origin = app.next_session_id;
+    let aux = app.insert_logical_window(crate::stub_session(origin), 24, 80);
+    app.tab_spawns.unsent = true;
+    app.open_tab_in(aux);
+    let pending = app.tab_spawns.in_flight.last().unwrap();
+    assert_eq!(pending.window, home);
+    assert_eq!(pending.place.asked_from(pending.window), Some(aux));
+    assert_eq!(pending.parent, app.new_tab_parent(aux));
+    let id = pending.id;
+    let _pty = land(&mut app, home, id);
+    assert_eq!(app.windows[&aux].tab_set.shown_len(), 1);
+    assert_eq!(app.focused_session_id(aux), Some(origin));
+    assert_eq!(app.focused_session_id(home), Some(id));
+}

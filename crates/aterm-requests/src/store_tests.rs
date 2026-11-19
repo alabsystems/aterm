@@ -52,6 +52,50 @@ fn closed_by(by: &str, reason: &str, code: Option<i32>) -> Left {
 }
 
 #[test]
+fn a_historical_fleet_request_survives_reopening_and_archiving() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    drop(Store::open(dir.path()).unwrap());
+    let id = "r-20261109-1411-87be5228-01";
+    let by = "fleet:87be5228:s-0123456789abcdef0123";
+    // These are rows an earlier build wrote, independent of today's actor constructors and
+    // record encoder. Reading them must preserve authorship and every attached verb.
+    let rows = [
+        format!(
+            "t={AT} op=open req={id} via=fleet-shell form=shell node={NODE} host=m114 \
+             by={by} program=- model=- account=- why_src=none"
+        ),
+        format!("t={} op=tab req={id} tab={TAB_A} by={by}", AT + 1),
+        format!(
+            "t={} op=attach req={id} tab={TAB_A} verb=turn n=2 by={by}",
+            AT + 2
+        ),
+    ];
+    std::fs::write(
+        dir.path().join(crate::JOURNAL),
+        format!("{}\n", rows.join("\n")),
+    )
+    .unwrap();
+
+    let mut reopened = Store::open(dir.path()).unwrap();
+    let request = reopened.get(id).expect("the historical open is retained");
+    assert_eq!(request.open.by, by);
+    assert_eq!(request.open.node, NODE);
+    assert_eq!(request.state(), State::Running);
+    assert_eq!(request.tabs.len(), 1);
+    assert_eq!(request.tabs[0].sid, TAB_A);
+    assert_eq!(request.tabs[0].verbs.get(&Verb::Turn), Some(&2));
+    assert_eq!(request.tabs[0].last_ms, AT + 2);
+    assert_eq!(
+        reopened.owner(TAB_A),
+        Some((id.to_owned(), NODE.to_owned(), by.to_owned()))
+    );
+    assert_eq!(reopened.skipped(), 0);
+    let (archived, said) = lines_of(dir.path(), id).unwrap();
+    assert_eq!(archived, rows);
+    assert!(said.is_empty());
+}
+
+#[test]
 fn a_request_survives_the_process_that_made_it() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let id = {
@@ -160,6 +204,7 @@ fn a_tab_attaches_only_its_requesters_verbs() {
         // Another node whose head is the requester's: the same token, a different Mac.
         (TWIN, BY),
         // The same node, another session.
+        (NODE, "fleet:87be5228:t0123456789"),
         (NODE, "fleet:87be5228:tqn5r6e0149"),
         // The same node, a drive that names no session.
         (NODE, "fleet:87be5228:-"),

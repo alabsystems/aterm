@@ -245,7 +245,8 @@ fn executable_fault_intersection_promotes_hot_symbols_and_rejects_random_neighbo
             hits_only_hot.clone(),
             hits_only_hot,
         ],
-    );
+    )
+    .expect("four hit sets refine an order");
     assert_eq!(
         refined,
         vec![
@@ -383,4 +384,263 @@ fn linker_arg_collection_and_order_file_roundtrip() {
             "-order_file must place __atpad_t_00003 before __atpad_t_00000:\n{nm_text}"
         );
     }
+}
+
+/// A macOS release image's final link takes the permutation sieve's order or none. Where the
+/// sieve gave no order, or an empty one, the link's arguments are its own then `-x`, with no
+/// `-order_file` though its inputs hold symbols the structural order lays out, and the wrapper
+/// writes no order. Where the sieve gave one, the link names the order file once, ahead of
+/// `-x`, and the wrapper writes exactly the sieve's order to it. A link that strips local
+/// symbols itself, in its arguments or in a response file, takes no second `-x`. Fewer than
+/// [`MIN_PROBE_HIT_SETS`] hit sets refine no order, where that many refine one.
+#[test]
+fn a_final_link_takes_the_sieves_order_or_none() {
+    let scratch_dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-final-link-test-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("create scratch dir");
+    let scratch = scratch_dir.path();
+    let obj = scratch.join("alpha.o");
+    std::fs::write(
+        &obj,
+        build_minimal_macho64(
+            MH_OBJECT,
+            0,
+            64,
+            &[("__RNvNtCs1_3agh3cli3run", 1, 0x0), ("_main", 1, 0x10)],
+        ),
+    )
+    .expect("write alpha.o");
+    let shown = |path: &Path| path.display().to_string();
+    let link_args = vec!["-o".to_owned(), shown(&scratch.join("aterm")), shown(&obj)];
+    let expanded = expand_linker_args(&link_args);
+    let structural = build_order_list(&collect_input_paths(&expanded));
+    assert_eq!(
+        structural,
+        ["_main", "__RNvNtCs1_3agh3cli3run"],
+        "the link's inputs have a structural order"
+    );
+    let order_file = scratch.join("aterm.order");
+    let own_then = |args: &[String], tail: &[&std::ffi::OsStr]| -> Vec<OsString> {
+        args.iter()
+            .map(OsString::from)
+            .chain(tail.iter().map(|arg| arg.to_os_string()))
+            .collect()
+    };
+    let strip: &std::ffi::OsStr = "-x".as_ref();
+
+    let unrefined = final_link(&link_args, &expanded, None, &order_file);
+    assert_eq!(
+        unrefined,
+        FinalLink {
+            args: own_then(&link_args, &[strip]),
+            order: None,
+        }
+    );
+    assert_eq!(
+        final_link(&link_args, &expanded, Some(Vec::new()), &order_file),
+        unrefined
+    );
+
+    let sieve = vec!["__RNvNtCs1_3agh3cli3run".to_owned(), "_main".to_owned()];
+    assert_eq!(
+        final_link(&link_args, &expanded, Some(sieve.clone()), &order_file),
+        FinalLink {
+            args: own_then(
+                &link_args,
+                &["-order_file".as_ref(), order_file.as_os_str(), strip]
+            ),
+            order: Some(sieve),
+        }
+    );
+
+    let stripped = [link_args.clone(), vec!["-x".to_owned()]].concat();
+    assert_eq!(
+        final_link(&stripped, &expand_linker_args(&stripped), None, &order_file).args,
+        own_then(&stripped, &[])
+    );
+    let response = scratch.join("strip.args");
+    std::fs::write(&response, "-x\n").expect("write response file");
+    let via_response = [link_args.clone(), vec![format!("@{}", response.display())]].concat();
+    assert_eq!(
+        final_link(
+            &via_response,
+            &expand_linker_args(&via_response),
+            None,
+            &order_file
+        )
+        .args,
+        own_then(&via_response, &[])
+    );
+
+    let hot: HashSet<String> = ["_main".to_owned()].into_iter().collect();
+    assert_eq!(
+        refine_order_with_probe_hits(&structural, &vec![hot.clone(); MIN_PROBE_HIT_SETS - 1]),
+        None
+    );
+    assert_eq!(
+        refine_order_with_probe_hits(&structural, &vec![hot; MIN_PROBE_HIT_SETS]),
+        Some(structural)
+    );
+}
+
+/// Where `world` falls short of a scratch world (`aterm_types::world`), each as a name: the
+/// `aterm.toml` its image reads (`aterm/aterm.toml` under its `XDG_CONFIG_HOME`) where the world
+/// writes none; each root key of [`PROBE_ROOT_KEYS`] that file does not hold at its root with the
+/// probe's value; each `table.key` of [`aterm_types::world::LANES_OFF`] it does not hold with the
+/// same value; and [`aterm_types::world::MARKER`] where the environment does not carry it at the
+/// state folder under its HOME ([`aterm_types::world::state_home`]).
+fn short_of_a_world(world: &ProbeWorld) -> Vec<String> {
+    let var = |name: &str| {
+        world
+            .env
+            .iter()
+            .find(|(held, _)| *held == name)
+            .map(|(_, value)| PathBuf::from(value))
+    };
+    let mut short = Vec::new();
+    let read = var("XDG_CONFIG_HOME").map(|config| config.join("aterm/aterm.toml"));
+    let file = world
+        .files
+        .iter()
+        .find(|(path, _)| Some(path) == read.as_ref());
+    let text = match file {
+        Some((_, text)) => text.as_str(),
+        None => {
+            short.push("aterm.toml".to_owned());
+            ""
+        }
+    };
+    let doc = aterm_toml::from_str::<aterm_toml::Value>(text)
+        .expect("the image's aterm.toml is one document");
+    let own = aterm_toml::from_str::<aterm_toml::Value>(PROBE_ROOT_KEYS)
+        .expect("the probe's root keys are one document");
+    for (key, value) in own.as_table().expect("a document is a table") {
+        if doc.get(key) != Some(value) {
+            short.push(key.clone());
+        }
+    }
+    let off = aterm_toml::from_str::<aterm_toml::Value>(aterm_types::world::LANES_OFF)
+        .expect("the lanes-off tables are one document");
+    for (table, keys) in off.as_table().expect("a document is a table") {
+        for (key, value) in keys.as_table().expect("each entry is a table") {
+            if doc.get(table).and_then(|held| held.get(key)) != Some(value) {
+                short.push(format!("{table}.{key}"));
+            }
+        }
+    }
+    let state = var("HOME").and_then(|home| aterm_types::world::state_home(&home));
+    if state.is_none() || var(aterm_types::world::MARKER) != state {
+        short.push(aterm_types::world::MARKER.to_owned());
+    }
+    short
+}
+
+/// A macOS release link's layout probe starts each image it measures, a release aterm under a
+/// fresh HOME, in a scratch world (`aterm_types::world`), as verify measure, the GUI smoke and the
+/// perf arena do: the `aterm.toml` the image reads holds the probe's root keys at its root and,
+/// word for word after them, the lanes-off tables aterm-types holds; every process the probe
+/// starts in the world begins from an environment that carries the world's marker at the state
+/// folder under its HOME; each file it writes sits in a folder it makes first; and everything it
+/// lays out sits under the root it removes. Where the platform keeps no state under a HOME there is no
+/// world, and the probe starts no image.
+#[test]
+fn a_layout_probe_starts_its_images_in_a_scratch_world() {
+    let root = Path::new("/w/atord");
+    let Some(world) = probe_world(root) else {
+        assert_eq!(
+            aterm_types::world::state_home(&root.join("home")),
+            None,
+            "a platform with state under HOME has a world"
+        );
+        return;
+    };
+    assert_eq!(short_of_a_world(&world), Vec::<String>::new());
+    let config = world
+        .files
+        .iter()
+        .find(|(path, _)| path.ends_with("aterm/aterm.toml"))
+        .map(|(_, text)| text.as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        config.strip_prefix(PROBE_ROOT_KEYS),
+        Some(aterm_types::world::LANES_OFF),
+        "{config}"
+    );
+    let home = world
+        .env
+        .iter()
+        .find(|(name, _)| *name == "HOME")
+        .map(|(_, value)| PathBuf::from(value));
+    assert_eq!(home.as_ref(), Some(&world.home));
+    assert!(world.dirs.contains(&world.home));
+    for (path, _) in &world.files {
+        let folder = path.parent().map(Path::to_path_buf);
+        assert!(
+            folder.is_some_and(|folder| world.dirs.contains(&folder)),
+            "{} is written in a folder the probe does not make",
+            path.display()
+        );
+    }
+    let written = world.files.iter().map(|(path, _)| path);
+    for path in world.dirs.iter().chain(written) {
+        assert!(
+            path.starts_with(root),
+            "{} lies outside the probe's root",
+            path.display()
+        );
+    }
+}
+
+/// NEGATIVE CONTROL: the probe's world before it took the scratch world's words (its own copy of
+/// three of the five lanes-off tables, no `[keeper]` or `[swarm]`, and no marker) falls short by
+/// exactly those, and one whose root keys follow the tables, which TOML reads into the last
+/// table, falls short by its root keys. Each case takes the probe's layout with its own
+/// `aterm.toml` and sets or leaves out the marker itself, so neither leans on the probe's own.
+#[cfg(unix)]
+#[test]
+fn a_probe_world_without_the_scratch_worlds_words_falls_short() {
+    let world = probe_world(Path::new("/w/atord")).expect("Unix keeps state under HOME");
+    let state = aterm_types::world::state_home(&world.home).expect("Unix keeps state under HOME");
+    let with = |config: &str, marker: bool| ProbeWorld {
+        home: world.home.clone(),
+        dirs: world.dirs.clone(),
+        files: world
+            .files
+            .iter()
+            .map(|(path, text)| {
+                let text = if path.ends_with("aterm/aterm.toml") {
+                    config
+                } else {
+                    text.as_str()
+                };
+                (path.clone(), text.to_owned())
+            })
+            .collect(),
+        env: world
+            .env
+            .iter()
+            .filter(|(name, _)| *name != aterm_types::world::MARKER)
+            .cloned()
+            .chain(marker.then(|| (aterm_types::world::MARKER, state.clone().into_os_string())))
+            .collect(),
+    };
+    let before = "bell_sound = false\ntemporal_recording = true\n\
+                  [update]\nenabled = false\nauto_apply = false\n\
+                  [packages]\nenabled = false\n\
+                  [machine]\nuniversal_control = \"leave\"\n";
+    assert_eq!(
+        short_of_a_world(&with(before, false)),
+        [
+            "keeper.enabled",
+            "swarm.enabled",
+            aterm_types::world::MARKER,
+        ]
+    );
+    let tables_first = format!("{}{PROBE_ROOT_KEYS}", aterm_types::world::LANES_OFF);
+    assert_eq!(
+        short_of_a_world(&with(tables_first.as_str(), true)),
+        ["bell_sound", "temporal_recording"]
+    );
 }

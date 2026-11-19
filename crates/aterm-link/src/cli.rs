@@ -516,10 +516,59 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
             return usage_error(&format!("unexpected argument `{extra}`"));
         }
     };
-    let mut lifeline = match lifeline_fd.as_deref().map(adopt_lifeline).transpose() {
+    // The job's log, bounded while it serves, where its standard output or error is the file
+    // its definition names (aterm_uds::job_log): serving takes what this kept.
+    let kept = crate::enable::keep_broker_log(&endpoint);
+    let lifeline = match lifeline_fd.as_deref().map(adopt_lifeline).transpose() {
         Ok(lifeline) => lifeline,
         Err(why) => return usage_error(&why),
     };
+    serve_broker(
+        args,
+        Serving {
+            watch,
+            endpoint,
+            log,
+            durability,
+            secret_file,
+            lifeline,
+            lifeline_at,
+        },
+        kept,
+    )
+}
+
+/// What `aterm link broker` read to serve ([`serve_broker`]).
+struct Serving {
+    /// This executable, watched for its replacement from the verb's first step.
+    watch: Option<ExeWatch>,
+    /// The socket.
+    endpoint: String,
+    /// The record log.
+    log: String,
+    /// The tier it serves at.
+    durability: crate::durability::Durability,
+    /// `--secret-file`, where it was given.
+    secret_file: Option<String>,
+    /// The adopted `--lifeline-fd`.
+    lifeline: Option<OnWake>,
+    /// Where `--lifeline-fd` stood in the arguments ([`by_hand`]).
+    lifeline_at: Option<usize>,
+}
+
+/// Serve what `aterm link broker <args>` read until the broker ends itself (its usage names
+/// each end). It takes what keeping the job's log kept ([`crate::enable::keep_broker_log`]):
+/// nothing else makes one, so the verb cannot serve without keeping it.
+fn serve_broker(args: &[String], serving: Serving, _kept: aterm_uds::job_log::Kept) -> ExitCode {
+    let Serving {
+        watch,
+        endpoint,
+        log,
+        durability,
+        secret_file,
+        mut lifeline,
+        lifeline_at,
+    } = serving;
     let secret_file = secret_file.or_else(|| {
         let beside = std::path::Path::new(&endpoint).with_file_name(crate::enable::MINT_SECRET);
         std::fs::symlink_metadata(&beside)

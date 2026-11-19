@@ -75,6 +75,9 @@ struct SelectionObservation {
 /// Only the local fleet is writable; neither this plan nor its guard grants a login.
 pub(in crate::harness) struct ManualRosterPlan {
     pub(in crate::harness) fleet: Option<LocalFleetEdit>,
+    /// Why the lab, which may name this Mac, is not read yet, where it is not: the row is this
+    /// roster's alone meanwhile, and the add says so ([`Chosen::Pending`]).
+    pub(in crate::harness) lab_pending: Option<String>,
     captured: AutomaticSource,
     protection: SourceProtection,
     roster: PathBuf,
@@ -151,15 +154,16 @@ impl ManualRosterPlan {
         let config = env.config.clone().unwrap_or_else(|| config_beside(roster));
         let mut captured =
             AutomaticSource::capture_requested(&config).map_err(SyncError::into_message)?;
-        let native = captured
+        let chosen = captured
             .chosen(cli, roster, None)
-            .map_err(SyncError::into_message)?
-            .is_some();
+            .map_err(SyncError::into_message)?;
+        let native = matches!(chosen, Chosen::Lab(_));
         if native {
             captured.native_guard().map_err(SyncError::into_message)?;
         }
         let policy = store.source_policy()?;
-        let selected = if cli == Cli::Claude && !native {
+        // A lab not read yet selects no other source: the row is this Mac's roster's alone.
+        let selected = if cli == Cli::Claude && matches!(chosen, Chosen::Unnamed) {
             Some(source_selection::select_observed(
                 env.home.as_deref(),
                 env.config.as_deref(),
@@ -201,13 +205,17 @@ impl ManualRosterPlan {
                     roster.display()
                 ));
             }
-            Some(FleetOrigin::AlabPending(why) | FleetOrigin::SourcePending(why)) => {
-                return Err(why);
-            }
-            Some(FleetOrigin::Roster | FleetOrigin::Alab) | None => None,
+            Some(
+                FleetOrigin::Roster
+                | FleetOrigin::Alab
+                | FleetOrigin::AlabPending(_)
+                | FleetOrigin::SourcePending(_),
+            )
+            | None => None,
         };
         let plan = Self {
             fleet,
+            lab_pending: chosen.pending().map(str::to_owned),
             captured,
             protection,
             roster: roster.to_owned(),
@@ -355,11 +363,10 @@ impl AutomaticSource {
         })
     }
 
+    /// The lab's row `name` asks for ([`super::super::alab_roster::asked_row_from`]); `None` where
+    /// no lab names this Mac or none is read yet, so `name` is a new local label.
     pub(super) fn named_account(&self, cli: Cli, name: &str) -> Result<Option<Row>, String> {
         self.validate().map_err(SyncError::into_message)?;
-        if self.observation.snapshot().pending() {
-            return Err("the native account source is unavailable; no account was added".into());
-        }
         super::super::alab_roster::asked_row_from(self.observation.snapshot(), cli, name)
             .transpose()
     }
@@ -403,7 +410,7 @@ impl AutomaticSource {
         cli: Cli,
         roster: &Path,
         named: Option<&str>,
-    ) -> Result<Option<FleetRoster>, SyncError> {
+    ) -> Result<Chosen, SyncError> {
         self.validate()?;
         super::super::alab_roster::chosen_captured(
             self.observation.snapshot(),
@@ -415,13 +422,7 @@ impl AutomaticSource {
                 .and_then(super::source_key_text)
                 .is_some(),
         )
-        .map_err(|why| {
-            if self.observation.snapshot().pending() {
-                SyncError::retry(Retry::Unavailable, why)
-            } else {
-                why.into()
-            }
-        })
+        .map_err(Into::into)
     }
 }
 
@@ -479,7 +480,7 @@ impl<'a> SourceRequest<'a> {
         cli: Cli,
         roster: &Path,
         config: Option<&Path>,
-    ) -> Result<Option<FleetRoster>, SyncError> {
+    ) -> Result<Chosen, SyncError> {
         self.validate()?;
         match self {
             Self::Requested(source) => {

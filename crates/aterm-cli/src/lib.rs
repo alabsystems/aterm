@@ -477,8 +477,9 @@ impl Verb {
                 "on Linux also enable | apply | rollback).",
             ],
             Verb::Agents => &[
-                "Keep the aterm primer in coding agents' context",
-                "files (status | install | remove | primer).",
+                "Manage coding agents' primers and skills (status |",
+                "install | remove | primer) or prepare the machine",
+                "resident's working directory (prepare-resident).",
             ],
             Verb::Ai => &[
                 "This machine's AI CLIs (claude, codex, agy, muse,",
@@ -1989,8 +1990,9 @@ fn network_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
 
 /// The root LAN broker as this account reads it (`docs/DESIGN-lan-broker-2026-11-05.md` §5).
 struct LanFact {
-    /// Its install against the app bundle this aterm runs from (`aterm_uds::lan::install::
-    /// read_here`): `None` outside a bundle (a development build).
+    /// Its install against the app bundle this aterm runs from, an adopting image judged against
+    /// the build the broker serves (`aterm_machines::items::lan::expected_reading`): `None`
+    /// outside a bundle (a development build).
     install: Option<Result<LanInstall, String>>,
     /// Whether something accepts a connection at its socket ([`aterm_uds::lan::socket_path`]).
     answers: bool,
@@ -1999,58 +2001,129 @@ struct LanFact {
     /// what switches it back on (`aterm_uds::lan::Unavailable::SwitchedOff`); `None` where it
     /// answers, its job is not switched off, or launchd could not say.
     switched_off: Option<String>,
+    /// macOS's allowance for this process's direct path (`aterm_uds::lan::direct::allowed`): its
+    /// words, or why there is none; `None` where this process has no direct path.
+    allowance: Option<Result<String, String>>,
+    /// Where the image is a newer build's this build keeps, why that broker serves this aterm
+    /// nothing ([`kept_outdated`]); `None` where it does or the image is no such one.
+    kept_outdated: Option<String>,
 }
 
 /// The broker's install as `aterm_uds::lan::install::Reading` reads it, in what the row shows.
 struct LanInstall {
     /// Both parts are as this build installs them.
     current: bool,
-    /// Setup's one elevation owes it (a part missing or another build's).
+    /// Both parts are as this build leaves them in place
+    /// (`aterm_uds::lan::install::Reading::in_place`): this build's, a newer build's image this
+    /// build keeps, or, for a development build, not its own.
+    in_place: bool,
+    /// This is a development build, which owns no broker outside a VM guest
+    /// (`aterm_uds::lan::install::Part::Development`).
+    development: bool,
+    /// The image is a newer build's this build keeps (`aterm_uds::lan::install::Part::Kept`),
+    /// which its elevation never replaces.
+    kept: bool,
+    /// Setup's one elevation owes it (a part missing or another build's, or an update the
+    /// running broker did not adopt).
     owed: bool,
     /// `image <state>, plist <state>`.
     words: String,
 }
 
+impl LanInstall {
+    /// What the row shows of `reading`.
+    #[cfg(all(unix, any(target_os = "macos", test)))]
+    fn of(reading: &aterm_uds::lan::install::Reading) -> Self {
+        Self {
+            current: reading.current(),
+            in_place: reading.in_place(),
+            development: reading.image == aterm_uds::lan::install::Part::Development,
+            kept: matches!(reading.image, aterm_uds::lan::install::Part::Kept { .. }),
+            owed: reading.owed(),
+            words: reading.words(),
+        }
+    }
+}
+
 /// macOS: the root LAN broker's install and whether its socket answers a plain connect; `None`
 /// elsewhere, where no broker runs.
 fn lan_fact() -> Option<LanFact> {
-    let (install, answers, switched_off) = lan_read()?;
+    let (install, answers, switched_off, allowance, kept_outdated) = lan_read()?;
     Some(LanFact {
-        install: install.map(|read| {
-            read.map(|(current, owed, words)| LanInstall {
-                current,
-                owed,
-                words,
-            })
-        }),
+        install,
         answers,
         switched_off,
+        allowance,
+        kept_outdated,
     })
 }
 
-/// What [`lan_fact`] reads: the install (`current`, `owed`, its words), whether the socket
-/// answers, and where it does not, the words for a job launchd lists switched off.
+/// What [`lan_fact`] reads: the install, whether the socket answers, where it does not the words
+/// for a job launchd lists switched off, macOS's allowance for this process's direct path, and
+/// where a kept image's broker serves this aterm nothing, why.
 type LanRead = (
-    Option<Result<(bool, bool, String), String>>,
+    Option<Result<LanInstall, String>>,
     bool,
+    Option<String>,
+    Option<Result<String, String>>,
     Option<String>,
 );
 
-/// [`lan_fact`]'s reads on macOS ([`aterm_uds::lan::install::read_here`], a plain connect to
-/// [`aterm_uds::lan::socket_path`], and where it fails
-/// [`aterm_uds::launchd::system_job_switched_off`]); none elsewhere or in a test.
+/// Where the image is a newer build's this build keeps (`kept`), why that broker serves this aterm
+/// nothing: the hello `heard` asks for (of whatever protocol,
+/// `aterm_uds::lan::broker::any_protocol`) names another protocol than this build's, and the
+/// broker never moves to an older build, so this aterm's LAN traffic is down until it updates.
+/// `None` where the image is no such one (and nothing is asked), the hello names this build's
+/// protocol, or no broker answered it.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn kept_outdated(
+    kept: bool,
+    heard: impl FnOnce() -> Result<aterm_uds::lan::BrokerHello, aterm_uds::lan::LanError>,
+) -> Option<String> {
+    if !kept {
+        return None;
+    }
+    let hello = aterm_uds::lan::broker::any_protocol(heard())
+        .ok()
+        .filter(|hello| hello.direct.is_none())?;
+    let ours = aterm_uds::lan::PROTOCOL;
+    (hello.protocol != ours).then(|| {
+        format!(
+            "the broker it keeps (build {}) speaks protocol {} and this aterm {ours}, and it never \
+             moves to an older build, so this aterm's LAN traffic is down until this aterm updates",
+            hello.build, hello.protocol
+        )
+    })
+}
+
+/// [`lan_fact`]'s reads on macOS (`aterm_machines::items::lan::expected_reading`, which asks the
+/// broker its hello where the image reads adopting, a plain connect to
+/// [`aterm_uds::lan::socket_path`], where it fails
+/// [`aterm_uds::launchd::system_job_switched_off`], and `aterm_uds::lan::direct::allowed`, which
+/// asks nothing); none elsewhere or in a test.
 fn lan_read() -> Option<LanRead> {
     #[cfg(all(target_os = "macos", not(test)))]
     {
-        let install = aterm_uds::lan::install::read_here().map(|(_, reading)| {
-            reading.map(|reading| (reading.current(), reading.owed(), reading.words()))
-        });
+        let reading =
+            aterm_machines::items::lan::expected_reading(&aterm_machines::port::Live::new());
+        let kept = matches!(
+            &reading,
+            Some(Ok(reading)) if matches!(reading.image, aterm_uds::lan::install::Part::Kept { .. })
+        );
+        let install = reading.map(|reading| reading.map(|reading| LanInstall::of(&reading)));
         let answers =
             std::os::unix::net::UnixStream::connect(aterm_uds::lan::socket_path()).is_ok();
         let switched_off = (!answers
             && aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL) == Some(true))
         .then(|| aterm_uds::lan::Unavailable::SwitchedOff.to_string());
-        Some((install, answers, switched_off))
+        let kept_outdated = kept_outdated(kept, aterm_uds::lan::broker::installed_hello);
+        Some((
+            install,
+            answers,
+            switched_off,
+            aterm_uds::lan::direct::allowed(),
+            kept_outdated,
+        ))
     }
     #[cfg(not(all(target_os = "macos", not(test))))]
     {
@@ -2064,7 +2137,14 @@ fn lan_read() -> Option<LanRead> {
 /// already allowed this aterm, goes by the allowed direct path, `aterm_uds::lan::direct`); an
 /// installed one whose socket does not answer is a warning, which that elevation starts. One
 /// that does not answer because launchd lists its job switched off is the person's choice: a
-/// note naming what switches it back on, never the elevation, which leaves that job alone.
+/// note naming what switches it back on, never the elevation, which leaves that job alone. A
+/// newer build's image this build keeps, answering, is in place, unless its broker speaks another
+/// protocol, which serves this aterm nothing: a note saying so, with no remedy but this aterm's
+/// update, since the broker never moves to an older build. One whose socket does not answer is a
+/// warning naming what this build's elevation can do for it (load it where launchd holds no job
+/// for it, never replace it) and that only an aterm at least as new repairs it otherwise. A
+/// development build's row is a note of how its LAN goes, with no remedy: it owns no broker
+/// outside a VM guest.
 fn lan_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     let Some(lan) = &facts.lan else {
         return Vec::new();
@@ -2102,6 +2182,41 @@ fn lan_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
                 ),
                 false,
             ),
+            Some(Ok(reading)) if reading.development => (
+                Mark::Note,
+                format!(
+                    "this development build leaves the broker alone outside a VM guest; its LAN \
+                     goes by macOS's allowance for it where one stands ({}), else the broker \
+                     refuses it; socket answers: {answers}",
+                    match &lan.allowance {
+                        Some(Ok(words) | Err(words)) => words.as_str(),
+                        None => "this process has no direct path",
+                    }
+                ),
+                false,
+            ),
+            Some(Ok(reading)) if reading.kept && !lan.answers => (
+                Mark::Warn,
+                format!(
+                    "installed ({}); socket answers: no; this aterm's `sudo aterm machines here \
+                     apply --plain` only loads that newer image where launchd holds no job for \
+                     it and never replaces it: otherwise only an aterm at least as new repairs it",
+                    reading.words
+                ),
+                false,
+            ),
+            Some(Ok(reading)) if reading.in_place && lan.answers => match &lan.kept_outdated {
+                Some(why) => (
+                    Mark::Note,
+                    format!("installed ({}); {why}; socket answers: yes", reading.words),
+                    false,
+                ),
+                None => (
+                    Mark::Ok,
+                    format!("installed ({}); socket answers: yes", reading.words),
+                    false,
+                ),
+            },
             Some(Ok(reading)) => (
                 Mark::Note,
                 format!(
@@ -3499,6 +3614,7 @@ fn front_door_alias(name: &str, first: &str) -> Option<aterm_ctl::census::Verb> 
         | AliasRoute::Link
         | AliasRoute::Askpass
         | AliasRoute::MachinesAskpass
+        | AliasRoute::UnitSource
         | AliasRoute::Amacs
         | AliasRoute::CommandLineToolsShim => Some(Census::Program),
         AliasRoute::FrontDoor => None,

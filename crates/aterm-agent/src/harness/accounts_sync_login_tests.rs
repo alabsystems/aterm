@@ -604,7 +604,9 @@ fn repointed_with_a_stale_sign_out(desk: &Desk, signed_out_at: i64) -> FleetRost
         .transact_logins(NOW + 61, &mut note, |state, logins| {
             // What the older aterm left: the sign-out of m2-2's earlier login, its end on record,
             // and the default login's sessions under the label the default login held before.
+            // An older aterm kept no login ledger: its word was the record.
             let account = state.accounts.entry("m2-2".to_owned()).or_default();
+            account.login = accounts::LoginLedger::default();
             account.auth = accounts::Auth::SignedOut;
             account.auth_at = Some(signed_out_at);
             if let Some(binding) = logins.labels.get_mut("m2-2") {
@@ -967,6 +969,25 @@ fn plant_claude_stand_in(desk: &Desk) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
     ran
+}
+
+/// A SIGN-IN RUNS CLAUDE CODE'S OWN INSTALL ON WINDOWS TOO: with no managed twin, the program is
+/// `~/.local/bin/claude.exe`, where Claude Code's installer lays it on Windows, and `claude` (on
+/// `PATH`) where the home holds none (CONTROL). NEGATIVE CONTROL (run as a temporary mutant,
+/// reverted): looking there for `claude` with no `.exe` finds nothing and answers `claude`.
+#[cfg(windows)]
+#[test]
+fn a_sign_in_runs_claude_codes_own_windows_install() {
+    let desk = Desk::new("m14");
+    assert_eq!(
+        resolve_claude_program(&desk.home),
+        PathBuf::from("claude"),
+        "CONTROL: none there"
+    );
+    let bin = desk.home.join(".local").join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("claude.exe"), b"MZ").unwrap();
+    assert_eq!(resolve_claude_program(&desk.home), bin.join("claude.exe"));
 }
 
 #[cfg(unix)]

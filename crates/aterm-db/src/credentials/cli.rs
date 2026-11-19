@@ -28,7 +28,14 @@ pub const USAGE: &str = "usage:
   aterm secrets need give <want|id> [--file <path>]
                                                    offer a value from a file or piped stdin; an admin publishes it now
                                                    (never claude-token:, whose one producer is aterm harness accounts token <account>)
+exit status: 0 done, 1 failed, 2 usage, 78 a need raised that the lab's table refused for its capacity
 ";
+
+/// The exit status of `aterm secrets need <want>` where the lab's table refused the pass for its
+/// capacity ([`Pass::full`]): the need is in the ledger, unposted, and stays there until the table
+/// takes this Mac's records again. It is the house status for work that stands until an input
+/// changes ([`aterm_secrets::converge::STANDING`]), distinct from a failure's 1.
+pub const FULL: u8 = aterm_secrets::converge::STANDING;
 
 fn say(text: &str) -> ExitCode {
     aterm_uds::stdout::answer_exit("aterm secrets need", text, 0)
@@ -140,10 +147,18 @@ pub fn run(paths: &Paths, words: &[String]) -> Result<String, (String, u8)> {
             let pass = table_pass(paths);
             let needs = need::list(paths).map_err(ledger)?;
             let all = words.iter().any(|word| word == "--all");
+            let refused = refusal(paths, &pass);
             if words.iter().any(|word| word == "--json") {
-                return Ok(format!("{}\n", json(&needs, all.then_some(&pass))));
+                return Ok(format!("{}\n", json(&needs, &pass, all, refused)));
             }
-            Ok(listing(&needs, all.then_some(&pass)))
+            let mut out = listing(&needs, all.then_some(&pass));
+            // `--all` says the pass's line, which carries the refusal this pass met; otherwise the
+            // refusal standing is said on a line of its own.
+            let said = all && matches!(&pass, Ok(Pass { full: Some(_), .. }));
+            if let (false, Some(full)) = (said, refused) {
+                out.push_str(&format!("lab table: {}\n", full.line()));
+            }
+            Ok(out)
         }
         "retire" => {
             known(&words[1..], &[], &["--note"])?;
@@ -219,14 +234,34 @@ pub fn run(paths: &Paths, words: &[String]) -> Result<String, (String, u8)> {
                 Some(id) => Purpose::parse(id)
                     .ok_or_else(|| (format!("unknown purpose {id}\n{USAGE}"), 2))?,
             };
-            need::raise(paths, want, purpose).map_err(ledger)?;
+            let raised = need::raise(paths, want, purpose).map_err(ledger)?;
             let pass = table_pass(paths);
             let needs = need::list(paths).map_err(ledger)?;
-            let mut out: String = needs
+            let rows: String = needs
                 .iter()
                 .filter(|need| need.want.key() == word)
                 .map(row)
                 .collect();
+            // A need the full table could not take is said as the refusal it is, with its own
+            // status: it is in the ledger, unposted.
+            if let Ok(Pass {
+                full: Some(full), ..
+            }) = &pass
+                && needs
+                    .iter()
+                    .any(|need| need.id == raised.id && need.state == need::State::Local)
+            {
+                return Err((
+                    format!(
+                        "{}; {word} could not be posted, and stays in this {}'s ledger until the \
+                         table takes it\n{rows}",
+                        full.line(),
+                        aterm_types::machine_name::OS_NOUN
+                    ),
+                    FULL,
+                ));
+            }
+            let mut out = rows;
             out.push_str(&pass_line(&pass));
             Ok(out)
         }
@@ -246,10 +281,18 @@ fn pass_line(pass: &Result<Pass, String>) -> String {
                 aterm_types::machine_name::OS_NOUN
             )
         }
-        Ok(pass) => format!(
-            "lab table: {} posted, {} answered, {} decided here, {} offered, {} swept\n",
-            pass.posted, pass.answered, pass.decided, pass.offered, pass.swept
-        ),
+        Ok(pass) => {
+            let mut line = format!(
+                "lab table: {} posted, {} answered, {} decided here, {} offered, {} swept",
+                pass.posted, pass.answered, pass.decided, pass.offered, pass.swept
+            );
+            if let Some(full) = &pass.full {
+                line.push_str("; ");
+                line.push_str(&full.line());
+            }
+            line.push('\n');
+            line
+        }
         Err(why) => {
             format!("lab table: not reached ({why}); the ledger holds each need until it is\n")
         }
@@ -395,9 +438,41 @@ fn observation_json(table: &Result<Observation, String>) -> Value {
     })
 }
 
-fn json(needs: &[Need], all: Option<&Result<Pass, String>>) -> String {
+/// The table's refusal for its capacity that `ls` says: the one `pass` met, else the one that
+/// stands ([`super::full`]), which a pass that appended nothing leaves as it was (on the vault
+/// admin's Mac, the custodian's, whose decisions wait on the table). `None` where neither is.
+fn refusal(paths: &Paths, pass: &Result<Pass, String>) -> Option<need::full::Full> {
+    match pass {
+        Ok(Pass {
+            full: Some(full), ..
+        }) => Some(*full),
+        _ => super::full(paths).ok().and_then(|reading| reading.standing),
+    }
+}
+
+/// `ls --json`: the needs, the table's refusal for its capacity ([`refusal`]: `full`, `null` where
+/// none is), and, with `all`, the table's requests.
+fn json(
+    needs: &[Need],
+    pass: &Result<Pass, String>,
+    all: bool,
+    refused: Option<need::full::Full>,
+) -> String {
     let mut top = needs_json(needs);
-    if let Some(pass) = all {
+    let full = match refused {
+        Some(full) => aterm_json::json!({
+            "bound": match full.bound {
+                need::full::Bound::Table => "table",
+                need::full::Bound::Writer => "writer",
+            },
+            "records": full.records,
+            "needs_unposted": full.needs_unposted,
+            "line": full.line(),
+        }),
+        None => Value::Null,
+    };
+    top.insert("full".into(), full);
+    if let Some(pass) = all.then_some(pass) {
         let table = match pass {
             Ok(pass) => Value::Array(
                 pass.threads

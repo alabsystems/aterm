@@ -112,6 +112,8 @@ impl Flush {
     /// No unavailable flush is accepted. The requested durability or ordering strength is
     /// the same as [`Self::file`], and the directory failure seam applies here too.
     /// Native errors retain their errno for callers that classify unavailable directory flushes.
+    /// On Windows, as in [`Self::dir`], the flush is only noted: NTFS commits a directory's
+    /// entries through its own log, and a handle a folder is held by flushes nothing.
     ///
     /// # Errors
     /// Reading its metadata fails, the descriptor is not a directory, or its flush fails.
@@ -123,6 +125,11 @@ impl Flush {
         if let Some(failed) = seam::dir_failure() {
             seam::note(self);
             return Err(failed);
+        }
+        if cfg!(windows) {
+            #[cfg(any(test, debug_assertions, feature = "test-support"))]
+            seam::note(self);
+            return Ok(());
         }
         self.file(dir)
     }

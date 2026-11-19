@@ -42,6 +42,8 @@ pub(crate) struct ScriptedPresenter {
     age: u8,
     script: VecDeque<ScriptedOutcome>,
     commits: usize,
+    #[cfg(test)]
+    capture_fence: TestCaptureFence,
     /// The successful commits that presented the whole surface (`present`), not damage rects.
     #[cfg(test)]
     whole_commits: usize,
@@ -50,7 +52,25 @@ pub(crate) struct ScriptedPresenter {
     owed: bool,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct TestCaptureFence(Option<Box<dyn super::SubmitFence>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestCaptureFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TestCaptureFence")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
 impl ScriptedPresenter {
+    #[cfg(test)]
+    pub(crate) fn set_capture_fence(&mut self, fence: Box<dyn super::SubmitFence>) {
+        self.capture_fence.0 = Some(fence);
+    }
+
     /// Queue the outcome of the next present that reaches this surface.
     #[cfg(test)]
     pub(crate) fn fail_next(&mut self, outcome: ScriptedOutcome) {
@@ -191,6 +211,21 @@ impl CpuPresenter for TestCpuSurface {
         }
     }
 
+    fn capture_submit_fence(&mut self) -> Result<Box<dyn super::SubmitFence>, String> {
+        match self {
+            Self::Platform(p) => p.capture_submit_fence(),
+            Self::Scripted(scripted) => {
+                #[cfg(test)]
+                if let Some(fence) = scripted.capture_fence.0.take() {
+                    return Ok(fence);
+                }
+                #[cfg(not(test))]
+                let _ = scripted;
+                Ok(Box::new(ScriptedSubmit))
+            }
+        }
+    }
+
     fn owes_repaint(&self) -> bool {
         match self {
             Self::Platform(p) => p.owes_repaint(),
@@ -262,6 +297,19 @@ impl CpuFrameBuffer for TestCpuFrame<'_> {
         match self {
             Self::Platform(b) => b.present_with_damage(damage).map_err(wrap),
             Self::Scripted(s) => Self::commit_scripted(s),
+        }
+    }
+}
+
+// Scripted commits synchronously copy every pixel to their actual glass.
+struct ScriptedSubmit;
+
+impl super::SubmitFence for ScriptedSubmit {
+    fn wait(self: Box<Self>, stopped: &(dyn Fn() -> bool + Send + Sync)) -> Result<(), String> {
+        if stopped() {
+            Err("the scripted presentation confirmation was cancelled".into())
+        } else {
+            Ok(())
         }
     }
 }

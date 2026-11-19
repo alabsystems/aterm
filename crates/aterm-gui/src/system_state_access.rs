@@ -219,9 +219,8 @@ pub(crate) struct AccessSteps {
     /// The launch folder pass's gate while it walks: shut, so the pass parks between folders,
     /// while System State is not frontmost or a `[privacy]` switch that started it is off.
     warmup_gate: Option<crate::consent_warmup::WarmupGate>,
-    /// The approved access revision this process last saw: another one is a new
-    /// approval in this process ([`App::rearm_access_steps`]).
-    seen_revision: Option<u64>,
+    /// The access revision and whether it carried a person's request at the last look.
+    seen_revision: Option<(u64, bool)>,
     /// No revision stood at a look since the last one that saw it: a revision standing again
     /// admits a Developer Tools step queued meanwhile ([`App::rearm_access_steps`]).
     revision_lapsed: bool,
@@ -441,7 +440,7 @@ fn rows_said(status: &SetupStatus, now: u64) -> (Vec<crate::system_state::RowVie
     let hold = readings_hold(status);
     let said = rows
         .iter()
-        .filter(|row| row.managed)
+        .filter(|row| row.managed && crate::system_state::counts_for_plan(row, selection))
         .map(|row| SaidRow {
             subject: row.subject,
             standing: row.standing,
@@ -1549,8 +1548,10 @@ impl App {
         if let Some(panel) = self.devtools_helper.panel() {
             return Some(panel.page().access());
         }
-        self.access_revision()?;
-        if !self.access_steps_allowed() || !(self.access_steps.reach.frontmost)(self) {
+        if !self.privacy_grants_requested()
+            || !self.access_steps_allowed()
+            || !(self.access_steps.reach.frontmost)(self)
+        {
             return None;
         }
         if self.devtools_helper.fda_waiting() {
@@ -1881,9 +1882,8 @@ impl App {
         self.devtools_helper.revision_stands(now, shown);
     }
 
-    /// A new access revision approved while aterm runs (Permissions off and on, or Set up)
-    /// brings back the window's own Full Disk Access and Developer Tools pages, as the next
-    /// launch would ([`Self::rearm_fda_step`], [`Self::rearm_devtools_step`]), each queued for
+    /// A person's request for the grants, or a new access revision carrying that request, brings
+    /// back the window's Full Disk Access and Developer Tools pages, each queued for
     /// the step moment (design §6). The first
     /// revision this process sees is the launch path's, and the same revision coming back
     /// changes nothing, except that a Developer Tools step queued while no revision stood starts
@@ -1895,16 +1895,32 @@ impl App {
             self.access_steps.revision_lapsed = true;
             return;
         };
+        let requested = self.privacy_grants_requested();
+        if !requested {
+            self.access_steps.seen_revision = Some((revision, false));
+            if self.devtools_helper.keep_explicit_handovers(now)
+                && self.consent_launch.fda() == crate::consent_launch::FdaLaunch::Waiting
+                && !self.fda_panel_up()
+            {
+                self.consent_launch
+                    .set_fda(crate::consent_launch::FdaLaunch::NotAsked);
+            }
+            return;
+        }
         if !self.access_steps_allowed() {
             return;
         }
         let lapsed = std::mem::take(&mut self.access_steps.revision_lapsed);
-        let Some(seen) = self.access_steps.seen_revision.replace(revision) else {
+        let Some(seen) = self
+            .access_steps
+            .seen_revision
+            .replace((revision, requested))
+        else {
             // A step asked before any revision stood waits for this one at its moment.
             self.list_ahead_for_queued_devtools_step();
             return;
         };
-        if seen == revision {
+        if seen == (revision, requested) {
             if lapsed {
                 // The same revision back: a step asked while none stood waits for it.
                 self.list_ahead_for_queued_devtools_step();
@@ -1912,7 +1928,7 @@ impl App {
             return;
         }
         aterm_log::info!(
-            "system state: access revision {revision} approved in this process; its pages ask again"
+            "system state: access revision {revision} carries a privacy grant request"
         );
         self.rearm_fda_step(now);
         self.rearm_devtools_step(now);

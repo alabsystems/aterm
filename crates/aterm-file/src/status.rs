@@ -96,11 +96,11 @@ impl Why {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kept {
     /// The replica it read is behind the snapshot: an earlier home of this Mac's writer
-    /// lineage, or the same home without a record the snapshot was projected from. A fenced
+    /// lineage, or the same home with a store behind the snapshot's ([`crate::Frontier::admits_over`]). A fenced
     /// home's read is behind too where the snapshot's frontier is not here to compare it with.
     Behind,
-    /// Its projection is larger than a snapshot a read takes, or its frontier larger than one
-    /// the next pass reads back ([`crate::snapshot::MAX_BYTES`] each).
+    /// Its projection, or the baseline beside it, is larger than a read takes
+    /// ([`crate::snapshot::MAX_BYTES`]).
     TooLarge,
 }
 
@@ -159,7 +159,7 @@ pub struct State {
     pub generation: u32,
     /// The fingerprint of the frontier the snapshot was projected from, lower-case hex.
     pub fingerprint: String,
-    /// The records the table held at that frontier.
+    /// How far that frontier's stores had counted, together ([`crate::Frontier::records`]).
     pub records: u64,
     /// The materializer's key of the read the snapshot was projected from, lower-case hex: a
     /// digest of everything the projection reads. `None` in a status file that does not say,
@@ -187,6 +187,11 @@ pub struct State {
     /// older build wrote it, or rewrote one a newer build wrote): the count is unknown, so the
     /// materializer projects the snapshot again rather than trust it, and a display says 0.
     pub inert: Option<u64>,
+    /// What the read the snapshot was projected from held and did not project, as aterm-db
+    /// says it ([`Projected::refused`](crate::Projected)): `Some(None)` where it held none,
+    /// `None` in a status file that does not say (an older build wrote it, or rewrote one a
+    /// newer build wrote), which the materializer projects again rather than trust.
+    pub refused: Option<Option<String>>,
     /// The file's kind (`table`) and its face's extension (`tsv`).
     pub kind: String,
     pub ext: String,
@@ -222,6 +227,9 @@ impl State {
         put("complete", Value::from(self.complete));
         put("withheld", Value::from(self.withheld));
         put("inert", Value::from(self.inert));
+        if let Some(refused) = &self.refused {
+            put("refused", Value::from(refused.as_deref()));
+        }
         put("kind", Value::from(self.kind.as_str()));
         put("ext", Value::from(self.ext.as_str()));
         put("face", Value::from(self.face.as_deref()));
@@ -283,6 +291,9 @@ impl State {
             complete: value.get("complete").and_then(Value::as_bool) == Some(true),
             withheld: number("withheld"),
             inert: value.get("inert").and_then(Value::as_u64),
+            refused: value
+                .get("refused")
+                .map(|refused| refused.as_str().map(str::to_owned)),
             kind: text("kind"),
             ext: text("ext"),
             face: value.get("face").and_then(Value::as_str).map(str::to_owned),
@@ -340,7 +351,8 @@ impl Status {
     /// The status as one line: `live · rev 7 · 12 rows`, `held (succession) · rev 7 · 12 rows`,
     /// `never (membership)`, `held (custody) · rev 7 · 12 rows · last read not taken (behind)`,
     /// `held (succession) · rev 7 · 12 rows · 2 queued · 1 held back`, `live · rev 7 · 12 rows ·
-    /// 3 inert`.
+    /// 3 inert`, `live · rev 7 · 12 rows · 1 record held here is not read: 1 signed by c05f416f
+    /// (unsupported database application schema)`.
     #[must_use]
     pub fn line(&self) -> String {
         let mut line = self.word.as_str().to_owned();
@@ -356,6 +368,9 @@ impl Status {
             }
             if let Some(inert) = state.inert.filter(|inert| *inert > 0) {
                 line.push_str(&format!(" · {inert} inert"));
+            }
+            if let Some(Some(refused)) = &state.refused {
+                line.push_str(&format!(" · {refused}"));
             }
         }
         if let Some(kept) = self.state.as_ref().and_then(|state| state.kept) {
@@ -400,6 +415,10 @@ impl Status {
                 object.insert(name.to_owned(), Value::from(value));
             }
             object.insert("complete".to_owned(), Value::from(state.complete));
+            object.insert(
+                "refused".to_owned(),
+                Value::from(state.refused.clone().flatten()),
+            );
             object.insert("kept".to_owned(), Value::from(state.kept.map(Kept::as_str)));
             object.insert("key".to_owned(), Value::from(state.key.as_deref()));
             object.insert(

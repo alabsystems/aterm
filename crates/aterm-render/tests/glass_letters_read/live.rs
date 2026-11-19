@@ -105,6 +105,34 @@ fn visible_glass_pixel(
     })
 }
 
+/// A live line's clean twin while its page holds: its pixels, and what the census reads of each
+/// glyph on it ([`Sheet::glyph_readings_for`]), read when a judged letter first needs it.
+struct Twin {
+    px: Vec<u32>,
+    bare: Option<Vec<(usize, char, f64, f64)>>,
+}
+
+impl Twin {
+    /// What the census reads of each glyph of `text` on the twin, a sheet `w` px wide of `cell`s.
+    fn bare(
+        &mut self,
+        w: usize,
+        (cw, ch): (usize, usize),
+        text: &str,
+    ) -> &[(usize, char, f64, f64)] {
+        self.bare.get_or_insert_with(|| {
+            Sheet {
+                frame: self.px.clone(),
+                clean: self.px.clone(),
+                w,
+                cw,
+                ch,
+            }
+            .glyph_readings_for(0, text)
+        })
+    }
+}
+
 fn live_reading(px: f32, line_height: f32, fg: u32, bg: u32) -> LiveReading {
     live_text_reading(px, line_height, fg, bg, GLYPHS)
 }
@@ -181,9 +209,12 @@ fn live_line_reading(
     let mut rail_run = 0;
     let (mut at_aa, mut under_aa, mut least_at_aa) = (0, 0, f64::INFINITY);
     let (mut judged_at_aa, mut judged_under_aa, mut judged_least_at_aa) = (0, 0, f64::INFINITY);
+    let mut twin: Option<Twin> = None;
     for tick in 0..glyphs.len() * 8 + 48 {
         let now = t0 + Duration::from_nanos(1_000_000_000 / 120) * tick as u32;
         if tick % 8 == 0 && tick / 8 < glyphs.len() {
+            // The page moves here alone: its twin is drawn again.
+            twin = None;
             fx.cursor_mut().glow.note_synthetic_typed(now, 1);
             let sgr = ink(tick / 8).map_or_else(|| "\x1b[39m".to_owned(), |n| format!("\x1b[{n}m"));
             term.process(sgr.as_bytes());
@@ -258,31 +289,38 @@ fn live_line_reading(
             fx.yield_glass_unworded(&mut input);
         }
         let glass_arm = fx.light_arms().iter().any(|(arm, _)| arm == "glass");
-        let clean = renderer.render_input(&base);
+        let twin = twin.get_or_insert_with(|| Twin {
+            px: renderer
+                .render_input(&base)
+                .pixels
+                .into_iter()
+                .map(|pixel| pixel & 0x00FF_FFFF)
+                .collect(),
+            bare: None,
+        });
         let frame = renderer.render_input(&input);
-        let without_glass = renderer.render_input(&without_glass);
         assert_eq!(frame.width, cols * cw, "the judged frame has no padding");
-        assert_eq!(
-            (frame.width, frame.height),
-            (without_glass.width, without_glass.height),
-            "the no-body-glass twin has the same frame geometry"
-        );
-        let without_glass: Vec<u32> = without_glass
-            .pixels
-            .into_iter()
-            .map(|pixel| pixel & 0x00FF_FFFF)
-            .collect();
+        // The frame with no body glass, read only where this frame can show glass.
+        let without_glass: Option<Vec<u32>> = (glass_arm && emitted_glass_slabs > 0).then(|| {
+            let without_glass = renderer.render_input(&without_glass);
+            assert_eq!(
+                (frame.width, frame.height),
+                (without_glass.width, without_glass.height),
+                "the no-body-glass twin has the same frame geometry"
+            );
+            without_glass
+                .pixels
+                .into_iter()
+                .map(|pixel| pixel & 0x00FF_FFFF)
+                .collect()
+        });
         let sheet = Sheet {
             frame: frame
                 .pixels
                 .into_iter()
                 .map(|pixel| pixel & 0x00FF_FFFF)
                 .collect(),
-            clean: clean
-                .pixels
-                .into_iter()
-                .map(|pixel| pixel & 0x00FF_FFFF)
-                .collect(),
+            clean: twin.px.clone(),
             w: frame.width,
             cw,
             ch,
@@ -291,17 +329,17 @@ fn live_line_reading(
         input
             .glow_under_ramps
             .expand_into(&input.glow_under, &mut glass_quads);
-        let glass = glass_arm
-            && emitted_glass_slabs > 0
-            && visible_glass_pixel(
+        let glass = without_glass.as_deref().is_some_and(|without_glass| {
+            visible_glass_pixel(
                 &input,
                 &sheet,
-                &without_glass,
+                without_glass,
                 &glass_quads,
                 (0, 0, sheet.w, sheet.frame.len() / sheet.w),
-            );
+            )
+        });
         glass_frames += usize::from(glass);
-        if glass {
+        if let Some(without_glass) = without_glass.as_deref().filter(|_| glass) {
             // The line's feet, and the rail past them: its run's reading is against the frame
             // with no glass, column by column along the glyph row.
             let foot = observed
@@ -329,14 +367,6 @@ fn live_line_reading(
         // A word in an app's ink keeps its letter bar on what it reads on the bare page, as the
         // census reads a letter: its worst solid pixel on its clean twin. A letter whose bar is
         // over that reading takes no light that lowers it, and reads it.
-        let bare = Sheet {
-            frame: sheet.clean.clone(),
-            clean: sheet.clean.clone(),
-            w: sheet.w,
-            cw,
-            ch,
-        };
-        let bare = bare.glyph_readings_for(0, text);
         for (col, glyph, reading, own) in sheet.glyph_readings_for(0, text) {
             judged += 1;
             assert!(reading.is_finite() && own.is_finite() && own > 0.0);
@@ -345,7 +375,8 @@ fn live_line_reading(
             }
             judged_glass += 1;
             let bar = if ink(col - 1).is_some() {
-                let (_, _, bare, _) = bare
+                let (_, _, bare, _) = twin
+                    .bare(sheet.w, (cw, ch), text)
                     .iter()
                     .find(|(at, ..)| *at == col)
                     .expect("the clean twin holds the glyph");
@@ -378,7 +409,9 @@ fn live_line_reading(
             let retains_glass = visible_glass_pixel(
                 &input,
                 &sheet,
-                &without_glass,
+                without_glass
+                    .as_deref()
+                    .expect("a glass frame drew its twin with no body glass"),
                 &glass_quads,
                 (col * cw, ch, (col + 1) * cw, 2 * ch),
             );

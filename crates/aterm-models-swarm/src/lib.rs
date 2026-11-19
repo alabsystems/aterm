@@ -27,7 +27,10 @@
 //! (`docs/DESIGN-vault-log-2026-11-14.md` step 4 `VaultCheckpoint`: final only with a majority of
 //! its cut's recent seats, a seat's shares never shrink, the newest final checkpoint contains
 //! every final one and there is none where a split's two sides do not nest, and a prune keeps
-//! every share the newest does not contain).
+//! every share the newest does not contain), and the exchange that makes a records file kept
+//! whole a layout where no atomic exchange of two names exists (`SwarmRecordsExchange`, NTFS:
+//! three renames that never replace, each copy at one name at every step, and the next writer
+//! finishing what a cut left).
 
 mod models_access_lock;
 mod models_cached_log;
@@ -52,6 +55,7 @@ mod models_peer_gate;
 mod models_peer_replacement;
 mod models_peer_selection;
 mod models_records_capacity;
+mod models_records_exchange;
 mod models_records_file;
 mod models_retained_frontier;
 mod models_role;
@@ -93,6 +97,7 @@ pub use models_peer_gate::peer_gate_model;
 pub use models_peer_replacement::peer_replacement_model;
 pub use models_peer_selection::peer_selection_model;
 pub use models_records_capacity::records_capacity_model;
+pub use models_records_exchange::records_exchange_model;
 pub use models_records_file::records_file_model;
 pub use models_retained_frontier::{
     first_enrollment_liveness, first_enrollment_model, retained_commit_model,

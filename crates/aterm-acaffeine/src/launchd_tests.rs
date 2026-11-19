@@ -987,3 +987,100 @@ fn choose_startup_and_startup_readers_refuse_symlinks() {
         assert_eq!(startup(&paths, bad_label, &doors), Startup::Off);
     }
 }
+
+/// The mug's paths in `root`, as a test's.
+#[cfg(unix)]
+fn mug_paths(root: &Path) -> Paths {
+    Paths {
+        state_dir: root.join("state"),
+        home: root.join("home"),
+        logs_dir: root.join("logs"),
+        local_volume: |_| true,
+    }
+}
+
+/// **THE MUG'S START KEEPS THE FILE ITS PLIST NAMES.** `serve` keeps its log as soon as it knows
+/// its login's paths (`keep_log`; the mug it serves takes the `Kept` it returns, which nothing
+/// else makes), handing `aterm_uds::job_log::keep` exactly the file the plist names for standard
+/// error (it names none for standard output).
+/// NEGATIVE CONTROL: this thread asked nothing before the call; another login's plist names a
+/// file the call did not ask for; a test's run keeps nothing (its output is not that file).
+#[cfg(unix)]
+#[test]
+fn the_mugs_start_keeps_the_file_its_plist_names() {
+    use aterm_uds::job_log::seam;
+    let paths = mug_paths(Path::new("/nonexistent/mug"));
+    let plist = |paths: &Paths| {
+        seam::plist_outputs(&plist_text(
+            INSTALLED_LABEL,
+            Path::new("/Applications/aterm.app/Contents/MacOS/aterm"),
+            &paths.log_file(),
+            None,
+        ))
+    };
+    assert_eq!(seam::asked(), None);
+    let kept = keep_log(&paths);
+    assert!(
+        !kept.stdout() && !kept.stderr(),
+        "a test's output is no job log"
+    );
+    let named = plist(&paths);
+    assert_eq!(named.stdout, None, "standard output is /dev/null");
+    assert_eq!(seam::asked(), Some(named.files()));
+    assert_ne!(
+        plist(&mug_paths(Path::new("/nonexistent/another"))).files(),
+        named.files()
+    );
+}
+
+/// The full name of [`a_burst_of_the_mugs_lines_stays_under_the_bound_where_its_log_is_kept`].
+#[cfg(unix)]
+const MUG_BURST: &str =
+    "launchd::tests::a_burst_of_the_mugs_lines_stays_under_the_bound_where_its_log_is_kept";
+
+/// **A BURST OF THE MUG'S OWN LINES STAYS UNDER THE BOUND WHERE ITS LOG IS KEPT.** A stand-in mug
+/// (this binary run again, standard error opened on the plist's file and standard output on
+/// `/dev/null`, as launchd opens them) keeps its log as `serve` does and writes `say`'s line
+/// about twice the cap's worth: the log stays under `job_log::CAP`, every line dated.
+/// NEGATIVE CONTROL: the same burst with nothing kept grows the log past the cap.
+#[cfg(unix)]
+#[test]
+fn a_burst_of_the_mugs_lines_stays_under_the_bound_where_its_log_is_kept() {
+    use aterm_uds::job_log::{CAP, seam, undated};
+    const LINE: &str = "aterm acaffeine: serve: already running (pid 4242)";
+    if let Some((stage, root)) = seam::stage() {
+        let paths = mug_paths(&root);
+        std::fs::create_dir_all(&paths.logs_dir).unwrap();
+        let plist = plist_text(
+            INSTALLED_LABEL,
+            Path::new("/x/aterm"),
+            &paths.log_file(),
+            None,
+        );
+        seam::open_as_service_manager(&seam::plist_outputs(&plist)).unwrap();
+        if stage == "kept" {
+            let kept = keep_log(&paths);
+            assert!(!kept.stdout() && kept.stderr());
+        }
+        for _ in 0..seam::BURST {
+            say(format_args!("{LINE}"));
+        }
+        std::process::exit(0);
+    }
+    let scratch = crate::test_scratch_dir("job-log");
+    let run = |stage: &str| {
+        let root = scratch.path().join(stage);
+        std::fs::create_dir(&root).unwrap();
+        seam::rerun(MUG_BURST, stage, &root).unwrap();
+        std::fs::read_to_string(mug_paths(&root).log_file()).unwrap()
+    };
+    let kept = run("kept");
+    assert!(kept.len() as u64 <= CAP, "{} > {CAP}", kept.len());
+    assert!(
+        kept.lines()
+            .skip(1)
+            .all(|l| l != undated(l) && undated(l) == LINE),
+        "every line dated"
+    );
+    assert!(run("unkept").len() as u64 > CAP, "the control is unbounded");
+}

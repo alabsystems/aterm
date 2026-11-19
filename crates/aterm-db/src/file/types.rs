@@ -495,11 +495,13 @@ pub const MACHINES: Type = Type {
 };
 
 /// `ai/logins`: each Mac's logins, one row per account it holds a login for (§10, file 3), the
-/// journal ring's `login` rows. A Mac states only its own rows; one at another Mac's key is
-/// inert.
+/// journal ring's `login` rows, each with the facts of the credential its sign-in runs on (SF-34:
+/// kind, where kept, issued, ends, refreshed, last used, state; never a value). A Mac states only
+/// its own rows; one at another Mac's key is inert.
 pub const LOGINS: Type = Type {
     name: "ai/logins",
-    about: "each machine's logins: which account, its state, how it was proved and last tried",
+    about: "each machine's logins: which account, its state, how it was proved and last tried, \
+            and its credential's facts",
     class: Class::Mac,
     store: Store::Journal(&LOGIN),
     computed: Computed::Kept,

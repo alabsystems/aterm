@@ -27,6 +27,9 @@ const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
 /// registration rings for would be an op whose wake drains the keeper's answer too.
 const NO_META_SEAM: &str = "ATERM_DEBUG_KEEPER_NO_META";
 
+#[path = "keeper_runner_death_fixture.rs"]
+mod death_fixture;
+
 #[test]
 fn keeper_runner_death_actor() {
     let Some(root) = std::env::var_os("ATERM_KEEPER_DEATH_ROOT") else {
@@ -55,18 +58,31 @@ fn keeper_runner_death_actor() {
     .stdin(std::process::Stdio::null())
     .stdout(log.try_clone().unwrap())
     .stderr(log);
-    let mut child = cmd.spawn().unwrap();
-    assert!(
-        aterm_spec::wait::within(HANG, GAP, || {
+    if death_fixture::cancelled(&root) {
+        return;
+    }
+    let mut child = death_fixture::Keeper(cmd.spawn().unwrap());
+    if !death_fixture::publish_created(&root, &child.0) {
+        return;
+    }
+    let serving = aterm_spec::wait::until_while_working(
+        child.0.id(),
+        "the newly created keeper's serving line",
+        || {
+            if death_fixture::cancelled(&root) {
+                return Some(false);
+            }
             std::fs::read_to_string(root.join("keeper.log"))
                 .ok()?
                 .contains("serving on")
-                .then_some(())
-        })
-        .is_some()
+                .then_some(true)
+        },
     );
-    std::fs::write(root.join("keeper.pid"), child.id().to_string()).unwrap();
-    let _ = child.wait();
+    if !serving {
+        return;
+    }
+    std::fs::write(root.join("keeper.pid"), child.0.id().to_string()).unwrap();
+    let _ = child.0.wait();
 }
 
 /// Drop is insufficient when libtest is killed. The positive control uses the same tether
@@ -84,45 +100,41 @@ fn a_killed_test_runner_leaves_no_foreground_keeper() {
         .env("ATERM_KEEPER_DEATH_ROOT", &world.0)
         .env("CARGO_BIN_EXE_aterm", launch_isolation::aterm_executable())
         .stdout(aterm_uds::spawnfd::Stdio::null());
+        cmd.env_remove("ATERM_KEEPER_DEATH_PLAIN");
         if plain {
             cmd.env("ATERM_KEEPER_DEATH_PLAIN", "1");
         }
-        let mut runner = cmd.spawn().unwrap();
-        let pid = aterm_spec::wait::within(HANG, GAP, || {
-            std::fs::read_to_string(world.0.join("keeper.pid"))
-                .ok()?
-                .parse::<i32>()
-                .ok()
-        })
-        .expect("keeper reports running before the runner is killed");
-        runner.kill().unwrap();
-        assert!(!runner.wait().unwrap().success());
-        let ended = || {
-            matches!(
-                aterm_uds::process::process_presence(pid),
-                aterm_uds::process::ProcessPresence::Exited
-                    | aterm_uds::process::ProcessPresence::Absent
-            )
-        };
+        let mut runner = death_fixture::Runner::new(cmd.spawn().unwrap(), world);
+        let keeper = runner.ready();
+        assert!(!runner.kill_and_reap().success());
         if plain {
-            let alive = !ended();
-            // The negative control is our live, handshaken child, never a discovered keeper.
-            // SAFETY: this positive pid is the live keeper our actor just handshook.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-            assert!(alive, "the untethered keeper demonstrates the old orphan");
+            let live = death_fixture::state(keeper);
+            assert!(
+                runner.retire_keeper(),
+                "the fixture retired its untethered keeper"
+            );
+            assert_eq!(
+                live,
+                death_fixture::State::Live,
+                "the untethered keeper demonstrates the old orphan after its parent was reaped"
+            );
         } else {
-            let gone = aterm_spec::wait::within(HANG, GAP, || ended().then_some(()));
-            if gone.is_none() {
-                // SAFETY: cleanup addresses only the keeper our actor handshook.
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
+            let gone = aterm_spec::wait::within_while_working(
+                keeper.pid as u32,
+                HANG,
+                aterm_spec::wait::WORKING_GUARD,
+                GAP,
+                || (death_fixture::state(keeper) == death_fixture::State::Gone).then_some(()),
+            );
+            if gone.is_err() {
+                assert!(
+                    runner.retire_keeper(),
+                    "the fixture retired its keeper after a failed tether"
+                );
             }
             assert!(
-                gone.is_some(),
-                "the fixture's keeper outlived its killed test runner"
+                gone.is_ok(),
+                "the fixture's keeper outlived its killed test runner: {gone:?}"
             );
         }
     }

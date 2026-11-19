@@ -3314,6 +3314,70 @@ fn decided_for_you_is_whole_on_every_host() {
 }
 
 #[test]
+fn close_idle_tabs_button_and_palette_command_dispatch_only_from_tab_control() {
+    use crate::native_settings::tabs_page::TABS_CLOSE_IDLE;
+
+    let (mut runtime, instance, view) = harness_route(fixture());
+    let cleanup = ActionId::new(TABS_CLOSE_IDLE);
+    let invoke = |id| AppEvent::Action(ActionInvocation { id, value: None });
+    let outside = runtime
+        .dispatch(instance, view, invoke(cleanup.clone()))
+        .unwrap();
+    assert!(!outside.effects.contains(&AppEffect::CleanUpIdleTabs));
+    assert!(
+        runtime
+            .commands(instance, view)
+            .unwrap()
+            .iter()
+            .all(|command| command.id != cleanup)
+    );
+
+    runtime
+        .dispatch(instance, view, invoke(route_action(SettingsRoute::Tabs)))
+        .unwrap();
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.semantic(&UiKey::new(TABS_CLOSE_IDLE)).is_none())
+        );
+        assert!(
+            runtime
+                .commands(instance, view)
+                .unwrap()
+                .iter()
+                .all(|command| command.id != cleanup)
+        );
+        let pressed = runtime.dispatch(instance, view, invoke(cleanup)).unwrap();
+        assert!(!pressed.effects.contains(&AppEffect::CleanUpIdleTabs));
+        return;
+    }
+    let button = node(&pages, TABS_CLOSE_IDLE);
+    assert_eq!(button.role, SemanticRole::Button);
+    assert!(button.state.expect("button state").enabled);
+    assert!(button.description.is_some());
+    assert!(
+        runtime
+            .commands(instance, view)
+            .unwrap()
+            .iter()
+            .any(|command| { command.id == cleanup && command.enabled })
+    );
+    let action = button.action.clone().expect("button action");
+    assert_eq!(action, cleanup);
+    let pressed = runtime.dispatch(instance, view, invoke(action)).unwrap();
+    assert_eq!(
+        pressed
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, AppEffect::CleanUpIdleTabs))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
     use crate::harness_screen::{TabComputer, TabControlState, TabSpreadsheetRow};
     use crate::native_app::HarnessRequest;

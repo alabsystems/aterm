@@ -33,6 +33,7 @@ fn seen_account() -> AccountSeen {
             WindowSeen {
                 window: "5h".into(),
                 sub: None,
+                model: None,
                 figure: Some(Figure::Used {
                     pct_x10: 425,
                     reset: None,
@@ -45,6 +46,7 @@ fn seen_account() -> AccountSeen {
             WindowSeen {
                 window: "7d".into(),
                 sub: None,
+                model: None,
                 figure: Some(Figure::ResetUnread { reset: 0 }),
                 read: None,
                 wall_until: Some(None),
@@ -106,6 +108,7 @@ fn cached_quota_reports_expire_together_without_changing_the_reading() {
                 WindowSeen {
                     window: "5h".into(),
                     sub: None,
+                    model: None,
                     figure: Some(Figure::Used {
                         pct_x10: 1000,
                         reset: Some(300),
@@ -118,6 +121,7 @@ fn cached_quota_reports_expire_together_without_changing_the_reading() {
                 WindowSeen {
                     window: "7d".into(),
                     sub: None,
+                    model: None,
                     figure: None,
                     read: None,
                     wall_until: Some(Some(300)),
@@ -174,6 +178,7 @@ fn quota_read_provenance_tracks_the_source_clock_without_changing_the_window() {
             windows: vec![WindowSeen {
                 window: "5h".into(),
                 sub: None,
+                model: None,
                 figure: Some(Figure::Used {
                     pct_x10: 420,
                     reset: Some(1_300),
@@ -225,6 +230,7 @@ fn relative_provenance_keeps_raw_times_when_the_signed_age_cannot_fit() {
         let window = WindowSeen {
             window: "5h".into(),
             sub: None,
+            model: None,
             figure: Some(Figure::Used {
                 pct_x10: 420,
                 reset: None,
@@ -784,6 +790,7 @@ fn the_display_admission_admits_a_peers_bound_and_nothing_one_field_off() {
     let admitted = WindowSeen {
         window: WEEK.into(),
         sub: None,
+        model: None,
         figure: Some(Figure::Used {
             pct_x10: 320,
             reset: Some(RESET),

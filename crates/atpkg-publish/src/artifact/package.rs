@@ -822,7 +822,7 @@ pub(crate) fn pinned_manifest(
 
 /// The manifest pair of `tag`, from the public owner's download host, else the staging
 /// owner, into `dir`: `(dir, where it came from)`.
-fn fetch_pair(
+pub(crate) fn fetch_pair(
     ctx: &Ctx,
     repo: &str,
     tag: &str,

@@ -154,11 +154,11 @@ pub(super) const ENVELOPES: Reads = Reads {
 
 /// The records a server answers a pull ([`transport::fetch_records_within`]): [`RECORDS_PEEK`] of
 /// every answer at once, and [`RECORDS_PULLS_AT_ONCE`] longer ones whole at once, up to
-/// [`crate::membership_log::MAX_RECORDS_STREAM`], as many as a server's pulls of its peers'
+/// [`crate::membership_log::REPLY_CAP`], as many as a server's pulls of its peers'
 /// records read at once.
 pub(super) const RECORDS: Reads = Reads {
     peek: RECORDS_PEEK,
-    whole: crate::membership_log::MAX_RECORDS_STREAM,
+    whole: crate::membership_log::REPLY_CAP,
     at_once: RECORDS_PULLS_AT_ONCE,
 };
 

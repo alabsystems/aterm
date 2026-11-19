@@ -5,6 +5,7 @@
 //! (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.3).
 
 use aterm_uds::sudo::{Secret, WireBuffer};
+use std::borrow::Cow;
 use std::io::{self, Write as _};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -68,9 +69,22 @@ pub fn main_entry(_args: Vec<std::ffi::OsString>) -> ExitCode {
     }
 }
 
-/// Return only public protocol outcomes, never arbitrary server text.
-fn refusal_reply(reply: &[u8]) -> &'static str {
-    match reply {
+/// Return only public protocol outcomes, never arbitrary server text: each line is a fixed
+/// outcome of this helper's own, and a quiet refusal adds only the one number it parsed and
+/// bounded (`aterm_uds::sudo::quiet_refusal_secs`). Its words hold for every way a wait starts
+/// (a person's Cancel, an empty field, a sheet left to its deadline or nobody touched), since the
+/// line names none, and for every part of the wait, which holds at least the asking tab. A
+/// server of another build whose line this helper does not know gets the generic
+/// `ERR askpass refused`.
+fn refusal_reply(reply: &[u8]) -> Cow<'static, str> {
+    if let Some(secs) = aterm_uds::sudo::quiet_refusal_secs(reply) {
+        return format!(
+            "ERR askpass refused quiet: a recent password sheet was declined or went unanswered; \
+             aterm raises no sheet for this tab for up to {secs}s"
+        )
+        .into();
+    }
+    Cow::Borrowed(match reply {
         b"ERR askpass declined" => "ERR askpass declined",
         b"ERR askpass timeout" => "ERR askpass timeout",
         b"ERR askpass headless" => "ERR askpass headless",
@@ -100,7 +114,7 @@ fn refusal_reply(reply: &[u8]) -> &'static str {
         line if line.starts_with(b"ERR askpass busy ") => "ERR askpass busy",
         line if line.starts_with(b"ERR askpass refused ") => "ERR askpass refused",
         _ => "the aterm sent a reply this helper cannot read",
-    }
+    })
 }
 
 fn send_askpass(path: &str, accept: Duration, reply: Duration) -> io::Result<WireBuffer> {

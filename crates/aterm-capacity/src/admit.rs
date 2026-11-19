@@ -453,6 +453,13 @@ pub enum Short {
         /// Its pid, where it wrote one.
         holder: Option<u32>,
     },
+    /// The caller's nonblocking external admission lock was unavailable.
+    ExternalLock,
+    /// A live old slot reservation prevents exclusive admission.
+    LegacySlots {
+        /// Distinct old reservations, including verified ancestors for ALONE.
+        holders: usize,
+    },
     /// The ledger could not be read or written.
     Ledger(String),
 }
@@ -640,6 +647,10 @@ impl fmt::Display for Short {
             ),
             Short::Turn { holder: Some(pid) } => write!(f, "pid {pid} holds the ledger's lock"),
             Short::Turn { holder: None } => f.write_str("another waiter holds the ledger's lock"),
+            Short::ExternalLock => f.write_str("the external admission lock is held"),
+            Short::LegacySlots { holders } => {
+                write!(f, "{holders} legacy build-slot reservations are held")
+            }
             Short::Ledger(e) => write!(f, "the ledger: {e}"),
         }
     }
@@ -2427,6 +2438,31 @@ pub fn covering(
     pid: u32,
     marker: Option<&str>,
 ) -> io::Result<Option<Record>> {
+    covering_for(ledger, machine, pid, marker, false)
+}
+
+/// Resolve the covering claim for a command front. An explicit zero-memory CPU cover
+/// must name the original holder whose tree or credited survivors run the command. Ordinary CPU-only
+/// claims retain their existing memory and nested-build admission behavior.
+///
+/// # Errors
+/// The ledger could not be read.
+pub fn covering_command(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    pid: u32,
+    marker: Option<&str>,
+) -> io::Result<Option<Record>> {
+    covering_for(ledger, machine, pid, marker, true)
+}
+
+fn covering_for(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    pid: u32,
+    marker: Option<&str>,
+    command: bool,
+) -> io::Result<Option<Record>> {
     let lineage = std::cell::OnceCell::new();
     let line = || lineage.get_or_init(|| machine.lineage(pid)).as_ref();
     let marker = marker.map(str::trim);
@@ -2441,11 +2477,28 @@ pub fn covering(
             r.accounting == crate::Accounting::Holder
                 && r.cover_marker() == marker
                 && r.held.is_some()
-                && r.need.mem > 0
                 && r.need.covers
+                && (r.need.mem > 0
+                    || (command && r.need.command_cover && r.held.is_some_and(|h| h.cores > 0)))
         }));
     }
     let all = ledger.list()?;
+    if command
+        && let Some((marker, _)) = named
+        && let Some(record) = all.iter().find(|r| {
+            r.need.command_cover
+                && r.need.covers
+                && r.held.is_some_and(|h| h.cores > 0)
+                && r.cover_marker() == marker
+                && credits(
+                    r,
+                    pid,
+                    &line().map(|p| p.ancestors(pid)).unwrap_or_default(),
+                )
+        })
+    {
+        return Ok(Some(record.clone()));
+    }
     if !all
         .iter()
         .any(|r| r.held.is_some() && r.need.mem > 0 && r.need.covers)
@@ -4850,7 +4903,35 @@ impl Waiter {
     /// # Errors
     /// The ledger's directory or the claim file could not be made, locked or written.
     pub fn enter(ledger: &Ledger, machine: &dyn Machine, need: Need) -> io::Result<Waiter> {
-        Self::enter_accounted(ledger, machine, need, crate::Accounting::Holder, None)
+        Self::enter_accounted(ledger, machine, need, crate::Accounting::Holder, None, None)
+    }
+
+    /// Enter an ordinary holder at a caller's earlier queue stamp, clamped to now.
+    /// The record's actual laying, wait duration and telemetry still start now;
+    /// this supplies neither a heavy judgment turn nor inherited holder authority.
+    ///
+    /// # Errors
+    /// As [`Self::enter`], or the ledger is a cohort rather than an account's holder ledger.
+    pub fn enter_since(
+        ledger: &Ledger,
+        machine: &dyn Machine,
+        need: Need,
+        since_ms: u64,
+    ) -> io::Result<Waiter> {
+        if ledger.cohort_aware()? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an external queue stamp requires an ordinary holder ledger",
+            ));
+        }
+        Self::enter_accounted(
+            ledger,
+            machine,
+            need,
+            crate::Accounting::Holder,
+            None,
+            Some(since_ms),
+        )
     }
 
     /// [`Self::enter`] at `place` (PLACE, [`mod@admit`]): where a record of this process still
@@ -4874,7 +4955,14 @@ impl Waiter {
         } else {
             place.standing_in(ledger.dir())
         };
-        Self::enter_accounted(ledger, machine, need, crate::Accounting::Holder, stood)
+        Self::enter_accounted(
+            ledger,
+            machine,
+            need,
+            crate::Accounting::Holder,
+            stood,
+            None,
+        )
     }
 
     /// TEST SEAM: a waiter whose record names `pid` as its holder (`None`: this process) and
@@ -4926,7 +5014,14 @@ impl Waiter {
                 "cohort-owned admission requires a private cohort ledger",
             ));
         }
-        Self::enter_accounted(ledger, machine, need, crate::Accounting::CohortOwned, None)
+        Self::enter_accounted(
+            ledger,
+            machine,
+            need,
+            crate::Accounting::CohortOwned,
+            None,
+            None,
+        )
     }
 
     fn enter_accounted(
@@ -4935,6 +5030,7 @@ impl Waiter {
         mut need: Need,
         accounting: crate::Accounting,
         stood: Option<std::sync::Arc<Stood>>,
+        since_ms: Option<u64>,
     ) -> io::Result<Waiter> {
         if machine.release_run() {
             need.rank = crate::Rank::Release;
@@ -4972,13 +5068,17 @@ impl Waiter {
         let stalled_after = need
             .stuck_ends
             .unwrap_or(aterm_toolchain::stall::STALLED_AFTER);
-        let (record, laid) = match (&stood, accounting) {
+        let laid_now = now_ms();
+        let (record, laid) = match (&stood, accounting, since_ms) {
             // The place orders it; the laying is now, which its wait and hold count from.
-            (Some(stood), crate::Accounting::Holder) => {
-                ledger.lay_placed(&need, stood.ms, now_ms())?
+            (Some(stood), crate::Accounting::Holder, _) => {
+                ledger.lay_placed(&need, stood.ms, laid_now)?
             }
-            (_, crate::Accounting::Holder) => ledger.lay(&need, now_ms())?,
-            _ => ledger.lay_accounted(&need, now_ms(), accounting)?,
+            (_, crate::Accounting::Holder, Some(stamp)) => {
+                ledger.lay_placed(&need, stamp.min(laid_now), laid_now)?
+            }
+            (_, crate::Accounting::Holder, None) => ledger.lay(&need, laid_now)?,
+            _ => ledger.lay_accounted(&need, laid_now, accounting)?,
         };
         let place = match stood {
             Some(stood) if accounting == crate::Accounting::Holder => stood,
@@ -5041,20 +5141,56 @@ impl Waiter {
     }
 
     fn poll_mode(
-        mut self,
+        self,
         machine: &dyn Machine,
         forced_now: bool,
         stopped: &dyn Fn() -> bool,
     ) -> Polled {
+        self.poll_guarded_mode(machine, forced_now, stopped, &mut || Ok(Some(())))
+            .0
+    }
+
+    /// Admit only after the caller also acquires a nonblocking external guard.
+    /// The callback runs under the ledger turn, after resources fit and before
+    /// publishing a grant. `None` keeps this waiter in place holding nothing.
+    /// Only an admitted claim returns its guard; cancellation or any grant error
+    /// drops it before releasing the ledger turn. The caller retains the returned
+    /// guard through its owning wait or transfers the same lock across exec.
+    #[must_use]
+    pub fn poll_until_guarded<G>(
+        self,
+        machine: &dyn Machine,
+        stopped: &dyn Fn() -> bool,
+        acquire: &mut dyn FnMut() -> io::Result<Option<G>>,
+    ) -> (Polled, Option<G>) {
+        self.poll_guarded_mode(machine, false, stopped, acquire)
+    }
+
+    fn poll_guarded_mode<G>(
+        mut self,
+        machine: &dyn Machine,
+        forced_now: bool,
+        stopped: &dyn Fn() -> bool,
+        acquire: &mut dyn FnMut() -> io::Result<Option<G>>,
+    ) -> (Polled, Option<G>) {
+        if stopped() {
+            return (
+                Polled::Gone(io::Error::from(io::ErrorKind::Interrupted)),
+                None,
+            );
+        }
         // `try_exists` follows a link: one to nothing is no claim file either.
         if matches!(self.laid.path().try_exists(), Ok(false)) {
-            return Polled::Gone(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "its claim file {} was removed while it waited",
-                    self.laid.path().display()
-                ),
-            ));
+            return (
+                Polled::Gone(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "its claim file {} was removed while it waited",
+                        self.laid.path().display()
+                    ),
+                )),
+                None,
+            );
         }
         // A quiet claim's GPU is read over a window, before the turn: no other waiter's look
         // waits on it. A forced look waits for nothing, and a measured claim's first look forms
@@ -5069,12 +5205,12 @@ impl Waiter {
             .and_then(|_| machine.gpu_busy(stopped));
         let turn = match self.ledger.try_turn() {
             Ok(Ok(turn)) => turn,
-            Ok(Err(holder)) => return self.unread(Short::Turn { holder }),
-            Err(e) => return self.unread(Short::Ledger(e.to_string())),
+            Ok(Err(holder)) => return (self.unread(Short::Turn { holder }), None),
+            Err(e) => return (self.unread(Short::Ledger(e.to_string())), None),
         };
-        let found = match self.look(machine, gpu) {
+        let mut found = match self.look(machine, gpu) {
             Ok(found) => found,
-            Err(e) => return self.unread(Short::Ledger(e.to_string())),
+            Err(e) => return (self.unread(Short::Ledger(e.to_string())), None),
         };
         if let Err(short) = &found.decided
             && let Some(issue) = short.shorts.iter().find_map(|s| match s {
@@ -5082,7 +5218,32 @@ impl Waiter {
                 _ => None,
             })
         {
-            return Polled::Unqualified(issue);
+            return (Polled::Unqualified(issue), None);
+        }
+        if stopped() {
+            return (
+                Polled::Gone(io::Error::from(io::ErrorKind::Interrupted)),
+                None,
+            );
+        }
+        let acquired = if found.decided.is_ok() {
+            match acquire() {
+                Ok(Some(guard)) => Some(guard),
+                Ok(None) => {
+                    found.decided = Err(Shortfall::only(Short::ExternalLock));
+                    None
+                }
+                Err(error) => return (Polled::Gone(error), None),
+            }
+        } else {
+            None
+        };
+        if stopped() {
+            drop(acquired);
+            return (
+                Polled::Gone(io::Error::from(io::ErrorKind::Interrupted)),
+                None,
+            );
         }
         let mut waiter = self;
         // First next for the quiet machine: its patience counts from this look, and every other
@@ -5109,10 +5270,16 @@ impl Waiter {
                 Polled::Waiting(waiter, short)
             }
         };
+        let acquired = if matches!(&polled, Polled::Admitted(_)) {
+            acquired
+        } else {
+            drop(acquired);
+            None
+        };
         drop(turn);
         // Its admission-log row, written with the ledger's lock let go.
         crate::admission_log::looked(before, &mut polled, &found.seen);
-        polled
+        (polled, acquired)
     }
 
     /// Read in `procs` the process tree of each held claim's holder `short` names, with the
@@ -5189,6 +5356,17 @@ impl Waiter {
         trace("look.scan.end");
         let mine = self.record.order();
         let theirs: Vec<&Record> = scanned.iter().filter(|r| r.order() != mine).collect();
+        // Old slots matter for cores and possible ALONE admission. Pure disk and
+        // quiet reads neither consume cores nor exclude those holders.
+        let legacy = if self.record.need.cores > 0
+            || self.record.need.alone
+            || (self.record.need.mem > 0
+                && alone_once_clear(&self.record.need, reading.reachable()))
+        {
+            machine.legacy_slots(&self.ledger, reading.cores)
+        } else {
+            crate::build_slot_wait::held::HeldSlots::default()
+        };
         let procs = (!theirs.is_empty())
             .then(|| {
                 trace("look.procs.begin");
@@ -5315,15 +5493,61 @@ impl Waiter {
                         < (!need.leads, need.priority(), mine)
             });
         let others = others(&records, used.claimants, &used.trees, &used.lines, &wide);
+        let old_lineage = if legacy.holders.is_empty() {
+            Vec::new()
+        } else {
+            machine.legacy_lineage(self.record.pid)
+        };
+        let mut native_lines = HashMap::new();
+        let claimed: Vec<(Vec<aterm_sysprobe::slots::Holder>, u32)> = if legacy.holders.is_empty() {
+            Vec::new()
+        } else {
+            records
+                .iter()
+                .filter_map(|record| {
+                    let held = record.held.filter(|h| h.cores > 0)?;
+                    (record.accounting == crate::Accounting::Holder).then(|| {
+                        let line = native_lines
+                            .entry(record.pid)
+                            .or_insert_with(|| machine.legacy_lineage(record.pid));
+                        (line.clone(), held.cores)
+                    })
+                })
+                .collect()
+        };
+        let (legacy_cores, inherited) = legacy.budget_with(&old_lineage, &claimed);
+        let inherited_full = need.cores > 0 && inherited == Some(0);
+        if let Some(ceiling) = inherited {
+            need.to_mut().cores = need.cores.min(ceiling);
+        }
+        let mut cpu_reading = reading.clone();
+        cpu_reading.cores = reading.cores.saturating_sub(legacy_cores);
         let mut decided = decide_with(
             &need,
             mine,
-            &reading,
+            &cpu_reading,
             &others,
             now,
             self.disk_rule,
             wide.reckoned.get(&mine).copied(),
         );
+        if inherited_full {
+            match &mut decided {
+                Ok(_) => decided = Err(Shortfall::only(Short::Cores)),
+                Err(found) => found.shorts.push(Short::Cores),
+            }
+        }
+        if !legacy.holders.is_empty()
+            && (need.alone || decided.as_ref().is_ok_and(|g| g.alone.is_some()))
+        {
+            let short = Short::LegacySlots {
+                holders: legacy.holders.len(),
+            };
+            match &mut decided {
+                Ok(_) => decided = Err(Shortfall::only(short)),
+                Err(found) => found.shorts.push(short),
+            }
+        }
         let mut loaded = None;
         if measured {
             use crate::TimingIssue;
@@ -5456,7 +5680,7 @@ impl Waiter {
         });
         let cores = match &decided {
             Ok((granted, _)) => granted.cores,
-            Err(_) => ranked_grant(&need, mine, &reading, &others, now),
+            Err(_) => ranked_grant(&need, mine, &cpu_reading, &others, now),
         };
         if self.record.need.lead_reservation.is_none()
             && decided.as_ref().is_err_and(|short| {
@@ -5661,6 +5885,16 @@ impl Waiter {
     /// What a forced look on a ledger that is not cohort-aware decides from what it `found`, in
     /// its turn ([`Self::force`]).
     fn forced_by(self, found: Found) -> Result<Forced, Error> {
+        if found.decided.as_ref().is_err_and(|s| {
+            s.shorts
+                .iter()
+                .any(|s| matches!(s, Short::LegacySlots { .. }))
+        }) {
+            return Ok(Forced::Turn(
+                self,
+                found.decided.expect_err("legacy exclusion was short"),
+            ));
+        }
         if found
             .protected_release_alone
             .as_ref()
@@ -6449,7 +6683,22 @@ fn admit_deciding(
         }
         // A claim file removed while it waits (the ledger's directory cleaned) is in no other
         // session's queue and can never be named a claim: the wait ends, saying so.
-        let polled = waiter.poll_until(machine, &interrupted);
+        // A Release or caller stop can arrive inside the poll. Keep the first
+        // observed reason: the low-level poll reports an interrupted I/O result,
+        // and the Release could already have left when the caller sees it.
+        let poll_stop = std::cell::Cell::new(None);
+        let polled = waiter.poll_until(machine, &|| {
+            if poll_stop.get().is_none() {
+                poll_stop.set(ended());
+            }
+            poll_stop.get().is_some()
+        });
+        if let Some(signal) = poll_stop.get() {
+            return Err(Error::Stopped {
+                signal,
+                short: last,
+            });
+        }
         if let Polled::Waiting(w, short) = &polled
             && entered.stuck_ends.is_some()
             && let Some(stuck) = w.stuck()
@@ -6591,3 +6840,7 @@ mod cohort_budget_tests;
 #[cfg(all(test, unix))]
 #[path = "admit_comparison_tests.rs"]
 mod comparison_tests;
+
+#[cfg(test)]
+#[path = "admit_guard_tests.rs"]
+mod guard_tests;

@@ -22,6 +22,9 @@ const HANDED: &str = "ATPKG_BECOMING_HANDED";
 #[cfg(target_os = "macos")]
 const MARKER: &str = "becoming-test-marker";
 
+const SDK_ROOT: &str = "/native-front-test-sdk";
+const KEPT: &str = "ATPKG_EXEC_ENV_SENTINEL";
+
 /// Whether `sig`'s disposition `INHERITED` read at load is to ignore it.
 fn ignored(sig: libc::c_int) -> bool {
     INHERITED.get().is_some_and(|i| {
@@ -48,7 +51,13 @@ fn standin_front_handles_and_becomes() {
         )
     };
     let exe = std::env::current_exe().expect("test binary");
-    match become_build(&exe, &BUILD, None) {
+    let environment = [(OsString::from("SDKROOT"), OsString::from(SDK_ROOT))];
+    let environment = if std::env::var_os(FRONT).is_some_and(|mode| mode == "with-sdk") {
+        environment.as_slice()
+    } else {
+        &[]
+    };
+    match become_build(&exe, &BUILD, None, environment) {
         Stayed::Failed(err) => panic!("the exec failed: {err}"),
         #[cfg(target_os = "macos")]
         Stayed::Reading(still) => panic!("no exec was made: {still}"),
@@ -82,14 +91,16 @@ fn standin_reports_what_it_was_started_with() {
             Some(_) => "open",
         };
         println!(
-            "BUILD pid={} parent={parent} handed={handed} cover={}",
+            "BUILD pid={} parent={parent} handed={handed} cover={} sdkroot={} kept={}",
             std::process::id(),
-            std::env::var(aterm_capacity::COVER_ENV).unwrap_or_default()
+            std::env::var(aterm_capacity::COVER_ENV).unwrap_or_default(),
+            std::env::var("SDKROOT").unwrap_or_default(),
+            std::env::var(KEPT).unwrap_or_default(),
         );
         std::process::exit(code);
     }
     println!(
-        "REPORT pipe={} int={}",
+        "REPORT pipe={} int={} sdkroot={}",
         if ignored(libc::SIGPIPE) {
             "ignored"
         } else {
@@ -99,7 +110,8 @@ fn standin_reports_what_it_was_started_with() {
             "ignored"
         } else {
             "default"
-        }
+        },
+        std::env::var("SDKROOT").unwrap_or_else(|_| "unset".into()),
     );
 }
 
@@ -107,7 +119,7 @@ fn standin_reports_what_it_was_started_with() {
 /// with SIGINT at its default action, set here, not the runner's (a `&` job's is ignored): the
 /// shell, and through it the front, inherit it. (SIGPIPE, which this process's runtime
 /// ignores, the spawn puts back to its default in the shell.)
-fn report(trap: &str) -> String {
+fn report(trap: &str, with_sdk: bool) -> String {
     let exe = std::env::current_exe().expect("test binary");
     let start = crate::platform::Starting::at_defaults(&[libc::SIGINT]);
     let mut child = start.spawning(|| {
@@ -121,8 +133,9 @@ fn report(trap: &str) -> String {
                 ),
             ])
             .arg(&exe)
-            .env(FRONT, "1")
+            .env(FRONT, if with_sdk { "with-sdk" } else { "1" })
             .env(REPORT, "1")
+            .env_remove("SDKROOT")
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::piped())
             .stderr(aterm_uds::spawnfd::Stdio::null())
@@ -152,8 +165,17 @@ fn report(trap: &str) -> String {
 /// build is started with both at their defaults.
 #[test]
 fn a_build_starts_with_the_signal_state_its_front_was_started_with() {
-    assert_eq!(report("trap '' PIPE INT;"), "pipe=ignored int=ignored");
-    assert_eq!(report(""), "pipe=default int=default");
+    for with_sdk in [false, true] {
+        let sdk = if with_sdk { SDK_ROOT } else { "unset" };
+        assert_eq!(
+            report("trap '' PIPE INT;", with_sdk),
+            format!("pipe=ignored int=ignored sdkroot={sdk}")
+        );
+        assert_eq!(
+            report("", with_sdk),
+            format!("pipe=default int=default sdkroot={sdk}")
+        );
+    }
 }
 
 /// The front, as a stand-in that goes through the front's own exec ([`super::super::exec_marked`])
@@ -197,7 +219,14 @@ fn standin_front_goes_through_the_fronts_exec() {
         let stayed = crate::platform::exec_or_run(&mut command);
         panic!("neither the exec nor the child's run ended this process: {stayed}");
     }
-    let end = super::super::exec_marked(&exe, &BUILD, Some(MARKER));
+    let end = super::super::exec_marked(
+        &super::super::Target {
+            path: &exe,
+            environment: &[("SDKROOT".into(), SDK_ROOT.into())],
+        },
+        &BUILD,
+        Some(MARKER),
+    );
     println!("FRONT ended {end:?}");
 }
 
@@ -210,6 +239,8 @@ struct Gated {
     build: (u32, u32),
     /// The cover marker the build was started with.
     cover: String,
+    sdkroot: String,
+    kept: String,
     /// Whether the build was started with the descriptor its front named: `open`, `closed`, or
     /// `none` where the front named none.
     handed: String,
@@ -249,6 +280,8 @@ fn gated(mode: &str) -> Gated {
             .env(GATED_FRONT, mode)
             .env(REPORT, "1")
             .env(TOLD, "7")
+            .env("SDKROOT", "")
+            .env(KEPT, "retained")
             .env_remove(aterm_capacity::COVER_ENV)
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::piped())
@@ -293,6 +326,8 @@ fn gated(mode: &str) -> Gated {
         front: pid(&front, "pid="),
         build: (pid(&build, "pid="), pid(&build, "parent=")),
         cover: said_of("cover="),
+        sdkroot: said_of("sdkroot="),
+        kept: said_of("kept="),
         handed: said_of("handed="),
         ended: line("FRONT ended "),
         code: status.code(),
@@ -318,6 +353,8 @@ fn a_front_with_a_table_read_in_the_kernel_runs_its_build_as_its_child() {
         "the front did not become the build"
     );
     assert_eq!(held.cover, MARKER);
+    assert_eq!(held.sdkroot, SDK_ROOT);
+    assert_eq!(held.kept, "retained");
     assert_eq!(
         held.ended.as_deref(),
         Some(format!("FRONT ended {:?}", std::process::ExitCode::from(7)).as_str()),
@@ -333,6 +370,8 @@ fn a_front_with_a_table_read_in_the_kernel_runs_its_build_as_its_child() {
     assert_eq!(free.build.0, free.front, "the front became the build");
     assert_eq!(free.build.1, std::process::id(), "its caller's child");
     assert_eq!(free.cover, MARKER);
+    assert_eq!(free.sdkroot, SDK_ROOT);
+    assert_eq!(free.kept, "retained");
     assert_eq!((free.ended, free.code), (None, Some(7)));
 }
 

@@ -201,7 +201,8 @@ impl ManagedScope {
     }
 
     /// Retire the old observation without losing the entry context needed by a later result.
-    pub(super) fn retire(&mut self) {
+    /// Its account's evidence starts again with it ([`Account::retire_login`]).
+    fn retire(&mut self) {
         self.retired = true;
         if let Some(witness) = &mut self.witness {
             witness.fresh = None;
@@ -248,6 +249,17 @@ impl Account {
     /// Managed retirement is independent of Codex's actual credential-context authority.
     pub(super) fn managed_auth_is_current(&self) -> bool {
         !self.auth_scope.is_retired()
+    }
+
+    /// THE WORD ON RECORD STOPS DESCRIBING THE ROW'S LOGIN, which a renewal or a changed login
+    /// context replaced at `since`: its scope retires, and the login's evidence starts again,
+    /// empty, under the next print, from `since` ([`LoginLedger::renew`]), so no reading dated
+    /// before the login it now describes decides for it (an idle tab's old wall asked again
+    /// after the change strikes nothing). The word stays as written until a reading of the new
+    /// login is recorded ([`Self::project_login`]).
+    pub(super) fn retire_login(&mut self, since: i64) {
+        self.auth_scope.retire();
+        self.login.renew(since);
     }
 }
 
@@ -328,6 +340,7 @@ pub(super) fn finish(
     raw: Option<&Roster>,
     logins: &mut Logins,
     events: &[Event],
+    now: i64,
 ) -> Result<bool, String> {
     if state.contextual_auth {
         lifetime::clear_witnesses(logins);
@@ -400,8 +413,9 @@ pub(super) fn finish(
                 && account
                     .auth_at
                     .is_some_and(|at| written_over.contains(&(label.as_str(), at)));
+            // The login changed in this transaction, at its time: its evidence starts there.
             if !of_final {
-                account.auth_scope.retired = true;
+                account.retire_login(now);
             }
         }
         if account.auth_scope.retired
@@ -442,11 +456,32 @@ fn note_in_context(
     at: i64,
     default: bool,
 ) -> Vec<Event> {
-    if state.contextual_auth {
-        return note_auth(state, label, auth, at);
+    match Login::of_auth(auth) {
+        Some(login) => note_said_in_context(
+            state,
+            logins,
+            label,
+            Said::Checked(login),
+            check_obs(auth, at),
+            default,
+        ),
+        None => Vec::new(),
     }
-    if auth == Auth::Unseen {
-        return Vec::new();
+}
+
+/// [`note_said`] of a reading of `label`'s login, against the login it describes: the binding's
+/// current login, or the native default login where `default` holds. Contextual Codex stores
+/// retain history here and use their staged credential observations instead.
+pub(super) fn note_said_in_context(
+    state: &mut State,
+    logins: &Logins,
+    label: &str,
+    said: Said,
+    obs: LoginObs,
+    default: bool,
+) -> Vec<Event> {
+    if state.contextual_auth {
+        return note_said(state, label, said, obs);
     }
     let observed = state
         .accounts
@@ -465,26 +500,27 @@ fn note_in_context(
                 context
             }
         });
-    note_captured(state, logins, label, auth, at, observed)
+    note_captured(state, logins, label, said, obs, observed)
 }
 
 fn note_captured(
     state: &mut State,
     logins: &Logins,
     label: &str,
-    auth: Auth,
-    at: i64,
+    said: Said,
+    obs: LoginObs,
     observed: Context,
 ) -> Vec<Event> {
-    retire_against(state, logins, label, &observed);
+    let at = obs.at;
+    retire_against(state, logins, label, &observed, at);
     if state.accounts.get(label).is_some_and(|account| {
         account.managed_auth_is_current() && account.auth_at.is_some_and(|held| held > at)
     }) {
         return Vec::new();
     }
-    let events = note_auth(state, label, auth, at);
+    let events = note_said(state, label, said, obs);
     if let Some(account) = state.accounts.get_mut(label)
-        && account.auth == auth
+        && account.auth == said.login().auth()
         && account.auth_at == Some(at)
         && account.managed_auth_is_current()
     {
@@ -493,7 +529,9 @@ fn note_captured(
     events
 }
 
-fn retire_against(state: &mut State, logins: &Logins, label: &str, observed: &Context) {
+/// Retire the word on record where `observed`, the login a reading dated `at` describes, is not
+/// the one the word was learned on: that login's evidence starts with the reading.
+fn retire_against(state: &mut State, logins: &Logins, label: &str, observed: &Context, at: i64) {
     if let Some(account) = state.accounts.get_mut(label)
         && account.auth_scope.witness.as_ref().is_some_and(|witness| {
             witness.fresh.as_ref().map_or_else(
@@ -509,23 +547,25 @@ fn retire_against(state: &mut State, logins: &Logins, label: &str, observed: &Co
         })
     {
         // A timestamp learned on a different login cannot reject this login's result.
-        account.auth_scope.retire();
+        account.retire_login(at);
     }
 }
 
-/// Withdraw a held word of another login before an enclosing authentication timestamp guard.
+/// Withdraw a held word of another login before an enclosing authentication timestamp guard,
+/// for a reading of the login now bound dated `at`.
 pub(super) fn retire_changed_context(
     state: &mut State,
     logins: &Logins,
     label: &str,
     default: bool,
+    at: i64,
 ) {
     if state.contextual_auth {
         return;
     }
     if let Some(account) = state.accounts.get(label) {
         let observed = observed_context(account, logins, label, default);
-        retire_against(state, logins, label, &observed);
+        retire_against(state, logins, label, &observed, at);
     }
 }
 
@@ -635,9 +675,16 @@ pub(in crate::harness) fn note_auth_for_observed_row(
     if state.contextual_auth {
         return note_auth(state, &row.label, auth, at);
     }
-    if auth == Auth::Unseen {
+    let Some(login) = Login::of_auth(auth) else {
         return Vec::new();
-    }
+    };
     let observed = Context::of_observed_row(row, logins);
-    note_captured(state, logins, &row.label, auth, at, observed)
+    note_captured(
+        state,
+        logins,
+        &row.label,
+        Said::Checked(login),
+        check_obs(auth, at),
+        observed,
+    )
 }

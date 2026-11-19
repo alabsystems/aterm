@@ -271,6 +271,7 @@ pub fn enrich_inventory_with_identity(
             state,
             enrolled,
             me.label(),
+            me.model,
             ranked_at.as_ref(),
             progress.observed_at,
         )

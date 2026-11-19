@@ -2268,6 +2268,7 @@ fn login_line(
     .map_err(|no| match no {
         NoPlan::Refused { what, .. } => what,
         NoPlan::Wait(why) => why.to_string(),
+        NoPlan::Noted { word: why, .. } => why.to_string(),
         NoPlan::Account(refusal) => refusal.kind.word().to_string(),
     })
 }
@@ -5280,6 +5281,7 @@ fn a_line_planned_at_the_shells_directory_carries_a_cd_once_the_shell_moved() {
         match owed_line_at_shell(line, line_dir, now, dialect) {
             Ok(line) => Ok(line),
             Err(NoPlan::Wait(why)) => Err(format!("wait:{why}")),
+            Err(NoPlan::Noted { word: why, .. }) => Err(format!("wait:{why}")),
             Err(NoPlan::Account(refusal)) => Err(format!("wait:{}", refusal.kind.word())),
             Err(NoPlan::Refused { what, .. }) => Err(format!("refused:{what}")),
         }
@@ -6149,6 +6151,7 @@ fn a_refused_token_line_names_the_account_by_its_key_and_slug() {
         Some(&tap),
         false,
         Some(&serve),
+        None,
     ) {
         Err(NoPlan::Refused { detail, .. }) => detail,
         Err(_) => panic!("another refusal"),
@@ -6241,6 +6244,7 @@ fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<
             Some(&tap),
             true,
             Some(&serve),
+            None,
         ),
         Err(NoPlan::Wait("native-token-policy"))
     ));
@@ -6259,6 +6263,7 @@ fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<
             Some(&tap),
             false,
             Some(&serve),
+            None,
         )
     };
     let mut seen = Vec::new();
@@ -6499,6 +6504,22 @@ fn a_relaunch_admission_holds_a_token_awaiting_its_basis() {
 /// Options over `dir` whose account namespace holds roster row `m16` on the default home's
 /// login, its recorded word signed out, and a second row `work-2` on its own directory.
 fn signed_out_default_home(dir: &Path) -> Opts {
+    let opts = default_home_m16(dir);
+    account_seat(&opts)
+        .expect("a seat")
+        .store(accounts::Cli::Claude)
+        .transact(now_s() as i64, &mut None, |state| {
+            state.home_accounts.extend(["m16".into(), "work-2".into()]);
+            accounts::note_auth(state, "m16", accounts::Auth::SignedOut, now_s() as i64);
+            Ok(Vec::new())
+        })
+        .expect("m16 recorded signed out");
+    opts
+}
+
+/// Options over `dir` whose roster holds row `m16` on the default home's login and a second row
+/// `work-2` on its own directory, with nothing recorded of either.
+fn default_home_m16(dir: &Path) -> Opts {
     let opts = super::super::upgrade_drive::Opts {
         home: dir.join("home"),
         state: dir.join("state"),
@@ -6540,17 +6561,11 @@ fn signed_out_default_home(dir: &Path) -> Opts {
         ),
     )
     .expect("the roster");
-    account_seat(&opts)
-        .expect("a seat")
-        .store(accounts::Cli::Claude)
-        .transact(now_s() as i64, &mut None, |state| {
-            state.home_accounts.extend(["m16".into(), "work-2".into()]);
-            accounts::note_auth(state, "m16", accounts::Auth::SignedOut, now_s() as i64);
-            Ok(Vec::new())
-        })
-        .expect("m16 recorded signed out");
     opts
 }
+
+#[path = "relaunch_login_ledger_tests.rs"]
+mod login_ledger;
 
 /// A RELAUNCH THAT KEEPS ITS LOGIN IS PLANNED ON A ROW RECORDED SIGNED OUT (the upgrade's restart
 /// left at `wait:account` for hours): an agent on the default home's stored login, which row `m16`
@@ -6603,6 +6618,7 @@ fn a_same_login_plan_carries_its_intent_where_a_selection_waits_on_the_policy_wo
         Ok(plan) => plan,
         Err(NoPlan::Account(refusal)) => panic!("account: {refusal:?}"),
         Err(NoPlan::Wait(word)) => panic!("wait: {word}"),
+        Err(NoPlan::Noted { word, .. }) => panic!("wait: {word}"),
         Err(NoPlan::Refused { why, .. }) => panic!("refused: {why}"),
     };
     let intent = plan
@@ -6633,9 +6649,740 @@ fn a_same_login_plan_carries_its_intent_where_a_selection_waits_on_the_policy_wo
             }
             Ok(plan) => panic!("{running:?}: a plan: {}", plan.line),
             Err(NoPlan::Wait(word)) => panic!("{running:?}: wait {word}"),
+            Err(NoPlan::Noted { word, .. }) => panic!("{running:?}: wait {word}"),
             Err(NoPlan::Refused { why, .. }) => panic!("{running:?}: refused {why}"),
         }
     }
+}
+
+/// `opts`' row `label` bound to the login `dir`, leaving `own_dir` (`None`: the default home's),
+/// as a renewal or a sign-in into a new directory records it.
+fn renew_row(opts: &Opts, label: &str, own_dir: Option<&Path>, dir: &Path) {
+    let now = now_s() as i64;
+    account_seat(opts)
+        .expect("a seat")
+        .store(accounts::Cli::Claude)
+        .transact_logins(now, &mut None, |state, logins| {
+            Ok(accounts::note_renewed(
+                state,
+                logins,
+                label,
+                own_dir.map(|dir| dir.to_str().expect("utf-8")),
+                dir.to_str().expect("utf-8"),
+                None,
+                now,
+            ))
+        })
+        .expect("the renewal");
+}
+
+/// A Claude Code login directory at `dir`, made here (a stand-in of its login file).
+fn made_login(dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("a login dir");
+    std::fs::write(dir.join(".credentials.json"), "{}").expect("a stand-in login");
+    dir.to_path_buf()
+}
+
+/// AN IN-PLACE RELAUNCH OFF A LOGIN ITS ROW LEFT TYPES THE ROW'S CURRENT LOGIN (m36: the upgrade
+/// held for good at `account-integrity` once the default home's row was signed into a new
+/// login): row `m16`, the default home's, was signed into a login directory of its own and is at
+/// its usage limit, while the agent still runs on the default login. The plan's line names `m16`'s
+/// new login and its intent is a rebind for `m16`, which no limit holds. The same for a row on a
+/// directory of its own (`work-2`, renewed from `W1` into `W2`, the agent on `W1`). NEGATIVE
+/// CONTROL: with `m16`'s new login not made here and no other row serving, the plan waits as signed
+/// out (`account-policy-signed-out`), never at `account-integrity`.
+#[test]
+fn an_in_place_relaunch_off_a_login_its_row_left_types_the_rows_current_login() {
+    use super::super::accounts_pool::{ExecutionIntent, Purpose, RefusalKind};
+    let argv = words(&["claude", "--verbose"]);
+    let exe = PathBuf::from("/opt/claude");
+    let planned = |opts: &Opts, cwd: &str, login: Option<&str>| {
+        let launch = Launch {
+            session: "aaaaaaaa-0000-0000-0000-000000000036",
+            resume: true,
+            cwd,
+            agent: 0,
+            argv: &argv,
+            exe: &exe,
+            mode: None,
+            home: None,
+            homedir: None,
+            login,
+            route: accounts::AuthRoute::Stored,
+            running: Some(Running {
+                home: None,
+                login,
+                route: accounts::AuthRoute::Stored,
+            }),
+            auth_observed: true,
+            launch_env: None,
+            serve: Serve::Never,
+        };
+        plan(opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+    };
+    let rebound = |opts: &Opts, cwd: &str, login: Option<&str>, owner: &str, to: &Path| {
+        let plan = match planned(opts, cwd, login) {
+            Ok(plan) => plan,
+            Err(NoPlan::Account(refusal)) => panic!("account: {refusal:?}"),
+            Err(NoPlan::Wait(word)) => panic!("wait: {word}"),
+            Err(NoPlan::Noted { word, why }) => panic!("wait: {word}: {why}"),
+            Err(NoPlan::Refused { why, .. }) => panic!("refused: {why}"),
+        };
+        assert!(
+            plan.line.contains(to.to_str().expect("utf-8")),
+            "the line names the new login: {}",
+            plan.line
+        );
+        let intent = plan
+            .command
+            .and_then(|command| command.account_intent)
+            .expect("an account intent");
+        let ExecutionIntent::Stored {
+            owner: Some(was),
+            purpose,
+            ..
+        } = &intent
+        else {
+            panic!("a stored intent: {intent:?}");
+        };
+        assert_eq!((was.as_str(), *purpose), (owner, Purpose::Rebind));
+    };
+
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let cwd = dir.path().to_str().expect("utf-8").to_owned();
+    let opts = signed_out_default_home(dir.path());
+    let m16 = made_login(&dir.path().join("logins/m16-2"));
+    renew_row(&opts, "m16", None, &m16);
+    let now = now_s() as i64;
+    account_change(&opts, |state| {
+        accounts::note_wall(
+            state,
+            "m16",
+            "five_hour",
+            Some(now + 3 * 3600),
+            now - 60,
+            now,
+        );
+    });
+    rebound(&opts, &cwd, None, "m16", &m16);
+
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let cwd = dir.path().to_str().expect("utf-8").to_owned();
+    let opts = signed_out_default_home(dir.path());
+    let w1 = made_login(&dir.path().join("logins/work-2"));
+    let w2 = made_login(&dir.path().join("logins/work-2-renewed"));
+    renew_row(&opts, "work-2", Some(&w1), &w2);
+    rebound(&opts, &cwd, w1.to_str(), "work-2", &w2);
+
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let cwd = dir.path().to_str().expect("utf-8").to_owned();
+    let opts = signed_out_default_home(dir.path());
+    let unmade = dir.path().join("logins/m16-unmade");
+    std::fs::create_dir_all(&unmade).expect("an unmade login");
+    renew_row(&opts, "m16", None, &unmade);
+    match planned(&opts, &cwd, None) {
+        Err(NoPlan::Account(refusal)) => {
+            assert_eq!(refusal.kind, RefusalKind::SignedOut, "{refusal:?}");
+            assert_eq!(refusal.kind.word(), "account-policy-signed-out");
+        }
+        Ok(plan) => panic!("a plan: {}", plan.line),
+        Err(NoPlan::Wait(word)) => panic!("wait {word}"),
+        Err(NoPlan::Noted { word, why }) => panic!("wait {word}: {why}"),
+        Err(NoPlan::Refused { why, .. }) => panic!("refused {why}"),
+    }
+}
+
+/// A RELAUNCH AFTER ITS AGENT ENDED OFF A LOGIN ITS ROW LEFT SELECTS: row `work-2` was renewed from
+/// `W1` into `W2` and the owner's pin stands on `m16`. A plan that replaces the agent still running
+/// on `W1` rebinds onto `W2`, which no pin holds, its account being the one that agent runs on; a
+/// plan whose agent already ended (no live process) types `W2` too but starts a new runner there,
+/// so its intent selects and the pin refuses it (`account-policy-pin`), as a cold relaunch of the
+/// same session is refused (`accounts_pool`'s
+/// `a_cold_relaunch_off_a_login_its_row_left_selects_so_a_pin_or_off_refuses_it`).
+#[test]
+fn a_relaunch_after_its_agent_ended_off_a_login_its_row_left_selects() {
+    use super::super::accounts_pool::{ExecutionIntent, Purpose, RefusalKind};
+    let argv = words(&["claude", "--verbose"]);
+    let exe = PathBuf::from("/opt/claude");
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let cwd = dir.path().to_str().expect("utf-8").to_owned();
+    let opts = signed_out_default_home(dir.path());
+    let w1 = made_login(&dir.path().join("logins/work-2"));
+    let w2 = made_login(&dir.path().join("logins/work-2-renewed"));
+    renew_row(&opts, "work-2", Some(&w1), &w2);
+    account_change(&opts, |state| {
+        state.pinned = true;
+        state.active = Some("m16".to_owned());
+    });
+    let planned = |running: bool| {
+        let launch = Launch {
+            session: "aaaaaaaa-0000-0000-0000-000000000037",
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe: &exe,
+            mode: None,
+            home: None,
+            homedir: None,
+            login: w1.to_str(),
+            route: accounts::AuthRoute::Stored,
+            running: running.then(|| Running {
+                home: None,
+                login: w1.to_str(),
+                route: accounts::AuthRoute::Stored,
+            }),
+            auth_observed: true,
+            launch_env: None,
+            serve: Serve::Never,
+        };
+        plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+    };
+    match planned(true) {
+        Ok(plan) => {
+            assert!(
+                plan.line.contains(w2.to_str().expect("utf-8")),
+                "{}",
+                plan.line
+            );
+            let intent = plan
+                .command
+                .and_then(|command| command.account_intent)
+                .expect("an account intent");
+            let ExecutionIntent::Stored { purpose, .. } = &intent else {
+                panic!("a stored intent: {intent:?}");
+            };
+            assert_eq!(*purpose, Purpose::Rebind);
+        }
+        Err(NoPlan::Account(refusal)) => panic!("account: {refusal:?}"),
+        Err(NoPlan::Wait(word)) => panic!("wait: {word}"),
+        Err(NoPlan::Noted { word, why }) => panic!("wait: {word}: {why}"),
+        Err(NoPlan::Refused { why, .. }) => panic!("refused: {why}"),
+    }
+    match planned(false) {
+        Err(NoPlan::Account(refusal)) => {
+            assert_eq!(refusal.kind, RefusalKind::Pin, "{refusal:?}");
+            assert_eq!(refusal.kind.word(), "account-policy-pin");
+        }
+        Ok(plan) => panic!("a plan past the owner's pin: {}", plan.line),
+        Err(NoPlan::Wait(word)) => panic!("wait {word}"),
+        Err(NoPlan::Noted { word, why }) => panic!("wait {word}: {why}"),
+        Err(NoPlan::Refused { why, .. }) => panic!("refused {why}"),
+    }
+}
+
+/// A REBIND'S PICK JUDGES EACH ROW AS ITS LINE STARTS IT (m21's shape: the row's new login is not
+/// made here, so the relaunch takes the pool's pick): `m16`'s new login is not made here;
+/// `work-2`'s stored login reads signed out here and a fresh reading of the vault names it as on
+/// its token, so rotation reads it runnable and would pick it; `work-3` is signed in on a login of
+/// its own. The line's token judgment declines a build outside atpkg's store, so a line on
+/// `work-2` would start on its lapsed stored login, refused as signed out on every pass while the
+/// records stand: the plan types `work-3`'s login, a selection of `work-3`.
+///
+/// NEGATIVE CONTROL (2026-11-17, `records_pick` choosing with `accounts::launch_row` unguarded, as
+/// before; restored with cp from a backup, confirmed with cmp): the plan waits
+/// `account-policy-signed-out`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_rebinds_pick_judges_each_row_as_its_line_starts_it() {
+    use super::super::accounts_pool::{ExecutionIntent, Purpose};
+    let argv = words(&["claude", "--verbose"]);
+    let exe = PathBuf::from("/opt/claude");
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let cwd = dir.path().to_str().expect("utf-8").to_owned();
+    let opts = signed_out_default_home(dir.path());
+    let work_2 = made_login(&dir.path().join("logins/work-2"));
+    let work_3 = made_login(&dir.path().join("logins/work-3"));
+    std::fs::write(
+        opts.account_roster.as_ref().expect("a roster"),
+        format!(
+            "[[account]]\nlabel = \"m16\"\nclass = \"dedicated\"\n\n[[account]]\n\
+             label = \"work-2\"\nclass = \"dedicated\"\ndir = {}\n\n[[account]]\n\
+             label = \"work-3\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::harness::host_path::toml(&work_2),
+            crate::harness::host_path::toml(&work_3)
+        ),
+    )
+    .expect("the roster");
+    let now = now_s() as i64;
+    account_change(&opts, |state| {
+        state.home_accounts.insert("work-3".into());
+        accounts::note_auth(state, "work-2", accounts::Auth::SignedOut, now);
+    });
+    let read: std::collections::BTreeMap<String, u64> = [(
+        "work-2".to_owned(),
+        u64::try_from(now + 86_400).expect("an end"),
+    )]
+    .into();
+    assert!(
+        account_seat(&opts)
+            .expect("a seat")
+            .store(accounts::Cli::Claude)
+            .note_tokens_here(Some(&read), now)
+            .expect("the reading")
+    );
+    let unmade = dir.path().join("logins/m16-unmade");
+    std::fs::create_dir_all(&unmade).expect("an unmade login");
+    renew_row(&opts, "m16", None, &unmade);
+    let stored = Running {
+        home: None,
+        login: None,
+        route: accounts::AuthRoute::Stored,
+    };
+    let launch = Launch {
+        session: "aaaaaaaa-0000-0000-0000-000000000021",
+        resume: true,
+        cwd: &cwd,
+        agent: 0,
+        argv: &argv,
+        exe: &exe,
+        mode: None,
+        home: None,
+        homedir: None,
+        login: None,
+        route: accounts::AuthRoute::Stored,
+        running: Some(stored),
+        auth_observed: true,
+        launch_env: None,
+        serve: Serve::Judge,
+    };
+    let plan = match plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())]) {
+        Ok(plan) => plan,
+        Err(NoPlan::Account(refusal)) => panic!("account: {refusal:?}"),
+        Err(NoPlan::Wait(word)) => panic!("wait: {word}"),
+        Err(NoPlan::Noted { word, why }) => panic!("wait: {word}: {why}"),
+        Err(NoPlan::Refused { why, .. }) => panic!("refused: {why}"),
+    };
+    assert!(
+        plan.line.contains(work_3.to_str().expect("utf-8")),
+        "the line names work-3's login: {}",
+        plan.line
+    );
+    let intent = plan
+        .command
+        .and_then(|command| command.account_intent)
+        .expect("an account intent");
+    let ExecutionIntent::Stored { owner, purpose, .. } = &intent else {
+        panic!("a stored intent: {intent:?}");
+    };
+    assert_eq!(
+        (owner.as_deref(), *purpose),
+        (Some("work-3"), Purpose::Select)
+    );
+}
+
+/// THE PICK'S TOKEN JUDGMENT IS THE LINE'S OWN: a relaunch line moved onto row `m16`'s login serves
+/// `m16`'s vault token where the one judgment says so (a build in atpkg's store, the token in use
+/// here), for a line that may serve it; never for a coordinated native upgrade's line, which execs
+/// the physical build and never carries the wrapper (its plan keeps an agent on a stored login
+/// there, `NATIVE_TOKEN_DROPPED`, or waits `native-token-policy`), nor for one on the stored login
+/// ([`Serve::Never`]). A row only its token keeps running here is picked by those lines only where
+/// this says yes.
+///
+/// NEGATIVE CONTROL (2026-11-17, `line_serves_token` answering for a native upgrade as for any
+/// other line; restored with cp from a backup, confirmed with cmp): the native lines read as
+/// serving the token.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_picks_token_judgment_is_the_lines_own() {
+    use super::super::token_route::TokenFact;
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some("ac-fedcba9876543210".to_owned())
+    }
+    let argv = words(&["claude", "--verbose"]);
+    let aterm = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let opts = signed_out_default_home(dir.path());
+    rewrite_roster(dir.path(), &opts, "m16", None);
+    account_change(&opts, |state| {
+        accounts::note_auth(state, "m16", accounts::Auth::Ok, now_s() as i64);
+    });
+    let build = dir.path().join("store/claude/7/bin/claude");
+    std::fs::create_dir_all(build.parent().expect("its folder")).expect("the build's folder");
+    std::fs::write(&build, "a build").expect("the build");
+    let cwd = dir.path().to_str().expect("utf-8").to_owned();
+    let roster = accounts::Roster::load_for(
+        accounts::Cli::Claude,
+        opts.account_roster.as_ref().expect("a roster"),
+    )
+    .expect("the roster");
+    let m16 = roster.row("m16").expect("m16");
+    TOKEN_SEAM.with(|seam| *seam.borrow_mut() = Some((aterm.clone(), TokenFact::InUse)));
+    TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(dir.path().join("store/claude")));
+    let judged = |serve, native| {
+        let launch = Launch {
+            session: "aaaaaaaa-0000-0000-0000-000000000022",
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe: &build,
+            mode: None,
+            home: None,
+            homedir: None,
+            login: None,
+            route: accounts::AuthRoute::Stored,
+            running: Some(Running {
+                home: None,
+                login: None,
+                route: accounts::AuthRoute::Stored,
+            }),
+            auth_observed: true,
+            launch_env: None,
+            serve,
+        };
+        let at = LineAt {
+            dialect: Dialect::Zsh,
+            heal: None,
+            cd: None,
+            want: &cwd,
+            native_upgrade: native,
+        };
+        crate::harness::journal::with_keyer(keyer, || line_serves_token(&opts, &launch, &at, m16))
+    };
+    let answers = [
+        judged(Serve::Judge, false),
+        judged(Serve::Must, false),
+        judged(Serve::Judge, true),
+        judged(Serve::Must, true),
+        judged(Serve::Never, false),
+    ];
+    TOKEN_SEAM.with(|seam| *seam.borrow_mut() = None);
+    TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+    assert_eq!(answers, [true, true, false, false, false]);
+}
+
+/// AN IN-PLACE RELAUNCH WHOSE ROW RUNS HERE ONLY ON ITS VAULT TOKEN TYPES THAT TOKEN'S LINE (m21:
+/// the upgrade held at `account-policy-signed-out` on every pass): row `m16` left the default
+/// home's login for `D2`, a login signed in on another Mac and not made here, its vault token is in
+/// use here and a fresh reading of the vault names it as on its token, and it is the active row.
+/// The roster file still lists `m16` on the default home's login, as a renewal leaves it: only
+/// this Mac's login records bind it to `D2`, so the line's token judgment resolves `D2` to `m16`
+/// through that binding alone. The agent runs on the default home's stored login and its line is
+/// a store build's, which the one judgment may move onto the token. The plan types the token
+/// wrapper on `D2`, its intent a selection of `m16`'s token. CONTROL: where the token is not in
+/// use here, the line cannot serve it and no other row serves (`work-2`'s login is not made
+/// here): the plan waits `account-policy-signed-out`.
+///
+/// NEGATIVE CONTROLS (2026-11-17, each restored with cp from a backup, confirmed with cmp):
+/// `records_pick` as before (its pick of `ran` itself thrown away, the pool's pick never past it),
+/// and `plan_roster` reading the roster file unbound, as before: the plan waits
+/// `account-policy-signed-out` though the token serves the line.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_in_place_relaunch_whose_row_runs_here_only_on_its_token_types_that_tokens_line() {
+    use super::super::accounts_pool::{ExecutionIntent, Purpose, RefusalKind};
+    use super::super::token_route::TokenFact;
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some("ac-fedcba9876543210".to_owned())
+    }
+    let argv = words(&["claude", "--verbose"]);
+    let aterm = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let planned = |fact: TokenFact| {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let opts = signed_out_default_home(dir.path());
+        let d2 = dir.path().join("logins/m16-elsewhere");
+        std::fs::create_dir_all(&d2).expect("D2, not made here");
+        // The roster as `signed_out_default_home` wrote it, `m16` on the default home's login
+        // (no `dir`): only the binding in the login records carries `D2`.
+        rewrite_roster(dir.path(), &opts, "m16", None);
+        renew_row(&opts, "m16", None, &d2);
+        let now = now_s() as i64;
+        account_change(&opts, |state| state.active = Some("m16".into()));
+        let read: std::collections::BTreeMap<String, u64> = [(
+            "m16".to_owned(),
+            u64::try_from(now + 86_400).expect("an end"),
+        )]
+        .into();
+        assert!(
+            account_seat(&opts)
+                .expect("a seat")
+                .store(accounts::Cli::Claude)
+                .note_tokens_here(Some(&read), now)
+                .expect("the reading")
+        );
+        let build = dir.path().join("store/claude/7/bin/claude");
+        std::fs::create_dir_all(build.parent().expect("its folder")).expect("the build's folder");
+        std::fs::write(&build, "a build").expect("the build");
+        let cwd = dir.path().to_str().expect("utf-8").to_owned();
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = Some((aterm.clone(), fact)));
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(dir.path().join("store/claude")));
+        let launch = Launch {
+            session: "aaaaaaaa-0000-0000-0000-000000000021",
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe: &build,
+            mode: None,
+            home: None,
+            homedir: None,
+            login: None,
+            route: accounts::AuthRoute::Stored,
+            running: Some(Running {
+                home: None,
+                login: None,
+                route: accounts::AuthRoute::Stored,
+            }),
+            auth_observed: true,
+            launch_env: None,
+            serve: Serve::Judge,
+        };
+        let plan = crate::harness::journal::with_keyer(keyer, || {
+            plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+        });
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = None);
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+        (plan, d2, dir)
+    };
+
+    let (planned_in_use, d2, _dir) = planned(TokenFact::InUse);
+    let plan = match planned_in_use {
+        Ok(plan) => plan,
+        Err(NoPlan::Account(refusal)) => panic!("account: {refusal:?}"),
+        Err(NoPlan::Wait(word)) => panic!("wait: {word}"),
+        Err(NoPlan::Noted { word, why }) => panic!("wait: {word}: {why}"),
+        Err(NoPlan::Refused { why, .. }) => panic!("refused: {why}"),
+    };
+    assert!(plan.line.contains("token-run"), "{}", plan.line);
+    assert!(
+        plan.line.contains(d2.to_str().expect("utf-8")),
+        "the line names D2: {}",
+        plan.line
+    );
+    let intent = plan.command.and_then(|command| command.account_intent);
+    let Some(ExecutionIntent::Token { owner, purpose, .. }) = &intent else {
+        panic!("a token intent: {intent:?}");
+    };
+    assert_eq!((owner.as_deref(), *purpose), (Some("m16"), Purpose::Select));
+
+    match planned(TokenFact::Absent).0 {
+        Err(NoPlan::Account(refusal)) => {
+            assert_eq!(refusal.kind, RefusalKind::SignedOut, "{refusal:?}");
+            assert_eq!(refusal.kind.word(), "account-policy-signed-out");
+        }
+        Ok(plan) => panic!("CONTROL: a plan: {}", plan.line),
+        Err(NoPlan::Wait(word)) => panic!("CONTROL: wait {word}"),
+        Err(NoPlan::Noted { word, why }) => panic!("CONTROL: wait {word}: {why}"),
+        Err(NoPlan::Refused { why, .. }) => panic!("CONTROL: refused {why}"),
+    }
+}
+
+/// A REBIND'S PICK TAKES ITS ROW'S TOKEN ONLY WHERE THE WRAPPER FITS THE LINE (Darwin's line
+/// budget drops the token wrapper, after the usage tap, from a line too long to carry it): row
+/// `m16` left the default home's login for `D2` and runs here only on its vault token, which is in
+/// use here, and `work-2` is signed in on a login of its own. Where the wrapper's line is too long
+/// for the tty (here, a long path to aterm), the line on `D2` would drop the wrapper: with `D2`
+/// not made here it has no login to start on, and with `D2` made here but signed out it starts on
+/// that lapsed login, refused as signed out on every pass. In both the plan types `work-2`'s
+/// login, a selection of `work-2`. CONTROL: on the same records, where the wrapper fits, the plan
+/// types it on `D2`, a selection of `m16`'s token.
+///
+/// NEGATIVE CONTROL (2026-11-17, `line_serves_token` asking the one judgment alone, as before;
+/// restored with cp from a backup, confirmed with cmp): with `D2` not made here the plan is
+/// refused (`line:`), and with `D2` made here it waits `account-policy-signed-out`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_rebinds_pick_takes_its_rows_token_only_where_the_wrapper_fits_the_line() {
+    use super::super::accounts_pool::{ExecutionIntent, Purpose};
+    use super::super::token_route::TokenFact;
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some("ac-fedcba9876543210".to_owned())
+    }
+    let argv = words(&["claude", "--verbose"]);
+    let short = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let long = PathBuf::from(format!(
+        "/Applications/{}/aterm",
+        "a".repeat(upgrade::MAX_LINE)
+    ));
+    let planned = |aterm: &Path, d2_made: bool| {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let opts = signed_out_default_home(dir.path());
+        rewrite_roster(dir.path(), &opts, "m16", None);
+        let d2 = dir.path().join("logins/m16-elsewhere");
+        if d2_made {
+            made_login(&d2);
+            std::fs::write(
+                d2.join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"person@example.com"}}"#,
+            )
+            .expect("D2's login record");
+        } else {
+            std::fs::create_dir_all(&d2).expect("D2, not made here");
+        }
+        let work_2 = made_login(&dir.path().join("logins/work-2"));
+        renew_row(&opts, "m16", None, &d2);
+        let now = now_s() as i64;
+        account_change(&opts, |state| {
+            state.active = Some("m16".into());
+            if d2_made {
+                accounts::note_auth(state, "m16", accounts::Auth::SignedOut, now);
+            }
+        });
+        let read: std::collections::BTreeMap<String, u64> = [(
+            "m16".to_owned(),
+            u64::try_from(now + 86_400).expect("an end"),
+        )]
+        .into();
+        assert!(
+            account_seat(&opts)
+                .expect("a seat")
+                .store(accounts::Cli::Claude)
+                .note_tokens_here(Some(&read), now)
+                .expect("the reading")
+        );
+        let build = dir.path().join("store/claude/7/bin/claude");
+        std::fs::create_dir_all(build.parent().expect("its folder")).expect("the build's folder");
+        std::fs::write(&build, "a build").expect("the build");
+        let cwd = dir.path().to_str().expect("utf-8").to_owned();
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = Some((aterm.to_path_buf(), TokenFact::InUse)));
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(dir.path().join("store/claude")));
+        let launch = Launch {
+            session: "aaaaaaaa-0000-0000-0000-000000000023",
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe: &build,
+            mode: None,
+            home: None,
+            homedir: None,
+            login: None,
+            route: accounts::AuthRoute::Stored,
+            running: Some(Running {
+                home: None,
+                login: None,
+                route: accounts::AuthRoute::Stored,
+            }),
+            auth_observed: true,
+            launch_env: None,
+            serve: Serve::Judge,
+        };
+        let plan = crate::harness::journal::with_keyer(keyer, || {
+            plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+        });
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = None);
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(NoPlan::Account(refusal)) => panic!("{d2_made}: account: {refusal:?}"),
+            Err(NoPlan::Wait(word)) => panic!("{d2_made}: wait: {word}"),
+            Err(NoPlan::Noted { word, why }) => panic!("{d2_made}: wait: {word}: {why}"),
+            Err(NoPlan::Refused { why, .. }) => panic!("{d2_made}: refused: {why}"),
+        };
+        let intent = plan
+            .command
+            .as_ref()
+            .and_then(|command| command.account_intent.clone())
+            .expect("an account intent");
+        (plan.line, intent, d2, work_2)
+    };
+
+    for d2_made in [false, true] {
+        let (line, intent, _, work_2) = planned(&long, d2_made);
+        assert!(!line.contains("token-run"), "{d2_made}: {line}");
+        assert!(
+            line.contains(work_2.to_str().expect("utf-8")),
+            "{d2_made}: the line names work-2's login: {line}"
+        );
+        let ExecutionIntent::Stored { owner, purpose, .. } = &intent else {
+            panic!("{d2_made}: a stored intent: {intent:?}");
+        };
+        assert_eq!(
+            (owner.as_deref(), *purpose),
+            (Some("work-2"), Purpose::Select),
+            "{d2_made}"
+        );
+
+        let (line, intent, d2, _) = planned(&short, d2_made);
+        assert!(line.contains("token-run"), "CONTROL {d2_made}: {line}");
+        assert!(
+            line.contains(d2.to_str().expect("utf-8")),
+            "CONTROL {d2_made}: the line names D2: {line}"
+        );
+        let ExecutionIntent::Token { owner, purpose, .. } = &intent else {
+            panic!("CONTROL {d2_made}: a token intent: {intent:?}");
+        };
+        assert_eq!(
+            (owner.as_deref(), *purpose),
+            (Some("m16"), Purpose::Select),
+            "CONTROL {d2_made}"
+        );
+    }
+}
+
+/// A RELAUNCH WHOSE ROW LEFT ITS LOGIN AFTER THE SIGNAL STOPS AT ONCE (the line, typed once the
+/// agent ended, names the login its plan named, and no pass plans it onto the row's current
+/// login): a same-login intent on the default home's login of row `m16`, which `m16` left for a
+/// login of its own after the signal, and the in-place rebind's intent onto that login, which
+/// `m16` left again for a newer one, each stop the relaunch (`account-moved`), native or raw,
+/// rather than wait out its stale clock.
+///
+/// NEGATIVE CONTROL (2026-11-17, `owner_left` answering false; restored with cp from a backup,
+/// confirmed with cmp): the relaunch waits `wait:account`.
+#[test]
+fn a_relaunch_whose_row_left_its_login_after_the_signal_stops_at_once() {
+    use super::super::accounts_pool::{ExecutionIntent, Purpose};
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let opts = signed_out_default_home(dir.path());
+    let seat = account_seat(&opts).expect("a seat");
+    let captured = |login: Option<&Path>, purpose| {
+        super::super::accounts_pool::capture_execution(
+            &seat,
+            accounts::Cli::Claude,
+            &accounts::ProcessLogin {
+                login: login.map(|login| login.display().to_string()),
+                default_home: true,
+                route: accounts::AuthRoute::Stored,
+            },
+            purpose,
+        )
+        .expect("an intent")
+    };
+    let stops = |what: &str, intent: &ExecutionIntent| {
+        for native in [false, true] {
+            let mut st = St {
+                tab: "s-1".to_string(),
+                account_intent: Some(intent.clone()),
+                phase: upgrade::Phase::Exiting { at_s: now_s() },
+                ..St::default()
+            };
+            let report = Report {
+                rung: None,
+                pid: 1,
+                tab: "s-1".to_string(),
+                session: SESSION_ID.to_string(),
+                from: "-".to_string(),
+                to: "-".to_string(),
+                step: String::new(),
+            };
+            match exec_account(&opts, report, &mut st, SESSION_ID, native) {
+                std::ops::ControlFlow::Break(r) => {
+                    assert_eq!(
+                        r.step,
+                        format!("failed:{ACCOUNT_MOVED}"),
+                        "{what} (native {native})"
+                    );
+                }
+                std::ops::ControlFlow::Continue(_) => {
+                    panic!("{what}: admitted (native {native})")
+                }
+            }
+            assert_eq!(
+                st.phase,
+                upgrade::Phase::Failed(ACCOUNT_MOVED.to_string()),
+                "{what}"
+            );
+        }
+    };
+    let same = captured(None, Purpose::SameLogin);
+    let m16 = made_login(&dir.path().join("logins/m16-2"));
+    renew_row(&opts, "m16", None, &m16);
+    stops("a same-login intent", &same);
+    let rebind = captured(Some(&m16), Purpose::Rebind);
+    let newer = made_login(&dir.path().join("logins/m16-3"));
+    renew_row(&opts, "m16", Some(&m16), &newer);
+    stops("a rebind's intent", &rebind);
 }
 
 /// A plan's account refusal records the wait its kind names and the reason in full, in the
@@ -6773,6 +7520,7 @@ fn a_same_login_plan_waits_on_custody_and_claims_but_not_on_a_limit() {
         }
         Err(NoPlan::Account(refusal)) => panic!("CONTROL: a limit refused: {refusal:?}"),
         Err(NoPlan::Wait(word)) => panic!("CONTROL: wait {word}"),
+        Err(NoPlan::Noted { word, .. }) => panic!("CONTROL: wait {word}"),
         Err(NoPlan::Refused { why, .. }) => panic!("CONTROL: refused {why}"),
     }
     type Change = fn(&Path, &Opts);
@@ -6813,6 +7561,7 @@ fn a_same_login_plan_waits_on_custody_and_claims_but_not_on_a_limit() {
             }
             Ok(plan) => panic!("{what}: a same-login plan on it: {}", plan.line),
             Err(NoPlan::Wait(word)) => panic!("{what}: wait {word}"),
+            Err(NoPlan::Noted { word, .. }) => panic!("{what}: wait {word}"),
             Err(NoPlan::Refused { why, .. }) => panic!("{what}: refused {why}"),
         }
     }
@@ -6889,12 +7638,14 @@ fn a_token_move_its_selection_refuses_keeps_the_stored_login() {
         Ok(plan) => plan,
         Err(NoPlan::Account(refusal)) => panic!("{what}: account {refusal:?}"),
         Err(NoPlan::Wait(word)) => panic!("{what}: wait {word}"),
+        Err(NoPlan::Noted { word, .. }) => panic!("{what}: wait {word}"),
         Err(NoPlan::Refused { why, .. }) => panic!("{what}: refused {why}"),
     };
     let refused = |what: &str, planned: Result<Plan, NoPlan>| match planned {
         Err(NoPlan::Account(refusal)) => refusal.kind,
         Ok(plan) => panic!("{what}: a plan: {}", plan.line),
         Err(NoPlan::Wait(word)) => panic!("{what}: wait {word}"),
+        Err(NoPlan::Noted { word, .. }) => panic!("{what}: wait {word}"),
         Err(NoPlan::Refused { why, .. }) => panic!("{what}: refused {why}"),
     };
     let nothing = |_: &Path, _: &Opts| {};
@@ -6989,17 +7740,356 @@ fn a_token_move_its_selection_refuses_keeps_the_stored_login() {
     );
 }
 
+/// A COORDINATED UPGRADE OF A SESSION ON ITS STORED LOGIN TYPES THE PHYSICAL BUILD THROUGH THE
+/// TOKEN TWIN (`m16`'s Claude Code sessions held at `wait:native-managed-policy` once atpkg's twin
+/// carried the token route, 2026-11-17): the agent on the default home's stored login of row
+/// `m16` was launched through the twin atpkg lays, token route included, and its vault token is
+/// absent here. The plan's own judgment keeps the stored login, so the twin's token block is
+/// projected as its as-typed arm: the native plan's target is the physical build, its env the
+/// twin's exports, its intent the same login's, and the record notes what the projection read.
+/// With the token in use, the move a judgment would offer it degrades to the same stored line
+/// (`NATIVE_TOKEN_DROPPED`), since the physical build carries no wrapper; one that must serve the
+/// token still waits `native-token-policy`, and so does the upgrade of an agent that runs on its
+/// vault token, which a line on its stored login would move off the credential it runs on (an
+/// upgrade changes the build, never the credential). A twin changed by one byte waits its own word,
+/// `native-twin-producer-unknown`, a typed refusal's word (which the status classes as aterm's own
+/// fault, never unclassified), whose reason reaches the record's wait log.
+///
+/// NEGATIVE CONTROLS: with `native_claude_restart` refusing every token block as before, the
+/// first plan waits `native-twin-token-unjudged` (`wait:native-managed-policy` before the typed
+/// refusals); with the degrade removed, the in-use plan waits `native-token-policy`; with the
+/// degrade applied whatever the replaced agent runs on, the vault-token agent's upgrade is planned
+/// on its stored login under a selecting intent.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_coordinated_upgrade_projects_the_token_twin_onto_its_build_under_the_plans_judgment() {
+    use super::super::accounts_pool::{ExecutionIntent, Purpose};
+    use super::super::token_route::TokenFact;
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some("ac-fedcba9876543210".to_owned())
+    }
+    let argv = words(&["claude", "--verbose"]);
+    let aterm = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let build_id = "1000002000001000326";
+    let planned_on = |route: accounts::AuthRoute, fact: TokenFact, serve, edit: &dyn Fn(&Path)| {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let prefix = std::fs::canonicalize(dir.path()).expect("canonical scratch");
+        let opts = signed_out_default_home(&prefix);
+        rewrite_roster(&prefix, &opts, "m16", None);
+        account_change(&opts, |state| {
+            accounts::note_auth(state, "m16", accounts::Auth::Ok, now_s() as i64);
+        });
+        let build = super::native_plan_tests::image_at(&prefix, build_id);
+        let twin = super::native_plan_tests::token_factory(&prefix, &build);
+        edit(&twin);
+        let previous = super::super::upgrade_drive::AGENTS_DIR
+            .with(|slot| slot.borrow_mut().replace(prefix.join("agents")));
+        let _agents = super::native_plan_tests::Agents(previous);
+        let cwd = prefix.to_str().expect("utf-8").to_owned();
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = Some((aterm.clone(), fact)));
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(prefix.join("store/claude")));
+        let launch = Launch {
+            session: "aaaaaaaa-0000-0000-0000-000000000016",
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe: &twin,
+            mode: None,
+            home: None,
+            homedir: None,
+            login: None,
+            route,
+            running: Some(Running {
+                home: None,
+                login: None,
+                route,
+            }),
+            auth_observed: true,
+            launch_env: None,
+            serve,
+        };
+        let plan = crate::harness::journal::with_keyer(keyer, || {
+            plan_native_upgrade(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+        });
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = None);
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+        (plan, build, opts, dir)
+    };
+    let planned = |fact: TokenFact, serve, edit: &dyn Fn(&Path)| {
+        planned_on(accounts::AuthRoute::Stored, fact, serve, edit)
+    };
+    let stored_on_build = |what: &str, plan: &Plan, build: &Path| {
+        let command = plan.command.as_ref().expect("a planned command");
+        assert_eq!(command.target, build, "{what}");
+        assert!(
+            command
+                .env
+                .iter()
+                .any(|(name, value)| name == "DISABLE_AUTOUPDATER" && value == "1"),
+            "{what}: {:?}",
+            command.env
+        );
+        assert!(!plan.line.contains("token-run"), "{what}: {}", plan.line);
+        let Some(ExecutionIntent::Stored { owner, purpose, .. }) = &command.account_intent else {
+            panic!("{what}: a stored intent: {:?}", command.account_intent);
+        };
+        assert_eq!(
+            (owner.as_deref(), *purpose),
+            (Some("m16"), Purpose::SameLogin),
+            "{what}"
+        );
+    };
+    let unwrap = |what: &str, planned: Result<Plan, NoPlan>| match planned {
+        Ok(plan) => plan,
+        Err(NoPlan::Account(refusal)) => panic!("{what}: account {refusal:?}"),
+        Err(NoPlan::Wait(word)) => panic!("{what}: wait {word}"),
+        Err(NoPlan::Noted { word, why }) => panic!("{what}: wait {word}: {why}"),
+        Err(NoPlan::Refused { why, .. }) => panic!("{what}: refused {why}"),
+    };
+    let untouched = |_: &Path| {};
+
+    let (off, build, _, _dir) = planned(TokenFact::Absent, Serve::Judge, &untouched);
+    let off = unwrap("token absent", off);
+    stored_on_build("token absent", &off, &build);
+    assert_eq!(off.token_dropped, None);
+    let projected = off.twin_projected.clone().expect("the projection noted");
+    assert!(projected.contains("token"), "{projected}");
+
+    let (in_use, build, _, _dir) = planned(TokenFact::InUse, Serve::Judge, &untouched);
+    let in_use = unwrap("token in use", in_use);
+    stored_on_build("token in use", &in_use, &build);
+    assert_eq!(
+        in_use.token_dropped,
+        Some(format!(
+            "{NATIVE_TOKEN_DROPPED}; it keeps the login the agent runs on"
+        ))
+    );
+
+    let (must, _, _, _dir) = planned(TokenFact::InUse, Serve::Must, &untouched);
+    assert!(
+        matches!(must, Err(NoPlan::Wait("native-token-policy"))),
+        "a move that must serve the token keeps the native refusal"
+    );
+
+    // An agent on its account's vault token, in use here: the physical build cannot serve it, and
+    // a line on the stored login would change the credential the agent runs on.
+    let on_token = accounts::AuthRoute::VaultToken {
+        entry: accounts::TokenEntry::parse("aterm-claude-token-ac-fedcba9876543210")
+            .expect("an entry"),
+    };
+    let (token_agent, _, _, _dir) =
+        planned_on(on_token, TokenFact::InUse, Serve::Judge, &untouched);
+    match token_agent {
+        Err(NoPlan::Wait(word)) => assert_eq!(word, "native-token-policy"),
+        Ok(plan) => panic!(
+            "an upgrade moved a vault-token agent onto {:?} ({:?})",
+            plan.command.and_then(|command| command.account_intent),
+            plan.token_dropped
+        ),
+        Err(NoPlan::Account(refusal)) => panic!("account {refusal:?}"),
+        Err(NoPlan::Noted { word, why }) => panic!("wait {word}: {why}"),
+        Err(NoPlan::Refused { why, .. }) => panic!("refused {why}"),
+    }
+
+    let edited = |twin: &Path| {
+        let body = std::fs::read_to_string(twin).unwrap();
+        std::fs::write(twin, body.replacen("#!/bin/sh\n", "#!/bin/sh\n:\n", 1)).unwrap();
+    };
+    let (changed, _, opts, _dir) = planned(TokenFact::Absent, Serve::Judge, &edited);
+    let Err(refused @ NoPlan::Noted { word, .. }) = changed else {
+        panic!("a changed twin waits its own word");
+    };
+    assert_eq!(word, "native-twin-producer-unknown");
+    // A typed refusal's word, each of which the status classes as aterm's own fault
+    // (`upgrade_status`'s `every_native_wait_is_atermss_own_fault_and_named`).
+    assert!(
+        atpkg::platform::NativeProjectionRefusal::ALL
+            .iter()
+            .any(|refusal| refusal.word() == word)
+    );
+    let mut st = St::default();
+    let report = Report {
+        rung: None,
+        pid: 1,
+        tab: "s-1".into(),
+        session: "aaaaaaaa-0000-0000-0000-000000000016".into(),
+        from: "-".into(),
+        to: "-".into(),
+        step: "current".into(),
+    };
+    let r = unplanned(&opts, report, &mut st, refused);
+    assert_eq!(r.step, "wait:native-twin-producer-unknown");
+    let noted = st.waits.last().expect("the wait noted");
+    assert_eq!(noted.word, "native-twin-producer-unknown");
+    assert!(noted.note.contains("agents/claude"), "{}", noted.note);
+}
+
+/// A COORDINATED UPGRADE THAT STAYS ON A STORED LOGIN NAMES THE LOGIN ITS LINE CARRIES (the
+/// dropped wrapper's reason said the line "keeps that login" while its plan typed another): the
+/// agent runs on the default home's stored login, which row `m16` has since left for a login of
+/// its own, and the vault token is in use here, so the physical build's line stays on a stored
+/// login. Where `m16`'s new login is signed in here, the line carries it under a rebind of `m16`
+/// and the reason names `m16`'s current login; where it is not, the pool picks `work-2`, whose
+/// own token is in use too, under a selection of `work-2`, and the reason names that pick, an
+/// account change. With `m16` still on the default login the line keeps it, and the reason says
+/// so (`a_coordinated_upgrade_projects_the_token_twin_onto_its_build_under_the_plans_judgment`).
+///
+/// NEGATIVE CONTROL (2026-11-18, `stored_in_place` recording `why` alone, as before; restored
+/// with cp from a backup, confirmed with cmp): the rebind's reason ends at "rather than move onto
+/// the vault token", naming no login, and its assertion fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_coordinated_upgrade_on_a_stored_login_names_the_login_its_line_carries() {
+    use super::super::accounts_pool::{ExecutionIntent, Purpose, Rebind};
+    use super::super::token_route::TokenFact;
+    fn keyer(_realm: &str, email: &str) -> Option<String> {
+        Some(match email {
+            "work@example.com" => "ac-0123456789abcdef".to_owned(),
+            _ => "ac-fedcba9876543210".to_owned(),
+        })
+    }
+    let argv = words(&["claude", "--verbose"]);
+    let aterm = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let build_id = "1000002000001000326";
+    let planned = |new_login: &str, made: bool| {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let prefix = std::fs::canonicalize(dir.path()).expect("canonical scratch");
+        let opts = signed_out_default_home(&prefix);
+        let work = made_login(&prefix.join("logins/work-2"));
+        std::fs::write(
+            opts.account_roster.as_ref().expect("a roster"),
+            format!(
+                "[[account]]\nlabel = \"m16\"\nclass = \"dedicated\"\nemail = \
+                 \"person@example.com\"\n\n[[account]]\nlabel = \"work-2\"\nclass = \
+                 \"dedicated\"\nemail = \"work@example.com\"\ndir = {}\n",
+                crate::harness::host_path::toml(&work)
+            ),
+        )
+        .expect("the roster");
+        account_change(&opts, |state| {
+            accounts::note_auth(state, "m16", accounts::Auth::Ok, now_s() as i64);
+        });
+        let renewed = prefix.join("logins").join(new_login);
+        if made {
+            made_login(&renewed);
+        } else {
+            std::fs::create_dir_all(&renewed).expect("an unmade login");
+        }
+        renew_row(&opts, "m16", None, &renewed);
+        let build = super::native_plan_tests::image_at(&prefix, build_id);
+        let twin = super::native_plan_tests::token_factory(&prefix, &build);
+        let previous = super::super::upgrade_drive::AGENTS_DIR
+            .with(|slot| slot.borrow_mut().replace(prefix.join("agents")));
+        let _agents = super::native_plan_tests::Agents(previous);
+        let cwd = prefix.to_str().expect("utf-8").to_owned();
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = Some((aterm.clone(), TokenFact::InUse)));
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(prefix.join("store/claude")));
+        let launch = Launch {
+            session: "aaaaaaaa-0000-0000-0000-000000000016",
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe: &twin,
+            mode: None,
+            home: None,
+            homedir: None,
+            login: None,
+            route: accounts::AuthRoute::Stored,
+            running: Some(Running {
+                home: None,
+                login: None,
+                route: accounts::AuthRoute::Stored,
+            }),
+            auth_observed: true,
+            launch_env: None,
+            serve: Serve::Judge,
+        };
+        let plan = crate::harness::journal::with_keyer(keyer, || {
+            plan_native_upgrade(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+        });
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = None);
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(NoPlan::Account(refusal)) => panic!("{new_login}: account {refusal:?}"),
+            Err(NoPlan::Wait(word)) => panic!("{new_login}: wait {word}"),
+            Err(NoPlan::Noted { word, why }) => panic!("{new_login}: wait {word}: {why}"),
+            Err(NoPlan::Refused { why, .. }) => panic!("{new_login}: refused {why}"),
+        };
+        (plan, build, renewed, work, dir)
+    };
+    let carried = |what: &str, plan: &Plan, build: &Path, login: &Path| {
+        let command = plan.command.as_ref().expect("a planned command");
+        assert_eq!(command.target, build, "{what}");
+        assert!(!plan.line.contains("token-run"), "{what}: {}", plan.line);
+        assert!(
+            command
+                .env
+                .iter()
+                .any(|(name, value)| name == accounts::LOGIN_ENV && Path::new(value) == login),
+            "{what}: the line carries {}: {:?}",
+            login.display(),
+            command.env
+        );
+        let Some(ExecutionIntent::Stored { owner, purpose, .. }) = &command.account_intent else {
+            panic!("{what}: a stored intent: {:?}", command.account_intent);
+        };
+        (owner.clone(), *purpose)
+    };
+
+    let (row, build, renewed, _, _dir) = planned("m16-2", true);
+    assert!(
+        matches!(row.rebind, Some(Rebind::Row(_))),
+        "{:?}",
+        row.rebind
+    );
+    assert_eq!(
+        carried("the row's current login", &row, &build, &renewed),
+        (Some("m16".to_owned()), Purpose::Rebind)
+    );
+    assert_eq!(
+        row.token_dropped,
+        Some(format!(
+            "{NATIVE_TOKEN_DROPPED}; it carries m16's current login, which that row holds in \
+             place of the login it left"
+        ))
+    );
+
+    let (pick, build, _, work, _dir) = planned("m16-unmade", false);
+    assert!(
+        matches!(pick.rebind, Some(Rebind::Pick(_))),
+        "{:?}",
+        pick.rebind
+    );
+    assert_eq!(
+        carried("the pool's pick", &pick, &build, &work),
+        (Some("work-2".to_owned()), Purpose::Select)
+    );
+    assert_eq!(
+        pick.token_dropped,
+        Some(format!(
+            "{NATIVE_TOKEN_DROPPED}; it carries work-2's login, the pool's pick in place of a \
+             login its row left"
+        ))
+    );
+}
+
 /// THE RELAUNCH'S ACCOUNT ADMISSION AT EXEC TAKES ITS LOGIN'S NEW GENERATION (an upgrade's agent
 /// ended and left at its shell when a commit moved its login's credential generation between the
 /// signal and the line): the saved same-login intent for `m16`, whose row has no binding of its
 /// own, is refused exactly once `work-2` renews (the global generation moves: CONTROL), and the
 /// raw relaunch's admission takes the login captured afresh instead, saving it in the record
-/// before any line. A native binding, which carries the exact intent its helper admits, waits.
-/// Once `m16`'s login is filed under another row, the relaunch stops at once (`account-moved`),
-/// never waiting out its stale clock.
+/// before any line. A native binding is admitted under the same rule and keeps its record's
+/// intent as its command carries it: its helper's Execute readmits that intent, and the
+/// restart's completion names the one admitted. Once `m16`'s login is filed under another row,
+/// the relaunch stops at once (`account-moved`), native or raw, never waiting out its stale clock.
 ///
-/// NEGATIVE CONTROL (2026-11-13, restored with cp from a backup, confirmed with cmp): with the
-/// raw relaunch admitting its saved intent exactly, the renewed login waits `wait:account`.
+/// NEGATIVE CONTROLS (2026-11-13, each restored with cp from a backup, confirmed with cmp): with
+/// the raw relaunch admitting its saved intent exactly, the renewed login waits `wait:account`;
+/// with a native binding admitted exactly (f26008c93f3's rule), the native relaunch waits
+/// `wait:account`.
 #[test]
 fn the_relaunchs_account_admission_at_exec_takes_its_logins_new_generation() {
     use super::super::accounts_pool::{ExecutionIntent, Purpose};
@@ -7055,16 +8145,22 @@ fn the_relaunchs_account_admission_at_exec_takes_its_logins_new_generation() {
     );
 
     let mut native = record(&intent);
-    match exec_account(&opts, report(), &mut native, SESSION_ID, false) {
-        std::ops::ControlFlow::Break(r) => assert_eq!(r.step, WAIT_ACCOUNT),
-        std::ops::ControlFlow::Continue(_) => {
-            panic!("a native binding admitted another intent than its own")
-        }
+    match exec_account(&opts, report(), &mut native, SESSION_ID, true) {
+        std::ops::ControlFlow::Continue(guard) => drop(guard.expect("a guard")),
+        std::ops::ControlFlow::Break(r) => panic!("the native relaunch waits: {}", r.step),
     }
-    assert_eq!(native.account_intent.as_ref(), Some(&intent));
+    assert_eq!(
+        native.account_intent.as_ref(),
+        Some(&intent),
+        "a native record keeps the intent its command carries"
+    );
+    assert!(
+        load(&opts, SESSION_ID).is_none(),
+        "a native admission saves nothing"
+    );
 
     let mut st = record(&intent);
-    let guard = match exec_account(&opts, report(), &mut st, SESSION_ID, true) {
+    let guard = match exec_account(&opts, report(), &mut st, SESSION_ID, false) {
         std::ops::ControlFlow::Continue(guard) => guard.expect("a guard held through the line"),
         std::ops::ControlFlow::Break(r) => panic!("the renewed login waits: {}", r.step),
     };
@@ -7080,15 +8176,21 @@ fn the_relaunchs_account_admission_at_exec_takes_its_logins_new_generation() {
     assert!(account_execution(&opts, Some(&renewed)).is_ok());
 
     rewrite_roster(dir.path(), &opts, "m16-b", None);
-    let mut moved = record(&renewed);
-    match exec_account(&opts, report(), &mut moved, SESSION_ID, true) {
-        std::ops::ControlFlow::Break(r) => assert_eq!(r.step, format!("failed:{ACCOUNT_MOVED}")),
-        std::ops::ControlFlow::Continue(_) => panic!("a login under another row admitted"),
+    for native in [false, true] {
+        let mut moved = record(&renewed);
+        match exec_account(&opts, report(), &mut moved, SESSION_ID, native) {
+            std::ops::ControlFlow::Break(r) => {
+                assert_eq!(r.step, format!("failed:{ACCOUNT_MOVED}"), "native {native}");
+            }
+            std::ops::ControlFlow::Continue(_) => {
+                panic!("a login under another row admitted (native {native})")
+            }
+        }
+        assert_eq!(
+            moved.phase,
+            upgrade::Phase::Failed(ACCOUNT_MOVED.to_string())
+        );
     }
-    assert_eq!(
-        moved.phase,
-        upgrade::Phase::Failed(ACCOUNT_MOVED.to_string())
-    );
 }
 
 /// The session the exec admission's records are kept under.

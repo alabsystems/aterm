@@ -91,10 +91,10 @@ fn listed(map: &Map, range: Range, after: Option<Digest>) -> Vec<(Digest, Vec<u8
 /// Every page of `map`, by hash, as a store would hold them; and how many there are.
 fn stored(map: &Map) -> HashMap<Digest, Vec<u8>> {
     let mut store = HashMap::new();
-    map.written(&Map::new(sha256, 0), |range, hash| {
+    for (range, hash) in map.written(&Map::new(sha256, 0)) {
         let page = map.page(range).unwrap();
         assert!(store.insert(hash, page).is_none(), "{range:?} twice");
-    });
+    }
     store
 }
 
@@ -215,8 +215,11 @@ fn a_map_of_1000000_rows_changes_one_row_in_under_8_pages_and_proves_it_in_under
     map.set(target, &[0xA7; SEAT]).unwrap();
     let changed = map.root();
     let hashes = HASHED.load(Ordering::Relaxed) - hashed;
-    let mut pages = Vec::new();
-    map.written(&before, |range, _| pages.push(range.prefix().1));
+    let pages: Vec<u8> = map
+        .written(&before)
+        .iter()
+        .map(|(range, _)| range.prefix().1)
+        .collect();
     let proof = map.prove(&target).unwrap().unwrap().encode();
     println!(
         "1000000 rows in {leaves} leaves: one row changed writes {} pages and computes \
@@ -275,9 +278,11 @@ fn the_root_is_a_function_of_the_rows_whatever_order_set_and_removed_them() {
             assert_eq!(map.root(), fresh.root(), "seed {seed} step {step}");
             assert_eq!(map.len(), model.len() as u64);
             assert_eq!(map.retained_bytes(), fresh.retained_bytes());
-            let mut differing = 0;
-            map.written(&fresh, |_, _| differing += 1);
-            assert_eq!(differing, 0, "seed {seed}: the same rows, the same pages");
+            assert_eq!(
+                map.written(&fresh),
+                [],
+                "seed {seed}: the same rows, the same pages"
+            );
             let rows: Vec<_> = model
                 .iter()
                 .map(|(key, value)| (*key, value.clone()))
@@ -843,8 +848,11 @@ fn a_page_not_held_is_named_by_whatever_needs_it_and_listing_stops_there() {
 
     // A store is asked for the pages still held; a range with no rows has no page to
     // release, and takes a row afterwards.
-    let mut asked = Vec::new();
-    map.written(&Map::new(sha256, 0), |range, _| asked.push(range));
+    let asked: Vec<Range> = map
+        .written(&Map::new(sha256, 0))
+        .into_iter()
+        .map(|(range, _)| range)
+        .collect();
     assert_eq!(asked, [ranges[1], ranges[2], Range::ROOT]);
     map.release(ranges[5]).unwrap();
     assert_eq!(map.get(&[0x50; 32]), Ok(None));
@@ -910,11 +918,7 @@ fn a_store_is_asked_to_write_only_the_pages_it_lacks() {
     let model: BTreeMap<Digest, Vec<u8>> = (0..700).map(|_| (rng.crowded(), rng.value())).collect();
     let full = built(&model);
     let store = stored(&full);
-    let count = |map: &Map, base: &Map| {
-        let mut pages = Vec::new();
-        map.written(base, |range, hash| pages.push((range, hash)));
-        pages
-    };
+    let count = |map: &Map, base: &Map| map.written(base);
 
     // A map read from the store page by page has nothing to write, and one row changed
     // in it writes the leaf and its ancestors, not the pages it read to get there.
@@ -973,10 +977,11 @@ fn keys_that_share_a_prefix_deepen_one_path_and_removing_one_folds_it_back() {
             Proof::decode(&bytes, bytes.len()).unwrap().root(sha256),
             Ok((map.root(), 33))
         );
-        let mut interior = 0;
-        map.written(&Map::new(sha256, 0), |range, _| {
-            interior += usize::from(map.node(range).unwrap().1 > LEAF_ROWS as u64);
-        });
+        let interior = map
+            .written(&Map::new(sha256, 0))
+            .iter()
+            .filter(|(range, _)| map.node(*range).unwrap().1 > LEAF_ROWS as u64)
+            .count();
         assert_eq!(interior, shared + 1);
         assert_eq!(map.node(prefix(&keys[0], shared)).unwrap().1, 33);
 

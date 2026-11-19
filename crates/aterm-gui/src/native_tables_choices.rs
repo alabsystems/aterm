@@ -44,7 +44,11 @@ pub(crate) fn type_words(
     column: &SheetColumn,
     title: impl Fn(&str) -> Option<&'static str>,
 ) -> String {
-    let named = |target: &str| title(target).unwrap_or(target).to_owned();
+    // A reference's table by the page's name for its sheet, the column's link, where it has one.
+    let named = |target: &str| {
+        let target = column.links.as_deref().unwrap_or(target);
+        title(target).unwrap_or(target).to_owned()
+    };
     let words = match (column.compiled.map(|c| c.ty), &column.links) {
         (Some(ty), _) => ty_words(&ty, &named),
         // A count of the rows of another table that name this row.
@@ -88,6 +92,10 @@ fn ty_words(ty: &Ty, named: &dyn Fn(&str) -> String) -> String {
         Ty::SecretRef | Ty::Secret => "secret".into(),
         Ty::Key => "key".into(),
         Ty::Ref(target) => format!("\u{2192} {}", named(target)),
+        Ty::Link(link) => format!(
+            "\u{2192} {} in {}/{}",
+            link.collection, link.application, link.role
+        ),
         Ty::Set(Ty::Enum(words)) => format!("any of {}", words.len()),
         Ty::Set(Ty::Ref(target)) | Ty::List(Ty::Ref(target), _) => {
             format!("\u{2192} {}, several", named(target))
@@ -138,6 +146,7 @@ fn plural(ty: &Ty) -> Option<&'static str> {
         | Ty::Hex(_)
         | Ty::Digits(_)
         | Ty::Ref(_)
+        | Ty::Link(_)
         | Ty::Set(_)
         | Ty::List(..) => return None,
     })

@@ -14,6 +14,7 @@
 //! has no reason for silence) is [`Cell::Empty`].
 
 use super::read::{At, Harness, How, Limits, Load, OutSrc, Pair, Rate, State, Tally, Task};
+use crate::alab::journal::ModelBucket;
 use crate::relation::{Cell, Row, Schema, col, opt};
 use crate::typed::{Member, Ty, keys};
 use aterm_json::{Value, json};
@@ -618,6 +619,23 @@ pub struct SeenOn {
 /// The most Macs an account row's `seen_on` lists: the ones that sighted it last.
 pub const SEEN_ON_MAX: usize = 64;
 
+/// One model's own weekly wall standing on an account (FL-271), beside the account's own wall
+/// ([`AccountRow::walled`]) as `ai/limits`' `model_walls` stands beside its `wall`: the model's
+/// bucket, until when it stands, and when it was hit and the Mac that hit it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelWall {
+    /// The model's weekly bucket; `None` for a `7d-model` wall an older build noted, which names
+    /// no model and so walls neither the account nor any model it could name.
+    pub bucket: Option<ModelBucket>,
+    /// Until when it stands; `None` where no Mac stated an end.
+    pub until_ms: Option<u64>,
+    pub read: Stamp,
+}
+
+/// The most entries an account row's `model_walls` holds: one per bucket, and the wall an
+/// older build noted naming none.
+pub const MODEL_WALLS_MAX: usize = ModelBucket::ALL.len() + 1;
+
 /// One AI account: every registry row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountRow {
@@ -643,12 +661,20 @@ pub struct AccountRow {
     pub plan_mismatch: Option<bool>,
     pub w5h: WindowRow,
     pub w7d: WindowRow,
-    /// Whether a wall stands; `None` where the journal says nothing of the account.
+    /// Whether a wall every session of the account meets stands (FL-271): one of 5h, 7d, day,
+    /// month or credits, or of the week of a model no bucket names (`seven_day_other`, which the
+    /// harness takes as the whole account's); never a Fable, Opus or Sonnet week's, which is
+    /// that model's alone ([`Self::model_walls`]). `None` where the journal says nothing of the
+    /// account.
     pub walled: Option<bool>,
+    /// Until when that wall stands: the one that stands longest, one with no stated end the
+    /// longest of all.
     pub wall_until_ms: Option<u64>,
     /// The machine whose reading the newest figure is.
     pub read_by: Option<String>,
-    /// The next reset or wall end ahead of the fold.
+    /// The next reset of the 5-hour or 7-day window, or end of the account's own wall
+    /// ([`Self::walled`]), ahead of the fold; a model's wall's end is its own
+    /// ([`Self::model_walls`]).
     pub next_reset_ms: Option<u64>,
     /// The machines the registry's preferences expect it on, by rank.
     pub expected: Vec<MachineRef>,
@@ -680,6 +706,12 @@ pub struct AccountRow {
     /// The Macs that sighted it, at most [`SEEN_ON_MAX`] (the ones that did last), in the
     /// machines' order; `None` where no source of sightings was read.
     pub seen_on: Option<Vec<SeenOn>>,
+    /// Each model's own weekly wall standing on it (or on a workspace of it), one per bucket
+    /// in [`ModelBucket`]'s order after the one an older build noted naming none, each the
+    /// wall of its bucket that stands longest; a `seven_day_other` wall is here and is the
+    /// account's too ([`Self::walled`]), as `ai/limits` states it (FL-271). `None` where the
+    /// journal says nothing of the account.
+    pub model_walls: Option<Vec<ModelWall>>,
 }
 
 /// The type of a cell that names a machine as a fact's `by` does ([`Stamp::by`]): its label,
@@ -733,10 +765,19 @@ pub static ACCOUNTS: Schema = Schema {
             "current, reset-passed or unread",
         ),
         opt("w7d_at", Ty::Time, "when the 7-day window was read"),
-        opt("walled", Ty::Bool, "a limit stands"),
+        opt(
+            "walled",
+            Ty::Bool,
+            "a limit every session meets stands (5h, 7d, day, month, credits, or the week of a \
+             model no bucket names); a model's own week's is in model_walls",
+        ),
         opt("wall_until", Ty::Time, "until when it stands"),
         opt("read_by", Ty::Text(32), "the machine that read the figure"),
-        opt("next_reset", Ty::Time, "the next reset or wall end ahead"),
+        opt(
+            "next_reset",
+            Ty::Time,
+            "the next reset, or end of the account's own limit, ahead",
+        ),
         col(
             "expected",
             Ty::List(&MAC, 64),
@@ -837,6 +878,36 @@ pub static ACCOUNTS: Schema = Schema {
         opt("wall_at", Ty::Time, "when the standing limit was hit"),
         opt("wall_by", MAC, "the machine that hit it"),
         opt("last_seen_by", MAC, "the machine of the newest sighting"),
+        opt(
+            "model_walls",
+            Ty::List(
+                &Ty::Struct(&[
+                    Member {
+                        name: "bucket",
+                        ty: Ty::Enum(ModelBucket::WORDS),
+                        null: true,
+                    },
+                    Member {
+                        name: "until",
+                        ty: Ty::Time,
+                        null: true,
+                    },
+                    Member {
+                        name: "at",
+                        ty: Ty::Time,
+                        null: false,
+                    },
+                    Member {
+                        name: "by",
+                        ty: MAC,
+                        null: false,
+                    },
+                ]),
+                MODEL_WALLS_MAX,
+            ),
+            "each model's own weekly limit standing, by its bucket (none for an older build's \
+             7d-model limit, which names no model), until when, when hit and by which machine",
+        ),
     ],
 };
 
@@ -948,6 +1019,21 @@ impl Row for AccountRow {
             (None, Some(_)) => Cell::Empty,
             (seen, _) => Cell::read(seen.as_ref().map(|seen| seen.by.clone())),
         });
+        cells.push(Cell::read(self.model_walls.as_ref().map(|walls| {
+            Value::Array(
+                walls
+                    .iter()
+                    .map(|wall| {
+                        json!({
+                            "bucket": wall.bucket.map(ModelBucket::word),
+                            "until": wall.until_ms,
+                            "at": wall.read.at_ms,
+                            "by": wall.read.by,
+                        })
+                    })
+                    .collect(),
+            )
+        })));
         cells
     }
 }

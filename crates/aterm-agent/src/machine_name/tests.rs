@@ -1050,30 +1050,309 @@ fn an_undo_of_a_followed_number_queues_the_number_it_restores() {
     assert_eq!(renumber(&root, Some("m86"), NOW + 4), None);
 }
 
+/// An invalid bound registry name stops first creation: no legacy evidence stands in for it, no
+/// noun is drawn and no partial name is kept.
 #[test]
-fn pending_or_invalid_bound_registry_names_refuse_first_creation_without_fallback() {
-    for source in [
+fn an_invalid_bound_registry_name_refuses_first_creation_without_fallback() {
+    let root = state();
+    write_private(root.path(), NAME_FILE, b"m7\n").expect("a tempting legacy fallback");
+    let refused = ensure_from(
+        root.path(),
+        || RegistryNameRead::Bound(Err("the label is conflicted".to_owned())),
+        unread,
+        |_| panic!("an unavailable registry name needs no draw"),
+        NOW,
+    )
+    .expect_err("an invalid bound name refuses");
+    assert!(
+        refused
+            .to_string()
+            .contains("the registry machine name is unavailable"),
+        "{refused}"
+    );
+    assert!(
+        file::read(root.path())
+            .expect("reads no partial name")
+            .is_none()
+    );
+}
+
+/// A registry not read yet names this Mac as no binding does: the first name is the legacy
+/// evidence's (`m7`, seeded, its migration pending), marked made unread, and stands for every
+/// later reader while the registry stays unread; a number an owner then writes to the row
+/// replaces the seeded one as any owner's number does ([`follow_number`]).
+/// NEGATIVE CONTROL: with `Pending` back among `ensure_from`'s refusing arms, the first read is an
+/// error (`a pending registry names this Mac`).
+#[test]
+fn a_pending_registry_names_this_mac_as_an_unbound_one_until_its_row_is_read() {
+    let root = state();
+    write_private(root.path(), NAME_FILE, b"m7\n").expect("legacy evidence");
+    let (name, origin) = ensure_from(
+        root.path(),
+        || RegistryNameRead::Pending,
+        no_roster,
+        never,
+        NOW,
+    )
+    .expect("a pending registry names this Mac");
+    assert_eq!((name.num, origin), (Some(num(7)), Origin::Evidence));
+    assert_eq!(name.migration, Some(Migration::Pending));
+    assert!(name.registry_unread, "made while the registry was unread");
+    assert_eq!(file::read(root.path()).expect("reads"), Some(name.clone()));
+    assert_eq!(
+        ensure_from(
+            root.path(),
+            || RegistryNameRead::Pending,
+            unread,
+            |_| panic!("a kept name draws nothing"),
+            NOW + 1,
+        )
+        .expect("the name stands"),
+        (name, Origin::Kept)
+    );
+    let read = renumber(&root, Some("m86"), NOW + 2).expect("the row's number replaces it");
+    assert_eq!(read.num, Some(num(86)));
+    assert!(!read.registry_unread, "a followed number is the name's own");
+}
+
+/// A NAME MADE WHILE THE REGISTRY WAS UNREAD TAKES ITS ROW'S NAME AT THE FIRST READ THAT FINDS
+/// THE ROW, WHOEVER WROTE IT: a stale roster label (`m7`, seeded) and a drawn noun give way to
+/// the row's number and nickname though an import or a registration wrote both (`label_auto`,
+/// an automatic nickname), which [`follow_number`] and [`follow_registry`] never take, as a first
+/// read that found the row would have named this Mac: one revision, with no alias of the number
+/// made meanwhile (who wrote the row is the row's own history). Later reads keep it and ask the
+/// registry no more.
+/// NEGATIVE CONTROL: with `ensure_from` answering a kept name at once (no [`settled`]), the name
+/// stays `m7` and its drawn noun (`takes the row's name`).
+#[test]
+fn a_name_made_while_the_registry_was_unread_takes_its_rows_name_whoever_wrote_it() {
+    let root = state();
+    let (made, _) = ensure_from(
+        root.path(),
+        || RegistryNameRead::Pending,
+        label("m7"),
+        never,
+        NOW,
+    )
+    .expect("made while unread");
+    assert_eq!(made.num, Some(num(7)));
+    assert_eq!(
+        renumber(&root, None, NOW + 1),
+        None,
+        "an imported or automatic label renumbers nothing through the owner's follow"
+    );
+    let (name, origin) = ensure_from(
+        root.path(),
+        || registry_name(40, Some(("Heron", NickClass::Auto))),
+        unread,
+        |_| panic!("the row's nickname needs no draw"),
+        NOW + 2,
+    )
+    .expect("the registry is read");
+    assert_eq!(
+        (name.title().as_str(), origin),
+        ("m40 Heron", Origin::Registry),
+        "takes the row's name"
+    );
+    assert_eq!(
+        (name.class, name.since, name.migration, name.nick_class),
+        (Class::Seeded, IMPLIED_SINCE, None, NickClass::Auto)
+    );
+    assert_eq!(
+        seen(&name),
+        Some(None),
+        "an automatic nickname is no chosen one"
+    );
+    assert!(!name.registry_unread);
+    assert!(name.was.is_empty(), "no alias of the number made unread");
+    assert_eq!((name.prev, name.rev), (Some(num(7)), made.rev + 1));
+    assert_eq!(file::read(root.path()).expect("reads"), Some(name.clone()));
+    assert_eq!(
+        ensure_from(
+            root.path(),
+            || panic!("a settled name asks the registry no more"),
+            unread,
+            |_| panic!("a kept name draws nothing"),
+            NOW + 3,
+        )
+        .expect("the name stands"),
+        (name, Origin::Kept)
+    );
+}
+
+/// A WORD-VALUED `fleet-name` MADE THE NICKNAME WHILE THE REGISTRY WAS UNREAD GIVES WAY TO THE
+/// ROW'S: `unnumbered otter`, its nickname chosen, would keep `otter` on a first look of
+/// [`follow_registry`] and take no number from a row it does not name, so the first read that
+/// finds the row takes both (`m86 Badger`, still chosen, the row seen), and a follow of the same
+/// row then moves nothing. A row with no nickname leaves the noun the name has.
+/// NEGATIVE CONTROL: as above, with no [`settled`] the name stays `unnumbered otter`.
+#[test]
+fn a_chosen_nickname_made_while_the_registry_was_unread_gives_way_to_the_rows() {
+    let root = state();
+    write_private(root.path(), NAME_FILE, b"otter\n").expect("a word-valued fleet-name");
+    let (made, origin) = ensure_from(
+        root.path(),
+        || RegistryNameRead::Pending,
+        no_roster,
+        never,
+        NOW,
+    )
+    .expect("made while unread");
+    assert_eq!(
+        (made.title().as_str(), made.nick_class, origin),
+        ("unnumbered otter", NickClass::Chosen, Origin::Evidence)
+    );
+    let (name, origin) = ensure_from(
+        root.path(),
+        || registry_name(86, Some(("Badger", NickClass::Chosen))),
+        unread,
+        |_| panic!("the row's nickname needs no draw"),
+        NOW + 1,
+    )
+    .expect("the registry is read");
+    assert_eq!(
+        (name.title().as_str(), name.nick_class, origin),
+        ("m86 Badger", NickClass::Chosen, Origin::Registry)
+    );
+    assert_eq!(
+        seen(&name),
+        Some(Some("Badger")),
+        "it saw the row it came from"
+    );
+    assert_eq!(
+        registry::with_row(Some("Badger"), || follow_registry(root.path()))
+            .expect("follows the row"),
+        None,
+        "the row's own nickname moves nothing"
+    );
+
+    let root = state();
+    let (made, _) = ensure_from(
+        root.path(),
+        || RegistryNameRead::Pending,
+        label("m7"),
+        never,
+        NOW,
+    )
+    .expect("made while unread");
+    let (name, origin) = ensure_from(
+        root.path(),
+        || registry_name(40, None),
+        unread,
+        |_| panic!("a row with no nickname draws no new noun"),
+        NOW + 1,
+    )
+    .expect("the registry is read");
+    assert_eq!(origin, Origin::Registry);
+    assert_eq!((name.num, &name.nick), (Some(num(40)), &made.nick));
+}
+
+/// A NAME MADE WHILE THE REGISTRY WAS UNREAD STANDS WHERE THE REGISTRY, READ, BINDS NO ROW TO THIS
+/// MAC, OR A CHANGE WAS MADE SINCE: a pending read or an invalid bound name leaves it marked
+/// for a later read; an unbound read keeps it as an unbound Mac's, with no new revision, so a row
+/// that binds this Mac later is followed as for any unbound Mac's name and never replaces it as a
+/// first name; and a person's rename, or a nickname a read followed from the row, meanwhile
+/// makes the name this Mac's own.
+/// NEGATIVE CONTROL: with the unbound arm of [`settled`] leaving the mark, the later bound row
+/// renames the Mac (`stands as an unbound Mac's`); with [`file::MachineName::made_own`] left out
+/// of `edit_name` or of `followed`, the rename or the followed nickname stays marked.
+#[test]
+fn a_name_made_unread_stands_where_no_row_binds_this_mac_or_a_change_was_made() {
+    let root = state();
+    let (made, _) = ensure_from(
+        root.path(),
+        || RegistryNameRead::Pending,
+        label("m7"),
+        never,
+        NOW,
+    )
+    .expect("made while unread");
+    for read in [
         RegistryNameRead::Pending,
         RegistryNameRead::Bound(Err("the label is conflicted".to_owned())),
     ] {
-        let root = state();
-        write_private(root.path(), NAME_FILE, b"m7\n").expect("a tempting legacy fallback");
-        assert!(
-            ensure_from(
-                root.path(),
-                || source,
-                unread,
-                |_| panic!("an unavailable registry name needs no draw"),
-                NOW
-            )
-            .is_err()
-        );
-        assert!(
-            file::read(root.path())
-                .expect("reads no partial name")
-                .is_none()
+        assert_eq!(
+            ensure_from(root.path(), || read, unread, |_| panic!("no draw"), NOW + 1)
+                .expect("the name stands"),
+            (made.clone(), Origin::Kept)
         );
     }
+    let (name, origin) = ensure_from(
+        root.path(),
+        || RegistryNameRead::Unbound,
+        unread,
+        |_| panic!("no draw"),
+        NOW + 2,
+    )
+    .expect("the registry is read");
+    assert_eq!(origin, Origin::Kept);
+    assert!(!name.registry_unread);
+    assert_eq!(
+        (name.title(), name.rev),
+        (made.title(), made.rev),
+        "no new revision"
+    );
+    let (later, _) = ensure_from(
+        root.path(),
+        || registry_name(40, Some(("Heron", NickClass::Auto))),
+        unread,
+        |_| panic!("no draw"),
+        NOW + 3,
+    )
+    .expect("a later read");
+    assert_eq!(later.title(), made.title(), "stands as an unbound Mac's");
+
+    let root = state();
+    ensure_from(
+        root.path(),
+        || RegistryNameRead::Pending,
+        label("m7"),
+        never,
+        NOW,
+    )
+    .expect("made while unread");
+    let renamed = renick(&root, "Wren", None, NOW + 1);
+    assert!(!renamed.registry_unread, "a rename is the name's own");
+    let (name, origin) = ensure_from(
+        root.path(),
+        || registry_name(40, Some(("Heron", NickClass::Auto))),
+        unread,
+        |_| panic!("no draw"),
+        NOW + 2,
+    )
+    .expect("a later read");
+    assert_eq!((name, origin), (renamed, Origin::Kept));
+
+    // A nickname a person wrote to the row and a read followed is the name's own as well.
+    let root = state();
+    let (made, _) = ensure_from(
+        root.path(),
+        || RegistryNameRead::Pending,
+        label("m7"),
+        never,
+        NOW,
+    )
+    .expect("made while unread");
+    assert_eq!(
+        made.nick_class,
+        NickClass::Auto,
+        "a drawn noun follows the row"
+    );
+    let followed = follow(&root, Some("Wren"));
+    assert_eq!(followed.nick.as_str(), "Wren");
+    assert!(
+        !followed.registry_unread,
+        "a followed nickname is the name's own"
+    );
+    let (name, origin) = ensure_from(
+        root.path(),
+        || registry_name(40, Some(("Heron", NickClass::Auto))),
+        unread,
+        |_| panic!("no draw"),
+        NOW + 2,
+    )
+    .expect("a later read");
+    assert_eq!((name, origin), (followed, Origin::Kept));
 }
 
 #[test]
@@ -1096,9 +1375,16 @@ fn an_unbound_registry_preserves_the_existing_fallback_order() {
 fn a_concurrent_local_winner_overrides_registry_pending_or_invalid_results() {
     use aterm_uds::private_file::PrivateLock;
     use std::time::Duration;
-    for source in [
-        RegistryNameRead::Pending,
-        RegistryNameRead::Bound(Err("the label is conflicted".to_owned())),
+    // A pending registry prepares a first name as an unbound one does, reading the roster; an
+    // invalid bound one prepares only its refusal.
+    let unbound_roster: fn() -> io::Result<Option<String>> = no_roster;
+    let refused_roster: fn() -> io::Result<Option<String>> = unread;
+    for (source, roster) in [
+        (RegistryNameRead::Pending, unbound_roster),
+        (
+            RegistryNameRead::Bound(Err("the label is conflicted".to_owned())),
+            refused_roster,
+        ),
     ] {
         let root = state();
         let winner = MachineName::unnumbered(Nickname::parse("Winner").expect("a nickname"), NOW);
@@ -1119,7 +1405,7 @@ fn a_concurrent_local_winner_overrides_registry_pending_or_invalid_results() {
             source
         };
         assert_eq!(
-            ensure_from(root.path(), registry, unread, never, NOW)
+            ensure_from(root.path(), registry, roster, never, NOW)
                 .expect("the valid winner stands"),
             (winner.clone(), Origin::Kept)
         );
@@ -2631,8 +2917,11 @@ fn a_move_judged_without_the_vault_s_labels_is_refused() {
     assert_eq!(refused.cause, Cause::Moved, "{refused}");
 }
 
+/// A known automatic starting nickname keeps the peer's Kestrel and Otter controls distinct
+/// and exercises the case where a proposed rename to Heron would keep the old name.
 fn renamed_from_m7(root: &aterm_tempfile::TempDir) -> (MachineName, MachineName) {
-    let (before, _) = ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    let (before, _) = ensure(root.path(), label("m7"), |noun| noun != "heron", NOW)
+        .expect("m7 with automatic nickname Heron");
     let to = NameTo {
         num: num(86),
         nick: Some(Nickname::parse("MissBunny").expect("a nickname")),
@@ -3104,9 +3393,10 @@ fn undo_is_refused_when_another_mac_now_carries_the_old_nickname() {
         .name;
     assert_eq!(back.title(), before.title());
 
+    let next = different_nickname(&back);
     let nicked = set_nick(
         root.path(),
-        &NickTo::Word(Nickname::parse("Heron").expect("a nickname")),
+        &NickTo::Word(next.clone()),
         ByKind::Person,
         unread,
         NOW + 3,
@@ -3114,7 +3404,7 @@ fn undo_is_refused_when_another_mac_now_carries_the_old_nickname() {
     )
     .expect("a nickname change")
     .name;
-    let seen = nickname_undo(&old, "Heron");
+    let seen = nickname_undo(&old, next.as_str());
     carries(&old, 5);
     refused(&seen, unreadable, NOW + 4);
     assert_eq!(file::read(root.path()).expect("reads"), Some(nicked));
@@ -3306,11 +3596,6 @@ fn a_preview_names_this_macs_node_only_once_it_has_one() {
     assert!(keyed.node().is_some(), "this Mac's node");
 }
 
-/// A drawn noun no test nickname is: a nickname change to `Heron` then always changes it.
-fn not_heron(word: &str) -> bool {
-    word.eq_ignore_ascii_case("heron")
-}
-
 /// What an undo of the name in `root` does as a dry run over `seen`, and its undo target: the
 /// title [`UndoTo::title`] names is the title the dry run gives.
 fn undo_titled(
@@ -3371,17 +3656,18 @@ fn an_undo_names_the_title_its_dry_run_gives() {
     );
 
     let nick = state();
-    let (seeded, _) = ensure(nick.path(), label("m7"), not_heron, NOW).expect("a seeded name");
+    let (seeded, _) = ensure(nick.path(), label("m7"), never, NOW).expect("a seeded name");
+    let next = different_nickname(&seeded);
     set_nick(
         nick.path(),
-        &NickTo::Word(Nickname::parse("Heron").expect("a nickname")),
+        &NickTo::Word(next.clone()),
         ByKind::Person,
         unread,
         NOW + 1,
         false,
     )
     .expect("a nickname change");
-    let (_, to, _) = undo_titled(&nick, &nickname_undo(&seeded.display_nick(), "Heron"));
+    let (_, to, _) = undo_titled(&nick, &nickname_undo(&seeded.display_nick(), next.as_str()));
     assert!(matches!(to, UndoTo::Nickname(_)), "{to:?}");
 }
 
@@ -3679,10 +3965,11 @@ fn an_undo_publishes_the_number_it_takes_back_or_the_chosen_one_it_keeps() {
     );
 
     let fresh = state();
-    let (first, _) = ensure(fresh.path(), label("m7"), not_heron, NOW).expect("a seeded name");
+    let (first, _) = ensure(fresh.path(), label("m7"), never, NOW).expect("a seeded name");
+    let next = different_nickname(&first);
     let seeded = set_nick(
         fresh.path(),
-        &NickTo::Word(Nickname::parse("Heron").expect("a nickname")),
+        &NickTo::Word(next.clone()),
         ByKind::Person,
         unread,
         NOW + 1,
@@ -3691,7 +3978,7 @@ fn an_undo_publishes_the_number_it_takes_back_or_the_chosen_one_it_keeps() {
     .expect("a nickname change")
     .name;
     assert_eq!(seeded.class, Class::Seeded);
-    let nick_back = nickname_undo(&first.display_nick(), "Heron");
+    let nick_back = nickname_undo(&first.display_nick(), next.as_str());
     assert_eq!(undo_publishes(&seeded, &nick_back), None, "a seeded number");
     let mut auto = seeded;
     auto.class = Class::Auto;

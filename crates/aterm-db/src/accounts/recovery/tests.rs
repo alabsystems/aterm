@@ -277,6 +277,56 @@ fn another_account_and_an_unchanged_retry_cannot_hide_pending_recovery() {
     assert_eq!(db.pending_at(NOW).unwrap().len(), 2);
 }
 
+/// An old recoveries period whose storage cannot be deleted (a directory left open to others,
+/// which retirement refuses to remove) costs no recovery publication: three days on, the request
+/// is published into the new day's table from the state the unfinished retirement left written
+/// (`Directory::retired`), the one pass counted (`Event::Unretired`), and the old period's
+/// storage stays as it was.
+/// MUTANT (`ring::RETIRE_FAILURE_STOPS`): the retirement's failure fails the publication, as
+/// before 2026-11-18, and nothing is pending.
+/// NEGATIVE CONTROL (a source edit, run and undone): `request_with_caps_at` retiring by
+/// `directory.retire(..)?` fails the publication the same way (`the request is published`).
+#[test]
+fn an_old_recoveries_period_that_cannot_be_deleted_costs_no_recovery_publication() {
+    use crate::{
+        catalog::ring::RETIRE_FAILURE_STOPS,
+        runtime::census::{Event, cadence_here},
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    for mutant in [false, true] {
+        let lab = Lab::new(&[Role::Writer]);
+        let db = Recovery::at(lab.paths[0].clone());
+        db.request_at([1; 32], [2; 32], [3; 16], NOW).unwrap();
+        let directory = Directory::new(&lab.paths[0], lab.bootstrap(0).trust());
+        let old = RECOVERIES
+            .scope(directory.trust(), RECOVERIES.epoch_of(NOW))
+            .unwrap();
+        let stuck = directory.path(old).unwrap();
+        assert!(stuck.is_dir(), "CONTROL: the first day's table is stored");
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let later = NOW + 3 * 86_400;
+        let before = cadence_here().get(Event::Unretired);
+        RETIRE_FAILURE_STOPS.with(|flag| flag.set(mutant));
+        let published = db.request_at([1; 32], [2; 32], [4; 16], later);
+        RETIRE_FAILURE_STOPS.with(|flag| flag.set(false));
+        let counted = cadence_here().get(Event::Unretired) - before;
+        let pending = db.pending_at(later).unwrap().len();
+        assert!(stuck.is_dir(), "the old period's storage stays");
+        if mutant {
+            assert!(
+                published.is_err(),
+                "MUTANT: the retirement fails the publication"
+            );
+            assert_eq!((counted, pending), (0, 0), "MUTANT: no pass went on");
+        } else {
+            published.expect("the request is published");
+            assert_eq!(counted, 1, "the one unfinished retirement is counted");
+            assert_eq!(pending, 1, "the request is pending in the new day's table");
+        }
+    }
+}
+
 #[test]
 fn an_invalid_unrelated_intent_does_not_block_a_current_recovery() {
     use crate::accounts::{

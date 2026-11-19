@@ -201,7 +201,11 @@ impl Proposals {
         )
     )]
     pub fn write(&self, request: [u8; 16], changes: Vec<Change>) -> Result<Receipt> {
-        let command = Command::Write { request, changes };
+        let command = Command::Write {
+            request,
+            changes,
+            said: None,
+        };
         let payload = encode(&command)?;
         self.with_store(true, |session, store, scope| {
             session.writer()?;
@@ -305,6 +309,7 @@ impl Proposals {
                 key: key.into(),
                 value: Some(value),
             }],
+            said: None,
         };
         self.with_store(false, |session, store, scope| {
             conditional_write(session, store, scope, &command, |_, _| Ok(expected))

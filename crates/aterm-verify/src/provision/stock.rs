@@ -31,7 +31,9 @@ pub const LINUX_LANE_TARGETS: [&str; 1] = ["aarch64-unknown-linux-musl"];
 /// universal binary's x86_64 slice, `ship check --compat` (and `verify watch`'s stage that
 /// rehearses it) and a Linux worker's static bootstrap verifier with that release by name in
 /// `RUSTUP_TOOLCHAIN`, records its `rustc -vV`, and `ship provision`'s `x86 slice` probes it.
-/// This row puts it in place, so `ship provision`, which runs this row, readies a release host.
+/// This row puts it in place, so `ship provision`, which runs this row, readies a release host;
+/// a real cut and a Linux release worker put the release their commit's lock names in place
+/// alone ([`run_release`]) before anything reads or builds on it.
 ///
 /// `Ok(None)`: the checkout carries no `trust.lock`, as a public snapshot does (its manifest ships
 /// none), so the row has no release-chain part there ([`lockless_note`]) and the stock pin is
@@ -290,6 +292,21 @@ pub(crate) fn argv(step: &Step) -> Vec<String> {
     }
 }
 
+/// The rustup command line that puts the release chain's toolchain `release` in place with
+/// [`RELEASE_TARGETS`]' stds, as [`run_release`] runs it where rustup's home lacks it: what a
+/// caller names, beside `verify provision rustup` in a checkout whose lock names `release`
+/// (which also places the rustup row's copy), for a release other than its own checkout's lock
+/// names, such as the commit `ship check --compat --commit REV` checks or a Linux worker's claim
+/// commit; `verify provision rustup` in a checkout whose lock names another installs that one.
+#[must_use]
+pub fn release_install(release: &str) -> String {
+    argv(&Step::ReleaseToolchain(
+        release.to_string(),
+        RELEASE_TARGETS.iter().map(|t| (*t).to_string()).collect(),
+    ))
+    .join(" ")
+}
+
 /// Where rustup's toolchains live, and how the `rustup` row is resolved, read once:
 /// rustup's own rules for its homes (`$RUSTUP_HOME`, else `~/.rustup`; `$CARGO_HOME`, else
 /// `~/.cargo`), which every child is handed, and the row's lookup ([`Lookup`]).
@@ -492,19 +509,74 @@ pub fn run(
             None
         }
     };
+    acquire(
+        homes,
+        rustup,
+        pin.as_deref(),
+        &pin_targets(linux),
+        release.as_deref(),
+        failed,
+        report,
+    )
+}
+
+/// The row's release-chain part alone, for the stock release `release` a caller read of the
+/// commit it builds (a cut's candidate, a Linux worker's claim commit: its `trust.lock`'s
+/// `[stock] toolchain`), whatever the lock of the checkout this runs in names: that release with
+/// [`RELEASE_TARGETS`]' stds, acquired where rustup's home lacks it with the rustup the row
+/// resolves (auto-install off first in a home rustup never ran in), and nothing of the stock
+/// pin. A real cut runs it before anything reads that release (its build-inputs seal, step 1's
+/// x86 slice probe), and a Linux release worker before it builds its static bootstrap verifier.
+/// Each step is said, and a step that fails is said with why; after its steps it observes the
+/// home again, and what is still missing is a failure.
+///
+/// # Errors
+/// Returns an error naming every step that failed and what is still missing after them, or the
+/// rustup the row could not resolve.
+pub fn run_release(
+    release: &str,
+    homes: &Homes,
+    rustup: &dyn Rustup,
+    report: &mut dyn FnMut(&str),
+) -> Result<Vec<String>, String> {
+    acquire(homes, rustup, None, &[], Some(release), Vec::new(), report)
+}
+
+/// What [`run_release`] would run for `release` on this machine, read only through the rustup
+/// the row resolves: each rustup command line in order, empty where the release is in place
+/// with its stds.
+///
+/// # Errors
+/// What [`run_release`] refuses before it changes anything: no rustup the row resolves.
+pub fn missing_release(
+    release: &str,
+    homes: &Homes,
+    rustup: &dyn Rustup,
+) -> Result<Vec<String>, String> {
+    missing(homes, rustup, None, Some(release), false)
+        .map_err(|absent| format!("no rustup to drive — {absent}"))
+}
+
+/// Acquire, through the rustup the row resolves, what rustup's home lacks of the stock pin
+/// `pin` with `pin_targets`' stds (nothing of it where `None`) and of the release chain's
+/// toolchain `release` (nothing of it where `None`), after the refusals `failed` already holds,
+/// then observe the home again: a step still planned there is a failure too.
+fn acquire(
+    homes: &Homes,
+    rustup: &dyn Rustup,
+    pin: Option<&str>,
+    pin_targets: &[&str],
+    release: Option<&str>,
+    mut failed: Vec<String>,
+    report: &mut dyn FnMut(&str),
+) -> Result<Vec<String>, String> {
     let bin = homes.rustup().map_err(|absent| {
         failed.push(format!("no rustup to drive — {absent}"));
         failed.join("; ")
     })?;
-    let seen = observe(homes, &bin, rustup, pin.as_deref(), release.as_deref());
+    let seen = observe(homes, &bin, rustup, pin, release);
     let mut acquired = Vec::new();
-    for step in plan(
-        &seen,
-        pin.as_deref(),
-        &pin_targets(linux),
-        release.as_deref(),
-        RELEASE_TARGETS,
-    ) {
+    for step in plan(&seen, pin, pin_targets, release, RELEASE_TARGETS) {
         let args = &argv(&step)[1..];
         match rustup.run(homes, &bin, args, None) {
             Ok(_) => {
@@ -519,14 +591,8 @@ pub fn run(
             )),
         }
     }
-    let after = observe(homes, &bin, rustup, pin.as_deref(), release.as_deref());
-    for step in plan(
-        &after,
-        pin.as_deref(),
-        &pin_targets(linux),
-        release.as_deref(),
-        RELEASE_TARGETS,
-    ) {
+    let after = observe(homes, &bin, rustup, pin, release);
+    for step in plan(&after, pin, pin_targets, release, RELEASE_TARGETS) {
         failed.push(format!(
             "still missing after provisioning: {}",
             argv(&step).join(" ")

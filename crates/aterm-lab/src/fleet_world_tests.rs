@@ -64,7 +64,11 @@ fn a_failed_version_probe_keeps_the_copied_image() {
     scratch.ran();
 }
 
-/// A member's descriptors are counted from its table; a reaped one is left out.
+/// A member's descriptors are counted from its table; a reaped one is left out. The table is
+/// read until the member's exec has closed what it was forked with: between spawnfd's fork and
+/// the child's exec, the child still holds the descriptors that close on exec, and a loaded Mac
+/// stretches that span (a full verify land read 7 where the exec leaves 3). A count that never
+/// comes down to stdin, stdout and stderr fails as a hang, naming the last count read.
 #[test]
 fn a_members_descriptors_are_counted_and_a_gone_one_left_out() {
     let mut child = aterm_uds::spawnfd::command("/bin/sleep")
@@ -73,9 +77,23 @@ fn a_members_descriptors_are_counted_and_a_gone_one_left_out() {
         .spawn()
         .expect("spawn a member");
     let pid = i32::try_from(child.id()).unwrap();
-    let counted = open_fds(&[pid]);
+    let mut last = None;
+    let execed = aterm_spec::wait::within_while_working(
+        child.id(),
+        aterm_spec::wait::MUST_HAPPEN,
+        aterm_spec::wait::WORKING_GUARD,
+        std::time::Duration::from_millis(10),
+        || {
+            last = open_fds(&[pid]).get(&pid).copied();
+            (last == Some(3)).then_some(())
+        },
+    );
     let _ = child.kill();
     let _ = child.wait();
-    assert_eq!(counted.get(&pid), Some(&3), "stdin, stdout and stderr");
+    if let Err(why) = execed {
+        panic!(
+            "the member's table read {last:?} descriptors, not stdin, stdout and stderr ({why:?})"
+        );
+    }
     assert!(open_fds(&[pid]).is_empty(), "reaped");
 }

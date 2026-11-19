@@ -29,6 +29,7 @@ fn plain(n: usize) -> Vec<TabStripMetadata> {
             attention: ChipLevel::Off,
             conn: None,
             closable: true,
+            panel_numbers: false,
             team: TabTeam::NONE,
         };
         n
@@ -365,6 +366,7 @@ fn rename_segment_is_left_uncovered_for_the_cell_well() {
         caption_hovered: None,
         subtitle: None,
         rename: Some(StripRenameField {
+            selected_all: false,
             tab: 0,
             text: "alp",
             cursor: 3,
@@ -1039,7 +1041,8 @@ fn a_tabs_want_seats_its_title_and_ignores_a_spinner() {
         label(TabSizing {
             cap: MAX_CHIP_COLS,
             grow: 48,
-            wants: &wants
+            wants: &wants,
+            ..TabSizing::FIXED
         }),
         title,
         "the grown tab seats the whole title"
@@ -1543,6 +1546,7 @@ fn the_band_resolves_one_label_per_painted_chip() {
     let segments = layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
     let paint = StripPaint {
         rename: Some(StripRenameField {
+            selected_all: false,
             tab: 2,
             text: "renaming",
             cursor: 0,

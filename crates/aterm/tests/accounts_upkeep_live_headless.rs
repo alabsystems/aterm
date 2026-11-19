@@ -10,11 +10,12 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aterm_spec::wait::MUST_HAPPEN;
 
 use crate::headless_boot::{self, Instance};
+use crate::patience::Patience;
 
 /// The network witness's jail (SBPL, the last rule that matches wins): a name
 /// lookup (the resolver's socket), or an IP connection to anything but IPv4
@@ -148,18 +149,19 @@ fn log_tail(inst: &Instance) -> String {
 /// waited for under the hang detector.
 #[track_caller]
 fn upkeep_word(inst: &mut Instance) -> String {
-    let until = Instant::now() + MUST_HAPPEN;
+    let mut patience = Patience::new(MUST_HAPPEN);
     loop {
         let log = instance_log(inst);
         if let Some(line) = log.lines().find(|l| l.contains("accounts-upkeep=")) {
             return line.to_owned();
         }
         alive(inst);
-        assert!(
-            Instant::now() < until,
-            "the accounts' upkeep never said what it found; log tail:\n{}",
-            log_tail(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the accounts' upkeep never said what it found ({why}); log tail:\n{}",
+                log_tail(inst)
+            );
+        }
         std::thread::sleep(headless_boot::POLL_GAP);
     }
 }
@@ -211,14 +213,15 @@ fn loopback_config(port: u16) -> String {
 /// activation wake is armed: the upkeep's first kick is behind it.
 #[track_caller]
 fn wake_armed(inst: &mut Instance) {
-    let until_at = Instant::now() + MUST_HAPPEN;
+    let mut patience = Patience::new(MUST_HAPPEN);
     while !instance_log(inst).contains("the activation wake is armed") {
         alive(inst);
-        assert!(
-            Instant::now() < until_at,
-            "the activation wake was never armed; log tail:\n{}",
-            log_tail(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the activation wake was never armed ({why}); log tail:\n{}",
+                log_tail(inst)
+            );
+        }
         std::thread::sleep(headless_boot::POLL_GAP);
     }
 }
@@ -273,12 +276,11 @@ fn loopback_source(
 /// Wait, under the hang detector, until `ready` holds.
 #[track_caller]
 fn until(what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + MUST_HAPPEN;
+    let mut patience = Patience::new(MUST_HAPPEN);
     while !ready() {
-        assert!(
-            Instant::now() < deadline,
-            "{what}: not within the hang detector"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("{what}: not reached ({why})");
+        }
         std::thread::sleep(headless_boot::POLL_GAP);
     }
 }

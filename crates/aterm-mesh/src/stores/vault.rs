@@ -39,8 +39,11 @@ impl VaultStores {
         }
     }
 
+    /// The membership log as the members lane reads it: an empty log for a Mac whose records
+    /// are past format 1, which neither feeds nor takes the lane
+    /// (`aterm_secrets::client::mesh_members`, ATERM-KI-1116-1471).
     fn members(&self) -> io::Result<aterm_secrets::membership_log::Store> {
-        aterm_secrets::client::load_records(self.db.paths())
+        aterm_secrets::client::mesh_members(self.db.paths())
             .map_err(|e| io::Error::other(e.to_string()))
     }
 }
@@ -172,6 +175,25 @@ impl Stores for VaultStores {
         Ok((records, log.held_count()))
     }
 
+    fn members_generation(&self) -> io::Result<super::Generation> {
+        let generation = self
+            .db
+            .paths()
+            .records_generation()
+            .map_err(io::Error::other)?;
+        Ok(super::Generation {
+            number: generation.number,
+            rewrite: generation.rewrite,
+        })
+    }
+
+    /// A record's own id, read off its bytes: a version-2 record's is that of its shed frame,
+    /// so it is one id whole and shed. Bytes that frame no record (the store holds none such)
+    /// are known by their digest.
+    fn member_id(&self, wire: &[u8]) -> Digest {
+        aterm_secrets::membership_log::record_id(wire).unwrap_or_else(|| super::digest(wire))
+    }
+
     fn tables(&self) -> io::Result<BTreeSet<Digest>> {
         self.db.tables().map_err(|e| io_of(&e))
     }
@@ -204,6 +226,11 @@ impl Stores for VaultStores {
         self.db
             .table_proof_wires(table, keys)
             .map_err(|e| io_of(&e))
+    }
+
+    fn members_lane(&self) -> io::Result<bool> {
+        aterm_secrets::client::members_lane_open(self.db.paths())
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     fn members_inventory(&self) -> io::Result<BTreeSet<Digest>> {
@@ -255,7 +282,7 @@ fn install() {
         });
         aterm_secrets::membership_log::on_written(|written| {
             if let Some(egress) = sinks::open() {
-                egress.feed(members_feed(written.store, egress.members_cursor()));
+                egress.feed(written_feed(written, egress.members_cursor().from));
             } else if let Some(state_dir) = WAKE_TO.get() {
                 let length = written
                     .store
@@ -293,16 +320,24 @@ fn table_feed(appended: &aterm_db::table::store::Appended<'_>) -> Feed {
     }
 }
 
-/// What one durable write of the records file tells the egress in this process: the complete
-/// records from the egress's cursor on.
-fn members_feed(store: &aterm_secrets::membership_log::Store, cursor: Option<usize>) -> Feed {
-    let Some(log) = store.log() else {
+/// What one durable write of the records file tells the egress in this process, whose members
+/// cursor has stepped past `from` records: the complete records from there on, and the rewrite
+/// generation the write says it was made under
+/// (`aterm_secrets::membership_log::Written::generation`), handed on as it is. The egress
+/// takes the records only where that is the generation its cursor counts, and reads the store
+/// itself otherwise ([`crate::egress::MembersCursor`]): a hook that named another would have
+/// every write's records dropped and the records file read in their place.
+fn written_feed(written: &aterm_secrets::membership_log::Written<'_>, from: usize) -> Feed {
+    let generation = super::Generation {
+        number: written.generation.number,
+        rewrite: written.generation.rewrite,
+    };
+    let Some(log) = written.store.log() else {
         return Feed::Members {
             length: 0,
             records: None,
         };
     };
-    let from = cursor.unwrap_or(0);
     // A shelved record that does not read back leaves the records unknown: the egress reads
     // them itself, and fails there.
     let records = log
@@ -313,7 +348,11 @@ fn members_feed(store: &aterm_secrets::membership_log::Store, cursor: Option<usi
         .ok();
     Feed::Members {
         length: log.held_count(),
-        records: records.map(|records| (from, records)),
+        records: records.map(|records| crate::egress::Handed {
+            from,
+            generation,
+            records,
+        }),
     }
 }
 

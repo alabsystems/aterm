@@ -345,7 +345,7 @@ fn a_led_table_is_the_next_rounds_before_the_scans_turn() {
     let mut round = |ours: &mut PeerRepair| {
         exchange_round(&endpoints[0], &endpoints[1], ours, &mut theirs);
         let report = ours.application().unwrap();
-        (selected(ours, &tables), report.witnesses_asked)
+        (selected(ours, &tables), report.witnesses_asked())
     };
     assert_eq!(
         round(&mut ours),
@@ -470,7 +470,7 @@ fn a_lead_past_a_lists_bound_is_not_kept() {
     }
     assert!(repair.lead(table(3)), "a table led already");
     assert!(!repair.lead(table(200)), "one past the bound is not kept");
-    assert!(repair.pending());
+    assert_eq!(repair.owed(), Some(Owed::Lead));
 
     // The tables a round leads because the lists newly share them have a bound of their own,
     // which leaves the scheduler's whole: a write here is led however many there are.
@@ -688,11 +688,11 @@ fn a_lead_outlives_a_round_that_breaks_off_before_its_table_is_exchanged() {
         exchange_round(&full[0], &full[1], &mut zero, &mut one);
         let took = zero.application().unwrap();
         if mutant {
-            assert!(took.regular, "MUTANT: the scan's turn");
+            assert!(took.regular(), "MUTANT: the scan's turn");
             continue;
         }
         assert_eq!(
-            (took.table, took.regular, took.sent),
+            (took.table, took.regular(), took.sent),
             (Some(digest), false, 1),
             "the table the broken round led"
         );
@@ -1000,7 +1000,7 @@ fn two_macs_dialling_each_other_ask_once_each_not_every_round() {
             let [a, b] = &mut repairs;
             let (ours, theirs) = if from == 0 { (a, b) } else { (b, a) };
             exchange_round(&endpoints[from], &endpoints[to], ours, theirs);
-            asked.push(ours.application().unwrap().witnesses_asked);
+            asked.push(ours.application().unwrap().witnesses_asked());
         }
         if echoes {
             assert_eq!(asked, [true; 6], "MUTANT: every round asks");
@@ -1012,5 +1012,130 @@ fn two_macs_dialling_each_other_ask_once_each_not_every_round() {
             );
         }
         assert_eq!(held(&lab, &tables, 2, 0), 1);
+    }
+}
+
+/// One round Mac `from` initiates with Mac `to` on endpoints whose ring clock reads `secs`: the
+/// table it took, by its place in `tables`, the turn that took it and why it asked
+/// ([`Report::turn`], [`Report::asked`]). The report's regular turn is its turn's.
+fn turned(
+    lab: &Lab,
+    tables: &[(Scope, [PathBuf; 2])],
+    secs: u64,
+    [from, to]: [usize; 2],
+    ours: &mut PeerRepair,
+    theirs: &mut PeerRepair,
+) -> (usize, Option<TableTurn>, Option<Ask>) {
+    let endpoints = [0, 1].map(|node| endpoint(lab, tables, node).with_ring_clock(secs));
+    exchange_round(&endpoints[from], &endpoints[to], ours, theirs);
+    let report = ours.application().unwrap();
+    assert_eq!(
+        report.regular(),
+        report.turn == Some(TableTurn::Regular),
+        "{report:?}"
+    );
+    (selected(ours, tables), report.turn, report.asked)
+}
+
+/// What a round this side initiates reports of the turn that took its table and of why it asked
+/// the peer which tables differ ([`Report::turn`], [`Report::asked`]), across real rounds.
+///
+/// A Mac whose peer wrote to two tables, one of them more than a [`BATCH`]: its first round asks
+/// as a first round and visits the first table that differs; a round within [`WITNESS_GAP_MS`]
+/// asks nothing and visits the other, a full batch; the round after the gap asks again and takes
+/// that table's next batch; an audit asks and takes the scan's turn; and once the peer asks this
+/// side in a round it began, this side's next round asks back. A table its peer cannot read is
+/// deferred and taken again by its retry; an audit asked of the round after a deferral asks, and
+/// no retry takes its table.
+/// MUTANT (`UNWITNESSED`): the first round's visit reads as the scan's turn.
+/// MUTANT (`AUDIT_FOLLOWS`): the audit's round takes the deferred table's retry.
+#[test]
+fn a_round_reports_which_turn_took_its_table_and_why_it_asked() {
+    use TableTurn::{Batch, Regular, Retry, Visit};
+    let start = 1_800_000_000;
+    let gap = WITNESS_GAP_MS / 1000;
+    for unwitnessed in [false, true] {
+        let lab = Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, 4);
+        write(&lab, &tables, 1, 1);
+        for _ in 0..=BATCH {
+            write(&lab, &tables, 3, 1);
+        }
+        let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
+        UNWITNESSED.with(|flag| flag.set(unwitnessed));
+        let first = turned(&lab, &tables, start, [0, 1], &mut ours, &mut theirs);
+        UNWITNESSED.with(|flag| flag.set(false));
+        if unwitnessed {
+            assert_eq!(
+                first,
+                (0, Some(Regular), Some(Ask::First)),
+                "MUTANT: the scan's turn"
+            );
+            continue;
+        }
+        assert_eq!(first, (1, Some(Visit), Some(Ask::First)));
+        let mut asked = Vec::new();
+        let mut clock = start + 60;
+        asked.push(turned(&lab, &tables, clock, [0, 1], &mut ours, &mut theirs));
+        clock += gap;
+        asked.push(turned(&lab, &tables, clock, [0, 1], &mut ours, &mut theirs));
+        ours.audit();
+        clock += 10;
+        asked.push(turned(&lab, &tables, clock, [0, 1], &mut ours, &mut theirs));
+        clock += gap;
+        turned(&lab, &tables, clock, [1, 0], &mut theirs, &mut ours);
+        clock += 10;
+        asked.push(turned(&lab, &tables, clock, [0, 1], &mut ours, &mut theirs));
+        assert_eq!(
+            asked,
+            [
+                (3, Some(Visit), None),
+                (3, Some(Batch), Some(Ask::Gap)),
+                (0, Some(Regular), Some(Ask::Audit)),
+                (1, Some(Regular), Some(Ask::Peer)),
+            ],
+            "a visit within the gap, a full batch's next after it, an audit, the peer's ask back"
+        );
+        assert_eq!(held(&lab, &tables, 3, 0), BATCH + 1);
+    }
+
+    for follows in [false, true] {
+        let lab = Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, 3);
+        std::fs::remove_file(tables[0].1[1].join("table.checkpoint")).unwrap();
+        let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
+        let mut rounds = Vec::new();
+        for _ in 0..5 {
+            rounds.push(turned(&lab, &tables, start, [0, 1], &mut ours, &mut theirs));
+        }
+        assert_eq!(
+            rounds,
+            [
+                (0, Some(Visit), Some(Ask::First)),
+                (0, Some(Retry), None),
+                (1, Some(Regular), None),
+                (2, Some(Regular), None),
+                (0, Some(Regular), None),
+            ],
+            "a deferred table's retry, once"
+        );
+        assert!(ours.application().unwrap().table_deferred);
+        ours.audit();
+        AUDIT_FOLLOWS.with(|flag| flag.set(follows));
+        let audit = turned(&lab, &tables, start, [0, 1], &mut ours, &mut theirs);
+        AUDIT_FOLLOWS.with(|flag| flag.set(false));
+        if follows {
+            assert_eq!(
+                audit,
+                (0, Some(Retry), Some(Ask::Audit)),
+                "MUTANT: the retry takes the audit's table"
+            );
+        } else {
+            assert_eq!(
+                audit,
+                (0, Some(Visit), Some(Ask::Audit)),
+                "the audit's visit"
+            );
+        }
     }
 }

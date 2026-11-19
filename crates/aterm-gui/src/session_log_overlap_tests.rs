@@ -444,7 +444,7 @@ fn drive_spawned() -> Seen {
     let h = test_handle(41);
     let store = new_store();
     during(&h.ctx.timeline, || {
-        store.write().unwrap().register(h.clone())
+        store.write().unwrap().register(h.clone());
     })
 }
 

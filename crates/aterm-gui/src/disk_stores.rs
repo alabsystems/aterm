@@ -65,13 +65,14 @@ pub(crate) fn specs(dirs: &OwnDirs) -> Vec<StoreSpec> {
     let mut out = Vec::new();
     if let Some(home) = dirs.home.as_deref() {
         let vault = aterm_secrets::client::Paths::locate_for_home(home);
+        // The bound of the store this Mac's format mark names: read off the mark alone, and
+        // format 1's where none is stored or it does not read.
+        let format = aterm_secrets::client::records_marked_format(&vault)
+            .unwrap_or(aterm_secrets::crossing::FORMAT_ONE);
         out.push(one(
             StoreWord::VaultRecords,
             vault.records_file(),
-            files(
-                aterm_secrets::membership_log::MAX_RECORDS_STREAM as u64,
-                AtBound::Refuses,
-            ),
+            files(aterm_secrets::crossing::capacity(format), AtBound::Refuses),
         ));
         out.push(one(StoreWord::VaultServed, vault.served(), None));
         out.push(StoreSpec {

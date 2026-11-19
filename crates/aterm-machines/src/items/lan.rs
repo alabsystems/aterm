@@ -36,8 +36,9 @@ use super::{Ctx, Item};
 use crate::model::{Effect, Probe};
 use crate::port::{Cloned, FileId, Scratch, System};
 use aterm_keeper::identity::CheckError;
+use aterm_types::macos_setup::refused::Failure;
 use aterm_uds::app_image;
-use aterm_uds::lan::{self, install};
+use aterm_uds::lan::{self, adoption, install};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -98,19 +99,20 @@ impl install::Files for Through<'_> {
         self.0.code_directories(path)
     }
 
-    fn canonical(&self, path: &Path) -> std::io::Result<PathBuf> {
-        self.0.canonicalize(path)
-    }
-
-    fn owner(&self, path: &Path) -> std::io::Result<u32> {
-        self.0.stat(path).map(|stat| stat.uid)
+    fn vm_guest(&self) -> Option<bool> {
+        self.0.vm_guest()
     }
 }
 
-/// The broker's install as `sys` reads it for the bundle it runs from, a job another bundle of
-/// its signer holds read as held: `None` off macOS or outside a bundle, else [`install::read`]'s
-/// answer. It decides what is asked for, never what an elevation installs ([`LanBroker`]'s
-/// probe reads [`install::read_own`]).
+/// Why a development build owns no broker on a real Mac ([`install::Part::Development`]).
+const DEVELOPMENT: &str = "a development build (no team signature) runs the LAN broker only in a \
+                           VM guest; a release's elevation installs it on this Mac";
+
+/// The broker's install as `sys` reads it for the bundle it runs from ([`install::read`]): `None`
+/// off macOS or outside a bundle. One reading decides both what is asked for and what an
+/// elevation installs: a development build reads [`install::Part::Development`] outside a VM
+/// guest, and an older build of the broker's signer reads a newer image
+/// [`install::Part::Kept`].
 #[must_use]
 pub fn reading(sys: &dyn System) -> Option<Result<install::Reading, String>> {
     if !sys.macos() {
@@ -118,6 +120,101 @@ pub fn reading(sys: &dyn System) -> Option<Result<install::Reading, String>> {
     }
     let source = sys.running_app()?;
     Some(install::read(&Through(sys), &source))
+}
+
+/// The account's side of the broker's adoption ([`adoption::Expecting`]), read through `sys`:
+/// its record in [`System::account_state_dir`] (none for root, whose elevation renews the image
+/// itself), the installed broker's hello of any protocol ([`System::installed_lan_broker`]: a
+/// broker an update's new protocol finds outdated still names its build; a direct path's is not
+/// the broker's), root's own refusal file, and `aterm_log` for the journal.
+struct Expecting<'a> {
+    sys: &'a dyn System,
+    record: Option<PathBuf>,
+}
+
+impl<'a> Expecting<'a> {
+    fn of(sys: &'a dyn System) -> Self {
+        let state = if sys.euid() == 0 {
+            None
+        } else {
+            sys.account_state_dir()
+        };
+        Self {
+            sys,
+            record: state.map(|dir| dir.join(adoption::RECORD)),
+        }
+    }
+}
+
+impl adoption::Expecting for Expecting<'_> {
+    fn now(&self) -> u64 {
+        self.sys.now()
+    }
+
+    fn record(&self) -> Option<std::io::Result<Vec<u8>>> {
+        self.record.as_ref().map(|path| {
+            let mut bytes = self.sys.read_file(path)?;
+            bytes.truncate(adoption::RECORD_MAX);
+            Ok(bytes)
+        })
+    }
+
+    fn keep(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let path = self
+            .record
+            .as_ref()
+            .ok_or(std::io::ErrorKind::Unsupported)?;
+        self.sys.write_file(path, bytes, 0o600)
+    }
+
+    fn hello(&self) -> Option<lan::BrokerHello> {
+        self.sys
+            .installed_lan_broker()
+            .ok()
+            .filter(|hello| hello.direct.is_none())
+    }
+
+    fn refusal(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.sys
+            .read_owned_file(path, 0, adoption::REFUSAL_MAX, false)
+    }
+
+    fn journal(&self, line: &str) {
+        aterm_log::info!("{line}");
+    }
+}
+
+/// [`reading`], with an adopting image judged against what the broker it hears serves
+/// ([`adoption::expect`]): [`install::Part::NotAdopted`] where the broker still serves another
+/// build than this one [`adoption::LOOKS`] of its looks after this account first saw it, owed
+/// with no ask of its own ([`crate::root_steps::Owed::LanBrokerAdoption`]). The broker is asked
+/// for its hello only where the image reads adopting or the account's record holds a pair, and
+/// an adopting image is asked once to consider this bundle ([`install::consider_for`]).
+#[must_use]
+pub fn expected_reading(sys: &dyn System) -> Option<Result<install::Reading, String>> {
+    let read = reading(sys)?;
+    let (Ok(found), Some(source)) = (&read, sys.running_app()) else {
+        return Some(read);
+    };
+    install::consider_for(found);
+    Some(Ok(adoption::expect(
+        &Expecting::of(sys),
+        found.clone(),
+        &source,
+        lan::hello_build(),
+    )))
+}
+
+/// The broker's own reason for not adopting the bundle `sys` runs from, from root's records
+/// ([`lan::ADOPTION_REFUSED`], or the bundle's own of [`lan::ADOPTION_REFUSED_ASKERS`],
+/// [`adoption::refusals_of`]): `None` where there is none, it is not root's own file, or it is
+/// another bundle's.
+pub(crate) fn adoption_refusal(sys: &dyn System) -> Option<String> {
+    let source = sys.running_app()?;
+    adoption::refusals_of(&Expecting::of(sys), &source)
+        .into_iter()
+        .next()
+        .map(|refusal| refusal.reason)
 }
 
 /// The key of a broker install from the bundle `sys` runs from, as root's record of a refused
@@ -175,23 +272,26 @@ struct Before {
     plist: Option<FileId>,
 }
 
-/// How a broker apply ended short. `durable` says the failure is taken as the step's own, one
-/// that would recur with the same bundle: the strict check or the clone definitely refused it,
-/// or every round of the run published the job and it did not serve (launchd refusing it, or
-/// not answering about it, each time). A stop, lost custody, a job switched off and an
-/// operational error in any round (a check unanswered or not run, file I/O, a source that
-/// changed) are not: a bundle that fails the check that way every time is still asked for again
-/// (ATERM-KI-1116-3472).
+/// How a broker apply ended short, and what root's record of it says
+/// (`aterm_types::macos_setup::refused`, `failure`). [`Failure::Definite`] is a failure taken as
+/// the step's own, one that would recur with the same bundle: the strict check or the clone
+/// definitely refused it, or every round of the run published the job and it did not serve
+/// (launchd refusing it, or not answering about it, each time). [`Failure::NoVerdict`] is a
+/// retained run that used up its rounds with no serve where at least one round ended without a
+/// verdict (a check unanswered or not run, file I/O, a source that changed): that may be the
+/// Mac's passing state, so it stalls the step only once it comes again later in the same boot.
+/// `None` says nothing of the bundle: a stop, lost custody, a job switched off, or a run that is
+/// not retained and so ended at its first such error.
 struct Failed {
     why: String,
-    durable: bool,
+    failure: Option<Failure>,
 }
 
 impl Failed {
     fn passing(why: impl Into<String>) -> Self {
         Self {
             why: why.into(),
-            durable: false,
+            failure: None,
         }
     }
 }
@@ -203,6 +303,10 @@ enum StageError {
     Lost(String),
     /// launchd lists the job switched off ([`switched_off`]), so it is not launched.
     SwitchedOff,
+    /// The image is a newer build's this build keeps ([`install::Part::Kept`]): nothing is
+    /// published over it ([`kept_job`]), and where launchd cannot say whether it holds its job,
+    /// nothing is loaded either ([`Installing::load_kept`]).
+    Kept(String),
 }
 
 impl std::fmt::Display for StageError {
@@ -213,6 +317,7 @@ impl std::fmt::Display for StageError {
             Self::SourceChanged => f.write_str("the source changed before image publication"),
             Self::Lost(why) => f.write_str(why),
             Self::SwitchedOff => lan::Unavailable::SwitchedOff.fmt(f),
+            Self::Kept(why) => f.write_str(why),
         }
     }
 }
@@ -363,6 +468,12 @@ impl<'a> Installing<'a> {
         current: &dyn Fn() -> Result<(), String>,
     ) -> Result<Option<String>, StageError> {
         current().map_err(StageError::Lost)?;
+        if self.published.is_none()
+            && let Ok(reading) = install::read(&Through(sys), source)
+            && let install::Part::Kept { image, ours, .. } = reading.image
+        {
+            return self.load_kept(sys, source, image, ours, current);
+        }
         if self.published.is_none() {
             if self.before.is_none() {
                 self.before = Some(Before::read(sys)?);
@@ -381,6 +492,11 @@ impl<'a> Installing<'a> {
             current().map_err(StageError::Lost)?;
             prepared.source_current(sys, source)?;
             before.check(sys)?;
+            // The probe read the image; the effect reads it again: nothing publishes this build's
+            // image over a newer one launchd holds.
+            if let Some(why) = kept_job(sys, source) {
+                return Err(StageError::Kept(why));
+            }
             let prepared = self.prepared.take().expect("strictly checked candidate");
             self.published = Some(item.publish(sys, source, prepared, before)?);
         }
@@ -430,12 +546,79 @@ impl<'a> Installing<'a> {
         Ok(Some(why))
     }
 
+    /// Load in place the image of build `image` this build (`ours`) keeps
+    /// ([`install::Part::Kept`]), publishing nothing over it: where launchd holds its job, running
+    /// or between two of its starts, it is ready as it is; where launchd holds none, the plist a
+    /// build wrote stays (the newer build's, whatever it says), this build's is written only where
+    /// none is (an exclusive create, so a newer build's written since stays), and the job is
+    /// loaded and started without a `bootout` ([`super::aterm::load_system_job`]), so a newer
+    /// build's own restart of it is never taken down. An older build that published its own image
+    /// here would move the broker down.
+    fn load_kept(
+        &mut self,
+        sys: &dyn System,
+        source: &Path,
+        image: u64,
+        ours: u64,
+        current: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Option<String>, StageError> {
+        let held = super::aterm::system_job_pid(sys, lan::LABEL);
+        match held {
+            Ok(Some(_)) => return Ok(None),
+            Ok(None) if self.launched => {
+                return Ok(Some("the broker job has not started yet".into()));
+            }
+            Ok(None) => {}
+            Err(why) => {
+                return Err(StageError::Kept(format!(
+                    "the broker's image is build {image}, newer than this build's {ours}, and \
+                     launchd could not say whether it holds its job ({why}): this build's \
+                     elevation leaves it as it is"
+                )));
+            }
+        }
+        // The probe read no switch-off; a person may switch it off while this run holds root.
+        if switched_off(sys) == Ok(true) {
+            return Err(StageError::SwitchedOff);
+        }
+        current().map_err(StageError::Lost)?;
+        let plist = Path::new(lan::PLIST_PATH);
+        if let Some(parent) = plist.parent() {
+            sys.create_dir_all(parent, 0o755)
+                .map_err(|error| stage_io(parent, error))?;
+        }
+        let log = log_dir();
+        sys.create_dir_all(log, 0o755)
+            .map_err(|error| stage_io(log, error))?;
+        match sys.create_new(plist, install::plist_text(source).as_bytes(), 0o644) {
+            Ok(()) => sys
+                .chown(plist, 0, 0)
+                .map_err(|error| stage_io(plist, error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(stage_io(plist, error)),
+        }
+        current().map_err(StageError::Lost)?;
+        let why = match super::aterm::load_system_job(sys, plist, lan::LABEL) {
+            Ok(()) => {
+                self.launched = true;
+                match super::aterm::system_job_pid(sys, lan::LABEL) {
+                    Ok(Some(_)) => return Ok(None),
+                    Ok(None) => "the broker job has not started yet".to_owned(),
+                    Err(why) => why,
+                }
+            }
+            Err(why) => why,
+        };
+        Ok(Some(why))
+    }
+
     fn retry(&mut self, error: &StageError) -> bool {
         match error {
             StageError::Check(CheckError::Refused(_))
             | StageError::Files(app_image::Error::Refused(_))
             | StageError::Lost(_)
-            | StageError::SwitchedOff => false,
+            | StageError::SwitchedOff
+            | StageError::Kept(_) => false,
             StageError::Check(CheckError::Unanswered(_)) => true,
             StageError::Check(CheckError::Unchecked(_))
             | StageError::Files(app_image::Error::Io(_))
@@ -457,9 +640,17 @@ fn readiness(sys: &dyn System) -> Readiness {
         Err(why) => return Readiness::Pending(why),
     };
     match sys.installed_lan_broker() {
-        Ok(hello) if hello.direct.is_some() || hello.protocol != lan::PROTOCOL => {
+        Ok(hello) if hello.direct.is_some() => {
             Readiness::Pending("the installed root broker has not answered this protocol".into())
         }
+        Ok(hello) if hello.protocol != lan::PROTOCOL => Readiness::Pending(
+            lan::Unavailable::Outdated {
+                ours: lan::PROTOCOL,
+                theirs: hello.protocol,
+                build: hello.build,
+            }
+            .to_string(),
+        ),
         Ok(_) => Readiness::Ready(pid),
         Err(why) => Readiness::Pending(why),
     }
@@ -468,14 +659,57 @@ fn readiness(sys: &dyn System) -> Readiness {
 /// Full effect-boundary readiness for a root result that otherwise looks short.
 /// The GUI's ordinary `reading` remains metadata-only. A job launchd lists switched off is the
 /// person's, and leaves nothing for the result to wait on.
+///
+/// A development build's broker is none of its own ([`install::Part::Development`]): ready. A
+/// newer image this build keeps ([`install::Part::Kept`]) is ready while launchd holds its job,
+/// with or without a pid (between two of its starts), whatever protocol it answers.
 pub(crate) fn ready(sys: &dyn System) -> Result<bool, String> {
     let Some(files) = reading(sys) else {
         return Ok(true);
     };
-    Ok(
-        (files?.current() && matches!(readiness(sys), Readiness::Ready(_)))
-            || switched_off(sys) == Ok(true),
-    )
+    let files = files?;
+    if files.image == install::Part::Development {
+        return Ok(true);
+    }
+    let serving = match files.image {
+        install::Part::Kept { .. } => {
+            matches!(super::aterm::system_job_pid(sys, lan::LABEL), Ok(Some(_)))
+        }
+        _ => matches!(readiness(sys), Readiness::Ready(_)),
+    };
+    Ok((files.in_place() && serving) || switched_off(sys) == Ok(true))
+}
+
+/// What launchd holds of the broker's job ([`aterm_uds::launchd::JobState`], from
+/// `launchctl print`): `None` where `launchctl` could not say.
+pub(crate) fn job_state(sys: &dyn System) -> Option<aterm_uds::launchd::JobState> {
+    use aterm_uds::launchd::JobState;
+    super::aterm::system_job_pid(sys, lan::LABEL)
+        .ok()
+        .map(|job| match job {
+            Some(Some(_)) => JobState::Running,
+            Some(None) => JobState::Idle,
+            None => JobState::Unloaded,
+        })
+}
+
+/// Why nothing may be published over the image, read again for the bundle `source` this build
+/// runs from just before it would be: it is a newer build's this build keeps
+/// ([`install::Part::Kept`]), whatever launchd holds of its job (one it holds none of is loaded in
+/// place, [`Installing::load_kept`]), or the image cannot be read. `None` where the image is no
+/// such one.
+fn kept_job(sys: &dyn System, source: &Path) -> Option<String> {
+    let reading = match install::read(&Through(sys), source) {
+        Ok(reading) => reading,
+        Err(why) => return Some(format!("the broker's image could not be read again: {why}")),
+    };
+    let install::Part::Kept { image, ours, .. } = reading.image else {
+        return None;
+    };
+    Some(format!(
+        "the broker's image is build {image}, newer than this build's {ours}: this build's \
+         elevation never replaces it with an older one"
+    ))
 }
 
 /// Whether launchd lists the broker's job switched off (`launchctl print-disabled system`,
@@ -554,11 +788,12 @@ impl LanBroker {
                 Err(error) => {
                     if !self.retained_root_run || !installing.retry(&error) {
                         return Err(Failed {
-                            durable: matches!(
+                            failure: matches!(
                                 error,
                                 StageError::Check(CheckError::Refused(_))
                                     | StageError::Files(app_image::Error::Refused(_))
-                            ),
+                            )
+                            .then_some(Failure::Definite),
                             why: error.to_string(),
                         });
                     }
@@ -572,7 +807,11 @@ impl LanBroker {
                         "the LAN broker is not serving after {rounds} attempts in this root run, \
                          the last: {why}; `sudo aterm machines here apply --plain` tries again"
                     ),
-                    durable: unserved == rounds,
+                    failure: Some(if unserved == rounds {
+                        Failure::Definite
+                    } else {
+                        Failure::NoVerdict
+                    }),
                 });
             }
             if said.as_ref() != Some(&why) {
@@ -694,17 +933,62 @@ impl Item for LanBroker {
                 why: NO_BUNDLE.to_owned(),
             };
         };
-        // Against this bundle alone: an elevation installs the bundle it runs from, so a job
-        // another bundle holds is one it takes ([`install::read_own`]).
-        let reading = match install::read_own(&Through(sys), &source) {
+        let reading = match install::read(&Through(sys), &source) {
             Ok(reading) => reading,
             Err(why) => return Probe::Unusable { why },
         };
+        if reading.image == install::Part::Development {
+            return Probe::NotApplicable {
+                why: DEVELOPMENT.to_owned(),
+            };
+        }
         let to = format!(
             "{} running in system from a root-owned clone of {}",
             lan::LABEL,
             source.display()
         );
+        // A newer build's image this build keeps stays, whatever its hello says and whatever its
+        // plist (the newer build's): ready while launchd holds its job, running or between two of
+        // launchd's starts. A `launchctl` that cannot say measures nothing. A job launchd does not
+        // hold at all is loaded in place ([`Installing::load_kept`]): this build's elevation never
+        // replaces a newer image with its own.
+        if let install::Part::Kept { image, ours, .. } = &reading.image {
+            let kept = |held: String| Probe::Ok {
+                now: format!(
+                    "{} {held} in system from build {image}, newer than this build's {ours}",
+                    lan::LABEL
+                ),
+            };
+            match super::aterm::system_job_pid(sys, lan::LABEL) {
+                Ok(Some(Some(pid))) => return kept(format!("running (pid {pid})")),
+                Ok(Some(None)) => return kept("loaded, which launchd starts again,".to_owned()),
+                Err(why) => {
+                    return Probe::Unusable {
+                        why: format!(
+                            "launchd could not say whether the broker of build {image}, newer than \
+                             this build's {ours}, runs: {why}"
+                        ),
+                    };
+                }
+                Ok(None) => {
+                    if switched_off(sys) == Ok(true) {
+                        return Probe::NotApplicable {
+                            why: lan::Unavailable::SwitchedOff.to_string(),
+                        };
+                    }
+                    return Probe::Change {
+                        from: format!(
+                            "build {image}'s image, newer than this build's {ours}, which launchd \
+                             does not hold"
+                        ),
+                        to: format!(
+                            "{} running in system from build {image}'s image, loaded in place",
+                            lan::LABEL
+                        ),
+                    };
+                }
+            }
+        }
         let from = if reading.current() {
             match readiness(sys) {
                 Readiness::Ready(pid) => {
@@ -738,13 +1022,18 @@ impl Item for LanBroker {
             Ok(()) => {
                 self.note(None);
                 crate::root_steps::clear_refusal(sys, LAN_BROKER);
+                // Where the image is now the source, the broker's record of not adopting it is
+                // over; a newer image loaded in place is no source's.
+                if install::read(&Through(sys), &source)
+                    .is_ok_and(|reading| reading.image == install::Part::Current)
+                {
+                    crate::root_steps::clear_refusal(sys, lan::ADOPTION_REFUSED);
+                }
                 Ok(())
             }
             Err(failed) => {
-                if failed.durable
-                    && let Some(key) = key
-                {
-                    crate::root_steps::record_refusal(sys, LAN_BROKER, &key);
+                if let (Some(failure), Some(key)) = (failed.failure, key) {
+                    crate::root_steps::record_refusal(sys, LAN_BROKER, &key, failure);
                 }
                 Err(failed.why)
             }

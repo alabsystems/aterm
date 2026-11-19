@@ -11,7 +11,9 @@ use crate::{EnvSnapshot, Scope, Seams, Show};
 
 const TARGET: &str = "wasm32-unknown-unknown";
 
-fn world() -> (aterm_tempfile::TempDir, Ctx) {
+/// The fixture workspace and its context, with no targo: nothing here can resolve a cell. Only a
+/// test that never resolves one takes it; every other takes [`world`].
+fn ground() -> (aterm_tempfile::TempDir, Ctx) {
     let dir = aterm_tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::write(
@@ -47,9 +49,19 @@ fn world() -> (aterm_tempfile::TempDir, Ctx) {
         crate::event_log::EventLog::open(&root.join("events")).unwrap(),
     ));
     ctx.path_env = std::env::var_os("PATH").unwrap_or_default();
-    if let Some(cargo) = std::env::var_os("CARGO") {
-        ctx.tools.targo = cargo.into();
-    }
+    (dir, ctx)
+}
+
+/// [`ground`] whose unready cell the real resolver walks: `targo metadata` names the members and
+/// the unit graph says whether the cell holds a selected crate, both run by the suite's own targo,
+/// the `CARGO` that `targo test` sets. The fixture's empty [`EnvSnapshot`] discovers no targo, so
+/// a run of this binary without `CARGO` stops here, not on a resolution that could not spawn (nor
+/// on a plan it never made, which would queue a cold claim in the live capacity ledger).
+fn world() -> (aterm_tempfile::TempDir, Ctx) {
+    let (dir, mut ctx) = ground();
+    ctx.tools.targo = std::env::var_os("CARGO")
+        .expect("CARGO, the suite's own targo (`targo test` sets it), walks the fixture's cell")
+        .into();
     (dir, ctx)
 }
 
@@ -384,11 +396,7 @@ fn empty_cell_plans_run_without_compiler_admission_and_are_consumed_without_rewa
         assert!(!invocation.has_compiler_stage());
         assert!(!invocation.builds(Check::Cells));
         assert!(crate::disk::run_planned(&invocation).unwrap().is_none());
-        assert!(
-            crate::turn::take(&invocation, None, aterm_capacity::Admit::Wait)
-                .unwrap()
-                .is_none()
-        );
+        assert!(crate::turn::Prepared::capture(&invocation, None).is_none());
         std::fs::remove_file(ctx.root.join("app/Cargo.toml")).unwrap();
         let mut output = Vec::new();
         let code = crate::run_with_plan(
@@ -398,6 +406,7 @@ fn empty_cell_plans_run_without_compiler_admission_and_are_consumed_without_rewa
             &Show::default(),
             seams,
             Some(invocation),
+            None,
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -477,6 +486,7 @@ fn selected_cell_work_preserves_the_normal_cold_claim_and_disk_selection() {
         &Show::default(),
         seams,
         Some(invocation),
+        None,
     )
     .unwrap();
     let output = String::from_utf8(output).unwrap();
@@ -567,7 +577,7 @@ fn an_empty_cell_stage_neither_borrows_a_compiler_token_nor_keeps_a_compiler_pea
 
 #[test]
 fn oracle_only_work_cannot_project_empty_compiler_admission() {
-    let (_dir, mut ctx) = world();
+    let (_dir, mut ctx) = ground();
     ctx.scope = Scope::workspace();
     let mut prepared = captured(&ctx).unwrap();
     let inputs = prepared.inputs.as_mut().unwrap();
@@ -641,6 +651,7 @@ fn prepared_cells_reject_a_different_live_context_before_projection_and_executio
         &Show::default(),
         seams,
         Some(invocation),
+        None,
     )
     .unwrap();
     assert_eq!(code, crate::exit::COULD_NOT_RUN);

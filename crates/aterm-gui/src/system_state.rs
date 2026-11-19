@@ -222,6 +222,14 @@ pub struct SetupStatus {
     /// has something to put back: before that the footer offers no Restore. Filled by the
     /// worker.
     pub restorable: bool,
+    /// The folders setup's receipt says it kept out of Spotlight that Spotlight's index holds
+    /// items in again, with no apply that failed for them, as a person reads them (`~/a`): a
+    /// person took them back, which setup never undoes, so the Spotlight indexing row reads Kept
+    /// as you set it (FL-188). Read from System Resources' Spotlight probe
+    /// (`ScopeReading::taken_back`), which asks only while that page is on screen and keeps
+    /// nothing across a restart. Filled by the window (`App::publish_system_state`), never by the
+    /// worker.
+    pub spotlight_taken_back: Vec<String>,
 }
 
 /// The permission walk's page now (`crate::permission_walk`), as the Needs-you card says it.
@@ -311,6 +319,8 @@ pub struct SetupCheck {
 pub struct InitialSetupPermissionPolicy {
     pub revision: u64,
     pub allowed: bool,
+    /// A person asked for the privacy grants on this Mac.
+    pub person_access: bool,
 }
 
 /// Whether this exact setup run remains admitted and not durably stopped.
@@ -1688,6 +1698,10 @@ pub(crate) enum SystemStateAction {
     /// The password headline's Go to tab: the Mac Setup tab comes to the front
     /// (`App::go_to_developer_tools_tab`).
     GoToToolsTab,
+    /// A row's Open System Resources ([`resources_link`]): the System Resources page opens at
+    /// its macOS configuration section (SD-97), where the Spotlight scope's controls are. It
+    /// grants nothing and changes nothing.
+    OpenSystemResources,
     /// The Apple-window card's Go to installer: Apple's own Command Line Tools installer window,
     /// already open, comes to the front (`App::go_to_developer_tools_installer`). It starts no
     /// install and asks for no permission.
@@ -1831,6 +1845,9 @@ fn vault_waits_for_input(status: &SetupStatus) -> bool {
 /// The slug a row's keys carry (`system-state/row/<slug>`).
 pub(crate) fn row_slug(subject: Subject) -> &'static str {
     match subject {
+        // Shown as Spotlight indexing on the Mac settings line (FL-188); its record word
+        // (`spotlight-scope`) stays, since setup's access record keeps it.
+        Subject::Access(Access::SpotlightScope) => "spotlight-indexing",
         Subject::Access(access) => access.word(),
         Subject::Setting(setting) => match setting {
             Setting::CapsLock => "caps-lock",
@@ -1856,6 +1873,65 @@ pub(crate) fn row_slug(subject: Subject) -> &'static str {
         },
     }
 }
+
+/// Whether a plan bit governs the row: every one but a reading no switch governs
+/// ([`Access::switch_governs`]: Spotlight indexing), which a line shows whatever its switch.
+pub(crate) const fn governed(subject: Subject) -> bool {
+    match subject {
+        Subject::Access(access) => access.switch_governs(),
+        Subject::Setting(_) | Subject::Sync(_) => true,
+    }
+}
+
+/// Whether the row counts toward what `selection`'s setup says (the headline, `setup=`): every
+/// row a switch governs; a reading no switch governs where the group it sits beside in setup's
+/// stages is selected (Spotlight indexing's scope runs in the Permissions stage), else only while
+/// it needs the person or failed, so a plan that leaves everything as is never reads as set up
+/// or still checking for it.
+pub(crate) fn counts_for_plan(row: &RowView, selection: Selection) -> bool {
+    governed(row.subject) || selection.contains(row.subject.setting()) || row.attention()
+}
+
+/// `rows` less those `selection`'s setup does not count ([`counts_for_plan`]), dropped in place,
+/// so the headline rule borrows them whole ([`plan_rows`]).
+fn counted(mut rows: Vec<RowView>, selection: Selection) -> Vec<RowView> {
+    rows.retain(|row| counts_for_plan(row, selection));
+    rows
+}
+
+/// The rows of `rows` that count toward what `selection`'s setup says ([`counts_for_plan`]): the
+/// one row set the headline, the hero's count and its waiting check read. Borrowed where every
+/// row counts, as the page's own headline passes them ([`counted`]).
+pub(crate) fn plan_rows(rows: &[RowView], selection: Selection) -> std::borrow::Cow<'_, [RowView]> {
+    if rows.iter().all(|row| counts_for_plan(row, selection)) {
+        std::borrow::Cow::Borrowed(rows)
+    } else {
+        std::borrow::Cow::Owned(
+            rows.iter()
+                .filter(|row| counts_for_plan(row, selection))
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+/// Whether the row links to System Resources' macOS configuration section, where the controls
+/// of what it reads are (FL-188): Spotlight indexing, whose scope that page applies, and Rust in
+/// Spotlight, which keeps Rust's folders out by placement where the scope does not reach.
+pub(crate) const fn resources_link(subject: Subject) -> bool {
+    matches!(
+        subject,
+        Subject::Access(Access::SpotlightScope) | Subject::Setting(Setting::Spotlight)
+    )
+}
+
+/// The key of a row's Open System Resources ([`resources_link`]).
+pub(crate) fn resources_link_key(slug: &str) -> String {
+    format!("system-state/row/{slug}/open-resources")
+}
+
+/// What a row's Open System Resources says.
+pub(crate) const OPEN_SYSTEM_RESOURCES: &str = "Open System Resources";
 
 /// The muted value of an Access row whose grant is on offer
 /// ([`aterm_types::macos_setup::ACCESS_OFFERED`]): nothing granted it yet.
@@ -1940,7 +2016,8 @@ pub(crate) fn manages(selection: Selection, subject: Subject) -> bool {
     match subject {
         Subject::Access(Access::Accessibility) => Access::Accessibility.needed_for(selection),
         Subject::Access(access) => {
-            selection.contains(Setting::Permissions) && access.needed_for(selection)
+            (selection.contains(Setting::Permissions) || !access.switch_governs())
+                && access.needed_for(selection)
         }
         Subject::Setting(setting) => selection.contains(setting),
         // Account provisioning rides Secrets and is supplied by its live base-layer reader.
@@ -2493,6 +2570,63 @@ fn row_view_current(
     } else {
         note
     };
+    // Spotlight indexing (FL-188), read in place: indexing off is left as found, whoever turned
+    // it off (FL-D15); a scope a person took a folder back from is theirs, which setup never
+    // undoes, so it reads Kept as you set it, changed since aterm set it, with no check.
+    let (value, chip, note, changed_since, label) = match reading.and_then(|o| o.now.as_deref()) {
+        Some(aterm_types::macos_setup::SPOTLIGHT_OFF)
+            if subject == Subject::Access(Access::SpotlightScope)
+                && standing == Some(Standing::InPlace) =>
+        {
+            (
+                value,
+                Some(Chip::LeftAsIs),
+                note,
+                changed_since,
+                format!("{name}: Off, left as found"),
+            )
+        }
+        // The person's own pause (System Resources ▸ Spotlight, SD-96): theirs until they
+        // resume it, which setup leaves as it is.
+        Some(aterm_types::macos_setup::SPOTLIGHT_PAUSED)
+            if subject == Subject::Access(Access::SpotlightScope)
+                && standing == Some(Standing::InPlace) =>
+        {
+            (
+                value,
+                Some(Chip::LeftAsIs),
+                note,
+                changed_since,
+                format!(
+                    "{name}: {}, left as you set it",
+                    aterm_types::macos_setup::SPOTLIGHT_PAUSED
+                ),
+            )
+        }
+        Some(_)
+            if subject == Subject::Access(Access::SpotlightScope)
+                && standing == Some(Standing::InPlace)
+                && previous.is_none()
+                && !status.spotlight_taken_back.is_empty() =>
+        {
+            let kept = aterm_types::macos_setup::SPOTLIGHT_KEPT_AS_SET;
+            let folders = &status.spotlight_taken_back;
+            let (which, it) = match folders.len() {
+                1 => (folders[0].clone(), "it"),
+                n => (format!("{} and {} more", folders[0], n - 1), "them"),
+            };
+            (
+                RowValue::One(kept.to_owned()),
+                None,
+                Some(format!(
+                    "You took {which} back into Spotlight since setup kept {it} out; setup leaves {it} so."
+                )),
+                true,
+                format!("{name}: {kept}, changed since aterm set it"),
+            )
+        }
+        _ => (value, chip, note, changed_since, label),
+    };
     RowView {
         subject,
         managed,
@@ -2999,6 +3133,11 @@ impl Headline {
 
 /// THE HEADLINE RULE (§3.2, pure).
 pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Plan>) -> Headline {
+    let selection = plan
+        .or(status.plan.as_ref())
+        .map_or_else(Selection::none, |plan| plan.selection);
+    let rows = plan_rows(rows, selection);
+    let rows = &*rows;
     match status.mac_setup {
         Some(ToolsInstall::Password) => return Headline::tools_tab(TOOLS_PASSWORD_HEADLINE),
         Some(ToolsInstall::Recovered) => return Headline::tools_tab(TOOLS_RECOVERED_HEADLINE),
@@ -3152,32 +3291,15 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     // that unwound and says so in its note) leaves no check under way for it, so the headline
     // names it and shows it, where its note says to Check again. A read an ordinary refresh
     // withheld never ran, so it failed nothing.
-    let withheld = withheld(status, rows, plan);
-    let unread: Vec<Subject> = rows
-        .iter()
-        .filter(|row| {
-            row.managed
-                && row.standing == Some(Standing::Unknown)
-                && (status.unconfirmed_observations.contains(&row.subject)
-                    // A read that ran and said nothing of the row, whatever the page shows of an
-                    // earlier reading beside it.
-                    || status
-                        .observations_for(plan.map(|plan| plan.vault_url.as_str()))
-                        .any(|seen| seen.subject == row.subject && seen.read_nothing())
-                    // A note is a failure only where the row is not showing its last known value
-                    // (whose note says so), unless the reading itself carries why.
-                    || (row.note.is_some()
-                        && (!matches!(row.value, RowValue::LastKnown(_))
-                            || status
-                                .observations_for(plan.map(|plan| plan.vault_url.as_str()))
-                                .any(|seen| {
-                                    seen.subject == row.subject
-                                        && (seen.note.is_some() || seen.detail.is_some())
-                                }))))
-        })
-        .map(|row| row.subject)
-        .filter(|subject| !withheld.contains(subject))
-        .collect();
+    let mut withheld = Vec::new();
+    let mut unread = Vec::new();
+    for row in rows {
+        match unread_reading(status, row, plan.map(|plan| plan.vault_url.as_str())) {
+            Some(UnreadReading::Withheld) => withheld.push(row.subject),
+            Some(UnreadReading::Unanswered) => unread.push(row.subject),
+            None => {}
+        }
+    }
     if let Some(first) = unread.first() {
         let names: Vec<&str> = unread.iter().map(|subject| subject.name()).collect();
         // Every other managed row is settled once no read of one is still to come and nothing is
@@ -3360,18 +3482,37 @@ pub(crate) const AT_NEXT_LOGIN_ONE: &str = "1 setting takes full effect at your 
 /// What a set-up headline adds after the count of several such rows.
 pub(crate) const AT_NEXT_LOGIN_MANY: &str = "settings take full effect at your next login";
 
-/// The managed rows of `rows` that read nothing but a withheld read ([`Observation::is_withheld`]):
-/// no stage's wait stands in for their reading, in page order.
-fn withheld(status: &SetupStatus, rows: &[RowView], plan: Option<&Plan>) -> Vec<Subject> {
-    rows.iter()
-        .filter(|row| row.managed && row.standing == Some(Standing::Unknown))
-        .filter(|row| {
-            status
-                .observations_for(plan.map(|plan| plan.vault_url.as_str()))
-                .any(|observation| observation.subject == row.subject && observation.is_withheld())
-        })
-        .map(|row| row.subject)
-        .collect()
+enum UnreadReading {
+    Withheld,
+    Unanswered,
+}
+
+/// Evidence that a managed row's last read was withheld or ended without an answer.
+/// The headline and group captions both use this to distinguish unread rows from a
+/// first reading that has yet to return. A new observation can be in flight meanwhile.
+fn unread_reading(
+    status: &SetupStatus,
+    row: &RowView,
+    vault_url: Option<&str>,
+) -> Option<UnreadReading> {
+    if !row.managed || row.standing != Some(Standing::Unknown) {
+        return None;
+    }
+    let has_note = row.note.is_some();
+    let mut unanswered = status.unconfirmed_observations.contains(&row.subject)
+        || (has_note && !matches!(row.value, RowValue::LastKnown(_)));
+    for seen in status
+        .observations_for(vault_url)
+        .filter(|seen| seen.subject == row.subject)
+    {
+        if seen.is_withheld() {
+            return Some(UnreadReading::Withheld);
+        }
+        // A historical value's note alone does not establish a failed read.
+        unanswered |=
+            seen.read_nothing() || (has_note && (seen.note.is_some() || seen.detail.is_some()));
+    }
+    unanswered.then_some(UnreadReading::Unanswered)
 }
 
 /// The set-up headline while macOS's grants are on offer ([`offered_access`]).
@@ -4638,7 +4779,7 @@ impl SystemStateApp {
     /// A row as the page shows it: for the plan as reviewed, and as what Apply, or Set up now,
     /// will do ([`row_view_as`]) where nothing the person approved runs it yet
     /// ([`Self::reads_as_review`]).
-    fn reviewed_row(&self, subject: Subject) -> RowView {
+    pub(crate) fn reviewed_row(&self, subject: Subject) -> RowView {
         row_view_as(
             subject,
             &self.status,
@@ -4706,7 +4847,11 @@ impl SystemStateApp {
             return Headline::before_plan(&self.status);
         }
         let plan = self.reviewed_plan();
-        let line = headline(&self.status, &self.reviewed_rows(), Some(&plan));
+        let line = headline(
+            &self.status,
+            &counted(self.reviewed_rows(), plan.selection),
+            Some(&plan),
+        );
         let in_force = self.judged_plan();
         if in_force == plan || self.status.busy || line.text != CHECKING {
             return line;
@@ -4715,7 +4860,8 @@ impl SystemStateApp {
             check: None,
             ..self.status.clone()
         };
-        headline(&status, &self.judged_rows(&in_force), Some(&in_force))
+        let rows = counted(self.judged_rows(&in_force), in_force.selection);
+        headline(&status, &rows, Some(&in_force))
     }
 
     /// An unadmitted row offers no Open ([`Self::reads_as_review`]).
@@ -5304,10 +5450,32 @@ impl SystemStateApp {
                 self.vault_open = Some(true);
             }
             _ => {
+                // A row's Open System Resources, only on a row that offers it: opening a page
+                // grants nothing, so a control client's press opens it as a person's does.
+                if let Some(slug) = key
+                    .strip_prefix("system-state/row/")
+                    .and_then(|rest| rest.strip_suffix("/open-resources"))
+                {
+                    if self
+                        .reviewed_rows()
+                        .iter()
+                        .any(|row| resources_link(row.subject) && row_slug(row.subject) == slug)
+                    {
+                        self.actions
+                            .push_back(SystemStateAction::OpenSystemResources);
+                    }
+                    return;
+                }
+                // The key's slug is the row's ([`row_slug`]), which for Spotlight indexing is not
+                // its record word.
                 if let Some(access) = key
                     .strip_prefix("system-state/row/")
                     .and_then(|rest| rest.strip_suffix("/open"))
-                    .and_then(|slug| Access::ALL.into_iter().find(|a| a.word() == slug))
+                    .and_then(|slug| {
+                        Access::ALL
+                            .into_iter()
+                            .find(|a| row_slug(Subject::Access(*a)) == slug)
+                    })
                     && self.can_open_access(access)
                 {
                     self.actions.push_back(SystemStateAction::OpenAccess {
@@ -5992,10 +6160,15 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 ),
                 (
                     Access::SpotlightScope,
-                    "Your Mac password excludes new home folders from Spotlight.",
+                    "Your Mac password keeps everything but Applications, Documents, Desktop and synced drives out of Spotlight.",
                 ),
             ] {
-                let mut row = read(Subject::Access(access), NeedsYou, Some("Incomplete"));
+                let now = if access == Access::SpotlightScope {
+                    aterm_types::macos_setup::SPOTLIGHT_OWED
+                } else {
+                    "Incomplete"
+                };
+                let mut row = read(Subject::Access(access), NeedsYou, Some(now));
                 row.note = Some(why.into());
                 if let Some(slot) = status
                     .observed

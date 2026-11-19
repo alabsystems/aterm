@@ -3,6 +3,256 @@
 
 use super::*;
 
+fn with_run(guest: &crate::linux_driver::fake::Guest, results: &Path, test: impl FnOnce(&Run<'_>)) {
+    let up = linux::fake_up(guest, false);
+    let cell = Cell {
+        up: &up,
+        arch: guest::Arch::X86_64,
+        tag: "x86_64".into(),
+        repo: "/repo".into(),
+        env: Vec::new(),
+        bin: "/b".into(),
+        results,
+    };
+    let row = Run {
+        cell: &cell,
+        gui: Gui {
+            up: &up,
+            bin: "/b".into(),
+            dir: "/d".into(),
+            name: "x86_64-edge-padding-0".into(),
+            cpu: true,
+            deck: false,
+        },
+        lane_wl: Ok("/b/lane-wl"),
+        invocation: RefCell::new(None),
+    };
+    test(&row);
+}
+
+#[test]
+fn failed_edges_retain_the_original_launch_evidence_before_stopping_its_unit() {
+    use crate::linux_driver::fake::{Answer, Call, Guest};
+    let id = "0123456789abcdef0123456789abcdef";
+    let journal_id = format!("_SYSTEMD_INVOCATION_ID={id}");
+    let guest = Guest::new()
+        .answer(
+            &["--property=InvocationID", "--value"],
+            Answer::Exited(0, id.into()),
+        )
+        .answer(&["ready", "60000"], Answer::Exited(0, "OK ready".into()))
+        .answer(
+            &["await", "match"],
+            Answer::Exited(1, "connect: Connection refused".into()),
+        )
+        .answer(
+            &["cat", "/d/gui.status"],
+            Answer::Exited(
+                0,
+                format!("schema=1\ninvocation={id}\ncode=dumped\nstatus=SEGV\nresult=core-dump\n"),
+            ),
+        )
+        .answer(
+            &["cat", "/d/gui.stderr"],
+            Answer::Exited(0, "GUI's native failure\n".into()),
+        )
+        .answer(
+            &["journalctl", &journal_id],
+            Answer::Exited(0, "this launch's journal\n".into()),
+        )
+        .answer(
+            &["find", "/d/home"],
+            Answer::Exited(0, "/d/home/crash-1.log\n".into()),
+        )
+        .answer(
+            &["cat", "/d/home/crash-1.log"],
+            Answer::Exited(0, "original crash\n".into()),
+        );
+    let top = aterm_tempfile::tempdir().unwrap();
+    with_run(&guest, top.path(), |row| {
+        row.launch(
+            &[("WAYLAND_DISPLAY".into(), "owned-display".into())],
+            &[("WAYLAND_DEBUG".into(), "client".into())],
+        )
+        .unwrap();
+        let original = row
+            .ctl(&["await", "match", "LAST-ROW", "timeout=60000"])
+            .unwrap_err();
+        let (verdict, detail) = row.finish((Verdict::Fail, original.clone()));
+        assert_eq!(verdict, Verdict::Fail);
+        assert!(detail.starts_with(&original));
+        let evidence =
+            std::fs::read_to_string(top.path().join("x86_64-edge-padding-0-failure.txt")).unwrap();
+        assert!(evidence.contains(id));
+        assert!(evidence.contains("code=dumped status=SEGV result=core-dump"));
+        assert!(evidence.contains("GUI's native failure"));
+        assert!(evidence.contains("this launch's journal"));
+        assert!(
+            std::fs::read_to_string(top.path().join("x86_64-edge-padding-0-crash-1.log"))
+                .unwrap()
+                .contains("original crash")
+        );
+    });
+    let calls = guest.calls();
+    let stop = calls.iter().position(|call| matches!(call, Call::Shell { argv, .. } if argv.iter().any(|v| v == "systemctl") && argv.iter().any(|v| v == "stop"))).unwrap();
+    for required in [
+        "/d/gui.status",
+        "/d/gui.stderr",
+        &journal_id,
+        "/d/home/crash-1.log",
+    ] {
+        assert!(calls.iter().take(stop).any(|call| matches!(call, Call::Shell { argv, .. } if argv.iter().any(|v| v == required))), "{required} was not retained before cleanup");
+    }
+    assert!(calls.iter().any(|call| matches!(call, Call::Shell { argv, .. } if argv.iter().any(|v| v == "--setenv=WAYLAND_DEBUG=client") && argv.iter().any(|v| v == "--setenv=WAYLAND_DISPLAY=owned-display") && argv.iter().any(|v| v == "--setenv=ATERM_LANE_EXIT_RECORD=/d/gui.status") && argv.iter().any(|v| v.starts_with("--property=ExecStopPost=")))));
+}
+
+#[test]
+fn unavailable_or_replaced_unit_evidence_cannot_replace_the_edge_failure() {
+    use crate::linux_driver::fake::{Answer, Call, Guest};
+    for (id, state_code, state_id) in [
+        ("", 0, "ffffffffffffffffffffffffffffffff"),
+        ("malformed", 0, "ffffffffffffffffffffffffffffffff"),
+        (
+            "0123456789abcdef0123456789abcdef",
+            0,
+            "ffffffffffffffffffffffffffffffff",
+        ),
+        (
+            "0123456789abcdef0123456789abcdef",
+            1,
+            "0123456789abcdef0123456789abcdef",
+        ),
+    ] {
+        let guest = Guest::new()
+            .answer(&["--property=InvocationID", "--value"], Answer::Exited(0, id.into()))
+            .answer(&["cat", "/d/gui.status"], Answer::Exited(1, "status unavailable".into()))
+            .answer(&["cat", "/d/gui.stderr"], Answer::Exited(1, "stderr unreadable".into()))
+            .answer(&["--property=InvocationID,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,ExecStopPost,MainPID"], Answer::Exited(state_code, format!("InvocationID={state_id}\nResult=success\n")))
+            .answer(&["find"], Answer::Exited(1, "crash inventory unreadable".into()));
+        let top = aterm_tempfile::tempdir().unwrap();
+        with_run(&guest, top.path(), |row| {
+            row.start(&[], &[]).unwrap();
+            let (verdict, detail) = row.finish((Verdict::Fail, "original socket failure".into()));
+            assert_eq!(verdict, Verdict::Fail);
+            assert!(detail.starts_with("original socket failure"));
+            let evidence =
+                std::fs::read_to_string(top.path().join("x86_64-edge-padding-0-failure.txt"))
+                    .unwrap();
+            assert!(evidence.contains("status unavailable"));
+            assert!(evidence.contains("stderr unreadable"));
+            assert!(evidence.contains("different invocation"));
+            assert!(evidence.contains("crash inventory incomplete"));
+            let journals: Vec<_> = guest
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::Shell { argv, .. } if argv.iter().any(|v| v == "journalctl") => {
+                        Some(argv)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if id.len() == 32 {
+                assert_eq!(journals.len(), 1);
+                assert!(journals[0].contains(&format!("_SYSTEMD_INVOCATION_ID={id}")));
+            } else {
+                assert!(journals.is_empty());
+                assert!(evidence.contains("no unit-name journal was substituted"));
+            }
+        });
+    }
+}
+
+#[test]
+fn main_exit_records_require_a_whole_matching_manager_record_without_hiding_unit_failure() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let whole = format!("schema=1\ninvocation={id}\ncode=exited\nstatus=37\nresult=exit-code\n");
+    assert_eq!(
+        main_exit(&whole, id).unwrap(),
+        "code=exited status=37 result=exit-code"
+    );
+    assert_eq!(
+        main_exit(
+            &whole.replace("37", "0").replace("exit-code", "success"),
+            id
+        )
+        .unwrap(),
+        "code=exited status=0 result=success"
+    );
+    for bad in [
+        whole.trim_end().to_string(),
+        whole.replace("schema=1", "schema=2"),
+        whole.replace("code=exited", "code="),
+        whole.replace("status=37", "status=037"),
+        whole.replace("status=37", "status=256"),
+        whole.replace("result=exit-code", "result="),
+        whole.replace(id, "ffffffffffffffffffffffffffffffff"),
+        format!("{whole}status=0\n"),
+    ] {
+        assert!(main_exit(&bad, id).is_err(), "{bad}");
+    }
+    assert!(main_exit(&whole, "").is_err());
+    // The main's record and the hook/unit result are distinct observations: neither can
+    // turn an existing socket failure into PASS, even when the main itself exited zero.
+    use crate::linux_driver::fake::{Answer, Guest};
+    let guest = Guest::new()
+        .answer(&["--property=InvocationID", "--value"], Answer::Exited(0, id.into()))
+        .answer(&["cat", "/d/gui.status"], Answer::Exited(0, whole.replace("status=37", "status=0").replace("result=exit-code", "result=success")))
+        .answer(&["--property=InvocationID,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,ExecStopPost,MainPID"], Answer::Exited(0, format!("InvocationID={id}\nResult=protocol\nExecMainStatus=0\n")));
+    let top = aterm_tempfile::tempdir().unwrap();
+    with_run(&guest, top.path(), |row| {
+        row.start(&[], &[]).unwrap();
+        let (verdict, detail) = row.finish((Verdict::Fail, "original socket failure".into()));
+        assert_eq!(verdict, Verdict::Fail);
+        assert!(detail.starts_with("original socket failure"));
+        let text =
+            std::fs::read_to_string(top.path().join("x86_64-edge-padding-0-failure.txt")).unwrap();
+        assert!(text.contains("Result=protocol"));
+        assert!(text.contains("code=exited status=0 result=success"));
+    });
+}
+
+#[test]
+fn failed_edge_logs_and_crash_inventory_are_bounded_and_report_truncation() {
+    use crate::linux_driver::fake::{Answer, Guest};
+    let long = format!("discarded-prefix{}retained-tail", "x".repeat(100_000));
+    let files = (0..10)
+        .map(|i| format!("/d/home/crash-{i}.log\n"))
+        .collect::<String>();
+    let guest = Guest::new()
+        .answer(&["cat", "/d/gui.stderr"], Answer::Exited(0, long.clone()))
+        .answer(&["find", "/d/home"], Answer::Exited(0, files))
+        .answer(&["cat"], Answer::Exited(0, long));
+    let top = aterm_tempfile::tempdir().unwrap();
+    with_run(&guest, top.path(), |row| {
+        row.start(&[], &[]).unwrap();
+        let (verdict, _) = row.finish((Verdict::Fail, "original failure".into()));
+        assert_eq!(verdict, Verdict::Fail);
+        let evidence =
+            std::fs::read_to_string(top.path().join("x86_64-edge-padding-0-failure.txt")).unwrap();
+        assert!(evidence.len() < 140_000);
+        assert!(evidence.contains("truncated:"));
+        assert!(evidence.contains("retained-tail"));
+        assert!(!evidence.contains("discarded-prefix"));
+        assert!(evidence.contains("retaining at most eight"));
+        for i in 0..8 {
+            let crash = std::fs::read_to_string(
+                top.path()
+                    .join(format!("x86_64-edge-padding-0-crash-{i}.log")),
+            )
+            .unwrap();
+            assert!(crash.len() < 66_000);
+            assert!(crash.contains("truncated:"));
+            assert!(crash.ends_with("retained-tail"));
+        }
+        assert!(
+            !top.path()
+                .join("x86_64-edge-padding-0-crash-8.log")
+                .exists()
+        );
+    });
+}
+
 #[test]
 fn every_row_has_a_name_it_is_found_by() {
     for e in Edge::ALL {

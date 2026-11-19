@@ -98,6 +98,7 @@ impl Bed {
             lab: false,
             rows_changed: RowChanges::default(),
             clashes: Vec::new(),
+            pending: None,
         }
     }
 

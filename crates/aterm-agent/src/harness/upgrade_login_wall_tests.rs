@@ -901,7 +901,8 @@ fn a_login_wall_nobody_lifts_holds_the_round_only_for_its_bound() {
 /// The login wall's age ([`wall_age`]): from the first row of the wall its transcript stands at
 /// ([`upgrade::LoginScan::since`], every later row the same wall), or a key of the person's since,
 /// or the start of the host's serving where its key record spans only that ([`HandAt::Since`]);
-/// keys unread, a person at the session, no wall and a wall no row dates never age it.
+/// a wall no row dates, and one whose keys cannot be read, age from the first look that saw it;
+/// a person at the session and no wall never age it.
 #[test]
 fn the_login_walls_age_runs_from_its_first_row_and_restarts_at_a_person() {
     let wall = || Facts {
@@ -936,15 +937,24 @@ fn the_login_walls_age_runs_from_its_first_row_and_restarts_at_a_person() {
         None,
         "no wall stands"
     );
+    // The first look that saw the wall, later than its first row: a row dates the wall before it.
+    let seen = now - 100;
     assert_eq!(
-        wall_age(true, &wall(), Some(first), HandAt::Never, now),
+        wall_age(true, &wall(), Some(first), seen, HandAt::Never, now),
         2_000
     );
     let key = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(60))
         .expect("an instant");
     assert!(
-        (58..=62).contains(&wall_age(true, &wall(), Some(first), HandAt::At(key), now)),
+        (58..=62).contains(&wall_age(
+            true,
+            &wall(),
+            Some(first),
+            seen,
+            HandAt::At(key),
+            now
+        )),
         "restarted at the key"
     );
     // A key record that spans only the host's serving (aterm began serving the session a minute
@@ -952,7 +962,7 @@ fn the_login_walls_age_runs_from_its_first_row_and_restarts_at_a_person() {
     let served = HandAt::of(HumanInput::NeverFor(60_000));
     assert!(matches!(served, HandAt::Since(_)), "{served:?}");
     assert!(
-        (58..=62).contains(&wall_age(true, &wall(), Some(first), served, now)),
+        (58..=62).contains(&wall_age(true, &wall(), Some(first), seen, served, now)),
         "from the serving's start"
     );
     assert_eq!(
@@ -960,6 +970,7 @@ fn the_login_walls_age_runs_from_its_first_row_and_restarts_at_a_person() {
             true,
             &wall(),
             Some(first),
+            seen,
             HandAt::of(HumanInput::Never),
             now
         ),
@@ -967,14 +978,24 @@ fn the_login_walls_age_runs_from_its_first_row_and_restarts_at_a_person() {
         "no span reported: from the wall's first row"
     );
     assert_eq!(
-        wall_age(true, &wall(), Some(first), HandAt::Unknown, now),
-        0,
-        "keys unread"
+        wall_age(true, &wall(), Some(first), seen, HandAt::Unknown, now),
+        100,
+        "keys unread: from the first look that saw it, each look since having read the person"
     );
     assert_eq!(
-        wall_age(true, &wall(), None, HandAt::Never, now),
+        wall_age(true, &wall(), None, seen, HandAt::Never, now),
+        100,
+        "no row dates it: from its first sighting"
+    );
+    assert_eq!(
+        wall_age(true, &wall(), None, 0, HandAt::Never, now),
         0,
-        "undated"
+        "neither a row nor a look dates it"
+    );
+    assert_eq!(
+        wall_age(true, &wall(), Some(first), 0, HandAt::Unknown, now),
+        0,
+        "keys unread and no look dates it"
     );
     assert_eq!(
         wall_age(
@@ -984,6 +1005,7 @@ fn the_login_walls_age_runs_from_its_first_row_and_restarts_at_a_person() {
                 ..wall()
             },
             Some(first),
+            seen,
             HandAt::Never,
             now
         ),
@@ -991,7 +1013,7 @@ fn the_login_walls_age_runs_from_its_first_row_and_restarts_at_a_person() {
         "a person at the session"
     );
     assert_eq!(
-        wall_age(false, &idle(), Some(first), HandAt::Never, now),
+        wall_age(false, &idle(), Some(first), seen, HandAt::Never, now),
         0,
         "no wall"
     );

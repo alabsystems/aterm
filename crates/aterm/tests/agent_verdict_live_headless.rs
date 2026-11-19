@@ -10,6 +10,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::headless_boot;
+use crate::patience::Patience;
 
 use headless_boot::{
     Instance, boot_session, client_command, ctl, ctl_ok, field, status, subscribed, type_line,
@@ -33,27 +34,29 @@ fn boot_rows(tag: &str, lines: u16) -> Instance {
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
 
-/// Poll `status` until `pred` holds.
+/// Poll `status` until `pred` holds, for as long as a [`Patience`] over `window` lasts.
 fn status_until(
     inst: &Instance,
     sid: &str,
-    within: Duration,
+    window: Duration,
     what: &str,
     pred: impl Fn(&str) -> bool,
 ) -> String {
-    let deadline = Instant::now() + within;
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        last = status(inst, sid);
+    let mut patience = Patience::new(window);
+    let (last, why) = loop {
+        let last = status(inst, sid);
         if pred(&last) {
             return last;
         }
+        if let Some(why) = patience.spent() {
+            break (last, why);
+        }
         std::thread::sleep(Duration::from_millis(20));
-    }
+    };
     let screen = ctl_ok(inst, &[&format!("@{sid}"), "text"]);
     let tree = headless_boot::process_tree(inst);
     panic!(
-        "{what}: not within {within:?}; last status: {last}\nscreen:\n{screen}\n\
+        "{what}: not reached ({why}); last status: {last}\nscreen:\n{screen}\n\
          processes under the instance (pid ppid stat command):\n{tree}"
     );
 }
@@ -152,10 +155,12 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
         );
         move || until_served(|| cmd.output().expect("await agent"))
     });
-    let armed_by = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     while watchers(&inst, &sid) <= watched {
         assert!(!waiter.is_finished(), "the await ended before it armed");
-        assert!(Instant::now() < armed_by, "the await never armed");
+        if let Some(why) = patience.spent() {
+            panic!("the await never armed ({why})");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -217,10 +222,10 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     );
 
     let want = format!("EVENT {local} agent prompt rev={rev} gen=");
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     let mut seen = Vec::new();
     let mut pushed = false;
-    while !pushed && Instant::now() < deadline {
+    while !pushed && patience.spent().is_none() {
         if let Ok(line) = rx.recv_timeout(Duration::from_millis(100)) {
             pushed = line.starts_with(&want) && line.contains(" fp=");
             if line.starts_with("EVENT") || line.starts_with("GAP") {
@@ -313,6 +318,7 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
         while rx.try_recv().is_ok() {}
         std::fs::write(&die, b"").expect("the exit");
         let t0 = Instant::now();
+        let mut patience = Patience::new(HANG);
         let mut seen: Vec<(Duration, String, String, u64)> = Vec::new();
         let gone = loop {
             let s = status(&inst, &sid);
@@ -330,7 +336,7 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
             if program == "bash" && agent == "-" {
                 break true;
             }
-            if t0.elapsed() > HANG {
+            if patience.spent().is_some() {
                 break false;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -345,12 +351,20 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
             );
         }
         let gone = format!("EVENT {local} agent - rev=");
-        let deadline = Instant::now() + HANG;
+        let mut patience = Patience::new(HANG);
         let mut pushed = Vec::new();
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let Ok(line) = rx.recv_timeout(left) else {
-                panic!("round {round}: no `agent -` on the stream: {pushed:?}");
+            let line = match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => line,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(why) = patience.spent() {
+                        panic!("round {round}: no `agent -` on the stream ({why}): {pushed:?}");
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("round {round}: no `agent -` on the stream before it ended: {pushed:?}")
+                }
             };
             if line.starts_with(&gone) {
                 break;

@@ -300,6 +300,7 @@ fn compiler_and_metric_changes_keep_estimates_without_renaming_measurements() {
         claiming.budget = Some(Budget {
             ledger: budget_ledger.clone(),
             bytes: MIN_BUDGET,
+            final_links: [(NATIVE.to_owned(), (accounting_name().to_owned(), GIB))].into(),
         });
         let args = [
             "/usr/bin/true",
@@ -378,7 +379,45 @@ fn prior_compilers_provision_one_parent_while_empty_history_stays_serial() {
     let parent = shared_need(&units, 2).unwrap();
     assert_eq!(parent.mem, 44 * GIB);
 
+    let (expanded, joint) = parallel_links(&units, 2).expect("two measured final links");
+    assert_eq!(joint.mem, 84 * GIB);
+    for unit in &expanded {
+        assert_eq!(unit.budget_bytes(), Some(80 * GIB));
+        assert_eq!(unit.budget.as_ref().unwrap().ledger, private);
+        assert_eq!(
+            unit.budget.as_ref().unwrap().final_links,
+            units[0].budget.as_ref().unwrap().final_links,
+            "expanding the parent keeps its measured admission evidence"
+        );
+    }
+    assert_eq!(shared_need(&expanded, 2).unwrap().mem, joint.mem);
+    assert!(parallel_links(&units, 1).is_none());
+
     let forecast_ledger = aterm_capacity::Ledger::at(dir.path().join("forecast-ledger"));
+    let roomy = aterm_capacity::Reading::of_gib(256, 208, 36);
+    for (available, pressure, both) in [
+        (208 * GIB, Some(aterm_sysprobe::MemoryLevel::Normal), true),
+        (64 * GIB, Some(aterm_sysprobe::MemoryLevel::Normal), false),
+        (208 * GIB, Some(aterm_sysprobe::MemoryLevel::Warn), false),
+        (208 * GIB, None, false),
+    ] {
+        let mut reading = roomy.clone();
+        reading.available = Some(available);
+        reading.pressure = pressure;
+        let forecast = crate::buildplan::slice_memory_forecast_in(
+            &forecast_ledger,
+            &aterm_capacity::Fixed::new(reading),
+            &units,
+        )
+        .unwrap();
+        assert_eq!(
+            forecast.line.contains("both final links fit now"),
+            both,
+            "{}",
+            forecast.line
+        );
+        assert!(forecast_ledger.list().unwrap().is_empty());
+    }
     let mut reading = aterm_capacity::Reading::of_gib(96, 43, 28);
     reading.pressure = Some(aterm_sysprobe::MemoryLevel::Normal);
     let forecast_machine = aterm_capacity::Fixed::new(reading.clone());
@@ -565,6 +604,7 @@ fn wrapper_timeline_probe() {
         budget: (mode == "claim").then_some(Budget {
             ledger: ledger_path.clone(),
             bytes: SYNTHETIC_BUDGET,
+            final_links: [(NATIVE.to_owned(), (accounting_name().to_owned(), GIB))].into(),
         }),
     };
     let mut records = Records::default();
@@ -607,6 +647,7 @@ fn lock_root_probe() {
         budget: Some(Budget {
             ledger: ledger_path.clone(),
             bytes: SYNTHETIC_BUDGET,
+            final_links: [(NATIVE.to_owned(), (accounting_name().to_owned(), GIB))].into(),
         }),
     };
     let args = Vec::from(
@@ -737,6 +778,7 @@ fn an_unidentified_non_query_compiler_claims_the_whole_private_budget() {
         budget: Some(Budget {
             ledger: ledger_path.clone(),
             bytes: SYNTHETIC_BUDGET,
+            final_links: [(NATIVE.to_owned(), (accounting_name().to_owned(), GIB))].into(),
         }),
     };
     let mut records = Records::default();
@@ -796,6 +838,7 @@ fn a_complete_record_builds_one_shared_unit_budget_and_parent() {
     let empty = Units::of(&record, &slices, 2, &ledger);
     assert_eq!(budgets(2), [None, None]);
     assert!(shared_need(&empty, 2).is_none());
+    assert!(parallel_links(&empty, 2).is_none());
     let cold = cold_parent_need();
     assert_eq!(cold.what, COLD_PARENT);
     assert_eq!(cold.rank, aterm_capacity::Rank::Release);
@@ -805,10 +848,12 @@ fn a_complete_record_builds_one_shared_unit_budget_and_parent() {
     let wrapper = Path::new("/r/aterm-release");
     let root = Path::new("/private/take/snapshot/src");
     assert!(
-        !empty[0]
-            .env(wrapper, root)
-            .iter()
-            .any(|(key, _)| [BUDGET_LEDGER, BUDGET_BYTES].contains(key))
+        !empty[0].env(wrapper, root).iter().any(|(key, _)| [
+            BUDGET_LEDGER,
+            BUDGET_BYTES,
+            FINAL_LINKS
+        ]
+        .contains(key))
     );
 
     let mut records = Records::default();
@@ -1147,6 +1192,9 @@ fn real_cargo_and_rustc_recover_from_sigkill_at_the_linker() {
             .arg(format!("linker={}", exe.display()))
             .envs(units.env(&exe, &aterm_tempfile::manifest_dir()))
             .env("ATERM_RELEASE_TEST_LINKER_READY", &ready)
+            // This offline, dependency-free fixture must reach its linker independently
+            // of another test or build holding the ambient package-cache lock.
+            .env("CARGO_HOME", root.join("cargo-home"))
             .env("CARGO_TARGET_DIR", root.join("build.noindex"))
             .env("CARGO_BUILD_JOBS", "1")
             .env("RUSTC", toolchain.join("trustc"))
@@ -1160,10 +1208,16 @@ fn real_cargo_and_rustc_recover_from_sigkill_at_the_linker() {
             let _ = cargo.wait();
             return;
         }
-        let reached =
-            aterm_spec::wait::within(Duration::from_secs(60), Duration::from_millis(10), || {
-                std::fs::read_to_string(&ready).ok()?.parse::<i32>().ok()
-            });
+        // Real Cargo compiles before it links: the minute is its own minute without
+        // progress, not the wall's, which a loaded Mac stretches without bound.
+        let reached = aterm_spec::wait::within_while_working(
+            cargo.id(),
+            aterm_spec::wait::MUST_HAPPEN,
+            aterm_spec::wait::WORKING_GUARD,
+            Duration::from_millis(10),
+            || std::fs::read_to_string(&ready).ok()?.parse::<i32>().ok(),
+        )
+        .ok();
         let Some(linker) = reached else {
             let _ = cargo.kill();
             let _ = cargo.wait();
@@ -1227,14 +1281,14 @@ fn real_cutter_sigkill_at_link_reclaims_the_next_runs_ledger() {
     .env("ATERM_RELEASE_REAL_CUTTER_ROOT", root)
     .stdout(aterm_uds::spawnfd::Stdio::null());
     let mut cutter = cmd.spawn().unwrap();
+    // The cutter compiles with real Cargo before it links: wait while its tree works.
     let linker =
-        aterm_spec::wait::within(Duration::from_secs(60), Duration::from_millis(10), || {
+        aterm_spec::wait::until_while_working(cutter.id(), "real cutter reached link", || {
             std::fs::read_to_string(root.join("linker.pid"))
                 .ok()?
                 .parse::<i32>()
                 .ok()
-        })
-        .expect("real cutter reached link");
+        });
     let before = std::fs::read(root.join("units.json")).unwrap();
     let ledger_path = root.join("ledger");
     let ledger = aterm_capacity::Ledger::at(&ledger_path);
@@ -1300,6 +1354,7 @@ fn the_wrapper_starts_the_compiler_with_the_releases_environment() {
     let mut removed: Vec<(String, bool)> = [
         BUDGET_BYTES,
         BUDGET_LEDGER,
+        FINAL_LINKS,
         WRAPPER,
         TRIPLE,
         ROOT,
@@ -1369,6 +1424,7 @@ fn the_wrapper_runs_each_compiler_under_its_claim_and_keeps_a_finished_ones_peak
         budget: Some(Budget {
             ledger: ledger_path.clone(),
             bytes: COMPLETE_BUDGET,
+            final_links: [(NATIVE.to_owned(), (accounting_name().to_owned(), GIB))].into(),
         }),
     };
     let ledger = aterm_capacity::Ledger::at(&ledger_path);
@@ -1434,4 +1490,127 @@ fn the_wrapper_runs_each_compiler_under_its_claim_and_keeps_a_finished_ones_peak
     assert!(run("/usr/bin/true", "heavy", &[]).is_err());
     assert_eq!(peaks(&heavy), Some(1));
     assert!(ledger.list().unwrap().is_empty());
+}
+
+/// A build retains its final-link admission evidence even after new compiler units evict
+/// every original history row. The wrapper still charges the whole pool for an unknown unit.
+#[cfg(unix)]
+#[test]
+fn admitted_final_link_evidence_survives_history_eviction() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let record = dir.path().join("record");
+    let ledger_path = dir.path().join("ledger");
+    let mut records = Records::default();
+    records.push(key(NATIVE, &last_unit()), 8 * GIB, 1);
+    records.save(&record).unwrap();
+    let mut units = Units::of(&record, &[NATIVE], 1, &ledger_path).remove(0);
+    let bytes = units.budget_bytes().expect("measured parent");
+    for index in 0..aterm_capacity::book::ROWS_KEPT {
+        records.push(
+            key(NATIVE, &unit("fixture", &format!("unit_{index} lib"))),
+            GIB,
+            index as u64 + 2,
+        );
+    }
+    assert_eq!(admission_peak(&records, NATIVE, &last_unit()), None);
+    records.save(&record).unwrap();
+    let ledger = aterm_capacity::Ledger::at(&ledger_path);
+    let args = [
+        "/usr/bin/true",
+        "--crate-name",
+        "fixture",
+        "--crate-type",
+        "lib",
+    ]
+    .map(OsString::from);
+    // Test the unknown unit before a successful compile records its measured footprint.
+    // Negative control: eviction cannot turn an unknown unit into a smaller claim.
+    let short = BudgetMachine::new(bytes - GIB);
+    assert!(wrap(&args, Some("fixture"), &units, Some((&ledger, &short))).is_err());
+    let machine = BudgetMachine::new(bytes);
+    assert_eq!(
+        wrap(&args, Some("fixture"), &units, Some((&ledger, &machine))),
+        Ok(0)
+    );
+    // A lighter live final-link row must not shrink the peak this parent admitted.
+    records.push(key(NATIVE, &last_unit()), GIB, 1000);
+    records.save(&record).unwrap();
+    let link = [
+        "/usr/bin/true",
+        "--crate-name",
+        "aterm",
+        "--crate-type",
+        "bin",
+    ]
+    .map(OsString::from);
+    let light = BudgetMachine::new(claim_bytes(GIB));
+    assert!(wrap(&link, Some("aterm"), &units, Some((&ledger, &light))).is_err());
+    // A measurement learned after parent admission still cannot outgrow that parent.
+    records.push(key(NATIVE, &last_unit()), bytes * 2, u64::MAX);
+    records.save(&record).unwrap();
+    let refused = wrap(&args, Some("fixture"), &units, Some((&ledger, &machine))).unwrap_err();
+    assert!(refused.contains("beyond the admitted"), "{refused}");
+    // The retained evidence never authenticates a different accounting metric.
+    units
+        .budget
+        .as_mut()
+        .unwrap()
+        .final_links
+        .get_mut(NATIVE)
+        .unwrap()
+        .0 = "incompatible".into();
+    let refused = wrap(&args, Some("fixture"), &units, Some((&ledger, &machine))).unwrap_err();
+    assert!(refused.contains("no compatible footprint"), "{refused}");
+    assert!(ledger.list().unwrap().is_empty());
+}
+
+#[test]
+fn private_budget_requires_complete_bounded_final_link_evidence() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let record = dir.path().join("record");
+    let mut records = Records::default();
+    for triple in [NATIVE, COMPAT] {
+        records.push(key(triple, &last_unit()), 8 * GIB, 1);
+    }
+    records.save(&record).unwrap();
+    let units = Units::of(&record, &[NATIVE, COMPAT], 2, &dir.path().join("ledger"));
+    let env = units[0].env(Path::new("wrapper"), Path::new("root"));
+    let get = |key| {
+        env.iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let ledger = get(BUDGET_LEDGER);
+    let bytes = get(BUDGET_BYTES);
+    let evidence = get(FINAL_LINKS);
+    assert_eq!(
+        decode_budget(ledger.clone(), bytes.clone(), evidence.clone()).unwrap(),
+        units[0].budget
+    );
+    assert_eq!(units[0].budget, units[1].budget);
+    assert_eq!(decode_budget(None, None, None), Ok(None));
+    for malformed in [
+        None,
+        Some("".into()),
+        Some("{}".into()),
+        Some("null".into()),
+        Some("{broken".into()),
+    ] {
+        assert!(decode_budget(ledger.clone(), bytes.clone(), malformed).is_err());
+    }
+    assert!(decode_budget(None, bytes.clone(), evidence.clone()).is_err());
+    assert!(decode_budget(ledger.clone(), None, evidence.clone()).is_err());
+    for peak in [0, u64::MAX] {
+        let invalid = [(NATIVE.to_owned(), (accounting_name().to_owned(), peak))]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(
+            decode_budget(
+                ledger.clone(),
+                bytes.clone(),
+                Some(aterm_json::to_string(&invalid).unwrap().into())
+            )
+            .is_err()
+        );
+    }
 }

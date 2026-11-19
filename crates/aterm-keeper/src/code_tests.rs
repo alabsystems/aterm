@@ -157,3 +157,74 @@ fn a_copied_bundle_keeps_its_signature() {
     std::fs::write(copy.join("Contents").join("Resources").join("r.txt"), "x").expect("r");
     assert!(!verify(&copy).status.success(), "a changed copy verifies");
 }
+
+/// An XML `Info.plist` naming `version`, behind a comment that names another.
+fn info_plist(version: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- <key>CFBundleShortVersionString</key>\n\
+         <string>9.9.0</string> -->\n<plist version=\"1.0\">\n<dict>\n\t\
+         <key>CFBundleShortVersionString</key>\n\t<string>{version}</string>\n</dict>\n</plist>\n"
+    )
+}
+
+/// Another file at a keeper's executable path counts for a restart only when its bundle says it
+/// is a release at least as new as the keeper: an older bundle, one with no `Info.plist`, one whose
+/// version is no release version, and a keeper of no release version each read as
+/// [`ImageLook::Older`], so a downgrade never restarts the keeper into an older build. A version
+/// inside a comment is not read.
+///
+/// NEGATIVE CONTROL (run by hand, restored): with `look` reading every other file as
+/// [`ImageLook::Replaced`], the older, bare, unversioned and unranked cases fail.
+#[test]
+fn a_replacement_counts_only_when_its_bundle_is_at_least_the_keepers_version() {
+    use crate::core::ImageLook;
+    let scratch = crate::test_scratch_dir("image");
+    let contents = scratch.path().join("Contents");
+    let macos = contents.join("MacOS");
+    std::fs::create_dir_all(&macos).expect("a bundle");
+    let exe = macos.join("aterm");
+    std::fs::write(&exe, b"the build the keeper started as").expect("write");
+    let plist = contents.join("Info.plist");
+    std::fs::write(&plist, info_plist("0.206.0")).expect("write");
+    let image = ExeImage::at(&exe).expect("it reads").serving("0.206.0");
+    assert_eq!(image.look(), ImageLook::Same);
+    let next = exe.with_extension("next");
+    std::fs::write(&next, b"the build an update put there").expect("write");
+    std::fs::rename(&next, &exe).expect("rename over it");
+    let replaced = ImageLook::Replaced(exe.display().to_string());
+    let older = ImageLook::Older(exe.display().to_string());
+    for (version, look) in [
+        ("0.207.0", &replaced),
+        ("0.206.0", &replaced),
+        ("1.20261117.1", &replaced),
+        ("0.205.0", &older),
+        ("0.206.0+gabcdef", &older),
+        ("", &older),
+    ] {
+        std::fs::write(&plist, info_plist(version)).expect("write");
+        assert_eq!(&image.look(), look, "a bundle of {version:?}");
+    }
+    std::fs::write(&plist, info_plist("0.207.0")).expect("write");
+    assert_eq!(
+        ExeImage::at(&exe)
+            .expect("it reads")
+            .serving("0.206.0")
+            .look(),
+        ImageLook::Same,
+        "a keeper started as this file"
+    );
+    let mut unranked = image.clone().serving("test");
+    assert_eq!(unranked.look(), older, "a keeper of no release version");
+    unranked = unranked.serving("0.206.0");
+    assert_eq!(unranked.look(), replaced);
+    std::fs::remove_file(&plist).expect("remove");
+    assert_eq!(image.look(), older, "a bundle with no Info.plist");
+    let bare = scratch.path().join("aterm");
+    std::fs::write(&bare, b"a bare build").expect("write");
+    std::fs::write(scratch.path().join("Info.plist"), info_plist("0.207.0")).expect("write");
+    assert_eq!(
+        bundle_version(&bare),
+        None,
+        "an executable outside a bundle"
+    );
+}

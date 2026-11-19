@@ -77,7 +77,6 @@ fn working_never_shares_done_s_green_under_any_theme_or_accent() {
 #[test]
 fn every_mark_reads_three_to_one_on_every_ground_it_sits_on() {
     let wash = crate::native_ui::DISCLOSURE_HOVER_WASH;
-    let mut held_to_the_ground_alone_falls_under = 0;
     every_palette(|what, roles| {
         for looks in [
             Looks::default(),
@@ -109,26 +108,32 @@ fn every_mark_reads_three_to_one_on_every_ground_it_sits_on() {
                             contrast_ratio(ink, ground_rgb)
                         );
                     }
-                    let bare = match mark {
-                        Mark::NeedsYou => SYSTEM_ORANGE.on(under),
-                        Mark::Failed => SYSTEM_RED.on(under),
-                        _ => continue,
-                    };
-                    let bare = ensure_contrast_ratio(bare, under, MARK_INK_CONTRAST);
-                    if hovered
-                        .iter()
-                        .any(|&wash| contrast_ratio(bare, wash) < MARK_CONTRAST)
-                    {
-                        held_to_the_ground_alone_falls_under += 1;
-                    }
                 }
             }
         }
     });
+
+    // A deliberately weak role makes the hover control independent of the solved palette.
+    let mut roles = Roles::from_theme(aterm_render::Theme::default());
+    roles.text_primary = [0, 0, 0];
+    roles.needs_person = [135, 135, 135];
+    let under = [240, 240, 240];
+    let hovered = [
+        mix_srgb(under, roles.text_primary, wash),
+        crate::native_appearance::mix_linear(under, roles.text_primary, wash),
+    ];
+    let bare = ensure_contrast_ratio(roles.needs_person, under, MARK_INK_CONTRAST);
+    assert!(contrast_ratio(bare, under) >= MARK_CONTRAST);
     assert!(
-        held_to_the_ground_alone_falls_under > 0,
-        "an ink held to its ground alone already clears every hovered line"
+        hovered
+            .iter()
+            .any(|&hover| contrast_ratio(bare, hover) < MARK_CONTRAST),
+        "a ground-only hold must miss the deliberately harder hover"
     );
+    let held = mark_ink(Mark::NeedsYou, &roles, under);
+    for ground in [under, hovered[0], hovered[1]] {
+        assert!(contrast_ratio(held, ground) >= MARK_CONTRAST);
+    }
 }
 
 /// THE PAGE IS A GROUPED FORM (§4.4): every card stands at least 1.2:1 from the page, and in
@@ -173,7 +178,7 @@ fn cards_rise_from_the_page_and_stand_apart_from_it() {
 }
 
 /// A CARD IS A RIM AND A MARK (§4.4, D5): the Needs-you and failed cards have no wash, so
-/// they read neither olive nor mauve; their rims are macOS's systemOrange and systemRed at
+/// they read neither olive nor mauve; their rims take the native needs-person and danger roles at
 /// .35 over the card, and their marks those colours, at least 3:1. NEGATIVE CONTROL: a
 /// working line still has its wash, so the test tells a wash from none.
 #[test]
@@ -196,19 +201,19 @@ fn a_needs_you_or_failed_card_is_a_rim_and_a_mark_with_no_wash() {
             "{what}: a working line keeps its wash"
         );
         for (ground, mark, colour) in [
-            (Ground::Needs, Mark::NeedsYou, SYSTEM_ORANGE),
-            (Ground::Failed, Mark::Failed, SYSTEM_RED),
+            (Ground::Needs, Mark::NeedsYou, roles.needs_person),
+            (Ground::Failed, Mark::Failed, roles.danger),
         ] {
             assert_eq!(
                 ground_rim(ground, &roles, Looks::default()),
-                mix_srgb(card, colour.on(card), RIM_STRENGTH),
+                mix_srgb(card, colour, RIM_STRENGTH),
                 "{what}: {ground:?}'s rim"
             );
             let ink = mark_ink(mark, &roles, card);
             assert!(
-                hue_distance(ink, colour.on(card)) < 12.0,
+                hue_distance(ink, colour) < 12.0,
                 "{what}: {mark:?} {ink:?} keeps {:?}'s hue",
-                colour.on(card)
+                colour
             );
         }
     });
@@ -262,8 +267,8 @@ fn reduce_transparency_keeps_every_rim_and_mark() {
         "the cards, rims and marks stay"
     );
     let card = card_ground(&roles);
-    for colour in [SYSTEM_ORANGE, SYSTEM_RED] {
-        let rim = crate::widget::rgba(mix_srgb(card, colour.on(card), RIM_STRENGTH), 255);
+    for colour in [roles.needs_person, roles.danger] {
+        let rim = crate::widget::rgba(mix_srgb(card, colour, RIM_STRENGTH), 255);
         assert!(
             solid
                 .iter()
@@ -275,6 +280,50 @@ fn reduce_transparency_keeps_every_rim_and_mark() {
         !plain_wash.is_empty() && solid_wash.is_empty(),
         "the working wash goes"
     );
+}
+
+/// The painter consumes the roles it was given, rather than a private status palette.
+#[test]
+fn marks_and_card_rims_follow_the_supplied_native_semantic_roles() {
+    let mut roles = Roles::from_theme(aterm_render::Theme::default());
+    let warm = [240, 180, 60];
+    let cool = [60, 200, 240];
+    let rect = LogicalRect::new(0.0, 0.0, 300.0, 60.0);
+    let slot = LogicalRect::new(0.0, 0.0, MARK_SLOT, MARK_SLOT);
+    for (needs_person, danger) in [(warm, cool), (cool, warm)] {
+        roles.needs_person = needs_person;
+        roles.danger = danger;
+        let card = card_ground(&roles);
+        for (ground, mark, role) in [
+            (Ground::Needs, Mark::NeedsYou, needs_person),
+            (Ground::Failed, Mark::Failed, danger),
+        ] {
+            assert_eq!(mark_ink(mark, &roles, card), role);
+            let mut prims = Vec::new();
+            paint_mark(
+                &mut prims,
+                slot,
+                Some(&mark_value(mark, ground)),
+                None,
+                &roles,
+            );
+            let ink = rgba(role, 255);
+            assert!(prims.iter().any(|prim| match prim {
+                DrawPrim::Ring { track, fill, .. } => *track == ink && *fill == ink,
+                DrawPrim::Dot { color, .. } => *color == ink,
+                _ => false,
+            }));
+            prims.clear();
+            paint_surface(&mut prims, rect, Some(&surface_value(ground)), &roles);
+            let rim = rgba(mix_srgb(card, role, RIM_STRENGTH), 255);
+            assert!(
+                prims
+                    .iter()
+                    .any(|prim| matches!(prim, DrawPrim::Stroke { color, .. } if *color == rim)),
+                "{mark:?}'s painted rim must follow its supplied role"
+            );
+        }
+    }
 }
 
 #[test]

@@ -170,6 +170,52 @@ impl NativeAccessibilityProjection {
         (self.update, self.routes, self.virtual_text)
     }
 
+    /// Append a window-owned native surface to the terminal or native page the window already
+    /// published. Its controls have their own qualified routes; its root never takes the keys.
+    pub(crate) fn append_to_window(
+        self,
+        window: &mut TreeUpdate,
+        published: &mut Option<PublishedNativeAccessibility>,
+        owner: AccessibilityOwner,
+    ) -> Result<(), AccessibilityProjectionError> {
+        let (mut panel, routes, virtual_text) = self.into_update_routes_and_virtual_text();
+        let panel_root = panel
+            .tree
+            .ok_or(AccessibilityProjectionError::EmptyTree)?
+            .root;
+        let window_root = window
+            .tree
+            .as_ref()
+            .ok_or(AccessibilityProjectionError::EmptyTree)?
+            .root;
+        let existing: aterm_hash::FxHashSet<_> = window.nodes.iter().map(|(id, _)| *id).collect();
+        if let Some((id, _)) = panel.nodes.iter().find(|(id, _)| existing.contains(id)) {
+            return Err(AccessibilityProjectionError::CompositeIdCollision(*id));
+        }
+        let root = window
+            .nodes
+            .iter_mut()
+            .find(|(id, _)| *id == window_root)
+            .ok_or(AccessibilityProjectionError::EmptyTree)?;
+        let mut children = root.1.children().to_vec();
+        children.push(panel_root);
+        root.1.set_children(children);
+        window.nodes.append(&mut panel.nodes);
+        if let Some(table) = published {
+            table.owners.push(owner);
+            table.routes.extend(routes);
+            table.virtual_text.extend(virtual_text);
+        } else {
+            *published = Some(PublishedNativeAccessibility::composite(
+                owner,
+                vec![owner],
+                routes,
+                virtual_text,
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn routes(&self) -> &[AccessibilityRoute] {
         &self.routes

@@ -11,8 +11,11 @@ use crate::task_record::TaskState;
 fn row(session: u64, creator: Option<u64>) -> NavRow {
     NavRow {
         session,
+        shortcut: None,
         title: format!("s{session}"),
-        agent: Some("claude".to_owned()),
+        original_topic: None,
+        named: false,
+        program: Some("claude".to_owned()),
         word: Word::Quiet,
         line: Some(format!("said {session}")),
         moved_ms: 0,
@@ -56,19 +59,14 @@ fn sessions(tree: &NavTree, listed: &[Listed]) -> Vec<u64> {
         .collect()
 }
 
-/// THE FIVE WORDS, FIRST MATCH IN THE ORDER stuck, ended, working, quiet, idle (decision ST-D23):
-/// a task that stalled, a task that failed with no turn in progress, or anything stopped to ask
-/// a person (the published need) is `stuck`; an agent whose program is gone is `ended`; a turn
-/// in progress or a shell's running command is `working`; an agent or a task at rest is `quiet`;
-/// a person's shell at its prompt is `idle`. A box the harness answers itself (`question`,
-/// `prompt`, a wall, with no published need) is no error; a task a person took off Autopilot
-/// did not fail; a turn in progress outranks a failed task. NEGATIVE CONTROLS: the same facts
-/// without the ask, the take-over, the turn or the running command read their own word.
+/// A recorded operation failure or stall takes precedence over the usual activity word.
+/// An active turn can follow a failed task. Taking a task off Autopilot clears its error,
+/// a shell's running command reads working and an agent between turns reads quiet.
 #[test]
 fn a_row_reads_one_of_five_words_first_match_in_order() {
     use TaskState::{Done, Exited, Failed, Stalled, Working};
-    // (task, taken off Autopilot, asks, agent word, shell running, word)
-    for (task, taken_off, asks, agent_word, running, word) in [
+    // (task, taken off Autopilot, operation has a confirmed obstacle, agent word, shell running, word)
+    for (task, taken_off, obstructed, agent_word, running, word) in [
         (Some(Failed), false, false, "idle", false, Word::Stuck),
         (Some(Stalled), false, false, "busy", false, Word::Stuck),
         (Some(Working), false, true, "busy", false, Word::Stuck),
@@ -110,11 +108,33 @@ fn a_row_reads_one_of_five_words_first_match_in_order() {
         let facts = WordFacts {
             task,
             taken_off,
-            asks,
+            need: obstructed.then_some(aterm_types::needs::NeedWord::Stopped),
             agent_word,
             running,
         };
         assert_eq!(word_of(&facts), word, "{facts:?}");
+    }
+}
+
+#[test]
+fn a_session_can_work_while_an_input_request_is_open() {
+    use aterm_types::needs::NeedWord;
+    for request in [NeedWord::Ask, NeedWord::Question] {
+        let facts = WordFacts {
+            task: Some(TaskState::Working),
+            taken_off: false,
+            need: Some(request),
+            agent_word: "busy",
+            running: true,
+        };
+        assert_eq!(word_of(&facts), Word::Working);
+        assert_eq!(
+            word_of(&WordFacts {
+                need: Some(NeedWord::Wall),
+                ..facts
+            }),
+            Word::Stuck
+        );
     }
 }
 
@@ -339,7 +359,7 @@ fn the_filter_keeps_a_match_with_the_rows_above_it_open() {
     all.insert(11, Arc::new(deep));
     let mut stuck = row(2, None);
     stuck.word = Word::Stuck;
-    stuck.agent = Some("codex".to_owned());
+    stuck.program = Some("codex".to_owned());
     all.insert(2, Arc::new(stuck));
     let tree = arrange("m11", &[1, 2], &[10, 11], &all, None);
     let none = BTreeSet::new();
@@ -382,9 +402,543 @@ fn texts(compiled: &crate::native_ui::CompiledUi) -> HashMap<String, String> {
         .collect()
 }
 
-/// ONE ROW TEMPLATE AT EVERY WIDTH, IN LOGICAL PIXELS: narrow (a 30-cell split) drops the agent
-/// and keeps the time; wide says the agent and the time. Both say the one word, the latest
-/// words, and on a closed parent the count. No text is a state phrase with a reason.
+#[test]
+fn a_long_creation_topic_is_readable_in_details_and_speech_after_a_rename() {
+    let (mut app, mut panel) = chart_fixture();
+    let mut all = rows(&[(7, None), (8, None)]);
+    let first = Arc::make_mut(all.get_mut(&7).unwrap());
+    // A path offers no spaces at which to wrap. Preserve every scalar across visual lines.
+    let path = "crates/aterm-gui/src/app_input_native_keyboard_boundary_tests.rs::visible_local_panel_digits_select_sessions_from_an_editor_and_a_terminal";
+    first.original_topic = Some(path.into());
+    first.title = "Test shortcuts".into();
+    first.named = true;
+    first.shortcut = Some(1);
+    first.program = Some("targo".into());
+    let task = "Prove that reopening a parked terminal preserves the original Lean command and its output stream after restoring the workspace";
+    let second = Arc::make_mut(all.get_mut(&8).unwrap());
+    second.original_topic = Some(task.into());
+    second.title = "Lean stdout".into();
+    second.shortcut = Some(2);
+    app.publish(Arc::new(arrange("Local machine", &[7, 8], &[], &all, None)));
+    let rect = LogicalRect::new(0., 0., 210., 1400.);
+    let render = |panel: &NavigatorViewState| {
+        page(&app, panel, rect.width, rect.height)
+            .compile(rect)
+            .unwrap()
+    };
+    let compact = render(&panel);
+    let row = UiKey::new("navigator/row/7");
+    let title = "navigator/item/7/title";
+    let origin = "navigator/item/7/origin/";
+    assert_eq!(texts(&compact)[title], "Test shortcuts");
+    assert!(texts(&compact)["navigator/item/8/title-continued"].ends_with('…'));
+    assert!(
+        compact
+            .semantic(&UiKey::new("navigator/row/8"))
+            .unwrap()
+            .label
+            .contains(task)
+    );
+    assert!(compact.semantic(&row).unwrap().label.contains(path));
+    assert!(
+        !compact
+            .paint
+            .iter()
+            .any(|node| node.key.as_str().starts_with(origin))
+    );
+    panel.chart_details = true;
+    let detailed = render(&panel);
+    let text = texts(&detailed);
+    assert_eq!(text["navigator/item/7/origin-label"], "Original topic");
+    let mut restored = String::new();
+    let mut lines = 0;
+    for i in 0.. {
+        let Some(part) = text.get(&format!("{origin}{i}")) else {
+            break;
+        };
+        assert!(!part.is_empty());
+        restored.push_str(part);
+        lines += 1;
+    }
+    assert!(lines > 2);
+    assert_eq!(restored, path);
+    let words: Vec<_> = (0..)
+        .map_while(|i| text.get(&format!("navigator/item/8/origin/{i}")))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(words.join(" "), task);
+    capture_panel(
+        &detailed,
+        210,
+        850,
+        "session-topic-details.png",
+        crate::native_appearance::forced_chrome_theme(aterm_render::Theme::default(), false),
+    );
+}
+
+#[test]
+fn the_session_panel_keeps_visible_and_hidden_order_independent_of_shortcuts_and_folds() {
+    let mut all = rows(&[(8, None), (19, Some(8)), (21, None)]);
+    Arc::make_mut(all.get_mut(&8).unwrap()).shortcut = Some(2);
+    Arc::make_mut(all.get_mut(&19).unwrap()).shortcut = Some(1);
+    let tree = arrange("host", &[8], &[19, 21], &all, None);
+    let mut standalone = NavigatorViewState::starting_in(None);
+    standalone.close(8);
+    assert_eq!(sessions(&tree, &standalone.listing(&tree)), [8, 21]);
+    standalone.set_filter("s21");
+    assert_eq!(sessions(&tree, &standalone.listing(&tree)), [21]);
+
+    let mut panel = NavigatorViewState::in_dock(None);
+    panel.sessions = DockSessions {
+        order: vec![8, 21, 19],
+        shown: 1,
+        numbered: true,
+        ..DockSessions::default()
+    };
+    let listed = panel.listing(&tree);
+    assert_eq!(sessions(&tree, &listed), [8, 21, 19]);
+    assert!(listed.iter().all(|row| row.under == 0));
+    let frame = Frame::of(&tree, &panel, 240.0, 200.0);
+    assert_eq!(frame.machine_from, Some(1));
+    assert_eq!(frame.top_of(&tree, 19), Some(frame.tops[2]));
+}
+
+#[test]
+fn the_session_panel_paints_and_speaks_its_assigned_shortcuts() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut all = rows(&[(25, None), (81, None)]);
+    Arc::make_mut(all.get_mut(&25).unwrap()).shortcut = Some(2);
+    let app = app_of(arrange("host", &[25, 81], &[], &all, None), 0);
+    let panel = |numbered| {
+        let mut view = NavigatorViewState::in_dock(None);
+        view.sessions = DockSessions {
+            order: vec![25, 81],
+            shown: 2,
+            numbered,
+            ..DockSessions::default()
+        };
+        view
+    };
+    let shortcut = if cfg!(target_os = "macos") {
+        "⌘2"
+    } else {
+        "Ctrl+Shift+2"
+    };
+    let spoken = if cfg!(target_os = "macos") {
+        "Command 2"
+    } else {
+        "Control Shift 2"
+    };
+    for (view, numbered) in [
+        (&panel(true), true),
+        (&panel(false), false),
+        (&NavigatorViewState::starting_in(None), false),
+    ] {
+        let compiled = page(&app, view, 230.0, 400.0)
+            .compile(LogicalRect::new(0.0, 0.0, 230.0, 400.0))
+            .unwrap();
+        let labels = texts(&compiled);
+        assert_eq!(
+            labels.get("navigator/item/25/shortcut").map(String::as_str),
+            numbered.then_some(shortcut)
+        );
+        assert_eq!(
+            compiled
+                .semantic(&UiKey::new("navigator/row/25"))
+                .unwrap()
+                .label
+                .contains(spoken),
+            numbered
+        );
+        assert!(!labels.contains_key("navigator/item/81/shortcut"));
+    }
+}
+
+fn capture_panel(
+    ui: &crate::native_ui::CompiledUi,
+    width: u32,
+    height: u32,
+    filename: &str,
+    theme: aterm_render::Theme,
+) {
+    let Some(dir) = std::env::var_os("ATERM_SESSION_PANEL_GALLERY") else {
+        return;
+    };
+    let tray = ui.tray(theme, 13.);
+    let [_, r, g, b] = theme.bg.to_be_bytes();
+    let (pixels, w, h) =
+        crate::tray_raster::rasterize_tray(&tray.prims, width, height, 2., [r, g, b, 255]);
+    let png = crate::app_introspect::encode_rgba8_png(&pixels, w, h).unwrap();
+    std::fs::write(std::path::Path::new(&dir).join(filename), png).unwrap();
+}
+
+fn chart_fixture() -> (NavigatorApp, NavigatorViewState) {
+    use aterm_vitals::pane_cpu::Reading;
+    use resources::Kind::{Cpu, Input, Output};
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut all = rows(&[(7, None), (8, None)]);
+    for (id, title, short) in [(7, "Compile Trust", 1), (8, "Check Lean proofs", 2)] {
+        let row = Arc::make_mut(all.get_mut(&id).unwrap());
+        row.title = title.into();
+        row.shortcut = Some(short);
+        row.word = Word::Working;
+        row.program = Some(if id == 7 { "codex" } else { "lean" }.into());
+        row.line = Some(
+            if id == 7 {
+                "Building trustc"
+            } else {
+                "Checking arithmetic lemmas"
+            }
+            .into(),
+        );
+    }
+    let mut app = app_of(arrange("Local machine", &[7, 7], &[8], &all, None), 0);
+    let now = 65_000_000_000;
+    app.resources_at_ns = now;
+    for (id, rate) in [(7, 0.02), (8, 1.8)] {
+        let mut r = resources::Readings::default();
+        r.cpu_read = Some(Reading {
+            at_ns: now - 1_000_000_000,
+            window_ns: 2_000_000_000,
+            cores: rate,
+        });
+        r.traces[Cpu as usize].values[0] = Some(0.);
+        r.traces[Cpu as usize].values[11] = Some(rate);
+        r.traces[Input as usize].values[11] = Some(10.);
+        r.traces[Output as usize].values[11] = Some(200.);
+        if id == 8 {
+            r.traces[Cpu as usize].values =
+                [0., 0.18, 0.45, 0.9, 1.8, 1.6, 1.2, 0., 0.9, 1.2, 1.4, rate].map(Some);
+            r.traces[Cpu as usize].values[7] = None;
+            r.traces[Input as usize].values =
+                [0., 2., 15., 5., 0., 24., 50., 10., 2., 55., 20., 10.].map(Some);
+            r.traces[Output as usize].values = [
+                0., 24., 52., 120., 200., 178., 155., 48., 20., 85., 132., 200.,
+            ]
+            .map(Some);
+        }
+        for (kind, value) in [(Cpu, rate), (Input, 10.), (Output, 200.)] {
+            r.traces[kind as usize].latest = Some(value);
+        }
+        app.resources.insert(id, r);
+    }
+    let mut panel = NavigatorViewState::in_dock(None);
+    panel.sessions = DockSessions {
+        order: vec![7, 8],
+        shown: 2,
+        numbered: true,
+        ..Default::default()
+    };
+    (app, panel)
+}
+
+#[test]
+fn local_panel_cpu_stream_narrow_rows_plot_and_describe_the_same_minute() {
+    use crate::native_ui::AuditedCustomNode;
+    let (app, panel) = chart_fixture();
+    let rect = LogicalRect::new(0., 0., 246., 390.);
+    let compiled = page(&app, &panel, rect.width, rect.height)
+        .compile(rect)
+        .unwrap();
+    let charts: HashMap<_, _> = compiled
+        .paint
+        .iter()
+        .filter_map(|node| match &node.content {
+            UiContent::Custom(AuditedCustomNode {
+                audit_id: resources::AUDIT,
+                paint: Some(code),
+                ..
+            }) => {
+                let visible = node.clip.intersect(node.rect).unwrap();
+                assert!(
+                    (visible.width - node.rect.width).abs() < 0.01
+                        && (visible.height - node.rect.height).abs() < 0.01,
+                    "the whole trace is visible at this size"
+                );
+                Some((node.key.as_str(), code.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        charts.len(),
+        16,
+        "a mirrored session still has one set of traces"
+    );
+    assert_eq!(charts["navigator/item/7/CPU/history"], "A----------B");
+    assert_eq!(charts["navigator/item/8/CPU/history"], "ACGMYVQ-MQTY");
+    assert_eq!(charts["navigator/item/7/In/history"], "-----------B");
+    assert_eq!(charts["navigator/item/7/Out/history"], "-----------Y");
+    let labels = texts(&compiled);
+    assert_eq!(labels["navigator/item/7/title"], "Compile Trust");
+    assert_eq!(labels["navigator/item/7/CPU/value"], "0.02c");
+    assert_eq!(labels["navigator/item/8/CPU/value"], "1.8c");
+    let ax = compiled
+        .semantic(&UiKey::new("navigator/row/7"))
+        .unwrap()
+        .description
+        .as_deref()
+        .unwrap();
+    for fragment in [
+        "Twelve closed five-second buckets, oldest first",
+        "CPU 0.02 reported cores, scale 0 to 1.8 reported cores, 2 of 12 observed",
+        "0, gap, gap, gap, gap, gap, gap, gap, gap, gap, gap, 0.02",
+        "Terminal input 10 bytes per second, scale 0 to 200 bytes per second",
+        "Terminal output 200 bytes per second, scale 0 to 200 bytes per second",
+        "1.0 seconds ago over 2.00 seconds",
+    ] {
+        assert!(ax.contains(fragment), "{ax}");
+    }
+    capture_panel(
+        &compiled,
+        246,
+        390,
+        "narrow-session-panel.png",
+        aterm_render::Theme::default(),
+    );
+    let normal = page(
+        &app,
+        &NavigatorViewState::default(),
+        rect.width,
+        rect.height,
+    )
+    .compile(rect)
+    .unwrap();
+    assert!(
+        !normal
+            .paint
+            .iter()
+            .any(|p| matches!(&p.content, UiContent::Custom(c) if c.audit_id == resources::AUDIT))
+    );
+}
+
+#[test]
+fn local_panel_mem_disk_tok_two_sessions_share_scales_and_keep_directions_and_coverage() {
+    use crate::native_ui::AuditedCustomNode;
+    use resources::Kind::{DiskRead, DiskWrite, Memory, TokenIn, TokenOut};
+    let (mut app, mut panel) = chart_fixture();
+    let now = app.resources_at_ns;
+    for (sid, mib, read, write, tokens) in [(7, 64., 0., None, 2.), (8, 256., 512., Some(256.), 8.)]
+    {
+        let r = app.resources.get_mut(&sid).unwrap();
+        r.process_read = Some(aterm_vitals::pane_resources::Reading {
+            at_ns: now - 1_000_000_000,
+            footprint: Some((mib * 1_048_576.) as u64),
+            footprint_unread: u32::from(sid == 7),
+            members: 3,
+            membership_complete: true,
+            read_bps: Some(read),
+            write_bps: write,
+            window_ns: Some(2_000_000_000),
+        });
+        r.token_read = Some(aterm_vitals::pane_tokens::Reading {
+            at_ns: now - 2_000_000_000,
+            collected_ns: now - 1_000_000_000,
+            window_ns: 5_000_000_000,
+            input_per_s: None,
+            output_per_s: Some(tokens),
+        });
+        for (kind, value) in [
+            (Memory, Some(mib)),
+            (DiskRead, Some(read)),
+            (DiskWrite, write),
+            (TokenIn, None),
+            (TokenOut, Some(tokens)),
+        ] {
+            let trace = &mut r.traces[kind as usize];
+            trace.latest = value;
+            trace.values[11] = value;
+        }
+        r.memory_floors[11] = sid == 7;
+        if sid == 8 {
+            r.traces[Memory as usize].values[0..4].copy_from_slice(&[
+                Some(16.),
+                Some(32.),
+                Some(96.),
+                Some(128.),
+            ]);
+            r.traces[DiskRead as usize].values[6..10].copy_from_slice(&[
+                Some(0.),
+                Some(256.),
+                Some(384.),
+                Some(64.),
+            ]);
+            r.traces[TokenOut as usize].values[7..10].copy_from_slice(&[
+                Some(0.),
+                Some(4.),
+                Some(2.),
+            ]);
+        }
+    }
+    for width in [210, 246, 480] {
+        let rect = LogicalRect::new(0., 0., width as f32, 420.);
+        let ui = page(&app, &panel, rect.width, rect.height)
+            .compile(rect)
+            .unwrap();
+        let text = texts(&ui);
+        assert_eq!(text["navigator/item/7/Mem/value"], "≥64MiB");
+        assert_eq!(text["navigator/item/7/DiskRead/value"], "0B/s");
+        assert_eq!(text["navigator/item/7/DiskWrite/value"], "—");
+        assert_eq!(text["navigator/item/7/TokenIn/value"], "—");
+        assert_eq!(text["navigator/item/7/TokenOut/value"], "2/s");
+        let ax = ui
+            .semantic(&UiKey::new("navigator/row/7"))
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap();
+        for words in [
+            "Memory footprint at least 64 MiB, scale 0 to 256 MiB",
+            "Footprints unread for 1 of 3 observed processes",
+            "Process sweep 1.0 seconds ago",
+            "Disk read 0 bytes per second, scale 0 to 512",
+            "Disk write unavailable",
+            "Model input unavailable",
+            "Model output 2 tokens per second, scale 0 to 8",
+            "Last token interval ended 2.0 seconds ago and covered 5.00 seconds. Collected 1.0 seconds ago",
+        ] {
+            assert!(ax.contains(words), "{ax}");
+        }
+        let charts: HashMap<_, _> = ui
+            .paint
+            .iter()
+            .filter_map(|n| match &n.content {
+                UiContent::Custom(AuditedCustomNode {
+                    audit_id: resources::AUDIT,
+                    paint: Some(c),
+                    ..
+                }) => {
+                    let shown = n.clip.intersect(n.rect).unwrap();
+                    assert!(
+                        (shown.width - n.rect.width).abs() < 0.01
+                            && (shown.height - n.rect.height).abs() < 0.01,
+                        "clipped plot {} at {width}",
+                        n.key.as_str()
+                    );
+                    Some((n.key.as_str(), c.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(charts.len(), 16);
+        assert_eq!(charts["navigator/item/7/Mem/history"], "-----------g");
+        assert_eq!(
+            charts["navigator/item/8/Mem/history"].chars().last(),
+            Some('Y')
+        );
+        assert_eq!(charts["navigator/item/7/DiskRead/history"], "-----------A");
+        assert_eq!(charts["navigator/item/7/DiskWrite/history"], "------------");
+        assert_eq!(charts["navigator/item/7/TokenOut/history"], "-----------G");
+        capture_panel(
+            &ui,
+            width,
+            420,
+            &format!("session-resources-{width}.png"),
+            aterm_render::Theme::default(),
+        );
+    }
+    let first = UiKey::new("navigator/row/7");
+    app.act(&mut panel, AppEvent::FocusChanged(Some(first.clone())));
+    app.act(&mut panel, AppEvent::StepFocus(-1));
+    assert_eq!(panel.common.last_focus, Some(UiKey::new(CHART_DETAILS)));
+    app.act(&mut panel, AppEvent::TextInput(TextInputEvent::Submit));
+    let rect = LogicalRect::new(0., 0., 210., 680.);
+    let detailed = page(&app, &panel, rect.width, rect.height)
+        .compile(rect)
+        .unwrap();
+    let text = texts(&detailed);
+    assert_eq!(text["navigator/item/7/Mem/range"], "0–256MiB");
+    assert_eq!(text["navigator/item/7/Mem/collected"], "1s ago");
+    assert_eq!(text["navigator/item/7/DiskRead/range"], "0–512B/s");
+    assert_eq!(text["navigator/item/7/TokenOut/range"], "0–8/s");
+    assert_eq!(text["navigator/item/7/TokenOut/collected"], "1s ago");
+    assert_eq!(text["navigator/item/7/TokenOut/value"], "2/s");
+    capture_panel(
+        &detailed,
+        210,
+        680,
+        "session-resource-details.png",
+        crate::native_appearance::forced_chrome_theme(aterm_render::Theme::default(), false),
+    );
+    let tokens = &mut app.resources.get_mut(&7).unwrap().traces[TokenOut as usize];
+    tokens.latest = None;
+    tokens.values = Default::default();
+    app.resources
+        .get_mut(&7)
+        .unwrap()
+        .token_read
+        .as_mut()
+        .unwrap()
+        .output_per_s = Some(200.);
+    let older = page(&app, &panel, rect.width, rect.height)
+        .compile(rect)
+        .unwrap();
+    let text = texts(&older);
+    assert_eq!(text["navigator/item/7/TokenOut/value"], "—");
+    assert_eq!(text["navigator/item/7/TokenOut/interval"], "Last 200/s");
+    assert_eq!(text["navigator/item/7/TokenOut/range"], "0–8/s");
+    panel.lay(&app.tree, 210., 150.);
+    panel.select(8, &app.tree);
+    let frame = panel.frame(&app.tree).unwrap();
+    assert_eq!(panel.scroll, frame.top_of(&app.tree, 8).unwrap());
+    panel.lay(&app.tree, 210., 680.);
+    app.act(
+        &mut panel,
+        AppEvent::FocusChanged(Some(UiKey::new(CHART_DETAILS))),
+    );
+    app.act(
+        &mut panel,
+        AppEvent::Action(crate::native_app::ActionInvocation {
+            id: ActionId::new(CHART_DETAILS),
+            value: None,
+        }),
+    );
+    app.act(&mut panel, AppEvent::StepFocus(1));
+    assert_eq!(panel.common.last_focus, Some(first));
+    assert!(!panel.chart_details);
+    app.resources.get_mut(&7).unwrap().traces[DiskRead as usize].latest = Some(0.005);
+    let pref = crate::native_appearance::current_preferences();
+    crate::native_appearance::install_preferences(
+        crate::native_appearance::AppearancePreferences {
+            text_scale: 1.5,
+            ..pref
+        },
+    );
+    let large = page(&app, &panel, rect.width, rect.height)
+        .compile(rect)
+        .unwrap();
+    let mem = texts(&large);
+    let large_scale = crate::native_appearance::text_scale();
+    let heading = large
+        .paint
+        .iter()
+        .find(|p| p.key.as_str() == "navigator/title")
+        .unwrap();
+    let heading_fits =
+        text_width("Sessions", SemanticRole::Heading, StyleRef::Primary) <= heading.rect.width;
+    let tiny_width = text_width("5e-3B/s", SemanticRole::Text, StyleRef::Note);
+    capture_panel(
+        &large,
+        210,
+        680,
+        "session-resources-large-text.png",
+        crate::native_appearance::forced_chrome_theme(aterm_render::Theme::default(), false),
+    );
+    crate::native_appearance::install_preferences(pref);
+    assert_eq!(large_scale, 1.5);
+    assert!(heading_fits);
+    assert_eq!(mem["navigator/item/7/DiskRead/value"], "5e-3B/s");
+    let tiny = large
+        .paint
+        .iter()
+        .find(|p| p.key.as_str() == "navigator/item/7/DiskRead/value")
+        .unwrap();
+    assert!(tiny_width <= tiny.rect.width);
+    assert_eq!(mem["navigator/item/7/Mem/value"], "≥64MiB");
+}
+
+/// Narrow rows keep a known program's name, and wide rows include its age. A row with
+/// no observed program uses that space for its age. Speech includes both at every width.
 #[test]
 fn a_row_is_its_title_and_time_over_its_word_and_latest_words_at_both_widths() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
@@ -399,23 +953,36 @@ fn a_row_is_its_title_and_time_over_its_word_and_latest_words_at_both_widths() {
     all.insert(1, Arc::new(parent));
     let mut stuck = row(2, None);
     stuck.word = Word::Stuck;
-    stuck.agent = None;
+    stuck.program = None;
     stuck.moved_ms = now - 3 * 60 * MIN;
     all.insert(2, Arc::new(stuck));
-    let tree = arrange("m11", &[1, 2], &[10], &all, None);
+    let mut build = row(3, None);
+    let executable = "instrumented-compiler-frontend-".repeat(4);
+    build.program = Some(executable.clone());
+    build.moved_ms = now - 2 * MIN;
+    all.insert(3, Arc::new(build));
+    let tree = arrange("m11", &[1, 2, 3], &[10], &all, None);
     let app = app_of(tree, now);
     let view = NavigatorViewState::default();
 
-    for (width, meta) in [(216.0, "41m"), (860.0, "claude \u{00b7} 41m")] {
+    for (width, meta) in [(216.0, "claude"), (860.0, "claude \u{00b7} 41m")] {
         let compiled = page(&app, &view, width, 600.0)
             .compile(LogicalRect::new(0.0, 0.0, width, 600.0))
             .expect("the page compiles");
         let texts = texts(&compiled);
         assert_eq!(texts["navigator/title"], "m11", "{width}");
         assert_eq!(texts["navigator/item/1/meta"], meta, "{width}");
+        let spoken = &compiled
+            .semantic(&UiKey::new("navigator/row/1"))
+            .expect("the session button")
+            .label;
+        assert!(spoken.contains("claude, 41m"), "{width}: {spoken}");
         assert_eq!(texts["navigator/item/1/word"], "working", "{width}");
         assert_eq!(texts["navigator/item/1/under"], "1 under", "{width}");
-        assert_eq!(texts["navigator/item/2/meta"], "3h", "a shell has no agent");
+        assert_eq!(
+            texts["navigator/item/2/meta"], "3h",
+            "no program was observed"
+        );
         assert_eq!(texts["navigator/item/2/word"], "stuck");
         assert!(
             !texts.contains_key("navigator/item/2/under"),
@@ -426,6 +993,13 @@ fn a_row_is_its_title_and_time_over_its_word_and_latest_words_at_both_widths() {
             "a closed parent lists none of its own"
         );
         if width > 480.0 {
+            let build = &texts["navigator/item/3/meta"];
+            assert!(build.ends_with("… · 2m"), "{build}");
+            let spoken = &compiled
+                .semantic(&UiKey::new("navigator/row/3"))
+                .expect("the build session")
+                .label;
+            assert!(spoken.contains(&format!("{executable}, 2m")));
             assert_eq!(
                 texts["navigator/item/1/line"], "Reading the chrome notes",
                 "one line, its breaks flattened"
@@ -559,7 +1133,7 @@ fn a_heading_with_no_row_under_it_is_not_drawn_and_a_cut_list_fades() {
     let whole = at(900.0);
     assert!(heads(&whole) && !fades(&whole), "NEGATIVE CONTROL: it fits");
 
-    let frame = Frame::of(&app.tree, &view.fold(), width, 900.0, false);
+    let frame = Frame::of(&app.tree, &view, width, 900.0);
     let first = frame.tops[frame.machine_from.expect("a machine group")];
     let room_to =
         |row_shows: f32| frame.m.pad * 2.0 + frame.m.header_h + ROOT_GAP + first + row_shows;
@@ -597,4 +1171,30 @@ fn the_first_size_reveals_the_selected_row_and_a_later_one_does_not() {
     view.scroll = 0.0;
     assert!(!view.lay(&app.tree, 300.0, 520.0));
     assert!(view.row_span(&app.tree, 60, 300.0, 520.0).is_none());
+}
+
+#[test]
+fn a_window_below_the_sessions_can_be_revealed_and_opened_with_the_keyboard() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut app = app_of(arrange("m11", &[1], &[], &rows(&[(1, None)]), None), 0);
+    let mut view = NavigatorViewState::in_dock(Some(1));
+    view.sessions.order.push(1);
+    view.sessions.shown = 1;
+    let window = crate::tab_model::ViewId::from_stored(8);
+    view.sessions.windows.push(OrganizerWindow {
+        view: window,
+        label: "Tables".into(),
+        selected: false,
+    });
+    view.lay(&app.tree, 260.0, 120.0);
+    app.act(&mut view, AppEvent::StepFocus(1));
+    assert_eq!(
+        view.common.last_focus.as_ref().unwrap().as_str(),
+        "navigator/window/8"
+    );
+    assert!(view.scroll > 0.0);
+    app.act(&mut view, AppEvent::TextInput(TextInputEvent::Submit));
+    assert!(matches!(app.actions.pop_front(), Some(NavAction::Window(v)) if v == window));
+    app.act(&mut view, AppEvent::StepFocus(-1));
+    assert_eq!(view.focused_row(), Some(1));
 }

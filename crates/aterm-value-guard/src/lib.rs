@@ -8,17 +8,18 @@
 //! value. Secret columns bypass these text guards only with an opaque inner seal;
 //! plaintext is rejected by their type check (aterm-db's `typed::cell::validate`).
 //!
-//! aterm-db's typed cells apply these rules by column type; aterm-file's outbox refuses a value
-//! shaped like a credential ([`credential_shaped`]) or holding a phone number ([`phone_shaped`])
-//! in every value an intent carries, whatever its column, so no writer of a shared file queues
-//! one (docs/DESIGN-shared-files-2026-11-11.md §5, rule 6).
+//! aterm-db's typed cells apply these rules by column type, and aterm-file's outbox holds each
+//! value an intent carries to the judgment its writer names for the cell's column: shaped like a
+//! credential ([`credential_shaped`]) or holding a phone number ([`phone_shaped`]) in a free-text
+//! column, a real secret ([`secret_shaped`]) in the lab tracker's prose, command, path and commit
+//! columns, so no writer of a shared file queues one (docs/DESIGN-shared-files-2026-11-11.md §5,
+//! rule 6).
 
 #![forbid(unsafe_code)]
 
 /// What a surface shows in place of a string another writer's build stored though this one
 /// refuses to show it: in a table's views one shaped like a credential or naming a secret
-/// ([`withheld`]), in a shared file's outbox one shaped like a credential or holding a phone
-/// number.
+/// ([`withheld`]), in a shared file's outbox one its column's judgment refuses.
 pub const REFUSED: &str = "(refused value: not shown)";
 
 /// Why a value was refused: a rule, never the value.

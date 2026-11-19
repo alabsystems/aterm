@@ -30,6 +30,10 @@ impl super::GitRunner for Git {
         self.git_env(args, &[])
     }
 
+    fn git_original_with_limit(&self, args: &[&str], limit: usize) -> super::Result<super::RunOut> {
+        super::GitCli::new(&self.repo).git_original_with_limit(args, limit)
+    }
+
     fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> super::Result<super::RunOut> {
         let out = git()
             .arg("-C")

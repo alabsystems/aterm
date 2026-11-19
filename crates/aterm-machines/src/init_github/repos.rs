@@ -851,13 +851,40 @@ pub(super) fn no_room(volume: Option<&Volume>, repo: &Repo) -> Option<String> {
     no_room_beside(volume, repo, 0)
 }
 
-/// The room [`no_room`] estimates `repo`'s clone takes, in bytes. A size from the vault's
-/// catalog can differ from GitHub's by a sixteenth of itself, or by 1 MiB where that is more
-/// (`RepositoryCatalog::refresh` keeps a saved size that near), so this is off by five times
-/// that at most.
-fn need(repo: &Repo) -> u64 {
-    repo.size_kib
-        .max(1)
+/// The least size class, in KiB: every repository of at most 1 MiB is in it.
+const LEAST_SIZE_CLASS_KIB: u64 = 1024;
+
+/// The class of a size of `kib` KiB, which the vault's catalog writes for a repository's size
+/// and [`need`] reads a size as: the least number at or above `kib` with at most three
+/// significant bits (four, five, six or seven times a power of two), and at least 1 MiB;
+/// `u64::MAX` past the largest such number; `None` for `0`, the size GitHub gives a repository
+/// it has not sized. A class is its own class. Past 1 MiB a class is under a quarter more than
+/// `kib`, and four classes span each doubling. It is integer arithmetic, so the two admin seats
+/// that write the catalog compute it alike.
+pub(super) fn size_class(kib: u64) -> Option<u64> {
+    if kib == 0 {
+        return None;
+    }
+    if kib <= LEAST_SIZE_CLASS_KIB {
+        return Some(LEAST_SIZE_CLASS_KIB);
+    }
+    // Over 1 MiB, `kib` has at least 11 bits: the shift keeps its top three, and is at least 8.
+    let shift = u64::BITS - 3 - kib.leading_zeros();
+    let unit = 1_u64 << shift;
+    let top = (kib >> shift) + u64::from(kib & (unit - 1) != 0);
+    Some(top.saturating_mul(unit))
+}
+
+/// The room [`no_room`] estimates `repo`'s clone takes, in bytes: [`CLONE_ROOM_PER_SIZE`] times
+/// the class of its size ([`size_class`]), 1 KiB for a size of `0`. The vault's catalog holds a
+/// class, or a size a refresh keeps (`RepositoryCatalog::refresh`) while GitHub's size is at
+/// most its class, so this is at least five times GitHub's size at the catalog's last look:
+/// under a quarter more where the catalog holds GitHub's class or a size in it, and under twice
+/// that where GitHub's size has fallen since, by under half. A size from a GitHub listing is
+/// read the same way.
+pub(super) fn need(repo: &Repo) -> u64 {
+    size_class(repo.size_kib)
+        .unwrap_or(1)
         .saturating_mul(1024)
         .saturating_mul(CLONE_ROOM_PER_SIZE)
 }
@@ -910,8 +937,9 @@ pub(super) struct Repo {
     pub(super) name: String,
     pub(super) default_branch: Option<String>,
     /// GitHub's `size` for it in KiB (`0` where GitHub gives none, or has not sized it yet),
-    /// which [`no_room`] estimates its clone's room from. The vault's catalog holds the size
-    /// GitHub gave when it was last published, or one GitHub's has stayed near since.
+    /// which [`no_room`] estimates its clone's room from, by its class ([`size_class`]). The
+    /// vault's catalog holds the class of a size GitHub gave, or a size GitHub gave earlier
+    /// whose class is at least that of GitHub's current one.
     pub(super) size_kib: u64,
     /// GitHub lists it as a fork of another repository.
     pub(super) fork: bool,

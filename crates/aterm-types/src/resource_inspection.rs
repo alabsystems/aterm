@@ -93,7 +93,8 @@ pub struct Memory {
 /// arbitrary JSON with this shape is not evidence of admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inspection {
-    /// Exact local session identity, including the legacy ID of a session this Mac holds.
+    /// Exact owned local session identity ([`crate::control_request::Sid::parse`]), including
+    /// the legacy ID of a session this Mac holds; never fleet requester attribution.
     pub session: String,
     /// Original nonreused submission attempt.
     pub attempt: [u8; 16],
@@ -129,7 +130,7 @@ impl Inspection {
     /// the owner must independently validate live custody before constructing it.
     pub fn json(&self) -> io::Result<Value> {
         let marker: Vec<_> = self.memory.marker.split('-').collect();
-        if !crate::control_verbs::is_minted_sid(&self.session)
+        if crate::control_request::Sid::parse(&self.session).is_none()
             || self.host.is_empty()
             || self.host.len() > 256
             || self.boot.is_empty()

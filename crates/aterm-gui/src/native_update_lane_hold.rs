@@ -19,6 +19,14 @@
 
 use std::time::{Duration, Instant};
 
+use aterm_evidence::{HoldBound, PersonHold};
+
+/// The backstop of every hold this program lifts itself ([`HoldBound::Program`]): one standing
+/// this long is what a bug looks like. Its act here is a journal record and the hold derived
+/// again, never an attempt: the lane's gates still decide whether a poll attempts, and the hold
+/// stays named while they hold it ([`NamedHold::hold`]).
+pub(crate) const PROGRAM_BACKSTOP: Duration = Duration::from_secs(60 * 60);
+
 /// The `password-prompt` hold's bound: the askpass relay withdraws every password sheet by its
 /// deadline (`crate::askpass::ASKPASS_DEADLINE`).
 pub(crate) const PASSWORD_PROMPT_BOUND: Duration = Duration::from_secs(300);
@@ -156,64 +164,6 @@ lane_holds! {
     ActivityRevoked => "activity-revoked",
 }
 
-/// A person's own state that is true now, the only thing that may hold the lane on a person
-/// ([`HoldBound::PersonNow`]): a Command Line Tools tab waiting on them, a draft they typed and
-/// have not applied, or a choice not yet saved. Each is one [`LaneHold`] ([`Self::hold`]), and
-/// holds only while it is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PersonHold {
-    /// A Mac Setup tab that cannot travel with the handoff, its password prompt waiting on them
-    /// while they are at it: a Command Line Tools install's one nobody touched for
-    /// `crate::clt_install::UNTOUCHED_PROMPT_BACKSTOP` is stopped by an update's apply.
-    DeveloperTools,
-    /// Their draft in the launch's setup offer.
-    SetupDraft,
-    /// A setup choice they (or a client) made that the setup worker has not taken yet, or a
-    /// Restore they started that it has not finished.
-    SetupChoice,
-}
-
-impl PersonHold {
-    /// The lane hold this person's state is.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn hold(self) -> LaneHold {
-        match self {
-            Self::DeveloperTools => LaneHold::DeveloperTools,
-            Self::SetupDraft => LaneHold::SetupDraft,
-            Self::SetupChoice => LaneHold::SetupChoice,
-        }
-    }
-
-    /// The bound as the line says it: whose state it is, and that it holds only while it is.
-    #[must_use]
-    pub(crate) const fn words(self) -> &'static str {
-        match self {
-            Self::DeveloperTools => {
-                " (a person's own setup tab: it holds only while it runs, and a Command Line \
-                 Tools install's password prompt only while someone answers it)"
-            }
-            Self::SetupDraft => " (a person's own draft: it holds only while it is there)",
-            Self::SetupChoice => {
-                " (a choice someone made and not yet saved: it holds only while it is unsaved)"
-            }
-        }
-    }
-}
-
-/// How a hold is bounded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HoldBound {
-    /// It lifts within this long of its start, whatever anyone does.
-    Within(Duration),
-    /// It lifts at an event this program makes by itself: a worker's answer, a timer, a check,
-    /// the end of aterm's own work.
-    Program,
-    /// A person's own state that is true now; it holds only while that state is, never on how
-    /// long ago a window took an event or whether anyone is at the Mac.
-    PersonNow(PersonHold),
-}
-
 impl LaneHold {
     /// What lifts the hold, for the log line that names it ("it lands when …").
     #[must_use]
@@ -263,8 +213,8 @@ impl LaneHold {
     }
 
     /// How the hold is bounded. No arm may wait for a person's event: a hold is bounded by time,
-    /// by this program, or by a person's state that is true now, which only a [`PersonHold`]
-    /// names.
+    /// by this program (with [`PROGRAM_BACKSTOP`] for the event that never comes), or by a
+    /// person's state that is true now, which only a [`PersonHold`] names.
     #[must_use]
     pub(crate) const fn bound(self) -> HoldBound {
         match self {
@@ -299,19 +249,22 @@ impl LaneHold {
             | Self::BoundaryItem
             | Self::TabStarting
             | Self::PolicyRead
-            | Self::ActivityRevoked => HoldBound::Program,
+            | Self::ActivityRevoked => HoldBound::Program {
+                backstop: PROGRAM_BACKSTOP,
+            },
         }
     }
 
     /// The bound as the line says it after [`Self::lifts`]: the time it lifts within, or that it
     /// holds only while the person's own dialog or draft is there; nothing for a hold this program
-    /// lifts itself.
+    /// lifts itself, whose backstop says its own line when it passes.
     #[must_use]
     pub(crate) fn bound_words(self) -> String {
         match self.bound() {
             HoldBound::Within(bound) => format!(" (at most {} s)", bound.as_secs()),
-            HoldBound::Program => String::new(),
+            HoldBound::Program { .. } => String::new(),
             HoldBound::PersonNow(person) => person.words().to_string(),
+            HoldBound::WorkNow(work) => work.words().to_string(),
         }
     }
 
@@ -407,6 +360,30 @@ pub(crate) struct HeldLane {
     pub(crate) hold: LaneHold,
     /// The poll that first found it.
     pub(crate) since: Instant,
+    /// Where a program hold's backstop counts from: `since`, or the poll that last passed it.
+    backstop_from: Instant,
+}
+
+impl HeldLane {
+    /// The same hold found again at `now` by a poll of build `build` whose refusal said `reason`:
+    /// past a program hold's backstop, the line that journals it, and its backstop counted again
+    /// from `now`. The hold stays named, from the same `since`; nothing here attempts.
+    fn past_backstop(&mut self, build: u64, reason: &str, now: Instant) -> Option<String> {
+        let HoldBound::Program { backstop } = self.hold.bound() else {
+            return None;
+        };
+        if now.saturating_duration_since(self.backstop_from) < backstop {
+            return None;
+        }
+        self.backstop_from = now;
+        Some(backstop_line(
+            build,
+            self.hold,
+            reason,
+            now.saturating_duration_since(self.since),
+            backstop,
+        ))
+    }
 }
 
 /// The hold an armed intent is under past its ladder, as it was named (`AutoApplyIntent::held`):
@@ -417,8 +394,10 @@ pub(crate) struct NamedHold(Option<HeldLane>);
 
 impl NamedHold {
     /// A poll in `Land` declined build `build` under `hold`, whose refusal said `reason`. The
-    /// line to say when this hold is new (`None` when it was already named, or when
-    /// [`LaneHold::said_elsewhere`]).
+    /// line to say when this hold is new (`None` when [`LaneHold::said_elsewhere`]); for the hold
+    /// already named, `None`, except that a program hold standing past its backstop since it was
+    /// named, or since its backstop last passed, says [`backstop_line`] once per backstop: the
+    /// lane derives its hold again at every poll, so that line is the whole act.
     pub(crate) fn hold(
         &mut self,
         build: u64,
@@ -427,10 +406,14 @@ impl NamedHold {
         now: Instant,
         now_unix: u64,
     ) -> Option<String> {
-        if self.0.is_some_and(|held| held.hold == hold) {
-            return None;
+        if let Some(held) = self.0.as_mut().filter(|held| held.hold == hold) {
+            return held.past_backstop(build, reason, now);
         }
-        self.0 = Some(HeldLane { hold, since: now });
+        self.0 = Some(HeldLane {
+            hold,
+            since: now,
+            backstop_from: now,
+        });
         (!hold.said_elsewhere()).then(|| held_line(build, hold, reason, now_unix))
     }
 
@@ -500,6 +483,27 @@ pub(crate) fn released_line(build: u64, hold: LaneHold, lasted: Duration) -> Str
         "update auto-apply for build {build}: the hold by {} is over after {} s",
         hold.token(),
         lasted.as_secs()
+    )
+}
+
+/// The line that journals a program hold that has stood `lasted` since it was named, past its
+/// `backstop`: the lane does not attempt on it, and derives the hold again at each poll.
+#[must_use]
+pub(crate) fn backstop_line(
+    build: u64,
+    hold: LaneHold,
+    reason: &str,
+    lasted: Duration,
+    backstop: Duration,
+) -> String {
+    format!(
+        "update auto-apply for build {build}: still held by {reason} ({}) after {} s, past its \
+         {} s backstop; the lane derives the hold again at each poll and attempts only when its \
+         gates allow; it lands when {}",
+        hold.token(),
+        lasted.as_secs(),
+        backstop.as_secs(),
+        hold.lifts()
     )
 }
 

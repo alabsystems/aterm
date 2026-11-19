@@ -481,12 +481,10 @@ pub(crate) struct LetterGuard {
     lum: Vec<f32>,
     ring_lo: Vec<f32>,
     ring_hi: Vec<f32>,
-    /// Per ring box pixel each channel's least and greatest ground within
-    /// [`RING`] columns ([`Self::holds`]), and per inner pixel of the row
-    /// being read the reading of each channel's least and greatest within
-    /// [`RING`] px of it.
-    ring_lo_c: Vec<u32>,
-    ring_hi_c: Vec<u32>,
+    /// The ring box's ground by channel and each ring's least and greatest of each channel
+    /// ([`Self::holds`], [`RingPlanes`]), and per inner pixel of the row being read the reading
+    /// of each channel's least and greatest within [`RING`] px of it.
+    ring_planes: RingPlanes,
     ground_lo: Vec<f32>,
     ground_hi: Vec<f32>,
     /// The ink's luminance per inner ring box pixel, where an over-text
@@ -683,8 +681,7 @@ impl LetterGuard {
         lum: Vec::new(),
         ring_lo: Vec::new(),
         ring_hi: Vec::new(),
-        ring_lo_c: Vec::new(),
-        ring_hi_c: Vec::new(),
+        ring_planes: RingPlanes::EMPTY,
         ground_lo: Vec::new(),
         ground_hi: Vec::new(),
         ink_lum: Vec::new(),
@@ -1630,6 +1627,110 @@ const fn layer(
     }
 }
 
+/// A ring box's ground pixels split by channel, and the least and greatest of each channel over
+/// every ring of [`RING`] px about a pixel ([`LetterGuard::holds`]): the judge's median of a
+/// ring's channel lies between those two. Each channel is a plane of bytes, so a run's least or
+/// greatest is one `u8::min` or `u8::max` per pixel over whole planes at once, as many pixels a
+/// step as the machine's vectors hold; packed, each pixel picked its three channels apart.
+#[derive(Default)]
+struct RingPlanes {
+    /// The box's ground, each channel's plane (red, green, blue), row-major.
+    px: [Vec<u8>; 3],
+    /// Each channel's least and greatest of the `2 * RING + 1` pixels of a row from each pixel.
+    run_lo: [Vec<u8>; 3],
+    run_hi: [Vec<u8>; 3],
+    /// Each channel's least and greatest of the ring box `2 * RING + 1` px square from each
+    /// pixel (its top left corner), the column of rows' runs below it.
+    ring_lo: [Vec<u8>; 3],
+    ring_hi: [Vec<u8>; 3],
+}
+
+impl RingPlanes {
+    const EMPTY: Self = Self {
+        px: [Vec::new(), Vec::new(), Vec::new()],
+        run_lo: [Vec::new(), Vec::new(), Vec::new()],
+        run_hi: [Vec::new(), Vec::new(), Vec::new()],
+        ring_lo: [Vec::new(), Vec::new(), Vec::new()],
+        ring_hi: [Vec::new(), Vec::new(), Vec::new()],
+    };
+
+    /// Split the box's `0x00RRGGBB` ground pixels `px` into their channels' planes.
+    #[inline]
+    fn split(&mut self, px: &[u32]) {
+        let [red, green, blue] = &mut self.px;
+        for plane in [&mut *red, &mut *green, &mut *blue] {
+            plane.clear();
+            plane.resize(px.len(), 0);
+        }
+        let planes = red.iter_mut().zip(green.iter_mut()).zip(blue.iter_mut());
+        for (&c, ((r, g), b)) in px.iter().zip(planes) {
+            (*r, *g, *b) = ((c >> 16) as u8, (c >> 8) as u8, c as u8);
+        }
+    }
+
+    /// Each channel's least and greatest over the whole box, packed `0x00RRGGBB`.
+    #[inline]
+    fn box_least_greatest(&self) -> (u32, u32) {
+        let (mut lo, mut hi) = (0u32, 0u32);
+        for (plane, sh) in self.px.iter().zip([16u32, 8, 0]) {
+            let (l, h) = plane
+                .iter()
+                .fold((u8::MAX, u8::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+            lo |= u32::from(l) << sh;
+            hi |= u32::from(h) << sh;
+        }
+        (lo, hi)
+    }
+
+    /// `pick` (`u8::min` or `u8::max`) of the `2 * RING + 1` values `step` apart from each
+    /// index of `src` whose run lies in it, into `out` (none where no run does).
+    #[inline(always)]
+    fn run(src: &[u8], step: usize, out: &mut Vec<u8>, pick: impl Fn(u8, u8) -> u8) {
+        let reach = 2 * RING as usize;
+        out.clear();
+        let Some(m) = src.len().checked_sub(reach * step) else {
+            return;
+        };
+        out.extend_from_slice(&src[..m]);
+        for d in 1..=reach {
+            for (o, &v) in out.iter_mut().zip(&src[d * step..d * step + m]) {
+                *o = pick(*o, v);
+            }
+        }
+    }
+
+    /// Each channel's least and greatest of every ring of the box `w` px wide
+    /// ([`Self::ring_at`]): the runs along each row, then down each column of those.
+    #[inline]
+    fn rings(&mut self, w: usize) {
+        let Self {
+            px,
+            run_lo,
+            run_hi,
+            ring_lo,
+            ring_hi,
+        } = self;
+        let runs = run_lo.iter_mut().zip(run_hi.iter_mut());
+        let rings = ring_lo.iter_mut().zip(ring_hi.iter_mut());
+        for ((px, (run_lo, run_hi)), (ring_lo, ring_hi)) in px.iter().zip(runs).zip(rings) {
+            Self::run(px, 1, run_lo, u8::min);
+            Self::run(px, 1, run_hi, u8::max);
+            Self::run(run_lo, w, ring_lo, u8::min);
+            Self::run(run_hi, w, ring_hi, u8::max);
+        }
+    }
+
+    /// The least and greatest of each channel over the ring whose box's top left is box pixel
+    /// `k` ([`Self::rings`]), packed `0x00RRGGBB`.
+    #[inline]
+    fn ring_at(&self, k: usize) -> (u32, u32) {
+        let pack = |p: &[Vec<u8>; 3]| {
+            u32::from(p[0][k]) << 16 | u32::from(p[1][k]) << 8 | u32::from(p[2][k])
+        };
+        (pack(&self.ring_lo), pack(&self.ring_hi))
+    }
+}
+
 impl LetterGuard {
     /// Composite the ring box under the cell's lights at share `s` (`1.0`,
     /// or a share in `(0, 1)` [`Self::share`] weighs), so each pixel meets
@@ -2276,18 +2377,6 @@ impl LetterGuard {
         const fn ratio(a: f32, b: f32) -> f32 {
             (a.max(b) + 0.05) / (a.min(b) + 0.05)
         }
-        /// Each channel's least (`max` false) or greatest of two colours.
-        #[inline(always)]
-        const fn ch_pick(a: u32, b: u32, max: bool) -> u32 {
-            let mut out = 0;
-            let mut sh = 0u32;
-            while sh <= 16 {
-                let (x, y) = (a & (0xff << sh), b & (0xff << sh));
-                out |= if (x < y) == max { y } else { x };
-                sh += 8;
-            }
-            out
-        }
         let (w, h) = ((j.x1 - j.x0) as usize, (j.y1 - j.y0) as usize);
         let r = RING as usize;
         if w <= 2 * r || h <= 2 * r {
@@ -2310,8 +2399,7 @@ impl LetterGuard {
         let mut ink_lum = std::mem::take(&mut self.ink_lum);
         let mut ring_lo = std::mem::take(&mut self.ring_lo);
         let mut ring_hi = std::mem::take(&mut self.ring_hi);
-        let mut ring_lo_c = std::mem::take(&mut self.ring_lo_c);
-        let mut ring_hi_c = std::mem::take(&mut self.ring_hi_c);
+        let mut planes = std::mem::take(&mut self.ring_planes);
         let mut ground_lo = std::mem::take(&mut self.ground_lo);
         let mut ground_hi = std::mem::take(&mut self.ground_hi);
         let n = w * h;
@@ -2319,10 +2407,7 @@ impl LetterGuard {
         ink_lum.resize(n, 0.0);
         ground_lo.resize(iw, 0.0);
         ground_hi.resize(iw, 0.0);
-        if channels {
-            ring_lo_c.resize(n, 0);
-            ring_hi_c.resize(n, 0);
-        } else {
+        if !channels {
             lum.resize(n, 0.0);
             ring_lo.resize(n, 0.0);
             ring_hi.resize(n, 0.0);
@@ -2478,13 +2563,8 @@ impl LetterGuard {
         if channels {
             // A median of every ring in the box reads between the box's least and greatest of
             // each channel: clear of the ink when that span of readings is.
-            let (mut lo_c, mut hi_c) = (px_ground[0], px_ground[0]);
-            let mut k = 1;
-            while k < n {
-                lo_c = ch_pick(lo_c, px_ground[k], false);
-                hi_c = ch_pick(hi_c, px_ground[k], true);
-                k += 1;
-            }
+            planes.split(&px_ground[..n]);
+            let (lo_c, hi_c) = planes.box_least_greatest();
             let lo = crate::color_math::relative_luminance_with(table, lo_c);
             let hi = crate::color_math::relative_luminance_with(table, hi_c);
             near = lo < light && hi > dark;
@@ -2551,50 +2631,33 @@ impl LetterGuard {
             let mut ready = 0;
             let mut last_lo: (u32, f32) = (j.ground, j.l_ground);
             let mut last_hi: (u32, f32) = (j.ground, j.l_ground);
+            if channels {
+                // Every ring's least and greatest of each channel at once, its rows' runs then
+                // their columns' ([`RingPlanes::rings`]).
+                planes.rings(w);
+            }
             let mut y = r;
             while holds && y < h - r {
-                while ready <= y + r {
-                    if channels {
-                        let row = &px_ground[ready * w..ready * w + w];
-                        let (lo_row, hi_row) = (
-                            &mut ring_lo_c[ready * w + r..ready * w + x_end],
-                            &mut ring_hi_c[ready * w + r..ready * w + x_end],
-                        );
-                        let mut x = 0;
-                        while x < iw {
-                            let ring = &row[x..x + 2 * r + 1];
-                            let (mut l, mut g) = (ring[0], ring[0]);
-                            let mut rx = 1;
-                            while rx < ring.len() {
-                                l = ch_pick(l, ring[rx], false);
-                                g = ch_pick(g, ring[rx], true);
-                                rx += 1;
-                            }
-                            lo_row[x] = l;
-                            hi_row[x] = g;
-                            x += 1;
+                while !channels && ready <= y + r {
+                    let row = &lum[ready * w..ready * w + w];
+                    let (lo_row, hi_row) = (
+                        &mut ring_lo[ready * w + r..ready * w + x_end],
+                        &mut ring_hi[ready * w + r..ready * w + x_end],
+                    );
+                    let mut x = 0;
+                    while x < iw {
+                        let ring = &row[x..x + 2 * r + 1];
+                        let (mut l, mut g) = (ring[0], ring[0]);
+                        let mut rx = 1;
+                        while rx < ring.len() {
+                            let v = ring[rx];
+                            l = l.min(v);
+                            g = g.max(v);
+                            rx += 1;
                         }
-                    } else {
-                        let row = &lum[ready * w..ready * w + w];
-                        let (lo_row, hi_row) = (
-                            &mut ring_lo[ready * w + r..ready * w + x_end],
-                            &mut ring_hi[ready * w + r..ready * w + x_end],
-                        );
-                        let mut x = 0;
-                        while x < iw {
-                            let ring = &row[x..x + 2 * r + 1];
-                            let (mut l, mut g) = (ring[0], ring[0]);
-                            let mut rx = 1;
-                            while rx < ring.len() {
-                                let v = ring[rx];
-                                l = l.min(v);
-                                g = g.max(v);
-                                rx += 1;
-                            }
-                            lo_row[x] = l;
-                            hi_row[x] = g;
-                            x += 1;
-                        }
+                        lo_row[x] = l;
+                        hi_row[x] = g;
+                        x += 1;
                     }
                     ready += 1;
                 }
@@ -2603,14 +2666,7 @@ impl LetterGuard {
                 let mut x = 0;
                 while x < iw {
                     let (lo, hi) = if channels {
-                        let at = from_ring + x;
-                        let (mut lo_c, mut hi_c) = (ring_lo_c[at], ring_hi_c[at]);
-                        let mut i = 1;
-                        while i <= 2 * r {
-                            lo_c = ch_pick(lo_c, ring_lo_c[from_ring + i * w + x], false);
-                            hi_c = ch_pick(hi_c, ring_hi_c[from_ring + i * w + x], true);
-                            i += 1;
-                        }
+                        let (lo_c, hi_c) = planes.ring_at((y - r) * w + x);
                         if lo_c != last_lo.0 {
                             let l = crate::color_math::relative_luminance_with(table, lo_c);
                             last_lo = (lo_c, l);
@@ -2700,8 +2756,7 @@ impl LetterGuard {
         self.ink_lum = ink_lum;
         self.ring_lo = ring_lo;
         self.ring_hi = ring_hi;
-        self.ring_lo_c = ring_lo_c;
-        self.ring_hi_c = ring_hi_c;
+        self.ring_planes = planes;
         self.ground_lo = ground_lo;
         self.ground_hi = ground_hi;
         holds
@@ -4099,18 +4154,21 @@ impl InkLedger {
     /// cell's box itself (not only its feather) in its rows, within the
     /// feather's reach `fx` across.
     #[inline]
-    const fn meets_dim_box(&self, (x0, y0, x1, y1): (i32, i32, i32, i32), fx: f32) -> bool {
+    fn meets_dim_box(&self, (x0, y0, x1, y1): (i32, i32, i32, i32), fx: f32) -> bool {
         let (x0f, y0f, x1f, y1f) = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
         let dims = self.dims.as_slice();
-        let mut i = 0;
-        while i < dims.len() {
-            let d = &dims[i];
-            if d.share < 1.0 && y0f < d.y1 && y1f > d.y0 && x0f < d.x1 + fx && x1f > d.x0 - fx {
-                return true;
-            }
-            i += 1;
+        let meets = |d: &Dim| {
+            d.share < 1.0 && y0f < d.y1 && y1f > d.y0 && x0f < d.x1 + fx && x1f > d.x0 - fx
+        };
+        // With the dims indexed, those whose left edge lies within the feather's reach (and a
+        // pixel more for each edge's rounding) of the box: no other meets it.
+        let fx_px = i64::from(fx.ceil() as i32) + 2;
+        match self.dims_in(i64::from(x0) - fx_px, i64::from(x1) + fx_px) {
+            Some(reach) => self.dims_order[reach]
+                .iter()
+                .any(|&i| meets(&dims[i as usize])),
+            None => dims.iter().any(meets),
         }
-        false
     }
 
     /// Cut every ramp of `ramps` to the guard's dims as
@@ -5335,9 +5393,12 @@ impl CursorGlow {
             );
         }
         if !ledger.dims.is_empty() {
+            // The dims stand until every stream is cut to them: each piece reads those in reach.
+            ledger.index_dims();
             ledger.guard_mask_stream(&mut self.under_out, &mut self.under_ramps, true);
             ledger.guard_mask_stream(over, &mut self.out_ramps, false);
             ledger.guard_mask_halos(&mut self.halo_out);
+            ledger.unindex_dims();
         }
         ledger.dims.clear();
         print

@@ -692,11 +692,7 @@ fn the_holder_trims_its_builds_directory_when_the_build_ends() {
     receipt_of(&leaf, selection, new, 10 * MINUTE);
     let trimmed = build_ended(&leaf, &trim).expect("the second build retired a unit");
     assert_eq!(
-        trimmed
-            .went
-            .iter()
-            .map(|(_, why)| why.clone())
-            .collect::<Vec<_>>(),
+        trimmed.went.iter().map(|(_, why)| *why).collect::<Vec<_>>(),
         vec![crate::build_cache::Unused::Stale {
             incremental: 0,
             units: 0,

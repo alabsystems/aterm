@@ -307,3 +307,355 @@ fn misuse_is_refused_before_the_kernel_is_asked() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A received socket right retains its peer after the sender retires its originals.
+/// Sender custody stays live until the descriptor and its generation are accepted,
+/// as the handoff protocol requires.
+#[test]
+fn a_received_socket_right_keeps_its_peer_alive_after_the_sender_closes() {
+    use std::io::Read as _;
+
+    fn descriptor(socket: &CtlStream) -> (RawFd, i32, i32, std::io::Result<(u64, u64, u32)>) {
+        let fd = socket.as_raw_fd();
+        // SAFETY: both commands only read flags of the socket borrowed for this call.
+        let (flags, status) = unsafe { (fcntl(fd, F_GETFD), fcntl(fd, libc::F_GETFL)) };
+        // SAFETY: this live borrowed descriptor is used only for metadata; ManuallyDrop
+        // prevents the temporary File from closing it or extending its kernel lifetime.
+        let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+        let identity = file.metadata().map(|m| (m.dev(), m.ino(), m.mode()));
+        (fd, flags, status, identity)
+    }
+
+    fn failure_state(socket: &CtlStream) -> String {
+        let mut peek = [0u8];
+        // SAFETY: peek is writable for one byte; MSG_PEEK never consumes it and
+        // MSG_DONTWAIT keeps failure diagnostics from waiting on the socket.
+        let n = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                peek.as_mut_ptr().cast(),
+                peek.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        let peeked = if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok((n, peek))
+        };
+        let mut error: libc::c_int = 0;
+        let mut len =
+            u32::try_from(std::mem::size_of_val(&error)).expect("socket error size fits socklen_t");
+        // SAFETY: error and len are correctly sized writable getsockopt outputs.
+        // SO_ERROR clears pending error state, so this runs only after the decisive read failed.
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&raw mut error).cast(),
+                &raw mut len,
+            )
+        };
+        let error = if rc < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok((error, len))
+        };
+        format!(
+            "descriptor={:?} peek={peeked:?} SO_ERROR={error:?}",
+            descriptor(socket)
+        )
+    }
+
+    let _guard = serial();
+    let (sender, receiver) = aterm_uds::kept_out(CtlStream::pair).expect("transport pair");
+    let (capability, mut peer) = aterm_uds::kept_out(CtlStream::pair).expect("capability pair");
+    for stream in [&sender, &receiver, &capability, &peer] {
+        stream.set_nonblocking(true).expect("nonblocking socket");
+    }
+    let original = [
+        ("sender", descriptor(&sender)),
+        ("receiver", descriptor(&receiver)),
+        ("capability", descriptor(&capability)),
+        ("peer", descriptor(&peer)),
+    ];
+
+    assert_eq!(
+        fdpass::send_with_fds(&sender, b"Q0123456789abcdef", &[capability.as_fd()])
+            .expect("queue socket right"),
+        17
+    );
+    let mut byte = [0];
+    assert_eq!(
+        peer.read(&mut byte)
+            .expect_err("sender custody must keep the peer live before receive")
+            .kind(),
+        ErrorKind::WouldBlock,
+        "the sender keeps custody until the receiver accepts the socket"
+    );
+
+    let mut transferred = aterm_uds::kept_out(|| {
+        let mut marker = [0];
+        let mut received = fdpass::recv_with_fds(&receiver, &mut marker, 1)?;
+        assert_eq!(received.bytes, 1, "one queued payload byte");
+        assert_eq!(&marker, b"Q");
+        assert_eq!(received.fds.len(), 1, "one queued socket right");
+        Ok::<_, std::io::Error>(CtlStream::from(received.fds.pop().expect("socket right")))
+    })
+    .expect("receive the queued socket right");
+    transferred
+        .set_nonblocking(true)
+        .expect("nonblocking transferred socket");
+    let installed = [
+        ("receiver", descriptor(&receiver)),
+        ("transferred", descriptor(&transferred)),
+        ("peer", descriptor(&peer)),
+    ];
+    let mut generation = [0; 16];
+    (&receiver)
+        .read_exact(&mut generation)
+        .expect("remaining payload after the descriptor marker");
+    assert_eq!(&generation, b"0123456789abcdef");
+    drop(capability);
+    drop(sender);
+    let sender_retired = [
+        ("receiver", descriptor(&receiver)),
+        ("peer", descriptor(&peer)),
+    ];
+    drop(receiver);
+    let transport_retired = [
+        ("transferred", descriptor(&transferred)),
+        ("peer", descriptor(&peer)),
+    ];
+
+    assert_eq!(
+        transferred
+            .write(b"C")
+            .expect("write through received right"),
+        1
+    );
+    assert_eq!(peer.read(&mut byte).expect("read from received right"), 1);
+    assert_eq!(&byte, b"C");
+    assert_eq!(peer.write(b"P").expect("write to received right"), 1);
+    let reverse = transferred.read(&mut byte);
+    if !matches!(&reverse, Ok(1)) {
+        eprintln!(
+            "received socket reverse read={reverse:?} byte={byte:?}\n\
+             descriptor tuple=(raw_fd, descriptor_flags, status_flags, fstat(dev,ino,mode))\n\
+             original={original:?}\nsender_retired={sender_retired:?}\n\
+             installed={installed:?}\ntransport_retired={transport_retired:?}\n\
+             transferred_now={}\npeer_now={}",
+            failure_state(&transferred),
+            failure_state(&peer),
+        );
+    }
+    assert_eq!(reverse.expect("read through received right"), 1);
+    assert_eq!(&byte, b"P");
+
+    drop(transferred);
+    assert_eq!(
+        aterm_uds::deadline::once_released(|| peer.read(&mut byte)),
+        0,
+        "closing the received right releases its peer"
+    );
+}
+
+/// A separately executed receiver adopts a fresh socket after proving its own
+/// startup, then exchanges the native monitor's request and response sizes.
+#[test]
+fn a_self_executed_receiver_accepts_socket_ownership_before_sender_retirement() {
+    use aterm_spec::wait::until_while_working;
+    use std::io::Read as _;
+
+    const ROLE: &str = "ATERM_UDS_FDPASS_RECEIVER_PARENT";
+    const TEST: &str = "a_self_executed_receiver_accepts_socket_ownership_before_sender_retirement";
+    const TRANSFER: &[u8; 17] = b"M0123456789abcdef";
+
+    // The parent owns the helper's progress guard and cleanup. Readiness puts
+    // the helper to sleep, so its polling CPU cannot hide a stalled exchange.
+    fn read_ready(stream: &mut CtlStream, mut bytes: &mut [u8]) {
+        while !bytes.is_empty() {
+            match stream.read(bytes) {
+                Ok(0) => panic!("socket reached EOF before all expected bytes arrived"),
+                Ok(n) => bytes = &mut bytes[n..],
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    aterm_uds::ready::any(&[stream.as_fd()], None).expect("socket readable");
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => panic!("socket read failed: {error}"),
+            }
+        }
+    }
+
+    fn read_from_child(pid: u32, stream: &mut CtlStream, bytes: &mut [u8], what: &str) {
+        let mut used = 0;
+        until_while_working(pid, what, || match stream.read(&mut bytes[used..]) {
+            Ok(0) => panic!("child socket reached EOF before {what}"),
+            Ok(n) => {
+                used += n;
+                (used == bytes.len()).then_some(())
+            }
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                None
+            }
+            Err(error) => panic!("child socket read failed while waiting for {what}: {error}"),
+        });
+    }
+
+    let request: [u8; 48] = std::array::from_fn(|i| u8::try_from(i).unwrap());
+    let response: [u8; 442] = std::array::from_fn(|i| u8::try_from(i % 251).unwrap());
+
+    if let Some(parent) = std::env::var_os(ROLE) {
+        let parent: u32 = parent.to_str().expect("parent PID text").parse().unwrap();
+        assert_eq!(
+            aterm_uds::process::read_process_parent(i32::try_from(std::process::id()).unwrap()),
+            Some(parent),
+            "the receiver was executed by this test's owning parent"
+        );
+        let mut bootstrap = CtlStream::from(
+            aterm_uds::kept_out(|| std::io::stdin().as_fd().try_clone_to_owned())
+                .expect("kept-out bootstrap clone"),
+        );
+        bootstrap.set_nonblocking(true).unwrap();
+        assert_eq!(bootstrap.write(b"B").expect("prove helper execution"), 1);
+
+        let mut capability = loop {
+            aterm_uds::ready::any(&[bootstrap.as_fd()], None).expect("delegation readable");
+            let received = aterm_uds::kept_out(|| {
+                let mut marker = [0];
+                let mut got = fdpass::recv_with_fds(&bootstrap, &mut marker, 1)?;
+                assert_eq!(got.bytes, 1, "the marker is received separately");
+                assert_eq!(marker, [TRANSFER[0]]);
+                assert_eq!(got.fds.len(), 1, "one fresh socket capability");
+                Ok::<_, std::io::Error>(CtlStream::from(got.fds.pop().unwrap()))
+            });
+            match received {
+                Ok(stream) => break stream,
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(error) => panic!("receive delegated socket: {error}"),
+            }
+        };
+        let mut generation = [0; 16];
+        read_ready(&mut bootstrap, &mut generation);
+        assert_eq!(&generation, &TRANSFER[1..]);
+        assert_eq!(
+            bootstrap.write(b"A").expect("accept the actual descriptor"),
+            1
+        );
+        let mut retired = [0];
+        read_ready(&mut bootstrap, &mut retired);
+        assert_eq!(&retired, b"D", "the sender retired its capability copy");
+        loop {
+            aterm_uds::ready::any(&[bootstrap.as_fd()], None).expect("bootstrap close readable");
+            match bootstrap.read(&mut retired) {
+                Ok(0) => break,
+                Ok(_) => panic!("bootstrap had bytes beyond retirement confirmation"),
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(error) => panic!("bootstrap retirement: {error}"),
+            }
+        }
+        drop(bootstrap);
+        // The original bootstrap at stdin 0 intentionally remains open.
+        capability.set_nonblocking(true).unwrap();
+        let mut empty = [0];
+        assert_eq!(
+            capability
+                .read(&mut empty)
+                .expect_err("the parent waits for the request before writing")
+                .kind(),
+            ErrorKind::WouldBlock,
+            "an empty live transferred socket must not report EOF"
+        );
+        assert_eq!(
+            capability.write(&request).expect("write 48-byte request"),
+            48
+        );
+        let mut header = [0; 28];
+        let mut body = [0; 414];
+        read_ready(&mut capability, &mut header);
+        read_ready(&mut capability, &mut body);
+        assert_eq!(&header, &response[..28]);
+        assert_eq!(&body, &response[28..]);
+        drop(capability);
+        return;
+    }
+
+    let _serial = serial();
+    struct Owned(aterm_uds::spawnfd::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            aterm_uds::deadline::settle_child(&mut self.0);
+        }
+    }
+
+    let exe = std::env::current_exe().expect("this Cargo-named test binary");
+    let (mut sender, receiver) = aterm_uds::kept_out(CtlStream::pair).expect("bootstrap pair");
+    sender.set_nonblocking(true).unwrap();
+    // This temporary command drops its copy of the child's stdin immediately
+    // after spawn; the parent retains only its own bootstrap endpoint.
+    let mut child = Owned(
+        aterm_uds::spawnfd::command(&exe)
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(ROLE, std::process::id().to_string())
+            .stdin(std::os::fd::OwnedFd::from(receiver))
+            .process_group(0)
+            .spawn()
+            .expect("execute socket receiver"),
+    );
+    let pid = child.0.id();
+    let mut started = [0];
+    read_from_child(pid, &mut sender, &mut started, "helper execution byte");
+    assert_eq!(&started, b"B");
+
+    let (capability, mut peer) =
+        aterm_uds::kept_out(CtlStream::pair).expect("fresh capability pair");
+    peer.set_nonblocking(true).unwrap();
+    assert_eq!(
+        fdpass::send_with_fds(&sender, TRANSFER, &[capability.as_fd()])
+            .expect("delegate fresh socket after helper execution"),
+        17
+    );
+    let mut accepted = [0];
+    read_from_child(
+        pid,
+        &mut sender,
+        &mut accepted,
+        "receiver accepted the actual descriptor",
+    );
+    assert_eq!(&accepted, b"A");
+    drop(capability);
+    assert_eq!(
+        sender.write(b"D").expect("confirm capability retirement"),
+        1
+    );
+    drop(sender);
+
+    let mut actual_request = [0; 48];
+    read_from_child(pid, &mut peer, &mut actual_request, "48-byte request");
+    assert_eq!(actual_request, request);
+    assert_eq!(peer.write(&response).expect("write 442-byte response"), 442);
+    let mut byte = [0];
+    until_while_working(
+        pid,
+        "receiver consumed its response and closed its socket",
+        || match peer.read(&mut byte) {
+            Ok(0) => Some(()),
+            Ok(_) => panic!("the receiver sent bytes beyond its exact 48-byte request"),
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                None
+            }
+            Err(error) => panic!("waiting for receiver socket close: {error}"),
+        },
+    );
+    let status = until_while_working(pid, "receiver owning exit", || {
+        child.0.try_wait().expect("wait for this test's receiver")
+    });
+    assert!(status.success(), "receiver exited {status:?}");
+}

@@ -27,6 +27,7 @@ fn ac(cli: Cli, address: &str) -> Value {
 /// The twin a sync's `--json` names beside the default login: the default login's row `main`,
 /// which names no address, by its label, and the row of `cli`'s account at `address` by its key,
 /// slug and name, with what keeps both (`kept`).
+#[cfg(unix)]
 fn twin_json(cli: Cli, address: &str, kept: &str) -> Value {
     let (pk, names) = crate::harness::account_names::names_of_login(cli, None, address, None)
         .expect("an account");
@@ -462,6 +463,7 @@ fn a_lab_sync_names_no_fleet_file_it_did_not_write() {
                 lab,
                 rows_changed: RowChanges::default(),
                 clashes: Vec::new(),
+                pending: None,
             },
             records: accounts::AccountRecords::default(),
             enrolled: BTreeSet::new(),
@@ -1968,4 +1970,182 @@ fn a_completion_that_names_the_twin_keeps_it_on_the_report_and_the_sync() {
         assert_eq!(doc["twin_merged"] == Value::Null, completed, "{doc}");
         assert_eq!(bed.rows(cli).len(), if completed { 2 } else { 1 });
     }
+}
+
+/// A CODEX SYNC WHILE THE LAB IS NOT READ YET MOVES NO ROW OFF THE DEFAULT LOGIN AND REFUSES
+/// NOTHING: the default login names `work`'s account while `main` is on it, so a sync with no lab
+/// to wait for moves `main` to its own directory and `work` onto the default login (CONTROL);
+/// while the lab is unread no row or login directory moves, the receipt names the row left on the
+/// default login and says once why the lab is not read, and both `accounts sync --cli codex`
+/// (exit 0, nothing on stderr) and the sync init and the upkeep run ([`sync_cli_accounts_with`])
+/// succeed.
+/// NEGATIVE CONTROL: with `default_move_asked`'s pending arm removed, the move is refused in the
+/// pending sentence (`no row moved`), on stderr, and `sync_cli_accounts_with` fails.
+#[test]
+fn a_codex_sync_while_the_lab_is_unread_moves_no_login_and_refuses_nothing() {
+    use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
+    let cli = Cli::Codex;
+    let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("no source is fetched") };
+    let setup = || {
+        let bed = Bed::new();
+        let (main, work) = (email("main"), email("work"));
+        let work_dir = bed.dir(cli, "work", false);
+        bed.seed(
+            cli,
+            &[
+                Row {
+                    label: "main".into(),
+                    email: Some(main),
+                    ..Row::default()
+                },
+                Row {
+                    label: "work".into(),
+                    dir: Some(work_dir),
+                    email: Some(work.clone()),
+                    ..Row::default()
+                },
+            ],
+        );
+        bed.login(&work);
+        bed
+    };
+    let run = |bed: &Bed| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_cli_accounts_sync_with(
+            cli,
+            (&bed.env, None),
+            (None, None, false),
+            (&mut out, &mut err),
+            &fetch,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    };
+    let upkeep = |bed: &Bed| {
+        let home = bed.env.home.clone().unwrap();
+        sync_cli_accounts_with(
+            &home,
+            &bed.env.state,
+            &bed.roster_path(Cli::Claude),
+            NOW,
+            &fetch,
+        )
+        .into_iter()
+        .find(|(synced, _)| *synced == cli)
+        .map(|(_, synced)| synced)
+        .expect("Codex's sync")
+    };
+
+    let control = setup();
+    {
+        let _absent = TestSourceOverride::new(SourceSnapshot::Absent);
+        let (code, out, err) = run(&control);
+        assert_eq!(code, ExitCode::SUCCESS, "CONTROL: {out}{err}");
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("on this machine's own login: ")
+                    && line.contains(&email("work"))),
+            "CONTROL: {out}"
+        );
+    }
+    let main_dir = |bed: &Bed| {
+        bed.rows(cli)
+            .into_iter()
+            .find(|row| row.label == "main")
+            .and_then(|row| row.dir)
+    };
+    assert!(main_dir(&control).is_some(), "CONTROL: `main` moved off");
+
+    let bed = setup();
+    let roster = fs::read(bed.roster_path(cli)).unwrap();
+    let (code, out, err) = alab_roster::while_pending(|| run(&bed));
+    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
+    assert!(err.is_empty(), "nothing is refused: {err}");
+    assert!(
+        out.contains(&format!("default login: it names {}", email("work"))),
+        "{out}"
+    );
+    assert_eq!(
+        format!("{out}{err}").matches("not read yet").count(),
+        1,
+        "{out}{err}"
+    );
+    let synced = alab_roster::while_pending(|| upkeep(&bed));
+    assert!(
+        matches!(&synced, Ok(CliSync::LabPending { .. })),
+        "{synced:?}"
+    );
+    assert_eq!(
+        fs::read(bed.roster_path(cli)).unwrap(),
+        roster,
+        "no row moved"
+    );
+    assert_eq!(main_dir(&bed), None, "`main` stays on the default login");
+}
+
+/// A CODEX DEFAULT ROW WITH NO ADDRESS IS NOT COMPLETED FROM ITS LOGIN WHILE THE LAB IS NOT READ
+/// YET, AND THE SYNC INIT AND THE UPKEEP RUN SUCCEEDS: no source vouches for the address
+/// meanwhile, so the completion has nothing to do; with no lab to wait for, the same sync writes
+/// the login's address into the row (CONTROL).
+/// NEGATIVE CONTROL: with `complete_with`'s pending arm removed, [`sync_cli_accounts_with`] fails
+/// Codex's sync with the pending sentence.
+#[test]
+fn a_codex_default_row_is_not_completed_while_the_lab_is_unread_and_its_sync_succeeds() {
+    use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
+    let cli = Cli::Codex;
+    let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("no source is fetched") };
+    let setup = || {
+        let bed = Bed::new();
+        bed.seed(
+            cli,
+            &[Row {
+                label: "main".into(),
+                ..Row::default()
+            }],
+        );
+        bed.login(&email("main"));
+        bed
+    };
+    let upkeep = |bed: &Bed| {
+        let home = bed.env.home.clone().unwrap();
+        sync_cli_accounts_with(
+            &home,
+            &bed.env.state,
+            &bed.roster_path(Cli::Claude),
+            NOW,
+            &fetch,
+        )
+        .into_iter()
+        .find(|(synced, _)| *synced == cli)
+        .map(|(_, synced)| synced)
+        .expect("Codex's sync")
+    };
+
+    let control = setup();
+    {
+        let _absent = TestSourceOverride::new(SourceSnapshot::Absent);
+        let synced = upkeep(&control);
+        assert!(synced.is_ok(), "CONTROL: {synced:?}");
+    }
+    assert_eq!(
+        control.rows(cli)[0].email,
+        Some(email("main")),
+        "CONTROL: completed"
+    );
+
+    let bed = setup();
+    let roster = fs::read(bed.roster_path(cli)).unwrap();
+    let synced = alab_roster::while_pending(|| upkeep(&bed));
+    assert!(
+        matches!(&synced, Ok(CliSync::LabPending { .. })),
+        "{synced:?}"
+    );
+    assert_eq!(
+        fs::read(bed.roster_path(cli)).unwrap(),
+        roster,
+        "nothing is completed"
+    );
 }

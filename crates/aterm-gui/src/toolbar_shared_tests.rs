@@ -12,6 +12,7 @@ fn single_settings_tab_keeps_route_and_all_independent_states() {
         attention: crate::tab_bar::ChipLevel::Wait,
         conn: Some(crate::tab_bar::TabConnRole::Both),
         closable: true,
+        panel_numbers: false,
         team: crate::tab_bar::TabTeam::NONE,
     };
     let line = format_tab_chrome(
@@ -54,6 +55,7 @@ fn the_hover_names_the_reason_once() {
         attention: crate::tab_bar::ChipLevel::Wait,
         conn: None,
         closable: true,
+        panel_numbers: false,
         team: crate::tab_bar::TabTeam::NONE,
     };
     let stop = |cause| TabStripMetadata {
@@ -93,6 +95,7 @@ fn the_hover_names_the_app_once() {
         attention: crate::tab_bar::ChipLevel::Off,
         conn: None,
         closable: true,
+        panel_numbers: false,
         team: crate::tab_bar::TabTeam::NONE,
     };
     let clauses = |title, icon| tab_help(title, None, app(icon), 0).split(" · ").count();
@@ -122,6 +125,7 @@ fn connection_roles_state_their_direction_in_chrome_and_help() {
         attention: crate::tab_bar::ChipLevel::Off,
         conn,
         closable: true,
+        panel_numbers: false,
         team: crate::tab_bar::TabTeam::NONE,
     };
     let line = format_tab_chrome(
@@ -158,6 +162,7 @@ fn system_state_help_names_system_state_not_settings() {
             attention: crate::tab_bar::ChipLevel::Off,
             conn: None,
             closable: true,
+            panel_numbers: false,
             team: crate::tab_bar::TabTeam::NONE,
         },
         0,
@@ -175,6 +180,15 @@ fn terminal_help_and_chrome_have_no_phantom_app_icon() {
         tab_help("build-server", None, terminal, 0),
         "build-server · ⌘1"
     );
+    let panel = TabStripMetadata {
+        panel_numbers: true,
+        ..terminal
+    };
+    assert_eq!(tab_help("build-server", None, panel, 0), "build-server");
+    assert_eq!(
+        tab_display_label("build-server", panel.tab_number(0), 300.0),
+        "build-server"
+    );
     let line = format_tab_chrome(&["build-server".to_string()], &[terminal], &[None], 0)
         .expect("single terminal is explicit title chrome");
     assert!(line.contains("icons=[None]"));
@@ -182,9 +196,15 @@ fn terminal_help_and_chrome_have_no_phantom_app_icon() {
 
 #[test]
 fn visible_tab_label_spends_narrow_space_on_identity() {
-    assert_eq!(tab_display_label("Settings", 1, 146.0), "Settings  ⌘2");
-    assert_eq!(tab_display_label("Settings", 1, 51.0), "Settings");
-    assert_eq!(tab_display_label("build-server", 0, 74.0), "build-server");
+    assert_eq!(
+        tab_display_label("Settings", Some(2), 146.0),
+        "Settings  ⌘2"
+    );
+    assert_eq!(tab_display_label("Settings", Some(2), 51.0), "Settings");
+    assert_eq!(
+        tab_display_label("build-server", Some(1), 74.0),
+        "build-server"
+    );
 }
 
 #[test]

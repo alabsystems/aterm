@@ -587,6 +587,7 @@ pub(super) fn upgrade_visit(
     match plan(opts, &st, k) {
         Ok(_) => {}
         Err(super::NoPlan::Wait(why)) => return Some(said(r, format!("wait:{why}"))),
+        Err(super::NoPlan::Noted { word, .. }) => return Some(said(r, format!("wait:{word}"))),
         Err(super::NoPlan::Account(refusal)) => {
             return Some(said(r, format!("wait:{}", refusal.kind.word())));
         }

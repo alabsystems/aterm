@@ -4,12 +4,13 @@
 //! The job probe's Darwin layouts (`src/jobs/darwin.rs`), the process
 //! records' (`src/kproc.rs`), the code-signing flags and categories
 //! (`src/identity.rs`), the usage record and the processor set's
-//! (`src/rusage.rs`, `src/room.rs`) and the holder scan's
-//! (`aterm_uds::holders`) held to
+//! (`src/rusage.rs`, `src/room.rs`), the self readers' (`src/self_cpu.rs`,
+//! `src/self_vm.rs`) and the holder scan's (`aterm_uds::holders`) held to
 //! the SDK headers on both arches: every row of `jobs::darwin::SDK_ROWS`,
 //! `kproc::SDK_ROWS`, `identity::SDK_ROWS`, `rusage::SDK_ROWS` (the process
 //! readers' `rusage_info_v6`), `room::SDK_ROWS` (the processor set's load
-//! info) and `aterm_uds::holders::SDK_ROWS` (a flavor, a flag, a struct's
+//! info), `self_cpu::SDK_ROWS` (the thread records), `self_vm::SDK_ROWS`
+//! (`task_vm_info` through rev 7) and `aterm_uds::holders::SDK_ROWS` (a flavor, a flag, a struct's
 //! size, a field's offset) becomes one `_Static_assert` that clang compiles
 //! against `sys/proc_info.h`, `sys/sysctl.h`, `sys/resource.h`,
 //! `mach/mach.h`, `sys/event.h`, `mach/machine.h`, `vis.h`, `xlocale.h` and
@@ -32,7 +33,7 @@
 )]
 mod sdk_consts;
 
-use aterm_sysprobe::{identity, jobs, kproc, room, rusage, self_cpu};
+use aterm_sysprobe::{identity, jobs, kproc, room, rusage, self_cpu, self_vm};
 
 /// Every table's rows.
 fn rows() -> impl Iterator<Item = &'static (&'static str, i64)> {
@@ -43,6 +44,7 @@ fn rows() -> impl Iterator<Item = &'static (&'static str, i64)> {
         .chain(rusage::SDK_ROWS)
         .chain(room::SDK_ROWS)
         .chain(self_cpu::SDK_ROWS)
+        .chain(self_vm::SDK_ROWS)
         .chain(aterm_uds::holders::SDK_ROWS)
 }
 
@@ -98,13 +100,15 @@ fn every_layout_row_matches_the_sdk_on_both_arches() {
             && identity::SDK_ROWS.len() >= 14
             && rusage::SDK_ROWS.len() >= 25
             && room::SDK_ROWS.len() >= 4
+            && self_vm::SDK_ROWS.len() >= 17
             && aterm_uds::holders::SDK_ROWS.len() >= 23,
-        "a table lost rows: {}, {}, {}, {}, {} and {}",
+        "a table lost rows: {}, {}, {}, {}, {}, {} and {}",
         jobs::darwin::SDK_ROWS.len(),
         kproc::SDK_ROWS.len(),
         identity::SDK_ROWS.len(),
         rusage::SDK_ROWS.len(),
         room::SDK_ROWS.len(),
+        self_vm::SDK_ROWS.len(),
         aterm_uds::holders::SDK_ROWS.len()
     );
     let body = probe(None);

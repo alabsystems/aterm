@@ -1,7 +1,839 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+use std::collections::BTreeMap;
+
 use super::*;
+
+#[test]
+fn strip_event_admission_drains_real_changes_once_with_original_source_time() {
+    use crate::events::{EventKind, EventScope, SessionScope, StripChangeKind};
+    let mut model = Vitals::new();
+    model.record_time_gap(TimeGap {
+        start_ms: T0 + 1_000,
+        end_ms: T0 + 10_000,
+        kind: GapKind::Crash,
+    });
+    let estimate = StripEvent {
+        at_unix_ms: T0 + 1_000,
+        kind: StripEventKind::Crash,
+        label: "aterm crash".into(),
+        scope: EventScope::Machine,
+        span: None,
+    };
+    model.record_strip_event(estimate.clone());
+    model.record_strip_event(estimate);
+    let first = model.absorb(&at(20_000, 1_000));
+    let admitted: Vec<_> = first
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Strip { .. }))
+        .collect();
+    assert_eq!(admitted.len(), 1);
+    let original = admitted[0].clone();
+    assert_eq!(original.at_unix_ms, Some(T0 + 1_000));
+    assert!(matches!(
+        original.kind,
+        EventKind::Strip {
+            change: StripChangeKind::Insert,
+            ..
+        }
+    ));
+    let exact = StripEvent {
+        at_unix_ms: T0 + 2_000,
+        kind: StripEventKind::Crash,
+        label: "SIGSEGV".into(),
+        scope: EventScope::Machine,
+        span: None,
+    };
+    model.record_strip_event(exact.clone());
+    let corrected = model.absorb(&at(30_000, 1_000));
+    let changes: Vec<_> = corrected
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Strip { .. }))
+        .collect();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].seq, corrected.seq);
+    assert_eq!(changes[0].at_unix_ms, Some(exact.at_unix_ms));
+    assert!(
+        matches!(&changes[0].kind, EventKind::Strip { marker, change: StripChangeKind::Update } if marker == &exact)
+    );
+    assert_eq!(original.at_unix_ms, Some(T0 + 1_000));
+    let mut empty = model.absorb(&at(31_000, 1_000));
+    model.drain_strip_events(&mut empty);
+    assert!(
+        !empty
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::Strip { .. }))
+    );
+    let source = SessionScope {
+        local: 7,
+        sid: "t0000000001".into(),
+        nonce: "11".repeat(16),
+    };
+    for nonce in [source.nonce.clone(), "22".repeat(16)] {
+        model.record_strip_event(StripEvent {
+            at_unix_ms: T0 + 31_000,
+            kind: StripEventKind::Crash,
+            label: "private task (SIGSEGV)".into(),
+            scope: EventScope::Session(SessionScope {
+                nonce,
+                ..source.clone()
+            }),
+            span: None,
+        });
+    }
+    let private = model.absorb(&at(32_000, 1_000));
+    assert_eq!(
+        private
+            .events
+            .iter()
+            .filter(|event| matches!(event.scope, EventScope::Session(_)))
+            .count(),
+        2,
+        "same label and local key cannot merge two launch principals"
+    );
+}
+
+#[test]
+fn strip_event_staging_overflow_and_original_sleep_interval_are_explicit() {
+    use crate::events::{EventKind, EventScope};
+    let mut model = Vitals::new();
+    for i in 0..STRIP_HISTORY_CAP + 7 {
+        model.record_strip_event(StripEvent {
+            at_unix_ms: T0 + i as i64,
+            kind: StripEventKind::PressureSpike,
+            label: format!("observed {i}"),
+            scope: EventScope::Machine,
+            span: None,
+        });
+    }
+    let overflow = model.absorb(&at(1_000, 1_000));
+    assert_eq!(overflow.events_lost, 7);
+    assert_eq!(
+        overflow
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Strip { .. }))
+            .count(),
+        STRIP_HISTORY_CAP
+    );
+    let mut wake = at(2_000, 1_000);
+    wake.at_unix_ms += 60_000;
+    let woke = model.absorb(&wake);
+    let sleep = woke.events.iter().find(|event| matches!(event.kind, EventKind::Strip { ref marker, .. } if marker.kind == StripEventKind::SleepWake)).unwrap();
+    assert_eq!(
+        sleep.span(),
+        None,
+        "sample skew brackets suspension but does not observe its onset and end"
+    );
+    assert_eq!(sleep.at_unix_ms, Some(wake.at_unix_ms));
+    assert_eq!(woke.events_lost, 0);
+    let mut original_pair = at(3_000, 1_000);
+    original_pair.at_unix_ms = wake.at_unix_ms + 1_000;
+    let onset = overflow.at_unix_ms + 200;
+    let end = wake.at_unix_ms - 200;
+    original_pair.timeline = Some(crate::explain::TimelineSample {
+        sleep_ms: Some(onset),
+        wake_ms: Some(end),
+        ..crate::explain::TimelineSample::default()
+    });
+    let exact = model.absorb(&original_pair);
+    let sleep = exact.events.iter().find(|event| matches!(event.kind, EventKind::Strip { ref marker, .. } if marker.kind == StripEventKind::SleepWake)).unwrap();
+    assert_eq!(
+        sleep.span(),
+        Some(crate::events::EventSpan {
+            onset_unix_ms: onset,
+            end_unix_ms: end
+        })
+    );
+    assert_eq!(
+        sleep.at_unix_ms,
+        Some(end),
+        "the original OS pair must not use the later publication time"
+    );
+}
+
+#[test]
+fn resource_history_keeps_source_weights_series_and_painted_capacities_distinct() {
+    let at_ms = 60_000;
+    let mut view = ResourceView {
+        capacity: Some(4.0),
+        basis: CapBasis::Peak,
+        recent: Arc::from(vec![
+            Reading {
+                at_ms: 59_500,
+                v: 2.0,
+                over: false,
+                w_ms: 500,
+            },
+            Reading {
+                at_ms: 59_750,
+                v: 6.0,
+                over: true,
+                w_ms: 250,
+            },
+            Reading {
+                at_ms: 60_001,
+                v: 999.0,
+                over: true,
+                w_ms: 1000,
+            },
+        ]),
+        second: Some(Series {
+            capacity: Some(10.0),
+            recent: Arc::from(vec![Reading {
+                at_ms: 59_500,
+                v: 40.0,
+                over: false,
+                w_ms: 1000,
+            }]),
+            ..Series::default()
+        }),
+        ..ResourceView::default()
+    };
+    let unchanged = view.clone();
+    let slots = view.history_slots(MultiScaleSpec::FULL_6H, at_ms, &[]);
+    assert_eq!(
+        view, unchanged,
+        "projection must not advance or rewrite a source ring"
+    );
+    assert_eq!(slots.cells.len(), 34);
+    assert_eq!(
+        (slots.capacity, slots.secondary_capacity, slots.basis),
+        (Some(4.0), Some(10.0), CapBasis::Peak)
+    );
+    let live = slots.cells[0];
+    assert!((live.primary.cell.mean.unwrap() - 10.0 / 3.0).abs() < 1e-12);
+    assert_eq!(
+        live.primary.cell.max,
+        Some(6.0),
+        "the future 999 reading must not enter"
+    );
+    assert_eq!(live.primary.cell.tau_ms, 750.0);
+    assert_eq!(live.primary.cell.over_ms, 250.0);
+    assert_eq!(live.secondary.unwrap().cell.mean, Some(40.0));
+    assert_eq!(live.secondary.unwrap().cell.max, Some(40.0));
+    assert_eq!(live.primary.slot, live.painted.slot);
+    assert_eq!(live.secondary.unwrap().slot, live.painted.slot);
+    assert_eq!(live.painted.cell.heat, Some(1.0));
+    assert_eq!(live.painted.cell.max, Some(1.0));
+    assert_eq!(live.painted.cell.over, 1.0 / 3.0);
+    view.basis = CapBasis::Fixed;
+    let fixed = view.history_slots(MultiScaleSpec::FULL_6H, at_ms, &[]);
+    assert_eq!(fixed.cells[0].primary, live.primary);
+    assert_eq!(fixed.cells[0].secondary, live.secondary);
+    assert_eq!(fixed.cells[0].painted.cell.heat, Some(4.0));
+    assert_eq!(fixed.cells[0].painted.cell.max, Some(4.0));
+
+    view.second = None;
+    view.capacity = None;
+    let no_cap = view.history_slots(MultiScaleSpec::FULL_6H, at_ms, &[]);
+    assert_eq!(no_cap.cells[0].primary, live.primary);
+    assert!(no_cap.cells[0].secondary.is_none());
+    assert!(no_cap.cells[0].painted.cell.heat.is_none());
+    view.capacity = Some(4.0);
+    view.recent = Arc::from(vec![Reading {
+        at_ms: 59_500,
+        v: 0.0,
+        over: false,
+        w_ms: 1000,
+    }]);
+    let zero = view.history_slots(MultiScaleSpec::FULL_6H, at_ms, &[]);
+    assert_eq!(zero.cells[0].primary.cell.mean, Some(0.0));
+    assert_eq!(zero.cells[0].painted.cell.heat, Some(0.0));
+    let asleep = view.history_slots(
+        MultiScaleSpec::FULL_6H,
+        at_ms,
+        &[TimeGap {
+            start_ms: 59_000,
+            end_ms: 60_000,
+            kind: GapKind::Sleep,
+        }],
+    );
+    assert_eq!(asleep.cells[0].painted.cell.gap, Some(GapKind::Sleep));
+    assert!(asleep.cells[0].primary.cell.mean.is_none());
+    let unread = ResourceView {
+        capacity: Some(4.0),
+        ..ResourceView::default()
+    }
+    .history_slots(MultiScaleSpec::FULL_6H, at_ms, &[]);
+    assert!(
+        unread
+            .cells
+            .iter()
+            .all(|cell| cell.primary.cell.mean.is_none())
+    );
+    assert!(
+        unread
+            .cells
+            .iter()
+            .all(|cell| cell.painted.cell.heat.is_none())
+    );
+}
+
+fn group_book_sample(second: u64, mut procs: Vec<ProcSample>) -> Sample {
+    for p in &mut procs {
+        p.uid = Some(501);
+        p.state = ProcState::Run;
+    }
+    Sample {
+        at_unix_ms: second as i64 * 1000,
+        mono_ms: second * 1000,
+        cadence_ms: 1000,
+        self_uid: Some(501),
+        ..sample(second, &[second * 100; 4], procs)
+    }
+}
+
+#[test]
+fn group_book_uses_the_uncapped_original_members_and_own_counters() {
+    use crate::groups::{GroupBook, GroupKey, Value};
+    let key = GroupKey::Tab {
+        pane: 7,
+        root: crate::delegated::ProcessKey { pid: 201, start: 1 },
+    };
+    let reading = |second| {
+        let mut procs = vec![proc(100, 1, 0, 1, "aterm"), proc(200, 100, 0, 1, "shell")];
+        for pid in std::iter::once(201).chain(1000..1600) {
+            let mut p = proc(
+                pid,
+                if pid == 201 { 200 } else { 201 },
+                second,
+                1,
+                if pid == 201 { "builder" } else { "worker" },
+            );
+            p.energy_nj = Some(second * 1_000_000);
+            p.child_cpu_ns = Some(second * 90_000_000_000);
+            procs.push(p);
+        }
+        group_book_sample(second, procs)
+    };
+    let mut supplied = GroupBook::new();
+    let supplied_key = GroupKey::Aterm(crate::delegated::ProcessKey { pid: 888, start: 1 });
+    supplied.absorb(
+        crate::groups::Frame {
+            taken: Taken::at(9000, 1000),
+            at_ns: 9_000_000_000,
+            mono_ms: 9000,
+            processes_observed: true,
+            ..crate::groups::Frame::default()
+        },
+        [crate::groups::Observation::new(
+            supplied_key,
+            crate::groups::Scope::Aterm,
+            "injected-book",
+            1,
+        )],
+    );
+    let mut model = Vitals::with_group_book(supplied);
+    let first = model.absorb(&reading(10));
+    let snapshot = model.absorb(&reading(11));
+    assert!(
+        snapshot
+            .groups
+            .rows()
+            .iter()
+            .any(|row| row.key() == supplied_key && row.ended()),
+        "CONTROL: construction must use the supplied book, not replace it with another default"
+    );
+    let row = snapshot
+        .groups
+        .rows()
+        .iter()
+        .find(|row| row.key() == key)
+        .unwrap();
+    assert_eq!(row.count(), 601);
+    assert_eq!(row.footprint(), Value::Read(601 << 20));
+    let Value::Read(cpu) = row.cpu().value else {
+        panic!("readable own counters: {row:?}")
+    };
+    assert!((cpu - 0.601).abs() < 0.000_01, "{row:?}");
+    assert_eq!(row.energy().thread_mw.value, Value::Read(601.0));
+    assert!(matches!(
+        row.energy().cpu_mw.value,
+        Value::Unread {
+            why: Unread::Unsupported,
+            ..
+        }
+    ));
+    assert!(snapshot.procs.len() <= ATERM_ROWS);
+    assert!(
+        snapshot
+            .procs
+            .iter()
+            .filter(|p| p.group == Some(key))
+            .count()
+            < row.count() as usize,
+        "CONTROL: summing the display subset would lose members"
+    );
+    assert_eq!(snapshot.groups.frame().unwrap().seq, snapshot.seq);
+    assert_eq!(snapshot.groups.frame().unwrap().taken, model.rows.taken);
+    assert_eq!(
+        first
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .count(),
+        601,
+        "published views remain immutable"
+    );
+}
+
+#[test]
+fn group_book_keeps_birth_bound_anchors_but_not_exec_or_reused_pid_energy() {
+    use crate::groups::{GroupKey, Value};
+    let key = GroupKey::Tab {
+        pane: 7,
+        root: crate::delegated::ProcessKey { pid: 201, start: 1 },
+    };
+    let reading = |second, root, version, start, pane| {
+        let mut p = proc(202, if root { 201 } else { 1 }, second, 1, "current-child");
+        p.version = Some(version);
+        p.start = Some(start);
+        p.energy_nj = Some(second * 1_000_000);
+        let mut procs = vec![proc(200, 100, 0, 1, "shell"), p];
+        if root {
+            procs.push(proc(201, 200, 0, 1, "original-root"));
+        }
+        let mut s = group_book_sample(second, procs);
+        s.tabs[0].key = pane;
+        s.tabs[0].tab = pane;
+        s
+    };
+    let mut model = Vitals::new();
+    model.absorb(&reading(10, true, 1, 1, 7));
+    let orphan = model.absorb(&reading(11, false, 2, 1, 7));
+    let child = orphan.procs.iter().find(|p| p.pid == 202).unwrap();
+    assert_eq!(
+        child.group,
+        Some(key),
+        "exec and reparenting do not erase the proved birth-bound anchor"
+    );
+    assert_eq!(child.energy_mw, None, "exec changes the counter baseline");
+    let resumed = model.absorb(&reading(12, false, 2, 1, 7));
+    assert_eq!(
+        resumed
+            .procs
+            .iter()
+            .find(|p| p.pid == 202)
+            .unwrap()
+            .energy_mw,
+        Some(1.0)
+    );
+    assert_eq!(
+        resumed
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .count(),
+        1
+    );
+
+    // An independent restore of the same custody is not a conflict with group metadata.
+    let (origins, incomplete) = model.process_origins();
+    assert!(!incomplete);
+    model.restore_process_origins(&origins);
+    assert!(!model.origins_incomplete);
+    let repeated = model.absorb(&reading(13, false, 2, 1, 7));
+    assert_eq!(
+        repeated.procs.iter().find(|p| p.pid == 202).unwrap().group,
+        Some(key)
+    );
+
+    let reused = model.absorb(&reading(14, true, 3, 9, 8));
+    let child = reused.procs.iter().find(|p| p.pid == 202).unwrap();
+    assert_eq!(
+        child.energy_mw, None,
+        "CONTROL: a reused PID cannot use the old energy baseline"
+    );
+    assert_ne!(
+        child.group,
+        Some(key),
+        "a different pane cannot receive old group credits"
+    );
+    let old = reused
+        .groups
+        .rows()
+        .iter()
+        .find(|row| row.key() == key)
+        .unwrap();
+    assert!(old.ended());
+    assert_ne!(old.energy().thread_mw.value, Value::Read(2.0));
+}
+
+#[test]
+fn group_book_missing_and_partial_censuses_cannot_end_an_observed_group() {
+    use crate::groups::GroupKey;
+    let key = GroupKey::Tab {
+        pane: 7,
+        root: crate::delegated::ProcessKey { pid: 201, start: 1 },
+    };
+    let mut model = Vitals::new();
+    let original = model.absorb(&group_book_sample(
+        10,
+        vec![
+            proc(200, 100, 0, 1, "shell"),
+            proc(201, 200, 0, 8, "idle-holder"),
+        ],
+    ));
+    assert_eq!(
+        original
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .count(),
+        1
+    );
+    let mut missing = group_book_sample(11, Vec::new());
+    missing.procs = None;
+    missing.machine_only = true;
+    let missing = model.absorb(&missing);
+    assert!(
+        !missing
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .ended()
+    );
+    let mut ambiguous = group_book_sample(
+        12,
+        vec![
+            proc(201, 200, 0, 8, "first"),
+            proc(201, 1, 0, 80, "duplicate"),
+        ],
+    );
+    ambiguous.procs_truncated = true;
+    let ambiguous = model.absorb(&ambiguous);
+    assert!(
+        !ambiguous
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .ended()
+    );
+    assert!(
+        ambiguous
+            .procs
+            .iter()
+            .filter(|p| p.pid == 201)
+            .all(|p| p.group.is_none()),
+        "ambiguous current PIDs cannot carry an old group's identity"
+    );
+    let mut cut = group_book_sample(13, Vec::new());
+    cut.procs_truncated = true;
+    let cut = model.absorb(&cut);
+    assert!(
+        !cut.groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .ended()
+    );
+    let empty = model.absorb(&group_book_sample(14, Vec::new()));
+    assert!(
+        empty
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .ended(),
+        "CONTROL: Some(empty) is known absence, unlike a missing or truncated sweep"
+    );
+    assert!(
+        !original
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .ended()
+    );
+}
+
+#[test]
+fn group_book_delegated_members_use_the_existing_job_root_without_remembering_custody() {
+    use crate::groups::GroupKey;
+    let root = crate::delegated::ProcessKey { pid: 900, start: 1 };
+    let mut first = group_book_sample(10, vec![proc(900, 1, 10, 8, "registered-worker")]);
+    first.delegated = vec![DelegatedJob {
+        root,
+        tab: Some(7),
+        members: vec![root],
+    }];
+    let mut model = Vitals::new();
+    model.absorb(&first);
+    let mut next = first.clone();
+    next.at_ns += 1_000_000_000;
+    next.at_unix_ms += 1000;
+    next.mono_ms += 1000;
+    let claimed = model.absorb(&next);
+    let key = GroupKey::Tab { pane: 7, root };
+    assert_eq!(claimed.procs[0].group, Some(key));
+    assert_eq!(
+        claimed
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .count(),
+        1
+    );
+    assert!(
+        model.process_origins().0.is_empty(),
+        "explicit custody never enters the natural origin inventory"
+    );
+    next.at_ns += 1_000_000_000;
+    next.at_unix_ms += 1000;
+    next.mono_ms += 1000;
+    next.delegated.clear();
+    let released = model.absorb(&next);
+    assert_eq!(
+        released.procs[0].group, None,
+        "CONTROL: no shell-path or remembered ownership fallback"
+    );
+    assert!(
+        released
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .ended()
+    );
+}
+
+#[test]
+fn group_book_energy_uses_the_accepted_original_heat_window_and_gap_gate() {
+    use crate::groups::{GroupKey, ReadWindow, Value};
+    use crate::heat::{Counters, HeatBook};
+    use crate::starts::{CoalTaskRead, CoalTasks, StartCount};
+    let reading = |second: u64, wall_offset: i64, starts: bool, bad_energy: bool| {
+        let counters = Counters {
+            cpu_ticks: second * 1_000_000_000,
+            qos_ticks: second * 1_000_000_000,
+            energy_nj: second
+                * if bad_energy {
+                    99_000_000_000
+                } else {
+                    2_000_000_000
+                },
+            instructions: second * 2_000_000_000,
+            cycles: second * 1_000_000_000,
+            gpu_energy_nj: second * 3_000_000_000,
+            ane_energy_nj: second * 4_000_000_000,
+            ..Counters::default()
+        };
+        let mut p = proc(900, 1, second * 100, 10, "outside");
+        p.coalition = Some(9);
+        p.birth_ms = Some(1000);
+        let mut s = group_book_sample(second, vec![p]);
+        s.tabs.clear();
+        s.at_unix_ms += wall_offset;
+        s.cores = Some(vec![Ticks {
+            busy: second * 100,
+            total: second * 100,
+        }]);
+        s.clusters.clear();
+        s.coal_lane = crate::explain::CoalLane::On;
+        s.coalitions = Some(crate::explain::CoalSample {
+            listed: 1,
+            newest: Some(9),
+            truncated: false,
+            rows: vec![crate::explain::CoalUsage {
+                id: 9,
+                tasks_started: second,
+                tasks_exited: second - 1,
+                cpu_ns: second * 1_000_000_000,
+                footprint: Some(10 << 20),
+                ..crate::explain::CoalUsage::default()
+            }],
+        });
+        s.starts = starts.then(|| StartCount::Coalitions {
+            read: CoalTaskRead::of(
+                Some(9),
+                false,
+                [CoalTasks {
+                    id: 9,
+                    started: second,
+                    exited: second - 1,
+                }],
+            )
+            .with_heat(HeatBook {
+                at_ns: s.at_ns + 100_000_000,
+                timebase: (1, 1),
+                by_id: vec![(9, counters.words())],
+                total: Ok(counters.words()),
+            }),
+            own: None,
+        });
+        s
+    };
+    let key = GroupKey::Coalition(9);
+    let row = |snapshot: &Snapshot| {
+        snapshot
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .clone()
+    };
+    let mut model = Vitals::new();
+    model.absorb(&reading(10, 0, true, false));
+    let good = model.absorb(&reading(11, 0, true, false));
+    assert!(good.heat.chain.is_ok(), "{good:?}");
+    let observed = row(&good);
+    assert_eq!(observed.energy().cpu_mw.value, Value::Read(2000.0));
+    assert_eq!(observed.energy().gpu_mw.value, Value::Read(3000.0));
+    assert_eq!(observed.energy().ane_mw.value, Value::Read(4000.0));
+    assert_eq!(
+        observed.energy().cpu_mw.window,
+        ReadWindow::Reported {
+            end_ns: 11_100_000_000,
+            window_ns: 1_000_000_000
+        }
+    );
+    assert_eq!(observed.starts_ps().value, Value::Read(1.0));
+    assert!(
+        good.procs
+            .iter()
+            .any(|p| p.pid == 900 && p.group == Some(key))
+    );
+
+    let mut partial_model = Vitals::new();
+    partial_model.absorb(&reading(10, 0, true, false));
+    partial_model.absorb(&reading(11, 0, true, false));
+    let mut cut = reading(12, 0, true, false);
+    cut.procs = Some(Vec::new());
+    cut.procs_truncated = true;
+    let partial = partial_model.absorb(&cut);
+    assert_eq!(row(&partial).count(), 0, "no process member was observed");
+    assert!(!row(&partial).membership_complete());
+    assert!(
+        !row(&partial).ended(),
+        "CONTROL: an observed count of zero in a cut census proves no ending"
+    );
+    let restored = partial_model.absorb(&reading(13, 0, true, false));
+    assert_eq!(row(&restored).count(), 1);
+    assert!(!row(&restored).ended());
+
+    let sleep = model.absorb(&reading(12, 6 * 3_600_000, true, false));
+    assert!(
+        matches!(row(&sleep).energy().cpu_mw.value, Value::Unread { .. }),
+        "CONTROL: raw monotone heat counters do not admit a Sample clock gap"
+    );
+    let recovered = model.absorb(&reading(13, 6 * 3_600_000, true, false));
+    assert_eq!(row(&recovered).energy().cpu_mw.value, Value::Read(2000.0));
+    let missing = model.absorb(&reading(14, 6 * 3_600_000, false, false));
+    assert!(matches!(
+        row(&missing).energy().cpu_mw.value,
+        Value::Unread { .. }
+    ));
+    let warming = model.absorb(&reading(15, 6 * 3_600_000, true, false));
+    assert!(matches!(
+        row(&warming).energy().cpu_mw.value,
+        Value::Unread { .. }
+    ));
+    let resumed = model.absorb(&reading(16, 6 * 3_600_000, true, false));
+    assert_eq!(row(&resumed).energy().cpu_mw.value, Value::Read(2000.0));
+    let refused = model.absorb(&reading(17, 6 * 3_600_000, true, true));
+    assert!(refused.heat.chain.is_err());
+    assert!(
+        matches!(row(&refused).energy().cpu_mw.value, Value::Unread { .. }),
+        "a per-ID transition cannot bypass the existing global heat self-check"
+    );
+    assert_eq!(observed.energy().cpu_mw.value, Value::Read(2000.0));
+}
+
+#[test]
+fn group_book_outside_scope_requires_current_owner_proof_not_the_services_fallback() {
+    use crate::explain::{CoalLane, CoalSample, CoalUsage, Part};
+    use crate::groups::{CpuBasis, GroupKey, Scope, Value};
+    for (member, expected) in [
+        (None, Scope::Unknown),
+        (Some(None), Scope::Unknown),
+        (Some(Some(0)), Scope::Services),
+        (Some(Some(501)), Scope::Others),
+    ] {
+        let reading = |second: u64| {
+            let procs = member
+                .map(|uid| {
+                    let mut p = proc(900, 1, second * 100, 1, "current-member");
+                    p.coalition = Some(9);
+                    p.uid = uid;
+                    p.state = ProcState::Run;
+                    p
+                })
+                .into_iter()
+                .collect();
+            let mut s = group_book_sample(second, procs);
+            // The fixture helper normally supplies the known user; restore the actual
+            // producer input so the unread-UID case remains an observed ownership gap.
+            if let Some(p) = s.procs.as_mut().unwrap().first_mut() {
+                p.uid = member.flatten();
+            }
+            s.tabs.clear();
+            s.coal_lane = CoalLane::On;
+            s.coalitions = Some(CoalSample {
+                listed: 1,
+                newest: Some(9),
+                truncated: false,
+                rows: vec![CoalUsage {
+                    id: 9,
+                    tasks_started: second,
+                    tasks_exited: second - u64::from(member.is_some()),
+                    cpu_ns: second * 1_000_000_000,
+                    footprint: Some(if member.is_some() { 1 << 20 } else { 0 }),
+                    ..CoalUsage::default()
+                }],
+            });
+            s
+        };
+        let mut model = Vitals::new();
+        model.absorb(&reading(10));
+        let snapshot = model.absorb(&reading(11));
+        let row = snapshot
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == GroupKey::Coalition(9))
+            .unwrap();
+        assert_eq!(row.scope(), expected, "{member:?}: {row:?}");
+        assert_eq!(row.cpu_basis(), CpuBasis::CoalitionCounters);
+        assert_eq!(row.cpu().value, Value::Read(1.0));
+        if member.is_none() {
+            let legacy = &snapshot.why.as_ref().unwrap().split.rows[0];
+            assert_eq!(
+                legacy.part,
+                Part::Services,
+                "CONTROL: the old classification really defaults here"
+            );
+            assert!(!legacy.ownership_mixed && !legacy.footprint_ownership_incomplete);
+            assert_eq!(legacy.footprint_outside, None);
+            assert_eq!(
+                row.footprint(),
+                Value::Read(0),
+                "known zero remains readable despite unknown ownership"
+            );
+        }
+    }
+}
 
 #[path = "model_reported_cpu_tests.rs"]
 mod reported_cpu;
@@ -399,6 +1231,106 @@ fn historical_native_source_loss_bounds_cpu_without_tainting_current_memory() {
             assert!(!facts.memory_provenance_incomplete);
         }
     }
+}
+
+#[path = "pane_resources_tests.rs"]
+mod pane_resources;
+
+fn panel_cpu_sample(second: u64, quiet_ms: u64, busy_ms: u64) -> Sample {
+    let shells = [(200, quiet_ms), (300, busy_ms)].map(|(pid, counter)| ProcSample {
+        uid: Some(501),
+        child_cpu_ns: Some(0),
+        reaps_unwaited: Some(false),
+        ..proc(pid, 100, counter, 1, "shell")
+    });
+    let mut s = sample(second, &[], shells.to_vec());
+    s.tabs.push(TabRoot {
+        tab: 7,
+        tab_id: Some(7),
+        ..tab(8, 300, "Tab 1", "")
+    });
+    s.at_unix_ms = (second * 1000) as i64;
+    s.mono_ms = second * 1000;
+    s.self_uid = Some(501);
+    s.cadence_ms = 5_000;
+    s
+}
+
+#[test]
+fn local_panel_cpu_stream_split_reads_are_separate_and_bucketed_by_observation_time() {
+    const SEC: u64 = 1_000_000_000;
+    let mut vitals = Vitals::new();
+    vitals.absorb(&panel_cpu_sample(60, 100, 100));
+    let split = vitals.absorb(&panel_cpu_sample(65, 200, 9_100));
+    let first = split.pane_cpu[&7].latest.unwrap();
+    let second = split.pane_cpu[&8].latest.unwrap();
+    assert_eq!((first.cores, second.cores), (0.02, 1.8));
+    assert_eq!((first.at_ns, first.window_ns), (65 * SEC, 5 * SEC));
+    let mut next = panel_cpu_sample(75, 200, 9_100);
+    // Park the second session and show the first in a different tab.
+    next.tabs[0].tab = 70;
+    next.tabs[0].tab_id = Some(70);
+    next.tabs[1].tab = 8;
+    next.tabs[1].tab_id = None;
+    let quiet = vitals.absorb(&next);
+    for key in [7, 8] {
+        let readings = quiet.pane_cpu[&key].buckets(75 * SEC);
+        let before = split.pane_cpu[&key].latest;
+        assert_eq!(readings[9], before);
+        assert_eq!(
+            readings[10], None,
+            "the ten-second observation did not read at 70 s"
+        );
+        assert_eq!(readings[11].unwrap().cores, 0.0);
+        assert_eq!(readings[11].unwrap().window_ns, 10 * SEC);
+        assert!(readings[..9].iter().all(Option::is_none));
+    }
+}
+
+#[test]
+fn local_panel_cpu_stream_incomplete_reads_and_replaced_shells_do_not_manufacture_zero() {
+    const SEC: u64 = 1_000_000_000;
+    let mut vitals = Vitals::new();
+    vitals.absorb(&panel_cpu_sample(60, 0, 200));
+    let healthy = vitals.absorb(&panel_cpu_sample(65, 100, 400));
+    assert!(healthy.pane_cpu[&7].latest.is_some());
+    let mut missing = panel_cpu_sample(70, 200, 600);
+    missing.procs = None;
+    assert!(vitals.absorb(&missing).pane_cpu[&7].latest.is_none());
+    let resumed = vitals.absorb(&panel_cpu_sample(75, 300, 800));
+    assert!(
+        resumed.pane_cpu[&7].latest.is_none(),
+        "a failed full sweep breaks the pair"
+    );
+    let new = |second, quiet, busy| {
+        let mut s = panel_cpu_sample(second, quiet, busy);
+        s.procs.as_mut().unwrap()[0].start = Some(2);
+        s
+    };
+    let replaced = vitals.absorb(&new(80, 0, 1000));
+    assert_eq!(replaced.pane_cpu[&7].root.unwrap().start, 2);
+    assert!(
+        replaced.pane_cpu[&7]
+            .buckets(80 * SEC)
+            .iter()
+            .all(Option::is_none)
+    );
+    let settled = vitals.absorb(&new(85, 0, 1200));
+    assert_eq!(settled.pane_cpu[&7].latest.unwrap().cores, 0.0);
+    assert!(
+        settled.pane_cpu[&8]
+            .buckets(85 * SEC)
+            .contains(&healthy.pane_cpu[&8].latest)
+    );
+    let reset = vitals.absorb(&new(90, 0, 10));
+    assert!(
+        reset.pane_cpu[&8].latest.is_none(),
+        "a counter reset is not idle"
+    );
+    let mut closed = new(95, 0, 20);
+    closed.tabs.pop();
+    let closed = vitals.absorb(&closed);
+    assert!(!closed.pane_cpu.contains_key(&8));
 }
 
 #[test]
@@ -2639,6 +3571,145 @@ fn memory_keeps_the_worst_pressure_of_each_bucket_and_an_unread_bucket_hollow() 
         [Some(Critical), Some(Normal), None, None, Some(Warn)],
         "the worst of 0-9 s is its one critical reading; 20-29 s read nothing; 30-39 s read \
          memory but no pressure; 40-42 s keeps its warn past an unread and a normal reading"
+    );
+}
+
+/// Memory's run of readings for [`a_memory_box_keeps_the_worst_pressure_read_in_it`]: two hours
+/// at 10 s, then two minutes at 1 s, each reading `level(t)` at `t` seconds from `T0`. Returns
+/// the last snapshot and the worst pressure read in each ten-minute key.
+fn pressure_run(level: impl Fn(i64) -> Pressure) -> (Snapshot, BTreeMap<i64, Pressure>) {
+    let mut v = Vitals::new();
+    let mut s = Snapshot::default();
+    let mut worst: BTreeMap<i64, Pressure> = BTreeMap::new();
+    let times = (0..7_200_i64)
+        .step_by(10)
+        .map(|t| (t, 10_000))
+        .chain((7_200..7_320).map(|t| (t, 1_000)));
+    for (t, cadence) in times {
+        let p = level(t);
+        if let Some(r) = p.rank() {
+            let w = worst.entry((T0 / 1000 + t).div_euclid(600)).or_insert(p);
+            if w.rank().is_none_or(|was| r > was) {
+                *w = p;
+            }
+        }
+        s = v.absorb(&pressed(t as u64 * 1000, cadence, Some((8, p))));
+    }
+    (s, worst)
+}
+
+/// Memory's ten-minute pressure tier lines up with its own ten-minute cells by key: each closed
+/// one holds the worst pressure read in that key's ten minutes, and none where no pressure was
+/// read. (The open cell has not yet folded its open 10 s bucket in, on either ring.)
+fn assert_pressure_long_by_key(mem: &ResourceView, worst: &BTreeMap<i64, Pressure>, why: &str) {
+    assert_eq!(
+        mem.pressure_long.len(),
+        mem.long.len(),
+        "{why}: cell for cell"
+    );
+    let first = mem.long_k + 1 - mem.long.len() as i64;
+    let mut held = 0_usize;
+    for (k, cell) in (first..mem.long_k).zip(mem.pressure_long.iter()) {
+        let got = cell.max.map(Pressure::of_rank);
+        assert_eq!(got, worst.get(&k).copied(), "{why}: ten-minute key {k}");
+        held += usize::from(got.is_some());
+    }
+    let closed = worst.range(..mem.long_k).count();
+    assert!(
+        held == closed && held >= 7,
+        "CONTROL {why}: closed ten-minute cells holding a pressure {held} of {closed}"
+    );
+}
+
+/// Each strip box of Memory keeps the worst kernel pressure read in it (SD-80): an episode two
+/// hours of readings back stands in its hour box (the ten-minute tier), one half an hour back in
+/// its ten-minute box (the 10 s tier), one five seconds back in its 1 s box (the last minute's
+/// readings), and a box far from every episode has none. The ten-minute tier lines up with
+/// Memory's own cells by key, also where no pressure was read for the first forty minutes, so
+/// the pressure ring's ten-minute ring starts later than Memory's. The live box takes at least
+/// the row's state now; Disk keeps no pressure, so only its live box carries a state.
+#[test]
+fn a_memory_box_keeps_the_worst_pressure_read_in_it() {
+    use Pressure::{Critical, Normal, Unknown, Warn};
+    // Episodes: (seconds from the first reading, level); 3_000 s and 3_610 s sit in the ten-minute
+    // cells either side of the hour at T0 + 3_600 s, so a tier shifted by one cell moves them.
+    let episodes = [
+        (1_800_i64, Critical),
+        (3_000, Warn),
+        (3_610, Critical),
+        (5_400, Warn),
+        (7_314, Warn),
+    ];
+    let level = |t: i64| episodes.iter().find(|e| e.0 == t).map_or(Normal, |e| e.1);
+    let (late, late_worst) = pressure_run(|t| if t < 2_400 { Unknown } else { level(t) });
+    let late_mem = &late.resources[Memory.index()];
+    assert!(
+        late_worst.len() < late_mem.long.iter().filter(|c| c.mean.is_some()).count(),
+        "CONTROL: the pressure ring's ten-minute ring starts later than Memory's"
+    );
+    assert_pressure_long_by_key(late_mem, &late_worst, "pressure read from 40 min on");
+    let (s, worst) = pressure_run(level);
+    let now = s.at_unix_ms;
+    let mem = &s.resources[Memory.index()];
+    assert_pressure_long_by_key(mem, &worst, "pressure read throughout");
+    let slots = mem.heat_multi_scale(MultiScaleSpec::FULL_6H, now, 15_000, &s.time_gaps);
+    let (mut exact, mut quiet) = ([0_usize; 3], 0_usize);
+    for hs in &slots {
+        let (lo, hi) = (now - hs.slot.age_hi_ms, now - hs.slot.age_lo_ms);
+        // The tier the box reads: the last minute's readings, the 10 s cells, the ten-minute ones.
+        let (tier, g) = if hs.slot.age_hi_ms <= 60_000 {
+            (0, 0)
+        } else if hs.slot.age_lo_ms < 3_600_000 {
+            (1, 10_000)
+        } else {
+            (2, 600_000)
+        };
+        let at = |e: &(i64, Pressure)| T0 + e.0 * 1000;
+        let inside = episodes
+            .iter()
+            .filter(|e| lo + g <= at(e) && at(e) < hi - g || hs.slot.is_live_now && at(e) == hi)
+            .map(|e| e.1.state())
+            .max()
+            .flatten();
+        let near = episodes.iter().any(|e| lo - g <= at(e) && at(e) < hi + g);
+        let tag = format!("box of age {}..{} ms", hs.slot.age_lo_ms, hs.slot.age_hi_ms);
+        if inside.is_some() {
+            assert_eq!(
+                hs.cell.state, inside,
+                "{tag}: the worst pressure read in it"
+            );
+            exact[tier] += 1;
+        } else if !near {
+            assert_eq!(hs.cell.state, None, "{tag}: no pressure was raised in it");
+            quiet += 1;
+        }
+    }
+    assert!(
+        exact.iter().all(|&n| n >= 1) && quiet >= 20,
+        "CONTROL: boxes with an episode per tier {exact:?}, quiet boxes {quiet}"
+    );
+    let live = |r: &ResourceView| {
+        r.heat_multi_scale(MultiScaleSpec::FULL_6H, now, 15_000, &s.time_gaps)
+            .into_iter()
+            .find(|hs| hs.slot.is_live_now)
+            .and_then(|hs| hs.cell.state)
+    };
+    let mut raised = mem.clone();
+    raised.state = Some(State::Critical);
+    assert_eq!(live(mem), None, "the live box at rest");
+    assert_eq!(
+        live(&raised),
+        Some(State::Critical),
+        "the live box takes the row's state now"
+    );
+    let mut disk = s.resources[Disk.index()].clone();
+    disk.state = Some(State::Warn);
+    let disk_slots = disk.heat_multi_scale(MultiScaleSpec::FULL_6H, now, 15_000, &s.time_gaps);
+    assert!(
+        disk_slots
+            .iter()
+            .all(|hs| hs.cell.state == hs.slot.is_live_now.then_some(State::Warn)),
+        "Disk's past boxes keep no state; its live box takes the row's"
     );
 }
 
@@ -4911,6 +5982,8 @@ fn sleep_jumps_and_crash_markers_record_time_gaps_and_strip_events() {
     let mut v = Vitals::new();
     let mut s0 = at(0, 1_000);
     s0.note_events.push(StripEvent {
+        scope: crate::events::EventScope::Machine,
+        span: None,
         at_unix_ms: s0.at_unix_ms - 5_000,
         kind: StripEventKind::Crash,
         label: "previous instance SIGSEGV".into(),
@@ -4955,6 +6028,82 @@ fn sleep_jumps_and_crash_markers_record_time_gaps_and_strip_events() {
         "critical pressure spike emitted: {:?}",
         snap.strip_events
     );
+}
+
+#[test]
+fn passive_tcp_latency_degrades_network_without_link_samples() {
+    use crate::words::{Locale, details, glance_details, rtt_word};
+
+    for established in [None, Some(0), Some(2)] {
+        for ms in [250.0, 1845.0] {
+            let mut s = at(0, 1_000);
+            s.links = None;
+            s.tcp = established.map(|established| TcpCounts {
+                established,
+                ..TcpCounts::default()
+            });
+            s.tcp_srtt_ms = Some(ms);
+            let snapshot = Vitals::new().absorb(&s);
+            let net = snapshot.net.as_ref().expect("passive TCP reading");
+            assert_eq!(
+                net.state,
+                NetState::Degraded,
+                "TCP {established:?}, {ms} ms"
+            );
+            assert_eq!(net.srtt_ms, Some(ms));
+            assert!(net.rates.is_none());
+            for clauses in [
+                details(Resource::Network, &snapshot, &Locale::default()),
+                glance_details(Resource::Network, &snapshot, &[], &Locale::default()),
+            ] {
+                let kept: Vec<_> = clauses.iter().filter(|c| c.keep).collect();
+                assert_eq!(kept.len(), 1);
+                assert!(
+                    kept[0]
+                        .forms
+                        .iter()
+                        .all(|form| form.contains(&rtt_word(ms)))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn healthy_or_invalid_tcp_latency_without_links_preserves_connection_state() {
+    for established in [None, Some(0), Some(2)] {
+        for ms in [
+            None,
+            Some(14.0),
+            Some(249.0),
+            Some(0.0),
+            Some(-1.0),
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+        ] {
+            let mut s = at(0, 1_000);
+            s.links = None;
+            s.tcp = established.map(|established| TcpCounts {
+                established,
+                ..TcpCounts::default()
+            });
+            s.tcp_srtt_ms = ms;
+            let snapshot = Vitals::new().absorb(&s);
+            let valid_ms = ms.filter(|ms| ms.is_finite() && *ms > 0.0);
+            if established.is_none() && valid_ms.is_none() {
+                assert!(snapshot.net.is_none(), "TCP {established:?}, {ms:?} ms");
+            } else {
+                let net = snapshot.net.as_ref().expect("TCP reading");
+                let expected = if established == Some(2) {
+                    NetState::Online
+                } else {
+                    NetState::Idle
+                };
+                assert_eq!(net.state, expected, "TCP {established:?}, {ms:?} ms");
+                assert_eq!(net.srtt_ms, valid_ms);
+            }
+        }
+    }
 }
 
 #[test]
@@ -5151,11 +6300,15 @@ fn saved_strip_preserves_multi_scale_history_across_restarts_and_crashes() {
         kind: GapKind::Crash,
     });
     first_post.note_events.push(StripEvent {
+        scope: crate::events::EventScope::Machine,
+        span: None,
         at_unix_ms: exact_crash_ms,
         kind: StripEventKind::Crash,
         label: "SIGSEGV".into(),
     });
     first_post.note_events.push(StripEvent {
+        scope: crate::events::EventScope::Machine,
+        span: None,
         at_unix_ms: crash_relaunch_ms,
         kind: StripEventKind::Restart,
         label: "restarted".into(),
@@ -5321,6 +6474,7 @@ fn distinct_and_sleep_spanning_crashes_preserve_timestamps_and_deduplicate() {
 
     let apply_host_jobs = |v: &mut Vitals, snap: &mut Snapshot, rows: Vec<JobRow>| {
         let prev = snap.strip_events.len();
+        // This fixture supplies no source session; its job markers keep unknown scope.
         snap.set_jobs(Some(Arc::new(JobsView {
             rows,
             ..JobsView::default()
@@ -5383,11 +6537,15 @@ fn distinct_and_sleep_spanning_crashes_preserve_timestamps_and_deduplicate() {
             st.strip_events,
             vec![
                 StripEvent {
+                    scope: crate::events::EventScope::Unknown,
+                    span: None,
                     at_unix_ms: T0 + 100_000,
                     kind: StripEventKind::Crash,
                     label: "cargo (SIGSEGV)".into(),
                 },
                 StripEvent {
+                    scope: crate::events::EventScope::Unknown,
+                    span: None,
                     at_unix_ms: T0 + 103_000,
                     kind: StripEventKind::Crash,
                     label: "node (SIGABRT)".into(),
@@ -5487,6 +6645,8 @@ fn distinct_and_sleep_spanning_crashes_preserve_timestamps_and_deduplicate() {
     let mut run2 = Vitals::new();
     run2.restore_strip_history(dirty1, T0 + 105_000);
     run2.record_strip_event(StripEvent {
+        scope: crate::events::EventScope::Machine,
+        span: None,
         at_unix_ms: T0 + 105_500,
         kind: StripEventKind::Crash,
         label: "cargo (SIGSEGV)".into(),
@@ -5521,11 +6681,15 @@ fn distinct_and_sleep_spanning_crashes_preserve_timestamps_and_deduplicate() {
     );
 
     run3.record_strip_event(StripEvent {
+        scope: crate::events::EventScope::Machine,
+        span: None,
         at_unix_ms: i64::MIN,
         kind: StripEventKind::Crash,
         label: "extreme (SIGSEGV)".into(),
     });
     run3.record_strip_event(StripEvent {
+        scope: crate::events::EventScope::Machine,
+        span: None,
         at_unix_ms: i64::MAX,
         kind: StripEventKind::Crash,
         label: "extreme (SIGSEGV)".into(),

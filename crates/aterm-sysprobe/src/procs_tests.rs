@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// A plain sweep that reads each process's scheduling too.
+#[cfg(target_os = "macos")]
+const SCHEDULING: SweepOpts = SweepOpts {
+    coalitions: false,
+    versions: false,
+    scheduling: true,
+};
+
 /// A sweep whose table was wanted and not read leaves every process's `reaps_unwaited`
 /// unread and reads no process's own record, which would wait on what the table waited on;
 /// a table read fills it in where its row names the swept parent; and a sweep of no more
@@ -126,7 +134,7 @@ fn priority_minus_one_is_a_value_only_without_errno() {
 #[cfg(target_os = "macos")]
 #[test]
 fn own_scheduling_is_read_and_cpu_classes_are_scaled() {
-    let mine = processes()
+    let mine = processes_with(SCHEDULING)
         .unwrap()
         .procs
         .into_iter()
@@ -359,7 +367,7 @@ fn the_sweep_splits_a_busy_childs_cpu_by_kind_of_core() {
     }
 }
 
-/// A sweep asked for coalitions reads each process's, and its pid version, as the one-process readers do, another user's too (launchd's, root's); a plain sweep reads neither.
+/// A sweep asked for coalitions reads each process's, and gives its pid version, as the one-process readers do, another user's too (launchd's, root's); a plain sweep gives neither (it reads no coalition, and the versions only to bracket each row's reads).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sweep_reads_coalitions_only_when_asked() {
@@ -388,12 +396,13 @@ fn a_sweep_reads_coalitions_only_when_asked() {
     );
 }
 
-/// A sweep asked for versions reads the pid version of each process whose start it cannot
+/// A sweep asked for versions gives the pid version of each process whose start it cannot
 /// read (launchd's, root's, to a user that is not root) and of no other (this process's,
-/// whose start it reads), and no coalition. NEGATIVE CONTROL: a plain sweep reads no version.
+/// whose start it reads), and no coalition; it reads every process's, to bracket the row's other
+/// reads. NEGATIVE CONTROL: a plain sweep gives no version.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_sweep_asked_for_versions_reads_them_where_it_reads_no_start() {
+fn a_sweep_asked_for_versions_gives_them_where_it_reads_no_start() {
     let sweep = processes_with(SweepOpts {
         versions: true,
         ..SweepOpts::default()
@@ -558,7 +567,7 @@ fn request_background(pid: libc::id_t, on: bool) -> std::io::Result<()> {
 #[test]
 fn scheduling_reads_each_childs_requested_background_bits() {
     let bits = |pid: u32| {
-        processes().and_then(|s| {
+        processes_with(SCHEDULING).and_then(|s| {
             s.procs
                 .into_iter()
                 .find(|p| p.pid == pid)
@@ -655,7 +664,7 @@ fn background_proof_precedes_a_descheduled_child() {
             })
         },
     );
-    let scheduling = processes().and_then(|s| {
+    let scheduling = processes_with(SCHEDULING).and_then(|s| {
         s.procs
             .into_iter()
             .find(|p| p.pid == child.id())
@@ -787,8 +796,11 @@ fn an_exec_moves_the_pid_version_and_keeps_the_coalition() {
 }
 
 /// A scripted process table the macOS sweep reads through [`imp::Reads`]: each process's
-/// answers, a race or an answer scripted where a test needs one, and a count of every read the
-/// sweep makes.
+/// answers, steps it takes (an exec, a new process at its pid, an exit, a new effective uid, a
+/// new group or session) between sweeps or, scripted, as the sweep makes any one of its reads,
+/// and a count of every read the sweep makes. Each answer names the generation (the pid and its
+/// pid version) that gave it: a usage's footprint ([`world::footprint_of`]), a coalition's id
+/// ([`world::coalition_of`]), a short name's and the longer names' program.
 #[cfg(target_os = "macos")]
 mod world {
     use std::cell::RefCell;
@@ -799,10 +811,33 @@ mod world {
     use crate::procs::imp::{Reads, ShortInfo};
     use crate::rusage::{RusageV6, Usage};
 
-    /// This world's user.
+    /// This world's user, the sweep's own.
     pub(super) const OWN: u32 = 501;
     /// Another user (root), whose usage and `p_name` the kernel refuses.
     pub(super) const OTHER: u32 = 0;
+
+    /// A step one process takes, between two sweeps or as the sweep makes a read
+    /// ([`World::race`]). Each holds to xnu's rules: a step the kernel refuses panics.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Step {
+        /// It execs this program: the same process, a new pid version.
+        Exec(&'static str),
+        /// It exits and is reaped, and a new process running this program as this user starts
+        /// at its pid, a session's leader: a new start and a new pid version.
+        Reuse(&'static str, u32),
+        /// It exits, unreaped.
+        Die,
+        /// It is gone.
+        Reap,
+        /// Its effective uid becomes this one (`setuid`); its pid version stays.
+        SetUid(u32),
+        /// `setpgid(pid, pgid)`: refused to a session's leader, and into a group of another
+        /// session or none (xnu's `setpgid`).
+        SetPgid(c_int),
+        /// `setsid()`: refused to a group's leader and where a group of its pid's id is left
+        /// (xnu's `setsid_internal`); else its session and group become its pid.
+        SetSid,
+    }
 
     /// One process: the file it last exec'd, which each name reader cuts at its own length.
     #[derive(Clone, Debug)]
@@ -812,17 +847,35 @@ mod world {
         uid: u32,
         start: u64,
         zombie: bool,
+        pgid: c_int,
+        sid: c_int,
+    }
+
+    /// One generation as the world made it: a pid, a pid version, the program it ran and the
+    /// process's start.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct Made {
+        pub(super) pid: c_int,
+        pub(super) version: i32,
+        pub(super) program: String,
+        pub(super) start: u64,
     }
 
     #[derive(Clone, Debug, Default)]
     struct Inner {
         procs: BTreeMap<c_int, Proc>,
         versions: i32,
-        /// An exec the next version read of that pid makes first: it lands between the sweep's
-        /// short-info read and its version read.
-        race: Option<(c_int, String)>,
+        /// The processes each pid has had.
+        spawned: BTreeMap<c_int, u64>,
+        /// Every generation made.
+        made: Vec<Made>,
+        /// Each step scripted to land as the sweep makes a read: that read's kind and pid, how
+        /// many such reads pass first, and the step, taken before that read answers.
+        races: Vec<(&'static str, c_int, u32, Step)>,
         /// The answers a pid's rusage reads give, in turn, in place of its own.
         rusage: BTreeMap<c_int, VecDeque<Result<u64, i32>>>,
+        /// The answers a pid's version reads give, in turn, in place of its own.
+        version: BTreeMap<c_int, VecDeque<Option<i32>>>,
         reads: BTreeMap<(&'static str, c_int), u32>,
     }
 
@@ -830,55 +883,150 @@ mod world {
     #[derive(Clone, Debug, Default)]
     pub(super) struct World(RefCell<Inner>);
 
+    /// The footprint a usage read of pid version `version` answers: each generation's own.
+    pub(super) fn footprint_of(version: i32) -> u64 {
+        u64::from(version.unsigned_abs()) << 20
+    }
+
+    /// The coalition id a coalition read of pid version `version` answers: each generation's own.
+    pub(super) fn coalition_of(version: i32) -> u64 {
+        7_000 + u64::from(version.unsigned_abs())
+    }
+
     impl World {
         fn next_version(inner: &mut Inner) -> i32 {
             inner.versions += 1;
             inner.versions
         }
 
-        /// A new process at `pid` running `program` as `uid`.
+        /// A new process at `pid` running `program` as `uid`, its own session's and group's
+        /// leader.
         pub(super) fn spawn(&self, pid: c_int, program: &str, uid: u32) {
+            self.spawn_in(pid, program, uid, pid, pid);
+        }
+
+        /// A new process at `pid` running `program` as `uid` in group `pgid` of session `sid`,
+        /// as a fork of a process there makes it.
+        pub(super) fn spawn_in(
+            &self,
+            pid: c_int,
+            program: &str,
+            uid: u32,
+            pgid: c_int,
+            sid: c_int,
+        ) {
             let inner = &mut *self.0.borrow_mut();
             let version = Self::next_version(inner);
+            let nth = inner.spawned.entry(pid).or_default();
+            let start = 1_000 + u64::from(pid.unsigned_abs()) + 100_000 * *nth;
+            *nth += 1;
             inner.procs.insert(
                 pid,
                 Proc {
                     version,
                     program: program.into(),
                     uid,
-                    start: 1_000 + u64::from(pid.unsigned_abs()),
+                    start,
                     zombie: false,
+                    pgid,
+                    sid,
                 },
             );
+            inner.made.push(Made {
+                pid,
+                version,
+                program: program.into(),
+                start,
+            });
+        }
+
+        /// `pid` takes `step`.
+        pub(super) fn step(&self, pid: c_int, step: Step) {
+            match step {
+                Step::Exec(program) => {
+                    let inner = &mut *self.0.borrow_mut();
+                    let version = Self::next_version(inner);
+                    let p = inner.procs.get_mut(&pid).expect("a live pid");
+                    assert!(!p.zombie, "a zombie runs nothing");
+                    p.version = version;
+                    p.program = program.into();
+                    let start = p.start;
+                    inner.made.push(Made {
+                        pid,
+                        version,
+                        program: program.into(),
+                        start,
+                    });
+                }
+                Step::Reuse(program, uid) => {
+                    self.0.borrow_mut().procs.remove(&pid).expect("a pid");
+                    self.spawn(pid, program, uid);
+                }
+                Step::Die => {
+                    self.0
+                        .borrow_mut()
+                        .procs
+                        .get_mut(&pid)
+                        .expect("a live pid")
+                        .zombie = true;
+                }
+                Step::Reap => {
+                    self.0.borrow_mut().procs.remove(&pid).expect("a pid");
+                }
+                Step::SetUid(uid) => {
+                    self.0.borrow_mut().procs.get_mut(&pid).expect("a pid").uid = uid;
+                }
+                Step::SetPgid(pgid) => {
+                    let inner = &mut *self.0.borrow_mut();
+                    let p = &inner.procs[&pid];
+                    assert_ne!(p.sid, pid, "setpgid is refused to a session's leader");
+                    assert!(
+                        pgid == pid
+                            || inner
+                                .procs
+                                .values()
+                                .any(|q| q.pgid == pgid && q.sid == p.sid),
+                        "setpgid into no group of its session"
+                    );
+                    inner.procs.get_mut(&pid).expect("a pid").pgid = pgid;
+                }
+                Step::SetSid => {
+                    let inner = &mut *self.0.borrow_mut();
+                    assert!(
+                        !inner.procs.values().any(|q| q.pgid == pid),
+                        "setsid is refused to a group's leader, and where its pid's group is left"
+                    );
+                    let p = inner.procs.get_mut(&pid).expect("a pid");
+                    p.pgid = pid;
+                    p.sid = pid;
+                }
+            }
         }
 
         /// `pid` execs `program`: the same process, a new pid version.
-        pub(super) fn exec(&self, pid: c_int, program: &str) {
-            let inner = &mut *self.0.borrow_mut();
-            let version = Self::next_version(inner);
-            let p = inner.procs.get_mut(&pid).expect("a live pid");
-            p.version = version;
-            p.program = program.into();
-        }
-
-        /// `pid` execs `program` as the sweep reads its version, after its short info.
-        pub(super) fn exec_at_version_read(&self, pid: c_int, program: &str) {
-            self.0.borrow_mut().race = Some((pid, program.into()));
+        pub(super) fn exec(&self, pid: c_int, program: &'static str) {
+            self.step(pid, Step::Exec(program));
         }
 
         /// `pid` exits, unreaped.
         pub(super) fn die(&self, pid: c_int) {
-            self.0
-                .borrow_mut()
-                .procs
-                .get_mut(&pid)
-                .expect("a live pid")
-                .zombie = true;
+            self.step(pid, Step::Die);
         }
 
         /// `pid` is gone.
         pub(super) fn reap(&self, pid: c_int) {
-            self.0.borrow_mut().procs.remove(&pid);
+            self.step(pid, Step::Reap);
+        }
+
+        /// `pid` takes `step` as the sweep makes its read of kind `kind` (a [`Reads`] method's
+        /// name) after `pass` such reads of it, before that read answers.
+        pub(super) fn race(&self, kind: &'static str, pid: c_int, pass: u32, step: Step) {
+            self.0.borrow_mut().races.push((kind, pid, pass, step));
+        }
+
+        /// Drops the races no read reached, and counts them.
+        pub(super) fn drop_races(&self) -> usize {
+            std::mem::take(&mut self.0.borrow_mut().races).len()
         }
 
         /// `pid`'s next rusage reads answer `answers` (a start, or an errno), in turn.
@@ -889,9 +1037,28 @@ mod world {
                 .insert(pid, answers.iter().copied().collect());
         }
 
+        /// `pid`'s next version reads answer `answers`, in turn.
+        pub(super) fn script_version(&self, pid: c_int, answers: &[Option<i32>]) {
+            self.0
+                .borrow_mut()
+                .version
+                .insert(pid, answers.iter().copied().collect());
+        }
+
         /// `pid`'s current pid version.
         pub(super) fn version_of(&self, pid: c_int) -> i32 {
             self.0.borrow().procs[&pid].version
+        }
+
+        /// `pid`'s session id now, as `getsid` answers it.
+        pub(super) fn sid_of(&self, pid: u32) -> u32 {
+            let pid = c_int::try_from(pid).expect("a pid");
+            self.0.borrow().procs[&pid].sid.unsigned_abs()
+        }
+
+        /// Every generation the world made.
+        pub(super) fn made(&self) -> Vec<Made> {
+            self.0.borrow().made.clone()
         }
 
         /// Every read since the last take, by kind and pid.
@@ -899,18 +1066,37 @@ mod world {
             std::mem::take(&mut self.0.borrow_mut().reads)
         }
 
-        fn count(&self, kind: &'static str, pid: c_int) -> std::cell::RefMut<'_, Inner> {
+        /// A read of kind `kind` of `pid`: the race scripted there taken first, then counted.
+        fn read(&self, kind: &'static str, pid: c_int) -> std::cell::RefMut<'_, Inner> {
+            let due = {
+                let inner = &mut *self.0.borrow_mut();
+                match inner
+                    .races
+                    .iter()
+                    .position(|(k, p, _, _)| *k == kind && *p == pid)
+                {
+                    Some(at) if inner.races[at].2 == 0 => Some(inner.races.remove(at).3),
+                    Some(at) => {
+                        inner.races[at].2 -= 1;
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if let Some(step) = due {
+                self.step(pid, step);
+            }
             let mut inner = self.0.borrow_mut();
             *inner.reads.entry((kind, pid)).or_default() += 1;
             inner
         }
     }
 
-    fn usage(start: u64) -> Usage {
+    fn usage(start: u64, version: i32) -> Usage {
         let mut ri = RusageV6::default();
         ri.ri_proc_start_abstime = start;
         ri.ri_user_time = 7_000;
-        ri.ri_phys_footprint = 4 << 20;
+        ri.ri_phys_footprint = footprint_of(version);
         Usage { ri, v6: true }
     }
 
@@ -920,7 +1106,7 @@ mod world {
 
     impl Reads for World {
         fn pids(&self) -> Option<Vec<c_int>> {
-            let inner = self.count("pids", 0);
+            let inner = self.read("pids", 0);
             let (zombies, live): (Vec<_>, Vec<_>) = inner.procs.iter().partition(|(_, p)| p.zombie);
             Some(
                 live.into_iter()
@@ -932,24 +1118,25 @@ mod world {
         }
 
         fn rusage(&self, pid: c_int) -> Result<Usage, i32> {
-            let mut inner = self.count("rusage", pid);
+            let mut inner = self.read("rusage", pid);
+            let version = inner.procs.get(&pid).map_or(0, |p| p.version);
             if let Some(answer) = inner.rusage.get_mut(&pid).and_then(VecDeque::pop_front) {
-                return answer.map(usage);
+                return answer.map(|start| usage(start, version));
             }
             match inner.procs.get(&pid) {
                 None => Err(libc::ESRCH),
                 Some(p) if p.uid != OWN && !p.zombie => Err(libc::EPERM),
-                Some(p) => Ok(usage(p.start)),
+                Some(p) => Ok(usage(p.start, p.version)),
             }
         }
 
         fn short_info(&self, pid: c_int) -> Option<ShortInfo> {
-            let inner = self.count("short_info", pid);
+            let inner = self.read("short_info", pid);
             let p = inner.procs.get(&pid).filter(|p| !p.zombie)?;
             let mut info = ShortInfo::default();
             info.pid = pid.unsigned_abs();
             info.ppid = 1;
-            info.pgid = pid.unsigned_abs();
+            info.pgid = p.pgid.unsigned_abs();
             info.status = 2;
             info.uid = p.uid;
             let comm = cut(&p.program, 15);
@@ -958,11 +1145,9 @@ mod world {
         }
 
         fn version(&self, pid: c_int) -> Option<i32> {
-            let mut inner = self.count("version", pid);
-            if let Some((_, program)) = inner.race.take_if(|(at, _)| *at == pid) {
-                drop(inner);
-                self.exec(pid, &program);
-                inner = self.0.borrow_mut();
+            let mut inner = self.read("version", pid);
+            if let Some(answer) = inner.version.get_mut(&pid).and_then(VecDeque::pop_front) {
+                return answer;
             }
             inner
                 .procs
@@ -972,45 +1157,53 @@ mod world {
         }
 
         fn coalition(&self, pid: u32) -> Option<u64> {
-            let _ = self.count("coalition", c_int::try_from(pid).ok()?);
-            Some(7)
+            let inner = self.read("coalition", c_int::try_from(pid).ok()?);
+            inner
+                .procs
+                .get(&c_int::try_from(pid).ok()?)
+                .filter(|p| !p.zombie)
+                .map(|p| coalition_of(p.version))
         }
 
         fn priority(&self, pid: c_int, _which: c_int) -> Result<i32, i32> {
-            let _ = self.count("priority", pid);
+            let _ = self.read("priority", pid);
             Ok(0)
         }
 
         fn sid(&self, pid: c_int) -> c_int {
-            let _ = self.count("sid", pid);
-            pid
+            let inner = self.read("sid", pid);
+            inner
+                .procs
+                .get(&pid)
+                .filter(|p| !p.zombie)
+                .map_or(-1, |p| p.sid)
         }
 
         fn p_name(&self, pid: c_int) -> Option<Vec<u8>> {
-            let inner = self.count("p_name", pid);
+            let inner = self.read("p_name", pid);
             let p = inner.procs.get(&pid).filter(|p| p.uid == OWN)?;
             Some(cut(&p.program, 31).to_vec())
         }
 
         fn image_name(&self, pid: c_int) -> Option<Vec<u8>> {
-            let inner = self.count("image_name", pid);
+            let inner = self.read("image_name", pid);
             let p = inner.procs.get(&pid).filter(|p| !p.zombie)?;
             Some(p.program.as_bytes().to_vec())
         }
 
         fn kinfo(&self, pid: c_int) -> Option<Kinfo> {
-            let inner = self.count("kinfo", pid);
+            let inner = self.read("kinfo", pid);
             let p = inner.procs.get(&pid)?;
             Some(Kinfo {
                 pid: pid.unsigned_abs(),
                 ppid: 1,
-                pgid: pid.unsigned_abs(),
+                pgid: p.pgid.unsigned_abs(),
                 stat: if p.zombie { 5 } else { 2 },
                 uid: p.uid,
                 start_us: 0,
                 tty: None,
                 tpgid: None,
-                session_leader: false,
+                session_leader: p.sid == pid,
                 exec: true,
                 reaps_unwaited: false,
                 comm: String::from_utf8_lossy(cut(&p.program, 16)).into_owned(),
@@ -1018,7 +1211,7 @@ mod world {
         }
 
         fn unwaited(&self) -> Option<Vec<(u32, u32, bool)>> {
-            let inner = self.count("unwaited", 0);
+            let inner = self.read("unwaited", 0);
             Some(
                 inner
                     .procs
@@ -1027,16 +1220,23 @@ mod world {
                     .collect(),
             )
         }
+
+        fn own_uid(&self) -> u32 {
+            let _ = self.read("own_uid", 0);
+            OWN
+        }
     }
 }
 
-/// A sweep of `world` as whole readings ask it (coalitions and versions), keeping in `ids`, its
-/// rows as they compare: with `read_at`, the clock's reading, left out.
+/// A sweep of `world` as a whole reading with every reader asks it (coalitions, versions and
+/// scheduling), keeping in `ids`, its rows as they compare: with `read_at`, the clock's reading,
+/// left out.
 #[cfg(target_os = "macos")]
 fn swept(world: &world::World, ids: &mut crate::coalitions::CoalitionIds) -> Vec<ProcessReading> {
     let opts = SweepOpts {
         coalitions: true,
         versions: true,
+        scheduling: true,
     };
     imp::sweep(world, opts, ids)
         .expect("a sweep")
@@ -1046,20 +1246,381 @@ fn swept(world: &world::World, ids: &mut crate::coalitions::CoalitionIds) -> Vec
         .collect()
 }
 
+/// The sweep's generation laws, judged sweep by sweep over [`swept`]'s rows and the reads it
+/// made, with each pid's refusal the last sweep kept a row of.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct Ledger {
+    /// Each pid whose last kept row was refused another user's usage: its pid version and uid.
+    refused: std::collections::BTreeMap<u32, (i32, u32)>,
+}
+
+#[cfg(target_os = "macos")]
+impl Ledger {
+    /// LAW (i): every live row the sweep kept holds the usage, short name, coalition, version and
+    /// whole name of one generation the world made at its pid. LAW (ii): a live row whose usage
+    /// was read holds the one usage read made of its pid in the sweep; a refused one made one
+    /// read, or none where the pid's last kept row was refused under the same pid version and
+    /// uid (the uid another user's: the sweep's own is read again).
+    fn judge(
+        &mut self,
+        world: &world::World,
+        rows: &[ProcessReading],
+        reads: &std::collections::BTreeMap<(&'static str, std::ffi::c_int), u32>,
+    ) -> Result<(), String> {
+        let made = world.made();
+        let mut refused = std::collections::BTreeMap::new();
+        for row in rows
+            .iter()
+            .filter(|r| r.state != crate::jobs::RunState::Zombie)
+        {
+            let of_one = made.iter().any(|g| {
+                g.pid.unsigned_abs() == row.pid
+                    && row.name == g.program
+                    && row.start.is_none_or(|s| s == g.start)
+                    && row
+                        .footprint
+                        .is_none_or(|f| f == world::footprint_of(g.version))
+                    && row
+                        .coalition
+                        .is_none_or(|c| c == world::coalition_of(g.version))
+                    && row.version.is_none_or(|v| v == g.version)
+            });
+            if !of_one {
+                return Err(format!("LAW (i): of no one generation: {row:?}"));
+            }
+            let pid = std::ffi::c_int::try_from(row.pid).map_err(|e| e.to_string())?;
+            let usage_reads = reads.get(&("rusage", pid)).copied().unwrap_or(0);
+            let Some(version) = row.version else {
+                continue;
+            };
+            let refusal = row.scheduling.and_then(|s| s.qos_cpu_ns) == Some(Err(libc::EPERM));
+            let uid = row.uid.unwrap_or(world::OWN);
+            let want = if !refusal {
+                1
+            } else if self.refused.get(&row.pid) == Some(&(version, uid)) {
+                0
+            } else {
+                1
+            };
+            if usage_reads != want {
+                return Err(format!(
+                    "LAW (ii): {usage_reads} usage reads, not {want}: {row:?}"
+                ));
+            }
+            if refusal && uid != world::OWN {
+                refused.insert(row.pid, (version, uid));
+            }
+        }
+        self.refused = refused;
+        Ok(())
+    }
+}
+
+/// LAW (iv): every live row's session id is the one `getsid` answers of its pid now.
+#[cfg(target_os = "macos")]
+fn sessions_hold(world: &world::World, rows: &[ProcessReading]) -> Result<(), String> {
+    match rows
+        .iter()
+        .filter(|r| r.state != crate::jobs::RunState::Zombie)
+        .find(|r| r.sid != world.sid_of(r.pid))
+    {
+        Some(row) => Err(format!(
+            "LAW (iv): sid {} where getsid answers {}: {row:?}",
+            row.sid,
+            world.sid_of(row.pid)
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A world of every kind of row the laws judge: a session's leader, a job's leader (a group's
+/// leader in another's session) with a member at the short name's cut, another user's process
+/// with a long name, and a zombie.
+#[cfg(target_os = "macos")]
+fn law_world() -> world::World {
+    use world::{OTHER, OWN, World};
+    let world = World::default();
+    world.spawn(100, "zsh", OWN);
+    // A test binary's name: 31 bytes, at `p_name`'s cut as at the short name's.
+    world.spawn_in(200, "aterm_sysprobe-0123456789abcdef", OWN, 200, 100);
+    world.spawn(300, "com.apple.WebKit.WebContent", OTHER);
+    world.spawn_in(400, "SetStoreUpdate1", OWN, 200, 100);
+    world.spawn(500, "exited", OWN);
+    world.die(500);
+    world
+}
+
+/// EVERY KEPT ROW IS READ OF ONE GENERATION (macOS, a scripted kernel world): whichever of a
+/// row's reads a step races (its first and last version reads, its usage, short info,
+/// coalition, either scheduling read, session and longer names; an exec, a new process at the
+/// pid, an exit, a reap, a new effective uid, a new group, a new session), on first sight or
+/// with the generation's facts kept from the sweep before: LAW (i), every live row the sweep keeps
+/// holds facts of one generation; LAW (ii), each kept live row with a readable usage was read
+/// once, and a refused one at most once a generation; a row a version-moving step landed inside
+/// (after its first version read) is not kept live; LAW (v), a process that exits (unreaped) as
+/// any of its row's reads is made has a zombie row, whose start, where it names one, is its
+/// generation's, and which names one where its usage was readable (this user's); and the next sweep
+/// with no race answers what a sweep reading every fact fresh answers (LAW (iii)) with each
+/// session id `getsid`'s (LAW (iv)). The world's exec sets the names with the version at one
+/// instant, as xnu's does not (`imp::sweep`'s bracket): of names, LAW (i) holds in such a world.
+/// NEGATIVE CONTROLS (each run on a mutant `imp::sweep`): keeping a row whose second version read
+/// answered another version fails LAW (i); dropping a row whose last version read answered none
+/// fails LAW (v); a second usage read before the last version read fails LAW (ii), as do a
+/// refusal kept across an exec, a refusal answered whatever uid the short info names, and, on the
+/// sweep after this user's uid raced to root's process, a refusal kept where its uid is the
+/// sweep's own; a session kept whatever the group fails LAW (iv) once a group's member leads a
+/// session of its own.
+#[cfg(target_os = "macos")]
+#[test]
+fn every_kept_row_is_read_of_one_generation() {
+    use world::{OTHER, OWN, Step};
+    let kinds: [(&str, u32); 10] = [
+        ("version", 0),
+        ("rusage", 0),
+        ("short_info", 0),
+        ("coalition", 0),
+        ("priority", 0),
+        ("priority", 1),
+        ("sid", 0),
+        ("p_name", 0),
+        ("image_name", 0),
+        ("version", 1),
+    ];
+    let steps: [(i32, &[Step]); 3] = [
+        (
+            200,
+            &[
+                Step::Exec("aterm_sysprobe-fedcba9876543210"),
+                Step::Die,
+                Step::Reap,
+                Step::SetUid(OTHER),
+                Step::SetPgid(100),
+            ],
+        ),
+        (
+            300,
+            &[
+                Step::Exec("com.apple.Safari.SafeBrowsing"),
+                Step::Reuse("com.apple.WebKit.Networking", OWN),
+                Step::Reuse("com.apple.WebKit.GPUProcess", OTHER),
+                Step::Die,
+                Step::Reap,
+                Step::SetUid(OWN),
+            ],
+        ),
+        (
+            400,
+            &[
+                Step::Exec("softwareupdated"),
+                Step::Reuse("SetStoreUpdate2", OWN),
+                Step::Die,
+                Step::Reap,
+                Step::SetUid(OTHER),
+                Step::SetPgid(400),
+                Step::SetSid,
+            ],
+        ),
+    ];
+    let mut fired = std::collections::BTreeMap::<(&str, u32), u32>::new();
+    let mut cases = 0;
+    for (target, target_steps) in steps {
+        for &step in target_steps {
+            for (kind, pass) in kinds {
+                for kept_before in [false, true] {
+                    let what =
+                        format!("{step:?} of {target} at {kind} #{pass}, kept {kept_before}");
+                    let world = law_world();
+                    let mut ids = crate::coalitions::CoalitionIds::default();
+                    let mut ledger = Ledger::default();
+                    if kept_before {
+                        let rows = swept(&world, &mut ids);
+                        ledger
+                            .judge(&world, &rows, &world.take_reads())
+                            .unwrap_or_else(|e| panic!("{what}, the sweep before: {e}"));
+                    }
+                    world.race(kind, target, pass, step);
+                    let rows = swept(&world, &mut ids);
+                    let reads = world.take_reads();
+                    ledger
+                        .judge(&world, &rows, &reads)
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    if world.drop_races() == 0 {
+                        *fired.entry((kind, pass)).or_default() += 1;
+                        let moves = matches!(
+                            step,
+                            Step::Exec(_) | Step::Reuse(..) | Step::Die | Step::Reap
+                        );
+                        if moves && (kind, pass) != ("version", 0) {
+                            assert!(
+                                rows.iter().all(|r| r.pid != target.unsigned_abs()
+                                    || r.state == crate::jobs::RunState::Zombie),
+                                "{what}: a row its version moved across is not kept live"
+                            );
+                        }
+                        if matches!(step, Step::Die) {
+                            let start = world
+                                .made()
+                                .iter()
+                                .rev()
+                                .find(|g| g.pid == target)
+                                .map(|g| g.start);
+                            let zombie = rows.iter().find(|r| {
+                                r.pid == target.unsigned_abs()
+                                    && r.state == crate::jobs::RunState::Zombie
+                            });
+                            // Its usage, read by the zombie pass under the start its live read
+                            // named; another user's (300's), refused while it ran, names none.
+                            let read = zombie.is_some_and(|z| match z.start {
+                                Some(s) => Some(s) == start,
+                                None => target == 300,
+                            });
+                            assert!(
+                                read,
+                                "{what}: LAW (v), an exit inside the row is read as a zombie: {zombie:?}"
+                            );
+                        }
+                    }
+                    let fresh = swept(
+                        &world.clone(),
+                        &mut crate::coalitions::CoalitionIds::default(),
+                    );
+                    let rows = swept(&world, &mut ids);
+                    let reads = world.take_reads();
+                    ledger
+                        .judge(&world, &rows, &reads)
+                        .unwrap_or_else(|e| panic!("{what}, the sweep after: {e}"));
+                    sessions_hold(&world, &rows)
+                        .unwrap_or_else(|e| panic!("{what}, the sweep after: {e}"));
+                    assert_eq!(rows, fresh, "{what}, the sweep after: LAW (iii)");
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 18 * 10 * 2);
+    for kind in kinds {
+        assert!(
+            fired.get(&kind).is_some_and(|n| *n > 0),
+            "a race at every read: none at {kind:?} ({fired:?})"
+        );
+    }
+}
+
+/// KEPT GENERATION FACTS ANSWER AS FRESH READS (macOS, a scripted kernel world), from one sweep
+/// to the next as processes exec, change their effective uid, leave their group and lead a
+/// session, and end: LAWS (i) and (ii) as [`every_kept_row_is_read_of_one_generation`] holds
+/// them, LAW (iii), every row a sweep reading every fact fresh answers, and LAW (iv), each
+/// session id `getsid`'s. A session's leader and a group's member are asked their session only
+/// on first sight of a generation, a group's leader that leads no session at every sweep; a
+/// refused usage is read once a generation and uid. NEGATIVE CONTROLS (each run on a mutant
+/// `imp::sweep`): a session kept whatever the group asks neither job's leader again; a refusal
+/// kept across an exec (its pid version) fails LAW (ii); a refusal answered whatever uid the short
+/// info names fails LAW (iii) where root's process takes this user's uid.
+#[cfg(target_os = "macos")]
+#[test]
+fn kept_generation_facts_answer_as_fresh_reads() {
+    use world::{OTHER, OWN, Step, World};
+    let world = World::default();
+    world.spawn(100, "zsh", OWN);
+    world.spawn_in(200, "cargo", OWN, 200, 100);
+    world.spawn_in(201, "rustc", OWN, 200, 100);
+    world.spawn(300, "com.apple.WebKit.WebContent", OTHER);
+    world.spawn_in(600, "make", OWN, 600, 100);
+    let mut ids = crate::coalitions::CoalitionIds::default();
+    let mut ledger = Ledger::default();
+    let mut step = |what: &str| {
+        let fresh = swept(
+            &world.clone(),
+            &mut crate::coalitions::CoalitionIds::default(),
+        );
+        let rows = swept(&world, &mut ids);
+        let reads = world.take_reads();
+        assert_eq!(rows, fresh, "{what}: LAW (iii)");
+        ledger
+            .judge(&world, &rows, &reads)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        sessions_hold(&world, &rows).unwrap_or_else(|e| panic!("{what}: {e}"));
+        move |kind: &'static str, pid: std::ffi::c_int| {
+            reads.get(&(kind, pid)).copied().unwrap_or(0)
+        }
+    };
+    let sids = |n: &dyn Fn(&'static str, std::ffi::c_int) -> u32| {
+        [100, 200, 201, 300, 600].map(|pid| n("sid", pid))
+    };
+
+    let n = step("first sight");
+    assert_eq!(sids(&n), [1; 5], "first sight: every session read");
+    assert_eq!(n("rusage", 300), 1, "and the refused usage");
+    let n = step("no step");
+    assert_eq!(
+        sids(&n),
+        [0, 1, 0, 0, 1],
+        "only the jobs' leaders, which lead no session, are asked again"
+    );
+    assert_eq!(
+        n("rusage", 300),
+        0,
+        "a refusal kept for its generation and uid"
+    );
+
+    world.step(300, Step::Exec("com.apple.Safari.SafeBrowsing"));
+    let n = step("another user's process execs");
+    assert_eq!(
+        (n("rusage", 300), n("sid", 300)),
+        (1, 1),
+        "a new generation: read again"
+    );
+    world.step(300, Step::SetUid(OWN));
+    let n = step("root's process takes this user's uid");
+    assert_eq!(n("rusage", 300), 1, "a refusal is not kept across its uid");
+    world.step(300, Step::SetUid(OTHER));
+    let n = step("and gives it up");
+    assert_eq!(n("rusage", 300), 1);
+    let n = step("refused again");
+    assert_eq!(n("rusage", 300), 0);
+
+    world.step(600, Step::SetPgid(100));
+    world.step(600, Step::SetSid);
+    let n = step("a job's leader leaves its group and leads a session");
+    assert_eq!(
+        n("sid", 600),
+        1,
+        "a group's leader with another's session is asked"
+    );
+    let n = step("the session's leader now");
+    assert_eq!(n("sid", 600), 0, "a session's leader is not asked again");
+
+    world.step(201, Step::SetPgid(201));
+    let n = step("a job's member makes a group of its own");
+    assert_eq!(
+        n("sid", 201),
+        1,
+        "now a group's leader in another's session"
+    );
+    world.step(201, Step::Reuse("cc", OWN));
+    let _ = step("a new process at the member's pid");
+    world.die(200);
+    let _ = step("the job's leader exits");
+    world.reap(200);
+    let _ = step("and is reaped");
+}
+
 /// THE SWEEP READS EACH GENERATION ONCE (macOS, a scripted kernel world). A sweep that keeps its
 /// ids from one sweep to the next answers, at each step, every row a fresh sweep of the same world
 /// answers, names included (`read_at`, the clock, aside). A name at the short name's cut is read
 /// whole (`p_name`, then the image's basename) once per pid version and short name: on first
-/// sight, again after an exec that keeps the short name and after one that moves it, and twice
-/// across an exec that races the sweep's reads (the short name read before it, the version after);
-/// a name below the cut is never read; one that left the cut or whose pid is gone is not kept. A
-/// usage read the kernel refuses (another user's process) is made once a sweep, a readable one
-/// twice. NEGATIVE CONTROLS: a name kept by pid alone answers the pre-exec name, so the rows part
-/// from the fresh sweep's; the old second read of a refused usage counts 2.
+/// sight, again after an exec that keeps the short name and after one that moves it, and again
+/// after an exec that raced the sweep's reads, whose row that sweep dropped; a name below the cut
+/// is never read; one that left the cut or whose pid is gone is not kept. A readable usage is read
+/// once a sweep, one the kernel refuses (another user's process) once a generation, and a
+/// zombie's twice (in the live pass, then in the zombie pass). NEGATIVE CONTROLS: a name kept by
+/// pid alone answers the pre-exec name, so the rows part from the fresh sweep's; a refusal kept
+/// across an exec reads the new generation's usage no time.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_keeping_sweep_reads_each_generation_once() {
-    use world::{OTHER, OWN, World};
+    use world::{OTHER, OWN, Step, World};
     let world = World::default();
     world.spawn(100, "zsh", OWN);
     // A test binary's name: 31 bytes, at `p_name`'s cut as at the short name's.
@@ -1069,7 +1630,7 @@ fn a_keeping_sweep_reads_each_generation_once() {
     world.spawn(500, "exited", OWN);
     world.die(500);
     let mut ids = crate::coalitions::CoalitionIds::default();
-    let step = |ids: &mut crate::coalitions::CoalitionIds, what: &str| {
+    let step = |ids: &mut crate::coalitions::CoalitionIds, what: &str, refused_reads: u32| {
         let fresh = swept(
             &world.clone(),
             &mut crate::coalitions::CoalitionIds::default(),
@@ -1078,10 +1639,19 @@ fn a_keeping_sweep_reads_each_generation_once() {
         let reads = world.take_reads();
         assert_eq!(kept, fresh, "{what}: the rows a fresh sweep reads");
         let n = |kind: &'static str, pid: i32| reads.get(&(kind, pid)).copied().unwrap_or(0);
-        assert_eq!(n("rusage", 300), 1, "{what}: one read of a refused usage");
+        assert_eq!(
+            n("rusage", 300),
+            refused_reads,
+            "{what}: the refused usage's reads"
+        );
         for row in kept.iter().filter(|p| p.uid == Some(OWN)) {
             let pid = i32::try_from(row.pid).expect("a pid");
-            assert_eq!(n("rusage", pid), 2, "{what}: a readable usage's bracket");
+            let want = if row.state == crate::jobs::RunState::Zombie {
+                2
+            } else {
+                1
+            };
+            assert_eq!(n("rusage", pid), want, "{what}: a readable usage's reads");
         }
         let named = |pid: i32| (n("p_name", pid), n("image_name", pid));
         (kept, [100, 200, 300, 400].map(named))
@@ -1093,7 +1663,7 @@ fn a_keeping_sweep_reads_each_generation_once() {
             .expect("swept")
     };
 
-    let (rows, reads) = step(&mut ids, "first sight");
+    let (rows, reads) = step(&mut ids, "first sight", 1);
     assert_eq!(reads, [(0, 0), (1, 1), (1, 1), (1, 0)], "first sight");
     assert_eq!(name(&rows, 200), "aterm_sysprobe-0123456789abcdef");
     assert_eq!(name(&rows, 300), "com.apple.WebKit.WebContent");
@@ -1114,37 +1684,38 @@ fn a_keeping_sweep_reads_each_generation_once() {
     );
     assert_eq!(ids.kept_name(100), None, "a name below the cut is not kept");
 
-    let (_, reads) = step(&mut ids, "no exec");
+    let (_, reads) = step(&mut ids, "no exec", 0);
     assert_eq!(reads, [(0, 0); 4], "every generation kept");
 
     world.exec(200, "aterm_sysprobe-fedcba9876543210");
-    let (rows, reads) = step(&mut ids, "an exec that keeps the short name");
+    let (rows, reads) = step(&mut ids, "an exec that keeps the short name", 0);
     assert_eq!(reads, [(0, 0), (1, 1), (0, 0), (0, 0)]);
     assert_eq!(name(&rows, 200), "aterm_sysprobe-fedcba9876543210");
 
     world.exec(300, "com.apple.Safari.SafeBrowsing");
-    let (rows, reads) = step(&mut ids, "an exec that moves the short name");
+    let (rows, reads) = step(&mut ids, "an exec that moves the short name", 1);
     assert_eq!(reads, [(0, 0), (0, 0), (1, 1), (0, 0)]);
     assert_eq!(name(&rows, 300), "com.apple.Safari.SafeBrowsing");
 
-    world.exec_at_version_read(400, "softwareupdated");
+    world.race("short_info", 400, 0, Step::Exec("softwareupdated"));
     let (rows, reads) = step(
         &mut ids,
-        "an exec between the short name's read and the version's",
+        "an exec between the usage's read and the short name's",
+        0,
     );
-    assert_eq!(reads, [(0, 0), (0, 0), (0, 0), (1, 1)]);
-    assert_eq!(
-        name(&rows, 400),
-        "SetStoreUpdate1\u{2026}",
-        "the old short name, the new program's readers"
+    assert_eq!(reads, [(0, 0), (0, 0), (0, 0), (1, 0)]);
+    assert!(
+        rows.iter().all(|p| p.pid != 400),
+        "the row the exec moved the version across is dropped"
     );
-    let (rows, reads) = step(&mut ids, "the new program's short name");
+    assert_eq!(ids.kept_name(400), None, "and nothing read for it kept");
+    let (rows, reads) = step(&mut ids, "the new program's row", 0);
     assert_eq!(reads, [(0, 0), (0, 0), (0, 0), (1, 0)]);
     assert_eq!(name(&rows, 400), "softwareupdated");
 
     world.exec(200, "zsh");
     world.reap(400);
-    let (rows, reads) = step(&mut ids, "a name below the cut, and a pid gone");
+    let (rows, reads) = step(&mut ids, "a name below the cut, and a pid gone", 0);
     assert_eq!(reads, [(0, 0); 4]);
     assert_eq!(name(&rows, 200), "zsh");
     assert_eq!(ids.kept_name(200), None, "a name that left the cut");
@@ -1155,21 +1726,25 @@ fn a_keeping_sweep_reads_each_generation_once() {
     );
 }
 
-/// A READABLE USAGE IS STILL BRACKETED BY ITS START (macOS, a scripted kernel world): a row whose
-/// second usage read names another start (a new process at the pid) or is refused is dropped
-/// from the sweep, and one whose two reads name one start is kept with the second's counters. A
-/// first read the kernel refused is the only one made: the row is kept with no counters and that
-/// refusal even where a second read would have answered (a process that became this user's
-/// between the reads) or found the process gone (`ESRCH`, a reap between them).
-/// NEGATIVE CONTROLS: without the second read the row of another start is kept; with a second
-/// read after a refused first one, the reaped row's refusal reads `ESRCH`.
+/// A ROW WHOSE FIRST VERSION READ ANSWERS NONE IS BRACKETED BY ITS START (macOS, a scripted
+/// kernel world): its usage is read again after its other reads; a row whose second usage read
+/// names another start (a new process at the pid) or is refused is dropped from the sweep, and one
+/// whose two reads name one start is kept with the second's counters and no version. A first read
+/// the kernel refused is the only one made: the row is kept with no counters and that refusal even
+/// where a second read would have answered (a process that became this user's between the reads)
+/// or found the process gone (`ESRCH`, a reap between them). A row whose first version read
+/// answers reads its usage once, under that version. NEGATIVE CONTROL: without the second read
+/// the row of another start is kept.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_readable_usage_is_still_bracketed_by_its_start() {
+fn a_row_whose_first_version_is_unread_is_bracketed_by_its_start() {
     use world::{OWN, World};
     let world = World::default();
-    for pid in [200, 201, 202, 203, 204] {
+    for pid in [200, 201, 202, 203, 204, 205] {
         world.spawn(pid, "worker", OWN);
+    }
+    for pid in [200, 201, 202, 203, 204] {
+        world.script_version(pid, &[None]);
     }
     world.script_rusage(201, &[Ok(1_201), Ok(9_999)]);
     world.script_rusage(202, &[Ok(1_202), Err(libc::EPERM)]);
@@ -1189,14 +1764,22 @@ fn a_readable_usage_is_still_bracketed_by_its_start() {
         "the first read's refusal, not a second read's answer"
     );
     assert_eq!(
-        rows.iter().map(|p| (p.pid, p.start)).collect::<Vec<_>>(),
-        [(204, None), (203, None), (200, Some(1_200))],
+        rows.iter()
+            .map(|p| (p.pid, p.start, p.version))
+            .collect::<Vec<_>>(),
+        [
+            (205, Some(1_205), Some(world.version_of(205))),
+            (204, None, None),
+            (203, None, None),
+            (200, Some(1_200), None)
+        ],
         "the kept rows, newest first"
     );
-    assert_eq!(
-        [200, 201, 202, 203, 204].map(|pid| reads.get(&("rusage", pid)).copied().unwrap_or(0)),
-        [2, 2, 2, 1, 1]
-    );
+    let n = |kind: &'static str| {
+        [200, 201, 202, 203, 204, 205].map(|pid| reads.get(&(kind, pid)).copied().unwrap_or(0))
+    };
+    assert_eq!(n("rusage"), [2, 2, 2, 1, 1, 1]);
+    assert_eq!(n("version"), [1, 1, 1, 1, 1, 2]);
 }
 
 /// The write stand-in's scratch directory: [`write_stand_in`] writes [`WRITE_BYTES`] there on a byte.
@@ -1707,5 +2290,62 @@ fn filetime_birth_and_age_measure_against_the_unix_epoch() {
         super::filetime_age_ms(epoch + 50_000_000, 1_000),
         Some(0),
         "a creation stamp ahead of the wall-clock read saturates to 0 ms"
+    );
+}
+
+/// A SWEEP READS SCHEDULING ONLY WHEN ASKED (C4; macOS, a scripted kernel world): a sweep whose
+/// options ask none makes no `getpriority` and leaves every row's scheduling `None`, its usage
+/// reads the same as when asked; one that asks makes two for each live process (its nice and
+/// its Darwin role) and gives each live row its scheduling, and a zombie none. NEGATIVE
+/// CONTROL: a sweep that reads scheduling whatever its options makes six unasked, which the
+/// first assertion refuses; the asking sweep over the same world counts them.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sweep_reads_scheduling_only_when_asked() {
+    use world::{OWN, World};
+    let world = World::default();
+    for pid in [200, 201, 202] {
+        world.spawn(pid, "worker", OWN);
+    }
+    world.spawn(203, "gone", OWN);
+    world.die(203);
+    let sweep = |scheduling| {
+        let opts = SweepOpts {
+            coalitions: true,
+            versions: true,
+            scheduling,
+        };
+        let rows = imp::sweep(
+            &world,
+            opts,
+            &mut crate::coalitions::CoalitionIds::default(),
+        )
+        .expect("a sweep")
+        .procs;
+        let reads = world.take_reads();
+        let count = |kind: &str| {
+            reads
+                .iter()
+                .filter(|((k, _), _)| *k == kind)
+                .map(|(_, n)| *n)
+                .sum::<u32>()
+        };
+        let mut read = rows
+            .iter()
+            .filter(|p| p.scheduling.is_some())
+            .map(|p| p.pid)
+            .collect::<Vec<_>>();
+        read.sort_unstable();
+        (count("priority"), count("rusage"), read)
+    };
+    let (priorities, usage, read) = sweep(false);
+    assert_eq!(priorities, 0, "no getpriority unasked");
+    assert_eq!(read, [0_u32; 0], "and no row's scheduling");
+    let (asked, asked_usage, asked_read) = sweep(true);
+    assert_eq!(asked, 2 * 3, "CONTROL: two a live process when asked");
+    assert_eq!(asked_read, [200, 201, 202], "every live row's, no zombie's");
+    assert_eq!(
+        usage, asked_usage,
+        "the usage reads are the same either way"
     );
 }

@@ -6,6 +6,99 @@ use std::cell::Cell;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn routed_exec_status_requires_a_complete_native_watcher_frame_and_bounded_errno() {
+    use std::io::Write as _;
+    let identity = crate::process::Identity {
+        pid: 42,
+        birth: crate::process::Birth(900),
+        idversion: crate::process::KEEPS_PID_VERSIONS.then_some(7),
+    };
+    let frame = crate::tether::receipt::encode(identity);
+    let inspect = |bytes: &[u8]| {
+        let status = super::ExecStatus::new().unwrap();
+        std::fs::File::from(status.write.try_clone().unwrap())
+            .write_all(bytes)
+            .unwrap();
+        status.after_fork()
+    };
+    inspect(&frame).unwrap();
+    let mut failed_exec = frame.to_vec();
+    failed_exec.extend_from_slice(&libc::ENOENT.to_ne_bytes());
+    assert_eq!(
+        inspect(&failed_exec).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    for length in 0..frame.len() {
+        assert!(inspect(&frame[..length]).is_err(), "partial frame {length}");
+    }
+    for tail in [vec![1], vec![1; 5]] {
+        let mut invalid = frame.to_vec();
+        invalid.extend(tail);
+        assert_eq!(
+            inspect(&invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    assert!(
+        inspect(&libc::ENOENT.to_ne_bytes()).is_err(),
+        "errno alone cannot stand for an armed watcher"
+    );
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn failed_readiness_retains_an_available_native_frame_without_waiting_for_exec_eof() {
+    use std::io::Write as _;
+    use std::time::Duration;
+    // An actual owned idle child supplies this fixture's native identity.
+    // Only that owning handle is signalled/reaped; the pipe models a private
+    // complete arming frame, not authority inferred from a listed process.
+    let mut child = Command::new(crate::deadline::stand_in(std::path::Path::new("/bin/cat")))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let identity = crate::process::read_lineage(child.id() as i32)
+        .unwrap()
+        .identity;
+    let status = super::ExecStatus::new().unwrap();
+    let receipt = status.watcher.clone();
+    let mut still_open = std::fs::File::from(status.write.try_clone().unwrap());
+    still_open
+        .write_all(&crate::tether::receipt::encode(identity))
+        .unwrap();
+    status.watcher_after_readiness_failure();
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the simulated producer and its writer have not ended"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    receipt
+        .finish(Duration::from_secs(60), || Ok(()))
+        .expect("the complete frame survived failed readiness");
+    drop(still_open);
+
+    // With a partial or absent frame, even an open producer cannot make the
+    // failed path wait for EOF or fabricate a successful observation.
+    for bytes in [vec![], vec![b'A'; 8]] {
+        let status = super::ExecStatus::new().unwrap();
+        let receipt = status.watcher.clone();
+        let mut still_open = std::fs::File::from(status.write.try_clone().unwrap());
+        still_open.write_all(&bytes).unwrap();
+        status.watcher_after_readiness_failure();
+        assert!(
+            receipt
+                .finish(Duration::from_secs(60), || panic!(
+                    "partial frame reached native wait"
+                ))
+                .is_err()
+        );
+        drop(still_open);
+    }
+}
+
 #[test]
 fn an_unavailable_prepared_route_restores_the_command_and_preserves_no_birth() {
     use crate::spawnfd::{BirthAttempt, SpawnFailure};

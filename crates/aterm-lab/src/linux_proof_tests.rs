@@ -761,36 +761,235 @@ fn a_frame_is_found_where_it_shows_whole() {
 }
 
 #[test]
-fn a_buffer_s_bands_continue_the_frame_s_edge() {
+fn the_complete_presented_client_includes_the_dock_and_remainder_bands() {
     let pixel = |x: usize, y: usize| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7];
     let frame = rgba(4, 5, pixel);
-    let view = WestonView {
-        x: 3,
-        y: 2,
-        width: 7,
-        height: 6,
-        format: "XRGB8888".into(),
-    };
-    let output = rgba(12, 10, |x, y| {
-        if !(3..10).contains(&x) || !(2..8).contains(&y) {
-            return [40, 50, 60];
+    let client_pixel = |x: usize, y: usize| {
+        if x < 3 {
+            [30, 30, 32]
+        } else if x < 7 && y < 5 {
+            pixel(x - 3, y)
+        } else {
+            [17, 19, 24]
         }
-        let (dx, dy) = (x as i64 - 5, y as i64 - 2);
-        pixel(dx.clamp(0, 3) as usize, dy.clamp(0, 4) as usize)
-    });
-    assert_eq!(held_at(&output, &frame, 5, 2, 0..0), Ok((4, 5)));
+    };
+    let client = rgba(9, 6, client_pixel);
+    let dims = "OK frame_w=4 frame_h=5 surface_w=9 surface_h=6 offset_x=3 offset_y=0";
+    let layout = ClientLayout::read(dims, &frame, &client, 1..2).unwrap();
     assert_eq!(
-        bands_held(&output, &frame, &view, (2, 0)),
-        Ok(7 * 6 - 4 * 5)
+        held_at(&client, &frame, layout.offset.0, layout.offset.1, 0..0),
+        Ok((4, 5))
     );
-    let mut off = output.clone();
-    off.0[((7 * 12) + 9) * 4] ^= 1;
-    let why = bands_held(&off, &frame, &view, (2, 0)).unwrap_err();
+    let rgb = |pixels: &(Vec<u8>, usize, usize)| {
+        (
+            pixels
+                .0
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| p[..3].iter().copied())
+                .collect::<Vec<_>>(),
+            pixels.1,
+            pixels.2,
+        )
+    };
+    let delivery = ClientDelivery::new(&client);
+    assert_eq!(delivery.compare_rgb(&rgb(&client)), Ok(()));
+    let mut moving = client.clone();
+    moving.0[(9 + 4) * 4] ^= 1;
+    let old_delivery_hole = LivePixels {
+        columns: 3..7,
+        rows: 1..2,
+    };
+    assert_eq!(
+        compare_rgb_except(&client.0, 9, 6, &rgb(&moving), &old_delivery_hole),
+        Ok(()),
+        "the old delivery mask accepted a changed Deck figure"
+    );
     assert!(
-        why.starts_with("1 of 22 band pixels differ; first at (6,5)"),
-        "{why}"
+        delivery.compare_rgb(&rgb(&moving)).is_err(),
+        "the lease pins every delivered Deck pixel"
     );
-    assert!(bands_held(&output, &frame, &view, (1, 0)).is_err());
+    assert_eq!(
+        held_at(&moving, &frame, 3, 0, 1..2),
+        Ok((4, 5)),
+        "the earlier frame may precede updated Deck figures in the client"
+    );
+    assert!(held_at(&moving, &frame, 3, 0, 0..0).is_err());
+    for (x, y) in [(0, 1), (8, 1), (4, 4)] {
+        let mut wrong = client.clone();
+        wrong.0[(y * 9 + x) * 4] ^= 1;
+        assert!(
+            delivery.compare_rgb(&rgb(&wrong)).is_err(),
+            "dock, remainder and static terminal pixels stay authoritative: {x},{y}"
+        );
+    }
+    let placed = |x: usize, y: usize| {
+        if (2..11).contains(&x) && (2..8).contains(&y) {
+            client_pixel(x - 2, y - 2)
+        } else {
+            [40, 50, 60]
+        }
+    };
+    let screen = rgba(13, 10, placed);
+    assert_eq!(delivery.at(&screen, 2, 2), Ok((9, 6)));
+    assert_eq!(delivery.places(&screen), [(2, 2)]);
+    let clipped = rgba(13, 7, placed);
+    assert_eq!(delivery.at(&clipped, 2, 2), Ok((9, 5)));
+    let mut changed_deck = screen.clone();
+    changed_deck.0[((2 + 1) * 13 + 2 + 4) * 4] ^= 1;
+    assert_eq!(
+        held_at_except(&changed_deck, &client, 2, 2, &old_delivery_hole),
+        Ok((9, 6)),
+        "the old compositor delivery mask accepted the changed figure"
+    );
+    assert!(delivery.at(&changed_deck, 2, 2).is_err());
+    assert!(
+        delivery.places(&changed_deck).is_empty(),
+        "Mutter must match the Deck figure as well"
+    );
+    let mut wrong = screen.clone();
+    wrong.0[((2 + 1) * 13 + 2) * 4] ^= 1;
+    assert!(delivery.at(&wrong, 2, 2).is_err());
+    assert!(delivery.places(&wrong).is_empty());
+    let short = (client.0[..8].to_vec(), 9, 6);
+    assert!(
+        ClientDelivery::new(&short)
+            .compare_rgb(&rgb(&client))
+            .is_err()
+    );
+    assert!(delivery.compare_rgb(&rgb(&frame)).is_err());
+}
+
+#[test]
+fn a_client_capture_keeps_exact_frame_and_surface_geometry() {
+    let frame = rgba(4, 5, |_, _| [1, 2, 3]);
+    let client = rgba(9, 6, |_, _| [1, 2, 3]);
+    let dims = "OK frame_w=4 frame_h=5 surface_w=9 surface_h=6 offset_x=3 offset_y=1";
+    let layout = ClientLayout::read(dims, &frame, &client, 1..3).unwrap();
+    assert_eq!(layout.offset, (3, 1));
+    assert_eq!(held_at(&client, &frame, 3, 1, 0..0), Ok((4, 5)));
+    for bad in [
+        dims.replace("frame_w=4", "frame_w=5"),
+        dims.replace("surface_w=9", "surface_w=4"),
+        dims.replace("offset_x=3", "offset_x=-1"),
+        dims.replace("offset_x=3", "offset_x=6"),
+        dims.replace("offset_x=3", "offset_x=9"),
+        dims.replace("offset_y=1", "offset_y=2"),
+        dims.replace("offset_y=1", ""),
+        format!("{dims} offset_x=3"),
+    ] {
+        assert!(
+            ClientLayout::read(&bad, &frame, &client, 1..3).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(ClientLayout::read(dims, &frame, &client, 1..6).is_err());
+}
+
+fn presentation_png() -> Vec<u8> {
+    let mut png = Vec::new();
+    {
+        let mut encoder = aterm_png::Encoder::new(&mut png, 1, 1);
+        encoder.set_color(aterm_png::ColorType::Rgb);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[1, 2, 3]).unwrap();
+        writer.finish().unwrap();
+    }
+    png
+}
+
+fn presentation_reply(png: &[u8]) -> String {
+    let hash = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(png));
+    format!(
+        "OK presentation-image window=0 serial=2 surface=3 width=1 height=1 png_sha256={hash} path=/tmp/owned%20world/client.png\n\
+             OK presentation-released window=0 serial=2 surface=3 width=1 height=1\n"
+    )
+}
+
+#[test]
+fn a_presentation_image_requires_the_same_validated_release_and_exact_payload() {
+    let png = presentation_png();
+    let reply = presentation_reply(&png);
+    let image = PresentationImage::parse(&reply).unwrap();
+    assert_eq!(image.path, "/tmp/owned world/client.png");
+    assert_eq!(
+        image.identity,
+        PresentationIdentity {
+            window: 0,
+            serial: 2,
+            surface: 3,
+            width: 1,
+            height: 1,
+        }
+    );
+    assert_eq!(image.pixels(&png).unwrap(), (vec![1, 2, 3, 255], 1, 1));
+    assert!(image.pixels(&png[..png.len() - 1]).is_err());
+    let resized = PresentationImage::parse(&reply.replace("width=1", "width=2")).unwrap();
+    assert!(
+        resized.pixels(&png).is_err(),
+        "matching release alone cannot authorize another PNG size"
+    );
+    let invalid = PresentationImage::parse(&presentation_reply(b"not PNG")).unwrap();
+    assert!(
+        invalid.pixels(b"not PNG").is_err(),
+        "a committed hash is not a valid raster"
+    );
+
+    let (captured, released) = reply.split_once('\n').unwrap();
+    for (before, after) in [
+        ("window=0", "window=1"),
+        ("serial=2", "serial=3"),
+        ("surface=3", "surface=4"),
+        ("width=1", "width=2"),
+        ("height=1", "height=2"),
+    ] {
+        let changed = format!("{captured}\n{}", released.replace(before, after));
+        assert!(
+            PresentationImage::parse(&changed).is_err(),
+            "{before}: an invalidated presentation cannot pass"
+        );
+    }
+    assert!(
+        PresentationImage::parse(&format!("{captured}\n")).is_err(),
+        "capture without validated release is insufficient"
+    );
+    assert!(
+        PresentationImage::parse(&format!("{captured}\nERR presentation invalidated\n")).is_err()
+    );
+}
+
+#[test]
+fn presentation_receipts_refuse_missing_ambiguous_or_untrusted_material() {
+    let reply = presentation_reply(&presentation_png());
+    for bad in [
+        String::new(),
+        reply.trim_end().into(),
+        reply.replace("serial=2", "serial=0"),
+        reply.replace("serial=2", "serial=02"),
+        reply.replace("surface=3", "surface=0"),
+        reply.replace("width=1", "width=8193"),
+        reply.replace("height=1", "height=0"),
+        reply.replace("height=1", "height=unknown"),
+        reply.replace("window=0", "window=-1"),
+        reply.replace("window=0", "window=0 window=0"),
+        reply.replace("window=0", "other=0"),
+        reply.replace("png_sha256=", "png_sha256=BAD"),
+        reply.replace("path=/tmp", "path=relative"),
+        reply.replace("path=/tmp", "path=%2Ftmp"),
+        reply.replace("%20world", "%00world"),
+        reply.replace("%20world", "%0Aworld"),
+        reply.replace("%20world", "%FFworld"),
+        reply.replace("%20world", "%GGworld"),
+        reply.replace("client.png", "client%"),
+        reply.replace("/client.png", "/../client.png"),
+        reply.replace("/client.png", "/./client.png"),
+        format!("{reply}OK presentation-released window=0 serial=2 surface=3 width=1 height=1\n"),
+        format!("{reply}a photograph's stdout is not authority\n"),
+        format!("a photograph's stdout\n{reply}"),
+    ] {
+        assert!(PresentationImage::parse(&bad).is_err(), "{bad}");
+    }
 }
 
 #[test]
@@ -905,4 +1104,43 @@ fn a_test_not_run_under_rosetta_is_listed_in_the_x86_64_cell_and_fails_any_other
     assert_eq!(still_failed.verdict, Verdict::Fail);
     assert_eq!(exit_code(&[row(), listed.clone()]), linux::NOT_RUN);
     assert_eq!(exit_code(&[listed, still_failed]), 1);
+}
+
+#[test]
+fn a_loaded_gui_admission_reports_its_observation_without_excusing_a_semantic_failure() {
+    let observed = aterm_capacity::Observed {
+        window: aterm_capacity::CpuWindow {
+            interval_ns: 1_000_000_000,
+            observed_ms: 1,
+            cores: 14,
+            busy_ticks: 99,
+            total_ticks: 100,
+        },
+        load1: 200.0,
+        max: 28.0,
+    };
+    let admission = reported_gui_admission(
+        "aarch64 (native)",
+        600.0,
+        aterm_capacity::Protection::Loaded(observed),
+    );
+    assert_eq!(admission.verdict, Verdict::Pass);
+    assert!(admission.detail.contains("admission=loaded"));
+    assert!(admission.detail.contains(&observed.to_string()));
+    let semantic = Row {
+        name: "aarch64 complete presented client".into(),
+        verdict: Verdict::Fail,
+        secs: 1.0,
+        detail: "native pixels differ from the held client".into(),
+    };
+    for rows in [
+        vec![admission.clone(), semantic.clone()],
+        vec![semantic.clone(), admission.clone()],
+    ] {
+        assert_eq!(exit_code(&rows), 1);
+        let report = render(&rows, &[], 601.0);
+        assert!(report.contains(&semantic.detail));
+        assert!(report.contains(&admission.detail));
+        assert!(report.ends_with("verdict: FAIL\n"));
+    }
 }

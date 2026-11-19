@@ -45,11 +45,21 @@ pub(crate) fn settled(path: &Path) {
     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
-/// A scratch directory: dereferences to its path, removed on drop.
+/// A scratch directory: dereferences to its path, removed on drop unless explicitly retained.
 #[derive(Debug)]
 pub(crate) struct Dir {
     path: PathBuf,
-    _dir: TempDir,
+    _dir: Option<TempDir>,
+    retained: std::sync::atomic::AtomicBool,
+}
+
+impl Dir {
+    /// Preserve this owned fixture on drop after a failure, without changing ordinary cleanup.
+    #[cfg(unix)]
+    pub(crate) fn retain_on_drop(&self) {
+        self.retained
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A fresh scratch directory under the temp dir, named `<prefix><unique>`.
@@ -99,17 +109,25 @@ pub(crate) fn dir_in(parent: &Path, prefix: &str) -> Dir {
         .expect("create a scratch directory");
     Dir {
         path: dir.path().to_path_buf(),
-        _dir: dir,
+        _dir: Some(dir),
+        retained: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
 impl Drop for Dir {
-    /// Removed as a build cache pass removes a stage ([`crate::build_cache::remove::tree`]): no
+    /// Unless explicitly retained, removed as a build cache pass removes a stage
+    /// ([`crate::build_cache::remove::tree`]): no
     /// one entry a test left unremovable (a folder without its owner's bits, a `deny delete`
     /// ACL) keeps the rest. What that leaves (the remover under test failing) is unlocked and
-    /// removed without it ([`unlock`]), so a failed test leaves no scratch a plain remover
-    /// cannot remove.
+    /// removed without it ([`unlock`]), so an unretained failed test leaves no scratch a plain
+    /// remover cannot remove.
     fn drop(&mut self) {
+        if self.retained.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(dir) = self._dir.take() {
+                let _ = dir.keep();
+            }
+            return;
+        }
         if !crate::build_cache::remove::tree(&self.path).whole() {
             unlock(&self.path);
             let _ = std::fs::remove_dir_all(&self.path);
@@ -256,6 +274,38 @@ pub(crate) fn each_side_by_side<T: Sync>(items: &[T], case: impl Fn(usize, &T) +
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::Path;
+
+    #[test]
+    fn an_explicit_retention_mark_preserves_failure_evidence() {
+        let parent = aterm_tempfile::tempdir().expect("private fixture parent");
+        for retained in [false, true] {
+            let dir = super::dir_in(parent.path(), "failure-evidence-");
+            let path = dir.to_path_buf();
+            std::fs::write(path.join("evidence"), b"original evidence").unwrap();
+            let panic = std::panic::catch_unwind(move || {
+                if retained {
+                    dir.retain_on_drop();
+                }
+                panic!("original fixture failure");
+            })
+            .expect_err("the failure is not swallowed");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"original fixture failure")
+            );
+            if retained {
+                assert_eq!(
+                    std::fs::read(path.join("evidence")).unwrap(),
+                    b"original evidence"
+                );
+            } else {
+                assert!(
+                    !path.exists(),
+                    "unmarked fixtures still clean up on failure"
+                );
+            }
+        }
+    }
 
     /// A chain of `levels` folders named `d` under `top`, each at 0o500 (its owner may not
     /// remove what it holds).

@@ -10,11 +10,14 @@
 //! DNS-SD calls (browse, resolve, query, register) itself, streaming what they hear. It serves
 //! only local-network destinations, runs no code and opens no file a client names, and admits a
 //! client by its code signature: the broker's own team requirement, or an ad-hoc image's own
-//! designated requirement. The wire and the client are `aterm_uds::lan`'s.
+//! designated requirement. Beside the LAN it answers one read, Spotlight's store sizes, which are
+//! root's alone ([`store`]). The wire and the client are `aterm_uds::lan`'s.
 
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
+#[cfg(unix)]
+mod askers;
 #[cfg(unix)]
 mod bonjour;
 #[cfg(target_os = "macos")]
@@ -26,19 +29,21 @@ mod direct;
 #[cfg(target_os = "macos")]
 pub mod grant;
 #[cfg(unix)]
-mod log;
-#[cfg(unix)]
 mod peers;
 #[cfg(unix)]
 mod server;
+#[cfg(unix)]
+mod store;
 
 #[cfg(target_os = "macos")]
 mod adopt;
+#[cfg(target_os = "macos")]
+mod install_refused;
 
 #[cfg(target_os = "macos")]
 pub use direct::provide_direct;
 #[cfg(unix)]
-pub use server::{Opts, serve};
+pub use server::{Opts, keep_log, serve};
 
 #[cfg(all(test, unix))]
 mod tests;

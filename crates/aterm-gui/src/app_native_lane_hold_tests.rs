@@ -495,6 +495,7 @@ fn a_pending_boot_health_is_named_once_in_the_updaters_own_words() {
 #[test]
 fn a_hung_up_session_its_reader_never_retires_is_booked_exited_at_its_backstop() {
     use crate::app_update_handoff::PANE_EXITED_BACKSTOP;
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let mut app = app_nobody_at_the_mac();
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     // SAFETY: `slave` is this test's own descriptor, closed once: the command "exits".
@@ -503,6 +504,11 @@ fn a_hung_up_session_its_reader_never_retires_is_booked_exited_at_its_backstop()
     let mut session = crate::stub_session(id);
     session.master = master;
     app.push_stub_tab(WindowId(0), session);
+    let wid = WindowId(0);
+    app.set_dock(wid, 23).expect("show the session navigator");
+    assert_eq!(app.local_panel_roster.len(), 2);
+    assert!(app.local_panel_roster.number(id).is_some());
+    assert!(app.dock_view(wid).is_some());
     assert!(
         crate::app_update_handoff::handoff_dead_masters(&app.handoff_live_sessions()).contains(&id),
         "PRECONDITION: its master reads hung up"
@@ -525,5 +531,10 @@ fn a_hung_up_session_its_reader_never_retires_is_booked_exited_at_its_backstop()
         "past it, the session is booked exited and is no longer handed over as live"
     );
     assert!(app.handoff_exited_session_ids().contains(&id));
+    app.publish_navigators(std::time::Instant::now());
+    assert_eq!(app.local_panel_roster.len(), 1);
+    assert!(app.local_panel_roster.number(id).is_none());
+    assert_eq!(app.windows[&wid].dock.cells, 23);
+    assert!(app.dock_view(wid).is_some());
     assert!(app.lane_hold_clocks.hung_up.is_empty());
 }

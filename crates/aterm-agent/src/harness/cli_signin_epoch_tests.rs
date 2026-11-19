@@ -507,7 +507,6 @@ fn unbound_rows_keep_the_conservative_global_counter_guard() {
 /// profile even where an automatic sign-in made it and failed in it (its
 /// [`crate::harness::headless_oauth::PROFILE_UNPROVEN_MARK`] goes), so a renewal then signs in
 /// through it. CONTROL: a window whose site kept no session leaves the folder no profile.
-#[cfg(unix)]
 #[test]
 fn a_windows_sign_in_makes_the_rows_folder_a_profile() {
     use crate::harness::headless_oauth::{PROFILE_UNPROVEN_MARK, has_browser_profile};
@@ -551,7 +550,6 @@ fn a_windows_sign_in_makes_the_rows_folder_a_profile() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn a_recorded_windows_sign_in_survives_and_reports_profile_adoption_failure() {
     use crate::harness::headless_oauth::{PROFILE_UNPROVEN_MARK, has_browser_profile};

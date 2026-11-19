@@ -4014,8 +4014,6 @@ fn held_account_selections_resume_the_latest_request_without_automatic_source_op
 /// before anything starts, so its caller retires it instead of opening a browser on a
 /// timer. CONTROL: the same choice served for an uncontended click starts its sign-in,
 /// which may open the window the person asked for.
-// Its pin request needs a manual sign-in, which only Unix queues (`manual_signin_capability`).
-#[cfg(unix)]
 #[test]
 fn a_saved_choice_nobody_waits_on_opens_no_window() {
     use std::sync::{Arc, Mutex};
@@ -4076,8 +4074,6 @@ fn a_saved_choice_nobody_waits_on_opens_no_window() {
     queued.lock().unwrap().clear();
 }
 
-// Its pin request needs a manual sign-in, which only Unix queues (`manual_signin_capability`).
-#[cfg(unix)]
 #[test]
 fn a_vendor_sign_in_holding_the_lock_keeps_a_claude_pin_request_pending() {
     use std::sync::{Arc, Mutex};
@@ -7599,49 +7595,7 @@ fn its_arrival_meets_the_need(
         Vault::Unchanged(3)
     }
     let w = World::new();
-    let store = accounts::Store::at(&w.state);
-    let row = Row {
-        label: "m29".to_owned(),
-        class: Class::Preferred,
-        dir: Some(
-            store
-                .logins_dir()
-                .join("m29")
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        email: Some("m29@example.test".to_owned()),
-        ..Row::default()
-    };
-    fs::create_dir_all(&w.config).unwrap();
-    fs::write(
-        w.roster(),
-        format!("{}\n", accounts::row_text(&row).unwrap()),
-    )
-    .unwrap();
-    // m29 is a due login this Mac uses: a session here ran on it yesterday, and its login
-    // here has ended since (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4).
-    let made = store.logins_dir().join("m29");
-    fs::create_dir_all(&made).unwrap();
-    fs::write(made.join(".claude.json"), "{}").unwrap();
-    store
-        .transact_logins(UPKEEP_NOW - 120, &mut None, |state, logins| {
-            let mut events = accounts::note_session(state, "s-0", "m29", None, UPKEEP_NOW - 86_400);
-            state.sessions.remove("s-0");
-            events.extend(accounts::note_login_end(
-                state,
-                logins,
-                "m29",
-                UPKEEP_NOW - 120,
-            ));
-            Ok(events)
-        })
-        .unwrap();
-    let paths = aterm_secrets::client::Paths::for_home(&w.home);
-    let source = w.home.join("lab.vault");
-    aterm_secrets::client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1"))
-        .unwrap();
-    need::test_alab_policy(&paths);
+    let (_, paths) = m29_due_with_no_mailbox(&w);
     let mailbox = Want::parse("mailbox:m29").unwrap();
     let pass = |wit: &Witness| {
         auto_renew_next_account(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &wit.fx())
@@ -7685,6 +7639,139 @@ fn its_arrival_meets_the_need(
         "the mailbox's arrival ends the need only where it holds the password \
          (browser {browser}, routed {routed}): {}",
         met.line
+    );
+}
+
+/// `w`'s roster of one row, `m29`, with no mailbox: a due login this Mac uses (a session here
+/// ran on it yesterday, and its login here has ended since,
+/// `DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4), keyed [`M29_KEY`], on a vault member
+/// whose lab's policy takes needs. Its store and the vault's paths.
+#[cfg(unix)]
+fn m29_due_with_no_mailbox(w: &World) -> (accounts::Store, aterm_secrets::client::Paths) {
+    use aterm_secrets::need;
+    let store = accounts::Store::at(&w.state);
+    let row = Row {
+        label: "m29".to_owned(),
+        class: Class::Preferred,
+        dir: Some(
+            store
+                .logins_dir()
+                .join("m29")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        email: Some("m29@example.test".to_owned()),
+        ..Row::default()
+    };
+    fs::create_dir_all(&w.config).unwrap();
+    fs::write(
+        w.roster(),
+        format!("{}\n", accounts::row_text(&row).unwrap()),
+    )
+    .unwrap();
+    let made = store.logins_dir().join("m29");
+    fs::create_dir_all(&made).unwrap();
+    fs::write(made.join(".claude.json"), "{}").unwrap();
+    store
+        .transact_logins(UPKEEP_NOW - 120, &mut None, |state, logins| {
+            let mut events = accounts::note_session(state, "s-0", "m29", None, UPKEEP_NOW - 86_400);
+            state.sessions.remove("s-0");
+            state.accounts.entry("m29".to_owned()).or_default().pk = Some(M29_KEY.to_owned());
+            events.extend(accounts::note_login_end(
+                state,
+                logins,
+                "m29",
+                UPKEEP_NOW - 120,
+            ));
+            Ok(events)
+        })
+        .unwrap();
+    let paths = aterm_secrets::client::Paths::for_home(&w.home);
+    let source = w.home.join("lab.vault");
+    aterm_secrets::client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1"))
+        .unwrap();
+    need::test_alab_policy(&paths);
+    (store, paths)
+}
+
+/// The account key [`m29_due_with_no_mailbox`]'s row is keyed as.
+#[cfg(unix)]
+const M29_KEY: &str = "ac-29292929292929ab";
+
+/// A HELD ROW ASKS THE LAB FOR NO MAILBOX (SF-09: a hold raises nothing). `m29` has no mailbox,
+/// and its vault refresh brought none, so its no-route outcome asks the lab for the row's
+/// mailbox password, a need that can reach a person
+/// ([`a_row_with_no_mailbox_asks_the_lab_for_it_and_its_arrival_meets_the_need`]). While a Mac
+/// of the fleet's block of its account an hour old holds it, the same pass records the hold,
+/// raises no need and logs no ask. CONTROL: with no snapshot the next pass asks, as before.
+///
+/// NEGATIVE CONTROL (2026-11-17, in a run beside mutants that reach other tests): the ladder
+/// asking under a hold too (`fleet.is_none() &&` dropped): `a hold raises no need` failed, the
+/// held pass having raised it; restored from HEAD.
+#[cfg(unix)]
+#[test]
+fn a_held_row_asks_the_lab_for_no_mailbox() {
+    use aterm_secrets::need::{self, Want};
+    fn nothing_new(
+        _: &Path,
+        _scope: Option<&crate::harness::account_work::Scope>,
+    ) -> super::super::sign_in_ladder::Vault {
+        super::super::sign_in_ladder::Vault::Unchanged(3)
+    }
+    let w = World::new();
+    let (store, paths) = m29_due_with_no_mailbox(&w);
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    let asked = |paths: &aterm_secrets::client::Paths| {
+        need::peek(paths)
+            .unwrap()
+            .iter()
+            .any(|need| need.want == mailbox && !need.state.ended())
+    };
+    let held = accounts::Fleet {
+        blocked: [(M29_KEY.to_owned(), UPKEEP_NOW - 3_600)]
+            .into_iter()
+            .collect(),
+        ..accounts::Fleet::default()
+    };
+    let wit = Witness {
+        vault_sync: nothing_new,
+        ..Witness::answering("")
+    };
+    assert!(!accounts::with_fleet(held, || {
+        auto_renew_next_account(&w.home, &w.state, &w.roster(), UPKEEP_NOW, &wit.fx())
+    }));
+    let (logins, _) = store.load_logins(UPKEEP_NOW).unwrap();
+    let attempt = logins.get("m29").and_then(|b| b.sign_in_attempt.clone());
+    assert!(
+        attempt.as_ref().is_some_and(|attempt| {
+            attempt.outcome == accounts::AttemptOutcome::NoRoute
+                && attempt.routes.starts_with("held: ")
+        }),
+        "the hold is on record: {attempt:?}"
+    );
+    assert!(!asked(&paths), "a hold raises no need");
+    assert!(
+        !wit.logged()
+            .iter()
+            .any(|line| line.contains("the lab is asked for its mailbox password")),
+        "{:?}",
+        wit.logged()
+    );
+
+    let wit = Witness {
+        vault_sync: nothing_new,
+        ..Witness::answering("")
+    };
+    assert!(!auto_renew_next_account(
+        &w.home,
+        &w.state,
+        &w.roster(),
+        UPKEEP_NOW + 60,
+        &wit.fx()
+    ));
+    assert!(
+        asked(&paths),
+        "CONTROL: with no snapshot the no-route outcome asks"
     );
 }
 
@@ -8035,6 +8122,7 @@ fn the_dashboards_use_form_posts_the_accounts_key_and_pins_its_row() {
         state: accounts::State::default(),
         enrolled: ["work-2".to_owned()].into(),
         own: None,
+        lab_pending: None,
     };
     let html = dashboard_rows_html(Some(&report), UPKEEP_NOW);
     let (pk, _) = crate::harness::account_names::names_of_row(Cli::Claude, &rows[0], None)

@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::linux_proof::{
-    WestonView, bands_held, compare_rgb, drew_on_gpu, field, held_at, input_summary, parse_ppm,
-    present_summary, reply,
+    compare_rgb, drew_on_gpu, field, held_at, input_summary, parse_ppm, present_summary, reply,
 };
 use crate::paths::paths;
 use crate::windows::{self, GPU_ID, Layout, Up, not_run, run_on_desktop, task_name};
@@ -70,6 +69,52 @@ fn off_monitors_as_framed(
         }
     }
     (put, span)
+}
+
+/// Whether the client pixels outside `frame` at `offset` repeat its nearest RGB pixel,
+/// as Windows' CPU presenter fills the bands of a client larger than the frame.
+fn nearest_frame_bands_held(
+    window: &(Vec<u8>, usize, usize),
+    frame: &(Vec<u8>, usize, usize),
+    offset: (i64, i64),
+) -> Result<usize, String> {
+    let (s, sw, sh) = (&window.0, window.1, window.2);
+    let (f, w, h) = (&frame.0, frame.1, frame.2);
+    if w == 0 || h == 0 || f.len() < w * h * 4 || s.len() < sw * sh * 4 {
+        return Err(format!("the output is {sw}x{sh}, the frame {w}x{h}"));
+    }
+    let (mut held, mut differ, mut first) = (0usize, 0usize, None);
+    for y in 0..sh {
+        for x in 0..sw {
+            let (dx, dy) = (x as i64 - offset.0, y as i64 - offset.1);
+            if (0..w as i64).contains(&dx) && (0..h as i64).contains(&dy) {
+                continue;
+            }
+            let (nx, ny) = (
+                dx.clamp(0, w as i64 - 1) as usize,
+                dy.clamp(0, h as i64 - 1) as usize,
+            );
+            let at = (y * sw + x) * 4;
+            let want = (ny * w + nx) * 4;
+            held += 1;
+            if s[at..at + 3] != f[want..want + 3] {
+                differ += 1;
+                first.get_or_insert((
+                    x,
+                    y,
+                    [f[want], f[want + 1], f[want + 2]],
+                    [s[at], s[at + 1], s[at + 2]],
+                ));
+            }
+        }
+    }
+    match first {
+        None => Ok(held),
+        Some((x, y, want, got)) => Err(format!(
+            "{differ} of {held} band pixels differ; first at ({x},{y}) of the buffer: the \
+             frame's nearest {want:02x?}, the output {got:02x?}"
+        )),
+    }
 }
 
 /// `l,t,r,b` for each of `rects`.
@@ -1118,15 +1163,8 @@ impl Run<'_> {
             cw,
             ch,
         );
-        let view = WestonView {
-            x: 0,
-            y: 0,
-            width: cw,
-            height: ch,
-            format: "XRGB8888".into(),
-        };
         held_at(&rgba, &presented, ox, oy, 0..0).map_err(|why| format!("{why}{off} ({files})"))?;
-        let n = bands_held(&rgba, &presented, &view, (ox, oy))
+        let n = nearest_frame_bands_held(&rgba, &presented, (ox, oy))
             .map_err(|why| format!("{why}{off} ({files})"))?;
         Ok(format!(
             "the window's {cw}x{ch} client pixels (GetDIBits) hold the presented {w}x{h} frame \

@@ -10,7 +10,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::wire::{self, Advert, Event, Frame, Reader, Request, Target};
+use super::wire::{self, Advert, Event, Frame, Reader, Request, SpotlightStores, Target};
 use super::{ConnectOptions, LanError, UdpOptions, Unavailable};
 use crate::CtlStream;
 
@@ -72,11 +72,8 @@ enum Absent {
     /// a LAN use.
     Direct,
     /// Reads why no broker answers ([`super::absent`]): a question about the broker itself
-    /// ([`super::Arrivals`]), which this process's own server cannot answer.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "broker arrivals are watched on macOS")
-    )]
+    /// ([`super::Arrivals`], [`consider`]) or one only root can answer ([`spotlight_stores`]),
+    /// which this process's own server cannot.
     NotInstalled,
 }
 
@@ -107,6 +104,17 @@ fn open_cancelled_at(
     started: Instant,
     cancel: Option<BorrowedFd<'_>>,
 ) -> Result<Session, LanError> {
+    // A development build on a real Mac owns no broker, and the broker admits its team alone: its
+    // LAN use takes its own server first where macOS already allowed its code, and dials the
+    // broker only where no allowance stands. The broker would refuse it, or turn it away
+    // unchecked while `trustd` stalls or at its connection bound, which no retry ends for a
+    // build it never admits, and would check its code as root at every use.
+    if matches!(absent, Absent::Direct) && super::install::development_here() {
+        crate::ready::check_cancelled(cancel)?;
+        if let Ok((stream, allowed)) = super::direct::open() {
+            return exchange_at(stream, request, ours, Some(allowed), Instant::now(), cancel);
+        }
+    }
     let stream = match crate::connect::until_cancelled(path, started + DIAL_HANG, cancel) {
         Ok(stream) => stream,
         // No broker: this process's own server, when the caller makes a LAN use and macOS
@@ -151,7 +159,13 @@ fn open_cancelled_at(
             .into());
         }
     }
-    exchange_at(stream, request, ours, None, Instant::now(), cancel)
+    let exchanged = exchange_at(stream, request, ours, None, Instant::now(), cancel);
+    if matches!(absent, Absent::Direct) && exchanged.is_ok() {
+        // The installed root broker served this process's LAN use: an older image of its own
+        // signer asks it, once per broker, to consider this bundle.
+        super::install::consider_here();
+    }
+    exchanged
 }
 
 fn exchange_at(
@@ -208,6 +222,7 @@ fn exchange_at(
         return Err(Unavailable::Outdated {
             ours,
             theirs: broker.protocol,
+            build: broker.build,
         }
         .into());
     }
@@ -406,6 +421,27 @@ pub fn resolve(name: &str, within: Duration) -> Result<Vec<IpAddr>, LanError> {
     }
 }
 
+/// Spotlight's stores as the root broker last walked them ([`Request::SpotlightStore`]): only the
+/// root broker is asked, never this process's own server, which runs as this user and cannot
+/// read a store that is root's alone.
+///
+/// # Errors
+/// [`LanError::Unavailable`] (no root broker, another protocol, or not the root broker), the
+/// broker's error (one too old to know the request closes the connection unanswered), or the
+/// exchange's.
+pub fn spotlight_stores() -> Result<SpotlightStores, LanError> {
+    let mut session = open_at(
+        Some(&Request::SpotlightStore),
+        &super::dialled_socket(),
+        super::protocol(),
+        Absent::NotInstalled,
+    )?;
+    match session.answer(Instant::now() + ANSWER_HANG)? {
+        Frame::SpotlightStores(stores) => Ok(stores),
+        other => Err(unexpected(&other).into()),
+    }
+}
+
 /// The broker's hello alone: whether a LAN use would be served now, and by which broker. With
 /// no broker installed it can be this process's own server ([`BrokerHello::direct`], `Some`).
 ///
@@ -426,11 +462,59 @@ pub fn installed_hello() -> Result<BrokerHello, LanError> {
     hello_at(&super::dialled_socket(), super::protocol())
 }
 
+/// `heard` (`installed_hello`'s answer) with a broker of another protocol read as the hello it
+/// sent ([`Unavailable::Outdated`] keeps its protocol and build): what a caller that asks which
+/// build the root broker serves, not whether it can serve this process, reads
+/// ([`super::adoption::expect`]). Every other answer is `heard`'s own.
+///
+/// # Errors
+/// `heard`'s error, unless it was [`Unavailable::Outdated`].
+pub fn any_protocol(heard: Result<BrokerHello, LanError>) -> Result<BrokerHello, LanError> {
+    match heard {
+        Err(LanError::Unavailable(Unavailable::Outdated { theirs, build, .. })) => {
+            Ok(BrokerHello {
+                protocol: theirs,
+                build,
+                direct: None,
+            })
+        }
+        heard => heard,
+    }
+}
+
 /// The hello of the broker at `path` alone, never this process's own server: whether a broker
 /// answers there ([`super::Arrivals`]).
 #[cfg(target_os = "macos")]
 pub(super) fn hello_at(path: &Path, protocol: u32) -> Result<BrokerHello, LanError> {
     open_at(None, path, protocol, Absent::NotInstalled).map(|session| session.broker)
+}
+
+/// Ask the installed root broker to consider the bundle this process runs from
+/// ([`Request::Consider`], [`super::install::consider_for`]): dialled with no direct path, the
+/// request sent, and the broker's close awaited within the exchange's bound. Whatever it then
+/// says, or that its wire predates the request, is not read. A broker of another protocol that
+/// admitted this process heard it too: the request goes in the same write as the hello, and its
+/// server reads that one request after another protocol's hello (`Consider` is the same in every
+/// protocol), as an older broker adopting a newer build is how that build's protocol comes to be
+/// served.
+///
+/// # Errors
+/// No root broker answers, it refused this process or did not check it, or the exchange failed.
+pub(super) fn consider() -> Result<(), LanError> {
+    let mut session = match open_at(
+        Some(&Request::Consider),
+        &super::dialled_socket(),
+        super::protocol(),
+        Absent::NotInstalled,
+    ) {
+        Ok(session) => session,
+        Err(LanError::Unavailable(Unavailable::Outdated { .. })) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let _ = session
+        .reader
+        .frame(&session.stream, Some(Instant::now() + ANSWER_HANG));
+    Ok(())
 }
 
 /// What a Bonjour request hears, as it hears it: a blocking iterator, whose descriptor a poll

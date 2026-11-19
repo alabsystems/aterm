@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use agh_fake::FakeGithub;
 use super::*;
 use crate::identity::vault::Slot;
 use crate::identity::{MapEnv, fingerprint};
-use crate::test_fixtures::{setup_file, write_config};
+use crate::test_fixtures::write_config;
 use crate::wire::http::HttpTransport;
 
 const GRANT: &str =
@@ -80,12 +81,30 @@ fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     let mut entries = std::collections::BTreeMap::new();
     for entry in std::fs::read_dir(root).unwrap() {
         let entry = entry.unwrap();
-        let metadata = entry.metadata().unwrap();
-        let mut content = format!(
-            "{:?}",
+        #[cfg(unix)]
+        let stamp = {
+            let metadata = entry.metadata().unwrap();
             (metadata.mode(), metadata.mtime(), metadata.mtime_nsec())
-        )
-        .into_bytes();
+        };
+        // Windows has no mode: its attributes, its write time to the 100 ns it keeps, and its
+        // owner and access list, which a change of either leaves the write time without. Each
+        // is read off the file itself, not the folder listing's copy.
+        #[cfg(windows)]
+        let stamp = {
+            use aterm_uds::acl::{Descriptor, Parts};
+            use std::os::windows::fs::MetadataExt as _;
+            let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+            let parts = Parts::OWNER | Parts::DACL;
+            let access = Descriptor::of_path(&entry.path(), parts)
+                .and_then(|descriptor| descriptor.to_sddl(parts))
+                .unwrap();
+            (
+                metadata.file_attributes(),
+                metadata.last_write_time(),
+                access,
+            )
+        };
+        let mut content = format!("{stamp:?}").into_bytes();
         if entry.file_type().unwrap().is_dir() {
             entries.insert(entry.path(), content);
             entries.extend(snapshot(&entry.path()));
@@ -147,7 +166,6 @@ fn only_exact_file_grants_survive_composition_with_vault_routes() {
 
 #[test]
 fn malformed_explicit_configuration_never_falls_back_to_healthy_vault_tokens() {
-    use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new(true);
     write_config(&fixture.dirs, "[profiles.invalid\n");
     let before = snapshot(&fixture.dirs.home);
@@ -155,12 +173,27 @@ fn malformed_explicit_configuration_never_falls_back_to_healthy_vault_tokens() {
     assert!(adopt_for_host(&fixture.base, &fixture.dirs).is_err());
     assert!(fixture.fake.seen().is_empty());
     assert_eq!(before, snapshot(&fixture.dirs.home));
-    std::fs::write(fixture.dirs.config_file(), GRANT).unwrap();
-    std::fs::set_permissions(
-        fixture.dirs.config_file(),
-        std::fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
+    // A well-formed agh.toml that is not private: on unix by its mode; on windows a file made
+    // anew with no access list of its own, which inherits its folder's entries.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(fixture.dirs.config_file(), GRANT).unwrap();
+        std::fs::set_permissions(
+            fixture.dirs.config_file(),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+    }
+    #[cfg(windows)]
+    {
+        std::fs::remove_file(fixture.dirs.config_file()).unwrap();
+        std::fs::write(fixture.dirs.config_file(), GRANT).unwrap();
+        assert!(
+            aterm_uds::private_file::read_private(&fixture.dirs.config, "agh.toml", 4096).is_err(),
+            "the inherited access list is not private"
+        );
+    }
     let before = snapshot(&fixture.dirs.home);
     assert!(view_for_host(&fixture.dirs).is_err());
     assert!(adopt_for_host(&fixture.base, &fixture.dirs).is_err());
@@ -243,8 +276,12 @@ fn a_bound_vault_dev_identity_cannot_write_the_release_tier() {
     assert!(fixture.fake.seen().is_empty());
 }
 
+/// Unix's by nature: `legacy_loose` lets a group or other read bit through, and a windows
+/// private file has no such bit (its token files are read by the strict rule alone).
+#[cfg(unix)]
 #[test]
 fn a_vault_join_preserves_only_the_host_admitted_explicit_legacy_profile() {
+    use crate::test_fixtures::setup_file;
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new(true);
     let path = fixture.dirs.home.join("explicit.token");

@@ -1049,8 +1049,11 @@ fn a_clock_set_back_a_day_cannot_reenter_a_retired_epoch() {
 }
 
 /// A retirement that fails after it deleted, before it forgot what it deleted, leaves the floor
-/// raised: the clock set back, behind it, writes nothing, never into day D's table, and the next
-/// pass on the righted clock forgets the deleted day.
+/// raised, and costs the pass nothing of the new period, which it writes from the state the
+/// retirement left written (`Directory::retired`): the clock set back, behind the floor, writes
+/// nothing, never into day D's table, and the next pass on the righted clock forgets the deleted
+/// day.
+/// MUTANT (`ring::RETIRE_FAILURE_STOPS`): the pass whose retirement failed writes nothing.
 /// NEGATIVE CONTROL: the floor written only with the forgotten days (`retire`'s first save
 /// removed) stays where it was when the pass fails, and the clock set back enrolls day D again.
 #[test]
@@ -1062,7 +1065,7 @@ fn a_crash_inside_a_retire_is_finished_by_the_next_pass() {
     write_at(paths, &row(1, first), first, caps).unwrap();
     ring::FAIL_AFTER_DELETE.with(|fail| fail.set(true));
     let ahead = at(D + 2, 60);
-    assert!(write_at(paths, &row(1, ahead), ahead, caps).is_err());
+    write_at(paths, &row(1, ahead), ahead, caps).expect("the new period is written");
     assert_eq!(ring_dirs(paths, D..=D), Vec::<u64>::new());
     assert!(ring_state(paths).held.contains(&D));
     // Day D's row went with its table, so a fresh row starts at counter 1.
@@ -1071,7 +1074,7 @@ fn a_crash_inside_a_retire_is_finished_by_the_next_pass() {
     assert_eq!(ring_dirs(paths, D - 1..=D), Vec::<u64>::new());
     assert_eq!(ring_claims(paths, D - 1..=D), Vec::<u64>::new());
     assert!(wrote.is_err(), "the clock set back is behind the floor");
-    write_at(paths, &row(1, ahead), ahead, caps).unwrap();
+    write_at(paths, &row(2, ahead), ahead, caps).unwrap();
     let state = ring_state(paths);
     assert!(state.held.iter().all(|day| *day >= state.floor));
 }

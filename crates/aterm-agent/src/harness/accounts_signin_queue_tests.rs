@@ -3,6 +3,7 @@
 
 use super::*;
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
 
 fn turn(ticket: &mut SigninTicket) -> SigninTurn {
@@ -180,9 +181,16 @@ fn manual_ticket_owner_stand_in() {
     std::process::exit(0);
 }
 
+/// A TICKET'S PLACE IS RETIRED BY ITS OWNER'S EXIT, never by a process id or a clock: a ticket
+/// another process queued holds this one's place behind it while that process lives, and is
+/// pruned once its exit released its lock. On Windows the owner is this test binary run as
+/// [`manual_ticket_owner_stand_in`], which exits without running its destructors, so only the
+/// process's own end closes its handle and releases its `LockFileEx` lock.
 #[test]
 fn a_departed_process_is_reclaimed_by_ticket_lock_without_pid_or_clock_authority() {
-    use aterm_uds::spawnfd::{Stdio, Tether as _};
+    use aterm_uds::spawnfd::Stdio;
+    #[cfg(unix)]
+    use aterm_uds::spawnfd::Tether as _;
     let scratch = aterm_tempfile::tempdir().unwrap();
     let store = Store::at(scratch.path());
     let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
@@ -192,9 +200,10 @@ fn a_departed_process_is_reclaimed_by_ticket_lock_without_pid_or_clock_authority
             "--exact",
             "--nocapture",
         ])
-        .env(CHILD_STATE, scratch.path())
-        .process_group(0)
-        .tether()
+        .env(CHILD_STATE, scratch.path());
+    #[cfg(unix)]
+    command.process_group(0).tether();
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -205,7 +214,30 @@ fn a_departed_process_is_reclaimed_by_ticket_lock_without_pid_or_clock_authority
         }
     }
     let mut child = Owned(command.spawn().unwrap());
+    #[cfg(unix)]
     aterm_uds::deadline::prints(&mut child.0, READY, Duration::from_secs(60));
+    #[cfg(windows)]
+    {
+        use std::io::BufRead as _;
+        let stdout = child.0.stdout.take().expect("the stand-in's stdout");
+        let (said, heard) = std::sync::mpsc::channel();
+        // libtest may print the test's name on the line before the stand-in's own words.
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) if line.contains(READY) => {
+                        let _ = said.send(());
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+        aterm_spec::wait::until_while_descendants_work("the stand-in holds its ticket", || {
+            heard.try_recv().ok()
+        });
+    }
     let mut second = store.queue_manual_signin().unwrap();
     assert_eq!(second.position().unwrap().ahead, 1);
     drop(child.0.stdin.take());
@@ -214,6 +246,7 @@ fn a_departed_process_is_reclaimed_by_ticket_lock_without_pid_or_clock_authority
     drop(turn(&mut second));
 }
 
+#[cfg(unix)]
 #[test]
 fn unsafe_queue_records_refuse_admission_without_changing_the_target() {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -244,6 +277,87 @@ fn unsafe_queue_records_refuse_admission_without_changing_the_target() {
                 std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
                 0o664
             );
+        }
+    }
+}
+
+/// UNSAFE QUEUE RECORDS REFUSE ADMISSION ON WINDOWS, AND NOTHING THEY NAME IS CHANGED: an entry
+/// that is no ticket, a ticket replaced by a junction to a folder outside (a reparse point,
+/// never followed), a ticket whose access list lets Everyone read it, and a ticket with a second
+/// hard link each refuse the ticket's position, its turn and every background sign-in; the
+/// junction's folder keeps its one file, the opened list keeps its entry and both names stay.
+/// CONTROL: a store whose queue nothing changed admits its ticket.
+#[cfg(windows)]
+#[test]
+fn unsafe_queue_records_refuse_admission_without_changing_the_target() {
+    use aterm_uds::acl::{Descriptor, Parts, Sid};
+    let control = aterm_tempfile::tempdir().unwrap();
+    let store = Store::at(control.path());
+    let mut ticket = store.queue_manual_signin().unwrap();
+    assert_eq!(
+        ticket.position().unwrap(),
+        SigninPosition {
+            ahead: 0,
+            blocker: SigninBlocker::None
+        },
+        "CONTROL: an unchanged queue admits its ticket"
+    );
+    drop(turn(&mut ticket));
+    let sddl = |path: &Path| {
+        Descriptor::of_path(path, Parts::DACL)
+            .and_then(|descriptor| descriptor.to_sddl(Parts::DACL))
+            .unwrap()
+    };
+    for kind in 0..4 {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let store = Store::at(scratch.path());
+        let mut ticket = store.queue_manual_signin().unwrap();
+        let file = ticket.root.join(&ticket.name);
+        let target = scratch.path().join("outside-target");
+        match kind {
+            0 => std::fs::write(ticket.root.join("unrecognized"), b"not a ticket").unwrap(),
+            1 => {
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("kept"), b"preserve").unwrap();
+                std::fs::remove_file(&file).unwrap();
+                // `mklink /J`, which needs no privilege.
+                let status = aterm_uds::spawnfd::command("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&file)
+                    .arg(&target)
+                    .stdin(aterm_uds::spawnfd::Stdio::null())
+                    .stdout(aterm_uds::spawnfd::Stdio::null())
+                    .stderr(aterm_uds::spawnfd::Stdio::null())
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "the junction is made");
+            }
+            2 => {
+                let me = Sid::token_user().unwrap();
+                Descriptor::from_sddl(&format!("D:P(A;;FA;;;{me})(A;;FA;;;SY)(A;;FR;;;WD)"))
+                    .unwrap()
+                    .apply_to_path(&file, Parts::DACL | Parts::PROTECTED_DACL)
+                    .unwrap();
+                assert!(sddl(&file).contains(";;;WD)"), "the opened list took");
+            }
+            _ => std::fs::hard_link(&file, &target).unwrap(),
+        }
+        assert!(ticket.position().is_err(), "{kind}");
+        assert!(ticket.try_enter().is_err(), "{kind}");
+        assert!(store.try_background_signin().is_err(), "{kind}");
+        if kind == 1 {
+            assert_eq!(std::fs::read(target.join("kept")).unwrap(), b"preserve");
+            assert_eq!(
+                std::fs::read_dir(&target).unwrap().count(),
+                1,
+                "nothing is made or removed through the junction"
+            );
+        }
+        if kind == 2 {
+            assert!(sddl(&file).contains(";;;WD)"), "the list is left as it was");
+        }
+        if kind == 3 {
+            assert!(target.is_file() && file.is_file(), "both names are left");
         }
     }
 }

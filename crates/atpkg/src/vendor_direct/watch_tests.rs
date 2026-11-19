@@ -17,18 +17,19 @@ const CODEX_HEAD: &str = "https://releases.openai.com/codex/channels/latest";
 /// release).
 pub(super) const HANG: Duration = Duration::from_secs(60);
 
-#[test]
-fn an_independent_package_hint_interrupts_an_idle_vendor_park() {
-    let mut watch = HeadWatch::new(&[]);
-    let owner = thread::current();
-    let notifier = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(100));
-        owner.unpark();
-    });
-    let started = std::time::Instant::now();
-    watch.park_for_hint(2 * HANG);
-    assert!(started.elapsed() < HANG, "{:?}", started.elapsed());
-    notifier.join().unwrap();
+/// A rest `watch`'s workers ring.
+pub(super) fn ringing(watch: &mut HeadWatch) -> Rest {
+    let rest = Rest::inert();
+    watch.bind_ring(rest.ringer());
+    rest
+}
+
+/// Wait for a head worker's ring (a hang detector) and take it.
+pub(super) fn rang(rest: &Rest) {
+    assert!(
+        rest.wait(Some(HANG)).is_some_and(|told| told.rung),
+        "a head worker rang within a minute (a hang detector)"
+    );
 }
 
 fn v(text: &str) -> Version {
@@ -46,7 +47,7 @@ pub(super) fn layout(label: &str) -> crate::testdir::ScratchLayout {
 #[test]
 fn a_window_sit_waits_for_a_sessions_held_move_look() {
     let l = layout("sit-handoff");
-    let mut session = host::HostClaim::new(Host::Session, &l);
+    let mut session = host::HostClaim::new(Host::Session, &l, None);
     assert_eq!(session.admit().0, host::Admit::Yes);
     assert!(session.seated_session());
     let mut window = HeadWatch::hosted(&[], Host::Window);
@@ -237,17 +238,6 @@ fn a_newer_head_triggers_and_an_equal_or_older_one_does_not() {
 }
 
 #[test]
-fn a_stale_completion_never_cuts_a_park_short() {
-    let mut watch = HeadWatch::new(&[]);
-    watch.completed_tx.send(0).unwrap();
-    watch.park_for_hint(Duration::ZERO);
-    assert!(
-        watch.ready_notices.is_empty(),
-        "the stale notice was dropped"
-    );
-}
-
-#[test]
 fn concurrent_watch_reaches_codex_while_claude_head_is_waiting() {
     let l = layout("concurrent-heads");
     install(&l, "claude", "2.1.280");
@@ -281,20 +271,15 @@ fn concurrent_watch_reaches_codex_while_claude_head_is_waiting() {
         },
     );
     let mut watch = HeadWatch::shared(&[]);
+    let rest = ringing(&mut watch);
     assert!(watch.check_pending(&l, at(0), &get).is_empty());
     assert_eq!(
         watch.pending_count(),
         2,
         "both independent hints are in flight"
     );
-    let deadline = std::time::Instant::now() + HANG;
-    let moved = loop {
-        watch.park_for_hint(Duration::from_millis(100));
-        let moved = watch.check_pending(&l, at(0), &get);
-        if !moved.is_empty() || std::time::Instant::now() >= deadline {
-            break moved;
-        }
-    };
+    rang(&rest);
+    let moved = watch.check_pending(&l, at(0), &get);
     assert_eq!(moved, ["codex"], "Codex is offered before Claude finishes");
     assert!(
         !claude_finished.load(Ordering::Acquire),
@@ -312,7 +297,7 @@ fn concurrent_watch_reaches_codex_while_claude_head_is_waiting() {
     let (lock, ready) = &*release_claude;
     *lock.lock().unwrap() = true;
     ready.notify_all();
-    watch.park_for_hint(HANG);
+    rang(&rest);
     assert_eq!(watch.check_pending(&l, at(0), &get), ["claude"]);
     assert_eq!(watch.pending_count(), 0);
     let notes = watch.take_notes();
@@ -352,8 +337,11 @@ fn one_blocked_vendor_is_owned_without_blocking_the_package_lane() {
     let caller_layout = l.clone();
     let caller_get = Arc::clone(&get);
     let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+    let rest = Rest::inert();
+    let ring = rest.ringer();
     let caller = std::thread::spawn(move || {
         let mut watch = HeadWatch::shared(&[String::from("codex")]);
+        watch.bind_ring(ring);
         let moved = watch.check_pending(&caller_layout, at(0), &caller_get);
         returned_tx.send((watch, moved)).unwrap();
     });
@@ -374,7 +362,7 @@ fn one_blocked_vendor_is_owned_without_blocking_the_package_lane() {
     );
     assert!(owned_while_blocked, "the blocked GET must remain owned");
     assert!(moved.is_empty());
-    watch.park_for_hint(HANG);
+    rang(&rest);
     assert_eq!(watch.check_pending(&l, at(0), &get), ["claude"]);
     assert_eq!(watch.pending_count(), 0);
     let _ = std::fs::remove_dir_all(&l.prefix);
@@ -429,11 +417,16 @@ fn vendor_spawn_failure_cannot_block_an_in_flight_index_answer() {
         })
     });
     let mut watch = HeadWatch::new(&[String::from("codex")]);
+    let rest = ringing(&mut watch);
     watch.fail_next_pending_spawn = true;
     assert!(
         watch
             .check_pending_with_index_in_flight(&l, at(0), &get, true)
             .is_empty()
+    );
+    assert!(
+        rest.take().is_some_and(|told| told.rung),
+        "the refused worker was its round's last, so the host is rung"
     );
     assert!(model.fire("VendorSpawnFailed", &mut state));
     assert_eq!(
@@ -459,7 +452,7 @@ fn vendor_spawn_failure_cannot_block_an_in_flight_index_answer() {
             .is_empty()
     );
     assert_eq!(watch.pending_count(), 1);
-    watch.park_for_hint(HANG);
+    rang(&rest);
     assert_eq!(
         watch.check_pending_with_index_in_flight(&l, at(0) + BUSY_RETRY, &get, true),
         ["claude"]
@@ -502,13 +495,14 @@ fn vendor_spawn_failure_defers_even_without_an_index_probe() {
         })
     });
     let mut watch = HeadWatch::new(&[]);
+    let rest = ringing(&mut watch);
     watch.fail_next_pending_spawn = true;
     assert!(watch.check_pending(&l, at(0), &get).is_empty());
     assert!(model.fire("VendorSpawnFailed", &mut state));
     assert_eq!(claude_calls.load(Ordering::SeqCst), 0);
     assert_eq!(state["inline_vendor_get"], 0);
     assert_eq!(watch.pending_count(), 1, "the other vendor keeps its slot");
-    watch.park_for_hint(HANG);
+    rang(&rest);
     assert!(watch.check_pending(&l, at(0), &get).is_empty());
     assert_eq!(watch.pending_count(), 0);
     assert!(!watch.round_active);
@@ -518,7 +512,7 @@ fn vendor_spawn_failure_defers_even_without_an_index_probe() {
 
     assert!(watch.check_pending(&l, at(0) + BUSY_RETRY, &get).is_empty());
     assert_eq!(watch.pending_count(), 1);
-    watch.park_for_hint(HANG);
+    rang(&rest);
     assert_eq!(
         watch.check_pending(&l, at(0) + BUSY_RETRY, &get),
         ["claude"]
@@ -561,9 +555,10 @@ fn completed_hint_skips_a_pass_already_landed_by_the_whole_store_update() {
         })
     });
     let mut watch = HeadWatch::new(&[]);
+    let rest = ringing(&mut watch);
     assert!(watch.check_pending(&l, at(0), &get).is_empty());
     codex_started_rx.recv_timeout(HANG).unwrap();
-    watch.park_for_hint(HANG);
+    rang(&rest);
     install(&l, "codex", "0.157.0");
     assert!(
         watch.check_pending(&l, at(0), &get).is_empty(),
@@ -573,7 +568,7 @@ fn completed_hint_skips_a_pass_already_landed_by_the_whole_store_update() {
     let (lock, ready) = &*release_claude;
     *lock.lock().unwrap() = true;
     ready.notify_all();
-    watch.park_for_hint(HANG);
+    rang(&rest);
     assert_eq!(watch.check_pending(&l, at(0), &get), ["claude"]);
     let notes = watch.take_notes();
     assert!(
@@ -901,21 +896,57 @@ fn the_cadence_is_one_minute_on_the_wall_clock() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
+/// ONE WAIT IS JUDGED A WAKE BY ITS TWO CLOCKS, AND A WAKE ASKS EVERY HEAD AFTER THE GRACE: a
+/// wait the wall clock outran by exactly WAKE_GAP is no wake, by a second more it is, however
+/// long the wait (an hour's wait whose wall clock ran an hour and a half is one), and a wall
+/// clock set back never is. woke() moves every head, and the next check of one in flight, to
+/// AFTER_WAKE later. NEGATIVE CONTROL: `>=` at the gap reads the first case as a wake; a woke()
+/// that skips the in-flight head leaves its wake_after unset.
 #[test]
-fn a_wake_asks_every_head_twenty_seconds_later() {
+fn woke_between_judges_one_wait_and_woke_reschedules_every_head() {
+    let five = Duration::from_secs(5);
+    let hour = Duration::from_secs(3600);
+    assert!(!woke_between(Some(five), five));
+    assert!(!woke_between(Some(five + WAKE_GAP), five), "the gap itself");
+    assert!(woke_between(
+        Some(five + WAKE_GAP + Duration::from_secs(1)),
+        five
+    ));
+    assert!(!woke_between(Some(hour + Duration::from_secs(29)), hour));
+    assert!(woke_between(Some(hour + hour / 2), hour), "one long wait");
+    assert!(!woke_between(None, five), "a clock set back");
+
     let l = layout("wake");
     install(&l, "claude", "2.1.280");
+    install(&l, "codex", "0.156.0");
     let f = Vendors::default();
     f.head(CLAUDE_HEAD, "2.1.280", Some("\"c1\""));
-    let mut w = HeadWatch::new(&[]);
+    let mut w = HeadWatch::new(&[String::from("codex")]);
     check(&mut w, &l, &f, at(0));
-    let five = Duration::from_secs(5);
-    assert!(!w.note_slice(at(5), Some(five), five));
-    assert!(!w.note_slice(at(40), Some(Duration::from_secs(34)), five));
-    assert!(!w.note_slice(at(40), None, five));
     assert!(!w.due(at(55)), "still on the cadence");
+    let (_hold, parked) = std::sync::mpsc::channel::<()>();
+    let idle = std::thread::spawn(move || {
+        let _ = parked.recv();
+        CompletedHead {
+            index: 1,
+            watched: Watched::default(),
+            outcome: CheckOutcome::default(),
+            notes: Vec::new(),
+        }
+    });
+    w.pending[1] = Some(PendingHead {
+        handle: idle,
+        done: Arc::new(AtomicBool::new(false)),
+        wake_after: None,
+    });
     let woke = at(8 * 3600);
-    assert!(w.note_slice(woke, Some(Duration::from_secs(8 * 3600)), five));
+    w.woke(woke);
+    assert_eq!(
+        w.pending[1].as_ref().and_then(|p| p.wake_after),
+        Some(woke + AFTER_WAKE),
+        "the head in flight is asked after the grace too"
+    );
+    w.pending[1] = None;
     assert!(!w.due(woke + Duration::from_secs(19)), "the network's 20 s");
     assert!(w.due(woke + AFTER_WAKE));
     assert!(check(&mut w, &l, &f, woke + AFTER_WAKE).is_empty());
@@ -1070,5 +1101,440 @@ fn an_exclusion_edited_mid_watch_is_heard_at_the_next_check() {
     assert!(w.due(at(5)), "included again: due at once");
     assert_eq!(check(&mut w, &l, &f, at(5)), ["claude"]);
     assert_eq!(f.take_gets(), [(CLAUDE_HEAD.to_string(), None)]);
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// A GET for the heads these round tests watch: claude answers `claude` (after `hold` lets it
+/// go, when set), codex answers a moved head, and every other vendor refuses (no move).
+fn round_get(
+    claude: &'static str,
+    hold: Arc<(Mutex<bool>, Condvar)>,
+) -> Arc<ConcurrentVendorGetFn<'static>> {
+    Arc::new(move |program: &str, url: &str, _cap, _etag: Option<&str>| {
+        let bytes = match program {
+            "claude" => {
+                let (lock, ready) = &*hold;
+                let held = lock.lock().unwrap();
+                let (held, _) = ready
+                    .wait_timeout_while(held, 2 * HANG, |held| *held)
+                    .unwrap();
+                assert!(!*held, "the test released claude's GET");
+                claude.as_bytes().to_vec()
+            }
+            "codex" => br#"{"tag_name":"rust-v0.157.0","assets":[]}"#.to_vec(),
+            _ => return Err(VendorFetchError::Refused(String::from("HTTP 404"))),
+        };
+        Ok(VendorGet::Body {
+            bytes,
+            etag: None,
+            effective_url: url.to_string(),
+        })
+    })
+}
+
+fn release(hold: &(Mutex<bool>, Condvar)) {
+    *hold.0.lock().unwrap() = false;
+    hold.1.notify_all();
+}
+
+/// Four installed programs, each a head the watch follows.
+fn four_installed(label: &str) -> crate::testdir::ScratchLayout {
+    let l = layout(label);
+    install(&l, "claude", "2.1.280");
+    install(&l, "codex", "0.156.0");
+    install(&l, "agy", "1.0.0");
+    install(&l, "muse", "1.0.0");
+    l
+}
+
+/// The index of `program` in the watch's table.
+fn slot(watch: &HeadWatch, program: &str) -> usize {
+    watch
+        .watched
+        .iter()
+        .position(|(spec, _)| spec.program == program)
+        .unwrap()
+}
+
+/// EVERY DUE, INSTALLED HEAD STARTS IN ONE ROUND, so all of them share one tick: with four
+/// installed programs due at once, all four GETs are in flight together, and after the round
+/// each is next asked at the same moment, one cadence on. NEGATIVE CONTROL: the old two-a-round
+/// cap (`due.truncate(2)`) leaves two in flight and staggers the rest a round later.
+#[test]
+fn every_due_head_starts_in_one_round() {
+    let l = four_installed("one-round");
+    let hold = Arc::new((Mutex::new(true), Condvar::new()));
+    let get = round_get("2.1.280", Arc::clone(&hold));
+    let mut watch = HeadWatch::new(&[]);
+    let rest = ringing(&mut watch);
+    assert!(watch.check_pending(&l, at(0), &get).is_empty());
+    assert_eq!(watch.pending_count(), 4, "every due head is in flight");
+    release(&hold);
+    while watch.has_pending() {
+        rang(&rest);
+        let _ = watch.check_pending(&l, at(0), &get);
+    }
+    let next: Vec<_> = ["claude", "codex", "agy", "muse"]
+        .iter()
+        .map(|program| watch.watched[slot(&watch, program)].1.next_check_at)
+        .collect();
+    assert_eq!(next, vec![Some(at(0) + CADENCE); 4], "one shared tick");
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// A ROUND RINGS ITS HOST ONCE PER MOVED HEAD AND ONCE MORE AT AN UNMOVED END, NOT AT EVERY
+/// ANSWER: each worker rings at most once, when its head moved or it is the round's last. Claude's
+/// GET is held while codex moves and two others answer unmoved. The moved codex rings, and is
+/// harvested while claude is still held; the unmoved answers ring nothing; claude, the round's
+/// unmoved last, rings its end. Two rings in all. Then a round of codex alone, moved and last,
+/// rings once. NEGATIVE CONTROL: ringing at every answer wakes the host at an unmoved answer, so
+/// its harvest can come before codex's offer, and counts four; ringing only at the round's end
+/// never harvests codex while claude is held, and the hang detector fails the test; ringing for a
+/// move and again for the end rings a moved last worker twice.
+#[test]
+fn a_round_rings_per_moved_head_and_once_at_an_unmoved_end() {
+    let l = four_installed("round-rings");
+    let hold = Arc::new((Mutex::new(true), Condvar::new()));
+    let get = round_get("2.1.280", Arc::clone(&hold));
+    let mut watch = HeadWatch::new(&[]);
+    let rest = Rest::inert();
+    let rings = Arc::new(AtomicUsize::new(0));
+    let (counted, inner) = (Arc::clone(&rings), rest.ringer());
+    watch.bind_ring(Ring::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        inner.ring();
+    }));
+    assert!(watch.check_pending(&l, at(0), &get).is_empty());
+    rang(&rest);
+    assert_eq!(watch.check_pending(&l, at(0), &get), ["codex"]);
+    let (agy, muse) = (slot(&watch, "agy"), slot(&watch, "muse"));
+    aterm_spec::wait::until_within(HANG, "the unmoved answers end", || {
+        let done = |i: usize| {
+            watch.pending[i]
+                .as_ref()
+                .is_none_or(|p| p.handle.is_finished())
+        };
+        (done(agy) && done(muse)).then_some(())
+    });
+    assert_eq!(rings.load(Ordering::SeqCst), 1, "only the moved head rang");
+    assert!(
+        watch.pending[slot(&watch, "claude")].is_some(),
+        "claude is still held"
+    );
+    release(&hold);
+    rang(&rest);
+    assert!(watch.check_pending(&l, at(0), &get).is_empty());
+    assert_eq!(
+        watch.pending_count(),
+        0,
+        "the round's end harvests the rest"
+    );
+    assert_eq!(rings.load(Ordering::SeqCst), 2, "and the round's last rang");
+
+    let mut alone = HeadWatch::new(&["claude", "agy", "muse"].map(String::from));
+    let (counted, inner) = (Arc::clone(&rings), rest.ringer());
+    alone.bind_ring(Ring::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        inner.ring();
+    }));
+    assert!(alone.check_pending(&l, at(0), &get).is_empty());
+    let codex = slot(&alone, "codex");
+    aterm_spec::wait::until_within(HANG, "codex's worker ends", || {
+        alone.pending[codex]
+            .as_ref()
+            .is_some_and(|p| p.handle.is_finished())
+            .then_some(())
+    });
+    assert_eq!(
+        rings.load(Ordering::SeqCst),
+        3,
+        "a moved last worker rings once"
+    );
+    rang(&rest);
+    assert_eq!(alone.check_pending(&l, at(0), &get), ["codex"]);
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// A HEAD WORKER THAT PANICS STILL RINGS ITS ROUND'S END, from its drop guard: its host wakes,
+/// harvests the dead worker as unavailable and asks that head a cadence later. NEGATIVE CONTROL:
+/// a worker that rings from its body, after the GET, never rings, and the hang detector fails.
+#[test]
+fn a_panicking_head_worker_still_rings_the_round_end() {
+    let l = layout("panicking-head");
+    install(&l, "claude", "2.1.280");
+    let get: Arc<ConcurrentVendorGetFn<'static>> =
+        Arc::new(|_: &str, _: &str, _, _: Option<&str>| panic!("an injected GET panic"));
+    let mut watch = HeadWatch::new(&[String::from("codex")]);
+    let rest = ringing(&mut watch);
+    assert!(watch.check_pending(&l, at(0), &get).is_empty());
+    rang(&rest);
+    assert!(watch.check_pending(&l, at(0), &get).is_empty());
+    assert_eq!(watch.pending_count(), 0);
+    let claude = slot(&watch, "claude");
+    assert_eq!(watch.watched[claude].1.next_check_at, Some(at(0) + CADENCE));
+    assert!(
+        watch
+            .take_notes()
+            .iter()
+            .any(|note| note == "vendor head worker unavailable: claude")
+    );
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// THE WATCH NAMES ITS NEXT WORK FOR ITS HOST'S ONE WAIT: now for a head never asked, a head's
+/// deadline once asked, nothing while a round is in flight (its ring is the event), now again
+/// while a moved head a higher-priority end deferred waits to be replayed (that wait is zero
+/// once: the replay takes it), now for a deadline set back past a cadence, and nothing when
+/// every head is excluded. NEGATIVE CONTROL: a next_due blind to the deferred move waits a whole
+/// cadence to replay a head already found moved.
+#[test]
+fn next_due_names_the_heads_deadline_and_waits_on_a_round_in_flight() {
+    let l = layout("next-due");
+    install(&l, "claude", "2.1.280");
+    let only_claude: Vec<String> = VENDORS
+        .iter()
+        .map(|spec| spec.program.to_string())
+        .filter(|program| program != "claude")
+        .collect();
+    let mut watch = HeadWatch::new(&only_claude);
+    assert_eq!(watch.next_due(at(0)), Some(at(0)), "never asked");
+    let hold = Arc::new((Mutex::new(true), Condvar::new()));
+    let get = round_get("2.1.281", Arc::clone(&hold));
+    let rest = ringing(&mut watch);
+    assert!(watch.check_pending(&l, at(0), &get).is_empty());
+    assert_eq!(watch.next_due(at(0)), None, "the round's ring is the event");
+    release(&hold);
+    rang(&rest);
+    assert_eq!(watch.check_pending(&l, at(0), &get), ["claude"]);
+    assert_eq!(watch.next_due(at(1)), Some(at(0) + CADENCE));
+    watch.defer_moved(&["claude"]);
+    assert_eq!(
+        watch.next_due(at(1)),
+        Some(at(1)),
+        "the deferred move replays now"
+    );
+    assert_eq!(watch.check_pending(&l, at(1), &get), ["claude"]);
+    assert_eq!(watch.next_due(at(1)), Some(at(0) + CADENCE), "once");
+    assert_eq!(
+        watch.next_due(at(0) - Duration::from_secs(3600)),
+        Some(at(0) - Duration::from_secs(3600)),
+        "a deadline set back past a cadence is due"
+    );
+    watch.set_exclude(
+        &VENDORS
+            .iter()
+            .map(|spec| spec.program.to_string())
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(watch.next_due(at(1)), None, "nothing watched");
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// A ROUND'S DONE WORKERS ARE DUE, WHOEVER TOOK THEIR RING. A host wait that ends before the
+/// host's round (the window lane's stand-by while Automatic updates are off, or a park that ends
+/// on a bump, a held move or an index) takes the ring a round's end made, and the round must still
+/// be harvested at the host's next wait, not at the end of a park. With claude's GET held, agy and
+/// muse answer unmoved and ring nothing, yet are due now; once they are harvested the round still
+/// in flight waits on its ring; claude's end rings, a wait that harvests nothing takes that ring,
+/// and the round is still due now, then harvested. MUTANTS: a next_due that waits on every round
+/// in flight (as it did) answers None once the ring was taken, so the window waits out its park;
+/// one due only once every worker is done leaves agy's and muse's answers for the round's end.
+#[test]
+fn a_rounds_done_workers_are_due_whoever_took_their_ring() {
+    let l = four_installed("done-due");
+    let hold = Arc::new((Mutex::new(true), Condvar::new()));
+    let get = round_get("2.1.280", Arc::clone(&hold));
+    let mut watch = HeadWatch::new(&[String::from("codex")]);
+    let rest = ringing(&mut watch);
+    assert!(watch.check_pending(&l, at(0), &get).is_empty());
+    assert_eq!(
+        watch.pending_count(),
+        3,
+        "claude, agy and muse are in flight"
+    );
+    let (agy, muse) = (slot(&watch, "agy"), slot(&watch, "muse"));
+    aterm_spec::wait::until_within(HANG, "agy's and muse's workers are done", || {
+        let done = |i: usize| watch.pending[i].as_ref().is_some_and(PendingHead::done);
+        (done(agy) && done(muse)).then_some(())
+    });
+    assert!(rest.take().is_none(), "unmoved answers ring nothing");
+    assert_eq!(
+        watch.next_due(at(0)),
+        Some(at(0)),
+        "done workers are due now"
+    );
+    assert!(watch.check_pending(&l, at(0), &get).is_empty());
+    assert_eq!(watch.pending_count(), 1, "agy and muse are harvested");
+    assert_eq!(
+        watch.next_due(at(0)),
+        None,
+        "claude still runs: its ring is the event"
+    );
+    release(&hold);
+    rang(&rest);
+    assert_eq!(
+        watch.next_due(at(0)),
+        Some(at(0)),
+        "the round's end is due, though a wait that harvested nothing took its ring"
+    );
+    assert!(
+        watch.check_pending(&l, at(0), &get).is_empty(),
+        "claude did not move"
+    );
+    assert_eq!(watch.pending_count(), 0, "the round is harvested");
+    assert_eq!(
+        watch.next_due(at(1)),
+        Some(at(0) + CADENCE),
+        "then the heads' next tick"
+    );
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// A STANDING SESSION KEEPS ONE WAITER PER LOCK HOWEVER OFTEN IT IS TURNED OFF AND ON. A session
+/// refused the seat arms a waiter that blocks on it. Turning Automatic updates off lets the claim
+/// go (`release_host`) but cannot interrupt the waiter's blocking take, so each claim refused the
+/// seat after that takes the waiter still blocked on it, instead of arming another beside it (one
+/// more thread and open file per toggle). Once the seat frees, the waiter hands it to the
+/// session's latest claim and rings. A waiter whose session let its claim go and made none since
+/// lets the seat go the moment it takes it, so a third session sits. MUTANTS: arming a new waiter
+/// at every refusal leaves a second waiter blocked at the first toggle; a waiter taken on but still
+/// naming the claim that armed it lets the seat go when it frees, and the hang detector fails the
+/// session's wait for its ring.
+#[test]
+fn a_standing_session_keeps_one_waiter_per_lock_across_toggles() {
+    let l = layout("toggles");
+    let mut sitter = host::HostClaim::new(Host::Session, &l, None);
+    assert_eq!(sitter.admit().0, host::Admit::Yes);
+    sitter.end_round();
+    let mut session = HeadWatch::hosted(&[], Host::Session);
+    let rest = ringing(&mut session);
+    for toggle in 0..3 {
+        assert!(
+            !session.admitted(&l, at(0)),
+            "refused the seat (toggle {toggle})"
+        );
+        assert!(session.admission_waits(), "it waits on a waiter");
+        assert_eq!(
+            session.waiters.running(),
+            1,
+            "one waiter blocks on the seat (toggle {toggle})"
+        );
+        session.release_host();
+    }
+    assert!(!session.admitted(&l, at(0)), "turned on again: refused");
+    drop(sitter);
+    rang(&rest);
+    assert!(
+        session.admitted(&l, at(0)),
+        "its latest claim takes the seat its waiter took"
+    );
+    assert!(session.holds_seat() && session.seated_session());
+    session.end_session_update_look();
+
+    let mut other = HeadWatch::hosted(&[], Host::Session);
+    let other_rest = ringing(&mut other);
+    assert!(!other.admitted(&l, at(0)), "a second session is refused");
+    assert_eq!(other.waiters.running(), 1);
+    other.release_host();
+    session.release_host();
+    aterm_spec::wait::until_within(HANG, "the let-go claim's waiter ended", || {
+        (other.waiters.running() == 0).then_some(())
+    });
+    let mut third = host::HostClaim::new(Host::Session, &l, None);
+    assert_eq!(
+        third.admit().0,
+        host::Admit::Yes,
+        "that waiter let the seat go"
+    );
+    assert!(
+        other_rest.take().is_none(),
+        "a waiter no claim took on rings nobody"
+    );
+    drop(third);
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// A SEATED SESSION KEEPS ONE RENDEZVOUS WAITER ACROSS TOGGLES, AND A REFUSAL OF THE SEAT NEVER
+/// TAKES IT ON. A seated session refused the rendezvous (a window holds it) arms a waiter that
+/// blocks on it. Turned off (`release_host`), the session lets the seat go but cannot interrupt
+/// that waiter; each time it is turned on, seated again and refused the rendezvous, it takes the
+/// waiter on. Turned on while a second session sits, it is refused the seat: that refusal arms a
+/// seat waiter beside the rendezvous's, one per lock, and the rendezvous waiter is taken on only
+/// once the seat is the session's again, so a claim without the seat never waits on the
+/// rendezvous and never rounds without the seat. The seat waiter hands over the seat when the
+/// second session goes, the rendezvous waiter hands over the rendezvous when the window closes,
+/// and the session rounds. MUTANTS: arming every refusal on the seat's line takes the rendezvous
+/// waiter on for the seat, and the count of one waiter per lock fails; a rendezvous waiter taken
+/// on but still naming the claim that armed it lets the rendezvous go when the window closes, and
+/// the hang detector fails the session's wait for its ring.
+#[test]
+fn a_seated_session_keeps_one_rendezvous_waiter_across_toggles() {
+    let l = layout("hosts-toggles");
+    let mut window = HeadWatch::hosted(&[], Host::Window);
+    assert!(window.sit(&l), "a window holds the rendezvous");
+    let mut session = HeadWatch::hosted(&[], Host::Session);
+    let rest = ringing(&mut session);
+    for toggle in 0..3 {
+        assert!(
+            !session.admitted(&l, at(0)),
+            "seated, refused the rendezvous (toggle {toggle})"
+        );
+        assert!(session.holds_seat() && session.session_behind_window());
+        assert!(session.admission_waits(), "it waits on a waiter");
+        assert_eq!(
+            session.waiters.running(),
+            1,
+            "one waiter blocks on the rendezvous (toggle {toggle})"
+        );
+        session.release_host();
+    }
+    let mut other = host::HostClaim::new(Host::Session, &l, None);
+    assert_eq!(
+        other.admit().0,
+        host::Admit::Later(CADENCE),
+        "a second session sits, behind the window"
+    );
+    assert!(other.holds_seat());
+    assert!(!session.admitted(&l, at(0)), "turned on: refused the seat");
+    assert!(!session.holds_seat() && session.admission_waits());
+    assert_eq!(
+        session.waiters.running(),
+        2,
+        "a seat waiter beside the rendezvous's: one per lock"
+    );
+    session.release_host();
+    assert!(
+        !session.admitted(&l, at(0)),
+        "turned on again: refused the seat"
+    );
+    assert_eq!(session.waiters.running(), 2, "it took the seat waiter on");
+    drop(other);
+    rang(&rest);
+    aterm_spec::wait::until_within(HANG, "the seat waiter ended", || {
+        (session.waiters.running() == 1).then_some(())
+    });
+    assert!(
+        !session.admitted(&l, at(0)),
+        "seated by its waiter, refused the rendezvous"
+    );
+    assert!(session.holds_seat() && session.session_behind_window());
+    assert!(session.admission_waits());
+    assert_eq!(
+        session.waiters.running(),
+        1,
+        "it took the rendezvous waiter on"
+    );
+    drop(window);
+    rang(&rest);
+    assert!(
+        session.admitted(&l, at(0)),
+        "its claim takes the rendezvous its waiter took"
+    );
+    assert!(session.seated_session());
+    session.end_session_update_look();
+    aterm_spec::wait::until_within(HANG, "every waiter ended", || {
+        (session.waiters.running() == 0).then_some(())
+    });
+    drop(session);
     let _ = std::fs::remove_dir_all(&l.prefix);
 }

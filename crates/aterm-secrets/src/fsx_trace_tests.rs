@@ -294,12 +294,21 @@ fn a_glance_records_each_look_it_gives_again() {
 /// its stamp shows (a file others may read: on Unix its mode, on Windows its access list, which
 /// the stamp's digest and change time hold) records none: the refusal stands until the file
 /// changes, and the file made the owner's alone again moves it. On Windows a private file has one
-/// name too: one refused for a second name stands until that name is removed.
+/// name too: one refused for a second name stands until that name is removed. And there each
+/// change moves the stamp by what it changed, not only by the change time NTFS moves with it:
+/// with the change time put back, the narrowed list still moves it (the stamp's digest of the
+/// owner and list), and so does the second name removed (its link count).
 /// NEGATIVE CONTROL (2026-11-14): with `open_admitted`'s `failed` recording nothing, the failed
 /// read is kept (`a failed read records a retry`).
 /// NEGATIVE CONTROLS (2026-11-16, on macOS): with `private_again` changing nothing, `its access
 /// narrowed moves it` failed, left `Ok(())`, right `Err(File(".../open"))`; with `open_to_others`
 /// changing nothing, `a file others may read is refused` failed.
+/// NEGATIVE CONTROLS (2026-11-18, on Windows), each in `aterm_uds::trace`'s Windows `Meta::of`:
+/// with the owner and list's digest left out (`uid: 0`), `its access narrowed moves it, its
+/// change time put back` failed, left `Ok(())`, right `Err(File(".../open"))`, while `its access
+/// narrowed moves it` held by the change time alone; with the link count left out (`nlink: 0`),
+/// `its second name removed moves it, its change time put back` failed, left `Ok(())`, right
+/// `Err(File(".../named"))`.
 #[test]
 fn a_read_that_fails_records_a_retry_and_a_refusal_none() {
     let root = scratch();
@@ -323,28 +332,65 @@ fn a_read_that_fails_records_a_retry_and_a_refusal_none() {
         Ok(()),
         "a refusal stands while the file does"
     );
+    #[cfg(windows)]
+    let refused_at = change_time(&open);
     private_again(&open);
     assert_eq!(
         stands(&refused),
         Err(Moved::File(open.clone())),
         "its access narrowed moves it"
     );
-
     #[cfg(windows)]
     {
+        put_back_change_time(&open, refused_at);
+        assert_eq!(
+            stands(&refused),
+            Err(Moved::File(open.clone())),
+            "its access narrowed moves it, its change time put back"
+        );
+
         let named = private_file(root.path(), "named", b"held");
         let second = root.path().join("named.second");
         std::fs::hard_link(&named, &second).unwrap();
         let (read, refused) = traced(|| read_private(&named, 64));
         assert!(read.is_err(), "a file of two names is refused");
         assert_eq!(refused.unkept(), None, "a refusal records no retry");
+        let refused_at = change_time(&named);
         std::fs::remove_file(&second).unwrap();
         assert_eq!(
             stands(&refused),
             Err(Moved::File(named.clone())),
             "its second name removed moves it"
         );
+        put_back_change_time(&named, refused_at);
+        assert_eq!(
+            stands(&refused),
+            Err(Moved::File(named.clone())),
+            "its second name removed moves it, its change time put back"
+        );
     }
+}
+
+/// The change time of the file at `path`, in filetime ticks.
+#[cfg(windows)]
+fn change_time(path: &Path) -> i64 {
+    aterm_dirfd::fstat(std::fs::File::open(path).unwrap())
+        .unwrap()
+        .change_time
+}
+
+/// Put the change time of the file at `path` back to `ticks`, as any writer of its attributes
+/// may: a change made within a tick of the system clock of the last one leaves it there too.
+#[cfg(windows)]
+fn put_back_change_time(path: &Path, ticks: i64) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    let file = std::fs::File::options()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .open(path)
+        .unwrap();
+    aterm_dirfd::seam::set_change_time(&file, ticks).unwrap();
+    assert_eq!(change_time(path), ticks, "the change time put back");
 }
 
 /// Each write here records a write, the ones `aterm_uds::atomic_file` makes for it and its own;

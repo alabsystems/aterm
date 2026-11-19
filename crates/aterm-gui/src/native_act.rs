@@ -27,7 +27,7 @@ use aterm_agent::harness::contract::Scope;
 use aterm_agent::harness::native_act::{
     AskedIntent, Binding, BootStamp, CancelPrepare, ClaimOutcome, Closure, ColdEnvironmentFacts,
     ColdIntent, Constructor, Decision, Image, ImagePhase, NativePlan, Prepare, Process,
-    RecipientWriterSupport, Recorded, Request, RestartCommand, Retirement,
+    RecipientWriterSupport, Recorded, Request, RestartCommand, Retirement, Succession,
 };
 
 use crate::session_timeline::{
@@ -205,6 +205,25 @@ pub(crate) fn retain_exec_claim(ctx: &crate::SessionCtx, local: u64, connection:
         let _ = (ctx, local, connection);
         false
     }
+}
+
+pub(crate) fn source_adoption_deadline(ctx: &crate::SessionCtx) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        source_exec::adoption_deadline(ctx)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctx;
+        None
+    }
+}
+
+pub(crate) fn expire_source_adoption(ctx: &crate::SessionCtx, now: u64) {
+    #[cfg(unix)]
+    source_exec::expire_adoption(ctx, now);
+    #[cfg(not(unix))]
+    let _ = (ctx, now);
 }
 
 /// A cancelled native cohort is positively closed and its exact original shell
@@ -706,10 +725,16 @@ enum Conversation {
 
 impl Conversation {
     fn current(&self, ctx: &crate::SessionCtx) -> bool {
+        self.is_current(ctx) == Some(true)
+    }
+
+    /// Whether the host's current conversation is this one: `Some(false)` where it reads another,
+    /// `None` where it reads none.
+    fn is_current(&self, ctx: &crate::SessionCtx) -> Option<bool> {
         match self {
-            Self::Host(expected) => current_conversation(ctx).as_ref() == Some(expected),
+            Self::Host(expected) => current_conversation(ctx).map(|current| current == *expected),
             #[cfg(test)]
-            Self::Facts(valid) => valid.load(std::sync::atomic::Ordering::Acquire),
+            Self::Facts(valid) => Some(valid.load(std::sync::atomic::Ordering::Acquire)),
         }
     }
 }
@@ -778,6 +803,13 @@ struct Operation {
     cold_facts: Option<ColdEnvironmentFacts>,
     cold_resolving: bool,
     resolved_cold: Option<Arc<ResolvedCold>>,
+    /// By phase, the account intent that phase's granted exec was admitted for in place of its
+    /// command's, which stays as it was planned (the recipe's identity): the same stored login
+    /// captured afresh where only its credential generation moved before Execute
+    /// ([`AccountAt::Execute`]). It outlives the launch children a completion seals, and the
+    /// restart's completion names it ([`completed_reply`]), so the harness's record keeps the
+    /// intent that was admitted. `None`: the command's own intent was, or none was asked.
+    readmitted: [Option<aterm_agent::harness::accounts_pool::ExecutionIntent>; 2],
 }
 
 trait ColdProof: std::fmt::Debug + Send + Sync {
@@ -1181,6 +1213,36 @@ enum Phase {
     Completed(Decision),
 }
 
+/// When a native restart admits its command's retained account intent ([`Kernel::account_execution`]).
+/// Both steps are the account seat's, for its own intents ([`seat_admitted`]): an external route
+/// is never readmitted, and at either step it takes its own external admission
+/// (`accounts_pool::admit_external_execution`, or no account guard for a route outside aterm's
+/// logins).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountAt {
+    /// An asked move's Prepare or Signal, with the agent it replaces still running: exactly the
+    /// retained intent (`accounts_pool::admit_execution`). A generation that moved since the plan
+    /// refuses it, and the harness plans again.
+    Signal,
+    /// Execute, the launcher's one exec grant once the replaced agent is gone, when no plan can
+    /// be made again: `accounts_pool::execution_readmission`, under the rule the raw relaunch's
+    /// exec admission holds. Where only the stored login's credential generation moved since the
+    /// plan (a renewal or a sign-in of its row, a first usage reading creating its binding, or,
+    /// for a row with no binding of its own, any account's commit), the same login captured
+    /// afresh for the intent's own purpose is admitted in its place ([`AccountGrant`]'s second
+    /// part); another owner row or namespace, and every other refusal, refuse the exec.
+    Execute,
+}
+
+/// What an account admission of a native command grants: the account writer held through the
+/// exec grant (`None`: no account admission holds it) and, at [`AccountAt::Execute`] only, the
+/// intent captured afresh and admitted in place of the command's, which the operation records
+/// beside its unchanged command ([`Operation::readmitted`]).
+type AccountGrant = (
+    Option<aterm_agent::harness::accounts_pool::ExecutionGuard>,
+    Option<aterm_agent::harness::accounts_pool::ExecutionIntent>,
+);
+
 /// Process/image facts are injected in conformance tests; the production arm reads the
 /// kernel, never a caller's holder, argv text, pathname alone or status-as-permission.
 trait Kernel {
@@ -1261,18 +1323,30 @@ trait Kernel {
     fn rejection_domain(&self) -> Result<Option<String>, ()> {
         Ok(None)
     }
+    /// The account seat's exact admission of `intent` ([`AccountAt::Signal`]).
     fn account_admission(
         &self,
         _: &aterm_agent::harness::accounts_pool::ExecutionIntent,
     ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
         Err(())
     }
+    /// The account seat's admission of `intent` at Execute ([`AccountAt::Execute`]).
+    fn account_readmission(
+        &self,
+        _: &aterm_agent::harness::accounts_pool::ExecutionIntent,
+    ) -> Result<AccountGrant, ()> {
+        Err(())
+    }
+    /// The account admission of `command`'s retained intent at `at`, for the process `pid` that
+    /// runs it now (the agent before its signal, the launcher at Execute) or, for a cold
+    /// restart, its helper's resolved `cold` facts.
     fn account_execution(
         &self,
         command: &RestartCommand,
         pid: u32,
         cold: Option<&ColdEnvironmentFacts>,
-    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()>;
+        at: AccountAt,
+    ) -> Result<AccountGrant, ()>;
     fn constructor_enabled(&self, kind: Constructor) -> bool;
     fn clock(&self) -> Clock;
     fn process(&self, pid: u32) -> Option<Process>;
@@ -1604,34 +1678,26 @@ impl Kernel for System<'_> {
         &self,
         intent: &aterm_agent::harness::accounts_pool::ExecutionIntent,
     ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
-        use aterm_agent::harness::{accounts, accounts_pool};
-        if !seat_admitted(intent) {
-            return Err(());
-        }
-        let home = aterm_primer::home_dir().ok_or(())?;
-        let roster = accounts::default_roster_path().ok_or(())?;
-        let state = crate::harness_host::harness_state().ok_or(())?;
-        let seat = accounts_pool::Seat {
-            config_dir: roster.parent().ok_or(())?,
-            state: &state,
-            home: &home,
-            now: aterm_time::unix_secs()
-                .and_then(|now| i64::try_from(now).ok())
-                .ok_or(())?,
-        };
-        accounts_pool::admit_execution(&seat, accounts::Cli::Claude, intent)
-            .map(Some)
-            .map_err(|_| ())
+        live_seat(|seat| seat_admission(seat, intent, AccountAt::Signal)).map(|(guard, _)| guard)
+    }
+    fn account_readmission(
+        &self,
+        intent: &aterm_agent::harness::accounts_pool::ExecutionIntent,
+    ) -> Result<AccountGrant, ()> {
+        live_seat(|seat| seat_admission(seat, intent, AccountAt::Execute))
     }
     fn account_execution(
         &self,
         command: &RestartCommand,
         pid: u32,
         cold: Option<&ColdEnvironmentFacts>,
-    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
+        at: AccountAt,
+    ) -> Result<AccountGrant, ()> {
         use aterm_agent::harness::{accounts, accounts_pool};
+        // A cold command's intent is its own helper's resolution, made once the agent ended and
+        // held to that resolution's proof at Execute: it is admitted exactly.
         if let Some(facts) = cold {
-            return cold_account_execution(command, facts);
+            return cold_account_execution(command, facts).map(|guard| (guard, None));
         }
         let intent = command.account_intent.as_deref().ok_or(())?;
         let args = atpkg::caller_shell::process_args(pid).ok_or(())?;
@@ -1643,21 +1709,37 @@ impl Kernel for System<'_> {
                 .ok()
                 .zip(std::fs::canonicalize(&home).ok())
                 .is_some_and(|(actual, expected)| actual == expected);
-        // Only a token route asks which entry the intent's account owns.
-        let owner_entry = match who.route {
-            accounts::AuthRoute::VaultToken { .. } => {
-                accounts::Roster::load(&accounts::default_roster_path().ok_or(())?)
-                    .ok()
-                    .and_then(|roster| intent.owner_entry(&roster))
+        // A rebind asks which logins its account's row left, as this Mac's login records bind it
+        // (the process `pid` may be the live one it replaces), and only a token route which entry
+        // the intent's account owns.
+        let roster = match (intent.purpose(), who.route) {
+            (Some(accounts_pool::Purpose::Rebind), _) => {
+                let roster = accounts::default_roster_path().ok_or(())?;
+                let state = crate::harness_host::harness_state().ok_or(())?;
+                accounts_pool::bound_roster(
+                    &accounts_pool::Seat {
+                        config_dir: roster.parent().ok_or(())?,
+                        state: &state,
+                        home: &home,
+                        now: aterm_time::unix_secs()
+                            .and_then(|now| i64::try_from(now).ok())
+                            .ok_or(())?,
+                    },
+                    accounts::Cli::Claude,
+                )
+                .ok()
             }
-            accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => None,
+            (_, accounts::AuthRoute::VaultToken { .. }) => {
+                accounts::Roster::load(&accounts::default_roster_path().ok_or(())?).ok()
+            }
+            (_, accounts::AuthRoute::Stored | accounts::AuthRoute::Outside) => None,
         };
-        if !intent.matches_process(&who, same_user_home, owner_entry) {
+        if !intent.replaces_process(&who, same_user_home, roster.as_ref()) {
             return Err(());
         }
         if matches!(intent, accounts_pool::ExecutionIntent::External { .. }) {
             match who.route {
-                accounts::AuthRoute::Outside => return Ok(None),
+                accounts::AuthRoute::Outside => return Ok((None, None)),
                 accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => {}
             }
             let mut directories = Vec::new();
@@ -1682,25 +1764,16 @@ impl Kernel for System<'_> {
                         .join(&*directory);
                 }
             }
-            let roster = accounts::default_roster_path().ok_or(())?;
-            let state = crate::harness_host::harness_state().ok_or(())?;
-            let seat = accounts_pool::Seat {
-                config_dir: roster.parent().ok_or(())?,
-                state: &state,
-                home: &home,
-                now: aterm_time::unix_secs()
-                    .and_then(|now| i64::try_from(now).ok())
-                    .ok_or(())?,
-            };
-            return accounts_pool::admit_external_execution(
-                &seat,
-                accounts::Cli::Claude,
-                &directories,
-            )
-            .map(Some)
-            .map_err(|_| ());
+            return live_seat(|seat| {
+                accounts_pool::admit_external_execution(seat, accounts::Cli::Claude, &directories)
+                    .map(|guard| (Some(guard), None))
+                    .map_err(|_| ())
+            });
         }
-        self.account_admission(intent)
+        match at {
+            AccountAt::Signal => self.account_admission(intent).map(|guard| (guard, None)),
+            AccountAt::Execute => self.account_readmission(intent),
+        }
     }
     fn constructor_enabled(&self, kind: Constructor) -> bool {
         self.0.constructor_enabled(kind)
@@ -1804,6 +1877,49 @@ fn seat_admitted(intent: &aterm_agent::harness::accounts_pool::ExecutionIntent) 
     match intent {
         ExecutionIntent::Stored { .. } | ExecutionIntent::Token { .. } => true,
         ExecutionIntent::External { .. } => false,
+    }
+}
+
+/// Run `admit` on this user's live account seat (the roster's folder, the harness state, the
+/// home, now); a part that does not read refuses.
+fn live_seat<T>(
+    admit: impl FnOnce(&aterm_agent::harness::accounts_pool::Seat<'_>) -> Result<T, ()>,
+) -> Result<T, ()> {
+    use aterm_agent::harness::{accounts, accounts_pool};
+    let home = aterm_primer::home_dir().ok_or(())?;
+    let roster = accounts::default_roster_path().ok_or(())?;
+    let state = crate::harness_host::harness_state().ok_or(())?;
+    admit(&accounts_pool::Seat {
+        config_dir: roster.parent().ok_or(())?,
+        state: &state,
+        home: &home,
+        now: aterm_time::unix_secs()
+            .and_then(|now| i64::try_from(now).ok())
+            .ok_or(())?,
+    })
+}
+
+/// The account seat's admission of `intent` at `at` ([`seat_admitted`] intents only): exactly
+/// before the signal; at Execute, readmitted, so a stored login whose credential generation alone
+/// moved since the plan is admitted as captured afresh, returned for the operation to record.
+fn seat_admission(
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    intent: &aterm_agent::harness::accounts_pool::ExecutionIntent,
+    at: AccountAt,
+) -> Result<AccountGrant, ()> {
+    use aterm_agent::harness::{accounts, accounts_pool};
+    if !seat_admitted(intent) {
+        return Err(());
+    }
+    match at {
+        AccountAt::Signal => accounts_pool::admit_execution(seat, accounts::Cli::Claude, intent)
+            .map(|guard| (Some(guard), None))
+            .map_err(|_| ()),
+        AccountAt::Execute => {
+            accounts_pool::execution_readmission(seat, accounts::Cli::Claude, intent)
+                .map(|(guard, readmitted)| (Some(guard), readmitted))
+                .map_err(|_| ())
+        }
     }
 }
 
@@ -2684,8 +2800,8 @@ fn prepare_inner(
         else {
             return DENIED.into();
         };
-        match kernel.account_execution(forward, process.pid, None) {
-            Ok(guard) => guard,
+        match kernel.account_execution(forward, process.pid, None, AccountAt::Signal) {
+            Ok((guard, _)) => guard,
             Err(()) => return DENIED.into(),
         }
     } else {
@@ -2726,6 +2842,23 @@ fn prepare_inner(
             return UNKNOWN.into();
         }
     }
+    // A re-entry's qualification reads this host's own current-epoch registration under the
+    // same metadata guard its context is captured from, before the operation table.
+    let registered = if matches!(request.asked, Some(AskedIntent::Reentry(_))) {
+        let Some(context) = observe_control::context(ctx, &meta, &caller, kernel) else {
+            return DENIED.into();
+        };
+        asked_upgrade::Registered::read(
+            &observations.lock().unwrap_or_else(|p| p.into_inner()),
+            &request,
+            &context,
+            master,
+            now,
+            &ObservationKernel(kernel),
+        )
+    } else {
+        None
+    };
     if !validate_plan(&request, &authority, master, kernel, observation.is_some()) {
         return DENIED.into();
     }
@@ -2762,17 +2895,18 @@ fn prepare_inner(
         return DENIED.into();
     }
     if request.asked.is_some() {
-        let qualified = match table.qualify_asked(ctx, &request, &authority, master, kernel) {
-            Ok(qualified) => qualified,
-            Err(reason) => {
-                drop(table);
-                drop(meta);
-                drop(account_guard);
-                drop(_asked_account_guard);
-                aterm_log::debug!("asked native admission refused stage={reason}");
-                return DENIED.into();
-            }
-        };
+        let qualified =
+            match table.qualify_asked(ctx, &request, &authority, master, kernel, registered) {
+                Ok(qualified) => qualified,
+                Err(reason) => {
+                    drop(table);
+                    drop(meta);
+                    drop(account_guard);
+                    drop(_asked_account_guard);
+                    aterm_log::debug!("asked native admission refused stage={reason}");
+                    return DENIED.into();
+                }
+            };
         authority.asked = Some(qualified);
     }
     let continuation = authority.continuation().cloned();
@@ -2894,6 +3028,7 @@ fn prepare_inner(
         cold_facts: None,
         cold_resolving: false,
         resolved_cold: None,
+        readmitted: [None, None],
     }));
     if !slot.publish(&mut table, Arc::clone(&operation)) {
         drop(table);
@@ -3125,24 +3260,28 @@ fn completed_reply(operation: &Arc<Mutex<Operation>>) -> String {
     let drain = op.completion_drain.clone();
     let observation = op.completed_observation.clone();
     let cold = matches!(op.request.plan, NativePlan::Restart { cold: Some(_), .. });
-    let account_intent = cold
-        .then(|| {
-            op.resolved_cold
-                .as_ref()
-                .and_then(|resolved| resolved.command.account_intent.as_deref())
-                .cloned()
-        })
-        .flatten();
+    // The account intent the committed exec was admitted for, where the harness's record does
+    // not already hold it: a cold restart's helper resolved it; a warm one's Execute readmitted
+    // its stored login's new credential generation in place of its command's.
+    let account_intent = if cold {
+        op.resolved_cold
+            .as_ref()
+            .and_then(|resolved| resolved.command.account_intent.as_deref())
+            .cloned()
+    } else {
+        op.resume_phase
+            .and_then(|phase| op.readmitted[phase_index(phase)].clone())
+    };
     drop(op);
     if drain.is_some_and(|drain| !drain.is_drained()) {
         return UNKNOWN.into();
     }
     match phase {
         Phase::Completed(Decision::Committed) => {
-            if cold {
-                let Some(intent) = account_intent else {
-                    return UNKNOWN.into();
-                };
+            if cold && account_intent.is_none() {
+                return UNKNOWN.into();
+            }
+            if let Some(intent) = account_intent {
                 let Ok(encoded_intent) = aterm_json::to_string(&intent.to_value()) else {
                     return UNKNOWN.into();
                 };
@@ -3575,17 +3714,19 @@ fn serve_launcher_step(
     } else {
         None
     };
-    let _account_guard = match account_command
+    // Execute readmits: the replaced agent is gone and no plan can be made again, so a stored
+    // login whose credential generation alone moved since the plan is admitted as captured
+    // afresh, recorded beside the unchanged command when its exec is granted.
+    let (_account_guard, readmitted) = match account_command
         .as_ref()
         .map(|(command, facts)| {
-            caller
-                .peer
-                .ok_or(())
-                .and_then(|pid| kernel.account_execution(command, pid, facts.as_ref()))
+            caller.peer.ok_or(()).and_then(|pid| {
+                kernel.account_execution(command, pid, facts.as_ref(), AccountAt::Execute)
+            })
         })
         .transpose()
     {
-        Ok(guard) => guard,
+        Ok(admitted) => admitted.unwrap_or((None, None)),
         Err(()) => return DENIED.into(),
     };
     let checked_cold = retained_cold.map(|resolved| {
@@ -3743,12 +3884,16 @@ fn serve_launcher_step(
             let resolution =
                 kernel
                     .resolve_cold(ctx, &intent, &seed, facts)
-                    .ok()
-                    .filter(|(command, proof)| {
-                        seed.cold_resolution_agrees(command)
-                            && command.encode().is_some()
-                            && kernel.image(&command.image)
-                            && kernel.cold_current(proof.as_ref())
+                    .and_then(|(command, proof)| {
+                        if !seed.cold_resolution_agrees(&command) || command.encode().is_none() {
+                            Err("its resolved command is not the plan's".to_string())
+                        } else if !kernel.image(&command.image) {
+                            Err("its program's image changed".to_string())
+                        } else if !kernel.cold_current(proof.as_ref()) {
+                            Err("its resolution went stale while it was made".to_string())
+                        } else {
+                            Ok((command, proof))
+                        }
                     });
             let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
@@ -3766,8 +3911,18 @@ fn serve_launcher_step(
             {
                 return DENIED.into();
             }
-            let Some((command, proof)) = resolution else {
-                return DENIED.into();
+            let (command, proof) = match resolution {
+                Ok(resolved) => resolved,
+                Err(why) => {
+                    // The launcher hears only the denial; the reason is the host's, recorded
+                    // once for this helper (a refused Resolve cannot select again).
+                    aterm_log::info!(
+                        "native restart @{}: the cold launch's account resolution was refused: \
+                         {why}",
+                        ctx.self_id
+                    );
+                    return DENIED.into();
+                }
             };
             let reply = resolved_reply(&command, op.request.deadline_us);
             op.resolved_cold = Some(Arc::new(ResolvedCold {
@@ -3845,6 +4000,14 @@ fn serve_launcher_step(
                 return DENIED.into();
             }
             op.children[index].as_mut().unwrap().execute_sent = true;
+            if readmitted.is_some() {
+                aterm_log::info!(
+                    "native restart @{}: Execute admitted its stored login's new credential \
+                     generation in place of its command's",
+                    ctx.self_id
+                );
+                op.readmitted[index] = readmitted;
+            }
             op.effect_started
                 .store(true, std::sync::atomic::Ordering::Release);
             format!(
@@ -5137,6 +5300,11 @@ fn serve_request(
         } else {
             DENIED.into()
         },
+        Request::Succession(predecessor) => return if caller.principal == crate::control::Principal::Harness {
+            asked_upgrade::succession_reply(ctx, master, kernel, predecessor.as_deref())
+        } else {
+            DENIED.into()
+        },
         Request::Prepare(request) => return prepare(ctx, master, *request, caller, kernel),
         Request::CancelSupport => return "OK native-act state=cancel-support cancel-prepare=1\n".into(),
         Request::RecipientWriterSupport => return format!("OK native-act state=recipient-writer-support writer={}\n", RECIPIENT_WRITER_SUPPORT.word()),
@@ -5147,6 +5315,7 @@ fn serve_request(
         Request::Info
         | Request::Constructors
         | Request::RejectionDomain
+        | Request::Succession(_)
         | Request::Prepare(_)
         | Request::CancelSupport
         | Request::RecipientWriterSupport
@@ -5240,10 +5409,10 @@ fn serve_request(
     // signals recheck canonical execution before taking Meta/operation predicates.
     let _asked_account_guard = match asked_signal
         .as_ref()
-        .map(|(command, pid)| kernel.account_execution(command, *pid, None))
+        .map(|(command, pid)| kernel.account_execution(command, *pid, None, AccountAt::Signal))
         .transpose()
     {
-        Ok(guard) => guard,
+        Ok(admitted) => admitted.and_then(|(guard, _)| guard),
         Err(()) => return DENIED.into(),
     };
     // Retry disposal is deferred beyond both predicates, including early refusal paths.
@@ -5358,7 +5527,7 @@ fn serve_request(
                 completed_reply(&operation)
             }
             Phase::Started
-                if matches!(op.request.asked, Some(AskedIntent::Relaunch(_)))
+                if op.request.checked_relaunch()
                     && op.signal_sent
                     && op.signal_accepted == Some(true) =>
             {
@@ -5695,7 +5864,7 @@ fn serve_request(
             {
                 return DENIED.into();
             }
-            if matches!(op.request.asked, Some(AskedIntent::Relaunch(_)))
+            if op.request.checked_relaunch()
                 && op
                     .authority
                     .asked
@@ -5875,6 +6044,7 @@ fn serve_request(
         Request::Info
         | Request::Constructors
         | Request::RejectionDomain
+        | Request::Succession(_)
         | Request::Prepare(_)
         | Request::CancelSupport
         | Request::RecipientWriterSupport

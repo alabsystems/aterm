@@ -177,7 +177,8 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use aterm_db::typed::grid::{Base, Seen};
@@ -199,8 +200,10 @@ use crate::native_workers::{one_line, text_width};
 mod claims;
 #[path = "native_tables_history.rs"]
 mod history;
+pub(crate) use history::registry::{Asked, Opened, Paged};
+#[cfg(unix)]
 pub(crate) use history::registry::{
-    Asked, Logged, LoggedCell, Opened, OpenedCell, Paged, SCAN, Valued, place_words, words_of,
+    Logged, LoggedCell, OpenedCell, SCAN, Valued, place_words, words_of,
 };
 #[path = "native_tables_columns.rs"]
 mod native_tables_columns;
@@ -255,8 +258,9 @@ impl Group {
 
 /// Who wrote an operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// What kind of write an operation is, as `aterm-db` decides it (`aterm_db::att::EntryKind`):
-/// the record does not say who typed an explicit write, a person or a program at that Mac.
+/// What kind of write an operation is, as `aterm-db` decides it (`aterm_db::att::EntryKind`).
+/// Who typed an explicit write, a person or a program at that Mac, is said only by a version 2
+/// record ([`Author::said`]).
 pub(crate) enum AuthorKind {
     Explicit,
     Aterm,
@@ -278,6 +282,9 @@ pub(crate) struct Author {
     /// The operation's place in the causal order: the latest claim among it and everything it
     /// saw, and a count that steps past ancestors with that same claim (`Handle::history`'s hlc).
     pub(crate) hlc: (u64, u64),
+    /// Who made the change, why and on what evidence, where its record says (a version 2
+    /// record, `aterm_db::att::Entry::said`): the signing Mac's statement.
+    pub(crate) said: Option<aterm_db::said::Said>,
 }
 
 impl Author {
@@ -303,14 +310,56 @@ impl Author {
 }
 
 impl Author {
-    /// `m73`, `aterm · m73`, `import · m73`; the short id in a label's place where none is known.
+    /// `m73`, `aterm · m73`, `import · m73`, `claude · m73` where the record names who made it
+    /// (its program, else what it said of itself; [`Self::statement`] has the whole principal);
+    /// the short id in a label's place where none is known.
     pub(crate) fn who(&self) -> String {
         let name = self.label.as_deref().unwrap_or(&self.id);
-        match self.kind {
-            AuthorKind::Import => format!("import \u{b7} {name}"),
-            AuthorKind::Aterm => format!("aterm \u{b7} {name}"),
-            AuthorKind::Explicit => name.to_owned(),
+        match (self.kind, self.principal()) {
+            (AuthorKind::Import, _) => format!("import \u{b7} {name}"),
+            (AuthorKind::Aterm, _) => format!("aterm \u{b7} {name}"),
+            (AuthorKind::Explicit, Some(by)) => format!("{by} \u{b7} {name}"),
+            (AuthorKind::Explicit, None) => name.to_owned(),
         }
+    }
+
+    /// Who the record says made the change, in a word (`claude`, `person`), where it says: its
+    /// program, else, outside every aterm session, what it said of itself. In a session aterm
+    /// read no program of (who acted there is unknown), the writer's own word is no attested
+    /// name: only the `By:` line ([`Self::statement`]) shows it, beside the session.
+    fn principal(&self) -> Option<String> {
+        let principal = &self.said.as_ref()?.principal;
+        principal
+            .program
+            .clone()
+            .or_else(|| {
+                principal
+                    .session
+                    .is_none()
+                    .then(|| principal.said.clone())
+                    .flatten()
+            })
+            .filter(|who| !who.is_empty())
+    }
+
+    /// The lines a history entry adds under its writer, where the record gives them: `By: …`,
+    /// the whole principal (`claude s-4705…`), `Why: …` and one `Evidence: …` per piece.
+    fn statement(&self) -> Vec<String> {
+        let Some(said) = &self.said else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        let who = said.who();
+        if !who.is_empty() {
+            lines.push(format!("By: {who}"));
+        }
+        if let Some(reason) = &said.reason {
+            lines.push(format!("Why: {reason}"));
+        }
+        for piece in &said.evidence {
+            lines.push(format!("Evidence: {}", piece.spell()));
+        }
+        lines
     }
 
     /// How the writer's words are set: as `known` is where its Mac's label is known; where only
@@ -539,6 +588,12 @@ pub(crate) struct Snapshot {
     /// (`aterm_db::att::Handle::cannot_write`): the page then takes no edit, and the Write bar's
     /// place says this.
     pub(crate) cannot_write: Option<String>,
+    /// What the table read holds and does not project, in aterm-db's one sentence for it
+    /// (`aterm_db::typed::View::refused_words`: how many, whose and why), where it holds any;
+    /// with it each family after the first that could not be read, or written, here, and why
+    /// ([`crate::tables_store::read`]): the page says it under its header. The read is complete
+    /// all the same, and the page writes as it would.
+    pub(crate) refused: Option<String>,
     /// The rows a reference may name, by collection: what a reference cell shows and chooses
     /// from ([`rows::Targets`]).
     pub(crate) targets: rows::Targets,
@@ -546,6 +601,14 @@ pub(crate) struct Snapshot {
 
 /// One collection's staged cells and the export they were staged against.
 pub(crate) struct Staged {
+    /// The sheet they were staged on, which what the Write did names its table by.
+    pub(crate) sheet: &'static str,
+    /// The generation the sheet was read from: the save is its family's.
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the table store of macOS and Linux saves")
+    )]
+    pub(crate) compiled: &'static crate::tables_store::Compiled,
     pub(crate) base: Base,
     pub(crate) cells: BTreeMap<(String, String), String>,
     /// Its new rows, each by the key the page gives it until it is written ([`rows::NEW`]) with
@@ -585,6 +648,11 @@ enum Work {
 }
 
 pub(crate) enum Reply {
+    /// One fully projected sheet from the first read. The terminal read decides when it is writable.
+    Opening {
+        sheet: Box<Sheet>,
+        targets: rows::Targets,
+    },
     /// A read, and whether it answers a move to another point ([`Work::At`]).
     Read {
         read: Result<Snapshot, String>,
@@ -644,10 +712,28 @@ fn next_work(
 /// A staged cell's address: collection, row, column.
 type At = (String, String, String);
 
+/// One change check of the page's reader, as a test reads it ([`TablesApp::checks`]): the
+/// registry's revision the reader's kept sighting was of as the check was asked (`held`) and
+/// once it answered (`kept`), and the revision of the History the reader then kept (`history`).
+/// A check asked with `held` the registry's revision is the one that opens no store
+/// (`aterm_db::att::Handle::revision_kept`).
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Check {
+    pub(crate) held: Option<[u8; 32]>,
+    pub(crate) kept: Option<[u8; 32]>,
+    pub(crate) history: Option<[u8; 32]>,
+}
+
 pub(crate) struct TablesApp {
     work: mpsc::Sender<Work>,
     replies: mpsc::Receiver<Reply>,
     snapshot: Option<Snapshot>,
+    opening_sheets: BTreeMap<&'static str, Sheet>,
+    opening_targets: rows::Targets,
+    opening_wake: Arc<AtomicBool>,
+    wanted: Arc<Mutex<&'static str>>,
+    initial_collections: Vec<crate::tables_store::Listed>,
     /// Why the last read found nothing, while no read has.
     unread: Option<String>,
     writing: bool,
@@ -669,9 +755,13 @@ pub(crate) struct TablesApp {
     /// Each staged label another row claims, as the read settles it once written ([`claims`]),
     /// worked out with `checked`.
     claimed: BTreeMap<At, claims::Claimed>,
-    /// Moves to another point asked for that have not answered: the page takes no edit until
-    /// the last of them has, since each answer may land it on a past table.
+    /// Point reads queued on the worker, including explicit refreshes at the current head.
     asked: usize,
+    /// How many of those FIFO replies must arrive before every requested time change is
+    /// settled. Requests after that one only refresh the head; other views can keep editing.
+    moving: usize,
+    /// Whether the last requested point failed to read, leaving its previous snapshot in place.
+    move_failed: bool,
     /// Whether the reader was last told a view of the page is shown.
     shown: bool,
     /// How many reads the page has taken: a view works its rows' order out once for each
@@ -680,6 +770,9 @@ pub(crate) struct TablesApp {
     /// Whether a view shows Check: the reader works check out only while one does
     /// ([`crate::native_tables_check`]).
     checking: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Each change check the reader has made since a test last took them, in order.
+    #[cfg(all(test, unix))]
+    checks: std::sync::Arc<std::sync::Mutex<Vec<Check>>>,
     /// The new rows not written, by sheet, each under the key the page gives it ([`rows::NEW`]),
     /// in the order they were added: each read shows them under its sheet's rows.
     born: Vec<(&'static str, String)>,
@@ -702,15 +795,17 @@ impl TablesApp {
     /// The thread cannot start.
     pub(crate) fn new(
         paths: Option<crate::tables_store::Paths>,
+        families: &'static [&'static crate::tables_store::Compiled],
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self, String> {
-        Self::paced(paths, wake, Some(READ_AGAIN))
+        Self::paced(paths, families, wake, Some(READ_AGAIN))
     }
 
     /// [`Self::new`] whose shown reader asks again every `again`, or only when asked where
     /// `None` (a test pairing each ask with its answer).
     fn paced(
         paths: Option<crate::tables_store::Paths>,
+        families: &'static [&'static crate::tables_store::Compiled],
         wake: impl Fn() + Send + 'static,
         again: Option<Duration>,
     ) -> Result<Self, String> {
@@ -718,6 +813,17 @@ impl TablesApp {
         let (reply_tx, reply_rx) = mpsc::channel();
         let checking = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let check = checking.clone();
+        let initial_collections = crate::tables_store::initial_collections(families);
+        let wanted = Arc::new(Mutex::new(
+            initial_collections.first().map_or("", |entry| entry.name),
+        ));
+        let reader_wanted = Arc::downgrade(&wanted);
+        let opening_wake = Arc::new(AtomicBool::new(false));
+        let wake_pending = Arc::clone(&opening_wake);
+        #[cfg(all(test, unix))]
+        let checks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        #[cfg(all(test, unix))]
+        let checked = checks.clone();
         crate::qos::spawn_lane_thread("aterm-tables", crate::qos::Role::Background, move || {
             let paths = match paths {
                 Some(paths) => Ok(paths),
@@ -728,11 +834,15 @@ impl TablesApp {
             // What the last read at `point` rested on (the registry's mark and whether it worked
             // check out); `None` until a read succeeds there.
             let mut read_at = None;
+            let mut first_read = true;
             let mut shown = true;
             // The asks taken off the channel to look behind one, not yet done.
             let mut queued = std::collections::VecDeque::new();
-            // History's order at the registry's revision, kept from one of its reads to the
-            // next: Read older and a filter changed at that revision read no record again.
+            // What this reader keeps of the registry from one read to the next: History's order
+            // at the registry's revision (Read older and a filter changed at that revision read
+            // no record again), and what its last open read of the registry's files, which the
+            // mark below and History's pages both ask to learn the registry unmoved without
+            // opening it. Until History is read it holds no record.
             let mut kept = crate::tables_store::Kept::default();
             loop {
                 // A hidden page's reader asks nothing until a view of it is shown again.
@@ -774,7 +884,7 @@ impl TablesApp {
                 // record, whatever point the tables are read at.
                 let work = match work {
                     Work::History(asked) => {
-                        let read = crate::tables_store::history(paths, &asked, &mut kept);
+                        let read = crate::tables_store::history(paths, families, &asked, &mut kept);
                         let reply = Reply::History {
                             seq: asked.seq,
                             read,
@@ -786,7 +896,7 @@ impl TablesApp {
                         continue;
                     }
                     Work::Record(operation) => {
-                        let read = crate::tables_store::record(paths, operation);
+                        let read = crate::tables_store::record(paths, families, operation);
                         if reply_tx.send(Reply::Record { operation, read }).is_err() {
                             return;
                         }
@@ -798,6 +908,7 @@ impl TablesApp {
                 let mut at = point;
                 let moved = matches!(work, Work::At(_));
                 let again = matches!(work, Work::Read | Work::Shown(_));
+                let opening = first_read && again;
                 match work {
                     Work::Write(staged) => {
                         let wrote = crate::tables_store::write(paths, staged);
@@ -811,11 +922,28 @@ impl TablesApp {
                 let checking = check.load(std::sync::atomic::Ordering::Relaxed);
                 // Asked before the read, so a write landing during it moves the next mark. A
                 // read rests on the mark and on whether it worked check out: Check shown on an
-                // unmoved registry still reads, so its findings are worked out.
-                let rests = crate::tables_store::mark(paths)
+                // unmoved registry still reads, so its findings are worked out. One that worked
+                // check out rests on this Mac's hearing ledger too, which Check's sentences on
+                // the registry's checkpoints are judged by and no record of the registry moves.
+                #[cfg(all(test, unix))]
+                let held = kept.sighted().map(|revision| revision.0);
+                let rests = crate::tables_store::mark(paths, families, &mut kept)
                     .ok()
-                    .map(|mark| (mark, checking));
-                let revision = rests.as_ref().map(|(mark, _)| mark.digest());
+                    .map(|mark| {
+                        let heard = checking
+                            .then(|| crate::tables_store::fence_mark(paths))
+                            .flatten();
+                        (mark, checking, heard)
+                    });
+                #[cfg(all(test, unix))]
+                if let Ok(mut checked) = checked.lock() {
+                    checked.push(Check {
+                        held,
+                        kept: kept.sighted().map(|revision| revision.0),
+                        history: kept.revision().map(|revision| revision.0),
+                    });
+                }
+                let revision = rests.as_ref().map(|(mark, ..)| mark.digest());
                 if again && rests.is_some() && rests == read_at {
                     let now = aterm_time::unix_millis().unwrap_or(0);
                     if reply_tx.send(Reply::Unchanged(now)).is_err() {
@@ -824,8 +952,37 @@ impl TablesApp {
                     wake();
                     continue;
                 }
-                let read = match crate::tables_store::read(paths, at, checking) {
+                let result = if opening && at.is_none() && !checking {
+                    let wanted = || {
+                        reader_wanted.upgrade().map(|wanted| {
+                            *wanted
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        })
+                    };
+                    let mut publish = |sheet, targets| {
+                        if reply_tx
+                            .send(Reply::Opening {
+                                sheet: Box::new(sheet),
+                                targets,
+                            })
+                            .is_ok()
+                            && !wake_pending.swap(true, Ordering::AcqRel)
+                        {
+                            wake();
+                        }
+                    };
+                    let mut opening = crate::tables_store::Opening {
+                        wanted: &wanted,
+                        publish: &mut publish,
+                    };
+                    crate::tables_store::read_opening(paths, families, &mut opening)
+                } else {
+                    crate::tables_store::read(paths, families, at, checking)
+                };
+                let read = match result {
                     Ok((snapshot, whole)) => {
+                        first_read = false;
                         point = at;
                         // A read that showed a mask in place of a number it could not open yet
                         // is read again, since that number may open with the registry unmoved.
@@ -853,6 +1010,11 @@ impl TablesApp {
             work: work_tx,
             replies: reply_rx,
             snapshot: None,
+            opening_sheets: BTreeMap::new(),
+            opening_targets: rows::Targets::new(),
+            opening_wake,
+            initial_collections,
+            wanted,
             unread: None,
             writing: false,
             note: None,
@@ -864,9 +1026,13 @@ impl TablesApp {
             checked_of: None,
             claimed: BTreeMap::new(),
             asked: 0,
+            moving: 0,
+            move_failed: false,
             shown: true,
             reads: 0,
             checking,
+            #[cfg(all(test, unix))]
+            checks,
             born: Vec::new(),
             born_count: 0,
             sent_born: Vec::new(),
@@ -888,6 +1054,8 @@ impl TablesApp {
 
     /// Take every answer the reader sent; whether the page changed.
     pub(crate) fn poll(&mut self) -> bool {
+        // Re-arm before draining. A concurrent delivery is either drained now or wakes us again.
+        self.opening_wake.store(false, Ordering::Release);
         let mut changed = false;
         while let Ok(reply) = self.replies.try_recv() {
             self.take(reply);
@@ -896,19 +1064,42 @@ impl TablesApp {
         changed
     }
 
-    /// Wait up to a minute for the reader's next answer and take it: a test's hang detector.
+    /// Take the reader's next terminal answer, applying any opening sheets along the way.
     #[cfg(all(test, unix))]
     pub(crate) fn settle(&mut self) {
-        let reply = self
-            .replies
-            .recv_timeout(Duration::from_secs(60))
-            .expect("the Tables reader answers within a minute");
-        self.take(reply);
+        loop {
+            let reply = self
+                .replies
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the Tables reader answers within a minute");
+            let opening = matches!(reply, Reply::Opening { .. });
+            self.take(reply);
+            if !opening {
+                return;
+            }
+        }
+    }
+
+    /// The change checks the reader made since this was last asked, in order. Each is recorded
+    /// before its answer is sent, so the checks of every answer taken are here.
+    #[cfg(all(test, unix))]
+    pub(crate) fn checks(&self) -> Vec<Check> {
+        self.checks
+            .lock()
+            .map(|mut checks| std::mem::take(&mut *checks))
+            .unwrap_or_default()
     }
 
     /// Take answers until the Write's and the read after it: a test's hang detector.
     #[cfg(all(test, unix))]
     pub(crate) fn settle_write(&mut self) {
+        // A reader that reads again on its own answers forever: with no Write out, no answer
+        // ends the wait.
+        assert!(
+            self.writing,
+            "a Write is out: {}",
+            self.note.as_deref().unwrap_or("nothing was sent")
+        );
         let mut wrote = false;
         loop {
             let reply = self
@@ -939,16 +1130,35 @@ impl TablesApp {
 
     fn take(&mut self, reply: Reply) {
         match reply {
+            Reply::Opening { sheet, targets } => {
+                if self.snapshot.is_none() {
+                    self.opening_targets.extend(targets);
+                    self.opening_sheets.insert(sheet.name, *sheet);
+                    self.unread = None;
+                }
+            }
             Reply::Read {
-                read: Ok(snapshot),
+                read: Ok(mut snapshot),
                 moved,
                 revision,
             } => {
+                if !self.opening_sheets.is_empty() {
+                    let mut sheets = std::mem::take(&mut self.opening_sheets);
+                    sheets.extend(snapshot.sheets.drain(..).map(|sheet| (sheet.name, sheet)));
+                    snapshot.sheets = snapshot
+                        .listed
+                        .iter()
+                        .filter_map(|entry| sheets.remove(entry.name))
+                        .collect();
+                }
+                self.opening_targets.clear();
                 self.snapshot = Some(snapshot);
                 self.unread = None;
                 self.reads = self.reads.wrapping_add(1);
                 if moved {
                     self.asked = self.asked.saturating_sub(1);
+                    self.moving = self.moving.saturating_sub(1);
+                    self.move_failed = false;
                 }
                 self.show_born();
                 self.drop_stranded();
@@ -965,8 +1175,15 @@ impl TablesApp {
                 moved,
                 ..
             } => {
+                if !self.opening_sheets.is_empty() {
+                    self.reads = self.reads.wrapping_add(1);
+                }
+                self.opening_sheets.clear();
+                self.opening_targets.clear();
                 if moved {
                     self.asked = self.asked.saturating_sub(1);
+                    self.moving = self.moving.saturating_sub(1);
+                    self.move_failed = true;
                 }
                 if self.snapshot.is_none() {
                     self.unread = Some(why);
@@ -1116,13 +1333,16 @@ impl TablesApp {
     /// Whether the page may move to another point: nothing staged, added or being written, which
     /// a past table could not take.
     fn movable(&self) -> bool {
-        self.staged.is_empty() && self.born.is_empty() && !self.writing
+        self.snapshot.is_some() && self.staged.is_empty() && self.born.is_empty() && !self.writing
     }
 
     /// Whether the page takes no edit: it shows a past point, or is moving to another one, or
     /// this Mac cannot write the registry ([`Self::cannot_write`]).
     fn fixed(&self) -> bool {
-        self.asked > 0 || self.as_of().is_some() || self.cannot_write().is_some()
+        self.snapshot.is_none()
+            || self.moving > 0
+            || self.as_of().is_some()
+            || self.cannot_write().is_some()
     }
 
     /// Why this Mac cannot write the registry, as the last read found it, where it cannot.
@@ -1132,22 +1352,57 @@ impl TablesApp {
             .and_then(|s| s.cannot_write.as_deref())
     }
 
+    /// What the last read holds and does not project ([`Snapshot::refused`]), where it holds any.
+    pub(crate) fn refused(&self) -> Option<&str> {
+        self.snapshot.as_ref().and_then(|s| s.refused.as_deref())
+    }
+
     /// Read the table as of `at` (as it is, where `None`); with cells not written, say why not.
     fn go(&mut self, at: Option<[u8; 32]>) {
+        if self.snapshot.is_none() {
+            return;
+        }
         if !self.movable() {
             self.note = Some("Write or discard the changes not written first".to_owned());
             return;
         }
-        if self.work.send(Work::At(at)).is_ok() {
-            self.asked += 1;
-            self.note = None;
+        if let Err(why) = self.ask_point(at, true) {
+            self.note = Some(why);
         }
     }
 
+    fn ask_point(&mut self, at: Option<[u8; 32]>, changes_point: bool) -> Result<(), String> {
+        self.work
+            .send(Work::At(at))
+            .map_err(|_| "The Tables reader is unavailable".to_owned())?;
+        self.asked += 1;
+        if changes_point {
+            self.moving = self.asked;
+        }
+        self.note = None;
+        Ok(())
+    }
+
     fn sheet(&self, name: &str) -> Option<&Sheet> {
+        match &self.snapshot {
+            Some(snapshot) => snapshot.sheets.iter().find(|sheet| sheet.name == name),
+            None => self.opening_sheets.get(name),
+        }
+    }
+
+    fn targets(&self) -> &rows::Targets {
         self.snapshot
             .as_ref()
-            .and_then(|s| s.sheets.iter().find(|sheet| sheet.name == name))
+            .map_or(&self.opening_targets, |snapshot| &snapshot.targets)
+    }
+
+    fn prioritize(&self, name: &'static str) {
+        if self.snapshot.is_none() {
+            *self
+                .wanted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
+        }
     }
 
     /// The sheet the last read holds of collection `name`.
@@ -1155,7 +1410,7 @@ impl TablesApp {
         self.sheet(name)
     }
 
-    /// The names of the rail's collections, as the last read listed them.
+    /// The names of the collections the rail offers.
     pub(crate) fn listed_names(&self) -> Vec<&'static str> {
         self.listed().iter().map(|listed| listed.name).collect()
     }
@@ -1166,6 +1421,7 @@ impl TablesApp {
             .iter()
             .find(|listed| listed.name == name)
             .map(|listed| listed.title)
+            .or_else(|| self.opening_sheets.get(name).map(|sheet| sheet.title))
     }
 
     /// The words row `pk` of collection `name` is known by, where the last read holds it: as a
@@ -1173,9 +1429,9 @@ impl TablesApp {
     /// pane names it ([`rows::row_name`]).
     pub(crate) fn row_words(&self, name: &str, pk: &str) -> Option<String> {
         let target = self
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.targets.get(name)?.rows.get(pk));
+            .targets()
+            .get(name)
+            .and_then(|named| named.rows.get(pk));
         if let Some(target) = target {
             return Some(target.short.clone());
         }
@@ -1206,20 +1462,33 @@ impl TablesApp {
         self.checked_read().and_then(|read| read.as_ref().ok())
     }
 
-    /// The rail's collections, as the last read listed them.
+    /// The active generation's collections once read. Until then, the schema alone supplies
+    /// the collections available in every generation on platforms that host the registry.
     fn listed(&self) -> &[crate::tables_store::Listed] {
-        self.snapshot.as_ref().map_or(&[], |s| s.listed.as_slice())
+        match &self.snapshot {
+            Some(snapshot) => &snapshot.listed,
+            None => &self.initial_collections,
+        }
     }
 
-    /// The sheet the view shows: the one it chose, else the first the rail lists that was read.
+    /// The selected collection, or the first one offered. Before the first read a selection
+    /// names the collection whose rows the view will show when they arrive.
     fn current(&self, view: &TablesViewState) -> Option<&'static str> {
-        if self.sheet(view.sheet).is_some() {
+        if self.snapshot.is_none()
+            && (self.opening_sheets.contains_key(view.sheet)
+                || view
+                    .pending_row
+                    .as_ref()
+                    .is_some_and(|row| row.sheet == view.sheet))
+        {
             return Some(view.sheet);
         }
-        self.listed()
+        let listed = self.listed();
+        listed
             .iter()
-            .map(|listed| listed.name)
-            .find(|name| self.sheet(name).is_some())
+            .find(|entry| entry.name == view.sheet)
+            .or_else(|| listed.first())
+            .map(|entry| entry.name)
     }
 
     /// The one rule for whether the page edits a cell: its column is the owner's and the grid
@@ -1417,10 +1686,16 @@ impl TablesApp {
             let Some(sheet) = snapshot.sheets.iter().find(|s| s.name == collection) else {
                 continue;
             };
-            let index = match staged.iter().position(|s| s.base.collection == *collection) {
+            // Only a cells sheet stages, and its read names the family its save is of.
+            let Some(schema) = &sheet.schema else {
+                continue;
+            };
+            let index = match staged.iter().position(|s| s.sheet == collection.as_str()) {
                 Some(index) => index,
                 None => {
                     staged.push(Staged {
+                        sheet: sheet.name,
+                        compiled: schema.compiled,
                         base: sheet.base.clone(),
                         cells: BTreeMap::new(),
                         born: Vec::new(),
@@ -1546,9 +1821,23 @@ struct Corner {
     order: u64,
 }
 
+struct PendingRow {
+    sheet: &'static str,
+    key: String,
+    column: Option<String>,
+    /// An external record route always names the current table.
+    current_record: bool,
+}
+
 pub(crate) struct TablesViewState {
     pub(crate) common: CommonViewState,
     sheet: &'static str,
+    /// A row to reveal when its sheet arrives on opening or after returning to the head.
+    pending_row: Option<PendingRow>,
+    /// Why a record requested before its read finished could not be shown.
+    missing_record: Option<String>,
+    /// This view navigated while the first read was still delivering its sheets.
+    opening_selection: bool,
     row: Option<String>,
     column: Option<String>,
     editing: Option<Editing>,
@@ -1619,6 +1908,9 @@ impl Default for TablesViewState {
             common: CommonViewState::default(),
             // None yet: the view shows the first sheet the rail lists until one is chosen.
             sheet: "",
+            pending_row: None,
+            missing_record: None,
+            opening_selection: false,
             row: None,
             column: None,
             editing: None,
@@ -2028,6 +2320,89 @@ impl TablesViewState {
         self.pane_focus(&keys[to]);
     }
 
+    /// Choose a collection and its controls just as a press on its rail entry would.
+    fn choose_sheet(&mut self, app: &mut TablesApp, name: &'static str) {
+        app.prioritize(name);
+        self.missing_record = None;
+        self.pending_row = None;
+        self.picking = false;
+        if self.check.open {
+            self.check.open = false;
+            app.check(false);
+        }
+        if self.sheet != name {
+            self.sheet = name;
+            self.anchor = None;
+            self.row = None;
+            self.column = None;
+            self.scroll.set(0.0);
+            self.across = 0.0;
+            self.pane_scroll = 0.0;
+            self.history.another_table();
+        }
+        self.rail_reveal(name);
+        self.rest_choice(&format!("{SHEET}{name}"));
+    }
+
+    /// The selected persisted row, including a record requested while its read is in flight.
+    pub(crate) fn row_route(&self) -> Option<String> {
+        let (sheet, key) = match &self.pending_row {
+            Some(next) => (next.sheet, next.key.as_str()),
+            None => (self.sheet, self.row.as_deref()?),
+        };
+        (!sheet.is_empty() && !rows::is_new(key)).then(|| format!("{sheet}/{key}"))
+    }
+
+    /// Open a stored row at the current head, preserving other staged edits. A historical
+    /// view waits for Now before selecting the row, since it may have been born since.
+    pub(crate) fn open_record(
+        &mut self,
+        app: &mut TablesApp,
+        sheet: &'static str,
+        key: &str,
+    ) -> Result<(), String> {
+        if key.is_empty() || rows::is_new(key) || key.chars().any(char::is_control) {
+            return Err("The record has no stored row key".into());
+        }
+        let moving = app.moving > 0 || app.as_of().is_some();
+        if let Some(why) = &app.unread {
+            return Err(why.clone());
+        }
+        let present = app
+            .sheet(sheet)
+            .is_some_and(|held| held.rows.iter().any(|row| row.pk == key));
+        // A hidden Tables tab may have read before the product. Even with unrelated edits
+        // staged, it can refresh at its current head before declaring a record absent.
+        let refresh_head = moving || (!present && app.snapshot.is_some());
+        if app.as_of().is_some() && !app.movable() {
+            return Err("Write or discard the changes not written before returning to Now".into());
+        }
+
+        // Leaving the current control stages its field and dismisses its menus.
+        app.act(self, AppEvent::FocusChanged(None));
+        self.choose_sheet(app, sheet);
+        self.history.choosing = None;
+        self.opening_selection |= app.snapshot.is_none();
+        if refresh_head {
+            app.ask_point(None, moving)?;
+        }
+        if !refresh_head && present {
+            self.show_row(app, sheet, key, None);
+        } else {
+            self.row = None;
+            self.column = None;
+            self.anchor = None;
+            self.opening_selection = true;
+            self.pending_row = Some(PendingRow {
+                sheet,
+                key: key.to_owned(),
+                column: None,
+                current_record: true,
+            });
+        }
+        Ok(())
+    }
+
     /// Show row `pk` of sheet `name` selected, at `column` where the sheet shows that column and
     /// else at its key column: the table chosen as the rail chooses it, and each of the find, the
     /// lifecycle filter and the filters on the columns' values giving way only where it leaves
@@ -2041,6 +2416,7 @@ impl TablesViewState {
         pk: &str,
         column: Option<&str>,
     ) {
+        self.pending_row = None;
         self.picking = false;
         let moved = self.sheet != name;
         if moved {
@@ -2049,6 +2425,20 @@ impl TablesViewState {
             self.scroll.set(0.0);
         }
         let Some(sheet) = app.sheet(name) else {
+            if app.snapshot.is_none() && app.unread.is_none() {
+                app.prioritize(name);
+                self.pending_row = Some(PendingRow {
+                    sheet: name,
+                    key: pk.to_owned(),
+                    column: column.map(str::to_owned),
+                    current_record: false,
+                });
+                self.row = None;
+                self.column = None;
+                self.across = 0.0;
+                self.rail_reveal(name);
+                self.rest_choice(&format!("{SHEET}{name}"));
+            }
             return;
         };
         let column = column
@@ -2082,6 +2472,59 @@ impl TablesViewState {
         }
         self.pane_scroll = 0.0;
         self.rail_reveal(name);
+    }
+
+    /// Follow a pending reference as its sheet arrives. A failed read or omitted family
+    /// leaves the keys on the rail instead of a cell that has disappeared.
+    pub(crate) fn settle_opening(&mut self, app: &TablesApp) {
+        if !self.opening_selection {
+            return;
+        }
+        if self
+            .pending_row
+            .as_ref()
+            .is_some_and(|next| next.current_record)
+            && app.asked > 0
+        {
+            return;
+        }
+        let finished = app.snapshot.is_some() || app.unread.is_some();
+        if finished {
+            self.opening_selection = false;
+        }
+        if self
+            .pending_row
+            .as_ref()
+            .is_some_and(|next| finished || app.sheet(next.sheet).is_some())
+            && let Some(next) = self.pending_row.take()
+            && self.sheet == next.sheet
+        {
+            let sheet = app.sheet(next.sheet);
+            if next.current_record && (app.as_of().is_some() || app.move_failed) {
+                self.missing_record = Some(
+                    app.note
+                        .clone()
+                        .unwrap_or_else(|| "Could not read the current table".into()),
+                );
+            } else if sheet.is_some_and(|s| s.rows.iter().any(|r| r.pk == next.key)) {
+                self.show_row(app, next.sheet, &next.key, next.column.as_deref());
+            } else if next.current_record && app.unread.is_none() {
+                self.missing_record = Some(match sheet {
+                    Some(s) => format!("Row {} is absent from {}", next.key, s.title),
+                    None => format!("Table {} is unavailable", next.sheet),
+                });
+            }
+        }
+        if finished && app.sheet(self.sheet).is_none() && !self.sheet.is_empty() {
+            self.row = None;
+            self.column = None;
+            self.anchor = None;
+            self.history.another_table();
+            self.sheet = app.current(self).unwrap_or("");
+            if !self.picking {
+                self.rest_choice(&format!("{SHEET}{}", self.sheet));
+            }
+        }
     }
 
     /// Close the open cell: stage what it holds unless `cancel` or it is what it opened with.
@@ -2144,7 +2587,9 @@ impl TablesViewState {
             .filter(|_| opens == Opens::List)
             .and_then(|c| match c.ty {
                 // A reference opens on the rows of its target, read by their words.
-                aterm_db::typed::Ty::Ref(to) => rows::choice(app, to, c.null, &seed),
+                aterm_db::typed::Ty::Ref(to) => {
+                    rows::choice(app, compiled.links.as_deref().unwrap_or(to), c.null, &seed)
+                }
                 _ => Choice::of(c, &seed),
             });
         // The field shows the marked choice as it reads: a row by its words, not its key.
@@ -2205,6 +2650,8 @@ impl TablesViewState {
     }
 
     fn select(&mut self, pk: &str, column: &str) {
+        self.pending_row = None;
+        self.missing_record = None;
         self.anchor = None;
         self.row = Some(pk.to_owned());
         self.column = Some(column.to_owned());
@@ -2602,35 +3049,22 @@ fn ordered(sheet: &Sheet) -> Vec<&SheetColumn> {
 }
 
 fn edit(input: &mut TextInputState, event: TextInputEvent) {
-    match event {
-        TextInputEvent::Preedit { text, selection } => input.set_preedit(text, selection),
-        TextInputEvent::Commit(text) => input.commit_preedit(&text),
-        TextInputEvent::Backspace => input.delete_backward(),
-        TextInputEvent::Delete => input.delete_forward(),
-        TextInputEvent::Left { extend } => input.move_left(extend),
-        TextInputEvent::Right { extend } => input.move_right(extend),
-        TextInputEvent::Home { extend } => input.move_to_start(extend),
-        TextInputEvent::End { extend } => input.move_to_end(extend),
-        TextInputEvent::WordLeft { extend } => input.move_word_left(extend),
-        TextInputEvent::WordRight { extend } => input.move_word_right(extend),
-        TextInputEvent::KillToEnd => input.kill_to_end(),
-        TextInputEvent::KillToStart => input.kill_to_start(),
-        TextInputEvent::DeleteWordBackward => input.delete_word_backward(),
-        TextInputEvent::DeleteWordForward => input.delete_word_forward(),
-        TextInputEvent::SelectAll => input.select_all(),
-        TextInputEvent::Undo => {
-            input.undo();
-        }
-        TextInputEvent::Redo => {
-            input.redo();
-        }
-        TextInputEvent::Submit | TextInputEvent::Cancel => input.cancel_preedit(),
-    }
+    event.edit(input);
 }
 
 impl TablesApp {
     /// The page's reducer, apart from the runtime's bookkeeping.
     fn act(&mut self, view: &mut TablesViewState, event: AppEvent) -> bool {
+        // A person's next command takes precedence over an external row reveal still waiting
+        // for its data. In particular Check, Find and the columns menu each own their focus.
+        if matches!(event, AppEvent::Action(_))
+            && view
+                .pending_row
+                .as_ref()
+                .is_some_and(|row| row.current_record)
+        {
+            view.pending_row = None;
+        }
         if let Some(done) = native_tables_filters::act(self, view, &event) {
             return done;
         }
@@ -2661,6 +3095,8 @@ impl TablesApp {
                     .and_then(|k| k.as_str().strip_prefix(CELL))
                     .and_then(|rest| rest.split_once('/'))
                 {
+                    view.pending_row = None;
+                    view.missing_record = None;
                     if (view.row.as_deref(), view.column.as_deref()) != (Some(pk), Some(column)) {
                         view.anchor = None;
                     }
@@ -2732,6 +3168,7 @@ impl TablesApp {
                 }
                 if key == PICKER {
                     view.close_edit(self, false);
+                    view.pending_row = None;
                     view.picking = !view.picking;
                     view.focus(PICKER);
                     return true;
@@ -2747,25 +3184,7 @@ impl TablesApp {
                         .map(|listed| listed.name)
                         .find(|listed| *listed == name)
                     {
-                        // A table chosen leaves Check and closes the picker.
-                        view.picking = false;
-                        if view.check.open {
-                            view.check.open = false;
-                            self.check(false);
-                        }
-                        if view.sheet != name {
-                            view.sheet = name;
-                            view.anchor = None;
-                            view.row = None;
-                            view.column = None;
-                            view.scroll.set(0.0);
-                            view.across = 0.0;
-                            view.pane_scroll = 0.0;
-                            view.history.another_table();
-                        }
-                        // The chosen table's line stays in the rail's view.
-                        view.rail_reveal(name);
-                        view.rest_choice(&key);
+                        view.choose_sheet(self, name);
                     }
                     return true;
                 }
@@ -3439,11 +3858,16 @@ impl NativeAppModel for TablesApp {
         event: AppEvent,
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
-        if let Some(shown) = self.current(view) {
+        if view.pending_row.is_none()
+            && let Some(shown) = self.current(view)
+        {
             view.sheet = shown;
         }
         let open = (view.columns.open, view.filters.is_open());
         let acted = self.act(view, event);
+        if self.snapshot.is_none() {
+            view.opening_selection = true;
+        }
         // The selection moves off a column no longer drawn, first, since the drawer's Cell scope
         // lists the selected cell's lines; then the keys off a line of a column's values the
         // list no longer offers, and last off a drawer line the next layout does not lay out.
@@ -3856,9 +4280,11 @@ const fn rail_group(face: aterm_db::typed::Face) -> &'static str {
     }
 }
 
-/// The rail: every collection the last read listed, under the heading of its group
-/// ([`rail_group`]), each with its rows and the cells of it not yet written, in a list that
-/// scrolls where the window is too short for it; when it was read stays at its foot.
+/// The rail: every collection the last read listed, under the title of its table family where
+/// it lists more than one (one family's title says nothing the page does not), and in its
+/// family under the heading of its group ([`rail_group`]), each with its rows and the cells of
+/// it not yet written, in a list that scrolls where the window is too short for it; when it was
+/// read stays at its foot.
 #[expect(clippy::too_many_lines, reason = "one rail, laid out in one pass")]
 fn rail(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiNode {
     let line = 26.0 * scale().max(1.0);
@@ -3869,35 +4295,82 @@ fn rail(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiN
     let mut tall = 0.0_f32;
     let mut spans = Vec::new();
     let step = |tall: &mut f32, h: f32| *tall += h + 2.0;
-    let mut heading: Option<&str> = None;
-    // Each group's tables together, in the order the read listed them.
-    let listed = ["STORED", "SET BY ATERM", "REFERENCE"]
-        .into_iter()
-        .flat_map(|word| {
-            app.listed()
-                .iter()
-                .filter(move |listed| rail_group(listed.face) == word)
-        });
+    let mut heading: Option<(&str, &str)> = None;
+    // The families in the order the read listed them: the first's group headings keep their
+    // own keys, a later family's are keyed under its title.
+    let mut families: Vec<&'static str> = Vec::new();
+    for listed in app.listed() {
+        if !families.contains(&listed.family) {
+            families.push(listed.family);
+        }
+    }
+    let titled = families.len() > 1;
+    let first = families.first().copied();
+    // Each family's tables together, and in it each group's, in the order the read listed them.
+    let listed = families.iter().flat_map(|family| {
+        ["STORED", "SET BY ATERM", "REFERENCE"]
+            .into_iter()
+            .flat_map(move |word| {
+                app.listed().iter().filter(move |listed| {
+                    listed.family == *family && rail_group(listed.face) == word
+                })
+            })
+    });
     for listed in listed {
         let name = listed.name;
         let title = listed.title;
         let group_word = rail_group(listed.face);
-        if heading != Some(group_word) {
+        let family_key = if Some(listed.family) == first {
+            String::new()
+        } else {
+            format!("{}/", crate::native_ui::key_word(listed.family))
+        };
+        if titled && heading.is_none_or(|(family, _)| family != listed.family) {
             if heading.is_some() {
                 children.push(
                     group(format!(
-                        "tables/rail/gap/{}",
+                        "tables/rail/gap/family/{}",
+                        crate::native_ui::key_word(listed.family)
+                    ))
+                    .layout(Layout::default().height(Length::Fixed(10.0 * scale()))),
+                );
+                step(&mut tall, 10.0 * scale());
+            }
+            children.push(
+                fitted(
+                    format!(
+                        "tables/rail/family/{}",
+                        crate::native_ui::key_word(listed.family)
+                    ),
+                    listed.family,
+                    StyleRef::Plain,
+                    inner,
+                )
+                .layout(
+                    Layout::default()
+                        .width(Length::Fixed(inner))
+                        .height(Length::Fixed(22.0 * scale())),
+                ),
+            );
+            step(&mut tall, 22.0 * scale());
+            heading = Some((listed.family, ""));
+        }
+        if heading != Some((listed.family, group_word)) {
+            if heading.is_some_and(|(family, word)| family == listed.family && !word.is_empty()) {
+                children.push(
+                    group(format!(
+                        "tables/rail/gap/{family_key}{}",
                         crate::native_ui::key_word(group_word)
                     ))
                     .layout(Layout::default().height(Length::Fixed(6.0 * scale()))),
                 );
                 step(&mut tall, 6.0 * scale());
             }
-            heading = Some(group_word);
+            heading = Some((listed.family, group_word));
             children.push(
                 fitted(
                     format!(
-                        "tables/rail/group/{}",
+                        "tables/rail/group/{family_key}{}",
                         crate::native_ui::key_word(group_word)
                     ),
                     group_word,
@@ -3970,7 +4443,7 @@ fn rail(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiN
             &key,
             format!(
                 "{title}: {}{}",
-                count.map_or_else(String::new, |n| rows_words(n, n)),
+                count.map_or_else(|| "rows unread".to_owned(), |n| rows_words(n, n)),
                 if staged == 0 {
                     String::new()
                 } else {
@@ -5462,20 +5935,21 @@ fn cell_bar(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32) 
         ])
 }
 
-fn write_bar(app: &TablesApp, width: f32) -> Option<UiNode> {
+fn write_bar(app: &TablesApp, width: f32, reading_more: bool) -> Option<UiNode> {
     let h = 40.0 * scale().max(1.0);
     // Where this Mac cannot write, the bar's place says why, and nothing offers a Write.
     if let Some(why) = app.cannot_write() {
         return Some(rows::cannot_write(app, why, width, h));
     }
     let n = app.staged.len();
-    if n == 0 && app.note.is_none() {
-        return None;
-    }
     if n == 0 {
-        let note = app.note.clone().unwrap_or_default();
+        let note = if reading_more {
+            "Reading remaining tables…"
+        } else {
+            app.note.as_deref()?
+        };
         return Some(
-            fitted("tables/note", &note, StyleRef::Note, width - 20.0).layout(
+            fitted("tables/note", note, StyleRef::Note, width - 20.0).layout(
                 Layout::default()
                     .height(Length::Fixed(h))
                     .padding(Insets::symmetric(10.0, 0.0)),
@@ -6125,15 +6599,18 @@ pub(crate) fn on_words(at_ms: u64, now_ms: u64) -> String {
 }
 
 /// How a writer set a cell, in the line's words: `set at m55 on …`, `cleared at m55 …`, `set by
-/// aterm at m22 …`, `imported at m55 …`. A person's or a program's explicit write is named by
-/// the Mac it was made at, since the record says no more (design §6); what aterm or an import
-/// wrote says so.
+/// aterm at m22 …`, `imported at m55 …`, `set by claude at m55 …`. A person's or a
+/// program's explicit write is named by the Mac it was made at, and by who made it where its
+/// record says (a version 2 record, design §6); what aterm or an import wrote says so.
 fn set_words(by: &Author, cleared: bool, now_ms: u64) -> (Said, String) {
     let verb = if cleared { "cleared" } else { "set" };
     let (said, verb) = match by.kind {
         AuthorKind::Import => (Said::Imported, "imported".to_owned()),
         AuthorKind::Aterm => (Said::Automatic, format!("{verb} by aterm")),
-        AuthorKind::Explicit => (Said::Set, verb.to_owned()),
+        AuthorKind::Explicit => match by.principal() {
+            Some(who) => (Said::Set, format!("{verb} by {who}")),
+            None => (Said::Set, verb.to_owned()),
+        },
     };
     (
         said,
@@ -6480,7 +6957,11 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
     // Where a column's list of values opens, down the main column: under the grid's header line,
     // or under the chips' line.
     let mut filter_at: (f32, Option<f32>) = (0.0, None);
-    let sheet = app.current(view).and_then(|name| app.sheet(name));
+    // The height of the line under the header that says which records the read does not
+    // project, with its gap: none where it says nothing.
+    let mut refused_h = 0.0;
+    let current = app.current(view);
+    let sheet = current.and_then(|name| app.sheet(name));
     if narrow && view.picking {
         main.push(
             group("tables/header")
@@ -6511,11 +6992,11 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
             ));
         }
     } else {
-        let (title, singular_count) = sheet.map_or((TABLES_TITLE, String::new()), |s| {
-            (
-                s.title,
-                rows_words(view.shown_count(app, s), rows::admitted(app, view, s)),
-            )
+        let title = current
+            .and_then(|name| app.title_of(name))
+            .unwrap_or(TABLES_TITLE);
+        let singular_count = sheet.map_or_else(String::new, |s| {
+            rows_words(view.shown_count(app, s), rows::admitted(app, view, s))
         });
         let count_w =
             text_width(&singular_count, SemanticRole::Text, StyleRef::Note).min(main_w * 0.4);
@@ -6532,12 +7013,25 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
                     fitted("tables/count", &singular_count, StyleRef::Note, count_w),
                 ]),
         );
+        // Records the read holds and does not project, said on a line of its own under the
+        // header whenever it holds any: that line and the gap under it move everything below
+        // down, the lists that open over the page included.
+        for (key, words) in [
+            ("tables/refused", app.refused()),
+            ("tables/missing-record", view.missing_record.as_deref()),
+        ] {
+            if let Some(words) = words {
+                main.push(fitted(key, words, StyleRef::Note, main_w).layout_height(line));
+                refused_h += line + 10.0;
+            }
+        }
+        room -= refused_h;
         main.push(tools(app, view, sheet, main_w, line));
         room -= head_h + 10.0 + line + 4.0 + 10.0;
         // The filters that stand, as chips on lines of their own under the tools: their height
         // and the gap under them come off the room once, as the tools row's do, before the cell
         // bar and the history drawer are judged on what is left.
-        let mut grid_top = 16.0 + head_h + 10.0 + line + 4.0 + 10.0;
+        let mut grid_top = 16.0 + head_h + 10.0 + refused_h + line + 4.0 + 10.0;
         if let Some((chips, chips_h)) =
             sheet.and_then(|s| native_tables_filters::chips(app, view, s, main_w, line))
         {
@@ -6546,7 +7040,7 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
             filter_at.1 = Some(grid_top);
             grid_top += chips_h + 10.0;
         }
-        let bar = write_bar(app, main_w);
+        let bar = write_bar(app, main_w, sheet.is_some() && app.snapshot.is_none());
         // The write bar's height and the gap over it, and the line under the grid at its least.
         let write_h = 40.0 * scale().max(1.0) + 10.0;
         let said_least = 24.0 * scale().max(1.0);
@@ -6687,7 +7181,7 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
     let list = sheet
         .filter(|_| view.columns.open && !(narrow && view.picking) && !view.check.open)
         .map(|sheet| {
-            let under = 16.0 + head_h + 10.0 + line + 4.0 + 2.0;
+            let under = 16.0 + head_h + 10.0 + refused_h + line + 4.0 + 2.0;
             native_tables_columns::list(app, view, sheet, (16.0 + main_w, under, height - 16.0))
         });
     // The open list of a column's values, under its mark or its chip.

@@ -650,6 +650,36 @@ pub(crate) fn git_relevant(key: &str) -> bool {
         || (key.starts_with("GIT_") && !matches!(key, "GIT_PAGER" | "GIT_EDITOR"))
 }
 
+enum DriverSelectionFailure {
+    Pipe(std::io::Error),
+    Read {
+        output: Result<std::process::Output, aterm_uds::deadline::CompleteOutputError>,
+        input: std::io::Result<()>,
+    },
+}
+
+impl std::fmt::Debug for DriverSelectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pipe(error) => f.debug_tuple("Pipe").field(error).finish(),
+            Self::Read { output, input } => {
+                let mut read = f.debug_struct("Read");
+                match output {
+                    Ok(output) => {
+                        read.field("status", &output.status)
+                            .field("stdout_bytes", &output.stdout.len())
+                            .field("stderr_bytes", &output.stderr.len());
+                    }
+                    Err(error) => {
+                        read.field("capture_error", &error.to_string());
+                    }
+                }
+                read.field("input", input).finish()
+            }
+        }
+    }
+}
+
 struct Probe<'a> {
     env: &'a WorkerEnv,
     program: PathBuf,
@@ -835,7 +865,18 @@ impl Probe<'_> {
         paths: Vec<u8>,
         wait: std::time::Duration,
     ) -> Option<Vec<String>> {
-        let (reader, mut writer) = aterm_uds::pipe().ok()?;
+        let out = self.driver_selection_output(top, paths, wait).ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        Some(text.split_terminator('\0').map(str::to_owned).collect())
+    }
+
+    fn driver_selection_output(
+        &self,
+        top: &Path,
+        paths: Vec<u8>,
+        wait: std::time::Duration,
+    ) -> Result<std::process::Output, DriverSelectionFailure> {
+        let (reader, mut writer) = aterm_uds::pipe().map_err(DriverSelectionFailure::Pipe)?;
         let wrote = std::thread::spawn(move || {
             use std::io::Write as _;
             writer.write_all(&paths)
@@ -868,16 +909,16 @@ impl Probe<'_> {
                     true
                 },
             )
-            .ok()
         };
-        let wrote = wrote.join().ok()?;
-        let out = out?;
-        wrote.ok()?;
-        if !out.status.success() {
-            return None;
+        let input = wrote.join().unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "git check-attr stdin writer panicked",
+            ))
+        });
+        match (out, input) {
+            (Ok(output), Ok(())) if output.status.success() => Ok(output),
+            (output, input) => Err(DriverSelectionFailure::Read { output, input }),
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        Some(text.split_terminator('\0').map(str::to_owned).collect())
     }
 }
 

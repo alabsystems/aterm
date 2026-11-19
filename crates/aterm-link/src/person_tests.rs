@@ -120,14 +120,14 @@ fn each_verb_parses_its_words_and_refuses_the_rest() {
 
     let post = parse(
         "post",
-        &words("--cap-file c to=@ta000000000@n-b kind=answer re=@12 -- yes, ship it"),
+        &words("--cap-file c to=@t0000000063@n-b kind=answer re=@12 -- yes, ship it"),
     )
     .unwrap()
     .unwrap();
     assert_eq!(
         post.act,
         Act::Post {
-            sid: "ta000000000".to_string(),
+            sid: "t0000000063".to_string(),
             node: "n-b".to_string(),
             kind: "answer".to_string(),
             re: Some(12),
@@ -137,7 +137,7 @@ fn each_verb_parses_its_words_and_refuses_the_rest() {
     for re in ["5", "@5"] {
         let post = parse(
             "post",
-            &words(&format!("--cap-file c to=@ta000000000@n-b re={re} hi")),
+            &words(&format!("--cap-file c to=@t0000000063@n-b re={re} hi")),
         )
         .unwrap()
         .unwrap();
@@ -150,7 +150,7 @@ fn each_verb_parses_its_words_and_refuses_the_rest() {
     for re in ["+5", "@", "", "@-1"] {
         let refused = parse(
             "post",
-            &words(&format!("--cap-file c to=@ta000000000@n-b re={re} hi")),
+            &words(&format!("--cap-file c to=@t0000000063@n-b re={re} hi")),
         );
         assert!(
             refused
@@ -160,12 +160,12 @@ fn each_verb_parses_its_words_and_refuses_the_rest() {
         );
     }
     for bad in [
-        "--cap-file c to=@ta000000000 kind=note hi",
-        "--cap-file c to=ta000000000@n-b kind=note hi",
-        "--cap-file c to=@ta000000000@n-b kind=ack hi",
-        "--cap-file c to=@ta000000000@n-b kind=note",
+        "--cap-file c to=@t0000000063 kind=note hi",
+        "--cap-file c to=t0000000063@n-b kind=note hi",
+        "--cap-file c to=@t0000000063@n-b kind=ack hi",
+        "--cap-file c to=@t0000000063@n-b kind=note",
         "--cap-file c kind=note hi",
-        "--cap-file c to=@ta000000000@n-b re=x note hi",
+        "--cap-file c to=@t0000000063@n-b re=x note hi",
     ] {
         assert!(parse("post", &words(bad)).is_err(), "{bad}");
     }
@@ -187,14 +187,14 @@ fn a_post_delimiter_makes_key_shaped_words_literal_message_text() {
     ] {
         let parsed = parse(
             "post",
-            &words(&format!("--cap-file c to=@ta000000000@n-b -- {text}")),
+            &words(&format!("--cap-file c to=@t0000000063@n-b -- {text}")),
         )
         .unwrap()
         .unwrap();
         assert_eq!(
             parsed.act,
             Act::Post {
-                sid: "ta000000000".to_string(),
+                sid: "t0000000063".to_string(),
                 node: "n-b".to_string(),
                 kind: "note".to_string(),
                 re: None,

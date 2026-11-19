@@ -534,12 +534,14 @@ pub fn resolve_state_dir(
         // cwd is no root at all.
         return root.is_absolute().then_some(root);
     }
+    // On Unix the folder under HOME is `crate::world::state_home`'s, the one a scratch world's
+    // marker names, written once in a `std`-only file that code linking no crate mounts too.
     #[cfg(target_os = "macos")]
     {
         let _ = (&platform.xdg_state_home, &platform.local_app_data);
         platform
             .home
-            .map(|home| home.join("Library/Application Support/aterm"))
+            .and_then(|home| crate::world::state_home(&home))
     }
     #[cfg(windows)]
     {
@@ -555,7 +557,9 @@ pub fn resolve_state_dir(
         if let Some(root) = platform.xdg_state_home.filter(|root| root.is_absolute()) {
             return Some(root.join("aterm"));
         }
-        platform.home.map(|home| home.join(".local/state/aterm"))
+        platform
+            .home
+            .and_then(|home| crate::world::state_home(&home))
     }
     #[cfg(not(any(unix, windows)))]
     {

@@ -253,7 +253,7 @@ fn a_shared_unit_a_build_uses_during_the_pass_stays() {
         });
         if used {
             assert_eq!(names(&went, &root), ["build/a/1"]);
-            assert_eq!(asked, [old.clone()]);
+            assert_eq!(asked, std::slice::from_ref(&old));
             assert!(younger.join(LOCK).is_file());
         } else {
             assert_eq!(names(&went, &root), ["build/a/1", "build/b/2"]);
@@ -491,7 +491,7 @@ fn a_store_a_build_noted_is_read_and_evicted() {
     assert_eq!(std::fs::read_dir(&notes_dir).unwrap().count(), 1);
     assert_eq!(
         roots(&home),
-        [own.clone()],
+        std::slice::from_ref(&own),
         "a store not yet made is not read"
     );
 
@@ -535,7 +535,7 @@ fn a_store_a_build_noted_is_read_and_evicted() {
     let unseen = home.join("Documents/cargo/trust/native-dependencies-v1");
     let kept = unit(&unseen.join("build/serde/0123abcd"), month);
     note_store(&home, &unseen).unwrap();
-    assert_eq!(roots(&home), [own.clone()]);
+    assert_eq!(roots(&home), std::slice::from_ref(&own));
     assert!(reclaim(&home, now, &mut |_, _| true).is_empty());
     assert!(kept.join(LOCK).is_file());
     assert!(notes_dir.join(noted_name(&unseen)).is_file());

@@ -6,7 +6,6 @@ use std::sync::Mutex;
 
 const NOW: i64 = 1_800_000_000;
 
-#[cfg(unix)]
 #[test]
 fn a_missing_row_intent_retires_only_after_its_owned_worker_validates_the_roster() {
     for case in 0..4 {
@@ -130,7 +129,6 @@ fn a_missing_row_intent_retires_only_after_its_owned_worker_validates_the_roster
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn closing_work_while_the_retirement_writer_is_held_preserves_the_request() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -179,7 +177,6 @@ fn closing_work_while_the_retirement_writer_is_held_preserves_the_request() {
         .expect("the writer and original operation retired");
 }
 
-#[cfg(unix)]
 #[test]
 fn a_retained_or_unreadable_detached_manual_result_does_not_wake_itself() {
     for case in 0..4 {
@@ -257,7 +254,6 @@ fn a_retained_or_unreadable_detached_manual_result_does_not_wake_itself() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn delayed_manual_failure_retires_only_its_exact_uncancelled_intent() {
     for next in [false, true] {

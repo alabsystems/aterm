@@ -19,6 +19,8 @@ mod keeper_world_tests;
 mod launch_isolation;
 #[path = "../support/live_ctl.rs"]
 mod live_ctl;
+#[path = "../support/patience.rs"]
+mod patience;
 #[path = "../fabric_bench/profile.rs"]
 #[expect(
     dead_code,

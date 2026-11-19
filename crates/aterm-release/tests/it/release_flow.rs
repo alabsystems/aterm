@@ -93,6 +93,44 @@ fn offline_launch_stops_at_the_qualification_boundary() {
     let _ = prequalify_fixture();
 }
 
+#[test]
+fn a_selected_snapshot_format_red_stops_before_step_one_work() {
+    for (finding, expected) in [
+        (
+            InputFinding::Failed("selected R is unformatted".into()),
+            aterm_verify::exit::FAILED,
+        ),
+        (
+            InputFinding::Unanswered("selected formatter context changed".into()),
+            aterm_verify::exit::COULD_NOT_RUN,
+        ),
+    ] {
+        let mut world = World::new();
+        world.snapshot_format_finding = Some(finding);
+        let (code, output) = world.run(ReleaseOptions {
+            dry_run: true,
+            ..mac()
+        });
+        assert_eq!(code, expected, "{output}");
+        assert!(
+            world
+                .calls
+                .iter()
+                .any(|call| call.starts_with("snapshot-format "))
+        );
+        assert!(
+            !world.observations.contains(&"machine"),
+            "step one must not begin: {:?}",
+            world.observations
+        );
+        assert!(!world.calls.iter().any(|call| call.starts_with("released-shim ") || call.starts_with("input-checks ")));
+        assert!(!world.observations.contains(&"warm-tools"));
+        assert!(world.verify_runs.is_empty());
+        assert!(world.records.is_empty());
+        assert!(!world.release_dir().join(JOURNAL_FILE).exists());
+    }
+}
+
 /// The hop the fake makes of `fix`.
 fn hop_of(fix: &str) -> String {
     format!("9{}", &fix[1..])
@@ -111,6 +149,8 @@ struct World {
     gate_revision: bool,
     /// What step 1's release-input judgment finds.
     input_finding: Option<InputFinding>,
+    /// The final selected snapshot's negative-only formatter prefix.
+    snapshot_format_finding: Option<InputFinding>,
     /// A new engine policy's answer, installed by Sync for the next input judgment.
     sync_input_finding: Option<InputFinding>,
     /// What step 1's released-shim early ask finds: the public release's refusal of R's tree,
@@ -194,6 +234,15 @@ struct World {
     /// origin/main as the next refresh finds it, once: a main rewritten since selection.
     main_at_next_fetch: Option<Vec<String>>,
     validation_tools: Result<String, Refusal>,
+    /// What the acquisition of the candidate's stock release answers (a dry run's read of it
+    /// too): `None`, it was in place.
+    stock_toolchain: Result<Option<String>, Refusal>,
+    /// Each commit the stock release was asked for, and whether as a dry run's read.
+    stock_asked: Vec<(String, bool)>,
+    /// The frozen cutter's build-inputs seal reads R's stock release, which this machine lacks
+    /// until a real acquisition for R answered: an exec into R's cutter before it refuses, as
+    /// `machine_roots` does where rustup does not hold that release.
+    freeze_needs_stock: bool,
     /// The preflight's own blocks: R's commit-only gates and the engine's readiness.
     blocks: Vec<Refusal>,
     /// What the commit-gate record binds beside R's commit: a stand-in for the build-inputs
@@ -469,6 +518,7 @@ impl World {
             gate_repo: None,
             gate_revision: false,
             input_finding: None,
+            snapshot_format_finding: None,
             sync_input_finding: None,
             shim_finding: None,
             fleet_refusal: None,
@@ -535,6 +585,9 @@ impl World {
             fetches: 0,
             main_at_next_fetch: None,
             validation_tools: Ok("pinned tools ready".into()),
+            stock_toolchain: Ok(None),
+            stock_asked: Vec::new(),
+            freeze_needs_stock: false,
             blocks: Vec::new(),
             gate_inputs: "seal-and-tags".into(),
             gates_judged: None,
@@ -1877,6 +1930,13 @@ impl Backend for World {
             .clone()
             .map_or_else(|| Ok("input clean".into()), Err)
     }
+    fn snapshot_format(&mut self, commit: &str, _prover: &Prover) -> Result<(), InputFinding> {
+        if let Some(finding) = &self.snapshot_format_finding {
+            self.calls.push(format!("snapshot-format {commit}"));
+            return Err(finding.clone());
+        }
+        Ok(())
+    }
     /// As the real backend: asked while R's tree owes its `test` check, and not of a tree
     /// whose `test` record stands.
     fn released_shim(&mut self, c: &Candidate) -> Result<String, InputFinding> {
@@ -1894,6 +1954,13 @@ impl Backend for World {
         self.ledger.clone()
     }
     fn engine_rows(&mut self, commit: Option<&str>) -> EngineRows {
+        assert!(
+            !self
+                .calls
+                .iter()
+                .any(|call| call.starts_with("snapshot-format ")),
+            "an early formatting refusal must not ask the engine"
+        );
         if commit.is_none()
             && self.publish_pending_on_unscoped_read
             && self.preview_own
@@ -2105,6 +2172,19 @@ impl Backend for World {
         self.validation_tools.clone()
     }
 
+    fn stock_toolchain(&mut self, commit: &str, dry: bool) -> Result<Option<String>, Refusal> {
+        self.calls.push(
+            if dry {
+                "stock-toolchain --dry-run"
+            } else {
+                "stock-toolchain"
+            }
+            .into(),
+        );
+        self.stock_asked.push((commit.to_owned(), dry));
+        self.stock_toolchain.clone()
+    }
+
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal> {
         self.calls.push(format!("move {}", &commit[..4]));
         if commit == TIP && self.release_dir().join(SELECTION_FILE).exists() {
@@ -2131,6 +2211,18 @@ impl Backend for World {
         self.exec_prover = Some(prover.clone());
         self.calls.push("exec-cutter".into());
         self.exec_commit = Some(commit.to_owned());
+        let placed = self.stock_toolchain.is_ok()
+            && self
+                .stock_asked
+                .iter()
+                .any(|(asked, dry)| asked == commit && !dry);
+        if self.freeze_needs_stock && !placed {
+            return Err(Refusal::new(
+                "cannot exec R's frozen cutter (resolve stock sysroot: error: toolchain \
+                 '1.99.1-aarch64-apple-darwin' is not installed)",
+                "the verdict's own remedy",
+            ));
+        }
         if let Some(judge) = &mut self.exec_judge {
             return judge(commit);
         }
@@ -2828,6 +2920,50 @@ fn a_proposal_the_fleet_never_took_is_dropped_before_selection() {
     });
     superseded.run(mac());
     assert!(!dropped(&superseded), "{:?}", superseded.out);
+}
+
+/// A proposal candidate.toml kept of a version another clone then cut (UB-15): a pump that
+/// yielded the line, or a standby whose adopt stopped before its claim, kept a selection on which
+/// it did nothing; the version's tag is on origin, so the next run drops it before it selects and
+/// says so, rather than refusing for good as a clone that journals no cut of it. Nothing a run
+/// made is lost: a proposal holds no ask, draft, reservation, bump or hop.
+/// NEGATIVE CONTROLS: a journal of the cut version with work on it (a pushed bump) stays, for a
+/// session's `--forget` to withdraw; a proposal of a version nobody cut, at the fleet line's own
+/// base, stays.
+#[test]
+fn a_proposal_of_a_version_another_clone_cut_is_dropped_before_selection() {
+    let setup = |journal: Journal, cut: bool| {
+        let mut world = World::new();
+        world.versions.insert(TIP.into(), "0.6.0".into());
+        world.existing_fleet_line = Some(Line::start("0.6.0", TIP, 100));
+        if cut {
+            world.origin_tags.insert("v0.6.0".into(), NEXT.into());
+        }
+        journal
+            .save(&world.release_dir().join(SELECTION_FILE))
+            .unwrap();
+        world
+    };
+    let dropped = |world: &World| world.out.iter().any(|line| line.contains("was dropped"));
+    let mut cut = setup(proposal("0.6.0", TIP), true);
+    cut.run(mac());
+    assert!(dropped(&cut), "{:?}", cut.out);
+    assert!(
+        cut.out
+            .iter()
+            .any(|line| line.contains("v0.6.0 is cut (its tag is on origin)")),
+        "{:?}",
+        cut.out
+    );
+    // NEGATIVE CONTROLS: work on the cut version's journal, or a version nobody cut.
+    let mut worked = proposal("0.6.0", TIP);
+    worked.bumped = true;
+    let mut kept = setup(worked, true);
+    kept.run(mac());
+    assert!(!dropped(&kept), "{:?}", kept.out);
+    let mut uncut = setup(proposal("0.6.0", TIP), false);
+    uncut.run(mac());
+    assert!(!dropped(&uncut), "{:?}", uncut.out);
 }
 
 /// An owner wait before the publish renews nothing, so another cutter may take the line's
@@ -3874,9 +4010,13 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
     assert_eq!(
         order,
         [
+            // R's stock release is put in place before anything reads it: the base's before its
+            // cutter, then the bump commit's once the bump wrote it.
+            "stock-toolchain",
             "sync",
             "bump",
             "move cccc",
+            "stock-toolchain",
             "commit-gates",
             shim.as_str(),
             input.as_str(),
@@ -5505,6 +5645,188 @@ fn selection_states_the_followers_red_on_its_base_without_refusing_or_reselectin
     assert!(w.journal().is_none());
     assert_eq!(w.count("build"), 0);
     assert_eq!(w.count("bump"), 0);
+}
+
+/// A REAL RUN PUTS R'S STOCK RELEASE IN PLACE BEFORE ANYTHING READS IT, AND A DRY RUN ONLY READS
+/// WHAT THAT WOULD DO: a fresh cut whose launcher is not R's own cutter asks the acquisition for R
+/// before it freezes and execs R's cutter, whose build-inputs seal hashes R's stock release with
+/// its x86_64 std (here the freeze refuses unless that acquisition answered), and says what it
+/// installed; a run in R's own cutter asks it before the commit gates and step 1's audit, for the
+/// bump's base and again for the bump commit it writes, and no more; `--open-next` from a launcher
+/// that is not the tip's cutter asks it for the tip before that freeze too; an acquisition that
+/// fails stops the run as COULD NOT RUN with the rustup row's remedy before any freeze or audit, at
+/// the step that asked it (1/10 checks for a cut, 3/10 commit for `--open-next`); a dry run asks
+/// only the read-only plan, at the same places (for its planned R, the private bump of a dry
+/// `--bump`, before its exec of that commit's cutter, which it says; in R's own cutter once, for
+/// that R), and audits read only; where R's release is missing, a dry run's freeze, which seals it,
+/// stops the run COULD NOT RUN before any audit. NEGATIVE CONTROLS: with the acquisition only in
+/// step 1 (no `Run::stock_in_place` in `Run::prepare_candidate` and `Run::own_cutter`), the fresh
+/// cut's freeze meets a release the machine lacks and the first exit-code assertion fails; without
+/// the one in `Run::own_cutter` alone, the open-next freeze meets it and the open-next leg's
+/// exit-code assertion fails; a `Run::own_cutter` that drops its refusal (`let _ =
+/// self.stock_in_place();`) execs the tip's cutter, and the open-next refusal leg's exit-code
+/// assertion fails; an exec of the clone's HEAD in place of R makes the dry leg's `exec_commit`
+/// assertion fail.
+#[test]
+fn a_real_run_puts_rs_stock_release_in_place_before_anything_reads_it_and_a_dry_run_only_reads() {
+    let installed = "put the stock release 1.99.1 (trust.lock's [stock]) in place with the \
+                     x86_64 slice's std: rustup toolchain install 1.99.1 --profile minimal \
+                     --target x86_64-apple-darwin --no-self-update";
+    let at = |w: &World, call: &str| w.calls.iter().position(|c| c.starts_with(call));
+
+    let mut w = World::new();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    w.freeze_needs_stock = true;
+    w.stock_toolchain = Ok(Some(installed.into()));
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "the exec edge: {last}\n{:#?}", w.out);
+    assert_eq!(w.exec_commit.as_deref(), Some(TIP));
+    assert_eq!(w.stock_asked, [(TIP.to_string(), false)]);
+    assert!(
+        at(&w, "stock-toolchain") < at(&w, "exec-cutter"),
+        "the acquisition comes before the freeze: {:?}",
+        w.calls
+    );
+    assert!(
+        w.out
+            .iter()
+            .any(|l| l.contains(&format!("release: {installed}"))),
+        "what it installed is said: {:#?}",
+        w.out
+    );
+
+    let mut w = World::new();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    w.freeze_needs_stock = true;
+    w.stock_toolchain = Ok(Some(installed.into()));
+    let (code, last) = w.run(ReleaseOptions {
+        open_next: true,
+        ..ReleaseOptions::default()
+    });
+    assert_eq!(code, 0, "the open-next exec edge: {last}\n{:#?}", w.out);
+    assert_eq!(w.exec_commit.as_deref(), Some(TIP));
+    assert_eq!(w.stock_asked, [(TIP.to_string(), false)]);
+    assert!(
+        at(&w, "stock-toolchain") < at(&w, "exec-cutter"),
+        "the acquisition comes before the open-next freeze: {:?}",
+        w.calls
+    );
+
+    let mut w = World::new();
+    w.preview_own = true;
+    w.stock_toolchain = Ok(Some(installed.into()));
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 0, "{last}");
+    assert_eq!(
+        w.stock_asked,
+        [(TIP.to_string(), false), (BUMP.to_string(), false)],
+        "the base, then the bump commit it wrote"
+    );
+    assert!(
+        at(&w, "stock-toolchain") < at(&w, "commit-gates")
+            && at(&w, "stock-toolchain") < at(&w, "audit"),
+        "the acquisition comes before the gates' seal and the audit: {:?}",
+        w.calls
+    );
+
+    let offline = || {
+        Refusal::new(
+            "the rustup row's release part did not put the stock release 1.99.1 trust.lock's \
+             [stock] names in place with the x86_64 slice's std: offline",
+            "targo --unverified verify provision rustup and retry the release",
+        )
+        .could_not_run()
+    };
+    let mut w = World::new();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    w.stock_toolchain = Err(offline());
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 3, "{last}");
+    assert!(
+        last.starts_with(
+            "REFUSED at 1/10 checks: COULD NOT RUN — the rustup row's release part did not put \
+             the stock release 1.99.1"
+        ),
+        "{last}"
+    );
+    assert_eq!(w.count("exec-cutter"), 0, "{:?}", w.calls);
+    assert_eq!(w.count("audit"), 0, "{:?}", w.calls);
+
+    let mut w = World::new();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    w.stock_toolchain = Err(offline());
+    let (code, last) = w.run(ReleaseOptions {
+        open_next: true,
+        ..ReleaseOptions::default()
+    });
+    assert_eq!(code, 3, "the open-next refusal: {last}");
+    assert!(
+        last.starts_with(
+            "REFUSED at 3/10 commit: COULD NOT RUN — the rustup row's release part did not put \
+             the stock release 1.99.1"
+        ),
+        "{last}"
+    );
+    assert_eq!(w.count("exec-cutter"), 0, "{:?}", w.calls);
+
+    let dry = || ReleaseOptions {
+        dry_run: true,
+        ..bump()
+    };
+    let planned = "a real run puts the stock release 1.99.1 (trust.lock's [stock]) in place \
+                   with the x86_64 slice's std before anything reads it";
+    let mut w = World::new();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    w.stock_toolchain = Ok(Some(planned.into()));
+    let (code, last) = w.run(dry());
+    assert_eq!(code, 0, "the exec edge: {last}");
+    assert_eq!(
+        w.stock_asked,
+        [(BUMP.to_string(), true)],
+        "a dry run only reads, for its private bump, before its exec"
+    );
+    assert_eq!(w.exec_commit.as_deref(), Some(BUMP), "{:?}", w.calls);
+    assert!(
+        at(&w, "stock-toolchain --dry-run") < at(&w, "exec-cutter"),
+        "{:?}",
+        w.calls
+    );
+    assert!(
+        w.out
+            .iter()
+            .any(|l| l.contains(&format!("release: {planned}"))),
+        "what a real run puts in place before its freeze is said: {:#?}",
+        w.out
+    );
+    // A dry run installs nothing, so where R's release is missing its freeze, whose seal hashes
+    // that release, stops the run there as COULD NOT RUN.
+    let mut w = World::new();
+    w.own_cutter = false;
+    w.exec_result = Ok(());
+    w.freeze_needs_stock = true;
+    w.stock_toolchain = Ok(Some(planned.into()));
+    let (code, last) = w.run(dry());
+    assert_eq!(code, 3, "{last}\n{:#?}", w.out);
+    assert!(
+        last.contains("cannot judge every step: 1/10 checks: cannot exec R's frozen cutter"),
+        "{last}"
+    );
+    assert_eq!(w.stock_asked, [(BUMP.to_string(), true)]);
+    assert_eq!(w.count("audit"), 0, "{:?}", w.calls);
+    let mut w = World::new();
+    let (code, last) = w.run(dry());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.stock_asked, [(BUMP.to_string(), true)]);
+    assert!(
+        !w.audited_dry.is_empty() && w.audited_dry.iter().all(|dry| *dry),
+        "{:?}",
+        w.audited_dry
+    );
 }
 
 /// A refusal before step 1 starts a child still creates the log its verdict names, with the

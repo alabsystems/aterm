@@ -57,6 +57,21 @@ impl AccountLineages {
             .count()
     }
 
+    /// Whether a lineage other than `id`'s own unused root slot is held: something a re-entry's
+    /// fresh operation `id` could inherit. A re-entry on a stored login reserves its own root
+    /// ([`AccountSlot::Root`]) before it is qualified, and that slot, still empty, is no lineage
+    /// it inherits; any other frontier, or a successor reserved on any, is.
+    pub(super) fn held_except(&self, id: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|(frontier, candidate)| frontier != id || candidate.is_some())
+    }
+
+    /// Whether any operation holds a lineage entry: a frontier or a candidate.
+    pub(super) fn held(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
     pub(super) fn pins(&self, id: &str) -> bool {
         self.entries.contains_key(id)
             || self

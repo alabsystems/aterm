@@ -10,10 +10,11 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::headless_boot;
 use crate::live_ctl::Ctl;
+use crate::patience::Patience;
 
 use headless_boot::{Instance, boot_session, ctl_ok, field, process_tree, status, type_line};
 
@@ -155,14 +156,15 @@ fn a_key_on_a_claude_code_box_closes_it_by_the_option_it_chose() {
             dir.display()
         ),
     );
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     while !status(&inst, &sid).contains(" program=claude ") {
-        assert!(
-            Instant::now() < deadline,
-            "the stand-in never ran as claude: {}\n{}",
-            status(&inst, &sid),
-            process_tree(&inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the stand-in never ran as claude ({why}): {}\n{}",
+                status(&inst, &sid),
+                process_tree(&inst)
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     let mut front = Ctl::connect(&inst.sock);

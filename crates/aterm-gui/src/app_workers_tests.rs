@@ -223,9 +223,13 @@ fn closing_the_worker_on_show_returns_to_the_list() {
 fn next_previous_and_the_number_keys_reach_only_what_the_strip_draws() {
     let (mut app, tabs, workers) = app_with(1, 1);
     app.cycle_tab_in(WID, true);
-    assert_eq!(set(&app).active_id(), set(&app).home());
+    assert_eq!(active_session(&app), Some(tabs[0]));
     app.cycle_tab_in(WID, true);
-    assert_eq!(active_session(&app), Some(tabs[0]), "past the list wraps");
+    assert_eq!(
+        active_session(&app),
+        Some(tabs[0]),
+        "cycling stays on the only visible session"
+    );
 
     app.switch_shown_tab_in(WID, 2);
     assert_eq!(
@@ -235,9 +239,9 @@ fn next_previous_and_the_number_keys_reach_only_what_the_strip_draws() {
     );
     assert!(app.session_is_parked(workers[0]));
     app.switch_shown_tab_in(WID, 1);
-    assert_eq!(set(&app).active_id(), set(&app).home());
+    assert_eq!(active_session(&app), Some(tabs[0]));
 
-    // While a worker shows, next walks from its chip.
+    // Cycling from a parked worker selects the visible session.
     assert!(app.focus_session_preferring(Some(WID), workers[0]));
     app.cycle_tab_in(WID, true);
     assert_eq!(active_session(&app), Some(tabs[0]));
@@ -410,24 +414,28 @@ fn the_native_strip_mirrors_the_shown_tabs_while_workers_come_and_go() {
     let (mut app, _, workers) = app_with(2, 1);
     assert_eq!(
         lockstep(&app),
-        (3, 0),
-        "two tabs and the list; a worker has no chip"
+        (2, 0),
+        "two session tabs; the list is in the organizer"
     );
 
     let parked = land_worker(&mut app);
     assert_eq!(
         lockstep(&app),
-        (3, 0),
+        (2, 0),
         "another worker moves nothing on the strip"
     );
 
     assert!(app.focus_session_preferring(Some(WID), workers[0]));
     app.sync_window(WID);
-    assert_eq!(lockstep(&app), (3, 2), "opening a worker selects the chip");
+    assert_eq!(
+        lockstep(&app),
+        (2, -1),
+        "opening a parked worker selects no session tab"
+    );
 
     assert!(app.close_session_tab_for_test(workers[0]));
     app.sync_window(WID);
-    assert_eq!(lockstep(&app), (3, 2), "closing it lands on the chip");
+    assert_eq!(lockstep(&app), (2, -1), "closing it returns to the list");
 
     assert!(app.close_session_tab_for_test(parked));
     app.sync_window(WID);
@@ -663,7 +671,7 @@ fn every_row_of_the_chips_menu_acts_on_the_worker_it_shows() {
         assert_eq!(set(&app).chip_of(edit.tab), Some(home));
         app.end_session_rename_editor(WID);
     } else {
-        assert!(!app.tab_strip_enabled(), "no surface is the only excuse");
+        assert!(app.windows[&WID].title_chip(shown).is_none() || !app.tab_strip_enabled());
     }
     assert_eq!(
         active_session(&app),
@@ -1609,7 +1617,7 @@ fn a_gone_program_workers_row_names_its_program_whatever_titles_its_tab() {
 fn the_strip_line_pushes_one_tooltip_per_shown_tab_while_workers_are_parked() {
     let (mut app, _, _) = app_with(2, 1);
     app.sync_window(WID);
-    let shown = set(&app).shown_len();
+    let shown = app.windows[&WID].strip_tab_count();
     assert!(set(&app).tabs().len() > shown, "a worker is parked");
     let pushed = &app.windows.get(&WID).expect("the window").tooltips_pushed;
     assert_eq!(pushed.len(), shown, "{pushed:?}");

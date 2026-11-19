@@ -791,7 +791,10 @@ fn reader_answers(name: &str) -> Option<bool> {
         "tcp_established" => crate::tcp_summary().is_some(),
         "tcp_states" => crate::tcp_summary().is_some_and(|s| !s.counters_only),
         "proc_sockets" => crate::open_socket_count(me).is_some(),
-        "device_io" => !crate::blockio::BlockReader::new().read(&mounts).is_empty(),
+        "device_io" => !crate::blockio::BlockReader::new()
+            .read(&mounts)
+            .devices
+            .is_empty(),
         "load" => {
             crate::load_average().is_some() || crate::task_room(0).run_queue.threads().is_some()
         }

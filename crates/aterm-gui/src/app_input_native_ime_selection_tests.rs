@@ -6,6 +6,50 @@ use crate::native_app::{ActionInvocation, AppEvent, AppViewState, TextInputEvent
 use crate::native_text_input::TextSelection;
 
 #[test]
+fn registry_find_keeps_clipboard_and_composition_on_its_search_field() {
+    use crate::native_registry::{RegistryApp, SEARCH};
+    use crate::native_ui::UiKey;
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.open_registry_tab().unwrap();
+    assert!(app.can_find(wid));
+    app.dispatch_action(wid, crate::keybinding::Action::Find);
+    let (_, view) = app.active_native_view(wid).unwrap();
+    let field = |app: &App| match app.native_runtime.view_state(view) {
+        Some(AppViewState::Registry(state)) => {
+            RegistryApp::field_input(state, SEARCH).unwrap().clone()
+        }
+        _ => panic!("Registry view"),
+    };
+    let paste = app.clipboard_recipient(wid).unwrap();
+    app.complete_clipboard_paste_in(wid, paste, "rack".into(), Source::Human);
+    assert_eq!(field(&app).value(), "rack");
+    app.find_requested_in(wid);
+    assert_eq!(app.native_selection_text(wid).as_deref(), Some("rack"));
+
+    // Composition replaces the selected text only at commit.
+    app.on_ime_preedit(wid, "北".into(), Some((0, 3)));
+    assert!(app.native_preedit_active(wid));
+    assert_eq!(field(&app).value(), "rack");
+    app.on_ime_commit(wid, "北".into());
+    assert_eq!(field(&app).value(), "北");
+
+    // A delayed paste and an in-flight composition both belong to the original field.
+    let paste = app.clipboard_recipient(wid).unwrap();
+    app.on_ime_preedit(wid, "西".into(), None);
+    app.focus_native_control(wid, view, UiKey::new("registry/clear-search"), true)
+        .unwrap();
+    app.on_ime_preedit(wid, String::new(), None);
+    app.on_ime_commit(wid, "西".into());
+    app.complete_clipboard_paste_in(wid, paste, "late".into(), Source::Human);
+    assert_eq!(field(&app).value(), "北");
+    assert!(field(&app).preedit().is_none());
+    assert!(app.native_selection_text(wid).is_none());
+    assert!(app.windows[&wid].search.is_none());
+}
+
+#[test]
 fn native_ime_preedit_preserves_platform_byte_selection_through_the_input_route() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);

@@ -140,11 +140,11 @@ fn fixture_row(
 }
 
 /// A rustup that holds the stock pin with every cell's std, the release chain's toolchain
-/// `release` with its slice's std, and rustup's floating `stable` with that std too (which no
-/// row may take for the release chain's), and changes nothing.
+/// `release` (where there is one) with its slice's std, and rustup's floating `stable` with that
+/// std too (which no row may take for the release chain's), and changes nothing.
 struct Provisioned {
     pin: String,
-    release: String,
+    release: Option<String>,
 }
 
 impl stock::Rustup for Provisioned {
@@ -159,16 +159,18 @@ impl stock::Rustup for Provisioned {
         let host = aterm_toolchain::rustup::NATIVE_TRIPLE;
         Ok(match (a.as_slice(), toolchain) {
             (["toolchain", "list"], _) => {
-                format!(
-                    "stable-{host}\n{}-{host}\n{}-{host}\n",
-                    self.pin, self.release
-                )
+                let release = self
+                    .release
+                    .as_ref()
+                    .map(|r| format!("{r}-{host}\n"))
+                    .unwrap_or_default();
+                format!("stable-{host}\n{}-{host}\n{release}", self.pin)
             }
             (["target", "list", "--installed"], Some(pin)) if pin == self.pin => {
                 CELL_TARGETS.join("\n")
             }
             (["target", "list", "--installed"], Some(held))
-                if held == self.release || held == "stable" =>
+                if self.release.as_deref() == Some(held) || held == "stable" =>
             {
                 stock::RELEASE_TARGETS.join("\n")
             }
@@ -264,12 +266,12 @@ impl Fake {
                 b"#!/bin/false\n".to_vec(),
             )],
             zip_links: Vec::new(),
+            // The release the checkout's lock names, where it carries one: a public snapshot
+            // carries none, and its row then has no release-chain part to hold.
             rustup: Provisioned {
                 pin: stock::stock_pin(&repo()).expect("the tree's stock pin"),
-                release: stock::release_toolchain(&repo(), true)
-                    .ok()
-                    .flatten()
-                    .expect("the tree's locked release"),
+                release: stock::release_toolchain(&repo(), false)
+                    .expect("the tree's trust.lock, where it carries one, reads"),
             },
             bare: None,
         }
@@ -1241,7 +1243,11 @@ fn a_bash_build_that_is_not_the_pin_is_refused() {
     }
 }
 
+/// Every row of a plain run in place under `m`, as a run leaves it: each row's tree and the
+/// directory its executable sits in are 0755 whatever the process's umask, since the rustup
+/// row reads a copy whose tree or `bin/` a group or other may write as not in place.
 fn all_in_place(m: &Machine) {
+    use std::os::unix::fs::PermissionsExt as _;
     std::fs::create_dir_all(&m.homes.rustup_home).unwrap();
     std::fs::write(m.homes.rustup_home.join("settings.toml"), "").unwrap();
     for row in select(&Options::default()) {
@@ -1249,10 +1255,99 @@ fn all_in_place(m: &Machine) {
             continue;
         };
         let exe = t.dir.join(&t.exe);
-        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        let dir = exe.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        for placed in [t.dir.as_path(), dir] {
+            std::fs::set_permissions(placed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::fs::write(&exe, "#!/bin/false\n").unwrap();
         place::write_stamp(&t.dir, &t.stamp(row.name, None, "sha256", None)).unwrap();
     }
+}
+
+/// What a test that ran under [`under_umask_002`] prints last, which its parent reads as the
+/// child having run it to its end.
+const UMASK_CHILD_PASSED: &str = "RAN TO ITS END under umask 002";
+
+/// Run this binary's test `provision::tests::<name>` again, alone, in a child whose umask is
+/// `002` (a user-private-group account's: Debian and Ubuntu give one, as Linux workers and
+/// guests are), and hold it to having passed and printed [`UMASK_CHILD_PASSED`]. `false` here,
+/// where the caller then returns; `true` in that child, whose umask this has set, where the
+/// caller runs its body and prints [`UMASK_CHILD_PASSED`] last. The umask is process-wide, so
+/// only a child that runs that one test may change it.
+fn under_umask_002(name: &str) -> bool {
+    const CHILD: &str = "ATERM_VERIFY_TEST_UMASK_002";
+    if std::env::var_os(CHILD).is_some() {
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this child
+        // runs this one test, so no other create sees the mask.
+        unsafe { libc::umask(0o002) };
+        return true;
+    }
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            &format!("provision::tests::{name}"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1");
+    let out = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        std::time::Duration::from_secs(60),
+        &format!("{name}, run again under umask 002"),
+    )
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains(UMASK_CHILD_PASSED),
+        "{:?}\nstdout: {stdout}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    false
+}
+
+/// THE EVERY-ROW-IN-PLACE FIXTURE MEANS THE SAME UNDER A USER-PRIVATE-GROUP UMASK: under umask
+/// `002` [`all_in_place`] still leaves each row's tree and executable directory 0755, so a plain
+/// run finds every row in place and changes nothing, fetching and spawning nothing, as it does
+/// under `022`. The tests that build on that fixture (a run that changes nothing, the rustup
+/// row's lock and pin legs, the Linux lane's musl leg) therefore read the same whatever the
+/// runner's umask. NEGATIVE CONTROL: without the fixture's explicit 0755 the child's directories
+/// are 0775 and its mode assertion fails, and the parent's with it, under any runner umask; under
+/// a runner umask of 002 the five tests that build on the fixture fail too (the rustup copy reads
+/// as not in place, and a run tries to fetch rustup-init).
+#[test]
+fn the_every_row_in_place_fixture_holds_under_a_group_umask() {
+    if !under_umask_002("the_every_row_in_place_fixture_holds_under_a_group_umask") {
+        return;
+    }
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    all_in_place(&m);
+    for row in select(&Options::default()) {
+        let Some(t) = target(row, &m) else {
+            continue;
+        };
+        let exe = t.dir.join(&t.exe);
+        assert_eq!(
+            (mode(&t.dir), mode(exe.parent().unwrap())),
+            (0o755, 0o755),
+            "{}",
+            row.name
+        );
+    }
+    let host = Fake::new();
+    let mut said = Vec::new();
+    let code = run(&Options::default(), &m, &host, &mut |l| {
+        said.push(l.to_string())
+    });
+    assert_eq!(code, crate::exit::PASS, "{said:#?}");
+    assert!(
+        host.fetched.borrow().is_empty() && host.spawns.borrow().is_empty(),
+        "{said:#?}"
+    );
+    println!("{UMASK_CHILD_PASSED}");
 }
 
 #[test]
@@ -1848,6 +1943,80 @@ fn the_rustup_row_places_a_stamped_copy_and_never_self_installs() {
     assert!(host.fetched.borrow().is_empty() && host.spawns.borrow().is_empty());
 }
 
+/// THE RUSTUP ROW'S COPY IS NEVER GROUP-WRITABLE, WHATEVER THE UMASK, AND ONE THAT IS IS PLACED
+/// AGAIN: under a user-private-group account's umask `002` the copy's tree and its `bin/` (where
+/// the release runs rustup, cargo and rustc from, `buildplan::release_rustup_shim_dir`, which
+/// refuses a directory a group or other may write) are placed 0755; a copy whose `bin/` is 0775
+/// reads as not in place, naming that mode, and a run places it again at 0755. The umask is
+/// process-wide, so the body runs alone in a child of this test binary. NEGATIVE CONTROLS:
+/// without `place_rustup`'s explicit directory mode the child's first `bin/` is 0775 and its
+/// first mode assertion fails; with a `rustup_complete` that reads `complete` alone the 0775
+/// copy reads as in place and the `check` assertion fails.
+#[test]
+fn the_rustup_rows_copy_is_never_group_writable_whatever_the_umask() {
+    if !under_umask_002("the_rustup_rows_copy_is_never_group_writable_whatever_the_umask") {
+        return;
+    }
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let init = b"#!/bin/false\nrustup-init\n".to_vec();
+    let url = "https://fixture.invalid/rustup/archive/{v}/aarch64-apple-darwin/rustup-init";
+    let row = Row {
+        name: "rustup",
+        tool: Some("rustup"),
+        install: Install::Rustup {
+            init: Box::leak(Box::new([Archive {
+                platform: "macos-aarch64",
+                url,
+                sha256: leak(sha256(&init)),
+                bytes: init.len() as u64,
+            }])),
+        },
+    };
+    let served = url.replace("{v}", "1.29.2");
+    let t = target(&row, &m).unwrap();
+    let copy = t.dir.join(&t.exe);
+    let bin = copy.parent().unwrap().to_path_buf();
+    let fresh = || {
+        let mut host = Fake::new().serve(&served, init.clone());
+        host.bare = Some(Bare::default());
+        host
+    };
+    // `Bare` installs nothing, so the row's look after its steps names what is still missing;
+    // the copy is placed all the same, and its modes are what this test holds.
+    let place = || match provide(&row, &m, &fresh(), &mut |_| {}) {
+        State::Failed(why) if why.contains("still missing after provisioning") => {
+            assert!(complete(&t), "the copy and its stamp are placed: {why}");
+        }
+        other => panic!("{other:?}"),
+    };
+    place();
+    assert_eq!(
+        (mode(&bin), mode(&t.dir)),
+        (0o755, 0o755),
+        "the copy's bin/ and tree, under umask 002"
+    );
+
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+    }
+    assert!(complete(&t), "the copy and its stamp are there");
+    match check(&row, &m, &fresh()) {
+        State::Missing(why) => assert!(
+            why.contains(&format!(
+                "{} is group/other-writable (mode 775)",
+                bin.display()
+            )),
+            "{why}"
+        ),
+        other => panic!("a copy a group may write is not in place: {other:?}"),
+    }
+    place();
+    assert_eq!((mode(&bin), mode(&t.dir)), (0o755, 0o755), "placed again");
+    println!("{UMASK_CHILD_PASSED}");
+}
+
 #[test]
 fn rustup_init_is_pinned_for_every_host_rustup_serves() {
     let row = super::row("rustup").unwrap();
@@ -1955,31 +2124,43 @@ fn a_tree_without_publish_rides_the_stock_pin_and_a_gate_that_disagrees_is_named
 /// this rustup holds gets nothing; a lock with no `[stock] toolchain` is refused with what it
 /// lacks named; one that carries no lock has no release-chain part, so a run asks nothing of the
 /// release chain and nothing of rustup's `stable` for it, and a release host (`--release`)
-/// refuses it. NEGATIVE CONTROL: this rustup holds `stable` with the slice's std, so a row that
-/// took `stable` for the release chain's finds the absent release in place and the first
-/// assertion fails; one that fell back to `stable` without a lock passes the release host and
+/// refuses it. Nothing reads the tree's own lock, which a public snapshot does not carry: the
+/// checkout and this rustup's release are the test's. NEGATIVE CONTROL: this rustup holds
+/// `stable` with the slice's std, so a row that took `stable` for the release chain's finds the
+/// absent release in place and the first `check` assertion (the lock's absent release planned
+/// for install) fails; one that fell back to `stable` without a lock passes the release host and
 /// the last ones fail.
 #[test]
 fn the_rustup_row_puts_the_locks_release_in_place_and_a_release_host_refuses_a_lockless_checkout() {
+    const HELD: &str = "1.91.1";
     let home = aterm_tempfile::tempdir().unwrap();
     let mut m = machine(home.path());
     all_in_place(&m);
     let row = super::row("rustup").unwrap();
-    let host = Fake::new();
+    let host = Fake {
+        rustup: Provisioned {
+            pin: stock::stock_pin(&repo()).expect("the tree's stock pin"),
+            release: Some(HELD.into()),
+        },
+        ..Fake::new()
+    };
     let checkout = home.path().join("checkout");
     std::fs::create_dir_all(&checkout).unwrap();
     m.repo = checkout.clone();
     let lock = |release: &str| {
-        let mut lock = aterm_toolchain::trust_lock::read(&repo().join("trust.lock")).unwrap();
-        lock.stock_toolchain = release.to_string();
+        let lock = aterm_toolchain::trust_lock::TrustLock {
+            build: 27009,
+            tree_root: "b".repeat(64),
+            compiler_commit: "5".repeat(40),
+            receipt: "SEED-MINT sha256:00".into(),
+            stock_toolchain: release.to_string(),
+        };
         std::fs::write(
             checkout.join("trust.lock"),
             aterm_toolchain::trust_lock::render_body(&lock),
         )
         .unwrap();
     };
-    let held = stock::release_toolchain(&repo(), true).unwrap().unwrap();
-    assert_ne!(held, "1.88.0");
     lock("1.88.0");
     assert_eq!(
         stock::release_toolchain(&checkout, false),
@@ -2007,7 +2188,7 @@ fn the_rustup_row_puts_the_locks_release_in_place_and_a_release_host_refuses_a_l
         other => panic!("{other:?}"),
     }
 
-    lock(&held);
+    lock(HELD);
     let copy = target(row, &m).map(|t| t.dir.join(&t.exe)).unwrap();
     assert_eq!(check(row, &m, &host), State::Present(copy.clone()));
     assert_eq!(

@@ -204,6 +204,7 @@ fn append_bulk_at(handle: &Handle, count: usize, authored_ms: u64) -> (usize, Op
                         let command = Command::Write {
                             request,
                             changes: vec![put(&MACHINE, MC, "nickname", json!(format!("n{n}")))],
+                            said: None,
                         };
                         let wire = crate::table::fixture::seal_at(
                             session,
@@ -306,6 +307,7 @@ fn history_follows_causality_when_a_writer_clock_runs_behind() {
         Command::Write {
             request: [71; 16],
             changes: machine(MC),
+            said: None,
         },
         u64::MAX,
     );
@@ -316,6 +318,7 @@ fn history_follows_causality_when_a_writer_clock_runs_behind() {
         Command::Write {
             request: [72; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+            said: None,
         },
         0,
     );
@@ -324,6 +327,7 @@ fn history_follows_causality_when_a_writer_clock_runs_behind() {
         Command::Write {
             request: [75; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("active"))],
+            said: None,
         },
         0,
     );
@@ -337,6 +341,7 @@ fn history_follows_causality_when_a_writer_clock_runs_behind() {
                 key: format!("{MC}.note"),
                 value: None,
             }],
+            said: None,
         },
         0,
     );
@@ -345,6 +350,7 @@ fn history_follows_causality_when_a_writer_clock_runs_behind() {
         Command::Write {
             request: [74; 16],
             changes: vec![put(&MACHINE, MC, "location", json!("rack b"))],
+            said: None,
         },
         0,
     );
@@ -449,6 +455,7 @@ fn a_table_reads_as_of_an_operation_and_diffs_two_points() {
         Command::Write {
             request: [81; 16],
             changes: born_row,
+            said: None,
         },
         2_000,
     );
@@ -459,6 +466,7 @@ fn a_table_reads_as_of_an_operation_and_diffs_two_points() {
         Command::Write {
             request: [82; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+            said: None,
         },
         3_000,
     );
@@ -470,6 +478,7 @@ fn a_table_reads_as_of_an_operation_and_diffs_two_points() {
                 put(&MACHINE, MC, "status", json!("lost")),
                 take_out(MC, "clis", "codex"),
             ],
+            said: None,
         },
         1_000,
     );
@@ -482,6 +491,7 @@ fn a_table_reads_as_of_an_operation_and_diffs_two_points() {
                 put(&MACHINE, MC, "nickname", json!("spare")),
                 clear(MC, "location"),
             ],
+            said: None,
         },
         4_000,
     );
@@ -2087,6 +2097,7 @@ fn the_resolved_digest_separates_any_binding() {
         Command::Write {
             request: [91; 16],
             changes: machine(MC),
+            said: None,
         },
         2_000,
     );
@@ -2096,6 +2107,7 @@ fn the_resolved_digest_separates_any_binding() {
         Command::Write {
             request: [92; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+            said: None,
         },
         3_000,
     );
@@ -2386,6 +2398,7 @@ fn history_reads_one_page_after_a_cursor_and_reports_a_moved_revision() {
         Command::Write {
             request: [92; 16],
             changes: vec![put(&MACHINE, MC, "label", json!("m10"))],
+            said: None,
         },
         u64::MAX / 2,
     );
@@ -2394,6 +2407,7 @@ fn history_reads_one_page_after_a_cursor_and_reports_a_moved_revision() {
         Command::Write {
             request: [93; 16],
             changes: vec![put(&MACHINE, MC, "label", json!("m11"))],
+            said: None,
         },
         u64::MAX / 2,
     );
@@ -2402,6 +2416,7 @@ fn history_reads_one_page_after_a_cursor_and_reports_a_moved_revision() {
         Command::Write {
             request: [94; 16],
             changes: vec![put(&MACHINE, MC, "location", json!("rack e"))],
+            said: None,
         },
         0,
     );
@@ -2514,6 +2529,7 @@ fn paged_history() -> (Lab, Handle) {
             Command::Write {
                 request: [100 + n as u8; 16],
                 changes: vec![put(&MACHINE, pk, column, json!(value))],
+                said: None,
             },
             0,
         );
@@ -2523,6 +2539,29 @@ fn paged_history() -> (Lab, Handle) {
         .unwrap();
     repair_registry(&lab, 2);
     (lab, handle)
+}
+
+#[test]
+fn view_with_history_decodes_the_head_once() {
+    let (_lab, handle) = paged_history();
+    let history = handle.history().unwrap();
+    let before = super::DECODED.get();
+    let (head, expected_usage) = handle.usage().unwrap();
+    let one_read = super::DECODED.get() - before;
+    assert!(one_read > 0);
+
+    let machine_judgments = || crate::typed::claim::projection_count(MACHINE.name);
+    let before = super::DECODED.get();
+    let before_judgments = machine_judgments();
+    let read = handle.view_with_history().unwrap();
+    assert_eq!(super::DECODED.get() - before, one_read);
+    assert_eq!(machine_judgments() - before_judgments, 1);
+    assert_eq!(read.usage, expected_usage);
+    assert_eq!(read.entries, history);
+    assert_eq!(read.machines, head.project_settled(&MACHINE));
+    assert_eq!(read.macs, Macs::of(&head));
+    assert_eq!(read.view.awaiting, head.awaiting);
+    assert_eq!(read.view.refusals, head.refusals);
 }
 
 /// The page `ask` names of a table at `revision` whose every entry is `all`, in history's order,
@@ -2567,6 +2606,8 @@ fn page_by_definition(all: &[Entry], revision: Revision, ask: &Ask) -> Page {
         moved,
         next: more.then(|| entries.last().map(Entry::cursor)).flatten(),
         entries,
+        // The fixture holds no record its reader refuses.
+        refused: Vec::new(),
     }
 }
 
@@ -2663,7 +2704,9 @@ fn every_ask(all: &[Entry], revision: Revision) -> Vec<Ask> {
 /// read the table again left: 13 right: 0`. With a page taken newest first left oldest first
 /// (`Cut::taken` turning nothing back), the sweep of cuts fails at its first newest-first page
 /// of two: `Ask { .., limit: 2, .., newest_first: true }` (the entries of the left page in the
-/// other order).
+/// other order). With the page asking after no sighting (tracker LT-25C), every page at the held
+/// revision opens the registry's store again: `a page at the held revision opened the
+/// registry's store left: 5376 right: 0`.
 #[test]
 fn a_history_page_at_a_held_revision_reads_no_record_again() {
     use super::history::{Ask, Cut, Filter};
@@ -2692,17 +2735,47 @@ fn a_history_page_at_a_held_revision_reads_no_record_again() {
     assert_eq!(kept.revision(), Some(revision));
     assert_eq!(handle.revision().unwrap(), revision);
     let asks = every_ask(&all, revision);
-    for ask in &asks {
-        let decoded = super::DECODED.get();
-        let page = handle.history_page_kept(ask, &mut kept).unwrap();
-        assert_eq!(
-            super::DECODED.get() - decoded,
-            0,
-            "a page at the held revision decoded {} records: {ask:?}",
-            super::DECODED.get() - decoded
-        );
-        assert_eq!(page, page_by_definition(&all, revision, ask), "{ask:?}");
-    }
+    // The registry's data folder, whose opens a page at the held revision makes none of.
+    let folder =
+        application::observe_store(&handle.paths, handle.descriptor(), |session, _, scope| {
+            crate::catalog::Directory::new(session.paths(), session.trust()).path(scope)
+        })
+        .unwrap();
+    let opens = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = std::rc::Rc::clone(&opens);
+    let sightings = crate::table::store::test_sightings();
+    crate::table::store::with_open_hook(
+        &folder,
+        move || {
+            counted.set(counted.get() + 1);
+            Ok(())
+        },
+        || {
+            for ask in &asks {
+                let decoded = super::DECODED.get();
+                let page = handle.history_page_kept(ask, &mut kept).unwrap();
+                assert_eq!(
+                    super::DECODED.get() - decoded,
+                    0,
+                    "a page at the held revision decoded {} records: {ask:?}",
+                    super::DECODED.get() - decoded
+                );
+                assert_eq!(page, page_by_definition(&all, revision, ask), "{ask:?}");
+            }
+        },
+    );
+    // Each opened no store, and learned the revision from the kept order's sighting (LT-25C).
+    assert_eq!(
+        opens.get(),
+        0,
+        "a page at the held revision opened the registry's store"
+    );
+    let now = crate::table::store::test_sightings();
+    assert_eq!(
+        (now.0 - sightings.0, now.1 - sightings.1),
+        (asks.len(), asks.len()),
+        "each page at the held revision stood on the kept order's sighting"
+    );
     // Taken out of the order (a page read with nothing kept) or copied from it (a kept one), a
     // page is one page.
     for ask in &asks {
@@ -2812,12 +2885,755 @@ fn a_kept_history_order_is_read_again_after_a_membership_change() {
     );
 }
 
+/// A recovery replica enrolled for the registry beside a kept order's sighting, the primary store
+/// untouched (tracker LT-25C): the primary still stands as the sighting read it, but a read of
+/// the table now reads the combined view, so the next page is read again at that view's revision
+/// and is the page read with nothing kept, never one cut from the primary's order.
+/// NEGATIVE CONTROL: with the recovery enrollment left out of `Directory::observe_table_sighted`,
+/// the page is cut from the primary's order: `a page after the enrollment holds the primary's
+/// revision` (`left` and `right` the same revision).
+#[test]
+fn a_kept_history_order_is_read_again_once_a_recovery_replica_is_enrolled() {
+    use super::history::{Ask, Filter};
+    use crate::table::store::test_sightings;
+    let (lab, handle) = paged_history();
+    let mut kept = Kept::default();
+    let ask = Ask::newest(Filter::default(), usize::MAX);
+    let before = handle.history_page_kept(&ask, &mut kept).unwrap();
+    assert_eq!(handle.history_page_kept(&ask, &mut kept).unwrap(), before);
+    assert_eq!(kept.reads(), 1, "the held page stood on its sighting");
+    {
+        let bootstrap = lab.bootstrap(0);
+        let session = crate::table::Session::open(&bootstrap).unwrap();
+        let directory = crate::catalog::Directory::new(&lab.paths[0], bootstrap.trust());
+        let scope = REGISTRY.descriptor(bootstrap.trust()).unwrap().scope;
+        drop(
+            crate::table::store::Store::join_recovery(
+                &session,
+                &directory.recovery().path(scope).unwrap(),
+                scope,
+            )
+            .unwrap(),
+        );
+    }
+    let sightings = test_sightings();
+    let after = handle.history_page_kept(&ask, &mut kept).unwrap();
+    let now = test_sightings();
+    assert_eq!(
+        (now.0 - sightings.0, now.1 - sightings.1),
+        (1, 1),
+        "the primary store, untouched, still stands as the sighting read it"
+    );
+    assert_ne!(
+        after.revision, before.revision,
+        "a page after the enrollment holds the primary's revision"
+    );
+    assert_eq!(kept.reads(), 2);
+    assert_eq!(kept.revision(), Some(after.revision));
+    assert_eq!(after, handle.history_page(&ask).unwrap());
+    assert_eq!(after.revision, handle.revision().unwrap());
+}
+
+/// A page whose first attempt read another revision, let the kept order go and was then refused
+/// as busy (the read is made again: `att::reopened`), while the store went back to the bytes the
+/// order's sighting read: the next attempt asks after no sighting, since the order it names is no
+/// longer held, and reads the store again; the page is the page read with nothing kept.
+/// Here a group permit past the witness stands beside the registry's claim, so the sighting
+/// fails and an open reads another revision; the permit that stood is put back between the
+/// attempts.
+/// NEGATIVE CONTROL: with the attempt asking after the sighting whatever `kept` holds, the second
+/// attempt's sighting stands and the page is refused: `a history sighting stood with no order
+/// kept`.
+#[test]
+fn a_history_page_made_again_after_a_busy_attempt_asks_after_no_order_it_let_go() {
+    use super::history::{Ask, Filter, with_order_let_go};
+    let (_lab, handle) = paged_history();
+    let mut kept = Kept::default();
+    let ask = Ask::newest(Filter::default(), usize::MAX);
+    let before = handle.history_page_kept(&ask, &mut kept).unwrap();
+    let (claims, scope) =
+        application::observe_store(&handle.paths, handle.descriptor(), |session, _, scope| {
+            Ok((crate::table::store::claim_dir(session)?, scope))
+        })
+        .unwrap();
+    let put_back = crate::table::store::permit_group(&claims, scope);
+    let page = with_order_let_go(
+        move || {
+            put_back();
+            Err(Error::busy())
+        },
+        || handle.history_page_kept(&ask, &mut kept),
+    )
+    .unwrap();
+    assert_eq!(page, before, "the store went back to the bytes it held");
+    assert_eq!(kept.revision(), Some(before.revision));
+    assert_eq!(kept.reads(), 2, "the page read the store again");
+}
+
+/// A cold file beside a registry that stands on no floor, which no read takes, refuses no read
+/// of History and moves no revision (tracker LT-25C), whatever it is: here a file other users
+/// can write, which a read that took it would refuse. The revision, a page with nothing kept
+/// and a kept page are what they were, and the kept page stands on its sighting. Once a recovery
+/// replica is enrolled, the combined view read in the table's place takes no cold payloads
+/// either, its primary's neither, and is read the same way.
+/// NEGATIVE CONTROLS: with `Store::revision` hashing the cold file whether or not a read takes
+/// it, as it did, the revision refuses: `cold: mode 666 lets other users write it; run chmod 600
+/// on it`. With a combined view's revision hashing its primary's cold file (`Store::files_into`
+/// handed `true` for the primary), the revision read after the enrollment refuses the same way.
+#[test]
+fn a_cold_file_no_read_takes_refuses_no_history_read() {
+    use super::history::{Ask, Filter};
+    use std::{
+        io::Write as _,
+        os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+    };
+    let (lab, handle) = paged_history();
+    let mut kept = Kept::default();
+    let ask = Ask::newest(Filter::default(), usize::MAX);
+    let before = handle.history_page_kept(&ask, &mut kept).unwrap();
+    let folder =
+        application::observe_store(&handle.paths, handle.descriptor(), |session, _, scope| {
+            crate::catalog::Directory::new(session.paths(), session.trust()).path(scope)
+        })
+        .unwrap();
+    let cold = folder.join("cold");
+    assert!(!cold.exists(), "the registry keeps no cold payloads here");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&cold)
+        .unwrap()
+        .write_all(b"not the registry's cold payloads")
+        .unwrap();
+    std::fs::set_permissions(&cold, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert_eq!(handle.revision().unwrap(), before.revision);
+    assert_eq!(handle.history_page(&ask).unwrap(), before);
+    let sightings = crate::table::store::test_sightings();
+    assert_eq!(handle.history_page_kept(&ask, &mut kept).unwrap(), before);
+    let now = crate::table::store::test_sightings();
+    assert_eq!(
+        (now.0 - sightings.0, now.1 - sightings.1),
+        (1, 1),
+        "the kept page stood on its sighting"
+    );
+    assert_eq!(kept.reads(), 1);
+
+    {
+        let bootstrap = lab.bootstrap(0);
+        let session = crate::table::Session::open(&bootstrap).unwrap();
+        let directory = crate::catalog::Directory::new(&lab.paths[0], bootstrap.trust());
+        let scope = REGISTRY.descriptor(bootstrap.trust()).unwrap().scope;
+        drop(
+            crate::table::store::Store::join_recovery(
+                &session,
+                &directory.recovery().path(scope).unwrap(),
+                scope,
+            )
+            .unwrap(),
+        );
+    }
+    let combined = handle.revision().unwrap();
+    assert_ne!(combined, before.revision, "CONTROL: the combined view");
+    let after = handle.history_page_kept(&ask, &mut kept).unwrap();
+    assert_eq!(after.revision, combined);
+    assert_eq!(after, handle.history_page(&ask).unwrap());
+}
+
+/// A page cut from a kept order says the records its read held and does not project
+/// ([`super::history::Page::refused`]) as the page read with nothing kept says them, a page that
+/// stands on the order's sighting (tracker LT-25C) and reads no record too: the registry holds a
+/// version 2 record, which its generation does not take.
+/// NEGATIVE CONTROL: with the page that stands on a sighting cut without the order's refused
+/// records: `a page that stood on its sighting says other refused records`.
+#[test]
+fn a_history_page_at_a_held_revision_says_the_records_its_read_refused() {
+    use super::history::{Ask, Filter};
+    use crate::{said::Said, typed::values::Principal};
+    let (lab, handle) = paged_history();
+    let stray = Command::Write {
+        request: [9; 16],
+        changes: vec![put(&MACHINE, MC, "note", json!("unseen"))],
+        said: Some(Box::new(Said::by(Principal {
+            program: Some("claude".to_owned()),
+            ..Principal::default()
+        }))),
+    };
+    let signed = super::said_tests::sign_raw(&lab.paths[0], &REGISTRY, &stray.encode().unwrap());
+    let ask = Ask::newest(Filter::default(), 3);
+    let unkept = handle.history_page(&ask).unwrap();
+    assert_eq!(
+        unkept
+            .refused
+            .iter()
+            .map(|unread| unread.operation)
+            .collect::<Vec<_>>(),
+        [signed],
+        "CONTROL: the read refuses the version 2 record"
+    );
+    let mut kept = Kept::default();
+    assert_eq!(handle.history_page_kept(&ask, &mut kept).unwrap(), unkept);
+    let sightings = crate::table::store::test_sightings();
+    assert_eq!(
+        handle.history_page_kept(&ask, &mut kept).unwrap(),
+        unkept,
+        "a page that stood on its sighting says other refused records"
+    );
+    let now = crate::table::store::test_sightings();
+    assert_eq!((now.0 - sightings.0, now.1 - sightings.1), (1, 1));
+    assert_eq!(kept.reads(), 1);
+}
+
+/// A catalog's table and a recovery directory's table are never answered from a sighting
+/// (tracker LT-25C): `Directory::observe_table_sighted` handed one asks after no sighting and
+/// reads the table. A sighting is made of the catalog's primary store, but the catalog is read
+/// by no reader that keeps one; a recovery directory reads its replica, which no sighting is of.
+/// NEGATIVE CONTROLS: with the catalog's scope not compared: `the catalog was asked after its
+/// sighting left: 1 right: 0`. With the recovery directory not compared: `a recovery directory
+/// was asked after the primary's sighting left: 1 right: 0`.
+#[test]
+fn a_catalog_or_recovery_table_is_never_answered_from_a_sighting() {
+    use crate::{catalog::Sighted, table::store::test_sightings};
+    let (_lab, handle) = paged_history();
+    application::observe_store(&handle.paths, handle.descriptor(), |session, _, scope| {
+        let directory = crate::catalog::Directory::new(session.paths(), session.trust());
+        let sighting_of = |scope| match directory.observe_table_sighted(session, scope, None) {
+            Ok(Sighted::Opened(store)) => store.sighted_revision(session).map(|(_, sighting)| {
+                sighting.expect("an observed primary store holding no conflict is sighted")
+            }),
+            Ok(Sighted::Unchanged) => panic!("a table with no sighting was answered unchanged"),
+            Err(error) => Err(error),
+        };
+        let registry = sighting_of(scope)?;
+        let catalog = directory.catalog_scope();
+        let of_catalog = sighting_of(catalog)?;
+        // The registry's own sighting stands: what each read below would otherwise answer.
+        let asked = test_sightings().0;
+        assert!(matches!(
+            directory.observe_table_sighted(session, scope, Some(&registry))?,
+            Sighted::Unchanged
+        ));
+        assert_eq!(test_sightings().0 - asked, 1);
+
+        let asked = test_sightings().0;
+        let read = directory.observe_table_sighted(session, catalog, Some(&of_catalog));
+        assert_eq!(
+            test_sightings().0 - asked,
+            0,
+            "the catalog was asked after its sighting"
+        );
+        assert!(matches!(read, Ok(Sighted::Opened(_))));
+        let asked = test_sightings().0;
+        let read = directory
+            .recovery()
+            .observe_table_sighted(session, scope, Some(&registry));
+        assert_eq!(
+            test_sightings().0 - asked,
+            0,
+            "a recovery directory was asked after the primary's sighting"
+        );
+        assert!(!matches!(read, Ok(Sighted::Unchanged)));
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// The data folder of `handle`'s table on its Mac: the folder whose opens [`counted`] counts.
+fn data_folder(handle: &Handle) -> PathBuf {
+    application::observe_store(&handle.paths, handle.descriptor(), |session, _, scope| {
+        crate::catalog::Directory::new(session.paths(), session.trust()).path(scope)
+    })
+    .unwrap()
+}
+
+/// What `read` answers, with how many opens of the store in data folder `folder` it made past
+/// the store's claim (`table::store::with_open_hook`: a sighting asked to stand makes none), and
+/// how many sightings it asked to stand and how many of them stood.
+fn counted<T>(folder: &Path, read: impl FnOnce() -> T) -> (T, usize, (usize, usize)) {
+    let opens = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = std::rc::Rc::clone(&opens);
+    let before = crate::table::store::test_sightings();
+    let read = crate::table::store::with_open_hook(
+        folder,
+        move || {
+            count.set(count.get() + 1);
+            Ok(())
+        },
+        read,
+    );
+    let now = crate::table::store::test_sightings();
+    (read, opens.get(), (now.0 - before.0, now.1 - before.1))
+}
+
+/// A revision asked again by a reader that keeps a sighting opens no store while the store
+/// stands (tracker LT-25D, the Tables page's change check): the first ask, nothing kept, opens
+/// the registry's store once, as the plain read does each time, and keeps that open's sighting
+/// and no order; each ask after it asks the sighting, which stands, opens no store, decodes no
+/// record and answers the revision the plain read (`Handle::revision`, a full open) answers.
+/// NEGATIVE CONTROL: with `Handle::revision_kept` asking after no sighting (`None` handed to
+/// `application::observe_store_sighted`), each ask opens the store: `a revision asked again
+/// opened the registry's store left: 1 right: 0`.
+#[test]
+fn a_revision_asked_again_opens_no_store_while_it_stands() {
+    let (_lab, handle) = paged_history();
+    let folder = data_folder(&handle);
+    let plain = handle.revision().unwrap();
+    let mut kept = Kept::default();
+    assert_eq!((kept.sighted(), kept.revision()), (None, None));
+    let (first, opens, sightings) = counted(&folder, || handle.revision_kept(&mut kept));
+    assert_eq!(first.unwrap(), plain);
+    assert_eq!(
+        (opens, sightings),
+        (1, (0, 0)),
+        "with nothing kept the store is opened once and no sighting asked"
+    );
+    assert_eq!(kept.sighted(), Some(plain), "the open's sighting is kept");
+    assert_eq!(
+        (kept.revision(), kept.reads()),
+        (None, 0),
+        "a revision read builds no order"
+    );
+    // CONTROL: the plain read opens the store each time it is asked.
+    let (again, opens, _) = counted(&folder, || handle.revision());
+    assert_eq!((again.unwrap(), opens), (plain, 1));
+    for _ in 0..3 {
+        let decoded = super::DECODED.get();
+        let (again, opens, sightings) = counted(&folder, || handle.revision_kept(&mut kept));
+        assert_eq!(
+            again.unwrap(),
+            plain,
+            "a revision asked again is the one an open reads"
+        );
+        assert_eq!(
+            opens, 0,
+            "a revision asked again opened the registry's store"
+        );
+        assert_eq!(
+            sightings,
+            (1, 1),
+            "a revision asked again stood on the kept sighting"
+        );
+        assert_eq!(super::DECODED.get(), decoded);
+    }
+    assert_eq!(handle.revision().unwrap(), plain);
+    assert_eq!(kept.sighted(), Some(plain));
+    assert_eq!((kept.revision(), kept.reads()), (None, 0));
+}
+
+/// A revision asked after the table moved is the new one, never the held one (tracker LT-25D):
+/// after a record is written, after a membership change that writes no record (Mac 1 made a
+/// Reader), and after a group permit is written beside the claim and again once it is put back,
+/// the kept sighting is asked, fails, the store is opened once and the answer is what the plain
+/// read answers; that open's sighting is kept in its turn and the next ask stands on it.
+/// NEGATIVE CONTROL: with `Handle::revision_kept` answering the kept sighting's revision without
+/// asking it: `a revision asked after a record was written is the held one` (`left` and
+/// `right` the same revision).
+#[test]
+fn a_revision_asked_after_the_table_moved_is_the_new_one() {
+    let (lab, handle) = paged_history();
+    let folder = data_folder(&handle);
+    let mut kept = Kept::default();
+    let mut held = handle.revision_kept(&mut kept).unwrap();
+    let (claims, scope) =
+        application::observe_store(&handle.paths, handle.descriptor(), |session, _, scope| {
+            Ok((crate::table::store::claim_dir(session)?, scope))
+        })
+        .unwrap();
+    let mut put_back = None;
+    for what in [
+        "a record was written",
+        "a membership change",
+        "a group permit was written",
+        "the group permit was put back",
+    ] {
+        match what {
+            "a record was written" => Registry::at(handle.paths.clone())
+                .write(vec![vec![put(&MACHINE, OTHER, "label", json!("m11"))]])
+                .unwrap(),
+            "a membership change" => lab.admit(&[Role::Writer, Role::Reader]),
+            "a group permit was written" => {
+                put_back = Some(crate::table::store::permit_group(&claims, scope));
+            }
+            _ => put_back.take().unwrap()(),
+        }
+        let (moved, opens, sightings) = counted(&folder, || handle.revision_kept(&mut kept));
+        let moved = moved.unwrap();
+        assert_ne!(moved, held, "a revision asked after {what} is the held one");
+        assert_eq!(moved, handle.revision().unwrap(), "after {what}");
+        assert_eq!(
+            (opens, sightings),
+            (1, (1, 0)),
+            "after {what} the kept sighting failed and the store was opened once"
+        );
+        assert_eq!(kept.sighted(), Some(moved), "after {what}");
+        let (again, opens, sightings) = counted(&folder, || handle.revision_kept(&mut kept));
+        assert_eq!(again.unwrap(), moved, "after {what}");
+        assert_eq!((opens, sightings), (0, (1, 1)), "after {what}");
+        held = moved;
+    }
+}
+
+/// A revision read and History's pages keep one sighting between them (tracker LT-25D). A
+/// reader whose first read is a revision read keeps that open's sighting and no order; the
+/// History page after it must read the records, so it opens the store once, asking after no
+/// sighting (it holds no order to cut from), and the two are of one revision: with a sighting
+/// kept, a revision read and then the first page open the store once in total. From then a
+/// revision read and a page, in any order, open no store, each standing on the one kept
+/// sighting. A reader whose first read is a page then reads the revision without an open. Once a
+/// record is written, the revision read opens the store, reads the new revision and lets the
+/// order of the old one go; the page after it reads the new revision's records, says the table
+/// moved and heads with the new record, never a page of the old order.
+/// NEGATIVE CONTROLS: with a page that reads the store keeping no sighting of its open
+/// (`Served::Read` leaving `kept.seen` empty): `the page that read the store keeps its order
+/// and its open's sighting left: (Some(..), None, 1) right: (Some(..), Some(..), 1)`. With a
+/// page asking after the kept sighting whatever order it holds, the first page after a revision
+/// read is refused: `a history sighting stood with no order kept`. With the revision read
+/// leaving the old order kept: `the revision read let the order of the revision the table left
+/// go left: (Some(..), Some(..)) right: (None, Some(..))`, the page after it still read from the
+/// store. With the page asking after the sighting of any order of its home and table (in its
+/// ask and where the sighting stood), the test passes: the revision read let that order go.
+/// With both, the page after the write is cut from the old order while the sighting of the new
+/// revision stands: `the page after a moved revision read is of the new revision` (`left` the
+/// revision the table left).
+#[test]
+fn a_revision_read_and_a_history_page_share_one_kept_sighting() {
+    use super::history::{Ask, Filter};
+    let (_lab, handle) = paged_history();
+    let folder = data_folder(&handle);
+    let ask = Ask::newest(Filter::default(), 3);
+    let mut kept = Kept::default();
+    let revision = handle.revision_kept(&mut kept).unwrap();
+    // A sighting kept and no order: the revision read stands on it, and the page reads the
+    // records in the one open the two make.
+    let ((again, page), opens, sightings) = counted(&folder, || {
+        let again = handle.revision_kept(&mut kept).unwrap();
+        (again, handle.history_page_kept(&ask, &mut kept).unwrap())
+    });
+    assert_eq!(again, revision);
+    assert_eq!(
+        (opens, sightings),
+        (1, (1, 1)),
+        "a revision read and the first page after it opened the store once in total"
+    );
+    assert_eq!(page.revision, revision);
+    assert_eq!(page, handle.history_page(&ask).unwrap());
+    assert_eq!(
+        (kept.revision(), kept.sighted(), kept.reads()),
+        (Some(revision), Some(revision), 1),
+        "the page that read the store keeps its order and its open's sighting"
+    );
+    // From then neither opens the store, in either order.
+    let (served, opens, sightings) = counted(&folder, || {
+        [
+            handle.revision_kept(&mut kept).unwrap() == revision,
+            handle.history_page_kept(&ask, &mut kept).unwrap() == page,
+            handle.history_page_kept(&ask, &mut kept).unwrap() == page,
+            handle.revision_kept(&mut kept).unwrap() == revision,
+        ]
+    });
+    assert_eq!(served, [true; 4]);
+    assert_eq!(
+        (opens, sightings),
+        (0, (4, 4)),
+        "a revision read and a page at the held revision each stood on the one kept sighting"
+    );
+    assert_eq!(kept.reads(), 1);
+
+    // A page first: the revision read after it stands on the page's sighting.
+    let mut paged = Kept::default();
+    assert_eq!(handle.history_page_kept(&ask, &mut paged).unwrap(), page);
+    let (after, opens, sightings) = counted(&folder, || handle.revision_kept(&mut paged));
+    assert_eq!(after.unwrap(), revision);
+    assert_eq!(opens, 0, "a revision read after a page opened the store");
+    assert_eq!(sightings, (1, 1));
+
+    // A record written: the revision read opens the store and lets the old order go, and the
+    // page after it is of the new revision.
+    Registry::at(handle.paths.clone())
+        .write(vec![vec![put(&MACHINE, OTHER, "label", json!("m11"))]])
+        .unwrap();
+    let (moved, opens, sightings) = counted(&folder, || handle.revision_kept(&mut kept));
+    let moved = moved.unwrap();
+    assert_ne!(moved, revision);
+    assert_eq!(moved, handle.revision().unwrap());
+    assert_eq!((opens, sightings), (1, (1, 0)));
+    let let_go = (kept.revision(), kept.sighted());
+    let older = Ask {
+        revision: Some(revision),
+        ..ask.clone()
+    };
+    let (after, opens, sightings) =
+        counted(&folder, || handle.history_page_kept(&older, &mut kept));
+    let after = after.unwrap();
+    assert_eq!(
+        after.revision, moved,
+        "the page after a moved revision read is of the new revision"
+    );
+    assert!(after.moved);
+    assert_eq!(
+        after.entries[0].changes,
+        [put(&MACHINE, OTHER, "label", json!("m11"))],
+        "the new record heads the page"
+    );
+    assert_eq!(after, handle.history_page(&older).unwrap());
+    assert_eq!((opens, sightings), (1, (0, 0)));
+    assert_eq!(
+        (kept.revision(), kept.sighted(), kept.reads()),
+        (Some(moved), Some(moved), 2)
+    );
+    assert_eq!(
+        let_go,
+        (None, Some(moved)),
+        "the revision read let the order of the revision the table left go"
+    );
+    // The reader that read a page first: its page reads the new revision, and its revision read
+    // after that opens nothing.
+    let (after, opens, sightings) =
+        counted(&folder, || handle.history_page_kept(&older, &mut paged));
+    assert_eq!(after.unwrap().revision, moved);
+    assert_eq!((opens, sightings), (1, (1, 0)));
+    let (after, opens, sightings) = counted(&folder, || handle.revision_kept(&mut paged));
+    assert_eq!(after.unwrap(), moved);
+    assert_eq!((opens, sightings), (0, (1, 1)));
+}
+
+/// A kept sighting is asked only of the home and the table it was made of (tracker LT-25D): a
+/// revision asked with a sighting of another Mac's registry, or of another table at the same
+/// home (the tracker), asks after no sighting, opens that table's store once and answers what
+/// the plain read answers there; the sighting kept is then that open's.
+/// NEGATIVE CONTROL: with a kept sighting taken to be of any home and table (`Seen::is_of`
+/// answering `true`), the sighting is asked of a store it was not made of, whose claim refuses
+/// it: `a sighting of another home was asked left: 1 right: 0`.
+#[test]
+fn a_revision_asked_with_a_sighting_of_another_home_or_table_opens_the_store() {
+    let (lab, handle) = paged_history();
+    let mut kept = Kept::default();
+    let here = handle.revision_kept(&mut kept).unwrap();
+    assert_eq!(kept.sighted(), Some(here));
+
+    let peer = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    let (there, opens, sightings) = counted(&data_folder(&peer), || peer.revision_kept(&mut kept));
+    let there = there.unwrap();
+    assert_eq!(sightings.0, 0, "a sighting of another home was asked");
+    assert_eq!(opens, 1, "the other home's store is opened");
+    assert_eq!(there, peer.revision().unwrap());
+    assert_ne!(there, here, "CONTROL: two homes, two revisions");
+    assert_eq!(kept.sighted(), Some(there));
+    // And back: the peer's sighting is not asked of this home either.
+    let (back, opens, sightings) =
+        counted(&data_folder(&handle), || handle.revision_kept(&mut kept));
+    assert_eq!(back.unwrap(), here);
+    assert_eq!((opens, sightings.0), (1, 0));
+
+    crate::file::tests::declare(&lab.paths[0], &TRACKER);
+    let tracker = Handle::at(lab.paths[0].clone(), &TRACKER);
+    let (other, opens, sightings) =
+        counted(&data_folder(&tracker), || tracker.revision_kept(&mut kept));
+    let other = other.unwrap();
+    assert_eq!(sightings.0, 0, "a sighting of another table was asked");
+    assert_eq!(opens, 1, "the other table's store is opened");
+    assert_eq!(other, tracker.revision().unwrap());
+    assert_ne!(other, here, "CONTROL: two tables, two revisions");
+    assert_eq!(kept.sighted(), Some(other));
+    // Each stands on a sighting of its own.
+    let mut registry = Kept::default();
+    assert_eq!(handle.revision_kept(&mut registry).unwrap(), here);
+    let (again, opens, sightings) =
+        counted(&data_folder(&tracker), || tracker.revision_kept(&mut kept));
+    assert_eq!((again.unwrap(), opens, sightings), (other, 0, (1, 1)));
+    let (again, opens, sightings) = counted(&data_folder(&handle), || {
+        handle.revision_kept(&mut registry)
+    });
+    assert_eq!((again.unwrap(), opens, sightings), (here, 0, (1, 1)));
+}
+
+/// A kept sighting is of the home whose store was opened, never of the path its handle was made
+/// at (tracker LT-25D). Once this Mac's writer is succeeded the same handle reads the successor
+/// home's store, in another data folder at another revision. The sighting a revision read kept,
+/// and the one a page kept with its order, are of the original home's store: neither read asks
+/// it of the successor's. Each opens the successor's store once, asking after no sighting, and
+/// answers what the plain read answers there; the sighting kept is then of the successor home,
+/// and the next revision read and page stand on it and open nothing.
+/// NEGATIVE CONTROL: with `application::observe_store_sighted` handing the reader the path the
+/// read was asked at in place of the home it selected, the sighting of the original home's
+/// store is asked of the successor's, whose claim refuses it: `a revision read asked the
+/// successor home's store after a sighting of the original home's left: (1, (1, 0)) right: (1,
+/// (0, 0))`. With a page asking the kept sighting wherever it is of the handle's path
+/// (`Seen::is_of` handed `self.paths` in `read_history_page`): `a page asked the successor
+/// home's store after a sighting of the original home's left: (1, (1, 0)) right: (1, (0, 0))`.
+#[test]
+fn a_sighting_kept_before_a_succession_is_not_asked_of_the_successor_home() {
+    use super::history::{Ask, Filter};
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    registry
+        .write(vec![machine(MC), other_machine(OTHER, "m8")])
+        .unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let ask = Ask::newest(Filter::default(), 3);
+    let mut marked = Kept::default();
+    let held = handle.revision_kept(&mut marked).unwrap();
+    let mut paged = Kept::default();
+    assert_eq!(
+        handle.history_page_kept(&ask, &mut paged).unwrap().revision,
+        held
+    );
+    let before = data_folder(&handle);
+    // CONTROL: before the succession each stands on its sighting.
+    let (stood, opens, sightings) = counted(&before, || {
+        (
+            handle.revision_kept(&mut marked).unwrap(),
+            handle.history_page_kept(&ask, &mut paged).unwrap().revision,
+        )
+    });
+    assert_eq!((stood, opens, sightings), ((held, held), 0, (2, 2)));
+
+    crate::generation::tests::succeed(&mut lab);
+    let after = data_folder(&handle);
+    assert_ne!(
+        after, before,
+        "CONTROL: the same handle now reads another home's store"
+    );
+    let plain = handle.revision().unwrap();
+    assert_ne!(plain, held, "CONTROL: two homes, two revisions");
+
+    let (mark, opens, sightings) = counted(&after, || handle.revision_kept(&mut marked));
+    assert_eq!(mark.unwrap(), plain, "the revision is the successor home's");
+    assert_eq!(
+        (opens, sightings),
+        (1, (0, 0)),
+        "a revision read asked the successor home's store after a sighting of the original \
+         home's"
+    );
+    assert_eq!(marked.sighted(), Some(plain));
+    let (page, opens, sightings) = counted(&after, || handle.history_page_kept(&ask, &mut paged));
+    assert_eq!(page.unwrap(), handle.history_page(&ask).unwrap());
+    assert_eq!(
+        (opens, sightings),
+        (1, (0, 0)),
+        "a page asked the successor home's store after a sighting of the original home's"
+    );
+    assert_eq!(
+        (paged.revision(), paged.sighted()),
+        (Some(plain), Some(plain))
+    );
+    // The sightings kept now are of the successor home: each read stands on its own.
+    let (stood, opens, sightings) = counted(&after, || {
+        (
+            handle.revision_kept(&mut marked).unwrap(),
+            handle.history_page_kept(&ask, &mut paged).unwrap().revision,
+            handle.revision_kept(&mut paged).unwrap(),
+        )
+    });
+    assert_eq!(
+        (stood, opens, sightings),
+        ((plain, plain, plain), 0, (3, 3)),
+        "a sighting made of the successor home's store stands for it"
+    );
+}
+
+/// A refused read leaves the kept sighting as it was, never one of a store it did not read
+/// (tracker LT-25D). A group permit written beside the registry's claim fails the kept sighting,
+/// and the open the read falls back to refuses: the revision read, and a page, are refused with
+/// that open's refusal, and the sighting and the order kept are the ones held before. With the
+/// permit put back, the store standing byte for byte as the sighting read it, the next revision
+/// read and page stand on that sighting and open nothing. Where the store did move (a record
+/// written) and the open refuses, the read is refused and never answered the held revision; the
+/// next read that opens the store answers the new one.
+/// NEGATIVE CONTROLS: with `Handle::revision_kept` taking the sighting out of `kept` before its
+/// read and putting none back when refused: `a refused revision read leaves the kept sighting
+/// as it was left: None right: Some(Revision(..))`. With a refused page putting no sighting
+/// back: `a refused page leaves the kept sighting as it was left: None right: Some(..)`.
+#[test]
+fn a_refused_revision_read_leaves_the_kept_sighting_as_it_was() {
+    use super::history::{Ask, Filter};
+    let (_lab, handle) = paged_history();
+    let folder = data_folder(&handle);
+    let ask = Ask::newest(Filter::default(), 3);
+    let mut kept = Kept::default();
+    let page = handle.history_page_kept(&ask, &mut kept).unwrap();
+    let held = handle.revision_kept(&mut kept).unwrap();
+    assert_eq!(page.revision, held);
+    let (claims, scope) =
+        application::observe_store(&handle.paths, handle.descriptor(), |session, _, scope| {
+            Ok((crate::table::store::claim_dir(session)?, scope))
+        })
+        .unwrap();
+    // `read`, every open of the registry's store refusing; with the sightings it asked and
+    // those that stood.
+    fn refusing<T>(folder: &Path, read: impl FnOnce() -> Result<T>) -> (String, (usize, usize)) {
+        let before = crate::table::store::test_sightings();
+        let refusal = crate::table::store::with_open_hook(
+            folder,
+            || Err(Error::new("the open refuses")),
+            read,
+        )
+        .err()
+        .expect("the read is refused")
+        .to_string();
+        let now = crate::table::store::test_sightings();
+        (refusal, (now.0 - before.0, now.1 - before.1))
+    }
+
+    let put_back = crate::table::store::permit_group(&claims, scope);
+    let (refusal, sightings) = refusing(&folder, || handle.revision_kept(&mut kept));
+    assert!(refusal.contains("the open refuses"), "{refusal}");
+    assert_eq!(sightings, (1, 0), "the sighting failed before the open");
+    assert_eq!(
+        kept.sighted(),
+        Some(held),
+        "a refused revision read leaves the kept sighting as it was"
+    );
+    let (refusal, sightings) = refusing(&folder, || handle.history_page_kept(&ask, &mut kept));
+    assert!(refusal.contains("the open refuses"), "{refusal}");
+    assert_eq!(sightings, (1, 0));
+    assert_eq!(
+        kept.sighted(),
+        Some(held),
+        "a refused page leaves the kept sighting as it was"
+    );
+    assert_eq!((kept.revision(), kept.reads()), (Some(held), 1));
+    put_back();
+    let (served, opens, sightings) = counted(&folder, || {
+        (
+            handle.revision_kept(&mut kept).unwrap(),
+            handle.history_page_kept(&ask, &mut kept).unwrap(),
+        )
+    });
+    assert_eq!(served, (held, page));
+    assert_eq!(
+        (opens, sightings),
+        (0, (2, 2)),
+        "the sighting a refused read left stands for the store it read"
+    );
+
+    // The store moved and the open refuses: no answer, and none of the held revision.
+    Registry::at(handle.paths.clone())
+        .write(vec![vec![put(&MACHINE, OTHER, "label", json!("m11"))]])
+        .unwrap();
+    let (refusal, sightings) = refusing(&folder, || handle.revision_kept(&mut kept));
+    assert!(refusal.contains("the open refuses"), "{refusal}");
+    assert_eq!(sightings, (1, 0));
+    assert_eq!(kept.sighted(), Some(held));
+    let (moved, opens, sightings) = counted(&folder, || handle.revision_kept(&mut kept));
+    let moved = moved.unwrap();
+    assert_ne!(
+        moved, held,
+        "a changed store is never answered the held revision"
+    );
+    assert_eq!(moved, handle.revision().unwrap());
+    assert_eq!((opens, sightings), (1, (1, 0)));
+    assert_eq!((kept.sighted(), kept.revision()), (Some(moved), None));
+}
+
 /// Seal, on Mac `from`, a typed write whose causal parent never arrives anywhere, and give it to
 /// Mac `to`: the record a slow or partitioned peer leaves waiting (`Log::awaited`).
 fn withhold_on(lab: &Lab, from: usize, to: usize, changes: Vec<crate::database::Change>) {
     let command = Command::Write {
         request: crate::crypto::random().unwrap(),
         changes,
+        said: None,
     };
     let missing = [91; 32];
     let wire = application::with_store(
@@ -3067,6 +3883,7 @@ fn a_registry_checkpoint_waits_on_the_fence_then_two_seats_sign_one_body() {
         Command::Write {
             request: [91; 16],
             changes: machine(MC),
+            said: None,
         },
         then + 1_000,
     );
@@ -3077,6 +3894,7 @@ fn a_registry_checkpoint_waits_on_the_fence_then_two_seats_sign_one_body() {
         Command::Write {
             request: [92; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+            said: None,
         },
         then + 2_000,
     );
@@ -3086,6 +3904,7 @@ fn a_registry_checkpoint_waits_on_the_fence_then_two_seats_sign_one_body() {
         Command::Write {
             request: [93; 16],
             changes: vec![put(&MACHINE, MC, "nickname", json!("spare"))],
+            said: None,
         },
         then + 3_000,
     );
@@ -3108,10 +3927,10 @@ fn a_registry_checkpoint_waits_on_the_fence_then_two_seats_sign_one_body() {
         ledger
     };
     let older = heard_at(hearing::Version(0, 202, 0));
-    assert_eq!(
+    assert!(matches!(
         here.checkpoint_every(&older, now, 1).unwrap(),
         Signed::Fenced
-    );
+    ));
     let ready = heard_at(hearing::READS_CHECKPOINTS);
     assert_eq!(
         here.checkpoint_every(&ready, now, 1).unwrap(),
@@ -3278,7 +4097,9 @@ fn a_history_entry_names_its_writers_machine_row() {
     let mut lines = tsv.lines();
     assert_eq!(
         lines.next(),
-        Some("time\tmac\tkind\tinert\tcollection\trow\tcolumn\tvalue\toperation")
+        Some(
+            "time\tmac\tkind\tinert\tcollection\trow\tcolumn\tvalue\toperation\tby\treason\tevidence"
+        )
     );
     let line = lines
         .find(|line| line.contains("rack z"))
@@ -3400,6 +4221,7 @@ fn a_writer_past_its_quota_writes_on_once_a_checkpoint_is_final() {
         Command::Write {
             request: [91; 16],
             changes: machine(MC),
+            said: None,
         },
         then,
     );
@@ -3425,10 +4247,10 @@ fn a_writer_past_its_quota_writes_on_once_a_checkpoint_is_final() {
         ledger
     };
     let older = heard_at(hearing::Version(0, 202, 0));
-    assert_eq!(
+    assert!(matches!(
         here.checkpoint_every(&older, now, 1).unwrap(),
         Signed::Fenced
-    );
+    ));
     assert_eq!(
         append_bulk_at(&here, 1, then).0,
         0,
@@ -3506,6 +4328,7 @@ fn a_read_after_a_final_checkpoint_opens_no_body_below_it() {
         Command::Write {
             request: [91; 16],
             changes: machine(MC),
+            said: None,
         },
         then,
     );
@@ -3598,6 +4421,7 @@ fn operations_under_checkpoints(rounds: u64, each: usize) -> (Lab, Vec<Handle>, 
         Command::Write {
             request: [91; 16],
             changes: machine(MC),
+            said: None,
         },
         start - 20 * DAY,
     );
@@ -3718,8 +4542,14 @@ fn table_outlives_operation_cap_via_checkpoint_writes() {
 /// kept, then, keeping their order ([`Kept`]), the first page again, Read older three times, a
 /// filter change (the kind, then a table) and a Find's bounded scan of 2,048, each at the
 /// revision the first page was read at, and the first page after one more record. Each kept
-/// page is the page read with nothing kept. Prints each one's median of three wall times in
-/// this build's profile; asserts nothing about time.
+/// page is the page read with nothing kept. It serves the Tables page's change check too
+/// (tracker LT-25D): the revision read by a full open, by a reader that keeps a sighting (its
+/// first ask, which opens the store, then asked again), asked of the sighting a page kept, and
+/// asked after one more record. Prints each one's median of three wall times in this build's
+/// profile; asserts nothing about time. Every time is taken on this test's own thread, in the
+/// process that wrote the fixture and has opened the store before: none is a newly started
+/// process's first open, and none is taken on the Tables page's reader thread, which runs at
+/// background priority. `revision asked, nothing kept` is one sample, not a median.
 /// Run it alone: `targo --unverified test -p aterm-db --lib -- --ignored --nocapture
 /// att::tests::history_pages_at_100000_records_cost`.
 #[test]
@@ -3764,6 +4594,24 @@ fn history_pages_at_100000_records_cost() {
             .collect(),
     );
     eprintln!("revision read: {revision:?}");
+    // The change check of a reader that reads no History: it keeps a sighting and no order.
+    let mut marked = Kept::default();
+    let at = Instant::now();
+    let opened = here.revision_kept(&mut marked).unwrap();
+    eprintln!("revision asked, nothing kept: {:?}", at.elapsed());
+    assert_eq!(opened, here.revision().unwrap());
+    let asked_again = |what: &str, kept: &mut Kept| {
+        let times: Vec<Duration> = (0..3)
+            .map(|_| {
+                let at = Instant::now();
+                assert_eq!(here.revision_kept(kept).unwrap(), opened);
+                at.elapsed()
+            })
+            .collect();
+        eprintln!("{what}: {:?} (of 3: {times:?})", median(times.clone()));
+    };
+    asked_again("revision asked again, sighting kept", &mut marked);
+    assert_eq!((marked.revision(), marked.sighted()), (None, Some(opened)));
     let first_ask = Ask::newest(Filter::default(), 100);
     let first = timed("first page, nothing kept", &mut || {
         here.history_page(&first_ask).unwrap()
@@ -3774,6 +4622,7 @@ fn history_pages_at_100000_records_cost() {
     let filled = here.history_page_kept(&first_ask, &mut kept).unwrap();
     eprintln!("first page, filling kept: {:?}", at.elapsed());
     assert_eq!(filled, first);
+    asked_again("revision asked after a page, its sighting kept", &mut kept);
     let mut measure = |what: &str, ask: &Ask| -> Page {
         let served = timed(what, &mut || {
             here.history_page_kept(ask, &mut kept).unwrap()
@@ -3820,6 +4669,10 @@ fn history_pages_at_100000_records_cost() {
     eprintln!("first page after a write: {:?}", at.elapsed());
     assert_ne!(moved.revision, first.revision);
     assert_eq!(moved, here.history_page(&first_ask).unwrap());
+    let at = Instant::now();
+    let after = here.revision_kept(&mut marked).unwrap();
+    eprintln!("revision asked after a write: {:?}", at.elapsed());
+    assert_eq!(after, moved.revision);
     eprintln!("history holds {} entries", here.history().unwrap().len());
 }
 
@@ -3936,6 +4789,7 @@ fn sealed_record(
             let command = Command::Write {
                 request: [request; 16],
                 changes,
+                said: None,
             };
             let wire = seal_history_at(session, store, scope, &command, authored_ms)?;
             Ok((session.authenticate(scope, &wire)?.header().id, wire))
@@ -3969,6 +4823,7 @@ fn archive(handle: &Handle, request: u8, record: Digest, wire: &[u8]) -> Digest 
                 archived("wire", json!(aterm_secrets::b64::encode_padded(wire))),
                 archived("row", json!("live")),
             ],
+            said: None,
         },
         u64::from(request) * 1_000,
     )
@@ -4048,6 +4903,7 @@ fn a_cell_lists_every_value_it_held_and_a_write_lists_what_it_had_not_seen() {
         Command::Write {
             request: [81; 16],
             changes: machine(MC),
+            said: None,
         },
         2_000,
     );
@@ -4058,6 +4914,7 @@ fn a_cell_lists_every_value_it_held_and_a_write_lists_what_it_had_not_seen() {
         Command::Write {
             request: [82; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+            said: None,
         },
         3_000,
     );
@@ -4069,6 +4926,7 @@ fn a_cell_lists_every_value_it_held_and_a_write_lists_what_it_had_not_seen() {
                 put(&MACHINE, MC, "status", json!("lost")),
                 take_out(MC, "clis", "codex"),
             ],
+            said: None,
         },
         1_000,
     );
@@ -4160,6 +5018,7 @@ fn a_cell_lists_every_value_it_held_and_a_write_lists_what_it_had_not_seen() {
         Command::Write {
             request: [84; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("active"))],
+            said: None,
         },
         4_000,
     );
@@ -4216,6 +5075,7 @@ fn a_write_lists_what_has_written_its_cells_since() {
         Command::Write {
             request: [85; 16],
             changes: machine(MC),
+            said: None,
         },
         2_000,
     );
@@ -4226,6 +5086,7 @@ fn a_write_lists_what_has_written_its_cells_since() {
         Command::Write {
             request: [86; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+            said: None,
         },
         3_000,
     );
@@ -4237,6 +5098,7 @@ fn a_write_lists_what_has_written_its_cells_since() {
                 put(&MACHINE, MC, "status", json!("lost")),
                 take_out(MC, "clis", "codex"),
             ],
+            said: None,
         },
         1_000,
     );
@@ -4246,6 +5108,7 @@ fn a_write_lists_what_has_written_its_cells_since() {
         Command::Write {
             request: [88; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("active"))],
+            said: None,
         },
         4_000,
     );
@@ -4322,6 +5185,7 @@ fn a_rows_writes_are_read_once_in_history_order_with_their_macs() {
         Command::Write {
             request: [91; 16],
             changes: machine(MC),
+            said: None,
         },
         2_000,
     );
@@ -4332,6 +5196,7 @@ fn a_rows_writes_are_read_once_in_history_order_with_their_macs() {
         Command::Write {
             request: [92; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+            said: None,
         },
         3_000,
     );
@@ -4343,6 +5208,7 @@ fn a_rows_writes_are_read_once_in_history_order_with_their_macs() {
                 put(&MACHINE, MC, "status", json!("lost")),
                 take_out(MC, "clis", "codex"),
             ],
+            said: None,
         },
         1_000,
     );
@@ -4437,6 +5303,7 @@ fn a_rows_writes_answer_by_their_bound() {
         Command::Write {
             request: [94; 16],
             changes: machine(MC),
+            said: None,
         },
         2_000,
     );
@@ -4484,6 +5351,7 @@ fn a_cells_values_never_carry_a_secret() {
             Command::Write {
                 request: [request; 16],
                 changes,
+                said: None,
             },
             u64::from(request) * 1_000,
         )
@@ -4568,6 +5436,7 @@ fn an_owned_rows_values_are_its_own_macs_whole_rows() {
             Command::Write {
                 request: [request; 16],
                 changes: vec![change],
+                said: None,
             },
             u64::from(request) * 1_000,
         )
@@ -4636,6 +5505,7 @@ fn a_revert_is_listed_with_its_target_and_a_refused_one_is_not() {
             Command::Write {
                 request: [request; 16],
                 changes,
+                said: None,
             },
             u64::from(request) * 1_000,
         )
@@ -4702,6 +5572,7 @@ fn a_revert_is_listed_with_its_target_and_a_refused_one_is_not() {
                 put(&MACHINE, MC, "location", json!("rack z")),
                 put(&MACHINE, MC, "nickname", json!("junk")),
             ],
+            said: None,
         },
         9_000,
     );
@@ -4727,6 +5598,7 @@ fn a_set_members_values_are_its_own_register() {
             Command::Write {
                 request: [request; 16],
                 changes,
+                said: None,
             },
             u64::from(request) * 1_000,
         )
@@ -4869,6 +5741,7 @@ fn a_cells_values_read_through_a_registry_roll() {
             Command::Write {
                 request: [request; 16],
                 changes,
+                said: None,
             },
             u64::from(request) * 1_000,
         )
@@ -4885,6 +5758,7 @@ fn a_cells_values_read_through_a_registry_roll() {
         Command::Write {
             request: [21; 16],
             changes: vec![stored("location", &token)],
+            said: None,
         },
         1_500,
     );
@@ -5180,6 +6054,7 @@ fn a_rolled_rows_writes_are_carried() {
             Command::Write {
                 request: [request; 16],
                 changes,
+                said: None,
             },
             u64::from(request) * 1_000,
         )
@@ -5309,6 +6184,7 @@ fn a_claims_reentry_stands_as_the_writes_it_reasserts() {
             Command::Write {
                 request: [request; 16],
                 changes,
+                said: None,
             },
             u64::from(request) * 1_000,
         )
@@ -5405,6 +6281,7 @@ fn a_cells_values_never_show_a_refused_string() {
             Command::Write {
                 request: [request; 16],
                 changes,
+                said: None,
             },
             u64::from(request) * 1_000,
         )
@@ -5597,6 +6474,7 @@ fn an_owned_rows_values_read_through_a_registry_roll() {
             Command::Write {
                 request: [request; 16],
                 changes,
+                said: None,
             },
             u64::from(request) * 1_000,
         )
@@ -5814,6 +6692,644 @@ fn an_owned_rows_values_read_through_a_registry_roll() {
     assert!(!shown.contains(&token), "a sealed token left the read");
 }
 
+/// A ROLL OF A FAMILY WITH NO SECRET COLUMN KEEPS EVERY SIGNED RECORD (tracker TK-31; decisions
+/// TK-D2, TK-D17 and TK-D31, docs/DESIGN-lab-tracker-2026-11-14.md §8). The family is
+/// `kept_tests::KEPT`: two generations, pages of prose, no secret column, version 2 records.
+/// Three Macs: the roller, an author (another Writer), and a reader that is not in the lab's
+/// exchanges until the roll is done.
+///
+/// The author signs 84 records of about 40 KiB each, each saying who made it, why and on what
+/// evidence: more than the 3 MiB a restated history holds (`alab::history::MAX_HISTORY_BYTES`),
+/// past which a registry roll leaves a horizon. The roller rolls the family. Then:
+///
+/// * the roll waited for the author to declare the second generation, sealed the first, and
+///   every reader moved to the second, whose registers read as the first's did;
+/// * the first generation is kept (`catalog::State::Kept`): both Macs still store it, and a
+///   release pass a year later releases nothing;
+/// * the second generation holds no restated history and no horizon;
+/// * history through the roll lists every record the author signed, as a record of generation
+///   1, signed by the author's Mac, with its principal, reason and evidence; and the roll's own
+///   records as generation 2's, signed by the roller, saying who rolled;
+/// * as of a record of the sealed generation, the table reads as that generation held it then;
+/// * a diff from a record of the sealed generation to the head names the author's later record
+///   in the sealed log, and its statement, as what changed the cell, shows no cell the roll only
+///   restated, and after a write in the second generation names that write;
+/// * a record the author signs into the first generation after the seal and before it hears of
+///   it reaches the roller by repair, is listed, and a roll run again carries it;
+/// * the reader, which joins after all that, fetches the sealed generation by repair and reads
+///   the same history, every record under its own signer.
+///
+/// NEGATIVE CONTROL, observed 2026-11-17: with `Handle::earlier` answering no generation (a
+/// history that reads the current generation alone, as every family read before this), the test
+/// fails with `Mac 0: history lists every record the author signed, across the roll`.
+#[test]
+fn a_roll_of_a_family_with_no_secret_column_keeps_every_record_under_its_own_signature_and_writes_no_horizon()
+ {
+    use super::kept_tests::{KEPT, KEPT_2, PAGE, declare, page, said, state, storage, title};
+    use crate::{
+        catalog::State,
+        table::fixture::{repair_commons, repair_commons_among},
+    };
+    const ROLLER: usize = 0;
+    const AUTHOR: usize = 1;
+    const READER: usize = 2;
+    const PAGES: usize = 84;
+    const PAGE_BYTES: usize = 40_000;
+    register_for_test(&KEPT);
+    assert!(keeps_records(&KEPT));
+    assert!(!keeps_records(&REGISTRY), "the registry declares secrets");
+
+    let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Reader]);
+    let now_ms = aterm_time::unix_millis().unwrap();
+    let clocks = [now_ms / 1000; 3];
+    // The two Writers exchange; the reader joins at the end.
+    let writers = |rounds| repair_commons_among(&lab, rounds, &[ROLLER, AUTHOR], &clocks);
+    let at = |n: usize| Handle::at(lab.paths[n].clone(), &KEPT);
+    let author_said = said("s-author", "TK-31: pages written before the roll");
+    let roller_said = said("s-roller", "TK-31: roll lab/kept to its second generation");
+    let author = |rows: Vec<Vec<Change>>| {
+        at(AUTHOR)
+            .saying(author_said.clone())
+            .commit_owner(|_| Ok(((), rows)))
+            .unwrap()
+            .1
+            .operations
+    };
+    let title_of = |view: &View, pk: &str| {
+        view.project(&PAGE)
+            .rows
+            .get(pk)
+            .and_then(|row| row.get("title").cloned())
+    };
+
+    // The author signs more than 3 MiB of records into the first generation, then two titles,
+    // the second over the first.
+    declare(&lab.paths[AUTHOR], &KEPT);
+    let pages: Vec<_> = (0..PAGES)
+        .map(|n| page(&format!("p{n:02}"), PAGE_BYTES))
+        .collect();
+    // A few commits, each inside one write's admission deadline in a debug build.
+    let mut signed = Vec::new();
+    for chunk in pages.chunks(14) {
+        signed.extend(author(chunk.to_vec()));
+    }
+    assert_eq!(signed.len(), PAGES, "one record a page");
+    let first_title = author(vec![title("p00", "first")])[0];
+    let second_title = author(vec![title("p00", "second")])[0];
+    signed.extend([first_title, second_title]);
+    writers(6);
+    let before = at(ROLLER).view().unwrap();
+    assert_eq!(before.project(&PAGE).rows.len(), PAGES);
+
+    // A plan writes nothing; the first apply restates and waits for the author's declaration of
+    // the second generation; the author declares it; the next apply seals.
+    let roller = || at(ROLLER).saying(roller_said.clone());
+    let plan = roller().roll(false, now_ms).unwrap();
+    assert_eq!((plan.from, plan.to, plan.records), (1, 2, 0));
+    // Each page's lifecycle and body, and the one title.
+    assert_eq!(plan.registers, 2 * PAGES + 1, "{plan:?}");
+    assert_eq!(plan.waiting, vec![lab.machine(AUTHOR)]);
+    assert_eq!(
+        state(&lab.paths[ROLLER], &KEPT_2),
+        None,
+        "a plan declares nothing"
+    );
+    let staged = roller().roll(true, now_ms).unwrap();
+    assert!(!staged.sealed && staged.records > PAGES, "{staged:?}");
+    assert_eq!(staged.registers, plan.registers);
+    assert_eq!(staged.waiting, vec![lab.machine(AUTHOR)]);
+    assert_eq!(at(ROLLER).compiled.generation, 1, "unsealed, readers stay");
+    writers(6);
+    assert!(at(AUTHOR).endorse().unwrap());
+    writers(6);
+    let rolled = roller().roll(true, now_ms).unwrap();
+    assert!(rolled.sealed && rolled.waiting.is_empty(), "{rolled:?}");
+    assert_eq!(rolled.records, 0, "nothing is restated twice: {rolled:?}");
+    // The author has not heard the seal, and signs one more record into the first generation.
+    assert_eq!(at(AUTHOR).compiled.generation, 1);
+    signed.extend(author(vec![page("late", 64)]));
+    writers(6);
+
+    // Readers moved, and the second generation reads as the first did.
+    for n in [ROLLER, AUTHOR] {
+        let handle = at(n);
+        assert_eq!(handle.compiled.generation, 2, "Mac {n} reads the second");
+        let view = handle.view().unwrap();
+        assert!(view.complete, "Mac {n}: the restatement is whole");
+        assert_eq!(view.project(&PAGE), before.project(&PAGE), "Mac {n}");
+        // Kept: still stored, and no release pass takes it, however late.
+        assert_eq!(state(&lab.paths[n], &KEPT), Some(State::Kept), "Mac {n}");
+        let released = Registry::at(lab.paths[n].clone())
+            .release(now_ms + 365 * 86_400_000)
+            .unwrap();
+        assert!(
+            released.released.is_empty() && released.kept.is_empty(),
+            "Mac {n}: no release pass names a kept generation: {released:?}"
+        );
+        assert!(
+            storage(&lab, n, &KEPT).exists(),
+            "Mac {n} stores the sealed log"
+        );
+        // No restated history and no horizon in the second generation.
+        let carried = handle.carried_history().unwrap();
+        assert!(carried.entries.is_empty() && carried.horizons.is_empty());
+        assert!(
+            view.cells
+                .keys()
+                .all(|(collection, _)| collection == PAGE.name
+                    || collection == crate::alab::registry::ROLL.name),
+            "Mac {n}: the roll wrote pages and its cover, nothing else"
+        );
+    }
+
+    // History across the roll: every record the author signed, under the author's signature,
+    // with what it says; more than a restated history's bound of them.
+    let author_machine = Some(lab.machine(AUTHOR));
+    let check_history = |n: usize, signed: &[Digest]| {
+        let history = at(n).history().unwrap();
+        let mut bytes = 0;
+        for id in signed {
+            let entry = history
+                .iter()
+                .find(|entry| entry.operation == *id)
+                .unwrap_or_else(|| {
+                    panic!("Mac {n}: history lists every record the author signed, across the roll")
+                });
+            assert_eq!(entry.generation, 1, "Mac {n}: a record of the sealed log");
+            assert_eq!(entry.machine, author_machine, "Mac {n}: its own signer");
+            assert_eq!(entry.said.as_ref(), Some(&author_said), "Mac {n}");
+            assert!(entry.inert.is_none(), "Mac {n}: {:?}", entry.inert);
+            bytes += aterm_json::to_vec(&entry.changes).unwrap().len();
+        }
+        assert!(
+            bytes > crate::alab::history::MAX_HISTORY_BYTES,
+            "Mac {n}: {bytes} bytes of the author's records, past a restated history's bound"
+        );
+        let cursors: Vec<_> = history.iter().map(history::Entry::cursor).collect();
+        assert!(cursors.is_sorted(), "Mac {n}: one order across generations");
+        history
+    };
+    let history = check_history(ROLLER, &signed);
+    let restated: Vec<_> = history.iter().filter(|e| e.generation == 2).collect();
+    assert_eq!(restated.len(), staged.records);
+    assert!(restated.iter().all(|entry| {
+        entry.machine == Some(lab.machine(ROLLER)) && entry.said.as_ref() == Some(&roller_said)
+    }));
+    assert_eq!(history.len(), signed.len() + staged.records);
+
+    // As of a record of the sealed generation.
+    let then = at(ROLLER).view_at(Point::At(first_title)).unwrap();
+    assert_eq!(title_of(&then, "p00"), Some(json!("first")));
+    assert_eq!(then.project(&PAGE).rows.len(), PAGES);
+
+    // A diff across the roll: the one cell that changed, by the author's record in the sealed
+    // log; no cell the roll only restated.
+    let changed = |diff: &Diff| -> Vec<(String, Vec<Maker>)> {
+        diff.cells
+            .iter()
+            .filter(|cell| cell.collection == PAGE.name)
+            .map(|cell| (cell.key.clone(), cell.by.clone()))
+            .collect()
+    };
+    let by_author = vec![(
+        "p00.title".to_owned(),
+        vec![Maker {
+            operation: second_title,
+            actor: history
+                .iter()
+                .find(|entry| entry.operation == second_title)
+                .unwrap()
+                .actor,
+            machine: author_machine,
+            said: Some(author_said.clone()),
+        }],
+    )];
+    let across = at(ROLLER).diff(first_title, Point::Head).unwrap();
+    assert_eq!(changed(&across), by_author);
+    let within = at(ROLLER)
+        .diff(first_title, Point::At(second_title))
+        .unwrap();
+    assert_eq!(changed(&within), by_author);
+    // A write in the second generation is then what changed it.
+    let third_title = roller()
+        .commit_owner(|_| Ok(((), vec![title("p00", "third")])))
+        .unwrap()
+        .1
+        .operations[0];
+    let across = at(ROLLER).diff(first_title, Point::Head).unwrap();
+    let makers = changed(&across);
+    assert_eq!(makers.len(), 1, "{makers:?}");
+    assert_eq!(makers[0].0, "p00.title");
+    assert_eq!(makers[0].1.len(), 1);
+    assert_eq!(makers[0].1[0].operation, third_title);
+    assert_eq!(makers[0].1[0].machine, Some(lab.machine(ROLLER)));
+    assert_eq!(makers[0].1[0].said.as_ref(), Some(&roller_said));
+
+    // The record the author signed after the seal reached the roller by repair, as any record
+    // of a kept generation does, and is listed above; a roll run again carries it, and nothing
+    // it carried before.
+    let late = |n: usize| {
+        at(n)
+            .view()
+            .unwrap()
+            .project(&PAGE)
+            .rows
+            .contains_key("late")
+    };
+    assert!(!late(ROLLER));
+    let again = roller().roll(true, now_ms).unwrap();
+    assert_eq!(
+        (again.from, again.to, again.registers),
+        (1, 2, 2),
+        "{again:?}"
+    );
+    assert!(!again.sealed, "sealed already: {again:?}");
+    assert!(late(ROLLER));
+    assert_eq!(
+        title_of(&at(ROLLER).view().unwrap(), "p00"),
+        Some(json!("third"))
+    );
+
+    // The reader joins: it fetches the sealed generation and reads the same history, each
+    // record under its own signer's signature.
+    assert!(!storage(&lab, READER, &KEPT).exists());
+    repair_commons(&lab, 6);
+    assert_eq!(state(&lab.paths[READER], &KEPT), Some(State::Kept));
+    assert!(storage(&lab, READER, &KEPT).exists(), "fetched by repair");
+    let read = check_history(READER, &signed);
+    let whole = at(ROLLER).history().unwrap();
+    assert_eq!(read, whole, "the reader's history is the roller's");
+    assert_eq!(
+        title_of(&at(READER).view_at(Point::At(first_title)).unwrap(), "p00"),
+        Some(json!("first"))
+    );
+}
+
+/// A KEPT ROLL OF A GENERATION WITH OWNED ROWS AND LOG ENTRIES READS EACH FROM THE SEALED LOG,
+/// UNDER ITS OWN SIGNER (tracker TK-40). The family is `kept_tests::KEPT`: two generations, each
+/// with pages (cells), a seat a Mac (an owned row at its own machine uuid) and remarks (a log,
+/// `<uuid32>.<n>`). Two Macs, both Writers: the roller and an author.
+///
+/// Into the first generation the roller signs its seat and a remark, and the author, having
+/// heard those, a page, a remark and its seat twice, the second over the first. The roller
+/// rolls the family: the plan restates the page's two registers and nothing else, and the roll
+/// is not refused. Then, on both Macs:
+///
+/// * the second generation's own log holds no change to a seat or a remark (none was restated
+///   or archived), and its view holds each seat and each remark exactly as the first
+///   generation's view read it before the roll: the same row at the same key, by the same
+///   operation, whose signer is the Mac the key names;
+/// * history lists each of those records as a record of generation 1, signed by its own Mac,
+///   with its principal, reason and evidence;
+/// * as of the author's first seat, the seat reads as it did then, beside the rows that record
+///   had observed;
+/// * a diff from that record to the head, across the roll, shows the author's seat changed by
+///   the author's second record in the sealed log, and no other seat or remark.
+///
+/// The author then signs into the second generation its seat, with a counter below its sealed
+/// row's, and a remark. On both Macs: the author's seat is the second generation's (a later
+/// generation's row over an earlier one's, whatever their counters) while the roller's is still
+/// read from the sealed log; the new remark's counter goes on past the sealed one's, so all
+/// three remarks stand at three keys; as of the new seat, a point of the second generation, the
+/// sealed rows are held; and a diff to the head from a sealed record, and one from a record of
+/// the second generation signed before the new seat, each show the new seat as a change of the
+/// sealed one and the new remark as added, and nothing else. An append through a handle asked
+/// for the second generation by name goes on past the sealed counter too.
+///
+/// NEGATIVE CONTROL, observed 2026-11-18: with `kept::overlay` laying nothing under a view's own
+/// reads (a view that reads its own log alone, as every view read before this), the test fails
+/// with `Mac 0: the second generation's view holds each seat its signer wrote into the first`.
+#[test]
+fn a_kept_roll_of_a_generation_with_owned_rows_and_log_entries_reads_each_from_the_sealed_log_under_its_own_signer()
+ {
+    use super::kept_tests::{KEPT, KEPT_2, REMARK, SEAT, declare, page, said, state};
+    use crate::{catalog::State, table::fixture::repair_commons_among, typed::owned};
+    const ROLLER: usize = 0;
+    const AUTHOR: usize = 1;
+    register_for_test(&KEPT);
+    assert!(keeps_records(&KEPT));
+
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let now_ms = aterm_time::unix_millis().unwrap();
+    let clocks = [now_ms / 1000; 2];
+    let exchange = |rounds| repair_commons_among(&lab, rounds, &[ROLLER, AUTHOR], &clocks);
+    let at = |n: usize| Handle::at(lab.paths[n].clone(), &KEPT);
+    let saids = [
+        said("s-roller", "TK-40: the roller's own rows, and the roll"),
+        said("s-author", "TK-40: the author's own rows"),
+    ];
+    let seat_key = |n: usize| keys::uuid32(&lab.machine(n));
+    // Mac `n` states its seat with `counter`: one record, named by its operation.
+    let seat = |n: usize, counter: u64, label: &str| {
+        let row = Change {
+            collection: SEAT.name.to_owned(),
+            key: seat_key(n),
+            value: Some(json!({"r": 1, "n": counter, "label": label})),
+        };
+        at(n)
+            .saying(saids[n].clone())
+            .commit_owner(|_| Ok(((), vec![vec![row]])))
+            .unwrap()
+            .1
+            .operations[0]
+    };
+    // Mac `n` appends a remark: its key.
+    let remark = |n: usize, text: &str| {
+        let row = json!({"text": text}).as_object().unwrap().clone();
+        at(n)
+            .saying(saids[n].clone())
+            .append_log(&REMARK, &[row])
+            .unwrap()
+            .remove(0)
+    };
+    let entry_key = |entry: &owned::LogEntry| owned::log_entry_key(&entry.machine, entry.n);
+    let remark_keys = |view: &View| -> BTreeSet<String> {
+        view.logs[REMARK.name]
+            .entries
+            .iter()
+            .map(entry_key)
+            .collect()
+    };
+    let remark_op = |view: &View, key: &str| {
+        view.logs[REMARK.name]
+            .entries
+            .iter()
+            .find(|entry| entry_key(entry) == key)
+            .unwrap_or_else(|| panic!("the view holds the remark {key}"))
+            .operation
+    };
+    // Each seat and remark that differs, with the operations that made the difference.
+    let own_rows = |diff: &Diff| -> Vec<(String, String, Delta, Vec<Digest>)> {
+        diff.cells
+            .iter()
+            .filter(|cell| cell.collection == SEAT.name || cell.collection == REMARK.name)
+            .map(|cell| {
+                (
+                    cell.collection.clone(),
+                    cell.key.clone(),
+                    cell.delta,
+                    cell.by.iter().map(|maker| maker.operation).collect(),
+                )
+            })
+            .collect()
+    };
+
+    // The first generation: the roller's seat and remark, which the author hears before it
+    // signs a page, a remark and its seat twice.
+    declare(&lab.paths[ROLLER], &KEPT);
+    declare(&lab.paths[AUTHOR], &KEPT);
+    exchange(6);
+    let roller_seat = seat(ROLLER, 1, "roller");
+    let roller_remark = remark(ROLLER, "the roller's");
+    exchange(6);
+    at(AUTHOR)
+        .saying(saids[AUTHOR].clone())
+        .commit_owner(|_| Ok(((), vec![page("p0", 64)])))
+        .unwrap();
+    let author_remark = remark(AUTHOR, "the author's");
+    let first = seat(AUTHOR, 1, "first");
+    let second = seat(AUTHOR, 2, "second");
+    exchange(6);
+    let before = at(ROLLER).view().unwrap();
+    assert_eq!(before.owned[SEAT.name].rows.len(), 2, "a seat a Mac");
+    assert_eq!(
+        before.owned[SEAT.name].rows[&seat_key(AUTHOR)].operation,
+        second
+    );
+    assert_eq!(
+        remark_keys(&before),
+        BTreeSet::from([roller_remark.clone(), author_remark.clone()])
+    );
+    // Every record a Mac signed of its own rows, and which Mac.
+    let signed = [
+        (roller_seat, ROLLER),
+        (remark_op(&before, &roller_remark), ROLLER),
+        (remark_op(&before, &author_remark), AUTHOR),
+        (first, AUTHOR),
+        (second, AUTHOR),
+    ];
+
+    // The roll is not refused, restates the page's lifecycle and body, and carries no seat and
+    // no remark.
+    let roller = || at(ROLLER).saying(saids[ROLLER].clone());
+    let plan = roller().roll(false, now_ms).unwrap();
+    assert_eq!((plan.from, plan.to, plan.registers), (1, 2, 2), "{plan:?}");
+    let staged = roller().roll(true, now_ms).unwrap();
+    assert!(!staged.sealed, "{staged:?}");
+    exchange(6);
+    assert!(at(AUTHOR).endorse().unwrap());
+    exchange(6);
+    let rolled = roller().roll(true, now_ms).unwrap();
+    assert!(rolled.sealed && rolled.waiting.is_empty(), "{rolled:?}");
+    exchange(6);
+
+    for n in [ROLLER, AUTHOR] {
+        let handle = at(n);
+        assert_eq!(handle.compiled.generation, 2, "Mac {n} reads the second");
+        assert_eq!(state(&lab.paths[n], &KEPT), Some(State::Kept), "Mac {n}");
+        let view = handle.view().unwrap();
+        assert!(view.complete, "Mac {n}: the restatement is whole");
+        // No row was restated or archived: the second generation's own log holds none.
+        assert!(
+            view.ops
+                .iter()
+                .flat_map(|op| &op.changes)
+                .all(|change| change.collection != SEAT.name && change.collection != REMARK.name),
+            "Mac {n}: the roll wrote no seat and no remark"
+        );
+        assert!(handle.carried_history().unwrap().entries.is_empty());
+        // Each is read from the sealed log: the same row, at the same key, by the same record.
+        assert_eq!(
+            view.owned[SEAT.name], before.owned[SEAT.name],
+            "Mac {n}: the second generation's view holds each seat its signer wrote into the first"
+        );
+        assert_eq!(
+            view.logs[REMARK.name], before.logs[REMARK.name],
+            "Mac {n}: the second generation's view holds each remark its signer appended to the \
+             first"
+        );
+        // Each under its own signer, at its own key.
+        for who in [ROLLER, AUTHOR] {
+            let row = &view.owned[SEAT.name].rows[&seat_key(who)];
+            assert_eq!(row.machine, lab.machine(who), "Mac {n}: {who}'s seat");
+        }
+        let seats = &view.owned[SEAT.name].rows;
+        assert_eq!(seats[&seat_key(ROLLER)].operation, roller_seat, "Mac {n}");
+        assert_eq!(seats[&seat_key(AUTHOR)].operation, second, "Mac {n}");
+        assert_eq!(seats[&seat_key(AUTHOR)].value["label"], json!("second"));
+        for (key, who) in [(&roller_remark, ROLLER), (&author_remark, AUTHOR)] {
+            assert_eq!(
+                owned::log_key(key).map(|(machine, _)| machine),
+                Some(lab.machine(who)),
+                "Mac {n}: a remark at its signer's key"
+            );
+        }
+
+        // History: each record under its own signer's signature, as a record of generation 1.
+        let history = handle.history().unwrap();
+        for (id, who) in signed {
+            let entry = history
+                .iter()
+                .find(|entry| entry.operation == id)
+                .unwrap_or_else(|| {
+                    panic!("Mac {n}: history lists every record of a Mac's own rows")
+                });
+            assert_eq!(entry.generation, 1, "Mac {n}: a record of the sealed log");
+            assert_eq!(entry.machine, Some(lab.machine(who)), "Mac {n}");
+            assert_eq!(entry.said.as_ref(), Some(&saids[who]), "Mac {n}");
+            assert!(entry.inert.is_none(), "Mac {n}: {:?}", entry.inert);
+        }
+
+        // As of the author's first seat, a point of the sealed generation.
+        let then = handle.view_at(Point::At(first)).unwrap();
+        let seats = &then.owned[SEAT.name].rows;
+        assert_eq!(seats[&seat_key(AUTHOR)].operation, first, "Mac {n}");
+        assert_eq!(seats[&seat_key(AUTHOR)].value["label"], json!("first"));
+        assert_eq!(seats[&seat_key(ROLLER)].operation, roller_seat, "Mac {n}");
+        assert_eq!(remark_keys(&then), remark_keys(&before), "Mac {n}");
+
+        // A diff across the roll: the author's seat, changed by the author's second record in
+        // the sealed log; no seat or remark that only stands where it stood.
+        let across = handle.diff(first, Point::Head).unwrap();
+        assert_eq!(
+            own_rows(&across),
+            vec![(
+                SEAT.name.to_owned(),
+                seat_key(AUTHOR),
+                Delta::Changed,
+                vec![second]
+            )],
+            "Mac {n}"
+        );
+        let maker = &across
+            .cells
+            .iter()
+            .find(|cell| cell.collection == SEAT.name)
+            .unwrap()
+            .by[0];
+        assert_eq!(maker.machine, Some(lab.machine(AUTHOR)), "Mac {n}");
+        assert_eq!(maker.said.as_ref(), Some(&saids[AUTHOR]), "Mac {n}");
+    }
+
+    // The second generation. The author states its seat again, with a counter below its sealed
+    // row's, and appends a remark.
+    let earlier = at(AUTHOR)
+        .saying(saids[AUTHOR].clone())
+        .commit_owner(|_| Ok(((), vec![page("p1", 64)])))
+        .unwrap()
+        .1
+        .operations[0];
+    let third = seat(AUTHOR, 1, "third");
+    let later_remark = remark(AUTHOR, "the author's, after the roll");
+    assert_eq!(
+        owned::log_key(&later_remark),
+        Some((lab.machine(AUTHOR), 2)),
+        "the counter goes on past the sealed generation's"
+    );
+    exchange(6);
+    for n in [ROLLER, AUTHOR] {
+        let handle = at(n);
+        let view = handle.view().unwrap();
+        let seats = &view.owned[SEAT.name].rows;
+        assert_eq!(
+            seats[&seat_key(AUTHOR)].operation,
+            third,
+            "Mac {n}: a later generation's row over an earlier one's"
+        );
+        assert_eq!(seats[&seat_key(AUTHOR)].value["label"], json!("third"));
+        assert_eq!(
+            seats[&seat_key(ROLLER)],
+            before.owned[SEAT.name].rows[&seat_key(ROLLER)],
+            "Mac {n}: the roller's seat is still read from the sealed log"
+        );
+        assert_eq!(
+            remark_keys(&view),
+            BTreeSet::from([
+                roller_remark.clone(),
+                author_remark.clone(),
+                later_remark.clone()
+            ]),
+            "Mac {n}: every remark of both generations, each at its own key"
+        );
+        assert_eq!(
+            view.logs[REMARK.name].inert, 0,
+            "Mac {n}: no key used twice"
+        );
+        let later = remark_op(&view, &later_remark);
+        let history = handle.history().unwrap();
+        for id in [third, later] {
+            let entry = history.iter().find(|entry| entry.operation == id).unwrap();
+            assert_eq!(entry.generation, 2, "Mac {n}");
+            assert_eq!(entry.machine, Some(lab.machine(AUTHOR)), "Mac {n}");
+        }
+
+        // As of the new seat, a point of the second generation: the sealed rows are held.
+        let then = handle.view_at(Point::At(third)).unwrap();
+        let seats = &then.owned[SEAT.name].rows;
+        assert_eq!(seats[&seat_key(AUTHOR)].operation, third, "Mac {n}");
+        assert_eq!(seats[&seat_key(ROLLER)].operation, roller_seat, "Mac {n}");
+        assert_eq!(remark_keys(&then), remark_keys(&before), "Mac {n}");
+
+        // A diff from a sealed record to the head, and one within the second generation.
+        let added = (
+            REMARK.name.to_owned(),
+            later_remark.clone(),
+            Delta::Added,
+            vec![later],
+        );
+        let across = handle.diff(second, Point::Head).unwrap();
+        assert_eq!(
+            own_rows(&across),
+            vec![
+                added.clone(),
+                (
+                    SEAT.name.to_owned(),
+                    seat_key(AUTHOR),
+                    Delta::Changed,
+                    vec![third]
+                ),
+            ],
+            "Mac {n}"
+        );
+        let seat_diff = across
+            .cells
+            .iter()
+            .find(|cell| cell.collection == SEAT.name)
+            .unwrap();
+        assert_eq!(seat_diff.before[0].operation, second, "Mac {n}");
+        assert_eq!(seat_diff.by[0].machine, Some(lab.machine(AUTHOR)));
+        assert_eq!(seat_diff.by[0].said.as_ref(), Some(&saids[AUTHOR]));
+        // From a record of the second generation signed before the new seat: the seat is a
+        // change of the sealed row, never a row added, and no sealed row differs.
+        let within = handle.diff(earlier, Point::Head).unwrap();
+        assert_eq!(
+            own_rows(&within),
+            own_rows(&across),
+            "Mac {n}: a diff within the second generation holds the sealed rows on both sides"
+        );
+        let seat_diff = within
+            .cells
+            .iter()
+            .find(|cell| cell.collection == SEAT.name)
+            .unwrap();
+        assert_eq!(seat_diff.before[0].operation, second, "Mac {n}");
+        let within = handle.diff(third, Point::Head).unwrap();
+        assert_eq!(own_rows(&within), vec![added], "Mac {n}");
+    }
+
+    // A handle asked for the second generation by name reads from it on, and an append
+    // through it still goes on past what its Mac spent in the sealed generation.
+    let named = Handle::at(lab.paths[ROLLER].clone(), &KEPT_2)
+        .saying(saids[ROLLER].clone())
+        .append_log(
+            &REMARK,
+            &[json!({"text": "by name"}).as_object().unwrap().clone()],
+        )
+        .unwrap()
+        .remove(0);
+    assert_eq!(owned::log_key(&named), Some((lab.machine(ROLLER), 2)));
+}
+
 /// A final checkpoint is final (tracker LT-B10D1, design §5, "Nothing above S changes what S's
 /// state holds"): Mac 0 writes a machine row and names it 20 days ago, and its pass signs and
 /// records a checkpoint of both, final at once since it is the only member whose frontier tip is
@@ -5862,6 +7378,7 @@ fn a_final_checkpoint_is_final_for_requests_reverts_and_opaque_authors() {
         Command::Write {
             request: [91; 16],
             changes: machine(MC),
+            said: None,
         },
         then,
     );
@@ -5871,6 +7388,7 @@ fn a_final_checkpoint_is_final_for_requests_reverts_and_opaque_authors() {
         Command::Write {
             request: [92; 16],
             changes: vec![nickname.clone()],
+            said: None,
         },
         then + 1_000,
     );
@@ -5900,6 +7418,7 @@ fn a_final_checkpoint_is_final_for_requests_reverts_and_opaque_authors() {
         Command::Write {
             request: [92; 16],
             changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+            said: None,
         },
         now,
     );
@@ -5912,6 +7431,7 @@ fn a_final_checkpoint_is_final_for_requests_reverts_and_opaque_authors() {
                 value: None,
                 ..nickname.clone()
             }],
+            said: None,
         },
         now + 1,
     );
@@ -5921,6 +7441,7 @@ fn a_final_checkpoint_is_final_for_requests_reverts_and_opaque_authors() {
             request: [96; 16],
             operation: undo,
             changes: vec![nickname.clone()],
+            said: None,
         },
         now + 2,
     );
@@ -5929,6 +7450,7 @@ fn a_final_checkpoint_is_final_for_requests_reverts_and_opaque_authors() {
         Command::Write {
             request: [94; 16],
             changes: vec![put(&MACHINE, MC, "location", json!("rack b"))],
+            said: None,
         },
         now + 3,
     );
@@ -6095,4 +7617,519 @@ fn a_final_checkpoint_is_final_for_requests_reverts_and_opaque_authors() {
         Ok(())
     })
     .unwrap();
+}
+
+/// A lab for the checkpoint fence's read (tracker LT-C1): five seats on one roster and their
+/// registry as Mac 0 holds it at `now`. Seats 0, 1 and 4 signed a record of it in the last 30
+/// days (20, 20 and 5 days ago), seat 2 signed one 40 days ago, and seat 3 signed none. Answers
+/// the lab, Mac 0's handle, each Mac's seat (its Commons writer) and `now`.
+fn fence_lab() -> (Lab, Handle, Vec<Actor>, u64) {
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let now = aterm_time::unix_millis().unwrap();
+    let lab = Lab::new(&[Role::Writer; 5]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let mac = |n: usize| Handle::at(lab.paths[n].clone(), &REGISTRY);
+    let here = mac(0);
+    append_history_at(
+        &here,
+        Command::Write {
+            request: [90; 16],
+            changes: machine(MC),
+            said: None,
+        },
+        now - 40 * DAY,
+    );
+    repair_new_registry(&lab);
+    // Each later record is written by a Mac that holds every earlier one, in the order of their
+    // signed times, so the newest record of each recent seat has seen the whole table.
+    let writes: [(usize, &str, u64); 4] = [
+        (2, "two", now - 40 * DAY + 1_000),
+        (1, "one", now - 20 * DAY),
+        (0, "zero", now - 20 * DAY + 1_000),
+        (4, "four", now - 5 * DAY),
+    ];
+    for (n, nickname, authored_ms) in writes {
+        append_history_at(
+            &mac(n),
+            Command::Write {
+                request: [91 + n as u8; 16],
+                changes: vec![put(&MACHINE, MC, "nickname", json!(nickname))],
+                said: None,
+            },
+            authored_ms,
+        );
+        repair_registry(&lab, 2);
+    }
+    let seats = (0..5)
+        .map(|n| {
+            let access = lab.bootstrap(n).access().unwrap().unwrap();
+            access.local().binding().actor()
+        })
+        .collect();
+    (lab, here, seats, now)
+}
+
+/// The ledger of [`fence_lab`]'s Mac 0 in which four seats hold the checkpoint fence, one for
+/// each reason a seat can: seat 1 reported 0.202.0 yesterday, seat 2 was heard two days ago
+/// with no report, seat 3 was never heard, and seat 4 reported a build that reads checkpoints
+/// ten days ago, which is not in the last 7 days. Seat 0 reported one that reads them today.
+fn fence_held(lab: &Lab, seats: &[Actor], now: u64) -> aterm_secrets::commons::hearing::Ledger {
+    use aterm_secrets::commons::hearing::{self, Ledger, Said};
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let mut ledger = Ledger::new(lab.bootstrap(0).trust());
+    ledger.record(seats[0], now, Said::Version(hearing::READS_CHECKPOINTS));
+    ledger.record(
+        seats[1],
+        now - DAY,
+        Said::Version(hearing::Version(0, 202, 0)),
+    );
+    ledger.record(seats[2], now - 2 * DAY, Said::Nothing);
+    ledger.record(
+        seats[4],
+        now - 10 * DAY,
+        Said::Version(hearing::READS_CHECKPOINTS),
+    );
+    ledger
+}
+
+/// The ledger of [`fence_lab`]'s Mac 0 in which no seat holds the fence: every seat reported a
+/// build that reads checkpoints, today.
+fn fence_ready(lab: &Lab, seats: &[Actor], now: u64) -> aterm_secrets::commons::hearing::Ledger {
+    use aterm_secrets::commons::hearing::{self, Ledger, Said};
+    let mut ledger = Ledger::new(lab.bootstrap(0).trust());
+    for seat in seats {
+        ledger.record(*seat, now, Said::Version(hearing::READS_CHECKPOINTS));
+    }
+    ledger
+}
+
+/// How many checkpoint records `handle`'s store holds.
+fn checkpoints_held(lab: &Lab, handle: &Handle) -> usize {
+    application::observe_store(&lab.paths[0], handle.descriptor(), |_, store, _| {
+        Ok(store.checkpoints().count())
+    })
+    .unwrap()
+}
+
+/// A checkpoint that is not signed says who holds it back and why (tracker LT-C1). With four of
+/// five seats holding the fence, one for each reason, the pass signs nothing and the read on
+/// demand names, on the roster, each of the four with its reason (an older build with its
+/// release, no report, unheard) and, among the three seats that signed a record in the last 30
+/// days, the two of them that hold it. Once every seat reports
+/// a build that reads checkpoints, the read names the same seats in both sets and no holder in
+/// either, and the pass signs.
+/// NEGATIVE CONTROL: with `checkpoint::fence` keeping every roster holder as a recent one (the
+/// `recent.contains(actor)` filter dropped), the seats that signed nothing in 30 days are named
+/// among those that did: `the recent seats that hold the fence` with four holders on the left.
+#[test]
+fn a_fenced_checkpoint_says_which_seats_hold_it_and_why_and_an_open_fence_says_none() {
+    use super::checkpoint::Signed;
+    use aterm_secrets::commons::hearing::{self, Hold};
+    let (lab, here, seats, now) = fence_lab();
+    let sorted = |mut holders: Vec<(Actor, Hold)>| {
+        holders.sort_by_key(|(seat, _)| *seat);
+        holders
+    };
+    let roster: BTreeSet<Actor> = seats.iter().copied().collect();
+    let recent: BTreeSet<Actor> = [seats[0], seats[1], seats[4]].into_iter().collect();
+
+    let held = fence_held(&lab, &seats, now);
+    assert_eq!(
+        here.checkpoint_every(&held, now, 1).unwrap(),
+        Signed::Fenced,
+        "a seat holds the fence, so the pass signs nothing"
+    );
+    assert_eq!(checkpoints_held(&lab, &here), 0, "nothing is signed");
+    let (_, _, fence) = here.usage_fenced_by(&held, now).unwrap();
+    assert!(!fence.open());
+    assert_eq!(fence.roster.seats, roster, "the seats on the roster");
+    assert_eq!(
+        fence.roster.holders,
+        sorted(vec![
+            (seats[1], Hold::Older(Some(hearing::Version(0, 202, 0)))),
+            (seats[2], Hold::Older(None)),
+            (seats[3], Hold::Unheard),
+            (seats[4], Hold::Unheard),
+        ]),
+        "the roster's seats that hold the fence"
+    );
+    assert_eq!(
+        fence.recent.seats, recent,
+        "the seats that signed a record in the last 30 days"
+    );
+    assert_eq!(
+        fence.recent.holders,
+        sorted(vec![
+            (seats[1], Hold::Older(Some(hearing::Version(0, 202, 0)))),
+            (seats[4], Hold::Unheard),
+        ]),
+        "the recent seats that hold the fence"
+    );
+
+    let ready = fence_ready(&lab, &seats, now);
+    let (_, _, open) = here.usage_fenced_by(&ready, now).unwrap();
+    assert!(open.open());
+    assert_eq!(open.roster.seats, roster);
+    assert_eq!(open.roster.holders, vec![], "an open fence names no holder");
+    assert_eq!(open.recent.seats, recent);
+    assert_eq!(open.recent.holders, vec![]);
+    assert_eq!(
+        here.checkpoint_every(&ready, now, 1).unwrap(),
+        Signed::Proposed,
+        "past the fence the pass signs"
+    );
+    assert_eq!(checkpoints_held(&lab, &here), 1);
+}
+
+/// The pass signs exactly where the fence's function says it is open (tracker LT-C1): for each
+/// ledger, the read's verdict at that ledger and time and the pass's answer agree, a fenced pass
+/// carries the read's very answer and adds no checkpoint, and an open one signs. The fence is
+/// the whole roster's: one seat that never signed a record of the table, unheard, holds it
+/// while no recent seat does. So do a seat on an older build, a seat heard with no report, and
+/// a seat heard today whose last report is older than 7 days.
+/// NEGATIVE CONTROL: with `checkpoint::held` answering false (the pass opening every table), the
+/// pass goes on to sign over a seat that signed nothing and is unheard, which the store
+/// refuses: `seat 3 unheard: a table checkpoint waits until every member heard in the last 7
+/// days runs aterm 0.203.0 or later: 1 do not yet`.
+#[test]
+fn the_checkpoint_pass_signs_exactly_where_the_fence_says_open() {
+    use super::checkpoint::Signed;
+    use aterm_secrets::commons::hearing::{self, Said};
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let (lab, here, seats, now) = fence_lab();
+    let reads = Said::Version(hearing::READS_CHECKPOINTS);
+    // Every seat reads checkpoints, but for seat `n`, heard as `said` at `at_ms` (or never).
+    let but = |n: usize, heard: &[(u64, Said)]| {
+        let mut ledger = aterm_secrets::commons::hearing::Ledger::new(lab.bootstrap(0).trust());
+        for (m, seat) in seats.iter().enumerate() {
+            if m != n {
+                ledger.record(*seat, now, reads);
+            }
+        }
+        for (at_ms, said) in heard {
+            ledger.record(seats[n], *at_ms, *said);
+        }
+        ledger
+    };
+    let cases = [
+        ("seat 3 unheard", but(3, &[]), false),
+        (
+            "seat 1 on an older build",
+            but(1, &[(now, Said::Version(hearing::Version(0, 202, 0)))]),
+            false,
+        ),
+        (
+            "seat 2 with no report",
+            but(2, &[(now, Said::Nothing)]),
+            false,
+        ),
+        (
+            "seat 0's report is 8 days old",
+            but(0, &[(now - 8 * DAY, reads), (now, Said::Unknown)]),
+            false,
+        ),
+        (
+            "every seat reads checkpoints",
+            but(3, &[(now, reads)]),
+            true,
+        ),
+        ("seat 3 unheard again", but(3, &[]), false),
+    ];
+    let mut signed = 0;
+    for (what, ledger, open) in cases {
+        let (_, _, verdict) = here.usage_fenced_by(&ledger, now).unwrap();
+        assert_eq!(verdict.open(), open, "{what}");
+        let passed = here
+            .checkpoint_every(&ledger, now, 1)
+            .unwrap_or_else(|error| panic!("{what}: {error}"));
+        match passed {
+            Signed::Fenced => {
+                assert!(!open, "{what}: the pass is fenced where the fence is open");
+            }
+            Signed::Proposed => {
+                assert!(open, "{what}: the pass signed over a held fence");
+                signed += 1;
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+        assert_eq!(checkpoints_held(&lab, &here), signed, "{what}");
+    }
+    assert_eq!(signed, 1);
+}
+
+/// A fenced pass takes no writer (tracker LT-C1): while another local writer holds the control
+/// journal, the pass over a held fence still answers and signs nothing. The roster is judged
+/// before anything is opened, so a Mac whose fence stays held (every one with a seat unheard
+/// for 7 days) never reads a table's log, queues its hearing tick behind a writer, seals a held
+/// write or repairs a tail to learn it signs nothing.
+/// NEGATIVE CONTROL: with `Handle::checkpoint_every` opening the table before it judges (its
+/// `held` branch removed), the pass waits out the admission on the journal's writer and is
+/// refused: `a fenced pass under another writer: Err(Error("journal control writer admission:
+/// another local journal writer is active"))`.
+#[test]
+fn a_fenced_checkpoint_pass_takes_no_writer() {
+    use super::checkpoint::Signed;
+    use aterm_secrets::commons::bootstrap::Bootstrap;
+    let (lab, here, seats, now) = fence_lab();
+    let held = fence_held(&lab, &seats, now);
+    let (_custody, writer) = Bootstrap::cached_with_journal_until(
+        &lab.paths[0],
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap()
+    .expect("CONTROL: the control journal's writer is taken");
+    let passed = here.checkpoint_every(&held, now, 1);
+    drop(writer);
+    assert!(
+        matches!(passed, Ok(Signed::Fenced)),
+        "a fenced pass under another writer: {passed:?}"
+    );
+    assert_eq!(checkpoints_held(&lab, &here), 0, "nothing is signed");
+}
+
+/// The fence's read never takes a busy vault for a Mac with no seat (tracker LT-C1): a vault
+/// writer holds this Mac's state when the read starts and lets go as the read turns to the
+/// table, and the read names the roster's five seats and their holders, as it does with no
+/// writer. Its seats are the members the read's own observation validated, which waits a
+/// writer out; a look taken before it without waiting reads nothing under a writer, which is
+/// right for the pass (it signs nothing that time) and would have the read say no seat.
+/// NEGATIVE CONTROL: with `Handle::usage_fenced` taking its roster from `seated` before the
+/// read (no seat where that reads none), the fence has no seat: `the seats on the roster` with
+/// an empty set on the left.
+#[test]
+fn the_fence_read_under_a_vault_writer_names_every_seat() {
+    let (lab, here, seats, now) = fence_lab();
+    fence_held(&lab, &seats, now)
+        .write(&lab.bootstrap(0))
+        .unwrap();
+    let writer = aterm_secrets::client::test_hold_state_lock(&lab.paths[0]).unwrap();
+    let let_go = std::rc::Rc::new(std::cell::Cell::new(false));
+    crate::file::seam::toward_custody({
+        let let_go = let_go.clone();
+        move || {
+            drop(writer);
+            let_go.set(true);
+        }
+    });
+    let read = here.usage_fenced(now);
+    assert!(
+        let_go.get(),
+        "CONTROL: the writer held the state until the read turned to the table"
+    );
+    let (_, _, fence) = read.unwrap();
+    assert_eq!(
+        fence.roster.seats,
+        seats.iter().copied().collect::<BTreeSet<Actor>>(),
+        "the seats on the roster"
+    );
+    assert!(!fence.open());
+    assert_eq!(fence.recent.seats.len(), 3);
+}
+
+/// What `aterm db table check` says of a table's checkpoint fence (tracker LT-C1). In words:
+/// three sentences, for whether this machine may sign a checkpoint, the enrolled machines and
+/// those that wrote a record in the last 30 days, each with how many hold checkpoints back for
+/// each reason, the release a checkpoint needs beside the older ones, and no machine's id. In
+/// JSON: the same sentences, each set's counts and seats by id, and each holder once with why,
+/// the release it reported and whether it is a recent seat, every list sorted. `--fence` prints
+/// the sentences alone and `--tsv` none of them. The verb reads the ledger this Mac keeps, in
+/// which this Mac's own seat is judged by its running build.
+/// NEGATIVE CONTROL: with `command::why` naming a seat heard with no report `unheard`, the
+/// roster's sentence counts three machines not heard from: `the roster's counts by reason`.
+#[test]
+fn check_says_who_holds_the_checkpoint_fence_in_words_and_names_the_seats_in_json() {
+    use aterm_secrets::commons::hearing::{self, Ledger};
+    let (lab, here, seats, now) = fence_lab();
+    let id = |n: usize| hex::encode_lower(&seats[n]);
+    let ids = |of: &[usize]| {
+        let mut ids: Vec<String> = of.iter().map(|n| id(*n)).collect();
+        ids.sort();
+        ids
+    };
+    let needs = hearing::READS_CHECKPOINTS;
+
+    let held = fence_held(&lab, &seats, now);
+    let (_, _, fence) = here.usage_fenced_by(&held, now).unwrap();
+    let lines = command::fence_lines(&fence);
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[0].contains("signs no new one"), "{lines:?}");
+    let older = format!("1 on aterm older than {needs} (0.202.0)");
+    assert!(
+        lines[1].starts_with("Of 5 enrolled machines: ")
+            && lines[1].contains(&older)
+            && lines[1].contains("1 with no version report in 7 days")
+            && lines[1].contains("2 not heard from in 7 days"),
+        "the roster's counts by reason: {lines:?}"
+    );
+    assert!(
+        lines[2].starts_with("Of the 3 that wrote a record in the last 30 days: ")
+            && lines[2].contains(&older)
+            && lines[2].contains("1 not heard from in 7 days")
+            && !lines[2].contains("version report"),
+        "the recent machines' counts by reason: {lines:?}"
+    );
+    for n in 0..5 {
+        assert!(
+            lines.iter().all(|line| !line.contains(&id(n)[..8])),
+            "the words name no seat: {lines:?}"
+        );
+    }
+    let holder = |n: usize, why: &str, version: Option<&str>, recent: bool| json!({"seat": id(n), "why": why, "version": version, "recent": recent});
+    let mut holders = vec![
+        holder(1, "older", Some("0.202.0"), true),
+        holder(2, "no_report", None, false),
+        holder(3, "unheard", None, false),
+        holder(4, "unheard", None, true),
+    ];
+    holders.sort_by_key(|holder| holder["seat"].as_str().map(str::to_owned));
+    assert_eq!(
+        command::fence_json(&fence),
+        json!({
+            "open": false,
+            "said": lines,
+            "limit": 255,
+            "roster": {
+                "count": 5, "holding": 4, "older": 1, "no_report": 1, "unheard": 2,
+                "seats": ids(&[0, 1, 2, 3, 4]),
+            },
+            "recent": {
+                "count": 3, "holding": 2, "older": 1, "no_report": 0, "unheard": 1,
+                "seats": ids(&[0, 1, 4]),
+            },
+            "holders": holders,
+        })
+    );
+
+    let ready = fence_ready(&lab, &seats, now);
+    let (_, _, fence) = here.usage_fenced_by(&ready, now).unwrap();
+    let lines = command::fence_lines(&fence);
+    assert!(lines[0].contains("may sign one"), "{lines:?}");
+    assert!(
+        lines[1..]
+            .iter()
+            .all(|line| line.ends_with(": none holds checkpoints back")),
+        "{lines:?}"
+    );
+    let open = command::fence_json(&fence);
+    assert_eq!(open["open"], json!(true));
+    assert_eq!(open["holders"], json!([]));
+    for set in ["roster", "recent"] {
+        for count in ["holding", "older", "no_report", "unheard"] {
+            assert_eq!(open[set][count], json!(0), "{set} {count}");
+        }
+    }
+    assert_eq!(open["roster"]["seats"], json!(ids(&[0, 1, 2, 3, 4])));
+    assert_eq!(open["recent"]["seats"], json!(ids(&[0, 1, 4])));
+
+    // The verb judges by the ledger this Mac keeps beside its journal, which knows this Mac's
+    // own seat by the build that runs: here a test binary's, older than any that reads
+    // checkpoints, so seat 0 holds the fence too.
+    let bootstrap = lab.bootstrap(0);
+    held.write(&bootstrap).unwrap();
+    let Output::Json(checked) = run(&lab.paths[0], &["check", "alab/registry"]) else {
+        panic!("check prints JSON");
+    };
+    let (_, _, kept) = here
+        .usage_fenced_by(&Ledger::read(&bootstrap), now)
+        .unwrap();
+    assert_eq!(checked["fence"], command::fence_json(&kept));
+    let own = hearing::Version::own();
+    assert!(own < needs, "{own}");
+    assert_eq!(checked["fence"]["roster"]["holding"], json!(5));
+    assert_eq!(checked["fence"]["roster"]["older"], json!(2));
+    assert!(
+        checked["fence"]["holders"]
+            .as_array()
+            .unwrap()
+            .contains(&holder(0, "older", Some(&own.to_string()), true)),
+        "{}",
+        checked["fence"]
+    );
+    let said = command::fence_lines(&kept);
+    assert!(
+        said[1].contains(&format!("2 on aterm older than {needs} ({own} to 0.202.0)")),
+        "{said:?}"
+    );
+    // In words at the command line: the sentences alone, a line each.
+    let Output::Text(words) = run(&lab.paths[0], &["check", "alab/registry", "--fence"]) else {
+        panic!("check --fence prints lines");
+    };
+    assert_eq!(words, format!("{}\n", said.join("\n")));
+    // The findings' lines are as they were: the fence is no finding.
+    let Output::Text(tsv) = run(&lab.paths[0], &["check", "alab/registry", "--tsv"]) else {
+        panic!("check --tsv prints lines");
+    };
+    assert!(
+        said.iter().all(|line| !tsv.contains(line.as_str())),
+        "{tsv}"
+    );
+}
+
+/// The fence's words and JSON over fences no lab roster makes (tracker LT-C1). A roster past
+/// the JSON's bound lists that many seats and holders and counts them all. One enrolled machine
+/// is said in the singular, and a table nobody wrote in 30 days says so. A seat this Mac did
+/// not watch for 7 days is one not heard from in 7 days, counted and named with those.
+/// NEGATIVE CONTROL: with `command::fence_json` listing every holder (its `take` removed), 299
+/// holders are listed past the bound of 255: `the holders listed`.
+#[test]
+fn the_fence_json_is_bounded_and_its_words_cover_one_machine_and_no_recent_writer() {
+    use super::checkpoint::{Fence, Seats};
+    use aterm_secrets::commons::hearing::Hold;
+    let seat = |n: u16| {
+        let mut seat: Actor = [0; 48];
+        seat[..2].copy_from_slice(&n.to_be_bytes());
+        seat
+    };
+    let all: BTreeSet<Actor> = (0..300).map(seat).collect();
+    let wide = Fence {
+        roster: Seats {
+            holders: (1..300).map(|n| (seat(n), Hold::Unheard)).collect(),
+            seats: all,
+        },
+        recent: Seats {
+            seats: BTreeSet::new(),
+            holders: Vec::new(),
+        },
+    };
+    let json = command::fence_json(&wide);
+    assert_eq!(json["limit"], json!(command::FENCE_SEATS));
+    assert_eq!(json["roster"]["count"], json!(300));
+    assert_eq!(json["roster"]["holding"], json!(299));
+    assert_eq!(json["roster"]["unheard"], json!(299));
+    assert_eq!(
+        json["roster"]["seats"].as_array().unwrap().len(),
+        command::FENCE_SEATS,
+        "the seats listed"
+    );
+    assert_eq!(
+        json["holders"].as_array().unwrap().len(),
+        command::FENCE_SEATS,
+        "the holders listed"
+    );
+    let lines = command::fence_lines(&wide);
+    assert!(
+        lines[1].contains("299 not heard from in 7 days"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[2], "No machine wrote a record in the last 30 days");
+
+    let one = Fence {
+        roster: Seats {
+            seats: [seat(7)].into_iter().collect(),
+            holders: vec![(seat(7), Hold::Unwatched)],
+        },
+        recent: Seats {
+            seats: [seat(7)].into_iter().collect(),
+            holders: vec![(seat(7), Hold::Unwatched)],
+        },
+    };
+    let lines = command::fence_lines(&one);
+    assert!(
+        lines[1].starts_with("Of 1 enrolled machine: 1 not heard from in 7 days"),
+        "{lines:?}"
+    );
+    let json = command::fence_json(&one);
+    assert_eq!(json["roster"]["unheard"], json!(1));
+    assert_eq!(json["holders"][0]["why"], json!("unheard"));
+    assert_eq!(json["holders"][0]["recent"], json!(true));
 }

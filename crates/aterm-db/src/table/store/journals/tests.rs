@@ -1040,7 +1040,7 @@ fn a_replay_shares_immutable_wires_with_or_without_cache_retention() {
     let journal = Journal::new(3);
     let dir = journal.dir.clone();
     let claim = whole(&dir);
-    let wires = |links: &[Linked]| {
+    let wires = |links: &Links| {
         links
             .iter()
             .map(|link| link.wire.wire().as_ptr())
@@ -1082,7 +1082,7 @@ fn a_replay_shares_immutable_wires_with_or_without_cache_retention() {
     let again = journals.read_at(&dir, ANCHOR, limits(), hour_on()).unwrap();
     assert_eq!(wires(&again.links), held, "and stays kept");
     assert_eq!(
-        again.links[0].wire.wire(),
+        again.links.get(0).unwrap().wire.wire(),
         original,
         "an owned edit leaves retained bytes intact"
     );
@@ -1217,15 +1217,9 @@ fn a_kept_table_read_holds_no_plaintext() {
     let _: (&Option<JournalSeen>, &u32, &usize) = (witnessed, hits, heap_bytes);
     assert!(!links.is_empty());
     for link in links.iter() {
-        let Linked {
-            wire,
-            received_ms,
-            conflict,
-            through,
-        } = link;
-        assert!(!holds(wire.wire()), "a kept wire is ciphertext");
-        // A time, a flag and a count with a hash.
-        let _: (&u64, &bool, &Witness) = (received_ms, conflict, through);
+        assert!(!holds(link.wire.wire()), "a kept wire is ciphertext");
+        // A time, a flag and the count with its stored custody digest.
+        let _: (u64, bool, Witness) = (link.received_ms, link.conflict, link.through);
     }
 }
 

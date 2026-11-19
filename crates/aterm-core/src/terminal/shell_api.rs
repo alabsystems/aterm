@@ -239,6 +239,13 @@ impl Terminal {
         self.program_state.report()
     }
 
+    /// Whether the writer of the standing display report spoke during this shell command,
+    /// or since startup in a terminal without shell marks. Carried reports need a fresh reading.
+    #[must_use]
+    pub const fn program_reported_in_command(&self) -> bool {
+        self.program_state.named_in_command()
+    }
+
     /// THE TURNS THE PROGRAM'S REPORTS DREW PAST `after` (OSC 7501,
     /// [`super::program_state::ProgramTurns::after`]): into `out`, oldest first, each kept turn
     /// with an edge newer than the cursor (every kept turn for `None`), answering how many turns

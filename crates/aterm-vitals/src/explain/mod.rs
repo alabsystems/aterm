@@ -421,6 +421,10 @@ pub struct CoalRow {
     /// Its CPU over the window, millicores (from 0 for one made inside it; 0 for one not
     /// [`Self::measured`]).
     pub cpu_mc: i64,
+    /// Its CPU since it began, ns: the coalition's cumulative counter, its exited members' work
+    /// included, as read at the window's end. For a daemon started at boot that is its CPU since
+    /// start-up; for an on-demand worker's coalition, since that worker's coalition was made.
+    pub cpu_total_ns: u64,
     /// Whether its counters were read at both ends of the window (or it was made inside it).
     /// `false` for one the base should have held and did not, or whose counter went back: its
     /// figures over the window read 0, and the residual holds its work.
@@ -994,6 +998,20 @@ pub fn name(
     live
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PaneCpuCut {
+    root: Option<crate::delegated::ProcessKey>,
+    read: bool,
+}
+
+#[derive(Debug)]
+struct ScopeBase {
+    at_ns: u64,
+    totals: ReapTotals,
+    counters: IdMap<crate::delegated::ProcessKey, (u64, Option<u64>)>,
+    panes: IdMap<u64, PaneCpuCut>,
+}
+
 /// The facts' running state between split ticks: the base the next window starts at, each
 /// coalition's last name, each lead identity read, and the last facts.
 #[derive(Debug, Default)]
@@ -1008,7 +1026,7 @@ pub(crate) struct WhyState {
     /// The tabs' and aterm's CPU, live and reaped, read at each whole reading ([`reap`]).
     reap: ReapLedger,
     /// The last whole reading used by the resource rows' scope histories.
-    scope_base: Option<(u64, ReapTotals, IdMap<crate::delegated::ProcessKey, u64>)>,
+    scope_base: Option<ScopeBase>,
     /// Whether a read misread the record's layout ([`misread`]): the lane
     /// stays off for good, since the kernel's layout does not change under a
     /// running process.
@@ -1054,6 +1072,10 @@ pub struct ScopeCpu {
 pub struct ScopeCpuPane {
     /// Pane/session key.
     pub key: u64,
+    /// This pane's shell generation, when the current process sweep proves it.
+    pub root: Option<crate::delegated::ProcessKey>,
+    /// Both endpoints read the same shell and its owned process counters with complete coverage.
+    pub complete: bool,
     /// Reported own-counter growth rate, in cores; not an execution-window floor.
     pub reported: f64,
 }
@@ -1097,6 +1119,12 @@ pub(crate) struct PreparedWhy {
 }
 
 impl PreparedWhy {
+    /// Only this pass's uncapped coalition facts, never the retained explained snapshot.
+    pub(crate) fn group_facts(&self) -> Option<&WhyFacts> {
+        self.facts
+            .as_ref()
+            .filter(|facts| facts.lane.on() && facts.split.via == Via::Coalitions)
+    }
     pub(crate) fn memory_owners(&self) -> Option<crate::model::MemoryOwners> {
         let facts = self.facts.as_ref().filter(|facts| facts.lane.on())?;
         Some(crate::model::MemoryOwners::of_coalitions(
@@ -1146,6 +1174,13 @@ impl WhyState {
     ) -> Option<ScopeCpu> {
         self.step_reap(s, attribution);
         if !self.reap.stepped_at(s.at_ns) {
+            if !s.machine_only
+                && let Some(base) = &mut self.scope_base
+            {
+                for cut in base.panes.values_mut() {
+                    cut.read = false;
+                }
+            }
             return None;
         }
         if let Some(read) = &s.coalitions {
@@ -1153,41 +1188,90 @@ impl WhyState {
         }
         let now = self.reap.totals();
         let procs = s.procs.as_deref()?;
-        let counters = procs
+        let (members, owners) = attribution?;
+        let complete_source = !s.procs_truncated
+            && !s.ownership_incomplete
+            && !s.native_incomplete
+            && !s.native_source_lost;
+        let mut cuts: Vec<_> = s
+            .tabs
             .iter()
-            .filter_map(|p| {
-                Some((
-                    crate::delegated::ProcessKey {
-                        pid: p.pid,
-                        start: p.start?,
-                    },
-                    p.cpu_ns?,
-                ))
+            .map(|pane| PaneCpuCut {
+                root: None,
+                read: complete_source && !s.unproved_tabs.contains(&pane.key),
             })
             .collect();
-        let (at, base, before) = self.scope_base.replace((s.at_ns, now.clone(), counters))?;
+        let mut counters = IdMap::default();
+        for (p, member) in procs.iter().zip(members) {
+            let key = p
+                .start
+                .map(|start| crate::delegated::ProcessKey { pid: p.pid, start });
+            if let Some(index) = member.tab {
+                let cut = &mut cuts[index];
+                cut.read &= key.is_some() && p.cpu_ns.is_some();
+                if s.tabs[index].shell_pid == p.pid && !s.unproved_tabs.contains(&s.tabs[index].key)
+                {
+                    cut.root = key;
+                }
+            }
+            if let Some((key, counter)) = key.zip(p.cpu_ns) {
+                counters.insert(key, (counter, member.tab.map(|index| s.tabs[index].key)));
+            }
+        }
+        let panes = s
+            .tabs
+            .iter()
+            .zip(&cuts)
+            .map(|(pane, cut)| (pane.key, *cut))
+            .collect();
+        let ScopeBase {
+            at_ns: at,
+            totals: base,
+            counters: before,
+            panes: previous_panes,
+        } = self.scope_base.replace(ScopeBase {
+            at_ns: s.at_ns,
+            totals: now.clone(),
+            counters,
+            panes,
+        })?;
         let window = s
             .at_ns
             .checked_sub(at)
             .filter(|dt| *dt > 0 && *dt <= WINDOW_MAX_NS)?;
+        // Published growth from a process that crossed pane ownership or disappeared has no
+        // complete two-sweep reading for its former pane. Keep unaffected siblings measurable.
+        let mut lost_panes = IdSet::default();
+        let current = &self.scope_base.as_ref()?.counters;
+        for (process, (_, prior_pane)) in &before {
+            if let Some(prior) = prior_pane
+                && current.get(process).and_then(|(_, pane)| *pane) != Some(*prior)
+            {
+                lost_panes.insert(*prior);
+            }
+        }
         let mut extra_own = 0_u64;
         let mut extra_tabs = IdMap::<u64, u64>::default();
         let mut extra_panes = IdMap::<u64, u64>::default();
         let mut extra_missing = IdSet::<Option<u64>>::default();
-        let (members, owners) = attribution?;
         for ((p, member), owner) in procs.iter().zip(members).zip(owners) {
-            if owner.is_none() {
-                continue;
-            }
             let tab = member
                 .tab
                 .and_then(|index| s.tabs.get(index))
                 .map(|t| t.tab);
-            let delta = p
+            let prior = p
                 .start
-                .and_then(|start| before.get(&crate::delegated::ProcessKey { pid: p.pid, start }))
+                .and_then(|start| before.get(&crate::delegated::ProcessKey { pid: p.pid, start }));
+            let delta = prior
                 .zip(p.cpu_ns)
-                .and_then(|(before, now)| now.checked_sub(*before));
+                .and_then(|((ns, _), now)| now.checked_sub(*ns));
+            if let Some(index) = member.tab {
+                cuts[index].read &=
+                    delta.is_some() && prior.and_then(|(_, pane)| *pane) == Some(s.tabs[index].key);
+            }
+            if owner.is_none() {
+                continue;
+            }
             if let Some(delta) = delta {
                 if let Some(tab) = tab {
                     let sum = extra_tabs.entry(tab).or_default();
@@ -1224,11 +1308,25 @@ impl WhyState {
                 }
             })
             .collect();
+        let measured_tabs: IdSet<_> = tabs
+            .iter()
+            .filter(|tab| !tab.missed)
+            .map(|tab| tab.key)
+            .collect();
         let panes = s
             .tabs
             .iter()
-            .map(|pane| ScopeCpuPane {
+            .zip(cuts)
+            .map(|(pane, cut)| ScopeCpuPane {
                 key: pane.key,
+                root: cut.root,
+                complete: cut.read
+                    && cut.root.is_some()
+                    && previous_panes
+                        .get(&pane.key)
+                        .is_some_and(|before| before.read && before.root == cut.root)
+                    && !lost_panes.contains(&pane.key)
+                    && measured_tabs.contains(&pane.tab),
                 reported: now
                     .pane_reported_since(&base, pane.key)
                     .saturating_add(extra_panes.get(&pane.key).copied().unwrap_or(0))

@@ -283,6 +283,7 @@ fn loose_config(root: &Path) -> String {
 }
 
 /// The dev profile's `legacy_loose()` and presence under `config::load` and `load_for_host`.
+#[cfg(unix)]
 fn dev_under_both(dirs: &Dirs) -> [(bool, Presence); 2] {
     let judge = |validated: Option<config::Validated>| {
         let validated = validated.expect("agh.toml is there");
@@ -295,6 +296,9 @@ fn dev_under_both(dirs: &Dirs) -> [(bool, Presence); 2] {
     ]
 }
 
+/// Unix's by nature: `legacy_loose` lets a group or other read bit through, which a windows
+/// private file has no counterpart of.
+#[cfg(unix)]
 #[test]
 fn legacy_loose_is_honoured_by_the_host_loader_only() {
     let root = common::scratch("writers-loose");
@@ -401,7 +405,6 @@ fn grant_vault(root: &Path, fake: &FakeGithub, recorded: bool) -> Dirs {
 
 #[test]
 fn first_grant_preserves_recorded_vault_routing_without_learning() {
-    use std::os::unix::fs::PermissionsExt;
     let root = common::scratch("first-grant");
     let fake = FakeGithub::start();
     let dirs = grant_vault(root.path(), &fake, true);
@@ -435,22 +438,37 @@ fn first_grant_preserves_recorded_vault_routing_without_learning() {
         granted(&dirs),
         [row("atpkg-publish", &["alabsystems/aterm"])]
     );
-    assert_eq!(
-        std::fs::metadata(dirs.config_file())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-    assert_eq!(
-        std::fs::metadata(&dirs.config)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(dirs.config_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&dirs.config)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    // Windows has no mode: the folder and agh.toml are private by their protected access lists
+    // of the user and SYSTEM alone.
+    #[cfg(windows)]
+    {
+        use aterm_uds::private_file::{PrivateDir, judge_private_dir, read_private};
+        assert_eq!(
+            judge_private_dir(&dirs.config).unwrap(),
+            PrivateDir::Private
+        );
+        read_private(&dirs.config, "agh.toml", 1 << 16).expect("a private agh.toml");
+    }
     let view = agh::routing::view(&dirs).unwrap();
     let router = view.router().unwrap();
     assert_eq!(router.writer_of("fixture-dev"), Some("dev"));
@@ -558,8 +576,13 @@ fn revoke_and_malformed_grants_do_not_initialize_a_vault_config() {
 
 #[test]
 fn first_grant_does_not_replace_unsafe_or_malformed_existing_config() {
-    use std::os::unix::fs::PermissionsExt;
-    for state in ["symlink", "loose", "invalid", "not-utf8"] {
+    // A symlink is unix's to make here (windows asks a privilege for one).
+    let states: &[&str] = if cfg!(unix) {
+        &["symlink", "loose", "invalid", "not-utf8"]
+    } else {
+        &["loose", "invalid", "not-utf8"]
+    };
+    for &state in states {
         let root = common::scratch("first-grant-config");
         let fake = FakeGithub::start();
         let dirs = grant_vault(root.path(), &fake, true);
@@ -573,12 +596,24 @@ fn first_grant_does_not_replace_unsafe_or_malformed_existing_config() {
         } else {
             dirs.config_file()
         };
-        std::fs::write(&protected, content).unwrap();
-        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o600)).unwrap();
-        if state == "symlink" {
-            std::os::unix::fs::symlink(&protected, dirs.config_file()).unwrap();
-        } else if state == "loose" {
-            std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o644)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&protected, content).unwrap();
+            std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o600)).unwrap();
+            if state == "symlink" {
+                std::os::unix::fs::symlink(&protected, dirs.config_file()).unwrap();
+            } else if state == "loose" {
+                std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+        }
+        #[cfg(windows)]
+        {
+            aterm_uds::private_file::write_private(&dirs.config, "agh.toml", content).unwrap();
+            if state == "loose" {
+                common::open_to_everyone(&protected);
+            }
         }
         let (exit, _, _) = run(
             root.path(),

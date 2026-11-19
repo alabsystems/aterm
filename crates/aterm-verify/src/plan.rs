@@ -61,6 +61,9 @@ pub enum StageId {
     /// Paint and spin matrices over the release bundle, run exclusively.
     MeasuringTests,
     GuiSmoke,
+    /// Compile the AppKit executables before any stage takes the quiet machine.
+    RedrawBuild,
+    ObjcBuild,
     RedrawConformance,
     /// macOS Objective-C live-window drivers (`stages::OBJC_DRIVES`).
     ObjcDrives,
@@ -279,6 +282,9 @@ pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
 /// matrix will run ([`folds_measuring`], [`named_skip`]).
 pub(crate) fn wanted(ctx: &Ctx) -> Vec<StageId> {
     let mut wanted = crate::checks::stages_of(&ctx.checks, ctx.checkers_in_tests);
+    if ctx.no_windows {
+        wanted.retain(|id| !matches!(id, StageId::RedrawBuild | StageId::ObjcBuild));
+    }
     if ctx.compile_only {
         wanted.retain(|id| matches!(id, StageId::TestCompile | StageId::MeasurePrebuild));
     }
@@ -389,6 +395,12 @@ pub fn plan(ctx: &Ctx) -> Result<Vec<StageSpec>, String> {
             if !s.after_stages.contains(prerequisite) {
                 s.after_stages.push(*prerequisite);
             }
+        }
+        // A timed stage can retain the quiet claim for later stages. Both headless
+        // builds must finish before the first such claim, including a windowed browser.
+        if crate::takes_quiet(ctx, s.id) {
+            s.after_stages
+                .extend([StageId::RedrawBuild, StageId::ObjcBuild]);
         }
         s.after_stages.retain(|id| present.contains(id));
         if measures && matches!(s.id, StageId::RedrawConformance | StageId::ObjcDrives) {
@@ -607,6 +619,16 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
             StageId::WasmGlue,
             "wasm glue (the generator on aterm-wasm-abi's toy, its goldens, in a browser)",
             Lane::CellsTarget,
+        ),
+        spec(
+            StageId::RedrawBuild,
+            "build the redraw conformance driver",
+            Lane::MainTarget,
+        ),
+        spec(
+            StageId::ObjcBuild,
+            "build the Objective-C window drivers",
+            Lane::MainTarget,
         ),
         spec(
             StageId::BrowserLane,

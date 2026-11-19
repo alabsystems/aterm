@@ -444,7 +444,7 @@ fn told_as_failed(record: &TaskRecord) -> bool {
 }
 
 /// Whether `record` is a worker's task still open to a landing: `working`, or stalled by a deadline (`startup`, `held`), as aterm's own loop reads one at its done edge.
-fn open_to_landing(record: Option<&TaskRecord>) -> bool {
+pub(crate) fn open_to_landing(record: Option<&TaskRecord>) -> bool {
     record.is_some_and(|r| {
         r.state == TaskState::Working
             || (r.state == TaskState::Stalled && matches!(r.why, Some("startup" | "held")))

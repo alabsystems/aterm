@@ -149,12 +149,13 @@ fn ctx<'a>(w: &'a World, s: &'a Snapshot, owner: bool) -> Ctx<'a> {
         snap: Some(s),
         epoch: 0x7f3a,
         as_of_unix_ms: u64::try_from(s.at_unix_ms).unwrap_or(0),
-        age_ms: 120,
+        age_ms: Some(120),
         state: Freshness::Fresh,
         machine: &w.machine,
         target: &w.target,
         tabs: &w.tabs,
         caller_panes: Some(&w.target.panes),
+        event_caller: None,
         owner_class: owner,
         volume: None,
         roots: &[],
@@ -385,11 +386,13 @@ fn long_workers_1032() -> Scene {
     scene
 }
 
-fn pressure_events(n: u64, at_ns: u64) -> Vec<Event> {
+fn pressure_events(n: u64, at_ns: u64, at_unix_ms: i64) -> Vec<Event> {
     (1..=n)
         .map(|seq| Event {
             seq,
             at_ns,
+            at_unix_ms: Some(at_unix_ms),
+            scope: crate::events::EventScope::Machine,
             kind: EventKind::Pressure {
                 from: Pressure::Normal,
                 to: Pressure::Warn,
@@ -418,7 +421,10 @@ fn a_carried_cpu_account_keeps_its_time_separate_from_current_memory() {
             cpu.get("unix_ms"),
             Some(&Jv::u(context.as_of_unix_ms - 2000))
         );
-        assert_eq!(cpu.get("age_ms"), Some(&Jv::u(context.age_ms + 2000)));
+        assert_eq!(
+            cpu.get("age_ms"),
+            Some(&Jv::u(context.age_ms.unwrap() + 2000))
+        );
         assert_eq!(cpu.get("window_ms"), Some(&Jv::u(source_span_ms)));
     }
 }
@@ -1201,7 +1207,7 @@ fn the_byte_cut_moves_rows_into_more_unless_top_is_given() {
     let j = render_json(&q("why --json"), &c);
     assert!(matches!(j.get("who"), Some(Jv::Arr(rows)) if rows.len() == 8));
     assert_eq!(j.get("more").and_then(|m| m.get("who")), Some(&Jv::Int(10)));
-    let events = pressure_events(4, s.at_ns);
+    let events = pressure_events(4, s.at_ns, s.at_unix_ms);
     let busy = Ctx {
         events: &events,
         ..ctx(&w, &s, true)
@@ -1235,12 +1241,15 @@ fn the_byte_cut_moves_rows_into_more_unless_top_is_given() {
 #[test]
 fn the_hardware_block_gives_way_before_the_last_who_rows() {
     let mut s = read(&long_workers_1032(), 3);
+    // Isolate hardware/event competition here; the adjacent byte-cut test keeps
+    // the independent Spotlight appendix in its reply budget.
+    s.spotlight = None;
     s.hardware = Some(crate::hardware::Sample::unavailable(
         "refused:ioreport_subscription",
     ));
     s.authorized_cpu_policy = Some(std::sync::Arc::new(Jv::obj([("state", Jv::s("ok"))])));
     let w = mac();
-    let events = pressure_events(9, s.at_ns);
+    let events = pressure_events(9, s.at_ns, s.at_unix_ms);
     let c = Ctx {
         events: &events,
         ..ctx(&w, &s, true)
@@ -1249,6 +1258,26 @@ fn the_hardware_block_gives_way_before_the_last_who_rows() {
     assert!(t.len() <= REPLY_MAX, "{} bytes\n{t}", t.len());
     assert!(!lines(&t, "who").is_empty(), "{t}");
     assert!(t.contains("`sys cores` prints it"), "{t}");
+    let appended = lines(&t, "e");
+    assert_eq!(appended.len(), events.len(), "{t}");
+    for (line, source) in appended.iter().zip(&events) {
+        assert_eq!(field(line, "seq"), i64::try_from(source.seq).unwrap());
+        assert_eq!(field(line, "at_ms"), source.at_unix_ms.unwrap());
+        assert!(line.contains(" source=machine span=not_sampled"), "{line}");
+    }
+    let full = why("events", &c);
+    let retained = lines(&full, "e");
+    assert_eq!(retained.len(), events.len(), "{full}");
+    for (line, source) in retained.iter().zip(&events) {
+        assert_eq!(field(line, "at_unix_ms"), source.at_unix_ms.unwrap());
+        assert!(line.contains(" source_scope=machine"), "{line}");
+        assert!(
+            line.contains(
+                " onset_unix_ms=unavailable(not_sampled) end_unix_ms=unavailable(not_sampled)"
+            ),
+            "{line}"
+        );
+    }
     let cores = why("cores", &c);
     assert!(cores.contains("CPU hardware: native IOReport"), "{cores}");
 }
@@ -1337,7 +1366,7 @@ fn the_cut_counts_a_since_replys_delta_header() {
     let w = mac();
     let mut edge = false;
     for n in 0..=4 {
-        let events = pressure_events(n, base.at_ns);
+        let events = pressure_events(n, base.at_ns, base.at_unix_ms);
         for (a, b) in (0..=28).flat_map(|a| (0..=20).map(move |b| (a, b))) {
             let mut s = base.clone();
             if let Some(f) = s.why.as_mut() {
@@ -1789,4 +1818,113 @@ fn sampled_cpu_names_the_work_its_attribution_cannot_witness() {
     let s = Snapshot::default();
     let c = ctx(&w, &s, true);
     assert!(!why("why cpu", &c).contains("not_sampled"));
+}
+
+/// THE INDEX SIZE (SD-94): where aterm's root LAN broker answered Spotlight's stores, every CPU
+/// form of `sys why` (`why`, `why cpu`, text and JSON) prints the index's size on disk (`index
+/// index_size=`) and the `index_folder` cannot line the answer meets is gone; `index_progress`
+/// stays, as no one has measured that root can read it. A walk the broker cut short prints a lower
+/// bound, in JSON too; where it cut every store, `index_folder` stays, its reason the bound. A
+/// memory reply touches neither of Spotlight's limits and names neither.
+/// CONTROL: the same reading with no answer prints no index line and keeps
+/// `cannot what=index_folder why=needs_privilege:root`.
+#[test]
+fn sys_why_prints_the_index_size_the_root_daemon_read() {
+    use crate::spotlight::{Store, StoreCut, StoreRead};
+    let readings = read_calm(spotlight_1032()).series(3);
+    let now_ms = readings.last().expect("readings").mono_ms;
+    let with = |store: Option<StoreRead>| {
+        let mut v = Vitals::new();
+        if let Some(store) = store {
+            v.note_spotlight_store(store);
+        }
+        let mut snaps: Vec<Snapshot> = readings.iter().map(|r| v.absorb(r)).collect();
+        snaps.pop().expect("readings")
+    };
+    let answer = |data: Option<StoreCut>, work: Option<StoreCut>| StoreRead {
+        stores: vec![
+            Store {
+                volume: "/System/Volumes/Data".into(),
+                bytes: 2_147_483_648,
+                entries: 412,
+                cut: data,
+            },
+            Store {
+                volume: "/Volumes/Work".into(),
+                bytes: 4096,
+                entries: 1,
+                cut: work,
+            },
+        ],
+        at_ms: now_ms - 4200,
+    };
+    let w = mac();
+    let answered = with(Some(answer(None, None)));
+    assert!(answered.spotlight.is_some(), "CONTROL: the family is read");
+    for text in ["why", "why cpu"] {
+        let t = why(text, &ctx(&w, &answered, true));
+        assert_eq!(
+            lines(&t, "index"),
+            ["index index_size=2147487744 volumes=2 age_ms=4200 src=root_daemon"],
+            "{text}: {t}"
+        );
+        assert!(!t.contains("cannot what=index_folder"), "{text}: {t}");
+        assert!(
+            t.contains("\ncannot what=index_progress why=unsupported\n"),
+            "{text}: {t}"
+        );
+        let j = render_json(&q(&format!("{text} --json")), &ctx(&w, &answered, true));
+        assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+        let index = j.get("index").expect("the index's size");
+        assert_eq!(index.get("size_bytes"), Some(&Jv::u(2_147_487_744)));
+        assert!(!j.to_text().contains("index_folder"), "{}", j.to_text());
+    }
+    let t = why("why mem", &ctx(&w, &answered, true));
+    assert!(lines(&t, "index").is_empty(), "why mem: {t}");
+    assert!(!t.contains("cannot what=index_"), "why mem: {t}");
+
+    let cut = with(Some(answer(None, Some(StoreCut::Entries))));
+    let t = why("why cpu", &ctx(&w, &cut, true));
+    assert_eq!(
+        lines(&t, "index"),
+        [
+            "index index_size=\u{2265}2147487744 partial=entries volumes=2 age_ms=4200 src=root_daemon"
+        ],
+        "{t}"
+    );
+    assert!(
+        !t.contains("cannot what=index_folder"),
+        "one store read whole: {t}"
+    );
+    let j = render_json(&q("why cpu --json"), &ctx(&w, &cut, true));
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    let index = j.get("index").expect("the index's size");
+    assert_eq!(
+        index.get("size_bytes"),
+        Some(&Jv::at_least(2_147_487_744, "entries"))
+    );
+    assert!(
+        j.to_text().contains(&Jv::at_least(1, "entries").to_text()),
+        "the cut store's entries are a lower bound: {}",
+        j.to_text()
+    );
+
+    let all_cut = with(Some(answer(Some(StoreCut::Time), Some(StoreCut::Time))));
+    let t = why("why cpu", &ctx(&w, &all_cut, true));
+    assert!(
+        t.contains("\ncannot what=index_folder why=unavailable:partial_time\n"),
+        "no store read whole: {t}"
+    );
+    let j = render_json(&q("why cpu --json"), &ctx(&w, &all_cut, true));
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+
+    let unanswered = with(None);
+    for text in ["why", "why cpu"] {
+        let t = why(text, &ctx(&w, &unanswered, true));
+        assert!(lines(&t, "index").is_empty(), "CONTROL {text}: {t}");
+        assert!(
+            t.contains("\ncannot what=index_folder why=needs_privilege:root\n"),
+            "CONTROL {text}: {t}"
+        );
+    }
 }

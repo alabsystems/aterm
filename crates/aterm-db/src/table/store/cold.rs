@@ -97,6 +97,27 @@ pub(super) fn read(
     decode(plain)
 }
 
+/// The SHA-256 of the file `dir` keeps, as [`read`] reads it (no larger than a store whose
+/// journal holds at most `journal_bytes` keeps); none without a file. It opens nothing: under a
+/// floor a table's revision names the file's bytes (`super::Store::revision`), since a read
+/// below the floor takes its payloads from them. The file is one bulk hash, read again by every
+/// sighting of such a store (`super::sighting`), so it is hashed with ring's SHA-256, which
+/// uses the CPU's SHA-256 instructions as aterm's other bulk file hashes do: 6.5 ms where
+/// `aterm_digest`'s portable SHA-256 takes 39 ms for 21.6 MB, the same digest.
+///
+/// # Errors
+/// The file is unreadable or past its bound.
+pub(super) fn digest(dir: &Path, journal_bytes: usize) -> Result<Option<Digest>> {
+    Ok(
+        aterm_secrets::fsx::read_owned(&path(dir), bound(journal_bytes))?.map(|bytes| {
+            ring::digest::digest(&ring::digest::SHA256, &bytes)
+                .as_ref()
+                .try_into()
+                .expect("a SHA-256 digest is 32 bytes")
+        }),
+    )
+}
+
 fn decode(mut plain: &[u8]) -> Result<Payloads> {
     let damaged = || Error::new("cold table payloads are damaged");
     let mut take = |n: usize| -> Result<&[u8]> {

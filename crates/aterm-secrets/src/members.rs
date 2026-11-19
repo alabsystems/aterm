@@ -61,7 +61,7 @@ where
             let size: u64 = Some(size)
                 .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|s| s.parse().ok())
-                .filter(|size| *size <= crate::membership_log::MAX_RECORDS_STREAM as u64)
+                .filter(|size| *size <= crate::membership_log::REPLY_CAP as u64)
                 .ok_or_else(|| crate::Error::new("the member's authority size is out of bounds"))?;
             let copied = std::io::copy(&mut std::io::Read::take(&mut *member, size), joiner)?;
             if copied != size {

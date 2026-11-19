@@ -13,13 +13,25 @@ fn capacity_is_a_typed_refusal_and_not_a_failure_word() {
             .context("credential requests")
             .is_capacity_exhausted()
     );
-    assert!(Error::capacity(words).is_capacity_exhausted());
-    assert_eq!(Error::capacity(words).repair_cause(), RepairCause::Quota);
-    assert!(
-        Error::capacity(words)
-            .context("credential requests")
-            .is_capacity_exhausted()
-    );
+    for bound in [CapacityBound::Table, CapacityBound::Writer] {
+        assert!(Error::capacity(bound, words).is_capacity_exhausted());
+        assert_eq!(
+            Error::capacity(bound, words).capacity_exhausted(),
+            Some(bound)
+        );
+        assert_eq!(
+            Error::capacity(bound, words).repair_cause(),
+            RepairCause::Quota
+        );
+        assert_eq!(
+            Error::capacity(bound, words)
+                .context("credential requests")
+                .capacity_exhausted(),
+            Some(bound),
+            "context keeps the bound"
+        );
+    }
+    assert_eq!(Error::new(words).capacity_exhausted(), None);
     assert!(!Error::repair(words, RepairCause::Quota).is_capacity_exhausted());
     assert!(
         !Error::from(aterm_secrets::Error::of_kind(

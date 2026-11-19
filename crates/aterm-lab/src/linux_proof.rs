@@ -78,6 +78,27 @@ fn gui_admission<T>(
     })
 }
 
+/// The claim's actual admission snapshot, without qualifying continuous quiet or changing
+/// any GUI behavior verdict. A loaded admission is reported alongside its still-strict rows.
+fn reported_gui_admission(tag: &str, secs: f64, protection: aterm_capacity::Protection) -> Row {
+    let detail = match protection {
+        aterm_capacity::Protection::Qualified(window) => {
+            format!("admission=quiet CPU-window={window:?}; timing values remain diagnostic")
+        }
+        aterm_capacity::Protection::Loaded(observed) => {
+            format!(
+                "admission=loaded at its patience bound: {observed}; timing values remain diagnostic"
+            )
+        }
+    };
+    Row {
+        name: format!("{tag} GUI admission"),
+        verdict: Verdict::Pass,
+        secs,
+        detail,
+    }
+}
+
 fn report_publication(
     rows: &mut Vec<Row>,
     path: &Path,
@@ -898,6 +919,150 @@ fn fresh_results(parent: &Path, prefix: &str) -> Result<PathBuf, Fail> {
         .map_err(|error| Fail::die(format!("{}: {error}", parent.display())))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentationIdentity {
+    window: u64,
+    serial: u64,
+    surface: u64,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PresentationImage {
+    identity: PresentationIdentity,
+    path: String,
+    png: String,
+}
+
+fn presentation_fields<'a>(
+    line: &'a str,
+    prefix: &str,
+) -> Result<std::collections::BTreeMap<&'a str, &'a str>, String> {
+    let words = line
+        .strip_prefix(prefix)
+        .ok_or("missing presentation receipt")?;
+    let mut fields = std::collections::BTreeMap::new();
+    for word in words.split_whitespace() {
+        let (key, value) = word
+            .split_once('=')
+            .ok_or("invalid presentation receipt field")?;
+        if value.is_empty() || fields.insert(key, value).is_some() {
+            return Err("empty or repeated presentation receipt field".into());
+        }
+    }
+    Ok(fields)
+}
+
+impl PresentationIdentity {
+    fn read(fields: &std::collections::BTreeMap<&str, &str>) -> Result<Self, String> {
+        let number = |key: &str| {
+            fields
+                .get(key)
+                .and_then(|word| word.parse::<u64>().ok().filter(|n| n.to_string() == *word))
+                .ok_or_else(|| format!("no canonical {key} in presentation receipt"))
+        };
+        let identity = Self {
+            window: number("window")?,
+            serial: number("serial")?,
+            surface: number("surface")?,
+            width: usize::try_from(number("width")?).map_err(|e| e.to_string())?,
+            height: usize::try_from(number("height")?).map_err(|e| e.to_string())?,
+        };
+        if identity.serial == 0
+            || identity.surface == 0
+            || identity.width == 0
+            || identity.height == 0
+            || identity.width > 8192
+            || identity.height > 8192
+        {
+            return Err("empty or oversized presentation identity".into());
+        }
+        Ok(identity)
+    }
+}
+
+impl PresentationImage {
+    /// The lease CLI suppresses the photograph's output on success. Its two receipts
+    /// acknowledge one immutable client and that same presentation's validated release.
+    fn parse(text: &str) -> Result<Self, String> {
+        if text.len() > 16 * 1024 || !text.ends_with('\n') {
+            return Err("invalid presentation receipt framing".into());
+        }
+        let mut lines = text.lines();
+        let image = presentation_fields(
+            lines.next().ok_or("missing presentation image")?,
+            "OK presentation-image ",
+        )?;
+        let released = presentation_fields(
+            lines.next().ok_or("missing presentation release")?,
+            "OK presentation-released ",
+        )?;
+        if lines.next().is_some() || image.len() != 7 || released.len() != 5 {
+            return Err("unexpected presentation receipt fields or output".into());
+        }
+        let identity = PresentationIdentity::read(&image)?;
+        if PresentationIdentity::read(&released)? != identity {
+            return Err("the released presentation differs from the photographed client".into());
+        }
+        let png = image
+            .get("png_sha256")
+            .filter(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .ok_or("no SHA256 for the held client")?
+            .to_string();
+        let encoded = image.get("path").ok_or("no held client path")?;
+        let path = aterm_codec::pct::decode(encoded);
+        if aterm_codec::pct::encode(&path) != *encoded
+            || path.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err("invalid escaped held client path".into());
+        }
+        if !Path::new(&path).is_absolute()
+            || path
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err("held client path is not an absolute artifact path".into());
+        }
+        Ok(Self {
+            identity,
+            path,
+            png,
+        })
+    }
+
+    fn pixels(&self, png: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
+        if self.png != aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(png)) {
+            return Err("held client PNG differs from its presentation receipt".into());
+        }
+        let pixels = aterm_png::decode_rgba8(png, 8192)
+            .ok_or("the held client is not a PNG this lab decodes")?;
+        if (pixels.1, pixels.2) != (self.identity.width, self.identity.height) {
+            return Err("held client dimensions differ from its presentation receipt".into());
+        }
+        Ok(pixels)
+    }
+}
+
+enum NativePhotoSource {
+    File(String),
+    WestonDirectory(String),
+}
+
+struct NativePhoto {
+    argv: Vec<String>,
+    source: NativePhotoSource,
+    local: PathBuf,
+    weston: Option<WestonView>,
+    producers: Vec<u32>,
+}
+
 /// One aterm-gui under `display` (or `--headless` with none), driven over its control socket in the guest.
 pub(crate) struct Gui<'a> {
     pub(crate) up: &'a Up,
@@ -927,6 +1092,10 @@ impl Gui<'_> {
 
     /// The guest argv of one `aterm-ctl` verb against this aterm: the verb's words last.
     pub(crate) fn ctl_argv(&self, verb: &[&str]) -> Vec<String> {
+        self.ctl_argv_timeout(verb, "90")
+    }
+
+    fn ctl_argv_timeout(&self, verb: &[&str], timeout: &str) -> Vec<String> {
         let mut argv = vec![
             "env".to_string(),
             format!("XDG_RUNTIME_DIR={}/run", self.dir),
@@ -935,7 +1104,7 @@ impl Gui<'_> {
             "--sock".into(),
             self.sock(),
             "--timeout".into(),
-            "90".into(),
+            timeout.into(),
         ];
         argv.extend(verb.iter().map(|s| (*s).to_string()));
         argv
@@ -1060,7 +1229,7 @@ impl Gui<'_> {
         format!("{}aterm", guest::UNIT_PREFIX)
     }
 
-    /// Send `signal` (`SIGSTOP`, `SIGCONT`) to the unit's main process, aterm-gui itself when it was started logged.
+    /// Send `signal` to the unit's main process, aterm-gui itself when it was started logged.
     pub(crate) fn signal(&self, signal: &str) -> bool {
         self.up
             .sh(&[
@@ -1129,20 +1298,22 @@ impl Gui<'_> {
         )
     }
 
-    /// [`Gui::start_logged_on`] with `extra` added to its environment.
+    /// [`Gui::start_logged_on`] with `extra` added to its environment and an atomic
+    /// manager-provided main-exit record at `status`. The GUI remains the native MainPID.
     ///
     /// # Errors
     /// `systemd-run` refused it.
-    pub(crate) fn start_logged_with(
+    pub(crate) fn start_recorded_with(
         &self,
         client: &[(String, String)],
         extra: &[(String, String)],
         stderr: &str,
+        status: &str,
     ) -> Result<String, String> {
-        self.start_unit(Some(client), extra, Some(stderr), false)
+        self.start_unit_with_record(Some(client), extra, Some(stderr), false, Some(status))
     }
 
-    /// [`Gui::start_watched`] on a display that is not one of the lane's [`Display`]s: `client` is what aterm-gui is told to reach it by.
+    /// [`Gui::start_watched`] with the display's `client` environment.
     ///
     /// # Errors
     /// `systemd-run` refused it.
@@ -1176,6 +1347,17 @@ impl Gui<'_> {
         extra: &[(String, String)],
         stderr: Option<&str>,
         watched: bool,
+    ) -> Result<String, String> {
+        self.start_unit_with_record(client, extra, stderr, watched, None)
+    }
+
+    fn start_unit_with_record(
+        &self,
+        client: Option<&[(String, String)]>,
+        extra: &[(String, String)],
+        stderr: Option<&str>,
+        watched: bool,
+        record: Option<&str>,
     ) -> Result<String, String> {
         let mut env = vec![
             ("HOME".to_string(), format!("{}/home", self.dir)),
@@ -1222,9 +1404,12 @@ impl Gui<'_> {
             argv,
             socket: self.sock(),
         };
-        let started = self
-            .up
-            .sh(&guest::run_unit(&unit, Some(&format!("{}/home", self.dir))));
+        let home = format!("{}/home", self.dir);
+        let argv = match record {
+            Some(record) => guest::run_unit_with_exit_record(&unit, Some(&home), record),
+            None => guest::run_unit(&unit, Some(&home)),
+        };
+        let started = self.up.sh(&argv);
         if !started.ok() {
             return Err(format!("systemd-run: {}", started.tail(3)));
         }
@@ -1253,25 +1438,72 @@ impl Gui<'_> {
         ]);
     }
 
-    /// Copy the crash reports this instance wrote to this Mac, beside the frames (the guest's `/tmp` is emptied at its next boot).
+    /// Read a bounded diagnostic tail, preserving the command's exit/error result.
+    /// This is diagnostic text, never a process or invocation authority receipt.
+    pub(crate) fn diagnostic(&self, argv: &[String]) -> Out {
+        const LIMIT: usize = 64 * 1024;
+        let mut command = vec![
+            "bash".into(),
+            "-o".into(),
+            "pipefail".into(),
+            "-c".into(),
+            format!("\"$@\" 2>&1 | tail -c {}", LIMIT + 1),
+            "diagnostic".into(),
+        ];
+        command.extend_from_slice(argv);
+        let mut out = self.up.sh(&command);
+        if out.text.len() > LIMIT {
+            let mut start = out.text.len() - LIMIT;
+            while !out.text.is_char_boundary(start) {
+                start += 1;
+            }
+            out.text = format!(
+                "[truncated: last {LIMIT} bytes of diagnostic text]\n{}",
+                &out.text[start..]
+            );
+        }
+        out
+    }
+
+    /// Retain at most eight bounded crash-report tails beside the frames. Missing or
+    /// unreadable evidence is named; the guest's `/tmp` is emptied at its next boot.
     pub(crate) fn keep_crash_reports(&self, results: &Path) -> String {
-        let found = self.up.sh(&[
+        let found = self.diagnostic(&[
             "find".into(),
             format!("{}/home", self.dir),
+            "-type".into(),
+            "f".into(),
             "-name".into(),
             "crash-*.log".into(),
         ]);
         let mut kept = Vec::new();
-        for guest_path in found.text.lines().filter(|l| l.starts_with('/')) {
+        if !found.ok() || found.text.starts_with("[truncated:") {
+            kept.push(format!(
+                "crash inventory incomplete ({}): {}",
+                found.status(),
+                crate::util::one_line(&found.text, 240)
+            ));
+        }
+        let home = format!("{}/home/", self.dir);
+        let paths: Vec<_> = found
+            .text
+            .lines()
+            .filter(|l| l.starts_with(&home))
+            .collect();
+        if paths.len() > 8 {
+            kept.push(format!(
+                "crash inventory truncated: {} files, retaining at most eight",
+                paths.len()
+            ));
+        }
+        for guest_path in paths.into_iter().take(8) {
             let file = guest_path.rsplit('/').next().unwrap_or("crash.log");
             let name = format!("{}-{file}", self.name);
-            if self
-                .up
-                .guest
-                .copy_out(guest_path, &results.join(&name))
-                .ok()
-            {
-                kept.push(name);
+            let out = self.diagnostic(&["cat".into(), guest_path.into()]);
+            let text = format!("{} ({})\n{}", guest_path, out.status(), out.text);
+            match crate::util::write_fresh_mode(&results.join(&name), text, 0o600) {
+                Ok(()) => kept.push(format!("{name} ({})", out.status())),
+                Err(error) => kept.push(format!("{name} could not be retained: {error}")),
             }
         }
         if kept.is_empty() {
@@ -1294,6 +1526,228 @@ impl Gui<'_> {
         } else {
             Err(refused(verb, &out))
         }
+    }
+
+    /// The guest CLI owns the presentation lease while the independent photograph
+    /// runs, validates its receipt, and settles the connection before returning here.
+    fn photographed_client(
+        &self,
+        photo: &NativePhoto,
+        results: &Path,
+        suffix: &str,
+    ) -> Result<(Vec<u8>, usize, usize), String> {
+        let file = format!("{}{suffix}-client.png", self.name);
+        let mut argv = self.ctl_argv_timeout(&["image", "--presentation-lease", &file], "0");
+        for pid in &photo.producers {
+            argv.extend(["--producer-pid".into(), pid.to_string()]);
+        }
+        argv.push("--".into());
+        argv.extend(photo.argv.iter().cloned());
+        let out = self.up.sh(&argv);
+        let receipt_path = results.join(format!("{}{suffix}-presentation.txt", self.name));
+        let retained = crate::util::write_fresh(&receipt_path, &out.text)
+            .map_err(|e| format!("{}: {e}", receipt_path.display()));
+        if !out.ok() {
+            let keep_error = retained
+                .err()
+                .map_or(String::new(), |e| format!("; receipt not retained: {e}"));
+            return Err(format!(
+                "the leased native photograph failed: {} ({}){keep_error}",
+                out.tail(5),
+                out.status()
+            ));
+        }
+        retained?;
+        let image = PresentationImage::parse(&out.text)?;
+        let expected = format!("{}/run/aterm/images/{file}", self.dir);
+        if image.path != expected {
+            return Err(format!(
+                "the held client path is outside this fixture: {}",
+                image.path
+            ));
+        }
+        let png = results.join(file);
+        let bytes = self.retain_photo(&image.path, &png)?;
+        image.pixels(&bytes)
+    }
+
+    fn retain_photo(&self, source: &str, target: &Path) -> Result<Vec<u8>, String> {
+        if !matches!(std::fs::symlink_metadata(target), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(format!(
+                "{} already exists or is unreadable",
+                target.display()
+            ));
+        }
+        let copied = self.up.guest.copy_out(source, target);
+        if !copied.ok() {
+            return Err(format!("{source} not copied out: {}", copied.tail(3)));
+        }
+        crate::util::read_artifact(target).map_err(|e| format!("{}: {e}", target.display()))
+    }
+
+    fn native_photo(
+        &self,
+        display: Display,
+        results: &Path,
+        suffix: &str,
+    ) -> Result<NativePhoto, String> {
+        let mut producers = Vec::new();
+        for unit in display.units(&self.up.runtime, self.up.config()?) {
+            let pid = unit_pid(self.up, &unit.name)
+                .and_then(|pid| pid.parse::<u32>().ok())
+                .filter(|pid| *pid != 0)
+                .ok_or_else(|| {
+                    format!("the photograph producer {} has no main process", unit.name)
+                })?;
+            producers.push(pid);
+        }
+        producers.sort_unstable();
+        producers.dedup();
+        let (argv, source, local, weston) = match display {
+            Display::Xvfb | Display::Xwayland => {
+                let pid = unit_pid(self.up, &Self::unit_name())
+                    .ok_or("aterm-gui's unit has no main process")?;
+                let env = [display.client_env(&self.up.runtime)];
+                let found = self.up.sh(&guest::with_env(
+                    &env,
+                    &["xdotool".into(), "search".into(), "--pid".into(), pid],
+                ));
+                let windows: Vec<_> = found
+                    .text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect();
+                if !found.ok()
+                    || windows.len() != 1
+                    || !windows[0].bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(format!(
+                        "the photograph needs one owned X11 window: {}",
+                        found.tail(3)
+                    ));
+                }
+                let path = format!("{}/{}{suffix}.ppm", self.dir, self.name);
+                (
+                    guest::with_env(
+                        &env,
+                        &[
+                            format!("{}/lane-bus", self.bin),
+                            "xgrab".into(),
+                            windows[0].into(),
+                            path.clone(),
+                        ],
+                    ),
+                    NativePhotoSource::File(path),
+                    results.join(format!("{}{suffix}.ppm", self.name)),
+                    None,
+                )
+            }
+            Display::Mutter => {
+                let pid = unit_pid(self.up, &format!("{}mutter", guest::UNIT_PREFIX))
+                    .ok_or("Mutter's unit has no main process")?;
+                let env = [
+                    (
+                        "DBUS_SESSION_BUS_ADDRESS".into(),
+                        format!("unix:path={}/bus", self.up.runtime),
+                    ),
+                    ("XDG_RUNTIME_DIR".into(), self.up.runtime.clone()),
+                ];
+                let path = format!("{}/{}{suffix}-monitor.png", self.dir, self.name);
+                (
+                    guest::with_env(
+                        &env,
+                        &[
+                            format!("{}/lane-bus", self.bin),
+                            "cast".into(),
+                            pid,
+                            path.clone(),
+                        ],
+                    ),
+                    NativePhotoSource::File(path),
+                    results.join(format!("{}{suffix}-monitor.png", self.name)),
+                    None,
+                )
+            }
+            Display::Weston | Display::WestonX11 => {
+                let view = self.weston_view(display)?;
+                let dir = format!("{}/{}{suffix}-shots", self.dir, self.name);
+                let made = self.up.sh(&["mkdir".into(), "--".into(), dir.clone()]);
+                if !made.ok() {
+                    return Err(format!(
+                        "the photograph directory is not fresh: {}",
+                        made.tail(3)
+                    ));
+                }
+                let env = [
+                    display.client_env(&self.up.runtime),
+                    ("XDG_RUNTIME_DIR".into(), self.up.runtime.clone()),
+                ];
+                (
+                    guest::with_env(
+                        &env,
+                        &[
+                            "env".into(),
+                            "-C".into(),
+                            dir.clone(),
+                            "weston-screenshooter".into(),
+                        ],
+                    ),
+                    NativePhotoSource::WestonDirectory(dir),
+                    results.join(format!("{}{suffix}-output.png", self.name)),
+                    Some(view),
+                )
+            }
+        };
+        if let NativePhotoSource::File(path) = &source {
+            let fresh = self.up.sh(&[
+                "sh".into(),
+                "-c".into(),
+                "test ! -e \"$1\" && test ! -L \"$1\"".into(),
+                "fresh-photograph".into(),
+                path.clone(),
+            ]);
+            if !fresh.ok() {
+                return Err(format!("the photograph path is not fresh: {path}"));
+            }
+        }
+        Ok(NativePhoto {
+            argv,
+            source,
+            local,
+            weston,
+            producers,
+        })
+    }
+
+    fn retained_native_photo(&self, photo: &NativePhoto) -> Result<Vec<u8>, String> {
+        let source = match &photo.source {
+            NativePhotoSource::File(path) => path.clone(),
+            NativePhotoSource::WestonDirectory(dir) => {
+                let listed = self
+                    .up
+                    .sh(&["ls".into(), "-1".into(), "--".into(), dir.clone()]);
+                let names: Vec<_> = listed
+                    .text
+                    .lines()
+                    .filter(|line| line.ends_with(".png"))
+                    .collect();
+                if !listed.ok()
+                    || names.len() != 1
+                    || Path::new(names[0]).components().count() != 1
+                    || names[0] == "."
+                    || names[0] == ".."
+                {
+                    return Err(format!(
+                        "weston-screenshooter did not leave one PNG: {}",
+                        listed.tail(3)
+                    ));
+                }
+                format!("{dir}/{}", names[0])
+            }
+        };
+        self.retain_photo(&source, &photo.local)
     }
 
     fn judge_cpu(&self, display: Display, results: &Path) -> Result<String, String> {
@@ -1324,7 +1778,8 @@ impl Gui<'_> {
         ))
     }
 
-    /// Photograph the presented frame (`image`, kept as `<name><suffix>.png`) and hold it to the display server's own pixels.
+    /// Retain the terminal frame and complete presented client, then hold the client
+    /// (including its dock and bands) to the display server's own pixels.
     pub(crate) fn held_to_server(
         &self,
         display: Display,
@@ -1334,7 +1789,7 @@ impl Gui<'_> {
         self.held_to_server_but(display, results, suffix, 0..0)
     }
 
-    /// [`Gui::held_to_server`], but for the frame's rows in `live`.
+    /// [`Gui::held_to_server`], but for the terminal frame's changing rows in `live`.
     pub(crate) fn held_to_server_but(
         &self,
         display: Display,
@@ -1357,140 +1812,80 @@ impl Gui<'_> {
             .ok()
             .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
             .ok_or_else(|| format!("{}: not a PNG this lab decodes", png.display()))?;
-        let (w, h) = (presented.1, presented.2);
+        let photo = self.native_photo(display, results, suffix)?;
+        let client = self.photographed_client(&photo, results, suffix)?;
+        let native = self.retained_native_photo(&photo)?;
+        let (w, h) = (client.1, client.2);
+        let dims = self.expect(&["dims"], &|r| r.starts_with("OK "))?;
+        let layout = ClientLayout::read(&dims, &presented, &client, live.clone())?;
+        held_at(&client, &presented, layout.offset.0, layout.offset.1, live)
+            .map_err(|why| format!("terminal frame within the presented client: {why}"))?;
+        let geometry = format!(
+            "terminal frame {}x{} at ({},{}) in the complete {w}x{h} client",
+            presented.1, presented.2, layout.offset.0, layout.offset.1,
+        );
+        let delivery = ClientDelivery::new(&client);
         match display {
             Display::Xvfb | Display::Xwayland => {
-                let ppm = self.x_grab(display, results, suffix)?;
-                let server = crate::util::read_artifact(&ppm)
-                    .ok()
-                    .and_then(|b| parse_ppm(&b))
+                let ppm = &photo.local;
+                let server = parse_ppm(&native)
                     .ok_or_else(|| format!("{}: not a PPM this lab reads", ppm.display()))?;
-                let (sw, sh) = (server.1, server.2);
-                if (sw, sh) == (w, h) {
-                    compare_rgb(&presented.0, w, h, &server, live).map_err(|why| {
-                        format!("{why} (frame {frame}, server {})", ppm.display())
-                    })?;
-                    return Ok(format!(
-                        "the server's {w}x{h} window pixels (lane-bus xgrab) equal the \
-                         presented frame exactly"
-                    ));
-                }
-                let d = self.expect(&["dims"], &|r| r.starts_with("OK "))?;
-                let num = |k: &str| field(&d, k).and_then(|v| v.parse::<i64>().ok());
-                if (num("surface_w"), num("surface_h"))
-                    != (i64::try_from(sw).ok(), i64::try_from(sh).ok())
-                {
-                    return Err(format!(
-                        "the server's window is {sw}x{sh}, the frame {w}x{h}, and `dims` \
-                         names another surface: {d}"
-                    ));
-                }
-                let (ox, oy) = (num("offset_x").unwrap_or(0), num("offset_y").unwrap_or(0));
-                let window = (
-                    server
-                        .0
-                        .as_chunks::<3>()
-                        .0
-                        .iter()
-                        .flat_map(|p| [p[0], p[1], p[2], 0xff])
-                        .collect::<Vec<u8>>(),
-                    sw,
-                    sh,
-                );
-                let whole = WestonView {
-                    x: 0,
-                    y: 0,
-                    width: sw,
-                    height: sh,
-                    format: "XRGB8888".into(),
-                };
-                held_at(&window, &presented, ox, oy, live)
-                    .map_err(|why| format!("{why} (frame {frame}, server {})", ppm.display()))?;
-                let n = bands_held(&window, &presented, &whole, (ox, oy))
-                    .map_err(|why| format!("{why} (frame {frame}, server {})", ppm.display()))?;
+                delivery.compare_rgb(&server).map_err(|why| {
+                    format!(
+                        "{why} (client {}{suffix}-client.png, server {})",
+                        self.name,
+                        ppm.display()
+                    )
+                })?;
                 Ok(format!(
-                    "the server's {sw}x{sh} window pixels (lane-bus xgrab) hold the presented \
-                     {w}x{h} frame exactly at ({ox},{oy}), and its {n} band pixels each the \
-                     frame's nearest pixel"
+                    "the server's {w}x{h} window pixels (lane-bus xgrab) equal the complete \
+                     presented client exactly; {geometry}"
                 ))
             }
             Display::Weston | Display::WestonX11 => {
-                let view = self.weston_view(display)?;
-                if view.format != "XRGB8888" {
+                let view = photo.weston.as_ref().ok_or("no retained Weston view")?;
+                if view.format != "XRGB8888" || (view.width, view.height) != (w, h) {
                     return Err(format!(
-                        "weston shows a {}x{} {} buffer for the {w}x{h} frame {frame}",
+                        "weston shows a {}x{} {} buffer for the {w}x{h} client",
                         view.width, view.height, view.format
                     ));
                 }
-                let (ox, oy) = if (view.width, view.height) == (w, h) {
-                    (0, 0)
-                } else {
-                    let d = self.expect(&["dims"], &|r| r.starts_with("OK "))?;
-                    let num = |k: &str| field(&d, k).and_then(|v| v.parse::<i64>().ok());
-                    let surface = (num("surface_w"), num("surface_h"));
-                    let shown = (
-                        i64::try_from(view.width).ok(),
-                        i64::try_from(view.height).ok(),
-                    );
-                    if surface != shown {
-                        return Err(format!(
-                            "weston shows a {}x{} buffer for the {w}x{h} frame {frame}, and \
-                             `dims` names a surface of {:?}",
-                            view.width, view.height, surface
-                        ));
-                    }
-                    (num("offset_x").unwrap_or(0), num("offset_y").unwrap_or(0))
-                };
-                let shot = self.weston_shot(display, results, suffix)?;
-                let output = crate::util::read_artifact(&shot)
-                    .ok()
-                    .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
+                let shot = &photo.local;
+                let output = aterm_png::decode_rgba8(&native, 8192)
                     .ok_or_else(|| format!("{}: not a PNG this lab decodes", shot.display()))?;
-                let (vw, vh) = held_at(&output, &presented, view.x + ox, view.y + oy, live)
-                    .map_err(|why| format!("{why} (frame {frame}, output {})", shot.display()))?;
-                let held = if (vw, vh) == (w, h) {
-                    format!("the presented {w}x{h} frame exactly")
-                } else {
-                    format!("the {vw}x{vh} of the presented {w}x{h} frame that is on it exactly")
-                };
-                let bands = if (view.width, view.height) == (w, h) {
-                    String::new()
-                } else {
-                    let n = bands_held(&output, &presented, &view, (ox, oy)).map_err(|why| {
-                        format!("{why} (frame {frame}, output {})", shot.display())
-                    })?;
+                let (vw, vh) = delivery.at(&output, view.x, view.y).map_err(|why| {
                     format!(
-                        " at ({ox},{oy}) in it, and its {n} band pixels each the frame's nearest \
-                         pixel"
+                        "{why} (client {}{suffix}-client.png, output {})",
+                        self.name,
+                        shot.display()
                     )
-                };
+                })?;
                 Ok(format!(
-                    "weston's {}x{} output (weston-screenshooter) shows {held}, where its scene \
-                     graph puts the window's {}x{} {} buffer ({},{}){bands}",
-                    output.1, output.2, view.width, view.height, view.format, view.x, view.y
+                    "weston's {}x{} output (weston-screenshooter) shows {vw}x{vh} of the \
+                     complete {w}x{h} presented client exactly where its scene graph puts \
+                     the window ({},{}); {geometry}",
+                    output.1, output.2, view.x, view.y
                 ))
             }
             Display::Mutter => {
-                let shot = self.mutter_cast(results, suffix)?;
-                let output = crate::util::read_artifact(&shot)
-                    .ok()
-                    .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
+                let shot = &photo.local;
+                let output = aterm_png::decode_rgba8(&native, 8192)
                     .ok_or_else(|| format!("{}: not a PNG this lab decodes", shot.display()))?;
-                let (fx, fy) = match frame_places(&output, &presented, live.clone()).as_slice() {
+                let (x, y) = match delivery.places(&output).as_slice() {
                     [one] => *one,
                     [] => {
-                        let centred = held_at(
-                            &output,
-                            &presented,
-                            (output.1 as i64 - w as i64) / 2,
-                            (output.2 as i64 - h as i64) / 2,
-                            live,
-                        )
-                        .err()
-                        .unwrap_or_default();
+                        let centred = delivery
+                            .at(
+                                &output,
+                                (output.1 as i64 - w as i64) / 2,
+                                (output.2 as i64 - h as i64) / 2,
+                            )
+                            .err()
+                            .unwrap_or_default();
                         return Err(format!(
-                            "Mutter's {}x{} monitor (lane-bus cast) shows the presented {w}x{h} \
-                             frame {frame} nowhere exactly; centred: {centred} (monitor {})",
+                            "Mutter's {}x{} monitor (lane-bus cast) shows the complete \
+                             {w}x{h} presented client nowhere exactly; centred: {centred} \
+                             (monitor {})",
                             output.1,
                             output.2,
                             shot.display()
@@ -1498,126 +1893,20 @@ impl Gui<'_> {
                     }
                     _ => {
                         return Err(format!(
-                            "Mutter's monitor shows the presented {w}x{h} frame {frame} in more \
-                             than one place (monitor {})",
+                            "Mutter's monitor shows the complete {w}x{h} presented client in \
+                         more than one place (monitor {})",
                             shot.display()
                         ));
                     }
                 };
-                let d = self.expect(&["dims"], &|r| r.starts_with("OK "))?;
-                let num = |k: &str| field(&d, k).and_then(|v| v.parse::<i64>().ok());
-                let surface = (
-                    num("surface_w").and_then(|v| usize::try_from(v).ok()),
-                    num("surface_h").and_then(|v| usize::try_from(v).ok()),
-                );
-                let bands = match surface {
-                    (Some(sw), Some(sh)) if (sw, sh) != (w, h) => {
-                        let (ox, oy) = (num("offset_x").unwrap_or(0), num("offset_y").unwrap_or(0));
-                        let view = WestonView {
-                            x: fx as i64 - ox,
-                            y: fy as i64 - oy,
-                            width: sw,
-                            height: sh,
-                            format: "XRGB8888".into(),
-                        };
-                        let n =
-                            bands_held(&output, &presented, &view, (ox, oy)).map_err(|why| {
-                                format!("{why} (frame {frame}, monitor {})", shot.display())
-                            })?;
-                        format!(
-                            ", {ox},{oy} into its {sw}x{sh} surface, whose {n} band pixels are \
-                             each the frame's nearest pixel"
-                        )
-                    }
-                    _ => String::new(),
-                };
                 Ok(format!(
-                    "Mutter's {}x{} monitor (lane-bus cast, a ScreenCast frame through PipeWire) \
-                     shows the presented {w}x{h} frame exactly at ({fx},{fy}){bands}",
+                    "Mutter's {}x{} monitor (lane-bus cast, a ScreenCast frame through \
+                     PipeWire) shows the complete {w}x{h} presented client exactly at \
+                     ({x},{y}); {geometry}",
                     output.1, output.2
                 ))
             }
         }
-    }
-
-    fn mutter_cast(&self, results: &Path, suffix: &str) -> Result<PathBuf, String> {
-        let pid = unit_pid(self.up, &format!("{}mutter", guest::UNIT_PREFIX))
-            .ok_or_else(|| "Mutter's unit has no main pid".to_string())?;
-        let guest_png = format!("{}/{}{suffix}-monitor.png", self.dir, self.name);
-        let env = [
-            (
-                "DBUS_SESSION_BUS_ADDRESS".to_string(),
-                format!("unix:path={}/bus", self.up.runtime),
-            ),
-            ("XDG_RUNTIME_DIR".to_string(), self.up.runtime.clone()),
-        ];
-        let cast = self.up.sh(&guest::with_env(
-            &env,
-            &[
-                format!("{}/lane-bus", self.bin),
-                "cast".into(),
-                pid,
-                guest_png.clone(),
-            ],
-        ));
-        if !cast.ok() {
-            return Err(format!("lane-bus cast: {}", cast.tail(3)));
-        }
-        let local = results.join(format!("{}{suffix}-monitor.png", self.name));
-        let copied = self.up.guest.copy_out(&guest_png, &local);
-        if !copied.ok() {
-            return Err(format!("{guest_png} not copied out: {}", copied.tail(2)));
-        }
-        Ok(local)
-    }
-
-    fn x_grab(&self, display: Display, results: &Path, suffix: &str) -> Result<PathBuf, String> {
-        let x = vec![display.client_env(&self.up.runtime)];
-        let pid = unit_pid(self.up, &Self::unit_name())
-            .ok_or_else(|| "aterm-gui's unit has no main pid".to_string())?;
-        let found = self.up.sh(&guest::with_env(
-            &x,
-            &[
-                "timeout".into(),
-                "60".into(),
-                "xdotool".into(),
-                "search".into(),
-                "--sync".into(),
-                "--pid".into(),
-                pid.clone(),
-            ],
-        ));
-        if !found.ok() {
-            return Err(format!(
-                "xdotool search for aterm-gui (pid {pid}): {}",
-                found.tail(3)
-            ));
-        }
-        let win = found
-            .text
-            .lines()
-            .find(|l| !l.trim().is_empty() && l.trim().bytes().all(|b| b.is_ascii_digit()))
-            .map(|l| l.trim().to_string())
-            .ok_or_else(|| format!("xdotool found no window for aterm-gui (pid {pid})"))?;
-        let guest_ppm = format!("{}/{}{suffix}.ppm", self.dir, self.name);
-        let grab = self.up.sh(&guest::with_env(
-            &x,
-            &[
-                format!("{}/lane-bus", self.bin),
-                "xgrab".into(),
-                win.clone(),
-                guest_ppm.clone(),
-            ],
-        ));
-        if !grab.ok() {
-            return Err(format!("lane-bus xgrab {win}: {}", grab.tail(3)));
-        }
-        let ppm = results.join(format!("{}{suffix}.ppm", self.name));
-        let copied = self.up.guest.copy_out(&guest_ppm, &ppm);
-        if !copied.ok() {
-            return Err(format!("{guest_ppm} not copied out: {}", copied.tail(2)));
-        }
-        Ok(ppm)
     }
 
     fn weston_view(&self, display: Display) -> Result<WestonView, String> {
@@ -1633,48 +1922,6 @@ impl Gui<'_> {
             ],
         ));
         read_weston_view(&dump, &pid)
-    }
-
-    fn weston_shot(
-        &self,
-        display: Display,
-        results: &Path,
-        suffix: &str,
-    ) -> Result<PathBuf, String> {
-        let dir = format!("{}/shots", self.dir);
-        let shot = self.up.sh(&guest::with_env(
-            &[display.client_env(&self.up.runtime)],
-            &[
-                "sh".into(),
-                "-c".into(),
-                format!(
-                    "rm -rf {dir} && mkdir -p {dir} && cd {dir} && \
-                     exec timeout 60 weston-screenshooter"
-                ),
-            ],
-        ));
-        if !shot.ok() {
-            return Err(format!("weston-screenshooter: {}", shot.tail(3)));
-        }
-        let listed = self.up.sh(&["ls".into(), dir.clone()]);
-        if !listed.ok() {
-            return Err(format!(
-                "listing weston-screenshooter output in {dir}: {}",
-                listed.tail(3)
-            ));
-        }
-        let name = listed
-            .text
-            .lines()
-            .map(str::trim)
-            .find(|l| l.ends_with(".png"))
-            .ok_or_else(|| format!("weston-screenshooter wrote no PNG in {dir}"))?;
-        let local = results.join(format!("{}{suffix}-output.png", self.name));
-        let copied = self.up.guest.copy_out(&format!("{dir}/{name}"), &local);
-        if !copied.ok() {
-            return Err(format!("{dir}/{name} not copied out: {}", copied.tail(2)));
-        }
-        Ok(local)
     }
 
     fn judge(
@@ -1791,6 +2038,103 @@ pub(crate) fn parse_ppm(b: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
     Some((rgb.to_vec(), w, h))
 }
 
+#[derive(Clone, Debug)]
+struct LivePixels {
+    columns: std::ops::Range<usize>,
+    rows: std::ops::Range<usize>,
+}
+
+impl LivePixels {
+    fn rows(width: usize, rows: std::ops::Range<usize>) -> Self {
+        Self {
+            columns: 0..width,
+            rows,
+        }
+    }
+
+    fn contains(&self, x: usize, y: usize) -> bool {
+        self.columns.contains(&x) && self.rows.contains(&y)
+    }
+}
+
+struct ClientLayout {
+    offset: (i64, i64),
+}
+
+impl ClientLayout {
+    fn read(
+        dims: &str,
+        frame: &(Vec<u8>, usize, usize),
+        client: &(Vec<u8>, usize, usize),
+        live: std::ops::Range<usize>,
+    ) -> Result<Self, String> {
+        let number = |key: &str| {
+            let prefix = format!("{key}=");
+            let mut values = dims
+                .split_whitespace()
+                .filter_map(|word| word.strip_prefix(&prefix));
+            let value = values.next().and_then(|value| value.parse::<i64>().ok());
+            (if values.next().is_some() { None } else { value })
+                .ok_or_else(|| format!("the client geometry has no unique {key}: {dims}"))
+        };
+        if (number("frame_w")?, number("frame_h")?) != (frame.1 as i64, frame.2 as i64)
+            || (number("surface_w")?, number("surface_h")?) != (client.1 as i64, client.2 as i64)
+            || frame.1 == 0
+            || frame.2 == 0
+            || client.1 == 0
+            || client.2 == 0
+            || live.start > live.end
+            || live.end > frame.2
+        {
+            return Err(format!(
+                "the retained frame/client dimensions disagree with `dims`: {dims}"
+            ));
+        }
+        let offset = (number("offset_x")?, number("offset_y")?);
+        let (Ok(x), Ok(y)) = (usize::try_from(offset.0), usize::try_from(offset.1)) else {
+            return Err(format!(
+                "the terminal frame begins outside the client: {dims}"
+            ));
+        };
+        if x.checked_add(frame.1).is_none_or(|right| right > client.1)
+            || y.checked_add(frame.2)
+                .is_none_or(|bottom| bottom > client.2)
+        {
+            return Err(format!("the terminal frame is outside the client: {dims}"));
+        }
+        Ok(Self { offset })
+    }
+}
+
+/// The native photograph runs while the lease pins the entire submitted client.
+/// Its delivery has no changing-pixel exception, including the stats Deck figures.
+struct ClientDelivery<'a> {
+    client: &'a (Vec<u8>, usize, usize),
+}
+
+impl<'a> ClientDelivery<'a> {
+    fn new(client: &'a (Vec<u8>, usize, usize)) -> Self {
+        Self { client }
+    }
+
+    fn compare_rgb(&self, server: &(Vec<u8>, usize, usize)) -> Result<(), String> {
+        compare_rgb(&self.client.0, self.client.1, self.client.2, server, 0..0)
+    }
+
+    fn at(
+        &self,
+        screen: &(Vec<u8>, usize, usize),
+        x: i64,
+        y: i64,
+    ) -> Result<(usize, usize), String> {
+        held_at(screen, self.client, x, y, 0..0)
+    }
+
+    fn places(&self, screen: &(Vec<u8>, usize, usize)) -> Vec<(usize, usize)> {
+        frame_places_except(screen, self.client, &LivePixels::rows(self.client.1, 0..0))
+    }
+}
+
 /// Whether `server` (RGB) shows exactly the RGB of `rgba` (`w` x `h`), but for the rows in `live` (the stats Deck's, whose figures move while the frame is read twice: `Gui::held_to_server_but`).
 pub(crate) fn compare_rgb(
     rgba: &[u8],
@@ -1799,11 +2143,24 @@ pub(crate) fn compare_rgb(
     server: &(Vec<u8>, usize, usize),
     live: std::ops::Range<usize>,
 ) -> Result<(), String> {
+    compare_rgb_except(rgba, w, h, server, &LivePixels::rows(w, live))
+}
+
+fn compare_rgb_except(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    server: &(Vec<u8>, usize, usize),
+    live: &LivePixels,
+) -> Result<(), String> {
     let (rgb, sw, sh) = server;
     if (*sw, *sh) != (w, h) {
         return Err(format!(
             "the server's window is {sw}x{sh}, the frame {w}x{h}"
         ));
+    }
+    if w == 0 || h == 0 || rgba.len() != w * h * 4 || rgb.len() != w * h * 3 {
+        return Err("the presented or server pixel buffer is incomplete".into());
     }
     let mut differ = 0usize;
     let mut first = None;
@@ -1814,7 +2171,7 @@ pub(crate) fn compare_rgb(
         .zip(rgb.as_chunks::<3>().0)
         .enumerate()
     {
-        if p[..3] != *q && !live.contains(&(n / w.max(1))) {
+        if p[..3] != *q && !live.contains(n % w, n / w) {
             differ += 1;
             first.get_or_insert((
                 n % w.max(1),
@@ -1892,6 +2249,16 @@ pub(crate) fn held_at(
     y: i64,
     live: std::ops::Range<usize>,
 ) -> Result<(usize, usize), String> {
+    held_at_except(screen, frame, x, y, &LivePixels::rows(frame.1, live))
+}
+
+fn held_at_except(
+    screen: &(Vec<u8>, usize, usize),
+    frame: &(Vec<u8>, usize, usize),
+    x: i64,
+    y: i64,
+    live: &LivePixels,
+) -> Result<(usize, usize), String> {
     let (s, sw, sh) = (&screen.0, screen.1, screen.2);
     let (f, w, h) = (&frame.0, frame.1, frame.2);
     if s.len() < sw * sh * 4 || f.len() < w * h * 4 {
@@ -1917,28 +2284,40 @@ pub(crate) fn held_at(
         }
         sub.extend_from_slice(&f[row * w * 4..(row * w + vw) * 4]);
     }
-    compare_rgb(&sub, vw, vh, &(region, vw, vh), live)
+    compare_rgb_except(&sub, vw, vh, &(region, vw, vh), live)
         .map(|()| (vw, vh))
         .map_err(|why| format!("at {x},{y}, {vw}x{vh} of the frame on the output: {why}"))
 }
 
 /// Where on `screen` (RGBA) the whole of `frame` (RGBA) shows exactly, by RGB, its rows in `live` aside.
+#[cfg(test)]
 pub(crate) fn frame_places(
     screen: &(Vec<u8>, usize, usize),
     frame: &(Vec<u8>, usize, usize),
     live: std::ops::Range<usize>,
 ) -> Vec<(usize, usize)> {
+    frame_places_except(screen, frame, &LivePixels::rows(frame.1, live))
+}
+
+fn frame_places_except(
+    screen: &(Vec<u8>, usize, usize),
+    frame: &(Vec<u8>, usize, usize),
+    live: &LivePixels,
+) -> Vec<(usize, usize)> {
     let (s, sw, sh) = (&screen.0, screen.1, screen.2);
     let (f, w, h) = (&frame.0, frame.1, frame.2);
-    let rows: Vec<usize> = (0..h).filter(|r| !live.contains(r)).collect();
     if w == 0 || w > sw || h > sh || s.len() < sw * sh * 4 || f.len() < w * h * 4 {
         return Vec::new();
     }
-    let (Some(&top), Some(&bottom)) = (rows.first(), rows.last()) else {
+    let checked = |x: usize, y: usize| !live.contains(x, y);
+    let first = (0..h).find_map(|y| (0..w).find(|&x| checked(x, y)).map(|x| (x, y)));
+    let last = (0..h)
+        .rev()
+        .find_map(|y| (0..w).rev().find(|&x| checked(x, y)).map(|x| (x, y)));
+    let (Some(first), Some(last)) = (first, last) else {
         return Vec::new();
     };
-    let middle = rows[rows.len() / 2];
-    let probes = [(0, top), (w - 1, bottom), (w / 2, middle)];
+    let probes = [first, last, (w / 2, h / 2)];
     let rgb = |buf: &[u8], stride: usize, x: usize, y: usize| {
         let at = (y * stride + x) * 4;
         [buf[at], buf[at + 1], buf[at + 2]]
@@ -1948,18 +2327,19 @@ pub(crate) fn frame_places(
         for x in 0..=sw - w {
             if probes
                 .iter()
-                .any(|&(px, py)| rgb(s, sw, x + px, y + py) != rgb(f, w, px, py))
+                .any(|&(px, py)| checked(px, py) && rgb(s, sw, x + px, y + py) != rgb(f, w, px, py))
             {
                 continue;
             }
-            let whole = rows.iter().all(|&r| {
+            let whole = (0..h).all(|r| {
                 let (a, b) = (((y + r) * sw + x) * 4, r * w * 4);
                 s[a..a + w * 4]
                     .as_chunks::<4>()
                     .0
                     .iter()
                     .zip(f[b..b + w * 4].as_chunks::<4>().0)
-                    .all(|(p, q)| p[..3] == q[..3])
+                    .enumerate()
+                    .all(|(column, (p, q))| !checked(column, r) || p[..3] == q[..3])
             });
             if whole {
                 found.push((x, y));
@@ -1970,58 +2350,6 @@ pub(crate) fn frame_places(
         }
     }
     found
-}
-
-/// Whether the bands of a window's buffer that a frame smaller than it leaves (`frame` at `offset` in the buffer weston shows as `view`) are on `screen` (RGBA, weston's whole output) as the CPU presenter fills them.
-pub(crate) fn bands_held(
-    screen: &(Vec<u8>, usize, usize),
-    frame: &(Vec<u8>, usize, usize),
-    view: &WestonView,
-    offset: (i64, i64),
-) -> Result<usize, String> {
-    let (s, sw, sh) = (&screen.0, screen.1, screen.2);
-    let (f, w, h) = (&frame.0, frame.1, frame.2);
-    if w == 0 || h == 0 || f.len() < w * h * 4 || s.len() < sw * sh * 4 {
-        return Err(format!("the output is {sw}x{sh}, the frame {w}x{h}"));
-    }
-    let (fx, fy) = (view.x + offset.0, view.y + offset.1);
-    let (mut held, mut differ, mut first) = (0usize, 0usize, None);
-    for by in 0..view.height {
-        for bx in 0..view.width {
-            let (x, y) = (view.x + bx as i64, view.y + by as i64);
-            let (dx, dy) = (x - fx, y - fy);
-            let inside = (0..w as i64).contains(&dx) && (0..h as i64).contains(&dy);
-            let (Ok(ux), Ok(uy)) = (usize::try_from(x), usize::try_from(y)) else {
-                continue;
-            };
-            if inside || ux >= sw || uy >= sh {
-                continue;
-            }
-            let (nx, ny) = (
-                dx.clamp(0, w as i64 - 1) as usize,
-                dy.clamp(0, h as i64 - 1) as usize,
-            );
-            let at = (uy * sw + ux) * 4;
-            let want = (ny * w + nx) * 4;
-            held += 1;
-            if s[at..at + 3] != f[want..want + 3] {
-                differ += 1;
-                first.get_or_insert((
-                    bx,
-                    by,
-                    [f[want], f[want + 1], f[want + 2]],
-                    [s[at], s[at + 1], s[at + 2]],
-                ));
-            }
-        }
-    }
-    match first {
-        None => Ok(held),
-        Some((x, y, want, got)) => Err(format!(
-            "{differ} of {held} band pixels differ; first at ({x},{y}) of the buffer: the \
-             frame's nearest {want:02x?}, the output {got:02x?}"
-        )),
-    }
 }
 
 /// `linux proof …`.
@@ -2347,9 +2675,9 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             "  | ",
         );
         let built = out.ok();
-        // The GUI rows that follow are timed: they run on the quiet machine, from here to the
-        // end of this arch ([`crate::admission`]), sharing the native-window lane
-        // with both Timing and functional Instances in other lab runs.
+        // GUI rows retain the window lane and their measured resource claim through this
+        // architecture. Admission waits for quiet, then reports loaded evidence at its patience
+        // bound. Pixel, protocol and behavior checks stay strict; timing values are diagnostic.
         rows.push(Row {
             name: format!("{tag} build aterm-gui"),
             verdict: if built { Verdict::Pass } else { Verdict::Fail },
@@ -2362,10 +2690,11 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         });
         // Every admission refusal is a report row, including one with no interrupt.
         // No GUI row starts; the existing stop and failure precedence is preserved.
-        let _quiet = match gui_admission(&mut rows, &tag, || {
+        let admission_started = Instant::now();
+        let timing = match gui_admission(&mut rows, &tag, || {
             if built {
                 crate::admission::window_lane()
-                    .and_then(|()| crate::admission::quiet(&format!("{tag} GUI rows")))
+                    .and_then(|()| crate::admission::reported_timing(&format!("{tag} GUI rows")))
                     .map(Some)
             } else {
                 Ok(None)
@@ -2380,6 +2709,15 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 break 'arches;
             }
         };
+        if let Some(admission) = timing.as_ref() {
+            let row = reported_gui_admission(
+                &tag,
+                admission_started.elapsed().as_secs_f64(),
+                admission.protection(),
+            );
+            println!("  {} {}", row.verdict.label(), row.detail);
+            rows.push(row);
+        }
         let sessions: Vec<Option<Display>> =
             if ask.gone_only || ask.a11y_only || ask.deck_only || ask.edges_only {
                 Vec::new()

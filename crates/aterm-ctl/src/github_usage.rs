@@ -155,16 +155,20 @@ pub fn summarize(rows: &[Value], hour: u64) -> Vec<Value> {
     rows
 }
 
-/// Bounded, read-only wire rows for the last completed and current UTC hour.
-/// Missing, old and incomplete records stay explicit; they never mean zero use.
+/// Bounded, read-only wire rows for the last completed and current UTC hour of the rate book agh
+/// keeps under aterm's state root `state` (`aterm_types::dirs::state_dir()`, whose `agh/rate`
+/// holds it): [`calls_dir`], one private file an hour, read as agh reads it, on Unix and Windows
+/// alike. A root that is unknown (`None`) answers `status=unavailable`, as a platform with no
+/// private files does. Missing, old and incomplete records stay explicit; they never mean zero
+/// use.
 #[must_use]
-pub fn survey(state: &Path, now: u64) -> Vec<String> {
-    #[cfg(unix)]
-    {
+pub fn survey(state: Option<&Path>, now: u64) -> Vec<String> {
+    #[cfg(any(unix, windows))]
+    if let Some(state) = state {
         use aterm_uds::private_file::read_private;
-        let dir = state.join("agh/rate/calls");
+        let dir = calls_dir(state);
         let hour = now / 3600;
-        [hour.saturating_sub(1), hour]
+        return [hour.saturating_sub(1), hour]
             .into_iter()
             .flat_map(|hour| {
                 let read = || -> Option<Vec<Value>> {
@@ -202,13 +206,18 @@ pub fn survey(state: &Path, now: u64) -> Vec<String> {
                 }));
                 lines
             })
-            .collect()
+            .collect();
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (state, now);
-        vec!["github_rate status=unavailable".into()]
-    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (state, now);
+    vec!["github_rate status=unavailable".into()]
+}
+
+/// The folder of agh's per-hour attribution files under aterm's state root `state`:
+/// `<state>/agh/rate/calls`, where agh's `Dirs::rate` book under the same root writes them.
+#[must_use]
+pub fn calls_dir(state: &Path) -> std::path::PathBuf {
+    state.join("agh").join("rate").join("calls")
 }
 
 #[cfg(test)]

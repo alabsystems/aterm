@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm db alab …` (docs/DESIGN-alab-lab-model-2026-11-01.md §0, §8, §9): `import`, `check`,
-//! `adopt`, `roll`, `export`, `prefer` and `unprefer` over `alab/registry`, and the readers and
+//! `adopt`, `roll`, `prefer` and `unprefer` over `alab/registry`, and the readers and
 //! owner writers of `verbs` (`machines`, `accounts`, `preferences`, `mail`, `who`, `quota`, `log`,
 //! `signins`, `add`, `retire`, `relabel`, `edit`). Every report names keys, columns, counts
 //! and source coordinates, never a secret; a secret cell names its secret-store entry or holds
@@ -119,9 +119,6 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
                     or its key. An <account> is its slug, its key, its provider word and its\n\
                     address (`oai ada@x.example` or `oai:ada@x.example`), or an address that\n\
                     names one account\n\
-  export [--dry-run|--apply]\n\
-                    the files older Macs still read, rendered from the lab and its place rows,\n\
-                    compared with the vault's and (--apply) published in one admin write\n\
   machines | accounts | preferences | mail | phones\n\
                     the registry's rows by key and label, each account by its key, its slug and\n\
                     its name (its provider word and address); mail shows each address by key,\n\
@@ -132,7 +129,8 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
                     account's plan and quota, the accounts it runs unpreferred, its latest sum\n\
   who <account>     who last used it and on which Mac (its clock), from the journal, relays\n\
                     and the claims ring, and which Macs hold or claim it now\n\
-  quota [<account>] each window's usage, reset, age, Mac and source; never a guessed 0\n\
+  quota [<account>] each window's usage, reset, age, Mac and source; never a guessed 0;\n\
+                    each standing wall, a model's own week's by its model (`model`)\n\
   log <account|machine> [--days <n>]\n\
                     the journal's events about it (or that Mac logged), with this Mac's heard\n\
                     archive past the window; 14 days unless --days (at most 120)\n\
@@ -347,7 +345,7 @@ fn whole(name: &str, raw: &std::ffi::OsStr) -> Result<u64> {
 }
 
 /// The verbs `run` takes.
-const VERBS: [&str; 22] = [
+const VERBS: [&str; 21] = [
     "import",
     "seed",
     "check",
@@ -356,7 +354,6 @@ const VERBS: [&str; 22] = [
     "prefer",
     "unprefer",
     "roll",
-    "export",
     "machines",
     "accounts",
     "preferences",
@@ -383,7 +380,7 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 .ok_or_else(|| Error::new(&format!("{name} needs a value")))
         };
         match (verb, word.as_str()) {
-            ("import" | "adopt" | "merge" | "roll" | "export", "--apply") => args.apply = true,
+            ("import" | "adopt" | "merge" | "roll", "--apply") => args.apply = true,
             ("import", flag @ ("--authoritative" | "--fill-only")) => {
                 let mode = if flag == "--authoritative" {
                     Mode::Authoritative
@@ -409,7 +406,7 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 }
                 args.compare = Some(value("--compare-sheet")?);
             }
-            ("import" | "adopt" | "merge" | "roll" | "export", "--dry-run") => {
+            ("import" | "adopt" | "merge" | "roll", "--dry-run") => {
                 args.dry_run = true;
             }
             ("import", "--review") => args.review = true,
@@ -650,8 +647,6 @@ pub fn run_io(
             let journal = super::journal::Spool::local().map(|spool| {
                 super::journal::status(&spool, aterm_types::dirs::aterm_config_path().as_deref())
             });
-            // The generated exports against what this Mac's verified store holds (design §7).
-            let exports = super::export::check(paths, vendors, now_ms / 1000);
             let lab = lab_json(&lab, &seen, &duplicates);
             if args.tsv {
                 let mut all = lab;
@@ -667,13 +662,11 @@ pub fn run_io(
                 "findings": findings,
                 "registration": registration,
                 "journal": journal,
-                "exports": exports,
             }))
         }
         "adopt" => adopt(paths, &args, io.store, now_ms),
         "merge" => merge(paths, &args),
         "roll" => roll(paths, &args, now_ms),
-        "export" => super::export::run(paths, vendors, args.apply, now_ms / 1000),
         "prefer" | "unprefer" => prefer(paths, &args, verb == "prefer", now_ms),
         _ => Err(Error::new("unknown alab verb (see `aterm db alab --help`)")),
     }

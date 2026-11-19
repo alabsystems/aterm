@@ -27,6 +27,12 @@ pub(crate) struct EpRules {
     /// offsets below that move's cut) keeps below the fork too, as aterm's
     /// `LogClock::keep_below` does.
     pub(crate) proved_chain: bool,
+    /// A session whose `via` (the newest proved move onto the log it holds, told while it held
+    /// that log or moved onto it, [`Session::take_log`]) names the `was` a move names again (the
+    /// move `was`→held proved and told, its attach refused or killed before the witness left
+    /// `was`, then held reminted and proved from `was` once more) keeps below the lower of the
+    /// two forks, as aterm's `LogClock::keep_below` does (ATERM-KI-1116-7314).
+    pub(crate) proved_via: bool,
     /// A replaced log (`forgot=1`) forgets every session log's mirror cursor.
     pub(crate) mirror_forgets: bool,
     /// A session's exit moves the count `sessions bridge` and `outbox` name (`roster=`).
@@ -46,6 +52,7 @@ impl Default for EpRules {
             forgets: true,
             chain: true,
             proved_chain: true,
+            proved_via: true,
             mirror_forgets: true,
             exit_moves_roster: true,
             names_roster: true,
@@ -120,6 +127,10 @@ pub(crate) struct Session {
     pub(crate) fleet_hold: Option<String>,
     /// The log this session's offsets are on.
     pub(crate) bus_log: Option<String>,
+    /// The newest proved move from another log onto that log told while the session held it or
+    /// moved onto it: `(was, fork)`, aterm's `Inbox::bus_via` (none after a bare move, or a
+    /// lineage's; [`Session::take_log`]).
+    via: Option<(String, u64)>,
     /// The highest addressed offset ever delivered on that log.
     addressed_head: Option<u64>,
     /// The session's log (`aterm_slog`), while the node mirrors it onto the
@@ -198,6 +209,7 @@ impl Session {
             next_rid: 1,
             fleet_hold: None,
             bus_log: None,
+            via: None,
             addressed_head: None,
             fetches: Vec::new(),
             fetched: Vec::new(),
@@ -206,6 +218,19 @@ impl Session {
             topics: BTreeMap::new(),
             seen_id: 0,
         }
+    }
+
+    /// Puts the session on `ident`, as aterm's `Inbox::take_clock` does: its `via` becomes the
+    /// log's proved move `via`, for a session already on `ident` (one [`Endpoint::revive`]
+    /// served again) too; where the log has none, one already there keeps its own, and one that
+    /// moves keeps none (its own names the log it left).
+    fn take_log(&mut self, ident: &str, via: Option<&(String, u64)>) {
+        let own = self
+            .via
+            .take()
+            .filter(|_| self.bus_log.as_deref() == Some(ident));
+        self.via = via.cloned().or(own);
+        self.bus_log = Some(ident.to_string());
     }
 
     /// The addressed refill floor `inbox-seen` reports.
@@ -259,6 +284,10 @@ pub(crate) struct EpState {
     pub(crate) gone: Vec<Session>,
     /// The log the endpoint was last told of, and its fork.
     log: Option<String>,
+    /// The proved move from another log that log was told by, `(was, fork)`, kept across a bare
+    /// tell of it again, as aterm's `LogClock::proved` is: a session that joins takes it for its
+    /// `via`.
+    log_via: Option<(String, u64)>,
     /// Every request line, cut, for the trace.
     pub(crate) requests: Vec<String>,
     /// The `deliver` lines that came in one write with another (`Bridge::send_rows`).
@@ -520,6 +549,7 @@ impl Endpoint {
         s.stamp = at;
         let mut session = Session::new(sid, local);
         session.bus_log.clone_from(&s.log);
+        session.via.clone_from(&s.log_via);
         if s.mirror {
             let mut log = aterm_slog::Log::with_limits(1, log_limits());
             log.open_session(
@@ -557,7 +587,17 @@ impl Endpoint {
         let Some(at) = s.gone.iter().rposition(|x| x.sid == sid) else {
             return false;
         };
-        let session = s.gone.remove(at);
+        let mut session = s.gone.remove(at);
+        // ITS `via` IS NOT CARRIED (aterm's `SessionFabric::seed_carry`), and registering on the
+        // log it holds takes that log's proved move (`register_on_log`).
+        session.via = None;
+        if let Some(log) = s
+            .log
+            .clone()
+            .filter(|log| session.bus_log.as_deref() == Some(log.as_str()))
+        {
+            session.take_log(&log, s.log_via.as_ref());
+        }
         s.sessions.insert(local, session);
         s.roster_seq += 1;
         s.listed_after_exit.retain(|_, to| to != sid);
@@ -1303,8 +1343,11 @@ impl EpState {
 
     /// `link log <id> [continues=<f> was=<old> [proved=1]]`: a change forgets the
     /// sessions' offsets; from lane 3 on, a session holding `old` keeps those
-    /// below `f`. `old` is an earlier generation of `id`'s log, or, marked
-    /// `proved=1` from lane 12 on, another log ([`EpRules::cross_id`]).
+    /// below `f`, and one a move from `old` took to the log it holds, or found on it
+    /// ([`Session::take_log`]), keeps those below the lower of `f` and that move's fork
+    /// ([`EpRules::proved_via`]). `old` is an earlier
+    /// generation of `id`'s log, or, marked `proved=1` from lane 12 on, another log
+    /// ([`EpRules::cross_id`]).
     fn link_log<'a>(&mut self, mut words: impl Iterator<Item = &'a str>) -> String {
         let Some(ident) = words.next().map(str::to_string) else {
             return "ERR usage: link log\n".to_string();
@@ -1343,9 +1386,19 @@ impl EpState {
         let forgets = self.rules.forgets;
         let chain = self.rules.chain;
         let proved_chain = self.rules.proved_chain;
+        let proved_via = self.rules.proved_via;
         let mut changed = self.log.as_ref().is_some_and(|was| *was != ident);
+        let id_of = |log: &str| log.split_once('.').map(|(id, _)| id.to_string());
+        let via = match continues.as_ref() {
+            Some((f, was)) => (id_of(was) != id_of(&ident)).then(|| (was.clone(), *f)),
+            None => self
+                .log_via
+                .clone()
+                .filter(|_| self.log.as_deref() == Some(ident.as_str())),
+        };
         for session in self.sessions.values_mut() {
             if session.bus_log.as_deref() == Some(ident.as_str()) {
+                session.take_log(&ident, via.as_ref());
                 continue;
             }
             let forget = match session.bus_log.as_deref() {
@@ -1353,7 +1406,6 @@ impl EpState {
                 Some(was) => was != ident,
             };
             if forget && forgets {
-                let id_of = |log: &str| log.split_once('.').map(|(id, _)| id.to_string());
                 if continues.is_none()
                     && !session.dedup.is_empty()
                     && session
@@ -1363,22 +1415,29 @@ impl EpState {
                 {
                     self.forgot_across.extend(id_of(&ident));
                 }
-                let keep_below = continues
-                    .as_ref()
-                    .filter(|(_, was)| {
-                        session.bus_log.as_deref().is_some_and(|held| {
-                            held == was.as_str()
-                                || (chain && in_chain(was, held, &ident))
-                                || (proved_chain && after_was_across_ids(was, held, &ident))
-                        })
-                    })
-                    .map(|(f, _)| *f);
+                let keep_below = continues.as_ref().and_then(|(f, was)| {
+                    let held = session.bus_log.as_deref()?;
+                    if held == was.as_str() {
+                        return Some(*f);
+                    }
+                    if let Some((_, moved)) = session
+                        .via
+                        .as_ref()
+                        .filter(|(from, _)| proved_via && from == was)
+                    {
+                        return Some((*f).min(*moved));
+                    }
+                    ((chain && in_chain(was, held, &ident))
+                        || (proved_chain && after_was_across_ids(was, held, &ident)))
+                    .then_some(*f)
+                });
                 session.forget(keep_below);
                 changed = true;
             }
-            session.bus_log = Some(ident.clone());
+            session.take_log(&ident, via.as_ref());
         }
         self.log = Some(ident);
+        self.log_via = via;
         if changed {
             // AND THE MIRROR'S CURSORS, every one: what the bus held of each
             // log was another log's (aterm-gui's `forget_landed`).

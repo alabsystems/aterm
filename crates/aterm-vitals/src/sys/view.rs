@@ -7,7 +7,7 @@ use super::disk::{self, RootSize};
 use super::held;
 use super::jobs_view;
 use super::json::Jv;
-use super::query::{DiskForm, ScopeArg, SysQuery, View};
+use super::query::{DiskForm, ScopeArg, SysQuery, View, history_row_word};
 use super::stores;
 use super::why;
 use super::{BudgetFacts, BudgetRead, Ctx, Freshness, clock_ms, exe_word, pct};
@@ -171,8 +171,9 @@ pub(super) fn header_line(
     match as_of(view, ctx) {
         Some((unix_ms, age_ms, window)) => {
             h.push_str(&format!(
-                " as_of={} age_ms={age_ms} window_ms={}",
+                " as_of={} age_ms={} window_ms={}",
                 clock_ms(unix_ms),
+                age_ms.map_or_else(|| "-".to_owned(), |ms| ms.to_string()),
                 window.map_or_else(|| "-".to_owned(), |w| w.to_string())
             ));
         }
@@ -189,6 +190,9 @@ pub(super) fn header_line(
     if delta {
         h.push_str(" delta=1");
     }
+    if view == View::Groups {
+        h.push_str(" as_of_basis=grouping_observation age_basis=oldest_required_input");
+    }
     h
 }
 
@@ -197,7 +201,7 @@ pub(super) fn header_line(
 /// view of the engine's last pass (a reading the engine did not run on keeps its view), aged by
 /// [`Snapshot::jobs_age_ms`], which the host reads off the one clock the pass and the reading
 /// share.
-fn as_of(view: View, ctx: &Ctx<'_>) -> Option<(u64, u64, Option<u64>)> {
+fn as_of(view: View, ctx: &Ctx<'_>) -> Option<(u64, Option<u64>, Option<u64>)> {
     let snap = ctx.snap?;
     let carried = match view {
         View::Why => snap.why.as_deref().map(|f| {
@@ -210,13 +214,18 @@ fn as_of(view: View, ctx: &Ctx<'_>) -> Option<(u64, u64, Option<u64>)> {
             .jobs
             .as_deref()
             .map(|_| (snap.jobs_age_ms, window_ms(snap))),
-        View::Boot => Some((0, None)),
+        View::Groups => {
+            let frame = snap.groups.frame()?;
+            let older = snap.at_ns.checked_sub(frame.at_ns)? / 1_000_000;
+            Some((older, None))
+        }
+        View::Boot | View::History | View::Events => Some((0, None)),
         _ => None,
     };
     let (older, window) = carried.unwrap_or((0, window_ms(snap)));
     Some((
         ctx.as_of_unix_ms.saturating_sub(older),
-        ctx.age_ms.saturating_add(older),
+        ctx.age_ms.map(|age| age.saturating_add(older)),
         window,
     ))
 }
@@ -391,8 +400,17 @@ impl Fig {
     }
 }
 
-/// The sessions a scope word covers for the target.
+/// The requested sessions, narrowed by the host's authenticated pane authority.
+/// Layout siblings and request membership do not extend a nonowner's grant.
 pub(super) fn scope_keys(ctx: &Ctx<'_>, scope: ScopeArg) -> Vec<u64> {
+    let mut keys = requested_keys(ctx, scope);
+    if !ctx.owner_class {
+        keys.retain(|key| pane_allowed(ctx, *key));
+    }
+    keys
+}
+
+fn requested_keys(ctx: &Ctx<'_>, scope: ScopeArg) -> Vec<u64> {
     match scope {
         ScopeArg::Pane => vec![ctx.target.key],
         ScopeArg::Tab => {
@@ -417,11 +435,18 @@ pub(super) fn scope_keys(ctx: &Ctx<'_>, scope: ScopeArg) -> Vec<u64> {
     }
 }
 
+fn pane_allowed(ctx: &Ctx<'_>, key: u64) -> bool {
+    ctx.owner_class || ctx.caller_panes.is_some_and(|keys| keys.contains(&key))
+}
+
 /// `scope=request`'s label: `request <id> (<n> tabs)`.
 fn request_label(ctx: &Ctx<'_>) -> String {
     ctx.target.request.as_ref().map_or_else(
         || "request -".to_owned(),
         |request| {
+            if !request_allowed(ctx, request) {
+                return format!("request {}", unavailable("refused"));
+            }
             let n = request.tabs;
             format!(
                 "request {} ({n} tab{})",
@@ -436,6 +461,12 @@ fn request_label(ctx: &Ctx<'_>) -> String {
 /// hold, each `unavailable` where nothing was read, never 0.
 fn request_line(ctx: &Ctx<'_>) -> Option<Line> {
     let request = ctx.target.request.as_ref()?;
+    if !request_allowed(ctx, request) {
+        return Some(line(
+            "request",
+            format!("request {}", unavailable("refused")),
+        ));
+    }
     let fig = |v: Option<u64>| v.map_or_else(|| unavailable("not_sampled"), |v| v.to_string());
     Some(line(
         "request",
@@ -456,6 +487,9 @@ fn request_line(ctx: &Ctx<'_>) -> Option<Line> {
 /// `scope=request`'s totals as JSON.
 fn request_json(ctx: &Ctx<'_>) -> Option<Jv> {
     let request = ctx.target.request.as_ref()?;
+    if !request_allowed(ctx, request) {
+        return Some(Jv::why("refused"));
+    }
     let fig = |v: Option<u64>| v.map_or_else(|| Jv::why("not_sampled"), Jv::u);
     Some(Jv::obj([
         ("id", Jv::s(request.id.clone())),
@@ -466,6 +500,203 @@ fn request_json(ctx: &Ctx<'_>) -> Option<Jv> {
         ("claims", Jv::u(request.claims as u64)),
         ("claimed_mb", fig(request.claimed_mb)),
     ]))
+}
+
+fn request_allowed(ctx: &Ctx<'_>, request: &super::RequestFacts) -> bool {
+    ctx.owner_class
+        || (!request.sessions.is_empty()
+            && request.sessions.iter().all(|key| pane_allowed(ctx, *key)))
+}
+
+fn history_number(value: Option<f64>, why: &'static str) -> Jv {
+    value.map_or_else(
+        || Jv::why(why),
+        |value| Jv::number(value).unwrap_or_else(|| Jv::why("unread_format")),
+    )
+}
+
+fn history_gap(gap: Option<crate::ring::GapKind>) -> Jv {
+    gap.map_or_else(
+        || Jv::s("none"),
+        |gap| {
+            Jv::s(match gap {
+                crate::ring::GapKind::Paused => "paused",
+                crate::ring::GapKind::Sleep => "sleep",
+                crate::ring::GapKind::Crash => "crash",
+            })
+        },
+    )
+}
+
+fn history_raw(cell: crate::ring::ScaleCell) -> Jv {
+    let why = if cell.gap == Some(crate::ring::GapKind::Sleep) {
+        "asleep"
+    } else {
+        "not_sampled"
+    };
+    Jv::obj([
+        ("mean", history_number(cell.cell.mean, why)),
+        ("max", history_number(cell.cell.max, why)),
+        (
+            "weighted_source_ms",
+            history_number(Some(cell.cell.tau_ms), "not_sampled"),
+        ),
+        (
+            "over_ms",
+            history_number(Some(cell.cell.over_ms), "not_sampled"),
+        ),
+        ("gap", history_gap(cell.gap)),
+    ])
+}
+
+struct HistoryBox {
+    cell: crate::model::ResourceHistoryCell,
+    period_ms: i64,
+    start_unix_ms: Option<i64>,
+    end_unix_ms: Option<i64>,
+}
+
+struct HistoryRow {
+    resource: crate::model::Resource,
+    capacity: Option<f64>,
+    secondary_capacity: Option<f64>,
+    basis: crate::model::CapBasis,
+    boxes: Vec<HistoryBox>,
+}
+
+/// Select existing canonical boxes and their checked original wall edges once, before either
+/// wire format. Neither text nor JSON reconstructs a grid or normalizes a second series.
+fn history_rows(q: &SysQuery, s: &Snapshot) -> Vec<HistoryRow> {
+    let spec = crate::ring::MultiScaleSpec::FULL_6H;
+    let rows: &[crate::model::Resource] = if q.history_rows.is_empty() {
+        &crate::model::Resource::ALL
+    } else {
+        &q.history_rows
+    };
+    rows.iter()
+        .map(|&resource| {
+            let history =
+                s.resources[resource.index()].history_slots(spec, s.at_unix_ms, &s.time_gaps);
+            let boxes = history
+                .cells
+                .into_iter()
+                .filter_map(|cell| {
+                    let slot = cell.painted.slot;
+                    let period_ms = spec.bands[usize::from(slot.band)].period_ms;
+                    q.history_res
+                        .is_none_or(|res| period_ms == res.period_ms())
+                        .then(|| HistoryBox {
+                            cell,
+                            period_ms,
+                            start_unix_ms: s.at_unix_ms.checked_sub(slot.age_hi_ms),
+                            end_unix_ms: s.at_unix_ms.checked_sub(slot.age_lo_ms),
+                        })
+                })
+                .collect();
+            HistoryRow {
+                resource,
+                capacity: history.capacity,
+                secondary_capacity: history.secondary_capacity,
+                basis: history.basis,
+                boxes,
+            }
+        })
+        .collect()
+}
+
+fn history_box_json(box_: &HistoryBox) -> Jv {
+    let cell = box_.cell;
+    let slot = cell.painted.slot;
+    let edge = |value: Option<i64>| value.map_or_else(|| Jv::why("unread_format"), Jv::Int);
+    Jv::obj([
+        ("band", Jv::u(u64::from(slot.band))),
+        ("period_ms", Jv::Int(box_.period_ms)),
+        ("start_unix_ms", edge(box_.start_unix_ms)),
+        ("end_unix_ms", edge(box_.end_unix_ms)),
+        ("age_hi_ms", Jv::Int(slot.age_hi_ms)),
+        ("age_lo_ms", Jv::Int(slot.age_lo_ms)),
+        ("live", Jv::Bool(slot.is_live_now)),
+        ("primary", history_raw(cell.primary)),
+        (
+            "secondary",
+            cell.secondary
+                .map_or_else(|| Jv::why("not_sampled"), history_raw),
+        ),
+        (
+            "painted",
+            Jv::obj([
+                (
+                    "mean",
+                    history_number(cell.painted.cell.heat.map(f64::from), "not_sampled"),
+                ),
+                (
+                    "max",
+                    history_number(cell.painted.cell.max.map(f64::from), "not_sampled"),
+                ),
+                (
+                    "over_share",
+                    history_number(Some(f64::from(cell.painted.cell.over)), "not_sampled"),
+                ),
+                ("gap", history_gap(cell.painted.cell.gap)),
+            ]),
+        ),
+    ])
+}
+
+fn history_row_json(row: &HistoryRow) -> Jv {
+    Jv::obj([
+        ("row", Jv::s(history_row_word(row.resource))),
+        ("capacity", history_number(row.capacity, "not_sampled")),
+        (
+            "secondary_capacity",
+            history_number(row.secondary_capacity, "not_sampled"),
+        ),
+        ("capacity_basis", Jv::s(unit_basis(row.basis))),
+        (
+            "boxes",
+            Jv::Arr(row.boxes.iter().map(history_box_json).collect()),
+        ),
+    ])
+}
+
+fn history_json(q: &SysQuery, s: &Snapshot) -> Jv {
+    Jv::obj([
+        ("basis", Jv::s("machine_strip")),
+        ("source_seq", Jv::u(s.seq)),
+        ("at_unix_ms", Jv::Int(s.at_unix_ms)),
+        ("horizon_ms", Jv::u(21_600_000)),
+        ("cover_ms", Jv::Int(crate::model::STRIP_COVER_MS)),
+        (
+            "weighted_source_basis",
+            Jv::s("resampling_weight_not_observation_coverage"),
+        ),
+        (
+            "rows",
+            Jv::Arr(history_rows(q, s).iter().map(history_row_json).collect()),
+        ),
+    ])
+}
+
+fn history_text(q: &SysQuery, s: &Snapshot, lines: &mut Vec<Line>) {
+    lines.push(line("history", "history machine strip · retained six-hour bands · source weights are resampling weights, not observation coverage"));
+    for row in history_rows(q, s) {
+        let name = history_row_word(row.resource);
+        lines.push(line(
+            format!("history {name}"),
+            format!(
+                "history row={name} capacity={} secondary_capacity={} basis={}",
+                history_number(row.capacity, "not_sampled").to_text(),
+                history_number(row.secondary_capacity, "not_sampled").to_text(),
+                Jv::s(unit_basis(row.basis)).to_text()
+            ),
+        ));
+        for (i, box_) in row.boxes.iter().enumerate() {
+            lines.push(line(
+                format!("history {name} {i}"),
+                format!("box row={name} {}", history_box_json(box_).to_text()),
+            ));
+        }
+    }
 }
 
 fn tabs_fig(s: &Snapshot, keys: &[u64], target: u64) -> Fig {
@@ -629,6 +860,14 @@ fn net_clause(net: &crate::model::NetView) -> Option<String> {
             _ => format!("{} TCP established or close-wait", tcp.established),
         });
     }
+    if let Some(ms) = net.srtt_ms.filter(|ms| ms.is_finite() && *ms > 0.0) {
+        let severity = if ms >= 250.0 {
+            "high TCP latency"
+        } else {
+            "TCP RTT"
+        };
+        sub.push(format!("{severity} {}", words::rtt_word(ms)));
+    }
     (!sub.is_empty()).then(|| format!("net {}", sub.join(", ")))
 }
 
@@ -736,38 +975,106 @@ fn rest_line(ctx: &Ctx<'_>, s: &Snapshot, tab: &Fig) -> Option<Line> {
     ))
 }
 
-fn event_unix_ms(ctx: &Ctx<'_>, s: &Snapshot, at_ns: u64) -> u64 {
-    match at_ns.checked_sub(s.at_ns) {
-        Some(after) => ctx.as_of_unix_ms.saturating_add(after / 1_000_000),
-        None => ctx
-            .as_of_unix_ms
-            .saturating_sub((s.at_ns - at_ns) / 1_000_000),
-    }
-}
-
 fn event_shown(ctx: &Ctx<'_>, e: &crate::events::Event) -> bool {
     if ctx.owner_class {
         return true;
     }
-    let own = |k: &u64| ctx.target.panes.contains(k);
+    use crate::events::EventScope;
+    let local = match &e.scope {
+        EventScope::Unknown => return false,
+        EventScope::Machine => None,
+        EventScope::Session(source) => {
+            if !pane_allowed(ctx, source.local)
+                || !ctx.event_caller.is_some_and(|caller| {
+                    caller == source && !caller.sid.is_empty() && !caller.nonce.is_empty()
+                })
+            {
+                return false;
+            }
+            Some(source.local)
+        }
+    };
     match &e.kind {
         EventKind::Load {
-            scope: LoadScope::Tab(k),
+            scope: LoadScope::Tab(key),
             ..
-        } => own(k),
-        EventKind::Tab { key, .. } | EventKind::Orphan { key, .. } => own(key),
-        EventKind::Job { tab, .. } => own(tab),
-        _ => true,
+        }
+        | EventKind::Tab { key, .. }
+        | EventKind::Orphan { key, .. }
+        | EventKind::Job { tab: key, .. } => local == Some(*key),
+        EventKind::Strip { marker, .. } => marker.scope == e.scope,
+        _ => local.is_none(),
     }
 }
 
-fn load_top_shown(ctx: &Ctx<'_>, scope: &LoadScope) -> bool {
-    ctx.owner_class || matches!(scope, LoadScope::Tab(k) if ctx.target.panes.contains(k))
+fn event_requested(q: &SysQuery, ctx: &Ctx<'_>, event: &crate::events::Event) -> bool {
+    q.view != View::Events
+        || q.since
+            .is_none_or(|since| since.epoch != ctx.epoch || event.seq > since.seq)
 }
 
-fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
-    let at = super::clock_s(event_unix_ms(ctx, s, e.at_ns));
+fn load_top_shown(ctx: &Ctx<'_>, scope: &LoadScope) -> bool {
+    ctx.owner_class || matches!(scope, LoadScope::Tab(k) if pane_allowed(ctx, *k))
+}
+
+fn event_line(ctx: &Ctx<'_>, _s: &Snapshot, e: &crate::events::Event, full: bool) -> Line {
+    let at = e
+        .at_unix_ms
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map_or_else(|| unavailable("not_sampled"), super::clock_s);
     let mut t = format!("e seq={} at={at} kind={}", e.seq, e.kind.word());
+    let wall = e
+        .at_unix_ms
+        .map_or_else(|| unavailable("not_sampled"), |ms| ms.to_string());
+    let source = match &e.scope {
+        crate::events::EventScope::Machine => "machine",
+        crate::events::EventScope::Session(_) => "session",
+        crate::events::EventScope::Unknown => "unknown",
+    };
+    // Compact provenance keeps stream field names from dominating an appendix's byte
+    // budget. Both forms retain the original wall, authority and interval facts.
+    let mut provenance = if full {
+        format!(" at_unix_ms={wall} source_scope={source}")
+    } else {
+        format!(" at_ms={wall} source={source}")
+    };
+    if let crate::events::EventScope::Session(source) = &e.scope {
+        provenance.push_str(&format!(" local={} sid={}", source.local, pct(&source.sid)));
+    }
+    if let Some(span) = e.span() {
+        if full {
+            provenance.push_str(&format!(
+                " onset_unix_ms={} end_unix_ms={}",
+                span.onset_unix_ms, span.end_unix_ms
+            ));
+        } else {
+            provenance.push_str(&format!(
+                " span_ms={}..{}",
+                span.onset_unix_ms, span.end_unix_ms
+            ));
+        }
+    } else if full {
+        provenance.push_str(
+            " onset_unix_ms=unavailable(not_sampled) end_unix_ms=unavailable(not_sampled)",
+        );
+    } else {
+        provenance.push_str(" span=not_sampled");
+    }
+    let kind_local = match &e.kind {
+        EventKind::Load {
+            scope: LoadScope::Tab(key),
+            ..
+        }
+        | EventKind::Tab { key, .. }
+        | EventKind::Orphan { key, .. }
+        | EventKind::Job { tab: key, .. } => Some(*key),
+        _ => None,
+    };
+    if let Some(key) =
+        kind_local.filter(|_| !matches!(e.scope, crate::events::EventScope::Session(_)))
+    {
+        provenance.push_str(&format!(" kind_local={key}"));
+    }
     match &e.kind {
         EventKind::Pressure { from, to } => {
             t.push_str(&format!(" from={} to={}", from.word(), to.word()));
@@ -803,22 +1110,18 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
             let sc = match scope {
                 LoadScope::Global => "scope=global".to_owned(),
                 LoadScope::Aterm => "scope=aterm".to_owned(),
-                LoadScope::Tab(k) => tab_scope_words(ctx, *k),
+                LoadScope::Tab(_) => "scope=tab".to_owned(),
             };
             t.push_str(&format!(" {sc} from_mc={from_mc} to_mc={to_mc}"));
             if let Some(top) = top.as_deref().filter(|_| load_top_shown(ctx, scope)) {
                 t.push_str(&format!(" top={}", exe_word(top)));
             }
         }
-        EventKind::Tab { key, opened, .. } => {
+        EventKind::Tab { opened, .. } => {
             t.push_str(&format!(
-                " local={key} to={}",
+                " to={}",
                 if *opened { "opened" } else { "closed" }
             ));
-            if let Some(n) = ctx.tab_number(*key) {
-                t.push_str(&format!(" tab={n}"));
-            }
-            t.push_str(&format!(" {}", session_words(ctx, *key)));
         }
         EventKind::Lane { lane, available } => {
             t.push_str(&format!(
@@ -830,13 +1133,8 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
                 }
             ));
         }
-        EventKind::Orphan {
-            key, procs, top, ..
-        } => {
-            t.push_str(&format!(
-                " local={key} {} procs={procs}",
-                session_words(ctx, *key)
-            ));
+        EventKind::Orphan { procs, top, .. } => {
+            t.push_str(&format!(" procs={procs}"));
             if let Some(top) = top {
                 t.push_str(&format!(" top={}", exe_word(top)));
             }
@@ -850,11 +1148,6 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
             task,
             exit,
         } => {
-            match ctx.tab_number(*tab) {
-                Some(n) => t.push_str(&format!(" tab={n}")),
-                None => t.push_str(&format!(" local={tab}")),
-            }
-            t.push_str(&format!(" {}", session_words(ctx, *tab)));
             t.push_str(&format!(
                 " job={} from={} to={} class={}",
                 pct(id),
@@ -862,23 +1155,215 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
                 to.word(),
                 class.word()
             ));
-            if let Some(task) = task.as_deref().filter(|_| ctx.target.panes.contains(tab)) {
+            if let Some(task) = task
+                .as_deref()
+                .filter(|_| scope_keys(ctx, ScopeArg::Tab).contains(tab))
+            {
                 t.push_str(&format!(" task={}", exe_word(task)));
             }
             if let Some(code) = exit {
                 t.push_str(&format!(" code={code}"));
             }
         }
+        EventKind::Starving(edge) => t.push_str(&starving_words(ctx, edge)),
+        EventKind::Strip { marker, change } => {
+            t.push_str(&format!(
+                " change={} label={}",
+                match change {
+                    crate::events::StripChangeKind::Insert => "insert",
+                    crate::events::StripChangeKind::Update => "update",
+                },
+                pct(&marker.label)
+            ));
+        }
     }
+    t.push_str(&provenance);
     note("e", t)
 }
 
-fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
+/// A starvation edge's words for `sys events`: `to=opened why=` and what its reading read, or
+/// `to=ended for_ms=` and the worst the episode read; then its holders (`largest=`), each named
+/// to the owner or where it is one of the target's tabs, else by its size and scope alone.
+fn starving_words(ctx: &Ctx<'_>, edge: &crate::starving::Edge) -> String {
+    use crate::starving::Edge;
+    let opt = |k: &str, v: Option<u64>| v.map_or_else(String::new, |v| format!(" {k}={v}"));
+    let bps = |v: Option<f64>| v.map(|v| v.max(0.0).round() as u64);
+    let (mut t, episode) = match edge {
+        Edge::Opened(e) => {
+            let l = &e.at_open;
+            (
+                format!(
+                    " to=opened why={}{}{}{}{} ram_bytes={}{}{} pressure={}",
+                    e.why.word(),
+                    opt("push_bps", bps(l.push_bps)),
+                    opt("refault_bps", bps(l.refault_bps)),
+                    opt("anon_back_bps", bps(l.anon_back_bps)),
+                    opt("headroom_bytes", l.headroom),
+                    l.ram,
+                    opt("wall_permille", l.wall_permille.map(u64::from)),
+                    opt("kept_permille", l.kept_permille.map(u64::from)),
+                    l.pressure.word()
+                ),
+                e,
+            )
+        }
+        Edge::Ended(e) => (
+            format!(
+                " to=ended{} why={} worst_push_bps={} worst_refault_bps={}{}{}",
+                opt("for_ms", e.for_ms()),
+                e.why.word(),
+                e.worst.push_bps.max(0.0).round() as u64,
+                e.worst.refault_bps.max(0.0).round() as u64,
+                opt("least_headroom_bytes", e.worst.headroom),
+                opt("worst_wall_permille", e.worst.wall_permille.map(u64::from)),
+            ),
+            e,
+        ),
+    };
+    let held: Vec<String> = episode
+        .holders
+        .iter()
+        .map(|h| {
+            let tab = match h.scope {
+                crate::model::RowScope::Tab(k) => ctx
+                    .tab_number(k)
+                    .map_or_else(|| format!("local={k}"), |n| format!("tab={n}")),
+                scope => format!("scope={}", scope.word()),
+            };
+            if holder_shown(ctx, h) {
+                format!("{}:{}:{}:{tab}", h.pid, exe_word(&h.name), h.bytes)
+            } else {
+                format!("-:-:{}:{tab}", h.bytes)
+            }
+        })
+        .collect();
+    if !held.is_empty() {
+        t.push_str(&format!(" largest={}", held.join(",")));
+    }
+    if let Some(age) = episode.holders_age_ms {
+        t.push_str(&format!(" largest_age_ms={age}"));
+    }
+    t
+}
+
+/// Whether `sys events` names a starvation holder: to the owner, or where it is one of the
+/// target's tabs' processes.
+fn holder_shown(ctx: &Ctx<'_>, h: &crate::starving::Holder) -> bool {
+    ctx.owner_class
+        || matches!(h.scope, crate::model::RowScope::Tab(k) if ctx.target.panes.contains(&k))
+}
+
+/// A starvation edge's JSON fields ([`starving_words`]'s, by the same rule for its holders).
+fn starving_json(ctx: &Ctx<'_>, o: &mut Jv, edge: &crate::starving::Edge) {
+    use crate::starving::Edge;
+    let (to, e) = match edge {
+        Edge::Opened(e) => ("opened", e),
+        Edge::Ended(e) => ("ended", e),
+    };
+    let num = |v: f64| Jv::u(v.max(0.0).round() as u64);
+    o.set("to", Jv::s(to));
+    o.set("why", Jv::s(e.why.word()));
+    let l = match edge {
+        Edge::Opened(_) => &e.at_open,
+        Edge::Ended(_) => e.ended.as_ref().map_or(&e.at_open, |(_, l)| l),
+    };
+    if let Some(v) = l.push_bps {
+        o.set("push_bytes_per_s", num(v));
+    }
+    if let Some(v) = l.refault_bps {
+        o.set("refault_bytes_per_s", num(v));
+    }
+    if let Some(v) = l.anon_back_bps {
+        o.set("anon_back_bytes_per_s", num(v));
+    }
+    if let Some(v) = l.headroom {
+        o.set("headroom_bytes", Jv::u(v));
+    }
+    o.set("ram_bytes", Jv::u(l.ram));
+    if let Some(v) = l.wall_permille {
+        o.set("wall_permille", Jv::u(u64::from(v)));
+    }
+    if let Some(v) = l.kept_permille {
+        o.set("kept_permille", Jv::u(u64::from(v)));
+    }
+    o.set("pressure", Jv::s(l.pressure.word()));
+    if let Some(ms) = e.for_ms() {
+        o.set("for_ms", Jv::u(ms));
+    }
+    o.set("worst_push_bytes_per_s", num(e.worst.push_bps));
+    o.set("worst_refault_bytes_per_s", num(e.worst.refault_bps));
+    if let Some(v) = e.worst.headroom {
+        o.set("least_headroom_bytes", Jv::u(v));
+    }
+    if let Some(v) = e.worst.wall_permille {
+        o.set("worst_wall_permille", Jv::u(u64::from(v)));
+    }
+    let held = e
+        .holders
+        .iter()
+        .map(|h| {
+            let mut j = Jv::obj([("bytes", Jv::u(h.bytes)), ("scope", Jv::s(h.scope.word()))]);
+            if let crate::model::RowScope::Tab(k) = h.scope {
+                j.set("local", Jv::u(k));
+                if let Some(n) = ctx.tab_number(k) {
+                    j.set("tab", Jv::u(n as u64));
+                }
+            }
+            if holder_shown(ctx, h) {
+                j.set("pid", Jv::u(u64::from(h.pid)));
+                j.set("name", Jv::s(exe_word(&h.name)));
+            }
+            j
+        })
+        .collect();
+    o.set("largest", Jv::Arr(held));
+    if let Some(age) = e.holders_age_ms {
+        o.set("largest_age_ms", Jv::u(age));
+    }
+}
+
+fn event_json(ctx: &Ctx<'_>, _s: &Snapshot, e: &crate::events::Event) -> Jv {
     let mut o = Jv::obj([
         ("seq", Jv::u(e.seq)),
-        ("at_unix_ms", Jv::u(event_unix_ms(ctx, s, e.at_ns))),
+        (
+            "at_unix_ms",
+            e.at_unix_ms.map_or_else(|| Jv::why("not_sampled"), Jv::Int),
+        ),
         ("kind", Jv::s(e.kind.word())),
     ]);
+    o.set(
+        "source_scope",
+        Jv::s(match &e.scope {
+            crate::events::EventScope::Machine => "machine",
+            crate::events::EventScope::Session(_) => "session",
+            crate::events::EventScope::Unknown => "unknown",
+        }),
+    );
+    if let crate::events::EventScope::Session(source) = &e.scope {
+        o.set("local", Jv::u(source.local));
+        o.set("sid", Jv::s(&source.sid));
+    }
+    for (name, value) in [
+        ("onset_unix_ms", e.span().map(|span| span.onset_unix_ms)),
+        ("end_unix_ms", e.span().map(|span| span.end_unix_ms)),
+    ] {
+        o.set(name, value.map_or_else(|| Jv::why("not_sampled"), Jv::Int));
+    }
+    let kind_local = match &e.kind {
+        EventKind::Load {
+            scope: LoadScope::Tab(key),
+            ..
+        }
+        | EventKind::Tab { key, .. }
+        | EventKind::Orphan { key, .. }
+        | EventKind::Job { tab: key, .. } => Some(*key),
+        _ => None,
+    };
+    if let Some(key) =
+        kind_local.filter(|_| !matches!(e.scope, crate::events::EventScope::Session(_)))
+    {
+        o.set("kind_local", Jv::u(key));
+    }
     match &e.kind {
         EventKind::Pressure { from, to } => {
             o.set("from", Jv::s(from.word()));
@@ -912,13 +1397,8 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
             match scope {
                 LoadScope::Global => o.set("scope", Jv::s("global")),
                 LoadScope::Aterm => o.set("scope", Jv::s("aterm")),
-                LoadScope::Tab(k) => {
+                LoadScope::Tab(_) => {
                     o.set("scope", Jv::s("tab"));
-                    o.set("local", Jv::u(*k));
-                    o.set("sid", session_json(ctx, *k));
-                    if let Some(n) = ctx.tab_number(*k) {
-                        o.set("tab", Jv::u(n as u64));
-                    }
                 }
             }
             o.set("from_mc", Jv::u(u64::from(*from_mc)));
@@ -927,13 +1407,8 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
                 o.set("top", Jv::s(exe_word(top)));
             }
         }
-        EventKind::Tab { key, opened, .. } => {
-            o.set("local", Jv::u(*key));
-            o.set("sid", session_json(ctx, *key));
+        EventKind::Tab { opened, .. } => {
             o.set("to", Jv::s(if *opened { "opened" } else { "closed" }));
-            if let Some(n) = ctx.tab_number(*key) {
-                o.set("tab", Jv::u(n as u64));
-            }
         }
         EventKind::Lane { lane, available } => {
             o.set("lane", Jv::s(*lane));
@@ -946,11 +1421,7 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
                 }),
             );
         }
-        EventKind::Orphan {
-            key, procs, top, ..
-        } => {
-            o.set("local", Jv::u(*key));
-            o.set("sid", session_json(ctx, *key));
+        EventKind::Orphan { procs, top, .. } => {
             o.set("procs", Jv::u(u64::from(*procs)));
             if let Some(top) = top {
                 o.set("top", Jv::s(exe_word(top)));
@@ -965,21 +1436,30 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
             task,
             exit,
         } => {
-            o.set("local", Jv::u(*tab));
-            o.set("sid", session_json(ctx, *tab));
-            if let Some(n) = ctx.tab_number(*tab) {
-                o.set("tab", Jv::u(n as u64));
-            }
             o.set("job", Jv::s(id.clone()));
             o.set("from", Jv::s(from.map_or("new", |v| v.word())));
             o.set("to", Jv::s(to.word()));
             o.set("class", Jv::s(class.word()));
-            if let Some(task) = task.as_deref().filter(|_| ctx.target.panes.contains(tab)) {
+            if let Some(task) = task
+                .as_deref()
+                .filter(|_| scope_keys(ctx, ScopeArg::Tab).contains(tab))
+            {
                 o.set("task", Jv::s(exe_word(task)));
             }
             if let Some(code) = exit {
                 o.set("code", Jv::Int(i64::from(*code)));
             }
+        }
+        EventKind::Starving(edge) => starving_json(ctx, &mut o, edge),
+        EventKind::Strip { marker, change } => {
+            o.set(
+                "change",
+                Jv::s(match change {
+                    crate::events::StripChangeKind::Insert => "insert",
+                    crate::events::StripChangeKind::Update => "update",
+                }),
+            );
+            o.set("label", Jv::s(&marker.label));
         }
     }
     o
@@ -1005,8 +1485,8 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
         .map_or_else(Vec::new, |s| {
             ctx.events
                 .iter()
-                .filter(|e| event_shown(ctx, e))
-                .map(|e| event_line(ctx, s, e))
+                .filter(|e| event_shown(ctx, e) && event_requested(q, ctx, e))
+                .map(|e| event_line(ctx, s, e, q.view == View::Events))
                 .collect()
         });
     let mut hw_notes: Vec<Line> = match (ctx.snap, q.view) {
@@ -1028,7 +1508,10 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             format!(
                 "cpu_reading as_of={} age_ms={} window_ms={} via={via} includes_finished=1",
                 clock_ms(ctx.as_of_unix_ms.saturating_sub(older)),
-                ctx.age_ms.saturating_add(older),
+                rec(
+                    ctx.age_ms.map(|age| age.saturating_add(older)),
+                    "not_sampled:observation_age"
+                ),
                 window / 1_000_000
             ),
         ));
@@ -1050,6 +1533,9 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             View::Disk => disk_text(q, ctx, s, &mut lines),
             View::Net => net_text(q, s, &mut lines),
             View::Procs => procs_text(q, ctx, s, &mut lines),
+            View::Groups => groups_text(q, ctx, s, &mut lines),
+            View::History => history_text(q, s, &mut lines),
+            View::Events => {}
             View::Why => why::why_text(q, ctx, s, &mut lines, &mut hw_notes, &events),
             View::Left => super::left::left_text(q, ctx, s, &mut lines),
             View::Report => {
@@ -1062,6 +1548,18 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             }
             View::Boot => lines.extend(super::boot::text(s.boot_cost.as_deref(), q.top)),
         },
+    }
+    if q.view == View::Events {
+        lines.push(line(
+            "events",
+            format!(
+                "events retained={} next={}{}",
+                events.len(),
+                ctx.cursor(),
+                ctx.gap
+                    .map_or_else(String::new, |gap| format!(" gap={}", gap.word()))
+            ),
+        ));
     }
     if let Some(s) = ctx.snap
         && matches!(q.view, View::Cores | View::Procs)
@@ -1153,6 +1651,16 @@ fn stale_line(view: View, ctx: &Ctx<'_>) -> Option<Line> {
         return None;
     }
     let (unix_ms, age_ms, _) = as_of(view, ctx)?;
+    let Some(age_ms) = age_ms else {
+        return Some(note(
+            "state",
+            format!(
+                "state  stale: these figures were read at {} UTC; their observation age is {}",
+                clock_ms(unix_ms),
+                unavailable("not_sampled:observation_age")
+            ),
+        ));
+    };
     Some(note(
         "state",
         format!(
@@ -1392,7 +1900,7 @@ fn aterm_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         return;
     };
     lines.push(line("cpu", format!("cpu     {:.3} reported cores · read_span_ns={} · execution_window=unavailable:execution_window_unknown", aterm_cpu(s).unwrap_or(a.cores.raw), cpu_timing(s).map_or(0, |(_, span, _)| span))));
-    for t in &s.tabs {
+    for t in s.tabs.iter().filter(|t| pane_allowed(ctx, t.key)) {
         let number = ctx
             .tab_number(t.key)
             .map_or_else(|| "-".into(), |n| n.to_string());
@@ -1578,12 +2086,19 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
                     words::cores((cpu.total() as f32 - busy).max(0.0))
                 ));
             }
-            for c in &cpu.clusters {
+            for (index, c) in cpu.clusters.iter().enumerate() {
                 let busy = cpu.current_cluster_busy(c);
                 t.push_str(&format!(
                     " · {} {} of {}",
                     c.name,
                     rec(busy.map(words::cores), "no_counter_delta"),
+                    c.cores.len()
+                ));
+                let mean = cluster_mean_10s(s, index).map(|mean| mean * c.cores.len() as f64);
+                t.push_str(&format!(
+                    " · {} 10s mean {} of {} cores",
+                    c.name,
+                    unit_cores_words(mean),
                     c.cores.len()
                 ));
             }
@@ -1629,12 +2144,25 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
         if let Some(c) = m.sample.commit.as_ref() {
             lines.push(line("commit", format!("commit   {}", commit_words(c))));
         }
-        lines.push(line("paging", format!("paging   {}", paging_words(m))));
+        lines.push(line(
+            "paging",
+            format!("paging   {}", paging_words(m, &s.units)),
+        ));
     }
     if let Some(v) = s.volume.as_ref() {
         lines.push(line(
             "disk",
-            format!("disk     {} {}", pct(&v.mount), words::disk_space_line(v)),
+            format!(
+                "disk     {} {} · {}",
+                pct(&v.mount),
+                words::disk_space_line(v),
+                home_io_words(&s.units)
+            ),
+        ));
+    } else if s.units.home_disk().is_some() {
+        lines.push(line(
+            "disk",
+            format!("disk     {}", home_io_words(&s.units)),
         ));
     }
     if let Some(t) = spotlight_words(s) {
@@ -2121,7 +2649,7 @@ fn thrashing_why(m: &crate::model::MemView) -> &'static str {
     }
 }
 
-fn paging_words(m: &crate::model::MemView) -> String {
+fn paging_words(m: &crate::model::MemView, units: &crate::units::Units) -> String {
     let mut t = format!(
         "swap {} used of {}",
         m.sample
@@ -2142,7 +2670,132 @@ fn paging_words(m: &crate::model::MemView) -> String {
         )),
         None => t.push_str(&format!(" · rates {}", unavailable(paging_why(m)))),
     }
+    t.push_str(&format!(
+        " · {}",
+        unit_rate_words("compressor", units.churn.as_ref())
+    ));
     t
+}
+
+fn cluster_mean_10s(s: &Snapshot, index: usize) -> Result<f64, &'static str> {
+    let mean = s
+        .units
+        .clusters
+        .get(index)
+        .copied()
+        .flatten()
+        .ok_or("warming")?
+        .mean;
+    if (0.0..=1.0).contains(&mean) {
+        Ok(if mean == 0.0 { 0.0 } else { mean })
+    } else {
+        Err("unread_format")
+    }
+}
+
+fn unit_cores_words(value: Result<f64, &'static str>) -> String {
+    match value {
+        Ok(value) => format!("{value:.1}"),
+        Err(why) => unavailable(why),
+    }
+}
+
+fn cluster_mean_json(s: &Snapshot, index: usize, scale: f64) -> Jv {
+    cluster_mean_10s(s, index)
+        .map_or_else(Jv::why, |mean| unit_number(Some(mean * scale), "warming"))
+}
+
+fn unit_number(value: Option<f64>, why: &str) -> Jv {
+    match value {
+        Some(value) if value >= 0.0 => {
+            Jv::number(value).unwrap_or_else(|| Jv::why("unread_format"))
+        }
+        Some(_) => Jv::why("unread_format"),
+        None => Jv::why(why),
+    }
+}
+
+fn unit_bps_words(value: Option<f64>, why: &str) -> String {
+    match value {
+        Some(value) => words::unit_rate_bps(value).unwrap_or_else(|| unavailable("unread_format")),
+        None => unavailable(why),
+    }
+}
+
+fn unit_basis(basis: crate::model::CapBasis) -> &'static str {
+    match basis {
+        crate::model::CapBasis::Fixed => "fixed",
+        crate::model::CapBasis::Peak => "peak",
+        crate::model::CapBasis::Link => "link",
+        crate::model::CapBasis::Learning => "learning",
+    }
+}
+
+fn unit_rate_words(name: &str, rate: Option<&crate::units::Rate>) -> String {
+    let Some(rate) = rate else {
+        return format!("{name} {}", unavailable("not_sampled"));
+    };
+    format!(
+        "{name} 10s mean {} max {} · 7d peak {} ({})",
+        unit_bps_words(rate.level.map(|level| level.mean), "warming"),
+        unit_bps_words(rate.level.map(|level| level.max), "warming"),
+        unit_bps_words(rate.peak, "warming"),
+        unit_basis(rate.basis)
+    )
+}
+
+fn home_io_words(units: &crate::units::Units) -> String {
+    let Some(disk) = units.home_disk() else {
+        return format!(
+            "home device I/O {}",
+            unavailable("not_sampled:home_device_unread")
+        );
+    };
+    format!(
+        "home device {} {} · {} · {}",
+        pct(&disk.id),
+        pct(&disk.name),
+        unit_rate_words("write", Some(&disk.write)),
+        unit_rate_words("read", Some(&disk.read))
+    )
+}
+
+fn set_unit_rate_json(object: &mut Jv, name: &str, rate: Option<&crate::units::Rate>) {
+    let why = if rate.is_some() {
+        "warming"
+    } else {
+        "not_sampled"
+    };
+    for (suffix, value) in [
+        (
+            "bytes_per_s_10s",
+            rate.and_then(|rate| rate.level).map(|level| level.mean),
+        ),
+        (
+            "max_bytes_per_s_10s",
+            rate.and_then(|rate| rate.level).map(|level| level.max),
+        ),
+        ("peak_bytes_per_s_7d", rate.and_then(|rate| rate.peak)),
+    ] {
+        object.set(&format!("{name}_{suffix}"), unit_number(value, why));
+    }
+    object.set(
+        &format!("{name}_rate_basis"),
+        rate.map_or_else(
+            || Jv::why("not_sampled"),
+            |rate| Jv::s(unit_basis(rate.basis)),
+        ),
+    );
+}
+
+fn home_io_json(units: &crate::units::Units) -> Jv {
+    let Some(disk) = units.home_disk() else {
+        return Jv::why("not_sampled:home_device_unread");
+    };
+    let mut object = Jv::obj([("id", Jv::s(&disk.id)), ("name", Jv::s(&disk.name))]);
+    set_unit_rate_json(&mut object, "write", Some(&disk.write));
+    set_unit_rate_json(&mut object, "read", Some(&disk.read));
+    object
 }
 
 fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
@@ -2177,7 +2830,7 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         ));
         return;
     };
-    let rows = if scope == ScopeArg::Global {
+    let rows = if scope == ScopeArg::Global && ctx.owner_class {
         jobs_view::rows_all(v)
     } else {
         jobs_view::rows_in(v, &keys)
@@ -2191,7 +2844,11 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         jobs_view::capacity_text(s, ctx.as_of_unix_ms, ctx.age_ms),
     ));
     let wide = !matches!(scope, ScopeArg::Pane | ScopeArg::Tab);
-    let findings = jobs_view::findings_in(&v.findings, &keys, scope == ScopeArg::Global);
+    let findings = jobs_view::findings_in(
+        &v.findings,
+        &keys,
+        scope == ScopeArg::Global && ctx.owner_class,
+    );
     lines.extend(jobs_view::row_lines(
         v,
         &rows,
@@ -2207,7 +2864,7 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         .map_or_else(
             || ("@self".to_owned(), "<id>".to_owned()),
             |r| {
-                let at = if ctx.target.panes.contains(&r.tab) {
+                let at = if scope_keys(ctx, ScopeArg::Tab).contains(&r.tab) {
                     "@self".to_owned()
                 } else {
                     ctx.tabs
@@ -2471,7 +3128,10 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     if let Some(c) = m.sample.commit.as_ref() {
         lines.push(line("commit", format!("commit  {}", commit_words(c))));
     }
-    lines.push(line("paging", format!("paging  {}", paging_words(m))));
+    lines.push(line(
+        "paging",
+        format!("paging  {}", paging_words(m, &s.units)),
+    ));
     let tab = tabs_fig(s, &scope_keys(ctx, ScopeArg::Tab), ctx.target.key);
     let aterm_fp = s.aterm.as_ref().and_then(|a| a.footprint);
     let mut owners = format!(
@@ -2569,9 +3229,16 @@ fn disk_panes<'a>(ctx: &Ctx<'_>, t: &'a disk::DiskTotals) -> (Vec<&'a disk::Pane
 
 fn disk_writers<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> (Vec<&'a ProcView>, usize) {
     let keys = scope_keys(ctx, ScopeArg::Tab);
+    let requested = requested_keys(ctx, scope);
     let mut withheld = 0usize;
-    let mut writers: Vec<&ProcView> = procs_in_scope(ctx, s, scope)
-        .into_iter()
+    let mut writers: Vec<&ProcView> = s
+        .procs
+        .iter()
+        .filter(|r| match scope {
+            ScopeArg::Global => true,
+            ScopeArg::Aterm => r.scope.in_aterm(),
+            _ => matches!(r.scope, RowScope::Tab(key) if requested.contains(&key)),
+        })
         .filter(|r| r.write_bps.is_some_and(|b| b >= 1.0))
         .filter(|r| {
             let own = matches!(r.scope, RowScope::Tab(k) if keys.contains(&k));
@@ -2591,16 +3258,14 @@ fn disk_writers<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> (Vec<&'a
     (writers, withheld)
 }
 
-/// The scope's programs of the last hour of writes, busiest first, and how many outside the
-/// caller's tab were withheld from a caller that is not the owner (as [`disk_writers`]). The
-/// hour is kept per tab (`ProcScope::Tab` is a tab's key, its least pane's), so a pane's scope
-/// reads its tab's programs.
+/// The scope's programs of the last hour of writes, busiest first. Historical logical-tab
+/// records lack the contributing pane keys, so only an owner may read their names and rates.
 fn disk_programs<'a>(
     ctx: &Ctx<'_>,
     s: &'a Snapshot,
     scope: ScopeArg,
 ) -> (Vec<&'a ProgramHour>, usize) {
-    let keys = scope_keys(
+    let keys = requested_keys(
         ctx,
         if scope == ScopeArg::Pane {
             ScopeArg::Tab
@@ -2608,7 +3273,6 @@ fn disk_programs<'a>(
             scope
         },
     );
-    let mine = scope_keys(ctx, ScopeArg::Tab);
     let mut withheld = 0usize;
     let programs = s
         .facts
@@ -2619,9 +3283,10 @@ fn disk_programs<'a>(
             ScopeArg::Aterm => p.scope != ProcScope::Other,
             _ => matches!(p.scope, ProcScope::Tab(k) if keys.contains(&k)),
         })
-        .filter(|p| {
-            let own = matches!(p.scope, ProcScope::Tab(k) if mine.contains(&k));
-            if own || ctx.owner_class {
+        .filter(|_| {
+            // These hour records retain only a logical tab key, not the contributing pane
+            // keys over that history. Current layout cannot certify a pane-only grant.
+            if ctx.owner_class {
                 true
             } else {
                 withheld += 1;
@@ -3205,24 +3870,51 @@ fn disk_summary(ctx: &Ctx<'_>) -> String {
 /// on macOS its kernel record missed or named another program, as after an exec).
 const BIRTH_UNREAD: &str = "not_sampled";
 
-/// [`Snapshot::programs`] in `scope`, as [`procs_in_scope`] takes the rows. A program groups
-/// by tab ([`ProcScope::Tab`] is the tab's key, its least pane's), so a pane's programs are its
-/// tab's: the target pane's key alone would miss them in any pane of a split tab but that one.
-fn programs_in_scope<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> Vec<&'a ProgramGroup> {
+/// [`Snapshot::programs`] in `scope`, as [`procs_in_scope`] takes the rows. Programs group by
+/// logical tab, so a nonowner also needs authority for all its sampled panes.
+fn programs_in_scope<'a>(
+    ctx: &Ctx<'_>,
+    s: &'a Snapshot,
+    scope: ScopeArg,
+) -> (Vec<&'a ProgramGroup>, usize) {
     let by_tab = if scope == ScopeArg::Pane {
         ScopeArg::Tab
     } else {
         scope
     };
-    let keys = scope_keys(ctx, by_tab);
-    s.programs
+    let keys = requested_keys(ctx, by_tab);
+    let mut withheld = 0;
+    let rows = s
+        .programs
         .iter()
         .filter(|g| match scope {
             ScopeArg::Aterm => g.scope != ProcScope::Other,
             ScopeArg::Global => true,
             _ => matches!(g.scope, ProcScope::Tab(k) if keys.contains(&k)),
         })
-        .collect()
+        .filter(|g| {
+            if program_allowed(ctx, s, g.scope) {
+                true
+            } else {
+                withheld += 1;
+                false
+            }
+        })
+        .collect();
+    (rows, withheld)
+}
+
+// Program groups combine all panes of a sampled logical tab. Its representative key alone
+// cannot authorize the other panes' names and counters.
+fn program_allowed(ctx: &Ctx<'_>, s: &Snapshot, scope: ProcScope) -> bool {
+    if ctx.owner_class {
+        return true;
+    }
+    let ProcScope::Tab(key) = scope else {
+        return false;
+    };
+    let mut members = s.tabs.iter().filter(|tab| tab.tab == key).peekable();
+    members.peek().is_some() && members.all(|tab| pane_allowed(ctx, tab.key))
 }
 
 fn procs_in_scope<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> Vec<&'a ProcView> {
@@ -3233,6 +3925,9 @@ fn procs_in_scope<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> Vec<&'
             ScopeArg::Aterm => r.scope.in_aterm(),
             ScopeArg::Global => true,
             _ => matches!(r.scope, RowScope::Tab(k) if keys.contains(&k)),
+        })
+        .filter(|r| {
+            ctx.owner_class || matches!(r.scope, RowScope::Tab(key) if pane_allowed(ctx, key))
         })
         .collect()
 }
@@ -3314,6 +4009,15 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
             scheduling_json(r.scheduling, ctx.machine.family).to_text(),
             rec(r.age_ms(s.at_unix_ms), unknown_why(s, "ages", BIRTH_UNREAD))
         );
+        t.push_str(&format!(
+            " energy_mw={} energy_basis=process_thread_ledger energy_read_span_ns={} group={}",
+            r.energy_mw.map_or_else(
+                || unavailable("not_sampled"),
+                |n| group_float_text(crate::groups::Value::Read(n), 1.0)
+            ),
+            rec(r.energy_read_span_ns, "not_sampled"),
+            proc_group_text(ctx, r),
+        ));
         if let RowScope::Tab(k) = r.scope {
             if !matches!(scope, ScopeArg::Pane | ScopeArg::Tab)
                 && let Some(n) = ctx.tab_number(k)
@@ -3336,6 +4040,322 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
     }
 }
 
+fn group_id(key: crate::groups::GroupKey) -> String {
+    use crate::groups::GroupKey;
+    match key {
+        GroupKey::Tab { pane, root } => format!("t{pane:x}-p{}-b{:x}", root.pid, root.start),
+        GroupKey::Aterm(root) => format!("a-p{}-b{:x}", root.pid, root.start),
+        GroupKey::Shared(root) => format!("s-p{}-b{:x}", root.pid, root.start),
+        GroupKey::Coalition(id) => format!("c{id:x}"),
+    }
+}
+
+/// Caller keys are authority; a requested target, scope or advisory caller string is not.
+fn group_caller_ok(ctx: &Ctx<'_>, key: crate::groups::GroupKey) -> bool {
+    match ctx.caller_panes {
+        Some(keys) => {
+            matches!(key, crate::groups::GroupKey::Tab { pane, .. } if keys.contains(&pane))
+        }
+        None => ctx.owner_class,
+    }
+}
+
+fn proc_group_json(ctx: &Ctx<'_>, row: &ProcView) -> Jv {
+    match row.group {
+        Some(key) if group_caller_ok(ctx, key) => Jv::s(group_id(key)),
+        Some(_) => Jv::why("refused"),
+        None => Jv::why("not_sampled"),
+    }
+}
+
+fn proc_group_text(ctx: &Ctx<'_>, row: &ProcView) -> String {
+    match row.group {
+        Some(key) if group_caller_ok(ctx, key) => group_id(key),
+        Some(_) => unavailable("refused"),
+        None => unavailable("not_sampled"),
+    }
+}
+
+fn group_scope_word(scope: crate::groups::Scope) -> &'static str {
+    use crate::groups::Scope;
+    match scope {
+        Scope::Tab(_) => "tab",
+        Scope::Aterm => "aterm",
+        Scope::Shared => "shared",
+        Scope::Others => "others",
+        Scope::Services => "services",
+        Scope::Unknown => "unknown",
+    }
+}
+
+fn group_rows<'a>(
+    q: &SysQuery,
+    ctx: &Ctx<'_>,
+    s: &'a Snapshot,
+) -> (Vec<&'a crate::groups::Row>, usize) {
+    let scope = q.effective_scope().unwrap_or(ScopeArg::Global);
+    let keys = scope_keys(ctx, scope);
+    let mut withheld = 0;
+    let rows = s
+        .groups
+        .rows()
+        .iter()
+        .filter(|row| {
+            let key = row.key();
+            if !group_caller_ok(ctx, key) {
+                withheld += 1;
+                return false;
+            }
+            match scope {
+                ScopeArg::Global => true,
+                ScopeArg::Aterm => key.in_aterm(),
+                _ => {
+                    matches!(key, crate::groups::GroupKey::Tab { pane, .. } if keys.contains(&pane))
+                }
+            }
+        })
+        .collect();
+    (rows, withheld)
+}
+
+fn group_float_text(value: crate::groups::Value<f64>, scale: f64) -> String {
+    match value.value() {
+        Some(n) if (n * scale).is_finite() && n >= 0.0 => (n * scale).to_string(),
+        Some(_) => unavailable("unread_format"),
+        None => unavailable(value.why().map_or("not_sampled", |why| why.word())),
+    }
+}
+
+fn group_value_json<T: Copy>(value: crate::groups::Value<T>, point: impl FnOnce(T) -> Jv) -> Jv {
+    use crate::groups::Value;
+    let (mut state, reading) = match value {
+        Value::Read(n) => ("read", point(n)),
+        Value::Partial { value: n, .. } => ("partial", point(n)),
+        Value::Unread { why, .. } => ("unread", Jv::why(why.word())),
+    };
+    if reading.get("why").is_some() {
+        state = "unread";
+    }
+    Jv::obj([
+        ("state", Jv::s(state)),
+        ("reported_point", reading),
+        ("unread", Jv::u(u64::from(value.unread()))),
+    ])
+}
+
+fn group_window_json(window: crate::groups::ReadWindow) -> Jv {
+    use crate::groups::ReadWindow;
+    match window {
+        ReadWindow::Reported { end_ns, window_ns } => Jv::obj([
+            ("kind", Jv::s("reported_counter_read_separation")),
+            ("end_ns", Jv::s(end_ns.to_string())),
+            ("window_ns", Jv::s(window_ns.to_string())),
+        ]),
+        ReadWindow::Mixed => Jv::obj([("kind", Jv::s("mixed_reported_read_windows"))]),
+        ReadWindow::Unread => Jv::why("not_sampled"),
+    }
+}
+
+fn group_rate_json(rate: crate::groups::Rate, scale: f64) -> Jv {
+    let mut value = group_value_json(rate.value, |n| unit_number(Some(n * scale), "not_sampled"));
+    value.set("read_window", group_window_json(rate.window));
+    value
+}
+
+fn group_basis_word(basis: crate::groups::CpuBasis) -> &'static str {
+    match basis {
+        crate::groups::CpuBasis::ProcessOwnCounters => "process_own_counters",
+        crate::groups::CpuBasis::CoalitionCounters => "independent_coalition_counters",
+    }
+}
+
+fn group_row_json(ctx: &Ctx<'_>, s: &Snapshot, row: &crate::groups::Row) -> Jv {
+    let history = s.groups.history(row, &s.time_gaps);
+    let cells = |metric| {
+        Jv::Arr(
+            history
+                .cells(metric)
+                .iter()
+                .map(|cell| {
+                    Jv::obj([
+                        ("mean", unit_number(cell.cell.mean, "not_sampled")),
+                        ("max", unit_number(cell.cell.max, "not_sampled")),
+                        (
+                            "weighted_source_ms",
+                            unit_number(Some(cell.cell.tau_ms), "not_sampled"),
+                        ),
+                        ("quality", Jv::s(cell.quality.word())),
+                        ("age_lo_ms", Jv::Int(cell.slot.age_lo_ms)),
+                        ("age_hi_ms", Jv::Int(cell.slot.age_hi_ms)),
+                        ("live", Jv::Bool(cell.slot.is_live_now)),
+                        (
+                            "gap",
+                            Jv::s(match cell.gap {
+                                None => "none",
+                                Some(crate::ring::GapKind::Paused) => "paused",
+                                Some(crate::ring::GapKind::Sleep) => "sleep",
+                                Some(crate::ring::GapKind::Crash) => "crash",
+                            }),
+                        ),
+                    ])
+                })
+                .collect(),
+        )
+    };
+    let energy = row.energy();
+    let mut object = Jv::obj([
+        ("id", Jv::s(group_id(row.key()))),
+        ("scope", Jv::s(group_scope_word(row.scope()))),
+        (
+            "exe",
+            if row.name().is_empty() {
+                Jv::why("not_sampled")
+            } else {
+                Jv::s(row.name())
+            },
+        ),
+        ("name_held", Jv::Bool(row.name_held())),
+        ("name_truncated", Jv::Bool(row.name_truncated())),
+        ("members", Jv::u(u64::from(row.count()))),
+        ("membership_complete", Jv::Bool(row.membership_complete())),
+        ("ended", Jv::Bool(row.ended())),
+        ("cpu_mc", group_rate_json(row.cpu(), 1000.0)),
+        ("cpu_basis", Jv::s(group_basis_word(row.cpu_basis()))),
+        ("footprint_bytes", group_value_json(row.footprint(), Jv::u)),
+        (
+            "gpu_busy",
+            group_value_json(row.gpu(), |n| unit_number(Some(n), "not_sampled")),
+        ),
+        ("read_bytes_per_s", group_rate_json(row.read_bps(), 1.0)),
+        ("write_bytes_per_s", group_rate_json(row.write_bps(), 1.0)),
+        ("thread_energy_mw", group_rate_json(energy.thread_mw, 1.0)),
+        ("cpu_energy_mw", group_rate_json(energy.cpu_mw, 1.0)),
+        ("gpu_energy_mw", group_rate_json(energy.gpu_mw, 1.0)),
+        ("ane_energy_mw", group_rate_json(energy.ane_mw, 1.0)),
+        ("starts_per_s", group_rate_json(row.starts_ps(), 1.0)),
+        ("cpu_history", cells(crate::groups::Metric::Cpu)),
+        ("footprint_history", cells(crate::groups::Metric::Memory)),
+    ]);
+    if let crate::groups::GroupKey::Tab { pane, .. } = row.key() {
+        object.set("sid", session_json(ctx, pane));
+    }
+    object
+}
+
+fn groups_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
+    if let Some(lane) = stalled_lane(s, "groups") {
+        return Jv::stalled(lane);
+    }
+    let Some(frame) = s.groups.frame() else {
+        return Jv::why("not_sampled");
+    };
+    let (rows, withheld) = group_rows(q, ctx, s);
+    let mut object = Jv::obj([
+        ("basis", Jv::s("independent_reported_accounts_may_overlap")),
+        ("as_of_basis", Jv::s("grouping_observation")),
+        ("age_basis", Jv::s("oldest_required_input")),
+        (
+            "execution_window",
+            Jv::why("unavailable:execution_window_unknown"),
+        ),
+        ("processes_complete", Jv::Bool(frame.processes_complete)),
+        ("coalitions_complete", Jv::Bool(frame.coalitions_complete)),
+        ("withheld", Jv::u(withheld as u64)),
+        ("more", Jv::u(rows.len().saturating_sub(q.top) as u64)),
+        (
+            "rows",
+            Jv::Arr(
+                rows.into_iter()
+                    .take(q.top)
+                    .map(|row| group_row_json(ctx, s, row))
+                    .collect(),
+            ),
+        ),
+    ]);
+    if ctx.owner_class && ctx.caller_panes.is_none() {
+        let omitted = s.groups.omitted();
+        object.set(
+            "omitted",
+            Jv::obj([
+                ("app_member_contributions", Jv::u(omitted.app_members)),
+                ("coalition_groups", Jv::u(omitted.outside_groups)),
+                ("invalid_contributions", Jv::u(omitted.invalid)),
+            ]),
+        );
+    }
+    object
+}
+
+fn groups_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
+    if stalled_lane(s, "groups").is_some() {
+        lines.push(line("groups", format!("groups {}", unavailable("stalled"))));
+        return;
+    }
+    let Some(_) = s.groups.frame() else {
+        lines.push(line(
+            "groups",
+            format!("groups {}", unavailable("not_sampled")),
+        ));
+        return;
+    };
+    let (rows, withheld) = group_rows(q, ctx, s);
+    lines.push(line("groups", format!(
+        "groups shown={} withheld={withheld} more={} · independent reported accounts may overlap; execution_window={}",
+        rows.len().min(q.top), rows.len().saturating_sub(q.top), unavailable("execution_window_unknown")
+    )));
+    for row in rows.into_iter().take(q.top) {
+        let energy = row.energy();
+        let footprint = row.footprint();
+        let mut text = format!(
+            "group id={} scope={} exe={} name_held={} name_truncated={} members={} membership_complete={} ended={} cpu_basis={} fp_bytes={} fp_unread={} gpu_busy={}",
+            group_id(row.key()),
+            group_scope_word(row.scope()),
+            if row.name().is_empty() {
+                unavailable("not_sampled")
+            } else {
+                pct(row.name())
+            },
+            row.name_held(),
+            row.name_truncated(),
+            row.count(),
+            row.membership_complete(),
+            row.ended(),
+            group_basis_word(row.cpu_basis()),
+            footprint.value().map_or_else(
+                || unavailable(footprint.why().map_or("not_sampled", |why| why.word())),
+                |n| n.to_string()
+            ),
+            footprint.unread(),
+            unavailable("unsupported")
+        );
+        for (name, rate, scale) in [
+            ("cpu_mc", row.cpu(), 1000.0),
+            ("read_bps", row.read_bps(), 1.0),
+            ("write_bps", row.write_bps(), 1.0),
+            ("thread_energy_mw", energy.thread_mw, 1.0),
+            ("cpu_energy_mw", energy.cpu_mw, 1.0),
+            ("gpu_energy_mw", energy.gpu_mw, 1.0),
+            ("ane_energy_mw", energy.ane_mw, 1.0),
+            ("starts_ps", row.starts_ps(), 1.0),
+        ] {
+            text.push_str(&format!(
+                " {name}={} {name}_unread={}",
+                group_float_text(rate.value, scale),
+                rate.value.unread()
+            ));
+            match rate.window {
+                crate::groups::ReadWindow::Reported { end_ns, window_ns } => text.push_str(&format!(" {name}_window=reported {name}_read_end_ns={end_ns} {name}_read_span_ns={window_ns}")),
+                crate::groups::ReadWindow::Mixed => text.push_str(&format!(" {name}_window=mixed")),
+                crate::groups::ReadWindow::Unread => text.push_str(&format!(" {name}_window=unread")),
+            }
+        }
+        if let crate::groups::GroupKey::Tab { pane, .. } = row.key() {
+            text.push_str(&format!(" {}", session_words(ctx, pane)));
+        }
+        lines.push(line(format!("group {}", group_id(row.key())), text));
+    }
+}
+
 fn as_of_json(view: View, ctx: &Ctx<'_>) -> Jv {
     if view == View::Boot {
         return Jv::obj([
@@ -3348,8 +4368,15 @@ fn as_of_json(view: View, ctx: &Ctx<'_>) -> Jv {
             ),
             (
                 "age_ms_decimal",
-                ctx.snap
-                    .map_or_else(|| Jv::why("warming"), |_| Jv::s(ctx.age_ms.to_string())),
+                ctx.snap.map_or_else(
+                    || Jv::why("warming"),
+                    |_| {
+                        ctx.age_ms.map_or_else(
+                            || Jv::why("not_sampled:observation_age"),
+                            |age| Jv::s(age.to_string()),
+                        )
+                    },
+                ),
             ),
             ("window_ms", Jv::why("unavailable:execution_window_unknown")),
             ("cursor", Jv::s(ctx.cursor().to_string())),
@@ -3359,8 +4386,17 @@ fn as_of_json(view: View, ctx: &Ctx<'_>) -> Jv {
     let (unix, age, window) = match as_of(view, ctx) {
         Some((unix, age, window)) => (
             Jv::u(unix),
-            Jv::u(age),
-            window.map_or_else(|| Jv::why("warming"), Jv::u),
+            age.map_or_else(|| Jv::why("not_sampled:observation_age"), Jv::u),
+            window.map_or_else(
+                || {
+                    Jv::why(if view == View::Groups {
+                        "not_sampled:independent_read_windows"
+                    } else {
+                        "warming"
+                    })
+                },
+                Jv::u,
+            ),
         ),
         None => (Jv::why("warming"), Jv::why("warming"), Jv::why("warming")),
     };
@@ -3651,9 +4687,8 @@ fn blockage_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
             o.set("zombie_count", Jv::why(why.word()));
         }
         Zombies::Read(v) => {
-            let shown = |z: &&ZombieParent| {
-                ctx.owner_class || z.tab.is_some_and(|t| ctx.target.panes.contains(&t))
-            };
+            let shown =
+                |z: &&ZombieParent| ctx.owner_class || z.tab.is_some_and(|t| pane_allowed(ctx, t));
             let piles: Vec<Jv> = v
                 .piles
                 .iter()
@@ -3823,7 +4858,34 @@ fn global_json(s: &Snapshot) -> Jv {
                     .collect(),
             ),
         );
+        o.set(
+            "cpu_by_level_mean_10s_mc",
+            Jv::Arr(
+                cpu.clusters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, cluster)| {
+                        cluster_mean_json(s, index, cluster.cores.len() as f64 * 1000.0)
+                    })
+                    .collect(),
+            ),
+        );
+        o.set(
+            "cpu_by_level_mean_10s_pm",
+            Jv::Arr(
+                cpu.clusters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| cluster_mean_json(s, index, 1000.0))
+                    .collect(),
+            ),
+        );
+    } else {
+        o.set("cpu_by_level_mean_10s_mc", Jv::why("warming"));
+        o.set("cpu_by_level_mean_10s_pm", Jv::why("warming"));
     }
+    set_unit_rate_json(&mut o, "compressor", s.units.churn.as_ref());
+    o.set("home_device_io", home_io_json(&s.units));
     o.set(
         "wait_mc",
         s.global.wait.map_or_else(
@@ -4080,7 +5142,12 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             "cpu_as_of",
             Jv::obj([
                 ("unix_ms", Jv::u(ctx.as_of_unix_ms.saturating_sub(older))),
-                ("age_ms", Jv::u(ctx.age_ms.saturating_add(older))),
+                (
+                    "age_ms",
+                    ctx.age_ms
+                        .map(|age| age.saturating_add(older))
+                        .map_or_else(|| Jv::why("not_sampled:observation_age"), Jv::u),
+                ),
                 ("window_ms", Jv::u(window / 1_000_000)),
             ]),
         );
@@ -4175,7 +5242,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             let keys = scope_keys(ctx, scope);
             match s.jobs.as_deref() {
                 Some(v) => {
-                    let rows = if scope == ScopeArg::Global {
+                    let rows = if scope == ScopeArg::Global && ctx.owner_class {
                         jobs_view::rows_all(v)
                     } else {
                         jobs_view::rows_in(v, &keys)
@@ -4194,7 +5261,11 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
                                 .collect(),
                         ),
                     );
-                    let f = jobs_view::findings_in(&v.findings, &keys, scope == ScopeArg::Global);
+                    let f = jobs_view::findings_in(
+                        &v.findings,
+                        &keys,
+                        scope == ScopeArg::Global && ctx.owner_class,
+                    );
                     o.set("findings", jobs_view::findings_json(&f));
                     o.set(
                         "lanes_off",
@@ -4268,6 +5339,25 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             let sc = scope.unwrap_or(ScopeArg::Tab);
             o.set("procs", procs_json(q, ctx, s, sc));
         }
+        View::Groups => o.set("groups", groups_json(q, ctx, s)),
+        View::History => o.set("history", history_json(q, s)),
+        View::Events => o.set(
+            "event_cursor",
+            Jv::obj([
+                ("head", Jv::s(ctx.cursor().to_string())),
+                (
+                    "since",
+                    q.since.map_or_else(
+                        || Jv::why("not_sampled"),
+                        |cursor| Jv::s(cursor.to_string()),
+                    ),
+                ),
+                (
+                    "coverage",
+                    Jv::s(ctx.gap.map_or("retained", |gap| gap.word())),
+                ),
+            ]),
+        ),
         View::Why => why::why_json(q, ctx, s, &mut o),
         View::Report => o.set("report", super::hardware::report_json(s)),
         View::Boot => o.set("boot", super::boot::json(s.boot_cost.as_deref())),
@@ -4296,7 +5386,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
         Jv::Arr(
             ctx.events
                 .iter()
-                .filter(|e| event_shown(ctx, e))
+                .filter(|e| event_shown(ctx, e) && event_requested(q, ctx, e))
                 .map(|e| event_json(ctx, s, e))
                 .collect(),
         ),
@@ -4459,7 +5549,7 @@ fn parts_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         return unknown_json(s, "aterm", "warming");
     }
     let mut parts = Vec::new();
-    for t in &s.tabs {
+    for t in s.tabs.iter().filter(|t| pane_allowed(ctx, t.key)) {
         let mut p = fig_json(&Fig::of(&t.scope));
         p.set("name", Jv::s("tab"));
         p.set("local", Jv::u(t.key));
@@ -4740,6 +5830,7 @@ fn mem_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
             None => Jv::why(paging_why(m)),
         },
     );
+    set_unit_rate_json(&mut o, "compressor", s.units.churn.as_ref());
     o.set(
         "thrashing",
         m.thrashing()
@@ -4852,6 +5943,14 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
     }
     o.set("cpu_mc", Jv::known_or(r.cores.map(mc), why));
     o.set("cpu_mc_scope", Jv::s("process_self"));
+    o.set("energy_mw", unit_number(r.energy_mw, "not_sampled"));
+    o.set("energy_basis", Jv::s("process_thread_ledger"));
+    o.set(
+        "energy_read_span_ns",
+        r.energy_read_span_ns
+            .map_or_else(|| Jv::why("not_sampled"), Jv::u),
+    );
+    o.set("group", proc_group_json(ctx, r));
     cpu_metadata(&mut o, cpu_read_span_json(s, r.cpu_read_span_ns));
     o.set(
         "cpu_accounting",
@@ -5099,6 +6198,7 @@ fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv 
         return stalled_lane(s, "procs").map_or_else(|| Jv::why("warming"), Jv::stalled);
     }
     let rows = procs_in_scope(ctx, s, scope);
+    let (programs, programs_withheld) = programs_in_scope(ctx, s, scope);
     let unread = rows.iter().filter(|r| r.refused).count();
     let mut object = Jv::obj([
         ("scope", Jv::s(scope.word())),
@@ -5123,7 +6223,7 @@ fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv 
         (
             "programs",
             Jv::Arr(
-                programs_in_scope(ctx, s, scope)
+                programs
                     .into_iter()
                     .take(q.top)
                     .map(|g| program_json(ctx, s, g))
@@ -5131,6 +6231,9 @@ fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv 
             ),
         ),
     ]);
+    if programs_withheld > 0 {
+        object.set("programs_withheld", Jv::u(programs_withheld as u64));
+    }
     if matches!(scope, ScopeArg::Pane | ScopeArg::Tab) {
         object.set("sid", session_json(ctx, ctx.target.key));
     }
@@ -5457,13 +6560,11 @@ fn net_json(q: &SysQuery, s: &Snapshot) -> Jv {
     let Some(net) = s.net.as_ref() else {
         return Jv::why("not_sampled");
     };
-    let rates_why = net.rates_why.map_or_else(
-        || {
-            if net.links.is_empty() {
-                "not_sampled"
-            } else {
-                "warming"
-            }
+    let rates_why = net.rates_why.map_or(
+        if net.links.is_empty() {
+            "not_sampled"
+        } else {
+            "warming"
         },
         |why| why.word(),
     );

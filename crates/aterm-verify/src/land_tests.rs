@@ -9,17 +9,6 @@ use aterm_land_trailer::{Interrupted, KEYS};
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-fn remote_step(
-    root: &Path,
-    git: &dyn Fn(&Path) -> Command,
-    tool: crate::remote::Tool,
-    args: &[std::ffi::OsString],
-    until: Instant,
-    _mode: RemoteMode,
-) -> Result<std::process::Output, String> {
-    crate::remote::run(root, git, tool, args, until)
-}
-
 #[test]
 fn an_ended_intent_wait_starts_no_observation() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -99,6 +88,156 @@ fn intent_observations_share_the_waits_absolute_deadline() {
         .unwrap();
     assert_eq!(reads.get(), 3);
     assert_eq!(pauses.get(), 2);
+}
+
+/// A PUSH REFUSED AGAIN BY AN INTENT WHOSE WRITER IS GONE IS MADE AGAIN WITHIN RETRIES: a wait
+/// that ended on its writer gone (`closable`) lets the next push's agh read the intent's refs
+/// from origin before it begins, and the same intent refusing that push again does not say
+/// whether origin read mixed, could not be read, or that agh did not judge the writer gone. So
+/// that refusal is a failure that sent nothing, made again after a doubling pause, [`RETRIES`]
+/// times in a row at most: a push that then lands is not stopped, and past that bound the push
+/// stops naming the intent to settle. An intent that records no writer and settled with an
+/// unknown outcome stops the push at once, naming `agh intent retract`. NEGATIVE CONTROLS: the
+/// same intent after a wait that ended on it closed is waited on again, as is another intent
+/// after a wait that ended on a writer gone, each running to the composition bound with
+/// nothing to settle; and an interrupt taken before the push is made again leaves nothing to
+/// settle.
+#[test]
+fn a_push_refused_again_by_an_intent_whose_writer_is_gone_is_made_again_within_retries() {
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let plumbing = Git {
+        root: root.path(),
+        make: &git_cmd,
+    };
+    let doubling: Vec<Duration> = (0..RETRIES).map(|n| RETRY_PAUSE * (1u32 << n)).collect();
+    for case in [
+        "same-gone",
+        "same-gone-cured",
+        "same-gone-interrupted",
+        "same-held",
+        "same-closed",
+        "other-gone",
+    ] {
+        let attempts = Cell::new(0_usize);
+        let shows = Cell::new(0_usize);
+        let said = Cell::new(0_usize);
+        let pauses = RefCell::new(Vec::new());
+        let step = |_: &Path,
+                    _: &dyn Fn(&Path) -> Command,
+                    tool,
+                    args: &[std::ffi::OsString],
+                    _,
+                    mode: RemoteMode| {
+            assert_eq!(mode, RemoteMode::Read, "a wait on an intent only reads");
+            let stdout = if tool == crate::remote::Tool::Git {
+                "https://github.com/fixture/repo.git\n".to_owned()
+            } else {
+                shows.set(shows.get() + 1);
+                let state = match case {
+                    "same-closed" => r#""open":false,"closable":false"#,
+                    "same-held" => {
+                        r#""open":true,"closable":false,"writer":null,"settled":"unknown""#
+                    }
+                    _ => r#""open":true,"closable":true"#,
+                };
+                format!(
+                    r#"{{"id":"{}","repo":"fixture/repo","op":"ref.update-atomic","key":"atomic refs",{state}}}"#,
+                    args[3].to_str().unwrap()
+                )
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: stdout.into_bytes(),
+                stderr: Vec::new(),
+            })
+        };
+        let pause = |pause: Duration| pauses.borrow_mut().push(pause);
+        let say = |_: &str| said.set(said.get() + 1);
+        let interrupt = || (case == "same-gone-interrupted" && shows.get() > 0).then_some(15);
+        let wire = Wire::new(&plumbing, &step, &pause, &say, &interrupt);
+        let mut races = 0;
+        let result = push_counting(
+            &mut races,
+            &|| {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if case == "same-gone-cured" && attempt == 2 {
+                    return Ok(crate::remote::Pushed::Done);
+                }
+                let intent = if case == "other-gone" {
+                    format!("{}-000000000000", attempt + 1)
+                } else {
+                    "66-fc387e8b41a0".to_owned()
+                };
+                Ok(crate::remote::Pushed::Blocked {
+                    intent: agh::IntentId::parse(&intent).unwrap(),
+                    why: "pre-send".into(),
+                })
+            },
+            &|intent| wire.await_intent(intent),
+            &|| Ok(PushObservation::Unchanged),
+            &|_| unreachable!("a pre-send obstruction is not a rejection"),
+            &|_| unreachable!("a pre-send obstruction is not an unsent write"),
+        );
+        let unsettled = wire.unsettled.take();
+        let counts = (attempts.get(), shows.get(), said.get());
+        match case {
+            "same-gone" => {
+                let why = result.unwrap_err();
+                assert!(
+                    why.contains("66-fc387e8b41a0")
+                        && why.contains(&format!(
+                            "stopped after {RETRIES} failures of the push in a row"
+                        )),
+                    "{why}"
+                );
+                assert_eq!(counts, (RETRIES + 2, RETRIES + 1, 2 * RETRIES + 1));
+                assert_eq!(*pauses.borrow(), doubling);
+                let unsettled = unsettled.expect("the held intent is left to settle");
+                assert!(
+                    unsettled.contains("66-fc387e8b41a0")
+                        && unsettled.contains("agh intent retract"),
+                    "{unsettled}"
+                );
+            }
+            "same-gone-cured" => {
+                assert_eq!(result, Ok(None));
+                assert_eq!(counts, (3, 2, 3));
+                assert_eq!(*pauses.borrow(), doubling[..1].to_vec());
+                assert!(unsettled.is_none());
+            }
+            "same-gone-interrupted" => {
+                let why = result.unwrap_err();
+                assert!(why.contains("the landing took signal 15"), "{why}");
+                assert_eq!(counts, (2, 1, 1));
+                assert!(pauses.borrow().is_empty());
+                assert!(unsettled.is_none());
+            }
+            "same-held" => {
+                let why = result.unwrap_err();
+                assert!(why.contains("records no writer"), "{why}");
+                assert_eq!(counts, (1, 1, 1));
+                let unsettled = unsettled.expect("the held intent is left to settle");
+                assert!(
+                    unsettled.contains("66-fc387e8b41a0")
+                        && unsettled.contains("agh intent retract"),
+                    "{unsettled}"
+                );
+            }
+            _ => {
+                let why = result.unwrap_err();
+                assert!(
+                    why.contains(&format!("stopped after {COMPOSES}")),
+                    "{case}: {why}"
+                );
+                assert_eq!(counts, (COMPOSES + 1, COMPOSES, COMPOSES), "{case}");
+                assert!(pauses.borrow().is_empty(), "{case}");
+                assert!(unsettled.is_none(), "{case}");
+            }
+        }
+    }
 }
 
 #[path = "land_rejudge_tests.rs"]
@@ -502,6 +641,47 @@ fn an_unsent_push_is_made_again_only_after_its_pause_and_a_fresh_read_of_main() 
     }
 }
 
+/// A WRITE REFUSED WITH NO EFFECT STOPS THE PUSH, NAMING THE REFUSAL
+/// ([`crate::remote::Pushed::Refused`]), whether agh refused it before it sent anything (no
+/// credential, no permission, input it refuses) or GitHub rejected the push it received (a
+/// branch rule's `[remote rejected]`, which agh reports with no side effect): it is not made
+/// again, no pause is taken, main is not read and no intent is waited on, and the error says the
+/// push was refused with no effect and nothing is left to settle, never that agh refused it
+/// before it sent anything, which GitHub's rejection contradicts. `Wire::push` keeps a write to
+/// settle only for an error from the push itself, so this one leaves none.
+#[test]
+fn a_push_refused_with_no_effect_stops_naming_the_refusal() {
+    use std::cell::Cell;
+    for refused in [
+        "Agh remote operation exited Some(4): routed identity dev is not let in",
+        "Agh remote operation exited Some(1): GitHub refused the push: !\trefs/heads/main:refs/heads/\
+         main\t[remote rejected] (push declined due to repository rule violations)",
+    ] {
+        let attempts = Cell::new(0);
+        let mut races = 0;
+        let result = push_counting(
+            &mut races,
+            &|| {
+                attempts.set(attempts.get() + 1);
+                Ok(crate::remote::Pushed::Refused(refused.into()))
+            },
+            &|_| panic!("a refused write waits on no intent"),
+            &|| panic!("a refused write reads no main"),
+            &|_| panic!("a refused write is no rejection to settle against main"),
+            &|_| panic!("a refused write is not made again"),
+        );
+        let why = result.expect_err("the push stops");
+        assert!(
+            why.starts_with(refused)
+                && why.contains("refused with no effect (by agh or by GitHub)")
+                && why.contains("nothing is left to settle")
+                && !why.contains("before it sent anything"),
+            "{why}"
+        );
+        assert_eq!((attempts.get(), races), (1, 0), "{refused}");
+    }
+}
+
 #[test]
 fn resource_controls_cannot_replace_the_landing_check_scope() {
     let args = |values: &[&str]| {
@@ -866,6 +1046,9 @@ fn a_rounds_delta_reaches_its_child_as_the_round_it_names() {
     }
 }
 
+/// Every git of a scripted landing, the landing's own included. Automatic maintenance is off: a
+/// fixture holds a few dozen objects, far below any threshold, so each commit, merge, fetch and
+/// push would only start a `git maintenance run --auto` that decides there is nothing to do.
 fn git_cmd(dir: &Path) -> Command {
     let mut cmd = aterm_uds::fixture_git::git();
     cmd.current_dir(dir)
@@ -873,7 +1056,10 @@ fn git_cmd(dir: &Path) -> Command {
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_COMMITTER_NAME", "Andrew Yates")
         .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+        .env("GIT_CONFIG_VALUE_0", "false");
     cmd
 }
 
@@ -901,16 +1087,34 @@ struct World {
 
 const SHARED: &str = "1\n2\n3\n4\n5\n6\n7\n8\n";
 
+/// A fresh [`World`], laid from the one [`build_world`] made in this process ([`Laid`]).
 fn world() -> World {
+    static BUILT: std::sync::OnceLock<Laid> = std::sync::OnceLock::new();
+    let built = BUILT.get_or_init(|| {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        build_world(dir.path());
+        // The seed only pushed origin's first main; no world reads it.
+        std::fs::remove_dir_all(dir.path().join("seed")).expect("the seed");
+        Laid::read(dir.path())
+    });
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let root = dir.path().to_path_buf();
+    built.lay(&root);
+    World {
+        _dir: dir,
+        origin: root.join("origin.git"),
+        work: root.join("work"),
+        rival: root.join("rival"),
+    }
+}
+
+/// [`World`]'s repositories under `root`: the bare origin, the seed that pushed its main, and the
+/// work and rival clones.
+fn build_world(root: &Path) {
     let origin = root.join("origin.git");
     let seed = root.join("seed");
-    git(
-        &root,
-        &["init", "-q", "--bare", "-b", "main", path(&origin)],
-    );
-    git(&root, &["init", "-q", "-b", "main", path(&seed)]);
+    git(root, &["init", "-q", "--bare", "-b", "main", path(&origin)]);
+    git(root, &["init", "-q", "-b", "main", path(&seed)]);
     for (file, text) in [
         ("a/x.txt", "a\n"),
         ("b/y.txt", "b\n"),
@@ -923,15 +1127,91 @@ fn world() -> World {
     git(&seed, &["remote", "add", "origin", path(&origin)]);
     git(&seed, &["push", "-q", "origin", "main"]);
     let work = root.join("work");
-    let rival = root.join("rival");
-    git(&root, &["clone", "-q", path(&origin), path(&work)]);
-    git(&root, &["clone", "-q", path(&origin), path(&rival)]);
+    git(root, &["clone", "-q", path(&origin), path(&work)]);
+    git(
+        root,
+        &["clone", "-q", path(&origin), path(&root.join("rival"))],
+    );
     git(&work, &["checkout", "-q", "-b", "feature"]);
-    World {
-        _dir: dir,
-        origin,
-        work,
-        rival,
+}
+
+/// A directory of repositories read into memory once, so each [`world`] is a copy of its bytes
+/// and modes instead of the two inits, a commit, a push and two clones (with every transport
+/// process they start) that made it. The only recorded path Git acts on is a clone's origin in
+/// its `config`, which [`Laid::lay`] rewrites to the copy's own (a reflog's `clone: from` message
+/// keeps the built path as text nothing reads). The `*.sample` scripts
+/// `git init` leaves in `hooks/` are left out: Git runs no hook by that name.
+struct Laid {
+    /// Where the repositories were built, as the clones' `config` files spell it.
+    from: String,
+    /// Each entry relative to the root, in walk order (a directory before what it holds).
+    entries: Vec<(PathBuf, Node)>,
+}
+
+/// One entry of a [`Laid`] tree.
+enum Node {
+    Dir,
+    File { bytes: Vec<u8>, mode: u32 },
+}
+
+impl Laid {
+    fn read(root: &Path) -> Self {
+        fn walk(root: &Path, rel: &Path, entries: &mut Vec<(PathBuf, Node)>) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut names: Vec<_> = std::fs::read_dir(root.join(rel))
+                .expect("read the built world")
+                .map(|entry| entry.expect("an entry").file_name())
+                .collect();
+            names.sort();
+            for name in names {
+                let rel = rel.join(name);
+                let meta = std::fs::symlink_metadata(root.join(&rel)).expect("stat");
+                assert!(
+                    !meta.is_symlink(),
+                    "{}: a built world holds no link",
+                    rel.display()
+                );
+                let sample = rel.parent().is_some_and(|dir| dir.ends_with("hooks"))
+                    && rel.extension().is_some_and(|ext| ext == "sample");
+                if sample {
+                    continue;
+                }
+                if meta.is_dir() {
+                    entries.push((rel.clone(), Node::Dir));
+                    walk(root, &rel, entries);
+                } else {
+                    let bytes = std::fs::read(root.join(&rel)).expect("read");
+                    let mode = meta.permissions().mode();
+                    entries.push((rel, Node::File { bytes, mode }));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        walk(root, Path::new(""), &mut entries);
+        Self {
+            from: path(root).to_owned(),
+            entries,
+        }
+    }
+
+    /// Write every entry under `root` (an empty directory), each `config` naming `root` where it
+    /// named the built one.
+    fn lay(&self, root: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        for (rel, entry) in &self.entries {
+            let at = root.join(rel);
+            let Node::File { bytes, mode } = entry else {
+                std::fs::create_dir(&at).expect("a world's directory");
+                continue;
+            };
+            if rel.file_name().is_some_and(|name| name == "config") {
+                let text = String::from_utf8(bytes.clone()).expect("a UTF-8 git config");
+                std::fs::write(&at, text.replace(&self.from, path(root))).expect("config");
+            } else {
+                std::fs::write(&at, bytes).expect("a world's file");
+            }
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(*mode)).expect("mode");
+        }
     }
 }
 
@@ -1131,7 +1411,7 @@ fn land_rechecking(
     judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
     recheck: impl FnMut(&str) -> Judged,
 ) -> Landed {
-    land_wired(world, git, &remote_step, &no_retry, branch, judge, recheck)
+    land_wired(world, git, &live_remote, &no_retry, branch, judge, recheck)
 }
 
 /// The pause seam of a landing whose remote never fails: no step is made again.
@@ -1167,7 +1447,7 @@ fn land_reaching(
     land_seamed(
         world,
         &git_cmd,
-        &remote_step,
+        &live_remote,
         &no_retry,
         reach,
         judge,
@@ -1456,7 +1736,7 @@ fn land_fixing(world: &World) -> (i32, Vec<String>, Vec<Vec<String>>) {
             },
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
             say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-            remote: &remote_step,
+            remote: &live_remote,
             pause: &no_retry,
         },
     );
@@ -1704,7 +1984,7 @@ fn a_landing_asked_for_a_commit_lands_it_or_nothing() {
                 autofix: &mut |_: &Path, _: &[String]| Ok(()),
                 hand_over: &mut |_, _, _| panic!("nothing is handed over"),
                 say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-                remote: &remote_step,
+                remote: &live_remote,
                 pause: &no_retry,
             },
         );
@@ -1768,7 +2048,7 @@ fn a_push_reported_failed_that_main_took_is_landed() {
         root: &world.work,
         make: &git_cmd,
     };
-    let wire = || Wire::new(&plumbing, &remote_step, &no_retry, &|_| {}, &|| None);
+    let wire = || Wire::new(&plumbing, &live_remote, &no_retry, &|_| {}, &|| None);
     assert_eq!(
         wire().settle(&landing, &onto, "refused"),
         Err("refused".to_owned())
@@ -2111,7 +2391,7 @@ fn an_already_landed_checkout_resumes_without_absorbing_main_or_losing_new_work(
                 autofix: &mut |_: &Path, _: &[String]| Ok(()),
                 hand_over: &mut |_, _, _| panic!("an already-landed checkout hands nothing over"),
                 say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-                remote: &remote_step,
+                remote: &live_remote,
                 pause: &no_retry,
             },
         )
@@ -4782,7 +5062,7 @@ fn a_refused_merge_commit_aborts_the_merge_cleanly() {
                 panic!("a refused merge hands nothing over")
             },
             say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-            remote: &remote_step,
+            remote: &live_remote,
             pause: &no_retry,
         },
     );
@@ -5175,7 +5455,7 @@ fn land_kept(
 #[test]
 fn every_run_end_writes_one_record() {
     use crate::land_record::tests::NOW;
-    let remote: &RemoteStep<'_> = &remote_step;
+    let remote: &RemoteStep<'_> = &live_remote;
     // Every record the runs below leave, journal and spool, for the census.
     let mut planted = Vec::new();
 
@@ -5285,7 +5565,7 @@ fn every_run_end_writes_one_record() {
             moves.set(moves.get() + 1);
             rival_moves(&world, "b/y.txt", &format!("b moved {}\n", moves.get()));
         }
-        remote_step(root, git, tool, args, until, mode)
+        live_remote(root, git, tool, args, until, mode)
     };
     let (code, said) = land_kept(&world, store.records('4'), |_| Ran::Ended(green()), racing);
     assert_eq!(code, STOPPED, "{said:#?}");
@@ -5461,7 +5741,7 @@ fn a_resumed_landing_records_as_the_run_that_handed_it_over() {
                 recheck: &mut |_: &Path, _: &Path, _: &str, _: &Delta| panic!("nothing runs"),
                 hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff"),
                 say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-                remote: &remote_step,
+                remote: &live_remote,
                 pause: &no_retry,
             },
         );
@@ -5575,7 +5855,7 @@ fn an_interrupt_stops_the_landing_before_it_changes_anything() {
             Err("the landing was interrupted while it built the checkout's verifier".into())
         },
         &green,
-        &remote_step,
+        &live_remote,
     );
     assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
     once(&said);
@@ -5602,7 +5882,7 @@ fn an_interrupt_stops_the_landing_before_it_changes_anything() {
         records,
         &mut |_: &Path| Ok(own_image()),
         &green,
-        &remote_step,
+        &live_remote,
     );
     assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
     once(&said);
@@ -5623,7 +5903,7 @@ fn an_interrupt_stops_the_landing_before_it_changes_anything() {
         store.records('3'),
         &mut |_: &Path| panic!("nothing is built after the interrupt"),
         &green,
-        &remote_step,
+        &live_remote,
     );
     assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
     once(&said);
@@ -5643,7 +5923,7 @@ fn an_interrupt_stops_the_landing_before_it_changes_anything() {
             rival_moves_line(&world, 8, "eight");
             signal.set(Some(15));
         }
-        remote_step(root, git, tool, args, until, mode)
+        live_remote(root, git, tool, args, until, mode)
     };
     let (code, said) = land_built(
         &world,
@@ -5691,7 +5971,7 @@ fn a_landing_that_panics_writes_its_end_record() {
             &world,
             store.records('1'),
             |_| panic!("a scripted fault mid-judgment"),
-            &remote_step,
+            &live_remote,
         )
     }));
     assert!(ran.is_err(), "the panic goes on past the record");
@@ -5829,7 +6109,7 @@ fn a_landing_stops_at_its_first_red() {
             autofix: &mut |_: &Path, _: &[String]| Ok(()),
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
             say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-            remote: &remote_step,
+            remote: &live_remote,
             pause: &no_retry,
         },
     );
@@ -5939,4 +6219,65 @@ fn the_verdict_names_the_landing_each_check_the_first_counted_red_and_where_the_
     };
     assert!(verdict(exit::PASS, Some("landing1"), &landed)[0].contains("LANDED landing1"));
     assert!(verdict(exit::COULD_NOT_RUN, None, &Tally::default()).is_empty());
+}
+
+/// A RED LANDING SAYS WHAT THE FOLLOWER LAST SAID OF MAIN, IN ONE LINE: the commit and its
+/// verdict with where it was judged and each red, so a red main already has reads as main's.
+/// Where the follower judged nothing of main's history, or the journal could not be read, the
+/// line says that. NEGATIVE CONTROL: an unread journal is never reported as no verdict.
+#[test]
+fn a_red_landing_says_the_followers_newest_verdict_on_main() {
+    let record = crate::judged::Record {
+        commit: "c0ffee".into(),
+        tree: "t".into(),
+        host: "m86".into(),
+        verifier: String::new(),
+        controller: String::new(),
+        inputs: String::new(),
+        token: "one".into(),
+        state: "red".into(),
+        cause: String::new(),
+        started: 1,
+        updated: 2,
+        lease_until: 0,
+        judge: crate::judged::FOLLOWER.into(),
+        repair: String::new(),
+        repair_assignment: String::new(),
+        repair_started: 0,
+        rows: vec![crate::judged::Row {
+            id: "tree".into(),
+            outcome: "red".into(),
+            log: String::new(),
+            red_items: vec!["aterm-gui --lib a::b".into()],
+            suspects: vec![],
+            fixed_by: None,
+            decisions: vec![],
+        }],
+    };
+    assert_eq!(
+        mains_verdict(Ok(Some(record))),
+        "verify land: the follower's newest verdict on main (refs/aterm/judged): c0ffee red on m86: 1 red: aterm-gui --lib a::b"
+    );
+    assert_eq!(
+        mains_verdict(Ok(None)),
+        "verify land: the follower has filed no verdict on main (refs/aterm/judged)"
+    );
+    assert_eq!(
+        mains_verdict(Err("journal away".into())),
+        "verify land: the follower's verdict on main was not read: journal away"
+    );
+}
+
+/// The finished run's time includes its tree preflight, excludes only its recorded turn wait,
+/// and never mistakes a historical queue rank or an incomplete event tail for elapsed waiting.
+#[test]
+fn completed_judgment_seconds_keep_tree_work_apart_from_queue_wait() {
+    let events = "verify-event: {\"schema\":1,\"event\":\"judgment-turn\",\"since_ms\":1,\"preflight_ms\":2000,\"waited_ms\":3000,\"held\":true}\n";
+    assert_eq!(judging_seconds(events, Duration::from_secs(9)), 6);
+    assert_eq!(
+        judging_seconds(events.trim_end(), Duration::from_secs(9)),
+        9
+    );
+    assert_eq!(judging_seconds("", Duration::from_secs(9)), 9);
+    assert_eq!(judging_seconds(events, Duration::from_secs(1)), 0);
 }

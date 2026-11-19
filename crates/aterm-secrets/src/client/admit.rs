@@ -1201,13 +1201,46 @@ pub fn post_records_to_servers(paths: &Paths) -> crate::Result<usize> {
 /// As [`post_records_to_servers`].
 /// The bytes of `store`'s complete records, each after its parents, for a peer's bundle
 /// ([`Store::read_held`]): a record an open through the vault's head shelved read back for it.
+/// A store whose log is rooted at a final checkpoint hands its roots and stubs after them, as
+/// its reply to a pull that names nothing does ([`crate::membership_log::Log::served`],
+/// [`crate::membership_log::store::read_reply`]): without them the new Mac's records after
+/// the cut wait on parents no member holds. Only a store that reads format 2 is rooted, and
+/// only a reader that states format 2 is handed its log ([`log_bundle`]), which reads the
+/// frame ([`bundle_records`]).
 ///
 /// # Errors
 /// A shelved record does not read back as it was.
 pub(super) fn held_records(store: &crate::membership_log::Store) -> crate::Result<Vec<u8>> {
-    store
+    let mut records = store
         .read_held()
-        .map_err(|e| Error::new(format!("reading this Mac's membership records failed: {e}")))
+        .map_err(|e| Error::new(format!("reading this Mac's membership records failed: {e}")))?;
+    if let Some(served) = store.log().and_then(crate::membership_log::Log::served) {
+        records.extend_from_slice(&served.encode());
+    }
+    Ok(records)
+}
+
+/// The records a member's log bundle carries, at most `limit` of them, each read as `reading`
+/// reads it, and the roots a rooted member hands after them ([`held_records`]). A reader of
+/// format 1 reads records alone, as ever, and refuses a bundle that carries a frame.
+///
+/// # Errors
+/// As [`crate::membership_log::store::decode_records_in`], or the frame does not read
+/// ([`crate::membership_log::store::decode_reply`]).
+pub(super) fn bundle_records(
+    records: &[u8],
+    limit: usize,
+    reading: crate::membership_log::Reading,
+) -> crate::Result<(
+    Vec<crate::membership_log::Record>,
+    Option<crate::membership_log::Served>,
+)> {
+    if reading.admits_two() {
+        crate::membership_log::store::decode_reply(records, limit, reading)
+    } else {
+        crate::membership_log::store::decode_records_in(records, limit, reading)
+            .map(|records| (records, None))
+    }
 }
 
 pub(super) fn post_records_to_servers_by(paths: &Paths, by: Instant) -> crate::Result<usize> {
@@ -1344,6 +1377,7 @@ fn write_log_bundle(
         entries,
         digest,
         requires_crossed_mark,
+        follows_format,
         afresh,
     } = checked_log_bundle(paths, bundle)?;
     if afresh && moving == Moving::Refused && super::config(paths)?.is_some() {
@@ -1356,7 +1390,7 @@ fn write_log_bundle(
             admission.check(paths)?;
         }
         let mut state = state;
-        super::records_file_for_write(paths, &store)?;
+        super::ready_records_entry(paths, &store)?;
         // A bundle of another vault than the one this Mac's state holds (one that let it go, or
         // one it waits to be let into) starts that vault afresh before its records are written,
         // so their write acknowledges them as the new vault's first history. Every check of that
@@ -1385,14 +1419,32 @@ fn write_log_bundle(
         handover::keep_allowed(paths, &bundle.allowed)?;
         Ok(report)
     };
-    if requires_crossed_mark {
+    let marked = || {
+        if requires_crossed_mark {
+            if let Some(admission) = admission {
+                admission.check(paths)?;
+            }
+            super::after_crossed_mark(&super::crossing_mark(paths), publish)
+        } else {
+            publish()
+        }
+    };
+    // The format mark before the crossed one and before the configuration and the records: a
+    // Mac that dies after it states format 2 and holds what it held.
+    #[cfg(unix)]
+    if follows_format {
         if let Some(admission) = admission {
             admission.check(paths)?;
         }
-        super::after_crossed_mark(&super::crossing_mark(paths), publish)
-    } else {
-        publish()
+        return crate::membership_log::follow::take_on_evidence(
+            &super::format_mark(paths),
+            &store,
+            marked,
+        );
     }
+    #[cfg(not(unix))]
+    let _ = follows_format;
+    marked()
 }
 
 /// Whether this Mac takes a member's join bundle, by every check its write runs
@@ -1418,6 +1470,10 @@ struct CheckedLog {
     entries: Vec<Entry>,
     digest: [u8; 32],
     requires_crossed_mark: bool,
+    /// The bundle's member states format 2 and this Mac, which states format 1, follows the
+    /// vault there by it (`crate::membership_log::follow`): its write stores the format mark
+    /// before anything else.
+    follows_format: bool,
     /// The bundle configures another vault than the one this Mac's state holds, and its write
     /// starts that vault afresh (`client::forget_vault_left`).
     afresh: bool,
@@ -1441,6 +1497,21 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
     };
     let previous = load_records(paths)?;
     let local = records_bound(paths, &previous)?;
+    // A member that states format 2 hands a Mac that states format 1 records it takes only by
+    // following the vault there (`crate::membership_log::follow`): where this Mac's build reads
+    // format 2 it takes the bundle as a format-2 reader would, into a store nothing reads yet,
+    // and its write stores the format mark first, on the evidence that store holds.
+    #[cfg(unix)]
+    let follows_format = local.format == crate::crossing::FORMAT_ONE
+        && source.is_some_and(|source| source.format == crate::crossing::FORMAT_TWO)
+        && super::format_mark(paths).follows();
+    #[cfg(not(unix))]
+    let follows_format = false;
+    let local = if follows_format {
+        local.at_format(crate::crossing::FORMAT_TWO)
+    } else {
+        local
+    };
     if let Some(why) = crate::members::bundle::source_refusal(local, *source) {
         return Err(Error::new(why));
     }
@@ -1451,7 +1522,17 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
             (local.held as usize).min(crate::membership_log::LEGACY_RECORDS)
         })
     });
-    let decoded = crate::membership_log::store::decode_records_bounded(records, limit)?;
+    // The format this Mac reads the bundle's records at: a follow copy's where it follows the
+    // vault by this bundle, and its own everywhere else (`client::records_reading`), which is
+    // format 2 once its mark names it on a build that reads it. So a Mac that stored its mark
+    // and died before its files, or one that left a format-2 vault, takes a format-2 member's
+    // bundle again; a Mac with no mark reads format 1, as ever.
+    let reading = if follows_format {
+        crate::membership_log::Reading::Follow
+    } else {
+        super::records_reading(paths)?
+    };
+    let (decoded, served) = bundle_records(records, limit, reading)?;
     let offered: std::collections::BTreeSet<_> =
         decoded.iter().map(|record| *record.id()).collect();
     let current = config(paths)?;
@@ -1502,8 +1583,9 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
     } else {
         records_store_for(Some(&config))?.1
     };
+    store = store.read_at(reading);
     store
-        .ingest_records(decoded)
+        .ingest_served(decoded, served.as_ref())
         .map_err(|error| Error::new(format!("the member's records: {error}")))?;
     let mut carried = std::collections::BTreeSet::new();
     if let (Some(own), Some(incoming)) = (previous.log(), store.log())
@@ -1521,6 +1603,21 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
     if !offered.is_subset(&retained) || !carried.is_subset(&retained) {
         return Err(Error::new(
             "the member's join bundle cannot be retained in full",
+        ));
+    }
+    // What the member states of its records is no evidence of their format: a bundle that
+    // states format 2 and holds no version-2 record a seat signed is refused before this Mac
+    // acknowledges it, and stores no mark.
+    #[cfg(unix)]
+    if follows_format {
+        if !crate::membership_log::follow::holds_evidence(&super::format_mark(paths), &store) {
+            return Err(Error::new(
+                "the member's bundle states membership records of format 2 and holds no record \
+                 of that format a seat signed",
+            ));
+        }
+        store = store.read_at(crate::membership_log::Reading::Format(
+            crate::crossing::FORMAT_TWO,
         ));
     }
     let learned_complete = store
@@ -1610,6 +1707,7 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
         entries,
         digest,
         requires_crossed_mark,
+        follows_format,
         afresh,
     })
 }

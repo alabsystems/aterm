@@ -184,6 +184,7 @@ fn loss_time_tracks_authentication_context_and_allows_record_metadata() {
         .unwrap();
     assert_eq!(idle.lost_seen(&old, login_wall(), 10), Some(10));
     let mut next = AccountLook {
+        model: old.model,
         screen_wall: None,
         profile_env: old.profile_env.clone(),
         token_served: old.token_served,
@@ -224,6 +225,7 @@ fn local_case(case: i64) -> [i64; 3] {
             at: 17,
         });
         AccountLook {
+            model: aterm_agent::harness::accounts::ModelWeek::Unread,
             screen_wall: None,
             profile_env: Vec::new(),
             token_served: ServedToken::Unnamed(None),

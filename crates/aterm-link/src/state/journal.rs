@@ -27,11 +27,28 @@
 //! in flight carry their heads there ([`PublishPin::at`], [`InFlight::at`]: `at <n>`, and
 //! `pin-at <n>` for an entry's pin; `any` for [`super::Head::Anywhere`], which a build before
 //! ATERM-KI-1114-1414 cannot read, and `own<n>` for [`super::Head::OwnFrom`], every keyed
-//! re-post's own head, which a build before it cannot), the one fact
-//! this build adds to the B19 record, so a journal this build wrote reads the same, record for
-//! record, to a build of the journal before it, whose parse of a body is strict (aterm-link B05
-//! review). A tail this build cannot read is no head: the record reads without one, and is not
-//! read back before it is published again.
+//! re-post's own head, which a build before it cannot), the one fact this build adds to the B19
+//! record, so a journal this build wrote reads the same, record for record, to a build of the
+//! journal before it, whose parse of a body is strict (aterm-link B05 review). A tail this build
+//! cannot read is no head: the record reads without one, and is not read back before it is
+//! published again. Every build of the heads reads a tail as `at` and `pin-at` pairs, each once,
+//! and a tail with any other pair as no head at all (main at 928adfca967, ATERM-KI-1114-1414's
+//! steps S1 to S5, among them), so no fact a build of the heads would skip can ride a tail.
+//!
+//! AN ENTRY'S OWN LOG ([`InFlight::own_log`], ATERM-KI-1114-1414's step S6) IS A RECORD OF ITS
+//! OWN ([`Frame::OwnLog`]), written right before the entry's in the same write
+//! ([`Frame::records`]): `retire own-log <seq>`, its tail `log <id> at <n>`, and `pin-at <n>`
+//! where the entry's pin had a head there. A build before the step reads it as the retirement of
+//! a post of [`OWN_LOG`], a session no aterm names (none is a tab ID, and this build reserves no
+//! post under it), which changes nothing, and then the entry's record with every head it reads:
+//! an own log named in the entry's own tail, as the step's third build wrote it, made such a
+//! build read that entry with no head at all (the step's third review, confirmed). This build
+//! reads it as the own log of the entry the next record journals at `<seq>` ([`Index::apply`]),
+//! and as none where the next record is not that entry, or is one on that log; a journal that
+//! ends at it ends in an append cut short ([`read_as`], [`End::Cut`]), so the next write rewrites
+//! the journal without it. A build before the step that rewrites the journal from its index (its
+//! compaction, a stop's hand-off) writes no own log: this build then reads the entry where that
+//! build left it, with its heads and no own log.
 //!
 //! ONE CODEC, MORE THAN ONE JOURNAL: what a fact's record is ([`Record`]) and what a run of them
 //! says ([`Replay`]) are the only things a journal of its own supplies; the framing, the read
@@ -48,7 +65,7 @@ use astream_wire::steps::{
     decode_step_header, encode_step_header, scan_steps_from, StepEnd, STEP_HEADER,
 };
 
-use super::{Head, InFlight, PublishPin};
+use super::{Head, InFlight, OwnLog, PublishPin};
 
 /// The journal's directory in the state dir.
 pub(crate) const DIR: &str = "journal";
@@ -93,6 +110,16 @@ pub(crate) trait Replay: Default {
 
     /// What it says after `record`.
     fn apply(&mut self, record: Self::Record);
+
+    /// Whether the last record applied begins a fact only the record after it completes (the
+    /// post journal's [`Frame::OwnLog`]): a run of records that ends there ends inside one
+    /// append, cut short ([`read_as`]).
+    fn begun(&self) -> bool {
+        false
+    }
+
+    /// Forget what the last record applied began ([`Replay::begun`]).
+    fn drop_begun(&mut self) {}
 }
 
 /// One fact the journal records.
@@ -121,7 +148,17 @@ pub(crate) enum Frame {
     /// An attach of this build took this incarnation: written before the incarnation lease
     /// (`inc-lease`) says so ([`super::StateDir::take_incarnation`]).
     Attached(u64),
+    /// THE OWN LOG OF THE ENTRY THE NEXT RECORD JOURNALS AT `seq` ([`InFlight::own_log`], the
+    /// module's AN ENTRY'S OWN LOG): never a fact of its own, only the record [`Frame::records`]
+    /// writes right before an entry that keeps one, which a build before it reads as a
+    /// retirement that changes nothing.
+    OwnLog { seq: u64, own: OwnLog },
 }
+
+/// The session an own log's record names ([`Frame::OwnLog`]): one no aterm names, since it is no
+/// tab ID (`aterm_types::tab_id`), and one this build reserves no post under ([`Frame::parse`]),
+/// so a build before the own log reads that record as a retirement of nothing.
+pub(crate) const OWN_LOG: &str = "own-log";
 
 /// Whether `sid` can name a session in a frame: what `sent/<sid>.<id>` could hold.
 fn is_sid(sid: &str) -> bool {
@@ -148,7 +185,34 @@ impl Frame {
         match self {
             Self::Reserve { sid, id, .. } => Some(format!("sent/{sid}.{id}")),
             Self::InFlight(entry) => Some(format!("inflight/{}", entry.pin.seq)),
-            Self::Retire { .. } | Self::Landed(_) | Self::Dropped(_) | Self::Attached(_) => None,
+            Self::Retire { .. }
+            | Self::Landed(_)
+            | Self::Dropped(_)
+            | Self::Attached(_)
+            | Self::OwnLog { .. } => None,
+        }
+    }
+
+    /// The records this fact is written as, in order: its own, but an entry in flight that keeps
+    /// an own log ([`InFlight::own_log`]) is written as that own log's record
+    /// ([`Frame::OwnLog`]) and then its own without it, which every build of the heads reads
+    /// with each head it reads (the module's AN ENTRY'S OWN LOG).
+    pub(crate) fn records(&self) -> Vec<Self> {
+        match self {
+            Self::InFlight(entry) => match entry.own_log {
+                Some(own) => vec![
+                    Self::OwnLog {
+                        seq: entry.pin.seq,
+                        own,
+                    },
+                    Self::InFlight(InFlight {
+                        own_log: None,
+                        ..entry.clone()
+                    }),
+                ],
+                None => vec![self.clone()],
+            },
+            _ => vec![self.clone()],
         }
     }
 
@@ -168,14 +232,22 @@ impl Frame {
     }
 
     /// This frame with the heads `tail` names (see [`Frame`]'s [`Record::tail`]); a tail this
-    /// build cannot read names none.
+    /// build cannot read names none. A retirement of [`OWN_LOG`]'s whose tail names an own log
+    /// is that own log's record ([`Frame::OwnLog`]); one whose tail names none stays the
+    /// retirement of nothing every build of the heads reads it as.
     fn with_tail(mut self, tail: &[u8]) -> Self {
+        let words: Vec<&str> = std::str::from_utf8(tail)
+            .map(|text| text.split_ascii_whitespace().collect())
+            .unwrap_or_default();
+        if let Self::Retire { sid, id } = &self {
+            if sid == OWN_LOG {
+                let seq = *id;
+                return own_log_of(&words).map_or(self, |own| Self::OwnLog { seq, own });
+            }
+        }
         let mut at = None;
         let mut pin_at = None;
-        let words: Option<Vec<&str>> = std::str::from_utf8(tail)
-            .ok()
-            .map(|text| text.split_ascii_whitespace().collect());
-        for pair in words.as_deref().unwrap_or_default().chunks(2) {
+        for pair in words.chunks(2) {
             let (slot, value) = match pair {
                 ["at", n] if at.is_none() => (&mut at, n),
                 ["pin-at", n] if pin_at.is_none() => (&mut pin_at, n),
@@ -208,7 +280,7 @@ impl Frame {
         let mut words = rest.splitn(3, ' ');
         match head {
             "reserve" => {
-                let sid = words.next().filter(|s| is_sid(s))?;
+                let sid = words.next().filter(|s| is_sid(s) && *s != OWN_LOG)?;
                 let id = number(words.next()?)?;
                 let pin = PublishPin::parse(words.next()?).ok()?;
                 Some(Self::Reserve {
@@ -244,14 +316,23 @@ impl Record for Frame {
             Self::Landed(seq) => format!("landed {seq}"),
             Self::Dropped(seq) => format!("dropped {seq}"),
             Self::Attached(inc) => format!("attached {inc}"),
+            Self::OwnLog { seq, .. } => format!("retire {OWN_LOG} {seq}"),
         }
     }
 
-    /// Its heads, as words (the module's A RECORD'S TAIL).
+    /// Its heads, as words (the module's A RECORD'S TAIL); an own log's record, the own log
+    /// (the module's AN ENTRY'S OWN LOG).
     fn tail(&self) -> String {
         let (at, pin_at) = match self {
             Self::Reserve { pin, .. } => (pin.at, None),
             Self::InFlight(entry) => (entry.at, entry.pin.at),
+            Self::OwnLog { own, .. } => {
+                let mut words = format!("log {} at {}", own.log, own.at.word());
+                if let Some(at) = own.pin_at {
+                    words.push_str(&format!(" pin-at {}", at.word()));
+                }
+                return words;
+            }
             Self::Retire { .. } | Self::Landed(_) | Self::Dropped(_) | Self::Attached(_) => {
                 (None, None)
             }
@@ -270,6 +351,25 @@ impl Record for Frame {
     fn of_record(body: &[u8], tail: &[u8]) -> Option<Self> {
         Some(Self::parse(body)?.with_tail(tail))
     }
+}
+
+/// The own log an own log's record's tail names (`log <id> at <n>`, and `pin-at <n>`, each once:
+/// the module's AN ENTRY'S OWN LOG), `None` for any other tail.
+fn own_log_of(words: &[&str]) -> Option<OwnLog> {
+    let (mut log, mut at, mut pin_at) = (None, None, None);
+    for pair in words.chunks(2) {
+        match pair {
+            ["log", id] if log.is_none() => log = Some(astream_broker::LogIdentity::parse(id)?),
+            ["at", n] if at.is_none() => at = Some(Head::of_word(n)?),
+            ["pin-at", n] if pin_at.is_none() => pin_at = Some(Head::of_word(n)?),
+            _ => return None,
+        }
+    }
+    Some(OwnLog {
+        log: log?,
+        at: at?,
+        pin_at,
+    })
 }
 
 /// `frame` as the record at `step`: its body, then its tail (the module's A RECORD'S TAIL). A
@@ -306,6 +406,25 @@ pub(crate) fn encode<R: Record>(step: u64, frame: &R) -> io::Result<Vec<u8>> {
     })
 }
 
+/// `frames` as the records from `step` on, each fact as the records it is written as
+/// ([`Frame::records`], [`encode`]). Returns the bytes and the step after the last.
+///
+/// # Errors
+/// As [`encode`].
+pub(crate) fn encode_frames<'a>(
+    mut step: u64,
+    frames: impl IntoIterator<Item = &'a Frame>,
+) -> io::Result<(Vec<u8>, u64)> {
+    let mut bytes = Vec::new();
+    for frame in frames {
+        for record in frame.records() {
+            bytes.extend_from_slice(&encode(step, &record)?);
+            step += 1;
+        }
+    }
+    Ok((bytes, step))
+}
+
 /// The fact of the intact record whose body is `body` in `bytes` (a range a step scan of
 /// `bytes` gave): its body read with its tail, the bytes from the body's end to its frame's.
 fn record<R: Record>(bytes: &[u8], body: &std::ops::Range<usize>) -> Option<R> {
@@ -330,6 +449,9 @@ pub(crate) struct Index {
     /// The newest incarnation an attach of this build took ([`Frame::Attached`]); `None` in a
     /// journal no attach named.
     pub(crate) attached: Option<u64>,
+    /// The own log the last record applied named, by sequence, for the entry the next one
+    /// journals ([`Frame::OwnLog`]); `None` after every other record, and after a read.
+    pub(super) own_log_next: Option<(u64, OwnLog)>,
 }
 
 impl Index {
@@ -339,6 +461,7 @@ impl Index {
         in_flight: BTreeMap::new(),
         in_flight_order: Vec::new(),
         attached: None,
+        own_log_next: None,
     };
 
     /// Whether it holds no reservation and no record in flight.
@@ -366,9 +489,14 @@ impl Index {
             .map(|seq| (*seq, &self.in_flight[seq]))
     }
 
-    /// The index after `frame`.
+    /// The index after `frame`. An own log's record ([`Frame::OwnLog`]) is the own log of the
+    /// entry the next record journals at its sequence, where that entry is not on that log (an
+    /// entry back on its own log keeps none), and of no entry where the next record is any
+    /// other (the module's AN ENTRY'S OWN LOG).
     pub(crate) fn apply(&mut self, frame: Frame) {
+        let own_log = self.own_log_next.take();
         match frame {
+            Frame::OwnLog { seq, own } => self.own_log_next = Some((seq, own)),
             Frame::Reserve { sid, id, pin } => {
                 self.reserved.entry(sid).or_default().insert(id, pin);
             }
@@ -380,8 +508,13 @@ impl Index {
                     }
                 }
             }
-            Frame::InFlight(entry) => {
+            Frame::InFlight(mut entry) => {
                 let seq = entry.pin.seq;
+                if let Some((_, own)) =
+                    own_log.filter(|(of, own)| *of == seq && entry.log != Some(own.log))
+                {
+                    entry.own_log = entry.own_log.or(Some(own));
+                }
                 let same = self.in_flight.get(&seq).is_some_and(|was| {
                     match (&was.pin.identity, &entry.pin.identity) {
                         (Some(was), Some(now)) => was == now,
@@ -405,13 +538,13 @@ impl Index {
     }
 
     /// The records a journal holding exactly this index opens with, from `step`: the attach it
-    /// names, then every reservation, then every record in flight. Returns the bytes and
-    /// the step after the last.
+    /// names, then every reservation, then every record in flight, each with its own log's
+    /// record before it where it keeps one ([`Frame::records`]). Returns the bytes and the step
+    /// after the last.
     ///
     /// # Errors
     /// A record past a step record's payload cap ([`encode`]).
-    pub(crate) fn encode_from(&self, mut step: u64) -> io::Result<(Vec<u8>, u64)> {
-        let mut bytes = Vec::new();
+    pub(crate) fn encode_from(&self, step: u64) -> io::Result<(Vec<u8>, u64)> {
         let attached = self.attached.map(Frame::Attached);
         let reserved = self.pins().map(|(sid, id, pin)| Frame::Reserve {
             sid: sid.to_string(),
@@ -421,11 +554,12 @@ impl Index {
         let in_flight = self
             .in_publication_order()
             .map(|(_, entry)| Frame::InFlight(entry.clone()));
-        for frame in attached.into_iter().chain(reserved).chain(in_flight) {
-            bytes.extend_from_slice(&encode(step, &frame)?);
-            step += 1;
-        }
-        Ok((bytes, step))
+        let frames: Vec<Frame> = attached
+            .into_iter()
+            .chain(reserved)
+            .chain(in_flight)
+            .collect();
+        encode_frames(step, &frames)
     }
 
     /// The journal that holds exactly this index, its steps from 0 ([`Index::encode_from`]).
@@ -442,6 +576,14 @@ impl Replay for Index {
 
     fn apply(&mut self, record: Frame) {
         Self::apply(self, record);
+    }
+
+    fn begun(&self) -> bool {
+        self.own_log_next.is_some()
+    }
+
+    fn drop_begun(&mut self) {
+        self.own_log_next = None;
     }
 }
 
@@ -490,15 +632,21 @@ pub(crate) fn read(bytes: &[u8]) -> Read {
 
 /// Read a journal's bytes: the longest intact run of records from step 0
 /// ([`astream_wire::steps::scan_steps_from`]), applied in order, and what ended it. An intact
-/// record whose body this build cannot read ends the run as a fault at that record.
+/// record whose body this build cannot read ends the run as a fault at that record. A run whose
+/// last record begins a fact only the next completes ([`Replay::begun`]: the post journal's own
+/// log, [`Frame::OwnLog`]) ends inside the append that wrote both: what it began is dropped, and
+/// the run ends where that record starts, cut short ([`End::Cut`]) where nothing broken follows
+/// it, so the next write rewrites the journal without it.
 #[must_use]
 pub(crate) fn read_as<I: Replay>(bytes: &[u8]) -> Read<I> {
     let scan = scan_steps_from(bytes, 0);
     let mut index = I::default();
     let mut next_step = 0u64;
+    let mut begun = None;
     for (step, body) in &scan.steps {
+        let at = body.start.saturating_sub(HEADER_SIZE + STEP_HEADER) as u64;
         let Some(frame) = record::<I::Record>(bytes, body) else {
-            let at = body.start.saturating_sub(HEADER_SIZE + STEP_HEADER) as u64;
+            index.drop_begun();
             return Read {
                 index,
                 valid_len: at,
@@ -513,10 +661,11 @@ pub(crate) fn read_as<I: Replay>(bytes: &[u8]) -> Read<I> {
             };
         };
         index.apply(frame);
+        begun = index.begun().then_some((at, *step));
         next_step = step.saturating_add(1);
     }
-    let valid_len = scan.valid_len as u64;
-    let end = match scan.end {
+    let mut valid_len = scan.valid_len as u64;
+    let mut end = match scan.end {
         StepEnd::Clean => End::Clean,
         StepEnd::Torn if cut_short(&bytes[scan.valid_len..], next_step) => End::Cut,
         StepEnd::Torn => End::Torn,
@@ -525,6 +674,16 @@ pub(crate) fn read_as<I: Replay>(bytes: &[u8]) -> Read<I> {
             why: kind.to_string(),
         },
     };
+    if let Some((at, step)) = begun {
+        index.drop_begun();
+        if !matches!(end, End::Fault { .. }) {
+            valid_len = at;
+            next_step = step;
+            if end == End::Clean {
+                end = End::Cut;
+            }
+        }
+    }
     Read {
         index,
         valid_len,
@@ -570,6 +729,8 @@ pub(crate) fn salvage_as<I: Replay>(bytes: &[u8]) -> I {
             index.apply(frame);
             first = step.saturating_add(1);
         }
+        // What a run's last record began, the record after it damaged or missing, is no fact.
+        index.drop_begun();
         if !stopped_early && scan.end == StepEnd::Clean {
             break;
         }

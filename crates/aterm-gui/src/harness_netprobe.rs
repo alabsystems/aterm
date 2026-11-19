@@ -1102,6 +1102,27 @@ pub(crate) fn route_of_agent(pid: u32, argv: &[String], cwd: &str) -> Route {
     ))
 }
 
+/// Every Claude Code settings document agent `pid` reads, highest precedence first: under its own
+/// environment (its `CLAUDE_CONFIG_DIR` or home), its line's `--settings`, its launch directory
+/// and this Mac's managed settings, the documents the route's reader reads ([`gather`]). An
+/// environment that cannot be read is one document that cannot be read, so nothing it may pin
+/// reads as pinning nothing (`turn_end::ModelPins::of`).
+pub(crate) fn settings_of_agent(pid: u32, argv: &[String], cwd: &str) -> Vec<(String, Source)> {
+    let env = atpkg::caller_shell::process_args(pid).map(|a| a.env);
+    if env.is_none() {
+        return vec![("the agent's environment".to_string(), Source::Unreadable)];
+    }
+    gather(
+        env,
+        argv,
+        Path::new(cwd),
+        claude_settings::MANAGED_DIR.map(Path::new),
+        Path::new(claude_settings::MANAGED_PREFERENCES_DIR),
+        aterm_types::dirs::home_dir().as_deref(),
+    )
+    .settings
+}
+
 /// Reads agent `pid`'s launch's route variables from its environment and Claude Code settings
 /// ([`netwatch::launch_env`]), or why they name no one route.
 pub(crate) fn launch_env_of_agent(

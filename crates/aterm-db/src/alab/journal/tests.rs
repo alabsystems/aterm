@@ -44,6 +44,7 @@ fn ev(t: u64, kind: Kind, account: Pk) -> Event {
         cli: Word::new("claude").unwrap(),
         sub: None,
         window: None,
+        model: None,
         pct_x10: None,
         reset: None,
         res: None,
@@ -113,7 +114,7 @@ fn no_event_word_can_carry_an_address_url_or_free_text() {
         cli: Word::new("aterm").unwrap(),
         src: Source::File,
         op: Word::new("0123456789abcdef"),
-        via: Word::new("set"),
+        via: Some(Via::Set),
         program: Word::new("claude"),
         ..ev(1, Kind::Auth, pk("ann@example.test"))
     };
@@ -141,12 +142,12 @@ fn no_event_word_can_carry_an_address_url_or_free_text() {
             set(&mut value, key, Value::from(text.as_str()));
             if let Some(event) = Event::from_value(&value) {
                 let word = match key {
-                    "op" => event.op,
-                    "via" => event.via,
-                    _ => event.program,
+                    "op" => event.op.map(|word| word.as_str().to_owned()),
+                    "via" => event.via.map(|via| via.word().to_owned()),
+                    _ => event.program.map(|word| word.as_str().to_owned()),
                 };
                 let word = word.unwrap();
-                assert!(plain(word.as_str()), "decoded {key} {text:?}");
+                assert!(plain(&word), "decoded {key} {text:?}");
                 if key == "op" {
                     assert!(
                         word.as_str().len() == 16
@@ -198,6 +199,65 @@ fn no_event_word_can_carry_an_address_url_or_free_text() {
         String::from_utf8_lossy(&buf[..n])
     );
     assert_eq!(Event::from_line(&buf[..n]), Some(event));
+    // The widest wall: a sub-account's own week of a model, Fable's bucket the longest word. A
+    // bucket is a closed word, `_` its only byte no other word holds.
+    let model_wall = Event {
+        cli: Word::new("codex-alab").unwrap(),
+        sub: Word::new("0123456789ab"),
+        model: Some(ModelBucket::Fable),
+        src: Source::SessionUsage,
+        ..wall(
+            9_999_999_999 - 3600,
+            pk("ann@example.test"),
+            Window::WeekModel,
+            9_999_999_999,
+        )
+    };
+    let mut wall_buf = [0; MAX_EVENT];
+    let n = model_wall.encode(&mut wall_buf).unwrap();
+    assert!(
+        wall_buf[..n]
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_\":,{}".contains(b)),
+        "{}",
+        String::from_utf8_lossy(&wall_buf[..n])
+    );
+    assert_eq!(Event::from_line(&wall_buf[..n]), Some(model_wall));
+    // Only a model's own weekly wall, or its clearing, names a model, and only a known one.
+    let named = model_wall.to_value();
+    for (key, to, why) in [
+        ("w", json!("7d"), "an account-wide wall"),
+        ("k", json!("quota"), "a reading"),
+        ("m", json!("seven_day_haiku"), "an unknown bucket"),
+        ("m", json!("ada@x.example"), "an address"),
+    ] {
+        let mut value = named.clone();
+        set(&mut value, key, to);
+        assert_eq!(Event::from_value(&value), None, "{why}");
+    }
+    let cleared = Event {
+        kind: Kind::WallCleared,
+        until: None,
+        model: Some(ModelBucket::Opus),
+        ..model_wall
+    };
+    assert_eq!(Event::from_value(&cleared.to_value()), Some(cleared));
+    // A refill of a model's own week names its model (FL-271); a refill of any other window
+    // names none.
+    let refilled = Event {
+        kind: Kind::ResetUsed,
+        until: None,
+        model: Some(ModelBucket::Sonnet),
+        ..model_wall
+    };
+    assert_eq!(Event::from_value(&refilled.to_value()), Some(refilled));
+    let mut week_refill = refilled.to_value();
+    set(&mut week_refill, "w", json!("7d"));
+    assert_eq!(
+        Event::from_value(&week_refill),
+        None,
+        "a refill of the account's week names no model"
+    );
     // One past the cap is refused whole, never cut mid-word.
     let wider = Event {
         why: Word::new("reset-failed-now"),
@@ -212,6 +272,90 @@ fn no_event_word_can_carry_an_address_url_or_free_text() {
     let mut at = event.to_value();
     set(&mut at, "c", json!("ann@proton.example"));
     assert_eq!(Event::from_value(&at), None, "an address is refused");
+}
+
+/// A `decided` holds only its own shape, in closed words (docs/DESIGN-shared-files-2026-11-11.md
+/// §5): its verb is one of [`Via`]'s six, its author a word of `aterm file --by`'s grammar
+/// (`[a-z][a-z0-9-]{0,19}`), its CLI `aterm` and its source `file`, and it names nothing else.
+/// A peer's line that breaks any of it is refused whole, as an unknown kind is; `file` is no
+/// other kind's source. Every verb the publisher writes and a twenty-byte author read back.
+///
+/// NEGATIVE CONTROL, observed: with `from_value`'s two `decided` shape checks removed (its
+/// source, and its CLI and no other field), a decided of another CLI is read:
+/// `` left: Some(Event { .., cli: claude, .. }) right: None `` at `a decided of another CLI`.
+#[test]
+fn a_decided_holds_only_its_own_closed_shape() {
+    let decided = Event {
+        kind: Kind::Decided,
+        account: None,
+        cli: Word::new(event::DECIDED_CLI).unwrap(),
+        src: Source::File,
+        op: Word::new("0123456789abcdef"),
+        via: Some(Via::Set),
+        program: Word::new("person"),
+        ..ev(1, Kind::Auth, pk("ann@example.test"))
+    };
+    for via in Via::ALL {
+        let each = Event {
+            via: Some(*via),
+            ..decided
+        };
+        assert_eq!(Event::from_value(&each.to_value()), Some(each), "{via:?}");
+    }
+    assert_eq!(
+        Via::WORDS,
+        ["set", "add", "rm", "revert", "resolve", "state"]
+    );
+    let longest = Event {
+        program: Word::new("a1234567890123456789"),
+        ..decided
+    };
+    assert_eq!(
+        Event::from_value(&longest.to_value()),
+        Some(longest),
+        "the longest --by word"
+    );
+    let account = pk("ann@example.test").as_str().to_owned();
+    for (key, to, why) in [
+        ("via", json!("anything-at-all"), "a verb no build writes"),
+        (
+            "via",
+            json!("commit"),
+            "a face's commit is named by its writes",
+        ),
+        ("pg", json!("0-x"), "an author with a leading digit"),
+        ("pg", json!("-x"), "an author with a leading hyphen"),
+        (
+            "pg",
+            json!("a12345678901234567890"),
+            "an author past twenty bytes",
+        ),
+        ("c", json!("claude"), "a decided of another CLI"),
+        ("src", json!("statusline"), "a decided from another source"),
+        ("a", json!(account), "a decided naming an account"),
+        ("w", json!("5h"), "a decided naming a window"),
+        ("p", json!(500), "a decided naming a figure"),
+        ("r", json!(2), "a decided naming a reset"),
+        ("rr", json!("exact"), "a decided naming a resolution"),
+        ("u", json!(2), "a decided naming a wall's end"),
+        ("plan", json!("max"), "a decided naming a plan"),
+        ("why", json!("ok"), "a decided naming a reason"),
+        ("to", json!(account), "a decided naming another account"),
+        ("s", json!("0123456789ab"), "a decided naming a workspace"),
+        ("x", json!("0123abcd"), "a decided naming a tab"),
+        ("h", json!("claude"), "a decided naming a harness"),
+    ] {
+        let mut value = decided.to_value();
+        set(&mut value, key, to);
+        assert_eq!(Event::from_value(&value), None, "{why}");
+    }
+    let mut other = ev(1, Kind::Auth, pk("ann@example.test")).to_value();
+    set(&mut other, "src", json!("file"));
+    assert_eq!(
+        Event::from_value(&other),
+        None,
+        "`file` is a decided's source alone"
+    );
 }
 
 /// The journal's schemas compile, and every reference in them names a collection the registry
@@ -258,9 +402,9 @@ fn journal_references_name_live_registry_collections() {
     assert_eq!(dangling, Vec::<String>::new());
 }
 
-/// The worst-case `use` row fits its 1,536 B cap whole, and over a smaller cap it keeps
-/// standing walls first, then readings newest first, and drops lapsed walls first (design
-/// §4.17, the `fit` priority).
+/// The worst-case `use` row (a model's week walled on Fable's, the longest bucket word) fits its
+/// 1,536 B cap whole, and over a smaller cap it keeps standing walls first, then readings newest
+/// first, and drops lapsed walls first (design §4.17, the `fit` priority).
 /// NEGATIVE CONTROL: with `use_row` sorting readings oldest first (`sort_by_key(|e| e.t)`),
 /// the newest reading is the one dropped: `` the newest reading stays `` (its message).
 #[test]
@@ -276,11 +420,13 @@ fn a_use_row_fits_its_cap_in_the_stated_priority() {
             plan: Word::new("max-20x"),
             ..quota(t, ann, *window, 1000 - n as u16)
         });
-        // Standing walls for half the windows, lapsed ones for the rest.
+        // Standing walls for half the windows, lapsed ones for the rest; a model's week names
+        // its model (FL-269), Fable's the longest word.
         let until = if n % 2 == 0 { now + 86_400 } else { now - 60 };
         facts.fold(&Event {
             until: Some(until),
             window: Some(*window),
+            model: (*window == Window::WeekModel).then_some(ModelBucket::Fable),
             ..ev(t, Kind::Wall, ann)
         });
     }
@@ -1264,9 +1410,13 @@ fn torn_book_recovers_sum_counter_and_mismatched_relay_bucket_keys_are_ignored()
             })),
         }];
         let request = crate::typed::request_id(APPLICATION, ROLE, &changes).unwrap();
-        let payload = crate::database::Command::Write { request, changes }
-            .encode()
-            .unwrap();
+        let payload = crate::database::Command::Write {
+            request,
+            changes,
+            said: None,
+        }
+        .encode()
+        .unwrap();
         directory
             .append_journal(&session, w2 + 30, w2 + 30, &payload)
             .unwrap()
@@ -2474,6 +2624,7 @@ fn login(account: Pk, since: u64) -> mine::Login {
         attempt_at: None,
         attempt_route: None,
         plan: Word::new("max"),
+        cred: None,
     }
 }
 
@@ -2701,7 +2852,8 @@ fn the_flusher_states_this_macs_login_and_usage_rows_beside_its_use_and_place_ro
     assert_eq!(
         usage,
         json!({"r": 1, "n": n1, "account": ann.as_str(), "w5h": 130, "w7d": 420,
-            "w5h_reset": (t0 + 3490) * 1000, "w7d_reset": (t0 + 3490) * 1000, "wall": "none",
+            "w5h_reset": (t0 + 3490) * 1000, "w7d_reset": (t0 + 3490) * 1000,
+            "w5h_res": "exact", "w7d_res": "exact", "wall": "none",
             "src": "statusline", "read_at": (t0 - 110) * 1000, "at": t0 * 1000,
             "sessions_7d": 1, "last_start": (t0 - 120) * 1000})
     );
@@ -2904,6 +3056,437 @@ fn the_flusher_states_this_macs_login_and_usage_rows_beside_its_use_and_place_ro
     );
 }
 
+/// Every 8-byte window of each of `values` (made-up credential values a fixture holds) that is
+/// in `text`, where `text` is what a Mac stated or published: none, or the windows found.
+fn value_windows<'a>(values: &[&'a str], text: &str) -> Vec<&'a str> {
+    values
+        .iter()
+        .flat_map(|value| (0..=value.len().saturating_sub(8)).map(move |at| &value[at..at + 8]))
+        .filter(|window| text.contains(window))
+        .collect()
+}
+
+/// Every file under `dir`, its bytes read as text, for [`value_windows`].
+fn texts_under(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.push_str(&texts_under(&path));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            out.push_str(&String::from_utf8_lossy(&bytes));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// SF-34's exit test (decision SF-D3): a Mac's report of its logins across two clients states,
+/// in each `ai/logins` row, the facts of the credential its sign-in runs on (kind, where kept,
+/// issued, ends, refreshed, last used, state) and never its value.
+///
+/// What runs here is the journal's half of the path: the harness's facts typed in as its
+/// readers state them (`mine::Credential`, a type that holds no text) through a stand-in of the
+/// installed source (`Reported`), the book, the spool, the flusher's record in the journal ring,
+/// and a materializer pass of `ai/logins` on this scratch store. The readers' half, made-up login
+/// files read into facts with no window of their values in the facts, the rows or the reports,
+/// is held by `aterm_agent::harness::login_token`'s tests and by the `aterm` executable's
+/// `logins_in` test, which reads them through the real login source.
+///
+/// ann's login runs on a Claude Code setup-token in the vault, cody's on a Codex OAuth login
+/// whose CLI renews it. A third login's reader leaked an 8-byte window of a made-up setup-token
+/// into its plan word, and a fourth's packed six bytes of it into a credential's time (a number
+/// no text check reads). Through that path ann's row says `setup-token`, `secret-store`, its
+/// mint, its end, its last use and `valid`, with no refresh (a setup-token is never refreshed),
+/// and cody's `oauth`, `login-file`, its sign-in, its last refresh, its last use and `valid`,
+/// with no end (a grant its CLI refreshes states none); both leaky logins are refused by the
+/// value-free guard and written nowhere; and no 8-byte window of the made-up value is in a row,
+/// the spool, the flushed record or the published file, nor in the spool between records. The
+/// pace: a refresh is routine (no record of its own), and the credential turning expired or
+/// refused, or leaving either, is urgent (the next pass). A version-1 reader has none of the
+/// credential's columns, and a released login states no credential.
+///
+/// NEGATIVE CONTROLS, each run: with `Login::content` not stating `cred_refreshed_at`, `` cody
+/// states his last refresh `` fails (`left: Null`); with `checked` taking any text as a plan word
+/// (its `plan_word` rule removed), the leaky login's row is written into the record with the
+/// window in its `plan`, and `` the leaky login is refused `` fails; with `credible_time`
+/// admitting any number, `` the packed login is refused `` fails; with `mine::urgent` not
+/// keeping `cred_state`, the refusal waits for the routine hour and `` a refused credential is
+/// urgent `` fails. Each also run: with `mine::urgent` keeping only `refused`, `` turning expired
+/// is urgent `` fails; with `Login::content` stating an expired credential as `valid`, the row
+/// does not move and `` turning expired is urgent `` fails; with `LOGIN` left at version 1 and
+/// its credential columns live from it, the version-1 reader's assertion fails; with
+/// `Book::take_logins` keeping a refused login's Debug print in the book's `kept`, the spool
+/// holds the leaked window after the refresh's idle pass (a later record clears `kept`, so the
+/// end's check alone misses it); with `mine::released` keeping the credential's columns, `` a
+/// released login states no credential behind it `` fails.
+#[test]
+fn a_mac_states_each_token_it_holds_without_its_value() {
+    let lab = Lab::new(&[Role::Writer]);
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = &spools(scratch.path(), 1)[0];
+    let paths = &lab.paths[0];
+    let ann = pk("ada@x.example");
+    let cody = Pk::new(&keys::account_pk("codex", "ada@x.example").unwrap()).unwrap();
+    let eve = pk("eve@x.example");
+    let fay = pk("fay@x.example");
+    let t0 = W * WEEK + 2 * 86_400;
+    const DAY: u64 = 86_400;
+
+    // A made-up setup-token value, the one the leaky readers leak: no real credential is read or
+    // named.
+    let setup = concat!("sk-ant-oat01-", "qx7mpv3krt9wzb2nLc5hJf8dGs4aYe6uWo1iNx0Tq");
+    let values = [setup];
+    assert_eq!(
+        value_windows(&values, &format!("a print that holds {}", &setup[13..21])),
+        [&setup[13..21]],
+        "the detector finds a window of the value"
+    );
+    // Six of its bytes packed into a number, as a reader stating a value as a time would.
+    let mut packed = [0_u8; 8];
+    packed[2..].copy_from_slice(&setup.as_bytes()[13..19]);
+    let packed = u64::from_be_bytes(packed);
+
+    // The report: each credential's facts, as the harness's readers state them.
+    let ann_cred = mine::Credential {
+        kind: mine::CredKind::SetupToken,
+        kept: Some(mine::Kept::SecretStore),
+        issued_at: Some(t0 - 10 * DAY),
+        expires_at: Some(t0 + 300 * DAY),
+        refreshed_at: None,
+        last_used: Some(t0 - 600),
+        state: mine::CredState::Valid,
+    };
+    let cody_cred = mine::Credential {
+        kind: mine::CredKind::OAuth,
+        kept: Some(mine::Kept::LoginFile),
+        issued_at: Some(t0 - 20 * DAY),
+        expires_at: None,
+        refreshed_at: Some(t0 - 2 * DAY),
+        last_used: Some(t0 - 900),
+        state: mine::CredState::Valid,
+    };
+    let claude_logins = vec![
+        mine::Login {
+            src: mine::Src::VaultToken,
+            cred: Some(ann_cred),
+            ..login(ann, t0 - 3600)
+        },
+        // A reader that leaked a window of the setup-token into a word it states.
+        mine::Login {
+            plan: Some(Word::new(&setup[13..21]).unwrap()),
+            cred: Some(ann_cred),
+            ..login(eve, t0 - 3600)
+        },
+        // A reader that packed six bytes of it into a credential's time.
+        mine::Login {
+            cred: Some(mine::Credential {
+                refreshed_at: Some(packed),
+                ..ann_cred
+            }),
+            ..login(fay, t0 - 3600)
+        },
+    ];
+    let codex_login = |cred: mine::Credential| mine::Login {
+        cli: mine::Cli::Codex,
+        src: mine::Src::AuthFile,
+        place: mine::Place::Managed,
+        plan: Word::new("plus"),
+        cred: Some(cred),
+        ..login(cody, t0 - 7200)
+    };
+    let source = Reported::default();
+    let report = |codex: mine::Credential| {
+        *source.report.borrow_mut() = [
+            (mine::Cli::Claude, Some(claude_logins.clone())),
+            (mine::Cli::Codex, Some(vec![codex_login(codex)])),
+        ]
+        .into();
+        source.moved.set(true);
+    };
+    report(cody_cred);
+    let pass = |now: u64| {
+        flush::pass_observed(
+            paths,
+            spool,
+            &Presence::default,
+            &|| Some(Vec::new()),
+            &source,
+            &|| None,
+            false,
+            now,
+        )
+        .unwrap()
+    };
+    let me = hex::encode_lower(&window_at(paths, t0).0);
+    let key = |account: Pk| format!("{}.{me}", account.as_str());
+    let row = |account: Pk, now: u64| {
+        rows(paths, now, &LOGIN)
+            .rows
+            .get(&key(account))
+            .map(|row| row.value.clone())
+    };
+
+    // (a) One record states both logins, each with its credential's facts.
+    spool
+        .append(&ev(t0 - 120, Kind::SessionStart, ann))
+        .unwrap();
+    flush::take_in(spool, false, t0 - 100).unwrap();
+    assert!(matches!(pass(t0), Flushed::Wrote { .. }));
+    let n1 = Book::load(spool).n;
+    let ada = row(ann, t0 + 1).expect("ann's login row");
+    value_free(&LOGIN, &ada);
+    let ms = |t: u64| json!(t * 1000);
+    assert_eq!(ada["n"], json!(n1));
+    assert_eq!(
+        [
+            &ada["src"],
+            &ada["cred_kind"],
+            &ada["cred_kept"],
+            &ada["cred_issued_at"],
+            &ada["cred_expires_at"],
+            &ada["cred_last_used"],
+            &ada["cred_state"],
+        ],
+        [
+            &json!("vault-token"),
+            &json!("setup-token"),
+            &json!("secret-store"),
+            &ms(t0 - 10 * DAY),
+            &ms(t0 + 300 * DAY),
+            &ms(t0 - 600),
+            &json!("valid"),
+        ],
+        "ann states her setup-token"
+    );
+    assert_eq!(
+        ada.get("cred_refreshed_at"),
+        None,
+        "a setup-token is never refreshed: stated as none"
+    );
+    let co = row(cody, t0 + 1).expect("cody's login row");
+    value_free(&LOGIN, &co);
+    assert_eq!(
+        [
+            &co["cli"],
+            &co["cred_kind"],
+            &co["cred_kept"],
+            &co["cred_issued_at"],
+            &co["cred_last_used"],
+            &co["cred_state"],
+        ],
+        [
+            &json!("codex"),
+            &json!("oauth"),
+            &json!("login-file"),
+            &ms(t0 - 20 * DAY),
+            &ms(t0 - 900),
+            &json!("valid"),
+        ],
+        "cody states his OAuth login"
+    );
+    assert_eq!(
+        co.get("cred_expires_at"),
+        None,
+        "a grant its CLI refreshes states no end"
+    );
+    assert_eq!(
+        co["cred_refreshed_at"],
+        ms(t0 - 2 * DAY),
+        "cody states his last refresh"
+    );
+    assert_eq!(row(eve, t0 + 1), None, "the leaky login is refused");
+    assert_eq!(row(fay, t0 + 1), None, "the packed login is refused");
+    let packed_login = mine::Login {
+        cred: Some(mine::Credential {
+            refreshed_at: Some(packed),
+            ..ann_cred
+        }),
+        ..login(fay, t0)
+    };
+    assert!(mine::checked(&LOGIN, &mine::row(&packed_login.content(), 1, t0)).is_err());
+    assert!(
+        mine::checked(
+            &LOGIN,
+            &mine::row(
+                &mine::Login {
+                    cred: Some(ann_cred),
+                    ..packed_login
+                }
+                .content(),
+                1,
+                t0
+            )
+        )
+        .is_ok(),
+        "the same login with a real credential's times passes"
+    );
+    // The widest row a build states: every column, its longest word, times of the year 2100.
+    let far = 4_102_444_800;
+    let widest = mine::Login {
+        cli: mine::Cli::CodexAlab,
+        place: mine::Place::Managed,
+        state: mine::State::WrongAccount,
+        proof: mine::Proof::Unchecked,
+        src: mine::Src::VaultToken,
+        use_: mine::Use::Running,
+        tabs: u64::MAX,
+        held: mine::Held::Probation,
+        served_at: Some(far),
+        ends_by: Some(far),
+        ended_at: Some(far),
+        attempt: mine::Attempt::SignedIn,
+        attempt_at: Some(far),
+        attempt_route: Some(mine::Route::MailCode),
+        plan: Word::new("enterprise"),
+        cred: Some(mine::Credential {
+            kind: mine::CredKind::SetupToken,
+            kept: Some(mine::Kept::SecretStore),
+            issued_at: Some(far),
+            expires_at: Some(far),
+            refreshed_at: Some(far),
+            last_used: Some(far),
+            state: mine::CredState::Expiring,
+        }),
+        ..login(ann, far)
+    };
+    let widest = mine::row(&widest.content(), u64::MAX, far);
+    mine::checked(&LOGIN, &widest).unwrap();
+    assert!(
+        aterm_json::to_vec(&widest).unwrap().len() <= caps::LOGIN_ROW,
+        "the widest login row fits its cap"
+    );
+    // An older build reads `login` at version 1, where no credential column is live: it takes a
+    // newer row's facts as columns it does not know, never as its own.
+    assert!(mine::CRED_COLUMNS.iter().all(|name| {
+        LOGIN
+            .column(name)
+            .is_some_and(|column| !column.live_at(1) && column.live_at(LOGIN.version))
+    }));
+
+    // (b) Pace: a refresh is routine, so its file moving makes no record of its own; the
+    // credential turning expired or refused is urgent, in the next pass, and so is its leaving
+    // either.
+    report(mine::Credential {
+        refreshed_at: Some(t0 + 200),
+        ..cody_cred
+    });
+    assert_eq!(pass(t0 + 300), Flushed::Idle, "a refresh is routine");
+    assert_eq!(row(cody, t0 + 301).unwrap()["n"], json!(n1));
+    assert_eq!(
+        value_windows(&values, &texts_under(spool.dir())),
+        Vec::<&str>::new(),
+        "no window of a value in the spool between records"
+    );
+    for (at, state) in [
+        (t0 + 350, mine::CredState::Expired),
+        (t0 + 375, mine::CredState::Valid),
+    ] {
+        report(mine::Credential { state, ..cody_cred });
+        assert!(
+            matches!(pass(at), Flushed::Wrote { .. }),
+            "turning {} is urgent",
+            state.word()
+        );
+        assert_eq!(
+            row(cody, at + 1).unwrap()["cred_state"],
+            json!(state.word())
+        );
+    }
+    report(mine::Credential {
+        state: mine::CredState::Refused,
+        ..cody_cred
+    });
+    assert!(
+        matches!(pass(t0 + 400), Flushed::Wrote { .. }),
+        "a refused credential is urgent"
+    );
+    let co = row(cody, t0 + 401).unwrap();
+    assert_eq!(
+        (&co["n"], &co["cred_state"]),
+        (&json!(Book::load(spool).n), &json!("refused"))
+    );
+    let gone = mine::released(&co, t0 + 401);
+    assert_eq!(
+        mine::CRED_COLUMNS.map(|column| gone.get(column).is_some()),
+        [false; 7],
+        "a released login states no credential behind it"
+    );
+
+    // (c) The published file: a materializer pass projects both rows, with every fact.
+    let config = scratch.path().join("aterm.toml");
+    let outcomes = crate::file::materialize::pass(
+        paths,
+        &config,
+        Some(&crate::file::LOGINS.file()),
+        &crate::file::materialize::Pass {
+            read_by: std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            vault_wait: crate::file::materialize::VAULT_WAIT,
+            again: true,
+            now_ms: (t0 + 401) * 1000,
+        },
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.word == aterm_file::Word::Live),
+        "{outcomes:?}"
+    );
+    let root = crate::file::root(paths);
+    let published = aterm_file::File::at(&root, &crate::file::LOGINS.file()).read();
+    let face = |account: Pk, column: &str| {
+        published
+            .named(&key(account))
+            .first()
+            .map(|row| row.cell(column).to_owned())
+            .unwrap_or_default()
+    };
+    for (account, kind, kept, state) in [
+        (ann, "setup-token", "secret-store", "valid"),
+        (cody, "oauth", "login-file", "refused"),
+    ] {
+        assert_eq!(
+            [
+                face(account, "cred_kind"),
+                face(account, "cred_kept"),
+                face(account, "cred_state"),
+            ],
+            [kind, kept, state],
+            "{account:?}"
+        );
+        for column in ["cred_issued_at", "cred_last_used"] {
+            assert!(!face(account, column).is_empty(), "{account:?} {column}");
+        }
+    }
+    assert!(!face(ann, "cred_expires_at").is_empty());
+    assert!(face(cody, "cred_expires_at").is_empty());
+    assert!(!face(cody, "cred_refreshed_at").is_empty());
+    assert!(face(ann, "cred_refreshed_at").is_empty());
+    assert!(published.named(&key(eve)).is_empty());
+    assert!(published.named(&key(fay)).is_empty());
+
+    // No window of a value anywhere the Mac stated or published.
+    let (_, window) = window_at(paths, t0 + 401);
+    let record = format!("{:?}", window.ops);
+    let stated = format!("{:?}", rows(paths, t0 + 401, &LOGIN));
+    for (place, text) in [
+        ("the rows", stated),
+        ("the spool", texts_under(spool.dir())),
+        ("the flushed record", record),
+        ("the published file", texts_under(root.path())),
+    ] {
+        assert!(!text.is_empty(), "{place} holds something");
+        assert_eq!(
+            value_windows(&values, &text),
+            Vec::<&str>::new(),
+            "no window of a value in {place}"
+        );
+    }
+}
+
 /// A routine change of a `login` or `usage` row (a tab on the login, a new reading) is written
 /// at most hourly and only its latest value; an unchanged row is never written again within a
 /// week.
@@ -3053,6 +3636,258 @@ fn an_urgent_login_or_usage_change_is_due_at_once_and_a_routine_one_waits() {
     let due = book.usages_due(4, W, t + 320);
     assert_eq!(due.len(), 1, "a wall cleared");
     assert_eq!(due[0].1["wall"], json!("none"));
+}
+
+/// A usage row's `wall` is the account's own: the longest standing 5h, 7d or credits wall. A
+/// model's weekly wall walls that model's sessions alone (FL-269), so it stands in
+/// `model_walls` under its bucket with its own end, apart from the account's and from every
+/// other model's: Opus's clearing leaves Fable's wall standing. A wall of a week the harness
+/// names no model of (`seven_day_other`) stands there too, under that word. A `7d-model` wall
+/// that names no model (an older build's) is no fact the book keeps, folded or loaded from a
+/// book saved before walls named their model: no row restates it, the `use` row included, so
+/// nothing clears it late. The book keeps each model's wall across a save, and the row is one
+/// this Mac may write (`mine::checked`).
+/// NEGATIVE CONTROLS, run: with `wall_word` taking `7d-model` for an account-wide wall
+/// (`Window::WeekModel => Some(mine::Wall::WeekModel)`), the model wall outlasts the 5h wall and
+/// names the account's: `` the account's wall `` (`left: String("7d-model") right:
+/// String("5h")``); with `wall_key` keeping a `7d-model` wall that names no model, the `use` row
+/// restates it: `` no unnamed model wall in the book ``; with `Book::load` keeping one, the
+/// saved book's: `` an older book's unnamed model wall is dropped ``.
+#[test]
+fn a_usage_rows_wall_is_the_accounts_and_each_models_wall_stands_apart() {
+    let ann = pk("ada@x.example");
+    let now = W * WEEK + 86_400;
+    let model_wall = |t, model, until| Event {
+        model,
+        ..wall(t, ann, Window::WeekModel, until)
+    };
+    let mut book = Book::default();
+    book.fold(&[
+        quota(now - 600, ann, Window::FiveHour, 1000),
+        wall(now - 500, ann, Window::FiveHour, now + 3600),
+        model_wall(now - 400, Some(ModelBucket::Fable), now + 5 * 86_400),
+        model_wall(now - 300, Some(ModelBucket::Opus), now + 2 * 86_400),
+        model_wall(now - 250, Some(ModelBucket::Other), now + 86_400),
+        model_wall(now - 200, None, now + 6 * 86_400),
+    ]);
+    let row = |book: &Book, now| {
+        let due = book.usages_due(1, W, now);
+        assert_eq!(due.len(), 1);
+        let row = due[0].1.clone();
+        mine::checked(&USAGE, &row).unwrap();
+        row
+    };
+    let unnamed = |book: &Book, now| -> Vec<Value> {
+        let facts = &book.accounts[&ann];
+        facts.use_row(1, W, now, caps::USE_ROW).unwrap()["wall"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["w"] == json!("7d-model") && w.get("m").is_none())
+            .cloned()
+            .collect()
+    };
+    let walls = |pairs: &[(&str, u64)]| {
+        Value::Array(
+            pairs
+                .iter()
+                .map(|(bucket, until)| json!({"bucket": *bucket, "until": mine::ms(*until)}))
+                .collect(),
+        )
+    };
+    let first = row(&book, now);
+    assert_eq!(first["wall"], json!("5h"), "the account's wall");
+    assert_eq!(first["wall_until"], json!(mine::ms(now + 3600)));
+    assert_eq!(
+        first["model_walls"],
+        walls(&[
+            ("seven_day_opus", now + 2 * 86_400),
+            ("seven_day_other", now + 86_400),
+            ("seven_day_overage_included", now + 5 * 86_400),
+        ]),
+        "each model's wall, the unnamed one in neither"
+    );
+    assert_eq!(
+        unnamed(&book, now),
+        Vec::<Value>::new(),
+        "no unnamed model wall in the book"
+    );
+
+    // Opus's clearing leaves Fable's; the 5h wall's end leaves no account-wide wall.
+    book.fold(&[Event {
+        window: Some(Window::WeekModel),
+        model: Some(ModelBucket::Opus),
+        src: Source::Statusline,
+        ..ev(now + 100, Kind::WallCleared, ann)
+    }]);
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = Spool::at(scratch.path().join("alab"));
+    book.save(&spool).unwrap();
+    let saved = Book::load(&spool);
+    let later = row(&saved, now + 7200);
+    assert_eq!(later["wall"], json!("none"), "no account-wide wall stands");
+    assert!(later.get("wall_until").is_none());
+    assert_eq!(
+        later["model_walls"],
+        walls(&[
+            ("seven_day_other", now + 86_400),
+            ("seven_day_overage_included", now + 5 * 86_400)
+        ]),
+        "Fable's wall, across the save"
+    );
+
+    // A book saved before walls named their model: Fable's wall there names none, and loads as
+    // no wall at all, while the one that names its model stands.
+    let mut older = saved.to_value();
+    let accounts = older.as_object_mut().unwrap().get_mut("accounts").unwrap();
+    for facts in accounts.as_object_mut().unwrap().values_mut() {
+        let facts = facts.as_object_mut().unwrap();
+        for w in facts.get_mut("walls").unwrap().as_array_mut().unwrap() {
+            let w = w.as_object_mut().unwrap();
+            if w.get("m") == Some(&json!("seven_day_overage_included")) {
+                w.remove("m");
+            }
+        }
+    }
+    let older = Book::from_value(&older);
+    assert_eq!(
+        unnamed(&older, now + 7200),
+        Vec::<Value>::new(),
+        "an older book's unnamed model wall is dropped"
+    );
+    assert_eq!(
+        row(&older, now + 7200)["model_walls"],
+        walls(&[("seven_day_other", now + 86_400)])
+    );
+}
+
+/// Two Macs' model walls of one account fold into its `ai/limits` row bucket by bucket, each to
+/// the latest end any Mac states, beside no wall of the account's (FL-269); a model wall no Mac
+/// states an end of is kept with none, and rotation reads each bucket's end apart and leaves the
+/// endless one out, as it leaves out an account-wide wall with no end.
+/// NEGATIVE CONTROL, run: with `limits::fold` keeping the first reading's model walls only
+/// (`if limit.model_walls.is_empty()` around the merge), mac b's later Fable end is lost: `` each
+/// bucket's latest end ``.
+#[cfg(unix)]
+#[test]
+fn each_models_wall_folds_to_its_latest_stated_end_and_rotation_reads_it_apart() {
+    const MAC_A: &str = "000000000000000000000000000000aa";
+    const MAC_B: &str = "000000000000000000000000000000bb";
+    let ann = pk("ada@x.example");
+    let now = W * WEEK + 86_400;
+    let day = 86_400;
+    let model_wall = |t, model, until| Event {
+        model: Some(model),
+        until,
+        ..wall(t, ann, Window::WeekModel, 0)
+    };
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let a = Spool::at(scratch.path().join("a"));
+    let b = Spool::at(scratch.path().join("b"));
+    for event in [
+        quota(now - 600, ann, Window::Week, 500),
+        model_wall(now - 500, ModelBucket::Fable, Some(now + 2 * day)),
+        model_wall(now - 400, ModelBucket::Opus, Some(now + 3 * day)),
+    ] {
+        a.append(&event).unwrap();
+    }
+    for event in [
+        quota(now - 300, ann, Window::Week, 600),
+        model_wall(now - 200, ModelBucket::Fable, Some(now + 4 * day)),
+        model_wall(now - 100, ModelBucket::Sonnet, None),
+    ] {
+        b.append(&event).unwrap();
+    }
+    let folded = fold_limits_for_test(&[(MAC_A, &a), (MAC_B, &b)], &[], &[], now).unwrap();
+    let limit = &folded.limits[ann.as_str()];
+    assert_eq!(limit["wall"], json!("none"), "no wall of the account's");
+    assert_eq!(
+        limit["model_walls"],
+        json!([
+            {"bucket": "seven_day_opus", "until": mine::ms(now + 3 * day)},
+            {"bucket": "seven_day_overage_included", "until": mine::ms(now + 4 * day)},
+            {"bucket": "seven_day_sonnet"},
+        ]),
+        "each bucket's latest end: {limit:?}"
+    );
+    assert!(folded.rotation.walls.is_empty(), "no account-wide wall");
+    assert_eq!(
+        folded.rotation.model_walls.get(ann.as_str()),
+        Some(
+            &[
+                (
+                    "seven_day_overage_included".to_owned(),
+                    mine::ms(now + 4 * day)
+                ),
+                ("seven_day_opus".to_owned(), mine::ms(now + 3 * day)),
+            ]
+            .into()
+        ),
+        "rotation reads each end apart, the endless one out"
+    );
+}
+
+/// A `usage` row's `model_walls` is read entry by entry (FL-269): of a newer build's row that
+/// holds more entries than this build writes, a bucket word this build does not know and a
+/// member it does not name, the projection a pass makes keeps the cell whole, `ai/limits` keeps
+/// each entry's wall (an unknown bucket's as `seven_day_other`'s, a week of a model this build
+/// names no bucket of, which walls every session), and rotation reads each with an end. An
+/// entry with no bucket word is no wall.
+/// NEGATIVE CONTROL, run: with `model_walls` typed as a list of records of the known buckets
+/// (`Ty::List(&Ty::Struct(..), 4)`, `bucket` a `Ty::Enum`), the projection withholds the whole
+/// cell and every model wall of the row is lost: `` the projection keeps the cell `` (`left:
+/// None`).
+#[cfg(unix)]
+#[test]
+fn a_newer_builds_model_walls_are_read_entry_by_entry_and_cost_no_entry_its_wall() {
+    const NEWER: &str = "000000000000000000000000000000cc";
+    let ann = pk("ada@x.example");
+    let now = W * WEEK + 86_400;
+    let day = 86_400;
+    let ms = mine::ms;
+    let key = format!("{}.{NEWER}", ann.as_str());
+    let newer = json!({
+        "r": 3, "n": 1, "account": ann.as_str(), "wall": "none", "src": "statusline",
+        "read_at": ms(now - 60), "at": ms(now), "sessions_7d": 0,
+        "model_walls": [
+            {"bucket": "seven_day_overage_included", "until": ms(now + 2 * day), "t": 5},
+            {"bucket": "seven_day_haiku", "until": ms(now + 3 * day)},
+            {"bucket": "seven_day_opus", "until": ms(now + day)},
+            {"bucket": "seven_day_sonnet", "until": ms(now + day)},
+            {"bucket": "seven_day_mistral"},
+            {"until": ms(now + 9 * day)},
+        ],
+    });
+    let projected = crate::file::materialize::ring_row(&USAGE, &key, &newer).unwrap();
+    assert_eq!(
+        projected.values.get("model_walls"),
+        newer.get("model_walls"),
+        "the projection keeps the cell"
+    );
+    let folded = fold_limits_for_test(&[], &[(key.as_str(), newer.clone())], &[], now).unwrap();
+    let limit = &folded.limits[ann.as_str()];
+    assert_eq!(
+        limit["model_walls"],
+        json!([
+            {"bucket": "seven_day_opus", "until": ms(now + day)},
+            {"bucket": "seven_day_other", "until": ms(now + 3 * day)},
+            {"bucket": "seven_day_overage_included", "until": ms(now + 2 * day)},
+            {"bucket": "seven_day_sonnet", "until": ms(now + day)},
+        ]),
+        "{limit:?}"
+    );
+    assert_eq!(
+        folded.rotation.model_walls.get(ann.as_str()),
+        Some(
+            &[
+                ("seven_day_opus".to_owned(), ms(now + day)),
+                ("seven_day_other".to_owned(), ms(now + 3 * day)),
+                ("seven_day_overage_included".to_owned(), ms(now + 2 * day)),
+                ("seven_day_sonnet".to_owned(), ms(now + day)),
+            ]
+            .into()
+        )
+    );
 }
 
 /// The weekly restatement: the week's first record restates every login the harness reported

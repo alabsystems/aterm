@@ -145,6 +145,7 @@ fn image_meta_is_an_opt_in_flag_and_preserves_legacy_names() {
         ImageOptions {
             want_bytes: true,
             want_metadata: true,
+            presentation: false,
             rest: "plain shot.png".to_string(),
         }
     );
@@ -153,9 +154,41 @@ fn image_meta_is_an_opt_in_flag_and_preserves_legacy_names() {
         ImageOptions {
             want_bytes: false,
             want_metadata: false,
+            presentation: false,
             rest: "meta".to_string(),
         },
         "only --meta is reserved; an existing file literally named meta still works",
+    );
+}
+
+#[test]
+fn a_presentation_capture_keeps_its_lease_modifier_out_of_the_confined_filename() {
+    assert_eq!(
+        parse_image_options("--presentation-lease held.png"),
+        ImageOptions {
+            want_bytes: false,
+            want_metadata: false,
+            presentation: true,
+            rest: "held.png".into(),
+        }
+    );
+}
+
+#[test]
+fn a_disconnected_presentation_controller_cannot_take_an_already_ready_capture() {
+    let (client, server) = crate::control::CtlStream::pair().unwrap();
+    let cancel = crate::control::CaptureCancellation::new();
+    let mut guard = CancelCaptureRequestOnDrop(Some(cancel.clone()));
+    let (tx, rx) = std::sync::mpsc::channel::<Result<crate::control::Retained<()>, String>>();
+    tx.send(Err("worker reply must not supersede controller EOF".into()))
+        .unwrap();
+    drop(client);
+    let result = recv_presentation_reply(&rx, &mut guard, &server);
+    assert!(result.unwrap_err().contains("controller disconnected"));
+    drop(guard);
+    assert!(
+        cancel.is_cancelled(),
+        "the queued renderer receives cancellation"
     );
 }
 

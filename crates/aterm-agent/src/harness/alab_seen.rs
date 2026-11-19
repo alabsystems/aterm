@@ -48,13 +48,20 @@ pub enum Figure {
     ResetUnread { reset: i64 },
 }
 
-/// One window of an account (or of one of its workspaces).
+/// One window of an account (or of one of its workspaces), or one model's own week of its
+/// `7d-model` window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowSeen {
     /// `5h`, `7d`, `7d-model`, `day`, `month` or `credits`.
     pub window: String,
     /// The workspace's sub-account key where the window is a workspace's.
     pub sub: Option<String>,
+    /// The weekly bucket of the model whose own week this is ([`super::profile::Bucket::id`]:
+    /// `seven_day_overage_included` for Fable, `seven_day_opus`, `seven_day_sonnet`,
+    /// `seven_day_other`), for a `7d-model` wall the journal names the model of (FL-271): such a
+    /// window holds that model's wall alone. `None` for the window's own, which holds its
+    /// figure and, in `7d-model`, an older build's wall that names no model.
+    pub model: Option<String>,
     pub figure: Option<Figure>,
     /// Original time, Mac and source of the quota reading retained with this window.
     pub read: Option<(i64, Mac, String)>,
@@ -67,7 +74,39 @@ pub struct WindowSeen {
     pub wall_by: Option<(i64, Mac, String)>,
 }
 
+/// The journal's word of the models' weeks' window.
+pub const WEEK_MODEL: &str = "7d-model";
+
 impl WindowSeen {
+    /// Whether this window is one every session of the account meets, so its wall walls them
+    /// all and its figure is the account's: any window but `7d-model`, or the week of a model
+    /// with no week of its own here (`seven_day_other`, or a bucket this build does not know),
+    /// which the harness takes as the account's ([`super::accounts::model_window`],
+    /// `Account::limited_until`). A Fable, Opus or Sonnet week's wall walls that model's
+    /// sessions alone, and the `7d-model` window's own row cannot say whose week its wall (an
+    /// older build's) or its figure (the most used of the models' weeks: a reading names no
+    /// model) is of, so neither is the account's (FL-271).
+    #[must_use]
+    pub fn walls_account(&self) -> bool {
+        match &self.model {
+            Some(bucket) => !super::accounts::model_window(bucket),
+            None => self.window != WEEK_MODEL,
+        }
+    }
+
+    /// What a line calls this window: its word (`5h`, `7d`, `7d-model`), or for a model's own
+    /// week that week's words (`Fable week`, `Opus week`, `Sonnet week`; `another model's week`
+    /// for one no bucket of this build names).
+    #[must_use]
+    pub fn name(&self) -> String {
+        match &self.model {
+            Some(bucket) => super::accounts::model_week_name(bucket)
+                .unwrap_or("another model's week")
+                .to_owned(),
+            None => self.window.clone(),
+        }
+    }
+
     /// Project this retained reading at `now`: a passed wall is lifted and a passed reset
     /// becomes unknown until read again. Unknown bounds and the original reading are kept.
     #[must_use]
@@ -340,8 +379,8 @@ pub fn signed_in_words(records: &[SignedIn], now: i64) -> Option<String> {
 pub fn window_line(w: &WindowSeen, now: i64) -> String {
     let w = w.as_of(now);
     let mut out = match &w.sub {
-        Some(sub) => format!("{} (workspace {sub})", w.window),
-        None => w.window.clone(),
+        Some(sub) => format!("{} (workspace {sub})", w.name()),
+        None => w.name(),
     };
     match &w.figure {
         Some(Figure::Used { pct_x10, reset }) => {
@@ -625,6 +664,7 @@ pub fn rows_json(
                 };
                 json!({
                     "window": w.window,
+                    "model": w.model,
                     "sub": w.sub,
                     "state": state,
                     "used_pct_x10": pct,

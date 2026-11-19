@@ -3,15 +3,28 @@
 
 //! One app-owned, read-only operation through the existing protected askpass sheet.
 //! No executable, output path, policy selector or command text comes from the caller.
+//!
+//! An operation stands for its [`Origin`]: the terminal session in front when `aterm ctl @self
+//! sys policy collect` or a pinned CPU card's key started it, or the System Resources page's view
+//! whose Collect CPU Policy a person pressed (SD-83). It is admitted only while that origin is in
+//! front ([`App::cpu_policy_origin_live`]); the password sheet hangs on the origin's window and
+//! is withdrawn with it ([`App::withdraw_askpass_view`] beside the window's and the session's).
+//! Who started it rides with it ([`Starter`]): a person's own key or press lets its password
+//! sheet past the spacing a sheet nobody touched set before it (`askpass::Backoff::refusal`).
+//!
+//! The machine runs one operation at a time, and each belongs to the [`Owner`] App that started
+//! it: an App reads, cancels and reaps only its own, so a test process's many headless Apps never
+//! see each other's operation as their pending one.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
+use crate::tab_model::ViewId;
 use crate::{App, Wake, WindowId};
 use aterm_json::{Value, json};
 use aterm_sysprobe::cpu_policy::{COLLECTOR_VERB, Identity};
@@ -21,11 +34,96 @@ const EXIT_GRACE: Duration = Duration::from_secs(15);
 const SUDO_ARGS: [&str; 3] = ["-k", "-A", "--"];
 static OPERATION: Mutex<Option<Arc<Operation>>> = Mutex::new(None);
 
+/// The App an operation belongs to ([`App::cpu_policy_owner`]). A running aterm has one App; a
+/// test process has many headless ones side by side, and each reads, cancels and reaps only the
+/// operation it started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Owner(u64);
+
+impl Owner {
+    /// A new App's own.
+    pub(crate) fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Why a press started no operation, in the words the journal and the ctl verb give.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// No terminal session is in front of the window a session-bound collect names.
+    NoSession,
+    /// The origin is not in front: its session not visible in its window, or its view not its
+    /// window's front tab in a window that is not occluded.
+    NotInFront,
+    /// The fabric is halted for askpass.
+    Halted,
+    /// The askpass relay is switched off.
+    RelayOff,
+    /// An operation is unsettled: no new one until its exact collector exits.
+    Pending,
+    /// This App has no event loop for the worker to report to.
+    NoEventLoop,
+    /// No person stands behind the gesture that asked ([`crate::App::gesture_unvouched`]).
+    NotAPerson,
+    /// A keep-out named no folder, or another step named one.
+    NoFolder,
+}
+
+impl Refusal {
+    pub(crate) const fn words(self) -> &'static str {
+        match self {
+            Self::NoSession => "no terminal session is in front",
+            Self::NotInFront => "its tab is not in front",
+            Self::Halted => "askpass is halted",
+            Self::RelayOff => "the askpass relay is off",
+            Self::Pending => "a collection is pending",
+            Self::NoEventLoop => "this aterm has no event loop",
+            Self::NotAPerson => "only a person's own click or key runs it",
+            Self::NoFolder => "no folder was chosen",
+        }
+    }
+}
+
+/// What an operation stands for: it is admitted only while its origin is in front, its password
+/// sheet hangs on the origin's window, and it is cancelled when the origin goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The terminal session in front of `window` when it started, by its local id and its stable
+    /// sid (a replaced session reusing the local id is not the origin).
+    Session {
+        window: WindowId,
+        session: u64,
+        sid: String,
+    },
+    /// A page's view, its window's front tab when a person pressed the page's button.
+    View { window: WindowId, view: ViewId },
+}
+
+impl Origin {
+    /// The window the origin is in, which the password sheet hangs on.
+    pub(crate) const fn window(&self) -> WindowId {
+        match self {
+            Self::Session { window, .. } | Self::View { window, .. } => *window,
+        }
+    }
+
+    /// What a password sheet raised for it stands for.
+    pub(crate) const fn sheet(&self) -> crate::askpass_sheet::SheetOrigin {
+        match self {
+            Self::Session { session, .. } => crate::askpass_sheet::SheetOrigin::Session(*session),
+            Self::View { view, .. } => crate::askpass_sheet::SheetOrigin::View(*view),
+        }
+    }
+}
+
 pub(crate) struct Operation {
     id: u64,
-    window: WindowId,
-    session: u64,
-    sid: String,
+    owner: Owner,
+    origin: Origin,
+    /// When a person's own click or key started it ([`Starter::Person`]); `None` for a control
+    /// client's `sys policy collect`, or a key no person is known to stand behind.
+    person_at: Option<Instant>,
     cancelled: AtomicBool,
     claims: Claims,
     retry_refused: AtomicBool,
@@ -56,6 +154,26 @@ impl Claims {
     }
     fn released(&self) -> bool {
         self.secret.load(Ordering::Acquire)
+    }
+}
+
+/// Who started a collection ([`App::collect_cpu_policy`], [`App::collect_cpu_policy_from_view`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Starter {
+    /// A person's own key in the CPU lens, or their own press of the System Resources page's
+    /// Collect CPU Policy, at this moment.
+    Person(Instant),
+    /// A control client (`sys policy collect`), or a key or press no person is known to stand
+    /// behind.
+    Control,
+}
+
+impl Starter {
+    const fn person_at(self) -> Option<Instant> {
+        match self {
+            Self::Person(at) => Some(at),
+            Self::Control => None,
+        }
     }
 }
 
@@ -174,8 +292,18 @@ fn reconcile(op: &Operation) -> Option<Value> {
     Some(r.report)
 }
 
-fn request_reconcile(proxy: &aterm_window::event_loop::EventLoopProxy<Wake>) {
-    let Some(op) = OPERATION.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+/// `owner`'s operation, if the slot holds one of its.
+fn owned(owner: Owner) -> Option<Arc<Operation>> {
+    OPERATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|op| op.owner == owner)
+        .cloned()
+}
+
+fn request_reconcile(owner: Owner, proxy: &aterm_window::event_loop::EventLoopProxy<Wake>) {
+    let Some(op) = owned(owner) else {
         return;
     };
     if !op.has_residual.load(Ordering::Acquire)
@@ -193,11 +321,7 @@ fn request_reconcile(proxy: &aterm_window::event_loop::EventLoopProxy<Wake>) {
         crate::qos::Role::Responsive,
         move || {
             if let Some(report) = reconcile(&worker) {
-                let mut active = OPERATION.lock().unwrap_or_else(|e| e.into_inner());
-                if active.as_ref().is_some_and(|op| op.id == worker.id) {
-                    *active = None;
-                }
-                drop(active);
+                vacate(worker.id);
                 let _ = proxy.send_event(Wake::CpuPolicyReport(Box::new(report)));
             }
             worker.reconciling.store(false, Ordering::Release);
@@ -222,8 +346,30 @@ impl Operation {
         }
     }
 
-    pub(crate) fn origin(&self) -> (WindowId, u64) {
-        (self.window, self.session)
+    pub(crate) const fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    fn new(owner: Owner, origin: Origin, starter: Starter) -> Self {
+        Self {
+            id: crate::alert_keys::next_confirm_id(),
+            owner,
+            origin,
+            person_at: starter.person_at(),
+            cancelled: AtomicBool::new(false),
+            claims: Claims::default(),
+            retry_refused: AtomicBool::new(false),
+            residual: Mutex::new(None),
+            has_residual: AtomicBool::new(false),
+            reconciling: AtomicBool::new(false),
+            sudo: Mutex::new(None),
+            ticket: Mutex::new(None),
+        }
+    }
+
+    /// When a person's own key or press started this collection; `None` for a control client's.
+    pub(crate) const fn person_at(&self) -> Option<Instant> {
+        self.person_at
     }
 
     fn bound(&self) -> bool {
@@ -296,26 +442,47 @@ pub(crate) fn request(sudo_pid: i32) -> Result<Option<OwnedPrompt>, ()> {
     Ok(Some((operation, ticket)))
 }
 
-pub(crate) fn pending() -> bool {
-    OPERATION
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some()
+/// Whether `owner` has an unsettled operation.
+pub(crate) fn pending(owner: Owner) -> bool {
+    owned(owner).is_some()
 }
 
-pub(crate) fn cancel_window(window: WindowId) {
-    if let Some(op) = OPERATION.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
-        && op.window == window
+/// Cancel `owner`'s operation if `gone` names its origin.
+fn cancel_where(owner: Owner, gone: impl FnOnce(&Origin) -> bool) {
+    if let Some(op) = owned(owner)
+        && gone(&op.origin)
     {
         op.cancel();
     }
 }
 
-pub(crate) fn cancel_session(session: u64) {
-    if let Some(op) = OPERATION.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
-        && op.session == session
-    {
-        op.cancel();
+/// Cancel `owner`'s operation whose origin is in `window`, a session's or a view's.
+pub(crate) fn cancel_window(owner: Owner, window: WindowId) {
+    cancel_where(owner, |origin| origin.window() == window);
+}
+
+/// Cancel `owner`'s operation the terminal session `session` started.
+pub(crate) fn cancel_session(owner: Owner, session: u64) {
+    cancel_where(
+        owner,
+        |origin| matches!(origin, Origin::Session { session: s, .. } if *s == session),
+    );
+}
+
+/// Cancel `owner`'s operation the page's view `view` started.
+pub(crate) fn cancel_view(owner: Owner, view: ViewId) {
+    cancel_where(
+        owner,
+        |origin| matches!(origin, Origin::View { view: v, .. } if *v == view),
+    );
+}
+
+/// The view whose operation of `owner`'s is pending, if a view started it: the host cancels it
+/// once the view is not in front ([`App::withdraw_askpass_view`]).
+pub(crate) fn pending_view(owner: Owner) -> Option<(WindowId, ViewId)> {
+    match owned(owner).map(|op| (op.origin.clone(), op.cancelled.load(Ordering::Acquire))) {
+        Some((Origin::View { window, view }, false)) => Some((window, view)),
+        _ => None,
     }
 }
 
@@ -327,8 +494,17 @@ fn issue_ack(
     admitted() && !cancelled() && write()
 }
 
-fn admission_allowed(origin_live: bool, halted: bool, relay_off: bool) -> bool {
-    origin_live && !halted && !relay_off
+/// What refuses admission, the origin first.
+const fn admission_refusal(origin_live: bool, halted: bool, relay_off: bool) -> Option<Refusal> {
+    if !origin_live {
+        Some(Refusal::NotInFront)
+    } else if halted {
+        Some(Refusal::Halted)
+    } else if relay_off {
+        Some(Refusal::RelayOff)
+    } else {
+        None
+    }
 }
 
 fn origin_matches(expected: &str, actual: Option<&str>, still_hosted: bool) -> bool {
@@ -390,9 +566,7 @@ pub(crate) fn control(
 
 impl App {
     pub(crate) fn cpu_policy_action(&mut self, session: u64, action: Action) -> String {
-        if let Some(proxy) = self.proxy.as_ref() {
-            request_reconcile(proxy);
-        }
+        self.reconcile_cpu_policy();
         match action {
             Action::Status => {}
             Action::Collect => {
@@ -404,39 +578,78 @@ impl App {
                 {
                     return "ERR focus the originating tab before authorizing diagnostics\n".into();
                 }
-                if !self.collect_cpu_policy(window) {
-                    return "ERR CPU policy operation pending or unavailable\n".into();
+                if let Err(refusal) = self.collect_cpu_policy(window, Starter::Control) {
+                    return format!("ERR CPU policy not collected: {}\n", refusal.words());
                 }
             }
-            Action::Cancel => cancel_session(session),
+            Action::Cancel => cancel_session(self.cpu_policy_owner(), session),
         }
-        let active = OPERATION.lock().unwrap_or_else(|e| e.into_inner());
-        let body = if let Some(op) = active.as_ref() {
-            json!({"operation":"cpu_policy","pending":true,"request_id":op.id,
-                "originating_session":op.session,"cancel_requested":op.cancelled.load(Ordering::Acquire),
-                "cause":"not_established"})
+        let body = if let Some(op) = owned(self.cpu_policy_owner()) {
+            let mut body = json!({"operation":"cpu_policy","pending":true,"request_id":op.id,
+                "cancel_requested":op.cancelled.load(Ordering::Acquire),
+                "cause":"not_established"});
+            if let Some(fields) = body.as_object_mut() {
+                match &op.origin {
+                    Origin::Session { session, .. } => {
+                        fields.insert("originating_session".into(), json!(session));
+                    }
+                    Origin::View { view, .. } => {
+                        fields.insert("originating_view".into(), json!(view.get()));
+                    }
+                }
+            }
+            body
         } else {
             json!({"operation":"cpu_policy","pending":false,"report":"sys report --json","cause":"not_established"})
         };
         aterm_control::wire::json_ok(&aterm_json::to_string(&body).unwrap_or_else(|_| "{}".into()))
     }
 
-    fn cpu_policy_ui_admission(&self, operation: &Operation) -> bool {
-        let same_session = {
-            let store = self.store.read().unwrap_or_else(|e| e.into_inner());
-            origin_matches(
-                &operation.sid,
-                store.by_local(operation.session).map(|s| s.sid.as_str()),
-                true,
-            )
-        };
-        // End the store read before app_halt_refusal takes its own read lock.
-        // A queued writer must not turn recursive read acquisition into a UI stall.
-        admission_allowed(
-            !operation.cancelled.load(Ordering::Acquire)
-                && same_session
-                && self.window_contains_session(operation.window, operation.session)
-                && self.is_visible_session(operation.session),
+    /// Whether `view` is the front tab's of `window` and the window is not occluded: what
+    /// [`App::view_on_screen`] asks, of one window.
+    pub(crate) fn view_in_front(&self, window: WindowId, view: ViewId) -> bool {
+        self.windows
+            .get(&window)
+            .is_some_and(|ws| !ws.occluded && crate::active_tab_shows(ws, |shown| shown == view))
+    }
+
+    /// Whether this App's CPU policy collection is pending.
+    pub(crate) fn cpu_policy_pending(&self) -> bool {
+        pending(self.cpu_policy_owner())
+    }
+
+    /// Whether the operation's origin is still in front: its session in its window and visible,
+    /// or its view its window's front tab in a window that is not occluded; under the same halt
+    /// and relay refusals either way.
+    pub(crate) fn cpu_policy_ui_admission(&self, operation: &Operation) -> bool {
+        self.cpu_policy_ui_refusal(operation).is_none()
+    }
+
+    /// What refuses [`Self::cpu_policy_ui_admission`], if anything does. Another App's
+    /// operation has no origin in this one.
+    fn cpu_policy_ui_refusal(&self, operation: &Operation) -> Option<Refusal> {
+        let live = operation.owner == self.cpu_policy_owner()
+            && !operation.cancelled.load(Ordering::Acquire)
+            && match &operation.origin {
+                Origin::Session {
+                    window,
+                    session,
+                    sid,
+                } => {
+                    let same_session = {
+                        let store = self.store.read().unwrap_or_else(|e| e.into_inner());
+                        origin_matches(sid, store.by_local(*session).map(|s| s.sid.as_str()), true)
+                    };
+                    // End the store read before app_halt_refusal takes its own read lock.
+                    // A queued writer must not turn recursive read acquisition into a UI stall.
+                    same_session
+                        && self.window_contains_session(*window, *session)
+                        && self.is_visible_session(*session)
+                }
+                Origin::View { window, view } => self.view_in_front(*window, *view),
+            };
+        admission_refusal(
+            live,
             crate::fabric::app_halt_refusal(&self.store, "askpass").is_some(),
             crate::askpass::relay_off(),
         )
@@ -450,52 +663,103 @@ impl App {
         self.cpu_policy_origin_live(operation)
     }
 
-    /// One explicit action; repeated clicks while any generation is unsettled do nothing.
-    pub(crate) fn collect_cpu_policy(&mut self, window: WindowId) -> bool {
-        if let Some(proxy) = self.proxy.as_ref() {
-            request_reconcile(proxy);
-        }
-        let Some(session) = self.focused_session_id(window) else {
-            return false;
-        };
-        let Some(proxy) = self.proxy.clone() else {
-            return false;
-        };
-        let Some(sid) = self
+    /// One explicit action from the terminal session in front of `window`; repeated clicks
+    /// while any generation is unsettled do nothing. With no terminal session in front (a page
+    /// is) it is refused: a page collects from its view ([`Self::collect_cpu_policy_from_view`]).
+    /// `starter` says whether a person's own key started it, which lets its password sheet past
+    /// the spacing a sheet nobody touched set (`askpass::Backoff::refusal`).
+    pub(crate) fn collect_cpu_policy(
+        &mut self,
+        window: WindowId,
+        starter: Starter,
+    ) -> Result<(), Refusal> {
+        self.reconcile_cpu_policy();
+        let session = self.focused_session_id(window).ok_or(Refusal::NoSession)?;
+        let sid = self
             .store
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .by_local(session)
             .map(|s| s.sid.as_str().to_owned())
-        else {
-            return false;
-        };
-        let operation = Arc::new(Operation {
-            id: crate::alert_keys::next_confirm_id(),
-            window,
-            session,
-            sid,
-            cancelled: AtomicBool::new(false),
-            claims: Claims::default(),
-            retry_refused: AtomicBool::new(false),
-            residual: Mutex::new(None),
-            has_residual: AtomicBool::new(false),
-            reconciling: AtomicBool::new(false),
-            sudo: Mutex::new(None),
-            ticket: Mutex::new(None),
-        });
-        if !self.cpu_policy_ui_admission(&operation) {
-            return false;
+            .ok_or(Refusal::NoSession)?;
+        self.start_cpu_policy(
+            Origin::Session {
+                window,
+                session,
+                sid,
+            },
+            starter,
+        )
+    }
+
+    /// A press of Collect CPU Policy on the page's view `view` in `window`, by `starter` (a
+    /// person's own, as the page's dispatch admits no other): the operation is bound to that
+    /// view, admitted while it is its window's front tab, and cancelled when it is not
+    /// ([`Self::withdraw_askpass_view`]).
+    pub(crate) fn collect_cpu_policy_from_view(
+        &mut self,
+        window: WindowId,
+        view: ViewId,
+        starter: Starter,
+    ) -> Result<(), Refusal> {
+        self.reconcile_cpu_policy();
+        self.start_cpu_policy(Origin::View { window, view }, starter)
+    }
+
+    /// A person's Cancel on the System Resources page: end this App's pending collection,
+    /// whatever started it, and withdraw its password sheet. The page's pending line and its live
+    /// Cancel stand for that one operation, so the press ends it; a cancel only lowers what runs,
+    /// so no origin need be in front for it.
+    pub(crate) fn cancel_cpu_policy_from_page(&mut self) {
+        cancel_where(self.cpu_policy_owner(), |_| true);
+        self.withdraw_askpass_cpu_policy();
+    }
+
+    /// Who starts a collection from the gesture being dispatched: a person, now, where a person
+    /// stands behind it ([`App::gesture_unvouched`]); a control client otherwise (a control
+    /// client's `hwkey` or `act`, an accessibility client's key, a relayed one).
+    pub(crate) fn cpu_policy_starter(&self) -> Starter {
+        if self.gesture_unvouched().is_none() {
+            Starter::Person(Instant::now())
+        } else {
+            Starter::Control
         }
+    }
+
+    /// Every press asks first that a settled operation's residual be reaped, whether or not it
+    /// then starts one.
+    fn reconcile_cpu_policy(&self) {
+        if let Some(proxy) = self.proxy.as_ref() {
+            request_reconcile(self.cpu_policy_owner(), proxy);
+        }
+    }
+
+    /// Start one operation for `origin`, by `starter`, if it is admitted and none is unsettled.
+    fn start_cpu_policy(&mut self, origin: Origin, starter: Starter) -> Result<(), Refusal> {
+        let operation = Arc::new(Operation::new(self.cpu_policy_owner(), origin, starter));
+        if let Some(refusal) = self.cpu_policy_ui_refusal(&operation) {
+            return Err(refusal);
+        }
+        let proxy = self.proxy.clone();
+        // A headless test's App has no event loop: its operation stands in the slot, with no
+        // worker and so no sudo, until it is cancelled and the test empties the slot.
+        #[cfg(not(test))]
+        let Some(proxy) = proxy else {
+            return Err(Refusal::NoEventLoop);
+        };
         {
             let mut active = OPERATION.lock().unwrap_or_else(|e| e.into_inner());
             if active.is_some() {
-                return false;
+                return Err(Refusal::Pending);
             }
             *active = Some(Arc::clone(&operation));
         }
 
         self.begin_cpu_policy_report(operation.id);
+        #[cfg(test)]
+        let Some(proxy) = proxy else {
+            return Ok(());
+        };
         let worker = Arc::clone(&operation);
         let spawn = crate::qos::spawn_lane_thread(
             "aterm-cpu-policy",
@@ -503,27 +767,81 @@ impl App {
             move || {
                 let (result, drained) = run(&worker, &proxy);
                 if drained {
-                    let mut active = OPERATION.lock().unwrap_or_else(|e| e.into_inner());
-                    if active.as_ref().is_some_and(|o| o.id == worker.id) {
-                        *active = None;
-                    }
+                    vacate(worker.id);
                 }
                 let _ = proxy.send_event(Wake::CpuPolicyReport(Box::new(result)));
             },
         );
         if let Err(error) = spawn {
-            *OPERATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            vacate(operation.id);
             self.accept_cpu_policy_report(status_report(
                 &operation,
                 &format!("worker_unavailable:{error}"),
                 true,
             ));
         }
-        true
+        Ok(())
     }
 
     pub(crate) fn cancel_cpu_policy(&mut self, window: WindowId) {
-        cancel_window(window);
+        cancel_window(self.cpu_policy_owner(), window);
+    }
+}
+
+/// Empty the slot if it still holds the operation `id`.
+fn vacate(id: u64) {
+    let mut active = OPERATION.lock().unwrap_or_else(|e| e.into_inner());
+    if active.as_ref().is_some_and(|op| op.id == id) {
+        *active = None;
+    }
+}
+
+/// The operation in the slot, for a test to read.
+#[cfg(test)]
+pub(crate) fn active_for_test() -> Option<Arc<Operation>> {
+    OPERATION.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[cfg(test)]
+impl Operation {
+    /// Whether it was cancelled.
+    pub(crate) fn cancelled_for_test(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Bind it to `sudo` as the worker binds the `sudo` it spawned, so its sheet may be raised.
+    pub(crate) fn bind_sudo_for_test(&self, sudo: Identity) {
+        *self.sudo.lock().unwrap_or_else(|e| e.into_inner()) = Some(sudo);
+    }
+}
+
+/// The one operation slot, held by one test at a time and empty while it is: tests that start an
+/// operation take it, since the slot is the process's.
+#[cfg(test)]
+pub(crate) struct SlotForTest {
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub(crate) fn slot_for_test() -> SlotForTest {
+    static HELD: Mutex<()> = Mutex::new(());
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    *OPERATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    SlotForTest { _held: held }
+}
+
+#[cfg(test)]
+impl SlotForTest {
+    /// Empty the slot, as a worker does once its operation settles.
+    pub(crate) fn empty(&self) {
+        *OPERATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for SlotForTest {
+    fn drop(&mut self) {
+        *OPERATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -574,6 +892,25 @@ pub(crate) fn fixed_paths() -> Result<(PathBuf, PathBuf), String> {
     Ok((exe, helper))
 }
 
+/// The suspended `sudo` of the fixed collector, whatever the origin. Its askpass helper asks
+/// this instance by its own control socket, the one whose operation stands for this `sudo`: no
+/// inherited session id may route it to another aterm, which would hold no operation for it.
+fn sudo_command(exe: &Path, helper: &Path, sock: &str) -> aterm_uds::spawnfd::Command {
+    let mut command = aterm_uds::spawnfd::command("/usr/bin/sudo");
+    command
+        .args(SUDO_ARGS)
+        .arg(exe)
+        .arg(COLLECTOR_VERB)
+        .env("SUDO_ASKPASS", helper)
+        .env(aterm_uds::sudo::ASKPASS_SOCK_ENV, sock)
+        .env_remove("ATERM_PARENT_SESSION_ID")
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::piped())
+        .start_suspended(true);
+    command
+}
+
 fn run(
     op: &Arc<Operation>,
     proxy: &aterm_window::event_loop::EventLoopProxy<Wake>,
@@ -587,17 +924,13 @@ fn run(
             );
         }
     };
-    let mut command = aterm_uds::spawnfd::command("/usr/bin/sudo");
-    command
-        .args(SUDO_ARGS)
-        .arg(&exe)
-        .arg(COLLECTOR_VERB)
-        .env("SUDO_ASKPASS", helper)
-        .env("ATERM_PARENT_SESSION_ID", &op.sid)
-        .stdin(aterm_uds::spawnfd::Stdio::piped())
-        .stdout(aterm_uds::spawnfd::Stdio::piped())
-        .stderr(aterm_uds::spawnfd::Stdio::piped())
-        .start_suspended(true);
+    let Some(sock) = crate::proxy::self_sock_path() else {
+        return (
+            status_report(op, "unavailable:this instance has no control socket", true),
+            true,
+        );
+    };
+    let mut command = sudo_command(&exe, &helper, &sock);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -993,21 +1326,47 @@ fn capture_matches(value: &Value, id: Identity, parent_pid: u32) -> bool {
 pub(crate) fn terminal_report_for_test(status: std::process::ExitStatus) -> Value {
     let operation = Operation {
         id: 1,
-        window: WindowId(1),
-        session: 1,
-        sid: "test-origin".into(),
-        cancelled: AtomicBool::new(false),
-        claims: Claims::default(),
-        retry_refused: AtomicBool::new(false),
-        residual: Mutex::new(None),
-        has_residual: AtomicBool::new(false),
-        reconciling: AtomicBool::new(false),
-        sudo: Mutex::new(None),
-        ticket: Mutex::new(None),
+        ..Operation::new(
+            Owner::next(),
+            Origin::Session {
+                window: WindowId(1),
+                session: 1,
+                sid: "test-origin".into(),
+            },
+            Starter::Control,
+        )
     };
     let mut report = status_report(&operation, "partial_or_failed", true);
     record_exit_status(&mut report, Some(status));
     report
+}
+
+/// `owner`'s operation for `session` in `window`, whose store sid is `sid`, started by
+/// `starter`, its sudo already bound (to a pid no test signals), as a collection's is once that
+/// sudo starts.
+#[cfg(test)]
+pub(crate) fn bound_operation_for_test(
+    owner: Owner,
+    window: WindowId,
+    session: u64,
+    sid: &str,
+    starter: Starter,
+) -> Arc<Operation> {
+    let operation = Operation::new(
+        owner,
+        Origin::Session {
+            window,
+            session,
+            sid: sid.to_owned(),
+        },
+        starter,
+    );
+    operation.bind_sudo_for_test(Identity {
+        pid: u32::MAX,
+        start_s: 0,
+        start_us: 0,
+    });
+    Arc::new(operation)
 }
 
 #[cfg(test)]

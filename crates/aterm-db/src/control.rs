@@ -32,6 +32,7 @@ pub(crate) mod enrollment;
 mod frontier;
 mod peer_check;
 mod peers;
+mod relay;
 
 use peer_check::Pass;
 
@@ -45,6 +46,12 @@ pub(crate) mod mutants;
 #[cfg(test)]
 #[path = "control_faults_tests.rs"]
 pub(crate) mod faults;
+
+/// What a session moves after its credential handoff, counted for a test, and the faults a
+/// test puts on it.
+#[cfg(test)]
+#[path = "control_tail_tests.rs"]
+pub(crate) mod tail;
 
 /// At most 4.5 MiB of sealed nodes are buffered per direction. The durable
 /// inventory, rather than an acknowledgement cursor, determines missing data.
@@ -374,6 +381,17 @@ fn before_retain(dir: &Path, wires: &[Vec<u8>]) {
     }
 }
 
+/// A local deferral's cause: an unavailable inventory's local refusal, else a refused batch's.
+/// A peer's unavailable inventory carries no cause of its own.
+pub(crate) fn deferral_cause(
+    inventory: Option<&crate::replica::InventoryDeferral>,
+    batch: Option<&crate::replica::BatchDeferral>,
+) -> Option<aterm_types::network_state::RepairCause> {
+    inventory
+        .and_then(|why| why.local_cause)
+        .or_else(|| batch.map(|why| why.cause))
+}
+
 /// Volatile scheduling hint, never a claim of delivery. Keep one per peer.
 /// Advancing past a deferred node prevents it from starving later restrictions;
 /// wraparound retries it even if the caller does not maintain a timer.
@@ -402,6 +420,12 @@ pub struct Repair {
     /// A protocol fence that refused this round's control exchange ([`Self::fenced`]).
     fence: Option<aterm_types::network_state::RepairCause>,
     handoff: Option<std::result::Result<usize, Failure>>,
+    /// Whether this side owes the peer a round it begins, in which it takes ([`Self::owing`]).
+    owing: crate::credentials::handoff::Owing,
+    /// What the trade of kept version reports with this peer left for its next round
+    /// ([`Endpoint::trade_relayed`]): how far the peer has been offered them, and whether it
+    /// left the last offer unanswered.
+    relay: relay::Relay,
 }
 impl Repair {
     /// This attempt's local progress, including its last operation on failure.
@@ -417,6 +441,7 @@ impl Repair {
         self.application_error = None;
         self.fence = None;
         self.handoff = None;
+        self.owing = crate::credentials::handoff::Owing::Nothing;
         self.data.retry_probe = false;
         self.data.deferral = None;
         self.data.batch_deferral = None;
@@ -462,12 +487,52 @@ impl Repair {
         self.application = Some(report);
         self
     }
+    /// This state once its round's credential handoff published `count` values, or failed
+    /// where `count` is none, this side owing the peer what `owing` says ([`Self::owing`])
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn handed(
+        mut self,
+        count: Option<usize>,
+        owing: crate::credentials::handoff::Owing,
+    ) -> Self {
+        self.handoff = Some(count.ok_or_else(|| {
+            Failure::new(
+                aterm_types::network_state::RepairCause::Other,
+                "credential handoff failed",
+            )
+        }));
+        self.owing = owing;
+        self
+    }
     /// This state once its scan took a turn at each of `common` tables both sides list
     /// ([`Self::cycled`]) (tests).
     #[cfg(test)]
     pub(crate) fn swept(mut self, common: usize) -> Self {
         self.data.swept(common);
         self
+    }
+    /// This state once a witness ask named `table` as differing, not yet visited
+    /// ([`Self::owed`]) (tests).
+    #[cfg(test)]
+    pub(crate) fn differing(mut self, table: Digest) -> Self {
+        self.data.differs(table);
+        self
+    }
+    /// This state once its round deferred its table, a received batch refused for `cause`
+    /// ([`Self::deferral_cause`]), and moved nothing (tests).
+    #[cfg(test)]
+    pub(crate) fn deferred_for(mut self, cause: aterm_types::network_state::RepairCause) -> Self {
+        self.data.batch_deferral = Some(crate::replica::BatchDeferral {
+            cause,
+            batch: "operations",
+            stage: "ingestion",
+            reason: String::new(),
+        });
+        self.applied(crate::replica::Report {
+            table_deferred: true,
+            ..Default::default()
+        })
     }
     /// Whether the dial scheduler asked this state's next round to ask which tables differ
     /// ([`Self::ask`]) (tests).
@@ -545,6 +610,11 @@ impl Repair {
     pub(crate) const fn said(&self) -> Said {
         self.said
     }
+    /// How far this state's peer has been offered the kept version reports (tests).
+    #[cfg(test)]
+    pub(crate) const fn relay(&self) -> hearing::Mark {
+        self.relay.mark
+    }
     /// What this round's application exchange read of this Mac's clock against the peer's
     /// (`crate::clock`, F22), whether or not its table repair then succeeded. None also covers a
     /// round that reached no table-ID list, a peer that sent two marks, and a pre-F22 peer that
@@ -580,6 +650,14 @@ impl Repair {
     pub const fn handoff(&self) -> Option<&std::result::Result<usize, Failure>> {
         self.handoff.as_ref()
     }
+    /// Whether this side, having answered the peer's credential handoff, owes the peer a round
+    /// it begins, in which it takes ([`crate::credentials::handoff::Handed::owing`]): its own
+    /// take did not run to its end in this round (over `atdb/3` to `atdb/5` only the side that
+    /// dials takes, or the exchange broke off), and it holds an Offer of the peer's that it would
+    /// take now, or it could not tell.
+    pub(crate) const fn owing(&self) -> crate::credentials::handoff::Owing {
+        self.owing
+    }
     /// The last application upgrade's failure in this round. A missing error
     /// does not establish that an application round completed; check
     /// [`Self::application`] separately. Starting another round clears it.
@@ -611,6 +689,15 @@ impl Repair {
     /// that acknowledged no incoming operations. Starting another round clears it.
     pub fn application_batch_deferral(&self) -> Option<&crate::replica::BatchDeferral> {
         self.data.batch_deferral.as_ref()
+    }
+    /// The local cause of this round's deferral ([`deferral_cause`]): what an
+    /// [`Self::application_deferral`] or an [`Self::application_batch_deferral`] names. A round
+    /// that deferred carries no application error, so [`Self::application_cause`] names none.
+    pub fn deferral_cause(&self) -> Option<aterm_types::network_state::RepairCause> {
+        deferral_cause(
+            self.application_deferral(),
+            self.application_batch_deferral(),
+        )
     }
     /// Name `table` for the rounds this side initiates from this state: once a round's peer
     /// authenticates, each repairs the first led table both sides list before its regular turn,
@@ -654,12 +741,21 @@ impl Repair {
     /// none shows no table round to do them in, and what the hints still name waits for one that
     /// does.
     pub fn pending(&self) -> bool {
+        self.owed().is_some()
+    }
+    /// Which work [`Self::pending`] names, the first of it a round takes
+    /// ([`crate::replica::Owed`]): a lead asked since this state's last round, else what the
+    /// peer's hints as that round left them name, where it completed a table exchange.
+    pub fn owed(&self) -> Option<crate::replica::Owed> {
         #[cfg(test)]
         let exchanged =
             self.application.is_some() || PENDING_UNEXCHANGED.with(std::cell::Cell::get);
         #[cfg(not(test))]
         let exchanged = self.application.is_some();
-        !self.requests.lead.is_empty() || (exchanged && self.data.pending())
+        if !self.requests.lead.is_empty() {
+            return Some(crate::replica::Owed::Lead);
+        }
+        exchanged.then(|| self.data.owed()).flatten()
     }
     /// The table scan has taken a regular turn ([`crate::replica::Report::regular`]) for each
     /// table the last round this side initiated had in common with the peer, counted since
@@ -739,6 +835,7 @@ impl Repair {
             self.membership_hint = MembershipHint::default();
             self.peer = Some((trust, actor));
             self.data = crate::replica::Repair::default();
+            self.relay = relay::Relay::default();
         }
     }
 
@@ -809,6 +906,13 @@ pub struct Endpoint {
     paths: Option<aterm_secrets::client::Paths>,
     credentials: Option<(crate::runtime::CredentialOwner, PathBuf)>,
     pending: bool,
+    /// The members' time-signed version reports this device keeps, traded after a completed
+    /// round ([`Self::trade_relayed`]); none where nothing keeps them (a pending device, a
+    /// tool's one round).
+    reports: Option<Arc<Mutex<hearing::Reports>>>,
+    /// The least release a peer must report for that trade: [`hearing::RELAYS`]. Only a test
+    /// sets another, since a test binary reports [`hearing::LIFTED`].
+    relay_floor: Version,
     /// Behave as 0.145 does: trade no version after a round.
     #[cfg(test)]
     pub(crate) legacy: bool,
@@ -849,7 +953,7 @@ enum Protocol {
     Legacy,
     Repair,
     Credentials,
-    /// `atdb/4` to `atdb/8`, as the wire names.
+    /// `atdb/4` to `atdb/9`, as the wire names.
     Frontier(frontier::Wire),
 }
 
@@ -862,6 +966,7 @@ impl Protocol {
             return Self::Frontier(frontier::Wire::Ranges);
         }
         match alpn {
+            Some(fleet::ALPN_DATABASE_PROOFS) => Self::Frontier(frontier::Wire::Proofs),
             Some(fleet::ALPN_DATABASE_RANGES) => Self::Frontier(frontier::Wire::Ranges),
             Some(fleet::ALPN_DATABASE_RECONCILE) => Self::Frontier(frontier::Wire::Reconcile),
             Some(fleet::ALPN_DATABASE_DUPLEX) => Self::Frontier(frontier::Wire::Duplex),
@@ -870,6 +975,35 @@ impl Protocol {
             Some(fleet::ALPN_DATABASE_CREDENTIALS) => Self::Credentials,
             Some(fleet::ALPN_DATABASE_REPAIR) => Self::Repair,
             _ => Self::Legacy,
+        }
+    }
+
+    /// The ALPN this protocol is negotiated by, or `no ALPN` for the fleet protocol a database
+    /// peer that offers none speaks.
+    pub(crate) const fn alpn(self) -> &'static str {
+        match self {
+            Self::Legacy => "no ALPN",
+            Self::Repair => "atdb/2",
+            Self::Credentials => "atdb/3",
+            Self::Frontier(frontier::Wire::Whole) => "atdb/4",
+            Self::Frontier(frontier::Wire::Delta) => "atdb/5",
+            Self::Frontier(frontier::Wire::Duplex) => "atdb/6",
+            Self::Frontier(frontier::Wire::Reconcile) => "atdb/7",
+            Self::Frontier(frontier::Wire::Ranges) => "atdb/8",
+            Self::Frontier(frontier::Wire::Proofs) => "atdb/9",
+        }
+    }
+
+    /// What this protocol lets table repair do ([`crate::replica::Tables`]): `atdb/9` reconciles
+    /// both of a table's inventories by range, `atdb/7` and `atdb/8` its operations by range and
+    /// its conflict proofs as one list, and every earlier protocol is refused table repair.
+    pub(crate) const fn tables(self) -> crate::replica::Tables {
+        match self {
+            Self::Frontier(frontier::Wire::Proofs) => crate::replica::Tables::Ranges,
+            Self::Frontier(frontier::Wire::Reconcile | frontier::Wire::Ranges) => {
+                crate::replica::Tables::ProofList
+            }
+            older => crate::replica::Tables::Refused(older.alpn()),
         }
     }
 }
@@ -1016,6 +1150,23 @@ impl Endpoint {
         config: PathBuf,
     ) -> Self {
         self.credentials = Some((owner, config));
+        self
+    }
+
+    /// Trade `reports`, the members' time-signed version reports this device keeps, with each
+    /// peer after a completed round ([`Self::trade_relayed`]). Its owner gives it the roster,
+    /// signs this device's own report into it and reads what rounds bring
+    /// (`crate::runtime`'s hearing tick).
+    pub(crate) fn with_reports(mut self, reports: Arc<Mutex<hearing::Reports>>) -> Self {
+        self.reports = Some(reports);
+        self
+    }
+
+    /// Trade kept reports with a peer that reports `floor` or later (tests): a test binary
+    /// reports [`hearing::LIFTED`], below [`hearing::RELAYS`].
+    #[cfg(test)]
+    pub(crate) fn relaying_from(mut self, floor: Version) -> Self {
+        self.relay_floor = floor;
         self
     }
 
@@ -1182,6 +1333,17 @@ impl Endpoint {
         self.application = self
             .application
             .map(|application| application.with_marks(marks));
+        self
+    }
+
+    /// Send at most `batches` operation batches a round, leaving the rest of a table's
+    /// difference to a later round (`Replica::with_drain_batches`, tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_drain_batches(mut self, batches: usize) -> Self {
+        self.application = self
+            .application
+            .map(|application| application.with_drain_batches(batches));
         self
     }
 
@@ -1373,6 +1535,8 @@ impl Endpoint {
                 paths: Some(paths),
                 credentials: None,
                 pending: true,
+                reports: None,
+                relay_floor: hearing::RELAYS,
                 #[cfg(test)]
                 legacy: false,
                 #[cfg(test)]
@@ -1409,6 +1573,13 @@ impl Endpoint {
 
     pub(crate) const fn pending(&self) -> bool {
         self.pending
+    }
+
+    /// Whether this endpoint's selection lists short now, read as its rounds read it and with no
+    /// peer (`crate::replica::Replica::listed_short`); none for an endpoint with no tables, or
+    /// where the selection could not be read.
+    pub(crate) fn listed_short(&self) -> Option<bool> {
+        self.application.as_ref()?.listed_short().ok()
     }
 
     /// The key this endpoint's discovery beacons name its lab by, enrolling or not
@@ -1488,7 +1659,7 @@ impl Endpoint {
             identity,
             hello,
             records_bound: aterm_secrets::crossing::RecordsBound::here(
-                aterm_secrets::crossing::past_legacy(log.held_count()),
+                aterm_secrets::crossing::past_legacy(log.known_count()),
             ),
             snapshot_log: Some(log),
             report,
@@ -1497,6 +1668,8 @@ impl Endpoint {
             peers: Arc::default(),
             paths: None,
             pending: false,
+            reports: None,
+            relay_floor: hearing::RELAYS,
             #[cfg(test)]
             legacy: false,
             #[cfg(test)]
@@ -1556,6 +1729,8 @@ impl Endpoint {
             peers: Arc::default(),
             paths: None,
             pending: false,
+            reports: None,
+            relay_floor: hearing::RELAYS,
             #[cfg(test)]
             legacy: false,
             #[cfg(test)]
@@ -1775,7 +1950,14 @@ impl Endpoint {
         // responders cannot each keep the channel whose initiator just lost.
         let preferred = (self.actor < actor) == (side == Side::Initiator);
         repair.phase = Phase::PeerAdmission;
-        let mut lease = self.lease_on(pass, actor, repair, preferred, until)?;
+        let mut lease = self.lease_on(
+            pass,
+            actor,
+            repair,
+            side == Side::Initiator,
+            preferred,
+            until,
+        )?;
         #[cfg(test)]
         tests::peer_cache_stage(tests::PeerCacheStage::Acquired(side));
         lease.prepare(self.trust, actor);
@@ -1822,7 +2004,7 @@ impl Endpoint {
                     if common & 4 != 0 {
                         self.require_legacy_records()?;
                         lease.phase = Phase::Credentials;
-                        lease.handoff =
+                        (lease.handoff, lease.owing) =
                             self.hand_off_credentials(check()?, actor, side, false, stream);
                     }
                     lease.phase = Phase::Complete;
@@ -1854,17 +2036,20 @@ impl Endpoint {
         Ok(report)
     }
 
-    /// The lease on `actor`'s channel ([`peers::Cache::acquire_on`]), the grant `pass` clears.
+    /// The lease on `actor`'s channel ([`peers::Cache::acquire_on`]), which this side `dialled`
+    /// or serves, the grant `pass` clears.
     fn lease_on<'a>(
         &'a self,
         pass: Pass,
         actor: Actor,
         repair: &'a mut Repair,
+        dialled: bool,
         preferred: bool,
         until: Instant,
     ) -> Result<peers::Lease<'a>> {
         pass.spend();
-        self.peers.acquire_on(actor, repair, preferred, until)
+        self.peers
+            .acquire_on(actor, repair, dialled, preferred, until)
     }
 
     /// The lease on a pending device's channel ([`peers::Cache::acquire`]), the grant `pass`
@@ -1879,9 +2064,28 @@ impl Endpoint {
         self.peers.acquire(actor, repair)
     }
 
+    /// Whether this endpoint, a credentials custodian, owes `peer` a round that it begins, in
+    /// which it takes the peer's Offer, judged with no round
+    /// ([`crate::credentials::handoff::owed_take`]); nothing where it holds no credentials
+    /// custody.
+    pub(crate) fn owed_take(&self, peer: Actor) -> crate::credentials::handoff::Owing {
+        let (Some(paths), Some((owner, config))) = (&self.paths, &self.credentials) else {
+            return crate::credentials::handoff::Owing::Nothing;
+        };
+        crate::credentials::handoff::owed_take(
+            paths,
+            config,
+            owner,
+            self.trust.network,
+            self.actor,
+            peer,
+        )
+    }
+
     /// Hand this endpoint's credentials to `actor` and take its own
     /// ([`crate::credentials::handoff::exchange`]), the grant `pass` clears: `None` where this
-    /// endpoint holds no credentials custody.
+    /// endpoint holds no credentials custody, with whether this side owes `actor` a round in
+    /// which it takes ([`Repair::owing`]).
     fn hand_off_credentials(
         &self,
         pass: Pass,
@@ -1889,25 +2093,29 @@ impl Endpoint {
         side: Side,
         bidirectional: bool,
         stream: &mut (impl Read + Write),
-    ) -> Option<std::result::Result<usize, Failure>> {
+    ) -> (
+        Option<std::result::Result<usize, Failure>>,
+        crate::credentials::handoff::Owing,
+    ) {
         pass.spend();
         let (Some(paths), Some((owner, config))) = (&self.paths, &self.credentials) else {
-            return None;
+            return (None, crate::credentials::handoff::Owing::Nothing);
         };
-        Some(
-            crate::credentials::handoff::exchange(
-                paths,
-                config,
-                owner,
-                self.trust.network,
-                self.actor,
-                actor,
-                side,
-                bidirectional,
-                stream,
-            )
-            .map_err(|error| Failure::new(error.repair_cause(), "credential handoff failed")),
-        )
+        let handed = crate::credentials::handoff::exchange(
+            paths,
+            config,
+            owner,
+            self.trust.network,
+            self.actor,
+            actor,
+            side,
+            bidirectional,
+            stream,
+        );
+        let count = handed
+            .count
+            .map_err(|error| Failure::new(error.repair_cause(), "credential handoff failed"));
+        (Some(count), handed.owing)
     }
 
     /// Synchronize verified membership records (`ACX2`) across bounded passes before control/table
@@ -2087,6 +2295,9 @@ impl Endpoint {
         }
         if let Some(application) = &self.application {
             repair.phase = Phase::Application;
+            // `atdb/7` and later reconcile table inventories by range; a peer on an earlier
+            // protocol is refused table repair ([`crate::replica::Tables::Refused`]).
+            repair.data.tables = protocol.tables();
             #[cfg(test)]
             if self.legacy_projection {
                 let result =
@@ -2095,12 +2306,6 @@ impl Endpoint {
                 repair.application = result.ok();
                 return;
             }
-            // `atdb/7` and `atdb/8` reconcile table inventories by range; every earlier wire trades
-            // them whole, as its released builds do.
-            repair.data.reconcile = matches!(
-                protocol,
-                Protocol::Frontier(frontier::Wire::Reconcile | frontier::Wire::Ranges)
-            );
             let result = if matches!(protocol, Protocol::Credentials | Protocol::Frontier(_)) {
                 application.exchange(stream, actor, side, &mut repair.data)
             } else {
@@ -3103,7 +3308,7 @@ impl<'a> MembershipDisk<'a> {
             aterm_secrets::crossing::RecordsBound::here(aterm_secrets::crossing::past_legacy(
                 store
                     .log()
-                    .map_or(0, aterm_secrets::membership_log::Log::held_count),
+                    .map_or(0, aterm_secrets::membership_log::Log::known_count),
             ))
         } else {
             bound

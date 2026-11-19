@@ -65,12 +65,26 @@ struct State {
     writer: String,
     stop: AtomicBool,
     lose_receive: AtomicBool,
-    active: Mutex<Option<TcpStream>>,
+    /// Every connection being served, by the number its accept gave it.
+    active: Mutex<Vec<(u64, TcpStream)>>,
     seen: Mutex<Vec<Observation>>,
 }
 
-/// One serialized loopback server and its owned object repository. Drop cancels its
-/// active socket/CGI work and joins the worker before removing the repository.
+impl State {
+    /// Connection `id` is no longer served.
+    fn served(&self, id: u64) {
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(each, _)| *each != id);
+    }
+}
+
+/// One loopback server and its owned object repository. Each connection is served on its own
+/// thread, as GitHub serves them: a request made while another is held (a receive parked in a
+/// hook that never returns) is answered, not queued behind it. Drop cancels every active
+/// socket's and CGI's work and joins the worker, which joins each connection's thread, before
+/// removing the repository.
 pub struct GitHttpBackend {
     state: Arc<State>,
     port: u16,
@@ -178,13 +192,15 @@ impl GitHttpBackend {
             writer: writer.to_owned(),
             stop: AtomicBool::new(false),
             lose_receive: AtomicBool::new(false),
-            active: Mutex::new(None),
+            active: Mutex::new(Vec::new()),
             seen: Mutex::new(Vec::new()),
         });
         let owned = Arc::clone(&state);
         let worker = std::thread::Builder::new()
             .name("git-http-fixture".into())
             .spawn(move || {
+                let mut serving: Vec<JoinHandle<()>> = Vec::new();
+                let mut accepted = 0u64;
                 loop {
                     if owned.stop.load(Ordering::SeqCst) {
                         break;
@@ -200,11 +216,32 @@ impl GitHttpBackend {
                     let Ok(active) = stream.try_clone() else {
                         continue;
                     };
-                    *owned.active.lock().unwrap_or_else(PoisonError::into_inner) = Some(active);
-                    if !owned.stop.load(Ordering::SeqCst) {
-                        serve(&stream, &owned);
+                    let id = accepted;
+                    accepted += 1;
+                    owned
+                        .active
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((id, active));
+                    if owned.stop.load(Ordering::SeqCst) {
+                        owned.served(id);
+                        break;
                     }
-                    *owned.active.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                    serving.retain(|thread| !thread.is_finished());
+                    let state = Arc::clone(&owned);
+                    let spawned = std::thread::Builder::new()
+                        .name("git-http-connection".into())
+                        .spawn(move || {
+                            serve(&stream, &state);
+                            state.served(id);
+                        });
+                    match spawned {
+                        Ok(thread) => serving.push(thread),
+                        Err(_) => owned.served(id),
+                    }
+                }
+                for thread in serving {
+                    let _ = thread.join();
                 }
             })?;
         Ok(Self {
@@ -255,12 +292,12 @@ impl GitHttpBackend {
 impl Drop for GitHttpBackend {
     fn drop(&mut self) {
         self.state.stop.store(true, Ordering::SeqCst);
-        if let Some(stream) = self
+        for (_, stream) in self
             .state
             .active
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
+            .iter()
         {
             let _ = stream.shutdown(Shutdown::Both);
         }

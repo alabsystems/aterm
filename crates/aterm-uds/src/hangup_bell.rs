@@ -64,6 +64,8 @@ struct Arm {
     id: u64,
     fd: RawFd,
     ring: Ring,
+    /// A hang-up was already reported for this registration; thread-end wakes are independent.
+    notified: bool,
 }
 
 /// What an arm's ring wakes. A ring runs on the bell's thread under its arms' lock, so each kind
@@ -167,6 +169,7 @@ impl Bell {
             id,
             fd: raw,
             ring: ring.into(),
+            notified: false,
         });
         Ok(Armed {
             shared: Arc::clone(shared),
@@ -258,10 +261,16 @@ impl Shared {
         self.arms.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Ring the arm registered under `id`, if it still stands.
+    /// Ring the arm registered under `id` once for a hang-up, if it still stands. The
+    /// thread's end may independently wake that arm again.
     fn ring(&self, id: u64) {
-        let arms = self.lock_arms();
-        if let Some(arm) = arms.rings.iter().find(|arm| arm.id == id) {
+        let mut arms = self.lock_arms();
+        if let Some(arm) = arms
+            .rings
+            .iter_mut()
+            .find(|arm| arm.id == id && !arm.notified)
+        {
+            arm.notified = true;
             arm.ring.ring();
         }
     }
@@ -379,8 +388,8 @@ mod sys {
             Ok(queue)
         }
 
-        /// Register `fd`'s write filter under `id`. `EV_CLEAR` resets the event as it is read,
-        /// so a hung-up descriptor is reported once, not at every wait.
+        /// Register `fd`'s write filter under `id`. `EV_CLEAR` resets its state when read;
+        /// `Shared::ring` supplies once-per-arm notification even if hang-up events recur.
         pub(super) fn add(&self, fd: RawFd, id: u64) -> io::Result<()> {
             let ident =
                 usize::try_from(fd).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;

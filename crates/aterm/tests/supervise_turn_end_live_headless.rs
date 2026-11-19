@@ -287,7 +287,8 @@ fn worker_events(events: &Path) -> Vec<(u64, String, SystemTime)> {
     seen
 }
 
-/// The lines of `path` once it holds `n` of them, or after `within`.
+/// The lines of `path` once it holds `n` of them, or after `within`: an observation window for a
+/// line that must not come (its callers assert it did not), not a hang detector, so a wall bound.
 fn lines_when(path: &Path, n: usize, within: Duration) -> Vec<String> {
     let deadline = Instant::now() + within;
     loop {

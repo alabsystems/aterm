@@ -3,11 +3,16 @@
 
 //! The verifier's remote boundary: GitHub goes through agh, local repositories through git.
 //! Pinned reads import an exact observed OID; ordinary main refreshes reuse the checkout's
-//! objects. Writes carry the expected ref and stop on an unknown outcome; one agh says sent
-//! nothing may be made again. Neither a failed agh command nor an unrecognised URL falls back
-//! to git. The reads every host makes (`engine`'s main refresh) build everywhere; the writes,
-//! the commit import and the deadline runners serve `verify land` alone and build where it does
-//! (unix).
+//! objects. Writes carry the expected ref and stop on an unknown outcome; one that sent nothing
+//! (agh says so, or its write started no child: [`Failed::Unstarted`]) may be made again, and
+//! one refused with no effect, by agh or by GitHub, for a reason another attempt does not cure
+//! ([`Pushed::Refused`]) is not. A push of main or of the journal runs on [`run_mutation`]: its
+//! work window's end, or an interrupt its caller reads, asks agh to stop, and its owner is kept
+//! through agh's settlement, never killed. Neither a failed agh command nor an unrecognised URL
+//! falls back to git.
+//! The reads every host makes (`engine`'s main refresh) build everywhere; the writes, the commit
+//! import and the deadline runners serve `verify land` and `verify watch` alone and build where
+//! they do (unix).
 
 use aterm_json::{Value, json};
 use aterm_uds::spawnfd::Command;
@@ -15,7 +20,28 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::Output;
 #[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// The window one write gets: the longest credential grant agh issues
+/// ([`agh::git::GRANT_MAX`]), beyond agh's own bounds on its write, the 60 s no-progress window
+/// agh gives each git child of a push that names no `--timeout` and agh's patience with a push
+/// that moved no remote ref ([`agh::git::GIT_BUDGET`]). agh opens its write's durable intent before its
+/// re-verification of the pushed history and records a settlement when it ends, so agh ends its
+/// own write: a write this tool killed would leave that intent open with no settlement at all,
+/// refusing every later atomic ref write of the repository from this Mac. A push of main
+/// (`land`'s `Wire::write`) has this work window from its own start, and the journal's pushes
+/// share one from the first admitted ([`run_mutation`]): its end asks agh to stop and keeps the
+/// owner through its settlement, so neither this window nor agh's per-child bound is a deadline
+/// on the whole write's cleanup. A push agh is asked to stop, or ends for want of progress
+/// (that window), once it may have sent its pack is settled Unknown (one whose transfer
+/// stalled only where agh's re-read does not find it landed), which keeps the intent open and
+/// refusing those writes until it is reconciled: once its agh and git are gone
+/// (`agh::Journal::closable`), the next atomic write reads its refs from origin and closes it
+/// only where they read wholly as before or wholly as after the write ([`IntentWait`]).
+#[cfg(unix)]
+pub(crate) const WRITE: Duration = agh::git::GRANT_MAX;
+#[cfg(unix)]
+const _: () = assert!(WRITE.as_secs() > agh::git::GIT_BUDGET.as_secs());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tool {
@@ -26,9 +52,47 @@ pub(crate) enum Tool {
 /// How a remote step is run: [`run`], or [`run_unless`].
 pub(crate) type Runner<'a> = dyn Fn(Tool, &[OsString]) -> Result<Output, String> + 'a;
 
+/// How a write is run: [`run_mutation`] in production.
+#[cfg(unix)]
+pub(crate) type Writer<'a> = dyn Fn(Tool, &[OsString]) -> Result<Output, Failed> + 'a;
+
+/// Why a remote step gave no output: whether its child started, which decides what a write
+/// that gave none means.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Failed {
+    /// No child started, so nothing was sent: the write was refused before it started (the run
+    /// took an interrupt first, or a push's work window or admission had ended:
+    /// [`run_mutation`]), or its command could not be made or started. A push whose write ends
+    /// so is one that sent nothing ([`Pushed::Unsent`]), never one of unknown outcome.
+    Unstarted(String),
+    /// Its child started and gave no whole output: its output could not be read whole, its
+    /// step's own hang detector ended it, or its work window or an interrupt asked it to stop. A
+    /// write that ends so has an unknown outcome.
+    Ended(String),
+}
+
+#[cfg(unix)]
+impl Failed {
+    /// The same failure, its reason rewritten by `say`.
+    pub(crate) fn map(self, say: impl FnOnce(String) -> String) -> Self {
+        match self {
+            Self::Unstarted(why) => Self::Unstarted(say(why)),
+            Self::Ended(why) => Self::Ended(say(why)),
+        }
+    }
+
+    /// The reason alone, for a caller that decides nothing by whether the child started.
+    pub(crate) fn why(self) -> String {
+        match self {
+            Self::Unstarted(why) | Self::Ended(why) => why,
+        }
+    }
+}
+
 /// The caller's explicit ownership policy for a mutation, separate from remote discovery.
 #[cfg(unix)]
-pub(crate) struct WriteRunner<'a>(pub(crate) &'a Runner<'a>);
+pub(crate) struct WriteRunner<'a>(pub(crate) &'a Writer<'a>);
 
 #[cfg(unix)]
 #[path = "remote_mutation.rs"]
@@ -253,9 +317,54 @@ pub(crate) enum Pushed {
         intent: agh::IntentId,
         why: String,
     },
-    /// agh could not run the write, says that it sent nothing, and settled its own intent (a
-    /// network, server or rate failure before the send): the same write may be made again.
+    /// Nothing was sent, so the same write may be made again: its write started no child
+    /// ([`Failed::Unstarted`]: the run took an interrupt first, its work window or admission had
+    /// ended, a GitHub push's input file could not be written, or git or agh could not be made or
+    /// started, so no intent was opened), or
+    /// agh could not run the write, says that it sent nothing, and settled its own intent closed
+    /// (a network, server or rate failure before the send, or a stop agh took before it
+    /// dispatched git: [`unsent`]).
     Unsent(String),
+    /// The write was refused with no effect, for a reason another attempt does not cure
+    /// ([`refused_with_no_effect`]): by agh before it sent anything (no credential or a 401, no
+    /// permission, input or usage it refuses, its own gate), or by GitHub, which rejected the push
+    /// it received (a branch rule, push protection, a token without the workflow scope). Nothing
+    /// was written and no intent is left open, so the push is not made again and leaves nothing
+    /// to settle.
+    Refused(String),
+}
+
+/// How a wait on another writer's open atomic intent ended ([`Remote::wait_for_intent`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntentWait {
+    /// The intent is closed (settled, found or retracted), so it stops no write.
+    Closed,
+    /// The intent is open and its writer, agh and its git child alike, is gone
+    /// (`agh::Journal::closable`). That permits the next atomic write to read the intent's
+    /// recorded refs from origin before it begins; it closes the intent only where every ref
+    /// reads as before its write (retracted) or every one as after it (found), and holds it
+    /// where they are mixed or cannot be read, or where that write's agh does not judge the
+    /// writer gone (its boot or process start unread). agh refuses that write with the same
+    /// diagnostic in all three cases ([`blocking_intent`]), so a later write the intent still
+    /// refuses cannot tell origin's settled answer from one a later attempt may change.
+    Reconcilable,
+    /// The intent is open, records no writer (`writer` is null: an agh from before writers were
+    /// recorded began it), and is settled with an unknown outcome, so its agh finished that
+    /// write. agh reconciles only a recorded writer's intent from origin, so no wait and no
+    /// later write closes it; once origin shows what that write did, `agh intent retract`
+    /// does.
+    Held,
+}
+
+/// The outcome of a push whose write ([`Writer`]) gave no output: one that started no child sent
+/// nothing ([`Pushed::Unsent`]); one that started has an unknown outcome, an error.
+#[cfg(unix)]
+fn unanswered(failed: Failed) -> Result<Pushed, String> {
+    match failed {
+        Failed::Unstarted(why) => Ok(Pushed::Unsent(why)),
+        Failed::Ended(why) => Err(why),
+    }
 }
 
 /// agh's one machine diagnostic of a failed command: the fields a caller decides by.
@@ -310,15 +419,39 @@ fn blocking_intent(out: &Output, repo: &str) -> Option<agh::IntentId> {
 }
 
 /// Whether agh's diagnostic says the write could not run and sent nothing: one of its kinds a
-/// later attempt may cure (could not run, a rate limit, a server failure), with no side effect,
-/// for this repository where it names one. agh settles such a write's intent itself, so the
-/// journal holds nothing open for it. Any other failure keeps its own meaning.
+/// later attempt may cure (could not run, a rate limit, a server failure, or a stop agh took
+/// before it dispatched git: a signal sent to agh itself, or its cancellation watcher's own
+/// stop; one this run asked for through the mutation's control is the capture's damage,
+/// [`run_mutation`], and never read here), with no side effect, for this repository where it
+/// names one. agh settles such a write's intent itself (never sent), so the journal holds
+/// nothing open for it. Another kind with no effect is a refusal ([`refused_with_no_effect`]);
+/// any other failure keeps its own meaning.
 #[cfg(unix)]
 fn unsent(out: &Output, repo: &str) -> bool {
     refusal(out).is_some_and(|error| {
         matches!(
             (error.exit, error.kind.as_str()),
-            (3, "could_not_run") | (11, "rate_limited") | (12, "server")
+            (3, "could_not_run") | (11, "rate_limited") | (12, "server") | (130, "interrupted")
+        ) && error.side_effect == "none"
+            && error.repo.as_deref().is_none_or(|named| named == repo)
+    })
+}
+
+/// Whether agh's diagnostic is a refusal with no effect that another attempt does not cure: no
+/// side effect (nothing was written, though the push may have been sent), for this repository
+/// where it names one, of any kind but the four [`unsent`] makes again and an unknown outcome
+/// (exit 13, which agh never settles as not sent, and whose pre-send intent refusal is
+/// [`blocking_intent`]'s). agh refuses so itself before it opens an intent (its login binding,
+/// route, permission and input checks), or settles the one it opened closed, never sent or
+/// refused, GitHub's own rejection of the push it received included (a `[remote rejected]` rule,
+/// the workflow scope), so nothing is left open. An expected-ref conflict (exit 9) is read
+/// before this, as a rejection.
+#[cfg(unix)]
+fn refused_with_no_effect(out: &Output, repo: &str) -> bool {
+    refusal(out).is_some_and(|error| {
+        !matches!(
+            error.kind.as_str(),
+            "could_not_run" | "rate_limited" | "server" | "interrupted" | "outcome_unknown"
         ) && error.side_effect == "none"
             && error.repo.as_deref().is_none_or(|named| named == repo)
     })
@@ -362,16 +495,6 @@ impl<'a> Remote<'a> {
             kind,
             run,
         })
-    }
-
-    /// The GitHub `OWNER/REPO` this remote names; `None` for a local repository. Read by
-    /// `verify watch` alone, which builds on unix only.
-    #[cfg(unix)]
-    pub(crate) fn github(&self) -> Option<&str> {
-        match &self.kind {
-            Kind::Github(slug) => Some(slug),
-            Kind::Local(_) => None,
-        }
     }
 
     /// Reject a source agh cannot push before the caller spends time judging it.
@@ -583,9 +706,23 @@ impl<'a> Remote<'a> {
     /// leases the expected ref too, so a ref moved anywhere else, back to an ancestor of `after`
     /// included (a fast-forward plain git would take), refuses it. An unknown outcome stops the
     /// caller; only a typed refusal which sent nothing permits observation of the blocking
-    /// intent ([`Pushed::Blocked`]) or the same write again ([`Pushed::Unsent`]).
-    /// Publish using an explicitly supplied mutation owner; discovery continues to use the
-    /// remote's reader. No command text is used to guess which lifetime a step needs.
+    /// intent ([`Pushed::Blocked`]) or the same write again ([`Pushed::Unsent`]), as does a
+    /// write that started no child ([`Failed::Unstarted`]), a GitHub push whose input file could
+    /// not be written included. Any other typed refusal agh says had no effect (its own
+    /// authentication, permission, input or usage refusal, or GitHub's rejection of the push it
+    /// received) is [`Pushed::Refused`]: neither made again nor of unknown outcome.
+    ///
+    /// Publish using an explicitly supplied mutation owner (`write`, [`run_mutation`] in
+    /// production); discovery continues to use the remote's reader, so no read's deadline ends
+    /// the push. No command text is used to guess which lifetime a step needs. The push names no
+    /// `--timeout`, so agh bounds each git child of its write by its 60 s no-progress window in
+    /// place of a wall bound: it ends one whose process tree is still that long, or whose HTTP
+    /// transfer moves less than a byte a second that long (a remote that holds the connection
+    /// open and never answers, which the tree cannot show), so a stalled push ends inside agh
+    /// long before the owner's work window would ask it to stop; once its pack may have gone,
+    /// agh never pushes it again: a push a re-read finds landed is [`Pushed::Done`], and any
+    /// other is settled Unknown, its intent open until it is reconciled, and is an error of
+    /// unknown outcome here.
     #[cfg(unix)]
     pub(crate) fn push_with(
         &self,
@@ -594,14 +731,32 @@ impl<'a> Remote<'a> {
         before: Option<&str>,
         after: &str,
     ) -> Result<Pushed, String> {
+        self.push_from(write, &aterm_tempfile::tempdir, reference, before, after)
+    }
+
+    /// [`Self::push_with`], a GitHub push's input file written in the directory `scratch` makes:
+    /// one that cannot be made, or an input that cannot be written in it, is a write that started
+    /// no child ([`Failed::Unstarted`]), so the push sent nothing ([`Pushed::Unsent`]).
+    #[cfg(unix)]
+    fn push_from(
+        &self,
+        write: WriteRunner<'_>,
+        scratch: &dyn Fn() -> std::io::Result<aterm_tempfile::TempDir>,
+        reference: &str,
+        before: Option<&str>,
+        after: &str,
+    ) -> Result<Pushed, String> {
         match &self.kind {
             Kind::Local(_) => {
                 let destination = format!("{after}:{reference}");
                 let lease = format!("--force-with-lease={reference}:{}", before.unwrap_or(""));
-                let out = (write.0)(
+                let out = match (write.0)(
                     Tool::Git,
                     &local_words(&["push", "--porcelain", &lease, self.name, &destination]),
-                )?;
+                ) {
+                    Ok(out) => out,
+                    Err(failed) => return unanswered(failed),
+                };
                 Ok(if out.status.success() {
                     Pushed::Done
                 } else {
@@ -613,21 +768,34 @@ impl<'a> Remote<'a> {
                 })
             }
             Kind::Github(slug) => {
-                let dir = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
+                let unwritten = |error: std::io::Error| {
+                    unanswered(Failed::Unstarted(format!(
+                        "Agh remote write: its input could not be written: {error}; nothing was \
+                         sent"
+                    )))
+                };
+                let dir = match scratch() {
+                    Ok(dir) => dir,
+                    Err(error) => return unwritten(error),
+                };
                 let input = dir.path().join("push.json");
                 let before = before.unwrap_or("0000000000000000000000000000000000000000");
-                std::fs::write(
+                if let Err(error) = std::fs::write(
                     &input,
                     json!([{"ref":reference,"before":before,"after":after}]).to_string(),
-                )
-                .map_err(|e| e.to_string())?;
+                ) {
+                    return unwritten(error);
+                }
                 let mut args = words(&["repo", "push", slug]);
                 args.extend([
                     self.root.as_os_str().to_owned(),
                     "--input".into(),
                     input.into_os_string(),
                 ]);
-                let out = (write.0)(Tool::Agh, &args)?;
+                let out = match (write.0)(Tool::Agh, &args) {
+                    Ok(out) => out,
+                    Err(failed) => return unanswered(failed),
+                };
                 if out.status.success() {
                     return Ok(Pushed::Done);
                 }
@@ -638,6 +806,8 @@ impl<'a> Remote<'a> {
                     Ok(Pushed::Blocked { intent, why })
                 } else if unsent(&out, slug) {
                     Ok(Pushed::Unsent(why))
+                } else if refused_with_no_effect(&out, slug) {
+                    Ok(Pushed::Refused(why))
                 } else if out.status.code() == Some(13) {
                     Err(format!(
                         "{why}; outcome unknown: reconcile agh's intent before another write"
@@ -650,15 +820,22 @@ impl<'a> Remote<'a> {
     }
 
     /// Observe only the exact foreign journal entry which refused our pre-send attempt, until
-    /// it is closed or its dead writer can be reconciled by the next atomic write
-    /// (`closable`), when the push is made again. The caller owns the
-    /// deadline; neither journal reads nor superseding writers extend it.
+    /// it is closed, its dead writer can be reconciled by the next atomic write (`closable`),
+    /// when the push is made again, or it is held for good: which of the three ended the wait
+    /// ([`IntentWait`]). The caller owns the deadline; neither journal reads nor superseding
+    /// writers extend it.
     #[cfg(unix)]
     pub(crate) fn wait_for_intent(
         &self,
         intent: &agh::IntentId,
         pause: &dyn Fn() -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<IntentWait, String> {
+        /// Whether the document records a writer: `Some(false)` for `"writer": null`, `None`
+        /// where the agh that printed it prints no `writer` at all.
+        fn recorded<'de, D: serde::Deserializer<'de>>(writer: D) -> Result<Option<bool>, D::Error> {
+            <Option<serde::de::IgnoredAny> as serde::Deserialize>::deserialize(writer)
+                .map(|writer| Some(writer.is_some()))
+        }
         let Kind::Github(slug) = &self.kind else {
             return Err("a local remote has no agh intent".into());
         };
@@ -676,6 +853,12 @@ impl<'a> Remote<'a> {
                 /// agh's next atomic write can reconcile it from origin (`agh::Journal::closable`).
                 #[serde(default)]
                 closable: bool,
+                /// Whether it records its writer ([`recorded`]).
+                #[serde(default, deserialize_with = "recorded")]
+                writer: Option<bool>,
+                /// How its writer settled it, `None` before that.
+                #[serde(default)]
+                settled: Option<String>,
             }
             let doc: Intent = aterm_json::from_slice(&bytes)
                 .map_err(|_| "agh intent returned invalid JSON".to_owned())?;
@@ -686,8 +869,14 @@ impl<'a> Remote<'a> {
             {
                 return Err("agh intent identity does not match the refused atomic push".into());
             }
-            if !doc.open || doc.closable {
-                return Ok(());
+            if !doc.open {
+                return Ok(IntentWait::Closed);
+            }
+            if doc.closable {
+                return Ok(IntentWait::Reconcilable);
+            }
+            if doc.writer == Some(false) && doc.settled.is_some() {
+                return Ok(IntentWait::Held);
             }
             pause()?;
         }

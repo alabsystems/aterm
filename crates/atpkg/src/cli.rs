@@ -336,6 +336,17 @@ const TABLE: &[Verb] = &[
         applies_machine: false,
         run: crate::capacity::verb,
     },
+    #[cfg(target_os = "macos")]
+    Verb {
+        name: "claim",
+        tier: Tier::Occasional,
+        usage: crate::claim_command::USAGE,
+        arity: Arity::Own,
+        program_flags: None,
+        mutates_store: false,
+        applies_machine: false,
+        run: crate::claim_command::raw_entry_required,
+    },
     Verb {
         name: "app-swap",
         tier: Tier::Plumbing,
@@ -669,6 +680,58 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b_chars.len()]
 }
 
+/// THE STANDALONE `atpkg` EXECUTABLE'S WHOLE `main`: the dev-only `[[bin]]`s that are atpkg alone
+/// call it and nothing else (this package's `atpkg`, `src/main.rs`; aterm-verify's
+/// `aterm-verify-candidate-helper`, the helper its released-shim tests hand a candidate shim, so
+/// those tests run a binary of their own package). The `aterm` binary serves `aterm pkg`
+/// in-process through [`main_entry`] instead, and the bundle ships `atpkg` as an argv0 symlink
+/// onto `aterm`.
+///
+/// Call it first in `main`, while the process has one thread, as aterm's `main` does: a build's
+/// claim holder ([`crate::build_admit::hold::entry`]) forks away from its front's spawn, and this
+/// executable is recorded as the one the front spawns that holder from (and tethered spawns run
+/// through, [`aterm_uds::tether::entry`]).
+///
+/// It names no fleet source ([`crate::peers::set_fleet`]), so a download it runs races only the
+/// LAN peers a person wrote in `[packages] peers`, never this Mac's fleet members. The source the
+/// `aterm` binary sets (`crates/aterm/src/unit_peers.rs`) is not a call or two away: it reads
+/// `aterm-net`'s fleet book and the swarm's sharing switch, which atpkg does not depend on, and
+/// `aterm-cli` depends on atpkg, so this package cannot link it.
+///
+/// `__qualify_retained_helper`, alone, qualifies the executable's real retained image (exit 0 and
+/// `retained helper prepared`) before a test starts a separately bounded admission/consumer
+/// phase; no producer override exists. Any other first word is [`main_entry`]'s.
+pub fn standalone_entry() -> ExitCode {
+    if let Some(code) = crate::build_admit::hold::entry() {
+        return code;
+    }
+    if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "__qualify_retained_helper")
+    {
+        if args.len() != 1 {
+            return ExitCode::from(2);
+        }
+        return match aterm_uds::tether::prepared_executable_within(
+            aterm_uds::deadline::FIRST_EXEC_HANG,
+        ) {
+            Ok(Some(_)) => {
+                println!("retained helper prepared");
+                ExitCode::SUCCESS
+            }
+            result => {
+                eprintln!("retained helper qualification failed: {result:?}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    main_entry(args)
+}
+
 /// The whole package-manager CLI as a callable.
 pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     // This explicit private-prefix producer must not enter the configured machine/store pass.
@@ -687,6 +750,12 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     let private_lead = argv.first().and_then(|v| v.to_str()) == Some(PRIVATE_STATE_ROOT_FLAG);
     if private_lead {
         argv.remove(0);
+    }
+    // The public exec wire owns inherited originals and raw PROGRAM/ARGS.
+    // Capture before store/ledger opens and before generic lossy String parsing.
+    #[cfg(target_os = "macos")]
+    if argv.first().and_then(|word| word.to_str()) == Some("claim") {
+        return crate::claim_command::command(&argv[1..]);
     }
     PRIVATE_STATE_ROOT_LEAD.with(|cell| cell.set(private_lead));
     HEAD_WATCH_PASS.with(|cell| cell.set(false));
@@ -12759,8 +12828,13 @@ fn sysroot_link_bins(
 
 /// Release `program`'s hold if a named harness install made it ([`crate::pin::set_held`]):
 /// `Ok(true)` when it did and its pin is gone, `Ok(false)` when the pin is the person's own.
+///
+/// # Errors
+/// A holds file that does not read ([`crate::pin::marks_hold`]: it is left as it is, and a hold
+/// it may mark is never taken for the person's own pin), or a pin or hold that cannot be
+/// written.
 fn release_named_hold(layout: &crate::store::Layout, program: &str) -> std::io::Result<bool> {
-    if !crate::pin::is_held(layout, program)? {
+    if !crate::pin::marks_hold(layout, program)? {
         return Ok(false);
     }
     crate::pin::set_pinned(layout, program, false)?;

@@ -59,8 +59,9 @@ pub(crate) struct TokenFact {
     pub(crate) key: String,
     /// The roster row's label, where one names the account.
     pub(crate) label: Option<String>,
-    /// The account's email.
-    pub(crate) email: String,
+    /// The account's email, where the view knows one
+    /// ([`aterm_agent::harness::accounts_token_view::AccountToken::email`]).
+    pub(crate) email: Option<String>,
     /// The state's one word (`active`, `soon`, `none`, …).
     pub(crate) state: String,
     /// The state and its value-free detail, and "not yet in vault" while a write made here waits.
@@ -91,10 +92,6 @@ pub(crate) struct TokenFact {
     pub(crate) logged_in: bool,
     /// The vault column as a person reads it (`in vault`, `not yet in vault (waiting: …)`).
     pub(crate) vault_words: Option<String>,
-    /// The other Macs whose sessions ran on the token at the last fleet read.
-    pub(crate) peers: Vec<String>,
-    /// When that fleet read was.
-    pub(crate) peers_read_at: Option<u64>,
     /// The account's token step a check stopped, while its record holds it, in the record's own
     /// words (`stopped 14 Nov: …; it is tried again only at …`), shown on demand
     /// ([`aterm_agent::harness::token_steps`]).
@@ -110,7 +107,7 @@ impl TokenFact {
         Self {
             key: account.into(),
             label: label.map(str::to_owned),
-            email: email.into(),
+            email: Some(email.into()),
             state: kind.word().to_owned(),
             words: kind.words(),
             phrase: None,
@@ -125,8 +122,6 @@ impl TokenFact {
             login: LoginHere::Half(LoginHalf::Ok),
             logged_in: false,
             vault_words: None,
-            peers: Vec::new(),
-            peers_read_at: None,
             step: None,
         }
     }
@@ -185,7 +180,9 @@ impl Tokens {
         let facts = &self.facts;
         label
             .and_then(|label| facts.iter().find(|f| f.label.as_deref() == Some(label)))
-            .or_else(|| email.and_then(|email| facts.iter().find(|f| f.email == email)))
+            .or_else(|| {
+                email.and_then(|email| facts.iter().find(|f| f.email.as_deref() == Some(email)))
+            })
     }
 
     /// The account of a tab whose footer says `facts`: its roster row's label, else its email.
@@ -241,6 +238,39 @@ pub(crate) fn status_fields(
             .map_or("-", |fact| fact.state.as_str()),
     };
     format!("auth={auth} token={token}")
+}
+
+/// `ctl status`'s `auth=` and `token=` for the tab of `timeline`: what its footer says
+/// ([`status_fields`]), or, while its claim's record stream feeds `account`, what the latest
+/// `account` record says ([`stream_fields`]); the footer's route and the vault's token facts
+/// stand down for exactly that long.
+#[must_use]
+pub(crate) fn status_of(timeline: &crate::session_timeline::SessionTimeline) -> String {
+    match timeline.agent().streamed.fed_account() {
+        Some(account) => stream_fields(&account.state),
+        None => {
+            let facts = timeline.claude_footer();
+            status_fields(
+                facts.and_then(|f| f.route.as_ref()),
+                footer_account(facts),
+                shown().as_deref(),
+            )
+        }
+    }
+}
+
+/// `ctl status`'s `auth=- token=<state>` for a tab whose claim's record stream feeds `account`
+/// (`docs/HARNESS-CONTRACT.md`): an `account` record names no sign-in route, so `auth=` says
+/// nothing, and `token=` is the account's state as the harness words it, percent-encoded (`-`
+/// for an empty one).
+#[must_use]
+pub(crate) fn stream_fields(state: &str) -> String {
+    let token = if state.is_empty() {
+        "-".to_string()
+    } else {
+        crate::control::pct_encode(state)
+    };
+    format!("auth=- token={token}")
 }
 
 #[cfg(not(test))]
@@ -331,7 +361,6 @@ pub(crate) fn facts_of_view(
                 if account.not_yet() {
                     words.push_str("; not yet in vault");
                 }
-                let used = account.row.as_ref().map(|row| &row.used_on);
                 let verified = account.verified();
                 TokenFact {
                     kind: account.state.clone(),
@@ -344,8 +373,6 @@ pub(crate) fn facts_of_view(
                     login: account.login,
                     logged_in: account.logged_in,
                     vault_words: account.vault_words(),
-                    peers: used.map(|used| used.peers.clone()).unwrap_or_default(),
-                    peers_read_at: used.and_then(|used| used.peers_read_at),
                     step: steps.get(&account.key).map(|step| {
                         let person = Step::Token {
                             word: account.word(),

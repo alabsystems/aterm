@@ -7,9 +7,8 @@
 //! ([`crate::stats_deck::bands_px`]), one head reservation
 //! ([`crate::stats_deck::reserved_deck_px`]). A window carries it or it does not
 //! (`WindowState::carries_band`): the first window a process creates is born with it, every
-//! later window without, and a person moves it per window (View ▸ Show System Resources Here,
-//! [`App::toggle_window_band`]). There is no main window: closing the window that carries the
-//! band, or dragging its last tab out, moves the band nowhere.
+//! later window without, and a person moves it per window (View ▸ Expand System Resources Here,
+//! [`App::toggle_window_band`]). The main window's successor takes the expanded chrome when it becomes the tab home.
 //!
 //! A window's own form is a pure function of the setting (`[sys] stats_bars`) and that bit:
 //! [`StatsBars::in_window`], read through [`App::window_bars`] by every site that sizes or
@@ -22,7 +21,7 @@ use crate::stats_deck::StatsBars;
 
 /// What a refused gesture is told ([`App::toggle_window_band`]).
 pub(crate) const BAND_PERSON_ONLY: &str =
-    "Show System Resources Here is the person's own act at the window";
+    "Expand System Resources Here is the person's own act at the window";
 
 impl StatsBars {
     /// The form a window takes under this setting, where `carries` is whether the window
@@ -52,7 +51,7 @@ impl App {
         self.windows.get(&wid).is_some_and(|ws| ws.carries_band)
     }
 
-    /// View ▸ Show System Resources Here: window `wid` takes the System Resources band, or
+    /// View ▸ Expand System Resources Here: window `wid` takes the System Resources band, or
     /// gives it up for the Sill. A person's act: a gesture no person at the window stands
     /// behind ([`Self::gesture_unvouched`]: a control client's key into the palette, an
     /// accessibility client's, relayed input) is refused with [`BAND_PERSON_ONLY`]. And only
@@ -83,6 +82,22 @@ impl App {
         if self.stats_bars_form() != StatsBars::Deck {
             return false;
         }
+        let expanded = !self.window_carries_band(wid);
+        self.set_window_band(wid, expanded)
+    }
+
+    /// Give the surviving tab home the main window's chrome.
+    pub(crate) fn promote_tab_home_chrome(&mut self, wid: WindowId) {
+        self.refresh_window_tabs(wid);
+        if !self.window_carries_band(wid) {
+            self.set_window_band(wid, true);
+        }
+        if self.docks_at_birth() && self.dock_view(wid).is_none() {
+            let _ = self.set_dock(wid, crate::app_window::DOCK_CELLS);
+        }
+    }
+
+    fn set_window_band(&mut self, wid: WindowId, expanded: bool) -> bool {
         // The size the window keeps, read under the head it has now.
         let Some(held) = self.held_inner_px(wid) else {
             return false;
@@ -91,7 +106,7 @@ impl App {
             let Some(mut ws) = self.windows.get_mut(&wid) else {
                 return false;
             };
-            ws.carries_band = !ws.carries_band;
+            ws.carries_band = expanded;
             // A card that goes with the form leaves the native page under it to be hovered
             // again, as a closed lens does.
             if ws.stats_lens.open.is_some() || ws.stats_lens.rect.is_some() {

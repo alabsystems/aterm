@@ -12,7 +12,7 @@ use crate::model::Snapshot;
 /// Machine measurements beside the jobs: spare CPU is not a reservation, and an old slot
 /// reading is not a promise of admission. Keep the ages and unavailable readings visible.
 #[must_use]
-pub fn capacity_json(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> Jv {
+pub fn capacity_json(s: &Snapshot, as_of_ms: u64, age_ms: Option<u64>) -> Jv {
     let cpu = s.cpu.as_ref();
     let slots = match s.slots {
         Some(crate::model::SlotsView::Read {
@@ -29,7 +29,9 @@ pub fn capacity_json(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> Jv {
             ("unknown", Jv::u(u64::from(unknown))),
             (
                 "age_ms",
-                Jv::u(age_ms.saturating_add(s.slots_age_ms.unwrap_or(0))),
+                age_ms
+                    .map(|age| age.saturating_add(s.slots_age_ms.unwrap_or(0)))
+                    .map_or_else(|| Jv::why("not_sampled:observation_age"), Jv::u),
             ),
         ]),
         Some(crate::model::SlotsView::Unread(why)) => Jv::why(why.word()),
@@ -37,7 +39,10 @@ pub fn capacity_json(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> Jv {
     };
     Jv::obj([
         ("as_of_ms", Jv::u(as_of_ms)),
-        ("age_ms", Jv::u(age_ms)),
+        (
+            "age_ms",
+            age_ms.map_or_else(|| Jv::why("not_sampled:observation_age"), Jv::u),
+        ),
         (
             "cpu_busy_mc",
             cpu.and_then(|c| c.current_busy()).map_or_else(
@@ -68,7 +73,7 @@ pub fn capacity_json(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> Jv {
 
 /// Human-readable counterpart of [`capacity_json`], with the machine snapshot's own age.
 #[must_use]
-pub fn capacity_text(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> String {
+pub fn capacity_text(s: &Snapshot, as_of_ms: u64, age_ms: Option<u64>) -> String {
     let cpu = s.cpu.as_ref().map_or_else(
         || "unavailable(not_sampled)".to_owned(),
         |c| {
@@ -101,11 +106,20 @@ pub fn capacity_text(s: &Snapshot, as_of_ms: u64, age_ms: u64) -> String {
         }) => format!(
             "{}/{n} confirmed free, {pending} awaiting confirmation, {unknown} unknown, age_ms={} (paired slot observations; admission queue not measured)",
             free.saturating_sub(discounted),
-            age_ms.saturating_add(s.slots_age_ms.unwrap_or(0))
+            age_ms
+                .map(|age| age.saturating_add(s.slots_age_ms.unwrap_or(0)))
+                .map_or_else(
+                    || "unavailable(not_sampled:observation_age)".into(),
+                    |age| age.to_string()
+                )
         ),
         Some(crate::model::SlotsView::Unread(why)) => format!("unavailable({})", why.word()),
         None => "unavailable(not_sampled)".to_owned(),
     };
+    let age_ms = age_ms.map_or_else(
+        || "unavailable(not_sampled:observation_age)".into(),
+        |age| age.to_string(),
+    );
     format!(
         "machine as_of_ms={as_of_ms} age_ms={age_ms} cpu={cpu} · available={available} · pressure={pressure} · build_slots={slots}"
     )

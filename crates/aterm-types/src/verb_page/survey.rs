@@ -186,8 +186,9 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "`account pool=<cli> id=<pct> email=<pct|-> condition=<word> enrolled=<0|1> \
                      pct5=<n|-> pct7=<n|-> week_reset=<unix s|-> walled_until=<unix s|-> \
-                     last_used=<unix s|-> read_at=<unix s|-> launch=<0|1|-> token=<state|->` (on \
-                     this machine's clock; `id`: the row's label, the key `--host any` matches; \
+                     model_walls=<bucket:unix s,…|-> last_used=<unix s|-> read_at=<unix s|-> \
+                     launch=<0|1|-> token=<state|->` (on this machine's clock; `id`: the row's \
+                     label, the key `--host any` matches; \
                      `email`: the account's address, which a reader shows it by, `-` where none \
                      is known; `enrolled`: its login is \
                      made here, as a launch judges it, which for a Claude Code row with no dir is \
@@ -196,6 +197,11 @@ pub(crate) const PAGE: Page = Page {
                      with a window read full, or a refusal in its rollouts, says `limited`, and \
                      one with no reading in six hours, or none since its newest wall, says \
                      `unseen`, not `usable`; a `week_reset` no read named is the latest it can be; \
+                     `model_walls`: each model's own weekly wall standing on the row (Fable's \
+                     `seven_day_overage_included`, Opus's, Sonnet's) and when it ends, which walls \
+                     that model's sessions alone and so is in neither `condition` nor \
+                     `walled_until`, `-` or no field where none stands or from an aterm too old \
+                     to say; \
                      `launch=1`: a worker with no starter of its kind would start on this row \
                      here, under the accounts mode, the owner's pin and the Codex build, which no \
                      row of a pool says where that launch is refused, runs on a login no row \
@@ -208,8 +214,10 @@ pub(crate) const PAGE: Page = Page {
                 ),
                 para(
                     "After the session rows come, in this order: a `release_line alive=<0|1|-> \
-                     data=<pct JSON>` row per release run this Mac's state folder records \
-                     (`alive=` whether its process still runs), the `account` rows, at `content` \
+                     data=<pct JSON>` row per release run this Mac's state folder records whose \
+                     process still runs (`1`), is unknown here (`-`), or ended (`0`) within its \
+                     four-hour lease, live first, then unknown, then ended, each newest first, \
+                     at most 64 KiB of them; the `account` rows, at `content` \
                      a `repo name=<pct> path= head= branch= main= behind= fetched_at= \
                      dirty=<0|1|->` row per checkout of that read, and one `server_heard \
                      vault=<pct> subject=<age1…> at=<unix s>` row per subscriber a vault served \

@@ -2114,8 +2114,14 @@ impl Store {
         events.extend(self.finalize_auth(&mut state, &mut logins, final_raw.as_ref())?);
         advance_renewal_generations(&before.1, &mut logins, &events)?;
         let managed_after = raw_after.as_ref().filter(|_| !state.contextual_auth);
-        let auth_changed =
-            auth_scope::finish(&mut state, &before.1, managed_after, &mut logins, &events)?;
+        let auth_changed = auth_scope::finish(
+            &mut state,
+            &before.1,
+            managed_after,
+            &mut logins,
+            &events,
+            now,
+        )?;
         let workflow_changed =
             workflow_scope::finish(&before.1, raw_after.as_ref(), &mut logins, &mut events)?;
         let auth_changed = auth_changed || workflow_changed;

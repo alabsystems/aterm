@@ -578,7 +578,7 @@ Run aterm's checks in place, alone or in any combination.
   verify census --fix             move test modules a release build reads out of line
   verify release --app <APP>      everything publication requires
   verify release --tree           its tree half: no bundle, nothing timed
-  verify watch                    the follower: judges main tips, posts commit statuses
+  verify watch                    the follower: judges main tips into refs/aterm/judged
   verify watch --once             judge one tip; return repair context to the caller
   verify land                     merge main, judge the cone since it, push; compose a
                                   moved main, or judge the merge over what the two

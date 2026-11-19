@@ -3,6 +3,27 @@
 
 use super::*;
 
+fn git(root: &Path, args: &[&str]) -> String {
+    identity(Path::new("git"), root, args).unwrap()
+}
+
+fn commit(root: &Path) {
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Andrew Yates",
+            "-c",
+            "user.email=test@aterm.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "source",
+        ],
+    );
+}
+
 /// Identity evidence must be complete, including at the collector's inclusive bound. Overflow
 /// is a refusal, not a truncated compiler identity; a failed child still supplies no identity.
 #[cfg(unix)]
@@ -37,32 +58,97 @@ fn identity_keeps_complete_output_and_refuses_overflow_or_failed_children() {
 fn dirty_sources_never_supply_head_tree_evidence() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let root = dir.path();
-    identity(Path::new("git"), root, &["init", "-q"]).unwrap();
+    git(root, &["init", "-q"]);
     std::fs::write(root.join("source"), b"original").unwrap();
-    identity(Path::new("git"), root, &["add", "source"]).unwrap();
-    identity(
-        Path::new("git"),
-        root,
-        &[
-            "-c",
-            "user.name=Andrew Yates",
-            "-c",
-            "user.email=test@aterm.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-qm",
-            "source",
-        ],
-    )
-    .unwrap();
-    assert!(clean_tree(root).is_ok());
+    git(root, &["add", "source"]);
+    commit(root);
+    let compiled_tree = clean_tree(root).unwrap();
     std::fs::write(root.join("source"), b"changed").unwrap();
     assert!(clean_tree(root).is_err());
     std::fs::write(root.join("source"), b"original").unwrap();
-    assert!(clean_tree(root).is_ok());
+    assert_eq!(clean_tree(root).unwrap(), compiled_tree);
+
+    for (hide, reveal) in [
+        ("--assume-unchanged", "--no-assume-unchanged"),
+        ("--skip-worktree", "--no-skip-worktree"),
+    ] {
+        git(root, &["update-index", hide, "source"]);
+        std::fs::write(root.join("source"), b"changed").unwrap();
+        assert!(git(root, &["status", "--porcelain"]).is_empty());
+        assert!(clean_tree(root).is_err());
+        assert_ne!(git(root, &["ls-files", "-v"]), "H source");
+        std::fs::write(root.join("source"), b"original").unwrap();
+        git(root, &["update-index", reveal, "source"]);
+        assert_eq!(clean_tree(root).unwrap(), compiled_tree);
+    }
     std::fs::write(root.join("untracked"), b"new input").unwrap();
     assert!(clean_tree(root).is_err());
+}
+
+#[test]
+fn unread_git_index_never_supplies_head_tree_evidence() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join("source"), b"original").unwrap();
+    git(root, &["add", "source"]);
+    commit(root);
+    assert!(clean_tree(root).is_ok());
+
+    std::fs::write(root.join(".git/index"), b"invalid index").unwrap();
+    assert!(identity(Path::new("git"), root, &["rev-parse", "HEAD^{tree}"]).is_ok());
+    assert!(clean_tree(root).is_err());
+}
+
+#[test]
+fn test_index_requires_clean_populated_submodules_at_their_saved_commit() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    let root = dir.path().join("root");
+    for path in [&origin, &root] {
+        std::fs::create_dir(path).unwrap();
+        git(path, &["init", "-q"]);
+    }
+    std::fs::write(origin.join("source"), b"original").unwrap();
+    git(&origin, &["add", "source"]);
+    commit(&origin);
+    git(
+        &root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--",
+            origin.to_str().unwrap(),
+            "nested",
+        ],
+    );
+    commit(&root);
+    git(&root, &["config", "submodule.nested.ignore", "all"]);
+    let tree = clean_tree(&root).unwrap();
+    let nested = root.join("nested");
+
+    std::fs::write(nested.join("source"), b"changed").unwrap();
+    assert!(git(&root, &["status", "--porcelain"]).is_empty());
+    assert!(clean_tree(&root).is_err());
+    git(&nested, &["add", "source"]);
+    commit(&nested);
+    assert!(git(&root, &["status", "--porcelain"]).is_empty());
+    assert!(clean_tree(&root).is_err());
+    git(&nested, &["checkout", "--detach", "HEAD~1"]);
+    assert_eq!(clean_tree(&root).unwrap(), tree);
+
+    git(&nested, &["update-index", "--skip-worktree", "source"]);
+    std::fs::write(nested.join("source"), b"changed").unwrap();
+    assert!(git(&nested, &["status", "--porcelain"]).is_empty());
+    assert!(clean_tree(&root).is_err());
+    std::fs::write(nested.join("source"), b"original").unwrap();
+    git(&nested, &["update-index", "--no-skip-worktree", "source"]);
+    assert_eq!(clean_tree(&root).unwrap(), tree);
+
+    git(&root, &["submodule", "deinit", "-f", "--", "nested"]);
+    assert!(clean_tree(&root).is_err());
 }
 
 #[test]

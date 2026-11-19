@@ -1011,3 +1011,70 @@ mod files {
         );
     }
 }
+
+/// Windows' remedies for an agh.toml its rules refuse: an access list, never a chmod; and in
+/// agh's own folder never `--config`, which only `policy check` takes and which changes no file
+/// that routes.
+#[cfg(windows)]
+mod windows_files {
+    use agh::config::{self, Dirs};
+    use agh::error::{Kind, Sub};
+    use agh::policy::RefusalCode;
+    use agh_fake::FakeGithub;
+
+    use crate::common;
+
+    /// A loose agh.toml in agh's own folder: its load is refused, and the remedy makes it and the
+    /// folder the user's alone, says agh reads it only there, and names no `--config` and no
+    /// chmod.
+    #[test]
+    fn a_loose_agh_toml_in_aghs_folder_names_no_config_flag() {
+        let root = common::scratch("win-loose-agh");
+        let dirs = Dirs::under(root.path());
+        common::write_config(&dirs, &common::canonical_config(root.path()));
+        common::open_to_everyone(&dirs.config_file());
+        let refused = config::load(&dirs).expect_err("a loose agh.toml");
+        assert_eq!(refused.kind, Kind::Refused);
+        assert_eq!(refused.sub, Sub::Policy(RefusalCode::ConfigInvalid));
+        for absent in ["--config", "chmod"] {
+            assert!(!refused.next.contains(absent), "{}", refused.next);
+        }
+        for present in ["yours alone", "agh reads agh.toml only there"] {
+            assert!(refused.next.contains(present), "{}", refused.next);
+        }
+    }
+
+    /// `policy check --config` of a loose file elsewhere: the remedy may keep it in a folder of
+    /// the user's alone, such as agh's own, and name it again with `--config`.
+    #[test]
+    fn policy_check_of_a_loose_file_elsewhere_names_aghs_folder_and_the_flag() {
+        let root = common::scratch("win-loose-elsewhere");
+        let elsewhere = root.path().join("c");
+        aterm_uds::private_file::create_private_dir(&elsewhere).expect("a private folder");
+        aterm_uds::private_file::write_private(
+            &elsewhere,
+            "agh.toml",
+            common::canonical_config(root.path()).as_bytes(),
+        )
+        .expect("agh.toml");
+        common::open_to_everyone(&elsewhere.join("agh.toml"));
+        let fake = FakeGithub::start();
+        let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
+        let named = elsewhere.join("agh.toml");
+        let exit = common::run_cli(
+            &mut ctx,
+            &[
+                "policy",
+                "check",
+                "--config",
+                named.to_str().expect("UTF-8"),
+            ],
+        );
+        assert_eq!(exit, 10, "{}", captured.stderr_text());
+        let value: aterm_json::Value = aterm_json::from_str(&captured.stdout_text()).expect("JSON");
+        let what = value["faults"][0]["what"].as_str().expect("what");
+        assert!(what.contains("--config"), "{what}");
+        assert!(what.contains("such as"), "{what}");
+        assert!(!what.contains("chmod"), "{what}");
+    }
+}

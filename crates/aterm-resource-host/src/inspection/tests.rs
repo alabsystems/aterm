@@ -74,7 +74,7 @@ fn missing_store_lookup_creates_nothing() {
     assert!(!missing.exists());
 }
 #[test]
-fn a_lookup_names_a_tab_id_or_is_refused() {
+fn a_lookup_names_a_local_session_id_or_is_refused() {
     let root = aterm_tempfile::tempdir().unwrap();
     let missing = root.path().join("absent");
     for session in [
@@ -87,14 +87,10 @@ fn a_lookup_names_a_tab_id_or_is_refused() {
         let error = lookup_at(&missing, session).expect_err(session);
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{session}");
     }
-    let control = lookup_at(&missing, "tqn5r6e0148").expect_err("CONTROL: no store");
-    assert_ne!(control.kind(), io::ErrorKind::InvalidData, "CONTROL");
-    let earlier = lookup_at(&missing, "t0123456789").expect_err("no store");
-    assert_ne!(
-        earlier.kind(),
-        io::ErrorKind::InvalidData,
-        "a tab opened before the update is looked up by its earlier ID"
-    );
+    for session in ["tqn5r6e0148", "t0123456789", "s-0123456789abcdef0123"] {
+        let control = lookup_at(&missing, session).expect_err("CONTROL: no store");
+        assert_ne!(control.kind(), io::ErrorKind::InvalidData, "{session}");
+    }
     assert!(!missing.exists());
 }
 

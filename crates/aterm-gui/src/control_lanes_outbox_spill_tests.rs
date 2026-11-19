@@ -6,6 +6,21 @@ use std::io::Read as _;
 
 #[cfg(debug_assertions)]
 #[test]
+fn settlement_ack_fault_reads_only_a_sole_unsent_status() {
+    let mut out = Outbox::default();
+    let status = b"OK native source-exec state=settled\n";
+    assert!(out.fixture_unsent_status().is_none());
+    out.push_owned(status.to_vec());
+    assert_eq!(out.fixture_unsent_status(), Some(status.as_slice()));
+    out.sent = 1;
+    assert!(out.fixture_unsent_status().is_none());
+    out.sent = 0;
+    out.push_owned(b"EVENT other\n".to_vec());
+    assert!(out.fixture_unsent_status().is_none());
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn source_fixture_requires_actual_exact_cleanup_reply() {
     let request = "@self native-act codex-auth member-retire-owned schema=1 request=req operation=op member=member";
     let mut out = Outbox::default();

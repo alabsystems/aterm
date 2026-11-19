@@ -26,7 +26,7 @@ use aterm_vitals::services::{
 };
 
 use crate::harness_host::{DISK_TICK, HostNote};
-use crate::park_bell::ParkBell;
+use aterm_uds::park_bell::ParkBell;
 
 /// The file under the state root whose lock the one watching process holds.
 pub(crate) const LOCK: &str = "services-watch.lock";

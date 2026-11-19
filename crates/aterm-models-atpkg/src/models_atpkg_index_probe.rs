@@ -88,7 +88,7 @@ pub fn atpkg_index_shared_handoff_model() -> Model {
     }
 }
 
-/// Models single-worker ownership, priority ordering (bump > full-pass > index > vendor), generation invalidation, and non-blocking vendor fallback across GUI package park slices.
+/// Models single-worker ownership, priority ordering (bump > full-pass > index > vendor), generation invalidation, and non-blocking vendor fallback across the GUI package park's waits.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_pending_park_model() -> Model {

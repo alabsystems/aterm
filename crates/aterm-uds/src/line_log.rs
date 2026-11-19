@@ -2,33 +2,109 @@
 // Copyright 2026 Andrew Yates
 
 //! Newline-framed append logs whose writers cooperate with atomic file replacement.
-//! The sibling lock remains at its path; callers must not unlink it. Paths aliased through
-//! hard links, and external writers that do not take this lock, are outside this protocol.
+//! The sibling lock is unlinked only by [`retire`], which removes the log and then the lock
+//! while it holds that lock; [`lock`] makes sure, once it holds the lock, that its path still
+//! names the file it locked, and takes the one there now where not, so a waiter that took a
+//! retired lock's file never writes beside a newcomer that made the next one. Paths aliased
+//! through hard links, and external writers that do not take this lock, are outside this
+//! protocol.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// Serialize appends and replacement by a stable sibling (`<filename>.lock`). A stalled
-/// holder cannot block a supervisor indefinitely: actual contention waits at most 250 ms.
-/// Hold the returned guard across the entire read/transform/atomic-replace operation.
-///
-/// # Errors
-/// An invalid filename or [`crate::file_lock::LockFile::take`]'s path, admission or lock error.
-pub fn lock(path: &Path) -> io::Result<crate::file_lock::LockFile> {
+/// What a lock wait past its deadline says.
+const BUSY: &str = "journal is being updated by another process";
+
+/// The sibling lock of the log at `path`: `<filename>.lock` beside it.
+fn lock_path(path: &Path) -> io::Result<std::path::PathBuf> {
     let mut name = path
         .file_name()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?
         .to_os_string();
     name.push(".lock");
+    Ok(path.with_file_name(name))
+}
+
+/// Serialize appends and replacement by a sibling (`<filename>.lock`). A stalled holder cannot
+/// block a supervisor indefinitely: actual contention waits at most 250 ms. Once taken, the
+/// lock's path must still name the file locked: where [`retire`] unlinked it meanwhile (nothing
+/// there, or another file), the lock is let go and the file there now taken instead, within the
+/// same deadline. Hold the returned guard across the entire read/transform/atomic-replace
+/// operation.
+///
+/// # Errors
+/// An invalid filename or [`crate::file_lock::LockFile::take`]'s path, admission or lock error;
+/// a failed look at the lock's path; `WouldBlock` where the path still named another file at the
+/// deadline.
+pub fn lock(path: &Path) -> io::Result<crate::file_lock::LockFile> {
+    let lock_path = lock_path(path)?;
     let now = Instant::now();
     let deadline = now.checked_add(Duration::from_millis(250)).unwrap_or(now);
-    crate::file_lock::LockFile::take(
-        &path.with_file_name(name),
-        deadline,
-        "journal is being updated by another process",
-    )
+    loop {
+        let held = crate::file_lock::LockFile::take(&lock_path, deadline, BUSY)?;
+        let locked = identity_of(held.file())?;
+        match identity_at(&lock_path) {
+            Ok(there) if (there.dev, there.ino) == (locked.dev, locked.ino) => return Ok(held),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        drop(held);
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, BUSY));
+        }
+    }
+}
+
+/// Remove the log at `path` and then its sibling lock, both while holding that lock ([`lock`]),
+/// so no writer appends between the two unlinks and every later writer starts a new log under a
+/// new lock. A final link, folder or anything else that is no regular file is never removed.
+/// Whether a log was there to remove; a lock with no log beside it is removed all the same.
+///
+/// # Errors
+/// [`lock`]'s; `InvalidInput`, with nothing removed, where `path` holds anything but a regular
+/// file; a failed look or unlink.
+pub fn retire(path: &Path) -> io::Result<bool> {
+    let lock_path = lock_path(path)?;
+    let held = lock(path)?;
+    let removed = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if regular(&metadata) => {
+            std::fs::remove_file(path)?;
+            true
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    match std::fs::remove_file(&lock_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    drop(held);
+    Ok(removed)
+}
+
+/// Whether `metadata`, read without following a final link, is a regular file (on Windows, and
+/// no reparse point).
+fn regular(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        // FILE_ATTRIBUTE_REPARSE_POINT
+        metadata.file_type().is_file() && metadata.file_attributes() & 0x0400 == 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_file()
+    }
 }
 
 /// Create or validate the regular log, without retaining an open descriptor across replacement.

@@ -27,6 +27,21 @@ pub type Digest = [u8; 32];
 /// first 48 bytes, then whether it proves a fork (byte 48), then the proof's own digest.
 pub type ProofKey = [u8; 81];
 
+/// Which rewrite made what the membership log holds ([`Stores::members_generation`]). Two
+/// that are equal name one order of the records the log holds. The number alone does not: a
+/// rewrite whose commit a power cut took back is made again, from what the log holds by then,
+/// under the same number, and a vault left and joined again counts from 0 and reaches it
+/// (`aterm_secrets::client::RecordsGeneration`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Generation {
+    /// How many rewrites made what the log holds: 0 for a log never rewritten.
+    pub number: u64,
+    /// What names the last of them apart from every other rewrite of its number (the vault's:
+    /// the SHA-256 of the layout header its pin names, which binds the data the rewrite was
+    /// computed from and the data it wrote); `None` exactly where `number` is 0.
+    pub rewrite: Option<Digest>,
+}
+
 /// One table's digest, operation digests, and conflict proof keys.
 pub type TableSummary = (Digest, BTreeSet<Digest>, BTreeSet<ProofKey>);
 
@@ -156,6 +171,30 @@ pub trait Stores: Send + Sync {
     /// Where the records file cannot be read.
     fn members_held(&self, from: usize) -> io::Result<(Vec<Vec<u8>>, usize)>;
 
+    /// The rewrite generation of the membership log ([`Generation`]): how many rewrites (a
+    /// prune at a final checkpoint, a shed of superseded bodies) made what it holds, and which
+    /// rewrite the last was. A rewrite drops records, so an index into
+    /// [`Stores::members_held`]'s order holds only under the generation it was taken at; the
+    /// egress keeps its members cursor under it and places the cursor again when it differs
+    /// ([`crate::egress::MembersCursor`]). While a process runs its number only grows, so a
+    /// read of the records between two equal reads of it is of that generation. A store that
+    /// is never rewritten answers the default, 0 with no rewrite named.
+    /// # Errors
+    /// Where the generation cannot be read.
+    fn members_generation(&self) -> io::Result<Generation> {
+        Ok(Generation::default())
+    }
+
+    /// The id the membership log knows the record `wire` by: what a rewrite keeps of a record
+    /// it keeps, though it change the record's bytes (a shed drops a version-2 record's
+    /// ciphertext and keeps its id, `aterm_secrets::membership_log::Record::id`). The egress
+    /// finds the last record it stepped past by it in a rewritten log
+    /// ([`crate::egress::MembersCursor`]). The default is the digest of the bytes, which is a
+    /// version-1 record's id.
+    fn member_id(&self, wire: &[u8]) -> Digest {
+        digest(wire)
+    }
+
     /// The tables this Mac holds for `Inventory`: their digests.
     /// # Errors
     /// Where the stores cannot be read.
@@ -196,6 +235,20 @@ pub trait Stores: Send + Sync {
     /// # Errors
     /// Where the store cannot be read.
     fn table_proof_wires(&self, table: Digest, keys: &[ProofKey]) -> io::Result<Vec<Vec<u8>>>;
+
+    /// Whether this Mac's membership records ride the members lane at all: `false` for a vault
+    /// whose records are past format 1 (`aterm_secrets::client::members_lane_open`,
+    /// ATERM-KI-1116-1471), whose lane holds, offers and takes none of them. An `Inventory`
+    /// exchange then sends no snapshot of the membership unit, as it sends none of a table
+    /// its stores do not take, so the neighbour offers this Mac no membership record and is
+    /// offered none. Asked at each exchange, and by the egress at each feed of the membership
+    /// log it reads (`crate::egress::Feed::Members`), so records a write handed over before
+    /// the lane shut are not published after it.
+    /// # Errors
+    /// Where the vault cannot say which format its records are in.
+    fn members_lane(&self) -> io::Result<bool> {
+        Ok(true)
+    }
 
     /// The ids of the membership log's complete records.
     /// # Errors

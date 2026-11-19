@@ -194,6 +194,50 @@ fn an_inactive_broker_keeps_its_configured_artifact() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn a_scheduled_train_keeps_its_interpreter_artifact() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = root.path().join("cpython-3.14.0");
+    let program = dir.join("bin/python3.14");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    std::fs::write(&program, "interpreter image").unwrap();
+    let services = root.path().join("LaunchAgents");
+    std::fs::create_dir(&services).unwrap();
+    let unit = services.join("systems.alab.trust-train.plist");
+    let text = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin</string></dict>
+    <key>Label</key><string>systems.alab.trust-train</string>
+    <key>ProgramArguments</key><array><string>{}</string><string>/source/trust/scripts/daily_toolchain_stage.py</string><string>train</string><string>run</string><string>--repo</string><string>/source/trust</string><string>--state-root</string><string>/state/train</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>StandardErrorPath</key><string>/state/train/launchd.stderr.log</string>
+    <key>StandardOutPath</key><string>/state/train/launchd.stdout.log</string>
+    <key>StartInterval</key><integer>3600</integer>
+    <key>WorkingDirectory</key><string>/source/trust</string>
+</dict>
+</plist>
+"#,
+        aterm_codec::xml::escape(&program.display().to_string())
+    );
+    std::fs::write(&unit, &text).unwrap();
+    let references = configured(std::slice::from_ref(&services)).unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].program, program);
+    assert!(remove_with(&dir, || configured(std::slice::from_ref(&services))).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&program).unwrap(),
+        "interpreter image"
+    );
+    let unused = artifact(root.path(), "unused");
+    assert!(remove_with(&unused, || configured(std::slice::from_ref(&services))).unwrap());
+    assert!(!unused.exists());
+    assert_eq!(std::fs::read_to_string(unit).unwrap(), text);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn an_explicit_configured_program_retains_its_artifact_when_argv0_differs() {
     let root = aterm_tempfile::tempdir().unwrap();
     let unused = artifact(root.path(), "unused");

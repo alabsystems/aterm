@@ -8,9 +8,10 @@
 //! before reaping; RSS remains timeline evidence, never footprint history. Each retained peak
 //! gains the capacity margin and GiB rounding. With both final links recorded for the current
 //! toolchains, or for a prior compiler under the same accounting metric, the release admits one
-//! parent holding the largest compatible unit claim plus every live driver before the qualify
-//! tree. Both slices then allocate from a private ledger of exactly that unit budget, so tree work
-//! cannot take link memory and two links cannot oversubscribe it.
+//! parent before the qualify tree. Under normal pressure, a parallel build first tries to
+//! reserve the sum of both final-link claims. If that envelope cannot start immediately, the
+//! ordinary parent requests the largest compatible unit claim. Each parent also covers every
+//! live driver. The two slices allocate compiler memory from the private ledger it funds.
 //! After a bounded normal-pressure shortage with no claimed blocker, the cut can serialize
 //! the slices under the complete private compiler pool plus its single live driver. The private
 //! pool and every compiler claim remain unchanged; an unknown unit consumes the whole pool.
@@ -54,6 +55,7 @@ const WRAPPER: &str = "ATERM_RELEASE_UNIT_RECORD";
 const TRIPLE: &str = "ATERM_RELEASE_UNIT_TRIPLE";
 const BUDGET_LEDGER: &str = "ATERM_RELEASE_UNIT_BUDGET_LEDGER";
 const BUDGET_BYTES: &str = "ATERM_RELEASE_UNIT_BUDGET_BYTES";
+const FINAL_LINKS: &str = "ATERM_RELEASE_UNIT_FINAL_LINKS";
 /// The slice's source root, whose `trust.lock` names its admission estimates ([`toolchain_key`]). Cargo
 /// starts a registry package's compiler in that package's own directory, where no lock is
 /// found, so the parent names the root rather than each wrapper reading its working directory.
@@ -67,6 +69,8 @@ const REFUSED: &str = "aterm-release: slice unit admission: ";
 struct Budget {
     ledger: PathBuf,
     bytes: u64,
+    /// Admission evidence survives eviction from the bounded account history.
+    final_links: std::collections::BTreeMap<String, (String, u64)>,
 }
 
 /// Native release links in isolation, without executing the product or
@@ -169,14 +173,25 @@ impl Units {
         budget_ledger: &Path,
     ) -> Vec<Units> {
         let records = aterm_capacity::book::Records::load(record);
-        let bounded = at_once > 0
-            && triples
-                .iter()
-                .all(|triple| admission_peak(&records, triple, &last_unit()).is_some());
-        let budget = bounded.then(|| Budget {
-            ledger: budget_ledger.to_owned(),
-            bytes: retained_budget(&records, triples),
-        });
+        let final_links = triples
+            .iter()
+            .map(|triple| {
+                Some((
+                    (*triple).to_owned(),
+                    (
+                        accounting_metric(triple)?,
+                        admission_peak(&records, triple, &last_unit())?,
+                    ),
+                ))
+            })
+            .collect::<Option<std::collections::BTreeMap<_, _>>>();
+        let budget = final_links
+            .filter(|_| at_once > 0)
+            .map(|final_links| Budget {
+                ledger: budget_ledger.to_owned(),
+                bytes: retained_budget(&records, triples),
+                final_links,
+            });
         triples
             .iter()
             .map(|triple| Units {
@@ -206,6 +221,15 @@ impl Units {
         self.budget.as_ref().map(|budget| budget.bytes)
     }
 
+    /// The same retained link evidence funds optional parallel parents and their wrappers.
+    fn final_link_bytes(&self) -> Option<u64> {
+        self.budget
+            .as_ref()?
+            .final_links
+            .get(&self.triple)
+            .map(|(_, peak)| claim_bytes(*peak))
+    }
+
     /// What Cargo's environment gains so that `wrapper`, this executable, starts each compiler
     /// of a build whose source root is `root`.
     pub(crate) fn env(&self, wrapper: &Path, root: &Path) -> Vec<(&'static str, OsString)> {
@@ -218,6 +242,12 @@ impl Units {
         if let Some(budget) = &self.budget {
             env.push((BUDGET_LEDGER, budget.ledger.clone().into_os_string()));
             env.push((BUDGET_BYTES, budget.bytes.to_string().into()));
+            env.push((
+                FINAL_LINKS,
+                aterm_json::to_string(&budget.final_links)
+                    .expect("string-keyed admission evidence serializes")
+                    .into(),
+            ));
         }
         env
     }
@@ -276,6 +306,32 @@ pub(crate) fn shared_need(units: &[Units], at_once: u64) -> Option<aterm_capacit
             // An unclaimed load cannot turn a memory shortage into ALONE admission.
             .margin(1),
     )
+}
+
+/// A second, optional admission candidate for a two-architecture parallel build. The
+/// ordinary budget is sufficient to complete either link alone. This one also accommodates
+/// their simultaneous measured claims, including the usual unit and driver margins.
+pub(crate) fn parallel_links(
+    units: &[Units],
+    at_once: u64,
+) -> Option<(Vec<Units>, aterm_capacity::Need)> {
+    let [first, second] = units else { return None };
+    if at_once != 2 || first.triple == second.triple {
+        return None;
+    }
+    let mut need = shared_need(units, at_once)?;
+    let bytes = first
+        .final_link_bytes()?
+        .checked_add(second.final_link_bytes()?)?;
+    if bytes <= first.budget_bytes()? {
+        return None;
+    }
+    need.mem = bytes.checked_add(DRIVER * 2)?;
+    let mut expanded = units.to_vec();
+    for unit in &mut expanded {
+        unit.budget.as_mut()?.bytes = bytes;
+    }
+    Some((expanded, need))
 }
 
 /// The least bounded parent this account's retained slice record requires.
@@ -567,17 +623,41 @@ impl aterm_capacity::Machine for BudgetMachine {
 fn budget_from_environment() -> Result<Option<Budget>, String> {
     let ledger = std::env::var_os(BUDGET_LEDGER);
     let bytes = std::env::var_os(BUDGET_BYTES);
-    match (ledger, bytes) {
-        (None, None) => Ok(None),
-        (Some(ledger), Some(bytes)) => {
+    let final_links = std::env::var_os(FINAL_LINKS);
+    decode_budget(ledger, bytes, final_links)
+}
+
+fn decode_budget(
+    ledger: Option<OsString>,
+    bytes: Option<OsString>,
+    final_links: Option<OsString>,
+) -> Result<Option<Budget>, String> {
+    match (ledger, bytes, final_links) {
+        (None, None, None) => Ok(None),
+        (Some(ledger), Some(bytes), Some(final_links)) => {
             let bytes = bytes
                 .to_str()
                 .and_then(|bytes| bytes.parse::<u64>().ok())
                 .filter(|bytes| *bytes >= MIN_BUDGET)
                 .ok_or("the private unit budget is invalid")?;
+            let final_links: std::collections::BTreeMap<String, (String, u64)> = final_links
+                .to_str()
+                .and_then(|value| aterm_json::from_str(value).ok())
+                .ok_or("the private final-link evidence is invalid")?;
+            if final_links.is_empty()
+                || final_links.values().any(|(metric, peak)| {
+                    metric.is_empty() || *peak == 0 || claim_bytes(*peak) > bytes
+                })
+            {
+                return Err(
+                    "the private final-link evidence exceeds or does not identify its budget"
+                        .into(),
+                );
+            }
             Ok(Some(Budget {
                 ledger: ledger.into(),
                 bytes,
+                final_links,
             }))
         }
         _ => Err("the private unit budget is incomplete".to_owned()),
@@ -654,6 +734,7 @@ pub(crate) fn compiler(args: &[OsString]) -> Result<aterm_uds::spawnfd::Command,
         TRIPLE,
         BUDGET_LEDGER,
         BUDGET_BYTES,
+        FINAL_LINKS,
         ROOT,
         "RUSTC_WRAPPER",
     ] {
@@ -707,10 +788,18 @@ fn wrap(
         }
         (false, Some(budget), Some((ledger, machine))) => {
             let records = aterm_capacity::book::Records::load(&units.record);
-            // Recheck against the slice's source root. A snapshot can carry a different lock
-            // from its orchestration checkout, or the book can have changed since the parent
-            // chose its budget.
-            if admission_peak(&records, &units.triple, &last_unit()).is_none() {
+            // Authenticate retained admission evidence against the snapshot's accounting
+            // metric. The shared history may evict it while this build records new units.
+            let retained_peak = budget
+                .final_links
+                .get(&units.triple)
+                .filter(|(metric, peak)| {
+                    accounting_metric(&units.triple).as_ref() == Some(metric)
+                        && *peak > 0
+                        && claim_bytes(*peak) <= budget.bytes
+                })
+                .map(|(_, peak)| *peak);
+            if retained_peak.is_none() {
                 return Err(
                     "no compatible footprint for the final link; rerun the slice alone to learn it"
                         .into(),
@@ -724,7 +813,7 @@ fn wrap(
                     aterm_capacity::size(budget.bytes)
                 ));
             }
-            let need = unit.as_ref().map_or_else(
+            let mut need = unit.as_ref().map_or_else(
                 || {
                     aterm_capacity::Need::new(format!(
                         "release slice {} unidentified compiler",
@@ -734,6 +823,13 @@ fn wrap(
                 },
                 |unit| unit_need(&units.triple, &records, unit, budget.bytes),
             );
+            if unit.as_ref() == Some(&last_unit()) {
+                // A newer, lighter measurement cannot shrink this build's admitted link.
+                // With no live row, unit_need already spends the entire private pool.
+                need.mem = need
+                    .mem
+                    .max(claim_bytes(retained_peak.expect("authenticated above")));
+            }
             let bytes = need.mem;
             let claim = aterm_capacity::admit_with(
                 ledger,

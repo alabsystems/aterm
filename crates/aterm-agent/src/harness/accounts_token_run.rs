@@ -209,24 +209,38 @@ impl Ctx {
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
             .collect();
         let found = super::cli::Env::from_process().ok();
+        let store = found.as_ref().map(super::cli::Env::accounts_store);
+        let now = found.as_ref().map_or(0, |env| env.now);
         let roster = found
             .as_ref()
             .and_then(|env| env.accounts_roster_for(accounts::Cli::Claude))
-            .filter(|path| path.exists())
-            .and_then(|path| Roster::load_for(accounts::Cli::Claude, &path).ok());
+            .zip(store.as_ref())
+            .and_then(|(path, store)| bound_roster_at(&path, store, now));
         Self {
             env,
             home: found.as_ref().and_then(|env| env.home.clone()),
             cwd: std::env::current_dir().unwrap_or_default(),
             roster,
-            store: found.as_ref().map(super::cli::Env::accounts_store),
+            store,
             builds: token_route::configured_builds(),
             #[cfg(unix)]
             vault: aterm_secrets::client::Paths::live().ok(),
-            now: found.as_ref().map_or(0, |env| env.now),
+            now,
             macos: token_route::LAUNCHES_ON_TOKEN,
         }
     }
+}
+
+/// Claude Code's roster at `path`, where one is there and reads, as this Mac's login records in
+/// `store` bind it at `now` ([`super::accounts_pool::bound_roster_at`]: each row on its current
+/// login, with the logins it left; no lock, nothing written): the view the relaunch plan judged
+/// its line by (`relaunch::plan_roster`). A line typed on the login a renewal bound a row to,
+/// which the roster file does not name, resolves to that row and its token entry, and the row's
+/// stored login, which [`Asked::unstored`] asks about, is the one it is bound to now.
+fn bound_roster_at(path: &Path, store: &Store, now: i64) -> Option<Roster> {
+    path.exists()
+        .then(|| super::accounts_pool::bound_roster_at(store, accounts::Cli::Claude, path, now))?
+        .ok()
 }
 
 /// How long a labelled line waits for a vault writer: a relaunch typed it on purpose. An
@@ -411,7 +425,7 @@ struct Decided {
     /// shape.
     unstored: Option<String>,
     /// The token entry today's judgment resolved the launch's account to.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     entry: Option<TokenEntry>,
 }
 
@@ -488,7 +502,7 @@ fn decide_with(run: &Run, ctx: &Ctx) -> Decided {
     };
     Decided {
         decision,
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "macos"))]
         entry: asked.entry.get(),
         read: asked.read.into_inner(),
         build,
@@ -503,6 +517,7 @@ pub(in crate::harness) struct Judged {
     /// The one judgment.
     pub decision: Decision,
     /// The token entry today's judgment resolved the launch's account to.
+    #[cfg(target_os = "macos")]
     pub entry: Option<TokenEntry>,
     /// Why the wrapper starts nothing where its token is not served ([`refusal`]).
     pub refusal: Option<String>,
@@ -516,6 +531,7 @@ pub(in crate::harness) fn judged(run: &Run, ctx: &Ctx) -> Judged {
     let decided = decide_with(run, ctx);
     Judged {
         refusal: refusal(&decided, false),
+        #[cfg(target_os = "macos")]
         entry: decided.entry,
         decision: decided.decision,
     }

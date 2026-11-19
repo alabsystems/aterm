@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Zero-dependency private temporary files and directories.
+//! Private temporary files and directories, excluded from indexing and backups under `.ubd`.
 
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
@@ -76,6 +76,25 @@ fn unique_name(prefix: &str) -> String {
         name.push(c);
     }
     name.push('_');
+    name.push_str(&count.to_string());
+    name
+}
+
+/// A quiet scratch name makes room for `.noindex`: eleven URL-safe base64 digits keep
+/// all 64 random bits, and the counter keeps names injective within this process. Cross-
+/// process collisions are still refused by exclusive creation. Omitting the pid and both
+/// separators saves at least the suffix's eight bytes compared with [`unique_name`].
+fn quiet_name(prefix: &str) -> String {
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    compact_name(prefix, count, os_random_u64())
+}
+
+fn compact_name(prefix: &str, count: u64, random: u64) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut name = String::from(prefix);
+    for digit in (0..11).rev() {
+        name.push(char::from(DIGITS[((random >> (digit * 6)) & 63) as usize]));
+    }
     name.push_str(&count.to_string());
     name
 }
@@ -272,6 +291,15 @@ pub fn is_quiet(dir: &Path) -> bool {
     dir.components().any(|c| c.as_os_str() == QUIET)
 }
 
+/// Whether a new quiet scratch leaf needs its own Spotlight suffix.
+fn needs_noindex(dir: &Path) -> bool {
+    cfg!(target_os = "macos")
+        && is_quiet(dir)
+        && !dir
+            .components()
+            .any(|part| part.as_os_str().as_encoded_bytes().ends_with(b".noindex"))
+}
+
 /// `dir`'s [`QUIET`] folder, made when absent, for files kept in a temporary root fseventsd
 /// need not hear of. `dir` itself where it is quiet already, off macOS (nothing else drops
 /// events by path, so the folder would only lengthen paths), or where the folder cannot be
@@ -390,7 +418,7 @@ impl TempDir {
     /// Create a new temporary directory in the system temp directory (in its [`QUIET`] folder
     /// on macOS, [`quiet_in`]).
     /// # Errors
-    /// Returns an error if the directory cannot be created.
+    /// Returns an error if the directory cannot be created or its backup exclusion fails.
     pub fn new() -> io::Result<Self> {
         Self::new_in(call0(std::env::temp_dir))
     }
@@ -398,7 +426,7 @@ impl TempDir {
     /// Create a new temporary directory inside `dir`, or inside its [`QUIET`] folder where `dir`
     /// is a shared temporary root (the system temp directory, `/tmp`) on macOS.
     /// # Errors
-    /// Returns an error if the directory cannot be created.
+    /// Returns an error if the directory cannot be created or its backup exclusion fails.
     pub fn new_in(dir: impl AsRef<Path>) -> io::Result<Self> {
         Self::with_prefix_in(".tmp", dir)
     }
@@ -411,12 +439,18 @@ impl TempDir {
 
     /// Create a new temporary directory with a custom prefix in exactly `dir`.
     fn made_in(prefix: &str, dir: &Path) -> io::Result<Self> {
-        Self::made_in_with(dir, || unique_name(prefix))
+        Self::made_in_with(dir, || {
+            if needs_noindex(dir) {
+                quiet_name(prefix)
+            } else {
+                unique_name(prefix)
+            }
+        })
     }
 
     fn made_in_with(dir: &Path, mut next_name: impl FnMut() -> String) -> io::Result<Self> {
         for _ in 0..5 {
-            let name = next_name();
+            let mut name = next_name();
             let mut components = Path::new(&name).components();
             if name.contains('\0')
                 || (cfg!(windows) && (name.ends_with('.') || name.ends_with(' ')))
@@ -428,6 +462,11 @@ impl TempDir {
                     "a temporary directory name must not contain a path",
                 ));
             }
+            // Keep explicit private suffixes already ending in .noindex intact. Heard
+            // roots keep their short names; quiet scratch always gets Spotlight's suffix.
+            if needs_noindex(dir) && !name.ends_with(".noindex") {
+                name.push_str(".noindex");
+            }
             let path = dir.join(name);
             #[cfg(unix)]
             let attempt = {
@@ -437,7 +476,13 @@ impl TempDir {
             #[cfg(not(unix))]
             let attempt = fs::create_dir(&path);
             match attempt {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    let directory = Self { path };
+                    if cfg!(target_os = "macos") && is_quiet(dir) {
+                        aterm_backup::Backups::SYSTEM.build_dir(directory.path())?;
+                    }
+                    return Ok(directory);
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
             }
@@ -570,14 +615,14 @@ impl Builder {
 
     /// Create a temporary directory using the configured options.
     /// # Errors
-    /// Returns an error if the directory cannot be created.
+    /// Returns an error if the directory cannot be created or its backup exclusion fails.
     pub fn tempdir(&self) -> io::Result<TempDir> {
         self.tempdir_in(call0(std::env::temp_dir))
     }
 
-    /// Create a temporary directory inside `dir` using the configured options (e.g. a short `/tmp` for a socket path, or a target-local scratch root); a shared temporary root's goes in its [`QUIET`] folder on macOS, five bytes longer, unless the builder is [`Self::heard`], which makes it in `dir` cut at its first quiet folder.
+    /// Create a temporary directory inside `dir` using the configured options (e.g. a short `/tmp` for a socket path, or a target-local scratch root); a shared temporary root's goes in its [`QUIET`] folder on macOS, with a `.noindex` leaf, unless the builder is [`Self::heard`], which makes it in `dir` cut at its first quiet folder.
     /// # Errors
-    /// Returns an error if the directory cannot be created.
+    /// Returns an error if the directory cannot be created or its backup exclusion fails.
     pub fn tempdir_in(&self, dir: impl AsRef<Path>) -> io::Result<TempDir> {
         let dir = if self.heard {
             outside_quiet(dir.as_ref())
@@ -585,7 +630,15 @@ impl Builder {
             placed(dir.as_ref())
         };
         TempDir::made_in_with(&dir, || {
-            let mut name = unique_name(self.prefix_str());
+            let already_named = self
+                .suffix
+                .as_deref()
+                .is_some_and(|suffix| suffix.ends_with(".noindex"));
+            let mut name = if needs_noindex(&dir) && !already_named {
+                quiet_name(self.prefix_str())
+            } else {
+                unique_name(self.prefix_str())
+            };
             if let Some(suffix) = &self.suffix {
                 name.push_str(suffix);
             }
@@ -596,7 +649,7 @@ impl Builder {
 
 /// Create a temporary directory in the system temp directory (in its [`QUIET`] folder on macOS).
 /// # Errors
-/// Returns an error if the directory cannot be created.
+/// Returns an error if the directory cannot be created or its backup exclusion fails.
 pub fn tempdir() -> io::Result<TempDir> {
     TempDir::new()
 }
@@ -694,7 +747,7 @@ pub fn clone_tree(_src: &Path, _dst: &Path) -> io::Result<()> {
 
 /// The name, before the user id, of the folder in the temporary directory's quiet folder that
 /// holds a user's shared stand-ins ([`shared_stand_in`]). aterm-verify's stand-ins made it
-/// first; the name stays, so every stand-in shares the files they made.
+/// first; a `.noindex` suffix on the user-specific folder keeps Spotlight out.
 #[cfg(unix)]
 const STAND_IN_CACHE: &str = "atv-standins-";
 
@@ -847,7 +900,7 @@ fn no_link_no_wait(opts: &mut fs::OpenOptions) -> bool {
 #[cfg_attr(trust_verify, trust::skip)]
 fn cached_in(me: u32, tmp: &Path, text: &str) -> Option<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
-    let cache = quiet_in(tmp).join(format!("{STAND_IN_CACHE}{me}"));
+    let cache = quiet_in(tmp).join(format!("{STAND_IN_CACHE}{me}.noindex"));
     if let Err(e) = fs::DirBuilder::new().mode(0o700).create(&cache)
         && e.kind() != io::ErrorKind::AlreadyExists
     {
@@ -859,6 +912,7 @@ fn cached_in(me: u32, tmp: &Path, text: &str) -> Option<PathBuf> {
     if !dir.is_dir() || dir.uid() != me || dir.mode() & 0o077 != 0 {
         return None;
     }
+    aterm_backup::Backups::SYSTEM.build_dir(&cache).ok()?;
     let hash = fnv1a(text.as_bytes());
     for slot in 0..4 {
         let file = cache.join(format!("{hash:016x}-{slot}"));
@@ -1133,7 +1187,7 @@ fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
     written_by_a_child(path, body, 0o555)
 }
 
-/// 64-bit FNV-1a, aterm-hash's `fnv1a_64` (this crate depends on nothing): names a text's slots
+/// 64-bit FNV-1a, aterm-hash's `fnv1a_64` (without a hash dependency): names a text's slots
 /// in the stand-in cache ([`cached_in`]), as aterm-verify's stand-ins named them. A collision
 /// costs a slot, never a wrong stand-in: a slot is used only when it holds the text's bytes.
 #[cfg(unix)]

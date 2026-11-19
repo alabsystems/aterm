@@ -169,10 +169,13 @@ fn home() -> Home {
     Home { _dir: dir, home }
 }
 
+/// The check `Seen` makes of each call as it is made: the verb, the registration, its pins.
+type Check = Box<dyn FnMut(&'static str, &Registration, &[Pin])>;
+
 /// What the pass asked of its caller, each call checked by `check` as it is made.
 struct Seen {
     asked: Vec<(&'static str, Registration, Vec<Pin>)>,
-    check: Box<dyn FnMut(&'static str, &Registration, &[Pin])>,
+    check: Check,
     refuse_pins: bool,
     refuse_drop: bool,
 }
@@ -398,7 +401,7 @@ fn a_gone_registrations_private_submodule_work_is_pinned_before_its_store_goes()
         !entry.exists() && !store.exists(),
         "the entry and its store went"
     );
-    assert_eq!(h.listed(), [checkout.clone()]);
+    assert_eq!(h.listed(), std::slice::from_ref(&checkout));
     assert_eq!(
         read(
             &checkout,

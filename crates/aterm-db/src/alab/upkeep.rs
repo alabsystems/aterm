@@ -48,9 +48,10 @@ pub(crate) const RETRY: Duration = Duration::from_secs(10 * 60);
 /// A journal pass at most this often.
 pub(crate) const JOURNAL_EVERY: Duration = Duration::from_secs(60);
 
-/// The journal's spool this build flushes: this user's (`Spool::local`), or none in this crate's
-/// tests, whose runtime labs must not touch the host's state.
-fn journal_spool() -> Option<Spool> {
+/// The journal's spool this build flushes, and the one the shared files' publisher notes what it
+/// published in (`crate::file::publish::Pass::journal`): this user's (`Spool::local`), or none
+/// in this crate's tests, whose runtime labs must not touch the host's state.
+pub(crate) fn journal_spool() -> Option<Spool> {
     if cfg!(test) { None } else { Spool::local() }
 }
 
@@ -219,11 +220,14 @@ impl Files {
 /// the outbox (`aterm file outbox`); with nothing queued the publisher reads three small files
 /// and opens no custody. Every materializer outcome is a state word in the file's own
 /// `state.json`: nothing to report here, and nothing a later pass does not see for itself.
-/// Returns the materializer's outcomes, one a file.
+/// What the publisher signed it notes in `journal` ([`crate::file::publish::Pass::journal`]),
+/// this user's spool ([`journal_spool`]) in a running aterm. Returns the materializer's
+/// outcomes, one a file.
 fn files_pass(
     paths: &Paths,
     config: &std::path::Path,
     publish_by: Instant,
+    journal: Option<&Spool>,
 ) -> Vec<crate::file::materialize::Outcome> {
     let published = crate::file::publish::pass(
         paths,
@@ -232,6 +236,7 @@ fn files_pass(
         &crate::file::publish::Pass {
             by: publish_by,
             now_ms: aterm_time::unix_millis().unwrap_or(0),
+            journal,
         },
     );
     drop(published);
@@ -340,13 +345,14 @@ pub(crate) struct Materializer {
 
 impl Materializer {
     /// Start the materializer over the writer lineage `paths` belongs to, reading `[commons]`
-    /// from `config`. `None` where its thread could not start: the files then move only by
-    /// `aterm file refresh`.
+    /// from `config`, its publisher noting what it signed in `journal` ([`files_pass`]). `None`
+    /// where its thread could not start: the files then move only by `aterm file refresh`.
     pub(crate) fn start(
         paths: Paths,
         config: std::path::PathBuf,
         cadence: Cadence,
         elsewhere: Arc<Elsewhere>,
+        journal: Option<Spool>,
     ) -> Option<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
@@ -356,7 +362,12 @@ impl Materializer {
             .name("alab-files".into())
             .spawn(move || {
                 materialize(&mut files, &Live, &stopped, &elsewhere, &mut || {
-                    met_busy(&files_pass(&paths, &config, crate::admission::deadline()))
+                    met_busy(&files_pass(
+                        &paths,
+                        &config,
+                        crate::admission::deadline(),
+                        journal.as_ref(),
+                    ))
                 });
             })
             .ok()?;

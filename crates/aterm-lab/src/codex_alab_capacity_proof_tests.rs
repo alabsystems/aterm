@@ -258,7 +258,7 @@ fn the_verdict_holds_the_smokes_rows() {
         assert!(
             judge(Case::PermanentRefusal, exit, one, &refusal)
                 .unwrap_err()
-                .contains("the refusal was retried"),
+                .contains("refusal request(s)"),
             "{exit:?}"
         );
     }
@@ -270,7 +270,7 @@ fn the_verdict_holds_the_smokes_rows() {
             &refusal
         )
         .unwrap_err()
-        .contains("the refusal was retried")
+        .contains("refusal request(s)")
     );
 }
 
@@ -460,7 +460,7 @@ fn the_model_stamps_each_answers_headers_before_its_body() {
     }
 }
 
-/// EACH WALL AS THE MODEL WRITES IT, over a real loopback connection: a terminal quota case's
+/// EACH WALL AS THE MODEL WRITES IT, over a real loopback connection: a workspace quota case's
 /// answer is a `429 Too Many Requests` with `Retry-After` and its
 /// `x-codex-rate-limit-reached-type`, and its body names the reset the model records on that
 /// request, stamped on the wall clock no later than the reset's base; a reset case's `429`
@@ -469,7 +469,7 @@ fn the_model_stamps_each_answers_headers_before_its_body() {
 #[test]
 fn the_model_writes_each_walls_headers_and_records_the_reset_it_named() {
     for (case, number) in [
-        (Case::QuotaTerminal(TERMINAL_KINDS[2]), 1),
+        (Case::WorkspaceQuotaRefusal(WORKSPACE_KINDS[2]), 1),
         (Case::QuotaResetRecovery, 2),
         (Case::CapacityRecovery, 2),
         (Case::QuotaResetRecovery, 1),
@@ -494,7 +494,7 @@ fn the_model_writes_each_walls_headers_and_records_the_reset_it_named() {
         );
         let has = |line: &str| head.lines().any(|l| l.eq_ignore_ascii_case(line));
         match (case, number) {
-            (Case::QuotaTerminal(kind), _) => {
+            (Case::WorkspaceQuotaRefusal(kind), _) => {
                 assert!(
                     head.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
                     "{label}"
@@ -536,9 +536,9 @@ fn the_model_writes_each_walls_headers_and_records_the_reset_it_named() {
 /// a second its reset is a second or more past `Retry-After` (a retry that keeps
 /// `Retry-After` alone, less than a second late, still comes before it) and within what the case
 /// waits by design; a no-reset case names no reset; a `403` case meets its wall at every
-/// request, with or without its reset; a terminal case meets a `429` typed with its kind at
+/// request, with or without its reset; a workspace case meets a `429` typed with its kind at
 /// every request, naming its reset. The case table holds ten cases of distinct names, every
-/// terminal kind once among them, and seven refusals.
+/// workspace kind once among them, and seven refusal outcomes.
 #[test]
 fn the_lanes_model_answers_each_quota_wall_past_what_retry_after_alone_reaches() {
     let error = |a: &Answer| J::parse(&a.body).expect("JSON").get("error").cloned();
@@ -598,9 +598,9 @@ fn the_lanes_model_answers_each_quota_wall_past_what_retry_after_alone_reaches()
             assert_eq!(a.reached_type, None, "{case:?}");
         }
     }
-    for kind in TERMINAL_KINDS {
+    for kind in WORKSPACE_KINDS {
         for number in [1, 2] {
-            let a = answer(Case::QuotaTerminal(kind), number, UNIX_AT);
+            let a = answer(Case::WorkspaceQuotaRefusal(kind), number, UNIX_AT);
             assert_eq!((a.status, a.retry_after), (429, Some(2)), "{kind}");
             assert_eq!(typed(&a), "usage_limit_reached", "{kind}");
             assert_eq!(a.reached_type, Some(kind));
@@ -615,11 +615,11 @@ fn the_lanes_model_answers_each_quota_wall_past_what_retry_after_alone_reaches()
 
     let names: std::collections::BTreeSet<String> = CASES.iter().map(|c| c.name()).collect();
     assert_eq!(names.len(), CASES.len(), "{names:?}");
-    for kind in TERMINAL_KINDS {
+    for kind in WORKSPACE_KINDS {
         assert_eq!(
             CASES
                 .iter()
-                .filter(|c| **c == Case::QuotaTerminal(kind))
+                .filter(|c| **c == Case::WorkspaceQuotaRefusal(kind))
                 .count(),
             1,
             "{kind}"
@@ -754,9 +754,105 @@ fn a_package_with_no_quota_recovery_skips_only_the_cases_that_need_it() {
     assert!(!without.contains(&"quota-no-reset-recovery".to_owned()));
 }
 
-/// EVERY REFUSAL'S ROWS AND EVERY RECOVERY'S, case by case: a refused case passes with one
-/// request, one failed turn and a non-zero exit, and fails retried, signaled, exiting 0, or
-/// with its turn completed or never failed; a recovering case fails a non-zero exit or a
+/// The unanswered workspace wall: a short named reset, then exactly the same
+/// input after the native host's grace. Header timing deliberately differs from
+/// request arrival, so an arrival-based backoff cannot satisfy these controls.
+fn workspace_taken(retry_at: f64) -> Vec<Taken> {
+    let mut rows = taken(13.0, 13.001, retry_at);
+    rows.remove(1);
+    rows[0].header_started = Some(1.0);
+    rows[0].header_sent = Some(1.0);
+    rows[0].resets_at = Some(1_800_000_004);
+    rows[1].body = rows[0].body.clone();
+    rows
+}
+
+#[test]
+fn workspace_refusals_keep_the_native_host_grace_and_exact_request() {
+    let turn = |kind: &str| J::obj([("type", J::s(kind))]);
+    let failed = [turn("turn.started"), turn("turn.failed")];
+    for kind in WORKSPACE_KINDS {
+        let case = Case::WorkspaceQuotaRefusal(kind);
+        let observed = workspace_taken(31.0);
+        let passed = judge(case, Some(1), &observed, &failed).expect("one unanswered host grace");
+        assert_eq!(passed.get("requestCount"), Some(&J::Int(2)));
+        assert_eq!(
+            passed.get("hostGraceSeconds").and_then(J::as_f64),
+            Some(30.0)
+        );
+        assert_eq!(case.waits(), Duration::from_secs(30));
+        let reset = observed[0].resets_at.unwrap() as f64;
+        assert!(
+            reset < UNIX_AT + 5.0,
+            "the named reset cannot authorize a shorter host grace"
+        );
+        for at in [5.0, 30.5, 30.999_999] {
+            let early = workspace_taken(at);
+            assert!(early[1].arrived_unix > reset);
+            assert!(
+                judge(case, Some(1), &early, &failed).is_err(),
+                "{kind}: premature {at}s retry"
+            );
+        }
+        for invalid in [f64::NAN, f64::INFINITY] {
+            assert!(
+                judge(case, Some(1), &workspace_taken(invalid), &failed).is_err(),
+                "{kind}: invalid retry clock"
+            );
+        }
+        let mut missing = observed.clone();
+        missing[0].header_sent = None;
+        assert!(
+            judge(case, Some(1), &missing, &failed).is_err(),
+            "{kind}: unstamped headers"
+        );
+        let mut late_headers = observed.clone();
+        late_headers[0].header_sent = Some(1.5);
+        assert!(
+            judge(case, Some(1), &late_headers, &failed).is_err(),
+            "{kind}: inconclusive emission"
+        );
+        let mut changed = observed.clone();
+        changed[1].body = request(vec![user(), output()]);
+        assert!(
+            judge(case, Some(1), &changed, &failed).is_err(),
+            "{kind}: extra retained output"
+        );
+        let mut changed_model = observed.clone();
+        changed_model[1]
+            .body
+            .as_mut()
+            .unwrap()
+            .set("model", J::s("another-model"));
+        assert!(
+            judge(case, Some(1), &changed_model, &failed).is_err(),
+            "{kind}: changed model"
+        );
+        for input in [Vec::new(), vec![user(), user()]] {
+            let mut changed_prompt = observed.clone();
+            changed_prompt[1].body = request(input);
+            assert!(
+                judge(case, Some(1), &changed_prompt, &failed).is_err(),
+                "{kind}: missing or duplicated prompt"
+            );
+        }
+        for ends in [
+            vec![turn("turn.failed"), turn("turn.completed")],
+            vec![turn("turn.failed"), turn("turn.failed")],
+        ] {
+            let mut events = vec![turn("turn.started")];
+            events.extend(ends);
+            assert!(
+                judge(case, Some(1), &observed, &events).is_err(),
+                "{kind}: not one failed turn"
+            );
+        }
+    }
+}
+
+/// Every refusal has exactly its native request count (one for 403, two for workspace
+/// grace), one failed turn and a non-zero nonsignal exit. A third attempt, success, or
+/// a completed or unfailed turn refuses the result; recovery fails a non-zero exit or a
 /// request short. CONTROL: each recovering case passes the rows its wall does not add.
 #[test]
 fn every_case_holds_its_refusal_or_recovery_rows() {
@@ -764,28 +860,35 @@ fn every_case_holds_its_refusal_or_recovery_rows() {
     let failed = [turn("turn.started"), turn("turn.failed")];
     let ok = taken(13.0, 13.001, 15.001);
     for case in CASES.into_iter().filter(|c| c.refused()) {
-        let one = &ok[..1];
-        let passed = judge(case, Some(1), one, &failed).expect("a refusal");
+        let expected = match case {
+            Case::WorkspaceQuotaRefusal(_) => workspace_taken(31.0),
+            _ => ok[..1].to_vec(),
+        };
+        let passed = judge(case, Some(1), &expected, &failed).expect("a refusal");
         assert_eq!(passed.get("case"), Some(&J::s(case.name())));
         for exit in [None, Some(0)] {
             assert!(
-                judge(case, exit, one, &failed)
+                judge(case, exit, &expected, &failed)
                     .unwrap_err()
-                    .contains("the refusal was retried"),
+                    .contains("refusal request(s)"),
                 "{case:?} {exit:?}"
             );
         }
+        let mut extra = expected.clone();
+        extra.push(expected.last().unwrap().clone());
         assert!(
-            judge(case, Some(1), &ok[..2], &failed)
-                .unwrap_err()
-                .contains("the refusal was retried"),
-            "{case:?}"
+            judge(case, Some(1), &extra, &failed).is_err(),
+            "{case:?}: an extra request"
+        );
+        assert!(
+            judge(case, Some(1), &expected[..expected.len() - 1], &failed).is_err(),
+            "{case:?}: a missing request"
         );
         for ends in [vec!["turn.completed"], Vec::new()] {
             let mut events = vec![turn("turn.started")];
             events.extend(ends.into_iter().map(turn));
             assert!(
-                judge(case, Some(1), one, &events)
+                judge(case, Some(1), &expected, &events)
                     .unwrap_err()
                     .contains("the refusal did not fail the native turn"),
                 "{case:?}"

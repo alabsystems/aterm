@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use crate::launch_isolation::aterm_under_test::{
     Host, LEAVING, REMARK, ThisHost, UNPROVEN, USED, aged, aterm_executable, prove, remark,
@@ -398,12 +398,11 @@ fn a_copy_a_live_process_runs_stays_by_this_hosts_own_reading() {
     assert!(!aged(&folder, now), "and is marked used");
 
     drop(input);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut patience = crate::patience::Patience::new(Duration::from_secs(60));
     while !cat.exited().expect("cat's state") {
-        assert!(
-            Instant::now() < deadline,
-            "cat never ended at its input's end"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("cat never ended at its input's end ({why})");
+        }
         aterm_uds::deadline::poll_yield();
     }
     let ended = cat.wait().expect("cat's end");

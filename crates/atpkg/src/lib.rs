@@ -54,6 +54,9 @@ pub mod cache;
 pub mod caller_shell;
 /// `aterm pkg capacity`: the machine's capacity now and the claims every session holds on it.
 pub(crate) mod capacity;
+/// The macOS public wire for one covering account-ledger admission.
+#[cfg(target_os = "macos")]
+pub(crate) mod claim_command;
 /// The `atpkg` CLI (all verbs), callable in-process by the `aterm` binary.
 pub mod cli;
 /// Copy-on-write clones of a build's files.

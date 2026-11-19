@@ -929,9 +929,7 @@ impl App {
 
     fn self_claim_may_land(&self, session: u64) -> bool {
         let (word, view, _) = self.session_autopilot(session);
-        view.mode()
-            .or(word)
-            .is_none_or(|mode| mode == alab_policy::config::Autopilot::Land)
+        view.may_land(word)
     }
 
     /// The wake arms: resolve the fabric sid to the pool's local id.
@@ -1731,11 +1729,18 @@ impl Desk for App {
 
     fn supervisor_lapse(&self, session: u64, now: Instant) -> Option<Instant> {
         let at_us = self.pool.get(session).and_then(|s| {
-            s.ctx
+            let expiry = s
+                .ctx
                 .meta
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .supervisor_expiry()
+                .supervisor_expiry();
+            // A foreign claim can supersede the closed SDK's expiry. Keep
+            // the original operation's independent cleanup appointment.
+            [expiry, crate::native_act::source_adoption_deadline(&s.ctx)]
+                .into_iter()
+                .flatten()
+                .min()
         })?;
         let now_us = crate::metrics::us_at(now);
         Some(now + Duration::from_micros(at_us.saturating_sub(now_us)) + Duration::from_millis(1))
@@ -1772,6 +1777,7 @@ impl Desk for App {
             return;
         };
         let now_us = crate::metrics::us_at(Desk::clock(self));
+        crate::native_act::expire_source_adoption(&ctx, now_us);
         if crate::session_timeline::publish_lapse_supervisor(&ctx, now_us).published() {
             self.redraw_claude_footer(session);
             self.note_harness_arm(session);

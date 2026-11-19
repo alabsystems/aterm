@@ -11,7 +11,7 @@ members = ["crates/*"]
 # `--workspace` and `-p` still reach every member. List new crates here unless
 # they are publication tools or check runners.
 default-members = [
-    "crates/aterm-repository-progress",
+    "crates/aterm-repository-progress", "crates/aterm-backup",
     "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-protocol", "crates/amacs-term",
     "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-agent-names", "crates/aterm-alloc", "crates/aterm-aos", "crates/aterm-aos-pane",
     "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-bootstrap-verify", "crates/aterm-brotli", "crates/aterm-buffer",
@@ -22,7 +22,7 @@ default-members = [
     "crates/aterm-core", "crates/aterm-ctl",
     "crates/aterm-dbus", "crates/aterm-digest", "crates/aterm-dirfd", "crates/aterm-diskwalk", "crates/aterm-dl",
     "crates/aterm-durable", "crates/aterm-db", "crates/aterm-db-core",
-    "crates/aterm-effects", "crates/aterm-file", "crates/aterm-value-guard", "crates/aterm-font", "crates/aterm-getrandom", "crates/aterm-gpu",
+    "crates/aterm-effects", "crates/aterm-evidence", "crates/aterm-file", "crates/aterm-value-guard", "crates/aterm-font", "crates/aterm-getrandom", "crates/aterm-gpu",
     "crates/aterm-gpu-web", "crates/aterm-grapheme", "crates/aterm-grid",
     "crates/aterm-gui", "crates/aterm-gui-consent", "crates/aterm-gui-documents",
     "crates/aterm-gui-fabric", "crates/aterm-gui-tabs", "crates/aterm-gui-timing",
@@ -91,7 +91,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit.
 [workspace.package]
-version = "0.207.0"
+version = "0.208.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -175,6 +175,9 @@ aterm-core = { path = "crates/aterm-core" }
 # First-party D-Bus wire format, SASL EXTERNAL, and blocking Unix client.
 aterm-dbus = { path = "crates/aterm-dbus" }
 aterm-digest = { path = "crates/aterm-digest" }
+# Dated, witnessed evidence (Obs, Ledger, Fresh) and the shared hold vocabulary (HoldBound,
+# Episode): pure, no I/O.
+aterm-evidence = { path = "crates/aterm-evidence" }
 # Runtime dlopen tables for Linux windowing libraries (libxcb, libX11,
 # libwayland-client, libxkbcommon) by versioned soname.
 aterm-dl = { path = "crates/aterm-dl" }
@@ -310,6 +313,7 @@ aterm-cores = { path = "crates/aterm-cores" }
 aterm-stamp = { path = "crates/aterm-stamp" }
 aterm-sysprobe = { path = "crates/aterm-sysprobe" }
 aterm-telemetry = { path = "crates/aterm-telemetry" }
+aterm-backup = { path = "crates/aterm-backup" }
 aterm-tempfile = { path = "crates/aterm-tempfile" }
 # Menu-bar template icons: a signed-distance shape supersampled to coverage and encoded as PNG.
 aterm-template-icon = { path = "crates/aterm-template-icon" }

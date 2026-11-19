@@ -12,6 +12,68 @@ const ACTOR: &str = "ATPKG_HEADLESS_HOST_WORLD";
 pub(super) const WORKER: &str = "ATPKG_HEADLESS_WORKER_WORLD";
 pub(super) const STOP: &str = "ATPKG_HEADLESS_STOP_WORKER";
 
+struct HeadlessJob {
+    worker: Option<std::thread::JoinHandle<(std::io::Result<JobOutcome>, Vec<CohortSignal>)>>,
+    input: std::io::PipeWriter,
+    cancel: CancelHandle,
+    world: PathBuf,
+    started: std::sync::mpsc::Receiver<u32>,
+}
+
+impl HeadlessJob {
+    fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
+    }
+
+    fn join(&mut self) -> std::thread::Result<(std::io::Result<JobOutcome>, Vec<CohortSignal>)> {
+        self.worker.take().expect("one owning join").join()
+    }
+
+    fn keep_cleanup(&self, why: &str) {
+        let _ = std::fs::write(self.world.join("owner-cleanup"), why);
+        let _ = writeln!(std::io::stderr(), "KEPT {}: {why}", self.world.display());
+    }
+}
+
+impl Drop for HeadlessJob {
+    fn drop(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+        let unwinding = std::thread::panicking();
+        self.keep_cleanup("the headless job owner was dropped before its join");
+        // Release any fixture barriers before awaiting either owner's drain.
+        if let Some(world) = self.world.parent() {
+            for index in 0..2 {
+                let _ = std::fs::write(
+                    world.join(index.to_string()).join("release"),
+                    b"fixture cleanup",
+                );
+            }
+        }
+        if !self.is_finished() {
+            let _ = self.cancel.request(CancelRequest::Terminate);
+        }
+        let finished = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(10),
+            || self.is_finished().then_some(()),
+        );
+        if finished.is_none() {
+            self.keep_cleanup("the owned headless supervisor did not finish within its cleanup hang detector; custody remains retained");
+        } else if let Some(worker) = self.worker.take()
+            && !matches!(worker.join(), Ok((Ok(outcome), _)) if outcome.cohort_settlement() == Some(CohortSettlement::Drained))
+        {
+            self.keep_cleanup("the owned headless supervisor did not report a drained cohort");
+        }
+        if !unwinding {
+            panic!("the headless job owner was dropped before its owning join");
+        }
+    }
+}
+
 #[test]
 fn headless_worker_if_requested() {
     let Some(world) = std::env::var_os(WORKER) else {
@@ -41,8 +103,8 @@ fn claim_job(world: &Path, seat: &Seat<'_>) -> Held {
     }
 }
 
-fn wait_ready(world: &Path, finished: impl Fn() -> bool) {
-    aterm_spec::wait::until_while_descendants_work("actual headless worker ready", || {
+fn wait_ready(world: &Path, root: u32, finished: impl Fn() -> bool) {
+    aterm_spec::wait::until_while_working(root, "actual headless worker ready", || {
         if world.join("ready").exists() {
             return Some(());
         }
@@ -140,19 +202,6 @@ fn headless_host_actor_if_requested() {
         let job = world.join(index.to_string());
         std::fs::create_dir(&job).unwrap();
     }
-    struct Release(PathBuf);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            // Also release both compiled fixture barriers on an assertion failure.
-            for index in 0..2 {
-                let _ = std::fs::write(
-                    self.0.join(index.to_string()).join("release"),
-                    b"fixture cleanup",
-                );
-            }
-        }
-    }
-    let _release = Release(world.clone());
     let first = claim_job(&world.join("0"), &selected);
     let second = claim_job(&world.join("1"), &selected);
     let second_need = second.claim().record().need.mem;
@@ -161,8 +210,8 @@ fn headless_host_actor_if_requested() {
     assert_eq!(rows.len(), 2, "same owner still reserves two actual jobs");
     assert_eq!(rows.iter().map(|r| r.need.mem).sum::<u64>(), expected);
 
-    // A regression to a per-job Front cannot get through this occupied global
-    // turn. The outer private actor's one-minute detector catches that deadlock.
+    // A regression to a per-job Front cannot get through this occupied global turn.
+    // The private actor's actual-root publication hang detector catches that deadlock.
     let _turn = crate::platform::FORWARDING_TURN.lock().unwrap();
     let mut jobs = Vec::new();
     for (index, held) in [first, second].into_iter().enumerate() {
@@ -170,7 +219,9 @@ fn headless_host_actor_if_requested() {
         let (input, writer) = aterm_uds::pipe().unwrap();
         let (cancel, cancellation) = Cancellation::channel(Duration::from_millis(100)).unwrap();
         let worker_world = job_world.clone();
+        let (started, root) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
+            HEADLESS_ROOT_STARTED.with(|slot| *slot.borrow_mut() = Some(started));
             let mut command = spawnfd::command(std::env::current_exe().unwrap());
             command
                 .args([
@@ -201,10 +252,33 @@ fn headless_host_actor_if_requested() {
             assert!(!command.starts_suspended(), "caller start policy restored");
             (outcome, requests)
         });
-        jobs.push((worker, writer, cancel, job_world));
+        jobs.push(HeadlessJob {
+            worker: Some(worker),
+            input: writer,
+            cancel,
+            world: job_world,
+            started: root,
+        });
     }
-    for (job, _, _, world) in &jobs {
-        wait_ready(world, || job.is_finished());
+    for job in &mut jobs {
+        let root = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the actual owned headless root is published",
+            || match job.started.try_recv() {
+                Ok(root) => Some(root),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    assert!(
+                        !job.is_finished(),
+                        "job ended before publishing its owned root"
+                    );
+                    None
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("job did not publish its owned root");
+                }
+            },
+        );
+        wait_ready(&job.world, root, || job.is_finished());
     }
     assert_eq!(ledger.list().unwrap().len(), 2);
     assert!(
@@ -228,14 +302,12 @@ fn headless_host_actor_if_requested() {
         "a refused one-shot leaves no waiting claim"
     );
     machine.set(concurrent_reading(256, 200, 128));
-    let (second, mut second_input, _second_cancel, _) = jobs.pop().unwrap();
-    let (first, _first_input, first_cancel, _) = jobs.pop().unwrap();
-    first_cancel.request(CancelRequest::Terminate).unwrap();
-    aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "only cancelled job ends",
-        || first.is_finished().then_some(()),
-    );
+    let mut second = jobs.pop().unwrap();
+    let mut first = jobs.pop().unwrap();
+    first.cancel.request(CancelRequest::Terminate).unwrap();
+    aterm_spec::wait::until_while_descendants_work("only cancelled job ends", || {
+        first.is_finished().then_some(())
+    });
     let (outcome, requests) = first.join().unwrap();
     let outcome = outcome.unwrap();
     assert!(outcome.cancelled());
@@ -255,12 +327,10 @@ fn headless_host_actor_if_requested() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].need.mem, second_need);
     assert_eq!(rows[0].accounting, aterm_capacity::Accounting::Whole);
-    second_input.write_all(b"finish\n").unwrap();
-    aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "uncancelled peer completes",
-        || second.is_finished().then_some(()),
-    );
+    second.input.write_all(b"finish\n").unwrap();
+    aterm_spec::wait::until_while_descendants_work("uncancelled peer completes", || {
+        second.is_finished().then_some(())
+    });
     let (outcome, requests) = second.join().unwrap();
     assert!(outcome.unwrap().succeeded());
     assert!(requests.is_empty());
@@ -291,21 +361,35 @@ fn run_actor(mode: &str) {
     if mode == "foreground" {
         command.env(STOP, "1");
     }
-    let output = aterm_uds::deadline::output_while_process_progressing(
-        &mut command,
-        aterm_spec::wait::MUST_HAPPEN,
-        format!("headless host actor {mode}"),
-    )
-    .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let output = actor_output(&mut command, "the private headless host actor finishes");
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let world = world.keep();
+            panic!("headless host failed: {error}; KEPT {}", world.display());
+        }
+    };
+    let cleanup = (0..2).any(|index| {
+        world
+            .path()
+            .join(index.to_string())
+            .join("owner-cleanup")
+            .exists()
+    });
+    if !output.status.success() || cleanup {
+        let world = world.keep();
+        panic!(
+            "headless host failed ({}; owner cleanup={cleanup}): {}; KEPT {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            world.display()
+        );
+    }
 }
 
-/// A one-crate package in `world` whose build script, a real compiled program, writes `ready`
-/// and waits for `release` in the folder `ATPKG_HEADLESS_REAL_BUILDS` names: the two real
+/// A one-crate package in `world` whose real compiled build script connects to the
+/// outer test's lifetime socket before writing `ready`, then waits for release or EOF:
+/// the two real
 /// `targo` builds the session's test holds at their barriers
 /// (`one_host_session_finishes_two_actual_targo_builds_after_clients_disconnect`).
 pub(super) fn prepare_build(world: &Path) {
@@ -317,18 +401,31 @@ pub(super) fn prepare_build(world: &Path) {
     .unwrap();
     std::fs::write(
         world.join("src/main.rs"),
-        "fn main() { assert_eq!((0..10).sum::<u64>(), 45); }\n",
+        "fn main() { assert_eq!((0..10).sum::<u64>(), 45); println!(\"host service probe executed\"); }\n",
     )
     .unwrap();
     std::fs::write(
         world.join("build.rs"),
         r#"
 fn main() {
+    use std::io::{Read as _, Write as _};
     let world = std::path::PathBuf::from(std::env::var_os("ATPKG_HEADLESS_REAL_BUILDS").unwrap());
-    std::fs::write(world.join("ready"), b"actual compiled build script running").unwrap();
-    while !world.join("release").exists() {
-        assert!(world.is_dir(), "build fixture owner disappeared");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    let mut owner = std::os::unix::net::UnixStream::connect(
+        std::env::var_os("ATPKG_HEADLESS_SESSION_OWNER").unwrap(),
+    ).unwrap();
+    owner.write_all(b"B").unwrap();
+    let mut byte = [0];
+    owner.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, *b"A");
+    std::fs::write(world.join("ready"), b"actual compiled build script running\n").unwrap();
+    loop {
+        match owner.read(&mut byte) {
+            Ok(0) => break,
+            Ok(1) if byte[0] == b'R' => break,
+            Ok(1) if byte[0] == b'?' => owner.write_all(b"A").unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => panic!("invalid fixture lifetime response: {other:?}"),
+        }
     }
 }
 "#,

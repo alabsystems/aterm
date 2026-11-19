@@ -810,6 +810,8 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn AgyKernel) -> Result<Plan, NoPl
         line,
         tap_dropped: None,
         token_dropped: None,
+        rebind: None,
+        twin_projected: None,
         line_dir: None,
     })
 }
@@ -869,6 +871,7 @@ fn relaunch_held(
     let (line, dialect) = match plan(opts, st, k) {
         Ok(p) => (p.line, p.dialect),
         Err(NoPlan::Wait(why)) => return said(r, format!("wait:{why}")),
+        Err(NoPlan::Noted { word, .. }) => return said(r, format!("wait:{word}")),
         Err(NoPlan::Account(refusal)) => return said(r, format!("wait:{}", refusal.kind.word())),
         Err(NoPlan::Refused { why, detail, .. }) => return fail(opts, r, st, &why, &detail),
     };
@@ -1470,11 +1473,14 @@ fn carry_on(
     r
 }
 
-/// Remove agy records nothing will visit again once their tab is proven gone (`life`, [`TabLife::Gone`]).
+/// Remove agy records nothing will visit again once their tab is proven gone: by `life` (this
+/// window's graph, [`TabLife::Gone`]) and from every other running window recorded beside them or
+/// under the aterm state root ([`super::across_records`]).
 pub(super) fn prune(opts: &Opts, now: u64, life: impl Fn(&str) -> TabLife) {
     if opts.dry_run || opts.background {
         return;
     }
+    let life = super::across_records(life, &opts.state, opts.aterm_state.as_deref(), now);
     let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return;
     };

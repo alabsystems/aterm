@@ -95,6 +95,40 @@ fn a_row_round_trips_through_its_line_for_every_class() {
     assert_eq!(Row::parse(&exact.to_line()), Some(exact));
 }
 
+/// A run that ended with a memory starvation episode open says `prev_pressure=starving`, which
+/// parses back, and the doctor's note counts it apart from critical pressure and names it as
+/// the last unexpected end's word. NEGATIVE CONTROL: a token no build writes refuses the row.
+#[test]
+fn a_starving_end_rides_the_row_and_the_doctors_note() {
+    let starved = PrevRun {
+        pressure: Pressure::Starving,
+        ..prev(EndClass::Killed)
+    };
+    let r = row(1_790_500_000, 88, starved);
+    let line = r.to_line();
+    assert!(line.contains(" prev_pressure=starving "), "{line}");
+    assert_eq!(Row::parse(&line), Some(r.clone()));
+    assert_eq!(
+        Row::parse(&line.replace("prev_pressure=starving", "prev_pressure=starved")),
+        None
+    );
+    let rows = vec![row(1_790_000_100, 2, prev(EndClass::Killed)), r];
+    let s = summarize(&rows);
+    assert_eq!((s.unexpected_critical, s.unexpected_starving), (1, 1));
+    let (lines, unexpected) = doctor_lines(&rows, Path::new("/x/recovery-ledger.log"));
+    assert!(unexpected);
+    assert!(
+        lines.iter().any(|l| l.contains("; memory starving")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.ends_with(
+            "2 with a stalled main thread, 1 with critical memory pressure, 1 while memory starved"
+        )),
+        "{lines:?}"
+    );
+}
+
 /// A row carries the kernel's birth microseconds (`started_us=`) beside its
 /// second under the same row version; an older row without the key still
 /// parses (`None`), and an out-of-range value rejects the row.

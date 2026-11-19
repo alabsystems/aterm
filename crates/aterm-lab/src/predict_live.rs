@@ -1096,7 +1096,7 @@ fn run_one(
         .ctl(&["sessions"])
         .stdout
         .split_whitespace()
-        .find(|w| aterm_types::control_verbs::is_minted_sid(w))
+        .find(|w| aterm_types::control_request::Sid::parse(w).is_some())
         .map(str::to_string);
     let Some(sid) = sid else {
         return Ok(Err("the tab has no session id".into()));

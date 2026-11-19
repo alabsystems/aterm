@@ -10,16 +10,12 @@
 //! unattended sign-in a lift ends, the row a step cannot lift, and the run a sleep interrupts.
 //! Every fixture address is `example.test`.
 
-// Read by the tests a scripted run of the ladder must reach, which run on Unix alone, where
-// aterm links the opener its page is handed to (`cli::opener_link`).
-#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::ladder_tests::{Bench, attempt_of, hand_roster, runs_signed_out};
 use super::login_tests::{Desk, NOW};
 use super::*;
-#[cfg(unix)]
 use crate::harness::cli::RenewBrowser;
 use crate::harness::cli::Renewal;
 use crate::harness::login_adoption::tests::{
@@ -133,8 +129,7 @@ impl Wrote {
         }
     }
 
-    /// When its last row was written: what the Unix-only in-flight run reports.
-    #[cfg(unix)]
+    /// When its last row was written: what the in-flight run reports.
     fn ended(self) -> i64 {
         match self {
             Self::Turn(_, answered) => answered,
@@ -361,14 +356,8 @@ fn login_adopted_the_upkeep_starts_no_sign_in_for_an_account_with_newer_served_e
                 !served,
                 "{what}"
             );
-            // The control's sign-in is handed its page, and its attempt is on record, on Unix
-            // alone, where aterm links the opener an unattended run's page is handed to
-            // (`cli::opener_link`); off Unix it is refused before its provider runs, and
-            // `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds that.
-            if served || cfg!(unix) {
-                assert_eq!(bench.handed().len(), usize::from(!served), "{what}");
-                assert_eq!(attempt_of(&desk, MAIN).is_some(), !served, "{what}");
-            }
+            assert_eq!(bench.handed().len(), usize::from(!served), "{what}");
+            assert_eq!(attempt_of(&desk, MAIN).is_some(), !served, "{what}");
             assert!(
                 signed_out(&desk, MAIN, now),
                 "{what}: the ladder's read hid the row and lifted nothing; the upkeep's step \
@@ -390,13 +379,6 @@ fn login_adopted_the_upkeep_starts_no_sign_in_for_an_account_with_newer_served_e
 /// response ran a tool while it streamed (the tool's result and a later row of that response
 /// are then both written after the sign-out and the baseline), and neither does no evidence:
 /// the run is counted failed and its work is not cancelled.
-///
-/// Unix only, where aterm links the opener an unattended run's page is handed to
-/// (`cli::opener_link`): off Unix the run never starts, and
-/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs there. A
-/// run superseded before it began and a person's sign-in are held on every platform
-/// ([`login_adopted_a_lift_reaches_no_run_before_it_began_and_no_desk_sign_in`]).
-#[cfg(unix)]
 #[test]
 fn login_adopted_a_lift_supersedes_an_unattended_sign_in_in_flight() {
     for (what, turn, lifts) in [
@@ -746,11 +728,6 @@ fn login_adopted_a_row_on_its_own_login_directory_is_left_to_the_ladder_and_said
     let bench = Bench::ending(Renewal::Failed);
     w3_tap(T - 5, 4_000);
     let _ = upkeep_at(&desk, &bench, T + 10);
-    // Its page is handed on Unix alone, where aterm links the opener an unattended run's page
-    // is handed to (`cli::opener_link`); off Unix the ladder's run is refused before it starts
-    // (`an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`), and the row stays
-    // its candidate all the same.
-    #[cfg(unix)]
     assert_eq!(bench.handed().len(), 1, "the ladder signs the row in");
     write_login_row(&desk.home, T + 38);
     write_served_turn(&desk.home, T + 95, T + 97);
@@ -794,6 +771,9 @@ fn login_adopted_a_row_on_its_own_login_directory_is_left_to_the_ladder_and_said
 /// every run a sleep spans is waived twice: the third is counted as it ended, and the ladder's
 /// backoff holds the pass after. CONTROL: the same run with no sleep is counted failed at
 /// once, and the next pass starts nothing.
+///
+/// Unix only, for the sleep seam it says the lid shut with (`wake_deadline::SleepSeam`),
+/// which only a Unix test build has.
 #[cfg(unix)]
 #[test]
 fn login_adopted_an_attempt_spanning_a_sleep_is_interrupted_not_timed_out() {

@@ -1214,10 +1214,13 @@ impl App {
     /// first line names it ([`task_line_of`], tracker ST-02), and with none, what it runs
     /// ([`worker_name`]): its agent, or a program worker's program.
     pub(crate) fn tab_label_of_session(&self, session: u64) -> String {
+        self.named_label_of_session(session)
+            .unwrap_or_else(|| self.unnamed_tab_label_of_session(session))
+    }
+
+    /// The remaining tab-label rungs when no role or pinned title names this session.
+    pub(crate) fn unnamed_tab_label_of_session(&self, session: u64) -> String {
         let clip = |t: &str| label_line(title_without_agent_glyph(t));
-        if let Some(label) = self.named_label_of_session(session) {
-            return label;
-        }
         if let Some(s) = self.pool.get(session) {
             // The live title, and whether nothing the tab runs gave it; a busy terminal's, as the
             // strip last read both.

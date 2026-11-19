@@ -39,6 +39,8 @@ pub mod kind {
     pub const SEAM: &str = "seam";
     /// A pass's index discovery ran: what it asked and what it found.
     pub const INDEX_RESOLVED: &str = "index-resolved";
+    /// A pin-format file that did not read was set aside, or could not be ([`crate::pin`]).
+    pub const SET_ASIDE: &str = "set-aside";
 }
 
 /// Path to `<logs dir>/packages.log`, or `None` if no log directory resolves.
@@ -155,6 +157,18 @@ pub enum Event<'a> {
         why: &'a str,
         /// The command that puts it back; empty when there is nothing to go back to.
         undo: &'a str,
+    },
+    /// A pin-format file unattended work could not read was set aside beside itself, or could
+    /// not be moved ([`crate::pin::holds_update`]); either way it holds nothing.
+    SetAside {
+        /// The file that did not read.
+        file: &'a str,
+        /// Why it did not read.
+        error: &'a str,
+        /// Where it is kept now; empty when it could not be moved.
+        kept: &'a str,
+        /// Why it could not be moved; empty when it was.
+        unmoved: &'a str,
     },
 }
 
@@ -381,6 +395,20 @@ fn render_at(unix: i64, pid: u32, t_ms: Option<u64>, event: &Event<'_>) -> Strin
                 ("to", to),
                 ("why", why),
                 ("undo", undo),
+            ],
+        ),
+        Event::SetAside {
+            file,
+            error,
+            kept,
+            unmoved,
+        } => (
+            kind::SET_ASIDE,
+            vec![
+                ("file", file),
+                ("error", error),
+                ("kept", kept),
+                ("unmoved", unmoved),
             ],
         ),
     };
@@ -801,6 +829,7 @@ pub fn parse_line(line: &str) -> Option<Entry> {
             kind::WARM,
             kind::SEAM,
             kind::INDEX_RESOLVED,
+            kind::SET_ASIDE,
         ]
         .contains(&entry.kind.as_str())
     })

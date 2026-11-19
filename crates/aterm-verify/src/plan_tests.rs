@@ -687,10 +687,8 @@ fn the_test_compile_claims_its_estimate_where_the_lint_claims_the_lesser() {
     );
 }
 
-/// A named skip plans no memory: under `--no-windows` the redraw conformance and the objc
-/// drives, which would compile and so claim the cold figure, are skipped before they start
-/// anything and claim nothing. NEGATIVE CONTROL: the same run with windows plans the cold 12
-/// GiB of a 24 GiB Mac for each.
+/// A headless plan omits the driver builds and skips both runtime stages with zero memory.
+/// With windows the two builds each claim the cold estimate of 12 GiB on this 24 GiB Mac.
 #[test]
 fn a_named_skip_plans_no_memory() {
     const GIB: u64 = 1 << 30;
@@ -712,8 +710,10 @@ fn a_named_skip_plans_no_memory() {
     assert_eq!(
         claims(false),
         [
-            (StageId::RedrawConformance, 12 * GIB),
-            (StageId::ObjcDrives, 12 * GIB)
+            (StageId::RedrawBuild, 12 * GIB),
+            (StageId::ObjcBuild, 12 * GIB),
+            (StageId::RedrawConformance, 0),
+            (StageId::ObjcDrives, 0)
         ]
     );
 }
@@ -1120,11 +1120,15 @@ fn the_measuring_compile_precedes_the_barrier_and_appkit_drives_the_main_target(
     }
     let appkit = plan(&ctx(&[Check::Appkit], Scope::workspace())).expect("complete graph and plan");
     for stage in &appkit {
-        assert!(
-            stage.id.timed() && stage.id.opens_windows(),
-            "{:?}",
-            stage.id
-        );
+        if matches!(stage.id, StageId::RedrawBuild | StageId::ObjcBuild) {
+            assert!(crate::memory::compiles(stage.id) && !stage.id.timed());
+        } else {
+            assert!(stage.id.timed() && stage.id.opens_windows());
+            assert!(!crate::memory::compiles(stage.id));
+            for build in [StageId::RedrawBuild, StageId::ObjcBuild] {
+                assert!(stage.after_stages.contains(&build));
+            }
+        }
         assert!(
             !stage.exclusive,
             "an ordinary AppKit run needs the quiet/window reservations, not a global barrier"

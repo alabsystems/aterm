@@ -6,7 +6,7 @@ use aterm_slog::{
     Actor, Close, Conf, Fields, Kind, Log, Mark, Node, Open, Out, RunOut, Src, Stamp, Tier,
 };
 
-const FACE: &str = "/f/f1/pub/n-a/tx000000000/ev";
+const FACE: &str = "/f/f1/pub/n-a/tzzzzzzzzzx/ev";
 
 fn mirrored(log: &mut Log) -> Vec<String> {
     mirrored_at(log, Stamp::new(9, 9))
@@ -887,20 +887,26 @@ fn a_watchs_live_marks_go_with_their_space_and_their_session() {
         Vec::<u32>::new(),
         "the old space's mark went with it, and the new space's partial fold sets none"
     );
+    let last_index = u64::try_from(fabric_brief::SESSIONS_MAX).expect("bounded session cap");
+    assert!(last_index < (1u64 << aterm_types::tab_id::BITS));
     for i in 0..fabric_brief::SESSIONS_MAX {
         off += 1;
-        let face = format!("/f/f1/pub/n-b/t{i:010}/ev");
+        let owner =
+            aterm_types::tab_id::TabId::from_bits(u64::try_from(i).expect("bounded session index"));
+        let face = format!("/f/f1/pub/n-b/{}/ev", owner.as_str());
         watch.step(off, &face, start[0].as_bytes());
     }
     assert!(
         !watch
             .read
             .sessions
-            .contains_key(&("n-a".into(), "tx000000000".into())),
+            .contains_key(&("n-a".into(), "tzzzzzzzzzx".into())),
         "PRECONDITION: the stalest session was evicted"
     );
     off += 1;
-    watch.step(off, "/f/f1/pub/n-b/t1ast000000/ev", start[0].as_bytes());
+    let last = aterm_types::tab_id::TabId::from_bits(last_index);
+    let last_face = format!("/f/f1/pub/n-b/{}/ev", last.as_str());
+    watch.step(off, &last_face, start[0].as_bytes());
     assert_eq!(
         watch.live_eps().len(),
         fabric_brief::SESSIONS_MAX,

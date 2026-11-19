@@ -1464,6 +1464,8 @@ pub enum TabIconKind {
     Recovery,
     Workers,
     Tables,
+    Registry,
+    SystemResources,
 }
 
 /// What kind of surface a tab's icon stands for: its session's terminal, or an application of aterm's own.
@@ -1475,7 +1477,7 @@ pub enum TabSurface {
 
 impl TabIconKind {
     /// Every kind, for the sweeps that must cover them all.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Mail,
         Self::Codex,
         Self::About,
@@ -1486,6 +1488,8 @@ impl TabIconKind {
         Self::Recovery,
         Self::Workers,
         Self::Tables,
+        Self::Registry,
+        Self::SystemResources,
     ];
 
     /// The surface this icon stands for. `Codex` names a program in a terminal, so an icon's presence never means an application: a new kind answers here.
@@ -1502,7 +1506,9 @@ impl TabIconKind {
             | Self::Editor
             | Self::Recovery
             | Self::Workers
-            | Self::Tables => TabSurface::App,
+            | Self::Tables
+            | Self::Registry
+            | Self::SystemResources => TabSurface::App,
         }
     }
 
@@ -1521,6 +1527,8 @@ impl TabIconKind {
             Self::Recovery => "recovery",
             Self::Workers => "workers",
             Self::Tables => "tables",
+            Self::Registry => "registry",
+            Self::SystemResources => "system-resources",
         }
     }
 
@@ -1539,6 +1547,8 @@ impl TabIconKind {
             Self::Recovery => "Recovery",
             Self::Workers => "Workers",
             Self::Tables => "Tables",
+            Self::Registry => "aRegistry",
+            Self::SystemResources => "System Resources",
         }
     }
 }
@@ -2241,6 +2251,20 @@ impl TabSet {
         tab.ephemeral = false;
         tab.fleet = false;
         Some(to)
+    }
+
+    /// Move a person's tab to the hidden suffix without transferring ownership of its sessions.
+    pub fn hide(&mut self, id: TabId) -> bool {
+        let Some(from) = self.shown().iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        if self.home == Some(id) {
+            return false;
+        }
+        let to = self.shown_len() - 1;
+        self.move_tab(from, to);
+        self.tabs[to].parked = true;
+        true
     }
 
     pub fn switch_to(&mut self, id: TabId) -> bool {

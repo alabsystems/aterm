@@ -592,6 +592,7 @@ fn the_report_writes_nothing_with_the_journal_on_or_off() {
                 windows: vec![WindowSeen {
                     window: alab_seen::WEEK.into(),
                     sub: None,
+                    model: None,
                     figure: Some(Figure::Used {
                         pct_x10: 400,
                         reset: Some(env.now + 5 * D),

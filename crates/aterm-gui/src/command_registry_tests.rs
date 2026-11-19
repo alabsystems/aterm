@@ -44,6 +44,12 @@ fn menu_faces_carry_stable_identities() {
     assert_eq!(system_state.content, ContentRequirement::Any);
     let tables = menu_command(menu::MenuAction::Tables);
     assert_eq!(tables.id.as_str(), "app.tables.open");
+    let registry = menu_command(menu::MenuAction::Registry);
+    assert_eq!(registry.id.as_str(), "app.registry.open");
+    assert_eq!(
+        (registry.scope, registry.authority, registry.content),
+        (tables.scope, tables.authority, tables.content)
+    );
     assert_eq!(
         (tables.scope, tables.authority, tables.content),
         (
@@ -58,6 +64,12 @@ fn menu_faces_carry_stable_identities() {
     assert_eq!(allocation.scope, CommandScope::Window);
     assert_eq!(allocation.authority, ActionAuthority::LocalUi);
     assert_eq!(allocation.content, ContentRequirement::Any);
+    let resources = menu_command(menu::MenuAction::SystemResources);
+    assert_eq!(resources.id.as_str(), "app.system_resources.open");
+    assert_eq!(
+        (resources.scope, resources.authority, resources.content),
+        (allocation.scope, allocation.authority, allocation.content)
+    );
 
     let all_actions: Vec<menu::MenuAction> =
         (0..=128).filter_map(menu::MenuAction::from_tag).collect();

@@ -23,18 +23,30 @@
 //!   their resolution, and says "reset at T, not read since" once every reset read has passed with
 //!   nothing read since, never a guessed 0. A `reset-used` (a limit reset spent, or a refill or a
 //!   raised allowance a Mac's usage tap read) from any Mac cuts the window it names, of its key:
-//!   a reading or a wall of that window made before the newest one is from before the refill and
+//!   a reading of that window made before the newest one, and a wall made before one that ends
+//!   it (in `7d-model`, a refill of its model's week: **Walls**), is from before the refill and
 //!   says nothing of the window now, and a reading another Mac dated within the clock-skew bound
 //!   after it counts only until a later reading the refill surely precedes. One that names no window (the limit still stood) cuts nothing,
 //!   and one dated past the skew bound ahead of the read is not believed. A workspace's
 //!   readings are its sub-account's (`sa-` key) and are folded under the account.
+//! - **Walls** stand per window and, in the `7d-model` window, per model (FL-271): a wall that
+//!   names its model's weekly bucket (`m`, [`ModelBucket`]) is that model's week alone, its own
+//!   [`WindowQuota`] row, and a `wall-cleared` or a refill (`reset-used`) that names a model
+//!   ends only that model's wall, so an Opus clearing or a Sonnet refill leaves a Fable wall
+//!   standing. A `seven_day_other` wall, of a model's week no bucket names, is its own too, and
+//!   walls every session of the account ([`WindowQuota::walls_account`]). A `7d-model` wall
+//!   that names no model (an older build's) is one unnamed wall of the window, as before: any
+//!   clearing or refill of the window ends it, and the same Mac's later wall that names its
+//!   model retires it (that Mac's backfill said it again with its model). A `7d-model` refill
+//!   that names no model (an older build's) ends every model's wall, as it ended the window's
+//!   one wall before; a clearing that names none ends the unnamed wall alone.
 //! - **Plan** is the newest plan word a Mac's CLI reported for the account ([`Seen::plan`]): a
 //!   `plan-seen` event, or the `plan` a Mac's `use` row states, with the Mac and the time. It is
 //!   what was observed, never the registry's `plan` cell, which is its owner's statement.
 
 use super::{
     EV, PLACE, RELAY, SUM, USE,
-    event::{Event, Kind, Pk, Res, SIGNIN_UNKNOWN, SIGNIN_WORDS, Window, Word},
+    event::{Event, Kind, ModelBucket, Pk, Res, SIGNIN_UNKNOWN, SIGNIN_WORDS, Window, Word},
     place::{self, Places},
     relay::{Heard, Rk},
 };
@@ -108,16 +120,57 @@ pub enum Usage {
     ResetUnread { reset: u64, read: u64, by: String },
 }
 
-/// One window of one account or sub-account.
+/// One window of one account or sub-account, or one model's own week of its `7d-model` window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowQuota {
     /// The account (`ac-`) or the workspace's sub-account (`sa-`).
     pub pk: String,
     pub window: Window,
+    /// The model whose own week this row's wall is of, for a `7d-model` wall that names one
+    /// (FL-271): such a row holds that model's wall alone and no usage, since a reading names
+    /// no model. `None` for the window's own row, which holds its usage and, in `7d-model`, an
+    /// older build's wall that names no model.
+    pub model: Option<ModelBucket>,
     /// `None` where only a wall is known.
     pub usage: Option<Usage>,
     /// A wall still standing at the read's `now`.
     pub wall: Option<Wall>,
+}
+
+impl WindowQuota {
+    /// Whether this row's wall is one every session of the account meets: a wall of any window
+    /// but `7d-model`, or of the week of a model no bucket names ([`ModelBucket::Other`]), which
+    /// the harness takes as the whole account's (FL-269). A Fable, Opus or Sonnet week's wall
+    /// walls that model's sessions alone, and a `7d-model` wall that names no model cannot say
+    /// whose week it is, so neither is the account's ([`ModelBucket`]).
+    #[must_use]
+    pub fn walls_account(&self) -> bool {
+        self.window != Window::WeekModel || self.model == Some(ModelBucket::Other)
+    }
+}
+
+/// A wall's key in the fold, and a refill's: its window, and the model a `7d-model` wall or
+/// refill is of where it names one (FL-271), so two models' weekly walls stand apart and the
+/// clearing or the refill of one ends no other.
+type WallKey = (Window, Option<ModelBucket>);
+
+/// The key a wall or a refill of `window` naming `model` stands under: a model only in
+/// `7d-model`, the one window whose walls and refills are a model's own
+/// ([`Event::names_model`]).
+fn wall_key(window: Window, model: Option<ModelBucket>) -> WallKey {
+    (window, model.filter(|_| window == Window::WeekModel))
+}
+
+/// The newer of two refills, by (time, Mac).
+fn newer<'a>(a: Option<&'a Cut>, b: Option<&'a Cut>) -> Option<&'a Cut> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if (a.t, &a.uuid) < (b.t, &b.uuid) {
+            b
+        } else {
+            a
+        }),
+        (a, b) => a.or(b),
+    }
 }
 
 /// One event of the log, with the Mac that logged it.
@@ -139,7 +192,21 @@ pub struct Seen {
     /// Each account's sign-in word per Mac (32 hex).
     pub signins: BTreeMap<String, BTreeMap<String, SignedIn>>,
     readings: BTreeMap<String, BTreeMap<Window, Vec<Reading>>>,
-    walls: BTreeMap<String, BTreeMap<Window, Wall>>,
+    /// Each wall's newest sighting by account (or sub-account) and [`WallKey`]: a model's
+    /// week's apart from the window's own and from every other model's. Whether it still
+    /// stands is read against [`Self::clears`], [`Self::named`] and the refills
+    /// ([`Self::quota`]).
+    walls: BTreeMap<String, BTreeMap<WallKey, Wall>>,
+    /// Each wall's newest clearing by account (or sub-account) and [`WallKey`], by the clock of
+    /// the Mac that logged it: a wall seen at or before it no longer stands. Held apart from
+    /// the walls, not folded by removing one, since the window's logs are folded a Mac at a
+    /// time and a `use` row after them, so a clearing is often folded before the wall it
+    /// clears.
+    clears: BTreeMap<String, BTreeMap<WallKey, u64>>,
+    /// Each Mac's newest `7d-model` wall that names its model, by account (or sub-account) and
+    /// Mac: an unnamed `7d-model` wall that Mac saw at or before it is one it said again with
+    /// its model ([`Self::wall`]).
+    named: BTreeMap<String, BTreeMap<String, u64>>,
     /// The newest plan seen of each account (or of a workspace, under its `sa-` key), from any
     /// Mac ([`Self::plan`]).
     plans: BTreeMap<String, PlanSeen>,
@@ -152,10 +219,12 @@ pub struct Seen {
     /// Each Mac's latest `sum` row (32 hex uuid to the row): its label, version, OS, the count
     /// of accounts it used and its `journal` word, as that Mac wrote it.
     pub sums: BTreeMap<String, Value>,
-    /// Each window's newest refill, by account (or sub-account) and window: the newest
-    /// `reset-used` that names the window, from any Mac. Its readings and walls made before it
-    /// are from before the refill ([`usage`], [`Self::quota`]).
-    resets_used: BTreeMap<String, BTreeMap<Window, Cut>>,
+    /// Each window's newest refill, by account (or sub-account) and [`WallKey`]: the newest
+    /// `reset-used` that names the window, and in `7d-model` the model whose week it refilled
+    /// (FL-271), from any Mac. The window's readings made before its newest refill, and each
+    /// wall made before a refill that ends it, are from before the refill ([`usage`],
+    /// [`Self::quota`]).
+    resets_used: BTreeMap<String, BTreeMap<WallKey, Cut>>,
     /// This Mac's own Commons uuids (32 hex): its seat's, and each seat it succeeded where its
     /// writer's lineage reads ([`read`]). A record one of them wrote is this Mac's own, whatever
     /// the registry binds it to; empty where no Commons was read (a fixture).
@@ -180,7 +249,8 @@ pub struct Claimed {
 /// minutes. One bound with the one a sighting is held to ([`crate::alab::sighted::SKEW_MS`]).
 const SKEW_S: u64 = crate::alab::sighted::SKEW_MS / 1_000;
 
-/// One window's refill as the fold holds it ([`Seen::quota`]): the newest `reset-used` naming it.
+/// One window's refill as the fold holds it ([`Seen::quota`]): the newest `reset-used` naming it
+/// (and, in `7d-model`, naming its model's week or none).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Cut {
     /// When, by the clock of the Mac that logged it, and never after the read's `now`.
@@ -192,8 +262,9 @@ struct Cut {
 /// How far apart two readings' resets may be and still name one window: each reading's
 /// resolution (§7: exact for status-line and API resets, an hour for "Resets 1pm", a day for
 /// "Resets Sep 23", the clock-skew bound for a local `now + reset_after`). An exact reset still
-/// gets a minute, since two Macs round one server time to the second differently.
-const fn tolerance(res: Option<Res>) -> u64 {
+/// gets a minute, since two Macs round one server time to the second differently. `ai/limits`
+/// joins two Macs' readings of one instance by the same tolerance (`file::limits::window`).
+pub(crate) const fn tolerance(res: Option<Res>) -> u64 {
     match res {
         Some(Res::Exact | Res::Minute) => 60,
         Some(Res::Hour) => 3_600,
@@ -339,9 +410,11 @@ impl Seen {
 
     /// What a window holding exactly `events` says at `now`, each event logged by the Mac whose
     /// Commons uuid (32 hex) it is paired with and folded by the code [`Self::of`] folds an `ev`
-    /// batch with: the journal of the fleet tables' fixture (`crate::fleet::fixture`), which
-    /// holds no Commons to read one from.
-    pub(crate) fn of_events(events: &[(String, Event)], now: u64) -> Self {
+    /// batch with: the journal of the fleet tables' fixture (`crate::fleet::fixture`) and of a
+    /// reader's tests in another crate (`aterm`'s harness snapshot), which hold no Commons to
+    /// read one from.
+    #[must_use]
+    pub fn of_events(events: &[(String, Event)], now: u64) -> Self {
         let mut seen = Self::empty(now);
         for (n, (uuid, event)) in events.iter().enumerate() {
             seen.fold_event(uuid, event);
@@ -462,16 +535,53 @@ impl Seen {
         self.readings.insert(pk.to_owned(), by_window);
     }
 
-    fn wall(&mut self, pk: &str, window: Window, wall: Wall) {
-        if let Some(by_window) = self.walls.get_mut(pk) {
-            if by_window.get(&window).is_none_or(|held| held.t <= wall.t) {
-                by_window.insert(window, wall);
-            }
-            return;
+    /// A wall of `pk` seen under `key`: the newest of its key is held. A `7d-model` wall that
+    /// names its model is also its Mac's word that it names its models ([`Self::named`]).
+    fn wall(&mut self, pk: &str, key: WallKey, wall: Wall) {
+        if key.0 == Window::WeekModel && key.1.is_some() {
+            let t = self
+                .named
+                .entry(pk.to_owned())
+                .or_default()
+                .entry(wall.uuid.clone())
+                .or_insert(wall.t);
+            *t = (*t).max(wall.t);
         }
-        let mut by_window = BTreeMap::new();
-        by_window.insert(window, wall);
-        self.walls.insert(pk.to_owned(), by_window);
+        let by_key = self.walls.entry(pk.to_owned()).or_default();
+        if by_key.get(&key).is_none_or(|held| held.t <= wall.t) {
+            by_key.insert(key, wall);
+        }
+    }
+
+    /// Whether the wall `wall` of `pk`, held under `key`, is neither cleared nor said again:
+    /// - A clearing clears the wall of its own (window, model) and no other model's: an Opus
+    ///   clearing leaves a Fable wall standing, and one that names no model (an older build's)
+    ///   clears the unnamed wall alone.
+    /// - The unnamed `7d-model` wall (an older build's) is cleared by any clearing of its
+    ///   window, as every clearing of the window cleared its one wall before walls named their
+    ///   model: it cannot say whose week it was.
+    /// - It is also said again, so no longer its own wall, once the same Mac noted a wall that
+    ///   names its model at or after it: that Mac now names its models, and its backfill noted
+    ///   each of its walls still standing again with its model (`harness::journal::backfill`).
+    ///   Another Mac's unnamed wall, one an older build may still hold, stays.
+    fn uncleared(&self, pk: &str, key: WallKey, wall: &Wall) -> bool {
+        let clears = self.clears.get(pk);
+        let cleared = if key == (Window::WeekModel, None) {
+            clears
+                .into_iter()
+                .flat_map(|by_key| by_key.iter())
+                .any(|((w, _), t)| *w == key.0 && wall.t <= *t)
+                || self
+                    .named
+                    .get(pk)
+                    .and_then(|by_mac| by_mac.get(&wall.uuid))
+                    .is_some_and(|t| wall.t <= *t)
+        } else {
+            clears
+                .and_then(|by_key| by_key.get(&key))
+                .is_some_and(|t| wall.t <= *t)
+        };
+        !cleared
     }
 
     /// A plan word the Mac `uuid` saw of `pk` at `t`: the newest stands, by (time, Mac, word),
@@ -540,8 +650,9 @@ impl Seen {
             return;
         };
         if event.kind == Kind::ResetUsed {
-            // A refill cuts the window it names. One dated more than the skew bound ahead of now
-            // is no evidence of now; one inside it holds from now.
+            // A refill cuts the window it names, in `7d-model` the model's week it names
+            // ([`Self::quota`]). One dated more than the skew bound ahead of now is no evidence
+            // of now; one inside it holds from now.
             if event.t <= self.now.saturating_add(SKEW_S) {
                 let cut = Cut {
                     t: event.t.min(self.now),
@@ -551,7 +662,7 @@ impl Seen {
                     .resets_used
                     .entry(pk.to_owned())
                     .or_default()
-                    .entry(window)
+                    .entry(wall_key(window, event.model))
                     .or_insert_with(|| cut.clone());
                 if (held.t, &held.uuid) < (cut.t, &cut.uuid) {
                     *held = cut;
@@ -578,30 +689,32 @@ impl Seen {
             }
             Kind::Wall => self.wall(
                 pk,
-                window,
+                wall_key(window, event.model),
                 Wall {
                     uuid: uuid.to_owned(),
                     t: event.t,
                     until: event.until,
                 },
             ),
+            // A clearing is held apart from the wall it clears ([`Self::uncleared`]).
             Kind::WallCleared => {
-                if let Some(by_window) = self.walls.get_mut(pk)
-                    && by_window.get(&window).is_some_and(|held| held.t <= event.t)
-                {
-                    by_window.remove(&window);
-                    if by_window.is_empty() {
-                        self.walls.remove(pk);
-                    }
-                }
+                let t = self
+                    .clears
+                    .entry(pk.to_owned())
+                    .or_default()
+                    .entry(wall_key(window, event.model))
+                    .or_insert(event.t);
+                *t = (*t).max(event.t);
             }
             _ => {}
         }
     }
 
     /// A `use` row's plan and its quota and wall lists (design §4.17: `plan: {word, t}`,
-    /// `quota: list<{w, p, r, rr, t, src}>`, `wall: list<{w, until, t}>`), at the row's own key.
-    /// A plan that is no word of the vocabulary (`[a-z0-9-]`, 12 bytes) is no plan.
+    /// `quota: list<{w, p, r, rr, t, src}>`, `wall: list<{w, m?, until, t}>`), at the row's own
+    /// key. A plan that is no word of the vocabulary (`[a-z0-9-]`, 12 bytes) is no plan. A wall's
+    /// `m` is read only on a `7d-model` wall, a bucket word this build does not know as
+    /// [`ModelBucket::Other`]'s ([`ModelBucket::read`]), as `ai/limits` reads it.
     fn fold_use(&mut self, pk: &str, uuid: &str, row: &Value) {
         if let Some(plan) = row.get("plan")
             && let Some(word) = plan
@@ -651,8 +764,10 @@ impl Seen {
             .flatten()
         {
             let parsed = (|| {
+                let window = Window::parse(w.get("w")?.as_str()?)?;
+                let model = w.get("m").and_then(Value::as_str).map(ModelBucket::read);
                 Some((
-                    Window::parse(w.get("w")?.as_str()?)?,
+                    wall_key(window, model),
                     Wall {
                         uuid: uuid.to_owned(),
                         t: w.get("t")?.as_u64()?,
@@ -660,14 +775,16 @@ impl Seen {
                     },
                 ))
             })();
-            if let Some((window, wall)) = parsed {
-                self.wall(pk, window, wall);
+            if let Some((key, wall)) = parsed {
+                self.wall(pk, key, wall);
             }
         }
     }
 
     /// The quota of account `account` per window, its sub-accounts' windows after its own (§7:
-    /// folded per sub-account), each read as of [`Self::now`].
+    /// folded per sub-account), each read as of [`Self::now`]: a window's own row (its usage and
+    /// the wall that names no model), then a row per model whose own week's wall stands in it,
+    /// in [`ModelBucket`]'s order (FL-271).
     pub fn quota(&self, account: &str) -> Vec<WindowQuota> {
         let mut pks: Vec<&str> = vec![account];
         pks.extend(
@@ -684,24 +801,62 @@ impl Seen {
                 continue;
             }
             let cuts = self.resets_used.get(pk);
+            let cut_of = |key: WallKey| cuts.and_then(|by_key| by_key.get(&key));
             for &window in Window::ALL {
-                let cut = cuts.and_then(|by_window| by_window.get(&window));
+                // A reading names no model, so the window's newest refill, of any model's week
+                // or of none, cuts its readings, as every refill of the window did before
+                // refills named their model.
+                let cut = cuts
+                    .into_iter()
+                    .flat_map(|by_key| by_key.iter())
+                    .filter(|((w, _), _)| *w == window)
+                    .fold(None, |newest, (_, cut)| newer(newest, Some(cut)));
                 let usage = readings
                     .and_then(|by_window| by_window.get(&window))
                     .and_then(|readings| usage(window, readings, cut, self.now));
-                // A wall seen before the window's refill no longer stands.
-                let wall = walls
-                    .and_then(|by_window| by_window.get(&window))
-                    .filter(|wall| wall.until.is_none_or(|until| until > self.now))
-                    .filter(|wall| cut.is_none_or(|cut| wall.t >= cut.t))
-                    .cloned();
+                // A wall seen before a refill that ends it no longer stands: a model's own
+                // week's wall ends at a refill of that model's week or at one that names no
+                // model (an older build's, which cut the whole window), never at another
+                // model's (FL-271); the window's own wall, which names no model, at any refill
+                // of the window, as before.
+                let held = |model: Option<ModelBucket>| {
+                    let cut = match model {
+                        None => cut,
+                        Some(_) => newer(cut_of((window, None)), cut_of((window, model))),
+                    };
+                    walls
+                        .and_then(|by_key| by_key.get(&(window, model)))
+                        .filter(|wall| {
+                            wall.until.is_none_or(|until| until > self.now)
+                                && cut.is_none_or(|cut| wall.t >= cut.t)
+                                && self.uncleared(pk, (window, model), wall)
+                        })
+                        .cloned()
+                };
+                // The window's own row: its usage, and the wall that names no model.
+                let wall = held(None);
                 if usage.is_some() || wall.is_some() {
                     out.push(WindowQuota {
                         pk: pk.to_owned(),
                         window,
+                        model: None,
                         usage,
                         wall,
                     });
+                }
+                // Each model's own week's wall, apart from the window's and every other model's.
+                if window == Window::WeekModel {
+                    for &model in ModelBucket::ALL {
+                        if let Some(wall) = held(Some(model)) {
+                            out.push(WindowQuota {
+                                pk: pk.to_owned(),
+                                window,
+                                model: Some(model),
+                                usage: None,
+                                wall: Some(wall),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -762,7 +917,12 @@ impl Seen {
     pub fn accounts(&self) -> std::collections::BTreeSet<String> {
         let mut out: std::collections::BTreeSet<String> = self.last_use.keys().cloned().collect();
         out.extend(self.signins.keys().cloned());
-        for pk in self.readings.keys().chain(self.walls.keys()) {
+        let walled = self.walls.iter().filter(|(pk, by_key)| {
+            by_key
+                .iter()
+                .any(|(key, wall)| self.uncleared(pk, *key, wall))
+        });
+        for pk in self.readings.keys().chain(walled.map(|(pk, _)| pk)) {
             out.insert(self.sub_of.get(pk).unwrap_or(pk).clone());
         }
         out

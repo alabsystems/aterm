@@ -40,7 +40,7 @@ pub const LIMIT_CLEARED: [&str; 2] = [
 pub const RETIRED_CHECK: &str = "If the task is finished and verified";
 
 /// Prefix of the dirty-repository suffix appended to Land nudges.
-pub const REPO_SUFFIX_HEAD: &str = "Your repository still holds work no remote main has";
+pub const REPO_SUFFIX_HEAD: &str = "Your repository's local Git state still shows work";
 
 /// The tag a request carrying Land's contradiction gets (aterm's slice 4c), its words as aterm
 /// types them ([`contradiction_fault`]).
@@ -105,12 +105,6 @@ pub const HOLD_FIRST_TURN: Duration = SLOW_TURN;
 
 /// Duration for which the carry leg's first response is held before SIGKILL.
 pub const CARRY_FIRST_TURN: Duration = Duration::from_secs(3600);
-
-/// Duration for which the repository leg holds its response while committing.
-pub const REPO_COMMIT_HOLD: Duration = Duration::from_secs(60);
-
-/// Duration for which the repository leg holds its response while pushing.
-pub const REPO_PUSH_HOLD: Duration = Duration::from_secs(20);
 
 /// Duration for which the `NEEDS YOU` leg holds its response while the need stands.
 pub const NEEDS_HOLD: Duration = Duration::from_secs(10);
@@ -209,11 +203,11 @@ pub const FACTS_TICK_MS: u64 = 250;
 pub const CARRIED_DONE: &str = "Carried on after the relaunch. All done.\n\nATERM-TASK-DONE";
 
 /// `NEEDS YOU` requirement text used by the needs leg.
-pub const NEED: &str = "the signing credential to publish the release";
+pub const NEED: &str = "the Full Disk Access grant";
 
 /// Initial report for the `NEEDS YOU` leg naming [`NEED`].
 pub const NEEDS_REPORT: &str = "Built the release candidate and ran its checks.\n\nNEEDS YOU: the \
-                                signing credential to publish the release";
+                                Full Disk Access grant";
 
 /// Follow-up report for the `NEEDS YOU` leg with no `NEEDS YOU:` line.
 pub const NEEDS_PLAIN: &str = "Carried on: the changelog is updated and the docs are next.";
@@ -230,7 +224,7 @@ pub const LAND_PROGRESS: [&str; 2] = [
 
 /// Unclean Land defense that still carries a standing `NEEDS YOU:` line.
 pub const NEEDS_DEFENSE: &str = "Checked origin/main.\n\nNothing left: all of the work is on \
-                                 origin/main.\nNEEDS YOU: the release credential to tag it";
+                                 origin/main.\nNEEDS YOU: the Full Disk Access grant";
 
 /// Unclean Land defense that mentions work left for later.
 pub const OPEN_DEFENSE: &str = "Checked origin/main again.\n\nNothing left: all of the work is \
@@ -717,8 +711,10 @@ fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -
         ("reland", Step::Reopen) => slow("Looked again at the landed work.", SLOW_TURN),
         ("repo", Step::Person) => slow(REPO_WROTE, SLOW_TURN),
         ("repo", Step::Land) => say(REPO_DEFENSE),
-        ("repo", Step::Nudge(1)) => slow(REPO_COMMITTED, REPO_COMMIT_HOLD),
-        ("repo", Step::Nudge(_)) => slow(REPO_PUSHED, REPO_PUSH_HOLD),
+        // The proof's request-local repository controller completes the corresponding Git
+        // mutation before it releases either answer.
+        ("repo", Step::Nudge(1)) => say(REPO_COMMITTED),
+        ("repo", Step::Nudge(_)) => say(REPO_PUSHED),
         (_, Step::Defend | Step::RetiredCheck) => say(CRUISE_DEFENSE),
         (_, Step::Land | Step::Nudge(_)) => say(LAND_DEFENSE),
         (_, Step::LandAnswer) => say("Took the option that lands it soonest."),

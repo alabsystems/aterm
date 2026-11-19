@@ -7,7 +7,7 @@ use crate::resource_admission::{CompletionCause, Outcome};
 #[test]
 fn account_terminal_is_bound_distinct_from_legacy_and_keeps_absent_or_observed_zero() {
     let binding = Binding {
-        session: "s-0000000000000000abcd".into(),
+        session: "tqn5r6e0148".into(),
         attempt: [1; 16],
     };
     let plain = EventFrame {

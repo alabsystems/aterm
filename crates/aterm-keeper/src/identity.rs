@@ -94,8 +94,19 @@ fn through_trust_gate<T: Send + 'static>(
     what: &str,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, GateRefusal> {
-    aterm_uds::deadline::TRUST
-        .run(suspect, deadline, work)
+    through_gate(&aterm_uds::deadline::TRUST, suspect, deadline, what, work)
+}
+
+/// `work`, a code check that waits on `trustd`, through `gate`.
+#[cfg(target_vendor = "apple")]
+fn through_gate<T: Send + 'static>(
+    gate: &'static aterm_uds::deadline::Gate,
+    suspect: Duration,
+    deadline: Duration,
+    what: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, GateRefusal> {
+    gate.run(suspect, deadline, work)
         .map_err(|refused| gate_refusal(refused, what))
 }
 
@@ -386,9 +397,33 @@ impl Identity {
     /// [`CheckError::Unchecked`]; a silent `trustd` is [`CheckError::Unanswered`].
     pub fn admits_code_at_strictly(&self, path: &Path) -> Result<(), CheckError> {
         #[cfg(target_vendor = "apple")]
+        return self.admits_code_at_strictly_through(&aterm_uds::deadline::TRUST, path);
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = path;
+            Err(CheckError::Unchecked(
+                "no code requirement is in force to check a copy against".to_string(),
+            ))
+        }
+    }
+
+    /// [`Self::admits_code_at_strictly`] through `gate` in place of the process's one `trustd`
+    /// gate ([`aterm_uds::deadline::TRUST`]): a check whose length a bundle's account sets (what
+    /// it put in the bundle) and that must never leave that gate overdue, which turns every peer
+    /// check away at once ([`aterm_uds::deadline::Gate::start`]), runs on a gate of its own, and
+    /// one such check overdue turns away only the next of its own kind.
+    /// # Errors
+    /// As [`Self::admits_code_at_strictly`]; `gate` overdue is [`CheckError::Unanswered`].
+    #[cfg(target_vendor = "apple")]
+    pub fn admits_code_at_strictly_through(
+        &self,
+        gate: &'static aterm_uds::deadline::Gate,
+        path: &Path,
+    ) -> Result<(), CheckError> {
         if let Some(req) = &self.requirement {
             let (owned, req) = (path.to_path_buf(), Arc::clone(req));
-            return through_trust_gate(
+            return through_gate(
+                gate,
                 CODE_CHECK_HANG,
                 CODE_CHECK_HANG,
                 &path.display().to_string(),
@@ -399,7 +434,6 @@ impl Identity {
             )
             .map_err(CheckError::from)?;
         }
-        let _ = path;
         Err(CheckError::Unchecked(
             "no code requirement is in force to check a copy against".to_string(),
         ))

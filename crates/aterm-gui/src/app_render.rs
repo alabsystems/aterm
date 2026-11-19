@@ -2365,6 +2365,21 @@ pub(crate) fn stamped_tray_quad<'a>(
     quad
 }
 
+/// The part of the window-space Deck outside the terminal's own composited frame.
+fn resource_strip_quad<'a>(
+    cropped: bool,
+    full: Option<&'a crate::SettingsCard>,
+    top: Option<&crate::SettingsCard>,
+    floor_y: u32,
+    stamp: (u64, Option<aterm_gpu::TrayDelta>),
+) -> Option<aterm_gpu::TrayQuad<'a>> {
+    if !cropped || top.is_some_and(|card| card.scrim.is_some()) {
+        return None;
+    }
+    let card = full?;
+    tray_quad_below_y(card, floor_y).map(|quad| stamped_tray_quad(quad, card, Some(stamp)))
+}
+
 /// Raw-quad twin used after [`tray_quad_below_y`] has cropped a cached card.
 pub(crate) fn composite_tray_quad_at(
     pixels: &mut [u32],
@@ -2374,10 +2389,23 @@ pub(crate) fn composite_tray_quad_at(
     oy: i64,
     card: aterm_gpu::TrayQuad<'_>,
 ) {
+    composite_tray_quad_in(pixels, (fb_w, fb_h), (ox, oy), card, 0..fb_w);
+}
+
+fn composite_tray_quad_in(
+    pixels: &mut [u32],
+    (fb_w, fb_h): (usize, usize),
+    (ox, oy): (i64, i64),
+    card: aterm_gpu::TrayQuad<'_>,
+    clip_x: std::ops::Range<usize>,
+) {
     if let Some(scrim) = card.scrim {
         composite_tray_scrim_at(pixels, fb_w, fb_h, oy, scrim);
     }
     let (cw, ch) = (card.pw as usize, card.ph as usize);
+    let start_x = ox + i64::from(card.dx);
+    let x0 = (clip_x.start as i64 - start_x).clamp(0, cw as i64) as usize;
+    let x1 = (clip_x.end as i64 - start_x).clamp(0, cw as i64) as usize;
     for ty in 0..ch {
         let py = i64::from(card.dy) + ty as i64 + oy;
         if py < 0 {
@@ -2388,12 +2416,8 @@ pub(crate) fn composite_tray_quad_at(
             break;
         }
         let base = py * fb_w;
-        for tx in 0..cw {
-            let px = i64::from(card.dx) + tx as i64 + ox;
-            if px < 0 || px >= fb_w as i64 {
-                continue;
-            }
-            let px = px as usize;
+        for tx in x0..x1 {
+            let px = (start_x + tx as i64) as usize;
             let i = (ty * cw + tx) * 4;
             let a = u32::from(card.rgba[i + 3]);
             if a == 0 {
@@ -2415,6 +2439,25 @@ pub(crate) fn composite_tray_quad_at(
             let dst_t = (d >> 24) & 0xff;
             let out_t = (dst_t * (255 - a) + 127) / 255;
             *slot = (out_t << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+/// Paint the strip's real pixels into the side columns of a destination capture or present.
+fn composite_resource_strip_edges(
+    pixels: &mut [u32],
+    size: (usize, usize),
+    frame_origin: (i64, i64),
+    frame_width: usize,
+    strip: aterm_gpu::TrayQuad<'_>,
+) {
+    let (width, _) = size;
+    let (x, y) = frame_origin;
+    let start = x.clamp(0, width as i64) as usize;
+    let end = (x + frame_width as i64).clamp(0, width as i64) as usize;
+    for side in [0..start, end..width] {
+        if !side.is_empty() {
+            composite_tray_quad_in(pixels, size, (0, y), strip, side);
         }
     }
 }
@@ -2461,7 +2504,7 @@ pub(crate) fn apply_host_chrome_at(
     origin_y: i64,
     frame_width: usize,
     frame_height: usize,
-    inset: aterm_render::SideInsetPx,
+    inset: impl Into<aterm_render::FrameInsets>,
     edge_rows: std::ops::Range<usize>,
     tray: Option<aterm_gpu::TrayQuad<'_>>,
     invert: bool,
@@ -6599,6 +6642,19 @@ impl App {
         self.side_inset_px_of(wid, self.windows.get(&wid).map_or(0, |ws| ws.dock.cells))
     }
 
+    /// Pixel margins used by every presentation and pointer route for this window.
+    pub(crate) fn frame_insets(&self, wid: WindowId) -> aterm_render::FrameInsets {
+        let px = self.win_side_inset_px(wid);
+        aterm_render::FrameInsets { left: px, right: 0 }
+    }
+
+    /// Padded terminal-frame width in device pixels, excluding the dock.
+    pub(crate) fn terminal_frame_width_px(&self, wid: WindowId) -> usize {
+        let cols = self.windows.get(&wid).map_or(0, |ws| usize::from(ws.cols));
+        cols.saturating_mul(self.win_cell_size(wid).0)
+            .saturating_add(self.win_pad(wid).saturating_mul(2))
+    }
+
     /// [`Self::win_side_inset_px`] were window `wid`'s side inset `cells` wide: what a dock rise
     /// is judged by before it commits ([`Self::set_dock_at`]).
     pub(crate) fn side_inset_px_of(&self, wid: WindowId, cells: u16) -> usize {
@@ -6635,9 +6691,9 @@ impl App {
     /// A headless destination for a bare frame.
     pub(crate) fn headless_surface_px(
         frame: (usize, usize),
-        inset: aterm_render::SideInsetPx,
+        inset: impl Into<aterm_render::FrameInsets>,
     ) -> (usize, usize) {
-        (frame.0.saturating_add(inset.0), frame.1)
+        (frame.0.saturating_add(inset.into().width()), frame.1)
     }
 
     /// Top interior padding (device px) for window `wid`.
@@ -10506,6 +10562,16 @@ impl App {
         lens_input: Option<crate::stats_lens::LensPaintReceipt>,
         presented_plan: &crate::tab_model::VisibleLeafPlan,
     ) {
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        if let Some(state) = self.windows.get(&id)
+            && let Some(held) = state.presentation_lease.as_ref()
+        {
+            held.invalidate("another present replaced the captured presentation");
+        }
         let frame_started = startup_timing.frame_started();
         let acquire_wait_ns = self.last_acquire_wait_ns(id);
         self.reveal_successfully_presented_window(id);
@@ -11341,6 +11407,14 @@ impl App {
         )>,
         frame_clock: Option<Instant>,
     ) {
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        if self.presentation_blocked(id) {
+            return;
+        }
         self.reconcile_title_delivery(Instant::now());
         metrics::note_redraw_attempt();
         match self.windows.get(&id) {
@@ -12779,7 +12853,7 @@ impl App {
 
     /// Compute this window's tab-strip fingerprint for the frame (a RepaintKey term, so it runs before the early-out), refilling the window's resident `strip_titles_scratch` in place for the splice to paint from.
     pub(crate) fn redraw_tab_strip_state(&mut self, id: WindowId) -> u64 {
-        let tab_count = self.windows.get(&id).map_or(0, |ws| ws.tab_set.shown_len());
+        let tab_count = self.windows.get(&id).map_or(0, |ws| ws.strip_tab_count());
         if self.tab_strip_enabled() && tab_count > 0 {
             let Some(mut titles) = self
                 .windows
@@ -12812,13 +12886,16 @@ impl App {
             titles.clear();
             return;
         };
-        titles.truncate(ws.tab_set.shown_len());
-        for (i, tab) in ws.tab_set.shown().iter().enumerate() {
+        titles.truncate(ws.strip_tab_count());
+        for (i, (_, tab)) in ws.strip_tabs().enumerate() {
             if i >= titles.len() {
                 titles.push(String::new());
             }
             let slot = &mut titles[i];
-            if let Some(title) = self.workers_chip_title(ws, tab) {
+            if let Some(title) = ws
+                .preview_chip_label(tab.id)
+                .or_else(|| self.workers_chip_title(ws, tab))
+            {
                 *slot = title;
                 continue;
             }
@@ -12907,6 +12984,11 @@ impl App {
                 .map(|tab| tab_bar::TabStripMetadata::from_presentation(&tab.presentation)),
         );
         self.stamp_presence_chips(id, metadata);
+        let mut tabs = ws.tab_set.shown().iter();
+        metadata.retain(|_| {
+            tabs.next()
+                .is_some_and(|tab| !ws.organizer_tabs.contains(&tab.id))
+        });
     }
 
     fn ensure_cpu_present_target(
@@ -12928,7 +13010,7 @@ impl App {
         }
         if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
             let ws = &mut **route_guard_ws;
-            ws.present = None;
+            ws.replace_present(None);
             ws.capture_acquire_armed = false;
             ws.gpu_acquire_wait = crate::GpuAcquireWait::default();
             ws.last_present = None;
@@ -12939,7 +13021,7 @@ impl App {
             return Err(metrics::PresentDropReason::TargetMismatch);
         };
         let ws = &mut **route_guard_ws;
-        ws.present = Some(PresentTarget::Cpu { surface });
+        ws.replace_present(Some(PresentTarget::Cpu { surface }));
         Ok(())
     }
 
@@ -13289,8 +13371,9 @@ impl App {
         self.splice_stats_deck(id);
         self.stack_or_fold_stats_deck(id);
         let tray_floor_y = self.paste_banner_tray_floor_y(id);
-        let inset = aterm_render::SideInsetPx(self.win_side_inset_px(id));
+        let inset = self.frame_insets(id);
         let dock_geometry = self.dock_geometry(id);
+        let frame_y = self.frame_origin(id).1;
         let app_frame_interval = self.frame_interval;
         let App {
             backend, windows, ..
@@ -13311,6 +13394,7 @@ impl App {
         };
         // A refusal leaves the deck's stamp for the full present that follows.
         let motion = ws.deck_motion.clone();
+        let strip_stamp = ws.deck_motion.clone().stamp();
         let deck_stamp = deck_tray_stamp(ws);
         let deck_target_ns = deck_stamp
             .filter(|&(generation, dirty)| dirty.is_none_or(|d| d.since != generation))
@@ -13321,15 +13405,23 @@ impl App {
             .as_ref()
             .or(ws.settings_card.as_ref())
             .or(ws.badge_card.as_ref());
+        let frame_deck = ws
+            .frame_resource_strip
+            .as_ref()
+            .map(|(_, c)| c)
+            .or(ws.deck_card.as_ref());
+        let strip = resource_strip_quad(
+            ws.frame_resource_strip.is_some(),
+            ws.deck_card.as_ref(),
+            top_card,
+            tray_floor_y,
+            strip_stamp,
+        );
+        let strip_origin = (0, frame_y + i64::from(strip.map_or(0, |card| card.dy)));
         let mut tray_layers = aterm_alloc::ArrayVec::new();
         let tray = present_tray_quad(
-            crate::tray_stack_of(
-                ws.tray_stacked,
-                ws.deck_card.as_ref(),
-                ws.lens_card.as_ref(),
-                top_card,
-            ),
-            ws.deck_fold.as_ref().or(top_card).or(ws.deck_card.as_ref()),
+            crate::tray_stack_of(ws.tray_stacked, frame_deck, ws.lens_card.as_ref(), top_card),
+            ws.deck_fold.as_ref().or(top_card).or(frame_deck),
             deck_stamp,
             tray_floor_y,
             u32::try_from(source_crop_top).unwrap_or(u32::MAX),
@@ -13356,7 +13448,8 @@ impl App {
                     window_gpu,
                 }),
             ) => {
-                window_gpu.set_side_inset_px(inset.0 as u32);
+                window_gpu.set_frame_insets(inset);
+                window_gpu.set_resource_strip(strip, strip_origin);
                 window_gpu.set_dock_quad(
                     ws.dock_card
                         .as_ref()
@@ -13408,7 +13501,8 @@ impl App {
                 })
             }
             (Some(gpu), Some(PresentTarget::Virtual { window_gpu })) => {
-                window_gpu.set_side_inset_px(inset.0 as u32);
+                window_gpu.set_frame_insets(inset);
+                window_gpu.set_resource_strip(strip, strip_origin);
                 window_gpu.set_dock_quad(
                     ws.dock_card
                         .as_ref()
@@ -13527,8 +13621,9 @@ impl App {
         overlay: Option<OverlayGlow>,
     ) -> Result<Option<u64>, metrics::PresentDropReason> {
         let tray_floor_y = self.paste_banner_tray_floor_y(id);
-        let inset = aterm_render::SideInsetPx(self.win_side_inset_px(id));
+        let inset = self.frame_insets(id);
         let dock_geometry = self.dock_geometry(id);
+        let frame_y = self.frame_origin(id).1;
         let app_frame_interval = self.frame_interval;
         let App {
             backend,
@@ -13556,6 +13651,7 @@ impl App {
                 source_y: u32::try_from(source_crop_top).unwrap_or(u32::MAX),
                 height: u32::try_from(visible_height).unwrap_or(u32::MAX),
             };
+            let strip_stamp = ws.deck_motion.clone().stamp();
             let deck_stamp = deck_tray_stamp(ws);
             // A present that shows a deck frame its clock's tick asked carries the tick's vsync,
             // so its `presentedTime` books `deck_glass_late`.
@@ -13568,15 +13664,23 @@ impl App {
                 .as_ref()
                 .or(ws.settings_card.as_ref())
                 .or(ws.badge_card.as_ref());
+            let frame_deck = ws
+                .frame_resource_strip
+                .as_ref()
+                .map(|(_, c)| c)
+                .or(ws.deck_card.as_ref());
+            let strip = resource_strip_quad(
+                ws.frame_resource_strip.is_some(),
+                ws.deck_card.as_ref(),
+                top_card,
+                tray_floor_y,
+                strip_stamp,
+            );
+            let strip_origin = (0, frame_y + i64::from(strip.map_or(0, |card| card.dy)));
             let mut tray_layers = aterm_alloc::ArrayVec::new();
             let tray_arg = present_tray_quad(
-                crate::tray_stack_of(
-                    ws.tray_stacked,
-                    ws.deck_card.as_ref(),
-                    ws.lens_card.as_ref(),
-                    top_card,
-                ),
-                ws.deck_fold.as_ref().or(top_card).or(ws.deck_card.as_ref()),
+                crate::tray_stack_of(ws.tray_stacked, frame_deck, ws.lens_card.as_ref(), top_card),
+                ws.deck_fold.as_ref().or(top_card).or(frame_deck),
                 deck_stamp,
                 tray_floor_y,
                 u32::try_from(source_crop_top).unwrap_or(u32::MAX),
@@ -13612,7 +13716,8 @@ impl App {
                         window_gpu,
                     }),
                 ) => {
-                    window_gpu.set_side_inset_px(inset.0 as u32);
+                    window_gpu.set_frame_insets(inset);
+                    window_gpu.set_resource_strip(strip, strip_origin);
                     window_gpu.set_dock_quad(
                         ws.dock_card
                             .as_ref()
@@ -13662,7 +13767,8 @@ impl App {
                     })
                 }
                 (Some(gpu), Some(PresentTarget::Virtual { window_gpu })) => {
-                    window_gpu.set_side_inset_px(inset.0 as u32);
+                    window_gpu.set_frame_insets(inset);
+                    window_gpu.set_resource_strip(strip, strip_origin);
                     window_gpu.set_dock_quad(
                         ws.dock_card
                             .as_ref()
@@ -13749,6 +13855,23 @@ impl App {
             let pixels = ws.cpu_cache.presented_pixels();
             let translated = ws.cpu_cache.last_translated();
             let translated_prev = ws.cpu_cache.presented_translated();
+            let top_card = ws
+                .route_card
+                .as_ref()
+                .or(ws.settings_card.as_ref())
+                .or(ws.badge_card.as_ref());
+            let strip = resource_strip_quad(
+                ws.frame_resource_strip.is_some(),
+                ws.deck_card.as_ref(),
+                top_card,
+                tray_floor_y,
+                ws.deck_motion.clone().stamp(),
+            );
+            let frame_deck = ws
+                .frame_resource_strip
+                .as_ref()
+                .map(|(_, c)| c)
+                .or(ws.deck_card.as_ref());
             let (dw, dh) = ws
                 .win_px
                 .map_or(Self::headless_surface_px((fw, fh), inset), |s| {
@@ -13816,7 +13939,7 @@ impl App {
                         .or(ws.route_card.as_ref())
                         .or(ws.settings_card.as_ref())
                         .or(ws.badge_card.as_ref())
-                        .or(ws.deck_card.as_ref())
+                        .or(frame_deck)
                         .and_then(|card| tray_quad_below_y(card, tray_floor_y));
                     apply_host_chrome_at(
                         &mut buf[..n],
@@ -13832,6 +13955,15 @@ impl App {
                         invert,
                         overlay,
                     );
+                    if let Some(strip) = strip {
+                        composite_resource_strip_edges(
+                            &mut buf[..n],
+                            (dw, dh),
+                            (place.x.origin, place.y.origin),
+                            fw,
+                            strip,
+                        );
+                    }
                     if let (Some(card), Some(host)) = (ws.dock_card.as_ref(), dock_geometry) {
                         if let Some(quad) = tray_quad_below_y(card, 0) {
                             composite_tray_quad_at(
@@ -16912,12 +17044,14 @@ impl App {
         let (cols, tab_count, active) = match self.windows.get(&wid) {
             Some(ws) => (
                 ws.cols as usize,
-                ws.tab_set.shown_len(),
-                ws.tab_set.strip_active().unwrap_or(0),
+                ws.strip_tab_count(),
+                ws.selected_strip_index()
+                    .unwrap_or(crate::tab_bar::NO_SELECTED_TAB),
             ),
             None => return,
         };
         let floor = self.strip_floor(wid, header);
+        let new_tab = self.tab_home_window() == Some(wid);
         let tab_strip = {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -16933,27 +17067,38 @@ impl App {
         let subtitle = (tab_count == 1)
             .then(|| {
                 let ws = self.windows.get(&wid)?;
-                let tab = ws.tab_set.tabs().first()?;
+                let (_, tab) = ws.strip_tabs().next()?;
                 tab_bar::solo_subtitle(&tab.presentation.title, tab.presentation.tooltip.as_deref())
             })
             .flatten();
         let rename = self
             .inline_rename_edit(wid)
-            .map(|edit| (edit.tab, edit.text.clone(), edit.cursor))
-            .and_then(|(tab, text, cursor)| {
-                let chip = self.windows.get(&wid)?.tab_set.chip_of(tab)?;
-                Some((self.tab_index_for_id(wid, chip)?, text, cursor))
+            .map(|edit| (edit.tab, edit.text.clone(), edit.cursor, edit.selected_all))
+            .and_then(|(tab, text, cursor, selected)| {
+                let chip = self.windows.get(&wid)?.title_chip(tab)?;
+                Some((
+                    self.windows.get(&wid)?.strip_index_of(chip)?,
+                    text,
+                    cursor,
+                    selected,
+                ))
             })
             .filter(|(tab, ..)| *tab < tab_count)
-            .map(|(tab, text, cursor)| {
+            .map(|(tab, text, cursor, selected)| {
                 match self
                     .windows
                     .get(&wid)
                     .filter(|ws| !ws.preedit.is_empty())
-                    .map(|ws| field_preedit_display(&text, cursor, &ws.preedit, ws.preedit_caret))
-                {
-                    Some((display, caret, _)) => (tab, display, caret),
-                    None => (tab, text, cursor),
+                    .map(|ws| {
+                        field_preedit_display(
+                            if selected { "" } else { &text },
+                            cursor,
+                            &ws.preedit,
+                            ws.preedit_caret,
+                        )
+                    }) {
+                    Some((display, caret, _)) => (tab, display, caret, false),
+                    None => (tab, text, cursor, selected),
                 }
             });
         #[cfg(any(windows, target_os = "linux"))]
@@ -17038,6 +17183,7 @@ impl App {
                 self.win_cell_size(wid).0,
                 self.windows.get(&wid).map_or(1.0, |ws| ws.scale) as f32,
                 &wants,
+                new_tab,
             );
             let segments = if tab_count > 0 || show_update || caption.cols() > 0 {
                 tab_bar::layout_segments_with_caption_sized(
@@ -17065,11 +17211,12 @@ impl App {
                         version_hovered,
                         caption_hovered,
                         subtitle: subtitle.as_deref(),
-                        rename: rename.as_ref().map(|(tab, text, cursor)| {
+                        rename: rename.as_ref().map(|(tab, text, cursor, selected)| {
                             tab_bar::StripRenameField {
                                 tab: *tab,
                                 text,
                                 cursor: *cursor,
+                                selected_all: *selected,
                             }
                         }),
                     };
@@ -17091,13 +17238,14 @@ impl App {
                     version_hovered,
                     caption_hovered,
                     subtitle: subtitle.as_deref(),
-                    rename: rename
-                        .as_ref()
-                        .map(|(tab, text, cursor)| tab_bar::StripRenameField {
+                    rename: rename.as_ref().map(|(tab, text, cursor, selected)| {
+                        tab_bar::StripRenameField {
                             tab: *tab,
                             text,
                             cursor: *cursor,
-                        }),
+                            selected_all: *selected,
+                        }
+                    }),
                 };
                 let foot_px = self.strip_foot_px(wid, strip);
                 let seam_top_px = if tab_bar::STRIP_WINDOWS_PAINT {
@@ -17142,6 +17290,7 @@ impl App {
             };
             if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
                 let ws = &mut **route_guard_ws;
+                ws.painted_strip_ids = ws.strip_tabs().map(|(_, tab)| tab.id).collect();
                 ws.tab_segments = segments;
                 ws.cached_strip_rows = rows;
                 ws.cached_strip_images = strip_images;
@@ -18596,7 +18745,7 @@ impl App {
         } else {
             0
         };
-        let inset = aterm_render::SideInsetPx(self.win_side_inset_px(wid));
+        let inset = self.frame_insets(wid);
         let App {
             backend, windows, ..
         } = self;
@@ -18640,13 +18789,21 @@ impl App {
         self.backend.gpu_mut()?;
         let (w, h) = Self::headless_surface_px(
             self.backend.frame_size(win_rows, cols),
-            aterm_render::SideInsetPx(self.win_side_inset_px(wid)),
+            self.frame_insets(wid),
         );
         Some((w as u32, h as u32))
     }
 
     /// Reconfigure this window's GPU swapchain to the raw window pixels (`win_px`), called from `WindowEvent::Resized` before the throttled grid reflow so the surface never lags the window.
     pub(crate) fn sync_surface_to_window(&mut self, wid: WindowId) {
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        if let Some(mut state) = self.windows.get_mut(&wid) {
+            state.invalidate_resized_presentation(wid);
+        }
         let App {
             backend, windows, ..
         } = self;
@@ -18695,7 +18852,7 @@ impl App {
             // the size synchronously and no `Resized` follows (Wayland).
             if let Some(applied) = w.request_inner_size(size) {
                 if let Some(mut ws) = self.front_mut() {
-                    ws.win_px = Some(applied);
+                    ws.set_window_pixels(applied);
                 }
                 self.sync_surface_to_window(wid);
             }

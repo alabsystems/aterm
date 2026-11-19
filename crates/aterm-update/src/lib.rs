@@ -2523,18 +2523,27 @@ pub fn check_now_with_settings(
 
 /// Start this process's background checker once [`automatic_at_launch`] answers
 /// ([`once_automatic_known`]): the platform's start reads [`automatic`] and runs no scheduled
-/// check where it is off. The files earlier updaters kept a verdict in are retired first
-/// ([`retire_old_records`]), whether or not checks are on.
+/// check where it is off, and starts the host's `wakes` only where it starts a checker. The
+/// files earlier updaters kept a verdict in are retired first ([`retire_old_records`]), whether
+/// or not checks are on.
 pub fn spawn_background_check_with_settings(
     current_build: u64,
     provider: CheckSettingsProvider,
     notify: Option<HealthNotify>,
     on_staged: Option<StagedNotify>,
     on_checked: Option<CheckedNotify>,
+    wakes: Wakes,
 ) {
     retire_old_records();
     once_automatic_known("automatic update checks", move || {
-        start_background_check(current_build, provider, notify, on_staged, on_checked);
+        start_background_check(
+            current_build,
+            provider,
+            notify,
+            on_staged,
+            on_checked,
+            wakes,
+        );
     });
 }
 
@@ -2740,11 +2749,18 @@ fn start_background_check(
     notify: Option<HealthNotify>,
     on_staged: Option<StagedNotify>,
     on_checked: Option<CheckedNotify>,
+    wakes: Wakes,
 ) {
     #[cfg(target_os = "linux")]
     {
         let _ = on_staged;
-        linux::spawn_background_check_with_settings(current_build, provider, notify, on_checked);
+        linux::spawn_background_check_with_settings(
+            current_build,
+            provider,
+            notify,
+            on_checked,
+            wakes,
+        );
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -2754,6 +2770,7 @@ fn start_background_check(
             std::sync::Arc::new(move || provider().map(|settings| settings.source)),
             notify,
             on_staged,
+            wakes,
         );
     }
 }
@@ -2783,12 +2800,14 @@ pub struct LinuxUpdateStatus {
 /// configuration reload takes effect without a restart. Each cycle runs under `catch_unwind`,
 /// takes `checker.lock` within a bound, and stamps [`checker_watch::WATCH`], so the window's
 /// watchdog can start a replacement once the stamp goes stale ([`respawn_stalled_checker`]).
+/// The host's `wakes` start with the checker ([`Wakes`]).
 #[cfg(target_os = "macos")]
 pub fn spawn_background_check_with_source(
     current_build: u64,
     source_provider: SourceProvider,
     notify: Option<HealthNotify>,
     on_staged: Option<StagedNotify>,
+    wakes: Wakes,
 ) {
     spawn_background_check_in(
         automatic(),
@@ -2797,11 +2816,13 @@ pub fn spawn_background_check_with_source(
         source_provider,
         notify,
         on_staged,
+        wakes,
     );
 }
 
 /// [`spawn_background_check_with_source`] with automatic checks on or off (`automatic`); while
-/// they are off, `sweep` stands in for the scheduled checks' sweep of `staged/`.
+/// they are off, `sweep` stands in for the scheduled checks' sweep of `staged/`. Where no
+/// checker starts here (checks off, no installed bundle) `wakes` never start.
 #[cfg(target_os = "macos")]
 fn spawn_background_check_in(
     automatic: bool,
@@ -2810,6 +2831,7 @@ fn spawn_background_check_in(
     source_provider: SourceProvider,
     notify: Option<HealthNotify>,
     on_staged: Option<StagedNotify>,
+    wakes: Wakes,
 ) {
     if !automatic {
         // No scheduled check sweeps here, and a bundle an earlier stage or another process's
@@ -2848,22 +2870,27 @@ fn spawn_background_check_in(
         &CHECKER_ARGS,
         &checker_watch::WATCH,
         args,
+        move || wakes.start(),
         spawn_checker_thread,
     );
 }
 
 /// Publish one process-wide argument set before reserving its initial worker.
-/// A repeated startup cannot retire that worker or replace its restart arguments.
+/// A repeated startup cannot retire that worker or replace its restart arguments. The start
+/// that publishes it starts the host's `wakes` before its worker's first wait, whatever the spawn
+/// answers (a failed one is retried by the watchdog), and a repeated one starts none.
 #[cfg(target_os = "macos")]
 fn start_checker_once(
     stored: &std::sync::OnceLock<std::sync::Arc<CheckerArgs>>,
     watch: &checker_watch::CheckerWatch,
     args: std::sync::Arc<CheckerArgs>,
+    wakes: impl FnOnce(),
     spawn: impl FnOnce(u64, std::sync::Arc<CheckerArgs>) -> std::io::Result<()>,
 ) {
     if stored.set(std::sync::Arc::clone(&args)).is_err() {
         return;
     }
+    wakes();
     let generation = watch.register(
         cadence::Cadence::new(std::time::Duration::from_secs(cadence::INTERVAL_SECS))
             .max_wait()
@@ -2988,7 +3015,7 @@ fn asked_check<T>(automatic: bool, sweep: &UncheckedSweep, check: impl FnOnce() 
 
 /// Tell the background check that the system just woke: the window's did-wake notification,
 /// which also comes when a dark wake becomes a full one, after the power domain's wake
-/// ([`hear_wakes`]) was announced at the dark wake's start.
+/// ([`Sleeps::Heard`]) was announced at the dark wake's start.
 #[cfg(target_os = "macos")]
 pub fn note_system_woke() {
     check_wake::SYSTEM_WOKE.post();
@@ -3001,27 +3028,52 @@ pub fn note_network_moved() {
     check_wake::SYSTEM_WOKE.post();
 }
 
-/// Hear this process's sleeps and wall-clock steps for the background check's waits
-/// ([`aterm_uds::wall_watch::WallWatch`]: on macOS the power domain's wake, which the listener's
-/// own thread acknowledges, and libnotify's `clock_set`; on Linux the timer every resume and set
-/// cancels), so each wait between checks is one deadline a wake ends at once. Once per process,
-/// and not while automatic checks are off at launch. The watch starts on a thread of its own, so
-/// the caller pays only its spawn. A process that never calls this, as a macOS terminal session
-/// does (a session stopped by Ctrl-Z or a debugger could not acknowledge a will-sleep, and each
-/// sleep of the Mac would wait out the 30 s the system gives an answer), reads its clocks every
-/// 5 s while it waits, as every wait did before. Whether the thread started.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn hear_wakes() -> bool {
-    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if automatic_at_launch() == Some(false) || ASKED.swap(true, std::sync::atomic::Ordering::AcqRel)
-    {
-        return false;
+/// What tells a host's background checker of a wake besides its own clocks, as the host hands it
+/// to [`spawn_background_check_with_settings`]: started by the start that runs this process's
+/// checker, once, before its first wait, and never where no checker runs (automatic checks off,
+/// a Mac's copy that runs from no installed bundle, a Linux install that is not enrolled), so a
+/// process with no checker holds no thread, descriptor or power client for one.
+#[derive(Clone, Copy, Debug)]
+pub struct Wakes {
+    /// Whether the start hears this process's sleeps and wall-clock steps.
+    pub sleeps: Sleeps,
+    /// The host's relay of this process's settled network moves to [`note_network_moved`], which
+    /// the start runs; `None` where the host relays none.
+    pub network: Option<fn()>,
+}
+
+/// Whether a host's background checker hears this process's sleeps ([`Wakes::sleeps`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sleeps {
+    /// Its start hears them ([`aterm_uds::wall_watch::WallWatch`]: on macOS the power domain's
+    /// wake, which the listener's own thread acknowledges, and libnotify's `clock_set`; on Linux
+    /// the timer every resume and set cancels), so each wait between checks is one deadline a
+    /// wake ends at once: a window, the node job and a Linux terminal session. The watch starts
+    /// on a thread of its own, so the start pays only its spawn.
+    Heard,
+    /// Nothing hears them, and each wait reads its clocks every 5 s, as every wait did before
+    /// one-leg waits: a macOS terminal session, which stopped by Ctrl-Z or a debugger could not
+    /// acknowledge a will-sleep, so each sleep of the Mac would wait out the 30 s the system
+    /// gives an answer.
+    Unheard,
+}
+
+impl Wakes {
+    /// Start what tells the checker of a wake: the start that won this process's one checker
+    /// start runs it ([`start_checker_once`], the Linux checker's start).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn start(self) {
+        if self.sleeps == Sleeps::Heard {
+            check_wake::hear_wakes_from(
+                &check_wake::SYSTEM_WOKE,
+                || aterm_uds::wall_watch::WallWatch::start().map(std::sync::Arc::new),
+                check_wake::wall_thread,
+            );
+        }
+        if let Some(network) = self.network {
+            network();
+        }
     }
-    check_wake::hear_wakes_from(
-        &check_wake::SYSTEM_WOKE,
-        || aterm_uds::wall_watch::WallWatch::start().map(std::sync::Arc::new),
-        check_wake::wall_thread,
-    )
 }
 
 /// How long the check loop pauses after the host did not answer its settings query.
@@ -4215,6 +4267,7 @@ pub fn spawn_background_check_with_source(
     _source_provider: SourceProvider,
     _notify: Option<HealthNotify>,
     _on_staged: Option<StagedNotify>,
+    _wakes: Wakes,
 ) {
 }
 

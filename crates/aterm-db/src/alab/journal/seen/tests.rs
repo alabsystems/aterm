@@ -472,6 +472,7 @@ fn ev(t: u64, kind: Kind, account: Pk) -> Event {
         cli: Word::new("claude").unwrap(),
         sub: None,
         window: None,
+        model: None,
         pct_x10: None,
         reset: None,
         res: None,
@@ -791,4 +792,444 @@ fn a_noted_plan_is_flushed_and_read_back() {
     let plan = seen.plan(ann.as_str()).expect("the plan the Mac noted");
     assert_eq!((plan.word.as_str(), plan.t), ("max", now - 590));
     assert!(seen.me.contains(&plan.uuid), "this Mac read it");
+}
+
+/// The Mac that logs the walls of [`a_models_wall_stands_apart_from_the_accounts_and_from_every_other_models`].
+const WALLS_MAC: &str = "0a0b0c0d0e0f101112131415161718ff";
+
+/// A wall of `account`'s `window` seen at `t`, standing until `until`, of `model`'s own week
+/// where it names one.
+fn wall_of(t: u64, account: Pk, window: Window, model: Option<ModelBucket>, until: u64) -> Event {
+    Event {
+        window: Some(window),
+        model,
+        until: Some(until),
+        ..ev(t, Kind::Wall, account)
+    }
+}
+
+/// The clearing at `t` of `account`'s `window` wall of `model`'s week where it names one.
+fn cleared(t: u64, account: Pk, window: Window, model: Option<ModelBucket>) -> Event {
+    Event {
+        window: Some(window),
+        model,
+        ..ev(t, Kind::WallCleared, account)
+    }
+}
+
+/// A Mac still on a build before walls named their model (FL-269).
+const OLDER_MAC: &str = "0a0b0c0d0e0f1011121314151617180e";
+
+/// A refill at `t` of `account`'s `7d-model` window, of `model`'s week where it names one.
+fn refill_of(t: u64, account: Pk, model: Option<ModelBucket>) -> Event {
+    Event {
+        model,
+        ..refill(t, account, Window::WeekModel)
+    }
+}
+
+/// Each standing wall `seen` holds of `account`: its window, the model it names, and whether it
+/// walls every session of the account.
+fn walls_of(seen: &Seen, account: Pk) -> Vec<(Window, Option<ModelBucket>, bool)> {
+    seen.quota(account.as_str())
+        .iter()
+        .filter(|q| q.wall.is_some())
+        .map(|q| (q.window, q.model, q.walls_account()))
+        .collect()
+}
+
+/// A MODEL'S OWN WEEKLY WALL STANDS APART FROM THE ACCOUNT'S AND FROM EVERY OTHER MODEL'S
+/// (FL-271). In `Seen`: ann's Fable week walled at t100 and her Opus week at t110, then an Opus
+/// `wall-cleared` at t200, leave the Fable wall standing, as Fable's own row of the `7d-model`
+/// window and no wall of the account's, and a refill of her Sonnet week, which names its model,
+/// leaves it too, though it cuts the window's readings, which name none; a refill of Fable's
+/// week ends Fable's wall. A `seven_day_other` wall is its own row and walls every session. An
+/// older build's `7d-model` wall that names no model (read from its line, no `m`) reads as
+/// before, one unnamed wall of the window: a clearing that names a model clears it, as any
+/// clearing of the window did, and a clearing naming none clears it and no model's; the same
+/// Mac's wall that names its model (its backfill's) retires it, in either fold order, while
+/// another Mac's stays beside a named one; a refill that names no model (an older build's) ends
+/// every model's wall. A `use` row's walls are keyed the same way, a bucket word this build does
+/// not know read as `seven_day_other`'s and an `m` on a 5-hour wall no model's. In the fleet
+/// table, ann's row is not walled by her Fable wall alone and names it beside (`model_walls`,
+/// with its end and who hit it); dan's 5-hour wall walls his row with his Fable wall still
+/// beside it, so neither hides the other, the longest of his own and his workspace's; bob's
+/// `seven_day_other` wall walls his row and is named beside; eve, whom the journal never names,
+/// has no `model_walls`; a refold is due at ann's Fable wall's end, and at it her wall is gone.
+/// NEGATIVE CONTROLS, run: with `Seen`'s walls keyed by window alone (`wall_key` giving
+/// `(window, None)`), the Opus clearing removes the standing Fable wall: `` left: [] right:
+/// [(WeekModel, Some(Fable), false)] ``; with a refill's cut keyed by window alone again (every
+/// refill of `7d-model` ending every model's wall), the Sonnet refill ends ann's Fable wall
+/// (`` left: [] right: [(WeekModel, Some(Fable), false)] ``); with a named clearing sparing the
+/// unnamed wall, cid's older wall stands (`` left: [(WeekModel, None, false)] right: [] ``), and
+/// so it does with a clearing folded by removing the wall it finds (as before), since cid's
+/// older Mac's log is folded after the clearing; with `Seen::uncleared` not taking the same
+/// Mac's named wall as saying its unnamed one again, fay's stands twice (`` left: [(WeekModel,
+/// None, false), (WeekModel, Some(Fable), false)] ``); with it taking any Mac's, gus's older
+/// wall is gone; with an unnamed clearing clearing every model's wall of its window, cid's later
+/// Fable wall goes (`` left: [] ``); with `Event::from_value` refusing a `7d-model` wall that names
+/// no model, cid's line does not read; with `wall_key` keeping an `m` on any window, the use
+/// row's 5-hour wall is lost (`left` lacks `(FiveHour, None, true)`); with the fleet row's
+/// `walled` taking every window's wall again (no `walls_account` filter), ann's row reads walled
+/// by her Fable wall: `` left: Some(true) right: Some(false) ``; with `model_walls` keeping a
+/// bucket's shortest wall, dan's names his own week's end, not his workspace's; with it stated
+/// for an account the journal does not know, eve's is `Some([])`; with no refold at a model's
+/// wall's end, the next change is bob's (`` left: Some(1800345600000) right:
+/// Some(1800259200000) ``); with `model_walls` not dropping an ended wall, ann's Fable wall is
+/// still named at its end.
+#[test]
+fn a_models_wall_stands_apart_from_the_accounts_and_from_every_other_models() {
+    let now = 1_800_000_000;
+    let week = now + 3 * 86_400;
+    let (ann, bob, cid, dan, fay, gus) = (
+        account("ann@example.test"),
+        account("bob@example.test"),
+        account("cid@example.test"),
+        account("dan@example.test"),
+        account("fay@example.test"),
+        account("gus@example.test"),
+    );
+    let (fable, opus) = (Some(ModelBucket::Fable), Some(ModelBucket::Opus));
+    let by = |mac: &str, events: Vec<Event>| -> Vec<(String, Event)> {
+        events
+            .into_iter()
+            .map(|event| (mac.to_owned(), event))
+            .collect()
+    };
+    let mut events = by(
+        WALLS_MAC,
+        vec![
+            wall_of(now - 900, ann, Window::WeekModel, fable, week),
+            wall_of(now - 890, ann, Window::WeekModel, opus, week),
+            cleared(now - 800, ann, Window::WeekModel, opus),
+            Event {
+                window: Some(Window::WeekModel),
+                pct_x10: Some(900),
+                reset: Some(week),
+                res: Some(Res::Exact),
+                src: Source::SessionUsage,
+                ..ev(now - 300, Kind::Quota, ann)
+            },
+            wall_of(
+                now - 700,
+                bob,
+                Window::WeekModel,
+                Some(ModelBucket::Other),
+                week + 86_400,
+            ),
+            cleared(now - 800, cid, Window::WeekModel, fable),
+            wall_of(now - 600, dan, Window::FiveHour, None, now + 3_600),
+            wall_of(now - 500, dan, Window::WeekModel, fable, week),
+            // His workspace's Fable week stands longer than his own.
+            Event {
+                sub: Word::new("0123456789ab"),
+                ..wall_of(now - 400, dan, Window::WeekModel, fable, week + 2 * 86_400)
+            },
+            // fay's Mac noted her wall naming no model, then, upgraded, its backfill noted it
+            // again, at its time, with its model.
+            wall_of(now - 900, fay, Window::WeekModel, None, week),
+            wall_of(now - 900, fay, Window::WeekModel, fable, week),
+            wall_of(now - 800, gus, Window::WeekModel, fable, week),
+        ],
+    );
+    // A Mac still on an older build: its lines name no model, and read all the same.
+    events.extend(by(
+        OLDER_MAC,
+        vec![
+            Event::from_value(&wall_of(now - 900, cid, Window::WeekModel, None, week).to_value())
+                .expect("a line with no `m` reads"),
+            wall_of(now - 900, gus, Window::WeekModel, None, week),
+        ],
+    ));
+    let seen = Seen::of_events(&events, now);
+
+    // The Opus clearing cleared Opus's wall alone: Fable's still stands, Fable's own.
+    assert_eq!(
+        walls_of(&seen, ann),
+        [(Window::WeekModel, fable, false)],
+        "an Opus clearing leaves the Fable wall"
+    );
+    let row = seen
+        .quota(ann.as_str())
+        .into_iter()
+        .find(|q| q.model == fable)
+        .expect("Fable's own row");
+    assert_eq!(row.usage, None, "a reading names no model");
+    assert_eq!(row.wall.and_then(|wall| wall.until), Some(week));
+    // A week no bucket names is its own, and walls every session.
+    assert_eq!(
+        walls_of(&seen, bob),
+        [(Window::WeekModel, Some(ModelBucket::Other), true)]
+    );
+    // An older build's unnamed wall reads as before: a clearing of the window that names a
+    // model clears it; the same Mac's named wall says it again and retires it, in either fold
+    // order; another Mac's stays beside a named one.
+    assert_eq!(walls_of(&seen, cid), [], "a named clearing clears it");
+    assert_eq!(
+        walls_of(&seen, fay),
+        [(Window::WeekModel, fable, false)],
+        "its own Mac's backfill retires it"
+    );
+    let mut stale_use = seen.clone();
+    stale_use.fold_use(
+        fay.as_str(),
+        WALLS_MAC,
+        &aterm_json::json!({"wall": [{"w": "7d-model", "until": week, "t": now - 900}]}),
+    );
+    assert_eq!(
+        walls_of(&stale_use, fay),
+        [(Window::WeekModel, fable, false)],
+        "a use row its Mac wrote before it named its models retires too"
+    );
+    assert_eq!(
+        walls_of(&seen, gus),
+        [
+            (Window::WeekModel, None, false),
+            (Window::WeekModel, fable, false)
+        ],
+        "another Mac's unnamed wall stays"
+    );
+    assert_eq!(
+        walls_of(&seen, dan),
+        [
+            (Window::FiveHour, None, true),
+            (Window::WeekModel, fable, false),
+            (Window::WeekModel, fable, false)
+        ]
+    );
+
+    // A refill that names its model ends that model's wall alone and cuts the window's
+    // readings; one that names none (an older build's) ends every model's wall; a clearing that
+    // names none clears no model's wall.
+    let mut later = events.clone();
+    later.extend(by(
+        WALLS_MAC,
+        vec![
+            wall_of(now - 150, cid, Window::WeekModel, fable, week),
+            refill_of(now - 50, ann, Some(ModelBucket::Sonnet)),
+            cleared(now - 100, fay, Window::WeekModel, fable),
+            refill_of(now - 50, gus, fable),
+        ],
+    ));
+    later.extend(by(
+        OLDER_MAC,
+        vec![
+            cleared(now - 100, cid, Window::WeekModel, None),
+            refill(now - 50, bob, Window::WeekModel),
+        ],
+    ));
+    let later = Seen::of_events(&later, now);
+    assert_eq!(
+        walls_of(&later, ann),
+        [(Window::WeekModel, fable, false)],
+        "a Sonnet refill leaves the Fable wall"
+    );
+    assert!(
+        later
+            .quota(ann.as_str())
+            .iter()
+            .all(|q| q.window != Window::WeekModel || q.usage.is_none()),
+        "a named refill cuts the window's readings, which name no model"
+    );
+    assert!(
+        seen.quota(ann.as_str())
+            .iter()
+            .any(|q| q.window == Window::WeekModel && q.usage.is_some()),
+        "CONTROL: the reading stood before the refill"
+    );
+    assert_eq!(walls_of(&later, cid), [(Window::WeekModel, fable, false)]);
+    assert_eq!(walls_of(&later, fay), [], "its clearing leaves nothing");
+    assert_eq!(
+        walls_of(&later, gus),
+        [],
+        "a Fable refill ends Fable's wall"
+    );
+    assert_eq!(
+        walls_of(&later, bob),
+        [],
+        "an unnamed refill ends every model's"
+    );
+    let fable_refill = Seen::of_events(
+        &by(WALLS_MAC, vec![refill_of(now - 50, ann, fable)])
+            .into_iter()
+            .chain(events.iter().cloned())
+            .collect::<Vec<_>>(),
+        now,
+    );
+    assert_eq!(walls_of(&fable_refill, ann), [], "a Fable refill ends it");
+
+    // A `use` row's walls stand by (window, model) too.
+    let mut used = Seen::empty(now);
+    let wall = |model: Option<&str>| {
+        let mut entry = aterm_json::json!({"w": "7d-model", "until": week, "t": now - 60});
+        if let (Some(model), aterm_json::Value::Object(entry)) = (model, &mut entry) {
+            entry.insert("m".into(), aterm_json::Value::from(model));
+        }
+        entry
+    };
+    used.fold_use(
+        ann.as_str(),
+        WALLS_MAC,
+        &aterm_json::json!({"wall": [
+            wall(Some("seven_day_overage_included")),
+            wall(Some("seven_day_opus")),
+            wall(Some("seven_day_haiku")),
+            // Only a `7d-model` wall is a model's: an `m` on any other is no model's.
+            {"w": "5h", "m": "seven_day_opus", "until": now + 3_600, "t": now - 60},
+        ]}),
+    );
+    // An older build's row names no model.
+    used.fold_use(
+        ann.as_str(),
+        OLDER_MAC,
+        &aterm_json::json!({"wall": [wall(None)]}),
+    );
+    assert_eq!(
+        walls_of(&used, ann),
+        [
+            (Window::FiveHour, None, true),
+            (Window::WeekModel, None, false),
+            (Window::WeekModel, fable, false),
+            (Window::WeekModel, opus, false),
+            (Window::WeekModel, Some(ModelBucket::Other), true),
+        ]
+    );
+
+    #[cfg(unix)]
+    fleet_rows_wall_by_the_account_and_name_each_model_beside(seen, [ann, bob, dan], now, week);
+}
+
+/// The fleet half of [`a_models_wall_stands_apart_from_the_accounts_and_from_every_other_models`]
+/// (the fleet tables are Unix's): `seen` folded into `[ann, bob, dan]`'s rows at `now`, each
+/// model's wall standing until `week`.
+#[cfg(unix)]
+fn fleet_rows_wall_by_the_account_and_name_each_model_beside(
+    seen: Seen,
+    [ann, bob, dan]: [Pk; 3],
+    now: u64,
+    week: u64,
+) {
+    use crate::fleet::fold::{Inputs, Source, fold};
+    use crate::fleet::rows::{AccountRow, ModelWall, Stamp};
+    use crate::relation::Row;
+    let fable = Some(ModelBucket::Fable);
+    // The journal says nothing of eve.
+    let eve = account("eve@example.test");
+    // The fleet table: the account's own wall alone walls its row; each model's stands beside.
+    let mut lab = crate::alab::view::LabView::default();
+    for (pk, slug) in [(ann, "ann"), (bob, "bob"), (dan, "dan"), (eve, "eve")] {
+        let pk = pk.as_str().to_owned();
+        lab.accounts.insert(
+            pk.clone(),
+            crate::alab::view::Account {
+                pk,
+                provider: Some("anthropic".to_owned()),
+                realm: Some("claude".to_owned()),
+                slug: slug.to_owned(),
+                name: None,
+                legacy_label: None,
+                login: None,
+                identity: None,
+                status: Some("active".to_owned()),
+                plan: None,
+                region: None,
+                flow: None,
+                browser: None,
+                live: true,
+            },
+        );
+    }
+    let now_ms = now * 1_000;
+    let inputs = Inputs {
+        lab: Source::Live {
+            value: std::sync::Arc::new(lab),
+            at_ms: now_ms,
+        },
+        journal: Source::Live {
+            value: std::sync::Arc::new(seen),
+            at_ms: now_ms,
+        },
+        ..Inputs::default()
+    };
+    let tables = fold(&inputs, now_ms).tables;
+    let row_in = |tables: &crate::fleet::fold::FleetTables, pk: Pk| -> AccountRow {
+        tables
+            .accounts
+            .iter()
+            .find(|row| row.account == pk.as_str())
+            .expect("a row per account")
+            .clone()
+    };
+    let row = |pk: Pk| row_in(&tables, pk);
+    let fable_wall = |t: u64, until: u64| ModelWall {
+        bucket: fable,
+        until_ms: Some(until * 1_000),
+        read: Stamp {
+            at_ms: t * 1_000,
+            by: WALLS_MAC[..8].to_owned(),
+        },
+    };
+    assert_eq!(
+        row(eve).model_walls,
+        None,
+        "no model's wall is known of an account the journal says nothing of"
+    );
+    // Once dan's 5-hour wall has ended, the next change is the first model's wall's end, ann's
+    // Fable week, before bob's account-wide one; at it, hers goes.
+    assert_eq!(
+        fold(&inputs, (now + 3_600) * 1_000).next_change_ms,
+        Some(week * 1_000)
+    );
+    assert_eq!(
+        row_in(&fold(&inputs, week * 1_000).tables, ann).model_walls,
+        Some(vec![]),
+        "an ended model's wall is no longer named"
+    );
+    let ann_row = row(ann);
+    assert_eq!(
+        ann_row.walled,
+        Some(false),
+        "a Fable wall alone walls no account"
+    );
+    assert_eq!((ann_row.wall_until_ms, &ann_row.wall_read), (None, &None));
+    assert_eq!(ann_row.model_walls, Some(vec![fable_wall(now - 900, week)]));
+    let dan_row = row(dan);
+    assert_eq!(
+        dan_row.walled,
+        Some(true),
+        "a 5-hour wall walls the account"
+    );
+    assert_eq!(dan_row.wall_until_ms, Some((now + 3_600) * 1_000));
+    assert_eq!(
+        dan_row.model_walls,
+        Some(vec![fable_wall(now - 400, week + 2 * 86_400)]),
+        "the account's wall hides no model's, and a model's wall is its longest"
+    );
+    let bob_row = row(bob);
+    assert_eq!(
+        bob_row.walled,
+        Some(true),
+        "a week no bucket names walls every session"
+    );
+    assert_eq!(
+        bob_row
+            .model_walls
+            .as_ref()
+            .map(|walls| walls.iter().map(|wall| wall.bucket).collect::<Vec<_>>()),
+        Some(vec![Some(ModelBucket::Other)])
+    );
+    // The cell is of its column's type.
+    let schema = AccountRow::SCHEMA;
+    let at = schema.position("model_walls").expect("a column");
+    let crate::relation::Cell::Value(cell) = ann_row.cells().swap_remove(at) else {
+        panic!("the list is read");
+    };
+    assert!(crate::typed::cell::admissible(
+        &schema.columns[at].column.ty,
+        &cell
+    ));
+    assert_eq!(
+        cell[0]["bucket"],
+        aterm_json::Value::from("seven_day_overage_included")
+    );
 }

@@ -851,6 +851,7 @@ fn a_row_shows_what_the_lab_journal_says_of_its_account() {
             windows: vec![alab_seen::WindowSeen {
                 window: "5h".into(),
                 sub: None,
+                model: None,
                 figure: Some(alab_seen::Figure::Used {
                     pct_x10: 420,
                     reset: None,
@@ -931,6 +932,7 @@ fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
     let window = |name: &str, reset, wall_until| alab_seen::WindowSeen {
         window: name.into(),
         sub: None,
+        model: None,
         figure: Some(alab_seen::Figure::Used {
             pct_x10: 1000,
             reset,

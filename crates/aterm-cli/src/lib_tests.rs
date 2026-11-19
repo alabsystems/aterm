@@ -2270,6 +2270,8 @@ fn the_lan_row_marks_the_install_and_whether_the_socket_answers() {
                 install,
                 answers,
                 switched_off,
+                allowance: None,
+                kept_outdated: None,
             }),
             ..MachineFacts::absent()
         });
@@ -2283,6 +2285,9 @@ fn the_lan_row_marks_the_install_and_whether_the_socket_answers() {
     let install = |current, owed| {
         Some(Ok(super::LanInstall {
             current,
+            in_place: current,
+            development: false,
+            kept: false,
             owed,
             words: String::new(),
         }))
@@ -2323,6 +2328,52 @@ fn the_lan_row_marks_the_install_and_whether_the_socket_answers() {
     )
     .0;
     assert!(!report.contains("lan:"), "{report}");
+}
+
+/// An update the running broker adopts by itself is an unmeasured note that says so; once the
+/// expectation lapsed (`aterm_uds::lan::adoption::expect`: it still serves the old build after
+/// its looks) the row no longer says the broker adopts by itself, names the reason the broker
+/// recorded, and is a measured note naming the elevation that renews it. MUTANT (run): a lapsed
+/// image whose words drop the broker's reason fails. NEGATIVE CONTROL: the adopting image's row
+/// still says it adopts by itself, unmeasured.
+#[cfg(unix)]
+#[test]
+fn a_lapsed_adoption_names_the_brokers_reason_and_no_longer_says_it_adopts_by_itself() {
+    use aterm_uds::lan::install::{Part, Reading};
+    let row = |image: Part| {
+        let reading = Reading {
+            image,
+            plist: Part::Current,
+        };
+        let rows = super::lan_rows(&MachineFacts {
+            lan: Some(super::LanFact {
+                install: Some(Ok(super::LanInstall::of(&reading))),
+                answers: true,
+                switched_off: None,
+                allowance: None,
+                kept_outdated: None,
+            }),
+            ..MachineFacts::absent()
+        });
+        assert_eq!(rows.len(), 1);
+        (rows[0].mark, rows[0].unmeasured, rows[0].fact.clone())
+    };
+    let (mark, unmeasured, fact) = row(Part::Adopting("ABCDE12345".into()));
+    assert_eq!((mark, unmeasured), (Mark::Note, true), "{fact}");
+    assert!(fact.contains("adopts by itself"), "{fact}");
+
+    let reason = "the bundle is on another volume than the broker's image";
+    let (mark, unmeasured, fact) = row(Part::NotAdopted {
+        team: "ABCDE12345".into(),
+        broker: "0.206.0+gabc1234".into(),
+        serves: true,
+        why: Some(reason.into()),
+    });
+    assert_eq!((mark, unmeasured), (Mark::Note, false), "{fact}");
+    assert!(!fact.contains("adopts by itself"), "{fact}");
+    assert!(fact.contains(reason), "{fact}");
+    assert!(fact.contains("0.206.0+gabc1234"), "{fact}");
+    assert!(fact.contains("apply --plain installs it"), "{fact}");
 }
 
 #[test]
@@ -4371,4 +4422,104 @@ fn the_session_child_sees_the_posture_of_its_mode() {
         [cap.to_string(), cap.to_string()],
         "containment mode: the contained program raised its cap back"
     );
+}
+
+/// A newer build's image this build keeps, its socket answering, is in place: ok, whatever its
+/// plist (the newer build's), unless its broker speaks another protocol than this aterm's, which
+/// serves it nothing: a measured note saying so, naming no elevation. A development build's row is
+/// a measured note of how its LAN goes, naming macOS's allowance in its words, and offers no
+/// elevation. A kept image whose socket does not answer is a warning naming the limit of this
+/// build's elevation, which only loads it in place, and that only an aterm at least as new
+/// repairs it otherwise. NEGATIVE CONTROLS (run): without the in-place arm the kept image is a
+/// note naming the elevation; without the protocol's note a kept broker of another protocol
+/// reads ok; without the kept arm for a socket that does not answer, the row offers the apply as
+/// the repair.
+#[cfg(unix)]
+#[test]
+fn a_kept_image_is_in_place_and_a_development_build_names_its_path() {
+    use aterm_uds::lan::install::{Part, Reading};
+    let row_answering = |image: Part, plist: Part, allowance, protocol, answers| {
+        let reading = Reading { image, plist };
+        let install = super::LanInstall::of(&reading);
+        let kept_outdated =
+            super::kept_outdated(matches!(reading.image, Part::Kept { .. }), || {
+                Ok(aterm_uds::lan::BrokerHello {
+                    protocol,
+                    build: "0.209.0+gfeedbee".into(),
+                    direct: None,
+                })
+            });
+        let rows = super::lan_rows(&MachineFacts {
+            lan: Some(super::LanFact {
+                install: Some(Ok(install)),
+                answers,
+                switched_off: None,
+                allowance,
+                kept_outdated,
+            }),
+            ..MachineFacts::absent()
+        });
+        assert_eq!(rows.len(), 1);
+        (rows[0].mark, rows[0].unmeasured, rows[0].fact.clone())
+    };
+    let row_hearing = |image: Part, plist: Part, allowance, protocol| {
+        row_answering(image, plist, allowance, protocol, true)
+    };
+    let row = |image: Part, plist: Part, allowance| {
+        row_hearing(image, plist, allowance, aterm_uds::lan::PROTOCOL)
+    };
+    let kept = Part::Kept {
+        team: "ABCDE12345".into(),
+        image: 1_790_120_495,
+        ours: 1_790_120_400,
+    };
+    let (mark, unmeasured, fact) = row(kept.clone(), Part::Current, None);
+    assert_eq!((mark, unmeasured), (Mark::Ok, false), "{fact}");
+    assert!(fact.contains("never moves to an older build"), "{fact}");
+    assert!(!fact.contains("apply --plain"), "{fact}");
+    // Its plist is the newer build's, whatever it says.
+    let (mark, _, fact) = row(kept.clone(), Part::Differs, None);
+    assert_eq!(mark, Mark::Ok, "{fact}");
+    // A kept broker of another protocol serves this aterm nothing: no ok, and no remedy but this
+    // aterm's update.
+    let (mark, unmeasured, fact) = row_hearing(
+        kept.clone(),
+        Part::Current,
+        None,
+        aterm_uds::lan::PROTOCOL + 1,
+    );
+    assert_eq!((mark, unmeasured), (Mark::Note, false), "{fact}");
+    assert!(
+        fact.contains(&format!("protocol {}", aterm_uds::lan::PROTOCOL + 1))
+            && fact.contains("until this aterm updates"),
+        "{fact}"
+    );
+    assert!(!fact.contains("apply --plain"), "{fact}");
+    // One whose socket does not answer: this build's elevation only loads it, and never replaces
+    // it.
+    let (mark, unmeasured, fact) = row_answering(
+        kept.clone(),
+        Part::Current,
+        None,
+        aterm_uds::lan::PROTOCOL,
+        false,
+    );
+    assert_eq!((mark, unmeasured), (Mark::Warn, false), "{fact}");
+    assert!(
+        fact.contains("only loads that newer image") && fact.contains("at least as new"),
+        "{fact}"
+    );
+
+    for (words, allowance) in [
+        ("macOS allowed aterm", Ok("macOS allowed aterm".to_owned())),
+        (
+            "macOS has not answered for this code",
+            Err("macOS has not answered for this code".to_owned()),
+        ),
+    ] {
+        let (mark, unmeasured, fact) = row(Part::Development, Part::Development, Some(allowance));
+        assert_eq!((mark, unmeasured), (Mark::Note, false), "{fact}");
+        assert!(fact.contains(words) && fact.contains("VM guest"), "{fact}");
+        assert!(!fact.contains("apply --plain"), "{fact}");
+    }
 }

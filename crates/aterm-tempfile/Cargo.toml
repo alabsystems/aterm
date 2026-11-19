@@ -7,7 +7,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Zero-dependency temporary directories with RAII cleanup"
+description = "Private temporary directories with RAII cleanup"
 
 [lints]
 workspace = true
@@ -20,12 +20,16 @@ workspace = true
 # aterm-tempfile/test-support`. `--profile opt-test` needs nothing.
 test-support = []
 
+[dependencies]
+# Backup marking sits below uds, which uses this allocator for its own roots.
+aterm-backup = { workspace = true }
+
 [dev-dependencies]
 # The stand-in tests run a stand-in and this test binary as children: built with
 # `spawnfd::command`, bounded by `deadline`. A dev-dependency only, so the crate
-# still depends on nothing; aterm-uds reaches aterm-tempfile only as its own
-# dev-dependency, so no cycle forms.
+# depends only on aterm-backup; aterm-uds also uses this allocator, but the reverse
+# edge here is test-only, so no normal dependency cycle forms.
 aterm-uds = { workspace = true }
-# `fnv1a` is spelled out, so the crate still depends on nothing; its test holds it to the
+# `fnv1a` is spelled out, so the crate needs no hash dependency; its test holds it to the
 # workspace's FNV-1a. aterm-hash depends on astream-wire alone.
 aterm-hash = { workspace = true }

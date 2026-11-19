@@ -499,6 +499,7 @@ pub(super) fn hashed(bytes: usize) {
     HASHED.with(|count| count.set(count.get() + bytes));
 }
 /// The bytes this thread's writer checkpoints have hashed so far.
+#[cfg(unix)]
 pub(super) fn hashed_bytes() -> usize {
     HASHED.with(std::cell::Cell::get)
 }

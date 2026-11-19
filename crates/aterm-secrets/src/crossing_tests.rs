@@ -120,7 +120,7 @@ fn vault_fence_a_version_two_bound_reads_back_and_nothing_near_it_does() {
     }
     assert_eq!(
         RecordsBound::of(4_096, true).at_format(FORMAT_TWO).value(),
-        format!("2 4096 {FORMAT_ONE_BYTES} 2 crossed")
+        format!("2 4096 {FORMAT_TWO_BYTES} 2 crossed")
     );
     for near in [
         "2 4096 67108864 1 crossed",
@@ -165,4 +165,71 @@ fn vault_fence_two_format_stores_at_once_never_lower_the_mark() {
         });
         assert_eq!(mark.stored().expect("readable"), 3, "round {round}");
     }
+}
+
+/// A bound at a format states that format's byte capacity ([`capacity`]), the one accessor a
+/// store's byte bound reads, and not the bytes it stated before: so the capacity a format-2
+/// node states on the wire is the one its store holds, wherever that is raised (tracker
+/// FL-249). Its records and crossed state are carried. In this package both formats hold one
+/// reply's bytes, so no stated value changed.
+///
+/// NEGATIVE CONTROL (2026-11-17): `at_format` carrying the bound's own bytes, as it did before,
+/// seen to fail with ``assertion `left == right` failed: format 1`` (left 7, right 67108864).
+#[test]
+fn vault_checkpoint_a_bound_at_a_format_states_that_formats_capacity() {
+    let stated = RecordsBound {
+        bytes: 7,
+        ..RecordsBound::of(4_096, true)
+    };
+    for format in [FORMAT_ONE, FORMAT_TWO, 7] {
+        let at = stated.at_format(format);
+        assert_eq!(at.bytes, capacity(format), "format {format}");
+        assert_eq!((at.held, at.format, at.crossed), (4_096, format, true));
+    }
+    assert_eq!(capacity(FORMAT_ONE), FORMAT_ONE_BYTES);
+    assert_eq!(capacity(FORMAT_TWO), FORMAT_TWO_BYTES);
+    assert_eq!(capacity(7), FORMAT_TWO_BYTES);
+    assert_eq!(
+        FORMAT_TWO_BYTES,
+        crate::membership_log::store::REPLY_CAP as u64
+    );
+}
+
+/// The two classes of byte bound, each pinned to its value (tracker FL-148D). The wire's is one
+/// reply's or stream's bytes ([`REPLY_CAP`]), 64 MiB as every build since 0.146 holds a stream
+/// to, whatever a store's format. A store's is its format's capacity ([`capacity`], and
+/// [`Reading::capacity`] as a length in memory): format 1's is today's 64 MiB for good, format
+/// 2's is one reply's in this package (FL-249 raises it, there alone), and a follow copy's is
+/// format 2's. A store, its log's byte bound and the stops its authors keep read the same
+/// capacity.
+///
+/// NEGATIVE CONTROL: [`capacity`] answering twice the bytes at format 2 (as FL-249 will raise
+/// it), seen to fail with ``assertion `left == right` failed: format 2 is one reply in this
+/// package``, `left: 134217728`, `right: 67108864`: the storage class moves alone, in its one
+/// accessor, and this test is what names the value it left.
+#[test]
+fn vault_checkpoint_each_class_of_byte_bound_has_its_value() {
+    use crate::membership_log::budgets::{AUTOMATIC_STOP, PERSON_STOP, held_bytes_within};
+    use crate::membership_log::{Reading, Store};
+
+    const MIB: usize = 1024 * 1024;
+    assert_eq!(REPLY_CAP, 64 * MIB, "the wire's class");
+    assert_eq!(capacity(FORMAT_ONE), 64 * MIB as u64, "format 1 is today's");
+    assert_eq!(
+        capacity(FORMAT_TWO),
+        REPLY_CAP as u64,
+        "format 2 is one reply in this package"
+    );
+    assert_eq!(Reading::ONE.capacity(), 64 * MIB);
+    for (reading, format) in [
+        (Reading::Format(FORMAT_ONE), FORMAT_ONE),
+        (Reading::Format(FORMAT_TWO), FORMAT_TWO),
+        (Reading::Follow, FORMAT_TWO),
+    ] {
+        assert_eq!(reading.capacity() as u64, capacity(format), "{reading:?}");
+        assert_eq!(held_bytes_within(reading) as u64, capacity(format));
+        let store = Store::with_compiled(None).read_at(reading);
+        assert_eq!(store.capacity(), reading.capacity());
+    }
+    assert_eq!((AUTOMATIC_STOP, PERSON_STOP), (56 * MIB, 60 * MIB));
 }

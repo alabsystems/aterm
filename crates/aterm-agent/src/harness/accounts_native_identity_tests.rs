@@ -241,6 +241,7 @@ fn a_native_sync_keeps_quota_walls_and_reports_hold_and_order_changes() {
             .with_policy(bed.store.source_policy()?, false);
         let fleet = admission
             .chosen(Cli::Claude, &bed.roster, None)?
+            .lab()
             .ok_or("the native test source is missing")?;
         persist_accounts_sync_with_pool(
             (&bed.store, &SourceProtection::default()),

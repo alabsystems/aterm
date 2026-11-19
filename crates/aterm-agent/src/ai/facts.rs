@@ -221,6 +221,11 @@ pub struct ClaudeAccounts {
     pub on_token_until: Option<i64>,
     /// The usage limit's end, when limited.
     pub limited_until: Option<i64>,
+    /// Each model's own weekly wall standing on it, by its bucket, with when it ends, Unix seconds
+    /// ([`crate::harness::accounts::Account::model_walls`]): it walls that model's sessions alone,
+    /// never the account, so it is not [`Self::limited_until`]; a session of that model goes on
+    /// there with Opus.
+    pub model_walls: std::collections::BTreeMap<String, i64>,
     /// The newest turn served under it.
     pub served_at: Option<i64>,
     /// When a renewal last bound it, in unix seconds.
@@ -867,6 +872,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             renew_by: None,
             on_token_until: None,
             limited_until: None,
+            model_walls: std::collections::BTreeMap::new(),
             served_at: None,
             renewed_at: None,
             signed_out_at: None,
@@ -899,6 +905,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             renew_by: None,
             on_token_until: None,
             limited_until: None,
+            model_walls: std::collections::BTreeMap::new(),
             served_at: None,
             renewed_at: None,
             signed_out_at: None,
@@ -1027,6 +1034,13 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         renew_by,
         on_token_until,
         limited_until,
+        model_walls: state
+            .accounts
+            .get(&row.label)
+            .into_iter()
+            .flat_map(|account| account.model_walls(m.now))
+            .map(|(bucket, until)| (bucket.to_owned(), until))
+            .collect(),
         served_at: binding.and_then(|b| b.served_at),
         renewed_at: binding.and_then(|b| b.renewed_at),
         signed_out_at: state

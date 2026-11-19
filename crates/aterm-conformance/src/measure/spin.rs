@@ -76,10 +76,13 @@ pub enum SpinScene {
     /// attention lapses ([`unattended::ATTENTION`] after the raise, whose focus is a touch),
     /// measured once `trail status` reads it focused, unattended, on glass and with its pet in
     /// deep sleep or not drawn ([`unattended::unready`]) and the readings have settled on their
-    /// background cadence ([`unattended::SETTLE`]), as it opens and as it ends, with no window
-    /// event between. Its motion stage and shed are recorded, never required: the Mac's Reduce
-    /// Motion and the load shed may move them. Its decision is [`unattended::decide`]'s: counts,
-    /// never time.
+    /// background cadence ([`unattended::SETTLE`]), with no window event from its `metrics reset`,
+    /// made just before that read, to the window's end, and read so again as the window ends. The
+    /// window opens with no `trail status` of its own, whose work would book in it: the readiness
+    /// wait's last read stands for its opening edge, and every `metrics` line the take reads runs
+    /// from that reset, so its settle's events and desk marks count. Its motion stage and shed are
+    /// recorded, never required: the Mac's Reduce Motion and the load shed may move them. Its
+    /// decision is [`unattended::decide`]'s: counts, never time.
     Unattended,
 }
 
@@ -485,7 +488,10 @@ fn os_events_unidle(scene: SpinScene, input: u64) -> Option<&'static str> {
 /// A take's wall-clock limit: every wait and request on the instance ends with it.
 pub const BUDGET_SECS: u64 = 90;
 
-/// One row's outcome.
+/// One row's outcome. A count the closing `metrics` line holds on its own (`stale_arm_heals`,
+/// `timer_wakes`, `wakes`, `wait_cancelled_wakes`, `turns`, `wakes_by_variant`, `fires_by_owner`,
+/// `os_events`) runs from `metrics reset`: the window's, and for an unattended take, whose reset
+/// comes before its readiness wait's last read, its settle's too ([`SpinScene::Unattended`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpinReport {
     pub row: SpinRow,
@@ -495,13 +501,14 @@ pub struct SpinReport {
     pub stale_arm_heals: Option<u64>,
     pub frames: Option<u64>,
     pub timer_wakes: Option<u64>,
-    /// Every loop wake in the window (`event_wakes`).
+    /// Every loop wake (`event_wakes`).
     pub wakes: Option<u64>,
     pub wait_cancelled_wakes: Option<u64>,
     pub turns: Option<u64>,
-    /// The window's `wakes_by_variant`: the proxy wakes that came with an event.
+    /// `wakes_by_variant`: the proxy wakes that came with an event, by variant (a host note by
+    /// its own, `HostNote.<note>`).
     pub wakes_by_variant: Option<String>,
-    /// The window's `deadline_fires_by_owner`: whose deadline each timer wake was.
+    /// `deadline_fires_by_owner`: whose deadline each timer wake was.
     pub fires_by_owner: Option<String>,
     /// The timer wakes in the window of each owner the row bounds
     /// ([`SpinRow::max_owner_fires`]), as the metrics read them.
@@ -840,20 +847,22 @@ const UNATTENDED_GUARD: Duration = Duration::from_secs(15 * 60);
 /// seconds apart, so a read a second is plenty.
 const UNATTENDED_POLL: Duration = Duration::from_secs(1);
 
-/// Wait, from the raise that touched the window last (`focused_at`), until its attention has
-/// lapsed ([`unattended::ATTENTION`]) without a read, then read `trail status` until it reads
-/// the unattended scene's state ([`unattended::unready`]), for as long as the instance (`pid`)
-/// works ([`Budget::await_while_working`]): the wait is refused once the instance made no CPU or
-/// I/O progress for a `MUST_HAPPEN`. Each read costs the instance the CPU of its answer, and its
-/// readings run on their own, so an instance that still answers or reads is read as working, and
-/// what ends the wait on one that keeps working without the state is the take's budget, which
-/// holds [`UNATTENDED_GUARD`] for it. A build whose reply lacks the scene's fields leaves the
-/// take unanswered ([`unattended::unanswered`]).
+/// Wait, from the raise that touched the window last (`focused_at`), until its attention has lapsed
+/// ([`unattended::ATTENTION`]) without a read, then read `trail status`, each read just after a
+/// `metrics reset`, until it reads the unattended scene's state ([`unattended::unready`]), for as
+/// long as the instance (`pid`) works ([`Budget::await_while_working`]): the wait is refused once
+/// the instance made no CPU or I/O progress for a `MUST_HAPPEN`. Each read costs the instance the
+/// CPU of its answer, and its readings run on their own, so an instance that still answers or reads
+/// is read as working, and what ends the wait on one that keeps working without the state is the
+/// take's budget, which holds [`UNATTENDED_GUARD`] for it. A build whose reply lacks the scene's
+/// fields leaves the take unanswered ([`unattended::unanswered`]). Returns the reply that read the
+/// state, the window's opening edge for [`unattended::decide`], whose counts run from the reset
+/// just before it, so every window event the loop takes after that reset counts.
 fn await_unattended(
     ctl: &Ctl,
     pid: u32,
     focused_at: std::time::Instant,
-) -> Result<(), CouldNotRun> {
+) -> Result<String, CouldNotRun> {
     let first = ctl.call(&["trail", "status"]);
     if let Some(why) = first
         .ok()
@@ -864,33 +873,44 @@ fn await_unattended(
     }
     std::thread::sleep(unattended::ATTENTION.saturating_sub(focused_at.elapsed()));
     let mut last = String::new();
-    ctl.budget()
+    ctl.take_budget()?
         .await_while_working(
             pid,
             "the window's unattended state",
             UNATTENDED_POLL,
             || {
+                let reset = ctl.call(&["metrics", "reset"]);
+                if !reset.ok() {
+                    last = format!(
+                        "metrics reset: {} {}",
+                        reset.stdout.trim(),
+                        reset.stderr.trim()
+                    );
+                    return None;
+                }
                 let reply = ctl.call(&["trail", "status"]);
                 if !reply.ok() {
                     last = format!("{} {}", reply.stdout.trim(), reply.stderr.trim());
                     return None;
                 }
                 last = unattended::fields(&reply.stdout);
-                unattended::unready(&reply.stdout).is_none().then_some(())
+                unattended::unready(&reply.stdout)
+                    .is_none()
+                    .then(|| reply.stdout.clone())
             },
         )
         .map_err(|error| error.map(|why| format!("{why}; last trail state: {last}")))
 }
 
-/// The unattended take's `trail status` reply as its window `edge` (opened, ended), refused where
-/// the request failed; its fields are [`unattended::decide`]'s to judge.
-fn unattended_trail(ctl: &Ctl, edge: &str) -> Result<String, CouldNotRun> {
+/// The unattended take's `trail status` reply as its window ended, refused where the request
+/// failed; its fields are [`unattended::decide`]'s to judge.
+fn unattended_trail(ctl: &Ctl) -> Result<String, CouldNotRun> {
     let trail = ctl.call(&["trail", "status"]);
     if trail.ok() {
         Ok(trail.stdout)
     } else {
         could_not_run(format!(
-            "the unattended window gave no trail status as its window {edge} ({} {})",
+            "the unattended window gave no trail status as its window ended ({} {})",
             trail.stdout.trim(),
             trail.stderr.trim()
         ))
@@ -991,19 +1011,26 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     let focused_at = std::time::Instant::now();
     ctl.ok(&["await", "idle", SETTLE_QUIET_MS, "timeout=60000"])?;
     require_recording(ctl, row.recording)?;
-    if row.scene == SpinScene::Unattended {
-        await_unattended(ctl, inst.pid(), focused_at)?;
+    let unattended_ready = if row.scene == SpinScene::Unattended {
+        let trail = await_unattended(ctl, inst.pid(), focused_at)?;
+        // A `metrics` read wakes no loop: it is answered on the control thread. The settle's and
+        // the window's desk marks count from this read.
+        let ready = ctl.ok(&["metrics"])?;
         eprintln!(
             "measure spin: {:?} readiness_seconds={:.3}",
             row.scene,
             focused_at.elapsed().as_secs_f64()
         );
-        // The readings' change to their background cadence, before the window opens.
+        // The readings' change to their background cadence, and the work the readiness wait's
+        // last read owes, before the window opens.
         std::thread::sleep(unattended::SETTLE);
-    }
+        Some((trail, ready))
+    } else {
+        None
+    };
     if row.scene.pet() {
         let started = std::time::Instant::now();
-        await_pet_ready(ctl.budget(), row.scene, || {
+        await_pet_ready(ctl.take_budget()?, row.scene, || {
             let reply = ctl.call(&["trail", "status"]);
             if reply.ok() {
                 Ok(reply.stdout)
@@ -1050,27 +1077,17 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         }
     }
     phases.end("settle");
-    ctl.ok(&["metrics", "reset"])?;
+    // The unattended take reset its metrics before its readiness wait's last read: its counts run
+    // from there, so no event or mark between two of its reads goes uncounted.
+    if unattended_ready.is_none() {
+        ctl.ok(&["metrics", "reset"])?;
+    }
     // Window events count from the reset, and the owners' fires from the metrics read after the
     // pet: what an event before the reset left the pet doing (its fade back in, its gaze's heat)
     // either reads here as a pet asking for frames or ended before the fires' count opened. The
     // read's own wake lands in the window, which its wake bound has room for.
     let pet_open = if row.scene.pet() {
         Some(pet_take(ctl, row.scene, "opened")?)
-    } else {
-        None
-    };
-    // The unattended window's state as its window opens: one that lost it since the wait would
-    // only be refused at the end ([`unattended::decide`]), so it is refused here.
-    let unattended_open = if row.scene == SpinScene::Unattended {
-        let trail = unattended_trail(ctl, "opened")?;
-        if let Some(off) = unattended::unready(&trail) {
-            return could_not_run(format!(
-                "the unattended window read {off} as its window opened ({})",
-                unattended::fields(&trail)
-            ));
-        }
-        Some(trail)
     } else {
         None
     };
@@ -1126,17 +1143,18 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     }
     let metrics = ctl.ok(&["metrics"])?;
     let at_most = opened_at.elapsed();
-    let unattended = match &unattended_open {
-        Some(opened_trail) => {
-            let ended_trail = unattended_trail(ctl, "ended")?;
+    let unattended = match &unattended_ready {
+        Some((ready_trail, ready)) => {
+            let ended_trail = unattended_trail(ctl)?;
             Some(unattended::decide(
                 row,
                 &unattended::UnattendedReadings {
                     at_least: row.window,
                     at_most,
+                    ready_trail,
+                    ready,
                     opened: &opened,
                     ended: &metrics,
-                    opened_trail,
                     ended_trail: &ended_trail,
                 },
             )?)

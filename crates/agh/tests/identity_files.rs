@@ -2,9 +2,13 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Token file loading tests under strict permissions.
+//! Token file loading tests under strict permissions: a mode on unix, a protected access list
+//! of the user and SYSTEM on windows. The chmod remedies and symlinks are unix's by nature, each
+//! marked so; windows has its own twins of the loose and linked refusals.
 
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+
 use std::path::{Path, PathBuf};
 
 use agh::identity::{self, LoadError, MapEnv, Profile, Source, TokenKind};
@@ -38,8 +42,14 @@ fn a_private_file_loads_with_its_kind_fingerprint_and_identity() {
     assert_eq!(cred.tier(), Tier::Dev);
     assert_eq!(cred.kind(), TokenKind::Classic);
     assert_eq!(cred.fingerprint(), identity::fingerprint(token.as_bytes()));
-    let meta = std::fs::metadata(&path).expect("metadata");
-    assert_eq!(cred.file_id(), Some((meta.dev(), meta.ino())));
+    #[cfg(unix)]
+    {
+        let meta = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(cred.file_id(), Some((meta.dev(), meta.ino())));
+    }
+    // Std reads no file id off a handle on windows; the one-name rule stands in for it.
+    #[cfg(windows)]
+    assert_eq!(cred.file_id(), None);
     let fine = agh_fake::fine_grained_token("load");
     let path = write_raw(root.path(), "fine", "dev.token", fine.as_bytes());
     assert_eq!(load(&path).expect("loads").kind(), TokenKind::FineGrained);
@@ -104,6 +114,8 @@ fn a_refresh_token_is_unsupported() {
     assert_eq!(error.presence(), Presence::Unusable("unsupported"));
 }
 
+/// Unix's by nature: a mode bit; `a_file_or_folder_open_to_everyone_is_loose` is windows'.
+#[cfg(unix)]
 #[test]
 fn a_loose_file_or_directory_is_loose() {
     let root = common::scratch("id-loose");
@@ -126,11 +138,18 @@ fn a_symlink_is_refused_and_a_missing_file_is_absent() {
         "real.token",
         &agh_fake::token("l"),
     );
-    let link = root.path().join("tokens").join("link.token");
-    std::os::unix::fs::symlink(&real, &link).expect("a symlink");
-    let error = load(&link).expect_err("a symlink");
-    assert_eq!(error, LoadError::Symlink);
-    assert_eq!(error.presence(), Presence::Unusable("symlink"));
+    // A file symlink is unix's to make here (windows asks a privilege for one); the junction
+    // twin is `a_junction_is_refused_and_its_remedy_names_it`.
+    #[cfg(unix)]
+    {
+        let link = root.path().join("tokens").join("link.token");
+        std::os::unix::fs::symlink(&real, &link).expect("a symlink");
+        let error = load(&link).expect_err("a symlink");
+        assert_eq!(error, LoadError::Symlink);
+        assert_eq!(error.presence(), Presence::Unusable("symlink"));
+    }
+    #[cfg(windows)]
+    let _ = real;
     let missing = load(&root.path().join("tokens").join("none.token")).expect_err("missing");
     assert_eq!(missing, LoadError::Missing);
     assert_eq!(missing.presence(), Presence::Absent);
@@ -138,6 +157,8 @@ fn a_symlink_is_refused_and_a_missing_file_is_absent() {
     assert_eq!(identity::presence(&profile), Presence::Absent);
 }
 
+/// Unix's by nature: chmod remedies, symlinks and uids.
+#[cfg(unix)]
 #[test]
 fn the_loose_remedy_names_only_the_loose_parts() {
     let root = common::scratch("id-remedy");
@@ -178,6 +199,8 @@ fn the_loose_remedy_names_only_the_loose_parts() {
     );
 }
 
+/// Unix's by nature: chmod remedies, symlinks and uids.
+#[cfg(unix)]
 #[test]
 fn the_loose_remedy_never_narrows_home() {
     let root = common::scratch("id-home");
@@ -202,6 +225,8 @@ fn the_loose_remedy_never_narrows_home() {
     assert!(!file_only.contains("chmod 700"), "{file_only}");
 }
 
+/// Unix's by nature: chmod remedies, symlinks and uids.
+#[cfg(unix)]
 #[test]
 fn the_loose_remedy_never_narrows_the_config_directories() {
     let root = common::scratch("id-dotconfig");
@@ -225,6 +250,8 @@ fn the_loose_remedy_never_narrows_the_config_directories() {
     }
 }
 
+/// Unix's by nature: chmod remedies, symlinks and uids.
+#[cfg(unix)]
 #[test]
 fn the_loose_remedy_names_no_chmod_of_a_link_or_a_directory() {
     let root = common::scratch("id-loose-link");
@@ -259,6 +286,8 @@ fn the_loose_remedy_names_no_chmod_of_a_link_or_a_directory() {
     );
 }
 
+/// Unix's by nature: chmod remedies, symlinks and uids.
+#[cfg(unix)]
 #[test]
 fn the_loose_remedy_names_no_chmod_of_another_users_directory() {
     if aterm_uds::peer::our_uid() == 0 {
@@ -288,6 +317,8 @@ fn the_loose_remedy_names_no_chmod_of_another_users_directory() {
     );
 }
 
+/// Unix's by nature: chmod remedies, symlinks and uids.
+#[cfg(unix)]
 #[test]
 fn the_symlink_remedy_names_a_linked_directory() {
     let root = common::scratch("id-linked");
@@ -311,6 +342,7 @@ fn the_symlink_remedy_names_a_linked_directory() {
 }
 
 /// A system directory that is a link of another user's.
+#[cfg(unix)]
 pub(crate) fn foreign_dir_link() -> Option<(PathBuf, PathBuf)> {
     if aterm_uds::peer::our_uid() == 0 {
         return None;
@@ -323,6 +355,8 @@ pub(crate) fn foreign_dir_link() -> Option<(PathBuf, PathBuf)> {
     })
 }
 
+/// Unix's by nature: chmod remedies, symlinks and uids.
+#[cfg(unix)]
 #[test]
 fn the_symlink_remedy_of_another_users_link_names_only_the_real_path() {
     let Some((link, real)) = foreign_dir_link() else {
@@ -351,10 +385,70 @@ fn the_symlink_remedy_of_another_users_link_names_only_the_real_path() {
 }
 
 /// How many words of `text` are `path`, with trailing punctuation dropped.
+#[cfg(unix)]
 pub(crate) fn path_mentions(text: &str, path: &str) -> usize {
     text.split_whitespace()
         .filter(|word| word.trim_end_matches([':', ',', ';', ')']) == path)
         .count()
+}
+
+/// NEGATIVE CONTROL (windows): a token file and a folder are private by their access lists:
+/// an Everyone read entry on either is loose, as a group or other bit is on unix, and the
+/// remedy is agh.toml's, naming both; the same file read before the entry was added loads.
+#[cfg(windows)]
+#[test]
+fn a_file_or_folder_open_to_everyone_is_loose() {
+    let root = common::scratch("id-loose-win");
+    let home = root.path();
+    let token = agh_fake::token("loose");
+    for (dir, opened) in [("file", false), ("folder", true)] {
+        let path = common::write_token(&home.join(dir), "t.token", &token);
+        load(&path).expect("private, it loads");
+        common::open_to_everyone(&if opened { home.join(dir) } else { path.clone() });
+        let error = load(&path).expect_err("open to everyone");
+        assert!(matches!(error, LoadError::Loose(_)), "{dir}: {error:?}");
+        assert_eq!(error.presence(), Presence::Unusable("loose"), "{dir}");
+        let remedy = error.remedy(&file_profile(&path), home).expect("a remedy");
+        // `~/` then the path below home as windows spells it, as `tilde` names a file.
+        let shown = format!("~/{}", Path::new(dir).join("t.token").display());
+        assert!(
+            remedy.contains(&shown) && remedy.contains("yours alone"),
+            "{dir}: {remedy}"
+        );
+    }
+}
+
+/// NEGATIVE CONTROL (windows): a token file reached through a junction is refused as a link,
+/// never followed, and its remedy names the folder; the same file by its own path loads.
+#[cfg(windows)]
+#[test]
+fn a_junction_is_refused_and_its_remedy_names_it() {
+    let root = common::scratch("id-junction");
+    let home = root.path();
+    let real = common::write_token(&home.join("real"), "dev.token", &agh_fake::token("jn"));
+    load(&real).expect("by its own path, it loads");
+    let linked = home.join("linked");
+    let status = aterm_uds::spawnfd::command("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&linked)
+        .arg(home.join("real"))
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .status()
+        .expect("run mklink");
+    assert!(status.success(), "mklink /J {}", linked.display());
+    let through = linked.join("dev.token");
+    let error = load(&through).expect_err("a junction");
+    assert_eq!(error, LoadError::Symlink);
+    assert_eq!(error.presence(), Presence::Unusable("symlink"));
+    let remedy = error
+        .remedy(&file_profile(&through), home)
+        .expect("a remedy");
+    assert!(
+        remedy.contains("~/linked") && remedy.contains("junction"),
+        "{remedy}"
+    );
 }
 
 #[test]

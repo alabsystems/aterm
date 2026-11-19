@@ -10,7 +10,8 @@
 
 use super::{
     event::{
-        Event, Kind, MAX_EVENT, Pk, SIGNIN_IN, SIGNIN_UNKNOWN, SIGNIN_WORDS, Source, Window, Word,
+        Event, Kind, MAX_EVENT, ModelBucket, Pk, SIGNIN_IN, SIGNIN_UNKNOWN, SIGNIN_WORDS, Source,
+        Window, Word,
     },
     mine,
     place::{Holding, Why},
@@ -88,6 +89,22 @@ pub(crate) struct Stated {
     pub period: u64,
 }
 
+/// A wall's key in the book: its window, and the model a `7d-model` wall is of
+/// ([`ModelBucket`], [`Event::model`]), so two models' weekly walls stand apart and the clearing
+/// of one clears no other. Every `7d-model` wall the book keeps names its model: one that names
+/// none (an older build's note, still in this Mac's spool or in a book it saved) cannot say
+/// whose week it is, so the book keeps no such wall and clears nothing by one
+/// ([`Facts::fold`], [`Book::load`]); the harness notes each of its standing walls once more
+/// with its model (`harness::journal::backfill`).
+pub(crate) type WallKey = (Window, Option<ModelBucket>);
+
+/// The key `e`'s wall or clearing is kept under ([`WallKey`]); `None` where it names no window,
+/// or is a `7d-model` one that names no model.
+fn wall_key(e: &Event) -> Option<WallKey> {
+    let w = e.window?;
+    (w != Window::WeekModel || e.model.is_some()).then_some((w, e.model))
+}
+
 /// What this Mac knows of one account it used, or of one provider workspace of it (a
 /// sub-account, design §4.13), each its own `use` row.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -100,8 +117,9 @@ pub(crate) struct Facts {
     pub signin: Option<SignIn>,
     /// The latest reading of each window.
     pub quota: BTreeMap<Window, Event>,
-    /// Each window's standing wall: until, and when it was seen.
-    pub walls: BTreeMap<Window, (Option<u64>, u64)>,
+    /// Each window's standing wall, a `7d-model` one by its model ([`WallKey`]): until, and when
+    /// it was seen.
+    pub walls: BTreeMap<WallKey, (Option<u64>, u64)>,
     pub plan: Option<(String, u64)>,
     /// The newest reading, wall or cleared wall, and where it was read: a `usage` row's `read_at`
     /// and `src` where it is newer than every reading the book keeps.
@@ -129,10 +147,12 @@ impl Facts {
             Kind::Quota if self.quota.get(&w).is_some_and(|held| held.t <= e.t) => {
                 self.quota.remove(&w);
             }
-            Kind::Wall | Kind::WallCleared
-                if self.walls.get(&w).is_some_and(|(_, t)| *t <= e.t) =>
-            {
-                self.walls.remove(&w);
+            Kind::Wall | Kind::WallCleared => {
+                if let Some(key) = wall_key(e)
+                    && self.walls.get(&key).is_some_and(|(_, t)| *t <= e.t)
+                {
+                    self.walls.remove(&key);
+                }
             }
             _ => {}
         }
@@ -180,17 +200,17 @@ impl Facts {
                 }
             }
             Kind::Wall => {
-                if let Some(w) = e.window
-                    && self.walls.get(&w).is_none_or(|(_, t)| *t <= e.t)
+                if let Some(key) = wall_key(e)
+                    && self.walls.get(&key).is_none_or(|(_, t)| *t <= e.t)
                 {
-                    self.walls.insert(w, (e.until, e.t));
+                    self.walls.insert(key, (e.until, e.t));
                 }
             }
             Kind::WallCleared => {
-                if let Some(w) = e.window
-                    && self.walls.get(&w).is_some_and(|(_, t)| *t <= e.t)
+                if let Some(key) = wall_key(e)
+                    && self.walls.get(&key).is_some_and(|(_, t)| *t <= e.t)
                 {
-                    self.walls.remove(&w);
+                    self.walls.remove(&key);
                 }
             }
             Kind::PlanSeen => {
@@ -246,7 +266,16 @@ impl Facts {
             base.insert("account".into(), Value::from(account.as_str()));
         }
         // Priority, most kept first: standing walls, readings newest first, lapsed walls.
-        let wall = |w: &Window, until: &Option<u64>, t: &u64| json!({"wall": {"w": w.word(), "until": until, "t": t}});
+        let wall = |(w, model): &WallKey, until: &Option<u64>, t: &u64| {
+            let mut entry = Map::new();
+            entry.insert("w".into(), Value::from(w.word()));
+            if let Some(model) = model {
+                entry.insert("m".into(), Value::from(model.word()));
+            }
+            entry.insert("until".into(), json!(until));
+            entry.insert("t".into(), Value::from(*t));
+            json!({ "wall": entry })
+        };
         let mut standing: Vec<_> = self
             .walls
             .iter()
@@ -287,7 +316,9 @@ impl Facts {
     /// The content of the `usage` row (docs/DESIGN-shared-files-2026-11-11.md §10 file 4) of the
     /// account or sub-account `pk` at `now`, without its counter and the time it is stated
     /// ([`mine::row`]): each window's latest reading (tenths of a percent, the provider's reset
-    /// in milliseconds), the standing wall that lasts longest, the plan where it is a plan word
+    /// in milliseconds, how exactly that reset is known), the standing wall of the whole account (5h, 7d or credits) that lasts
+    /// longest (`wall`, `wall_until`), each model's own standing weekly wall by its bucket
+    /// (`model_walls`, FL-269), the plan where it is a plan word
     /// the registry seeds ([`mine::plan_word`]), where and when the
     /// newest reading was read, and the sessions. `None` where nothing was read of it (no
     /// reading and no wall from a reading source), or a sub-account's row names no account.
@@ -310,10 +341,10 @@ impl Facts {
         if let Some(sub) = sub {
             row.insert("sub".into(), Value::from(sub));
         }
-        for (window, pct, reset) in [
-            (Window::FiveHour, "w5h", "w5h_reset"),
-            (Window::Week, "w7d", "w7d_reset"),
-            (Window::WeekModel, "w7dm", "w7dm_reset"),
+        for (window, pct, reset, res) in [
+            (Window::FiveHour, "w5h", "w5h_reset", "w5h_res"),
+            (Window::Week, "w7d", "w7d_reset", "w7d_res"),
+            (Window::WeekModel, "w7dm", "w7dm_reset", "w7dm_res"),
         ] {
             let Some(e) = self.quota.get(&window) else {
                 continue;
@@ -323,14 +354,21 @@ impl Facts {
             }
             if let Some(r) = e.reset {
                 row.insert(reset.into(), Value::from(mine::ms(r)));
+                if let Some(rr) = e.res {
+                    row.insert(res.into(), Value::from(rr.word()));
+                }
             }
         }
-        // The standing wall that lasts longest; one with no stated end outlasts every other.
-        let wall = self
-            .walls
-            .iter()
-            .filter(|(_, (until, _))| until.is_none_or(|u| u > now))
-            .filter_map(|(w, (until, _))| Some((wall_word(*w)?, *until)))
+        // The standing account-wide wall that lasts longest; one with no stated end outlasts
+        // every other. A model's own weekly wall walls that model's sessions alone, so it is no
+        // wall of the account's: each stands in `model_walls` under its model's bucket.
+        let standing = || {
+            self.walls
+                .iter()
+                .filter(|(_, (until, _))| until.is_none_or(|u| u > now))
+        };
+        let wall = standing()
+            .filter_map(|((w, _), (until, _))| Some((wall_word(*w)?, *until)))
             .max_by_key(|(_, until)| until.unwrap_or(u64::MAX));
         row.insert(
             "wall".into(),
@@ -338,6 +376,23 @@ impl Facts {
         );
         if let Some(until) = wall.and_then(|(_, until)| until) {
             row.insert("wall_until".into(), Value::from(mine::ms(until)));
+        }
+        // In the byte order of the bucket's word, as `ai/limits` folds them.
+        let model_walls: Vec<Value> = standing()
+            .filter_map(|((w, model), (until, _))| {
+                let model = model.filter(|_| *w == Window::WeekModel)?;
+                let mut entry = Map::new();
+                entry.insert("bucket".into(), Value::from(model.word()));
+                if let Some(until) = until {
+                    entry.insert("until".into(), Value::from(mine::ms(*until)));
+                }
+                Some((model.word(), Value::Object(entry)))
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect();
+        if !model_walls.is_empty() {
+            row.insert("model_walls".into(), Value::Array(model_walls));
         }
         if let Some((word, _)) = self.plan.as_ref().filter(|(word, _)| mine::plan_word(word)) {
             row.insert("plan".into(), Value::from(word.as_str()));
@@ -358,15 +413,15 @@ impl Facts {
     }
 }
 
-/// A usage row's wall word of a window's wall: none for the journal's own `day` and `month`
-/// windows, which `ai/usage` does not name.
+/// A usage row's `wall` word of a window's wall, where it walls the account: none for a model's
+/// own week (`7d-model`, stated in `model_walls` instead) and for the journal's own `day` and
+/// `month` windows, which `ai/usage` does not name.
 const fn wall_word(window: Window) -> Option<mine::Wall> {
     match window {
         Window::FiveHour => Some(mine::Wall::FiveHour),
         Window::Week => Some(mine::Wall::Week),
-        Window::WeekModel => Some(mine::Wall::WeekModel),
         Window::Credits => Some(mine::Wall::Credits),
-        Window::Day | Window::Month => None,
+        Window::WeekModel | Window::Day | Window::Month => None,
     }
 }
 
@@ -880,8 +935,12 @@ impl Book {
     /// reported now. Of a CLI whose store read, a login the report no longer names is released
     /// ([`mine::released`]: stated once as no longer held here, then forgotten, as an ended
     /// `place` row is; one never stated is forgotten at once). Of a CLI whose store did not read,
-    /// or the report names nothing of, every login stays as it was, its `reported_at` unmoved. At
-    /// most [`MAX_ACCOUNTS`] are kept: a new login past them is not taken.
+    /// or the report names nothing of, every login stays as it was, its `reported_at` unmoved. A
+    /// login whose row the value-free guard refuses ([`mine::checked`]) is not taken, not even
+    /// into this book, which lives in the spool folder: it stays as the book held it, or unknown
+    /// here, and is not released, so a word a reader should never have stated (a credential's
+    /// fragment in a plan word) is kept nowhere. At most [`MAX_ACCOUNTS`] are kept: a new login
+    /// past them is not taken.
     pub(crate) fn take_logins(&mut self, reports: &mine::Reports, now: u64) {
         let read: BTreeSet<&str> = reports
             .iter()
@@ -894,6 +953,9 @@ impl Book {
                 continue;
             }
             let content = login.content();
+            if mine::checked(&super::LOGIN, &mine::row(&content, 0, now)).is_err() {
+                continue;
+            }
             let room = self.logins.len() < MAX_ACCOUNTS;
             match self.logins.get_mut(&login.account) {
                 Some(known) => {
@@ -1366,7 +1428,16 @@ impl Book {
                     Value::Array(
                         f.walls
                             .iter()
-                            .map(|(w, (u, t))| json!({"w": w.word(), "until": u, "t": t}))
+                            .map(|((w, model), (u, t))| {
+                                let mut wall = Map::new();
+                                wall.insert("w".into(), Value::from(w.word()));
+                                if let Some(model) = model {
+                                    wall.insert("m".into(), Value::from(model.word()));
+                                }
+                                wall.insert("until".into(), json!(u));
+                                wall.insert("t".into(), Value::from(*t));
+                                Value::Object(wall)
+                            })
                             .collect(),
                     ),
                 );
@@ -1528,9 +1599,20 @@ impl Book {
                     w.get("w").and_then(Value::as_str).and_then(Window::parse),
                     w.get("t").and_then(Value::as_u64),
                 ) {
+                    // A model only on a `7d-model` wall, which always names one: a book saved
+                    // before walls named their model holds such a wall with none, and that is
+                    // dropped ([`WallKey`]).
+                    let model = w
+                        .get("m")
+                        .and_then(Value::as_str)
+                        .and_then(ModelBucket::parse)
+                        .filter(|_| window == Window::WeekModel);
+                    if window == Window::WeekModel && model.is_none() {
+                        continue;
+                    }
                     facts
                         .walls
-                        .insert(window, (w.get("until").and_then(Value::as_u64), t));
+                        .insert((window, model), (w.get("until").and_then(Value::as_u64), t));
                 }
             }
             facts.plan = f

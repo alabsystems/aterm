@@ -12,7 +12,7 @@ fn a_twin_with_the_token_block_still_names_its_build() {
     let with = atpkg::launch_tap::with_token_block(
         "claude",
         body.to_owned(),
-        Some(Path::new("/A/MacOS/atpkg")),
+        Some(std::path::Path::new("/A/MacOS/atpkg")),
     );
     assert!(with.contains("token-run --auto --"), "{with}");
     assert_eq!(
@@ -24,7 +24,7 @@ fn a_twin_with_the_token_block_still_names_its_build() {
 #[test]
 fn a_twin_names_its_binary_in_its_hosts_dialects_and_only_absolutely() {
     let sh = |p: &str| format!("#!/bin/sh\nexec '{p}' \"$@\"\n");
-    let cmd = |p: &str| format!("@echo off\r\n@\"{p}\" %* & @exit /b\r\n");
+    let cmd = |p: &str| format!("@echo off\r\n@\"{p}\" %* & @call exit /b %%errorlevel%%\r\n");
     let named = |p: &str| Some(std::path::PathBuf::from(p));
     assert_eq!(twin_binary(&sh("/s/codex")), named("/s/codex"));
     // A `.cmd` twin is Windows' alone: elsewhere its body names nothing, even an absolute path.
@@ -36,9 +36,22 @@ fn a_twin_names_its_binary_in_its_hosts_dialects_and_only_absolutely() {
     let on_windows = |p: &str| named(p).filter(|_| cfg!(windows));
     assert_eq!(twin_binary(&cmd(windows)), on_windows(windows));
     assert_eq!(
+        twin_binary(&format!("@\"{windows}\" %* & @exit /b\r\n")),
+        on_windows(windows),
+        "the tail laid before the forward kept its exit code"
+    );
+    assert_eq!(
         twin_binary(&format!("@\"{windows}\" %*\r\n")),
         on_windows(windows),
         "the legacy tail"
+    );
+    assert_eq!(
+        twin_binary(&format!(
+            "@\"{windows}\" %__atpkg_tap% %* & @call exit /b %%errorlevel%%\r\n@goto :eof\r\n\
+             :atpkg_tap_plain\r\n@\"{windows}\" %* & @call exit /b %%errorlevel%%\r\n"
+        )),
+        on_windows(windows),
+        "the launch tap's forward sits ahead of the last line, which names the build"
     );
     for relative in ["s/codex", r"s\codex.exe"] {
         assert_eq!(twin_binary(&sh(relative)), None, "{relative}");

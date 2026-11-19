@@ -520,6 +520,22 @@ pub struct MemoryDetail {
     /// the kernel's own figure, which counts the active queue too, so not [`Self::available`].
     /// `None` off macOS.
     pub memorystatus_level_pct: Option<u8>,
+    /// HEADROOM, bytes: what the kernel can hand out without compressing or swapping anyone's
+    /// anonymous pages. macOS: the free pages, the speculative ones among them, the purgeable
+    /// ones, and the file-backed pages above the kernel's file-cache floor
+    /// (`vm.vm_page_filecache_min`), below which its pageout scan compresses anonymous pages
+    /// instead of dropping file ones; none of the file-backed pages where that floor is unread
+    /// ([`mac_headroom`]). Linux: `MemAvailable`. Unlike [`Self::available`] it counts nothing
+    /// that compressing an idle page would free. `None` where unread (Windows).
+    pub headroom: Option<u64>,
+    /// THE COMPRESSOR'S WALL, the nearer of its two limits: its segments in use
+    /// and their limit (macOS 27.2's `vm.compressor.segment.total` and `.limit`, swapped-out
+    /// segments included), or the pages it holds compressed and theirs
+    /// (`vm.compressor.pages_compressed` and `.pages_compressed_limit`). At 98 % of either the
+    /// kernel calls the compressor short of space and its pressure level critical; at 100 % no
+    /// anonymous page can leave RAM. `None` where neither is read (an earlier macOS, Linux,
+    /// Windows).
+    pub wall: Option<(u64, u64)>,
 }
 
 impl MemoryDetail {
@@ -533,6 +549,28 @@ impl MemoryDetail {
             .saturating_add(self.wired)
             .saturating_add(self.compressed.unwrap_or(0))
             .min(self.total)
+    }
+
+    /// THE SHARE THE KERNEL'S PRESSURE TEST WEIGHS, per mille, on a Mac ([`Self::exact`]): of the
+    /// active, inactive, free and speculative pages and the compressor's, those that are not the
+    /// compressor's (xnu's `AVAILABLE_NON_COMPRESSED_MEMORY` over `AVAILABLE_MEMORY`). The
+    /// kernel's level is warn under 500 and critical under 343 on a Mac over 3 GB, or critical
+    /// where the compressor nears its wall ([`Self::wall`]); it computes that on its pageout path,
+    /// which stops when that path stalls, so this computes it from the same read. On 2026-11-15 a
+    /// 128 GiB Mac read 470 at 23:16:09 and 403 at its panic. `None` off macOS or where a queue
+    /// was unread.
+    #[must_use]
+    pub fn kept_permille(&self) -> Option<u16> {
+        if !self.exact {
+            return None;
+        }
+        let kept = self
+            .active?
+            .saturating_add(self.inactive?)
+            .saturating_add(self.free)
+            .saturating_add(self.speculative?);
+        let weighed = u128::from(kept) + u128::from(self.compressed?);
+        (weighed > 0).then(|| u16::try_from(u128::from(kept) * 1000 / weighed).unwrap_or(1000))
     }
 }
 
@@ -551,8 +589,66 @@ pub struct VmCounters {
     pub pageins: u64,
     /// The VM page size the page counts are in, bytes.
     pub page_bytes: u64,
+    /// Anonymous pages pushed out of RAM, pages. macOS: `compressions` less the compressor's
+    /// single-value pages (`vm.compressor.svp.zval_compressions` and `nzval_compressions`), which
+    /// store nothing ([`mac_pushed`]); Linux: `pswpout` and `zswpout`. `None` where unread.
+    pub pushed: Option<u64>,
+    /// Pages that came back after the kernel pushed them out or queued them to go, pages. macOS:
+    /// `decompressions` and `reactivations`; Linux: `workingset_refault_anon`, else `pswpin` and
+    /// `zswpin`. `None` where unread.
+    pub refaulted: Option<u64>,
+    /// Linux's PSI memory totals (`/proc/pressure/memory`'s `some` and `full` `total=`), µs:
+    /// how long at least one task, and every task, stalled on memory. `None` elsewhere.
+    pub stall_us: Option<(u64, u64)>,
 }
 
+/// Of two `(used, limit)` walls, the one nearer its limit (the first on a tie), each kept only
+/// where its limit is above zero: [`MemoryDetail::wall`].
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn nearer_wall(a: Option<(u64, u64)>, b: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    let fill = |(used, limit): (u64, u64)| u128::from(used) * 1_000_000 / u128::from(limit);
+    match (a.filter(|w| w.1 > 0), b.filter(|w| w.1 > 0)) {
+        (Some(a), Some(b)) => Some(if fill(b) > fill(a) { b } else { a }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// [`VmCounters::pushed`] on macOS: `compressions` less the single-value pages among them
+/// (`svp`, the zero- and one-value compressions, which keep no data in the compressor), or all
+/// of them where `svp` is unread or reads more than they do.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn mac_pushed(compressions: u64, svp: Option<u64>) -> u64 {
+    compressions - svp.filter(|s| *s <= compressions).unwrap_or(0)
+}
+
+/// [`MemoryDetail::headroom`] on macOS from one read of its page queues `d` and the kernel's
+/// file-cache floor `filecache_min` (bytes; `None` where unread, so no file-backed page counts):
+/// the free pages, speculative ones included, the purgeable ones, and the file-backed pages
+/// outside the speculative queue above that floor. On 2026-11-15 a 128 GiB Mac whose stackshots
+/// read 64 GiB in its compressor had 5.8 GiB of this at 23:16:09, 0.12 GiB at 23:20:24 and
+/// 0.01 GiB at its panic (each stackshot's free count read as the kernel's, the speculative pages
+/// within it); its file-backed pages were under the floor throughout.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn mac_headroom(d: &MemoryDetail, filecache_min: Option<u64>) -> u64 {
+    let speculative = d.speculative.unwrap_or(0);
+    let file = filecache_min.map_or(0, |floor| {
+        d.file_backed
+            .saturating_sub(speculative)
+            .saturating_sub(floor)
+    });
+    d.free
+        .saturating_add(speculative)
+        .saturating_add(d.purgeable.unwrap_or(0))
+        .saturating_add(file)
+}
+
+/// One read of a Mac's page queues and VM counters (`host_statistics64(HOST_VM_INFO64)`), in
+/// pages, with the sysctls read beside it: the compressor's single-value compressions (`svp`,
+/// [`mac_pushed`]) and the kernel's file-cache floor (`filecache_min`, [`mac_headroom`]), each
+/// `None` where unread.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct VmPages {
@@ -571,6 +667,9 @@ pub(crate) struct VmPages {
     pub decompressions: u64,
     pub compressions: u64,
     pub pageins: u64,
+    pub reactivations: u64,
+    pub svp: Option<u64>,
+    pub filecache_min: Option<u64>,
 }
 
 /// THE MEMORY A MAC CAN HAND OUT NOW WITHOUT PAGING, bytes ([`MemoryDetail::available`]), from
@@ -651,10 +750,16 @@ pub(crate) fn memory_detail_of(
             compressions: p.compressions,
             pageins: p.pageins,
             page_bytes,
+            pushed: Some(mac_pushed(p.compressions, p.svp)),
+            refaulted: Some(p.decompressions.saturating_add(p.reactivations)),
+            stall_us: None,
         }),
         memorystatus_level_pct: None,
+        headroom: None,
+        wall: None,
     };
     detail.available = mac_available(&detail);
+    detail.headroom = Some(mac_headroom(&detail, p.filecache_min.map(b)));
     detail
 }
 

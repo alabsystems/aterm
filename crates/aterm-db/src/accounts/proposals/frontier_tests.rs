@@ -55,6 +55,7 @@ fn more_than_one_parent_window_of_offline_writers_preserves_values_and_retries()
         encode(&Command::Write {
             request: [1; 16],
             changes: vec![change("one", &format!("offline-{writer}"))],
+            said: None,
         })
         .unwrap()
     }));

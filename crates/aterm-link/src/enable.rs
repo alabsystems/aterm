@@ -565,6 +565,8 @@ impl Paths {
     #[must_use]
     pub fn plist_text(&self) -> String {
         let root = aterm_codec::xml::escape(&self.root.to_string_lossy());
+        let [out, err] =
+            job_logs(&self.root).map(|log| aterm_codec::xml::escape(&log.to_string_lossy()));
         let pkg_bin = self.home.join("Library/Application Support/aterm/pkg/bin");
         let path = aterm_codec::xml::escape(&format!(
             "{}:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -593,8 +595,8 @@ impl Paths {
              \x20 <dict>\n\
              \x20   <key>PATH</key><string>{path}</string>\n\
              \x20 </dict>\n\
-             \x20 <key>StandardOutPath</key><string>{root}/broker.out</string>\n\
-             \x20 <key>StandardErrorPath</key><string>{root}/broker.err</string>\n\
+             \x20 <key>StandardOutPath</key><string>{out}</string>\n\
+             \x20 <key>StandardErrorPath</key><string>{err}</string>\n\
              </dict>\n\
              </plist>\n",
             label = aterm_codec::xml::escape(&self.label()),
@@ -604,6 +606,7 @@ impl Paths {
     /// Render the `systemd --user` unit.
     #[must_use]
     pub fn unit_text(&self) -> String {
+        let [_, err] = job_logs(&self.root);
         format!(
             "[Unit]\n\
              Description=aterm fabric broker ({label})\n\
@@ -611,7 +614,7 @@ impl Paths {
              [Service]\n\
              ExecStart=/bin/sh -c \"exec {broker}\"\n\
              WorkingDirectory={root}\n\
-             StandardError=append:{root}/broker.err\n\
+             StandardError=append:{err}\n\
              Restart=always\n\
              RestartSec=1\n\
              \n\
@@ -620,8 +623,31 @@ impl Paths {
             label = self.label(),
             broker = self.broker_words(),
             root = self.root.to_string_lossy(),
+            err = err.to_string_lossy(),
         )
     }
+}
+
+/// The files the broker job's definitions under `root` name for its output: `<root>/broker.out`,
+/// the plist's standard output, and `<root>/broker.err`, the plist's standard error and the
+/// `systemd --user` unit's (whose standard output is the journal). The plist and the unit write
+/// them from here, and the broker keeps them from here ([`keep_broker_log`]).
+#[must_use]
+pub(crate) fn job_logs(root: &Path) -> [PathBuf; 2] {
+    [root.join("broker.out"), root.join("broker.err")]
+}
+
+/// Keep the broker job's log bounded where this process's standard output or error is one of its
+/// files ([`aterm_uds::job_log::keep`]): [`job_logs`] of the folder the broker's socket
+/// `endpoint` lies in (`<root>/bus.sock`, [`Paths::broker_argv`]), whoever started it. So any
+/// broker whose output is `broker.out` or `broker.err` beside its socket is kept as the job's
+/// (one a test or a person starts that way included), and one whose output is any other file (the
+/// lab's `lab-broker.out`), a terminal or a pipe keeps nothing; a relative `endpoint` names no
+/// folder, and `keep` is handed nothing. The broker verb's first step once it knows its socket:
+/// its serving takes what this kept.
+pub(crate) fn keep_broker_log(endpoint: &str) -> aterm_uds::job_log::Kept {
+    let logs = root_of(endpoint).map(|root| job_logs(&root));
+    aterm_uds::job_log::keep(logs.as_ref().map_or(&[][..], |logs| &logs[..]))
 }
 
 pub(crate) fn default_root(home: &Path) -> PathBuf {
@@ -695,7 +721,9 @@ fn failure_hint(root: &Path, otherwise: &str) -> String {
 
 const LAST_WORD_TAIL: u64 = 4096;
 
-/// Last non-empty stderr line from `<root>/broker.err` as `written <age> ago: <line>`.
+/// Last non-empty stderr line from `<root>/broker.err` as `written <age> ago: <line>`, without the
+/// date a dated line carries (`aterm_uds::job_log::undated`: a line that is only a date is
+/// empty).
 pub(crate) fn supervisor_last_word(root: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -717,7 +745,7 @@ pub(crate) fn supervisor_last_word(root: &Path) -> Option<String> {
     let line: String = text
         .lines()
         .rev()
-        .map(str::trim)
+        .map(|l| aterm_uds::job_log::undated(l.trim()).trim())
         .find(|l| !l.is_empty())?
         .chars()
         .filter(|c| !c.is_control())

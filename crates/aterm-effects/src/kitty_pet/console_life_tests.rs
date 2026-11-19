@@ -4797,10 +4797,11 @@ impl Twin {
         self.frames += 1;
         self.kept_frames += usize::from(self.kept.console.reading.kept());
         let (k, f) = (&self.kept.console, &self.fresh.console);
-        assert_eq!(
-            format!("{:?}", k.world),
-            format!("{:?}", f.world),
-            "{host:?} {what}: the world"
+        assert!(
+            k.world == f.world,
+            "{host:?} {what}: the world, kept {:?} and fresh {:?}",
+            k.world,
+            f.world
         );
         assert_eq!(k.row_sig, f.row_sig, "{host:?} {what}: the row signatures");
         assert_eq!(
@@ -5051,7 +5052,7 @@ fn an_unchanged_screen_is_read_once() {
     for host in [Host::Reuse, Host::Refill, Host::Banded] {
         let mut t = Twin::new(host);
         t.frames("first", 1);
-        let world = format!("{:?}", t.kept.console.world);
+        let world = t.kept.console.world.clone();
         assert_eq!(
             t.kept.observed_cells(),
             20 * 80,
@@ -5065,7 +5066,11 @@ fn an_unchanged_screen_is_read_once() {
                 "{host:?}: an unchanged frame reads no cell"
             );
             assert!(t.kept.console.reading.kept());
-            assert_eq!(format!("{:?}", t.kept.console.world), world);
+            assert!(
+                t.kept.console.world == world,
+                "{host:?}: an unchanged frame keeps the world {world:?}, not {:?}",
+                t.kept.console.world
+            );
         }
         assert_eq!(t.kept_frames, 12);
         let facts = PetWorldFacts::read(&t.term, 17);

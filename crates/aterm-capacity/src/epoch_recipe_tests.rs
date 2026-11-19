@@ -89,7 +89,7 @@ fn startup_encoding_keeps_nullable_package_and_rejects_aliases_and_mutable_drive
 #[test]
 fn version_grammar_rejects_noncanonical_or_incomplete_semver() {
     for value in ["0.1.0", "1.2.3-alpha.1+build.001", "0.1.0+gabcdef012"] {
-        assert!(semver(value), "{value}");
+        assert!(cargo_semver(value), "{value}");
     }
     for value in [
         "1.2",
@@ -100,7 +100,7 @@ fn version_grammar_rejects_noncanonical_or_incomplete_semver() {
         "1.2.3-x..y",
         "1.2.3\n",
     ] {
-        assert!(!semver(value), "{value:?}");
+        assert!(!cargo_semver(value), "{value:?}");
     }
 }
 

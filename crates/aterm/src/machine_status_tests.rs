@@ -568,7 +568,17 @@ fn repos_say_what_they_wait_on() {
     assert_eq!(
         unborn.level,
         Level::Ok,
-        "an empty remote checked out is no clone owed: {unborn:?}"
+        "matching but unobserved checkouts stay with the vault's sync: {unborn:?}"
+    );
+    assert!(unborn.next.is_none(), "{unborn:?}");
+    assert_eq!(
+        unborn
+            .says
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|word| word.parse::<usize>().ok())
+            .collect::<Vec<_>>(),
+        vec![50, 53, 3],
+        "the status retains ready, total and unobserved counts: {unborn:?}"
     );
     assert!(
         unborn.next.is_none(),
@@ -1223,6 +1233,23 @@ fn name_reads_one_name_across_vault_fleet_and_the_mac() {
         act.contains("renew") && !act.contains("password step"),
         "{act}"
     );
+    // A rule the person removed is theirs: no step, and no password asked for it.
+    let removed = named(
+        FleetName::Current,
+        Some(MacNamePending::Removed(
+            "this Mac's own name is Mac, not m42".to_owned(),
+        )),
+    );
+    assert_eq!((removed.level, who(&removed)), (Level::Off, None));
+    assert!(
+        removed
+            .says
+            .contains("you removed setup's naming permission")
+            && removed.says.contains("aterm init"),
+        "{}",
+        removed.says
+    );
+    assert!(removed.next.is_none());
     let collision = named(
         FleetName::Current,
         Some(MacNamePending::Collision("Bonjour collision".into())),

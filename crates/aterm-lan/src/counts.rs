@@ -93,6 +93,14 @@ pub(crate) enum Count {
     Query,
     /// A Bonjour advert.
     Register,
+    /// A request for Spotlight's stores ([`crate::store`]).
+    SpotlightStore,
+    /// Walks of Spotlight's stores: at most one every [`crate::store::WALK_EVERY`], however many
+    /// requests ask.
+    StoreWalks,
+    /// An ask to consider the asking process's bundle for adoption, answered by nothing
+    /// ([`aterm_uds::lan::wire::Request::Consider`]).
+    Considered,
     /// Ended: the request was answered (a standing operation: its client went).
     Answered,
     /// Ended: the request failed and its error was sent.
@@ -101,7 +109,7 @@ pub(crate) enum Count {
 
 impl Count {
     /// Every count, in the order a snapshot prints them.
-    pub(crate) const ALL: [Self; 26] = [
+    pub(crate) const ALL: [Self; 29] = [
         Self::Accepted,
         Self::Busy,
         Self::NoThread,
@@ -126,6 +134,9 @@ impl Count {
         Self::ResolveService,
         Self::Query,
         Self::Register,
+        Self::SpotlightStore,
+        Self::StoreWalks,
+        Self::Considered,
         Self::Answered,
         Self::Failed,
     ];
@@ -157,6 +168,9 @@ impl Count {
             Self::ResolveService => "resolve_service",
             Self::Query => "query",
             Self::Register => "register",
+            Self::SpotlightStore => "spotlight_store",
+            Self::StoreWalks => "store_walks",
+            Self::Considered => "considered",
             Self::Answered => "answered",
             Self::Failed => "failed",
         }

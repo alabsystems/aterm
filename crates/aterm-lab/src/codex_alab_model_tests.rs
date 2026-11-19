@@ -254,6 +254,8 @@ fn the_needs_leg_names_one_need_then_withdraws_it() {
     let t1 = answer(&body(&["LEG-needs Build the release."], None));
     assert_eq!(t1.tag, "needs:person");
     assert_eq!(needs_you(NEEDS_REPORT), vec![NEED.to_string()]);
+    assert_eq!(needs::persons_needs(NEEDS_REPORT), [NEED]);
+    assert!(needs::credential_needs(NEEDS_REPORT).is_empty());
     assert!(!says_done(Some(NEEDS_REPORT)), "a need is no done claim");
     assert_eq!(
         classify_said(Some(&without_needs(NEEDS_REPORT))),
@@ -301,6 +303,22 @@ fn the_needs_leg_names_one_need_then_withdraws_it() {
 }
 
 #[test]
+fn a_credential_report_is_excluded_from_the_persons_need_boundary() {
+    let need = "the signing credential to publish the release";
+    let report = format!("Built the release.\n\nNEEDS YOU: {need}");
+    let defense = format!("Nothing left: all work is on origin/main.\nNEEDS YOU: {need}");
+    for text in [&report, &defense] {
+        assert_eq!(needs_you(text), [need], "the report was actually parsed");
+        assert!(needs::persons_needs(text).is_empty());
+        assert_eq!(needs::credential_needs(text), [need]);
+    }
+    assert!(
+        says_done(Some(&defense)),
+        "the credential is handled separately from the defense"
+    );
+}
+
+#[test]
 fn the_land_leg_defends_unclean_twice_then_clean_at_its_fourth_nudge() {
     let p = "LEG-land Land the work.";
     let t1 = answer(&body(&[p], None));
@@ -328,7 +346,11 @@ fn the_land_leg_defends_unclean_twice_then_clean_at_its_fourth_nudge() {
     assert!(clean_defense(Some(last)) && last == LAND_DEFENSE);
     assert!(said[NUDGES_BEFORE_DEFENSE - 1].contains("Nothing left:"));
     assert!(says_done(Some(NEEDS_DEFENSE)) && needs::defense_line(NEEDS_DEFENSE).is_some());
-    assert!(!needs_you(NEEDS_DEFENSE).is_empty(), "a need keeps it open");
+    assert_eq!(
+        needs::persons_needs(NEEDS_DEFENSE),
+        [NEED],
+        "the native harness must see a person's need, not a credential it handles itself"
+    );
     assert!(says_done(Some(OPEN_DEFENSE)) && needs::defense_line(OPEN_DEFENSE).is_some());
     assert!(
         needs_you(OPEN_DEFENSE).is_empty() && says_no_needs(OPEN_DEFENSE),
@@ -349,7 +371,7 @@ fn the_land_leg_defends_unclean_twice_then_clean_at_its_fourth_nudge() {
         "past codex-alab's min_work"
     );
     assert!(!clean_defense(Some(
-        "Nothing left: all of the work is on origin/main.\nNEEDS YOU: the release credential"
+        "Nothing left: all of the work is on origin/main.\nNEEDS YOU: the Full Disk Access grant"
     )));
     assert!(!clean_defense(Some(
         "Nothing left: all of the work is on origin/main, but the docs fix is not pushed."
@@ -401,13 +423,13 @@ fn the_repository_leg_defends_clean_words_over_a_dirty_repository() {
     );
     let nudge = acted(
         LAND_NUDGE,
-        "Your repository still holds work no remote main has (1 untracked (notes.txt)): \
+        "Your repository's local Git state still shows work (1 untracked (notes.txt)): \
          commit, merge and push it to the remote main first.",
     );
     let committed = answer(&body(&[p, LAND, &nudge], None));
     assert_eq!(
         (committed.tag.as_str(), committed.delay),
-        ("repo:nudge1+repo", REPO_COMMIT_HOLD),
+        ("repo:nudge1+repo", Duration::ZERO),
         "the tag says the nudge named the repository's work"
     );
     assert!(text_of(&committed).contains("Committed notes.txt."));
@@ -417,13 +439,13 @@ fn the_repository_leg_defends_clean_words_over_a_dirty_repository() {
     );
     let unpushed = acted(
         LAND_NUDGE,
-        "Your repository still holds work no remote main has (1 unpushed commit, 1 commit \
-         not on origin/main): commit, merge and push it to the remote main first.",
+        "Your repository's local Git state still shows work (1 unpushed commit, 1 commit \
+         not on cached origin/main): commit, merge and push it to the remote main first.",
     );
     let pushed = answer(&body(&[p, LAND, &nudge, &unpushed], None));
     assert_eq!(
         (pushed.tag.as_str(), pushed.delay),
-        ("repo:nudge2+repo", REPO_PUSH_HOLD)
+        ("repo:nudge2+repo", Duration::ZERO)
     );
     assert!(text_of(&pushed).contains("pushed it to origin/main"));
     let bare = answer(&body(&[p, LAND, LAND_NUDGE], None));

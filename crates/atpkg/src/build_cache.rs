@@ -17,6 +17,9 @@ pub mod tooling;
 #[path = "build_cache_shared_units.rs"]
 pub mod shared_units;
 
+#[path = "build_cache_unit_source.rs"]
+pub mod unit_source;
+
 #[path = "build_cache_leftovers.rs"]
 pub mod leftovers;
 

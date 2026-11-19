@@ -305,7 +305,7 @@ struct Judged {
 
 /// What reading and judging the file found: whether it is there, its row counts, its faults
 /// and its rows. No file is a valid state (`present: false`), as it is for `config::load`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn judge(dir: &Path, name: &str, home: &Path, agh_dir: Option<&Path>) -> Judged {
     match config::faults_of(config::read_config_in(dir, name, home, agh_dir), home) {
         None => Judged {
@@ -323,9 +323,9 @@ fn judge(dir: &Path, name: &str, home: &Path, agh_dir: Option<&Path>) -> Judged 
     }
 }
 
-/// Off unix there is no permission check, so agh never reads agh.toml there (design §6.6:
+/// A host with no private files (neither unix nor windows) never reads agh.toml (design §6.6:
 /// every read is anonymous), and `agh policy check` follows `config::load`'s rule: no file.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn judge(dir: &Path, name: &str, home: &Path, agh_dir: Option<&Path>) -> Judged {
     let _ = (dir, name, home, agh_dir);
     Judged {
@@ -353,8 +353,8 @@ fn judge(dir: &Path, name: &str, home: &Path, agh_dir: Option<&Path>) -> Judged 
 /// written, when the edit would break one of its rules, would make it longer than
 /// `config::CONFIG_MAX`, or cannot be made in place (`config::edit_writers`'s Refused).
 /// Invalid when agh.toml does not parse or its `writers` cannot be edited
-/// (`config::edit_writers`'s Invalid). could_not_run off unix, when no config directory
-/// resolves, and when agh.toml or the lock cannot be read or written.
+/// (`config::edit_writers`'s Invalid). could_not_run off unix and windows, when no config
+/// directory resolves, and when agh.toml or the lock cannot be read or written.
 pub(crate) fn policy_grant(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     edit_grant(ctx, inv, true)
 }
@@ -408,15 +408,14 @@ fn edit_grant(ctx: &mut Ctx, inv: &Invocation, add: bool) -> Result<Outcome> {
 }
 
 /// The why of `AuthEdit::take`'s refusal while another edit holds the lock.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const AUTH_EDIT_BUSY: &str = "another agh auth edit is in progress";
 
-/// The edit on unix, under the auth edit lock: agh.toml read with `read_private`, edited by
-/// `config::edit_writers`, judged by L1–L11 and held to `config::CONFIG_MAX`, and written with
-/// `write_private` (or `write_private_new` for the first grant). The change (`added`,
-/// `removed` or `unchanged`) and the caller's
-/// repositories after it.
-#[cfg(unix)]
+/// The edit on unix and windows, under the auth edit lock: agh.toml read with `read_private`,
+/// edited by `config::edit_writers`, judged by L1–L11 and held to `config::CONFIG_MAX`, and
+/// written with `write_private` (or `write_private_new` for the first grant). The change
+/// (`added`, `removed` or `unchanged`) and the caller's repositories after it.
+#[cfg(any(unix, windows))]
 fn write_grant(
     dirs: &config::Dirs,
     caller: &str,
@@ -512,7 +511,7 @@ fn write_grant(
 
 /// Preserve absent-file routing: only already-recorded, healthy vault identities can seed
 /// the first explicit grant. This view neither learns a login nor writes its record.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn first_grant_seed(dirs: &config::Dirs) -> Result<String> {
     let refused = || {
         Error::refused("a first grant needs healthy recorded vault identities")
@@ -532,7 +531,7 @@ fn first_grant_seed(dirs: &config::Dirs) -> Result<String> {
     crate::identity::provision::join_vault("", "")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn create_grant_config(dirs: &config::Dirs, text: &str) -> Result<()> {
     let created = aterm_uds::private_file::write_private_new(
         &dirs.config,
@@ -552,8 +551,9 @@ fn create_grant_config(dirs: &config::Dirs, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Off unix agh never reads or writes agh.toml (design §6.6), so it grants nothing there.
-#[cfg(not(unix))]
+/// A host with no private files (neither unix nor windows) never reads or writes agh.toml
+/// (design §6.6), so it grants nothing there.
+#[cfg(not(any(unix, windows)))]
 fn write_grant(
     dirs: &config::Dirs,
     caller: &str,
@@ -562,10 +562,10 @@ fn write_grant(
 ) -> Result<(&'static str, Vec<String>)> {
     let _ = (dirs, caller, slug, add);
     Err(Error::local(
-        "agh reads and writes agh.toml only on unix, where its permissions are checked",
+        "agh reads and writes agh.toml only on unix and windows, where its files are private",
     ))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 #[path = "cmd_policy_grant_creation_tests.rs"]
 mod grant_creation_tests;

@@ -32,6 +32,7 @@ pub mod frontier;
 pub mod layout;
 pub mod name;
 pub mod outbox;
+pub mod rendered;
 mod resolver;
 pub mod retain;
 pub mod snapshot;
@@ -41,7 +42,7 @@ pub use account::AccountNames;
 #[cfg(any(unix, windows))]
 pub use file::Look;
 pub use file::{File, Opened, Pass, Projected, Projection, Read, Recorded, Restored};
-pub use frontier::Frontier;
+pub use frontier::{At, Frontier, Witnessed};
 pub use layout::Root;
 pub use name::{Name, NotAName};
 #[cfg(any(unix, windows))]
@@ -51,13 +52,25 @@ pub use outbox::owner_act_for_test;
 pub use outbox::{
     Accepted, Done, Draft, Dropped, Edit, Held, Intent, Mark, Outbox, OwnerAct, Refused,
 };
+pub use rendered::Rendered;
 pub use resolver::{ACCOUNT_HANDLES, Named, Resolved, many_accounts, no_account, resolve};
 pub use snapshot::{Column, Row, Snapshot, Source};
 pub use status::{Face, Kept, State, Status, Why, Word};
 
 /// The most bytes of a face a pass writes: the grid's limit (`amacs::table::MAX_TABLE_BYTES`).
-/// A larger table keeps its snapshot and has no face: a pass removes the face it wrote.
+/// A table whose face would be larger shows fewer columns, its widest left out
+/// ([`snapshot::face_columns`]); every column stays in the snapshot and in `aterm file export`.
+/// Only where the key alone does not fit, or the rows pass [`MAX_FACE_RECORDS`], is no face
+/// written: a pass removes the face it wrote.
 pub const MAX_FACE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most records of a face, its header included: the grid's limit
+/// (`amacs::table::MAX_TABLE_RECORDS`). A table with more rows has no face.
+pub const MAX_FACE_RECORDS: usize = 100_000;
+
+/// The most cells of a face's record: the grid's limit (`amacs::table::MAX_TABLE_COLUMNS`). A
+/// table with more columns shows fewer, its widest left out ([`snapshot::face_columns`]).
+pub const MAX_FACE_COLUMNS: usize = 1024;
 
 /// `aterm file`'s exit codes (section 3).
 pub mod exit {

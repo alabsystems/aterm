@@ -862,13 +862,14 @@ fn xml_strategy_block_shapes() {
         ),
         Some(XmlShape::TextsRegex(vec!["Contents".into(), "Key".into()]))
     );
-    // A non-descendant path does not reduce.
-    assert_eq!(
+    // r465: a relative path reads as child steps
+    // from the document (seekfast).
+    assert!(matches!(
         shape(
             "    strategy :xml do |xml|\n      xml.get_elements(\"Contents/Key\").map(&:text)\n    end"
         ),
-        None
-    );
+        Some(XmlShape::Template(_))
+    ));
 }
 
 /// r399: `:yaml` strategy blocks reduce to data shapes for
@@ -900,6 +901,19 @@ fn yaml_strategy_block_shapes() {
             JsonKey::Idx(1),
         ]))
     );
+    // r472 foks/openttd: guarded item-key maps.
+    assert!(matches!(
+        shape(
+            "    strategy :yaml do |yaml|\n      yaml[\"changelog\"]&.map { |r| r[\"version\"] }\n    end"
+        ),
+        Some(YamlShape::MapKey { .. })
+    ));
+    assert!(matches!(
+        shape(
+            "    strategy :yaml do |yaml|\n      yaml[\"latest\"]&.map do |item|\n        next if item[\"name\"] != \"stable\"\n        next if item[\"version\"].blank?\n\n        item[\"version\"].to_s\n      end\n    end"
+        ),
+        Some(YamlShape::MapKey { ref guards, .. }) if guards.len() == 2
+    ));
     // r452 electron-builder forms: files map, root
     // match, version tails.
     {
@@ -1010,7 +1024,7 @@ fn yaml_strategy_block_shapes() {
 /// else in a page_match block stays block-only.
 #[test]
 fn page_match_tr_block_shapes() {
-    use super::super::formula::{HopPick, HopScan, HopTarget, PageShape};
+    use super::super::formula::{HopPick, HopScan, HopTarget, PageCond, PagePart, PageShape};
     let spec = |body: &str| {
         let text = format!(
             "class X < Formula\n  livecheck do\n    url \"https://example.com/\"\n    regex(/v(\\d+)/i)\n{body}\n  end\nend\n"
@@ -1036,12 +1050,132 @@ fn page_match_tr_block_shapes() {
         ),
         Some(PageShape::ScanTr("_".into(), ".".into()))
     );
-    // No regex param, no reduction.
+    // r459: scan forks, split-chars, match fork.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map do |match|\n        (match[0] == match[1]) ? match[0] : \"#{match[0]},#{match[1]}\"\n      end\n    end"
+        ),
+        Some(PageShape::ScanFork {
+            cond: PageCond::CapEq(0, 1),
+            then: vec![PagePart::Cap(0)],
+            els: vec![
+                PagePart::Cap(0),
+                PagePart::Lit(",".into()),
+                PagePart::Cap(1)
+            ],
+        })
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match[0].split(\"\", 4).join(\".\") }\n    end"
+        ),
+        Some(PageShape::ScanSplitChars(4, ".".into()))
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      match = page.match(regex)\n      next unless match\n      match[2].present? ? \"#{match[1]},#{match[2]}\" : match[1]\n    end"
+        ),
+        Some(PageShape::MatchFork {
+            cond: PageCond::CapPresent(2),
+            then: vec![
+                PagePart::Cap(1),
+                PagePart::Lit(",".into()),
+                PagePart::Cap(2)
+            ],
+            els: vec![PagePart::Cap(1)],
+        })
+    );
+    // r464: line-continued `.map`, count forks.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex)\n          .map { |match| \"#{match[0]},#{match[1]}\" }\n    end"
+        ),
+        Some(PageShape::ScanTemplate(vec![
+            PagePart::Cap(0),
+            PagePart::Lit(",".into()),
+            PagePart::Cap(1),
+        ]))
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map do |match|\n        if (version = match[0]).count(\".\") >= 2\n          version\n        else\n          \"#{version}.0\"\n        end\n      end\n    end"
+        ),
+        Some(PageShape::ScanFork {
+            cond: PageCond::CapCountGe(0, '.', 2),
+            then: vec![PagePart::Cap(0)],
+            els: vec![PagePart::Cap(0), PagePart::Lit(".0".into())],
+        })
+    );
+    // r467: guarded forks, split captures,
+    // parse_json digs, two-match templates.
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).filter_map do |match|\n        next if match[1]&.match?(/^RC/i)\n        match[1].present? ? \"#{match[0]},#{match[1]}\" : match[0]\n      end\n    end"
+        ),
+        Some(PageShape::ScanGuardedFork { skip_cap: 1, .. })
+    ));
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.split(/<h\\d+/i).filter_map do |section|\n        next if section.match?(/Canary/i)\n        section[regex, 1]\n      end\n    end"
+        ),
+        Some(PageShape::SplitCapture { .. })
+    ));
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      match = page.match(regex)\n      next if match.blank?\n      json = Homebrew::Livecheck::Strategy::Json.parse_json(match[1])\n      json[\"buildVersion\"]\n    end"
+        ),
+        Some(PageShape::MatchJsonDig { cap: 1, .. })
+    ));
+    let two = parse_livecheck_block(
+        "  livecheck do\n    url :homepage\n    strategy :page_match do |page|\n      version = page.match(/v(\\d+)/i)\n      metaurl = page.match(%r{/(\\d+)/x}i)\n      next if version.blank? || metaurl.blank?\n      \"#{version[1]},#{metaurl[1]}\"\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        two.page_block.map(|b| b.shape),
+        Some(PageShape::TwoMatch { .. })
+    ));
+    // r468 hermes-desktop: the first match may use
+    // the block regex (`page.match(regex)`), recorded
+    // as an empty `a_pat` marker.
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      version_match = page.match(regex)\n      next unless version_match\n      build_match = page.match(/Setup\\.dmg\\?build=(\\h+)/i)\n      next unless build_match\n      \"#{version_match[1]},#{build_match[1]}\"\n    end"
+        ),
+        Some(PageShape::TwoMatch { a_pat, .. }) if a_pat.is_empty()
+    ));
+    // r468 imagej: a leading capture-alias statement
+    // in a scan map body rewrites to the capture.
+    assert!(matches!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map do |match|\n        version = match[0]\n        version.include?(\".\") ? version : version.sub(/(\\d)(\\d+)/, '\\\\1.\\\\2')\n      end\n    end"
+        ),
+        Some(PageShape::ScanFork {
+            cond: PageCond::CapIncludes(0, _),
+            ..
+        })
+    ));
+    // r470: an undeclared `regex` resolves to the
+    // livecheck's own regex (sleep-aid's `|page|`
+    // scan runs under the oracle), so the shape
+    // reduces just like the declared-param form.
+    // (Deliberately reversed from the r423 rule.)
     assert_eq!(
         shape(
             "    strategy :page_match do |page|\n      page.scan(regex).map { |match| match[0].tr(\"_\", \".\") }\n    end"
         ),
-        None
+        Some(PageShape::ScanTr("_".into(), ".".into()))
+    );
+    // r470 icollections: split-head char window.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page|\n      page.split(\":\").first[0..2].chars.join(\".\")\n    end"
+        ),
+        Some(PageShape::SplitHeadChars {
+            sep: ":".into(),
+            start: 0,
+            len: 3,
+            join: ".".into()
+        })
     );
     // A computed map body does not reduce.
     assert_eq!(
@@ -1219,7 +1353,8 @@ fn page_match_tr_block_shapes() {
 #[test]
 fn github_releases_block_shapes() {
     use super::super::formula::{
-        GhRelBlock, GhRelCapture, GhRelOp, GhRelPart, GhRelSource, GhRelThen,
+        GhRelBlock, GhRelCapture, GhRelLocalOp, GhRelMatchGuard, GhRelOp, GhRelPart, GhRelSource,
+        GhRelThen, GhRelXform,
     };
     let spec = |body: &str| {
         let text = format!(
@@ -1240,6 +1375,9 @@ fn github_releases_block_shapes() {
         pre_capture: None,
         then: GhRelThen::Identity,
         fallback_tag: None,
+        blank_emit_local: false,
+        limit: None,
+        own_guards: Vec::new(),
     };
     // saxon: tr on the capture.
     assert_eq!(
@@ -1328,6 +1466,8 @@ fn github_releases_block_shapes() {
             pre_capture: Some(GhRelCapture {
                 field: "tag_name".into(),
                 lit: Some((r"^v?(\d+(?:\.\d+)+)$".into(), "i".into())),
+                op: GhRelLocalOp::Capture,
+                blank_guard: true,
             }),
             then: GhRelThen::EqElse {
                 a: GhRelOp::Cap(1),
@@ -1352,6 +1492,8 @@ fn github_releases_block_shapes() {
             pre_capture: Some(GhRelCapture {
                 field: "name".into(),
                 lit: None,
+                op: GhRelLocalOp::Capture,
+                blank_guard: true,
             }),
             then: GhRelThen::Template(vec![
                 GhRelPart::Local,
@@ -1434,6 +1576,123 @@ fn github_releases_block_shapes() {
             "    strategy :github_releases do |json, regex|\n      saxon_suffix = \"-1\"\n\n      json.map do |release|\n        next if release[\"draft\"]\n\n        match[1] if match[1].end_with?(saxon_suffix)\n      end\n    end"
         ),
         None
+    );
+    // r476: librecad — delete_prefix local, blank-emit.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json.map do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        tag = release[\"tag_name\"]&.delete_prefix(\"v\")\n\n        release[\"assets\"]&.map do |asset|\n          match = asset[\"name\"]&.match(regex)\n          next tag if match.blank?\n\n          (match[1] == tag) ? tag : \"#{tag},#{match[1]}\"\n        end\n      end.flatten\n    end"
+        ),
+        Some(GhRelBlock {
+            source: GhRelSource::AssetName,
+            pre_capture: Some(GhRelCapture {
+                field: "tag_name".into(),
+                lit: None,
+                op: GhRelLocalOp::DeletePrefix("v".into()),
+                blank_guard: false,
+            }),
+            then: GhRelThen::EqElse {
+                a: GhRelOp::Cap(1),
+                b: GhRelOp::Local,
+                then: vec![GhRelPart::Local],
+                els: vec![
+                    GhRelPart::Local,
+                    GhRelPart::Lit(",".into()),
+                    GhRelPart::Cap(1),
+                ],
+            },
+            blank_emit_local: true,
+            ..base.clone()
+        })
+    );
+    // r476: wljs-notebook — raw-tag alias + capture off it.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json.map do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        tag = release[\"tag_name\"]\n        tag_version = tag[/^v?(\\d+(?:\\.\\d+)+.*)$/i, 1]\n        next if tag_version.blank?\n\n        release[\"assets\"]&.map do |asset|\n          match = asset[\"name\"]&.match(regex)\n          next if match.blank?\n\n          (match[1] == tag_version) ? tag_version : \"#{match[1]},#{tag}\"\n        end\n      end.flatten\n    end"
+        ),
+        Some(GhRelBlock {
+            source: GhRelSource::AssetName,
+            pre_capture: Some(GhRelCapture {
+                field: "tag_name".into(),
+                lit: Some((r"^v?(\d+(?:\.\d+)+.*)$".into(), "i".into())),
+                op: GhRelLocalOp::Capture,
+                blank_guard: true,
+            }),
+            then: GhRelThen::EqElse {
+                a: GhRelOp::Cap(1),
+                b: GhRelOp::Local,
+                then: vec![GhRelPart::Local],
+                els: vec![
+                    GhRelPart::Cap(1),
+                    GhRelPart::Lit(",".into()),
+                    GhRelPart::Tag,
+                ],
+            },
+            ..base.clone()
+        })
+    );
+    // r476: synfigstudio — compacted capture join.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json.map do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        release[\"assets\"]&.map do |asset|\n          match = asset[\"name\"]&.match(regex)\n          next if match.blank?\n\n          match.to_a.compact.drop(1).join(\",\")\n        end\n      end.flatten\n    end"
+        ),
+        Some(GhRelBlock {
+            source: GhRelSource::AssetName,
+            then: GhRelThen::CompactJoin(",".into()),
+            ..base.clone()
+        })
+    );
+    // r476: outfox — sliced release list. (The comment
+    // quoting `json.map do |release|` must not distort
+    // block capture; see the probe in commands tests.)
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json[0...9].map do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        release[\"assets\"]&.map do |asset|\n          match = asset[\"browser_download_url\"]&.match(regex)\n          next if match.blank?\n\n          \"#{match[3]},#{match[1]},#{match[2]},#{match[4]}\"\n        end\n      end.flatten\n    end"
+        ),
+        Some(GhRelBlock {
+            source: GhRelSource::AssetDownloadUrl,
+            then: GhRelThen::Template(vec![
+                GhRelPart::Cap(3),
+                GhRelPart::Lit(",".into()),
+                GhRelPart::Cap(1),
+                GhRelPart::Lit(",".into()),
+                GhRelPart::Cap(2),
+                GhRelPart::Lit(",".into()),
+                GhRelPart::Cap(4),
+            ]),
+            limit: Some(9),
+            ..base.clone()
+        })
+    );
+    // r476: free-gpgmail — own-version guards.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      version_suffix = version.csv.third&.sub(/^[_-]/, \"\")\n\n      json.map do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        release[\"assets\"]&.map do |asset|\n          match = asset[\"name\"]&.match(regex)\n          next if match.blank?\n          next if match[1].split(\".\").first != version.csv.first.split(\".\").first\n          next if match[3]&.sub(/^[_-]/, \"\") != version_suffix\n\n          \"#{match[1]},#{match[2]},#{match[3]}\"\n        end\n      end.flatten\n    end"
+        ),
+        Some(GhRelBlock {
+            source: GhRelSource::AssetName,
+            then: GhRelThen::Template(vec![
+                GhRelPart::Cap(1),
+                GhRelPart::Lit(",".into()),
+                GhRelPart::Cap(2),
+                GhRelPart::Lit(",".into()),
+                GhRelPart::Cap(3),
+            ]),
+            own_guards: vec![
+                GhRelMatchGuard {
+                    cap: 1,
+                    cap_xform: GhRelXform::SplitFirst(".".into()),
+                    own_csv: 0,
+                    own_xform: GhRelXform::SplitFirst(".".into()),
+                },
+                GhRelMatchGuard {
+                    cap: 3,
+                    cap_xform: GhRelXform::SubRe("^[_-]".into(), "".into(), "".into()),
+                    own_csv: 2,
+                    own_xform: GhRelXform::SubRe("^[_-]".into(), "".into(), "".into()),
+                },
+            ],
+            ..base.clone()
+        })
     );
 }
 
@@ -1774,6 +2033,8 @@ fn git_block_shapes() {
         needs_spec_regex: false,
         skip_tags: Vec::new(),
         op: GitOp::Tr("_".into(), ".".into()),
+        match_template: None,
+        skip_split_contains: None,
     };
     // anyzig: filter_map + tr.
     assert_eq!(
@@ -1851,6 +2112,36 @@ fn git_block_shapes() {
             ..base.clone()
         })
     );
+    // r472 pxplay: match-assign template over caps.
+    {
+        use super::super::formula::LatestPart;
+        assert_eq!(
+            shape(
+                "    strategy :git do |tags, regex|\n      tags.filter_map do |tag|\n        match = tag.match(regex)\n        next if match.blank?\n\n        \"#{match[1]},#{match[2]}\"\n      end\n    end"
+            ),
+            Some(GitBlock {
+                op: GitOp::Identity,
+                match_template: Some(vec![
+                    LatestPart::Cap(1),
+                    LatestPart::Lit(",".into()),
+                    LatestPart::Cap(2),
+                ]),
+                ..base.clone()
+            })
+        );
+        // r472 hdfview: split-contains skip guard.
+        assert_eq!(
+            shape(
+                "    strategy :git do |tags, regex|\n      tags.filter_map do |tag|\n        match = tag.match(regex)\n        next if match.blank? || match[1].split(\".\").include?(\"99\")\n\n        match[1]\n      end\n    end"
+            ),
+            Some(GitBlock {
+                op: GitOp::Identity,
+                match_template: Some(vec![LatestPart::Cap(1)]),
+                skip_split_contains: Some((".".into(), "99".into())),
+                ..base.clone()
+            })
+        );
+    }
     // teleport: a second fetch does not reduce.
     assert_eq!(
         shape(
@@ -1887,6 +2178,8 @@ fn github_latest_block_shapes() {
         render: LatestRender::Capture,
         two_b: None,
         pre_capture: None,
+        match_pre: false,
+        asset_pick: None,
     };
     // expat: scan of tag_name with tr.
     assert_eq!(
@@ -2230,6 +2523,51 @@ fn sparkle_block_shapes_parse() {
     assert!(!block.all && !block.needs_spec_regex);
     assert_eq!(block.expr, SpExpr::Field(SpField::Short));
 
+    // r473 macdown: own-version early return.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/appcast.xml\"\n    strategy :sparkle do |item|\n      next version if item.short_version == \"0.7.3\"\n      item.nice_version\n    end\n  end\n",
+    )
+    .unwrap();
+    let block = spec.sparkle_block.unwrap();
+    assert_eq!(block.own_if, Some((SpField::Short, "0.7.3".to_string())));
+    // r473 opencat: count-padded local in a template.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/appcast.xml\"\n    strategy :sparkle do |item|\n      short_version = (item.short_version.count(\".\") >= 2) ? item.short_version : \"#{item.short_version}.0\"\n      \"#{short_version},#{item.version}\"\n    end\n  end\n",
+    )
+    .unwrap();
+    let block = spec.sparkle_block.unwrap();
+    assert!(matches!(
+        block.expr,
+        SpExpr::Template { ref parts, .. }
+            if matches!(parts[0], SpPart::CountPad { .. })
+    ));
+    // r473 macwhisper: cap-blank early return.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/appcast.xml\"\n    regex(/v(\\d+)/)\n    strategy :sparkle do |items, regex|\n      items.map do |item|\n        version_suffix = item.url.match(regex)\n        next item.nice_version if version_suffix.nil? || version_suffix[1].blank?\n        \"#{item.nice_version}_#{version_suffix[1]}\"\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.sparkle_block.map(|b| b.expr),
+        Some(SpExpr::CapBlankElse { .. })
+    ));
+    // r473 longplay: assign-find under another name.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/appcast.xml\"\n    regex(/v(\\d+)/)\n    strategy :sparkle do |items|\n      stable_item = items.find { |item| item.channel.nil? }\n      next unless stable_item\n      stable_item.url&.[](regex, 1)&.tr(\"-\", \",\")\n    end\n  end\n",
+    )
+    .unwrap();
+    let block = spec.sparkle_block.unwrap();
+    assert!(block.find);
+    assert!(matches!(block.expr, SpExpr::FieldIndexTr(..)));
+    // r473 tripmode: scan if/else.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/appcast.xml\"\n    regex(/v(\\h+)?-(\\d+)/)\n    strategy :sparkle do |item, regex|\n      item.url.scan(regex).map do |match|\n        if match[1] == item.version\n          item.nice_version\n        else\n          \"#{item.nice_version},#{match[1]}\"\n        end\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.sparkle_block.map(|b| b.expr),
+        Some(SpExpr::ScanEqElse { .. })
+    ));
+
     let spec = parse_livecheck_block(
         "  livecheck do\n    url \"https://example.com/appcast.xml\"\n    strategy :sparkle do |items|\n      items.find { |item| item.channel.nil? }&.nice_version\n    end\n  end\n",
     )
@@ -2311,6 +2649,180 @@ fn sparkle_block_shapes_parse() {
     assert!(spec.sparkle_block.is_none());
 }
 
+fn sparkle_fixture(params: &str, body: &str) -> Option<super::super::formula::SparkleBlock> {
+    parse_livecheck_block(&format!(
+        "  livecheck do\n    url \"https://example.com/appcast.xml\"\n    regex(/v(\\d+-\\d+)/)\n    strategy :sparkle do |{params}|\n{body}\n    end\n  end\n"
+    ))?
+    .sparkle_block
+}
+
+#[test]
+fn sparkle_field_indexes_keep_bare_and_transformed_forms() {
+    use super::super::formula::{SpExpr, SpField};
+    for index in ["[regex, 1]", ".[](regex, 1)", "&.[](regex, 1)"] {
+        let block = sparkle_fixture("item, regex", &format!("      item.url{index}")).unwrap();
+        assert_eq!(block.expr, SpExpr::FieldIndex(SpField::Url, 1), "{index}");
+        assert!(block.needs_spec_regex);
+        for transform in [".tr(\"-\", \",\")", "&.tr(\"-\", \",\")"] {
+            let block =
+                sparkle_fixture("item, regex", &format!("      item.url{index}{transform}"))
+                    .unwrap();
+            assert_eq!(
+                block.expr,
+                SpExpr::FieldIndexTr(SpField::Url, 1, "-".into(), ",".into()),
+                "{index}{transform}"
+            );
+        }
+    }
+    for invalid in [
+        "[regex, 1)",
+        ".[](regex, 1]",
+        "&.[](regex, 1]",
+        "[regex, -1]",
+        "[regex, 1].unknown",
+        "[regex, 1]more",
+    ] {
+        assert!(
+            sparkle_fixture("item, regex", &format!("      item.url{invalid}")).is_none(),
+            "unsupported index tail: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn sparkle_assign_find_parses_its_receiver_without_changing_literal_text() {
+    use super::super::formula::{SpChannel, SpExpr, SpField, SpPart};
+    let selected = |body: &str| {
+        sparkle_fixture(
+            "items, regex",
+            &format!(
+                "      stable_item = items.find {{ |item| item.channel.nil? }}\n      next unless stable_item\n{body}"
+            ),
+        )
+    };
+    let block =
+        selected(r##"      "#{stable_item.nice_version}-stable_item.url-other_stable_item.url""##)
+            .unwrap();
+    assert!(block.find);
+    assert_eq!(block.channel, Some(SpChannel::Nil));
+    assert_eq!(
+        block.expr,
+        SpExpr::Template {
+            from: None,
+            local: None,
+            parts: vec![
+                SpPart::Field(SpField::Nice),
+                SpPart::Lit("-stable_item.url-other_stable_item.url".into()),
+            ],
+        }
+    );
+    let block = selected("      stable_item.url[regex, 1]").unwrap();
+    assert_eq!(block.expr, SpExpr::FieldIndex(SpField::Url, 1));
+    for receiver in ["item", "stable_item"] {
+        for presence in [
+            format!("next unless {receiver}"),
+            format!("next if {receiver}.nil?"),
+        ] {
+            let block = sparkle_fixture(
+                "items, regex",
+                &format!(
+                    "      {receiver} = items.find {{ |item| item.url.match(regex) }}\n      {presence}\n      {receiver}.nice_version"
+                ),
+            )
+            .unwrap();
+            assert!(block.find);
+            assert_eq!(block.match_guard, Some(SpField::Url));
+            assert!(block.needs_spec_regex);
+            assert_eq!(block.expr, SpExpr::Field(SpField::Nice));
+        }
+    }
+    let block = selected(
+        "      next if stable_item&.short_version.blank?\n      found = stable_item.url.match(regex)\n      next if found.blank?\n      \"#{stable_item.nice_version}-#{found[1]}\"",
+    )
+    .unwrap();
+    assert_eq!(block.present, [SpField::Short]);
+    assert_eq!(
+        block.expr,
+        SpExpr::Template {
+            from: Some(SpField::Url),
+            local: None,
+            parts: vec![
+                SpPart::Field(SpField::Nice),
+                SpPart::Lit("-".into()),
+                SpPart::Cap(1),
+            ],
+        }
+    );
+    for wrong in [
+        "stable_item_extra.url",
+        "other_stable_item.url",
+        "object.stable_item.url",
+        "item.url",
+        r##""#{stable_item_extra.version}""##,
+        r##""#{other_stable_item.version}""##,
+    ] {
+        assert!(selected(wrong).is_none(), "another receiver: {wrong}");
+    }
+}
+
+#[test]
+fn sparkle_templates_distinguish_escaped_interpolation_from_receiver_reads() {
+    use super::super::formula::{SpExpr, SpField, SpPart};
+    for (template, parts) in [
+        (
+            r##""\#{stable_item.version}|#{stable_item.nice_version}""##,
+            vec![
+                SpPart::Lit("#{stable_item.version}|".into()),
+                SpPart::Field(SpField::Nice),
+            ],
+        ),
+        (
+            r##""\\#{stable_item.nice_version}""##,
+            vec![SpPart::Lit("\\".into()), SpPart::Field(SpField::Nice)],
+        ),
+        (
+            r##""\\\#{other_stable_item.version}|#{stable_item.nice_version}""##,
+            vec![
+                SpPart::Lit("\\#{other_stable_item.version}|".into()),
+                SpPart::Field(SpField::Nice),
+            ],
+        ),
+        (
+            r##""stable_item.url \"#{stable_item.nice_version}\"""##,
+            vec![
+                SpPart::Lit("stable_item.url \"".into()),
+                SpPart::Field(SpField::Nice),
+                SpPart::Lit("\"".into()),
+            ],
+        ),
+        (
+            r##""\##{stable_item.nice_version}""##,
+            vec![SpPart::Lit("#".into()), SpPart::Field(SpField::Nice)],
+        ),
+        (
+            r##""#{stable_item.nice_version}\#""##,
+            vec![SpPart::Field(SpField::Nice), SpPart::Lit("#".into())],
+        ),
+    ] {
+        let body = format!(
+            "      stable_item = items.find {{ |item| item.channel.nil? }}\n      next unless stable_item\n      {template}"
+        );
+        assert_eq!(
+            sparkle_fixture("items, regex", &body).unwrap().expr,
+            SpExpr::Template {
+                from: None,
+                local: None,
+                parts,
+            },
+            "{template}"
+        );
+    }
+    assert!(
+        sparkle_fixture("item", r##"      "#{item.nice_version""##).is_none(),
+        "an unfinished expression is not a literal"
+    );
+}
+
 /// r445: statement-form `:json` bodies (locals,
 /// guarded match, CSV templates) reduce to a
 /// `JsonTemplate`; interpolation-aware strings.
@@ -2347,22 +2859,300 @@ fn json_template_shapes_parse() {
     let (tok, tail) = quoted_token("\"https://x/?#{DateTime.now.strftime(\"%Q\")}\"").unwrap();
     assert_eq!(tok, "https://x/?#{DateTime.now.strftime(\"%Q\")}");
     assert!(tail.is_empty());
+    // r458: find-locals, int/field-blank guards,
+    // match-block, cap forks.
+    use super::super::formula::{JsonCond, JsonFindCond, JsonLit, JsonTail, JsonValue};
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      stable = json[\"channels\"]&.find { |channel| channel[\"id\"] == \"stable\" }\n      next unless stable\n      stable[\"version\"]\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert_eq!(
+        tmpl.finds[0].cond,
+        JsonFindCond::FieldEq("id".into(), JsonLit::Str("stable".into()))
+    );
+    assert_eq!(tmpl.require_find, vec![(0, false)]);
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json[\"data\"]&.map do |item|\n        next if item[\"is_beta\"] == 1\n        next if item[\"dl\"].blank?\n        item[\"version\"]&.strip\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert_eq!(
+        tmpl.guards[0].cond,
+        JsonCond::Eq("is_beta".into(), JsonLit::Int(1))
+    );
+    assert_eq!(tmpl.guards[1].cond, JsonCond::FieldBlank("dl".into()));
+    assert!(matches!(
+        tmpl.render,
+        JsonRender::Value(JsonValue::Local(_), JsonTail::Strip)
+    ));
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    regex(/v(\\d+)(?:-(\\d+))?/)\n    strategy :json do |json, regex|\n      match = json[\"version\"]&.match(regex)\n      next unless match\n      match[2].present? ? \"#{match[1]},#{match[2]}\" : match[1]\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(matches!(
+        tmpl.render,
+        JsonRender::CapFork {
+            cap: 2,
+            present: true,
+            ..
+        }
+    ));
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    regex(/v(\\d+)/)\n    strategy :json do |json, regex|\n      json[\"name\"]&.match(regex) { |match| match[1] }\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::DigRegex(_))
+    ));
+    // r463: dig-blank guards, object locals,
+    // scan/captures shapes.
+    use super::super::formula::JsonCond as JC;
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json.map do |item|\n        next if item.dig(\"osx\", \"server\").blank?\n        next if !item[\"a\"]\n        item[\"version\"]\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(matches!(tmpl.guards[0].cond, JC::DigBlank(ref p) if p.len() == 2));
+    assert!(matches!(tmpl.guards[1].cond, JC::Truthy(ref f) if f == "a") && tmpl.guards[1].unless);
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      v = json.dig(\"cura\", \"Darwin\")\n      \"#{v[\"major\"]}.#{v[\"minor\"]}\"\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(matches!(tmpl.render, JsonRender::Template(_)) && tmpl.locals.len() == 3);
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    regex(/v(\\d+)-(\\d+)/)\n    strategy :json do |json, regex|\n      json.dig(\"data\", \"url\")&.scan(regex)&.map { |match| \"#{match[1]},#{match[0]}\" }\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::DigScan(_, _))
+    ));
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    regex(/v(\\d+)/)\n    strategy :json do |json, regex|\n      json[\"url\"]&.match(regex)&.captures\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::DigCaptures(_))
+    ));
+    // r466: object-values maps, plain sub, postfix
+    // render guards, literal-regex guards.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json[\"versionTable\"].map { |_, entry| entry[\"originVersion\"] }\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::ValuesKey(_, ref k)) if k == "originVersion"
+    ));
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json[\"version\"].to_s.sub(/-?b/, \",\")\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::DigSubPlain(_, _, _, ref r)) if r == ","
+    ));
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json[\"value\"]&.map do |build|\n        next if build[\"desc\"].match?(/beta/i)\n        build[\"id\"]&.to_s if build[\"sourceBranch\"] == \"refs/heads/stable\"\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(matches!(tmpl.guards[0].cond, JC::MatchRe(..)));
+    assert!(tmpl.guards[1].unless);
+    // r469 alfaview: mid-path `.first` and the
+    // bracket-call form dig as path segments.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json[\"versions\"]&.first&.[](\"version\")\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::Dig(_))
+    ));
+    // r469 onekey: an array join tail.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json.dig(\"desktop\", \"version\")&.join(\".\")\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::DigJoin(_, ref s)) if s == "."
+    ));
+    // r469 burp: a map over a dug local, postfix
+    // `&&` guards across lines, an `any?` element
+    // block, and a cask-local `.to_s`.
+    let spec = parse_livecheck_block(
+        "cask \"x\" do\n  arch arm: \"MacOsArm64\", intel: \"MacOsx\"\n  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      all_versions = json.dig(\"ResultSet\", \"Results\")\n      next if all_versions.blank?\n      all_versions.filter_map do |item|\n        item[\"version\"] if\n              item[\"releaseChannels\"]&.include?(\"Stable\") &&\n              item[\"builds\"]&.any? do |build|\n                build[\"BuildCategoryId\"] == \"desktop\" &&\n                build[\"BuildCategoryPlatform\"] == arch.to_s\n              end\n      end\n    end\n  end\nend\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(tmpl.map);
+    assert_eq!(tmpl.guards.len(), 2);
+    assert!(matches!(tmpl.guards[1].cond, JC::AnyEq(..)));
+    // r469 vscode: a tab before `=` still assigns.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      version = json[\"productVersion\"]\n      timestamp\t= json[\"timestamp\"]\n      next if version.blank? || timestamp.blank?\n      \"#{version},#{timestamp}\"\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::Template(_))
+    ));
+    // r469 soundtoys: an entries map with a key
+    // regex guard.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json.map do |key, item|\n        next unless key.match?(/Mac/i)\n        item[\"fullversion\"]\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::EntriesMap(_, _))
+    ));
+    // r469 pixcake: literal-array membership and a
+    // trailing `&.max`.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json[\"data\"]&.filter_map do |item|\n        next unless [15, 17].include?(item[\"app_type\"])\n        item[\"version\"]\n      end&.max\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::MapGuardedMax(_, guard)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected max shape");
+    };
+    assert!(matches!(guard.guards[0].cond, JC::FieldIn(..)));
+    // r471 warp: (dig || dig)&.delete_prefix.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      (json.dig(\"stable\", \"tui_version\") || json.dig(\"stable\", \"version\"))&.delete_prefix(\"v\")\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::Template(ref t))
+            if matches!(t.locals[0], JsonLocal::DigOrTail(..))
+    ));
+    // r471 yealink: inline digs in a root template.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      \"#{json.dig(\"data\", \"packageVersion\")},#{json.dig(\"data\", \"md5\")}\"\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::Template(_))
+    ));
+    // r471 proxybridge: local-equality fork.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    regex(/v(\\d+)/)\n    strategy :json do |json|\n      ver = json.dig(\"macos\", \"version\")\n      next unless ver\n      tag = json.dig(\"macos\", \"download\")&.[](regex, 1)\n      next unless tag\n      (tag == ver) ? ver : \"#{ver},#{tag}\"\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(matches!(tmpl.render, JsonRender::LocalEqFork { .. }));
+    // r471 dolphin: a root dig inside a map template.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    regex(/v(\\d+)-(\\h+)/)\n    strategy :json do |json, regex|\n      json[\"artifacts\"]&.map do |artifact|\n        match = artifact[\"url\"]&.match(regex)\n        next if match.blank?\n        \"#{json[\"shortrev\"]},#{match[1]},#{match[2]}\"\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(matches!(
+        tmpl.render,
+        JsonRender::Template(ref parts) if matches!(parts[0], JsonPart::RootDig(_))
+    ));
+    // r471 leigod: values map + parenthesized match guard.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    regex(/v(\\d+)/)\n    strategy :json do |json, regex|\n      json[\"mac\"]&.values&.filter_map do |item|\n        next unless (match = item[\"download_url\"]&.match(regex))\n        match[1]\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(tmpl.values && tmpl.map);
+    // r471 pcsx2: a dig-truthy guard.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    regex(/v(\\d+)/)\n    strategy :json do |json, regex|\n      json[\"data\"]&.map do |release|\n        next unless release.dig(\"assets\", \"MacOS\")\n        release[\"version\"]&.[](regex, 1)\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(matches!(tmpl.guards[0].cond, JC::DigTruthy(_)));
+    // r471 mongrel: an if-block wrapper as guards.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json[\"files\"]&.filter_map do |file|\n        if file[\"platform\"] == \"macos\" && file[\"file_name\"]&.end_with?(\".dmg\")\n          \"#{file[\"version\"]},#{file[\"id\"]}\"\n        end\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(matches!(tmpl.guards[1].cond, JC::EndsWith(..)));
+    // r471 zoho: one-line brace values map.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    regex(/v(\\d+)/)\n    strategy :json do |json, regex|\n      json[\"mac\"]&.values&.filter_map { |item| item[\"arm64\"]&.[](regex, 1) }\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(JsonShape::Template(tmpl)) = spec.json_block.map(|b| b.shape) else {
+        panic!("expected template shape");
+    };
+    assert!(tmpl.values);
+    // r471 julia: entry keys passing value guards.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.json\"\n    strategy :json do |json|\n      json.map do |version, release|\n        next unless release[\"stable\"]\n        next unless release[\"files\"].any? { |file| file[\"os\"] == \"mac\" && file[\"arch\"] == \"aarch64\" }\n        version\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::EntriesKeys(_, _))
+    ));
 }
 
 /// r446: cask url interpolation with a conditional
 /// quoted segment (`#{"-#{...}" if ...}`) and the
-/// `token` local.
+/// `token` local. `arch` is this host's: `mac_arm` on
+/// arm64, `mac` on x86_64.
 #[test]
 fn cask_url_conditional_interpolation() {
     let text = "cask \"demo\" do\n  arch arm: \"mac_arm\", intel: \"mac\"\n  version \"2026.3.1.1,stingray1\"\n  url \"https://example.com/#{version.csv.first}/app#{\"-#{version.csv.second}\" if version.csv.second}-#{arch}.dmg\"\nend\n";
     let c = parse_cask_rb_as_data(text, "demo");
+    let arch = if cfg!(target_arch = "x86_64") {
+        "mac"
+    } else {
+        "mac_arm"
+    };
     assert_eq!(
         c.url,
-        "https://example.com/2026.3.1.1/app-stingray1-mac_arm.dmg"
+        format!("https://example.com/2026.3.1.1/app-stingray1-{arch}.dmg")
     );
     let text = "cask \"demo\" do\n  version \"4,2023.07\"\n  url \"https://example.com/#{version.csv.second.major}/#{token}#{version.major}.zip\"\nend\n";
     let c = parse_cask_rb_as_data(text, "demo");
     assert_eq!(c.url, "https://example.com/2023/demo4.zip");
+    // r471 julia: a string-op chain on a cask local (`arch` this host's).
+    let text = "cask \"demo\" do\n  arch arm: \"aarch64\", intel: \"x64\"\n  version \"1.13.4\"\n  url \"https://example.com/mac#{arch.delete_prefix(\"x\")}.dmg\"\nend\n";
+    let c = parse_cask_rb_as_data(text, "demo");
+    let arch = if cfg!(target_arch = "x86_64") {
+        "64"
+    } else {
+        "aarch64"
+    };
+    assert_eq!(c.url, format!("https://example.com/mac{arch}.dmg"));
 }
 
 /// r447: `:xml` template bodies reduce (xpath
@@ -2399,6 +3189,138 @@ fn xml_template_shapes_parse() {
         panic!("expected xml template");
     };
     assert_eq!(tmpl.map.map(|m| m.proj), Some(XmlProj::NextText));
+    // r457: single-element modifier-if match.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.xml\"\n    regex(/v(\\d+)/)\n    strategy :xml do |xml, regex|\n      url = xml.elements[\"//FilePath\"]&.text&.strip\n      match = url.match(regex) if url\n      next if match.blank?\n      match[1]\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(XmlShape::Template(tmpl)) = spec.xml_block.map(|b| b.shape) else {
+        panic!("expected xml template");
+    };
+    assert_eq!(tmpl.render, XmlRender::CapValue(1));
+    // r457: element local + following-sibling predicate.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.plist\"\n    regex(/(\\d+)/)\n    strategy :xml do |xml, regex|\n      item = xml.elements[\"//dict[key[text()='AppName']/following-sibling::*[1][text()='Demo']]\"]\n      next unless item\n      version = item.elements[\"key[text()='Version']\"]&.next_element&.text\n      next if version.blank?\n      version.strip\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(XmlShape::Template(tmpl)) = spec.xml_block.map(|b| b.shape) else {
+        panic!("expected xml template");
+    };
+    assert_eq!(tmpl.require_elems, vec![0]);
+    assert_eq!(
+        tmpl.elems[0].path.steps[0].pred,
+        Some(XmlPred::SiblingAfterChild {
+            child: "key".into(),
+            child_text: "AppName".into(),
+            text: "Demo".into(),
+        })
+    );
+    assert_eq!(tmpl.locals[0].from, Some(0));
+    assert!(tmpl.locals[0].path.relative);
+    // r465: continued chains, zip maps, relative
+    // paths, delete_suffix, present forks.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.xml\"\n    strategy :xml do |xml|\n      xml.get_elements(\"//Version\")\n         .map { |item| item.text&.strip&.delete_suffix(\"/\") }\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(XmlShape::Template(tmpl)) = spec.xml_block.map(|b| b.shape) else {
+        panic!("expected xml template");
+    };
+    assert!(matches!(
+        tmpl.map.map(|m| m.proj),
+        Some(super::super::formula::XmlProj::TextDeleteSuffix(s)) if s == "/"
+    ));
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.plist\"\n    strategy :xml do |xml|\n      versions = xml.get_elements(\"//key[text()='shortVersion']\").map { |item| item.next_element&.text&.strip }\n      builds = xml.get_elements(\"//key[text()='version']\").map { |item| item.next_element&.text&.strip }\n      versions.zip(builds).map do |version, build|\n        \"#{version},#{build}\"\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.xml_block.map(|b| b.shape),
+        Some(XmlShape::ZipPair { .. })
+    ));
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.xml\"\n    regex(/^v?(\\d+)(?:\\.(\\d{3,}))?$/)\n    strategy :xml do |xml, regex|\n      xml.get_elements(\"//full-version\").map do |item|\n        match = item.text&.strip&.match(regex)\n        next if match.blank?\n        match[2].present? ? \"#{match[1]},#{match[2]}\" : match[1]\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(XmlShape::Template(tmpl)) = spec.xml_block.map(|b| b.shape) else {
+        panic!("expected xml template");
+    };
+    assert!(matches!(
+        tmpl.render,
+        super::super::formula::XmlRender::CapPresentFork { cap: 2, .. }
+    ));
+    // Interpolated predicate values stay outside.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.plist\"\n    strategy :xml do |xml|\n      item = xml.elements[\"//dict[key[text()='App#{version.major}']]\"]\n      next unless item\n      item.elements[\"key[text()='Version']\"]&.next_element&.text\n    end\n  end\n",
+    );
+    assert!(spec.is_none() || spec.unwrap().xml_block.is_none());
+    // r470 qnap: nested child-text predicates, an
+    // elem blank guard, and relative text reads.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.xml\"\n    strategy :xml do |xml|\n      item = xml.elements[\"//application[productName[text()='Qsync']]/platform[platformName[text()='Mac']]/software\"]\n      next if item.blank?\n      version = item.elements[\"version\"]&.text&.strip\n      build = item.elements[\"buildNumber\"]&.text&.strip\n      next if version.blank? || build.blank?\n      \"#{version},#{build}\"\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(XmlShape::Template(tmpl)) = spec.xml_block.map(|b| b.shape) else {
+        panic!("expected xml template");
+    };
+    assert_eq!(tmpl.require_elems, vec![0]);
+    assert_eq!(
+        tmpl.elems[0].path.steps[0].pred,
+        Some(XmlPred::ChildTextEq("productName".into(), "Qsync".into()))
+    );
+    // r470 zen: a bare attribute template map.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.xml\"\n    strategy :xml do |xml|\n      xml.get_elements(\"//update\").map { |item| \"#{item.attributes[\"appVersion\"]},#{item.attributes[\"buildID\"]}\" }\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(XmlShape::Template(tmpl)) = spec.xml_block.map(|b| b.shape) else {
+        panic!("expected xml template");
+    };
+    assert_eq!(tmpl.map.map(|m| m.locals.len()), Some(2));
+    // r470 emacs: an attribute-fed match in a map.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.xml\"\n    regex(/v(\\d+)-(\\h+)/i)\n    strategy :xml do |xml, regex|\n      xml.get_elements(\"/feed/entry/link\").filter_map do |item|\n        match = item.attributes[\"href\"]&.match(regex)\n        next unless match\n        \"#{match[1]},#{match[2]}\"\n      end\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(XmlShape::Template(tmpl)) = spec.xml_block.map(|b| b.shape) else {
+        panic!("expected xml template");
+    };
+    assert!(matches!(
+        tmpl.map.map(|m| m.proj),
+        Some(XmlProj::AttrMatch(ref a)) if a == "href"
+    ));
+    // r473 yandex: a capture with a tr transform in
+    // a template.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.xml\"\n    regex(/Yandex_(\\d+(?:\\.\\d+)*)_(\\d+)\\.dmg/i)\n    strategy :xml do |xml, regex|\n      url = xml.elements[\"//item/guidArm64\"]&.text&.strip\n      match = url.match(regex) if url\n      next if match.blank?\n      \"#{match[1].tr(\"_\", \".\")},#{match[2]}\"\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(XmlShape::Template(tmpl)) = spec.xml_block.map(|b| b.shape) else {
+        panic!("expected xml template");
+    };
+    assert!(matches!(
+        tmpl.render,
+        super::super::formula::XmlRender::Template(ref parts)
+            if matches!(parts[0], XmlPart::CapTr(1, ..))
+    ));
+    // r473 lingon: REXML::XPath.first + next_element read.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.xml\"\n    strategy :xml do |xml|\n      key = REXML::XPath.first(xml, \"//dict/key[text()='version']\")\n      key.next_element.text\n    end\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.xml_block.map(|b| b.shape),
+        Some(XmlShape::Template(_))
+    ));
+    // r473 macx: or-assign fallback between two reads.
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/x.xml\"\n    strategy :xml do |xml|\n      version = xml.elements[\"//dict/key[text()='LatestVersion']\"]&.next_element&.text\n      version ||= xml.elements[\"//dict/key[text()='LastestVersion']\"]&.next_element&.text\n      next if version.blank?\n      version.strip\n    end\n  end\n",
+    )
+    .unwrap();
+    let Some(XmlShape::Template(tmpl)) = spec.xml_block.map(|b| b.shape) else {
+        panic!("expected xml template");
+    };
+    assert_eq!(tmpl.or_pairs, vec![(0, 1)]);
 }
 
 /// r448: `post_json:`/`header:` url options parse
@@ -2424,6 +3346,44 @@ fn post_json_and_header_options_parse() {
     )
     .unwrap();
     assert_eq!(spec.header, Some(vec!["RSC: 1".to_string()]));
+    // r460: UA symbols, referer/cookies as headers,
+    // %Q urls, symbol block-pass strategies.
+    use super::super::formula::{JsonShape, LivecheckUrl, PageShape};
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/\", user_agent: :curl, referer: \"https://example.com/\", cookies: { \"a\" => \"1\" }\n  end\n",
+    )
+    .unwrap();
+    assert_eq!(spec.user_agent.as_deref(), Some(":curl"));
+    assert_eq!(
+        spec.header,
+        Some(vec![
+            "Referer: https://example.com/".to_string(),
+            "Cookie: a=1".to_string()
+        ])
+    );
+    assert!(!spec.url_options);
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url %Q(https://example.com/?q=[{\"a\":1}])\n    strategy :json, &:to_s\n  end\n",
+    )
+    .unwrap();
+    assert_eq!(
+        spec.url,
+        Some(LivecheckUrl::Literal(
+            "https://example.com/?q=[{\"a\":1}]".to_string()
+        ))
+    );
+    assert!(matches!(
+        spec.json_block.map(|b| b.shape),
+        Some(JsonShape::RootToS)
+    ));
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/version\"\n    strategy :page_match, &:strip\n  end\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        spec.page_block.map(|b| b.shape),
+        Some(PageShape::PageStrip)
+    ));
 }
 
 /// r449: `:header_match` blocks reduce (guarded
@@ -2450,6 +3410,71 @@ fn header_match_shapes_parse() {
     )
     .unwrap();
     assert_eq!(spec.header_block.unwrap().shape, HeaderShape::Bare);
+    // r461: forks with rich capture transforms.
+    use super::super::formula::PageCond;
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/dl\"\n    regex(/v(\\d+)-(\\d+)/)\n    strategy :header_match do |headers, regex|\n      match = headers[\"location\"]&.match(regex)\n      next if match.blank?\n      (match[1] == match[2].tr(\".\", \"\")) ? match[2] : \"#{match[2].split(\"\", 3).join(\".\")},#{match[1]}\"\n    end\n  end\n",
+    )
+    .unwrap();
+    assert_eq!(
+        spec.header_block.unwrap().shape,
+        HeaderShape::Fork {
+            cond: PageCond::CapTrEq(1, 2, ".".into(), "".into()),
+            then: vec![PagePart::Cap(2)],
+            els: vec![
+                PagePart::CapSplitJoin(2, 3, ".".into()),
+                PagePart::Lit(",".into()),
+                PagePart::Cap(1),
+            ],
+        }
+    );
+    let spec = parse_livecheck_block(
+        "  livecheck do\n    url \"https://example.com/dl\"\n    regex(/v(\\d+)/)\n    strategy :header_match do |headers, regex|\n      match = headers[\"content-disposition\"]&.match(regex)\n      next if match.blank?\n      (version = match[1]).include?(\".\") ? version : version.chars.join(\".\")\n    end\n  end\n",
+    )
+    .unwrap();
+    assert_eq!(
+        spec.header_block.unwrap().shape,
+        HeaderShape::Fork {
+            cond: PageCond::CapIncludes(1, ".".into()),
+            then: vec![PagePart::Cap(1)],
+            els: vec![PagePart::CapSplitJoin(1, 0, ".".into())],
+        }
+    );
+}
+
+#[test]
+fn a_first_matching_header_loop_requires_an_explicit_break() {
+    use super::super::formula::{HeaderShape, PagePart};
+    let parsed = |render: &str, stop: &str| {
+        parse_livecheck_block(&format!(
+            "  livecheck do\n    url \"https://example.com/dl\"\n    regex(/v(\\d+)-(\\d+)/)\n    strategy :header_match do |all_headers, regex|\n      version = nil\n      all_headers.each do |headers|\n        matched = headers[\"location\"]&.match(regex)\n        next unless matched\n        version = {render}\n{stop}      end\n      version\n    end\n  end\n"
+        ))
+        .unwrap()
+        .header_block
+    };
+    for (render, parts) in [
+        (
+            r##""#{matched[2]},#{matched[1]}""##,
+            vec![
+                PagePart::Cap(2),
+                PagePart::Lit(",".into()),
+                PagePart::Cap(1),
+            ],
+        ),
+        ("matched[1]", vec![PagePart::Cap(1)]),
+    ] {
+        let first = parsed(render, "        break\n").unwrap();
+        assert_eq!(first.header, "location");
+        assert_eq!(first.shape, HeaderShape::AllTemplate(parts));
+        assert!(
+            parsed(render, "").is_none(),
+            "without a break, {render} keeps the last matching response"
+        );
+        assert!(
+            parsed(render, "        breakend\n").is_none(),
+            "another identifier cannot stand in for the break statement"
+        );
+    }
 }
 
 /// r450: bare version chains as `post_json:`
@@ -2491,6 +3516,16 @@ fn cask_url_version_tr_interpolation() {
         cask_version_token("v1.2", "version.delete_prefix(\"v\")").as_deref(),
         Some("1.2")
     );
+    // A terminal character index
+    // (`version.csv.second[0]`, macgamestore).
+    assert_eq!(
+        cask_version_token("5.8.3,7055", "version.csv.second[0]").as_deref(),
+        Some("7")
+    );
+    assert_eq!(
+        cask_version_token("5.8.3,7055", "version.csv.second[-1]").as_deref(),
+        Some("5")
+    );
     // Ranges/negation stay unmodeled.
     assert_eq!(
         cask_version_token("a1", "version.tr(\"a-z\", \"A-Z\")"),
@@ -2529,15 +3564,23 @@ fn json_capture_with_tr_tail_parses() {
 fn cask_url_nested_locals_and_conditionals() {
     let text = "cask \"demo\" do\n  arch arm: \"Silicon\", intel: \"Intel\"\n  os macos: \"_macOS_#{arch}.dmg\", linux: \"_#{arch}.AppImage\"\n  version \"2026.11.10\"\n  url \"https://example.com/v#{version.csv.first.dots_to_hyphens}/App_#{version.csv.second || version}#{os}\"\n  livecheck do\n    url :url\n    regex(/App[._-]v?(\\d+(?:\\.\\d+)+)#{os}/i)\n    strategy :github_latest do |json, regex|\n      match = json[\"tag_name\"]&.match(regex)\n      next unless match\n\n      match[1]\n    end\n  end\nend\n";
     let c = parse_cask_rb_as_data(text, "demo");
+    // `arch` and `os` are this host's.
+    let arch = if cfg!(target_arch = "x86_64") {
+        "Intel"
+    } else {
+        "Silicon"
+    };
+    let os = if cfg!(target_os = "macos") {
+        format!("_macOS_{arch}.dmg")
+    } else {
+        format!("_{arch}.AppImage")
+    };
     assert_eq!(
         c.url,
-        "https://example.com/v2026-11-10/App_2026.11.10_macOS_Silicon.dmg"
+        format!("https://example.com/v2026-11-10/App_2026.11.10{os}")
     );
     let spec = parse_livecheck_block(text).unwrap();
-    assert_eq!(
-        spec.regex.as_deref(),
-        Some(r"App[._-]v?(\d+(?:\.\d+)+)_macOS_Silicon.dmg")
-    );
+    assert_eq!(spec.regex, Some(format!(r"App[._-]v?(\d+(?:\.\d+)+){os}")));
     let text2 = "cask \"demo\" do\n  version \"1.1.0.6161,-final\"\n  url \"https://example.com/v#{version.csv.first}#{version.csv.second if version.csv.second}/App.dmg\"\nend\n";
     assert_eq!(
         parse_cask_rb_as_data(text2, "demo").url,

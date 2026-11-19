@@ -19,6 +19,22 @@ pub(crate) use aterm_gui_fabric::*;
 static MAIL_WATCH: std::sync::Mutex<Option<fleet_mail::watch::Door<crate::SessionCtx>>> =
     std::sync::Mutex::new(None);
 
+/// Read the existing native owner for the standalone cached-host probe; this never starts it.
+#[cfg(all(unix, feature = "bench-support", debug_assertions))]
+pub(crate) fn direct_mail_watch_started() -> bool {
+    #[cfg(not(test))]
+    {
+        MAIL_WATCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+    #[cfg(test)]
+    {
+        false
+    }
+}
+
 /// Keep `ctx`'s direct mailbox read, starting the worker for the first session, or again where
 /// it ended.
 #[cfg(all(unix, not(test)))]
@@ -81,9 +97,10 @@ impl FabricSession for crate::SessionCtx {
     }
 
     /// A hold decides what the startup deadline may judge, so the host looks right after it moves,
-    /// and a hold standing at that look is seen.
+    /// and a hold standing at that look is seen. An open record stream's `hand` carries it too.
     fn hold_moved(&self) {
         crate::harness_host::ring();
+        self.watchers.ring_stream();
     }
 
     fn holder_token(&self) -> Option<String> {

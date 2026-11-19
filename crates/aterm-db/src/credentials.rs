@@ -146,6 +146,7 @@ impl Record {
                 key: self.key.clone(),
                 value: Some(Value::Object(self.body.clone())),
             }],
+            said: None,
         })
     }
 
@@ -412,7 +413,10 @@ fn check_parts(kind: &str, key: &str, body: &Map) -> Result<Vec<u8>> {
 }
 
 fn check_command(command: &Command) -> Result<(&str, &str, &Map)> {
-    let Command::Write { request, changes } = command else {
+    let Command::Write {
+        request, changes, ..
+    } = command
+    else {
         return Err(Error::new("credential records are whole-value writes"));
     };
     let [change] = changes.as_slice() else {
@@ -1245,6 +1249,120 @@ pub struct Pass {
     pub threads: Vec<Thread>,
     /// Inert records and why.
     pub inert: Vec<(Digest, String)>,
+    /// The table refused this pass's append for its capacity ([`Error::capacity_exhausted`]): the
+    /// pass made no append after it, took in all the same every move that needs none (a
+    /// decision, a request already on the table, a custodian's silence), and recorded the
+    /// refusal ([`need::full`]). `None` where the table refused none of its appends.
+    pub full: Option<need::full::Full>,
+}
+
+/// The appends one pass makes, in order. Once the table refuses one for its capacity the pass
+/// makes no more, since the table refuses each the same way, and goes on taking in what needs no
+/// append; any other refusal ends the pass ([`Self::make`]).
+#[derive(Default)]
+struct Appends {
+    /// The bound that refused this pass's append for its capacity, where one did.
+    refused: Option<crate::CapacityBound>,
+}
+
+impl Appends {
+    /// What `append` made, where the table took it; `None` where a capacity refusal ended this
+    /// pass's appends before it, or refuses it now and ends them.
+    ///
+    /// # Errors
+    /// `append`'s refusal, where it is not a capacity's.
+    fn make<T>(&mut self, append: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+        if self.refused.is_some() {
+            return Ok(None);
+        }
+        match append() {
+            Ok(made) => Ok(Some(made)),
+            Err(error) => match error.capacity_exhausted() {
+                Some(bound) => {
+                    self.refused = Some(bound);
+                    Ok(None)
+                }
+                None => Err(error),
+            },
+        }
+    }
+
+    /// Whether no capacity refusal ended this pass's appends yet.
+    const fn open(&self) -> bool {
+        self.refused.is_none()
+    }
+
+    /// How the pass met the table, read off `store` once it made its last append: `opened` is the
+    /// claim `store` held when the pass opened it.
+    fn met(&self, session: &Session<'_>, store: &Store, log: &Log, opened: &[u8]) -> Result<Met> {
+        let (claim, held) = store.claim();
+        let refused = match self.refused {
+            None => None,
+            Some(bound) => {
+                let (bound, records) = match bound {
+                    crate::CapacityBound::Table => (need::full::Bound::Table, log.retained()),
+                    crate::CapacityBound::Writer => (
+                        need::full::Bound::Writer,
+                        store.retained_by(session, session.actor())?,
+                    ),
+                };
+                Some(Refused {
+                    bound,
+                    records: records as u64,
+                    claim,
+                    held: held.to_vec(),
+                })
+            }
+        };
+        Ok(Met {
+            took: held != opened,
+            refused,
+        })
+    }
+}
+
+/// A capacity refusal, with what it stands on: the store's claim as it held it then.
+struct Refused {
+    bound: need::full::Bound,
+    records: u64,
+    claim: std::path::PathBuf,
+    held: Vec<u8>,
+}
+
+/// How one pass met the table ([`Appends::met`]).
+struct Met {
+    /// The table took one of the pass's appends: its claim moved.
+    took: bool,
+    /// The table refused one for its capacity.
+    refused: Option<Refused>,
+}
+
+impl Met {
+    /// Record the refusal `by`'s pass met, or forget the one it recorded before where the table
+    /// took its append and refused none; a pass that appended nothing and met no refusal leaves
+    /// what is recorded. Called once the ledger took in what the pass read, so the ledger the
+    /// refusal stands on is the one the next pass reads.
+    ///
+    /// # Errors
+    /// The ledger cannot be read, or the record cannot be written or removed.
+    fn settle(self, paths: &Paths, by: need::full::By) -> Result<Option<need::full::Full>> {
+        match self.refused {
+            Some(refused) => need::full::record(
+                paths,
+                by,
+                refused.bound,
+                refused.records,
+                &refused.claim,
+                &refused.held,
+            )
+            .map(Some)
+            .map_err(crate::table::failure),
+            None if self.took => need::full::forget(paths, by)
+                .map(|()| None)
+                .map_err(crate::table::failure),
+            None => Ok(None),
+        }
+    }
 }
 
 fn decision_for(thread: &Thread, need: &Need) -> Option<Decision> {
@@ -1293,9 +1411,10 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
     let needs = need::list(paths).map_err(crate::table::failure)?;
     let facts = facts(paths, now_ms)?;
     let mut moves = Vec::new();
-    let (mut report, network, book) = with_store(paths, |session, store, scope| {
+    let (mut report, network, book, met) = with_store(paths, |session, store, scope| {
         let context = context(&facts, session, scope, now_ms)?;
         let log = Log::read_with(session, store, scope, decode)?;
+        let opened = store.claim().1.to_vec();
         let writer = session.writer().is_ok() && log.writable(session.actor()).is_ok();
         let mut book = Book::read(&log, &context);
         let me = session.actor();
@@ -1321,6 +1440,9 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
         {
             open[need::pool(&thread.want)] += 1;
         }
+        // Every append the pass makes goes through `appends`: a capacity refusal of one ends the
+        // appends and not the pass, which takes in every need's moves that need no append.
+        let mut appends = Appends::default();
         for need in &needs {
             let key = request_key(&me, &need.id);
             let thread = book
@@ -1354,39 +1476,47 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
             let room = open[pool] < need::MAX_OPEN;
             match (need.state, thread) {
                 (State::Local, None) if writer && allowed && room => {
-                    let receipt =
-                        request(request_record(&me, need)?)?.commit(session, store, &log)?;
-                    moves.push((need.id, Absorb::Flushed(receipt.id.to_vec())));
-                    report.posted += 1;
-                    open[pool] += 1;
+                    if let Some(receipt) = appends.make(|| {
+                        request(request_record(&me, need)?)?.commit(session, store, &log)
+                    })? {
+                        moves.push((need.id, Absorb::Flushed(receipt.id.to_vec())));
+                        report.posted += 1;
+                        open[pool] += 1;
+                    }
                 }
                 (State::Open | State::Offered | State::Published, None)
                     if writer && allowed && room && need.posted =>
                 {
                     // Older readers must see the old request end before they encounter
-                    // the successor whose binding they do not understand.
-                    commit(
-                        session,
-                        store,
-                        &log,
-                        &retired_record(
-                            &key,
-                            Reason::Superseded,
-                            "the requester replaced an obsolete request schema",
-                            "",
-                        ),
-                    )?;
+                    // the successor whose binding they do not understand; a refusal of the end
+                    // ends the appends, so no successor is made without it.
+                    appends.make(|| {
+                        commit(
+                            session,
+                            store,
+                            &log,
+                            &retired_record(
+                                &key,
+                                Reason::Superseded,
+                                "the requester replaced an obsolete request schema",
+                                "",
+                            ),
+                        )
+                    })?;
                     let (nonce, successor) = reissued.expect("computed for unplaced posted need");
-                    let receipt = request(successor)?.commit(session, store, &log)?;
-                    moves.push((
-                        need.id,
-                        Absorb::Reissued {
-                            nonce,
-                            record: receipt.id.to_vec(),
-                        },
-                    ));
-                    report.posted += 1;
-                    open[pool] += 1;
+                    if let Some(receipt) =
+                        appends.make(|| request(successor)?.commit(session, store, &log))?
+                    {
+                        moves.push((
+                            need.id,
+                            Absorb::Reissued {
+                                nonce,
+                                record: receipt.id.to_vec(),
+                            },
+                        ));
+                        report.posted += 1;
+                        open[pool] += 1;
+                    }
                 }
                 (State::Local, Some(thread)) => {
                     moves.push((need.id, Absorb::Flushed(thread.operation.to_vec())));
@@ -1394,8 +1524,13 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 (State::Fulfilled, Some(thread)) if writer && !thread.ended() => {
                     let mut body = Map::new();
                     body.insert("seq".into(), Value::from(need.seq.unwrap_or(0)));
-                    commit(session, store, &log, &Record::new("fulfilled", &key, body))?;
-                    report.answered += 1;
+                    let record = Record::new("fulfilled", &key, body);
+                    if appends
+                        .make(|| commit(session, store, &log, &record))?
+                        .is_some()
+                    {
+                        report.answered += 1;
+                    }
                 }
                 (State::Retired, Some(thread)) if writer && !thread.ended() => {
                     if let Some(retired) = need.retired.as_ref().filter(|retired| {
@@ -1406,8 +1541,12 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                     }) {
                         let record =
                             retired_record(&key, retired.reason, &retired.evidence, &retired.note);
-                        commit(session, store, &log, &record)?;
-                        report.answered += 1;
+                        if appends
+                            .make(|| commit(session, store, &log, &record))?
+                            .is_some()
+                        {
+                            report.answered += 1;
+                        }
                     }
                 }
                 (State::Open | State::Offered | State::Published, Some(thread)) => {
@@ -1430,8 +1569,13 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                     {
                         let mut body = Map::new();
                         body.insert("at".into(), Value::from(now_ms / MS));
-                        commit(session, store, &log, &Record::new("still", &key, body))?;
-                        report.answered += 1;
+                        let record = Record::new("still", &key, body);
+                        if appends
+                            .make(|| commit(session, store, &log, &record))?
+                            .is_some()
+                        {
+                            report.answered += 1;
+                        }
                     }
                 }
                 _ => {}
@@ -1444,8 +1588,9 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
         // record against its own clock and members (a lapse counts 30 days from its own receipt
         // of this Mac's last word), so until it does, the old request is live there and the
         // successor is the second live one for its want and purpose. Only the requester's own
-        // record ends it on every Mac at once; it is written once.
-        if writer {
+        // record ends it on every Mac at once; it is written once. This and the sweep are appends
+        // alone, which a capacity refusal already ended.
+        if writer && appends.open() {
             let standing: BTreeSet<[u8; 16]> = needs
                 .iter()
                 .map(|need| request_key(&me, &need.id))
@@ -1479,11 +1624,15 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 if thread.ended() && log.retry(me, &record.command()?)?.is_some() {
                     continue;
                 }
-                commit(session, store, &log, &record)?;
-                report.answered += 1;
+                if appends
+                    .make(|| commit(session, store, &log, &record))?
+                    .is_some()
+                {
+                    report.answered += 1;
+                }
             }
         }
-        if writer {
+        if writer && appends.open() {
             let mut covers = Vec::new();
             for thread in book.threads.values() {
                 // A want with a producer is swept by no member (the model's `Sweep` takes no
@@ -1501,13 +1650,13 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                     continue;
                 }
                 if source::held(paths, scope.trust().network, thread, now_ms) {
-                    commit(
-                        session,
-                        store,
-                        &log,
-                        &Record::new("offer", &thread.id, Map::new()),
-                    )?;
-                    report.offered += 1;
+                    let record = Record::new("offer", &thread.id, Map::new());
+                    if appends
+                        .make(|| commit(session, store, &log, &record))?
+                        .is_some()
+                    {
+                        report.offered += 1;
+                    }
                 }
                 covers.push(Value::from(hex::encode_lower(&thread.id)));
                 if covers.len() == MAX_COVERS {
@@ -1515,15 +1664,22 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 }
             }
             if !covers.is_empty() {
-                report.swept = covers.len();
+                let swept = covers.len();
                 let pass_id = crate::crypto::random::<16>()?;
                 let mut body = Map::new();
                 body.insert("covers".into(), Value::Array(covers));
-                commit(session, store, &log, &Record::new("sweep", &pass_id, body))?;
+                let record = Record::new("sweep", &pass_id, body);
+                if appends
+                    .make(|| commit(session, store, &log, &record))?
+                    .is_some()
+                {
+                    report.swept = swept;
+                }
             }
         }
+        let met = appends.met(session, store, &log, &opened)?;
         report.inert = std::mem::take(&mut book.inert);
-        Ok((report, scope.trust().network, book))
+        Ok((report, scope.trust().network, book, met))
     })?;
     report.decided = need::absorb(paths, &moves)
         .map_err(crate::table::failure)?
@@ -1535,6 +1691,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
         })
         .count();
     source::cleanup(paths, network, &book, now_ms)?;
+    report.full = met.settle(paths, need::full::By::Member)?;
     report.threads = book.threads.into_values().collect();
     Ok(report)
 }
@@ -1687,6 +1844,10 @@ pub struct Custodian {
     /// Requests whose copy or publication failed this pass, and the error: each waits alone,
     /// and the next pass tries it again.
     pub failed: Vec<([u8; 16], String)>,
+    /// The table refused a decision's append for its capacity: the decisions it took before
+    /// stay in [`Self::published`] and [`Self::retired`], each one after waits in
+    /// [`Self::waiting`], and the refusal is recorded ([`need::full`]).
+    pub full: Option<need::full::Full>,
 }
 
 impl Custodian {
@@ -1704,8 +1865,48 @@ impl Custodian {
             use std::fmt::Write as _;
             let _ = write!(said, ", {} failed: {why}", self.failed.len());
         }
+        if let Some(full) = &self.full {
+            said.push_str("; ");
+            said.push_str(&full.line());
+        }
         said
     }
+}
+
+/// The refusal a full table last gave this Mac's pass ([`need::full`]), read under the paths the
+/// passes record it at: the [`need::full::Full`] while it stands, and the files whose change can
+/// end it, which a watch hears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullReading {
+    /// The refusal, while the ledger and (for the table's own bound) the table's claim read as
+    /// the refused pass left them.
+    pub standing: Option<need::full::Full>,
+    /// Whether a refusal is recorded at all, standing or not ([`need::full::recorded`]): one that
+    /// no longer stands is the table or the ledger moved since; none is a pass the table admitted.
+    pub recorded: bool,
+    /// The record, the ledger and, for the table's own bound, the claim the record names
+    /// ([`need::full::Reading::watched`]).
+    pub watched: Vec<std::path::PathBuf>,
+    /// What the reading stood on ([`need::full::Reading::key`]): a look asks for one pass per
+    /// reading, so a later move of the needs or the table asks again.
+    pub key: Option<[u8; 32]>,
+}
+
+/// [`FullReading`] for this Mac, the record and the ledger read in one hold of the ledger's lock
+/// ([`need::full::reading`]): it opens no table, and writes nothing but that lock's file where it
+/// is missing.
+///
+/// # Errors
+/// The generation link, the record, the claim it names, the ledger or its lock cannot be read.
+pub fn full(paths: &Paths) -> Result<FullReading> {
+    let paths = crate::generation::observed_logical_paths(paths)?;
+    let reading = need::full::reading(&paths).map_err(crate::table::failure)?;
+    Ok(FullReading {
+        standing: reading.standing,
+        recorded: reading.recorded,
+        watched: reading.watched,
+        key: reading.key,
+    })
 }
 
 /// Read provenance before mutating the batch draft. Another request's copy cannot
@@ -1999,7 +2200,13 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
             }
         },
     };
-    let mut parts = Vec::new();
+    // Each decision with the parts it names, retirements first, then publications, in the order
+    // `report` lists them: a decision's parts go right before it, so a full table that refuses
+    // one leaves at most one decision's parts on the table without it.
+    let mut decisions: Vec<(Record, Vec<Record>)> = records
+        .into_iter()
+        .map(|record| (record, Vec::new()))
+        .collect();
     for (id, recipient, versioned, source) in copied {
         let (claim, legacy_sequence) = match &published {
             Some(claim) => (claim, claim.envelope().map(|envelope| envelope.seq)),
@@ -2007,30 +2214,56 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
         };
         let (bundle, version) =
             publication(&id, claim, legacy_sequence, &recipient, None, versioned)?;
-        parts.extend(bundle.parts);
-        records.push(bundle.record);
+        decisions.push((bundle.record, bundle.parts));
         report.published.push((id, version));
     }
-    if records.is_empty() {
+    if decisions.is_empty() {
         return Ok(Some(report));
     }
     let sign = |record: custody::Attested<'_>| admin.attest_credential_record(&network, record);
-    let records = records
+    let decisions = decisions
         .into_iter()
-        .map(|record| record.attest(&sign))
+        .map(|(record, parts)| Ok((record.attest(&sign)?, parts)))
         .collect::<Result<Vec<_>>>()?;
-    with_store(paths, |session, store, scope| {
+    let (committed, met) = with_store(paths, |session, store, scope| {
         session.writer()?;
         let log = Log::read_with(session, store, scope, decode)?;
         log.writable(session.actor())?;
-        for part in &parts {
-            commit(session, store, &log, part)?;
+        let opened = store.claim().1.to_vec();
+        let mut appends = Appends::default();
+        let mut committed = 0;
+        for (record, parts) in &decisions {
+            let made = appends.make(|| {
+                for part in parts {
+                    commit(session, store, &log, part)?;
+                }
+                commit(session, store, &log, record)
+            })?;
+            if made.is_none() {
+                break;
+            }
+            committed += 1;
         }
-        for record in &records {
-            commit(session, store, &log, record)?;
-        }
-        Ok(())
+        Ok((committed, appends.met(session, store, &log, &opened)?))
     })?;
+    // A full table took the decisions before its refusal and none after: the rest wait, decided
+    // again by the next pass, and the refusal is recorded as a member pass records it.
+    report.full = met.settle(paths, need::full::By::Custodian)?;
+    if let Some(full) = &report.full {
+        let retirements = report.retired.len();
+        let retired = report.retired.split_off(committed.min(retirements));
+        let published = report
+            .published
+            .split_off(committed.saturating_sub(retirements));
+        let waits = full.line();
+        report.waiting.extend(
+            retired
+                .into_iter()
+                .map(|(id, _)| id)
+                .chain(published.into_iter().map(|(id, _)| id))
+                .map(|id| (id, waits.clone())),
+        );
+    }
     Ok(Some(report))
 }
 

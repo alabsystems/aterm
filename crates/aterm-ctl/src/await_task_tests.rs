@@ -1081,7 +1081,7 @@ fn answers(line: &str) -> crate::DriveLink {
 fn a_wait_of_many_legs_is_one_read_of_each_mac() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     const NODE: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
-    const ASKER: &str = "s-0123456789abcdef0123";
+    const ASKER: &str = "tqn5r6e0148";
     static NAMED: AtomicUsize = AtomicUsize::new(0);
     static UNNAMED: AtomicUsize = AtomicUsize::new(0);
     fn unnamed(_: &str, _: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {

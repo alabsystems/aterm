@@ -9,15 +9,10 @@
 //! ladder, and `add` lists its row where the next sync reads it, or refuses by the source's name.
 //! Every fixture email is `example.test`.
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
-#![cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "some helpers serve only the tests gated `cfg(unix)`"
-    )
-)]
+// The tests gated `cfg(unix)` here reach what aterm has only on Unix: a file mode, a symbolic
+// link, a signal, a `/bin/sh` stand-in, or a part built only there (native credential custody,
+// native fleet renewal, the vault-token, Google and agy sign-ins, the Kimi pool's overlay
+// staging home, aterm's own browser window, the test sleep seam).
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
@@ -254,7 +249,6 @@ fn the_rows_a_resync_leaves_without_a_login_are_reported_and_left_for_a_person()
 /// it, under the account's reserved slug, with its own login directory; the file still says
 /// `discovered`. CONTROL: a word that names no account (a would-be label) is refused and nothing
 /// is written.
-#[cfg(unix)]
 #[test]
 fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
     let desk = discovered_desk();
@@ -313,7 +307,6 @@ fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
 /// Where a source this machine reads and does not write makes the roster (the vault's fleet of
 /// several machines, `[fleet] accounts_source`), `accounts add` refuses by that source's name and
 /// writes nothing: the row would be dropped at the next sync.
-#[cfg(unix)]
 #[test]
 fn a_row_added_under_a_source_this_machine_does_not_write_is_refused_by_name() {
     let desk = Desk::new("m27");
@@ -514,7 +507,6 @@ fn the_converge_read_is_due_where_the_resync_syncs_a_missing_roster() {
 }
 
 #[test]
-#[cfg(unix)]
 fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
     let desk = Desk::new("m16");
     let config = desk.config.join("aterm.toml");
@@ -655,7 +647,6 @@ fn a_missing_claude_roster_keeps_its_unannotated_local_source_and_its_refusal() 
 }
 
 #[test]
-#[cfg(unix)]
 fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
     let desk = Desk::new("m16");
     let config = desk.config.join("aterm.toml");

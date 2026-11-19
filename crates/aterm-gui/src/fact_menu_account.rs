@@ -2146,18 +2146,6 @@ pub(crate) fn details_report(facts: &FactMenuFacts) -> String {
         if let Some(step) = &token.step {
             lines.push(format!("Token step: {step}"));
         }
-        match secs(token.peers_read_at) {
-            Some(at) => lines.push(format!(
-                "Other Macs on the token: {}, read {}",
-                if token.peers.is_empty() {
-                    "none".to_owned()
-                } else {
-                    token.peers.join(", ")
-                },
-                ctx.when(at).text()
-            )),
-            None => lines.push("Other Macs on the token: not read".to_owned()),
-        }
     }
     if let Some(card) = ctx.card() {
         if let Home::Known { mac, also, .. } = &card.machine.home {

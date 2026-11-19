@@ -587,9 +587,62 @@ impl Watched {
     }
 }
 
+/// `sync.requests`'s inputs while the lab's credential-requests table stands full
+/// ([`aterm_db::credentials::full`]): the runner's recheck runs the passes against it anyway, and
+/// neither the table's claim nor the need ledger is a control path the repository mark reads, so
+/// a move that can let the table take this Mac's records would wait for that recheck. A look that
+/// finds the refusal recorded but no longer standing (the table took a record, or a need was
+/// raised, retired or moved) asks for a pass, once for what it read; a later move reads anew and
+/// asks again, whether or not a pass answered the first. One that finds it gone (a pass the table
+/// took an append of forgot it, so that pass ran) asks for none.
+struct RequestsInputs {
+    paths: Paths,
+    /// What the reading the last look asked a pass for stood on
+    /// ([`aterm_db::credentials::FullReading::key`]).
+    asked: Option<[u8; 32]>,
+    /// What the last look read that a watch hears: the record, the ledger and, for the table's
+    /// own bound, the claim.
+    watched: Vec<PathBuf>,
+}
+
+impl RequestsInputs {
+    fn new(paths: &Paths) -> Self {
+        Self {
+            paths: paths.clone(),
+            asked: None,
+            watched: Vec::new(),
+        }
+    }
+
+    fn request(
+        &mut self,
+        read: impl FnOnce(&Paths) -> Option<aterm_db::credentials::FullReading>,
+        allowed: impl FnOnce() -> bool,
+    ) -> Option<aterm_secrets::converge::RepositoryRequest> {
+        let reading = read(&self.paths)?;
+        self.watched = reading.watched;
+        let moved = reading.recorded && reading.standing.is_none();
+        if !moved {
+            self.asked = None;
+            return None;
+        }
+        // A sharing hold does not consume the move: the look after it asks.
+        if self.asked == reading.key || !allowed() {
+            return None;
+        }
+        self.asked = reading.key;
+        Some(aterm_secrets::converge::RepositoryRequest::Repair)
+    }
+
+    fn watched(&self) -> impl Iterator<Item = Watch> + '_ {
+        self.watched.iter().cloned().map(Watch::File)
+    }
+}
+
 /// The observer's state, shared by its look and its answer of when the next is owed.
 struct Observed {
     readiness: Readiness,
+    requests: RequestsInputs,
     watched: Option<Watched>,
     /// What every look reads apart from its control paths: the setup records, the shared
     /// refresh receipt and the machine's name. The sharing switch is the lane's own to watch, since its hold keeps the
@@ -605,6 +658,7 @@ impl Observed {
                     .iter()
                     .cloned()
                     .chain(self.readiness.watched())
+                    .chain(self.requests.watched())
                     .collect(),
             );
         }
@@ -687,6 +741,7 @@ fn observing(
             .collect();
     let mut observed = Observed {
         readiness,
+        requests: RequestsInputs::new(paths),
         watched: rung.and_then(Watched::start),
         fixed,
     };
@@ -696,6 +751,7 @@ fn observing(
     let moved = Arc::clone(&observed);
     let repository_sys = Arc::clone(&sys);
     let naming_sys = Arc::clone(&sys);
+    let requests_shared = Arc::clone(&sharing);
     aterm_secrets::client::ConvergenceInputs::new(Box::new(move |refresh| {
         let mut observed = looked.lock().unwrap_or_else(PoisonError::into_inner);
         let request = observed.readiness.request(
@@ -704,8 +760,15 @@ fn observing(
             refresh,
             Instant::now(),
         );
+        let requests = observed.requests.request(
+            |paths| aterm_db::credentials::full(paths).ok(),
+            || requests_shared(),
+        );
         observed.arm();
-        request
+        match (request, requests) {
+            (Some(request), Some(requests)) => Some(request.merge(requests)),
+            (request, requests) => request.or(requests),
+        }
     }))
     .with_identity(Box::new(move || {
         naming.request(naming_sys.as_ref(), || sharing())

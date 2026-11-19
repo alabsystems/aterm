@@ -24,6 +24,9 @@ use crate::{Need, Patience};
 mod cohort_ledger;
 #[cfg(all(test, unix))]
 pub(crate) use cohort_ledger::tests::Fixture as CohortFixture;
+#[cfg(all(test, windows))]
+#[path = "ledger_delete_pending_tests.rs"]
+mod delete_pending_tests;
 #[cfg(all(test, unix))]
 #[path = "cohort_failure_tests.rs"]
 mod failure_tests;
@@ -294,6 +297,9 @@ impl Record {
         if self.need.covers {
             o.insert("covers".to_owned(), Value::from(true));
         }
+        if self.need.command_cover {
+            o.insert("command_cover".to_owned(), Value::from(true));
+        }
         if self.need.scratch {
             o.insert("scratch".to_owned(), Value::from(true));
         }
@@ -521,6 +527,7 @@ impl Record {
             checkout: None,
             alone: head.get("alone").and_then(Value::as_bool) == Some(true),
             covers: head.get("covers").and_then(Value::as_bool) == Some(true),
+            command_cover: head.get("command_cover").and_then(Value::as_bool) == Some(true),
             scratch: head.get("scratch").and_then(Value::as_bool) == Some(true),
             leads: head.get("leads").and_then(Value::as_bool) == Some(true),
             person: head.get("person").and_then(Value::as_bool) == Some(true),
@@ -1406,6 +1413,23 @@ impl Ledger {
     #[must_use]
     pub fn user() -> Option<Ledger> {
         user_dir().map(Self::account_at)
+    }
+
+    /// Whether this ledger shares the account's legacy slot pool. Private fixture
+    /// ledgers and separately provisioned cohort namespaces have their own capacity.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn is_account(&self) -> bool {
+        if self.user_source.is_some() {
+            return true;
+        }
+        // Ordinary claim custody can reopen the account ledger by its physical path.
+        // A path that cannot be resolved supplies no evidence of that identity.
+        matches!(self.mode, Mode::Legacy)
+            && user_dir()
+                .and_then(|account| std::fs::canonicalize(account).ok())
+                .zip(std::fs::canonicalize(&self.dir).ok())
+                .is_some_and(|(account, here)| account == here)
     }
 
     pub(crate) fn account_at(source: PathBuf) -> Self {

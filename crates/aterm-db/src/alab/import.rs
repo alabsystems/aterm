@@ -570,27 +570,6 @@ pub trait Vendors {
     fn this_mac(&self) -> Option<super::register::ThisMac> {
         None
     }
-
-    /// The generated exports' file names (design §9, `super::export`), in render order. A build
-    /// that links no harness renders none.
-    fn export_names(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Each generated export of the registry `view` and the journal's `places`, by file name,
-    /// without its seal line, given `current` (each file's text as it is now, by name), rendered
-    /// the harness's way (`aterm_agent::harness::alab_exports`).
-    ///
-    /// # Errors
-    /// A current file does not parse, or this build links no harness.
-    fn exports(
-        &self,
-        _view: &super::view::LabView,
-        _places: &super::journal::place::Places,
-        _current: &BTreeMap<String, String>,
-    ) -> std::result::Result<Vec<(String, String)>, String> {
-        Err("this build renders no exports".to_owned())
-    }
 }
 
 /// One account as a harness file states it: its realm, its login, what the harness calls it and

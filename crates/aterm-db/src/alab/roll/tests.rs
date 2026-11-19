@@ -6,6 +6,7 @@
 //! synthetic (`example.test`).
 
 use super::*;
+use crate::att::decode;
 use crate::typed::secret::Store as _;
 use crate::{
     alab::{
@@ -121,6 +122,7 @@ fn the_restatement_merges_what_each_side_saw() {
     let carried = carried_origins([&Command::Write {
         request: [0; 16],
         changes: rows[0].clone(),
+        said: None,
     }]);
     assert!(
         restated(&source, &held, &target, &carried)
@@ -183,6 +185,7 @@ fn carrying_one_cell_never_marks_another_cell_of_the_same_operation_carried() {
         let carried = carried_origins([&Command::Write {
             request: [0; 16],
             changes: vec![first.clone()],
+            said: None,
         }]);
         let target = Cells::from([(key(), register(&[(op(9), first.value.unwrap())]))]);
         let resumed = restated(&source, &held, &target, &carried).unwrap();
@@ -345,6 +348,7 @@ fn a_roll_cleanup_is_not_suppressed_by_an_earlier_identical_write() {
         )
         .unwrap(),
         changes: changes.clone(),
+        said: None,
     };
     let receipt = application::append(&session, &mut store, &first.encode().unwrap()).unwrap();
     let mut late = changes.clone();
@@ -358,6 +362,7 @@ fn a_roll_cleanup_is_not_suppressed_by_an_earlier_identical_write() {
     let late = Command::Write {
         request: [240; 16],
         changes: late,
+        said: None,
     };
     application::append(&session, &mut store, &late.encode().unwrap()).unwrap();
     let log = Log::read_with(&session, &store, scope, decode).unwrap();
@@ -390,6 +395,7 @@ fn a_roll_cleanup_is_not_suppressed_by_an_earlier_identical_write() {
         )
         .unwrap(),
         changes: again,
+        said: None,
     };
     if att::retry_or_appended(&log, session.actor(), &cleanup, &BTreeMap::new())
         .unwrap()
@@ -1116,7 +1122,11 @@ fn copying_roll(lab: &Lab, n: usize) {
     records.extend(pack(vec![cover]).unwrap());
     for changes in records {
         let request = typed::request_id(APPLICATION, to.table.role, &changes).unwrap();
-        let command = Command::Write { request, changes };
+        let command = Command::Write {
+            request,
+            changes,
+            said: None,
+        };
         application::append(&session, &mut store, &command.encode().unwrap()).unwrap();
     }
 }
@@ -1249,6 +1259,7 @@ fn a_sealed_password_rolls_into_a_store_reference() {
     let done = carried_origins([&Command::Write {
         request: [0; 16],
         changes: vec![change],
+        said: None,
     }]);
     let again = restate(
         (&REGISTRY_2, &REGISTRY_3),
@@ -1614,7 +1625,11 @@ fn write_first_raw(lab: &Lab, n: usize, changes: Vec<Change>) {
     let scope = att::REGISTRY.descriptor(bootstrap.trust()).unwrap().scope;
     let mut store = Store::open(&session, &directory.path(scope).unwrap(), scope).unwrap();
     let request = typed::request_id(APPLICATION, att::REGISTRY.table.role, &changes).unwrap();
-    let command = Command::Write { request, changes };
+    let command = Command::Write {
+        request,
+        changes,
+        said: None,
+    };
     application::append(&session, &mut store, &command.encode().unwrap()).unwrap();
 }
 
@@ -2107,7 +2122,11 @@ fn copying_roll_between(lab: &Lab, n: usize, from: &att::Compiled, to: &att::Com
     records.extend(pack(vec![cover]).unwrap());
     for changes in records {
         let request = typed::request_id(APPLICATION, to.table.role, &changes).unwrap();
-        let command = Command::Write { request, changes };
+        let command = Command::Write {
+            request,
+            changes,
+            said: None,
+        };
         application::append(&session, &mut store, &command.encode().unwrap()).unwrap();
     }
 }
@@ -2701,7 +2720,11 @@ fn interrupted_roll(lab: &Lab, n: usize) {
     .unwrap();
     for changes in pack(planned.rows).unwrap() {
         let request = typed::request_id(APPLICATION, to.table.role, &changes).unwrap();
-        let command = Command::Write { request, changes };
+        let command = Command::Write {
+            request,
+            changes,
+            said: None,
+        };
         application::append(&session, &mut store, &command.encode().unwrap()).unwrap();
     }
 }
@@ -2927,6 +2950,7 @@ fn a_list_carries_into_registry_4_as_members_with_their_provenance() {
             .map(|changes| Command::Write {
                 request: [0; 16],
                 changes: changes.clone(),
+                said: None,
             })
             .collect::<Vec<_>>()
             .iter(),

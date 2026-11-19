@@ -126,6 +126,8 @@ ids! {
     DEV_LINK = "base.pkg.dev-link";
     /// A local update pin, `@<program>`, or unreadable pin decisions.
     PIN = "base.pkg.pin";
+    /// A pin-format file unattended work set aside ([`crate::pin::set_aside_files`]), `@<file>`.
+    PIN_SET_ASIDE = "base.pkg.pin-set-aside";
     /// The toolset against the signed index.
     TOOLSET = "base.pkg.toolset";
     /// The toolset on a platform no build is published for.

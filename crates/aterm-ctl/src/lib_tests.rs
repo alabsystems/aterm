@@ -2421,6 +2421,10 @@ fn completions_cover_every_verb_per_shell_and_reject_unknown() {
             .expect("known shell yields a script");
         assert!(ctl.contains(ctl_wiring), "{shell}: {ctl}");
         assert!(front.contains(front_wiring), "{shell}: {front}");
+        assert!(
+            front.contains("prepare-resident"),
+            "{shell} completes the resident verb"
+        );
         for script in [&ctl, &front] {
             for spec in aterm_types::control_verbs::VERBS {
                 assert!(script.contains(spec.name), "{shell}: `{}`", spec.name);

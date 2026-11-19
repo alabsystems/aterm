@@ -2097,6 +2097,9 @@ fn run<S: Read + Write + ?Sized>(
             return Err(error);
         }
     };
+    // The member's later format, where that is why its run refuses this reader: answered
+    // before the run touches its phrase ([`wire::later_refusal`]).
+    let later = std::cell::Cell::new(None);
     let started = (|| {
         let line = RunLine {
             wire: first.b64("request")?,
@@ -2113,6 +2116,7 @@ fn run<S: Read + Write + ?Sized>(
             let store = client::load_records(paths)?;
             let source = client::records_bound(paths, &store)?;
             if !reader.can_take(source) {
+                later.set(reader.later_format(source));
                 return Err(Error::new(reader.refusal(source)));
             }
         }
@@ -2135,7 +2139,11 @@ fn run<S: Read + Write + ?Sized>(
     let (running, member_run, nonce) = match started {
         Ok(started) => started,
         Err(error) => {
-            let _ = wire::write_line(stream, &wire::refusal(&error.to_string()));
+            let line = match later.get() {
+                Some(format) => wire::later_refusal(&error.to_string(), format),
+                None => wire::refusal(&error.to_string()),
+            };
+            let _ = wire::write_line(stream, &line);
             return Err(error);
         }
     };
@@ -2251,6 +2259,9 @@ fn prove<S: Read + Write + ?Sized>(
     greeted: &super::joiner::Greeting,
     proof: Proof<'_>,
 ) -> Result<()> {
+    // The member's later format, where that is why it refuses this proof before possession
+    // ([`later_refused`]).
+    let later = std::cell::Cell::new(None);
     let ended = (|| {
         let asked = ProveLine {
             wire: first.b64("request")?,
@@ -2293,6 +2304,8 @@ fn prove<S: Read + Write + ?Sized>(
         // so while it has sent nothing a member could sign on, so the next member and its plain ask
         // may follow. The desk's lock is not held: this reads the vault's state.
         if let Some(why) = (proof.refuses)(&proving) {
+            let paths = desk.lock_or_recover().local.paths.clone();
+            later.set(later_refused(paths.as_ref(), reader, &why));
             return Err(Error::new(why));
         }
         if first.get("authority").is_ok() {
@@ -2302,7 +2315,7 @@ fn prove<S: Read + Write + ?Sized>(
                 .ok_or_else(|| Error::new("this member serves no proof authority witness"))?(
                 &proving,
             )?;
-            if records.len() > crate::membership_log::MAX_RECORDS_STREAM {
+            if records.len() > crate::membership_log::REPLY_CAP {
                 return Err(Error::new("the member's authority exceeds its bound"));
             }
             let message = super::authority::message(&nonce, greeted, proof_line, &records);
@@ -2342,9 +2355,31 @@ fn prove<S: Read + Write + ?Sized>(
         Ok(())
     })();
     if let Err(error) = &ended {
-        let _ = wire::write_line(stream, &wire::refusal(&error.to_string()));
+        let line = match later.get() {
+            Some(format) => wire::later_refusal(&error.to_string(), format),
+            None => wire::refusal(&error.to_string()),
+        };
+        let _ = wire::write_line(stream, &line);
     }
     ended
+}
+
+/// The format of the member at `paths` where `why`, its refusal of a proof before possession
+/// (`client::refuses_before_possession`), is that its membership records are in a later format
+/// than `reader` stated ([`Reader::later_format`], [`Reader::refusal`]): what its `NO` line
+/// then names ([`wire::later_refusal`]), so a Mac whose build reads that format proves itself
+/// once more stating it (`join::prove_first`). The Mac has sent nothing a member could sign
+/// on. `None` for every other refusal, and for a member whose format mark is not stored, which
+/// is asked only whether the mark is there and answers the line it always did.
+fn later_refused(paths: Option<&Paths>, reader: Reader, why: &str) -> Option<u32> {
+    let paths = paths?;
+    if client::records_marked_format(paths).ok()? == crate::crossing::FORMAT_ONE {
+        return None;
+    }
+    let store = client::load_records(paths).ok()?;
+    let source = client::records_bound(paths, &store).ok()?;
+    let format = reader.later_format(source)?;
+    (why == reader.refusal(source)).then_some(format)
 }
 
 fn reader(line: &Line<'_>) -> Result<Reader> {

@@ -189,13 +189,25 @@ fn a_worlds_heartbeat_waits_the_hang_detector_at_each_member() {
         },
         |_| true,
     );
-    let (mut dial, _) = aterm_uds::accept(
-        &silent,
-        aterm_uds::AcceptWait::Until(Instant::now() + HANG),
-        aterm_uds::AcceptedMode::Blocking,
-    )
-    .expect("the heartbeat dials the member");
+    let mut patience = crate::patience::Patience::new(HANG);
+    let mut dial = loop {
+        match aterm_uds::accept(
+            &silent,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
+            Ok((dial, _)) => break dial,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("accept the heartbeat's dial of the member: {e}"),
+        }
+        if let Some(why) = patience.spent() {
+            panic!("the heartbeat never dialled the member: {why}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let share = PERSONS_HEARTBEAT_ROUND / (HEARTBEAT_MEMBERS as u32 + 1);
+    // The claim's own span, not a hang detector: the dial must stay up through a person's share
+    // of the round, so its end is a wall-clock time.
     let held = Instant::now() + share + Duration::from_secs(1);
     let mut hello = [0u8; 4096];
     loop {
@@ -717,8 +729,8 @@ fn spawn_fleet_unset(
 
 /// What `aterm fleet` (`args`), started by [`spawn_fleet`], wrote and how it ended.
 fn fleet_ended(args: &[&str], child: std::process::Child) -> Output {
-    crate::child_output::wait_and_read(child, Instant::now() + HANG)
-        .unwrap_or_else(|| panic!("aterm fleet {args:?} did not exit"))
+    crate::child_output::wait_and_read(child, HANG)
+        .unwrap_or_else(|why| panic!("aterm fleet {args:?} was killed before it exited: {why}"))
 }
 
 fn ctl_in(root: &Path, args: &[&str]) -> Output {
@@ -770,8 +782,8 @@ fn ctl_as(root: &Path, typed: Typed<'_>, stdin: Option<&[u8]>, env: &[(&str, &st
                 );
             }
         }
-        crate::child_output::wait_and_read(child, Instant::now() + HANG)
-            .unwrap_or_else(|| panic!("aterm ctl {typed:?} did not exit"))
+        crate::child_output::wait_and_read(child, HANG)
+            .unwrap_or_else(|why| panic!("aterm ctl {typed:?} was killed before it exited: {why}"))
     })
 }
 
@@ -829,7 +841,7 @@ fn listen_of(root: &Path) -> String {
         .to_owned()
 }
 
-fn fleet_ok(root: &Path, args: &[&str], stdin: Option<&str>) -> String {
+pub(crate) fn fleet_ok(root: &Path, args: &[&str], stdin: Option<&str>) -> String {
     succeeded(args, fleet(root, args, stdin))
 }
 
@@ -1089,6 +1101,7 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
             node: Some(node.to_owned()),
             key,
         };
+        // The product's own read deadline, handed to it as an argument.
         fetch_book(&target, (&secret, None), (Instant::now() + HANG, HANG))
     };
     let other_key = key_of(&other.tmp.join("state"));
@@ -1136,6 +1149,7 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
             key: Some(taker.key()),
             signed: None,
         },
+        // The product's own read deadline, handed to it as an argument.
         Instant::now() + HANG,
     );
     assert!(
@@ -2637,7 +2651,7 @@ fn hold_ends(inst: &Instance, sid: &str) {
     assert!(ended.is_some(), "the remote hold never ended: {last}");
 }
 
-fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
+pub(crate) fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
     driven_pair_with(tags, &[])
 }
 
@@ -2799,8 +2813,12 @@ fn member_git(dir: &Path, args: &[&str]) -> String {
     ])
     .args(args)
     .current_dir(dir);
-    let out = aterm_uds::deadline::output_until(&mut git, Instant::now() + HANG)
-        .unwrap_or_else(|e| panic!("git {args:?} within the hang detector: {e}"));
+    let out = aterm_uds::deadline::output_while_process_progressing(
+        &mut git,
+        HANG,
+        format!("git {args:?}"),
+    )
+    .unwrap_or_else(|e| panic!("git {args:?} within the hang detector: {e}"));
     assert!(out.status.success(), "git {args:?}: {out:?}");
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
@@ -3614,6 +3632,7 @@ fn open_drive_bare(root: &Path, target: &str) -> aterm_net::fleet_member::Driven
         &aterm_net::fleet_member::target_of(peer),
         &Keyring::of(&book),
         (&secret, &me),
+        // The product's own read deadline, handed to it as an argument.
         (Instant::now() + HANG, HANG),
     )
     .unwrap_or_else(|why| panic!("{why}"))

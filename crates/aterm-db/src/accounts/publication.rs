@@ -183,7 +183,10 @@ impl Draft {
     /// predecessor may still be offline, or already acknowledged locally.
     /// Delivery requires its signed operation to remain the sole current value.
     pub fn after(predecessor: &Pending, value: Value) -> Result<Self> {
-        let Command::Write { request, changes } = predecessor.validate()? else {
+        let Command::Write {
+            request, changes, ..
+        } = predecessor.validate()?
+        else {
             return Err(Error::new("publication predecessor needs a put"));
         };
         let [change] = changes.as_slice() else {
@@ -371,7 +374,10 @@ impl Pending {
             return Err(Error::new("publication command exceeds its limit"));
         }
         let command = Command::decode(self.command.as_bytes())?;
-        let Command::Write { request, changes } = &command else {
+        let Command::Write {
+            request, changes, ..
+        } = &command
+        else {
             return Err(Error::new("publication must be a description write"));
         };
         if changes.len() != 1 {

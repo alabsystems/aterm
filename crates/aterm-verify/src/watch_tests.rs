@@ -4,22 +4,22 @@
 use super::*;
 use std::collections::BTreeMap;
 
+/// A CLAIM NAMES ITS CONTROLLER BY EXACT SELECTORS: that it is the follower's, its image and
+/// process, and the node and session it runs in where those are well formed. NEGATIVE CONTROL:
+/// a malformed node or session is left out, never written as given.
 #[test]
-fn a_pending_status_keeps_exact_controller_selectors_when_the_host_is_clipped() {
+fn a_claim_names_its_controller_by_exact_selectors() {
     let node = "1234567890abcdef1234567890abcdef";
     let session = "tqn5r6e0148";
-    let status = pending_status(&"長".repeat(DESCRIPTION_CHARS), Some(node), Some(session));
-    assert_eq!(status.state, "pending");
-    assert!(status.description.contains(&format!("node={node}")));
-    assert!(status.description.contains(&format!("session={session}")));
-    assert_eq!(status.description.chars().count(), DESCRIPTION_CHARS);
-    assert!(status.description.ends_with('…'));
-    assert!(!status.verdict());
+    assert_eq!(
+        controller_identity("abc", 7, Some(node), Some(session)),
+        format!("follower sha256=abc pid=7 node={node} session={session}")
+    );
     for (node, session) in [(None, None), (Some("not a node"), Some("not a session"))] {
-        let status = pending_status("m45", node, session);
-        assert!(!status.description.contains("node="));
-        assert!(!status.description.contains("session="));
-        assert!(status.description.contains("m45"));
+        assert_eq!(
+            controller_identity("abc", 7, node, session),
+            "follower sha256=abc pid=7"
+        );
     }
 }
 
@@ -67,7 +67,10 @@ fn a_planted_signal_is_named_in_the_pass_that_could_not_run() {
         .wait()
         .unwrap();
     let stopped = stopped_sample(status, "planted signal control");
-    assert_eq!(stopped.state, "could-not-run");
+    assert_eq!(
+        stopped.state, "cancelled",
+        "a pass that was stopped did not break"
+    );
     assert!(stopped.rows[0].red_items.is_empty());
     let log = stopped.rows[0].log.clone();
     assert!(
@@ -220,7 +223,7 @@ fn stopping_a_sample_first_allows_its_signal_handler_to_clean_up() {
 }
 
 /// A DECLINED START OR A FAILED TURN IS LOGGED ONCE PER REASON, and a pass that ran leaves no
-/// line here (its verdict is the commit status) and makes the next reason news again.
+/// line here (its verdict is in the journal) and makes the next reason news again.
 #[test]
 fn a_declined_start_is_logged_once_per_reason() {
     let declined = |why: &str| Ok(Start::Declined(why.into()));
@@ -231,25 +234,57 @@ fn a_declined_start_is_logged_once_per_reason() {
     );
     assert_eq!(log_line(&mut last, &declined("judged")), None);
     assert_eq!(
-        log_line(&mut last, &declined("c0ffee has the follower's failure")).as_deref(),
-        Some("verify watch: no pass started: c0ffee has the follower's failure")
+        log_line(&mut last, &declined("c0ffee: red on m9")).as_deref(),
+        Some("verify watch: no pass started: c0ffee: red on m9")
     );
     assert_eq!(log_line(&mut last, &Ok(Start::Judged)), None);
     assert_eq!(
-        log_line(&mut last, &declined("c0ffee has the follower's failure")).as_deref(),
-        Some("verify watch: no pass started: c0ffee has the follower's failure"),
+        log_line(&mut last, &declined("c0ffee: red on m9")).as_deref(),
+        Some("verify watch: no pass started: c0ffee: red on m9"),
         "a pass ran in between, so the reason is news again"
     );
-    // A refusal GitHub repeats at every turn (a token without commit status access) is one
-    // line, not one a minute.
+    // A refusal the journal repeats at every turn is one line, not one a minute.
     assert_eq!(
-        log_line(&mut last, &Err("GitHub 403".into())).as_deref(),
-        Some("verify watch: pass could not run: GitHub 403")
+        log_line(&mut last, &Err("journal away".into())).as_deref(),
+        Some("verify watch: pass could not run: journal away")
     );
-    assert_eq!(log_line(&mut last, &Err("GitHub 403".into())), None);
+    assert_eq!(log_line(&mut last, &Err("journal away".into())), None);
     assert_eq!(
-        log_line(&mut last, &Err("GitHub away".into())).as_deref(),
-        Some("verify watch: pass could not run: GitHub away")
+        log_line(&mut last, &Err("journal back".into())).as_deref(),
+        Some("verify watch: pass could not run: journal back")
+    );
+}
+
+/// WHAT HOLDS A TIP IS SAID IN WORDS THAT DO NOT CHANGE FROM TURN TO TURN, so [`log_line`]
+/// writes it once: a verdict, a claim with its lease's end, this Mac's own attempt that ended
+/// with none and the time it rests to. NEGATIVE CONTROL: a reason counting seconds from now
+/// would differ at each turn.
+#[test]
+fn a_declined_start_says_what_holds_the_tip() {
+    let mut held = filed("c", "judging", None);
+    held.lease_until = 2200;
+    assert_eq!(
+        declined("tip", &held),
+        "tip: judging on m9, its lease to 2200"
+    );
+    held.state = "red".into();
+    held.rows = red_sample("deadline::tests::a")
+        .rows
+        .iter()
+        .map(journal_row)
+        .collect();
+    assert_eq!(
+        declined("tip", &held),
+        "tip: red on m9: 1 red: aterm-uds --lib deadline::tests::a"
+    );
+    held.state = "could-not-run".into();
+    held.updated = 200;
+    assert_eq!(
+        declined("tip", &held),
+        format!(
+            "tip: this Mac's attempt ended could-not-run at 200; it is not claimed again before {}",
+            200 + judged::RETRY_AFTER
+        )
     );
 }
 
@@ -260,6 +295,7 @@ fn opts(workspace: PathBuf, once: bool) -> Options {
         branch: "main".into(),
         once,
         interval: Duration::from_secs(60),
+        repair: false,
         repair_cwd: Some(PathBuf::from("/")),
     }
 }
@@ -502,15 +538,10 @@ fn signal_provenance_survives_watch_messages_and_the_tail_limit() {
     assert!(!control.log.contains("sender_pid"));
 }
 
-/// A scripted world: statuses by commit (newest first), the commits whose read fails, the
-/// statuses posted, the workers started with where each stands, and those retired.
+/// A scripted world: the workers started with where each stands, those asked after and those
+/// retired, and what a one-shot caller was handed.
 #[derive(Default)]
 struct Scripted {
-    statuses: BTreeMap<String, Vec<Status>>,
-    unreadable: Vec<String>,
-    posted: Vec<(String, Status)>,
-    post_attempts: usize,
-    post_error: Option<String>,
     caller_write_error: Option<String>,
     caller_repairs: Vec<String>,
     spawned: Vec<String>,
@@ -520,26 +551,6 @@ struct Scripted {
 }
 
 impl World for Scripted {
-    fn statuses(&mut self, commit: &str) -> Result<Vec<Status>, String> {
-        if self.unreadable.iter().any(|c| c == commit) {
-            return Err("GitHub answered 502".into());
-        }
-        Ok(self.statuses.get(commit).cloned().unwrap_or_default())
-    }
-
-    fn post(&mut self, commit: &str, status: &Status) -> Result<(), String> {
-        self.post_attempts += 1;
-        if let Some(why) = &self.post_error {
-            return Err(why.clone());
-        }
-        self.statuses
-            .entry(commit.to_owned())
-            .or_default()
-            .insert(0, status.clone());
-        self.posted.push((commit.to_owned(), status.clone()));
-        Ok(())
-    }
-
     fn caller_repair(&mut self, context: &str) -> Result<(), String> {
         self.caller_repairs.push(context.to_owned());
         self.caller_write_error.clone().map_or(Ok(()), Err)
@@ -562,6 +573,59 @@ impl World for Scripted {
     }
 }
 
+/// The follower's record on `commit`: `state`, carrying `repair`'s custody.
+fn filed(commit: &str, state: &str, repair: Option<&Repair>) -> Record {
+    let mut record = Record {
+        commit: commit.into(),
+        tree: format!("tree-of-{commit}"),
+        host: "m9".into(),
+        verifier: String::new(),
+        controller: String::new(),
+        inputs: String::new(),
+        token: format!("token-of-{commit}"),
+        state: state.into(),
+        cause: String::new(),
+        started: 100,
+        updated: 100,
+        lease_until: 0,
+        judge: judged::FOLLOWER.into(),
+        repair: String::new(),
+        repair_assignment: String::new(),
+        repair_started: 0,
+        rows: Vec::new(),
+    };
+    if let Some(repair) = repair {
+        repair.put(&mut record);
+    }
+    record
+}
+
+const ROOT: &str = "/follower/checkout";
+
+/// [`conclude`] `sample` into a fresh claim of `tip`, the persistent follower's way.
+fn persistent(
+    world: &mut Scripted,
+    worker: &mut Option<Repair>,
+    tip: &str,
+    before: &[Record],
+    complete: bool,
+    sample: &Sample,
+) -> Record {
+    let mut record = filed(tip, "judging", None);
+    let earlier = walk(before, complete);
+    conclude(
+        world,
+        &mut record,
+        &earlier,
+        sample,
+        RepairMode::Persistent(worker),
+        Path::new(ROOT),
+        1000,
+    )
+    .unwrap();
+    record
+}
+
 /// A WORKER'S PLACE IS READ FROM ITS TASK RECORD: it holds the repair place while it works or is
 /// stalled where it resumes by itself, keeps its reds once it failed or is stalled where only a
 /// mark moves it, and has ended otherwise. NEGATIVE CONTROL: a stall at sign-in is no work.
@@ -571,7 +635,7 @@ fn a_worker_holds_the_repair_place_only_while_it_works() {
     assert_eq!(task_state(&record("state=working")), Worker::Working);
     assert_eq!(
         task_state(&record("state=stalled why=startup")),
-        Worker::Working
+        Worker::Starting
     );
     assert_eq!(
         task_state(&record("state=stalled why=held")),
@@ -626,788 +690,6 @@ fn red_sample(test: &str) -> Sample {
     }
 }
 
-/// A RED PASS POSTS A FAILURE THAT NAMES THE RED TEST AND STARTS AT MOST ONE REPAIR WORKER: a
-/// later red pass while that worker works starts none and names the same worker, a restarted
-/// follower finds it in the failure it posted, and only once it has ended does a red start
-/// another.
-#[test]
-fn a_red_pass_posts_a_failure_naming_the_red_test_and_starts_at_most_one_repair_worker() {
-    let mut world = Scripted::default();
-    world.statuses.insert(
-        "green".into(),
-        vec![Status::new("success", "pass on m9: inputs tree".into())],
-    );
-    let root = Path::new("/follower/checkout");
-    let mut worker = None;
-    let first = conclude(
-        &mut world,
-        "red1",
-        &["landed".into(), "green".into(), "older".into()],
-        true,
-        &red_sample("deadline::tests::a_child_ends"),
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    assert_eq!(first.state, "failure");
-    assert_eq!(world.spawned.len(), 1, "a red starts one repair worker");
-    let sid = worker.as_ref().expect("the worker").sid.clone();
-    assert_eq!(
-        first.repair().unwrap().assignment,
-        Some(assignment(
-            Some("green"),
-            &red_sample("deadline::tests::a_child_ends").rows
-        ))
-    );
-    assert!(
-        first.description.contains(&format!("repair {sid}")),
-        "{}",
-        first.description
-    );
-    assert!(first.description.chars().count() <= DESCRIPTION_CHARS);
-    let task = &world.spawned[0];
-    assert!(task.contains("red1") && task.contains("green"), "{task}");
-    assert!(
-        task.contains("aterm-uds --lib deadline::tests::a_child_ends"),
-        "{task}"
-    );
-    assert!(
-        task.contains("git bisect start --first-parent red1 green"),
-        "{task}"
-    );
-    assert!(task.contains("/follower/checkout"), "{task}");
-    assert!(task.contains("Could not finish"), "{task}");
-    assert!(
-        !world.statuses.contains_key("landed"),
-        "a commit the follower did not judge gets no status"
-    );
-
-    // A later red while that worker works: none started, the same one named.
-    let second = conclude(
-        &mut world,
-        "red2",
-        &["red1".into(), "landed".into(), "green".into()],
-        true,
-        &red_sample("deadline::tests::another"),
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    assert_eq!(world.spawned.len(), 1, "a working repair worker is the one");
-    assert!(second.description.contains(&format!("repair {sid}")));
-
-    // A follower started again knows no worker; the failure it posted names the one at work.
-    let mut restarted = None;
-    conclude(
-        &mut world,
-        "red3",
-        &[
-            "red2".into(),
-            "red1".into(),
-            "landed".into(),
-            "green".into(),
-        ],
-        true,
-        &red_sample("deadline::tests::another"),
-        RepairMode::Persistent(&mut restarted),
-        root,
-    )
-    .unwrap();
-    assert_eq!(world.spawned.len(), 1, "the restarted follower starts none");
-    assert_eq!(
-        restarted.as_ref().map(|repair| repair.sid.as_str()),
-        Some(sid.as_str())
-    );
-    let task_of_tip = repair_task(
-        "red3",
-        &walk(
-            &mut world,
-            &["red2".into(), "red1".into(), "green".into()],
-            true,
-        ),
-        &red_sample("x").rows,
-        root,
-    );
-    assert!(
-        task_of_tip.contains("git bisect start --first-parent red3 green"),
-        "the bisect runs from the tip these reds were seen on to the one known green: \
-         {task_of_tip}"
-    );
-    assert!(task_of_tip.contains("oldest red tip since then is red1"));
-    let no_green = repair_task(
-        "red3",
-        &walk(&mut world, &["red2".into(), "red1".into()], true),
-        &red_sample("x").rows,
-        root,
-    );
-    assert!(
-        no_green.contains("`git bisect start --first-parent red3`,"),
-        "no tip is taken as good without a green: {no_green}"
-    );
-
-    // Negative control: once that worker has ended, the next red retires it and starts another.
-    world.workers.insert(sid.clone(), Worker::Ended);
-    conclude(
-        &mut world,
-        "red4",
-        &["red3".into(), "green".into()],
-        true,
-        &red_sample("deadline::tests::another"),
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    assert_eq!(world.spawned.len(), 2);
-    assert_ne!(
-        worker.as_ref().map(|repair| repair.sid.as_str()),
-        Some(sid.as_str())
-    );
-    assert_eq!(world.retired, [sid]);
-}
-
-/// A WORKER THAT COULD NOT FINISH KEEPS THE SAME REDS: the next red pass with those reds names it
-/// and starts none, since a fresh worker would meet what stopped it; reds that changed retire it
-/// and start another.
-#[test]
-fn a_worker_that_could_not_finish_keeps_the_same_reds_and_new_reds_start_another() {
-    let mut world = Scripted::default();
-    world.statuses.insert(
-        "green".into(),
-        vec![Status::new("success", "pass on m9: inputs tree".into())],
-    );
-    let root = Path::new("/follower/checkout");
-    let mut worker = None;
-    conclude(
-        &mut world,
-        "red1",
-        &["green".into()],
-        true,
-        &red_sample("deadline::tests::a_child_ends"),
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    let sid = worker.as_ref().unwrap().sid.clone();
-    world.workers.insert(sid.clone(), Worker::Failed);
-    let mut restarted = None;
-    let same = conclude(
-        &mut world,
-        "red2",
-        &["red1".into(), "green".into()],
-        true,
-        &red_sample("deadline::tests::a_child_ends"),
-        RepairMode::Persistent(&mut restarted),
-        root,
-    )
-    .unwrap();
-    assert_eq!(
-        world.spawned.len(),
-        1,
-        "the same reds start no second worker"
-    );
-    assert!(same.description.contains(&format!("repair {sid}")));
-    assert!(world.retired.is_empty());
-
-    let other = conclude(
-        &mut world,
-        "red3",
-        &["red2".into(), "red1".into(), "green".into()],
-        true,
-        &red_sample("deadline::tests::another"),
-        RepairMode::Persistent(&mut restarted),
-        root,
-    )
-    .unwrap();
-    assert_eq!(world.spawned.len(), 2, "new reds start a worker");
-    assert_eq!(world.retired, std::slice::from_ref(&sid));
-    assert!(!other.description.contains(&sid));
-}
-
-/// A WALK THAT COULD NOT READ BACK TO A WORKER OR A GREEN STARTS NONE: a worker it did not read
-/// may still work, and two at once is what one place forbids. NEGATIVE CONTROL: the same red
-/// with every status read starts one.
-#[test]
-fn an_unread_walk_starts_no_second_worker() {
-    let mut world = Scripted::default();
-    world.unreadable.push("red1".into());
-    let root = Path::new("/follower/checkout");
-    let mut worker = None;
-    let posted = conclude(
-        &mut world,
-        "red2",
-        &["red1".into(), "green".into()],
-        true,
-        &red_sample("deadline::tests::a_child_ends"),
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    assert_eq!(posted.state, "failure");
-    assert!(world.spawned.is_empty());
-    assert!(!posted.description.contains("repair"));
-    world.unreadable.clear();
-    conclude(
-        &mut world,
-        "red2",
-        &["red1".into(), "green".into()],
-        true,
-        &red_sample("deadline::tests::a_child_ends"),
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    assert_eq!(world.spawned.len(), 1);
-}
-
-#[test]
-fn a_one_shot_red_returns_context_without_managing_existing_workers() {
-    let root = Path::new("/follower/checkout");
-    let options = opts(root.to_owned(), true);
-    let sample = red_sample("deadline::tests::caller_failure");
-    let red = reds(&sample.rows).remove(0);
-    for state in [Worker::Working, Worker::Failed, Worker::Ended] {
-        for unread in [false, true] {
-            let sid = "t0000000001";
-            let mut world = Scripted::default();
-            world.statuses.insert(
-                "old".into(),
-                vec![Status::new(
-                    "failure",
-                    format!("1 red, repair {sid}: older"),
-                )],
-            );
-            world
-                .statuses
-                .insert("green".into(), vec![Status::new("success", "pass".into())]);
-            world.workers.insert(sid.into(), state);
-            if unread {
-                world.unreadable.push("old".into());
-            }
-            let mut worker = Some(Repair {
-                sid: sid.to_owned(),
-                assignment: None,
-            });
-            let posted = conclude(
-                &mut world,
-                "caller-tip",
-                &["old".into(), "green".into()],
-                true,
-                &sample,
-                options.repair_mode(&mut worker),
-                root,
-            )
-            .unwrap();
-            assert_eq!(posted.state, "failure");
-            assert_eq!(posted.worker(), None, "the caller assigns no worker");
-            assert_eq!(worker.as_ref().map(|repair| repair.sid.as_str()), Some(sid));
-            assert_eq!(world.caller_repairs.len(), 1);
-            let context = &world.caller_repairs[0];
-            for field in ["caller-tip", red.as_str(), root.to_str().unwrap()] {
-                assert!(context.contains(field), "missing {field:?}");
-            }
-            if !unread {
-                assert!(context.contains("green"));
-            }
-            assert!(world.worker_reads.is_empty());
-            assert!(world.retired.is_empty());
-            assert!(world.spawned.is_empty());
-            assert_eq!(world.posted, [("caller-tip".into(), posted)]);
-        }
-    }
-}
-
-#[test]
-fn a_caller_failure_preserves_older_worker_custody_and_its_original_reds() {
-    let root = Path::new("/follower/checkout");
-    for unread in [false, true] {
-        for state in [Worker::Working, Worker::Failed] {
-            for same_red in [false, true] {
-                let mut world = Scripted::default();
-                world
-                    .statuses
-                    .insert("green".into(), vec![Status::new("success", "pass".into())]);
-                let mut worker = None;
-                let original = red_sample("deadline::tests::original");
-                conclude(
-                    &mut world,
-                    "original",
-                    &["green".into()],
-                    true,
-                    &original,
-                    RepairMode::Persistent(&mut worker),
-                    root,
-                )
-                .unwrap();
-                let sid = worker.as_ref().unwrap().sid.clone();
-                world.workers.insert(sid.clone(), state);
-                if unread {
-                    world.unreadable.push("original".into());
-                }
-                let sample = if same_red {
-                    original
-                } else {
-                    red_sample("deadline::tests::other")
-                };
-                conclude(
-                    &mut world,
-                    "caller",
-                    &["original".into(), "green".into()],
-                    true,
-                    &sample,
-                    RepairMode::Caller,
-                    root,
-                )
-                .unwrap();
-                assert_eq!(world.spawned.len(), 1);
-                assert!(world.retired.is_empty());
-                assert!(world.worker_reads.is_empty());
-                world.unreadable.clear();
-                let mut restarted = None;
-                let posted = conclude(
-                    &mut world,
-                    "next",
-                    &["caller".into(), "original".into(), "green".into()],
-                    true,
-                    &sample,
-                    RepairMode::Persistent(&mut restarted),
-                    root,
-                )
-                .unwrap();
-                let replaced = state == Worker::Failed && !same_red;
-                assert_eq!(world.spawned.len(), if replaced { 2 } else { 1 });
-                assert_eq!(
-                    world.retired,
-                    if replaced { vec![sid.clone()] } else { vec![] }
-                );
-                assert_eq!(world.worker_reads.as_slice(), std::slice::from_ref(&sid));
-                if replaced {
-                    assert_ne!(posted.worker(), Some(sid.as_str()));
-                } else {
-                    assert_eq!(posted.worker(), Some(sid.as_str()));
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn caller_context_is_bounded_and_survives_a_status_write_failure() {
-    let root = Path::new("/follower/checkout");
-    let mut world = Scripted {
-        post_error: Some("GitHub answered 502".into()),
-        ..Scripted::default()
-    };
-    let mut sample = red_sample("deadline::tests::multibyte_failure");
-    let row = sample
-        .rows
-        .iter_mut()
-        .find(|row| row.outcome == "red")
-        .unwrap();
-    row.red_items.push("𝄞".repeat(100_000));
-    let error = conclude(
-        &mut world,
-        "red-tip",
-        &[],
-        true,
-        &sample,
-        RepairMode::Caller,
-        root,
-    )
-    .unwrap_err();
-    assert_eq!(error, "GitHub answered 502");
-    assert_eq!(world.caller_repairs.len(), 1);
-    let context = &world.caller_repairs[0];
-    assert!(context.len() <= 64 * 1024);
-    for field in [
-        "red-tip",
-        "deadline::tests::multibyte_failure",
-        root.to_str().unwrap(),
-        "git bisect",
-        "targo --unverified verify land",
-    ] {
-        assert!(context.contains(field), "missing {field:?}");
-    }
-    assert!(!context.contains("Could not finish:") && !context.contains("FIX <"));
-    assert!(world.posted.is_empty());
-    assert!(world.worker_reads.is_empty());
-    assert!(world.retired.is_empty());
-    assert!(world.spawned.is_empty());
-}
-
-#[test]
-fn caller_output_failure_never_prevents_the_final_status_attempt() {
-    struct Closed {
-        deferred: bool,
-    }
-    impl std::io::Write for Closed {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.deferred {
-                Ok(bytes.len())
-            } else {
-                Err(std::io::ErrorKind::BrokenPipe.into())
-            }
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-    }
-    for deferred in [false, true] {
-        assert_eq!(
-            write_caller_repair(&mut Closed { deferred }, "repair context")
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::BrokenPipe
-        );
-    }
-    for post_error in [None, Some("GitHub refused the status".to_owned())] {
-        let mut world = Scripted {
-            post_error: post_error.clone(),
-            caller_write_error: Some("closed pipe".into()),
-            ..Scripted::default()
-        };
-        let error = conclude(
-            &mut world,
-            "tip",
-            &[],
-            true,
-            &red_sample("deadline::tests::failed"),
-            RepairMode::Caller,
-            Path::new("/follower/checkout"),
-        )
-        .unwrap_err();
-        assert!(error.contains("closed pipe"));
-        match post_error {
-            Some(post) => assert!(
-                error.starts_with(&post),
-                "status error stays primary: {error}"
-            ),
-            None => {
-                assert_eq!(world.posted.len(), 1);
-                assert_eq!(world.posted[0].1.state, "failure");
-                assert!(world.posted[0].1.verdict());
-            }
-        }
-        assert_eq!(world.caller_repairs.len(), 1);
-        assert_eq!(world.post_attempts, 1);
-        assert!(world.worker_reads.is_empty());
-        assert!(world.spawned.is_empty());
-        assert!(world.retired.is_empty());
-    }
-}
-
-#[test]
-fn a_working_workers_assignment_survives_new_reds_and_a_failed_first_post() {
-    let root = Path::new("/follower/checkout");
-    for first_post_fails in [false, true] {
-        for return_to_original in [false, true] {
-            let mut world = Scripted::default();
-            world
-                .statuses
-                .insert("green".into(), vec![Status::new("success", "pass".into())]);
-            if first_post_fails {
-                world.post_error = Some("GitHub refused A".into());
-            }
-            let a = red_sample("deadline::tests::a");
-            let b = red_sample("deadline::tests::b");
-            let mut worker = None;
-            let first = conclude(
-                &mut world,
-                "a",
-                &["green".into()],
-                true,
-                &a,
-                RepairMode::Persistent(&mut worker),
-                root,
-            );
-            assert_eq!(first.is_err(), first_post_fails);
-            let original = worker.clone().unwrap();
-            assert_eq!(
-                original.assignment,
-                Some(assignment(Some("green"), &a.rows))
-            );
-            world.post_error = None;
-            let working_b = conclude(
-                &mut world,
-                "working-b",
-                &["a".into(), "green".into()],
-                true,
-                &b,
-                RepairMode::Persistent(&mut worker),
-                root,
-            )
-            .unwrap();
-            assert_eq!(working_b.repair(), Some(original.clone()));
-            assert_eq!(world.spawned.len(), 1);
-            world.workers.insert(original.sid.clone(), Worker::Failed);
-            let mut restarted = None;
-            let final_sample = if return_to_original { &a } else { &b };
-            conclude(
-                &mut world,
-                "next",
-                &["working-b".into(), "a".into(), "green".into()],
-                true,
-                final_sample,
-                RepairMode::Persistent(&mut restarted),
-                root,
-            )
-            .unwrap();
-            assert_eq!(world.spawned.len(), if return_to_original { 1 } else { 2 });
-            if return_to_original {
-                assert_eq!(restarted, Some(original));
-                assert!(world.retired.is_empty());
-            } else {
-                assert_eq!(world.retired, [original.sid]);
-                assert_eq!(
-                    restarted.unwrap().assignment,
-                    Some(assignment(Some("green"), &b.rows))
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn a_failed_repair_gets_a_new_assignment_after_a_green_frontier() {
-    let mut world = Scripted::default();
-    let root = Path::new("/follower/checkout");
-    world.statuses.insert(
-        "old-green".into(),
-        vec![Status::new("success", "pass".into())],
-    );
-    let red = red_sample("deadline::tests::a");
-    let green = Sample {
-        state: "pass".into(),
-        rows: vec![row("tree", Some(0), "ok")],
-    };
-    let mut worker = None;
-    conclude(
-        &mut world,
-        "old-red",
-        &["old-green".into()],
-        true,
-        &red,
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    let original = worker.clone().unwrap();
-    world.workers.insert(original.sid.clone(), Worker::Failed);
-    conclude(
-        &mut world,
-        "new-green",
-        &["old-red".into(), "old-green".into()],
-        true,
-        &green,
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    assert_eq!(worker, Some(original.clone()));
-    conclude(
-        &mut world,
-        "new-red",
-        &["new-green".into(), "old-red".into(), "old-green".into()],
-        true,
-        &red,
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    assert_eq!(world.spawned.len(), 2);
-    assert_eq!(world.retired, [original.sid]);
-    assert_ne!(worker.unwrap().assignment, original.assignment);
-}
-
-#[test]
-fn a_working_repair_crosses_a_green_frontier_until_it_fails_even_after_restart() {
-    for restart in [false, true] {
-        let mut world = Scripted::default();
-        let root = Path::new("/follower/checkout");
-        world.statuses.insert(
-            "old-green".into(),
-            vec![Status::new("success", "pass".into())],
-        );
-        let red = red_sample("deadline::tests::a");
-        let green = Sample {
-            state: "pass".into(),
-            rows: vec![row("tree", Some(0), "ok")],
-        };
-        let mut worker = None;
-        conclude(
-            &mut world,
-            "old-red",
-            &["old-green".into()],
-            true,
-            &red,
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        let original = worker.clone().unwrap();
-        conclude(
-            &mut world,
-            "new-green",
-            &["old-red".into(), "old-green".into()],
-            true,
-            &green,
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        let held = conclude(
-            &mut world,
-            "working-red",
-            &["new-green".into(), "old-red".into(), "old-green".into()],
-            true,
-            &red,
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        assert_eq!(held.repair(), Some(original.clone()));
-        assert_eq!(world.spawned.len(), 1);
-        assert!(world.retired.is_empty());
-        world.workers.insert(original.sid.clone(), Worker::Failed);
-        if restart {
-            worker = None;
-        }
-        conclude(
-            &mut world,
-            "failed-red",
-            &[
-                "working-red".into(),
-                "new-green".into(),
-                "old-red".into(),
-                "old-green".into(),
-            ],
-            true,
-            &red,
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        assert_eq!(world.spawned.len(), 2, "restart={restart}");
-        assert_eq!(world.retired, [original.sid]);
-        assert_ne!(worker.unwrap().assignment, original.assignment);
-    }
-}
-
-#[test]
-fn a_green_pass_carries_repair_custody_across_an_immediate_restart() {
-    for caller_green in [false, true] {
-        for state in [Worker::Working, Worker::Failed] {
-            let mut world = Scripted::default();
-            let root = Path::new("/follower/checkout");
-            world.statuses.insert(
-                "old-green".into(),
-                vec![Status::new("success", "pass".into())],
-            );
-            let red = red_sample("deadline::tests::a");
-            let green = Sample {
-                state: "pass".into(),
-                rows: vec![row("tree", Some(0), "ok")],
-            };
-            let mut worker = None;
-            conclude(
-                &mut world,
-                "old-red",
-                &["old-green".into()],
-                true,
-                &red,
-                RepairMode::Persistent(&mut worker),
-                root,
-            )
-            .unwrap();
-            let original = worker.clone().unwrap();
-            world.workers.insert(original.sid.clone(), state);
-            let mode = if caller_green {
-                RepairMode::Caller
-            } else {
-                RepairMode::Persistent(&mut worker)
-            };
-            let passed = conclude(
-                &mut world,
-                "new-green",
-                &["old-red".into(), "old-green".into()],
-                true,
-                &green,
-                mode,
-                root,
-            )
-            .unwrap();
-            assert_eq!(passed.state, "success");
-            assert!(world.worker_reads.is_empty());
-            assert!(world.retired.is_empty());
-            assert_eq!(world.spawned.len(), 1);
-            let mut restarted = None;
-            conclude(
-                &mut world,
-                "new-red",
-                &["new-green".into(), "old-red".into(), "old-green".into()],
-                true,
-                &red,
-                RepairMode::Persistent(&mut restarted),
-                root,
-            )
-            .unwrap();
-            assert_eq!(
-                world.spawned.len(),
-                if state == Worker::Working { 1 } else { 2 },
-                "caller_green={caller_green}, state={state:?}"
-            );
-            assert_eq!(passed.repair(), Some(original.clone()));
-            if state == Worker::Working {
-                assert_eq!(restarted, Some(original));
-                assert!(world.retired.is_empty());
-            } else {
-                assert_eq!(world.retired, [original.sid]);
-                assert_ne!(restarted.unwrap().assignment, original.assignment);
-            }
-        }
-    }
-}
-
-#[test]
-fn a_failed_repair_keeps_its_assignment_at_the_same_green_frontier_after_restart() {
-    for restart in [false, true] {
-        let mut world = Scripted::default();
-        let root = Path::new("/follower/checkout");
-        world
-            .statuses
-            .insert("green".into(), vec![Status::new("success", "pass".into())]);
-        let red = red_sample("deadline::tests::a");
-        let mut worker = None;
-        conclude(
-            &mut world,
-            "old-red",
-            &["green".into()],
-            true,
-            &red,
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        let original = worker.clone().unwrap();
-        world.workers.insert(original.sid.clone(), Worker::Failed);
-        if restart {
-            worker = None;
-        }
-        conclude(
-            &mut world,
-            "new-red",
-            &["old-red".into(), "green".into()],
-            true,
-            &red,
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        assert_eq!(world.spawned.len(), 1);
-        assert!(world.retired.is_empty());
-        assert_eq!(worker, Some(original));
-    }
-}
-
 #[test]
 fn worker_assignment_hashes_canonical_full_row_and_red_keys() {
     let mut a = row("tree", Some(1), "failed");
@@ -1447,279 +729,6 @@ fn worker_assignment_hashes_canonical_full_row_and_red_keys() {
     assert_ne!(assignment(None, &[left]), assignment(None, &[right]));
 }
 
-#[test]
-fn repair_headers_preserve_custody_and_never_infer_assignment_from_prose() {
-    let hash = assignment(None, &red_sample("deadline::tests::a").rows);
-    for sid in ["tqn5r6e0148", "s-3f7db22fd790a94538cd"] {
-        for state in ["failure", "success"] {
-            let status = Status::new(
-                state,
-                format!("repair {sid} assigned={hash}; {}", "detail".repeat(100)),
-            );
-            assert!(status.verdict());
-            assert_eq!(status.description.chars().count(), DESCRIPTION_CHARS);
-            assert_eq!(
-                status.repair(),
-                Some(Repair {
-                    sid: sid.into(),
-                    assignment: Some(hash.clone())
-                })
-            );
-            for malformed in [
-                "?".to_owned(),
-                hash[..40].into(),
-                hash.to_uppercase(),
-                format!("{hash}x"),
-            ] {
-                let status = Status::new(state, format!("repair {sid} assigned={malformed}; red"));
-                assert_eq!(
-                    status.repair(),
-                    Some(Repair {
-                        sid: sid.into(),
-                        assignment: None
-                    })
-                );
-            }
-            let truncated = Status::new(state, format!("repair {sid} assigned={hash}"));
-            assert_eq!(truncated.repair().unwrap().assignment, None);
-            for fake in [
-                format!("1 red: test repair {sid} assigned={hash}; x"),
-                format!("x red, repair {sid}: x"),
-            ] {
-                assert_eq!(Status::new(state, fake).repair(), None);
-            }
-        }
-        let legacy = Status::new("failure", format!("1 red, repair {sid}: old"));
-        assert_eq!(legacy.repair().unwrap().assignment, None);
-        let legacy_success = Status::new("success", format!("1 red, repair {sid}: old"));
-        assert_eq!(legacy_success.repair(), None);
-        for state in ["pending", "error"] {
-            assert_eq!(
-                Status::new(state, format!("repair {sid} assigned={hash}; text")).repair(),
-                None
-            );
-        }
-    }
-}
-
-#[test]
-fn an_unknown_worker_assignment_holds_custody_without_claiming_it_tried_new_reds() {
-    let root = Path::new("/follower/checkout");
-    let sid = "t0000000001";
-    for old in [
-        format!("1 red, repair {sid}: old"),
-        format!("repair {sid} assigned=broken; old"),
-    ] {
-        let mut world = Scripted::default();
-        world
-            .statuses
-            .insert("old".into(), vec![Status::new("failure", old)]);
-        world.workers.insert(sid.into(), Worker::Failed);
-        let mut worker = None;
-        let posted = conclude(
-            &mut world,
-            "new",
-            &["old".into()],
-            true,
-            &red_sample("deadline::tests::new"),
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        assert_eq!(
-            posted.repair(),
-            Some(Repair {
-                sid: sid.into(),
-                assignment: None
-            })
-        );
-        assert!(world.spawned.is_empty());
-        assert!(world.retired.is_empty());
-    }
-}
-
-#[test]
-fn an_unknown_failure_header_cannot_establish_worker_free_history() {
-    let root = Path::new("/follower/checkout");
-    let sid = "t0000000001";
-    for description in [
-        "",
-        "unrecognized failure",
-        "repair invalid assigned=broken; 1 red",
-        "1 red, repair invalid: test",
-    ] {
-        let mut world = Scripted::default();
-        world.workers.insert(sid.into(), Worker::Working);
-        world.statuses.insert(
-            "older".into(),
-            vec![Status::new("failure", format!("1 red, repair {sid}: old"))],
-        );
-        world.statuses.insert(
-            "bad".into(),
-            vec![Status::new("failure", description.into())],
-        );
-        let sample = red_sample("deadline::tests::new");
-        conclude(
-            &mut world,
-            "caller",
-            &["bad".into(), "older".into()],
-            true,
-            &sample,
-            RepairMode::Caller,
-            root,
-        )
-        .unwrap();
-        assert_eq!(world.caller_repairs.len(), 1);
-        let mut worker = None;
-        let posted = conclude(
-            &mut world,
-            "next",
-            &["caller".into(), "bad".into(), "older".into()],
-            true,
-            &sample,
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        assert_eq!(posted.state, "failure");
-        assert!(world.worker_reads.is_empty());
-        assert!(world.retired.is_empty());
-        assert!(world.spawned.is_empty());
-    }
-    // An anchored caller/no-worker header is evidence, rather than a malformed repair record.
-    let mut world = Scripted::default();
-    world.statuses.insert(
-        "caller".into(),
-        vec![Status::new("failure", "1 red: test".into())],
-    );
-    let mut worker = None;
-    conclude(
-        &mut world,
-        "next",
-        &["caller".into()],
-        true,
-        &red_sample("deadline::tests::new"),
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    assert_eq!(world.spawned.len(), 1);
-}
-
-#[test]
-fn a_bounded_unread_or_shallow_history_cannot_hide_a_live_worker() {
-    let root = Path::new("/follower/checkout");
-    let long = (0..WALK + 2)
-        .map(|n| format!("commit-{n}\n"))
-        .collect::<String>();
-    for answer in [
-        Ok((long, false)),
-        Ok(("tip\nshallow-boundary\n".into(), true)),
-        Err("git rev-list failed".into()),
-    ] {
-        let (before, complete) = first_parent_history(answer);
-        assert!(!complete);
-        assert!(before.len() <= WALK);
-        let mut world = Scripted::default();
-        let sid = "t0000000001";
-        world.workers.insert(sid.into(), Worker::Working);
-        world.statuses.insert(
-            "older".into(),
-            vec![Status::new(
-                "failure",
-                format!("1 red, repair {sid}: original"),
-            )],
-        );
-        let sample = red_sample("deadline::tests::current");
-        conclude(
-            &mut world,
-            "caller",
-            &before,
-            complete,
-            &sample,
-            RepairMode::Caller,
-            root,
-        )
-        .unwrap();
-        assert_eq!(world.caller_repairs.len(), 1);
-        let mut worker = None;
-        let posted = conclude(
-            &mut world,
-            "next",
-            &before,
-            complete,
-            &sample,
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        assert_eq!(posted.state, "failure");
-        assert!(world.worker_reads.is_empty());
-        assert!(world.retired.is_empty());
-        assert!(world.spawned.is_empty());
-        assert_eq!(world.workers.get(sid), Some(&Worker::Working));
-    }
-
-    // A real root, or a fully read chain exactly at the bound, can establish no prior worker.
-    for text in [
-        "root\n".into(),
-        (0..WALK + 1)
-            .map(|n| format!("commit-{n}\n"))
-            .collect::<String>(),
-    ] {
-        let (before, complete) = first_parent_history(Ok((text, false)));
-        assert!(complete);
-        let mut world = Scripted::default();
-        let mut worker = None;
-        conclude(
-            &mut world,
-            "tip",
-            &before,
-            complete,
-            &red_sample("deadline::tests::current"),
-            RepairMode::Persistent(&mut worker),
-            root,
-        )
-        .unwrap();
-        assert_eq!(world.spawned.len(), 1);
-    }
-}
-
-#[test]
-fn one_shot_passes_and_unavailable_checks_keep_their_verdicts_without_repair() {
-    for state in ["pass", "could-not-run"] {
-        let sample = Sample {
-            state: state.into(),
-            rows: vec![row(
-                "tree",
-                Some(if state == "pass" { 0 } else { 3 }),
-                "verdict",
-            )],
-        };
-        let mut world = Scripted::default();
-        let mut worker = None;
-        let posted = conclude(
-            &mut world,
-            "tip",
-            &[],
-            true,
-            &sample,
-            opts(PathBuf::from("/follower/checkout"), true).repair_mode(&mut worker),
-            Path::new("/follower/checkout"),
-        )
-        .unwrap();
-        assert_eq!(
-            posted.state,
-            if state == "pass" { "success" } else { "error" }
-        );
-        assert!(posted.verdict());
-        assert!(world.caller_repairs.is_empty());
-        assert!(world.worker_reads.is_empty());
-        assert!(world.retired.is_empty());
-        assert!(world.spawned.is_empty());
-    }
-}
-
 /// A `verify` ROW THAT EXITED 0 WITH A SKIPPED CHECK COULD NOT RUN: appkit on a console locked
 /// mid-pass is no green. NEGATIVE CONTROL: the same row with the check ok passes.
 #[test]
@@ -1749,139 +758,1006 @@ fn a_verify_row_with_a_skipped_check_could_not_run() {
     assert_eq!(passed.outcome, "pass");
 }
 
+/// A RED PASS FILES A RED THAT NAMES THE RED TEST AND STARTS AT MOST ONE REPAIR WORKER: a later
+/// red pass while that worker works starts none and names the same worker, a restarted
+/// follower finds it in the red it filed, and only once it has ended does a red start another,
+/// the ended one retired. The worker is told to bisect between the red tip and the green one
+/// over every parent. NEGATIVE CONTROL: the green before the reds carries no worker and starts
+/// none.
 #[test]
-fn a_green_pass_and_a_pass_that_could_not_run_post_their_verdicts_and_start_no_worker() {
+fn a_red_pass_files_a_red_naming_the_test_and_starts_at_most_one_repair_worker() {
     let mut world = Scripted::default();
     let mut worker = None;
-    let root = Path::new("/follower/checkout");
-    let green = Sample {
+    let sample = red_sample("deadline::tests::a");
+    let green = filed("green", "pass", None);
+    let first = persistent(
+        &mut world,
+        &mut worker,
+        "r1",
+        &[green.clone()],
+        true,
+        &sample,
+    );
+    assert_eq!(first.state, "red");
+    assert_eq!(first.reds(), ["aterm-uds --lib deadline::tests::a"]);
+    assert_eq!(
+        first.rows.len(),
+        3,
+        "every row is filed, the green ones too"
+    );
+    assert_eq!(first.repair, "t0000000001");
+    assert_eq!(first.repair_started, 1000);
+    assert_eq!(
+        first.repair_assignment,
+        assignment(Some("green"), &sample.rows)
+    );
+    assert_eq!(world.spawned.len(), 1);
+    assert!(world.spawned[0].contains("`git bisect start r1 green`"));
+    assert!(world.spawned[0].contains("- tree: aterm-uds --lib deadline::tests::a"));
+    assert!(world.spawned[0].contains("Could not finish: <why>"));
+    assert!(!world.spawned[0].contains("bisect start --first-parent"));
+
+    let before = [first.clone(), green.clone()];
+    let second = persistent(&mut world, &mut worker, "r2", &before, true, &sample);
+    assert_eq!(world.spawned.len(), 1, "the worker still works");
+    assert_eq!(
+        (second.repair.as_str(), second.repair_started),
+        ("t0000000001", 1000)
+    );
+
+    let mut restarted = None;
+    let before = [second, first, green];
+    let third = persistent(&mut world, &mut restarted, "r3", &before, true, &sample);
+    assert_eq!(world.spawned.len(), 1, "the journal names the worker");
+    assert_eq!(restarted, Repair::of(&third));
+    assert!(world.retired.is_empty());
+
+    world.workers.insert("t0000000001".into(), Worker::Ended);
+    let fourth = persistent(&mut world, &mut restarted, "r4", &before, true, &sample);
+    assert_eq!(world.retired, ["t0000000001"]);
+    assert_eq!(world.spawned.len(), 2);
+    assert_eq!(fourth.repair, "t0000000002");
+}
+
+/// A WORKER THAT COULD NOT FINISH KEEPS THE SAME REDS, AND NEW REDS START ANOTHER: a fresh
+/// worker on the reds that stopped the last would meet what stopped it. The reds it was given
+/// are the hash its verdict carries, so the same red names after a later green are a new
+/// assignment. NEGATIVE CONTROLS: a worker with no recorded assignment keeps its place whatever
+/// the reds (nothing says what it tried); one that still works keeps it across a green.
+#[test]
+fn a_worker_that_could_not_finish_keeps_its_reds_and_new_reds_start_another() {
+    let mut world = Scripted::default();
+    let mut worker = None;
+    let sample = red_sample("deadline::tests::a");
+    let green = filed("g1", "pass", None);
+    let first = persistent(
+        &mut world,
+        &mut worker,
+        "r1",
+        &[green.clone()],
+        true,
+        &sample,
+    );
+    world.workers.insert(first.repair.clone(), Worker::Failed);
+    let before = [first.clone(), green.clone()];
+    let same = persistent(&mut world, &mut worker, "r2", &before, true, &sample);
+    assert_eq!(same.repair, first.repair);
+    assert_eq!((world.spawned.len(), world.retired.len()), (1, 0));
+
+    // A later green carries the custody, and the same red names after it are a new assignment.
+    let mut restarted = None;
+    let passed = Sample {
+        state: "pass".into(),
+        rows: vec![row("tree", Some(0), "ok")],
+    };
+    let g2 = persistent(&mut world, &mut restarted, "g2", &before, true, &passed);
+    assert_eq!(
+        (g2.state.as_str(), g2.repair.as_str()),
+        ("pass", "t0000000001")
+    );
+    assert_eq!(world.worker_reads.len(), 1, "a pass asks after no worker");
+    let after = [g2.clone(), first.clone(), green.clone()];
+    let found = walk(&after, false);
+    assert_eq!(found.green.as_deref(), Some("g2"));
+    assert_eq!(found.repair, Repair::of(&first));
+    assert!(
+        found.complete,
+        "a green closes the frontier, whatever lies before it"
+    );
+    let again = persistent(&mut world, &mut restarted, "r3", &after, true, &sample);
+    assert_eq!(world.retired, ["t0000000001"]);
+    assert_eq!(again.repair, "t0000000002");
+    assert_ne!(again.repair_assignment, first.repair_assignment);
+
+    // New reds at the same green start another too.
+    world.workers.insert("t0000000002".into(), Worker::Failed);
+    let other = red_sample("deadline::tests::b");
+    let before = [again.clone(), g2.clone()];
+    let new = persistent(&mut world, &mut restarted, "r4", &before, true, &other);
+    assert_eq!(new.repair, "t0000000003");
+
+    // Unknown assignment: custody holds, and nothing claims the worker tried these reds.
+    let mut unknown = new.clone();
+    unknown.repair_assignment = "not a hash".into();
+    world.workers.insert("t0000000003".into(), Worker::Failed);
+    let mut fresh = None;
+    let before = [unknown, g2.clone()];
+    let held = persistent(&mut world, &mut fresh, "r5", &before, true, &sample);
+    assert_eq!(held.repair, "t0000000003");
+    assert_eq!(held.repair_assignment, "");
+    assert_eq!(world.spawned.len(), 3);
+
+    // A worker that still works keeps its place across a green.
+    world.workers.insert("t0000000003".into(), Worker::Working);
+    let crossed = persistent(&mut world, &mut fresh, "r6", &[g2], true, &other);
+    assert_eq!(crossed.repair, "t0000000003");
+    assert_eq!(world.spawned.len(), 3);
+}
+
+/// CUSTODY THAT COULD NOT BE READ STARTS NO SECOND WORKER: where the journal or the history was
+/// not read whole and no green closes the frontier, a worker no record read names may still
+/// work, and an ended one that is named is kept, not replaced. NEGATIVE CONTROL: the same red
+/// with the custody read whole starts one.
+#[test]
+fn an_unread_journal_starts_no_second_worker() {
+    let mut world = Scripted::default();
+    let sample = red_sample("deadline::tests::a");
+    let mut worker = None;
+    let unread = persistent(&mut world, &mut worker, "r1", &[], false, &sample);
+    assert_eq!((unread.state.as_str(), unread.repair.as_str()), ("red", ""));
+    assert!(world.spawned.is_empty());
+    assert_eq!(Before::default(), walk(&[], false), "an unread journal");
+
+    let ended = Repair {
+        sid: "t0000000009".into(),
+        assignment: None,
+        started: 5,
+    };
+    let older = filed("r0", "red", Some(&ended));
+    let kept = persistent(&mut world, &mut worker, "r2", &[older], false, &sample);
+    assert_eq!(kept.repair, "t0000000009");
+    assert!(world.spawned.is_empty() && world.retired.is_empty());
+
+    let mut fresh = None;
+    let read = persistent(&mut world, &mut fresh, "r3", &[], true, &sample);
+    assert_eq!(read.repair, "t0000000001");
+}
+
+/// A ONE-SHOT RED RETURNS CONTEXT TO ITS CALLER AND MANAGES NO WORKER: it asks after none,
+/// starts none, retires none, and its red carries no custody, so the worker an older red names
+/// is still the one the next persistent follower finds beyond it. Its context is bounded, and
+/// a caller that cannot be written to still leaves the red whole for the journal. NEGATIVE
+/// CONTROL: the caller's context carries no worker protocol.
+#[test]
+fn a_one_shot_red_returns_bounded_context_and_keeps_older_custody() {
+    let mut world = Scripted::default();
+    let working = Repair {
+        sid: "t0000000007".into(),
+        assignment: Some("ab".repeat(32)),
+        started: 5,
+    };
+    let before = [
+        filed("r1", "red", Some(&working)),
+        filed("green", "pass", None),
+    ];
+    let mut sample = red_sample("deadline::tests::a");
+    sample.rows[1].red_items = (0..4000)
+        .map(|n| format!("{n} {}", "長".repeat(40)))
+        .collect();
+    let mut record = filed("r2", "judging", None);
+    let earlier = walk(&before, true);
+    let mode = RepairMode::Caller;
+    conclude(
+        &mut world,
+        &mut record,
+        &earlier,
+        &sample,
+        mode,
+        Path::new(ROOT),
+        9,
+    )
+    .unwrap();
+    assert_eq!((record.state.as_str(), record.repair.as_str()), ("red", ""));
+    assert_eq!(record.reds().len(), 4000, "the journal keeps every red");
+    assert!(world.worker_reads.is_empty() && world.spawned.is_empty());
+    assert!(world.retired.is_empty());
+    let [context] = world.caller_repairs.as_slice() else {
+        panic!("one context, got {}", world.caller_repairs.len());
+    };
+    assert!(context.starts_with("Use your harness's native subagents"));
+    assert!(context.contains("`git bisect start r2 green`"));
+    assert!(context.contains("The oldest red tip since then is r1"));
+    assert!(context.contains("More red details remain in this pass's row logs."));
+    assert!(!context.contains("Could not finish"));
+    assert!(
+        context.len() < MAX_REPAIR_CONTEXT_BYTES + 256,
+        "{}",
+        context.len()
+    );
+
+    let after = [record, before[0].clone(), before[1].clone()];
+    let found = walk(&after, true);
+    assert_eq!(found.repair, Some(working));
+    assert_eq!(found.oldest_red.as_deref(), Some("r1"));
+
+    world.caller_write_error = Some("stdout closed".into());
+    let mut unwritten = filed("r3", "judging", None);
+    let small = red_sample("deadline::tests::a");
+    let mode = RepairMode::Caller;
+    let written = conclude(
+        &mut world,
+        &mut unwritten,
+        &found,
+        &small,
+        mode,
+        Path::new(ROOT),
+        9,
+    );
+    assert_eq!(written, Err("caller repair output: stdout closed".into()));
+    assert_eq!(unwritten.state, "red");
+    assert_eq!(unwritten.reds(), ["aterm-uds --lib deadline::tests::a"]);
+}
+
+/// ONLY A WELL-FORMED RECORD ESTABLISHES CUSTODY: a session that is no tab names no worker, and
+/// an assignment that is no hash leaves the worker's assignment unknown, never guessed.
+#[test]
+fn custody_is_read_from_a_records_fields_and_never_guessed() {
+    let mut record = filed("r1", "red", None);
+    assert_eq!(Repair::of(&record), None);
+    record.repair = "repair the tree".into();
+    assert_eq!(Repair::of(&record), None);
+    record.repair = "t0000000001".into();
+    record.repair_assignment = "AB".repeat(32);
+    record.repair_started = 7;
+    let unknown = Repair::of(&record).unwrap();
+    assert_eq!((unknown.assignment.as_deref(), unknown.started), (None, 7));
+    record.repair_assignment = "ab".repeat(32);
+    let known = Repair::of(&record).unwrap();
+    assert_eq!(known.assignment, Some("ab".repeat(32)));
+    let mut copy = filed("r2", "red", None);
+    known.put(&mut copy);
+    assert_eq!(Repair::of(&copy), Some(known));
+}
+
+/// A GREEN PASS AND A PASS THAT COULD NOT RUN FILE THEIR OWN WORDS AND START NO WORKER: a pass
+/// with every row, a pass that could not run with the row that stopped it as its cause.
+#[test]
+fn a_green_pass_and_a_pass_that_could_not_run_start_no_worker() {
+    let mut world = Scripted::default();
+    let mut worker = None;
+    let passed = Sample {
         state: "pass".into(),
         rows: vec![row("inputs", Some(0), "ok"), row("tree", Some(0), "ok")],
     };
-    let posted = conclude(
-        &mut world,
-        "tip",
-        &[],
-        true,
-        &green,
-        RepairMode::Persistent(&mut worker),
-        root,
-    )
-    .unwrap();
-    assert_eq!(posted.state, "success");
-    assert!(
-        posted.description.contains("inputs tree"),
-        "{}",
-        posted.description
-    );
+    let green = persistent(&mut world, &mut worker, "g", &[], true, &passed);
+    assert_eq!(green.summary(), "pass on m9: inputs tree");
+    assert_eq!(green.repair, "");
     let unavailable = Sample {
         state: "could-not-run".into(),
-        rows: vec![could_not_run("follower", "git fetch: network".into())],
+        rows: vec![
+            row("inputs", Some(0), "ok"),
+            could_not_run("tree", "first\ncompiler lease: held\n".into()),
+        ],
     };
-    let posted = conclude(
-        &mut world,
-        "next",
-        &[],
-        true,
-        &unavailable,
-        RepairMode::Persistent(&mut worker),
-        root,
+    let ended = persistent(&mut world, &mut worker, "u", &[], true, &unavailable);
+    assert_eq!(ended.state, "could-not-run");
+    assert_eq!(ended.cause, "could not run tree: compiler lease: held");
+    assert_eq!(
+        ended.summary(),
+        "could-not-run on m9: could not run tree: compiler lease: held"
+    );
+    assert!(world.worker_reads.is_empty() && world.spawned.is_empty());
+    assert!(!ended.occupied(1), "the tip is judged again");
+}
+
+/// A repository with a committer, in a new folder `name` of `dir`.
+fn repository(dir: &Path, name: &str, extra: &[&str]) -> PathBuf {
+    let mut init = vec!["init", "--quiet", "-b", "main"];
+    init.extend_from_slice(extra);
+    init.push(name);
+    git(dir, &init).unwrap();
+    let root = dir.join(name);
+    git(&root, &["config", "user.name", "Andrew Yates"]).unwrap();
+    git(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+    git(&root, &["config", "maintenance.auto", "false"]).unwrap();
+    root
+}
+
+/// Commit a file `name` in `root`: the commit.
+fn landed(root: &Path, name: &str) -> String {
+    fs::write(root.join(name), name).unwrap();
+    git(root, &["add", name]).unwrap();
+    git(root, &["commit", "--quiet", "-m", name]).unwrap();
+    git(root, &["rev-parse", "HEAD"]).unwrap()
+}
+
+/// THE TIP SEQUENCE IS THE JOURNAL'S VERDICTS ORDERED BY ANCESTRY OVER EVERY PARENT. A landing
+/// merges main into its branch and pushes the merge: its first parent is the branch, its second
+/// the tip before it. Here t0 was judged green and t1 red with a worker, and t2 is such a merge
+/// of t1. The sequence before t2 is t1 then t0, whatever order the journal lists them in, and
+/// it leaves out the tip itself, a claim, a record that is not the follower's and a record on a
+/// commit that is no ancestor. NEGATIVE CONTROL: t1 is not on t2's first-parent chain, and the
+/// same records ordered by that chain lose it: the walk then reads t0 as the green with no red
+/// since and no worker, and a second worker would start beside the first.
+#[test]
+fn the_tip_sequence_is_ancestry_over_every_parent_not_the_first_parent_chain() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = repository(dir.path(), "main", &[]);
+    let t0 = landed(&root, "t0");
+    git(&root, &["checkout", "--quiet", "-b", "work"]).unwrap();
+    let branch = landed(&root, "work");
+    git(&root, &["checkout", "--quiet", "main"]).unwrap();
+    let t1 = landed(&root, "t1");
+    git(&root, &["checkout", "--quiet", "work"]).unwrap();
+    git(
+        &root,
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "-m",
+            "Merge main into work",
+            "main",
+        ],
     )
     .unwrap();
-    assert_eq!(posted.state, "error");
-    assert!(posted.description.contains("git fetch: network"));
-    assert!(world.spawned.is_empty());
-    assert!(
-        posted.verdict(),
-        "an error is a verdict: the tip is not judged again"
-    );
-    assert!(!Status::new("pending", "judging on m9".into()).verdict());
+    let t2 = git(&root, &["rev-parse", "HEAD"]).unwrap();
+    let chain = git(&root, &["rev-list", "--first-parent", &t2]).unwrap();
+    assert_eq!(chain.lines().collect::<Vec<_>>(), [&t2, &branch, &t0]);
+
+    let working = Repair {
+        sid: "t0000000001".into(),
+        assignment: Some("ab".repeat(32)),
+        started: 5,
+    };
+    let mut lane = filed(&branch, "pass", None);
+    lane.judge = String::new();
+    let records = vec![
+        filed(&t0, "pass", None),
+        filed(&t2, "red", None),
+        filed("f00d", "pass", None),
+        lane,
+        filed(&branch, "judging", None),
+        filed(&t1, "red", Some(&working)),
+    ];
+    let listed = git(&root, &["rev-list", "--topo-order", &t2]).unwrap();
+    let before = sequence(records.clone(), &t2, &listed);
+    let commits: Vec<&str> = before.iter().map(|record| record.commit.as_str()).collect();
+    assert_eq!(commits, [&t1, &t0]);
+    let found = walk(&before, true);
+    assert_eq!(found.green.as_deref(), Some(t0.as_str()));
+    assert_eq!(found.oldest_red.as_deref(), Some(t1.as_str()));
+    assert_eq!(found.repair, Some(working));
+
+    let lost = walk(&sequence(records, &t2, &chain), true);
+    assert_eq!(lost.green.as_deref(), Some(t0.as_str()));
+    assert_eq!((lost.oldest_red, lost.repair), (None, None));
 }
 
-#[test]
-fn a_description_fits_githubs_limit_and_names_its_worker() {
-    let long = (0..40)
-        .map(|n| format!("aterm-gui --lib settings::tests::case_{n}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let status = Status::new("failure", format!("40 red, repair tqn5r6e0148: {long}"));
-    assert_eq!(status.description.chars().count(), DESCRIPTION_CHARS);
-    assert!(status.description.ends_with('…'));
-    assert_eq!(status.worker(), Some("tqn5r6e0148"));
-    assert_eq!(
-        Status::new("failure", "1 red, repair s-3f7db22fd790a94538cd: x".into()).worker(),
-        Some("s-3f7db22fd790a94538cd"),
-        "a worker started before the t form is still named"
-    );
-    assert_eq!(
-        Status::new("failure", "1 red: x".into()).worker(),
-        None,
-        "a failure with no worker names none"
-    );
+/// A judgment's wait, looked at `looks` more times, thirty seconds apart by its own clock, and
+/// then ended clean, unless `signal` reaches its controller first. No real time passes.
+struct Hours {
+    at: Instant,
+    epoch: u64,
+    looks: u64,
+    signal: Option<i32>,
+    stopped: bool,
 }
 
-/// Only the follower's own statuses are read, newest first as GitHub lists them. NEGATIVE
-/// CONTROL: a reader that took every context would hand the release another tool's success.
-#[test]
-fn only_the_followers_context_is_read_from_a_commits_statuses() {
-    let answer = aterm_json::json!([
-        {"context": "ci/other", "state": "success", "description": "not ours"},
-        {"context": CONTEXT, "state": "failure", "description": "1 red: x"},
-        {"context": CONTEXT, "state": "pending", "description": "judging on m9"},
-    ]);
-    assert_eq!(
-        follower_statuses(&answer),
-        Some(vec![
-            ("failure".to_owned(), "1 red: x".to_owned()),
-            ("pending".to_owned(), "judging on m9".to_owned()),
-        ])
-    );
-    assert_eq!(follower_statuses(&aterm_json::json!([])), Some(vec![]));
-    assert_eq!(
-        follower_statuses(&aterm_json::json!({"message": "Not Found"})),
-        None
-    );
-}
-
-#[test]
-fn malformed_status_records_cannot_establish_the_absence_of_a_worker() {
-    let own = aterm_json::json!({"context": CONTEXT, "state": "failure", "description": "1 red"});
-    for malformed in [
-        aterm_json::json!(null),
-        aterm_json::json!("not a status"),
-        aterm_json::json!({}),
-        aterm_json::json!({"context": null}),
-        aterm_json::json!({"context": ""}),
-        aterm_json::json!({"context": CONTEXT, "state": "future", "description": "unknown"}),
-        aterm_json::json!({"context": CONTEXT, "state": "failure"}),
-        aterm_json::json!({"context": CONTEXT, "state": "failure", "description": null}),
-        aterm_json::json!({"context": CONTEXT, "description": "missing state"}),
-    ] {
-        let answer = aterm_json::json!([own.clone(), malformed]);
-        assert_eq!(follower_statuses(&answer), None, "{answer:?}");
+impl Hours {
+    fn of(looks: u64) -> Self {
+        Self {
+            at: Instant::now(),
+            epoch: 10_000,
+            looks,
+            signal: None,
+            stopped: false,
+        }
     }
 }
 
+impl Attended for Hours {
+    fn exited(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        use std::os::unix::process::ExitStatusExt as _;
+        if self.looks == 0 {
+            return Ok(Some(std::process::ExitStatus::from_raw(0)));
+        }
+        self.looks -= 1;
+        Ok(None)
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        self.stopped = true;
+        Ok(())
+    }
+
+    fn signal(&self) -> Option<i32> {
+        self.signal
+    }
+
+    fn now(&self) -> (Instant, u64) {
+        (self.at, self.epoch)
+    }
+
+    fn pause(&mut self) {
+        self.at += Duration::from_secs(30);
+        self.epoch += 30;
+    }
+}
+
+/// A CLAIM IS RENEWED EVERY TEN MINUTES WHILE ITS PASS RUNS, AND A RENEWAL THE JOURNAL DID NOT
+/// TAKE IS TRIED AGAIN A MINUTE LATER AND ENDS NOTHING. An hour's pass renews five times, each
+/// moving the lease twenty minutes past its own time, so one renewal may fail before the lease
+/// lapses. A renewal displaced by another attempt waits the whole ten minutes. The failures
+/// are counted for the attempt's last record. NEGATIVE CONTROLS: a claim renewed at every look
+/// would write 119 journal commits an hour; a controller's signal stops the pass and renews
+/// nothing more.
 #[test]
-fn all_returned_statuses_are_read_beyond_unrelated_page_sized_prefixes() {
-    let mut rows = vec![
-        aterm_json::json!({
-            "context": "ci/other", "state": "success", "description": "not ours"
-        });
-        250
-    ];
-    rows.push(aterm_json::json!({
-        "context": CONTEXT, "state": "failure",
-        "description": "1 red, repair tqn5r6e0148: older worker"
-    }));
-    rows.push(
-        aterm_json::json!({"context": CONTEXT, "state": "error", "description": "could not run"}),
-    );
-    let found = follower_statuses(&aterm_json::json!(rows)).unwrap();
-    assert_eq!(found.len(), 2);
+fn a_claim_is_renewed_every_ten_minutes_and_a_failed_renewal_is_tried_again_sooner() {
+    let hour = 120;
+    let mut record = filed("c", "judging", None);
+    let mut renewed = Vec::new();
+    let (ended, evidence) = attend(&mut record, &mut Hours::of(hour), &mut |record, epoch| {
+        renewed.push((epoch, record.lease_until));
+        Ok(())
+    })
+    .unwrap();
+    assert!(matches!(ended, Ended::Exited(status) if status.success()));
+    assert_eq!(evidence, None);
+    let every: Vec<_> = [10_600, 11_200, 11_800, 12_400, 13_000]
+        .map(|at| (at, at + judged::LEASE))
+        .into();
+    assert_eq!(renewed, every);
+    assert_eq!(record.lease_until, 13_000 + judged::LEASE);
+
+    let mut tried = Vec::new();
+    let (_, evidence) = attend(&mut record, &mut Hours::of(hour), &mut |_, epoch| {
+        tried.push(epoch);
+        match tried.len() {
+            1 => Err(Unfiled::Unavailable("journal away".into())),
+            3 => Err(Unfiled::Displaced("judging by m45".into())),
+            _ => Ok(()),
+        }
+    })
+    .unwrap();
+    assert_eq!(tried, [10_600, 10_660, 11_260, 11_860, 12_460, 13_060]);
     assert_eq!(
-        Status::new(&found[0].0, found[0].1.clone()).worker(),
-        Some("tqn5r6e0148")
+        evidence.as_deref(),
+        Some(
+            "claim renewals that failed: 2; the last: another attempt holds this tree: judging by m45"
+        )
     );
-    assert_eq!(found[1], ("error".into(), "could not run".into()));
+
+    let mut signalled = Hours::of(hour);
+    signalled.signal = Some(15);
+    let (ended, _) = attend(&mut record, &mut signalled, &mut |_, _| {
+        panic!("a stopped pass renews nothing")
+    })
+    .unwrap();
+    assert!(matches!(ended, Ended::Interrupted(15)));
+    assert!(signalled.stopped);
+}
+
+/// A main of one commit in a bare remote, and a follower's clone of it for each of `followers`:
+/// the folder that holds them, main's tip, its tree, and the clones.
+fn followed(followers: &[&str]) -> (aterm_tempfile::TempDir, String, String, Vec<PathBuf>) {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let remote = repository(dir.path(), "remote", &["--bare"]);
+    let source = repository(dir.path(), "source", &[]);
+    let tip = landed(&source, "tip");
+    let tree = git(&source, &["rev-parse", "HEAD^{tree}"]).unwrap();
+    let url = remote.to_str().unwrap();
+    git(&source, &["push", "--quiet", url, "main"]).unwrap();
+    let roots = followers
+        .iter()
+        .map(|name| {
+            let root = repository(dir.path(), name, &[]);
+            git(&root, &["remote", "add", "origin", url]).unwrap();
+            root
+        })
+        .collect();
+    (dir, tip, tree, roots)
+}
+
+/// What `tree`'s slot holds in the journal `root` follows.
+fn slot(root: &Path, tree: &str) -> Option<Record> {
+    let head = judged::head(root, ORIGIN, judged::deadline()).unwrap();
+    judged::record(root, head.as_deref(), tree, judged::deadline()).unwrap()
+}
+
+/// A pass no declined follower may start.
+fn no_pass(_: &Path, _: &mut Record) -> Result<(Judged, Option<String>), String> {
+    panic!("a follower that was declined judges nothing")
+}
+
+/// A PASS FILES `judging` AND THEN ITS VERDICT AT THE TIP'S TREE'S SLOT, AND A SECOND FOLLOWER
+/// ON THE SAME TIP IS DECLINED WHILE THAT LEASE IS LIVE. While the first follower's pass runs,
+/// the slot holds its claim with a twenty-minute lease, marked the follower's; a second
+/// follower one second before the lease's end starts nothing and writes nothing. The pass ends
+/// green: the slot holds `pass` with the rows, the journal took exactly those two commits, the
+/// checkout keeps no record, and the tip is judged for every later follower. NEGATIVE CONTROL:
+/// the second follower's turn would panic had it started a pass.
+#[test]
+fn a_pass_files_judging_then_its_verdict_and_a_second_follower_is_declined() {
+    let (_dir, tip, tree, roots) = followed(&["one", "two"]);
+    let two = opts(roots[1].clone(), true);
+    let mut second = None;
+    let mut pass = |root: &Path, record: &mut Record| {
+        let held = slot(root, &tree).unwrap();
+        assert_eq!(held, *record, "the claim is in the journal before the pass");
+        assert_eq!(
+            (held.state.as_str(), held.judge.as_str()),
+            ("judging", "follower")
+        );
+        assert_eq!(held.lease_until, 1000 + judged::LEASE);
+        let mut world = Scripted::default();
+        let late = || 1000 + judged::LEASE - 1;
+        second = Some(attempt_with(
+            &two,
+            &mut world,
+            &mut None,
+            &late,
+            &|| None,
+            &mut no_pass,
+        ));
+        assert_eq!(slot(root, &tree), Some(held));
+        let rows = vec![row("inputs", Some(0), "ok"), row("tree", Some(0), "ok")];
+        let state = "pass".into();
+        Ok((Judged::Sample(Sample { state, rows }), None))
+    };
+    let mut world = Scripted::default();
+    let one = opts(roots[0].clone(), true);
+    let judged = attempt_with(&one, &mut world, &mut None, &|| 1000, &|| None, &mut pass);
+    assert_eq!(judged, Ok(Start::Judged));
+    let why = format!(
+        "{tip}: judging on {}, its lease to {}",
+        host(),
+        1000 + judged::LEASE
+    );
+    assert_eq!(second, Some(Ok(Start::Declined(why))));
+
+    let filed = slot(&roots[0], &tree).unwrap();
+    assert_eq!(filed.summary(), format!("pass on {}: inputs tree", host()));
+    assert_eq!(
+        (filed.commit.as_str(), filed.lease_until),
+        (tip.as_str(), 0)
+    );
+    let head = judged::head(&roots[0], ORIGIN, judged::deadline())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        git(&roots[0], &["log", "--format=%s", &head]).unwrap(),
+        format!("verify watch: pass {tip}\nverify watch: judging {tip}")
+    );
+    assert!(!saved(&roots[0]).exists());
+    let later = attempt_with(
+        &two,
+        &mut world,
+        &mut None,
+        &|| 99_999,
+        &|| None,
+        &mut no_pass,
+    );
+    let why = format!("{tip}: {}", filed.summary());
+    assert_eq!(later, Ok(Start::Declined(why)));
+    assert!(world.caller_repairs.is_empty() && world.spawned.is_empty());
+}
+
+/// ANOTHER MAC'S CLAIM KEEPS THIS FOLLOWER OUT WHILE ITS LEASE IS LIVE, AND IS TAKEN ONCE IT
+/// LAPSED. m45 claimed the tip at 1000 and went away. One second before its lease ends this
+/// follower starts nothing; at its end it claims the tip, judges it red, and files the red
+/// with its rows in the slot, in place of the lapsed claim. Being one-shot it hands the repair
+/// context to its caller and starts no agent session. NEGATIVE CONTROL: the first turn is the
+/// same follower one second earlier.
+#[test]
+fn another_macs_claim_is_taken_only_after_its_lease_lapsed() {
+    let (_dir, tip, tree, roots) = followed(&["one"]);
+    let root = &roots[0];
+    git(root, &["fetch", "--quiet", ORIGIN, "main"]).unwrap();
+    let mut gone = filed(&tip, "judging", None);
+    gone.tree.clone_from(&tree);
+    gone.host = "m45".into();
+    gone.lease_until = 1000 + judged::LEASE;
+    assert_eq!(
+        judged::claim(root, ORIGIN, &gone, 1000, judged::deadline()),
+        Ok(None)
+    );
+    let one = opts(root.clone(), true);
+    let mut world = Scripted::default();
+    let live = || 1000 + judged::LEASE - 1;
+    let early = attempt_with(&one, &mut world, &mut None, &live, &|| None, &mut no_pass);
+    let why = format!(
+        "{tip}: judging on m45, its lease to {}",
+        1000 + judged::LEASE
+    );
+    assert_eq!(early, Ok(Start::Declined(why)));
+    assert_eq!(slot(root, &tree), Some(gone.clone()));
+
+    let mut red =
+        |_: &Path, _: &mut Record| Ok((Judged::Sample(red_sample("deadline::tests::a")), None));
+    let lapsed = || 1000 + judged::LEASE;
+    let taken = attempt_with(&one, &mut world, &mut None, &lapsed, &|| None, &mut red);
+    assert_eq!(taken, Ok(Start::Judged));
+    let filed = slot(root, &tree).unwrap();
+    assert_eq!(filed.state, "red");
+    assert_eq!(filed.host, host());
+    assert_ne!(filed.token, gone.token);
+    assert_eq!(filed.reds(), ["aterm-uds --lib deadline::tests::a"]);
+    assert_eq!(filed.rows.len(), 3);
+    assert_eq!(filed.repair, "");
+    assert_eq!(world.caller_repairs.len(), 1);
+    assert!(world.caller_repairs[0].contains(&format!("`git bisect start {tip}`")));
+    assert!(world.spawned.is_empty() && world.worker_reads.is_empty());
+}
+
+/// WHAT AN ATTEMPT LEFT REACHES THE JOURNAL BEFORE ANYTHING NEW IS CLAIMED. A follower that
+/// ended while judging left its claim in the journal and in its checkout: the next loop closes
+/// it as could-not-run, and this Mac then leaves the tip alone for [`judged::RETRY_AFTER`]. A
+/// last record whose filing failed stays in the checkout, and is filed once the journal can be
+/// reached. NEGATIVE CONTROLS: the claim is closed by its own token, not by a new attempt's;
+/// the unreachable journal leaves the kept record where it was.
+#[test]
+fn a_claim_its_follower_left_is_closed_and_a_last_record_is_filed_later() {
+    let (dir, tip, tree, roots) = followed(&["one"]);
+    let root = &roots[0];
+    let mut claim = filed(&tip, "judging", None);
+    claim.tree.clone_from(&tree);
+    claim.host = host();
+    claim.lease_until = 1000 + judged::LEASE;
+    assert_eq!(
+        judged::claim(root, ORIGIN, &claim, 1000, judged::deadline()),
+        Ok(None)
+    );
+    save(root, &claim).unwrap();
+    settle(root, 1500).unwrap();
+    let closed = slot(root, &tree).unwrap();
+    assert_eq!(
+        (closed.state.as_str(), &closed.token),
+        ("could-not-run", &claim.token)
+    );
+    assert_eq!(
+        closed.cause,
+        "the follower ended before this attempt had a last record"
+    );
+    assert!(!saved(root).exists());
+    let one = opts(root.clone(), true);
+    let rest = || 1500 + judged::RETRY_AFTER - 1;
+    let rested = attempt_with(
+        &one,
+        &mut Scripted::default(),
+        &mut None,
+        &rest,
+        &|| None,
+        &mut no_pass,
+    );
+    let why = format!(
+        "{tip}: this Mac's attempt ended could-not-run at 1500; it is not claimed again before {}",
+        1500 + judged::RETRY_AFTER
+    );
+    assert_eq!(rested, Ok(Start::Declined(why)));
+
+    let mut last = filed("0ther", "red", None);
+    last.updated = 2000;
+    save(root, &last).unwrap();
+    let url = git(root, &["remote", "get-url", ORIGIN]).unwrap();
+    let away = dir.path().join("away");
+    git(root, &["remote", "set-url", ORIGIN, away.to_str().unwrap()]).unwrap();
+    assert!(settle(root, 2000).is_err());
+    assert!(saved(root).exists(), "kept until the journal holds it");
+    git(root, &["remote", "set-url", ORIGIN, &url]).unwrap();
+    settle(root, 2100).unwrap();
+    assert_eq!(slot(root, "tree-of-0ther"), Some(last));
+    assert!(!saved(root).exists());
+}
+
+/// NO CODE PATH OF THE FOLLOWER CALLS GITHUB'S STATUSES API, OR ANY GITHUB API: its sources
+/// name no statuses path and start no agh API call; the journal is its one store, reached
+/// through the verifier's remote transport. The vault's development token may not write a
+/// commit status (403), which is why a follower that posted them judged nothing. NEGATIVE
+/// CONTROL: the follower before this named both `commits/{sha}/statuses` and
+/// `statuses/{sha}` and ran `agh api`.
+#[test]
+fn no_code_path_of_the_follower_reads_or_posts_a_commit_status() {
+    for (name, source) in [
+        ("watch.rs", include_str!("watch.rs")),
+        ("watch_service.rs", include_str!("watch_service.rs")),
+        ("judged.rs", include_str!("judged.rs")),
+    ] {
+        for call in [
+            "/statuses",
+            "statuses/",
+            "Tool::Agh",
+            "\"api\"",
+            "aterm/follower",
+        ] {
+            assert!(!source.contains(call), "{name} names {call}");
+        }
+    }
+}
+
+/// WITH REPAIRS OFF A RED IS FILED AND NOTHING OPENS, ASKS AFTER OR ENDS AN AGENT SESSION. A
+/// persistent follower is off unless `--repair worker` was given. Its red carries the rows and
+/// no custody, though an older verdict names a worker that has ended: that worker is not
+/// retired, not asked after and not replaced, and its custody stays in the journal for a
+/// follower that is asked to repair. A green carries that custody on. NEGATIVE CONTROL: the
+/// same red from a follower with `--repair worker` retires the ended worker and starts one.
+#[test]
+fn with_repairs_off_a_red_is_filed_and_no_session_is_started() {
+    let dir = PathBuf::from("/w");
+    let mut off = opts(dir.clone(), false);
+    assert!(matches!(off.repair_mode(&mut None), RepairMode::Off));
+    off.repair = true;
+    assert!(matches!(
+        off.repair_mode(&mut None),
+        RepairMode::Persistent(_)
+    ));
+    off.once = true;
+    assert!(matches!(off.repair_mode(&mut None), RepairMode::Caller));
+
+    let ended = Repair {
+        sid: "t0000000009".into(),
+        assignment: Some("ab".repeat(32)),
+        started: 5,
+    };
+    let before = [filed("r1", "red", Some(&ended)), filed("g", "pass", None)];
+    let earlier = walk(&before, true);
+    let sample = red_sample("deadline::tests::a");
+    let mut world = Scripted::default();
+    let mut record = filed("r2", "judging", None);
+    let root = Path::new(ROOT);
+    conclude(
+        &mut world,
+        &mut record,
+        &earlier,
+        &sample,
+        RepairMode::Off,
+        root,
+        9,
+    )
+    .unwrap();
+    assert_eq!((record.state.as_str(), record.repair.as_str()), ("red", ""));
+    assert_eq!(record.reds(), ["aterm-uds --lib deadline::tests::a"]);
+    assert_eq!(record.rows.len(), 3);
+    assert!(world.spawned.is_empty() && world.retired.is_empty());
+    assert!(world.worker_reads.is_empty() && world.caller_repairs.is_empty());
+    let after = [record, before[0].clone(), before[1].clone()];
+    assert_eq!(walk(&after, true).repair, Some(ended.clone()));
+
+    let passed = Sample {
+        state: "pass".into(),
+        rows: vec![row("tree", Some(0), "ok")],
+    };
+    let mut green = filed("g2", "judging", None);
+    let earlier = walk(&after, true);
+    conclude(
+        &mut world,
+        &mut green,
+        &earlier,
+        &passed,
+        RepairMode::Off,
+        root,
+        9,
+    )
+    .unwrap();
+    assert_eq!(Repair::of(&green), Some(ended));
+    assert!(world.worker_reads.is_empty());
+
+    let mut worker = None;
+    let asked = persistent(&mut world, &mut worker, "r3", &after, true, &sample);
+    assert_eq!(world.retired, ["t0000000009"]);
+    assert_eq!(asked.repair, "t0000000001");
+}
+
+/// A WORKER STALLED AT ITS START HOLDS THE REPAIR PLACE FOR FIFTEEN MINUTES, NOT FOR EVER. One
+/// second inside that time from its start a red keeps it; at the fifteenth minute it is
+/// retired and another started. NEGATIVE CONTROLS: a worker that works keeps its place however
+/// long ago it started, and so does one stalled where it resumes by itself.
+#[test]
+fn a_worker_stalled_at_its_start_holds_the_place_for_a_bounded_time() {
+    let sample = red_sample("deadline::tests::a");
+    let started = Repair {
+        sid: "t0000000009".into(),
+        assignment: None,
+        started: 1000,
+    };
+    let before = [filed("r1", "red", Some(&started))];
+    let earlier = walk(&before, true);
+    let red_at = |world: &mut Scripted, epoch: u64| {
+        let mut record = filed("r2", "judging", None);
+        let mut worker = None;
+        let mode = RepairMode::Persistent(&mut worker);
+        conclude(
+            world,
+            &mut record,
+            &earlier,
+            &sample,
+            mode,
+            Path::new(ROOT),
+            epoch,
+        )
+        .unwrap();
+        record.repair
+    };
+    let mut world = Scripted::default();
+    world.workers.insert("t0000000009".into(), Worker::Starting);
+    assert_eq!(red_at(&mut world, 1000 + STARTUP_STALL - 1), "t0000000009");
+    assert!(world.spawned.is_empty() && world.retired.is_empty());
+    assert_eq!(red_at(&mut world, 1000 + STARTUP_STALL), "t0000000001");
+    assert_eq!(world.retired, ["t0000000009"]);
+
+    let mut world = Scripted::default();
+    world.workers.insert("t0000000009".into(), Worker::Working);
+    assert_eq!(
+        red_at(&mut world, 1000 + 100 * STARTUP_STALL),
+        "t0000000009"
+    );
+    assert!(world.spawned.is_empty() && world.retired.is_empty());
+}
+
+/// One claim in the capacity ledger at `rank`.
+fn capacity_claim(rank: aterm_capacity::Rank, held: bool) -> aterm_capacity::Record {
+    aterm_capacity::Record {
+        accounting: aterm_capacity::Accounting::Holder,
+        pid: 41,
+        start_ms: 1,
+        laid_at: None,
+        seq: 1,
+        checkout: "/release/aterm".into(),
+        need: aterm_capacity::Need::new("ship release").rank(rank).mem(1),
+        timing: aterm_capacity::TimingEvidence::default(),
+        held: held.then_some(aterm_capacity::Held {
+            admitted_ms: 2,
+            cores: 0,
+            alone: false,
+        }),
+        credit: Vec::new(),
+        wrote: None,
+        next_ms: None,
+    }
+}
+
+/// A RELEASE GOES FIRST: NO PASS STARTS UNDER A RELEASE CLAIM, AND NOTHING IS CLAIMED. While
+/// the capacity ledger holds a Release claim, waiting or admitted, or cannot be read, a turn
+/// fetches nothing, files no claim in the journal and judges nothing; ordinary and background
+/// claims stop no start. NEGATIVE CONTROLS: the same turn with no release claims the tip; an
+/// unread ledger is never read as an empty one.
+#[test]
+fn a_release_claim_starts_no_pass_and_nothing_is_claimed() {
+    use aterm_capacity::Rank;
+    let why = "Release claim pid=41 what=\"ship release\" checkout=\"/release/aterm\"";
+    for held in [false, true] {
+        let ledger = vec![
+            capacity_claim(Rank::Ordinary, true),
+            capacity_claim(Rank::Release, held),
+        ];
+        assert_eq!(release_holds(Some(Ok(ledger))).as_deref(), Some(why));
+    }
+    let others = vec![
+        capacity_claim(Rank::Ordinary, true),
+        capacity_claim(Rank::Background, true),
+    ];
+    assert_eq!(release_holds(Some(Ok(others))), None);
+    assert_eq!(release_holds(Some(Ok(Vec::new()))), None);
+    let unread = release_holds(Some(Err(std::io::Error::other("locked")))).unwrap();
+    assert_eq!(unread, "the capacity ledger could not be read: locked");
+    assert!(release_holds(None).is_some());
+
+    let (_dir, _tip, tree, roots) = followed(&["one"]);
+    let one = opts(roots[0].clone(), true);
+    let mut world = Scripted::default();
+    let release = || Some(why.to_owned());
+    let turn = attempt_with(
+        &one,
+        &mut world,
+        &mut None,
+        &|| 1000,
+        &release,
+        &mut no_pass,
+    );
+    assert_eq!(
+        turn,
+        Ok(Start::Declined(format!("a release goes first: {why}")))
+    );
+    assert_eq!(
+        judged::head(&roots[0], ORIGIN, judged::deadline()),
+        Ok(None)
+    );
+    let mut pass = |_: &Path, _: &mut Record| {
+        let rows = vec![row("tree", Some(0), "ok")];
+        let state = "pass".into();
+        Ok((Judged::Sample(Sample { state, rows }), None))
+    };
+    let turn = attempt_with(&one, &mut world, &mut None, &|| 1000, &|| None, &mut pass);
+    assert_eq!(turn, Ok(Start::Judged));
+    assert_eq!(slot(&roots[0], &tree).unwrap().state, "pass");
+}
+
+/// A PASS HOLDS ONE BACKGROUND CLAIM THAT COVERS ITS ROWS' BUILDS, AND A STOPPED ADMISSION IS A
+/// STOP. The claim is background work's (a release ends its holder's group; ordinary work is
+/// served first), covers the builds below it with 26 GiB, and asks one core. An admission that
+/// a release or an interrupt stopped ends the pass with no row and no error, and a pass that
+/// was stopped is filed cancelled, never as one that could not run or as a verdict. NEGATIVE
+/// CONTROLS: a ledger that failed is an error, not a stop; a pass that broke (exit 3) could
+/// not run.
+#[test]
+fn a_pass_holds_one_background_claim_and_a_stopped_pass_is_cancelled() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let need = pass_need();
+    assert_eq!(need.rank, aterm_capacity::Rank::Background);
+    assert!(need.covers);
+    assert_eq!((need.mem, need.cores), (26 << 30, 1));
+    let stopped = aterm_capacity::Error::Stopped {
+        signal: None,
+        short: None,
+    };
+    assert!(matches!(pass_claim(Err(stopped)), Ok(None)));
+    let failed = aterm_capacity::Error::Ledger(std::io::Error::other("no ledger"));
+    let why = pass_claim(Err(failed)).map(drop).unwrap_err();
+    assert!(why.starts_with("capacity: "), "{why}");
+
+    let preempted = stopped_sample(std::process::ExitStatus::from_raw(75 << 8), "row=tree");
+    assert_eq!(preempted.state, "cancelled");
+    let mut world = Scripted::default();
+    let mut worker = None;
+    let record = persistent(&mut world, &mut worker, "c", &[], true, &preempted);
+    assert_eq!(record.state, "cancelled");
+    assert!(!record.verdict() && !record.occupied(1));
+    assert!(record.resting("m9", record.updated + judged::RETRY_AFTER - 1));
+    let broke = stopped_sample(std::process::ExitStatus::from_raw(3 << 8), "row=tree");
+    assert_eq!(broke.state, "could-not-run");
+    let full = "watch row=tree stopped: code=Some(75) kind=environment condition=\"no space\"";
+    let failed = stopped_sample(std::process::ExitStatus::from_raw(75 << 8), full);
+    assert_eq!(failed.state, "could-not-run", "a full disk is no stop");
+}
+
+/// A GIT STEP THAT MOVES OBJECTS IS BOUNDED BY PROGRESS, NOT BY A WALL CLOCK, AND A SEED THAT
+/// WAS STOPPED HALF WAY IS MADE AGAIN. A step that works for three times its stall window ends
+/// well, since it never stopped working; the seed clone took 38.8 to 67.8 s under a 60 s wall
+/// bound. What a stopped seed left beside the workspace is cleared, and the workspace appears
+/// whole, with its owner's mark, or not at all. NEGATIVE CONTROLS: a step that only sleeps for
+/// as long is ended as a hang; a folder at the workspace's own path that this tool did not
+/// make is still refused and kept.
+#[test]
+fn a_seed_waits_by_progress_and_a_half_made_seed_is_made_again() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let source = repository(dir.path(), "source", &[]);
+    landed(&source, "seed");
+    git(
+        &source,
+        &["remote", "add", "origin", "https://invalid.invalid/absent"],
+    )
+    .unwrap();
+    let window = Duration::from_secs(1);
+    let busy = "alias.work=!end=$(( $(date +%s) + 3 )); while [ $(date +%s) -lt $end ]; do :; done; echo worked";
+    assert_eq!(
+        git_working_within(&source, &["-c", busy, "work"], window).as_deref(),
+        Ok("worked")
+    );
+    let idle = git_working_within(&source, &["-c", "alias.work=!sleep 3", "work"], window);
+    assert!(idle.is_err(), "{idle:?}");
+    let failed = git_working(&source, &["rev-parse", "--verify", "absent"]).unwrap_err();
+    assert!(
+        failed.starts_with("git rev-parse --verify absent: "),
+        "{failed}"
+    );
+
+    let workspace = dir.path().join("lane");
+    let seed = seeding(&workspace).unwrap();
+    assert_eq!(seed, dir.path().join("lane.seeding"));
+    fs::create_dir_all(seed.join(".git")).unwrap();
+    fs::write(seed.join("half"), "a clone that was stopped").unwrap();
+    let root = prepare_workspace(&opts(workspace.clone(), false), &source).unwrap();
+    assert_eq!(git(&root, &["show", "HEAD:seed"]).unwrap(), "seed");
+    assert!(!root.join("half").exists() && !seed.exists());
+    assert_eq!(
+        fs::read_to_string(root.join(".git/verify-watch-owner")).unwrap(),
+        "https://invalid.invalid/absent"
+    );
+
+    let foreign = dir.path().join("theirs");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("work"), "kept").unwrap();
+    let refused = prepare_workspace(&opts(foreign.clone(), false), &source).unwrap_err();
+    assert!(refused.contains("not created by verify watch"), "{refused}");
+    assert_eq!(fs::read_to_string(foreign.join("work")).unwrap(), "kept");
 }

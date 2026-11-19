@@ -29,8 +29,9 @@
 //!   [`mailbox_labels`]: the labels (each lab label, and the legacy label a row may still have
 //!   and its label-keyed sign-in secrets name) the mailbox config maps to addresses.
 //! - [`holdings`]: what this Mac runs that it does not prefer, from what its login places hold
-//!   ([`observe::sweep::places_of`]), which the journal publishes as `place` rows; [`Lab::places`] is what every Mac's rows say, and
-//!   [`Lab::holders`] reads them beside the preferences ("which Macs hold A"), never as a limit.
+//!   ([`observe::sweep::places_of`]), which the journal publishes as `place` rows; [`Lab::places`] holds what every Mac's rows say
+//!   where a reader fills it (none does since FL-209), and [`Lab::holders`] reads them beside the
+//!   preferences ("which Macs hold A"), never as a limit.
 //!
 //! Traced by the accounts keeper: what this file reads of the file system itself, it reads
 //! through `aterm_uds::trace::fs` (census `traced-reads`).
@@ -198,8 +199,8 @@ pub struct Lab {
     /// [`mailbox_of`].
     pub mailboxes: std::collections::BTreeMap<String, String>,
     /// What the journal's live `place` rows say each Mac runs that it does not prefer, where a
-    /// reader asks for them (the exports, `aterm db alab export`); the lab every process caches
-    /// for its syncs leaves this empty, since none of them reads it.
+    /// reader fills it. No process does since the generated exports, its one filler, were removed
+    /// (FL-209); SF-11 removes the place rows whole.
     pub places: Placements,
 }
 
@@ -248,14 +249,6 @@ impl LabAccount {
             .iter()
             .find(|(held, _)| &held.key == machine)
             .map(|(_, rank)| *rank)
-    }
-
-    /// The legacy export format names machines by label. This predicate is for rendering
-    /// that format only; local preference decisions use [`Self::preferred_on`].
-    pub(crate) fn prefers_label_for_export(&self, label: &str) -> bool {
-        self.preferred
-            .iter()
-            .any(|(machine, _)| machine.label.as_deref() == Some(label))
     }
 
     /// Whether `row` is this account's: its address or provider identity, in the same realm.
@@ -628,9 +621,9 @@ fn overridden() -> Option<SourceSnapshot> {
     Some(source)
 }
 
-/// Whether the lab this process may hold could not be read yet: a Mac the
-/// lab may name then reads no sheet ([`chosen`] refuses a sync with no source named), so a
-/// failed first look never labels a row after a machine that a later look would have named.
+/// Whether the lab this process may hold could not be read yet: a Mac the lab may name then
+/// reads no sheet, fleet file or pool ([`Chosen::Pending`]: a sync keeps the roster as it stands),
+/// so a failed first look never labels a row after a machine that a later look would have named.
 #[must_use]
 pub fn pending() -> bool {
     snapshot().pending()
@@ -667,7 +660,9 @@ pub fn names_this_mac() -> bool {
 }
 
 /// The registry's first-name source, taken in one call so a concurrent refresh cannot turn a
-/// pending or conflicted binding into an apparently unbound machine.
+/// pending or conflicted binding into an apparently unbound machine: a conflicted one stops a
+/// first name, and a pending one makes it as an unbound Mac's, marked for the first read that
+/// finds the registry to settle ([`crate::machine_name::ensure`]).
 #[must_use]
 #[cfg(unix)]
 pub fn machine_name() -> crate::machine_name::RegistryNameRead {
@@ -1102,26 +1097,92 @@ fn fleet_account(
     }
 }
 
+/// What a sync of one CLI's pool reads, chosen from one source observation ([`chosen`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chosen {
+    /// The lab names this Mac: its fleet, ahead of every other default.
+    Lab(FleetRoster),
+    /// The lab names no machine here, or the caller named another source: that source, or the
+    /// defaults a Mac the lab does not name always read.
+    Unnamed,
+    /// The lab may name this Mac and is not read yet (its source or local policy could not be
+    /// read, or it binds this Mac with no usable machine key), in these words. Nothing a source
+    /// holds is read meanwhile, no sheet, fleet file or pool among them: a sync keeps the roster
+    /// as it stands, writes no row and moves no login directory, so nothing read meanwhile
+    /// labels a row after a machine that the lab, once read, would have named.
+    Pending(String),
+}
+
+impl Chosen {
+    /// The lab's fleet, where it is the source.
+    #[must_use]
+    pub fn lab(self) -> Option<FleetRoster> {
+        match self {
+            Self::Lab(fleet) => Some(fleet),
+            Self::Unnamed | Self::Pending(_) => None,
+        }
+    }
+
+    /// Why the lab is not read yet, where it is not.
+    #[must_use]
+    pub fn pending(&self) -> Option<&str> {
+        match self {
+            Self::Pending(why) => Some(why),
+            Self::Lab(_) | Self::Unnamed => None,
+        }
+    }
+
+    /// The word the aterm log keeps of this choice, one line per change ([`log_choice`]).
+    const fn state(&self) -> u8 {
+        match self {
+            Self::Lab(_) => 1,
+            Self::Unnamed => 2,
+            Self::Pending(_) => 3,
+        }
+    }
+}
+
+/// Write one aterm log line each time this process's source choice moves between the lab, no lab
+/// and a lab not read yet, so a Mac that keeps its roster while the lab is unread says so once
+/// rather than at every sync.
+fn log_choice(chosen: &Chosen) {
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let state = chosen.state();
+    if LAST.swap(state, std::sync::atomic::Ordering::Relaxed) == state {
+        return;
+    }
+    match chosen {
+        Chosen::Lab(fleet) => aterm_log::info!(
+            "accounts: the lab names this Mac; its rosters follow the lab ({} preferred here)",
+            fleet.accounts.len()
+        ),
+        Chosen::Unnamed => {
+            aterm_log::info!("accounts: the lab names no machine here; its own sources are read")
+        }
+        Chosen::Pending(why) => aterm_log::info!("accounts: {why}"),
+    }
+}
+
 /// The `alab` fleet a sync of `cli` reads, given the source it was `named` (none, or a path or
 /// URL), its roster at `roster_path` and the `aterm.toml` at `config`: with [`SOURCE`] named,
 /// the lab's fleet or a refusal where no lab names this Mac; with another source named, or for
-/// Claude Code a source the owner set in `config` (`[fleet] accounts_source`), none, so that
-/// source is read; with none named, the lab's fleet ahead of every other default once the lab
-/// names this Mac, even one that prefers nothing here: an empty lab roster stays empty (a sync
+/// Claude Code a source the owner set in `config` (`[fleet] accounts_source`), [`Chosen::Unnamed`],
+/// so that source is read; with none named, the lab's fleet ahead of every other default once the
+/// lab names this Mac, even one that prefers nothing here: an empty lab roster stays empty (a sync
 /// keeps every row the roster has and adds none), and no legacy discovery labels a row after a
-/// machine or reads a slot from an address on a Mac the lab names. A Mac the lab does not name
-/// keeps reading what it always read. The roster is read without the lock, only to keep each
-/// account's label; the sync reads it again under the lock.
+/// machine or reads a slot from an address on a Mac the lab names. A lab not read yet is
+/// [`Chosen::Pending`], with [`SOURCE`] named or none: a sync goes on with the roster as it stands.
+/// A Mac the lab does not name keeps reading what it always read. The roster is read without the
+/// lock, only to keep each account's label; the sync reads it again under the lock.
 ///
 /// # Errors
-/// [`SOURCE`] was named and no lab names this Mac; or no other source was named and the lab is
-/// [`pending`], so whether it names this Mac is not known.
+/// [`SOURCE`] was named and the lab, read, names no machine for this Mac.
 pub(super) fn chosen(
     cli: Cli,
     roster_path: Option<&Path>,
     named: Option<&str>,
     config: Option<&Path>,
-) -> Result<Option<FleetRoster>, String> {
+) -> Result<Chosen, String> {
     // An explicit external source need not open the registry at all.
     let named = named.map(str::trim).filter(|s| !s.is_empty());
     if named.is_some_and(|named| named != SOURCE)
@@ -1129,7 +1190,7 @@ pub(super) fn chosen(
             && cli == Cli::Claude
             && config.and_then(accounts_sync::source_key).is_some())
     {
-        return Ok(None);
+        return Ok(Chosen::Unnamed);
     }
     chosen_from(&snapshot(), cli, roster_path, named, config)
 }
@@ -1141,7 +1202,7 @@ pub(super) fn chosen_from(
     roster_path: Option<&Path>,
     named: Option<&str>,
     config: Option<&Path>,
-) -> Result<Option<FleetRoster>, String> {
+) -> Result<Chosen, String> {
     chosen_captured(
         source,
         cli,
@@ -1151,51 +1212,67 @@ pub(super) fn chosen_from(
     )
 }
 
-pub(super) fn chosen_captured(
+/// [`chosen`] from the observation `source` and whether the configuration `has_key`.
+///
+/// # Errors
+/// As [`chosen`].
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "LabSourceAvailability",
+        action = "Project",
+        project = "aterm::alab_view::source_model_tests::project"
+    )
+)]
+pub fn chosen_captured(
     source: &SourceSnapshot,
     cli: Cli,
     roster_path: Option<&Path>,
     named: Option<&str>,
     has_key: bool,
-) -> Result<Option<FleetRoster>, String> {
+) -> Result<Chosen, String> {
     let named = named.map(str::trim).filter(|s| !s.is_empty());
     if named.is_some_and(|named| named != SOURCE) {
-        return Ok(None);
+        return Ok(Chosen::Unnamed);
     }
     if named.is_none() && cli == Cli::Claude && has_key {
-        return Ok(None);
+        return Ok(Chosen::Unnamed);
     }
-    let existing = roster_path.and_then(|path| Roster::load_for(cli, path).ok());
-    let fleet = source
-        .lab()
-        .and_then(|lab| fleet_for(&lab, cli, existing.as_ref()));
-    if source.pending() {
-        return Err(
-            "the lab source or its local policy could not be read, so this Mac may be one it \
-             names: nothing was synced (no sheet is read meanwhile); a later sync reads it again"
+    let chosen = if source.pending() {
+        Chosen::Pending(
+            "the lab source or its local policy is not read yet, so this Mac may be one it \
+             names: the roster stands as it is, and no source is read until the lab is"
                 .to_owned(),
-        );
-    }
-    if source.names_this_mac() && fleet.is_none() {
-        return Err(
-            "the lab binds this Mac but supplies no usable machine key; nothing was synced"
-                .to_owned(),
-        );
-    }
-    if named.is_some() {
-        return fleet.map(Some).ok_or_else(|| {
-            if source.disabled() {
-                "`[alab] roster = false` in aterm.toml turns the lab source off, so the `alab` \
-                 source has nothing to read"
-                    .to_owned()
-            } else {
-                "the lab registry names no machine for this Mac yet (its facts row binds none, or \
-                 this Mac does not hold the registry), so the `alab` source has nothing to read"
-                    .to_owned()
+        )
+    } else {
+        let existing = roster_path.and_then(|path| Roster::load_for(cli, path).ok());
+        match source
+            .lab()
+            .and_then(|lab| fleet_for(&lab, cli, existing.as_ref()))
+        {
+            Some(fleet) => Chosen::Lab(fleet),
+            None if source.names_this_mac() => Chosen::Pending(
+                "the lab binds this Mac but gives it no usable machine key yet: the roster \
+                 stands as it is, and no source is read until the lab gives one"
+                    .to_owned(),
+            ),
+            None if named.is_some() => {
+                return Err(if source.disabled() {
+                    "`[alab] roster = false` in aterm.toml turns the lab source off, so the \
+                     `alab` source has nothing to read"
+                        .to_owned()
+                } else {
+                    "the lab registry names no machine for this Mac yet (its facts row binds \
+                     none, or this Mac does not hold the registry), so the `alab` source has \
+                     nothing to read"
+                        .to_owned()
+                });
             }
-        });
-    }
-    Ok(fleet)
+            None => Chosen::Unnamed,
+        }
+    };
+    log_choice(&chosen);
+    Ok(chosen)
 }
 
 /// The roster row `word` asks for (§0, §7: "any account asked for by name"): the one account of

@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 #[path = "artifact_snapshot.rs"]
 mod snapshot;
+#[cfg(target_os = "macos")]
+pub(crate) use snapshot::Images;
 pub(crate) use snapshot::Snapshot;
 
 /// The requested assertion contract, checked against the artifact's actual compiled facts.

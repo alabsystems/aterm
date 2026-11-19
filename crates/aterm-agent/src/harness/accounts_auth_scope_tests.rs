@@ -326,6 +326,7 @@ fn restoring_a_retired_failure_as_current_reproduces_the_real_selection_bug() {
     let model = aterm_models_harness::account_renewal_generation_model();
     for case in [12, 13] {
         let fixture = FailedLogin::new();
+        let failed = fixture.records().state.account("work").login.clone();
         assert!(fixture.replace(case));
         let records = fixture.records();
         assert_eq!(
@@ -333,8 +334,12 @@ fn restoring_a_retired_failure_as_current_reproduces_the_real_selection_bug() {
             [false, true, false, true]
         );
         assert!(fixture.history_kept(&records.state, "work"));
+        // The bug restores what the replacement retired as current: the failure's scope and the
+        // replaced login's evidence, which retirement renewed (`Account::retire_login`).
         let mut stale = records.state.clone();
-        stale.accounts.get_mut("work").unwrap().auth_scope = Default::default();
+        let account = stale.accounts.get_mut("work").unwrap();
+        account.auth_scope = Default::default();
+        account.login = failed;
         let [failure, _, expired, selectable] = auth_read(&stale, &records.logins, "work");
         assert!(failure && expired && !selectable);
         let mut bad = model.init_state();

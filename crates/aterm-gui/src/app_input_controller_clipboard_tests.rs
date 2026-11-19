@@ -183,9 +183,10 @@ fn a_controllers_invoked_paste_fills_no_rename_or_find_field() {
     let mut app = App::headless_for_test();
     app.tab_strip_rows = 1;
     assert!(app.begin_active_session_rename(WID));
+    let title = app.tab_titles(WID).remove(0);
     edit_menu(&mut app, MenuAction::Paste, true);
     let field = |app: &App| app.inline_rename_edit(WID).map(|edit| edit.text.clone());
-    assert_eq!(field(&app).as_deref(), Some(""), "the controller's paste");
+    assert_eq!(field(&app), Some(title), "the controller's paste");
     assert_eq!(
         app.pending_action_refusal.as_deref(),
         Some(CLIPBOARD_REFUSED)

@@ -150,6 +150,9 @@ pub(crate) enum SpawnPlace {
     /// behind the front. Any other goes at the end of the shown ones, ahead of the parked tabs,
     /// and is made active unless the ask lands it behind ([`SpawnAsk::background`]).
     Tab,
+    /// A tab requested from an auxiliary window lands in the main strip. Folder,
+    /// origin checks and input held during startup still belong to the requesting window.
+    HomeTab { from: WindowId },
     /// A new pane splitting the window's focused pane in this direction.
     Split(crate::pane::SplitDir),
     /// The sole tab of a new window built on landing (`from` is the origin window).
@@ -160,6 +163,7 @@ impl SpawnPlace {
     const fn asked_from(self, window: WindowId) -> Option<WindowId> {
         match self {
             Self::Window { from } => from,
+            Self::HomeTab { from } => Some(from),
             Self::Tab | Self::Split(_) => Some(window),
         }
     }
@@ -168,7 +172,7 @@ impl SpawnPlace {
     /// for ([`SpawnAsk::unasked`]) asks nobody to open it again, and its caller logs it.
     fn failed(self, app: &mut App, error: &str, unasked: bool) -> String {
         match self {
-            Self::Tab => {
+            Self::Tab | Self::HomeTab { .. } => {
                 crate::logging::stderr_line!("aterm-gui: could not open a new tab: {error}");
                 if !unasked {
                     app.post_message(crate::message_reporters::new_tab_failed(error));
@@ -1310,9 +1314,15 @@ impl App {
             then.answer(self, owner, Err("no event loop to spawn on".to_string()));
             return;
         };
-        let grid = self.spawn_grid(owner);
         let parent = self.spawn_parent(owner, &ask);
-        self.book_off_loop(owner, place, grid, parent, ask, then, proxy);
+        let (host, place) = match (place, self.tab_home_window()) {
+            (SpawnPlace::Tab, Some(home)) if home != owner => {
+                (home, SpawnPlace::HomeTab { from: owner })
+            }
+            _ => (owner, place),
+        };
+        let grid = self.spawn_grid(host);
+        self.book_off_loop(host, place, grid, parent, ask, then, proxy);
     }
 
     /// The lineage parent of a tab `ask` opens in `owner`: the window's focused session, but none
@@ -1896,14 +1906,14 @@ impl App {
         let outcome = match session {
             _ if os.exiting() => Err(QUITTING.to_string()),
             Err(e) => Err(place.failed(self, &e.to_string(), unasked)),
-            Ok(_) if !then.may_land(self, window) => {
+            Ok(_) if !then.may_land(self, place.asked_from(window).unwrap_or(window)) => {
                 Err("the request is no longer ready to open its tab".to_string())
             }
             Ok(_) if !new_window && !self.windows.contains_key(&window) => {
                 Err("the window closed before the session started".to_string())
             }
             Ok(mut session) => 'land: {
-                let host = (!new_window).then_some(window);
+                let host = place.asked_from(window).filter(|_| !new_window);
                 if let Err(why) = self.validate_spawn_admission(&admission, host) {
                     break 'land Err(why);
                 }
@@ -1936,7 +1946,7 @@ impl App {
                         let sid = session.ctx.self_id.as_str().to_string();
                         let acted = crate::tab_marks::ActScope::resume(acting);
                         let installed = match place {
-                            SpawnPlace::Tab => {
+                            SpawnPlace::Tab | SpawnPlace::HomeTab { .. } => {
                                 let kept = background
                                     .then(|| self.windows.get(&window)?.tab_set.active_index())
                                     .flatten();
@@ -1961,8 +1971,8 @@ impl App {
                             SpawnPlace::Split(dir) => {
                                 self.install_split_session(window, dir, session)
                             }
-                            SpawnPlace::Window { from } => {
-                                self.install_window_session(window, session, parent, grid, os, from)
+                            SpawnPlace::Window { .. } => {
+                                self.install_window_session(window, session, parent, grid, os)
                             }
                         };
                         drop(acted);
@@ -1974,7 +1984,7 @@ impl App {
                                 gate.release();
                             }
                             if adopted_spare {
-                                if !matches!(place, SpawnPlace::Tab)
+                                if !matches!(place, SpawnPlace::Tab | SpawnPlace::HomeTab { .. })
                                     || spare_grid != Some(self.spawn_grid(window))
                                 {
                                     self.resize_panes(window);
@@ -2029,19 +2039,12 @@ impl App {
         parent: Option<aterm_session::SessionId>,
         grid: Option<SpawnGrid>,
         os: &dyn LandingOs,
-        from: Option<WindowId>,
     ) -> Result<(), String> {
         let (rows, cols) = grid.map_or_else(
             || self.new_window_frame(None).0,
             |(rows, cols, _)| (rows, cols),
         );
         self.install_window_state_with_parent(wid, session, rows, cols, parent);
-        // The window it came from, reserved at the booking: the front window at the landing
-        // may be another, focused while the shell spawned. An origin gone since keeps the
-        // front's record.
-        if let Some(from) = from.filter(|from| self.windows.contains_key(from)) {
-            self.inherit_dock_record(from, wid);
-        }
         if !os.attach(self, wid) {
             self.close_window_logical(wid);
             self.post_message(crate::message_reporters::new_window_failed(
@@ -2062,7 +2065,10 @@ impl App {
     ) -> Option<crate::session_theme::SessionTheme> {
         match place {
             SpawnPlace::Split(_) if asked.is_none() => self.split_theme(window),
-            SpawnPlace::Split(_) | SpawnPlace::Tab | SpawnPlace::Window { .. } => None,
+            SpawnPlace::Split(_)
+            | SpawnPlace::Tab
+            | SpawnPlace::HomeTab { .. }
+            | SpawnPlace::Window { .. } => None,
         }
     }
 

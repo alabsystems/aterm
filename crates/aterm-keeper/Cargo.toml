@@ -18,6 +18,9 @@ trust-resource-provenance = { workspace = true }
 # The workspace's one FNV-1a/64, for a dev keeper's per-path label. Its one
 # dependency is astream-wire (dependency-free, vendor/astream), whose byte loop it runs.
 aterm-hash = { workspace = true }
+# Release versions (dependency-free): a keeper asked to restart exits only for a build at least
+# as new as its own, read from the bundle's Info.plist.
+aterm-stamp = { workspace = true }
 # The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
 aterm-spec-anchor = { workspace = true }

@@ -13,7 +13,8 @@ pub struct Connector {
     /// Where the CLI keeps its state.
     pub home: Home,
     /// Files under the home whose existence indicates a stored login (`stat`ed; only
-    /// [`stored_login_lapsed`] opens one, Claude Code's, for its token fields).
+    /// [`stored_login_lapsed`] and [`claude_stored_credential`] open one, Claude Code's, for its
+    /// token fields, and no value leaves either).
     pub stores: &'static [&'static str],
     /// Credential variables the CLI reads in place of or beside its stored login. Its job: what
     /// a pooled launch or relaunch removes ([`crate::harness::relaunch::ahead_env`], less the
@@ -1588,13 +1589,34 @@ pub fn test_on_login_platform<R>(file: bool, read: impl FnOnce() -> R) -> R {
     read()
 }
 
-/// Whether Claude Code's credential file `file` holds a login: `Some(true)` where its
-/// `claudeAiOauth` holds a non-empty `accessToken` or a non-empty `refreshToken`, `Some(false)`
-/// where it holds neither (lapsed, [`stored_login_lapsed`]), and `None` for a file that is not a
-/// regular file of at most [`CLAUDE_CREDENTIAL_MAX`] bytes, cannot be read or parsed, or has no
-/// `claudeAiOauth` object ([`stored_login_held`]). The bytes and the parsed tree are scrubbed
-/// before it returns.
-fn claude_credentials_held(file: &std::path::Path) -> Option<bool> {
+/// What Claude Code's credential file says of the login it holds, value-free (plan package
+/// SF-34): whether it holds one, whether it can renew itself, and the end its access token
+/// states. No field holds a token, a digest of one or any part of one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaudeCredential {
+    /// Its `claudeAiOauth` holds a non-empty `accessToken` or a non-empty `refreshToken`.
+    pub held: bool,
+    /// It holds a non-empty `refreshToken`, by which Claude Code renews its access token.
+    pub refreshable: bool,
+    /// Its access token's end, `claudeAiOauth.expiresAt` (Unix milliseconds in the file), in
+    /// Unix seconds.
+    pub expires_at: Option<i64>,
+}
+
+/// What Claude Code's credential file under `home` ([`stored_login_file`]) says of its login
+/// ([`ClaudeCredential`]), read from that file alone as [`stored_login_lapsed`] reads it: `None`
+/// where `home` holds no such file (a keychain-held login leaves none) or the file is one these
+/// rules cannot read. The bytes and the parsed tree are scrubbed before it returns.
+#[must_use]
+pub fn claude_stored_credential(home: &std::path::Path) -> Option<ClaudeCredential> {
+    claude_credential(&stored_login_file(Cli::Claude.connector(), home)?)
+}
+
+/// What Claude Code's credential file `file` says of its login ([`ClaudeCredential`]): `None` for
+/// a file that is not a regular file of at most [`CLAUDE_CREDENTIAL_MAX`] bytes, cannot be read
+/// or parsed, or has no `claudeAiOauth` object. The bytes and the parsed tree are scrubbed
+/// before it returns, and no string of the file leaves it.
+fn claude_credential(file: &std::path::Path) -> Option<ClaudeCredential> {
     if !aterm_uds::trace::fs::symlink_metadata(file)
         .is_ok_and(|m| m.is_file() && m.len() <= CLAUDE_CREDENTIAL_MAX)
     {
@@ -1602,16 +1624,25 @@ fn claude_credentials_held(file: &std::path::Path) -> Option<bool> {
     }
     let bytes = aterm_uds::secret::Secret::from_vec(aterm_uds::trace::fs::read(file).ok()?);
     let value = aterm_json::from_slice::<aterm_json::Value>(bytes.expose()).ok()?;
-    let token = |name: &str| {
-        value["claudeAiOauth"][name]
-            .as_str()
-            .is_some_and(|token| !token.is_empty())
-    };
-    let held = value["claudeAiOauth"]
-        .is_object()
-        .then(|| token("accessToken") || token("refreshToken"));
+    let oauth = &value["claudeAiOauth"];
+    let token = |name: &str| oauth[name].as_str().is_some_and(|token| !token.is_empty());
+    let read = oauth.is_object().then(|| ClaudeCredential {
+        held: token("accessToken") || token("refreshToken"),
+        refreshable: token("refreshToken"),
+        expires_at: oauth["expiresAt"].as_i64().map(|ms| ms.div_euclid(1000)),
+    });
     crate::harness::cli::shared_provider::wipe_json(value);
-    held
+    read
+}
+
+/// Whether Claude Code's credential file `file` holds a login: `Some(true)` where its
+/// `claudeAiOauth` holds a non-empty `accessToken` or a non-empty `refreshToken`, `Some(false)`
+/// where it holds neither (lapsed, [`stored_login_lapsed`]), and `None` for a file that is not a
+/// regular file of at most [`CLAUDE_CREDENTIAL_MAX`] bytes, cannot be read or parsed, or has no
+/// `claudeAiOauth` object ([`stored_login_held`]). The bytes and the parsed tree are scrubbed
+/// before it returns.
+fn claude_credentials_held(file: &std::path::Path) -> Option<bool> {
+    claude_credential(file).map(|credential| credential.held)
 }
 
 /// Whose OAuth login the home path `name` (`~/…`) is, by the product's name, as the connector

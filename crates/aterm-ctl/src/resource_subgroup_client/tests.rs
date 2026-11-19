@@ -13,7 +13,7 @@ fn deadline() -> Instant {
 }
 fn binding(attempt: u8) -> admission::Binding {
     admission::Binding {
-        session: "s-0000000000000000ab12".into(),
+        session: "tqn5r6e0148".into(),
         attempt: [attempt; 16],
     }
 }
@@ -122,7 +122,7 @@ fn stale_oversized_truncated_and_out_of_order_facts_poison_observation() {
 }
 fn request() -> wire::Request {
     let identity = process::read_identity(std::process::id() as i32).unwrap();
-    wire::Request {
+    let request = wire::Request {
         job: binding(1),
         capability: wire::Capability::from_bytes([7; 32]),
         member: admission::Submission {
@@ -140,7 +140,9 @@ fn request() -> wire::Request {
         cpu: wire::CpuDelegation::FixedBorrow { units: 1 },
         gnu: wire::GnuTransport::None,
         fence_targets: vec![],
-    }
+    };
+    assert!(request.validate().is_ok());
+    request
 }
 fn fixture() -> (aterm_tempfile::TempDir, aterm_uds::CtlListener, Endpoint) {
     let temp = aterm_tempfile::tempdir().unwrap();

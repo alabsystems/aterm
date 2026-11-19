@@ -1341,6 +1341,8 @@ fn capture(app: &mut App, wid: WindowId) -> Vec<u8> {
             session: None,
             want_bytes: true,
             want_metadata: false,
+            whole_client: false,
+            presentation: None,
             frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
             cancel: crate::control::CaptureCancellation::new(),
             reply,

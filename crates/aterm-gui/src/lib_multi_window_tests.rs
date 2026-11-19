@@ -416,18 +416,18 @@ fn migrate_active_tab_moves_view_to_next_window() {
     for native in [false, true] {
         for remaining_tab in [false, true] {
             let mut app = App::headless_for_test();
-            let source = WindowId(0);
+            let destination = WindowId(0);
             if native {
                 assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-                if !remaining_tab {
-                    assert_eq!(
-                        app.apply_tab_cmd(crate::TabAction::Close(Some(0))),
-                        Ok((0, 1))
-                    );
-                }
-            } else if remaining_tab {
+            } else {
+                let session = app.next_session_id;
+                app.push_stub_tab(destination, stub_session(session));
+            }
+            let source = app.detach_active_tab_logical().expect("auxiliary window");
+            if remaining_tab {
                 let session = app.next_session_id;
                 app.push_stub_tab(source, stub_session(session));
+                app.switch_tab_in(source, 0);
             }
             let moved = app.windows[&source].tab_set.active().unwrap().clone();
             let moved_kind = *app.view_store.get(moved.focus).unwrap();
@@ -443,8 +443,10 @@ fn migrate_active_tab_moves_view_to_next_window() {
                 .cloned()
                 .collect::<Vec<_>>();
             assert_eq!(!retained.is_empty(), remaining_tab);
-            let other_session = app.next_session_id;
-            let destination = app.insert_logical_window(stub_session(other_session), 40, 120);
+            let size = (
+                app.windows[&destination].rows,
+                app.windows[&destination].cols,
+            );
             app.frontmost_window = Some(destination);
             app.sync_active_session();
             let mut expected_destination = app.windows[&destination].tab_set.tabs().to_vec();
@@ -508,7 +510,7 @@ fn migrate_active_tab_moves_view_to_next_window() {
             }
             if let Some(session) = moved_kind.terminal_session() {
                 let terminal = term_lock(&app.pool.get(session).unwrap().term);
-                if (terminal.rows(), terminal.cols()) != (40, 120) {
+                if (terminal.rows(), terminal.cols()) != size {
                     ownership_failures.push(format!(
                         "native={native} remaining_tab={remaining_tab}: moved terminal did not take the destination grid"
                     ));

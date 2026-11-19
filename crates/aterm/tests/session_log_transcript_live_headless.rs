@@ -7,11 +7,12 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aterm_agent::supervise::prompt::fixtures::composer;
 
 use crate::headless_boot;
+use crate::patience::Patience;
 
 use headless_boot::{Instance, boot_session, ctl_ok, field, process_tree, status, type_line};
 
@@ -296,14 +297,15 @@ fn session_log_transcript_live_headless() {
             work.display()
         ),
     );
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     while !status(&inst, &sid).contains(" program=claude ") {
-        assert!(
-            Instant::now() < deadline,
-            "the stand-in never ran as claude: {}\n{}",
-            status(&inst, &sid),
-            process_tree(&inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the stand-in never ran as claude ({why}): {}\n{}",
+                status(&inst, &sid),
+                process_tree(&inst)
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 

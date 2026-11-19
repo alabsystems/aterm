@@ -3,7 +3,7 @@
 
 //! THE JUDGMENT TURN, VERIFY'S SIDE (`docs/DESIGN-landing-economy.md` §2.3): a dev-set run
 //! predicted HEAVY takes the turn in this user's capacity ledger ([`aterm_capacity::Heavy`])
-//! before it claims its disk, and holds it for its whole life, so heavy judgments on a Mac run
+//! after its tree preflight and before it claims its disk, and holds it through its compiler work, so heavy judgments on a Mac run
 //! one at a time, shortest predicted first and aged, and each at the full width of the machine
 //! (its own claims of cores are granted all the room, and its test dispatch's live share is what
 //! it asked: `crate::test_share`). A run that is not heavy asks nothing and runs beside it.
@@ -169,7 +169,7 @@ pub(crate) fn bind_events(ctx: &mut crate::Ctx) {
     }
 }
 
-/// The turn a heavy run holds ([`take`]) until it ends ([`Held::end`]).
+/// The turn a heavy run holds ([`Prepared::take`]) until it ends ([`Held::end`]).
 pub(crate) struct Held {
     _claim: aterm_capacity::Claim,
     prediction: Prediction,
@@ -208,21 +208,31 @@ pub(crate) fn queued_event(
 /// `judgment-turn`: the run's wait for the turn ended after `waited`, with the turn where
 /// `held`, else with the run going on without it (the ledger unread, or its holder stuck), so it
 /// is no longer queued either way.
+#[cfg(test)]
 pub(crate) fn turn_event(
     prediction: Prediction,
     heavy: aterm_capacity::Heavy,
     waited: Duration,
     held: bool,
 ) -> String {
+    event(
+        EventKind::JudgmentTurn,
+        turn_value(prediction, heavy, waited, held),
+    )
+}
+
+fn turn_value(
+    prediction: Prediction,
+    heavy: aterm_capacity::Heavy,
+    waited: Duration,
+    held: bool,
+) -> aterm_json::Value {
     let value = with(
         predicted(prediction, heavy),
         "waited_ms",
-        aterm_json::Value::from(millis(waited)),
+        millis(waited).into(),
     );
-    event(
-        EventKind::JudgmentTurn,
-        with(value, "held", aterm_json::Value::from(held)),
-    )
+    with(value, "held", held.into())
 }
 
 /// What a run that held the turn used ([`cpu_event`]).
@@ -231,7 +241,7 @@ pub(crate) struct Used {
     /// Its test binaries' CPU, ms: what [`Prediction::cpu_ms`] predicts, so the two compare
     /// ([`crate::Ctx::tests_cpu_ms`]).
     pub(crate) tests_cpu_ms: u64,
-    /// Its whole process tree's, compile and lint included, ms; `None` where unread.
+    /// Its process tree's CPU while it held the turn, compile and lint included, ms; `None` where unread.
     pub(crate) run_cpu_ms: Option<u64>,
     /// Its wall from taking the turn to its end.
     pub(crate) wall: Duration,
@@ -239,7 +249,7 @@ pub(crate) struct Used {
 
 /// `judgment-cpu`: what a run that held the turn `used`, on `cores` cores, against its
 /// `prediction`: `tests_cpu_ms` against `predicted_cpu_ms` (and `tests_machine_ms` against
-/// `predicted_ms`) calibrates the prediction; `run_cpu_ms` is the whole tree's, which the
+/// `predicted_ms`) calibrates the prediction; `run_cpu_ms` is its held process tree's, which the
 /// prediction does not yet cover.
 pub(crate) fn cpu_event(prediction: Prediction, used: Used, cores: u32) -> String {
     let cores_ms = u64::from(cores.max(1));
@@ -279,71 +289,112 @@ fn now_ms() -> u64 {
     aterm_time::unix_millis().unwrap_or(0)
 }
 
-/// Take the turn for a run of `ctx`'s that [`asks`] for it and is predicted heavy, first queued
-/// at `since_ms` (`--queued-since`: a landing's own start, so its re-judges keep its place), else
-/// now, admitted as `mode` says. `Ok(None)` where it asks none, or where the ledger could not
-/// be read or every holder it waits behind made no progress for [`crate::STUCK_ENDS`] (the turn
-/// orders work and guards nothing, so the run goes on without it, saying so). Its events go to
-/// the run's events, bound to the run first.
-///
-/// # Errors
-/// The wait ended on an interrupt or the run's end, which ends the run.
-pub(crate) fn take(
-    plan: &crate::RunPlan<'_>,
-    since_ms: Option<u64>,
-    mode: aterm_capacity::Admit,
-) -> Result<Option<Held>, String> {
-    let ctx = plan.context();
-    if !plan.has_compiler_stage() || !asks(ctx) {
-        return Ok(None);
-    }
-    let cores = aterm_capacity::cores();
-    let history = ctx
-        .test_history
-        .as_deref()
-        .map(crate::test_history::load)
-        .unwrap_or_default();
-    let prediction = predict(&history, &ctx.scope, cores);
-    if !prediction.heavy() {
-        return Ok(None);
-    }
-    let heavy = aterm_capacity::Heavy {
-        since_ms: since_ms.unwrap_or_else(now_ms),
-        predicted_ms: prediction.machine_ms,
-    };
-    let events = ctx.events.as_ref();
-    let need = aterm_capacity::Need::new(format!("verify judgment turn: {}", ctx.scope.label()))
-        .heavy(heavy.since_ms, heavy.predicted_ms)
-        .ends_when_stuck(crate::STUCK_ENDS);
-    let asked = Instant::now();
-    let mut queued = false;
-    let admitted = crate::admit_with_say(need, mode, &mut |line| {
-        if !queued {
-            queued = true;
-            event_log::emit(events, &queued_event(prediction, heavy, line));
+/// One frozen prediction and queue key, captured from the same invocation before its tree
+/// rows run. History changing during that preflight cannot reclassify or reorder this run.
+pub(crate) struct Prepared<'ctx> {
+    ctx: &'ctx crate::Ctx,
+    prediction: Prediction,
+    heavy: aterm_capacity::Heavy,
+    cores: u32,
+}
+
+impl<'ctx> Prepared<'ctx> {
+    pub(crate) fn capture(plan: &crate::RunPlan<'ctx>, since_ms: Option<u64>) -> Option<Self> {
+        let ctx = plan.context();
+        if !plan.has_compiler_stage() || !asks(ctx) {
+            return None;
         }
-        eprintln!("{line}");
-    });
-    match admitted {
-        Ok(claim) => {
-            event_log::emit(events, &turn_event(prediction, heavy, claim.waited(), true));
-            Ok(Some(Held {
-                _claim: claim,
-                prediction,
-                cores,
-                began: Instant::now(),
-                cpu_before: cpu_used_ms(),
-            }))
-        }
-        Err(e @ (aterm_capacity::Error::Ledger(_) | aterm_capacity::Error::Stuck { .. })) => {
-            event_log::emit(
-                events,
-                &turn_event(prediction, heavy, asked.elapsed(), false),
+        let cores = aterm_capacity::cores();
+        let history = ctx
+            .test_history
+            .as_deref()
+            .map(crate::test_history::load)
+            .unwrap_or_default();
+        let prediction = predict(&history, &ctx.scope, cores);
+        prediction.heavy().then(|| Self {
+            ctx,
+            prediction,
+            heavy: aterm_capacity::Heavy {
+                since_ms: since_ms.unwrap_or_else(now_ms),
+                predicted_ms: prediction.machine_ms,
+            },
+            cores,
+        })
+    }
+
+    /// Take the prepared turn after the tree rows. The returned wait is the same duration its
+    /// event reports, including when the ledger is unread or stuck and the run goes on without
+    /// a turn. An interrupt refuses; the caller still records the completed tree rows.
+    pub(crate) fn take(
+        &self,
+        plan: &crate::RunPlan<'_>,
+        mode: aterm_capacity::Admit,
+        preflight: Duration,
+    ) -> (Duration, Result<Option<Held>, String>) {
+        let Self {
+            ctx,
+            prediction,
+            heavy,
+            cores,
+        } = *self;
+        if !std::ptr::eq(ctx, plan.context()) {
+            return (
+                Duration::ZERO,
+                Err("the prepared judgment turn belongs to another invocation".into()),
             );
-            eprintln!("verify: the judgment turn was not taken ({e}); the run goes on without it");
-            Ok(None)
         }
-        Err(e) => Err(format!("the judgment turn: {e}")),
+        let events = ctx.events.as_ref();
+        let need =
+            aterm_capacity::Need::new(format!("verify judgment turn: {}", ctx.scope.label()))
+                .heavy(heavy.since_ms, heavy.predicted_ms)
+                .ends_when_stuck(crate::STUCK_ENDS);
+        let asked = Instant::now();
+        let mut queued = false;
+        let admitted = crate::admit_with_say(need, mode, &mut |line| {
+            if !queued {
+                queued = true;
+                event_log::emit(events, &queued_event(prediction, heavy, line));
+            }
+            eprintln!("{line}");
+        });
+        let (waited, result) = match admitted {
+            Ok(claim) => (
+                claim.waited(),
+                Ok(Some(Held {
+                    _claim: claim,
+                    prediction,
+                    cores,
+                    began: Instant::now(),
+                    cpu_before: cpu_used_ms(),
+                })),
+            ),
+            Err(e @ (aterm_capacity::Error::Ledger(_) | aterm_capacity::Error::Stuck { .. })) => {
+                eprintln!(
+                    "verify: the judgment turn was not taken ({e}); the run goes on without it"
+                );
+                (asked.elapsed(), Ok(None))
+            }
+            Err(e) => (asked.elapsed(), Err(format!("the judgment turn: {e}"))),
+        };
+        // Preflight, queue time and held time are separate observations. This is not a new
+        // qualification receipt: the ordinary keyed checks and final reseal still decide it.
+        event_log::emit(
+            events,
+            &event(
+                EventKind::JudgmentTurn,
+                with(
+                    turn_value(
+                        prediction,
+                        heavy,
+                        waited,
+                        result.as_ref().is_ok_and(Option::is_some),
+                    ),
+                    "preflight_ms",
+                    aterm_json::Value::from(millis(preflight)),
+                ),
+            ),
+        );
+        (waited, result)
     }
 }
 

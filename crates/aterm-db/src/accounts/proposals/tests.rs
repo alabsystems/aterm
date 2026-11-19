@@ -386,6 +386,7 @@ fn known_missing_ancestry_withholds_plans_but_valid_duplicate_receipts_remain_co
         &encode(&Command::Write {
             request: [71; 16],
             changes: vec![other],
+            said: None,
         })
         .unwrap(),
     );
@@ -572,6 +573,7 @@ fn reverting_creation_is_reversible_absence_and_bad_revert_keys_are_inert() {
             request: [4; 16],
             operation: created.id,
             changes: vec![other],
+            said: None,
         })
         .unwrap(),
     );
@@ -614,6 +616,7 @@ fn authority_and_unknown_payloads_are_inert_without_poisoning_later_data() {
         &encode(&Command::Write {
             request: [2; 16],
             changes: vec![account("valid")],
+            said: None,
         })
         .unwrap(),
     );
@@ -648,6 +651,7 @@ fn repeated_request_contents_are_inert_without_poisoning_following_edits() {
         &encode(&Command::Write {
             request: [1; 16],
             changes: vec![account("different")],
+            said: None,
         })
         .unwrap(),
     );
@@ -657,6 +661,7 @@ fn repeated_request_contents_are_inert_without_poisoning_following_edits() {
         &encode(&Command::Write {
             request: [2; 16],
             changes: vec![account("dependent")],
+            said: None,
         })
         .unwrap(),
     );
@@ -854,6 +859,7 @@ fn a_late_remote_request_conflict_cannot_blame_an_honest_reverter() {
         &encode(&Command::Write {
             request: [1; 16],
             changes: vec![account("conflicting")],
+            said: None,
         })
         .unwrap(),
     );
@@ -885,6 +891,7 @@ fn refused_revert_never_returns_a_successful_retry_receipt() {
             request: [2; 16],
             operation: first.id,
             changes: vec![wrong],
+            said: None,
         })
         .unwrap(),
     );
@@ -906,6 +913,7 @@ fn withheld_request_conflicts_remain_negative_evidence() -> aterm_spec::interp::
         &encode(&Command::Write {
             request: [1; 16],
             changes: vec![account("conflicting")],
+            said: None,
         })
         .unwrap(),
     );
@@ -990,6 +998,7 @@ fn unreadable_quarantined_requests_fence_only_their_author() -> aterm_spec::inte
         &encode(&Command::Write {
             request: [1; 16],
             changes: vec![account("left-branch-conflict")],
+            said: None,
         })
         .unwrap(),
     );

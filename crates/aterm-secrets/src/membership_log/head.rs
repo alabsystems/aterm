@@ -24,7 +24,11 @@
 //!   anchor ([`Ops`]). An entry whose value carries the inner seal (a Claude Code token entry)
 //!   is left out: which of its writes read the same depends on the epoch keys the reading log
 //!   holds, which a log made from this one (a projection, a `Wrap` held since) changes, while
-//!   every other entry's writes read the same under any keys that open them.
+//!   every other entry's writes read the same under any keys that open them;
+//! - for a log rooted at a final checkpoint alone, last, the frame its rewritten file begins
+//!   with ([`super::stored`]: its roots and the stubs of what they dropped), behind the frame's
+//!   length: a record that follows a dropped one places only by its stub, and the records stand
+//!   in the file after the frame. A whole log's head ends at the entry above, as it always did.
 //!
 //! The head holds no name and no value, but it does show structure to whoever reads the file
 //! (mode 0600, beside the records file): the entry numbers follow the order of the entries'
@@ -64,9 +68,13 @@ use std::sync::{Arc, Mutex};
 const MAGIC: &[u8] = b"aterm-vault-head/1\n";
 /// The domain the head's MAC key is derived under from this Mac's identity.
 const KEY_DOMAIN: &[u8] = b"aterm/vault-head/1 mac";
-/// The most bytes a head holds: the records it holds whole stay under the stream bound, and a
-/// shelved record's place is its frame and a few numbers.
-const MAX_HEAD: usize = super::MAX_RECORDS_STREAM + 32 * 1024 * 1024;
+/// The most bytes the head of a records file whose store holds `capacity` bytes of records
+/// holds ([`Store::capacity`], the storage class of byte bound): the records it holds whole
+/// stay under the store's capacity, and a shelved record's place is its frame and a few
+/// numbers.
+const fn max_head(capacity: usize) -> usize {
+    capacity.saturating_add(32 * 1024 * 1024)
+}
 /// A record held whole.
 const WHOLE: u8 = 0;
 /// A record shelved.
@@ -143,6 +151,10 @@ pub(crate) struct Origin {
     /// Where each record stands in the file and its length, as the read found them
     /// ([`Store::read_from`]): empty until a store takes this origin.
     places: Places,
+    /// The bytes of the file before its first record: the frame a rewritten file of a rooted
+    /// log begins with ([`super::stored`]), which a head of that file holds too; `0` for every
+    /// other file.
+    lead: u64,
     context: [u8; 32],
     /// The recipient of this Mac's identity, the one a head of this file is written for: a
     /// resolve under another (a test's, a tool's) writes none, so it never takes the place of
@@ -196,6 +208,7 @@ impl Origin {
             stamp,
             digest,
             places: Places::new(),
+            lead: 0,
             context,
             owner,
             settled: fsx::stamp_settled(&stamp, began),
@@ -368,6 +381,23 @@ fn encode(log: &Log, origin: &Origin, identity: &Identity, resolved: &Resolved) 
         out.extend_from_slice(&op.register.to_be_bytes());
         out.extend_from_slice(&op.class.to_be_bytes());
     }
+    // A rooted log's records do not place without its roots and stubs: its head ends with the
+    // frame its file begins with, and a whole log's ends here, as it always did.
+    #[cfg(test)]
+    let framed = !super::stored::mutant(super::stored::Mutant::HeadWithoutFrame);
+    #[cfg(not(test))]
+    let framed = true;
+    let frame = super::stored::Kept::of(log)
+        .ok()?
+        .filter(|_| framed)
+        .map(|kept| kept.encode());
+    if frame.as_ref().map_or(0, |frame| frame.len() as u64) != origin.lead && framed {
+        return None;
+    }
+    if let Some(frame) = frame {
+        out.extend_from_slice(&origin.lead.to_be_bytes());
+        out.extend_from_slice(&frame);
+    }
     let mac = ring::hmac::sign(&key(identity), &out);
     out.extend_from_slice(mac.as_ref());
     Some(out)
@@ -438,7 +468,7 @@ pub(crate) fn open(
     if !names(&mut reader, stamp.len, context, identity) {
         return None;
     }
-    let bytes = reader.read_private(MAX_HEAD).ok()?;
+    let bytes = reader.read_private(max_head(store.capacity())).ok()?;
     let bytes = bytes.as_slice();
     let signed = bytes.len().checked_sub(32)?;
     #[cfg(test)]
@@ -498,9 +528,6 @@ pub(crate) fn open(
         }
         records.push(record);
     }
-    if covered != stamp.len {
-        return None;
-    }
     let mut ops = BTreeMap::new();
     for _ in 0..fields.len()? {
         let id = fields.array::<32>()?;
@@ -510,7 +537,20 @@ pub(crate) fn open(
         };
         ops.insert(id, op);
     }
-    if fields.at != fields.bytes.len() {
+    // What a rooted log's file begins with, ahead of its records ([`encode`]): the head of a
+    // whole log ends at its ops.
+    let (lead, kept) = if fields.at == fields.bytes.len() {
+        (0, None)
+    } else {
+        let lead = fields.u64()?;
+        let frame = fields.take(usize::try_from(lead).ok()?)?;
+        let (kept, read) = super::stored::Kept::decode(frame, reading).ok()?;
+        if read != frame.len() {
+            return None;
+        }
+        (lead, Some(kept))
+    };
+    if fields.at != fields.bytes.len() || covered.checked_add(lead)? != stamp.len {
         return None;
     }
     let recipient = identity.recipient().0;
@@ -519,10 +559,11 @@ pub(crate) fn open(
     // A read-only query leaves publication for a later ordinary cache hit. Keep the
     // authenticated positions it needs to encode that head without rereading records.
     origin.places = places;
+    origin.lead = lead;
     if publication == Publication::Allowed {
         origin.stood_for(recipient);
     }
-    let read = store.read_through_head(records, ops, origin)?;
+    let read = store.read_through_head(records, ops, origin, kept)?;
     if publication == Publication::Allowed
         && named != stamp
         && fsx::stamp_settled(&stamp, began)
@@ -650,13 +691,36 @@ impl Record {
 
 impl Store {
     /// This empty store with `records` held, each in its order, as a head read them
-    /// ([`open`]), its log carrying the head's `ops` and `origin`: `None` where it does not take
-    /// every one of them, held.
-    fn read_through_head(mut self, records: Vec<Record>, ops: Ops, origin: Origin) -> Option<Self> {
+    /// ([`open`]), its log carrying the head's `ops` and `origin`, and rooted as `kept` says
+    /// where the head keeps a rooted log's frame: `None` where it does not take every one of
+    /// them, held.
+    fn read_through_head(
+        mut self,
+        records: Vec<Record>,
+        ops: Ops,
+        origin: Origin,
+        kept: Option<super::stored::Kept>,
+    ) -> Option<Self> {
         if !self.is_empty() {
             return None;
         }
         let count = records.len();
+        let mut records = records.into_iter();
+        if let Some(kept) = kept {
+            // The genesis, then the log of it rooted, then the rest: a record that follows a
+            // dropped one places only by its stub.
+            if !self.insert(records.next()?).ok()? {
+                return None;
+            }
+            let log = self.log.as_ref()?;
+            if kept.network != *log.network() {
+                return None;
+            }
+            let rooted = log
+                .rebuilt_with(kept.into_rooting(), &BTreeSet::new(), records.by_ref())
+                .ok()?;
+            self.log = Some(rooted);
+        }
         for record in records {
             if !self.insert(record).ok()? {
                 return None;
@@ -686,7 +750,8 @@ impl Store {
         if log.waiting() != 0 || !self.unrooted.is_empty() || order.len() != log.held_count() {
             return;
         }
-        let mut at = 0u64;
+        let mut at = self.file_lead;
+        origin.lead = self.file_lead;
         for &(id, len) in order.iter() {
             if log.get(&id).is_none() || origin.places.insert(id, (at, len)).is_some() {
                 return;

@@ -283,6 +283,7 @@ fn status_enforces_the_clients_identity_floor_and_empty_welcome() {
             frame_wait: wait,
             policy,
             keeper_caps: Cell::new(0),
+            keeper_version: OnceCell::new(),
             syncs: Cell::new(0),
             synced: Cell::new(0),
             retiring: RefCell::new(Vec::new()),

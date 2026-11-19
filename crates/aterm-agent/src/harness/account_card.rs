@@ -470,7 +470,7 @@ impl LoginHalf {
             accounts::LoginHere::NotMade => return Self::SignedOut { at: None },
             accounts::LoginHere::SignedOut => {
                 return Self::SignedOut {
-                    at: accounts::login_ended_at(row, logins, state),
+                    at: accounts::sign_out_ended_at(row, logins, state),
                 };
             }
             // Its token carries its sessions past its stored login's end, as a token in use does.

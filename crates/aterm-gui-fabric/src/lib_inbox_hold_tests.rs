@@ -2781,7 +2781,7 @@ fn a_wait_parked_with_nothing_owed_answers_stale_when_a_later_debt_goes_stale() 
                 inbox
                     .fetches
                     .iter()
-                    .any(|(o, slot)| *o == 7 && matches!(slot, FetchSlot::Pending)),
+                    .any(|entry| entry.off == 7 && matches!(entry.slot, FetchSlot::Pending)),
                 "the fetch released its guard, so it is parked"
             );
             assert_eq!(stale_in(), None, "and it parked with nothing owed");
@@ -4698,6 +4698,566 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
     });
 }
 
+/// A WHOLE FETCHED ANSWER NO READ WAITS FOR IS ANSWERED `OK unrequested=1` AND STILL CACHED
+/// (ATERM-KI-1114-1414): `inbox get @77` parks a fetch, and its read ends before the bridge
+/// answers (here its wait runs out at once, `ERR timeout`, as the product's does after
+/// `FETCH_WAIT_MS`), which takes its slot out. The bridge's whole answer is then cached for a
+/// later read, which it answers, and its line is answered `OK unrequested=1`: no session was
+/// handed it, and the bridge notes an own receipt as handed only at a plain `OK` (aterm-link's
+/// `Bridge::answer_fetch`). An answer a parked read waits for is answered `OK`. NEGATIVE CONTROL
+/// (run by hand, 2026-11-17): `deliver_fetched` answering the cached line `OK`, as before, fails
+/// the `unrequested` assertion with `left: "OK\n"`.
+#[test]
+fn a_whole_fetched_answer_no_read_waits_for_is_answered_unrequested_and_cached() {
+    with_link(|| {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        attach_up(&store, next_bridge_generation());
+        let fetched = |off: u64, text: &str| {
+            cmd_deliver(
+                &store,
+                &format!(
+                    "{sid} fetched={off} from=t0000100000@n-lab kind=note trust=agent text={text}"
+                ),
+            )
+        };
+        assert_eq!(
+            inbox_get_at_within(&ctx, 77, std::time::Duration::ZERO),
+            "ERR timeout off=77\n",
+            "PRECONDITION: the read ended before its answer came"
+        );
+        assert_eq!(
+            fetched(77, "late"),
+            "OK unrequested=1\n",
+            "no read waits for the answer: no session was handed it"
+        );
+        assert_eq!(
+            cmd_inbox_get(&ctx, "@77"),
+            "OK 4 off=77 from=t0000100000@n-lab kind=note trust=agent\nlate",
+            "a later read is answered from the cache"
+        );
+        let reader = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                fetch_waits_a_hang();
+                cmd_inbox_get(&ctx, "@78")
+            })
+        };
+        await_parked(&store, &sid, 78);
+        assert_eq!(
+            fetched(78, "waited"),
+            "OK\n",
+            "a parked read waits for the answer"
+        );
+        assert_eq!(
+            reader.join().expect("the reader finished"),
+            "OK 6 off=78 from=t0000100000@n-lab kind=note trust=agent\nwaited"
+        );
+    });
+}
+
+/// `sid`'s bridge answering its fetch of `off` whole with `text`.
+fn fetched_whole(store: &Store, sid: &str, off: u64, text: &str) -> String {
+    cmd_deliver(
+        store,
+        &format!("{sid} fetched={off} from=t0000100000@n-lab kind=note trust=agent text={text}"),
+    )
+}
+
+/// The rendering of [`fetched_whole`]'s record at `off`.
+fn rendered(off: u64, text: &str) -> String {
+    format!(
+        "OK {} off={off} from=t0000100000@n-lab kind=note trust=agent\n{text}",
+        text.len()
+    )
+}
+
+/// Run what follows on this thread with `control`'s rule switched off ([`FETCH_CONTROL`]),
+/// until the guard drops.
+struct ControlOn;
+
+impl ControlOn {
+    fn new(control: FetchControl) -> Self {
+        FETCH_CONTROL.with(|on| on.set(Some(control)));
+        Self
+    }
+}
+
+impl Drop for ControlOn {
+    fn drop(&mut self) {
+        FETCH_CONTROL.with(|on| on.set(None));
+    }
+}
+
+/// A read of `off` on its own thread that stands aside at its settled answer
+/// ([`TEST_FETCH_STAND_ASIDE`]): the receiver hears that it woke to the answer, still listed on
+/// the fetch, and the sender lets it take the answer.
+fn standing_aside(
+    ctx: &std::sync::Arc<SessionCtx>,
+    off: u64,
+) -> (
+    std::thread::JoinHandle<String>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (woke, heard_woke) = std::sync::mpsc::channel();
+    let (let_go, go) = std::sync::mpsc::channel();
+    let ctx = ctx.clone();
+    let reader = std::thread::spawn(move || {
+        fetch_waits_a_hang();
+        TEST_FETCH_STAND_ASIDE.with(|aside| *aside.borrow_mut() = Some((woke, go)));
+        cmd_inbox_get(&ctx, &format!("@{off}"))
+    });
+    (reader, heard_woke, let_go)
+}
+
+/// AN ANSWERED FETCH IS NOT EVICTED FROM UNDER THE READ IT WAS ANSWERED FOR (ATERM-KI-1114-1414):
+/// a read parks on 500, seven whole answers no read waits for fill the other slots, and the
+/// bridge's answer to 500 is told `OK`. The read wakes to it and stands aside before it takes it
+/// ([`TEST_FETCH_STAND_ASIDE`]), as it does where another thread takes the Inbox lock first, and
+/// another read of the session, at 700, needs a slot. [`evict_answered_fetch`] takes the oldest
+/// answer kept for a later read (600), not 500's, which its read is listed on, and the woken read
+/// renders its record.
+/// NEGATIVE CONTROL (`FetchControl::EvictUnderARead`, run here): the eviction as before takes
+/// 500's answer, the first settled one, and the read the bridge was told took it answers
+/// `ERR no such record off=500`.
+#[test]
+fn an_answered_fetch_is_not_evicted_from_under_the_read_it_was_answered_for() {
+    let run = |control: Option<FetchControl>| {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            attach_up(&store, next_bridge_generation());
+            let (reader, heard_woke, let_go) = standing_aside(&ctx, 500);
+            await_parked(&store, &sid, 500);
+            for off in 600..600 + FETCH_SLOTS as u64 - 1 {
+                assert_eq!(
+                    fetched_whole(&store, &sid, off, "kept"),
+                    "OK unrequested=1\n",
+                    "PRECONDITION: no read waits for {off}"
+                );
+            }
+            assert_eq!(
+                ctx.fabric.lock().fetches.len(),
+                FETCH_SLOTS,
+                "PRECONDITION: every slot is in use"
+            );
+            let told = fetched_whole(&store, &sid, 500, "owed");
+            heard_woke
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the read woke to its answer and stood aside");
+            {
+                let _control = control.map(ControlOn::new);
+                assert_eq!(
+                    inbox_get_at_within(&ctx, 700, std::time::Duration::ZERO),
+                    "ERR timeout off=700\n",
+                    "PRECONDITION: the read at 700 is given a slot"
+                );
+            }
+            let_go.send(()).expect("the read still stands aside");
+            (told, reader.join().expect("the reader finished"))
+        })
+    };
+    assert_eq!(
+        run(None),
+        ("OK\n".to_string(), rendered(500, "owed")),
+        "the read the bridge was told took the answer renders it"
+    );
+    assert_eq!(
+        run(Some(FetchControl::EvictUnderARead)),
+        (
+            "OK\n".to_string(),
+            "ERR no such record off=500\n".to_string()
+        ),
+        "NEGATIVE CONTROL: an answer evicted from under its read is a record the bridge reads \
+         as handed that no session got"
+    );
+}
+
+/// EVERY SLOT HELD BY AN ANSWER ITS READ HAS YET TO TAKE REFUSES WHAT COMES NEXT AND LOSES
+/// NOTHING (ATERM-KI-1114-1414): [`FETCH_SLOTS`] reads park, and each is answered `OK` and
+/// stands aside before it takes its answer. A read of another offset is refused the documented
+/// `ERR busy` (its caller asks again), and a whole answer no read waits for is answered
+/// `OK unrequested=1` and kept nowhere (the bridge, reading it unhanded, offers it again). Once the
+/// reads took their answers, those are a later read's to evict: the read at 600 is given a slot,
+/// where 600's earlier answer is not kept. The eviction rule's negative control is
+/// [`an_answered_fetch_is_not_evicted_from_under_the_read_it_was_answered_for`]'s.
+#[test]
+fn every_slot_owed_to_its_read_refuses_the_next_read_busy_and_keeps_no_unrequested_answer() {
+    with_link(|| {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        attach_up(&store, next_bridge_generation());
+        let offs: Vec<u64> = (500..500 + FETCH_SLOTS as u64).collect();
+        let mut readers = Vec::new();
+        for &off in &offs {
+            readers.push(standing_aside(&ctx, off));
+            await_parked(&store, &sid, off);
+        }
+        for (&off, (_, heard_woke, _)) in offs.iter().zip(&readers) {
+            assert_eq!(
+                fetched_whole(&store, &sid, off, "owed"),
+                "OK\n",
+                "a live read waits for {off}"
+            );
+            heard_woke
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the read woke to its answer and stood aside");
+        }
+        assert_eq!(
+            inbox_get_at_within(&ctx, 700, std::time::Duration::ZERO),
+            format!(
+                "ERR busy: {FETCH_SLOTS} inbox reads already waiting; retry when one answers\n"
+            ),
+            "no answer a read has yet to take is evicted for another read"
+        );
+        assert_eq!(
+            fetched_whole(&store, &sid, 600, "unasked"),
+            "OK unrequested=1\n",
+            "a whole answer past the slots is no record handed"
+        );
+        assert!(
+            ctx.fabric.lock().fetch_at(600).is_none(),
+            "and it is kept nowhere"
+        );
+        for (&off, (reader, _, let_go)) in offs.iter().zip(readers) {
+            let_go.send(()).expect("the read still stands aside");
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                rendered(off, "owed")
+            );
+        }
+        assert_eq!(
+            inbox_get_at_within(&ctx, 600, std::time::Duration::ZERO),
+            "ERR timeout off=600\n",
+            "a taken answer makes room, and 600's unrequested answer was not kept"
+        );
+    });
+}
+
+/// A FETCHED ANSWER TO A READ WHOSE CALLER HUNG UP UNHEARD IS ANSWERED `OK unrequested=1`
+/// (ATERM-KI-1114-1414): a read parked on 900 serves a connection whose caller then closes, on a
+/// lane that never hears it (`Lane::SERVED.ignoring_hangup()`, as a park is between its
+/// `HANGUP_POLL` asks, or past a lost ring for up to `ARMED_POLL`), so the read is still listed
+/// and pending when the bridge's whole answer comes. [`deliver_fetched`] asks the read's
+/// connection itself ([`FetchRead::live`]) and answers the line `OK unrequested=1`: the read
+/// sends the record to a closed connection, and the answer stays kept for a later read, which
+/// it answers. A read on the same lane whose caller is still there is answered `OK`.
+/// NEGATIVE CONTROL (`FetchControl::HungUpReadLive`, run here): every listed read counted live,
+/// as before, the line is answered `OK`, a record the bridge notes as handed that no session got.
+#[cfg(unix)]
+#[test]
+fn a_fetched_answer_to_a_read_whose_caller_hung_up_unheard_is_answered_unrequested() {
+    use std::os::fd::AsRawFd as _;
+
+    fn parked_serving(
+        ctx: &std::sync::Arc<SessionCtx>,
+        off: u64,
+        server: aterm_uds::CtlStream,
+    ) -> std::thread::JoinHandle<String> {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _serving = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+            fetch_waits_a_hang();
+            TEST_INBOX_LANE.with(|lane| {
+                lane.set(Some(aterm_control::park::Lane::SERVED.ignoring_hangup()));
+            });
+            cmd_inbox_get(&ctx, &format!("@{off}"))
+        })
+    }
+
+    let run = |control: Option<FetchControl>| {
+        with_link(|| {
+            stale_after_a_hang();
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            attach_up(&store, next_bridge_generation());
+
+            let (client, server) = aterm_uds::CtlStream::pair().expect("socket pair");
+            let reader = parked_serving(&ctx, 901, server);
+            await_parked(&store, &sid, 901);
+            assert_eq!(
+                fetched_whole(&store, &sid, 901, "heard"),
+                "OK\n",
+                "a read whose caller is there takes the answer"
+            );
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                rendered(901, "heard")
+            );
+            drop(client);
+
+            let (client, server) = aterm_uds::CtlStream::pair().expect("socket pair");
+            let served = server.as_raw_fd();
+            let reader = parked_serving(&ctx, 900, server);
+            await_parked(&store, &sid, 900);
+            drop(client);
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the read's connection to read as closed",
+                || aterm_uds::hangup::fd_peer_closed(served).then_some(()),
+            );
+            {
+                let inbox = ctx.fabric.lock();
+                let unheard = inbox.fetch_at(900).is_some_and(|i| {
+                    let entry = &inbox.fetches[i];
+                    matches!(entry.slot, FetchSlot::Pending) && entry.reads.len() == 1
+                });
+                assert!(
+                    unheard,
+                    "PRECONDITION: the parked read has not heard its caller go"
+                );
+            }
+            let told = {
+                let _control = control.map(ControlOn::new);
+                fetched_whole(&store, &sid, 900, "unheard")
+            };
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                rendered(900, "unheard"),
+                "the read sends the record to its closed connection"
+            );
+            assert_eq!(
+                cmd_inbox_get(&ctx, "@900"),
+                rendered(900, "unheard"),
+                "the answer is kept for a later read"
+            );
+            told
+        })
+    };
+    assert_eq!(
+        run(None),
+        "OK unrequested=1\n",
+        "no live read took the answer: no session was handed it"
+    );
+    assert_eq!(
+        run(Some(FetchControl::HungUpReadLive)),
+        "OK\n",
+        "NEGATIVE CONTROL: counted live, the hung-up read's answer reads as handed"
+    );
+}
+
+/// A LINE PAST A WHOLE ANSWER ITS READ HAS YET TO TAKE KEEPS NOTHING (ATERM-KI-1114-1414): a read
+/// parks on 500, and the bridge's whole answer is told `OK`. The read wakes to it and stands
+/// aside before it takes it ([`TEST_FETCH_STAND_ASIDE`]), as it does where another thread takes
+/// the Inbox lock first, and the bridge answers 500 again, as it may a fetch two outbox peeks
+/// listed before its answer landed: a first chunk (`more=1`), then `err=no-record`.
+/// [`deliver_fetched`] answers each `OK unrequested=1` and keeps the whole answer, and the woken
+/// read renders the record the bridge was told it took.
+/// NEGATIVE CONTROL (`FetchControl::ReplaceAnUntakenAnswer`, run here): each line replaces the
+/// answer as before and is answered `OK`, and the read the bridge was told took the whole answer
+/// answers `ERR no such record off=500`.
+#[test]
+fn a_line_past_a_whole_answer_its_read_has_yet_to_take_keeps_nothing() {
+    let run = |control: Option<FetchControl>| {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            attach_up(&store, next_bridge_generation());
+            let (reader, heard_woke, let_go) = standing_aside(&ctx, 500);
+            await_parked(&store, &sid, 500);
+            assert_eq!(
+                fetched_whole(&store, &sid, 500, "owed"),
+                "OK\n",
+                "PRECONDITION: a live read waits for 500"
+            );
+            heard_woke
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the read woke to its answer and stood aside");
+            let past = {
+                let _control = control.map(ControlOn::new);
+                [
+                    format!(
+                        "{sid} fetched=500 from=t0000100000@n-lab kind=note trust=agent more=1 \
+                         text=chunk"
+                    ),
+                    format!("{sid} fetched=500 err=no-record"),
+                ]
+                .map(|line| cmd_deliver(&store, &line))
+            };
+            let_go.send(()).expect("the read still stands aside");
+            (past, reader.join().expect("the reader finished"))
+        })
+    };
+    let unrequested = "OK unrequested=1\n".to_string();
+    assert_eq!(
+        run(None),
+        ([unrequested.clone(), unrequested], rendered(500, "owed")),
+        "a line past a whole answer its read has yet to take is no record handed, and the read \
+         takes the whole answer"
+    );
+    assert_eq!(
+        run(Some(FetchControl::ReplaceAnUntakenAnswer)),
+        (
+            ["OK\n".to_string(), "OK\n".to_string()],
+            "ERR no such record off=500\n".to_string()
+        ),
+        "NEGATIVE CONTROL: a whole answer replaced under its read is a record the bridge reads as \
+         handed that no session got"
+    );
+}
+
+/// A LOG SWITCH FAILS A WHOLE ANSWER ITS READ HAS YET TO TAKE `log-replaced`
+/// (ATERM-KI-1114-1414): on log A, reads park on 5 and 500, and the bridge's whole answer to
+/// each is told `OK`. Each read wakes to its answer and stands aside before it takes it
+/// ([`TEST_FETCH_STAND_ASIDE`]), as it does where the bridge's next line takes the Inbox lock
+/// first, and the bridge then tells a move. [`Inbox::forget_bus_offsets`] keeps each answer at
+/// or above the fork for its read and fails it: told another log (fork 0), both reads answer
+/// `ERR fetch failed reason=log-replaced`; told A's next generation `continues=20`, the read at
+/// 500 does, and the read at 5, below the fork, renders its record.
+/// NEGATIVE CONTROL (`FetchControl::DropAnsweredOnLogSwitch`, run here): the move as before drops
+/// each answer at or above the fork, and its read answers `ERR no such record`, though the
+/// record it asked for was on the log.
+#[test]
+fn a_log_switch_fails_a_whole_answer_its_read_has_yet_to_take_log_replaced() {
+    let a0 = format!("{}.0", "aa".repeat(16));
+    let a1 = format!("{}.1", "aa".repeat(16));
+    let another = format!("{}.0", "bb".repeat(16));
+    let lineage = format!("{a1} continues=20 was={a0}");
+    let run = |moved: &str, control: Option<FetchControl>| {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |line: &str| cmd_link(&store, &format!("log {line}"), Some(generation));
+            assert_eq!(
+                tell(&a0),
+                "OK\n",
+                "PRECONDITION: the first log forgets nothing"
+            );
+            let mut readers = Vec::new();
+            for off in [5, 500] {
+                let (reader, heard_woke, let_go) = standing_aside(&ctx, off);
+                await_parked(&store, &sid, off);
+                assert_eq!(
+                    fetched_whole(&store, &sid, off, "owed"),
+                    "OK\n",
+                    "PRECONDITION: a live read waits for {off}"
+                );
+                heard_woke
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("the read woke to its answer and stood aside");
+                readers.push((reader, let_go));
+            }
+            {
+                let _control = control.map(ControlOn::new);
+                assert_eq!(
+                    tell(moved),
+                    "OK forgot=1\n",
+                    "PRECONDITION: `{moved}` moves the log"
+                );
+            }
+            readers
+                .into_iter()
+                .map(|(reader, let_go)| {
+                    let_go.send(()).expect("the read still stands aside");
+                    reader.join().expect("the reader finished")
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let replaced = |off: u64| format!("ERR fetch failed reason=log-replaced off={off}\n");
+    let dropped = |off: u64| format!("ERR no such record off={off}\n");
+    assert_eq!(
+        run(&another, None),
+        [replaced(5), replaced(500)],
+        "another log: each answer a read has yet to take fails for it"
+    );
+    assert_eq!(
+        run(&lineage, None),
+        [rendered(5, "owed"), replaced(500)],
+        "a lineage move fails the answer at or above the fork and keeps the one below"
+    );
+    assert_eq!(
+        run(&another, Some(FetchControl::DropAnsweredOnLogSwitch)),
+        [dropped(5), dropped(500)],
+        "NEGATIVE CONTROL: dropped, the answers' reads say the log holds no such record"
+    );
+    assert_eq!(
+        run(&lineage, Some(FetchControl::DropAnsweredOnLogSwitch)),
+        [rendered(5, "owed"), dropped(500)],
+        "NEGATIVE CONTROL: dropped at or above the fork, the answer's read says the log holds no \
+         such record"
+    );
+}
+
+/// ONE READ OF A SHARED OFFSET THAT ENDS LEAVES THE FETCH TO THE OTHERS (ATERM-KI-1114-1414): a
+/// read parks on 800 for a hang detector, and a second read of 800 ends at once
+/// (`ERR timeout off=800`). [`Inbox::leave_fetch`] takes only that read off the fetch, which
+/// stays listed for the first: the outbox peek still lists it, so the bridge, which answers each
+/// fetch the peek lists, answers it whole and is told `OK`, and the first read renders the record.
+/// NEGATIVE CONTROL (`FetchControl::LeaveUnderARead`, run here): the second read's leave takes
+/// the fetch out from under the first, as before. The peek no longer lists 800, so the bridge
+/// sends nothing, and the first read, woken as its park's next look would wake it (no later than
+/// the stale horizon, `park_until`), answers `ERR no such record off=800`.
+#[test]
+fn one_read_of_a_shared_offset_that_ends_leaves_the_fetch_to_the_others() {
+    let run = |control: Option<FetchControl>| {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            attach_up(&store, next_bridge_generation());
+            let waiting = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@800")
+                })
+            };
+            await_parked(&store, &sid, 800);
+            {
+                let _control = control.map(ControlOn::new);
+                assert_eq!(
+                    inbox_get_at_within(&ctx, 800, std::time::Duration::ZERO),
+                    "ERR timeout off=800\n",
+                    "PRECONDITION: the second read ends at once"
+                );
+            }
+            let listed = {
+                let inbox = ctx.fabric.lock();
+                inbox.fetch_at(800).map(|i| inbox.fetches[i].reads.len())
+            };
+            let asked = cmd_outbox(&store, "").contains(&format!("fetch sid={sid} off=800\n"));
+            let told = if asked {
+                Some(fetched_whole(&store, &sid, 800, "kept"))
+            } else {
+                // Asked for nothing, the bridge sends nothing, and the parked read looks again at
+                // its stale horizon (`park_until`): this ring stands in for it.
+                ctx.fabric.changed.ring(ctx.fabric.lock());
+                None
+            };
+            (
+                listed,
+                asked,
+                told,
+                waiting.join().expect("the reader finished"),
+            )
+        })
+    };
+    assert_eq!(
+        run(None),
+        (
+            Some(1),
+            true,
+            Some("OK\n".to_string()),
+            rendered(800, "kept")
+        ),
+        "the fetch stays listed for the read still waiting, which takes the answer"
+    );
+    assert_eq!(
+        run(Some(FetchControl::LeaveUnderARead)),
+        (
+            None,
+            false,
+            None,
+            "ERR no such record off=800\n".to_string()
+        ),
+        "NEGATIVE CONTROL: taken out from under its other read, the fetch is asked of no bridge, \
+         and that read says the log holds no such record"
+    );
+}
+
 #[test]
 fn after_a_log_switch_the_refill_floor_is_the_new_logs() {
     with_link(|| {
@@ -5912,7 +6472,11 @@ fn a_proved_move_told_again_keeps_a_session_on_an_earlier_generation_of_the_new_
             None,
             "NEGATIVE CONTROL: the rule before forgot {b}.0"
         );
-        assert_eq!(again.keep_below(held), Some(20), "{b}.0 is in the chain");
+        assert_eq!(
+            again.keep_below(held, None),
+            Some(20),
+            "{b}.0 is in the chain"
+        );
         // A later generation of `was`, told as a move from it by an attach whose witness then
         // never moved off it (the sim's keyed reminted seed 90): kept because the session holds
         // only offsets below that move's cut (the tell forgot the rest, and nothing is delivered
@@ -5931,16 +6495,20 @@ fn a_proved_move_told_again_keeps_a_session_on_an_earlier_generation_of_the_new_
             None,
             "NEGATIVE CONTROL: the rule before forgot {a}.1"
         );
-        assert_eq!(again.keep_below(later), Some(20), "{a}.1 is in the chain");
+        assert_eq!(
+            again.keep_below(later, None),
+            Some(20),
+            "{a}.1 is in the chain"
+        );
         let lineage = clock(&format!("{a}.2"), &format!("{a}.0"));
         assert_eq!(
-            lineage.keep_below(LogIdentity::parse(&format!("{a}.3"))),
+            lineage.keep_below(LogIdentity::parse(&format!("{a}.3")), None),
             None,
             "a lineage move keeps no generation past the one it names"
         );
         for other in [format!("{c}.0"), format!("{b}.2")] {
             assert_eq!(
-                again.keep_below(LogIdentity::parse(&other)),
+                again.keep_below(LogIdentity::parse(&other), None),
                 None,
                 "{other} is not in the chain"
             );
@@ -5956,6 +6524,313 @@ fn a_proved_move_told_again_keeps_a_session_on_an_earlier_generation_of_the_new_
             "25, at or above the fork, is shown"
         );
     });
+}
+
+/// A SECOND REMINT TOLD FROM THE LOG BEFORE THE FIRST (ATERM-KI-1116-7314, the sim's reminted
+/// seed 522): a bridge proved that `<b>.0` holds `<a>.0`'s records below 14 and told it, and its
+/// attach was refused before its witness left `<a>.0`; astream then reminted `<b>.0` as `<c>.0`,
+/// and the next attach proves `<c>.0` from `<a>.0`'s samples and tells
+/// `<c>.0 continues=20 was=<a>.0 proved=1`. The session holds `<b>.0`, which is neither `was` nor
+/// a generation of it or of the new log, but the move that took it there (its `via`,
+/// `Inbox::bus_via`) said `<b>.0` holds `<a>.0`'s records below 14: it keeps below the lower
+/// fork, 7 and 13, and forgets 16, which it was handed on `<b>.0` above that move's fork. So does
+/// a session registered on `<b>.0` after the first tell (`register_on_log`), and the node's
+/// given-up range told on `<b>.0` below both forks stays named (`NodeGaps::log_moved`). A session
+/// whose `via` names another log (`<d>.0`) forgets everything, and one holding `was` itself keeps
+/// below this move's fork whatever its `via`. NEGATIVE CONTROL: the rule before (no `via`) kept
+/// nothing on `<b>.0`, so 7 and 13 were shown again, each a second row; and (run) an endpoint
+/// that reads no `via` in `keep_below`, sets none in `cmd_link_log` or in `register_on_log`, or
+/// passes none to `NodeGaps::log_moved` fails this test. A lineage's move sets no `via`: the
+/// chain rules bound a later move from its `was`, and the sim's controls of those rules
+/// (`EpRules::chain`, `EpRules::proved_chain`) went unwitnessed with one.
+#[test]
+fn a_second_remint_told_from_the_log_before_the_first_keeps_below_both_forks() {
+    with_link(|| {
+        let store = new_store();
+        let (sid, _ctx) = registered(&store);
+        let generation = next_bridge_generation();
+        attach_up(&store, generation);
+        let (a, b, c, d) = (
+            "aa".repeat(16),
+            "bb".repeat(16),
+            "cc".repeat(16),
+            "dd".repeat(16),
+        );
+        let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+        let at =
+            |off: u64, text: &str| deliver(&store, &sid, off, "t0000100000@n-lab", "note", text);
+        assert_eq!(tell(format!("{a}.0")), "OK\n");
+        assert_eq!(at(7, "seven"), "OK 1\n");
+        assert_eq!(at(13, "thirteen"), "OK 2\n");
+        assert_eq!(
+            tell(format!("{b}.0 continues=14 was={a}.0 proved=1")),
+            "OK forgot=1\n"
+        );
+        assert_eq!(at(13, "thirteen"), "OK 2\n", "13 is below the first fork");
+        let late = test_handle(2);
+        let late_sid = late.sid.as_str().to_string();
+        let late_ctx = late.ctx.clone();
+        register_on_log(&late_ctx, || {
+            store
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .register(late);
+        });
+        let late_at = |off: u64| deliver(&store, &late_sid, off, "t0000100000@n-lab", "note", "x");
+        let late_nine = late_at(9);
+        assert!(late_nine.starts_with("OK "), "{late_nine}");
+        assert_eq!(at(16, "b-at-16"), "OK 3\n", "16 on {b}.0, above its fork");
+        assert_eq!(
+            cmd_link(&store, "gap from=2 to=6", Some(generation)),
+            "OK\n"
+        );
+
+        let ident = |log: String| LogIdentity::parse(&log).expect("an identity");
+        let second = LogClock {
+            ident: ident(format!("{c}.0")),
+            continues: Some((ident(format!("{a}.0")), 20)),
+        };
+        let held = Some(ident(format!("{b}.0")));
+        let via = |log: &str, fork: u64| Some((ident(format!("{log}.0")), fork));
+        assert_eq!(
+            second.keep_below(held, None),
+            None,
+            "NEGATIVE CONTROL: the rule before keeps nothing on {b}.0"
+        );
+        assert_eq!(
+            second.keep_below(held, via(&a, 14)),
+            Some(14),
+            "the lower fork"
+        );
+        assert_eq!(
+            second.keep_below(held, via(&a, 30)),
+            Some(20),
+            "the lower fork"
+        );
+        assert_eq!(
+            second.keep_below(held, via(&d, 14)),
+            None,
+            "a via from another log keeps nothing"
+        );
+        assert_eq!(
+            second.keep_below(Some(ident(format!("{a}.0"))), via(&d, 14)),
+            Some(20),
+            "a session on was keeps below this move's fork"
+        );
+        assert_eq!(second.keep_below(None, via(&a, 14)), None, "no clock");
+
+        assert_eq!(
+            tell(format!("{c}.0 continues=20 was={a}.0 proved=1")),
+            "OK forgot=1\n"
+        );
+        assert_eq!(at(7, "seven"), "OK 1\n", "7 is below both forks");
+        assert_eq!(at(13, "thirteen"), "OK 2\n", "13 is below both forks");
+        assert_eq!(
+            at(16, "c-at-16"),
+            "OK 4\n",
+            "16 is above the first fork: the record there is shown"
+        );
+        assert_eq!(late_at(9), late_nine, "the late session keeps 9");
+        assert_eq!(
+            fabric_gap_facts(),
+            " mail_gaps=1 mail_gap=@2..@6",
+            "the node's range below both forks is still named"
+        );
+
+        let other = new_store();
+        let (other_sid, other_ctx) = registered(&other);
+        let other_tell = |line: String| cmd_link(&other, &format!("log {line}"), Some(generation));
+        let other_at =
+            |off: u64| deliver(&other, &other_sid, off, "t0000100000@n-lab", "note", "x");
+        assert!(other_tell(format!("{d}.0")).starts_with("OK"));
+        assert_eq!(other_at(7), "OK 1\n");
+        assert_eq!(
+            other_tell(format!("{b}.0 continues=14 was={d}.0 proved=1")),
+            "OK forgot=1\n"
+        );
+        assert_eq!(other_at(7), "OK 1\n");
+        assert_eq!(
+            other_tell(format!("{c}.0 continues=20 was={a}.0 proved=1")),
+            "OK forgot=1\n"
+        );
+        assert_eq!(
+            other_at(7),
+            "OK 2\n",
+            "a via from {d}.0 keeps nothing across a move from {a}.0"
+        );
+        let via_of = |ctx: &SessionCtx| ctx.fabric.lock().bus_via;
+        assert_eq!(
+            via_of(&other_ctx),
+            Some((ident(format!("{a}.0")), 20)),
+            "the proved move is the session's via"
+        );
+        assert_eq!(
+            other_tell(format!("{c}.1 continues=3 was={c}.0")),
+            "OK forgot=1\n"
+        );
+        assert_eq!(
+            via_of(&other_ctx),
+            None,
+            "a lineage's move is no via: the chain rules bound a later move from its was"
+        );
+    });
+}
+
+/// A SESSION A SEAMLESS UPDATE CARRIED ONTO THE LOG A PROVED MOVE TOLD (ATERM-KI-1116-7314's
+/// second remint, the review of 2026-11-17): the move `<a>.0`→`<b>.0` proved and told, its
+/// attach refused before its witness left `<a>.0`, and aterm updated seamlessly; the carry puts
+/// the session back on `<b>.0` holding no `via` (`Inbox::bus_via` is not carried). The
+/// successor's bridge, its witness still on `<a>.0`, tells the step it stored again
+/// (`<b>.0 continues=14 was=<a>.0 proved=1`), its attach is refused too, and astream remints
+/// `<b>.0` as `<c>.0`, told `<c>.0 continues=20 was=<a>.0 proved=1`. The carried session takes
+/// the move told again for its `via` though it already holds `<b>.0` (`Inbox::take_clock`:
+/// from `cmd_link_log`'s tell of the log it holds, or from `register_on_log` where that tell
+/// came before it registered), so it keeps its carried marks below 14 and takes their refills
+/// back without a second mail-in, and forgets 16, above the first fork, whose record on `<c>.0`
+/// is another mail. A later proved move of the log a session holds replaces its `via`; a clock
+/// of that log with none leaves it; a move takes the new clock's, none for a lineage's.
+/// NEGATIVE CONTROL: the carry alone holds no `via`, so before the move told again the session
+/// keeps nothing on `<b>.0`; and (run) `cmd_link_log` skipping a session on the told log with
+/// its `via` as carried fails the arm told after the session registered (past that assertion,
+/// it keeps no carried mark), `register_on_log` setting one only for a session that moves fails
+/// the arm told before it, a held `via` kept over the clock's proved move fails "replaces it",
+/// and one kept across a move (it names the log left: unsound) fails "a bare move takes none".
+#[test]
+fn a_carried_session_takes_the_proved_move_of_its_log_told_again_for_its_via() {
+    let mail_ins = |ctx: &SessionCtx| {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .facts
+            .iter()
+            .filter(|f| f.starts_with("inbox: MailIn"))
+            .count()
+    };
+    let (a, b, c, d) = (
+        "aa".repeat(16),
+        "bb".repeat(16),
+        "cc".repeat(16),
+        "dd".repeat(16),
+    );
+    let ident = |log: String| LogIdentity::parse(&log).expect("an identity");
+    let carry = with_link(|| {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        let generation = next_bridge_generation();
+        attach_up(&store, generation);
+        let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+        let at = |off: u64| deliver(&store, &sid, off, "t0000100000@n-lab", "note", "m");
+        assert_eq!(tell(format!("{a}.0")), "OK\n");
+        assert_eq!(at(7), "OK 1\n");
+        assert_eq!(at(13), "OK 2\n");
+        assert_eq!(
+            tell(format!("{b}.0 continues=14 was={a}.0 proved=1")),
+            "OK forgot=1\n"
+        );
+        assert_eq!(at(16), "OK 3\n", "16 on {b}.0, above its fork");
+        ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone())
+    });
+    assert_eq!(carry.bus_log, Some(format!("{b}.0")));
+    let mut marked = carry.marked.clone();
+    marked.sort_unstable();
+    assert_eq!(marked, [7, 13, 16], "the carried marks");
+    for told_first in [false, true] {
+        with_link(|| {
+            let store = new_store();
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+            let again = || tell(format!("{b}.0 continues=14 was={a}.0 proved=1"));
+            if told_first {
+                assert_eq!(again(), "OK\n");
+            }
+            let h = test_handle(1);
+            let sid = h.sid.as_str().to_string();
+            let ctx = h.ctx.clone();
+            ctx.timeline.lock().unwrap().log_carried = true;
+            ctx.fabric.seed_carry(&carry, &ctx.timeline);
+            assert_eq!(
+                ctx.fabric.lock().bus_via,
+                None,
+                "NEGATIVE CONTROL: the carry holds no via"
+            );
+            assert_eq!(
+                LogClock {
+                    ident: ident(format!("{c}.0")),
+                    continues: Some((ident(format!("{a}.0")), 20)),
+                }
+                .keep_below(Some(ident(format!("{b}.0"))), None),
+                None,
+                "NEGATIVE CONTROL: with none, the second remint keeps nothing on {b}.0"
+            );
+            register_on_log(&ctx, || {
+                store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+            });
+            if !told_first {
+                assert_eq!(again(), "OK\n");
+            }
+            assert_eq!(
+                ctx.fabric.lock().bus_via,
+                Some((ident(format!("{a}.0")), 14)),
+                "the move told again is the carried session's via (told first: {told_first})"
+            );
+            assert_eq!(
+                tell(format!("{c}.0 continues=20 was={a}.0 proved=1")),
+                "OK forgot=1\n"
+            );
+            let mut kept: Vec<u64> = ctx.fabric.lock().carried_marks.iter().copied().collect();
+            kept.sort_unstable();
+            assert_eq!(kept, [7, 13], "below both forks (told first: {told_first})");
+            let before = mail_ins(&ctx);
+            for off in [7, 13] {
+                let reply = deliver(&store, &sid, off, "t0000100000@n-lab", "note", "m");
+                assert!(reply.starts_with("OK "), "{reply}");
+            }
+            assert_eq!(
+                mail_ins(&ctx) - before,
+                0,
+                "7 and 13 are below both forks: their refills take the carried marks back \
+                 (told first: {told_first})"
+            );
+            let reply = deliver(&store, &sid, 16, "t0000100000@n-lab", "note", "m");
+            assert!(reply.starts_with("OK "), "{reply}");
+            assert_eq!(
+                mail_ins(&ctx) - before,
+                1,
+                "16 is above the first fork: its record on {c}.0 is another mail"
+            );
+        });
+    }
+
+    let clock = |log: &str, continues: Option<(&str, u64)>| LogClock {
+        ident: ident(format!("{log}.0")),
+        continues: continues.map(|(was, fork)| (ident(format!("{was}.0")), fork)),
+    };
+    let mut inbox = Inbox::default();
+    inbox.take_clock(clock(&b, Some((&a, 14))));
+    let via = |inbox: &Inbox| inbox.bus_via;
+    assert_eq!(via(&inbox), Some((ident(format!("{a}.0")), 14)), "a move");
+    inbox.take_clock(clock(&b, Some((&d, 10))));
+    assert_eq!(
+        via(&inbox),
+        Some((ident(format!("{d}.0")), 10)),
+        "a later proved move of the log held replaces it"
+    );
+    inbox.take_clock(clock(&b, None));
+    assert_eq!(
+        via(&inbox),
+        Some((ident(format!("{d}.0")), 10)),
+        "a clock of that log with none leaves it"
+    );
+    inbox.take_clock(clock(&c, None));
+    assert_eq!(via(&inbox), None, "a bare move takes none");
+    inbox.take_clock(clock(&c, Some((&a, 20))));
+    inbox.take_clock(LogClock {
+        ident: ident(format!("{c}.1")),
+        continues: Some((ident(format!("{c}.0")), 3)),
+    });
+    assert_eq!(via(&inbox), None, "a lineage's move takes none");
+    assert_eq!(inbox.bus_log, Some(ident(format!("{c}.1"))));
 }
 
 /// A log identity is astream's value, not its text: a bridge that names the clock this

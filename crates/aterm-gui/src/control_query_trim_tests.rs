@@ -63,6 +63,17 @@ fn text_order_display_reads_a_right_to_left_run_as_painted() {
         json.contains(",\"order\":\"display\",\"display_map\":[[0,1,2,4,3,5,6,7,8,9],null]"),
         "{json}"
     );
+    let trimmed = cmd_text_json_opt(&term, args("order=display trim"));
+    assert!(
+        trimmed.contains("\"rows\":[\"ab \u{05D1}\u{05D0}\",\"plain\"]"),
+        "{trimmed}"
+    );
+    assert!(
+        trimmed.ends_with(
+            ",\"trimmed\":1,\"order\":\"display\",\"display_map\":[[0,1,2,4,3,5,6,7,8,9],null]}\n"
+        ),
+        "{trimmed}"
+    );
     let plain = cmd_text_json_opt(&term, args("rows=0-1"));
     assert!(!plain.contains("display_map"), "{plain}");
 }
@@ -717,6 +728,9 @@ fn text_json_carries_first_for_a_shaped_read() {
         trimmed.ends_with(",\"trimmed\":2,\"first\":19}\n"),
         "{trimmed}"
     );
+    let blank = cmd_text_json_opt(&term, args("rows=22-23 trim"));
+    assert!(blank.starts_with("OK 1\n{\"rows\":[],"), "{blank}");
+    assert!(blank.ends_with(",\"trimmed\":2,\"first\":22}\n"), "{blank}");
     let span = cmd_text_json_opt(&term, args("rows=20-21"));
     assert!(
         span.starts_with("OK 1\n{\"rows\":[\"r20\",\"r21\"],"),
@@ -734,6 +748,24 @@ fn text_json_carries_first_for_a_shaped_read() {
         "a tail larger than the grid is the bare JSON"
     );
     assert!(!whole.contains("\"first\""), "{whole}");
+}
+
+#[test]
+fn shaped_logical_wire_replies_match_when_a_range_or_whole_screen_is_memoized() {
+    let term = term_with(24, "above\x1b[21;1H世界 e\u{301} \r\n".as_bytes());
+    let shaped = args("tail=5 trim");
+    let slot = crate::frame_memo::FrameSlot::default();
+    let json = || super::cmd_text_json_read(&term, &slot, shaped, || (None, None, 0), None, None);
+    let plain = || super::cmd_text_opt(&term, &slot, shaped);
+    let cold = json();
+    let expected = "OK 2 trimmed=3 first=19\n\n世界 e\u{301}\n";
+    assert!(cold.starts_with("OK 1\n{\"rows\":[\"\",\"世界 e\u{301}\"],"));
+    assert!(cold.ends_with(",\"trimmed\":3,\"first\":19}\n"));
+    assert_eq!(cold, cmd_text_json_opt(&term, shaped));
+    assert_eq!(plain(), expected);
+    let _ = super::cmd_text_opt(&term, &slot, TextArgs::default());
+    assert_eq!(json(), cold);
+    assert_eq!(plain(), expected);
 }
 
 #[test]

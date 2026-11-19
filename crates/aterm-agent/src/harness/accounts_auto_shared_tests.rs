@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The tests gated `cfg(unix)` here adopt a shared Claude account, whose sign-in opener aterm
-// links only on Unix (`cli::opener_link`).
-#![cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "some helpers serve only the tests gated `cfg(unix)`"
-    )
-)]
+// The tests gated `cfg(unix)` here run an automatic shared adoption to its provider, which reads
+// its private staged evidence only on Unix; off Unix the adoption is refused before anything is
+// consumed (`cli::shared_adoption::SHARED_EVIDENCE_UNAVAILABLE`, ATERM-KI-1117-63091).
 
 #[path = "accounts_auto_shared_identity_tests.rs"]
 mod identity_tests;
@@ -975,7 +969,6 @@ impl RenewalAdmission {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn blocked_shared_renewal_keeps_the_last_admitted_preparation() {
     let mut fixture = RenewalAdmission::new();
@@ -1016,7 +1009,6 @@ pub(crate) fn renewal_admission_transition(
     fixture.observe()
 }
 
-#[cfg(unix)]
 #[test]
 fn shared_renewal_admission_conforms_and_rejects_premature_history() {
     let model = aterm_models_harness::shared_renewal_admission_model();
@@ -1044,7 +1036,6 @@ fn shared_renewal_admission_conforms_and_rejects_premature_history() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn shared_renewal_backoffs_preserve_admission_history() {
     for bot in [false, true] {
@@ -1111,7 +1102,6 @@ fn a_new_shared_preparation_wakes_unchanged_unavailable_routes() {
     assert_eq!(bed.provider.calls.load(Ordering::SeqCst), 0);
 }
 
-#[cfg(unix)]
 #[test]
 fn uncertain_shared_renewal_requests_recovery_without_replaying_the_provider() {
     let bed = Bed::new(None);
@@ -1153,7 +1143,6 @@ fn uncertain_shared_renewal_requests_recovery_without_replaying_the_provider() {
     ));
 }
 
-#[cfg(unix)]
 #[test]
 fn shared_renewal_activity_names_the_running_route_and_ends_with_the_attempt() {
     for fails in [false, true] {
@@ -1506,7 +1495,6 @@ pub(crate) fn recovery_transition(
     next
 }
 
-#[cfg(unix)]
 #[test]
 fn shared_recovery_conforms_and_detects_the_silent_noop() {
     let model = aterm_models_harness::shared_recovery_model();
@@ -1534,10 +1522,6 @@ fn shared_recovery_conforms_and_detects_the_silent_noop() {
     }
 }
 
-/// Unix only, where aterm links the opener an unattended renewal's page is handed to
-/// (`cli::opener_link`); off Unix the sign-in ladder's
-/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs.
-#[cfg(unix)]
 #[test]
 fn a_shared_policy_stop_is_deferred_without_a_failure_or_retry_wait() {
     for during_provider in [false, true] {
@@ -1600,10 +1584,6 @@ fn a_shared_policy_stop_is_deferred_without_a_failure_or_retry_wait() {
     }
 }
 
-/// Unix only, where aterm links the opener an unattended renewal's page is handed to
-/// (`cli::opener_link`); off Unix the sign-in ladder's
-/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs.
-#[cfg(unix)]
 #[test]
 fn upkeep_renews_a_pinned_row_once_per_new_root_generation_without_a_terminal() {
     let bed = Bed::new(None);
@@ -1643,6 +1623,7 @@ fn upkeep_renews_a_pinned_row_once_per_new_root_generation_without_a_terminal() 
         &records.state,
         &accounts::enrolled(&roster),
         Some("walled"),
+        accounts::ModelWeek::Unread,
         &accounts::Point::Wall {
             window: String::new(),
             at: None,
@@ -1700,10 +1681,6 @@ fn shared_upkeep_refuses_missing_authority_routes_required_profiles_and_local_of
     }
 }
 
-/// Unix only, where aterm links the opener an unattended renewal's page is handed to
-/// (`cli::opener_link`); off Unix the sign-in ladder's
-/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs.
-#[cfg(unix)]
 #[test]
 fn a_stop_during_provider_work_consumes_the_attempt_but_publishes_no_login() {
     let bed = Bed::new(None);
@@ -1774,10 +1751,6 @@ fn queued_shared_work_rechecks_the_root_and_the_local_login_switch() {
     }
 }
 
-/// Unix only, where aterm links the opener an unattended renewal's page is handed to
-/// (`cli::opener_link`); off Unix the sign-in ladder's
-/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs.
-#[cfg(unix)]
 #[test]
 fn automatic_shared_renewal_refuses_a_profile_that_contradicts_the_successful_status() {
     let bed = Bed::new(None);
@@ -1805,8 +1778,6 @@ fn automatic_shared_renewal_refuses_a_profile_that_contradicts_the_successful_st
     );
 }
 
-// For the unattended-renewal tests alone, which run only where aterm links the opener (Unix).
-#[cfg(unix)]
 fn observed_upkeep(bed: &Bed) -> (Arc<Watched<AutoRenewGuard>>, Vec<String>) {
     let guard = AutoRenewGuard::default().shared();
     let lines = Arc::new(Mutex::new(Vec::new()));
@@ -1824,6 +1795,7 @@ fn observed_upkeep(bed: &Bed) -> (Arc<Watched<AutoRenewGuard>>, Vec<String>) {
 
 struct ExistingMustUseRenewal;
 
+#[cfg(unix)]
 struct ResumableAdoption {
     calls: AtomicUsize,
 }
@@ -2127,11 +2099,13 @@ fn held_shared_candidates_preserve_history_and_let_peers_run() {
     }
 }
 
+#[cfg(unix)]
 struct RevokedAfterRanking {
     grant: Grant,
     prepares: AtomicUsize,
 }
 
+#[cfg(unix)]
 impl Authority for RevokedAfterRanking {
     fn prepare(&self, _: &Row) -> Result<Grant, String> {
         if self.prepares.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -2369,10 +2343,12 @@ fn unavailable_native_preparation_keeps_first_chance_while_shared_work_progresse
     assert_eq!(native_reads.load(Ordering::SeqCst), 2);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 }
+#[cfg(unix)]
 struct RecordedAdoption {
     path: PathBuf,
     bytes: Vec<u8>,
 }
+#[cfg(unix)]
 impl super::super::cli::shared_provider::LoginProof for RecordedAdoption {
     fn identity(&self) -> &str {
         EMAIL
@@ -2389,6 +2365,7 @@ impl super::super::cli::shared_provider::LoginProof for RecordedAdoption {
             .ok_or_else(|| "changed profile".into())
     }
 }
+#[cfg(unix)]
 impl super::super::cli::shared_provider::Provider for ResumableAdoption {
     fn execute(
         &self,
@@ -2432,6 +2409,7 @@ impl super::super::cli::shared_provider::Provider for ResumableAdoption {
     }
 }
 
+#[cfg(unix)]
 fn observe_adoption_progress(phase: i64) -> [i64; 3] {
     let bed = Bed::with_custody(None, false);
     let guard = AutoRenewGuard::default().shared();
@@ -2517,6 +2495,7 @@ fn observe_adoption_progress(phase: i64) -> [i64; 3] {
     ]
 }
 
+#[cfg(unix)]
 pub(crate) fn adoption_progress_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -2669,7 +2648,6 @@ pub(crate) fn shared_progress_transition(
     next
 }
 
-#[cfg(unix)]
 #[test]
 fn shared_progress_with_live_discovery_and_persistent_guard_conforms() {
     let model = aterm_models_harness::shared_progress_model();
@@ -2698,10 +2676,6 @@ fn shared_progress_with_live_discovery_and_persistent_guard_conforms() {
     }
 }
 
-/// Unix only, where aterm links the opener an unattended renewal's page is handed to
-/// (`cli::opener_link`); off Unix the sign-in ladder's
-/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs.
-#[cfg(unix)]
 #[test]
 fn changed_shared_policy_during_provider_or_failed_status_is_deferred() {
     for during_status in [false, true] {
@@ -2788,8 +2762,6 @@ fn changed_shared_policy_during_provider_or_failed_status_is_deferred() {
         }
     }
 }
-// For the unattended-renewal tests alone, which run only where aterm links the opener (Unix).
-#[cfg(unix)]
 fn observe_disposition(before: bool, after: bool, provider: bool, replay: bool) -> [i64; 4] {
     let bed = Bed::new(None);
     bed.provider.stop.store(!after, Ordering::SeqCst);
@@ -2863,8 +2835,6 @@ fn observe_disposition(before: bool, after: bool, provider: bool, replay: bool) 
     ]
 }
 
-// For the unattended-renewal tests alone, which run only where aterm links the opener (Unix).
-#[cfg(unix)]
 pub(crate) fn disposition_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -2898,10 +2868,6 @@ pub(crate) fn disposition_transition(
     next
 }
 
-/// Unix only, where aterm links the opener an unattended renewal's page is handed to
-/// (`cli::opener_link`); off Unix the sign-in ladder's
-/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener` holds what runs.
-#[cfg(unix)]
 #[test]
 fn shared_dispositions_conform_and_failure_on_policy_refusal_is_detected() {
     let model = aterm_models_harness::shared_disposition_model();
@@ -2943,10 +2909,12 @@ fn shared_dispositions_conform_and_failure_on_policy_refusal_is_detected() {
 }
 
 /// A shared candidate whose provider's page meets a bot protection, counting its runs.
+#[cfg(unix)]
 struct CheckedCandidate {
     calls: Arc<AtomicUsize>,
 }
 
+#[cfg(unix)]
 impl super::super::cli::shared_provider::Provider for CheckedCandidate {
     fn execute(
         &self,
@@ -2985,11 +2953,13 @@ impl super::super::cli::shared_provider::Provider for CheckedCandidate {
 }
 
 /// [`CandidateApproval`] that counts the recoveries asked of it.
+#[cfg(unix)]
 struct CountedApproval {
     grant: Grant,
     recoveries: Arc<AtomicUsize>,
 }
 
+#[cfg(unix)]
 impl Authority for CountedApproval {
     fn prepare(&self, row: &Row) -> Result<Grant, String> {
         CandidateApproval(self.grant.clone()).prepare(row)

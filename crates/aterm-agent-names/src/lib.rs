@@ -73,7 +73,7 @@ pub fn agent_of(program: &str) -> Option<Agent> {
 fn is_muse_build(word: &str) -> bool {
     word.get(..9)
         .is_some_and(|p| p.eq_ignore_ascii_case("muse-bin-"))
-        && word[9..].starts_with(|c: char| c.is_ascii_digit())
+        && matches!(word.as_bytes().get(9), Some(b'0'..=b'9'))
 }
 
 /// The script runtimes an agent runs under without renaming itself (an npm or bun install of

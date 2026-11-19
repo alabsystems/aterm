@@ -323,6 +323,88 @@ fn dry_slice_memory_forecast_matches_the_shared_serial_and_refusal_plans() {
 }
 
 #[test]
+fn both_final_links_hold_their_full_parent_and_yield_to_an_older_waiter() {
+    use aterm_capacity::book::{Key, Records};
+    use aterm_capacity::{Fixed, Ledger, Need, Polled, Rank, Reading, Waiter};
+    const GIB: u64 = 1 << 30;
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let record = dir.path().join("units.json");
+    let mut history = Records::default();
+    let metric = if cfg!(target_os = "macos") {
+        "phys-footprint-tree-v1"
+    } else {
+        "maxrss-v1"
+    };
+    for (triple, peak) in [(super::ARM64, 39 * GIB), (super::X86_64, 28 * GIB)] {
+        history.push(
+            Key {
+                stage: "release slice unit".into(),
+                checkout: String::new(),
+                crates: Some(vec!["aterm".into()]),
+                variant: Some(format!("{triple} aterm bin {metric} prior-compiler")),
+            },
+            peak,
+            1,
+        );
+    }
+    history.save(&record).unwrap();
+    let units = crate::slice_units::Units::of(
+        &record,
+        &[super::ARM64, super::X86_64],
+        2,
+        &dir.path().join("private"),
+    );
+    let ledger = Ledger::at(dir.path().join("global"));
+    let mut reading = Reading::of_gib(256, 208, 36);
+    reading.pressure = Some(aterm_sysprobe::MemoryLevel::Normal);
+    let machine = Fixed::new(reading);
+    let reserve = || super::try_parallel_link_parent(&ledger, &machine, &units, 2).unwrap();
+    let wide = reserve().expect("both measured links fit");
+    // The 47 and 34 GiB compiler envelopes share a single parent with both 2 GiB drivers.
+    assert_eq!(wide.claim.record().need.mem, 85 * GIB);
+    assert!(wide.claim.alone().is_none());
+    assert!(
+        wide.units
+            .iter()
+            .all(|u| u.budget_bytes() == Some(81 * GIB))
+    );
+    assert_eq!(ledger.list().unwrap(), vec![wide.claim.record().clone()]);
+
+    let older = Waiter::enter_stand_in(
+        &ledger,
+        &machine,
+        Need::new("older exclusive release check")
+            .rank(Rank::Release)
+            .mem_gib(1)
+            .alone(),
+        Some(std::process::id() + 1),
+        wide.claim.record().start_ms.saturating_sub(1),
+    )
+    .unwrap();
+    let Polled::Waiting(older, _) = older.poll(&machine) else {
+        panic!("the live link reservation must block exclusive work");
+    };
+    let before = ledger.list().unwrap();
+    assert!(
+        reserve().is_none(),
+        "a later 85 GiB parent cannot jump the queue"
+    );
+    assert_eq!(
+        ledger.list().unwrap(),
+        before,
+        "a refused probe leaves no row"
+    );
+    drop(wide);
+    let Polled::Admitted(older) = older.poll(&machine) else {
+        panic!("releasing the parent must let the older check run");
+    };
+    assert!(older.alone().is_some());
+    drop(older);
+    assert!(ledger.list().unwrap().is_empty());
+}
+
+#[test]
 fn dry_slice_memory_forecast_waits_on_and_names_a_claimed_holder() {
     use aterm_capacity::{Fixed, Ledger, Need, Reading};
     use aterm_sysprobe::MemoryLevel;
@@ -931,11 +1013,11 @@ use super::{
     RELEASE_SYSTEM_PATH, ReleaseEnv, Renderer, SECTION_64_LEN, SEGMENT_COMMAND_64_LEN, SliceArch,
     SliceBuild, Stock, cargo_build_args, current_release_uid, parse_thin_macho_update_pin,
     publish_verified_output, release_build_command, release_env, release_tool_path,
-    resolve_release_rustup_shim_dir, slice_drives_a_session, turn_verdict,
-    validate_app_version_reports, validate_cli_app_version, validate_embedded_update_pin,
-    validate_final_slice_records, validate_lipo_architectures, validate_named_cli_app_version,
-    validate_slice_update_pin_reports, x86_64_probe_asset_name, x86_64_probe_transcript,
-    x86_64_slice_runs,
+    resolve_release_rustup_shim_dir, slice_drives_a_session, stock_install_remedy,
+    stock_release_remedy, turn_verdict, validate_app_version_reports, validate_cli_app_version,
+    validate_embedded_update_pin, validate_final_slice_records, validate_lipo_architectures,
+    validate_named_cli_app_version, validate_slice_update_pin_reports, x86_64_probe_asset_name,
+    x86_64_probe_transcript, x86_64_slice_runs,
 };
 
 #[test]
@@ -1665,6 +1747,11 @@ fn the_release_build_enables_no_development_seam() {
             compat.then_some("/h/.rustup"),
             "the compat slice's rustup home comes with its release"
         );
+        assert_eq!(
+            get("RUSTUP_AUTO_INSTALL").as_deref(),
+            compat.then_some("0"),
+            "the compat slice's rustup never installs a release its home lacks"
+        );
     }
 
     let root = aterm_tempfile::manifest_dir().join("..").join("..");
@@ -1753,6 +1840,109 @@ fn the_release_build_enables_no_development_seam() {
     let config: aterm_toml::Table =
         aterm_toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     assert_no_debug_assertions(".cargo/config.toml", &config);
+}
+
+/// EVERY STOCK CHILD ASKS RUSTUP WITH AUTO-INSTALL OFF: `Stock::env`, which `Stock::command` (and
+/// so `require_rustup_target_in`, `stock_rustc_version_in` and the seal's machine roots) and a
+/// slice's `release_env` take whole after clearing the environment, names rustup's home and the
+/// release, and `RUSTUP_AUTO_INSTALL=0`, so a read-only probe on a home that lacks the release
+/// fails rather than downloading it (and a person's own `RUSTUP_AUTO_INSTALL=0`, which the clear
+/// drops, is restored). NEGATIVE CONTROL: a `Stock::env` whose third entry is not
+/// `RUSTUP_AUTO_INSTALL=0` (the release named twice, `("RUSTUP_TOOLCHAIN", 1.99.1)` in its place)
+/// fails both assertions, and `the_release_build_enables_no_development_seam` fails with it;
+/// rustup would then install a minimal release before each probe answers.
+#[test]
+fn every_stock_child_asks_rustup_with_auto_install_off() {
+    let stock = Stock {
+        home: "/h".into(),
+        rustup_home: "/h/.rustup".into(),
+        toolchain: "1.99.1".into(),
+        shim: Ok("/tooling/rustup-1.29.2/bin".into()),
+    };
+    assert_eq!(
+        stock.env(),
+        [
+            ("RUSTUP_HOME", OsString::from("/h/.rustup")),
+            ("RUSTUP_TOOLCHAIN", OsString::from("1.99.1")),
+            ("RUSTUP_AUTO_INSTALL", OsString::from("0")),
+        ]
+    );
+    let child = stock.command("rustup").unwrap();
+    let auto_install = child
+        .get_envs()
+        .find(|(name, _)| *name == "RUSTUP_AUTO_INSTALL")
+        .and_then(|(_, value)| value);
+    assert_eq!(
+        auto_install,
+        Some(std::ffi::OsStr::new("0")),
+        "{:?}",
+        child.get_envs().collect::<Vec<_>>()
+    );
+}
+
+/// WHAT INSTALLS A MISSING STOCK RELEASE IS NAMED FOR THE COMMIT WHOSE LOCK NAMES IT: where this
+/// checkout's `trust.lock` names the same release, `verify provision rustup` here installs it and
+/// is named alone; where it names another (a `ship check --compat --commit REV` of an older
+/// commit, a cut's candidate ahead of this checkout) or does not read, that command is named in a
+/// checkout at the commit, first, with the release's own install line after it, and the release
+/// `verify provision rustup` here would install is said to be another. A seal's stock role, which
+/// carries the release and no commit (`stock_release_remedy`), names a checkout whose lock names
+/// the release instead, and is the same remedy where this checkout's lock names it. NEGATIVE
+/// CONTROL: a remedy that names `verify provision rustup` alone whatever the checkout's lock says
+/// (what `require_rustup_target` said before) sends a person to install this checkout's release,
+/// and the second leg's assertions fail.
+#[test]
+fn a_missing_stock_release_is_installed_for_the_commit_whose_lock_names_it() {
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    let provision = crate::gates::X86_SLICE_REMEDIES;
+    let same = stock_install_remedy("1.99.1", COMMIT, Some("1.99.1"));
+    assert!(same.starts_with(&format!("run `{provision}`, ")), "{same}");
+    assert!(same.contains("1.99.1"), "{same}");
+    assert!(
+        !same.contains("in a checkout at") && !same.contains("rustup toolchain install"),
+        "{same}"
+    );
+
+    let install = aterm_verify::provision::stock::release_install("1.99.1");
+    assert!(
+        install.starts_with("rustup toolchain install 1.99.1 --profile minimal "),
+        "{install}"
+    );
+    for checkout in [Some("1.100.0"), None] {
+        let other = stock_install_remedy("1.99.1", COMMIT, checkout);
+        let at = other
+            .find(&format!("run `{provision}` in a checkout at 0123456789ab "))
+            .unwrap_or_else(|| panic!("the commit's own checkout: {other}"));
+        let bare = other
+            .find(&format!("`{install}`"))
+            .unwrap_or_else(|| panic!("the release's own install line: {other}"));
+        assert!(
+            at < bare,
+            "the route that also places the copy first: {other}"
+        );
+        assert!(
+            !other.contains("toolchain install 1.100.0"),
+            "nothing installs this checkout's release: {other}"
+        );
+        if checkout.is_some() {
+            assert!(other.contains("here it would install 1.100.0"), "{other}");
+        }
+
+        // A seal's stock role carries the release, not the commit: the same remedy, said of a
+        // checkout whose lock names the release.
+        let release = stock_release_remedy("1.99.1", checkout);
+        let at = release
+            .find(&format!(
+                "run `{provision}` in a checkout whose trust.lock names 1.99.1 "
+            ))
+            .unwrap_or_else(|| panic!("a checkout whose lock names the release: {release}"));
+        let bare = release
+            .find(&format!("`{install}`"))
+            .unwrap_or_else(|| panic!("the release's own install line: {release}"));
+        assert!(at < bare, "{release}");
+        assert!(!release.contains("toolchain install 1.100.0"), "{release}");
+    }
+    assert_eq!(stock_release_remedy("1.99.1", Some("1.99.1")), same);
 }
 
 /// A TAKE'S TARGET SLICE BUILDS ON THE STOCK RELEASE ITS COMMIT'S LOCK NAMES: a take of a commit

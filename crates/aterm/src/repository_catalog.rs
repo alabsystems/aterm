@@ -556,11 +556,13 @@ fn publish(
 /// What a publication logs: why the entry was signed again, as counts of repositories and
 /// whether the account's spelling or the repositories' order differs. No name, URL, id, key
 /// name or size is in it. The entry is signed only where the candidate differs from it as
-/// JSON, so a logged line has a count above `0` or a flag set ([`RepositoryCatalogChanges`]).
+/// JSON, which a refresh makes only where the catalog's meaning moved, so a logged line has
+/// `other_fields`, `size_class`, `added` or `removed` above `0` or `account` set; `pruned` and
+/// `order` say what was published beside it ([`RepositoryCatalogChanges`]).
 fn refreshed_line(candidate: &Candidate) -> String {
     let RepositoryCatalogChanges {
         other_fields,
-        size_only,
+        size_class,
         added,
         removed,
         pruned,
@@ -569,8 +571,8 @@ fn refreshed_line(candidate: &Candidate) -> String {
     } = candidate.changes;
     format!(
         "private repository catalog refreshed: mode={:?}, observed_owned={}, \
-         other_fields={other_fields}, size_only={size_only}, added={added}, removed={removed}, \
-         pruned={pruned}, account={account}, order={order}",
+         other_fields={other_fields}, size_class={size_class}, added={added}, \
+         removed={removed}, pruned={pruned}, account={account}, order={order}",
         candidate.visibility, candidate.observed
     )
 }

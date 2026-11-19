@@ -28,8 +28,8 @@ fn a_cold_build_records_every_startup_leg() {
 
 /// A MOTION FRAME'S ROWS UPLOAD WITHOUT A COMPARE (MOT-1): rows a card names as all it
 /// changed since the card held upload as named, clamped to the card, and none where they
-/// fall outside it; a card that names none is compared whole. NEGATIVE CONTROL: an unnamed
-/// card whose rows match uploads nothing.
+/// fall outside it; a card that names none, or names the whole card, is compared whole.
+/// NEGATIVE CONTROL: an unnamed card whose rows match uploads nothing.
 #[test]
 fn a_motion_frames_rows_upload_as_named_and_an_unnamed_card_is_compared() {
     let stride = 4 * 4;
@@ -52,6 +52,15 @@ fn a_motion_frames_rows_upload_as_named_and_an_unnamed_card_is_compared() {
     );
     assert_eq!(
         super::tray_rows_to_upload(&old, &new, stride, Some((8, 9))),
+        None
+    );
+    assert_eq!(
+        super::tray_rows_to_upload(&old, &new, stride, Some((0, 99))),
+        Some((5, 6)),
+        "a band of the whole card names no row: compared"
+    );
+    assert_eq!(
+        super::tray_rows_to_upload(&old, &old, stride, Some((0, 8))),
         None
     );
 }
@@ -627,7 +636,7 @@ fn visible_source_scissor_preserves_signed_odd_crop_intersections() {
         11,
         7,
         8,
-        0,
+        Default::default(),
         0,
     );
     if cfg!(target_os = "linux") {
@@ -649,7 +658,7 @@ fn visible_source_scissor_preserves_signed_odd_crop_intersections() {
         11,
         1,
         1,
-        0,
+        Default::default(),
         0,
     );
     if cfg!(target_os = "linux") {
@@ -669,7 +678,8 @@ fn visible_source_scissor_preserves_signed_odd_crop_intersections() {
 
 #[test]
 fn crown_scissor_clips_both_scroll_directions_to_independent_destination_bounds() {
-    let mut uniform = present_blit_uniform(false, None, None, 40, 60, 40, 60, 0, 0);
+    let mut uniform =
+        present_blit_uniform(false, None, None, 40, 60, 40, 60, Default::default(), 0);
     let up = BandShift {
         src_y: 13,
         dst_y: 10,
@@ -1461,7 +1471,10 @@ fn tray_upload_skips_unchanged_card_bytes() {
 
 /// A tracked card's serial spares the compare: the same serial draws the card it
 /// holds, a band counted from it uploads that band alone, and only an untracked card (or a
-/// band from a serial it does not hold) is compared; a new size makes a new card.
+/// band from a serial it does not hold, or one that spans the whole card) is compared; a new
+/// size makes a new card. A whole-card band over the same pixels uploads nothing, and over a
+/// card one row of which changed uploads that row. NEGATIVE CONTROL: trusted as named, as
+/// the arm did before, each whole-card band uploads every row and compares nothing.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_tray_card_update_compares_only_what_it_cannot_name() {
@@ -1491,8 +1504,22 @@ fn a_tray_card_update_compares_only_what_it_cannot_name() {
         TrayCardUpdate,
         u64,
     );
-    let cases: [Case<'_>; 7] = [
+    let cases: [Case<'_>; 9] = [
         (card, quad(7, None), None, TrayCardUpdate::Keep, 0),
+        (
+            card,
+            quad(8, delta(7, (0, ph))),
+            Some(None),
+            TrayCardUpdate::Keep,
+            full,
+        ),
+        (
+            card,
+            quad(8, delta(7, (0, 99))),
+            Some(Some((3, 4))),
+            TrayCardUpdate::Rows(3, 4),
+            full,
+        ),
         (
             card,
             quad(8, delta(7, (1, 3))),
@@ -1560,7 +1587,10 @@ fn a_tray_card_update_compares_only_what_it_cannot_name() {
 
 /// By the renderer's counters: a card presented again under its serial is neither
 /// compared nor uploaded, a change counted from the serial the window holds uploads its
-/// band (after the ring's second slot is minted whole), and the frames show each card.
+/// band (after the ring's second slot is minted whole), a band of the whole card is
+/// compared and uploads one span, from the first row that differs to the last, widened to the
+/// rows the ring's other slot missed, or nothing where no row differs, and the frames show each
+/// card.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_unchanged_card_is_neither_compared_nor_uploaded() {
@@ -1643,10 +1673,47 @@ fn an_unchanged_card_is_neither_compared_nor_uploaded() {
         back.pixels, first.pixels,
         "the band alone restores the card"
     );
-    let _ = gpu.render_input(&mut win, &input, Some(tray(&red, pw, ph, 0, None)));
+    // A card painted whole stamps a band of every row whatever moved: it is compared, so the
+    // same pixels upload nothing and one changed row uploads that row (the first time as one
+    // span with the rows the ring's other slot missed, 4..8: rows 2..8).
+    let whole = |since| {
+        Some(TrayDelta {
+            since,
+            rows: (0, ph),
+        })
+    };
+    let kept = gpu.render_input(&mut win, &input, Some(tray(&red, pw, ph, 10, whole(9))));
     assert_eq!(
         counters(&gpu),
         (3, 2 * full + 4 * stride, full),
+        "the same pixels under a whole band upload nothing"
+    );
+    assert_eq!(kept.pixels, first.pixels);
+    let mut row = red.clone();
+    for px in row[(2 * stride) as usize..(3 * stride) as usize]
+        .as_chunks_mut::<4>()
+        .0
+    {
+        *px = [40, 40, 200, 255];
+    }
+    let moved = gpu.render_input(&mut win, &input, Some(tray(&row, pw, ph, 11, whole(10))));
+    assert_eq!(
+        counters(&gpu),
+        (4, 2 * full + 10 * stride, 2 * full),
+        "rows 2..8: row 2 in one span with the rows the slot missed"
+    );
+    assert_ne!(moved.pixels, first.pixels, "the row reaches the frame");
+    let restored = gpu.render_input(&mut win, &input, Some(tray(&red, pw, ph, 12, whole(11))));
+    assert_eq!(
+        counters(&gpu),
+        (5, 2 * full + 11 * stride, 3 * full),
+        "one changed row under a whole band uploads that row alone"
+    );
+    assert_eq!(restored.pixels, first.pixels);
+    let _ = gpu.render_input(&mut win, &input, Some(tray(&red, pw, ph, 0, None)));
+    assert_eq!(
+        counters(&gpu),
+        (5, 2 * full + 11 * stride, 4 * full),
         "CONTROL: an untracked card is compared whole"
     );
 }
@@ -2467,7 +2534,7 @@ fn a_compose_rect_past_the_offscreen_is_refused() {
     };
     let encode = |copy_rect| {
         let seq = PresentSequence {
-            dock: None,
+            chrome: [None, None],
             offscreen: &offscreen,
             present_off: Some(&copy),
             copy_rect,
@@ -2930,6 +2997,119 @@ fn a_dock_reaches_the_virtual_present_and_fences_overlay_reuse() {
     );
 }
 
+/// The regular tray and terminal retain their own pixels. The resource strip paints the
+/// remaining parts of the same physical row, independently of the session panel below.
+#[test]
+fn window_resource_strip_virtual_present_keeps_frame_pixels_and_reuses_resident_sources() {
+    let mut gpu = super::gpu_renderer_for_test(None, 18.0, Theme::default());
+    gpu.set_bloom(false);
+    gpu.set_shimmer(false);
+    let mut terminal = Terminal::new(6, 20);
+    terminal.process(b"\x1b[?25lterminal and trainer");
+    let input = terminal.cell_frame(6, 20);
+    let (fw, fh) = gpu.frame_size(6, 20);
+    let destination = ((fw + 20) as u32, fh as u32);
+    let crop = super::PresentCrop {
+        source_y: 0,
+        height: fh as u32,
+    };
+    let mut win = WindowGpu::new();
+    win.set_frame_insets(aterm_render::FrameInsets { left: 0, right: 8 });
+    let raster = |rgba, pw, ph, serial| super::TrayQuad {
+        rgba,
+        pw,
+        ph,
+        serial,
+        delta: None,
+        dx: 0,
+        dy: 0,
+        above: &[],
+        scrim: None,
+    };
+    let present = |gpu: &mut super::GpuRenderer, win: &mut WindowGpu| {
+        assert!(gpu.present_virtual_cropped_with_effects_transport(
+            win,
+            &input,
+            false,
+            None,
+            None,
+            crop,
+            0,
+            destination
+        ));
+    };
+    let pixels = |gpu: &super::GpuRenderer, win: &WindowGpu| {
+        gpu.virtual_presented_snapshot_current(win, win.resident_input_epoch(), 1)
+            .expect("the virtual surface was presented")
+            .convert()
+            .expect("RGBA pixels")
+            .rgba
+    };
+    let red = [235, 20, 13, 255].repeat(14 * fh);
+    win.set_dock_quad(Some(raster(&red, 14, fh as u32, 81)), ((fw + 6) as i64, 0));
+    present(&mut gpu, &mut win);
+    let before = pixels(&gpu, &win);
+    let stride = (fw + 20) * 4;
+    let dock_sample = &before[7 * stride + (fw + 8) * 4..][..3];
+    assert!(
+        dock_sample[0] > dock_sample[1],
+        "the panel is already on the surface"
+    );
+    let green = [12, 230, 18, 255].repeat((fw + 24) * 4);
+    let blue = [12, 16, 230, 255].repeat((fw + 24) * 4);
+    win.set_resource_strip(Some(raster(&green, (fw + 24) as u32, 4, 82)), (-2, 3));
+    assert_eq!(
+        win.chrome_rects(1, destination, fw as u32),
+        [
+            Some([0, 3, 6, 7]),
+            Some([(fw + 6) as u32, 3, destination.0, 7])
+        ]
+    );
+    present(&mut gpu, &mut win);
+    let shown = pixels(&gpu, &win);
+    for (y, (now, was)) in shown
+        .chunks_exact(stride)
+        .zip(before.chunks_exact(stride))
+        .enumerate()
+    {
+        for (x, (pixel, original)) in now.chunks_exact(4).zip(was.chunks_exact(4)).enumerate() {
+            if (3..7).contains(&y) && !(6..fw + 6).contains(&x) {
+                assert!(
+                    pixel[1] > pixel[0] && pixel[1] > pixel[2],
+                    "strip pixel at {x},{y}: {pixel:?}"
+                );
+            } else {
+                assert_eq!(pixel, original, "preserved frame or panel pixel at {x},{y}");
+            }
+        }
+    }
+    let uploads = gpu.tray_uploads();
+    present(&mut gpu, &mut win);
+    assert_eq!(gpu.tray_uploads(), uploads);
+    win.set_resource_strip(Some(raster(&blue, (fw + 24) as u32, 4, 83)), (-2, 3));
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        gpu.present_overlay_virtual(&mut win, false, None, None, Some(crop), destination),
+        Ok(true)
+    );
+    #[cfg(not(target_os = "macos"))]
+    present(&mut gpu, &mut win);
+    let changed = pixels(&gpu, &win);
+    let sample = &changed[3 * stride..][..3];
+    assert!(
+        sample[2] > sample[1] && sample[2] > sample[0],
+        "new strip serial"
+    );
+    assert_eq!(&changed[7 * stride + (fw + 8) * 4..][..3], dock_sample);
+    win.set_resource_strip(None, (0, 0));
+    present(&mut gpu, &mut win);
+    assert_eq!(
+        pixels(&gpu, &win),
+        before,
+        "clearing the strip keeps the panel"
+    );
+}
+
 /// A dock fixture: a renderer, the frame of a small terminal beside a dock `width` px wide, the
 /// virtual destination that holds both, and a present of the frame into it.
 #[cfg(target_os = "macos")]
@@ -3103,18 +3283,18 @@ fn hiding_the_dock_releases_its_resident_card_and_stage() {
         destination
     ));
     assert!(
-        win.metal_dock_card.is_some() && win.metal_dock_stage.is_some(),
+        win.metal_dock_card[0].is_some() && win.metal_dock_stage[0].is_some(),
         "positive control: a shown dock keeps its card and stage resident"
     );
     win.set_dock_quad(None, (0, 0));
     win.set_side_inset_px(0);
     assert!(gpu.present_virtual(&mut win, &input, false, None, None));
     assert!(
-        win.metal_dock_card.is_none(),
+        win.metal_dock_card[0].is_none(),
         "the hidden dock's resident card is released"
     );
     assert!(
-        win.metal_dock_stage.is_none(),
+        win.metal_dock_stage[0].is_none(),
         "the hidden dock's stage is released"
     );
 }
@@ -3196,7 +3376,7 @@ fn a_failed_dock_stage_writer_is_repainted_without_reupload_or_an_idle_poll() {
         let healthy_passes = crate::metal::encoder::render_census::opened() - before;
         assert!(healthy_passes > 0);
         let failed = matches!(outcome, CbOutcome::Retryable { .. });
-        let stage = win.metal_dock_stage.as_mut().unwrap();
+        let stage = win.metal_dock_stage[0].as_mut().unwrap();
         let live = gpu.metal_arm.as_mut().unwrap().live_mut();
         let mut cb = live.session.begin().unwrap();
         if failed {

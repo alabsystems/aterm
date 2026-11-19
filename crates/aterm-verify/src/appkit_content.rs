@@ -131,6 +131,210 @@ pub struct GroupProof {
 /// Prior successful group proofs, keyed by group.
 pub type Passed = BTreeMap<String, GroupProof>;
 
+/// This build's immutable driver paths on macOS; other hosts retain their existing original
+/// output checks. Runtime commands and carry proofs always consume the same selected paths.
+#[derive(Debug)]
+pub(crate) struct Prepared {
+    pub(crate) executables: Vec<Executable>,
+    paths: Vec<(&'static str, PathBuf)>,
+    #[cfg(target_os = "macos")]
+    images: crate::artifact::Images,
+}
+
+impl Prepared {
+    pub(crate) fn capture(
+        paths: &[(&'static str, PathBuf)],
+        messages: &str,
+        manifest: &std::path::Path,
+    ) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let expected = producer_digests(paths, messages, manifest)?;
+            Self::from_images(crate::artifact::Images::prepare(paths, &expected)?)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (messages, manifest);
+            let prepared = Self {
+                executables: read_executables(paths)?,
+                paths: paths.to_vec(),
+            };
+            prepared.validate()?;
+            Ok(prepared)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn from_images(images: crate::artifact::Images) -> Result<Self, String> {
+        let paths = images.paths();
+        let prepared = Self {
+            executables: read_executables(&paths)?,
+            paths,
+            images,
+        };
+        prepared.validate()?;
+        Ok(prepared)
+    }
+
+    pub(crate) fn paths(&self) -> &[(&'static str, PathBuf)] {
+        &self.paths
+    }
+
+    pub(crate) fn proof(
+        &self,
+        group: &str,
+        context: &str,
+        commands: &[crate::exec::Cmd],
+    ) -> Result<GroupProof, String> {
+        self.validate()?;
+        GroupProof::bound(
+            group,
+            context,
+            self.executables.clone(),
+            &self.paths,
+            commands,
+        )
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            self.images.validate()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if read_executables(&self.paths)? != self.executables {
+                return Err("AppKit selected images differ from this build".into());
+            }
+            Ok(())
+        }
+    }
+
+    pub(crate) fn validate_program(&self, path: &std::path::Path) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            self.images.validate_program(path)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let index = self
+                .paths
+                .iter()
+                .position(|(_, selected)| selected == path)
+                .ok_or("AppKit command is not its prepared image")?;
+            if crate::test_index::digest(path).map_err(|e| e.to_string())?
+                != self.executables[index].sha256
+            {
+                return Err("AppKit selected image differs from this build".into());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Exact original bytes named by this successful native compiler invocation. The compiler
+/// computes these digests at publication while it still owns its output lock; reading a
+/// pathname only after compiler exit cannot establish that origin.
+#[cfg(target_os = "macos")]
+pub(crate) fn producer_digests(
+    paths: &[(&'static str, PathBuf)],
+    messages: &str,
+    manifest: &std::path::Path,
+) -> Result<BTreeMap<&'static str, String>, String> {
+    let mut expected = BTreeMap::new();
+    let mut finished = 0;
+    for line in messages.lines().filter(|line| !line.trim().is_empty()) {
+        let checked: crate::compiler_message::CheckedValue = aterm_json::from_str(line)
+            .map_err(|e| format!("invalid AppKit compiler receipt: {e}"))?;
+        let (value, duplicate) = checked.into_parts();
+        if duplicate {
+            return Err("ambiguous AppKit compiler receipt".into());
+        }
+        match value["reason"].as_str() {
+            Some("build-finished") => {
+                if value["success"].as_bool() != Some(true) {
+                    return Err("AppKit compiler did not finish successfully".into());
+                }
+                finished += 1;
+            }
+            Some("compiler-artifact") => {
+                let crate::compiler_message::UnitMessage::Unit(value) =
+                    aterm_json::from_str(line).map_err(|e| e.to_string())?
+                else {
+                    return Err("ambiguous AppKit compiler artifact".into());
+                };
+                let Some(name) = value
+                    .pointer("/target/name")
+                    .and_then(aterm_json::Value::as_str)
+                else {
+                    return Err("AppKit compiler artifact has no target name".into());
+                };
+                let Some((name, path)) = paths.iter().find(|(wanted, _)| *wanted == name) else {
+                    continue;
+                };
+                let kinds = crate::compiler_message::artifact_target_kinds(&value)
+                    .map_err(str::to_owned)?;
+                let kind = if *name == crate::stages::REDRAW_CONFORMANCE_BIN {
+                    "bin"
+                } else {
+                    "example"
+                };
+                if kinds != [kind]
+                    || value["manifest_path"].as_str().map(std::path::Path::new) != Some(manifest)
+                    || value["executable"].as_str().map(std::path::Path::new)
+                        != Some(path.as_path())
+                    || value["trust_compile_mode"].as_str() != Some("build")
+                    || value["trust_compile_kind"].as_str() != Some("host")
+                    || value["trust_compile_target"].as_str()
+                        != Some(format!("{}-apple-darwin", std::env::consts::ARCH).as_str())
+                    || value
+                        .pointer("/profile/test")
+                        .and_then(aterm_json::Value::as_bool)
+                        != Some(false)
+                    || value
+                        .pointer("/profile/debug_assertions")
+                        .and_then(aterm_json::Value::as_bool)
+                        != Some(true)
+                    || !value["trust_unit_identity_sha256"]
+                        .as_str()
+                        .is_some_and(|s| aterm_codec::hex::is_lower(s, 64))
+                {
+                    return Err(
+                        "AppKit compiler artifact does not match its selected native build".into(),
+                    );
+                }
+                let digest = value["trust_executable_sha256"]
+                    .as_str()
+                    .filter(|s| aterm_codec::hex::is_lower(s, 64))
+                    .ok_or("AppKit compiler artifact lacks its original executable digest")?;
+                if expected.insert(*name, digest.to_owned()).is_some() {
+                    return Err("duplicate selected AppKit compiler artifact".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    if finished != 1 || expected.len() != paths.len() || paths.is_empty() {
+        return Err("AppKit build receipt is incomplete or has ambiguous completion".into());
+    }
+    Ok(expected)
+}
+
+/// Read each driver as a regular file in the caller's canonical group order.
+pub(crate) fn read_executables(paths: &[(&str, PathBuf)]) -> Result<Vec<Executable>, String> {
+    paths
+        .iter()
+        .map(|(name, path)| {
+            crate::test_index::digest(path)
+                .map(|sha256| Executable {
+                    name: (*name).to_owned(),
+                    sha256,
+                })
+                .map_err(|error| format!("hash AppKit driver {}: {error}", path.display()))
+        })
+        .collect()
+}
+
 impl GroupProof {
     /// Hash binaries at `paths` into an explicitly runtime-unbound wire fixture.
     ///
@@ -145,17 +349,7 @@ impl GroupProof {
         carry_context: &str,
         paths: &[(&str, PathBuf)],
     ) -> Result<Self, String> {
-        let executables = paths
-            .iter()
-            .map(|(name, path)| {
-                crate::test_index::digest(path)
-                    .map(|sha256| Executable {
-                        name: (*name).to_owned(),
-                        sha256,
-                    })
-                    .map_err(|error| format!("hash AppKit driver {}: {error}", path.display()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let executables = read_executables(paths)?;
         Self::from_executables(group, carry_context, executables)
     }
 
@@ -188,25 +382,25 @@ impl GroupProof {
     ///
     /// # Errors
     /// As [`Self::from_paths`], or a command is not the exact finalized runtime for its matching
-    /// executable. A verifier carry decision uses only this constructor, never the digest-only
-    /// public constructor.
+    /// executable. Both this path-backed constructor and [`Prepared::proof`] bind that runtime;
+    /// the digest-only public constructor cannot carry a verifier result.
     pub(crate) fn from_paths_and_commands(
         group: &str,
         carry_context: &str,
         paths: &[(&str, PathBuf)],
         commands: &[crate::exec::Cmd],
     ) -> Result<Self, String> {
-        let executables = paths
-            .iter()
-            .map(|(name, path)| {
-                crate::test_index::digest(path)
-                    .map(|sha256| Executable {
-                        name: (*name).to_owned(),
-                        sha256,
-                    })
-                    .map_err(|error| format!("hash AppKit driver {}: {error}", path.display()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let executables = read_executables(paths)?;
+        Self::bound(group, carry_context, executables, paths, commands)
+    }
+
+    fn bound(
+        group: &str,
+        carry_context: &str,
+        executables: Vec<Executable>,
+        paths: &[(&str, PathBuf)],
+        commands: &[crate::exec::Cmd],
+    ) -> Result<Self, String> {
         if !aterm_codec::hex::is_lower(carry_context, 64) {
             return Err("AppKit carry context is not 64 lowercase hex digits".into());
         }

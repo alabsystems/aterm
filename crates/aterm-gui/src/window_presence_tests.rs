@@ -59,7 +59,7 @@ fn the_beat_writes_at_start_each_hour_and_each_wake() {
 
 /// A ring heard before a wait ends it at once as a wake, taken, and the quit outranks a ring: a
 /// wait after the quit reads the quit whatever rang. A ring that reaches a parked wait is
-/// [`ParkBell`]'s own test (`park_bell::tests::a_ring_reaches_a_parked_waiter`). NEGATIVE
+/// [`ParkBell`]'s own test (`aterm_uds::park_bell::tests::a_ring_reaches_a_parked_waiter`). NEGATIVE
 /// CONTROL: the ring is taken, so the next wait does not read it again.
 #[test]
 fn a_ring_ends_the_wait_as_a_wake() {

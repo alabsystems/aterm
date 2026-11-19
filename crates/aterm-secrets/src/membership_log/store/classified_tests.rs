@@ -207,12 +207,14 @@ fn written_reaches_this_threads_override_and_not_once_the_call_is_removed() {
             written(&Written {
                 paths_dir: dir,
                 store: &store,
+                generation: crate::records_storage::RecordsGeneration::default(),
             });
             // MUTANT: the call removed.
             without_written_call(|| {
                 written(&Written {
                     paths_dir: dir,
                     store: &store,
+                    generation: crate::records_storage::RecordsGeneration::default(),
                 });
             });
         },
@@ -222,6 +224,7 @@ fn written_reaches_this_threads_override_and_not_once_the_call_is_removed() {
     written(&Written {
         paths_dir: dir,
         store: &store,
+        generation: crate::records_storage::RecordsGeneration::default(),
     });
     assert_eq!(calls.get(), 1);
 }

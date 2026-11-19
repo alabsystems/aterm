@@ -3,12 +3,11 @@
 
 //! The build a managed twin names: the binary its shim execs on its last line.
 
-use std::path::Path;
-
 /// Returns the absolute target binary path from the last line of a managed twin shim:
-/// `exec '/<path>' "$@"` after a `#!/bin/sh` line in a `sh` twin, and on Windows
-/// `@"<path>" %* & @exit /b` (or the legacy ` %*` tail) in a `.cmd` twin, absolute as Windows
-/// reads a path. A `.cmd` body names nothing on another host, which runs none.
+/// `exec '/<path>' "$@"` after a `#!/bin/sh` line in a `sh` twin, and on Windows a `.cmd`
+/// twin's forward line (`atpkg::platform::cmd_forward_target`: `@"<path>"` and the tail that
+/// ends the batch with its exit code, or a tail atpkg laid before it), absolute as Windows reads
+/// a path. A `.cmd` body names nothing on another host, which runs none.
 #[must_use]
 pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
     let last = twin_text
@@ -26,9 +25,7 @@ pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
     if !cfg!(windows) {
         return None;
     }
-    let (path, tail) = last.strip_prefix("@\"")?.split_once('"')?;
-    (matches!(tail, " %* & @exit /b" | " %*") && Path::new(path).is_absolute())
-        .then(|| std::path::PathBuf::from(path))
+    atpkg::platform::cmd_forward_target(last).filter(|path| path.is_absolute())
 }
 
 #[cfg(test)]

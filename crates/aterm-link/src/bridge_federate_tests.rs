@@ -112,7 +112,14 @@ fn bridge_hosting(
     bridge.fx = fx;
     let (server, socket) = Served::on(mac);
     bridge.cfg.broker = socket.to_string_lossy().into_owned();
-    bridge.caps = crate::enable::node_rules(FLEET, &mac.node)
+    bridge.caps = node_ring(mac);
+    assert!(bridge.refresh_sessions().is_ok());
+    (lane, bridge, server)
+}
+
+/// The ring of `mac`'s node, minted under its secret, as the node service mints its bridge's.
+fn node_ring(mac: &Mac) -> Vec<Cap> {
+    crate::enable::node_rules(FLEET, &mac.node)
         .into_iter()
         .map(|grant| {
             let cap = astream_cap::mint(&mac.secret, &grant).expect("a grant");
@@ -121,9 +128,7 @@ fn bridge_hosting(
                 tag: cap.tag,
             }
         })
-        .collect();
-    assert!(bridge.refresh_sessions().is_ok());
-    (lane, bridge, server)
+        .collect()
 }
 
 /// [`bridge_on`], attached.
@@ -940,6 +945,315 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
             "{case}: the late ask's receipt names it as A's log numbers it, not 11"
         );
         drop((routes, served_old));
+    }
+}
+
+/// What the told rows meet on the log after the rotation, in
+/// [`a_told_row_of_a_node_before_a_key_rotation_is_read_through_the_grant_that_reaches_it`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OldRows {
+    /// The node service's reader's ring ([`crate::federate::OLD_READS_FILE`]) reads the old
+    /// node's lane, on the log reminted keeping its records.
+    Granted,
+    /// No reader's ring: no grant the bridge holds reads the old node's lane.
+    Ungranted,
+    /// No reader's ring, and a row of the new node's lane above the old node's.
+    UngrantedBelowANewRow,
+    /// The reader's ring, a row of the new node's lane above the old node's, and a log set aside
+    /// whose records hold another subject at each old row's offset and the new row's own bytes at
+    /// its offset.
+    SetAsideBelowANewRow,
+    /// A reader's ring minted under a secret the root no longer holds: the broker refuses its
+    /// grant's attach (`ERR_UNAUTHORIZED`), a refusal for good.
+    StaleReadersRing,
+}
+
+/// **A TOLD ROW OF A NODE BEFORE A KEY ROTATION IS READ THROUGH THE GRANT THAT REACHES IT**
+/// (ATERM-KI-1116-7314, `Bridge::proof_read`): A's bridge, as A's node before its key rotated,
+/// was handed two notes to `tb000000000` on that node's lane, rows of the told samples; the key
+/// rotates, and the bridge, the new node on the same state dir and `bus.log` (whose node the dir
+/// names now), attaches to the log astream reminted keeping its records. The link's ring, the new
+/// node's, reads none of the old node's lane, so a read of a row there on the link is refused.
+/// Under the node service's reader's ring the rows read with their bytes and prove the step past
+/// the newest (`Granted`); with none, they are no evidence and the attach goes on, told a bare
+/// `link log` (`Ungranted`), and a row of the new node's lane above them still proves
+/// (`UngrantedBelowANewRow`). On a log set aside, the reader's ring reads another subject at the
+/// lowest old row, a mismatch: nothing proves though the new row above it reads with its own
+/// bytes (`SetAsideBelowANewRow`). A reader's ring minted under a secret the root no longer holds
+/// is refused at its grant's attach for good (`ERR_UNAUTHORIZED`, `bridge::read_refused_for_good`):
+/// the rows are no evidence and the attach goes on, told a bare `link log` (`StaleReadersRing`).
+/// NEGATIVE CONTROLS: `Mutant::ProofReadsEveryRowOnTheLink` (every build before's read): the
+/// broker refuses the old row's read on the link, and the attach is refused, every attach, aterm
+/// told nothing and the witness left on the log before; `Mutant::UnreachableRowStopsTheProof`:
+/// the old rows stop the walk and the new row proves nothing; `Mutant::HeldMismatchIsNoEvidence`
+/// (`Bridge::held_record`'s answer): the old rows' mismatches pass, and the new row proves a
+/// step past them; `Mutant::ReaderRefusalRefusesTheAttach` (the stale ring's refusal an error):
+/// the attach is refused, every attach, aterm told nothing and the witness left on the log before.
+#[test]
+fn a_told_row_of_a_node_before_a_key_rotation_is_read_through_the_grant_that_reaches_it() {
+    use crate::sim::world::Mutant;
+    use aterm_types::control_verbs::LINK_PROVED_LANE;
+    for (rows, control) in [
+        (OldRows::Granted, None),
+        (OldRows::Ungranted, None),
+        (OldRows::UngrantedBelowANewRow, None),
+        (OldRows::SetAsideBelowANewRow, None),
+        (OldRows::StaleReadersRing, None),
+        (OldRows::Granted, Some(Mutant::ProofReadsEveryRowOnTheLink)),
+        (
+            OldRows::Ungranted,
+            Some(Mutant::ProofReadsEveryRowOnTheLink),
+        ),
+        (
+            OldRows::UngrantedBelowANewRow,
+            Some(Mutant::UnreachableRowStopsTheProof),
+        ),
+        (
+            OldRows::SetAsideBelowANewRow,
+            Some(Mutant::HeldMismatchIsNoEvidence),
+        ),
+        (
+            OldRows::StaleReadersRing,
+            Some(Mutant::ReaderRefusalRefusesTheAttach),
+        ),
+    ] {
+        let case = format!("{rows:?} control={control:?}");
+        let ma = Mac::new(71);
+        let new = ma.as_key(72);
+        let peer = key_of(74);
+        let pn = node_of(&peer);
+        let before = members(&ma, &[&ma.node, &pn]);
+        let after = Handoff {
+            me: new.node.clone(),
+            members: [new.node.clone(), pn.clone()].into(),
+            moved: [(ma.node.clone(), new.node.clone())].into(),
+            rank: BTreeMap::new(),
+            gone: BTreeSet::new(),
+        };
+        let state = ma.link_state();
+        // The peer's note to `tb000000000` on `dst`'s inbox, as its push writes it on this log.
+        let note = |mac: &Mac, dst: &str, seq: u64| -> u64 {
+            let subject = format!("/f/{FLEET}/in/{dst}/tb000000000/{pn}/note");
+            let mut push = mac.client(peer, &[format!("rw,p={pn}:/f/{FLEET}/in/{dst}/*/{pn}/*")]);
+            let mut body = Body::new(0);
+            body.from = Some("tc000000000".to_owned());
+            body.text = format!("note {seq}");
+            push.publish(pid(&pn), seq, &subject, &body.encode())
+                .expect("the peer's push lands")
+                .0
+        };
+
+        // A's bridge as the old node is handed two notes there: rows of its lane.
+        let k_old = keys_for(71, Some(&before));
+        let (lane_old, mut old, served_old) = bridge_on(
+            &ma,
+            "tb000000000",
+            k_old.path(),
+            Some(&state),
+            crate::fx::Fx::os(),
+        );
+        assert!(
+            old.attach_broker(),
+            "{case}: the old node's bridge attaches"
+        );
+        let (r1, r2) = (note(&ma, &ma.node, 1), note(&ma, &ma.node, 2));
+        rounds_until(
+            &format!("{case}: the old node's bridge delivers both"),
+            &mut old,
+            || {
+                let got = lane_old.delivery_offsets();
+                got.contains(&r1) && got.contains(&r2)
+            },
+        );
+        let was = ma.broker.log_identity();
+        old.close_subscriptions();
+        // The bridge goes; the log stays served until the remint, as the node service keeps it.
+        drop((old, lane_old));
+        let mut serving = vec![served_old];
+
+        // A's key rotates: the hand-off names the old node retired, and where granted the node
+        // service's reader's ring reads its lane; a stale one is minted under another secret.
+        let k_new = keys_for(72, Some(&after));
+        let readers_secret = match rows {
+            OldRows::Granted | OldRows::SetAsideBelowANewRow => Some(ma.secret.clone()),
+            OldRows::StaleReadersRing => Some(vec![9u8; 32]),
+            OldRows::Ungranted | OldRows::UngrantedBelowANewRow => None,
+        };
+        if let Some(secret) = readers_secret {
+            crate::federate::write_old_reads(k_new.path(), &after, &|grant| {
+                Mac::mint(&secret, grant)
+            })
+            .expect("the node service's reader's ring");
+        }
+        // The new node's bridge is handed a note on its own lane before the remint.
+        let r3 = matches!(
+            rows,
+            OldRows::UngrantedBelowANewRow | OldRows::SetAsideBelowANewRow
+        )
+        .then(|| {
+            let (lane_mid, mut mid, served_mid) = bridge_on(
+                &new,
+                "tb000000000",
+                k_new.path(),
+                Some(&state),
+                crate::fx::Fx::os(),
+            );
+            assert!(
+                mid.attach_broker(),
+                "{case}: the new node's bridge attaches on the same log"
+            );
+            let r3 = note(&new, &new.node, 3);
+            rounds_until(
+                &format!("{case}: the new node's bridge delivers its note"),
+                &mut mid,
+                || lane_mid.delivery_offsets().contains(&r3),
+            );
+            mid.close_subscriptions();
+            drop((mid, lane_mid));
+            serving.push(served_mid);
+            r3
+        });
+        let told = crate::state::StateDir::peek(&state).told_samples();
+        assert_eq!(told.log, Some(was), "{case}: PRECONDITION: rows of the log");
+        assert!(
+            [Some(r1), Some(r2), r3]
+                .into_iter()
+                .flatten()
+                .all(|off| told.rows.contains_key(&off)),
+            "{case}: PRECONDITION: each note a row: {:?}",
+            told.rows
+        );
+        let newest = *told.rows.keys().max().expect("rows");
+        let old_subject = told.rows[&r1].1.clone();
+        let ring = node_ring(&new);
+        assert!(
+            !ring_reads(&ring, &old_subject),
+            "{case}: PRECONDITION: the new node's ring reads no row of the old node's lane"
+        );
+        // Each row the new node's ring reads, with its bytes, for a log set aside.
+        let kept: Vec<(u64, Option<(String, Vec<u8>)>)> = told
+            .rows
+            .iter()
+            .map(|(&off, (_, subject))| {
+                let raw = ring_reads(&ring, subject).then(|| {
+                    let (_, _, raw, _) = new
+                        .holds(subject)
+                        .into_iter()
+                        .find(|(at, _, _, _)| *at == off)
+                        .expect("the row's record");
+                    (subject.clone(), raw)
+                });
+                (off, raw)
+            })
+            .collect();
+        // The newest row the link reads, the one the steps past old rows prove from.
+        let newest_on_the_link = kept
+            .iter()
+            .filter(|(_, row)| row.is_some())
+            .map(|(off, _)| *off)
+            .max();
+
+        // The log astream reminted keeping its records, or the one set aside.
+        drop((serving, ma));
+        let mac = if rows == OldRows::SetAsideBelowANewRow {
+            let mac = new.set_aside();
+            let mut god = mac.client(peer, &["rw:/>".to_owned()]);
+            let (_, (_, mut next)) = god.fetch(0, "/>", 0).expect("the head");
+            let mut seq = 0;
+            for (off, row) in &kept {
+                loop {
+                    seq += 1;
+                    let (subject, raw): (&str, &[u8]) = match row {
+                        Some((subject, raw)) if next == *off => (subject, raw),
+                        _ => ("/f/alab/x/padding", b"v=1"),
+                    };
+                    let (at, _) = god
+                        .publish(pid(&pn), seq, subject, raw)
+                        .expect("a record of the log set aside");
+                    next = at + 1;
+                    if at == *off {
+                        break;
+                    }
+                    assert!(at < *off, "{case}: PRECONDITION: the row's offset reached");
+                }
+            }
+            mac
+        } else {
+            new.reminted()
+        };
+        let now = mac.broker.log_identity();
+        assert!(
+            now.id != was.id && now.generation == 0,
+            "{case}: PRECONDITION: another id: {was:?} -> {now:?}"
+        );
+
+        let fx = control.map_or_else(crate::fx::Fx::os, crate::fx::Fx::os_without);
+        let (lane, mut a, _served) = bridge_on(&mac, "tb000000000", k_new.path(), Some(&state), fx);
+        a.endpoint_lane = LINK_PROVED_LANE;
+        assert_eq!(
+            crate::state::StateDir::peek(&state).node().as_deref(),
+            Some(mac.node.as_str()),
+            "{case}: PRECONDITION: the dir names the new node"
+        );
+        let attached = a.attach_broker();
+        let told_line = || {
+            lane.links()
+                .into_iter()
+                .rev()
+                .find(|line| line.starts_with("link log "))
+        };
+        let proved = |fork: u64| {
+            Some(format!(
+                "link log {now} continues={fork} was={was} proved=1"
+            ))
+        };
+        let bare = Some(format!("link log {now}"));
+        let steps = || {
+            a.state
+                .proved_steps()
+                .iter()
+                .map(|step| (step.was, step.now, step.fork))
+                .collect::<Vec<_>>()
+        };
+        match (rows, control) {
+            (_, Some(Mutant::ProofReadsEveryRowOnTheLink))
+            | (OldRows::StaleReadersRing, Some(Mutant::ReaderRefusalRefusesTheAttach)) => {
+                assert!(!attached, "CONTROL {case}: the attach refused");
+                assert_eq!(told_line(), None, "CONTROL {case}: nothing told");
+                let witness = std::fs::read_to_string(state.join("bus-log"))
+                    .ok()
+                    .as_deref()
+                    .and_then(crate::state::LogWitness::parse);
+                assert_eq!(
+                    witness.and_then(|w| w.id),
+                    Some(was),
+                    "CONTROL {case}: the witness on the log before"
+                );
+                assert!(
+                    !a.attach_broker(),
+                    "CONTROL {case}: refused again, for good"
+                );
+                assert_eq!(told_line(), None, "CONTROL {case}: nothing told again");
+            }
+            (OldRows::Granted, None) => {
+                assert!(attached, "{case}: attached");
+                assert_eq!(told_line(), proved(newest + 1), "{case}");
+                assert_eq!(steps(), [(was, now, newest + 1)], "{case}: the step stored");
+            }
+            (OldRows::UngrantedBelowANewRow, None)
+            | (OldRows::SetAsideBelowANewRow, Some(Mutant::HeldMismatchIsNoEvidence)) => {
+                let fork = newest_on_the_link.expect("PRECONDITION: a row the link reads") + 1;
+                assert!(attached, "{case}: attached");
+                assert_eq!(told_line(), proved(fork), "{case}: past the old rows");
+                assert_eq!(steps(), [(was, now, fork)], "{case}: the step stored");
+            }
+            _ => {
+                assert!(attached, "{case}: attached");
+                assert_eq!(told_line(), bare, "{case}: continues none");
+                assert!(steps().is_empty(), "{case}: no step stored");
+            }
+        }
+        a.close_subscriptions();
     }
 }
 
@@ -1789,7 +2103,7 @@ fn a_moved_copy_of_what_a_killed_bridge_delivered_names_where_it_was_first() {
             [Some(read), Some(3)],
             "{case}: read on the old node's lane, the receipt names the ask by its offset on B"
         );
-        let (fields, text) = a
+        let Fetched { fields, text, .. } = a
             .fetch_record("ta000000000", read)
             .unwrap_or_else(|_| panic!("{case}: the old row's body is fetched"));
         assert_eq!(text, "read before", "{case}: {fields}");
@@ -2324,7 +2638,7 @@ fn an_old_nodes_row_held_below_its_lanes_oldest_is_read_there() {
                 [Some(3)],
                 "the receipt names the ask by its offset on B"
             );
-            let (fields, text) = fetched.expect("the old row's body is fetched");
+            let Fetched { fields, text, .. } = fetched.expect("the old row's body is fetched");
             assert_eq!(text, "read before", "{fields}");
         }
     }

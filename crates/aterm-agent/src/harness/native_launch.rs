@@ -90,12 +90,25 @@ fn local_environment(raw: &[(OsString, OsString)]) -> std::io::Result<Vec<String
         .collect()
 }
 
+/// `error` as the step of the launch it ended (`what`): the host's own refusal line, an I/O
+/// error or an exec error, kept on one line.
+fn at(what: &'static str) -> impl FnOnce(std::io::Error) -> std::io::Error {
+    move |error| {
+        let said = error.to_string();
+        std::io::Error::new(
+            error.kind(),
+            format!("{what}: {}", said.trim_end().replace(['\n', '\r'], " ")),
+        )
+    }
+}
+
 fn run(
     args: Args,
     #[cfg(debug_assertions)] hook: Option<&dyn Fn(FixtureStage, ImagePhase) -> std::io::Result<()>>,
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    let mut client = super::upgrade_drive::harness_client(&args.socket, None)?;
+    let mut client =
+        super::upgrade_drive::harness_client(&args.socket, None).map_err(at("host socket"))?;
     // SAFETY: the client exclusively owns this live socket; only its descriptor flags are read.
     let flags = unsafe { libc::fcntl(client.transport().as_raw_fd(), libc::F_GETFD) };
     if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
@@ -111,7 +124,8 @@ fn run(
         &mut client,
         &args.session,
         &Request::Attach(args.binding.clone(), args.phase),
-    )?;
+    )
+    .map_err(at("attach"))?;
     let mut inherited = None;
     let (command, deadline_us) = match attached {
         Reply::Launch {
@@ -127,7 +141,7 @@ fn run(
                 return Err(std::io::Error::other("cold rollback refused"));
             }
             let raw = std::env::vars_os().collect::<Vec<_>>();
-            let cwd = std::env::current_dir()?;
+            let cwd = std::env::current_dir().map_err(at("working directory"))?;
             let env = local_environment(&raw)?;
             let facts =
                 native_act::ColdEnvironmentFacts::observe_for_command(&env, &intent, &seed, &cwd)
@@ -139,7 +153,8 @@ fn run(
                 &mut client,
                 &args.session,
                 &Request::Resolve(args.binding.clone(), args.phase, facts),
-            )?
+            )
+            .map_err(at("cold resolution"))?
             else {
                 return Err(std::io::Error::other("cold launch was not admitted"));
             };
@@ -187,14 +202,15 @@ fn run(
         }
         exec.env_exactly(raw);
     }
-    let exec = exec.prepare_exec()?;
+    let exec = exec.prepare_exec().map_err(at("exec preparation"))?;
     let Reply::Execute {
         deadline_us: original,
     } = native_act::exchange(
         &mut client,
         &args.session,
         &Request::Execute(args.binding.clone(), args.phase),
-    )?
+    )
+    .map_err(at("exec grant"))?
     else {
         return Err(std::io::Error::other("native exec was not admitted"));
     };
@@ -215,22 +231,60 @@ fn run(
             &Request::ExecFailed(args.binding, args.phase, errno),
         );
     }
-    Err(refused)
+    Err(at("exec")(refused))
+}
+
+/// The status of a launcher that did not exec: the shell's "found but not executable".
+const REFUSED: u8 = 126;
+
+/// Run the constructor `argv` names, or say on `err` why it ran nothing and exit [`REFUSED`]:
+/// the line is typed into a person's shell, so a launcher that ends there names its refusal
+/// (malformed arguments, the host's answer to the step that refused, or the exec's error),
+/// never a silent status alone. A successful exec never returns here.
+fn launch(
+    argv: &[OsString],
+    #[cfg(debug_assertions)] hook: Option<&dyn Fn(FixtureStage, ImagePhase) -> std::io::Result<()>>,
+    err: &mut dyn std::io::Write,
+) -> Option<ExitCode> {
+    if argv.first().is_none_or(|arg| arg != "native-launch") {
+        return None;
+    }
+    let why = match arguments(&argv[1..]) {
+        None => "malformed arguments".to_string(),
+        Some(args) => match run(
+            args,
+            #[cfg(debug_assertions)]
+            hook,
+        ) {
+            Ok(()) => "returned without an exec".to_string(),
+            Err(error) => error.to_string(),
+        },
+    };
+    let _said = writeln!(err, "aterm harness native-launch: {why}");
+    Some(ExitCode::from(REFUSED))
 }
 
 /// Intercept this internal constructor before normal harness setup, account reads or lanes.
 pub(super) fn entry(argv: &[OsString]) -> Option<ExitCode> {
-    if argv.first().is_none_or(|arg| arg != "native-launch") {
-        return None;
-    }
-    if let Some(args) = arguments(&argv[1..]) {
-        let _terminal = run(
-            args,
-            #[cfg(debug_assertions)]
-            None,
-        );
-    }
-    Some(ExitCode::from(126))
+    launch(
+        argv,
+        #[cfg(debug_assertions)]
+        None,
+        &mut std::io::stderr(),
+    )
+}
+
+/// [`launch`] to a writer of the test's own: what a refused launcher says.
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn said(argv: &[OsString]) -> (Option<ExitCode>, String) {
+    let mut err = Vec::new();
+    let exit = launch(
+        argv,
+        #[cfg(debug_assertions)]
+        None,
+        &mut err,
+    );
+    (exit, String::from_utf8_lossy(&err).into_owned())
 }
 
 /// Exercise the actual native launcher with a fixture-owned checkpoint callback.
@@ -240,13 +294,7 @@ pub fn fixture_entry(
     argv: &[OsString],
     hook: &dyn Fn(FixtureStage, ImagePhase) -> std::io::Result<()>,
 ) -> Option<ExitCode> {
-    if argv.first().is_none_or(|arg| arg != "native-launch") {
-        return None;
-    }
-    if let Some(args) = arguments(&argv[1..]) {
-        let _terminal = run(args, Some(hook));
-    }
-    Some(ExitCode::from(126))
+    launch(argv, Some(hook), &mut std::io::stderr())
 }
 
 #[cfg(test)]

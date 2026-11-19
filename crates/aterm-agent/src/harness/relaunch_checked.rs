@@ -139,11 +139,9 @@ impl CheckedSource {
     }
 
     pub(crate) fn checked(&self, request: &Prepare) -> Option<CheckedRelaunch> {
-        let Some(AskedIntent::Relaunch(intent)) = &request.asked else {
-            return None;
-        };
+        let ask = request.asked.as_ref().and_then(AskedIntent::relaunch_ask)?;
         if request.expected_human_seq != Some(self.human_seq)
-            || intent.ask != self.ask.word()
+            || ask != self.ask.word()
             || !self.agrees(request)
         {
             return None;

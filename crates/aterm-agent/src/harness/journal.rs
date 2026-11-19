@@ -20,8 +20,9 @@
 //!   state, so the fleet's fold ends on what this Mac's store holds whichever recorder set it.
 //! - [`publish`]: once the transaction is durable, each note goes to the sink, whose `note` is
 //!   one bounded append to the spool with no lock and no allocation (the typing hook).
-//! - [`backfill`]: once per Mac, the local ledger's last 30 days and the state's standing facts;
-//!   [`mark_backfilled`] once the caller has made them durable.
+//! - [`backfill`]: once per Mac, the local ledger's last 30 days and the state's standing facts,
+//!   and once more after an older build's, the standing walls of the models' weeks with their
+//!   model; [`mark_backfilled`] once the caller has made them durable.
 //! - [`probe_note`]: each provider usage read step 9's door reports
 //!   ([`super::provider_read::ProbeEvent`]), as a `probe` of the account read with why it is in
 //!   use; the executable fills that door with it. Claude Code's ledger `probe` claim row is not
@@ -190,6 +191,24 @@ pub const KINDS: &[&str] = &[
 ];
 /// Every window word a note can carry.
 pub const WINDOWS: &[&str] = &["5h", "7d", "7d-model"];
+/// The model word of a week of a model this build names no bucket of
+/// ([`super::profile::Bucket::Other`]: `seven_day_other`, and a `/usage` panel's
+/// `seven_day_<name>`), whose wall the harness takes as the whole account's
+/// ([`super::accounts::Account::limited_until`]), so every reader takes it as every session's.
+pub const OTHER_MODEL: &str = super::profile::Bucket::Other.id();
+/// Every model word a note can carry ([`Note::model`]): the buckets of the models' own weeks
+/// ([`super::accounts::model_week`]), as the survey's `model_walls=` names them, then
+/// [`OTHER_MODEL`].
+pub const MODELS: &[&str] = &{
+    const KNOWN: [&str; super::accounts::MODEL_BUCKETS.len()] = super::accounts::MODEL_BUCKETS;
+    let mut out = [OTHER_MODEL; KNOWN.len() + 1];
+    let mut i = 0;
+    while i < KNOWN.len() {
+        out[i] = KNOWN[i];
+        i += 1;
+    }
+    out
+};
 /// Every source word a note can carry.
 pub const SOURCES: &[&str] = &[
     "statusline",
@@ -377,6 +396,12 @@ pub struct Note {
     pub sub: Option<SubKey>,
     /// One of [`WINDOWS`].
     pub window: Option<&'static str>,
+    /// One of [`MODELS`]: the model whose own week a `7d-model` wall, its clearing (FL-269) or
+    /// its refill (FL-271, [`refills`]) is of ([`model_word`]), so the fleet walls that model's
+    /// sessions alone, or every session for [`OTHER_MODEL`], and a refill ends that model's
+    /// wall alone. Always set on a `7d-model` wall, clearing or refill; none on every other
+    /// note.
+    pub model: Option<&'static str>,
     /// Tenths of a percent used, at most 1000.
     pub pct_x10: Option<u16>,
     /// The window's reset, Unix seconds.
@@ -420,6 +445,7 @@ impl Note {
             cli,
             sub: None,
             window: None,
+            model: None,
             pct_x10: None,
             reset: None,
             res: None,
@@ -993,10 +1019,12 @@ pub fn account_key_with(
 
 /// One login this Mac holds of an account, in the words of the shared file `ai/logins`
 /// (docs/DESIGN-shared-files-2026-11-11.md §10 file 3): what one CLI's accounts store says of it
-/// ([`login_rows`]). Every field is a word of a fixed list, a count, a Unix second, the account's
-/// lab key or a word of [`PLANS`], so it can carry no address, path, link, mail code, token or
-/// cookie: the `aterm` executable checks each word again into the journal's own types
-/// (`aterm_db::alab::journal::mine::Login`) and the flusher writes it as this Mac's `login` row.
+/// ([`login_rows`]), with the facts of the credential its sign-in runs on (plan package SF-34,
+/// [`super::login_token::TokenFacts`]). Every field is a word of a fixed list, a count, a Unix
+/// second, the account's lab key or a word of [`PLANS`], so it can carry no address, path, link,
+/// mail code, token value or cookie: the `aterm` executable checks each word again into the
+/// journal's own types (`aterm_db::alab::journal::mine::Login`) and the flusher writes it as this
+/// Mac's `login` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoginRow {
     pub account: Key,
@@ -1029,6 +1057,9 @@ pub struct LoginRow {
     pub attempt_route: Option<&'static str>,
     /// The plan its renewal's check answered, where it is one of [`PLANS`].
     pub plan: Option<&'static str>,
+    /// The credential its sign-in runs on, where its CLI's reader states one
+    /// ([`super::login_token::read`]).
+    pub token: Option<super::login_token::TokenFacts>,
 }
 
 /// The login rows of `cli`'s accounts as `records` (one consistent read of its roster,
@@ -1054,8 +1085,10 @@ pub struct LoginRow {
 ///   speaks for it, then the one signed out, the first in roster order among equals; its tabs are
 ///   every session on any of them.
 ///
-/// `held` says why this Mac holds each account. Nothing of a directory, a retained login, the
-/// proved address or directory, the routes a sign-in tried, a bot check's page or a token is
+/// `held` says why this Mac holds each account, and `token` the facts of the credential a row
+/// signs in with (its account's key beside it, [`super::login_token::read`]); the row that
+/// speaks for an account brings its own. Nothing of a directory, a retained login, the proved
+/// address or directory, the routes a sign-in tried, a bot check's page or a token's value is
 /// read into a row.
 #[must_use]
 pub fn login_rows(
@@ -1063,6 +1096,7 @@ pub fn login_rows(
     records: &super::accounts::AccountRecords,
     keyer: &dyn Fn(&str, &str) -> Option<String>,
     held: &dyn Fn(&Key) -> &'static str,
+    token: &dyn Fn(&super::accounts::Row, &Key) -> Option<super::login_token::TokenFacts>,
     now: i64,
 ) -> Vec<LoginRow> {
     use super::accounts::{AttemptOutcome, Proof};
@@ -1086,7 +1120,7 @@ pub fn login_rows(
         let binding = records.logins.get(&row.label);
         let tokened =
             cli == Cli::Claude && super::accounts::on_token_here(row, state, now).is_some();
-        let ended_at = super::accounts::login_ended_at(row, &records.logins, state);
+        let ended_at = super::accounts::sign_out_ended_at(row, &records.logins, state);
         let renewed = binding.and_then(|b| b.renewed_at).unwrap_or(0);
         let wrong = binding.and_then(|b| b.wrong_at).filter(|at| *at > renewed);
         let attempt = binding.and_then(|b| b.sign_in_attempt.as_ref());
@@ -1186,6 +1220,7 @@ pub fn login_rows(
             plan: binding
                 .and_then(|b| b.subscription.as_deref())
                 .and_then(plan_word),
+            token: token(row, &key),
         };
         match out.iter_mut().find(|(_, known)| known.account == key) {
             Some(slot) if rank > slot.0 => *slot = (rank, login),
@@ -1286,6 +1321,16 @@ fn window_word(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The model word ([`MODELS`]) a wall of the harness's window `name` names, where its window is
+/// `7d-model` ([`window_word`]): its model's bucket where it is a model's own week
+/// ([`super::accounts::model_week`]), and [`OTHER_MODEL`] for any other, whose wall the harness
+/// takes as the account's, so the fleet takes it as every session's as this Mac does; `None`
+/// for every other window.
+fn model_word(name: &str) -> Option<&'static str> {
+    (window_word(name) == Some("7d-model"))
+        .then(|| super::accounts::model_week(name).unwrap_or(OTHER_MODEL))
+}
+
 /// The note a ledger row becomes, keyed by `pk` (and `to` for a switch or a displacement), with
 /// the sign-in word that note states where it states one; or none for a kind the journal does
 /// not take (a sample, a proof, a pin, a warning, a move, a wall, which the state's diff notes
@@ -1359,16 +1404,22 @@ fn of_ledger(
 }
 
 /// The notes a reset's or a refill's ledger row becomes ([`of_ledger`]'s `note`): one
-/// `reset-used` for each window the row says was refilled or raised ([`Event::refilled`]), of the account's workspace
-/// (`sub`) where it has one as its readings and walls are, so a Mac's fold cuts that window's
-/// earlier readings and walls and no other window's. A row that names no window the journal
-/// holds (a reset spent with the limit still standing, a row written before rows named them) is
-/// one note of no window, which says a reset was used and cuts nothing.
+/// `reset-used` for each window the row says was refilled or raised ([`Event::refilled`]), of
+/// the account's workspace (`sub`) where it has one as its readings and walls are, so a Mac's
+/// fold cuts that window's earlier readings and walls and no other window's. A model's own
+/// week's refill names its model ([`model_word`], FL-271) as its wall does, so the fold ends
+/// that model's wall alone: a refill of the Sonnet week leaves a Fable wall standing, as the
+/// harness's own lift does ([`super::accounts::refills_with`]). A row that names no window the
+/// journal holds (a reset spent with the limit still standing, a row written before rows named
+/// them) is one note of no window, which says a reset was used and cuts nothing.
 fn refills(note: Note, event: &Event, sub: Option<SubKey>) -> Vec<Note> {
-    let mut windows: Vec<&'static str> = Vec::new();
-    for window in event.refilled.iter().filter_map(|w| window_word(w)) {
-        if !windows.contains(&window) {
-            windows.push(window);
+    let mut windows: Vec<(&'static str, Option<&'static str>)> = Vec::new();
+    for name in &event.refilled {
+        if let Some(window) = window_word(name) {
+            let refilled = (window, model_word(name));
+            if !windows.contains(&refilled) {
+                windows.push(refilled);
+            }
         }
     }
     let note = Note { sub, ..note };
@@ -1377,8 +1428,9 @@ fn refills(note: Note, event: &Event, sub: Option<SubKey>) -> Vec<Note> {
     }
     windows
         .into_iter()
-        .map(|window| Note {
+        .map(|(window, model)| Note {
             window: Some(window),
+            model,
             ..note
         })
         .collect()
@@ -1524,6 +1576,7 @@ pub fn probe_note(
                 cli: event.read.cli(),
                 sub: None,
                 window: None,
+                model: None,
                 pct_x10: None,
                 reset: None,
                 res: None,
@@ -1683,6 +1736,7 @@ fn notes_of(
                 note
             };
             note.window = window_word(name);
+            note.model = model_word(name);
             note.sub = sub;
             notes.push(note);
         }
@@ -1699,16 +1753,28 @@ const BACKFILL_DIR: &str = "alab";
 /// The marker a finished backfill leaves there.
 #[cfg(unix)]
 const BACKFILL_MARK: &str = "backfilled";
+/// What the marker says once this build's backfill is done: `2` since a wall of a model's week
+/// names its model (FL-269). A build before that wrote `1`, and its notes of those walls named
+/// none, which no reader takes as any model's ([`backfill`] notes each still standing again).
+#[cfg(unix)]
+const BACKFILL_DONE: &[u8] = b"2\n";
 /// How far back the backfill reaches: the spool keeps 30 days.
 #[cfg(unix)]
 const BACKFILL_S: i64 = 30 * 86_400;
 
-/// Whether this Mac's backfill is done.
+/// The marker this Mac's backfill left, where a private one is there.
+#[cfg(unix)]
+fn backfill_mark(harness_state: &Path) -> Option<Vec<u8>> {
+    aterm_uds::private_file::read_private(&harness_state.join(BACKFILL_DIR), BACKFILL_MARK, 16).ok()
+}
+
+/// Whether this Mac's backfill is done, as this build makes it ([`BACKFILL_DONE`]): an older
+/// build's marker leaves the standing walls of the models' weeks to be noted again with their
+/// model ([`backfill`]).
 #[cfg(unix)]
 #[must_use]
 pub fn backfilled(harness_state: &Path) -> bool {
-    aterm_uds::private_file::read_private(&harness_state.join(BACKFILL_DIR), BACKFILL_MARK, 16)
-        .is_ok()
+    backfill_mark(harness_state).as_deref() == Some(BACKFILL_DONE)
 }
 
 /// Mark this Mac's backfill done: the caller's word that the notes [`backfill`] returned are
@@ -1721,14 +1787,18 @@ pub fn backfilled(harness_state: &Path) -> bool {
 pub fn mark_backfilled(harness_state: &Path) -> std::io::Result<()> {
     let dir = harness_state.join(BACKFILL_DIR);
     aterm_uds::private_file::ensure_private_dir(&dir)?;
-    aterm_uds::private_file::write_private(&dir, BACKFILL_MARK, b"1\n")
+    aterm_uds::private_file::write_private(&dir, BACKFILL_MARK, BACKFILL_DONE)
 }
 
 /// Once per Mac: the notes each CLI's local ledger holds from the last 30 days, and the state's
 /// standing facts (current window readings, standing walls, each login's word, the last time a
 /// session was read on an account), each account keyed by its learned key or else the key of
-/// the roster row `roster(cli)` gives. Returns the notes and writes nothing: the caller marks
-/// the backfill done ([`mark_backfilled`]) once the notes are durable.
+/// the roster row `roster(cli)` gives. Where a backfill is already marked done (an older
+/// build's, which [`backfilled`] does not take as this build's), only each standing wall of a
+/// `7d-model` window, now with its model ([`model_word`], FL-269): that build's notes of them
+/// named none, so no reader holds them as any model's, and the harness notes a standing wall
+/// only once. The ledger is not replayed again. Returns the notes and writes nothing: the
+/// caller marks the backfill done ([`mark_backfilled`]) once the notes are durable.
 #[cfg(unix)]
 #[must_use]
 pub fn backfill(
@@ -1743,6 +1813,7 @@ pub fn backfill(
         // No harness has run here yet; the next start looks again.
         return notes;
     }
+    let model_walls_only = backfill_mark(harness_state).is_some();
     for cli in Cli::ALL {
         let store = Store::at_for(harness_state, cli, user_home);
         let Ok((mut state, _)) = store.load(now) else {
@@ -1751,9 +1822,13 @@ pub fn backfill(
         if let Some(roster) = roster(cli) {
             learn_with(cli, &roster, &mut state, keyer);
         }
-        let mut events = store
-            .tail(super::accounts::LEDGER_KEEP_ROWS)
-            .unwrap_or_default();
+        let mut events = if model_walls_only {
+            Vec::new()
+        } else {
+            store
+                .tail(super::accounts::LEDGER_KEEP_ROWS)
+                .unwrap_or_default()
+        };
         let quiet = State {
             accounts: state
                 .accounts
@@ -1774,12 +1849,18 @@ pub fn backfill(
         let mut seeded = state.clone();
         seeded.sessions.clear();
         for account in seeded.accounts.values_mut() {
-            account.windows.retain(|_, fig| fig.current(now));
             account
-                .walls
-                .retain(|_, wall| wall.stands_until().is_some_and(|end| now < end));
+                .windows
+                .retain(|_, fig| !model_walls_only && fig.current(now));
+            account.walls.retain(|name, wall| {
+                (!model_walls_only || model_word(name).is_some())
+                    && wall.stands_until().is_some_and(|end| now < end)
+            });
         }
         notes.extend(notes_of(cli, &quiet, &seeded, &mut events, now, None));
+        if model_walls_only {
+            continue;
+        }
         for account in state.accounts.values() {
             let Some(pk) = account.pk.as_deref().and_then(Key::new) else {
                 continue;

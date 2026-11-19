@@ -298,9 +298,9 @@ fn fixture(mode: u8) -> (Tmp, Env, Arc<Approval>, Host) {
     (tmp, env, approval, host)
 }
 
-/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// Unix only, where aterm reads a shared login's private
 /// staged evidence (`shared_provider::read_staged_bytes`); off Unix
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn an_unknown_attempt_requests_a_successor_without_repeating_the_consumed_action() {
@@ -358,9 +358,9 @@ fn an_unknown_attempt_requests_a_successor_without_repeating_the_consumed_action
     assert!(env.accounts_store().load(NOW).unwrap().0.active.is_none());
 }
 
-/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// Unix only, where aterm reads a shared login's private
 /// staged evidence (`shared_provider::read_staged_bytes`); off Unix
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn a_verified_but_unapproved_principal_requests_recovery_without_replaying_it() {
@@ -487,9 +487,9 @@ impl shared_provider::Provider for FirstResult {
     }
 }
 
-/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// Unix only, where aterm reads a shared login's private
 /// staged evidence (`shared_provider::read_staged_bytes`); off Unix
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn a_proved_unstarted_attempt_resumes_its_original_request_but_an_unknown_one_does_not() {
@@ -545,9 +545,9 @@ fn a_proved_unstarted_attempt_resumes_its_original_request_but_an_unknown_one_do
     }
 }
 
-/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// Unix only, where aterm reads a shared login's private
 /// staged evidence (`shared_provider::read_staged_bytes`); off Unix
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn first_shared_adoption_publishes_only_after_identity_and_retains_one_use_floor() {
@@ -641,9 +641,9 @@ fn automatic_first_adoption_refuses_before_consumption_without_a_headless_opener
 #[test]
 fn automatic_first_adoption_does_not_substitute_a_headless_profile_for_a_required_one() {
     for pending in [false, true] {
-        // Pending reconciliation first runs a headless sign-in (`cli::opener_link`), which runs
-        // only on Unix; `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds
-        // the off-Unix refusal.
+        // Pending reconciliation reads a shared login's private staged evidence, which runs only
+        // on Unix; `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence`
+        // holds the off-Unix refusal.
         if pending && !cfg!(unix) {
             continue;
         }
@@ -679,9 +679,9 @@ fn automatic_first_adoption_does_not_substitute_a_headless_profile_for_a_require
     }
 }
 
-/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// Unix only, where aterm reads a shared login's private
 /// staged evidence (`shared_provider::read_staged_bytes`); off Unix
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn first_shared_adoption_preserves_an_existing_default_login_and_selection() {
@@ -726,9 +726,9 @@ fn first_shared_adoption_preserves_an_existing_default_login_and_selection() {
     );
 }
 
-/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// Unix only, where aterm reads a shared login's private
 /// staged evidence (`shared_provider::read_staged_bytes`); off Unix
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn interrupted_first_adoption_reconciles_same_staging_without_another_provider_effect() {
@@ -834,9 +834,9 @@ impl shared_provider::Provider for ChangeDuringProof {
     }
 }
 
-/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// Unix only, where aterm reads a shared login's private
 /// staged evidence (`shared_provider::read_staged_bytes`); off Unix
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn publication_rechecks_root_and_local_off_after_the_final_credential_read() {
@@ -869,9 +869,9 @@ fn publication_rechecks_root_and_local_off_after_the_final_credential_read() {
     }
 }
 
-/// Unix only, where aterm links the headless opener (`cli::opener_link`) and reads private
+/// Unix only, where aterm reads a shared login's private
 /// staged evidence (`shared_provider::read_staged_bytes`); off Unix
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn a_new_root_generation_can_replace_its_own_unlisted_reservation() {
@@ -883,8 +883,8 @@ fn a_new_root_generation_can_replace_its_own_unlisted_reservation() {
     assert_eq!(host.calls.load(Ordering::SeqCst), 2);
 }
 
-/// Unix only, where aterm links the headless opener (`cli::opener_link`); off Unix
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds the refusal.
+/// Unix only, where aterm reads a shared login's private staged evidence; off Unix
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn local_invalidation_never_resumes_the_older_pending_result() {
@@ -896,18 +896,21 @@ fn local_invalidation_never_resumes_the_older_pending_result() {
     assert!(!host.roster.exists());
 }
 
-/// Off Unix aterm makes no symbolic-link opener (`cli::opener_link`), so automatic Claude
-/// shared adoption refuses before staging, provider calls, or decision consumption.
+/// Off Unix aterm reads no shared login's private staged evidence
+/// (`shared_provider::read_staged_bytes`), so automatic Claude shared adoption refuses at its
+/// opener, before staging, provider calls, or decision consumption.
 #[cfg(not(unix))]
 #[test]
-fn automatic_shared_adoption_refuses_where_aterm_links_no_opener() {
+fn automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence() {
     let (_tmp, env, approval, host) = fixture(0);
-    let err = run(&env, &host, &approval).expect_err("no headless opener off Unix");
+    let err = run(&env, &host, &approval).expect_err("no private evidence off Unix");
     assert_eq!(
         err,
-        opener_link(&env.accounts_store(), &host)
-            .unwrap_err()
-            .to_string()
+        crate::harness::cli::shared_adoption::SHARED_EVIDENCE_UNAVAILABLE
+    );
+    assert!(
+        !env.accounts_store().dir.join("bin").exists(),
+        "no opener is published for a run that cannot be adopted"
     );
     assert_eq!(host.calls.load(Ordering::SeqCst), 0);
     assert!(!env.accounts_store().logins_dir().exists());
@@ -953,9 +956,9 @@ fn revoked_wrong_identity_and_disabled_adoptions_never_publish_a_row() {
     assert_eq!(host.calls.load(Ordering::SeqCst), 0);
 }
 
-/// Unix only, where aterm links the headless opener a first adoption needs before it records an
-/// attempt to recover (`opener_link`); off Unix it is refused before it consumes anything, as
-/// `automatic_shared_adoption_refuses_where_aterm_links_no_opener` holds.
+/// Unix only, where aterm reads the private staged evidence a first adoption needs before it
+/// records an attempt to recover; off Unix it is refused before it consumes anything, as
+/// `automatic_shared_adoption_refuses_where_aterm_reads_no_private_evidence` holds.
 #[cfg(unix)]
 #[path = "cli_shared_adoption_recovery_tests.rs"]
 mod recovery;

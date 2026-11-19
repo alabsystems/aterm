@@ -255,8 +255,14 @@ fn release_role_distinguishes_absence_from_an_invalid_or_dangling_lock() {
     std::fs::write(&path, "not a lock\n").unwrap();
     assert!(release_toolchain(root.path(), false).is_err());
     assert!(release_toolchain(root.path(), true).is_err());
-    let source = aterm_tempfile::manifest_dir().join("../../trust.lock");
-    let lock = aterm_toolchain::trust_lock::read(&source).unwrap();
+    // A lock of its own, never the checkout's, which a public snapshot does not carry.
+    let lock = aterm_toolchain::trust_lock::TrustLock {
+        build: 27009,
+        tree_root: "b".repeat(64),
+        compiler_commit: "5".repeat(40),
+        receipt: "SEED-MINT sha256:00".into(),
+        stock_toolchain: "1.91.1".into(),
+    };
     std::fs::write(&path, aterm_toolchain::trust_lock::render_body(&lock)).unwrap();
     assert_eq!(
         release_toolchain(root.path(), false),

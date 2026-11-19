@@ -130,9 +130,9 @@ impl TrailRig {
         // rig titles frame 0's panes on a cold store and every later rig on a warm one.
         app.sync_chrome_fonts();
         if let Some(mut ws) = app.windows.get_mut(&WindowId(0)) {
-            ws.present = Some(crate::PresentTarget::Cpu {
+            ws.replace_present(Some(crate::PresentTarget::Cpu {
                 surface: crate::present::CpuSurface::Scripted(Default::default()),
-            });
+            }));
         }
         app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
         let t0 = crate::metrics::instant_at_us(crate::metrics::us_at(Instant::now()) + 1)

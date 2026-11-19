@@ -81,6 +81,11 @@ pub const ALPN_DATABASE_RECONCILE: &[u8] = b"atdb/7";
 /// or an earlier protocol.
 pub const ALPN_DATABASE_RANGES: &[u8] = b"atdb/8";
 
+/// [`ALPN_DATABASE_RANGES`]'s frames, with each table's conflict-proof inventory reconciled by
+/// range as well, where `atdb/7` and `atdb/8` trade it as one whole list. Earlier peers negotiate
+/// [`ALPN_DATABASE_RANGES`] or an earlier protocol.
+pub const ALPN_DATABASE_PROOFS: &[u8] = b"atdb/9";
+
 const PROTOCOLS: [&[u8]; 2] = [ALPN_NODES, ALPN];
 
 /// The mesh's ALPN protocol (`atm/1`, `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4): the
@@ -205,6 +210,9 @@ pub enum FleetOp {
     Desk,
     /// atpkg's content-addressed toolset units (`atpkg::peers`), in place of port 7487.
     Units,
+    /// A shared dependency unit of targo's store, asked for by key only by a member whose build
+    /// would compile it ([`crate::built`], DC-24b); carried on `atf/2` alone.
+    Built,
 }
 
 impl FleetOp {
@@ -227,6 +235,7 @@ impl FleetOp {
             Self::Inventory => "inventory",
             Self::Desk => "desk",
             Self::Units => "units",
+            Self::Built => "built",
         }
     }
 
@@ -249,21 +258,26 @@ impl FleetOp {
             Self::Inventory,
             Self::Desk,
             Self::Units,
+            Self::Built,
         ]
         .into_iter()
         .find(|op| op.word() == word)
     }
 
-    /// Whether [`ALPN_MESH`] carries it: every op but the three bound to the fleet's secret or
-    /// its own protocols. [`Self::Join`] registers with the issuer under the join key,
+    /// Whether [`ALPN_MESH`] carries it: every op but the four bound to the fleet's secret or
+    /// their own protocols. [`Self::Join`] registers with the issuer under the join key,
     /// [`Self::VaultJoin`] proves the vault's current fleet code (the desk takes it over the mesh's
-    /// `Desk` op, `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4), and [`Self::Database`] keeps its
-    /// own `atdb` protocols on the old listener. A dialer offers the mesh only for an op it
+    /// `Desk` op, `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4), [`Self::Database`] keeps its
+    /// own `atdb` protocols on the old listener, and [`Self::Built`] is the fleet listener's own
+    /// (its answer reads targo's store, which no node service serves). A dialer offers the mesh only for an op it
     /// carries, so neither end ever needs another try for one it does not.
     #[inline]
     #[must_use]
     pub const fn meshed(self) -> bool {
-        !matches!(self, Self::Join | Self::VaultJoin | Self::Database)
+        !matches!(
+            self,
+            Self::Join | Self::VaultJoin | Self::Database | Self::Built
+        )
     }
 
     /// Whether only [`ALPN_MESH`] carries it: the ops the mesh brought ([`Self::Neighbour`],
@@ -1172,6 +1186,9 @@ fn database_server_config() -> Arc<ServerConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_RANGES.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_PROOFS.to_vec());
         Arc::new(config)
     }))
 }
@@ -1202,6 +1219,9 @@ fn database_client_config() -> Arc<ClientConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_RANGES.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_PROOFS.to_vec());
         Arc::new(config)
     }))
 }
@@ -1432,7 +1452,7 @@ pub fn server_handshake_with_denied(
     )
 }
 
-/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_RANGES`]
+/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_PROOFS`]
 /// and retaining the earlier database and fleet protocols for older dialers. This serves
 /// only [`FleetOp::Database`], with no terminal survey or drive capability.
 ///
@@ -1540,6 +1560,7 @@ fn database_version(alpn: &[u8]) -> Option<u8> {
         ALPN_DATABASE_DUPLEX,
         ALPN_DATABASE_RECONCILE,
         ALPN_DATABASE_RANGES,
+        ALPN_DATABASE_PROOFS,
     ]
     .iter()
     .zip(2..)
@@ -1746,7 +1767,7 @@ pub fn client_handshake_as(
     client_handshake_by(tcp, secret, me, op, within).map_err(|undialed| undialed.error)
 }
 
-/// Authenticate a database dialer, preferring [`ALPN_DATABASE_RANGES`] and
+/// Authenticate a database dialer, preferring [`ALPN_DATABASE_PROOFS`] and
 /// negotiating an earlier database or fleet protocol with an older listener. TLS pins,
 /// secret proofs and exporter-bound node proofs are unchanged.
 ///
@@ -3625,7 +3646,8 @@ const fn spoken(alpn: Option<&[u8]>) -> Option<Spoken> {
             | ALPN_DATABASE_DELTA
             | ALPN_DATABASE_DUPLEX
             | ALPN_DATABASE_RECONCILE
-            | ALPN_DATABASE_RANGES,
+            | ALPN_DATABASE_RANGES
+            | ALPN_DATABASE_PROOFS,
         ) => Some(Spoken::Fleet { nodes: true }),
         Some(ALPN) => Some(Spoken::Fleet { nodes: false }),
         Some(ALPN_MESH) => Some(Spoken::Mesh),

@@ -5,8 +5,6 @@
 
 #![cfg(unix)]
 
-use std::time::Instant;
-
 use crate::{child_output, headless_boot};
 
 use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field, status};
@@ -83,7 +81,7 @@ fn a_workers_record_is_marked_read_published_and_awaited() {
         let child = first
             .take()
             .unwrap_or_else(|| waiting.spawn().expect("spawn the waiting client"));
-        child_output::wait_and_read(child, Instant::now() + headless_boot::CLIENT_EXIT_DEADLINE)
+        child_output::wait_and_read(child, headless_boot::CLIENT_NO_PROGRESS_WINDOW)
             .expect("the waiting client exits")
     });
     let stdout = String::from_utf8_lossy(&out.stdout);

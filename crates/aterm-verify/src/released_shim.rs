@@ -868,6 +868,88 @@ mod mac {
         }
     }
 
+    /// A pristine copy of the first placement's tracked inputs, captured before its build.
+    /// Each later build gets an independent writable tree, including the in-tree fallback.
+    #[derive(Default)]
+    struct PlacementSource {
+        saved: Option<SavedSource>,
+    }
+
+    struct SavedSource {
+        private: aterm_tempfile::TempDir,
+        files: Vec<PathBuf>,
+    }
+
+    impl PlacementSource {
+        fn populate(
+            &mut self,
+            rig: &Rig,
+            root: &Path,
+            env: &EnvSnapshot,
+            execution: exec::ExecEnv<'_>,
+        ) -> Result<(), String> {
+            let last = Placement::ALL.last() == Some(&rig.placement);
+            if let Some(saved) = &self.saved {
+                let phase = Phase::new(execution.events, rig.check, rig.placement, "source-reuse");
+                let method = saved.install(&rig.home, &rig.tree, last)?;
+                phase.finish(method);
+                return Ok(());
+            }
+            let files = rig.copy_source(root, env, execution)?;
+            if !last {
+                let phase = Phase::new(
+                    execution.events,
+                    rig.check,
+                    rig.placement,
+                    "source-snapshot",
+                );
+                self.saved = SavedSource::capture(&rig.tree, files).ok();
+                phase.finish(if self.saved.is_some() {
+                    "complete"
+                } else {
+                    "unavailable"
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl SavedSource {
+        fn capture(tree: &Path, files: Vec<PathBuf>) -> std::io::Result<Self> {
+            let private = aterm_tempfile::Builder::new()
+                .prefix("rs-source-")
+                .suffix(".noindex")
+                .tempdir_in("/tmp")?;
+            aterm_tempfile::clone_tree(tree, &private.path().join("source"))?;
+            Ok(Self { private, files })
+        }
+
+        fn install(&self, home: &Path, tree: &Path, last: bool) -> Result<&'static str, String> {
+            let source = self.private.path().join("source");
+            if !io(fs::symlink_metadata(&source))?.is_dir() {
+                return Err("the captured candidate source is no longer a directory".into());
+            }
+            if last && fs::rename(&source, tree).is_ok() {
+                return Ok("moved");
+            }
+            // Only a complete clone replaces the rig's empty candidate directory. The
+            // tracked-file fallback uses the same captured image even if the checkout moved.
+            if let Ok(staging) = aterm_tempfile::Builder::new().tempdir_in(home) {
+                let candidate = staging.path().join("source");
+                if aterm_tempfile::clone_tree(&source, &candidate)
+                    .and_then(|()| fs::rename(candidate, tree))
+                    .is_ok()
+                {
+                    return Ok("cloned");
+                }
+            }
+            for path in &self.files {
+                copy_file(&source.join(path), &tree.join(path))?;
+            }
+            Ok("copied")
+        }
+    }
+
     pub(super) struct Rig {
         _scratch: aterm_tempfile::TempDir,
         pub(super) home: PathBuf,
@@ -1072,6 +1154,43 @@ mod mac {
             Ok(self.run_build(&cmd, execution))
         }
 
+        fn copy_source(
+            &self,
+            root: &Path,
+            env: &EnvSnapshot,
+            execution: exec::ExecEnv<'_>,
+        ) -> Result<Vec<PathBuf>, String> {
+            let mut files = {
+                let mut phase =
+                    Phase::new(execution.events, self.check, self.placement, "tracked-list");
+                let files = git_files(root, env)?;
+                phase.count("listed_entries", files.len());
+                phase.finish("complete");
+                files
+            };
+            let mut phase = Phase::new(execution.events, self.check, self.placement, "source-copy");
+            let listed = files.len();
+            let mut copied = 0;
+            // Keep only the entries actually copied in the same allocation as the Git list.
+            for index in 0..listed {
+                let path = &files[index];
+                let from = root.join(path);
+                // Deleted tracked inputs remain deleted in the candidate snapshot.
+                if fs::symlink_metadata(&from).is_ok() {
+                    copy_file(&from, &self.tree.join(path))?;
+                    if index != copied {
+                        files.swap(index, copied);
+                    }
+                    copied += 1;
+                }
+            }
+            files.truncate(copied);
+            phase.count("copied_entries", copied);
+            phase.count("missing_or_unread_entries", listed - copied);
+            phase.finish("complete");
+            Ok(files)
+        }
+
         /// The candidate's tracked files, snapshotted into the rig, and the rig's one build of
         /// them. A build that exits 0 with no library under scratch decided nothing.
         fn first_build(
@@ -1079,33 +1198,13 @@ mod mac {
             root: &Path,
             env: &EnvSnapshot,
             execution: exec::ExecEnv<'_>,
+            source: Option<&mut PlacementSource>,
         ) -> Result<exec::MachineRun, String> {
             let result = (|| {
-                let files = {
-                    let mut phase =
-                        Phase::new(execution.events, self.check, self.placement, "tracked-list");
-                    let files = git_files(root, env)?;
-                    phase.count("listed_entries", files.len());
-                    phase.finish("complete");
-                    files
-                };
-                {
-                    let mut phase =
-                        Phase::new(execution.events, self.check, self.placement, "source-copy");
-                    let (mut copied, mut skipped) = (0, 0);
-                    for path in files {
-                        let from = root.join(&path);
-                        // Deleted tracked inputs remain deleted in the candidate snapshot.
-                        if fs::symlink_metadata(&from).is_ok() {
-                            copy_file(&from, &self.tree.join(path))?;
-                            copied += 1;
-                        } else {
-                            skipped += 1;
-                        }
-                    }
-                    phase.count("copied_entries", copied);
-                    phase.count("missing_or_unread_entries", skipped);
-                    phase.finish("complete");
+                if let Some(source) = source {
+                    source.populate(&self, root, env, execution)?;
+                } else {
+                    self.copy_source(root, env, execution)?;
                 }
                 let output = {
                     let phase = Phase::new(
@@ -1212,7 +1311,7 @@ mod mac {
             Placement::SharedCache,
         )?;
         setup.finish("complete");
-        let output = rig.first_build(root, env, execution)?;
+        let output = rig.first_build(root, env, execution, None)?;
         Ok((judging, output))
     }
 
@@ -1220,12 +1319,13 @@ mod mac {
     const CANDIDATE: &str = "this tree's shim and atpkg";
 
     /// This tree's pair under `placement`: a fresh home, one build.
-    pub(super) fn judge_candidate(
+    fn judge_candidate(
         root: &Path,
         env: &EnvSnapshot,
         helper: &Path,
         placement: Placement,
         execution: exec::ExecEnv<'_>,
+        source: &mut PlacementSource,
     ) -> Result<exec::MachineRun, String> {
         let selection = Phase::new(
             execution.events,
@@ -1244,7 +1344,7 @@ mod mac {
             placement,
         )?;
         setup.finish("complete");
-        rig.first_build(root, env, execution)
+        rig.first_build(root, env, execution, Some(source))
     }
 
     /// `candidate-shim`'s rows: [`judge_candidate`] under each of [`Placement::ALL`].
@@ -1255,9 +1355,10 @@ mod mac {
         execution: exec::ExecEnv<'_>,
         report: &mut crate::ladder::Report,
     ) {
+        let mut source = PlacementSource::default();
         for placement in Placement::ALL {
             let under = placement.name();
-            match judge_candidate(root, env, helper, placement, execution) {
+            match judge_candidate(root, env, helper, placement, execution, &mut source) {
                 Ok(output) if output.run.ok => {
                     report.raw(output.run.output);
                     report.pass(format!(

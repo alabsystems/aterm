@@ -187,7 +187,7 @@ impl Registry {
             |session, catalog| projection_descriptor(config, session, catalog),
             |session, store, scope, compiled, custody, _, validate| {
                 count_admission(AdmissionCount::Observation, 1);
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, compiled.decoder())?;
                 let view = View::read(compiled.table, session, &log)?;
                 let read = ProjectionRead::read(session, scope, &view, custody)?;
                 include_source(config, session.paths(), session.trust(), scope)?;
@@ -399,13 +399,14 @@ fn count_admission(which: AdmissionCount, n: u64) {
     });
 }
 
-/// [`decode`] for an admission's read of the registry's log, counting the record it is handed
-/// and that record's payload bytes. The answer is [`decode`]'s own; no other read of the
-/// registry passes this function, so none is counted.
+/// The registry's decoder (every registry generation takes version 1 records,
+/// `att::Compiled::records`) for an admission's read of the registry's log, counting the record
+/// it is handed and that record's payload bytes. The answer is the decoder's own; no other read
+/// of the registry passes this function, so none is counted.
 fn admitted_decode(payload: &[u8]) -> Result<Command> {
     count_admission(AdmissionCount::Record, 1);
     count_admission(AdmissionCount::Byte, payload.len() as u64);
-    decode(payload)
+    crate::att::decode(payload)
 }
 
 /// The counts now ([`AdmissionCounts`]).

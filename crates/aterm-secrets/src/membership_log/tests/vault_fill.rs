@@ -69,7 +69,7 @@ fn automatic(record: &Record) -> Authoring {
 /// production 64 MiB, and the same shares of a test's smaller bound.
 #[test]
 fn vault_fill_stops_are_seven_eighths_and_fifteen_sixteenths_of_the_bound() {
-    assert_eq!(MAX_RECORDS_STREAM, 64 * MIB);
+    assert_eq!(Reading::ONE.capacity(), 64 * MIB);
     assert_eq!((AUTOMATIC_STOP, PERSON_STOP), (56 * MIB, 60 * MIB));
     assert_eq!(
         Class::ALL,
@@ -145,12 +145,12 @@ fn vault_fill_classes_a_write_by_its_author() {
     // The same bytes as a removal's batch run to the bound.
     let removal = Authoring::all(std::slice::from_ref(&token), Class::Membership);
     assert_eq!(
-        removal.refusal(MAX_RECORDS_STREAM - removal.bytes, 0, Author::Person),
+        removal.refusal(Reading::ONE.capacity() - removal.bytes, 0, Author::Person),
         None
     );
     assert!(
         removal
-            .refusal(MAX_RECORDS_STREAM, 0, Author::Person)
+            .refusal(Reading::ONE.capacity(), 0, Author::Person)
             .is_some()
     );
 }
@@ -460,7 +460,7 @@ fn vault_fill_status_line_matches_a_header_census() {
     let fill = log.fill(Some(NOW));
 
     assert_eq!(fill.bytes, rows.iter().map(|row| row.3).sum::<usize>());
-    assert_eq!(fill.bound, MAX_RECORDS_STREAM);
+    assert_eq!(fill.bound, Reading::ONE.capacity());
     for (kind, records, bytes) in fill.by_kind {
         let of_kind: Vec<usize> = rows
             .iter()
@@ -505,7 +505,7 @@ fn vault_fill_status_line_matches_a_header_census() {
             ],
         })
     );
-    let left = u128::try_from(MAX_RECORDS_STREAM - fill.bytes).unwrap();
+    let left = u128::try_from(Reading::ONE.capacity() - fill.bytes).unwrap();
     let ms = u64::try_from(left * 24 * u128::from(HOUR) / u128::try_from(a + b + c).unwrap());
     assert_eq!(fill.projected(), Projected::In(ms.unwrap()));
     let membership = log.membership();
@@ -637,7 +637,7 @@ fn vault_fill_window_ends_at_the_readers_clock() {
 fn vault_fill_status_line_names_the_refused_classes_and_the_time_left() {
     let fill = |bytes: usize| Fill {
         bytes,
-        bound: MAX_RECORDS_STREAM,
+        bound: Reading::ONE.capacity(),
         by_kind: Kind::ALL.map(|kind| (kind, 0, 0)),
         stops: Class::ALL.map(author_stop),
         signed: Some(Signed {

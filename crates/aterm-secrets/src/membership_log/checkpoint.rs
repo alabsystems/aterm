@@ -259,7 +259,7 @@ pub fn checkpoint_id(body: &Body) -> Option<RecordId> {
     matches!(body, Body::Checkpoint { .. }).then(|| {
         let mut hash = aterm_digest::Sha256::new();
         hash.update(CHECKPOINT_DOMAIN);
-        hash.update(&encode_body(body));
+        hash.update(encode_body(body));
         hash.finalize()
     })
 }
@@ -446,7 +446,7 @@ fn cut_log(log: &Log, cut_ms: u64, heads: &[RecordId]) -> Result<AtCut> {
     let mut heads = heads.to_vec();
     heads.sort_unstable();
     heads.dedup();
-    if cut_ms == 0 || cut_ms % DAY_MS != 0 {
+    if cut_ms == 0 || !cut_ms.is_multiple_of(DAY_MS) {
         return Err(Error::new("a checkpoint's cut is a whole UTC day"));
     }
     if heads.is_empty() || heads.len() > super::MAX_CHECKPOINT_HEADS {
@@ -511,6 +511,7 @@ fn projection(log: &Log, past: Vec<Record>, ends: &[RecordId]) -> Result<Log> {
         .ok_or_else(|| Error::new("a checkpoint's cut has no genesis"))?;
     let mut at = Log::new(genesis)?;
     at.budgets = log.budgets;
+    at.stored_at = log.stored_at;
     at.enforce_seats = log.enforce_seats;
     // A rooted log's records follow its dropped records' places (FL-148c): the stubs in the
     // past of `ends` are this past's.
@@ -595,7 +596,7 @@ fn stubs_dropped(at: &Log, dropped: &[RecordId]) -> BTreeMap<RecordId, Stub> {
 pub fn dropped_digest(stubs: &BTreeMap<RecordId, Stub>) -> [u8; 32] {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(DROPPED_DOMAIN);
-    hash.update(&(stubs.len() as u64).to_be_bytes());
+    hash.update((stubs.len() as u64).to_be_bytes());
     #[cfg(test)]
     if super::served::mutant(super::served::Mutant::IdsOnly) {
         for id in stubs.keys() {

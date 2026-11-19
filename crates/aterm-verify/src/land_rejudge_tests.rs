@@ -263,7 +263,7 @@ fn replay(scenario: &str) {
             autofix: &mut |_: &Path, _: &[String]| Ok(()),
             hand_over: &mut |_, _, _| panic!("no handoff was expected"),
             say: &mut |line| said.push(line.to_owned()),
-            remote: &remote_step,
+            remote: &live_remote,
             pause: &no_retry,
         },
     );

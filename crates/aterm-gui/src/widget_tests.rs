@@ -545,3 +545,104 @@ fn a_least_change_to_any_field_moves_the_fingerprint() {
         "changes the fingerprint misses: {missed:#?}"
     );
 }
+
+/// [`scale_prims`] scales every length and leaves every ink, fraction and angle: a deck painted
+/// in device px at 2× and scaled by ½ is the same paint laid in points.
+#[test]
+fn scaling_prims_scales_lengths_and_keeps_inks() {
+    let ink = rgba([10, 20, 30], 255);
+    let mut prims = vec![
+        DrawPrim::Panel {
+            x: 2.0,
+            y: 4.0,
+            w: 20.0,
+            h: 8.0,
+            radius: 2.0,
+            fill: ink,
+        },
+        DrawPrim::Ring {
+            cx: 10.0,
+            cy: 12.0,
+            r_outer: 6.0,
+            thickness: 2.0,
+            track: ink,
+            start: 0.25,
+            frac: 0.5,
+            fill: ink,
+        },
+        DrawPrim::Text {
+            x: 4.0,
+            baseline: 16.0,
+            s: "CPU".into(),
+            px: 22.0,
+            color: ink,
+            weight: TextWeight::Regular,
+            face: TextFace::Ui,
+        },
+        DrawPrim::Dashed {
+            x: 0.0,
+            y: 2.0,
+            w: 40.0,
+            h: 0.0,
+            width: 2.0,
+            on: 4.0,
+            off: 2.0,
+            color: ink,
+        },
+        DrawPrim::FadePush {
+            y: 8.0,
+            h: 4.0,
+            from: 0.5,
+            to: 1.0,
+        },
+        DrawPrim::ClipPop,
+    ];
+    let original = prims.clone();
+    scale_prims(&mut prims, 0.5);
+    let DrawPrim::Panel { x, w, radius, .. } = prims[0] else {
+        panic!("a panel")
+    };
+    assert_eq!((x, w, radius), (1.0, 10.0, 1.0));
+    let DrawPrim::Ring {
+        r_outer,
+        thickness,
+        start,
+        frac,
+        ..
+    } = prims[1]
+    else {
+        panic!("a ring")
+    };
+    assert_eq!((r_outer, thickness, start, frac), (3.0, 1.0, 0.25, 0.5));
+    let DrawPrim::Text {
+        px,
+        baseline,
+        color,
+        ..
+    } = &prims[2]
+    else {
+        panic!("a text")
+    };
+    assert_eq!((*px, *baseline, *color), (11.0, 8.0, ink));
+    let DrawPrim::Dashed { on, off, width, .. } = prims[3] else {
+        panic!("a dash")
+    };
+    assert_eq!((on, off, width), (2.0, 1.0, 1.0));
+    let DrawPrim::FadePush { y, h, from, to } = prims[4] else {
+        panic!("a fade")
+    };
+    assert_eq!((y, h, from, to), (4.0, 2.0, 0.5, 1.0));
+    scale_prims(&mut prims, 2.0);
+    let fp = |prims: &[DrawPrim]| {
+        let mut state = std::collections::hash_map::DefaultHasher::new();
+        for p in prims {
+            p.fingerprint_into(&mut state);
+        }
+        state.finish()
+    };
+    assert_eq!(
+        fp(&prims),
+        fp(&original),
+        "a power of two round-trips exactly"
+    );
+}

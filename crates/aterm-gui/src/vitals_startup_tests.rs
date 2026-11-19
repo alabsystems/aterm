@@ -61,6 +61,8 @@ fn crash_evidence(dir: &Path, at_ms: i64) -> CrashEvidence {
 
 fn restarted() -> StripEvent {
     StripEvent {
+        scope: aterm_vitals::events::EventScope::Machine,
+        span: None,
         at_unix_ms: LAUNCH_MS,
         kind: StripEventKind::Restart,
         label: "restarted".into(),

@@ -14,9 +14,15 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aterm_uds::spawnfd::{Child, Stdio};
+use aterm_uds::spawnfd::{BirthAttempt, BirthKey, Child, ObservedSpawned, SpawnFailure, Stdio};
+
+#[path = "mac_vm_lifecycle.rs"]
+mod vm_lifecycle;
+use vm_lifecycle::{Action as VmAction, Journal as VmJournal};
+pub(crate) use vm_lifecycle::{Scratch as VmScratch, after_cleanup as after_vm_cleanup};
 
 use crate::instance::{take_flag, take_value};
 use crate::paths::paths;
@@ -54,6 +60,8 @@ pub(crate) const BOOT: Duration = Duration::from_secs(300);
 const ATTEMPT: Duration = Duration::from_secs(3);
 pub(crate) const ROW: Duration = Duration::from_secs(300);
 pub(crate) const STEP: Duration = Duration::from_secs(120);
+/// One minute without CPU or I/O progress from the owned launcher.
+const REAP_WINDOW: Duration = Duration::from_secs(60);
 /// How long the control's `~/Desktop` read may take, when tccd shows no dialog for it, before it
 /// counts as parked on a consent question: a hang detector ([`desktop_prompted`] ends it sooner).
 const CONTROL: Duration = Duration::from_secs(15);
@@ -93,6 +101,22 @@ pub(crate) struct DiskInterval {
 }
 
 impl Shape {
+    fn check_reservation(self, reservation: &aterm_capacity::RetainedClaim) -> Result<(), Fail> {
+        if self.cpus == 0 || self.memory_mib == 0 || self.disk_gb == 0 {
+            return Err(Fail::usage(
+                "a VM shape needs positive CPU, memory and disk bounds",
+            ));
+        }
+        let record = reservation.record();
+        let memory = u64::from(self.memory_mib) << 20;
+        if memory > record.need.mem || record.held.is_none_or(|held| self.cpus > held.cores) {
+            return Err(not_run(
+                "VM shape exceeds its original admitted memory or CPU reservation",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn disk_interval(self) -> Result<DiskInterval, Fail> {
         let lower = u64::from(self.disk_gb)
             .checked_mul(1_000_000_000)
@@ -162,6 +186,8 @@ pub(crate) struct Prep {
     pub lan_allow: bool,
     /// Configure the preparation clone before every boot; the caller holds its admission.
     pub shape: Option<Shape>,
+    /// Retain a preparation clone if it cannot be promoted, and preserve older bases.
+    pub keep: bool,
 }
 
 /// The executable nux installs and launches (`/Applications/aterm.app`): what a
@@ -215,8 +241,9 @@ targo --unverified lab mac <verb> — the macOS guest lane: a disposable tart VM
                 guest's own administrator) and, --fda, Full Disk Access granted to the guest agent, made once by
                 the first run that needs it and kept stopped; booted with no window, each bench run in the guest
                 with tccd's log streamed; prints every row, the removable-volume requests tccd saw and a
-                ~/Desktop control; the clone deleted (--keep: stopped and kept as aterm-mac-dmg-kept-<pid>-<instance>; a
-                killed run's clone is reported by the next and retained). No tart here: it fetches tart
+                ~/Desktop control. --keep retains the stopped clone and any failed preparation clone,
+                and preserves existing bases. A killed run's clone is reported by the next and retained.
+                No tart here: it fetches tart
                 2.40.1 (SHA-256 and Developer ID checked) into ~/Library/Caches/aterm/mac-lane, or
                 $LAB_TART=/path/to/tart. ~2.5 min with the image and a base here. Exit 0 every row passed, 1 a
                 row failed, 3 NOT RUN (a row the guest refused, a guest that did not boot, no tart)
@@ -289,6 +316,46 @@ fn capture_output(
         aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
     )
     .map_err(|error| format!("complete guest output: {error}"))
+}
+
+/// The guest retirement observer supplies the hang judgment. This transport owns/reaps its
+/// actual local child and requires complete EOFs, but has no host-work or wall-clock surrogate
+/// for guest progress. Cancellation runs on the cleanup-owning thread, preserving Grace/CUT.
+fn capture_retirement_output(
+    command: &mut aterm_uds::spawnfd::Command,
+    maximum: usize,
+    spawned: impl FnOnce(u32),
+    stopped: impl FnMut() -> bool,
+) -> Result<std::process::Output, String> {
+    use aterm_uds::deadline::ChildOutput;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = aterm_uds::deadline::stream_until_stopped(
+        command,
+        None,
+        spawned,
+        |stream, bytes| {
+            let buffer = match stream {
+                ChildOutput::Stdout => &mut stdout,
+                ChildOutput::Stderr => &mut stderr,
+            };
+            if bytes.len() > maximum.saturating_sub(buffer.len()) {
+                return Err(std::io::Error::other(
+                    "guest retirement complete output exceeds its bound",
+                ));
+            }
+            buffer.extend_from_slice(bytes);
+            Ok(())
+        },
+        stopped,
+    )
+    .map_err(|error| format!("guest retirement transport incomplete: {error}"))?
+    .ok_or("guest retirement transport cancelled before complete output and owning reap")?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Where the `tart` to run comes from.
@@ -711,18 +778,46 @@ pub const fn control_verdict(
     }
 }
 
+/// Detach one original ordinary admission without changing its declared resources or jobs.
+/// Each VM keeps the same guard; a quarantined preparation cannot release a later caller's debt.
+pub(crate) fn retain_admission(
+    admitted: &mut crate::vm_admit::Admitted,
+) -> Result<Arc<aterm_capacity::RetainedClaim>, Fail> {
+    let claim = admitted
+        .claim
+        .take()
+        .ok_or_else(|| not_run("macOS VM admission supplied no original resource claim"))?;
+    match claim.into_retained_reservation() {
+        Ok(reservation) => Ok(Arc::new(reservation)),
+        Err((original, error)) => {
+            admitted.claim = Some(original);
+            Err(not_run(format!(
+                "macOS VM admission cannot retain its original reservation: {error}"
+            )))
+        }
+    }
+}
+
 pub(crate) struct Vm {
     pub(crate) tart: String,
     pub(crate) name: String,
     identity: VmIdentity,
     share: PathBuf,
     log: PathBuf,
-    run: Option<Child>,
+    run: Option<ObservedSpawned>,
+    clone_pending: Option<ObservedSpawned>,
+    owner: BirthKey,
+    allocation_owned: bool,
+    journal: VmJournal,
+    retirement_attempted: bool,
+    closed: bool,
+    blocked: Option<String>,
     keep: bool,
     /// Renamed to a prepared base ([`Vm::promote`]): neither deleted nor kept here.
     promoted: bool,
     slot: Option<crate::mac_slots::Slot>,
     display_slot: Option<crate::mac_slots::Slot>,
+    reservation: Option<Arc<aterm_capacity::RetainedClaim>>,
     pub(crate) graphics: bool,
     /// When present, reapplied before every boot, including preparation and later boots.
     pub(crate) shape: Option<Shape>,
@@ -751,31 +846,250 @@ impl Vm {
         share: &Path,
         keep: bool,
     ) -> Result<Vm, Fail> {
+        let receipts = run
+            .parent()
+            .ok_or("macOS guest run has no parent")?
+            .join("vm-lifecycle.noindex");
+        crate::util::create_private_dir_all(&receipts)
+            .map_err(|e| format!("{}: {e}", receipts.display()))?;
+        Self::clone_from_recorded(tart, source, run, share, keep, &receipts)
+    }
+
+    /// As `clone_from`, retaining the owned allocation's receipt outside disposable scratch.
+    /// The receipt is diagnostic data; only this live value and its actual Child supply custody.
+    pub(crate) fn clone_from_recorded(
+        tart: &str,
+        source: &str,
+        run: &Path,
+        share: &Path,
+        keep: bool,
+        receipt_dir: &Path,
+    ) -> Result<Vm, Fail> {
         let identity = VmIdentity::allocate()?;
         let name = identity.running_name();
-        let status = aterm_uds::spawnfd::command(tart)
-            .args(["clone", source, &name])
-            .stdin(Stdio::null())
-            .status()
-            .map_err(|e| not_run(format!("tart clone: {e}")))?;
-        if !status.success() {
-            return Err(not_run(format!("tart clone {source} {name}: {status}")));
-        }
-        Ok(Vm {
+        let attempt = BirthAttempt::new().map_err(|e| not_run(format!("tart clone birth: {e}")))?;
+        let owner = attempt.key().clone();
+        let journal = VmJournal::new(
+            receipt_dir.join(format!("{name}-{}.vm.json", owner.nonce())),
+            aterm_json::json!({"name":name, "source":source, "tart":tart,
+                "owner":vm_lifecycle::birth_key(&owner), "keep":keep}),
+        )?;
+        let mut vm = Vm {
             tart: tart.to_owned(),
             log: run.join("tart-run.log"),
             share: share.to_path_buf(),
             name,
             identity,
             run: None,
+            clone_pending: None,
+            owner,
+            allocation_owned: false,
+            journal,
+            retirement_attempted: false,
+            closed: false,
+            blocked: None,
             keep,
             promoted: false,
             slot: None,
             display_slot: None,
+            reservation: None,
             graphics: false,
             shape: None,
             configurations: 0,
-        })
+        };
+        println!("mac: owned VM receipt {}", vm.receipt_path().display());
+        let result = (|| -> Result<(), String> {
+            vm.journal
+                .event("clone-armed", vm_lifecycle::birth_key(attempt.key()))?;
+            match aterm_uds::spawnfd::command(tart)
+                .args(["clone", source, &vm.name])
+                .stdin(Stdio::null())
+                .spawn_observed(attempt)
+            {
+                Ok(child) => vm.clone_pending = Some(child),
+                Err(SpawnFailure::Unbound { spawned, error }) => {
+                    vm.clone_pending = Some(*spawned);
+                    vm.record_child("clone-unbound", true)?;
+                    return Err(format!("tart clone target execution: {error}"));
+                }
+                Err(SpawnFailure::NotSpawned(proof)) => {
+                    vm.journal.event("clone-not-spawned", aterm_json::json!({
+                        "attempt":vm_lifecycle::birth_key(proof.key()), "error":proof.error().to_string()}))?;
+                    return Err(format!("tart clone: {}", proof.error()));
+                }
+                Err(SpawnFailure::Refused(error)) => {
+                    return Err(format!(
+                        "tart clone refused without a no-child receipt: {error}"
+                    ));
+                }
+            }
+            vm.record_child("clone-created", true)?;
+            let status = vm
+                .clone_pending
+                .as_mut()
+                .expect("stored clone child")
+                .child_mut()
+                .wait()
+                .map_err(|e| format!("tart clone owning wait: {e}"))?;
+            vm.clone_pending = None;
+            vm.allocation_owned = status.success();
+            vm.journal.event("clone-reaped", status_value(status))?;
+            if !status.success() {
+                return Err(format!("tart clone {source} {}: {status}", vm.name));
+            }
+            Ok(())
+        })();
+        if let Err(why) = result {
+            vm.retirement_attempted = true;
+            vm.blocked = Some(why.clone());
+            if let Err(error) = vm
+                .journal
+                .event("creation-failed", aterm_json::json!({"error":why}))
+            {
+                eprintln!("mac: could not retain creation failure: {error}");
+            }
+            return Err(not_run(why));
+        }
+        Ok(vm)
+    }
+
+    pub(crate) fn receipt_path(&self) -> &Path {
+        self.journal.path()
+    }
+
+    pub(crate) fn receipt(&self) -> aterm_json::Value {
+        self.journal.value()
+    }
+
+    fn preflight_admission(&self) -> Result<(), Fail> {
+        if self.closed
+            || self.run.is_some()
+            || self.reservation.is_some()
+            || self.blocked.is_some()
+            || !self.allocation_owned
+            || self.clone_pending.is_some()
+            || self.retirement_attempted
+            || !self.owner.is_current()
+        {
+            return Err(Fail::die(
+                "the VM cannot accept an admission reservation in this state",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Transfer this actual admission before any VM launch, preserving the original owner on
+    /// an unsupported kind. A diagnostic claim path or a numeric resource budget is not a guard.
+    pub(crate) fn hold_admission(
+        &mut self,
+        admitted: &mut crate::vm_admit::Admitted,
+    ) -> Result<(), Fail> {
+        self.preflight_admission()?;
+        let reservation = retain_admission(admitted)?;
+        self.hold_reserved_admission(&reservation)
+    }
+
+    /// Carry the caller's actual shared guard, cloning only after this VM's state is checked.
+    pub(crate) fn hold_reserved_admission(
+        &mut self,
+        reservation: &Arc<aterm_capacity::RetainedClaim>,
+    ) -> Result<(), Fail> {
+        self.preflight_admission()?;
+        self.hold_reservation(Arc::clone(reservation))
+    }
+
+    /// Carry the original full admitted reservation into Tart. Descriptor transfer preserves
+    /// close-only custody; the recorded path and numbers themselves supply no admission.
+    fn hold_reservation(
+        &mut self,
+        reservation: Arc<aterm_capacity::RetainedClaim>,
+    ) -> Result<(), Fail> {
+        use std::os::unix::fs::MetadataExt as _;
+        // hold_admission preflights before taking/converting the original claim. Keep the
+        // actual converted guard before every fallible observation or publication here.
+        self.reservation = Some(reservation);
+        let result = (|| -> Result<(), String> {
+            let reservation = self
+                .reservation
+                .as_ref()
+                .expect("retained original reservation");
+            let metadata = reservation
+                .metadata()
+                .map_err(|e| format!("original VM reservation: {e}"))?;
+            self.journal.event(
+                "admission-reservation",
+                aterm_json::json!({
+                "path":reservation.path(), "device":metadata.dev(), "inode":metadata.ino(),
+                "declared_memory_bytes":reservation.record().need.mem,
+                "admitted_cores":reservation.record().held.as_ref().map(|held| held.cores),
+                "accounting":"detached full reservation; no numeric PID credit"}),
+            )
+        })();
+        if let Err(why) = result {
+            self.blocked = Some(why.clone());
+            return Err(Fail::die(why));
+        }
+        if let Some(shape) = self.shape {
+            shape.check_reservation(
+                self.reservation
+                    .as_ref()
+                    .expect("stored original reservation"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn preflight_boot(&self) -> Result<(), Fail> {
+        if self.closed
+            || self.run.is_some()
+            || self.blocked.is_some()
+            || self.clone_pending.is_some()
+            || self.retirement_attempted
+            || !self.allocation_owned
+            || !self.owner.is_current()
+        {
+            return Err(Fail::die(
+                "this owned VM is closed, already running or quarantined",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn log_path(&self) -> &Path {
+        &self.log
+    }
+
+    fn record_child(&mut self, action: &str, cloning: bool) -> Result<(), String> {
+        let owned = if cloning {
+            &mut self.clone_pending
+        } else {
+            &mut self.run
+        };
+        let child = owned.as_mut().ok_or("the actual child was not retained")?;
+        let original = child.is_original_child();
+        let key = vm_lifecycle::birth_key(child.key());
+        let pid = child.child_mut().id();
+        let unreaped = child.child_mut().owns_unreaped();
+        // Only this actual, unreaped child is observed: the record never authorizes a PID read.
+        let identity = if original && unreaped {
+            i32::try_from(pid)
+                .ok()
+                .and_then(aterm_uds::process::read_identity)
+        } else {
+            None
+        };
+        self.journal.event(
+            action,
+            aterm_json::json!({"attempt":key,
+            "pid":pid, "birth":identity.map(|id| id.token()), "original_child":original,
+            "unreaped":unreaped, "selected_executable":self.tart}),
+        )?;
+        if !original || !unreaped || (!cloning && identity.is_none()) {
+            return Err(
+                "the Tart launch's original unreaped child/birth binding is unavailable".into(),
+            );
+        }
+        Ok(())
     }
 
     /// Set the admitted shape while stopped. Keep both complete streams, even on refusal.
@@ -785,10 +1099,14 @@ impl Vm {
                 "a running VM cannot be configured for another boot",
             ));
         }
+        self.preflight_boot()?;
         if shape.cpus == 0 || shape.memory_mib == 0 || shape.disk_gb == 0 {
             return Err(Fail::usage(
                 "a VM shape needs positive CPU, memory and disk bounds",
             ));
+        }
+        if let Some(reservation) = &self.reservation {
+            shape.check_reservation(reservation)?;
         }
         self.configurations = self
             .configurations
@@ -842,6 +1160,7 @@ impl Vm {
         phase: &str,
         command: &mut aterm_uds::spawnfd::Command,
     ) -> Result<std::process::Output, Fail> {
+        self.preflight_boot()?;
         let record = self
             .log
             .parent()
@@ -877,12 +1196,14 @@ impl Vm {
     /// Boot it with the selected display, the share read-only, and wait for the guest agent ([`ATTEMPT`] at a
     /// time).
     pub(crate) fn boot(&mut self) -> Result<(), Fail> {
+        self.preflight_boot()?;
         let shape = self.shape;
         configure_then_boot(self, shape, Self::configure, Self::boot_configured)
     }
 
     fn boot_configured(&mut self) -> Result<(), Fail> {
         use std::os::unix::fs::OpenOptionsExt as _;
+        self.preflight_boot()?;
         let display_slot = if self.graphics {
             Some(crate::mac_slots::Slot::display()?)
         } else {
@@ -911,6 +1232,13 @@ impl Vm {
         if let Some(display) = &display_slot {
             guards.push(display.inherited()?);
         }
+        if let Some(reservation) = &self.reservation {
+            guards.push(
+                reservation
+                    .try_clone_fd()
+                    .map_err(|e| format!("VM reservation inheritance: {e}"))?,
+            );
+        }
         command
             .inherit_guards(guards)
             .map_err(|e| format!("mac guest slot inheritance: {e}"))?;
@@ -918,18 +1246,42 @@ impl Vm {
         if !self.graphics {
             command.arg("--no-graphics");
         }
-        let child = command
+        let attempt = BirthAttempt::new().map_err(|e| not_run(format!("tart run birth: {e}")))?;
+        self.journal
+            .event("run-armed", vm_lifecycle::birth_key(attempt.key()))?;
+        self.slot = Some(slot);
+        self.display_slot = display_slot;
+        let spawned = command
             .arg(format!("--dir=lane:{}:ro", self.share.display()))
             .arg(&self.name)
             .setsid(true)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err))
-            .spawn()
-            .map_err(|e| not_run(format!("tart run: {e}")))?;
-        self.run = Some(child);
-        self.slot = Some(slot);
-        self.display_slot = display_slot;
+            .spawn_observed(attempt);
+        match spawned {
+            Ok(child) => self.run = Some(child),
+            Err(SpawnFailure::Unbound { spawned, error }) => {
+                self.run = Some(*spawned);
+                self.record_child("run-unbound", false)?;
+                return Err(not_run(format!("tart run target execution: {error}")));
+            }
+            Err(SpawnFailure::NotSpawned(proof)) => {
+                self.journal.event("run-not-spawned", aterm_json::json!({
+                    "attempt":vm_lifecycle::birth_key(proof.key()), "error":proof.error().to_string()}))?;
+                self.slot = None;
+                self.display_slot = None;
+                return Err(not_run(format!("tart run: {}", proof.error())));
+            }
+            Err(SpawnFailure::Refused(error)) => {
+                let why = format!("tart run refused without a no-child receipt: {error}");
+                self.blocked = Some(why.clone());
+                self.journal
+                    .event("run-unknown", aterm_json::json!({"error":why}))?;
+                return Err(not_run(why));
+            }
+        }
+        self.record_child("run-created", false)?;
         let start = Instant::now();
         while start.elapsed() < BOOT {
             stop::check()?;
@@ -990,6 +1342,30 @@ impl Vm {
         )
     }
 
+    /// Complete private guest-observer result, without a host wall-clock work deadline.
+    /// Local child retirement is separate from guest driver/descendant closure and VM finish.
+    pub(crate) fn retirement_output(&self, script: &str) -> Result<std::process::Output, Fail> {
+        let mut cancellation = None;
+        let result = capture_retirement_output(
+            aterm_uds::spawnfd::command(&self.tart)
+                .args(["exec", &self.name, "/bin/sh", "-c", script]),
+            aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+            |_| {},
+            || {
+                cancellation = stop::check().err();
+                cancellation.is_some()
+            },
+        );
+        result.map_err(|error| match cancellation {
+            Some(stopped) => {
+                let mut failure = Fail::from(stopped);
+                failure.msg = Some(error);
+                failure
+            }
+            None => not_run(error),
+        })
+    }
+
     pub(crate) fn sh(&self, script: &str, limit: Duration) -> Result<String, Fail> {
         let out = self.exec(script, limit)?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -1004,57 +1380,247 @@ impl Vm {
         }
     }
 
-    pub(crate) fn stop(&mut self) {
-        if let Some(mut child) = self.run.take() {
-            let _ = aterm_uds::deadline::output_until(
-                aterm_uds::spawnfd::command(&self.tart)
-                    .args(["stop", &self.name])
-                    .stdin(Stdio::null()),
-                Instant::now() + STEP,
+    fn control(&mut self, action: &str, args: &[&str]) -> Result<std::process::Output, String> {
+        if !self.allocation_owned || !self.owner.is_current() {
+            return Err(
+                "VM operation requires its successful clone and original current owner".into(),
             );
-            reap_within(&mut child, STEP);
         }
-        self.slot = None;
-        self.display_slot = None;
+        self.journal
+            .event(action, aterm_json::json!({"phase":"armed", "args":args}))?;
+        let result = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command(&self.tart)
+                .args(args)
+                .stdin(Stdio::null()),
+            Instant::now() + STEP,
+        );
+        match result {
+            Ok(out) => {
+                self.journal.event(action, aterm_json::json!({"phase":"finished",
+                    "status":status_value(out.status), "stdout":String::from_utf8_lossy(&out.stdout).as_ref(),
+                    "stderr":String::from_utf8_lossy(&out.stderr).as_ref(), "output_policy":"bounded diagnostic tails"}))?;
+                Ok(out)
+            }
+            Err(error) => {
+                let why = format!("tart {action}: {error}");
+                self.blocked = Some(why.clone());
+                self.journal.event(
+                    action,
+                    aterm_json::json!({"phase":"failed", "error":error.to_string()}),
+                )?;
+                Err(why)
+            }
+        }
     }
 
-    pub(crate) fn pid(&self) -> Option<u32> {
-        self.run.as_ref().map(Child::id)
+    fn retirement_step(&mut self, action: VmAction) -> Result<(), String> {
+        let result = (|| {
+            if let Some(why) = &self.blocked {
+                return Err(why.clone());
+            }
+            if !self.owner.is_current() {
+                return Err("VM's original owner changed".into());
+            }
+            match action {
+                VmAction::Stop => {
+                    let child = self.run.as_mut().ok_or("the launcher was not retained")?;
+                    if !child.is_original_child() || !child.child_mut().owns_unreaped() {
+                        return Err("the original unreaped launcher custody changed".into());
+                    }
+                    let name = self.name.clone();
+                    let out = self.control("stop", &["stop", &name])?;
+                    if !out.status.success() {
+                        return Err(format!("tart stop {name}: {}", out.status));
+                    }
+                }
+                VmAction::Join => {
+                    self.journal
+                        .event("owning-reap", aterm_json::json!({"phase":"armed"}))?;
+                    let child = self.run.as_mut().ok_or("the launcher was not retained")?;
+                    if !child.is_original_child() {
+                        return Err("the original launcher custody changed".into());
+                    }
+                    let status = wait_vm_launcher(child.child_mut(), REAP_WINDOW)?;
+                    self.run = None;
+                    self.journal.event(
+                        "owning-reap",
+                        aterm_json::json!({"phase":"finished",
+                        "reaped":true, "status":status_value(status)}),
+                    )?;
+                }
+                VmAction::Delete | VmAction::Keep => {
+                    let name = self.name.clone();
+                    let kept = self.identity.kept_name();
+                    let args = if action == VmAction::Keep {
+                        vec!["rename", name.as_str(), kept.as_str()]
+                    } else {
+                        vec!["delete", name.as_str()]
+                    };
+                    let out = self.control(action.name(), &args)?;
+                    if !out.status.success() {
+                        return Err(format!("tart {} {name}: {}", action.name(), out.status));
+                    }
+                    if action == VmAction::Keep {
+                        println!("mac: kept the stopped VM {kept} (tart delete {kept})");
+                    }
+                }
+                VmAction::ReleaseSlots => {
+                    self.journal.event(
+                        "release-slots",
+                        aterm_json::json!({"shutdown_and_owning_reap_confirmed":true}),
+                    )?;
+                    self.slot = None;
+                    self.display_slot = None;
+                    if self.retirement_attempted {
+                        self.reservation = None;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(why) = &result {
+            self.blocked = Some(why.clone());
+            if let Err(error) = self.journal.event(
+                "retirement-failed",
+                aterm_json::json!({
+                "action":action.name(), "error":why, "complete":false}),
+            ) {
+                eprintln!("mac: could not retain retirement failure: {error}");
+            }
+        }
+        result
     }
 
-    /// Stop it and rename it `base`. `false` when the rename did not take (a concurrent lane's
-    /// base already holds the name): it is deleted as usual then.
-    fn promote(&mut self, base: &str) -> bool {
-        self.stop();
-        self.promoted = aterm_uds::spawnfd::command(&self.tart)
-            .args(["rename", &self.name, base])
-            .stdin(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        self.promoted
+    /// Explicitly stop and own the launcher's terminal wait before releasing its slots.
+    /// A failed stop/wait retains custody and prevents a restart or alternate cleanup route.
+    pub(crate) fn stop(&mut self) -> Result<(), Fail> {
+        if let Some(why) = &self.blocked {
+            return Err(Fail::die(why.clone()));
+        }
+        if self.run.is_some() {
+            self.retirement_step(VmAction::Stop)?;
+            self.retirement_step(VmAction::Join)?;
+            self.retirement_step(VmAction::ReleaseSlots)?;
+        }
+        Ok(())
     }
+
+    /// Retire exactly this successful clone. Completion requires a positive Tart stop,
+    /// this launcher's owning reap, and exact delete (or requested kept-name rename).
+    pub(crate) fn finish(&mut self) -> Result<aterm_json::Value, Fail> {
+        if self.closed {
+            return if let Some(why) = &self.blocked {
+                Err(Fail::die(why.clone()))
+            } else {
+                Ok(self.receipt())
+            };
+        }
+        if self.retirement_attempted {
+            return Err(Fail::die(
+                self.blocked
+                    .clone()
+                    .unwrap_or_else(|| "VM retirement already failed".into()),
+            ));
+        }
+        self.retirement_attempted = true;
+        if let Some(why) = &self.blocked {
+            return Err(Fail::die(why.clone()));
+        }
+        if self.clone_pending.is_some() || !self.allocation_owned {
+            return Err(Fail::die("the clone's owning completion is unconfirmed"));
+        }
+        let running = self.run.is_some();
+        vm_lifecycle::retire_with(running, self.keep, |action| self.retirement_step(action))?;
+        self.closed = true;
+        if let Err(why) = self
+            .journal
+            .complete(if self.keep { "kept-stopped" } else { "deleted" })
+        {
+            self.blocked = Some(why.clone());
+            return Err(Fail::die(why));
+        }
+        Ok(self.receipt())
+    }
+
+    /// Stop it and rename it `base`. `false` when a concurrent lane already holds the name;
+    /// that successful clone is then explicitly retired by the caller.
+    fn promote(&mut self, base: &str) -> Result<bool, Fail> {
+        self.stop()?;
+        let name = self.name.clone();
+        let out = self.control("promote", &["rename", &name, base])?;
+        self.promoted = out.status.success();
+        if self.promoted {
+            self.closed = true;
+            self.reservation = None;
+            if let Err(why) = self.journal.complete("promoted-stopped-base") {
+                self.blocked = Some(why.clone());
+                return Err(Fail::die(why));
+            }
+        }
+        Ok(self.promoted)
+    }
+}
+
+fn status_value(status: std::process::ExitStatus) -> aterm_json::Value {
+    use std::os::unix::process::ExitStatusExt as _;
+    aterm_json::json!({"success":status.success(), "exit":status.code(), "signal":status.signal()})
+}
+
+fn wait_vm_launcher(
+    child: &mut Child,
+    window: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    vm_lifecycle::wait_for_reap(child.id(), window, || child.try_wait())
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        self.stop();
-        if self.promoted {
+        if self.closed {
             return;
         }
-        if self.keep {
-            let kept = self.identity.kept_name();
-            let renamed = aterm_uds::spawnfd::command(&self.tart)
-                .args(["rename", &self.name, &kept])
-                .stdin(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            let name = if renamed { &kept } else { &self.name };
-            println!("mac: kept the stopped VM {name} (tart delete {name})");
+        let explicit = self.retirement_attempted;
+        let result = if explicit {
+            Err(Fail::die(self.blocked.clone().unwrap_or_else(|| {
+                "VM retirement was not confirmed".into()
+            })))
         } else {
-            let _ = aterm_uds::spawnfd::command(&self.tart)
-                .args(["delete", &self.name])
-                .stdin(Stdio::null())
-                .status();
+            self.finish().map(drop)
+        };
+        if let Err(error) = result {
+            let why = error
+                .msg
+                .as_deref()
+                .unwrap_or("VM retirement was not confirmed");
+            if let Err(error) = self.journal.event("quarantined", aterm_json::json!({"error":why,
+                "complete":false, "retained_child":self.run.is_some(), "retained_clone_child":self.clone_pending.is_some(),
+                "retained_guest_slot":self.slot.is_some(), "retained_display_slot":self.display_slot.is_some(),
+                "retained_reservation":self.reservation.is_some()})) {
+                eprintln!("mac: could not retain quarantine observation: {error}");
+            }
+            // Keep exact native custody alive. A decoded name/PID never gets a cleanup route,
+            // and releasing these slots would claim a shutdown that did not complete.
+            if let Some(child) = self.run.take() {
+                std::mem::forget(child);
+            }
+            if let Some(child) = self.clone_pending.take() {
+                std::mem::forget(child);
+            }
+            if let Some(slot) = self.slot.take() {
+                std::mem::forget(slot);
+            }
+            if let Some(slot) = self.display_slot.take() {
+                std::mem::forget(slot);
+            }
+            if let Some(reservation) = self.reservation.take() {
+                std::mem::forget(reservation);
+            }
+            eprintln!(
+                "mac: incomplete VM retirement: {why}; receipt {}",
+                self.receipt_path().display()
+            );
+            if !explicit && !std::thread::panicking() {
+                panic!("owned VM fallback retirement failed: {why}");
+            }
         }
     }
 }
@@ -1113,8 +1679,8 @@ pub(crate) fn prepared_base(
 
 /// [`prepared_base`] for `prep` ([`prep_name`]): the grants and the Local Network answer written
 /// while the image's SIP is off, then SIP turned on, then the Command Line Tools removed
-/// (`no_clt`, held to `xcode-select -p` failing). A new person base deletes the image's older
-/// person bases of the same kind.
+/// (`no_clt`, held to `xcode-select -p` failing). A disposable run that prepares a person base
+/// cleans up older person bases of the same kind.
 ///
 /// # Errors
 /// As [`prepared_base`]; a grant or answer asked of an image with SIP on, or an answer the
@@ -1127,6 +1693,36 @@ pub(crate) fn prepared_base_with(
     share: &Path,
     between: &mut dyn FnMut() -> Result<(), Fail>,
 ) -> Result<String, Fail> {
+    prepared_base_core(tart, image, prep, run, share, None, between)
+}
+
+/// Prepare a base under the same actual reservation that will cover its final VM.
+pub(crate) fn prepared_base_with_admission(
+    tart: &str,
+    image: &str,
+    prep: &Prep,
+    run: &Path,
+    share: &Path,
+    reservation: &Arc<aterm_capacity::RetainedClaim>,
+    between: &mut dyn FnMut() -> Result<(), Fail>,
+) -> Result<String, Fail> {
+    prepared_base_core(tart, image, prep, run, share, Some(reservation), between)
+}
+
+fn prepared_base_core(
+    tart: &str,
+    image: &str,
+    prep: &Prep,
+    run: &Path,
+    share: &Path,
+    reservation: Option<&Arc<aterm_capacity::RetainedClaim>>,
+    between: &mut dyn FnMut() -> Result<(), Fail>,
+) -> Result<String, Fail> {
+    if let Some(reservation) = reservation {
+        prep.shape
+            .ok_or_else(|| Fail::usage("admitted VM preparation requires an explicit shape"))?
+            .check_reservation(reservation)?;
+    }
     let fda = prep.fda;
     let base = prep_name(image, prep);
     if local_vms(tart)?.lines().any(|n| n.trim() == base) {
@@ -1136,8 +1732,11 @@ pub(crate) fn prepared_base_with(
     println!(
         "mac: preparing {base} from {image}, once (tart pulls the image first when this Mac has no copy)"
     );
-    let mut prep_vm = Vm::clone_from(tart, image, run, share, false)?;
+    let mut prep_vm = Vm::clone_from(tart, image, run, share, prep.keep)?;
     prep_vm.shape = prep.shape;
+    if let Some(reservation) = reservation {
+        prep_vm.hold_reserved_admission(reservation)?;
+    }
     prep_vm.boot()?;
     between()?;
     let vm = &mut prep_vm;
@@ -1169,32 +1768,63 @@ pub(crate) fn prepared_base_with(
     // What the guest has not written out is lost when `tart stop` outlasts its graceful wait and
     // cuts the power: a base's removal of the Command Line Tools came back in its clones.
     vm.sh("/bin/sync", STEP)?;
-    if !vm.promote(&base) && !local_vms(tart)?.lines().any(|n| n.trim() == base) {
+    if !vm.promote(&base)? && !local_vms(tart)?.lines().any(|n| n.trim() == base) {
         return Err(not_run(format!(
             "tart rename {} {base} did not take",
             vm.name
         )));
     }
-    if prep.person.is_some() {
-        let kind = prep_name(
-            image,
-            &Prep {
-                person: None,
-                ..prep.clone()
-            },
-        );
-        let older = format!("{kind}-person-");
-        for name in local_vms(tart)?.lines().map(str::trim) {
-            if name.starts_with(&older) && name != base {
-                let _ = aterm_uds::spawnfd::command(tart)
-                    .args(["delete", name])
-                    .stdin(Stdio::null())
-                    .status();
+    if !vm.promoted {
+        vm.finish()?;
+    }
+    retire_older_person_bases(
+        image,
+        prep,
+        &base,
+        || local_vms(tart),
+        |name| {
+            if delete_vm(tart, name) {
                 println!("mac: deleted the older person base {name}");
+            } else {
+                eprintln!("mac: could not delete the older person base {name}");
             }
+        },
+    )?;
+    Ok(base)
+}
+
+fn retire_older_person_bases(
+    image: &str,
+    prep: &Prep,
+    base: &str,
+    list: impl FnOnce() -> Result<String, Fail>,
+    mut retire: impl FnMut(&str),
+) -> Result<(), Fail> {
+    if prep.keep || prep.person.is_none() {
+        return Ok(());
+    }
+    let kind = prep_name(
+        image,
+        &Prep {
+            person: None,
+            ..prep.clone()
+        },
+    );
+    let older = format!("{kind}-person-");
+    for name in list()?.lines().map(str::trim) {
+        if name.starts_with(&older) && name != base {
+            retire(name);
         }
     }
-    Ok(base)
+    Ok(())
+}
+
+fn delete_vm(tart: &str, name: &str) -> bool {
+    aterm_uds::spawnfd::command(tart)
+        .args(["delete", name])
+        .stdin(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Write the answer an Allow press writes for the ad-hoc aterm at [`NUX_APP_EXE`], for the
@@ -1273,8 +1903,8 @@ fn lan_allow(_: &Vm, _: &Path) -> Result<(), Fail> {
 const NO_CLT: &str = "sudo -n rm -rf /Library/Developer/CommandLineTools && sudo -n xcode-select --reset; \
                       if p=$(xcode-select -p 2>/dev/null); then echo \"xcode-select -p still answers: $p\"; exit 1; fi";
 
-/// Boot `vm` (a clone of the prepared `base`) and hold it to SIP on: a base whose clone booted
-/// with SIP not on is deleted, and the next run makes it again.
+/// Boot `vm` (a clone of the prepared `base`) and hold it to SIP on. A disposable run removes
+/// a base whose clone booted with SIP off so the next run makes it again. A retained run keeps it.
 ///
 /// # Errors
 /// The boot, the status read, or SIP not on (NOT RUN).
@@ -1282,15 +1912,27 @@ pub(crate) fn boot_sip_on(vm: &mut Vm, base: &str) -> Result<(), Fail> {
     vm.boot()?;
     let sip = vm.sh("csrutil status", STEP)?;
     println!("mac: {} {}", vm.name, sip.trim());
-    if sip_on(&sip) {
+    require_sip_on(&sip, base, vm.keep, |name| delete_vm(&vm.tart, name))
+}
+
+fn require_sip_on(
+    sip: &str,
+    base: &str,
+    keep: bool,
+    retire: impl FnOnce(&str) -> bool,
+) -> Result<(), Fail> {
+    if sip_on(sip) {
         return Ok(());
     }
-    let _ = aterm_uds::spawnfd::command(&vm.tart)
-        .args(["delete", base])
-        .stdin(Stdio::null())
-        .status();
+    let recovery = if keep {
+        format!("retained its base {base}")
+    } else if retire(base) {
+        format!("deleted its base {base}; the next run makes it again")
+    } else {
+        format!("could not delete its base {base}")
+    };
     Err(not_run(format!(
-        "SIP is not on in the guest: {} (its base {base} is deleted; the next run makes it again)",
+        "SIP is not on in the guest: {} ({recovery})",
         sip.trim()
     )))
 }
@@ -1562,6 +2204,7 @@ pub fn cmd_dmg(args: &[String]) -> Res {
         .suffix(".noindex")
         .tempdir_in(&runs)
         .map_err(|e| format!("{}: {e}", runs.display()))?;
+    let mut run_guard = VmScratch::new(run_guard, &runs.join("vm-lifecycle.noindex"))?;
     let run = run_guard.path();
     // The share holds only what the guest runs.
     let share = run.join("share");
@@ -1571,7 +2214,18 @@ pub fn cmd_dmg(args: &[String]) -> Res {
     let mut build = Build::start(run)?;
 
     // 2. The guest: a clone of the prepared base (made first when this Mac has none).
-    let base = prepared_base(&tart, &image, fda, run, &share, &mut || build.check())?;
+    let base = prepared_base_with(
+        &tart,
+        &image,
+        &Prep {
+            fda,
+            keep,
+            ..Prep::default()
+        },
+        run,
+        &share,
+        &mut || build.check(),
+    )?;
     let mut vm = Vm::clone_from(&tart, &base, run, &share, keep)?;
     boot_sip_on(&mut vm, &base)?;
 
@@ -1667,7 +2321,8 @@ pub fn cmd_dmg(args: &[String]) -> Res {
             "; the tccd count proves nothing (control FAILED)"
         }
     };
-    drop(vm);
+    vm.finish()?;
+    run_guard.discard_after_finish();
     let benches = BENCHES.len();
     if failed > 0 {
         println!("mac dmg: FAIL ({failed} of {benches} benches){counted}");

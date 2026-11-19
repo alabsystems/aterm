@@ -179,6 +179,7 @@ fn command(actor: Actor, target: &Target, policy: Digest) -> Command {
             key: aterm_codec::hex::encode_lower(&key),
             value: Some(value),
         }],
+        said: None,
     }
 }
 

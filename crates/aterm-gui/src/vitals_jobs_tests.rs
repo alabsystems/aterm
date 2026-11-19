@@ -3,6 +3,32 @@
 
 use super::*;
 
+#[test]
+fn terminal_byte_history_is_owned_by_the_active_output_reader_and_rotates_after_a_minute() {
+    let start = aterm_session::terminal_stream::epoch();
+    let at = |s| start + Duration::from_secs(s);
+    let feed = JobFeed::default();
+    assert_eq!(feed.output_byte_rates(at(65)), [None; 12]);
+
+    let old = feed.start_output_reading(start);
+    for key in 0..=13 {
+        old.record(at(key * 5), key as usize * 5);
+    }
+    assert_eq!(
+        feed.output_byte_rates(at(65)),
+        std::array::from_fn(|index| Some((index + 1) as f64))
+    );
+
+    let new = feed.start_output_reading(at(67));
+    old.record(at(70), 5_000);
+    drop(old);
+    new.record(at(71), 25);
+    assert_eq!(
+        &feed.output_byte_rates(at(80))[9..],
+        &[None, Some(5.0), Some(0.0)]
+    );
+}
+
 fn process_facts(sweep: Option<&[ProcessReading]>) -> ProcessFacts {
     ProcessFacts::new(sweep.map(<[ProcessReading]>::to_vec), true, None, None)
 }
@@ -2904,4 +2930,597 @@ fn a_leader_lives_only_at_its_own_birth() {
     assert!(leader_lives(me, birth));
     assert!(!leader_lives(me, birth + 1));
     assert!(!leader_lives(u32::MAX - 1, birth));
+}
+
+/// The first pid of a scripted resting machine: past every pid a kernel hands out (macOS's
+/// 99 999, Linux's `PID_MAX_LIMIT` of 4 194 304), so the real job reader reads none of its rows.
+const REST_PID: u32 = 4_194_400;
+
+/// A scripted machine at rest, as one reading hands it to [`JobsPass::tick`].
+#[derive(Clone)]
+struct Scene {
+    sweep: Vec<ProcessReading>,
+    tabs: Vec<TabRoot>,
+    ttys: Vec<(u64, TtyMode)>,
+    feeds: Vec<(u64, TabFeed)>,
+    grant: GrantFacts,
+}
+
+impl Scene {
+    /// This user's uid.
+    const UID: u32 = 501;
+    /// This process: past [`HELD_CPU_NS`], so no candidate.
+    const ME: u32 = REST_PID;
+    /// The one tab's shell.
+    const SHELL: u32 = REST_PID + 1;
+    /// The shell's child.
+    const CHILD: u32 = REST_PID + 2;
+    /// A process of this user outside every tab that has used at most [`HELD_CPU_NS`].
+    const CANDIDATE: u32 = REST_PID + 3;
+
+    fn row(pid: u32, ppid: u32, cpu_ns: u64) -> ProcessReading {
+        ProcessReading {
+            pid,
+            ppid,
+            uid: Some(Self::UID),
+            cpu_ns: Some(cpu_ns),
+            start: Some(u64::from(pid) * 10),
+            version: Some(1),
+            name: format!("p{pid}"),
+            ..ProcessReading::default()
+        }
+    }
+
+    /// One tab whose shell has one child, this process, and one candidate, at a prompt.
+    fn resting() -> Self {
+        Self {
+            sweep: vec![
+                Self::row(Self::ME, 1, 400_000_000),
+                Self::row(Self::SHELL, Self::ME, 300_000_000),
+                Self::row(Self::CHILD, Self::SHELL, 300_000_000),
+                Self::row(Self::CANDIDATE, 1, 2_000_000),
+            ],
+            tabs: vec![Self::tab(1, Self::SHELL)],
+            ttys: vec![(
+                1,
+                TtyMode {
+                    canonical: true,
+                    echo: true,
+                    stamped_ms: 1_000,
+                },
+            )],
+            feeds: vec![(1, TabFeed::default())],
+            grant: GrantFacts::default(),
+        }
+    }
+
+    fn tab(key: u64, shell_pid: u32) -> TabRoot {
+        TabRoot {
+            key,
+            tab: key,
+            shell_pid,
+            label: format!("Tab {key}"),
+            program: String::new(),
+            tab_id: None,
+            agent_leader: None,
+        }
+    }
+
+    fn proc_mut(&mut self, pid: u32) -> &mut ProcessReading {
+        self.sweep
+            .iter_mut()
+            .find(|p| p.pid == pid)
+            .expect("a scripted pid")
+    }
+
+    /// A reading of this scene at `at_ms` that no edge raised, with no zombie receipt.
+    fn read(&self, pass: &mut JobsPass, at_ms: u64) -> Arc<JobsView> {
+        self.read_facts(pass, at_ms, &process_facts(Some(&self.sweep)))
+    }
+
+    /// The same reading, its sweep and zombie receipt `facts` (which hold this scene's sweep).
+    fn read_facts(&self, pass: &mut JobsPass, at_ms: u64, facts: &ProcessFacts) -> Arc<JobsView> {
+        pass.tick(
+            at_ms,
+            || at_ms,
+            facts,
+            &self.tabs,
+            &self.ttys,
+            &self.feeds,
+            &self.grant,
+            Self::ME,
+            false,
+            false,
+        )
+        .expect("a view")
+    }
+
+    /// Two readings of this scene 5 s apart from `at_ms`: the first pass over its inputs starts
+    /// no rest, and the second, reading the same, rests ([`JobsPass::settling`]). Returns the
+    /// second's view.
+    fn settle(&self, pass: &mut JobsPass, at_ms: u64) -> Arc<JobsView> {
+        let first = self.read(pass, at_ms);
+        assert!(
+            pass.rest.is_none(),
+            "the first pass over its inputs starts no rest"
+        );
+        let second = self.read(pass, at_ms + 5_000);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the second reading is a pass"
+        );
+        assert!(pass.rest.is_some(), "which rests, reading the same");
+        second
+    }
+}
+
+/// AN UNCHANGED IDLE REST MAKES NO PASS (C8): after the second of two passes in a row over the
+/// same inputs whose view rests (no job to watch, nothing held or young, no wait read on a
+/// timer, no live agent call), each reading 5 s apart (Background's cadence) that reads the same
+/// tab tree, tabs, terminal words, feeds, grant and candidates publishes that view without a
+/// pass, until Slow's 30 s from it, whose reading runs one; that pass starts no rest, and the
+/// next reading's pass rests again. NEGATIVE CONTROL: with no rest, the engine's 2 s floor alone,
+/// each of the five readings inside the 30 s is a pass.
+#[test]
+fn an_unchanged_idle_rest_makes_no_pass_until_slows_bound() {
+    let scene = Scene::resting();
+    let mut pass = JobsPass::new();
+    let first = scene.settle(&mut pass, 10_000);
+    assert_eq!(first.demand, Demand::Idle, "{first:?}");
+    let mut last = Arc::clone(&first);
+    let mut passes = 0;
+    for at_ms in (20_000..45_000).step_by(5_000) {
+        let view = scene.read(&mut pass, at_ms);
+        passes += usize::from(!Arc::ptr_eq(&last, &view));
+        last = view;
+    }
+    assert_eq!(passes, 0, "five readings inside 30 s run no pass");
+    let bound = scene.read(&mut pass, 45_000);
+    assert!(!Arc::ptr_eq(&last, &bound), "the 30 s bound runs one");
+    assert_eq!(bound.demand, Demand::Idle);
+    assert!(pass.rest.is_none(), "the bound's pass starts no rest");
+    let again = scene.read(&mut pass, 50_000);
+    assert!(!Arc::ptr_eq(&bound, &again), "the next reading is a pass");
+    assert!(pass.rest.is_some(), "which rests again");
+}
+
+/// EACH INPUT OF A REST THAT MOVES MAKES ONE PASS AT THE NEXT READING (C8): from a resting view
+/// a reading the same as its pass's runs no pass, and the next reading after any one input
+/// moves runs one: a fork under a tab's shell, an exec or a stop of a process there, a new tab,
+/// a terminal word, a feed's output, the grant, a new candidate of this user, a candidate's
+/// exec, or the stand-in. NEGATIVE CONTROL: drop that input from the rest's key, and its case
+/// reads the rest's view instead.
+#[test]
+fn each_input_of_a_rest_that_moves_makes_one_pass_at_the_next_reading() {
+    let cases: [(&str, fn(&mut Scene)); 10] = [
+        ("a fork under the shell", |s| {
+            // Past the candidates' CPU, so only the tree tells it.
+            let fork = Scene::row(REST_PID + 9, Scene::CHILD, 2 * HELD_CPU_NS);
+            s.sweep.push(fork);
+        }),
+        ("an exec under the shell", |s| {
+            s.proc_mut(Scene::CHILD).version = Some(2);
+        }),
+        ("a stop under the shell", |s| {
+            s.proc_mut(Scene::CHILD).state = probe::RunState::Stopped;
+        }),
+        ("a new tab", |s| {
+            s.tabs.push(Scene::tab(2, 0));
+        }),
+        ("a terminal word", |s| {
+            s.ttys[0].1.canonical = false;
+        }),
+        ("a feed's output", |s| {
+            s.feeds[0].1.output_bytes = 4;
+        }),
+        ("the grant", |s| {
+            s.grant.grant_ms = Some(9_000);
+        }),
+        ("a new candidate", |s| {
+            let born = Scene::row(REST_PID + 8, 1, 1_000_000);
+            s.sweep.push(born);
+        }),
+        ("a candidate's exec", |s| {
+            s.proc_mut(Scene::CANDIDATE).version = Some(2);
+        }),
+        ("the stand-in", |_| {
+            STAND_IN.store(true, std::sync::atomic::Ordering::SeqCst);
+        }),
+    ];
+    static STAND_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut missed = Vec::new();
+    for (what, moved) in cases {
+        STAND_IN.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut scene = Scene::resting();
+        let mut pass = JobsPass::new();
+        pass.held = HeldReaders {
+            stand_in: || {
+                STAND_IN
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then_some(REST_PID + 7)
+            },
+            ..HeldReaders::INERT
+        };
+        let rest = scene.settle(&mut pass, 10_000);
+        let same = scene.read(&mut pass, 20_000);
+        assert!(Arc::ptr_eq(&rest, &same), "{what}: the rest stands");
+        moved(&mut scene);
+        let after = scene.read(&mut pass, 25_000);
+        if Arc::ptr_eq(&same, &after) {
+            missed.push(what);
+        }
+    }
+    assert_eq!(missed, [""; 0], "inputs whose next reading was no pass");
+}
+
+/// A START READ UNRUN ENDS A REST WHEN IT TURNS OLD ENOUGH TO JUDGE (C8): a program of this user
+/// that has not run, stopped at its exec 5 s after its fork, is neither held nor young
+/// ([`probe::judge_start`] reads it started under the held bar, and `unrun` reads no stopped
+/// one), so its view rests from the second pass over it, 10 s after its fork; the first reading
+/// once it is [`probe::PROGRAM_CHECK_AGE_MS`] old runs a pass, which lists it held, stopped.
+/// NEGATIVE CONTROL: bound the rest by Slow's 30 s alone, and that reading publishes the rest's
+/// view, with nothing held.
+#[test]
+fn a_start_read_unrun_ends_a_rest_when_it_turns_old_enough_to_judge() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const MS: u64 = 1_000;
+    const FORK_US: u64 = 1_791_000_000_000_000;
+    static NOW: AtomicU64 = AtomicU64::new(0);
+    let scene = Scene::resting();
+    let mut pass = JobsPass::new();
+    pass.held = HeldReaders {
+        start: |pid, now_us, _| {
+            (pid == Scene::CANDIDATE).then(|| StartFacts {
+                lone_zero: true,
+                user_ns: Some(0),
+                program_check_wait: true,
+                stopped: true,
+                local: Some(true),
+                age_ms: Some(now_us.saturating_sub(FORK_US) / MS),
+                start_us: Some(FORK_US),
+                ..StartFacts::default()
+            })
+        },
+        exec: |pid| Some(u64::from(pid)),
+        now_us: || NOW.load(Ordering::SeqCst),
+        ..HeldReaders::INERT
+    };
+    // Each reading's view, and whether its pass left a rest.
+    let mut read = |at_ms: u64| {
+        // The pass clock and the wall clock move together: the fork is 5 s before 10 000.
+        NOW.store(FORK_US + (at_ms - 5_000) * MS, Ordering::SeqCst);
+        let view = scene.read(&mut pass, at_ms);
+        (view, pass.rest.is_some())
+    };
+    let stopped = |view: &JobsView| {
+        view.findings
+            .stopped_unstarted
+            .iter()
+            .map(|s| (s.named.pid, s.stopped, s.traced))
+            .collect::<Vec<_>>()
+    };
+    let (first, resting) = read(10_000);
+    assert_eq!(stopped(&first), [], "5 s old: under the held bar");
+    assert!(!resting, "the first pass over it starts no rest");
+    let (young, resting) = read(15_000);
+    assert!(!Arc::ptr_eq(&first, &young), "10 s old: the second pass");
+    assert_eq!(stopped(&young), [], "10 s old: under the held bar");
+    assert!(pass_rests(&young), "{young:?}");
+    assert!(resting, "which rests");
+    let (rested, _) = read(20_000);
+    assert!(Arc::ptr_eq(&young, &rested), "15 s old: the rest stands");
+    let (judged, _) = read(25_000);
+    assert!(!Arc::ptr_eq(&rested, &judged), "20 s old: a pass");
+    assert_eq!(
+        stopped(&judged),
+        [(Scene::CANDIDATE, true, false)],
+        "listed held, stopped"
+    );
+}
+
+/// Whether a view rests by its own words ([`rests`]), nothing held or young.
+fn pass_rests(view: &JobsView) -> bool {
+    rests(view, false, false)
+}
+
+/// A REST STARTS ONLY AT THE SECOND OF TWO PASSES IN A ROW OVER THE SAME INPUTS (C8 review): the
+/// engine leaves some confirmations to a job's next pass (a wait name shown at its second
+/// sighting, `aterm_vitals::jobs::step`'s `cand_streak`; a group in front at its second), so the
+/// pass that reads a moved input (here a terminal word turning canonical with no echo, as
+/// `getpass` turns it) starts no rest, and the next reading due by the engine's cadence is a
+/// pass, which rests where it reads the same. NEGATIVE CONTROL: rest from the first pass over
+/// the inputs, as C8 did, and the reading after the moved word's pass publishes that pass's view.
+#[test]
+fn a_rest_starts_only_at_the_second_of_two_passes_over_the_same_inputs() {
+    let mut scene = Scene::resting();
+    let mut pass = JobsPass::new();
+    for at_ms in [10_000, 15_000] {
+        scene.read(&mut pass, at_ms);
+    }
+    assert!(pass.rest.is_some(), "the scene rests");
+    scene.ttys[0].1.echo = false;
+    let moved = scene.read(&mut pass, 20_000);
+    let next = scene.read(&mut pass, 25_000);
+    assert!(
+        !Arc::ptr_eq(&moved, &next),
+        "the reading after the moved word's pass is a pass"
+    );
+    assert!(pass.rest.is_some(), "which rests, reading the same");
+}
+
+/// AN EXEC THE SWEEP READ NO PID VERSION FOR MOVES A REST (C8 review): where the sweep reads no
+/// pid version for this user's processes (the coalition lane off, and off macOS), an exec under
+/// a tab's shell or by a candidate still moves the rest's key, by the process's name, and a
+/// fork's first exec into a program of its own name by its exec flag: the next reading is a
+/// pass. NEGATIVE CONTROL: key a process's program by its pid version alone, as C8 did, and each
+/// case reads the rest's view.
+#[test]
+fn an_exec_the_sweep_read_no_version_for_moves_a_rest() {
+    let cases: [(&str, fn(&mut Scene)); 3] = [
+        ("an exec under the shell", |s| {
+            s.proc_mut(Scene::CHILD).name = "held".into();
+        }),
+        ("a candidate's exec", |s| {
+            s.proc_mut(Scene::CANDIDATE).name = "held".into();
+        }),
+        ("a fork's first exec into its own name", |s| {
+            s.proc_mut(Scene::CANDIDATE).exec = Some(true);
+        }),
+    ];
+    let mut missed = Vec::new();
+    for (what, moved) in cases {
+        let mut scene = Scene::resting();
+        for p in &mut scene.sweep {
+            p.version = None;
+            p.exec = Some(p.pid != Scene::CANDIDATE);
+        }
+        let mut pass = JobsPass::new();
+        let rest = scene.settle(&mut pass, 10_000);
+        moved(&mut scene);
+        if Arc::ptr_eq(&rest, &scene.read(&mut pass, 20_000)) {
+            missed.push(what);
+        }
+    }
+    assert_eq!(missed, [""; 0], "execs whose next reading was no pass");
+}
+
+/// One reading of `rows` at `at_ms` as the host hands it to the pass: the vitals model `model`
+/// absorbs it (its one zombie book judging each zombie's age), and the pass gets the sweep with
+/// the model's receipt for that reading, paired ([`ProcessFacts::new`]). `whole` false reads a
+/// census cut at its cap.
+fn observed(
+    model: &mut aterm_vitals::Vitals,
+    rows: &[ProcessReading],
+    at_ms: u64,
+    whole: bool,
+) -> ProcessFacts {
+    let sample = aterm_vitals::Sample {
+        at_ns: at_ms * 1_000_000,
+        mono_ms: at_ms,
+        procs: Some(
+            rows.iter()
+                .map(|row| crate::vitals_host::proc_sample(row, Instant::now()))
+                .collect(),
+        ),
+        procs_truncated: !whole,
+        ..aterm_vitals::Sample::default()
+    };
+    let snapshot = model.absorb(&sample);
+    ProcessFacts::new(
+        Some(rows.to_vec()),
+        whole,
+        Some((&sample, &snapshot)),
+        model.current_zombie_facts(),
+    )
+}
+
+/// A REST HEARS ITS READING'S ZOMBIE PILES (C8, with one zombie book): the pass reads the piles
+/// the vitals reading judged ([`ProcessFacts`]), so a rest's key holds each admitted pile's
+/// parent, start and count. From a resting view over another user's standing pile outside every
+/// tab, each later reading hands a new receipt (its own sequence and clock, the pile's rate
+/// falling with it) and the rest stands while the piles read the same, as it does for a zombie
+/// not yet old enough to count; the next reading after a pile moves is a pass, whose view keeps
+/// that reading's receipt: a zombie that comes to count, a pile's zombie reaped, a pile that
+/// goes, another parent's pile, a pile that starts again (the readings from its end to its new
+/// start not assessed, so only its start moved), and a census cut at its cap, whose receipt the
+/// pass does not admit. NEGATIVE CONTROL: drop the piles from the rest's key, and each case
+/// reads the rest's view.
+#[test]
+fn a_rest_hears_its_readings_zombie_piles() {
+    /// A parent outside every tab, another user's, past [`HELD_CPU_NS`].
+    const OUTSIDE: u32 = REST_PID + 4;
+    /// Another such parent.
+    const OTHER: u32 = REST_PID + 5;
+    fn zombie(pid: u32, ppid: u32) -> ProcessReading {
+        ProcessReading {
+            uid: Some(0),
+            state: probe::RunState::Zombie,
+            ..Scene::row(pid, ppid, 0)
+        }
+    }
+    let piled = || {
+        let mut scene = Scene::resting();
+        for parent in [OUTSIDE, OTHER] {
+            scene.sweep.push(ProcessReading {
+                uid: Some(0),
+                ..Scene::row(parent, 1, 2 * HELD_CPU_NS)
+            });
+        }
+        scene.sweep.extend([
+            zombie(REST_PID + 10, OUTSIDE),
+            zombie(REST_PID + 11, OUTSIDE),
+        ]);
+        scene
+    };
+    // The scene's rest: the model reads it every 5 s from 5 000, the pass from 70 000, whose
+    // pass starts no rest; 75 000's rests.
+    let settle = |scene: &Scene, model: &mut aterm_vitals::Vitals, pass: &mut JobsPass| {
+        for at_ms in (5_000..70_000).step_by(5_000) {
+            let _ = observed(model, &scene.sweep, at_ms, true);
+        }
+        scene.read_facts(pass, 70_000, &observed(model, &scene.sweep, 70_000, true));
+        assert!(pass.rest.is_none(), "the first pass starts no rest");
+        let rest = scene.read_facts(pass, 75_000, &observed(model, &scene.sweep, 75_000, true));
+        assert!(pass.rest.is_some(), "the second rests");
+        rest
+    };
+    let rate = |view: &JobsView| {
+        view.findings
+            .zombies
+            .iter()
+            .map(|z| (z.ppid, z.count, z.per_min_deci))
+            .collect::<Vec<_>>()
+    };
+
+    let scene = piled();
+    let mut model = aterm_vitals::Vitals::new();
+    let mut pass = JobsPass::new();
+    let rest = settle(&scene, &mut model, &mut pass);
+    assert_eq!(rate(&rest), [(OUTSIDE, 2, 17)], "two zombies 70 s on");
+    let mut rates = Vec::new();
+    for at_ms in (80_000..=100_000).step_by(5_000) {
+        let facts = observed(&mut model, &scene.sweep, at_ms, true);
+        let view = scene.read_facts(&mut pass, at_ms, &facts);
+        assert!(Arc::ptr_eq(&rest, &view), "{at_ms}: the rest stands");
+        let receipt = facts.admitted_zombies().expect("a whole paired receipt");
+        assert_ne!(receipt.seq(), rest.zombie_facts.as_ref().unwrap().seq());
+        rates.extend(receipt.piles().iter().map(|p| p.per_min_deci()));
+    }
+    assert_eq!(
+        rates,
+        [16, 15, 14, 13, 12],
+        "the rate fell as the rest stood"
+    );
+
+    // Each case's scene at a reading's clock, and whether that reading is whole and assessed.
+    let cases: [(&str, fn(&mut Scene, u64) -> (bool, bool)); 6] = [
+        ("a zombie that comes to count", |s, at| {
+            if at == 90_000 {
+                s.sweep.push(zombie(REST_PID + 12, OUTSIDE));
+            }
+            (true, true)
+        }),
+        ("a pile's zombie reaped", |s, at| {
+            if at == 100_000 {
+                s.sweep.retain(|p| p.pid != REST_PID + 11);
+            }
+            (true, true)
+        }),
+        ("a pile that goes", |s, at| {
+            if at == 100_000 {
+                s.sweep.retain(|p| p.ppid != OUTSIDE);
+            }
+            (true, true)
+        }),
+        ("another parent's pile", |s, at| {
+            if at == 90_000 {
+                s.sweep.push(zombie(REST_PID + 13, OTHER));
+            }
+            (true, true)
+        }),
+        ("a pile that starts again", |s, at| {
+            if at == 80_000 {
+                s.sweep.retain(|p| p.ppid != OUTSIDE);
+            }
+            if at == 85_000 {
+                s.sweep.extend([
+                    zombie(REST_PID + 14, OUTSIDE),
+                    zombie(REST_PID + 15, OUTSIDE),
+                ]);
+            }
+            (true, at == 100_000)
+        }),
+        ("a census cut at its cap", |_, at| (at != 100_000, true)),
+    ];
+    let mut missed = Vec::new();
+    for (what, at) in cases {
+        let mut scene = piled();
+        let mut model = aterm_vitals::Vitals::new();
+        let mut pass = JobsPass::new();
+        let rest = settle(&scene, &mut model, &mut pass);
+        for at_ms in (80_000..=100_000).step_by(5_000) {
+            let (whole, assessed) = at(&mut scene, at_ms);
+            let facts = observed(&mut model, &scene.sweep, at_ms, whole);
+            if !assessed {
+                continue;
+            }
+            let view = scene.read_facts(&mut pass, at_ms, &facts);
+            if at_ms < 100_000 {
+                assert!(
+                    Arc::ptr_eq(&rest, &view),
+                    "{what} at {at_ms}: the rest stands"
+                );
+            } else if Arc::ptr_eq(&rest, &view) {
+                missed.push(what);
+            } else {
+                assert_eq!(
+                    view.zombie_facts.as_ref().map(Arc::as_ptr),
+                    facts.admitted_zombies().map(std::ptr::from_ref),
+                    "{what}: the pass's view keeps that reading's receipt"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        missed, [""; 0],
+        "zombie piles whose next reading was no pass"
+    );
+}
+
+/// A REST HEARS THIS USER'S UNINTERRUPTIBLE WAITS (C8 review): the engine names a wait of this
+/// user's once it is `KERNEL_WAIT_MS` old (`Findings::d_state`), dated from the first pass that
+/// reads it, so a rest's key holds the identity of each of this user's processes the sweep reads
+/// in an uninterruptible wait (Linux's `D`), and a rest ends when a wait the engine dated and did
+/// not name turns old enough to name ([`Jobs::d_state_due_ms`]). From a resting view, a process of
+/// this user outside every tab, past the candidates' CPU, that enters a wait makes the next
+/// reading a pass; the pass after it rests, and the first reading 10 s after the wait's first
+/// pass is a pass that names it, as the engine's own cadence would; from the rest that view
+/// starts, the next reading after the wait ends is a pass, which names none. NEGATIVE CONTROL:
+/// drop the waits from the rest's key, and the reading after the wait starts reads the rest's
+/// view; bound the rest without the engine's due, and the reading 10 s after the wait's first
+/// pass reads the view of the pass that rested, which names none.
+#[test]
+fn a_rest_hears_this_users_uninterruptible_waits() {
+    /// A process of this user outside every tab, past [`HELD_CPU_NS`].
+    const WAITER: u32 = REST_PID + 4;
+    let named = |view: &JobsView| {
+        view.findings
+            .d_state
+            .iter()
+            .map(|n| n.pid)
+            .collect::<Vec<_>>()
+    };
+    let mut scene = Scene::resting();
+    scene.sweep.push(Scene::row(WAITER, 1, 2 * HELD_CPU_NS));
+    let awake = scene.proc_mut(WAITER).state;
+    let mut pass = JobsPass::new();
+    let rest = scene.settle(&mut pass, 10_000);
+    let same = scene.read(&mut pass, 20_000);
+    assert!(Arc::ptr_eq(&rest, &same), "the rest stands");
+
+    scene.proc_mut(WAITER).state = probe::RunState::Uninterruptible;
+    let dated = scene.read(&mut pass, 25_000);
+    assert!(!Arc::ptr_eq(&rest, &dated), "the wait's start: a pass");
+    assert_eq!(named(&dated), [0_u32; 0], "dated, not yet named");
+    assert!(pass.rest.is_none(), "which starts no rest");
+    let resting = scene.read(&mut pass, 30_000);
+    assert!(!Arc::ptr_eq(&dated, &resting), "the next reading is a pass");
+    assert!(pass.rest.is_some(), "which rests");
+    let still = scene.read(&mut pass, 32_500);
+    assert!(Arc::ptr_eq(&resting, &still), "the rest stands");
+    let due = scene.read(&mut pass, 35_000);
+    assert!(
+        !Arc::ptr_eq(&resting, &due),
+        "10 s after its first pass: a pass"
+    );
+    assert_eq!(named(&due), [WAITER], "which names the wait");
+
+    let rested = scene.read(&mut pass, 40_000);
+    assert!(pass.rest.is_some(), "the view naming it rests");
+    let still = scene.read(&mut pass, 45_000);
+    assert!(Arc::ptr_eq(&rested, &still), "the rest stands");
+    scene.proc_mut(WAITER).state = awake;
+    let ended = scene.read(&mut pass, 50_000);
+    assert!(!Arc::ptr_eq(&rested, &ended), "the wait's end: a pass");
+    assert_eq!(named(&ended), [0_u32; 0], "which names none");
 }

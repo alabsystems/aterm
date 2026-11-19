@@ -4,7 +4,7 @@
 use super::{Form, Request, signed_us_ms};
 
 #[test]
-fn the_grammar_is_three_bodies() {
+fn the_grammar_is_four_bodies() {
     let summary = |reset| {
         Some(Request {
             form: Form::Summary,
@@ -21,11 +21,20 @@ fn the_grammar_is_three_bodies() {
             reset: false
         })
     );
+    assert_eq!(
+        Request::parse("commons"),
+        Some(Request {
+            form: Form::Commons,
+            reset: false
+        })
+    );
     for refused in [
         "rest",
         "percentile",
         "reset now",
         "percentiles reset",
+        "commons reset",
+        "reset commons",
         "json",
     ] {
         assert_eq!(Request::parse(refused), None, "{refused:?}");

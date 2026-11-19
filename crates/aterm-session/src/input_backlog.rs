@@ -115,6 +115,7 @@ pub enum Liveness {
 pub struct InputLedger {
     /// Bytes the kernel has accepted (every `end` adds its count).
     accepted: u64,
+    byte_history: crate::terminal_stream::ByteHistory,
     /// Bytes of the one write currently inside `write(2)`.
     inflight: u64,
     /// The accepted runs.
@@ -137,6 +138,7 @@ impl InputLedger {
     pub fn new(born: Instant) -> Self {
         Self {
             accepted: 0,
+            byte_history: crate::terminal_stream::ByteHistory::new(born),
             inflight: 0,
             ring: VecDeque::with_capacity(Self::CAPACITY),
             born,
@@ -179,6 +181,7 @@ impl InputLedger {
             return;
         }
         let n = u64::try_from(n).unwrap_or(u64::MAX);
+        self.byte_history.record(at, n);
         self.accepted = self.accepted.saturating_add(n);
         if let Some(newest) = self.ring.back_mut()
             && at.saturating_duration_since(newest.last) < Self::COALESCE
@@ -195,6 +198,10 @@ impl InputLedger {
             first: at,
             last: at,
         });
+    }
+
+    pub(crate) fn byte_rates(&self, at: Instant, through: Instant) -> [Option<f64>; 12] {
+        self.byte_history.rates(at, through)
     }
 
     fn merge_cheapest(&mut self, now: Instant) {

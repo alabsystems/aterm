@@ -384,6 +384,10 @@ pub(crate) struct Survey {
     /// Observed native release rows, not a complete inventory: old or capped replies have no
     /// count or support marker. No usable row leaves this unknown, never an empty proof.
     pub(crate) release_lines: Option<Vec<release::ReleaseLine>>,
+    /// The release pumps' facts (`release_pump` rows, `pump=`), one per pump record on the host:
+    /// empty from an aterm that sent none (one older than the row, or one whose host keeps no
+    /// pump record), which a reader takes as unknown, never as no pump.
+    pub(crate) pumps: Vec<crate::release_pump::Pump>,
     /// The `release_holder` rows the reply carried, unread until a `--holder` names the identity
     /// they must echo.
     pub(crate) holder_rows: Vec<String>,
@@ -443,6 +447,8 @@ pub(crate) fn parse_reply(lines: &[String]) -> Result<Survey, String> {
             survey.github_rate.push(Fields::of(line));
         } else if line.starts_with(crate::release_holder::ROW) {
             survey.holder_rows.push(line.clone());
+        } else if line.starts_with(crate::release_pump::ROW) {
+            survey.pumps.extend(crate::release_pump::Pump::parse(line));
         } else if let Some(release) = release::ReleaseLine::parse(line) {
             survey.release_lines.get_or_insert_default().push(release);
         }
@@ -2204,6 +2210,12 @@ fn blocks_of(replies: &[HostReply], own: Option<&str>, whole: bool) -> Blocks {
                         .map(|row| {
                             row.summary(release_observer_node(reply, survey), reply.unproven)
                         })
+                        .chain(
+                            survey
+                                .pumps
+                                .iter()
+                                .map(|pump| shown(&pump.summary(), LINE_CHARS)),
+                        )
                         .collect(),
                     home: home_lines(survey),
                     entries,
@@ -2600,7 +2612,7 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
             );
             match &reply.answer {
                 Ok(survey) => format!(
-                    "{{{head}{},\"instance\":{},\"accounts\":{},\"repos\":{},\"github_rate\":[{}],\"release_lines\":{},\"sessions\":[{}]}}",
+                    "{{{head}{},\"instance\":{},\"accounts\":{},\"repos\":{},\"github_rate\":[{}],\"release_lines\":{},\"pumps\":[{}],\"sessions\":[{}]}}",
                     proof_json(reply, survey),
                     object(&survey.header),
                     survey.accounts.as_ref().map_or_else(
@@ -2631,6 +2643,12 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
                                 .join(",")
                         ),
                     ),
+                    survey
+                        .pumps
+                        .iter()
+                        .map(crate::release_pump::Pump::json)
+                        .collect::<Vec<_>>()
+                        .join(","),
                     survey
                         .sessions
                         .iter()

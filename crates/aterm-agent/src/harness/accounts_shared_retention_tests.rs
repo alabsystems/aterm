@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
-
 use super::*;
 
 #[test]
@@ -37,7 +34,6 @@ fn a_prepared_account_is_not_a_next_sign_in_target() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_non_home_warm_grant_wakes_a_sync_to_release_prepared_execution() {
     let now = 1_800_000_000;
@@ -154,7 +150,6 @@ fn preparation_only_labels_cannot_be_reused_or_overwritten_by_a_move() {
     assert!(state.accounts.contains_key("unused"));
 }
 
-#[cfg(unix)]
 #[test]
 fn a_preparation_hold_cannot_be_pinned_or_queued_for_login() {
     let now = 1_800_000_000;

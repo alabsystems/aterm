@@ -447,3 +447,140 @@ fn selected_targets_use_literal_names_and_refuse_unbound_script_execution() {
         .is_err()
     );
 }
+
+fn published_library_fixture(root: &Path) -> Vec<u8> {
+    let mut output = fixture(root);
+    let unit = root.join("units/library");
+    let archive = unit.join("out/libcutter_lib-0123456789abcdef.rlib");
+    let metadata = archive.with_extension("rmeta");
+    let published = root.join("published/libcutter_lib.rlib");
+    std::fs::create_dir_all(unit.join("out")).unwrap();
+    std::fs::create_dir_all(unit.join("fingerprint")).unwrap();
+    std::fs::create_dir_all(published.parent().unwrap()).unwrap();
+    std::fs::write(&archive, b"the selected compiler's archive bytes").unwrap();
+    std::fs::write(&metadata, b"the selected compiler's metadata bytes").unwrap();
+    std::fs::copy(&archive, &published).unwrap();
+    for (dep, source) in [
+        (
+            unit.join("out/cutter_lib-0123456789abcdef.d"),
+            "private-library.rs",
+        ),
+        (published.with_extension("d"), "aggregate-library.rs"),
+    ] {
+        let source = root.join("crates/cutter").join(source);
+        std::fs::write(&source, "pub fn selected() {}\n").unwrap();
+        std::fs::write(dep, format!("output: {}\n", source.display())).unwrap();
+    }
+    std::fs::write(
+        unit.join("fingerprint/lib-cutter_lib.json"),
+        r#"{"local":[]}"#,
+    )
+    .unwrap();
+    let mut compiler_outputs = Vec::new();
+    let mut outputs = Vec::new();
+    for (path, emit) in [(&archive, "link"), (&metadata, "metadata")] {
+        let path_sha256 =
+            aterm_codec::hex::encode_lower(&Sha256::digest(path.as_os_str().as_encoded_bytes()));
+        let bytes = std::fs::read(path).unwrap();
+        compiler_outputs.push(aterm_json::json!({"path_sha256":path_sha256,"emit":emit}));
+        outputs.push(aterm_json::json!({"path_sha256":path_sha256,"size":bytes.len(),"sha256":aterm_codec::hex::encode_lower(&Sha256::digest(&bytes))}));
+    }
+    std::fs::write(
+        unit.join("fingerprint/outputs-lib-cutter_lib.json"),
+        aterm_json::json!({
+            "schema":4,"compiler":{"mode":"build","workspace":true,"build_script":false},
+            "compiler_outputs":compiler_outputs,"outputs":outputs,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let row = aterm_json::json!({
+        "reason":"compiler-artifact","fresh":true,"package_id":"path+file:///fixture#cutter@0.0.0",
+        "manifest_path":root.join("crates/cutter/Cargo.toml"),
+        "target":{"kind":["lib"],"name":"cutter_lib"},"profile":{"test":false},
+        "trust_compile_mode":"build","trust_compile_kind":"host","trust_unit_identity_sha256":"b".repeat(64),
+        "filenames":[published,metadata],"executable":Value::Null,
+    });
+    output.extend_from_slice(format!("{row}\n").as_bytes());
+    output
+}
+
+#[test]
+fn a_published_library_keeps_its_selected_private_producer_and_both_source_sets() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let output = published_library_fixture(root);
+    let seal = "a".repeat(64);
+    let first = capture(root, &output, &seal).unwrap();
+    assert!(first.all_fresh);
+    for source in ["private-library.rs", "aggregate-library.rs"] {
+        let path = root.join("crates/cutter").join(source);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "pub fn changed() {}\n").unwrap();
+        assert_ne!(capture(root, &output, &seal).unwrap().inputs, first.inputs);
+        std::fs::write(path, original).unwrap();
+    }
+}
+
+#[test]
+fn a_published_library_refuses_missing_or_mismatched_private_evidence() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let output = published_library_fixture(root);
+    let seal = "a".repeat(64);
+    for file in [
+        "units/library/fingerprint/lib-cutter_lib.json",
+        "units/library/fingerprint/outputs-lib-cutter_lib.json",
+        "units/library/out/cutter_lib-0123456789abcdef.d",
+        "units/library/out/libcutter_lib-0123456789abcdef.rmeta",
+        "units/library/out/libcutter_lib-0123456789abcdef.rlib",
+        "published/libcutter_lib.d",
+    ] {
+        let path = root.join(file);
+        let original = std::fs::read(&path).unwrap();
+        let sibling = path.with_file_name("unrelated-selected-evidence.json");
+        std::fs::write(&sibling, &original).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(capture(root, &output, &seal).is_err(), "{file}");
+        std::fs::write(&path, original).unwrap();
+        std::fs::remove_file(sibling).unwrap();
+    }
+    for file in [
+        "published/libcutter_lib.rlib",
+        "units/library/out/libcutter_lib-0123456789abcdef.rlib",
+        "units/library/out/libcutter_lib-0123456789abcdef.rmeta",
+    ] {
+        let path = root.join(file);
+        let original = std::fs::read(&path).unwrap();
+        let mut changed = original.clone();
+        changed[0] ^= 1;
+        std::fs::write(&path, changed).unwrap();
+        assert!(capture(root, &output, &seal).is_err(), "{file}");
+        std::fs::write(path, original).unwrap();
+    }
+    let receipt_path = root.join("units/library/fingerprint/outputs-lib-cutter_lib.json");
+    let original = std::fs::read(&receipt_path).unwrap();
+    for pointer in ["/outputs/0/path_sha256", "/compiler_outputs/0/emit"] {
+        let mut receipt: Value = aterm_json::from_slice(&original).unwrap();
+        *declaration_mut(&mut receipt, pointer) = aterm_json::json!("different-producer");
+        std::fs::write(&receipt_path, receipt.to_string()).unwrap();
+        assert!(capture(root, &output, &seal).is_err(), "{pointer}");
+    }
+    std::fs::write(receipt_path, original).unwrap();
+    let mut rows: Vec<Value> = output
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| aterm_json::from_slice(line).unwrap())
+        .collect();
+    let library = rows.last_mut().unwrap();
+    library.as_object_mut().unwrap().insert(
+        "filenames".into(),
+        aterm_json::json!([root.join("published/libcutter_lib.rlib")]),
+    );
+    let unbound = rows
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(capture(root, unbound.as_bytes(), &seal).is_err());
+}

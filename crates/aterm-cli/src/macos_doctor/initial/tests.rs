@@ -1575,26 +1575,35 @@ fn an_explicit_completion_rereads_network_stages_an_earlier_pass_finished() {
     }
 }
 
-/// Automatic setup starts selected permission steps without a second opt-in.
+/// Automatic setup starts its Permissions lanes and offers Full Disk Access. A person's
+/// request changes the same unconfirmed grant to a pending approval while the plan admits it.
 #[test]
 fn automatic_setup_starts_selected_permission_steps() {
+    use aterm_types::macos_setup::{Access, Standing};
     let root = aterm_tempfile::tempdir().unwrap();
     let plan = selected(&[Setting::Permissions, Setting::Secrets]);
-    authorize_reading(root.path(), &plan, || Ok(None)).unwrap();
-    assert_eq!(
-        permission_steps_at(root.path()),
-        Ok(PermissionSteps::Allowed),
-        "the admitted plan starts its steps automatically"
-    );
+    let revision = authorize_reading(root.path(), &plan, || Ok(None))
+        .unwrap()
+        .unwrap();
+    let fda = || {
+        let grants = access::Grants {
+            acquiring: acquiring_person_access_at(root.path()),
+            ..access::Grants::fixture()
+        };
+        access::observation(Access::FullDiskAccess, &grants, plan.selection)
+    };
+    let offered = fda();
+    assert_eq!(offered.standing, Standing::NotNeeded);
+    assert!(offered.on_offer());
     let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
     assert!(snapshot.plan.selection.contains(Setting::Permissions));
     assert!(snapshot.permissions_allowed);
     note_person_asked_at(root.path()).unwrap();
-    assert_eq!(
-        permission_steps_at(root.path()),
-        Ok(PermissionSteps::Allowed),
-        "CONTROL: the press admits them, on this Mac's records"
-    );
+    let requested = fda();
+    assert_eq!(requested.standing, Standing::NeedsYou);
+    assert!(!requested.on_offer());
+    request_stop_at(root.path(), revision).unwrap();
+    assert!(!acquiring_person_access_at(root.path()));
 }
 
 /// The records as an older aterm left them: its progress record carries no
@@ -1641,8 +1650,7 @@ fn an_older_aterms_approval_outlives_its_records() {
     );
 }
 
-/// A historical press belongs to its hardware UUID. Automatic acquisition follows this
-/// Mac's admitted plan regardless of that historical press.
+/// Automatic permission steps run on this Mac even when a press elsewhere grants no authority.
 #[test]
 fn automatic_permission_steps_do_not_depend_on_another_macs_press() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1659,8 +1667,10 @@ fn automatic_permission_steps_do_not_depend_on_another_macs_press() {
     .unwrap();
     assert_eq!(person_access_at(root.path()), PersonAccess::NotAsked);
     assert!(permissions_allowed(root.path()));
+    assert!(!acquiring_person_access_at(root.path()));
     note_person_asked_at(root.path()).unwrap();
     assert_eq!(person_access_at(root.path()), PersonAccess::Asked);
+    assert!(acquiring_person_access_at(root.path()));
     assert!(
         permissions_allowed(root.path()),
         "CONTROL: this Mac's press"
@@ -1949,11 +1959,7 @@ fn permission_steps_split_what_waits_from_what_a_person_holds() {
         set_up(root.path());
         let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
         assert_eq!(snapshot.access_steps, expected, "{case}");
-        assert_eq!(
-            permission_steps_at(root.path()),
-            Ok(expected),
-            "{case}: the light read agrees with the page"
-        );
+        assert_eq!(steps_of(&snapshot.observation.records), expected, "{case}");
         assert_eq!(
             snapshot.permissions_allowed,
             expected == PermissionSteps::Allowed,

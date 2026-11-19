@@ -4943,6 +4943,13 @@ pub(super) fn cmd_meta_harness_act_with_clock(
             false,
         ));
     };
+    // D29: the claim's own stream applied `act` under this act's duty, so it is the act's one
+    // writer.
+    if duty.is_some_and(|duty| {
+        meta.stream_writes(&[crate::session_timeline::ACT_KIND], &[duty], now_us())
+    }) {
+        return Some((STREAM_WRITES_IT.to_string(), false));
+    }
     let resent;
     {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -5032,6 +5039,42 @@ pub(super) fn cmd_meta_harness_act_with_clock(
     Some(("OK\n".to_string(), true))
 }
 
+/// THE STREAM'S ARM OF THE SHARED ACT PATH (D10): the act of record `hseq` the live scoped
+/// claim's own stream applied (an `act` record's rule, or `landed@v1` for a `land` record saying
+/// `landed`), applied under the timeline lock as an admitted `meta set harness_act <rule>` of
+/// that scoped claim is ([`cmd_meta_harness_act_with_clock`]): its row is written, now through
+/// the stream's write arm (`SessionTimeline::note_stream_act`: the four stamps, `hseq=`, no
+/// mark limiter), a face that stands until another turn takes the typed turn's counts, an
+/// opening act that types a turn notes one, and the face it tells is queued
+/// (`SessionTimeline::queue_self_task`). A scoped claim's act is never queued for codex-alab's
+/// glass nor booked in its ledger, and a stream reads no act barrier (as the unbounded `meta
+/// set` spelling reads none). `None`, with nothing done, where the log refused the row; else
+/// the face the act tells, for the window's wake.
+#[cfg(unix)]
+pub(crate) fn stream_act(
+    timeline: &mut crate::session_timeline::SessionTimeline,
+    rule: &str,
+    holder: &str,
+    by: aterm_slog::Actor,
+    hseq: u64,
+) -> Option<Option<aterm_agent::harness::acts::TaskFace>> {
+    let face = crate::harness_task::self_claim_act_face(rule);
+    timeline.note_stream_act(rule, holder, by, hseq)?;
+    let _ = timeline.self_act_resent(rule, holder, face, None);
+    if face.is_some_and(crate::harness_task::holds_until_another_turn) {
+        let _ = timeline.take_typed_turn();
+    } else if face == Some(aterm_agent::harness::acts::TaskFace::Open)
+        && aterm_agent::harness::acts::self_claim_types_turn(rule)
+    {
+        timeline.note_typed_act(None);
+    }
+    if let Some(face) = face {
+        timeline.queue_self_task(face);
+    }
+    let _ = timeline.slog_take_wake();
+    Some(face)
+}
+
 /// The face a recorded `meta set harness_act <act>` tells ([`crate::harness_task::self_claim_act_face`]), for the meta arm's change wake: `landed` for codex-alab's `landed@v1`, `theirs` for its `left-to-person@v1` (a person's own exchange left to them), `open` for any other act save its re-exec (`upgrade@v1`, no face); `None` for that one and for every other `meta` line.
 pub(crate) fn harness_act_face(rest: &str) -> Option<aterm_agent::harness::acts::TaskFace> {
     let HarnessActRequest::Set { act, .. } = harness_act_request(rest)?.ok()? else {
@@ -5071,6 +5114,13 @@ const TURN_END: aterm_agent::harness::contract::Scope =
 pub(crate) const STATE: aterm_agent::harness::contract::Scope =
     aterm_agent::harness::contract::Scope::State;
 
+/// THE ANSWER OF A `meta set harness_*` WRITER THE STREAM STOOD DOWN (D29): the live claim's own
+/// record stream applied the kind that line would write (`act` for `harness_act`, `harness_held`
+/// and `harness_activity`, `need` or `clear` for `harness_needs`, `land` for `harness_land`;
+/// [`crate::session_timeline::SessionMeta::stream_writes`]), so the stream is that kind's one
+/// writer and the line keeps nothing.
+pub(crate) const STREAM_WRITES_IT: &str = "ERR usage: stream\n";
+
 const HARNESS_HELD_USAGE: &str =
     "ERR usage: meta set harness_held same-reply|no-work | meta unset harness_held\n";
 
@@ -5109,9 +5159,17 @@ pub(crate) fn cmd_meta_harness_held(
         Err(usage) => return Some((usage.to_string(), false)),
     };
     let Some((holder, moved)) = self_claim_write(ctx, conn, TURN_END, prove, |meta, proven| {
-        meta.tell_self_held(proven, held)
+        let stood_down = meta.stream_writes(
+            &[crate::session_timeline::ACT_KIND],
+            &[TURN_END],
+            crate::metrics::now_us(),
+        );
+        (!stood_down).then(|| meta.tell_self_held(proven, held))
     }) else {
         return Some(("ERR denied\n".to_string(), false));
+    };
+    let Some(moved) = moved else {
+        return Some((STREAM_WRITES_IT.to_string(), false));
     };
     if moved {
         aterm_log::info!(
@@ -5166,32 +5224,25 @@ pub(crate) fn cmd_meta_harness_activity(
     }
     let now = aterm_time::unix_millis().unwrap_or(0);
     let Some((_, changed)) = self_claim_write(ctx, conn, STATE, prove, |meta, _| {
-        let activity = crate::autopilot_activity::Activity {
-            sequence: sequence.unwrap_or(0),
-            reason: reason.unwrap_or("waiting").into(),
-            until_ms: wait_ms.flatten().map(|ms| now.saturating_add(ms)),
-            observed_ms: now,
-        };
-        let revision = meta.supervisor_revision;
-        if meta
-            .continuation_activity
-            .as_ref()
-            .is_some_and(|(rev, old)| *rev == revision && old.sequence >= activity.sequence)
-        {
-            return false;
-        }
-        let changed = meta
-            .continuation_activity
-            .as_ref()
-            .is_none_or(|(rev, old)| {
-                *rev != revision
-                    || old.reason != activity.reason
-                    || old.until_ms != activity.until_ms
-            });
-        meta.continuation_activity = Some((revision, activity));
-        changed
+        let stood_down = meta.stream_writes(
+            &[crate::session_timeline::ACT_KIND],
+            &[STATE],
+            crate::metrics::now_us(),
+        );
+        (!stood_down).then(|| {
+            meta.keep_continuation_activity(crate::autopilot_activity::Activity {
+                sequence: sequence.unwrap_or(0),
+                reason: reason.unwrap_or("waiting").into(),
+                until_ms: wait_ms.flatten().map(|ms| now.saturating_add(ms)),
+                observed_ms: now,
+                from_stream: false,
+            })
+        })
     }) else {
         return Some(("ERR denied\n".into(), false));
+    };
+    let Some(changed) = changed else {
+        return Some((STREAM_WRITES_IT.to_string(), false));
     };
     Some(("OK\n".into(), changed))
 }
@@ -5325,9 +5376,17 @@ pub(crate) fn cmd_meta_harness_land(
         Err(usage) => return Some((usage.to_string(), false)),
     };
     let Some((holder, moved)) = self_claim_write(ctx, conn, TURN_END, prove, |meta, proven| {
-        meta.tell_self_land(proven, held)
+        let stood_down = meta.stream_writes(
+            &[crate::session_timeline::LAND_KIND],
+            &[TURN_END],
+            crate::metrics::now_us(),
+        );
+        (!stood_down).then(|| meta.tell_self_land(proven, held))
     }) else {
         return Some(("ERR denied\n".to_string(), false));
+    };
+    let Some(moved) = moved else {
+        return Some((STREAM_WRITES_IT.to_string(), false));
     };
     if moved {
         aterm_log::info!(
@@ -5372,19 +5431,30 @@ fn harness_needs_of<'a>(toks: impl Iterator<Item = &'a str>) -> Option<crate::ne
     let mut needs = Vec::new();
     for tok in toks {
         match tok.split_once('=')? {
-            ("entry", value) if entry.is_none() => {
-                entry = Some(pct_strict(value).filter(|text| !text.is_empty())?);
-            }
-            ("need", value) if needs.len() < HARNESS_NEEDS_MAX => {
-                needs.push(pct_strict(value).filter(|need| {
-                    need.len() <= crate::needs::NEED_TOLD_MAX
-                        && !crate::needs::fold_clip(need, crate::needs::NEED_TOLD_MAX).is_empty()
-                })?)
-            }
+            ("entry", value) if entry.is_none() => entry = Some(pct_strict(value)?),
+            ("need", value) if needs.len() < HARNESS_NEEDS_MAX => needs.push(pct_strict(value)?),
             _ => return None,
         }
     }
-    crate::needs::HarnessNeeds::told(&needs, &entry?)
+    needs_told_of(&needs, &entry?)
+}
+
+/// THE SET `needs` TELL OF THE ENTRY `entry`, read as a `meta set harness_needs` line's decoded
+/// values are ([`harness_needs_of`]) and as a stream's `need` record's are: a non-empty entry,
+/// one to [`HARNESS_NEEDS_MAX`] needs, each at most [`crate::needs::NEED_TOLD_MAX`] bytes and
+/// non-empty once folded ([`crate::needs::fold_clip`]), and the entry's text kept through the
+/// presentation sanitizer ([`crate::needs::HarnessNeeds::told`]); `None` for anything else.
+pub(crate) fn needs_told_of(needs: &[String], entry: &str) -> Option<crate::needs::HarnessNeeds> {
+    let told = |need: &String| {
+        need.len() <= crate::needs::NEED_TOLD_MAX
+            && !crate::needs::fold_clip(need, crate::needs::NEED_TOLD_MAX).is_empty()
+    };
+    (!entry.is_empty()
+        && !needs.is_empty()
+        && needs.len() <= HARNESS_NEEDS_MAX
+        && needs.iter().all(told))
+    .then(|| crate::needs::HarnessNeeds::told(needs, entry))
+    .flatten()
 }
 
 /// `value` PERCENT-DECODED STRICTLY: every `%` begins two hex digits (either case), any other byte stands for itself, and the bytes decoded are UTF-8; `None` for anything else, where [`aterm_control::wire::pct_decode`] passes a stray `%` through and decodes bad UTF-8 lossily.
@@ -5418,16 +5488,39 @@ pub(crate) fn cmd_meta_harness_needs(
         Err(usage) => return Some((usage.to_string(), NeedsMoved::default())),
     };
     let count = told.as_ref().map(|told| told.needs().len());
-    let Some((holder, (read, credentials, shown))) =
-        self_claim_write(ctx, conn, TURN_END, prove, |meta, proven| {
-            meta.tell_self_needs(proven, told)
-        })
-    else {
+    let Some((holder, told)) = self_claim_write(ctx, conn, TURN_END, prove, |meta, proven| {
+        let stood_down = meta.stream_writes(
+            &[
+                crate::session_timeline::NEED_KIND,
+                crate::session_timeline::CLEAR_KIND,
+            ],
+            &crate::session_timeline::NEED_SCOPES,
+            crate::metrics::now_us(),
+        );
+        (!stood_down).then(|| meta.tell_self_needs(proven, told))
+    }) else {
         return Some(("ERR denied\n".to_string(), NeedsMoved::default()));
     };
-    // The claimant's entry spoke for the lines taken off, or for lines a set before took off:
-    // aterm puts up the one for the person's needs, the claimant's own where none was taken off,
-    // or takes it down where none is left.
+    let Some(told) = told else {
+        return Some((STREAM_WRITES_IT.to_string(), NeedsMoved::default()));
+    };
+    let moved = needs_told(ctx, &holder, count, told);
+    Some(("OK\n".to_string(), moved))
+}
+
+/// WHAT FOLLOWS A NEEDS YOU SET `holder` TOLD ([`crate::session_timeline::SessionMeta::
+/// tell_self_needs`]'s answer, `told`), with the session's locks let go: the claimant's entry
+/// spoke for the lines taken off, or for lines a set before took off, so aterm puts up the one
+/// for the person's needs, the claimant's own where none was taken off, or takes it down where
+/// none is left; the credential lines go on the secrets path ([`resolve_credentials`]). `count`
+/// is how many needs the set held, for the log line (`None` for a take-down). What moved.
+pub(crate) fn needs_told(
+    ctx: &SessionCtx,
+    holder: &str,
+    count: Option<usize>,
+    told: (bool, Vec<String>, Option<Option<String>>),
+) -> NeedsMoved {
+    let (read, credentials, shown) = told;
     let entry = shown.is_some_and(|shown| {
         crate::session_timeline::write_attention_kind(
             ctx,
@@ -5450,7 +5543,7 @@ pub(crate) fn cmd_meta_harness_needs(
             credentials.len()
         );
     }
-    Some(("OK\n".to_string(), moved))
+    moved
 }
 
 /// What an admitted `meta set|unset harness_needs` line moved ([`cmd_meta_harness_needs`]).

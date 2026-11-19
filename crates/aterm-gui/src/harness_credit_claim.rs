@@ -576,11 +576,13 @@ pub(crate) fn claim_workers(store: &crate::session_store::Store) -> Vec<ClaimWor
 
 /// [`Seams::walled`] on this machine: the claim worker starts as Claude Code with no starter's
 /// login (no caller), on the row the launch's own accounts read would start it on
-/// ([`crate::task_launch::claude_worker_wall`]).
+/// ([`crate::task_launch::claude_worker_wall`]), running Claude Code's default model: its order
+/// names none.
 pub(crate) fn walled_here() -> Option<i64> {
     let cli = aterm_agent::harness::worker::worker_cli(aterm_phase::Program::Claude)?;
     let seat = crate::task_launch::PoolSeat::here()?;
-    crate::task_launch::claude_worker_wall(&cli.unstarted(), &seat.seat())
+    let week = aterm_agent::harness::accounts::ModelWeek::of_launch(None);
+    crate::task_launch::claude_worker_wall(&cli.unstarted(), &seat.seat(), week)
 }
 
 /// [`Seams::left`] on this machine: Chrome and its Claude extension, put in place where aterm

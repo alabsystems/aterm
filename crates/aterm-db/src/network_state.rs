@@ -490,7 +490,7 @@ fn accounts_exchange(value: &Value) -> Result<Option<AccountsExchangeObservation
         .map(|value| {
             let inventory_count = number(value, "inventory_count")?;
             let sampled_at_ms = number(value, "sampled_at_ms")?;
-            if inventory_count > crate::replica::MAX_RECORDS as u64 || sampled_at_ms == 0 {
+            if sampled_at_ms == 0 {
                 return Err(bad());
             }
             Ok(AccountsExchangeObservation {

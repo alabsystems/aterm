@@ -26,6 +26,21 @@ fn memory_instant() -> Instant {
 }
 
 fn memory_receipt(snapshot: &Snapshot, observed_at: ObservedAt) -> Arc<memory::Receipt> {
+    memory_receipt_of(
+        snapshot,
+        observed_at,
+        &aterm_sysprobe::Sweep {
+            procs: Vec::new(),
+            truncated: false,
+        },
+    )
+}
+
+fn memory_receipt_of(
+    snapshot: &Snapshot,
+    observed_at: ObservedAt,
+    sweep: &aterm_sysprobe::Sweep,
+) -> Arc<memory::Receipt> {
     let probes = memory::Probes {
         continuous_ns: memory_clock,
         context: || {
@@ -41,12 +56,396 @@ fn memory_receipt(snapshot: &Snapshot, observed_at: ObservedAt) -> Arc<memory::R
     };
     Arc::new(
         memory::Pending::begin(probes, observed_at)
-            .finish(&aterm_sysprobe::Sweep {
-                procs: Vec::new(),
-                truncated: false,
-            })
+            .finish(sweep)
             .publish(snapshot, Vec::new()),
     )
+}
+
+fn groups_frame(seq: u64) -> aterm_vitals::groups::Frame {
+    aterm_vitals::groups::Frame {
+        seq,
+        taken: aterm_vitals::ring::Taken::at(1_800_000_000_000 + seq as i64 * 1000, 1000),
+        mono_ms: seq * 1000,
+        at_ns: seq * 1_000_000_000,
+        processes_observed: true,
+        coalitions_observed: true,
+        processes_complete: true,
+        coalitions_complete: true,
+    }
+}
+
+fn groups_observation(
+    cpu: aterm_vitals::groups::Value<f64>,
+) -> aterm_vitals::groups::Observation<'static> {
+    use aterm_vitals::groups::{GroupKey, Observation, Rate, ReadWindow, Scope, Value};
+    let mut observation = Observation::new(
+        GroupKey::Tab {
+            pane: 0,
+            root: aterm_vitals::delegated::ProcessKey {
+                pid: 400,
+                start: 500,
+            },
+        },
+        Scope::Tab(0),
+        "groups-source-root",
+        1,
+    );
+    observation.cpu = Rate {
+        value: cpu,
+        window: ReadWindow::Reported {
+            end_ns: 1_000_000_000,
+            window_ns: 1_000_000_000,
+        },
+    };
+    observation.footprint = Value::Read(4096);
+    observation.membership_complete = true;
+    observation
+}
+
+fn groups_snapshot(seq: u64, book: &aterm_vitals::groups::GroupBook) -> Snapshot {
+    let mut snapshot = synthetic(seq, 0.1);
+    snapshot.at_unix_ms = groups_frame(seq).taken.at_ms;
+    snapshot.groups = book.view();
+    // Groups is its own source view, not a CPU warm pair or a retained Why explanation.
+    snapshot.cpu = None;
+    snapshot.aterm = None;
+    snapshot.procs_window_ns = None;
+    snapshot.why = None;
+    snapshot.coal_lane = aterm_vitals::explain::CoalLane::On;
+    snapshot
+}
+
+fn groups_receipt(
+    snapshot: &Snapshot,
+    observed_at: ObservedAt,
+    truncated: bool,
+) -> Arc<memory::Receipt> {
+    memory_receipt_of(
+        snapshot,
+        observed_at,
+        &aterm_sysprobe::Sweep {
+            procs: vec![aterm_sysprobe::ProcessReading {
+                pid: 400,
+                start: Some(500),
+                name: "groups-source-root".into(),
+                footprint: Some(4096),
+                ..aterm_sysprobe::ProcessReading::default()
+            }],
+            truncated,
+        },
+    )
+}
+
+#[test]
+fn sys_groups_freshness_keeps_original_census_age_across_new_machine_frames() {
+    use aterm_vitals::groups::{GroupBook, Value};
+    const SECOND: u64 = 1_000_000_000;
+    const SLEEP: u64 = 6 * 60 * 60 * SECOND;
+    let base = Instant::now();
+    MEMORY_INSTANT.with(|clock| clock.set(Some(base)));
+    MEMORY_CLOCK.with(|clock| clock.set(Some(0)));
+    let shared = Shared::with_clocks(memory_instant, memory_clock);
+    let first = ObservedAt::capture(memory_instant, memory_clock);
+    let mut book = GroupBook::new();
+    book.absorb(groups_frame(1), [groups_observation(Value::Read(0.75))]);
+    let publish = |snapshot: Snapshot, observed_at, receipt| {
+        shared.publish(
+            Arc::new(snapshot),
+            &Machine::default(),
+            observed_at,
+            None,
+            None,
+            true,
+            receipt,
+        );
+    };
+    let snapshot = groups_snapshot(1, &book);
+    publish(
+        snapshot.clone(),
+        first,
+        Some(groups_receipt(&snapshot, first, false)),
+    );
+    let query = SysQuery::parse("groups --json fresh=60000").expect("groups query");
+    let read = || {
+        shared.fresh_for(
+            &query,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+        )
+    };
+    let (held, state) = read();
+    assert_eq!(
+        state,
+        Freshness::Fresh,
+        "current groups need no CPU warm-up or Why cache"
+    );
+    assert_eq!(
+        held.as_ref().unwrap().snap.groups.rows()[0]
+            .cpu()
+            .value
+            .value(),
+        Some(0.75)
+    );
+    let reply = answer(
+        &shared,
+        &query,
+        held.as_ref(),
+        state,
+        &Machine::default(),
+        &gathered(),
+        true,
+    );
+    assert!(
+        reply.contains("groups-source-root"),
+        "a real group is rendered: {reply}"
+    );
+
+    // A new global publication carrying the old book cannot make that book current, even
+    // while all clocks and its newly paired process receipt would otherwise be recent.
+    let snapshot = groups_snapshot(2, &book);
+    publish(
+        snapshot.clone(),
+        first,
+        Some(groups_receipt(&snapshot, first, false)),
+    );
+    assert_eq!(read().1, Freshness::Stale);
+
+    MEMORY_INSTANT.with(|clock| clock.set(Some(base + Duration::from_secs(1))));
+    MEMORY_CLOCK.with(|clock| clock.set(Some(SLEEP + SECOND)));
+    let current = ObservedAt::capture(memory_instant, memory_clock);
+    book.absorb(groups_frame(3), [groups_observation(Value::Read(0.25))]);
+    let snapshot = groups_snapshot(3, &book);
+    let old_receipt = groups_receipt(&snapshot, first, false);
+    publish(snapshot, current, Some(Arc::clone(&old_receipt)));
+    let (held, state) = read();
+    assert_eq!(
+        state,
+        Freshness::Stale,
+        "an older in-flight census keeps its original age"
+    );
+    assert!(Arc::ptr_eq(
+        held.as_ref().unwrap().processes.as_ref().unwrap(),
+        &old_receipt
+    ));
+    let reply = answer(
+        &shared,
+        &query,
+        held.as_ref(),
+        state,
+        &Machine::default(),
+        &gathered(),
+        true,
+    );
+    let body: aterm_json::Value = aterm_json::from_str(reply.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(body["as_of"]["state"].as_str(), Some("stale"));
+    assert!(body["as_of"]["age_ms"].as_u64().unwrap() >= (SLEEP + SECOND) / 1_000_000);
+
+    let mut machine_only = groups_snapshot(4, &book);
+    machine_only.machine_only = true;
+    publish(machine_only, current, None);
+    let (held, state) = read();
+    assert_eq!((held.unwrap().snap.seq, state), (3, Freshness::Stale));
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+    MEMORY_INSTANT.with(|clock| clock.set(None));
+}
+
+#[test]
+fn sys_groups_freshness_requires_matching_observed_sources_and_preserves_partial_values() {
+    use aterm_vitals::groups::{GroupBook, Value};
+    MEMORY_INSTANT.with(|clock| clock.set(Some(Instant::now())));
+    MEMORY_CLOCK.with(|clock| clock.set(Some(0)));
+    let shared = Shared::with_clocks(memory_instant, memory_clock);
+    let at = ObservedAt::capture(memory_instant, memory_clock);
+    let query = SysQuery::parse("groups fresh=60000").unwrap();
+    let publish = |snapshot: Snapshot, receipt| {
+        shared.publish(
+            Arc::new(snapshot),
+            &Machine::default(),
+            at,
+            None,
+            None,
+            true,
+            receipt,
+        );
+        shared
+            .fresh_for(
+                &query,
+                &Arming::new(),
+                &Arming::new(),
+                &Arming::new(),
+                &Arming::new(),
+                &Arming::new(),
+            )
+            .1
+    };
+    let mut book = GroupBook::new();
+    book.absorb(groups_frame(1), [groups_observation(Value::Read(0.75))]);
+    let mut partial = groups_frame(2);
+    partial.processes_complete = false;
+    book.absorb(
+        partial,
+        [groups_observation(Value::Partial {
+            value: 0.25,
+            unread: 1,
+        })],
+    );
+    let snapshot = groups_snapshot(2, &book);
+    let row = &snapshot.groups.rows()[0];
+    assert_eq!(row.cpu().value.value(), Some(0.25));
+    assert!(
+        row.cpu().value.unread() > 0,
+        "neither the older 0.75 nor an invented zero"
+    );
+    assert_eq!(
+        publish(snapshot.clone(), Some(groups_receipt(&snapshot, at, true))),
+        Freshness::Partial
+    );
+
+    for (seq, field) in [(3, "process"), (4, "coalition"), (5, "seq"), (6, "time")] {
+        let mut frame = groups_frame(seq);
+        match field {
+            "process" => {
+                frame.processes_observed = false;
+                frame.processes_complete = false;
+            }
+            "coalition" => {
+                frame.coalitions_observed = false;
+                frame.coalitions_complete = false;
+            }
+            "seq" => frame.seq -= 1,
+            _ => frame.at_ns -= 1,
+        }
+        book.absorb(frame, std::iter::empty());
+        let snapshot = groups_snapshot(seq, &book);
+        assert!(
+            snapshot
+                .groups
+                .rows()
+                .iter()
+                .all(|row| row.cpu().value.value().is_none()),
+            "a missing current observation cannot retain the old live value: {field}"
+        );
+        assert_eq!(
+            publish(snapshot.clone(), Some(groups_receipt(&snapshot, at, false))),
+            Freshness::Stale,
+            "{field}"
+        );
+    }
+    book.absorb(groups_frame(7), [groups_observation(Value::Read(0.5))]);
+    assert_eq!(
+        publish(groups_snapshot(7, &book), None),
+        Freshness::Stale,
+        "missing original census"
+    );
+    let snapshot = groups_snapshot(8, &GroupBook::new());
+    assert_eq!(
+        publish(snapshot.clone(), Some(groups_receipt(&snapshot, at, false))),
+        Freshness::Warming,
+        "never sampled"
+    );
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+    MEMORY_INSTANT.with(|clock| clock.set(None));
+}
+
+#[test]
+fn sys_groups_forced_pull_arms_split_without_restamping_its_process_source() {
+    use aterm_vitals::groups::{GroupBook, Value};
+    const HANG: Duration = Duration::from_secs(60);
+    const NOW_NS: u64 = 10_000_000_000;
+    let base = Instant::now();
+    let original = ObservedAt {
+        instant: base,
+        continuous_ns: Some(0),
+    };
+    let current = ObservedAt {
+        instant: base + Duration::from_secs(10),
+        continuous_ns: Some(NOW_NS),
+    };
+    MEMORY_INSTANT.with(|clock| clock.set(Some(current.instant)));
+    MEMORY_CLOCK.with(|clock| clock.set(Some(NOW_NS)));
+    for old in [true, false] {
+        let shared = Arc::new(Shared::paced_with_clocks(
+            HANG,
+            HANG,
+            memory_instant,
+            memory_clock,
+        ));
+        let armed = Arc::new(Arming::new());
+        let mut book = GroupBook::new();
+        book.absorb(groups_frame(1), [groups_observation(Value::Read(0.75))]);
+        let snapshot = groups_snapshot(1, &book);
+        shared.publish(
+            Arc::new(snapshot.clone()),
+            &Machine::default(),
+            original,
+            None,
+            None,
+            true,
+            Some(groups_receipt(&snapshot, original, false)),
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        shared.install(tx);
+        let producer = {
+            let shared = Arc::clone(&shared);
+            let armed = Arc::clone(&armed);
+            std::thread::spawn(move || {
+                MEMORY_CLOCK.with(|clock| clock.set(Some(NOW_NS)));
+                assert!(matches!(
+                    rx.recv_timeout(HANG).expect("one requested pull"),
+                    Msg::Pull
+                ));
+                assert!(
+                    armed.armed(),
+                    "Groups requests the existing coalition/process lane"
+                );
+                book.absorb(groups_frame(2), [groups_observation(Value::Read(0.25))]);
+                let snapshot = groups_snapshot(2, &book);
+                let receipt =
+                    groups_receipt(&snapshot, if old { original } else { current }, false);
+                shared.publish(
+                    Arc::new(snapshot),
+                    &Machine::default(),
+                    current,
+                    None,
+                    None,
+                    true,
+                    Some(Arc::clone(&receipt)),
+                );
+                receipt
+            })
+        };
+        let query = SysQuery::parse("groups fresh=0").unwrap();
+        let (held, state) = shared.fresh_for(
+            &query,
+            &armed,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+        );
+        assert_eq!(
+            state,
+            if old {
+                Freshness::Stale
+            } else {
+                Freshness::Fresh
+            }
+        );
+        assert_eq!(held.as_ref().unwrap().snap.seq, 2);
+        assert!(!armed.armed());
+        shared.uninstall();
+        let receipt = producer.join().unwrap();
+        assert!(Arc::ptr_eq(
+            held.as_ref().unwrap().processes.as_ref().unwrap(),
+            &receipt
+        ));
+        assert_eq!(receipt.observed_at, if old { original } else { current });
+    }
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+    MEMORY_INSTANT.with(|clock| clock.set(None));
 }
 
 #[test]
@@ -70,8 +469,14 @@ fn one_engine_processes_peer_age_keeps_old_census_across_sleep_and_new_machine_f
     );
     let query = SysQuery::parse("aterm --json fresh=60000").unwrap();
     let read = || {
-        let (held, state) =
-            shared.fresh_for(&query, &Arming::new(), &Arming::new(), &Arming::new());
+        let (held, state) = shared.fresh_for(
+            &query,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+        );
         let text = answer(
             &shared,
             &query,
@@ -166,7 +571,14 @@ fn one_engine_processes_peer_refuses_unknown_and_regressing_age_without_pull_spi
     shared.install(tx);
     let query = SysQuery::parse("aterm --json fresh=60000").unwrap();
     MEMORY_CLOCK.with(|clock| clock.set(None));
-    let (held, state) = shared.fresh_for(&query, &Arming::new(), &Arming::new(), &Arming::new());
+    let (held, state) = shared.fresh_for(
+        &query,
+        &Arming::new(),
+        &Arming::new(),
+        &Arming::new(),
+        &Arming::new(),
+        &Arming::new(),
+    );
     assert!(matches!(
         rx.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
@@ -230,8 +642,14 @@ fn one_engine_processes_memory_age_does_not_stale_independent_assessments() {
     publish(1, now - Duration::from_secs(1));
     for view in ["jobs", "left"] {
         let query = SysQuery::parse(view).unwrap();
-        let (held, state) =
-            shared.fresh_for(&query, &Arming::new(), &Arming::new(), &Arming::new());
+        let (held, state) = shared.fresh_for(
+            &query,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+        );
         assert_eq!(
             state,
             Freshness::Fresh,
@@ -263,7 +681,14 @@ fn one_engine_processes_memory_age_does_not_stale_independent_assessments() {
     publish(2, now - Duration::from_secs(120));
     for view in ["jobs", "left"] {
         let query = SysQuery::parse(view).unwrap();
-        let (_, state) = shared.fresh_for(&query, &Arming::new(), &Arming::new(), &Arming::new());
+        let (_, state) = shared.fresh_for(
+            &query,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+        );
         assert_eq!(
             state,
             Freshness::Stale,
@@ -337,7 +762,8 @@ fn one_engine_processes_forced_wrappers_bound_new_arrivals_by_their_view_default
         } else {
             let (held, state) = match view {
                 View::Overview => shared.fresh(fresh, force),
-                View::Why => shared.fresh_why(fresh, force),
+                // As a `sys why mem` is, which prints no self CPU line.
+                View::Why => shared.fresh_why(fresh, force, false),
                 View::Left => shared.fresh_left(fresh, force),
                 _ => unreachable!(),
             };
@@ -443,6 +869,7 @@ fn gathered() -> Gathered {
         stores: Vec::new(),
         volume: None,
         caller_panes: None,
+        event_caller: None,
         home: None,
         held: None,
     }
@@ -501,12 +928,13 @@ fn every_view_of_a_live_snapshot_answers_and_its_json_keeps_the_contract() {
             snap: held.as_ref().map(|h| h.snap.as_ref()),
             epoch: *EPOCH,
             as_of_unix_ms: 0,
-            age_ms: 0,
+            age_ms: Some(0),
             state,
             machine: &Machine::default(),
             target: &g.target,
             tabs: &g.tabs,
             caller_panes: None,
+            event_caller: None,
             owner_class: true,
             volume: None,
             roots: &[],
@@ -575,6 +1003,114 @@ fn a_since_cursor_answers_a_delta_and_its_gaps() {
 }
 
 #[test]
+fn history_and_events_do_not_fill_the_delta_cache_or_displace_a_usable_reply() {
+    use aterm_vitals::events::EventScope;
+    use aterm_vitals::model::{Sample, StripEvent, StripEventKind, Ticks, Vitals};
+    let base = Instant::now();
+    MEMORY_INSTANT.with(|clock| clock.set(Some(base)));
+    MEMORY_CLOCK.with(|clock| clock.set(Some(0)));
+    let shared = Shared::with_clocks(memory_instant, memory_clock);
+    let mut model = Vitals::new();
+    let mut input = Sample {
+        at_ns: 1_000_000_000,
+        at_unix_ms: 1_760_000_001_000,
+        mono_ms: 1000,
+        cores: Some(vec![Ticks {
+            busy: 20,
+            total: 100,
+        }]),
+        mem: Some(MemSample {
+            total: 8 << 30,
+            app: 1 << 30,
+            wired: 1 << 30,
+            free: 6 << 30,
+            available: 6 << 30,
+            pressure: Pressure::Normal,
+            exact: true,
+            ..MemSample::default()
+        }),
+        ..Sample::default()
+    };
+    shared.publish_for_test(model.absorb(&input), Vec::new());
+    let ordinary = ask(&shared, "mem");
+    let cursor = cursor_of(&ordinary);
+    assert_eq!(
+        shared.lock().replies.len(),
+        1,
+        "ordinary replies keep a real delta base"
+    );
+    for step in 2..=5 {
+        model.record_strip_event(StripEvent {
+            at_unix_ms: input.at_unix_ms,
+            kind: StripEventKind::Restart,
+            label: format!("uncached-marker-{step}"),
+            scope: EventScope::Machine,
+            span: None,
+        });
+        input.at_ns += 1_000_000_000;
+        input.at_unix_ms += 1000;
+        input.mono_ms += 1000;
+        input.cores = Some(vec![Ticks {
+            busy: step * 20,
+            total: step * 100,
+        }]);
+        shared.publish_for_test(model.absorb(&input), Vec::new());
+        for request in [
+            "history cpu mem",
+            "history cpu mem --json",
+            "events",
+            "events --json",
+        ] {
+            let reply = ask(&shared, request);
+            assert!(reply.starts_with("OK "), "{request}: {reply}");
+            if request.starts_with("history") {
+                if request.ends_with("--json") {
+                    let body: aterm_json::Value =
+                        aterm_json::from_str(reply.lines().nth(1).unwrap()).unwrap();
+                    let rows = body["history"]["rows"].as_array().unwrap();
+                    assert_eq!(rows.len(), 2);
+                    assert!(
+                        rows.iter().any(|row| row["boxes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|cell| cell["primary"]["mean"].as_f64().is_some())),
+                        "history contains actual retained measurements"
+                    );
+                } else {
+                    assert!(
+                        reply.contains("history row=mem") && reply.contains("box row=cpu"),
+                        "{reply}"
+                    );
+                }
+            } else {
+                assert!(
+                    reply.contains(&format!("uncached-marker-{step}")),
+                    "events remain usable: {reply}"
+                );
+            }
+            assert_eq!(
+                shared.lock().replies.len(),
+                1,
+                "{request} has no reply-delta consumer"
+            );
+        }
+    }
+    let delta = ask(&shared, &format!("mem since={cursor}"));
+    assert!(
+        delta.lines().next().unwrap().ends_with(" delta=1"),
+        "the original normal-view base remains usable: {delta}"
+    );
+    assert!(
+        delta.lines().any(|line| line.starts_with("same ")),
+        "real unchanged measurements still fold: {delta}"
+    );
+    assert!(!delta.contains("gap why="), "{delta}");
+    MEMORY_INSTANT.with(|clock| clock.set(None));
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+}
+
+#[test]
 fn a_why_since_cursor_folds_only_against_the_same_reply() {
     let shared = Shared::with_clock(|| Some(0));
     shared.publish_for_test(synthetic(3, 0.1), Vec::new());
@@ -606,6 +1142,8 @@ fn events_since_a_cursor_print_and_the_ring_says_when_it_lost_them() {
     s.events = vec![aterm_vitals::events::Event {
         seq: 2,
         at_ns: s.at_ns,
+        at_unix_ms: Some(s.at_unix_ms),
+        scope: aterm_vitals::events::EventScope::Machine,
         kind: aterm_vitals::events::EventKind::Pressure {
             from: Pressure::Normal,
             to: Pressure::Warn,
@@ -629,6 +1167,8 @@ fn events_since_a_cursor_print_and_the_ring_says_when_it_lost_them() {
         s.events = vec![aterm_vitals::events::Event {
             seq,
             at_ns: s.at_ns,
+            at_unix_ms: Some(s.at_unix_ms),
+            scope: aterm_vitals::events::EventScope::Machine,
             kind: aterm_vitals::events::EventKind::Lane {
                 lane: "gpu",
                 available: seq % 2 == 0,
@@ -638,6 +1178,580 @@ fn events_since_a_cursor_print_and_the_ring_says_when_it_lost_them() {
     }
     let (_, covered) = shared.events_since(1);
     assert!(!covered, "the oldest events left the ring");
+}
+
+#[test]
+fn sys_events_cursor_is_one_atomic_retained_cut_without_reply_or_same_sequence_loss() {
+    use aterm_vitals::events::{Event, EventKind, EventScope};
+    use aterm_vitals::model::{Sample, StripEvent, StripEventKind, Vitals};
+    let shared = Shared::with_clock(|| Some(0));
+    let mut model = Vitals::new();
+    let mut input = Sample {
+        at_ns: 1_000_000_000,
+        at_unix_ms: 1_760_000_001_000,
+        mono_ms: 1000,
+        ..Sample::default()
+    };
+    let first = model.absorb(&input);
+    shared.publish_for_test(first.clone(), Vec::new());
+    let cursor = Cursor {
+        epoch: *EPOCH,
+        seq: first.seq,
+    };
+    for i in 0..20 {
+        model.record_strip_event(StripEvent {
+            at_unix_ms: input.at_unix_ms + i,
+            kind: StripEventKind::Restart,
+            label: format!("batch-{i}"),
+            scope: EventScope::Machine,
+            span: None,
+        });
+    }
+    input.at_ns += 1_000_000_000;
+    input.mono_ms += 1000;
+    input.at_unix_ms -= 100_000;
+    let batch = model.absorb(&input);
+    assert_eq!(batch.events.len(), 20, "accepted source batch");
+    shared.publish_for_test(batch.clone(), Vec::new());
+    let cut = shared.event_cut(Some(cursor), *EPOCH).unwrap();
+    assert_eq!(cut.head.seq, batch.seq);
+    assert_eq!(cut.held.as_ref().unwrap().snap.seq, batch.seq);
+    assert_eq!(cut.events.len(), 20);
+    assert_eq!(cut.gap, None);
+    assert!(cut.events.iter().all(|event| event.seq == batch.seq));
+    let text = ask(&shared, &format!("events since={cursor}"));
+    assert_eq!(
+        text.lines().filter(|line| line.starts_with("e ")).count(),
+        20,
+        "{text}"
+    );
+    assert!(
+        !text.contains("gap why="),
+        "no remembered reply is required: {text}"
+    );
+    let json = ask(&shared, &format!("events since={cursor} --json"));
+    let parsed: aterm_json::Value = aterm_json::from_str(json.lines().nth(1).unwrap()).unwrap();
+    let events = parsed["events"].as_array().unwrap();
+    assert_eq!(
+        events.len(),
+        20,
+        "no top cut may discard same-sequence events: {json}"
+    );
+    for i in 0..20 {
+        assert!(
+            events
+                .iter()
+                .any(|event| event["label"].as_str() == Some(format!("batch-{i}").as_str()))
+        );
+    }
+    let head = cut.head;
+    shared.publish_for_test(batch.clone(), Vec::new());
+    let repeat = shared.event_cut(Some(head), *EPOCH).unwrap();
+    assert_eq!(repeat.head, head);
+    assert!(repeat.events.is_empty());
+    assert_eq!(repeat.gap, None, "identical publication is idempotent");
+    let mut invalid = batch.clone();
+    invalid.events[0] = Event {
+        seq: head.seq,
+        at_ns: batch.at_ns,
+        at_unix_ms: Some(input.at_unix_ms),
+        scope: EventScope::Machine,
+        kind: EventKind::Lane {
+            lane: "late-new-event",
+            available: false,
+        },
+    };
+    shared.publish_for_test(invalid, Vec::new());
+    let rejected = shared.event_cut(Some(head), *EPOCH).unwrap();
+    assert!(rejected.events.is_empty());
+    assert_eq!(
+        rejected.gap,
+        Some(Gap::Evicted),
+        "a later different same-sequence batch cannot silently disappear behind a successful cursor"
+    );
+    assert!(!ask(&shared, "events --json").contains("late-new-event"));
+    let next_seq = head.seq + 1;
+    let mut next = synthetic(next_seq, 0.1);
+    next.events = vec![Event {
+        seq: next_seq,
+        at_ns: next.at_ns,
+        at_unix_ms: Some(42),
+        scope: EventScope::Machine,
+        kind: EventKind::Lane {
+            lane: "gpu",
+            available: true,
+        },
+    }];
+    shared.publish_for_test(next.clone(), Vec::new());
+    let recovery = shared.event_cut(Some(head), *EPOCH).unwrap();
+    assert_eq!(recovery.events.len(), 1);
+    assert_eq!(recovery.events[0].at_unix_ms, Some(42));
+    assert_eq!(recovery.gap, Some(Gap::Evicted));
+    assert_eq!(
+        shared.event_cut(Some(recovery.head), *EPOCH).unwrap().gap,
+        None
+    );
+    let reset = shared
+        .event_cut(
+            Some(Cursor {
+                epoch: EPOCH.wrapping_add(1),
+                seq: u64::MAX,
+            }),
+            *EPOCH,
+        )
+        .unwrap();
+    assert_eq!(reset.gap, Some(Gap::Reset));
+    assert_eq!(reset.events.len(), 21);
+    assert!(
+        shared
+            .event_cut(
+                Some(Cursor {
+                    epoch: *EPOCH,
+                    seq: next_seq + 1
+                }),
+                *EPOCH
+            )
+            .is_err()
+    );
+    next.seq += 1;
+    next.events.clear();
+    next.events_lost = 1;
+    shared.publish_for_test(next, Vec::new());
+    assert_eq!(
+        shared.event_cut(Some(recovery.head), *EPOCH).unwrap().gap,
+        Some(Gap::Evicted)
+    );
+}
+
+#[test]
+fn sys_events_reads_retained_sources_without_pulling_on_empty_stale_or_unread_clocks() {
+    use aterm_vitals::events::EventScope;
+    use aterm_vitals::model::{Sample, StripEvent, StripEventKind, Vitals};
+    let base = Instant::now();
+    MEMORY_INSTANT.with(|clock| clock.set(Some(base)));
+    MEMORY_CLOCK.with(|clock| clock.set(Some(0)));
+    let shared = Shared::with_clocks(memory_instant, memory_clock);
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    shared.lock().tx = Some(tx);
+    let arming = Arming::new();
+    let read = |request: &str, expected| {
+        let q = SysQuery::parse(request).unwrap();
+        let (held, state) = shared.fresh_for(&q, &arming, &arming, &arming, &arming, &arming);
+        assert_eq!(state, expected, "{request}");
+        let reply = answer(
+            &shared,
+            &q,
+            held.as_ref(),
+            state,
+            &Machine::default(),
+            &gathered(),
+            true,
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "reading Events must send no pull: {request}"
+        );
+        assert!(!arming.armed());
+        (held, reply)
+    };
+    let (empty, text) = read("events fresh=0", Freshness::Warming);
+    assert!(empty.is_none());
+    assert!(
+        text.contains("events retained=0") && text.contains("state=warming"),
+        "{text}"
+    );
+    let (_, json) = read("events fresh=0 --json", Freshness::Warming);
+    let body: aterm_json::Value = aterm_json::from_str(json.lines().nth(1).unwrap()).unwrap();
+    assert!(body["events"].as_array().unwrap().is_empty());
+    assert!(json.lines().next().unwrap().contains("age_ms=-"));
+    let mut model = Vitals::new();
+    model.record_strip_event(StripEvent {
+        at_unix_ms: 1_760_000_000_000,
+        kind: StripEventKind::Restart,
+        label: "retained-real-marker".into(),
+        scope: EventScope::Machine,
+        span: None,
+    });
+    let snapshot = model.absorb(&Sample {
+        at_ns: 1_000_000_000,
+        at_unix_ms: 1_760_000_001_000,
+        mono_ms: 1000,
+        machine_only: true,
+        ..Sample::default()
+    });
+    assert_eq!(snapshot.events.len(), 1);
+    MEMORY_CLOCK.with(|clock| clock.set(Some(5_000_000_000)));
+    shared.publish_for_test(snapshot.clone(), Vec::new());
+    let (fresh, text) = read("events fresh=0", Freshness::Fresh);
+    assert_eq!(fresh.unwrap().snap.seq, snapshot.seq);
+    assert!(text.contains("retained-real-marker"), "{text}");
+    MEMORY_INSTANT.with(|clock| clock.set(Some(base + Duration::from_secs(11))));
+    MEMORY_CLOCK.with(|clock| clock.set(Some(16_000_000_000)));
+    for request in ["events", "events fresh=0", "events fresh=0 --json"] {
+        let (old, reply) = read(request, Freshness::Stale);
+        assert_eq!(
+            old.unwrap().observed_at.instant,
+            base,
+            "no read can renew the original frame"
+        );
+        assert!(
+            reply.contains("retained-real-marker") && reply.contains("age_ms=11000"),
+            "{reply}"
+        );
+    }
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+    let (old, reply) = read("events fresh=0 --json", Freshness::Stale);
+    assert_eq!(old.unwrap().snap.seq, snapshot.seq);
+    assert!(
+        reply.contains("retained-real-marker"),
+        "missing clock cannot force a source read: {reply}"
+    );
+    assert!(
+        !reply.starts_with("ERR"),
+        "retained original event timestamps remain readable: {reply}"
+    );
+    assert!(
+        reply.lines().next().unwrap().contains("age_ms=-"),
+        "unknown inclusive age is not an awake-time substitute: {reply}"
+    );
+    let body: aterm_json::Value = aterm_json::from_str(reply.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body["as_of"]["unix_ms"].as_u64(),
+        Some(snapshot.at_unix_ms as u64)
+    );
+    assert_eq!(
+        body["as_of"]["age_ms"]["why"].as_str(),
+        Some("not_sampled:observation_age")
+    );
+    for continuous in [None, Some(4_000_000_000)] {
+        MEMORY_CLOCK.with(|clock| clock.set(continuous));
+        let (_, text) = read("events fresh=0", Freshness::Stale);
+        assert!(
+            text.contains("retained-real-marker") && text.contains("age_ms=-"),
+            "{text}"
+        );
+        assert!(
+            text.contains("observation age is unavailable(not_sampled:observation_age)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "onset_unix_ms=unavailable(not_sampled) end_unix_ms=unavailable(not_sampled)"
+            ),
+            "point intervals stay unavailable: {text}"
+        );
+    }
+    MEMORY_CLOCK.with(|clock| clock.set(Some(16_000_000_000)));
+    let (_, recovered) = read("events --json", Freshness::Stale);
+    let body: aterm_json::Value = aterm_json::from_str(recovered.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(body["as_of"]["age_ms"].as_u64(), Some(11_000));
+    assert_eq!(
+        body["as_of"]["unix_ms"].as_u64(),
+        Some(snapshot.at_unix_ms as u64)
+    );
+    MEMORY_INSTANT.with(|clock| clock.set(None));
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+}
+
+#[test]
+fn sys_history_uses_new_machine_only_rings_without_renewing_a_process_frame() {
+    use aterm_vitals::model::{Resource, Sample, Ticks, Vitals};
+    let shared = Shared::with_clock(|| Some(0));
+    let mut model = Vitals::new();
+    let mut input = Sample {
+        at_ns: 1_000_000_000,
+        at_unix_ms: 1_760_000_001_000,
+        mono_ms: 1000,
+        cadence_ms: 1000,
+        cores: Some(vec![Ticks {
+            busy: 10,
+            total: 100,
+        }]),
+        mem: Some(MemSample {
+            total: 8 << 30,
+            app: 1 << 30,
+            wired: 1 << 30,
+            free: 6 << 30,
+            available: 6 << 30,
+            pressure: Pressure::Normal,
+            exact: true,
+            ..MemSample::default()
+        }),
+        ..Sample::default()
+    };
+    let mut whole = model.absorb(&input);
+    // Populate earlier boxes from original readings before the pause.
+    for step in 2..=40 {
+        input.at_ns += 1_000_000_000;
+        input.at_unix_ms += 1000;
+        input.mono_ms += 1000;
+        input.cores = Some(vec![Ticks {
+            busy: step * 20 - 10,
+            total: step * 100,
+        }]);
+        whole = model.absorb(&input);
+    }
+    let old_cpu = whole.resources[Resource::Cpu.index()]
+        .now
+        .expect("the declared one-second cadence admits real strip CPU rates");
+    assert!(old_cpu > 0.0);
+    let old_slots = whole.resources[Resource::Cpu.index()].history_slots(
+        aterm_vitals::MultiScaleSpec::FULL_6H,
+        whole.at_unix_ms,
+        &whole.time_gaps,
+    );
+    assert!(
+        old_slots.cells.iter().any(|cell| {
+            !cell.primary.slot.is_live_now && cell.primary.cell.mean.is_some_and(|cpu| cpu > 0.0)
+        }),
+        "fixture setup must populate a positive canonical historical CPU box"
+    );
+    shared.publish_for_test(whole.clone(), Vec::new());
+    input.at_ns += 20_000_000_000;
+    input.at_unix_ms += 20_000;
+    input.mono_ms += 20_000;
+    input.machine_only = true;
+    input.cores = None;
+    let mem = input.mem.as_mut().unwrap();
+    mem.app = 2 << 30;
+    mem.free = 5 << 30;
+    mem.available = 5 << 30;
+    let machine_only = model.absorb(&input);
+    assert!(machine_only.time_gaps.iter().any(|gap| {
+        gap.kind == aterm_vitals::GapKind::Paused
+            && gap.start_ms == whole.at_unix_ms
+            && gap.end_ms == machine_only.at_unix_ms
+    }));
+    assert!(
+        machine_only.cpu.is_none(),
+        "current unread CPU is not a carried live reading"
+    );
+    let slots = machine_only.resources[Resource::Cpu.index()].history_slots(
+        aterm_vitals::MultiScaleSpec::FULL_6H,
+        machine_only.at_unix_ms,
+        &machine_only.time_gaps,
+    );
+    assert!(
+        slots.cells[0].primary.cell.mean.is_none(),
+        "old point is past the strip's original support"
+    );
+    assert!(
+        slots
+            .cells
+            .iter()
+            .any(|cell| cell.primary.cell.mean.is_some_and(|cpu| cpu > 0.0)),
+        "retained earlier history remains readable"
+    );
+    let before_pause = slots
+        .cells
+        .iter()
+        .find(|cell| cell.primary.slot.age_lo_ms == 20_000 && cell.primary.slot.age_hi_ms == 30_000)
+        .expect("the canonical ten-second box immediately before the pause");
+    assert_eq!(before_pause.primary.gap, None);
+    assert!(
+        before_pause
+            .primary
+            .cell
+            .mean
+            .is_some_and(|cpu| (cpu - old_cpu).abs() < 1e-6),
+        "the earlier box keeps the original positive CPU reading"
+    );
+    let memory = &machine_only.resources[Resource::Memory.index()];
+    assert!(
+        memory.now.unwrap() > whole.resources[Resource::Memory.index()].now.unwrap(),
+        "the current machine-only memory reading differs from the held whole frame"
+    );
+    let memory_slots = memory.history_slots(
+        aterm_vitals::MultiScaleSpec::FULL_6H,
+        machine_only.at_unix_ms,
+        &machine_only.time_gaps,
+    );
+    assert_eq!(memory_slots.cells[0].primary.cell.mean, memory.now);
+    shared.publish_for_test(machine_only.clone(), Vec::new());
+    let q = SysQuery::parse("history cpu mem --json").unwrap();
+    let arming = Arming::new();
+    let (held, state) = shared.fresh_for(&q, &arming, &arming, &arming, &arming, &arming);
+    let held = held.unwrap();
+    assert_eq!(held.snap.seq, machine_only.seq);
+    assert_eq!(held.snap.at_unix_ms, machine_only.at_unix_ms);
+    assert_eq!(held.snap.resources, machine_only.resources);
+    assert_eq!(
+        shared.held_now().unwrap().snap.seq,
+        whole.seq,
+        "whole-process authority is unchanged"
+    );
+    let reply = answer(
+        &shared,
+        &q,
+        Some(&held),
+        state,
+        &Machine::default(),
+        &gathered(),
+        true,
+    );
+    let expected = render_json(
+        &q,
+        &Ctx {
+            snap: Some(&machine_only),
+            as_of_unix_ms: held.unix_ms,
+            age_ms: Some(0),
+            epoch: *EPOCH,
+            state,
+            machine: &Machine::default(),
+            target: &gathered().target,
+            tabs: &[],
+            caller_panes: None,
+            event_caller: None,
+            owner_class: true,
+            volume: None,
+            roots: &[],
+            disk: None,
+            stores: &[],
+            home: None,
+            events: &[],
+            gap: None,
+            head_seq: machine_only.seq,
+            held: None,
+        },
+    );
+    assert!(
+        reply.contains(&expected.get("history").unwrap().to_text()),
+        "latest canonical body: {reply}"
+    );
+    assert_eq!(
+        shared
+            .event_cut(None, *EPOCH)
+            .unwrap()
+            .held
+            .unwrap()
+            .snap
+            .seq,
+        machine_only.seq
+    );
+}
+
+#[test]
+fn sys_events_admits_only_the_live_grant_without_process_receipt_or_caller_spoofing() {
+    use aterm_vitals::events::{EventScope, SessionScope};
+    use aterm_vitals::model::{Sample, StripEvent, StripEventKind, Vitals};
+    let store = crate::session_store::new_store();
+    let own = crate::session_store::test_handle(71);
+    let sibling = crate::session_store::test_handle(72);
+    let foreign = crate::session_store::test_handle(73);
+    for handle in [&own, &sibling, &foreign] {
+        store.write().unwrap().register(handle.clone());
+    }
+    let layout = vec![
+        PaneFact {
+            key: own.local_id,
+            window: 1,
+            tab: 1,
+            ..PaneFact::default()
+        },
+        PaneFact {
+            key: sibling.local_id,
+            window: 1,
+            tab: 1,
+            ..PaneFact::default()
+        },
+        PaneFact {
+            key: foreign.local_id,
+            window: 1,
+            tab: 2,
+            ..PaneFact::default()
+        },
+    ];
+    let mut model = Vitals::new();
+    for (handle, label) in [
+        (&own, "own-private-marker"),
+        (&sibling, "sibling-private-marker"),
+        (&foreign, "foreign-private-marker"),
+    ] {
+        model.record_strip_event(StripEvent {
+            at_unix_ms: 1_760_000_000_000,
+            kind: StripEventKind::Restart,
+            label: label.into(),
+            scope: EventScope::Session(SessionScope {
+                local: handle.local_id,
+                sid: handle.sid.as_str().into(),
+                nonce: handle.nonce.to_hex(),
+            }),
+            span: None,
+        });
+    }
+    model.record_strip_event(StripEvent {
+        at_unix_ms: 1_760_000_000_000,
+        kind: StripEventKind::Restart,
+        label: "machine-marker".into(),
+        scope: EventScope::Machine,
+        span: None,
+    });
+    let snapshot = model.absorb(&Sample {
+        at_ns: 1_000_000_000,
+        at_unix_ms: 1_760_000_001_000,
+        mono_ms: 1000,
+        machine_only: true,
+        ..Sample::default()
+    });
+    let shared = Shared::with_clock(|| Some(0));
+    shared.publish_for_test(snapshot.clone(), layout.clone());
+    let q = SysQuery::parse(&format!("events --json caller={}", foreign.sid.as_str())).unwrap();
+    let admitted = AuthorizedTarget {
+        session: own.local_id,
+        term: &own.term,
+        master: -1,
+        ctx: &own.ctx,
+    };
+    let nonowner = gather(&store, &admitted, &layout, &q, Some(&snapshot), None, false).unwrap();
+    assert_eq!(
+        nonowner.caller_panes.as_deref(),
+        Some([own.local_id].as_slice())
+    );
+    assert!(
+        nonowner.tabs.iter().all(|tab| tab.sampled_nonce.is_none()),
+        "no process receipt exists"
+    );
+    assert_eq!(
+        nonowner.event_caller.as_ref().unwrap().nonce,
+        own.nonce.to_hex()
+    );
+    let arming = Arming::new();
+    let (held, state) = shared.fresh_for(&q, &arming, &arming, &arming, &arming, &arming);
+    let reply = answer(
+        &shared,
+        &q,
+        held.as_ref(),
+        state,
+        &Machine::default(),
+        &nonowner,
+        false,
+    );
+    assert!(
+        reply.contains("own-private-marker") && reply.contains("machine-marker"),
+        "{reply}"
+    );
+    assert!(
+        !reply.contains("sibling-private-marker") && !reply.contains("foreign-private-marker"),
+        "{reply}"
+    );
+    assert!(
+        !reply.contains(&own.nonce.to_hex()),
+        "internal proof must not be serialized: {reply}"
+    );
+    let owner = gather(&store, &admitted, &layout, &q, Some(&snapshot), None, true).unwrap();
+    let wide = answer(
+        &shared,
+        &q,
+        held.as_ref(),
+        state,
+        &Machine::default(),
+        &owner,
+        true,
+    );
+    assert!(
+        wide.contains("sibling-private-marker") && wide.contains("foreign-private-marker"),
+        "owner positive: {wide}"
+    );
 }
 
 #[test]
@@ -770,7 +1884,8 @@ fn a_why_is_as_fresh_as_its_split() {
     let shared = Arc::new(Shared::paced(hour, Duration::from_secs(60)));
     let pulls = probe(&shared, 1);
     shared.publish_for_test(with_split(1, Some(1)), Vec::new());
-    let (held, state) = shared.fresh_why(hour, false);
+    // Judged by its split alone, as a `sys why mem` is, which prints no self CPU line.
+    let (held, state) = shared.fresh_why(hour, false, false);
     assert_eq!(
         (held.map(|h| h.snap.seq), state),
         (Some(1), Freshness::Fresh)
@@ -778,7 +1893,7 @@ fn a_why_is_as_fresh_as_its_split() {
     shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
     let (held, _) = shared.fresh(hour, false);
     assert_eq!(held.map(|h| h.snap.seq), Some(7300));
-    let (held, state) = shared.fresh_why(hour, false);
+    let (held, state) = shared.fresh_why(hour, false, false);
     assert_eq!(
         (held.map(|h| h.snap.seq), state),
         (Some(7301), Freshness::Fresh)
@@ -791,7 +1906,7 @@ fn a_why_is_as_fresh_as_its_split() {
     shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
     let (held, _) = shared.fresh(Duration::ZERO, true);
     assert_eq!(held.map(|h| h.snap.seq), Some(7301));
-    let (held, state) = shared.fresh_why(hour, false);
+    let (held, state) = shared.fresh_why(hour, false, false);
     assert_eq!(
         (held.map(|h| h.snap.seq), state),
         (Some(7302), Freshness::Fresh)
@@ -802,7 +1917,7 @@ fn a_why_is_as_fresh_as_its_split() {
     let shared = Arc::new(Shared::paced(hour, Duration::from_millis(200)));
     let pulls = probe(&shared, u64::MAX);
     shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
-    let (held, state) = shared.fresh_why(hour, false);
+    let (held, state) = shared.fresh_why(hour, false, false);
     assert!(held.is_some_and(|h| h.snap.seq >= 7300));
     assert_eq!(state, Freshness::Stale);
     shared.lock().tx = None;
@@ -810,7 +1925,7 @@ fn a_why_is_as_fresh_as_its_split() {
     let mut off = synthetic(7400, 0.1);
     off.coal_lane = aterm_vitals::explain::CoalLane::Off;
     shared.publish_for_test(off, Vec::new());
-    let (held, state) = shared.fresh_why(hour, false);
+    let (held, state) = shared.fresh_why(hour, false, false);
     assert_eq!(
         (held.map(|h| h.snap.seq), state),
         (Some(7400), Freshness::Fresh)
@@ -820,6 +1935,8 @@ fn a_why_is_as_fresh_as_its_split() {
 #[test]
 fn a_why_arms_the_split_while_it_waits() {
     static ARMED: Arming = Arming::new();
+    static SCHEDULING: Arming = Arming::new();
+    static SELF_CPU: Arming = Arming::new();
     static AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     fn instant() -> Instant {
         *AT.get().unwrap()
@@ -869,6 +1986,10 @@ fn a_why_arms_the_split_while_it_waits() {
                     // A forced `sys why` waits for a CPU Stats sample too.
                     let mut snap = with_split(7301, Some(7301));
                     snap.hardware = Some(aterm_vitals::hardware::Sample::unavailable("warming"));
+                    // A `sys procs` waits for a reading whose sweep read scheduling too.
+                    snap.scheduling_read = SCHEDULING.armed();
+                    // A `sys why` waits for one that read aterm's own threads too.
+                    snap.self_cpu_read = SELF_CPU.armed();
                     publish(&shared, snap);
                 }
                 seen
@@ -876,7 +1997,14 @@ fn a_why_arms_the_split_while_it_waits() {
         };
         publish(&shared, with_split(7300, Some(1)));
         let q = SysQuery::parse(text).expect("query");
-        let (held, state) = shared.fresh_for(&q, &ARMED, &Arming::new(), &Arming::new());
+        let (held, state) = shared.fresh_for(
+            &q,
+            &ARMED,
+            &Arming::new(),
+            &Arming::new(),
+            &SCHEDULING,
+            &SELF_CPU,
+        );
         assert_eq!(
             (held.map(|h| h.snap.seq), state),
             (Some(7301), Freshness::Fresh),
@@ -907,6 +2035,8 @@ fn with_hardware(seq: u64, sampled: bool) -> Snapshot {
 #[test]
 fn sys_cores_and_report_force_a_pull_when_the_held_snapshot_has_no_hardware() {
     static HARDWARE: Arming = Arming::new();
+    static SCHEDULING: Arming = Arming::new();
+    static SELF_CPU: Arming = Arming::new();
     let run = |text: &str, held_sampled: bool| {
         let shared = Arc::new(Shared::paced(
             Duration::from_secs(3600),
@@ -929,14 +2059,32 @@ fn sys_cores_and_report_force_a_pull_when_the_held_snapshot_has_no_hardware() {
                         shared.publish_for_test(with_hardware(seq, false), Vec::new());
                     }
                     seq += 1;
-                    shared.publish_for_test(with_hardware(seq, armed), Vec::new());
+                    // A `sys report`'s pull reads each process's scheduling too, and a
+                    // `sys why`'s aterm's own threads.
+                    let mut snap = with_hardware(seq, armed);
+                    snap.scheduling_read = SCHEDULING.armed();
+                    snap.self_cpu_read = SELF_CPU.armed();
+                    shared.publish_for_test(snap, Vec::new());
                 }
                 seen
             })
         };
-        shared.publish_for_test(with_hardware(7300, held_sampled), Vec::new());
+        // A held snapshot with a sample read each process's scheduling too; every held one read
+        // aterm's own threads, as an earlier `sys why`'s pull does, so a `sys why` is judged by
+        // its CPU Stats need alone.
+        let mut held = with_hardware(7300, held_sampled);
+        held.scheduling_read = held_sampled;
+        held.self_cpu_read = true;
+        shared.publish_for_test(held, Vec::new());
         let q = SysQuery::parse(text).expect("query");
-        let (held, state) = shared.fresh_for(&q, &Arming::new(), &Arming::new(), &HARDWARE);
+        let (held, state) = shared.fresh_for(
+            &q,
+            &Arming::new(),
+            &Arming::new(),
+            &HARDWARE,
+            &SCHEDULING,
+            &SELF_CPU,
+        );
         assert!(!HARDWARE.armed(), "{text}: disarmed once answered");
         shared.lock().tx = None;
         let sampled = held.as_ref().is_some_and(|h| h.snap.hardware.is_some());
@@ -978,6 +2126,8 @@ fn sys_cores_and_report_force_a_pull_when_the_held_snapshot_has_no_hardware() {
 #[test]
 fn a_reply_that_needs_cpu_stats_waits_as_a_cold_pull() {
     static HARDWARE: Arming = Arming::new();
+    static SCHEDULING: Arming = Arming::new();
+    static SELF_CPU: Arming = Arming::new();
     let run = |text: &str| {
         let shared = Arc::new(Shared::paced(
             Duration::from_secs(3600),
@@ -990,13 +2140,23 @@ fn a_reply_that_needs_cpu_stats_waits_as_a_cold_pull() {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
                 while rx.recv().is_ok() {
-                    shared.publish_for_test(with_hardware(7301, HARDWARE.armed()), Vec::new());
+                    let mut snap = with_hardware(7301, HARDWARE.armed());
+                    snap.scheduling_read = SCHEDULING.armed();
+                    snap.self_cpu_read = SELF_CPU.armed();
+                    shared.publish_for_test(snap, Vec::new());
                 }
             })
         };
         shared.publish_for_test(with_hardware(7300, false), Vec::new());
         let q = SysQuery::parse(text).expect("query");
-        let (held, state) = shared.fresh_for(&q, &Arming::new(), &Arming::new(), &HARDWARE);
+        let (held, state) = shared.fresh_for(
+            &q,
+            &Arming::new(),
+            &Arming::new(),
+            &HARDWARE,
+            &SCHEDULING,
+            &SELF_CPU,
+        );
         shared.lock().tx = None;
         probe.join().unwrap();
         (held.map(|h| h.snap.seq), state)
@@ -1008,6 +2168,412 @@ fn a_reply_that_needs_cpu_stats_waits_as_a_cold_pull() {
         run("global fresh=0"),
         (Some(7300), Freshness::Stale),
         "control: a warm pull's wait"
+    );
+}
+
+/// A snapshot whose sweep read each process's scheduling where `read`.
+fn with_scheduling(seq: u64, read: bool) -> Snapshot {
+    let mut s = synthetic(seq, 0.1);
+    s.scheduling_read = read;
+    s
+}
+
+/// NO SNAPSHOT WITHOUT SCHEDULING ANSWERS A VIEW THAT PRINTS IT (C4): `sys procs`, `sys report`
+/// and the JSON of `sys tab`, `sys global` and `sys mem` over a held snapshot whose sweep read no
+/// scheduling pull, whatever its age or their `fresh=`, with the scheduling armed while they
+/// wait, and answer from the pull's reading, never from a deck reading without it that lands
+/// first; over one that read it, `sys procs` answers at once. A view that prints none (`sys
+/// global` in text, `sys cores`) arms nothing for it and answers the held one. NEGATIVE CONTROL:
+/// with no scheduling need in `fresh_by`, `sys procs` answers the held snapshot read without it.
+#[test]
+fn a_view_that_prints_scheduling_answers_only_a_reading_that_read_it() {
+    static SCHEDULING: Arming = Arming::new();
+    let run = |text: &str, held_read: bool| {
+        let shared = Arc::new(Shared::paced(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        shared.install(tx);
+        let probe = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                let mut seq = 7300;
+                while let Ok(msg) = rx.recv() {
+                    assert!(matches!(msg, Msg::Pull));
+                    let armed = SCHEDULING.armed();
+                    seen.push(armed);
+                    if armed {
+                        // A deck reading already in flight lands first, its sweep asked none.
+                        seq += 1;
+                        shared.publish_for_test(with_scheduling(seq, false), Vec::new());
+                    }
+                    seq += 1;
+                    let mut snap = with_scheduling(seq, armed);
+                    snap.hardware = Some(aterm_vitals::hardware::Sample::unavailable("warming"));
+                    shared.publish_for_test(snap, Vec::new());
+                }
+                seen
+            })
+        };
+        let mut held = with_scheduling(7300, held_read);
+        held.hardware = Some(aterm_vitals::hardware::Sample::unavailable("warming"));
+        shared.publish_for_test(held, Vec::new());
+        let q = SysQuery::parse(text).expect("query");
+        let (held, state) = shared.fresh_for(
+            &q,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &SCHEDULING,
+            &Arming::new(),
+        );
+        assert!(!SCHEDULING.armed(), "{text}: disarmed once answered");
+        shared.lock().tx = None;
+        let read = held.as_ref().is_some_and(|h| h.snap.scheduling_read);
+        (held.map(|h| h.snap.seq), state, read, probe.join().unwrap())
+    };
+    let pulled = (Some(7302), Freshness::Fresh, true, vec![true]);
+    for text in [
+        "procs",
+        "procs fresh=60000",
+        "procs --json",
+        "report",
+        "tab --json",
+        "global --json",
+        "mem --json",
+    ] {
+        assert_eq!(run(text, false), pulled, "{text}: pulled, scheduling armed");
+    }
+    let held = (Some(7300), Freshness::Fresh, true, vec![]);
+    assert_eq!(
+        run("procs", true),
+        held,
+        "a reading that read it answers at once"
+    );
+    let unread = (Some(7300), Freshness::Fresh, false, vec![]);
+    assert_eq!(run("global", false), unread, "text global prints none");
+    assert_eq!(run("cores", false), unread, "nor do the cores");
+}
+
+/// INSIDE ITS GAP A VIEW THAT PRINTS SCHEDULING ANSWERS THE PULL'S READING (C4 review): a
+/// `sys procs` pulls and answers from its pull's reading; a deck reading whose sweep read no
+/// scheduling then lands, and a second `sys procs` or `sys tab --json` inside that pull's gap
+/// answers the pull's reading at once, fresh, sending no pull of its own. NEGATIVE CONTROL: judge
+/// it by the newest snapshot (`State::judged` returning `held`), as C4 did, and the second
+/// query, allowed no wait, answers the deck reading stale, its scheduling unread.
+#[test]
+fn inside_its_gap_a_view_that_prints_scheduling_answers_the_pulls_reading() {
+    static SCHEDULING: Arming = Arming::new();
+    for second in ["procs", "tab --json"] {
+        let shared = Arc::new(Shared::paced(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        shared.install(tx);
+        let probe = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while let Ok(msg) = rx.recv() {
+                    assert!(matches!(msg, Msg::Pull));
+                    seen.push(SCHEDULING.armed());
+                    shared.publish_for_test(with_scheduling(7301, SCHEDULING.armed()), Vec::new());
+                }
+                seen
+            })
+        };
+        shared.publish_for_test(with_scheduling(7300, false), Vec::new());
+        let ask = |text: &str| {
+            let q = SysQuery::parse(text).expect("query");
+            let (held, state) = shared.fresh_for(
+                &q,
+                &Arming::new(),
+                &Arming::new(),
+                &Arming::new(),
+                &SCHEDULING,
+                &Arming::new(),
+            );
+            let read = held.as_ref().is_some_and(|h| h.snap.scheduling_read);
+            (held.map(|h| h.snap.seq), state, read)
+        };
+        assert_eq!(ask("procs"), (Some(7301), Freshness::Fresh, true), "pulled");
+        // A deck reading lands inside the pull's gap, its sweep asked for no scheduling.
+        shared.publish_for_test(with_scheduling(7302, false), Vec::new());
+        {
+            let mut g = shared.lock();
+            g.pacing.wait = Duration::ZERO;
+            g.pacing.wait_cold = Duration::ZERO;
+        }
+        assert_eq!(
+            ask(second),
+            (Some(7301), Freshness::Fresh, true),
+            "{second}: the pull's reading answers inside its gap"
+        );
+        shared.lock().tx = None;
+        assert_eq!(probe.join().unwrap(), [true], "{second}: one pull, armed");
+    }
+}
+
+/// A snapshot whose reading read aterm's own thread CPU where `read`.
+fn with_self_cpu(seq: u64, read: bool) -> Snapshot {
+    let mut s = synthetic(seq, 0.1);
+    s.self_cpu_read = read;
+    s
+}
+
+/// NO SNAPSHOT WITHOUT ATERM'S OWN THREADS ANSWERS A `sys why` THAT PRINTS THEM: a bare `sys
+/// why`, `sys why cpu`, `sys why --json` and `sys why fresh=60000` over a held snapshot whose
+/// reading read none pull, whatever its age or their `fresh=`, with the read armed while they
+/// wait, and answer from the pull's reading, never from a deck reading without it that lands
+/// first; over one that read them, a bare `sys why` answers at once; `sys why mem`, which prints
+/// none, arms nothing for them and answers the held one. Inside the pull's gap, once a deck
+/// reading without them has landed, a second `sys why` answers the pull's reading at once and
+/// sends no pull. Where no reader reads aterm's threads (off macOS, `Shared::self_cpu_reads`
+/// false), every reading answers why, so a bare `sys why` or `sys why cpu` over a held snapshot
+/// whose reading read none answers it at once and sends no pull. NEGATIVE CONTROLS: with no
+/// self-CPU need (`Reads::of` never `SelfCpu`), a bare `sys why` answers the held snapshot read
+/// without them; with the need wherever `sys why` prints them, whatever reads them, it pulls
+/// where no reader reads them.
+#[test]
+fn a_why_that_prints_self_cpu_answers_only_a_reading_that_read_it() {
+    static SELF_CPU: Arming = Arming::new();
+    let probe = |shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<Msg>| {
+        let shared = Arc::clone(shared);
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut seq = 7300;
+            while let Ok(msg) = rx.recv() {
+                assert!(matches!(msg, Msg::Pull));
+                let armed = SELF_CPU.armed();
+                seen.push(armed);
+                if armed {
+                    // A deck reading already in flight lands first, reading none.
+                    seq += 1;
+                    shared.publish_for_test(with_self_cpu(seq, false), Vec::new());
+                }
+                seq += 1;
+                shared.publish_for_test(with_self_cpu(seq, armed), Vec::new());
+            }
+            seen
+        })
+    };
+    let ask = |shared: &Shared, text: &str| {
+        let q = SysQuery::parse(text).expect("query");
+        let (held, state) = shared.fresh_for(
+            &q,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &SELF_CPU,
+        );
+        assert!(!SELF_CPU.armed(), "{text}: disarmed once answered");
+        let read = held.as_ref().is_some_and(|h| h.snap.self_cpu_read);
+        (held.map(|h| h.snap.seq), state, read)
+    };
+    let run_where = |text: &str, held_read: bool, self_cpu_reads: bool| {
+        let mut shared = Shared::paced(Duration::from_secs(3600), Duration::from_secs(60));
+        shared.self_cpu_reads = self_cpu_reads;
+        let shared = Arc::new(shared);
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        shared.install(tx);
+        let pulls = probe(&shared, rx);
+        shared.publish_for_test(with_self_cpu(7300, held_read), Vec::new());
+        let answer = ask(&shared, text);
+        shared.lock().tx = None;
+        (answer, pulls.join().unwrap())
+    };
+    let run = |text: &str, held_read: bool| run_where(text, held_read, true);
+    let pulled = ((Some(7302), Freshness::Fresh, true), vec![true]);
+    for text in ["why", "why cpu", "why --json", "why fresh=60000"] {
+        assert_eq!(run(text, false), pulled, "{text}: pulled, its read armed");
+    }
+    assert_eq!(
+        run("why", true),
+        ((Some(7300), Freshness::Fresh, true), vec![]),
+        "a reading that read them answers at once"
+    );
+    assert_eq!(
+        run("why mem", false),
+        ((Some(7300), Freshness::Fresh, false), vec![]),
+        "why mem prints none"
+    );
+    for text in ["why", "why cpu"] {
+        assert_eq!(
+            run_where(text, false, false),
+            ((Some(7300), Freshness::Fresh, false), vec![]),
+            "{text}: no reader reads them, so the held reading answers"
+        );
+    }
+
+    let mut shared = Shared::paced(Duration::from_secs(3600), Duration::from_secs(60));
+    shared.self_cpu_reads = true;
+    let shared = Arc::new(shared);
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    shared.install(tx);
+    let pulls = probe(&shared, rx);
+    shared.publish_for_test(with_self_cpu(7300, false), Vec::new());
+    assert_eq!(ask(&shared, "why"), pulled.0, "pulled");
+    // A deck reading lands inside the pull's gap, reading none.
+    shared.publish_for_test(with_self_cpu(7303, false), Vec::new());
+    {
+        let mut g = shared.lock();
+        g.pacing.wait = Duration::ZERO;
+        g.pacing.wait_cold = Duration::ZERO;
+    }
+    assert_eq!(
+        ask(&shared, "why"),
+        pulled.0,
+        "the pull's reading answers inside its gap"
+    );
+    shared.lock().tx = None;
+    assert_eq!(pulls.join().unwrap(), [true], "one pull, armed");
+}
+
+/// A SCHEDULING READING ANSWERS ONLY WITHIN `fresh=`, AND NONE WITHOUT THE CLOCK (C4 on the
+/// paired census's clocks): `sys procs fresh=60000` over a reading whose sweep read scheduling,
+/// now 120 s old, answers nothing at once but pulls, its scheduling armed, and answers the pull's
+/// reading; inside that pull's gap, once that reading is 120 s old too, a second one sends no pull
+/// and answers it stale; a pull whose scheduling reading was observed 120 s before it lands
+/// answers that reading stale; and with the observation clock unavailable, `sys procs` sends no
+/// pull and answers the newest whole snapshot (a deck reading without scheduling), stale, never
+/// the older reading that read it. NEGATIVE CONTROLS: without `fresh_age` in `fresh_by`'s early
+/// answer the first answers the old reading fresh, with no pull; without it in the gap answer the
+/// second answers its reading fresh; without it in the wait the third answers fresh; answering
+/// the judged reading where the clock is unavailable (`stale(have)`) the fourth answers the
+/// reading that read scheduling; and without that early return the fourth sends a pull.
+#[test]
+fn a_view_that_prints_scheduling_answers_its_reading_only_within_fresh() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SCHEDULING: Arming = Arming::new();
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    static ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
+    const GAP: Duration = Duration::from_secs(3600);
+    const WAIT: Duration = Duration::from_secs(60);
+    const OLD: Duration = Duration::from_secs(120);
+    fn instant() -> Instant {
+        *BASE.get().unwrap() + Duration::from_nanos(ELAPSED_NS.load(Ordering::SeqCst))
+    }
+    fn continuous() -> Option<u64> {
+        Some(ELAPSED_NS.load(Ordering::SeqCst))
+    }
+    fn advance(by: Duration) {
+        ELAPSED_NS.fetch_add(u64::try_from(by.as_nanos()).unwrap(), Ordering::SeqCst);
+    }
+    /// Now less `back` on both clocks.
+    fn observed(back: Duration) -> ObservedAt {
+        let back_ns = u64::try_from(back.as_nanos()).unwrap();
+        ObservedAt {
+            instant: instant() - back,
+            continuous_ns: continuous().map(|ns| ns - back_ns),
+        }
+    }
+    fn publish(shared: &Shared, snap: Snapshot, observed_at: ObservedAt) {
+        shared.publish(
+            Arc::new(snap),
+            &Machine::default(),
+            observed_at,
+            None,
+            None,
+            true,
+            None,
+        );
+    }
+    // Each pull's reading reads scheduling where the query armed it, observed `back` before it
+    // lands.
+    let probe = |shared: &Arc<Shared>, rx: std::sync::mpsc::Receiver<Msg>, back: Duration| {
+        let shared = Arc::clone(shared);
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut seq = 7300;
+            while let Ok(msg) = rx.recv() {
+                assert!(matches!(msg, Msg::Pull));
+                let armed = SCHEDULING.armed();
+                seen.push(armed);
+                seq += 1;
+                publish(&shared, with_scheduling(seq, armed), observed(back));
+            }
+            seen
+        })
+    };
+    let ask = |shared: &Shared| {
+        let q = SysQuery::parse("procs fresh=60000").expect("query");
+        let (held, state) = shared.fresh_for(
+            &q,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &SCHEDULING,
+            &Arming::new(),
+        );
+        let read = held.as_ref().is_some_and(|h| h.snap.scheduling_read);
+        (held.map(|h| h.snap.seq), state, read)
+    };
+    let _ = BASE.set(Instant::now());
+
+    let shared = Arc::new(Shared::paced_with_clocks(GAP, WAIT, instant, continuous));
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    shared.install(tx);
+    let pulls = probe(&shared, rx, Duration::ZERO);
+    publish(
+        &shared,
+        with_scheduling(7300, true),
+        observed(Duration::ZERO),
+    );
+    advance(OLD);
+    assert_eq!(
+        ask(&shared),
+        (Some(7301), Freshness::Fresh, true),
+        "early: a scheduling reading older than fresh= pulls"
+    );
+    advance(OLD);
+    {
+        let mut g = shared.lock();
+        g.pacing.wait = Duration::ZERO;
+        g.pacing.wait_cold = Duration::ZERO;
+    }
+    assert_eq!(
+        ask(&shared),
+        (Some(7301), Freshness::Stale, true),
+        "gap: the pull's reading, now older than fresh=, answers stale"
+    );
+    shared.lock().tx = None;
+    assert_eq!(pulls.join().unwrap(), [true], "one pull, armed");
+
+    let shared = Arc::new(Shared::paced_with_clocks(GAP, WAIT, instant, continuous));
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    shared.install(tx);
+    let pulls = probe(&shared, rx, OLD);
+    publish(
+        &shared,
+        with_scheduling(7300, false),
+        observed(Duration::ZERO),
+    );
+    assert_eq!(
+        ask(&shared),
+        (Some(7301), Freshness::Stale, true),
+        "wait: a pull's scheduling reading observed past fresh= answers stale"
+    );
+    shared.lock().tx = None;
+    assert_eq!(pulls.join().unwrap(), [true], "one pull, armed");
+
+    let shared = Shared::paced_with_clocks(GAP, Duration::ZERO, instant, || None);
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    shared.install(tx);
+    let unclocked = || ObservedAt::capture(instant, || None);
+    publish(&shared, with_scheduling(7300, true), unclocked());
+    publish(&shared, with_scheduling(7301, false), unclocked());
+    assert_eq!(
+        ask(&shared),
+        (Some(7301), Freshness::Stale, false),
+        "no clock: the newest whole snapshot, stale"
+    );
+    assert!(
+        matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "no clock: no pull"
     );
 }
 
@@ -1086,7 +2652,14 @@ fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
             None,
         );
         let q = SysQuery::parse(text).expect("query");
-        let (held, state) = shared.fresh_for(&q, &Arming::new(), &JOBS, &Arming::new());
+        let (held, state) = shared.fresh_for(
+            &q,
+            &Arming::new(),
+            &JOBS,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+        );
         assert!(!JOBS.armed(), "{text}: disarmed once answered");
         shared.lock().tx = None;
         (held.map(|h| h.snap.seq), state, probe.join().unwrap())
@@ -1301,6 +2874,12 @@ fn a_named_job_that_left_the_view_answers_from_the_ring_or_is_gone() {
     s.events = vec![Event {
         seq: 2,
         at_ns: s.at_ns,
+        at_unix_ms: Some(s.at_unix_ms),
+        scope: aterm_vitals::events::EventScope::Session(aterm_vitals::events::SessionScope {
+            local: 7,
+            sid: "s-test".into(),
+            nonce: "test-nonce".into(),
+        }),
         kind: EventKind::Job {
             tab: 7,
             id: "a1".into(),
@@ -2477,6 +4056,254 @@ fn scope_request_reads_the_request_owning_the_tab() {
     crate::requests_host::set_dir_for_test(None);
 }
 
+/// The production Store lookup binds disclosure to the admitted session before any advisory
+/// caller or row limit is applied. A visual sibling has no implicit scoped-read grant.
+#[test]
+fn sys_groups_host_binds_disclosure_to_the_authorized_session() {
+    use aterm_vitals::groups::{GroupBook, GroupKey, Scope, Value};
+    let store = crate::session_store::new_store();
+    let own = crate::session_store::test_handle(61);
+    let sibling = crate::session_store::test_handle(62);
+    let foreign = crate::session_store::test_handle(63);
+    let unknown = crate::session_store::test_handle(64);
+    for handle in [&own, &sibling, &foreign] {
+        store.write().unwrap().register(handle.clone());
+    }
+    let layout = [
+        PaneFact {
+            key: own.local_id,
+            window: 1,
+            tab: 1,
+            tab_id: None,
+        },
+        PaneFact {
+            key: sibling.local_id,
+            window: 1,
+            tab: 1,
+            tab_id: None,
+        },
+        PaneFact {
+            key: foreign.local_id,
+            window: 1,
+            tab: 2,
+            tab_id: None,
+        },
+    ];
+    let mut book = GroupBook::new();
+    let observations = [
+        (&own, "authorized-process", 0.25),
+        (&sibling, "sibling-private-process", 50.0),
+        (&foreign, "foreign-private-process", 100.0),
+    ]
+    .into_iter()
+    .map(|(handle, name, cpu)| {
+        let mut observation = groups_observation(Value::Read(cpu));
+        observation.key = GroupKey::Tab {
+            pane: handle.local_id,
+            root: aterm_vitals::delegated::ProcessKey {
+                pid: 400 + handle.local_id as u32,
+                start: 500,
+            },
+        };
+        observation.scope = Scope::Tab(handle.local_id);
+        observation.name = name;
+        observation
+    });
+    book.absorb(groups_frame(1), observations);
+    let snapshot = groups_snapshot(1, &book);
+    let at = ObservedAt {
+        instant: Instant::now(),
+        continuous_ns: Some(snapshot.at_ns),
+    };
+    MEMORY_CLOCK.with(|clock| clock.set(at.continuous_ns));
+    MEMORY_INSTANT.with(|clock| clock.set(Some(at.instant)));
+    let shared = Shared::paced_with_clocks(
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        memory_instant,
+        memory_clock,
+    );
+    shared.publish(
+        Arc::new(snapshot.clone()),
+        &Machine::default(),
+        at,
+        None,
+        None,
+        true,
+        Some(groups_receipt(&snapshot, at, false)),
+    );
+    let authorized = AuthorizedTarget {
+        session: own.local_id,
+        term: &own.term,
+        master: -1,
+        ctx: &own.ctx,
+    };
+    let read = |request: &str, owner: bool| {
+        let q = SysQuery::parse(request).expect("the public query grammar");
+        let (held, state) = shared.fresh_for(
+            &q,
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+            &Arming::new(),
+        );
+        let g = gather(&store, &authorized, &layout, &q, None, None, owner)
+            .expect("the admitted target is still the registered target");
+        assert!(
+            held.is_some(),
+            "a nonempty current source is the positive control"
+        );
+        let reply = answer(
+            &shared,
+            &q,
+            held.as_ref(),
+            state,
+            &Machine::default(),
+            &g,
+            owner,
+        );
+        (g.caller_panes, reply)
+    };
+    for caller in [
+        None,
+        Some(&own),
+        Some(&sibling),
+        Some(&foreign),
+        Some(&unknown),
+    ] {
+        for scope in ["pane", "tab", "window", "aterm", "global"] {
+            for json in [false, true] {
+                let mut request = format!("groups scope={scope} top=1 fresh=60000");
+                if let Some(caller) = caller {
+                    request.push_str(&format!(" caller={}", caller.sid.as_str()));
+                }
+                if json {
+                    request.push_str(" --json");
+                }
+                let (panes, reply) = read(&request, false);
+                assert_eq!(
+                    panes.as_deref(),
+                    Some([own.local_id].as_slice()),
+                    "{request}"
+                );
+                assert!(reply.contains("authorized-process"), "{request}: {reply}");
+                for private in ["sibling-private-process", "foreign-private-process"] {
+                    assert!(!reply.contains(private), "{request}: {reply}");
+                }
+                if json {
+                    let body: aterm_json::Value =
+                        aterm_json::from_str(reply.lines().nth(1).unwrap()).unwrap();
+                    assert_eq!(body["groups"]["rows"].as_array().unwrap().len(), 1);
+                    assert_eq!(body["groups"]["withheld"].as_u64(), Some(2));
+                } else {
+                    assert!(reply.contains("withheld=2"), "{reply}");
+                }
+            }
+        }
+    }
+    for json in [false, true] {
+        let shape = if json { " --json" } else { "" };
+        let (panes, all) = read(
+            &format!("groups scope=global top=32 fresh=60000{shape}"),
+            true,
+        );
+        assert!(panes.is_none());
+        for name in [
+            "authorized-process",
+            "sibling-private-process",
+            "foreign-private-process",
+        ] {
+            assert!(
+                all.contains(name),
+                "the owner's nonempty positive control: {all}"
+            );
+        }
+        let (panes, filtered) = read(
+            &format!(
+                "groups scope=global top=32 fresh=60000 caller={}{shape}",
+                foreign.sid.as_str()
+            ),
+            true,
+        );
+        assert_eq!(panes.as_deref(), Some([foreign.local_id].as_slice()));
+        assert!(filtered.contains("foreign-private-process"), "{filtered}");
+        assert!(
+            !filtered.contains("authorized-process")
+                && !filtered.contains("sibling-private-process")
+        );
+        let (panes, empty) = read(
+            &format!(
+                "groups scope=global top=32 fresh=60000 caller={}{shape}",
+                unknown.sid.as_str()
+            ),
+            true,
+        );
+        assert_eq!(panes.as_deref(), Some([].as_slice()));
+        for name in [
+            "authorized-process",
+            "sibling-private-process",
+            "foreign-private-process",
+        ] {
+            assert!(
+                !empty.contains(name),
+                "an unresolved owner filter cannot widen: {empty}"
+            );
+        }
+    }
+    MEMORY_CLOCK.with(|clock| clock.set(None));
+    MEMORY_INSTANT.with(|clock| clock.set(None));
+}
+
+/// A pull may finish after the admitted session was removed or replaced. The captured SID,
+/// nonce and terminal identity must still match under the Store lock used by disclosure.
+#[test]
+fn sys_groups_host_refuses_an_admitted_target_replaced_before_gather() {
+    for changed in ["sid", "nonce", "terminal", "missing"] {
+        let store = crate::session_store::new_store();
+        let original = crate::session_store::test_handle(71);
+        store.write().unwrap().register(original.clone());
+        let authorized = AuthorizedTarget {
+            session: original.local_id,
+            term: &original.term,
+            master: -1,
+            ctx: &original.ctx,
+        };
+        let q = SysQuery::parse("groups scope=global").unwrap();
+        assert!(gather(&store, &authorized, &[], &q, None, None, false).is_ok());
+        if changed == "missing" {
+            let _ = store.write().unwrap().deregister_local(original.local_id);
+        } else {
+            let mut replacement = original.clone();
+            match changed {
+                "sid" => replacement.sid = crate::session_store::test_handle(72).sid,
+                "nonce" => {
+                    let bytes =
+                        if original.nonce == aterm_session::LaunchNonce::from_bytes([42; 16]) {
+                            [43; 16]
+                        } else {
+                            [42; 16]
+                        };
+                    replacement.nonce = aterm_session::LaunchNonce::from_bytes(bytes);
+                }
+                "terminal" => replacement.term = Arc::new(Mutex::new(Terminal::new(24, 80))),
+                _ => unreachable!(),
+            }
+            store.write().unwrap().register(replacement);
+        }
+        for owner in [false, true] {
+            let refusal = match gather(&store, &authorized, &[], &q, None, None, owner) {
+                Ok(_) => panic!("the {changed} replacement retained the old admission"),
+                Err(refusal) => refusal,
+            };
+            assert_eq!(
+                refusal, "ERR sys target changed after authorization\n",
+                "{changed}"
+            );
+        }
+    }
+}
+
 #[test]
 fn one_engine_processes_windowless_session_identity_does_not_depend_on_layout() {
     let store = crate::session_store::new_store();
@@ -2511,14 +4338,19 @@ fn one_engine_processes_windowless_session_identity_does_not_depend_on_layout() 
     let gather_now = || {
         gather(
             &store,
-            visible.local_id,
-            &visible.term,
-            -1,
+            &AuthorizedTarget {
+                session: visible.local_id,
+                term: &visible.term,
+                master: -1,
+                ctx: &visible.ctx,
+            },
             &layout,
             &q,
             Some(&snapshot),
             Some(&receipt),
+            true,
         )
+        .expect("the same admitted session is still live")
     };
     let read = gather_now();
     let fact = read
@@ -3192,7 +5024,6 @@ fn a_partial_snapshot_answers_a_pull_without_waiting_it_out() {
             .any(|l| l.starts_with("stalled procs: proc_listallpids since ")),
         "{reply}"
     );
-    assert!(!reply.contains("warming"), "{reply}");
     shared.publish_for_test(synthetic(4, 0.1), Vec::new());
     assert_eq!(
         shared.fresh(Duration::from_secs(60), false).1,

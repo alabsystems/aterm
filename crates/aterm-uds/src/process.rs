@@ -608,6 +608,64 @@ pub fn read_code_directory_hash(pid: i32) -> Option<[u8; 20]> {
     }
 }
 
+/// The kernel's CodeDirectory hash for the image the process `token` names loaded, and the path
+/// the kernel records for that image: [`read_code_directory_hash`] and [`read_process_path`]
+/// read by audit token (`csops_audittoken`'s `CS_OPS_CDHASH`, `proc_pidpath_audittoken`), the
+/// hash read again after the path. The kernel answers each only while the token's pid names the
+/// process at the version the token was taken at (`p_idversion`, which a later exec moves), so a
+/// pid reused or an exec between the reads answers `None`, never another image's hash or path.
+/// `None` off Apple platforms or when the kernel refuses a read.
+#[must_use]
+pub fn read_loaded_code_of(
+    token: &crate::peer::AuditToken,
+) -> Option<([u8; 20], std::path::PathBuf)> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        const MAX: usize = 4096;
+        unsafe extern "C" {
+            fn csops_audittoken(
+                pid: i32,
+                ops: u32,
+                useraddr: *mut core::ffi::c_void,
+                usersize: usize,
+                token: *mut [u32; 8],
+            ) -> i32;
+            fn proc_pidpath_audittoken(
+                token: *mut [u32; 8],
+                buffer: *mut core::ffi::c_void,
+                buffersize: u32,
+            ) -> i32;
+        }
+        let pid = i32::try_from(token.pid()).ok()?;
+        let hash = || {
+            let mut words = token.0;
+            let mut hash = [0_u8; 20];
+            // SAFETY: hash holds 20 writable bytes, exactly the length passed to CS_OPS_CDHASH,
+            // and words is a live audit_token_t (eight 32-bit words) the call only reads.
+            let result = unsafe {
+                csops_audittoken(pid, 5, hash.as_mut_ptr().cast(), hash.len(), &mut words)
+            };
+            (result == 0).then_some(hash)
+        };
+        let before = hash()?;
+        let mut words = token.0;
+        let mut buf = [0_u8; MAX];
+        // SAFETY: buf is MAX writable bytes; libproc writes at most that many and returns the
+        // path's length, or <= 0 on failure; words is a live audit_token_t the call only reads.
+        let len =
+            unsafe { proc_pidpath_audittoken(&mut words, buf.as_mut_ptr().cast(), MAX as u32) };
+        let len = usize::try_from(len).ok().filter(|&n| n > 0 && n <= MAX)?;
+        let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(buf.get(..len)?));
+        (hash()? == before).then_some((before, path))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = token;
+        None
+    }
+}
+
 /// Reads the kernel's start-time record for `pid`, or `None` if unavailable.
 #[cfg(target_vendor = "apple")]
 #[must_use]
@@ -3202,6 +3260,10 @@ mod program_tests;
 #[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
 #[path = "process_parent_and_path_tests.rs"]
 mod parent_and_path_tests;
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[path = "process_loaded_code_tests.rs"]
+mod loaded_code_tests;
 
 #[cfg(all(test, unix))]
 #[path = "process_argv_tests.rs"]

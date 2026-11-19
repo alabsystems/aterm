@@ -1694,3 +1694,273 @@ fn the_harness_asks_for_a_token_once_and_again_after_a_token_answered_it() {
         "one is under way"
     );
 }
+
+/// A FULL TABLE'S REFUSAL STANDS UNTIL THE TABLE OR THE LEDGER MOVES (ATERM-KI-1116-3474): once
+/// recorded, it stands while the table's enrollment claim and the ledger's needs read as the
+/// refused pass left them, and a rewrite of the ledger that moves no need (a line, a time) leaves
+/// it standing. A claim the table renamed anew (it took a record), a need raised, a claim gone
+/// and a claim the store held newer than the file each end it, and what is put back stands
+/// again; the pass that recorded it forgets it, and the other pass leaves it. The watch hears the
+/// record, the ledger and the claim it names.
+/// NEGATIVE CONTROLS: `full::standing` not comparing the ledger keeps a raised need standing; not
+/// comparing the claim keeps a moved table standing; `full::forget` not asking which pass
+/// recorded it lets the member pass forget the custodian's refusal.
+#[test]
+fn a_full_tables_refusal_stands_until_the_table_or_the_ledger_moves() {
+    use full::{Bound, By};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::locate_for_home(&std::fs::canonicalize(root.path()).unwrap());
+    let facts = facts_of(&model_state(&[("kind", 3)]));
+    let mut rows = vec![fresh(
+        [21; 16],
+        Want::Mailbox("m29".into()),
+        Purpose::HarnessSignIn,
+        &facts,
+    )];
+    ledger::save(&paths, &mut rows).unwrap();
+    let claims = paths.dir.join("commons").join("table-claims");
+    crate::fsx::ensure_private_dir(&paths.dir.join("commons")).unwrap();
+    crate::fsx::ensure_private_dir(&claims).unwrap();
+    let claim = claims.join("table.claim");
+    let put_claim = |bytes: &[u8]| crate::fsx::write_atomic(&claim, bytes, 0o600).unwrap();
+    let record = |by, at: &[u8]| full::record(&paths, by, Bound::Table, 8192, &claim, at);
+    put_claim(b"claim at 8192");
+    assert_eq!(full::standing(&paths).unwrap(), None, "nothing recorded");
+
+    let recorded = record(By::Member, b"claim at 8192").unwrap();
+    let held = full::Full {
+        bound: Bound::Table,
+        records: 8192,
+        needs_unposted: 1,
+    };
+    assert_eq!(recorded, held);
+    assert_eq!(full::standing(&paths).unwrap(), Some(held));
+    assert!(
+        held.line().contains("table is full (8192 operations"),
+        "{}",
+        held.line()
+    );
+    assert!(
+        held.line().contains("1 need waits unposted"),
+        "{}",
+        held.line()
+    );
+    assert_eq!(
+        full::watched(&paths),
+        vec![
+            paths.dir.join(full::FILE),
+            paths.dir.join(LEDGER),
+            claim.clone()
+        ]
+    );
+
+    // A rewrite that moves no need leaves it standing.
+    rows[0].line = "reworded".into();
+    rows[0].updated += 60;
+    ledger::save(&paths, &mut rows).unwrap();
+    assert_eq!(full::standing(&paths).unwrap(), Some(held), "no need moved");
+
+    // The table took a record: its claim was renamed anew.
+    put_claim(b"claim at 8193");
+    assert_eq!(full::standing(&paths).unwrap(), None, "the table moved");
+    put_claim(b"claim at 8192");
+    assert_eq!(
+        full::standing(&paths).unwrap(),
+        Some(held),
+        "CONTROL: the claim as recorded"
+    );
+
+    // A need raised since.
+    let mut raised = rows.clone();
+    raised.push(fresh([22; 16], Want::Notary, Purpose::ByHand, &facts));
+    ledger::save(&paths, &mut raised).unwrap();
+    assert_eq!(full::standing(&paths).unwrap(), None, "a need was raised");
+    ledger::save(&paths, &mut rows).unwrap();
+    assert_eq!(
+        full::standing(&paths).unwrap(),
+        Some(held),
+        "CONTROL: the needs as recorded"
+    );
+
+    // A claim gone, and one the store held newer than the file, stand for nothing.
+    std::fs::remove_file(&claim).unwrap();
+    assert_eq!(full::standing(&paths).unwrap(), None, "the claim is gone");
+    put_claim(b"claim at 8192");
+    record(By::Member, b"claim at 8194").unwrap();
+    assert_eq!(
+        full::standing(&paths).unwrap(),
+        None,
+        "the store held a newer claim"
+    );
+
+    // Each pass forgets only the refusal it recorded.
+    record(By::Custodian, b"claim at 8192").unwrap();
+    assert_eq!(full::standing(&paths).unwrap(), Some(held));
+    full::forget(&paths, By::Member).unwrap();
+    assert_eq!(
+        full::standing(&paths).unwrap(),
+        Some(held),
+        "the member's appends are not the custodian's"
+    );
+    full::forget(&paths, By::Custodian).unwrap();
+    assert_eq!(full::standing(&paths).unwrap(), None, "forgotten");
+    record(By::Member, b"claim at 8192").unwrap();
+    full::forget(&paths, By::Member).unwrap();
+    assert_eq!(full::standing(&paths).unwrap(), None, "forgotten");
+    full::forget(&paths, By::Member).unwrap();
+    assert_eq!(
+        full::watched(&paths),
+        vec![paths.dir.join(full::FILE), paths.dir.join(LEDGER)],
+        "no claim to hear once forgotten"
+    );
+}
+
+/// A PASS'S OWN MOVES CARRY A FULL TABLE'S REFUSAL; A PERSON'S END IT (ATERM-KI-1116-3474): what
+/// a pass takes in for its needs (here the lab's lapse of a posted need, which raises it again)
+/// rewrites the ledger before the pass rewrites the record, and the refusal is carried over it in
+/// the same hold of the ledger's lock, its unposted needs counted afresh, so a look between the
+/// two reads it standing still and asks no pass. A need a person raises is not the pass's move:
+/// it ends the refusal, which a later pass's own moves do not carry back.
+/// NEGATIVE CONTROL: with `absorb` not carrying the refusal, the pass's own move ends it.
+#[test]
+fn a_passs_own_moves_carry_a_full_tables_refusal_and_a_raise_ends_it() {
+    use full::{Bound, By};
+    let vault = vault();
+    crate::need::test_alab_policy(&vault.member);
+    let paths = &vault.member;
+    raise(paths, Want::Notary, Purpose::ByHand).unwrap();
+    raise(paths, Want::Mailbox("m29".into()), Purpose::ByHand).unwrap();
+    // As a pass leaves the notary's once the table holds its request.
+    let mut rows: Vec<Need> = ledger::load(paths)
+        .unwrap()
+        .into_iter()
+        .map(|need| match need.want {
+            Want::Notary => Need {
+                state: State::Open,
+                wait: Wait::Holders,
+                posted: true,
+                ..need
+            },
+            _ => need,
+        })
+        .collect();
+    ledger::save(paths, &mut rows).unwrap();
+    let notary = rows
+        .iter()
+        .find(|need| need.want == Want::Notary)
+        .unwrap()
+        .id;
+    let claims = paths.dir.join("commons").join("table-claims");
+    crate::fsx::ensure_private_dir(&paths.dir.join("commons")).unwrap();
+    crate::fsx::ensure_private_dir(&claims).unwrap();
+    let claim = claims.join("table.claim");
+    crate::fsx::write_atomic(&claim, b"claim at 8192", 0o600).unwrap();
+    let held = full::record(
+        paths,
+        By::Member,
+        Bound::Table,
+        8192,
+        &claim,
+        b"claim at 8192",
+    )
+    .unwrap();
+    assert_eq!(held.needs_unposted, 1, "the mailbox's");
+    let before = full::reading(paths).unwrap();
+    assert_eq!(before.standing, Some(held));
+
+    let lapse = Retirement {
+        reason: Reason::Lapsed,
+        evidence: "a custodian".into(),
+        note: String::new(),
+        generation: None,
+    };
+    absorb(
+        paths,
+        &[(notary, Absorb::Decided(Decision::Retired(lapse)))],
+    )
+    .unwrap();
+    let after = full::reading(paths).unwrap();
+    assert_eq!(
+        after.standing,
+        Some(full::Full {
+            needs_unposted: 2,
+            ..held
+        }),
+        "the pass's own move carries the refusal, counted afresh"
+    );
+    assert_ne!(after.key, before.key, "the reading moved with it");
+
+    raise(paths, Want::SiteDeployerKey, Purpose::ByHand).unwrap();
+    assert_eq!(full::standing(paths).unwrap(), None, "a need was raised");
+    list(paths).unwrap();
+    assert_eq!(
+        full::standing(paths).unwrap(),
+        None,
+        "a pass's settling carries no refusal that no longer stood"
+    );
+}
+
+/// A WRITER QUOTA SPENT IS NOT A FULL TABLE (ATERM-KI-1116-3474): this Mac's own quota refusing
+/// its append says so, and that other Macs still post, never that the lab's table is full; other
+/// Macs' records renaming the claim do not lift it, so the claim is neither what it stands on nor
+/// what its watch hears, and a need raised ends it as it ends the table's.
+/// NEGATIVE CONTROLS: `Full::line` wording the writer's bound as the table's fails the words;
+/// `full::standing` comparing the claim for the writer's bound ends it at another Mac's record.
+#[test]
+fn a_spent_writer_quota_says_so_and_stands_past_other_macs_records() {
+    use full::{Bound, By};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::locate_for_home(&std::fs::canonicalize(root.path()).unwrap());
+    let facts = facts_of(&model_state(&[("kind", 3)]));
+    let mut rows = vec![fresh(
+        [21; 16],
+        Want::Mailbox("m29".into()),
+        Purpose::HarnessSignIn,
+        &facts,
+    )];
+    ledger::save(&paths, &mut rows).unwrap();
+    let claims = paths.dir.join("commons").join("table-claims");
+    crate::fsx::ensure_private_dir(&paths.dir.join("commons")).unwrap();
+    crate::fsx::ensure_private_dir(&claims).unwrap();
+    let claim = claims.join("table.claim");
+    crate::fsx::write_atomic(&claim, b"claim at 6000", 0o600).unwrap();
+
+    let spent = full::record(
+        &paths,
+        By::Member,
+        Bound::Writer,
+        4096,
+        &claim,
+        b"claim at 6000",
+    )
+    .unwrap();
+    assert_eq!(
+        spent,
+        full::Full {
+            bound: Bound::Writer,
+            records: 4096,
+            needs_unposted: 1,
+        }
+    );
+    let line = spent.line();
+    assert!(!line.contains("table is full"), "{line}");
+    assert!(line.contains("writer quota"), "{line}");
+    assert!(line.contains("4096 records of its own"), "{line}");
+    assert!(line.contains("still takes other"), "{line}");
+    assert_eq!(full::standing(&paths).unwrap(), Some(spent));
+    assert_eq!(
+        full::watched(&paths),
+        vec![paths.dir.join(full::FILE), paths.dir.join(LEDGER)],
+        "another Mac's record does not lift this Mac's quota"
+    );
+
+    crate::fsx::write_atomic(&claim, b"claim at 6001", 0o600).unwrap();
+    assert_eq!(
+        full::standing(&paths).unwrap(),
+        Some(spent),
+        "another Mac's record took the table on"
+    );
+    rows.push(fresh([22; 16], Want::Notary, Purpose::ByHand, &facts));
+    ledger::save(&paths, &mut rows).unwrap();
+    assert_eq!(full::standing(&paths).unwrap(), None, "a need was raised");
+}

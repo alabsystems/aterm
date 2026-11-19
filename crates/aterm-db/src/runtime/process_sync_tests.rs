@@ -3,6 +3,8 @@
 
 //! Real runtime processes enroll, repair external writes and transfer custody.
 //! Only generated identities and isolated loopback state are used.
+//! Each real-process case enters an exact-test owned process before it creates state, so a
+//! sibling test's children cannot renew its repair waits' process-progress detector.
 //!
 //! What each wait for the children's repair waits for is their rounds, so its hang detector's
 //! minute is theirs while they work on one: a round they end, or their CPU or I/O while a round of
@@ -375,11 +377,21 @@ fn await_attempts<T>(
 
 #[test]
 fn separate_processes_transfer_live_repair() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "runtime::process_sync_tests::separate_processes_transfer_live_repair",
+    ) {
+        return;
+    }
     transfer_live_repair(false);
 }
 
 #[test]
 fn separate_configurations_share_live_repair_and_transfer_its_owner() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "runtime::process_sync_tests::separate_configurations_share_live_repair_and_transfer_its_owner",
+    ) {
+        return;
+    }
     transfer_live_repair(true);
 }
 
@@ -564,7 +576,7 @@ fn append_round(file: &Path, round: &super::RepairRound) {
             app.sent + app.conflicts_sent,
             app.received + app.conflicts_received,
             app.added,
-            app.regular,
+            app.regular(),
             failed(round.application_error.as_ref()),
         ),
         None => format!(
@@ -773,6 +785,11 @@ fn append(
 
 #[test]
 fn separate_processes_enroll_then_repair_external_writes_and_later_tables() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "runtime::process_sync_tests::separate_processes_enroll_then_repair_external_writes_and_later_tables",
+    ) {
+        return;
+    }
     let lab = crate::control::enrollment::tests::Lab::new(true);
     assert!(lab.bootstrap(1).witness().unwrap().is_none());
     assert!(!lab.paths[1].dir.join("commons/tables").exists());

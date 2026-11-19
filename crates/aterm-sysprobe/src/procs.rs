@@ -73,7 +73,8 @@ pub fn priority_result(value: i32, errno: i32) -> Result<i32, i32> {
 /// One process in a sweep.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcessReading {
-    /// Darwin scheduling state, or `None` off Darwin and for exited processes.
+    /// Darwin scheduling state where the sweep's options ask for it ([`SweepOpts::scheduling`]);
+    /// `None` where they do not, off Darwin, and for exited processes.
     pub scheduling: Option<Scheduling>,
     /// Its pid.
     pub pid: u32,
@@ -165,7 +166,7 @@ pub struct ProcessReading {
     pub read_at: Option<std::time::Instant>,
     /// Its resource coalition's id (macOS), read only by a sweep asked for it ([`SweepOpts::coalitions`]); `None` otherwise, for a zombie, and off macOS.
     pub coalition: Option<u64>,
-    /// Its pid version (macOS `p_idversion`, [`pid_version`]), which a new process and each exec take anew, read with [`Self::coalition`], or where the sweep reads no [`Self::start`] and [`SweepOpts::versions`] asks; `None` otherwise, for a zombie, and off macOS.
+    /// Its pid version (macOS `p_idversion`, [`pid_version`]), which a new process and each exec take anew: the one the macOS sweep read before and after the row's other reads, given with [`Self::coalition`], or where the sweep reads no [`Self::start`] and [`SweepOpts::versions`] asks; `None` otherwise, where the first of those reads answered none, for a zombie, and off macOS.
     pub version: Option<i32>,
     /// When it started, unix ms: on Linux its boot-clock start against `/proc/uptime` and the wall clock read once a sweep ([`birth_of_boot_start`]), on Windows its creation `FILETIME` ([`birth_of_filetime`]). `None` on macOS, whose [`Self::start`] is Mach absolute time, which stops while the Mac sleeps (the kernel record, [`crate::kproc::record`], gives the wall birth there), and where unread.
     pub birth_ms: Option<i64>,
@@ -201,10 +202,15 @@ pub struct CoreSplit {
 /// What a sweep reads beyond each process's row ([`processes_with`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepOpts {
-    /// Each process's resource coalition and pid version ([`ProcessReading::coalition`], [`ProcessReading::version`]): one more `proc_pidinfo` a process on macOS, two more for one whose coalition [`processes_keeping`]'s ids do not hold under that version, nothing elsewhere. On macOS, with every version read, a name at the short name's cut ([`whole_name`]) is read whole once for each pid version and short name: [`processes_keeping`]'s ids keep it for the sweeps after ([`crate::coalitions::CoalitionIds::name`]).
+    /// Each process's resource coalition and pid version ([`ProcessReading::coalition`], [`ProcessReading::version`]): on macOS, whose sweep reads every process's version to bracket its reads, one more `proc_pidinfo` for each process whose coalition [`processes_keeping`]'s ids do not hold under its version; nothing elsewhere. On macOS a name at the short name's cut ([`whole_name`]) is then read whole once for each pid version and short name: [`processes_keeping`]'s ids keep it for the sweeps after ([`crate::coalitions::CoalitionIds::name`]).
     pub coalitions: bool,
-    /// The pid version of each process whose start the sweep cannot read (another user's, on macOS, whose usage the kernel refuses), which is what tells a new process at its pid (or an exec) from the one a reader kept something for: one more `proc_pidinfo` for each such process on macOS, nothing elsewhere. [`Self::coalitions`] reads every process's.
+    /// The pid version of each process whose start the sweep cannot read (another user's, on macOS, whose usage the kernel refuses), which is what tells a new process at its pid (or an exec) from the one a reader kept something for: no more reads on macOS, whose sweep reads every process's version to bracket its reads, and nothing elsewhere. [`Self::coalitions`] gives every process's.
     pub versions: bool,
+    /// Each live process's scheduling ([`ProcessReading::scheduling`]): two more `getpriority`
+    /// calls a process on macOS (its nice and its Darwin role), with the QoS CPU split its usage
+    /// read already holds; nothing elsewhere, where it is `None` either way. Without it no
+    /// `getpriority` is made and every row's is `None`.
+    pub scheduling: bool,
 }
 
 /// One sweep of the process table.
@@ -258,10 +264,12 @@ pub fn processes_with(opts: SweepOpts) -> Option<Sweep> {
 }
 
 /// [`processes_with`], each process's coalition taken from `ids` where they hold it under the
-/// process's pid version, else read and kept there, and where `opts` asks for coalitions (so
-/// every version is read) on macOS, each name at the short name's cut likewise, under the
-/// process's pid version and short name ([`crate::coalitions::CoalitionIds::name`]); `ids` then
-/// holds the swept processes' alone.
+/// process's pid version, else read and kept there, and where `opts` asks for coalitions on
+/// macOS, each name at the short name's cut likewise, under the process's pid version and short
+/// name ([`crate::coalitions::CoalitionIds::name`]). On macOS `ids` keep too, under the pid
+/// version of each row the sweep kept, its session id and a refusal of its usage
+/// ([`crate::coalitions::Generation`]), which the sweeps after answer without reading them again
+/// where they cannot have moved. `ids` then holds the kept live rows' alone.
 #[must_use]
 pub fn processes_keeping(
     opts: SweepOpts,
@@ -562,6 +570,9 @@ pub(crate) mod imp {
         /// The whole table's `(pid, ppid, reaps unwaited)` rows
         /// ([`crate::kproc::reaps_unwaited_all`]).
         fn unwaited(&self) -> Option<Vec<(u32, u32, bool)>>;
+        /// This process's effective uid (`geteuid`), the one the kernel compares a target's with
+        /// before it answers that target's usage.
+        fn own_uid(&self) -> u32;
     }
 
     /// The kernel's own reads.
@@ -622,6 +633,11 @@ pub(crate) mod imp {
 
         fn unwaited(&self) -> Option<Vec<(u32, u32, bool)>> {
             crate::kproc::reaps_unwaited_all()
+        }
+
+        fn own_uid(&self) -> u32 {
+            // SAFETY: a plain syscall with no arguments, which cannot fail.
+            unsafe { libc::geteuid() }
         }
     }
 
@@ -811,10 +827,9 @@ pub(crate) mod imp {
         let truncated = pids.len() > MAX_PROCESSES;
         pids.truncate(MAX_PROCESSES);
         let (numer, denom) = timebase();
+        let own = kernel.own_uid();
         let mut procs = Vec::with_capacity(pids.len());
-        if opts.coalitions {
-            ids.begin_sweep();
-        }
+        ids.begin_sweep();
         // The kernel lists every live process, newest first, and then its zombies. A child is
         // always newer than the process that forked it, so reading the live list from its end
         // reads each parent before its children, and reading the zombies after every live
@@ -822,71 +837,138 @@ pub(crate) mod imp {
         // either read (its parent's reaped-children time, read before the reap, does not hold it
         // yet) or gone (its parent reaped it after its read), never counted in both (SA §7.5's
         // reap credit). A process that answers no `proc_pidinfo` flavor (a zombie, or one
-        // exiting) waits for that second pass. The live rows keep the kernel's order, and the
-        // zombies follow them, as the kernel lists them.
+        // exiting), or whose pid version goes unanswered by the end of its row's reads, waits for
+        // that second pass. The live rows keep the kernel's order, and the zombies follow them, as
+        // the kernel lists them.
         let mut dead = Vec::new();
         for pid in pids.into_iter().rev() {
             if pid <= 0 {
                 continue;
             }
-            let before_read = kernel.rusage(pid);
-            let before = before_read.ok();
+            let key = pid.unsigned_abs();
+            // The row's reads are bracketed by its pid version, read first and again last. A fork
+            // and each exec take a new one, as a new process at the pid does, so where the two
+            // answer one version every read between them (the usage, the short info, the
+            // coalition, the scheduling, the session and the names) is of one process, and no exec
+            // took a new version between them, which the start alone does not show. An exec that
+            // took its version before the first may still be setting the names: xnu's takes it
+            // (`exec_handle_sugid`) before it sets `p_comm` and `p_name` (`set_proc_name`), and an
+            // `execve`'s new process takes the pid (`proc_exec_switch_task`) before the image path
+            // names its file (`exec_resettextvp`). A row whose last version read answers another
+            // version is dropped, and nothing read for it is kept. One whose last answers none
+            // (it exited, or is gone) waits for the zombie pass with its usage read, as one whose
+            // short info answers none does, and nothing read for it is kept. Where the first
+            // answers none, the row's usage is read again after its other reads, and the row is
+            // kept where both reads name one start or neither answers, and dropped otherwise.
+            let version = kernel.version(pid);
+            let kept = version
+                .and_then(|v| ids.generation(key, v))
+                .unwrap_or_default();
+            // A usage the kernel refused (`EPERM`: xnu answers another user's process's usage to
+            // root alone, comparing the target's effective uid with the reader's) is read once a
+            // generation: the refusal is kept under its pid version with the effective uid the
+            // short info named (`pbsi_uid`, the process's `p_uid`, which xnu sets from its
+            // credential's effective uid under the lock that installs it), and answered again
+            // while the short info names that uid. One that named this process's own uid is not
+            // kept: the uid moved between the reads, or something else refused it.
+            let refused = kept.refused.filter(|uid| *uid != own);
+            let first = refused
+                .is_none()
+                .then(|| (kernel.rusage(pid), std::time::Instant::now()));
             let Some(info) = kernel.short_info(pid) else {
-                dead.push((pid, before));
+                let before = first.map_or_else(|| kernel.rusage(pid), |(read, _)| read);
+                dead.push((pid, before.ok()));
                 continue;
             };
-            let (coalition, version) = if opts.coalitions {
-                ids.read(
-                    pid as u32,
-                    || kernel.version(pid),
-                    || kernel.coalition(pid as u32),
-                )
-            } else if opts.versions && before.is_none() {
-                (None, kernel.version(pid))
+            let (read, read_at) = match first {
+                Some(first) => first,
+                None if refused == Some(info.uid) => (Err(libc::EPERM), std::time::Instant::now()),
+                None => (kernel.rusage(pid), std::time::Instant::now()),
+            };
+            let coalition = if opts.coalitions {
+                ids.of(key, version, || kernel.coalition(key))
             } else {
-                (None, None)
+                None
             };
-            let mut scheduling = scheduling(kernel, pid, info.flags);
-            // The second read brackets the short info by the start the first read named. A first
-            // read the kernel refused (`EPERM`: another user's process) named none, so it is not
-            // made again: the row keeps that refusal and no counters, whatever a second read would
-            // have answered (a process readable by then, or one reaped by then, `ESRCH`).
-            let after_read = match before_read {
-                Err(libc::EPERM) => before_read,
-                _ => kernel.rusage(pid),
-            };
-            scheduling.qos_cpu_ns = match after_read {
-                Err(errno) => Some(Err(errno)),
-                Ok(u) => {
-                    super::kernel_timebase().map(|(numer, denom)| Ok(qos_cpu(&u.ri, numer, denom)))
-                }
-            };
-            let after = after_read.ok();
-            let (usage, split) = match (before, after) {
-                (Some(before), Some(after))
-                    if before.ri.ri_proc_start_abstime == after.ri.ri_proc_start_abstime =>
-                {
-                    (Some(after), cores_of(&after, numer, denom))
-                }
-                (None, None) => (None, None),
-                _ => continue,
-            };
-            let read_at = Some(std::time::Instant::now());
-            let sid = kernel.sid(pid);
+            let mut scheduling = opts.scheduling.then(|| scheduling(kernel, pid, info.flags));
+            // A session id moves only by `setsid` (xnu's `setsid_internal`, which `posix_spawn`'s
+            // `POSIX_SPAWN_SETSID` calls too), which makes the process its new session's leader
+            // and its new group's (its sid and its group its pid) and is refused to a group's
+            // leader, and `setpgid` moves a process only within its session and is refused to a
+            // session's leader. So a kept sid that is the pid is the pid still, and where the
+            // group is not the pid no `setsid` came since the kept sid was read; only a group's
+            // leader that leads no session (a shell's job) is asked again.
+            let sid = kept
+                .sid
+                .filter(|&sid| sid == key || info.pgid != key)
+                .and_then(|sid| c_int::try_from(sid).ok())
+                .unwrap_or_else(|| kernel.sid(pid));
             let end = info.comm.iter().position(|b| *b == 0).unwrap_or(16);
             let comm = &info.comm[..end];
             let whole = || super::whole_name(comm, SHORT_COMM_CUT, longer_names(kernel, pid));
             // A name at the cut costs its longer readers. Each names the file the process last
-            // exec'd, and an exec moves its pid version, so a name read under this version and
-            // short name is kept for the sweeps that read both again.
+            // exec'd (one an exec is still setting can name the file before it, as the bracket
+            // above says), and an exec moves its pid version, so a name read under this version
+            // and short name is kept for the sweeps that read both again.
             let name = match version {
                 Some(version) if opts.coalitions && comm.len() == SHORT_COMM_CUT => {
-                    ids.name(pid as u32, version, comm, whole)
+                    ids.name(key, version, comm, whole)
                 }
                 _ => whole(),
             };
+            let (read, read_at) = if let Some(version) = version {
+                match kernel.version(pid) {
+                    Some(last) if last == version => {}
+                    Some(_) => {
+                        ids.forget(key);
+                        continue;
+                    }
+                    None => {
+                        ids.forget(key);
+                        dead.push((pid, read.ok()));
+                        continue;
+                    }
+                }
+                ids.keep_generation(
+                    key,
+                    version,
+                    crate::coalitions::Generation {
+                        sid: u32::try_from(sid).ok().filter(|sid| *sid > 0),
+                        refused: (matches!(read, Err(libc::EPERM)) && info.uid != own)
+                            .then_some(info.uid),
+                    },
+                );
+                (read, read_at)
+            } else {
+                // A first read the kernel refused named no start, so it is not made again: the
+                // row keeps that refusal and no counters, whatever a second read would answer.
+                let after = match read {
+                    Err(libc::EPERM) => read,
+                    _ => kernel.rusage(pid),
+                };
+                match (read, after) {
+                    (Ok(before), Ok(after))
+                        if before.ri.ri_proc_start_abstime == after.ri.ri_proc_start_abstime =>
+                    {
+                        (Ok(after), std::time::Instant::now())
+                    }
+                    (Err(_), Err(_)) => (after, read_at),
+                    _ => {
+                        ids.forget(key);
+                        continue;
+                    }
+                }
+            };
+            if let Some(scheduling) = scheduling.as_mut() {
+                scheduling.qos_cpu_ns = match read {
+                    Err(errno) => Some(Err(errno)),
+                    Ok(u) => super::kernel_timebase()
+                        .map(|(numer, denom)| Ok(qos_cpu(&u.ri, numer, denom))),
+                };
+            }
+            let usage = read.ok();
             procs.push(ProcessReading {
-                scheduling: Some(scheduling),
+                scheduling,
                 ppid: info.ppid,
                 name,
                 pgid: info.pgid,
@@ -896,13 +978,13 @@ pub(crate) mod imp {
                 sid: u32::try_from(sid).unwrap_or(0),
                 has_tty: Some(info.flags & PROC_FLAG_CONTROLT != 0),
                 exec: Some(info.flags & PROC_FLAG_EXEC != 0),
-                cores: split,
-                read_at,
+                cores: usage.and_then(|u| cores_of(&u, numer, denom)),
+                read_at: Some(read_at),
                 coalition,
-                version,
+                version: version.filter(|_| opts.coalitions || (opts.versions && usage.is_none())),
                 birth_ms: None,
                 reaps_unwaited: None,
-                ..usage_row(pid as u32, usage.as_ref(), numer, denom)
+                ..usage_row(key, usage.as_ref(), numer, denom)
             });
         }
         procs.reverse();
@@ -946,9 +1028,7 @@ pub(crate) mod imp {
                 ..ProcessReading::default()
             });
         }
-        if opts.coalitions {
-            ids.end_sweep();
-        }
+        ids.end_sweep();
         read_unwaited(kernel, &mut procs);
         Some(Sweep { procs, truncated })
     }

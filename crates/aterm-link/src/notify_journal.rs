@@ -522,6 +522,24 @@ impl StepsFile {
         written
     }
 
+    /// Replace what the file holds by `held`: the file written again whole from it, its
+    /// directory flushed by `flush` (`super::Notifier::recarry`, a carry into the journal this
+    /// notifier holds open: the descriptor it appended to goes with the file it replaces).
+    /// Refused, it holds what it held before, to be rewritten whole at the next write.
+    ///
+    /// # Errors
+    /// The write or its flush, or a step that would not read back.
+    pub(super) fn rewrite_as(&mut self, held: Verdicts, flush: Flush) -> io::Result<()> {
+        let was = std::mem::replace(&mut self.held, held);
+        self.whole = true;
+        let written = self.put(&[], flush, None);
+        if written.is_err() {
+            self.held = was;
+            self.file = None;
+        }
+        written
+    }
+
     fn put(&mut self, steps: &[Step], flush: Flush, stamps: Option<&[u64]>) -> io::Result<()> {
         let count = steps.len() as u64;
         #[cfg(test)]

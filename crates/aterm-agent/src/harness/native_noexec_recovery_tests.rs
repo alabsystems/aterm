@@ -404,7 +404,7 @@ fn cold_predecessor_cannot_authorize_a_cold_reply_for_an_active_warm_plan() {
     assert_eq!(
         terminal_reply(
             &mut st,
-            &Reply::ColdRestartCommitted {
+            &Reply::AdmittedRestartCommitted {
                 claim: native_act::ClaimOutcome::Builtin,
                 observation: None,
                 intent: Box::new(crate::harness::accounts_pool::ExecutionIntent::external()),

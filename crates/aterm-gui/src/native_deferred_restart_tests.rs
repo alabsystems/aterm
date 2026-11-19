@@ -116,8 +116,9 @@ impl Kernel for DeferredFacts {
         command: &RestartCommand,
         pid: u32,
         cold: Option<&ColdEnvironmentFacts>,
-    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
-        let admitted = self.base.account_execution(command, pid, cold)?;
+        at: AccountAt,
+    ) -> Result<AccountGrant, ()> {
+        let admitted = self.base.account_execution(command, pid, cold, at)?;
         if self.revoke_during_admission.load(Ordering::SeqCst)
             && self.admissions.fetch_add(1, Ordering::SeqCst) == 1
         {
@@ -639,7 +640,7 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
             assert!(
                 matches!(
                     Reply::parse(&reply),
-                    Some(Reply::ColdRestartCommitted { .. })
+                    Some(Reply::AdmittedRestartCommitted { .. })
                 ),
                 "{reply}"
             );
@@ -761,10 +762,37 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
                     ),
                     NOEXEC
                 );
-                let mut table = ctx.fenced_writes.native.lock().unwrap();
-                assert!(table.settle_asked_binding().is_err());
-                assert!(matches!(&table.asked_binding,
-                    asked_upgrade::CurrentBinding::Unsettled { binding, .. } if *binding == next));
+                {
+                    let mut table = ctx.fenced_writes.native.lock().unwrap();
+                    assert!(table.settle_asked_binding().is_err());
+                    assert!(matches!(&table.asked_binding,
+                        asked_upgrade::CurrentBinding::Unsettled { binding, .. } if *binding == next));
+                }
+                // CONTROL: the succession read compacts as a prepare would, and a no-exec Stored
+                // root's frontier, kept for its account continuation, still binds the epoch.
+                assert_eq!(
+                    kernel.serve(
+                        ctx,
+                        Request::Succession(Some(next.id.clone())),
+                        completion_actor.clone()
+                    ),
+                    aterm_agent::harness::native_act::succession_reply(
+                        host_epoch().unwrap(),
+                        &aterm_agent::harness::native_act::Succession::Bound(
+                            "settlement-receipt-or-account-debt".into()
+                        )
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    ctx.fenced_writes
+                        .native
+                        .lock()
+                        .unwrap()
+                        .account_lineages
+                        .pins(&next.id),
+                    "the account continuation's frontier is kept"
+                );
                 continue;
             }
             let resumed = serve_by(
@@ -944,11 +972,38 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
                 ),
                 "{reply}"
             );
-            let (retired, removed, settled) = {
-                let mut table = ctx.fenced_writes.native.lock().unwrap();
-                let retired = table.reclaim(kernel.base.clock.load(Ordering::SeqCst));
+            // THE STORED LOGIN'S NEXT ASKED MOVE IS NAMED, NEVER HELD BY THE ROOT IT COMMITTED
+            // (the succession read settled without compacting, so a committed Stored root's own
+            // account lineage answered `bound` and every later asked move on a stored login
+            // waited native-reentry-bound until the host was recreated): the agent's read before
+            // it tells or prepares the next move reclaims the table as a prepare does, so the
+            // root's lineage compacts and its settlement is named.
+            // NEGATIVE CONTROL: with `succession_reply` reading the table unreclaimed, the answer
+            // is `bound`.
+            assert!(
+                ctx.fenced_writes
+                    .native
+                    .lock()
+                    .unwrap()
+                    .account_lineages
+                    .pins(&next.id),
+                "the committed Stored root still holds its lineage before the read"
+            );
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::Succession(Some(next.id.clone())),
+                    completion_actor.clone()
+                ),
+                aterm_agent::harness::native_act::succession_reply(
+                    host_epoch().unwrap(),
+                    &aterm_agent::harness::native_act::Succession::Predecessor
+                )
+                .unwrap()
+            );
+            let (removed, settled) = {
+                let table = ctx.fenced_writes.native.lock().unwrap();
                 (
-                    retired,
                     !table.by_id.contains_key(&next.id),
                     matches!(
                         &table.asked_binding,
@@ -956,7 +1011,6 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
                     ),
                 )
             };
-            drop(retired);
             assert!(removed, "the expired operation was actually reclaimed");
             assert!(
                 settled,

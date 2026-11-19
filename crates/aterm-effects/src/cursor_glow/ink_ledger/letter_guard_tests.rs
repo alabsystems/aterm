@@ -1973,6 +1973,159 @@ fn a_ramp_cut_reuses_its_near_dims_as_a_fresh_reading_reads_them() {
     );
 }
 
+/// THE DIMS' INDEX READS WHAT EVERY DIM READS ([`InkLedger::index_dims`], [`InkLedger::dims_in`]):
+/// a box read with the dims indexed by their left edges, as the guard reads them while it cuts
+/// every stream to fixed dims, gives what it gives with every dim read. Seeded cases of up to ten
+/// dims whose edges lie on eighths of a pixel either side of the origin, some inverted, some
+/// hard, some keeping their whole light, on grids of fractional cells, and boxes of one row and
+/// more, a run of them along a ramp's rows with the rows' reuse on: [`InkLedger::knots`] meets
+/// the same dims (the near list in its order, whether one is hard, the x and y knots, the rows a
+/// one-row box holds them for) and [`InkLedger::meets_dim_box`] answers alike at the feather's
+/// reach and at others. A case with an edge past `2^24` px is read unindexed. Negative controls
+/// (each broken briefly, red): `meets_dim_box`'s slack 0 px, and `ceil(fx)` without the rounding
+/// pixels; `dims_in` past its first dim in reach; the dims' reach 0; `knots`' reach a pixel short
+/// on the left; the dims in reach read in their left edges' order.
+#[test]
+fn the_dims_index_reads_what_every_dim_reads() {
+    /// A dim's every field, bit for bit.
+    fn key(d: &Dim) -> (u32, u32, u32, u32, u32, bool) {
+        (
+            d.x0.to_bits(),
+            d.y0.to_bits(),
+            d.x1.to_bits(),
+            d.y1.to_bits(),
+            d.share.to_bits(),
+            d.hard,
+        )
+    }
+    /// What [`InkLedger::knots`] leaves for the cut that reads it: the near dims in their order,
+    /// whether one is hard, the x and y knots, and the rows a one-row box holds them for.
+    type Read<'a> = (
+        Vec<(u32, u32, u32, u32, u32, bool)>,
+        bool,
+        &'a [i32],
+        &'a [i32],
+        Option<(i32, i32, i32, i32)>,
+    );
+    fn read(ledger: &InkLedger) -> Read<'_> {
+        (
+            ledger.near.iter().map(key).collect(),
+            ledger.near_hard,
+            &ledger.knots_x,
+            &ledger.knots_y,
+            ledger.row_near,
+        )
+    }
+    /// An edge, px: eighths of a pixel within `span` px either side of the origin, three in ten
+    /// cut to a whole pixel.
+    fn edge(mix: &mut Mix, span: u32) -> f32 {
+        let e = (mix.below(16 * span) as i32 - 8 * span as i32) as f32 / 8.0;
+        if mix.chance(3) { e.trunc() } else { e }
+    }
+    const CASES: u32 = 3_000;
+    let mut mix = Mix(0x6469_6D73_5F69_6478);
+    let (mut narrowed, mut by_feather, mut unindexed, mut reused) = (0u32, 0u32, 0u32, 0u32);
+    for case in 0..CASES {
+        let grid = (
+            edge(&mut mix, 8),
+            edge(&mut mix, 8),
+            2.0 + mix.below(280) as f32 / 10.0,
+            4.0 + mix.below(360) as f32 / 10.0,
+        );
+        let mut dims = Vec::new();
+        for _ in 0..1 + mix.below(10) {
+            let (x0, y0) = (edge(&mut mix, 100), edge(&mut mix, 60));
+            let (w, h) = (edge(&mut mix, 20).abs(), edge(&mut mix, 15).abs());
+            // One in ten inverted across, one in ten down.
+            let x1 = if mix.below(10) == 0 { x0 - w } else { x0 + w };
+            let y1 = if mix.below(10) == 0 { y0 - h } else { y0 + h };
+            dims.push(Dim {
+                x0,
+                y0,
+                x1,
+                y1,
+                share: mix.below(160) as f32 / 128.0,
+                hard: mix.chance(2),
+            });
+        }
+        let past = mix.below(50) == 0;
+        if past {
+            let d = mix.below(dims.len() as u32) as usize;
+            dims[d].x1 = 3.0e7;
+        }
+        let ledger = || {
+            let mut ledger = InkLedger::EMPTY;
+            ledger.grid = grid;
+            ledger.dims.clone_from(&dims);
+            ledger
+        };
+        let (mut every, mut indexed) = (ledger(), ledger());
+        indexed.index_dims();
+        assert_eq!(
+            indexed.dims_in(0, 1).is_none(),
+            past,
+            "case {case}: indexed unless an edge lies past 2^24 px"
+        );
+        unindexed += u32::from(past);
+        // A ramp's pass: its one-row boxes reuse the dims the row before gathered.
+        let rows = mix.chance(3);
+        (every.row_near_on, indexed.row_near_on) = (rows, rows);
+        let feather = every.feather().0;
+        let mut at: Option<(i32, i32, i32, i32)> = None;
+        for _ in 0..16 {
+            let b = match at {
+                Some((x0, _, x1, y1)) if mix.chance(4) => (x0, y1, x1, y1 + 1),
+                _ => {
+                    let (x0, y0) = (mix.below(240) as i32 - 120, mix.below(140) as i32 - 70);
+                    let h = if mix.chance(5) {
+                        1
+                    } else {
+                        1 + mix.below(24) as i32
+                    };
+                    (x0, y0, x0 + 1 + mix.below(48) as i32, y0 + h)
+                }
+            };
+            at = Some(b);
+            for fx in [feather, 1.0 + mix.below(1100) as f32 / 100.0] {
+                let met = every.meets_dim_box(b, fx);
+                assert_eq!(
+                    indexed.meets_dim_box(b, fx),
+                    met,
+                    "case {case}: box {b:?} meets a dim's box within {fx} px"
+                );
+                by_feather += u32::from(met && !every.meets_dim_box(b, 0.0));
+            }
+            let gen_before = every.near_gen;
+            let met = every.knots(b);
+            assert_eq!(indexed.knots(b), met, "case {case}: box {b:?} meets a dim");
+            assert_eq!(
+                read(&indexed),
+                read(&every),
+                "case {case}: box {b:?} read with the dims indexed"
+            );
+            reused += u32::from(every.near_gen == gen_before);
+            // The reach `knots` reads the index over.
+            let fxk = (grid.2 * InkLedger::FEATHER_X).ceil() as i64;
+            let (x0, _, x1, _) = b;
+            narrowed += u32::from(
+                met && indexed
+                    .dims_in(i64::from(x0) - fxk, i64::from(x1) + fxk)
+                    .is_some_and(|r| r.len() < dims.len()),
+            );
+        }
+    }
+    // The cases reach what the index decides: boxes met whose reading the index narrowed, boxes
+    // met by a dim's feather alone (the slack's reach), unindexed cases, and reused rows.
+    assert!(
+        narrowed >= CASES
+            && by_feather >= CASES / 4
+            && unindexed >= CASES / 300
+            && reused >= CASES / 4,
+        "premise: {narrowed} boxes met through a narrowed index, {by_feather} met by a feather \
+         alone, {unindexed} cases unindexed, {reused} rows reused"
+    );
+}
+
 /// §15.2 1.9: the letter guard never weighs nor cuts the light-owned glass
 /// ([`InkLedger::note_light_owned_laid`]): the yield cuts it to the words
 /// (`glass_yield`). A dark glass under a row of paper's letters, laid as

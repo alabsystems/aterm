@@ -2356,17 +2356,7 @@ fn an_octopus_config_obligation_needs_no_shared_input_cross_product() {
     std::fs::write(root.join("a/src/unreadable.rs"), [0xff]).unwrap();
     let fixture = Committed::new(root);
     let read = |args: &[&str]| {
-        let out = git(root, &fixture.path)
-            .args([
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-            ])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{args:?}: {out:?}");
+        let out = fixture.git(args);
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     };
     let base = read(&["rev-parse", "HEAD"]);
@@ -2430,13 +2420,42 @@ impl<'a> Committed<'a> {
         committed
     }
 
-    fn git(&self, args: &[&str]) {
-        let out = git(self.root, &self.path)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(out.status.success(), "git {args:?}: {out:?}");
+    fn command(&self) -> aterm_uds::spawnfd::Command {
+        let mut command = crate::git_provider::command();
+        aterm_uds::fixture_git::hermetic(&mut command);
+        command
+            .current_dir(self.root)
+            .env("PATH", &self.path)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .arg("--no-optional-locks")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
+            ]);
+        command
+    }
+
+    fn git(&self, args: &[&str]) -> std::process::Output {
+        let mut command = self.command();
+        let provider = command.get_program().to_owned();
+        let out = command.args(args).output().unwrap_or_else(|error| {
+            panic!(
+                "git {args:?} in {} via {provider:?}: {error}",
+                self.root.display()
+            )
+        });
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} via {provider:?}: {out:?}",
+            self.root.display()
+        );
+        out
     }
 
     /// What [`resolve`] selects with each repo-relative file of `files` holding its text; the
@@ -2494,11 +2513,13 @@ impl<'a> Committed<'a> {
         // The merge is made on a branch of its own: `judged` stays the branch's commit.
         self.git(&["checkout", "-q", "-b", &format!("{name}-merge")]);
         match by_hand {
-            None => self.git(&["merge", "-q", "--no-edit", &tip]),
+            None => {
+                self.git(&["merge", "-q", "--no-edit", &tip]);
+            }
             Some(files) => {
                 // The merge may stop on a conflict: the person's files resolve it.
-                let _ = git(self.root, &self.path)
-                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                let _ = self
+                    .command()
                     .args(["merge", "-q", "--no-commit", "--no-ff", &tip])
                     .output()
                     .expect("git runs");

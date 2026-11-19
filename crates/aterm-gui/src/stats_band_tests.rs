@@ -15,7 +15,7 @@ use crate::{App, WindowId};
 pub(crate) const BAND_PTS: f64 = 28.0;
 /// The fixture's display scale.
 pub(crate) const SCALE: f64 = 2.0;
-/// The fixture's pad: 12 pt at 2×, so the Sill draws ([`crate::stats_sill::SILL_MIN_PT`]).
+/// The fixture's 12 pt padding at 2×.
 pub(crate) const PAD_PX: usize = 24;
 
 /// Two windows of one process, each drawing its stats bars as glass would: `first`, the
@@ -96,11 +96,8 @@ fn band_and_deck(app: &App, wid: WindowId) -> (usize, usize) {
     )
 }
 
-/// BIRTH. Under `deck` the process's first window is born carrying the band: its head is the
-/// titlebar band plus the band's reservation and its frame is the Deck. A window created later
-/// is born without it: its head is the titlebar band alone, no deck rows are drawn (`dims`
-/// deck_h=0) and its frame is the Sill. CONTROL: a second window born with the bit takes the
-/// Deck, so the form follows the bit and not the window's place.
+/// The first window reserves its expanded head and every new auxiliary window reserves
+/// the compact resource lanes. Each window can expand independently.
 #[test]
 fn a_processs_first_window_carries_the_band_and_a_later_window_takes_the_sill() {
     let TwoWindows {
@@ -121,10 +118,15 @@ fn a_processs_first_window_carries_the_band_and_a_later_window_takes_the_sill() 
     let frame = app.deck_frame(first).expect("the first window's bars");
     assert_eq!(frame.form, StatsBars::Deck);
 
-    assert_eq!(app.deck_head_px(second, BAND_PTS, SCALE, 0), band);
-    assert_eq!(app.win_head(second), band, "the titlebar band alone");
-    assert_eq!(app.deck_rows_px(second), None, "dims deck_h=0");
-    assert_eq!(app.deck_drawn_px(second), 0);
+    let compact = crate::stats_sill::compact_height(SCALE);
+    assert_eq!(app.deck_head_px(second, BAND_PTS, SCALE, 0), band + compact);
+    assert_eq!(
+        app.win_head(second),
+        band + compact,
+        "titlebar and compact resources"
+    );
+    assert_eq!(app.deck_rows_px(second).unwrap().len(), compact);
+    assert_eq!(app.deck_drawn_px(second), compact);
     let frame = app.deck_frame(second).expect("the later window's bars");
     assert_eq!(frame.form, StatsBars::Sill);
 
@@ -134,6 +136,122 @@ fn a_processs_first_window_carries_the_band_and_a_later_window_takes_the_sill() 
     assert_eq!(app.win_head(second), band + deck, "CONTROL");
     let frame = app.deck_frame(second).expect("CONTROL: its bars");
     assert_eq!(frame.form, StatsBars::Deck, "CONTROL");
+}
+
+#[test]
+fn window_resource_strip_keeps_its_laid_hits_and_width_when_the_left_panel_appears() {
+    use crate::stats_paint::HitKind;
+    use aterm_window::event::{ElementState, MouseButton};
+
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let TwoWindows {
+        mut app,
+        first,
+        attached: _attached,
+        ..
+    } = two_windows();
+    app.vitals.snapshot = Some(std::sync::Arc::new(crate::stats_deck::tests::snapshot()));
+    let size = app.window_frame_px_for(first, 44, 150);
+    app.on_resize(first, size);
+    let bare = app.terminal_frame_width_px(first);
+    let now = std::time::Instant::now();
+    let mut expected_hit = None;
+    for (step, cells) in [0, crate::app_window::DOCK_CELLS, 0]
+        .into_iter()
+        .enumerate()
+    {
+        app.set_roster_dock_at(
+            first,
+            cells,
+            now + std::time::Duration::from_secs(60 * step as u64),
+        )
+        .unwrap();
+        assert_eq!(app.windows[&first].dock.cells, cells);
+        let frame = app.deck_frame(first).unwrap();
+        let terminal_width = app.terminal_frame_width_px(first);
+        assert_eq!(
+            terminal_width,
+            bare - usize::from(cells) * app.win_cell_size(first).0
+        );
+        assert_eq!(frame.span.x, 0);
+        assert_eq!(frame.span.width, size.width);
+        assert_eq!(app.network_band_px(first).0, size.width as f32);
+        #[cfg(a11y_tree)]
+        {
+            let bounds = app.stats_a11y(first).unwrap().bounds.unwrap();
+            assert_eq!((bounds.x0, bounds.x1), (0.0, f64::from(size.width)));
+        }
+        app.splice_stats_deck(first);
+        let (input, crop) = {
+            let ws = &app.windows[&first];
+            let full = ws.deck_card.as_ref().unwrap();
+            assert_eq!(full.pw, size.width);
+            let inside = ws.frame_deck_card().unwrap();
+            assert_eq!(inside.pw as usize, terminal_width.min(size.width as usize));
+            let panel_end =
+                f32::from(crate::app_window::DOCK_CELLS) * app.win_cell_size(first).0 as f32;
+            let (x, y, w, h) = ws
+                .stats_hits
+                .borrow()
+                .iter()
+                .rev()
+                .filter(|hit| matches!(hit.kind, HitKind::Row(_, _)))
+                .map(|hit| hit.rect)
+                .find(|(x, _, w, h)| *x >= 0.0 && *x < panel_end - 4.0 && *w > 0.0 && *h > 0.0)
+                .expect("an instrument over the left panel");
+            let px = (x + (x + w).min(panel_end)) / 2.0;
+            (
+                (
+                    f64::from(px),
+                    app.frame_origin(first).1 as f64 + f64::from(frame.dy) + f64::from(y + h * 0.5),
+                ),
+                ws.frame_resource_strip.is_some(),
+            )
+        };
+        if cells != 0 {
+            assert!(crop);
+        }
+        app.on_cursor_moved(first, input.0, input.1);
+        let hit = app.stats_hit_under_pointer(first).unwrap();
+        if let Some(previous) = expected_hit {
+            assert_eq!(hit.kind, previous);
+        }
+        expected_hit = Some(hit.kind);
+        if cells != 0 {
+            assert!(app.in_side_inset(first, input.0));
+            app.on_mouse_input(first, ElementState::Pressed, MouseButton::Left);
+            app.on_mouse_input(first, ElementState::Released, MouseButton::Left);
+            assert_eq!(
+                app.windows[&first].stats_lens.open.unwrap().focus,
+                hit.instrument()
+            );
+            app.windows.get_mut(&first).unwrap().stats_lens.open = None;
+        }
+    }
+    // A minimized physical client has no capture or hit surface. Restoring it seats the Deck again.
+    for empty in [
+        PhysicalSize::new(0, size.height),
+        PhysicalSize::new(size.width, 0),
+    ] {
+        app.windows.get_mut(&first).unwrap().win_px = Some(empty);
+        app.splice_stats_deck(first);
+        assert!(app.deck_frame(first).is_none());
+        assert!(app.windows[&first].frame_deck_card().is_none());
+    }
+    app.windows.get_mut(&first).unwrap().win_px = Some(size);
+    app.splice_stats_deck(first);
+    assert_eq!(
+        app.windows[&first].frame_deck_card().unwrap().pw,
+        size.width
+    );
+    set_bars(&mut app, "sill");
+    let sill = app.deck_frame(first).unwrap();
+    assert_eq!(sill.form, StatsBars::Sill);
+    let rows = app.deck_rows_px(first).unwrap();
+    assert_eq!(sill.dy as usize, rows.start);
+    assert_eq!(sill.geom.h as usize, rows.len());
+    set_bars(&mut app, "off");
+    assert!(app.deck_frame(first).is_none());
 }
 
 /// THE FORM. A window's own form is the setting in that window: `off` is Off and `sill` the
@@ -210,7 +328,10 @@ fn showing_the_band_in_a_window_regrids_its_tabs_once_booked_deck_and_no_other_w
     let sill_grid = grid(&app, second);
     let far_grid = grid(&app, first);
 
-    for (shown, head) in [(true, band + deck), (false, band)] {
+    for (shown, head) in [
+        (true, band + deck),
+        (false, band + crate::stats_sill::compact_height(SCALE)),
+    ] {
         let at = if shown { "shown here" } else { "taken away" };
         let before = (sites_of(&app, &here), sites_of(&app, &there));
         let was = grid(&app, second);
@@ -331,7 +452,7 @@ fn a_form_switch_in_the_config_regrids_only_the_windows_that_carry_the_band() {
         crate::app_colorscheme::install_resolved_colors::apply_config_text(app, &dir, &text);
     };
     apply(&mut app, "deck", DeckSizePref::Auto);
-    let quiet = grid(&app, second);
+
     for (bars, size, regrids) in [
         ("sill", DeckSizePref::Auto, true),
         ("sill", DeckSizePref::Auto, false),
@@ -344,6 +465,7 @@ fn a_form_switch_in_the_config_regrids_only_the_windows_that_carry_the_band() {
     ] {
         let at = format!("to {bars} {size:?}");
         let before = (sites_of(&app, &carrying), sites_of(&app, &without));
+        let previous = grid(&app, second);
         let was = grid(&app, first);
         apply(&mut app, bars, size);
         assert_eq!(app.stats_bars_form().word(), bars, "{at}");
@@ -359,11 +481,11 @@ fn a_form_switch_in_the_config_regrids_only_the_windows_that_carry_the_band() {
             assert!(booked.iter().all(Vec::is_empty), "{booked:?}, {at}");
         }
         let far = new_sites(&before.1, &sites_of(&app, &without));
-        assert!(
-            far.iter().all(Vec::is_empty),
-            "the window without the band: {far:?}, {at}"
-        );
-        assert_eq!(grid(&app, second), quiet, "its grid, {at}");
+        if grid(&app, second) == previous {
+            assert!(far.iter().all(Vec::is_empty), "{far:?}, {at}");
+        } else {
+            assert!(far.iter().all(|b| b == &["site=deck"]), "{far:?}, {at}");
+        }
     }
 }
 
@@ -445,7 +567,8 @@ fn a_window_restored_under_the_other_form_keeps_its_grid_and_takes_its_grids_own
         let carries = app.windows[&wid].carries_band;
         let at = format!("window {} (carries the band: {carries})", wid.0);
         let (rows, cols) = grid(&app, wid);
-        let (_, deck) = band_and_deck(&app, wid);
+        let (_, expanded) = band_and_deck(&app, wid);
+        let deck = expanded - crate::stats_sill::compact_height(SCALE);
         let (_, cell) = app.win_cell_size(wid);
         // The frame the other form sized for this grid.
         app.windows.get_mut(&wid).expect("window").carries_band = !carries;
@@ -665,5 +788,61 @@ fn the_tree_reads_the_network_state_band_only_where_it_is_drawn() {
     assert!(
         names.iter().all(|n| carded.contains(n)),
         "its open card is read: {carded:?}"
+    );
+}
+
+#[test]
+fn the_client_presents_the_same_resource_raster_over_the_dock_and_terminal() {
+    let _attached = crate::stats_deck::tests::attach_stats();
+    let mut app = crate::scripted_redraw_fixture::scripted_app();
+    let wid = WindowId(0);
+    app.config
+        .sys
+        .get_or_insert_with(Default::default)
+        .stats_bars = Some("deck".into());
+    crate::stats_band::tests::seat(&mut app, wid);
+    app.apply_window_scale(wid);
+    let size = app.held_inner_px(wid).unwrap();
+    app.windows.get_mut(&wid).unwrap().win_px = Some(size);
+    app.on_resize(wid, size);
+    app.redraw_window(wid);
+    app.set_dock(wid, 30).unwrap();
+    app.publish_navigators(std::time::Instant::now());
+    app.redraw_window(wid);
+
+    let ((width, height), pixels) = crate::scripted_redraw_fixture::glass(&mut app);
+    let (fx, fy) = app.frame_origin(wid);
+    let seam = usize::try_from(fx).expect("the dock precedes the terminal");
+    let ws = &app.windows[&wid];
+    assert!(ws.frame_resource_strip.is_some());
+    let full = ws.deck_card.as_ref().unwrap();
+    assert_eq!(full.pw as usize, width);
+    let mut checked = [0, 0];
+    for y in 0..full.ph as usize {
+        let yy = fy + i64::from(full.dy) + y as i64;
+        if !(0..height as i64).contains(&yy) {
+            continue;
+        }
+        for x in seam.saturating_sub(10)..(seam + 10).min(full.pw as usize) {
+            let xx = x as i64;
+            if !(0..width as i64).contains(&xx) {
+                continue;
+            }
+            let offset = (y * full.pw as usize + x) * 4;
+            let rgba = &full.rgba[offset..offset + 4];
+            if rgba[3] == 255 {
+                let color = u32::from_be_bytes([0, rgba[0], rgba[1], rgba[2]]);
+                assert_eq!(
+                    pixels[yy as usize * width + xx as usize] & 0xffffff,
+                    color,
+                    "header pixel ({x}, {y})"
+                );
+                checked[usize::from(x >= seam)] += 1;
+            }
+        }
+    }
+    assert!(
+        checked.iter().all(|n| *n > 0),
+        "both sides of the seam were visible: {checked:?}"
     );
 }

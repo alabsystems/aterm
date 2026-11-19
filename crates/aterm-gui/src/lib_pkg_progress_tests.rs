@@ -566,32 +566,28 @@ fn package_park_checks_bump_and_deadline_before_remote_probe() {
 
 #[test]
 fn a_wake_past_the_deadline_runs_the_pass_twenty_seconds_after_it() {
+    use atpkg::vendor_direct::watch::woke_between;
     let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
     let five = Duration::from_secs(5);
     let until = t0 + Duration::from_secs(60);
+    let after =
+        |until, wall, slept, mono| park_deadline_after_wait(until, wall, woke_between(slept, mono));
+    assert_eq!(after(until, t0, Some(five), five), until);
     assert_eq!(
-        park_deadline_after_slice(until, t0, Some(five), five),
-        until
-    );
-    assert_eq!(
-        park_deadline_after_slice(until, t0, Some(Duration::from_secs(20)), five),
+        after(until, t0, Some(Duration::from_secs(20)), five),
         until,
         "a small step is no wake"
     );
-    assert_eq!(
-        park_deadline_after_slice(until, t0, None, five),
-        until,
-        "set back"
-    );
+    assert_eq!(after(until, t0, None, five), until, "set back");
     let woke = t0 + Duration::from_secs(8 * 3600);
     assert_eq!(
-        park_deadline_after_slice(until, woke, Some(Duration::from_secs(8 * 3600)), five),
+        after(until, woke, Some(Duration::from_secs(8 * 3600)), five),
         woke + atpkg::vendor_direct::watch::AFTER_WAKE,
         "slept through the deadline"
     );
     let later = woke + Duration::from_secs(3600);
     assert_eq!(
-        park_deadline_after_slice(later, woke, Some(Duration::from_secs(8 * 3600)), five),
+        after(later, woke, Some(Duration::from_secs(8 * 3600)), five),
         later,
         "the negative control: a wake short of the deadline keeps it"
     );
@@ -603,25 +599,28 @@ fn a_park_keeps_a_deadline_within_the_wake_gap_of_its_length() {
     let five = Duration::from_secs(5);
     let ten_minutes = Duration::from_secs(600);
     let three = Duration::from_secs(3);
-    assert_eq!(park_slice(t0 + ten_minutes, t0, ten_minutes), Some(five));
-    assert_eq!(park_slice(t0 + three, t0, three), Some(three));
     assert_eq!(
-        park_slice(t0 + atpkg::vendor_direct::watch::AFTER_WAKE, t0, three),
-        Some(five),
+        park_left(t0 + ten_minutes, t0, ten_minutes),
+        Some(ten_minutes)
+    );
+    assert_eq!(park_left(t0 + three, t0, three), Some(three));
+    assert_eq!(
+        park_left(t0 + atpkg::vendor_direct::watch::AFTER_WAKE, t0, three),
+        Some(atpkg::vendor_direct::watch::AFTER_WAKE),
         "the twenty seconds after a wake, on a three-second park"
     );
     assert_eq!(
-        park_slice(t0 + ten_minutes + Duration::from_secs(2), t0, ten_minutes),
-        Some(five),
+        park_left(t0 + ten_minutes + Duration::from_secs(2), t0, ten_minutes),
+        Some(ten_minutes + Duration::from_secs(2)),
         "a clock stepped back two seconds early in the park"
     );
     assert_eq!(
-        park_slice(t0 + Duration::from_secs(3600), t0, Duration::from_secs(300)),
+        park_left(t0 + Duration::from_secs(3600), t0, Duration::from_secs(300)),
         None,
         "an hour out on a five-minute park: the clock went back"
     );
-    assert_eq!(park_slice(t0, t0, ten_minutes), None, "due");
-    assert_eq!(park_slice(t0 - five, t0, ten_minutes), None, "past");
+    assert_eq!(park_left(t0, t0, ten_minutes), None, "due");
+    assert_eq!(park_left(t0 - five, t0, ten_minutes), None, "past");
 }
 
 #[test]

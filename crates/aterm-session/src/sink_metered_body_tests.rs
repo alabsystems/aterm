@@ -106,7 +106,7 @@ fn the_close_a_windows_stop_owes_waits_until_a_sever_releases_it() {
                 if flag.is_some_and(|f| f.load(Ordering::Acquire)) {
                     return Ok(0);
                 }
-                shared.severed.store(true, Ordering::Release);
+                shared.severed.get_or_init(Instant::now);
                 Ok(0)
             }
         }

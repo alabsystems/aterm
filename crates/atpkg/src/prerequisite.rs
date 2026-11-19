@@ -8,6 +8,96 @@
 
 use std::path::{Path, PathBuf};
 
+struct CommandDirectory {
+    // Remove the unique command names before another holder can use this parent.
+    directory: aterm_tempfile::TempDir,
+    #[cfg(target_os = "macos")]
+    _parent_lock: Option<aterm_uds::private_file::PrivateLock>,
+}
+
+impl CommandDirectory {
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+impl std::fmt::Debug for CommandDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.directory.fmt(f)
+    }
+}
+
+/// A compiler which searches PATH observes the directories containing its linker
+/// candidates throughout the link. The macOS temporary directory also receives
+/// unrelated compiler and test scratch. Give leased commands their own cache
+/// location while preserving a distinct private directory per acquisition.
+fn command_directory(prefix: &str) -> std::io::Result<CommandDirectory> {
+    let builder = aterm_tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(".noindex");
+    #[cfg(target_os = "macos")]
+    if let Some(home) = aterm_uds::account::home()
+        && let Ok(parent) = command_directory_parent(&home)
+        && let Ok(directory) = command_directory_in(&builder, parent)
+    {
+        return Ok(directory);
+    }
+    Ok(CommandDirectory {
+        directory: builder.tempdir()?,
+        #[cfg(target_os = "macos")]
+        _parent_lock: None,
+    })
+}
+
+/// Each level has two permanent siblings. A holder creates and removes commands
+/// only under its locked directory. Other holders can pass through the overflow
+/// directory without changing any directory on the first holder's search path.
+#[cfg(target_os = "macos")]
+fn command_directory_in(
+    builder: &aterm_tempfile::Builder,
+    mut parent: PathBuf,
+) -> std::io::Result<CommandDirectory> {
+    use aterm_uds::private_file::{PrivateLock, create_private_dir};
+    loop {
+        let commands = parent.join("commands");
+        let overflow = parent.join("more");
+        create_private_dir(&commands)?;
+        create_private_dir(&overflow)?;
+        match PrivateLock::take_private(&commands, "owner", std::time::Duration::ZERO, "occupied") {
+            Ok(lock) => {
+                return Ok(CommandDirectory {
+                    directory: builder.tempdir_in(commands)?,
+                    _parent_lock: Some(lock),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => parent = overflow,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn command_directory_parent(home: &Path) -> std::io::Result<PathBuf> {
+    use aterm_uds::private_file::{PrivateDir, create_private_dir, judge_private_dir};
+    let mut path = home.canonicalize()?;
+    for name in ["Library", "Caches", "aterm", "prerequisite-scopes.noindex"] {
+        match judge_private_dir(&path)? {
+            PrivateDir::Private => {}
+            PrivateDir::Open(mode) if mode & 0o022 == 0 => {}
+            PrivateDir::Missing => create_private_dir(&path)?,
+            PrivateDir::Open(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("shared prerequisite cache ancestor {}", path.display()),
+                ));
+            }
+        }
+        path.push(name);
+    }
+    create_private_dir(&path)?;
+    Ok(path)
+}
+
 use aterm_uds::host::upstream::{self, PinnedTool};
 
 use crate::flow::Fetcher;
@@ -653,11 +743,7 @@ impl<'a> Session<'a> {
             }
             tools.push((want, self.acquire(want)?));
         }
-        let directory = aterm_tempfile::Builder::new()
-            .prefix("atpkg-prerequisites-")
-            .suffix(".noindex")
-            .tempdir()
-            .map_err(|e| e.to_string())?;
+        let directory = command_directory("atpkg-prerequisites-").map_err(|e| e.to_string())?;
         for (want, tool) in &tools {
             let names: &[&str] = if *want == Prerequisite::Python {
                 // Source transforms use the portable python3 spelling. This
@@ -683,7 +769,7 @@ impl<'a> Session<'a> {
 /// A channel update can replace global shims without changing these invocations.
 #[derive(Debug)]
 pub struct HeldSet {
-    directory: aterm_tempfile::TempDir,
+    directory: CommandDirectory,
     tools: Vec<(Prerequisite, HeldTool)>,
 }
 

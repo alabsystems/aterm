@@ -27,9 +27,9 @@ use crate::ai::connector::Seam;
 #[path = "accounts_execution.rs"]
 mod execution;
 pub use execution::{
-    ExecutionGuard, ExecutionIntent, Purpose, Refusal, RefusalKind, Unadmitted, admit_execution,
-    admit_external_execution, capture_execution, execution_admission, execution_readmission,
-    external_admission,
+    ExecutionGuard, ExecutionIntent, Purpose, Rebind, Refusal, RefusalKind, Unadmitted,
+    admit_execution, admit_external_execution, capture_execution, execution_admission,
+    execution_readmission, external_admission, relaunch_rebind,
 };
 
 pub use super::codex_grant_owner::{
@@ -1413,6 +1413,45 @@ fn snapshot_held(
     })
 }
 
+/// `cli`'s roster as this Mac's login records bind it ([`accounts::bound`]: each row on its
+/// current login, with the logins it left), read with no lock between one sync receipt's
+/// bracket, writing nothing: what a check of a live process against an intent reads its owner
+/// row from ([`ExecutionIntent::replaces_process`]).
+///
+/// # Errors
+/// The roster, the login records or the sync receipt cannot be read, or a sync commit moved them
+/// during the read.
+pub fn bound_roster(seat: &Seat<'_>, cli: Cli) -> Result<Roster, String> {
+    bound_roster_at(
+        &seat.store(cli),
+        cli,
+        &seat.config_dir.join(cli.accounts().roster_file),
+        seat.now,
+    )
+}
+
+/// [`bound_roster`] of `cli`'s roster file at `roster` and the login records in `store` at `now`,
+/// with no lock and writing nothing: the view a relaunch plan's token judgment reads
+/// (`relaunch::plan_roster`) and the token wrapper reads at exec, under a relaunch that may hold
+/// the account writer from admission through dispatch ([`super::accounts_token_run::Ctx`]).
+///
+/// # Errors
+/// As [`bound_roster`].
+pub fn bound_roster_at(
+    store: &accounts::Store,
+    cli: Cli,
+    roster: &Path,
+    now: i64,
+) -> Result<Roster, String> {
+    let receipt = store.sync_read_receipt()?;
+    let raw = Roster::load_for(cli, roster)?;
+    let (logins, _) = store.load_logins(now)?;
+    store
+        .check_sync_read_receipt(&receipt)
+        .map_err(crate::harness::account_sync_error::SyncError::into_message)?;
+    Ok(accounts::bound(&raw, &logins))
+}
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2297,8 +2336,16 @@ pub fn unstarted_launch_row<'a>(
     if cli == Cli::Claude {
         let plain = super::observe::Login::claude(&[], home, roster);
         let from = plain.reconciled(roster).row()?;
-        let moved =
-            accounts::claude_worker_move(roster, state, enrolled, &plain, (mode, now), serves);
+        // A launch with no starter names no model of its own: Claude Code's default.
+        let moved = accounts::claude_worker_move(
+            roster,
+            state,
+            enrolled,
+            &plain,
+            accounts::ModelWeek::of_launch(None),
+            (mode, now),
+            serves,
+        );
         return Some(moved.map_or(from, |(_, row)| row));
     }
     let row = match launch_now((cli, keyring, mode), roster, state, enrolled, program, now).ok()? {
@@ -3286,7 +3333,10 @@ pub fn cold_launch_admitted(
             }
             None => input.clone(),
         };
-        // A cold selection picks its row: the selection policy holds for it.
+        // A cold selection picks its row: the selection policy holds for it. A cold relaunch
+        // replaces no live process (its agent already ended), so a start on the current login of
+        // the row that left the login it ran on selects too: no running credential stands for
+        // its pin, pending pin, limit or `accounts = "off"` standing.
         intent = Some(execution::capture_held(
             seat,
             cli,
@@ -3362,14 +3412,23 @@ fn cold_launch_who_capturing(
             .map_err(|why| why.to_string())?
             .ok_or(accounts::LOCK_HELD)?;
         let current = snapshot_held(seat, cli, &store, &held)?;
-        let ran = cold_row(cli, &current.roster, &who, &env_of(&who), seat.home).cloned();
+        // Whether it rebinds is judged on the attribution, after its login file is read: a login
+        // several rows left is that of the one row its file or token marker names ([`rebinds`]).
+        let ran = attributed_row(cli, &current.roster, &who, &env_of(&who), seat.home).map(
+            |attributed| {
+                (
+                    attributed.row.clone(),
+                    rebinds(&current.roster, &who, attributed),
+                )
+            },
+        );
         if ran.is_none() {
             capture(&current, None)?;
         }
         (current, ran)
     };
     let (mut snapshot, ran) = snapshot;
-    let Some(ran) = ran else {
+    let Some((ran, rebound)) = ran else {
         // A process on a login's own credential, stored or a vault token's, never reuses a
         // login retained without a binding.
         let own = match who.route {
@@ -3397,8 +3456,9 @@ fn cold_launch_who_capturing(
         return Ok(None);
     };
     // A retained old directory identifies the account, but cannot authorize reusing
-    // that old credential after its binding moved to a newly prepared login.
-    let rebound = who.me(&snapshot.roster).account.is_none();
+    // that old credential after its binding moved to a newly prepared login: the relaunch starts
+    // on the row's current login ([`rebound_login`], the rule an in-place relaunch follows too).
+    let rebound = rebound?;
     let mode = seat.mode_for(cli);
     if mode == Mode::Off {
         if asked.wanted.is_some() {
@@ -3451,24 +3511,15 @@ fn cold_launch_who_capturing(
     }
     let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
     let isolated = ran.dir.is_none() || default_only(cli, &snapshot.roster, program).is_none();
-    // The launch-time token guard ([`accounts::token_pick_refused`]): a row only its vault token
-    // keeps running here is kept only where the token judgment would serve the relaunch, which
-    // otherwise starts on the row's lapsed stored login. The vault is read only for such a row,
-    // and only once everything else would keep it.
+    // The launch-time token guard ([`relaunch_keeps`]): a row only its vault token keeps running
+    // here is kept only where the token judgment would serve the relaunch, which otherwise starts
+    // on the row's lapsed stored login.
     let roster = snapshot.roster.clone();
     let store = seat.store(cli);
     let mut token_serves = token_serves_here(Some(seat.home), Some(&store), &roster, seat.now);
     let mut serves = |state: &accounts::State| {
         isolated
-            && ran.held_by.is_none()
-            && !matches!(
-                accounts::condition(&ran, state, enrolled.contains(&ran.label), seat.now),
-                accounts::Condition::Limited { .. }
-                    | accounts::Condition::SignedOut
-                    | accounts::Condition::NotEnrolled
-            )
-            && state.lease_verdict(&ran.label, seat.now).is_ok()
-            && !accounts::token_pick_refused(
+            && relaunch_keeps(
                 &ran,
                 state,
                 enrolled.contains(&ran.label),
@@ -3883,12 +3934,12 @@ pub fn moves_in(
 }
 
 /// The row a cold start on `who` (a process started with `env`, `KEY=value` entries) runs on:
-/// the row its environment makes the roster believe ([`accounts::judged_label`]), reconciled
-/// with the account Claude Code's login file at that place names ([`accounts::reconcile`]), as
-/// every other launch planner reads it (`docs/DESIGN-account-discovery-2026-11-09.md`): the
-/// row the file names where it names a listed one, the belief where nothing was read, and
-/// `None` where the file names an account no row lists, which no cold pick charges, leases or
-/// rotates away from. Another CLI's is the belief: nothing observes its login file yet.
+/// the row its environment makes the roster believe ([`believed_row`]), reconciled with the
+/// account Claude Code's login file at that place names ([`accounts::reconcile`]), as every
+/// other launch planner reads it (`docs/DESIGN-account-discovery-2026-11-09.md`): the row the
+/// file names where it names a listed one, the belief where nothing was read, and `None` where
+/// the file names an account no row lists, which no cold pick charges, leases or rotates away
+/// from. Another CLI's is the belief: nothing observes its login file yet.
 fn cold_row<'a>(
     cli: Cli,
     roster: &'a Roster,
@@ -3896,16 +3947,138 @@ fn cold_row<'a>(
     env: &[String],
     home: &Path,
 ) -> Option<&'a Row> {
-    let believed = roster.row(accounts::judged_label(roster, who)?)?;
+    attributed_row(cli, roster, who, env, home).map(|attributed| attributed.row)
+}
+
+/// The row a relaunch attributes a process to ([`attributed_row`]), and whether what the process
+/// runs on says so.
+#[derive(Clone, Copy, Debug)]
+struct Attributed<'a> {
+    row: &'a Row,
+    /// Whether what the process runs on names `row`'s account: the login file at its login, or its
+    /// vault token's marker ([`accounts::Reconciled::Agrees`] or [`accounts::Reconciled::Other`]).
+    /// Otherwise `row` is the belief its environment gives, unverified
+    /// ([`accounts::Reconciled::Unread`], or another CLI's, whose login file nothing observes).
+    observed: bool,
+}
+
+/// [`cold_row`], with whether the row was observed ([`Attributed::observed`]): the row Claude
+/// Code's login file (or the vault token's marker) names where it names a listed one, the belief
+/// where nothing was read, and `None` where the file names an account no row lists.
+fn attributed_row<'a>(
+    cli: Cli,
+    roster: &'a Roster,
+    who: &accounts::ProcessLogin,
+    env: &[String],
+    home: &Path,
+) -> Option<Attributed<'a>> {
+    let believed = Attributed {
+        row: believed_row(roster, who)?,
+        observed: false,
+    };
     if cli != Cli::Claude {
         return Some(believed);
     }
     let seen = super::observe::claude(env, home, who.route, Some(roster));
     match accounts::reconcile(roster, who, &seen) {
-        accounts::Reconciled::Agrees(row) | accounts::Reconciled::Other(row) => Some(row),
+        accounts::Reconciled::Agrees(row) | accounts::Reconciled::Other(row) => Some(Attributed {
+            row,
+            observed: true,
+        }),
         accounts::Reconciled::Unread(_) => Some(believed),
         accounts::Reconciled::Unlisted(_) => None,
     }
+}
+
+/// The row `who`'s environment makes the roster believe it runs on, before its login file is
+/// read: [`accounts::judged_label`]'s row, whose route is resolved against the row that holds
+/// `who`'s login; and where no row holds it, for a vault token route in the default home, the one
+/// row that left that login ([`Roster::rows_of_login`]) whose entry the token's marker names
+/// ([`accounts::AuthRoute::for_account`]). A renewal or a sign-in that binds a row to a new
+/// directory leaves its old login held by no row, so the token its own account still runs on
+/// would otherwise read as no account's and never move onto the row's current login. The marker
+/// names the token the process runs on, so it picks its row out of several that left the login,
+/// as the token's observation does ([`super::observe::claude`]). `None` where the marker names no
+/// row's entry that left the login.
+fn believed_row<'a>(roster: &'a Roster, who: &accounts::ProcessLogin) -> Option<&'a Row> {
+    if let Some(label) = accounts::judged_label(roster, who) {
+        return roster.row(label);
+    }
+    let accounts::AuthRoute::VaultToken { .. } = who.route else {
+        return None;
+    };
+    if !who.default_home || roster.row_for_login(who.login.as_deref()).is_some() {
+        return None;
+    }
+    let mut named = roster
+        .rows_of_login(who.login.as_deref())
+        .into_iter()
+        .filter(|left| {
+            who.route
+                .for_account(accounts::TokenEntry::of_row(left))
+                .on_account()
+        });
+    let (Some(left), None) = (named.next(), named.next()) else {
+        return None;
+    };
+    Some(left)
+}
+
+/// Whether a relaunch of `who`, attributed to `attributed` ([`attributed_row`]), starts on the
+/// current login of that row rather than on `who`'s own: no row holds `who`'s login now
+/// ([`accounts::ProcessLogin::me`]), so the row it is attributed to left it for a newer one (a
+/// renewal or a sign-in bound the row to a new directory, [`Row::was`]), or its login file names
+/// another row's account. A retained old login identifies the account but never authorizes running
+/// that superseded credential again. Several rows that left the login make it ambiguous only where
+/// nothing it runs on was read: a login file or a token marker that names one row's account says
+/// whose it is ([`Attributed::observed`]), whatever the records left.
+///
+/// # Errors
+/// [`LEFT_BY_SEVERAL`] where no row holds the login, several rows left it
+/// ([`Roster::rows_of_login`]) and the attribution is the belief alone: the records cannot say
+/// whose account the process runs on.
+fn rebinds(
+    roster: &Roster,
+    who: &accounts::ProcessLogin,
+    attributed: Attributed<'_>,
+) -> Result<bool, &'static str> {
+    if who.me(roster).account.is_some() {
+        return Ok(false);
+    }
+    if !attributed.observed && roster.rows_of_login(who.login.as_deref()).len() > 1 {
+        return Err(LEFT_BY_SEVERAL);
+    }
+    Ok(true)
+}
+
+/// Why no relaunch rebinds a login several rows left where nothing it runs on was read
+/// ([`rebinds`]).
+const LEFT_BY_SEVERAL: &str = "execution login was left by several accounts";
+
+/// The row whose current login a relaunch of `who` starts on in place of the login `who` runs on
+/// ([`rebinds`]): the row it is attributed to ([`attributed_row`]: the row that left that login,
+/// `who` on its stored login or on that row's vault token, or the row its login file names, never
+/// one for a login file that names an account no row lists).
+/// The one rule a cold relaunch ([`cold_launch_admitted`]) and an in-place relaunch
+/// ([`relaunch_rebind`]) follow; a turn end's login follow moves a session the same way. `None`
+/// where a row holds `who`'s login now, or no row is attributed.
+///
+/// # Errors
+/// As [`rebinds`].
+pub(super) fn rebound_login<'a>(
+    cli: Cli,
+    roster: &'a Roster,
+    who: &accounts::ProcessLogin,
+    home: &Path,
+) -> Result<Option<&'a Row>, &'static str> {
+    // A row holds the login: nothing rebinds, and its login file is not read.
+    if who.me(roster).account.is_some() {
+        return Ok(None);
+    }
+    let Some(attributed) = attributed_row(cli, roster, who, &env_of(who), home) else {
+        return Ok(None);
+    };
+    Ok(rebinds(roster, who, attributed)?.then_some(attributed.row))
 }
 
 /// The environment (`KEY=value`) that names `who`'s login directory, as a start on it carries.
@@ -4103,33 +4276,34 @@ fn cold_resume_pick(
     store.check_sync_read_receipt(&receipt).ok()?;
     let roster = accounts::bound(&raw, &logins);
     store.hydrate_auth_contexts(&mut state, &roster);
+    let records = PoolSnapshot {
+        roster,
+        logins,
+        state,
+    };
+    let (roster, state) = (&records.roster, &records.state);
     let who = accounts::ProcessLogin::of_env_for(cli, env.iter().copied());
     let raw_env: Vec<String> = env
         .iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect();
-    let ran = cold_row(cli, &roster, &who, &raw_env, seat.home)?;
-    let enrolled = accounts::enrolled_in(cli, &roster, seat.home);
-    let ready = |row: &Row| -> Option<LoginEnv> {
-        check_login_identity(cli, row, seat.home).ok()?;
-        let (var, value) = accounts::login_env_for(cli, row);
-        Some(LoginEnv {
-            label: row.label.clone(),
-            var,
-            value,
-        })
-    };
+    let ran = cold_row(cli, roster, &who, &raw_env, seat.home)?;
+    let enrolled = accounts::enrolled_in(cli, roster, seat.home);
     if default_only {
         if ran.dir.is_none()
-            || checked_launch_pin(seat, cli, &roster, &state, &enrolled)
+            || checked_launch_pin(seat, cli, roster, state, &enrolled)
                 .ok()?
                 .is_some_and(|row| row.dir.is_some())
         {
             return None;
         }
-        return ready(default_serving(&roster, &state, &enrolled, seat.now).ok()?);
+        return identity_ready(
+            cli,
+            seat.home,
+            default_serving(roster, state, &enrolled, seat.now).ok()?,
+        );
     }
-    let cond = accounts::condition(ran, &state, enrolled.contains(&ran.label), seat.now);
+    let cond = accounts::condition(ran, state, enrolled.contains(&ran.label), seat.now);
     if ran.held_by.is_none()
         && state.lease_verdict(&ran.label, seat.now).is_ok()
         && !matches!(
@@ -4141,18 +4315,125 @@ fn cold_resume_pick(
     {
         return None;
     }
-    if let Some(pinned) = checked_launch_pin(seat, cli, &roster, &state, &enrolled).ok()? {
-        if pinned.held_by.is_none() && state.lease_verdict(&pinned.label, seat.now).is_ok() {
-            return ready(pinned).filter(|pick| pick.label != ran.label);
+    // The launch-time token guard's judgment, as the resume line's own launch makes it.
+    let mut serves = token_serves_here(Some(seat.home), Some(&store), roster, seat.now);
+    records_pick(seat, cli, &records, &enrolled, ran, &mut serves)
+}
+
+/// `row`'s login, where its stored identity agrees with it ([`check_login_identity`]).
+fn identity_ready(cli: Cli, home: &Path, row: &Row) -> Option<LoginEnv> {
+    check_login_identity(cli, row, home).ok()?;
+    let (var, value) = accounts::login_env_for(cli, row);
+    Some(LoginEnv {
+        label: row.label.clone(),
+        var,
+        value,
+    })
+}
+
+/// Whether a relaunch keeps `ran`, the row its process is attributed to, rather than take the
+/// pool's pick, `state` as it reads (`enrolled`: its login is made here): no other Mac holds it and
+/// the claims admit this Mac, it has a login to run on here (its stored one or its vault token,
+/// [`accounts::condition`]) and no limit holds it, and the launch-time token guard does not refuse
+/// it ([`accounts::token_pick_refused`]: where only its vault token keeps it running here,
+/// `serves`, the token judgment of the relaunch's line, says that token serves the line, which
+/// otherwise starts on the row's lapsed stored login). `serves` is asked last, so the vault is read
+/// only once everything else would keep the row. The one rule a cold relaunch
+/// ([`cold_launch_who_capturing`]) and an in-place relaunch off a login the row left
+/// ([`records_pick`]) keep their row by.
+fn relaunch_keeps(
+    ran: &Row,
+    state: &accounts::State,
+    enrolled: bool,
+    now: i64,
+    serves: &mut dyn FnMut(&Row) -> bool,
+) -> bool {
+    ran.held_by.is_none()
+        && !matches!(
+            accounts::condition(ran, state, enrolled, now),
+            accounts::Condition::Limited { .. }
+                | accounts::Condition::SignedOut
+                | accounts::Condition::NotEnrolled
+        )
+        && state.lease_verdict(&ran.label, now).is_ok()
+        && !accounts::token_pick_refused(ran, state, enrolled, now, serves)
+}
+
+/// The row the pool's records pick for a relaunch off the row `ran` (`records` as they stand,
+/// `enrolled` the rows with a login made here), each only where its stored identity agrees
+/// ([`identity_ready`]): the owner's pin where it stands and this Mac may run its row; else `ran`
+/// on its own vault token, where only that token runs it here ([`accounts::LoginHere::OnToken`])
+/// and the relaunch keeps it ([`relaunch_keeps`]); else [`accounts::launch_row`]'s pick of every
+/// other row. `ran` is never taken on its stored login, which the relaunch leaves (a cold resume's
+/// row cannot serve on it; an in-place relaunch's row left the login its process runs on, and its
+/// current one is not signed in here), and a pick that lands on `ran` asks again past it, so the
+/// search never stops at `ran` while another row serves. Every pick is under the launch-time token
+/// guard ([`accounts::token_guarded`]): a row only its vault token keeps running here is taken only
+/// where `serves` (the token judgment the relaunch's line makes of a start on that row, asked once
+/// a row) says the token serves it, since the line otherwise starts on the row's lapsed stored
+/// login, which its admission refuses on every pass while the records stand. Takes no lock, reads
+/// no usage and writes nothing: the relaunch's admission judges the pick under the writer. `None`
+/// where no row serves.
+fn records_pick(
+    seat: &Seat<'_>,
+    cli: Cli,
+    records: &PoolSnapshot,
+    enrolled: &std::collections::BTreeSet<String>,
+    ran: &Row,
+    serves: &mut dyn FnMut(&Row) -> bool,
+) -> Option<LoginEnv> {
+    let (roster, state) = (&records.roster, &records.state);
+    let mut judged = std::collections::BTreeMap::<String, bool>::new();
+    let mut serves = |row: &Row| {
+        *judged
+            .entry(row.label.clone())
+            .or_insert_with(|| serves(row))
+    };
+    // `ran` carries the relaunch only on its own vault token, never on its stored login.
+    let ran_on_token = accounts::login_here(ran, state, enrolled.contains(&ran.label), seat.now)
+        == accounts::LoginHere::OnToken;
+    if let Some(pinned) = checked_launch_pin(seat, cli, roster, state, enrolled).ok()? {
+        if pinned.held_by.is_none()
+            && state.lease_verdict(&pinned.label, seat.now).is_ok()
+            && (pinned.label != ran.label || ran_on_token)
+            && !accounts::token_pick_refused(
+                pinned,
+                state,
+                enrolled.contains(&pinned.label),
+                seat.now,
+                &mut serves,
+            )
+        {
+            return identity_ready(cli, seat.home, pinned);
         }
         return None;
     }
-    let mut excluded = std::collections::BTreeSet::new();
+    if ran_on_token
+        && relaunch_keeps(
+            ran,
+            state,
+            enrolled.contains(&ran.label),
+            seat.now,
+            &mut serves,
+        )
+        && let Some(pick) = identity_ready(cli, seat.home, ran)
+    {
+        return Some(pick);
+    }
+    let mut excluded = std::collections::BTreeSet::from([ran.label.clone()]);
     loop {
-        let candidates = without_failed_preparations(&state, &excluded);
-        let row = accounts::launch_row(&roster, &candidates, &enrolled, seat.now)?;
-        if let Some(pick) = ready(row) {
-            return (pick.label != ran.label).then_some(pick);
+        let candidates = without_failed_preparations(state, &excluded);
+        let row = accounts::token_guarded(
+            roster,
+            &candidates,
+            enrolled,
+            seat.now,
+            &mut serves,
+            None,
+            |current| accounts::launch_row(roster, current, enrolled, seat.now),
+        )?;
+        if let Some(pick) = identity_ready(cli, seat.home, row) {
+            return Some(pick);
         }
         if (state.pinned && state.active.as_deref() == Some(row.label.as_str()))
             || !excluded.insert(row.label.clone())
@@ -5096,6 +5377,7 @@ pub fn native_quota_target_at(
         left: None,
         default_home: true,
         route: accounts::AuthRoute::Stored,
+        model: accounts::ModelWeek::Unread,
     };
     let point = Point::Wall {
         window: window.to_owned(),
@@ -5590,6 +5872,7 @@ fn finish_move<T>(
                             },
                             to,
                             asked,
+                            me.model,
                             seat.now,
                         )
                         .map_err(|lost| format!("{lost:?}"))?,
@@ -5864,7 +6147,10 @@ fn note_session_login(
     match seen {
         LoginSeen::Lost => accounts::note_login_end(state, logins, label, now),
         LoginSeen::Served => {
-            let events = accounts::note_signed_back(state, logins, label, now);
+            if !accounts::sign_back_due(state, label) {
+                return Vec::new();
+            }
+            let events = accounts::note_checked_sign_in(state, logins, label, now);
             if !events.is_empty() {
                 accounts::note_served_login(logins, label, now);
             }

@@ -1289,7 +1289,7 @@ mod mac {
         if let Some(paths) = paths {
             crate::macos::release_bridge(paths);
         }
-        eprintln!("{VERB}: serve: {why}");
+        launchd::say(format_args!("{VERB}: serve: {why}"));
         ExitCode::SUCCESS
     }
 
@@ -1300,7 +1300,9 @@ mod mac {
     /// ([`code::prepare_copy`]). A bridge an update restart left holds on meanwhile.
     pub(super) fn retry(paths: &Paths, why: impl std::fmt::Display) -> ExitCode {
         let why = why.to_string();
-        eprintln!("{VERB}: serve: {why}; launchd starts it again");
+        launchd::say(format_args!(
+            "{VERB}: serve: {why}; launchd starts it again"
+        ));
         trouble::note(paths, &why);
         launchd::pause_before_retry();
         ExitCode::from(launchd::EXIT_RETRY)
@@ -1314,7 +1316,9 @@ mod mac {
     /// holds on, to its own end.
     pub(super) fn stall(paths: &Paths, why: impl std::fmt::Display) -> ExitCode {
         let why = why.to_string();
-        eprintln!("{VERB}: serve: {why}; a window or a converge pass starts it again");
+        launchd::say(format_args!(
+            "{VERB}: serve: {why}; a window or a converge pass starts it again"
+        ));
         trouble::note(paths, &why);
         ExitCode::SUCCESS
     }
@@ -1359,7 +1363,7 @@ mod mac {
     /// without it is read as the asking build's job.
     fn name_job(instance: &mut Instance, label: &str, lock: &Path) {
         if let Err(e) = instance.set_label(label) {
-            eprintln!("{VERB}: serve: {}: {e}", lock.display());
+            launchd::say(format_args!("{VERB}: serve: {}: {e}", lock.display()));
         }
     }
 
@@ -1371,6 +1375,9 @@ mod mac {
             Ok(paths) => paths,
             Err(why) => return refuse(None, why),
         };
+        // The job's log, bounded while it serves, where its standard error is the file its plist
+        // names (aterm_uds::job_log): the mug takes what this kept.
+        let kept = launchd::keep_log(&paths);
         let code_dir = paths.code_dir();
         let lock = paths.lock_file();
         let (origin, instance) = if code::runs_from_copy(&code_dir) {
@@ -1440,12 +1447,12 @@ mod mac {
         let label = launchd::label_for(&origin);
         let restart_on_update =
             std::env::var_os("XPC_SERVICE_NAME").is_some_and(|name| name == label.as_str());
-        eprintln!(
+        launchd::say(format_args!(
             "{VERB}: serving (pid {}, label {label}, started as {}, running {})",
             std::process::id(),
             origin.display(),
             std::env::current_exe().map_or_else(|e| e.to_string(), |p| p.display().to_string()),
-        );
+        ));
         crate::macos::serve(crate::macos::ServeContext {
             paths,
             label,
@@ -1453,6 +1460,7 @@ mod mac {
             version: version.to_string(),
             restart_on_update,
             instance,
+            kept,
         })
     }
 
@@ -1480,7 +1488,10 @@ mod mac {
             Ok(Some(instance)) => Ok(instance),
             Ok(None) => match instance::running_mug(&lock, &code_dir) {
                 Some(mug) => {
-                    eprintln!("{VERB}: serve: already running (pid {})", mug.pid);
+                    launchd::say(format_args!(
+                        "{VERB}: serve: already running (pid {})",
+                        mug.pid
+                    ));
                     Err(ExitCode::SUCCESS)
                 }
                 None => {

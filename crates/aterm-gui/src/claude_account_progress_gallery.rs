@@ -25,6 +25,8 @@ fn capture(app: &mut crate::App, wid: crate::WindowId) -> Vec<u8> {
             session: None,
             want_bytes: true,
             want_metadata: false,
+            whole_client: false,
+            presentation: None,
             frame_metadata: Arc::new(OnceLock::new()),
             cancel: crate::control::CaptureCancellation::new(),
             reply,
@@ -963,6 +965,7 @@ fn lab_own_claim_gallery() {
         left: None,
         default_home: true,
         route: aterm_agent::harness::accounts::AuthRoute::Stored,
+        model: aterm_agent::harness::accounts::ModelWeek::Unread,
     };
     let mut manifest = String::from(
         "# Synthetic retained claim decisions in the actual App Lab page; no provider or credential reads.\nscene\tcolumns\trows\tfile\n",

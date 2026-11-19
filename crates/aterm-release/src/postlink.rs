@@ -43,6 +43,11 @@ struct Layout {
 }
 
 fn layout(bytes: &[u8]) -> Result<Layout, String> {
+    layout_from_commands(bytes, bytes.len())
+}
+
+// The command table describes ranges in the whole file. A stamper only needs the table.
+fn layout_from_commands(bytes: &[u8], file_len: usize) -> Result<Layout, String> {
     if u32_at(bytes, 0)? != 0xfeed_facf
         || !matches!(u32_at(bytes, 4)?, 0x0100_0007 | 0x0100_000c)
         || u32_at(bytes, 12)? != 2
@@ -71,11 +76,7 @@ fn layout(bytes: &[u8]) -> Result<Layout, String> {
             if size < 72 {
                 return Err("short Mach-O segment".into());
             }
-            let segment = range(
-                u64_at(bytes, at + 40)?,
-                u64_at(bytes, at + 48)?,
-                bytes.len(),
-            )?;
+            let segment = range(u64_at(bytes, at + 40)?, u64_at(bytes, at + 48)?, file_len)?;
             let sections = u32_at(bytes, at + 64)? as usize;
             if sections > (size - 72) / 80 {
                 return Err("Mach-O sections exceed segment command".into());
@@ -102,7 +103,7 @@ fn layout(bytes: &[u8]) -> Result<Layout, String> {
                 let record = range(
                     u64::from(u32_at(bytes, section + 48)?),
                     aterm_stamp::LEN as u64,
-                    bytes.len(),
+                    file_len,
                 )?;
                 if record.start < commands.end
                     || record.start < segment.start
@@ -121,9 +122,9 @@ fn layout(bytes: &[u8]) -> Result<Layout, String> {
             let blob = range(
                 u64::from(u32_at(bytes, at + 8)?),
                 u64::from(u32_at(bytes, at + 12)?),
-                bytes.len(),
+                file_len,
             )?;
-            if blob.is_empty() || blob.start < commands.end || blob.end != bytes.len() {
+            if blob.is_empty() || blob.start < commands.end || blob.end != file_len {
                 return Err("signature must be a nonempty trailing blob".into());
             }
             if signature.replace((blob, at + 8..at + 16)).is_some() {
@@ -202,14 +203,48 @@ pub fn normalized(bytes: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Patch exactly the dedicated section. Never search for a stamp-shaped string elsewhere.
 pub fn stamp(path: &Path, record: &[u8; aterm_stamp::LEN]) -> Result<(), String> {
-    let mut bytes = crate::durable::read_regular_bytes(path, u64::MAX)
-        .map_err(|e| format!("read stamp slice {}: {e}", path.display()))?;
-    let layout = layout(&bytes)?;
-    if !bytes[layout.stamp.clone()].starts_with(aterm_stamp::HEADER.as_bytes()) {
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .map_err(|e| e.to_string())?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("refusing stamp symlink".into());
+    }
+    let mut file =
+        aterm_uds::kept_out(|| astream_sys::open_nonblocking_rw(path, astream_sys::Links::Refuse))
+            .map_err(|e| format!("open stamp slice {}: {e}", path.display()))?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("stamp slice is not a regular file".into());
+    }
+    let len = usize::try_from(meta.len()).map_err(|_| "stamp slice exceeds address space")?;
+    patch_record(&mut file, len, record).map_err(|e| format!("stamp {}: {e}", path.display()))
+}
+
+fn patch_record(
+    image: &mut (impl std::io::Read + std::io::Write + std::io::Seek),
+    file_len: usize,
+    record: &[u8; aterm_stamp::LEN],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read as _, SeekFrom};
+
+    let mut header = [0; 32];
+    image.read_exact(&mut header)?;
+    let table = range(32, u64::from(u32_at(&header, 20)?), file_len)?;
+    let mut commands = Vec::from(header);
+    image.take(table.len() as u64).read_to_end(&mut commands)?;
+    let stamp = layout_from_commands(&commands, file_len)?.stamp;
+    let offset = SeekFrom::Start(stamp.start as u64);
+    image.seek(offset)?;
+    let mut marker = [0; aterm_stamp::HEADER.len()];
+    image.read_exact(&mut marker)?;
+    if marker != aterm_stamp::HEADER.as_bytes() {
         return Err("stamp section has no identity record".into());
     }
-    bytes[layout.stamp].copy_from_slice(record);
-    std::fs::write(path, bytes).map_err(|e| format!("stamp {}: {e}", path.display()))
+    image.seek(offset)?;
+    image.write_all(record)?;
+    Ok(())
 }
 
 /// Every architecture must carry exactly the reservation's fields, in the stamp format's

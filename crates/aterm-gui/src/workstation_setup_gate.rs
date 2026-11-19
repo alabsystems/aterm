@@ -75,6 +75,11 @@ impl PermissionGate {
             .map(|policy| policy.revision)
     }
 
+    /// Whether the admitted Permissions group carries a person's privacy request.
+    pub(super) fn privacy_grants_requested(&self) -> bool {
+        self.allowed() && self.policy.is_some_and(|policy| policy.person_access)
+    }
+
     pub(super) fn hold(&mut self) {
         // An unanswered offer or refused intent cannot withdraw the earlier
         // Stop.

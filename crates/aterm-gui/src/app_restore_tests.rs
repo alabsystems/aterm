@@ -9317,6 +9317,11 @@ fn a_restored_workers_tab_keeps_its_bits_only_with_a_record() {
         "an older build's parked tab"
     );
     assert_eq!(bits_of(row, false, false), (false, false), "a person's tab");
+    assert_eq!(
+        bits_of(None, true, false),
+        (true, false),
+        "a person's hidden tab"
+    );
     for (parked, ephemeral) in [(true, true), (false, true)] {
         assert_eq!(bits_of(None, parked, ephemeral), (false, false));
         assert_eq!(
@@ -9889,4 +9894,73 @@ fn a_failed_opens_recovery_tab_is_captured_as_its_document() {
             "split beside a terminal, it is left out and the terminal takes its place: {captured:?}"
         );
     }
+}
+
+/// The System Resources page holds nothing of its own a relaunch could bring back: the manifest
+/// captures neither its leaf nor its tab, as for the navigator, and split beside a terminal in
+/// its tab it is left out and the terminal takes the tab's place. The split is what
+/// `AppKind::left_out_of_restore` decides: a page alone in its tab is dropped by the leaf
+/// descriptor's catch-all whatever that says, while a page the kind did not leave out would
+/// drop its whole tab, the terminal with it.
+/// NEGATIVE CONTROL: an About tab beside it is captured as its `about` leaf, so the capture ran
+/// over the window's native pages.
+#[test]
+fn a_resources_page_is_not_written_to_the_restore_manifest() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let before = app.windows[&wid].tab_set.len();
+    assert!(app.open_about_tab());
+    assert_eq!(
+        app.open_app(crate::app_control::OpenRequest::SystemResources { section: None })
+            .as_deref(),
+        Ok("app system-resources")
+    );
+    assert_eq!(app.windows[&wid].tab_set.len(), before + 2, "PRECONDITION");
+    let captured = app.capture_manifest(false, false);
+    let window = &captured.windows[0];
+    assert_eq!(
+        window.native_tabs.len(),
+        1,
+        "About's legacy entry alone: {:?}",
+        window.native_tabs
+    );
+    let toml = captured.to_toml().expect("the manifest writes");
+    assert!(!toml.contains("system-resources"), "{toml}");
+    assert_eq!(
+        window.restored_tabs.len(),
+        before + 1,
+        "the terminal tabs and About, not the page"
+    );
+    assert!(
+        toml.contains("restore_tag = \"about\""),
+        "NEGATIVE CONTROL: the About leaf is captured\n{toml}"
+    );
+
+    let (instance, _) = app.active_native_view(wid).expect("the page is in front");
+    assert_eq!(
+        app.native_runtime.app(instance).map(|app| app.kind()),
+        Some(crate::native_app::AppKind::SystemResources),
+        "PRECONDITION: the page's tab is in front"
+    );
+    let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+    let tab = app.windows[&wid].tab_set.active().expect("the page's tab");
+    assert_eq!(
+        tab.root.len(),
+        2,
+        "PRECONDITION: the page beside a terminal"
+    );
+    let captured = app.tab_restore_descriptor(tab);
+    assert!(
+        matches!(
+            captured,
+            Some(restore::RestoredTab {
+                root: restore::RestoredSplitTree::Leaf {
+                    view: restore::RestoredView::Terminal(_)
+                },
+                ..
+            })
+        ),
+        "split beside a terminal, the page is left out and the terminal takes its place: \
+         {captured:?}"
+    );
 }

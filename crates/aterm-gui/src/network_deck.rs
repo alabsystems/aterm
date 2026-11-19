@@ -267,9 +267,10 @@ impl crate::App {
         let Some(ws) = self.windows.get(&wid) else {
             return (0.0, 1.0);
         };
-        let (cw, _) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid);
-        ((ws.cols as usize * cw + 2 * pad) as f32, ws.scale as f32)
+        (
+            self.resource_span(wid, self.window_bars(wid)).width as f32,
+            ws.scale as f32,
+        )
     }
 
     /// Whether a visible window draws the Network State band (in the System Resources band, so

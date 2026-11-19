@@ -27,7 +27,7 @@ use aterm_vitals::jobs::{
     Block, Class, Consumer, Demand, Fd, FdKind, HeldProc, JobCounters, JobKind, JobProc, JobRow,
     JobTab, JobTick, Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, NamingError,
     NamingSelector, NamingTicket, ProcState, Standing, StartWait, SweepProc, TcpState, TermWord,
-    ThreadState, TierB, TtyMode,
+    ThreadState, TierB, TtyMode, Verdict,
 };
 use aterm_vitals::left::{LeftRow, LeftView};
 use aterm_vitals::model::TabRoot;
@@ -37,6 +37,13 @@ use crate::program_check_watch::RunningCheck;
 /// The engine's fast cadence, also the floor between passes, so a 2 Hz lens does not double the
 /// detailed reads.
 const FAST_MS: u64 = 2_000;
+
+/// The longest a resting view ([`rests`]) stands for a reading whose inputs have not moved since
+/// its pass ([`RestKey`]): Slow's 30 s, the pace the engine reads a legitimate wait at.
+const REST_MS: u64 = match Demand::Slow.every_ms() {
+    Some(ms) => ms,
+    None => FAST_MS,
+};
 
 /// One owned native sweep and the canonical zombie judgment made from that exact input.
 /// A cached or synthetic model frame cannot lend its receipt to another native reading.
@@ -99,6 +106,14 @@ impl ProcessFacts {
 
     pub(crate) fn complete(&self) -> bool {
         self.complete
+    }
+
+    /// The receipt a pass admits, by the engine's rule for [`JobTick::zombie_facts`]: the one
+    /// paired with this reading's `source_seq`, and only a whole one; else none.
+    fn admitted_zombies(&self) -> Option<&ZombieFacts> {
+        self.zombies
+            .as_deref()
+            .filter(|z| self.source_seq == Some(z.seq()) && z.whole())
     }
 }
 
@@ -362,6 +377,192 @@ pub(crate) struct JobsPass {
     /// The kernel's exit watches on agent calls' leaders, whose statuses each pass hands the
     /// engine ([`crate::telemetry_host::CallWatch`]).
     calls: crate::telemetry_host::CallWatch,
+    /// What the last pass read, while its view rests ([`rests`]) and the pass before it read the
+    /// same and started no rest ([`Self::settling`]), and the pass clock until which that view
+    /// stands for a reading that reads the same ([`Rest`]); `None` otherwise.
+    rest: Option<Rest>,
+    /// What the last pass read ([`RestKey`]), kept only where its view could rest ([`rests`]) but
+    /// it started no rest: a rest starts only at the next pass, should that one read the same.
+    /// So what the engine leaves to confirm at a job's next pass (a wait name shown at its
+    /// second sighting, a group in front at its second) has that pass at the engine's cadence
+    /// after the pass that read a moved input, and after the pass a rest's bound runs.
+    settling: Option<RestKey>,
+}
+
+/// What a resting view was read from, as a reading's inputs give it before any pass runs: the
+/// identity, program ([`Program`]) and state of each process the sweep holds under a tab's shell
+/// (the shells included), the tabs, their terminal words and feeds and the grant as the request
+/// hands them, the identity and program of this user's live processes of at most
+/// [`HELD_CPU_NS`] (whose start [`held_list`] asks), with the held stand-in, the identity of each
+/// of this user's processes the sweep reads in an uninterruptible wait (Linux's `D`; macOS's
+/// sweep reads none), and the zombie piles of the canonical receipt the pass admits
+/// ([`ProcessFacts::admitted_zombies`]), whose ages the vitals reading judges, each by its parent,
+/// start and count; a process's identity is its pid and start. So a wait that starts or ends, a
+/// pile that comes to count, grows, shrinks, starts again or goes, and a receipt the pass admits
+/// or no longer admits, moves the key; a wait the engine dates but does not name yet ends the
+/// rest when it turns old enough to name ([`Rest`]). What else a pass reads is read again by the
+/// pass at the rest's bound ([`REST_MS`]) at the latest: its members' thread states and CPU, the
+/// machine-wide findings (stopped processes, the name of a pile's parent outside every tab, busy
+/// orphans, this user's process count), a named wait's age and a pile's rate, which with the
+/// waits and the pile's parent, start and count the same move with the clock alone (the view
+/// keeps the findings and the receipt its pass read, as a cached view does), an exited row's
+/// keep, and an exec into a program of the same name by a process that had already run one since
+/// its fork, where the sweep read no pid version for it.
+/// What that pass leaves to confirm shows at the pass after it, which starts no rest
+/// ([`JobsPass::settling`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RestKey {
+    /// Each process under a tab's shell, ascending by pid: its pid, start, program and state.
+    tree: Vec<(u32, Option<u64>, Program, probe::RunState)>,
+    /// The request's tabs, in its order.
+    tabs: Vec<TabRoot>,
+    /// Each tab's terminal word, by its key.
+    ttys: Vec<(u64, TtyMode)>,
+    /// Each tab's feed, by its key.
+    feeds: Vec<(u64, TabFeed)>,
+    /// The grant's facts.
+    grant: GrantFacts,
+    /// This user's live processes of at most [`HELD_CPU_NS`], ascending by pid: its pid, start
+    /// and program.
+    candidates: Vec<(u32, Option<u64>, Program)>,
+    /// The pid a development build stands in as held ([`HeldReaders::stand_in`]).
+    stand_in: Option<u32>,
+    /// This user's processes the sweep reads in an uninterruptible wait, ascending by pid: its
+    /// pid and start.
+    waits: Vec<(u32, Option<u64>)>,
+    /// The admitted receipt's piles, ascending by parent: each one's parent, start
+    /// ([`aterm_vitals::blockage::ZombiePile::since_ms`]) and count; `None` where the pass admits
+    /// no receipt.
+    zombies: Option<Vec<(u32, u64, u32)>>,
+}
+
+/// What a rest's key holds of the program a process runs, as the sweep read it: its pid
+/// version, which each exec takes anew, where the sweep read one (on macOS, with coalitions or
+/// where its usage read was refused: `ProcessReading::version`), and, for an exec where it read
+/// none, its name and whether it has run a program since its fork
+/// (`ProcessReading::{name,exec}`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Program {
+    version: Option<i32>,
+    name: String,
+    exec: Option<bool>,
+}
+
+impl Program {
+    fn of(p: &ProcessReading) -> Self {
+        Self {
+            version: p.version,
+            name: p.name.clone(),
+            exec: p.exec,
+        }
+    }
+}
+
+impl RestKey {
+    /// The key of a reading whose sweep and zombie receipt are `facts`'s, with `tabs`, `ttys`,
+    /// `feeds` and `grant`, this process `self_pid` (whose row names this user) and `stand_in`.
+    fn of(
+        facts: &ProcessFacts,
+        tabs: &[TabRoot],
+        ttys: &[(u64, TtyMode)],
+        feeds: &[(u64, TabFeed)],
+        grant: &GrantFacts,
+        self_pid: u32,
+        stand_in: Option<u32>,
+    ) -> Self {
+        let sweep = facts.sweep().unwrap_or_default();
+        let mut children: HashMap<u32, Vec<&ProcessReading>> = HashMap::new();
+        for p in sweep {
+            children.entry(p.ppid).or_default().push(p);
+        }
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        let mut tree = Vec::new();
+        let mut next: Vec<u32> = tabs
+            .iter()
+            .map(|t| t.shell_pid)
+            .filter(|&pid| pid > 0)
+            .collect();
+        for p in sweep.iter().filter(|p| next.contains(&p.pid)) {
+            if seen.insert(p.pid) {
+                tree.push((p.pid, p.start, Program::of(p), p.state));
+            }
+        }
+        while let Some(parent) = next.pop() {
+            for p in children.get(&parent).into_iter().flatten() {
+                if seen.insert(p.pid) {
+                    tree.push((p.pid, p.start, Program::of(p), p.state));
+                    next.push(p.pid);
+                }
+            }
+        }
+        tree.sort_unstable_by_key(|row| row.0);
+        let uid = sweep.iter().find(|p| p.pid == self_pid).and_then(|p| p.uid);
+        let mut candidates: Vec<_> = sweep
+            .iter()
+            .filter(|p| {
+                uid.is_some()
+                    && p.uid == uid
+                    && p.state != probe::RunState::Zombie
+                    && p.cpu_ns.is_some_and(|c| c <= HELD_CPU_NS)
+            })
+            .map(|p| (p.pid, p.start, Program::of(p)))
+            .collect();
+        candidates.sort_unstable_by_key(|row| row.0);
+        let mut waits: Vec<_> = sweep
+            .iter()
+            .filter(|p| {
+                uid.is_some() && p.uid == uid && p.state == probe::RunState::Uninterruptible
+            })
+            .map(|p| (p.pid, p.start))
+            .collect();
+        waits.sort_unstable_by_key(|row| row.0);
+        Self {
+            tree,
+            tabs: tabs.to_vec(),
+            ttys: ttys.to_vec(),
+            feeds: feeds.to_vec(),
+            grant: grant.clone(),
+            candidates,
+            stand_in,
+            waits,
+            zombies: facts.admitted_zombies().map(|z| {
+                z.piles()
+                    .iter()
+                    .map(|p| (p.parent(), p.since_ms(), p.count()))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// A resting view's inputs ([`RestKey`]) and the pass clock, ms, before which it stands for a
+/// reading that reads the same: its pass's plus [`REST_MS`], or sooner where a start that pass
+/// read with one unrun thread turns [`probe::PROGRAM_CHECK_AGE_MS`] old first, or a wait of this
+/// user's the engine dated and did not name turns old enough to name
+/// ([`Jobs::d_state_due_ms`]).
+#[derive(Debug)]
+struct Rest {
+    key: RestKey,
+    until_ms: u64,
+}
+
+/// Whether `view`, from a pass that listed held programs (`held`) or rows read unrun and not yet
+/// held (`young`, which turn held at [`probe::PROGRAM_CHECK_AGE_MS`] with nothing else moving),
+/// rests: no job to watch ([`Demand::Idle`]), no held or young row, no wait read on a timer
+/// ([`read_on_a_timer`]), and no live agent call, whose leader's exit watch the next pass reads.
+/// Such a view reads nothing on a timer, so a later reading moves it only through its inputs
+/// ([`RestKey`]), what the engine leaves to confirm at its next pass (which
+/// [`JobsPass::settling`] gives that pass before any rest starts), or what the rest's bound
+/// ([`Rest`]) answers.
+fn rests(view: &JobsView, held: bool, young: bool) -> bool {
+    view.demand == Demand::Idle
+        && !held
+        && !young
+        && !read_on_a_timer(view, None)
+        && !view
+            .rows
+            .iter()
+            .any(|r| r.kind == JobKind::AgentCall && r.verdict != Verdict::Exited)
 }
 
 impl JobsPass {
@@ -387,6 +588,8 @@ impl JobsPass {
             observed_at: None,
             ties: BTreeMap::new(),
             calls: crate::telemetry_host::CallWatch::new(!cfg!(test)),
+            rest: None,
+            settling: None,
         }
     }
 
@@ -460,8 +663,13 @@ impl JobsPass {
 
     /// One reading's pass: runs the engine when it is due, or whenever `now` (an edge's reading:
     /// the loop paces those on its own clock, and one landing inside this pass's cadence must
-    /// still look, or the job it was asked for goes unseen until the next edge). Returns the view
-    /// to publish, the last one when the engine did not run.
+    /// still look, or the job it was asked for goes unseen until the next edge). While the last
+    /// pass's view rests ([`rests`]) it is not due until its bound ([`Rest`]: [`REST_MS`] past
+    /// that pass at the latest), or until a reading's inputs ([`RestKey`]) differ from that
+    /// pass's, and then no sooner than the engine's own cadence. A view rests only from the
+    /// second of two passes in a row that read the same inputs, the first of which started no
+    /// rest ([`Self::settling`]). Returns the view to publish, the last one when the engine did
+    /// not run.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn tick(
         &mut self,
@@ -480,30 +688,42 @@ impl JobsPass {
         let Some(sweep) = facts.sweep() else {
             return self.view.clone();
         };
+        let readers = self.held;
+        let stand_in = (readers.stand_in)();
+        let key = || RestKey::of(facts, tabs, ttys, feeds, grant, self_pid, stand_in);
+        let mut keyed = None;
+        if !now
+            && let Some(rest) = self.rest.as_ref()
+            && at_ms < rest.until_ms
+        {
+            let read = key();
+            if read == rest.key {
+                return self.view.clone();
+            }
+            keyed = Some(read);
+        }
         if !now && self.next_ms.is_some_and(|due| at_ms < due) {
             return self.view.clone();
         }
         let self_uid = sweep.iter().find(|p| p.pid == self_pid).and_then(|p| p.uid);
         let readings = sweep;
         let sweep: Vec<SweepProc> = sweep.iter().map(sweep_proc).collect();
-        let tabs = job_tabs(tabs, ttys, feeds, &grant.adopted);
+        let engine_tabs = job_tabs(tabs, ttys, feeds, &grant.adopted);
         let reqs: Vec<ReadReq> = self
             .jobs
-            .plan(&sweep, &tabs)
+            .plan(&sweep, &engine_tabs)
             .iter()
             .map(|w| ReadReq {
                 pid: w.pid,
                 fds: w.fds,
             })
             .collect();
-        let readers = self.held;
-        let stand_in = (readers.stand_in)();
         // Each age is the probe's as its reading starts.
         let probe_ms = read_ms();
         // One wall clock for every start the pass reads, so each fork time is its age before it.
         let now_us = (readers.now_us)();
         let read = self.reader.read_all_at(&reqs, now_us);
-        let roots: BTreeSet<u32> = tabs.iter().map(|t| t.shell_pid).collect();
+        let roots: BTreeSet<u32> = engine_tabs.iter().map(|t| t.shell_pid).collect();
         let fronts = &mut self.fronts;
         let mut procs = job_procs(&read, &roots, stand_in, readers.exec, |p| fronts.front(p));
         // One read per actual native pass, after detailed descriptors were sampled. Never
@@ -527,13 +747,33 @@ impl JobsPass {
         let read_ms = clock();
         let mounts = OnceCell::new();
         let ours = OnceCell::new();
+        // The soonest a start this pass read with one unrun thread turns old enough to judge
+        // ([`probe::PROGRAM_CHECK_AGE_MS`]): until then [`probe::judge_start`] reads it started,
+        // and then it may read held with nothing else moving, so a rest ends there.
+        let judged_in = std::cell::Cell::new(None::<u64>);
+        let note = |f: &StartFacts| {
+            if f.lone_zero
+                && let Some(age) = f.age_ms
+                && age < probe::PROGRAM_CHECK_AGE_MS
+            {
+                let left = probe::PROGRAM_CHECK_AGE_MS - age;
+                judged_in.set(Some(judged_in.get().map_or(left, |t| t.min(left))));
+            }
+        };
+        read.iter()
+            .filter_map(|m| m.start_facts.as_ref())
+            .for_each(note);
         let (mut held, young) = held_list(
             readings,
             &read,
             self_uid,
             stand_in,
             now_us,
-            |pid| (readers.start)(pid, now_us, &mounts),
+            |pid| {
+                let facts = (readers.start)(pid, now_us, &mounts);
+                facts.as_ref().inspect(|f| note(f));
+                facts
+            },
             readers.exec,
             |pid| {
                 let ours = *ours.get_or_init(|| (readers.coalition)(self_pid));
@@ -552,6 +792,7 @@ impl JobsPass {
             }
         }
         self.unrun = unrun;
+        let (listed, unlisted) = (!held.is_empty(), !young.is_empty());
         let lanes = self.reader.lanes();
         // The statuses of watched calls' leaders read since the last pass, each at its own moment
         // on this pass's clock: read after the sweep, so a leader it no longer lists has left its
@@ -568,7 +809,7 @@ impl JobsPass {
             source_seq: facts.source_seq,
             zombie_facts: facts.zombies.clone(),
             procs,
-            tabs,
+            tabs: engine_tabs,
             machine: Machine {
                 stretch_milli: crate::input_stall::machine_contention().factor_milli(),
                 thrashing,
@@ -590,6 +831,21 @@ impl JobsPass {
         self.naming_fresh = true;
         self.observed_at = None;
         self.next_ms = Some(at_ms + next_pass_ms(view.demand));
+        let settling = self.settling.take();
+        self.rest = None;
+        if rests(&view, listed, unlisted) {
+            let read = keyed.unwrap_or_else(key);
+            if settling.as_ref() == Some(&read) {
+                self.rest = Some(Rest {
+                    key: read,
+                    until_ms: at_ms
+                        .saturating_add(judged_in.get().map_or(REST_MS, |t| t.min(REST_MS)))
+                        .min(self.jobs.d_state_due_ms().unwrap_or(u64::MAX)),
+                });
+            } else {
+                self.settling = Some(read);
+            }
+        }
         self.view = Some(Arc::new(view));
         self.view.clone()
     }
@@ -1422,7 +1678,9 @@ fn background_call(r: &JobRow) -> BackgroundCall {
 /// How long until the next pass after one whose demand was `demand`: the
 /// engine's interval, never under [`FAST_MS`]; an idle engine (no job, or
 /// only waits for the person) looks again at the fast cadence, since a job
-/// can start at any keystroke.
+/// can start at any keystroke, unless its view rests ([`JobsPass::tick`]):
+/// then a reading that is no edge's makes a pass only once its inputs move
+/// ([`RestKey`]) or the rest's bound passes, [`REST_MS`] at the latest.
 fn next_pass_ms(demand: Demand) -> u64 {
     demand.every_ms().unwrap_or(FAST_MS).max(FAST_MS)
 }
@@ -1511,7 +1769,59 @@ fn job_tabs(
 #[derive(Debug, Default)]
 pub(crate) struct JobFeed(Mutex<Fed>, crate::telemetry_host::CmdMeter);
 
+#[derive(Debug)]
+struct OutputHistory {
+    bytes: Mutex<aterm_session::terminal_stream::ByteHistory>,
+    stopped: std::sync::OnceLock<Instant>,
+}
+
+/// A physical PTY reader's observation lifetime, including periods in which it reads no bytes.
+/// A successor owns a new history even if its session and inherited PTY keep their identities.
+pub(crate) struct OutputReader(Arc<OutputHistory>);
+
+impl OutputReader {
+    pub(crate) fn record(&self, at: Instant, bytes: usize) {
+        self.0
+            .bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record(at, u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+}
+
+impl Drop for OutputReader {
+    fn drop(&mut self) {
+        let _ = self.0.stopped.set(Instant::now());
+    }
+}
+
 impl JobFeed {
+    pub(crate) fn start_output_reading(&self, at: Instant) -> OutputReader {
+        let history = Arc::new(OutputHistory {
+            bytes: Mutex::new(aterm_session::terminal_stream::ByteHistory::new(at)),
+            stopped: std::sync::OnceLock::new(),
+        });
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .output_history = Some(history.clone());
+        OutputReader(history)
+    }
+
+    /// Raw bytes per second over closed intervals, with a gap before the reader started or
+    /// after it stopped. Parsing or repainting a pane never advances this history.
+    pub(crate) fn output_byte_rates(&self, at: Instant) -> [Option<f64>; 12] {
+        let fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(history) = &fed.output_history else {
+            return [None; 12];
+        };
+        history
+            .bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .rates(at, history.stopped.get().copied().unwrap_or(at))
+    }
+
     /// The session's command edges for its telemetry rows ([`crate::telemetry_host::CmdMeter`]).
     pub(crate) const fn meter(&self) -> &crate::telemetry_host::CmdMeter {
         &self.1
@@ -1520,6 +1830,7 @@ impl JobFeed {
 
 #[derive(Debug, Default)]
 struct Fed {
+    output_history: Option<Arc<OutputHistory>>,
     output: Option<Instant>,
     line: Option<Instant>,
     /// The newest moving feed that drew the screen ([`Lines::drawn`]).
@@ -1552,6 +1863,8 @@ struct Fed {
     /// (`ProgramStateReport::other`), else the known programs' while its writer's group holds the
     /// front (`ProgramStateReport::sign`).
     program: Option<aterm_core::terminal::program_state::ProgramState>,
+    /// Whether the program reported during the current shell command.
+    named_in_command: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1632,6 +1945,7 @@ impl JobFeed {
         let lines = Lines::of(chunk);
         let mut fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         fed.program = program;
+        fed.named_in_command = term.program_reported_in_command();
         let line = lines.ends && (lines.ended || lines.tail || fed.text);
         fed.text = lines.tail || (fed.text && !lines.ends);
         let marked = marks.is_some() && marks != fed.marks;
@@ -1727,11 +2041,22 @@ impl JobFeed {
     /// group, as on Windows), and is none of the session's. A program stopped there (`^Z`) is in
     /// front again once its shell runs it (`fg`), and its report is its word again. Read without
     /// the term lock.
-    pub(crate) fn program(&self) -> Option<aterm_core::terminal::program_state::ProgramState> {
+    /// Its second reading is the identity established in this command.
+    pub(crate) fn program(
+        &self,
+    ) -> (
+        Option<aterm_core::terminal::program_state::ProgramState>,
+        Option<aterm_core::terminal::program_state::ProgramApp>,
+    ) {
         let fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let at_its_prompt =
             fed.marks.is_some() && !fed.block.as_ref().is_some_and(|block| block.open);
-        fed.program.filter(|_| !at_its_prompt)
+        if at_its_prompt {
+            (None, None)
+        } else {
+            let named = fed.program.filter(|_| fed.named_in_command);
+            (fed.program, named.map(|state| state.app))
+        }
     }
 
     /// The feed now: [`Self::at_pass`] with no pass's clock.

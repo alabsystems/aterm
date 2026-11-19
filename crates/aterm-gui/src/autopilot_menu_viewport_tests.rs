@@ -172,6 +172,8 @@ fn capture(app: &mut App, wid: WindowId, path: &std::path::Path) {
             session: None,
             want_bytes: true,
             want_metadata: false,
+            whole_client: false,
+            presentation: None,
             frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
             cancel: crate::control::CaptureCancellation::new(),
             reply,
@@ -206,7 +208,7 @@ fn large_account_popup_viewport_gallery() {
         capture(&mut app, wid, &gallery.join(&file));
         manifest.push_str(&format!("initial\t{cols}\t14\t{file}\n"));
         // The pin row is enabled, so the keys reach it, only where the manual sign-in queue is
-        // (`accounts::manual_signin_capability`: not on Windows).
+        // (`accounts::manual_signin_capability`).
         let rotate = aterm_agent::harness::accounts::manual_signin_capability()
             == aterm_agent::harness::accounts::ManualSigninCapability::Available;
         let expected: BTreeSet<_> = (0..64)
@@ -316,8 +318,8 @@ fn an_unpainted_or_previously_hidden_action_cannot_be_chosen() {
     // geometry instead of retaining the intentional gaps of removed choices. The Account card
     // draws no tab name (`fact_menu_account::head_rows`), so the head is the one a renamed
     // pane's other cards draw (`header_rows`). Without it every fresh row took a place of the old
-    // card's on Windows, whose card says in notes that signing in by hand is unavailable there
-    // (ATERM-KI-1105-14), and the refresh kept the 87 rows' geometry.
+    // card's where the card says in notes that signing in by hand is unavailable
+    // (`accounts::manual_signin_capability`), and the refresh kept the 87 rows' geometry.
     let title = "Replacement pool";
     let mut fresh = crate::fact_menu::rows(
         Fact::Account,

@@ -442,7 +442,10 @@ impl MetalBlit {
                 uniform: &blit_u,
                 uniform_slot: bb.fragment_buffers[0] as usize,
             },
-            rect: scissor,
+            rects: [
+                (scissor[0] < scissor[2] && scissor[1] < scissor[3]).then_some(scissor),
+                None,
+            ],
         };
         encode_dock_stage(&mut cb, &dock_pass)?;
         {

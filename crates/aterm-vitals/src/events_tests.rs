@@ -32,7 +32,7 @@ fn pressure_and_thermal_changes_are_events_and_the_first_reading_is_not() {
         ..MemView::default()
     });
     s.thermal = Some(Thermal::default());
-    assert!(d.detect(&s).is_empty());
+    assert!(d.detect(&s, &[]).is_empty());
     let mut s2 = snap(2, 2);
     s2.mem = s.mem.clone();
     s2.mem.as_mut().unwrap().sample.pressure = Pressure::Warn;
@@ -42,7 +42,7 @@ fn pressure_and_thermal_changes_are_events_and_the_first_reading_is_not() {
         low_power: None,
         exact: true,
     });
-    let e = d.detect(&s2);
+    let e = d.detect(&s2, &[]);
     assert_eq!(kinds(&e), ["pressure", "thermal"]);
     assert_eq!(e[0].seq, 2);
     assert_eq!(
@@ -55,7 +55,7 @@ fn pressure_and_thermal_changes_are_events_and_the_first_reading_is_not() {
     let mut s3 = snap(3, 3);
     s3.mem = s2.mem.clone();
     s3.mem.as_mut().unwrap().sample.pressure = Pressure::Unknown;
-    assert!(d.detect(&s3).is_empty());
+    assert!(d.detect(&s3, &[]).is_empty());
 }
 
 #[test]
@@ -76,8 +76,8 @@ fn swap_traffic_starting_and_stopping_are_events() {
         });
         s
     };
-    assert!(d.detect(&at(1, 0.0)).is_empty());
-    let e = d.detect(&at(2, 5e6));
+    assert!(d.detect(&at(1, 0.0), &[]).is_empty());
+    let e = d.detect(&at(2, 5e6), &[]);
     assert_eq!(
         e[0].kind,
         EventKind::Swap {
@@ -85,9 +85,9 @@ fn swap_traffic_starting_and_stopping_are_events() {
             bps: 5_000_000
         }
     );
-    assert!(d.detect(&at(3, 4e6)).is_empty());
-    assert!(d.detect(&at(3, f64::NAN)).is_empty());
-    let e = d.detect(&at(4, 0.0));
+    assert!(d.detect(&at(3, 4e6), &[]).is_empty());
+    assert!(d.detect(&at(3, f64::NAN), &[]).is_empty());
+    let e = d.detect(&at(4, 0.0), &[]);
     assert_eq!(
         e[0].kind,
         EventKind::Swap {
@@ -110,8 +110,8 @@ fn free_space_crossing_a_line_either_way_is_an_event() {
         });
         s
     };
-    assert!(d.detect(&at(1, 50_000_000_000)).is_empty());
-    let e = d.detect(&at(2, 9_000_000_000));
+    assert!(d.detect(&at(1, 50_000_000_000), &[]).is_empty());
+    let e = d.detect(&at(2, 9_000_000_000), &[]);
     assert_eq!(e.len(), 1);
     assert!(matches!(
         e[0].kind,
@@ -121,7 +121,7 @@ fn free_space_crossing_a_line_either_way_is_an_event() {
             ..
         }
     ));
-    let e = d.detect(&at(3, 500_000_000));
+    let e = d.detect(&at(3, 500_000_000), &[]);
     let lines: Vec<&str> = e
         .iter()
         .map(|e| match &e.kind {
@@ -130,7 +130,7 @@ fn free_space_crossing_a_line_either_way_is_an_event() {
         })
         .collect();
     assert_eq!(lines, ["5%", "1GB"]);
-    let e = d.detect(&at(4, 50_000_000_000));
+    let e = d.detect(&at(4, 50_000_000_000), &[]);
     assert_eq!(e.len(), 3);
     assert!(
         e.iter()
@@ -150,13 +150,13 @@ fn a_load_move_of_a_core_that_holds_ten_seconds_is_one_event() {
         s.global.top = Some(("trustc".into(), 2.0));
         s
     };
-    assert!(d.detect(&at(1, 0.5)).is_empty());
-    assert!(d.detect(&at(2, 3.0)).is_empty());
-    assert!(d.detect(&at(3, 0.6)).is_empty());
+    assert!(d.detect(&at(1, 0.5), &[]).is_empty());
+    assert!(d.detect(&at(2, 3.0), &[]).is_empty());
+    assert!(d.detect(&at(3, 0.6), &[]).is_empty());
     for t in 4..14 {
-        assert!(d.detect(&at(t, 3.0)).is_empty(), "t={t}");
+        assert!(d.detect(&at(t, 3.0), &[]).is_empty(), "t={t}");
     }
-    let e = d.detect(&at(14, 3.1));
+    let e = d.detect(&at(14, 3.1), &[]);
     assert_eq!(
         e[0].kind,
         EventKind::Load {
@@ -167,20 +167,20 @@ fn a_load_move_of_a_core_that_holds_ten_seconds_is_one_event() {
         }
     );
     for t in 15..40 {
-        assert!(d.detect(&at(t, 3.1)).is_empty());
+        assert!(d.detect(&at(t, 3.1), &[]).is_empty());
     }
     for t in 41..56 {
         assert!(
-            d.detect(&at(t, f32::NAN)).is_empty(),
+            d.detect(&at(t, f32::NAN), &[]).is_empty(),
             "a NaN level is no move (t={t})"
         );
     }
-    assert!(d.detect(&at(56, f32::INFINITY)).is_empty());
+    assert!(d.detect(&at(56, f32::INFINITY), &[]).is_empty());
     for t in 57..67 {
-        assert!(d.detect(&at(t, 0.5)).is_empty(), "t={t}");
+        assert!(d.detect(&at(t, 0.5), &[]).is_empty(), "t={t}");
     }
     assert_eq!(
-        d.detect(&at(67, 0.5))[0].kind,
+        d.detect(&at(67, 0.5), &[])[0].kind,
         EventKind::Load {
             scope: LoadScope::Global,
             from_mc: 3100,
@@ -210,8 +210,8 @@ fn tabs_opening_and_closing_are_events_after_the_first_sweep() {
             .collect();
         s
     };
-    assert!(d.detect(&at(1, &[1, 2])).is_empty());
-    let e = d.detect(&at(2, &[2, 3]));
+    assert!(d.detect(&at(1, &[1, 2]), &[]).is_empty());
+    let e = d.detect(&at(2, &[2, 3]), &[]);
     assert_eq!(
         e.iter().map(|e| e.kind.clone()).collect::<Vec<_>>(),
         [
@@ -227,7 +227,11 @@ fn tabs_opening_and_closing_are_events_after_the_first_sweep() {
             }
         ]
     );
-    assert!(d.detect(&snap(3, 3)).iter().all(|e| e.kind.word() != "tab"));
+    assert!(
+        d.detect(&snap(3, 3), &[])
+            .iter()
+            .all(|e| e.kind.word() != "tab")
+    );
 }
 
 #[test]
@@ -235,14 +239,14 @@ fn a_reader_going_away_and_coming_back_is_a_lane_event() {
     let mut d = Detector::default();
     let mut s = snap(1, 1);
     s.mem = Some(MemView::default());
-    assert!(d.detect(&s).is_empty());
-    let e = d.detect(&snap(2, 2));
+    assert!(d.detect(&s, &[]).is_empty());
+    let e = d.detect(&snap(2, 2), &[]);
     assert!(e.iter().any(|e| e.kind
         == EventKind::Lane {
             lane: "mem",
             available: false
         }));
-    let e = d.detect(&s);
+    let e = d.detect(&s, &[]);
     assert!(e.iter().any(|e| e.kind
         == EventKind::Lane {
             lane: "mem",
@@ -263,6 +267,9 @@ fn a_closed_tab_whose_processes_live_on_is_an_orphan_event() {
         scope: ScopeView::default(),
     };
     let proc = |pid: u32, name: &str, scope: RowScope, cores: f32| ProcView {
+        group: None,
+        energy_mw: None,
+        energy_read_span_ns: None,
         scheduling: None,
         cpu_accounting: crate::model::CpuAccounting::default(),
         pid,
@@ -291,7 +298,7 @@ fn a_closed_tab_whose_processes_live_on_is_an_orphan_event() {
         proc(12, "make", RowScope::Tab(2), 0.9),
         proc(20, "sh", RowScope::Tab(1), 0.0),
     ];
-    assert!(d.detect(&s1).is_empty());
+    assert!(d.detect(&s1, &[]).is_empty());
     let mut s2 = snap(2, 2);
     s2.aterm = Some(ScopeView::default());
     s2.tabs = vec![tab(1)];
@@ -300,7 +307,7 @@ fn a_closed_tab_whose_processes_live_on_is_an_orphan_event() {
         proc(12, "cc", RowScope::Others, 0.9),
         proc(20, "sh", RowScope::Tab(1), 0.0),
     ];
-    let e = d.detect(&s2);
+    let e = d.detect(&s2, &[]);
     assert_eq!(kinds(&e), ["tab", "orphan"]);
     assert_eq!(
         e[1].kind,
@@ -315,7 +322,7 @@ fn a_closed_tab_whose_processes_live_on_is_an_orphan_event() {
     s3.aterm = Some(ScopeView::default());
     s3.tabs = Vec::new();
     s3.procs = vec![proc(11, "node", RowScope::Others, 0.4)];
-    assert_eq!(kinds(&d.detect(&s3)), ["tab"]);
+    assert_eq!(kinds(&d.detect(&s3, &[])), ["tab"]);
 }
 
 #[test]
@@ -334,6 +341,8 @@ fn a_job_whose_verdict_moves_is_a_job_event_and_a_steady_one_is_not() {
         ]),
         5,
         9,
+        None,
+        &[],
     );
     assert!(w.seeded());
     assert_eq!(e.len(), 1, "{e:?}");
@@ -346,7 +355,7 @@ fn a_job_whose_verdict_moves_is_a_job_event_and_a_steady_one_is_not() {
         row("a1", 7, Class::Running, Verdict::Fine),
         stuck("a2", 7),
     ]);
-    assert!(w.step(&steady, 6, 10).is_empty());
+    assert!(w.step(&steady, 6, 10, None, &[]).is_empty());
     let mut done = row("a1", 7, Class::Exited, Verdict::Exited);
     done.exit = Some(0);
     let e = w.step(
@@ -357,6 +366,8 @@ fn a_job_whose_verdict_moves_is_a_job_event_and_a_steady_one_is_not() {
         ]),
         7,
         11,
+        None,
+        &[],
     );
     assert_eq!(e.len(), 1, "{e:?}");
     assert_eq!(
@@ -379,4 +390,66 @@ fn millicores_round_and_never_go_negative() {
     assert_eq!(millicores(1.2345), 1235);
     assert_eq!(millicores(-1.0), 0);
     assert_eq!(millicores(f32::NAN), 0);
+}
+
+#[test]
+fn event_sources_keep_original_wall_time_and_closed_session_generation() {
+    let old = SessionScope {
+        local: 7,
+        sid: "t0000000001".into(),
+        nonce: "11".repeat(16),
+    };
+    let new = SessionScope {
+        nonce: "22".repeat(16),
+        ..old.clone()
+    };
+    let mut detector = Detector::default();
+    let mut first = snap(1, 1);
+    first.at_unix_ms = 10_000;
+    first.aterm = Some(ScopeView::default());
+    first.tabs = vec![TabView {
+        key: 7,
+        label: "private old label".into(),
+        ..TabView::default()
+    }];
+    assert!(
+        detector
+            .detect(&first, std::slice::from_ref(&old))
+            .is_empty()
+    );
+    let mut closed = snap(2, 2);
+    closed.at_unix_ms = 20_000;
+    closed.aterm = Some(ScopeView::default());
+    let events = detector.detect(&closed, std::slice::from_ref(&new));
+    let event = events
+        .iter()
+        .find(|event| matches!(event.kind, EventKind::Tab { opened: false, .. }))
+        .unwrap()
+        .clone();
+    assert_eq!(event.scope, EventScope::Session(old));
+    assert_eq!(event.at_unix_ms, Some(20_000));
+    assert_eq!(event.span(), None);
+    let mut reopened = first;
+    reopened.seq = 3;
+    reopened.at_ns = 3_000_000_000;
+    reopened.at_unix_ms = 1_000;
+    let current = detector.detect(&reopened, std::slice::from_ref(&new));
+    assert_eq!(
+        current
+            .iter()
+            .find(|event| matches!(event.kind, EventKind::Tab { opened: true, .. }))
+            .unwrap()
+            .scope,
+        EventScope::Session(new.clone())
+    );
+    assert_eq!(
+        event.at_unix_ms,
+        Some(20_000),
+        "a later wall backstep cannot move an older event"
+    );
+    assert_eq!(
+        EventScope::session(7, &[new.clone(), new]),
+        EventScope::Unknown,
+        "ambiguous source never grants authority"
+    );
 }

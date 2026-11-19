@@ -9,6 +9,30 @@ use crate::native_ui::ActionId;
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::trail_sound::{SoundGesture, SoundKind, SoundVoice};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn close_idle_tabs_reports_zero_on_the_requesting_settings_view() {
+    let mut app = App::headless_for_test();
+    let wid = crate::WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Tabs));
+    let (_, view) = app.active_native_view(wid).unwrap();
+    app.dispatch_native_view_event(
+        wid,
+        view,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new(crate::native_settings::tabs_page::TABS_CLOSE_IDLE),
+            value: None,
+        }),
+    )
+    .unwrap();
+    let Some(crate::native_app::AppViewState::Settings(state)) =
+        app.native_runtime.view_state(view)
+    else {
+        panic!("the requesting Settings view stays open");
+    };
+    assert_eq!(state.feedback.as_deref(), Some("No tabs closed."));
+}
+
 #[test]
 fn an_idle_pass_and_a_frame_of_the_clock_keep_the_chrome_decided() {
     use crate::native_app::AppViewState;
@@ -1593,6 +1617,7 @@ fn the_automatic_step_waits_for_a_full_disk_access_reading_still_out() {
         app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
             revision: 1,
             allowed: true,
+            person_access: true,
         }));
         app.set_privacy_for_test(crate::app_config::PrivacyConfig {
             probe_interval_ms: Some(3_600_000),
@@ -1695,6 +1720,7 @@ fn a_hand_over_judged_quiet_before_spctl_is_judged_again_when_it_ends() {
     app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
         revision: 1,
         allowed: true,
+        person_access: true,
     }));
     app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
         aterm_containment::consent::FdaProbe {
@@ -1804,6 +1830,7 @@ fn an_automatic_hand_over_refused_as_unknown_asks_again_at_the_next_reading() {
         app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
             revision: 1,
             allowed: true,
+            person_access: true,
         }));
         app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
             aterm_containment::consent::FdaProbe {

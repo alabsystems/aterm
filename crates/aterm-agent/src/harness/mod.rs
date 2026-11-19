@@ -45,7 +45,6 @@ pub mod agy_signin;
 pub mod ai_pool;
 #[cfg(unix)]
 pub mod ai_signin;
-pub mod alab_exports;
 pub mod alab_roster;
 pub mod alab_seen;
 pub mod align;
@@ -103,6 +102,7 @@ pub mod google_direct;
 pub(crate) mod google_federation;
 pub mod google_identity;
 pub mod google_profile;
+pub mod graph_records;
 pub mod grok_signin;
 pub mod headless_fetch;
 pub mod headless_oauth;
@@ -119,6 +119,8 @@ pub mod lights;
 pub mod login_adoption;
 pub mod login_drive;
 pub mod login_latch;
+/// The credential behind each login, as facts for its `ai/logins` row (plan package SF-34).
+pub mod login_token;
 /// What a footer read looked at before it read, for the resolver that watches its inputs.
 pub mod looks;
 pub mod mail_browser;
@@ -168,6 +170,8 @@ pub mod registry;
 pub mod relaunch;
 pub mod remote_renew;
 pub mod repo_work;
+#[cfg(unix)]
+pub mod resident;
 pub mod restart_stamp;
 pub mod result;
 pub mod resume;

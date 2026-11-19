@@ -75,9 +75,17 @@ aterm-spec-anchor = { workspace = true }
 aterm-dirfd = { workspace = true }
 # No-follow, close-on-exec opens for the private complete-source inventory.
 libc = { workspace = true }
+
+[target.'cfg(any(unix, windows))'.dependencies]
 # The vault's entries (gh_access_token, gh_access_token_alabsystems, any `~/.secrets/NAME`
-# token_file), read in place from this Mac's verified store: no file under ~/.secrets is read.
+# token_file), read in place from this host's verified store: no file under ~/.secrets is read.
+# Its client builds on Unix and Windows.
 aterm-secrets = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Windows comparison keys (`windows_key`): a token_file spelled in another case, or verbatim
+# (`\\?\C:\…`), under ~/.secrets is still the vault entry, never a file there.
+aterm-path = { workspace = true }
 
 [dev-dependencies]
 aterm-sysprobe = { workspace = true }

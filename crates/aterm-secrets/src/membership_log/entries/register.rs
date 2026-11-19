@@ -146,6 +146,9 @@ struct Held {
     deletes: bool,
 }
 
+/// Whether a rep a register holds no op of lies in the past of the held record at an index.
+pub(super) type Outside<'a> = &'a dyn Fn(&RecordId, usize) -> bool;
+
 /// One register's ops (in causal order, as `CandidateOp`s), which of them are carries, and what
 /// each stands for.
 pub(super) struct Register<'a> {
@@ -160,7 +163,7 @@ pub(super) struct Register<'a> {
     /// ([`CandidateOp::stated`]): ops a prune dropped, or ops this reader did not open.
     outside_reps: Vec<RecordId>,
     /// Whether such a rep lies in the past of the held record at an index.
-    outside: Option<&'a dyn Fn(&RecordId, usize) -> bool>,
+    outside: Option<Outside<'a>>,
     /// What a writer held at each distinct frontier read so far, by its first word's place in
     /// the index and then its words.
     memo: HashMap<usize, HashMap<Box<[u64]>, Held>>,
@@ -170,10 +173,7 @@ pub(super) struct Register<'a> {
 }
 
 impl<'a> Register<'a> {
-    fn new(
-        cands: &'a [CandidateOp],
-        outside: Option<&'a dyn Fn(&RecordId, usize) -> bool>,
-    ) -> Self {
+    fn new(cands: &'a [CandidateOp], outside: Option<Outside<'a>>) -> Self {
         let mut classes: BTreeMap<Writes<'a>, usize> = BTreeMap::new();
         let class = cands
             .iter()
@@ -208,7 +208,7 @@ impl<'a> Register<'a> {
     pub(super) fn classify_all<P, I>(
         registers: &[&'a [CandidateOp]],
         reach: &Reach,
-        outside: Option<&'a dyn Fn(&RecordId, usize) -> bool>,
+        outside: Option<Outside<'a>>,
         parents: P,
     ) -> Vec<Self>
     where

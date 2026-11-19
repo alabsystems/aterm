@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! macOS `sudo` askpass password sheet attached to the asking session's active window.
+//! macOS `sudo` askpass password sheet attached to the asking session's active window, or, for
+//! an operation a page's button started, to that page's window ([`SheetOrigin`]).
 
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -17,15 +18,27 @@ pub(crate) fn sheets_open() -> bool {
     crate::askpass::PROMPT_INPUT.with_post(|| ()).is_err()
 }
 
+/// What a password sheet stands for: the terminal session whose `sudo` asked, or the page's view
+/// whose button started the operation that asked. It goes when its origin goes
+/// ([`App::withdraw_askpass_session`], [`App::withdraw_askpass_view`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SheetOrigin {
+    Session(u64),
+    View(crate::tab_model::ViewId),
+}
+
 /// One outstanding password sheet and the channel back to the waiting helper.
 pub(crate) struct AskpassSheet {
     pub id: u64,
     ticket: std::sync::Arc<crate::askpass::AskpassTicket>,
     window: crate::WindowId,
-    session: u64,
-    owned: Option<std::sync::Arc<crate::cpu_policy_authorization::Operation>>,
+    origin: SheetOrigin,
+    owned: Option<crate::root_step_authorization::OwnedOperation>,
     /// When it went up, for the untouched-sheet backstop (`App::refuse_untouched_askpass_sheet`).
     raised: Instant,
+    /// When it went up on the wall clock, for the spacing record's standing field
+    /// (`App::persist_askpass_quiet`); `None` where the wall clock could not be read.
+    raised_wall_ms: Option<u64>,
     /// Whether a person has touched it (`crate::askpass::PasswordInput::touched`).
     input: std::sync::Arc<crate::askpass::PasswordInput>,
     reply: Sender<AskpassAnswer>,
@@ -96,15 +109,47 @@ impl AskpassSheet {
                 raised + crate::askpass::ASKPASS_DEADLINE,
             )),
             window,
-            session,
+            origin: SheetOrigin::Session(session),
             owned: None,
             raised,
+            raised_wall_ms: aterm_time::unix_millis().map(|wall| {
+                let ago = Instant::now().saturating_duration_since(raised);
+                wall.saturating_sub(u64::try_from(ago.as_millis()).unwrap_or(u64::MAX))
+            }),
             input: std::sync::Arc::clone(&input),
             reply,
             chrome: SheetChrome::Headless,
         };
         (sheet, input)
     }
+
+    /// The window it hangs on and what it stands for.
+    pub(crate) const fn origin_for_test(&self) -> (crate::WindowId, SheetOrigin) {
+        (self.window, self.origin)
+    }
+}
+
+/// How a password sheet came down, which says what spacing it feeds
+/// ([`App::end_askpass_sheet`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SheetEnd {
+    /// A person allowed it with a password: every part of the spacing clears.
+    Answered,
+    /// A person cancelled it (on the sheet, or by the System Resources page's Cancel of the
+    /// operation it stands for), or allowed it with the field empty: its window and session wait.
+    Declined,
+    /// It went unanswered: its deadline, its caller's hang-up, a withdrawn request, its session,
+    /// its window or its page's view closing or leaving the front. Its window and session wait
+    /// unless the window or the view went with it (`window_spacing` false); every window waits
+    /// when nobody touched it.
+    Lapsed { window_spacing: bool },
+    /// An update's apply refused it, untouched (`App::refuse_untouched_askpass_sheet`): its
+    /// window and session wait and so does every window. The apply that refused it stands for
+    /// the change on the desk, so it revokes nothing.
+    Backstop,
+    /// It came down with no answer counted: its request was withdrawn or its operation's origin
+    /// went before the answer could be used, or the password could not be read.
+    Gone,
 }
 
 struct PasswordDetails {
@@ -216,15 +261,15 @@ impl App {
             return;
         }
 
-        let (wid, session) = if let Some(operation) = &owned {
-            if !self.cpu_policy_origin_live(operation) {
+        let (wid, origin) = if let Some(operation) = &owned {
+            if !self.owned_origin_live(operation) {
                 ticket.cancel();
                 let _ = reply.send(AskpassAnswer::Refused(
                     "originating resource panel is gone".into(),
                 ));
                 return;
             }
-            operation.origin()
+            (operation.origin().window(), operation.origin().sheet())
         } else {
             let sessions: Vec<(u64, i32)> = self.pool.iter().map(|s| (s.id, s.pid)).collect();
             let session = crate::consent_observer::session_of_pid(
@@ -244,14 +289,23 @@ impl App {
                 ));
                 return;
             };
-            (wid, session)
+            (wid, SheetOrigin::Session(session))
         };
+        // The spacing keeps a program that re-asks from standing a sheet with no gap. A request
+        // is let past the unattended part when a person stood behind it after that part's last
+        // end: in the asking session, or by the key or press that started its owned operation. A
+        // page's sheet is held by that part alone ([`Self::askpass_refusal`]).
         let now = Instant::now();
-        if let Some(rem) = self.askpass_backoff.quiet_for(wid.0, now) {
-            let _ = reply.send(AskpassAnswer::Refused(format!(
-                "a recent prompt was cancelled or left unanswered; retry in {}s",
-                rem.as_secs() + 1
-            )));
+        let person_at = later(
+            owned
+                .as_ref()
+                .and_then(crate::root_step_authorization::OwnedOperation::person_at),
+            origin
+                .session()
+                .and_then(|session| self.askpass_person_at(session, now)),
+        );
+        if let Some(rem) = self.askpass_refusal(wid, origin, person_at, now) {
+            let _ = reply.send(AskpassAnswer::Quiet(rem));
             return;
         }
         if self.askpass_sheet.is_some() {
@@ -260,7 +314,11 @@ impl App {
             ));
             return;
         }
-        if !self.is_visible_session(session) {
+        let in_front = match origin {
+            SheetOrigin::Session(session) => self.is_visible_session(session),
+            SheetOrigin::View(view) => self.view_in_front(wid, view),
+        };
+        if !in_front {
             let _ = reply.send(AskpassAnswer::Refused(
                 "not-frontmost; focus the tab and retry".into(),
             ));
@@ -268,7 +326,7 @@ impl App {
         }
         self.build_askpass_sheet(
             wid,
-            session,
+            origin,
             (&command, &invoker, exact, purpose.as_deref()),
             owned,
             ticket,
@@ -280,15 +338,33 @@ impl App {
     fn build_askpass_sheet(
         &mut self,
         wid: crate::WindowId,
-        session: u64,
+        origin: SheetOrigin,
         (command, invoker, exact, purpose): (&str, &str, bool, Option<&str>),
-        owned: Option<std::sync::Arc<crate::cpu_policy_authorization::Operation>>,
+        owned: Option<crate::root_step_authorization::OwnedOperation>,
         ticket: std::sync::Arc<crate::askpass::AskpassTicket>,
         reply: Sender<AskpassAnswer>,
     ) {
         let refuse = |reply: Sender<AskpassAnswer>, why: &str| {
             let _ = reply.send(AskpassAnswer::Refused(why.to_string()));
         };
+        // A headless test's App raises a sheet no window shows, past every gate a real one
+        // passes: what it hangs on and stands for are the rest of [`AskpassSheet`].
+        #[cfg(test)]
+        if self.headless {
+            self.stand_askpass_sheet(AskpassSheet {
+                id: ticket.id,
+                ticket,
+                window: wid,
+                origin,
+                owned,
+                raised: Instant::now(),
+                raised_wall_ms: aterm_time::unix_millis(),
+                input: std::sync::Arc::new(crate::askpass::PasswordInput::new()),
+                reply,
+                chrome: SheetChrome::Headless,
+            });
+            return;
+        }
         let Some(mtm) = MainThread::new() else {
             return refuse(reply, "headless");
         };
@@ -312,16 +388,16 @@ impl App {
         };
 
         let id = ticket.id;
-        let (message, details) = if owned.is_some() {
-            ("Authorize CPU diagnostics".to_owned(),
-             "Read CPU scheduling information and save a diagnostic report. Authorization applies to this collection only.".to_owned())
+        let (message, details) = if let Some(operation) = &owned {
+            operation.sheet_words()
         } else if exact {
             (
                 purpose
                     .unwrap_or("Enter your system sudo password to allow this change.")
                     .to_owned(),
                 format!(
-                    "Session {session}\n\n{command}\n\nAsked by:\n{invoker}\n\nYour password authorizes this one command, not later ones. A shell or script can go on to run anything."
+                    "{}\n\n{command}\n\nAsked by:\n{invoker}\n\nYour password authorizes this one command, not later ones. A shell or script can go on to run anything.",
+                    origin.words()
                 ),
             )
         } else {
@@ -453,13 +529,14 @@ impl App {
             Err(why) => return refuse(reply, why),
         };
 
-        self.askpass_sheet = Some(AskpassSheet {
+        self.stand_askpass_sheet(AskpassSheet {
             id,
             ticket,
             window: wid,
-            session,
+            origin,
             owned,
             raised: Instant::now(),
+            raised_wall_ms: aterm_time::unix_millis(),
             input,
             reply,
             chrome: SheetChrome::Shown {
@@ -473,60 +550,216 @@ impl App {
         });
     }
 
-    /// Read the answered secure field once, reply with the secret or cancel, and update backoff.
+    /// Put `sheet` up: a change on the desk, so it stands a pending handoff down, and the spacing
+    /// record names it as standing, so a crash under it still counts it as a sheet that went
+    /// unanswered.
+    pub(crate) fn stand_askpass_sheet(&mut self, sheet: AskpassSheet) {
+        self.askpass_sheet = Some(sheet);
+        self.note_update_handoff_activity();
+        self.persist_askpass_quiet();
+    }
+
+    /// The one way a taken password sheet comes down: it feeds the spacing `end` names
+    /// ([`SheetEnd`]) at `now`, is dropped (which takes it off its window), stands a pending
+    /// handoff down unless the update's own backstop took it, and rewrites the spacing record.
+    pub(crate) fn end_askpass_sheet(&mut self, sheet: AskpassSheet, end: SheetEnd, now: Instant) {
+        let (window, session, raised) = (sheet.window.0, sheet.origin.session(), sheet.raised);
+        let untouched = !sheet.input.touched();
+        let wall = || aterm_time::unix_millis().unwrap_or(0);
+        let backoff = &mut self.askpass_backoff;
+        match end {
+            SheetEnd::Answered => backoff.on_answer(window, session),
+            SheetEnd::Declined => backoff.on_cancel(window, session, raised, now),
+            SheetEnd::Lapsed { window_spacing } => {
+                if window_spacing {
+                    backoff.on_cancel(window, session, raised, now);
+                }
+                if untouched {
+                    backoff.on_unattended(raised, now, wall());
+                }
+            }
+            SheetEnd::Backstop => {
+                backoff.on_cancel(window, session, raised, now);
+                backoff.on_unattended(raised, now, wall());
+            }
+            SheetEnd::Gone => {}
+        }
+        drop(sheet);
+        if end != SheetEnd::Backstop {
+            self.note_update_handoff_activity();
+        }
+        self.persist_askpass_quiet();
+    }
+
+    /// Mirror the unattended spacing and the sheet standing, if any, to the record
+    /// ([`crate::askpass_record`]), or remove it when there is neither.
+    fn persist_askpass_quiet(&self) {
+        let Some(dir) = self.askpass_record.as_deref() else {
+            return;
+        };
+        let standing = self
+            .askpass_sheet
+            .as_ref()
+            .and_then(|sheet| sheet.raised_wall_ms);
+        let line = self.askpass_backoff.unattended_line(standing);
+        crate::askpass_record::persist(dir, line.as_deref());
+    }
+
+    /// How long a request for a sheet that stands for `origin` in `window` is refused at `now`;
+    /// `person_at` is when a person last stood behind it. A terminal session's request is held
+    /// by every part of the spacing ([`crate::askpass::Backoff::refusal`]). A page's view's is
+    /// held by the unattended part alone ([`crate::askpass::Backoff::unattended_refusal`]): only
+    /// a person's own press raises its sheet and its operation asks once, so a person's press
+    /// never waits out a program's spacing of its window, and the sheets nobody touched still
+    /// space it unless that press came after them.
+    fn askpass_refusal(
+        &self,
+        window: crate::WindowId,
+        origin: SheetOrigin,
+        person_at: Option<Instant>,
+        now: Instant,
+    ) -> Option<Duration> {
+        match origin {
+            SheetOrigin::Session(session) => self
+                .askpass_backoff
+                .refusal(window.0, session, person_at, now),
+            SheetOrigin::View(_) => self.askpass_backoff.unattended_refusal(person_at, now),
+        }
+    }
+
+    /// When a person last gave `session` input, here or (carried) in the process an update took
+    /// it from, as of `now`; `None` when no person has.
+    pub(crate) fn askpass_person_at(&self, session: u64, now: Instant) -> Option<Instant> {
+        let ms = self
+            .pool
+            .get(session)?
+            .ctx
+            .human_input
+            .ms_since(crate::metrics::now_us())?;
+        now.checked_sub(Duration::from_millis(ms))
+    }
+
+    /// Take up the unattended spacing the record holds ([`crate::askpass_record::read_in`]) at
+    /// `now`, `wall_ms` on the wall clock: settled ([`crate::askpass::settle_record`]), what it
+    /// leaves replaces the unattended part held here ([`crate::askpass::Backoff::take_unattended`]).
+    /// Made only where this process owns the record: at a launch that is no update's successor
+    /// and at an update's activation. A sheet the record names as standing is then counted once:
+    /// the settled line is written back with no standing field (or the record removed where it
+    /// leaves nothing), so no later launch or activation counts that sheet again.
+    pub(crate) fn take_up_askpass_record(&mut self, now: Instant, wall_ms: u64) {
+        let Some(dir) = self.askpass_record.clone() else {
+            return;
+        };
+        let settled = crate::askpass_record::read_in(&dir).map(|(streak, ended, standing)| {
+            crate::askpass::settle_record(streak, ended, standing, wall_ms)
+        });
+        let left = settled.and_then(|settled| {
+            crate::askpass::unattended_left(settled.streak, settled.ended, wall_ms)
+        });
+        self.askpass_backoff.take_unattended(left, now, wall_ms);
+        let Some(settled) = settled.filter(|settled| settled.counted_standing) else {
+            return;
+        };
+        let kept = left.map(|_| (settled.streak, settled.ended));
+        let standing = self
+            .askpass_sheet
+            .as_ref()
+            .and_then(|sheet| sheet.raised_wall_ms);
+        let line = (kept.is_some() || standing.is_some()).then(|| {
+            crate::askpass_record::line(
+                kept.map_or(0, |(streak, _)| streak),
+                kept.and_then(|(_, ended)| ended),
+                standing,
+            )
+        });
+        crate::askpass_record::persist(&dir, line.as_deref());
+    }
+
+    /// An update's activation takes up the record ([`Self::take_up_askpass_record`]): the
+    /// outgoing process owned it until the Commit, and this process owns it now.
+    pub(crate) fn take_up_askpass_record_at_activation(&mut self) {
+        if let Some(wall) = aterm_time::unix_millis() {
+            self.take_up_askpass_record(Instant::now(), wall);
+        }
+    }
+
+    /// The launch's take-up of the record ([`Self::take_up_askpass_record`]), and a sweep, on a
+    /// lane thread, of the temporaries a writer killed mid-write left beside it. An update's
+    /// successor takes nothing up here: the outgoing process still owns the record, and a sheet it
+    /// names as standing may still be up there; the successor reads it at its activation.
+    pub(crate) fn take_up_askpass_record_at_launch(&mut self) {
+        if !self.incoming_handoff_pending
+            && let Some(wall) = aterm_time::unix_millis()
+        {
+            self.take_up_askpass_record(Instant::now(), wall);
+        }
+        if let Some(dir) = self.askpass_record.clone() {
+            let _ = crate::qos::spawn_lane_thread(
+                "aterm-askpass-record-sweep",
+                crate::qos::Role::Housekeeping,
+                move || crate::askpass_record::sweep(&dir),
+            );
+        }
+    }
+
+    /// Read the answered secure field once, reply with the secret or cancel, and end the sheet
+    /// ([`Self::end_askpass_sheet`]) as that answer says.
     pub(crate) fn answer_askpass_sheet(&mut self, id: u64, proceed: bool) {
         if self.askpass_sheet.as_ref().is_none_or(|s| s.id != id) {
             return;
         }
         let sheet = self.askpass_sheet.take().expect("checked just above");
         let now = Instant::now();
-        if !sheet.ticket.is_live(now)
-            || sheet
+        let end = self.answer_taken_askpass_sheet(&sheet, proceed, now);
+        self.end_askpass_sheet(sheet, end, now);
+    }
+
+    /// [`Self::answer_askpass_sheet`]'s answer to the taken `sheet`, and how it ended.
+    fn answer_taken_askpass_sheet(
+        &self,
+        sheet: &AskpassSheet,
+        proceed: bool,
+        now: Instant,
+    ) -> SheetEnd {
+        let origin_gone = |sheet: &AskpassSheet| {
+            sheet
                 .owned
                 .as_ref()
-                .is_some_and(|op| !self.cpu_policy_origin_live(op))
-        {
+                .is_some_and(|op| !self.owned_origin_live(op))
+        };
+        if !sheet.ticket.is_live(now) || origin_gone(sheet) {
             sheet.ticket.cancel();
-            return;
+            return SheetEnd::Gone;
         }
-        if proceed {
-            let field = match &sheet.chrome {
-                SheetChrome::Shown { field, .. } => Some(field),
-                #[cfg(test)]
-                SheetChrome::Headless => None,
-            };
-            let Some(secret) = field.and_then(read_secure_field) else {
-                let _ = sheet.reply.send(AskpassAnswer::Refused(
-                    "the password is invalid or longer than 1023 UTF-8 bytes".into(),
-                ));
-                return;
-            };
-            if !sheet.ticket.is_live(Instant::now())
-                || sheet
-                    .owned
-                    .as_ref()
-                    .is_some_and(|op| !self.cpu_policy_origin_live(op))
-            {
-                sheet.ticket.cancel();
-                return;
-            }
-            if secret.is_empty() {
-                let _ = sheet.reply.send(AskpassAnswer::Cancel);
-                self.askpass_backoff
-                    .on_cancel(sheet.window.0, sheet.raised, now);
-            } else {
-                if sheet.owned.as_ref().is_some_and(|op| !op.release_secret()) {
-                    sheet.ticket.cancel();
-                    return;
-                }
-                let _ = sheet.reply.send(AskpassAnswer::Secret(secret));
-                self.askpass_backoff.on_answer(sheet.window.0);
-            }
-        } else {
+        if !proceed {
             let _ = sheet.reply.send(AskpassAnswer::Cancel);
-            self.askpass_backoff
-                .on_cancel(sheet.window.0, sheet.raised, now);
+            return SheetEnd::Declined;
         }
+        let field = match &sheet.chrome {
+            SheetChrome::Shown { field, .. } => Some(field),
+            #[cfg(test)]
+            SheetChrome::Headless => None,
+        };
+        let Some(secret) = field.and_then(read_secure_field) else {
+            let _ = sheet.reply.send(AskpassAnswer::Refused(
+                "the password is invalid or longer than 1023 UTF-8 bytes".into(),
+            ));
+            return SheetEnd::Gone;
+        };
+        if !sheet.ticket.is_live(Instant::now()) || origin_gone(sheet) {
+            sheet.ticket.cancel();
+            return SheetEnd::Gone;
+        }
+        if secret.is_empty() {
+            let _ = sheet.reply.send(AskpassAnswer::Cancel);
+            return SheetEnd::Declined;
+        }
+        if sheet.owned.as_ref().is_some_and(|op| !op.release_secret()) {
+            sheet.ticket.cancel();
+            return SheetEnd::Gone;
+        }
+        let _ = sheet.reply.send(AskpassAnswer::Secret(secret));
+        SheetEnd::Answered
     }
 
     /// Whether aterm's own password sheet stands, and if it does, whether it has stood untouched
@@ -539,8 +772,9 @@ impl App {
 
     /// Refuse aterm's own password sheet when an update waits on it and it has stood untouched
     /// for [`crate::askpass::ASKPASS_UNTOUCHED_BACKSTOP`]: an unanswered prompt is recorded and
-    /// the rest goes on. The `sudo` that asked is told why and may ask again once the window's
-    /// decline spacing passes; a sheet a person has touched is never refused here. Returns
+    /// the rest goes on. Its window, its session and every window wait before the next sheet
+    /// ([`SheetEnd::Backstop`]), and the `sudo` that asked is told for how long
+    /// ([`AskpassAnswer::Quiet`]); a sheet a person has touched is never refused here. Returns
     /// whether it refused one.
     pub(crate) fn refuse_untouched_askpass_sheet(&mut self, now: Instant) -> bool {
         let Some(sheet) = self.askpass_sheet.take_if(|sheet| {
@@ -550,56 +784,164 @@ impl App {
         };
         let backstop = crate::askpass::ASKPASS_UNTOUCHED_BACKSTOP.as_secs();
         aterm_log::info!(
-            "update: session {}'s password prompt stood untouched for {backstop}s while an \
-             update waited; aterm refused it and the update goes on",
-            sheet.session
+            "update: {}'s password prompt stood untouched for {backstop}s while an update \
+             waited; aterm refused it and the update goes on",
+            sheet.origin.words()
         );
-        let _ = sheet.reply.send(AskpassAnswer::Refused(format!(
-            "nobody answered it within {backstop}s while an update waited; ask again"
-        )));
-        self.askpass_backoff
-            .on_cancel(sheet.window.0, sheet.raised, now);
+        let (window, origin, reply) = (sheet.window, sheet.origin, sheet.reply.clone());
+        self.end_askpass_sheet(sheet, SheetEnd::Backstop, now);
+        let wait = self
+            .askpass_refusal(window, origin, None, now)
+            .unwrap_or(crate::askpass::QUIET_BASE);
+        let _ = reply.send(AskpassAnswer::Quiet(wait));
         true
     }
 
     /// The waiting lane's word that request `id` ended, posted after every end. A sheet still
     /// standing then got no answer: its deadline passed, its caller hung up, or its request
-    /// was withdrawn (the `aterm ctl sudo` call ended). It is dropped, and its window waits
-    /// before the next sheet as after a Cancel, or a program that re-asks keeps a sheet
-    /// standing with no gap. A sheet a person already answered or cancelled is gone by now and
-    /// is counted there, once.
+    /// was withdrawn (the `aterm ctl sudo` call ended). It is dropped, and its window and session
+    /// wait before the next sheet as after a Cancel, and every window does when nobody touched
+    /// it, or a program that re-asks keeps a sheet standing with no gap. A sheet a person already
+    /// answered or cancelled is gone by now and is counted there, once; and the wake that follows
+    /// a request refused with no sheet finds none and changes nothing.
     pub(crate) fn withdraw_askpass_sheet(&mut self, id: u64, now: Instant) {
         if let Some(sheet) = self.askpass_sheet.take_if(|sheet| sheet.id == id) {
             sheet.ticket.cancel();
-            self.askpass_backoff
-                .on_cancel(sheet.window.0, sheet.raised, now);
+            self.end_askpass_sheet(
+                sheet,
+                SheetEnd::Lapsed {
+                    window_spacing: true,
+                },
+                now,
+            );
         }
     }
 
+    /// A window that closes under its sheet withdraws it unanswered. The window's key goes with
+    /// it, so it spaces no window or session of its own, but a sheet nobody touched still makes
+    /// every window wait: closing a window is no way past that spacing.
     pub(crate) fn withdraw_askpass_window(&mut self, wid: crate::WindowId) {
-        crate::cpu_policy_authorization::cancel_window(wid);
+        crate::cpu_policy_authorization::cancel_window(self.cpu_policy_owner(), wid);
+        crate::root_step_authorization::cancel_window(self.cpu_policy_owner(), wid);
         if let Some(sheet) = self.askpass_sheet.take_if(|sheet| sheet.window == wid) {
             sheet.ticket.cancel();
+            let end = SheetEnd::Lapsed {
+                window_spacing: false,
+            };
+            self.end_askpass_sheet(sheet, end, Instant::now());
+        }
+    }
+
+    /// The run's end takes a standing sheet down unanswered, as its window closing would: its
+    /// window and session go with the process, and a sheet nobody touched makes every window wait
+    /// ([`SheetEnd::Lapsed`]). The record then names that end and no standing sheet, so the next
+    /// launch reads the sheet as it ended, a person's touch included, rather than as a crash's.
+    pub(crate) fn end_askpass_sheet_at_quit(&mut self) {
+        if let Some(sheet) = self.askpass_sheet.take() {
+            sheet.ticket.cancel();
+            let end = SheetEnd::Lapsed {
+                window_spacing: false,
+            };
+            self.end_askpass_sheet(sheet, end, Instant::now());
         }
     }
 
     /// A session that closes under its sheet withdraws it unanswered, and spaces its window's
     /// next sheet as [`Self::withdraw_askpass_sheet`] does: a new tab does not escape the
-    /// spacing. A closing window ([`Self::withdraw_askpass_window`]) takes its key with it and
-    /// spaces nothing.
+    /// spacing. The session's own spacing goes with it.
     pub(crate) fn withdraw_askpass_session(&mut self, session: u64, now: Instant) {
-        crate::cpu_policy_authorization::cancel_session(session);
-        if let Some(sheet) = self.askpass_sheet.take_if(|sheet| sheet.session == session) {
+        crate::cpu_policy_authorization::cancel_session(self.cpu_policy_owner(), session);
+        if let Some(sheet) = self
+            .askpass_sheet
+            .take_if(|sheet| sheet.origin == SheetOrigin::Session(session))
+        {
             sheet.ticket.cancel();
-            self.askpass_backoff
-                .on_cancel(sheet.window.0, sheet.raised, now);
+            self.end_askpass_sheet(
+                sheet,
+                SheetEnd::Lapsed {
+                    window_spacing: true,
+                },
+                now,
+            );
+        }
+        self.askpass_backoff.forget_session(session);
+    }
+
+    /// The page's view `view` left its window's front, closed or went with its window: cancel
+    /// the operation it started and withdraw the sheet that stands for it, unanswered. Only a
+    /// person's press starts a view's operation, so no program re-asks through it: like a closing
+    /// window, its withdrawal spaces no window or session of its own, but a sheet nobody touched
+    /// still makes every window wait ([`SheetEnd::Lapsed`]): leaving the page is no way past that
+    /// spacing.
+    pub(crate) fn withdraw_askpass_view(&mut self, view: crate::tab_model::ViewId) {
+        crate::cpu_policy_authorization::cancel_view(self.cpu_policy_owner(), view);
+        crate::root_step_authorization::cancel_view(self.cpu_policy_owner(), view);
+        if let Some(sheet) = self
+            .askpass_sheet
+            .take_if(|sheet| sheet.origin == SheetOrigin::View(view))
+        {
+            sheet.ticket.cancel();
+            let end = SheetEnd::Lapsed {
+                window_spacing: false,
+            };
+            self.end_askpass_sheet(sheet, end, Instant::now());
+        }
+    }
+
+    /// Withdraw the sheet a CPU policy operation raised, whatever its origin: a person cancelled
+    /// the operation on the System Resources page ([`App::cancel_cpu_policy_from_page`]). That is
+    /// a person's no to it, counted as a Cancel on the sheet would be ([`SheetEnd::Declined`]):
+    /// its window and session wait, never every window.
+    pub(crate) fn withdraw_askpass_cpu_policy(&mut self) {
+        if let Some(sheet) = self.askpass_sheet.take_if(|sheet| {
+            matches!(
+                sheet.owned,
+                Some(crate::root_step_authorization::OwnedOperation::CpuPolicy(_))
+            )
+        }) {
+            sheet.ticket.cancel();
+            self.end_askpass_sheet(sheet, SheetEnd::Declined, Instant::now());
+        }
+    }
+
+    /// Withdraw a view's operation and sheet once that view is not its window's front tab in a
+    /// window that is not occluded ([`App::view_in_front`]): a tab switch, the view's close, its
+    /// window's close or occlusion. Called on every front-tab and occlusion change.
+    pub(crate) fn withdraw_askpass_view_unless_front(&mut self) {
+        let owner = self.cpu_policy_owner();
+        for (window, view) in [
+            crate::cpu_policy_authorization::pending_view(owner),
+            crate::root_step_authorization::pending_view(owner),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !self.view_in_front(window, view) {
+                self.withdraw_askpass_view(view);
+            }
+        }
+    }
+
+    /// Whether an owned operation's origin is still in front and its sudo bound.
+    fn owned_origin_live(
+        &self,
+        operation: &crate::root_step_authorization::OwnedOperation,
+    ) -> bool {
+        match operation {
+            crate::root_step_authorization::OwnedOperation::CpuPolicy(op) => {
+                self.cpu_policy_origin_live(op)
+            }
+            crate::root_step_authorization::OwnedOperation::RootStep(op) => {
+                self.root_step_origin_live(op)
+            }
         }
     }
 
     /// The sidecar rows that carry the password sheet's spacing to an update's successor: for
-    /// each of the handed sessions `ids`, the longest quiet window still running on a window
-    /// that shows it ([`crate::askpass::Backoff::carried`]). Window ids are a process's own, so
-    /// the spacing crosses by the session.
+    /// each of the handed sessions `ids`, the longest quiet window still running on the session
+    /// itself or on a window that shows it ([`crate::askpass::Backoff::carried`],
+    /// [`crate::askpass::Backoff::carried_session`]). Window ids are a process's own, so the
+    /// spacing crosses by the session.
     pub(crate) fn askpass_spacing_rows(
         &self,
         ids: &[u64],
@@ -612,6 +954,7 @@ impl App {
                     .keys()
                     .filter(|wid| self.window_contains_session(**wid, id))
                     .filter_map(|wid| self.askpass_backoff.carried(wid.0, now))
+                    .chain(self.askpass_backoff.carried_session(id, now))
                     .max_by_key(|(_, remaining)| *remaining)?;
                 Some((
                     id,
@@ -625,8 +968,9 @@ impl App {
     }
 
     /// Take up the spacing the outgoing process carried ([`Self::askpass_spacing_rows`]): each
-    /// row, named by the session this process adopted, spaces every window that shows that
-    /// session ([`crate::askpass::Backoff::adopt`]). Returns how many rows found no window.
+    /// row, named by the session this process adopted, spaces that session and every window that
+    /// shows it ([`crate::askpass::Backoff::adopt_session`], [`crate::askpass::Backoff::adopt`]).
+    /// Returns how many rows found no window.
     pub(crate) fn adopt_askpass_spacing(
         &mut self,
         rows: &[(u64, u32, u64)],
@@ -634,6 +978,9 @@ impl App {
     ) -> usize {
         let mut unplaced = 0;
         for &(session, streak, remaining_ms) in rows {
+            let remaining = Duration::from_millis(remaining_ms);
+            self.askpass_backoff
+                .adopt_session(session, streak, remaining, now);
             let windows: Vec<_> = self
                 .windows
                 .keys()
@@ -644,11 +991,34 @@ impl App {
                 unplaced += 1;
             }
             for wid in windows {
-                self.askpass_backoff
-                    .adopt(wid.0, streak, Duration::from_millis(remaining_ms), now);
+                self.askpass_backoff.adopt(wid.0, streak, remaining, now);
             }
         }
         unplaced
+    }
+}
+
+/// The later of two moments, either of which may be unknown.
+fn later(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    a.max(b)
+}
+
+impl SheetOrigin {
+    /// How a sheet and the log name it.
+    fn words(self) -> String {
+        match self {
+            Self::Session(session) => format!("Session {session}"),
+            Self::View(view) => format!("View {}", view.get()),
+        }
+    }
+
+    /// The terminal session it stands for; `None` for a page's view, which keys no session's
+    /// spacing.
+    pub(crate) const fn session(self) -> Option<u64> {
+        match self {
+            Self::Session(session) => Some(session),
+            Self::View(_) => None,
+        }
     }
 }
 

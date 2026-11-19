@@ -18,6 +18,7 @@ dependencies = [
  "aterm-json",
  "aterm-land-trailer",
  "aterm-models-agh",
+ "aterm-path",
  "aterm-regex",
  "aterm-secrets",
  "aterm-serde",
@@ -165,7 +166,7 @@ version = "0.2.2"
 
 [[package]]
 name = "aterm"
-version = "0.207.0"
+version = "0.208.0"
 dependencies = [
  "agh",
  "alab-policy",
@@ -283,6 +284,7 @@ dependencies = [
  "aterm-digest",
  "aterm-dirfd",
  "aterm-durable",
+ "aterm-evidence",
  "aterm-file",
  "aterm-grapheme",
  "aterm-hash",
@@ -358,6 +360,14 @@ dependencies = [
  "aterm-core",
  "aterm-models-aos",
  "aterm-spec",
+]
+
+[[package]]
+name = "aterm-backup"
+version = "0.0.0"
+dependencies = [
+ "aterm-tempfile",
+ "libc",
 ]
 
 [[package]]
@@ -685,7 +695,6 @@ dependencies = [
  "aterm-models-swarm",
  "aterm-net",
  "aterm-netplace",
- "aterm-seal",
  "aterm-secrets",
  "aterm-serde",
  "aterm-spec",
@@ -799,6 +808,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-evidence"
+version = "0.0.0"
+dependencies = [
+ "aterm-digest",
+ "aterm-models-harness",
+ "aterm-spec",
+ "aterm-spec-anchor",
+]
+
+[[package]]
 name = "aterm-file"
 version = "0.0.0"
 dependencies = [
@@ -848,6 +867,7 @@ dependencies = [
  "aterm-digest",
  "aterm-effects",
  "aterm-hash",
+ "aterm-json",
  "aterm-log",
  "aterm-models-core",
  "aterm-models-misc",
@@ -857,6 +877,7 @@ dependencies = [
  "aterm-render",
  "aterm-spec",
  "aterm-spec-anchor",
+ "aterm-sysprobe",
  "aterm-tempfile",
  "aterm-time",
  "aterm-types",
@@ -945,6 +966,7 @@ dependencies = [
  "aterm-diskwalk",
  "aterm-durable",
  "aterm-effects",
+ "aterm-evidence",
  "aterm-file",
  "aterm-gpu",
  "aterm-grapheme",
@@ -1163,6 +1185,7 @@ dependencies = [
  "aterm-restore",
  "aterm-spec",
  "aterm-spec-anchor",
+ "aterm-stamp",
  "aterm-tempfile",
  "aterm-uds",
  "trust-resource-provenance",
@@ -1236,9 +1259,12 @@ name = "aterm-lan"
 version = "0.0.0"
 dependencies = [
  "aterm-containment",
+ "aterm-dirfd",
  "aterm-dl",
  "aterm-keeper",
+ "aterm-sysprobe",
  "aterm-tempfile",
+ "aterm-types",
  "aterm-uds",
  "libc",
 ]
@@ -2150,6 +2176,7 @@ dependencies = [
  "aterm-db",
  "aterm-db-core",
  "aterm-effects",
+ "aterm-evidence",
  "aterm-gpu",
  "aterm-grid",
  "aterm-gui",
@@ -2230,6 +2257,7 @@ dependencies = [
 name = "aterm-tempfile"
 version = "0.0.0"
 dependencies = [
+ "aterm-backup",
  "aterm-hash",
  "aterm-uds",
 ]
@@ -2266,6 +2294,7 @@ name = "aterm-toolchain"
 version = "0.0.0"
 dependencies = [
  "aterm-digest",
+ "aterm-dirfd",
  "aterm-path",
  "aterm-spec",
  "aterm-sysprobe",
@@ -2319,6 +2348,7 @@ name = "aterm-uds"
 version = "0.0.0"
 dependencies = [
  "astream-sys",
+ "aterm-backup",
  "aterm-bench",
  "aterm-digest",
  "aterm-dirfd",

@@ -4182,18 +4182,18 @@ fn a_records_file_this_build_refuses_keeps_what_it_takes_and_records_go_on() {
     );
 }
 
-/// A member's `records` file past `MAX_RECORDS_STREAM` (a build that bounded its store by count
+/// A member's `records` file past its store's capacity (a build that bounded its store by count
 /// alone wrote one once about 64 records each carried a 1 MiB `Put`) made `load_records` fail
 /// before `Store::recover` ran, so record sync, saves, Commons repair and every envelope apply
 /// that reads the log stopped on that Mac for good: nothing truncates the file, and every write
-/// starts by loading it. It now keeps the records the file's first `MAX_RECORDS_STREAM` bytes
+/// starts by loading it. It now keeps the records the file's first bytes within that capacity
 /// hold, and the next write replaces it.
 /// NEGATIVE CONTROL: `fsx::read_owned`'s refusal of a file past its cap in `load_records` (main
 /// before this fix) fails both the load and the save.
 #[test]
 fn a_records_file_past_the_stream_cap_keeps_what_it_holds_and_records_go_on() {
     use crate::membership_log::{
-        Body, Draft, Entrant, Evidence, Log, MAX_RECORDS_STREAM, Record, Store, encode_records,
+        Body, Draft, Entrant, Evidence, Log, Reading, Record, Store, encode_records,
     };
 
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4249,13 +4249,13 @@ fn a_records_file_past_the_stream_cap_keeps_what_it_holds_and_records_go_on() {
         .collect();
     let mut file = genesis.bytes().to_vec();
     file.extend_from_slice(&encode_records(&puts));
-    assert!(file.len() > MAX_RECORDS_STREAM);
+    assert!(file.len() > Reading::ONE.capacity());
     crate::fsx::write_atomic(&member.records_file(), &file, 0o600).unwrap();
     drop(file);
 
     let held = load_records(&member).expect("a file past the cap never stops this Mac's records");
     assert!(held.contains(genesis.id()));
-    assert!(held.encode().len() <= MAX_RECORDS_STREAM);
+    assert!(held.encode().len() <= Reading::ONE.capacity());
     drop(held);
 
     let admit_two = Log::new(genesis.clone())
@@ -4275,7 +4275,7 @@ fn a_records_file_past_the_stream_cap_keeps_what_it_holds_and_records_go_on() {
         1
     );
     let rewritten = std::fs::read(member.records_file()).unwrap();
-    assert!(rewritten.len() <= MAX_RECORDS_STREAM);
+    assert!(rewritten.len() <= Reading::ONE.capacity());
     let reread = Store::decode("", &rewritten).expect("the file reads whole again");
     assert!(reread.contains(genesis.id()) && reread.contains(admit_two.id()));
 }

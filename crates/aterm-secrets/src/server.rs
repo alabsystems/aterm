@@ -27,6 +27,10 @@ mod crossing_tests;
 mod fence_tests;
 
 #[cfg(test)]
+#[path = "server/follow_tests.rs"]
+mod follow_tests;
+
+#[cfg(test)]
 #[path = "server/takes_over_tests.rs"]
 mod takes_over_tests;
 
@@ -871,7 +875,7 @@ impl Running {
             .records
             .get(vault)
             .map(|slot| slot.store.clone())
-            .or_else(|| crate::membership_log::Store::for_vault(vault).ok())
+            .or_else(|| self.shared.records_store(vault).ok())
             .unwrap_or_default()
     }
 
@@ -1343,7 +1347,10 @@ struct RecordSlot {
     /// ([`look_at_records`]). `None` until this server read, wrote or was refused one.
     stamp: Option<fsx::FileStamp>,
     /// `Some(n)` when the file holds exactly the records of the log's first `n` (as a set: a
-    /// reload may order them otherwise), so what the log holds past them can go on its end.
+    /// reload may order them otherwise), so what the log holds past them can go on its end. It
+    /// held them in the forms the log held them then: a whole version-2 record that has since
+    /// taken its shed frame's place among them is not on the file, which a write finds by the
+    /// file's length ([`persist_records`]).
     on_file: Option<usize>,
     /// A record application is writing the file ([`apply_records`], [`Writing`]): a look reads nothing, since
     /// what the file holds past the stamp may not be durable yet, and reading it would take
@@ -1719,7 +1726,7 @@ impl Shared {
 
     /// `name`'s format mark ([`crate::crossing::FormatMark`]), beside its records file.
     fn format_mark(&self, name: &str) -> crate::crossing::FormatMark {
-        crate::crossing::FormatMark::at(self.store.join(format!("{name}.format")))
+        format_mark_in(&self.store, name)
     }
 
     /// What this server states of `name`'s records ([`crate::crossing::RecordsBound`]): this
@@ -1753,6 +1760,27 @@ impl Shared {
     /// As [`Shared::records_here`].
     fn records_bound_here(&self, name: &str) -> Result<crate::crossing::RecordsBound, Reply> {
         self.records_here(&mut self.lock_server_state(), name)
+    }
+
+    /// The format this server reads `name`'s records at
+    /// ([`crate::membership_log::follow::reading`]): format 2 once `name`'s format mark names
+    /// it, on a build that reads it; format 1 on every other, which looks for no mark. Its
+    /// records file, the body of a records POST, the frames of a peer pull and the store of
+    /// its slot are all read at it.
+    ///
+    /// # Errors
+    /// The mark cannot be read, on a build that reads format 2.
+    fn records_reading(&self, name: &str) -> crate::Result<crate::membership_log::Reading> {
+        records_reading_in(&self.store, name)
+    }
+
+    /// An empty store for `name` ([`crate::membership_log::Store::for_vault`]) that reads
+    /// records at the format this server reads `name`'s at ([`Shared::records_reading`]).
+    ///
+    /// # Errors
+    /// The store cannot be made, or the format cannot be read.
+    fn records_store(&self, name: &str) -> crate::Result<crate::membership_log::Store> {
+        Ok(crate::membership_log::Store::for_vault(name)?.read_at(self.records_reading(name)?))
     }
 
     /// Store `name`'s crossed mark, before this server takes a record of a crossed log or holds
@@ -1993,6 +2021,21 @@ fn unheld_note(
     ))
 }
 
+/// `name`'s format mark ([`crate::crossing::FormatMark`]) in the store folder `store`, beside
+/// its records file.
+fn format_mark_in(store: &Path, name: &str) -> crate::crossing::FormatMark {
+    crate::crossing::FormatMark::at(store.join(format!("{name}.format")))
+}
+
+/// The format a server whose store folder is `store` reads `name`'s records at
+/// ([`Shared::records_reading`]).
+///
+/// # Errors
+/// As [`Shared::records_reading`].
+fn records_reading_in(store: &Path, name: &str) -> crate::Result<crate::membership_log::Reading> {
+    crate::membership_log::follow::reading(&format_mark_in(store, name))
+}
+
 /// Read the store: every `<name>.vault` that parses and verifies, and every `<name>.joins` line
 /// that parses and has not expired.
 #[cfg(test)]
@@ -2053,7 +2096,12 @@ fn load_with_pins(store: &Path, now: u64, pins: &[(String, [u8; 32])]) -> crate:
                 pins.iter()
                     .find_map(|(v, key)| (v == name).then(|| vec![*key]))
             });
-            if let Err(unread) = look_at_records(&mut state, name, &path, keys.as_deref()) {
+            let looked = records_reading_in(store, name)
+                .map_err(fsx::Unread::Failed)
+                .and_then(|reading| {
+                    look_at_records(&mut state, name, &path, keys.as_deref(), reading)
+                });
+            if let Err(unread) = looked {
                 note(&format!("{file}: skipped: {}", unread.into_error()));
             }
         } else if let Some(name) = file
@@ -2641,8 +2689,10 @@ enum Body {
     Text(String),
     Envelope(Arc<Vec<u8>>),
     /// A records reply: its records, then the frame its store serves where its log is rooted at
-    /// a final checkpoint ([`crate::membership_log::served`]), which no store of this build is.
-    Records(Vec<crate::membership_log::Record>, Option<Vec<u8>>),
+    /// a final checkpoint ([`crate::membership_log::served`]), which no server's store is.
+    /// The frame is a boxed slice, two words where a `Vec` takes three: that keeps `Reply` under
+    /// the size at which clippy calls every `Result<_, Reply>` error variant too large.
+    Records(Vec<crate::membership_log::Record>, Option<Box<[u8]>>),
 }
 
 impl Reply {
@@ -2744,7 +2794,7 @@ fn record_reply_len(records: &[crate::membership_log::Record]) -> io::Result<usi
     records.iter().try_fold(0usize, |length, record| {
         length
             .checked_add(record.wire_len())
-            .filter(|length| *length <= crate::membership_log::MAX_RECORDS_STREAM)
+            .filter(|length| *length <= crate::membership_log::REPLY_CAP)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record reply is too large"))
     })
 }
@@ -2765,8 +2815,8 @@ fn write_reply_to(
         Body::Envelope(bytes) => (bytes.len(), "text/plain; charset=utf-8"),
         Body::Records(records, served) => (
             record_reply_len(records)?
-                .checked_add(served.as_ref().map_or(0, Vec::len))
-                .filter(|length| *length <= crate::membership_log::MAX_RECORDS_STREAM)
+                .checked_add(served.as_ref().map_or(0, |served| served.len()))
+                .filter(|length| *length <= crate::membership_log::REPLY_CAP)
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "record reply is too large")
                 })?,
@@ -3259,6 +3309,90 @@ fn records_fence(
     }
 }
 
+/// How this server takes the records of a source the fence was asked about
+/// ([`records_admission`]).
+enum Admission {
+    /// As any records, read at the format this server reads its own at
+    /// ([`Shared::records_reading`]).
+    Take(crate::membership_log::Reading),
+    /// Into a follow copy ([`crate::membership_log::follow::follow_records`]): this server
+    /// states format 1, its build reads format 2, and the source states format 2 with a bound
+    /// this server could exchange with once it stated that format too. The fence's refusal is
+    /// kept: it is the answer where the source's records hold no evidence, and the server and
+    /// the source then refuse each other as two formats do.
+    Follow(Reply),
+}
+
+impl Admission {
+    /// The format the source's records are read at.
+    const fn reading(&self) -> crate::membership_log::Reading {
+        match self {
+            Self::Take(reading) => *reading,
+            Self::Follow(_) => crate::membership_log::Reading::Follow,
+        }
+    }
+}
+
+/// What the fence says of a source that states `stated` of its records to this server, which
+/// states `own` of `name`'s ([`records_fence`]), and how the server takes what it admits.
+///
+/// The fence's refusal stands for every source but one: a source that states format 2 to a
+/// server that states format 1 and whose build reads format 2
+/// ([`crate::crossing::FormatMark::follows`], asked before anything else is looked at: no
+/// running build answers yes). That source's records are read into a follow copy, and taken
+/// only on a seat's signed version-2 record, mark first ([`apply_records`]).
+///
+/// # Errors
+/// The fence's refusal; the format mark cannot be read; or, as a `500`, `name`'s mark names a
+/// later format than this build reads: its records file holds records this build does not
+/// read, and a write from the store this build read of it would replace them, so this server
+/// takes nothing until aterm is updated (as a Mac does, `client::reads_marked_format`).
+fn records_admission(
+    shared: &Shared,
+    name: &str,
+    own: crate::crossing::RecordsBound,
+    stated: Option<crate::crossing::RecordsBound>,
+) -> Result<Admission, Reply> {
+    use crate::crossing::{FORMAT_ONE, FORMAT_TWO};
+    if let Some(refusal) = records_fence(own, stated) {
+        let follows = shared.format_mark(name).follows()
+            && own.format == FORMAT_ONE
+            && stated.is_some_and(|peer| {
+                peer.format == FORMAT_TWO && own.at_format(FORMAT_TWO).can_exchange(peer)
+            });
+        return if follows {
+            Ok(Admission::Follow(refusal))
+        } else {
+            Err(refusal)
+        };
+    }
+    let reading = shared.records_reading(name).map_err(|e| {
+        note(&format!(
+            "{name}: could not read the records format mark: {e}"
+        ));
+        Reply::text(
+            500,
+            "the server could not read which format its records are in",
+        )
+    })?;
+    if own.format != FORMAT_ONE && reading != crate::membership_log::Reading::Format(own.format) {
+        // MUTANT (`crate::crossing::Faults::writes_unread_format`): the records are taken.
+        #[cfg(test)]
+        if crate::crossing::faults(shared.format_mark(name).path()).writes_unread_format {
+            return Ok(Admission::Take(reading));
+        }
+        return Err(Reply::text(
+            500,
+            format!(
+                "this server's membership records are in format {}, which this build of aterm \
+                 does not read: it takes no record until aterm is updated",
+                own.format
+            ),
+        ));
+    }
+    Ok(Admission::Take(reading))
+}
+
 fn answer(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Request) -> Reply {
     let path = std::mem::take(&mut request.path);
     let Some(route) = route(&path) else {
@@ -3376,17 +3510,18 @@ fn answer(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Re
         (Route::Records(name), _) => {
             // Before the body is read: a crossed or format-2 server takes no record from a poster
             // that states no bound it can exchange with ([`apply_records`] asks again once it
-            // holds the store).
-            match shared.records_bound_here(name) {
-                Ok(own) => {
-                    if let Some(reply) = records_fence(own, request.records_bound) {
-                        return reply;
-                    }
-                }
-                Err(failed) => return failed,
-            }
+            // holds the store). The body is read at the format this server reads its records
+            // at, or as a follow copy reads it where the poster states a later format this
+            // server's build follows ([`Admission`]).
             let stated = request.records_bound;
-            let length = match body_length(&request, crate::membership_log::MAX_RECORDS_STREAM) {
+            let reading = match shared
+                .records_bound_here(name)
+                .and_then(|own| records_admission(shared, name, own, stated))
+            {
+                Ok(admission) => admission.reading(),
+                Err(refused) => return refused,
+            };
+            let length = match body_length(&request, crate::membership_log::REPLY_CAP) {
                 Ok(length) => length,
                 Err(reply) => return reply,
             };
@@ -3400,7 +3535,7 @@ fn answer(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Re
                 Ok(reading) => reading,
                 Err(reply) => return reply,
             };
-            match records_input::from_http(shared, name, stream, request, length) {
+            match records_input::from_http(shared, name, stream, request, length, reading) {
                 Ok(records) => apply_records(shared, name, records, local, stated),
                 Err(reply) => reply,
             }
@@ -4095,7 +4230,14 @@ fn look_for_records(shared: &Shared, state: &mut State, name: &str) -> Result<()
         return Ok(());
     }
     let keys = record_keys(shared, state, name);
-    look_at_records(state, name, &shared.records_path(name), keys.as_deref())
+    let reading = shared.records_reading(name).map_err(fsx::Unread::Failed)?;
+    look_at_records(
+        state,
+        name,
+        &shared.records_path(name),
+        keys.as_deref(),
+        reading,
+    )
 }
 
 /// A look at `name`'s records file at `path`, its store following `keys` ([`held_keys`],
@@ -4103,12 +4245,17 @@ fn look_for_records(shared: &Shared, state: &mut State, name: &str) -> Result<()
 /// (`lstat`) and reads it only when the slot's stamp differs, or when a store with no genesis
 /// now follows other keys (a new envelope may name the key that signed the file's genesis):
 /// each long-poll looks on every wake, and reading and comparing the
-/// whole file each time cost up to [`crate::membership_log::MAX_RECORDS_STREAM`] a look. A
+/// whole file each time cost up to the store's capacity ([`crate::membership_log::Store::capacity`]) a look. A
 /// rooted store takes the file's records in place (what it refuses changes nothing); a store
 /// with no genesis keeps them only when they root it. The slot keeps the
 /// stamp of the file it read, and knows the file holds exactly its log (`on_file`) only when
 /// the store was empty before the read and its records' bytes fill the file: then each held
 /// record came from the file, and nothing else is in it. Nothing is cloned.
+///
+/// The file is read at `reading`, the format this server reads `name`'s records at
+/// ([`Shared::records_reading`]), and the slot's store reads at it from then on. A slot whose
+/// store reads another format (its mark was stored since it read the file) reads the file
+/// again whatever its stamp.
 ///
 /// # Errors
 /// [`fsx::Unread::Refused`]: the read refuses the file (past the bound, an owner or mode it
@@ -4130,8 +4277,9 @@ fn look_at_records(
     name: &str,
     path: &Path,
     keys: Option<&[[u8; 32]]>,
+    reading: crate::membership_log::Reading,
 ) -> Result<(), fsx::Unread> {
-    look_at_records_with(state, name, path, keys, || {})
+    look_at_records_with(state, name, path, keys, reading, || {})
 }
 
 fn look_at_records_with(
@@ -4139,6 +4287,7 @@ fn look_at_records_with(
     name: &str,
     path: &Path,
     keys: Option<&[[u8; 32]]>,
+    reading: crate::membership_log::Reading,
     after_decode: impl FnOnce(),
 ) -> Result<(), fsx::Unread> {
     if state.records.get(name).is_some_and(|slot| slot.writing) {
@@ -4152,6 +4301,7 @@ fn look_at_records_with(
     };
     if let Some(slot) = state.records.get(name)
         && slot.stamp == Some(seen)
+        && slot.store.reading() == reading
         && (slot.store.log().is_some() || keys.is_none_or(|k| slot.store.keys() == Some(k)))
     {
         return Ok(());
@@ -4164,7 +4314,10 @@ fn look_at_records_with(
             || crate::membership_log::RecordBudgets::current().held,
             |slot| slot.store.budgets().held,
         );
-        let decoded = crate::membership_log::Store::read_records(reader.file(), limit)
+        // What a store of this server's format holds (the storage class of byte bound): the
+        // prefix the decoder reads, and the most the file may be.
+        let capacity = reading.capacity();
+        let decoded = crate::membership_log::Store::read_records(reader.file(), limit, reading)
             .map_err(fsx::Unread::Failed)?;
         after_decode();
         // The shared decoder consumes at most the client's recovery prefix. Servers refuse
@@ -4186,9 +4339,8 @@ fn look_at_records_with(
         crate::records_storage::data_path(entry).map_err(fsx::Unread::Failed)?;
         if more {
             return Err(fsx::Unread::Refused(Error::new(format!(
-                "{}: larger than {} bytes",
+                "{}: larger than {capacity} bytes",
                 path.display(),
-                crate::membership_log::MAX_RECORDS_STREAM
             ))));
         }
         Ok(Some((reader.stamp(), decoded)))
@@ -4200,7 +4352,9 @@ fn look_at_records_with(
         Err(failed @ fsx::Unread::Failed(_)) => return Err(failed),
     };
     if !state.records.contains_key(name) {
-        let store = crate::membership_log::Store::for_vault(name).map_err(fsx::Unread::Failed)?;
+        let store = crate::membership_log::Store::for_vault(name)
+            .map_err(fsx::Unread::Failed)?
+            .read_at(reading);
         state
             .records
             .insert(name.to_owned(), RecordSlot::new(follow_held(store, keys)));
@@ -4219,7 +4373,7 @@ fn look_at_records_with(
     let was_empty = slot.store.is_empty();
     let heads = slot.store.log().map(crate::membership_log::Log::heads);
     let bytes_read = decoded.bytes_read();
-    let store = follow_held(std::mem::take(&mut slot.store), keys);
+    let store = follow_held(std::mem::take(&mut slot.store), keys).read_at(reading);
     slot.store = decoded.apply_rooted(store);
     slot.stamp = Some(stamp);
     slot.on_file = slot
@@ -4248,7 +4402,12 @@ pub fn test_cold_records(
     keys: &[[u8; 32]],
 ) -> crate::Result<(crate::membership_log::Store, Option<usize>)> {
     let mut state = State::default();
-    look_at_records(&mut state, name, path, Some(keys)).map_err(fsx::Unread::into_error)?;
+    let reading = match path.parent() {
+        Some(store) => records_reading_in(store, name)?,
+        None => crate::membership_log::Reading::ONE,
+    };
+    look_at_records(&mut state, name, path, Some(keys), reading)
+        .map_err(fsx::Unread::into_error)?;
     let slot = state
         .records
         .remove(name)
@@ -4305,7 +4464,9 @@ fn records_reply(
         status: 200,
         body: Body::Records(
             records,
-            served.as_ref().map(crate::membership_log::Served::encode),
+            served
+                .as_ref()
+                .map(|served| served.encode().into_boxed_slice()),
         ),
         etag: None,
         vault_head: None,
@@ -4333,8 +4494,9 @@ fn records_digest_of(state: &State, name: &str) -> [u8; 32] {
 
 /// What a records GET naming `have` is sent under `cap`: with a served frame where it takes one
 /// (`served`) and the store is rooted at a final checkpoint whose cut `have` does not show
-/// ([`crate::membership_log::Store::missing_served`]), records alone otherwise. No client of this
-/// build asks for a frame and no store of it is rooted, so every reply is records alone.
+/// ([`crate::membership_log::Store::missing_served`]), records alone otherwise. Only a puller
+/// that reads format 2 asks for a frame (`crate::transport::Pull::takes_served`), and no
+/// server's store is rooted (its peer pull takes no root), so every reply is records alone.
 fn missing_of(
     store: &crate::membership_log::Store,
     have: &[crate::membership_log::RecordId],
@@ -4468,7 +4630,7 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
                 format!("this server holds its limit of {MAX_VAULTS} vaults"),
             );
         }
-        let store = match crate::membership_log::Store::for_vault(name) {
+        let store = match shared.records_store(name) {
             Ok(store) => store,
             Err(e) => return Reply::text(500, e.to_string()),
         };
@@ -4547,7 +4709,15 @@ fn post_records_stating(
     local: bool,
     stated: Option<crate::crossing::RecordsBound>,
 ) -> Reply {
-    match records_input::from_bytes(shared, name, body) {
+    let reading = match shared
+        .records_bound_here(name)
+        .and_then(|own| records_admission(shared, name, own, stated))
+    {
+        Ok(admission) => admission.reading(),
+        // A refusal the application gives again, once the body staged at format 1.
+        Err(_) => crate::membership_log::Reading::ONE,
+    };
+    match records_input::from_bytes(shared, name, body, reading) {
         Ok(records) => apply_records(shared, name, records, local, stated),
         Err(reply) => reply,
     }
@@ -4638,6 +4808,10 @@ struct PersistFailure {
 
 /// Persist only the accepted Store's complete prefix. The caller owns record_writes and
 /// the Writing fence, and publishes the Store only after this operation succeeds.
+///
+/// `on_file` is how many of the store's first records the file at `stamp` was known to hold.
+/// The records past them go on the file's end only where the file is as long as those first
+/// records are in `accepted`; any other file is replaced by the store's complete records.
 fn persist_records(
     shared: &Shared,
     name: &str,
@@ -4662,17 +4836,26 @@ fn persist_records(
             append_left: None,
         })
     })?;
+    // An append is planned by bytes: only onto a file as long as the store's first `from`
+    // records are now. A whole version-2 record that took its shed frame's place among them
+    // made them longer than the file, which holds the frame: that file is written whole.
     let tail = match (on_file, stamp) {
-        (Some(from), Some(stamp)) => Some(AppendAttempt {
-            stamp,
-            from,
-            len: accepted.held_len_from(from).map_err(|error| {
-                Box::new(PersistFailure {
-                    error: Error::new(error.to_string()),
-                    append_left: None,
-                })
-            })?,
-        }),
+        (Some(from), Some(stamp))
+            if accepted
+                .held_len_to(from)
+                .is_some_and(|bytes| bytes as u64 == stamp.len) =>
+        {
+            Some(AppendAttempt {
+                stamp,
+                from,
+                len: accepted.held_len_from(from).map_err(|error| {
+                    Box::new(PersistFailure {
+                        error: Error::new(error.to_string()),
+                        append_left: None,
+                    })
+                })?,
+            })
+        }
         _ => None,
     };
     let appended = tail
@@ -4739,6 +4922,20 @@ fn persist_records(
 /// so too before it holds more than [`crate::membership_log::LEGACY_RECORDS`] records. A crossed
 /// poster's batch that brings only waiting records is dropped and stores no mark. Where the
 /// mark cannot be stored the answer is 500 and neither the slot nor the file takes a record.
+///
+/// The records format (`crate::membership_log::follow`). The copy reads at the format this
+/// server's format mark names where its build reads it, format 1 everywhere else
+/// ([`Shared::records_reading`]). A source that states format 2 to a server that states format
+/// 1 is refused by the fence, on every build that reads no format 2 and before anything of it
+/// is looked at ([`records_admission`]). On a build that reads it, that source's records go
+/// into a follow copy no reader sees, and the server stores its format mark and then takes the
+/// copy only where it holds a version-2 record signed by a seat its log holds; a source whose
+/// records hold none gets the fence's refusal, and nothing of it is kept.
+///
+/// A version-2 record's whole and shed forms share one id. "Holds already" is therefore asked
+/// of the form too: a whole record the poster brings is taken where the store holds its shed
+/// frame ([`crate::membership_log::Store::lacks_whole`]), and a store whose complete records
+/// grew in bytes alone is written to the file as one that grew in count is ([`take_copy`]).
 #[cfg_attr(
     all(unix, any(test, debug_assertions)),
     aterm_spec_anchor::refines(
@@ -4792,6 +4989,14 @@ fn apply_records(
         Err(error) => return Reply::text(500, error.to_string()),
         Ok(false) => {}
     }
+    // Whether the store holds each staged record as it was sent: its id, and not as the shed
+    // frame of a whole version-2 record the poster brings, which the store still takes.
+    let brings_nothing = |store: &crate::membership_log::Store| {
+        staged
+            .records()
+            .iter()
+            .all(|record| store.contains(record.id()) && !store.lacks_whole(record))
+    };
     {
         let mut state = shared.lock_server_state();
         if let Some(reply) = unreadable_records(shared, &mut state, name) {
@@ -4800,28 +5005,31 @@ fn apply_records(
         if let Some(reply) = refuse_unheld_records(shared, &state, name, local) {
             return reply;
         }
-        match shared.records_here(&mut state, name) {
-            Ok(own) => {
-                if let Some(reply) = records_fence(own, stated) {
-                    return reply;
-                }
-            }
-            Err(failed) => return failed,
-        }
-        if state.records.get(name).is_some_and(|slot| {
-            staged
-                .records()
-                .iter()
-                .all(|record| slot.store.contains(record.id()))
-        }) {
-            return Reply::empty(204);
+        let admission = match shared
+            .records_here(&mut state, name)
+            .and_then(|own| records_admission(shared, name, own, stated))
+        {
+            Ok(admission) => admission,
+            Err(refused) => return refused,
+        };
+        if state
+            .records
+            .get(name)
+            .is_some_and(|slot| brings_nothing(&slot.store))
+        {
+            // Records this server holds are no evidence of a later format: a source that
+            // states one and brings nothing else is refused as the fence refused it.
+            return match admission {
+                Admission::Take(_) => Reply::empty(204),
+                Admission::Follow(refusal) => refusal,
+            };
         }
     }
     let _writing = shared
         .record_writes
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let (mut copy, stamp, on_file, crossed) = {
+    let (copy, taking, admission) = {
         let mut state = shared.lock_server_state();
         if let Some(reply) = unreadable_records(shared, &mut state, name) {
             return reply;
@@ -4833,58 +5041,148 @@ fn apply_records(
             Ok(own) => own,
             Err(failed) => return failed,
         };
-        if let Some(reply) = records_fence(own, stated) {
-            return reply;
+        let admission = match records_admission(shared, name, own, stated) {
+            Ok(admission) => admission,
+            Err(refused) => return refused,
+        };
+        if state
+            .records
+            .get(name)
+            .is_some_and(|slot| brings_nothing(&slot.store))
+        {
+            return match admission {
+                Admission::Take(_) => Reply::empty(204),
+                Admission::Follow(refusal) => refusal,
+            };
         }
-        let crossed = own.crossed;
-        if state.records.get(name).is_some_and(|slot| {
-            staged
-                .records()
-                .iter()
-                .all(|record| slot.store.contains(record.id()))
-        }) {
-            return Reply::empty(204);
-        }
+        // The copy reads at the format this server reads its records at: the slot's store
+        // read it when it last read the file, and a mark stored since moved it.
+        let reading = match shared.records_reading(name) {
+            Ok(reading) => reading,
+            Err(e) => return Reply::text(500, e.to_string()),
+        };
         let keys = record_keys(shared, &state, name);
-        match state.records.get(name) {
+        let (store, stamp, on_file) = match state.records.get(name) {
             Some(slot) => (
                 {
                     #[cfg(test)]
                     shared.post_clones.fetch_add(1, Ordering::SeqCst);
-                    follow_held(slot.store.clone(), keys.as_deref())
+                    slot.store.clone()
                 },
                 slot.stamp,
                 slot.on_file,
-                crossed,
             ),
             None => match crate::membership_log::Store::for_vault(name) {
-                Ok(store) => (follow_held(store, keys.as_deref()), None, None, crossed),
+                Ok(store) => (store, None, None),
                 Err(e) => return Reply::text(500, e.to_string()),
             },
-        }
+        };
+        let copy = follow_held(store, keys.as_deref()).read_at(reading);
+        let taking = Taking {
+            stamp,
+            on_file,
+            crossed: own.crossed,
+            // What a crossed log brings crosses this store where the store takes a complete
+            // record of it.
+            from_crossed: !own.crossed && stated.is_some_and(|bound| bound.crossed),
+            complete_before: complete_part(&copy),
+        };
+        (copy, taking, admission)
     };
-    // What a crossed log brings crosses this store where the store takes a complete record of
-    // it.
-    let from_crossed = !crossed && stated.is_some_and(|bound| bound.crossed);
+    let mut copy = copy;
     // MUTANT (`crate::crossing::Faults::mark_on_receipt`): the mark before the copy shows it
     // takes anything.
     #[cfg(test)]
-    if from_crossed
+    if taking.from_crossed
         && crate::crossing::faults(shared.crossing_mark(name).path()).mark_on_receipt
         && let Err(reply) = shared.mark_crossed(name)
     {
         return reply;
     }
-    let held_before = copy.log().map_or(0, crate::membership_log::Log::held_count);
     let mut records = staged.into_records();
-    records.retain(|record| !copy.holds(record.id()));
-    let added = match copy.ingest_records(records) {
-        Ok(added) => added,
-        Err(e) => return Reply::text(400, e.to_string()),
+    // A record the copy holds complete is not offered again, but for a whole version-2 record
+    // of which it holds the shed frame: the copy takes that in the frame's place.
+    records.retain(|record| !copy.holds(record.id()) || copy.lacks_whole(record));
+    let refusal = match admission {
+        Admission::Take(_) => {
+            let added = match copy.ingest_records(records) {
+                Ok(added) => added,
+                Err(e) => return Reply::text(400, e.to_string()),
+            };
+            if added == 0 {
+                return Reply::empty(204);
+            }
+            return take_copy(shared, name, copy, &taking);
+        }
+        Admission::Follow(refusal) => refusal,
     };
-    if added == 0 {
-        return Reply::empty(204);
+    // The source states format 2 and this server format 1, on a build that reads format 2
+    // ([`records_admission`]). Its records go into a copy of the copy, read as a follow copy
+    // reads; only where that holds a version-2 record signed by a seat its log holds is the
+    // format mark stored, and only then do the file and the slot take it
+    // (`crate::membership_log::follow`). What the source states is no evidence: without the
+    // record, nothing is taken, no mark is stored, and the answer is the fence's.
+    let mark = shared.format_mark(name);
+    let Ok(Some(followed)) =
+        crate::membership_log::follow::follow_records(&mark, &copy, records, None)
+    else {
+        return refusal;
+    };
+    match followed.take(&mark, |store| {
+        Ok(take_copy(shared, name, store.clone(), &taking))
+    }) {
+        Ok(reply) => reply,
+        Err(e) => {
+            note(&format!(
+                "{name}: could not follow its records into format 2: {e}"
+            ));
+            Reply::text(500, "the server could not store its records format mark")
+        }
     }
+}
+
+/// What [`apply_records`] read of `name`'s slot under the state lock, beside the copy it tries
+/// the records on.
+struct Taking {
+    /// The slot's file stamp ([`RecordSlot::stamp`]).
+    stamp: Option<fsx::FileStamp>,
+    /// What the slot knew the file to hold ([`RecordSlot::on_file`]).
+    on_file: Option<usize>,
+    /// Whether `name`'s records had crossed ([`Shared::crossed`]).
+    crossed: bool,
+    /// Whether the poster states a crossed log to a store that has not crossed.
+    from_crossed: bool,
+    /// The copy's complete part before it took anything ([`complete_part`]).
+    complete_before: (usize, usize),
+}
+
+/// The complete part of `store`'s log, which a server's records file holds: how many records,
+/// and their bytes. A record that arrives complete grows the first; a whole version-2 record
+/// that takes its shed frame's place ([`crate::membership_log::Store::insert`]) grows the
+/// second alone, and the file must hold it all the same.
+fn complete_part(store: &crate::membership_log::Store) -> (usize, usize) {
+    store
+        .log()
+        .map_or((0, 0), |log| (log.held_count(), log.held_bytes()))
+}
+
+/// The second half of [`apply_records`]: `copy`, which took at least one record the slot's
+/// store did not hold as it was sent, becomes `name`'s store. Where its complete part changed,
+/// the crossed mark is stored first where the records cross it, then the file is written, then
+/// the slot takes the copy; where only waiting records came, the slot takes it in memory.
+fn take_copy(
+    shared: &Shared,
+    name: &str,
+    copy: crate::membership_log::Store,
+    taking: &Taking,
+) -> Reply {
+    let &Taking {
+        stamp,
+        on_file,
+        crossed,
+        from_crossed,
+        complete_before,
+    } = taking;
     // A store with no genesis keeps nothing but the genesis that roots it, with whatever
     // comes beside it: no member is ever served a record before a genesis
     // (`Store::missing`), so what such a store took could be anyone's (any LAN host may POST
@@ -4899,7 +5197,7 @@ fn apply_records(
             "a store with no genesis takes records only with the genesis that roots them",
         );
     };
-    if held == held_before {
+    if complete_part(&copy) == complete_before {
         // Only waiting records came. A crossed log's are not taken, and store no mark: a record
         // waits for any signer that ever held a seat (`Log::insert`), a removed Mac's among
         // them, with a parent that may never come, so taking them would let such a key cross
@@ -4923,7 +5221,8 @@ fn apply_records(
         hold_waiting(shared, name, copy, stamp, on_file);
         return Reply::empty(204);
     }
-    // The copy holds more complete records than the slot. Where a crossed log taught them, the
+    // The copy's complete part is not the slot's: it holds more complete records, or a whole
+    // record where the slot holds its frame. Where a crossed log taught them, the
     // mark before the slot or the file takes the copy, so nothing a crossed log taught this
     // server is held without the mark. Nothing has seen the copy yet, so a batch it takes none
     // of (a `400`, a `422`, records it holds, records that only wait on a parent) stores no
@@ -6128,9 +6427,10 @@ pub(crate) struct Own {
 
 /// What a gated pass pulls of the vault a peer's TXT names (`peer`, as a browse handed it), given
 /// whether the instance its TXT's `label` names, resolving to the peer's endpoints, named a `rec`
-/// for that vault, in the round or one within [`NAMED_FOR`] before it and since the last
-/// catch-up (`named_elsewhere`, [`PullGate::names_rec`]), what this server holds of it (`own`)
-/// and whether a pull it finished proved a records digest (`proven`, [`PullGate`]):
+/// for that vault that this server held since or a pull it finished there proved, in the round or
+/// one within [`NAMED_FOR`] before it and since the last catch-up (`named_elsewhere`,
+/// [`PullGate::names_rec`]), what this server holds of it (`own`) and whether a pull it finished
+/// proved a records digest (`proven`, [`PullGate`]):
 ///
 /// - its envelope when this server takes the vault's envelopes and holds none, or the TXT names
 ///   a higher `seq` than the one held: exactly when the `?after=<held seq>` ask would answer a
@@ -6141,15 +6441,18 @@ pub(crate) struct Own {
 ///   before: an older build's (since `rec`, a server with no genesis names the empty log's), and
 ///   an `alab-secrets` instance's ([`PullGate::alab_instance`]), which never names `rec`
 ///   ([`advertised_vault`]). An `alab-secrets` instance is excused where `named_elsewhere` (its
-///   server's own-label instance named the records): that instance's TXT makes them due in each
-///   round whose rotating batch resolves it, and this one makes them due by none. Its `label`
-///   names the instance that may stand for it and proves none did: the instance under that
-///   label carries the TXT of whichever vault its server advertises there, which can be
-///   another, and a peer resolves only an instance whose TXT names ALab's vault
-///   ([`crate::discover::Watch::peer_vaults`]); a TXT naming no label is never excused. A
-///   forged instance on the labelled host, resolving to the same endpoints and naming a `rec`,
-///   holds those records back as a forged TXT holds back any gated pull, until the group's sweep
-///   ([`VaultTxt`]).
+///   server's own-label instance named records this server held since or proved there): that
+///   instance's TXT makes them due in each round whose rotating batch resolves it, and this one
+///   makes them due by none, even where this server has taken newer records since. A `rec` it
+///   named that this server has not held since nor proved there (one its round found due and
+///   did not take: the pull paced out or failed) excuses nothing, so this one keeps them due
+///   each round until a pull takes or proves them. Its `label` names the instance that may
+///   stand for it and proves none did: the instance under that label carries the TXT of
+///   whichever vault its server advertises there, which can be another, and a peer resolves
+///   only an instance whose TXT names ALab's vault ([`crate::discover::Watch::peer_vaults`]); a
+///   TXT naming no label is never excused. A forged instance on the labelled host, resolving to
+///   the same endpoints and naming a `rec`, holds those records back as a forged TXT holds back
+///   any gated pull, until the group's sweep ([`VaultTxt`]).
 ///
 /// A peer with no TXT (an empty store, several unrelated vaults and no single pin) is pulled by
 /// sweeps alone. The TXT is a suppression signal, bounded as [`VaultTxt`] says.
@@ -6247,11 +6550,18 @@ fn instance_key(url: &str) -> Option<InstanceKey> {
     ))
 }
 
-/// Where and when a round last resolved an instance whose TXT named a `rec` ([`PullGate::named`]).
+/// Where and when a round last resolved an instance whose TXT named a `rec`, and which
+/// ([`PullGate::named`]).
 #[derive(Clone, Debug)]
 struct Named {
     /// The exact list of endpoints it resolved to, as [`grouped`] keys a group.
     endpoints: Vec<SocketAddr>,
+    /// The records digest its TXT named: it stands for the records only where this server held
+    /// it since (`held`) or proved it there ([`PullGate::names_rec`]).
+    rec: [u8; 32],
+    /// Whether a round found this server holding `rec` since it was noted
+    /// ([`PullGate::note_held`]): it stays held whatever this server takes after.
+    held: bool,
     /// The round's instant ([`Pass::Gated`]).
     at: Instant,
 }
@@ -6390,10 +6700,10 @@ impl PullGate {
     /// Note what a round at `now` resolved (`resolved`: each peer, with the endpoints its host
     /// resolved to), before it decides what is due ([`Self::names_rec`]). Of each instance
     /// ([`InstanceKey`]) whose host resolved to endpoints, what an earlier round noted is
-    /// forgotten, and where its TXT names a `rec` it is remembered at exactly those endpoints,
-    /// for the vault its TXT names: one resolving elsewhere, or naming no `rec` now, stands
-    /// nowhere it stood. Of one whose host resolved to none (a lookup that timed out or
-    /// failed), the round knows its TXT and nowhere: what was noted of it for a vault its TXT
+    /// forgotten, and where its TXT names a `rec` it is remembered, with that `rec`, at exactly
+    /// those endpoints, for the vault its TXT names: one resolving elsewhere, or naming no `rec`
+    /// now, stands nowhere it stood. Of one whose host resolved to none (a lookup that timed out
+    /// or failed), the round knows its TXT and nowhere: what was noted of it for a vault its TXT
     /// now names no `rec` for is forgotten, and the rest stands as for an instance the round
     /// did not resolve. What was noted [`NAMED_FOR`] or longer before `now` is forgotten. A round's
     /// resolve leaves out an instance whose TXT names another vault than ALab's
@@ -6429,7 +6739,7 @@ impl PullGate {
             if endpoints.is_empty() {
                 continue;
             }
-            let Some(txt) = peer.txt.as_ref().filter(|txt| txt.rec.is_some()) else {
+            let Some((txt, rec)) = peer.txt.as_ref().and_then(|txt| Some((txt, txt.rec?))) else {
                 continue;
             };
             let key = (instance, txt.vault.clone());
@@ -6447,6 +6757,8 @@ impl PullGate {
                 key,
                 Named {
                     endpoints: endpoints.iter().map(|(at, _)| *at).collect(),
+                    rec,
+                    held: false,
                     at: now,
                 },
             );
@@ -6458,11 +6770,19 @@ impl PullGate {
     /// `alab-secrets` TXT with its own-label instance's name), named a `rec` for `txt`'s vault
     /// at exactly `endpoints` in a round noted within [`NAMED_FOR`] and not forgotten since
     /// ([`Self::note_named`]): the round deciding, which noted what it resolved first, or one
-    /// before it. An instance on another host stands for nothing here, whatever endpoints it
-    /// resolved to: another server that answered at those endpoints before (a DHCP lease handed
-    /// on) holds back no records of the one there now. A TXT naming no label (its server's only
-    /// registration, or an older build's) is answered `false`.
-    fn names_rec(&self, endpoints: &[SocketAddr], txt: &VaultTxt) -> bool {
+    /// before it; and that a round since found this server holding that `rec` of the vault (this
+    /// one first notes `own`, [`Own::rec`], [`Self::note_held`]), or a records pull it finished
+    /// at one of `endpoints` proved it ([`Self::proved`]). A `rec` noted that is neither stands
+    /// for nothing: the round that noted it found the records due and did not take them (its
+    /// pull paced out or failed), so they stay due until a pull takes or proves them, while a lab
+    /// whose records are all held asks nothing, and goes on asking nothing once this server takes
+    /// newer records than a holder's own-label instance last named. An instance on another host
+    /// stands for nothing here, whatever endpoints it resolved to: another server that answered
+    /// at those endpoints before (a DHCP lease handed on) holds back no records of the one there
+    /// now. A TXT naming no label (its server's only registration, or an older build's) is
+    /// answered `false`.
+    fn names_rec(&mut self, endpoints: &[SocketAddr], txt: &VaultTxt, own: &Own) -> bool {
+        self.note_held(&txt.vault, &own.rec);
         let Some(label) = txt.label.as_deref() else {
             return false;
         };
@@ -6472,16 +6792,34 @@ impl PullGate {
                 && host
                     .strip_suffix(".local")
                     .is_some_and(|stem| stem.eq_ignore_ascii_case(label))
+                && (named.held || self.proved(vault, &named.rec, endpoints, &own.follows))
         })
+    }
+
+    /// A round read this server holding the records `rec` digests of `vault` ([`own_of`],
+    /// [`Own::rec`]): each instance noted naming that `rec` for that vault ([`Self::note_named`])
+    /// stands for its records from now on ([`Named::held`], [`Self::names_rec`]), whatever this
+    /// server takes after. A records store holding a genesis only grows, so each record under
+    /// the heads it held it holds for good; one holding none states the empty log's digest
+    /// ([`crate::membership_log::empty_heads_digest`]), as does a server it notes naming it,
+    /// which holds no genesis either and so answers a records pull with no record
+    /// ([`crate::membership_log::Store::missing_within`]), whatever keys this store follows
+    /// later.
+    fn note_held(&mut self, vault: &str, rec: &[u8; 32]) {
+        for ((_, noted), named) in &mut self.named {
+            if noted == vault && named.rec == *rec {
+                named.held = true;
+            }
+        }
     }
 
     /// Whether `url` names a holder's `alab-secrets` instance (its host is `alab-secrets.local`,
     /// every collision rename's too), whose TXT never names its server's records
     /// ([`VaultTxt::rec`]): a TXT there makes them due by none where the instance its `label`
-    /// names, resolving to its endpoints, named a `rec` for its vault, in the round or one
-    /// within [`NAMED_FOR`] before it ([`Self::names_rec`]), and has them pulled at every visit
-    /// where none did, as a TXT with no `rec` on any other instance (an older build's) always
-    /// has ([`pull_due`]).
+    /// names, resolving to its endpoints, named a `rec` for its vault that this server held since
+    /// or proved there, in the round or one within [`NAMED_FOR`] before it ([`Self::names_rec`]),
+    /// and has them pulled at every visit where none did, as a TXT with no `rec` on any other
+    /// instance (an older build's) always has ([`pull_due`]).
     fn alab_instance(url: &str) -> bool {
         aterm_http::Uri::parse(url).is_some_and(|uri| {
             strip_local_suffix(uri.host()).eq_ignore_ascii_case(crate::alab_advertised())
@@ -6638,11 +6976,11 @@ struct Pull {
 /// it resolved before it decides ([`PullGate::note_named`]). An instance (a forged one) only adds
 /// to what its group pulls, but for one naming a `rec` on the host an `alab-secrets` instance's
 /// `label` names, which stands for that instance's records where both resolve to the same
-/// endpoints, in its round and those up to [`NAMED_FOR`] after it until a catch-up
-/// ([`pull_due`], [`PullGate::names_rec`]), and one resolving elsewhere is a group of its own;
-/// peers are told apart by address, never by a TXT's label. A round's
-/// passes pull a group only where no round pulled that exact list of endpoints within
-/// [`PULL_SPACING`] ([`PullGate::pace`]); a sweep held back so stays due.
+/// endpoints and this server held since or proved there the `rec` it named, in its round and
+/// those up to [`NAMED_FOR`] after it until a catch-up ([`pull_due`], [`PullGate::names_rec`]),
+/// and one resolving elsewhere is a group of its own; peers are told apart by address, never by
+/// a TXT's label. A round's passes pull a group only where no round pulled that exact list of
+/// endpoints within [`PULL_SPACING`] ([`PullGate::pace`]); a sweep held back so stays due.
 ///
 /// Each group is pulled on a thread of its own ([`pull_from_peer`]): a peer that takes a pull and
 /// never answers (a Mac asleep mid-answer, a server that stalls) holds only its own pull, not the
@@ -6749,9 +7087,9 @@ fn pull_pass(
             let at: Vec<SocketAddr> = pull.endpoints.iter().map(|(at, _)| *at).collect();
             shared.lock_gate().swept(&at, now, draw());
         }
-        pulled.stored
+        (pulled.stored, pulled.later)
     };
-    std::thread::scope(|scope| {
+    let pulled: Vec<(usize, Vec<LaterPeer>)> = std::thread::scope(|scope| {
         let threads: Vec<_> = pulls
             .iter()
             .map(|one| {
@@ -6766,12 +7104,29 @@ fn pull_pass(
             .iter()
             .zip(threads)
             .map(|(one, thread)| match thread {
-                Ok(thread) => thread.join().unwrap_or(0),
+                Ok(thread) => thread.join().unwrap_or_default(),
                 // No thread to spare: this one pulls once the others are under way.
                 Err(_) => pull(one),
             })
-            .sum()
-    })
+            .collect()
+    });
+    let mut stored = 0usize;
+    let mut later = Vec::new();
+    for (pulled, refused) in pulled {
+        stored += pulled;
+        later.extend(refused);
+    }
+    // Every pull of the pass has ended and taken what it brought: only now is a server that
+    // refused for a later records format asked again (`crate::membership_log::follow`, "Take
+    // first, then judge"). None is on a build that reads no format 2.
+    if !later.is_empty() {
+        let followed = follow_later_peers(shared, &later);
+        if followed != 0 {
+            shared.counts.add(Count::PullsStored);
+        }
+        stored += followed;
+    }
+    stored
 }
 
 /// Whether `url` names its server by a host, which a pull resolves first ([`peer_endpoints`]).
@@ -6784,12 +7139,15 @@ fn named_by_host(url: &str) -> bool {
 /// `owns` keeps what this server holds of each vault the pass looked at. An `alab-secrets`
 /// instance's TXT names no `rec` by design ([`PullGate::alab_instance`]): where the instance its
 /// `label` names (its server's own-label instance, which a round's rotating batch may leave
-/// out), resolving to the group's endpoints, named a `rec` for its vault, in this round or one
-/// within [`NAMED_FOR`] before it and since the last catch-up ([`PullGate::names_rec`]), the
-/// `alab-secrets` TXT makes the records due by none, and that instance's TXT makes them due in
-/// each round that resolves it; where none did (its server's only registration, whose TXT names
-/// no label, or an own-label instance that no round within that period resolved naming the
-/// records), they are pulled at every visit.
+/// out), resolving to the group's endpoints, named a `rec` for its vault that this server held
+/// since (this round's `own` or an earlier round's, [`PullGate::note_held`]) or proved there, in
+/// this round or one within [`NAMED_FOR`] before it and since the last catch-up
+/// ([`PullGate::names_rec`]), the `alab-secrets` TXT makes the records due by none, and that
+/// instance's TXT makes them due in each round that resolves it; where none did (its server's
+/// only registration, whose TXT names no label, an own-label instance that no round within that
+/// period resolved naming the records, or one that named records this server has not held since
+/// nor proved, as where the round that resolved it paced its pull out or the pull failed), they
+/// are pulled at every visit.
 fn group_wants(
     shared: &Shared,
     group: &Group<'_>,
@@ -6823,8 +7181,9 @@ fn group_wants(
                 let own = own_of(shared, &txt.vault, owns);
                 let at: Vec<SocketAddr> = group.endpoints.iter().map(|(at, _)| *at).collect();
                 let due = {
-                    let gate = shared.lock_gate();
-                    pull_due(peer, gate.names_rec(&at, txt), &own, |rec| {
+                    let mut gate = shared.lock_gate();
+                    let named_elsewhere = gate.names_rec(&at, txt, &own);
+                    pull_due(peer, named_elsewhere, &own, |rec| {
                         gate.proved(&txt.vault, rec, &at, &own.follows)
                     })
                 };
@@ -6921,6 +7280,7 @@ fn pull_endpoints(
         stored: 0,
         silent: true,
         whole: false,
+        later: Vec::new(),
     };
     for (tried, (at, url)) in endpoints.iter().enumerate() {
         if tried > 0 && now().saturating_duration_since(first) >= budget {
@@ -6929,6 +7289,7 @@ fn pull_endpoints(
         let pulled = pull(*at, url);
         all.stored += pulled.stored;
         all.whole |= pulled.whole;
+        all.later.extend(pulled.later);
         if !pulled.silent {
             all.silent = false;
             break;
@@ -7008,6 +7369,19 @@ struct PeerPull {
     /// left unjudged by a store that could not write (`500`, `507`, `403`), and the crossing
     /// could be read. A sweep marked swept is one so finished ([`PullGate::swept`]).
     whole: bool,
+    /// The records pulls a server refused beside a bound stating a later records format than
+    /// this server's ([`crate::ErrorKind::LaterFormat`]), which the pass asks again once every
+    /// pull of it has taken what it brought ([`follow_later_peers`]). Empty on a build that
+    /// reads no format 2.
+    later: Vec<LaterPeer>,
+}
+
+/// A vault's records at a server that refused this server's pull for a later records format.
+struct LaterPeer {
+    /// The vault.
+    vault: String,
+    /// Where the pull asked: `http://<address>/v1/<vault>`.
+    url: String,
 }
 
 /// Pull from the server at `url` what `wants` names of each vault: a newer envelope
@@ -7035,11 +7409,13 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
     let mut answered = false;
     shared.counts.add(Count::Pulls);
     let mut whole = true;
+    let mut later = Vec::new();
     let Some((base_prefix, _)) = url.rsplit_once('/') else {
         return PeerPull {
             stored,
             silent: false,
             whole: false,
+            later,
         };
     };
     let budget = shared.tuning.peer_pull;
@@ -7123,6 +7499,7 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
                             stored,
                             silent: !answered,
                             whole: false,
+                            later,
                         };
                     }
                 }
@@ -7155,6 +7532,12 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
                 whole = false;
                 continue;
             };
+            // The frames are read at the format this server reads the vault's records at; a
+            // pull that cannot say which takes nothing this pass either.
+            let Ok(reading) = shared.records_reading(vault_name) else {
+                whole = false;
+                continue;
+            };
             let answer = match crate::transport::fetch_record_frames_with_known(
                 &vault_url,
                 &have_records,
@@ -7162,18 +7545,31 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
                 budget,
                 None,
                 own,
+                reading,
                 |id| records_input::known_record(shared, vault_name, id),
             ) {
                 Ok(answer) => {
                     shared.counts.add(Count::RecordsFetches);
                     answer
                 }
-                Err(_) => {
+                Err(refused) => {
+                    // A server that refused beside a bound stating a later records format is
+                    // asked again stating it, on a build that reads it, once the pass has
+                    // taken what its other pulls brought ([`follow_later_peers`]).
+                    if refused.kind() == crate::ErrorKind::LaterFormat
+                        && shared.format_mark(vault_name).follows()
+                    {
+                        later.push(LaterPeer {
+                            vault: vault_name.to_owned(),
+                            url: vault_url,
+                        });
+                    }
                     shared.counts.add(Count::RecordsUnanswered);
                     return PeerPull {
                         stored,
                         silent: !answered,
                         whole: false,
+                        later,
                     };
                 }
             };
@@ -7240,7 +7636,87 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
         stored,
         silent: false,
         whole,
+        later,
     }
+}
+
+/// Follow a vault into records format 2 from the servers of `later`, each of which refused a
+/// records pull of this pass beside a bound stating a later format than this server's
+/// (`crate::membership_log::follow`). It runs once every pull of the pass has ended, so the
+/// log the evidence is judged on holds what the pass's other servers sent, a `Remove` of the
+/// signing seat among it. Each is asked again stating format 2, with no mark stored, for what
+/// it holds past this server's store; its frames are read as a follow copy reads them, and
+/// [`apply_records`] takes them only on a seat's signed version-2 record, format mark first.
+/// A server whose answer holds no such record is refused as before, and no mark is stored.
+/// Returns how many servers' answers this server followed or took records from.
+///
+/// It asks nothing on a build that reads no format 2
+/// ([`crate::crossing::FormatMark::follows`]): `later` is empty there ([`pull_from_peer`]),
+/// and each entry is asked the gate again before any request.
+fn follow_later_peers(shared: &Shared, later: &[LaterPeer]) -> usize {
+    use crate::crossing::{FORMAT_ONE, FORMAT_TWO};
+    let mut stored = 0usize;
+    for peer in later {
+        let vault = peer.vault.as_str();
+        if !shared.format_mark(vault).follows() {
+            continue;
+        }
+        let _slot = shared.records_pulls.take();
+        let have = {
+            let mut state = shared.lock_server_state();
+            take_records_from_store(shared, &mut state, vault);
+            state
+                .records
+                .get(vault)
+                .map_or_else(Vec::new, |slot| slot.store.have())
+        };
+        // A vault another server of this pass already moved into format 2 is pulled at that
+        // format by the next pass, as any vault is.
+        let Ok(own) = shared.records_bound_here(vault) else {
+            continue;
+        };
+        if own.format != FORMAT_ONE {
+            continue;
+        }
+        let Ok(answer) = crate::transport::fetch_record_frames_with_known(
+            &peer.url,
+            &have,
+            None,
+            shared.tuning.peer_pull,
+            None,
+            own.at_format(FORMAT_TWO),
+            crate::membership_log::Reading::Follow,
+            |id| records_input::known_record(shared, vault, id),
+        ) else {
+            shared.counts.add(Count::RecordsUnanswered);
+            continue;
+        };
+        shared.counts.add(Count::RecordsFetches);
+        if answer.received.byte_len() == 0 {
+            continue;
+        }
+        let before_len = shared
+            .lock_server_state()
+            .records
+            .get(vault)
+            .map_or(0, |slot| slot.store.len());
+        let stated = answer.bound.stated();
+        let (_, reply) = apply_pulled_records(shared, vault, answer.received, stated);
+        if reply.status == 204 {
+            let after_len = shared
+                .lock_server_state()
+                .records
+                .get(vault)
+                .map_or(0, |slot| slot.store.len());
+            if after_len > before_len {
+                shared
+                    .counts
+                    .add_n(Count::RecordsStored, after_len - before_len);
+                stored += 1;
+            }
+        }
+    }
+    stored
 }
 
 /// A records pull of `vault` this server judged whole was answered by the server at `at`, which

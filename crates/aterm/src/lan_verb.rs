@@ -36,6 +36,9 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> ExitCode {
 
 /// The broker, as root on macOS until its process ends.
 fn serve(source: &str) -> ExitCode {
+    // The job's log, bounded while it serves, where its standard output or error is the file its
+    // plist names (aterm_uds::job_log): serving takes what this kept.
+    let kept = aterm_lan::keep_log();
     if !cfg!(target_os = "macos") {
         eprintln!("aterm lan serve: macOS only (no Local Network privacy gates aterm elsewhere)");
         return ExitCode::from(2);
@@ -44,7 +47,7 @@ fn serve(source: &str) -> ExitCode {
         source: source.into(),
         socket: aterm_uds::lan::socket_path(),
     };
-    match aterm_lan::serve(opts) {
+    match aterm_lan::serve(opts, kept) {
         Ok(()) => ExitCode::SUCCESS,
         // The broker reports its failure through the same bounded sink as its live work.
         Err(_) => ExitCode::FAILURE,

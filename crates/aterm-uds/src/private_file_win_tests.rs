@@ -2,48 +2,32 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-use std::cell::Cell;
 use std::io;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::super::elevated::as_elevated;
 use super::super::{
-    ANOTHER_LINK, ELEVATED, JudgedDir, OPEN_MODE, PrivateDir, PrivateFileError, PrivateLock,
-    check_owned_dir, check_private_dir, create_private_dir, ensure_private_dir, judge_private_dir,
-    open_private, open_private_rw, read_private, remove_private, write_private,
-    write_private_flushed, write_private_new,
+    ANOTHER_LINK, ELEVATED, ELEVATED_PARENT, JudgedDir, OPEN_MODE, OTHERS_WRITE, PrivateDir,
+    PrivateFileError, PrivateLock, check_owned_dir, check_private_dir, create_private_dir,
+    ensure_private_dir, judge_private_dir, new_file_descriptor, open_private, open_private_rw,
+    read_owned, read_owned_into, read_private, read_private_into, remove_private,
+    set_dir_mode_nofollow, write_private, write_private_flushed, write_private_new,
 };
+use super::DIR_OTHERS_WRITE;
 use crate::acl::{Descriptor, NotOwnerOnly, Parts, Sid};
-
-thread_local! {
-    /// Whether this thread's calls take this process as elevated (`None`: as it is).
-    pub(super) static ELEVATED_HERE: Cell<Option<bool>> = const { Cell::new(None) };
-}
-
-/// `run` with this thread's calls taking this process as elevated.
-fn as_elevated<R>(run: impl FnOnce() -> R) -> R {
-    struct Back;
-    impl Drop for Back {
-        fn drop(&mut self) {
-            ELEVATED_HERE.set(None);
-        }
-    }
-    ELEVATED_HERE.set(Some(true));
-    let _back = Back;
-    run()
-}
 
 fn me() -> Sid {
     Sid::token_user().expect("this token's user")
 }
 
 /// A scratch folder under the temporary folder, and a private folder made in it.
-fn scratch() -> (aterm_tempfile::TempDir, PathBuf) {
+pub(in crate::private_file) fn scratch() -> (aterm_tempfile::TempDir, PathBuf) {
     assert!(
         !crate::elevation::is_elevated(),
-        "these tests make private files, which an elevated process may not"
+        "these tests take this process as unelevated wherever they do not say otherwise"
     );
     let root = aterm_tempfile::Builder::new()
         .prefix("aterm-private-win-")
@@ -74,7 +58,7 @@ fn dacl_parts(sddl: &str) -> (String, Vec<String>) {
 
 /// Assert `path` is owned by the user under a protected list of exactly the user and SYSTEM,
 /// with `flags` on each entry (`""` for a file, `"OICI"` for a folder).
-fn assert_owner_only(path: &Path, flags: &str) {
+pub(in crate::private_file) fn assert_owner_only(path: &Path, flags: &str) {
     let me = me();
     let sddl = sddl_of(path);
     assert!(
@@ -96,7 +80,7 @@ fn assert_owner_only(path: &Path, flags: &str) {
 }
 
 /// `path` opened to rewrite its descriptor.
-fn open_to_rewrite(path: &Path) -> std::fs::File {
+pub(in crate::private_file) fn open_to_rewrite(path: &Path) -> std::fs::File {
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
     std::fs::OpenOptions::new()
@@ -109,7 +93,7 @@ fn open_to_rewrite(path: &Path) -> std::fs::File {
 }
 
 /// Make the junction `link` to the folder `target` (`mklink /J`, which needs no privilege).
-fn junction(link: &Path, target: &Path) {
+pub(in crate::private_file) fn junction(link: &Path, target: &Path) {
     let status = crate::spawnfd::command("cmd")
         .args(["/C", "mklink", "/J"])
         .arg(link)
@@ -435,44 +419,394 @@ fn an_ordinary_folder_is_refused_until_ensured_and_a_missing_one_is_made_private
     assert_eq!(read_private(&deep, "key", 8).unwrap(), b"d");
 }
 
-/// An elevated process makes and changes nothing here, and still reads.
-/// NEGATIVE CONTROL: each maker, and removal, run as elevated is refused with `ELEVATED`, and
-/// nothing is made or removed.
+/// AN ELEVATED PROCESS KEEPS PRIVATE FILES THROUGH A HELD FOLDER OF THE USER'S: run as elevated,
+/// each maker writes, replaces, links, opens to write, locks and removes in a private folder,
+/// and what it makes is the user's under the private list (never Administrators', a full
+/// token's default owner); a missing private folder is made in a folder of the user's that is
+/// there. It makes no missing folder above one, nor one in another account's folder (Windows'
+/// own, `TrustedInstaller`'s): `ELEVATED_PARENT`, naming the folder, and nothing is made. And
+/// `new_file_descriptor`, whose callers make their files by path, still refuses it (`ELEVATED`).
+/// NEGATIVE CONTROLS (2026-11-18): `ensure_private_dir` making the parents elevated too (its
+/// `!elevated()` guard dropped): the folders above are made and the refusal does not come
+/// (`refused elevated: ()`); the parent's owner unread (`make_private_dir`'s `is_users` clause
+/// dropped): the make in Windows' folder is the system's own refusal (`Access is denied`), not
+/// `ELEVATED_PARENT`.
 #[test]
-fn an_elevated_process_makes_nothing_and_still_reads() {
+fn an_elevated_process_keeps_private_files_through_a_held_folder_of_the_users() {
     let (root, dir) = scratch();
-    write_private(&dir, "key", b"k").unwrap();
-    let missing = root.path().join("missing");
-    let refused = |result: io::Result<()>| {
+    write_private(&dir, "gone", b"g").unwrap();
+    let made = root.path().join("made");
+    let deep = root.path().join("missing").join("inner");
+    let windows = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+    let theirs = windows.join("aterm-private-win-elevated");
+    assert!(!theirs.exists(), "the control's name is free");
+    let parent_refused = |result: io::Result<()>, at: &Path| {
         let e = result.expect_err("refused elevated");
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
-        assert_eq!(e.to_string(), ELEVATED);
+        let text = e.to_string();
+        assert!(text.contains(ELEVATED_PARENT), "{text}");
+        assert!(text.contains(&at.display().to_string()), "{text}");
     };
     as_elevated(|| {
-        refused(write_private(&dir, "made", b"x"));
-        refused(write_private_flushed(
-            &dir,
-            "made",
-            b"x",
-            aterm_durable::Flush::Durable,
-        ));
-        refused(write_private_new(&dir, "made", b"x", |_| Ok(())).map(drop));
-        refused(create_private_dir(&missing));
-        refused(ensure_private_dir(&missing).map(drop));
-        refused(PrivateLock::take(&dir, ".lock", Duration::ZERO, "held").map(drop));
-        assert!(matches!(
-            open_private_rw(&dir, "made"),
-            Err(PrivateFileError::Io(e)) if e.to_string() == ELEVATED
-        ));
-        refused(remove_private(&dir, "key").map(drop));
-        assert_eq!(read_private(&dir, "key", 8).unwrap(), b"k", "it reads");
+        write_private(&dir, "key", b"k").expect("written elevated");
+        write_private(&dir, "key", b"again").expect("replaced elevated");
+        write_private_flushed(&dir, "flushed", b"f", aterm_durable::Flush::Durable)
+            .expect("flushed elevated");
+        assert!(write_private_new(&dir, "new", b"n", |_| Ok(())).expect("linked elevated"));
+        drop(open_private_rw(&dir, "rw").expect("opened to write elevated"));
+        drop(PrivateLock::take(&dir, ".lock", Duration::ZERO, "held").expect("locked elevated"));
+        assert!(remove_private(&dir, "gone").expect("removed elevated"));
+        assert_eq!(
+            ensure_private_dir(&made).expect("made in the user's folder"),
+            None
+        );
+        write_private(&made, "key", b"m").expect("written in it");
+
+        parent_refused(ensure_private_dir(&deep).map(drop), &deep);
+        parent_refused(create_private_dir(&deep), &deep);
+        parent_refused(ensure_private_dir(&theirs).map(drop), &theirs);
+        parent_refused(create_private_dir(&theirs), &theirs);
+        let refused = new_file_descriptor().expect_err("a maker by path");
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(refused.to_string(), ELEVATED);
+        assert_eq!(read_private(&dir, "key", 8).unwrap(), b"again", "it reads");
     });
-    assert!(!missing.exists() && !dir.join("made").exists() && !dir.join(".lock").exists());
-    assert_eq!(
-        read_private(&dir, "key", 8).unwrap(),
-        b"k",
-        "nothing removed"
+    for path in [
+        dir.join("key"),
+        dir.join("flushed"),
+        dir.join("new"),
+        dir.join("rw"),
+        dir.join(".lock"),
+        made.join("key"),
+    ] {
+        assert_owner_only(&path, "");
+    }
+    assert_owner_only(&made, "OICI");
+    assert!(!dir.join("gone").exists(), "removed");
+    assert!(
+        !root.path().join("missing").exists() && !theirs.exists(),
+        "nothing made above or elsewhere"
     );
+    new_file_descriptor().expect("unelevated, a maker by path has its descriptor");
+}
+
+/// THE LAW, A HELD FOLDER: a folder renamed after its judgement, with a junction to another
+/// private folder put at its name, sends nothing there: a judged folder's reads, and a write's
+/// temporary, rename and removal, all stay on the folder the judgement held.
+/// NEGATIVE CONTROL (2026-11-18): `open_in` judging the folder again by its path (as the arm
+/// did before its folders were held): the judged folder's read fails `Symlink`.
+#[test]
+fn a_folder_renamed_after_its_judgement_sends_nothing_elsewhere() {
+    let (root, dir) = scratch();
+    let other = root.path().join("other");
+    let retired = root.path().join("retired");
+    create_private_dir(&other).unwrap();
+    write_private(&dir, "row", b"before").unwrap();
+    write_private(&other, "row", b"unrelated").unwrap();
+
+    let judged = JudgedDir::judge(&dir).unwrap();
+    let directory = super::super::PrivateDirectory::open(&dir).unwrap();
+    std::fs::rename(&dir, &retired).expect("a held folder renames");
+    junction(&dir, &other);
+    assert_eq!(
+        read_private(&dir, "row", 16).ok(),
+        None,
+        "the name is a link"
+    );
+    assert_eq!(
+        judged.read("row", 16).unwrap(),
+        b"before",
+        "read from the folder judged"
+    );
+    let view = directory.view().unwrap();
+    view.write_entry_landed("row", b"after", || Ok(()))
+        .expect("published in the held folder")
+        .expect("noted");
+    view.write("second", b"2").unwrap();
+    view.remove("second").unwrap();
+    assert_eq!(view.read("row", 16).unwrap(), b"after");
+    assert_eq!(read_private(&retired, "row", 16).unwrap(), b"after");
+    assert!(!retired.join("second").exists());
+    assert_eq!(read_private(&other, "row", 16).unwrap(), b"unrelated");
+    let names: Vec<String> = std::fs::read_dir(&other)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["row"], "nothing reached the other folder");
+    assert!(directory.is_at(&retired).unwrap());
+    assert!(
+        directory.is_at(&dir).is_err(),
+        "a junction is no folder of its own"
+    );
+    std::fs::remove_dir(&dir).expect("the junction goes");
+}
+
+/// THE LAW, A FOLDER SWAPPED IN THE WRITE: the writer `write_private` and its kin share
+/// (`write_in`) runs its `check` after its temporary is written and before its rename, and a
+/// folder renamed then and replaced by a junction to another private folder still takes the
+/// rename: the bytes land in the folder judged, never through the junction, and no temporary is
+/// left in either.
+/// NEGATIVE CONTROL (2026-11-18): `write_in` renaming its temporary by the file's path
+/// (`std::fs::rename`, as the arm did before its folders were held): `published in the held
+/// folder` fails, the temporary not found behind the junction.
+#[test]
+fn a_folder_swapped_during_a_write_takes_the_write_in_the_folder_judged() {
+    let (root, dir) = scratch();
+    let other = root.path().join("other");
+    let retired = root.path().join("retired");
+    create_private_dir(&other).unwrap();
+    write_private(&other, "row", b"unrelated").unwrap();
+    write_private(&dir, "row", b"before").unwrap();
+    let folder = super::private_folder(&dir).unwrap();
+    let flushing = super::Flushing {
+        flush: aterm_durable::Flush::Durable,
+        diagnose: true,
+    };
+    super::write_in(&folder, &dir.join("row"), "row", b"after", flushing, || {
+        std::fs::rename(&dir, &retired)?;
+        junction(&dir, &other);
+        Ok(())
+    })
+    .expect("published in the held folder")
+    .expect("noted");
+    drop(folder);
+    assert_eq!(read_private(&retired, "row", 16).unwrap(), b"after");
+    assert_eq!(read_private(&other, "row", 16).unwrap(), b"unrelated");
+    for folder in [&retired, &other] {
+        let names: Vec<String> = std::fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["row"], "no temporary left in {}", folder.display());
+    }
+    std::fs::remove_dir(&dir).expect("the junction goes");
+}
+
+/// A lock file is judged private on its handle, as a private file is: one another account may
+/// read, or that has a second link, takes no lock (a mandatory lock on another's file is a way
+/// to stop it being written).
+/// NEGATIVE CONTROL (2026-11-18): a read-write opening judged as a plain file only, as the lock's
+/// was before (`judge_opened` skipping the owner-only and link clauses for it): the lock another
+/// account may read is taken (`another account may read it` fails).
+#[test]
+fn a_lock_file_that_is_not_private_takes_no_lock() {
+    let (_root, dir) = scratch();
+    drop(PrivateLock::take(&dir, "open.lock", Duration::ZERO, "held").unwrap());
+    let me = me();
+    Descriptor::from_sddl(&format!("D:P(A;;FA;;;{me})(A;;FA;;;SY)(A;;FR;;;WD)"))
+        .unwrap()
+        .apply(
+            open_to_rewrite(&dir.join("open.lock")),
+            Parts::DACL | Parts::PROTECTED_DACL,
+        )
+        .unwrap();
+    let refused = PrivateLock::take(&dir, "open.lock", Duration::ZERO, "held")
+        .err()
+        .expect("another account may read it");
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+
+    drop(PrivateLock::take(&dir, "linked.lock", Duration::ZERO, "held").unwrap());
+    std::fs::hard_link(dir.join("linked.lock"), dir.join("copy")).unwrap();
+    let refused = PrivateLock::take(&dir, "linked.lock", Duration::ZERO, "held")
+        .err()
+        .expect("a second link");
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    std::fs::remove_file(dir.join("copy")).unwrap();
+    drop(PrivateLock::take(&dir, "linked.lock", Duration::ZERO, "held").expect("one link again"));
+}
+
+/// `file`'s access list replaced with `sddl`'s (the kernel's own write, which keeps each entry's
+/// flags as given) and `protected` or not.
+fn set_list(path: &Path, sddl: &str, protected: bool) {
+    const DACL: u32 = 0x0000_0004;
+    const PROTECTED_DACL: u32 = 0x8000_0000;
+    const UNPROTECTED_DACL: u32 = 0x2000_0000;
+    let list = Descriptor::from_sddl(sddl).unwrap();
+    let file = open_to_rewrite(path);
+    let how = DACL
+        | if protected {
+            PROTECTED_DACL
+        } else {
+            UNPROTECTED_DACL
+        };
+    // SAFETY: `file` is a live handle with WRITE_DAC and `list` a live descriptor.
+    let set = unsafe {
+        crate::win::ffi::SetKernelObjectSecurity(
+            file.as_raw_handle() as crate::win::ffi::RawHandle,
+            how,
+            list.as_ptr(),
+        )
+    };
+    assert_ne!(set, 0, "{}", io::Error::last_os_error());
+}
+
+/// READ_OWNED'S RULE: a file and folder the user owns may hold inherited entries, take entries
+/// from their folder, and let other accounts read (`loose`), but no entry may let an account
+/// other than the user, SYSTEM and Administrators write: `OTHERS_WRITE`, the folder's
+/// `DIR_OTHERS_WRITE`. A strict private file reads as not loose; a file made as any other in the
+/// user's ordinary folder reads; another account's file and folder, a junction and a second
+/// link are refused as by the strict rule. The identity is the handle's (`file_id`).
+/// NEGATIVE CONTROL (2026-11-18): `owned_rule` taking any right of another account as a read
+/// (its `READ_RIGHTS` clause dropped): the file Everyone may write reads.
+#[test]
+fn read_owned_lets_others_read_but_never_write() {
+    let (root, dir) = scratch();
+    let me = me();
+    let mut buf = [0u8; 64];
+
+    write_private(&dir, "strict", b"s").unwrap();
+    let read = read_owned_into(&dir, "strict", 64, &mut buf).unwrap();
+    assert_eq!((&buf[..read.len], read.loose), (&b"s"[..], false));
+    let id = aterm_dirfd::file_id(std::fs::File::open(dir.join("strict")).unwrap()).unwrap();
+    assert_eq!(
+        (read.dev, read.ino),
+        (id.dev, id.ino),
+        "the handle's identity"
+    );
+
+    write_private(&dir, "readable", b"r").unwrap();
+    set_list(
+        &dir.join("readable"),
+        &format!("D:(A;;FA;;;{me})(A;ID;FA;;;SY)(A;;FR;;;WD)(A;;FA;;;BA)"),
+        false,
+    );
+    let read = read_owned_into(&dir, "readable", 64, &mut buf).unwrap();
+    assert_eq!((&buf[..read.len], read.loose), (&b"r"[..], true));
+    assert_eq!(read_owned(&dir, "readable", 64).unwrap(), b"r");
+    assert!(
+        matches!(
+            read_private(&dir, "readable", 64),
+            Err(PrivateFileError::NotPrivate(_))
+        ),
+        "the strict rule refuses it"
+    );
+
+    write_private(&dir, "writable", b"w").unwrap();
+    set_list(
+        &dir.join("writable"),
+        &format!("D:P(A;;FA;;;{me})(A;;FA;;;SY)(A;;0x00000002;;;WD)"),
+        true,
+    );
+    assert!(matches!(
+        read_owned(&dir, "writable", 64),
+        Err(PrivateFileError::NotPrivate(OTHERS_WRITE))
+    ));
+
+    // A file made as any other in an ordinary folder of the user's (the profile's inherited list).
+    let plain = root.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::write(plain.join("legacy"), b"l").unwrap();
+    let read = read_owned_into(&plain, "legacy", 64, &mut buf).unwrap();
+    assert_eq!(&buf[..read.len], b"l");
+    assert!(read_private(&plain, "legacy", 64).is_err());
+
+    // The folder: another account may read it, then write in it.
+    let shared = root.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join("row"), b"x").unwrap();
+    set_list(
+        &shared,
+        &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;;FR;;;WD)"),
+        true,
+    );
+    assert!(read_owned_into(&shared, "row", 64, &mut buf).unwrap().loose);
+    set_list(
+        &shared,
+        &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;;0x00000006;;;WD)"),
+        true,
+    );
+    assert!(matches!(
+        read_owned(&shared, "row", 64),
+        Err(PrivateFileError::NotPrivate(DIR_OTHERS_WRITE))
+    ));
+    // An entry passed on only to what the folder holds grants the folder nothing.
+    set_list(
+        &shared,
+        &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;OICIIO;FA;;;WD)"),
+        true,
+    );
+    assert!(!read_owned_into(&shared, "row", 64, &mut buf).unwrap().loose);
+
+    std::fs::hard_link(dir.join("strict"), dir.join("copy")).unwrap();
+    assert!(matches!(
+        read_owned(&dir, "strict", 64),
+        Err(PrivateFileError::NotPrivate(ANOTHER_LINK))
+    ));
+    let windows = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+    assert!(matches!(
+        read_owned(&windows, "win.ini", 64),
+        Err(PrivateFileError::NotPrivate(_) | PrivateFileError::Missing)
+    ));
+    let link = root.path().join("link");
+    junction(&link, &dir);
+    assert!(matches!(
+        read_owned(&link, "readable", 64),
+        Err(PrivateFileError::Symlink)
+    ));
+    std::fs::remove_dir(&link).unwrap();
+}
+
+/// READ_PRIVATE_INTO reads into the caller's buffer and answers the file's identity off its
+/// handle: the same file's, and a replacement's another.
+/// NEGATIVE CONTROL (2026-11-18): the identity's file id answered as 0: the first comparison
+/// with `file_id` fails (and `read_owned_into`'s in the test of its rule).
+#[test]
+fn read_private_into_answers_the_files_identity() {
+    let (_root, dir) = scratch();
+    write_private(&dir, "key", b"secret").unwrap();
+    let mut buf = [0u8; 16];
+    let first = read_private_into(&dir, "key", 16, &mut buf).unwrap();
+    assert_eq!(&buf[..first.len], b"secret");
+    let id = aterm_dirfd::file_id(std::fs::File::open(dir.join("key")).unwrap()).unwrap();
+    assert_eq!((first.dev, first.ino), (id.dev, id.ino));
+    assert_eq!(read_private_into(&dir, "key", 16, &mut buf).unwrap(), first);
+    write_private(&dir, "key", b"other").unwrap();
+    let second = read_private_into(&dir, "key", 16, &mut buf).unwrap();
+    assert_eq!(&buf[..second.len], b"other");
+    assert_eq!(second.dev, first.dev);
+    assert_ne!(second.ino, first.ino, "a replacement is another file");
+    assert!(matches!(
+        read_private_into(&dir, "key", 3, &mut buf),
+        Err(PrivateFileError::Malformed(_))
+    ));
+}
+
+/// SET_DIR_MODE_NOFOLLOW narrows an ordinary folder of the user's to the private list on a
+/// handle of the folder itself, leaves a private one as it is, never widens one, and never
+/// follows a junction: one is refused and its target left as it was.
+/// NEGATIVE CONTROL (2026-11-18): the folder opened by a path that follows links
+/// (`open_parent`'s open): the junction's target is narrowed and the refusal does not come
+/// (`a junction: ()`).
+#[test]
+fn set_dir_mode_nofollow_narrows_a_folder_as_itself() {
+    let (root, dir) = scratch();
+    let plain = root.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let inherited = sddl_of(&plain);
+    assert!(!dacl_parts(&inherited).0.contains('P'), "{inherited}");
+
+    let link = root.path().join("link");
+    junction(&link, &plain);
+    let refused = set_dir_mode_nofollow(&link, 0o700).expect_err("a junction");
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    assert_eq!(sddl_of(&plain), inherited, "its target is left as it was");
+    std::fs::remove_dir(&link).unwrap();
+
+    let widened = set_dir_mode_nofollow(&plain, 0o755).expect_err("a mode for others");
+    assert_eq!(widened.kind(), io::ErrorKind::Unsupported, "{widened}");
+    assert_eq!(sddl_of(&plain), inherited);
+
+    set_dir_mode_nofollow(&plain, 0o700).unwrap();
+    assert_owner_only(&plain, "OICI");
+    let private = sddl_of(&dir);
+    set_dir_mode_nofollow(&dir, 0o700).unwrap();
+    assert_eq!(sddl_of(&dir), private, "a private folder is left as it is");
+
+    write_private(&dir, "file", b"f").unwrap();
+    let refused = set_dir_mode_nofollow(&dir.join("file"), 0o700).expect_err("a file");
+    assert_eq!(refused.kind(), io::ErrorKind::NotADirectory, "{refused}");
+    let missing = set_dir_mode_nofollow(&root.path().join("missing"), 0o700).unwrap_err();
+    assert_eq!(missing.kind(), io::ErrorKind::NotFound, "{missing}");
 }
 
 /// A name a Windows path would read as more or other than one file in its folder is refused
@@ -524,7 +858,7 @@ fn a_name_windows_reads_as_another_file_is_refused() {
 /// A held lock is held against a second taker, and a waiter takes it once it is let go.
 #[test]
 fn a_private_lock_excludes_and_a_waiter_takes_it_once_let_go() {
-    let (_root, dir) = scratch();
+    let (root, dir) = scratch();
     let first = PrivateLock::take(&dir, ".lock", Duration::ZERO, "busy").unwrap();
     assert_eq!(
         PrivateLock::take(&dir, ".lock", Duration::ZERO, "busy")
@@ -539,10 +873,27 @@ fn a_private_lock_excludes_and_a_waiter_takes_it_once_let_go() {
             PrivateLock::wait_for(&dir, ".lock", move || told.send(()).unwrap())
         })
     };
-    heard
-        .recv_timeout(Duration::from_secs(60))
-        .expect("the waiter found the lock held");
+    if let Err(error) = heard.recv_timeout(Duration::from_secs(60)) {
+        let kept = root.keep();
+        panic!(
+            "the waiter did not find the lock held: {error}; retained {}",
+            kept.display()
+        );
+    }
     drop(first);
+    if aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(10),
+        || waiter.is_finished().then_some(()),
+    )
+    .is_none()
+    {
+        let kept = root.keep();
+        panic!(
+            "the released lock waiter did not finish within the hang detector; retained {}",
+            kept.display()
+        );
+    }
     let held = waiter.join().unwrap().expect("taken once let go");
     assert!(PrivateLock::take(&dir, ".lock", Duration::ZERO, "busy").is_err());
     drop(held);
@@ -586,7 +937,7 @@ fn a_judged_folder_serves_its_files_and_removal_answers_whether_one_was_there() 
 fn a_cloud_placeholder_is_refused_as_a_reparse_point() {
     assert!(
         !crate::elevation::is_elevated(),
-        "these tests make private files, which an elevated process may not"
+        "these tests take this process as unelevated wherever they do not say otherwise"
     );
     let root = aterm_tempfile::Builder::new()
         .prefix("aterm-private-win-")
@@ -627,4 +978,78 @@ fn a_cloud_placeholder_is_refused_as_a_reparse_point() {
     drop(synced);
     assert_eq!(read_private(&state, "key", 8).expect("plain again"), b"k");
     check_private_dir(&folder).expect("a plain private folder again");
+}
+
+/// KEPT PARSES ON WINDOWS ARE KEPT BY THEIR BYTES: no file is held open, every read opens and
+/// judges the file and reads its bytes, equal bytes at the same path reuse their parse (the
+/// same bytes in a replacement too), and a same-length write in place through a handle still
+/// open is read and parsed again. A file no longer private is refused and forgotten; the bound
+/// evicts the first kept.
+/// NEGATIVE CONTROL (2026-11-18): the parse found by its path alone (the byte comparison
+/// dropped): the write in place hands the old parse back (`first`, not `again`).
+#[test]
+fn a_kept_parse_is_kept_by_its_bytes_and_reads_a_write_in_place() {
+    use std::io::Write as _;
+    let (_root, dir) = scratch();
+    write_private(&dir, "book", b"first").unwrap();
+    let kept = super::super::KeptParse::new(1);
+    let parses = std::cell::Cell::new(0);
+    let parse = |bytes: &[u8]| {
+        parses.set(parses.get() + 1);
+        bytes.to_vec()
+    };
+    assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"first");
+    assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"first");
+    assert_eq!(parses.get(), 1, "equal bytes are parsed once");
+    write_private(&dir, "book", b"first").unwrap();
+    assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"first");
+    assert_eq!(
+        parses.get(),
+        1,
+        "equal bytes in a replacement reuse their parse"
+    );
+    drop(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(dir.join("book"))
+            .expect("opened alone: no handle holds the file"),
+    );
+
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("book"))
+        .unwrap();
+    writer.write_all(b"again").unwrap();
+    assert_eq!(
+        kept.read(&dir, "book", 64, parse).unwrap(),
+        b"again",
+        "a same-length write in place, its handle still open, is read again"
+    );
+    assert_eq!(parses.get(), 2);
+    drop(writer);
+    assert!(matches!(
+        kept.read(&dir, "book", 4, parse),
+        Err(PrivateFileError::Malformed(_))
+    ));
+
+    write_private(&dir, "other", b"other").unwrap();
+    assert_eq!(kept.read(&dir, "other", 64, parse).unwrap(), b"other");
+    assert_eq!(parses.get(), 3);
+    assert_eq!(kept.read(&dir, "book", 64, parse).unwrap(), b"again");
+    assert_eq!(parses.get(), 4, "the evicted file is parsed again");
+
+    let me = me();
+    Descriptor::from_sddl(&format!("D:P(A;;FA;;;{me})(A;;FA;;;SY)(A;;FR;;;WD)"))
+        .unwrap()
+        .apply(
+            open_to_rewrite(&dir.join("book")),
+            Parts::DACL | Parts::PROTECTED_DACL,
+        )
+        .unwrap();
+    assert!(matches!(
+        kept.read(&dir, "book", 64, parse),
+        Err(PrivateFileError::NotPrivate(_))
+    ));
+    assert_eq!(parses.get(), 4, "a refused file is not parsed");
 }

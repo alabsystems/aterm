@@ -2928,6 +2928,12 @@ impl Wake {
             Wake::GrokSigninLooked { session } => Some(*session),
             #[cfg(all(unix, not(target_os = "macos")))]
             Wake::NavigatorTitleReady(_) => None,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            Wake::PresentationReleased => None,
             Wake::LeaseChanged { .. }
             | Wake::CrashJournalOwed
             | Wake::HostMaintenance
@@ -3157,6 +3163,7 @@ impl Wake {
             Wake::Askpass(..) => None,
             #[cfg(target_os = "macos")]
             Wake::CpuPolicyReport(_)
+            | Wake::RootStepEnded { .. }
             | Wake::CpuPolicyPermit { .. }
             | Wake::CpuPolicyAction { .. } => None,
             #[cfg(target_os = "macos")]
@@ -3214,6 +3221,7 @@ impl Wake {
             Wake::AccountsDrained { .. }
             | Wake::AccountsOutlived { .. }
             | Wake::MailChanged
+            | Wake::RegistryChanged
             | Wake::TablesChanged
             | Wake::NoMacosDialog
             | Wake::WorkstationSetup(_)

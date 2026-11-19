@@ -657,7 +657,7 @@ struct Shared {
     input_hook_driven: AtomicBool,
     discards: AtomicU64,
     restarts: AtomicU64,
-    severed: AtomicBool,
+    severed: std::sync::OnceLock<Instant>,
     reply_reserved: AtomicUsize,
     master_nonblocking: AtomicBool,
     #[cfg(all(unix, any(test, debug_assertions)))]
@@ -972,6 +972,20 @@ impl SinkWriter {
         self.input_backlog_at(Instant::now())
     }
 
+    /// Bytes the kernel accepted per second in each of the last twelve complete five-second
+    /// intervals. Coverage runs from the ledger's birth to this sink's severance.
+    #[must_use]
+    pub fn input_byte_rates(&self, at: Instant) -> [Option<f64>; 12] {
+        if self.master < 0 {
+            return [None; 12];
+        }
+        self.shared
+            .ledger
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .byte_rates(at, self.shared.severed.get().copied().unwrap_or(at))
+    }
+
     /// [`Self::input_backlog`] as of `now`, which the caller reads first (step 1).
     #[must_use]
     pub fn input_backlog_at(&self, now: Instant) -> Option<InputBacklog> {
@@ -1086,7 +1100,7 @@ impl SinkWriter {
     pub fn sever_input(&self) {
         {
             let mut s = self.shared.spill.lock().unwrap_or_else(|p| p.into_inner());
-            self.shared.severed.store(true, Ordering::Release);
+            self.shared.severed.get_or_init(Instant::now);
             if !s.buf.is_empty() {
                 s.failed = true;
             }
@@ -1099,6 +1113,28 @@ impl SinkWriter {
         self.shared.drained.notify_all();
         #[cfg(windows)]
         aterm_pty::release_input_writes(self.master);
+    }
+
+    /// Seal an idle shell at its cleanup boundary. The observed epoch must still hold with no
+    /// queued bytes, while both a direct write and a spill admission are excluded. Losing the
+    /// race leaves the sink open and every accepted byte in its original custody.
+    #[must_use]
+    pub fn try_sever_quiet_input(&self, observed: InputEpoch) -> bool {
+        let Some(_frames) = self.try_fence_egress() else {
+            return false;
+        };
+        let Ok(spill) = self.shared.spill.try_lock() else {
+            return false;
+        };
+        if !spill.buf.is_empty()
+            || self.shared.is_severed()
+            || self.ordered_egress_count() != 0
+            || self.input_epoch() != observed
+        {
+            return false;
+        }
+        self.shared.severed.get_or_init(Instant::now);
+        true
     }
 
     /// Let go of this sink's PTY master for good, at the final exit ([`aterm_pty::retire_master`]):
@@ -1444,7 +1480,7 @@ impl SinkWriter {
         short: ShortWrite,
         tracked: bool,
     ) -> (ImmediateWrite, WriteReceipt) {
-        if bytes.len() > Self::IMMEDIATE_FRAME_MAX || self.shared.is_severed() {
+        if bytes.len() > Self::IMMEDIATE_FRAME_MAX {
             return (ImmediateWrite::BusyZero, WriteReceipt::new(0, None));
         }
         if !self.shared.master_nonblocking.load(Ordering::Relaxed) {
@@ -1465,7 +1501,7 @@ impl SinkWriter {
                 return (ImmediateWrite::BusyZero, WriteReceipt::new(0, None));
             }
         };
-        if !spill_guard.buf.is_empty() {
+        if self.shared.is_severed() || !spill_guard.buf.is_empty() {
             return (ImmediateWrite::BusyZero, WriteReceipt::new(0, None));
         }
         let Ok(order) = self.shared.next_accepted_order(false) else {
@@ -2199,7 +2235,7 @@ impl Shared {
             input_hook_driven: AtomicBool::new(false),
             discards: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
-            severed: AtomicBool::new(false),
+            severed: std::sync::OnceLock::new(),
             reply_reserved: AtomicUsize::new(0),
             master_nonblocking: AtomicBool::new(false),
             #[cfg(all(unix, any(test, debug_assertions)))]
@@ -2250,7 +2286,7 @@ impl Shared {
     }
 
     fn is_severed(&self) -> bool {
-        self.severed.load(Ordering::Acquire)
+        self.severed.get().is_some()
     }
 
     fn severed_error() -> io::Error {
@@ -2490,6 +2526,9 @@ impl Shared {
         self: &Arc<Self>,
         tracked: bool,
     ) -> io::Result<Option<AcceptedFrame>> {
+        if self.is_severed() {
+            return Err(Self::severed_error());
+        }
         let mut cur = self.order_state.load(Ordering::Acquire);
         loop {
             if cur & Self::SPILL_ACTIVE_BIT != 0 {
@@ -2649,6 +2688,9 @@ impl Shared {
                     Err(poison) => poison.into_inner().0,
                 };
             }
+        }
+        if self.is_severed() {
+            return Err(Self::severed_error());
         }
         if self.discarded_since(since) {
             let order = self.next_accepted_order(!s.buf.is_empty())?;

@@ -430,6 +430,11 @@ pub(crate) enum StyleRef {
     Setting,
     Code,
     Chip,
+    /// A button laid over words its page paints itself (the System Resources page's span button
+    /// over the Disk document's `24 h \u{b7} 3 weeks`): no fill and no words of its own, so the
+    /// painted ones read through it; only the pointer's wash and the focus ring
+    /// ([`paint_over_button`]).
+    Over,
     /// A note under a row or an item: Caption, in the readable secondary ink.
     Note,
     /// Plain words dimmed: Body, in the tertiary ink (a writer known only by its short id).
@@ -2790,6 +2795,8 @@ pub(crate) enum UiContent {
     MarkdownBlock(MarkdownBlockSpec),
     TextViewport(TextViewportSpec),
     SettingsPreview(Box<crate::settings_preview::SettingsPreviewSpec>),
+    /// A painted block of the System Resources page ([`crate::native_resources`]).
+    Resources(Box<crate::native_resources::ResourcesPaint>),
     ColorWheel(Control<ColorWheelSpec>),
     Custom(AuditedCustomNode),
 }
@@ -2855,6 +2862,7 @@ impl UiContent {
             Self::MarkdownBlock(spec) => spec.selectable,
             Self::TextViewport(spec) => spec.selectable,
             Self::SettingsPreview(spec) => spec.pause_control(),
+            Self::Resources(_) => false,
             Self::Custom(spec) => spec.focusable,
         }
     }
@@ -2962,6 +2970,15 @@ impl UiContent {
                     audit_id: None,
                 }
             }
+            Self::Resources(spec) => SemanticProjection {
+                role: SemanticRole::Group,
+                label: spec.semantic_label(),
+                value: SemanticValue::Text(spec.semantic_value()),
+                state: None,
+                action: None,
+                focusable: false,
+                audit_id: None,
+            },
             Self::Custom(spec) => SemanticProjection {
                 role: spec.role,
                 label: spec.label.clone(),
@@ -3200,6 +3217,7 @@ impl UiTree {
                     spec.focus_visible = spec.focused && focus_visible;
                     None
                 }
+                UiContent::Resources(_) => None,
                 UiContent::Custom(spec) => {
                     if spec.focusable {
                         spec.focused = focus == Some(key);
@@ -4487,6 +4505,9 @@ impl CompiledUi {
                         spec.paint_fingerprint(),
                     ));
                 }
+                UiContent::Resources(spec) => {
+                    lines.push(spec.audit_line(paint.key.as_str()));
+                }
                 UiContent::MarkdownBlock(spec) => {
                     lines.push(markdown_paint_audit(paint, spec));
                 }
@@ -4813,6 +4834,7 @@ impl CompiledUi {
             ui_content_kind(&node.content).hash(&mut hash);
             match &node.content {
                 UiContent::SettingsPreview(spec) => spec.paint_fingerprint().hash(&mut hash),
+                UiContent::Resources(spec) => spec.fingerprint().hash(&mut hash),
                 UiContent::MarkdownBlock(spec) => {
                     markdown_paint_fingerprint(node, spec).hash(&mut hash);
                 }
@@ -5168,6 +5190,7 @@ const fn ui_content_kind(content: &UiContent) -> &'static str {
         UiContent::MarkdownBlock(_) => "markdown-block",
         UiContent::TextViewport(_) => "text-viewport",
         UiContent::SettingsPreview(_) => "settings-preview",
+        UiContent::Resources(_) => "resources",
         UiContent::ColorWheel(_) => "color-wheel",
         UiContent::Custom(_) => "custom",
     }
@@ -5497,6 +5520,9 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                 available,
             ))
         }
+        // An Over button paints no words of its own ([`paint_over_button`]): the words it lies on
+        // are another node's.
+        UiContent::Button(control) if control.style == StyleRef::Over => None,
         UiContent::Button(control) => {
             let navigation = control.style == StyleRef::Navigation;
             let (_, face) = navigation_label_type(control);
@@ -5725,9 +5751,13 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
         }
         UiContent::Custom(spec) => {
             let available = effective_horizontal_width(node, node.rect.x, node.rect.right());
-            // A scroll indicator says nothing, and a comprehension mark says its label and
-            // paints no words: neither has words that could overflow.
-            if spec.audit_id == MESSAGES_SCROLL_AUDIT || spec.audit_id == COMPREHENSION_MARK_AUDIT {
+            // Scroll indicators, comprehension marks and resource histories paint no text.
+            if matches!(
+                spec.audit_id,
+                MESSAGES_SCROLL_AUDIT
+                    | COMPREHENSION_MARK_AUDIT
+                    | crate::navigator::resources::AUDIT
+            ) {
                 return Some(finish_text_fit(
                     node,
                     "custom",
@@ -6482,6 +6512,9 @@ fn paint_compiled_node_at(
         {
             paint_disclosure_button(prims, rect, control, &roles);
         }
+        UiContent::Button(control) if control.style == StyleRef::Over => {
+            paint_over_button(prims, rect, control.state, &roles);
+        }
         UiContent::Button(control) => {
             let style = button_paint_style(control);
             let unwritten = style == StyleRef::Unwritten;
@@ -7108,6 +7141,9 @@ fn paint_compiled_node_at(
         UiContent::SettingsPreview(spec) => {
             spec.paint(prims, rect, theme, roles);
         }
+        UiContent::Resources(spec) => {
+            spec.paint(prims, rect, &roles);
+        }
         UiContent::ColorWheel(control) => {
             let geometry = color_wheel_geometry(rect);
             if control.state.focus_visible {
@@ -7302,6 +7338,10 @@ fn paint_compiled_node_at(
             }
             if spec.audit_id == SYSTEM_STATE_SURFACE_AUDIT {
                 crate::system_state::paint_surface(prims, rect, spec.paint.as_deref(), &roles);
+                return;
+            }
+            if spec.audit_id == crate::navigator::resources::AUDIT {
+                crate::navigator::resources::paint(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
             if spec.audit_id == COMPREHENSION_MARK_AUDIT {
@@ -9175,6 +9215,40 @@ const LIGHT_CONTROLS_RISE: bool = cfg!(windows);
 
 const LIGHT_CONTROL_RISE: f32 = 0.7;
 
+/// A [`StyleRef::Over`] button: under the pointer a translucent wash of the words' ink, deeper
+/// while pressed, and the accent's ring while the keyboard's focus shows; at rest nothing, so the
+/// words its page painted under it are all that shows.
+fn paint_over_button(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    state: ControlState,
+    roles: &crate::settings::Roles,
+) {
+    use crate::widget::{DrawPrim, rgba};
+
+    if state.pressed || state.hovered {
+        prims.push(DrawPrim::Panel {
+            x: rect.x,
+            y: rect.y,
+            w: rect.width,
+            h: rect.height,
+            radius: 4.0,
+            fill: rgba(roles.text_primary, if state.pressed { 46 } else { 26 }),
+        });
+    }
+    if state.focus_visible {
+        prims.push(DrawPrim::Stroke {
+            x: rect.x + 1.0,
+            y: rect.y + 1.0,
+            w: (rect.width - 2.0).max(0.0),
+            h: (rect.height - 2.0).max(0.0),
+            radius: 4.0,
+            width: 2.0,
+            color: rgba(roles.accent, 255),
+        });
+    }
+}
+
 const FLUENT_TEXT_BUTTONS: bool = cfg!(windows);
 
 fn button_paint_style(control: &Control<ButtonSpec>) -> StyleRef {
@@ -9907,6 +9981,7 @@ fn style_text_color(style: StyleRef, roles: &crate::settings::Roles) -> [u8; 3] 
         | StyleRef::Navigation
         | StyleRef::Setting
         | StyleRef::Chip
+        | StyleRef::Over
         | StyleRef::Cell
         | StyleRef::CellHead
         | StyleRef::Note => readable_secondary(roles),

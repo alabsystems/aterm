@@ -83,6 +83,7 @@ impl TerminalHandler<'_> {
 
     /// Shell mark C: Command execution starting.
     fn shell_execution_start(&mut self, row: u64) {
+        self.program_state.command_started();
         self.shell.started_seq = self.shell.started_seq.saturating_add(1);
         if let Some(ref mut mark) = self.shell.current_mark {
             mark.prompt_start_row = mark.prompt_start_row.min(row);

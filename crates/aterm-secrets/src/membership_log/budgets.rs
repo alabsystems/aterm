@@ -41,7 +41,7 @@
 //! writes. [`Fill`] is the one reading of all of it: the bytes of the bound, by kind, what each
 //! seat signed in a day, which classes are open and when the bound comes at that rate.
 
-use super::{Kind, MAX_RECORDS_STREAM, MemberId, Record};
+use super::{Kind, MemberId, Reading, Record};
 
 /// The most weighed records ([`Kind::weighed`]) a [`Log`](super::Log) holds, the genesis among
 /// them. Each quorum candidate is a group of at least two `Remove`s, so the weighing has at most
@@ -131,8 +131,8 @@ impl Kind {
     }
 }
 
-/// One bound a [`Log`](super::Log) holds its records within: a [`RecordBudgets`] budget, or the
-/// byte bound of [`MAX_RECORDS_STREAM`].
+/// One bound a [`Log`](super::Log) holds its records within: a [`RecordBudgets`] budget, or its
+/// byte bound ([`held_bytes_within`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Budget {
     /// Every held record ([`RecordBudgets::held`]).
@@ -141,7 +141,7 @@ pub enum Budget {
     Weighed,
     /// The keyed records ([`RecordBudgets::keyed`]).
     Keyed,
-    /// The held records' wire bytes ([`MAX_RECORDS_STREAM`]).
+    /// The held records' wire bytes ([`held_bytes_within`]).
     Bytes,
 }
 
@@ -242,17 +242,27 @@ thread_local! {
     static WITHIN_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// The wire bytes a [`Log`](super::Log)'s held records stay within ([`Budget::Bytes`]):
-/// [`MAX_RECORDS_STREAM`], the bound of every stream a member reads, or in a test or debug build
-/// the smaller one [`RecordBudgets::within_bytes`] set on this thread, so a test fills it with a
-/// few records.
+/// The wire bytes the held records of a [`Log`](super::Log) whose store reads `reading` stay
+/// within ([`Budget::Bytes`]): that store's capacity ([`Reading::capacity`], the storage class
+/// of byte bound), or in a test or debug build the smaller one [`RecordBudgets::within_bytes`]
+/// set on this thread, so a test fills it with a few records.
 #[must_use]
-pub fn held_bytes_bound() -> usize {
+pub fn held_bytes_within(reading: Reading) -> usize {
     #[cfg(any(test, debug_assertions))]
     if let Some(bytes) = WITHIN_BYTES.with(std::cell::Cell::get) {
         return bytes;
     }
-    MAX_RECORDS_STREAM
+    reading.capacity()
+}
+
+/// [`held_bytes_within`] for this Mac's own log, where it authors with no log at hand: the
+/// capacity of its store whichever format its mark names, which is format 1's while every
+/// format this build reads holds one reply's bytes ([`Reading::STORE_BYTES`], where the build
+/// checks it). A log at hand reads its own ([`super::Log::capacity`]).
+#[must_use]
+pub fn held_bytes_bound() -> usize {
+    const _: () = assert!(Reading::STORE_BYTES == Reading::ONE.capacity());
+    held_bytes_within(Reading::ONE)
 }
 
 impl RecordBudgets {
@@ -307,13 +317,14 @@ impl RecordBudgets {
     }
 
     /// Run `run` with every [`Log`](super::Log) on this thread holding its records within
-    /// `bytes` wire bytes ([`held_bytes_bound`]) rather than [`MAX_RECORDS_STREAM`]: a test's
+    /// `bytes` wire bytes ([`held_bytes_within`]) rather than its store's capacity: a test's
     /// smaller byte bound, which a few large records fill. The class stops ([`author_stop`]) are
     /// the same shares of it, so a few records pass each stop in turn. The bound before comes
     /// back when `run` returns or unwinds.
     ///
     /// # Panics
-    /// `bytes` is larger than [`MAX_RECORDS_STREAM`].
+    /// `bytes` is larger than a store of this build's nodes holds
+    /// ([`Reading::STORE_BYTES`]).
     #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     pub fn within_bytes<T>(bytes: usize, run: impl FnOnce() -> T) -> T {
@@ -324,7 +335,7 @@ impl RecordBudgets {
             }
         }
         assert!(
-            bytes <= MAX_RECORDS_STREAM,
+            bytes <= Reading::STORE_BYTES,
             "a test's byte bound stays within the production one"
         );
         let _restore = Restore(WITHIN_BYTES.with(|within| within.replace(Some(bytes))));
@@ -357,20 +368,19 @@ impl RecordBudgets {
     }
 
     /// [`RecordBudgets::passed_by`], and [`Budget::Bytes`] where `held_bytes` and `more_bytes`
-    /// together pass [`held_bytes_bound`] ([`MAX_RECORDS_STREAM`]).
+    /// together pass `bound`, the log's byte bound ([`held_bytes_within`]).
     #[must_use]
-    pub fn passed_with_bytes(
+    pub const fn passed_with_bytes(
         self,
         held: RecordCounts,
         more: RecordCounts,
         held_bytes: usize,
         more_bytes: usize,
+        bound: usize,
     ) -> Option<Budget> {
         match self.passed_by(held, more) {
             Some(budget) => Some(budget),
-            None if held_bytes.saturating_add(more_bytes) > held_bytes_bound() => {
-                Some(Budget::Bytes)
-            }
+            None if held_bytes.saturating_add(more_bytes) > bound => Some(Budget::Bytes),
             None => None,
         }
     }
@@ -521,12 +531,13 @@ impl Class {
     }
 }
 
-/// Where an automatic writer stops in the production bound: 56 MiB of [`MAX_RECORDS_STREAM`]'s
-/// 64.
-pub const AUTOMATIC_STOP: usize = Class::Automatic.stop_within(MAX_RECORDS_STREAM);
+/// Where an automatic writer stops in the production bound, the capacity of the store this
+/// Mac authors into, whichever format its mark names ([`Reading::STORE_BYTES`]): 56 MiB of
+/// its 64.
+pub const AUTOMATIC_STOP: usize = Class::Automatic.stop_within(Reading::STORE_BYTES);
 /// Where a person's write stops in the production bound: 60 MiB of its 64.
-pub const PERSON_STOP: usize = Class::Person.stop_within(MAX_RECORDS_STREAM);
-const _: () = assert!(AUTOMATIC_STOP < PERSON_STOP && PERSON_STOP < MAX_RECORDS_STREAM);
+pub const PERSON_STOP: usize = Class::Person.stop_within(Reading::STORE_BYTES);
+const _: () = assert!(AUTOMATIC_STOP < PERSON_STOP && PERSON_STOP < Reading::STORE_BYTES);
 
 /// The held bytes past which this Mac authors no batch of `class`: its share of
 /// [`held_bytes_bound`] ([`Class::stop_within`]: [`AUTOMATIC_STOP`], [`PERSON_STOP`] and the

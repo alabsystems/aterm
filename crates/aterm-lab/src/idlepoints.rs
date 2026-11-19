@@ -804,7 +804,7 @@ fn gate_dir(dir: &Path) -> Result<(String, usize), Fail> {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".journal.jsonl"))
-                .is_some_and(aterm_types::control_verbs::is_minted_sid)
+                .is_some_and(|sid| aterm_types::control_request::Sid::parse(sid).is_some())
         })
         .collect();
     rd.sort();

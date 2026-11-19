@@ -390,6 +390,7 @@ impl DeckImageRig {
             network_place: None,
             network_target: crate::network_deck::Target::Overview,
             disk_span: crate::stats_lens::DiskSpan::Day,
+            cpu_policy_pending: false,
             lab: None,
             fleet: None,
             snap: Some(&self.snap),
@@ -406,6 +407,33 @@ impl DeckImageRig {
             locale: crate::stats_deck::host_locale(Some(&self.snap)),
             live: DeckLive::STILL,
         }
+    }
+
+    /// The page's complete resource documents at `case`'s width, laid and painted without a
+    /// raster. Each row names its document and the layout wall time, ns; this separates document
+    /// construction from native scrolling and presentation in `deck_image_cost`'s page cases.
+    #[must_use]
+    pub fn page_documents(&self, case: DeckImageCase) -> Vec<(&'static str, u64, usize)> {
+        let (inks, _) = Self::inks(case.theme);
+        let input = self.input(case, inks);
+        let metrics = crate::deck_face::deck_metrics();
+        crate::stats_paint::Instrument::page_order()
+            .into_iter()
+            .map(|instrument| {
+                let started = Instant::now();
+                let laid = crate::stats_lens::lay_page(
+                    case.width_pt,
+                    &input,
+                    crate::stats_lens::PageDoc::Lens(instrument),
+                    crate::stats_paint::Bar::Global,
+                    case.scale as f32,
+                    (13.0 * case.scale) as f32,
+                    &metrics,
+                    true,
+                );
+                (instrument.word(), ns(started.elapsed()), laid.prims.len())
+            })
+            .collect()
     }
 
     /// One frame of `case`: layout, paint and raster, timed, its heap read through `heap`.
@@ -798,6 +826,8 @@ mod schema1 {
                 .into_iter()
                 .filter_map(|(at_unix_ms, kind, label)| {
                     Some(StripEvent {
+                        scope: aterm_vitals::events::EventScope::Unknown,
+                        span: None,
                         at_unix_ms,
                         kind: event_kind_of(&kind)?,
                         label,

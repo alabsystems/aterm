@@ -6,9 +6,9 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::time::Instant;
 
 use crate::headless_boot;
+use crate::patience::Patience;
 
 use headless_boot::{Instance, boot_session, boot_with, ctl, ctl_ok, field, status};
 
@@ -28,12 +28,15 @@ fn held_call(inst: &Instance, boot_sid: &str, args: &[&str]) -> std::process::Ou
     let held = inst.tmp.join("hold.held");
     std::thread::scope(|scope| {
         let call = scope.spawn(|| ctl(inst, args));
-        let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
         while !held.exists() {
             assert!(
-                Instant::now() < give_up && !call.is_finished(),
-                "the spawner never took the spawn of {args:?}"
+                !call.is_finished(),
+                "the spawner never took the spawn of {args:?}: the call ended first"
             );
+            if let Some(why) = patience.spent() {
+                panic!("the spawner never took the spawn of {args:?} ({why})");
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let boot = status(inst, boot_sid);
@@ -147,12 +150,11 @@ fn a_held_new_window_leaves_the_loop_answering_and_lands_once_spawned() {
     };
     let booked = ctl_ok(&inst, &["invoke", "NewWindow"]);
     assert!(booked.starts_with("OK"), "booked: {booked}");
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     while !held.exists() {
-        assert!(
-            Instant::now() < give_up,
-            "the spawner never took the new window's spawn"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("the spawner never took the new window's spawn ({why})");
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let boot = status(&inst, &boot_sid);
@@ -166,16 +168,15 @@ fn a_held_new_window_leaves_the_loop_answering_and_lands_once_spawned() {
     );
 
     std::fs::write(&hold, b"").expect("release the hold");
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     let landed = loop {
         let born = in_window("1");
         if let [sid] = born.as_slice() {
             break sid.clone();
         }
-        assert!(
-            Instant::now() < give_up,
-            "the new window never landed: {born:?}"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("the new window never landed ({why}): {born:?}");
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     let born = status(&inst, &landed);

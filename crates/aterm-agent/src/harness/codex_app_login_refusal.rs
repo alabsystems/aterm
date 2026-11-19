@@ -416,16 +416,18 @@ pub fn row_signed_out_reason(
 }
 
 /// Whether the login `stored` holds is the account `expected_email` names: where an address is
-/// expected, the login names that address and no other ([`check_stored_identity`]); a login
+/// expected, the login names that address and no other and its tokens one user ([`claims_name`],
+/// [`check_stored_identity`]'s rule); a login
 /// that names no address is not shown to be it. Its tokens already name one user
 /// ([`load_stored_auth`]). Where no address is expected (a row that names none), the row is the
 /// login in its place, whoever that is.
 fn is_account(stored: &StoredAuth, expected_email: Option<&str>) -> bool {
-    expected_email.is_none_or(|expected| {
-        preferred_email(stored)
-            .is_some_and(|email| crate::harness::accounts::email_matches(expected, email))
-            && check_stored_identity(stored, Some(expected)).is_ok()
-    })
+    (expected_email.is_none() || !conflicting_users(stored))
+        && claims_name(
+            stored.id_claims.as_ref(),
+            stored.access_claims.as_ref(),
+            expected_email,
+        )
 }
 
 /// Whether a refusal the issuer made at `at` (Unix seconds) is settled at `now`: [`ROTATION_HANG`]

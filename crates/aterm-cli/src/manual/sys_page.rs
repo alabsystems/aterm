@@ -118,6 +118,18 @@ pub(super) const VIEW_ROWS: &[(&str, &str)] = &[
     ),
     ("procs", "this tab's processes, busiest first"),
     (
+        "groups",
+        "process groups and coalitions; tab callers see their own groups and a withheld count",
+    ),
+    (
+        "history",
+        "retained machine strip boxes; [cpu memory…] [res=1s|10s|1m|10m|1h]",
+    ),
+    (
+        "events",
+        "retained detector and strip events with original times; [since=<cursor>]",
+    ),
+    (
         "why",
         "who uses the CPU or memory, and why: `why cpu`, `why mem`, or bare: what stands out",
     ),
@@ -222,12 +234,9 @@ WAITING — aterm ctl @self await sys <condition> [timeout=<ms>]
 EXAMPLES
   aterm ctl @self sys                     is the machine, aterm or this tab busy, and with what?
   aterm ctl @self sys why                 is the CPU or memory busy, why, and is it this tab?
-  aterm ctl @self sys mem                 which processes hold the most memory?
   aterm ctl @self sys jobs                is my command still making progress, or stuck?
-  aterm ctl @self sys procs top=20        which of this tab's processes are busiest?
   aterm ctl @self sys disk                how big are my folders, and how full is the volume?
   aterm ctl @self sys left                did this tab leave processes running?
-  aterm ctl @self sys tab --json          this tab's figures, for a program to parse
   aterm ctl @self await sys quiet for=20s timeout=600000   wait for a quiet machine to measure
 "#;
 
@@ -459,8 +468,8 @@ SINCE (since=<cursor>)
   subject, target and --json. Sent with that request, the reply carries only what changed:
   unchanged sentences and records fold into one `same <key>,<key>,…` line (notes such as
   more= print again), each event since prints as `e seq=<n> at=<hh:mm:ss> kind=<k> …`
-  (pressure, thermal, swap, disk, load, tab, lane, orphan, job; seq= is the reading it came in,
-  which several events can share), and the header says delta=1. A --json reply is always
+  (pressure, thermal, swap, disk, load, tab, lane, orphan, job, starving; seq= is the reading it
+  came in, which several events can share), and the header says delta=1. A --json reply is always
   whole, its events under "events". A gap line comes before a whole reply instead:
   gap why=other-request   this request has no reply at that reading; another view or options did
   gap why=evicted         its reply has left the record (kept while under 30 minutes old or
@@ -504,6 +513,12 @@ TERMS — <metric><op><value>, <op> one of < <= > >= = !=
   swap                swap traffic: <size>[/s]
   decompress          decompressions: <n>[/s]
   thrash              yes|no
+  starving            yes|no: a memory starvation episode is open (`sys events` kind=starving):
+                      pages pushed out of RAM and read back with no headroom left; anonymous
+                      pages moving with the compressor near its wall or the kernel's level
+                      critical; or every task stalled on memory 5% of the time (Linux), at a
+                      reading and every reading 10s after it; it ends after a quiet minute off
+                      the wall and the critical level
   spotlight           idle|indexing|off: Spotlight's family (the nine members the why help
                       names) is indexing at or over 200 millicores of reported CPU counter
                       growth or 5 MB/s of reads, whatever the volumes read; else off where
@@ -515,9 +530,10 @@ TERMS — <metric><op><value>, <op> one of < <= > >= = !=
                       none|light|heavy|severe ranks alike
   jobs.stuck, jobs.quiet, jobs.running   how many of this tab's jobs: <n>
   slots               Trust `build-slot` slots proven free, less those an orphaned build fills: <n>
-  mem, thermal, thrash and spotlight take = and != with a comma list; mem and thermal also take one
-  level with < <= > >=. <size> is <n> with B, KB, MB, GB, TB (decimal) or KiB, MiB, GiB,
-  TiB (binary). eta, growth and walk are not measured: ERR unavailable <m> why=not_sampled.
+  mem, thermal, thrash, starving and spotlight take = and != with a comma list; mem and thermal
+  also take one level with < <= > >=. <size> is <n> with B, KB, MB, GB, TB (decimal) or KiB,
+  MiB, GiB, TiB (binary). eta, growth and walk are not measured: ERR unavailable <m>
+  why=not_sampled.
 
 JOBS
   job=<id> <verdict>[,…]       one job, by its `sys jobs` id, reaches a verdict
@@ -716,7 +732,13 @@ LINES
   pass     trend= whether it is passing
   do       class=none may=agent destructive=0: nothing needs doing; class=restart service=<s>
            may=person destructive=1: only a person can do it (`aterm help sys privacy`)
-  cannot   what= a limit, never a zero: index_progress, index_folder, wired_by_process,
+  index    (cpu) index_size=[≥]<bytes> [partial=entries|time|unreadable] volumes= age_ms=
+           src=root_daemon: Spotlight's index on disk, every local volume's store, as aterm's
+           root LAN broker last walked it (at most every 10 minutes); ≥ and partial= mark a walk
+           it cut short. Without the broker's answer it prints nothing, and index_folder stays
+           among the cannot lines. JSON: "index":{"size_bytes","volumes":[{"volume",
+           "size_bytes","entries"}],"age_ms","src"}
+  cannot   what= a limit, never a zero: index_progress and index_folder (cpu), wired_by_process,
            uncharged_memory, coalitions (no coalition lane: Linux, Windows, or macOS's
            self-check missed; the split then uses process evidence and no who row prints),
            coalition_list (truncated), finished_tab_work, remedy

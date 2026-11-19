@@ -869,7 +869,10 @@ fn a_group_still_forking_at_its_deadline_is_killed_whole() {
     let dir = scratch("forking");
     let pid_file = dir.join("pid");
     let mut cmd = sh(
-        "echo $$ > \"$0\"; while :; do sleep 600 & kill $!; done",
+        &format!(
+            "echo $$ > \"$0\"; {}",
+            crate::stand_in_loop::while_alive("sleep 600 & kill $!")
+        ),
         &[&pid_file],
     );
     let ready = pid_file.clone();
@@ -1252,7 +1255,12 @@ fn a_reaped_child_is_read_on_a_tick_wherever_the_last_reading_fell() {
 fn stalled_process_progress_is_named_and_the_owned_group_ends() {
     let dir = scratch("process-progress-stalled");
     let pid_file = dir.join("pid");
-    let mut cmd = sh("echo $$ > \"$0\"; exec sleep 600", &[&pid_file]);
+    let stdout = b"\0\xffprivate-stdout";
+    let stderr = b"\xfe\0private-stderr";
+    let mut cmd = sh(
+        "printf '\\000\\377private-stdout'; printf '\\376\\000private-stderr' >&2; echo $$ > \"$0\"; exec sleep 600",
+        &[&pid_file],
+    );
     let start = Instant::now();
     let mut reads = 0u32;
     let mut now = || {
@@ -1284,6 +1292,18 @@ fn stalled_process_progress_is_named_and_the_owned_group_ends() {
         ),
         "{error:?}"
     );
+    let super::ProgressError::Stalled { partial, .. } = &error else {
+        panic!("the injected flat progress must remain a stall");
+    };
+    for (observed, written) in [
+        (partial.stdout(), &stdout[..]),
+        (partial.stderr(), &stderr[..]),
+    ] {
+        let n = usize::try_from(observed.observed_bytes()).expect("small fixture observation");
+        assert!(n <= written.len(), "a snapshot claims only observed bytes");
+        assert_eq!(observed.as_bytes(), &written[..n]);
+        assert!(!observed.is_truncated());
+    }
     assert!(
         error
             .to_string()
@@ -1294,6 +1314,74 @@ fn stalled_process_progress_is_named_and_the_owned_group_ends() {
         !crate::process::pid_alive(child),
         "stalled child {child} outlived the progress collector"
     );
+}
+
+/// Refused output preserves the same bounded observations the drains made, rather than
+/// discarding them or claiming complete EOF. A binary stream larger than OUTPUT_KEEP proves
+/// that counts and truncated tails agree; ordinary Debug never emits the retained bytes.
+#[cfg(unix)]
+#[test]
+fn a_stall_retains_bounded_binary_tails_without_exposing_them_in_debug() {
+    let mut stdout_bytes = vec![0xff; OUTPUT_KEEP + 19];
+    stdout_bytes.extend_from_slice(b"private-stdout\0");
+    let stderr_bytes = b"\0\xfeprivate-stderr";
+    let stdout = super::drain(
+        std::io::Cursor::new(stdout_bytes.clone()),
+        None,
+        "test-stdout",
+    )
+    .expect("stdout drain");
+    let stderr = super::drain(
+        std::io::Cursor::new(stderr_bytes.to_vec()),
+        None,
+        "test-stderr",
+    )
+    .expect("stderr drain");
+    // The known Cursor readers are complete before sampling; the production snapshot itself
+    // adds no wait and grants no EOF claim for a general reader, which may have failed.
+    stdout
+        .ended
+        .recv_timeout(HANG)
+        .expect("stdout reader finished");
+    stderr
+        .ended
+        .recv_timeout(HANG)
+        .expect("stderr reader finished");
+    let error = super::ProgressError::stalled(
+        Duration::from_secs(60),
+        "safe operation".to_owned(),
+        super::Late {
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+        },
+    );
+    let super::ProgressError::Stalled { partial, .. } = &error else {
+        panic!("retained bytes do not turn refusal into success");
+    };
+    assert_eq!(
+        partial.stdout().observed_bytes(),
+        u64::try_from(stdout_bytes.len()).unwrap()
+    );
+    assert_eq!(
+        partial.stdout().as_bytes(),
+        &stdout_bytes[stdout_bytes.len() - OUTPUT_KEEP..]
+    );
+    assert!(partial.stdout().is_truncated());
+    assert_eq!(
+        partial.stderr().observed_bytes(),
+        u64::try_from(stderr_bytes.len()).unwrap()
+    );
+    assert_eq!(partial.stderr().as_bytes(), stderr_bytes);
+    assert!(!partial.stderr().is_truncated());
+    let debug = format!("{error:?}");
+    assert!(
+        debug.len() < 512,
+        "Debug is bounded metadata, not the raw tails"
+    );
+    assert!(!debug.contains("private-stdout"));
+    assert!(!debug.contains("private-stderr"));
+    assert!(!debug.contains(&format!("{stderr_bytes:?}")));
+    assert!(!error.to_string().contains(&format!("{stderr_bytes:?}")));
 }
 
 /// A process-progress collector under test: it runs `cmd` with a one-minute window on the clock

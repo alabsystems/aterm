@@ -290,6 +290,48 @@ fn identified_records_witness_every_claim_as_the_interleaved_replay() {
                 oracle,
                 "{what}, against {claim}: an observer"
             );
+            let (cached, refused) = Links::identify(None, records.clone(), None);
+            let cached = std::sync::Arc::new(cached);
+            let refusal = || refused.as_ref().map(|error| Error::new(&error.0));
+            assert_eq!(
+                production_answer(witnessed_cached(
+                    std::sync::Arc::clone(&cached),
+                    refusal(),
+                    *acknowledged,
+                )),
+                oracle,
+                "{what}, against {claim}: compact cached observer"
+            );
+            let mut helds = chain.clone();
+            helds.extend(
+                chain
+                    .iter()
+                    .skip(1)
+                    .map(|held| with(*held, |bytes| bytes[8] ^= 1)),
+            );
+            for held in helds {
+                let actual = witnessed_after(
+                    std::sync::Arc::clone(&cached),
+                    refusal(),
+                    *acknowledged,
+                    held,
+                )
+                .map(|tail| tail.map(|tail| production_answer(Ok(tail)).unwrap()))
+                .map_err(|error| error.to_string());
+                let expected = oracle
+                    .as_ref()
+                    .map(|(entries, witness)| {
+                        let start = usize::try_from(held.count).unwrap();
+                        (start <= entries.len() && chain.get(start) == Some(&held))
+                            .then(|| (entries[start..].to_vec(), *witness))
+                    })
+                    .map_err(Clone::clone);
+                assert_eq!(
+                    actual, expected,
+                    "{what}, against {claim}: held prefix {}",
+                    held.count
+                );
+            }
             let mut links = Vec::new();
             if let Err(identification) = identify_onto(&mut links, records.clone())
                 && oracle

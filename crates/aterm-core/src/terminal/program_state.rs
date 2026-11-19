@@ -584,6 +584,9 @@ impl ProgramStateReport {
 /// reports drew ([`Self::turns`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProgramStateRecord {
+    /// The two independent report sequences when the current command began.
+    command_known_seq: u64,
+    command_other_seq: u64,
     report: ProgramStateReport,
     ring: ProgramTurns,
 }
@@ -604,6 +607,21 @@ impl ProgramStateRecord {
     #[must_use]
     pub const fn report(&self) -> ProgramStateReport {
         self.report
+    }
+
+    /// Whether the standing display report's own writer spoke in this command.
+    pub(super) const fn named_in_command(&self) -> bool {
+        if self.report.other.state.is_some() {
+            self.report.other.seq != self.command_other_seq
+        } else {
+            self.report.seq != self.command_known_seq && self.report.sign().is_some()
+        }
+    }
+
+    /// A new shell command needs fresh evidence from whichever writer reports.
+    pub(super) const fn command_started(&mut self) {
+        self.command_known_seq = self.report.seq;
+        self.command_other_seq = self.report.other.seq;
     }
 
     /// The turns the reports drew.
@@ -750,6 +768,7 @@ impl ProgramStateRecord {
         };
         let r = &mut self.report;
         if state == r.state {
+            self.command_started();
             return;
         }
         r.seq = r.seq.wrapping_add(1);
@@ -772,6 +791,7 @@ impl ProgramStateRecord {
                 });
             }
         }
+        self.command_started();
     }
 
     /// The shell drew its prompt (an OSC 133 or 633 `A` the engine took): no program runs in
@@ -780,6 +800,7 @@ impl ProgramStateRecord {
     #[inline]
     pub(super) const fn prompt_drawn(&mut self) {
         self.report.other.take(None);
+        self.command_started();
     }
 
     /// A full reset (RIS): no report stands, a known program's or another's, and no title.
@@ -797,6 +818,7 @@ impl ProgramStateRecord {
             r.cleared = r.seq;
             r.state = None;
         }
+        self.command_started();
     }
 }
 

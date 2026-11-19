@@ -129,6 +129,9 @@ fn a_checker_retired_inside_its_wait_exits_without_a_network_wake() {
     assert_eq!(WAKE.posts(), 0, "retirement is not a network wake");
 }
 
+/// Eight starts racing: one publishes its arguments, starts the host's wakes once and its one
+/// worker; the others start nothing.
+/// MUTANT: the wakes started before the arguments are published (each start starts them: 8).
 #[test]
 fn concurrent_checker_startup_keeps_one_worker_and_its_exact_restart_arguments() {
     let (finished, completion) = std::sync::mpsc::channel();
@@ -136,24 +139,35 @@ fn concurrent_checker_startup_keeps_one_worker_and_its_exact_restart_arguments()
         let stored = std::sync::OnceLock::new();
         let watch = CheckerWatch::new();
         let spawned = Mutex::new(Vec::new());
+        let woke = AtomicU64::new(0);
         let ready = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
             for build in 1..=8 {
                 let mut input = args(Arc::new(|| Some(source())));
                 input.current_build = build;
                 let input = Arc::new(input);
-                let (stored, watch, spawned, ready) = (&stored, &watch, &spawned, &ready);
+                let (stored, watch, spawned, woke, ready) =
+                    (&stored, &watch, &spawned, &woke, &ready);
                 scope.spawn(move || {
                     ready.wait();
-                    crate::start_checker_once(stored, watch, input, |generation, input| {
-                        spawned.lock().unwrap().push((generation, input));
-                        Ok(())
-                    });
+                    crate::start_checker_once(
+                        stored,
+                        watch,
+                        input,
+                        || {
+                            woke.fetch_add(1, Ordering::SeqCst);
+                        },
+                        |generation, input| {
+                            spawned.lock().unwrap().push((generation, input));
+                            Ok(())
+                        },
+                    );
                 });
             }
         });
         let spawned = spawned.lock().unwrap();
         assert_eq!(spawned.len(), 1);
+        assert_eq!(woke.load(Ordering::SeqCst), 1, "the wakes start once");
         assert_eq!(spawned[0].0, 1);
         assert!(Arc::ptr_eq(stored.get().unwrap(), &spawned[0].1));
         let beat = watch.snapshot().unwrap();
@@ -165,21 +179,34 @@ fn concurrent_checker_startup_keeps_one_worker_and_its_exact_restart_arguments()
         .expect("competing startup calls must finish");
 }
 
+/// A start whose spawn failed keeps its arguments and has started the host's wakes, for the
+/// watchdog's retry; a repeated start replaces nothing and starts no wakes again.
+/// MUTANT: the wakes started after a spawn that succeeded only (a failed start's retry waits
+/// unheard); started before the arguments are published (the repeat starts them again).
 #[test]
 fn repeated_startup_does_not_replace_a_failed_starts_retained_arguments() {
     let stored = std::sync::OnceLock::new();
     let watch = CheckerWatch::new();
     let original = Arc::new(args(Arc::new(|| Some(source()))));
-    crate::start_checker_once(&stored, &watch, Arc::clone(&original), |_, _| {
-        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
-    });
+    let woke = AtomicU64::new(0);
+    crate::start_checker_once(
+        &stored,
+        &watch,
+        Arc::clone(&original),
+        || {
+            woke.fetch_add(1, Ordering::SeqCst);
+        },
+        |_, _| Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+    );
     let failed = watch.snapshot().unwrap();
     assert_eq!(failed.phase, CheckerPhase::StartFailed);
     assert_eq!(failed.workers, 0);
+    assert_eq!(woke.load(Ordering::SeqCst), 1, "the failed start's wakes");
     crate::start_checker_once(
         &stored,
         &watch,
         Arc::new(args(Arc::new(|| None))),
+        || panic!("a duplicate startup started the wakes again"),
         |_, _| panic!("a duplicate startup bypassed the watchdog"),
     );
     let after = watch.snapshot().unwrap();
@@ -192,6 +219,40 @@ fn repeated_startup_does_not_replace_a_failed_starts_retained_arguments() {
         watch.supersede(after.generation).is_some(),
         "the normal watchdog retry remains available"
     );
+}
+
+/// A start that runs no checker starts none of the host's wakes: with automatic checks on, a
+/// copy that runs from no installed bundle (a test binary, as a `target/` build, a dev-marked
+/// bundle or a mounted image) returns before the checker's start, and its network relay, which
+/// the wakes name, never runs. Its sleeps are `Unheard`, so no form of the code reaches this
+/// Mac's power domain.
+/// MUTANT: the wakes started on entry to `spawn_background_check_in`, before its gates (the
+/// relay runs once).
+#[test]
+fn a_start_that_runs_no_checker_starts_no_wakes() {
+    static RELAYED: AtomicU64 = AtomicU64::new(0);
+    fn relay() {
+        RELAYED.fetch_add(1, Ordering::SeqCst);
+    }
+    assert!(
+        crate::bundle::resolve().is_none(),
+        "a test binary runs from no installed bundle"
+    );
+    let sweep = crate::UncheckedSweep::new(|| None, |_| {});
+    crate::spawn_background_check_in(
+        true,
+        &sweep,
+        1,
+        Arc::new(|| Some(source())),
+        None,
+        None,
+        crate::Wakes {
+            sleeps: crate::Sleeps::Unheard,
+            network: Some(relay),
+        },
+    );
+    assert_eq!(RELAYED.load(Ordering::SeqCst), 0, "no checker, no relay");
+    assert!(crate::CHECKER_ARGS.get().is_none(), "and no checker");
 }
 
 #[test]

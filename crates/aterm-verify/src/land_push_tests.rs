@@ -273,8 +273,8 @@ fn tracking_after_a_push_preserves_a_newer_tip_and_tolerates_a_locked_ref() {
         );
         let pushes = Cell::new(0);
         let observed = RefCell::new(None);
-        let step: &RemoteStep<'_> = &|root, make, tool, args, until, _mode| {
-            let out = crate::remote::run(root, make, tool, args, until)?;
+        let step: &RemoteStep<'_> = &|root, make, tool, args, until, mode| {
+            let out = live_remote(root, make, tool, args, until, mode)?;
             if is_push(args) && out.status.success() {
                 pushes.set(pushes.get() + 1);
                 if locked {
@@ -342,10 +342,18 @@ struct Raced {
 
 /// Land `world`'s branch, judged green, over a remote whose main the rival moves (a file the
 /// branch does not touch) just before each of the landing's first `moves` pushes. Every remote
-/// step must come with its own whole hang detector ([`WRITE`] for a push, [`NETWORK`] for any
-/// other), however many steps and landings came before it: a deadline shared across them, as
-/// the one that ended the measured landing of 2026-11-12 at its seventh push, fails here. The
-/// judgment must already be kept when the first push starts.
+/// step must come with its own whole window (a push runs as a mutation,
+/// [`RemoteMode::Mutation`], with a whole [`WRITE`] work window; any other step is a read with a
+/// whole [`NETWORK`]), however many steps and landings came before it: a deadline shared across
+/// them, as the one that ended the measured landing of 2026-11-12 at its seventh push, fails
+/// here. So does a push [`Wire::write`] hands over as a read, and one whose command the
+/// production seam ([`live_remote`]) makes outside a hold of the watchdog, as
+/// [`crate::remote::run_unless`] does: [`Wire::write`] holds nothing, and
+/// [`crate::remote::run_mutation`] takes the hold itself before it makes the command (the hold
+/// is process-wide, so another test's hold at that moment can hide such a seam). That the seam
+/// runs the push on [`crate::remote::run_mutation`] and no other writer is
+/// [`a_push_whose_work_window_ended_makes_no_command`]'s.
+/// The judgment must already be kept when the first push starts.
 fn racing(world: &World, moves: usize) -> Raced {
     let left = Cell::new(moves);
     let pushes = Cell::new(0);
@@ -372,6 +380,15 @@ fn racing(world: &World, moves: usize) -> Raced {
                 let text = format!("b moved, {} to go\n", left.get());
                 tips.borrow_mut().push(rival_moves(world, "b/y.txt", &text));
             }
+            let held = |root: &Path| {
+                assert!(
+                    crate::exec::group::held(),
+                    "push {} made its command outside a write's hold of the watchdog",
+                    pushes.get()
+                );
+                git(root)
+            };
+            return live_remote(root, &held, tool, args, until, mode);
         } else {
             assert_eq!(mode, RemoteMode::Read, "discovery keeps the read lifetime");
             assert!(
@@ -380,7 +397,7 @@ fn racing(world: &World, moves: usize) -> Raced {
                 pushes.get()
             );
         }
-        remote_step(root, git, tool, args, until, mode)
+        live_remote(root, git, tool, args, until, mode)
     };
     let (code, said, bases, _) = land_wired(
         world,
@@ -398,6 +415,51 @@ fn racing(world: &World, moves: usize) -> Raced {
         pushes: pushes.get(),
         tips: tips.take(),
     }
+}
+
+/// THE PRODUCTION SEAM RUNS A PUSH ON ITS OWN MUTATION OWNER: [`live_remote`] with
+/// [`RemoteMode::Mutation`] is [`crate::remote::run_mutation`], so a push whose work window has
+/// already ended makes no command and is refused as one that sent nothing
+/// ([`crate::remote::Failed::Unstarted`]), main unchanged. NEGATIVE CONTROL: the same push as a
+/// read ([`RemoteMode::Read`], [`crate::remote::run_unless`], ended only once it started) makes
+/// its command; so would a seam that ran the mutation as a read.
+#[test]
+fn a_push_whose_work_window_ended_makes_no_command() {
+    let world = world();
+    let before = origin_main(&world);
+    commit(&world.work, "a/x.txt", "a2\n");
+    let made = Cell::new(0);
+    let counted = |root: &Path| {
+        made.set(made.get() + 1);
+        git_cmd(root)
+    };
+    let args: Vec<OsString> = ["push", "origin", "HEAD:refs/heads/main"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    let ended = Instant::now();
+    let step = |mode| {
+        live_remote(
+            &world.work,
+            &counted,
+            crate::remote::Tool::Git,
+            &args,
+            ended,
+            mode,
+        )
+    };
+    match step(RemoteMode::Mutation) {
+        Err(crate::remote::Failed::Unstarted(why)) => assert!(
+            why.contains("its work window ended before the write started; nothing was sent"),
+            "{why}"
+        ),
+        other => panic!("a push past its window started: {other:?}"),
+    }
+    assert_eq!(made.get(), 0, "no command was made");
+    assert_eq!(origin_main(&world), before);
+
+    let read = step(RemoteMode::Read);
+    assert_eq!(made.get(), 1, "a read makes its command: {read:?}");
 }
 
 /// A MAIN THAT MOVES BETWEEN THE JUDGMENT AND EVERY PUSH IS COMPOSED ONTO EACH TIME, AND THE ONE
@@ -692,9 +754,9 @@ fn a_read_of_main_that_times_out_after_the_pass_is_made_again_and_the_landing_la
             }
             if is_read(args) && moved.borrow().is_some() && failed.get() < failures {
                 failed.set(failed.get() + 1);
-                return Err(TIMED_OUT.to_owned());
+                return Err(crate::remote::Failed::Ended(TIMED_OUT.to_owned()));
             }
-            remote_step(root, git, tool, args, until, mode)
+            live_remote(root, git, tool, args, until, mode)
         };
         let (code, said, bases, _) = land_wired(
             &world,
@@ -756,12 +818,12 @@ fn a_push_that_timed_out_is_landed_where_main_took_it_and_never_made_again() {
             if is_push(args) {
                 pushes.set(pushes.get() + 1);
                 if sent {
-                    let out = remote_step(root, git, tool, args, until, mode)?;
+                    let out = live_remote(root, git, tool, args, until, mode)?;
                     assert!(out.status.success(), "the push reached main");
                 }
-                return Err(TIMED_OUT.to_owned());
+                return Err(crate::remote::Failed::Ended(TIMED_OUT.to_owned()));
             }
-            remote_step(root, git, tool, args, until, mode)
+            live_remote(root, git, tool, args, until, mode)
         };
         let (code, said, bases, _) = land_wired(
             &world,
@@ -803,6 +865,93 @@ fn a_push_that_timed_out_is_landed_where_main_took_it_and_never_made_again() {
         assert_eq!(receipt.checked[0].tree, tree);
         assert_eq!(receipt.composed_onto, None);
         assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landing);
+    }
+}
+
+/// A PUSH WHOSE WRITE NEVER STARTED SENT NOTHING, AND LEAVES NOTHING TO SETTLE: the writer
+/// refused it before any child started ([`crate::remote::Failed::Unstarted`]: the landing took
+/// an interrupt between its own look and the write's, or git could not be started). With no
+/// interrupt it is made again after [`RETRY_PAUSE`], as a push agh says it did not send, and
+/// the landing lands; with the interrupt it is not made again, the landing stops with nothing
+/// pushed, one INTERRUPTED line and its judgment kept with nothing to settle, and the next run
+/// pushes it without judging. NEGATIVE CONTROL (mutant): `Remote::push_with` handing such a
+/// refusal back as an error makes it a push of unknown outcome, never made again, and tells the
+/// next run to settle a write that never started.
+#[test]
+fn a_push_whose_write_never_started_sent_nothing() {
+    for interrupt in [None, Some(15)] {
+        let store = Store::default();
+        let world = world();
+        commit(&world.work, "a/x.txt", "a2\n");
+        let before = origin_main(&world);
+        let signal = store.signal.clone();
+        let pushes = Cell::new(0);
+        let refused = match interrupt {
+            Some(_) => "Git remote write: interrupted before the write started; nothing was sent",
+            None => "Git remote write: could not start: scripted; nothing was sent",
+        };
+        let step: &RemoteStep<'_> = &|root, git, tool, args, until, mode| {
+            if is_push(args) {
+                assert_eq!(mode, RemoteMode::Mutation);
+                pushes.set(pushes.get() + 1);
+                if pushes.get() == 1 {
+                    signal.set(interrupt);
+                    return Err(crate::remote::Failed::Unstarted(refused.to_owned()));
+                }
+            }
+            live_remote(root, git, tool, args, until, mode)
+        };
+        let pauses = RefCell::new(Vec::new());
+        let (code, said) = match interrupt {
+            None => {
+                let (code, said, bases, _) = land_wired(
+                    &world,
+                    &git_cmd,
+                    step,
+                    &|pause| pauses.borrow_mut().push(pause),
+                    crates(&["a"]),
+                    |_, _, _| Ran::Ended(green()),
+                    |base| panic!("no recheck was expected (base {base})"),
+                );
+                assert_eq!(bases.len(), 1, "{said:#?}");
+                (code, said)
+            }
+            Some(_) => land_kept(&world, store.records('1'), |_| Ran::Ended(green()), step),
+        };
+        for word in ["unknown outcome", "settle that"] {
+            assert!(
+                !said.iter().any(|line| line.contains(word)),
+                "{word}: {said:#?}"
+            );
+        }
+        if interrupt.is_none() {
+            assert_eq!(code, exit::PASS, "{said:#?}");
+            assert_eq!(pushes.get(), 2, "made again once: {said:#?}");
+            assert_eq!(*pauses.borrow(), [RETRY_PAUSE], "{said:#?}");
+            assert!(
+                said.iter().any(|line| line.contains(refused)
+                    && line.contains("nothing was sent, so it is made again")),
+                "{said:#?}"
+            );
+            assert_eq!(kept_record(&world), None);
+            continue;
+        }
+        assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
+        assert_eq!(pushes.get(), 1, "not made again after the interrupt");
+        assert!(pauses.borrow().is_empty());
+        assert_eq!(origin_main(&world), before, "nothing was pushed");
+        assert_eq!(
+            said.iter().filter(|line| interrupted_by(line, 15)).count(),
+            1,
+            "{said:#?}"
+        );
+        assert!(kept_record(&world).is_some(), "the judgment is kept");
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |base, _| {
+            panic!("a kept judgment is not made again (base {base})")
+        });
+        assert_eq!(code, exit::PASS, "{said:#?}");
+        assert!(bases.is_empty(), "{said:#?}");
+        assert_ne!(origin_main(&world), before, "the next run pushed it");
     }
 }
 

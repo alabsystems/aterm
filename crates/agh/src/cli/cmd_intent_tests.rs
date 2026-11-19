@@ -68,6 +68,7 @@ fn begin(journal: &Journal, slug: &str, key: &str) -> IntentId {
             after,
             writer: None,
             refs: Vec::new(),
+            atomic_admission: None,
         })
         .expect("begin")
 }

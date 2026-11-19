@@ -67,6 +67,8 @@ fn rig(form: &str) -> Rig {
         .sys
         .get_or_insert_with(Default::default)
         .stats_bars = Some(form.into());
+    let head = app.deck_head_px(wid, 0.0, app.windows[&wid].scale, 0);
+    app.windows.get_mut(&wid).unwrap().metrics.head = head;
     app.windows.get_mut(&wid).expect("window").metrics.pad = 24;
     app.vitals.snapshot = Some(Arc::new(crate::stats_deck::tests::snapshot()));
     let now = Instant::now();
@@ -1543,8 +1545,13 @@ fn a_stats_bars_choice_that_cannot_be_saved_says_so() {
 }
 
 #[test]
-fn switching_between_the_sill_and_off_regrids_nothing() {
+fn switching_off_the_compact_header_releases_its_height_and_closes_the_lens() {
     let mut r = rig("sill");
+    r.app
+        .windows
+        .get_mut(&r.wid)
+        .unwrap()
+        .head_follows_form_for_test = true;
     let scratch = aterm_tempfile::tempdir().expect("scratch dir");
     let dir = scratch.path().to_path_buf();
     crate::app_colorscheme::install_resolved_colors::apply_config_text(
@@ -1553,34 +1560,15 @@ fn switching_between_the_sill_and_off_regrids_nothing() {
         "[sys]\nstats_bars = \"sill\"\n",
     );
     assert!(r.app.toggle_stats_lens());
-    let term = r
-        .app
-        .pool
-        .get(r.session)
-        .expect("live session")
-        .term
-        .clone();
-    let grid = |app: &App, wid: WindowId| {
-        let ws = &app.windows[&wid];
-        (
-            ws.rows,
-            ws.cols,
-            ws.metrics.head,
-            ws.metrics.pad,
-            ws.metrics.pad_top,
-        )
-    };
-    let before = (grid(&r.app, r.wid), term_lock(&term).resize_lifetime());
+    let before = r.app.win_head(r.wid);
+    let compact = crate::stats_sill::compact_height(r.app.windows[&r.wid].scale);
     crate::app_colorscheme::install_resolved_colors::apply_config_text(
         &mut r.app,
         &dir,
         "[sys]\nstats_bars = \"off\"\n",
     );
     assert_eq!(r.app.stats_bars_form(), StatsBars::Off);
-    assert_eq!(
-        (grid(&r.app, r.wid), term_lock(&term).resize_lifetime()),
-        before
-    );
+    assert_eq!(r.app.win_head(r.wid) + compact, before);
     assert_eq!(r.lens(), None, "the lens closes with its form");
 }
 

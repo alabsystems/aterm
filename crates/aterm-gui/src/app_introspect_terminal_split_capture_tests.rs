@@ -260,6 +260,8 @@ fn recording_image_keeps_the_exact_successful_present_cursor_layers() {
             session: None,
             want_bytes: true,
             want_metadata: true,
+            whole_client: false,
+            presentation: None,
             frame_metadata: std::sync::Arc::clone(&metadata),
             cancel: crate::control::CaptureCancellation::new(),
             reply,

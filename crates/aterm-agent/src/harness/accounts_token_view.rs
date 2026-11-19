@@ -21,10 +21,12 @@
 //!   is asked of the lab as `claude-token:<key>` through the need ledger, never of a person; the
 //!   request ends by itself when such a token arrives, and is asked again once that token has
 //!   left use and an offer stands again.
-//! - **Peers' use** ([`peers_of`]) comes from one bounded fleet read: each peer whose session
-//!   rows carry `token=<ac key>`; with no read, the report says "peers not read".
 //!
-//! Nothing here reads, holds or prints a token: the vault's standings are value-free.
+//! Nothing here reads, holds or prints a token: the vault's standings are value-free. This Mac's
+//! table names no address and no other Mac (`docs/DESIGN-shared-files-2026-11-11.md` §6): an
+//! account only the table names takes its address and names from the registry
+//! ([`Places::lab`]), and which other Macs run on a token is each one's own `ai/logins` row
+//! (`src` `vault-token`), which no surface here restates.
 
 pub use super::account_card::{ENDING_S, LoginHalf, LoginHere};
 use super::account_names::{self, Candidates, Named, Word};
@@ -47,8 +49,10 @@ use std::path::{Path, PathBuf};
 pub struct Covered {
     /// The lab account key.
     pub key: Key,
-    /// The row's claims email, else the login record's.
-    pub email: String,
+    /// The address a surface prints for it: the row's claims email, else the login record's;
+    /// for an account only this Mac's table names, the registry's ([`lab_address`]); `None`
+    /// where none of them gives one (the table holds no address).
+    pub email: Option<String>,
     /// The roster row's label, where one names it: the local key a surface finds the row by,
     /// which no surface prints.
     pub label: Option<String>,
@@ -87,8 +91,8 @@ pub struct Offer {
 pub struct AccountToken {
     /// The lab account key.
     pub key: String,
-    /// Its email.
-    pub email: String,
+    /// Its address, where a source a surface prints from gives one ([`Covered::email`]).
+    pub email: Option<String>,
     /// The roster row's label, where one names it: the local key a surface finds the row by,
     /// which no surface prints.
     pub label: Option<String>,
@@ -136,6 +140,16 @@ impl AccountToken {
 
     fn meta(&self) -> Option<&aterm_secrets::claude_token::Meta> {
         self.standing.as_ref()?.meta.as_ref()
+    }
+
+    /// The address a judgment that prints nothing looks the account's files up by
+    /// ([`held_steps`]): its own ([`Self::email`]), else the one its vault token's meta was made
+    /// for, as this Mac's table kept it before it held none; `None` where neither names one.
+    fn lookup_address(&self) -> Option<&str> {
+        self.email
+            .as_deref()
+            .or_else(|| self.meta().map(|meta| meta.email.as_str()))
+            .filter(|email| !email.is_empty())
     }
 
     /// When its token was made.
@@ -312,7 +326,7 @@ impl AccountToken {
 
     /// The account's line in the report: its state and every value-free field, then the offer's
     /// step, or "not yet in vault" while a write made here waits.
-    fn text(&self, peers: &PeersShown) -> String {
+    fn text(&self) -> String {
         let mut parts = vec![self.state.words()];
         if self.minted_at().is_some() || self.row.is_some() {
             parts.push(format!("entry {}", self.entry()));
@@ -348,15 +362,11 @@ impl AccountToken {
         if let Some(at) = self.rejected_at() {
             parts.push(format!("rejected here {}", date(at)));
         }
-        if let Some(row) = &self.row {
-            if let (Some(first), Some(last)) =
+        if let Some(row) = &self.row
+            && let (Some(first), Some(last)) =
                 (row.used_on.first_served_at, row.used_on.last_served_at)
-            {
-                parts.push(format!("used here {}..{}", date(first), date(last)));
-            }
-            if self.standing.is_some() {
-                parts.push(peers.words(row));
-            }
+        {
+            parts.push(format!("used here {}..{}", date(first), date(last)));
         }
         if self.label.is_some() {
             match self.login {
@@ -374,7 +384,7 @@ impl AccountToken {
         line
     }
 
-    fn json(&self, peers: &PeersShown) -> Value {
+    fn json(&self) -> Value {
         let mut o = Map::new();
         o.insert("key".into(), Value::from(self.key.clone()));
         o.insert("email".into(), Value::from(self.email.clone()));
@@ -424,18 +434,6 @@ impl AccountToken {
         );
         let mut used_on = Map::new();
         used_on.insert("here".into(), Value::Object(here));
-        used_on.insert(
-            "peers".into(),
-            Value::Array(
-                used.map(|used| used.peers.iter().cloned().map(Value::from).collect())
-                    .unwrap_or_default(),
-            ),
-        );
-        used_on.insert("peers_read".into(), Value::from(peers.read()));
-        used_on.insert(
-            "peers_read_at".into(),
-            Value::from(used.and_then(|used| used.peers_read_at)),
-        );
         o.insert("used_on".into(), Value::Object(used_on));
         o.insert("login".into(), Value::from(self.login.word()));
         o.insert(
@@ -628,7 +626,7 @@ fn covered_in(places: &Places<'_>) -> (Vec<Covered>, Vec<Row>) {
             let word = word_among(&named, &rows, places.lab);
             out.push(Covered {
                 key,
-                email: email.to_owned(),
+                email: Some(email.to_owned()),
                 label: Some(row.label.clone()),
                 named,
                 word,
@@ -660,7 +658,7 @@ fn covered_in(places: &Places<'_>) -> (Vec<Covered>, Vec<Row>) {
         let word = word_among(&named, &rows, places.lab);
         out.push(Covered {
             key,
-            email: login.email.clone(),
+            email: Some(login.email.clone()),
             label: None,
             named,
             word,
@@ -680,6 +678,15 @@ pub fn named_by_key(key: &Key) -> Named<'static> {
         row: None,
         names: aterm_file::AccountNames::default(),
     }
+}
+
+/// The address the registry gives the account `key` (its claims address, else its login's), where
+/// `lab` names one: how a surface names an account only this Mac's token table names, which
+/// holds no address.
+#[must_use]
+pub fn lab_address(key: &Key, lab: Option<&Lab>) -> Option<String> {
+    let names = lab?.names.get(key.as_str())?;
+    names.email.clone().or_else(|| names.login.clone())
 }
 
 /// The Claude Code account of the address `email` (keyed `key` by the lab journal), as the
@@ -714,11 +721,22 @@ pub fn view(places: &Places<'_>, vault: &dyn TokenVault) -> Vec<AccountToken> {
         if covered.iter().any(|seen| seen.key == key) {
             continue;
         }
-        let named = named_of_login(&key, &row.email, places.lab);
+        // The table names no address: the registry's names of the key, else the key alone.
+        let named = places
+            .lab
+            .and_then(|lab| lab.names.get(key.as_str()))
+            .map_or_else(
+                || named_by_key(&key),
+                |names| Named {
+                    pk: key.as_str().to_owned(),
+                    row: None,
+                    names: names.clone(),
+                },
+            );
         let word = word_among(&named, &rows, places.lab);
         covered.push(Covered {
+            email: lab_address(&key, places.lab),
             key,
-            email: row.email.clone(),
             label: row.label.clone(),
             named,
             word,
@@ -944,102 +962,6 @@ pub fn view_changes_after(accounts: &[AccountToken], now: i64) -> Option<i64> {
         .min()
 }
 
-/// Which peers use each token, from one fleet read (§5.10).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Peers {
-    /// No read answered: the fleet was offline, past its bound, or not asked.
-    NotRead,
-    /// A read at `at`: each account key's peers, by the name the read gave them.
-    Read {
-        /// When.
-        at: u64,
-        /// Each key's peers.
-        by_key: BTreeMap<String, Vec<String>>,
-    },
-}
-
-/// The peers each token's key names in `read` at `at`: each answering peer whose session rows
-/// carry `token=<ac key>`. A read no peer answered is [`Peers::NotRead`]; a read of a fleet of
-/// none is a read that names none.
-#[must_use]
-pub fn peers_of(read: &aterm_ctl::FleetRead, at: u64) -> Peers {
-    if !read.peers.is_empty() && read.peers.iter().all(|peer| peer.answer.is_err()) {
-        return Peers::NotRead;
-    }
-    let mut by_key: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for peer in &read.peers {
-        let Ok(lines) = &peer.answer else {
-            continue;
-        };
-        let name = peer.node.clone().unwrap_or_else(|| peer.label.clone());
-        for line in lines.iter().filter(|line| line.starts_with("session ")) {
-            let Some(key) = line
-                .split(' ')
-                .find_map(|kv| kv.strip_prefix("token="))
-                .filter(|key| key.starts_with("ac-") && Key::parse(key).is_some())
-            else {
-                continue;
-            };
-            let peers = by_key.entry(key.to_owned()).or_default();
-            if !peers.contains(&name) {
-                peers.push(name.clone());
-            }
-        }
-    }
-    Peers::Read { at, by_key }
-}
-
-/// Writes a fleet read's peers into this Mac's table rows (`used_on.peers`, `peers_read_at`),
-/// never into the vault; nothing where the read did not answer or nothing changed.
-///
-/// # Errors
-/// The table could not be read or written.
-pub fn note_peers(store: &Store, peers: &Peers) -> io::Result<()> {
-    let Peers::Read { at, by_key } = peers else {
-        return Ok(());
-    };
-    let table = tokens::read_table(store)?;
-    if table.rows.is_empty() {
-        return Ok(());
-    }
-    tokens::update_table(store, |table| {
-        for row in table.rows.values_mut() {
-            row.used_on.peers = by_key.get(&row.key).cloned().unwrap_or_default();
-            row.used_on.peers_read_at = Some(*at);
-        }
-    })
-}
-
-/// What the report says of peers' use: a read this run, or none and the last one's time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PeersShown {
-    /// Read this run.
-    Read,
-    /// Not read this run.
-    NotRead,
-}
-
-impl PeersShown {
-    const fn read(self) -> bool {
-        matches!(self, Self::Read)
-    }
-
-    fn words(self, row: &TokenRow) -> String {
-        let peers = if row.used_on.peers.is_empty() {
-            "no peer".to_owned()
-        } else {
-            row.used_on.peers.join(", ")
-        };
-        match (self, row.used_on.peers_read_at) {
-            (Self::Read, _) => format!("used on peers: {peers}"),
-            (Self::NotRead, Some(at)) => {
-                format!("peers not read (last read {}: {peers})", date(at))
-            }
-            (Self::NotRead, None) => "peers not read".to_owned(),
-        }
-    }
-}
-
 /// One Claude Code session on this Mac as its aterm's survey row names it: its sid, the row it is
 /// on (masked), how it authenticates, its token's key on the token route, and the account its
 /// login record names ([`with_logins`]).
@@ -1114,12 +1036,10 @@ pub fn sessions_of(lines: &[String]) -> Vec<SessionRoute> {
 pub enum Report {
     /// This Mac has no vault to read.
     NoVault,
-    /// The accounts, whether peers were read, and the sessions this aterm's survey named.
+    /// The accounts and the sessions this aterm's survey named.
     Accounts {
         /// Each account.
         accounts: Vec<AccountToken>,
-        /// Whether peers were read this run.
-        peers: PeersShown,
         /// This aterm's Claude Code sessions, where its survey was read.
         sessions: Option<Vec<SessionRoute>>,
         /// What holds each account's token step, by its key ([`held_steps`]): shown here, on
@@ -1136,7 +1056,6 @@ impl Report {
             Self::NoVault => "vault tokens: this Mac has no vault to read\n".to_owned(),
             Self::Accounts {
                 accounts,
-                peers,
                 sessions,
                 steps,
             } => {
@@ -1145,7 +1064,7 @@ impl Report {
                     text.push_str("  no account a session here is on names an email\n");
                 }
                 for account in accounts {
-                    text.push_str(&account.text(peers));
+                    text.push_str(&account.text());
                     let person = Step::Token {
                         word: account.word(),
                         replace: false,
@@ -1170,8 +1089,11 @@ impl Report {
                             };
                             let login = match login_of(session, accounts) {
                                 (Some(key), Some(account)) => format!(
-                                    " (logged into {} {key}, token: {})",
-                                    account.email,
+                                    " (logged into {}{key}, token: {})",
+                                    account
+                                        .email
+                                        .as_ref()
+                                        .map_or_else(String::new, |email| format!("{email} ")),
                                     account.state.word()
                                 ),
                                 (Some(key), None) => format!(" (logged into {key})"),
@@ -1197,7 +1119,6 @@ impl Report {
             }
             Self::Accounts {
                 accounts,
-                peers,
                 sessions,
                 steps,
             } => {
@@ -1207,7 +1128,7 @@ impl Report {
                         accounts
                             .iter()
                             .map(|a| {
-                                let mut account = a.json(peers);
+                                let mut account = a.json();
                                 if let Some(o) = account.as_object_mut() {
                                     o.insert(
                                         "step".into(),
@@ -1226,7 +1147,6 @@ impl Report {
                             .collect(),
                     ),
                 );
-                o.insert("peers_read".into(), Value::from(peers.read()));
                 o.insert(
                     "sessions".into(),
                     sessions.as_ref().map_or(Value::Null, |sessions| {
@@ -1262,7 +1182,7 @@ impl Report {
                                             l.insert("key".into(), Value::from(key.to_owned()));
                                             l.insert(
                                                 "email".into(),
-                                                Value::from(account.map(|a| a.email.clone())),
+                                                Value::from(account.and_then(|a| a.email.clone())),
                                             );
                                             l.insert(
                                                 "token".into(),
@@ -1311,8 +1231,11 @@ impl Held {
 /// it, a code page's only while aterm's window reads no mailbox of the account, the environment
 /// read through `var` ([`token_steps::mailbox_read`]); and this Mac's upkeep's record of a run
 /// for a gap of the token the vault holds now (by its `minted_at`) while that record holds it,
-/// whatever mailbox the window reads. What the report shows on demand; nothing of a file that
-/// does not read.
+/// whatever mailbox the window reads. An account's files are looked up by its address, else the
+/// one its vault token was made for ([`AccountToken::lookup_address`]); with neither, its window
+/// store and mail grant date nothing and no mailbox is asked of (a stop then holds unless a
+/// build moved, a mailbox configuration was written or a token was made). What the report shows
+/// on demand; nothing of a file that does not read.
 pub fn held_steps(
     store: &Store,
     accounts: &[AccountToken],
@@ -1331,23 +1254,26 @@ pub fn held_steps(
     let cli = cli();
     let aterm = aterm_stamp::build_id();
     for account in accounts {
+        let address = account.lookup_address();
         let since = Since {
             cli: cli.as_deref(),
             aterm: Some(&aterm),
-            route_at: token_steps::route_at(store, home, &account.email),
+            route_at: token_steps::route_at(store, home, address),
             token_at: account.minted_at(),
             mailbox_read: None,
         };
         if let Some(step) = steps.remove(&account.key) {
             let since = Since {
-                mailbox_read: step.waits_on_a_mailbox().then(|| {
-                    token_steps::mailbox_read(
-                        store,
-                        (home, var),
-                        account.label.as_deref(),
-                        &account.email,
-                    )
-                }),
+                mailbox_read: address
+                    .filter(|_| step.waits_on_a_mailbox())
+                    .map(|address| {
+                        token_steps::mailbox_read(
+                            store,
+                            (home, var),
+                            account.label.as_deref(),
+                            address,
+                        )
+                    }),
                 ..since
             };
             if step.holds(&since) {
@@ -1443,7 +1369,10 @@ pub fn states_by_label(places: &Places<'_>, vault: &dyn TokenVault) -> BTreeMap<
 /// store and roster beside `config`, the login records under `home`, its vault; `None` where no
 /// home is known or no vault is configured under it ([`tokens::configured_vault`]), so a Mac with
 /// no vault says nothing of tokens (a vault whose read fails reads `unknown`, [`doctor_words`]).
-/// A `signed here` row's post is retried as the read goes ([`note_posted`]).
+/// A `signed here` row's post is retried as the read goes ([`note_posted`]). First, with a home
+/// and a vault or not, a table an earlier build wrote with an address or a survey's peers in it
+/// is written again without them ([`tokens::rewrite_stale`]): a Mac that has left its vault keeps
+/// none of them on disk either.
 #[must_use]
 pub fn view_here(
     harness: &Path,
@@ -1451,8 +1380,9 @@ pub fn view_here(
     home: Option<&Path>,
     now: i64,
 ) -> Option<Vec<AccountToken>> {
-    let home = home?;
     let store = Store::at(harness);
+    let _ = tokens::rewrite_stale(&store);
+    let home = home?;
     let roster = config.and_then(|config| accounts::roster_beside_for(config, Cli::Claude));
     let vault = tokens::configured_vault(aterm_secrets::client::Paths::for_home(home))?;
     let logins = tokens::session_logins_at(Some(&store), roster.as_deref(), Some(home), now);
@@ -1483,13 +1413,18 @@ pub fn view_here(
 /// reading, table, checks, steps and the upkeep's tried gaps ([`token_steps::TRIED_FILE`], which
 /// [`held_steps`] reads beside the steps); the roster; the login record of each login a session
 /// here runs on ([`tokens::session_login_dirs`]); the files a held step's route is judged by for
-/// each account the roster, those records and the table name ([`token_steps::route_paths`]); the
+/// each account the roster and those records name, and each the table names by the address the
+/// registry gives it ([`lab_address`], as [`view`] names it; [`token_steps::route_paths`]); the
 /// managed Claude Code twin a held step is judged by; and the vault's own
 /// ([`aterm_secrets::client::token_view_files`]), configured or not, so a vault made here later is
 /// heard. A surface that watches them and stamps them before each read ([`ReadSet::stamp`]) hears
 /// each write a read did not see. Which logins and accounts it names comes from the store, the
 /// roster, the records and the table, all of which it names, so a change of that set moves a
-/// stamp too.
+/// stamp too; the registry's address of an account only the table names is not one of its
+/// files, and a change of it is seen at the view's next read for another cause, as is a write of
+/// the window store or mail grant of such an account the registry gives no address, which
+/// [`held_steps`] looks up by its vault token's meta (no file named here), the mailbox
+/// configuration files being named whatever account names them.
 ///
 /// Where a step the store holds waits on a mailbox ([`token_steps::Stopped::waits_on_a_mailbox`]:
 /// a code page's stop, which [`held_steps`] judges by whether aterm's window reads the account's
@@ -1544,12 +1479,19 @@ pub fn read_set_here(
         );
     }
     if let Ok(read) = tokens::read_parts(&store) {
-        emails.extend(read.table.rows.values().map(|row| row.email.clone()));
+        let lab = super::alab_roster::current();
+        emails.extend(
+            read.table
+                .rows
+                .keys()
+                .filter_map(|key| lab_address(&Key::parse(key)?, lab.as_deref())),
+        );
     }
     emails.sort();
     emails.dedup();
+    files.extend(token_steps::route_paths(&store, home, None));
     for email in &emails {
-        files.extend(token_steps::route_paths(&store, home, email));
+        files.extend(token_steps::route_paths(&store, home, Some(email)));
     }
     if token_steps::read(&store)
         .is_ok_and(|steps| steps.values().any(token_steps::Stopped::waits_on_a_mailbox))

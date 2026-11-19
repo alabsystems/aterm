@@ -2012,6 +2012,8 @@ fn deck_live_gallery() {
         kind: aterm_vitals::GapKind::Sleep,
     }];
     show.strip_events = vec![aterm_vitals::StripEvent {
+        scope: aterm_vitals::events::EventScope::Unknown,
+        span: None,
         at_unix_ms: OPEN - 25_000,
         kind: aterm_vitals::StripEventKind::Crash,
         label: "SIGSEGV".into(),

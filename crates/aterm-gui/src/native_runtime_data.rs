@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Host-owned opaque runtime data, never SDK or execution admission. Receiving
-//! data does not consume it: retries and failed replacement startup retain the
-//! original host copy until the same kernel process explicitly releases it.
+//! data does not consume it. The original kernel process may release its copy. A native
+//! handover owns its pinned checkpoint through settlement, or through its original close
+//! when a granted source dies. Other retained producer data keeps its existing ownership.
 //! Descriptors are immutable data, with a shared file offset: readers must use
 //! positional reads. Neither image identity nor SDK permission comes from them.
 use super::*;
@@ -133,6 +134,21 @@ impl Slot {
                         Outcome::Reserved | Outcome::Failed | Outcome::Released
                     )))
     }
+    /// Reserve DATA for a source whose native operation has already proved its process and
+    /// supervisor authority. A different live or retained producer keeps its slot.
+    pub(super) fn reserve_pinned(
+        current: &mut Option<Arc<Self>>,
+        operation: &str,
+        source: &Process,
+    ) -> Option<Pin> {
+        if current
+            .as_ref()
+            .is_none_or(|slot| slot.reusable_by(operation, source))
+        {
+            *current = Some(Self::reserved(operation.to_owned(), source.clone()));
+        }
+        current.as_ref()?.pin(operation, source)
+    }
     pub(super) fn pin(self: &Arc<Self>, operation: &str, peer: &Process) -> Option<Pin> {
         if self.operation != operation || !self.owned_by(peer) {
             return None;
@@ -186,6 +202,19 @@ pub(super) struct Released {
     _snapshot: Arc<Snapshot>,
 }
 impl Pin {
+    /// Remove this dead producer’s exact slot from discovery. The private recovery pin and a send
+    /// already in flight retain its immutable file. A new producer reserves its own slot.
+    pub(super) fn detach(&self, current: &mut Option<Arc<Slot>>) -> Option<Arc<Slot>> {
+        if current
+            .as_ref()
+            .is_some_and(|slot| Arc::ptr_eq(slot, &self.0))
+        {
+            current.take()
+        } else {
+            None
+        }
+    }
+
     /// Only the owning native handover calls this after live settlement checks.
     /// Concurrent readers/pins or changed DATA retain custody for a later retry.
     pub(super) fn release_retained(&self, bytes: u64, digest: &str) -> Option<Released> {
@@ -485,6 +514,9 @@ impl Drop for Sending {
             .sending = false;
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+pub(super) use tests::seed_retained_checkpoint;
 
 #[cfg(test)]
 #[path = "native_runtime_data_tests.rs"]

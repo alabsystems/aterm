@@ -885,3 +885,33 @@ fn a_borrowed_sink_cannot_supply_an_owned_descriptor_borrow() {
         "sink did not retain the descriptor"
     );
 }
+
+#[test]
+fn idle_cleanup_seals_only_unchanged_unclaimed_egress() {
+    let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let sink = SinkWriter::new(writer.as_raw_fd());
+    sink.note_master_nonblocking(true);
+    let seen = sink.input_epoch();
+    sink.write_frame(b"draft").unwrap();
+    assert!(!sink.try_sever_quiet_input(seen));
+    let mut bytes = [0; 5];
+    reader.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"draft");
+
+    let quiet = sink.input_epoch();
+    let held = sink.try_fence_egress().unwrap();
+    assert!(!sink.try_sever_quiet_input(quiet));
+    drop(held);
+    sink.claim_ordered_egress();
+    assert!(!sink.try_sever_quiet_input(quiet));
+    sink.retire_ordered_egress();
+    assert!(sink.try_sever_quiet_input(quiet));
+    assert!(sink.is_severed());
+    assert!(sink.write_frame(b"late").is_err());
+    assert_eq!(
+        sink.try_write_frame_immediate(b"late"),
+        ImmediateWrite::BusyZero
+    );
+    assert!(sink.write_frame_interactive_with_receipt(b"late").is_err());
+}

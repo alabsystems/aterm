@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::membership_log::store::framed::{FrameReadError, FrameReader};
-use crate::membership_log::{MAX_HELD_RECORDS, MAX_RECORDS_STREAM, Record, RecordId};
+use crate::membership_log::{MAX_HELD_RECORDS, REPLY_CAP, Reading, Record, RecordId};
 use std::io::{Cursor, Read, Write};
 
 pub(super) struct StagedRecords(Vec<Record>);
@@ -41,8 +41,9 @@ pub(super) fn from_bytes(
     shared: &Shared,
     name: &str,
     bytes: &[u8],
+    reading: Reading,
 ) -> Result<StagedRecords, Reply> {
-    stage(shared, name, &mut Cursor::new(bytes), bytes.len())
+    stage(shared, name, &mut Cursor::new(bytes), bytes.len(), reading)
 }
 
 pub(super) fn from_http(
@@ -51,6 +52,7 @@ pub(super) fn from_http(
     stream: &mut TcpStream,
     request: Request,
     length: usize,
+    reading: Reading,
 ) -> Result<StagedRecords, Reply> {
     if request.expect_continue && request.early.len() < length {
         stream
@@ -59,7 +61,7 @@ pub(super) fn from_http(
             .map_err(|_| Reply::text(400, "the connection closed"))?;
     }
     let mut body = HttpBody::new(stream, request.early, length, &shared.tuning);
-    stage(shared, name, &mut body, length)
+    stage(shared, name, &mut body, length, reading)
 }
 
 fn stage(
@@ -67,10 +69,12 @@ fn stage(
     name: &str,
     reader: &mut impl Read,
     length: usize,
+    reading: Reading,
 ) -> Result<StagedRecords, Reply> {
     stage_with(
         reader,
         length,
+        reading,
         |id| known_record(shared, name, id),
         || {
             #[cfg(test)]
@@ -92,14 +96,25 @@ fn stage(
     )
 }
 
+/// Read `length` bytes of `reader` as a records stream, each frame as `reading` reads it (the
+/// format the server reads the vault's records at, or a follow copy's): every frame decoded
+/// and verified, but one `known` holds already, which stands for its frame unverified.
+///
+/// A frame is named by its record's id ([`crate::membership_log::record_id`]): the SHA-256 of
+/// its bytes for a version-1 record, and for a version-2 record the one id its whole and its
+/// shed form share, which the SHA-256 of a whole record's bytes is not. The id covers every
+/// signed byte, and a whole record's ciphertext is checked against the digest it signs. The
+/// record `known` holds stands for the frame only where it is as long: one held shed is not
+/// the whole record a poster sends under the same id, which is decoded and kept whole.
 fn stage_with(
     reader: &mut impl Read,
     length: usize,
+    reading: Reading,
     mut known: impl FnMut(&RecordId) -> Option<Record>,
     mut starting_verification: impl FnMut(),
     mut verifying: impl FnMut(),
 ) -> Result<StagedRecords, Reply> {
-    if length > MAX_RECORDS_STREAM {
+    if length > REPLY_CAP {
         return Err(Reply::text(400, "membership record stream is too large"));
     }
     if length == 0 {
@@ -109,7 +124,7 @@ fn stage_with(
         ));
     }
     let mut reader = reader.take(length as u64);
-    let mut frames = FrameReader::new();
+    let mut frames = FrameReader::at(reading);
     let mut records = Vec::new();
     let mut raw_count = 0;
     let mut started = false;
@@ -125,8 +140,9 @@ fn stage_with(
             Err(FrameReadError::Invalid(error)) => break Reply::text(400, error.to_string()),
         };
         raw_count += 1;
-        let id = aterm_digest::Sha256::digest(&frame);
-        if let Some(record) = known(&id) {
+        let id = crate::membership_log::record_id(&frame)
+            .unwrap_or_else(|| aterm_digest::Sha256::digest(&frame));
+        if let Some(record) = known(&id).filter(|held| held.wire_len() == frame.len()) {
             records.push(record);
             continue;
         }
@@ -135,7 +151,7 @@ fn stage_with(
             started = true;
         }
         verifying();
-        match Record::decode(&frame) {
+        match Record::decode_in(&frame, reading) {
             Ok(record) => records.push(record),
             Err(error) => break Reply::text(400, error.to_string()),
         }

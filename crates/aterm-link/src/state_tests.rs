@@ -600,6 +600,7 @@ fn the_journal_is_rewritten_from_its_index_past_its_bound_and_keeps_what_is_live
         body: b"v=1 t=1 text=live".to_vec(),
         log: None,
         at: None,
+        own_log: None,
     };
     st.set_in_flight(&entry).expect("a live record in flight");
     let journal = dir.join(journal::FILE);
@@ -1861,6 +1862,7 @@ fn in_flight_entries_round_trip_in_order_and_a_damaged_one_is_not_absent() {
         body: body.to_vec(),
         log: None,
         at: None,
+        own_log: None,
     };
     let late = InFlight {
         log: Some(astream_broker::LogIdentity {
@@ -2240,6 +2242,7 @@ fn a_re_base_drops_proven_old_references_and_keeps_uncertain_or_unrelated_mail()
         body: format!("v=1 t=1 re={seq}").into_bytes(),
         log,
         at: None,
+        own_log: None,
     };
     st.set_in_flight(&entry(1, Some(a))).unwrap();
     st.set_in_flight(&entry(2, None)).unwrap();
@@ -2328,6 +2331,7 @@ fn a_moved_generation_clamps_the_offsets_it_continues_and_forgets_the_rest() {
         body: format!("v=1 t=1 re={re}").into_bytes(),
         log: Some(old),
         at: None,
+        own_log: None,
     };
     let deadline = |off| Deadline {
         off,
@@ -2481,6 +2485,7 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
         body: format!("v=1 t=1 re={re}").into_bytes(),
         log: Some(log(generation)),
         at: None,
+        own_log: None,
     };
     let fill = |st: &StateDir| {
         st.set_in_flight(&entry(1, 40, 0)).unwrap();
@@ -2495,7 +2500,6 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
     let keep_below = LogWitness {
         high: 150,
         id: Some(log(1)),
-        met: None,
     }
     .continues(Some(log(2)), Some(&lineage));
     assert_eq!(keep_below, Some(138), "the newest move's fork");
@@ -2531,6 +2535,606 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
     let _ = std::fs::remove_dir_all(&twin);
 }
 
+/// An entry in flight on `log` at `at`, its pin's head the same and its winner's offset 12:
+/// a keyed re-post's (`via_key`) or an unkeyed post's, never a reply.
+fn entry_on(seq: u64, keyed: bool, log: astream_broker::LogIdentity, at: Option<Head>) -> InFlight {
+    InFlight {
+        pin: PublishPin {
+            seq,
+            via_key: keyed,
+            identity: Some(PublishIdentity {
+                subject: "/f/f/in/p/h-a/n-a/note".into(),
+                digest: "ab".repeat(32),
+            }),
+            original: None,
+            original_off: Some(12),
+            owner: Some(1),
+            at,
+        },
+        subject: "/f/f/in/p/h-a/n-a/note".into(),
+        body: b"v=1 t=1".to_vec(),
+        log: Some(log),
+        at,
+        own_log: None,
+    }
+}
+
+/// [`entry_on`] re-witnessed onto `log` at `at`, its pin's head with it.
+fn rewitnessed_onto(entry: &InFlight, log: astream_broker::LogIdentity, at: Head) -> InFlight {
+    InFlight {
+        log: Some(log),
+        at: Some(at),
+        pin: PublishPin {
+            at: Some(at),
+            ..entry.pin.clone()
+        },
+        ..entry.clone()
+    }
+}
+
+/// **A KEYED RE-POST'S ENTRY ON A LOG THAT CONTINUES NONE GOES ONTO THE ATTACH'S LOG AT THE HEAD
+/// IT READ** (ATERM-KI-1114-1414's step S6, `StateDir::rewitnessed_entry`): the attach reads
+/// generation 2 of one line at 150, its lineage continuing generation 1 to 138, and a proved step
+/// from another id to it, its fork 70. A keyed entry kept on a third id goes onto generation 2 at
+/// `From(150)`, its pin's head with it and its winner's offset kept, the log it stood on and its
+/// heads there kept as its own (`InFlight::own_log`); one on generation 1 onto it down to the
+/// lineage's fork, an own head still its own, and no own log kept (generation 2 reaches it
+/// still); one the proved step reaches stays, above
+/// its fork or below it, for the read back to read across the step; one already on generation 2,
+/// one with no head (an older build's) and an unkeyed one stay ([`StateDir::rewitness_in_flight`],
+/// which every attach makes once its witness names its log). A second pass moves nothing: each
+/// entry it moved names the attach's log, and none's own log is one the attach's log reaches.
+/// NEGATIVE CONTROLS: the seam
+/// `Mutant::KeyedEntryKeptOnItsLog` sets leaves every keyed entry on its log; the one
+/// `Mutant::ProvedOwnHeadAtTheAttach` sets puts the keyed entry above the proved fork onto
+/// generation 2 at `From(150)` too; the one `Mutant::ReadBackFromTheAttachHead` sets puts the
+/// unkeyed one there.
+#[test]
+fn a_keyed_entry_on_a_log_that_continues_none_goes_onto_the_attachs_log_at_its_head() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let now = log(0x3c, 2);
+    let lineage =
+        astream_broker::Lineage::from_steps(&[(1, 41), (2, 138)]).expect("a lineage astream reads");
+    let entries = [
+        entry_on(1, true, log(0x77, 0), Some(Head::OwnFrom(60))),
+        entry_on(2, true, log(0x3c, 1), Some(Head::OwnFrom(140))),
+        entry_on(3, true, log(0x99, 0), Some(Head::OwnFrom(100))),
+        entry_on(4, true, log(0x99, 0), Some(Head::From(50))),
+        entry_on(5, false, log(0x77, 0), Some(Head::From(60))),
+        entry_on(6, true, now, Some(Head::From(20))),
+        entry_on(7, true, log(0x77, 0), None),
+    ];
+    for control in ["rule", "kept", "proved", "every"] {
+        let dir = scratch(&format!("rewitness-keyed-{control}"));
+        let st = StateDir::open(&dir).unwrap();
+        st.add_proved_step(Proved {
+            was: log(0x99, 0),
+            now,
+            fork: 70,
+            head: 200,
+        })
+        .unwrap();
+        for entry in &entries {
+            st.set_in_flight(entry).unwrap();
+        }
+        st.keyed_entries_kept_on_their_log(control == "kept");
+        st.proved_keyed_heads_at_the_attach(control == "proved");
+        st.heads_at_the_attach(control == "every");
+        let steps = st.proved_steps();
+        st.rewitness_in_flight(150, Some(now), Some(&lineage), &steps)
+            .unwrap();
+        let kept = control == "kept";
+        let want: Vec<(u64, InFlight)> = entries
+            .iter()
+            .map(|entry| {
+                let seq = entry.pin.seq;
+                let moved = match seq {
+                    1 if !kept => Some(moved_off(entry, now, Head::From(150))),
+                    2 if !kept => Some(rewitnessed_onto(entry, now, Head::OwnFrom(138))),
+                    3 if control == "proved" => Some(moved_off(entry, now, Head::From(150))),
+                    5 if control == "every" => Some(moved_off(entry, now, Head::From(150))),
+                    _ => None,
+                };
+                (seq, moved.unwrap_or_else(|| entry.clone()))
+            })
+            .collect();
+        assert_eq!(st.in_flight().unwrap(), want, "control={control}");
+        st.rewitness_in_flight(160, Some(now), Some(&lineage), &steps)
+            .unwrap();
+        // Under the `proved` control the entry the step reaches was moved off its own log though
+        // the step reaches it, so the next pass puts it back and moves it again.
+        let want: Vec<(u64, InFlight)> = want
+            .into_iter()
+            .map(|(seq, entry)| match seq {
+                3 if control == "proved" => (seq, moved_off(&entries[2], now, Head::From(160))),
+                _ => (seq, entry),
+            })
+            .collect();
+        assert_eq!(
+            StateDir::open(&dir).unwrap().in_flight().unwrap(),
+            want,
+            "control={control}: a second pass, across a reopen"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// [`entry_on`] moved off the log it stands on onto `log` at `at`, its pin's head with it, the log
+/// it stood on and its heads there kept as its own (`InFlight::own_log`).
+fn moved_off(entry: &InFlight, log: astream_broker::LogIdentity, at: Head) -> InFlight {
+    InFlight {
+        own_log: Some(OwnLog {
+            log: entry.log.expect("an entry on a log"),
+            at: entry.at.expect("an entry with a head"),
+            pin_at: entry.pin.at,
+        }),
+        ..rewitnessed_onto(entry, log, at)
+    }
+}
+
+/// **AN ENTRY MOVED OFF ITS OWN LOG GOES BACK WHERE A LOG REACHES IT** (`InFlight::own_log`,
+/// `StateDir::rewitnessed_entry`, the second review of ATERM-KI-1114-1414's step S6): a keyed
+/// entry on `C` at its own head 60, moved onto `N`, which continues none of it, at the head 150 an
+/// attach read there, keeps `C` and its heads as its own; moved on again to `Q`, it keeps `C`, the
+/// log it was first moved off. An attach to `C` puts it back at its own head; one to `C₁`, whose
+/// lineage continues `C` to 50, puts it back and down to that fork there; one to `P`, which a
+/// proved step reaches `C` on (fork 70), puts it back on `C`, its own head below the fork, for the
+/// read back to read across the step. Each then stands as an entry never moved does, its own log
+/// gone. NEGATIVE CONTROL (`StateDir::own_logs_forgotten`, the seam `Mutant::OwnLogForgotten`
+/// sets): no own log is kept, and each attach puts the entry at the head it read, or leaves it
+/// where it is.
+#[test]
+fn an_entry_moved_off_its_own_log_goes_back_where_a_log_reaches_it() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let (c, c1, n, q, p) = (
+        log(0x77, 0),
+        log(0x77, 1),
+        log(0x3c, 0),
+        log(0x55, 0),
+        log(0x99, 0),
+    );
+    let on_c = entry_on(1, true, c, Some(Head::OwnFrom(60)));
+    let lineage = astream_broker::Lineage::from_steps(&[(1, 50)]).expect("a lineage");
+    let step = Proved {
+        was: c,
+        now: p,
+        fork: 70,
+        head: 200,
+    };
+    for control in [false, true] {
+        for back_on in ["c", "c1", "p"] {
+            let dir = scratch(&format!("own-log-{back_on}-{control}"));
+            let st = StateDir::open(&dir).unwrap();
+            st.add_proved_step(step).unwrap();
+            st.set_in_flight(&on_c).unwrap();
+            st.own_logs_forgotten(control);
+            st.rewitness_in_flight(150, Some(n), None, &[]).unwrap();
+            let on_n = if control {
+                rewitnessed_onto(&on_c, n, Head::From(150))
+            } else {
+                moved_off(&on_c, n, Head::From(150))
+            };
+            assert_eq!(
+                st.in_flight().unwrap(),
+                vec![(1, on_n.clone())],
+                "control={control}: moved onto `N`"
+            );
+            st.rewitness_in_flight(160, Some(q), None, &[]).unwrap();
+            let on_q = InFlight {
+                pin: PublishPin {
+                    at: Some(Head::From(160)),
+                    ..on_n.pin.clone()
+                },
+                log: Some(q),
+                at: Some(Head::From(160)),
+                ..on_n.clone()
+            };
+            assert_eq!(
+                st.in_flight().unwrap(),
+                vec![(1, on_q.clone())],
+                "control={control}: moved on to `Q`, `C` still its own log"
+            );
+            let steps = st.proved_steps();
+            let (now, lineage, head) = match back_on {
+                "c" => (c, None, 200),
+                "c1" => (c1, Some(&lineage), 210),
+                _ => (p, None, 300),
+            };
+            st.rewitness_in_flight(head, Some(now), lineage, &steps)
+                .unwrap();
+            let want = match (control, back_on) {
+                (false, "c" | "p") => on_c.clone(),
+                (false, _) => rewitnessed_onto(&on_c, c1, Head::OwnFrom(50)),
+                (true, _) => rewitnessed_onto(&on_c, now, Head::From(head)),
+            };
+            assert_eq!(
+                StateDir::open(&dir).unwrap().in_flight().unwrap(),
+                vec![(1, want)],
+                "control={control} back_on={back_on}: after the attach, across a reopen"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// **AN OLDER BUILD'S MEETING RE-WITNESSES THE KEYED ENTRIES IT BOUNDED, BY ITS WITNESS ALONE**
+/// (`StateDir::rewitness_at_an_older_meeting`, ATERM-KI-1114-1414's step S6): that build met
+/// generation 1 of the line at 40, and its witness names generation 2. A keyed entry that build
+/// kept on another id (one a stored proved step reaches from generation 3 among them), or on a
+/// generation of the line before the meeting's, goes onto generation 2 at `From(40)`, its pin's
+/// head with it and its winner's offset kept, the log it stood on and its heads there kept as its
+/// own; one on the met generation or a later one (which that build read back from nowhere), one
+/// on generation 2 itself, one with no head and an unkeyed one stay, and a meeting of another line
+/// moves none. Then an attach to generation 3, whose lineage continues generation 2 to 50 and
+/// which the step reaches the other id from, puts the entry the step reaches back on its own log
+/// at its own head, where that build read it across the step, and brings those it does not reach
+/// down to the fork on generation 3, their own logs kept (`StateDir::rewitness_in_flight`). In
+/// the lineage arm the attach to generation 4 continues the entry's own generation 2 to 50: it
+/// goes back there and down to that fork on generation 4, as an entry never moved is. Nothing
+/// read the log the attach reads to decide what the meeting moved, so an attach refused before
+/// its witness names that log leaves what any later attach reads as that build did. NEGATIVE
+/// CONTROL (the seam `Mutant::OwnLogForgotten` sets): no own log is kept, and the attach leaves
+/// the entry the step reaches on generation 3 at the meeting's head, below the step's fork, and
+/// the one the lineage reaches at the meeting's head on generation 4.
+#[test]
+fn an_older_builds_meeting_re_witnesses_the_keyed_entries_it_bounded() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let witnessed = log(0x3c, 2);
+    let now = log(0x3c, 3);
+    let step = Proved {
+        was: log(0x99, 0),
+        now,
+        fork: 30,
+        head: 90,
+    };
+    let entries = [
+        entry_on(1, true, log(0x77, 0), Some(Head::OwnFrom(60))),
+        entry_on(2, true, log(0x3c, 0), Some(Head::From(30))),
+        entry_on(3, true, log(0x3c, 1), Some(Head::OwnFrom(45))),
+        entry_on(4, true, witnessed, Some(Head::From(20))),
+        entry_on(5, true, log(0x77, 0), None),
+        entry_on(6, false, log(0x77, 0), Some(Head::From(60))),
+        entry_on(7, true, log(0x99, 0), Some(Head::OwnFrom(70))),
+        entry_on(8, true, now, Some(Head::From(80))),
+    ];
+    let lineage = astream_broker::Lineage::from_steps(&[(3, 50)]).expect("a lineage astream reads");
+    for control in [false, true] {
+        let dir = scratch(&format!("older-meeting-{control}"));
+        let st = StateDir::open(&dir).unwrap();
+        st.add_proved_step(step).unwrap();
+        for entry in &entries {
+            st.set_in_flight(entry).unwrap();
+        }
+        st.own_logs_forgotten(control);
+        st.rewitness_at_an_older_meeting(witnessed, (log(0x55, 1), 40))
+            .unwrap();
+        let as_journaled: Vec<(u64, InFlight)> = entries
+            .iter()
+            .map(|entry| (entry.pin.seq, entry.clone()))
+            .collect();
+        assert_eq!(
+            st.in_flight().unwrap(),
+            as_journaled,
+            "control={control}: a meeting of another line"
+        );
+        st.rewitness_at_an_older_meeting(witnessed, (log(0x3c, 1), 40))
+            .unwrap();
+        let met = |entry: &InFlight| {
+            if control {
+                rewitnessed_onto(entry, witnessed, Head::From(40))
+            } else {
+                moved_off(entry, witnessed, Head::From(40))
+            }
+        };
+        let want: Vec<(u64, InFlight)> = entries
+            .iter()
+            .map(|entry| {
+                let seq = entry.pin.seq;
+                let moved = matches!(seq, 1 | 2 | 7).then(|| met(entry));
+                (seq, moved.unwrap_or_else(|| entry.clone()))
+            })
+            .collect();
+        assert_eq!(st.in_flight().unwrap(), want, "control={control}");
+        st.rewitness_at_an_older_meeting(witnessed, (log(0x3c, 1), 40))
+            .unwrap();
+        assert_eq!(
+            StateDir::open(&dir).unwrap().in_flight().unwrap(),
+            want,
+            "control={control}: a second meeting moves nothing, across a reopen"
+        );
+        let steps = st.proved_steps();
+        st.rewitness_in_flight(100, Some(now), Some(&lineage), &steps)
+            .unwrap();
+        let on_three = |seq: u64| {
+            let (_, entry) = &want[usize::try_from(seq - 1).unwrap()];
+            InFlight {
+                log: Some(now),
+                ..entry.clone()
+            }
+        };
+        let back = if control {
+            on_three(7)
+        } else {
+            entries[6].clone()
+        };
+        let in_flight = st.in_flight().unwrap();
+        assert_eq!(
+            in_flight[6],
+            (7, back),
+            "control={control}: the entry the step reaches after the attach"
+        );
+        assert_eq!(
+            in_flight[0],
+            (1, on_three(1)),
+            "control={control}: an entry the attach's log reaches by neither stays at the \
+             meeting's head, brought onto generation 3 by its lineage"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // The meeting on generation 3, the witness and the attach on generation 4, continuing the
+    // entry's own generation 2 to 50.
+    let lineage =
+        astream_broker::Lineage::from_steps(&[(3, 55), (4, 50)]).expect("a lineage astream reads");
+    let (met, four) = ((log(0x3c, 3), 40), log(0x3c, 4));
+    let on_two = entry_on(1, true, log(0x3c, 2), Some(Head::OwnFrom(60)));
+    assert_eq!(
+        four.continues(log(0x3c, 2), &lineage),
+        Some(50),
+        "PRECONDITION: generation 4 continues generation 2 to 50"
+    );
+    for control in [false, true] {
+        let dir = scratch(&format!("older-meeting-lineage-{control}"));
+        let st = StateDir::open(&dir).unwrap();
+        st.set_in_flight(&on_two).unwrap();
+        st.own_logs_forgotten(control);
+        st.rewitness_at_an_older_meeting(four, met).unwrap();
+        st.rewitness_in_flight(70, Some(four), Some(&lineage), &[])
+            .unwrap();
+        let want = if control {
+            rewitnessed_onto(&on_two, four, Head::From(40))
+        } else {
+            rewitnessed_onto(&on_two, four, Head::OwnFrom(50))
+        };
+        assert_eq!(
+            st.in_flight().unwrap(),
+            vec![(1, want)],
+            "control={control}: the entry the lineage continues, after the attach"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// **A PROVED STEP IS CARRIED ONTO EACH LATER GENERATION ITS LOG'S LINEAGE CONTINUES**
+/// ([`Proved::carried`], ATERM-KI-1114-1414's step S6): the step `A → B₀` (fork 30, proved at
+/// 90), read on `B₂`, whose lineage continues `B₀` to 60, names `B₂`, its fork 30 and head 60, and
+/// reaches `A` from `B₂` as it did from `B₀` (`Proved::reach`); one whose lineage continues `B₀`
+/// below its fork, at 20, brings its fork down with its head, both 20, so it continues `A` on `B₂`
+/// where the step on `B₀` does (`Proved::continues`, what every reader reads), and the codec,
+/// which holds no head below a fork, reads it back as it is, on the media too. A step on a log the
+/// lineage does not continue, on `B₂` itself, or with no lineage stays; two carried onto one are
+/// one, the newer kept. Past the lineage window (a lineage continuing `B₂` and not `B₀`) the
+/// carried step still reaches `A`, and the step left on `B₀` does not. NEGATIVE CONTROLS
+/// (`Mutant::ProvedStepLeftOnItsGeneration`): the step left on `B₀`, past the window;
+/// (`Mutant::CarriedStepKeepsItsFork`, `StateDir::carried_steps_keep_their_fork`): the fork kept
+/// above the head, a reload reads the head at the fork, and `B₂` continues `A` at 30, above the
+/// cut.
+#[test]
+fn a_proved_step_is_carried_onto_each_later_generation_its_logs_lineage_continues() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let (a, b0, b2, b4) = (log(1, 0), log(2, 0), log(2, 2), log(2, 4));
+    let step = Proved {
+        was: a,
+        now: b0,
+        fork: 30,
+        head: 90,
+    };
+    let lineage = astream_broker::Lineage::from_steps(&[(1, 70), (2, 60)]).expect("a lineage");
+    assert_eq!(b2.continues(b0, &lineage), Some(60), "PRECONDITION");
+    let carried = Proved::carried(&[step], b2, Some(&lineage));
+    assert_eq!(
+        carried,
+        vec![Proved {
+            now: b2,
+            head: 60,
+            ..step
+        }]
+    );
+    assert_eq!(
+        Proved::reach(&carried, a, b2, Some(&lineage)),
+        Proved::reach(&[step], a, b2, Some(&lineage)),
+        "it reaches `A` from `B₂` as the step did"
+    );
+    let low = astream_broker::Lineage::from_steps(&[(1, 20), (2, 60)]).expect("a lineage");
+    let carried_low = Proved::carried(&[step], b2, Some(&low));
+    assert_eq!(
+        carried_low,
+        vec![Proved {
+            now: b2,
+            fork: 20,
+            head: 20,
+            ..step
+        }],
+        "a lineage below the fork brings the fork down with the head"
+    );
+    assert_eq!(
+        Proved::continues(&carried_low, a, b2, Some(&low)),
+        Proved::continues(&[step], a, b2, Some(&low)),
+        "and continues `A` on `B₂` where the step did (every reader reads the fork brought \
+         down to the head)"
+    );
+    assert_eq!(
+        Proved::parse_all(&Proved::render_all(&carried_low)),
+        carried_low,
+        "the codec holds it"
+    );
+    // NEGATIVE CONTROL (`Mutant::CarriedStepKeepsItsFork`): the fork kept, its head below it, the
+    // codec reads the head back at the fork, and `B₂` continues `A` there, above the lineage's cut.
+    let kept_fork = Proved::carried_keeping_the_fork(&[step], b2, Some(&low));
+    assert_eq!(
+        kept_fork,
+        vec![Proved {
+            now: b2,
+            head: 20,
+            ..step
+        }],
+        "the control keeps the fork"
+    );
+    assert_eq!(
+        Proved::continues(
+            &Proved::parse_all(&Proved::render_all(&kept_fork)),
+            a,
+            b2,
+            None
+        ),
+        Some(30),
+        "the control's step, read back, continues `A` at the fork above the cut"
+    );
+    let other = Proved {
+        was: log(3, 0),
+        now: log(4, 0),
+        fork: 5,
+        head: 9,
+    };
+    assert_eq!(
+        Proved::carried(&[other, step], b2, None),
+        vec![other, step],
+        "no lineage carries nothing"
+    );
+    assert_eq!(
+        Proved::carried(&[other, step], b2, Some(&lineage)),
+        vec![
+            other,
+            Proved {
+                now: b2,
+                head: 60,
+                ..step
+            }
+        ],
+        "a step on a log the lineage does not continue stays"
+    );
+    let on_b2 = Proved {
+        now: b2,
+        head: 60,
+        ..step
+    };
+    assert_eq!(
+        Proved::carried(&[on_b2, step], b2, Some(&lineage)),
+        vec![on_b2],
+        "two carried onto one are one"
+    );
+    // Past the window: `B₄`'s lineage continues `B₂` and not `B₀`.
+    let past = astream_broker::Lineage::from_steps(&[(3, 55), (4, 50)]).expect("a lineage");
+    assert_eq!(
+        b4.continues(b0, &past),
+        None,
+        "PRECONDITION: past the window"
+    );
+    assert_eq!(
+        Proved::reach(&carried, a, b4, Some(&past)),
+        Some((30, 50)),
+        "the carried step reaches `A` from `B₄`"
+    );
+    assert_eq!(
+        Proved::reach(&[step], a, b4, Some(&past)),
+        None,
+        "the control: the step left on `B₀` does not"
+    );
+    let dir = scratch("proved-carried");
+    let st = StateDir::open(&dir).unwrap();
+    st.add_proved_step(step).unwrap();
+    assert_eq!(
+        st.carry_proved_steps(&[step], b2, Some(&lineage)).unwrap(),
+        Some(carried.clone())
+    );
+    assert_eq!(
+        StateDir::open(&dir).unwrap().proved_steps(),
+        carried,
+        "on the media"
+    );
+    assert_eq!(
+        st.carry_proved_steps(&carried, b2, Some(&lineage)).unwrap(),
+        None,
+        "nothing moves again"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    // Carried below the fork, across a reopen: what the attach reads on `B₂` is what a reload
+    // reads, the cut and all (the second review of step S6, confirmed: the head kept below the
+    // fork read back at the fork, and a later read on `B₂` started above the cut).
+    for control in [false, true] {
+        let dir = scratch(&format!("proved-carried-low-{control}"));
+        let st = StateDir::open(&dir).unwrap();
+        st.add_proved_step(step).unwrap();
+        st.carried_steps_keep_their_fork(control);
+        let held = st
+            .carry_proved_steps(&[step], b2, Some(&low))
+            .unwrap()
+            .expect("the step moves");
+        let reloaded = StateDir::open(&dir).unwrap().proved_steps();
+        let (held, reloaded) = (
+            Proved::continues(&held, a, b2, None),
+            Proved::continues(&reloaded, a, b2, None),
+        );
+        if control {
+            assert_eq!(
+                (held, reloaded),
+                (Some(20), Some(30)),
+                "CONTROL: the reload reads the fork, above the cut"
+            );
+        } else {
+            assert_eq!(
+                (held, reloaded),
+                (Some(20), Some(20)),
+                "the reload reads the cut, as the attach did"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// **A READ START ABOVE A PROVED FORK IS NEVER JOURNALED** ([`Head::Since`]): it starts where its
+/// `From` does, is no own head, and is stored as that `From`; a frame that holds one does not read
+/// back as itself, and the journal refuses it.
+#[test]
+fn a_read_start_above_a_proved_fork_is_stored_as_its_from_and_never_journaled() {
+    let since = Head::Since(40);
+    assert_eq!(since.start(), 40);
+    assert_eq!(since.own(), None);
+    assert_eq!(since.min(30), Head::Since(30));
+    assert_eq!(since.stored(), Head::From(40));
+    assert_eq!(Head::OwnFrom(40).stored(), Head::OwnFrom(40));
+    let log = astream_broker::LogIdentity {
+        id: [0x3c; 16],
+        generation: 0,
+    };
+    let dir = scratch("since-refused");
+    let st = StateDir::open(&dir).unwrap();
+    assert!(
+        st.set_in_flight(&entry_on(1, true, log, Some(since)))
+            .is_err(),
+        "a frame holding a read start is refused"
+    );
+    assert_eq!(st.in_flight().unwrap(), Vec::new());
+    st.set_in_flight(&entry_on(1, true, log, Some(since.stored())))
+        .unwrap();
+    assert_eq!(
+        st.in_flight().unwrap(),
+        vec![(1, entry_on(1, true, log, Some(Head::From(40))))]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// **A REPLY RE-WITNESSED ONTO A MOVED LOG TAKES ITS HEAD DOWN TO ITS FORK**
 /// (ATERM-KI-1116-2615). Past the fork, the new log's offsets name records published since the
 /// move, so a read from the old head would miss a copy published there. Generation 0's reply,
@@ -2560,6 +3164,7 @@ fn a_reply_re_witnessed_onto_a_moved_log_takes_its_head_down_to_its_fork() {
         body: format!("v=1 t=1 re={re}").into_bytes(),
         log: Some(log(generation)),
         at: Some(at),
+        own_log: None,
     };
     let journaled = [
         (1, 40, 0, Head::From(90), Head::From(41)),
@@ -3766,7 +4371,6 @@ fn the_log_witness_round_trips_and_names_another_log_by_identity_or_head() {
     st.set_log_witness(&LogWitness {
         high: 500,
         id: None,
-        met: None,
     })
     .expect("write");
     let w = st.log_witness().expect("read back");
@@ -3775,7 +4379,6 @@ fn the_log_witness_round_trips_and_names_another_log_by_identity_or_head() {
         LogWitness {
             high: 500,
             id: None,
-            met: None,
         }
     );
     assert!(w.replaced_by(499, None) && w.replaced_by(499, Some(a)));
@@ -3783,7 +4386,6 @@ fn the_log_witness_round_trips_and_names_another_log_by_identity_or_head() {
     let with_id = LogWitness {
         high: 500,
         id: Some(a),
-        met: None,
     };
     st.set_log_witness(&with_id).expect("write");
     assert_eq!(st.log_witness(), Some(with_id));
@@ -3800,148 +4402,59 @@ fn the_log_witness_round_trips_and_names_another_log_by_identity_or_head() {
     );
     assert_eq!(
         LogWitness::parse("id=00ff high=7"),
-        Some(LogWitness {
-            high: 7,
-            id: None,
-            met: None
-        })
+        Some(LogWitness { high: 7, id: None })
     );
     assert_eq!(LogWitness::parse("high=+7"), None);
     assert_eq!(LogWitness::parse("id=00ff"), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **A WITNESS KEEPS WHERE THE NODE MET ITS LOG** ([`Met`]): `met=<log>@<head>` after the rest,
-/// read back as written; a witness without it (an older build's) reads with none, and one whose
-/// meeting does not read keeps the rest and names none, so a read back finds no floor there
-/// and the record is published again at its pin.
+/// **AN OLDER BUILD'S MEETING IS READ, NEVER WRITTEN** ([`LogWitness::older_meeting`],
+/// ATERM-KI-1114-1414's step S6): a witness renders as `id=<log> high=<n>` alone; one an older
+/// build wrote with `met=<log>@<head>` after the rest reads its id and high as written and names
+/// that meeting, and one whose meeting does not read keeps the rest and names none, as a witness
+/// that carries none.
 #[test]
-fn a_witness_keeps_where_the_node_met_its_log() {
+fn an_older_builds_witness_reads_its_meeting_and_this_build_writes_none() {
     let log = astream_broker::LogIdentity {
         id: [0xcc; 16],
         generation: 3,
     };
-    let met = Met { log, head: 41 };
     let witness = LogWitness {
         high: 57,
         id: Some(log),
-        met: Some(met),
     };
     let line = witness.render();
-    assert_eq!(line, format!("id={log} high=57 met={log}@41"));
+    assert_eq!(line, format!("id={log} high=57"));
     assert_eq!(LogWitness::parse(&line), Some(witness));
+    assert_eq!(LogWitness::older_meeting(&line), None, "this build's line");
+    let older = format!("id={log} high=57 met={log}@41");
+    assert_eq!(
+        LogWitness::parse(&older),
+        Some(witness),
+        "an older build's line"
+    );
+    assert_eq!(LogWitness::older_meeting(&older), Some((log, 41)));
     let dir = scratch("witness-met");
+    StateDir::open(&dir).expect("make the dir");
+    std::fs::write(dir.join("bus-log"), &older).expect("an older build's witness");
     let st = StateDir::open(&dir).expect("open");
-    st.set_log_witness(&witness).expect("write");
-    assert_eq!(
-        StateDir::open(&dir).expect("reopen").log_witness(),
-        Some(witness)
-    );
+    assert_eq!(st.log_witness(), Some(witness));
+    assert_eq!(st.older_meeting(), Some((log, 41)));
+    st.rebase_log_witness(&witness).expect("write");
+    let reopened = StateDir::open(&dir).expect("reopen");
+    assert_eq!(reopened.log_witness(), Some(witness));
+    assert_eq!(reopened.older_meeting(), None, "written again without it");
     let _ = std::fs::remove_dir_all(&dir);
-    let without = LogWitness {
-        met: None,
-        ..witness
-    };
-    assert_eq!(
-        LogWitness::parse(&format!("id={log} high=57")),
-        Some(without)
-    );
     for torn in [
         format!("id={log} high=57 met={log}@"),
         format!("id={log} high=57 met={log}41"),
         format!("id={log} high=57 met=00ff@41"),
         format!("id={log} high=57 met={log}@+41"),
     ] {
-        assert_eq!(LogWitness::parse(&torn), Some(without), "{torn}");
+        assert_eq!(LogWitness::parse(&torn), Some(witness), "{torn}");
+        assert_eq!(LogWitness::older_meeting(&torn), None, "{torn}");
     }
-}
-
-/// **THE NODE STANDS MET WHERE IT MET THE LOG'S LINE, BROUGHT DOWN BY EACH MOVE** ([`Met::after`]):
-/// the same log keeps the meeting; a move that continues it to a fork brings its head down to the
-/// fork and keeps the log it met, never up, and a proved step to another id ([`Proved`]) meets
-/// that id's line as far down; a log that continues none, and a node that stood met nowhere,
-/// meet the new log at the attach's head; a log with no identity meets none.
-#[test]
-fn the_node_stands_met_where_it_met_the_logs_line_brought_down_by_each_move() {
-    let log = |id: u8, generation| astream_broker::LogIdentity {
-        id: [id; 16],
-        generation,
-    };
-    let at = |l, head| Some(Met { log: l, head });
-    let met = at(log(1, 0), 30);
-    assert_eq!(
-        Met::after(met, Some(log(1, 0)), 80, None),
-        met,
-        "the same log"
-    );
-    assert_eq!(
-        Met::after(met, Some(log(1, 1)), 80, Some(Some(12))),
-        at(log(1, 0), 12),
-        "a move whose fork lies below the meeting"
-    );
-    assert_eq!(
-        Met::after(met, Some(log(1, 1)), 80, Some(Some(60))),
-        met,
-        "a move whose fork lies above it"
-    );
-    assert_eq!(
-        Met::after(met, Some(log(2, 0)), 80, Some(None)),
-        at(log(2, 0), 80),
-        "another log"
-    );
-    assert_eq!(
-        Met::after(met, Some(log(1, 1)), 80, Some(None)),
-        at(log(1, 1), 80),
-        "the same id continuing none"
-    );
-    assert_eq!(
-        Met::after(None, Some(log(1, 0)), 80, None),
-        at(log(1, 0), 80),
-        "met nowhere before"
-    );
-    assert_eq!(
-        Met::after(None, Some(log(1, 1)), 80, Some(Some(12))),
-        at(log(1, 1), 80),
-        "met nowhere before a move"
-    );
-    assert_eq!(Met::after(met, None, 80, None), None, "no identity");
-    assert_eq!(
-        Met::after(met, Some(log(2, 0)), 80, Some(Some(12))),
-        at(log(2, 0), 12),
-        "a proved step to another id, its fork below the meeting, meets that id's line"
-    );
-    assert_eq!(
-        Met::after(met, Some(log(2, 0)), 80, Some(Some(60))),
-        at(log(2, 0), 30),
-        "a proved step whose fork lies above the meeting keeps its head"
-    );
-}
-
-/// **A READ BACK ON A LOG THAT CONTINUES NONE STARTS WHERE THE NODE MET ITS LINE**
-/// ([`Met::floor`]): a head kept on another id, or on a generation of the met line older than
-/// the meeting, reads back from the meeting's head; one kept on the met generation or a later
-/// one (a generation since the meeting a lineage did not relate) reads back from nowhere, and
-/// so does any where the log read now is of another line.
-#[test]
-fn a_read_back_on_a_log_that_continues_none_starts_where_the_node_met_its_line() {
-    let log = |id: u8, generation| astream_broker::LogIdentity {
-        id: [id; 16],
-        generation,
-    };
-    let met = Met {
-        log: log(1, 2),
-        head: 40,
-    };
-    let now = log(1, 5);
-    assert_eq!(met.floor(log(9, 0), now), Some(40), "another id");
-    assert_eq!(met.floor(log(1, 1), now), Some(40), "before the meeting");
-    assert_eq!(met.floor(log(1, 2), now), None, "the met generation");
-    assert_eq!(met.floor(log(1, 4), now), None, "a generation since");
-    assert_eq!(
-        met.floor(log(9, 0), log(7, 0)),
-        None,
-        "another line read now"
-    );
 }
 
 #[test]
@@ -4736,7 +5249,6 @@ fn resume_through(
     let witness = LogWitness {
         high: c,
         id: Some(log(rg)),
-        met: None,
     };
     let keep_below = if rebase_at_head {
         None
@@ -4902,6 +5414,7 @@ fn in_flight_entry(seq: u64) -> InFlight {
         body: b"v=1 t=5 text=hello".to_vec(),
         log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
         at: None,
+        own_log: None,
     }
 }
 
@@ -7132,19 +7645,22 @@ fn in_flight_point_reads_preserve_reopen_removal_and_uncertain_journal_errors() 
     }
 }
 
-/// **THE TOLD SAMPLES KEEP THE NEWEST RECORD OF EACH SUBJECT ON ONE LOG** ([`ToldSamples`],
-/// ATERM-KI-1116-7314): a record is noted only above the one kept for its subject; another log
-/// starts them again; a move keeps those below its fork, now of the new log; past
-/// [`ToldSamples::MAX`] subjects the lowest offsets go; they round-trip through their text, a
-/// text any line of which does not read is none, as is every prefix a power cut can leave of
-/// one (NEGATIVE CONTROL: unsealed, a prefix that cut the last subject short read as a sample of
-/// that prefix), and the state dir keeps them.
+/// **THE TOLD SAMPLES KEEP EVERY RECORD TOLD ON ONE LOG, BY OFFSET** ([`ToldSamples`],
+/// ATERM-KI-1116-7314): a record is a row at its offset, an older one of its subject than a row
+/// before included; an offset noted is the record first noted; each subject's newest is an anchor
+/// ([`ToldSamples::anchors`]); another log starts them again; a move keeps the rows below its
+/// fork, now of the new log, a subject whose newest lies at or above it keeping its older rows;
+/// `told-samples` holds the anchors and `told-history` every row, and they round-trip through both
+/// texts; a text any line of which does not read is none, as is every prefix a power cut can leave
+/// of one (NEGATIVE CONTROL: unsealed, a prefix that cut the last subject short read as a sample
+/// of that prefix), each file sealed in a domain of its own; and the state dir keeps them.
 #[test]
-fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
+fn the_told_samples_keep_every_record_told_on_one_log() {
     let log = |id: u8, generation| astream_broker::LogIdentity {
         id: [id; 16],
         generation,
     };
+    let row = |raw: &[u8], subject: &str| (told_digest(raw), subject.to_string());
     let mut told = ToldSamples::default();
     assert!(told.note(log(1, 0), "/f/f/in/a", 5, b"one"), "the first");
     assert!(
@@ -7152,8 +7668,8 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
         "the same record again"
     );
     assert!(
-        !told.note(log(1, 0), "/f/f/in/a", 3, b"older"),
-        "an older record"
+        told.note(log(1, 0), "/f/f/in/a", 3, b"older"),
+        "an older record of the subject is a row too"
     );
     assert!(
         told.note(log(1, 0), "/f/f/in/a", 9, b"newer"),
@@ -7163,15 +7679,58 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
         told.note(log(1, 0), "/f/f/in/b", 2, b"b"),
         "another subject"
     );
+    assert!(
+        !told.note(log(1, 0), "/f/f/in/c", 9, b"other"),
+        "an offset noted is the record first noted there"
+    );
     assert_eq!(
-        told.rows.get("/f/f/in/a"),
-        Some(&(9, told_digest(b"newer")))
+        told.rows,
+        BTreeMap::from([
+            (2, row(b"b", "/f/f/in/b")),
+            (3, row(b"older", "/f/f/in/a")),
+            (5, row(b"one", "/f/f/in/a")),
+            (9, row(b"newer", "/f/f/in/a")),
+        ])
+    );
+    assert_eq!(
+        told.anchors(),
+        BTreeSet::from([2, 9]),
+        "each subject's newest"
     );
     assert_eq!(told.log, Some(log(1, 0)));
+    let anchors = ToldSamples {
+        rows: told
+            .rows
+            .iter()
+            .filter(|(off, _)| [2, 9].contains(*off))
+            .map(|(off, row)| (*off, row.clone()))
+            .collect(),
+        ..told.clone()
+    };
+    let text = told.render();
     assert_eq!(
-        ToldSamples::parse(&told.render()),
+        text.lines().skip(1).take(2).collect::<Vec<_>>(),
+        [
+            format!("9 {:016x} /f/f/in/a", told_digest(b"newer")),
+            format!("2 {:016x} /f/f/in/b", told_digest(b"b")),
+        ],
+        "told-samples names the anchors in subject order"
+    );
+    assert_eq!(
+        ToldSamples::parse(&text),
+        Some(anchors.clone()),
+        "told-samples holds the anchors"
+    );
+    let history = ToldSamples::parse_history(&told.render_history()).expect("the history reads");
+    assert_eq!(
+        history.rows.keys().copied().collect::<Vec<_>>(),
+        [2, 3, 5, 9],
+        "told-history every row, the anchors too, ascending"
+    );
+    assert_eq!(
+        anchors.union(&history),
         Some(told.clone()),
-        "round trip"
+        "round trip through both"
     );
     let dir = scratch("told-samples");
     let st = StateDir::open(&dir).expect("open");
@@ -7183,9 +7742,14 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
     moved.moved(Some(log(1, 0)), log(2, 0), 9);
     assert_eq!(moved.log, Some(log(2, 0)), "of the new log");
     assert_eq!(
-        moved.rows.keys().collect::<Vec<_>>(),
-        ["/f/f/in/b"],
-        "those below the fork"
+        moved.rows.keys().copied().collect::<Vec<_>>(),
+        [2, 3, 5],
+        "those below the fork, a subject whose newest lies at it keeping its older rows"
+    );
+    assert_eq!(
+        moved.anchors(),
+        BTreeSet::from([2, 5]),
+        "its newest below the fork its anchor now"
     );
     assert_eq!(
         moved.moved_from,
@@ -7193,7 +7757,9 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
         "still records of the log they were read on, below the fork"
     );
     assert_eq!(
-        ToldSamples::parse(&moved.render()),
+        ToldSamples::parse(&moved.render()).and_then(
+            |anchors| anchors.union(&ToldSamples::parse_history(&moved.render_history())?)
+        ),
         Some(moved.clone()),
         "round trip of moved samples"
     );
@@ -7213,7 +7779,7 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
     // seed 42): the rule before cleared them there.
     let mut lineage = told.clone();
     lineage.moved(Some(log(1, 0)), log(1, 1), 10);
-    assert_eq!(lineage.rows.len(), 2, "both below the fork");
+    assert_eq!(lineage.rows.len(), 4, "all below the fork");
     let mut again = lineage.clone();
     again.moved(Some(log(1, 0)), log(1, 1), 10);
     assert_eq!(again, lineage, "the same move met again keeps what it kept");
@@ -7221,7 +7787,7 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
     on.moved(Some(log(1, 0)), log(1, 2), 20);
     assert_eq!(
         (on.log, on.moved_from, on.rows.len()),
-        (Some(log(1, 2)), Some((log(1, 0), 10)), 2),
+        (Some(log(1, 2)), Some((log(1, 0), 10)), 4),
         "a later move from the same witness keeps them below both forks"
     );
     let mut lower = lineage.clone();
@@ -7229,34 +7795,27 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
     assert_eq!(
         (
             lower.moved_from,
-            lower.rows.keys().map(String::as_str).collect::<Vec<_>>()
+            lower.rows.keys().copied().collect::<Vec<_>>()
         ),
-        (Some((log(1, 0), 5)), vec!["/f/f/in/b"]),
+        (Some((log(1, 0), 5)), vec![2, 3]),
         "and a lower fork cuts them"
     );
     let mut from_here = lineage.clone();
     from_here.moved(Some(log(1, 1)), log(1, 2), 20);
     assert_eq!(
         (from_here.moved_from, from_here.rows.len()),
-        (Some((log(1, 1), 20)), 2),
+        (Some((log(1, 1), 20)), 4),
         "a move from the log they are of now names that log"
     );
 
     assert!(told.note(log(3, 0), "/f/f/in/c", 1, b"c"), "another log");
     assert_eq!(told.log, Some(log(3, 0)));
-    assert_eq!(told.rows.keys().collect::<Vec<_>>(), ["/f/f/in/c"]);
+    assert_eq!(told.rows, BTreeMap::from([(1, row(b"c", "/f/f/in/c"))]));
 
-    let mut many = ToldSamples::default();
-    for n in 0..=ToldSamples::MAX as u64 {
-        many.note(log(1, 0), &format!("/f/f/in/s{n}"), 100 + n, b"x");
-    }
-    assert_eq!(many.rows.len(), ToldSamples::MAX);
-    assert!(
-        !many.rows.contains_key("/f/f/in/s0"),
-        "the lowest offset dropped"
-    );
-
-    let text = told.render();
+    let mut two = ToldSamples::default();
+    two.note(log(1, 0), "/f/f/in/a", 3, b"older");
+    two.note(log(1, 0), "/f/f/in/a", 9, b"newer");
+    let text = two.render();
     let unsealed = text.rsplit_once('\n').expect("an end line").0;
     let cut = &unsealed[..unsealed.len() - 2];
     let lines = cut.lines().count();
@@ -7268,19 +7827,39 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
         lines - 1,
         "NEGATIVE CONTROL: the cut text's rows each read as a row"
     );
-    for len in 0..text.len() {
+    let history = two.render_history();
+    for (name, text, parse) in [
+        (
+            "samples",
+            &text,
+            ToldSamples::parse as fn(&str) -> Option<ToldSamples>,
+        ),
+        ("history", &history, ToldSamples::parse_history),
+    ] {
+        assert!(
+            parse(text).is_some(),
+            "{name}: PRECONDITION: whole, it reads"
+        );
+        for len in 0..text.len() {
+            assert_eq!(parse(&text[..len]), None, "{name}: a prefix of {len} bytes");
+        }
+        let mut flipped = text.clone().into_bytes();
+        flipped[10] ^= 1;
         assert_eq!(
-            ToldSamples::parse(&text[..len]),
+            parse(&String::from_utf8_lossy(&flipped)),
             None,
-            "a prefix of {len} bytes"
+            "{name}: other bytes"
         );
     }
-    let mut flipped = text.clone().into_bytes();
-    flipped[10] ^= 1;
     assert_eq!(
-        ToldSamples::parse(&String::from_utf8_lossy(&flipped)),
+        ToldSamples::parse(&history),
         None,
-        "other bytes"
+        "a history is no samples file"
+    );
+    assert_eq!(
+        ToldSamples::parse_history(&text),
+        None,
+        "nor a samples file a history"
     );
     let sealed = |body: &str| format!("{body}\nend {:016x}", ToldSamples::seal(body));
     let digest = format!("{:016x}", told_digest(b"x"));
@@ -7293,6 +7872,7 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
         "log=-\nx 0123456789abcdef /a".to_string(),
         format!("log=-\n5 {digest} /a extra"),
         format!("log=-\n5 {digest} /a\n6 {digest} /a"),
+        format!("log=-\n5 {digest} /a\n5 {digest} /b"),
     ] {
         assert_eq!(ToldSamples::parse(&sealed(&torn)), None, "{torn:?}");
     }
@@ -7306,9 +7886,9 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
         Some(ToldSamples {
             log: None,
             moved_from: None,
-            rows: [("/a".to_string(), (5, told_digest(b"x")))].into(),
+            rows: [(5, (told_digest(b"x"), "/a".to_string()))].into(),
         }),
-        "a sealed row"
+        "a sealed row, as every build before reads it"
     );
     for odd in [
         format!("log=-\nfrom=- 5\n5 {digest} /a"),
@@ -7317,7 +7897,697 @@ fn the_told_samples_keep_the_newest_record_of_each_subject_on_one_log() {
     ] {
         assert_eq!(ToldSamples::parse(&sealed(&odd)), None, "{odd:?}");
     }
+    let sealed = |body: &str| format!("{body}\nend {:016x}", ToldSamples::seal_history(body));
+    let on = format!("log={}", log(1, 0));
+    assert_eq!(
+        ToldSamples::parse_history(&sealed(&format!("{on}\n5 {digest} /a\n6 {digest} /a")))
+            .map(|h| h.rows.len()),
+        Some(2),
+        "a subject may repeat in a history"
+    );
+    for torn in [
+        format!("{on}\n5 {digest} /a\n5 {digest} /b"),
+        format!("{on}\n6 {digest} /a\n5 {digest} /a"),
+        format!("log=-\n5 {digest} /a"),
+        format!("{on}\n5 {digest}"),
+    ] {
+        assert_eq!(ToldSamples::parse_history(&sealed(&torn)), None, "{torn:?}");
+    }
+    assert_eq!(
+        ToldSamples::parse_history(&sealed("log=-")),
+        Some(ToldSamples::default()),
+        "a history of no log, with no row"
+    );
     assert_ne!(told_digest(b"a"), told_digest(b"b"), "other bytes");
+}
+
+/// **THE TOLD ROWS KEEP EACH SUBJECT'S NEWEST PAST THE ROW CAP** ([`ToldSamples::MAX_ROWS`],
+/// [`ToldSamples::anchors`], ATERM-KI-1116-7314): a quiet subject told once and a busy one told
+/// 300 times keep [`ToldSamples::MAX_ROWS`] rows, the quiet subject's among them, which
+/// `told-samples` (the file every build before reads) still names; and past
+/// [`ToldSamples::MAX_SUBJECTS`] subjects the rows hold the anchors of the subjects whose newest
+/// are highest and the newest `MAX_ROWS - MAX_SUBJECTS` records told, whatever their subjects.
+/// NEGATIVE CONTROL (`Mutant::ToldRowsEvictASubjectsNewest`,
+/// [`ToldSamples::note_evicting_anchors`]): the lowest row goes, an anchor included, and
+/// `told-samples` names the quiet subject no more, as every build before kept it.
+#[test]
+fn the_told_rows_keep_each_subjects_newest_past_the_row_cap() {
+    let on = astream_broker::LogIdentity {
+        id: [1; 16],
+        generation: 0,
+    };
+    for control in [false, true] {
+        let mut told = ToldSamples::default();
+        let mut note = |subject: &str, off: u64| {
+            if control {
+                told.note_evicting_anchors(on, subject, off, b"x")
+            } else {
+                told.note(on, subject, off, b"x")
+            }
+        };
+        assert!(note("/f/f/in/quiet", 1));
+        for off in 2..=301 {
+            note("/f/f/in/busy", off);
+        }
+        assert_eq!(told.rows.len(), ToldSamples::MAX_ROWS, "control={control}");
+        let named: Vec<String> = ToldSamples::parse(&told.render())
+            .expect("told-samples reads")
+            .rows
+            .into_values()
+            .map(|(_, subject)| subject)
+            .collect();
+        if control {
+            assert_eq!(
+                named,
+                ["/f/f/in/busy"],
+                "CONTROL: the quiet subject's one record evicted, told-samples names it no more"
+            );
+        } else {
+            assert_eq!(named, ["/f/f/in/quiet", "/f/f/in/busy"]);
+            assert_eq!(told.anchors(), BTreeSet::from([1, 301]));
+            assert_eq!(
+                told.rows.keys().copied().collect::<Vec<_>>(),
+                std::iter::once(1).chain(47..=301).collect::<Vec<_>>(),
+                "the busy subject's newest beside the quiet one's"
+            );
+        }
+    }
+    let mut many = ToldSamples::default();
+    for n in 1..=70 {
+        many.note(on, &format!("/f/f/in/s{n}"), n, b"x");
+    }
+    for off in 71..=370 {
+        many.note(on, "/f/f/in/busy", off, b"x");
+    }
+    assert_eq!(many.rows.len(), ToldSamples::MAX_ROWS);
+    let anchors = many.anchors();
+    assert_eq!(
+        anchors,
+        (8..=70).chain([370]).collect::<BTreeSet<u64>>(),
+        "the anchors of the subjects whose newest are highest"
+    );
+    let rest = (ToldSamples::MAX_ROWS - ToldSamples::MAX_SUBJECTS) as u64;
+    assert!(
+        (371 - rest..=370).all(|off| many.rows.contains_key(&off)),
+        "the newest {rest} records told"
+    );
+    assert!(
+        !(1..=7).any(|off| many.rows.contains_key(&off)),
+        "a subject past the anchors' count has none, its record the lowest"
+    );
+    assert_eq!(
+        ToldSamples::parse(&many.render()).map(|s| s.rows.len()),
+        Some(ToldSamples::MAX_SUBJECTS),
+        "told-samples names the anchors alone"
+    );
+}
+
+/// **A TOLD HISTORY OF ANOTHER LOG IS NEVER READ BESIDE THE SAMPLES** ([`StateDir::told_samples`],
+/// [`ToldSamples::union`], ATERM-KI-1116-7314): `told-history` holds a row of `L` below an anchor
+/// of the same subject; then a reset whose history write is refused (its best effort), a build
+/// before's lineage move of `told-samples` alone to a fork below that row, or a build before's
+/// note on another log, each writes `told-samples` under another header, the history left. Each
+/// reads as those samples alone. NEGATIVE CONTROL (`Mutant::ToldHistoryOfAnotherHeader`,
+/// [`StateDir::told_history_of_any_header`]): the history's row is read beside them, a record of
+/// `L` passing for one of a log that does not hold it.
+#[test]
+fn a_told_history_of_another_log_is_never_read_beside_the_samples() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let mut base = ToldSamples::default();
+    base.note(log(1, 0), "/f/f/in/a", 3, b"older");
+    base.note(log(1, 0), "/f/f/in/a", 9, b"newer");
+    for control in [false, true] {
+        for arm in ["reset", "moved", "another log"] {
+            let what = format!("{arm} control={control}");
+            let dir = scratch("told-header");
+            let st = StateDir::open(&dir).expect("open");
+            st.told_history_of_any_header(control);
+            st.set_told_samples(&base).unwrap();
+            assert_eq!(st.told_samples(), base, "{what}: PRECONDITION: both read");
+            let main = || {
+                MainToldSamples::parse(&st.read("told-samples").expect("told-samples"))
+                    .expect("a build before reads told-samples")
+            };
+            let expect = match arm {
+                "reset" => {
+                    st.refuse_writes_of(Some("told-history"));
+                    st.reset_told_samples()
+                        .expect("the samples' reset is the commit");
+                    st.refuse_writes_of(None);
+                    ToldSamples::default()
+                }
+                "moved" => {
+                    let mut main = main();
+                    main.moved(Some(log(1, 0)), log(1, 1), 2);
+                    st.write("told-samples", &main.render()).unwrap();
+                    ToldSamples {
+                        log: Some(log(1, 1)),
+                        moved_from: Some((log(1, 0), 2)),
+                        rows: BTreeMap::new(),
+                    }
+                }
+                _ => {
+                    let mut main = main();
+                    main.note(log(2, 0), "/f/f/in/b", 4, b"b");
+                    st.write("told-samples", &main.render()).unwrap();
+                    ToldSamples {
+                        log: Some(log(2, 0)),
+                        moved_from: None,
+                        rows: BTreeMap::from([(4, (told_digest(b"b"), "/f/f/in/b".to_string()))]),
+                    }
+                }
+            };
+            let read = st.told_samples();
+            if control {
+                assert!(
+                    read != expect && read.rows.contains_key(&3),
+                    "CONTROL {what}: the history's row of the log before read beside them: {read:?}"
+                );
+            } else {
+                assert_eq!(read, expect, "{what}: the samples alone");
+            }
+        }
+    }
+}
+
+/// **A TOLD HISTORY ONE MOVE AHEAD IS READ BELOW THAT MOVE'S CUT** ([`ToldSamples::union`],
+/// ATERM-KI-1116-7314): beside samples of `W`, a history whose move is from `W` gives its rows
+/// below the move's cut, under the samples' header, and none it noted on its own log since at or
+/// above it; beside samples a move from `A` took to `B`, a history whose move is from `A` gives its
+/// rows below the lower of the two cuts, `A`'s records below it being `B`'s; a history whose move
+/// is from another log, or beside samples of no log (a reset's), gives none, as does one whose row
+/// below the cut holds another record at an offset of theirs. NEGATIVE CONTROL
+/// (`Mutant::ToldHistoryOfTheMoveAheadUnread`, [`ToldSamples::union_of_the_same_header`]): the
+/// same header alone, so neither history one move ahead reads.
+#[test]
+fn a_told_history_one_move_ahead_is_read_below_that_moves_cut() {
+    let log = |id: u8| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation: 0,
+    };
+    let (w, n, a, b, c) = (log(1), log(2), log(3), log(4), log(5));
+    let row = |off: u64| {
+        (
+            off,
+            (told_digest(&off.to_be_bytes()), format!("/f/f/in/{off}")),
+        )
+    };
+    let of = |log, moved_from, offs: &[u64]| ToldSamples {
+        log: Some(log),
+        moved_from,
+        rows: offs.iter().map(|&off| row(off)).collect(),
+    };
+    let samples = of(w, None, &[9]);
+    let history = of(n, Some((w, 20)), &[3, 9, 21, 22]);
+    let moved_from = of(b, Some((a, 10)), &[2, 12]);
+    let ahead_of_moved = of(c, Some((a, 15)), &[2, 5, 7, 12, 14]);
+    for control in [false, true] {
+        let union = |s: &ToldSamples, h: &ToldSamples| {
+            if control {
+                s.union_of_the_same_header(h)
+            } else {
+                s.union(h)
+            }
+        };
+        let read = union(&samples, &history);
+        let read_moved = union(&moved_from, &ahead_of_moved);
+        if control {
+            assert_eq!(
+                (read, read_moved),
+                (None, None),
+                "CONTROL: a history one move ahead is not read"
+            );
+            continue;
+        }
+        assert_eq!(
+            read,
+            Some(of(w, None, &[3, 9])),
+            "below the move's cut, under the samples' header"
+        );
+        assert_eq!(
+            read_moved,
+            Some(of(b, Some((a, 10)), &[2, 5, 7, 12])),
+            "below the lower of the two cuts"
+        );
+        assert_eq!(
+            samples.union(&of(n, Some((a, 20)), &[3])),
+            None,
+            "a move from another log"
+        );
+        assert_eq!(
+            ToldSamples::default().union(&of(n, Some((w, 20)), &[3])),
+            None,
+            "beside a reset's samples"
+        );
+        let mut conflict = history.clone();
+        conflict
+            .rows
+            .insert(9, (told_digest(b"another"), "/f/f/in/9".to_string()));
+        assert_eq!(
+            samples.union(&conflict),
+            None,
+            "an offset of both holding another record in each"
+        );
+    }
+}
+
+/// **A REFUSED SECOND TOLD WRITE KEEPS EVERY ROW ON THE DISK** ([`StateDir::set_told_samples`],
+/// [`StateDir::told_samples`], [`ToldSamples::union`], ATERM-KI-1116-7314): rows of a log `W` are
+/// on the disk; a move to `N` with its fork at 20 is flushed, the second of its two writes is
+/// refused (a kill between the two renames leaves the same two files), and the state dir is
+/// opened again, as a bridge's next start reads it: the rows below the fork read beside the
+/// samples, under the samples' header, and the move met again keeps every row it kept. In arm
+/// `older` the row at 3 is a subject's older record below its newest at 9, a row that is no
+/// anchor before the move and after it; in arm `promoted` the subject's newest lies at 25, above
+/// the fork, so the move makes the row at 3 its anchor, which the samples on the disk do not
+/// name. In arm `twice` a second move, to `M` with its fork at 15, follows the first in the same
+/// bridge, its flush's second write refused too, before the state dir is opened again: an attach
+/// whose move flush is refused returns before `Bridge::note_log`, so the witness still names `W`
+/// and the second move is from `W` again, [`ToldSamples::moved`] keeping `W` with the lower cut,
+/// and the history two flushes ahead of the samples is still one move ahead of them, read below
+/// 15. NEGATIVE CONTROLS, each of which leaves the row at 3 on no file the read accepts:
+/// `Mutant::ToldHistoryOfTheMoveAheadUnread` ([`StateDir::told_history_of_the_same_header_only`]),
+/// the history of the move, one move ahead of the samples, unread (every arm);
+/// `Mutant::ToldHistoryWrittenLast` ([`StateDir::told_history_written_last`]), the samples of the
+/// move written first and the history refused, which leaves the history before the move, one
+/// move behind them, beside them (`older`, `twice`); and `Mutant::ToldHistoryWithoutTheAnchors`
+/// ([`StateDir::told_history_without_the_anchors`]), the history of the move without the row it
+/// made an anchor (`promoted`).
+#[test]
+fn a_refused_second_told_write_keeps_every_row_on_the_disk() {
+    let w = astream_broker::LogIdentity {
+        id: [1; 16],
+        generation: 0,
+    };
+    let n = astream_broker::LogIdentity {
+        id: [2; 16],
+        generation: 0,
+    };
+    let m = astream_broker::LogIdentity {
+        id: [3; 16],
+        generation: 0,
+    };
+    let older: &[(&str, u64)] = &[("/f/f/in/a", 3), ("/f/f/in/a", 9), ("/f/f/in/b", 1)];
+    let promoted: &[(&str, u64)] = &[("/f/f/in/a", 3), ("/f/f/in/a", 25)];
+    let once: &[(astream_broker::LogIdentity, u64)] = &[(n, 20)];
+    let twice: &[(astream_broker::LogIdentity, u64)] = &[(n, 20), (m, 15)];
+    for (arm, notes, moves, controls) in [
+        ("older", older, once, &["ahead unread", "written last"][..]),
+        (
+            "promoted",
+            promoted,
+            once,
+            &["ahead unread", "no anchors"][..],
+        ),
+        ("twice", older, twice, &["ahead unread", "written last"][..]),
+    ] {
+        let &(last, fork) = moves.last().expect("a move");
+        for control in std::iter::once(None).chain(controls.iter().copied().map(Some)) {
+            let what = format!("{arm} control={control:?}");
+            let dir = scratch("told-order");
+            let st = StateDir::open(&dir).expect("open");
+            let mut told = ToldSamples::default();
+            for &(subject, off) in notes {
+                told.note(w, subject, off, format!("{subject}@{off}").as_bytes());
+            }
+            st.set_told_samples(&told).unwrap();
+            assert_eq!(st.told_samples(), told, "{what}: PRECONDITION: both read");
+            let mut moved = told.clone();
+            for &(now, at) in moves {
+                moved.moved(Some(w), now, at);
+            }
+            assert_eq!(
+                moved.moved_from,
+                Some((w, fork)),
+                "{what}: PRECONDITION: each move from `W`, the lower cut kept"
+            );
+            assert!(
+                moved.rows.contains_key(&3),
+                "{what}: PRECONDITION: the move keeps the row at 3"
+            );
+            assert_eq!(
+                moved.anchors().contains(&3),
+                arm == "promoted",
+                "{what}: PRECONDITION: an anchor after the move in `promoted` alone"
+            );
+            st.told_history_without_the_anchors(control == Some("no anchors"));
+            st.told_history_written_last(control == Some("written last"));
+            let second = if control == Some("written last") {
+                "told-history"
+            } else {
+                "told-samples"
+            };
+            st.refuse_writes_of(Some(second));
+            let mut flushed = told.clone();
+            for &(now, at) in moves {
+                flushed.moved(Some(w), now, at);
+                assert!(
+                    st.set_told_samples(&flushed).is_err(),
+                    "{what}: the second write refused, so the flush is"
+                );
+            }
+            st.refuse_writes_of(None);
+            drop(st);
+            let st = StateDir::open(&dir).expect("open again");
+            st.told_history_of_the_same_header_only(control == Some("ahead unread"));
+            let read = st.told_samples();
+            let mut again = read.clone();
+            again.moved(Some(w), last, fork);
+            if control.is_some() {
+                assert!(
+                    !again.rows.contains_key(&3),
+                    "CONTROL {what}: the row at 3 on no file the read accepts: {again:?}"
+                );
+            } else {
+                assert_eq!(
+                    (read.log, read.moved_from),
+                    (Some(w), None),
+                    "{what}: under the samples' header"
+                );
+                assert!(read.rows.contains_key(&3), "{what}: the row at 3 read");
+                assert_eq!(
+                    again, moved,
+                    "{what}: the move met again keeps every row it kept"
+                );
+            }
+        }
+    }
+}
+
+/// What main at e567e4d28d4 keeps of the records told aterm: its `ToldSamples` (state.rs
+/// 438–596), copied, which reads and writes `told-samples` alone, a subject's newest record each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MainToldSamples {
+    /// The log the samples are records of now.
+    log: Option<astream_broker::LogIdentity>,
+    /// Where a lineage move took the samples to `log` ([`ToldSamples::moved`]): the log they
+    /// were read on and the fork below which the move continues it, so each is a record of that
+    /// log as well. `None` for samples read on `log`. An attach refused after the move leaves its
+    /// witness on that log, and the next attach proves from them as from that log's own.
+    moved_from: Option<(astream_broker::LogIdentity, u64)>,
+    /// For each subject, the newest record of it told: its offset and digest.
+    rows: BTreeMap<String, (u64, u64)>,
+}
+
+impl MainToldSamples {
+    /// At most this many subjects are kept, the lowest offsets dropped first.
+    const MAX: usize = 64;
+
+    /// The text this is stored as: `log=<id>`, then `from=<id> <fork>` where a move took them
+    /// ([`ToldSamples::moved_from`]), then `<off> <digest> <subject>` per subject, then
+    /// `end <seal>` ([`ToldSamples::seal`] of the text before it). The file is written
+    /// undurably, so a power cut can leave any prefix of it, or other bytes: the seal makes each
+    /// read as none.
+    #[must_use]
+    fn render(&self) -> String {
+        let mut out = match self.log {
+            Some(log) => format!("log={log}"),
+            None => "log=-".to_string(),
+        };
+        if let Some((from, fork)) = self.moved_from {
+            out.push_str(&format!("\nfrom={from} {fork}"));
+        }
+        for (subject, (off, digest)) in &self.rows {
+            out.push_str(&format!("\n{off} {digest:016x} {subject}"));
+        }
+        let seal = Self::seal(&out);
+        out.push_str(&format!("\nend {seal:016x}"));
+        out
+    }
+
+    /// The seal of the text above a samples file's `end` line: the first eight bytes of its
+    /// SHA-256.
+    fn seal(body: &str) -> u64 {
+        let mut hash = aterm_digest::Sha256::new();
+        hash.update(b"aterm-link-told-samples-v1\0");
+        hash.update(body.as_bytes());
+        let digest = hash.finalize();
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&digest[..8]);
+        u64::from_be_bytes(first)
+    }
+
+    /// Parse one back: `None` for a text with no `end` line sealing what is above it, or any of
+    /// whose lines does not read, which proves nothing.
+    #[must_use]
+    fn parse(text: &str) -> Option<Self> {
+        let (body, end) = text.trim_end_matches('\n').rsplit_once('\n')?;
+        let seal = end.strip_prefix("end ").filter(|s| s.len() == 16)?;
+        if u64::from_str_radix(seal, 16).ok()? != Self::seal(body) {
+            return None;
+        }
+        let mut lines = body.lines().peekable();
+        let log = match lines.next()?.strip_prefix("log=")? {
+            "-" => None,
+            id => Some(astream_broker::LogIdentity::parse(id)?),
+        };
+        let moved_from = match lines.peek().copied().and_then(|l| l.strip_prefix("from=")) {
+            Some(from) => {
+                let (id, fork) = from.split_once(' ')?;
+                lines.next();
+                Some((
+                    astream_broker::LogIdentity::parse(id)?,
+                    crate::parse_uint(fork)?,
+                ))
+            }
+            None => None,
+        };
+        let mut rows = BTreeMap::new();
+        for line in lines {
+            let mut toks = line.split_whitespace();
+            let off = crate::parse_uint(toks.next()?)?;
+            let digest = toks.next().filter(|d| d.len() == 16)?;
+            let digest = u64::from_str_radix(digest, 16).ok()?;
+            let subject = toks.next()?;
+            if toks.next().is_some() || rows.insert(subject.to_string(), (off, digest)).is_some() {
+                return None;
+            }
+        }
+        Some(Self {
+            log,
+            moved_from,
+            rows,
+        })
+    }
+
+    /// Note the record at `off` of `subject` on `log`, whose raw body is `raw`, as told: whether
+    /// the samples changed. Samples of another log are dropped first.
+    fn note(
+        &mut self,
+        log: astream_broker::LogIdentity,
+        subject: &str,
+        off: u64,
+        raw: &[u8],
+    ) -> bool {
+        let mut changed = false;
+        if self.log != Some(log) {
+            *self = Self {
+                log: Some(log),
+                ..Self::default()
+            };
+            changed = true;
+        }
+        if self.rows.get(subject).is_some_and(|&(have, _)| have >= off) {
+            return changed;
+        }
+        self.rows
+            .insert(subject.to_string(), (off, told_digest(raw)));
+        while self.rows.len() > Self::MAX {
+            let lowest = self
+                .rows
+                .iter()
+                .min_by_key(|(_, (off, _))| *off)
+                .map(|(subject, _)| subject.clone());
+            if let Some(subject) = lowest {
+                self.rows.remove(&subject);
+            }
+        }
+        true
+    }
+
+    /// The samples a move from `was` to `now` that continues it below `fork` keeps: those below
+    /// it, now of `now` and still of `was` ([`ToldSamples::moved_from`]), where they are records
+    /// of `was`, read on it or taken from it by a move before (an attach refused after that move
+    /// left its witness on `was`, and this one meets the move again, or the next one on), and
+    /// then below that move's fork as well; none where they are another log's (a file a refused
+    /// or lost write left), whose records the move says nothing of.
+    fn moved(
+        &mut self,
+        was: Option<astream_broker::LogIdentity>,
+        now: astream_broker::LogIdentity,
+        fork: u64,
+    ) {
+        let Some(was) = was.filter(|was| {
+            self.log == Some(*was) || self.moved_from.is_some_and(|(from, _)| from == *was)
+        }) else {
+            *self = Self {
+                log: Some(now),
+                ..Self::default()
+            };
+            return;
+        };
+        let cut = match self.moved_from {
+            Some((from, cut)) if from == was && self.log != Some(was) => fork.min(cut),
+            _ => fork,
+        };
+        self.rows.retain(|_, (off, _)| *off < cut);
+        self.moved_from = Some((was, cut));
+        self.log = Some(now);
+    }
+}
+
+/// **THIS BUILD'S TOLD SAMPLES READ ON MAIN AS EXACTLY THEIR ANCHORS** (compatibility C1,
+/// ATERM-KI-1116-7314): rows of 70 subjects, ten with an older row each, render a `told-samples`
+/// that main ([`MainToldSamples`], copied) reads as each anchor's subject, offset and digest and
+/// nothing else, and writes back byte for byte; after a move, main reads at least its own evidence
+/// (its own move of its read keeps a subset, each subject's newest below the cut where it kept the
+/// subject). A note main makes on what it read renders a file this build reads as main's rows.
+#[test]
+fn this_builds_told_samples_read_on_main_as_exactly_their_anchors() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let mut told = ToldSamples::default();
+    for n in 0..80u64 {
+        told.note(
+            log(1, 0),
+            &format!("/f/f/in/s{}", n % 70),
+            10 + n,
+            format!("r{n}").as_bytes(),
+        );
+    }
+    assert_eq!(told.rows.len(), 80, "PRECONDITION: under the row cap");
+    let anchors: BTreeMap<String, (u64, u64)> = told
+        .anchors()
+        .into_iter()
+        .map(|off| {
+            let (digest, subject) = told.rows[&off].clone();
+            (subject, (off, digest))
+        })
+        .collect();
+    assert_eq!(anchors.len(), ToldSamples::MAX_SUBJECTS);
+    let text = told.render();
+    let main = MainToldSamples::parse(&text).expect("main reads this build's told-samples");
+    assert_eq!(
+        (main.log, main.moved_from, &main.rows),
+        (told.log, told.moved_from, &anchors),
+        "exactly the anchors"
+    );
+    assert_eq!(main.render(), text, "and writes them back byte for byte");
+
+    let mut moved = told.clone();
+    moved.moved(Some(log(1, 0)), log(1, 1), 75);
+    let read = MainToldSamples::parse(&moved.render()).expect("main reads the moved samples");
+    let mut mains = main.clone();
+    mains.moved(Some(log(1, 0)), log(1, 1), 75);
+    assert_eq!((read.log, read.moved_from), (mains.log, mains.moved_from));
+    assert!(
+        mains
+            .rows
+            .iter()
+            .all(|(subject, row)| read.rows.get(subject) == Some(row)),
+        "main reads at least what its own move keeps"
+    );
+    assert!(
+        read.rows.len() > mains.rows.len(),
+        "and more: each subject's newest row below the cut"
+    );
+
+    let mut noted = main;
+    assert!(noted.note(log(1, 0), "/f/f/in/new", 200, b"new"));
+    let back = ToldSamples::parse(&noted.render()).expect("this build reads main's file");
+    assert_eq!(
+        back.rows,
+        noted
+            .rows
+            .iter()
+            .map(|(subject, (off, digest))| (*off, (*digest, subject.clone())))
+            .collect::<BTreeMap<_, _>>(),
+        "as main's rows, by offset"
+    );
+}
+
+/// **A TOLD SAMPLES FILE MAIN WROTE READS AS ITS ROWS, WITH OR WITHOUT A STALE HISTORY**
+/// (compatibility C2, ATERM-KI-1116-7314): a `told-samples` file exactly as main writes it (the
+/// literal bytes) reads as its rows by offset; beside a history this build left under the same
+/// header (main kept noting on that log), as those rows and the history's; beside one of the same
+/// header one of whose offsets holds another record, as main's rows alone; and once this build
+/// writes, main reads `told-samples` as its own.
+#[test]
+fn a_told_samples_file_main_wrote_reads_as_its_rows_with_or_without_a_stale_history() {
+    let on = astream_broker::LogIdentity {
+        id: [1; 16],
+        generation: 0,
+    };
+    let literal = "log=01010101010101010101010101010101.0\n\
+                   9 b098cd9f64cf18a7 /f/f/in/a\n\
+                   4 25d27c879a8227b7 /f/f/in/b\n\
+                   end bb07a74b11229814";
+    let mut mains = MainToldSamples::default();
+    mains.note(on, "/f/f/in/a", 9, b"newer");
+    mains.note(on, "/f/f/in/b", 4, b"b");
+    assert_eq!(
+        mains.render(),
+        literal,
+        "PRECONDITION: main writes these bytes"
+    );
+    let rows = BTreeMap::from([
+        (4, (told_digest(b"b"), "/f/f/in/b".to_string())),
+        (9, (told_digest(b"newer"), "/f/f/in/a".to_string())),
+    ]);
+    let alone = ToldSamples {
+        log: Some(on),
+        moved_from: None,
+        rows: rows.clone(),
+    };
+    let mut older = ToldSamples::default();
+    older.note(on, "/f/f/in/a", 3, b"older");
+    older.note(on, "/f/f/in/a", 9, b"newer");
+    let mut other = ToldSamples::default();
+    other.note(on, "/f/f/in/c", 4, b"another record");
+    other.note(on, "/f/f/in/c", 11, b"c");
+    for (arm, history, expect) in [
+        ("no history", None, alone.clone()),
+        ("a stale history of the header", Some(&older), {
+            let mut both = alone.clone();
+            both.rows
+                .insert(3, (told_digest(b"older"), "/f/f/in/a".to_string()));
+            both
+        }),
+        (
+            "a history whose offset holds another record",
+            Some(&other),
+            alone.clone(),
+        ),
+    ] {
+        let dir = scratch("told-main");
+        let st = StateDir::open(&dir).expect("open");
+        if let Some(history) = history {
+            st.write("told-history", &history.render_history()).unwrap();
+        }
+        st.write("told-samples", literal).unwrap();
+        let read = st.told_samples();
+        assert_eq!(read, expect, "{arm}");
+        let mut noted = read.clone();
+        noted.note(on, "/f/f/in/a", 12, b"newest");
+        st.set_told_samples(&noted).unwrap();
+        let main = MainToldSamples::parse(&st.read("told-samples").unwrap())
+            .expect("main reads this build's write");
+        assert_eq!(
+            main.rows.get("/f/f/in/a"),
+            Some(&(12, told_digest(b"newest"))),
+            "{arm}: as its own"
+        );
+        assert_eq!(
+            st.told_samples(),
+            noted,
+            "{arm}: and this build reads both back"
+        );
+    }
 }
 
 /// **A PROVED STEP SAYS WHERE A HEAD KEPT ON THE LOG BEFORE CONTINUES** ([`Proved::continues`],
@@ -7491,7 +8761,7 @@ fn a_proved_step_says_where_a_head_kept_on_the_log_before_continues() {
 /// log the entry names). NEGATIVE CONTROLS: `StateDir::heads_to_a_proved_fork` (the seam
 /// `Mutant::ProvedHeadToTheFork` sets) brings each down to the fork, as on a move astream's
 /// lineage names; `StateDir::proved_keyed_heads_at_the_attach` (the seam
-/// `Mutant::ProvedKeyedHeadAtTheMeeting` sets) takes a keyed pin to the head the attach read and a
+/// `Mutant::ProvedOwnHeadAtTheAttach` sets) takes a keyed pin to the head the attach read and a
 /// keyed reply anywhere, as every build before the own head took them;
 /// `StateDir::plain_from_heads_own` (the seam `Mutant::PlainFromHeadReadAsOwn` sets) keeps a
 /// keyed plain head as an own head, as the own head's second cut read every keyed `From`;
@@ -7551,6 +8821,7 @@ fn a_head_above_a_proved_fork_reads_as_on_a_log_that_continues_none() {
         body: format!("v=1 t=1 re={re}").into_bytes(),
         log: Some(was),
         at: Some(at),
+        own_log: None,
     };
     let rules = [
         Rule::Proved,

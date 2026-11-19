@@ -183,17 +183,19 @@ fn real_enrollment_and_binding_refine_the_custody_model() {
     let model = aterm_models_harness::recipient_custody_model();
     aterm_spec::interp::prove_and_catch(&model);
     let mut evidence = aterm_spec::xref::StepEvidence::new("RecipientCustody");
+    // A step reads none of the four outputs and sets each ([`reset_outputs`]), so the states apart
+    // only in those take one real step, and each is held to the model with its result.
+    let mut steps = std::collections::BTreeMap::new();
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                let mut inputs = state.clone();
+                reset_outputs(&mut inputs);
+                let next = steps.entry((inputs, action.name)).or_insert_with(|| {
+                    transition_recorded(&state, action.name, Some(&mut evidence))
+                });
                 assert!(
-                    model
-                        .successors(action.name, &state)
-                        .contains(&transition_recorded(
-                            &state,
-                            action.name,
-                            Some(&mut evidence)
-                        )),
+                    model.successors(action.name, &state).contains(next),
                     "{}: {state:?}",
                     action.name
                 );

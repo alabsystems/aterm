@@ -829,6 +829,71 @@ fn an_elevation_is_its_sudo_once_and_its_root_half_once_and_the_watch_is_neither
     );
 }
 
+#[test]
+fn only_one_live_shared_elevation_can_account_for_unanswered_root_steps() {
+    let pending = Elevations {
+        asks: vec![(1001, 812)],
+        root_runs: Vec::new(),
+    };
+    assert_eq!(pending.pending_password_pid(true, 1), Some(812));
+    assert_eq!(pending.pending_password_pid(false, 1), None);
+    assert_eq!(pending.pending_password_pid(true, 0), None);
+    assert_eq!(pending.pending_password_pid(true, 2), None);
+    let ran = Elevations {
+        asks: pending.asks.clone(),
+        root_runs: vec![(1002, 814)],
+    };
+    assert_eq!(ran.pending_password_pid(true, 1), None);
+    let repeated = Elevations {
+        asks: vec![(1001, 812), (1003, 816)],
+        root_runs: Vec::new(),
+    };
+    assert_eq!(repeated.pending_password_pid(true, 1), None);
+
+    let aterm = "/Applications/aterm.app/Contents/MacOS/aterm";
+    let sudo = format!("/usr/bin/sudo -k -p Mac password:  {aterm} machines here apply --plain");
+    assert!(setup_password_command(&sudo, aterm));
+    assert!(setup_password_command(
+        &format!("{sudo} --root-steps-only"),
+        aterm
+    ));
+    for command in [
+        format!("{sudo} --name-rule-only"),
+        format!("{sudo}text"),
+        sudo.replace(aterm, "/usr/local/bin/aterm"),
+        "/usr/bin/sudo -n /usr/bin/true".into(),
+        String::new(),
+    ] {
+        assert!(!setup_password_command(&command, aterm), "{command}");
+    }
+
+    assert!(mac_setup_prompt::shown(
+        "aterm is finishing the part of this Mac's setup\nonly an administrator can do.\nMac password:\n"
+    ));
+    assert!(!mac_setup_prompt::shown("% tail some-log\nMac password:\n"));
+    assert!(!mac_setup_prompt::shown(
+        "aterm is finishing the part of this Mac's setup\nMac password:\n%\n"
+    ));
+}
+
+#[test]
+fn nux_only_labels_current_setup_done_as_completion() {
+    let (done_label, done_frame, done_reason) = setup_end_labels(SetupEnd::Done);
+    assert_eq!(done_label, "setup done");
+    assert_eq!(done_frame, "setup-done");
+    assert!(done_reason.ends_with("setup=done"));
+    for end in [
+        SetupEnd::ReadBack,
+        SetupEnd::VaultOffLan,
+        SetupEnd::RecordCompleted,
+    ] {
+        let (label, frame, reason) = setup_end_labels(end);
+        assert_ne!(label, done_label);
+        assert_ne!(frame, done_frame);
+        assert!(!reason.contains("setup=done"));
+    }
+}
+
 /// The LAN broker is a root aterm too: it is never a root half or an ask, by its argv in the
 /// watch and by launchd's count of its ended processes in process accounting.
 #[test]

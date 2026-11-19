@@ -157,7 +157,9 @@ fn a_write_after_the_store_is_removed_and_taken_again_reaches_only_the_removed_d
             journal
                 .write(&cursor_step(1), Flush::Ordered, None)
                 .unwrap();
-            first.for_log(Some(log(1)), None).unwrap();
+            first
+                .for_log(Some(log(1)), None, &Steps::default())
+                .unwrap();
             first.access.0.check().unwrap();
             let removed = world.path().join("removed");
             std::fs::rename(&first.root, &removed).unwrap();
@@ -177,7 +179,9 @@ fn a_write_after_the_store_is_removed_and_taken_again_reaches_only_the_removed_d
                 Late::Append => first
                     .load()
                     .and_then(|mut again| again.write(&cursor_step(3), Flush::Ordered, None)),
-                Late::LogStore => first.for_log(Some(log(2)), None).map(drop),
+                Late::LogStore => first
+                    .for_log(Some(log(2)), None, &Steps::default())
+                    .map(drop),
             };
             directory::BY_PATH.with(|by| by.set(false));
             wrote.unwrap();

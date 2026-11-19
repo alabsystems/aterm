@@ -197,14 +197,24 @@ fn node(byte: u8) -> NodeIdentity {
     NodeIdentity::from_seed(&format!("{byte:02x}").repeat(16), &[byte; 32]).unwrap()
 }
 
-/// Two database endpoints meet on the newest database protocol both offer: version 8 is this
-/// build (`atdb/8`, range-reconciled control, membership and table inventories), 7 the build
-/// before it (`atdb/7`, range-reconciled table inventories), 6 the duplex build before that, 5 is
+/// Two database endpoints meet on the newest database protocol both offer: version 9 is this
+/// build (`atdb/9`, range-reconciled conflict proofs as well), 8 the build before it (`atdb/8`,
+/// range-reconciled control, membership and table operation inventories), 7 the build before
+/// that (`atdb/7`, range-reconciled table operation inventories), 6 the duplex build, 5 is
 /// delta-frontier repair, 4 is 0.153 (`atdb/4`), 3 and 2 the builds
 /// before it, and 1 a fleet endpoint that offers no database protocol.
 #[test]
 fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() {
     for (listener_version, dialer_version, expected) in [
+        (9, 9, ALPN_DATABASE_PROOFS),
+        (9, 8, ALPN_DATABASE_RANGES),
+        (8, 9, ALPN_DATABASE_RANGES),
+        (9, 7, ALPN_DATABASE_RECONCILE),
+        (7, 9, ALPN_DATABASE_RECONCILE),
+        (9, 6, ALPN_DATABASE_DUPLEX),
+        (6, 9, ALPN_DATABASE_DUPLEX),
+        (9, 1, ALPN_NODES),
+        (1, 9, ALPN_NODES),
         (8, 8, ALPN_DATABASE_RANGES),
         (8, 7, ALPN_DATABASE_RECONCILE),
         (7, 8, ALPN_DATABASE_RECONCILE),
@@ -265,7 +275,7 @@ fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() 
         let (listened, dialed) = over_loopback(
             move |tcp| {
                 let me = node(1);
-                let mut accepted = if listener_version == 8 {
+                let mut accepted = if listener_version == 9 {
                     server_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
                 } else if listener_version >= 2 {
                     let mut config = (*database_server_config()).clone();
@@ -310,7 +320,7 @@ fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() 
             },
             move |tcp| {
                 let me = node(2);
-                let mut dialed = if dialer_version == 8 {
+                let mut dialed = if dialer_version == 9 {
                     client_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
                 } else if dialer_version >= 2 {
                     let mut config = (*database_client_config()).clone();

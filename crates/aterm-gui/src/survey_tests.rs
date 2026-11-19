@@ -1400,6 +1400,7 @@ fn codex_survey() -> CodexSurvey {
             cwd: Some("/private/tmp/codex-work".into()),
             tok_in: None,
             tok_out: None,
+            tok_at_ms: None,
         },
         branch: Some("feat/parser".into()),
         task: None,
@@ -1706,6 +1707,7 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
         usage_7d_pct: None,
         week_reset: None,
         walled_until: None,
+        model_walls: std::collections::BTreeMap::new(),
         last_used: None,
         read_at: None,
         launch: None,
@@ -2237,6 +2239,7 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
             usage_7d_pct: Some(50),
             week_reset: Some(1_793_500_000),
             walled_until: None,
+            model_walls: std::collections::BTreeMap::new(),
             last_used: Some(1_793_159_000),
             read_at: None,
             launch: None,
@@ -2929,8 +2932,7 @@ fn a_holder_query_adds_a_counted_kernel_judgement_of_exactly_that_identity() {
         [Some(false)]
     );
     assert!(judged("facts", &me).is_empty());
-    // The word that names the session that asked changes no answer, wherever it stands: a tab
-    // ID, or the ID a legacy tab's shell still holds.
+    // The word that names the session that asked changes no answer, wherever it stands.
     let by = "by=t0123456789";
     let legacy = "by=s-0123456789abcdef0123";
     // The header's clock (`at_ms=`) moves between two asks; nothing else may.
@@ -2953,7 +2955,6 @@ fn a_holder_query_adds_a_counted_kernel_judgement_of_exactly_that_identity() {
     };
     assert_eq!(plain(&format!("facts {by}")), plain("facts"));
     assert_eq!(plain(by), plain(""));
-    assert_eq!(plain(legacy), plain(""));
     assert_eq!(
         judged(&format!("{by} facts {}", me.arg()), &me),
         [Some(true)]
@@ -2965,6 +2966,7 @@ fn a_holder_query_adds_a_counted_kernel_judgement_of_exactly_that_identity() {
         format!("{} everything", me.arg()),
         format!("{by} {by}"),
         format!("{by} {legacy}"),
+        legacy.to_owned(),
         "by=someone".to_owned(),
         "by=".to_owned(),
         // The loose `s-` forms name no session: any hex, upper case, another length.
@@ -3988,4 +3990,162 @@ fn a_rows_upgrade_word_is_the_one_status_prints() {
     // A host that sends none leaves the word: the kept row is the top rule's, not a pending one.
     assert!(claude.ctx.timeline.lock().unwrap().set_upgrade(None));
     assert_eq!(word_at(SurveyLevel::Facts), "-", "cleared");
+}
+
+/// A Mac whose release-line registry keeps 200 dead records whose leases lapsed and 200 dead
+/// records still leased, beside one live holder, answers a survey within the fleet's reply bound
+/// that keeps its account, repository and session rows and the live holder's row.
+/// NEGATIVE CONTROL: the same records surveyed whole, a row each as the previous reader sent
+/// them, leave the reply no room for its account and repository rows.
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[test]
+fn a_survey_keeps_its_rows_beside_hundreds_of_dead_release_lines() {
+    use aterm_agent::harness::repo_work::home::{HomeRepo, HomeRepos};
+    use aterm_agent::release_progress::{DIRECTORY, identity, survey};
+    use aterm_agent::survey_facts::{SurveyAccountFact, SwarmSurveyFacts};
+    const NOW: u64 = 2_000_000_000;
+    const LEASE: u64 = aterm_ctl::release_holder::MAX_LEASE_S;
+    let max = aterm_net::fleet::REPLY_MAX;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let registry = dir.path().join(DIRECTORY);
+    std::fs::create_dir(&registry).unwrap();
+    let pid = std::process::id();
+    let (boot, start) = identity(pid).unwrap();
+    // A record of the shape a cutter keeps (`line_claim::keep_local`), about 860 bytes a row.
+    let record = |start: u64, at: u64| {
+        aterm_json::json!({
+            "line": {"version": "0.206.0", "base": "01885734e5983b8e4e1d33f6b2f0c0ad1e2c4b5a",
+                "started": 1_999_990_000_u64,
+                "hops": [{"commit": "7c8bec6fa5f0e1d2c3b4a5968778695a4b3c2d1e",
+                    "carries": "e2b5aa2f2d2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c",
+                    "why": "fix(release): the carried fix's subject, of an ordinary length",
+                    "paths": ["crates/aterm-release/src/line_claim.rs",
+                        "crates/aterm-agent/src/release_progress.rs",
+                        "crates/aterm-release/src/line_claim_tests.rs"]}]},
+            "holder": {"node": "0123456789abcdef0123456789abcdef", "host": "m3",
+                "sid": "s-0123456789abcdef0123", "pid": pid, "boot": boot, "start": start},
+            "step": "verify", "boundary": "verify — test-binary-finished aterm-gui ok",
+            "at": at, "p95_s": 1800,
+            "evidence": "a completed row: test-binary-finished aterm-agent ok in 412s",
+            "rows": []
+        })
+    };
+    let mut whole = Vec::new();
+    let mut keep = |name: String, record: aterm_json::Value, at: u64, alive: &str| {
+        let path = registry.join(name);
+        std::fs::write(&path, record.to_string()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at))
+            .unwrap();
+        whole.push(format!(
+            "release_line alive={alive} data={}",
+            aterm_codec::pct::encode(&record.to_string())
+        ));
+    };
+    keep("live.json".into(), record(start, NOW - 60), NOW - 60, "1");
+    for n in 0..200 {
+        let lapsed = NOW - LEASE - 1 - n;
+        keep(
+            format!("lapsed-{n}.json"),
+            record(start + 1 + n, lapsed),
+            lapsed,
+            "0",
+        );
+        let leased = NOW - 60 - n;
+        keep(
+            format!("leased-{n}.json"),
+            record(start + 1000 + n, leased),
+            leased,
+            "0",
+        );
+    }
+    let whole_bytes: usize = whole.iter().map(|row| row.len() + 1).sum();
+    assert!(
+        whole_bytes > max,
+        "PRECONDITION: the whole rows overflow ({whole_bytes})"
+    );
+    let store = crate::session_store::new_store();
+    store
+        .write()
+        .unwrap()
+        .register(crate::session_store::test_handle(3));
+    let facts = |operation_lines: Vec<String>| SwarmSurveyFacts {
+        version: "0.206.0".to_owned(),
+        operation_lines,
+        home: Some("/Users//a".to_owned()),
+        home_dir: None,
+        home_free_mb: Some(812_345),
+        home_total_mb: None,
+        home_build: None,
+        store_worst: None,
+        machine: None,
+        repos: Some(HomeRepos {
+            read_ms: 1_793_159_000_000,
+            repos: vec![HomeRepo {
+                name: "trust".to_owned(),
+                path: "/Users//a/trust".into(),
+                head: Some("e23254f84a67131e6cad7724c7f749073b190dd2".to_owned()),
+                branch: Some("main".to_owned()),
+                main_ref: Some("origin/main".to_owned()),
+                behind: Some(2),
+                fetched_ms: Some(1_793_150_000_000),
+                dirty: Some(false),
+            }],
+            cut: 0,
+        }),
+        node: None,
+        label: None,
+        roster_unread: false,
+        window: true,
+        window_last: None,
+        sessions: 1,
+        ssh_host_key: None,
+        accounts: vec![SurveyAccountFact {
+            pool: "claude".to_owned(),
+            id: "c01".to_owned(),
+            email: None,
+            condition: "usable".to_owned(),
+            enrolled: true,
+            usage_5h_pct: Some(25),
+            usage_7d_pct: Some(50),
+            week_reset: None,
+            walled_until: None,
+            model_walls: std::collections::BTreeMap::new(),
+            last_used: None,
+            read_at: None,
+            launch: None,
+            token: None,
+        }],
+        accounts_unread: Vec::new(),
+        session_accounts: std::collections::BTreeMap::new(),
+        moves: None,
+        server_heard: Vec::new(),
+        update: None,
+    };
+    let reply_of = |lines: Vec<String>| {
+        let here = Here {
+            facts: Some(facts(lines)),
+            ..here()
+        };
+        survey_rows(&store, SurveyLevel::Content, max, &here)
+    };
+    let reply = reply_of(survey(dir.path(), NOW));
+    assert!(reply.len() <= max, "{}", reply.len());
+    for row in [
+        "\naccount pool=claude id=c01 ",
+        "\nrepo name=trust ",
+        "\nsession local=3 ",
+        "\nrelease_line alive=1 ",
+    ] {
+        assert!(reply.contains(row), "{row:?} in {} bytes", reply.len());
+    }
+    let old = reply_of(whole);
+    assert!(old.len() <= max);
+    assert!(
+        !old.contains("\naccount ") && !old.contains("\nrepo "),
+        "NEGATIVE CONTROL: the whole rows crowd out the account and repository rows"
+    );
 }

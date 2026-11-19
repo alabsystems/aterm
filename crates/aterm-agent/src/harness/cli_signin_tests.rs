@@ -6,8 +6,10 @@
 //! transcript), a Codex row by its native loopback PKCE sign-in, and the machine's one sign-in at
 //! a time.
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+// The tests gated `cfg(unix)` here reach what aterm has only on Unix: a file mode, a symbolic
+// link, a signal, a `/bin/sh` stand-in, or a part built only there (native credential custody,
+// native fleet renewal, the vault-token, Google and agy sign-ins, the Kimi pool's overlay
+// staging home, aterm's own browser window, the test sleep seam).
 #![cfg_attr(
     not(unix),
     expect(
@@ -23,7 +25,6 @@ use std::time::Duration;
 use super::*;
 use crate::harness::login_drive::{self, Approval, Approver, Drove, Handoff, Request};
 
-#[cfg(unix)]
 #[test]
 fn adding_a_native_account_requires_receipt_admission_before_any_directory_or_row() {
     use crate::harness::alab_roster::{
@@ -555,7 +556,6 @@ fn a_kimi_row_without_email_renews_through_its_device_flow() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refused() {
     let tmp = tmp_dir("signin-codex");
@@ -620,7 +620,6 @@ fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refus
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn unavailable_browser_records_codex_renewal_failure_without_a_person_task() {
     let tmp = tmp_dir("codex-browser-unavailable");
@@ -768,7 +767,6 @@ fn a_codex_sign_ins_staging_home_keeps_only_auth_json_under_codex_auth_path_and_
 /// refusal says why the pool's staged sign-in cannot make it and what signs it in; a row of its
 /// own keeps the refusal that its sign-in would replace this machine's own login. Neither runs a
 /// sign-in or makes a staging home.
-#[cfg(unix)]
 #[test]
 fn under_a_keyring_login_the_default_rows_renewal_refusal_is_its_own() {
     let tmp = tmp_dir("signin-codex-keyring-default");
@@ -875,12 +873,11 @@ fn ledger_accounts_reads_the_named_clis_ledger() {
 /// overlay only on Unix, so the renewal says so, binds nothing and leaves no staging home.
 #[cfg(not(unix))]
 #[test]
-#[ignore = "off Unix `accounts add` takes the manual sign-in queue, which only Unix has"]
 fn a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links() {
     let (tmp, env) = kimi_env("signin-no-links");
     let home = tmp.path().join("home");
     let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
-    let before = read(&store.logins_file());
+    let before = store.load_logins(env.now).expect("kimi's logins").0;
     let host = SignInHost::new(Script::Kimi("kimi 0"), &home);
     let (code, out, err) = renew(
         "accounts renew kimi-one@example.com --cli kimi",
@@ -900,14 +897,45 @@ fn a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links() {
         stagings(&home.join(".aterm").join("logins").join("kimi"), "kimi-one").is_empty(),
         "staging removed"
     );
-    assert_eq!(
-        read(&store.logins_file()),
-        before,
-        "the binding is unchanged"
+    // Only the renewed row's workflow custody moves, as on a failed renewal anywhere: no other
+    // row's, and no binding.
+    let mut after = store.load_logins(env.now).expect("kimi's logins").0;
+    let moved: Vec<&String> = after
+        .workflows
+        .keys()
+        .chain(before.workflows.keys())
+        .filter(|label| after.workflows.get(*label) != before.workflows.get(*label))
+        .collect();
+    assert!(
+        moved.iter().all(|label| label.as_str() == "kimi-one"),
+        "only the renewed row's custody moves: {moved:?}"
     );
+    let custody = (after.workflows.clone(), after.workflow_clock);
+    after.workflows = before.workflows.clone();
+    after.workflow_clock = before.workflow_clock;
+    assert_eq!(after, before, "the binding is unchanged");
+    // What the refused renewal left holds nothing back: the same renewal again is refused the
+    // same way, for the same reason, and runs nothing.
+    let (code, out, err) = renew(
+        "accounts renew kimi-one@example.com --cli kimi",
+        &env,
+        &host,
+    );
+    let again = format!("{out}{err}");
+    assert_eq!(code, exit(1), "{again}");
+    assert_eq!(again, said, "the next renewal meets the same refusal");
+    assert_eq!(host.calls.get(), 0, "no sign-in ran");
+    let mut last = store.load_logins(env.now).expect("kimi's logins").0;
+    assert_eq!(
+        last.workflows.keys().collect::<Vec<_>>(),
+        custody.0.keys().collect::<Vec<_>>(),
+        "no other row's custody moves"
+    );
+    last.workflows = before.workflows.clone();
+    last.workflow_clock = before.workflow_clock;
+    assert_eq!(last, before, "the binding is still unchanged");
 }
 
-#[cfg(unix)]
 #[test]
 fn accounts_cli_all_lists_each_kept_pool_and_none_is_claudes_empty_report() {
     let tmp = tmp_dir("accounts-all");
@@ -979,7 +1007,6 @@ impl AccountsHost for PoolHost {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
     let tmp = tmp_dir("adopt-codex");
@@ -1029,7 +1056,6 @@ fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
 /// The account `adopt-default` names is the identity Codex's default login must report, with or
 /// without the alias `--email` its login signs in with: a login that reports another account, or
 /// none, is refused and nothing is written.
-#[cfg(unix)]
 #[test]
 fn codex_adopt_default_checks_an_explicit_canonical_identity() {
     let label = crate::harness::account_names::tests::added_label(Cli::Codex, "owner@example.test");
@@ -1061,7 +1087,6 @@ fn codex_adopt_default_checks_an_explicit_canonical_identity() {
 }
 
 /// Whether `text` holds `word` as a word of its own (a roster label printed).
-#[cfg(unix)]
 fn prints_word(text: &str, word: &str) -> bool {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
         .any(|token| token == word)
@@ -1076,7 +1101,6 @@ fn prints_word(text: &str, word: &str) -> bool {
 /// NEGATIVE CONTROL: with `complete_with` comparing the identity asked for with the row's stored
 /// `identity_email` alone (`existing == Some(supplied)`), the row with no address is refused (exit
 /// 1, not 0) (2026-11-16, by hand on SF-07H S6's review settle, then restored).
-#[cfg(unix)]
 #[test]
 fn codex_adopt_default_naming_the_account_completes_the_default_row() {
     for original in [
@@ -1117,7 +1141,6 @@ fn codex_adopt_default_naming_the_account_completes_the_default_row() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
     for configuration in [
@@ -1157,7 +1180,6 @@ fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn a_pools_stats_list_each_row_alike_as_text_and_json() {
     let (tmp, env) = kimi_env("stats-kimi");
@@ -1251,8 +1273,8 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
 /// ended. CONTROL: a mainland row opens kimi.com, and a window closed with nothing signed in
 /// exits 1.
 ///
-/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
-/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// Unix only, as aterm's own browser window's profile lock is (`browser_window::profile_holder`);
+/// off Unix a run's own desk refuses `accounts browser` before its window
 /// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
 /// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
@@ -1347,8 +1369,8 @@ fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_n
 /// what else works. CONTROL: with a window browser installed nothing is fetched; a row refused
 /// for its own reasons (no email) fetches nothing either.
 ///
-/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
-/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// Unix only, as aterm's own browser window's profile lock is (`browser_window::profile_holder`);
+/// off Unix a run's own desk refuses `accounts browser` before its window
 /// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
 /// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
@@ -1463,12 +1485,6 @@ fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
 /// build stays for the next run rather than that nothing was fetched. CONTROL: the same host's
 /// fetch giving the build opens the window in it
 /// (`accounts_browser_fetches_its_own_window_browser_where_none_is_installed`).
-///
-/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
-/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
-/// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
-/// `the_window_route_reads_the_desk_and_the_downloader` holds).
-#[cfg(unix)]
 #[test]
 fn accounts_browser_stopped_as_its_fetch_placed_the_build_opens_nothing() {
     let (tmp, env) = kimi_env("browser-fetch-stopped");
@@ -1514,8 +1530,8 @@ fn accounts_browser_stopped_as_its_fetch_placed_the_build_opens_nothing() {
 /// and put back once the window is recorded; a pass that ran removes the mark. CONTROL: a pass
 /// that failed leaves the mark, for the next headless launch on the profile to make up.
 ///
-/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
-/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// Unix only, as aterm's own browser window's profile lock is (`browser_window::profile_holder`);
+/// off Unix a run's own desk refuses `accounts browser` before its window
 /// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
 /// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
@@ -1844,10 +1860,7 @@ fn live_desk_stand_in() {
 /// Each of these refusals comes before `accounts browser` asks its host's desk
 /// ([`AccountsHost::no_window_desk`]), and off Unix a run's own desk refuses the row with none of
 /// them before its window browser is looked for (`browser_window::no_window_desk_in`, which
-/// `headless_fetch`'s `the_window_route_reads_the_desk_and_the_downloader` holds). Unix only, as
-/// its rows' `accounts add` queues for the machine's sign-in, which only Unix does (this file's
-/// head).
-#[cfg(unix)]
+/// `headless_fetch`'s `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[test]
 fn accounts_browser_refuses_no_email_no_region_no_window_browser_and_an_unknown_account() {
     let (tmp, env) = kimi_env("browser-rows");
@@ -2539,8 +2552,8 @@ fn an_unrecorded_bot_check_still_ends_as_a_bot_check() {
 /// `ACCOUNTS BROWSER` with no `--cli` serves Claude Code's pool: claude.ai's sign-in page, in the
 /// profile its headless opener keys on. CONTROL: the record lands in Claude Code's own ledger.
 ///
-/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
-/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// Unix only, as aterm's own browser window's profile lock is (`browser_window::profile_holder`);
+/// off Unix a run's own desk refuses `accounts browser` before its window
 /// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
 /// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
@@ -2634,8 +2647,8 @@ fn accounts_browser_takes_one_account() {
 /// and names `renew`; a pass that could not run exits 1 and says the identity provider's sign-in
 /// may be left.
 ///
-/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
-/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// Unix only, as aterm's own browser window's profile lock is (`browser_window::profile_holder`);
+/// off Unix a run's own desk refuses `accounts browser` before its window
 /// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
 /// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
@@ -3186,7 +3199,6 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
 /// NEGATIVE CONTROL: with the completion's receipt naming the row by its label (`completed this
 /// machine's own login as main`), it fails `completed this machine's own login as oai
 /// owner@example.test` (2026-11-16, by hand on SF-07H S6's review settle, then restored).
-#[cfg(unix)]
 #[test]
 fn codex_default_completion_preserves_metadata_and_is_idempotent() {
     for inline in [false, true] {
@@ -3374,7 +3386,6 @@ fn codex_default_completion_runs_in_init_and_upkeep_and_obeys_policy() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn codex_default_completion_retains_alias_and_respects_native_auth_lock() {
     let tmp = tmp_dir("codex-complete-alias");
@@ -3452,7 +3463,6 @@ fn codex_default_completion_respects_signed_out_state() {
     assert_eq!(read(&path), original);
 }
 
-#[cfg(unix)]
 #[test]
 fn codex_default_completion_preserves_pool_holds_and_local_authority() {
     for warm in ["[]", "['m2']", "['m1']"] {
@@ -3502,7 +3512,6 @@ fn codex_default_completion_preserves_pool_holds_and_local_authority() {
 }
 
 /// The text of the vault entry `name` under `home`, read in place.
-#[cfg(unix)]
 fn delivered(home: &Path, name: &str) -> String {
     crate::vault_entry::read_text(home, name, 4 << 20)
         .text()
@@ -3512,7 +3521,6 @@ fn delivered(home: &Path, name: &str) -> String {
 
 /// The sheet at `tmp`'s home whose one line gives `address`'s account to `computer`, in the column
 /// `cells` fills, with this Mac named m16.
-#[cfg(unix)]
 fn sheet_of_other_macs(tmp: &Tmp, env: &Env, cells: &str, address: &str, computer: &str) {
     let config = env.config.clone().expect("a config path");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -3695,7 +3703,6 @@ fn no_report_asks_for_a_sign_in_of_another_macs_account() {
 /// Set, [`a_test_host_holds_no_end_signal_through_any_account_verb`] is the child its own run
 /// started, which runs the account verbs ([`account_verbs_read_sigterm`]) and writes what their
 /// host read to the file this names, instead of starting another child.
-#[cfg(unix)]
 const VERB_DISPOSITION_ENV: &str = "ATERM_TEST_ACCOUNT_VERB_DISPOSITION";
 
 /// A test host whose stand-ins read this process's SIGTERM action in the middle of an account
@@ -3703,7 +3710,6 @@ const VERB_DISPOSITION_ENV: &str = "ATERM_TEST_ACCOUNT_VERB_DISPOSITION";
 /// notes how many of its own holds ([`AccountsHost::hold_window_ends`]) are alive and what
 /// SIGTERM does now ([`sigterm_action`]), then cancels (or reads no identity), so the verb runs
 /// nothing past it.
-#[cfg(unix)]
 #[derive(Default)]
 struct DispositionHost {
     holds: std::rc::Rc<Cell<i32>>,

@@ -215,6 +215,7 @@ mod models_claude_live_admission;
 mod models_claude_restore_auth;
 mod models_closed_restart;
 mod models_host_ended_relaunch;
+mod models_login_evidence;
 pub use models_closed_restart::closed_restart_model;
 mod models_continuation_phase;
 pub use models_continuation_phase::continuation_phase_model;
@@ -489,6 +490,7 @@ pub use models_harness_state_collection::{
 };
 pub use models_host_ended_relaunch::host_ended_relaunch_model;
 pub use models_left::{left_write_liveness, left_write_model};
+pub use models_login_evidence::{LOGIN_EVIDENCE_LAWS, login_evidence_model};
 pub use models_occupancy::{occupancy_door_liveness, occupancy_door_model};
 pub use models_program_queue::{
     claude_footer_cause_model, claude_footer_model_model, claude_footer_watch_model,

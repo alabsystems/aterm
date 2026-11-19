@@ -35,7 +35,7 @@ mod git_runner;
 mod golden_cli;
 mod help_schema;
 mod hop;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod identity_files;
 #[cfg(unix)]
 mod inline_source;
@@ -52,7 +52,7 @@ mod output;
 mod pages;
 mod permits;
 mod policy_table;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod policy_writers;
 mod rate_book;
 mod redaction;
@@ -74,7 +74,7 @@ mod tapes;
 #[cfg(unix)]
 mod tapes_m2;
 mod users_rate;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod vault_adoption;
 mod waits;
 mod wire_loopback;

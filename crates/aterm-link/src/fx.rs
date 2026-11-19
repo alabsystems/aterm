@@ -100,6 +100,9 @@ pub(crate) enum ReservationTap {
     /// The attach's replay settled a keyed re-post's entry at its key's winner, read back
     /// (`Bridge::keyed_winner_at`), not published again.
     ReplayedAtTheWinner,
+    /// A delivery took a record for an attempt no read from anywhere decided, held for its
+    /// drain (`Bridge::take_undecided`, ATERM-KI-1114-1414).
+    UndecidedTaken,
 }
 
 /// Which world answers the doors.

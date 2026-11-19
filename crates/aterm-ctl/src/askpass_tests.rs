@@ -141,3 +141,35 @@ fn an_answer_outlives_the_host_that_sent_it() {
     let answer = read_answer_within(&near, Duration::from_secs(60)).unwrap();
     assert_eq!(answer.as_bytes(), b"ERR refused\n");
 }
+
+/// A quiet refusal reaches the agent in the helper's own words, with the one number it read and
+/// bounded; any other shape of it, the old `retry in` words included, prints the generic refusal.
+/// The words claim no cause and no reach the line does not carry: a person's Cancel starts a wait
+/// for its window and tab as a sheet nobody touched starts one for every tab, and either holds
+/// the asking tab for at most that long.
+/// NEGATIVE CONTROLS: a prefix match that echoed the tail would print `42; x` or `999`; words
+/// that said nobody answered would be false after a person's Cancel.
+#[test]
+fn a_quiet_refusal_says_how_long_no_sheet_is_raised_and_nothing_else() {
+    assert_eq!(
+        refusal_reply(b"ERR askpass refused quiet 42"),
+        "ERR askpass refused quiet: a recent password sheet was declined or went unanswered; \
+         aterm raises no sheet for this tab for up to 42s"
+    );
+    assert!(refusal_reply(b"ERR askpass refused quiet 300").ends_with("for up to 300s"));
+    for line in [
+        b"ERR askpass refused quiet 42; x".as_slice(),
+        b"ERR askpass refused quiet 999",
+        b"ERR askpass refused quiet 042",
+        b"ERR askpass refused quiet 0",
+        b"ERR askpass refused quiet ",
+        b"ERR askpass refused a recent prompt was cancelled or left unanswered; retry in 12s",
+    ] {
+        assert_eq!(
+            refusal_reply(line),
+            "ERR askpass refused",
+            "{}",
+            String::from_utf8_lossy(line)
+        );
+    }
+}

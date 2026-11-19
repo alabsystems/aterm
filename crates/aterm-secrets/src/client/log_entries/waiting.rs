@@ -310,11 +310,7 @@ pub(in super::super) fn waiting_file(paths: &Paths) -> PathBuf {
 /// # Errors
 /// The file cannot be read, does not open with `identity`, or holds a line of no known shape.
 pub(super) fn read_waiting(paths: &Paths, identity: &Identity) -> crate::Result<Waiting> {
-    let Some(sealed) = fsx::read_private(
-        &waiting_file(paths),
-        crate::membership_log::MAX_RECORDS_STREAM,
-    )?
-    else {
+    let Some(sealed) = fsx::read_private(&waiting_file(paths), WAITING_LIMIT)? else {
         return Ok(Waiting::default());
     };
     let plain = age::decrypt(std::slice::from_ref(identity), sealed.as_slice())
@@ -348,8 +344,7 @@ pub(in super::super) fn waiting_bytes_here(
         count(&waiting);
     }
     for (_, _, _, path) in pending_files(paths).unwrap_or_default() {
-        if let Ok(Some(sealed)) =
-            fsx::read_private(&path, crate::membership_log::MAX_RECORDS_STREAM)
+        if let Ok(Some(sealed)) = fsx::read_private(&path, WAITING_LIMIT)
             && let Some((_, writes)) = open_pending(identity, sealed.as_slice())
         {
             count(&writes);
@@ -615,6 +610,10 @@ pub(in super::super) fn wait_files(paths: &Paths) -> [PathBuf; 2] {
 /// What a pending set's plain text starts with. Then come the servers its publish may have sent
 /// its version to, one per line, then an empty line, then its writes ([`Waiting::encode`]).
 const PENDING_MAGIC: &[u8] = b"aterm/everyone-pending/1\n";
+/// The most bytes a file of writes that wait for a key holds, sealed: what the store they are
+/// signed into holds, whichever format this Mac's mark names
+/// ([`crate::membership_log::Reading::STORE_BYTES`], the storage class of byte bound).
+const WAITING_LIMIT: usize = crate::membership_log::Reading::STORE_BYTES;
 
 /// One pending set ([`pending_dir`]).
 struct Pending {
@@ -691,8 +690,7 @@ fn unopened(path: &Path) -> Error {
 fn read_pending(paths: &Paths, identity: &Identity) -> crate::Result<Vec<Pending>> {
     let mut sets = Vec::new();
     for (order, seq, version, path) in pending_files(paths)? {
-        let Some(sealed) = fsx::read_private(&path, crate::membership_log::MAX_RECORDS_STREAM)?
-        else {
+        let Some(sealed) = fsx::read_private(&path, WAITING_LIMIT)? else {
             continue;
         };
         match open_pending(identity, sealed.as_slice()) {
@@ -778,7 +776,7 @@ fn write_pending(paths: &Paths, identity: &Identity, set: &Pending) -> crate::Re
 fn pending_names(paths: &Paths, identity: &Identity) -> Option<BTreeSet<String>> {
     let mut names = BTreeSet::new();
     for (_, _, _, path) in pending_files(paths).ok()? {
-        let sealed = match fsx::read_private(&path, crate::membership_log::MAX_RECORDS_STREAM) {
+        let sealed = match fsx::read_private(&path, WAITING_LIMIT) {
             Ok(Some(sealed)) => sealed,
             Ok(None) => continue,
             Err(_) if unread_as_none() => continue,
@@ -806,11 +804,9 @@ pub(in super::super) fn unread_waiting(
         .then(|| waiting_file(paths).display().to_string());
     let mut unread = Vec::new();
     for (_, _, _, path) in pending_files(paths).unwrap_or_default() {
-        let opens = fsx::read_private(&path, crate::membership_log::MAX_RECORDS_STREAM).is_ok_and(
-            |sealed| {
-                sealed.is_none_or(|sealed| open_pending(identity, sealed.as_slice()).is_some())
-            },
-        );
+        let opens = fsx::read_private(&path, WAITING_LIMIT).is_ok_and(|sealed| {
+            sealed.is_none_or(|sealed| open_pending(identity, sealed.as_slice()).is_some())
+        });
         if !opens {
             unread.push(path.display().to_string());
         }
@@ -2645,8 +2641,7 @@ pub(in super::super) fn waiting_shapes(
     let pending = files
         .into_iter()
         .filter_map(|(_, _, version, path)| {
-            let sealed = fsx::read_private(&path, crate::membership_log::MAX_RECORDS_STREAM)
-                .expect("a pending set")?;
+            let sealed = fsx::read_private(&path, WAITING_LIMIT).expect("a pending set")?;
             let (_, writes) = open_pending(identity, sealed.as_slice())?;
             Some((version, writes.shapes()))
         })

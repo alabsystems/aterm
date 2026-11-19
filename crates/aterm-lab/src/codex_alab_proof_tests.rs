@@ -3,6 +3,56 @@
 
 use super::*;
 
+#[test]
+fn only_a_successful_native_discovery_can_establish_execution_unavailable() {
+    let reply = |code, stdout: &str| instance::Reply {
+        code,
+        stdout: stdout.into(),
+        ..instance::Reply::default()
+    };
+    let asked = "@s-1 native-act info source-exec";
+    let unavailable = "OK native source-exec preparation=1 execution=unavailable input-fence=1";
+    assert_eq!(
+        source_execution_unavailable(asked, reply(0, unavailable)),
+        Ok(true)
+    );
+    assert_eq!(
+        source_execution_unavailable(
+            asked,
+            reply(
+                0,
+                "OK native source-exec preparation=0 execution=unavailable input-fence=1\n"
+            )
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        source_execution_unavailable(
+            asked,
+            reply(
+                0,
+                "OK native source-exec preparation=1 execution=available input-fence=1\n"
+            )
+        ),
+        Ok(false)
+    );
+    for (code, stdout) in [
+        (124, unavailable),
+        (0, "ERR read access refused"),
+        (
+            0,
+            "OK native source-exec preparation=1 execution=unavailable",
+        ),
+        (
+            0,
+            "OK native source-exec preparation=1 execution=unavailable input-fence=1\nERR unexpected",
+        ),
+        (0, ""),
+    ] {
+        assert!(source_execution_unavailable(asked, reply(code, stdout)).is_err());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_retargeted_alias_does_not_prove_a_running_image_upgraded() {
@@ -31,17 +81,40 @@ fn a_retargeted_alias_does_not_prove_a_running_image_upgraded() {
         ("execGeneration", J::Int(2)),
         ("exe", J::s(alias.to_str().unwrap())),
     ]);
+    let source_matches = observed_image(&record, pid, &old);
+    let source_is_successor = observed_image(&record, pid, &new);
     let matched_old = observed_upgrade(&record, pid, 1, &old);
     std::fs::remove_file(&alias).unwrap();
     std::os::unix::fs::symlink(&new, &alias).unwrap();
+    let retargeted_source = observed_image(&record, pid, &new);
     let matched_new = observed_upgrade(&record, pid, 1, &new);
     drop(input);
     assert!(child.wait().unwrap().success());
+    assert!(source_matches && !source_is_successor && !retargeted_source);
     assert!(matched_old);
     assert!(
         !matched_new,
         "retargeting a name cannot replace a loaded image"
     );
+}
+
+#[test]
+fn watcher_diagnostics_report_the_last_admission_failure_without_journal_data() {
+    let prefix = "DEBUG codex_alab_autopilot: upgrade target admission: ";
+    assert!(upgrade_admission_failure("unrelated private text").is_none());
+    let custody = format!("{prefix}invalid executable custody descriptors");
+    assert!(
+        upgrade_admission_failure(&custody)
+            .unwrap()
+            .contains("custody descriptors")
+    );
+    let incompatible =
+        format!("{custody}\n{prefix}unknown field `full_runtime`, data from the child");
+    let why = upgrade_admission_failure(&incompatible).unwrap();
+    assert!(why.contains("full_runtime") && !why.contains("data from the child"));
+    let unknown = format!("{incompatible}\n{prefix}arbitrary private data");
+    let why = upgrade_admission_failure(&unknown).unwrap();
+    assert!(!why.contains("full_runtime") && !why.contains("arbitrary private data"));
 }
 
 /// A WORKER'S LANDING READS LANDED WHATEVER BECAME OF ITS TAB: live or reaped. NEGATIVE CONTROLS:
@@ -1224,6 +1297,8 @@ fn a_run_takes_one_lane_and_only_the_options_that_lane_reads() {
         Asked {
             keep: true,
             lane: Lane::Capacity,
+            signed_original: false,
+            lose_settle_ack: false,
             aterm: None,
             package: Some("/p".to_string()),
             upgrade_package: None,
@@ -1231,6 +1306,66 @@ fn a_run_takes_one_lane_and_only_the_options_that_lane_reads() {
         }
     );
     assert_eq!(usage(&["--capacity-only", "extra"]), 2);
+}
+
+#[test]
+fn signed_original_requires_the_explicit_upgrade_lane_and_both_packages() {
+    let parse =
+        |words: &[&str]| asked(&words.iter().map(|word| (*word).into()).collect::<Vec<_>>());
+    let a = ["--package", "a"];
+    let b = ["--upgrade-package", "b"];
+    let signed = ["--signed-original"];
+    let upgrade = ["--upgrade-only"];
+    for bad in [
+        [signed.as_slice(), &a, &b].concat(),
+        [&signed[..], &["--raw-upgrade-only"], &a, &b].concat(),
+        [&signed[..], &upgrade, &b].concat(),
+        [&signed[..], &upgrade, &a].concat(),
+    ] {
+        assert_eq!(parse(&bad).unwrap_err().code, 2, "{bad:?}");
+    }
+    assert!(
+        parse(&[signed.as_slice(), &upgrade, &a, &b].concat())
+            .unwrap()
+            .signed_original
+    );
+    assert!(
+        !parse(&[upgrade.as_slice(), &b].concat())
+            .unwrap()
+            .signed_original
+    );
+}
+
+#[test]
+fn losing_settlement_ack_requires_explicit_private_signed_upgrade() {
+    let parse =
+        |words: &[&str]| asked(&words.iter().map(|word| (*word).into()).collect::<Vec<_>>());
+    let signed = [
+        "--upgrade-only",
+        "--signed-original",
+        "--package",
+        "a",
+        "--upgrade-package",
+        "b",
+    ];
+    let host = ["--aterm", "/private/debug/aterm"];
+    let fault = ["--lose-settle-ack"];
+    assert!(!parse(&signed).unwrap().lose_settle_ack);
+    assert_eq!(
+        parse(&[signed.as_slice(), &fault].concat())
+            .unwrap_err()
+            .code,
+        2
+    );
+    assert_eq!(
+        parse(&[host.as_slice(), &fault].concat()).unwrap_err().code,
+        2
+    );
+    assert!(
+        parse(&[signed.as_slice(), &host, &fault].concat())
+            .unwrap()
+            .lose_settle_ack
+    );
 }
 
 /// THE RUN'S END (review F2, F4): the capacity lane runs alone and as the full proof's last
@@ -1405,108 +1540,373 @@ fn a_rig_whose_bus_cannot_stand_leaves_nothing_behind() {
     assert!(!world.dir.join("bin").exists(), "nothing copied in yet");
 }
 
-/// A LAB ACT A MODEL'S HOLD TIMES SAYS WHO WAS LATE: a lab that came and acted inside the hold
-/// passes; one that came inside it and acted past it fails naming the act; one that came
-/// already past it fails naming the lab's own earlier legs, never Land's repo logic.
-#[test]
-fn a_hold_timed_act_names_who_was_late() {
-    let (ok, line) = hold_line(1_000, 1_500, 1_800, REPO_COMMIT_HOLD);
-    assert!(ok, "{line}");
-    assert_eq!(
-        line,
-        "0.8 s into the model's 60 s hold (the lab came 0.5 s after the model's nudge)"
+fn repo_fixture() -> (aterm_tempfile::TempDir, RepoFixture) {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let root = scratch.path().join("repo/proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    let root = root.canonicalize().unwrap();
+    let fixture = RepoFixture::new(
+        root.clone(),
+        vec![("HOME".into(), home.to_string_lossy().into_owned())],
     );
-    let (ok, line) = hold_line(1_000, 900, 1_300, REPO_PUSH_HOLD);
-    assert!(ok, "{line}");
-    assert!(
-        line.contains("the lab was waiting for the model's nudge"),
-        "{line}"
-    );
-
-    let (ok, line) = hold_line(0, 10_000, 61_000, REPO_COMMIT_HOLD);
-    assert!(!ok, "{line}");
-    assert!(
-        line.starts_with("61.0 s into the model's 60 s hold: the lab came 10.0 s after")
-            && line.contains("the act itself took 1.0 s past it")
-            && !line.contains("earlier leg")
-            && !line.contains("Land"),
-        "{line}"
-    );
-
-    let (ok, line) = hold_line(0, 182_000, 182_400, REPO_COMMIT_HOLD);
-    assert!(!ok, "{line}");
-    assert!(
-        line.starts_with("182.4 s into the model's 60 s hold: the lab came 182.0 s after")
-            && line.contains("held by an earlier leg of the lab's run")
-            && line.contains("not Land's repo logic")
-            && !line.contains("the act itself"),
-        "{line}"
-    );
-    let (ok, line) = hold_line(0, 20_000, 20_100, REPO_PUSH_HOLD);
-    assert!(!ok && line.contains("earlier leg"), "{line}");
+    let origin = root.parent().unwrap().join("origin.git");
+    fixture_git(
+        &fixture.env,
+        root.parent().unwrap(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            origin.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    fixture_git(&fixture.env, &root, &["init", "-q", "-b", "main"]).unwrap();
+    std::fs::write(root.join("README.md"), "# fixture\n").unwrap();
+    fixture_git(&fixture.env, &root, &["add", "README.md"]).unwrap();
+    fixture_git(&fixture.env, &root, &["commit", "-q", "-m", "initial"]).unwrap();
+    fixture_git(
+        &fixture.env,
+        &root,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    )
+    .unwrap();
+    fixture_git(&fixture.env, &root, &["push", "-q", "-u", "origin", "main"]).unwrap();
+    std::fs::write(root.join(NOTES), "# notes\n").unwrap();
+    (scratch, fixture)
 }
 
-/// THE LAB'S COMMIT IS TIMED TO THE MILLISECOND ([`committed_ms`]): one 60.4 s after the
-/// model's nudge, whose own whole-second date reads 59.7 s, is past the 60 s hold, so
-/// `repo_pushed`'s line can say why the next nudge names the untracked file; one 59.4 s after
-/// is inside it. The commit's time is a hand-set stamp on `main`'s reflog.
-#[test]
-fn a_commit_under_a_second_past_the_hold_reads_past_it() {
-    const T: i64 = 1_700_000_000_000;
-    let root = aterm_tempfile::tempdir().unwrap();
-    let proj = root.path();
-    let git = |args: &[&str], date: Option<&str>| {
-        let mut cmd = aterm_uds::fixture_git::git();
-        cmd.args([
-            "-c",
-            "user.name=jsmith",
-            "-c",
-            "user.email=jsmith@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .current_dir(proj)
-        .stdin(Stdio::null());
-        if let Some(date) = date {
-            cmd.env("GIT_AUTHOR_DATE", date)
-                .env("GIT_COMMITTER_DATE", date);
-        }
-        let out = cmd.output().unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-    git(&["init", "-q", "-b", "main"], None);
-    std::fs::write(proj.join(NOTES), "# release notes\n").unwrap();
-    git(&["add", NOTES], None);
-    git(
-        &["commit", "-q", "-m", "lab: the release notes"],
-        Some("@1700000060 +0000"),
-    );
-    let (asked, made) = (T + 300, T + 60_700);
-    std::fs::File::options()
-        .append(true)
-        .open(proj.join(".git/logs/refs/heads/main"))
+fn repo_request(push: bool) -> J {
+    use alab_policy::words::{LAND, LAND_NUDGE};
+    use aterm_agent::harness::repo_work::RepoWork;
+    use aterm_agent::supervise::policy::turn_end;
+    let dirty = turn_end::repo_work_suffix(&RepoWork {
+        repo: "fixture".into(),
+        untracked: 1,
+        paths: vec![NOTES.into()],
+        main_ref: "origin/main".into(),
+        ..RepoWork::default()
+    });
+    let ahead = turn_end::repo_work_suffix(&RepoWork {
+        repo: "fixture".into(),
+        unpushed: 1,
+        unlanded: 1,
+        main_ref: "origin/main".into(),
+        ..RepoWork::default()
+    });
+    let mut texts = vec![
+        "LEG-repo Write the release notes.".to_string(),
+        LAND.into(),
+        format!("{LAND_NUDGE} {dirty}"),
+    ];
+    if push {
+        texts.push(format!("{LAND_NUDGE} {ahead}"));
+    }
+    J::obj([(
+        "input",
+        J::Arr(
+            texts
+                .into_iter()
+                .map(|text| J::obj([("role", J::s("user")), ("content", J::s(text))]))
+                .collect(),
+        ),
+    )])
+}
+
+fn repo_answer(fixture: &RepoFixture, request: &J) -> codex_rig::Answered {
+    fixture.answer_with(request, model::answerer()(request), || Ok(Vec::new()))
+}
+
+fn repo_head(fixture: &RepoFixture) -> String {
+    fixture_git(&fixture.env, &fixture.root, &["rev-parse", "HEAD"])
         .unwrap()
-        .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(made.unsigned_abs()))
-        .unwrap();
-    let own: i64 = git(&["log", "-1", "--format=%ct"], None)
         .trim()
-        .parse()
-        .unwrap();
-    assert!(
-        own * 1000 - asked < ms_of(REPO_COMMIT_HOLD),
-        "the commit's own date reads inside the hold"
-    );
-    assert_eq!(committed_ms(proj), Some(made));
-    assert_eq!(committed_past(asked, proj, REPO_COMMIT_HOLD), Some(60_400));
+        .to_string()
+}
+
+fn repo_remote(fixture: &RepoFixture) -> String {
+    let origin = fixture.root.parent().unwrap().join("origin.git");
+    fixture_git(
+        &fixture.env,
+        &fixture.root,
+        &[
+            "--git-dir",
+            origin.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ],
+    )
+    .unwrap()
+    .trim()
+    .to_string()
+}
+
+#[test]
+fn repository_responses_follow_real_mutations_before_the_sequential_judge_reads_them() {
+    let (_scratch, fixture) = repo_fixture();
+    let initial = repo_head(&fixture);
+    let commit = repo_request(false);
+    let response = repo_answer(&fixture, &commit);
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("Committed notes.txt."));
+    assert_eq!(response.delay, Duration::ZERO);
+    let committed = repo_head(&fixture);
+    assert_ne!(committed, initial);
     assert_eq!(
-        committed_past(asked + 1_000, proj, REPO_COMMIT_HOLD),
-        None,
-        "59.4 s: inside"
+        repo_remote(&fixture),
+        initial,
+        "the first defense still leaves an unpushed commit"
+    );
+    assert_eq!(
+        fixture_git(&fixture.env, &fixture.root, &["show", "HEAD:notes.txt"]).unwrap(),
+        "# notes\n"
+    );
+    let receipt = fixture.receipt(RepoAction::Commit).unwrap().unwrap();
+    assert!(receipt.request.contains(NOTES));
+    assert_eq!(receipt.stopped.as_ref().unwrap(), &Vec::<String>::new());
+    assert_eq!(receipt.result.as_ref().unwrap().head, committed);
+    let duplicate = fixture.answer_with(&commit, model::answerer()(&commit), || {
+        panic!("a duplicate must reuse its original custody witness")
+    });
+    assert_eq!(duplicate.status, 200);
+    assert_eq!(repo_head(&fixture), committed, "no second commit");
+
+    let push = repo_request(true);
+    let response = repo_answer(&fixture, &push);
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("pushed it to origin/main"));
+    assert_eq!(repo_head(&fixture), committed);
+    assert_eq!(
+        repo_remote(&fixture),
+        committed,
+        "the answer cannot claim a push until it actually landed locally"
+    );
+    let receipt = fixture.receipt(RepoAction::Push).unwrap().unwrap();
+    assert!(receipt.request.contains("not on cached origin/main"));
+    let change = receipt.result.unwrap();
+    assert_eq!(
+        (
+            change.old_head,
+            change.head,
+            change.remote_before,
+            change.remote_after
+        ),
+        (
+            committed.clone(),
+            committed.clone(),
+            initial,
+            committed.clone()
+        )
+    );
+    assert_eq!(repo_answer(&fixture, &push).status, 200);
+    assert_eq!(repo_remote(&fixture), committed);
+}
+
+#[test]
+fn a_failed_repository_mutation_is_latched_and_never_claims_success_after_repair() {
+    let (_scratch, fixture) = repo_fixture();
+    let before = repo_head(&fixture);
+    let lock = fixture.root.join(".git/index.lock");
+    std::fs::write(&lock, "kept lock").unwrap();
+    let request = repo_request(false);
+    let failed = repo_answer(&fixture, &request);
+    assert_eq!(failed.status, 500);
+    assert!(!failed.body.contains("Committed notes.txt."));
+    assert!(
+        fixture
+            .receipt(RepoAction::Commit)
+            .unwrap()
+            .unwrap()
+            .result
+            .is_err()
+    );
+    std::fs::remove_file(lock).unwrap();
+    assert_eq!(
+        repo_answer(&fixture, &request).status,
+        500,
+        "a later retry cannot replay the failed transition"
+    );
+    assert_eq!(repo_head(&fixture), before);
+    assert_eq!(repo_remote(&fixture), before);
+    assert!(
+        fixture_git(&fixture.env, &fixture.root, &["status", "--porcelain"])
+            .unwrap()
+            .contains(NOTES)
+    );
+}
+
+#[test]
+fn repository_protocol_refuses_reordered_or_changed_requests_and_early_endings() {
+    for reason in [
+        "push-first",
+        "changed-request",
+        "unread-timeline",
+        "landed",
+        "finished",
+    ] {
+        let (_scratch, fixture) = repo_fixture();
+        let before = repo_head(&fixture);
+        let request = repo_request(reason == "push-first");
+        let response = match reason {
+            "unread-timeline" => fixture.answer_with(&request, model::answerer()(&request), || {
+                Err("timeline unread".into())
+            }),
+            "landed" | "finished" => {
+                fixture.answer_with(&request, model::answerer()(&request), || {
+                    Ok(vec![
+                        if reason == "landed" { LANDED } else { FINISHED }.into(),
+                    ])
+                })
+            }
+            "changed-request" => {
+                assert_eq!(repo_answer(&fixture, &request).status, 200);
+                let mut changed = request.clone();
+                if let J::Obj(fields) = &mut changed {
+                    fields.push(("new_request".into(), J::Bool(true)));
+                }
+                let response = repo_answer(&fixture, &changed);
+                assert_eq!(
+                    repo_head(&fixture),
+                    fixture
+                        .receipt(RepoAction::Commit)
+                        .unwrap()
+                        .unwrap()
+                        .result
+                        .unwrap()
+                        .head
+                );
+                assert_eq!(response.status, 500);
+                continue;
+            }
+            _ => repo_answer(&fixture, &request),
+        };
+        assert_eq!(response.status, 500, "{reason}");
+        assert_eq!(repo_head(&fixture), before, "{reason}: no mutation");
+        assert_eq!(repo_remote(&fixture), before, "{reason}: no push");
+    }
+}
+
+#[test]
+fn a_repository_push_refuses_origin_or_commit_drift_and_retired_custody() {
+    for reason in ["origin", "head", "closed"] {
+        let (_scratch, fixture) = repo_fixture();
+        let initial = repo_remote(&fixture);
+        assert_eq!(repo_answer(&fixture, &repo_request(false)).status, 200);
+        match reason {
+            "origin" => {
+                let other = fixture.root.parent().unwrap().join("other.git");
+                fixture_git(
+                    &fixture.env,
+                    &fixture.root,
+                    &[
+                        "init",
+                        "-q",
+                        "--bare",
+                        "-b",
+                        "main",
+                        other.to_str().unwrap(),
+                    ],
+                )
+                .unwrap();
+                fixture_git(
+                    &fixture.env,
+                    &fixture.root,
+                    &["remote", "set-url", "origin", other.to_str().unwrap()],
+                )
+                .unwrap();
+            }
+            "head" => {
+                fixture_git(
+                    &fixture.env,
+                    &fixture.root,
+                    &["commit", "-q", "--allow-empty", "-m", "unacknowledged"],
+                )
+                .unwrap();
+            }
+            "closed" => fixture.close(),
+            _ => unreachable!(),
+        }
+        let before = repo_head(&fixture);
+        let failed = repo_answer(&fixture, &repo_request(true));
+        assert_eq!(failed.status, 500, "{reason}");
+        assert!(!failed.body.contains("pushed it to origin/main"));
+        assert_eq!(repo_head(&fixture), before);
+        assert_eq!(
+            repo_remote(&fixture),
+            initial,
+            "{reason}: original bare origin unchanged"
+        );
+        if reason == "origin" {
+            let other = fixture.root.parent().unwrap().join("other.git");
+            assert!(
+                fixture_git(
+                    &fixture.env,
+                    &fixture.root,
+                    &[
+                        "--git-dir",
+                        other.to_str().unwrap(),
+                        "rev-parse",
+                        "--verify",
+                        "refs/heads/main"
+                    ]
+                )
+                .is_err(),
+                "substituted origin stayed empty"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_repository_stop_witness_requires_a_complete_native_timeline() {
+    let timeline = |stdout: &str| {
+        repo_stops(instance::Reply {
+            code: 0,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        })
+    };
+    assert!(
+        timeline("event 1 t=1 kind=program text=kind=harness-act act=landed@v1\n")
+            .unwrap()
+            .is_empty(),
+        "a payload substring does not change the event kind"
+    );
+    assert!(
+        timeline("event 1 t=1 kind=harness-act act=land-nudge@v1\n")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        timeline("event 1 t=1 kind=harness-act act=landed@v1\nevent 2 t=2 kind=harness-act act=finished@v1\n").unwrap(),
+        [LANDED, FINISHED]
+    );
+    for invalid in [
+        "",
+        "ERR unread\n",
+        "OK 1\n",
+        "OK 0\nevent 1 t=1 kind=harness-act act=landed@v1\n",
+        "not an event\n",
+        "event 1 t=1\n",
+        "event 1 t=1 kind=harness-act\n",
+        "event 1 t=1 kind=harness-act act=land-nudge@v1",
+        "event 2 t=2 kind=harness-act act=land-nudge@v1\n",
+        "event 1 t=1 kind=program\nevent 3 t=3 kind=harness-act act=land-nudge@v1\n",
+        "event 2 t=2 kind=program\nevent 1 t=1 kind=harness-act act=land-nudge@v1\n",
+    ] {
+        assert!(timeline(invalid).is_err(), "{invalid:?}");
+    }
+    assert!(
+        repo_stops(instance::Reply {
+            code: 1,
+            stdout: "event 1 t=1 kind=harness-act act=land-nudge@v1\n".into(),
+            stderr: "aterm-ctl: the counted reply ended early".into(),
+        })
+        .is_err(),
+        "a cut counted body never proves that no later stop exists"
     );
 }

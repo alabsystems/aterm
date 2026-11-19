@@ -108,3 +108,10 @@ name = "size"
 path = "benches/size.rs"
 harness = false
 test = false
+
+# The ordinary production Mac capture capability row; windowed and release-artifact-only.
+[[bench]]
+name = "capture"
+path = "benches/capture.rs"
+harness = false
+test = false

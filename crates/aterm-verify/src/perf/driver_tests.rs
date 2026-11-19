@@ -104,6 +104,7 @@ fn record_launcher_context(
         "RUSTFLAGS",
         "RUSTDOCFLAGS",
         "CARGO_HOME",
+        "CARGO_LOG",
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_BUILD_DIR",
         "CARGO_MANIFEST_DIR",
@@ -204,6 +205,8 @@ fn main() { println!("cargo:rerun-if-changed=build.rs"); }
 #[cfg(unix)]
 #[test]
 fn nested_build_reuses_artifacts_across_launcher_metadata() {
+    use std::path::Path;
+
     const TEST: &str =
         "perf::driver::tests::nested_build_reuses_artifacts_across_launcher_metadata";
     const ROOT: &str = "ATERM_VERIFY_LAUNCHER_FIXTURE";
@@ -253,6 +256,21 @@ fn nested_build_reuses_artifacts_across_launcher_metadata() {
     ));
     let root = scratch.0.as_ref().unwrap().path();
     write_launcher_fixture(root);
+    let home = root.join("home");
+    let cargo_home = root.join("cargo-home");
+    for directory in [&home, &cargo_home] {
+        std::fs::create_dir(directory).unwrap();
+    }
+    // This offline fixture has no dependencies. Keep native-tool reobservation out of
+    // mutable agent/provisioner search directories and keep its caches private.
+    let path = std::env::join_paths([
+        driver.program.parent().expect("the pinned compiler's bin"),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+        Path::new("/usr/sbin"),
+        Path::new("/sbin"),
+    ])
+    .expect("native tool directories contain no search-path separators");
     let mut executable = None;
     for (launcher, want_fresh) in [("first", false), ("second", true)] {
         let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
@@ -260,6 +278,13 @@ fn nested_build_reuses_artifacts_across_launcher_metadata() {
             .current_dir(root)
             .env(ROOT, root)
             .env(PROGRAM, &driver.program)
+            .env("HOME", &home)
+            .env("CARGO_HOME", &cargo_home)
+            .env("PATH", &path)
+            .env(
+                "CARGO_LOG",
+                "targo_core::compiler::fingerprint=trace,cargo::compiler::fingerprint=trace",
+            )
             .env("CARGO_TARGET_DIR", root.join("target.noindex"))
             .env("CARGO_BUILD_BUILD_DIR", root.join("build.noindex"))
             .env("CARGO_MANIFEST_DIR", root.join(launcher))

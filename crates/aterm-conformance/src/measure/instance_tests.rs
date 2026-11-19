@@ -243,7 +243,8 @@ fn a_request_the_subject_has_no_verb_for_is_unanswered() {
         bin: PathBuf::from(bin),
         sock: PathBuf::from("/nonexistent.sock"),
         home: PathBuf::from("/"),
-        budget: Budget::from_now(60),
+        policy: WaitPolicy::Take(Budget::from_now(60)),
+        subject: None,
     };
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let stand_in = dir.path().join("refuses");
@@ -272,7 +273,8 @@ fn a_client_whose_budget_is_spent_runs_nothing() {
         bin: PathBuf::from("/usr/bin/true"),
         sock: PathBuf::from("/nonexistent.sock"),
         home: PathBuf::from("/"),
-        budget: Budget::from_now(secs),
+        policy: WaitPolicy::Take(Budget::from_now(secs)),
+        subject: None,
     };
     assert_eq!(client(60).call(&["status"]).code, Some(0));
     assert!(client(60).ok(&["status"]).is_ok());
@@ -303,7 +305,8 @@ fn replay_checks_judges_before_reading_status() {
         bin: stand_in,
         sock: PathBuf::from("/nonexistent.sock"),
         home: PathBuf::from("/"),
-        budget: Budget::from_now(60),
+        policy: WaitPolicy::Take(Budget::from_now(60)),
+        subject: None,
     };
     assert_eq!(
         replay_checks(&ctl),

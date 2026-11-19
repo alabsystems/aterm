@@ -16,23 +16,31 @@
 //! lab (every test, a debug build) reports nothing, so no place row is written. So is its login
 //! source (the `login` rows of the shared file `ai/logins`, docs/DESIGN-shared-files-2026-11-11.md
 //! §10 file 3, [`Logins`]): what each CLI's accounts store says of each login this Mac holds,
-//! read without a credential (`Store::peek_account_records`) into the harness's value-free words
-//! (`journal::login_rows`), every word checked again into the journal's own types
-//! ([`logins_in`]); a CLI whose store does not read reports nothing of that CLI, so none of its
-//! rows ends on a passing failure and no other CLI's waits for it. The vault is not read for it:
-//! a Claude Code row is on its token as the upkeep's last reading says (`tokens_here.json`), the
-//! reading its launch takes. No token or its state is reported: those are the fleet vault's
-//! alone.
+//! its records read as they stand (`Store::peek_account_records`, which reads no credential) into
+//! the harness's value-free words (`journal::login_rows`), every word checked again into the
+//! journal's own types ([`logins_in`]); a CLI whose store does not read reports nothing of that
+//! CLI, so none of its rows ends on a passing failure and no other CLI's waits for it. Each row
+//! states the facts of the credential its sign-in runs on (plan package SF-34, decision SF-D3:
+//! kind, where kept, issued, ends, refreshed, last used, state; `login_token::read`), never its
+//! value: to learn them the harness's readers parse, in memory and scrubbed, each Codex row's
+//! `auth.json` (and its refresh journal's refusal of the refresh token it holds) and each Claude
+//! Code row's `.credentials.json` where it is in a file, and keep only words and times. The vault
+//! is not read for it: a Claude Code row is on its token as the upkeep's last reading says
+//! (`tokens_here.json`), the reading its launch takes, its token's mint and last use are this
+//! Mac's value-free table's (`tokens.json`, `tokens-check.json`), and its refusal here the
+//! value-free file beside the vault state; the values stay in the vault, each CLI's login file and
+//! the keychain.
 
 use aterm_agent::harness::{
-    accounts::{self, Cli, Roster},
+    accounts::{self, Cli, Roster, Row},
     alab_roster::{self, Lab},
     journal::{self, Note, Sink},
+    login_token::{self, SetupTokens},
     observe::{self, sweep::OnToken},
     provider_read::{self, ProbeEvent},
 };
 use aterm_db::alab::journal::{
-    Appended, Event, Kind, Pk, Publishing, Res, Source, Spool, Window, Word,
+    Appended, Event, Kind, ModelBucket, Pk, Publishing, Res, Source, Spool, Window, Word,
     mine::{self, Login},
     place::{self, Holding, Why},
 };
@@ -101,6 +109,7 @@ fn event(note: &Note) -> Option<Event> {
         cli: Word::new(note.cli)?,
         sub: word(note.sub.as_ref().map(journal::SubKey::as_str), Word::new)?,
         window: word(note.window, Window::parse)?,
+        model: word(note.model, ModelBucket::parse)?,
         pct_x10: match note.pct_x10 {
             None => None,
             Some(p) if p <= 1000 => Some(p),
@@ -120,8 +129,10 @@ fn event(note: &Note) -> Option<Event> {
         via: None,
         program: None,
     })
-    // Only a kind about one tab's run names a tab or a harness, as every reader admits it.
+    // Only a kind about one tab's run names a tab or a harness, and only a `7d-model` wall, its
+    // clearing or its refill a model, as every reader admits it.
     .filter(|event| (event.tab.is_none() && event.harness.is_none()) || event.kind.names_tab())
+    .filter(|event| event.model.is_none() || event.names_model())
     // A plan word rides only on a `plan-seen`, and a `plan-seen` always carries one.
     .filter(|event| (event.kind == Kind::PlanSeen) == event.plan.is_some())
 }
@@ -156,10 +167,12 @@ pub(super) fn install() {
 
 /// This Mac's login source, the flusher's `login` rows ([`mine::Source`]): each pooled CLI's
 /// accounts store under the harness state, read at a pass the flusher's gate lets past
-/// ([`logins_in`]), and the stamps of the files they are read from ([`login_files`]), looked at
-/// each pass so a login whose row changed with no sharp note beside it is read within a minute;
-/// so is the clock against the second the last report's token reading can answer otherwise
-/// ([`LoginsRead::turns`]), the one word of a row that moves with no file moving.
+/// ([`logins_in`]), and the stamps of the files they are read from (the stores' [`login_files`]
+/// and each row's credential files, [`LoginsRead::watched`]), looked at each pass so a login
+/// whose row changed with no sharp note beside it is read within a minute; so is the clock
+/// against the second the last report can read otherwise with no file moving
+/// ([`LoginsRead::turns`]: a token reading aging out, a credential's stated end coming near or
+/// passing, a refusal coming to be settled).
 #[derive(Default)]
 struct Logins {
     /// What the last report saw: `None` before the first.
@@ -170,6 +183,8 @@ struct Logins {
 struct Seen {
     /// The stamps of [`login_files`] as it found them before it read.
     stamps: Vec<Option<FileStamp>>,
+    /// [`LoginsRead::watched`] of what it read; empty after a read that did not finish.
+    watched: Vec<(PathBuf, Option<FileStamp>)>,
     /// [`LoginsRead::turns`] of what it read; `None` after a read that did not finish.
     turns: Option<i64>,
 }
@@ -208,6 +223,10 @@ impl mine::Source for Logins {
             .and_then(|lab| logins_in(&lab, &config, &harness, home.as_deref(), now));
         *self.seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(Seen {
             stamps,
+            watched: read
+                .as_ref()
+                .map(|read| read.watched.clone())
+                .unwrap_or_default(),
             turns: read.as_ref().and_then(|read| read.turns),
         });
         read.map(|read| read.reports)
@@ -215,9 +234,21 @@ impl mine::Source for Logins {
 }
 
 /// Whether a login may read otherwise at `now` than when `seen` was read: none was, a file of
-/// [`login_files`] moved (`stamps` now), or its token reading's turn came.
+/// [`login_files`] moved (`stamps` now), a credential file the read stamped moved
+/// ([`watched_moved`]), or its clock's turn came ([`LoginsRead::turns`]).
 fn moved_since(seen: Option<&Seen>, stamps: &[Option<FileStamp>], now: i64) -> bool {
-    seen.is_none_or(|seen| seen.stamps != stamps || seen.turns.is_some_and(|at| at <= now))
+    seen.is_none_or(|seen| {
+        seen.stamps != stamps
+            || watched_moved(&seen.watched)
+            || seen.turns.is_some_and(|at| at <= now)
+    })
+}
+
+/// Whether a credential file a read stamped (`watched`, [`LoginsRead::watched`]) moved since.
+fn watched_moved(watched: &[(PathBuf, Option<FileStamp>)]) -> bool {
+    watched
+        .iter()
+        .any(|(file, stamp)| FileStamp::of(file) != *stamp)
 }
 
 /// What [`logins_in`] read.
@@ -225,10 +256,15 @@ fn moved_since(seen: Option<&Seen>, stamps: &[Option<FileStamp>], now: i64) -> b
 struct LoginsRead {
     /// One report per pooled CLI.
     reports: mine::Reports,
-    /// The first second after the read at which a Claude Code row's reading on its vault token
-    /// can answer otherwise by the clock alone (`accounts::on_token_turns`: the reading coming to
-    /// stand, aging out, or the row's token ending): `None` where none is ahead.
+    /// The first second after the read at which a row can read otherwise by the clock alone: a
+    /// Claude Code row's reading on its vault token coming to stand, aging out, or its token
+    /// ending (`accounts::on_token_turns`), and a credential's stated end coming within 30 days or
+    /// passing, or its refusal coming to be settled (`login_token::Reading::turns`): `None` where
+    /// none is ahead.
     turns: Option<i64>,
+    /// Each file a row's credential facts are read from (`login_token::files`), with its stamp
+    /// taken before the read, so a file that moves while it reads has moved at the next pass.
+    watched: Vec<(PathBuf, Option<FileStamp>)>,
 }
 
 /// Each file's stamp now, `None` for one that is not there.
@@ -249,7 +285,10 @@ fn store_for(cli: Cli, harness: &Path, home: Option<&Path>) -> Option<accounts::
 /// Every file a pass's login rows are read from ([`logins_in`]): each pooled CLI's roster beside
 /// the `aterm.toml` at `config`, and its store's state, sync receipt, ledger and `logins.json`
 /// (`Store::state_files`, `Store::logins_files`), with Claude Code's reading of the rows on their
-/// vault token (`accounts::TOKENS_HERE_FILE`). Their stamps are looked at, never their contents.
+/// vault token (`accounts::TOKENS_HERE_FILE`) and its token facts (`SetupTokens::files`: the
+/// table and its checks, whose mint and last use the rows on a token state, and the refusals
+/// beside the vault state under `home`). Their stamps are looked at, never their contents; each
+/// row's own credential files are stamped by the read that reads them ([`LoginsRead::watched`]).
 fn login_files(config: &Path, harness: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for cli in Cli::ALL {
@@ -263,12 +302,19 @@ fn login_files(config: &Path, harness: &Path, home: Option<&Path>) -> Vec<PathBu
                         .state_file()
                         .with_file_name(accounts::TOKENS_HERE_FILE),
                 );
+                files.extend(SetupTokens::files(&store, vault(home).as_ref()));
             }
         }
     }
     files.sort();
     files.dedup();
     files
+}
+
+/// Where this Mac keeps its vault state under `home`, located with no identity started
+/// (`Paths::locate_for_home`): the folder whose value-free refusals file the login source reads.
+fn vault(home: Option<&Path>) -> Option<aterm_secrets::client::Paths> {
+    home.map(aterm_secrets::client::Paths::locate_for_home)
 }
 
 /// The Claude Code rows on their vault token now: such a row is held by its token's account, not
@@ -290,17 +336,21 @@ fn on_token_now(config: &Path, home: Option<&Path>) -> OnToken {
 }
 
 /// This Mac's logins at `now`, one report per pooled CLI: its accounts store under `harness`
-/// ([`store_for`]; its roster beside the `aterm.toml` at `config`), read without a credential
-/// (`Store::peek_account_records`) with the upkeep's reading of the rows on their vault token
-/// (`Store::read_tokens_here`, no vault read), through the harness's value-free rows
-/// (`journal::login_rows`), each word checked again into the journal's types ([`login`]); a row
-/// outside the journal's words is left out. Each says why this Mac holds it as the lab does:
-/// `linked` where a preference of this Mac's names it, else `fill` (run here with no preference
-/// naming it, or an account the lab does not know); the flusher's book says the reason of a
-/// `place` row over either. A CLI with no roster holds none (`Some` of nothing); one whose store
-/// does not read, or that keeps its store under a home there is none of, is `None`, which leaves
-/// its rows as the book holds them. With them, when the token reading of a Claude Code row it read
-/// next turns ([`LoginsRead::turns`]). `None` where the lab names no machine for this Mac.
+/// ([`store_for`]; its roster beside the `aterm.toml` at `config`), its records read as they
+/// stand (`Store::peek_account_records`) with the upkeep's reading of the rows on their vault
+/// token (`Store::read_tokens_here`, no vault read), through the harness's value-free rows
+/// (`journal::login_rows`), each with the facts of the credential its sign-in runs on
+/// (`login_token::read`: Claude Code's from its token facts, `SetupTokens::read`, and its
+/// credential file where it is in one; Codex's from its `auth.json`), each word checked again
+/// into the journal's types ([`login`]); a row outside the journal's words is left out. Each
+/// says why this Mac holds it as the lab does: `linked` where a preference of this Mac's names
+/// it, else `fill` (run here with no preference naming it, or an account the lab does not know);
+/// the flusher's book says the reason of a `place` row over either. A CLI with no roster holds
+/// none (`Some` of nothing); one whose store does not read, or that keeps its store under a home
+/// there is none of, is `None`, which leaves its rows as the book holds them. With them, the
+/// first second the clock can make a row read otherwise ([`LoginsRead::turns`]) and the
+/// credential files the rows were read from, each stamped before its read
+/// ([`LoginsRead::watched`]). `None` where the lab names no machine for this Mac.
 fn logins_in(
     lab: &Lab,
     config: &Path,
@@ -310,7 +360,14 @@ fn logins_in(
 ) -> Option<LoginsRead> {
     let me = lab.me.as_ref()?;
     let mut out = mine::Reports::new();
-    let mut turns: Option<i64> = None;
+    let turns: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
+    let turn = |at: Option<i64>| {
+        if let Some(at) = at.filter(|at| *at > now) {
+            turns.set(Some(turns.get().map_or(at, |first| first.min(at))));
+        }
+    };
+    let mut watched: Vec<(PathBuf, Option<FileStamp>)> = Vec::new();
+    let vault_paths = vault(home);
     for cli in Cli::ALL {
         let Some(word) = mine::Cli::parse(cli.id()) else {
             continue;
@@ -323,8 +380,10 @@ fn logins_in(
             let mut records = store.peek_account_records(&path, now).ok()?;
             records.state.tokens_here = store.read_tokens_here();
             for row in &records.roster.rows {
-                if let Some(at) = accounts::on_token_turns(row, &records.state, now) {
-                    turns = Some(turns.map_or(at, |first| first.min(at)));
+                turn(accounts::on_token_turns(row, &records.state, now));
+                for file in login_token::files(cli, row, &store) {
+                    let stamp = FileStamp::of(&file);
+                    watched.push((file, stamp));
                 }
             }
             let linked: BTreeSet<&str> = records
@@ -342,8 +401,19 @@ fn logins_in(
                     "fill"
                 }
             };
+            let setup = if cli == Cli::Claude {
+                SetupTokens::read(&store, vault_paths.as_ref())
+            } else {
+                SetupTokens::default()
+            };
+            let judged = login_token::Judged::of(&store, &records);
+            let token = |row: &Row, key: &journal::Key| {
+                let read = login_token::read(cli, row, key, &judged, &store, &setup, now);
+                turn(read.turns);
+                read.facts
+            };
             Some(
-                journal::login_rows(cli, &records, &keyer, &held, now)
+                journal::login_rows(cli, &records, &keyer, &held, &token, now)
                     .iter()
                     .filter_map(login)
                     .collect(),
@@ -351,9 +421,12 @@ fn logins_in(
         };
         out.insert(word, read());
     }
+    watched.sort_by(|a, b| a.0.cmp(&b.0));
+    watched.dedup_by(|a, b| a.0 == b.0);
     Some(LoginsRead {
         reports: out,
-        turns,
+        turns: turns.get(),
+        watched,
     })
 }
 
@@ -381,7 +454,36 @@ fn login(row: &journal::LoginRow) -> Option<Login> {
         attempt_at: row.attempt_at,
         attempt_route: word(row.attempt_route, mine::Route::parse)?,
         plan: word(row.plan, Word::new)?,
+        cred: row.token.as_ref().map(credential),
     })
+}
+
+/// The journal's credential the harness's facts are: each word mapped to the journal's own by a
+/// total match, so a word either side adds fails to build until it is mapped.
+fn credential(token: &login_token::TokenFacts) -> mine::Credential {
+    mine::Credential {
+        kind: match token.kind {
+            login_token::Kind::OAuth => mine::CredKind::OAuth,
+            login_token::Kind::SetupToken => mine::CredKind::SetupToken,
+            login_token::Kind::ApiKey => mine::CredKind::ApiKey,
+        },
+        kept: token.kept.map(|kept| match kept {
+            login_token::Kept::Keychain => mine::Kept::Keychain,
+            login_token::Kept::LoginFile => mine::Kept::LoginFile,
+            login_token::Kept::SecretStore => mine::Kept::SecretStore,
+        }),
+        issued_at: token.issued_at,
+        expires_at: token.expires_at,
+        refreshed_at: token.refreshed_at,
+        last_used: token.last_used,
+        state: match token.state {
+            login_token::State::Valid => mine::CredState::Valid,
+            login_token::State::Expiring => mine::CredState::Expiring,
+            login_token::State::Expired => mine::CredState::Expired,
+            login_token::State::Refused => mine::CredState::Refused,
+            login_token::State::Unknown => mine::CredState::Unknown,
+        },
+    }
 }
 
 /// What this Mac runs that it does not prefer (`alab_roster::holdings`), over every pooled CLI's

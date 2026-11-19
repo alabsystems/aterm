@@ -59,23 +59,35 @@ pub(crate) fn serve(
     // A fixed app-owned operation is authorized by the PID generation bound
     // before suspended sudo was resumed. Unbound requests still take the
     // unchanged generic argv/refusal path below.
-    let owned_request = match crate::cpu_policy_authorization::request(sudo_pid) {
-        Ok(request) => request,
-        Err(()) => {
-            return public_reply(
-                "ERR askpass refused owned operation already requested or withdrawn\n",
-            );
-        }
-    };
+    use crate::root_step_authorization::OwnedOperation;
+    let owned_request =
+        match crate::cpu_policy_authorization::request(sudo_pid).and_then(|cpu| match cpu {
+            Some((op, ticket)) => Ok(Some((OwnedOperation::CpuPolicy(op), ticket))),
+            None => crate::root_step_authorization::request(sudo_pid)
+                .map(|step| step.map(|(op, ticket)| (OwnedOperation::RootStep(op), ticket))),
+        }) {
+            Ok(request) => request,
+            Err(()) => {
+                return public_reply(
+                    "ERR askpass refused owned operation already requested or withdrawn\n",
+                );
+            }
+        };
     if let Some((owned, ticket)) = owned_request {
         let (tx, rx) = std::sync::mpsc::channel();
+        let command = match &owned {
+            OwnedOperation::CpuPolicy(_) => {
+                "Read CPU policy flags (Game Mode, CarPlay, runaway mitigation)".to_owned()
+            }
+            OwnedOperation::RootStep(op) => format!("aterm {}", op.step().argv().join(" ")),
+        };
         let request = AskpassRequest {
             ticket: std::sync::Arc::clone(&ticket),
             attribute_from: std::process::id() as i32,
-            owned: Some(std::sync::Arc::clone(&owned)),
+            owned: Some(owned.clone()),
             exact: false,
             purpose: None,
-            command: "Read CPU policy flags (Game Mode, CarPlay, runaway mitigation)".into(),
+            command,
             invoker: "aterm system resource diagnostics".into(),
             reply: tx,
         };

@@ -23,6 +23,7 @@ USAGE:
     aterm keeper stop   [--identity designated|uid] [--label <label>]
     aterm keeper status [--sock <path>] [--identity designated|uid]
     aterm keeper serve  [--sock <path>] [--identity designated|uid] [--no-relaunch]
+                        [--job <label>]
 
     start    Submit this build's keeper as a launchd job (`launchctl submit`:
              no plist; launchd restarts it whenever it exits, until `stop` or
@@ -54,6 +55,12 @@ OPTIONS (a verb ignores those its USAGE line leaves out):
                          (`com.aterm.aterm.keeper.test.*`) is accepted.
     --no-relaunch        Never reopen a window; a crashed window's shells wait
                          for the next launch.
+    --job <label>        The launchd job this keeper runs as when it is not
+                         its build's own (a test label `start --label`
+                         submits); by default, its build's own label. Only
+                         a keeper launchd runs as that job (its
+                         XPC_SERVICE_NAME) honours a window's request to
+                         restart: launchd starts it again.
 
 macOS only. Each window of an app bundle uses the keeper and starts it; turn
 that off with `[keeper] enabled = false` in aterm.toml (read at launch), then
@@ -73,6 +80,8 @@ struct Args {
     label: Option<String>,
     #[cfg_attr(not(unix), allow(dead_code))]
     no_relaunch: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    job: Option<String>,
 }
 
 fn parse(args: &[OsString]) -> Result<Args, String> {
@@ -86,6 +95,7 @@ fn parse(args: &[OsString]) -> Result<Args, String> {
     let mut identity = IdentityPolicy::Designated;
     let mut label = None;
     let mut no_relaunch = false;
+    let mut job = None;
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => help = true,
@@ -108,6 +118,13 @@ fn parse(args: &[OsString]) -> Result<Args, String> {
             }
             "--label" => label = Some(it.next().ok_or("--label needs a label")?),
             "--no-relaunch" => no_relaunch = true,
+            "--job" => {
+                job = Some(
+                    it.next()
+                        .filter(|s| !s.is_empty())
+                        .ok_or("--job needs a label")?,
+                );
+            }
             other => return Err(format!("unknown option {other:?}")),
         }
     }
@@ -118,6 +135,7 @@ fn parse(args: &[OsString]) -> Result<Args, String> {
         identity,
         label,
         no_relaunch,
+        job,
     })
 }
 
@@ -190,12 +208,17 @@ fn serve(args: &Args, version: &str) -> ExitCode {
         crate::code::mark_ran(copy);
     }
     let exe = crate::code::origin_exe(own_copy.is_some());
+    // Taken before any copy, so that a file an update puts at the path while the copy is made
+    // reads as a replacement.
+    let image = crate::code::started_image(own_copy.is_some(), exe.as_deref());
     if let Some(dir) = code.as_deref() {
         crate::code::sweep(dir, crate::server::born);
     }
     if own_copy.is_none() && identity.policy() == IdentityPolicy::Designated {
         let why = match (exe.as_deref(), code.as_deref()) {
-            (Some(exe), Some(dir)) => crate::code::run_from_own_copy(exe, dir, &identity),
+            (Some(exe), Some(dir)) => {
+                crate::code::run_from_own_copy(exe, dir, &identity, image.as_ref())
+            }
             (None, _) => "this executable's path cannot be read".to_string(),
             (_, None) => "no absolute $HOME to keep a copy in".to_string(),
         };
@@ -204,7 +227,7 @@ fn serve(args: &Args, version: &str) -> ExitCode {
              check it once an update removes this build"
         );
     }
-    let exit = serve_as(args, identity, exe.as_deref(), version);
+    let exit = serve_as(args, identity, exe.as_deref(), image, version);
     if let Some(copy) = own_copy {
         let _ = std::fs::remove_dir_all(copy);
     }
@@ -216,6 +239,7 @@ fn serve_as(
     args: &Args,
     identity: Identity,
     exe: Option<&std::path::Path>,
+    image: Option<crate::code::ExeImage>,
     version: &str,
 ) -> ExitCode {
     let Some(socket) = args
@@ -244,6 +268,25 @@ fn serve_as(
             return ExitCode::FAILURE;
         }
     };
+    let place = exe.map(|exe| crate::job::place_for(exe).label);
+    match (
+        image,
+        supervised(
+            args.job.as_deref(),
+            place.as_deref(),
+            std::env::var("XPC_SERVICE_NAME").ok().as_deref(),
+        ),
+    ) {
+        (Some(image), Ok(())) => server.restart_for(image),
+        (None, _) => eprintln!(
+            "aterm keeper serve: the file at this executable's path was not read; a window's \
+             RESTART_WHEN_SAFE is never honoured"
+        ),
+        (Some(_), Err(why)) => eprintln!(
+            "aterm keeper serve: {why}, so nothing would start this keeper again; a window's \
+             RESTART_WHEN_SAFE is never honoured"
+        ),
+    }
     eprintln!(
         "aterm keeper: serving on {} (pid {}, running {})",
         server.socket().display(),
@@ -256,6 +299,30 @@ fn serve_as(
             eprintln!("aterm keeper serve: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Whether launchd runs this keeper as its job: the label `job` names (`--job`, which `start`
+/// passes only for a label other than the place's own, a test's), else `place`, the label of
+/// the place its executable belongs to ([`crate::job::place_for`], the label `start` submits by
+/// default), and launchd set `xpc` (`XPC_SERVICE_NAME`, which it sets for each job it runs) to
+/// it. Only such a keeper may exit for a wanted restart, since only launchd's `KeepAlive` starts
+/// it again; one run by hand, by a test, or under another job would end for good. The installed
+/// job's argv names no new flag, so a build from before this one that launchd starts from it
+/// (a downgrade, or the updater's rollback) still parses it.
+/// # Errors
+/// Why not, in words for the log.
+#[cfg(unix)]
+fn supervised(job: Option<&str>, place: Option<&str>, xpc: Option<&str>) -> Result<(), String> {
+    match (job.or(place), xpc) {
+        (None, _) => {
+            Err("no launchd job is known for this keeper (no --job, no place)".to_string())
+        }
+        (Some(job), Some(xpc)) if xpc == job => Ok(()),
+        (Some(job), xpc) => Err(format!(
+            "launchd does not run this keeper as job {job} (XPC_SERVICE_NAME is {})",
+            xpc.map_or_else(|| "unset".to_string(), |x| format!("{x:?}"))
+        )),
     }
 }
 
@@ -449,12 +516,25 @@ fn fresh_log(log: &std::path::Path) -> std::io::Result<()> {
         .map(drop)
 }
 
-/// The `serve` a job runs: it reopens the app after a crash only where `relaunch` says so.
+/// The `serve` the job `label` runs, for an executable whose place's own label is `place`: it
+/// reopens the app after a crash only where `relaunch` says so, and names its job (`--job`,
+/// [`supervised`]) only when `label` is not `place`, a test's label. A keeper derives its own
+/// place's label itself, so the argv of the job a build submits for its own place, the installed
+/// app's included, holds nothing a build from before `--job` would refuse.
 #[cfg(unix)]
-fn serve_argv<'a>(socket: &'a str, identity: &'a str, relaunch: bool) -> Vec<&'a str> {
+fn serve_argv<'a>(
+    socket: &'a str,
+    identity: &'a str,
+    relaunch: bool,
+    label: &'a str,
+    place: &str,
+) -> Vec<&'a str> {
     let mut argv = vec!["keeper", "serve", "--sock", socket, "--identity", identity];
     if !relaunch {
         argv.push("--no-relaunch");
+    }
+    if label != place {
+        argv.extend(["--job", label]);
     }
     argv
 }
@@ -509,7 +589,13 @@ fn ensure_job(
         IdentityPolicy::SameUid => "uid",
     };
     let program = exe.to_string_lossy().into_owned();
-    let argv = serve_argv(&socket_arg, identity, own_place && place.installed);
+    let argv = serve_argv(
+        &socket_arg,
+        identity,
+        own_place && place.installed,
+        &label,
+        &place.label,
+    );
     crate::job::submit(&label, &program, &argv, &log).map_err(|e| e.to_string())?;
     Ok(Ensured::Submitted {
         socket,

@@ -1625,146 +1625,76 @@ fn an_import_plans_no_row_for_a_seat_no_sheet_names() {
     assert!(labelled("m3"), "a Mac the sheets name has its row");
 }
 
-/// A harness stand-in that renders two exports from the view: each lists the accounts the lab
-/// holds (by key) and the place rows the journal holds, so the writer's path is the one under test.
-struct Render;
-
-impl Vendors for Render {
-    fn mark(&self, provider: &str, cell: &str, notes: &str) -> import::Mark {
-        Stand.mark(provider, cell, notes)
-    }
-
-    fn export_names(&self) -> Vec<String> {
-        vec!["fleet-accounts.toml".to_owned(), "ai-pool.toml".to_owned()]
-    }
-
-    fn exports(
-        &self,
-        view: &super::super::view::LabView,
-        places: &super::super::journal::place::Places,
-        current: &BTreeMap<String, String>,
-    ) -> std::result::Result<Vec<(String, String)>, String> {
-        if current.values().any(|text| text.contains("unparseable")) {
-            return Err("a current file does not parse".to_owned());
-        }
-        let keys: Vec<&str> = view.accounts.keys().map(String::as_str).collect();
-        Ok(self
-            .export_names()
-            .into_iter()
-            .map(|name| {
-                let body = format!(
-                    "# {name}\n# {}\n# places {}\n",
-                    keys.join(" "),
-                    places.rows.len()
-                );
-                (name, body)
-            })
-            .collect())
-    }
-}
-
-/// `export` renders through the harness, publishes the changed files the vault holds in one admin
-/// publish of the scratch vault and never creates one it does not hold, and a second run publishes
-/// nothing; once the vault is synced `check` reports the held file `same` and the other `missing`,
-/// an edit by hand `edited`, and a dry run never publishes. Nothing here touches a real vault: the
-/// lab's paths are scratch homes.
-/// NEGATIVE CONTROL: with `run` publishing whatever `plan` says (no compare-before-write: `plan`
-/// keeping every file), the second `--apply` publishes again (`left: true right: false`); with
-/// `plan` writing a missing file, the dry run plans `ai-pool.toml` (`"write": Bool(true)`).
+/// The generated exports' writer and drift report are gone (FL-209): `export` is an unknown verb,
+/// bare, with `--apply` and with `--dry-run`, and the usage text names no such verb; `check`'s
+/// report has no `exports` field and holds exactly its other fields, the same with the harness's
+/// stand-in in hand as without it. Nothing here touches a real vault: the lab's paths are scratch
+/// homes.
+/// NEGATIVE CONTROL: with `"export"` restored to `VERBS` and an `"export" => Ok(json!({}))` arm in
+/// `run_io`'s dispatch, the first assertion fails (`export is an unknown verb: Ok(Object({}))`);
+/// with `"exports": Value::Null` restored to `check`'s report, the key-set assertion lists
+/// `"exports"`.
 #[test]
-fn the_export_publishes_once_and_check_reports_its_drift() {
+fn export_is_an_unknown_verb_and_check_reports_no_exports() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], NOW);
     let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let (vault, logins) = sheets(scratch.path());
-    let mut opened = Vec::new();
-    import(paths, &["--apply"], &vault, &logins, &mut opened);
-    // The scratch vault holds the fleet file an older Mac reads; it holds no pool.
-    let admin = aterm_secrets::client::admin_open(paths).unwrap();
-    let mut doc = admin.doc.clone();
-    doc.set_entry(
-        &aterm_secrets::text::Audience::Everyone,
-        "fleet-accounts.toml",
-        b"# by hand\n",
-    )
-    .unwrap();
-    aterm_secrets::client::admin_publish(paths, &admin, &doc).unwrap();
-    let mut none = |_: &Path| Ok(());
-    let mut export = |extra: &[&str]| {
-        let mut list = vec!["export"];
-        list.extend_from_slice(extra);
-        run(paths, &words(&list), Some(&Render), &mut none, NOW).unwrap()
-    };
-    let dry = export(&["--dry-run"]);
-    assert_eq!(dry["published"], json!(false), "{dry}");
-    assert_eq!(
-        dry["files"],
-        json!([
-            {"file": "fleet-accounts.toml", "state": "unsealed", "write": true},
-            {"file": "ai-pool.toml", "state": "missing", "write": false},
-        ]),
-        "{dry}"
-    );
-    let first = export(&["--apply"]);
-    assert_eq!(first["published"], json!(true), "{first}");
-    let second = export(&["--apply"]);
-    assert_eq!(
-        second["published"],
-        json!(false),
-        "compare before write: {second}"
-    );
-    aterm_secrets::client::sync(paths, None).unwrap();
-    let held_entry = |name: &str| {
-        aterm_secrets::client::read_in_place(paths, name)
-            .unwrap()
-            .map(|value| value.as_str().unwrap().to_owned())
-    };
-    let held = held_entry("fleet-accounts.toml").unwrap();
+    for list in [
+        &["export"][..],
+        &["export", "--apply"],
+        &["export", "--dry-run"],
+    ] {
+        let refused = run(
+            paths,
+            &words(list),
+            Some(&Stand),
+            &mut |_: &Path| Ok(()),
+            NOW,
+        );
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.to_string().contains("unknown alab verb")),
+            "export is an unknown verb: {refused:?}"
+        );
+    }
     assert!(
-        held.starts_with("# @generated by aterm db alab export --apply (seal "),
-        "{held}"
+        !USAGE
+            .lines()
+            .any(|line| line.trim_start().starts_with("export")),
+        "the usage lists no export verb"
     );
-    assert!(
-        held_entry("ai-pool.toml").is_none(),
-        "an entry the vault did not hold is never created"
-    );
-    // A hand edit of the vault's entry, published and synced as an admin's edit would be.
-    let republish = |text: &str| {
-        let admin = aterm_secrets::client::admin_open(paths).unwrap();
-        let mut doc = admin.doc.clone();
-        doc.set_entry(
-            &aterm_secrets::text::Audience::Everyone,
-            "fleet-accounts.toml",
-            text.as_bytes(),
-        )
-        .unwrap();
-        aterm_secrets::client::admin_publish(paths, &admin, &doc).unwrap();
-        aterm_secrets::client::sync(paths, None).unwrap();
-    };
-    let check = || {
-        run(
+    for vendors in [Some(&Stand as &dyn Vendors), None] {
+        let report = run(
             paths,
             &words(&["check"]),
-            Some(&Render),
+            vendors,
             &mut |_: &Path| Ok(()),
             NOW,
         )
-        .unwrap()
-    };
-    let states = |report: &Value| -> Vec<String> {
-        report["exports"]
-            .as_array()
+        .unwrap();
+        let mut fields: Vec<&str> = report
+            .as_object()
             .unwrap()
-            .iter()
-            .map(|f| f["state"].as_str().unwrap().to_owned())
-            .collect()
-    };
-    assert_eq!(states(&check()), ["same", "missing"]);
-    republish(&held.replace("# places", "# hand edit, places"));
-    assert_eq!(states(&check()), ["edited", "missing"]);
-    // A current entry the harness cannot parse refuses the export and is reported, not hidden.
-    republish("unparseable");
-    assert!(check()["exports"]["error"].as_str().is_some());
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "complete",
+                "findings",
+                "journal",
+                "lab",
+                "next",
+                "refused",
+                "registration",
+                "registry",
+            ],
+            "{report}"
+        );
+    }
 }
 
 /// The verbs' scripted [`Io`]: an opener that runs `edit`, stdin that answers `stdin`, no review
@@ -2252,10 +2182,12 @@ fn edit_saves_the_owners_cell_through_the_grid() {
 }
 
 /// `who`, `quota`, `log` and `signins` read the journal window: after one Mac's flushed session,
-/// sign-in and reading, `who` names that Mac's enrollment and the time, `quota` the window's
-/// usage, `signins` its sign-in word, and `log` the account's three events.
-/// NEGATIVE CONTROL: with `log` matching events by the machine filter alone (`(Some(pk), _) =>
-/// false`), the account's log is empty: `left: 0 right: 3`.
+/// sign-in, reading and Fable week's wall, `who` names that Mac's enrollment and the time,
+/// `quota` the window's usage and the Fable wall as a row of its own by its model (FL-271),
+/// `signins` its sign-in word, and `log` the account's four events.
+/// NEGATIVE CONTROLS, run: with `log` matching events by the machine filter alone (`(Some(pk), _)
+/// => false`), the account's log is empty: `left: 0 right: 4`; with `quota`'s rows naming no
+/// model, the Fable row's `model` is `Null`.
 #[test]
 fn the_journal_readers_say_who_used_an_account_and_its_quota() {
     use crate::alab::journal::{
@@ -2277,6 +2209,7 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
         cli: Word::new("claude").unwrap(),
         sub: None,
         window: None,
+        model: None,
         pct_x10: None,
         reset: None,
         res: None,
@@ -2312,6 +2245,16 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
             ..base
         })
         .unwrap();
+    spool
+        .append(&Event {
+            t: now - 570,
+            kind: Kind::Wall,
+            window: Some(Window::WeekModel),
+            model: Some(crate::alab::journal::ModelBucket::Fable),
+            until: Some(now + 86_400),
+            ..base
+        })
+        .unwrap();
     let pass = |at| flush::pass(paths, &spool, &Presence::default, false, at).unwrap();
     assert!(matches!(pass(now - 120), Flushed::Wrote { .. }));
     assert!(matches!(pass(now - 60), Flushed::Wrote { .. }));
@@ -2331,6 +2274,17 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
     assert_eq!(window["window"], json!("5h"));
     assert_eq!(window["usage"]["state"], json!("current"));
     assert_eq!(window["usage"]["used_pct_x10"], json!(250));
+    // A model's own week's wall is a row of its own, by its model, walling no account (FL-271).
+    let fable = &quota["accounts"][0]["windows"][1];
+    assert_eq!(
+        (&fable["window"], &fable["model"], &fable["walls_account"]),
+        (
+            &json!("7d-model"),
+            &json!("seven_day_overage_included"),
+            &json!(false)
+        ),
+        "{quota}"
+    );
     // What runs on m3 is its preferences with each account's quota from the same window.
     let m3 = verb(paths, &["machines", "m3"]).unwrap();
     let on = m3["prefers"]
@@ -2345,7 +2299,7 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
     let signins = verb(paths, &["signins"]).unwrap();
     assert_eq!(signins["accounts"][0]["machines"][0]["state"], json!("in"));
     let log = verb(paths, &["log", &claude, "--days", "1"]).unwrap();
-    assert_eq!(log["events"].as_array().unwrap().len(), 3, "{log}");
+    assert_eq!(log["events"].as_array().unwrap().len(), 4, "{log}");
     assert_eq!(log["events"][0]["kind"], json!("session-start"));
     assert_eq!(log["events"][0]["slug"], json!("claude-ann-example"));
     assert!(verb(paths, &["log", "nobody"]).is_err());
@@ -3092,6 +3046,7 @@ fn a_stored_redaction_mark_is_uncovered_until_the_registry_holds_a_password() {
             key: crate::fleet_db::storage_key("emails", &email).unwrap(),
             value: Some(row),
         }],
+        said: None,
     })
     .unwrap();
     drop(db);
@@ -3128,6 +3083,7 @@ fn a_password_beside_a_concurrent_protected_mark_is_uncovered() {
                 key: crate::fleet_db::storage_key("emails", email).unwrap(),
                 value: Some(row),
             }],
+            said: None,
         })
         .unwrap();
     };
@@ -3201,6 +3157,7 @@ fn a_spelling_is_not_reported_beside_a_column_that_really_disagrees() {
                 key: crate::fleet_db::storage_key("emails", email).unwrap(),
                 value: Some(row),
             }],
+            said: None,
         })
         .unwrap();
     };

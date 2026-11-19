@@ -220,6 +220,7 @@ fn protected_email_validation_rejects_nested_credential_fields_at_ingestion() {
                     key: key.clone(),
                     value: Some(row),
                 }],
+                said: None,
             }
             .encode()
             .unwrap();
@@ -367,6 +368,7 @@ fn a_stored_placeholder_does_not_stop_a_rekey_and_moves_as_a_word() {
             key: storage_key("emails", key).unwrap(),
             value: Some(json!({"email": key, "protected": false, "password": REDACTED})),
         }],
+        said: None,
     })
     .unwrap();
     drop(db);
@@ -649,6 +651,7 @@ fn no_member_can_stop_a_row_for_good() {
             key: storage_key("emails", key).unwrap(),
             value: None,
         }],
+        said: None,
     };
 
     assert!(a.commit(stop.clone()).is_err(), "the verb refuses it");
@@ -700,6 +703,7 @@ fn a_stored_flag_reads_as_stored_and_a_read_field_is_not_taken_for_the_row() {
                 "_conflicts": [{"notes": "stale"}],
             })),
         }],
+        said: None,
     })
     .unwrap();
 
@@ -789,6 +793,7 @@ fn a_password_against(tmp: &Path, other: Value) -> Database {
                 key: storage_key("emails", key).unwrap(),
                 value: Some(value),
             }],
+            said: None,
         })
         .unwrap();
     };
@@ -856,6 +861,7 @@ fn password_cells_that_say_the_same_thing_are_no_conflict() {
                 key: storage_key("emails", key).unwrap(),
                 value: Some(row),
             }],
+            said: None,
         })
         .unwrap();
     };
@@ -979,6 +985,7 @@ fn values_that_read_alike_are_no_conflict() {
                 key: storage_key("emails", key).unwrap(),
                 value: Some(junk),
             }],
+            said: None,
         })
         .unwrap();
         put_row(&mut b, "emails", key, json!({"email": key, "notes": "n"})).unwrap();
@@ -1017,6 +1024,7 @@ fn a_dump_holding_a_stored_mark_cannot_clear_a_password() {
                 key: storage_key("emails", key).unwrap(),
                 value: Some(json!({"email": key, "protected": false, "password": REDACTED})),
             }],
+            said: None,
         })
         .unwrap();
     let dump = dump_all(&other, true).unwrap();
@@ -1598,6 +1606,7 @@ fn a_stored_redaction_mark_reads_as_a_word_and_blocks_nothing() {
                 key: storage_key("emails", key).unwrap(),
                 value: Some(json!({"email": key, "protected": false, "password": REDACTED})),
             }],
+            said: None,
         })
         .unwrap();
     };

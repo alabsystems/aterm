@@ -57,8 +57,9 @@ impl Refs<'_> {
     }
 
     /// Execute one canonical control transaction with the repository-wide
-    /// durable atomic-write intent. Unknown outcomes fence later writes for
-    /// agh's window (`Journal::closable`).
+    /// durable atomic-write intent. Unknown outcomes fence later writes until
+    /// a complete origin observation reconciles the dead writer's intent
+    /// (`Journal::closable`).
     ///
     /// # Errors
     /// As [`Self::check_control`], plus intent/journal failures. A transient
@@ -77,8 +78,10 @@ impl Refs<'_> {
     }
 
     /// Execute one canonical control transaction with a native-progress
-    /// inactivity window instead of a wall-clock execution bound. The ordinary
-    /// Git budget remains only the credential grant's lifetime.
+    /// inactivity window instead of a wall-clock execution bound, settled as
+    /// [`Self::push_atomic_with_progress_window`] settles a push the window
+    /// ended. The ordinary Git budget remains the credential grant's lifetime
+    /// and the patience with a receive failure that moved no ref.
     ///
     /// # Errors
     /// As [`Self::push_control`].
@@ -157,8 +160,8 @@ impl Refs<'_> {
     /// Push exact local objects with atomic leases and one durable intent.
     /// Transient receive failures re-read remote refs before any retry.
     /// A journaled unknown outcome blocks every later atomic batch for this
-    /// repository until it is reconciled or agh's window for it ends
-    /// (`Journal::closable`).
+    /// repository until a complete origin observation reconciles the dead
+    /// writer's intent (`Journal::closable`).
     ///
     /// # Errors
     /// As `check_push`, plus the journal's errors. A missing acknowledgement
@@ -191,8 +194,14 @@ impl Refs<'_> {
     }
 
     /// The same journaled atomic operation with a native-progress inactivity
-    /// window instead of a wall-clock execution bound. The ordinary Git budget
-    /// remains only the credential grant's lifetime.
+    /// window instead of a wall-clock execution bound: a native child whose tree
+    /// or HTTP transfer makes no progress for the window ends, and the write
+    /// settles its own intent ([`crate::git::GitRun::progress_window`]): a push
+    /// ended once it may have sent its pack is never made again. It is settled
+    /// Created where the transfer's bound ended it and one re-read finds every
+    /// requested ref moved; otherwise Unknown, open until it is reconciled. The
+    /// ordinary Git budget remains the credential grant's lifetime and the
+    /// patience with a receive failure that moved no ref.
     ///
     /// # Errors
     /// As [`Self::push_atomic`].

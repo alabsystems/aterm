@@ -32,7 +32,8 @@
 //! (`"seal": {"absent": "A8"}`), so a file shaped like a record counts as one; the counter
 //! refuses only what Trust would not write.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -220,10 +221,12 @@ pub struct Tally {
 }
 
 impl Tally {
-    fn add(&mut self, o: Tally) {
-        self.proved += o.proved;
-        self.calculus += o.calculus;
-        self.graded += o.graded;
+    fn checked_add(self, other: Tally) -> Option<Self> {
+        Some(Self {
+            proved: self.proved.checked_add(other.proved)?,
+            calculus: self.calculus.checked_add(other.calculus)?,
+            graded: self.graded.checked_add(other.graded)?,
+        })
     }
 }
 
@@ -247,50 +250,201 @@ pub fn record_path(target: &Path, package: &str) -> PathBuf {
         .join(format!("{stem}.ndjson"))
 }
 
+// Trust has kept the original metadata and added fields under the same v1 schema.
+// The later fields may be absent in archives; when present they have their writer's type.
 #[derive(Deserialize)]
-struct Line {
-    schema: Option<String>,
-    key: Option<String>,
-    status: Option<String>,
+#[serde(deny_unknown_fields)]
+struct Header {
+    schema: String,
+    package: String,
+    #[serde(rename = "lane")]
+    _lane: String,
+    #[serde(rename = "selection")]
+    _selection: String,
+    #[serde(rename = "seal")]
+    _seal: serde::de::IgnoredAny,
+    #[serde(rename = "profile")]
+    _profile: String,
+    #[serde(rename = "outcome")]
+    _outcome: String,
+    #[serde(rename = "vector")]
+    _vector: String,
+    #[serde(rename = "coverage_complete")]
+    _coverage_complete: bool,
+    #[serde(default, rename = "policy")]
+    _policy: String,
+    #[serde(default, rename = "targo_trust_commit")]
+    _targo_trust_commit: String,
+    #[serde(default, rename = "degraded_anchors")]
+    _degraded_anchors: usize,
+    #[serde(default, rename = "concluded")]
+    _concluded: bool,
+}
+
+/// Trust dispatches on the presence of either marker before decoding a closed record.
+#[derive(Deserialize)]
+struct BodyMarkers {
+    #[serde(default, deserialize_with = "present_field")]
+    compile_error: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "fn", default, deserialize_with = "present_field")]
+    function: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FunctionLine {
+    #[serde(rename = "fn")]
+    path: String,
+    #[serde(rename = "source")]
+    _source: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompileErrorLine {
+    compile_error: String,
+    #[serde(rename = "message")]
+    _message: String,
+    #[serde(rename = "code")]
+    _code: Option<String>,
+    #[serde(rename = "file")]
+    _file: Option<String>,
+    #[serde(rename = "line")]
+    _line: Option<u32>,
+    #[serde(rename = "col")]
+    _col: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObligationLine {
+    key: String,
+    #[serde(rename = "kind")]
+    _kind: String,
+    status: String,
+    stop: String,
+    #[serde(rename = "file")]
+    _file: Option<String>,
+    #[serde(rename = "line")]
+    _line: Option<u32>,
+    #[serde(rename = "col")]
+    _col: Option<u32>,
+    #[serde(default, deserialize_with = "present_field")]
+    basis: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_field")]
     encoding: Option<String>,
+    #[serde(default, deserialize_with = "present_field")]
     discharge: Option<String>,
+    #[serde(default, deserialize_with = "present_field")]
     premises: Option<Vec<String>>,
 }
 
+/// Earlier writers omitted the three grade fields or the basis. A present field must
+/// deserialize as its own type, which allows null for the basis and not for a grade.
+fn present_field<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
+fn body_line<'de, T: Deserialize<'de>>(raw: &'de str, n: usize, kind: &str) -> Result<T, String> {
+    aterm_json::from_str(raw).map_err(|e| format!("line {n}: invalid {kind} row: {e}"))
+}
+
 /// Count one `trust.obligations.v1` record's proved obligations by grade. The header must
-/// name the schema; `fn` lines are skipped; an obligation line with none of `encoding`,
+/// name the schema. Compile errors precede functions in increasing key order. Each
+/// obligation belongs to its preceding function. An obligation line with none of `encoding`,
 /// `discharge`, `premises` is ungraded (a prover that states no grade). A graded line is held
 /// to what Trust's own reader (`targo-trust` `check_grade_fields`) and writer allow
 /// ([`check_grade`]), and a key may appear once: Trust writes one line per key (the worst of a
 /// key's rows), so a record that repeats one is not Trust's.
 ///
 /// # Errors
-/// An empty record, another schema, a line that is not JSON, an obligation line with no
-/// status, a key written twice, a line with some but not all of the three grade fields, or a
-/// grade [`check_grade`] refuses.
+/// An empty record, another schema, a malformed or misplaced body row, an obligation key
+/// written twice, a line with some but not all of the three grade fields, or a
+/// grade [`check_grade`] refuses, a proved row whose stop is not `solved`, or a stated
+/// failure basis inconsistent with its status.
 pub fn tally(text: &str) -> Result<Tally, String> {
+    tally_for(text, None)
+}
+
+fn tally_for(text: &str, expected_package: Option<&str>) -> Result<Tally, String> {
     let mut t = Tally::default();
     let mut lines = text.lines();
-    let header: Line = aterm_json::from_str(lines.next().ok_or("the record is empty")?)
-        .map_err(|e| format!("line 1 is not a record header: {e}"))?;
-    match header.schema.as_deref() {
-        Some(RECORD_SCHEMA) => {}
-        other => {
-            return Err(format!(
-                "the header says schema {}, and this counter reads {RECORD_SCHEMA}",
-                other.unwrap_or("(none)")
-            ));
-        }
+    let first = lines.next().ok_or("the record is empty")?;
+    if !first.trim_start().starts_with('{') {
+        return Err("line 1 is not a record header object".into());
+    }
+    let header: Header = aterm_json::from_str(first).map_err(|e| match expected_package {
+        Some(expected) => format!("line 1 is not a record header for package {expected:?}: {e}"),
+        None => format!("line 1 is not a record header: {e}"),
+    })?;
+    if header.schema != RECORD_SCHEMA {
+        return Err(format!(
+            "line 1: the header says schema {}, and this counter reads {RECORD_SCHEMA}",
+            header.schema
+        ));
+    }
+    if let Some(expected) = expected_package
+        && header.package != expected
+    {
+        return Err(format!(
+            "line 1: expected package {expected:?}, found {:?} in the record header",
+            header.package
+        ));
     }
     let mut keys: BTreeMap<String, usize> = BTreeMap::new();
+    let mut function: Option<String> = None;
+    let mut last_error: Option<String> = None;
     for (i, raw) in lines.enumerate() {
         let n = i + 2;
-        let l: Line =
-            aterm_json::from_str(raw).map_err(|e| format!("line {n} is not JSON: {e}"))?;
-        let Some(key) = l.key else {
-            continue; // a function's `fn` line
+        // Serde structs also accept positional arrays. The wire format uses JSON objects.
+        if !raw.trim_start().starts_with('{') {
+            return Err(format!("line {n}: expected a record object"));
+        }
+        let markers: BodyMarkers = body_line(raw, n, "record")?;
+        if markers.compile_error.is_some() {
+            let CompileErrorLine { compile_error, .. } = body_line(raw, n, "compile-error")?;
+            if function.is_some() {
+                return Err(format!("line {n}: compile-error row after a function"));
+            }
+            if last_error
+                .as_ref()
+                .is_some_and(|last| last >= &compile_error)
+            {
+                return Err(format!(
+                    "line {n}: compile-error key {compile_error:?} is out of order or repeated"
+                ));
+            }
+            last_error = Some(compile_error);
+            continue;
+        }
+        if markers.function.is_some() {
+            let FunctionLine { path, .. } = body_line(raw, n, "function")?;
+            function = Some(path);
+            continue;
+        }
+        let l: ObligationLine = body_line(raw, n, "obligation")?;
+        // Trust's split_obligation_key splits at the last '#' because a closure's path
+        // contains its own '#'. The writer groups every well-formed key by that path.
+        let Some((path, id)) = l.key.rsplit_once('#') else {
+            return Err(format!("line {n}: malformed obligation key {:?}", l.key));
         };
-        match keys.entry(key) {
+        if path.is_empty()
+            || id.len() != 16
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!("line {n}: malformed obligation key {:?}", l.key));
+        }
+        if function.as_deref() != Some(path) {
+            return Err(format!(
+                "line {n}: obligation {:?} must follow its function {path:?}",
+                l.key
+            ));
+        }
+        match keys.entry(l.key) {
             std::collections::btree_map::Entry::Occupied(entry) => {
                 return Err(format!(
                     "line {n}: key {:?} was written on line {} too, and Trust writes one line per key",
@@ -302,9 +456,20 @@ pub fn tally(text: &str) -> Result<Tally, String> {
                 entry.insert(n);
             }
         }
-        let status = l
-            .status
-            .ok_or_else(|| format!("line {n}: an obligation with no status"))?;
+        let status = l.status;
+        if let Some(basis) = l.basis {
+            let allowed = if status == "failed" {
+                matches!(basis.as_deref(), Some("refuted" | "unproved_fail_closed"))
+            } else {
+                basis.is_none()
+            };
+            if !allowed {
+                return Err(format!(
+                    "line {n}: {status:?} row with invalid failure basis {}",
+                    basis.as_deref().unwrap_or("null")
+                ));
+            }
+        }
         let grade = match (l.encoding, l.discharge, l.premises) {
             (None, None, None) => None,
             (Some(e), Some(d), Some(p)) => Some((e, d, p)),
@@ -322,6 +487,12 @@ pub fn tally(text: &str) -> Result<Tally, String> {
         };
         if status != "proved" {
             continue;
+        }
+        if l.stop != "solved" {
+            return Err(format!(
+                "line {n}: proved obligation has stop {:?}, expected \"solved\"",
+                l.stop
+            ));
         }
         t.proved += 1;
         if graded {
@@ -428,7 +599,12 @@ impl Credit {
     pub fn add(&mut self, name: &str, record: Option<Result<Tally, String>>) {
         match record {
             None => self.absent.push(name.to_string()),
-            Some(Ok(t)) => self.total.add(t),
+            Some(Ok(t)) => match self.total.checked_add(t) {
+                Some(total) => self.total = total,
+                None => self
+                    .refused
+                    .push((name.into(), "credit tally overflow".into())),
+            },
             Some(Err(why)) => self.refused.push((name.to_string(), why)),
         }
     }
@@ -436,8 +612,15 @@ impl Credit {
     /// The counter: `proved (calculus): N of P proved [credit epoch E, floor F; <grading>]`.
     #[must_use]
     pub fn line(&self, epoch: Option<&Epoch>) -> String {
+        self.line_for_epoch(Ok(epoch))
+    }
+
+    /// Counts the readable records even when the lane could not accept its working epoch.
+    pub(super) fn line_for_epoch(&self, epoch: Result<Option<&Epoch>, &str>) -> String {
         let t = self.total;
-        let grading = if t.proved == 0 {
+        let grading = if !self.refused.is_empty() {
+            "incomplete count from readable records".to_string()
+        } else if t.proved == 0 {
             if self.absent.is_empty() {
                 "no proved obligation".to_string()
             } else {
@@ -456,15 +639,18 @@ impl Credit {
         use std::fmt::Write as _;
         let mut s = format!("proved (calculus): {} of {} proved [", t.calculus, t.proved);
         match epoch {
-            Some(e) => {
+            Ok(Some(e)) => {
                 let _ = write!(
                     s,
                     "credit epoch {}, floor {}; {grading}",
                     e.id, e.calculus_floor
                 );
             }
-            None => {
+            Ok(None) => {
                 let _ = write!(s, "no credit epoch; {grading}");
+            }
+            Err(_) => {
+                let _ = write!(s, "credit epoch unavailable; {grading}");
             }
         }
         if !self.absent.is_empty() {
@@ -475,17 +661,19 @@ impl Credit {
     }
 }
 
-/// The current epoch's verdict on `credit`: each line a failure. Fewer calculus proofs
-/// than the floor, and every refused record, fail; an ungraded or absent record counts 0,
-/// so it fails only a floor above 0.
+/// Every refused record fails. When all present records are readable, a count below
+/// the epoch floor fails. An ungraded or absent record contributes zero calculus proofs.
 #[must_use]
-pub fn judge(epoch: &Epoch, credit: &Credit) -> Vec<String> {
+pub fn judge(epoch: Option<&Epoch>, credit: &Credit) -> Vec<String> {
     let mut out: Vec<String> = credit
         .refused
         .iter()
         .map(|(name, why)| format!("{name} CREDIT-UNREADABLE {why}"))
         .collect();
-    if credit.total.calculus < epoch.calculus_floor {
+    if let Some(epoch) = epoch
+        && credit.refused.is_empty()
+        && credit.total.calculus < epoch.calculus_floor
+    {
         out.push(format!(
             "proved (calculus) CREDIT-REGRESSED {} below credit epoch {}'s floor {}",
             credit.total.calculus, epoch.id, epoch.calculus_floor
@@ -506,15 +694,43 @@ pub fn current_epoch(repo: &Path) -> Result<Option<Epoch>, String> {
     }
 }
 
-/// Read one library's record from its check's target directory: `None` when there is none.
+/// Read one library's record from its check's target directory. A present record must
+/// name that package in its header. An absent file returns `None`.
 #[must_use]
 pub fn read_record(target: &Path, package: &str) -> Option<Result<Tally, String>> {
     let path = record_path(target, package);
     match crate::durable::read_text(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(Err(format!("{}: {e}", path.display()))),
-        Ok(text) => Some(tally(&text).map_err(|why| format!("{}: {why}", path.display()))),
+        Ok(text) => Some(
+            tally_for(&text, Some(package)).map_err(|why| format!("{}: {why}", path.display())),
+        ),
     }
+}
+
+/// Count one physical record across its names. The bytes and metadata come from
+/// the same bounded, no-follow open, even if the path is replaced during the read.
+fn count_file(credit: &mut Credit, files: &mut BTreeMap<(u64, u64), [u8; 32]>, path: &Path) {
+    let read = match crate::durable::read_file_with_meta(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(Err(e.to_string())),
+        Ok((bytes, meta)) => {
+            let digest = aterm_digest::Sha256::digest(&bytes);
+            match files.entry((meta.dev(), meta.ino())) {
+                Entry::Occupied(first) if first.get() == &digest => return,
+                Entry::Occupied(_) => Some(Err("the same file yielded different records".into())),
+                Entry::Vacant(first) => {
+                    first.insert(digest);
+                    Some(
+                        std::str::from_utf8(&bytes)
+                            .map_err(|e| e.to_string())
+                            .and_then(tally),
+                    )
+                }
+            }
+        }
+    };
+    credit.add(&path.to_string_lossy(), read);
 }
 
 /// `ship trust credit <record>…`: the counter over the records named, judged against the
@@ -533,20 +749,13 @@ pub fn run_cmd(repo: &Path, records: &[PathBuf]) -> i32 {
         }
     };
     let mut credit = Credit::default();
-    let mut by_name: BTreeMap<String, Option<Result<Tally, String>>> = BTreeMap::new();
-    for r in records {
-        let read = match crate::durable::read_text(r) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => Some(Err(e.to_string())),
-            Ok(text) => Some(tally(&text)),
-        };
-        by_name.insert(r.display().to_string(), read);
-    }
-    for (name, read) in by_name {
-        credit.add(&name, read);
+    let mut files = BTreeMap::new();
+    let names: BTreeSet<_> = records.iter().map(|r| r.as_os_str()).collect();
+    for name in names {
+        count_file(&mut credit, &mut files, Path::new(name));
     }
     println!("{}", credit.line(Some(&epoch)));
-    let failed = judge(&epoch, &credit);
+    let failed = judge(Some(&epoch), &credit);
     for f in &failed {
         println!("{f}");
     }
@@ -555,4 +764,4 @@ pub fn run_cmd(repo: &Path, records: &[PathBuf]) -> i32 {
 
 #[cfg(test)]
 #[path = "trust_credit_tests.rs"]
-mod tests;
+pub(crate) mod tests;

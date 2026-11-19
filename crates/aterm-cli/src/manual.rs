@@ -753,7 +753,7 @@ WHAT IT IS
   * Claude Code (`~/.claude/skills/<name>/SKILL.md`) and Codex
     (`~/.codex/skills/<name>/SKILL.md`): `drive-aterm`, `supervise-agent`,
     `rust-in-aterm`, `aterm-themes`, `aterm-fabric`, `system-state`,
-    `open-in-amacs`.
+    `open-in-amacs`. Claude Code also gets `aterm-resident`.
   * OpenCode and Muse Code: `aterm-fabric`.
   `aterm agents` follows a set `$CODEX_HOME` in place of `~/.codex`, as a codex
   started from the same shell does. A window's automatic pass writes `~/.codex`,
@@ -772,6 +772,9 @@ KEY USAGE
   aterm agents install codex one agent by name (creates the file if needed)
   aterm agents remove        remove the block, aterm's skills and its hooks
   aterm agents primer        print the block
+  aterm agents prepare-resident
+                             prepare the machine resident's private working directory and
+                             CLAUDE.md standing brief, then print the directory (Unix only)
 
   An aterm window brings every detected agent up to date itself, at startup and on
   new sessions (at most once a minute), and so does each `aterm init` run from the
@@ -2232,6 +2235,7 @@ KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
   aterm pkg rollback | pin | unpin <program>
                              a vendor program's kept previous build (ALab's own programs
                              are fixed by the next release); hold or release the current one
+                             (`<prefix>/pins`; one that does not read holds nothing)
   aterm pkg gc               reclaim superseded builds and partial downloads
   aterm pkg repair [--json]  restore command links, shell integration, reroute stubs, the
                              rustup `trust` link and exec roots
@@ -2244,6 +2248,9 @@ KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
   aterm pkg capacity [--json] [<path>]
                              the machine's free cores, memory, swap and disk above the floor,
                              and the claims heavy and timing-sensitive work holds or waits for
+  aterm pkg claim --capabilities | --what LABEL --key K --checkout DIR ... -- PROGRAM ARGS...
+                             macOS: one covering account-ledger claim; `pkg help claim` gives
+                             the core, memory, rank, worktree-lock and status-pipe contract
   aterm pkg abrew <brew-command> [args…]
                              native brew compatibility inside atpkg (`aterm help abrew`)
   aterm pkg self-uninstall [--dry-run]
@@ -2285,6 +2292,15 @@ HOW IT WORKS & GOTCHAS
     only once that exits 0, else grok-alab exits 69. `login`, `logout`, `--help`, `-p`, the
     one-shot options and the local subcommands (`doctor`, `mcp`, `inspect`, …) skip it, and
     so does `--no-harness`; `dashboard` and every other subcommand are gated.
+  * A pin holds only once it is read. A `<prefix>/pins` that does not read (unreadable,
+    not a regular file, over 256 KiB or 2048 names, or a name no program can have) holds
+    nothing: unattended work renames it to `pins.unread-<unix seconds>` beside it, kept
+    with its bytes, and writes the packages log a `set-aside` line; `aterm pkg doctor`
+    names the kept file, and `aterm pkg pin <program>` makes a pin again. A read that
+    fails only for want of file descriptors or memory moves nothing and holds every
+    program that once. `pin`, `unpin`, `list` and `update <harness>` print why a file
+    does not read; `aterm pkg doctor` reads it without moving it. A named harness
+    install (`--build <n>`) sets a `harness-holds` that does not read aside the same way.
   * A toolchain build stages at once and goes live once no running build holds the old
     one (`aterm pkg lease`). A `trust` build whose `rustc` and `trustc` differ runs from
     a copy-on-write exec root, `<prefix>/compat/trust/<build>/`.
@@ -2657,10 +2673,15 @@ FOR AN AGENT
     the conversation, and never pipe it to `sudo -S`.
   * A cancelled or unanswered prompt fails with `no password was provided`.
     Each prompt that ends with no password (a cancel, five minutes with no
-    answer, or your call ending first: Esc, a tool timeout) makes the window
-    wait before its next sheet: 10 seconds, doubling to 5 minutes, across an
-    update too. Requests inside that wait are refused at once with no sheet;
-    wait it out rather than loop.
+    answer, or your call ending first: Esc, a tool timeout) makes its window
+    and its tab wait before their next sheet: 10 seconds, doubling to 5
+    minutes, across an update too. A prompt nobody touched makes every window
+    wait, across an update, a crash and a relaunch, except for a tab the
+    operator has typed in since that prompt ended, so a request made after
+    they last typed there is not held by it. Requests inside a wait are refused at once with no sheet, and
+    the refusal says for how long: `ERR askpass refused quiet: ... aterm
+    raises no sheet for this tab for up to <n>s`. A person must be there to
+    answer: report the refusal to them rather than ask again in a loop.
   * The sheet waits up to 5 minutes, longer than a shell tool's default
     2-minute command timeout. Give a sudo command a longer timeout (300000 ms
     or more), or it is backgrounded before the operator answers.
@@ -2988,7 +3009,9 @@ const fn verb_line(v: crate::Verb) -> &'static str {
             "prove a scratch binary can be signed, notarized and uploaded as a draft"
         }
         crate::Verb::Update => "report or check for an update, or print this build's identity",
-        crate::Verb::Agents => "keep the aterm primer in coding agents' context files",
+        crate::Verb::Agents => {
+            "manage coding agents' primers and skills, and prepare the resident's folder"
+        }
         crate::Verb::Ai => "this machine's AI CLIs: one working login each, and reviews across AIs",
         crate::Verb::Machines => {
             "configure and manage a lab of Macs over SSH from this one (macOS)"

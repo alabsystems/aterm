@@ -223,8 +223,12 @@ pub struct Row {
     pub behind_since: u64,
     /// The last wait a step recorded ([`upgrade::wait_word`]), empty after an act.
     pub wait: String,
-    /// When that wait began.
+    /// When that wait's word began: the word's own clock, which the rules for one word read.
     pub wait_since: u64,
+    /// When the hold that wait belongs to began, as one episode across changes of word and of the
+    /// process that holds it and across clear gaps shorter than `CLEAR_GAP_S` (`St::wait_episode`);
+    /// 0 for none. `wait_for=` reads it ([`Self::waited_for`]).
+    pub episode_since: u64,
     /// For a person at the tab (`attended`), when a look last recorded that wait.
     pub wait_seen: u64,
     /// Whether the row's words name a person at the tab ([`Self::person_seen`]) as of the look.
@@ -395,6 +399,7 @@ impl Row {
             behind_since: read_age(st),
             wait: st.wait.clone(),
             wait_since: st.wait_since,
+            episode_since: st.wait_episode.since,
             wait_seen: st.wait_seen,
             request: st.request_for(&st.tab),
             request_at: st.request_at,
@@ -1212,6 +1217,7 @@ impl Row {
         if matches!(self.phase, Phase::Pending | Phase::Announced { .. }) && self.wait != why {
             why.clone_into(&mut self.wait);
             self.wait_since = 0;
+            self.episode_since = 0;
         }
         self.read_at(now);
         self.person_named = self.person_seen(now);
@@ -1269,6 +1275,7 @@ impl Row {
             if self.wait == self.aside {
                 self.wait.clone_from(&word.wait);
                 self.wait_since = word.wait_since;
+                self.episode_since = word.episode_since;
             }
             self.aside.clear();
             self.person_named = self.person_seen(now);
@@ -1296,6 +1303,7 @@ impl Row {
         if !status.is_empty() && status != "idle" {
             self.wait = upgrade::wait_word("not-idle", &status);
             self.wait_since = since.max(self.behind_since);
+            self.episode_since = 0;
             self.read_at(now);
         }
         true
@@ -1415,6 +1423,19 @@ impl Row {
         self.rung(now).word().to_string()
     }
 
+    /// How long the recorded wait has held the upgrade at `now`: since its episode began
+    /// ([`Self::episode_since`]), which a change of word never starts again, else since its word
+    /// was first noted; `None` with no wait or no clock.
+    #[must_use]
+    pub fn waited_for(&self, now: u64) -> Option<u64> {
+        let since = if self.episode_since != 0 {
+            self.episode_since
+        } else {
+            self.wait_since
+        };
+        (!self.wait.is_empty() && since != 0).then(|| now.saturating_sub(since))
+    }
+
     /// One `--status` line.
     #[must_use]
     pub fn line(&self, now: u64) -> String {
@@ -1425,11 +1446,9 @@ impl Row {
                 word(s)
             }
         };
-        let wait_for = if self.wait.is_empty() || self.wait_since == 0 {
-            "-".to_string()
-        } else {
-            upgrade::span(now.saturating_sub(self.wait_since))
-        };
+        let wait_for = self
+            .waited_for(now)
+            .map_or_else(|| "-".to_string(), upgrade::span);
         let next_round = match self.next_round_in(now) {
             Some(0) => "due".to_string(),
             Some(secs) => upgrade::span(secs),
@@ -1518,14 +1537,7 @@ impl Row {
         }
         for (k, v) in [
             ("pending_for_s", now.saturating_sub(self.behind_since)),
-            (
-                "wait_for_s",
-                if self.wait.is_empty() || self.wait_since == 0 {
-                    0
-                } else {
-                    now.saturating_sub(self.wait_since)
-                },
-            ),
+            ("wait_for_s", self.waited_for(now).unwrap_or(0)),
             ("done_at", self.done_at),
             ("retry_at", self.retry_at),
             ("next_round_s", self.next_round_in(now).unwrap_or(0)),
@@ -1688,6 +1700,10 @@ impl Row {
             }
             Cause::NextPoint => NEXT_POINT_CAUSE.to_string(),
             Cause::NoLook => "no look has recorded what it waits on".to_string(),
+            Cause::NativeFault(wait) => format!(
+                "aterm's native restart cannot carry its move yet ({}), aterm's own fault",
+                word(&wait)
+            ),
             Cause::Unclassified(wait) => {
                 format!("a wait aterm does not classify ({})", word(&wait))
             }
@@ -1712,6 +1728,10 @@ impl Row {
             WaitClass::VersionUnread => Cause::VersionUnread,
             WaitClass::NextPoint => Cause::NextPoint,
             WaitClass::Unrecorded => Cause::NoLook,
+            WaitClass::NativeFault => {
+                let wait = wait.strip_prefix("release:").unwrap_or(wait);
+                Cause::NativeFault(wait.to_string())
+            }
             WaitClass::Unclassified => {
                 let wait = wait.strip_prefix("release:").unwrap_or(wait);
                 Cause::Unclassified(wait.to_string())
@@ -1821,6 +1841,10 @@ pub(super) enum WaitClass {
     NextPoint,
     /// No look has recorded a wait.
     Unrecorded,
+    /// aterm's own native coordination holds it (`native-…`, its twin projection's
+    /// `native-twin-<kind>` included): a plan its native restart refused, or an operation it
+    /// still resolves, each with its reason in the wait log. aterm's own fault, never a person's.
+    NativeFault,
     /// A wait this build does not classify.
     Unclassified,
 }
@@ -1840,10 +1864,14 @@ impl WaitClass {
             WaitClass::VersionUnread => "version-unread",
             WaitClass::NextPoint => "next-point",
             WaitClass::Unrecorded => "unrecorded",
+            WaitClass::NativeFault => "native-fault",
             WaitClass::Unclassified => "unclassified",
         }
     }
 }
+
+/// The head every native coordination wait word carries ([`WaitClass::NativeFault`]).
+pub(super) const NATIVE_WAIT_PREFIX: &str = "native-";
 
 pub(super) fn wait_class(wait: &str) -> WaitClass {
     let wait = wait.strip_prefix("release:").unwrap_or(wait);
@@ -1923,6 +1951,13 @@ pub(super) fn wait_class(wait: &str) -> WaitClass {
             WaitClass::VersionUnread
         }
         (upgrade::NEXT_POINT, _) => WaitClass::NextPoint,
+        // A native restart's words that name a person at the tab, or a read of the tab (its
+        // status line, the person's input sequence on it, its screen) that the next look retries.
+        ("native-person-or-hand" | "native-person-changed", _) => WaitClass::Person,
+        ("native-person-unread" | "native-status" | "native-screen-unread", _) => {
+            WaitClass::TabUnread
+        }
+        (head, _) if head.starts_with(NATIVE_WAIT_PREFIX) => WaitClass::NativeFault,
         ("", "") => WaitClass::Unrecorded,
         _ => WaitClass::Unclassified,
     }
@@ -1931,14 +1966,16 @@ pub(super) fn wait_class(wait: &str) -> WaitClass {
 /// What holds a move whose relaunch an account admission refused for `kind`
 /// ([`crate::harness::accounts_pool::RefusalKind::word`]): a lock or a change is under way and the
 /// next look plans again; an unread or unattributed route or record is a tab aterm cannot read
-/// yet; integrity, a vault token out of use here and selection policy are the person's (a sign-in,
-/// a new token, a pin, custody) but for a usage limit, which is its reset's.
+/// yet; integrity, a retained login no relaunch moves off (its account no longer listed here), a
+/// vault token out of use here and selection policy are the person's (a sign-in, the account
+/// listed again, a new token, a pin, custody) but for a usage limit, which is its reset's.
 const fn account_refusal_class(kind: crate::harness::accounts_pool::RefusalKind) -> WaitClass {
     use crate::harness::accounts_pool::RefusalKind;
     match kind {
         RefusalKind::Lock | RefusalKind::Changing => WaitClass::UnderWay,
         RefusalKind::Unattributed | RefusalKind::Unread => WaitClass::TabUnread,
         RefusalKind::Integrity
+        | RefusalKind::Retained
         | RefusalKind::Token
         | RefusalKind::SignedOut
         | RefusalKind::Pin
@@ -1957,6 +1994,7 @@ const fn account_refusal_words(kind: crate::harness::accounts_pool::RefusalKind)
         RefusalKind::Unattributed => "aterm cannot tell which login it runs on",
         RefusalKind::Unread => "aterm cannot read its account records yet",
         RefusalKind::Integrity => "its login does not match the account it is filed under",
+        RefusalKind::Retained => "its login was replaced by a newer one of its account",
         RefusalKind::Token => "its vault token is not in use on this Mac",
         RefusalKind::SignedOut => "its account is signed out here",
         RefusalKind::Limited => "its account is at a usage limit",
@@ -2008,6 +2046,10 @@ fn unworded_waiting_line(wait: &str) -> &'static str {
                  to; it reads them again on its own and moves once it can"
             }
             WaitClass::NextPoint => NEXT_POINT_CAUSE,
+            WaitClass::NativeFault => {
+                "aterm's native restart cannot carry its move yet, aterm's own fault: it moves on \
+                 its own once that is fixed (`aterm harness upgrade --status` names why)"
+            }
             WaitClass::Unrecorded | WaitClass::Unclassified => {
                 "aterm is waiting on a step of its own; it moves on its own once that is over \
                  (`aterm harness upgrade --status` names the step)"
@@ -2309,6 +2351,8 @@ enum Cause {
     NextPoint,
     /// No look has recorded what it waits on.
     NoLook,
+    /// aterm's own native coordination holds it ([`WaitClass::NativeFault`]), named.
+    NativeFault(String),
     /// A wait this build does not classify, named so it fails loud.
     Unclassified(String),
 }
@@ -2484,7 +2528,11 @@ impl Row {
         let wait = self.wait.strip_prefix("release:").unwrap_or(&self.wait);
         let own = matches!(
             self.cause(),
-            Cause::CouldNotType | Cause::TabUnread | Cause::VersionUnread | Cause::Unclassified(_)
+            Cause::CouldNotType
+                | Cause::TabUnread
+                | Cause::VersionUnread
+                | Cause::NativeFault(_)
+                | Cause::Unclassified(_)
         ) || matches!(
             wait,
             "settling"
@@ -2959,6 +3007,10 @@ impl Row {
             Cause::Unclassified(word) => {
                 format!("an unclassified wait ({})", word_short(&word))
             }
+            Cause::NativeFault(word) => format!(
+                "its native restart's wait ({}), aterm's own fault; the wait log names why",
+                word_short(&word)
+            ),
             Cause::CouldNotType if self.refused > 0 => format!(
                 "typing its notice, which the screen refused {} time{}",
                 self.refused,
@@ -3533,8 +3585,8 @@ fn stop_words(agent: upgrade::Agent, why: &str) -> String {
         }
         "stale-exit" => format!("{who} ended and was never started again on the new build"),
         crate::harness::relaunch::ACCOUNT_MOVED => format!(
-            "{who} ended for the move, and its login was filed under another account before it \
-             started again, so it was not started on it"
+            "{who} ended for the move, and before it started again its login was filed under \
+             another account or its account moved to a newer login, so it was not started on it"
         ),
         "shell-gone" => {
             "the shell it ran in is gone, so there is no prompt to start it at".to_string()
@@ -5186,6 +5238,7 @@ pub fn progress_projection(row: &Row, now: u64) -> BTreeMap<&'static str, i64> {
         | WaitClass::VersionUnread
         | WaitClass::NextPoint
         | WaitClass::Unrecorded
+        | WaitClass::NativeFault
         | WaitClass::Unclassified => 3,
     };
     BTreeMap::from([

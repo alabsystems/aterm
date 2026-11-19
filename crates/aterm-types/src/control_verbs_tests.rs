@@ -694,7 +694,7 @@ fn requester_line_round_trips() {
         ),
         Requester::of(Some(sid), None, None, Some("team acct")),
         Requester::of(
-            Some("s-0123456789abcdef0123"),
+            Some("t0123456789"),
             Some("claude"),
             Some("Opus 5.5"),
             Some("a\u{e9}…@example.com"),
@@ -729,12 +729,17 @@ fn requester_line_round_trips() {
     );
     // The longest of every part still fits the line the driven Mac reads.
     let longest = Requester::of(
-        Some("s-0123456789abcdef0123"),
+        Some(sid),
         Some(&"p".repeat(super::REQUESTER_TOKEN_MAX)),
         Some(&"m".repeat(super::REQUESTER_TOKEN_MAX)),
         Some(&"a".repeat(super::REQUESTER_ACCOUNT_BYTES)),
     );
-    assert!(longest.program().is_some() && longest.account().is_some());
+    assert!(
+        longest.sid() == Some(sid)
+            && longest.program().is_some()
+            && longest.model().is_some()
+            && longest.account().is_some()
+    );
     assert!(longest.line().len() - 1 <= super::REQUESTER_LINE_MAX);
 }
 
@@ -765,25 +770,30 @@ fn requester_refuses_unknown_or_repeated_key() {
     }
 }
 
-/// A REQUESTER'S SID IS A CANONICAL TAB ID OR AN EXACT LEGACY SESSION ID. NEGATIVE CONTROLS: a
-/// short, long, uppercase or non-hex legacy sid, a `t` ID one character short or long, upper-case
-/// or with a Crockford alias, a chosen name and an alias are refused on the wire and left out by
-/// [`super::Requester::of`] without dropping its valid program, model or account.
+/// A REQUESTER'S SID IS A CURRENT TAB ID. An exact legacy ID remains local; malformed IDs
+/// and chosen names are refused on the wire and omitted without dropping valid program, model
+/// or account fields.
 #[test]
 fn requester_refuses_unminted_sid() {
     use super::{Requester, is_minted_sid};
-    let line = |sid: &str| format!("requester sid={sid} program=- model=- account=-");
-    for minted in [
-        "tqn5r6e0148",
-        "t0000000000",
-        "tzzzzzzzzzz",
-        "s-0123456789abcdef0123",
-        "s-00000000000000000000",
-        "s-ffffffffffffffffffff",
-    ] {
+    let line = |sid: &str| {
+        format!("requester sid={sid} program=claude model=opus-5.5 account=team%20acct")
+    };
+    for minted in ["tqn5r6e0148", "t0123456789", "t0000000000", "tzzzzzzzzzz"] {
         assert!(is_minted_sid(minted), "{minted}");
+        let requester = Requester::of(
+            Some(minted),
+            Some("claude"),
+            Some("Opus 5.5"),
+            Some("team acct"),
+        );
+        assert_eq!(requester.sid(), Some(minted));
+        assert_eq!(Requester::parse(&line(minted)), Ok(requester), "{minted}");
         assert_eq!(
-            Requester::parse(&line(minted)).map(|r| r.sid().map(str::to_owned)),
+            Requester::parse(&format!(
+                "requester sid={minted} program=- model=- account=-"
+            ))
+            .map(|r| r.sid().map(str::to_owned)),
             Ok(Some(minted.to_owned())),
             "{minted}"
         );
@@ -793,6 +803,9 @@ fn requester_refuses_unminted_sid() {
         );
     }
     for unminted in [
+        "s-0123456789abcdef0123",
+        "s-00000000000000000000",
+        "s-ffffffffffffffffffff",
         "s-0123456789abcdef012",
         "s-0123456789abcdef01234",
         "s-0123456789ABCDEF0123",
@@ -805,14 +818,26 @@ fn requester_refuses_unminted_sid() {
         "Tqn5r6e0148",
         "tqn5r6e014u",
     ] {
-        assert!(!is_minted_sid(unminted), "{unminted}");
         assert!(Requester::parse(&line(unminted)).is_err(), "{unminted}");
+        assert!(
+            Requester::parse(&format!(
+                "requester sid={unminted} program=- model=- account=-"
+            ))
+            .is_err(),
+            "{unminted}"
+        );
+        assert!(!is_minted_sid(unminted), "{unminted}");
         assert_eq!(Requester::of(Some(unminted), None, None, None).sid(), None);
         let requester = Requester::of(
             Some(unminted),
             Some("claude"),
             Some("Opus 5.5"),
             Some("team acct"),
+        );
+        assert_eq!(
+            requester,
+            Requester::of(None, Some("claude"), Some("Opus 5.5"), Some("team acct")),
+            "only the invalid sid is omitted: {unminted}"
         );
         assert_eq!(requester.sid(), None, "{unminted}");
         assert_eq!(requester.program(), Some("claude"), "{unminted}");

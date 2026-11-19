@@ -21,8 +21,10 @@ parallel = 8
 "#;
 
 /// `baselines/default.toml` as `init` writes it: the owner's lab, from the request that
-/// started this design.
-pub const DEFAULT_BASELINE: &str = r#"# The baseline every host gets unless its [[host]] block names another.
+/// started this design. Its `[power.ac]` and `[updates]` tables are aterm-types' own
+/// (`aterm_types::macos_setup::baseline`), which the System Resources page judges this Mac by.
+pub const DEFAULT_BASELINE: &str = concat!(
+    r#"# The baseline every host gets unless its [[host]] block names another.
 # `aterm machines plan --all` shows what it would change; `apply --all` changes it.
 # {name}, {tag}, {serial} and {uuid} are filled per host ({tag} is the name's leading
 # letters and digits: m10 of m10-MacBook-M4-Max-36GB-1TB); {hardware} by each Mac from what
@@ -71,20 +73,12 @@ stealth = true
 network_time = true
 
 # Always on while plugged in; laptops still sleep on battery as macOS chooses.
-[power.ac]
-sleep = 0
-disk_sleep = 0
-display_sleep = 15
-power_nap = false
-wake_on_lan = true
-restart_after_power_loss = true
-
-[updates]
-automatic_check = true
-automatic_download = true
-automatic_macos_install = false
-critical = true
-
+"#,
+    aterm_types::starter_power_ac_toml!(),
+    r#"
+"#,
+    aterm_types::starter_updates_toml!(),
+    r#"
 [developer]
 command_line_tools = true
 
@@ -111,7 +105,8 @@ remote_full_disk_access = true
 screen_sharing = true
 full_disk_access = ["aterm"]
 developer_tools = ["aterm"]
-"#;
+"#
+);
 
 /// The SHA-256 of every earlier [`DEFAULT_BASELINE`], as `init` wrote it.
 pub const EARLIER_DEFAULT_BASELINES: &[&str] = &[

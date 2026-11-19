@@ -5,6 +5,7 @@
 //! values survive together; a resolving edit must actually observe the candidates.
 //! Tombstones stop an object generation forever. Use a new key for a new generation.
 
+use crate::said::Said;
 use crate::{
     Error, Result,
     crypto::{self, Opened},
@@ -51,6 +52,10 @@ pub enum Command {
         request: [u8; 16],
         /// All changes become visible in one causal operation.
         changes: Vec<Change>,
+        /// Who made it, why and on what evidence: a version 2 record's statement
+        /// ([`crate::said`]), which only a typed table generation that takes version 2 records
+        /// decodes. `None` is the version 1 record every build reads.
+        said: Option<Box<Said>>,
     },
     /// An ordinary compensating edit. The referenced operation stays in history.
     /// An absent value here restores absence reversibly, unlike a permanent stop.
@@ -61,6 +66,8 @@ pub enum Command {
         operation: Digest,
         /// Whole-value compensations for the target transaction's keys.
         changes: Vec<Change>,
+        /// Who reverted it, why and on what evidence, as a [`Self::Write`]'s.
+        said: Option<Box<Said>>,
     },
     /// Immutable owner-authorized allocation, in application-defined admission units.
     Budget {
@@ -140,6 +147,13 @@ impl Command {
             _ => None,
         }
     }
+    /// What a version 2 write or revert says of who made it ([`crate::said`]).
+    pub fn said(&self) -> Option<&Said> {
+        match self {
+            Self::Write { said, .. } | Self::Revert { said, .. } => said.as_deref(),
+            _ => None,
+        }
+    }
     /// Encode a `Write` command payload without taking ownership of `changes`.
     pub fn encode_write(request: [u8; 16], changes: &[Change]) -> Result<Vec<u8>> {
         #[derive(serde::Serialize)]
@@ -182,9 +196,33 @@ impl Command {
                     v: 1,
                 })
             }
-            Self::Write { request, changes } => return Self::encode_write(*request, changes),
+            Self::Write {
+                request,
+                changes,
+                said: None,
+            } => return Self::encode_write(*request, changes),
+            Self::Write {
+                changes,
+                said: Some(said),
+                ..
+            } => encode_said(changes, "write", None, &request_hex, said),
             Self::Revert {
-                operation, changes, ..
+                operation,
+                changes,
+                said: Some(said),
+                ..
+            } => encode_said(
+                changes,
+                "revert",
+                Some(&hex::encode_lower(operation)),
+                &request_hex,
+                said,
+            ),
+            Self::Revert {
+                operation,
+                changes,
+                said: None,
+                ..
             } => {
                 #[derive(serde::Serialize)]
                 struct Encoded<'a> {
@@ -279,16 +317,35 @@ impl Command {
         encoded.map_err(|_| Error::new("database payload could not be encoded"))
     }
     /// Parse only the supported schema; unknown fields cannot silently change authority.
+    /// Version 1 only: a version 2 record ([`crate::said`]) is refused here as every build
+    /// before it refuses one, and only a typed table generation that takes it reads one
+    /// ([`Self::decode_said`]).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::decode_versioned(bytes, false)
+    }
+    /// [`Self::decode`], also reading a version 2 write or revert: the version 1 record's
+    /// members and its [`Said`] (`principal`, and `reason` and `evidence` where it has them),
+    /// each checked by its type. Only a typed table generation that takes version 2 records
+    /// decodes with this (`att::Compiled::records`).
+    #[cfg(unix)]
+    pub(crate) fn decode_said(bytes: &[u8]) -> Result<Self> {
+        Self::decode_versioned(bytes, true)
+    }
+    fn decode_versioned(bytes: &[u8], said: bool) -> Result<Self> {
         if bytes.len() > crypto::MAX_BODY {
             return Err(Error::new("database payload exceeds limit"));
         }
         let v: Value = aterm_json::from_slice(bytes)
             .map_err(|_| Error::new("invalid database payload JSON"))?;
-        if v.get("v").and_then(Value::as_u64) != Some(1) {
+        let version = v.get("v").and_then(Value::as_u64);
+        let v2 = said && version == Some(crate::said::VERSION);
+        if version != Some(1) && !v2 {
             return Err(Error::new("unsupported database application schema"));
         }
         let request = decode_hex(field(&v, "request")?)?;
+        if v2 && !matches!(field(&v, "kind")?, "write" | "revert") {
+            return Err(Error::new("a version 2 record is a write or a revert"));
+        }
         let command = match field(&v, "kind")? {
             "merge" => {
                 keys(&v, &["v", "request", "kind"])?;
@@ -296,11 +353,22 @@ impl Command {
             }
             "write" | "revert" => {
                 let reverts = field(&v, "kind")? == "revert";
-                if reverts {
-                    keys(&v, &["v", "request", "kind", "changes", "operation"])?;
+                let required: &[&str] = match (reverts, v2) {
+                    (true, false) => &["v", "request", "kind", "changes", "operation"],
+                    (false, false) => &["v", "request", "kind", "changes"],
+                    (true, true) => &["v", "request", "kind", "changes", "operation", "principal"],
+                    (false, true) => &["v", "request", "kind", "changes", "principal"],
+                };
+                let optional: &[&str] = if v2 { &["reason", "evidence"] } else { &[] };
+                keys_with(&v, required, optional)?;
+                let said = if v2 {
+                    Some(Box::new(
+                        Said::of_parts(v.get("principal"), v.get("reason"), v.get("evidence"))
+                            .map_err(Error::new)?,
+                    ))
                 } else {
-                    keys(&v, &["v", "request", "kind", "changes"])?;
-                }
+                    None
+                };
                 let raw = v
                     .get("changes")
                     .and_then(Value::as_array)
@@ -353,9 +421,14 @@ impl Command {
                         request,
                         operation: decode_hex(field(&v, "operation")?)?,
                         changes,
+                        said,
                     }
                 } else {
-                    Self::Write { request, changes }
+                    Self::Write {
+                        request,
+                        changes,
+                        said,
+                    }
                 }
             }
             "budget" => {
@@ -1130,13 +1203,54 @@ fn number(v: &Value, name: &str) -> Result<u64> {
         .ok_or_else(|| Error::new("database payload lacks a required unsigned number"))
 }
 fn keys(v: &Value, keys: &[&str]) -> Result<()> {
-    if v.as_object()
-        .is_some_and(|o| o.len() == keys.len() && keys.iter().all(|k| o.contains_key(*k)))
-    {
+    keys_with(v, keys, &[])
+}
+/// Every one of `required`, and of `optional` only those present: no other member.
+fn keys_with(v: &Value, required: &[&str], optional: &[&str]) -> Result<()> {
+    if v.as_object().is_some_and(|o| {
+        required.iter().all(|k| o.contains_key(*k))
+            && o.keys()
+                .all(|k| required.contains(&k.as_str()) || optional.contains(&k.as_str()))
+    }) {
         Ok(())
     } else {
         Err(Error::new("database payload has unknown or missing fields"))
     }
+}
+/// A version 2 write or revert ([`crate::said`]): the version 1 record's members, then the
+/// statement's, every map sorted, with `reason` and `evidence` only where it has them, so a
+/// decode and an encode give the same bytes.
+fn encode_said(
+    changes: &[Change],
+    kind: &'static str,
+    operation: Option<&str>,
+    request: &str,
+    said: &Said,
+) -> std::result::Result<Vec<u8>, aterm_json::Error> {
+    #[derive(serde::Serialize)]
+    struct Encoded<'a> {
+        changes: &'a [Change],
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        evidence: Vec<Value>,
+        kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        operation: Option<&'a str>,
+        principal: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'a str>,
+        request: &'a str,
+        v: u64,
+    }
+    aterm_json::to_vec(&Encoded {
+        changes,
+        evidence: said.evidence_values(),
+        kind,
+        operation,
+        principal: said.principal_value(),
+        reason: said.reason.as_deref(),
+        request,
+        v: crate::said::VERSION,
+    })
 }
 /// Decode a bounded, canonical lowercase hex identifier.
 pub fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {

@@ -3,6 +3,7 @@
 
 use super::*;
 use std::cell::{Cell, RefCell};
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::rc::Rc;
 

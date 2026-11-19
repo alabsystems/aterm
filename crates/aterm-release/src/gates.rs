@@ -3286,7 +3286,7 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
     }
 }
 
-/// The proof, before the release's one build (`artifact::build`), that this builder can build the x86_64 slice (`target`, the stable `x86_64-apple-darwin` std) and run it.
+/// The proof, before the release's one build (`artifact::build`), that this builder can build the x86_64 slice (`target`, the stock release's `x86_64-apple-darwin` std) and run it.
 pub(crate) fn universal_gate(
     target: impl FnOnce() -> Result<()>,
     rosetta: impl FnOnce() -> std::result::Result<(), String>,

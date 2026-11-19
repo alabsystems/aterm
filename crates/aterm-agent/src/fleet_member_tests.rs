@@ -12374,7 +12374,8 @@ fn a_host_word_that_is_a_macs_short_name_binds_its_whole_node() {
         .collect();
     write_private(&world.places.state, PEERS_FILE, text.as_bytes()).unwrap();
     let node = |byte: u8| format!("{byte:02x}").repeat(16);
-    let word = |what: &str| host_word(&world.places, what, None, after_now(HANG));
+    let word =
+        |what: &str| host_word(&world.places, what, None, after_now(HANG)).map(|said| said.word);
     assert_eq!(
         word("m27"),
         Ok(node(0x11)),
@@ -12530,7 +12531,7 @@ fn a_short_name_of_the_issuer_is_refused_while_no_book_here_lists_its_members() 
         unserved: false,
     };
     let word = |what: &str, unread: Option<&Missed>| {
-        host_word(&world.places, what, unread, after_now(HANG))
+        host_word(&world.places, what, unread, after_now(HANG)).map(|said| said.word)
     };
 
     // No copy held: the issuer's short names stay as typed, and binding one is refused.

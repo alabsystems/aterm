@@ -354,6 +354,136 @@ fn block(write_bytes: u64, read_bytes: u64) -> BlockSample {
 }
 
 #[test]
+fn the_home_device_uses_its_current_binding_never_position_attachment_or_an_old_reading() {
+    let mut home = block(1000, 2000);
+    home.location = DiskLocation::External;
+    let front = BlockSample {
+        id: "00000000000000f1".into(),
+        name: "front's internal disk".into(),
+        location: DiskLocation::Internal,
+        ..BlockSample::default()
+    };
+    let mut model = Vitals::new();
+    let mut sample = reading(1);
+    sample.block = vec![front.clone(), home.clone()];
+    sample.home_device_id = Some(DEVICE.into());
+    let first = model.absorb(&sample);
+    assert_eq!(first.units.disks[0].id, front.id);
+    let bound = first.units.home_disk().expect("home's original binding");
+    assert_eq!(bound.id, DEVICE);
+    assert_eq!(bound.location, DiskLocation::External);
+    assert_eq!(
+        bound.write.level, None,
+        "a resolved device's first counters are warming"
+    );
+
+    let mut sample = Sample {
+        block: sample.block,
+        home_device_id: Some(DEVICE.into()),
+        ..reading(2)
+    };
+    let idle = model.absorb(&sample);
+    let bound = idle.units.home_disk().unwrap();
+    assert_eq!(
+        bound.write.level,
+        Some(Level {
+            mean: 0.0,
+            max: 0.0
+        })
+    );
+    assert_eq!(
+        bound.read.level,
+        Some(Level {
+            mean: 0.0,
+            max: 0.0
+        })
+    );
+    assert_eq!(bound.write.basis, CapBasis::Learning);
+    assert_eq!(
+        bound.write.share(),
+        None,
+        "known idle counters do not imply a learned peak"
+    );
+
+    sample = Sample {
+        block: vec![front.clone()],
+        ..reading(3)
+    };
+    let unresolved = model.absorb(&sample);
+    assert_eq!(unresolved.units.home_device_id, None);
+    assert_eq!(unresolved.units.disks.len(), 1);
+    assert_eq!(
+        unresolved.units.home_disk(),
+        None,
+        "the current front-only reading cannot borrow the earlier home binding"
+    );
+    sample = Sample {
+        block: vec![front.clone()],
+        home_device_id: Some(DEVICE.into()),
+        ..reading(4)
+    };
+    let unread = model.absorb(&sample);
+    assert_eq!(unread.units.home_device_id.as_deref(), Some(DEVICE));
+    assert_eq!(
+        unread.units.home_disk(),
+        None,
+        "a resolved home with no current counters cannot reuse a cached home device"
+    );
+
+    sample = Sample {
+        block: vec![front.clone(), home],
+        home_device_id: Some(front.id.clone()),
+        ..reading(5)
+    };
+    let changed = model.absorb(&sample);
+    assert_eq!(
+        changed.units.home_disk().unwrap().id,
+        front.id,
+        "a changed current binding takes effect without retaining the previous home role"
+    );
+    assert_eq!(
+        first.units.home_disk().unwrap().id,
+        DEVICE,
+        "later bindings cannot mutate an already published reading"
+    );
+
+    sample = Sample {
+        block: vec![BlockSample {
+            id: "invalid-id".into(),
+            ..BlockSample::default()
+        }],
+        home_device_id: Some("invalid-id".into()),
+        ..reading(6)
+    };
+    let invalid = model.absorb(&sample);
+    assert_eq!(invalid.units.home_device_id, None);
+    assert!(invalid.units.disks.is_empty());
+    assert_eq!(invalid.units.home_disk(), None);
+    let mut ambiguous = first.units.clone();
+    ambiguous
+        .disks
+        .push(first.units.home_disk().unwrap().clone());
+    assert_eq!(
+        ambiguous.home_disk(),
+        None,
+        "duplicate matching identities are ambiguous"
+    );
+    ambiguous.home_device_id = Some("00000000000000ff".into());
+    assert_eq!(
+        ambiguous.home_disk(),
+        None,
+        "an unmatched ID never falls back to another disk"
+    );
+    ambiguous.home_device_id = Some("invalid-id".into());
+    ambiguous.disks[0].id = "invalid-id".into();
+    assert_eq!(
+        ambiguous.home_disk(),
+        None,
+        "a matching malformed ID supplies no authority"
+    );
+}
+
+#[test]
 fn a_disk_half_is_hollow_while_its_peak_learns() {
     let mut v = Vitals::default();
     let today = u32::try_from(T0.div_euclid(86_400_000)).expect("a day");

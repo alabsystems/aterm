@@ -386,22 +386,19 @@ fn process() -> &'static Arc<Moved> {
     static PROCESS: OnceLock<Arc<Moved>> = OnceLock::new();
     PROCESS.get_or_init(|| {
         let moved = Arc::new(Moved::herded_by(process_spread(), members_here));
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), not(test)))]
-        relay_to_updater(&moved, aterm_update::note_network_moved);
         start_sources(&moved);
         moved
     })
 }
 
-/// Start this process's network observation for its automatic updater even
-/// when no fleet, account, or converge consumer has requested a watch yet, and
-/// while the launch's `[update] enabled` has no answer yet, since the checker
-/// may start once it answers.
+/// Relay this process's settled network moves to its automatic update check
+/// ([`aterm_update::note_network_moved`]), starting its network observation where no fleet,
+/// account or converge consumer has asked for a watch. A window and the node job hand it to their
+/// checker's start ([`aterm_update::Wakes::network`]), which runs it once, where a checker starts:
+/// a process that runs none holds no relay.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn observe_for_updater() {
-    if aterm_update::automatic_at_launch() != Some(false) {
-        let _ = process();
-    }
+    relay_to_updater(process(), aterm_update::note_network_moved);
 }
 
 /// Relay each settled move of `moved` to the update check (`post`), from a thread of its own on a

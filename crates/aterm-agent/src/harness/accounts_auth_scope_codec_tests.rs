@@ -17,7 +17,7 @@ fn legacy_and_retired_words_round_trip_with_history_and_fail_closed_on_bad_scope
     assert!(!original.contains("auth_retired"));
     let legacy = State::from_json(&original, NOW).unwrap();
     assert_eq!(legacy.account("work").current_auth(&row), Auth::SignedOut);
-    state.accounts.get_mut("work").unwrap().auth_scope.retire();
+    state.accounts.get_mut("work").unwrap().retire_login(NOW);
     let held = State::from_json(&state.to_json(), NOW).unwrap();
     assert_eq!(held.account("work").auth, Auth::SignedOut);
     assert_eq!(held.account("work").auth_at, Some(NOW));

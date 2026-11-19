@@ -369,7 +369,7 @@ fn first_adoption_discovers_only_current_root_decisions_without_a_local_roster()
 #[test]
 fn automatic_upkeep_resolves_only_the_pinned_network_and_current_root_head() {
     super::repository_catalog::tests::exercise_owned_upkeep();
-    super::repository_catalog::tests::exercise_size_band();
+    super::repository_catalog::tests::exercise_size_class();
     super::repository_catalog::tests::exercise_pause_keeps_the_schedule();
     let (_home, approved, row) = fixture();
     let grant = approved.prepare(&row).unwrap();

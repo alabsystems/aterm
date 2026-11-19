@@ -76,6 +76,117 @@ pub struct VerifierArtifact {
     pub compiler_version: String,
 }
 
+/// THE WORKER'S RECORD THAT IT LEFT THE STATIC BOOTSTRAP VERIFIER OUT, at
+/// [`left_out_path`] beside the executable's pair: written by [`run_worker`] where, and only
+/// where, this host's C compiler finds no static C library ([`bootstrap_verifier_step`]), with
+/// what `cc` answered. It is what tells a handoff directory with no verifier because none was
+/// built from one whose verifier did not come back: the cutter copies the verifier's pair or this
+/// record from each worker ([`fetch_verifier`]), counts a pair already in place current only
+/// beside one of them ([`pair_is_current`]), and imports an architecture with neither, or with
+/// both, never ([`Handoff::import`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierLeftOut {
+    pub schema: u32,
+    pub version: String,
+    pub build_number: u64,
+    pub commit: String,
+    pub target: String,
+    /// The verifier asset this release does not publish for `target`.
+    pub asset: String,
+    /// What `cc -print-file-name=libc.a` answered: a name that is no static C library here.
+    pub static_c_library: String,
+}
+
+impl VerifierLeftOut {
+    /// The record is this cut's: its version, build and commit, and its architecture's asset.
+    pub fn validate(&self, version: &str, build: u64, commit: &str) -> Result<(), String> {
+        check_identity(version, build, commit)?;
+        let target = target(&self.target)?;
+        if self.schema != 1
+            || self.version != version
+            || self.build_number != build
+            || self.commit != commit
+            || self.asset != pin::asset_name(version, target.arch())
+        {
+            return Err(
+                "Linux bootstrap verifier's left-out record has mismatched source/build/target"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Where the worker's [`VerifierLeftOut`] record of the verifier `asset` lives in `directory`.
+pub fn left_out_path(directory: &Path, asset: &str) -> PathBuf {
+    directory.join(format!("{asset}.left-out.toml"))
+}
+
+/// The record at [`left_out_path`] of `target`'s verifier for this cut, if one is there: `Ok(None)`
+/// where none is, and an error where one is that is not this cut's or not readable whole.
+fn read_left_out(
+    directory: &Path,
+    target: LinuxTarget,
+    version: &str,
+    build: u64,
+    commit: &str,
+) -> Result<Option<VerifierLeftOut>, String> {
+    let path = left_out_path(directory, &pin::asset_name(version, target.arch()));
+    let text = match crate::durable::read_regular_text(&path, 65536) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Err(e.to_string()),
+        Err(_) => {
+            return Err("unsafe or oversized Linux bootstrap verifier left-out record".into());
+        }
+        Ok(text) => text,
+    };
+    let record: VerifierLeftOut = aterm_toml::from_str(&text)
+        .map_err(|e| format!("parse Linux bootstrap verifier left-out record: {e}"))?;
+    record.validate(version, build, commit)?;
+    if record.target != target.triple() {
+        return Err(
+            "Linux bootstrap verifier left-out record's architecture does not match its filename"
+                .into(),
+        );
+    }
+    Ok(Some(record))
+}
+
+/// What came back from a worker of its static bootstrap verifier ([`fetch_verifier`]).
+#[derive(Debug, PartialEq, Eq)]
+enum VerifierFetch {
+    /// Its pair: the worker built it.
+    Built,
+    /// Its [`VerifierLeftOut`] record: this release publishes none for that architecture.
+    LeftOut,
+}
+
+/// Bring back the worker's static bootstrap verifier: its pair (`pair`, the copy and move of the
+/// verifier and its receipt), else its left-out record (`record`). The worker writes exactly one
+/// of them, so where neither comes back a built verifier failed to: that refuses the worker,
+/// never a release published without it.
+///
+/// # Errors
+/// Neither the pair nor the record came back, with both reasons.
+fn fetch_verifier(
+    triple: &str,
+    pair: impl FnOnce() -> Result<(), String>,
+    record: impl FnOnce() -> Result<(), String>,
+) -> Result<VerifierFetch, String> {
+    let Err(pair) = pair() else {
+        return Ok(VerifierFetch::Built);
+    };
+    record().map(|()| VerifierFetch::LeftOut).map_err(|record| {
+        format!(
+            "the Linux worker's static bootstrap verifier for {triple} did not come back: its \
+             pair ({pair}), nor its record that it left the verifier out ({record}). A built \
+             verifier is never dropped from the release; resume the cut, which builds this \
+             architecture again"
+        )
+    })
+}
+
 /// The ELF program header type of a dynamic loader's path.
 const PT_INTERP: u32 = 3;
 
@@ -546,6 +657,40 @@ fn pair_is_current(
     artifact.validate(version, build, commit).is_ok()
         && artifact.target == target.triple()
         && artifact.verify_file(&directory.join(&name)).is_ok()
+        && verifier_is_current(directory, target, version, build, commit)
+}
+
+/// Whether `directory` holds exactly one of this cut's answers for `target`'s static bootstrap
+/// verifier: its valid pair, or the worker's valid [`VerifierLeftOut`] record with no verifier
+/// file beside it. Neither (a built verifier whose copy failed) or both is no answer, and the
+/// worker runs again.
+fn verifier_is_current(
+    directory: &Path,
+    target: LinuxTarget,
+    version: &str,
+    build: u64,
+    commit: &str,
+) -> bool {
+    let name = pin::asset_name(version, target.arch());
+    let receipt = directory.join(format!("{name}.handoff.toml"));
+    let there = |path: &Path| fs::symlink_metadata(path).is_ok();
+    let pair = crate::durable::read_regular_text(&receipt, 65536)
+        .ok()
+        .and_then(|text| aterm_toml::from_str::<VerifierArtifact>(&text).ok())
+        .is_some_and(|verifier| {
+            verifier.validate(version, build, commit).is_ok()
+                && verifier.target == target.triple()
+                && verifier.verify_file(&directory.join(&name)).is_ok()
+        });
+    let left_out = matches!(
+        read_left_out(directory, target, version, build, commit),
+        Ok(Some(_))
+    );
+    if pair {
+        !there(&left_out_path(directory, &name))
+    } else {
+        left_out && !there(&receipt) && !there(&directory.join(&name))
+    }
 }
 
 fn valid_destination(destination: &str) -> bool {
@@ -622,6 +767,7 @@ impl Worker {
         let receipt = format!("{name}.handoff.toml");
         let verifier = pin::asset_name(version, target.arch());
         let verifier_receipt = format!("{verifier}.handoff.toml");
+        let left_out = format!("{verifier}.left-out.toml");
         if pair_is_current(directory, target, version, build, commit) {
             println!(
                 "==> Linux worker {}: this cut's pair is already in {}; not rebuilding",
@@ -632,7 +778,7 @@ impl Worker {
         }
         let (_bundle_dir, bundle) = worker_source_bundle(repo, commit)?;
         let remote_source = RemoteSource::send(&self.destination, &bundle)?;
-        for stale in [&name, &receipt, &verifier, &verifier_receipt] {
+        for stale in [&name, &receipt, &verifier, &verifier_receipt, &left_out] {
             match fs::remove_file(directory.join(stale)) {
                 Ok(()) => println!(
                     "==> Linux worker {}: removed a stale {stale}",
@@ -724,34 +870,41 @@ impl Worker {
             fs::rename(staging.join(file), directory.join(file))
                 .map_err(|e| format!("move the Linux worker's {file} into place: {e}"))?;
         }
-        // The static bootstrap verifier's pair, when the worker built one: best effort,
-        // since a release without it leaves install.sh on its embedded verifier for this
-        // architecture. Receipt last, as above.
-        let copied = command("scp")
-            .args(SSH_OPTIONS)
-            .args(["-q", "--"])
-            .arg(format!("{}:{remote_out}/{verifier}", self.destination))
-            .arg(format!(
-                "{}:{remote_out}/{verifier_receipt}",
-                self.destination
-            ))
-            .arg(&staging)
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-            && [&verifier, &verifier_receipt]
-                .into_iter()
-                .all(|file| fs::rename(staging.join(file), directory.join(file)).is_ok());
-        if !copied {
-            for file in [&verifier, &verifier_receipt] {
+        // The static bootstrap verifier's pair where the worker built one, else its record that
+        // it left the verifier out (it writes exactly one): neither refuses, so a built verifier
+        // is never dropped from the release. Receipt last, as above.
+        let fetch = |files: &[&String]| -> Result<(), String> {
+            let status = command("scp")
+                .args(SSH_OPTIONS)
+                .args(["-q", "--"])
+                .args(
+                    files
+                        .iter()
+                        .map(|file| format!("{}:{remote_out}/{file}", self.destination)),
+                )
+                .arg(&staging)
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .status()
+                .map_err(|e| format!("could not start scp: {e}"))?;
+            if !status.success() {
+                return Err(format!("scp {status}"));
+            }
+            for file in files {
+                fs::rename(staging.join(file), directory.join(file))
+                    .map_err(|e| format!("move {file} into place: {e}"))?;
+            }
+            Ok(())
+        };
+        let fetched = fetch_verifier(
+            target.triple(),
+            || fetch(&[&verifier, &verifier_receipt]),
+            || fetch(&[&left_out]),
+        );
+        if fetched.is_err() {
+            for file in [&verifier, &verifier_receipt, &left_out] {
                 let _ = fs::remove_file(directory.join(file));
                 let _ = fs::remove_file(staging.join(file));
             }
-            println!(
-                "==> Linux worker {}: no static bootstrap verifier came back; this release \
-                 publishes none for it",
-                target.triple()
-            );
         }
         let _ = fs::remove_dir(&staging);
         let _ = command("ssh")
@@ -768,8 +921,15 @@ impl Worker {
             ])
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .status();
+        let verifier_words = match fetched? {
+            VerifierFetch::Built => "its static bootstrap verifier's pair",
+            VerifierFetch::LeftOut => {
+                "its record that it left the static bootstrap verifier out (this host's C \
+                 compiler finds no static C library), so this release publishes none for it"
+            }
+        };
         println!(
-            "==> Linux worker {}: pair copied into {}",
+            "==> Linux worker {}: pair copied into {}, with {verifier_words}",
             target.triple(),
             directory.display()
         );
@@ -1092,8 +1252,10 @@ impl Handoff {
                     return Err(format!(
                         "Linux worker output missing for {}. On that native host at commit {commit}, run: \
                          targo --unverified ship linux-build --version {version} --build-number {build} \
-                         --commit {commit} --out <handoff-directory>; copy its pair into {} and resume the \
-                         cut (or name the host with --linux-worker on the next cut, and the cutter runs it)",
+                         --commit {commit} --out <handoff-directory>; copy its pair, with its static \
+                         bootstrap verifier's pair or its record that it left the verifier out, into {} \
+                         and resume the cut (or name the host with --linux-worker on the next cut, and \
+                         the cutter runs it)",
                         target.triple(),
                         self.directory.display()
                     ));
@@ -1140,9 +1302,11 @@ impl Handoff {
     }
 
     /// Each declared architecture's bootstrap verifier pair in the handoff directory, in
-    /// target order. One with no receipt is absent: that architecture's release publishes
-    /// none, and install.sh keeps its embedded verifier there. A receipt that is there must
-    /// be this cut's and its file the receipt's.
+    /// target order. One with no receipt is absent only beside the worker's record that it left
+    /// the verifier out ([`VerifierLeftOut`]): that architecture's release publishes none, and
+    /// install.sh keeps its embedded verifier there. Neither refuses (a built verifier that did
+    /// not come back), and so do both; a receipt that is there must be this cut's and its file
+    /// the receipt's.
     fn verifier_pairs(
         &self,
         version: &str,
@@ -1154,12 +1318,33 @@ impl Handoff {
             let target = target(requested)?;
             let name = pin::asset_name(version, target.arch());
             let receipt_path = self.directory.join(format!("{name}.handoff.toml"));
+            let left_out = read_left_out(&self.directory, target, version, build, commit)?;
             let receipt_text = match crate::durable::read_regular_text(&receipt_path, 65536) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let Some(left_out) = left_out else {
+                        return Err(format!(
+                            "Linux bootstrap verifier missing for {}: {} holds neither its pair \
+                             ({name} and {name}.handoff.toml) nor the worker's record that it \
+                             left it out ({name}.left-out.toml). Copy the one the worker at \
+                             commit {commit} wrote into it and resume the cut (or name the host \
+                             with --linux-worker, and the cutter runs it again)",
+                            target.triple(),
+                            self.directory.display()
+                        ));
+                    };
+                    if fs::symlink_metadata(self.directory.join(&name)).is_ok() {
+                        return Err(format!(
+                            "Linux bootstrap verifier {name} is in the handoff directory with no \
+                             receipt beside the worker's record that it left it out"
+                        ));
+                    }
                     println!(
-                        "==> no static bootstrap verifier for {}: this release publishes none \
-                         for it, and install.sh keeps its embedded verifier there",
-                        target.triple()
+                        "==> no static bootstrap verifier for {}: its worker's C compiler finds \
+                         no static C library (`cc {STATIC_C_LIBRARY_PROBE}` answered {:?}). \
+                         This release publishes none for it, and install.sh keeps its embedded \
+                         verifier there",
+                        target.triple(),
+                        left_out.static_c_library
                     );
                     continue;
                 }
@@ -1181,6 +1366,12 @@ impl Handoff {
                 );
             }
             verifier.verify_file(&self.directory.join(&name))?;
+            if left_out.is_some() {
+                return Err(format!(
+                    "Linux bootstrap verifier {name} has both its pair and the worker's record \
+                     that it left it out; a worker writes one"
+                ));
+            }
             found.push(verifier);
         }
         Ok(found)
@@ -1405,6 +1596,7 @@ pub fn run_worker(
         receipt.clone(),
         out.join(&verifier),
         out.join(format!("{verifier}.handoff.toml")),
+        left_out_path(out, &verifier),
     ];
     if outputs.iter().any(|path| path.exists()) {
         return Err("Linux output already exists; choose a fresh handoff directory (never overwrite provenance)".into());
@@ -1468,6 +1660,21 @@ pub fn run_worker(
         return Err("Trust compiler library differs from its build-stamped seal".into());
     }
     let take = super::Take::prepare(repo, commit)?;
+    // The stock release the claim commit's trust.lock names, which the static bootstrap
+    // verifier builds on (the STOCK EXCEPTION): put in place by this worker itself and held to
+    // this host's std before anything builds, so a worker that lacks it refuses the cut rather
+    // than ship a release without this architecture's verifier.
+    let machine = aterm_verify::provision::this_machine(repo)
+        .ok_or("Linux worker has no $HOME to name this user's rustup homes and tooling cache")?;
+    let system = aterm_verify::provision::System::new(repo);
+    worker_stock(
+        take.stock()?,
+        commit,
+        native,
+        &machine.homes,
+        aterm_verify::provision::Host::rustup(&system),
+        |_, triple| super::require_rustup_target_in(take.stock_context()?, triple),
+    )?;
     let plan = super::BuildPlan {
         repo_root: repo.into(),
         commit: commit.into(),
@@ -1542,23 +1749,188 @@ pub fn run_worker(
         "Linux local handoff ready: {} (unsigned; only ship cut may publish it)",
         out.join(&name).display()
     );
-    // The static bootstrap verifier beside it, from the same take. Soft: a host that
-    // cannot build it (no stock release, no static C library) leaves this architecture's release
-    // without one, and install.sh keeps its embedded verifier there.
-    match build_bootstrap_verifier(&plan, &take, native, out, version, build, commit) {
-        Ok(path) => println!(
-            "Linux bootstrap verifier ready: {} (unsigned; install.sh pins it by SHA-256)",
-            path.display()
-        ),
-        Err(why) => println!(
-            "==> no static bootstrap verifier for {}: {why}. This release publishes none for \
-             it, and install.sh keeps its embedded verifier there",
-            native.triple()
-        ),
-    }
+    // The static bootstrap verifier beside it, from the same take, on the stock release
+    // `worker_stock` put in place above. Left out only where this host's C compiler finds no
+    // static C library to link it with, and install.sh keeps its embedded verifier there; once it
+    // finds one, every failure of the verifier's build, smoke run or pair refuses the worker.
+    // Either way the worker leaves its answer in `out` (`record_verifier_step`).
+    let cc = super::RELEASE_SYSTEM_PATH
+        .split(':')
+        .map(|dir| Path::new(dir).join("cc"))
+        .find(|cc| cc.is_file())
+        .ok_or_else(|| format!("no `cc` on {}", super::RELEASE_SYSTEM_PATH))
+        .and_then(|cc| {
+            command(&cc)
+                .env_clear()
+                .env("PATH", super::RELEASE_SYSTEM_PATH)
+                .current_dir("/")
+                .arg(STATIC_C_LIBRARY_PROBE)
+                .output()
+                .map_err(|e| format!("run {} {STATIC_C_LIBRARY_PROBE}: {e}", cc.display()))
+        });
+    let step = bootstrap_verifier_step(native.triple(), cc, || {
+        build_bootstrap_verifier(&plan, &take, native, out, version, build, commit)
+    })?;
+    println!(
+        "{}",
+        record_verifier_step(out, native, version, build, commit, step)?
+    );
     take.verify()?;
     clean_head(repo, commit)?;
     Ok(())
+}
+
+/// THE WORKER'S STOCK PRELUDE, BEFORE ANY BUILD: the release chain's part of `verify provision`'s
+/// rustup row ([`aterm_verify::provision::stock::run_release`]) puts `stock`, the stock release the
+/// claim commit `commit`'s `trust.lock` names ([`super::Take::stock`]), in place in `homes` through
+/// `rustup`, driving the rustup the row resolves; then `probe` holds that release to the std of
+/// `native`'s own triple ([`super::require_rustup_target_in`] on the take's captured stock context,
+/// [`super::Take::stock_context`], in [`run_worker`]: the one its static build then runs under). A
+/// worker provisioned before its lock moved holds another release, and one with rustup's
+/// auto-install off or offline cannot have rustup fetch it: either refusing refuses the worker,
+/// naming `verify provision rustup` (it places the rustup row's copy, which the release build runs,
+/// after which this prelude installs `stock` itself) first and the release's own install line as
+/// the alternative, so a missing toolchain never drops the verifier from the release
+/// ([`bootstrap_verifier_step`]).
+///
+/// # Errors
+/// What the acquisition or `probe` refuses, with that remedy.
+fn worker_stock(
+    stock: &str,
+    commit: &str,
+    native: LinuxTarget,
+    homes: &aterm_verify::provision::stock::Homes,
+    rustup: &dyn aterm_verify::provision::stock::Rustup,
+    probe: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let refused = |why: String| {
+        format!(
+            "this worker cannot build the static bootstrap verifier on the stock release {stock} \
+             the claim commit {}'s trust.lock names: {why}. Run `{}` in a checkout on this host \
+             (it places the rustup row's copy, which the release build runs, and this worker then \
+             installs {stock} itself), or, where a rustup the row accepts is in place, `{}`; then \
+             the cut again",
+            commit.get(..12).unwrap_or(commit),
+            crate::gates::X86_SLICE_REMEDIES,
+            aterm_verify::provision::stock::release_install(stock),
+        )
+    };
+    aterm_verify::provision::stock::run_release(stock, homes, rustup, &mut |line| {
+        println!("==> stock toolchain: {line}");
+    })
+    .map_err(refused)?;
+    probe(stock, native.triple()).map_err(refused)
+}
+
+/// What asks the C compiler for the static C library a `+crt-static` link takes: `cc` answers
+/// the library's path where it finds one, and the bare name where it does not.
+const STATIC_C_LIBRARY_PROBE: &str = "-print-file-name=libc.a";
+
+/// What the static bootstrap verifier step answered ([`bootstrap_verifier_step`]).
+#[derive(Debug, PartialEq, Eq)]
+enum VerifierStep {
+    /// Built: its pair is in the worker's output directory, the verifier at this path.
+    Built(PathBuf),
+    /// Left out: what this host's C compiler answered, which names no static C library.
+    LeftOut(String),
+}
+
+/// Leave the worker's answer for its static bootstrap verifier in `out`, and say it: a built
+/// one's pair is there already; a left-out one gets the [`VerifierLeftOut`] record of this cut
+/// for `native` at [`left_out_path`], written once and synced after the executable's pair, which
+/// tells the cutter none was built rather than that its copy failed.
+///
+/// # Errors
+/// The record could not be written.
+fn record_verifier_step(
+    out: &Path,
+    native: LinuxTarget,
+    version: &str,
+    build: u64,
+    commit: &str,
+    step: VerifierStep,
+) -> Result<String, String> {
+    let answer = match step {
+        VerifierStep::Built(path) => {
+            return Ok(format!(
+                "Linux bootstrap verifier ready: {} (unsigned; install.sh pins it by SHA-256)",
+                path.display()
+            ));
+        }
+        VerifierStep::LeftOut(answer) => answer,
+    };
+    let record = VerifierLeftOut {
+        schema: 1,
+        version: version.into(),
+        build_number: build,
+        commit: commit.into(),
+        target: native.triple().into(),
+        asset: pin::asset_name(version, native.arch()),
+        static_c_library: answer,
+    };
+    record.validate(version, build, commit)?;
+    let path = left_out_path(out, &record.asset);
+    write_receipt(
+        &path,
+        &aterm_toml::to_string(&record).map_err(|e| e.to_string())?,
+    )?;
+    Ok(format!(
+        "==> no static bootstrap verifier for {}: this host's C compiler finds no static C \
+         library (`cc {STATIC_C_LIBRARY_PROBE}` answered {:?}). This release publishes none for \
+         it, and install.sh keeps its embedded verifier there; recorded in {}",
+        native.triple(),
+        record.static_c_library,
+        path.display()
+    ))
+}
+
+/// THE STATIC BOOTSTRAP VERIFIER STEP: left out ([`VerifierStep::LeftOut`], with that answer,
+/// which [`record_verifier_step`] records for the cutter) only where this host's C compiler
+/// `cc`, the first on the release's system `PATH` and the one the stock release links with,
+/// answers [`STATIC_C_LIBRARY_PROBE`] (`answer`) with no static C library: the one thing the
+/// worker's stock prelude ([`worker_stock`]) cannot settle and a person installs (glibc's static
+/// libraries). Where it names one, `build` ([`build_bootstrap_verifier`]: the static build on
+/// that stock release, its smoke run as install.sh reads it, its pair) runs, and any failure of
+/// it refuses the worker naming that library, never a release published without this
+/// architecture's verifier; a probe that did not answer refuses too, `build` never run. `triple`
+/// is this host's.
+///
+/// # Errors
+/// The probe did not answer (no `cc`, it did not run or exited non-zero), or `build` failed.
+fn bootstrap_verifier_step(
+    triple: &str,
+    answer: Result<std::process::Output, String>,
+    build: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<VerifierStep, String> {
+    let answer = answer.and_then(|out| {
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(format!(
+                "`cc {STATIC_C_LIBRARY_PROBE}` failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    });
+    let libc = answer.map_err(|why| {
+        format!(
+            "this worker cannot tell whether it has the static C library {triple}'s static \
+             bootstrap verifier links: {why}"
+        )
+    })?;
+    let found = PathBuf::from(&libc);
+    if !(found.is_absolute() && found.is_file()) {
+        return Ok(VerifierStep::LeftOut(libc));
+    }
+    let libc = found;
+    build().map(VerifierStep::Built).map_err(|why| {
+        format!(
+            "the static bootstrap verifier for {triple} failed on this host, whose C compiler \
+             links {}: {why}; a release is not published without it here",
+            libc.display()
+        )
+    })
 }
 
 /// A receipt at `path`, written once and synced.

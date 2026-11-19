@@ -538,9 +538,9 @@ fn rustup_check(t: &Target, opts: &Options, machine: &Machine, host: &dyn Host) 
         }
     };
     let mut lacks = Vec::new();
-    let placed = complete(t);
+    let placed = rustup_complete(t);
     if !placed {
-        lacks.push(format!("place {}", not_complete("rustup", t)));
+        lacks.push(format!("place {}", rustup_not_complete(t)));
     }
     match stock::missing(
         &machine.homes,
@@ -675,9 +675,10 @@ fn managed_row(
 /// the copy's directory (`buildplan::release_rustup_shim_dir`).
 pub(crate) const RUSTUP_PROXIES: [&str; 2] = ["cargo", "rustc"];
 
-/// The rustup row: its copy `t` placed ([`place_rustup`]) where it is not complete, then
-/// [`stock::run`] with the rustup the `rustup` row resolves; `--linux` adds the Linux lane's
-/// targets to the stock pin, and `--release` refuses a checkout with no `trust.lock`.
+/// The rustup row: its copy `t` placed ([`place_rustup`]) where it is not complete
+/// ([`rustup_complete`]), then [`stock::run`] with the rustup the `rustup` row resolves;
+/// `--linux` adds the Linux lane's targets to the stock pin, and `--release` refuses a checkout
+/// with no `trust.lock`.
 fn rustup_row(
     row: &Row,
     t: &Target,
@@ -687,7 +688,7 @@ fn rustup_row(
     say: &mut dyn FnMut(&str),
 ) -> State {
     let exe = t.dir.join(&t.exe);
-    let placed = if complete(t) {
+    let placed = if rustup_complete(t) {
         place::touch_stamp(&t.dir);
         false
     } else {
@@ -713,9 +714,48 @@ fn rustup_row(
     }
 }
 
+/// The rustup row's copy `t` [`complete`], with no directory of it a group or other may write
+/// ([`rustup_open_dir`]): a copy the release's shim validation refuses
+/// (`buildplan::release_rustup_shim_dir`) is not in place, so a run places it again.
+fn rustup_complete(t: &Target) -> bool {
+    complete(t) && rustup_open_dir(t).is_none()
+}
+
+/// Why the rustup row's copy `t`, which is not [`rustup_complete`], is not in place.
+fn rustup_not_complete(t: &Target) -> String {
+    match rustup_open_dir(t).filter(|_| complete(t)) {
+        Some((dir, mode)) => format!(
+            "rustup {}: {} is group/other-writable (mode {mode:03o}), which the release's rustup \
+             shim validation refuses and a run replaces",
+            t.version,
+            dir.display()
+        ),
+        None => not_complete("rustup", t),
+    }
+}
+
+/// The first directory of the rustup row's copy `t`, its tree and then the `bin/` its rustup,
+/// cargo and rustc sit in, that a group or other may write, with its mode: the release runs
+/// those from that `bin/` and refuses it then. `None` where neither is, or neither is there.
+fn rustup_open_dir(t: &Target) -> Option<(PathBuf, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let exe = t.dir.join(&t.exe);
+    let bin = exe.parent().unwrap_or(&t.dir).to_path_buf();
+    [t.dir.clone(), bin].into_iter().find_map(|dir| {
+        let mode = std::fs::symlink_metadata(&dir).ok()?.mode() & 0o777;
+        (mode & 0o022 != 0).then_some((dir, mode))
+    })
+}
+
+/// The mode of the rustup row's copy's directories, its tree and `bin/`, whatever the umask:
+/// the release's rustup shim validation refuses a `bin/` a group or other may write
+/// (`buildplan::release_rustup_shim_dir`), which a umask of 002 gives a plain `create_dir`.
+const RUSTUP_DIR_MODE: u32 = 0o755;
+
 /// rustup-init at its pin, held to its sha256 and copied into the tree as `bin/rustup`:
 /// rustup-init is rustup's multi-call binary, so under that name it is rustup itself, and
-/// [`RUSTUP_PROXIES`] are hard links to it. It answers `--version` as its pin from the
+/// [`RUSTUP_PROXIES`] are hard links to it. The tree and its `bin/` are
+/// [`RUSTUP_DIR_MODE`] whatever the umask. It answers `--version` as its pin from the
 /// scratch, over a scratch `RUSTUP_HOME` and `CARGO_HOME`, before it is stamped and placed.
 /// It never runs as an installer, so nothing is written to the account's `CARGO_HOME`.
 fn place_rustup(
@@ -735,6 +775,11 @@ fn place_rustup(
         .parent()
         .ok_or_else(|| format!("{} has no directory", t.exe))?;
     std::fs::create_dir_all(bin).map_err(|e| format!("could not create {}: {e}", bin.display()))?;
+    for dir in [tree.as_path(), bin] {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(RUSTUP_DIR_MODE))
+            .map_err(|e| format!("could not set the mode of {}: {e}", dir.display()))?;
+    }
     crate::copy_regular_fresh_mode(&init, &rustup, 0o755)
         .map_err(|e| format!("could not copy rustup-init to {}: {e}", rustup.display()))?;
     for proxy in RUSTUP_PROXIES {
@@ -767,7 +812,7 @@ fn place_rustup(
         &tree,
         &t.stamp(row.name, Some(url), "sha256", Some(reports)),
     )?;
-    place::place(&scratch, &tree, &t.dir, &|| complete(t))?;
+    place::place(&scratch, &tree, &t.dir, &|| rustup_complete(t))?;
     say(&format!(
         "placed {}: rustup-init {} under its multi-call name, with {} beside it; its \
          self-install never ran, so nothing was written to CARGO_HOME",

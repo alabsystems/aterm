@@ -54,13 +54,14 @@ fn only_aterm_machines_names_a_root_tool_or_reaches_its_agent() {
     );
 }
 
-/// The admitted-name rule's two whole path lines in aterm-types, and the lab lane's guest rule
+/// The admitted-name rule's three whole path lines in aterm-types, and the lab lane's guest rule
 /// inside `sudo_asks_script` alone. NEGATIVE CONTROLS: the same path in another aterm-types
 /// line or another file, and the lane's tools outside that function, are findings.
 #[test]
 fn the_rule_paths_and_the_lanes_guest_rule_alone_name_sudoers() {
     let types = "pub const ADMITTED_NAME_RULE: &str = \"/private/etc/sudoers.d/aterm-admitted-name\";\n\
                  pub const ADMITTED_NAME_RULE_REFUSED: &str =\n    \"/private/etc/sudoers.d/.aterm-admitted-name.refused\";\n\
+                 pub const ADMITTED_NAME_RULE_REMOVED: &str = \"/private/etc/sudoers.d/.aterm-admitted-name.removed\";\n\
                  pub const OTHER: &str = \"/private/etc/sudoers.d/other\";\n";
     let lane = "fn sudo_asks_script() -> String {\n    \"f=/private/etc/sudoers.d/.x; /usr/sbin/visudo -c -f $f\".to_owned()\n}\n\
                 fn other() { let v = \"/usr/sbin/visudo\"; }\n";
@@ -78,9 +79,10 @@ fn the_rule_paths_and_the_lanes_guest_rule_alone_name_sudoers() {
             "crates/aterm-gui/src/clt_install.rs:1",
             "crates/aterm-gui/src/clt_install.rs:3",
             "crates/aterm-gui/src/clt_install.rs:4",
+            "crates/aterm-gui/src/clt_install.rs:5",
             "crates/aterm-lab/src/mac_nux.rs:4",
             "crates/aterm-types/src/macos_setup.rs:3",
-            "crates/aterm-types/src/macos_setup.rs:4",
+            "crates/aterm-types/src/macos_setup.rs:5",
         ],
         "{found:#?}"
     );

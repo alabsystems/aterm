@@ -2815,22 +2815,27 @@ fn the_pid_is_the_services_own_line() {
     assert_eq!(main_pid(""), None);
 }
 
-/// Only a successful launchd reading or its unloaded-job status establishes service state.
-/// Permission failures and a signal remain unknown even when their output looks like a PID.
+/// Only a successful launchd reading or its unloaded-job status establishes service state, and a
+/// loaded job with no pid is told from one launchd does not hold. Permission failures and a signal
+/// remain unknown even when their output looks like a PID.
 #[test]
 fn a_system_job_read_distinguishes_stopped_from_unreadable() {
+    use aterm_uds::launchd::JobState;
     let running = "system/job = {\n\tpid = 77\n}\n";
-    assert_eq!(system_job_running_of(Some(0), running), Some(true));
     assert_eq!(
-        system_job_running_of(Some(0), "\tstate = waiting\n"),
-        Some(false)
+        system_job_state_of(Some(0), running),
+        Some(JobState::Running)
     );
     assert_eq!(
-        system_job_running_of(Some(113), "no such service"),
-        Some(false)
+        system_job_state_of(Some(0), "\tstate = waiting\n"),
+        Some(JobState::Idle)
     );
-    assert_eq!(system_job_running_of(Some(1), running), None);
-    assert_eq!(system_job_running_of(None, running), None);
+    assert_eq!(
+        system_job_state_of(Some(113), "no such service"),
+        Some(JobState::Unloaded)
+    );
+    assert_eq!(system_job_state_of(Some(1), running), None);
+    assert_eq!(system_job_state_of(None, running), None);
 }
 
 #[test]
@@ -3229,5 +3234,102 @@ fn daemon_state_reads_system_domain_and_ignores_scratch_homes() {
     assert_eq!(
         daemon_state_for_home(Path::new("/nonexistent/scratch-home-for-test")).unwrap(),
         State::Absent
+    );
+}
+
+/// **EACH VAULT JOB'S VERB KEEPS THE FILES ITS DEFINITIONS NAME.** `aterm secrets watch` and
+/// `serve` start with `keep_log` (their serving, `client::watch` and the verb's `serve`, takes the
+/// `Kept` it returns, which nothing else makes), and it hands `aterm_uds::job_log::keep` exactly
+/// the files their plists name: the subscriber's and the server's `log_path` (one file for both
+/// streams), and for the server the root vault server's `DAEMON_LOG` too, since `serve` is that
+/// daemon's program.
+/// NEGATIVE CONTROL: this thread asked nothing before the calls; a plist under another home names
+/// files neither call asked for; a test's run keeps nothing (its output is not those files).
+#[test]
+fn each_vault_jobs_verb_keeps_the_files_its_definitions_name() {
+    use aterm_uds::job_log::seam;
+    let keeps_nothing = |kept: aterm_uds::job_log::Kept| !kept.stdout() && !kept.stderr();
+    let home = Path::new("/nonexistent/vault-job-log");
+    let program = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+    let plist = |job: Job, home: &Path| {
+        seam::plist_outputs(&plist_text(job.label(), program, &[], &log_path(home, job))).files()
+    };
+    assert_eq!(seam::asked(), None);
+    assert!(keeps_nothing(keep_log(home, Job::Subscriber)));
+    assert_eq!(seam::asked(), Some(plist(Job::Subscriber, home)));
+    assert!(keeps_nothing(keep_log(home, Job::Server)));
+    let daemon = seam::plist_outputs(&plist_text(
+        DAEMON_LABEL,
+        program,
+        &daemon_serve_args(Path::new(DAEMON_STORE), None),
+        Path::new(DAEMON_LOG),
+    ))
+    .files();
+    let mut server = plist(Job::Server, home);
+    server.extend(daemon);
+    assert_eq!(seam::asked(), Some(server));
+    assert_ne!(
+        plist(Job::Server, Path::new("/nonexistent/another-home")),
+        plist(Job::Server, home)
+    );
+}
+
+/// The full name of [`a_burst_of_a_vault_jobs_lines_stays_under_the_bound_where_its_log_is_kept`].
+const VAULT_BURST: &str =
+    "service::tests::a_burst_of_a_vault_jobs_lines_stays_under_the_bound_where_its_log_is_kept";
+
+/// A line a vault job writes for each request a remote that keeps asking makes.
+const REFUSED_PEER: &str = "refused 198.51.100.7: not a member of this vault";
+
+/// **A BURST OF A VAULT JOB'S OWN LINES STAYS UNDER THE BOUND WHERE ITS LOG IS KEPT.** A stand-in
+/// subscriber and a stand-in server (this binary run again under a scratch home, standard output
+/// and error opened as the job's plist names them) start as their verbs do (`keep_log`) and write
+/// `log_line`'s line about twice the cap's worth: the log stays under `job_log::CAP`, every line
+/// dated. NEGATIVE CONTROL: the same burst with nothing kept grows the log past the cap.
+#[test]
+fn a_burst_of_a_vault_jobs_lines_stays_under_the_bound_where_its_log_is_kept() {
+    use aterm_uds::job_log::{CAP, seam, undated};
+    let job_of = |stage: &str| {
+        if stage.ends_with("subscriber") {
+            Job::Subscriber
+        } else {
+            Job::Server
+        }
+    };
+    if let Some((stage, home)) = seam::stage() {
+        let job = job_of(&stage);
+        let log = log_path(&home, job);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let plist = plist_text(job.label(), Path::new("/x/aterm"), &[], &log);
+        seam::open_as_service_manager(&seam::plist_outputs(&plist)).unwrap();
+        if stage.starts_with("kept") {
+            let kept = keep_log(&home, job);
+            assert!(kept.stdout() && kept.stderr());
+        }
+        for _ in 0..seam::BURST {
+            crate::log_line(REFUSED_PEER);
+        }
+        std::process::exit(0);
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let run = |stage: &str| {
+        let home = scratch.path().join(stage);
+        std::fs::create_dir(&home).unwrap();
+        seam::rerun(VAULT_BURST, stage, &home).unwrap();
+        std::fs::read_to_string(log_path(&home, job_of(stage))).unwrap()
+    };
+    for stage in ["kept-subscriber", "kept-server"] {
+        let kept = run(stage);
+        assert!(kept.len() as u64 <= CAP, "{stage}: {} > {CAP}", kept.len());
+        assert!(
+            kept.lines()
+                .skip(1)
+                .all(|l| l != undated(l) && undated(l) == REFUSED_PEER),
+            "{stage}: every line dated"
+        );
+    }
+    assert!(
+        run("unkept-server").len() as u64 > CAP,
+        "the control is unbounded"
     );
 }

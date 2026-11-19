@@ -173,7 +173,7 @@ fn standin_run_reports_once_interrupted() {
         Some(&mut log),
         ctx.events.as_ref(),
     );
-    crate::end_run(&ctx, &scratch);
+    crate::end_run(&ctx, &scratch, None);
     std::process::exit(code);
 }
 

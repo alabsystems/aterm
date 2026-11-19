@@ -211,6 +211,120 @@ fn a_restarted_keeper_is_told_again_without_a_new_op() {
     drop(second);
 }
 
+/// A window's link asks no keeper to restart until it is told the window booted healthy
+/// ([`LinkOp::AskRestart`]); from then on it asks each keeper it reaches whose WELCOME its
+/// judgment says so of: the keeper of the connection it has when told, and a restarted one on the
+/// connection the link makes, behind the REGISTER it replays. The keeper exits only once a build
+/// as new stands at its executable's path, and then with the link's master registered, which the
+/// link tells its successor again. A link whose judgment says no never asks.
+///
+/// NEGATIVE CONTROLS (run by hand, each restored): with the worker asking the boot connection's
+/// keeper as it starts (the ask before the checkpoint), the keeper holds the master with the
+/// restart already wanted, and the first assertion fails; with `reconnect_inner` asking nothing,
+/// the restarted keeper is never asked.
+#[test]
+fn a_window_link_asks_each_keeper_it_reaches_to_restart_once_it_booted_healthy() {
+    use crate::core::Restart;
+    const VERSION: &str = "0.1.0";
+    let scratch = crate::test_scratch_dir("askrestart");
+    let sock = scratch.path().join("k.sock");
+    let wanted = |s: &Server| matches!(s.core().restart(), Restart::Wanted { .. });
+    let held_by = |s: &Server, word: &str| {
+        s.core()
+            .status_lines()
+            .contains(&format!("restart=wanted askers=1 held_by={word}"))
+    };
+    let at = |version: &str| {
+        Server::bind(ServeConfig {
+            socket: sock.clone(),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: version.into(),
+            test_drop_custody: false,
+        })
+        .expect("bind")
+    };
+    let mut first = at(VERSION);
+    let boot = booted(&mut first, &sock);
+    let link = KeeperLink::start_window(
+        sock.clone(),
+        Identity::same_uid(),
+        "t".into(),
+        None,
+        Some(boot),
+        true,
+        |version, _| version == VERSION,
+    )
+    .expect("link");
+    let (rdev, register) = register_op("/dev/null", 1);
+    assert!(link.enqueue(register));
+    // The REGISTER follows anything the link wrote on this connection before it.
+    step_until(&mut first, "the first keeper holds it", |s| s.holds(rdev));
+    assert!(!wanted(&first), "nothing asked before the boot-health op");
+    assert!(link.enqueue(LinkOp::AskRestart));
+    step_until(&mut first, "the boot connection's keeper is asked", |s| {
+        held_by(s, "image-unknown")
+    });
+    assert!(
+        !first.exits(),
+        "a keeper that read no executable never exits"
+    );
+    drop(first);
+
+    let contents = scratch.path().join("Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).expect("a bundle");
+    std::fs::write(
+        contents.join("Info.plist"),
+        format!(
+            "<plist><dict><key>CFBundleShortVersionString</key><string>{VERSION}</string>\
+             </dict></plist>"
+        ),
+    )
+    .expect("write");
+    let exe = contents.join("MacOS/aterm");
+    std::fs::write(&exe, b"the build the keeper started as").expect("write");
+    let mut second = at(VERSION);
+    second.restart_for(crate::code::ExeImage::at(&exe).expect("stat"));
+    step_until(&mut second, "the restarted keeper is told and asked", |s| {
+        s.holds(rdev) && held_by(s, "same-image")
+    });
+    let next = exe.with_extension("next");
+    std::fs::write(&next, b"the build an update put there").expect("write");
+    std::fs::rename(&next, &exe).expect("rename over");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        second.step(20).expect("step");
+        if second.exits() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never: the keeper exits");
+    }
+    assert!(second.holds(rdev), "it exits beside the window's master");
+    drop(second);
+    link.shutdown();
+
+    let mut third = at(VERSION);
+    let quiet = KeeperLink::start_window(
+        sock.clone(),
+        Identity::same_uid(),
+        "t".into(),
+        None,
+        None,
+        true,
+        |_, _| false,
+    )
+    .expect("link");
+    let (rdev, register) = register_op("/dev/zero", 2);
+    assert!(quiet.enqueue(register));
+    assert!(quiet.enqueue(LinkOp::AskRestart));
+    step_until(&mut third, "the keeper holds its master", |s| s.holds(rdev));
+    for _ in 0..10 {
+        third.step(20).expect("step");
+    }
+    assert!(!wanted(&third), "a link that judges no never asks");
+    quiet.shutdown();
+}
+
 #[test]
 fn a_restarted_keeper_is_told_each_region_again() {
     let scratch = crate::test_scratch_dir("journal");

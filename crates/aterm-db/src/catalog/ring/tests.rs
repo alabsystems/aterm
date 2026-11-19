@@ -811,3 +811,374 @@ fn a_full_byte_share_spills_into_the_next_period() {
         assert_eq!(placed, [D, D + 1]);
     });
 }
+
+/// Every ring's tables a clock at `now` can reach (`Ring::reach`): what a peer that holds each
+/// ring's current periods offers.
+fn reach_ids(directory: &Directory, now: u64) -> BTreeSet<Digest> {
+    RINGS
+        .iter()
+        .flat_map(|ring| {
+            ring.reach(now)
+                .map(|epoch| ring.scope(directory.trust, epoch).unwrap().digest())
+        })
+        .collect()
+}
+
+/// Day by day from D+1 to D+8, after day D's take-up, with claims period D-1's storage left open
+/// to others, which retirement refuses to remove from day D+1 on: whether that day's take-up of
+/// what a peer offers stored each ring's newest window period, in [`RINGS`]' order; whether the
+/// writer pass then listed every ring's newest window period, and an own write of each of the
+/// claims and journal rings landed.
+fn days_past_a_stuck_period(session: &Session<'_>, directory: &Directory) -> Vec<[bool; 5]> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let policy = Policy::default();
+    let shares = Shares {
+        records: 100,
+        bytes: usize::MAX,
+        writer_records: 100,
+        writer_bytes: usize::MAX,
+    };
+    let now = at(D, 60);
+    directory
+        .adopt_ring_tables(session, &policy, now, &reach_ids(directory, now))
+        .unwrap();
+    let stuck = directory
+        .path(CLAIMS.scope(directory.trust, D - 1).unwrap())
+        .unwrap();
+    assert!(stuck.exists(), "CONTROL: day D-1 is taken up");
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (D + 1..=D + 8)
+        .map(|day| {
+            let now = at(day, 60);
+            let _ = directory.adopt_ring_tables(session, &policy, now, &reach_ids(directory, now));
+            let newest = |ring: &Ring| {
+                let newest = *directory.ring_view(session, ring).window(ring, now).end();
+                ring.scope(directory.trust, newest).unwrap()
+            };
+            let stored = |ring: &Ring| directory.path(newest(ring)).unwrap().exists();
+            let whole = directory
+                .ring_subscriptions(session, &policy, now)
+                .is_ok_and(|listed| {
+                    RINGS
+                        .iter()
+                        .all(|ring| listed.contains_key(&newest(ring).digest()))
+                });
+            let written = [&CLAIMS, &JOURNAL].into_iter().all(|ring| {
+                directory
+                    .append_own(session, ring, shares, now, now, &[7; 64])
+                    .is_ok()
+            });
+            [
+                stored(&CLAIMS),
+                stored(&RECOVERIES),
+                stored(&JOURNAL),
+                whole,
+                written,
+            ]
+        })
+        .collect()
+}
+
+/// An old claims period whose storage cannot be deleted (a directory left open to others, which
+/// retirement refuses to remove) costs this Mac none of its rings' new periods: on each of the
+/// eight days after it, through a journal week's turn, the take-up of what a peer offers stores
+/// the newest window period of the claims, recoveries and journal rings, the writer pass lists
+/// them, and own writes to the claims and journal rings land. Every other old claims period is
+/// deleted, so the stuck one alone stays held beside the window, and each pass that meets it
+/// and goes on counts its retirement unfinished (`Event::Unretired`).
+/// MUTANT (`RETIRE_FAILURE_STOPS`): a retirement that does not finish fails the writer pass, as
+/// before 2026-11-18: from day D+1 no claims period is taken up, listed or written, while the
+/// recoveries and journal rings, whose take-up stands alone, go on.
+/// MUTANT (`RETIRE_STOPS_AT_FIRST`): the stuck period ends each retirement, the old periods
+/// behind it stay held, and from day D+6 the claims ring holds [`MAX_HELD`] periods and takes no
+/// new one up.
+#[test]
+fn an_old_period_that_cannot_be_deleted_costs_no_ring_its_new_periods() {
+    use crate::runtime::census::{Event, cadence_here};
+    let every = [true; 5];
+    for (mutant, flag) in [
+        ("", None),
+        ("RETIRE_FAILURE_STOPS", Some(&RETIRE_FAILURE_STOPS)),
+        ("RETIRE_STOPS_AT_FIRST", Some(&RETIRE_STOPS_AT_FIRST)),
+    ] {
+        let lab = Lab::new(&[Role::Writer]);
+        let before = cadence_here().get(Event::Unretired);
+        if let Some(flag) = flag {
+            flag.with(|flag| flag.set(true));
+        }
+        let (days, held) = with_writer(&lab, |session, directory| {
+            let days = days_past_a_stuck_period(session, directory);
+            (days, directory.ring_state(session, &CLAIMS).unwrap().held)
+        });
+        if let Some(flag) = flag {
+            flag.with(|flag| flag.set(false));
+        }
+        let counted = cadence_here().get(Event::Unretired) - before;
+        match mutant {
+            "" => {
+                assert_eq!(days, vec![every; 8], "each day takes up, lists and writes");
+                assert_eq!(held, BTreeSet::from([D - 1, D + 7, D + 8, D + 9]));
+                // Each day's take-up, writer pass and claims write meet the stuck period.
+                assert_eq!(counted, 3 * 8, "unfinished retirements counted");
+            }
+            "RETIRE_FAILURE_STOPS" => {
+                assert!(
+                    days.iter()
+                        .all(|day| *day == [false, true, true, false, false]),
+                    "MUTANT: the claims ring stops, the others go on: {days:?}"
+                );
+                assert_eq!(counted, 0, "MUTANT: no pass went on");
+            }
+            _ => {
+                assert_eq!(days[..5], [every; 5], "MUTANT: CONTROL");
+                assert!(!days[5][0], "MUTANT: day D+6's claims period: {days:?}");
+            }
+        }
+    }
+}
+
+/// A retirement that deletes nothing flushes nothing: with claims day D-1's storage left open to
+/// others, the pass after the one that raised the floor leaves the state as it was and asks for
+/// no flush, where every writer pass of a Mac with such a period would pay two durable directory
+/// flushes (`F_FULLFSYNC` on Apple). The flush still precedes the forgetting: once the storage
+/// can be deleted, a pass that fails after its delete has flushed the tables root and the claim
+/// directory, those two flushes alone, and still holds the day, which the next pass forgets.
+/// NEGATIVE CONTROLS (each a source edit, run and undone): the flush made whatever was deleted
+/// (`if true || !deleted.is_empty()`) gives the stuck pass two flushes (`left: [Durable,
+/// Durable]`); the flush never made (`if false && !deleted.is_empty()`) gives the pass that
+/// deleted none (`left: []`).
+#[test]
+fn a_retirement_that_deletes_nothing_flushes_nothing() {
+    use aterm_durable::{Flush, seam::Recording};
+    use std::os::unix::fs::PermissionsExt as _;
+    let lab = Lab::new(&[Role::Writer]);
+    with_writer(&lab, |session, directory| {
+        adopt_window(session, directory, D);
+        let stuck = directory
+            .path(CLAIMS.scope(directory.trust, D - 1).unwrap())
+            .unwrap();
+        assert!(stuck.exists(), "CONTROL: day D-1 is taken up");
+        let mode = |mode| {
+            std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o755);
+        let now = at(D + 1, 60);
+        let raised = directory.retired(session, &CLAIMS, now).unwrap();
+        assert_eq!(raised.floor, D, "CONTROL: the first pass raises the floor");
+        assert!(raised.held.contains(&(D - 1)), "CONTROL: day D-1 is stuck");
+
+        let recording = Recording::start();
+        let again = directory.retired(session, &CLAIMS, now).unwrap();
+        assert_eq!(again, raised, "the stuck pass changes nothing");
+        assert_eq!(
+            recording.take(),
+            [],
+            "a pass that deleted nothing flushes nothing"
+        );
+        assert_eq!(recording.take_plain(), 0, "nor by a plain fsync");
+
+        mode(0o700);
+        FAIL_AFTER_DELETE.with(|fail| fail.set(true));
+        let cut = directory.retired(session, &CLAIMS, now).unwrap();
+        assert!(!stuck.exists(), "CONTROL: the pass deleted day D-1");
+        assert_eq!(
+            recording.take(),
+            [Flush::Durable; 2],
+            "the delete is flushed, root and claims, before the day is forgotten"
+        );
+        assert!(cut.held.contains(&(D - 1)), "cut short, the day stays held");
+        let done = directory.retired(session, &CLAIMS, now).unwrap();
+        assert_eq!(
+            done.held,
+            BTreeSet::from([D, D + 1]),
+            "the next pass forgets it"
+        );
+    });
+}
+
+/// Only a pass that goes on past an unfinished retirement is counted (`Event::Unretired`): a
+/// damaged claims ring state whose rebuild cannot be written, its claim directory closed to
+/// writes, leaves no state to go on with, so the pass fails and counts nothing.
+/// NEGATIVE CONTROL (run by hand): the count made before `Directory::retired` reads the written
+/// state counts this pass (`left: 1`).
+#[test]
+fn a_retirement_that_leaves_no_state_to_go_on_with_is_not_counted() {
+    use crate::runtime::census::{Event, cadence_here};
+    use std::os::unix::fs::PermissionsExt as _;
+    let lab = Lab::new(&[Role::Writer]);
+    with_writer(&lab, |session, directory| {
+        adopt_window(session, directory, D);
+        damage_state(session, b"damaged");
+        let claims = claim_dir(session).unwrap();
+        let mode = |mode| {
+            std::fs::set_permissions(&claims, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o500);
+        let before = cadence_here().get(Event::Unretired);
+        let retired = directory.retired(session, &CLAIMS, at(D, 120));
+        let counted = cadence_here().get(Event::Unretired) - before;
+        mode(0o700);
+        assert!(
+            retired.is_err(),
+            "CONTROL: the pass cannot go on: {retired:?}"
+        );
+        assert_eq!(counted, 0, "a pass that does not go on is not counted");
+        directory
+            .retired(session, &CLAIMS, at(D, 120))
+            .expect("CONTROL: the state is rebuilt once it can be written");
+    });
+}
+
+/// The tables one take-up at `now` of every ring's tables a peer offers takes up, on a fresh Mac
+/// whose tables root holds `damage` first: each table it returns, as its ring's place in
+/// [`RINGS`] and its period, whether each has storage, and, where `damage` names the path it
+/// damaged, whether that path is still a symlink to the same target, read once the take-up ends.
+fn taken_up(
+    now: u64,
+    damage: impl FnOnce(&Directory) -> Option<std::path::PathBuf>,
+) -> (BTreeSet<(usize, u64)>, bool, Option<bool>) {
+    let lab = Lab::new(&[Role::Writer]);
+    with_writer(&lab, |session, directory| {
+        aterm_journal::create_private_dir_durable(&directory.root).unwrap();
+        let damaged = damage(directory).map(|path| {
+            let target = std::fs::read_link(&path).ok();
+            (path, target)
+        });
+        let taken = directory
+            .adopt_ring_tables(session, &Policy::default(), now, &reach_ids(directory, now))
+            .unwrap();
+        let stored = taken.values().all(|(_, path)| path.is_dir());
+        let kept = damaged
+            .map(|(path, target)| target.is_some() && std::fs::read_link(&path).ok() == target);
+        let periods = RINGS
+            .iter()
+            .enumerate()
+            .flat_map(|(n, ring)| ring.reach(now).map(move |epoch| (n, ring, epoch)))
+            .filter(|(_, ring, epoch)| {
+                taken.contains_key(&ring.scope(directory.trust, *epoch).unwrap().digest())
+            })
+            .map(|(n, _, epoch)| (n, epoch))
+            .collect();
+        (periods, stored, kept)
+    })
+}
+
+/// Each ring's take-up stands alone, and each table's in it: where the claims ring's day D
+/// storage path holds a symlink to nothing (damaged storage, which a take-up cannot create
+/// over), a peer's offer of every ring's tables still takes up every other one, the claims ring's
+/// other days and the recoveries and journal rings' among them, each with its storage, and the
+/// damaged path stays as it was, the same symlink to nothing.
+/// NEGATIVE CONTROLS (each a source edit, run and undone): a table whose storage cannot be made
+/// failing its ring's take-up (`create_private_dir(&path)?`) passes over the claims ring's other
+/// days too; the commit before this one, where it fails the whole take-up, returns the error.
+#[test]
+fn a_ring_table_that_cannot_be_taken_up_costs_no_other_table_its_take_up() {
+    let now = at(D, 60);
+    let claims = RINGS
+        .iter()
+        .position(|ring| (ring.application, ring.role) == (CLAIMS.application, CLAIMS.role))
+        .unwrap();
+    let (all, stored, _) = taken_up(now, |_| None);
+    assert!(stored, "CONTROL: each table taken up has its storage");
+    assert!(
+        all.contains(&(claims, D)),
+        "CONTROL: day D is taken up undamaged"
+    );
+    assert!(
+        (0..RINGS.len()).all(|n| all.iter().any(|(ring, _)| *ring == n)),
+        "CONTROL: every ring takes some table up: {all:?}"
+    );
+    let (taken, stored, kept) = taken_up(now, |directory| {
+        let path = directory
+            .path(CLAIMS.scope(directory.trust, D).unwrap())
+            .unwrap();
+        std::os::unix::fs::symlink(directory.root.join("gone"), &path).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink())
+                && !path.exists(),
+            "CONTROL: the damage is in place"
+        );
+        Some(path)
+    });
+    assert_eq!(
+        taken,
+        &all - &BTreeSet::from([(claims, D)]),
+        "only day D is passed over"
+    );
+    assert!(stored, "each table taken up has its storage");
+    assert_eq!(kept, Some(true), "the damaged path stays as it was");
+}
+
+/// A take-up needs the control writer, and says so itself: under a reader's session it is
+/// refused, where each ring's own refusal would be passed over as that ring's alone and the
+/// take-up would read as one with nothing to take up.
+/// NEGATIVE CONTROL (a source edit, run and undone): without `adopt_ring_tables`' own check the
+/// take-up answers `Ok` with no table.
+#[test]
+fn a_take_up_with_no_control_writer_is_refused() {
+    let lab = Lab::new(&[Role::Writer]);
+    let now = at(D, 60);
+    let offered = with_writer(&lab, |session, directory| {
+        let offered = reach_ids(directory, now);
+        let taken = directory
+            .adopt_ring_tables(session, &Policy::default(), now, &offered)
+            .unwrap();
+        assert!(!taken.is_empty(), "CONTROL: the writer takes tables up");
+        reach_ids(directory, now + 2 * DAY)
+    });
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    assert!(!session.has_control_writer(), "CONTROL: a reader's session");
+    assert!(
+        directory
+            .adopt_ring_tables(&session, &Policy::default(), now + 2 * DAY, &offered)
+            .is_err(),
+        "a reader takes nothing up, and is told"
+    );
+}
+
+/// Going on past an unfinished retirement is a writer's: under a reader's session, two days after
+/// a writer took the window up, `retired` and the writer pass's listing (`ring_subscriptions`)
+/// are refused with `retire`'s own refusal, nothing is counted (`Event::Unretired`), and the
+/// claims ring's state stays as the writer left it.
+/// NEGATIVE CONTROL (a source edit, run and undone): without `retired`'s own check
+/// (`if false && !session.has_control_writer()`) the refusal reads as an unfinished retirement:
+/// the reader is answered with the written state (`a reader retires nothing, and is told`).
+#[test]
+fn a_retirement_with_no_control_writer_is_refused_and_not_counted() {
+    use crate::runtime::census::{Event, cadence_here};
+    let lab = Lab::new(&[Role::Writer]);
+    let written = with_writer(&lab, |session, directory| {
+        adopt_window(session, directory, D);
+        directory.ring_state(session, &CLAIMS).unwrap()
+    });
+    assert_eq!(
+        written.held,
+        BTreeSet::from([D - 1, D, D + 1]),
+        "CONTROL: a writer wrote the state"
+    );
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    assert!(!session.has_control_writer(), "CONTROL: a reader's session");
+    let now = at(D + 2, 60);
+    let before = cadence_here().get(Event::Unretired);
+    let retired = directory.retired(&session, &CLAIMS, now);
+    assert!(
+        retired.is_err(),
+        "a reader retires nothing, and is told: {retired:?}"
+    );
+    let listed = directory.ring_subscriptions(&session, &Policy::default(), now);
+    assert!(listed.is_err(), "a reader's listing is refused: {listed:?}");
+    assert_eq!(
+        cadence_here().get(Event::Unretired),
+        before,
+        "a refusal is no unfinished retirement"
+    );
+    assert_eq!(
+        directory.ring_state(&session, &CLAIMS).unwrap(),
+        written,
+        "the state stays as the writer left it"
+    );
+}

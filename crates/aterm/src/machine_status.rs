@@ -798,6 +798,14 @@ pub(crate) fn name_area(name: &Result<crate::converge::MacName, String>) -> Area
             Who::Person,
             "renew setup's naming permission: run `aterm init` in your own Mac login",
         ),
+        // The person's removal is their choice: no pass and no password step undoes it.
+        Some(MacNamePending::Removed(pending)) => Area::off(
+            NAME,
+            format!(
+                "{target}; {fleet}; {pending}; you removed setup's naming permission; \
+                 the name menu's permission repair or `aterm init` puts it back"
+            ),
+        ),
         Some(MacNamePending::Unread(pending)) => Area::due(
             NAME,
             format!("{target}; {fleet}; {pending}"),

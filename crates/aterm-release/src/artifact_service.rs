@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 enum Value {
     Text(String),
     Strings(Vec<String>),
+    Integer(i64),
     Other,
 }
 
@@ -44,6 +45,12 @@ pub(super) fn program(text: &str) -> Result<PathBuf, &'static str> {
             Value::Text(directory) if Path::new(directory).is_absolute() => {}
             _ => return Err("WorkingDirectory is not an absolute string"),
         }
+    }
+    if fields
+        .get("StartInterval")
+        .is_some_and(|value| !matches!(value, Value::Integer(seconds) if *seconds > 0))
+    {
+        return Err("StartInterval is not a positive integer");
     }
     let selected = match fields.get("Program") {
         Some(Value::Text(program)) => program,
@@ -156,6 +163,7 @@ impl Xml<'_> {
                         | "LimitLoadToSessionType"
                         | "AssociatedBundleIdentifiers"
                         | "RunAtLoad"
+                        | "StartInterval"
                         | "KeepAlive"
                         | "ProcessType"
                         | "Nice"
@@ -190,8 +198,8 @@ impl Xml<'_> {
             if text.starts_with('+') {
                 return Err("unsupported integer");
             }
-            text.parse::<i64>().map_err(|_| "unsupported integer")?;
-            return Ok(Value::Other);
+            let integer = text.parse::<i64>().map_err(|_| "unsupported integer")?;
+            return Ok(Value::Integer(integer));
         }
         if !nested && self.take("<array>") {
             let mut strings = Vec::new();

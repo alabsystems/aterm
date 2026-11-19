@@ -729,6 +729,13 @@ impl Journal {
         self.done.iter().any(|d| d == fact)
     }
 
+    /// R is a hop carried in this clone whose record merge has not landed on main: the fleet's
+    /// claim publishes the line's newest prefix main retains ([`crate::line::recorded_prefix`]).
+    #[must_use]
+    pub fn pending_line(&self) -> bool {
+        self.has(PENDING_LINE)
+    }
+
     fn add(&mut self, fact: &str) {
         if !self.has(fact) {
             self.done.push(fact.to_string());
@@ -1644,7 +1651,7 @@ impl Discarded {
 
 /// Everything the release asks of the world — git, the engine, the records, the children, the clock, the owner's aterm.
 pub trait Backend {
-    /// State the follower's status on the selected base without steering selection or
+    /// State the follower's verdict on the selected base without steering selection or
     /// refusing a cut.
     fn follower(&mut self, _base: &str) -> Option<String> {
         None
@@ -1805,6 +1812,11 @@ pub trait Backend {
     ) -> Result<String, InputFinding> {
         Ok("release input checked".into())
     }
+    /// A negative-only formatter prefix of the final selected source. It creates no
+    /// qualification receipt and never replaces the later source or tree checks.
+    fn snapshot_format(&mut self, _commit: &str, _prover: &Prover) -> Result<(), InputFinding> {
+        Ok(())
+    }
     /// THE EARLY ASK: the released-shim judgment of `c`'s tree, which this Mac's installed
     /// public release makes ([`aterm_verify::released_shim::judge`], the function `verify
     /// released-shim` runs), before anything of `c` is qualified. Its answer depends on which
@@ -1881,6 +1893,19 @@ pub trait Backend {
     }
     /// Provision the selected checkout's tools before staging or compiling the product.
     fn validation_tools(&mut self) -> Result<String, Refusal>;
+    /// Put the stock release `commit`'s `trust.lock` names in `[stock]` (the candidate's, read
+    /// from that commit whatever the clone's working tree holds) in place with the x86_64
+    /// slice's std: `verify provision`'s rustup row's release part alone
+    /// (`aterm_verify::provision::stock::run_release`), never the stock pin, whose stds and
+    /// components the whole row [`Backend::validation_tools`] runs takes. A run asks it before
+    /// anything reads that release (`Run::stock_in_place`, before the freeze of R's cutter
+    /// among them); what it did (`None`: all of it was in place). A dry run (`dry`) changes
+    /// nothing and answers what a real run would do; a refusal is the one a real run meets.
+    /// Where a dry run's answer is an install and the run freezes R's cutter, that freeze then
+    /// meets the release missing and stops, naming what puts it there
+    /// ([`crate::build_inputs::stock_gap`]); a dry run already in R's own cutter meets it at step
+    /// 1's seal and input judge instead.
+    fn stock_toolchain(&mut self, commit: &str, dry: bool) -> Result<Option<String>, Refusal>;
     fn own_cutter(&mut self, commit: &str) -> Result<String, crate::cutter::NotOwn>;
     fn frozen_commit(&mut self) -> Option<String> {
         None
@@ -2184,6 +2209,10 @@ struct Run<'b> {
     allowance_waited: bool,
     /// A dry run audits once.
     dry_audit: Option<Vec<Finding>>,
+    /// The candidate commit whose stock release this image asked for ([`Run::stock_in_place`]:
+    /// a real run's put it in place, a dry run's read what that would do), asked again only for
+    /// another.
+    stock_asked: Option<String>,
     /// This image asked whether the host fits ([`Run::host_fits`]): once is enough.
     host_judged: bool,
     last: String,
@@ -2237,6 +2266,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions) -> Outcome {
         waited: 0,
         allowance_waited: false,
         dry_audit: None,
+        stock_asked: None,
         host_judged: false,
         last: String::new(),
         early_sign: None,
@@ -2449,6 +2479,26 @@ impl Run<'_> {
         if !self.dry {
             self.journal_path = selection;
             self.prepare_candidate()?;
+        }
+
+        let candidate = self.cand.clone().ok_or(Halt::Said(1))?;
+        let prover = self.prover.clone().ok_or(Halt::Said(1))?;
+        if let Err(finding) = self.b.snapshot_format(&candidate.commit, &prover) {
+            // The ordinary source remedy reads the engine's publication state. This prefix
+            // must stop without that read, and cannot guess that an unfinished cut is absent.
+            let again = self.again(&candidate);
+            return self.refuse_hard(match finding {
+                InputFinding::Failed(why) => Refusal::new(
+                    why,
+                    format!(
+                        "land a formatting fix on main, then follow this candidate's normal \
+                         release-line recovery ({RELEASE_COMMAND} status --json)"
+                    ),
+                ),
+                InputFinding::Unanswered(why) => {
+                    Refusal::new(why, format!("run {again} again once it answers")).could_not_run()
+                }
+            });
         }
 
         self.begin(Step::Checks)?;
@@ -3136,16 +3186,18 @@ impl Run<'_> {
         // A removal that is not yet durable is removed again by the next run.
         let _ = crate::durable::sync_dir(&release_dir);
         Some(format!(
-            "{SELECTION_FILE}'s proposal of v{} at {}, which this clone never held as the \
-             fleet's line, was dropped",
+            "{SELECTION_FILE}'s proposal of v{} at {}, on which this clone did nothing, was \
+             dropped",
             proposal.version,
             short(&proposal.commit)
         ))
     }
 
-    /// Before a candidate is chosen: a proposal candidate.toml kept of a version whose fleet
-    /// line is another line ([`Journal::never_claimed`]) is dropped, so the run selects as a
-    /// clone with no journal of that line does. A read that fails drops nothing.
+    /// Before a candidate is chosen: a proposal candidate.toml kept of a version that is cut
+    /// (its tag is on origin) or whose fleet line is another line ([`Journal::never_claimed`]) is
+    /// dropped, so the run selects as a clone with no journal of that line does: a proposal holds
+    /// nothing a run made ([`Journal::proposal_only`]), and neither line is this clone's to go on
+    /// with. A read that fails drops nothing.
     fn drop_never_claimed(&mut self) -> Flow {
         if self.opts.supersede || self.supersede.is_some() || self.opts.qualify {
             return Ok(());
@@ -3160,23 +3212,33 @@ impl Run<'_> {
         let Ok(judged) = Journal::load(&release_dir.join(JOURNAL_FILE)) else {
             return Ok(());
         };
-        if !proposal.proposal_only(judged.as_ref())
-            || !matches!(self.b.fleet_supersession(&proposal.version), Ok(None))
+        if !proposal.proposal_only(judged.as_ref()) {
+            return Ok(());
+        }
+        let why = if self
+            .b
+            .origin_tag(&format!("v{}", proposal.version))
+            .is_some()
         {
-            return Ok(());
-        }
-        let Ok(Some(fleet)) = self.b.fleet_existing(&proposal.version) else {
-            return Ok(());
-        };
-        if !proposal.never_claimed(judged.as_ref(), &fleet) {
-            return Ok(());
-        }
-        if let Some(dropped) = self.drop_proposal(&proposal.version) {
-            self.say(&format!(
-                "release: {dropped}: the fleet's line of v{} starts at {}",
+            format!("v{} is cut (its tag is on origin)", proposal.version)
+        } else {
+            if !matches!(self.b.fleet_supersession(&proposal.version), Ok(None)) {
+                return Ok(());
+            }
+            let Ok(Some(fleet)) = self.b.fleet_existing(&proposal.version) else {
+                return Ok(());
+            };
+            if !proposal.never_claimed(judged.as_ref(), &fleet) {
+                return Ok(());
+            }
+            format!(
+                "the fleet's line of v{} starts at {}",
                 fleet.version,
                 short(&fleet.base)
-            ));
+            )
+        };
+        if let Some(dropped) = self.drop_proposal(&proposal.version) {
+            self.say(&format!("release: {dropped}: {why}"));
             // What the run read at its start, as a clone without that proposal reads it.
             self.line_selection = judged
                 .as_ref()
@@ -4277,6 +4339,12 @@ impl Run<'_> {
         self.hold_selected_prover()?;
         if self.cand.as_ref().is_some_and(|c| c.bump_from.is_none()) {
             self.public_state();
+        }
+        // The candidate's lock names the stock release the audit's x86 slice probes. A real run
+        // put it in place before anything read it (`Run::stock_in_place`, again here only for a
+        // candidate step 1 chose anew); a dry run says what that would do.
+        if let Err(refusal) = self.stock_in_place() {
+            self.refuse(refusal)?;
         }
         notes.push(self.provision(false)?);
         if !self.claimed()
@@ -5537,6 +5605,15 @@ impl Run<'_> {
                 });
             }
         }
+        // R's stock release, before the first reader of it: the commit gates' and the frozen
+        // cutter's build-inputs seal, which hash it with its x86_64 std, then step 1's audit.
+        if let Err(refusal) = self.stock_in_place() {
+            return if self.supersede.is_some() {
+                self.refuse_supersede(refusal)
+            } else {
+                self.refuse_hard(refusal)
+            };
+        }
         if self.supersede.is_none()
             && self.b.head() != r
             && let Err(refusal) = self.b.move_to(&r)
@@ -6738,6 +6815,13 @@ impl Run<'_> {
     fn own_cutter(&mut self) -> Flow {
         self.hold_selected_prover()?;
         self.announce_line_selection(false);
+        // A real run's freeze of R's cutter seals this machine's build inputs, R's stock release
+        // with its x86_64 std among them: that release is put in place first. A dry run installs
+        // nothing; it says here what a real run puts in place before its freeze, and its own
+        // freeze, whose seal meets that release missing, stops naming what puts it there.
+        if let Err(refusal) = self.stock_in_place() {
+            self.refuse(refusal)?;
+        }
         let r = self.commit_r();
         match self.b.own_cutter(&r) {
             Ok(_) => Ok(()),
@@ -6789,6 +6873,29 @@ impl Run<'_> {
                 }
             }
         }
+    }
+
+    /// A real run puts the stock release the candidate R's `trust.lock` names in place, with the
+    /// x86_64 slice's std ([`Backend::stock_toolchain`]), before anything reads it: the commit
+    /// gates' and the frozen cutter's build-inputs seal hash that release, and step 1's audit
+    /// probes it. A dry run asks at the same places what that would do and installs nothing.
+    /// Each image asks the backend once per candidate: a call for the R it already asked for
+    /// returns at once, and one after R changed (a bump, a carry, a fleet selection) asks for
+    /// the new R. What it installed, or would install, is said; its refusal
+    /// is the backend's (COULD NOT RUN where the machine lacks it, naming `verify provision
+    /// rustup`).
+    fn stock_in_place(&mut self) -> Result<(), Refusal> {
+        let r = self.commit_r();
+        if self.stock_asked.as_deref() == Some(r.as_str()) {
+            return Ok(());
+        }
+        let asked = self.b.stock_toolchain(&r, self.dry);
+        self.stock_asked = Some(r);
+        let line = asked?;
+        if let Some(line) = line {
+            self.say(&format!("release: {line}"));
+        }
+        Ok(())
     }
 
     fn fleet_selection(&mut self, candidate: &Candidate) {

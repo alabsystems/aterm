@@ -787,7 +787,9 @@ fn drain_available_collects_what_the_pipe_holds_and_never_blocks() {
     }
     let mut buf = [0u8; 64];
     buf[..2].copy_from_slice(b">>");
-    let filled = drain_available(sh.master, &mut buf, 2);
+    let mut received = 0;
+    let filled = drain_available_observed(sh.master, &mut buf, 2, |bytes| received += bytes);
+    assert_eq!(received, filled - 2, "only the additional pipe reads count");
     assert_eq!(&buf[..filled], b">>one\r\ntwo\r\nsix\r\n");
     write(&[b'x'; 100]);
     let mut small = [0u8; 40];

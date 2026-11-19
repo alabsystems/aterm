@@ -11,9 +11,11 @@
 //! view of it; the page holds no session and reads no clock. A row on screen is built whole, a
 //! row off it is one node, so a list of hundreds compiles one screen.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+
+use aterm_types::needs::NeedWord;
 
 use crate::native_app::{
     AppDescriptor, AppEvent, AppIcon, AppIndicators, AppKind, AppPresentation, CloseReadiness,
@@ -28,6 +30,9 @@ use crate::native_ui::{
 use crate::native_workers::{one_line, text_width};
 use crate::task_record::TaskState;
 
+#[path = "navigator_resources.rs"]
+pub(crate) mod resources;
+
 /// The width of the navigator's pane in a split, in cells.
 pub(crate) const SPLIT_COLS: u16 = 30;
 /// The filter field's key, and the action that puts the keyboard in it.
@@ -36,6 +41,7 @@ pub(crate) const FILTER: &str = "navigator/filter";
 pub(crate) const ROW: &str = "navigator/row/";
 /// A row's disclosure button, before its session's local id.
 const FOLD: &str = "navigator/fold/";
+const CHART_DETAILS: &str = "navigator/chart-details";
 /// Open the selected row, or step to the first session under it.
 pub(crate) const STEP_IN: &str = "navigator/step-in";
 /// Close the selected row, or step to the row it is under.
@@ -47,8 +53,7 @@ const NO_SESSIONS: &str = "No live sessions";
 const NO_MATCH: &str = "No sessions match";
 const FILTER_LABEL: &str = "Filter";
 
-/// The one word a row reads (decision ST-D23). A wait on a person is a case of `stuck`: nothing
-/// counts, sorts or marks a row for it.
+/// The observed activity or obstruction on a session row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Word {
     Working,
@@ -94,9 +99,8 @@ pub(crate) struct WordFacts<'a> {
     /// A person took its task off Autopilot (`why=off`, `why=off-ctl`): the task's last state
     /// is `failed`, and nothing failed.
     pub(crate) taken_off: bool,
-    /// It stopped to ask a person: the need the harness published for it. A box the harness
-    /// answers itself is not one.
-    pub(crate) asks: bool,
+    /// The published reason an operation needs attention, if any.
+    pub(crate) need: Option<NeedWord>,
     /// What its program reads as now (`busy`, `question`, `prompt`, `wall:…`, `idle`,
     /// `unknown`, or `-` for a shell with no agent): as Tab Status read it, or, where nothing
     /// observes it, as the program's own report says.
@@ -112,7 +116,19 @@ pub(crate) struct WordFacts<'a> {
 pub(crate) fn word_of(facts: &WordFacts<'_>) -> Word {
     let busy = facts.agent_word == "busy";
     let failed = matches!(facts.task, Some(TaskState::Failed)) && !facts.taken_off && !busy;
-    if facts.asks || failed || matches!(facts.task, Some(TaskState::Stalled)) {
+    let obstructed = matches!(
+        facts.need,
+        Some(
+            NeedWord::Frozen
+                | NeedWord::Stopped
+                | NeedWord::Stalled
+                | NeedWord::Login
+                | NeedWord::Memory
+                | NeedWord::Wall
+                | NeedWord::Approval
+        )
+    );
+    if obstructed || failed || matches!(facts.task, Some(TaskState::Stalled)) {
         Word::Stuck
     } else if matches!(facts.task, Some(TaskState::Exited)) {
         Word::Ended
@@ -132,9 +148,15 @@ pub(crate) fn word_of(facts: &WordFacts<'_>) -> Word {
 #[derive(Clone, Debug)]
 pub(crate) struct NavRow {
     pub(crate) session: u64,
+    /// The stable shortcut number of this session in the local process.
+    pub(crate) shortcut: Option<u8>,
     pub(crate) title: String,
-    /// The agent's program (`claude`, `codex`); a person's shell has none.
-    pub(crate) agent: Option<String>,
+    /// The task recorded when the session was created, across foreground program changes.
+    pub(crate) original_topic: Option<String>,
+    /// A deliberate name or role supplies the display title.
+    pub(crate) named: bool,
+    /// The foreground program's observed or self-reported name.
+    pub(crate) program: Option<String>,
     pub(crate) word: Word,
     /// The latest words the session's stream said.
     pub(crate) line: Option<String>,
@@ -149,8 +171,11 @@ pub(crate) struct NavRow {
 impl PartialEq for NavRow {
     fn eq(&self, other: &Self) -> bool {
         self.session == other.session
+            && self.shortcut == other.shortcut
             && self.title == other.title
-            && self.agent == other.agent
+            && self.original_topic == other.original_topic
+            && self.named == other.named
+            && self.program == other.program
             && self.word == other.word
             && self.line == other.line
             && self.creator == other.creator
@@ -158,16 +183,33 @@ impl PartialEq for NavRow {
 }
 
 impl NavRow {
+    pub(crate) fn panel_title(&self) -> &str {
+        if self.named {
+            &self.title
+        } else {
+            self.original_topic.as_deref().unwrap_or(&self.title)
+        }
+    }
+
     /// Every field, for a screen reader and `inspect`: the painted texts are cut to their boxes.
-    fn spoken(&self, listed: Listed, clock_ms: u64) -> String {
-        let mut said = format!("{}, {}", self.title, self.word.word());
+    fn spoken(&self, listed: Listed, clock_ms: u64, numbered: bool) -> String {
+        let title = if numbered {
+            self.panel_title()
+        } else {
+            &self.title
+        };
+        let mut said = format!("{title}, {}", self.word.word());
+        if numbered && let Some(topic) = self.original_topic.as_deref().filter(|t| *t != title) {
+            said.push_str(", Original topic, ");
+            said.push_str(topic);
+        }
         if listed.under > 0 && !listed.open {
             said.push_str(", ");
             said.push_str(&under_words(listed.under));
         }
-        if let Some(agent) = &self.agent {
+        if let Some(program) = &self.program {
             said.push_str(", ");
-            said.push_str(agent);
+            said.push_str(program);
         }
         let age = age_words(clock_ms, self.moved_ms);
         if !age.is_empty() {
@@ -410,7 +452,7 @@ pub(crate) struct Listed {
 }
 
 /// The rows a view lists, in order: every row not inside a closed one; or, with a filter, every
-/// row that matches it (its title, agent, word or latest words, in any case) with the rows above
+/// row that matches it (its title, program, word or latest words, in any case) with the rows above
 /// it shown open, whatever was folded.
 pub(crate) fn listed(tree: &NavTree, fold: &Fold<'_>) -> Vec<Listed> {
     let entries = &tree.entries;
@@ -463,7 +505,7 @@ pub(crate) fn listed(tree: &NavTree, fold: &Fold<'_>) -> Vec<Listed> {
 fn matches(row: &NavRow, needle: &str) -> bool {
     let holds = |text: &str| text.to_lowercase().contains(needle);
     holds(&row.title)
-        || row.agent.as_deref().is_some_and(holds)
+        || row.program.as_deref().is_some_and(holds)
         || row.word.word().contains(needle)
         || row.line.as_deref().is_some_and(holds)
 }
@@ -471,6 +513,9 @@ fn matches(row: &NavRow, needle: &str) -> bool {
 /// What a press on the page asks the host for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NavAction {
+    Window(crate::tab_model::ViewId),
+    /// Show the session here, retaining its place below the tabs until kept.
+    Preview(u64),
     /// Show this session and give it the keys.
     Go(u64),
 }
@@ -482,6 +527,8 @@ pub(crate) struct NavigatorApp {
     tree: Arc<NavTree>,
     clock_ms: u64,
     actions: VecDeque<NavAction>,
+    pub(crate) resources: resources::Panel,
+    pub(crate) resources_at_ns: u64,
 }
 
 impl NavigatorApp {
@@ -512,11 +559,39 @@ impl NavigatorApp {
     }
 }
 
+/// A built-in app view. Its stable identity survives tab and window reordering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrganizerWindow {
+    pub(crate) view: crate::tab_model::ViewId,
+    pub(crate) label: String,
+    pub(crate) selected: bool,
+}
+
+const WINDOW: &str = "navigator/window/";
+
+/// The terminal leaves in this window’s strip order, followed by the other live sessions.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DockSessions {
+    /// The window routes its session-number shortcuts through the organizer.
+    pub(crate) numbered: bool,
+    pub(crate) windows: Vec<OrganizerWindow>,
+    pub(crate) order: Vec<u64>,
+    pub(crate) shown: usize,
+    pub(crate) preview: Option<u64>,
+}
+
+pub(crate) fn row_session(key: &str) -> Option<u64> {
+    key.strip_prefix(ROW)?.parse().ok()
+}
+
 /// One view of the list: its filter, its folds, its scroll and the row the keyboard is on.
 #[derive(Debug)]
 pub(crate) struct NavigatorViewState {
     pub(crate) common: CommonViewState,
     docked: bool,
+    chart_details: bool,
+    panel_headers: RefCell<PanelHeaderMemo>,
+    pub(crate) sessions: DockSessions,
     filter: TextInputState,
     scroll: f32,
     /// The selected row's session. It outlives the keyboard's move to the filter.
@@ -541,6 +616,9 @@ impl Default for NavigatorViewState {
         Self {
             common: CommonViewState::default(),
             docked: false,
+            chart_details: false,
+            panel_headers: RefCell::default(),
+            sessions: DockSessions::default(),
             filter: TextInputState::new(String::new()),
             scroll: 0.0,
             cursor: None,
@@ -588,7 +666,20 @@ impl NavigatorViewState {
 
     /// The rows this view lists of `tree`.
     pub(crate) fn listing(&self, tree: &NavTree) -> Vec<Listed> {
-        listed(tree, &self.fold())
+        if self.docked {
+            self.sessions
+                .order
+                .iter()
+                .filter_map(|session| tree.index_of(*session))
+                .map(|at| Listed {
+                    at,
+                    open: false,
+                    under: 0,
+                })
+                .collect()
+        } else {
+            listed(tree, &self.fold())
+        }
     }
 
     /// The selected row's session.
@@ -611,6 +702,14 @@ impl NavigatorViewState {
             .ok()
     }
 
+    fn window_index(&self, key: &UiKey) -> Option<usize> {
+        let id = key.as_str().strip_prefix(WINDOW)?.parse::<u64>().ok()?;
+        self.sessions
+            .windows
+            .iter()
+            .position(|row| row.view.get() == id)
+    }
+
     fn in_filter(&self) -> bool {
         self.common
             .last_focus
@@ -620,7 +719,7 @@ impl NavigatorViewState {
 
     fn frame(&self, tree: &NavTree) -> Option<Frame> {
         let (width, height) = self.laid.get()?;
-        Some(Frame::of(tree, &self.fold(), width, height, self.docked))
+        Some(Frame::of(tree, self, width, height))
     }
 
     /// Put the selection, and the keyboard, on `session`'s row and scroll it into the room.
@@ -636,14 +735,35 @@ impl NavigatorViewState {
         let Some(frame) = self.frame(tree) else {
             return;
         };
-        if let Some(top) = frame.top_of(tree, session) {
-            if top < self.scroll {
-                self.scroll = top;
-            } else if top + frame.m.row_h > self.scroll + frame.room {
-                self.scroll = top + frame.m.row_h - frame.room;
-            }
+        if let Some(at) = frame.place_of(tree, session) {
+            self.reveal_span(&frame, frame.tops[at], frame.height(at));
+        }
+    }
+
+    fn reveal_span(&mut self, frame: &Frame, top: f32, height: f32) {
+        if height >= frame.room || top < self.scroll {
+            self.scroll = top;
+        } else if top + height > self.scroll + frame.room {
+            self.scroll = top + height - frame.room;
         }
         self.scroll = self.scroll.clamp(0.0, frame.limit());
+    }
+
+    /// A change in this row's height moves the rows below it even if their contents are the same.
+    pub(crate) fn panel_row_resized(&self, before: &NavRow, after: &NavRow, width: f32) -> bool {
+        if !self.sessions.numbered || same_panel_header(before, after, self.chart_details) {
+            return false;
+        }
+        let m = Measure::at(width, self.docked);
+        let header = |row: &NavRow| {
+            PanelHeader::of(
+                row,
+                m.panel_width(),
+                self.sessions.preview,
+                self.chart_details,
+            )
+        };
+        header(before).extra_height(m) != header(after).extra_height(m)
     }
 
     /// The host's word on the size this view is laid out in. A view opens on the session the
@@ -672,6 +792,7 @@ impl NavigatorViewState {
             ring: self.common.focus_visible,
             scroll: self.scroll.to_bits(),
             folds: self.folds,
+            chart_details: self.chart_details,
         }
     }
 
@@ -682,6 +803,16 @@ impl NavigatorViewState {
 
     /// An assistive technology's or the inspector's reveal of a row. Whether the list moved.
     pub(crate) fn reveal_listed_control(&mut self, key: &UiKey, tree: &NavTree) -> bool {
+        if let Some(index) = self.window_index(key) {
+            let Some(frame) = self.frame(tree) else {
+                return false;
+            };
+            let top = frame.content + ROW_GAP
+                - (self.sessions.windows.len() - index) as f32 * (frame.m.title_h + ROW_GAP);
+            let before = self.scroll;
+            self.reveal_span(&frame, top, frame.m.title_h);
+            return self.scroll != before;
+        }
         let Some(session) = [ROW, FOLD]
             .into_iter()
             .find_map(|prefix| key.as_str().strip_prefix(prefix))
@@ -779,7 +910,7 @@ impl NavigatorViewState {
 
     /// The sessions whose rows a page `width` by `height` paints, into `out`.
     pub(crate) fn on_screen(&self, tree: &NavTree, width: f32, height: f32, out: &mut Vec<u64>) {
-        let frame = Frame::of(tree, &self.fold(), width, height, self.docked);
+        let frame = Frame::of(tree, self, width, height);
         let scroll = self.scroll.min(frame.limit());
         out.extend(
             frame
@@ -827,15 +958,16 @@ impl NavigatorViewState {
         if sessions.peek().is_none() {
             return Shows::Nothing;
         }
-        let frame = Frame::of(tree, &self.fold(), width, height, self.docked);
+        let frame = Frame::of(tree, self, width, height);
         let scroll = self.scroll.min(frame.limit());
         let (list_top, list_bottom) = frame.painted_span();
         let mut listed = false;
         let span = sessions
             .filter_map(|session| {
-                let top = list_top + frame.top_of(tree, session)? - scroll;
+                let at = frame.place_of(tree, session)?;
+                let top = list_top + frame.tops[at] - scroll;
                 listed = true;
-                let (top, bottom) = (top.max(list_top), (top + frame.m.row_h).min(list_bottom));
+                let (top, bottom) = (top.max(list_top), (top + frame.height(at)).min(list_bottom));
                 (bottom > top).then_some((top, bottom))
             })
             .reduce(|(top, bottom), (a, b)| (top.min(a), bottom.max(b)));
@@ -857,7 +989,14 @@ impl NavigatorViewState {
 
     /// Whether the filter holds a word.
     pub(crate) fn filtered(&self) -> bool {
-        !self.filter.value().trim().is_empty()
+        !self.docked && !self.filter.value().trim().is_empty()
+    }
+
+    fn toggle_chart_details(&mut self, tree: &NavTree) {
+        self.chart_details = !self.chart_details;
+        if let Some(session) = self.cursor {
+            self.reveal(session, tree);
+        }
     }
 
     fn open(&mut self, session: u64) {
@@ -902,6 +1041,9 @@ impl NavigatorViewState {
     /// open one moves to the first row under it; Out closes an open row and from a closed one
     /// moves to the row it is under.
     fn step_level(&mut self, inward: bool, tree: &NavTree) {
+        if self.docked {
+            return;
+        }
         let rows = self.listing(tree);
         let Some((at, row)) = self.cursor.and_then(|cursor| {
             rows.iter()
@@ -931,33 +1073,6 @@ impl NavigatorViewState {
 /// One line of a wheel step.
 const LINE_PX: f32 = 40.0;
 
-fn edit(input: &mut TextInputState, event: TextInputEvent) {
-    match event {
-        TextInputEvent::Preedit { text, selection } => input.set_preedit(text, selection),
-        TextInputEvent::Commit(text) => input.commit_preedit(&text),
-        TextInputEvent::Backspace => input.delete_backward(),
-        TextInputEvent::Delete => input.delete_forward(),
-        TextInputEvent::Left { extend } => input.move_left(extend),
-        TextInputEvent::Right { extend } => input.move_right(extend),
-        TextInputEvent::Home { extend } => input.move_to_start(extend),
-        TextInputEvent::End { extend } => input.move_to_end(extend),
-        TextInputEvent::WordLeft { extend } => input.move_word_left(extend),
-        TextInputEvent::WordRight { extend } => input.move_word_right(extend),
-        TextInputEvent::KillToEnd => input.kill_to_end(),
-        TextInputEvent::KillToStart => input.kill_to_start(),
-        TextInputEvent::DeleteWordBackward => input.delete_word_backward(),
-        TextInputEvent::DeleteWordForward => input.delete_word_forward(),
-        TextInputEvent::SelectAll => input.select_all(),
-        TextInputEvent::Undo => {
-            input.undo();
-        }
-        TextInputEvent::Redo => {
-            input.redo();
-        }
-        TextInputEvent::Submit | TextInputEvent::Cancel => input.cancel_preedit(),
-    }
-}
-
 /// What a view draws that a step of the reducer can move ([`NavigatorViewState::drawn`]).
 #[derive(PartialEq)]
 struct Drawn {
@@ -966,6 +1081,7 @@ struct Drawn {
     ring: bool,
     scroll: u32,
     folds: u64,
+    chart_details: bool,
 }
 
 impl Drawn {
@@ -1005,6 +1121,11 @@ impl NavigatorApp {
                 return self.act(view, AppEvent::TextInput(TextInputEvent::Commit(text)));
             }
             AppEvent::FocusChanged(focus) => {
+                if let Some(key) = &focus
+                    && key.as_str().starts_with(WINDOW)
+                {
+                    view.reveal_listed_control(key, tree);
+                }
                 view.common.last_focus = focus;
                 if let Some(session) = view.focused_row() {
                     view.cursor = Some(session);
@@ -1019,18 +1140,45 @@ impl NavigatorApp {
             }
             AppEvent::StepFocus(step) => {
                 let rows = view.listing(tree);
-                let at = view.cursor.and_then(|cursor| {
-                    rows.iter()
-                        .position(|row| tree.entries[row.at].row.session == cursor)
+                let count = rows.len() + view.sessions.windows.len();
+                let focused_window = view
+                    .common
+                    .last_focus
+                    .as_ref()
+                    .and_then(|key| view.window_index(key))
+                    .map(|index| rows.len() + index);
+                let on_details = view
+                    .common
+                    .last_focus
+                    .as_ref()
+                    .is_some_and(|key| key.as_str() == CHART_DETAILS);
+                let at = focused_window.or_else(|| {
+                    view.cursor.and_then(|cursor| {
+                        rows.iter()
+                            .position(|row| tree.entries[row.at].row.session == cursor)
+                    })
                 });
+                if view.sessions.numbered && step < 0 && (on_details || at == Some(0)) {
+                    view.common.last_focus = Some(UiKey::new(CHART_DETAILS));
+                    view.common.focus_visible = true;
+                    return Moved::Step;
+                }
+                let at = at.filter(|_| !on_details);
                 let next = match (at, step.signum()) {
-                    (None, -1) => rows.len().checked_sub(1),
-                    (None, _) => (!rows.is_empty()).then_some(0),
+                    (None, -1) => count.checked_sub(1),
+                    (None, _) => (count > 0).then_some(0),
                     (Some(at), -1) => Some(at.saturating_sub(1)),
-                    (Some(at), _) => Some((at + 1).min(rows.len().saturating_sub(1))),
+                    (Some(at), _) => Some((at + 1).min(count.saturating_sub(1))),
                 };
-                if let Some(row) = next.and_then(|next| rows.get(next)) {
-                    view.select(tree.entries[row.at].row.session, tree);
+                if let Some(index) = next {
+                    if let Some(row) = rows.get(index) {
+                        view.select(tree.entries[row.at].row.session, tree);
+                    } else if let Some(window) = view.sessions.windows.get(index - rows.len()) {
+                        let key = UiKey::new(format!("{WINDOW}{}", window.view));
+                        view.reveal_listed_control(&key, tree);
+                        view.common.last_focus = Some(key);
+                        view.common.focus_visible = true;
+                    }
                 }
             }
             AppEvent::TextInput(event) if view.in_filter() => {
@@ -1046,7 +1194,33 @@ impl NavigatorApp {
                     return Moved::Nothing;
                 };
                 view.reveal(session, tree);
-                self.actions.push_back(NavAction::Go(session));
+                self.actions.push_back(if view.docked {
+                    NavAction::Preview(session)
+                } else {
+                    NavAction::Go(session)
+                });
+            }
+            AppEvent::TextInput(TextInputEvent::Submit)
+                if view.sessions.numbered
+                    && view
+                        .common
+                        .last_focus
+                        .as_ref()
+                        .is_some_and(|key| key.as_str() == CHART_DETAILS) =>
+            {
+                view.toggle_chart_details(tree);
+            }
+            AppEvent::TextInput(TextInputEvent::Submit) => {
+                let Some(index) = view
+                    .common
+                    .last_focus
+                    .as_ref()
+                    .and_then(|key| view.window_index(key))
+                else {
+                    return Moved::Nothing;
+                };
+                self.actions
+                    .push_back(NavAction::Window(view.sessions.windows[index].view));
             }
             AppEvent::TextInput(TextInputEvent::Right { .. }) if view.focused_row().is_some() => {
                 view.step_level(true, tree);
@@ -1057,7 +1231,9 @@ impl NavigatorApp {
             AppEvent::Action(action) => {
                 let key = action.id.as_str();
                 let session = |prefix: &str| key.strip_prefix(prefix)?.parse::<u64>().ok();
-                if key == FILTER {
+                if key == CHART_DETAILS && view.sessions.numbered {
+                    view.toggle_chart_details(tree);
+                } else if key == FILTER {
                     match action.value {
                         Some(SemanticInput::Text(value)) => {
                             view.filter = TextInputState::new(value);
@@ -1075,6 +1251,16 @@ impl NavigatorApp {
                     }
                     view.common.last_focus = Some(UiKey::new(FILTER));
                     return Moved::Text;
+                } else if let Some(id) = session(WINDOW) {
+                    let Some(row) = view
+                        .sessions
+                        .windows
+                        .iter()
+                        .find(|row| row.view.get() == id)
+                    else {
+                        return Moved::Nothing;
+                    };
+                    self.actions.push_back(NavAction::Window(row.view));
                 } else if key == STEP_IN {
                     view.step_level(true, tree);
                 } else if key == STEP_OUT {
@@ -1087,7 +1273,11 @@ impl NavigatorApp {
                     }
                     view.cursor = Some(session);
                     view.common.last_focus = Some(UiKey::new(format!("{ROW}{session}")));
-                    self.actions.push_back(NavAction::Go(session));
+                    self.actions.push_back(if view.docked {
+                        NavAction::Preview(session)
+                    } else {
+                        NavAction::Go(session)
+                    });
                 } else {
                     return Moved::Nothing;
                 }
@@ -1124,11 +1314,15 @@ impl NavigatorApp {
                     .map(|row| row.session);
                 if let Some(session) = first {
                     view.cursor = Some(session);
-                    self.actions.push_back(NavAction::Go(session));
+                    self.actions.push_back(if view.docked {
+                        NavAction::Preview(session)
+                    } else {
+                        NavAction::Go(session)
+                    });
                 }
             }
             event => {
-                edit(&mut view.filter, event);
+                event.edit(&mut view.filter);
                 view.scroll = 0.0;
             }
         }
@@ -1170,6 +1364,7 @@ impl NativeAppModel for NavigatorApp {
                 let rows = [before.cursor, after.cursor, before.row(), after.row()];
                 let in_place = after.scroll == before.scroll
                     && after.folds == before.folds
+                    && after.chart_details == before.chart_details
                     && before.row().is_some()
                     && after.row().is_some();
                 let band = view
@@ -1277,6 +1472,10 @@ struct Measure {
 }
 
 impl Measure {
+    fn panel_width(self) -> f32 {
+        (self.inner - 2. * ROW_END).max(1.)
+    }
+
     fn at(width: f32, docked: bool) -> Self {
         let scale = crate::native_appearance::text_scale();
         let narrow = width < 480.0;
@@ -1308,27 +1507,56 @@ fn room_of(m: Measure, height: f32) -> f32 {
     (height - m.pad * 2.0 - m.header_h - ROOT_GAP).max(0.0)
 }
 
-/// Where each listed row stands in the list, by arithmetic: every row is one height.
+/// Offscreen and painted rows reserve the same measured header and chart space.
 struct Frame {
     m: Measure,
     room: f32,
     rows: Vec<Listed>,
     /// Each row's top from the list's first line.
     tops: Vec<f32>,
+    bottoms: Vec<f32>,
+    /// Numbered rows alone have independently measured headers.
+    headers: Vec<Arc<PanelHeader>>,
+    dock_places: Vec<usize>,
     /// The first row of the machine's group.
     machine_from: Option<usize>,
     content: f32,
 }
 
 impl Frame {
-    fn of(tree: &NavTree, fold: &Fold<'_>, width: f32, height: f32, docked: bool) -> Self {
-        let m = Measure::at(width, docked);
-        let rows = listed(tree, fold);
+    fn of(tree: &NavTree, view: &NavigatorViewState, width: f32, height: f32) -> Self {
+        let docked = view.docked;
+        let mut m = Measure::at(width, docked);
+        if view.sessions.numbered {
+            m.row_h += resources::chart_height(m.panel_width(), m.detail_line, view.chart_details);
+        }
+        let rows = view.listing(tree);
+        let mut memo = view.sessions.numbered.then(|| {
+            let mut memo = view.panel_headers.borrow_mut();
+            memo.prepare(m.panel_width(), view.chart_details, rows.len());
+            memo
+        });
         let mut tops = Vec::with_capacity(rows.len());
+        let mut bottoms = Vec::with_capacity(rows.len());
+        let mut headers = Vec::new();
         let mut machine_from = None;
+        let mut dock_places = if docked {
+            vec![usize::MAX; tree.entries.len()]
+        } else {
+            Vec::new()
+        };
         let mut top = 0.0;
         for (at, row) in rows.iter().enumerate() {
-            if machine_from.is_none() && tree.entries[row.at].group == Group::Machine {
+            if docked {
+                dock_places[row.at] = at;
+            }
+            if machine_from.is_none()
+                && if docked {
+                    at == view.sessions.shown
+                } else {
+                    tree.entries[row.at].group == Group::Machine
+                }
+            {
                 machine_from = Some(at);
                 if at > 0 {
                     top += GROUP_GAP + ROW_GAP;
@@ -1336,18 +1564,44 @@ impl Frame {
                 top += m.group_line + ROW_GAP;
             }
             tops.push(top);
-            top += m.row_h + ROW_GAP;
+            top += m.row_h;
+            if let Some(memo) = &mut memo {
+                let header = memo.header(
+                    at,
+                    &tree.entries[row.at].row,
+                    m.panel_width(),
+                    view.sessions.preview,
+                    view.chart_details,
+                );
+                top += header.extra_height(m);
+                headers.push(header);
+            }
+            bottoms.push(top);
+            top += ROW_GAP;
+        }
+        if docked && machine_from.is_none() {
+            machine_from = Some(rows.len());
+            if !rows.is_empty() {
+                top += GROUP_GAP + ROW_GAP;
+            }
+            top += m.group_line + ROW_GAP;
+        }
+        if rows.is_empty() {
+            top += m.title_line + ROW_GAP;
+        }
+        if !view.sessions.windows.is_empty() {
+            top += GROUP_GAP + ROW_GAP + m.group_line + ROW_GAP;
+            top += (view.sessions.windows.len() as f32) * (m.title_h + ROW_GAP);
         }
         Self {
             m,
             room: room_of(m, height),
-            content: if rows.is_empty() {
-                m.title_line
-            } else {
-                top - ROW_GAP
-            },
+            content: top - ROW_GAP,
             rows,
             tops,
+            bottoms,
+            headers,
+            dock_places,
             machine_from,
         }
     }
@@ -1375,22 +1629,33 @@ impl Frame {
     /// shows in the room. A heading the room's edge leaves with nothing under it is not drawn.
     fn heads_machine(&self, scroll: f32) -> bool {
         self.machine_from
-            .is_some_and(|at| self.tops[at] - scroll + crate::native_ui::LIST_PEEK_MIN <= self.room)
+            .and_then(|at| self.tops.get(at))
+            .is_some_and(|top| top - scroll + crate::native_ui::LIST_PEEK_MIN <= self.room)
     }
 
     /// The rows any part of which shows at `scroll`.
     fn shown(&self, scroll: f32) -> std::ops::Range<usize> {
-        let from = self
-            .tops
-            .partition_point(|top| top + self.m.row_h <= scroll);
+        let from = self.bottoms.partition_point(|bottom| *bottom <= scroll);
         let to = self.tops.partition_point(|top| *top < scroll + self.room);
         from..to
     }
 
-    fn top_of(&self, tree: &NavTree, session: u64) -> Option<f32> {
+    fn height(&self, at: usize) -> f32 {
+        self.bottoms[at] - self.tops[at]
+    }
+
+    fn place_of(&self, tree: &NavTree, session: u64) -> Option<usize> {
         let entry = tree.index_of(session)?;
-        let at = self.rows.binary_search_by_key(&entry, |row| row.at).ok()?;
-        Some(self.tops[at])
+        let at = match self.dock_places.get(entry) {
+            Some(&at) => at,
+            None => self.rows.binary_search_by_key(&entry, |row| row.at).ok()?,
+        };
+        (at < self.rows.len()).then_some(at)
+    }
+
+    #[cfg(test)]
+    fn top_of(&self, tree: &NavTree, session: u64) -> Option<f32> {
+        Some(self.tops[self.place_of(tree, session)?])
     }
 
     /// The top and bottom of what the list paints on the page: its room and the band under it.
@@ -1412,57 +1677,372 @@ fn words(key: String, text: String, role: SemanticRole, style: StyleRef, width: 
         .layout(Layout::default().width(width).height(Length::Fill))
 }
 
+fn panel_shortcut(number: u8) -> String {
+    let chord = if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl+Shift+"
+    };
+    format!("{chord}{number}")
+}
+
+fn panel_identity(row: &NavRow, preview: Option<u64>) -> std::borrow::Cow<'_, str> {
+    let program = row.program.as_deref().unwrap_or("");
+    if preview == Some(row.session) {
+        if program.is_empty() {
+            "Preview".into()
+        } else {
+            format!("Preview · {program}").into()
+        }
+    } else {
+        program.into()
+    }
+}
+
+fn same_panel_header(a: &NavRow, b: &NavRow, details: bool) -> bool {
+    a.panel_title() == b.panel_title()
+        && a.program == b.program
+        && a.shortcut == b.shortcut
+        && (!details || a.original_topic == b.original_topic)
+}
+
+/// A panel refresh frequently changes only session output, resource samples or the scroll.
+/// Keep one measurement per listed position. Width, face coverage, text scale or Details
+/// invalidates the view's measures; a row edit or changed preview can invalidate one position.
+#[derive(Debug, Default)]
+struct PanelHeaderMemo {
+    context: Option<(u32, u32, u64, bool)>,
+    rows: Vec<(Arc<NavRow>, bool, Arc<PanelHeader>)>,
+}
+
+impl PanelHeaderMemo {
+    fn prepare(&mut self, width: f32, details: bool, count: usize) {
+        let context = (
+            width.to_bits(),
+            crate::native_appearance::text_scale().to_bits(),
+            crate::tray_raster::chrome_measure_epoch(),
+            details,
+        );
+        if self.context != Some(context) {
+            self.context = Some(context);
+            self.rows.clear();
+        }
+        self.rows.truncate(count);
+    }
+
+    fn header(
+        &mut self,
+        at: usize,
+        row: &Arc<NavRow>,
+        width: f32,
+        preview: Option<u64>,
+        details: bool,
+    ) -> Arc<PanelHeader> {
+        let selected = preview == Some(row.session);
+        if let Some((prior, was_preview, header)) = self.rows.get_mut(at)
+            && *was_preview == selected
+            && (Arc::ptr_eq(prior, row) || same_panel_header(prior, row, details))
+        {
+            if !Arc::ptr_eq(prior, row) {
+                Arc::clone_from(prior, row);
+            }
+            return Arc::clone(header);
+        }
+        let header = Arc::new(PanelHeader::of(row, width, preview, details));
+        let entry = (Arc::clone(row), selected, Arc::clone(&header));
+        if let Some(slot) = self.rows.get_mut(at) {
+            *slot = entry;
+        } else {
+            self.rows.push(entry);
+        }
+        header
+    }
+}
+
+/// Header geometry is independent of the minute clock. Optional age text uses the remaining
+/// room after the title, the program and its shortcut have been placed.
+#[derive(Debug, Default)]
+struct PanelHeader {
+    second_title: Option<usize>,
+    meta_below: bool,
+    shortcut_below: bool,
+    original_lines: Vec<std::ops::Range<usize>>,
+}
+
+impl PanelHeader {
+    fn of(row: &NavRow, width: f32, preview: Option<u64>, details: bool) -> Self {
+        let title = row.panel_title();
+        let title_width = text_width(title, SemanticRole::Text, StyleRef::Primary);
+        let identity = panel_identity(row, preview);
+        let note_width = |s: &str| text_width(s, SemanticRole::Text, StyleRef::Note);
+        let identity_width = if identity.is_empty() {
+            0.
+        } else {
+            note_width(&identity)
+        };
+        let shortcut_width = row.shortcut.map_or(0., |n| note_width(&panel_shortcut(n)));
+        let pair_width = identity_width
+            + shortcut_width
+            + if identity_width > 0. && shortcut_width > 0. {
+                TEXT_GAP
+            } else {
+                0.
+            };
+        let meta_below = pair_width > 0. && title_width + TEXT_GAP + pair_width > width;
+        let shortcut_below = identity_width > 0. && shortcut_width > 0. && pair_width > width;
+
+        let wrap = |text, style| {
+            let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, style);
+            crate::tray_raster::ui_text_wrap_ranges(text, px, (width - 1.).max(1.))
+        };
+        let title_lines = if title_width > width {
+            wrap(title, StyleRef::Primary)
+        } else {
+            Vec::new()
+        };
+        let title_cut = || {
+            !title_lines.is_empty()
+                && (title_lines.len() > 2
+                    || title_lines.iter().any(|range| {
+                        text_width(
+                            title[range.clone()].trim(),
+                            SemanticRole::Text,
+                            StyleRef::Primary,
+                        ) > width
+                    }))
+        };
+        let original_lines = row
+            .original_topic
+            .as_deref()
+            .filter(|original| details && (*original != title || title_cut()))
+            .map(|original| wrap(original, StyleRef::Note))
+            .unwrap_or_default();
+        Self {
+            second_title: title_lines.get(1).map(|range| range.start),
+            meta_below,
+            shortcut_below,
+            original_lines,
+        }
+    }
+
+    fn extra_height(&self, m: Measure) -> f32 {
+        let notes = usize::from(self.meta_below)
+            + usize::from(self.shortcut_below)
+            + if self.original_lines.is_empty() {
+                0
+            } else {
+                1 + self.original_lines.len()
+            };
+        let extra_title = if self.second_title.is_some() {
+            m.title_line
+        } else {
+            0.
+        };
+        extra_title + notes as f32 * m.detail_line
+    }
+
+    fn lines(&self, row: &NavRow, key: &str, cx: RowCx<'_>, width: f32) -> Vec<UiNode> {
+        let m = cx.m;
+        let title = row.panel_title();
+        let identity = panel_identity(row, cx.preview);
+        let shortcut = row.shortcut.map(panel_shortcut);
+        let measure = |s: &str| text_width(s, SemanticRole::Text, StyleRef::Note);
+        let shortcut_w = shortcut.as_deref().map_or(0., measure);
+        let mut meta_room = width;
+        if !self.meta_below {
+            meta_room -= text_width(title, SemanticRole::Text, StyleRef::Primary) + TEXT_GAP;
+        }
+        if shortcut.is_some() && !self.shortcut_below {
+            meta_room -= shortcut_w + TEXT_GAP;
+        }
+        let age = age_words(cx.clock_ms, row.moved_ms);
+        let meta = if !age.is_empty() && identity.is_empty() && measure(&age) <= meta_room {
+            age
+        } else if !m.narrow
+            && !age.is_empty()
+            && !identity.is_empty()
+            && cx.preview != Some(row.session)
+        {
+            let dated = format!("{identity} · {age}");
+            if measure(&dated) <= meta_room {
+                dated
+            } else {
+                identity.into_owned()
+            }
+        } else {
+            identity.into_owned()
+        };
+        let line = |suffix: &str, h: f32, children: Vec<UiNode>| {
+            plain_group(format!("{key}/{suffix}"))
+                .layout(Layout::row().gap(TEXT_GAP).height(Length::Fixed(h)))
+                .children(children)
+        };
+        let text = |suffix: &str, value: String, style, width| {
+            words(
+                format!("{key}/{suffix}"),
+                value,
+                SemanticRole::Text,
+                style,
+                width,
+            )
+        };
+        let (first, rest) = title.split_at(self.second_title.unwrap_or(title.len()));
+        let mut heading = vec![text(
+            "title",
+            first.trim_end().into(),
+            StyleRef::Primary,
+            Length::Fill,
+        )];
+        let mut metadata = Vec::new();
+        if !meta.is_empty() {
+            let node = text(
+                "meta",
+                one_line(&meta, SemanticRole::Text, StyleRef::Note, meta_room),
+                StyleRef::Note,
+                if self.meta_below {
+                    Length::Fill
+                } else {
+                    Length::Fixed(measure(&meta))
+                },
+            );
+            if self.meta_below {
+                metadata.push(node);
+            } else {
+                heading.push(node);
+            }
+        }
+        let mut chord_line = None;
+        if let Some(chord) = shortcut {
+            let node = text("shortcut", chord, StyleRef::Note, Length::Fixed(shortcut_w));
+            if self.shortcut_below {
+                chord_line = Some(line(
+                    "chord",
+                    m.detail_line,
+                    vec![plain_group(format!("{key}/chord-space")), node],
+                ));
+            } else if self.meta_below {
+                if metadata.is_empty() {
+                    metadata.push(plain_group(format!("{key}/chord-space")));
+                }
+                metadata.push(node);
+            } else {
+                heading.push(node);
+            }
+        }
+        let mut lines = vec![line("first", m.title_line, heading)];
+        if !rest.is_empty() {
+            let continued = one_line(rest.trim(), SemanticRole::Text, StyleRef::Primary, width);
+            lines.push(line(
+                "continued",
+                m.title_line,
+                vec![text(
+                    "title-continued",
+                    continued,
+                    StyleRef::Primary,
+                    Length::Fill,
+                )],
+            ));
+        }
+        if self.meta_below {
+            lines.push(line("identity", m.detail_line, metadata));
+        }
+        lines.extend(chord_line);
+        if !self.original_lines.is_empty()
+            && let Some(topic) = &row.original_topic
+        {
+            let note = |suffix: &str, content: &str| {
+                text(suffix, content.into(), StyleRef::Note, Length::Fill)
+                    .layout(Layout::default().height(Length::Fixed(m.detail_line)))
+            };
+            lines.push(note("origin-label", "Original topic"));
+            for (i, range) in self.original_lines.iter().enumerate() {
+                lines.push(note(&format!("origin/{i}"), topic[range.clone()].trim()));
+            }
+        }
+        lines
+    }
+}
+
 /// What every row of one page is drawn with.
 #[derive(Clone, Copy)]
-struct RowCx {
+struct RowCx<'a> {
+    resources: &'a resources::Panel,
+    scales: resources::Scales,
+    resources_at_ns: u64,
     m: Measure,
     clock_ms: u64,
     cursor: Option<u64>,
     at_hand: bool,
+    numbered: bool,
+    chart_details: bool,
     /// The widest of the five words, so the latest words start in one column.
     word_w: f32,
+    docked: bool,
+    preview: Option<u64>,
 }
 
-fn press(row: &NavRow, listed: Listed, cx: RowCx) -> UiNode {
+fn press(row: &NavRow, listed: Listed, cx: RowCx<'_>) -> UiNode {
     let key = format!("{ROW}{}", row.session);
     let selected = cx.cursor == Some(row.session);
+    let mut label = row.spoken(listed, cx.clock_ms, cx.numbered);
+    if let Some(number) = row.shortcut.filter(|_| cx.numbered) {
+        let chord = if cfg!(target_os = "macos") {
+            "Command"
+        } else {
+            "Control Shift"
+        };
+        label.push_str(&format!(", {chord} {number}"));
+    }
+    if cx.preview == Some(row.session) {
+        label = format!("Preview, {label}. Double-click to keep as a tab.");
+    }
+    let mut button = ButtonSpec::new(label).visual_label(String::new());
+    if cx.numbered {
+        button = button.description(cx.resources.get(&row.session).map_or_else(
+            || "No resource observation for this session.".into(),
+            |readings| readings.description(cx.scales, cx.resources_at_ns),
+        ));
+    }
     UiNode::new(
         key.clone(),
         UiContent::Button(
-            Control::new(
-                ButtonSpec::new(row.spoken(listed, cx.clock_ms)).visual_label(String::new()),
-                ActionId::new(key),
-            )
-            .state(ControlState {
-                selected,
-                muted: selected && !cx.at_hand,
-                ..ControlState::default()
-            })
-            .style(StyleRef::Navigation),
+            Control::new(button, ActionId::new(key))
+                .state(ControlState {
+                    selected,
+                    muted: selected && !cx.at_hand,
+                    ..ControlState::default()
+                })
+                .style(StyleRef::Navigation),
         ),
     )
 }
 
-/// A row on the list's screen: a whole-row press under its two painted lines, and its
-/// disclosure button over them where sessions sit under it.
-fn row_node(entry: &NavEntry, listed: Listed, cx: RowCx) -> UiNode {
+fn navigator_header(row: &NavRow, key: &str, cx: RowCx<'_>, text_w: f32) -> UiNode {
     let m = cx.m;
-    let row = &*entry.row;
-    let key = format!("navigator/item/{}", row.session);
-    let indent = INDENT * f32::from(entry.depth.min(INDENT_DEPTHS));
-    let text_w = (m.inner - indent - FOLD_SLOT - ROW_END).max(1.0);
-
     let age = age_words(cx.clock_ms, row.moved_ms);
-    let meta = match &row.agent {
-        Some(agent) if !m.narrow && !age.is_empty() => format!("{agent} \u{b7} {age}"),
-        Some(agent) if !m.narrow => agent.clone(),
-        _ => age,
+    let fit = |text: &str, width| one_line(text, SemanticRole::Text, StyleRef::Note, width);
+    let measure = |text: &str| text_width(text, SemanticRole::Text, StyleRef::Note);
+    let meta_limit = text_w * 0.45;
+    let meta = match &row.program {
+        program if cx.preview == Some(row.session) => {
+            let label = program
+                .as_ref()
+                .map_or_else(|| "Preview".to_owned(), |name| format!("Preview · {name}"));
+            fit(&label, meta_limit)
+        }
+        Some(program) if !m.narrow && !age.is_empty() => {
+            let suffix = format!(" \u{b7} {age}");
+            let name = fit(program, meta_limit - measure(&suffix));
+            if name.is_empty() {
+                fit(&age, meta_limit)
+            } else {
+                format!("{name}{suffix}")
+            }
+        }
+        Some(program) => fit(program, meta_limit),
+        None => fit(&age, meta_limit),
     };
-    let meta_w = if meta.is_empty() {
-        0.0
-    } else {
-        text_width(&meta, SemanticRole::Text, StyleRef::Note).min(text_w * 0.45)
-    };
+    let meta_w = measure(&meta).min(meta_limit);
     let title_room = if meta.is_empty() {
         text_w
     } else {
@@ -1483,19 +2063,47 @@ fn row_node(entry: &NavEntry, listed: Listed, cx: RowCx) -> UiNode {
     if !meta.is_empty() {
         first.push(words(
             format!("{key}/meta"),
-            one_line(&meta, SemanticRole::Text, StyleRef::Note, meta_w),
+            meta,
             SemanticRole::Text,
             StyleRef::Note,
             Length::Fixed(meta_w),
         ));
     }
-    let first = plain_group(format!("{key}/first"))
+    plain_group(format!("{key}/first"))
         .layout(
             Layout::row()
                 .gap(TEXT_GAP)
                 .height(Length::Fixed(m.title_line)),
         )
-        .children(first);
+        .children(first)
+}
+
+/// A single row action under its painted details and, in the local panel, its resource traces.
+/// A navigator entry that has children also offers its disclosure button.
+fn row_node(
+    entry: &NavEntry,
+    listed: Listed,
+    cx: RowCx<'_>,
+    header: Option<&PanelHeader>,
+    height: f32,
+) -> UiNode {
+    let m = cx.m;
+    let row = &*entry.row;
+    let key = format!("navigator/item/{}", row.session);
+    let (indent, leading) = if cx.docked {
+        (0.0, ROW_END)
+    } else {
+        (
+            INDENT * f32::from(entry.depth.min(INDENT_DEPTHS)),
+            FOLD_SLOT,
+        )
+    };
+    let text_w = (m.inner - indent - leading - ROW_END).max(1.0);
+
+    let mut lines = match header {
+        Some(header) => header.lines(row, &key, cx, text_w),
+        None => vec![navigator_header(row, &key, cx, text_w)],
+    };
 
     let count = (listed.under > 0 && !listed.open).then(|| under_words(listed.under));
     let count_w = count.as_deref().map_or(0.0, |count| {
@@ -1550,14 +2158,26 @@ fn row_node(entry: &NavEntry, listed: Listed, cx: RowCx) -> UiNode {
         )
         .children(second);
 
+    lines.push(second);
+    if cx.numbered {
+        let empty = resources::Readings::default();
+        lines.push(resources::charts(
+            &key,
+            cx.resources.get(&row.session).unwrap_or(&empty),
+            cx.scales,
+            cx.chart_details.then_some(cx.resources_at_ns),
+            text_w,
+            m.detail_line,
+        ));
+    }
     let band = plain_group(format!("{key}/band"))
         .layout(Layout::column().padding(Insets {
             top: ROW_PAD,
             right: ROW_END,
             bottom: ROW_PAD,
-            left: FOLD_SLOT,
+            left: leading,
         }))
-        .children(vec![first, second])
+        .children(lines)
         .paint_only_tree();
 
     let mut face = vec![press(row, listed, cx), band];
@@ -1598,7 +2218,7 @@ fn row_node(entry: &NavEntry, listed: Listed, cx: RowCx) -> UiNode {
     plain_group(key)
         .layout(
             Layout::default()
-                .height(Length::Fixed(m.row_h))
+                .height(Length::Fixed(height))
                 .padding(Insets {
                     left: indent,
                     ..Insets::default()
@@ -1615,7 +2235,7 @@ pub(crate) fn page(
     height: f32,
 ) -> UiTree {
     let tree = &*app.tree;
-    let frame = Frame::of(tree, &view.fold(), width, height, view.docked);
+    let frame = Frame::of(tree, view, width, height);
     view.laid.set(Some((width, height)));
     let m = frame.m;
     let limit = frame.limit();
@@ -1650,6 +2270,52 @@ pub(crate) fn page(
         )
         .layout(Layout::default().height(Length::Fixed(m.filter_h)))
     });
+    let title = UiNode::new(
+        "navigator/title",
+        UiContent::Text(TextSpec::heading(one_line(
+            if view.docked { "Sessions" } else { app.title() },
+            SemanticRole::Heading,
+            StyleRef::Primary,
+            m.inner,
+        ))),
+    )
+    .layout(Layout::default().height(Length::Fixed(m.title_h)));
+    let heading = if view.sessions.numbered {
+        let button = ButtonSpec::new("Session details")
+            .description("Show the full original topic, chart ranges and time since collection.");
+        let label_width = text_width("Details", SemanticRole::Button, StyleRef::Chip) + 24.;
+        let title_width = text_width("Sessions", SemanticRole::Heading, StyleRef::Primary);
+        let (width, button) = if title_width + label_width + TEXT_GAP <= m.inner {
+            (label_width, button.visual_label("Details"))
+        } else {
+            (
+                m.title_h,
+                button.visual_icon(crate::native_ui::ButtonIcon::Info),
+            )
+        };
+        let details = UiNode::new(
+            CHART_DETAILS,
+            UiContent::Button(
+                Control::new(button, ActionId::new(CHART_DETAILS))
+                    .state(ControlState {
+                        expanded: Some(view.chart_details),
+                        selected: view.chart_details,
+                        ..ControlState::default()
+                    })
+                    .style(StyleRef::Chip),
+            ),
+        )
+        .layout(
+            Layout::default()
+                .width(Length::Fixed(width))
+                .height(Length::Fixed(m.title_h)),
+        );
+        plain_group("navigator/heading")
+            .layout(Layout::row().height(Length::Fixed(m.title_h)))
+            .children(vec![title, details])
+    } else {
+        title
+    };
     let header = plain_group("navigator/header")
         .layout(
             Layout::column()
@@ -1657,73 +2323,105 @@ pub(crate) fn page(
                 .width(Length::Fixed(m.inner))
                 .height(Length::Fixed(m.header_h)),
         )
-        .children(
-            std::iter::once(
-                UiNode::new(
-                    "navigator/title",
-                    UiContent::Text(TextSpec::heading(one_line(
-                        app.title(),
-                        SemanticRole::Heading,
-                        StyleRef::Primary,
-                        m.inner,
-                    ))),
-                )
-                .layout(Layout::default().height(Length::Fixed(m.title_h))),
-            )
-            .chain(filter)
-            .collect(),
-        );
+        .children(std::iter::once(heading).chain(filter).collect());
 
+    let shown = frame.painted(scroll);
+    let visible = if view.sessions.numbered {
+        &frame.rows[shown.clone()]
+    } else {
+        &[]
+    };
+    let scales = resources::Scales::visible(
+        visible
+            .iter()
+            .filter_map(|listed| app.resources.get(&tree.entries[listed.at].row.session)),
+    );
     let cx = RowCx {
+        resources: &app.resources,
+        scales,
+        resources_at_ns: app.resources_at_ns,
         m,
         clock_ms: app.clock_ms,
         cursor: view.cursor,
         at_hand: view.at_hand,
+        preview: view.sessions.preview,
+        docked: view.docked,
+        numbered: view.sessions.numbered,
+        chart_details: view.chart_details,
         word_w: Word::ALL
             .iter()
             .map(|word| text_width(word.word(), SemanticRole::Status, word.style()))
             .fold(0.0, f32::max),
     };
-    let shown = frame.painted(scroll);
-    let heads_machine = frame.heads_machine(scroll);
+    let group_heading = |visible: bool| {
+        let name = if view.docked {
+            "Other sessions"
+        } else {
+            app.title()
+        };
+        let heading = UiNode::new(
+            "navigator/machine",
+            UiContent::Text(TextSpec {
+                text: one_line(name, SemanticRole::Heading, StyleRef::Quiet, m.inner),
+                role: SemanticRole::Heading,
+                style: StyleRef::Quiet,
+            }),
+        )
+        .layout(Layout::default().height(Length::Fixed(m.group_line)));
+        if visible {
+            heading
+        } else {
+            heading.offscreen()
+        }
+    };
+    let group_gap = || {
+        let gap = plain_group("navigator/machine/gap")
+            .layout(Layout::column().height(Length::Fixed(GROUP_GAP)));
+        if view.docked {
+            let rule = UiNode::new(
+                "navigator/divider",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group).style(StyleRef::Cell)),
+            )
+            .layout(Layout::default().height(Length::Fixed(1.0)));
+            gap.children(vec![rule]).paint_only_tree()
+        } else {
+            gap.paint_only()
+        }
+    };
     let mut children = Vec::with_capacity(frame.rows.len() + 2);
     for (at, listed) in frame.rows.iter().enumerate() {
         let entry = &tree.entries[listed.at];
         if frame.machine_from == Some(at) {
             if at > 0 {
-                children.push(
-                    plain_group("navigator/machine/gap")
-                        .layout(Layout::default().height(Length::Fixed(GROUP_GAP)))
-                        .paint_only(),
-                );
+                children.push(group_gap());
             }
-            let heading = UiNode::new(
-                "navigator/machine",
-                UiContent::Text(TextSpec {
-                    text: one_line(app.title(), SemanticRole::Heading, StyleRef::Quiet, m.inner),
-                    role: SemanticRole::Heading,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(Layout::default().height(Length::Fixed(m.group_line)));
-            children.push(if heads_machine {
-                heading
-            } else {
-                heading.offscreen()
-            });
+            children.push(group_heading(frame.heads_machine(scroll)));
         }
+        let height = frame.height(at);
         children.push(if shown.contains(&at) {
-            row_node(entry, *listed, cx)
+            row_node(
+                entry,
+                *listed,
+                cx,
+                frame.headers.get(at).map(Arc::as_ref),
+                height,
+            )
         } else {
             // A row off the list's screen is its press alone: `inspect`, Tab and the arrows
             // reach it, and the page compiles one screen of rows however many it lists.
             press(&entry.row, *listed, cx)
-                .layout(Layout::default().height(Length::Fixed(m.row_h)))
+                .layout(Layout::default().height(Length::Fixed(height)))
                 .offscreen()
         });
     }
+    if frame.machine_from == Some(frame.rows.len()) {
+        if !frame.rows.is_empty() {
+            children.push(group_gap());
+        }
+        children.push(group_heading(true));
+    }
     if frame.rows.is_empty() {
-        let none = if view.filter.value().trim().is_empty() {
+        let none = if !view.filtered() {
             NO_SESSIONS
         } else {
             NO_MATCH
@@ -1739,6 +2437,37 @@ pub(crate) fn page(
             )
             .layout(Layout::default().height(Length::Fixed(m.title_line))),
         );
+    }
+
+    if !view.sessions.windows.is_empty() {
+        children.push(
+            plain_group("navigator/windows/gap")
+                .layout(Layout::default().height(Length::Fixed(GROUP_GAP)))
+                .paint_only(),
+        );
+        children.push(
+            UiNode::new(
+                "navigator/windows",
+                UiContent::Text(TextSpec::heading("Windows")),
+            )
+            .layout(Layout::default().height(Length::Fixed(m.group_line))),
+        );
+        for row in &view.sessions.windows {
+            let key = format!("{WINDOW}{}", row.view);
+            let button = Control::new(
+                ButtonSpec::new(row.label.clone()),
+                ActionId::new(key.clone()),
+            )
+            .style(StyleRef::Navigation)
+            .state(ControlState {
+                selected: row.selected,
+                ..ControlState::default()
+            });
+            children.push(
+                UiNode::new(key, UiContent::Button(button))
+                    .layout(Layout::default().height(Length::Fixed(m.title_h))),
+            );
+        }
     }
 
     let list = UiNode::new(

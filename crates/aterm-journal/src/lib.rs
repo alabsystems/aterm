@@ -1647,8 +1647,8 @@ fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<(WriterLoc
         Err(error) => return Err(error),
     }
     // Made, where missing, under the user's protected access list from its creation, never
-    // given one after; an elevated process makes none (`private_file::ELEVATED`), so it opens
-    // no writer. One that is there is judged below, as on Unix.
+    // given one after, relative to the folder judged private (an elevated process's too: it is
+    // the user's from its creation). One that is there is judged below, as on Unix.
     #[cfg(windows)]
     match private_file::open_private_rw(dir, &layout.lock) {
         Ok(_) => {}

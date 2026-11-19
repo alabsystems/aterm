@@ -33,7 +33,7 @@ Result: **4 specs**, covering **19 tests**. **2 tests are not spec samples** (§
   - nothing else under `parent` changed.
 - `SI(path, body)` means `path` is a regular file holding exactly `body` with
   `mode & 0o7777 = 0o555`.
-- `Cache(me, tmp) = quiet_in(tmp)/("atv-standins-" ++ dec(me))`, user `me`'s stand-in cache,
+- `Cache(me, tmp) = quiet_in(tmp)/("atv-standins-" ++ dec(me) ++ ".noindex")`, user `me`'s stand-in cache,
   and `Slot(text, k) = Cache(me, tmp)/(hex16(fnv1a(text)) ++ "-" ++ dec(k))` for `k < 4`
   (2026-10-28: this replaced the hard-linked `temp_dir()/"aterm-stand-ins"/hex16(fnv1a(body))`).
 - `fnv1a` is the fold that starts at `0xcbf29ce484222325` and maps

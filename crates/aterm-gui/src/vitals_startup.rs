@@ -129,6 +129,8 @@ impl StartupMarks {
 /// no crash, as the restore dates no crash from a stop that old.
 pub(crate) fn startup_marks(prior: PriorStop, launch_ms: i64) -> StartupMarks {
     let events = vec![StripEvent {
+        scope: aterm_vitals::events::EventScope::Machine,
+        span: None,
         at_unix_ms: launch_ms,
         kind: StripEventKind::Restart,
         label: "restarted".into(),

@@ -376,6 +376,90 @@ fn a_stall_that_ended_and_pressure_that_eased_are_not_at_the_end() {
     assert_eq!(row.prev.pressure, Pressure::Normal);
 }
 
+/// A run whose vitals opened a memory starvation episode and died before it ended records
+/// `starving`, whatever level the OS reported after the opening (2026-11-15's dispatch source
+/// reported normal and warn while the machine starved); one whose episode ended records the
+/// level reported after the end. NEGATIVE CONTROL: the same lines from another pid leave the
+/// run's pressure as its own lines say.
+#[test]
+fn a_starvation_episode_open_at_the_end_is_the_runs_pressure() {
+    let opened = crate::memory_starving::line(&starving_edge(false));
+    let ended = crate::memory_starving::line(&starving_edge(true));
+    assert!(opened.starts_with(crate::memory_starving::OPENED_LINE));
+    assert!(ended.starts_with(crate::memory_starving::ENDED_LINE));
+    let census = |lines: &[(u64, u32, &str)]| {
+        let s = Scratch::new("starving");
+        with_previous(&s);
+        s.file(&format!("{}.seen", marker(4242, BORN)), "");
+        s.log(lines);
+        census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        )
+        .prev
+        .pressure
+    };
+    let warn = format!("{PRESSURE_LINE} warn");
+    let normal = format!("{PRESSURE_LINE} normal");
+    assert_eq!(
+        census(&[
+            (BORN + 10, 4242, &warn),
+            (BORN + 11, 4242, &opened),
+            (BORN + 12, 4242, &normal),
+        ]),
+        Pressure::Starving
+    );
+    assert_eq!(
+        census(&[
+            (BORN + 11, 4242, &opened),
+            (BORN + 12, 4242, &ended),
+            (BORN + 13, 4242, &warn),
+        ]),
+        Pressure::Warn
+    );
+    assert_eq!(
+        census(&[(BORN + 11, 4242, &opened), (BORN + 12, 4242, &ended)]),
+        Pressure::None,
+        "an episode that ended leaves no level of its own"
+    );
+    assert_eq!(
+        census(&[(BORN + 10, 4242, &normal), (BORN + 11, 4243, &opened)]),
+        Pressure::Normal,
+        "another run's episode"
+    );
+}
+
+fn starving_edge(ended: bool) -> aterm_vitals::starving::Edge {
+    use aterm_vitals::starving::{Edge, Episode, Look, Why, Worst};
+    let e = Episode {
+        why: Why::Thrash,
+        opened_ns: 1,
+        opened_unix_ms: 1_763_277_369_800,
+        at_open: Look {
+            push_bps: Some(259.0 * 1_048_576.0),
+            refault_bps: Some(89.0 * 1_048_576.0),
+            headroom: Some(382_055 * 16_384),
+            ram: 128 << 30,
+            ..Look::default()
+        },
+        worst: Worst::default(),
+        holders: Vec::new(),
+        holders_age_ms: None,
+        ended: None,
+    };
+    if ended {
+        Edge::Ended(Episode {
+            ended: Some((1_763_277_369_800 + 300_000, Look::default())),
+            ..e
+        })
+    } else {
+        Edge::Opened(e)
+    }
+}
+
 #[test]
 fn a_written_marker_is_the_signal_it_names_at_its_mtime() {
     let s = Scratch::new("signal");

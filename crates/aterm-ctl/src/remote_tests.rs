@@ -1997,7 +1997,7 @@ fn host_any_follows_the_board_first_and_never_records_a_survey() {
 }
 
 const ACTIVITY_NODE: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
-const ACTIVITY_ASKER: &str = "s-0123456789abcdef0123";
+const ACTIVITY_ASKER: &str = "tqn5r6e0148";
 
 /// The lock's refusal of an act of `kind` as a driven Mac at Read Only answers it.
 fn locked(kind: aterm_types::fleet_access::DriveKind) -> String {

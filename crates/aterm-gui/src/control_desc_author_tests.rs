@@ -482,6 +482,7 @@ fn a_rename_a_person_typed_is_theirs_whoever_settles_it() {
 
     assert!(app.begin_active_session_rename(wid));
     app.with_controller_mark(true, |app| {
+        assert!(app.rename_field_edit(wid, crate::app_search::SearchEdit::MoveEnd));
         assert!(app.rename_input_event(wid, &InputEvent::Text(" too".into())));
     });
     settle_by_invoke(&mut app);

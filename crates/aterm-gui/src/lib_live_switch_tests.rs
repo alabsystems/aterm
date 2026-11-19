@@ -59,7 +59,7 @@ fn a_park_answers_the_switch_at_a_slice() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let switch_file = path.clone();
     std::thread::spawn(move || {
-        super::set_park_slice_for_this_thread(Duration::from_millis(10));
+        super::set_blind_look_for_this_thread(Duration::from_millis(10));
         let end = sleep_interval_watching_bump(
             None,
             &mut (SystemTime::now() + Duration::from_secs(300)),

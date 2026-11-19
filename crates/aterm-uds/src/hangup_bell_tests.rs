@@ -153,22 +153,56 @@ fn a_number_reused_after_a_drop_rings_its_new_arm() {
 
 /// A HUNG-UP ARM RINGS ONCE, not at every wait of the bell's queue while it stays armed: after A
 /// rang and its ring was read, B's peer closes; once B rings, A has rung no more.
-/// NEGATIVE CONTROL: a level-triggered registration (macOS without `EV_CLEAR`, Linux without
-/// `EPOLLONESHOT`) reports A at every wait, and A has rung again by B's ring.
+/// NEGATIVE CONTROL: removing the per-arm notification guard lets repeated hang-up events ring
+/// again after the first wake was consumed; the explicit duplicate-event test exercises this.
 #[test]
 fn a_hung_up_arm_rings_once() {
     let bell = started();
     let (a, a_peer) = CtlStream::pair().expect("pair");
     let (a_tx, a_rx) = ring();
-    let _a_armed = bell.arm(&a, a_tx).expect("arm A");
+    let a_armed = bell.arm(&a, a_tx).expect("arm A");
     drop(a_peer);
     rung(&a_rx, "A, whose peer closed");
     let (b, b_peer) = CtlStream::pair().expect("pair");
     let (b_tx, b_rx) = ring();
-    let _b_armed = bell.arm(&b, b_tx).expect("arm B");
+    let b_armed = bell.arm(&b, b_tx).expect("arm B");
     drop(b_peer);
     rung(&b_rx, "B, whose peer closed");
+    let _arms = a_armed.shared.lock_arms();
+    assert!(
+        a_armed.ringing() && b_armed.ringing(),
+        "the bell still serves both arms; these are hang-up rings, not thread-end wakes"
+    );
     assert_eq!(unread(&a_rx), 0, "A rang again while it stayed armed");
+}
+
+/// Repeated kernel delivery for one id cannot ring again after its first wake was consumed.
+/// A fresh registration can ring, an old id cannot reach it, and ending the thread still wakes
+/// the already-notified arm. These deliveries are explicit, with no scheduling absence window.
+#[test]
+fn duplicate_hangup_events_notify_each_registration_once() {
+    let bell = started();
+    let (near, _peer) = CtlStream::pair().expect("pair");
+    let (tx, rx) = ring();
+    let armed = bell.arm(&near, tx).expect("arm");
+    let first_id = armed.id;
+    armed.shared.ring(first_id);
+    rung(&rx, "the first hang-up event");
+    armed.shared.ring(first_id);
+    assert_eq!(unread(&rx), 0, "a repeated event rang the same arm twice");
+    assert!(armed.ringing(), "the thread is still serving this bell");
+    drop(armed);
+
+    let (next_tx, next_rx) = ring();
+    let next = bell.arm(&near, next_tx).expect("rearm the same descriptor");
+    assert_ne!(next.id, first_id, "a new registration has a fresh identity");
+    next.shared.ring(first_id);
+    assert_eq!(unread(&next_rx), 0, "a retired id reached the new arm");
+    next.shared.ring(next.id);
+    rung(&next_rx, "the fresh arm's first event");
+    bell.end_thread_for_test();
+    rung(&next_rx, "thread end after a consumed hang-up notification");
+    assert!(!next.ringing(), "the final wake reports the ended thread");
 }
 
 /// A BELL WHOSE THREAD ENDED rings every standing arm as it ends, says so to each

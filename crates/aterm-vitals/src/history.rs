@@ -292,7 +292,8 @@ impl<const BUCKET_MS: i64, const BUCKETS: usize> FreeSeries<BUCKET_MS, BUCKETS> 
 
 /// The Spotlight family's cost over the last 24 hours, in 10-minute buckets of time-weighted
 /// split readings ([`crate::spotlight::Reading`]): its CPU and reads, each bucket's mean, and its
-/// footprint, each bucket's largest. One [`FreeHistory`] span a figure, keyed to no volume.
+/// footprint and its index's size on disk (the root broker's store answer, SD-94), each bucket's
+/// largest. One [`FreeHistory`] span a figure, keyed to no volume.
 ///
 /// It holds only the windows the host split by coalition ([`crate::spotlight::Family::absorb`]):
 /// while no window in view shows the bars and no query or spotlight wait asks for a split, it
@@ -303,6 +304,9 @@ pub struct SpotlightHistory {
     cpu_mc: FreeHistory,
     read_bps: FreeHistory,
     footprint: FreeHistory,
+    /// Kept in memory only: [`SavedSpotlight`], the form the host writes, does not carry it, so
+    /// a restored history starts it empty.
+    index_bytes: FreeHistory,
 }
 
 /// One bucket of [`SpotlightHistory`]: what the family cost in it.
@@ -314,6 +318,9 @@ pub struct SpotlightBucket {
     pub read_bps: f64,
     /// Its largest footprint, bytes; `None` where no reading in it read every share's.
     pub footprint_max: Option<f64>,
+    /// Its largest index size on disk, bytes; `None` where no reading in it carried a whole
+    /// store answer.
+    pub index_bytes_max: Option<f64>,
 }
 
 /// A Spotlight history as the host writes it ([`SpotlightHistory::saved`]).
@@ -342,6 +349,10 @@ impl SpotlightHistory {
         if let Some(bytes) = r.footprint_bytes() {
             self.footprint.note(t, bytes);
         }
+        // A walk cut short is a lower bound, which is no bucket's max.
+        if let Some((bytes, None)) = r.index_bytes() {
+            self.index_bytes.note(t, bytes);
+        }
     }
 
     /// Whether nothing was read yet.
@@ -356,14 +367,17 @@ impl SpotlightHistory {
         let cpu = self.cpu_mc.buckets(now_unix_ms);
         let read = self.read_bps.buckets(now_unix_ms);
         let foot = self.footprint.buckets(now_unix_ms);
+        let index = self.index_bytes.buckets(now_unix_ms);
         cpu.into_iter()
             .zip(read)
             .zip(foot)
-            .map(|((c, r), f)| {
+            .zip(index)
+            .map(|(((c, r), f), i)| {
                 Some(SpotlightBucket {
                     cpu_mc: c?.value()?,
                     read_bps: r?.value()?,
                     footprint_max: f.map(|f| f.max),
+                    index_bytes_max: i.map(|i| i.max),
                 })
             })
             .collect()
@@ -387,6 +401,7 @@ impl SpotlightHistory {
             cpu_mc: FreeHistory::restored_rows(&saved.cpu_mc, now_unix_ms),
             read_bps: FreeHistory::restored_rows(&saved.read_bps, now_unix_ms),
             footprint: FreeHistory::restored_rows(&saved.footprint, now_unix_ms),
+            index_bytes: FreeHistory::default(),
         }
     }
 }

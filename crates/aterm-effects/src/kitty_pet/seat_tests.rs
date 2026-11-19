@@ -74,6 +74,10 @@ impl Desk {
             true,
             0x0050_FA7B,
         );
+        // The rule reads nothing of the rainbow's letter guard, which shapes the lights alone
+        // (`steam_tests::the_pet_reads_nothing_of_the_letter_guard`) and was most of a frame's
+        // cost here.
+        fx.set_letter_guard(false);
         fx.set_cursor_pet(true, 0x5EED);
         fx.set_cursor_pet_species(style);
         fx.set_sparkle_enabled(words);

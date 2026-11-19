@@ -46,7 +46,7 @@ pub(crate) struct ActRequest {
 /// that does not show the button yet refuses it the same way; every press of a native control
 /// no person is known to stand behind (a control client's key or click, an accessibility
 /// client's request) is refused them as it is dispatched ([`App::person_only_press_refusal`]).
-const PERSON_ONLY_PREFIXES: [(&str, &str); 4] = [
+const PERSON_ONLY_PREFIXES: [(&str, &str); 7] = [
     (
         crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX,
         "Settings ▸ Security's macOS access buttons",
@@ -64,6 +64,22 @@ const PERSON_ONLY_PREFIXES: [(&str, &str); 4] = [
     (
         crate::native_tables::WRITE,
         "the Tables page's Write button and command",
+    ),
+    // Collect raises a password sheet for a root collection; only a person asks for one.
+    (
+        crate::native_resources::CPU_POLICY_PREFIX,
+        "System Resources ▸ CPU's policy buttons",
+    ),
+    // Apply changes this Mac's settings, some as root under a password sheet: a person's act.
+    (
+        crate::native_resources::MACOS_APPLY_PREFIX,
+        "System Resources ▸ macOS configuration's buttons",
+    ),
+    // Each runs a root step on Spotlight (pause, resume, rebuild, keep a folder out, apply the
+    // scope) under a password sheet: a person's act.
+    (
+        crate::native_resources::SPOTLIGHT_CONTROL_PREFIX,
+        "System Resources ▸ Spotlight's buttons",
     ),
 ];
 
@@ -96,13 +112,21 @@ impl App {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequest {
-    Allocation { split: bool },
+    Allocation {
+        split: bool,
+    },
     Mail,
     About,
     SystemState,
     Workers,
     Tables,
-    Navigator { split: bool },
+    Registry,
+    SystemResources {
+        section: Option<aterm_types::app_inspection::ResourcesSection>,
+    },
+    Navigator {
+        split: bool,
+    },
     NavigatorDock,
     Settings(crate::native_settings::SettingsRoute),
     Markdown(String),
@@ -207,6 +231,10 @@ pub(crate) fn parse_open(rest: &str) -> Result<OpenRequest, String> {
         WireOpenAppRequest::SystemState => Ok(OpenRequest::SystemState),
         WireOpenAppRequest::Workers => Ok(OpenRequest::Workers),
         WireOpenAppRequest::Tables => Ok(OpenRequest::Tables),
+        WireOpenAppRequest::Registry => Ok(OpenRequest::Registry),
+        WireOpenAppRequest::SystemResources { section } => {
+            Ok(OpenRequest::SystemResources { section })
+        }
         WireOpenAppRequest::NavigatorDock => Ok(OpenRequest::NavigatorDock),
         WireOpenAppRequest::Navigator { split } => Ok(OpenRequest::Navigator { split }),
         WireOpenAppRequest::Allocation { split } => Ok(OpenRequest::Allocation { split }),
@@ -350,6 +378,9 @@ impl App {
                     Some(crate::native_app::AppViewState::Tables(state)) => {
                         state.reveal_listed_control(&key)
                     }
+                    Some(crate::native_app::AppViewState::SystemResources(state)) => {
+                        state.reveal_listed_control(&key)
+                    }
                     _ => false,
                 })
         {
@@ -449,6 +480,15 @@ impl App {
                 }),
             OpenRequest::Workers => self.open_workers_tab().map(|()| "app workers".to_string()),
             OpenRequest::Tables => self.open_tables_tab().map(|()| "app tables".to_string()),
+            OpenRequest::Registry => self
+                .open_registry_tab()
+                .map(|()| "app registry".to_string()),
+            OpenRequest::SystemResources { section } => self
+                .open_resources_at(section.map(|section| UiKey::new(section.key())))
+                .map(|()| match section {
+                    Some(section) => format!("app system-resources section={}", section.word()),
+                    None => "app system-resources".to_string(),
+                }),
             // A Show the window cannot hold (no room for the terminal's least grid beside the
             // column, or no client while minimized) is refused in words and changes nothing.
             OpenRequest::NavigatorDock => {
@@ -457,9 +497,11 @@ impl App {
                     .ok_or_else(|| "no front window".to_string())?;
                 self.set_dock(wid, crate::app_window::DOCK_CELLS)
                     .map_err(|refusal| refusal.to_string())?;
-                self.dock_view(wid)
-                    .map(|_| "app navigator dock".to_string())
-                    .ok_or_else(|| "navigator could not be shown".to_string())
+                if self.dock_view(wid).is_some() {
+                    Ok("app navigator dock".to_string())
+                } else {
+                    Err("navigator could not be shown".to_string())
+                }
             }
             // The reply says what it did: a tab with no room for the list opens a tab.
             OpenRequest::Navigator { split } => self.open_navigator(split).map(|split| {

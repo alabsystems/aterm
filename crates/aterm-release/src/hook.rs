@@ -212,6 +212,9 @@ fn own_cutter(
     target: &Path,
     envs: &[(&str, &OsStr)],
 ) -> Result<i32, String> {
+    aterm_uds::backup::Backups::SYSTEM
+        .build_dir(target)
+        .map_err(|e| format!("prepare cutter build directory {}: {e}", target.display()))?;
     let targo = std::env::var_os("TRUST_STAGE2_BIN")
         .filter(|b| !b.is_empty())
         .map_or_else(

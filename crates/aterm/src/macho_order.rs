@@ -1,26 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Mach-O 64-bit object/archive/executable symbol reader and locality orderer for
-//! macOS release links (`ld -order_file`).
+//! Mach-O 64-bit object/archive/executable symbol reader and the locality orderer of the
+//! `aterm-order-ld` wrapper that macOS release links run (`ld -order_file`).
 //!
 //! Under fat LTO (`lto = true, codegen-units = 1`), LLVM merges functions and generic
 //! instantiations from every crate in the binary into a single `.rcgu.o`, scattering
 //! cold CLI crates and unrelated UI modules across the same 16 KiB `__TEXT` pages as
 //! startup/idle paths.
 //!
-//! Two complementary, zero-registry ordering passes cooperate here:
+//! The order comes from two passes, with no hand-maintained symbol or module list:
 //! 1. Structural Rust v0 / Itanium `(tier, crate, module, sub_tier)` grouping with
-//!    in-module object-address preservation, which packs every crate and module
-//!    (together with its monomorphized `core`/`alloc`/`std` helpers and destructors)
-//!    onto contiguous pages.
-//! 2. Multi-permutation headless startup page-fault intersection (`CS_VALIDATED` across
-//!    independent symbol permutations), which isolates the ~3% of functions actually
-//!    executed during startup and idle park into a dense prefix at the front of `__TEXT`
-//!    without any hand-maintained symbol or module list.
+//!    in-module object-address preservation, which groups every crate and module (together
+//!    with its monomorphized `core`/`alloc`/`std` helpers and destructors). It is the
+//!    permutation sieve's base: the symbol set every probe link permutes, and the order the
+//!    refinement keeps inside each bucket. The wrapper does not link with it where the sieve
+//!    gave no order: linked alone it left more of `__TEXT` resident than the layout the
+//!    linker makes with no order file.
+//! 2. The permutation sieve: multi-permutation headless startup page-fault intersection
+//!    (`CS_VALIDATED` across independent symbol permutations), which moves the symbols
+//!    whose pages faulted in every probe's start (then those that faulted in all but one,
+//!    given four or more probes) ahead of the rest ([`refine_order_with_probe_hits`]).
+//!
+//! A final link takes the sieve's order where the sieve gave one, and where it gave none no
+//! order file beyond one the link's own arguments name ([`final_link`]).
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+/// A scratch world's words (`aterm_types::world`), mounted from that crate's own file: the
+/// `aterm-order-ld` wrapper links no crate, so it compiles them from source, and the images the
+/// probe measures start in the world every other release aterm under a fresh HOME takes
+/// ([`probe_world`]).
+#[path = "../../aterm-types/src/world_words.rs"]
+mod world_words;
 
 const MH_MAGIC_64: u32 = 0xfeed_facf;
 const FAT_MAGIC: u32 = 0xcafe_babe;
@@ -449,18 +463,24 @@ fn fnv1a_64(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// The fewest probe hit sets the permutation sieve refines an order from. A symbol the
+/// start never ran reaches bucket 0 only where it shared a faulted page in every probe's
+/// permutation, which each further probe makes less likely.
+pub(crate) const MIN_PROBE_HIT_SETS: usize = 3;
+
 /// Promotes symbols whose pages faulted across `probe_count` independent permuted runs
 /// (`hits == probe_count` in bucket 0, `hits + 1 == probe_count` when `probe_count >= 4`
 /// in bucket 1, and cold symbols in bucket 2), preserving `base_ordered`'s `(crate, module)`
-/// and intra-module order inside each bucket.
+/// and intra-module order inside each bucket. `None` with fewer than [`MIN_PROBE_HIT_SETS`]
+/// hit sets: no refinement, so no order ([`final_link`]), never `base_ordered` alone.
 #[must_use]
 pub(crate) fn refine_order_with_probe_hits(
     base_ordered: &[String],
     hit_sets: &[HashSet<String>],
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     let probe_count = hit_sets.len();
-    if probe_count < 2 {
-        return base_ordered.to_vec();
+    if probe_count < MIN_PROBE_HIT_SETS {
+        return None;
     }
 
     let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -490,7 +510,47 @@ pub(crate) fn refine_order_with_probe_hits(
         .map(|(idx, sym)| (bucket_of(sym), idx, sym))
         .collect();
     indexed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    indexed.into_iter().map(|(_, _, sym)| sym.clone()).collect()
+    Some(indexed.into_iter().map(|(_, _, sym)| sym.clone()).collect())
+}
+
+/// The final link of a macOS release image, as the `aterm-order-ld` wrapper runs it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FinalLink {
+    /// The arguments the wrapper hands the real `ld`: the link's own as the compiler gave
+    /// them, then `-order_file` and the order file's path where [`Self::order`] is set, then
+    /// `-x` where the link's arguments, response files read, carry no `-x`.
+    pub args: Vec<OsString>,
+    /// The order the wrapper writes to that order file before it runs the link: the
+    /// permutation sieve's, and `None` where the sieve gave no order or an empty one.
+    pub order: Option<Vec<String>>,
+}
+
+/// The final link of `link_args` (`expanded` is them with their response files read, by
+/// [`expand_linker_args`]), given `sieve`, the permutation sieve's order for the link, and
+/// `order_file`, the path the wrapper writes an order to. The link takes the sieve's order
+/// where the sieve gave one, and otherwise none beyond one `link_args` name: the image then
+/// has the layout the linker makes from its inputs alone, since the structural order the
+/// sieve starts from left more of `__TEXT` resident than that layout. Every final link
+/// strips local symbols (`-x`). The wrapper runs the sieve only for a link whose arguments
+/// name no `-order_file`, and where it cannot write the sieve's order it links with `sieve`
+/// `None`.
+#[must_use]
+pub(crate) fn final_link(
+    link_args: &[String],
+    expanded: &[String],
+    sieve: Option<Vec<String>>,
+    order_file: &Path,
+) -> FinalLink {
+    let order = sieve.filter(|list| !list.is_empty());
+    let mut args: Vec<OsString> = link_args.iter().map(OsString::from).collect();
+    if order.is_some() {
+        args.push("-order_file".into());
+        args.push(order_file.as_os_str().to_owned());
+    }
+    if !expanded.iter().any(|arg| arg == "-x") {
+        args.push("-x".into());
+    }
+    FinalLink { args, order }
 }
 
 /// Parses an unstripped Mach-O 64-bit executable (`MH_EXECUTE` or `MH_OBJECT`) and
@@ -1220,6 +1280,71 @@ pub(crate) fn write_order_file(path: &Path, symbols: &[String]) -> std::io::Resu
         opts.mode(0o600).custom_flags(OPEN_NOFOLLOW_CLOEXEC);
     }
     opts.open(path)?.write_all(buf.as_bytes())
+}
+
+/// The root keys of a probed image's `aterm.toml`, ahead of the world's tables (TOML reads a key
+/// after a table header into that table): the audible bell off and temporal recording on.
+const PROBE_ROOT_KEYS: &str = "bell_sound = false\ntemporal_recording = true\n";
+
+/// The scratch world (`aterm_types::world`) each image the layout probe measures starts in. The
+/// image is a release aterm under a fresh HOME, which a macOS release link starts unattended, so
+/// the lanes that act for the login's own account stay off by the world's marker and lanes-off
+/// tables (`aterm_types::world`), not only by the gates a headless start or a foreign HOME
+/// closes.
+pub(crate) struct ProbeWorld {
+    /// The image's HOME and the folder it starts in.
+    pub home: PathBuf,
+    /// The folders the probe makes, owner-only, before it writes [`Self::files`]: HOME, the
+    /// folder of the image's `aterm.toml` and its runtime folder.
+    pub dirs: Vec<PathBuf>,
+    /// The files the probe writes, each with its text and each in a folder of [`Self::dirs`]:
+    /// the shell's two startup files and the image's `aterm.toml`, [`PROBE_ROOT_KEYS`] then the
+    /// world's lanes-off tables. A file that cannot be written starts no image.
+    pub files: Vec<(PathBuf, String)>,
+    /// The environment each process the probe starts in the world begins from, nothing inherited
+    /// (to the image's the probe adds only its own variables): HOME, a system `PATH`, a plain
+    /// `/bin/sh` with its startup file and no history, an xterm `TERM`, the configuration and
+    /// runtime folders, and the world's marker at the state folder under HOME.
+    pub env: Vec<(&'static str, OsString)>,
+}
+
+/// The [`ProbeWorld`] laid out under `root`, which the probe removes when its image ends; `None`
+/// where the platform keeps no state under a HOME (Windows), so no marker could name it.
+#[must_use]
+pub(crate) fn probe_world(root: &Path) -> Option<ProbeWorld> {
+    let home = root.join("home");
+    let state = world_words::state_home(&home)?;
+    let config_home = root.join("cfg");
+    let config_dir = config_home.join("aterm");
+    let run_dir = root.join("run");
+    let shrc = home.join(".shrc");
+    let prompt = "PS1='$ '\n";
+    let env: Vec<(&'static str, OsString)> = vec![
+        ("HOME", home.clone().into_os_string()),
+        ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+        ("SHELL", "/bin/sh".into()),
+        ("ENV", shrc.clone().into_os_string()),
+        ("TERM", "xterm-256color".into()),
+        ("XDG_CONFIG_HOME", config_home.into_os_string()),
+        ("XDG_RUNTIME_DIR", run_dir.clone().into_os_string()),
+        ("HISTFILE", "/dev/null".into()),
+        (world_words::MARKER, state.into_os_string()),
+    ];
+    let files = vec![
+        (home.join(".profile"), prompt.to_owned()),
+        (shrc, prompt.to_owned()),
+        (
+            config_dir.join("aterm.toml"),
+            format!("{PROBE_ROOT_KEYS}{}", world_words::LANES_OFF),
+        ),
+    ];
+    let dirs = vec![home.clone(), config_dir, run_dir];
+    Some(ProbeWorld {
+        home,
+        dirs,
+        files,
+        env,
+    })
 }
 
 #[cfg(test)]

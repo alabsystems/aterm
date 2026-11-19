@@ -378,16 +378,22 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                     .map_or_else(String::new, |why| format!(" why={why}"))
             ),
         ),
-        // Only a self-claim's act (`SessionLog::self_claim_act`, the one writer of
-        // `harness_act=`) is a row; the harness's own `mark` act claims are none.
-        Kind::Act if r.src == aterm_slog::Src::Mark && f.get(Key::HarnessAct).is_some() => (
-            crate::session_timeline::HARNESS_ACT,
-            format!(
-                "act={} holder={}",
-                raw(f, Key::HarnessAct),
-                raw(f, Key::Holder)
-            ),
-        ),
+        // Only a self-claim's act (`SessionLog::self_claim_act` and its stream arm
+        // `stream_self_claim_act`, the writers of `harness_act=`) is a row; the harness's own
+        // `mark` act claims are none.
+        Kind::Act
+            if matches!(r.src, aterm_slog::Src::Mark | aterm_slog::Src::Harness)
+                && f.get(Key::HarnessAct).is_some() =>
+        {
+            (
+                crate::session_timeline::HARNESS_ACT,
+                format!(
+                    "act={} holder={}",
+                    raw(f, Key::HarnessAct),
+                    raw(f, Key::Holder)
+                ),
+            )
+        }
         Kind::Task => (
             "task-change",
             format!(

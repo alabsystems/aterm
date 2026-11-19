@@ -222,6 +222,7 @@ struct RevealedParts {
     values: BTreeMap<(String, super::alab_roster::Part), Option<zeroize::Zeroizing<String>>>,
     /// What it learned with nothing revealed: whether a reveal would hand a value over, and
     /// whether that value holds a character other than whitespace.
+    #[cfg(any(unix, test))]
     standing: BTreeMap<(String, super::alab_roster::Part), Option<bool>>,
 }
 
@@ -260,6 +261,7 @@ impl Revealed {
     /// whitespace. Read from what this discovery already revealed, else asked of the registry
     /// once per discovery ([`super::alab_roster::usable`]), which cannot see a reveal whose
     /// journal append would fail, nor a cell that changes before the reveal.
+    #[cfg(any(unix, test))]
     fn standing(&self, mailbox: &str, part: super::alab_roster::Part) -> Option<bool> {
         use super::alab_roster::Standing;
         let mut held = self
@@ -343,6 +345,7 @@ impl MailboxConfig {
     /// component), asking the registry what its value holds ([`Revealed::standing`]) where
     /// the getter would reveal it. A caller that only decides whether a sign-in can start
     /// (`native_mail::plan`) asks this; the sign-in that types the password asks the getter.
+    #[cfg(any(unix, test))]
     #[must_use]
     pub(super) fn password_standing(&self, target_email: Option<&str>) -> Option<bool> {
         use super::alab_roster::{Part, Standing};

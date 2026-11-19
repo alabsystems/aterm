@@ -399,7 +399,7 @@ impl Rig {
         };
         write_debugger_marker(
             &self.config,
-            OBSERVED_MARKER,
+            &own_observed().expect("a test's Mac has a UUID"),
             &marker.encode(),
             crate::durable::Flush::Ordered,
         )
@@ -407,9 +407,12 @@ impl Rig {
     }
 
     fn recorded(&self) -> Option<(i64, Origin)> {
-        read_debugger_marker(&self.config, OBSERVED_MARKER)
-            .and_then(|text| ObservedMarker::parse(&text))
-            .map(|m| (norm(m.mode, self.change), m.origin))
+        read_debugger_marker(
+            &self.config,
+            &own_observed().expect("a test's Mac has a UUID"),
+        )
+        .and_then(|text| ObservedMarker::parse(&text))
+        .map(|m| (norm(m.mode, self.change), m.origin))
     }
 
     fn lock_now(&self) -> i64 {

@@ -2926,7 +2926,8 @@ fn a_plain_builds_receipt_is_a_kept_run() {
         superseded(&[(member, OTHER)]),
         "padded to the bound"
     );
-    let unread: Vec<(&str, Box<dyn Fn(&mut Fake) + '_>)> = vec![
+    type Unread<'a> = (&'a str, Box<dyn Fn(&mut Fake) + 'a>);
+    let unread: Vec<Unread> = vec![
         (
             "another format",
             Box::new(|fs: &mut Fake| {

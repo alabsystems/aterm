@@ -20,7 +20,7 @@ use aterm_secrets::{
         bootstrap::Bootstrap,
     },
     crossing::RecordsBound,
-    membership_log::{Body, Log, MAX_RECORD, MAX_RECORDS_STREAM, Record, Store as Records},
+    membership_log::{Body, Log, MAX_RECORD, REPLY_CAP, Reading, Record, Store as Records},
 };
 
 const META_LEN: usize = HELLO_FIXED + 6;
@@ -46,13 +46,18 @@ pub(super) const WHOLE_BATCH_RECORDS: usize = 256;
 pub(super) const WHOLE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const _: () = assert!(WHOLE_BATCH_BYTES >= MAX_RECORD);
 
+/// The most bytes of records a log these wires move holds: a format-1 store's capacity (the
+/// storage class of byte bound, [`aterm_secrets::crossing::capacity`]). A log past format 1
+/// speaks none of them ([`format_one`]).
+const LOG_BYTES: usize = Reading::Format(aterm_secrets::crossing::FORMAT_ONE).capacity();
+
 /// The frontier wire a session speaks, as its ALPN named it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Wire {
     /// `atdb/4` ([`fleet::ALPN_DATABASE_FRONTIER`]), frame for frame as 0.153 released it, so a
     /// 0.153 peer and this build meet on it: each side sends the whole seat witness its bootstrap
-    /// selected (never none), judged from that witness's genesis alone, at most
-    /// [`MAX_RECORDS_STREAM`] bytes; membership rounds move at most [`WHOLE_BATCH_RECORDS`]
+    /// selected (never none), judged from that witness's genesis alone, at most one stream's
+    /// bytes ([`REPLY_CAP`]); membership rounds move at most [`WHOLE_BATCH_RECORDS`]
     /// records or [`WHOLE_BATCH_BYTES`] bytes, and records left for a later session end this one
     /// before table repair.
     Whole,
@@ -74,14 +79,25 @@ pub(super) enum Wire {
     /// ([`drain_records`]) reconciled by range as well, each one's whole difference moved in one
     /// session, parents first, in bounded batches.
     Ranges,
+    /// `atdb/9` ([`fleet::ALPN_DATABASE_PROOFS`]): [`Self::Ranges`]'s, with each table's
+    /// conflict-proof inventory reconciled by range as well ([`crate::replica`]).
+    Proofs,
 }
 
 impl Wire {
+    /// Whether this wire reconciles the control journal and the membership log by range
+    /// (`atdb/8` and later).
+    pub(super) const fn ranges(self) -> bool {
+        matches!(self, Self::Ranges | Self::Proofs)
+    }
+
     /// The most records one membership round pushes.
     pub(super) const fn batch_records(self) -> usize {
         match self {
             Self::Whole => WHOLE_BATCH_RECORDS,
-            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges => BATCH_RECORDS,
+            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges | Self::Proofs => {
+                BATCH_RECORDS
+            }
         }
     }
 
@@ -89,30 +105,33 @@ impl Wire {
     pub(super) const fn batch_bytes(self) -> usize {
         match self {
             Self::Whole => WHOLE_BATCH_BYTES,
-            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges => BATCH_BYTES,
+            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges | Self::Proofs => {
+                BATCH_BYTES
+            }
         }
     }
 
     /// The most bytes of seat evidence a peer sends before it is authenticated.
     pub(super) const fn evidence_bytes(self) -> usize {
         match self {
-            Self::Whole => MAX_RECORDS_STREAM,
-            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges => MAX_EVIDENCE,
+            Self::Whole => REPLY_CAP,
+            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges | Self::Proofs => {
+                MAX_EVIDENCE
+            }
         }
     }
 
     /// The most membership rounds a session runs between peers that hold at most `capacity`
     /// records, which both sides count alike. Under `atdb/5`, every two rounds a side with
     /// records left sends a full batch of records or of bytes, or every record left, so the
-    /// rounds a log of `capacity` records and [`MAX_RECORDS_STREAM`] bytes needs, and two more to
+    /// rounds a log of `capacity` records and a format-1 store's bytes ([`LOG_BYTES`]) needs, and two more to
     /// agree that nothing is left. Under `atdb/4`, 0.153's count: `capacity` over the number of
     /// largest records ([`MAX_RECORD`]) one batch's bytes hold, and two more.
     pub(super) const fn round_cap(self, capacity: usize) -> usize {
         match self {
             Self::Whole => capacity / (WHOLE_BATCH_BYTES / MAX_RECORD) + 2,
-            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges => {
-                2 * (capacity.div_ceil(BATCH_RECORDS) + MAX_RECORDS_STREAM.div_ceil(BATCH_BYTES))
-                    + 2
+            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges | Self::Proofs => {
+                2 * (capacity.div_ceil(BATCH_RECORDS) + LOG_BYTES.div_ceil(BATCH_BYTES)) + 2
             }
         }
     }
@@ -456,7 +475,7 @@ pub(super) fn send_evidence(
             admit_by_log_witness(log, target.binding())?;
             match wire {
                 Wire::Whole => log.records().map(Frame::Record).collect(),
-                Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
+                Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges | Wire::Proofs => {
                     lacked(endpoint, Some(log), log.records(), session.have)
                         .into_iter()
                         .map(Frame::Record)
@@ -632,7 +651,7 @@ fn receive_evidence(
             admit_by_log_witness(&log, target.binding())?;
             Ok(Received::Witness(Box::new(log)))
         }
-        Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
+        Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges | Wire::Proofs => {
             let (overlay, pushed) = overlay(endpoint, session.view, records)?;
             admit_by_log_witness(&overlay, target.binding())?;
             Ok(Received::Push {
@@ -767,7 +786,7 @@ pub(super) fn connected(
     // Delta-frontier peers state what each side holds; an `atdb/4` peer sends its evidence next.
     let (view, have) = match wire {
         Wire::Whole => (View::NONE, Vec::new()),
-        Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
+        Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges | Wire::Proofs => {
             let view = View::of(endpoint)?;
             let have = trade_haves(endpoint, stream, side, repair, &mut peer, &view)?;
             (view, have)
@@ -840,7 +859,7 @@ pub(super) fn connected(
         &Disk::new(&endpoint.dir, endpoint.trust),
         side,
         &mut lease,
-        (wire == Wire::Ranges).then_some(until),
+        wire.ranges().then_some(until),
     )?;
     if own.flags & peer.flags & RECORDS != 0 {
         lease.phase = Phase::MembershipRecords;
@@ -915,15 +934,24 @@ pub(super) fn connected(
                 compatible(endpoint, peer.bound)?;
                 let pass = verify_evidence(endpoint, &peer, &theirs)?;
                 lease.phase = Phase::Credentials;
-                lease.handoff = endpoint.hand_off_credentials(
+                (lease.handoff, lease.owing) = endpoint.hand_off_credentials(
                     pass,
                     actor,
                     side,
-                    matches!(wire, Wire::Duplex | Wire::Reconcile | Wire::Ranges),
+                    matches!(
+                        wire,
+                        Wire::Duplex | Wire::Reconcile | Wire::Ranges | Wire::Proofs
+                    ),
                     stream,
                 );
             }
             lease.phase = Phase::Complete;
+            // The round is complete and stays so: what follows only trades kept version
+            // reports, with a peer whose reported release trades them. A test counts and
+            // faults what moves from here on.
+            #[cfg(test)]
+            let stream = &mut super::tail::Tail::of(stream);
+            endpoint.trade_relayed(stream, actor, side, &mut lease, until);
         }
     } else {
         pass.waive();
@@ -946,7 +974,14 @@ fn lease_after_evidence<'a>(
     repair.authenticated = Some(authenticated);
     repair.phase = Phase::PeerAdmission;
     let preferred = (endpoint.actor < actor) == (side == Side::Initiator);
-    let mut lease = endpoint.lease_on(pass, actor, repair, preferred, until)?;
+    let mut lease = endpoint.lease_on(
+        pass,
+        actor,
+        repair,
+        side == Side::Initiator,
+        preferred,
+        until,
+    )?;
     #[cfg(test)]
     tests::peer_cache_stage(tests::PeerCacheStage::Acquired(side));
     lease.prepare(endpoint.trust, actor);
@@ -1232,7 +1267,7 @@ fn repair_records(
     wire: Wire,
 ) -> Result<(Report, Ending)> {
     pass.spend();
-    if wire == Wire::Ranges {
+    if wire.ranges() {
         return drain_records(endpoint, stream, side, peer, hint, until);
     }
     let mut total = Report::default();
@@ -1489,7 +1524,7 @@ fn enroll(
             &own.request,
             None,
             session,
-            MAX_RECORDS_STREAM,
+            REPLY_CAP,
         )?;
         let received = match grant {
             Received::Witness(log) => retain_grant(endpoint, paths, peer.bound, log.records())?,
@@ -1564,7 +1599,7 @@ fn enroll(
             .map_err(failure)?;
             let wires: Vec<_> = match session.wire {
                 Wire::Whole => chain.iter().map(Frame::Record).collect(),
-                Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
+                Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges | Wire::Proofs => {
                     lacked(endpoint, None, &chain, session.have)
                         .into_iter()
                         .map(Frame::Record)
@@ -1578,7 +1613,7 @@ fn enroll(
                 session.wire,
                 true,
                 &wires,
-                MAX_RECORDS_STREAM,
+                REPLY_CAP,
             )?;
             wires.len()
         } else {

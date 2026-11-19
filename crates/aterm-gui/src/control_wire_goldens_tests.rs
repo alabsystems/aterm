@@ -137,7 +137,7 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
         let _ = tl.note_harness_act("approve", "codex-alab", aterm_slog::Actor::Ctl);
         tl.note_program_state(None, 1);
     }
-    crate::harness_policy_verb::record_policy_move(&ctx.timeline, 2);
+    crate::harness_policy_verb::record_policy_move(&ctx, 2);
     let reply = crate::fabric::cmd_deliver_waking(
         &store,
         &format!("{sid} off=40 from=t0000000001 kind=ask trust=agent text=SENTINEL"),

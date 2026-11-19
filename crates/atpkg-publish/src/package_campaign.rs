@@ -117,6 +117,11 @@ pub enum Observation {
         /// Exact files actually read from staging.
         files: PackageFiles,
     },
+    /// The controller requested a Codex input comparison before this campaign can promote.
+    CodexProtocolPrepared {
+        /// SHA-256 of the exact input frame. This records preparation only.
+        input: String,
+    },
     /// Retained before attempting publication; the outcome can be unknown.
     IndexPrepared {
         /// The reserved index number.
@@ -159,6 +164,7 @@ pub enum Observation {
 impl Observation {
     fn valid(&self) -> bool {
         match self {
+            Self::CodexProtocolPrepared { input } => hex(input, 64),
             Self::Qualified { files } | Self::Staged { files } => [
                 &files.manifest,
                 &files.signature,
@@ -219,6 +225,7 @@ pub struct Campaign {
     intent: String,
     entries: Vec<Entry>,
     attempted: Option<Observation>,
+    expected_protocol: Option<protocol::Input>,
 }
 
 impl Campaign {
@@ -277,6 +284,7 @@ impl Campaign {
             intent: atpkg::sha256_bytes(&bytes),
             entries: Vec::new(),
             attempted: None,
+            expected_protocol: None,
         };
         campaign.keep("intent.json", &bytes)?;
         campaign.entries = campaign.read_entries()?;
@@ -468,6 +476,9 @@ pub use index_snapshot::{RetainedIndex, Retention};
 
 #[path = "package_campaign_package.rs"]
 mod qualified_package;
+
+#[path = "package_campaign_protocol.rs"]
+mod protocol;
 
 #[path = "package_campaign_cli.rs"]
 mod cli;

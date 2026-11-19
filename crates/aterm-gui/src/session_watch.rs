@@ -33,6 +33,12 @@ pub(crate) struct Watchers {
     owed: AtomicU8,
     /// How many records this list was rung for ([`Self::ring_record`]).
     records_rung: AtomicU64,
+    /// The doorbell of the session's open record stream (`control_stream.rs`), which
+    /// [`Self::ring_stream`] rings when a record aterm owes that stream may be due: a person's
+    /// gesture, the composer or a hold moved (`hand`), a restart was asked or the policy moved.
+    /// The stream lane registers its own and drops it when it ends. A STRICT LEAF.
+    #[cfg(unix)]
+    stream: Mutex<std::sync::Weak<aterm_uds::ready::Doorbell>>,
 }
 
 /// [`Watchers::owed`]: a ring of every watcher is owed.
@@ -57,6 +63,21 @@ impl Watchers {
             return;
         }
         self.ring_slots(false);
+    }
+
+    /// Ring the open record stream's doorbell, where one is registered ([`Self::watch_stream`]):
+    /// it looks at what aterm owes its harness. Takes no lock but this list's leaf.
+    pub(crate) fn ring_stream(&self) {
+        #[cfg(unix)]
+        if let Some(bell) = self.stream.lock_or_recover().upgrade() {
+            bell.ring();
+        }
+    }
+
+    /// Register `bell` as the open record stream's doorbell, in place of any earlier stream's.
+    #[cfg(unix)]
+    pub(crate) fn watch_stream(&self, bell: &Arc<aterm_uds::ready::Doorbell>) {
+        *self.stream.lock_or_recover() = Arc::downgrade(bell);
     }
 
     /// Increments the record counter and wakes every watcher ([`Self::ring_watchers`]).

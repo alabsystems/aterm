@@ -781,6 +781,7 @@ fn review_refuses_a_running_request_and_keep_keeps_its_open_tabs() {
 
 #[test]
 fn reply_mails_the_requester_there_and_here_through_report_post() {
+    const CURRENT_ASKER: &str = "t0123456789";
     for malformed in [
         "s-0123456789abcdef012",
         "s-0123456789abcdef01234",
@@ -801,6 +802,8 @@ fn reply_mails_the_requester_there_and_here_through_report_post() {
         for tab in [&fleet_tab, &local_tab, &silent_tab] {
             sessions.write().unwrap().register(tab.clone());
         }
+        let current_tab = test_handle(4);
+        sessions.write().unwrap().register(current_tab.clone());
         let there = request(
             &mut store,
             AT,
@@ -820,6 +823,15 @@ fn reply_mails_the_requester_there_and_here_through_report_post() {
             AT + 2,
             fleet_shell(NODE, "fleet:87be5228:-", "named no session"),
             silent_tab.sid.as_str(),
+            None,
+        );
+        let mut current_intake = local_spawn("current here");
+        current_intake.from.by = CURRENT_ASKER.to_owned();
+        let current = request(
+            &mut store,
+            AT + 3,
+            current_intake,
+            current_tab.sid.as_str(),
             None,
         );
         let fake = Fake::default();
@@ -864,6 +876,8 @@ fn reply_mails_the_requester_there_and_here_through_report_post() {
                 )),
                 "{line}"
             );
+            assert_eq!(posts[1].0, local_tab.sid.as_str());
+            assert_eq!(posts[1].1, format!("@{ASKER}"));
         }
         let mut cold = here.store();
         let request = cold.get(&there).cloned().unwrap();
@@ -872,6 +886,54 @@ fn reply_mails_the_requester_there_and_here_through_report_post() {
         assert_eq!(
             cold.said(&there).unwrap().replies[0].1,
             "thanks, cleaning it up"
+        );
+        let reopened = here
+            .store()
+            .get(&local)
+            .cloned()
+            .expect("the local request");
+        assert_eq!(reopened.open.by, ASKER, "the stored requester is whole");
+        assert_eq!(
+            reopened
+                .replies
+                .iter()
+                .map(|reply| reply.sent)
+                .collect::<Vec<_>>(),
+            [true]
+        );
+        let current_reply = Fake::default();
+        let answer = current_reply.run(
+            &no_client,
+            "request",
+            &format!("reply {current} done in a current tab"),
+            &sessions,
+        );
+        assert_eq!(
+            answer,
+            format!("OK replied req={current} to=@{CURRENT_ASKER} OK f1\n")
+        );
+        {
+            let posts = current_reply.posts.lock().unwrap();
+            assert_eq!(posts.len(), 1, "one reply to the current local requester");
+            assert_eq!(posts[0].0, current_tab.sid.as_str());
+            assert_eq!(posts[0].1, format!("@{CURRENT_ASKER}"));
+        }
+        let reopened = here
+            .store()
+            .get(&current)
+            .cloned()
+            .expect("the current local request");
+        assert_eq!(
+            reopened.open.by, CURRENT_ASKER,
+            "the stored requester is whole"
+        );
+        assert_eq!(
+            reopened
+                .replies
+                .iter()
+                .map(|reply| reply.sent)
+                .collect::<Vec<_>>(),
+            [true]
         );
         // NEGATIVE: a requester that named no session is refused, and nothing is posted.
         let refused = fake.run(
@@ -909,9 +971,9 @@ fn reply_mails_the_requester_there_and_here_through_report_post() {
     }
 }
 
-/// A DRIVE FROM A TAB OPENED BEFORE THE `t` FORM IS ANSWERED IN THAT TAB: the actor a drive
-/// records for a requester line naming such a tab's `s-` ID (`Actor::fleet_drive`) keeps the ID,
-/// so a reply to each of two such tabs' requests is mailed to its own tab on the asking Mac.
+/// A STORED DRIVE FROM A TAB OPENED BEFORE THE `t` FORM IS ANSWERED IN THAT TAB: the
+/// historical actor read by [`aterm_slog::Actor::from_word`] keeps its exact legacy ID, so a
+/// reply to each of two such tabs' requests is mailed to its own tab on the asking Mac.
 /// NEGATIVE CONTROL: a drive whose requester line named no session is refused a reply.
 #[test]
 fn a_legacy_tabs_drive_is_replied_to_in_that_tab() {
@@ -920,13 +982,24 @@ fn a_legacy_tabs_drive_is_replied_to_in_that_tab() {
     let mut store = here.store();
     let tab = test_handle(1);
     sessions.write().unwrap().register(tab.clone());
+    assert_eq!(
+        aterm_slog::Actor::fleet_drive(NODE, Some(REMOTE)).word(),
+        BY
+    );
     let asked: Vec<(String, &str)> = [
         (AT, "s-0123456789abcdef0123"),
         (AT + 10, "s-fedcba9876543210fedc"),
     ]
     .into_iter()
     .map(|(at, legacy)| {
-        let by = aterm_slog::Actor::fleet_drive(NODE, Some(legacy));
+        assert_eq!(
+            aterm_slog::Actor::fleet_drive(NODE, Some(legacy)).word(),
+            "fleet:87be5228:-",
+            "a live drive cannot attribute a legacy requester"
+        );
+        let carried = format!("fleet:87be5228:{legacy}");
+        let by = aterm_slog::Actor::from_word(&carried);
+        assert_eq!(by.word(), carried, "the historical actor is kept whole");
         let id = request(
             &mut store,
             at,
@@ -970,7 +1043,12 @@ fn a_legacy_tabs_drive_is_replied_to_in_that_tab() {
         "ERR request reply: its requester named no session, so no mail reaches it\n",
         "CONTROL"
     );
-    assert_eq!(fake.posts.lock().unwrap().len(), 2);
+    let posts = fake.posts.lock().unwrap();
+    assert_eq!(posts.len(), 2);
+    for ((_, legacy), (from, to, _, _)) in asked.iter().zip(posts.iter()) {
+        assert_eq!(from, tab.sid.as_str(), "the hosted tab sends the reply");
+        assert_eq!(to, &format!("@{legacy}@{NODE}"));
+    }
 }
 
 /// The tab ID whose number is `n`, for tab `n` of a test.

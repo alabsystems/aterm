@@ -32,6 +32,8 @@ mod native {
 
     const ROOT: &str = "ATERM_SUBSCRIBER_PROBE_ROOT";
     const CHILD: &str = "ATERM_SUBSCRIBER_PROBE_CHILD";
+    // A wall bound on each wait: this dev-only program is run by a person, not a test binary, and
+    // is built without the dev-dependencies the tests' progress-based patience needs.
     const HANG: Duration = Duration::from_secs(60);
     // A sampling interval, never an acceptance ceiling or a first-use delay.
     const IDLE: Duration = Duration::from_secs(5);
@@ -263,7 +265,12 @@ mod native {
             ));
         }
         send(&mut stream, &json!({"stage":"joined-idle"}))?;
-        aterm_secrets::client::watch(&paths, &|_| {}).map_err(io::Error::other)
+        // As `aterm secrets watch` starts: its log is kept where this child's output is that file.
+        let kept = aterm_secrets::service::keep_log(
+            &root.join("home"),
+            aterm_secrets::service::Job::Subscriber,
+        );
+        aterm_secrets::client::watch(&paths, &|_| {}, kept).map_err(io::Error::other)
     }
 
     fn launchctl(args: &[String]) -> io::Result<std::process::Output> {
@@ -400,11 +407,13 @@ mod native {
     }
 
     fn usage(pid: u32) -> io::Result<aterm_sysprobe::procs::ProcessReading> {
-        aterm_sysprobe::procs::processes()
-            .and_then(|sweep| sweep.procs.into_iter().find(|process| process.pid == pid))
-            .ok_or_else(|| {
-                io::Error::other("the owned subscriber's resource reading is unavailable")
-            })
+        // Its QoS CPU split is read, which a sweep reads only when asked.
+        aterm_sysprobe::procs::processes_with(aterm_sysprobe::SweepOpts {
+            scheduling: true,
+            ..aterm_sysprobe::SweepOpts::default()
+        })
+        .and_then(|sweep| sweep.procs.into_iter().find(|process| process.pid == pid))
+        .ok_or_else(|| io::Error::other("the owned subscriber's resource reading is unavailable"))
     }
 
     fn delta(before: Option<u64>, after: Option<u64>) -> Option<u64> {

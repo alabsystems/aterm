@@ -154,55 +154,21 @@ pub struct LogWitness {
     pub high: u64,
     /// The identity of that log, once a broker that answers one was read.
     pub id: Option<astream_broker::LogIdentity>,
-    /// Where this node MET that log's line ([`Met`]), once a broker that answers an identity was
-    /// read: `None` for a witness that names no identity, or one an older build wrote.
-    pub met: Option<Met>,
-}
-
-/// WHERE A NODE MET THE LOG IT READS: the log it attached to when it last met one that continues
-/// none of the log it read before (another id; the same id continuing nothing; a move whose
-/// lineage it was not told), or when it first named a log at all, and the head it read there,
-/// brought down to the fork of each move since that continues it ([`Met::after`]).
-///
-/// Every record that landed before the node met the log lies below `head` on it, if the log
-/// holds it at all: astream gives a log that KEPT its records another id as well as an empty
-/// one (`logid::settle`: a fresh id where its identity sidecar does not read, `Prior::Unreadable`;
-/// one derived from the records it kept where the sidecar is gone, `Prior::Absent`), each at
-/// generation 0 with an empty lineage, so an id that changed proves nothing about what lies
-/// below. And every record the node published on the log since it met it lies at or above
-/// `head`: it publishes on a log only once it attached to it, and a move that cut below `head`
-/// brought it down to the fork, below which the moved generation still holds what the earlier
-/// one held. But not every record the node published BEFORE it met the log: one a carried cut
-/// kept, on a log astream reminted keeping its records, lies below `head`, so since
-/// ATERM-KI-1114-1414 a read back on a log that continues none starts anywhere
-/// ([`Head::Anywhere`]), but for a keyed re-post's entry, whose key's sequence every re-post of
-/// it shares, which still starts here ([`Met::floor`], a head that is not the post's own,
-/// [`Head::own`]; its pin keeps the attach's head, `StateDir::forget_log_offsets`), as
-/// `Mutant::ReadBackFromTheAttachHead` starts every one; one whose own head a proved step
-/// ([`Proved`]) left above its fork reads from that head instead ([`Head::OwnFrom`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Met {
-    /// The log met.
-    pub log: astream_broker::LogIdentity,
-    /// Its head when it was met, brought down to the fork of each move since.
-    pub head: u64,
 }
 
 impl LogWitness {
     /// The one line this is stored as.
     #[must_use]
     pub fn render(&self) -> String {
-        let mut line = match self.id {
+        match self.id {
             Some(id) => format!("id={id} high={}", self.high),
             None => format!("high={}", self.high),
-        };
-        if let Some(met) = self.met {
-            line.push_str(&format!(" met={}@{}", met.log, met.head));
         }
-        line
     }
 
-    /// Parse one back: `None` without a readable `high=`.
+    /// Parse one back: `None` without a readable `high=`. A word this build does not write is
+    /// passed, the `met=` a build before ATERM-KI-1114-1414's step S6 wrote among them
+    /// ([`LogWitness::older_meeting`] reads that one, once).
     #[must_use]
     pub fn parse(line: &str) -> Option<Self> {
         let high = line
@@ -215,17 +181,28 @@ impl LogWitness {
             .split_whitespace()
             .find_map(|tok| tok.strip_prefix("id="))
             .and_then(astream_broker::LogIdentity::parse);
-        let met = line
+        Some(Self { high, id })
+    }
+
+    /// THE MEETING AN OLDER BUILD'S WITNESS NAMES (`met=<log>@<head>`, every build from critic
+    /// review F1 to ATERM-KI-1114-1414's step S6): the log that node last met continuing none of
+    /// the one it read before, and the head it read there, brought down to the fork of each move
+    /// since. That build started there a keyed re-post's read back of an entry kept on an
+    /// earlier log the log it read continued by neither a lineage nor a proved step, and this
+    /// build re-witnesses every keyed entry kept on another log at it once, at its first attach,
+    /// each keeping that log as its own (`Bridge::attach_broker`,
+    /// [`StateDir::rewitness_at_an_older_meeting`]). `None` where the
+    /// line names none, or one that does not read (a torn word reads as none).
+    #[must_use]
+    pub fn older_meeting(line: &str) -> Option<(astream_broker::LogIdentity, u64)> {
+        let (log, head) = line
             .split_whitespace()
-            .find_map(|tok| tok.strip_prefix("met="))
-            .and_then(|met| {
-                let (log, head) = met.split_once('@')?;
-                Some(Met {
-                    log: astream_broker::LogIdentity::parse(log)?,
-                    head: crate::parse_uint(head)?,
-                })
-            });
-        Some(Self { high, id, met })
+            .find_map(|tok| tok.strip_prefix("met="))?
+            .split_once('@')?;
+        Some((
+            astream_broker::LogIdentity::parse(log)?,
+            crate::parse_uint(head)?,
+        ))
     }
 
     /// Whether a broker answering `head` under `id` is provably not the log this witness saw.
@@ -249,64 +226,15 @@ impl LogWitness {
     }
 }
 
-impl Met {
-    /// Where the node stands met once an attach read `now` at `head`, having stood met at `met`
-    /// on the log it read before: there on the same log (`replaced` `None`); down to `fork` where
-    /// the attach found it replaced by a move that continues it to that fork (`Some(Some(fork))`);
-    /// and at `now`'s `head` where it found a log that continues none of it (`Some(None)`), or
-    /// where the node stood met nowhere (no log named before, or a witness an older build
-    /// wrote). `None` where `now` names no identity.
-    #[must_use]
-    pub fn after(
-        met: Option<Self>,
-        now: Option<astream_broker::LogIdentity>,
-        head: u64,
-        replaced: Option<Option<u64>>,
-    ) -> Option<Self> {
-        let now = now?;
-        Some(match (met, replaced) {
-            (Some(met), None) => met,
-            // A move astream's lineage carries stays on the line met; a proved step to another
-            // id (`Proved`) meets that id's line, as far down as the fork.
-            (Some(met), Some(Some(fork))) => Self {
-                log: if met.log.id == now.id { met.log } else { now },
-                head: met.head.min(fork),
-            },
-            _ => Self { log: now, head },
-        })
-    }
-
-    /// WHERE A READ BACK OF A HEAD KEPT ON LOG `was` STARTS ON `now`, a log of the line this
-    /// meeting is of, which continues none of `was` as far as the broker told: the head the
-    /// node met the line at, above every record that landed before (a sender's earlier post of
-    /// the same words among them) and at or below every copy the node published on it since.
-    /// `None` where `now` is of another line, and where `was` may be a generation of this line
-    /// since the meeting (its id, a generation at or past the met one's, which a lineage window
-    /// too short to reach it, or a move told without one, leaves unrelated): a head kept there
-    /// lies above records of the line that landed before it, and the meeting's head below them.
-    /// There the record is published again at its pin, and astream's dedup answers a copy whose
-    /// key stands. Read for a keyed re-post's read back, and by
-    /// `Mutant::ReadBackFromTheAttachHead` for every one, the rule before ATERM-KI-1114-1414
-    /// ([`Met`]).
-    #[must_use]
-    pub fn floor(
-        &self,
-        was: astream_broker::LogIdentity,
-        now: astream_broker::LogIdentity,
-    ) -> Option<u64> {
-        let since = was.id == self.log.id && was.generation >= self.log.generation;
-        (now.id == self.log.id && !since).then_some(self.head)
-    }
-}
-
 /// ONE PROVED STEP (ATERM-KI-1116-7314): `now`, another id than `was`, holds `was`'s records below
-/// `fork`, as this node proved by reading back the records it told its endpoint, the newest of
-/// each subject ([`ToldSamples`]), at their offsets on `now` with their bytes. astream gives a log
+/// `fork`, as this node proved by reading back the records it told its endpoint ([`ToldSamples`],
+/// by offset from the lowest up) at their offsets on `now` with their bytes. astream gives a log
 /// whose identity sidecar does not read a fresh id at generation 0 with no lineage, keeping every
 /// record (`logid::settle`'s `Prior::Unreadable`; one derived from its records where the sidecar
 /// is gone, `Prior::Absent`): only a reader that kept evidence of its own can say it continues.
 /// The newest [`Proved::MAX`] are kept ([`StateDir::proved_steps`]), so a head kept on `was` reads
-/// back from the fork on `now` (`Bridge::read_back_from`).
+/// back from the fork on `now` (`Bridge::read_back_from`), each carried onto every later
+/// generation of `now` an attach reads ([`Proved::carried`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Proved {
     /// The log before.
@@ -430,17 +358,93 @@ impl Proved {
         }
         Some((step.fork, step.head.min(now.continues(step.now, lineage?)?)))
     }
+
+    /// `steps` CARRIED ONTO `now`, a log an attach reads (ATERM-KI-1114-1414's step S6): each
+    /// step whose own log `now` continues by astream's `lineage` (a later generation of it) names
+    /// `now` in its place, its fork and its head each brought down to where `now` continues it,
+    /// so [`Proved::reach`] answers from it on `now`, and on each later generation of `now`'s
+    /// lineage, what it answered from the step: a lineage keeps the newest
+    /// [`astream_broker::Lineage::MAX`] moves, and past them a step left on the generation it was
+    /// proved on reaches no later one, though each move between was told. The fork comes down
+    /// with the head: below where `now` continues the step's log `now` holds `was`'s records
+    /// below the step's fork, and every reader of a step reached takes its fork no higher than
+    /// its second part ([`Proved::continues`], `Bridge::read_back_from`,
+    /// `StateDir::rewitnessed_entry`), so no answer moves, and the step stays [`Proved::head`]
+    /// at or above its fork, which the media holds ([`Proved::render_head`]; the second review of
+    /// step S6, confirmed: a head carried below a kept fork was written as the fork, and after a
+    /// restart or the next proof the read back started above the move's fork again). Every other
+    /// step stays as it is; one carried onto another that names `now` already is that one, the
+    /// newer kept.
+    #[must_use]
+    pub fn carried(
+        steps: &[Self],
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+    ) -> Vec<Self> {
+        Self::carried_by(steps, now, lineage, |fork, cut| fork.min(cut))
+    }
+
+    /// [`Proved::carried`]'s NEGATIVE CONTROL (`Mutant::CarriedStepKeepsItsFork`, the first
+    /// carry of step S6): each carried step keeps its fork, its head brought down below it where
+    /// `now` continues the step's log below the fork, which the media holds as the fork.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn carried_keeping_the_fork(
+        steps: &[Self],
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+    ) -> Vec<Self> {
+        Self::carried_by(steps, now, lineage, |fork, _| fork)
+    }
+
+    /// [`Proved::carried`], each carried step's fork `fork(step's fork, where now continues it)`.
+    fn carried_by(
+        steps: &[Self],
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+        fork: impl Fn(u64, u64) -> u64,
+    ) -> Vec<Self> {
+        let mut carried: Vec<Self> = Vec::with_capacity(steps.len());
+        for step in steps {
+            let cut = lineage
+                .filter(|_| step.now != now)
+                .and_then(|lineage| now.continues(step.now, lineage));
+            let step = match cut {
+                Some(cut) => Self {
+                    now,
+                    fork: fork(step.fork, cut),
+                    head: step.head.min(cut),
+                    ..*step
+                },
+                None => *step,
+            };
+            carried.retain(|s| *s != step);
+            carried.push(step);
+        }
+        carried
+    }
 }
 
-/// THE RECORDS THIS NODE TOLD ITS ENDPOINT (ATERM-KI-1116-7314): for each subject, the offset and
-/// the digest ([`told_digest`]) of the newest record of it the bridge offered aterm, recorded
-/// before the line that offers it goes (`Bridge::flush_told`). An attach that finds a log of
-/// another id continuing none of the one before reads each back at its offset; where one is
-/// there with its bytes and none is another record, the new log holds the old one's records
-/// below the newest proved, astream having given a log that kept its records another id
-/// ([`Proved`]). Above every offset the endpoint holds, the proof keeps them all, so nothing it
-/// was shown is offered as new. A sample recorded for a record never offered says only what the
-/// log holds; one that lags a record offered lowers the fork, and the endpoint forgets more.
+/// THE RECORDS THIS NODE TOLD ITS ENDPOINT (ATERM-KI-1116-7314): by offset, the digest
+/// ([`told_digest`]) and the subject of each record the bridge offered aterm, recorded before the
+/// line that offers it goes (`Bridge::flush_told`). Its ANCHORS ([`ToldSamples::anchors`]) are
+/// each subject's newest row, for the [`ToldSamples::MAX_SUBJECTS`] subjects whose newest rows are
+/// highest, which is what every build before kept; past [`ToldSamples::MAX_ROWS`] rows the lowest
+/// row that is no anchor goes, so the rows hold the anchors and at least the newest
+/// `MAX_ROWS - MAX_SUBJECTS` records told, whatever their subjects. An attach that finds a log of
+/// another id continuing none of the one before reads them back at their offsets from the lowest
+/// up (`Bridge::prove_remint`); below the lowest that is another record or none, the new log holds
+/// the old one's records up to the newest that is there with its bytes, astream having given a log
+/// that kept its records another id ([`Proved`]). A cut that took fewer told records than the rows
+/// keep beside the anchors leaves the newest told record below it a row, so the proof keeps every
+/// offset aterm holds below the cut, and nothing it was shown is offered as new. A row recorded
+/// for a record never offered says only what the log holds; rows that lag a record offered lower
+/// the fork, and the endpoint forgets more.
+///
+/// They are kept in two files under one header ([`StateDir::told_samples`]): `told-samples`
+/// holds the anchors in the grammar every build before reads and writes ([`ToldSamples::render`]),
+/// and `told-history` every row ([`ToldSamples::render_history`]), read beside them under the
+/// same log and move, or below the cut of a move one ahead of theirs ([`ToldSamples::union`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToldSamples {
     /// The log the samples are records of now.
@@ -450,21 +454,36 @@ pub struct ToldSamples {
     /// log as well. `None` for samples read on `log`. An attach refused after the move leaves its
     /// witness on that log, and the next attach proves from them as from that log's own.
     pub moved_from: Option<(astream_broker::LogIdentity, u64)>,
-    /// For each subject, the newest record of it told: its offset and digest.
-    pub rows: BTreeMap<String, (u64, u64)>,
+    /// Each record told, by its offset: its digest and its subject.
+    pub rows: BTreeMap<u64, (u64, String)>,
 }
 
 impl ToldSamples {
-    /// At most this many subjects are kept, the lowest offsets dropped first.
-    pub const MAX: usize = 64;
+    /// At most this many subjects have an anchor, each subject's newest row
+    /// ([`ToldSamples::anchors`]): every build before kept this many rows, one per subject, the
+    /// lowest offsets dropped first, and reads and writes `told-samples` so.
+    pub const MAX_SUBJECTS: usize = 64;
 
-    /// The text this is stored as: `log=<id>`, then `from=<id> <fork>` where a move took them
-    /// ([`ToldSamples::moved_from`]), then `<off> <digest> <subject>` per subject, then
-    /// `end <seal>` ([`ToldSamples::seal`] of the text before it). The file is written
-    /// undurably, so a power cut can leave any prefix of it, or other bytes: the seal makes each
-    /// read as none.
+    /// At most this many rows are kept, the lowest that is no anchor dropped first.
+    pub const MAX_ROWS: usize = 256;
+
+    /// The offsets of the ANCHORS: each subject's newest row, for the
+    /// [`ToldSamples::MAX_SUBJECTS`] subjects whose newest rows are highest.
     #[must_use]
-    pub fn render(&self) -> String {
+    pub fn anchors(&self) -> BTreeSet<u64> {
+        let mut newest: BTreeMap<&str, u64> = BTreeMap::new();
+        for (&off, (_, subject)) in &self.rows {
+            newest.insert(subject, off);
+        }
+        let mut offs: Vec<u64> = newest.into_values().collect();
+        offs.sort_unstable_by(|a, b| b.cmp(a));
+        offs.truncate(Self::MAX_SUBJECTS);
+        offs.into_iter().collect()
+    }
+
+    /// `log=<id>` (`log=-` for none), then `from=<id> <fork>` where a move took them
+    /// ([`ToldSamples::moved_from`]).
+    fn header(&self) -> String {
         let mut out = match self.log {
             Some(log) => format!("log={log}"),
             None => "log=-".to_string(),
@@ -472,7 +491,26 @@ impl ToldSamples {
         if let Some((from, fork)) = self.moved_from {
             out.push_str(&format!("\nfrom={from} {fork}"));
         }
-        for (subject, (off, digest)) in &self.rows {
+        out
+    }
+
+    /// The text `told-samples` holds, exactly as every build before writes it: the header
+    /// ([`ToldSamples::moved_from`] on its `from=` line), then `<off> <digest> <subject>` for each
+    /// anchor ([`ToldSamples::anchors`]) in subject order, then `end <seal>`
+    /// ([`ToldSamples::seal`] of the text before it). The file is written undurably, so a power
+    /// cut can leave any prefix of it, or other bytes: the seal makes each read as none.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let by_subject: BTreeMap<&str, (u64, u64)> = self
+            .anchors()
+            .into_iter()
+            .filter_map(|off| {
+                let (digest, subject) = self.rows.get(&off)?;
+                Some((subject.as_str(), (off, *digest)))
+            })
+            .collect();
+        let mut out = self.header();
+        for (subject, (off, digest)) in by_subject {
             out.push_str(&format!("\n{off} {digest:016x} {subject}"));
         }
         let seal = Self::seal(&out);
@@ -480,11 +518,57 @@ impl ToldSamples {
         out
     }
 
+    /// The text `told-history` holds: the same header, then `<off> <digest> <subject>` for EVERY
+    /// row, the anchors included, in ascending offsets (a subject may repeat), then `end <seal>`
+    /// ([`ToldSamples::seal_history`], a domain of its own). None of no log, which no history
+    /// holds. Every row, since a move makes a row below its fork an anchor that `told-samples`
+    /// on the disk does not name yet: written first ([`StateDir::set_told_samples`]), the history
+    /// alone holds it until the samples are written. NEGATIVE CONTROL
+    /// (`Mutant::ToldHistoryWithoutTheAnchors`, [`ToldSamples::render_history_without_the_anchors`]):
+    /// the rows that are no anchor alone, so a refused or killed second write of a move's flush
+    /// leaves such a row on neither file.
+    #[must_use]
+    pub fn render_history(&self) -> String {
+        self.render_history_of(&BTreeSet::new())
+    }
+
+    /// [`ToldSamples::render_history`] without the rows at `left_out`.
+    fn render_history_of(&self, left_out: &BTreeSet<u64>) -> String {
+        let mut out = self.header();
+        if self.log.is_some() {
+            for (off, (digest, subject)) in &self.rows {
+                if !left_out.contains(off) {
+                    out.push_str(&format!("\n{off} {digest:016x} {subject}"));
+                }
+            }
+        }
+        let seal = Self::seal_history(&out);
+        out.push_str(&format!("\nend {seal:016x}"));
+        out
+    }
+
+    /// The negative control of the anchors in the history ([`ToldSamples::render_history`],
+    /// [`crate::sim::world::Mutant::ToldHistoryWithoutTheAnchors`]): the rows that are no anchor
+    /// alone.
+    #[cfg(test)]
+    pub(crate) fn render_history_without_the_anchors(&self) -> String {
+        self.render_history_of(&self.anchors())
+    }
+
     /// The seal of the text above a samples file's `end` line: the first eight bytes of its
     /// SHA-256.
     fn seal(body: &str) -> u64 {
+        Self::seal_in(b"aterm-link-told-samples-v1\0", body)
+    }
+
+    /// The seal of the text above a history file's `end` line ([`ToldSamples::render_history`]).
+    fn seal_history(body: &str) -> u64 {
+        Self::seal_in(b"aterm-link-told-history-v1\0", body)
+    }
+
+    fn seal_in(domain: &[u8], body: &str) -> u64 {
         let mut hash = aterm_digest::Sha256::new();
-        hash.update(b"aterm-link-told-samples-v1\0");
+        hash.update(domain);
         hash.update(body.as_bytes());
         let digest = hash.finalize();
         let mut first = [0u8; 8];
@@ -492,13 +576,12 @@ impl ToldSamples {
         u64::from_be_bytes(first)
     }
 
-    /// Parse one back: `None` for a text with no `end` line sealing what is above it, or any of
-    /// whose lines does not read, which proves nothing.
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Self> {
+    /// The header and the row lines of a text sealed by `seal`: `None` for a text with no `end`
+    /// line sealing what is above it, or whose header does not read.
+    fn parse_sealed(text: &str, seal: fn(&str) -> u64) -> Option<(Self, Vec<&str>)> {
         let (body, end) = text.trim_end_matches('\n').rsplit_once('\n')?;
-        let seal = end.strip_prefix("end ").filter(|s| s.len() == 16)?;
-        if u64::from_str_radix(seal, 16).ok()? != Self::seal(body) {
+        let sealed = end.strip_prefix("end ").filter(|s| s.len() == 16)?;
+        if u64::from_str_radix(sealed, 16).ok()? != seal(body) {
             return None;
         }
         let mut lines = body.lines().peekable();
@@ -517,27 +600,218 @@ impl ToldSamples {
             }
             None => None,
         };
-        let mut rows = BTreeMap::new();
+        let samples = Self {
+            log,
+            moved_from,
+            rows: BTreeMap::new(),
+        };
+        Some((samples, lines.collect()))
+    }
+
+    /// One row line, `<off> <digest> <subject>`.
+    fn parse_row(line: &str) -> Option<(u64, u64, &str)> {
+        let mut toks = line.split_whitespace();
+        let off = crate::parse_uint(toks.next()?)?;
+        let digest = toks.next().filter(|d| d.len() == 16)?;
+        let digest = u64::from_str_radix(digest, 16).ok()?;
+        let subject = toks.next()?;
+        if toks.next().is_some() {
+            return None;
+        }
+        Some((off, digest, subject))
+    }
+
+    /// Parse `told-samples` back, as every build before reads it: `None` for a text with no
+    /// `end` line sealing what is above it, any of whose lines does not read, that names a
+    /// subject twice, or two subjects at one offset, which proves nothing.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let (mut samples, lines) = Self::parse_sealed(text, Self::seal)?;
+        let mut subjects = BTreeSet::new();
         for line in lines {
-            let mut toks = line.split_whitespace();
-            let off = crate::parse_uint(toks.next()?)?;
-            let digest = toks.next().filter(|d| d.len() == 16)?;
-            let digest = u64::from_str_radix(digest, 16).ok()?;
-            let subject = toks.next()?;
-            if toks.next().is_some() || rows.insert(subject.to_string(), (off, digest)).is_some() {
+            let (off, digest, subject) = Self::parse_row(line)?;
+            if !subjects.insert(subject)
+                || samples
+                    .rows
+                    .insert(off, (digest, subject.to_string()))
+                    .is_some()
+            {
                 return None;
             }
         }
-        Some(Self {
-            log,
-            moved_from,
-            rows,
-        })
+        Some(samples)
+    }
+
+    /// Parse `told-history` back ([`ToldSamples::render_history`]): `None` for a text not sealed
+    /// in the history's domain, any of whose lines does not read, whose offsets do not ascend,
+    /// or that holds a row of no log.
+    #[must_use]
+    pub fn parse_history(text: &str) -> Option<Self> {
+        let (mut history, lines) = Self::parse_sealed(text, Self::seal_history)?;
+        for line in lines {
+            let (off, digest, subject) = Self::parse_row(line)?;
+            if history
+                .rows
+                .last_key_value()
+                .is_some_and(|(&last, _)| last >= off)
+            {
+                return None;
+            }
+            history.rows.insert(off, (digest, subject.to_string()));
+        }
+        if history.log.is_none() && !history.rows.is_empty() {
+            return None;
+        }
+        Some(history)
+    }
+
+    /// These samples with the rows of `history` beside them, under these samples' header: every
+    /// row where it is a history of the same log and the same move (every build changes both at
+    /// a note on another log, a move and a reset, so under them each of its rows is still a
+    /// record of that log at its offset); and where it is ONE MOVE AHEAD of them, its rows below
+    /// that move's cut ([`ToldSamples::move_ahead_cut`]): a move's flush writes the history
+    /// first ([`StateDir::set_told_samples`]), so a refusal or a kill before the samples are
+    /// written leaves the history of the move beside the samples before it. `None` where its
+    /// header is another, or an offset of both holds another record in each. NEGATIVE CONTROL
+    /// (`Mutant::ToldHistoryOfTheMoveAheadUnread`, [`ToldSamples::union_of_the_same_header`]):
+    /// the same header alone, and the rows such a flush kept below the fork are on the disk under
+    /// a header no read accepts.
+    #[must_use]
+    pub fn union(&self, history: &Self) -> Option<Self> {
+        if (history.log, history.moved_from) == (self.log, self.moved_from) {
+            return self.union_rows(history);
+        }
+        let cut = self.move_ahead_cut(history)?;
+        let below = Self {
+            rows: history
+                .rows
+                .range(..cut)
+                .map(|(&off, row)| (off, row.clone()))
+                .collect(),
+            ..history.clone()
+        };
+        self.union_rows(&below)
+    }
+
+    /// Where `history` is one move ahead of these samples, the offset below which each of its
+    /// rows is a record of these samples' log: [`ToldSamples::moved`] keeps a row only below its
+    /// cut, and only of the log the move is from, these samples' log (read on it), or the log
+    /// a move before took them from (`moved_from`), whose records below that move's cut are
+    /// these samples' log's too; a row noted on the history's log since below that cut is a record
+    /// of the log it continues there. So the history's move from these samples' log gives its
+    /// cut, and its move from their `moved_from`'s log the lower of the two cuts. `None` for a
+    /// history of any other header: a reset's samples name no log, and a note on another log
+    /// names no move.
+    fn move_ahead_cut(&self, history: &Self) -> Option<u64> {
+        let (from, cut) = history.moved_from?;
+        if self.log == Some(from) {
+            return Some(cut);
+        }
+        match self.moved_from {
+            Some((was, before)) if was == from => Some(cut.min(before)),
+            _ => None,
+        }
+    }
+
+    /// The negative control of the history one move ahead ([`ToldSamples::union`],
+    /// [`crate::sim::world::Mutant::ToldHistoryOfTheMoveAheadUnread`]): the same header alone.
+    #[cfg(test)]
+    pub(crate) fn union_of_the_same_header(&self, history: &Self) -> Option<Self> {
+        if (history.log, history.moved_from) != (self.log, self.moved_from) {
+            return None;
+        }
+        self.union_rows(history)
+    }
+
+    /// [`ToldSamples::union`] whatever `history`'s header (`StateDir::told_samples`' negative
+    /// control, [`crate::sim::world::Mutant::ToldHistoryOfAnotherHeader`]).
+    fn union_rows(&self, history: &Self) -> Option<Self> {
+        let mut out = self.clone();
+        for (&off, row) in &history.rows {
+            match out.rows.get(&off) {
+                Some(have) if have != row => return None,
+                Some(_) => {}
+                None => {
+                    out.rows.insert(off, row.clone());
+                }
+            }
+        }
+        Some(out)
     }
 
     /// Note the record at `off` of `subject` on `log`, whose raw body is `raw`, as told: whether
-    /// the samples changed. Samples of another log are dropped first.
+    /// the samples changed. Samples of another log are dropped first; an offset already noted is
+    /// the same record, kept as first noted; past [`ToldSamples::MAX_ROWS`] the lowest row that is
+    /// no anchor goes.
     pub fn note(
+        &mut self,
+        log: astream_broker::LogIdentity,
+        subject: &str,
+        off: u64,
+        raw: &[u8],
+    ) -> bool {
+        self.note_evicting(log, subject, off, raw, false)
+    }
+
+    /// [`ToldSamples::note`], evicting the lowest row past the cap, an anchor included
+    /// (`anchors_too`, the negative control of the anchors: a busy subject's rows take a quiet
+    /// one's newest, which `told-samples` then names no more).
+    fn note_evicting(
+        &mut self,
+        log: astream_broker::LogIdentity,
+        subject: &str,
+        off: u64,
+        raw: &[u8],
+        anchors_too: bool,
+    ) -> bool {
+        let mut changed = false;
+        if self.log != Some(log) {
+            *self = Self {
+                log: Some(log),
+                ..Self::default()
+            };
+            changed = true;
+        }
+        if self.rows.contains_key(&off) {
+            return changed;
+        }
+        self.rows
+            .insert(off, (told_digest(raw), subject.to_string()));
+        while self.rows.len() > Self::MAX_ROWS {
+            let victim = if anchors_too {
+                self.rows.keys().next().copied()
+            } else {
+                let anchors = self.anchors();
+                self.rows.keys().copied().find(|off| !anchors.contains(off))
+            };
+            let Some(victim) = victim else {
+                break;
+            };
+            self.rows.remove(&victim);
+            changed |= victim != off;
+        }
+        changed || self.rows.contains_key(&off)
+    }
+
+    /// The negative control of the anchors ([`ToldSamples::note_evicting`],
+    /// [`crate::sim::world::Mutant::ToldRowsEvictASubjectsNewest`]).
+    #[cfg(test)]
+    pub(crate) fn note_evicting_anchors(
+        &mut self,
+        log: astream_broker::LogIdentity,
+        subject: &str,
+        off: u64,
+        raw: &[u8],
+    ) -> bool {
+        self.note_evicting(log, subject, off, raw, true)
+    }
+
+    /// The negative control of the rows below each subject's newest
+    /// ([`crate::sim::world::Mutant::ToldNewestOfEachSubjectOnly`]): every build before's
+    /// `note`, which keeps each subject's newest record alone, at most
+    /// [`ToldSamples::MAX_SUBJECTS`] of them, the lowest offset dropped first.
+    #[cfg(test)]
+    pub(crate) fn note_newest_of_each_subject_only(
         &mut self,
         log: astream_broker::LogIdentity,
         subject: &str,
@@ -552,19 +826,20 @@ impl ToldSamples {
             };
             changed = true;
         }
-        if self.rows.get(subject).is_some_and(|&(have, _)| have >= off) {
+        if self
+            .rows
+            .iter()
+            .any(|(&have, (_, s))| s == subject && have >= off)
+        {
             return changed;
         }
+        self.rows.retain(|_, (_, s)| s != subject);
         self.rows
-            .insert(subject.to_string(), (off, told_digest(raw)));
-        while self.rows.len() > Self::MAX {
-            let lowest = self
-                .rows
-                .iter()
-                .min_by_key(|(_, (off, _))| *off)
-                .map(|(subject, _)| subject.clone());
-            if let Some(subject) = lowest {
-                self.rows.remove(&subject);
+            .insert(off, (told_digest(raw), subject.to_string()));
+        while self.rows.len() > Self::MAX_SUBJECTS {
+            let lowest = self.rows.keys().next().copied();
+            if let Some(lowest) = lowest {
+                self.rows.remove(&lowest);
             }
         }
         true
@@ -575,7 +850,9 @@ impl ToldSamples {
     /// of `was`, read on it or taken from it by a move before (an attach refused after that move
     /// left its witness on `was`, and this one meets the move again, or the next one on), and
     /// then below that move's fork as well; none where they are another log's (a file a refused
-    /// or lost write left), whose records the move says nothing of.
+    /// or lost write left), whose records the move says nothing of. A subject whose newest row
+    /// lies at or above the fork keeps its rows below it, among them the record aterm holds
+    /// below the move.
     pub fn moved(
         &mut self,
         was: Option<astream_broker::LogIdentity>,
@@ -595,9 +872,31 @@ impl ToldSamples {
             Some((from, cut)) if from == was && self.log != Some(was) => fork.min(cut),
             _ => fork,
         };
-        self.rows.retain(|_, (off, _)| *off < cut);
+        self.rows.retain(|off, _| *off < cut);
         self.moved_from = Some((was, cut));
         self.log = Some(now);
+    }
+
+    /// The negative control of the rows a move keeps
+    /// ([`crate::sim::world::Mutant::MovedDropsTheSubject`]): after [`ToldSamples::moved`], every
+    /// row of each subject whose newest row before it (`newest`, [`ToldSamples::newest_rows`])
+    /// lay at or above the move's fork goes, as every build before's move dropped that subject.
+    #[cfg(test)]
+    pub(crate) fn drop_subjects_moved_past(&mut self, newest: &BTreeMap<String, u64>) {
+        let Some((_, cut)) = self.moved_from else {
+            return;
+        };
+        self.rows
+            .retain(|_, (_, subject)| newest.get(subject).is_none_or(|off| *off < cut));
+    }
+
+    /// Each subject's newest row's offset.
+    #[cfg(test)]
+    pub(crate) fn newest_rows(&self) -> BTreeMap<String, u64> {
+        self.rows
+            .iter()
+            .map(|(&off, (_, subject))| (subject.clone(), off))
+            .collect()
     }
 }
 
@@ -1164,6 +1463,14 @@ pub struct StateDir {
     #[cfg(test)]
     proved_keyed_heads_at_the_attach: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    keyed_entries_kept_on_their_log: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    own_logs_forgotten: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    own_pins_left: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    carried_steps_keep_their_fork: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     plain_from_heads_own: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     own_heads_above_the_proved_head: std::sync::atomic::AtomicBool,
@@ -1171,6 +1478,14 @@ pub struct StateDir {
     lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     keep_acked_across_its_replace: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    told_history_written_last: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    told_history_of_any_header: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    told_history_without_the_anchors: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    told_history_of_the_same_header_only: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     proof_rule: std::sync::Mutex<ProofRule>,
 }
@@ -1248,15 +1563,22 @@ pub(crate) struct PublishIdentity {
 /// (by its words where the broker cannot say origins, `Bridge::found_since`). A keyed re-post's
 /// `From(n)` is NOT its own head: an older build wrote every keyed head so, the one it made the
 /// pin at and the head an attach read where the log continued none of the pin's alike
-/// (`StateDir::publication_offset_resets`), as this build writes the latter and the head the node
-/// met the log's line at for an entry (`Bridge::keyed_floor`): its attempts may lie below it,
-/// where a carried cut kept one, so it bounds none of them, and no proved step makes it an own
-/// head.
+/// (`StateDir::publication_offset_resets`), as this build writes the latter, for a pin and for an
+/// entry it re-witnesses onto such a log (`StateDir::rewitness_in_flight`): its attempts may
+/// lie below it, where a carried cut kept one, so it bounds none of them, and no proved step makes
+/// it an own head. `Since(n)` (ATERM-KI-1114-1414's step S6): where a read back of such a keyed
+/// `From` head above a proved fork starts (`Bridge::read_back_from`), at it or lower: every
+/// earlier record of its key was published below `n`, which the remint keeps naming the same point
+/// below the head the step was proved at, and a record of its words at or above `n` under this
+/// node's producers at the key's sequence is the post's own, so it is read as an own head is, by
+/// its words and its origin. It is no own head ([`Head::own`]): its attempts may lie below it. A
+/// read start only, never written: [`Head::stored`] makes it the `From` a journal holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Head {
     From(u64),
     Anywhere,
     OwnFrom(u64),
+    Since(u64),
 }
 
 impl Head {
@@ -1271,6 +1593,7 @@ impl Head {
             Self::From(at) => Self::From(at.min(cap)),
             Self::Anywhere => Self::Anywhere,
             Self::OwnFrom(at) => Self::OwnFrom(at.min(cap)),
+            Self::Since(at) => Self::Since(at.min(cap)),
         }
     }
 
@@ -1295,7 +1618,7 @@ impl Head {
     #[must_use]
     pub(crate) const fn start(self) -> u64 {
         match self {
-            Self::From(at) | Self::OwnFrom(at) => at,
+            Self::From(at) | Self::OwnFrom(at) | Self::Since(at) => at,
             Self::Anywhere => 0,
         }
     }
@@ -1306,15 +1629,27 @@ impl Head {
     pub(crate) const fn own(self) -> Option<u64> {
         match self {
             Self::OwnFrom(at) => Some(at),
-            Self::From(_) | Self::Anywhere => None,
+            Self::From(_) | Self::Anywhere | Self::Since(_) => None,
+        }
+    }
+
+    /// The head a journal holds for this one: a read start `Since(n)` as the `From(n)` it was
+    /// read from, every other head as it is.
+    #[must_use]
+    pub(crate) const fn stored(self) -> Self {
+        match self {
+            Self::Since(at) => Self::From(at),
+            head => head,
         }
     }
 
     /// Its word in a journal record's tail ([`journal`]'s A RECORD'S TAIL): the offset, `any`,
-    /// or `own<n>`.
+    /// or `own<n>`. A `Since(n)` has `From(n)`'s, so a frame holding one does not read back as
+    /// itself, and the journal refuses it ([`journal::encode`]): only [`Head::stored`] heads are
+    /// written.
     pub(crate) fn word(self) -> String {
         match self {
-            Self::From(at) => at.to_string(),
+            Self::From(at) | Self::Since(at) => at.to_string(),
             Self::Anywhere => "any".to_string(),
             Self::OwnFrom(at) => format!("own{at}"),
         }
@@ -1567,6 +1902,36 @@ pub(crate) struct InFlight {
     /// only the records at or above the base retention leaves. Kept as [`PublishPin::at`] is:
     /// never in the text form.
     pub at: Option<Head>,
+    /// THE LOG A KEYED RE-POST'S ENTRY STOOD ON BEFORE AN ATTACH MOVED IT onto one that continues
+    /// none of it, or an older build's meeting moved it onto the log its witness names
+    /// (ATERM-KI-1114-1414's step S6, [`OwnLog`]), and its heads there; `None` for an entry nothing
+    /// moved so, and for one back on it. Never in the text form, nor in the entry's journal
+    /// record: a record of its own before it (`state::journal`'s AN ENTRY'S OWN LOG).
+    pub own_log: Option<OwnLog>,
+}
+
+/// WHERE A KEYED RE-POST'S ENTRY STOOD ON ITS OWN LOG ([`InFlight::own_log`], ATERM-KI-1114-1414's
+/// step S6): the log it stood on when an attach first moved it onto a log that continues none of
+/// it ([`StateDir::rewitnessed_entry`]), or an older build's meeting onto the log its witness
+/// names ([`StateDir::rewitness_at_an_older_meeting`]), and its head and its pin's head there,
+/// kept through every later move. An attempt its replay published there stands at or above that
+/// head, and an attach to that log, or to one its lineage or a proved step reaches it on (another
+/// broker's for a while, a failover undone; an attach refused or killed after the move, or whose
+/// replay's answer was lost), puts the entry back there, at that head, and re-witnesses it from
+/// there, as every build before the step kept it and read it back: from the head the attach read
+/// the read missed an attempt a carried cut kept below it, its dedup key dropped, and the key's
+/// second record landed (the second review of step S6, confirmed). Its post's reservation goes
+/// back with it ([`StateDir::own_pins_back`]), so the drain's retry reads from there too. A build
+/// before the step reads the entry with every head it reads and no own log, and drops the own
+/// log where it rewrites the journal (`state::journal`'s AN ENTRY'S OWN LOG).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnLog {
+    /// The log.
+    pub log: astream_broker::LogIdentity,
+    /// The entry's head there ([`InFlight::at`]).
+    pub at: Head,
+    /// Its pin's head there ([`PublishPin::at`]).
+    pub pin_at: Option<Head>,
 }
 
 impl PublishPin {
@@ -1580,11 +1945,12 @@ impl PublishPin {
 }
 
 impl InFlight {
-    /// This entry as its text form holds it: without its head or its pin's.
+    /// This entry as its text form holds it: without its head or its pin's, nor its own log's.
     pub(crate) fn without_head(&self) -> Self {
         Self {
             pin: self.pin.without_head(),
             at: None,
+            own_log: None,
             ..self.clone()
         }
     }
@@ -1625,6 +1991,7 @@ impl InFlight {
             body,
             log,
             at: None,
+            own_log: None,
         })
     }
 }
@@ -2237,6 +2604,14 @@ impl StateDir {
             #[cfg(test)]
             proved_keyed_heads_at_the_attach: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            keyed_entries_kept_on_their_log: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            own_logs_forgotten: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            own_pins_left: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            carried_steps_keep_their_fork: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             plain_from_heads_own: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             own_heads_above_the_proved_head: std::sync::atomic::AtomicBool::new(false),
@@ -2244,6 +2619,14 @@ impl StateDir {
             lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             keep_acked_across_its_replace: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            told_history_written_last: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            told_history_of_any_header: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            told_history_without_the_anchors: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            told_history_of_the_same_header_only: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             proof_rule: std::sync::Mutex::default(),
         }
@@ -2349,9 +2732,12 @@ impl StateDir {
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// The negative control of a pin's head on a log that continues none, which goes to the head
-    /// the attach read, as every build from critic review F1 to ATERM-KI-1114-1414 took it, not
-    /// anywhere ([`crate::sim::world::Mutant::ReadBackFromTheAttachHead`]).
+    /// The negative control of a head on a log that continues none, which goes to the head the
+    /// attach read, as every build from critic review F1 to ATERM-KI-1114-1414 took it, not
+    /// anywhere: a pin's ([`StateDir::publication_offset_resets`]), and every entry in flight's
+    /// but a reply's, re-witnessed onto that log there as a keyed re-post's is
+    /// ([`StateDir::rewitness_in_flight`];
+    /// [`crate::sim::world::Mutant::ReadBackFromTheAttachHead`]).
     #[cfg(test)]
     pub(crate) fn heads_at_the_attach(&self, on: bool) {
         self.heads_at_the_attach
@@ -2388,13 +2774,96 @@ impl StateDir {
 
     /// The negative control of a keyed re-post's head above a proved fork, which goes where a
     /// head on a log that continues none goes, as every build before ATERM-KI-1114-1414's own
-    /// head took it: a pin's to the head the attach read, a reply's in flight anywhere, not to
-    /// its own head ([`Head::OwnFrom`],
-    /// [`crate::sim::world::Mutant::ProvedKeyedHeadAtTheMeeting`]).
+    /// head took it: a pin's to the head the attach read, a reply's in flight anywhere, and any
+    /// other entry's in flight re-witnessed onto the proved log at the head the attach read, not
+    /// to its own head ([`Head::OwnFrom`],
+    /// [`crate::sim::world::Mutant::ProvedOwnHeadAtTheAttach`]).
     #[cfg(test)]
     pub(crate) fn proved_keyed_heads_at_the_attach(&self, on: bool) {
         self.proved_keyed_heads_at_the_attach
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a keyed re-post's entry in flight on a log the attach's log
+    /// continues none of, which the attach leaves on that log, not re-witnessed onto its own at
+    /// the head it read ([`StateDir::rewitness_in_flight`],
+    /// [`crate::sim::world::Mutant::KeyedEntryKeptOnItsLog`]).
+    #[cfg(test)]
+    pub(crate) fn keyed_entries_kept_on_their_log(&self, on: bool) {
+        self.keyed_entries_kept_on_their_log
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of an entry's own log ([`InFlight::own_log`]): an attach that moves
+    /// a keyed re-post's entry onto a log that continues none of its own, or an older build's
+    /// meeting that moves it, keeps no own log, and an attach back on that log puts it at the
+    /// head that attach read there ([`StateDir::rewitnessed_entry`],
+    /// [`crate::sim::world::Mutant::OwnLogForgotten`]).
+    #[cfg(test)]
+    pub(crate) fn own_logs_forgotten(&self, on: bool) {
+        self.own_logs_forgotten
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a re-witness keeps an entry's own log ([`StateDir::own_logs_forgotten`]).
+    fn keeps_own_logs(&self) -> bool {
+        #[cfg(test)]
+        return !self
+            .own_logs_forgotten
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        true
+    }
+
+    /// The negative control of a post's reservation put back with its entry: an attach that puts
+    /// a keyed re-post's entry back on its own log leaves its post's reservation at the head the
+    /// attach's forget put it at ([`StateDir::own_pins_back`],
+    /// [`crate::sim::world::Mutant::OwnLogPinLeft`]).
+    #[cfg(test)]
+    pub(crate) fn own_pins_left(&self, on: bool) {
+        self.own_pins_left
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether an attach leaves a post's reservation where its forget put it, its entry back on
+    /// its own log ([`StateDir::own_pins_left`]).
+    fn leaves_own_pins(&self) -> bool {
+        #[cfg(test)]
+        return self.own_pins_left.load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        false
+    }
+
+    /// The negative control of a proved step carried onto a later generation: its fork kept,
+    /// its head brought down below it, which the media holds as the fork
+    /// ([`StateDir::carry_proved_steps`],
+    /// [`crate::sim::world::Mutant::CarriedStepKeepsItsFork`]).
+    #[cfg(test)]
+    pub(crate) fn carried_steps_keep_their_fork(&self, on: bool) {
+        self.carried_steps_keep_their_fork
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether an attach re-witnesses a keyed re-post's entry kept on a log its own continues
+    /// none of ([`StateDir::keyed_entries_kept_on_their_log`]).
+    fn rewitnesses_keyed_entries(&self) -> bool {
+        #[cfg(test)]
+        return !self
+            .keyed_entries_kept_on_their_log
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        true
+    }
+
+    /// Whether the attach re-witnesses every entry in flight but a reply's at the head it read
+    /// where its log continues none of the entry's ([`StateDir::heads_at_the_attach`]).
+    fn every_entry_at_the_attach(&self) -> bool {
+        #[cfg(test)]
+        return self
+            .heads_at_the_attach
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        false
     }
 
     /// Whether a keyed head above a proved fork keeps its own head
@@ -3518,7 +3987,7 @@ impl StateDir {
                 }
             }
         }
-        let (mut bytes, mut step) = if posts.exists && !posts.attach_unwritten {
+        let (mut bytes, step) = if posts.exists && !posts.attach_unwritten {
             (Vec::new(), posts.next_step)
         } else {
             journal::Index {
@@ -3527,10 +3996,8 @@ impl StateDir {
             }
             .encode_from(posts.next_step)?
         };
-        for frame in frames {
-            bytes.extend_from_slice(&journal::encode(step, frame)?);
-            step += 1;
-        }
+        let (records, step) = journal::encode_frames(step, frames)?;
+        bytes.extend_from_slice(&records);
         let path = self.path(journal::FILE);
         let w = crate::fx::Write::Append {
             path: &path,
@@ -4124,6 +4591,32 @@ impl StateDir {
             self.write_owed_asks(&mut asks)?;
         }
         self.hand_asks_to_files()
+    }
+
+    /// Every post's sequence reservation the journal holds, by session and post id: what the
+    /// attach reads for the attempts a read from anywhere may leave undecided
+    /// (`Bridge::arm_undecided_pins`, ATERM-KI-1114-1414). An older build's `sent/` file the
+    /// journal could not take in is not among them ([`StateDir::post_pin`] reads it where it is).
+    pub(crate) fn post_pins(&self) -> io::Result<Vec<(String, u64, PublishPin)>> {
+        let posts = self.posts()?;
+        Ok(posts
+            .index()
+            .pins()
+            .map(|(sid, id, pin)| (sid.to_string(), id, pin.clone()))
+            .collect())
+    }
+
+    /// Every owed receipt that has a pin file, by session and receipt id ([`StateDir::receipt_pin`]
+    /// reads each): what the attach reads beside [`StateDir::post_pins`].
+    pub(crate) fn receipt_pin_ids(&self) -> io::Result<Vec<(String, u64)>> {
+        Ok(self
+            .files_in("acks", |name| !name.starts_with('.'))?
+            .into_iter()
+            .filter_map(|(name, _)| {
+                let (sid, rid) = name.rsplit_once('.')?;
+                Some((sid.to_string(), crate::parse_uint(rid)?))
+            })
+            .collect())
     }
 
     /// Owed receipt `rid` of `sid`'s sequence reservation, as its pin file holds it: with no head
@@ -6421,7 +6914,9 @@ impl StateDir {
     /// [`StateDir::forget_log_offsets`] at an attach whose `keep_below` is the fork of the proved
     /// step `proved` ([`Proved`], ATERM-KI-1116-7314): a reply kept on its log before takes the
     /// step's fork as a reply on a move astream's lineage names takes the lineage's, which names
-    /// generations of one id and says nothing of the step.
+    /// generations of one id and says nothing of the step. Every other entry stays on the log it
+    /// names here: a keyed re-post's kept on another log is re-witnessed onto `log` only once the
+    /// witness names `log` ([`StateDir::rewitness_in_flight`]).
     pub fn forget_log_offsets_proved(
         &self,
         head: u64,
@@ -6626,6 +7121,359 @@ impl StateDir {
         Ok(dropped)
     }
 
+    /// A KEYED RE-POST'S ENTRY IN FLIGHT ON THE LOG `now` AN ATTACH READ AT `head`, re-witnessed
+    /// there from the log it was kept on (ATERM-KI-1114-1414's step S6), or `None` where it stays
+    /// as it is: a reply (the caller's), one kept on `now`, one with no log or no head (an older
+    /// build's, read back from nowhere), and one a proved step reaches ([`Proved::reach`], which
+    /// `Bridge::read_back_from` reads it across). Every re-post of a key takes the key's sequence,
+    /// so on a log `now` continues none of (another id; the same id continuing nothing; a lineage
+    /// unknown, `steps` proving nothing) no read from anywhere tells its own attempt from an
+    /// earlier re-post's of the same words, and it is read from the head the attach read: every
+    /// record of its key under this node's producers at or above it landed since the attach, and
+    /// only this re-post publishes its key while it stands. So it goes onto `now` at `From(head)`,
+    /// no own head ([`Head::own`]), its pin's head with it, its winner's offset kept, once the
+    /// witness names `now` and before the replay publishes there
+    /// ([`StateDir::rewitness_in_flight`]): a copy the replay publishes lands at or above it, and a
+    /// later attach to the same log reads the entry from that head and finds the copy, though a
+    /// cut dropped its dedup key. Not complete: an attempt a carried cut kept below `head` goes
+    /// unread, and the re-post is published again, the key's second record where that cut dropped
+    /// its key (ATERM-KI-1114-1414). Where `now` continues its log by astream's lineage it goes
+    /// onto `now` down to that fork ([`Head::min`]), as a read back brings it down
+    /// (`Bridge::read_back_from`): it then stands on the log the attach read, which a later move's
+    /// lineage reaches however short its window. Each build from critic review F1 to this step
+    /// left the entry on its log and read it from where the node met the log's line, the attach's
+    /// head at the first attach, brought down to each move's fork since (the meeting its witness
+    /// kept, [`LogWitness::older_meeting`]), and an entry kept on a generation of that line since
+    /// the meeting not at all. NEGATIVE CONTROLS: `StateDir::keyed_entries_kept_on_their_log` (the
+    /// seam `Mutant::KeyedEntryKeptOnItsLog` sets) leaves a keyed entry on its log;
+    /// `StateDir::heads_at_the_attach` (`Mutant::ReadBackFromTheAttachHead`) re-witnesses an
+    /// unkeyed one at the head the attach read too, where its log continues none;
+    /// `StateDir::proved_keyed_heads_at_the_attach` (`Mutant::ProvedOwnHeadAtTheAttach`)
+    /// re-witnesses a keyed one at the head the attach read across a proved step too, its head
+    /// above the step's fork.
+    ///
+    /// AN ENTRY MOVED ONTO A LOG THAT CONTINUES NONE KEEPS ITS OWN LOG ([`InFlight::own_log`]):
+    /// the log it stood on, its head and its pin's there, from its first such move on (here and
+    /// at an older build's meeting, [`StateDir::rewitness_at_an_older_meeting`]). Where `now` is
+    /// that log, or one its lineage or a proved step reaches it on ([`StateDir::reaches`]), the
+    /// entry goes back there first, its own log forgotten (its post's reservation with it, by the
+    /// caller: [`StateDir::own_pins_back`]), and is re-witnessed from there as an
+    /// entry never moved is: back on that log at its own head, where an attempt its replay
+    /// published there, kept by a carried cut below the head this attach read, its dedup key
+    /// dropped, is read back and settled, as every build before the step kept it (the second
+    /// review of step S6, confirmed: an attach refused or killed after the move, or one whose
+    /// replay's answer was lost, then an attach back on the entry's own log, read it from that
+    /// log's head and landed the key's second record). NEGATIVE CONTROL
+    /// (`StateDir::own_logs_forgotten`, the seam `Mutant::OwnLogForgotten` sets): no own log is
+    /// kept, and the attach back puts the entry at the head it read.
+    fn rewitnessed_entry(
+        &self,
+        entry: &InFlight,
+        head: u64,
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+        steps: &[Proved],
+    ) -> Option<InFlight> {
+        let was = entry.log?;
+        let at = entry.at?;
+        if let Some(own) = self.own_log_reached(entry, now, lineage, steps) {
+            let back = InFlight {
+                log: Some(own.log),
+                at: Some(own.at),
+                pin: PublishPin {
+                    at: own.pin_at,
+                    ..entry.pin.clone()
+                },
+                own_log: None,
+                ..entry.clone()
+            };
+            return Some(
+                self.rewitnessed_entry(&back, head, now, lineage, steps)
+                    .unwrap_or(back),
+            );
+        }
+        let keyed = entry.pin.via_key && self.rewitnesses_keyed_entries();
+        if was == now || !(keyed || self.every_entry_at_the_attach()) {
+            return None;
+        }
+        let onto = |to: &dyn Fn(Head) -> Head| InFlight {
+            log: Some(now),
+            at: Some(to(at)),
+            pin: PublishPin {
+                at: entry.pin.at.map(to),
+                ..entry.pin.clone()
+            },
+            ..entry.clone()
+        };
+        let off_its_own_log = |to: &dyn Fn(Head) -> Head| InFlight {
+            own_log: self.own_log_off(entry),
+            ..onto(to)
+        };
+        let at_the_attach = |_: Head| Head::From(head);
+        if let Some(fork) = lineage.and_then(|lineage| now.continues(was, lineage)) {
+            return keyed.then(|| onto(&|at: Head| at.min(fork.min(head))));
+        }
+        if let Some((fork, moved)) = Proved::reach(steps, was, now, lineage) {
+            let above = at.below_a_proved_fork(fork.min(moved)).is_none();
+            return (keyed && above && !self.keyed_own_heads())
+                .then(|| off_its_own_log(&at_the_attach));
+        }
+        Some(off_its_own_log(&at_the_attach))
+    }
+
+    /// The own log `entry` goes back to at an attach to `now` ([`StateDir::rewitnessed_entry`]):
+    /// the one it keeps ([`InFlight::own_log`]), where it is not the log `entry` stands on and
+    /// `now` is it or reaches it ([`StateDir::reaches`]); none under
+    /// [`StateDir::own_logs_forgotten`].
+    fn own_log_reached(
+        &self,
+        entry: &InFlight,
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+        steps: &[Proved],
+    ) -> Option<OwnLog> {
+        let was = entry.log?;
+        entry.own_log.filter(|own| {
+            own.log != was && self.keeps_own_logs() && Self::reaches(own.log, now, lineage, steps)
+        })
+    }
+
+    /// Whether a head kept on `was` stands on `now`: `now` is `was`, a later generation of it
+    /// astream's `lineage` continues it on, or a log a proved step in `steps` reaches it on
+    /// ([`Proved::reach`]).
+    fn reaches(
+        was: astream_broker::LogIdentity,
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+        steps: &[Proved],
+    ) -> bool {
+        was == now
+            || lineage.and_then(|l| now.continues(was, l)).is_some()
+            || Proved::reach(steps, was, now, lineage).is_some()
+    }
+
+    /// The own log `entry` keeps as an attach moves it off the log it stands on onto one that
+    /// continues none of it ([`InFlight::own_log`]): the one it kept already, else that log and
+    /// its heads there (none under [`StateDir::own_logs_forgotten`]).
+    fn own_log_off(&self, entry: &InFlight) -> Option<OwnLog> {
+        if !self.keeps_own_logs() {
+            return None;
+        }
+        entry.own_log.or_else(|| {
+            Some(OwnLog {
+                log: entry.log?,
+                at: entry.at?,
+                pin_at: entry.pin.at,
+            })
+        })
+    }
+
+    /// THE KEYED ENTRIES IN FLIGHT KEPT ON ANOTHER LOG, RE-WITNESSED onto `now`, the log an attach
+    /// read at `head` and its witness names (ATERM-KI-1114-1414's step S6): each entry but a
+    /// reply's goes where [`StateDir::rewitnessed_entry`] puts it by the proved `steps`, and each
+    /// one it puts back on its own log takes its post's reservation with it
+    /// ([`StateDir::own_pins_back`]), on the media before this returns and before the attach's
+    /// replay publishes on `now`. Made at every
+    /// attach once its witness names its log (`Bridge::attach_broker`), never before: an attach
+    /// refused before its witness moved (the window floor, presence, the mesh's halts, the
+    /// witness's own write) leaves each entry on its own log at its own head, where a later
+    /// attach that finds the log the witness still names reads it back as before; one killed
+    /// after the witness moved and before this is finished by the next attach to that log, which
+    /// no replay or drain published the entry on since. So an entry a build from before critic
+    /// review F1 kept on another log, its witness naming this one and no meeting, goes onto it at
+    /// the head this build's first attach read, as every build from F1 met the log at its first
+    /// attach. Nothing is read from the media here but the journal it holds, and nothing is
+    /// written where nothing moves.
+    pub(crate) fn rewitness_in_flight(
+        &self,
+        head: u64,
+        now: Option<astream_broker::LogIdentity>,
+        lineage: Option<&astream_broker::Lineage>,
+        steps: &[Proved],
+    ) -> io::Result<()> {
+        let Some(now) = now else {
+            return Ok(());
+        };
+        let mut moved = Vec::new();
+        let mut back = Vec::new();
+        for (_, entry) in self.in_flight()? {
+            if crate::body::Body::decode(&entry.body).0.re.is_some() {
+                continue;
+            }
+            let Some(placed) = self.rewitnessed_entry(&entry, head, now, lineage, steps) else {
+                continue;
+            };
+            if self.own_log_reached(&entry, now, lineage, steps).is_some() {
+                back.push(placed.pin.clone());
+            }
+            moved.push(placed);
+        }
+        let pins = self.own_pins_back(&back)?;
+        self.journal_in_flight(pins, moved)
+    }
+
+    /// A POST'S RESERVATION GOES BACK WITH ITS ENTRY (the third review of ATERM-KI-1114-1414's
+    /// step S6, confirmed): each reservation of a keyed re-post (`via_key`) at the sequence of an
+    /// entry an attach put back on its own log, in that entry's words (its pin's identity), its
+    /// head put where the entry's pin's head now stands, `entries` the pins of those entries as
+    /// placed ([`StateDir::rewitnessed_entry`]). The attach's forget put it at the head the attach
+    /// read (`StateDir::publication_offset_resets`: a log judged to replace the one the witness
+    /// named, the log the entry was moved onto), above an attempt a carried cut kept below that
+    /// head on the entry's own log; the replay reads the entry back from its own head and settles
+    /// it there, but the drain's retry of the post aterm still lists reads from the reservation's
+    /// head (`Bridge::read_back_for_its_retry`), and from there found none and published the
+    /// key's second record (an attach killed once its pass moved the entry, then a bridge on the
+    /// same state attaching back to the entry's own log). One whose head stands there already, or
+    /// that names no head there, stays. NEGATIVE CONTROL (`StateDir::own_pins_left`, the seam
+    /// `Mutant::OwnLogPinLeft` sets): every reservation stays where the forget put it.
+    fn own_pins_back(&self, entries: &[PublishPin]) -> io::Result<Vec<(String, u64, PublishPin)>> {
+        if entries.is_empty() || self.leaves_own_pins() {
+            return Ok(Vec::new());
+        }
+        let posts = self.posts()?;
+        Ok(posts
+            .index()
+            .pins()
+            .filter_map(|(sid, id, pin)| {
+                let at = entries
+                    .iter()
+                    .find(|entry| {
+                        pin.via_key
+                            && entry.seq == pin.seq
+                            && entry.identity.is_some()
+                            && entry.identity == pin.identity
+                    })?
+                    .at?;
+                (pin.at != Some(at)).then(|| {
+                    (
+                        sid.to_string(),
+                        id,
+                        PublishPin {
+                            at: Some(at),
+                            ..pin.clone()
+                        },
+                    )
+                })
+            })
+            .collect())
+    }
+
+    /// Each of `pins` reserved (by session and post id) and then each of `moved` journaled in
+    /// flight in its sequence's place, in one write, on the media before this returns: a write
+    /// cut short keeps a prefix, so an entry stands where it was put only once each reservation
+    /// that goes with it does ([`StateDir::own_pins_back`]). Nothing is read or written where
+    /// both are empty.
+    fn journal_in_flight(
+        &self,
+        pins: Vec<(String, u64, PublishPin)>,
+        moved: Vec<InFlight>,
+    ) -> io::Result<()> {
+        if pins.is_empty() && moved.is_empty() {
+            return Ok(());
+        }
+        let mut posts = self.posts()?;
+        let frames = pins
+            .into_iter()
+            .map(|(sid, id, pin)| journal::Frame::Reserve { sid, id, pin })
+            .chain(moved.into_iter().map(journal::Frame::InFlight))
+            .collect();
+        self.append_post_frames(&mut posts, frames)?;
+        self.sync_posts(&mut posts, aterm_durable::Flush::Durable)
+    }
+
+    /// THE MEETING AN OLDER BUILD'S WITNESS NAMES ([`LogWitness::older_meeting`]), where it reads.
+    #[must_use]
+    pub(crate) fn older_meeting(&self) -> Option<(astream_broker::LogIdentity, u64)> {
+        self.read("bus-log")
+            .and_then(|text| LogWitness::older_meeting(&text))
+    }
+
+    /// AN OLDER BUILD'S MEETING, RE-WITNESSED (ATERM-KI-1114-1414's step S6): each keyed re-post's
+    /// entry in flight that build kept on another log than `log`, the log its witness names,
+    /// goes onto `log` at the meeting's head (`met`, [`LogWitness::older_meeting`]), `From`, its
+    /// pin's head with it, its winner's offset kept, keeping the log it stood on as its own
+    /// ([`InFlight::own_log`]), on the media before this returns. That build read such an entry
+    /// back from the meeting wherever the log it read continued the entry's by neither astream's
+    /// lineage nor a stored proved step: a copy its replay published there lies at or above the
+    /// meeting's head, which the next attach brings down or up as a move or another log does
+    /// ([`StateDir::rewitness_in_flight`]). Where the log an attach reads does continue the
+    /// entry's own, by either, that attach's pass puts it back on its own log at its own head
+    /// first ([`StateDir::rewitnessed_entry`]) and re-witnesses it from there, as that build read
+    /// it across the step or down to the move's fork; so what is moved depends on the witness
+    /// alone, never on the log an attach that may yet be refused reads (the second review of the
+    /// step, confirmed: decided against that log, an attach refused before its witness moved
+    /// left the entry where an attach back on the witnessed log read it otherwise than that
+    /// build). Every other entry stays: one kept on `log`; one on a generation of the meeting's
+    /// line at or since the meeting's, which that build published again at its pin, read back
+    /// from nowhere; a reply, one with no log or no head; and every one where the meeting is of
+    /// another line than `log`'s. A second call moves nothing: each entry moved stands on `log`.
+    /// NEGATIVE CONTROLS (`Mutant::OlderMeetingUnread`: the attach does not ask;
+    /// `Mutant::OwnLogForgotten`: a moved entry keeps no own log, and one the attach's log reaches
+    /// across a stored step stays at the meeting's head, below the step's fork).
+    pub(crate) fn rewitness_at_an_older_meeting(
+        &self,
+        log: astream_broker::LogIdentity,
+        met: (astream_broker::LogIdentity, u64),
+    ) -> io::Result<()> {
+        self.rewitness_at_an_older_meeting_but(log, met, |_| false)
+    }
+
+    /// [`StateDir::rewitness_at_an_older_meeting`]'s NEGATIVE CONTROL
+    /// (`Mutant::OlderMeetingJudgedOnTheAttachsLog`, the second build of step S6): an entry `now`,
+    /// the log an attach reads, continues by astream's `lineage` or a stored proved step, or one
+    /// kept on `now`, stays.
+    #[cfg(test)]
+    pub(crate) fn rewitness_at_an_older_meeting_judged_on(
+        &self,
+        log: astream_broker::LogIdentity,
+        met: (astream_broker::LogIdentity, u64),
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+        steps: &[Proved],
+    ) -> io::Result<()> {
+        self.rewitness_at_an_older_meeting_but(log, met, |was| {
+            Self::reaches(was, now, lineage, steps)
+        })
+    }
+
+    /// [`StateDir::rewitness_at_an_older_meeting`], an entry on a log `stays` names left too.
+    fn rewitness_at_an_older_meeting_but(
+        &self,
+        log: astream_broker::LogIdentity,
+        met: (astream_broker::LogIdentity, u64),
+        stays: impl Fn(astream_broker::LogIdentity) -> bool,
+    ) -> io::Result<()> {
+        let (met, from) = met;
+        if met.id != log.id {
+            return Ok(());
+        }
+        let met_there = |entry: &InFlight| {
+            let (Some(was), Some(_)) = (entry.log, entry.at) else {
+                return false;
+            };
+            let since = was.id == met.id && was.generation >= met.generation;
+            !(was == log || since || stays(was))
+                && entry.pin.via_key
+                && crate::body::Body::decode(&entry.body).0.re.is_none()
+        };
+        let moved: Vec<InFlight> = self
+            .in_flight()?
+            .into_iter()
+            .filter(|(_, entry)| met_there(entry))
+            .map(|(_, entry)| InFlight {
+                log: Some(log),
+                at: Some(Head::From(from)),
+                pin: PublishPin {
+                    at: entry.pin.at.map(|_| Head::From(from)),
+                    ..entry.pin.clone()
+                },
+                own_log: self.own_log_off(&entry),
+                ..entry
+            })
+            .collect();
+        self.journal_in_flight(Vec::new(), moved)
+    }
+
     /// What this node knows of the bus log it reads ([`LogWitness`]), or `None` before its first attach recorded anything.
     #[must_use]
     pub fn log_witness(&self) -> Option<LogWitness> {
@@ -6639,25 +7487,144 @@ impl StateDir {
     }
 
     /// The records this node told its endpoint ([`ToldSamples`]): none where none were recorded,
-    /// or what is there does not read.
+    /// or `told-samples` does not read ([`ToldSamples::parse`], every build's grammar: the
+    /// anchors); with the rows of `told-history` beside them where it reads and names the same
+    /// log and move, and its rows below the move's cut where it names a move one ahead of theirs
+    /// ([`ToldSamples::union`]), else the anchors alone. A history one move ahead was left by a
+    /// move's flush whose second write a refusal or a kill stopped ([`StateDir::set_told_samples`]);
+    /// a history of any other header by a reset whose second write failed, or by a build before
+    /// it, which reads and writes `told-samples` alone and moves or resets it with no word to the
+    /// history. NEGATIVE CONTROLS: `Mutant::ToldHistoryOfAnotherHeader`
+    /// ([`StateDir::told_history_of_any_header`]), a history of any header read beside them, its
+    /// rows of another log passing for records of this one; and
+    /// `Mutant::ToldHistoryOfTheMoveAheadUnread` ([`StateDir::told_history_of_the_same_header_only`]),
+    /// the same header alone, so the rows a move's flush kept below its fork are on the disk under
+    /// a header no read accepts.
     #[must_use]
     pub fn told_samples(&self) -> ToldSamples {
+        let Some(samples) = self
+            .read("told-samples")
+            .and_then(|text| ToldSamples::parse(&text))
+        else {
+            return ToldSamples::default();
+        };
+        self.told_history_beside(samples)
+    }
+
+    /// `samples` with the rows of `told-history` beside them ([`StateDir::told_samples`]).
+    fn told_history_beside(&self, samples: ToldSamples) -> ToldSamples {
+        let Some(history) = self
+            .read("told-history")
+            .and_then(|text| ToldSamples::parse_history(&text))
+        else {
+            return samples;
+        };
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.told_history_of_any_header.load(SeqCst) {
+                return samples.union_rows(&history).unwrap_or(samples);
+            }
+            if self.told_history_of_the_same_header_only.load(SeqCst) {
+                return samples
+                    .union_of_the_same_header(&history)
+                    .unwrap_or(samples);
+            }
+        }
+        samples.union(&history).unwrap_or(samples)
+    }
+
+    /// The records this node told its endpoint as `told-samples` alone names them, every build
+    /// before's read (the negative control of the history's read at a bridge's start,
+    /// `Mutant::ToldHistoryUnread`).
+    #[cfg(test)]
+    pub(crate) fn told_samples_alone(&self) -> ToldSamples {
         self.read("told-samples")
             .and_then(|text| ToldSamples::parse(&text))
             .unwrap_or_default()
     }
 
-    /// Record the records this node told its endpoint, as written: a power cut that takes it back
-    /// ends the endpoint's sessions too.
+    /// Record the records this node told its endpoint, as written (a power cut that takes them
+    /// back ends the endpoint's sessions too): every row in `told-history` first
+    /// ([`ToldSamples::render_history`]), then the anchors in `told-samples`
+    /// ([`ToldSamples::render`], every build's grammar), so every row is on the disk before the
+    /// samples change, and a refusal of the second write, or a kill between them, leaves the
+    /// history under the new header beside the samples under the old, which
+    /// [`StateDir::told_samples`] reads: under the same header, or, for a move's flush, one move
+    /// ahead, below its cut. Either refusal is this one's. NEGATIVE CONTROLS:
+    /// `Mutant::ToldHistoryWrittenLast` ([`StateDir::told_history_written_last`]), the samples
+    /// first, so a refused or killed second write of a move's flush leaves the samples of the
+    /// move beside the history before it, which no read accepts; and
+    /// `Mutant::ToldHistoryWithoutTheAnchors` ([`StateDir::told_history_without_the_anchors`]),
+    /// the rows that are no anchor alone in the history, so a row the move makes an anchor is on
+    /// neither file.
     pub fn set_told_samples(&self, samples: &ToldSamples) -> io::Result<()> {
+        #[cfg(test)]
+        let (last, history) = {
+            use std::sync::atomic::Ordering::SeqCst;
+            let history = if self.told_history_without_the_anchors.load(SeqCst) {
+                samples.render_history_without_the_anchors()
+            } else {
+                samples.render_history()
+            };
+            (self.told_history_written_last.load(SeqCst), history)
+        };
+        #[cfg(not(test))]
+        let (last, history) = (false, samples.render_history());
+        if last {
+            self.write("told-samples", &samples.render())?;
+            return self.write("told-history", &history);
+        }
+        self.write("told-history", &history)?;
         self.write("told-samples", &samples.render())
     }
 
     /// Record that no record is told, on the media: before aterm is told a log that continues
     /// none, which forgets what it holds (`Bridge::attach_broker`), so samples of the log before
-    /// never prove a later attach a step aterm no longer holds.
+    /// never prove a later attach a step aterm no longer holds. `told-samples` is the commit
+    /// point; `told-history` is reset after it as a best effort, since a history whose header
+    /// is not the samples' is never read beside them ([`StateDir::told_samples`]).
     pub fn reset_told_samples(&self) -> io::Result<()> {
-        self.write_durable("told-samples", &ToldSamples::default().render())
+        self.write_durable("told-samples", &ToldSamples::default().render())?;
+        if let Err(e) = self.write("told-history", &ToldSamples::default().render_history()) {
+            eprintln!(
+                "aterm-link: could not reset the history of the records told aterm: {e}; its \
+                 header names the log before, so it is not read beside the samples"
+            );
+        }
+        Ok(())
+    }
+
+    /// The negative control of the order of the told samples' two files
+    /// ([`StateDir::set_told_samples`], [`crate::sim::world::Mutant::ToldHistoryWrittenLast`]).
+    #[cfg(test)]
+    pub(crate) fn told_history_written_last(&self, on: bool) {
+        self.told_history_written_last
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of the anchors in the history ([`StateDir::set_told_samples`],
+    /// [`crate::sim::world::Mutant::ToldHistoryWithoutTheAnchors`]).
+    #[cfg(test)]
+    pub(crate) fn told_history_without_the_anchors(&self, on: bool) {
+        self.told_history_without_the_anchors
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of the history one move ahead ([`StateDir::told_samples`],
+    /// [`crate::sim::world::Mutant::ToldHistoryOfTheMoveAheadUnread`]).
+    #[cfg(test)]
+    pub(crate) fn told_history_of_the_same_header_only(&self, on: bool) {
+        self.told_history_of_the_same_header_only
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of the history's header gate ([`StateDir::told_samples`],
+    /// [`crate::sim::world::Mutant::ToldHistoryOfAnotherHeader`]).
+    #[cfg(test)]
+    pub(crate) fn told_history_of_any_header(&self, on: bool) {
+        self.told_history_of_any_header
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The proved steps this node took ([`Proved`]), oldest first; a line that does not read is
@@ -6667,6 +7634,21 @@ impl StateDir {
         self.read("proved-logs")
             .map(|text| Proved::parse_all(&text))
             .unwrap_or_default()
+    }
+
+    /// [`StateDir::proved_steps`] for a reader that decides by them what it cannot take back
+    /// (`aterm link notify`'s carry of its store, `notify::proved_steps`): none where the file
+    /// truly is not there, and an `Err` where it is and does not read, so no unread file is
+    /// taken for a state dir that proved no step. A line that does not read is passed.
+    ///
+    /// # Errors
+    /// `proved-logs` exists and cannot be read (a directory, unreadable, over its bound, not
+    /// UTF-8).
+    pub(crate) fn proved_steps_present(&self) -> io::Result<Vec<Proved>> {
+        Ok(self
+            .read_present("proved-logs")?
+            .map(|text| Proved::parse_all(&text))
+            .unwrap_or_default())
     }
 
     /// Record `step` after the proved steps there, the newest [`Proved::MAX`] kept, on the media
@@ -6681,12 +7663,41 @@ impl StateDir {
         Ok(steps)
     }
 
+    /// The proved `steps` carried onto `now` ([`Proved::carried`]), on the media before this
+    /// returns where any moved: `None` where none did, and nothing is written.
+    pub(crate) fn carry_proved_steps(
+        &self,
+        steps: &[Proved],
+        now: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+    ) -> io::Result<Option<Vec<Proved>>> {
+        #[cfg(test)]
+        let carried = if self
+            .carried_steps_keep_their_fork
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Proved::carried_keeping_the_fork(steps, now, lineage)
+        } else {
+            Proved::carried(steps, now, lineage)
+        };
+        #[cfg(not(test))]
+        let carried = Proved::carried(steps, now, lineage);
+        if carried == steps {
+            return Ok(None);
+        }
+        self.write_durable("proved-logs", &Proved::render_all(&carried))?;
+        Ok(Some(carried))
+    }
+
     /// Record the witness of a log the attach judged to replace the one before it, on the media
-    /// before this returns. The head the node met that log at ([`Met`]) is the floor of a keyed
-    /// re-post's read back of a head kept on an earlier log (`Bridge::read_back_from`'s `keyed`;
-    /// every other read back there starts anywhere), and the attach's replay publishes above it
-    /// next: a witness a power cut took back to the earlier log would have the
-    /// next attach meet the log again, at a later head above the copies that replay published.
+    /// before this returns. The attach put each keyed re-post's pin at the head it read there
+    /// ([`StateDir::publication_offset_resets`]; a pin names no log), and its replay publishes
+    /// above it next: a witness a power cut took back to the earlier log would have the next
+    /// attach judge the log replaced again and put those pins at a later head, above the copies
+    /// that replay published, where a retry no longer finds one. The entries in flight the attach
+    /// re-witnesses onto the log once this names it ([`StateDir::rewitness_in_flight`]) name their
+    /// log, and stay. It is also what
+    /// keeps the mirror pin's drop and a torn file's memory (sim item S7) on the media with it.
     pub fn rebase_log_witness(&self, witness: &LogWitness) -> io::Result<()> {
         self.write_durable("bus-log", &witness.render())
     }

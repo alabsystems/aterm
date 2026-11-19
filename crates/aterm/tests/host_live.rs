@@ -5,6 +5,7 @@
 
 #![cfg(unix)]
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -211,28 +212,22 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     })
 }
 
-/// How often [`until_read`] reads the process tree: a sweep of the process table, so not once a
-/// poll (as `aterm_spec::wait`'s own tick).
-const TREE_TICK: Duration = Duration::from_millis(500);
-
 /// Polls `probe` every `gap` until `answer` finds what the wait is for in what it read, and
-/// returns that. A hang detector, not a latency budget: it waits for as long as what this test
-/// process started (the instance, its stand-ins) keeps working, and fails, naming `what` and what
-/// `last` renders of the last read, once a reading of their tree just taken shows no CPU or I/O
-/// progress for one whole `within` ([`aterm_uds::deadline::ProcessProgressProbe::read_descendants`],
-/// with this process's own work left out, the children its polls ran and reaped included), or
-/// once [`aterm_spec::wait::WORKING_GUARD`] passed in all. A loaded Mac stretches the wall clock
+/// returns that. A hang detector, not a latency budget ([`crate::patience`]): it waits for as
+/// long as what this test process started (the instance, its stand-ins) keeps working, and
+/// fails, naming `what` and what `last` renders of the last read, once a reading of their tree
+/// just taken shows no CPU or I/O progress for one whole `within`, or once
+/// [`aterm_spec::wait::WORKING_GUARD`] passed in all. A loaded Mac stretches the wall clock
 /// without bound, so a wall-clock `within` failed tests whose instance was only slow
 /// (`a_wall_the_host_resumes_is_no_stop_and_one_nobody_answers_is` at 60 s with every core of
 /// the Mac busy; `an_agent_that_exits_unasked_is_relaunched_on_its_conversation` at load 35,
-/// its relaunch under way). A reading that fails or cannot be compared is no evidence of a
-/// stall: the window opens again at the next one, as in `aterm_spec::wait`. Everything else the
-/// tree does is progress too, and holds the window open until the guard ends the wait: what the
-/// instance does to serve a probe that asks it (an `aterm ctl` request, every poll), another
-/// test's instance beside this one in the binary, and a stand-in's poll loop (each `sleep` it
-/// starts changes the tree's members). `probe` runs once a poll, so a check that must hold at
-/// every read (a file that must not appear, a key that must not be read) goes in it; `gap` is
-/// the caller's, so a probe that starts a process or asks the instance keeps its own pace.
+/// its relaunch under way). Everything else the tree does is progress too, and holds the window
+/// open until the guard ends the wait: what the instance does to serve a probe that asks it (an
+/// `aterm ctl` request, every poll), another test's instance beside this one in the binary, and
+/// a stand-in's poll loop (each `sleep` it starts changes the tree's members). `probe` runs once
+/// a poll, so a check that must hold at every read (a file that must not appear, a key that
+/// must not be read) goes in it; `gap` is the caller's, so a probe that starts a process or asks
+/// the instance keeps its own pace.
 #[track_caller]
 fn until_read<T, U>(
     within: Duration,
@@ -242,44 +237,23 @@ fn until_read<T, U>(
     answer: impl Fn(&T) -> Option<U>,
     last: impl Fn(&T) -> String,
 ) -> U {
-    let own = std::process::id();
-    let mut tree = aterm_uds::deadline::ProcessProgressProbe::default();
-    let began = Instant::now();
-    let tick = TREE_TICK.min(within / 4);
-    let mut seen = None;
-    let mut read_at: Option<Instant> = None;
-    let mut worked_at = began;
+    let mut patience = crate::patience::Patience::new(within);
     loop {
         let got = probe();
         if let Some(found) = answer(&got) {
             return found;
         }
-        let at = Instant::now();
-        if read_at.is_none_or(|read| at.saturating_duration_since(read) >= tick) {
-            read_at = Some(at);
-            match tree.read_descendants(own) {
-                Some(generation) if seen == Some(generation) => {}
-                reading => {
-                    seen = reading;
-                    worked_at = at;
-                }
-            }
-            // Judged on the reading just taken, as `aterm_spec::wait` judges: between readings
-            // the silence since `worked_at` is not all observed.
-            if at.saturating_duration_since(worked_at) >= within {
-                panic!(
-                    "{what}: what this test started made no CPU or I/O progress for {within:?}; \
-                     last: {}",
-                    last(&got)
-                );
-            }
-        }
-        if at.saturating_duration_since(began) >= aterm_spec::wait::WORKING_GUARD {
-            panic!(
-                "{what}: what this test started kept working for {:?} without it; last: {}",
-                aterm_spec::wait::WORKING_GUARD,
+        match patience.spent() {
+            None => {}
+            Some(crate::patience::Spent::Stalled(window)) => panic!(
+                "{what}: what this test started made no CPU or I/O progress for {window:?}; \
+                 last: {}",
                 last(&got)
-            );
+            ),
+            Some(crate::patience::Spent::Guard(guard)) => panic!(
+                "{what}: what this test started kept working for {guard:?} without it; last: {}",
+                last(&got)
+            ),
         }
         std::thread::sleep(gap);
     }
@@ -632,6 +606,7 @@ fn write_world(tmp: &Path) {
          # Read subprocesses stay in this fake's foreground process group.\n\
          set +m\n\
          log=$1; shift\n\
+         printf 'started pid=%s script=%s\\n' \"$$\" \"$0\" > \"$log.steps\"\n\
          printf '\\033[2J\\033[H'\n\
          printf 'x\\b \\b'\n\
          if ! test -t 0 || ! old=$(stty -g 2>\"$log.dd\") || ! stty -icanon -echo min 1 time 0 2>>\"$log.dd\"; then\n\
@@ -639,6 +614,7 @@ fn write_world(tmp: &Path) {
          \x20 cat \"$log.dd\" >> \"$log.noread\"\n\
          \x20 exit 74\n\
          fi\n\
+         printf 'tty-ready\\n' >> \"$log.steps\"\n\
          for scene in \"$@\"; do\n\
          \x20 case \"$scene\" in *.late) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;; esac\n\
          \x20 printf '\\033[?2026h'\n\
@@ -646,6 +622,7 @@ fn write_world(tmp: &Path) {
          \x20 cat \"$scene\"\n\
          \x20 r=$(grep -n '^❯' \"$scene\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
          \x20 printf '\\033[?2026l'\n\
+          printf 'drawn scene=%s\\n' \"$scene\" >> \"$log.steps\"\n\
          \x20 case \"$scene\" in\n\
          \x20 *.hold) sleep {HOLD_S}; continue ;;\n\
          \x20 *.until) n=0; while [ ! -e \"$log.release\" ] && [ $n -lt {UNTIL_MAX_TENTHS} ]; do sleep 0.1; n=$((n+1)); done; continue ;;\n\
@@ -653,6 +630,7 @@ fn write_world(tmp: &Path) {
          \x20 *.look|*.over) while [ ! -e \"$log.next\" ]; do sleep 0.1; done; rm -f \"$log.next\"; continue ;;\n\
          \x20 *.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; continue ;;\n\
          \x20 esac\n\
+          printf 'reading-one-byte\\n' >> \"$log.steps\"\n\
          \x20 k=$(dd bs=1 count=1 2>\"$log.dd\" | od -An -c | tr -d ' ')\n\
          \x20 if ! grep -q '^1+0 records in' \"$log.dd\"; then\n\
          \x20   tr '\\n' ' ' < \"$log.dd\" >> \"$log.noread\"; echo >> \"$log.noread\"\n\
@@ -662,7 +640,9 @@ fn write_world(tmp: &Path) {
          \x20 [ -z \"$k\" ] && k=space\n\
          \x20 case \"$k\" in 033) k=\"$k$(dd bs=1 count=2 2>/dev/null | od -An -c | tr -d ' ')\" ;; esac\n\
          \x20 printf '%s\\n' \"$k\" >> \"$log\"\n\
+          printf 'read-complete key=%s\\n' \"$k\" >> \"$log.steps\"\n\
          done\n\
+         printf 'done\\n' >> \"$log.steps\"\n\
          stty \"$old\"\n\
          printf '\\033[2J\\033[H'\n"
     );
@@ -1447,12 +1427,41 @@ fn the_host_dismisses_every_rating_card_and_presses_nothing_on_a_card_over_a_wor
         for ((log, screen, what), sid) in busy.into_iter().zip(busy_tabs) {
             runs.push(scope.spawn(move || {
                 start_fake_in(inst, sid, log, &[screen]);
-                until(
-                    HANG,
-                    &format!("agent=idle, the turn's rest under its workflow, under {what}"),
-                    || status_of(inst, sid),
-                    |s| field(s, "agent") == Some("idle"),
-                );
+                let idle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    until(
+                        HANG,
+                        &format!("agent=idle, the turn's rest under its workflow, under {what}"),
+                        || status_of(inst, sid),
+                        |s| field(s, "agent") == Some("idle"),
+                    );
+                }));
+                if let Err(why) = idle {
+                    let steps = std::fs::read_to_string(inst.tmp.join(format!("{log}.steps")));
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "{what}: stand-in progress: {steps:?}"
+                    );
+                    let sel = format!("@{sid}");
+                    let timeline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        headless_boot::ctl(inst, &[&sel, "timeline", "since=0"])
+                    }));
+                    match timeline {
+                        Ok(out) => {
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "{what}: timeline: {}",
+                                headless_boot::said(&out)
+                            );
+                        }
+                        Err(_) => {
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "{what}: timeline diagnostic unavailable"
+                            );
+                        }
+                    }
+                    std::panic::resume_unwind(why);
+                }
                 ctl_ok(inst, &[&format!("@{sid}"), "key", "z"]);
                 keys_until(inst, log, &["z"], HANG);
                 program_in_is(inst, sid, "sh", HANG);
@@ -3050,11 +3059,8 @@ fn worker_line_of(inst: &Instance, from: Option<&str>) -> String {
         let mut stdin = child.stdin.take().expect("its stdin");
         std::io::Write::write_all(&mut stdin, b"the task").expect("write the task");
         drop(stdin);
-        crate::child_output::wait_and_read(
-            child,
-            Instant::now() + headless_boot::CLIENT_EXIT_DEADLINE,
-        )
-        .expect("aterm ctl exits")
+        crate::child_output::wait_and_read(child, headless_boot::CLIENT_NO_PROGRESS_WINDOW)
+            .expect("aterm ctl exits")
     });
     assert!(
         out.status.success(),

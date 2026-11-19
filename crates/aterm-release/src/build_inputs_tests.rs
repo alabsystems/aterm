@@ -609,3 +609,95 @@ fn the_content_digest_of_a_fixed_tree_is_schema_v2s() {
         )
     );
 }
+
+/// A SEAL WHOSE STOCK RELEASE IS NOT IN PLACE NAMES WHAT PUTS IT THERE: on this Mac's Trust, the
+/// rustup row's shim and SDK, the seal's machine roots for a stock release no rustup home holds
+/// fail at that release's sysroot with rustup's own words, then the remedy [`stock_gap_remedy`]
+/// reads back: `verify provision rustup` in a checkout whose lock names that release
+/// (`buildplan::stock_release_remedy`, here, where this checkout's lock names it), which installs
+/// it with the stds the seal hashes. Any other failure carries no such remedy. A Mac whose Trust,
+/// shim or SDK does not resolve says nothing of the stock part and ends the test COULD NOT RUN.
+/// NEGATIVE CONTROL: without the [`stock_gap`] on the sysroot's step the failure carries no
+/// remedy, and the `stock_gap_remedy` unwrap fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_seal_whose_stock_release_is_not_in_place_names_what_puts_it_there() {
+    let absent = "1.0.0";
+    let resolved = (|| -> Result<_, String> {
+        let trust = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
+        let home = std::env::var_os("HOME").ok_or("no HOME")?;
+        let stock = crate::buildplan::Stock::under(&home, absent)?;
+        stock.shim()?;
+        Ok((trust, stock, AppleSdk::capture()?))
+    })();
+    let (trust, stock, sdk) = resolved.unwrap_or_else(|why| {
+        aterm_spec::host::could_not_run(format!(
+            "the seal's Trust, stock shim or SDK does not resolve here, so it says nothing of the \
+             stock part: {why}"
+        ))
+    });
+    let why = match machine_roots_from(trust, &stock, &sdk) {
+        Ok(roots) => panic!("rustup resolves no {absent}, yet the seal read {roots:?}"),
+        Err(why) => why,
+    };
+    if !why.starts_with(&format!("resolve {absent} sysroot")) {
+        aterm_spec::host::could_not_run(format!(
+            "the seal failed before its stock part, so it says nothing of it here: {why}"
+        ));
+    }
+    assert!(why.contains(absent), "rustup's own words: {why}");
+    let remedy = stock_gap_remedy(&why).unwrap_or_else(|| panic!("no remedy: {why}"));
+    assert_eq!(
+        remedy,
+        crate::buildplan::stock_release_remedy(
+            absent,
+            crate::trust_lock::checkout_stock_toolchain()
+                .ok()
+                .as_deref()
+        )
+    );
+    assert!(
+        remedy.contains(crate::gates::X86_SLICE_REMEDIES) && remedy.contains(absent),
+        "{remedy}"
+    );
+    assert_eq!(
+        stock_gap_remedy("resolve the macOS SDK: xcrun failed"),
+        None
+    );
+}
+
+/// A STOCK RELEASE WITHOUT ITS X86_64 STD IS A GAP NAMING WHAT PUTS IT THERE: a sysroot that
+/// resolves but holds only its host's library, as `rustup toolchain install` alone leaves it on an
+/// arm64 Mac, fails the seal's library step naming the missing slice, with the remedy
+/// [`stock_gap_remedy`] reads back: `verify provision rustup` in a checkout whose lock names that
+/// release, which installs the x86_64 std too. A sysroot that holds both libraries gives their
+/// roots. NEGATIVE CONTROL: without the [`stock_gap`] mapping on that step (`stock_library_roots`),
+/// the failure carries no remedy and the remedy assertion fails.
+#[test]
+fn a_stock_release_without_its_x86_64_std_is_a_gap_naming_what_puts_it_there() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = dir.path().join("stock");
+    let host = "aarch64-apple-darwin";
+    std::fs::create_dir_all(root.join("lib/rustlib").join(host)).unwrap();
+    let why = stock_library_roots("1.99.1", &root, host).unwrap_err();
+    assert!(why.contains("x86_64-apple-darwin"), "{why}");
+    let checkout = crate::trust_lock::checkout_stock_toolchain().ok();
+    assert_eq!(
+        stock_gap_remedy(&why),
+        Some(crate::buildplan::stock_release_remedy("1.99.1", checkout.as_deref()).as_str()),
+        "{why}"
+    );
+
+    std::fs::create_dir_all(root.join("lib/rustlib/x86_64-apple-darwin")).unwrap();
+    let roots = stock_library_roots("1.99.1", &root, host).unwrap();
+    assert_eq!(
+        roots
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "stock/rustlib/aarch64-apple-darwin",
+            "stock/rustlib/x86_64-apple-darwin"
+        ]
+    );
+}

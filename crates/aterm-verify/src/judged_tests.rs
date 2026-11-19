@@ -61,6 +61,10 @@ fn history_keeps_cancelled_attempts_replaced_by_a_verdict() {
         started: now,
         updated: now,
         lease_until: now + LEASE,
+        judge: String::new(),
+        repair: String::new(),
+        repair_assignment: String::new(),
+        repair_started: 0,
         rows: vec![],
     };
     let mut parent = None;
@@ -217,6 +221,10 @@ fn only_decided_verdicts_or_unexpired_claims_exclude_another_sample() {
         started: 0,
         updated: 0,
         lease_until: 120,
+        judge: String::new(),
+        repair: String::new(),
+        repair_assignment: String::new(),
+        repair_started: 0,
         rows: vec![],
     };
     assert!(r.occupied(119));
@@ -253,6 +261,10 @@ fn competing_append_cannot_replace_a_claim_and_pruning_keeps_recent_rows() {
         started: 0,
         updated: 1,
         lease_until: 120,
+        judge: String::new(),
+        repair: String::new(),
+        repair_assignment: String::new(),
+        repair_started: 0,
         rows: vec![],
     };
     assert!(append(&one, "origin", None, &r, deadline()).unwrap());
@@ -313,6 +325,10 @@ fn lane_record(tree: &str, token: &str, state: &str, updated: u64) -> Record {
         started: updated,
         updated,
         lease_until: updated + LEASE,
+        judge: String::new(),
+        repair: String::new(),
+        repair_assignment: String::new(),
+        repair_started: 0,
         rows: vec![],
     }
 }
@@ -1720,20 +1736,80 @@ fn journal_timeout_head_retains_an_already_exhausted_deadline() {
 
 /// A GitHub journal push goes through agh's write runner alone, keeps the refusal's evidence,
 /// never makes an unknown outcome again, and counts only a rejection (exit 9) as a lost race,
-/// whose pause comes before the readback. NEGATIVE CONTROL, run once against a broken copy of
+/// whose pause comes before the readback. Every other outcome that is not a landed push is an
+/// error that neither pauses nor reads the journal again: an unknown one (exit 13 with no
+/// diagnostic), one agh says sent nothing (could not run, exit 3), a refusal agh says had no
+/// effect (unauthenticated, exit 4), and one another writer's open intent stopped before it sent
+/// anything (exit 13, `intent_open`). NEGATIVE CONTROLS, each run once against a broken copy of
 /// `judged.rs` (restored with cp, then touch), which made this test fail: `push_journal` reading
-/// the journal before `lost()`: `assertion `left == right` failed: only a rejected push is a
-/// lost race` (left: 0, right: 1).
+/// the journal before `lost()`: `assertion `left == right` failed: a lost race pauses: Rejected`
+/// (left: 0, right: 1); and `push_journal` taking a refusal ([`crate::remote::Pushed::Refused`])
+/// for a rejection: `assertion `left == right` failed: a lost race pauses: Refused` (left: 1,
+/// right: 0).
 #[test]
 fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retries() {
     use crate::remote::Tool;
+    use agh::error::{Error, Kind, Sub};
     use std::cell::Cell;
     use std::os::unix::process::ExitStatusExt as _;
+
+    /// The outcome agh's answer to the push comes to.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Answer {
+        Done,
+        Rejected,
+        Unknown,
+        Unsent,
+        Refused,
+        Blocked,
+    }
 
     let dir = aterm_tempfile::tempdir().unwrap();
     let parent = "1111111111111111111111111111111111111111";
     let sha = "2222222222222222222222222222222222222222";
-    for code in [0, 9, 13] {
+    let refusal = "original push refusal";
+    let intent = "66-fc387e8b41a0";
+    // agh's one machine diagnostic of `error`, under its own exit, after its human words.
+    let diagnosed = |error: Error| {
+        let error = error.with_repo("fixture/repo");
+        (
+            i32::from(error.exit()),
+            format!(
+                "{refusal}\n{}\n",
+                error.to_json(&agh::redact::Redactor::new())
+            ),
+        )
+    };
+    let plain = |code: i32| (code, refusal.to_owned());
+    for (answer, (code, stderr)) in [
+        (Answer::Done, plain(0)),
+        (Answer::Rejected, plain(9)),
+        (Answer::Unknown, plain(13)),
+        (
+            Answer::Unsent,
+            diagnosed(Error::new(
+                Kind::CouldNotRun,
+                "the network went away before the send",
+            )),
+        ),
+        (
+            Answer::Refused,
+            diagnosed(Error::new(
+                Kind::Unauthenticated,
+                "GitHub answered 401 for the routed writer's login",
+            )),
+        ),
+        (
+            Answer::Blocked,
+            diagnosed(
+                Error::new(Kind::OutcomeUnknown, "another intent began first").with_sub(
+                    Sub::IntentOpen {
+                        intent: intent.into(),
+                    },
+                ),
+            ),
+        ),
+    ] {
         let pushes = Cell::new(0);
         let reads = Cell::new(0);
         let output = |code: i32, stdout: &[u8], stderr: &[u8]| std::process::Output {
@@ -1775,7 +1851,7 @@ fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retri
                 batch,
                 aterm_json::json!([{"ref":REF,"before":parent,"after":sha}])
             );
-            Ok(output(code, b"", b"original push refusal"))
+            Ok(output(code, b"", stderr.as_bytes()))
         };
         let lost = Cell::new(0);
         let result = push_journal(
@@ -1790,35 +1866,35 @@ fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retri
                 lost.set(lost.get() + 1);
             },
         );
-        assert_eq!(pushes.get(), 1);
+        assert_eq!(pushes.get(), 1, "{answer:?}");
+        let raced = usize::from(answer == Answer::Rejected);
+        assert_eq!(lost.get(), raced, "a lost race pauses: {answer:?}");
         assert_eq!(
-            lost.get(),
-            usize::from(code == 9),
-            "only a rejected push is a lost race"
+            reads.get(),
+            raced,
+            "a lost race reads the journal again: {answer:?}"
         );
-        if let Err(why) = &result {
-            assert!(why.contains(&format!("journal_ref={REF}")), "{why}");
-            assert!(why.contains(&format!("journal_before={parent}")), "{why}");
-            assert!(why.contains(&format!("journal_after={sha}")), "{why}");
+        if answer == Answer::Done {
+            assert_eq!(result, Ok(Appended::Holds(sha.to_owned())));
+            continue;
         }
-        match code {
-            0 => {
-                assert_eq!(result, Ok(Appended::Holds(sha.to_owned())));
-                assert_eq!(reads.get(), 0);
-            }
-            9 => {
-                let why = result.unwrap_err();
-                assert!(why.contains("original push refusal"), "{why}");
+        let why = result.unwrap_err();
+        assert!(why.contains(refusal), "{answer:?}: {why}");
+        assert!(why.contains(&format!("journal_ref={REF}")), "{why}");
+        assert!(why.contains(&format!("journal_before={parent}")), "{why}");
+        assert!(why.contains(&format!("journal_after={sha}")), "{why}");
+        let unknown = "outcome unknown: reconcile agh's intent before another write";
+        assert_eq!(why.contains(unknown), answer == Answer::Unknown, "{why}");
+        match answer {
+            Answer::Rejected => {
                 assert!(why.contains("controlled head lookup failure"), "{why}");
                 assert!(why.contains("journal-after-push-failure"), "{why}");
-                assert_eq!(reads.get(), 1);
             }
-            13 => {
-                let why = result.unwrap_err();
-                assert!(why.contains("outcome unknown"), "{why}");
-                assert_eq!(reads.get(), 0, "unknown sends are never retried or raced");
+            Answer::Unknown | Answer::Unsent | Answer::Refused => {
+                assert!(why.contains(&format!("exited Some({code})")), "{why}");
             }
-            _ => unreachable!(),
+            Answer::Blocked => assert!(why.contains(intent), "{why}"),
+            Answer::Done => unreachable!(),
         }
     }
 }
@@ -2489,4 +2565,429 @@ fn journal_reads_do_not_lazy_fetch_missing_promisor_objects() {
         "negative control: ordinary Git fetches the missing blob from the local promisor"
     );
     assert_eq!(records(&root, Some(&parent), deadline()).unwrap(), [held]);
+}
+
+/// A journal transport's answer: `code`, with `stderr`.
+fn answered(code: i32, stderr: &str) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt as _;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+/// The URL discovery of a GitHub journal remote, the only git a GitHub journal push runs.
+fn journal_url(args: &[std::ffi::OsString]) -> std::process::Output {
+    let words: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+    assert!(
+        words == ["remote", "get-url", "--all", "origin"]
+            || words == ["remote", "get-url", "--all", "--push", "origin"],
+        "GitHub journal transport must not fall back to git: {words:?}"
+    );
+    let mut out = answered(0, "");
+    out.stdout = b"https://github.com/fixture/repo.git\n".to_vec();
+    out
+}
+
+/// Whether a journal transport step is agh's push.
+fn journal_push(tool: crate::remote::Tool, args: &[std::ffi::OsString]) -> bool {
+    tool == crate::remote::Tool::Agh
+        && args.first().is_some_and(|word| word == "repo")
+        && args.get(1).is_some_and(|word| word == "push")
+}
+
+/// Sleep until `until` has passed.
+fn outlive(until: std::time::Instant) {
+    std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
+}
+
+/// A JOURNAL PUSH THAT STARTED BEFORE THE APPEND'S DEADLINE RUNS TO ITS END PAST IT, AS `publish`
+/// WIRES IT: an append to a local journal remote whose `pre-receive` hook holds the push until the
+/// append's deadline has passed lands its commit, and the push held the watchdog while the hook
+/// held it (`exec::group::held`), as [`crate::remote::run_mutation`] does within the publication
+/// window its admission started. The reads before it ran under the deadline, the production one
+/// (`judged::deadline`). NEGATIVE CONTROL (mutant): `publish` handing its push to the reader, as
+/// it once did, runs it under `capture_until`, which kills it at the deadline, and the append
+/// fails: the kill that left agh's intent open on m113 (`inherited_remaining_ms=15496`).
+#[test]
+fn a_started_journal_push_outlives_the_append_deadline() {
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let (tmp, one) = scratch(&["origin"]);
+    let origin = tmp.path().join("origin");
+    let started = tmp.path().join("hook-started");
+    let gate = tmp.path().join("hook-gate");
+    let fifo = std::ffi::CString::new(gate.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `mkfifo` reads the NUL-terminated path `fifo` owns, and a mode.
+    let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "{}", std::io::Error::last_os_error());
+    let hooks = origin.join("hooks");
+    git(
+        &origin,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    )
+    .unwrap();
+    let hook = hooks.join("pre-receive");
+    let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    std::fs::write(
+        &hook,
+        format!(
+            "#!{}\n: > '{}'\nread go < '{}'\n",
+            sh.display(),
+            started.display(),
+            gate.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let until = deadline();
+    let release = std::thread::spawn(move || {
+        aterm_spec::wait::until_while_descendants_work(
+            "the journal push to reach its hook",
+            || started.exists().then_some(()),
+        );
+        let held = crate::exec::group::held();
+        outlive(until);
+        // The open waits for the hook to open the gate to read it.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&gate)
+            .and_then(|mut gate| gate.write_all(b"go\n"))
+            .unwrap();
+        held
+    });
+    let record = lane_record("t", "held", "green", 1);
+    let landed = append(&one, "origin", None, &record, until);
+    assert!(
+        std::time::Instant::now() >= until,
+        "the push answered past the deadline"
+    );
+    assert_eq!(landed, Ok(true));
+    assert!(
+        release.join().unwrap(),
+        "the push held the watchdog while it ran"
+    );
+    let last = head(&one, "origin", deadline()).unwrap().unwrap();
+    assert_eq!(
+        records(&one, Some(&last), deadline()).unwrap(),
+        vec![record]
+    );
+}
+
+/// NO JOURNAL PUSH STARTS ONCE THE APPEND'S ADMISSION HAS EXPIRED: the read deadline passes during
+/// the last read before the push, the push's admission refuses it as `publish`'s writer does
+/// ([`AppendBudget::admit_write`]), and the append fails saying nothing was sent, with no push
+/// run and its error naming the ref, the expected parent and the commit. NEGATIVE CONTROL: the
+/// same reads within the deadline admit the push, once.
+#[test]
+fn no_journal_push_starts_after_the_append_deadline() {
+    use std::cell::Cell;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let parent = "1111111111111111111111111111111111111111";
+    let sha = "2222222222222222222222222222222222222222";
+    for late in [true, false] {
+        let until = std::time::Instant::now()
+            + if late {
+                std::time::Duration::from_millis(100)
+            } else {
+                aterm_spec::wait::MUST_HAPPEN
+            };
+        let budget = AppendBudget::new(until);
+        let pushes = Cell::new(0);
+        let read = |tool, args: &[std::ffi::OsString]| {
+            assert!(!journal_push(tool, args), "the reader runs no push");
+            if late && args.iter().any(|word| word == "--push") {
+                // The last read before the push answers as the deadline passes.
+                outlive(until);
+            }
+            Ok(journal_url(args))
+        };
+        let write = |tool, args: &[std::ffi::OsString]| {
+            budget.admit_write(std::time::Instant::now())?;
+            assert!(journal_push(tool, args), "the writer runs only the push");
+            pushes.set(pushes.get() + 1);
+            Ok(answered(0, ""))
+        };
+        let result = push_journal(
+            dir.path(),
+            "origin",
+            Some(parent),
+            sha,
+            &read,
+            crate::remote::WriteRunner(&write),
+            &|| panic!("a push sent nothing or held: no race was lost"),
+        );
+        if late {
+            let why = result.unwrap_err();
+            assert!(
+                why.contains(
+                    "journal mutation not started: append budget expired; nothing was sent"
+                ),
+                "{why}"
+            );
+            assert!(why.contains(&format!("journal_ref={REF}")), "{why}");
+            assert!(why.contains(&format!("journal_before={parent}")), "{why}");
+            assert!(why.contains(&format!("journal_after={sha}")), "{why}");
+            assert_eq!(pushes.get(), 0, "no push started");
+        } else {
+            assert_eq!(result, Ok(Appended::Holds(sha.to_owned())));
+            assert_eq!(pushes.get(), 1);
+        }
+    }
+}
+
+/// `host`'s attempt `token` on `tree`: `state` at `at`, its lease from there.
+fn attempt_of(host: &str, tree: &str, token: &str, state: &str, at: u64) -> Record {
+    Record {
+        host: host.into(),
+        ..lane_record(tree, token, state, at)
+    }
+}
+
+/// A CLAIM IS A LEASE ON THE TREE'S SLOT: ANOTHER HOST IS DECLINED WHILE IT IS LIVE, TAKES THE
+/// TREE ONCE IT LAPSED, AND THE LAPSED ATTEMPT'S VERDICT IS THEN FILED BESIDE THE SLOT. Host a
+/// claims at 1000 and renews at 1500; host b is declined at 1100 and one second before the
+/// renewed lease ends, and claims at its end. From there a's renewal is displaced, its pass goes
+/// beside b's claim and replaces nothing, a second filing of it writes nothing, and a third
+/// host finds the tree judged though b's claim lapsed too. NEGATIVE CONTROLS: a claim that
+/// ignored the lease would give b the slot at 1100; a lease counted from the claim alone, not
+/// from the renewal, would give it at 2200; a filing at the slot would replace b's live claim.
+#[test]
+fn a_claim_is_a_lease_another_host_takes_only_after_it_lapsed() {
+    let (_tmp, root) = scratch(&["origin"]);
+    let slot = |root: &Path| {
+        let head = head(root, "origin", deadline()).unwrap();
+        record(root, head.as_deref(), "t", deadline()).unwrap()
+    };
+    let mut a = attempt_of("a", "t", "one", "judging", 1000);
+    assert_eq!(claim(&root, "origin", &a, 1000, deadline()), Ok(None));
+    let b = attempt_of("b", "t", "two", "judging", 1100);
+    let declined = claim(&root, "origin", &b, 1100, deadline()).unwrap();
+    assert_eq!(
+        declined.as_ref().map(|held| held.token.as_str()),
+        Some("one")
+    );
+    assert_eq!(
+        slot(&root).unwrap().token,
+        "one",
+        "a declined claim writes nothing"
+    );
+
+    a.updated = 1500;
+    a.lease_until = 1500 + LEASE;
+    assert_eq!(renew(&root, "origin", &a, 1500, deadline()), Ok(()));
+    let late = 1500 + LEASE;
+    let b = attempt_of("b", "t", "two", "judging", late - 1);
+    assert!(
+        claim(&root, "origin", &b, late - 1, deadline())
+            .unwrap()
+            .is_some(),
+        "the renewal moved the lease's end"
+    );
+    let b = attempt_of("b", "t", "two", "judging", late);
+    assert_eq!(claim(&root, "origin", &b, late, deadline()), Ok(None));
+    assert_eq!(slot(&root).unwrap().token, "two");
+
+    a.updated = late + 10;
+    a.lease_until = late + 10 + LEASE;
+    assert_eq!(
+        renew(&root, "origin", &a, late + 10, deadline()),
+        Err(Unfiled::Displaced("judging by b".into()))
+    );
+    a.state = "pass".into();
+    a.lease_until = 0;
+    assert_eq!(
+        file(&root, "origin", &a, late + 20, deadline()),
+        Ok(Some(Place::Beside))
+    );
+    assert_eq!(slot(&root).unwrap().token, "two", "b's live claim stays");
+    let head_now = head(&root, "origin", deadline()).unwrap();
+    assert_eq!(
+        beside(&root, head_now.as_deref(), "t", deadline()).unwrap(),
+        vec![a.clone()]
+    );
+    assert_eq!(file(&root, "origin", &a, late + 30, deadline()), Ok(None));
+    assert_eq!(head(&root, "origin", deadline()).unwrap(), head_now);
+
+    let after = late + LEASE + 1;
+    let c = attempt_of("c", "t", "three", "judging", after);
+    let judged = claim(&root, "origin", &c, after, deadline()).unwrap();
+    assert_eq!(judged.map(|held| held.state), Some("pass".into()));
+}
+
+/// A HOST LEAVES A TREE IT COULD NOT JUDGE ALONE FOR [`RETRY_AFTER`]; ANOTHER HOST DOES NOT. A
+/// could-not-run or cancelled record keeps no claim out by itself, so a controller whose every
+/// attempt ends that way would claim the tree again at each turn of its loop. NEGATIVE CONTROL:
+/// a pass or a red rests nobody (it holds the tree for every host), and neither does the same
+/// record one second later than the rest.
+#[test]
+fn a_host_rests_after_its_own_attempt_ended_with_no_verdict() {
+    let (_tmp, root) = scratch(&["origin"]);
+    for state in ["could-not-run", "cancelled"] {
+        let ended = attempt_of("a", "t", "one", state, 1000);
+        assert!(ended.resting("a", 1000 + RETRY_AFTER - 1), "{state}");
+        assert!(!ended.resting("a", 1000 + RETRY_AFTER), "{state}");
+        assert!(!ended.resting("b", 1001), "{state}");
+        assert!(!ended.occupied(1001), "{state}");
+    }
+    assert!(!attempt_of("a", "t", "one", "pass", 1000).resting("a", 1001));
+    let ended = attempt_of("a", "t", "one", "could-not-run", 1000);
+    assert_eq!(
+        file(&root, "origin", &ended, 1000, deadline()),
+        Ok(Some(Place::Slot))
+    );
+    let head_now = head(&root, "origin", deadline()).unwrap();
+    let again = attempt_of("a", "t", "two", "judging", 1060);
+    let held = claim(&root, "origin", &again, 1060, deadline()).unwrap();
+    assert_eq!(held.map(|held| held.token), Some("one".into()));
+    assert_eq!(head(&root, "origin", deadline()).unwrap(), head_now);
+    let other = holder(&root, head_now.as_deref(), "t", "b", 1060, deadline()).unwrap();
+    assert_eq!(other, None, "another host may claim it at once");
+    let later = 1000 + RETRY_AFTER;
+    let again = attempt_of("a", "t", "two", "judging", later);
+    assert_eq!(claim(&root, "origin", &again, later, deadline()), Ok(None));
+}
+
+/// A FOLLOWER'S RECORD CARRIES ITS MARK AND ITS REPAIR CUSTODY, AND A RECORD WITHOUT THEM IS
+/// WRITTEN AS BEFORE THEY EXISTED. The journal is read by every verifier that prunes it, a
+/// controller built before these fields among them, so they are added keys an older reader
+/// skips, written only where set, and they precede the rows. NEGATIVE CONTROLS: an unset field
+/// written as an empty key would change every older record's bytes, which [`published`]
+/// compares; a key after `[[rows]]` would not parse back.
+#[test]
+fn a_followers_record_keeps_its_custody_and_an_older_record_keeps_its_bytes() {
+    let row = Row {
+        id: "tree".into(),
+        outcome: "red".into(),
+        log: "one\ntwo".into(),
+        red_items: vec!["aterm-gui --lib a::b".into()],
+        suspects: vec![],
+        fixed_by: None,
+        decisions: vec![],
+    };
+    let mut older = lane_record("t", "one", "red", 1000);
+    older.rows = vec![row];
+    let text = aterm_toml::to_string(&older).unwrap();
+    for key in ["judge", "repair", "repair_assignment", "repair_started"] {
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with(&format!("{key} "))),
+            "{key} in {text}"
+        );
+    }
+    assert_eq!(aterm_toml::from_str::<Record>(&text).unwrap(), older);
+    // A key this reader does not know, as these four are to a verifier built before them.
+    let unknown = text.replacen("state = ", "later = \"x\"\nstate = ", 1);
+    assert_ne!(unknown, text);
+    assert_eq!(aterm_toml::from_str::<Record>(&unknown).unwrap(), older);
+
+    let mut follower = older.clone();
+    follower.judge = FOLLOWER.into();
+    follower.repair = "t3vfwan0ygx".into();
+    follower.repair_assignment = "ab".repeat(32);
+    follower.repair_started = 1700;
+    let text = aterm_toml::to_string(&follower).unwrap();
+    assert!(
+        text.find("repair_started = 1700").unwrap() < text.find("[[rows]]").unwrap(),
+        "{text}"
+    );
+    assert_eq!(aterm_toml::from_str::<Record>(&text).unwrap(), follower);
+}
+
+/// THE SUPERSEDE CANDIDATE IS THE NEWEST COMMIT THE FOLLOWER PASSED, AND A TREE'S VERDICT IS
+/// READ WHEREVER IT IS FILED. Of main's commits past a line's head, newest first, the first
+/// with a follower's pass is named: a red, a claim, an attempt that could not run, a commit
+/// nobody judged and a pass filed by a controller that is not the follower are passed over.
+/// For one tree a verdict beside the slot is its verdict though a claim holds the slot.
+/// NEGATIVE CONTROLS: a reader taking the newest record whatever its state would name c4, a
+/// red; one reading the slot alone would call the tree `t` unjudged while its pass is filed.
+#[test]
+fn the_newest_follower_pass_is_the_candidate_and_a_trees_verdict_is_read_where_it_is_filed() {
+    let of = |commit: &str, state: &str, judge: &str| {
+        let mut record = lane_record(&format!("tree-of-{commit}"), commit, state, 1000);
+        record.commit = commit.into();
+        record.judge = judge.into();
+        record
+    };
+    let records = vec![
+        of("c5", "judging", FOLLOWER),
+        of("c4", "red", FOLLOWER),
+        of("c3", "could-not-run", FOLLOWER),
+        of("c2", "pass", ""),
+        of("c1", "pass", FOLLOWER),
+        of("c0", "pass", FOLLOWER),
+    ];
+    let listed = "c6\nc5\nc4\nc3\nc2\nc1\nc0\n";
+    assert_eq!(newest_pass(&records, listed), Some("c1".into()));
+    assert_eq!(newest_pass(&records, "c6\nc5\nc4\nc3\nc2\n"), None);
+    assert_eq!(newest_pass(&[], listed), None);
+
+    let mut claim = lane_record("t", "two", "judging", 2000);
+    claim.judge = FOLLOWER.into();
+    let mut pass = lane_record("t", "one", "pass", 1900);
+    pass.judge = FOLLOWER.into();
+    let filed = vec![claim.clone(), pass.clone(), of("c1", "pass", FOLLOWER)];
+    assert_eq!(of_tree(filed, "t"), Some(pass));
+    assert_eq!(of_tree(vec![claim.clone()], "t"), Some(claim));
+    assert_eq!(of_tree(records, "t"), None);
+}
+
+/// THE FOLLOWER'S NEWEST VERDICT ON A TIP IS READ OVER EVERY PARENT. t0 was judged green and t1
+/// red; t2 merges t1 into a branch that forked at t0, as a landing does, so t1 is t2's second
+/// parent. What the follower last said of t2's history is t1's red, and of the branch before
+/// the merge t0's pass; a claim on t2 itself and a pass that is not the follower's say nothing.
+/// NEGATIVE CONTROLS: before anything is filed the answer is none; a reader of t2's
+/// first-parent chain would answer t0's pass, and a red landing would be told main is green.
+#[test]
+fn the_followers_newest_verdict_on_a_tip_is_read_over_every_parent() {
+    let (_tmp, root) = scratch(&["origin"]);
+    let commit = |name: &str| {
+        std::fs::write(root.join(name), name).unwrap();
+        git(&root, &["add", name]).unwrap();
+        git(&root, &["commit", "--quiet", "-m", name]).unwrap();
+        rev(&root, "HEAD")
+    };
+    let t0 = commit("t0");
+    git(&root, &["checkout", "--quiet", "-b", "work"]).unwrap();
+    let branch = commit("work");
+    git(&root, &["checkout", "--quiet", "-"]).unwrap();
+    let t1 = commit("t1");
+    git(&root, &["checkout", "--quiet", "work"]).unwrap();
+    git(
+        &root,
+        &["merge", "--quiet", "--no-ff", "-m", "merge main", &t1],
+    )
+    .unwrap();
+    let t2 = rev(&root, "HEAD");
+    assert_eq!(
+        newest_verdict_on(&root, "origin", &t2, deadline()),
+        Ok(None)
+    );
+
+    let of = |commit: &str, state: &str, judge: &str, at: u64| {
+        let mut record = attempt_of("m9", &format!("tree-{commit}"), commit, state, at);
+        record.commit = commit.into();
+        record.judge = judge.into();
+        assert!(
+            file(&root, "origin", &record, at, deadline())
+                .unwrap()
+                .is_some()
+        );
+        record
+    };
+    let green = of(&t0, "pass", FOLLOWER, 1000);
+    let red = of(&t1, "red", FOLLOWER, 2000);
+    of(&branch, "pass", "", 3000);
+    of(&t2, "judging", FOLLOWER, 4000);
+    assert_eq!(
+        newest_verdict_on(&root, "origin", &t2, deadline()),
+        Ok(Some(red))
+    );
+    assert_eq!(
+        newest_verdict_on(&root, "origin", &branch, deadline()),
+        Ok(Some(green))
+    );
 }

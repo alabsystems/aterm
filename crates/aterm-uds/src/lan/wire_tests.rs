@@ -102,9 +102,42 @@ fn every_frame_survives_the_wire() {
             host: Some("vault-host.local.".into()),
             addresses: vec!["192.168.1.9".parse().unwrap(), "fe80::9".parse().unwrap()],
         })),
+        Frame::Request(Request::Consider),
         Frame::Socket { reached: Some(v6) },
         Frame::Socket { reached: None },
         Frame::Addresses(vec!["10.0.0.1".parse().unwrap()]),
+        Frame::Request(Request::SpotlightStore),
+        Frame::SpotlightStores(SpotlightStores::default()),
+        Frame::SpotlightStores(SpotlightStores {
+            age_ms: 61_000,
+            walk_ms: 140,
+            volumes: vec![
+                StoreVolume {
+                    volume: "/System/Volumes/Data".into(),
+                    bytes: u64::MAX,
+                    entries: 412,
+                    partial: None,
+                },
+                StoreVolume {
+                    volume: "/Volumes/Work".into(),
+                    bytes: 4096,
+                    entries: 1,
+                    partial: Some(StoreBound::Entries),
+                },
+                StoreVolume {
+                    volume: "/Volumes/Old".into(),
+                    bytes: 0,
+                    entries: 0,
+                    partial: Some(StoreBound::Time),
+                },
+                StoreVolume {
+                    volume: "/Volumes/Odd".into(),
+                    bytes: 8192,
+                    entries: 2,
+                    partial: Some(StoreBound::Unreadable),
+                },
+            ],
+        }),
         Frame::Event(Event::Added(Instance {
             name: "m11".into(),
             service: "_alab._tcp.".into(),

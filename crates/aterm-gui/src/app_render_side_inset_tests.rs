@@ -60,6 +60,53 @@ pub(crate) fn assert_pet_pointer_picture_agreement() {
 }
 
 #[test]
+fn window_resource_strip_side_pixels_preserve_the_terminal_tray_and_paste_floor() {
+    let size = (9, 5);
+    let source: Vec<_> = (0..3)
+        .flat_map(|y| (0..9).flat_map(move |x| [x + 1, y + 1, 0x70, 255]))
+        .collect();
+    let card = crate::SettingsCard {
+        rgba: source,
+        pw: 9,
+        ph: 3,
+        dx: 0,
+        dy: 1,
+        fp: 1,
+        geom: 1,
+        serial: 1,
+        delta: None,
+        scrim: None,
+        raster_fingerprint_once: std::sync::OnceLock::new(),
+    };
+    let strip = resource_strip_quad(true, Some(&card), None, 2, (1, None)).unwrap();
+    let interior = 0x456789;
+    for (x, frame_width) in [(-2, 6), (0, 4), (2, 4), (5, 4), (0, 9)] {
+        let mut pixels = vec![interior; size.0 * size.1];
+        composite_resource_strip_edges(&mut pixels, size, (x, 0), frame_width, strip);
+        for py in 0..size.1 {
+            for px in 0..size.0 {
+                let inside = (x..x + frame_width as i64).contains(&(px as i64));
+                let expected = if !inside && (2..4).contains(&py) {
+                    (((px + 1) as u32) << 16) | ((py as u32) << 8) | 0x70
+                } else {
+                    interior
+                };
+                assert_eq!(
+                    pixels[py * size.0 + px],
+                    expected,
+                    "frame {x}/{frame_width}, pixel {px}/{py}"
+                );
+            }
+        }
+    }
+    let modal = crate::SettingsCard {
+        scrim: Some([0, 0, 0, 128]),
+        ..card
+    };
+    assert!(resource_strip_quad(true, Some(&modal), Some(&modal), 0, (1, None)).is_none());
+}
+
+#[test]
 fn side_inset_cpu_partial_damage_refreshes_a_leading_chrome_band() {
     let mut app = scripted_app();
     app.backend.set_pad(12);
@@ -242,6 +289,8 @@ fn side_inset_recorded_virtual_images_cut_the_frame_in_both_capture_routes() {
             session: None,
             want_bytes: true,
             want_metadata: metadata,
+            whole_client: false,
+            presentation: None,
             frame_metadata: Arc::new(std::sync::OnceLock::new()),
             cancel: crate::control::CaptureCancellation::new(),
             reply,

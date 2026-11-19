@@ -12,8 +12,7 @@ use crate::stats_plan::DeckForm;
 use aterm_vitals::ink::VitalsInks;
 use aterm_vitals::model::ScopeView;
 
-/// A 2× window: a 24 px bottom pad, 2,238 px wide, whose card keeps the pad's
-/// top 18 px over the 6 px drop border.
+/// A constrained 2× surface that fits three lanes.
 const GEOM: DeckGeom = DeckGeom {
     w: 2238.0,
     h: 18.0,
@@ -22,8 +21,7 @@ const GEOM: DeckGeom = DeckGeom {
     font_px: 26.0,
 };
 
-/// A large window at 1× (the Linux and Windows phases): a 12 px pad over a
-/// 6 px drop border leaves a 6 px card.
+/// A six-pixel-high surface that fits two lanes at 1×.
 const GEOM_1X: DeckGeom = DeckGeom {
     w: 1600.0,
     h: 6.0,
@@ -31,14 +29,6 @@ const GEOM_1X: DeckGeom = DeckGeom {
     scale: 1.0,
     font_px: 13.0,
 };
-
-#[test]
-fn the_sill_is_the_bottom_pad_and_needs_eight_points_of_it() {
-    assert_eq!(sill_px(24, 2.0), 24);
-    assert_eq!(sill_px(12, 1.0), 12);
-    assert_eq!(sill_px(15, 2.0), 0, "7.5 pt of pad hides the sill");
-    assert_eq!(sill_px(16, 2.0), 16);
-}
 
 #[test]
 fn a_translucent_floor_puts_a_plate_behind_each_instrument_only() {
@@ -61,7 +51,7 @@ fn a_translucent_floor_puts_a_plate_behind_each_instrument_only() {
 }
 
 #[test]
-fn the_sill_stays_in_the_pad_and_leaves_the_drop_border() {
+fn the_sill_keeps_the_marks_in_its_surface() {
     let snap = snapshot();
     let mut i = input(&snap);
     i.tab_count = 2;
@@ -291,49 +281,21 @@ fn hot_cores_draw_the_sills_load_ramp_and_no_glow() {
     }
 }
 
-/// The card stops where the drop-target border begins, whatever the window:
-/// the 2× pad keeps the three lanes' 18 px, a large window at 1× keeps 6 px
-/// over its 6 px border, a small one 9 px over 3 px.
-#[test]
-fn the_sill_card_leaves_the_drop_border_to_the_border() {
-    assert_eq!(sill_card_px(24, 2238, 1900), 18);
-    assert_eq!(sill_card_px(12, 1600, 1300), 6);
-    assert_eq!(sill_card_px(12, 900, 640), 9);
-    assert_eq!(sill_card_px(4, 1600, 1300), 0, "no card under the border");
-}
-
-/// The App places the sill's card from the top of the bottom pad to the top
-/// of the drop border, so its raster and its hit map end there.
 #[cfg(unix)]
 #[test]
-fn the_app_ends_the_sill_card_at_the_drop_border() {
-    let _attached = crate::stats_deck::tests::attach_stats();
-    let mut app = crate::App::headless_for_test();
-    let wid = crate::WindowId(0);
-    app.config
-        .sys
-        .get_or_insert_with(Default::default)
-        .stats_bars = Some("sill".into());
-    // A 24 px bottom pad (a test window's own is thinner).
-    app.windows.get_mut(&wid).expect("window").metrics.pad = 24;
-    let f = app.deck_frame(wid).expect("the sill draws");
-    let frame_h = app.stats_frame_h(wid);
-    let pad = app.win_pad(wid);
-    let border = aterm_render::drop_overlay_border_px(f.geom.w as usize, frame_h, 0);
-    assert!(border >= 2);
-    assert_eq!(f.dy as usize, frame_h - pad, "the card starts at the pad");
-    assert_eq!(
-        f.dy as usize + f.geom.h as usize,
-        frame_h - border,
-        "the card ends where the drop border begins"
-    );
+fn compact_resources_occupy_the_head_even_without_window_padding() {
+    let fixture = crate::stats_band::tests::two_windows();
+    let mut app = fixture.app;
+    let wid = fixture.second;
+    app.windows.get_mut(&wid).unwrap().metrics.pad = 0;
+    let f = app.deck_frame(wid).unwrap();
+    assert_eq!(f.geom.h as usize, compact_height(app.windows[&wid].scale));
+    assert!(f.dy as usize + f.geom.h as usize <= app.win_head(wid));
 }
 
-/// At 1× the lanes yield to the drop border bottom-up: on a 6 px card the Tab
-/// lane yields at two tabs and the Global and aterm lanes stay where they are;
-/// on a 9 px card (a small window's 3 px border) all three fit.
+/// The third lane fits at nine pixels and yields at six.
 #[test]
-fn at_1x_the_tab_lane_yields_to_the_drop_border() {
+fn incomplete_lanes_have_no_paint_or_hit_target() {
     let snap = snapshot();
     let mut i = input(&snap);
     i.tab_count = 2;
@@ -538,7 +500,7 @@ fn the_swap_capsule_stays_in_the_gap_before_the_disk_column() {
 struct SillWindow {
     /// Its width, pt.
     w_pt: f32,
-    /// Its pad, pt: the bottom pad the Sill is drawn in, and the side pad.
+    /// Its horizontal padding, in points.
     pad_pt: f32,
     /// Device px per point.
     scale: f32,
@@ -551,18 +513,8 @@ impl SillWindow {
         (pt * self.scale).round() as usize
     }
 
-    /// The Sill's height in px, 0 where the pad holds none (`App::deck_frame`'s Sill arm).
-    fn sill(self) -> usize {
-        sill_px(self.px(self.pad_pt), f64::from(self.scale))
-    }
-
-    /// The card's height in px. The window is as tall as it is wide, so its drop border is
-    /// the widest a window of this width has and the card the shortest: 18 px of a 24 px pad
-    /// at 2× from 600 pt of width up, 6 px of a 12 px pad at 1× from 1200 pt up, and more
-    /// under those widths, where the border is thinner.
     fn card(self) -> usize {
-        let w = self.px(self.w_pt);
-        sill_card_px(self.sill(), w, w)
+        compact_height(f64::from(self.scale))
     }
 
     /// The card as `App::deck_frame` lays it: the frame's width, the card's height, the
@@ -588,23 +540,15 @@ struct SillFrame {
 }
 
 impl SillFrame {
-    /// The frame as the window's foot shows it: the whole bottom pad on its ground. The card
-    /// is rastered at its own height, as `App::splice_stats_deck` rasters it, so what the
-    /// Sill draws past the card is cut as the window cuts it; the rows the drop border keeps
-    /// under the card are the ground.
     fn raster(&self) -> (Vec<u8>, u32, u32) {
         let [r, g, b] = self.ground;
-        let pad = self.window.px(self.window.pad_pt) as u32;
-        let (mut rgba8, pw, card) = crate::tray_raster::rasterize_tray(
+        crate::tray_raster::rasterize_tray(
             &self.prims,
             self.window.px(self.window.w_pt) as u32,
             self.window.card() as u32,
             1.0,
             [r, g, b, 0xFF],
-        );
-        let under = pad.saturating_sub(card);
-        rgba8.extend([r, g, b, 0xFF].repeat((pw * under) as usize));
-        (rgba8, pw, card + under)
+        )
     }
 }
 
@@ -638,7 +582,7 @@ fn sill_scene(o: Owner) -> Snapshot {
 /// The Sill `window` shows for `snap` on `inks`; `None` where it shows none, as
 /// `App::deck_frame`'s Sill arm gives no frame for a pad under 8 pt or a card of no height.
 fn sill_frame(snap: &Snapshot, inks: VitalsInks, window: SillWindow) -> Option<SillFrame> {
-    if window.sill() == 0 || window.card() == 0 {
+    if window.card() == 0 {
         return None;
     }
     Some(sill_frame_at(snap, inks, window, window.geom()))
@@ -715,8 +659,6 @@ fn inked(prims: &[DrawPrim]) -> Vec<(usize, [f32; 4])> {
 /// What a Sill frame must show, as the faults `f` has for the scene `snap` (none: it holds).
 /// Each fault starts with the law it breaks:
 ///
-/// - `PAD`: a frame exists only where the pad holds a Sill ([`sill_px`] and
-///   [`sill_card_px`] are not 0); a frame that has this fault is judged no further.
 /// - `KIND`: the Sill draws panels, strokes and clips, which the `CARD` law places.
 /// - `CLIP`: each clip the Sill opens it closes.
 /// - `CARD`: no panel or stroke is inked outside the card ([`inked`]), a rounded rim's line
@@ -734,14 +676,7 @@ fn inked(prims: &[DrawPrim]) -> Vec<(usize, [f32; 4])> {
 ///   judged: it is a fault to ask.
 fn sill_faults(snap: &Snapshot, f: &SillFrame) -> Vec<String> {
     let win = f.window;
-    let (sill, card) = (win.sill(), win.card());
-    if sill == 0 || card == 0 {
-        return vec![format!(
-            "PAD: a frame for a {} pt pad at {}x, which holds no Sill (sill {sill} px, card \
-             {card} px)",
-            win.pad_pt, win.scale
-        )];
-    }
+    let card = win.card();
     let mut faults = Vec::new();
     let (w, card_h) = (win.px(win.w_pt) as f32, card as f32);
     let boxes = inked(&f.prims);
@@ -923,15 +858,7 @@ fn laws(faults: &[String]) -> Vec<&str> {
 
 /// The Sill for a person to read, and what its frames must show ([`sill_faults`]). Each of
 /// the six owner scenes is drawn in windows 1440, 1039, 700 and 450 pt wide, at 2× and 1×,
-/// on the dark and the light ground, with one tab and with three: a 12 pt pad, and the card
-/// a window as tall as it is wide keeps of it ([`SillWindow::card`]). Each frame is the
-/// window's whole bottom pad: the card as the window rasters it, over the rows the drop
-/// border keeps. The grounds are the deck fixtures' ([`dark_inks`], [`light_inks`], as
-/// `deck_gallery` draws the band); a window inks its Sill for the terminal's floor
-/// (`App::sill_floor`). One more frame a scene, at the owner's 1039 pt window and 2×, stacks
-/// the Folded band over the Sill, a pad of ground between them: what the window that
-/// carries the band shows, over what a window without it keeps. A 7 pt pad holds no Sill
-/// and writes no frame.
+/// on dark and light grounds, with one tab and with three, in a 12 pt compact header.
 ///
 /// `ATERM_DECK_GALLERY=<dir>` keeps the frames.
 #[test]
@@ -949,7 +876,7 @@ fn the_sill_gallery_keeps_every_scene_inside_its_card_at_both_scales() {
     let mut frames = std::collections::BTreeSet::new();
     let mut stacked = std::collections::BTreeSet::new();
     // Which arms of the law the gallery's own frames reach.
-    let (mut lit, mut yielded, mut folds) = (0, 0, Vec::new());
+    let mut folds = Vec::new();
     let (mut caps, mut wedges) = (0, 0);
     for o in Owner::ALL {
         let snap = sill_scene(o);
@@ -970,9 +897,6 @@ fn the_sill_gallery_keeps_every_scene_inside_its_card_at_both_scales() {
                             "{} {window:?} on {ground}: {faults:#?}",
                             o.name()
                         );
-                        let tab_lanes = f.hits.iter().filter(|h| h.bar() == Bar::Tab).count();
-                        lit += usize::from(tab_lanes > 0);
-                        yielded += usize::from(tabs >= 2 && tab_lanes == 0);
                         // A folded column is its cap or its ◢ alone: a region with no lanes.
                         let alone = |i: Instrument| {
                             let n = |bar: Bar| {
@@ -994,17 +918,6 @@ fn the_sill_gallery_keeps_every_scene_inside_its_card_at_both_scales() {
                         frames.insert(file);
                     }
                 }
-                let thin = SillWindow {
-                    w_pt,
-                    pad_pt: 7.0,
-                    scale,
-                    tabs: 3,
-                };
-                assert_eq!(thin.sill(), 0, "{thin:?}");
-                assert!(
-                    sill_frame(&snap, dark_inks(), thin).is_none(),
-                    "a 7 pt pad writes no frame: {thin:?}"
-                );
             }
             let fold = Fold::of(w_pt - 2.0 * PAD_PT);
             if !folds.contains(&fold) {
@@ -1062,20 +975,15 @@ fn the_sill_gallery_keeps_every_scene_inside_its_card_at_both_scales() {
         Owner::ALL.len() * WIDTHS.len() * SCALES.len() * grounds.len() * TABS.len()
     );
 
-    // The frames reach each arm of the law. The 2× pad keeps an 18 px card and the 1× pad a
-    // 6 px one in a 1440 pt window; the Tab lane draws in some frames and yields to the drop
-    // border in others; the four widths fold to all columns, to no disk column, and to
-    // neither it nor the memory column; and some folded column shows its pressure cap alone,
-    // some its ◢ alone.
+    // At both scales the complete compact header holds every tab lane.
     let at_1440 = |scale: f32, pad_pt: f32| SillWindow {
         w_pt: 1440.0,
         pad_pt,
         scale,
         tabs: 3,
     };
-    assert_eq!(at_1440(2.0, PAD_PT).card(), 18);
-    assert_eq!(at_1440(1.0, PAD_PT).card(), 6);
-    assert!(lit > 0 && yielded > 0, "{lit} lit, {yielded} yielded");
+    assert_eq!(at_1440(2.0, PAD_PT).card(), 24);
+    assert_eq!(at_1440(1.0, PAD_PT).card(), 12);
     assert!(caps > 0 && wedges > 0, "{caps} caps, {wedges} wedges");
     assert_eq!(
         folds
@@ -1174,32 +1082,6 @@ fn the_sill_gallery_keeps_every_scene_inside_its_card_at_both_scales() {
         3,
         "two scoped columns' lanes and their ink: {faults:#?}"
     );
-
-    // A Tab lane drawn where the card does not hold it: a 9 px card's three 1× lanes (a
-    // small window's 3 px border) in the 1440 pt window's 6 px card.
-    let tight = at_1440(1.0, PAD_PT);
-    let roomy = DeckGeom {
-        h: 9.0,
-        ..tight.geom()
-    };
-    let faults = sill_faults(&snap, &sill_frame_at(&snap, inks, tight, roomy));
-    assert!(
-        laws(&faults).contains(&"TAB") && laws(&faults).contains(&"CARD"),
-        "CONTROL: {faults:#?}"
-    );
-
-    // A frame written for a 7 pt pad.
-    let thin = SillWindow {
-        pad_pt: 7.0,
-        ..window
-    };
-    let forced = DeckGeom {
-        h: sill_card_px(thin.px(7.0), thin.px(thin.w_pt), thin.px(thin.w_pt)) as f32,
-        ..thin.geom()
-    };
-    assert!(forced.h > 0.0, "CONTROL: the 7 pt pad has room to draw in");
-    let faults = sill_faults(&snap, &sill_frame_at(&snap, inks, thin, forced));
-    assert_eq!(laws(&faults), ["PAD"], "CONTROL: {faults:#?}");
 
     // A Sill folded to its memory column in a window whose width keeps the disk column.
     let mut folded = frame(SillWindow {

@@ -133,6 +133,7 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
                 .with_policy(store.source_policy()?, false);
             let fleet = admission
                 .chosen(Cli::Claude, &roster_path, None)?
+                .lab()
                 .ok_or("the native test source is missing")?;
             persist_accounts_sync_with_pool(
                 (&store, &SourceProtection::default()),

@@ -252,6 +252,7 @@ fn an_untouched_setup_offer_can_restart_without_being_answered() {
         permissions: Some(crate::InitialSetupPermissionPolicy {
             revision: 7,
             allowed: true,
+            person_access: true,
         }),
         run: Some(crate::InitialSetupRunPolicy {
             revision: 7,
@@ -6358,6 +6359,15 @@ fn an_unconfirmed_row_is_drawn_waiting_with_its_note() {
         .position(|label| *label == row.label)
         .unwrap_or_else(|| panic!("{heard:?}"));
     assert_eq!(heard.get(at + 1).copied(), Some(UNCONFIRMED_NOTE));
+    // An unread sibling must leave a known step's wait visible on the collapsed line.
+    let mut mixed = status_of("check-unconfirmed");
+    let spotlight = Subject::Setting(Setting::Spotlight);
+    *mixed
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == spotlight)
+        .unwrap() = Observation::withheld(spotlight);
+    assert_eq!(mark_on(&mixed, Setting::Repositories), Mark::Waiting);
     // A run that could not confirm a change does the same.
     let mut ran = status_of("set-up");
     ran.rows = pass_rows(&PassOutcome {
@@ -6581,8 +6591,18 @@ fn the_older_cancel_scenario_reads_every_group_left_as_is() {
     assert!(status.notes(&plan).is_empty());
     assert!(!app.needs_attention());
     assert_eq!(menu(&status), None);
+    // The hero reads the headline's rows: no count of a plan that leaves everything as is.
+    let hero = hero_of(&app);
+    assert_eq!(hero.headline, EVERYTHING_LEFT_AS_IS);
+    assert_eq!((hero.sub.as_str(), hero.done, hero.total), ("", 0, 0));
+    // Every row a switch governs is left; Spotlight indexing, which no switch governs (FL-188),
+    // is still read.
     for subject in Subject::all() {
-        assert!(!app.reviewed_row(subject).managed, "{subject:?}");
+        assert_eq!(
+            app.reviewed_row(subject).managed,
+            !governed(subject),
+            "{subject:?}"
+        );
     }
 }
 
@@ -7952,6 +7972,37 @@ fn a_withheld_reading_is_no_failure_and_no_set_up_mac() {
         failed.owes_a_read(1_700_000_000 + aterm_types::macos_setup::READING_STANDS_SECS + 1),
         "a private read past its age is owed again"
     );
+
+    let mut applying = failed.clone();
+    applying.busy = true;
+    applying.running.push(Setting::Spotlight);
+    assert_eq!(mark_on(&applying, Setting::Spotlight), Mark::Working);
+
+    // Every affected group shows completed unread evidence with the neutral ring,
+    // including Developer, where GitHub repositories did return a reading.
+    // The same evidence may be visible while a new read is in flight.
+    for mut status in [status, failed] {
+        for checking in [false, true] {
+            let word = if checking {
+                status.observing = private
+                    .iter()
+                    .map(|subject| (*subject, None, false))
+                    .collect();
+                lines::CHECKING_WORD
+            } else {
+                "unread"
+            };
+            let (shown, _) = lines_of(&page_reading(&status));
+            for line in [
+                lines::Line::Mac,
+                lines::Line::Accounts,
+                lines::Line::Developer,
+            ] {
+                let view = shown.iter().find(|view| view.line == line).unwrap();
+                assert_eq!((view.mark, view.word), (Mark::Pending, word), "{line:?}");
+            }
+        }
+    }
 }
 
 #[test]

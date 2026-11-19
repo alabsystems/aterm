@@ -72,6 +72,12 @@ impl Where {
         true
     }
 
+    /// The survey's actual admission time, without racing its worker's completion.
+    #[cfg(all(test, unix))]
+    pub(crate) fn started(&self) -> Option<Instant> {
+        self.lock().started.map(|(at, _)| at)
+    }
+
     /// Return the latest survey results and whether a survey is currently running.
     pub(crate) fn read(&self) -> (Option<Found>, bool) {
         let s = self.lock();

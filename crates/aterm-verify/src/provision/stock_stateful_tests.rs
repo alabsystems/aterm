@@ -144,19 +144,43 @@ impl Rustup for FakeRustup {
     }
 }
 
-fn repo() -> PathBuf {
-    aterm_tempfile::manifest_dir().join("../..")
+/// The release chain's toolchain the scratch checkout's `trust.lock` names ([`checkout`]).
+const RELEASE: &str = "1.91.1";
+
+/// A scratch checkout in `dir` whose `trust.lock` names [`RELEASE`] in `[stock]` and which has
+/// no `publish/`, so its stock pin is [`STOCK_PIN`]: nothing here reads the tree's own lock or
+/// gate, which a public snapshot does not carry.
+fn checkout(dir: &Path) -> PathBuf {
+    checkout_naming(dir, RELEASE)
 }
 
-fn pin() -> String {
-    stock_pin(&repo()).unwrap()
+/// [`checkout`] whose `trust.lock` names `release` in `[stock]`.
+fn checkout_naming(dir: &Path, release: &str) -> PathBuf {
+    let repo = dir.join("checkout");
+    std::fs::create_dir_all(&repo).unwrap();
+    let lock = aterm_toolchain::trust_lock::TrustLock {
+        build: 27009,
+        tree_root: "b".repeat(64),
+        compiler_commit: "5".repeat(40),
+        receipt: "SEED-MINT sha256:00".into(),
+        stock_toolchain: release.into(),
+    };
+    std::fs::write(
+        repo.join(aterm_toolchain::trust_lock::LOCK_FILE),
+        aterm_toolchain::trust_lock::render_body(&lock),
+    )
+    .unwrap();
+    assert_eq!(release_toolchain(&repo, true), Ok(Some(release.into())));
+    repo
 }
 
-/// The release chain's toolchain the checkout's `trust.lock` names.
+fn pin(repo: &Path) -> String {
+    stock_pin(repo).unwrap()
+}
+
+/// The release chain's toolchain the scratch checkout's `trust.lock` names.
 fn release() -> String {
-    release_toolchain(&repo(), true)
-        .unwrap()
-        .expect("the checkout carries a trust.lock")
+    RELEASE.to_string()
 }
 
 /// A scratch account's homes: nothing on `$PATH`, no `$ATERM_TEST_RUSTUP`, and the row's
@@ -206,16 +230,17 @@ fn position(calls: &[String], prefix: &str) -> usize {
 #[test]
 fn a_bare_home_gets_auto_install_off_then_the_pin_by_name() {
     let tmp = aterm_tempfile::tempdir().unwrap();
+    let repo = checkout(tmp.path());
     let homes = homes(tmp.path());
     let rustup = FakeRustup::default();
-    let refused = run(&repo(), &homes, &rustup, false, false, &mut |_| {}).unwrap_err();
+    let refused = run(&repo, &homes, &rustup, false, false, &mut |_| {}).unwrap_err();
     assert!(
         refused.contains("no rustup to drive") && refused.contains("verify provision"),
         "{refused}"
     );
     assert!(rustup.calls().is_empty(), "{:#?}", rustup.calls());
     let copy = placed(&homes);
-    let acquired = run(&repo(), &homes, &rustup, false, false, &mut |_| {}).unwrap();
+    let acquired = run(&repo, &homes, &rustup, false, false, &mut |_| {}).unwrap();
     assert!(!acquired.is_empty());
     let calls = rustup.calls();
     assert!(
@@ -223,7 +248,7 @@ fn a_bare_home_gets_auto_install_off_then_the_pin_by_name() {
             < position(&calls, "rustup toolchain install"),
         "auto-install is off before anything is installed: {calls:#?}"
     );
-    let pin = pin();
+    let pin = pin(&repo);
     position(
         &calls,
         &format!("rustup toolchain install {pin} --profile minimal --component clippy"),
@@ -267,7 +292,7 @@ fn a_bare_home_gets_auto_install_off_then_the_pin_by_name() {
         Ok(Vec::<String>::new())
     );
     assert_eq!(
-        run(&repo(), &homes, &rustup, false, false, &mut |_| {}),
+        run(&repo, &homes, &rustup, false, false, &mut |_| {}),
         Ok(Vec::new())
     );
 }
@@ -278,10 +303,11 @@ fn a_bare_home_gets_auto_install_off_then_the_pin_by_name() {
 #[test]
 fn a_bare_home_gets_the_release_chains_locked_toolchain_with_its_slice_std() {
     let tmp = aterm_tempfile::tempdir().unwrap();
+    let repo = checkout(tmp.path());
     let homes = homes(tmp.path());
     let rustup = FakeRustup::default();
     placed(&homes);
-    run(&repo(), &homes, &rustup, false, false, &mut |_| {}).unwrap();
+    run(&repo, &homes, &rustup, false, false, &mut |_| {}).unwrap();
     let calls = rustup.calls();
     let install = release_install();
     position(&calls, &install);
@@ -301,7 +327,7 @@ fn a_bare_home_gets_the_release_chains_locked_toolchain_with_its_slice_std() {
         assert!(state.auto_installed.is_empty());
     }
     assert_eq!(
-        run(&repo(), &homes, &rustup, false, false, &mut |_| {}),
+        run(&repo, &homes, &rustup, false, false, &mut |_| {}),
         Ok(Vec::new())
     );
 }
@@ -310,16 +336,10 @@ fn a_bare_home_gets_the_release_chains_locked_toolchain_with_its_slice_std() {
 fn coincident_roles_keep_both_target_sets_and_components_after_the_real_plan() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let homes = homes(tmp.path());
-    let checkout = tmp.path().join("checkout");
-    std::fs::create_dir(&checkout).unwrap();
+    // A checkout with no `publish/` rides the stock pin, and its lock names that same release.
+    let checkout = checkout_naming(tmp.path(), STOCK_PIN);
     let pin = stock_pin(&checkout).unwrap();
-    let mut lock = aterm_toolchain::trust_lock::read(&repo().join("trust.lock")).unwrap();
-    lock.stock_toolchain.clone_from(&pin);
-    std::fs::write(
-        checkout.join("trust.lock"),
-        aterm_toolchain::trust_lock::render_body(&lock),
-    )
-    .unwrap();
+    assert_eq!(pin, STOCK_PIN);
     let rustup = FakeRustup::default();
     placed(&homes);
     run(&checkout, &homes, &rustup, false, true, &mut |_| {}).unwrap();
@@ -361,12 +381,14 @@ fn entries(dir: &Path) -> Vec<String> {
 /// step (`rustup is not installed at …`) and write 13 proxies beside the person's rustup.
 #[test]
 fn a_toolchain_install_never_self_updates_into_cargo_home() {
-    let pin = pin();
+    let lock = aterm_tempfile::tempdir().unwrap();
+    let repo = checkout(lock.path());
+    let pin = pin(&repo);
     let bare = aterm_tempfile::tempdir().unwrap();
     let bare = homes(bare.path());
     placed(&bare);
     let rustup = FakeRustup::default();
-    let acquired = run(&repo(), &bare, &rustup, false, false, &mut |_| {}).unwrap();
+    let acquired = run(&repo, &bare, &rustup, false, false, &mut |_| {}).unwrap();
     assert!(
         acquired
             .iter()
@@ -380,7 +402,7 @@ fn a_toolchain_install_never_self_updates_into_cargo_home() {
     let copy = placed(&own);
     stub(&own.cargo_home.join("bin/rustup"));
     run(
-        &repo(),
+        &repo,
         &own,
         &FakeRustup::default(),
         false,
@@ -430,9 +452,10 @@ fn stub(path: &Path) {
 #[test]
 fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
     let tmp = aterm_tempfile::tempdir().unwrap();
+    let repo = checkout(tmp.path());
     let homes = homes(tmp.path());
     let rustup = FakeRustup::default();
-    let pin = pin();
+    let pin = pin(&repo);
     {
         let targets: Vec<String> = CELL_TARGETS.iter().map(|t| (*t).to_string()).collect();
         let mut s = rustup.0.borrow_mut();
@@ -470,7 +493,7 @@ fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
         Ok(vec![add.clone(), clippy.clone()]),
         "the read-only probe names what a run adds"
     );
-    run(&repo(), &homes, &rustup, false, false, &mut |_| {}).unwrap();
+    run(&repo, &homes, &rustup, false, false, &mut |_| {}).unwrap();
     let calls = rustup.calls();
     position(&calls, &add);
     position(&calls, &clippy);
@@ -499,7 +522,7 @@ fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
         missing(&homes, &rustup, Some(&pin), Some(&release()), true),
         Ok(vec![musl.clone()])
     );
-    let acquired = run(&repo(), &homes, &rustup, true, false, &mut |_| {}).unwrap();
+    let acquired = run(&repo, &homes, &rustup, true, false, &mut |_| {}).unwrap();
     assert_eq!(acquired, [musl]);
     assert_eq!(
         missing(&homes, &rustup, Some(&pin), Some(&release()), true),
@@ -533,4 +556,72 @@ fn the_row_drives_its_stamped_copy_before_path_and_never_the_keg() {
         ..h
     };
     assert_eq!(kegged.rustup(), Ok(keg));
+}
+
+/// THE ROW'S RELEASE-CHAIN PART ALONE, WHICH A REAL CUT AND A LINUX RELEASE WORKER RUN FOR THE
+/// RELEASE THEIR COMMIT'S LOCK NAMES (`run_release`): on a bare home it turns auto-install off,
+/// then installs that release, by name and through the row's copy, with the release's stds, and
+/// asks nothing of the stock pin; `missing_release` names exactly those steps beforehand, read
+/// only, and nothing once they ran; a second run changes nothing. A home with no rustup the row
+/// resolves is refused before rustup is asked anything, naming `verify provision`. NEGATIVE
+/// CONTROLS: a `run_release` that also asks the stock pin (`acquire` with `Some(STOCK_PIN)` and
+/// the cells' targets) installs the pin too and the acquired-steps assertion fails; a
+/// `missing_release` that runs the steps (`run_release`) instead of reading them changes rustup
+/// and the plan-only-reads assertion fails.
+#[test]
+fn a_release_worker_acquires_the_release_chains_toolchain_alone() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let homes = homes(tmp.path());
+    let rustup = FakeRustup::default();
+    let unplaced = missing_release(RELEASE, &homes, &rustup).unwrap_err();
+    assert!(
+        unplaced.contains("no rustup to drive") && unplaced.contains("verify provision"),
+        "{unplaced}"
+    );
+    let refused = run_release(RELEASE, &homes, &rustup, &mut |_| {}).unwrap_err();
+    assert!(
+        refused.contains("no rustup to drive") && refused.contains("verify provision"),
+        "{refused}"
+    );
+    assert!(rustup.calls().is_empty(), "{:#?}", rustup.calls());
+
+    let copy = placed(&homes);
+    let steps = vec![
+        "rustup set auto-install disable".to_string(),
+        release_install(),
+    ];
+    assert_eq!(missing_release(RELEASE, &homes, &rustup), Ok(steps.clone()));
+    assert!(
+        rustup.calls().iter().all(|c| c.contains(" list")),
+        "the plan only reads: {:#?}",
+        rustup.calls()
+    );
+    let mut said = Vec::new();
+    assert_eq!(
+        run_release(RELEASE, &homes, &rustup, &mut |l| said.push(l.to_string())),
+        Ok(steps.clone()),
+        "auto-install off, then the named release, and nothing of the pin"
+    );
+    assert_eq!(
+        said,
+        steps
+            .iter()
+            .map(|s| format!("completed command: {s}"))
+            .collect::<Vec<_>>()
+    );
+    {
+        let state = rustup.0.borrow();
+        let locked = &state.toolchains[&format!("{RELEASE}-{HOST}")];
+        for t in RELEASE_TARGETS {
+            assert!(locked.iter().any(|s| s == t), "{locked:?}");
+        }
+        assert_eq!(state.toolchains.len(), 1, "{:?}", state.toolchains);
+        assert!(state.auto_installed.is_empty());
+        assert!(state.ran.iter().all(|r| *r == copy), "{:?}", state.ran);
+    }
+    assert_eq!(missing_release(RELEASE, &homes, &rustup), Ok(Vec::new()));
+    assert_eq!(
+        run_release(RELEASE, &homes, &rustup, &mut |_| {}),
+        Ok(Vec::new())
+    );
 }

@@ -730,7 +730,9 @@ impl App {
     pub(crate) fn can_find(&self, wid: crate::WindowId) -> bool {
         if let Some((instance, view)) = self.active_native_view(wid) {
             return match self.native_runtime.app(instance).map(|app| app.kind()) {
-                Some(crate::native_app::AppKind::Settings) => true,
+                Some(
+                    crate::native_app::AppKind::Settings | crate::native_app::AppKind::Registry,
+                ) => true,
                 Some(crate::native_app::AppKind::Editor) => matches!(
                     self.native_runtime.view_state(view),
                     Some(crate::native_app::AppViewState::Editor(state)) if state.buffer.as_ref()
@@ -785,7 +787,9 @@ impl App {
                     | crate::native_app::AppKind::SystemState
                     | crate::native_app::AppKind::Recovery
                     | crate::native_app::AppKind::Allocation
+                    | crate::native_app::AppKind::SystemResources
                     | crate::native_app::AppKind::Workers => None,
+                    crate::native_app::AppKind::Registry => Some(crate::native_registry::SEARCH),
                     crate::native_app::AppKind::Tables => Some("tables/find"),
                     crate::native_app::AppKind::Navigator => Some(crate::navigator::FILTER),
                 });

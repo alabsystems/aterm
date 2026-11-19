@@ -627,6 +627,168 @@ fn a_refused_read_refuses_the_change() {
     assert_eq!(change(&then, &same_instant, &[]), Err("window"));
 }
 
+/// Per-id energy retains each original midpoint and separate account, including a real zero
+/// change, a coalition born during the window, and no invented zero for one that is gone.
+#[test]
+fn group_book_energy_retains_original_windows_and_separate_channels() {
+    let c = |cpu, gpu, ane| Counters {
+        energy_nj: cpu,
+        gpu_energy_nj: gpu,
+        ane_energy_nj: ane,
+        ..Counters::default()
+    };
+    let baseline = c(4_000_000_000, 500_000_000, 250_000_000);
+    let delta = c(2_000_000_000, 1_000_000_000, 500_000_000);
+    let then = book(
+        7 * SECOND,
+        &[
+            (30, c(100_000_000_000, 0, 0)),
+            (20, baseline),
+            (10, baseline),
+        ],
+    );
+    let now = book(
+        9 * SECOND,
+        &[
+            (50, c(1_000_000_000, 0, 0)),
+            (20, baseline),
+            (10, plus(baseline, delta)),
+        ],
+    );
+    let (aggregate, energy) = change_with_energy(&then, &now, &[30], Some(40));
+    assert_eq!(aggregate, change(&then, &now, &[30]));
+    let energy = energy.expect("accepted individual counters");
+    assert_eq!(
+        (energy.before_ns(), energy.at_ns(), energy.window_ns()),
+        (7 * SECOND, 9 * SECOND, 2 * SECOND)
+    );
+    assert_eq!(
+        energy
+            .rows()
+            .iter()
+            .map(CoalitionEnergy::id)
+            .collect::<Vec<_>>(),
+        [10, 20, 50]
+    );
+    let rates = |id| {
+        let row = energy.get(id).expect("current coalition");
+        (row.cpu_mw(), row.gpu_mw(), row.ane_mw())
+    };
+    assert_eq!(rates(10), (1000.0, 500.0, 250.0));
+    assert_eq!(rates(20), (0.0, 0.0, 0.0));
+    assert_eq!(rates(50), (500.0, 0.0, 0.0));
+    assert!(energy.get(30).is_none() && energy.get(99).is_none());
+
+    let held = std::sync::Arc::clone(&energy);
+    let later = book(
+        12 * SECOND,
+        &[
+            (10, plus(plus(baseline, delta), delta)),
+            (20, baseline),
+            (50, c(1_000_000_000, 0, 0)),
+        ],
+    );
+    let (_, next) = change_with_energy(&now, &later, &[], Some(50));
+    assert_eq!(next.expect("next transition").window_ns(), 3 * SECOND);
+    assert!(std::sync::Arc::ptr_eq(&energy, &held));
+    assert_eq!(
+        (held.at_ns(), held.window_ns(), rates(10)),
+        (9 * SECOND, 2 * SECOND, (1000.0, 500.0, 250.0))
+    );
+}
+
+/// Growth in another coalition cannot hide an individual reset. The established aggregate
+/// result is deliberately preserved: group attribution cannot turn that total into a valid
+/// rate for the coalition whose source counter went backwards.
+#[test]
+fn group_book_energy_refuses_a_reset_hidden_by_other_coalition_growth() {
+    let base = Counters {
+        cpu_ticks: 1000,
+        energy_nj: 1000,
+        gpu_energy_nj: 1000,
+        ane_energy_nj: 1000,
+        ..Counters::default()
+    };
+    for channel in 0..4 {
+        let mut reset = base;
+        match channel {
+            0 => reset.energy_nj = 900,
+            1 => reset.gpu_energy_nj = 900,
+            2 => reset.ane_energy_nj = 900,
+            _ => reset.cpu_ticks = 900,
+        }
+        let then = book(SECOND, &[(10, base), (20, base)]);
+        let now = book(2 * SECOND, &[(20, plus(base, base)), (10, reset)]);
+        let (aggregate, energy) = change_with_energy(&then, &now, &[], Some(20));
+        assert!(
+            aggregate.is_ok(),
+            "the other coalition hides reset {channel}"
+        );
+        assert_eq!(aggregate, change(&then, &now, &[]));
+        assert_eq!(energy, Err("backwards"));
+        let control = book(2 * SECOND, &[(20, plus(base, base)), (10, base)]);
+        assert!(change_with_energy(&then, &control, &[], Some(20)).1.is_ok());
+    }
+}
+
+/// A failed native read, changed clock domain or nonadvancing original timestamp supplies no
+/// energy facts. No new endpoint, zero value or fallback denominator is manufactured.
+#[test]
+fn group_book_energy_refuses_missing_sources_and_broken_windows() {
+    let c = second(1.0, 3000.0, 0.0, 0.0);
+    let then = book(7 * SECOND, &[(10, c)]);
+    let now = book(9 * SECOND, &[(10, plus(c, c))]);
+    assert!(change_with_energy(&then, &now, &[], Some(10)).1.is_ok());
+    for (unread, why) in [
+        (
+            HeatBook {
+                total: Err("unwritten"),
+                ..now.clone()
+            },
+            "unwritten",
+        ),
+        (
+            HeatBook {
+                timebase: (1, 1),
+                ..now.clone()
+            },
+            "timebase",
+        ),
+        (
+            HeatBook {
+                at_ns: then.at_ns,
+                ..now.clone()
+            },
+            "window",
+        ),
+        (
+            HeatBook {
+                at_ns: then.at_ns - 1,
+                ..now.clone()
+            },
+            "window",
+        ),
+    ] {
+        let (aggregate, energy) = change_with_energy(&then, &unread, &[], Some(10));
+        assert_eq!(aggregate, Err(why));
+        assert_eq!(energy, Err(why));
+    }
+    let unbased = book(9 * SECOND, &[(10, plus(c, c)), (15, c)]);
+    assert_eq!(
+        change_with_energy(&then, &unbased, &[], Some(20)).1,
+        Err("unbased")
+    );
+    assert_eq!(
+        change_with_energy(&then, &unbased, &[], None).1,
+        Err("unbased")
+    );
+    let duplicate = book(9 * SECOND, &[(10, plus(c, c)), (10, c)]);
+    assert_eq!(
+        change_with_energy(&then, &duplicate, &[], Some(10)).1,
+        Err("rows")
+    );
+}
+
 /// Compute watts is the CPU's, the GPU's and the Neural Engine's; a part this system has no reader
 /// of adds nothing, and an unread one leaves the figure unread.
 #[test]

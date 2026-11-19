@@ -31,8 +31,8 @@ pub(crate) struct D3dPresentBufs {
     bloom: D3dBuffer,
     shimmer: D3dBuffer,
     tray: D3dBuffer,
-    dock_tray: D3dBuffer,
-    dock_blit: D3dBuffer,
+    chrome_tray: [D3dBuffer; 2],
+    chrome_blit: [D3dBuffer; 2],
     scrim: D3dBuffer,
     crown: D3dBuffer,
     /// The bloom extract's instances (`bloom_glow_scratch[extract_first..]`),
@@ -51,8 +51,14 @@ impl D3dPresentBufs {
             bloom: u(std::mem::size_of::<BloomUniform>())?,
             shimmer: u(std::mem::size_of::<ShimmerUniform>())?,
             tray: u(std::mem::size_of::<TrayUniform>())?,
-            dock_tray: u(std::mem::size_of::<TrayUniform>())?,
-            dock_blit: u(std::mem::size_of::<BlitUniform>())?,
+            chrome_tray: [
+                u(std::mem::size_of::<TrayUniform>())?,
+                u(std::mem::size_of::<TrayUniform>())?,
+            ],
+            chrome_blit: [
+                u(std::mem::size_of::<BlitUniform>())?,
+                u(std::mem::size_of::<BlitUniform>())?,
+            ],
             scrim: u(std::mem::size_of::<TrayUniform>())?,
             crown: u(std::mem::size_of::<HdrGlowUniform>())?,
             extract: None,
@@ -241,6 +247,8 @@ impl GpuRenderer {
             || tray.is_some()
             || band_shift.is_some();
 
+        let cards = win.chrome_cards();
+
         // ---- Phase B: residency ------------------------------------------
         let live = self
             .d3d11_arm
@@ -265,7 +273,7 @@ impl GpuRenderer {
         if shimmer_region.is_some() {
             live.ensure_pipeline(Pipeline::Shimmer)?;
         }
-        if tray.is_some() || win.dock_card.is_some() {
+        if tray.is_some() || cards.iter().any(Option::is_some) {
             live.ensure_pipeline(Pipeline::Tray)?;
         }
         if live.present.is_none() {
@@ -526,16 +534,26 @@ impl GpuRenderer {
             live.pipeline(row)
                 .unwrap_or_else(|| panic!("d3d11 present: {row:?} ensured above"))
         };
-        let dock_card = win.dock_card.clone();
-        let dock_rect = win.dock_rect((dw, dh));
-        let mut dock_redraw = false;
-        if let Some(card) = dock_card.as_ref() {
-            let fresh = win.d3d11_dock_stage.as_ref().is_none_or(|stage| {
+        let origins = win.chrome_origins();
+        let rects = [
+            win.chrome_rects(0, (dw, dh), fw),
+            win.chrome_rects(1, (dw, dh), fw),
+        ];
+        let mut chrome_redraw = [false; 2];
+        for (index, card) in cards.iter().enumerate() {
+            let Some(card) = card
+                .as_ref()
+                .filter(|_| rects[index].iter().any(Option::is_some))
+            else {
+                win.d3d11_dock_stage[index] = None;
+                continue;
+            };
+            let fresh = win.d3d11_dock_stage[index].as_ref().is_none_or(|stage| {
                 !stage.input.on(&live.dev) || (stage.input.width, stage.input.height) != card.size
             });
             if fresh {
                 let (format, alias) = offscreen_format();
-                win.d3d11_dock_stage = Some(ArmDockStage {
+                win.d3d11_dock_stage[index] = Some(ArmDockStage {
                     input: live.dev.texture_2d(
                         TexelFormat::Rgba8Unorm,
                         card.size.0,
@@ -548,9 +566,11 @@ impl GpuRenderer {
                     serial: None,
                 });
             }
-            let stage = win.d3d11_dock_stage.as_ref().expect("dock stage ensured");
-            dock_redraw = card.serial == 0 || stage.serial != Some(card.serial);
-            if dock_redraw {
+            let stage = win.d3d11_dock_stage[index]
+                .as_ref()
+                .expect("chrome stage ensured");
+            chrome_redraw[index] = card.serial == 0 || stage.serial != Some(card.serial);
+            if chrome_redraw[index] {
                 live.dev.upload_rows(
                     &stage.input,
                     0,
@@ -563,20 +583,17 @@ impl GpuRenderer {
                 self.tray_upload_bytes += card.rgba.len() as u64;
             }
             let mut uniform = want.for_dock(&card.quad());
-            uniform.content_off = [win.dock_origin.0 as f32, win.dock_origin.1 as f32];
+            uniform.content_off = [origins[index].0 as f32, origins[index].1 as f32];
             live.dev
-                .write_buffer(&bufs.dock_blit, aterm_bits::bytes_of(&uniform))?;
+                .write_buffer(&bufs.chrome_blit[index], aterm_bits::bytes_of(&uniform))?;
             live.dev.write_buffer(
-                &bufs.dock_tray,
+                &bufs.chrome_tray[index],
                 aterm_bits::bytes_of(&TrayUniform {
                     rect: [0.0, 0.0, card.size.0 as f32, card.size.1 as f32],
                     fb: [card.size.0 as f32, card.size.1 as f32],
                     _pad: [0.0; 2],
                 }),
             )?;
-        } else {
-            // A hidden dock keeps no resident stage, as no tray keeps no tray card.
-            win.d3d11_dock_stage = None;
         }
         let nearest = live.nearest();
         let linear = live.linear();
@@ -719,8 +736,10 @@ impl GpuRenderer {
             pass.bind_texture(&card.tex, linear, binds.fragment_textures[0], false);
             pass.draw(4, 1)?;
         }
-        if let Some(stage) = win.d3d11_dock_stage.as_ref() {
-            if dock_redraw {
+        for (index, stage) in win.d3d11_dock_stage.iter().enumerate() {
+            if let Some(stage) = stage
+                && chrome_redraw[index]
+            {
                 let binds = Pipeline::Tray.spec().binds;
                 let mut pass = frame.begin_pass(
                     &stage.target,
@@ -733,7 +752,7 @@ impl GpuRenderer {
                     }),
                     None,
                     (
-                        &bufs.dock_tray,
+                        &bufs.chrome_tray[index],
                         binds.vertex_uniform.expect("tray vertex uniform"),
                     ),
                 )?;
@@ -743,7 +762,7 @@ impl GpuRenderer {
             }
         }
         // 5. The blit pass: clear to the live background, the letterbox blit
-        //    over the whole destination, then the crown and dock in the same pass.
+        //    over the whole destination, then the crown and window chrome in the same pass.
         {
             let binds = Pipeline::Blit.spec().binds;
             let clear = crate::device_layer::ClearColor4 {
@@ -782,13 +801,12 @@ impl GpuRenderer {
                 bind_glow_lights(&mut pass, live, crown_row, bufs.crown_stream.as_ref());
                 pass.draw(6, crown_count)?;
             }
-            if let (Some(stage), Some([x0, y0, x1, y1])) =
-                (win.d3d11_dock_stage.as_ref(), dock_rect)
-            {
-                if x1 > x0 && y1 > y0 {
-                    let binds = Pipeline::Blit.spec().binds;
+            for (index, stage) in win.d3d11_dock_stage.iter().enumerate() {
+                let Some(stage) = stage else { continue };
+                let binds = Pipeline::Blit.spec().binds;
+                for [x0, y0, x1, y1] in rects[index].into_iter().flatten() {
                     pass.set_scissor(Some((x0, y0, x1 - x0, y1 - y0)));
-                    pass.bind_uniform(&bufs.dock_blit, binds.fragment_buffers[0]);
+                    pass.bind_uniform(&bufs.chrome_blit[index], binds.fragment_buffers[0]);
                     pass.set_pipeline(pipe(Pipeline::Blit));
                     pass.bind_texture(&stage.target, nearest, binds.fragment_textures[0], true);
                     pass.draw(3, 1)?;
@@ -796,8 +814,10 @@ impl GpuRenderer {
             }
         }
         frame.submit()?;
-        if let (Some(stage), Some(card)) = (win.d3d11_dock_stage.as_mut(), dock_card.as_ref()) {
-            stage.serial = Some(card.serial);
+        for (stage, card) in win.d3d11_dock_stage.iter_mut().zip(cards.iter()) {
+            if let (Some(stage), Some(card)) = (stage, card) {
+                stage.serial = Some(card.serial);
+            }
         }
         // Bookkeeping after the encode: the copy now differs from the
         // offscreen only where this present wrote over it.

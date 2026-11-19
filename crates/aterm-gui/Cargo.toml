@@ -235,6 +235,19 @@ required-features = ["bench-support"]
 name = "comprehension_specimen"
 path = "examples/comprehension_specimen.rs"
 
+# M-HIST's complete cached host handler, using one isolated Shared and registered headless
+# session. The probe retains debug assertions: use --profile opt-test --features bench-support.
+[[example]]
+name = "sys_history_host_cost"
+path = "examples/sys_history_host_cost.rs"
+required-features = ["bench-support"]
+
+# A manual observation of the local replica and its first selectable aRegistry machine.
+[[example]]
+name = "registry_open"
+path = "examples/registry_open.rs"
+required-features = ["bench-support"]
+
 [features]
 # Accessibility delivery is native and unconditional on supported platforms:
 # macOS NSAccessibility, Linux AT-SPI and Windows UIA use one semantic tree.
@@ -285,6 +298,9 @@ aterm-core = { workspace = true, features = ["serde"] }
 # `#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(…))]` anchors expand in
 # every test and debug build, so aterm-spec-closure's closure gate sees them; release strips them.
 aterm-spec-anchor = { workspace = true }
+# The hold vocabulary the update lanes share: `native_update_lane_hold`'s `HoldBound` and
+# `PersonHold` are aterm-evidence's (pure, std plus its digest).
+aterm-evidence = { workspace = true }
 # The selection/block control verbs + the shared response-framing primitives,
 # hosted here through `control_host::GuiHost`'s `SessionHost` impl.
 aterm-control = { workspace = true }

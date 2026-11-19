@@ -3,6 +3,76 @@
 
 use super::*;
 
+/// EACH PUMP'S FACT IS READ, AND AN OLDER PEER'S SILENCE IS UNKNOWN (UB-15, `pump=`). A reply's
+/// `release_pump` rows are the host's pumps, one per clone's record, in both renderers: each one's
+/// step, line, holder, age and last decision; a second clone's record (a `--once` that ran there)
+/// is a row of its own and hides no other. A reply with no row, as an aterm older than it sends,
+/// says `"pumps":[]` and no pump line, never a pump that is absent or dead.
+/// NEGATIVE CONTROL: the reply with only the header has no pump.
+#[test]
+fn a_pump_row_is_read_and_an_older_peers_silence_is_unknown() {
+    let record = crate::release_pump::Record {
+        holder: "m16".into(),
+        line: "v0.201.0@9afa50b42".into(),
+        step: "prepare".into(),
+        own: true,
+        at: 100,
+        decision: "line v0.201.0 at 9afa50b42 is this clone's unfinished line".into(),
+        pid: 7,
+        boot: None,
+        start: None,
+    };
+    let row = record.row(Some(true), 130);
+    let once = crate::release_pump::Record {
+        line: "v0.201.0@9afa50b42".into(),
+        step: "wait".into(),
+        own: false,
+        pid: 8,
+        ..record.clone()
+    }
+    .row(Some(false), 130);
+    let reply = |lines: Vec<String>| {
+        vec![HostReply {
+            label: "m16".into(),
+            remote: true,
+            unproven: false,
+            node: None,
+            answer: parse_reply(&lines),
+            reason: None,
+        }]
+    };
+    let header = "instance host=m16 pid=1 sessions=0 level=facts".to_string();
+    let with = reply(vec![header.clone(), row, once]);
+    let json = render_json(&with);
+    assert!(json.contains("\"pumps\":[{"), "{json}");
+    assert!(json.contains("\"age_s\":30"), "{json}");
+    let hosts: aterm_json::Value = aterm_json::from_str(&json).unwrap();
+    let pumps = hosts[0]["pumps"].as_array().unwrap();
+    assert_eq!(pumps.len(), 2, "{json}");
+    assert_eq!(
+        (pumps[0]["pid"].as_u64(), pumps[0]["own"].as_bool()),
+        (Some(7), Some(true))
+    );
+    assert_eq!(
+        (pumps[1]["pid"].as_u64(), pumps[1]["own"].as_bool()),
+        (Some(8), Some(false))
+    );
+    let text = render_full(&with, None);
+    assert!(
+        text.contains(
+            "  pump=prepare line=v0.201.0@9afa50b42 holder=m16 age=30s alive=live pid=7 last="
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("  pump=wait line=v0.201.0@9afa50b42 "),
+        "{text}"
+    );
+    let older = reply(vec![header]);
+    assert!(render_json(&older).contains("\"pumps\":[]"));
+    assert!(!render_full(&older, None).contains("pump="));
+}
+
 #[test]
 fn quota_rows_survive_fleet_parsing_and_both_renderers() {
     let data = r#"{"as":"dev","caller":"cli:api","counted":12}"#;
@@ -3980,7 +4050,7 @@ fn a_built_host_ask_is_read_back_by_the_parser() {
 #[test]
 fn a_sessions_fleet_survey_is_a_read_of_each_mac_that_answered() {
     use aterm_types::fleet_activity::{Outcome, Plain, Way};
-    const SID: &str = "s-0123456789abcdef0123";
+    const SID: &str = "tqn5r6e0148";
     let (a, b) = ("0a".repeat(16), "0b".repeat(16));
     let peer = |label: &str, node: Option<&str>, proved: Option<&str>, answered: bool| PeerSurvey {
         authenticated: proved.map(|node| AuthenticatedPeer {

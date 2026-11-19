@@ -188,34 +188,79 @@
 //!   what is weighed, opened and served per record, and a stub is none of these, and a log full
 //!   by count frees room by a prune.
 //!
-//! Not yet (the rows that own it, which FL-148f's pass waits on):
+//! Settled since (FL-148D), so no longer waited on: a store's bytes are bounded by its format's
+//! capacity, the storage class, apart from one reply's, the wire class
+//! ([`crate::crossing::capacity`], [`super::REPLY_CAP`]); the legacy fence counts the records a
+//! root dropped ([`Log::known_count`]: aterm-db's legacy exchange is told of a rooted store's
+//! stubs with its records, [`super::Store::complete_inventory`], so a store within the legacy
+//! count of held records and past it with its stubs is fenced); and the mesh egress's members
+//! cursor, a position in the held records that a prune shifts, is kept under the rewrite
+//! generation (its number and the rewrite that made it) and placed again when it differs,
+//! just past the last record it stepped past, which it knows by the record's id, the same
+//! whole and shed (`crate::client::Paths::records_generation`, [`super::record_id`],
+//! `aterm_mesh::egress::MembersCursor`).
+//!
+//! Not yet (each with the row that owns it, which FL-148F's pass waits on):
 //!
 //! - **Consumers that read records by id or position** (FL-148E). The set a reconciling peer
 //!   compares ([`super::Store::complete_inventory`]) names a dropped record as known, and a
 //!   cursor at one starts again at genesis ([`super::Store::complete_missing`]). Not yet read as
 //!   dropped: [`super::entries`]'s winning ops and carried reps, which may name a dropped op (the
-//!   evaluators place it; a consumer that opens its ciphertext does not); the mesh egress's
-//!   members cursor, a position in the held records that a prune shifts (it resets on FL-148D's
-//!   rewrite generation); `legacy_applied_held`, whose search for the applied heads walks held
-//!   records alone, so a log that dropped one reads it absent; and the join bundle, the mesh's
+//!   evaluators place it; a consumer that opens its ciphertext does not);
+//!   `legacy_applied_held`, whose search for the applied heads walks held
+//!   records alone, so a log that dropped one reads it absent; and the mesh's
 //!   members unit and aterm-db's records exchange (`Store::missing`, `complete_missing`), which
 //!   send records alone, so a peer behind the cut is sent, on every round, records that wait, and
-//!   its summary never matches (they take [`super::Served`] with the client pass). Their own
-//!   crates' tests need a rooted store, which only this crate's tests build.
-//! - **aterm-db's legacy fence counting stubs** (FL-148D). Its legacy exchange counts a rooted
-//!   store's inventory, its stubs among it, against its node bound, which a store within the
-//!   legacy count of held records can pass: the fence must count the stubs once a rooted store
-//!   reaches a records file.
-//! - **A served reply past the stream bound** (FL-148D). A root's reply holds every record the
-//!   peer lacks ([`super::Store::missing_served`]), which a store of this build always fits; a
-//!   store past [`super::MAX_RECORDS_STREAM`] serves records alone and a Mac behind its cut
-//!   waits. Closing it needs a pull that names the records it holds waiting, so a reply need not
-//!   carry them again.
-//! - **Taking a served root into a store's file** (FL-148E's client pass, on FL-148D's
-//!   rewrite). [`super::Store::ingest_served`] takes a root in memory, and a server sends a frame
-//!   only to a pull that asks for one ([`crate::transport::RECORDS_SERVED_HEADER`]); the client
-//!   pass, the server's peer pull and the join bundle read records alone and ask for none, since
-//!   a rooted store's records file is FL-148D's rewrite generation.
+//!   its summary never matches. Their own crates' tests need a rooted store, which only this
+//!   crate's tests build. (A member's join bundle hands its roots after its records,
+//!   `crate::client::admit`'s `held_records`.) (The mesh's
+//!   members unit carries no rooted store's records: a rewritten file is format 2's, and a Mac
+//!   past format 1 leaves the unit out, `crate::client::members_lane_open`. A write's hook now
+//!   says which generation the records it hands over are of, [`super::store::Written`], and
+//!   the mesh egress takes them under it.)
+//! - **The storage sites that read this build's format** (FL-148E, the row that first stores
+//!   a format mark: a store past format 1 exists from then on, and each of these sites must
+//!   read it by then). A store, its log and its file read their bytes' bound from the store's
+//!   own format ([`super::Store::capacity`], [`Log::capacity`]), and a site that has a store
+//!   at hand reads and decodes by it. A Mac that follows a format-2 vault (`super::follow`)
+//!   reads at the format its mark names: its store, its records cache (a rewritten layout
+//!   and its frame included), the frames its records pass pulls, a member's bundle and a
+//!   seat's records; so do aterm-db's catalog limit (the inspected log's own capacity) and
+//!   aterm-gui's bound of the file (the mark's format). The sites with no store at hand (the
+//!   held drafts, the writes that wait for a key, the authoring stops, the most a store's
+//!   footprint reaches) name [`super::Reading::STORE_BYTES`], which is every format's capacity
+//!   while a store is one reply and stops the build once it is not (FL-249). A vault server
+//!   reads its records file, a POST's body and the frames its peer pull reads at its mark's
+//!   format too (`server::Shared::records_reading`). (The first transition's layout and
+//!   aterm-db's legacy wires are format 1's by what they are, and name format 1.) Not yet:
+//!   the readers that name the records entry's data file without a store select it as format
+//!   1 does and refuse a rewritten layout (`crate::client::Paths::records_data_file`, the
+//!   vault memo's and the seat ask's standing, `client::genesis`'s private-realm read,
+//!   `client::remove`'s look, aterm-db's moved-home check, aterm-agent's fleet log and
+//!   census): on a Mac whose entry a rewrite made they fail or read nothing, and change
+//!   nothing.
+//! - **A served reply past one reply's bytes** (FL-249). A root's reply holds every record the
+//!   peer lacks and the frame, which a prefix cannot replace ([`super::Store::missing_served`]).
+//!   It is the held records the peer lacks and the stubs, both counted in the store's bytes,
+//!   and the frame's head, counted in none (42 bytes and 32 for each root, at most
+//!   [`super::served::MAX_SERVED_HEAD`], 8,234). While a store's capacity is one reply's
+//!   ([`crate::crossing::FORMAT_TWO_BYTES`]) it therefore passes [`super::REPLY_CAP`] only
+//!   from a store within that head of full to a peer that lacks nearly all it holds: the
+//!   store then serves records alone, capped, and the peer waits on another that holds the
+//!   cut or on this store's next prune, which frees room; nothing is lost or taken in part.
+//!   It is not closed here: reserving the head in a rooted log's byte bound would put a log
+//!   whose prune freed less than the head over its bound, and the wire's bound does not move.
+//!   Once a store's capacity is past a reply (FL-249) every such reply passes it, and closing
+//!   it needs a pull that names the records it holds waiting, so a reply need not carry them
+//!   again and a root is served with the prefix that settles it: that row owns it.
+//! - **Taking a served root into a vault server's file** (FL-148E). A Mac's records pass and
+//!   a new Mac's join take a served root into a rewritten records file (`super::follow`'s
+//!   "Served roots": a pull that reads format 2 asks for the frame,
+//!   [`crate::transport::RECORDS_SERVED_HEADER`], and a rooted store is written through
+//!   `crate::records_storage::rewrite` and read back from [`super::stored`]'s file). A vault
+//!   server's peer pull still asks for none and reads records alone: its records file is one
+//!   flat file with no rewritten form, so a server behind a cut holds what follows the cut
+//!   waiting (`super::follow`'s "Not yet" names each site left of that row).
 
 use super::checkpoint::{self, Plan};
 use super::{Body, EpochAudience, Kind, Log, MemberId, Record, RecordId};
@@ -250,6 +295,9 @@ pub(super) enum Mutant {
     RootedStatementsOnly,
     /// The stubs count against no budget.
     FreeStubs,
+    /// The legacy fence counts held records alone ([`Log::known_count`]), as before FL-148D:
+    /// not the records a root dropped, which a set-reconciling exchange names all the same.
+    FenceHeldAlone,
     /// The register reads a statement naming a dropped `Put` as its carry as standing for that
     /// `Put`: a stub's own `carries` is not read.
     StubCarriesUnread,
@@ -1054,6 +1102,24 @@ impl Log {
         self.held.contains_key(id) || self.is_dropped(id)
     }
 
+    /// How many records it knows ([`Log::knows`]): those it holds and those a root dropped,
+    /// which it holds a stub of. It is the size of what a set-reconciling peer is told this log
+    /// has ([`super::Store::complete_inventory`]), so it is the count a fence on that exchange
+    /// judges ([`crate::crossing::crossed`], aterm-db's legacy exchange, whose inventory a
+    /// build before the fence holds to [`super::LEGACY_RECORDS`] ids): a rooted log within the
+    /// legacy count of held records names more ids than such a peer reads once its stubs are
+    /// counted. [`Log::held_count`] for a whole log.
+    #[must_use]
+    pub fn known_count(&self) -> usize {
+        #[cfg(test)]
+        if mutant(Mutant::FenceHeldAlone) {
+            return self.order.len();
+        }
+        self.order
+            .len()
+            .saturating_add(self.rooting().map_or(0, |r| r.stubs.len()))
+    }
+
     pub(super) fn stub(&self, id: &RecordId) -> Option<&Stub> {
         self.rooting.as_deref().and_then(|r| r.stubs.get(id))
     }
@@ -1720,8 +1786,21 @@ impl Log {
     /// A log of this one's records but `drop`, rooted as `rooting` says: each record placed
     /// afresh through its stubs, in this log's order, and each waiting record offered again.
     pub(super) fn rebuilt(&self, rooting: Rooting, drop: &BTreeSet<RecordId>) -> Result<Self> {
+        self.rebuilt_with(rooting, drop, std::iter::empty())
+    }
+
+    /// [`Log::rebuilt`], with `more` offered after this log's own records, each in its turn and
+    /// a refused one passed over: what a records file holds after its roots and stubs
+    /// ([`super::stored`]), read into the log of its genesis.
+    pub(super) fn rebuilt_with(
+        &self,
+        rooting: Rooting,
+        drop: &BTreeSet<RecordId>,
+        more: impl IntoIterator<Item = Record>,
+    ) -> Result<Self> {
         let mut out = Self::new(self.order[0].clone())?;
         out.budgets = self.budgets;
+        out.stored_at = self.stored_at;
         out.enforce_seats = self.enforce_seats;
         #[cfg(unix)]
         out.head.clone_from(&self.head);
@@ -1737,6 +1816,9 @@ impl Log {
             .try_for_each(|record| out.insert(record.clone()).map(|_| ()));
         for record in self.waiting.values() {
             let _ = out.insert(record.clone());
+        }
+        for record in more {
+            let _ = out.insert(record);
         }
         #[cfg(test)]
         PRUNING.set(false);

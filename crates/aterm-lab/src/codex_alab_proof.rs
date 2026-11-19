@@ -19,8 +19,7 @@ use aterm_uds::spawnfd::Stdio;
 
 use crate::bus::Fabric;
 use crate::codex_alab_model::{
-    self as model, KEEP_GOING, NEED, NUDGES_BEFORE_DEFENSE, PERSON_ASKS, REOPEN, REPO_COMMIT_HOLD,
-    REPO_PUSH_HOLD, SLOW_TURN,
+    self as model, KEEP_GOING, NEED, NUDGES_BEFORE_DEFENSE, PERSON_ASKS, REOPEN, SLOW_TURN,
 };
 use crate::codex_rig;
 
@@ -38,6 +37,8 @@ mod policy_proof;
 mod published_target;
 #[path = "codex_alab_restart_proof.rs"]
 mod restart_proof;
+#[path = "codex_alab_settle_ack_proof.rs"]
+mod settle_ack_proof;
 #[path = "codex_alab_terminals_proof.rs"]
 mod terminals_proof;
 #[path = "codex_alab_upgrade_proof.rs"]
@@ -584,6 +585,22 @@ fn reading(asked: &str, r: instance::Reply) -> Result<instance::Reply, String> {
     Err(format!("`{asked}` answered {}: {said}", r.code))
 }
 
+/// Only the host's exact discovery reply establishes unavailable native execution. A transport
+/// or protocol failure is a separate finding and does not excuse the handoff checks.
+fn source_execution_unavailable(asked: &str, reply: instance::Reply) -> Result<bool, String> {
+    let reply = reading(asked, reply)?;
+    let status = reply.stdout.strip_suffix('\n').unwrap_or(&reply.stdout);
+    match status {
+        "OK native source-exec preparation=1 execution=available input-fence=1" => Ok(false),
+        "OK native source-exec preparation=1 execution=unavailable input-fence=1"
+        | "OK native source-exec preparation=0 execution=unavailable input-fence=1" => Ok(true),
+        _ => Err(format!(
+            "`{asked}` answered with an unrecognized capability: {}",
+            crate::util::one_line(status, 200)
+        )),
+    }
+}
+
 /// A one-line reply to `asked` (`status`, `meta`) as a reading ([`reading`]): its first line, which
 /// a reply that printed none lacks.
 fn line_reading(asked: &str, r: instance::Reply) -> Result<String, String> {
@@ -603,68 +620,438 @@ fn ends_said(ended: &Result<Vec<String>, String>) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepoAction {
+    Commit,
+    Push,
+}
+
+impl RepoAction {
+    const fn index(self) -> usize {
+        match self {
+            Self::Commit => 0,
+            Self::Push => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RepoChange {
+    before: String,
+    after: String,
+    old_head: String,
+    head: String,
+    remote_before: String,
+    remote_after: String,
+}
+
+#[derive(Clone, Debug)]
+struct RepoReceipt {
+    body: J,
+    request: String,
+    stopped: Result<Vec<String>, String>,
+    result: Result<RepoChange, String>,
+}
+
+#[derive(Default)]
+struct RepoState {
+    closed: bool,
+    receipts: [Option<RepoReceipt>; 2],
+}
+
+#[derive(Clone)]
+struct RepoControl {
+    client: PathBuf,
+    socket: PathBuf,
+    sid: String,
+    server: i32,
+}
+
+/// Each repository response follows its actual local mutation, independently of the order
+/// in which the proof's main thread judges the other legs. The same mutex owns the mutation,
+/// its receipt and retirement; a repeated request never performs Git work twice.
+struct RepoFixture {
+    root: PathBuf,
+    env: Vec<(String, String)>,
+    control: std::sync::Mutex<Option<RepoControl>>,
+    state: std::sync::Mutex<RepoState>,
+}
+
+impl RepoFixture {
+    fn new(root: PathBuf, mut env: Vec<(String, String)>) -> Self {
+        env.retain(|(key, _)| key != "PATH");
+        env.push(("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()));
+        Self {
+            root,
+            env,
+            control: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(RepoState::default()),
+        }
+    }
+
+    fn arm(&self, control: RepoControl) -> Result<(), String> {
+        let mut held = self
+            .control
+            .lock()
+            .map_err(|_| "repository control poisoned")?;
+        if held.is_some() {
+            return Err("repository control was already armed".into());
+        }
+        *held = Some(control);
+        Ok(())
+    }
+
+    fn stopped(&self) -> Result<Vec<String>, String> {
+        let control = self
+            .control
+            .lock()
+            .map_err(|_| "repository control poisoned")?
+            .clone()
+            .ok_or("repository control was not armed")?;
+        let server = u32::try_from(control.server)
+            .ok()
+            .filter(|pid| *pid != 0)
+            .ok_or("repository control has no native instance pid")?;
+        let mut cmd = aterm_uds::spawnfd::command(&control.client);
+        cmd.env_clear()
+            .envs(
+                self.env
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
+            .args(["ctl", "--sock"])
+            .arg(&control.socket)
+            .args(["--timeout", "0", &format!("@{}", control.sid), "timeline"])
+            .stdin(Stdio::null());
+        // The client waits on the native instance: its own idle tree is not the
+        // producer's progress. An unread tree supplies no evidence of a stall.
+        let mut probe = aterm_uds::deadline::ProcessProgressProbe::default();
+        let mut seen = None;
+        let mut generation = 0_u64;
+        let mut read_at: Option<Instant> = None;
+        let mut gone = false;
+        let out = aterm_uds::deadline::output_while_progressing(
+            &mut cmd,
+            Duration::from_secs(60),
+            &mut || {
+                let now = Instant::now();
+                if read_at.is_none_or(|at| now.duration_since(at) >= Duration::from_millis(500)) {
+                    read_at = Some(now);
+                    use aterm_uds::process::{ProcessPresence, process_presence};
+                    gone |= matches!(
+                        process_presence(control.server),
+                        ProcessPresence::Absent | ProcessPresence::Exited
+                    );
+                    if !gone {
+                        let reading = probe.read(server);
+                        if reading.is_none() || reading != seen {
+                            generation = generation.saturating_add(1);
+                        }
+                        seen = reading;
+                    }
+                }
+                generation
+            },
+        )
+        .map_err(|error| format!("repository timeline: {error}"))?;
+        if gone {
+            return Err("repository timeline's native instance ended".into());
+        }
+        // This collector keeps a bounded tail. Refuse its exact bound too: a
+        // possibly truncated prefix cannot establish the absence of an old stop.
+        if out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
+            return Err("repository timeline exceeds its complete frame bound".into());
+        }
+        let reply = instance::Reply {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        };
+        repo_stops(reply)
+    }
+
+    fn answer(&self, body: &J, answer: codex_rig::Answered) -> codex_rig::Answered {
+        self.answer_with(body, answer, || self.stopped())
+    }
+
+    fn answer_with(
+        &self,
+        body: &J,
+        answer: codex_rig::Answered,
+        stopped: impl FnOnce() -> Result<Vec<String>, String>,
+    ) -> codex_rig::Answered {
+        let action = match answer.tag.split('+').next().unwrap_or("") {
+            "repo:nudge1" => RepoAction::Commit,
+            "repo:nudge2" => RepoAction::Push,
+            tag if tag.starts_with("repo:nudge") => {
+                return repo_refused(answer, "unexpected repository transition");
+            }
+            _ => return answer,
+        };
+        let (request, _) = codex_rig::request_view(body);
+        let Ok(mut state) = self.state.lock() else {
+            return repo_refused(answer, "repository fixture state poisoned");
+        };
+        if state.closed {
+            return repo_refused(answer, "repository fixture retired");
+        }
+        let index = action.index();
+        if let Some(receipt) = &state.receipts[index] {
+            return if receipt.body != *body {
+                repo_refused(
+                    answer,
+                    "repository transition repeated with different request facts",
+                )
+            } else if let Err(why) = &receipt.result {
+                repo_refused(answer, why)
+            } else {
+                answer
+            };
+        }
+        let stopped = stopped();
+        let result = (|| {
+            let stopped = stopped.as_ref().map_err(Clone::clone)?;
+            if !stopped.is_empty() {
+                return Err(format!("repository ended before its mutation: {stopped:?}"));
+            }
+            let committed = match action {
+                RepoAction::Commit => None,
+                RepoAction::Push => Some(
+                    state.receipts[0]
+                        .as_ref()
+                        .ok_or("push requested before the commit")?
+                        .result
+                        .as_ref()
+                        .map_err(Clone::clone)?
+                        .head
+                        .as_str(),
+                ),
+            };
+            self.mutate(action, &request, committed)
+        })();
+        let refused = result.as_ref().err().cloned();
+        state.receipts[index] = Some(RepoReceipt {
+            body: body.clone(),
+            request,
+            stopped,
+            result,
+        });
+        match refused {
+            Some(why) => repo_refused(answer, &why),
+            None => answer,
+        }
+    }
+
+    fn mutate(
+        &self,
+        action: RepoAction,
+        request: &str,
+        committed: Option<&str>,
+    ) -> Result<RepoChange, String> {
+        if !request.contains(model::REPO_SUFFIX_HEAD) {
+            return Err("repository request carries no native repository facts".into());
+        }
+        let git = |args: &[&str]| fixture_git(&self.env, &self.root, args);
+        let named_origin = self
+            .root
+            .parent()
+            .ok_or("repository fixture has no parent")?
+            .join("origin.git");
+        if !std::fs::symlink_metadata(&named_origin)
+            .map_err(|error| format!("repository origin: {error}"))?
+            .is_dir()
+        {
+            return Err("repository origin is not its original local bare directory".into());
+        }
+        let origin = named_origin
+            .canonicalize()
+            .map_err(|error| format!("repository origin: {error}"))?;
+        let origin_s = origin.to_string_lossy();
+        for args in [
+            &["remote", "get-url", "--all", "origin"][..],
+            &["remote", "get-url", "--push", "--all", "origin"][..],
+        ] {
+            if git(args)?.trim() != origin_s {
+                return Err("repository origin changed from its original local bare store".into());
+            }
+        }
+        let head = || git(&["rev-parse", "--verify", "HEAD"]).map(|s| s.trim().to_string());
+        let remote = || {
+            git(&[
+                "--git-dir",
+                &origin_s,
+                "rev-parse",
+                "--verify",
+                "refs/heads/main",
+            ])
+            .map(|s| s.trim().to_string())
+        };
+        let before = git(&["status", "--porcelain", "--branch"])?;
+        let dirty = git(&["status", "--porcelain"])?;
+        let old_head = head()?;
+        let remote_before = remote()?;
+        match action {
+            RepoAction::Commit => {
+                if !request.contains(NOTES)
+                    || dirty.trim() != format!("?? {NOTES}")
+                    || old_head != remote_before
+                {
+                    return Err("commit request did not observe exactly the untracked notes".into());
+                }
+                git(&["add", NOTES])?;
+                git(&["commit", "-q", "-m", "lab: the release notes"])?;
+            }
+            RepoAction::Push => {
+                if !request.contains("not on cached origin/main")
+                    || !dirty.is_empty()
+                    || committed != Some(old_head.as_str())
+                    || old_head == remote_before
+                    || git(&["rev-parse", "--verify", "HEAD^"])?.trim() != remote_before
+                {
+                    return Err(
+                        "push request did not observe the acknowledged unpushed commit".into(),
+                    );
+                }
+                git(&["push", "-q", "origin", "main"])?;
+            }
+        }
+        let after = git(&["status", "--porcelain", "--branch"])?;
+        let head = head()?;
+        let remote_after = remote()?;
+        if !git(&["status", "--porcelain"])?.is_empty() {
+            return Err("repository mutation left uncommitted work".into());
+        }
+        let correct = match action {
+            RepoAction::Commit => {
+                head != old_head
+                    && git(&["rev-parse", "--verify", "HEAD^"])?.trim() == old_head
+                    && remote_after == remote_before
+                    && git(&["rev-list", "--count", "origin/main..HEAD"])?.trim() == "1"
+            }
+            RepoAction::Push => head == old_head && remote_after == head,
+        };
+        if !correct {
+            return Err(
+                "repository mutation did not produce its declared local and remote heads".into(),
+            );
+        }
+        Ok(RepoChange {
+            before,
+            after,
+            old_head,
+            head,
+            remote_before,
+            remote_after,
+        })
+    }
+
+    fn receipt(&self, action: RepoAction) -> Result<Option<RepoReceipt>, String> {
+        self.state
+            .lock()
+            .map(|state| state.receipts[action.index()].clone())
+            .map_err(|_| "repository fixture state poisoned".into())
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+    }
+}
+
+fn repo_stops(reply: instance::Reply) -> Result<Vec<String>, String> {
+    // The owned CLI validates the server's counted frame and prints only its rows.
+    // Only its successful exit with complete collected pipes and bounded output stands
+    // for that frame; this fresh session's history must also have no missing events.
+    let reply = reading("repository timeline before its mutation", reply)?;
+    let rows: Vec<_> = reply.stdout.lines().collect();
+    if rows.is_empty()
+        || !reply.stdout.ends_with('\n')
+        || rows.iter().any(|line| !line.starts_with("event "))
+    {
+        return Err("repository timeline is incomplete or malformed".into());
+    }
+    let mut stopped = Vec::new();
+    // This leg is a fresh session: a retained suffix or an interior ring hole cannot
+    // establish that no earlier stop was published.
+    for (index, line) in rows.into_iter().enumerate() {
+        let id = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|word| word.parse::<usize>().ok());
+        if id != index.checked_add(1) {
+            return Err("repository timeline omitted or reordered an event".into());
+        }
+        let kind = field(line, "kind").ok_or("repository timeline has an unreadable kind")?;
+        if kind == "harness-act" {
+            let act = field(line, "act").ok_or("repository timeline has an unreadable act")?;
+            if matches!(act.as_str(), LANDED | FINISHED) {
+                stopped.push(act);
+            }
+        }
+    }
+    Ok(stopped)
+}
+
+fn repo_refused(mut answer: codex_rig::Answered, why: &str) -> codex_rig::Answered {
+    answer.status = 500;
+    answer.kind = "application/json";
+    answer.body = J::obj([("error", J::obj([("message", J::s(why))]))]).py();
+    answer.delay = Duration::ZERO;
+    answer
+}
+
+struct RepoOwner(Arc<RepoFixture>);
+
+impl Drop for RepoOwner {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+fn fixture_git(env: &[(String, String)], dir: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/git");
+    cmd.env_clear()
+        .envs(
+            env.iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "user.name=aterm-lab",
+            "-c",
+            "user.email=lab@aterm.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null());
+    let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
+        &mut cmd,
+        Duration::from_secs(60),
+        "the repository fixture's Git operation",
+    )
+    .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
 fn ms_of(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
-}
-
-/// When the last commit on `main` in the repository at `proj` was made, in milliseconds since the
-/// epoch: the time `main`'s reflog was last written, which the commit appended to (a push or a
-/// fetch writes the remote's reflog, never this one). A commit's own date holds whole seconds,
-/// which reads a commit up to a second past a hold as inside it.
-fn committed_ms(proj: &Path) -> Option<i64> {
-    let at = std::fs::symlink_metadata(proj.join(".git/logs/refs/heads/main"))
-        .ok()
-        .filter(std::fs::Metadata::is_file)?
-        .modified()
-        .ok()?;
-    i64::try_from(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()).ok()
-}
-
-/// How long after a model's nudge at `asked_ms` the last commit in `proj` came
-/// ([`committed_ms`]), when that was past the model's `hold`.
-fn committed_past(asked_ms: i64, proj: &Path, hold: Duration) -> Option<i64> {
-    let came = committed_ms(proj)? - asked_ms;
-    (came >= ms_of(hold)).then_some(came)
-}
-
-/// A lab act a model's hold times: whether it came inside the hold, and the line saying when,
-/// counted from the model's nudge (`asked_ms`): when the lab came to act (`arrived_ms`) and when
-/// it acted (`acted_ms`). A lab that came already past the hold was held by an earlier leg of its
-/// own run, which says nothing of Land's repo logic; one that came inside it and acted past it
-/// names the act.
-fn hold_line(asked_ms: i64, arrived_ms: i64, acted_ms: i64, hold: Duration) -> (bool, String) {
-    let hold_ms = ms_of(hold);
-    let (came, into) = (arrived_ms - asked_ms, acted_ms - asked_ms);
-    let held = hold.as_secs();
-    if came >= hold_ms {
-        return (
-            false,
-            format!(
-                "{} into the model's {held} s hold: the lab came {} after the model's nudge, past its hold, held by an earlier leg of the lab's run (this is not Land's repo logic)",
-                secs(into),
-                secs(came)
-            ),
-        );
-    }
-    let at = if came > 0 {
-        format!("the lab came {} after the model's nudge", secs(came))
-    } else {
-        "the lab was waiting for the model's nudge".to_string()
-    };
-    if into >= hold_ms {
-        return (
-            false,
-            format!(
-                "{} into the model's {held} s hold: {at}, inside its hold, and the act itself took {} past it",
-                secs(into),
-                secs(into - hold_ms)
-            ),
-        );
-    }
-    (
-        true,
-        format!("{} into the model's {held} s hold ({at})", secs(into)),
-    )
 }
 
 fn str_of(row: &J, k: &str) -> String {
@@ -996,14 +1383,32 @@ fn exec_generation(record: &J) -> i64 {
 }
 
 fn observed_upgrade(record: &J, pid: i32, before: i64, executable: &Path) -> bool {
-    exec_generation(record) > before
-        && record
-            .get("exe")
-            .and_then(J::as_str)
-            .and_then(|path| std::fs::canonicalize(path).ok())
-            .zip(std::fs::canonicalize(executable).ok())
-            .is_some_and(|(observed, expected)| observed == expected)
+    exec_generation(record) > before && observed_image(record, pid, executable)
+}
+
+fn observed_image(record: &J, pid: i32, executable: &Path) -> bool {
+    record
+        .get("exe")
+        .and_then(J::as_str)
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .zip(std::fs::canonicalize(executable).ok())
+        .is_some_and(|(observed, expected)| observed == expected)
         && aterm_uds::process::image_matches_file(pid, executable) == Some(true)
+}
+
+/// Classify the watcher’s own last admission refusal without reproducing arbitrary journal text.
+fn upgrade_admission_failure(log: &str) -> Option<&'static str> {
+    let reason = log.lines().rev().find_map(|line| {
+        line.split_once(" codex_alab_autopilot: upgrade target admission: ")
+            .map(|(_, reason)| reason)
+    })?;
+    Some(if reason == "invalid executable custody descriptors" {
+        "native package admission returned invalid executable custody descriptors"
+    } else if reason.contains("unknown field `full_runtime`") {
+        "the source rejected full_runtime in the successor’s capability reply"
+    } else {
+        "the source refused target admission; the private watcher journal contains its reason"
+    })
 }
 
 fn person_hand(status: &str) -> (Option<u64>, u64) {
@@ -1045,11 +1450,13 @@ pub(crate) struct Proof {
     s: PathBuf,
     h: PathBuf,
     world_env: Vec<(String, String)>,
-    published_target: Option<published_target::Target>,
+    published: Option<published_target::Staged>,
+    settle_ack: Option<settle_ack_proof::Guardian>,
     api_log: Arc<std::sync::Mutex<codex_rig::ApiLog>>,
     /// The fake API and observer share this clock, outside every re-exec.
     api_clock: Instant,
     port: u16,
+    repo: RepoOwner,
     fails: Vec<String>,
     /// The checks that held.
     oks: usize,
@@ -1229,33 +1636,7 @@ impl Proof {
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> Result<String, String> {
-        let out = aterm_uds::spawnfd::command("/usr/bin/git")
-            .env_clear()
-            .envs(self.world_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .args([
-                "-c",
-                "user.name=aterm-lab",
-                "-c",
-                "user.email=lab@aterm.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "init.defaultBranch=main",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            Err(format!(
-                "git {}: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))
-        }
+        fixture_git(&self.world_env, dir, args)
     }
 
     fn lay_folder(&self, dir: &Path, proj: &Path, folder: Folder) -> Result<(), String> {
@@ -1514,6 +1895,17 @@ impl Proof {
             sh_quote(&home.to_string_lossy()),
             sh_quote(&proj.to_string_lossy()),
         );
+        if name == "repo" {
+            self.repo
+                .0
+                .arm(RepoControl {
+                    client: self.inst.client.clone(),
+                    socket: self.inst.sock.clone(),
+                    sid: sid.clone(),
+                    server: self.inst.pid,
+                })
+                .map_err(Fail::die)?;
+        }
         let sent = self
             .inst
             .ctl_stdin(&[&format!("@{sid}"), "send", "--stdin"], line.as_bytes());
@@ -1664,13 +2056,19 @@ impl Proof {
     }
 
     fn link(&self, pkg: &Path) -> Result<(), String> {
-        if let Some(target) = &self.published_target
-            && target.matches(&self.h, pkg)?
-        {
-            if target.linked(&self.h)? {
-                self.package_action("unlink", None)?;
+        if let Some(packages) = &self.published {
+            if let Some(payload) = packages.payload(pkg)? {
+                if published_target::linked(&self.h)? {
+                    if packages.original().is_some() {
+                        return Err("the signed handoff store has a development link".into());
+                    }
+                    self.package_action("unlink", None)?;
+                }
+                return payload.activate(&self.h);
             }
-            return target.activate(&self.h);
+            if packages.original().is_some() {
+                return Err("the package is outside the signed handoff pair".into());
+            }
         }
         self.package_action("link", Some(pkg))
     }
@@ -2749,12 +3147,11 @@ impl Proof {
         self.requests(leg)
             .iter()
             .find(|r| str_of(r, "tag").starts_with(head))
-            .map(|r| (str_of(r, "tag"), str_of(r, "u")))
+            .map(|r| (str_of(r, "tag"), str_of(r, "u_full")))
             .unwrap_or_default()
     }
 
     fn repo_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
-        let arrived = crate::util::now_ms();
         let land = self.await_act(leg, "land@v1", Duration::from_secs(300))?;
         let defended = self.await_tag(leg, "land", Duration::from_secs(60))?;
         self.check(
@@ -2765,86 +3162,76 @@ impl Proof {
             return Ok(());
         }
         let nudged = self.await_tag(leg, "nudge1", Duration::from_secs(240))?;
-        let ended = self.has_any(leg, &[LANDED]);
-        let asked = first_at(&self.requests("repo"), "repo:nudge1").unwrap_or(0);
         let (tag, text) = self.request_named("repo", "repo:nudge1");
+        let receipt = self
+            .repo
+            .0
+            .receipt(RepoAction::Commit)
+            .and_then(|receipt| receipt.ok_or_else(|| "no commit receipt".to_string()));
+        let ended = receipt
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|receipt| receipt.stopped.clone());
         self.check(
             &format!(
-                "repo: the clean defense over a repository with an untracked file is NOT landed: a land-nudge@v1 follows naming the repository's work (ends {}; …{})",
-                ends_said(&ended),
-                tail(&text, 180)
+                "repo: the clean defense over a repository with an untracked file is NOT landed: a land-nudge@v1 follows naming the repository's work (ends before mutation {}; …{})",
+                ends_said(&ended), tail(&text, 180)
             ),
-            nudged
-                && ended.as_ref().is_ok_and(Vec::is_empty)
-                && tag.ends_with("+repo")
-                && text.contains(NOTES),
+            nudged && ended.as_ref().is_ok_and(Vec::is_empty)
+                && tag.ends_with("+repo") && text.contains(NOTES)
+                && receipt.as_ref().is_ok_and(|receipt| receipt.request == text),
         );
-        if !nudged {
-            return Ok(());
-        }
-        let committed = self
-            .git(&leg.proj, &["add", NOTES])
-            .and_then(|_| self.git(&leg.proj, &["commit", "-q", "-m", "lab: the release notes"]))
-            .and_then(|_| self.git(&leg.proj, &["status", "--porcelain", "--branch"]));
-        let (inside, timing) = hold_line(asked, arrived, crate::util::now_ms(), REPO_COMMIT_HOLD);
+        let committed = receipt.and_then(|receipt| receipt.result);
         self.check(
-            &format!(
-                "repo: the lab committed {NOTES}, not pushing it, {timing} ({})",
-                committed
-                    .as_ref()
-                    .map_or_else(Clone::clone, |s| s.trim().replace('\n', " | "))
-            ),
-            committed.as_ref().is_ok_and(|s| s.contains("ahead 1")) && inside,
+            &format!("repo: the request-local fixture committed {NOTES} before its model defense ({committed:?})"),
+            committed.as_ref().is_ok_and(|change| {
+                change.old_head != change.head
+                    && change.old_head == change.remote_before
+                    && change.remote_before == change.remote_after
+                    && change.before.contains(NOTES)
+                    && change.after.contains("ahead 1")
+            }),
         );
         Ok(())
     }
 
-    /// How long after the model's first repo nudge the lab's commit came, when that was past the
-    /// model's commit hold ([`committed_ms`]).
-    fn committed_past_hold(&self, leg: &Leg) -> Option<i64> {
-        let asked = first_at(&self.requests("repo"), "repo:nudge1")?;
-        committed_past(asked, &leg.proj, REPO_COMMIT_HOLD)
-    }
-
     fn repo_pushed(&mut self, leg: &Leg) -> Result<(), Stopped> {
-        let arrived = crate::util::now_ms();
-        let nudged = self.await_tag(leg, "nudge2", REPO_COMMIT_HOLD + Duration::from_secs(360))?;
-        let ended = self.has_any(leg, &[LANDED]);
-        let asked = first_at(&self.requests("repo"), "repo:nudge2").unwrap_or(0);
+        let nudged = self.await_tag(leg, "nudge2", Duration::from_secs(420))?;
         let (tag, text) = self.request_named("repo", "repo:nudge2");
-        let why = self.committed_past_hold(leg).map_or_else(String::new, |came| {
-            format!(
-                "; the nudge names the untracked {NOTES} because the lab's commit came {} after the model's first nudge, past its {} s hold",
-                secs(came),
-                REPO_COMMIT_HOLD.as_secs()
-            )
-        });
+        let receipt = self
+            .repo
+            .0
+            .receipt(RepoAction::Push)
+            .and_then(|receipt| receipt.ok_or_else(|| "no push receipt".to_string()));
+        let ended = receipt
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|receipt| receipt.stopped.clone());
         self.check(
             &format!(
-                "repo: committed but not pushed, the next clean defense is NOT landed either: a land-nudge@v1 names the commit the remote main lacks (ends {}; …{}){why}",
-                ends_said(&ended),
-                tail(&text, 180)
+                "repo: committed but not pushed, the next clean defense is NOT landed either: a land-nudge@v1 names the commit the remote main lacks (ends before mutation {}; …{})",
+                ends_said(&ended), tail(&text, 180)
             ),
-            nudged
-                && ended.as_ref().is_ok_and(Vec::is_empty)
-                && tag.ends_with("+repo")
-                && text.contains("not on origin/main"),
+            nudged && ended.as_ref().is_ok_and(Vec::is_empty)
+                && tag.ends_with("+repo") && text.contains("not on cached origin/main")
+                && receipt.as_ref().is_ok_and(|receipt| receipt.request == text),
         );
-        if !nudged {
-            return Ok(());
-        }
-        let pushed = self
-            .git(&leg.proj, &["push", "-q", "origin", "main"])
-            .and_then(|_| self.git(&leg.proj, &["status", "--porcelain", "--branch"]));
-        let (inside, timing) = hold_line(asked, arrived, crate::util::now_ms(), REPO_PUSH_HOLD);
+        let pushed = receipt.and_then(|receipt| receipt.result);
+        let committed = self
+            .repo
+            .0
+            .receipt(RepoAction::Commit)
+            .ok()
+            .flatten()
+            .and_then(|receipt| receipt.result.ok());
         self.check(
-            &format!(
-                "repo: the lab pushed it to the local bare origin {timing} ({})",
-                pushed
-                    .as_ref()
-                    .map_or_else(Clone::clone, |s| s.trim().replace('\n', " | "))
-            ),
-            pushed.is_ok() && inside,
+            &format!("repo: the request-local fixture pushed the acknowledged commit to its original bare origin before its model defense ({pushed:?})"),
+            pushed.as_ref().is_ok_and(|change| {
+                committed.as_ref().is_some_and(|commit| commit.head == change.old_head)
+                    && change.old_head == change.head && change.remote_after == change.head
+                    && change.remote_before != change.remote_after
+                    && change.before.contains("ahead 1") && !change.after.contains("ahead")
+            }),
         );
         let landed = self.await_act(leg, LANDED, Duration::from_secs(90))?;
         let mut face = String::new();
@@ -2856,11 +3243,16 @@ impl Proof {
         if face.is_empty() {
             face = task_face(&self.status(&leg.sid));
         }
+        let acts = self.read_acts(&leg.sid);
         self.check(
-            &format!(
-                "repo: pushed, the next clean defense lands it ({LANDED}; status task={face})"
-            ),
-            landed && landed_face,
+            &format!("repo: after both native nudges and the push, the next clean defense lands exactly once ({LANDED}; status task={face}; acts {acts:?})"),
+            landed && landed_face && acts.as_ref().is_ok_and(|acts| {
+                acts.iter().filter(|act| act.as_str() == LANDED).count() == 1
+                    && acts.iter().filter(|act| act.as_str() == "land-nudge@v1").count() == 2
+                    && acts.iter().rposition(|act| act == "land-nudge@v1")
+                        .zip(acts.iter().position(|act| act == LANDED))
+                        .is_some_and(|(nudge, end)| nudge < end)
+            }),
         );
         Ok(())
     }
@@ -3137,13 +3529,95 @@ impl Proof {
         Ok(())
     }
 
-    fn upgrade_leg(&mut self, leg: &Leg, pkg_b: &Path) -> Result<(), Stopped> {
+    fn upgrade_leg(&mut self, leg: &Leg, pkg_b: &Path) -> Result<bool, Stopped> {
         let Some(pid) = self.proven_pid(&leg.sid) else {
             self.check("upgrade: no proven codex-alab to move", false);
-            return Ok(());
+            return Ok(false);
         };
         let generation = exec_generation;
-        let before = Self::record(leg, pid).map_or(0, |r| generation(&r));
+        let prior = Self::record(leg, pid);
+        let before = prior.as_ref().map_or(0, generation);
+        let signed_source = if let Some(original) = self
+            .published
+            .as_ref()
+            .and_then(published_target::Staged::original)
+        {
+            let build = original.build();
+            let source = original.observe_process(pid);
+            let different = aterm_uds::process::image_matches_file(pid, &pkg_b.join("bin/codex"))
+                == Some(false);
+
+            self.check(
+                &format!("upgrade: source PID {pid} maps the signed private Codex build {build}"),
+                source.is_some() && different,
+            );
+            let Some(source) = source.filter(|_| different) else {
+                return Ok(false);
+            };
+            println!(
+                "  signed source: pid={} birth={} build={build} image={} device={} inode={}",
+                source.pid,
+                source.birth,
+                String::from_utf8_lossy(&source.image.path),
+                source.image.device,
+                source.image.inode,
+            );
+            Some((source.birth, build))
+        } else {
+            None
+        };
+        if self.settle_ack.is_some() {
+            let expected = (|| {
+                let (birth, source_build) = signed_source?;
+                let primary = prior.as_ref()?.get("sessionId")?.as_str()?.to_owned();
+                let target = self.published.as_ref()?.payload(pkg_b).ok()??;
+                Some(settle_ack_proof::Expected {
+                    sid: leg.sid.clone(),
+                    pid: u32::try_from(pid).ok()?,
+                    birth,
+                    source_build,
+                    build: target.build(),
+                    primary,
+                })
+            })();
+            let Some(expected) = expected else {
+                self.check(
+                    "upgrade: missing original signed settlement identity",
+                    false,
+                );
+                return Ok(false);
+            };
+            if let Some(guardian) = self.settle_ack.as_mut()
+                && let Err(error) = guardian.arm(expected)
+            {
+                self.check(
+                    &format!("upgrade: fault guardian refused arm ({error})"),
+                    false,
+                );
+                return Ok(false);
+            }
+        }
+        let reply = self.on(&leg.sid, &["native-act", "info", "source-exec"]);
+        let asked = format!("@{} native-act info source-exec", leg.sid);
+        match source_execution_unavailable(&asked, reply) {
+            Ok(true) => {
+                self.check(
+                    "upgrade: the host reports native source execution unavailable",
+                    false,
+                );
+                return Ok(false);
+            }
+            Ok(false) => {}
+            Err(why) => {
+                self.check(
+                    &format!("upgrade: native source execution discovery failed ({why})"),
+                    false,
+                );
+                if self.settle_ack.is_some() {
+                    return Ok(false);
+                }
+            }
+        }
         let linked = self.link(pkg_b);
         self.check(
             &format!(
@@ -3152,20 +3626,90 @@ impl Proof {
             ),
             linked.is_ok(),
         );
+        if linked.is_err() {
+            return Ok(false);
+        }
         let executable = pkg_b.join("bin/codex");
         let moved = Self::wait_for(Duration::from_secs(150), Duration::from_secs(1), || {
             Self::record(leg, pid).is_some_and(|r| observed_upgrade(&r, pid, before, &executable))
+                && signed_source.is_none_or(|(birth, _)| {
+                    aterm_uds::process::read_birth(pid).is_some_and(|now| now.0 == birth)
+                })
         })?;
         let acts = self.acts(&leg.sid);
         self.check(
             "upgrade: the running codex-alab re-exec'd onto the selected build (upgrade@v1, execGeneration up, exe the replacement's)",
             moved && acts.iter().any(|a| a == "upgrade@v1"),
         );
-        let reproven = moved
-            && Self::wait_for(Duration::from_secs(90), Duration::from_secs(1), || {
-                self.proven_pid(&leg.sid) == Some(pid)
-            })?;
+        if !moved {
+            if let Some(why) = upgrade_admission_failure(&Self::codex_log(leg)) {
+                println!("  watcher: {why}");
+            }
+            return Ok(false);
+        }
+        if let Some(guardian) = self.settle_ack.as_mut() {
+            match guardian.await_recovery() {
+                Ok(()) => {
+                    self.check(
+                        "upgrade: replacement read back the exact settlement after EOF",
+                        true,
+                    );
+                }
+                Err(error) => {
+                    self.check(
+                        &format!("upgrade: exact settlement recovery not witnessed ({error})"),
+                        false,
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        let reproven = Self::wait_for(Duration::from_secs(90), Duration::from_secs(1), || {
+            self.proven_pid(&leg.sid) == Some(pid)
+        })?;
         self.check("upgrade: the new image proved its claim again", reproven);
+        Ok(reproven)
+    }
+
+    fn verify_final_settle_ack(&mut self, pid: i32, pkg_b: &Path) -> Result<(), Fail> {
+        let Some(guardian) = self.settle_ack.as_mut() else {
+            return Ok(());
+        };
+        let still_target = self
+            .published
+            .as_ref()
+            .and_then(|staged| staged.payload(pkg_b).ok().flatten())
+            .and_then(|target| target.observe_process(pid))
+            .is_some();
+        if !still_target {
+            self.check(
+                "upgrade: the surviving process still maps the signed target",
+                false,
+            );
+            return Ok(());
+        }
+        match guardian.final_observation() {
+            Ok(observed) => {
+                let bytes = aterm_json::to_vec(&observed).map_err(|error| {
+                    Fail::die(format!(
+                        "cannot encode the native settlement evidence: {error}"
+                    ))
+                })?;
+                crate::util::write_fresh(&self.s.join("settle-ack-evidence.json"), bytes).map_err(
+                    |error| Fail::die(format!("cannot preserve settlement evidence: {error}")),
+                )?;
+                self.check(
+                    "upgrade: the original operation settled once through continuation",
+                    true,
+                );
+            }
+            Err(error) => {
+                self.check(
+                    &format!("upgrade: final original settlement observation changed ({error})"),
+                    false,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -3816,7 +4360,11 @@ impl Proof {
     }
 
     fn end_all(&mut self) {
+        // A server thread that already admitted a Git mutation retains it through retirement;
+        // closing waits for its receipt and prevents any later request from mutating.
+        self.repo.0.close();
         codex_rig::end_all(self.inst.pid, &self.s);
+        drop(self.settle_ack.take());
         if let Err(why) = self.inst.stop() {
             self._world.keep();
             self.check("private instance cleanup completed", false);
@@ -4002,6 +4550,8 @@ const ONLY: [(&str, Lane); 8] = [
 struct Asked {
     keep: bool,
     lane: Lane,
+    signed_original: bool,
+    lose_settle_ack: bool,
     aterm: Option<String>,
     package: Option<String>,
     upgrade_package: Option<String>,
@@ -4016,6 +4566,8 @@ struct Asked {
 fn asked(args: &[String]) -> Result<Asked, Fail> {
     let mut a = args.to_vec();
     let keep = instance::take_flag(&mut a, "--keep");
+    let signed_original = instance::take_flag(&mut a, "--signed-original");
+    let lose_settle_ack = instance::take_flag(&mut a, "--lose-settle-ack");
     let named: Vec<(&str, Lane)> = ONLY
         .into_iter()
         .filter(|(flag, _)| instance::take_flag(&mut a, flag))
@@ -4042,6 +4594,17 @@ fn asked(args: &[String]) -> Result<Asked, Fail> {
             "codex-alab-proof: --upgrade-package goes with the full proof, --upgrade-only or --raw-upgrade-only",
         ));
     }
+    if signed_original && (lane != Lane::Upgrade || package.is_none() || upgrade_package.is_none())
+    {
+        return Err(Fail::usage(
+            "codex-alab-proof: --signed-original requires --upgrade-only, --package and --upgrade-package",
+        ));
+    }
+    if lose_settle_ack && (!signed_original || aterm.is_none()) {
+        return Err(Fail::usage(
+            "codex-alab-proof: --lose-settle-ack requires --signed-original and an explicit debug --aterm",
+        ));
+    }
     if lane == Lane::Capacity && (aterm.is_some() || expect.is_some()) {
         return Err(Fail::usage(
             "codex-alab-proof: --capacity-only runs no aterm and no rollout leg",
@@ -4055,6 +4618,8 @@ fn asked(args: &[String]) -> Result<Asked, Fail> {
     Ok(Asked {
         keep,
         lane,
+        signed_original,
+        lose_settle_ack,
         aterm,
         package,
         upgrade_package,
@@ -4063,6 +4628,9 @@ fn asked(args: &[String]) -> Result<Asked, Fail> {
 }
 
 /// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--restart-only|--window-only|--capacity-only]`
+/// `--upgrade-only --signed-original --package A --upgrade-package B` starts from two distinct
+/// installed signed builds in one private store. Use a debug or dev-seams aterm for its registry.
+/// `--lose-settle-ack` adds the private guardian proof to that signed lane with explicit `--aterm`.
 /// (`--terminals-only`: the background terminals leg alone, about 1 min; `--facts-only`: the facts
 /// leg alone, about 7 min; `--capacity-only`: the capacity lane alone, with no aterm, about 1 min).
 /// # Errors
@@ -4072,6 +4640,8 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     let Asked {
         keep,
         lane,
+        signed_original,
+        lose_settle_ack,
         aterm,
         package: given,
         upgrade_package: upgrade_given,
@@ -4114,9 +4684,14 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     } else if matches!(lane, Lane::Upgrade | Lane::RawUpgrade) {
         println!("upgrade target: the same package bytes at another private path");
     }
-    let published_target = lane
+    let published = lane
         .hands_off()
-        .then(|| published_target::Target::prepare(upgrade_pkg.as_deref().unwrap_or(&pkg)))
+        .then(|| {
+            published_target::Packages::prepare(
+                signed_original.then_some(pkg.as_path()),
+                upgrade_pkg.as_deref().unwrap_or(&pkg),
+            )
+        })
         .transpose()
         .map_err(not_run)?;
     let mut proof = start_with_grace(
@@ -4130,7 +4705,8 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
             "",
         ),
         if lane == Lane::Restart { 120 } else { 5 },
-        published_target,
+        published,
+        lose_settle_ack,
     )?;
     proof.expect = expect;
     let (pkg_a, pkg_b) = (proof.s.join("pkg-a"), proof.s.join("pkg-b"));
@@ -4210,7 +4786,7 @@ fn settle(
 /// The signed handoff target is unavailable, the rig could not start, an interrupt, or a leg
 /// ended in an error before any check failed.
 pub(crate) fn run(aterm: PathBuf, pkg: &Path, expect: Option<bool>) -> Result<Run, Fail> {
-    let published_target = published_target::Target::prepare(pkg)
+    let published = published_target::Packages::prepare(None, pkg)
         .map_err(|why| Fail::exit(3, format!("NOT RUN: {why}")))?;
     let mut proof = start_with_grace(
         aterm,
@@ -4223,7 +4799,8 @@ pub(crate) fn run(aterm: PathBuf, pkg: &Path, expect: Option<bool>) -> Result<Ru
             "",
         ),
         5,
-        Some(published_target),
+        Some(published),
+        false,
     )?;
     proof.expect = expect;
     let (pkg_a, pkg_b) = (proof.s.join("pkg-a"), proof.s.join("pkg-b"));
@@ -4283,7 +4860,7 @@ fn start(
     keep: bool,
     (args, top): (Vec<String>, &str),
 ) -> Result<Proof, Fail> {
-    start_with_grace(aterm, (pkg, upgrade), keep, (args, top), 5, None)
+    start_with_grace(aterm, (pkg, upgrade), keep, (args, top), 5, None, false)
 }
 
 fn start_with_grace(
@@ -4292,8 +4869,16 @@ fn start_with_grace(
     keep: bool,
     (args, top): (Vec<String>, &str),
     human_grace_s: u32,
-    published_target: Option<published_target::Target>,
+    published: Option<published_target::Packages>,
+    lose_settle_ack: bool,
 ) -> Result<Proof, Fail> {
+    if lose_settle_ack {
+        published
+            .as_ref()
+            .ok_or_else(|| "missing the signed settlement pair".to_string())
+            .and_then(published_target::Packages::check_source_constructor)
+            .map_err(|error| Fail::exit(3, format!("NOT RUN: {error}")))?;
+    }
     let lock = proof_lock(
         &crate::paths::state_root(crate::sys::getuid()).join(PROOF_LOCK),
         PROOF_LOCK_WAIT,
@@ -4315,6 +4900,7 @@ fn start_with_grace(
         s.join("api.log"),
         api_clock,
     )));
+    let repo = Arc::new(RepoFixture::new(s.join("legs/repo/proj"), world.env()));
     world.keep();
     let made = (|| -> std::io::Result<u16> {
         for d in ["zdot", "legs"] {
@@ -4324,7 +4910,9 @@ fn start_with_grace(
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let log = Arc::clone(&api_log);
-        let answer = model::answerer();
+        let model = model::answerer();
+        let repo = Arc::clone(&repo);
+        let answer: codex_rig::Answer = Arc::new(move |body| repo.answer(body, model(body)));
         std::thread::spawn(move || codex_rig::serve(listener, log, answer));
         crate::util::write_fresh(
             &s.join("zdot/.zshrc"),
@@ -4340,14 +4928,22 @@ fn start_with_grace(
     })();
     let port =
         made.map_err(|e| format!("codex-alab-proof: cannot lay out {}: {e}", s.display()))?;
-    published_target::clone_package(pkg, &s.join("pkg-a")).map_err(Fail::die)?;
-    let registry = if let Some(target) = &published_target {
-        Some(target.stage(&s, &h).map_err(Fail::die)?)
-    } else {
+    let published = published
+        .map(|packages| packages.stage(&s, &h))
+        .transpose()
+        .map_err(Fail::die)?;
+    if published
+        .as_ref()
+        .and_then(published_target::Staged::original)
+        .is_none()
+    {
+        published_target::clone_package(pkg, &s.join("pkg-a")).map_err(Fail::die)?;
+    }
+    if published.is_none() {
         published_target::clone_package(upgrade.unwrap_or(pkg), &s.join("pkg-b"))
             .map_err(Fail::die)?;
-        None
-    };
+    }
+    let registry = published.as_ref().map(|packages| &packages.registry);
     let sandbox = policy(port, crate::paths::paths(), &s).map_err(Fail::die)?;
     let sstr = |sub: &str| s.join(sub).to_string_lossy().into_owned();
     let mut env: Vec<(String, String)> = [
@@ -4365,7 +4961,7 @@ fn start_with_grace(
     ]
     .map(|(k, v)| (k.to_string(), v))
     .to_vec();
-    if let Some(registry) = &registry {
+    if let Some(registry) = registry {
         env.push((
             "ATPKG_REGISTRY".into(),
             format!("dir:{}", registry.display()),
@@ -4375,13 +4971,43 @@ fn start_with_grace(
         let mut e = world.env();
         e.retain(|(k, _)| k != "PATH");
         e.push(("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()));
-        if let Some(registry) = &registry {
+        if let Some(registry) = registry {
             e.push((
                 "ATPKG_REGISTRY".into(),
                 format!("dir:{}", registry.display()),
             ));
         }
         e
+    };
+    if let Some(packages) = &published
+        && packages.original().is_some()
+    {
+        packages
+            .check_fixture_host(&aterm, &sandbox, &env, &s)
+            .map_err(|why| Fail::exit(3, format!("NOT RUN: {why}")))?;
+    }
+    let guardian = if lose_settle_ack {
+        let state_home = aterm_types::world::state_home(&world.home)
+            .ok_or_else(|| Fail::die("private settlement state home is unavailable"))?;
+        env.push((
+            aterm_types::world::MARKER.into(),
+            state_home.to_string_lossy().into_owned(),
+        ));
+        aterm_uds::private_file::write_private(&world.dir, "lab-world", b"aterm-lab-world/1\n")
+            .map_err(|error| Fail::die(format!("cannot mark the settlement world: {error}")))?;
+        let listener = settle_ack_proof::Listener::bind(&s).map_err(|error| {
+            Fail::die(format!(
+                "cannot create the private settlement guardian: {error}"
+            ))
+        })?;
+        listener.append_environment(&mut env).map_err(|error| {
+            Fail::die(format!(
+                "cannot offer the private settlement guardian: {error}"
+            ))
+        })?;
+        Some((listener, aterm.clone()))
+    } else {
+        None
     };
     let inst = Instance::start(
         &world,
@@ -4395,15 +5021,29 @@ fn start_with_grace(
             reroute: false,
         },
     )?;
+    let settle_ack = guardian
+        .map(|(listener, executable)| {
+            let pid = inst
+                .aterm_pid()
+                .ok_or_else(|| Fail::die("private host PID unavailable"))?;
+            listener.connect_host(pid, &executable).map_err(|error| {
+                Fail::die(format!(
+                    "cannot authenticate the private settlement guardian: {error}"
+                ))
+            })
+        })
+        .transpose()?;
     Ok(Proof {
         inst,
         s,
         h,
         world_env,
-        published_target,
+        published,
+        settle_ack,
         api_log,
         api_clock,
         port,
+        repo: RepoOwner(repo),
         fails: Vec::new(),
         oks: 0,
         unobserved: Vec::new(),
@@ -4623,23 +5263,13 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     let t = Instant::now();
     proof.land_leg(&land)?;
     timed(proof, "land", t);
-    // Each of the rollout leg's four fences waits out two reads of a tab at rest, up to 30 s
-    // where the tab wrote in the last ten minutes and up to two minutes where it did not
-    // ([`FENCE_WAIT`]), so the leg is read here, after the legs whose lab act must land inside a
-    // model's hold: ahead of them its waits would bring the lab to the repo leg's commit that
-    // much later into the model's hold. Its four tabs were driven by the legs above; no leg
-    // between those and here acts on them, and `upgrade_leg`, which re-execs every codex-alab,
-    // comes after.
+    // These fences read the four tabs after their driving legs and before upgrade re-execs
+    // them. Repository mutations are request-local and cannot be delayed by these reads.
     let t = Instant::now();
     proof.rollout_leg(&[&first, &cont, &approval, &question])?;
     timed(proof, "rollout", t);
-    // The worker's `await task` waits up to 240 s on a worker that never lands (a package's
-    // defect), so it is checked here, after the legs whose lab act must land inside a model's
-    // hold (the repo leg's commit and push), and that defect reads as the worker's FAILs alone.
-    // The legs ahead of those acts can also wait long when a package stalls them; their lines
-    // then say the lab came past the hold, held by an earlier leg ([`hold_line`]). The worker
-    // was spawned and claimed at the start, so one that lands costs nothing here; and it is
-    // checked before `upgrade_leg` re-execs every codex-alab.
+    // The worker was spawned and claimed at the start. Judge its completion before upgrade
+    // re-execs every codex-alab; its bounded wait cannot delay repository mutations.
     if let Some(worker) = &worker {
         let t = Instant::now();
         proof.worker_leg(worker)?;
@@ -4658,16 +5288,21 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     let exchange_was = proof.exchange_before_upgrade(&exchange);
     let landed_was = proof.landed_before_upgrade(&[&land, &reland, &repo])?;
     let t = Instant::now();
-    proof.upgrade_leg(&cont, pkg_b)?;
+    let upgraded = proof.upgrade_leg(&cont, pkg_b)?;
     timed(proof, "upgrade", t);
-    if typed.0.is_some() {
+    if !upgraded {
+        proof.unobserved("post-upgrade exchange and landed-state checks require an observed replacement with a renewed claim");
+    }
+    if upgraded && typed.0.is_some() {
         let t = Instant::now();
         proof.exchange_stays_left(&exchange, exchange_was)?;
         timed(proof, "exchange (past the upgrade)", t);
     }
-    let t = Instant::now();
-    proof.landed_stand_past_upgrade(&landed_was)?;
-    timed(proof, "landed (past the upgrade)", t);
+    if upgraded {
+        let t = Instant::now();
+        proof.landed_stand_past_upgrade(&landed_was)?;
+        timed(proof, "landed (past the upgrade)", t);
+    }
     proof.took = Some(began.elapsed());
     if !proof.fails.is_empty() {
         proof.diagnose(&all);

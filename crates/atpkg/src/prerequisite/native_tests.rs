@@ -64,6 +64,17 @@ fn kept(fixture: &Fixture) -> bool {
         crate::lease::Reclaim::Keep(_)
     )
 }
+/// The lease is free once its final description closes. A child another test thread forked
+/// meanwhile holds a copy of that description until its exec (a lock released by close, as an
+/// offered-out lease is, stays held by it), so this is a hang detector, not an instant read.
+#[track_caller]
+fn released(fixture: &Fixture) {
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the lease's final close frees it",
+        || (!kept(fixture)).then_some(()),
+    );
+}
 #[test]
 fn same_signed_owner_and_native_pins_keep_gc_blocked_until_last_actual_lease_copy_closes() {
     let fixture = fixture();
@@ -76,7 +87,7 @@ fn same_signed_owner_and_native_pins_keep_gc_blocked_until_last_actual_lease_cop
     drop(native);
     assert!(kept(&fixture));
     drop(copy);
-    assert!(!kept(&fixture));
+    released(&fixture);
 }
 #[test]
 fn failed_native_capture_returns_the_same_actual_signed_lease() {
@@ -101,7 +112,7 @@ fn failed_native_capture_returns_the_same_actual_signed_lease() {
     let (_, original) = repeated.into_parts();
     assert_eq!(original.native_attempt, original_end);
     drop(original);
-    assert!(!kept(&fixture));
+    released(&fixture);
 }
 #[test]
 fn native_refusal_is_sticky_after_observed_image_replacement_and_restore() {
@@ -125,7 +136,7 @@ fn native_refusal_is_sticky_after_observed_image_replacement_and_restore() {
     drop(native);
     assert!(kept(&fixture));
     drop(copy);
-    assert!(!kept(&fixture));
+    released(&fixture);
 }
 #[test]
 fn expired_original_endpoint_cannot_start_native_capture_or_release_its_original_lease() {
@@ -137,7 +148,7 @@ fn expired_original_endpoint_cannot_start_native_capture_or_release_its_original
     assert_eq!(refused.error().kind(), std::io::ErrorKind::TimedOut);
     assert!(kept(&fixture));
     drop(refused);
-    assert!(!kept(&fixture));
+    released(&fixture);
 }
 #[test]
 fn foreign_signed_guard_cannot_become_a_new_native_owner_or_unlock_offered_custody() {
@@ -153,5 +164,5 @@ fn foreign_signed_guard_cannot_become_a_new_native_owner_or_unlock_offered_custo
     drop(refused);
     assert!(kept(&fixture));
     drop(copy);
-    assert!(!kept(&fixture));
+    released(&fixture);
 }

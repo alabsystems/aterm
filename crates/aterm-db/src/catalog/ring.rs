@@ -529,6 +529,16 @@ fn move_aside(dir: &Path, name: &str) -> Result<()> {
 thread_local! {
     /// Fail the next retirement once its tables are deleted, before it forgets them.
     pub(crate) static FAIL_AFTER_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Directory::retired`], on for one test thread: a retirement that does not
+    /// finish fails the writer pass that ran it, as before 2026-11-18, so an old period that
+    /// cannot be deleted keeps this Mac from listing, taking up or writing its ring's new periods.
+    pub(crate) static RETIRE_FAILURE_STOPS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Directory::retire`], on for one test thread: the first period whose storage
+    /// cannot be deleted ends the pass, as before 2026-11-18, so every later period stays held
+    /// behind it and fills the ring's held periods.
+    pub(crate) static RETIRE_STOPS_AT_FIRST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 impl Directory {
@@ -648,14 +658,21 @@ impl Directory {
 
     /// Delete every table of `ring` this Mac writes no more, under the control writer: raise the
     /// floor and write it durably, delete each held period outside the window below the floor (its
-    /// storage directory and its enrollment claim), then forget them. A pass cut short anywhere is
-    /// finished by the next.
+    /// storage directory and its enrollment claim), then forget those deleted. A pass cut short
+    /// anywhere is finished by the next. Each period stands alone: one that cannot be deleted
+    /// stays held, the others are deleted and forgotten, and the pass fails with the first such
+    /// period's error once it has written that. A writer goes on with what such a pass leaves
+    /// written ([`Self::retired`]). The tables root and the claim directory are flushed durably
+    /// before a deleted period is forgotten, and only then: a pass that deleted none, each of its
+    /// old periods stuck, flushes and writes nothing once the floor is raised.
     /// A missing, damaged or unreadable state is rebuilt first (`rebuild_ring_state`) and
     /// written.
     ///
     /// # Errors
-    /// No control writer, a state that could be neither read nor rebuilt and written, or storage
-    /// that could not be deleted.
+    /// No control writer, a state that could be neither read nor rebuilt and written, a period
+    /// that names the catalog or whose storage is not private or could not be deleted, a
+    /// directory that could not be flushed, or a state that could not be written without the
+    /// periods deleted.
     pub(crate) fn retire(&self, session: &Session<'_>, ring: &Ring, now: u64) -> Result<RingState> {
         if !session.has_control_writer() {
             return Err(Error::new(
@@ -675,24 +692,28 @@ impl Directory {
             return Ok(state);
         }
         let claims = claim_dir(session)?;
-        for epoch in &doomed {
-            let scope = ring.scope(self.trust, *epoch)?;
-            if scope == self.catalog_scope() {
-                return Err(Error::new("a ring table cannot name the catalog"));
-            }
-            let path = self.path(scope)?;
-            match private_file::judge_private_dir(&path)? {
-                PrivateDir::Missing => {}
-                PrivateDir::Private => std::fs::remove_dir_all(&path)?,
-                PrivateDir::Open(_) => {
-                    return Err(Error::new("ring table storage is not private"));
+        #[cfg(test)]
+        let first_stops = RETIRE_STOPS_AT_FIRST.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let first_stops = false;
+        let mut deleted = Vec::new();
+        let mut stuck = None;
+        for &epoch in &doomed {
+            match self.delete_period(ring, epoch, &claims) {
+                Ok(()) => deleted.push(epoch),
+                Err(error) if first_stops => return Err(error),
+                Err(error) => {
+                    stuck.get_or_insert(error);
                 }
             }
-            crate::table::store::remove_claim_files(&claims, &claim_name(scope))?;
         }
-        for dir in [&self.root, &claims] {
-            if dir.try_exists()? {
-                aterm_durable::durable_dir(dir)?;
+        // The flush has to precede only the forgetting below: a period that stays held is deleted
+        // again by the next pass, so a pass that deleted nothing flushes nothing.
+        if !deleted.is_empty() {
+            for dir in [&self.root, &claims] {
+                if dir.try_exists()? {
+                    aterm_durable::durable_dir(dir)?;
+                }
             }
         }
         #[cfg(test)]
@@ -701,11 +722,78 @@ impl Directory {
                 "injected failure after a ring retirement deleted",
             ));
         }
-        for epoch in &doomed {
-            state.held.remove(epoch);
+        if !deleted.is_empty() {
+            for epoch in &deleted {
+                state.held.remove(epoch);
+            }
+            self.save_ring_state(session, ring, &state)?;
         }
-        self.save_ring_state(session, ring, &state)?;
-        Ok(state)
+        stuck.map_or(Ok(state), Err)
+    }
+
+    /// Delete `ring`'s table of period `epoch`, its storage directory and its enrollment claim in
+    /// `claims`, under the control writer.
+    ///
+    /// # Errors
+    /// The period's scope or storage path cannot be formed or names the catalog, or its storage
+    /// is not private, cannot be examined or could not be deleted, or its claim could not be
+    /// removed.
+    fn delete_period(&self, ring: &Ring, epoch: u64, claims: &Path) -> Result<()> {
+        let scope = ring.scope(self.trust, epoch)?;
+        if scope == self.catalog_scope() {
+            return Err(Error::new("a ring table cannot name the catalog"));
+        }
+        let path = self.path(scope)?;
+        match private_file::judge_private_dir(&path)? {
+            PrivateDir::Missing => {}
+            PrivateDir::Private => std::fs::remove_dir_all(&path)?,
+            PrivateDir::Open(_) => {
+                return Err(Error::new("ring table storage is not private"));
+            }
+        }
+        crate::table::store::remove_claim_files(claims, &claim_name(scope))?;
+        Ok(())
+    }
+
+    /// `ring`'s state once a retirement ran ([`Self::retire`]), whether or not it finished. One
+    /// that did not (an old period's storage that is not private or cannot be removed, a state
+    /// that cannot be written) leaves the state it read, raised as far as it got, written: that
+    /// places the window where a finished one would (the floor is raised to the window's first
+    /// period, which moves no window), and holds every period whose storage or claim may remain
+    /// (a period is forgotten only once it is deleted). Every writer pass goes on with it, so an
+    /// old period that keeps failing to delete costs this Mac none of its current tables, in what
+    /// it lists, takes up from a peer or writes; each such pass is counted
+    /// ([`crate::runtime::census::Event::Unretired`]), the only trace a stuck retirement leaves,
+    /// and the next tries the retirement again. A pass that has no written state to go on with
+    /// fails and is not counted.
+    ///
+    /// # Errors
+    /// No control writer, or a retirement that did not finish where no state is written or the
+    /// one written cannot be read.
+    pub(crate) fn retired(
+        &self,
+        session: &Session<'_>,
+        ring: &Ring,
+        now: u64,
+    ) -> Result<RingState> {
+        let error = match self.retire(session, ring, now) {
+            Ok(state) => return Ok(state),
+            Err(error) => error,
+        };
+        if !session.has_control_writer() {
+            return Err(error);
+        }
+        #[cfg(test)]
+        if RETIRE_FAILURE_STOPS.with(std::cell::Cell::get) {
+            return Err(error);
+        }
+        match self.written_ring_state(session, ring) {
+            Ok(Some(state)) => {
+                crate::runtime::census::count(crate::runtime::census::Event::Unretired);
+                Ok(state)
+            }
+            Ok(None) | Err(_) => Err(error),
+        }
     }
 
     /// Enroll `ring`'s table of period `epoch` for a write, under the control writer: retire
@@ -786,7 +874,7 @@ impl Directory {
         until: u64,
         payload: &[u8],
     ) -> Result<std::result::Result<(u64, crate::table::store::Receipt), Kept>> {
-        let state = self.retire(session, ring, now)?;
+        let state = self.retired(session, ring, now)?;
         let actor = session.actor();
         let mut used = BTreeMap::new();
         for epoch in state.window(ring, now) {
@@ -810,10 +898,14 @@ impl Directory {
     /// Retire old ring tables and name the window's tables this Mac holds storage for, under the
     /// control writer, honouring local policy. Nothing is reserved here: a Mac takes up a ring
     /// table when it writes one (`enroll_ring`) or a peer offers it (`adopt_ring_tables`), so a
-    /// ring nobody writes costs no repair turn.
+    /// ring nobody writes costs no repair turn. A retirement that does not finish leaves the
+    /// window where the state it wrote places it ([`Self::retired`]), so a period that keeps
+    /// failing to delete costs this Mac none of its current tables.
     ///
     /// # Errors
-    /// No control writer, an unreadable ring state, or storage that could not be deleted.
+    /// No control writer, a ring state that can be neither read nor rebuilt and written, a window
+    /// table whose scope or storage path cannot be formed or whose storage cannot be examined, or
+    /// a hold that cannot be taken or written.
     pub(crate) fn ring_subscriptions(
         &self,
         session: &Session<'_>,
@@ -825,7 +917,7 @@ impl Directory {
             return Ok(tables);
         }
         for ring in RINGS {
-            let mut state = self.retire(session, ring, now)?;
+            let mut state = self.retired(session, ring, now)?;
             let mut changed = false;
             for epoch in state.window(ring, now) {
                 let scope = ring.scope(self.trust, epoch)?;
@@ -850,11 +942,14 @@ impl Directory {
     /// Reserve each table of some ring's window that a peer offers (`offered`) and this Mac has no
     /// storage for, under the control writer, honouring local policy: hold it durably, then
     /// reserve its storage, so the next repair round can carry its rows. A table with no storage
-    /// slot left is skipped, not an error.
+    /// slot left is skipped, not an error. Each ring stands alone, and each table in it: a
+    /// retirement that does not finish takes up what the window its written state places holds
+    /// ([`Self::retired`]); a ring that cannot take up its tables ([`Self::adopt_ring`]) takes up
+    /// none this pass, and a table whose storage cannot be made (damaged storage at its path) is
+    /// not taken up, while the others take up theirs. What is not taken up now is offered again.
     ///
     /// # Errors
-    /// No control writer, an unreadable ring state, or storage that could not be created or
-    /// deleted.
+    /// No control writer.
     pub(crate) fn adopt_ring_tables(
         &self,
         session: &Session<'_>,
@@ -866,52 +961,88 @@ impl Directory {
         if !policy.enabled || policy.excluded.contains(&self.catalog_scope().digest()) {
             return Ok(tables);
         }
+        if !session.has_control_writer() {
+            return Err(Error::new(
+                "ring table take-up requires a locked control observation",
+            ));
+        }
         for ring in RINGS {
-            let mut state = self.retire(session, ring, now)?;
-            let mut wanted = Vec::new();
-            for epoch in state.window(ring, now) {
-                let scope = ring.scope(self.trust, epoch)?;
-                let digest = scope.digest();
-                if offered.contains(&digest) && !policy.excluded.contains(&digest) {
-                    let path = self.path(scope)?;
-                    if !path.try_exists()? {
-                        wanted.push((epoch, digest, scope, path));
-                    }
-                }
-            }
-            if wanted.is_empty() {
-                continue;
-            }
-            self.ensure_catalog(session)?;
-            let (_, mut count) = self.retained()?;
-            let mut held = state.held.len();
-            wanted.retain(|(epoch, _, _, _)| {
-                if count > MAX_TABLES {
-                    return false;
-                }
-                if !state.held.contains(epoch) {
-                    if held >= MAX_HELD {
-                        return false;
-                    }
-                    held += 1;
-                }
-                count += 1;
-                true
-            });
-            if wanted.is_empty() {
-                continue;
-            }
-            for (epoch, _, _, _) in &wanted {
-                state.hold(ring, *epoch, now)?;
-            }
-            self.save_ring_state(session, ring, &state)?;
-            for (_, digest, scope, path) in wanted {
-                private_file::create_private_dir(&path)?;
-                tables.insert(digest, (scope, path));
-            }
-            aterm_durable::durable_dir(&self.root)?;
+            // A ring that takes up nothing now leaves its tables to the next offer.
+            let _ = self.adopt_ring(session, ring, policy, now, offered, &mut tables);
         }
         Ok(tables)
+    }
+
+    /// [`Self::adopt_ring_tables`] for `ring`: each window table it takes up goes into `tables`,
+    /// once its hold is written, its storage made and the tables root flushed. A table whose
+    /// storage cannot be made keeps its hold, as one a take-up cut short leaves, and is not taken
+    /// up.
+    ///
+    /// # Errors
+    /// No control writer, a ring state that can be neither read nor rebuilt and written, a window
+    /// table whose scope or storage path cannot be formed or whose storage cannot be examined, a
+    /// catalog that cannot be read or made, a hold that cannot be taken or written, or a tables
+    /// root that cannot be flushed: the ring takes nothing up.
+    fn adopt_ring(
+        &self,
+        session: &Session<'_>,
+        ring: &Ring,
+        policy: &Policy,
+        now: u64,
+        offered: &BTreeSet<Digest>,
+        tables: &mut BTreeMap<Digest, (Scope, PathBuf)>,
+    ) -> Result<()> {
+        let mut state = self.retired(session, ring, now)?;
+        let mut wanted = Vec::new();
+        for epoch in state.window(ring, now) {
+            let scope = ring.scope(self.trust, epoch)?;
+            let digest = scope.digest();
+            if offered.contains(&digest) && !policy.excluded.contains(&digest) {
+                let path = self.path(scope)?;
+                if !path.try_exists()? {
+                    wanted.push((epoch, digest, scope, path));
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        self.ensure_catalog(session)?;
+        let (_, mut count) = self.retained()?;
+        let mut held = state.held.len();
+        wanted.retain(|(epoch, _, _, _)| {
+            if count > MAX_TABLES {
+                return false;
+            }
+            if !state.held.contains(epoch) {
+                if held >= MAX_HELD {
+                    return false;
+                }
+                held += 1;
+            }
+            count += 1;
+            true
+        });
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        for (epoch, _, _, _) in &wanted {
+            state.hold(ring, *epoch, now)?;
+        }
+        self.save_ring_state(session, ring, &state)?;
+        let made: Vec<_> = wanted
+            .into_iter()
+            .filter(|(_, _, _, path)| private_file::create_private_dir(path).is_ok())
+            .collect();
+        if made.is_empty() {
+            return Ok(());
+        }
+        aterm_durable::durable_dir(&self.root)?;
+        tables.extend(
+            made.into_iter()
+                .map(|(_, digest, scope, path)| (digest, (scope, path))),
+        );
+        Ok(())
     }
 
     /// The ids of the ring tables this Mac holds by its ring states, whose storage takes the slots

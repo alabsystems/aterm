@@ -20,6 +20,8 @@ struct Fake {
     asked: std::sync::Mutex<Vec<String>>,
     posted: std::sync::atomic::AtomicUsize,
     post_error: Option<String>,
+    /// The line a run the lab's full table refused says.
+    post_refused: Option<String>,
 }
 
 impl ReleaseHost for Fake {
@@ -99,10 +101,16 @@ impl ReleaseHost for Fake {
             .find(|(gap, _)| *gap == slug)
             .map_or(Ok(()), |(_, gap)| Err(gap.clone()))
     }
-    fn post_site_key_need(&self) -> Result<(), String> {
+    fn post_site_key_need(&self) -> Result<Posted, String> {
         self.posted
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.post_error.clone().map_or(Ok(()), Err)
+        if let Some(why) = &self.post_error {
+            return Err(why.clone());
+        }
+        Ok(self
+            .post_refused
+            .clone()
+            .map_or(Posted::Ran, Posted::Refused))
     }
 }
 
@@ -283,6 +291,7 @@ fn whole_keeping(home: &Path) -> Fake {
         asked: std::sync::Mutex::new(Vec::new()),
         posted: std::sync::atomic::AtomicUsize::new(0),
         post_error: None,
+        post_refused: None,
     }
 }
 
@@ -389,6 +398,72 @@ fn step_one_files_a_deployer_key_this_mac_lacks() {
     );
     assert!(!fake.needs.lock().unwrap().contains(&NeedStep::Raise));
     assert_eq!(posted(&fake), 0);
+}
+
+/// The line `aterm secrets need site-deployer-key` says where the lab's full table refuses it.
+const REFUSAL: &str = "the lab's credential-requests table is full (8192 operations, all it \
+                       holds): it takes no request, answer or sweep, and 1 need waits unposted \
+                       in this Mac's ledger; site-deployer-key could not be posted, and stays \
+                       in this Mac's ledger until the table takes it";
+
+/// THE FULL TABLE'S EXIT IS A REFUSAL, NOT A FAILURE (ATERM-KI-1116-3474): a run of `aterm
+/// secrets need` that exits its capacity refusal's status ([`aterm_secrets::converge::STANDING`])
+/// is the refusal, in the run's own first line (or, where it said none, in words of its own); a
+/// run that exits 0 ran; any other exit or a signal is a failure, said with it.
+/// NEGATIVE CONTROL: with the refusal's exit read as any other, `posted` returns a failure.
+#[test]
+fn the_full_tables_exit_is_a_refusal_not_a_failure() {
+    let stderr = format!("aterm secrets need: {REFUSAL}\nsite-deployer-key  local  …\n");
+    let full = i32::from(aterm_secrets::converge::STANDING);
+    assert_eq!(
+        posted(Some(full), stderr.as_bytes()),
+        Ok(Posted::Refused(REFUSAL.to_owned()))
+    );
+    assert!(
+        matches!(posted(Some(full), b""), Ok(Posted::Refused(line))
+            if line.contains("refused it for its capacity") && line.contains("unposted")),
+        "a refusal that said nothing is still said as one"
+    );
+    assert_eq!(posted(Some(0), b""), Ok(Posted::Ran));
+    assert_eq!(
+        posted(Some(1), b"aterm secrets need: no vault\n"),
+        Err("aterm secrets need exited Some(1)".to_owned())
+    );
+    assert_eq!(
+        posted(None, b""),
+        Err("aterm secrets need exited None".to_owned())
+    );
+}
+
+/// A DEPLOYER KEY'S NEED THE LAB'S FULL TABLE REFUSED IS SAID SO (ATERM-KI-1116-3474): the need is
+/// filed and stays in this Mac's ledger, unposted, and the row says the run's own line for it,
+/// never that it posts at this Mac's next pass, and its fix that the request posts once the table
+/// takes it.
+/// NEGATIVE CONTROL: with the row saying a refusal as a failed run, it says the need posts at the
+/// next pass.
+#[test]
+fn a_site_key_need_the_full_table_refused_is_said_so() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let mut fake = whole(home);
+    deployer(home, None);
+    fake.post_refused = Some(REFUSAL.to_owned());
+    let fake = Arc::new(fake);
+    let rows = distribution(&(Arc::clone(&fake) as Arc<dyn ReleaseHost>), false);
+    match row(&rows, "release.site-key") {
+        Check::Fail { what, fix } => {
+            assert!(what.contains("filed with the lab"), "{what}");
+            assert!(what.contains(REFUSAL), "{what}");
+            assert!(!what.contains("next pass"), "{what}");
+            assert!(
+                fix.contains("posts at a pass the lab's table takes it")
+                    && fix.contains("aterm secrets need ls"),
+                "{fix}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fake.posted.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 /// EACH WRITE THE LAST STEPS MAKE IS PROVED AT STEP 1 BY A READ OR A DRY RUN: Google's grant

@@ -1710,8 +1710,12 @@ fn a_corrupt_log_is_prescribed_and_repaired_by_the_shipped_verb() {
         .env("ATERM_STATE_HOME", s.path("link"))
         .env("ATERM_TEST_REPAIR_EXE", harness::aterm_to_launch())
         .current_dir(s.dir.path());
-    let repaired = aterm_uds::deadline::output_until(&mut command, Instant::now() + DEADLINE)
-        .expect("the offered repair finishes; its owned group is reaped on timeout");
+    let repaired = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        DEADLINE,
+        "the offered repair",
+    )
+    .expect("the offered repair finishes; its owned group is reaped once it stalls");
     assert!(
         repaired.status.success(),
         "the offered repair failed: {}",

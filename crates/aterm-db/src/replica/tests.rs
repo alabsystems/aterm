@@ -23,7 +23,9 @@ mod compatibility;
 mod hooks;
 mod inventory;
 mod policy;
+mod protocol;
 mod recovery;
+mod relay;
 mod reuse;
 pub(crate) mod witness;
 pub(super) use policy::{session_boundary, table_admission};
@@ -319,8 +321,10 @@ fn automatic_application_refusal_preserves_control_for_retired_members() {
     assert!(Session::observe(&p.lab.bootstrap(1)).is_err());
 }
 
+/// A legacy peer (0.145, or a pre-F13 repair) in either seat completes control repair and is
+/// refused table repair: nothing moves, and both sides name the refusal's cause.
 #[test]
-fn negotiated_repair_keeps_legacy_application_transfers_in_both_directions() {
+fn negotiated_repair_refuses_legacy_peers_table_repair_in_both_directions() {
     for (legacy, pre_f13) in [(0, true), (1, true), (0, false), (1, false)] {
         let p = Pair::new(false, 1);
         let mut endpoints = [p.endpoint(0, true), p.endpoint(1, true)];
@@ -328,10 +332,21 @@ fn negotiated_repair_keeps_legacy_application_transfers_in_both_directions() {
         endpoints[legacy].legacy_repair = !pre_f13;
         let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
         p.round(&endpoints[0], &endpoints[1], &mut ra, &mut rb);
-        assert_eq!(p.count(0), 1);
-        assert_eq!(p.count(1), 1);
-        assert!(ra.application().is_some() && rb.application().is_some());
-        assert!(ra.application_error().is_none() && rb.application_error().is_none());
+        assert_eq!((p.count(0), p.count(1)), (1, 0));
+        assert!(ra.actor().is_some() && rb.actor().is_some());
+        assert!(ra.application().is_none() && rb.application().is_none());
+        for repair in [&ra, &rb] {
+            let failure = repair.application_error().expect("table repair is refused");
+            assert_eq!(
+                failure.cause,
+                aterm_types::network_state::RepairCause::NeedsUpdate,
+                "{failure}"
+            );
+            assert!(
+                failure.text.starts_with("table repair refused"),
+                "{failure}"
+            );
+        }
         assert!(ra.membership_error().is_none() && rb.membership_error().is_none());
     }
 }
@@ -463,16 +478,17 @@ fn deferred_membership_records_hold_up_no_table_repair() {
     }
 }
 
-/// A Mac whose records are not crossed completes table sync with a legacy peer, a build that
+/// A Mac whose records are not crossed completes control repair with a legacy peer, a build that
 /// offers `atdb/3` alone, both holding a log of 4,071 records, near the legacy count: the hello's
 /// witness, each inventory and the legacy witness decode stay within
-/// [`aterm_secrets::membership_log::LEGACY_RECORDS`], and the table converges.
+/// [`aterm_secrets::membership_log::LEGACY_RECORDS`]. Table repair is then refused with the line
+/// naming `atdb/3`, and no operation moves.
 ///
 /// NEGATIVE CONTROL (in the test): the same pair with this Mac's records crossed refuses the legacy
 /// peer before any membership frame, and the table stays unrepaired, so the session above ran the
 /// legacy protocol.
 #[test]
-fn a_mac_not_crossed_completes_table_sync_with_a_legacy_peer_of_4071_records() {
+fn a_mac_not_crossed_completes_control_repair_with_a_legacy_peer_of_4071_records() {
     use aterm_secrets::{
         client::{load_records, save_records, test_found},
         membership_log::{Body, Entrant, Log, read_records},
@@ -563,10 +579,11 @@ fn a_mac_not_crossed_completes_table_sync_with_a_legacy_peer_of_4071_records() {
         );
         for repair in [&ra, &rb] {
             assert!(repair.membership_error().is_none(), "{repair:?}");
-            assert!(repair.application().is_some());
-            assert!(repair.application_error().is_none());
+            assert!(repair.application().is_none());
+            let failure = repair.application_error().expect("table repair is refused");
+            assert_eq!(failure.text, refused_below_atdb_7("atdb/3"));
         }
-        assert_eq!(p.count(1), 1);
+        assert_eq!(p.count(1), 0);
         for paths in &p.lab.paths {
             assert_eq!(load_records(paths).unwrap().len(), HELD);
         }
@@ -885,13 +902,15 @@ fn the_final_matching_inventory_read_rejects_real_inventory_and_control_changes(
 #[test]
 fn tls_fetches_historical_keys_then_repairs_pages_and_restarts() {
     let p = Pair::new(true, 35);
-    let (a, b) = (p.endpoint(0, true).duplex(), p.endpoint(1, true).duplex());
+    let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
     let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
     let (mut keys_sent, mut keys_received) = (0, 0);
+    let mut sent = Vec::new();
     for _ in 0..3 {
         p.round(&a, &b, &mut ra, &mut rb);
         keys_sent += ra.application().unwrap().keys_sent;
         keys_received += rb.application().unwrap().keys_received;
+        sent.push(ra.application().unwrap().sent);
     }
     assert!(
         keys_sent > 0,
@@ -899,7 +918,8 @@ fn tls_fetches_historical_keys_then_repairs_pages_and_restarts() {
     );
     assert_eq!(keys_sent, keys_received);
     assert_eq!(p.count(1), 35);
-    assert_eq!(ra.application().unwrap().sent, 3);
+    // The first round drains every page of the table; the rounds after it find nothing to send.
+    assert_eq!(sent, [35, 0, 0]);
     let history = p.lab.paths[1].dir.join("commons/history");
     let files: Vec<_> = std::fs::read_dir(history)
         .unwrap()
@@ -1035,6 +1055,9 @@ fn new_peers_start_on_different_tables_and_resume_their_own_scan() {
     }
 }
 
+/// Each source sends one batch a round and then says nothing is left
+/// (`Endpoint::with_drain_batches`), so a table's difference takes more rounds than one, as a
+/// round cut short leaves it.
 #[test]
 fn full_batches_continue_without_starving_another_table() {
     for initiator in 0..2 {
@@ -1068,7 +1091,6 @@ fn full_batches_continue_without_starving_another_table() {
                 Endpoint::from_bootstrap(&pair.lab.bootstrap(node))
                     .unwrap()
                     .unwrap()
-                    .duplex()
                     .with_tables(
                         pair.lab.paths[node].clone(),
                         tables
@@ -1077,6 +1099,7 @@ fn full_batches_continue_without_starving_another_table() {
                             .collect(),
                     )
                     .unwrap()
+                    .with_drain_batches(1)
             })
             .collect();
         let mut sent = PeerRepair::default();
@@ -1110,6 +1133,9 @@ fn full_batches_continue_without_starving_another_table() {
     }
 }
 
+/// Each source sends one batch a round and then says nothing is left
+/// (`Endpoint::with_drain_batches`), so a table's difference takes more rounds than one, as a
+/// round cut short leaves it.
 #[test]
 fn incoming_backlog_guides_a_different_peer_without_starving_regular_tables() {
     let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
@@ -1156,7 +1182,6 @@ fn incoming_backlog_guides_a_different_peer_without_starving_regular_tables() {
         let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(node))
             .unwrap()
             .unwrap()
-            .duplex()
             .with_tables(
                 lab.paths[node].clone(),
                 tables
@@ -1164,7 +1189,8 @@ fn incoming_backlog_guides_a_different_peer_without_starving_regular_tables() {
                     .map(|(scope, paths)| (*scope, paths[node].clone()))
                     .collect(),
             )
-            .unwrap();
+            .unwrap()
+            .with_drain_batches(1);
         if node == 1 {
             endpoint.with_repair_cache(&cache)
         } else {
@@ -1181,21 +1207,35 @@ fn incoming_backlog_guides_a_different_peer_without_starving_regular_tables() {
     // An ordinary owner rebuild keeps work hints for this same trust and actor.
     endpoints[1] = endpoint(1);
 
-    // This is a new outgoing peer: it has no per-peer table cursor to resume.
+    // This is a new outgoing peer: it has no per-peer table cursor to resume. The backlog's
+    // hint takes its first round, and its full batches' follow-ups the rest of the burst
+    // ([`Report::turn`]).
     let (mut outbound, mut other) = (PeerRepair::default(), PeerRepair::default());
-    for _ in 0..TABLE_BURST {
+    for turn in 0..TABLE_BURST {
         exchange_round(&endpoints[1], &endpoints[2], &mut outbound, &mut other);
         let report = outbound.application().unwrap();
         assert_eq!(report.table, Some(tables[1].0.digest()));
         assert_eq!(report.received, BATCH);
+        let expected = if turn == 0 {
+            TableTurn::Hinted
+        } else {
+            TableTurn::Batch
+        };
+        assert_eq!(report.turn, Some(expected), "turn {turn}");
     }
     exchange_round(&endpoints[1], &endpoints[2], &mut outbound, &mut other);
+    let report = outbound.application().unwrap();
     assert_eq!(
-        outbound.application().unwrap().table,
-        Some(tables[0].0.digest())
+        (report.table, report.turn),
+        (Some(tables[0].0.digest()), Some(TableTurn::Regular))
     );
     exchange_round(&endpoints[1], &endpoints[2], &mut outbound, &mut other);
-    assert_eq!(outbound.application().unwrap().received, 1);
+    let report = outbound.application().unwrap();
+    assert_eq!(
+        (report.received, report.turn),
+        (1, Some(TableTurn::Hinted)),
+        "the backlog's hint again, once the scan took its turn"
+    );
     let bootstrap = lab.bootstrap(1);
     let session = Session::observe(&bootstrap).unwrap();
     let store = Store::observe(&session, &tables[1].1[1], tables[1].0).unwrap();
@@ -1220,11 +1260,15 @@ fn duplicate_receipts_do_not_clear_other_missing_ids() {
     assert_eq!(backfill.next(&tables, &tables), None);
 }
 
+/// The hints remember at most [`WANTED_BYTES`] of IDs across every table: a second peer's
+/// disjoint inventory adds nothing to a full table's hint, nor does a second table's; learning the
+/// first set locally frees its room for the next. At most [`MAX_TABLES`] tables are hinted.
 #[test]
-fn missing_id_hints_keep_inventory_and_table_bounds() {
+fn missing_id_hints_keep_their_byte_and_table_bounds() {
     let table = [9; 32];
+    let room = WANTED_BYTES / std::mem::size_of::<Digest>();
     let inventory = |start| {
-        (start..start + MAX_RECORDS)
+        (start..start + room)
             .map(|index| {
                 let mut id = [0; 32];
                 id[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
@@ -1233,14 +1277,26 @@ fn missing_id_hints_keep_inventory_and_table_bounds() {
             .collect::<BTreeSet<_>>()
     };
     let first = inventory(0);
-    let second = inventory(MAX_RECORDS);
+    let second = inventory(room);
     let mut backfill = Backfill::default();
     backfill.observe(table, &BTreeSet::new(), &first);
     backfill.observe(table, &BTreeSet::new(), &second);
     assert_eq!(backfill.wanted[&table], first);
-    // Learning the first set locally frees its slots for the next inventory.
+    backfill.observe([8; 32], &BTreeSet::new(), &BTreeSet::from([[5; 32]]));
+    assert!(
+        !backfill.wanted.contains_key(&[8; 32]),
+        "the bytes bound every table's hints together"
+    );
+    assert_eq!(backfill.wanted_ids(), room);
+    // Learning the first set locally frees its room for the next inventory.
     backfill.observe(table, &first, &second);
     assert_eq!(backfill.wanted[&table], second);
+    assert_eq!(
+        backfill.wanted_ids() * std::mem::size_of::<Digest>(),
+        WANTED_BYTES
+    );
+    backfill.observe(table, &second, &BTreeSet::new());
+    assert!(backfill.wanted.is_empty());
     for index in 0..=MAX_TABLES {
         let mut other = [0; 32];
         other[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
@@ -1249,6 +1305,9 @@ fn missing_id_hints_keep_inventory_and_table_bounds() {
     assert_eq!(backfill.wanted.len(), MAX_TABLES);
 }
 
+/// Each source sends one batch a round and then says nothing is left
+/// (`Endpoint::with_drain_batches`), so a table's difference takes more rounds than one, as a
+/// round cut short leaves it.
 #[test]
 fn concurrent_local_writes_do_not_erase_a_remote_backlog() {
     let lab = Lab::new(&[Role::Writer; 3]);
@@ -1283,7 +1342,6 @@ fn concurrent_local_writes_do_not_erase_a_remote_backlog() {
             let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(node))
                 .unwrap()
                 .unwrap()
-                .duplex()
                 .with_tables(
                     lab.paths[node].clone(),
                     tables
@@ -1291,7 +1349,8 @@ fn concurrent_local_writes_do_not_erase_a_remote_backlog() {
                         .map(|(scope, paths)| (*scope, paths[node].clone()))
                         .collect(),
                 )
-                .unwrap();
+                .unwrap()
+                .with_drain_batches(1);
             if node == 1 {
                 endpoint.with_repair_cache(&cache)
             } else {
@@ -1375,6 +1434,9 @@ fn empty_regular_scans_do_not_restore_a_spent_hint_allowance() {
     assert_eq!(backfill.next(&tables, &tables), Some(table));
 }
 
+/// Each source sends one batch a round and then says nothing is left
+/// (`Endpoint::with_drain_batches`), so a table's difference takes more rounds than one, as a
+/// round cut short leaves it.
 #[test]
 fn stale_backlog_yields_across_first_contact_peers() {
     let nodes = TABLE_BURST + 4;
@@ -1425,7 +1487,6 @@ fn stale_backlog_yields_across_first_contact_peers() {
             let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(node))
                 .unwrap()
                 .unwrap()
-                .duplex()
                 .with_tables(
                     lab.paths[node].clone(),
                     tables
@@ -1433,7 +1494,8 @@ fn stale_backlog_yields_across_first_contact_peers() {
                         .map(|(scope, paths)| (*scope, paths[node].clone()))
                         .collect(),
                 )
-                .unwrap();
+                .unwrap()
+                .with_drain_batches(1);
             if node == 1 {
                 endpoint.with_repair_cache(&cache)
             } else {
@@ -1752,7 +1814,6 @@ fn damaged_neighbor_case(case: usize) -> [i64; 4] {
         Endpoint::from_bootstrap(&p.lab.bootstrap(node))
             .unwrap()
             .unwrap()
-            .duplex()
             .with_tables(
                 p.lab.paths[node].clone(),
                 tables
@@ -1796,7 +1857,8 @@ fn damaged_neighbor_case(case: usize) -> [i64; 4] {
             assert!(!offered.caught_up, "a deferred table caught nobody up");
             refused += 1;
         } else {
-            let expected = BATCH.min(records - acknowledged);
+            // A healthy round drains the table's whole difference.
+            let expected = records - acknowledged;
             assert_eq!((offered.sent, received.received), (expected, expected));
             acknowledged += expected;
             assert_eq!(offered.caught_up, acknowledged == records);
@@ -2034,6 +2096,32 @@ fn receipt_loss_follows_the_selected_digest_across_write_partitions() {
     }
 }
 
+/// A stream that fails the write of one exact receipt frame and every write after it.
+struct DroppedReceipt {
+    stream: std::os::unix::net::UnixStream,
+    receipt: Option<Vec<u8>>,
+    failed: bool,
+    writes: Vec<usize>,
+}
+impl Read for DroppedReceipt {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(bytes)
+    }
+}
+impl Write for DroppedReceipt {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.writes.push(bytes.len());
+        if self.failed || self.receipt.as_deref() == Some(bytes) {
+            self.failed = true;
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "lost receipt"));
+        }
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 #[test]
 fn interrupted_application_reports_durable_ingestion_without_a_receipt() {
     let pair = Pair::new(false, 1);
@@ -2058,7 +2146,15 @@ fn interrupted_application_reports_durable_ingestion_without_a_receipt() {
         let (client, server) = repairs.split_at_mut(1);
         thread::scope(|threads| {
             let worker = threads.spawn(move || {
-                let mut stream = LostReceipt::new(right, lose_receipt.then_some(id));
+                // The receipt frame alone: by range, the receiver's reconciliation can name the
+                // record's ID before the record arrives.
+                let receipt = [&id[..], &[1]].concat();
+                let mut stream = DroppedReceipt {
+                    stream: right,
+                    receipt: lose_receipt.then_some(receipt),
+                    failed: false,
+                    writes: Vec::new(),
+                };
                 let result =
                     receiver.exchange(&mut stream, sender.actor, Side::Responder, &mut server[0]);
                 (result, stream.failed, stream.writes)
@@ -2272,8 +2368,8 @@ fn lost_acknowledgement_retries_the_same_durable_record_once(retry_ack: bool) ->
 
 #[test]
 fn wire_bounds_and_fair_rotation_do_not_depend_on_acknowledgements() {
-    let mut huge = Cursor::new((MAX_RECORDS as u32 + 1).to_le_bytes().to_vec());
-    assert!(receive_ids::<32>(&mut huge, MAX_RECORDS).is_err());
+    let mut huge = Cursor::new((MAX_TABLES as u32 + 1).to_le_bytes().to_vec());
+    assert!(receive_ids::<32>(&mut huge, MAX_TABLES).is_err());
     let mut duplicate = 2u32.to_le_bytes().to_vec();
     duplicate.extend_from_slice(&[1; 64]);
     assert!(receive_ids::<32>(&mut Cursor::new(duplicate), 2).is_err());
@@ -2291,30 +2387,44 @@ fn wire_bounds_and_fair_rotation_do_not_depend_on_acknowledgements() {
 }
 
 /// A round catches the peer up on a table only once the peer lacks nothing of it this side
-/// offered: a round that leaves some for a later one (more than a batch) has not, so a push never
-/// reads a peer reached that may lack the pushed row. The side that offered nothing the peer
-/// lacked is caught up at once.
-///
-/// NEGATIVE CONTROL: drop the `whole` term (`report.caught_up` whenever the peer accepted the
-/// batch sent), and the first round, which leaves four operations for the next, reads as caught
-/// up.
+/// offered, so a push never reads a peer reached that may lack the pushed row. A round cut short
+/// (its sender stops after one batch, `Endpoint::with_drain_batches`) leaves four operations for
+/// the next and has not caught the peer up; the next one, which moves them, has. A whole round
+/// drains the difference, more than a batch here, and catches the peer up at once. The side that
+/// offered nothing the peer lacked is caught up at once, and a round with nothing left to move
+/// stays caught up.
 #[test]
 fn a_round_catches_the_peer_up_only_once_it_lacks_nothing_of_the_table() {
     let records = BATCH + 4;
+    let cut = Pair::new(false, records);
+    let (a, b) = (
+        cut.endpoint(0, true).with_drain_batches(1),
+        cut.endpoint(1, true),
+    );
+    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+    cut.round(&a, &b, &mut ra, &mut rb);
+    let first = ra.application().expect("a completed application round");
+    assert_eq!((first.sent, cut.count(1)), (BATCH, BATCH));
+    assert!(!first.caught_up, "four operations wait for the next round");
+    cut.round(&a, &b, &mut ra, &mut rb);
+    let second = ra.application().expect("a completed application round");
+    assert_eq!((second.sent, cut.count(1)), (records - BATCH, records));
+    assert!(second.caught_up);
+
     let p = Pair::new(false, records);
-    let (a, b) = (p.endpoint(0, true).duplex(), p.endpoint(1, true).duplex());
+    let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
     let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
     p.round(&a, &b, &mut ra, &mut rb);
     let first = ra.application().expect("a completed application round");
-    assert_eq!((first.sent, p.count(1)), (BATCH, BATCH));
-    assert!(!first.caught_up, "four operations wait for the next round");
+    assert_eq!((first.sent, p.count(1)), (records, records));
+    assert!(first.caught_up, "every operation the peer lacked moved");
     assert!(
         rb.application().expect("the responder's round").caught_up,
         "the peer offered nothing this side lacked"
     );
     p.round(&a, &b, &mut ra, &mut rb);
     let second = ra.application().expect("a completed application round");
-    assert_eq!((second.sent, p.count(1)), (records - BATCH, records));
+    assert_eq!((second.sent, p.count(1)), (0, records));
     assert!(second.caught_up);
 }
 
@@ -2394,7 +2504,7 @@ pub fn repair_transition(
     let (scenario, (stored, acknowledged, control)) = match action {
         "NewMember" | "LostKey" => {
             let p = Pair::new(true, 1);
-            let (a, b) = (p.endpoint(0, true).duplex(), p.endpoint(1, true).duplex());
+            let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
             let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
             p.round(&a, &b, &mut ra, &mut rb);
             let sent = ra.application().unwrap().sent;
@@ -2933,16 +3043,16 @@ fn older_application_frames_cannot_bypass_certificate_exchange() {
     }
     let actors = BTreeSet::from([[1; 48], [2; 48]]);
     let mut frame = Vec::new();
-    send_inventory(&mut frame, Some(&actors), MAX_RECORDS).unwrap();
+    send_inventory(&mut frame, Some(&actors), actors.len()).unwrap();
     assert_eq!(
-        receive_inventory::<48>(&mut Cursor::new(frame), MAX_RECORDS).unwrap(),
+        receive_inventory::<48>(&mut Cursor::new(frame), actors.len()).unwrap(),
         Some(actors)
     );
 }
 
 #[test]
 fn proof_inventory_carries_both_retained_source_pools_without_unbounded_allocation() {
-    let proofs: BTreeSet<ProofKey> = (0..MAX_PROOFS as u32)
+    let proofs: BTreeSet<ProofKey> = (0..LISTED_PROOFS as u32)
         .map(|n| {
             let mut key = [0; 81];
             key[77..].copy_from_slice(&n.to_be_bytes());
@@ -2950,18 +3060,18 @@ fn proof_inventory_carries_both_retained_source_pools_without_unbounded_allocati
         })
         .collect();
     let mut wire = Vec::new();
-    send_inventory(&mut wire, Some(&proofs), MAX_PROOFS).unwrap();
+    send_inventory(&mut wire, Some(&proofs), LISTED_PROOFS).unwrap();
     assert_eq!(
-        receive_inventory::<81>(&mut Cursor::new(wire), MAX_PROOFS).unwrap(),
+        receive_inventory::<81>(&mut Cursor::new(wire), LISTED_PROOFS).unwrap(),
         Some(proofs)
     );
     let mut oversized = vec![1];
-    oversized.extend_from_slice(&(MAX_PROOFS as u32 + 1).to_le_bytes());
-    assert!(receive_inventory::<81>(&mut Cursor::new(oversized), MAX_PROOFS).is_err());
+    oversized.extend_from_slice(&(LISTED_PROOFS as u32 + 1).to_le_bytes());
+    assert!(receive_inventory::<81>(&mut Cursor::new(oversized), LISTED_PROOFS).is_err());
 }
 
 #[test]
-fn completed_rounds_trade_signed_versions_and_a_0_145_peer_reads_as_saying_nothing() {
+fn completed_rounds_trade_signed_versions_and_a_refused_0_145_peer_trades_none() {
     use aterm_secrets::commons::hearing::{Said, Version};
     let p = Pair::new(false, 1);
     let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
@@ -2970,19 +3080,21 @@ fn completed_rounds_trade_signed_versions_and_a_0_145_peer_reads_as_saying_nothi
     assert!(ra.application().is_some() && rb.application().is_some());
     assert_eq!(ra.said(), Said::Version(Version::own()));
     assert_eq!(rb.said(), Said::Version(Version::own()));
-    // A 0.145 peer, in either seat: its round completes as before, it trades nothing, and
-    // this side reads that as a peer that said nothing (the C26 gate holds for it).
+    // A 0.145 peer, in either seat, is refused table repair, so the round never reaches the
+    // version report: neither side concludes anything of what the other said.
     let mut old = p.endpoint(1, true);
     old.legacy = true;
-    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
-    p.round(&a, &old, &mut ra, &mut rb);
-    assert!(ra.application().is_some() && rb.application().is_some());
-    assert_eq!(ra.said(), Said::Nothing);
-    assert_eq!(rb.said(), Said::Unknown);
-    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
-    p.round(&old, &a, &mut rb, &mut ra);
-    assert!(ra.application().is_some() && rb.application().is_some());
-    assert_eq!(ra.said(), Said::Nothing);
+    for initiates in [true, false] {
+        let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+        if initiates {
+            p.round(&a, &old, &mut ra, &mut rb);
+        } else {
+            p.round(&old, &a, &mut rb, &mut ra);
+        }
+        assert!(ra.application().is_none() && rb.application().is_none());
+        assert!(ra.application_error().is_some() && rb.application_error().is_some());
+        assert_eq!((ra.said(), rb.said()), (Said::Unknown, Said::Unknown));
+    }
     // Negative control: without a completed round nothing is traded or concluded.
     let (bare_a, bare_b) = (p.endpoint(0, false), p.endpoint(1, false));
     let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
@@ -3062,36 +3174,30 @@ fn rbsr_round_observed<T: Send>(
     })
 }
 
-/// On `atdb/7` one round drains the whole difference: a peer that lacks three batches and more
-/// of a table has every record of it after one round, caught up, where `atdb/6`'s round moves one
-/// batch ([`a_round_catches_the_peer_up_only_once_it_lacks_nothing_of_the_table`]).
-/// NEGATIVE CONTROL: with `reconcile` false on both sides (the `atdb/6` wire), the same round
-/// leaves the peer at `BATCH` records: `` left: 16 right: 53 ``.
+/// One round drains the whole difference: a peer that lacks three batches and more of a table
+/// has every record of it after one round, caught up, on `atdb/9` and on the `atdb/7` and
+/// `atdb/8` wire alike, where the whole-list round `atdb/6` peers ran (and are now refused) moved
+/// one batch.
 #[test]
 fn rbsr_round_drains_a_difference_larger_than_a_batch_in_one_round() {
-    let records = 3 * BATCH + 5;
-    let pair = Pair::new(false, records);
-    let (sender, receiver) = (pair.replica(0), pair.replica(1));
-    let reconciling = || Repair {
-        reconcile: true,
-        ..Repair::default()
-    };
-    let mut repairs = [reconciling(), reconciling()];
-    let [sent, received] = rbsr_round(&sender, &receiver, &mut repairs);
-    let (sent, received) = (sent.unwrap(), received.unwrap());
-    assert_eq!(pair.count(1), records);
-    assert_eq!((sent.sent, received.received), (records, records));
-    assert!(sent.caught_up, "{sent:?}");
-    // A second round finds nothing to move.
-    let [again, _] = rbsr_round(&sender, &receiver, &mut repairs);
-    assert_eq!(again.unwrap().sent, 0);
-
-    // The `atdb/6` wire, as before: one batch a round.
-    let other = Pair::new(false, records);
-    let mut whole = [Repair::default(), Repair::default()];
-    let [sent, _] = rbsr_round(&other.replica(0), &other.replica(1), &mut whole);
-    assert_eq!(sent.unwrap().sent, BATCH);
-    assert_eq!(other.count(1), BATCH);
+    for tables in [Tables::Ranges, Tables::ProofList] {
+        let records = 3 * BATCH + 5;
+        let pair = Pair::new(false, records);
+        let (sender, receiver) = (pair.replica(0), pair.replica(1));
+        let reconciling = || Repair {
+            tables,
+            ..Repair::default()
+        };
+        let mut repairs = [reconciling(), reconciling()];
+        let [sent, received] = rbsr_round(&sender, &receiver, &mut repairs);
+        let (sent, received) = (sent.unwrap(), received.unwrap());
+        assert_eq!(pair.count(1), records);
+        assert_eq!((sent.sent, received.received), (records, records));
+        assert!(sent.caught_up, "{sent:?}");
+        // A second round finds nothing to move.
+        let [again, _] = rbsr_round(&sender, &receiver, &mut repairs);
+        assert_eq!(again.unwrap().sent, 0);
+    }
 }
 
 /// A record ships after every parent of it it ships with, across actors: a child by the actor

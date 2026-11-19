@@ -9,8 +9,8 @@
 //! - [`Handle`]: read (at the head or as of a past point, [`Point`]), compare two points
 //!   ([`Handle::diff`]), apply a grid save with compare-before-write, revert one operation,
 //!   read history in pages ([`history`]), and list every value one cell held and what one write
-//!   replaced and had not seen ([`Handle::cell_values`], [`Handle::wrote`]), for any table in
-//!   [`TABLES`]; append to a log at keys per writer ([`Handle::append_log`]), and read it typed
+//!   replaced and had not seen ([`Handle::cell_values`], [`Handle::wrote`]), for any compiled
+//!   table; append to a log at keys per writer ([`Handle::append_log`]), and read it typed
 //!   ([`View::logs`]).
 //! - [`command`]: `aterm db table ls|schema|get|scan|history|diff|check|revert|export|apply|edit`,
 //!   and the amacs grid round trip. A secret cell shows as the name of its secret-store entry
@@ -18,12 +18,17 @@
 
 #[cfg(unix)]
 pub(crate) mod checkpoint;
+#[cfg(unix)]
+pub use checkpoint::ledger_mark;
 pub mod command;
 mod diff;
 mod edit;
 pub mod history;
+pub mod kept;
+pub mod roll;
 mod values;
 
+use crate::said::Said;
 use crate::{
     Error, Result,
     alab::registry,
@@ -49,7 +54,8 @@ pub use diff::{CellDiff, Delta, Diff, Maker, Point};
 pub(crate) use edit::edit as edit_grid;
 pub use edit::{Edited, Opener, amacs, open_every_ordinary, open_ordinary};
 pub use history::{
-    Ask, Cursor, Entry, EntryKind, Filter, Inert, Kept, Mac, Macs, Page, Revision, Writer,
+    Ask, Cursor, Entry, EntryKind, Filter, HistoryView, Inert, Kept, Mac, Macs, Page, Revision,
+    Writer,
 };
 pub use values::{Held, Source, Written, Wrote};
 
@@ -89,6 +95,9 @@ pub enum Author {
 #[derive(Clone, Copy, Debug)]
 pub struct Compiled {
     pub table: &'static Table,
+    /// What a person calls the family this generation is of (`Registry`): the heading the
+    /// Tables page's rail lists its tables under. Every generation of a family says the same.
+    pub title: &'static str,
     /// The table descriptor's version.
     pub version: u32,
     pub birth: Birth,
@@ -103,6 +112,19 @@ pub struct Compiled {
     pub generation: u32,
     /// The next generation a roll restates this one into, when this build compiles one.
     pub successor: Option<&'static Compiled>,
+    /// The newest record version this generation takes ([`Self::decoder`]): 1, the record
+    /// every build reads, or 2, which also says who made it, why and on what evidence
+    /// ([`crate::said`]). A generation takes 2 only where every build that compiles it
+    /// decodes version 2, so no build reads a generation whose records it refuses (design
+    /// docs/DESIGN-lab-tracker-2026-11-14.md §7, finding 2): a version 2 generation is a new
+    /// one, never one a build before version 2 compiled. Every registry generation takes 1:
+    /// v0.202.0 compiles the first three and v0.203.0 all four, each with a version 1 decoder.
+    pub records: u8,
+    /// Whether each row an owner's write changes is a record of its own ([`Self::packed`]): a
+    /// record says once who made it and why ([`crate::said`]), so rows packed into one record
+    /// would share one reason (docs/DESIGN-lab-tracker-2026-11-14.md §7, finding 10). The
+    /// registry's generations pack a save's rows together, as every build that reads them has.
+    pub rows_apart: bool,
 }
 
 impl Compiled {
@@ -112,6 +134,39 @@ impl Compiled {
     /// The table's words break the descriptor grammar.
     pub fn descriptor(&self, trust: aterm_secrets::commons::journal::Trust) -> Result<Descriptor> {
         Descriptor::application(trust, self.table.application, self.table.role, self.version)
+    }
+
+    /// How this generation's records are read: [`decode`] where it takes version 1 records
+    /// only, refusing a version 2 record as every build before version 2 refuses one; else
+    /// [`decode_said`].
+    pub const fn decoder(&self) -> fn(&[u8]) -> Result<Command> {
+        if self.records >= 2 {
+            decode_said
+        } else {
+            decode
+        }
+    }
+
+    /// The statement a record of this generation carries for `said`: all of it where the
+    /// generation takes version 2 records, none where it takes version 1 only.
+    pub fn carries(&self, said: Option<&Said>) -> Option<Box<Said>> {
+        said.filter(|_| self.records >= 2).cloned().map(Box::new)
+    }
+
+    /// Refuse `command` where it is a version 2 record and this generation takes version 1
+    /// records only: what every write into the generation passes before it is signed.
+    ///
+    /// # Errors
+    /// The command says who made it, and this generation's readers would refuse it.
+    pub fn admits(&self, command: &Command) -> Result<()> {
+        if command.said().is_some() && self.records < 2 {
+            return Err(Error::new(&format!(
+                "{}: this generation takes version 1 records only; the builds that read it \
+                 refuse a record that says who made it",
+                self.name()
+            )));
+        }
+        Ok(())
     }
 
     /// This generation and every later one this build compiles, oldest first.
@@ -165,10 +220,32 @@ impl Compiled {
         (self.guard)(rows, cells)
     }
 
+    /// The records an owner's write of `rows` (each row's changes) appends, in order, each
+    /// carrying `said`: every row a record of its own where this generation keeps its rows
+    /// apart ([`Self::rows_apart`]), else as many rows to a record as fit ([`pack_saying`]). A
+    /// row is never split across two records.
+    ///
+    /// # Errors
+    /// One row alone passes a record's limits.
+    pub(crate) fn packed(
+        &self,
+        rows: Vec<Vec<Change>>,
+        said: Option<&Said>,
+    ) -> Result<Vec<Vec<Change>>> {
+        if !self.rows_apart {
+            return pack_saying(rows, said);
+        }
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows.into_iter().filter(|row| !row.is_empty()) {
+            records.extend(pack_saying(vec![row], said)?);
+        }
+        Ok(records)
+    }
+
     /// The records a grid save of `plan` to `collection` appends where it lands on the table as
     /// `cells` hold it, in the order the save appends them: the plan settled against those cells
     /// ([`grid::settle`]), with what the owner's rules add to it ([`Self::rules`]), in the form
-    /// and the records [`records`] packs it in, as [`Handle::apply`] writes it. `None` where
+    /// ([`conform`]) and the records [`Self::packed`] packs it in, as [`Handle::apply`] writes it. `None` where
     /// those rules refuse it, so the save writes nothing. A page that holds a read's cells asks
     /// it, before a Write, which record carries each cell (a claim one record begins comes after
     /// one an earlier record begins); the rules every table keeps, which read the whole view,
@@ -186,7 +263,10 @@ impl Compiled {
         if self.owner_rules(&mut rows, cells, Author::Owner)?.is_some() {
             return Ok(None);
         }
-        records(self.table, rows).map(Some)
+        for row in &mut rows {
+            conform(self.table, row)?;
+        }
+        self.packed(rows, None).map(Some)
     }
 
     /// The key a new grid row in `collection` is born under ([`Birth`]), refused when the
@@ -236,23 +316,29 @@ impl Compiled {
 /// `alab/registry`, the lab model's owner data, until a roll seals it ([`REGISTRY_2`]).
 pub const REGISTRY: Compiled = Compiled {
     table: &registry::REGISTRY,
+    title: registry::TITLE,
     version: registry::VERSION,
     birth: registry::birth,
     guard: registry::guard,
     seeded: crate::alab::seeds::compiled,
     generation: 1,
     successor: Some(&REGISTRY_2),
+    records: 1,
+    rows_apart: false,
 };
 
 /// `alab/registry.2`, the registry's second generation (design §3.8, step 13).
 pub const REGISTRY_2: Compiled = Compiled {
     table: &registry::REGISTRY_2,
+    title: registry::TITLE,
     version: registry::VERSION,
     birth: registry::birth,
     guard: registry::guard,
     seeded: crate::alab::seeds::compiled,
     generation: 2,
     successor: Some(&REGISTRY_3),
+    records: 1,
+    rows_apart: false,
 };
 
 /// `alab/registry.3`, the registry's third generation: the first whose history holds no secret.
@@ -260,12 +346,15 @@ pub const REGISTRY_2: Compiled = Compiled {
 /// carries only the reference (docs/PLAN.md LT-04, `alab::roll`).
 pub const REGISTRY_3: Compiled = Compiled {
     table: &registry::REGISTRY_3,
+    title: registry::TITLE,
     version: registry::VERSION,
     birth: registry::birth,
     guard: registry::guard,
     seeded: crate::alab::seeds::compiled,
     generation: 3,
     successor: Some(&REGISTRY_4),
+    records: 1,
+    rows_apart: false,
 };
 
 /// `alab/registry.4`, the registry's fourth generation: the first whose free-text lists (a Mac's
@@ -274,54 +363,113 @@ pub const REGISTRY_3: Compiled = Compiled {
 /// `alab::roll`).
 pub const REGISTRY_4: Compiled = Compiled {
     table: &registry::REGISTRY_4,
+    title: registry::TITLE,
     version: registry::VERSION,
     birth: registry::birth,
     guard: registry::guard,
     seeded: crate::alab::seeds::compiled,
     generation: 4,
     successor: None,
+    records: 1,
+    rows_apart: false,
 };
 
-/// `lab/tracker`, the lab tracker's tables (docs/DESIGN-lab-tracker-2026-11-14.md); this build
-/// compiles its logs (`crate::lab::tracker`). Nothing but a log is written to it yet, so it
-/// guards no owner write, holds no seed and births no row.
+/// `lab/tracker`, the lab tracker's tables (docs/DESIGN-lab-tracker-2026-11-14.md,
+/// `crate::lab::tracker`): its cells tables and its logs, a row born under the key its name
+/// makes and an owner's write held to the tracker's own rules. It holds no seed. It is a new
+/// generation, declared with version 2 writes (design §5, step 3), so a record says who made it
+/// where its writer states so, and each row an owner's write changes is a record of its own.
+/// No build registers it for production yet ([`FAMILIES`]; TK-32): only a test declares it.
 pub const TRACKER: Compiled = Compiled {
     table: &tracker::TRACKER,
+    title: tracker::TITLE,
     version: tracker::VERSION,
-    birth: no_birth,
-    guard: no_guard,
+    birth: tracker::mapped::birth,
+    guard: tracker::checks::guard,
     seeded: no_seed,
     generation: 1,
     successor: None,
+    records: 2,
+    rows_apart: true,
 };
-
-/// No row of a family without cells collections is born through the grid.
-fn no_birth(collection: &Collection, _: &BTreeMap<String, Value>, _: &Cells) -> Result<String> {
-    Err(Error::new(&format!(
-        "{}: rows are not born through the grid here",
-        collection.name
-    )))
-}
-
-/// No rule beyond the ones every table keeps.
-fn no_guard(_: &mut [Vec<Change>], _: &Cells) -> Result<Option<Refused>> {
-    Ok(None)
-}
 
 /// No row is compiled in.
 fn no_seed(_: &str, _: &str) -> bool {
     false
 }
 
-/// Every typed catalog table the `aterm db table` verbs, checkpoints and roll reach: the
-/// registry's generations. `lab/tracker` ([`TRACKER`]) is written and read through [`Handle`] and
-/// its shared files; TK-06 brings every compiled family to the verbs.
-pub const TABLES: &[Compiled] = &[REGISTRY, REGISTRY_2, REGISTRY_3, REGISTRY_4];
+/// Every typed table family this build registers, each by its first generation: what the
+/// `aterm db table` verbs, checkpoints, the Tables page and its Check reach, each family's later
+/// generations through its chain ([`generations`]). `lab/tracker` ([`TRACKER`]) joins at its
+/// go-live (TK-32): until then it is written and read through [`Handle`] and its shared files on
+/// test replicas only (decision TK-D14), so no build declares a generation of it that a later
+/// one must keep.
+pub const FAMILIES: &[&Compiled] = &[&REGISTRY];
+
+/// Every generation of every family in [`FAMILIES`], each family's oldest first.
+pub fn generations() -> impl Iterator<Item = &'static Compiled> {
+    FAMILIES.iter().flat_map(|first| first.chain())
+}
+
+/// The families a test registered for its own replicas ([`register_for_test`]): a family no
+/// build registers, which the catalog must still know as one this build compiles.
+#[cfg(test)]
+static TEST_FAMILIES: std::sync::Mutex<Vec<&'static Compiled>> = std::sync::Mutex::new(Vec::new());
+
+/// Register `first`'s family for this test process, once: what [`FAMILIES`] does for a family a
+/// build registers. Every test replica is a lab of its own, so a family registered by one test
+/// is declared in no other test's catalog.
+#[cfg(test)]
+pub(crate) fn register_for_test(first: &'static Compiled) {
+    let mut families = TEST_FAMILIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !families.iter().any(|held| held.name() == first.name()) {
+        families.push(first);
+    }
+}
+
+/// Every family this build registers ([`FAMILIES`]), each by its first generation; in a test
+/// build, the families a test registered too ([`register_for_test`]).
+pub(crate) fn families() -> Vec<&'static Compiled> {
+    #[cfg(test)]
+    {
+        let mut all = FAMILIES.to_vec();
+        all.extend(
+            TEST_FAMILIES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .copied(),
+        );
+        all
+    }
+    #[cfg(not(test))]
+    FAMILIES.to_vec()
+}
+
+/// Whether a roll of `first`'s family keeps every signed record (decisions TK-D2 and TK-D17,
+/// docs/DESIGN-lab-tracker-2026-11-14.md §8): none of its generations declares a secret column
+/// ([`Table::holds_secret`]). A signed record cannot be carried with a secret value taken out,
+/// so a family that declares one has its history restated by the roll, within a bound and
+/// behind a horizon (`alab::history`), and its sealed generation released (`alab::roll`). A
+/// family that declares none loses nothing by keeping the record itself: its roll
+/// ([`roll`]) restates the registers alone, the sealed generation's log stays on every Mac
+/// that holds it and is repaired to every Mac that does not (`catalog::State::Kept`), and
+/// history, as-of and diff read each record there under its own signer's signature
+/// ([`kept`]).
+pub fn keeps_records(first: &'static Compiled) -> bool {
+    !first
+        .chain()
+        .iter()
+        .any(|compiled| compiled.table.holds_secret())
+}
 
 /// The generation of `chain` (oldest first) readers and writers use in `snapshot`: the oldest
 /// one subscribed here. A roll declares the next generation and restates into it while the old
 /// one stays subscribed, so every Mac keeps reading the old one until the roll seals it; then
-/// the old one's declarations conflict and the next is the oldest subscribed. With none
+/// the old one's declarations conflict (or, in a family that keeps its records, read as
+/// `catalog::State::Kept`) and the next is the oldest subscribed. With none
 /// subscribed it is the first, whose read then says why.
 pub(crate) fn current_in(
     snapshot: &crate::catalog::Snapshot,
@@ -414,12 +562,12 @@ pub fn sole_generation(paths: &Paths, first: &'static Compiled, at: &'static Com
 /// # Errors
 /// A change is no typed cell value, or `table`'s collection refuses it; the error names the
 /// generation and the cell's column, never its value.
-/// Whether some generation of [`TABLES`] types `collection.column` otherwise than `column` does:
+/// Whether some generation of [`FAMILIES`] types `collection.column` otherwise than `column` does:
 /// a list or set column whose form a generation sets apart (a Mac's hosts, a mailbox's domains),
 /// which [`conform`] re-types, while a set or list every generation holds alike is carried as
 /// it is.
 fn set_apart(collection: &str, column: &typed::Column) -> bool {
-    TABLES.iter().any(|generation| {
+    generations().any(|generation| {
         generation
             .table
             .collection(collection)
@@ -517,7 +665,7 @@ pub(crate) fn current_within(
 /// The compiled table of `table`'s family at `generation`.
 fn generation_of(table: &Table, generation: u64) -> Option<&'static Compiled> {
     let target_family = table.role.split('.').next().unwrap_or(table.role);
-    TABLES.iter().find(|compiled| {
+    generations().find(|compiled| {
         compiled.table.application == table.application
             && compiled
                 .table
@@ -530,13 +678,12 @@ fn generation_of(table: &Table, generation: u64) -> Option<&'static Compiled> {
     })
 }
 
-/// The compiled table named `<application>/<role>`.
+/// The compiled generation named `<application>/<role>`, of a family in [`FAMILIES`].
 ///
 /// # Errors
 /// This build compiles no such table.
 pub fn find(name: &str) -> Result<&'static Compiled> {
-    TABLES
-        .iter()
+    generations()
         .find(|compiled| compiled.matches_name(name))
         .ok_or_else(|| {
             Error::new("no typed table of that name in this build (see `aterm db table ls`)")
@@ -556,7 +703,21 @@ thread_local! {
 pub(crate) fn decode(payload: &[u8]) -> Result<Command> {
     #[cfg(test)]
     DECODED.set(DECODED.get() + 1);
-    let command = Command::decode(payload)?;
+    typed_record(payload, Command::decode(payload)?)
+}
+
+/// [`decode`] for a generation that takes version 2 records ([`Compiled::records`]): a
+/// version 1 record, or a version 2 one with its statement of who made it ([`crate::said`]),
+/// canonical either way.
+pub(crate) fn decode_said(payload: &[u8]) -> Result<Command> {
+    #[cfg(test)]
+    DECODED.set(DECODED.get() + 1);
+    typed_record(payload, Command::decode_said(payload)?)
+}
+
+/// `command`, decoded from `payload`, as a typed record: canonical, and a write that stops no
+/// cell or a revert.
+fn typed_record(payload: &[u8], command: Command) -> Result<Command> {
     if command.encode()? != payload {
         return Err(Error::new("typed table payload is not canonical"));
     }
@@ -582,10 +743,28 @@ impl View {
         Ok(Self::of(table, log, &Resolved::read(table, session, log)?))
     }
 
+    /// [`Self::read`] over `sealed`, the owned rows and log entries of the generations before
+    /// `table`'s that its family keeps, oldest first ([`kept::Rows`], [`Resolved::over`]): the
+    /// view a reader of the family is shown. [`Self::read`] is the generation's own log alone,
+    /// which is what a checkpoint signs, a roll restates and a quota counts.
+    ///
+    /// # Errors
+    /// As [`Resolved::read`].
+    pub(crate) fn read_over(
+        table: &'static Table,
+        session: &Session<'_>,
+        log: &Log,
+        sealed: Vec<kept::Rows>,
+    ) -> Result<Self> {
+        let resolved = Resolved::read(table, session, log)?.over(sealed);
+        Ok(Self::of(table, log, &resolved))
+    }
+
     /// `table` as `log` holds it, with what `resolved` read through the session: its cells,
-    /// refusals, quota and owned rows, with the records a roll carried into its `archived` rows.
-    /// It reads nothing else, so two calls with the same log and the same resolution make the
-    /// same view.
+    /// refusals, quota and owned rows, with the records a roll carried into its `archived` rows
+    /// and, in a family that keeps its records, the owned rows and log entries `resolved`
+    /// holds of the sealed generations before this one ([`kept::overlay`]). It reads nothing
+    /// else, so two calls with the same log and the same resolution make the same view.
     pub(crate) fn of(table: &'static Table, log: &Log, resolved: &Resolved) -> Self {
         let (eligible, merges) = log.eligible_and_merges();
         let ops: Vec<Op> = eligible
@@ -609,10 +788,19 @@ impl View {
         };
         let awaited = log.awaited(resolved.actor);
         let refused = log.refused(&awaited);
+        // Whether the cells are exactly the ones the log took from the cells this process keeps
+        // of the table: one plain projection, nothing held inert, no claim interpreted.
+        let (plain, other) = (std::cell::Cell::new(0_u32), std::cell::Cell::new(false));
         let (mut cells, inert) =
             typed::authority::read(table, within, log.causal_index(), |before, unwritten| {
+                if before.is_none() && unwritten.is_empty() {
+                    plain.set(plain.get() + 1);
+                } else {
+                    other.set(true);
+                }
                 log.cells_without(before, &quota.over, unwritten)
             });
+        let mut interpreted = false;
         for collection in table.collections {
             if collection
                 .columns
@@ -626,8 +814,16 @@ impl View {
                 )
             {
                 cells = restored;
+                interpreted = true;
             }
         }
+        let cells_from = (plain.get() == 1
+            && !other.get()
+            && !interpreted
+            && inert.changes.is_empty()
+            && inert.carried.is_empty())
+        .then(|| log.cells_marked())
+        .flatten();
         // A carried record stands where an operation within its writer's quota carried it.
         let archived: Vec<Op> = resolved
             .carried
@@ -635,7 +831,7 @@ impl View {
             .filter(|carried| carried.by.iter().any(|id| !quota.over.contains(id)))
             .map(|carried| carried.op.clone())
             .collect();
-        let owned = table
+        let mut owned: BTreeMap<&'static str, owned::OwnedRead> = table
             .collections
             .iter()
             .filter(|collection| collection.kind == typed::Kind::Owned)
@@ -650,9 +846,7 @@ impl View {
                 (collection.name, read)
             })
             .collect();
-        // A log's entries are this generation's alone: a roll carries owned rows
-        // (`resolved.carried`, read above), and no log is compiled in a family that rolls.
-        let logs = table
+        let mut logs: BTreeMap<&'static str, owned::LogRead> = table
             .collections
             .iter()
             .filter(|collection| collection.kind == typed::Kind::Log)
@@ -663,6 +857,10 @@ impl View {
                 )
             })
             .collect();
+        // What the sealed generations before this one hold of each, in a family that keeps its
+        // records: a roll restates no owned row and no log entry, so each is read where its
+        // signer wrote it.
+        kept::overlay(&resolved.sealed, &mut owned, &mut logs);
         // A later generation is whole only once a roll's cover row is here: before that its
         // history is still arriving from the Macs that restated it.
         let restated = table.collection(registry::ROLL.name).is_none()
@@ -674,6 +872,7 @@ impl View {
             rows: log.awaited_rows(&awaited),
             restated,
         };
+        let refusals = log.refusals(&refused, &resolve);
         Self {
             table: Some(table),
             causal: log.causal_index().clone(),
@@ -682,10 +881,12 @@ impl View {
             complete: awaited.is_empty() && restated,
             awaiting,
             refused,
+            refusals,
             ops,
             quota,
             owned,
             logs,
+            cells_from,
         }
     }
 }
@@ -703,6 +904,10 @@ pub(crate) struct Resolved {
     /// The machine each (roster, writer) of an eligible operation or a carried record held a
     /// Writer seat as in that roster; `None` where it held none.
     bindings: BTreeMap<(Digest, Actor), Option<[u8; 16]>>,
+    /// The owned rows and log entries of the sealed generations before this one, oldest
+    /// first, in a family that keeps its records and for a read that asked for them
+    /// ([`Self::over`]); empty otherwise.
+    sealed: Vec<kept::Rows>,
 }
 
 /// One record a roll carried into a table's `archived` rows, authenticated under the scope of
@@ -766,11 +971,38 @@ impl Resolved {
                 );
             }
         }
+        // A record the view holds and does not project is named by its signer's machine where
+        // this session read its roster. One whose payload never authenticated (quarantined, a
+        // discarded fork source) names a roster this session may not hold: its signer is then
+        // unknown, never a reason the read fails (a record this build cannot read is inert, not
+        // a stop).
+        for (roster, actor) in log.refused_writers() {
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                bindings.entry((roster, actor))
+            {
+                slot.insert(
+                    session
+                        .held_binding(&roster, &actor)
+                        .ok()
+                        .flatten()
+                        .map(|binding| *binding.machine()),
+                );
+            }
+        }
         Ok(Self {
             actor: session.actor(),
             carried,
             bindings,
+            sealed: Vec::new(),
         })
+    }
+
+    /// `self` over `sealed`, the owned rows and log entries of the sealed generations before
+    /// this one, oldest first ([`kept::rows`]): [`View::of`] lays them under its own.
+    #[must_use]
+    pub(crate) fn over(mut self, sealed: Vec<kept::Rows>) -> Self {
+        self.sealed = sealed;
+        self
     }
 
     /// A digest of the whole resolution: equal digests resolve every record alike.
@@ -780,6 +1012,7 @@ impl Resolved {
             actor,
             carried,
             bindings,
+            sealed,
         } = self;
         let mut sha = aterm_digest::Sha256::new();
         sha.update(b"aterm/db/resolved/1\0");
@@ -804,6 +1037,15 @@ impl Resolved {
                     sha.update([1]);
                     sha.update(machine);
                 }
+            }
+        }
+        // A resolution over no sealed generation digests as it did before a view read any:
+        // the fields above are each counted, so this section starts where they end.
+        if !sealed.is_empty() {
+            sha.update(b"sealed\0");
+            sha.update((sealed.len() as u64).to_le_bytes());
+            for rows in sealed {
+                rows.digest_into(&mut sha);
             }
         }
         sha.finalize()
@@ -849,6 +1091,8 @@ fn carried<'a>(
     // are authenticated together.
     type Keys = BTreeMap<String, BTreeSet<Digest>>;
     let mut wires: Vec<(crate::table::Scope, Vec<u8>, Keys)> = Vec::new();
+    // Each wire's record is read as its own generation reads its records.
+    let mut decoders: Vec<fn(&[u8]) -> Result<Command>> = Vec::new();
     let mut first: BTreeMap<(u64, Vec<u8>), usize> = BTreeMap::new();
     for (op, changes) in ops {
         // One archived row's cells go in one record (`pack` never splits a row).
@@ -893,6 +1137,7 @@ fn carried<'a>(
             };
             let at = *first.entry((generation, wire.clone())).or_insert_with(|| {
                 wires.push((descriptor.scope, wire, Keys::new()));
+                decoders.push(compiled.decoder());
                 wires.len() - 1
             });
             wires[at].2.entry(pk.to_owned()).or_default().insert(op);
@@ -927,7 +1172,7 @@ fn carried<'a>(
         }
     }
     let mut out: BTreeMap<Digest, CarriedOp> = BTreeMap::new();
-    for ((_, _, keys), record) in wires.iter().zip(records) {
+    for (((_, _, keys), record), decode) in wires.iter().zip(records).zip(&decoders) {
         let Some(record) = record else {
             continue;
         };
@@ -993,28 +1238,32 @@ pub(crate) fn archived_records(resolved: &Resolved, ops: &[Op]) -> Vec<(Digest, 
         .collect()
 }
 
-/// The records a grid save appends of `rows` (each row's changes, settled and passed by the
-/// rules), in order: each change in the form this generation writes it ([`conform`]), packed
-/// ([`pack`]).
-///
-/// # Errors
-/// A change is not a typed cell of its collection, or one row passes a record's limits.
-pub fn records(table: &Table, mut rows: Vec<Vec<Change>>) -> Result<Vec<Vec<Change>>> {
-    for row in &mut rows {
-        conform(table, row)?;
-    }
-    pack(rows)
-}
-
 /// Pack rows of changes into records of at most [`MAX_WRITES`] changes and a payload within
 /// the Commons body limit, never splitting a row.
 ///
 /// # Errors
 /// One row alone passes a record's limits.
 pub(crate) fn pack(rows: Vec<Vec<Change>>) -> Result<Vec<Vec<Change>>> {
-    // `Command::Write::encode()` wraps the serialized `changes` JSON array (`[...]`) in the
-    // fixed 78-byte envelope `{"changes":...,"kind":"write","request":"<32-hex>","v":1}`.
-    const WRITE_ENVELOPE_BYTES: usize = 78;
+    pack_saying(rows, None)
+}
+
+/// [`pack`] for records that each carry `said` ([`crate::said`]), which takes its bytes in
+/// every record.
+///
+/// # Errors
+/// One row alone passes a record's limits.
+pub(crate) fn pack_saying(rows: Vec<Vec<Change>>, said: Option<&Said>) -> Result<Vec<Vec<Change>>> {
+    // `Command::Write::encode()` wraps the serialized `changes` JSON array (`[...]`) in an
+    // envelope of fixed size for one statement: 78 bytes for a version 1 record,
+    // `{"changes":...,"kind":"write","request":"<32-hex>","v":1}`.
+    let envelope = Command::Write {
+        request: [0; 16],
+        changes: Vec::new(),
+        said: said.cloned().map(Box::new),
+    }
+    .encode()?
+    .len()
+        - "[]".len();
     let mut records: Vec<Vec<Change>> = Vec::new();
     let mut last_cmd_bytes = 0usize;
     for row in rows {
@@ -1024,7 +1273,7 @@ pub(crate) fn pack(rows: Vec<Vec<Change>>) -> Result<Vec<Vec<Change>>> {
         let row_json_len = aterm_json::to_vec(&row)
             .map_err(|_| Error::new("one typed row passes a record's limits"))?
             .len();
-        let row_cmd_bytes = WRITE_ENVELOPE_BYTES + row_json_len;
+        let row_cmd_bytes = envelope + row_json_len;
         if row_cmd_bytes > crate::crypto::MAX_BODY {
             return Err(Error::new("one typed row passes a record's limits"));
         }
@@ -1169,6 +1418,19 @@ pub struct Usage {
     pub mine_bytes: usize,
 }
 
+impl Usage {
+    fn of(actor: Actor, log: &Log) -> Self {
+        let used = log.local_use();
+        Self {
+            actor,
+            records: used.records,
+            bytes: used.bytes,
+            mine_records: used.writer_records,
+            mine_bytes: used.writer_bytes,
+        }
+    }
+}
+
 /// The sealer of table `name` in `session` ([`typed::secret::Sealer`]), for a generation that
 /// holds sealed tokens: the current audience epoch seals, and a stored token opens under the
 /// epoch it names, through the session's retained handoffs.
@@ -1225,15 +1487,41 @@ pub(crate) fn reopened<T>(
 /// A typed table on this Mac's Commons.
 pub struct Handle {
     paths: Paths,
+    /// The family's generation this handle was asked for: the first of the chain its own
+    /// generation is of ([`Self::at`]), whose earlier generations a read across a roll opens
+    /// ([`kept`]).
+    family: &'static Compiled,
     compiled: &'static Compiled,
+    /// Who makes this handle's writes, why and on what evidence ([`Self::saying`]).
+    said: Option<Box<Said>>,
 }
 
 impl Handle {
     /// The table `compiled` names, at the generation this Mac's catalog says to use
     /// ([`current`]): after a roll, `alab/registry` reaches `alab/registry.2`.
     pub fn at(paths: Paths, compiled: &'static Compiled) -> Self {
+        let family = compiled;
         let compiled = current(&paths, compiled);
-        Self { paths, compiled }
+        Self {
+            paths,
+            family,
+            compiled,
+            said: None,
+        }
+    }
+
+    /// This handle, its writes saying who made them, why and on what evidence ([`crate::said`]):
+    /// each record carries `said` where the generation it writes takes version 2 records
+    /// ([`Compiled::carries`]), and none where it takes version 1 only.
+    #[must_use]
+    pub fn saying(mut self, said: Said) -> Self {
+        self.said = Some(Box::new(said));
+        self
+    }
+
+    /// What this handle's records carry of who makes them ([`Self::saying`]).
+    fn carried(&self) -> Option<Box<Said>> {
+        self.compiled.carries(self.said.as_deref())
     }
 
     /// [`Self::at`] for a read a person waits on: the generation is read as [`current_within`]
@@ -1246,8 +1534,14 @@ impl Handle {
         compiled: &'static Compiled,
         read_by: std::time::Instant,
     ) -> Result<Self> {
+        let family = compiled;
         let compiled = reopened(read_by, || current_within(&paths, compiled, read_by))?;
-        Ok(Self { paths, compiled })
+        Ok(Self {
+            paths,
+            family,
+            compiled,
+            said: None,
+        })
     }
 
     /// The table this handle reaches.
@@ -1285,7 +1579,7 @@ impl Handle {
             let view = View::read(
                 compiled.table,
                 session,
-                &Log::read_with(session, store, scope, decode)?,
+                &Log::read_with(session, store, scope, self.compiled.decoder())?,
             )?;
             let name = compiled.name();
             read(&view, &sealer(&name, session, scope)?)
@@ -1328,18 +1622,35 @@ impl Handle {
 
     /// [`Self::view`] as of `point`: the table as the causal cut an operation names projects it,
     /// through the same read, quota and claims included, with eligibility judged on everything
-    /// this Mac retains now.
+    /// this Mac retains now. In a family that keeps its records across a roll ([`kept`]), a
+    /// point of a sealed generation is read from that generation's own log, as its table, and
+    /// every point holds the owned rows and log entries of the sealed generations before its
+    /// own, each read from its generation's log ([`kept::Rows`]).
     ///
     /// # Errors
-    /// As [`Self::view`], or this Mac retains no operation `point` names in this table.
+    /// As [`Self::view`], or this Mac retains no operation `point` names in this table; for a
+    /// family that keeps its records, also where this Mac does not hold a sealed generation yet.
     pub fn view_at(&self, point: Point) -> Result<View> {
         let table = self.compiled.table;
+        let earlier = self.earlier();
         reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                let log = Log::read_with(session, store, scope, decode)?;
-                match point {
-                    Point::Head => View::read(table, session, &log),
-                    Point::At(at) => View::read(table, session, &log.as_of(&at)?),
+                let log = Log::read_with(session, store, scope, self.compiled.decoder())?;
+                let at = match point {
+                    Point::Head => None,
+                    Point::At(at) => Some(at),
+                };
+                // A point of a sealed generation a family keeps is that generation's table
+                // at the cut ([`kept::as_of`]).
+                if let Some(at) = at.filter(|at| !earlier.is_empty() && !log.holds(at))
+                    && let Some(view) = kept::as_of(session, &earlier, &at)?
+                {
+                    return Ok(view);
+                }
+                let sealed = kept::rows(session, &kept::sealed(session, &earlier)?)?;
+                match at {
+                    None => View::read_over(table, session, &log, sealed),
+                    Some(at) => View::read_over(table, session, &log.as_of(&at)?, sealed),
                 }
             })
         })
@@ -1350,14 +1661,27 @@ impl Handle {
     /// writers and machines. Both sides are read in one observation through [`Self::view_at`]'s
     /// projection. A comparison runs forward: `to` must have observed `from` (the head holds
     /// every operation this Mac retains); two concurrent points are each compared with the head.
+    /// In a family that keeps its records across a roll, `from` may be a point of a sealed
+    /// generation, and each difference names the record that made it in whichever generation's
+    /// log holds it, with what that record says of who made it ([`kept::diff`]).
     ///
     /// # Errors
     /// As [`Self::view_at`] for either point, or `to` did not observe `from`.
     pub fn diff(&self, from: Digest, to: Point) -> Result<Diff> {
         let table = self.compiled.table;
+        let earlier = self.earlier();
         reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, self.compiled.decoder())?;
+                // From a point of a sealed generation a family keeps, across the roll
+                // ([`kept::diff`]).
+                if !earlier.is_empty()
+                    && !log.holds(&from)
+                    && let Some(diff) =
+                        kept::diff(session, self.compiled, &log, &earlier, from, to)?
+                {
+                    return Ok(diff);
+                }
                 let past = log.as_of(&from)?;
                 let later = match to {
                     Point::Head => None,
@@ -1369,8 +1693,12 @@ impl Handle {
                         "the later point did not observe the first: compare each with head",
                     ));
                 }
-                let before = View::read(table, session, &past)?;
-                let after = View::read(table, session, later)?;
+                // Both points hold what the sealed generations before this one hold of each
+                // owned row and log entry, so a row this generation wrote over a sealed one
+                // reads as changed, and one it never wrote does not differ.
+                let sealed = kept::rows(session, &kept::sealed(session, &earlier)?)?;
+                let before = View::read_over(table, session, &past, sealed.clone())?;
+                let after = View::read_over(table, session, later, sealed)?;
                 let resolve = owned::commons::historical(session);
                 let cells = diff::between(table, &before, &after, |id| {
                     let operation = log.operation(id)?;
@@ -1378,9 +1706,15 @@ impl Handle {
                         operation: *id,
                         actor: operation.header.actor,
                         machine: resolve(&operation.roster, &operation.header.actor),
+                        said: log.said(id).cloned(),
                     })
                 });
-                Ok(Diff { from, to, cells })
+                Ok(Diff {
+                    from,
+                    to,
+                    cells,
+                    refused: after.refusals.clone(),
+                })
             })
         })
     }
@@ -1396,6 +1730,7 @@ impl Handle {
     /// As [`Self::view`], or the read ran out of time at `read_by`.
     pub fn view_until(&self, read_by: std::time::Instant) -> Result<View> {
         let table = self.compiled.table;
+        let earlier = self.earlier();
         reopened(read_by, || {
             application::observe_store_within(
                 &self.paths,
@@ -1403,10 +1738,11 @@ impl Handle {
                 read_by,
                 &|| crate::admission::deadline().min(read_by),
                 |session, store, scope| {
-                    View::read(
+                    View::read_over(
                         table,
                         session,
-                        &Log::read_with(session, store, scope, decode)?,
+                        &Log::read_with(session, store, scope, self.compiled.decoder())?,
+                        kept::rows(session, &kept::sealed(session, &earlier)?)?,
                     )
                 },
             )
@@ -1418,20 +1754,30 @@ impl Handle {
     /// # Errors
     /// As [`Self::view`].
     pub fn usage(&self) -> Result<(View, Usage)> {
+        self.usage_with(|_, _| ())
+            .map(|(view, usage, ())| (view, usage))
+    }
+
+    /// [`Self::usage`], and with it what `of` reads of the same log under the session that read
+    /// it: one read of the table serves both (the checkpoint fence's read,
+    /// [`Self::usage_fenced`]).
+    ///
+    /// # Errors
+    /// As [`Self::view`].
+    pub(crate) fn usage_with<T>(
+        &self,
+        of: impl Fn(&crate::table::Session<'_>, &Log) -> T,
+    ) -> Result<(View, Usage, T)> {
         let table = self.compiled.table;
+        let earlier = self.earlier();
         reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                let log = Log::read_with(session, store, scope, decode)?;
-                let used = log.local_use();
+                let log = Log::read_with(session, store, scope, self.compiled.decoder())?;
+                let sealed = kept::rows(session, &kept::sealed(session, &earlier)?)?;
                 Ok((
-                    View::read(table, session, &log)?,
-                    Usage {
-                        actor: session.actor(),
-                        records: used.records,
-                        bytes: used.bytes,
-                        mine_records: used.writer_records,
-                        mine_bytes: used.writer_bytes,
-                    },
+                    View::read_over(table, session, &log, sealed)?,
+                    Usage::of(session.actor(), &log),
+                    of(session, &log),
                 ))
             })
         })
@@ -1448,7 +1794,7 @@ impl Handle {
         let table = self.compiled.table;
         reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, self.compiled.decoder())?;
                 Ok(crate::alab::history::carried(
                     &View::read(table, session, &log)?,
                     owned::commons::historical(session),
@@ -1478,7 +1824,7 @@ impl Handle {
             self.descriptor(),
             |session, store, scope| {
                 session.writer()?;
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, self.compiled.decoder())?;
                 log.writable(session.actor())?;
                 let view = View::read(table, session, &log)?;
                 let mut settled = grid::settle(collection, plan, &view.cells);
@@ -1491,7 +1837,7 @@ impl Handle {
                         ..Applied::default()
                     });
                 }
-                // What waits is judged by each change's row, which the form [`records`] writes
+                // What waits is judged by each change's row, which the form [`conform`] writes
                 // the change in keeps.
                 if let Some(why) = view.holds_back(&settled.rows) {
                     return Err(Error::new(&format!(
@@ -1505,12 +1851,18 @@ impl Handle {
                     retired: settled.retired,
                     ..Applied::default()
                 };
-                for changes in records(table, settled.rows)? {
+                let said = self.carried();
+                for row in &mut settled.rows {
+                    conform(table, row)?;
+                }
+                for changes in self.compiled.packed(settled.rows, said.as_deref())? {
                     let count = changes.len();
                     let command = Command::Write {
                         request: crate::crypto::random()?,
                         changes,
+                        said: said.clone(),
                     };
+                    self.compiled.admits(&command)?;
                     let receipt = application::append(session, store, &command.encode()?)?;
                     applied.records += 1;
                     applied.cells += count;
@@ -1647,7 +1999,7 @@ impl Handle {
             deadline,
             |session, store, scope| {
                 session.writer()?;
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, self.compiled.decoder())?;
                 log.writable(session.actor())?;
                 let view = View::read(table, session, &log)?;
                 let (planned, mut rows) = derive(&view, &sealer(&name, session, scope)?)?;
@@ -1669,14 +2021,20 @@ impl Handle {
                 }
                 let mut applied = Applied::default();
                 let mut appended = BTreeMap::new();
-                for changes in pack(rows)? {
+                let said = self.carried();
+                for changes in self.compiled.packed(rows, said.as_deref())? {
                     let count = changes.len();
                     let request = if owner {
                         crate::crypto::random()?
                     } else {
-                        typed::request_id(table.application, table.role, &changes)?
+                        derived_request(table, &changes, said.as_deref())?
                     };
-                    let command = Command::Write { request, changes };
+                    let command = Command::Write {
+                        request,
+                        changes,
+                        said: said.clone(),
+                    };
+                    self.compiled.admits(&command)?;
                     if !owner
                         && let Some(first) =
                             retry_or_appended(&log, session.actor(), &command, &appended)?
@@ -1733,7 +2091,8 @@ impl Handle {
     /// records as a record's limits allow ([`pack`]: one, for up to 64 small rows), declaring
     /// the table first where this Mac's catalog does not yet: each at the key
     /// `<uuid32>.<n>`, this Mac's Commons machine uuid and its own counter, one past the highest
-    /// it has spent in the log ([`owned::log_spent`]). The counter is read and the record
+    /// it has spent in the log ([`owned::log_spent`]), in this generation or in a sealed one the
+    /// family keeps ([`kept::Sealed::spent`]). The counter is read and the record
     /// appended under this Mac's Commons writer lock and the table's, which every writer of the
     /// Mac takes, so two agents on one Mac appending at once get two counters, in whichever order
     /// the lock admits them; two Macs never share a key, since the uuid is the signer's. No key
@@ -1746,8 +2105,8 @@ impl Handle {
     /// # Errors
     /// `collection` names no log of this table, or `rows` is empty; a row breaks its schema
     /// ([`owned::log_row`]) or passes a record's limits; no Commons writer, or this Mac is not
-    /// in its own roster; this writer's history here is withheld or forked; or a record cannot
-    /// be written.
+    /// in its own roster; this writer's history here is withheld or forked; this Mac does not
+    /// hold a sealed generation the family keeps yet; or a record cannot be written.
     pub fn append_log(
         &self,
         collection: &Collection,
@@ -1777,6 +2136,8 @@ impl Handle {
         for row in rows {
             owned::log_row(collection, row, 1)?;
         }
+        // Every sealed generation of the family, whichever one this handle was asked for.
+        let earlier = kept::before(self.family, self.compiled);
         application::with_store_until(
             &self.paths,
             true,
@@ -1784,6 +2145,7 @@ impl Handle {
             crate::admission::deadline(),
             |session, store, scope| {
                 session.writer()?;
+                let decode = self.compiled.decoder();
                 let log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
                 let me = session
@@ -1796,8 +2158,14 @@ impl Handle {
                     .eligible_iter()
                     .filter_map(|(operation, command)| Op::from_eligible(0, operation, command))
                     .collect();
-                let spent =
+                let mut spent =
                     owned::log_spent(collection, &ops, owned::commons::historical(session), &me);
+                // An entry of a sealed generation the family keeps stands at its key in every
+                // later generation's view ([`kept::overlay`]), so the counter goes on past what
+                // this Mac spent in each of them.
+                for sealed in kept::sealed(session, &earlier)? {
+                    spent = spent.max(sealed.spent(session, collection.name, &me)?);
+                }
                 let mut keys = Vec::with_capacity(rows.len());
                 let mut changes = Vec::with_capacity(rows.len());
                 for (i, row) in (1_u64..).zip(rows) {
@@ -1818,10 +2186,12 @@ impl Handle {
                     }]);
                     keys.push(key);
                 }
-                for changes in pack(changes)? {
+                let said = self.carried();
+                for changes in pack_saying(changes, said.as_deref())? {
                     let command = Command::Write {
                         request: crate::crypto::random()?,
                         changes,
+                        said: said.clone(),
                     };
                     let payload = command.encode()?;
                     // A record this build's own reader would refuse is never signed: it would
@@ -1853,14 +2223,18 @@ impl Handle {
             self.descriptor(),
             |session, store, scope| {
                 session.writer()?;
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, self.compiled.decoder())?;
                 log.writable(session.actor())?;
                 if let Some(id) = log.revert_retry(session.actor(), request, operation)? {
                     return Ok(id);
                 }
                 let view = View::read(table, session, &log)?;
-                let command =
+                let mut command =
                     log.compensate(request, operation, &view.quota.over, &view.inert.changes)?;
+                if let Command::Revert { said, .. } = &mut command {
+                    *said = self.carried();
+                }
+                self.compiled.admits(&command)?;
                 if let Some(changes) = command.changes() {
                     refuse_secret_revert(table, changes)?;
                 }
@@ -1901,13 +2275,20 @@ impl Handle {
             self.descriptor(),
             |session, store, scope| {
                 session.writer()?;
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, self.compiled.decoder())?;
                 log.writable(session.actor())?;
                 let mut written = 0;
                 let mut appended = BTreeMap::new();
-                for changes in pack(schema_rows(table, &View::read(table, session, &log)?))? {
-                    let request = typed::request_id(table.application, table.role, &changes)?;
-                    let command = Command::Write { request, changes };
+                let said = self.carried();
+                let rows = schema_rows(table, &View::read(table, session, &log)?);
+                for changes in pack_saying(rows, said.as_deref())? {
+                    let request = derived_request(table, &changes, said.as_deref())?;
+                    let command = Command::Write {
+                        request,
+                        changes,
+                        said: said.clone(),
+                    };
+                    self.compiled.admits(&command)?;
                     if retry_or_appended(&log, session.actor(), &command, &appended)?.is_some() {
                         continue;
                     }
@@ -1956,6 +2337,45 @@ fn refuse_secret_revert(table: &typed::Table, changes: &[Change]) -> Result<()> 
 /// Check whether `command` is an exact retry of an eligible record in `log` or of a record already
 /// appended in the current write batch (`appended`), without re-reading the store log on every
 /// append.
+/// The request id of a record whose id derives from its content ([`typed::request_id`]): its
+/// changes', and where it says who made it ([`crate::said`]), that statement's too, so a retry
+/// of the same statement returns its first receipt and another principal's identical changes
+/// are that principal's own record.
+///
+/// # Errors
+/// The changes or the statement cannot be encoded.
+pub(crate) fn derived_request(
+    table: &Table,
+    changes: &[Change],
+    said: Option<&Said>,
+) -> Result<[u8; 16]> {
+    said_request(
+        typed::request_id(table.application, table.role, changes)?,
+        said,
+    )
+}
+
+/// `request`, a content-derived request id, as the record of who `said` it carries it
+/// ([`derived_request`]): itself where the record states nothing.
+///
+/// # Errors
+/// The statement cannot be encoded.
+pub(crate) fn said_request(request: [u8; 16], said: Option<&Said>) -> Result<[u8; 16]> {
+    let Some(said) = said else {
+        return Ok(request);
+    };
+    let statement = aterm_json::to_vec(&said.to_value())
+        .map_err(|_| Error::new("a statement of who acted could not be encoded"))?;
+    let mut sha = aterm_digest::Sha256::new();
+    sha.update(b"aterm/typed/said-request/1\0");
+    sha.update(request);
+    sha.update(&statement);
+    let digest = sha.finalize();
+    let mut out = [0; 16];
+    out.copy_from_slice(&digest[..16]);
+    Ok(out)
+}
+
 pub(crate) fn retry_or_appended(
     log: &Log,
     actor: Actor,
@@ -2035,6 +2455,11 @@ pub(crate) fn read_regular_utf8(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod kept_tests;
+#[cfg(test)]
+pub(crate) mod said_tests;
 
 /// The log keys a clock would make: the negative control of the exit test of `lab/tracker`'s
 /// logs (`file::tests`).

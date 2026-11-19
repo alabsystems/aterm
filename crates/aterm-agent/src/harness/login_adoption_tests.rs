@@ -1578,6 +1578,45 @@ fn on_windows_keeping_the_baselines_leaves_the_stores_other_entries_as_they_were
     );
 }
 
+/// ON WINDOWS AN ELEVATED ATERM KEEPS THE BASELINES: run as elevated
+/// (`aterm_uds::private_file::elevated`), a keep makes the baselines' private folder in a store
+/// of the user's, writes them there and reads them back, and a keep of none removes them; a
+/// store that is not there is refused (`ELEVATED_PARENT`) and nothing is made.
+/// NEGATIVE CONTROL (2026-11-18): `write_private` refusing an elevated process again
+/// (`ELEVATED`, as it did before its folder was held): `kept elevated` fails.
+#[cfg(windows)]
+#[test]
+fn on_windows_an_elevated_aterm_keeps_the_baselines() {
+    use aterm_uds::private_file::{ELEVATED_PARENT, elevated::as_elevated};
+    let scratch = aterm_tempfile::TempDir::new().unwrap();
+    let store = scratch.path().join("accounts");
+    fs::create_dir_all(&store).unwrap();
+    let missing = scratch.path().join("missing");
+    let baselines = Baselines(BTreeMap::from([(
+        format!("{SID}-{PID}"),
+        Baseline {
+            api_ms: 4_000,
+            taken_at: T + 10,
+            session: None,
+        },
+    )]));
+    as_elevated(|| {
+        baselines.keep(&store).expect("kept elevated");
+        assert_eq!(Baselines::kept(&store), baselines);
+        Baselines(BTreeMap::new())
+            .keep(&store)
+            .expect("removed elevated");
+        assert_eq!(Baselines::kept(&store), Baselines(BTreeMap::new()));
+        let refused = baselines.keep(&missing).expect_err("no store");
+        assert!(refused.to_string().contains(ELEVATED_PARENT), "{refused}");
+    });
+    assert!(
+        !store.join(BASELINES_DIR).join(BASELINES_FILE).exists(),
+        "removed"
+    );
+    assert!(!missing.exists(), "nothing made where no store is");
+}
+
 /// FL-116: A SERVED TURN IS DATED BY THE REQUEST ITS REPLY ANSWERED ([`served_request`]), so a
 /// limit met while the reply streamed is not one it speaks against. A tool's result written at
 /// `T`, after a response's tool call, answered by another response whose row is written ninety

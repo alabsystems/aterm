@@ -217,6 +217,15 @@ pub(super) fn busy_refusal(why: &str, left: Duration) -> String {
     )
 }
 
+/// A `NO` line naming `why` that also says the member's membership records are in `format`, a
+/// later one than the new Mac stated (`later=<format>`): its run touched no phrase, so a new
+/// Mac whose build reads that format asks again stating it, with the same words
+/// (`join::run_phrase`). Only a member whose format mark is stored answers it. A joiner before
+/// it reads `why` alone.
+pub(super) fn later_refusal(why: &str, format: u32) -> String {
+    format!("NO later={format} why={}", escape_within(why, MAX_WHY))
+}
+
 /// The phrase life a busy answer `line` names (`left=`, [`busy_refusal`]); `None` from a member
 /// that names none.
 pub(super) fn busy_left(line: &str) -> Option<Duration> {
@@ -234,7 +243,8 @@ pub(super) fn busy_left(line: &str) -> Option<Duration> {
 }
 
 /// The answer line `line`, `OK …` taken apart, or the error its `NO` names
-/// ([`ErrorKind::MemberBusy`] for a [`busy_refusal`]).
+/// ([`ErrorKind::MemberBusy`] for a [`busy_refusal`], [`ErrorKind::LaterFormat`] for a
+/// [`later_refusal`] of format 2 or later).
 pub(super) fn answer(line: &str) -> Result<Line<'_>> {
     let parsed = Line::parse(line);
     match parsed.verb {
@@ -245,8 +255,16 @@ pub(super) fn answer(line: &str) -> Result<Line<'_>> {
                 .ok()
                 .and_then(|why| unescape_within(why, MAX_WHY).ok())
                 .unwrap_or_else(|| "the member refused".to_owned());
+            let later = parsed
+                .get("later")
+                .ok()
+                .filter(|format| format.len() <= 10 && format.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|format| format.parse::<u32>().ok())
+                .is_some_and(|format| format > crate::crossing::FORMAT_ONE);
             Err(if parsed.get("busy") == Ok("1") {
                 Error::of_kind(ErrorKind::MemberBusy, why)
+            } else if later {
+                Error::of_kind(ErrorKind::LaterFormat, why)
             } else {
                 Error::new(why)
             })

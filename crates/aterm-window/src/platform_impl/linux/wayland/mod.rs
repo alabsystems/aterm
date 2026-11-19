@@ -31,6 +31,7 @@ pub use window::Window;
 mod clipboard;
 mod event_loop;
 mod output;
+mod outside_release;
 mod seat;
 mod state;
 mod types;

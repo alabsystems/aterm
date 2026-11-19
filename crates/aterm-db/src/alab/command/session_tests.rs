@@ -242,3 +242,64 @@ fn a_legacy_tabs_answer_is_read_as_its_own_verdict() {
         assert!(refusal.contains("did not answer"), "{word}: {refusal}");
     }
 }
+
+/// THE LINEAGE IS THE INSTANCE'S WORD: the session and the agent its `reveal` answer names, the
+/// agent absent where it says `-` or an instance before `program=` says nothing of one, and
+/// nothing where it names no minted session or an agent out of grammar.
+#[test]
+fn the_lineage_is_the_session_and_agent_the_answer_names() {
+    let one = |line: &str| named(&[line.to_owned()]);
+    let lineage = |session: &str, program: Option<&str>, person: bool| {
+        Some(Lineage {
+            session: session.to_owned(),
+            program: program.map(str::to_owned),
+            person,
+        })
+    };
+    assert_eq!(
+        one("verdict=agent session=s-47051b9a207955a92b14 fleet=no program=claude"),
+        lineage("s-47051b9a207955a92b14", Some("claude"), false)
+    );
+    // No agent in the asker's lineage, and nothing else acts in the session: a person.
+    assert_eq!(
+        one("verdict=allowed session=tqn5r6e0148 fleet=no program=-"),
+        lineage("tqn5r6e0148", None, true)
+    );
+    // Who acted is unknown: an instance before `program=`, or a session `aterm ctl` started or
+    // drives, or one an agent runs in, with no agent in the asker's lineage.
+    for line in [
+        "verdict=allowed session=tqn5r6e0148 fleet=no",
+        "verdict=spawned session=tqn5r6e0148 fleet=no program=-",
+        "verdict=driven session=tqn5r6e0148 fleet=no program=-",
+        "verdict=agent session=tqn5r6e0148 fleet=no program=-",
+    ] {
+        assert_eq!(one(line), lineage("tqn5r6e0148", None, false), "{line}");
+    }
+    for line in [
+        "verdict=none session=- fleet=no program=-",
+        "verdict=agent session=forged fleet=no program=claude",
+        "verdict=agent session=tqn5r6e0148 fleet=no program=Claude Code",
+    ] {
+        assert_eq!(one(line), None, "{line}");
+    }
+    assert_eq!(named(&[]), None);
+}
+
+/// Of nested instances, the one nearest the asker in its ancestry answers first: the inner
+/// instance holds the asker's session, the outer one only the inner instance's.
+#[test]
+fn the_nearest_instance_in_the_askers_ancestry_answers_first() {
+    let instances = vec![
+        (100, "outer".to_owned()),
+        (300, "elsewhere".to_owned()),
+        (200, "inner".to_owned()),
+    ];
+    // asker → shell 250 → inner 200 → shell 150 → outer 100
+    let order = nearest_first(&instances, &[250, 200, 150, 100]);
+    assert_eq!(order, ["inner", "outer", "elsewhere"]);
+    assert_eq!(
+        nearest_first(&instances, &[]),
+        ["outer", "elsewhere", "inner"],
+        "with no ancestry read, the listed order"
+    );
+}

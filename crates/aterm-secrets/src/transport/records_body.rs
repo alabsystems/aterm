@@ -3,7 +3,7 @@
 
 //! A bounded wire reader over one immutable record selection.
 
-use crate::membership_log::{MAX_RECORDS_STREAM, Record};
+use crate::membership_log::{REPLY_CAP, Record};
 use crate::{Error, Result};
 use std::io::{self, Read};
 
@@ -22,12 +22,10 @@ impl<'a> RecordsReader<'a> {
     pub(crate) fn new(records: &'a [Record]) -> Result<Self> {
         let len = records.iter().try_fold(0usize, |len, record| {
             len.checked_add(record.wire_len())
-                .filter(|len| *len <= MAX_RECORDS_STREAM)
+                .filter(|len| *len <= REPLY_CAP)
         });
         let len = len.ok_or_else(|| {
-            Error::new(format!(
-                "the record batch is larger than {MAX_RECORDS_STREAM} bytes"
-            ))
+            Error::new(format!("the record batch is larger than {REPLY_CAP} bytes"))
         })?;
         Ok(Self {
             records,

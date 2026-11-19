@@ -20,9 +20,10 @@ fn faults(journal: &Journal, site: &str) -> Vec<Value> {
         .collect()
 }
 
-/// A journal file is named by its current or complete legacy tab ID; malformed IDs name no file.
+/// A journal file keeps its owned local session's current or exact legacy ID. Malformed IDs
+/// name no journal file; attempt binding remains part of the file name.
 #[test]
-fn a_journal_file_requires_a_minted_tab_id() {
+fn a_journal_file_is_named_by_a_local_session_id() {
     let named = |session: &str| {
         name(&Binding {
             session: session.into(),
@@ -30,7 +31,13 @@ fn a_journal_file_requires_a_minted_tab_id() {
         })
     };
     let attempt = "ab".repeat(16);
-    for session in ["tqn5r6e0148", "t000000000a", "s-0123456789abcdef0123"] {
+    for session in [
+        "tqn5r6e0148",
+        "t000000000a",
+        "t0123456789",
+        "s-0123456789abcdef0123",
+        "s-00000000000000000000",
+    ] {
         assert_eq!(named(session).unwrap(), format!("{session}.{attempt}.json"));
     }
     for session in [
@@ -38,6 +45,7 @@ fn a_journal_file_requires_a_minted_tab_id() {
         "tqn5r6e014u",
         "TQN5R6E0148",
         "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
         "s-0123456789ABCDEF0123",
         "s-",
         "",

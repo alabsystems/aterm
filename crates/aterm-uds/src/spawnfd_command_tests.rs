@@ -505,6 +505,10 @@ struct Case {
     args: Vec<String>,
     env: Vec<Env>,
     cwd: Option<PathBuf>,
+    /// The `#!` files a Darwin spawn of the row hands the kernel to interpret
+    /// ([`kernel_scripts_during`]): those it may not run, which the kernel refuses. A sandboxed
+    /// Darwin process hands the kernel every one, which this count does not hold.
+    kernel: usize,
 }
 
 fn case(what: &'static str, program: &str, args: &[&str]) -> Case {
@@ -514,6 +518,7 @@ fn case(what: &'static str, program: &str, args: &[&str]) -> Case {
         args: args.iter().map(|a| (*a).to_string()).collect(),
         env: Vec::new(),
         cwd: None,
+        kernel: 0,
     }
 }
 
@@ -525,6 +530,15 @@ impl Case {
 
     fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cwd = Some(dir.into());
+        self
+    }
+
+    fn kernel(mut self, handed: usize) -> Self {
+        self.kernel = if cfg!(target_vendor = "apple") {
+            handed
+        } else {
+            0
+        };
         self
     }
 }
@@ -673,6 +687,9 @@ fn programs_arguments_environments_and_directories_match_std() {
         .expect("chmod the locked directory");
     };
     lock(0o000);
+    // Root may run `denied/tool` (mode 0474: an execute bit, though not its owner's), which this
+    // layer then interprets; any other user may not, and the kernel refuses it.
+    let denied = usize::from(crate::peer::our_uid() != 0);
     let pwd_and_args = r#"pwd -P; printf '[%s]' "$0" "$@"; echo"#;
     let long_name = "x".repeat(1_100);
     let cases = [
@@ -706,11 +723,15 @@ fn programs_arguments_environments_and_directories_match_std() {
             "PATH",
             format!("{}:{}", dir("missing"), dir("bin")),
         )),
-        case("a candidate it may not run is passed over", "tool", &["x"]).env(Env::Set(
-            "PATH",
-            format!("{}:{}", dir("denied"), dir("bin")),
-        )),
-        case("the only candidate may not run", "tool", &["x"]).env(Env::Set("PATH", dir("denied"))),
+        case("a candidate it may not run is passed over", "tool", &["x"])
+            .env(Env::Set(
+                "PATH",
+                format!("{}:{}", dir("denied"), dir("bin")),
+            ))
+            .kernel(denied),
+        case("the only candidate may not run", "tool", &["x"])
+            .env(Env::Set("PATH", dir("denied")))
+            .kernel(denied),
         case("a directory named like the program", "tool", &["x"])
             .env(Env::Set("PATH", dir("dirs"))),
         case("a directory, then the program", "tool", &["x"])
@@ -769,7 +790,7 @@ fn programs_arguments_environments_and_directories_match_std() {
         ),
         case("an unsearchable PATH entry", "tool", &["x"]).env(Env::Set("PATH", dir("locked"))),
         case("a PATH entry that is a file", "tool", &["x"]).env(Env::Set("PATH", dir("plain"))),
-        case("a file without an execute bit", &dir("plain"), &[]),
+        case("a file without an execute bit", &dir("plain"), &[]).kernel(1),
         case("a directory as the program", &dir("dirs"), &[]),
         case("a script with no #! line", &dir("script/noshebang"), &["y"]),
         case("a bare script with no #! line", "noshebang", &["y"])
@@ -801,11 +822,23 @@ fn programs_arguments_environments_and_directories_match_std() {
             && ours.is_err()
             && *theirs == Ok((Some(127), String::new(), String::new()))
     };
+    // A sandboxed Darwin process leaves every `#!` file to the kernel (`shebang::interpret`).
+    #[cfg(target_vendor = "apple")]
+    let counted = super::shebang::interprets_here();
+    #[cfg(not(target_vendor = "apple"))]
+    let counted = true;
     let mut kinds = Vec::new();
     let mut mute = Vec::new();
     for row in &cases {
         let theirs = outcome(configured!(std::process::Command::new, row).output());
-        let ours = outcome(configured!(command, row).output());
+        let (ours, handed) = kernel_scripts_during(|| outcome(configured!(command, row).output()));
+        if counted {
+            assert_eq!(
+                handed, row.kernel,
+                "{}: #! files handed the kernel",
+                row.what
+            );
+        }
         if std_mute(&ours, &theirs) {
             mute.push(row.what);
         } else if !std_answers_two_ways(row.what) {
@@ -830,6 +863,14 @@ fn programs_arguments_environments_and_directories_match_std() {
             mute.len(),
             cases.len(),
             mute.join("; ")
+        );
+    }
+    if !counted {
+        println!(
+            "NOT RUN in a sandbox: spawnfd::command_tests::\
+             programs_arguments_environments_and_directories_match_std: the #! files {} rows \
+             hand the kernel, since a sandboxed process leaves each to it",
+            cases.len()
         );
     }
     lock(0o755);
@@ -1182,12 +1223,21 @@ fn sigset_bits(set: &SigSet) -> String {
 }
 
 fn staged_signals() {
-    // SAFETY: `signal` with `SIG_IGN`, and a mask change for this thread; both take plain integers
-    // or a live local.
+    // SAFETY: `signal` with `SIG_IGN` and the mask changes for this thread take plain integers
+    // or live locals.
     unsafe {
         signal(SIGUSR2, SIG_IGN);
+        // Model a launcher that leaves SIGINT blocked, then install the exact test mask.
+        let inherited = sigset_of(&[libc::SIGINT]);
+        assert_eq!(
+            pthread_sigmask(SIG_BLOCK, &inherited, std::ptr::null_mut()),
+            0
+        );
         let block = sigset_of(&[SIGUSR1, SIGTERM]);
-        assert_eq!(pthread_sigmask(SIG_BLOCK, &block, std::ptr::null_mut()), 0);
+        assert_eq!(
+            pthread_sigmask(libc::SIG_SETMASK, &block, std::ptr::null_mut()),
+            0
+        );
     }
     let ours_mask = probed_mask(&crate::deadline::ends_within(
         &mut mask_probe!(command),

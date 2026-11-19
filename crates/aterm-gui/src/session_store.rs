@@ -1048,6 +1048,22 @@ pub(crate) struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// The current session identity and terminal, kept together for registry admission.
+    pub(crate) fn of_session(session: &crate::Session, parent: Option<SessionId>) -> Self {
+        Self {
+            sid: session.ctx.self_id.clone(),
+            nonce: session.ctx.nonce,
+            local_id: session.id,
+            parent,
+            state: SessionState::Spawning,
+            title: crate::term_lock(&session.term).title().to_string(),
+            term: Arc::clone(&session.term),
+            master: session.master,
+            shell_identity: session.shell_identity,
+            ctx: Arc::clone(&session.ctx),
+        }
+    }
+
     /// Returns the session's user-assigned title if set, or its sanitized registry title.
     pub(crate) fn display_title(&self) -> String {
         self.ctx
@@ -1211,6 +1227,9 @@ pub(crate) struct SessionStore {
     by_local: HashMap<u64, SessionId>,
     roster: VecDeque<RosterRecord>,
     roster_seq: u64,
+    /// The instance's latest exit word survives eviction from the membership journal.
+    #[cfg(any(unix, test))]
+    last_bye: Option<(u64, aterm_types::fabric_grammar::Bye)>,
     instance_watchers: std::sync::Arc<crate::session_watch::Watchers>,
     exit_codes: HashMap<u64, i32>,
     frozen_path: std::collections::HashSet<u64>,
@@ -1229,6 +1248,29 @@ pub(crate) struct SessionStore {
 
 /// Shared thread-safe handle to [`SessionStore`].
 pub(crate) type Store = Arc<RwLock<SessionStore>>;
+
+/// A completed in-memory registration. Live session owners start its mailbox while retaining
+/// Store custody, so a close cannot overtake its enqueue. Dropping it starts no native work.
+pub(crate) struct Registration<'store> {
+    first: bool,
+    ctx: Arc<SessionCtx>,
+    _store: &'store SessionStore,
+}
+
+impl Registration<'_> {
+    /// Continue a live session's existing first-registration mailbox lifecycle.
+    pub(crate) fn start_mailbox(self) {
+        #[cfg(not(test))]
+        self.start_mailbox_with(crate::fabric::watch_direct_mail);
+    }
+
+    /// The same first-registration decision with an explicitly supplied lifecycle effect.
+    pub(crate) fn start_mailbox_with(self, start: impl FnOnce(&Arc<SessionCtx>)) {
+        if self.first {
+            start(&self.ctx);
+        }
+    }
+}
 
 /// What [`SessionStore::deregister_closing`] did.
 #[must_use]
@@ -1288,10 +1330,12 @@ impl SessionStore {
         Arc::clone(&self.allocation_monitor)
     }
 
-    /// Registers or replaces a [`SessionHandle`], updating both indices and appending to the roster journal.
-    pub(crate) fn register(&mut self, handle: SessionHandle) {
+    /// Registers or replaces a [`SessionHandle`] in memory, updating both indices and the
+    /// roster journal. The returned receipt separately starts a live owner's mailbox.
+    pub(crate) fn register(&mut self, handle: SessionHandle) -> Registration<'_> {
         handle.ctx.native_policy.registered();
         let first = !self.by_id.contains_key(&handle.sid);
+        let ctx = Arc::clone(&handle.ctx);
         if first {
             let mut tl = handle
                 .ctx
@@ -1315,8 +1359,6 @@ impl SessionStore {
             );
             tl.record("spawned");
             drop(tl);
-            #[cfg(not(test))]
-            crate::fabric::watch_direct_mail(&handle.ctx);
         }
         // The log ranks a description claim by whose session this is: said on every register,
         // since a handle that replaces one may bring another context and so another log.
@@ -1349,6 +1391,11 @@ impl SessionStore {
                 crate::turn_ledger::now_ms(),
             );
         }
+        Registration {
+            first,
+            ctx,
+            _store: self,
+        }
     }
 
     /// Appends one roster record stamped `t_ms`, evicting the oldest past [`ROSTER_JOURNAL_CAP`]; returns its seq.
@@ -1361,6 +1408,10 @@ impl SessionStore {
         t_ms: u64,
     ) -> u64 {
         self.roster_seq += 1;
+        #[cfg(any(unix, test))]
+        if let RosterChange::Bye(bye) = change {
+            self.last_bye = Some((self.roster_seq, bye));
+        }
         if self.roster.len() == ROSTER_JOURNAL_CAP {
             self.roster.pop_front();
         }
@@ -1818,6 +1869,13 @@ impl SessionStore {
     #[must_use]
     pub(crate) const fn roster_seq(&self) -> u64 {
         self.roster_seq
+    }
+
+    /// The latest instance-exit word and the roster sequence that published it.
+    #[cfg(any(unix, test))]
+    #[must_use]
+    pub(crate) const fn last_bye(&self) -> Option<(u64, aterm_types::fabric_grammar::Bye)> {
+        self.last_bye
     }
 
     /// Seeds the roster journal sequence counter from a predecessor handoff before registering sessions.

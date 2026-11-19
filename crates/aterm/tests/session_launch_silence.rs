@@ -14,12 +14,16 @@ use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
+#[path = "support/patience.rs"]
+mod patience;
 
-/// One-minute hang detector for session exit and pipe drains.
+use patience::Patience;
+
+/// The hang detector's window for session exit and pipe drains ([`Patience`]).
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// `[machine]` table keeping host settings untouched.
@@ -115,26 +119,27 @@ fn launch(root: &Path, reroute: bool) -> (String, String) {
     });
     input.write_all(b"exit 0\n").expect("type `exit 0`");
 
-    let start = Instant::now();
+    let mut patience = Patience::new(DEADLINE);
     let status_code = loop {
         match child.try_wait().expect("wait on aterm") {
             Some(status) => break status,
-            None if start.elapsed() >= DEADLINE => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("`aterm --session` did not exit within {DEADLINE:?}");
+            None => {
+                if let Some(why) = patience.spent() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("`aterm --session` was killed before it exited: {why}");
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
     drop(input);
     let join = |drain: std::thread::JoinHandle<Vec<u8>>, what: &str| -> String {
-        let grace = Instant::now() + DEADLINE;
+        let mut patience = Patience::new(DEADLINE);
         while !drain.is_finished() {
-            assert!(
-                Instant::now() < grace,
-                "the {what} stayed open past the session's exit"
-            );
+            if let Some(why) = patience.spent() {
+                panic!("the {what} stayed open past the session's exit ({why})");
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         String::from_utf8_lossy(&drain.join().expect("drain")).into_owned()

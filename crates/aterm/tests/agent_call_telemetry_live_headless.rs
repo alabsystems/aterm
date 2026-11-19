@@ -14,6 +14,7 @@ use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use crate::headless_boot::{self, Instance};
+use crate::patience::Patience;
 use crate::standin;
 
 /// This file's stand-in entry: run as the agent, with the calls [`standin::spec`] names.
@@ -70,6 +71,8 @@ fn agent_standin() {
     )
     .expect("call offsets and commands");
     standin::put(b"standin-ready\n");
+    // A wall bound: the stand-in waits on the test that drives it, an ancestor no reading of
+    // this process's descendants can see.
     let deadline = Instant::now() + HANG;
     while !gate.join("start").exists() {
         assert!(Instant::now() < deadline, "calls never started");
@@ -169,6 +172,7 @@ fn agent_standin() {
     }
     std::fs::write(gate.join("done"), b"").expect("done marker");
     standin::put(b"\nstandin-done\n");
+    // A wall bound, as for `start` above: the driver, an ancestor, writes `finish`.
     let deadline = Instant::now() + HANG;
     while !gate.join("finish").exists() {
         assert!(Instant::now() < deadline, "stand-in never finished");
@@ -180,7 +184,7 @@ fn agent_standin() {
 
 /// The instance's `kind=agent-call` rows, polled until `n` are written.
 fn call_rows(inst: &Instance, n: usize) -> Vec<String> {
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     loop {
         let body = headless_boot::ctl_ok(
             inst,
@@ -201,14 +205,15 @@ fn call_rows(inst: &Instance, n: usize) -> Vec<String> {
         if rows.len() >= n {
             return rows;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{} of {n} agent-call rows within {HANG:?}:\n{body}\n{}\n{}\n{}",
-            rows.len(),
-            headless_boot::ctl_ok(inst, &["telemetry"]),
-            readers_evidence(inst),
-            headless_boot::log_tail(&inst.log)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "{} of {n} agent-call rows ({why}):\n{body}\n{}\n{}\n{}",
+                rows.len(),
+                headless_boot::ctl_ok(inst, &["telemetry"]),
+                readers_evidence(inst),
+                headless_boot::log_tail(&inst.log)
+            );
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -235,15 +240,20 @@ fn readers_evidence(inst: &Instance) -> String {
         Ok(child) => child,
         Err(e) => return format!("vitals threads: sample did not start: {e}"),
     };
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     loop {
         match sample.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
             Ok(None) => {
+                let Some(why) = patience.spent() else {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
                 let _ = sample.kill();
                 let _ = sample.wait();
-                return format!("vitals threads: sample of pid {pid} did not end within {HANG:?}");
+                return format!(
+                    "vitals threads: sample of pid {pid} was killed before it ended: {why}"
+                );
             }
             Err(e) => return format!("vitals threads: sample could not be waited on: {e}"),
         }
@@ -291,7 +301,7 @@ fn run(prefix: &str, calls: &[(u64, &str)]) -> (Vec<String>, String) {
     let inst = headless_boot::boot(prefix, &[]);
     let (_, sid) = headless_boot::boot_session(&inst);
     start(&inst, &sid, calls);
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     loop {
         let jobs = headless_boot::ctl_ok(&inst, &["sys", "jobs", "top=64"]);
         let live: Vec<_> = jobs
@@ -309,11 +319,12 @@ fn run(prefix: &str, calls: &[(u64, &str)]) -> (Vec<String>, String) {
         {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "calls were not observed:\n{jobs}\n{telemetry}\n{}",
-            readers_evidence(&inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "calls were not observed ({why}):\n{jobs}\n{telemetry}\n{}",
+                readers_evidence(&inst)
+            );
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     std::fs::write(inst.tmp.join("release"), b"").expect("release calls after observation");
@@ -338,7 +349,7 @@ fn run(prefix: &str, calls: &[(u64, &str)]) -> (Vec<String>, String) {
 fn wait_file(path: &std::path::Path) {
     let progress_file = path.parent().expect("marker directory").join("progress");
     let mut progress = 0;
-    let mut deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     while !path.exists() {
         if let Some(next) = std::fs::read_to_string(&progress_file)
             .ok()
@@ -346,9 +357,11 @@ fn wait_file(path: &std::path::Path) {
             .filter(|next| *next > progress)
         {
             progress = next;
-            deadline = Instant::now() + HANG;
+            patience = Patience::new(HANG);
         }
-        assert!(Instant::now() < deadline, "no {}", path.display());
+        if let Some(why) = patience.spent() {
+            panic!("no {} ({why})", path.display());
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -421,7 +434,7 @@ fn start(inst: &Instance, sid: &str, calls: &[(u64, &str)]) {
         0
     );
     let resume = Resume(inst.child.id());
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     loop {
         let mut status = 0;
         // SAFETY: the owned child is live and status points to one writable int. Reap only
@@ -436,10 +449,10 @@ fn start(inst: &Instance, sid: &str, calls: &[(u64, &str)]) {
         if got == inst.child.id() as i32 && libc::WIFSTOPPED(status) {
             break;
         }
-        assert!(
-            got >= 0 && Instant::now() < deadline,
-            "instance did not stop"
-        );
+        assert!(got >= 0, "instance did not stop: waitpid failed");
+        if let Some(why) = patience.spent() {
+            panic!("instance did not stop ({why})");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     std::fs::write(inst.tmp.join("start"), b"").expect("start calls");

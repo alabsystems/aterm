@@ -1187,6 +1187,8 @@ fn paced_notes(
     let ticks_before = ticks(broker);
     let mut before = batches();
     for i in 0..spec.paced_notes {
+        // The measurement's pace, not a hang detector: each note starts one NOTE_PACE after the
+        // last, by the wall clock it is timed on.
         let paced = Instant::now() + NOTE_PACE;
         let text = format!("paced-{i}");
         let t_post = clock.us();
@@ -2014,7 +2016,7 @@ fn await_attach(
     session_subjects: &[String],
     pid: i32,
 ) {
-    let deadline = Instant::now() + DEADLINE;
+    let mut patience = crate::patience::Patience::new(DEADLINE);
     let mut received: Vec<(u64, String, String)> = Vec::new();
     loop {
         let rows: Vec<(u64, &str, &str)> = received
@@ -2024,11 +2026,12 @@ fn await_attach(
         if attach_rows(&rows, node_subject, session_subjects, pid).is_some() {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the restarted bridge (pid {pid}) did not publish its attach within {DEADLINE:?}; \
-             the presence rows that arrived: {received:?}"
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the restarted bridge (pid {pid}) did not publish its attach ({why}); the \
+                 presence rows that arrived: {received:?}"
+            );
+        }
         match watch.recv() {
             Ok(Some((off, subject, body))) => {
                 received.push((off, subject, census::head_line(&body)));

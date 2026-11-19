@@ -308,6 +308,63 @@ fn a_failing_member_pass_still_runs_the_custodians_and_a_failed_copy_fails_the_p
     );
 }
 
+/// A FULL TABLE IS THE ITEM'S SETTLED REPORT, NOT ITS FAILURE, AND NEVER HOLDS A PASS BACK
+/// (ATERM-KI-1116-3474): a member or custodian pass the lab's table refused for its capacity ends
+/// the item as a pass that ran, its line saying the refusal; a failure beside it still fails the
+/// item; and a refusal that still stands reads the row due, saying it, so the retry of that
+/// failure and every later pass runs the passes, which take in what needs no append. One that
+/// cannot be read leaves the pass due as well.
+/// NEGATIVE CONTROLS: `requests_pass` failing a full pass fails the settled item; `requests_read`
+/// reading a standing refusal as anything but due (a settled or idle row) leaves the retry of a
+/// failure beside it, and the custodian's copies, unrun.
+#[test]
+fn a_full_table_is_the_requests_items_settled_report() {
+    use aterm_db::credentials::{Custodian, Pass};
+    use aterm_secrets::need::full::{Bound, Full};
+    let full = Full {
+        bound: Bound::Table,
+        records: 8192,
+        needs_unposted: 2,
+    };
+    let refused = || {
+        Ok(Pass {
+            full: Some(full),
+            ..Pass::default()
+        })
+    };
+    let said = requests_pass(refused, || Ok(None)).expect("a full table is no failure");
+    assert!(
+        said.contains("0 posted") && said.contains(&full.line()),
+        "{said}"
+    );
+    let custodian = Custodian {
+        full: Some(full),
+        ..Custodian::default()
+    };
+    let said = requests_pass(|| Ok(Pass::default()), || Ok(Some(custodian)))
+        .expect("a full table is no failure");
+    assert!(said.contains(&full.line()), "{said}");
+
+    // A failure beside the refusal fails the item, and the refusal standing does not keep its
+    // retry from running the passes.
+    let said = requests_pass(refused, || Err("the vault cannot be read".to_owned())).unwrap_err();
+    assert!(said.contains("custodian's pass failed"), "{said}");
+    match requests_read(Ok(Vec::new()), || Ok(true), || true, || Ok(Some(full))) {
+        Ok(RequestsRead::Due(said)) => {
+            assert!(said.contains(&full.line()), "{said}");
+        }
+        other => panic!("a standing refusal holds no pass back: {other:?}"),
+    }
+    assert!(matches!(
+        requests_read(Ok(Vec::new()), || Ok(true), || false, || Ok(Some(full))),
+        Ok(RequestsRead::Idle(_))
+    ));
+    assert!(matches!(
+        requests_read(Ok(Vec::new()), || Ok(true), || true, || Err("requests-full: damaged".to_owned())),
+        Ok(RequestsRead::Due(said)) if said.contains("requests-full: damaged")
+    ));
+}
+
 /// A need ledger `sync.requests` cannot read (damaged, on the vault's admin Mac) leaves the
 /// pass due, saying so, so its apply runs and the custodian's half still decides for the
 /// lab; the probe failing instead would read as unusable and run nothing.
@@ -316,22 +373,30 @@ fn a_failing_member_pass_still_runs_the_custodians_and_a_failed_copy_fails_the_p
 #[test]
 fn a_need_ledger_that_cannot_be_read_still_runs_the_requests_pass() {
     let damaged = || Err("needs.toml: not a need ledger aterm wrote".to_owned());
-    let due = requests_read(damaged(), || Ok(true), || true);
+    let due = requests_read(damaged(), || Ok(true), || true, || Ok(None));
     assert!(
         matches!(&due, Ok(RequestsRead::Due(said)) if said.contains("needs.toml: not a need ledger")),
         "{due:?}"
     );
     assert!(matches!(
-        requests_read(damaged(), || Ok(true), || false),
+        requests_read(damaged(), || Ok(true), || false, || Ok(None)),
         Ok(RequestsRead::Idle(_))
     ));
     assert!(matches!(
-        requests_read(damaged(), || Ok(false), || true),
+        requests_read(damaged(), || Ok(false), || true, || Ok(None)),
         Ok(RequestsRead::Idle(_))
     ));
-    assert!(requests_read(Ok(Vec::new()), || Err("aterm.toml".to_owned()), || true).is_err());
+    assert!(
+        requests_read(
+            Ok(Vec::new()),
+            || Err("aterm.toml".to_owned()),
+            || true,
+            || Ok(None)
+        )
+        .is_err()
+    );
     assert_eq!(
-        requests_read(Ok(Vec::new()), || Ok(true), || true),
+        requests_read(Ok(Vec::new()), || Ok(true), || true, || Ok(None)),
         Ok(RequestsRead::Due(format!(
             "no needs on this {}",
             aterm_types::machine_name::OS_NOUN
@@ -1483,6 +1548,9 @@ enum RuleFile<'a> {
     Unreadable,
     /// A rule standing as a stat reads it, holding these bytes, which the account can read.
     Holding(&'a [u8]),
+    /// No file, and the person's removal marker where the rule's revert moved it
+    /// ([`aterm_machines::root_steps::rule_removed`]).
+    Removed,
 }
 
 /// A Fake Mac where this process's ordinary account (not root), `alice` (uid 501), runs the
@@ -1502,6 +1570,21 @@ fn naming_rule_mac(rule: RuleFile<'_>) -> aterm_machines::port::Fake {
     sys.euid = alice.uid;
     let len = match rule {
         RuleFile::Missing => return sys,
+        RuleFile::Removed => {
+            sys.file(aterm_machines::root_steps::REMOVED_RULE, b"the rule\n")
+                .stat_of(
+                    aterm_machines::root_steps::REMOVED_RULE,
+                    aterm_machines::port::Stat {
+                        uid: 0,
+                        gid: 0,
+                        mode: 0o440,
+                        dir: false,
+                        symlink: false,
+                        len: 9,
+                    },
+                );
+            return sys;
+        }
         RuleFile::Unreadable => 452,
         RuleFile::Holding(rule) => {
             sys.file(ADMITTED_NAME_RULE, rule);
@@ -1616,6 +1699,7 @@ fn a_naming_rule_this_build_did_not_write_leaves_the_identity_row_quiet() {
         ("missing", RuleFile::Missing),
         ("number-only", RuleFile::Holding(old.as_bytes())),
         ("unreadable", RuleFile::Unreadable),
+        ("removed", RuleFile::Removed),
     ] {
         let sys = naming_rule_mac(rule);
         let values = bare_m16();
@@ -1627,7 +1711,8 @@ fn a_naming_rule_this_build_did_not_write_leaves_the_identity_row_quiet() {
         );
         match (case, mac_name_pending(&sys, "m16", &names, &own)) {
             ("missing", Some(MacNamePending::Elevation(why)))
-            | ("number-only", Some(MacNamePending::Renewal(why))) => {
+            | ("number-only", Some(MacNamePending::Renewal(why)))
+            | ("removed", Some(MacNamePending::Removed(why))) => {
                 assert!(why.contains("not m16-global"), "{why}");
             }
             ("unreadable", Some(MacNamePending::Unread(why))) => {
@@ -1695,6 +1780,23 @@ fn the_name_status_offers_the_password_step_only_where_setup_owes_the_rule() {
         assert_eq!(act.contains("password step"), owes, "{case}: {act}");
         assert!(act.contains("aterm init"), "{case}: {act}");
     }
+    // A rule the person removed is theirs: setup owes no password step for it, and status names
+    // no step at all, only how to put it back. NEGATIVE CONTROL (run): a removal read as
+    // `Elevation` promises the password step.
+    let sys = naming_rule_mac(RuleFile::Removed);
+    assert!(!owed(&sys).contains(&Owed::NameRule));
+    let area = crate::machine_status::name_area(&Ok(MacName::Named {
+        target: "m16".to_owned(),
+        fleet: FleetName::Current,
+        pending: mac_name_pending(&sys, "m16", &names, &own),
+    }));
+    assert!(area.next.is_none(), "{:?}", area.next);
+    assert!(
+        area.says.contains("you removed setup's naming permission")
+            && area.says.contains("aterm init"),
+        "{}",
+        area.says
+    );
 }
 
 /// With this build's rule for the account, the same owed names make the probe due, status

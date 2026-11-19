@@ -5165,6 +5165,86 @@ fn an_overdue_move_names_its_cause_by_class() {
     }
 }
 
+/// EVERY NATIVE WAIT IS ATERM'S OWN FAULT, NAMED (`m16`'s sessions read "a wait aterm does not
+/// classify" for days at `native-managed-policy`): each typed twin-projection refusal's word
+/// (`native-twin-<kind>`), the native token policy and the asked upgrade's own preconditions
+/// (re-entry into a recreated host included) are classed `native-fault`, worded as aterm's native
+/// restart, and named in the overdue cause, with or without a `release:` prefix, under work or
+/// not. CONTROL: a word without the native head stays unclassified, and a native restart's read
+/// of its tab (`native-status`, `native-screen-unread`, `native-person-unread`) is a tab aterm
+/// could not read, never aterm's own fault.
+///
+/// NEGATIVE CONTROL: with the tab-read arm naming `native-person-unread` alone, `native-status`
+/// is classed `native-fault`.
+#[test]
+fn every_native_wait_is_atermss_own_fault_and_named() {
+    let mut waits: Vec<&str> = atpkg::platform::NativeProjectionRefusal::ALL
+        .iter()
+        .map(|refusal| refusal.word())
+        .collect();
+    waits.extend([
+        "native-token-policy",
+        "native-platform",
+        crate::harness::native_restart::REENTRY_UNOBSERVED,
+        crate::harness::native_restart::REENTRY_BOUND,
+        crate::harness::native_restart::SUCCESSION_UNREAD,
+        "native-unresolved-operation",
+        "native-host-epoch",
+    ]);
+    for wait in waits {
+        assert!(wait.starts_with(NATIVE_WAIT_PREFIX), "{wait}");
+        for spelled in [wait.to_string(), format!("release:{wait}")] {
+            assert_eq!(wait_class(&spelled), WaitClass::NativeFault, "{spelled}");
+            for held in [false, true] {
+                let row = Row {
+                    wait_seen: NOW,
+                    held_by: if held {
+                        vec![HeldBy {
+                            pid: 51_435,
+                            name: "zsh".to_string(),
+                            since: NOW - 3 * 86_400,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..pending_with(&spelled)
+                };
+                assert_eq!(
+                    row.cause(),
+                    Cause::NativeFault(wait.to_string()),
+                    "{spelled}"
+                );
+                assert_eq!(row.cause_word(NOW), "native-fault", "{spelled}");
+                let overdue = row.overdue_cause(NOW);
+                assert!(overdue.contains("native restart"), "{spelled}: {overdue}");
+            }
+        }
+    }
+    assert_eq!(wait_class("twin-producer-unknown"), WaitClass::Unclassified);
+    // CONTROL: a native restart's read of its tab (the status line, the person's input sequence,
+    // the screen) is a tab aterm could not read this look, which the next look retries, never
+    // aterm's own native fault.
+    for unread in [
+        "native-status",
+        "native-screen-unread",
+        "native-person-unread",
+    ] {
+        for spelled in [unread.to_string(), format!("release:{unread}")] {
+            assert_eq!(wait_class(&spelled), WaitClass::TabUnread, "{spelled}");
+            let row = Row {
+                wait_seen: NOW,
+                ..pending_with(&spelled)
+            };
+            assert!(
+                !matches!(row.cause(), Cause::NativeFault(_)),
+                "{spelled}: {:?}",
+                row.cause()
+            );
+            assert_ne!(row.cause_word(NOW), "native-fault", "{spelled}");
+        }
+    }
+}
+
 /// `no-version`, the wait the watch records while a version is unread, is classed and worded for
 /// what it is in every line the status prints: its own class, never `a wait aterm does not
 /// classify` and never a tab aterm cannot read, with or without a `release:` prefix. CONTROL: a
@@ -9622,6 +9702,7 @@ fn every_account_refusal_wait_has_a_class_and_words() {
             RefusalKind::Unattributed | RefusalKind::Unread => WaitClass::TabUnread,
             RefusalKind::Limited => WaitClass::Limit,
             RefusalKind::Integrity
+            | RefusalKind::Retained
             | RefusalKind::Token
             | RefusalKind::SignedOut
             | RefusalKind::Pin

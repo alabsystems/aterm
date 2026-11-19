@@ -950,9 +950,25 @@ fn browser(
 ) -> Result<RenewBrowser, String> {
     match row.browser.as_ref() {
         Some(_) => Err(super::super::account_catalog::NAMED_BROWSER_UNSUPPORTED.into()),
-        None if cli == Cli::Claude => Ok(RenewBrowser::Remote {
-            opener: Some(opener_link(store, host).map_err(|error| error.to_string())?),
-        }),
+        None if cli == Cli::Claude => {
+            // Off Unix a shared login's private evidence is not read back
+            // (`shared_provider::read_staged_bytes`), so a Claude adoption is refused here, at
+            // its opener, before it consumes authority or runs its provider.
+            #[cfg(not(unix))]
+            {
+                let _ = (store, host);
+                Err(SHARED_EVIDENCE_UNAVAILABLE.into())
+            }
+            #[cfg(unix)]
+            Ok(RenewBrowser::Remote {
+                opener: Some(opener_link(store, host).map_err(|error| error.to_string())?),
+            })
+        }
         None => Ok(RenewBrowser::Default),
     }
 }
+
+/// Why a Claude shared adoption is refused off Unix ([`browser`]).
+#[cfg(not(unix))]
+pub(super) const SHARED_EVIDENCE_UNAVAILABLE: &str =
+    "private shared-login evidence is unavailable on this platform; nothing was consumed";

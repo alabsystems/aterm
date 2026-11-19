@@ -418,12 +418,12 @@ fn tail_json_prints_one_object_per_record_and_a_body_only_under_bodies() {
         transport::connect(&sock.to_string_lossy(), aterm_spec::wait::MUST_HAPPEN).expect("dial");
     let records = [
         (
-            "/f/f1/in/n-a/tx000000000/h-jsmith/note",
+            "/f/f1/in/n-a/t0000000081/h-jsmith/note",
             "v=1 t=1700000000000 text=QZP8NOTE",
         ),
         ("/f/f1/pub/n-a/node/presence", "v=1 t=1700000000001 inc=3"),
         (
-            "/f/f1/pub/n-a/tx000000000/presence",
+            "/f/f1/pub/n-a/t0000000081/presence",
             "v=1 t=1700000000002 state=live",
         ),
     ];
@@ -479,7 +479,7 @@ fn tail_json_prints_one_object_per_record_and_a_body_only_under_bodies() {
             );
             assert_eq!(field("subject"), Some(subject));
             assert_eq!(field("node"), Some("n-a"));
-            assert_eq!(field("sid"), [Some("tx000000000"), None][i], "{line}");
+            assert_eq!(field("sid"), [Some("t0000000081"), None][i], "{line}");
             assert_eq!(field("kind"), Some(["note", "presence"][i]));
             let t = traffic_of("f1", offs[i], subject, body.as_bytes(), 0);
             let table = tail_line(&t, 0, 0, true);
@@ -1412,21 +1412,22 @@ fn sessions_show_the_broadcast_topics_and_a_dash_for_none() {
 #[test]
 fn sessions_show_the_presence_rows_meaning_fields() {
     let mut r = healthy();
+    r.instances[0].sessions[0].sid = "t0000000090".to_string();
     let (_, body) = (
         "",
         b"v=1 t=1 inc=1 state=live hold=0 holder=- attention=- role=bus-role \
         detail=claude phase=busy context=12%25 title=bus%20title",
     );
     let local_row =
-        crate::glance::Row::parse("lab", 5, "/f/lab/pub/n-a/t0ne0000000/presence", body)
+        crate::glance::Row::parse("lab", 5, "/f/lab/pub/n-a/t0000000090/presence", body)
             .expect("a row");
     let remote_row =
-        crate::glance::Row::parse("lab", 6, "/f/lab/pub/n-far/tfar0000000/presence", body)
+        crate::glance::Row::parse("lab", 6, "/f/lab/pub/n-far/t0000000083/presence", body)
             .expect("a row");
     let old_row = crate::glance::Row::parse(
         "lab",
         7,
-        "/f/lab/pub/n-far/tpmd0000000/presence",
+        "/f/lab/pub/n-far/t0000000086/presence",
         b"v=1 t=1 inc=1 state=live hold=0 holder=- attention=-",
     )
     .expect("a row");
@@ -1683,11 +1684,11 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
         "lab",
         4,
         "/f/lab/in/n-a/tw000000000/n-a/task",
-        b"v=1 t=1757000000000 from=tme00000000 text=secret%20plan",
+        b"v=1 t=1757000000000 from=t0000000093 text=secret%20plan",
         0,
     );
     assert_eq!(
-        t.from, "tme00000000@n-a",
+        t.from, "t0000000093@n-a",
         "the node attests which session spoke"
     );
     assert_eq!(t.to, "tw000000000@n-a");
@@ -1858,7 +1859,7 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
 /// When the carried-post tests' certificate was signed, and the post: a reader's clock.
 const CARRIED_AT: u64 = 1_800_000_000_000;
 
-/// A post of h-andrew's to session `tq000000000`, of `kind`, sealed on the Mac whose node seed is
+/// A post of h-andrew's to session `t0000000091`, of `kind`, sealed on the Mac whose node seed is
 /// `[51; 32]` and carried by that Mac's mesh (§11 C3c, `federate::Routes::carry_one`): the
 /// Mac's node, and the body its lane holds, `by=h-andrew` beside the seal.
 fn carried_post(kind: &str) -> (String, Body) {
@@ -1874,7 +1875,7 @@ fn carried_post(kind: &str) -> (String, Body) {
     body.text = "QZP9PLAN".to_owned();
     key.seal(
         &cert,
-        &post_address("lab", "tq000000000", "h-andrew", kind),
+        &post_address("lab", "t0000000091", "h-andrew", kind),
         &mut body,
     );
     body.unknown
@@ -1884,7 +1885,7 @@ fn carried_post(kind: &str) -> (String, Body) {
 }
 
 /// **A CARRIED PERSON'S POST READS AS THE PERSON ONLY WHILE ITS SEAL VERIFIES** (§11 C3d): a
-/// post of h-andrew's that the Mac P carried onto its own lane to session tq000000000 on Q,
+/// post of h-andrew's that the Mac P carried onto its own lane to session t0000000091 on Q,
 /// `by=h-andrew` beside the seal, is the person's in every observer view (`traffic_of`, the
 /// TRAFFIC cells, `tail`, `tail --json`, the deadline scan), `from=h-andrew@<P>
 /// trust=human`, once its seal verifies, at the reader's clock, under the certificate of the
@@ -1892,8 +1893,8 @@ fn carried_post(kind: &str) -> (String, Body) {
 /// NEGATIVE CONTROLS, each the same record less one premise, each refused for its reason and
 /// shown as the lane's writer and `agent`, never under the name it claims: the same bytes on
 /// another Mac's lane (not vouched), `by=` naming another person and its text changed (each
-/// a bad seal), its seal taken off (unsealed), a body `from=tx000000000` beside a failed claim (the
-/// Mac still, not `tx000000000@<P>`), `by=` naming no person (malformed), and a reader whose clock
+/// a bad seal), its seal taken off (unsealed), a body `from=t0000000092` beside a failed claim (the
+/// Mac still, not `t0000000092@<P>`), `by=` naming no person (malformed), and a reader whose clock
 /// is past the certificate's life (lapsed, though nothing in the post changed); one relayed
 /// (`via=`) reads `relayed`.
 #[test]
@@ -1902,7 +1903,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     let (p, post) = carried_post("ask");
     let q = crate::federate::node_of(&[52; 32]);
     let other = crate::federate::node_of(&[53; 32]);
-    let lane = |writer: &str| format!("/f/lab/in/{q}/tq000000000/{writer}/ask");
+    let lane = |writer: &str| format!("/f/lab/in/{q}/t0000000091/{writer}/ask");
     // Every view of the record: its classification, its TRAFFIC cells' trust and sender,
     // its `tail` line's words and its `tail --json` object.
     let views = |subject: &str, body: &Body, now: u64| {
@@ -1915,7 +1916,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     let shows = |what: &str, subject: &str, body: &Body, now: u64, (from, trust): (&str, &str)| {
         let (t, cells, line, json) = views(subject, body, now);
         assert_eq!((t.from.as_str(), t.trust), (from, trust), "{what}");
-        assert_eq!(t.to, format!("tq000000000@{q}"), "{what}");
+        assert_eq!(t.to, format!("t0000000091@{q}"), "{what}");
         assert_eq!(cells, (trust.to_owned(), from.to_owned()), "{what}");
         let words: Vec<&str> = line.split_whitespace().collect();
         assert!(
@@ -1936,7 +1937,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     let person = format!("h-andrew@{p}");
     shows("verified", &lane(&p), &post, CARRIED_AT, (&person, "human"));
     assert_eq!(
-        carried_by("lab", "tq000000000", &p, "ask", &post, CARRIED_AT),
+        carried_by("lab", "t0000000091", &p, "ask", &post, CARRIED_AT),
         Ok(Some(person.clone()))
     );
     let late = CARRIED_AT + 60_001;
@@ -1988,10 +1989,10 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
             Refusal::Unsealed,
         ),
         (
-            "from=tx000000000 beside a failed claim",
+            "from=t0000000092 beside a failed claim",
             &p,
             with(&|b| {
-                b.from = Some("tx000000000".to_owned());
+                b.from = Some("t0000000092".to_owned());
                 b.text.push('!');
             }),
             CARRIED_AT,
@@ -2017,7 +2018,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     ];
     for (what, writer, body, now, refusal) in &controls {
         assert_eq!(
-            carried_by("lab", "tq000000000", writer, "ask", body, *now),
+            carried_by("lab", "t0000000091", writer, "ask", body, *now),
             Err(*refusal),
             "{what}"
         );
@@ -2031,7 +2032,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     );
     let relayed = with(&|b| b.via = Some(other.clone()));
     assert_eq!(
-        carried_by("lab", "tq000000000", &p, "ask", &relayed, CARRIED_AT),
+        carried_by("lab", "t0000000091", &p, "ask", &relayed, CARRIED_AT),
         Err(Refusal::Relayed)
     );
     shows("relayed", &lane(&p), &relayed, CARRIED_AT, (&p, "relayed"));
@@ -2051,7 +2052,7 @@ fn a_person_lane_names_a_session_on_another_mac_as_its_bridge_wrote_it() {
         crate::federate::node_of(&[51; 32]),
         crate::federate::node_of(&[52; 32]),
     );
-    let named = format!("tq000000000@{q}");
+    let named = format!("t0000000091@{q}");
     let raw = |from: &str| format!("v=1 t=1757000000000 from={from} re=3 text=done");
     let on_person_lane = format!("/f/lab/in/p/h-andrew/{p}/answer");
     let t = traffic_of("lab", 41, &on_person_lane, raw(&named).as_bytes(), 0);
@@ -2071,14 +2072,14 @@ fn a_person_lane_names_a_session_on_another_mac_as_its_bridge_wrote_it() {
         inbox.contains(&format!("  answer  from={named} trust=agent re=3")),
         "{inbox}"
     );
-    let bare = traffic_of("lab", 42, &on_person_lane, raw("tx000000000").as_bytes(), 0);
+    let bare = traffic_of("lab", 42, &on_person_lane, raw("t0000000092").as_bytes(), 0);
     assert_eq!(
         bare.from,
-        format!("tx000000000@{p}"),
+        format!("t0000000092@{p}"),
         "a bare session is still the writer's"
     );
 
-    let on_session_lane = format!("/f/lab/in/{p}/tx000000000/{q}/note");
+    let on_session_lane = format!("/f/lab/in/{p}/t0000000092/{q}/note");
     let t = traffic_of("lab", 43, &on_session_lane, raw(&named).as_bytes(), 0);
     assert_eq!((t.from.as_str(), t.trust), (q.as_str(), "agent"));
     let by_person = "/f/lab/in/p/h-andrew/h-bob/answer";
@@ -2086,10 +2087,10 @@ fn a_person_lane_names_a_session_on_another_mac_as_its_bridge_wrote_it() {
     assert_eq!((t.from.as_str(), t.trust), ("h-bob", "human"));
     for odd in [
         format!("h-x@{q}"),
-        "tq000000000@h-x".to_owned(),
-        format!("tq000000000@{q}@{q}"),
+        "t0000000091@h-x".to_owned(),
+        format!("t0000000091@{q}@{q}"),
         format!("s-Q@{q}"),
-        "tq000000000@".to_owned(),
+        "t0000000091@".to_owned(),
     ] {
         let t = traffic_of("lab", 45, &on_person_lane, raw(&odd).as_bytes(), 0);
         assert_eq!(t.from, p, "{odd}");
@@ -3428,6 +3429,7 @@ fn a_lapsed_ring_is_named_and_its_fix_is_a_renewal() {
 #[test]
 fn nodes_lists_every_node_and_marks_this_one() {
     let mut r = healthy();
+    r.instances[0].sessions[0].sid = "t0000000090".to_string();
     let body = b"v=1 t=1 inc=1 state=live hold=0 holder=- attention=-";
     let roster = crate::glance::Glance {
         fleet: "lab".to_string(),
@@ -3446,9 +3448,9 @@ fn nodes_lists_every_node_and_marks_this_one() {
                 b"v=1 t=1 inc=1 state=live fabric=connected host=m100",
             )
             .expect("row"),
-            crate::glance::Row::parse("lab", 3, "/f/lab/pub/n-z/tfar0000000/presence", body)
+            crate::glance::Row::parse("lab", 3, "/f/lab/pub/n-z/t0000000083/presence", body)
                 .expect("row"),
-            crate::glance::Row::parse("lab", 4, "/f/lab/pub/n-a/t0ne0000000/presence", body)
+            crate::glance::Row::parse("lab", 4, "/f/lab/pub/n-a/t0000000090/presence", body)
                 .expect("row"),
         ],
         truncated: false,
@@ -4048,10 +4050,10 @@ impl HeldAsk {
 }
 
 /// RETENTION HOLDS OVERDUE ASKS BELOW THE `in` LANES' OLDEST (audit finding BUS-1, on one
-/// node): `t0ne0000000@n-a` asks the person `h-jsmith` three times with a deadline of 10 min, 20
+/// node): `t0000000096@n-a` asks the person `h-jsmith` three times with a deadline of 10 min, 20
 /// min before `now`; the person lanes' reader group (`/f/lab/cur/p/node/inbox`) is one
-/// nothing commits, so retention holds the asks. On `t0ne0000000`'s own lane, the person answers
-/// the first (`answered`) and `t0ne0000000`'s bridge records the second expired (`lapsed`); the
+/// nothing commits, so retention holds the asks. On `t0000000096`'s own lane, the person answers
+/// the first (`answered`) and `t0000000096`'s bridge records the second expired (`lapsed`); the
 /// third (`ask`) gets neither. Last, a mail between two of the node's sessions. The node's
 /// inbox group reads all three, and the bulk stream's cut (aterm's rules, its bytes
 /// scaled) gives them up past the asks, which raises their subjects' floors, and so the
@@ -4091,21 +4093,21 @@ fn held_ask_bus(tag: &str) -> HeldAsk {
         "{}/ask",
         crate::subject::person_lane("lab", "h-jsmith", "n-a")
     );
-    let asked = format!("v=1 t={t} from=t0ne0000000 dl=600000 text=which");
+    let asked = format!("v=1 t={t} from=t0000000096 dl=600000 text=which");
     let answered = publish(&to_person, &asked);
     publish(
-        &crate::subject::post_lane("lab", "n-a", "t0ne0000000", "h-jsmith", "answer"),
+        &crate::subject::post_lane("lab", "n-a", "t0000000096", "h-jsmith", "answer"),
         &format!("v=1 t=1 re={answered} text=yes"),
     );
     let lapsed = publish(&to_person, &asked);
     publish(
-        &crate::subject::post_lane("lab", "n-a", "t0ne0000000", "n-a", "expired"),
+        &crate::subject::post_lane("lab", "n-a", "t0000000096", "n-a", "expired"),
         &format!("v=1 t=1 re={lapsed} dl=600000 text=expired"),
     );
     let ask = publish(&to_person, &asked);
     let read = publish(
         &crate::subject::post_lane("lab", "n-a", "ttw00000000", "n-a", "note"),
-        "v=1 t=1 from=t0ne0000000 text=fyi",
+        "v=1 t=1 from=t0000000096 text=fyi",
     );
     let filler = "e".repeat(BODY as usize);
     for _ in 0..3 {
@@ -4192,11 +4194,11 @@ fn an_ask_held_below_the_in_lanes_oldest_is_listed_overdue() {
     }
 }
 
-/// AN ASK STATUS CANNOT JUDGE IS COUNTED, NEVER LISTED (audit finding BUS2-3): `t0ne0000000@n-a`
+/// AN ASK STATUS CANNOT JUDGE IS COUNTED, NEVER LISTED (audit finding BUS2-3): `t0000000096@n-a`
 /// asks the person `h-jsmith` with a deadline that has passed (`ask`), then again with one
-/// that has not (`later`), and the person answers `later` on `t0ne0000000`'s lane. The node's
+/// that has not (`later`), and the person answers `later` on `t0000000096`'s lane. The node's
 /// inbox group reads the answer and a mail, and the bulk stream's cut (aterm's rules, its
-/// bytes scaled) gives them up, which raises the floor of `t0ne0000000`'s answers above `ask`: the
+/// bytes scaled) gives them up, which raises the floor of `t0000000096`'s answers above `ask`: the
 /// bus no longer says whether `ask` had one. Over the whole fleet's `in` lanes and over the
 /// node cap's faces, the deadline scan lists nothing and counts `ask` unjudged, and status
 /// says so in one warning (exit 1), which `doctor` gives its own fix, and as
@@ -4246,19 +4248,19 @@ fn an_ask_whose_askers_later_answer_was_given_up_is_counted_unjudged() {
     );
     let ask = publish(
         &to_person,
-        &format!("v=1 t={t} from=t0ne0000000 dl=600000 text=which"),
+        &format!("v=1 t={t} from=t0000000096 dl=600000 text=which"),
     );
     let later = publish(
         &to_person,
-        &format!("v=1 t={now} from=t0ne0000000 dl=600000 text=which"),
+        &format!("v=1 t={now} from=t0000000096 dl=600000 text=which"),
     );
     publish(
-        &crate::subject::post_lane("lab", "n-a", "t0ne0000000", "h-jsmith", "answer"),
+        &crate::subject::post_lane("lab", "n-a", "t0000000096", "h-jsmith", "answer"),
         &format!("v=1 t=1 re={later} text=yes"),
     );
     let read = publish(
         &crate::subject::post_lane("lab", "n-a", "ttw00000000", "n-a", "note"),
-        "v=1 t=1 from=t0ne0000000 text=fyi",
+        "v=1 t=1 from=t0000000096 text=fyi",
     );
     let filler = "e".repeat(BODY as usize);
     for _ in 0..3 {
@@ -4271,7 +4273,7 @@ fn an_ask_whose_askers_later_answer_was_given_up_is_counted_unjudged() {
         .retention_tick_at(broker.now_ms())
         .expect("the retention tick");
     let (_, (_, head)) = writer.fetch(0, "/f/lab/>", 0).expect("the head");
-    let lane = verdict_lane("lab", &to_person, Some("t0ne0000000"));
+    let lane = verdict_lane("lab", &to_person, Some("t0000000096"));
     let (floor, _) = writer
         .oldest(&format!("{lane}/answer"))
         .expect("the answers' oldest");
@@ -4322,39 +4324,39 @@ fn an_ask_whose_askers_later_answer_was_given_up_is_counted_unjudged() {
 fn an_asks_verdicts_are_read_on_its_askers_lane() {
     let lane = |subject: &str, from: Option<&str>| verdict_lane("lab", subject, from);
     assert_eq!(
-        lane("/f/lab/in/p/h-jsmith/n-a/ask", Some("t0ne0000000")),
-        "/f/lab/in/n-a/t0ne0000000/*"
+        lane("/f/lab/in/p/h-jsmith/n-a/ask", Some("t0000000094")),
+        "/f/lab/in/n-a/t0000000094/*"
     );
     assert_eq!(
-        lane("/f/lab/in/n-b/ttw00000000/n-a/ask", Some("t0ne0000000")),
-        "/f/lab/in/n-a/t0ne0000000/*"
+        lane("/f/lab/in/n-b/t0000000095/n-a/ask", Some("t0000000094")),
+        "/f/lab/in/n-a/t0000000094/*"
     );
     assert_eq!(
-        lane("/f/lab/in/n-a/t0ne0000000/h-jsmith/ask", None),
+        lane("/f/lab/in/n-a/t0000000094/h-jsmith/ask", None),
         "/f/lab/in/p/h-jsmith/*"
     );
     for (subject, from) in [
-        ("/f/lab/in/n-b/ttw00000000/n-a/ask", None),
-        ("/f/lab/in/n-b/ttw00000000/n-a/ask", Some("s-Bad")),
+        ("/f/lab/in/n-b/t0000000095/n-a/ask", None),
+        ("/f/lab/in/n-b/t0000000095/n-a/ask", Some("s-Bad")),
         (
-            "/f/lab/in/n-b/ttw00000000/t0ne0000000/ask",
-            Some("t0ne0000000"),
+            "/f/lab/in/n-b/t0000000095/t0000000094/ask",
+            Some("t0000000094"),
         ),
     ] {
         assert_eq!(lane(subject, from), "/f/lab/in/*/*/*", "{subject} {from:?}");
     }
-    let verdicts = "/f/lab/in/n-b/ttw00000000/*/answer";
+    let verdicts = "/f/lab/in/n-b/t0000000095/*/answer";
     assert_eq!(
         filter_meet(verdicts, "/f/lab/in/>").as_deref(),
         Some(verdicts)
     );
     assert_eq!(
         filter_meet(verdicts, "/f/lab/in/*/*/n-a/*").as_deref(),
-        Some("/f/lab/in/n-b/ttw00000000/n-a/answer")
+        Some("/f/lab/in/n-b/t0000000095/n-a/answer")
     );
     assert_eq!(
         filter_meet("/f/lab/in/*/*/n-a/*", verdicts).as_deref(),
-        Some("/f/lab/in/n-b/ttw00000000/n-a/answer")
+        Some("/f/lab/in/n-b/t0000000095/n-a/answer")
     );
     assert_eq!(filter_meet(verdicts, "/f/lab/in/n-a/>"), None);
     assert_eq!(filter_meet(verdicts, "/f/lab/in/*/*/*"), None);
@@ -4440,7 +4442,7 @@ fn the_status_reports_only_a_halt_a_bridge_applies() {
 #[test]
 fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
     let now = 100 * 60 * 1000u64;
-    let lane = |src: &str, kind: &str| format!("/f/lab/in/n-a/t0ne0000000/{src}/{kind}");
+    let lane = |src: &str, kind: &str| format!("/f/lab/in/n-a/t0000000094/{src}/{kind}");
     let rec = |off: u64, subject: String, body: &str| (off, subject, body.as_bytes().to_vec());
     let records = vec![
         rec(
@@ -4457,7 +4459,7 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
             45,
             lane("n-b", "answer"),
             &format!(
-                "v=1 t={} from=ttw00000000 re=41 text=done",
+                "v=1 t={} from=t0000000095 re=41 text=done",
                 now - 5 * 60 * 1000
             ),
         ),
@@ -4465,7 +4467,7 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
             42,
             lane("n-b", "ask"),
             &format!(
-                "v=1 t={} from=ttw00000000 dl=600000 text=why",
+                "v=1 t={} from=t0000000095 dl=600000 text=why",
                 now - 20 * 60 * 1000
             ),
         ),
@@ -4515,8 +4517,8 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
     );
     assert_eq!(overdue[0].late_ms, 10 * 60 * 1000);
     assert_eq!(overdue[0].from, "h-andrew");
-    assert_eq!(overdue[0].to, "t0ne0000000@n-a");
-    assert_eq!(overdue[1].from, "ttw00000000@n-b");
+    assert_eq!(overdue[0].to, "t0000000094@n-a");
+    assert_eq!(overdue[1].from, "t0000000095@n-b");
 
     let mut r = healthy();
     r.overdue = overdue;
@@ -4638,6 +4640,7 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
     assert!(!w.iter().any(|l| l.contains("h-bea's")), "{w:#?}");
 
     let mut r = healthy();
+    r.instances[0].sessions[0].sid = "t0000000090".to_string();
     let fresh_gone = format!("v=1 t={} state=exited hold=0", crate::now_ms());
     let rows: [(&str, &[u8]); 5] = [
         (
@@ -4645,16 +4648,16 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
             b"v=1 t=1 state=live fabric=connected",
         ),
         (
-            "/f/lab/pub/n-a/t0ne0000000/presence",
+            "/f/lab/pub/n-a/t0000000090/presence",
             b"v=1 t=1 state=live hold=0",
         ),
         (
-            "/f/lab/pub/n-a/tghpst00000/presence",
+            "/f/lab/pub/n-a/t0000000084/presence",
             b"v=1 t=1 state=live hold=0",
         ),
-        ("/f/lab/pub/n-a/tgpne000000/presence", fresh_gone.as_bytes()),
+        ("/f/lab/pub/n-a/t0000000085/presence", fresh_gone.as_bytes()),
         (
-            "/f/lab/pub/n-far/tfar0000000/presence",
+            "/f/lab/pub/n-far/t0000000083/presence",
             b"v=1 t=1 state=live hold=0",
         ),
     ];
@@ -4676,23 +4679,23 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
     assert_eq!(
         joined,
         vec![
-            ("t0ne0000000", Some(100), "live"),
-            ("tfar0000000", None, "live"),
-            ("tghpst00000", None, "live"),
-            ("tgpne000000", None, "gone"),
+            ("t0000000090", Some(100), "live"),
+            ("t0000000083", None, "live"),
+            ("t0000000084", None, "live"),
+            ("t0000000085", None, "gone"),
         ],
         "local rows first, then the bus-only ones by sid; a recently retired \
          local row is LISTED as `gone` rather than counted"
     );
     assert_eq!(r.exited, 0, "nothing here is old enough to be a bare count");
     let w = warned(&r);
-    assert!(w.iter().any(|l| l.contains("@tghpst00000")), "{w:#?}");
+    assert!(w.iter().any(|l| l.contains("@t0000000084")), "{w:#?}");
     assert!(
-        !w.iter().any(|l| l.contains("@tgpne000000")),
+        !w.iter().any(|l| l.contains("@t0000000085")),
         "a retired row is not advertised live and must not be warned about: {w:#?}"
     );
     assert!(
-        !w.iter().any(|l| l.contains("@tfar0000000")),
+        !w.iter().any(|l| l.contains("@t0000000083")),
         "a REMOTE node's session is not this machine's to host: {w:#?}"
     );
 }
@@ -4700,6 +4703,7 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
 #[test]
 fn a_will_reads_away_and_so_do_the_rows_it_left_live() {
     let mut r = healthy();
+    r.instances[0].sessions[0].sid = "t0000000090".to_string();
     let fresh_exited = format!("v=1 t={} state=exited hold=0", crate::now_ms());
     let rows: [(&str, &[u8]); 7] = [
         (
@@ -4707,7 +4711,7 @@ fn a_will_reads_away_and_so_do_the_rows_it_left_live() {
             b"v=1 t=1 state=live fabric=connected",
         ),
         (
-            "/f/lab/pub/n-a/t0ne0000000/presence",
+            "/f/lab/pub/n-a/t0000000090/presence",
             b"v=1 t=1 state=live hold=0",
         ),
         (
@@ -4719,15 +4723,15 @@ fn a_will_reads_away_and_so_do_the_rows_it_left_live() {
             b"v=1 t=1 state=gone inc=2 fabric=disconnected",
         ),
         (
-            "/f/lab/pub/n-far/tfar0000000/presence",
+            "/f/lab/pub/n-far/t0000000083/presence",
             b"v=1 t=1 state=live hold=0",
         ),
         (
-            "/f/lab/pub/n-old/tpmd0000000/presence",
+            "/f/lab/pub/n-old/t0000000086/presence",
             b"v=1 t=1 state=live hold=0",
         ),
         (
-            "/f/lab/pub/n-a/tended00000/presence",
+            "/f/lab/pub/n-a/t0000000082/presence",
             fresh_exited.as_bytes(),
         ),
     ];
@@ -4749,10 +4753,10 @@ fn a_will_reads_away_and_so_do_the_rows_it_left_live() {
     assert_eq!(
         joined,
         vec![
-            ("t0ne0000000", "live"),
-            ("tended00000", "gone"),
-            ("tfar0000000", "away"),
-            ("tpmd0000000", "away"),
+            ("t0000000090", "live"),
+            ("t0000000082", "gone"),
+            ("t0000000083", "away"),
+            ("t0000000086", "away"),
         ]
     );
     assert_eq!(

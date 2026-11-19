@@ -12,13 +12,16 @@ fn stored_stream(
     use aterm_json::json;
     use aterm_secrets::{
         fsx,
-        membership_log::{MAX_HELD_RECORDS, MAX_RECORDS_STREAM, decode_records},
+        membership_log::{MAX_HELD_RECORDS, decode_records_in},
     };
 
-    let Some(bytes) = fsx::read_private(&paths.records_data_file()?, MAX_RECORDS_STREAM)? else {
+    // Read and decoded as the store that holds them reads: its capacity and its format, which
+    // this Mac's format mark names. A records entry a rewrite made is not a records stream and
+    // is not selected here: the probe then fails with the layout's refusal.
+    let Some(bytes) = fsx::read_private(&paths.records_data_file()?, store.capacity())? else {
         return Ok(aterm_json::Value::Null);
     };
-    let records = match decode_records(bytes.as_slice()) {
+    let records = match decode_records_in(bytes.as_slice(), MAX_HELD_RECORDS, store.reading()) {
         Ok(records) => records,
         Err(error) => {
             return Ok(json!({

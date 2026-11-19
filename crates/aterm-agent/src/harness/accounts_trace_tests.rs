@@ -170,12 +170,14 @@ fn a_state_read_stands_until_its_claims_clock_ends() {
 fn a_login_stamp_past_its_reading_poisons_the_read_and_one_before_stands_from_it_on() {
     let mut state = State::default();
     let mut logins = Logins::default();
+    // A login folder this host reads as absolute: a roster refuses a relative one on reading.
+    let dir = crate::harness::host_path::abs("/logins/a");
     let _ = note_renewed(
         &mut state,
         &mut logins,
         "a",
-        Some("/logins/a"),
-        "/logins/a",
+        Some(&dir),
+        &dir,
         Some("max"),
         AT,
     );
@@ -388,4 +390,52 @@ fn each_digest_lines_reading_stands_until_the_second_its_line_moves() {
         },
     );
     line_moves_at_its_bound("a low window", |now| condition(&low, &state, true, now));
+}
+
+/// THE FLEET'S LOOKUPS STAND UNTIL THE SECOND THEIR WALL OR HOLD ENDS (SF-09). A peer's wall
+/// ([`peer_wall`]) and a fleet's block's hold ([`fleet_blocked`], [`FleetHold::of`]) compare
+/// through the run's reading ([`Now`]): read a second before the wall's end, or before the hold
+/// lapses, the trace stands through that second and moves at the end, where the lookup answers
+/// none, so a kept verdict that read them is made again when the wall or the hold ends, and not
+/// later. A hold read before its block's time, where the block's own Mac's clock runs ahead,
+/// moves at the first second it would hold.
+///
+/// NEGATIVE CONTROL (2026-11-17, in a run beside mutants that reach other tests):
+/// `FleetHold::of` comparing raw (`now.raw().abs_diff(at) < FLEET_BLOCK_S`): `a fleet's hold`
+/// was poisoned, left `Some(Poison("a raw read of now"))`, right `None`; restored from HEAD.
+#[test]
+fn the_fleets_lookups_stand_until_the_second_their_wall_or_hold_ends() {
+    const KEY: &str = "ac-0123456789abcdef";
+    let mut state = State::default();
+    state.accounts.entry("a".to_owned()).or_default().pk = Some(KEY.to_owned());
+    state.fleet = Fleet {
+        walls: [(KEY.to_owned(), LINE_BOUND)].into_iter().collect(),
+        blocked: [(KEY.to_owned(), LINE_BOUND - FLEET_BLOCK_S)]
+            .into_iter()
+            .collect(),
+        ..Fleet::default()
+    };
+    line_moves_at_its_bound("a peer's wall", |now| {
+        peer_wall(&state, ModelWeek::Unread, "a", now)
+    });
+    // A peer's wall of a model's own week, for a session of that model (FL-269).
+    let mut modeled = state.clone();
+    modeled.fleet = Fleet {
+        model_walls: [(
+            KEY.to_owned(),
+            [(MODEL_BUCKETS[0].to_owned(), LINE_BOUND)]
+                .into_iter()
+                .collect(),
+        )]
+        .into_iter()
+        .collect(),
+        ..Fleet::default()
+    };
+    line_moves_at_its_bound("a peer's model wall", |now| {
+        peer_wall(&modeled, ModelWeek::CLAUDE_DEFAULT, "a", now)
+    });
+    line_moves_at_its_bound("a fleet's hold", |now| fleet_blocked(&state, "a", now));
+    line_moves_at_its_bound("a hold dated ahead", |now| {
+        FleetHold::of(LINE_BOUND + FLEET_BLOCK_S - 1, now)
+    });
 }

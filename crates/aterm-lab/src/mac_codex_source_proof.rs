@@ -367,6 +367,7 @@ pub(crate) fn cmd(args: &[String]) -> Res {
         .suffix(".noindex")
         .tempdir()
         .map_err(fail)?;
+    let mut scratch = mac::VmScratch::new(scratch, &ask.record)?;
     let share = scratch.path().join("share");
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -391,7 +392,8 @@ pub(crate) fn cmd(args: &[String]) -> Res {
             cpus: CPUS,
         };
         let mut admitted = crate::vm_admit::admit(&need, true)?;
-        let mut vm = Vm::clone_from(&tart, &base, &ask.record, &share, false)?;
+        let mut vm =
+            Vm::clone_from_recorded(&tart, &base, &ask.record, &share, false, &ask.record)?;
         json_file(
             &ask.record,
             "vm.json",
@@ -414,16 +416,28 @@ pub(crate) fn cmd(args: &[String]) -> Res {
             return Err(Fail::die(format!("tart set: {}", shaped.status)));
         }
         vm.graphics = false;
+        vm.hold_admission(&mut admitted)?;
         mac::boot_sip_on(&mut vm, &base)?;
-        if let Some(pid) = vm.pid() {
-            admitted.credit("mac-codex-source-proof", &[pid]);
-        }
+
         let result = guest(&vm, &ask, &inputs);
+        let retired = vm.finish();
+        json_file(
+            &ask.record,
+            "vm-retirement.json",
+            &json!({
+            "complete":retired.is_ok(), "receipt":vm.receipt(),
+            "work_exit":result.as_ref().ok(), "work_error":result.as_ref().err().and_then(|error| error.msg.as_deref()),
+            "retirement_error":retired.as_ref().err().and_then(|error| error.msg.as_deref())}),
+        )?;
+        let result = mac::after_vm_cleanup(result, || retired.map(drop));
         drop(vm);
         drop(admitted);
         result
     };
     let result = run();
+    if result.is_ok() {
+        scratch.discard_after_finish();
+    }
     if let Err(why) = &result {
         json_file(
             &ask.record,

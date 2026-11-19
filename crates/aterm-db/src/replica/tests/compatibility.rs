@@ -447,8 +447,12 @@ fn legacy_probe_alias_does_not_replace_the_local_change_fence() {
     );
 }
 
+/// An `atdb/2` peer (a build from before the delta frontier) is refused table repair on the
+/// worker's first channel, with the line that names its protocol and builds, and the worker dials
+/// no second channel: the application probe's retry, which once recovered such a peer's round,
+/// has nothing to recover.
 #[test]
-fn native_atdb2_worker_retries_once_on_a_fresh_authenticated_channel() {
+fn an_atdb2_peer_is_refused_table_repair_and_its_worker_redials_none() {
     let pair = log_pair();
     let a = pair.endpoint(0, true);
     let mut b = pair.endpoint(1, true);
@@ -457,103 +461,42 @@ fn native_atdb2_worker_retries_once_on_a_fresh_authenticated_channel() {
         aterm_net::lan::Listener::bind("127.0.0.1:0".parse().unwrap(), LinkScope::Loopback)
             .unwrap();
     let address = listener.local_addr().unwrap();
+    let refused = |repair: &PeerRepair| {
+        assert!(repair.application().is_none());
+        let failure = repair.application_error().expect("table repair is refused");
+        assert_eq!(
+            failure.cause,
+            aterm_types::network_state::RepairCause::NeedsUpdate
+        );
+        assert_eq!(failure.text, refused_below_atdb_7("atdb/2"));
+        assert!(!repair.retry_application_probe());
+    };
     thread::scope(|scope| {
         let server = scope.spawn(|| {
             let mut repair = PeerRepair::default();
-            for attempt in 0..2 {
-                let connection = aterm_spec::wait::until_within(
-                    aterm_spec::wait::MUST_HAPPEN,
-                    "fresh authenticated application channel",
-                    || match listener.accept() {
-                        Ok(connection) => Some(connection),
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
-                        Err(error) => panic!("application listener failed: {error}"),
-                    },
-                );
-                b.exchange(connection, Side::Responder, &mut repair)
-                    .unwrap();
-                if attempt == 0 {
-                    assert!(repair.application().is_none());
-                    assert!(repair.application_error().is_some());
-                    assert_eq!(pair.count(1), 0);
-                }
-            }
-            assert!(repair.application().is_some());
-            assert!(repair.application_error().is_none());
-            assert!(!repair.retry_application_probe());
+            let connection = aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the authenticated application channel",
+                || match listener.accept() {
+                    Ok(connection) => Some(connection),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+                    Err(error) => panic!("application listener failed: {error}"),
+                },
+            );
+            b.exchange(connection, Side::Responder, &mut repair)
+                .unwrap();
+            refused(&repair);
         });
-        let (repair, success, report) =
-            crate::runtime::test_worker(a, address, PeerRepair::default());
-        assert!(success);
+        let (repair, _, report) = crate::runtime::test_worker(a, address, PeerRepair::default());
         assert!(report.control.is_ok());
-        assert!(repair.application().is_some());
-        assert!(repair.application_error().is_none());
-        assert!(!repair.retry_application_probe());
+        refused(&repair);
         server.join().unwrap();
     });
-    assert_eq!(pair.count(1), 1);
-}
-
-/// A worker whose redial to an older peer fails (here refused: the peer's listener is gone once
-/// the first exchange runs) records that dial's cause at its transport, not the first exchange's
-/// probe failure, which the redial was there to recover from.
-/// NEGATIVE CONTROL: with the redial keeping what the first exchange left
-/// (`Endpoint::redial_keeps_first_attempt`, the worker before CS1), the same round reads as an
-/// application failure with the probe's cause, as the second half asserts.
-#[test]
-fn a_worker_redial_that_fails_is_recorded_with_its_dial_cause() {
-    use aterm_types::network_state::{RepairCause, RepairOutcome, RepairStage};
-    let recorded = |keeps_first_attempt: bool| {
-        let pair = log_pair();
-        let mut a = pair.endpoint(0, true);
-        a.redial_keeps_first_attempt = keeps_first_attempt;
-        let mut b = pair.endpoint(1, true);
-        b.legacy_projection = true;
-        // A plain socket, so closing it leaves the admitted connection's proof standing.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        thread::scope(|scope| {
-            let server = scope.spawn(move || {
-                let stream = aterm_spec::wait::until_within(
-                    aterm_spec::wait::MUST_HAPPEN,
-                    "first application channel",
-                    || match aterm_uds::accept(
-                        &listener,
-                        aterm_uds::AcceptWait::Ready,
-                        aterm_uds::AcceptedMode::Blocking,
-                    ) {
-                        Ok((stream, _)) => Some(stream),
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
-                        Err(error) => panic!("application listener failed: {error}"),
-                    },
-                );
-                // Nothing listens once the first exchange runs, so the worker's redial is refused.
-                drop(listener);
-                let connection = Connection::admit(stream, LinkScope::Loopback).unwrap();
-                let mut repair = PeerRepair::default();
-                b.exchange(connection, Side::Responder, &mut repair)
-                    .unwrap();
-                assert!(repair.application_error().is_some());
-            });
-            let (_, success, report) =
-                crate::runtime::test_worker(a, address, PeerRepair::default());
-            server.join().unwrap();
-            assert!(!success);
-            report.observation().unwrap().1
-        })
-    };
-    let fixed = recorded(false);
-    assert_eq!(fixed.stage, Some(RepairStage::Transport));
-    assert_eq!(
-        fixed.outcome,
-        RepairOutcome::Failed(RepairCause::Unreachable)
-    );
-    let mutant = recorded(true);
-    assert_eq!(mutant.stage, Some(RepairStage::Application));
     assert!(
-        matches!(mutant.outcome, RepairOutcome::Failed(cause) if cause != RepairCause::Unreachable),
-        "{mutant:?}"
+        matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+        "the worker dialled a second channel"
     );
+    assert_eq!(pair.count(1), 0);
 }
 
 /// This process's user plus system CPU time so far, as the kernel counts it.

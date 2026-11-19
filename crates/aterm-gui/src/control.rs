@@ -650,6 +650,13 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
     use crate::menu::{InvokeAuthority, MenuAction};
     let (_, rest) = control_input::take_app_unread_ok(input_of(verb), rest);
     match verb {
+        "image"
+            if rest
+                .split_whitespace()
+                .any(|word| word == "--presentation-lease") =>
+        {
+            Some(Need::OwnerOnly)
+        }
         "inspect"
             if matches!(
                 aterm_types::app_inspection::parse_inspect(rest),
@@ -681,6 +688,7 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
             if aterm_types::app_inspection::parse_act(rest).is_ok_and(|act| {
                 act.action
                     .starts_with(crate::harness_screen::SESSION_ACTION_PREFIX)
+                    || act.action == crate::native_settings::tabs_page::TABS_CLOSE_IDLE
             }) =>
         {
             Some(Need::OwnerOnly)
@@ -898,6 +906,8 @@ fn help_full_catalog() -> String {
 #   text / screen        what the PROGRAM wrote (plain rows / lossless styled grid)
 #   image                what ATERM drew (decorations, tab strip, overlays; `image plain`
 #                        leaves out the visual effects), not what the compositor showed
+#                        `image --presentation-lease` holds a confirmed Linux CPU client
+#                        while its command photographs the display (local instance owner)
 #   subscribe            the LIVE stream (pushed deltas, events, mail; every-frame for animation)
 #   cast | temporal <t>  HISTORY: a replayable timestamped recording | the screen as it was
 #                        at <t> (temporal needs config temporal_recording = true)
@@ -908,6 +918,8 @@ fn help_full_catalog() -> String {
 #   open app settings /about              legacy About route inside Settings
 #   open app settings /updates            Software Update inside the Settings tab
 #   open app system-state                 System State: the setup plan and its progress
+#   open app tables                       browse stored tables
+#   open app registry                     open aRegistry for fleet machines, their assigned AI accounts and signed observations
 #   open app markdown file:///abs/doc.md  open a local Markdown workspace in Read
 #   open app editor file:///abs/doc.md    open its source in Edit through a file grant
 #   inspect app/v1 tabs                   discover stable native view ids
@@ -1547,6 +1559,13 @@ pub(crate) struct ImageReq {
     pub session: Option<u64>,
     pub want_bytes: bool,
     pub want_metadata: bool,
+    pub whole_client: bool,
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    pub presentation: Option<crate::presentation_lease::Lease>,
     pub frame_metadata: Arc<std::sync::OnceLock<ImageFrameMetadata>>,
     pub cancel: CaptureCancellation,
     pub reply: Sender<ImageReply>,
@@ -2106,6 +2125,12 @@ pub(crate) struct ControlReply {
     body: String,
     retention: Option<ReplyHandoff>,
     written: Option<ReplyWritten>,
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    presentation: Option<crate::presentation_lease::Owner>,
 }
 
 /// A latch the connection releases once a reply is on the wire (written and flushed, or failed, closed or dropped).
@@ -2259,6 +2284,12 @@ impl Drop for ReplyWritten {
 pub(crate) struct ReplyTail {
     retention: Option<ReplyHandoff>,
     written: Option<ReplyWritten>,
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    presentation: Option<crate::presentation_lease::Owner>,
 }
 
 impl ControlReply {
@@ -2275,6 +2306,12 @@ impl ControlReply {
             body,
             retention: retention.map(ReplyHandoff::Acknowledged),
             written: None,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation: None,
         }
     }
 
@@ -2283,6 +2320,12 @@ impl ControlReply {
             body,
             retention,
             written: None,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation: None,
         }
     }
 
@@ -2293,11 +2336,30 @@ impl ControlReply {
         self
     }
 
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    pub(crate) fn retaining_presentation(
+        mut self,
+        owner: crate::presentation_lease::Owner,
+    ) -> Self {
+        self.presentation = Some(owner);
+        self
+    }
+
     fn with_tail(body: String, tail: ReplyTail) -> Self {
         Self {
             body,
             retention: tail.retention,
             written: tail.written,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation: tail.presentation,
         }
     }
 
@@ -2306,9 +2368,23 @@ impl ControlReply {
             body,
             retention,
             written,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation,
         } = self;
         slot.retention = retention;
         slot.written = written;
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        {
+            slot.presentation = presentation;
+        }
         body
     }
 
@@ -2326,6 +2402,12 @@ impl From<String> for ControlReply {
             body,
             retention: None,
             written: None,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation: None,
         }
     }
 }
@@ -2824,6 +2906,8 @@ struct ControlWorkerContext {
     token: Arc<String>,
     sock_dir: std::path::PathBuf,
     recovery_count_admission: Arc<crate::keeper_link::RecoveryCountAdmission>,
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    signed_settle_ack: Option<Arc<native_host_fixture::signed_settle_ack_guardian::Guardian>>,
 }
 
 /// Local resource preparation, not Commit authority.
@@ -2913,19 +2997,28 @@ impl control_lanes::LaneService for ControlWorkerContext {
         reader: &mut control_lanes::LaneReader<'_>,
         out: &mut control_lanes::Outbox,
     ) -> Option<ServeDisposition> {
-        serve_request_line(
-            request,
-            scope,
-            &self.account_services,
-            stream,
-            reader,
-            out,
-            &self.active,
-            &self.store,
-            &self.proxy,
-            &self.sock_dir,
-            &self.recovery_count_admission,
-        )
+        let serve = |request,
+                     reader: &mut control_lanes::LaneReader<'_>,
+                     out: &mut control_lanes::Outbox| {
+            serve_request_line(
+                request,
+                scope,
+                &self.account_services,
+                stream,
+                reader,
+                out,
+                &self.active,
+                &self.store,
+                &self.proxy,
+                &self.sock_dir,
+                &self.recovery_count_admission,
+            )
+        };
+        #[cfg(all(target_os = "macos", debug_assertions))]
+        if let Some(guardian) = &self.signed_settle_ack {
+            return guardian.dispatch(request, stream, reader, out, serve);
+        }
+        serve(request, reader, out)
     }
 
     fn frame_header(
@@ -2994,20 +3087,35 @@ impl control_lanes::LaneService for ControlWorkerContext {
             &self.store,
             stream,
             buffered,
-            &control_stream::awake_now,
-            &|handle, rest| serve_stream_claim(handle, rest, &self.store, &self.proxy),
+            &control_stream::Services {
+                now_ms: &control_stream::awake_now,
+                claims: &|handle, rest| serve_stream_claim(handle, rest, &self.store, &self.proxy),
+                post: &|wake| {
+                    let _ = self.proxy.send_event(wake);
+                },
+                landed: &|handle, proven| {
+                    control_stream::check_landed_live(&self.store, handle, proven);
+                },
+            },
         );
         #[cfg(not(unix))]
         let _ = (request, stream, buffered);
     }
 
     fn release(&self, id: u64) {
-        release_source_connection_claims(
-            &self.store,
-            Some(&self.proxy),
-            id,
-            &self.account_services.source_registry,
-        );
+        let release = || {
+            release_source_connection_claims(
+                &self.store,
+                Some(&self.proxy),
+                id,
+                &self.account_services.source_registry,
+            );
+        };
+        #[cfg(all(target_os = "macos", debug_assertions))]
+        if let Some(guardian) = &self.signed_settle_ack {
+            return guardian.release(id, release);
+        }
+        release();
     }
 
     #[cfg(unix)]
@@ -3839,6 +3947,12 @@ pub(crate) fn spawn(
                 token: token.clone(),
                 sock_dir: sock_dir.clone(),
                 recovery_count_admission,
+                #[cfg(all(target_os = "macos", debug_assertions))]
+                signed_settle_ack: native_host_fixture::signed_settle_ack_guardian::Guardian::start(
+                    headless && !windowed && handoff.is_none(),
+                    &sock_dir,
+                    &store,
+                ),
             });
             lanes.publish(worker_context.clone());
             let _ = BRIDGE_CONTEXT.set(worker_context.clone());
@@ -5404,6 +5518,7 @@ struct DispatchCx<'a> {
     active: &'a ActiveHandle,
     store: &'a Store,
     scope: Scope,
+    stream: &'a CtlStream,
     proxy: &'a EventLoopProxy<Wake>,
     account_services: &'a ServingAccounts<'a>,
     sock_dir: &'a std::path::Path,
@@ -5411,6 +5526,18 @@ struct DispatchCx<'a> {
 
 fn dispatch_request(request: &Request, cx: &DispatchCx<'_>) -> ControlReply {
     let head = request.head();
+    if head.verb == "image"
+        && head
+            .rest
+            .split_whitespace()
+            .any(|word| word == "--presentation-lease")
+        && (!matches!(cx.scope, Scope::Owner)
+            || serving_principal() != Principal::Instance
+            || crate::fabric::serving_driver().is_some()
+            || head.selector.is_some())
+    {
+        return "ERR presentation capture requires the local instance owner\n".into();
+    }
     let (route, form) = match route(head.verb, request.form()) {
         Ok(routed) => routed,
         Err(refusal) => return refusal.into(),
@@ -5796,7 +5923,13 @@ fn sessionless_front(head: &Head<'_>, cx: &DispatchCx<'_>) -> Option<ControlRepl
         "scroll" => sessionless_front_scroll_event(rest, selector, false, principal),
         "resize" => sessionless_front_window_resize(verb, rest, selector, false, principal),
         "image" if cx.scope.is_owner_class() && rest.split_whitespace().next() != Some("read") => {
-            return Some(control_media::cmd_image(cx.proxy, rest, cx.sock_dir, None));
+            return Some(control_media::cmd_image(
+                cx.proxy,
+                rest,
+                cx.sock_dir,
+                None,
+                cx.stream,
+            ));
         }
         _ => None,
     }?;
@@ -6203,9 +6336,9 @@ enum PendingHandoff {
 }
 
 impl PendingHandoff {
-    const fn deadline(&self) -> std::time::Instant {
+    const fn deadline(&self) -> Option<std::time::Instant> {
         match self {
-            Self::WriteOnly { deadline, .. } => *deadline,
+            Self::WriteOnly { deadline, .. } => Some(*deadline),
             Self::Acknowledged(ack) => ack.deadline,
         }
     }
@@ -6214,8 +6347,14 @@ impl PendingHandoff {
 struct AwaitedAck {
     retention: Option<ReplyRetention>,
     nonce: String,
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
     on_wire: bool,
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    presentation: Option<crate::presentation_lease::Owner>,
 }
 
 impl AwaitedAck {
@@ -6224,17 +6363,42 @@ impl AwaitedAck {
         self.on_wire = true;
     }
 
-    fn acknowledged(mut self, stream: &CtlStream) {
+    fn acknowledged(mut self, stream: &CtlStream) -> Option<String> {
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        let released = self.presentation.take().map(|owner| match owner.finish() {
+            Ok(receipt) => format!("OK presentation-released {}\n", receipt.wire_fields()),
+            Err(error) => format!("ERR presentation lease invalid: {error}\n"),
+        });
+        #[cfg(not(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        )))]
+        let released: Option<String> = None;
         if let Some(mut retention) = self.retention.take() {
             retention.acknowledge_peer_anchor();
-            let _ = stream.shutdown(std::net::Shutdown::Write);
+            if released.is_none() {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
             drop(retention);
         }
+        released
     }
 }
 
 impl Drop for AwaitedAck {
     fn drop(&mut self) {
+        // Pixel custody ends with its controller, independently of artifact quarantine.
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        drop(self.presentation.take());
         let Some(mut retention) = self.retention.take() else {
             return;
         };
@@ -6459,8 +6623,25 @@ impl ControlReply {
                             Some(PendingHandoff::Acknowledged(AwaitedAck {
                                 retention: Some(retention),
                                 nonce,
-                                deadline,
+                                #[cfg(any(
+                                    test,
+                                    target_os = "linux",
+                                    all(unix, feature = "bench-support", debug_assertions)
+                                ))]
+                                deadline: self.presentation.is_none().then_some(deadline),
+                                #[cfg(not(any(
+                                    test,
+                                    target_os = "linux",
+                                    all(unix, feature = "bench-support", debug_assertions)
+                                )))]
+                                deadline: Some(deadline),
                                 on_wire: false,
+                                #[cfg(any(
+                                    test,
+                                    target_os = "linux",
+                                    all(unix, feature = "bench-support", debug_assertions)
+                                ))]
+                                presentation: self.presentation.take(),
                             }))
                         }
                     },
@@ -6496,13 +6677,21 @@ fn read_ack_until(
     stream: &CtlStream,
     reader: &mut impl BufRead,
     nonce: &str,
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
 ) -> bool {
-    let mut bound = DeadlineRead::new(stream, deadline);
     let mut sent = Vec::with_capacity(ACK_LINE_MAX);
     loop {
-        if bound.arm().is_err() {
-            return false;
+        match deadline {
+            Some(deadline) => {
+                if DeadlineRead::new(stream, deadline).arm().is_err() {
+                    return false;
+                }
+            }
+            None => {
+                if stream.set_read_timeout(None).is_err() {
+                    return false;
+                }
+            }
         }
         match reader.fill_buf() {
             Ok([]) => return ack_verdict(&sent, nonce, true) == Some(true),
@@ -7174,6 +7363,24 @@ pub(crate) fn serving_connection() -> Option<u64> {
 
 fn note_connection_claim() {
     CONNECTION_CLAIMED.with(|claimed| claimed.set(true));
+}
+
+#[cfg(unix)]
+pub(crate) fn transfer_served_native_exec_claim(
+    meta: &mut crate::session_timeline::SessionMeta,
+    expected: &crate::session_timeline::SupervisorAuthority,
+    connection: u64,
+    detached_until: Option<u64>,
+    now_us: u64,
+) -> Option<crate::session_timeline::SupervisorAuthority> {
+    if serving_connection() != Some(connection) {
+        return None;
+    }
+    let authority =
+        meta.transfer_native_exec_claim(expected, connection, detached_until, now_us)?;
+    // A peer can disconnect before it reads the successful transfer reply.
+    note_connection_claim();
+    Some(authority)
 }
 
 #[cfg(unix)]
@@ -9262,6 +9469,7 @@ fn serve_request_line(
             active,
             store,
             scope,
+            stream,
             proxy,
             account_services: &account_services.serving(),
             sock_dir,
@@ -11760,9 +11968,12 @@ fn serve_session_verb(
                 "described" => crate::session_log::cmd_described_json(ctx, &body),
                 "sys" => crate::sys_host::cmd_sys(
                     store,
-                    session,
-                    term,
-                    master,
+                    crate::sys_host::AuthorizedTarget {
+                        session,
+                        term,
+                        master,
+                        ctx,
+                    },
                     scope.is_owner_class(),
                     rest,
                 ),
@@ -12164,8 +12375,14 @@ fn serve_session_verb(
             rest.strip_prefix("read").unwrap_or(rest).trim_start(),
         ),
         "image" if !scope.is_owner_class() => image_frame_refusal(ctx),
-        "image" => control_media::cmd_image(proxy, rest, sock_dir, is_cross.then_some(session))
-            .into_body_retaining(reply_retention),
+        "image" => control_media::cmd_image(
+            proxy,
+            rest,
+            sock_dir,
+            is_cross.then_some(session),
+            cx.stream,
+        )
+        .into_body_retaining(reply_retention),
         "close" => match control_media::close_no_arg(rest) {
             Ok(()) => control_media::cmd_close(
                 proxy,
@@ -12261,9 +12478,17 @@ fn serve_session_verb(
             rest,
             crate::sys_host::brief_jobs_line(session),
         ),
-        "sys" => {
-            crate::sys_host::cmd_sys(store, session, term, master, scope.is_owner_class(), rest)
-        }
+        "sys" => crate::sys_host::cmd_sys(
+            store,
+            crate::sys_host::AuthorizedTarget {
+                session,
+                term,
+                master,
+                ctx,
+            },
+            scope.is_owner_class(),
+            rest,
+        ),
         "occupancy" => {
             let sid = store
                 .read()
@@ -12676,7 +12901,7 @@ pub(crate) fn meta_wakes_keeping_for_test(
 /// [`meta_wakes_keeping_for_test`] with the claim's own proof answered by `prove_claim`, a
 /// test's stand-in for the image proof and the version of the build it admitted
 /// ([`crate::harness_claim::ClaimProof`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn meta_wakes_admitting_for_test(
     store: &Store,

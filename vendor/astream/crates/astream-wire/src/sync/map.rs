@@ -366,34 +366,11 @@ fn replace(node: &mut Arc<Node>, key: &Digest, nibbles: usize, depth: usize, new
     node.tally();
 }
 
-/// `hashers` are the map's own and its base's: each state's pages are named by its own.
-fn written(
-    node: &Arc<Node>,
-    base: Option<&Arc<Node>>,
-    range: Range,
-    hashers: (Hasher, Hasher),
-    visit: &mut dyn FnMut(Range, Digest),
-) {
-    // Under a page a store gave, every page is one it gave, or absent, or empty.
-    if node.rows == 0 || node.stored || matches!(node.body, Body::Absent(_)) {
-        return;
-    }
-    let hash = node.hash(hashers.0);
-    if let Some(base) = base {
-        if Arc::ptr_eq(node, base) || base.hash(hashers.1) == hash {
-            return;
-        }
-    }
-    if let (Body::Interior(children), Some(ranges)) = (&node.body, range.children()) {
-        for (index, (child, range)) in children.iter().zip(ranges).enumerate() {
-            let base = base.and_then(|base| match &base.body {
-                Body::Interior(children) => children.get(index),
-                Body::Absent(_) | Body::Leaf(_) => None,
-            });
-            written(child, base, range, hashers, visit);
-        }
-    }
-    visit(range, hash);
+/// A page [`Map::written`] has yet to judge, or has judged changed and lists once the
+/// pages under it are listed.
+enum Step<'a> {
+    Judge(&'a Arc<Node>, Option<&'a Arc<Node>>, Range),
+    Visit(Range, Digest),
 }
 
 /// What a range names: a page, or some of one leaf's rows.
@@ -726,15 +703,44 @@ impl Map {
     /// before the page that names them: what a store must write for this state, in an
     /// order that never leaves a written page naming an unwritten one. A store has the
     /// pages `base` has at the same range and the pages it gave ([`Map::admit`]) that
-    /// have not changed since. The empty leaf is never visited; any reader makes it.
-    pub fn written(&self, base: &Self, mut visit: impl FnMut(Range, Digest)) {
-        written(
-            &self.root,
-            Some(&base.root),
-            Range::ROOT,
-            (self.hasher, base.hasher),
-            &mut visit,
-        );
+    /// have not changed since. The empty leaf is never listed; any reader makes it.
+    /// Each state's pages are hashed with its own hasher. The walk keeps its own stack,
+    /// and the list holds only changed pages: a leaf and its ancestors for one row.
+    #[must_use]
+    pub fn written(&self, base: &Self) -> Vec<(Range, Digest)> {
+        let mut pages = Vec::new();
+        let mut steps = vec![Step::Judge(&self.root, Some(&base.root), Range::ROOT)];
+        while let Some(step) = steps.pop() {
+            let (node, theirs, range) = match step {
+                Step::Visit(range, hash) => {
+                    pages.push((range, hash));
+                    continue;
+                }
+                Step::Judge(node, theirs, range) => (node, theirs, range),
+            };
+            // Under a page a store gave, every page is one it gave, or absent, or empty.
+            if node.rows == 0 || node.stored || matches!(node.body, Body::Absent(_)) {
+                continue;
+            }
+            let hash = node.hash(self.hasher);
+            if let Some(theirs) = theirs {
+                if Arc::ptr_eq(node, theirs) || theirs.hash(base.hasher) == hash {
+                    continue;
+                }
+            }
+            steps.push(Step::Visit(range, hash));
+            if let (Body::Interior(children), Some(ranges)) = (&node.body, range.children()) {
+                // Pushed last to first, so the first child's pages are listed first.
+                for (index, (child, range)) in children.iter().zip(ranges).enumerate().rev() {
+                    let theirs = theirs.and_then(|theirs| match &theirs.body {
+                        Body::Interior(children) => children.get(index),
+                        Body::Absent(_) | Body::Leaf(_) => None,
+                    });
+                    steps.push(Step::Judge(child, theirs, range));
+                }
+            }
+        }
+        pages
     }
 
     /// The proof that the row at `key` lies under [`Map::root`]; `None` if the map has

@@ -1241,6 +1241,142 @@ fn begin_keeps_one_spacing_clock_for_the_mac_and_refuses_a_token_for_another_acc
     );
 }
 
+/// A fleet whose files say the account keyed `pk` had a sign-in blocked at `at`.
+fn blocked_fleet(pk: &str, at: i64) -> super::super::accounts::Fleet {
+    super::super::accounts::Fleet {
+        blocked: [(pk.to_owned(), at)].into_iter().collect(),
+        ..super::super::accounts::Fleet::default()
+    }
+}
+
+/// THE FLEET'S HOLD SPACES THE TOKEN CAPTURE AND HOLDS `begin_native` (SF-09). The upkeep's token
+/// capture loads the account's page with nobody there ([`space_token_capture`]), so a block of
+/// its account's sign-in that a Mac of the fleet recorded an hour ago holds it until the hold
+/// lapses, and records no start; with no snapshot it starts. Codex's native door
+/// ([`SignIn::begin_native`]) refuses a due sign-in of an account under such a hold
+/// ([`Refused::Fleet`]) and starts it with no snapshot, and a sign-in a person names starts under
+/// the hold.
+///
+/// NEGATIVE CONTROLS (2026-11-17), each in its own run beside mutants that reach other tests,
+/// restored from HEAD after: `space_token_capture` without its fleet check: the capture started
+/// (left `Started`, right `Until(..)`); `begin_native` without `fleet_holds`: the due sign-in
+/// started (left `Ok(())`, right `Err(Fleet { .. })`).
+#[cfg(unix)]
+#[test]
+fn a_fleet_hold_spaces_the_token_capture_and_begin_native() {
+    use super::super::accounts::{Cli, FLEET_BLOCK_S, Store, with_fleet};
+    const PK: &str = "ac-0123456789abcdef";
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let store = Store::at_for(&dir.path().join("state"), Cli::Claude, dir.path());
+    std::fs::create_dir_all(&store.dir).unwrap();
+    std::fs::create_dir_all(store.shared_dir()).unwrap();
+    let now = 1_800_000_000;
+    store
+        .transact(now - 60, &mut None, |state| {
+            state.accounts.entry("d".to_owned()).or_default().pk = Some(PK.to_owned());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let held = blocked_fleet(PK, now - 3_600);
+    assert_eq!(
+        with_fleet(held.clone(), || space_token_capture(&store, "d", now)),
+        TokenSpacing::Until(now - 3_600 + FLEET_BLOCK_S)
+    );
+    assert_eq!(
+        last_started(&store).unwrap(),
+        None,
+        "a held capture records no start"
+    );
+    assert_eq!(
+        with_fleet(blocked_fleet(PK, now - 25 * 3_600), || {
+            space_token_capture(&store, "d", now)
+        }),
+        TokenSpacing::Started,
+        "CONTROL: a block a day old holds nothing"
+    );
+    assert_eq!(
+        last_started(&store).unwrap(),
+        Some(Started::new(Cli::Claude, "d", now))
+    );
+
+    crate::harness::codex_grant_owner::with_preparation_fixture(
+        |env, request, _auth, turn, _admission, _artifact| {
+            let store = env.accounts_store_for(Cli::Codex).unwrap();
+            store
+                .transact(env.now - 60, &mut None, |state| {
+                    state.accounts.entry(request.label.clone()).or_default().pk =
+                        Some(PK.to_owned());
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            let begin = |why: Why, fleet: super::super::accounts::Fleet| {
+                with_fleet(fleet, || {
+                    SignIn::fixture(Cli::Codex, &request.label, why)
+                        .begin_native(&request.label, turn.clone(), &store, env.now)
+                        .map(drop)
+                })
+            };
+            let held = blocked_fleet(PK, env.now - 3_600);
+            assert_eq!(
+                begin(Why::Due, held.clone()),
+                Err(Refused::Fleet {
+                    at: env.now - 3_600,
+                    until: env.now - 3_600 + FLEET_BLOCK_S,
+                })
+            );
+            assert_eq!(begin(Why::Asked, held), Ok(()), "a named sign-in starts");
+            assert_eq!(
+                begin(Why::Due, super::super::accounts::Fleet::default()),
+                Ok(()),
+                "CONTROL: with no snapshot the due one starts"
+            );
+        },
+    );
+}
+
+/// A FLEET'S HOLD THAT CANNOT NAME ITS ACCOUNT STARTS NOTHING (SF-09). Where the fleet's files
+/// name a blocked sign-in and the store does not load (here its state file does not parse),
+/// which account a row is cannot be told: [`super::super::accounts::fleet_blocked_in`] fails, and
+/// an automatic start refuses as it does on an unreadable spacing record ([`Refused::Record`]).
+/// CONTROL: with no blocked sign-in in the files nothing is loaded and nothing holds, so a store
+/// in the same state decides as before the files; a named sign-in is not held either way.
+///
+/// NEGATIVE CONTROL (2026-11-17, in a run beside mutants that reach other tests):
+/// `fleet_blocked_in` holding nothing where the load failed (as `store.load(now).ok()?` did):
+/// its `is_err()` failed; restored from HEAD.
+#[test]
+fn a_fleet_hold_that_cannot_name_its_account_starts_nothing() {
+    use super::super::accounts::{Cli, Fleet, State, Store, fleet_blocked_in, with_fleet};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path()).bounded_by(&[]);
+    store.save(&State::default()).unwrap();
+    std::fs::write(store.state_file(), "{ not a state").unwrap();
+    let now = 1_800_000_000;
+    assert!(store.load(now).is_err(), "the store does not load");
+    let held = blocked_fleet("ac-0123456789abcdef", now - 3_600);
+    assert!(with_fleet(held.clone(), || fleet_blocked_in(&store, "d", now)).is_err());
+    let holds = |why: Why, fleet: Fleet| {
+        with_fleet(fleet, || {
+            SignIn::fixture(Cli::Claude, "d", why).fleet_holds(&store, now)
+        })
+    };
+    assert!(matches!(
+        holds(Why::Due, held.clone()),
+        Err(Refused::Record(_))
+    ));
+    assert_eq!(
+        holds(Why::Asked, held),
+        Ok(()),
+        "a named sign-in is not held"
+    );
+    assert_eq!(
+        with_fleet(Fleet::default(), || fleet_blocked_in(&store, "d", now)),
+        Ok(None),
+        "CONTROL: no block in the files loads nothing"
+    );
+    assert_eq!(holds(Why::Due, Fleet::default()), Ok(()));
+}
+
 /// A ROW'S RUNS ARE WAIVED FOR A SLEEP ONLY SO MANY TIMES IN A ROW ([`Ladder::run_ended`]): the
 /// first [`MOST_INTERRUPTED_RUNS`] runs a sleep interrupted are waived, the next is counted as
 /// it ended, and any run of the row that ends without a sleep starts the count again. A run a

@@ -8,10 +8,16 @@ use crate::{App, SessionCtx};
 /// Latest supervisor decision, scoped to its claim revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Activity {
+    /// Its sequence, in the count of the source that reported it (`from_stream`).
     pub(crate) sequence: u64,
     pub(crate) reason: String,
     pub(crate) until_ms: Option<u64>,
     pub(crate) observed_ms: u64,
+    /// Reported by the claim's record stream (an `act` of act `wait`, `sequence` the record's
+    /// `seq`), not by a `meta set harness_activity` line (`sequence` its `seq=`) or aterm's own
+    /// host: the two count apart, so a sequence of one never orders a report of the other
+    /// ([`crate::session_timeline::SessionMeta::keep_continuation_activity`]).
+    pub(crate) from_stream: bool,
 }
 
 pub(crate) fn report(ctx: &SessionCtx, reason: &str, wait_ms: Option<u64>) {
@@ -28,6 +34,7 @@ pub(crate) fn report(ctx: &SessionCtx, reason: &str, wait_ms: Option<u64>) {
         reason: reason.into(),
         until_ms: wait_ms.map(|ms| now.saturating_add(ms)),
         observed_ms: now,
+        from_stream: false,
     };
     let changed = meta
         .continuation_activity

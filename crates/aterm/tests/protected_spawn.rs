@@ -12,8 +12,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::launch_isolation;
+use crate::patience::Patience;
 
-const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
+/// How long the CLI and what it started may make no progress before it is killed as hung.
+const CLI_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(60);
 
 fn session_command(test: &str) -> (Command, aterm_tempfile::TempDir) {
     let root = launch_isolation::scratch_root(&format!("aterm-protected-spawn-{test}"));
@@ -36,7 +38,7 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
 
-    let deadline = Instant::now() + CLI_EXIT_DEADLINE;
+    let mut patience = Patience::new(CLI_NO_PROGRESS_WINDOW);
     loop {
         match child.try_wait().expect("poll the aterm CLI child") {
             Some(status) => {
@@ -48,9 +50,15 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
                     stderr: stderr.join().expect("join the stderr drain"),
                 };
             }
-            None if Instant::now() >= deadline => {
+            None => {
+                let Some(why) = patience.spent() else {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                };
                 let _ = child.kill();
                 let _ = child.wait();
+                // A diagnostic of a wait that already failed, not a hang detector: a grandchild
+                // the killed CLI left may hold its pipe for good, so its drain may never end.
                 fn join_bounded(handle: std::thread::JoinHandle<Vec<u8>>) -> String {
                     let grace = Instant::now() + Duration::from_secs(5);
                     while !handle.is_finished() {
@@ -65,11 +73,10 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
                 let out = join_bounded(stdout);
                 let err = join_bounded(stderr);
                 panic!(
-                    "CLI did not exit within {}s; captured stdout={out:?} stderr={err:?}",
-                    CLI_EXIT_DEADLINE.as_secs()
+                    "the CLI was killed before it exited: {why}; captured stdout={out:?} \
+                     stderr={err:?}"
                 );
             }
-            None => std::thread::sleep(Duration::from_millis(25)),
         }
     }
 }

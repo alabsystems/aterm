@@ -416,14 +416,36 @@ fn issuer_number(state: IssuerState) -> i64 {
     }
 }
 
+/// `action` from `state`, on a journal laid for its two phases alone: the only fields a step reads
+/// ([`issuer_effect`]), so each phase pair and action is laid and acted on once in a thread, and
+/// its effect is applied to every state that holds that pair (the walk below meets most pairs
+/// more than once, apart in fields no step reads).
 pub(crate) fn issuer_transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
+    type Effects = BTreeMap<(i64, i64, String), Vec<(&'static str, i64)>>;
+    std::thread_local! {
+        static EFFECTS: std::cell::RefCell<Effects> = std::cell::RefCell::default();
+    }
+    let (a, b) = (state["a"], state["b"]);
+    let mut next = state.clone();
+    next.extend(EFFECTS.with_borrow_mut(|effects| {
+        effects
+            .entry((a, b, action.to_owned()))
+            .or_insert_with(|| issuer_effect(a, b, action))
+            .clone()
+    }));
+    next
+}
+
+/// The fields `action` sets, read back from a fresh journal laid for the phases `a_phase` and
+/// `b_phase`.
+fn issuer_effect(a_phase: i64, b_phase: i64, action: &str) -> Vec<(&'static str, i64)> {
     let (_home, paths, mut a, a_binding) = fixture();
     a.rejection_domain = Some(rejection_domain_at(&paths).unwrap());
     let (b, b_binding) = other_epoch(&a, &a_binding);
-    let actors = [(&a, &a_binding, state["a"]), (&b, &b_binding, state["b"])];
+    let actors = [(&a, &a_binding, a_phase), (&b, &b_binding, b_phase)];
     let put = |prepare, binding, event| {
         record_event_at_limits(&paths, prepare, binding, Some(event), five_records())
     };
@@ -454,7 +476,7 @@ pub(crate) fn issuer_transition(
             put(prepare, binding, Event::Seal).unwrap();
         }
     }
-    let mut next = state.clone();
+    let mut effect = Vec::new();
     match action {
         "PrepareA" => {
             let _ = put(&a, &a_binding, Event::Prepare);
@@ -487,13 +509,13 @@ pub(crate) fn issuer_transition(
             put(&b, &b_binding, Event::Seal).unwrap();
         }
         "ObserveA" => {
-            next.insert(
+            effect.push((
                 "observed",
                 i64::from(observe_at(&paths, &a_binding).unwrap().is_some()),
-            );
+            ));
         }
         "RetryA" | "ConflictA" => {
-            if state["a"] == 6 {
+            if a_phase == 6 {
                 let mut requested = a.clone();
                 if action == "ConflictA" {
                     requested.deadline_us += 1;
@@ -503,7 +525,7 @@ pub(crate) fn issuer_transition(
                     action == "RetryA"
                 );
             } else {
-                let event = match state["a"] {
+                let event = match a_phase {
                     1 => Event::Prepare,
                     2 => Event::MayExecute,
                     3 => Event::NoExec,
@@ -521,10 +543,10 @@ pub(crate) fn issuer_transition(
             assert!(put(&a, &a_binding, Event::Prepare).is_err());
         }
         "ContainsA" => {
-            next.insert(
+            effect.push((
                 "seen_a",
                 i64::from(contains_operation_at(&paths, &a.id).unwrap()),
-            );
+            ));
         }
         _ => panic!("unknown issuer action {action}"),
     }
@@ -534,29 +556,29 @@ pub(crate) fn issuer_transition(
             .as_ref()
             .and_then(|(key, view)| view.entries.get(&key.operation(&prepare.id)))
             .map_or(0, |entry| issuer_number(entry.state));
-        next.insert(name, phase);
-        next.insert(
+        effect.push((name, phase));
+        effect.push((
             if name == "a" { "a_may" } else { "b_may" },
             i64::from(phase == 2 || phase == 5),
-        );
-        next.insert(
+        ));
+        effect.push((
             if name == "a" { "a_closed" } else { "b_closed" },
             i64::from(phase >= 3),
-        );
-        next.insert(
+        ));
+        effect.push((
             if name == "a" {
                 "a_rejected"
             } else {
                 "b_rejected"
             },
             i64::from(phase == 6),
-        );
+        ));
     }
-    next.insert(
+    effect.push((
         "records",
         loaded.as_ref().map_or(0, |(_, view)| view.sequence as i64),
-    );
-    next
+    ));
+    effect
 }
 
 #[test]

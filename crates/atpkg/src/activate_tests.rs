@@ -1266,7 +1266,9 @@ fn an_alab_program_gets_an_alias_beside_every_shim_forwarding_to_the_same_target
         {
             let body = std::fs::read_to_string(layout.shim(&alias)).unwrap();
             assert!(
-                body.contains(&format!("\\bin\\{name}.exe\" %* & @exit /b")),
+                body.contains(&format!(
+                    "\\bin\\{name}.exe\" %* & @call exit /b %%errorlevel%%"
+                )),
                 "{body}"
             );
         }
@@ -1408,10 +1410,83 @@ fn reconcile_lays_the_aliases_of_an_already_installed_program() {
 fn the_cmd_alias_forwards_to_the_primary_exe() {
     let target = Path::new(r"C:\Users\me\.aterm\pkg\store\ay\18\bin\ay.exe");
     let mut want = crate::platform::cmd_frame();
-    want.push_str("@\"C:\\Users\\me\\.aterm\\pkg\\store\\ay\\18\\bin\\ay.exe\" %* & @exit /b\r\n");
+    want.push_str(
+        "@\"C:\\Users\\me\\.aterm\\pkg\\store\\ay\\18\\bin\\ay.exe\" %* & @call exit /b \
+         %%errorlevel%%\r\n",
+    );
     assert_eq!(crate::platform::cmd_shim_content(target), want);
     assert_eq!(
         crate::platform::parse_cmd_shim_target(&crate::platform::cmd_shim_content(target)),
         Some(target.to_path_buf())
     );
+}
+
+/// THE `.cmd` TWIN AND PRIMARY CARRY THE USAGE TAP'S BLOCK (Windows): with no live atpkg named,
+/// Claude Code's twin and `bin\` primary are the plain shim; with one named by the block a twin
+/// carries already, or offered by this process (the atpkg beside it), a pass lays both with the
+/// block naming the aterm beside that atpkg, each still resolving to the build with its
+/// environment, and a second pass writes nothing; with none named again, a pass lays both plain.
+#[cfg(windows)]
+#[test]
+fn the_cmd_twin_and_primary_carry_the_usage_tap_while_an_atpkg_is_named() {
+    let layout = temp_prefix("cmd-tap");
+    let run = layout.prefix.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("self.exe"), b"").unwrap();
+    crate::stub::with_current_exe(&run.join("self.exe"), || {
+        let claude = tool("claude");
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        let build = make_build(&layout, "claude", 7, &["claude"]);
+        install_tools_env(
+            &layout,
+            &build,
+            std::slice::from_ref(&claude),
+            Aliases::Off,
+            &env,
+        )
+        .unwrap();
+        let exe = build.join("bin").join("claude.exe");
+        let (twin, primary) = (layout.agent_shim(&claude), layout.shim(&claude));
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+        let plain = crate::platform::cmd_shim_content_env(&exe, &env);
+        assert_eq!(read(&primary), plain, "no atpkg named: the plain primary");
+        assert_eq!(read(&twin), plain, "and the plain twin");
+        let tapped_by = |dir: &Path| {
+            crate::launch_tap::with_cmd_block("claude", plain.clone(), Some(&dir.join("atpkg.exe")))
+        };
+        let app = layout.prefix.join("app (x86)");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("atpkg.exe"), b"").unwrap();
+        let tapped = tapped_by(&app);
+        assert_ne!(tapped, plain);
+        std::fs::write(&twin, &tapped).unwrap();
+        reconcile_agents(&layout);
+        assert_eq!(read(&twin), tapped, "the atpkg the twin's block names");
+        assert_eq!(read(&primary), tapped, "the primary carries it too");
+        for p in [&twin, &primary] {
+            assert_eq!(platform::resolve_shim(p).as_deref(), Some(exe.as_path()));
+            assert_eq!(platform::shim_env_of(p), env);
+        }
+        let stamp = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        let before = (stamp(&twin), stamp(&primary));
+        reconcile_agents(&layout);
+        assert_eq!(
+            (stamp(&twin), stamp(&primary)),
+            before,
+            "a second pass writes nothing"
+        );
+        std::fs::remove_file(app.join("atpkg.exe")).unwrap();
+        reconcile_agents(&layout);
+        assert_eq!(read(&twin), plain, "no live atpkg named: plain again");
+        assert_eq!(read(&primary), plain);
+        std::fs::write(run.join("atpkg.exe"), b"").unwrap();
+        reconcile_agents(&layout);
+        assert_eq!(
+            read(&twin),
+            tapped_by(&run),
+            "the atpkg this process offers"
+        );
+        assert_eq!(read(&primary), tapped_by(&run));
+    });
+    let _ = std::fs::remove_dir_all(&layout.prefix);
 }

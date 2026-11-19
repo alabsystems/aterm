@@ -104,6 +104,30 @@ fn rustups_host_is_its_settings_default_host_else_this_builds_own() {
 }
 
 #[test]
+fn rustup_default_host_reads_toml_strings_and_rejects_invalid_documents() {
+    for text in [
+        "default_host_triple = 'x86_64-apple-darwin' # selected host\n",
+        "\"default_host_triple\" = \"x86_64-apple-darwin\"\n",
+        "default_host_triple = \"x86_64-apple-\\u0064arwin\"\n",
+    ] {
+        assert_eq!(
+            settings_host(text).as_deref(),
+            Some("x86_64-apple-darwin"),
+            "{text}"
+        );
+    }
+    for text in [
+        "default_host_triple = \"first\"\ndefault_host_triple = \"second\"\n",
+        "default_host_triple = \"first\"\n[broken\n",
+        "default_host_triple = 12\n",
+        "default_host_triple = \"\"\n",
+        "[overrides]\ndefault_host_triple = \"nested\"\n",
+    ] {
+        assert_eq!(settings_host(text), None, "{text}");
+    }
+}
+
+#[test]
 fn the_wasm32_clause_is_read_out_of_the_engines_own_line() {
     let good = "CHECK_CMD_DEFAULT=\"rustup run trust targo trust check && rustup target add \
                 --toolchain 1.95.0 wasm32-unknown-unknown && sh -c \

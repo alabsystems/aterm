@@ -42,6 +42,13 @@ pub(super) use agy::carry_in_flight as agy_carry_in_flight;
 #[path = "upgrade_watch.rs"]
 mod watch;
 
+#[path = "upgrade_episode.rs"]
+mod episode;
+pub(super) use episode::Episode;
+
+#[path = "drive_collect.rs"]
+mod drive_collect;
+
 #[path = "upgrade_build_start.rs"]
 mod build_start;
 pub use build_start::BUILD_FAILS;
@@ -509,9 +516,10 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
         ("off", flag(!f.may_tell)),
         ("silent", flag(f.silent)),
         ("outlasted", flag(f.own_hold_s >= upgrade::SILENT_HOLD_S)),
-        // The wall has an age, from a row of its transcript ([`wall_age`]); it has aged where
-        // each of its parts has stood its bound with nobody seen (`upgrade::login_holds`,
-        // `upgrade::limit_holds`). One nothing dates reads no age and never ages.
+        // The wall has an age, from a row of its transcript or the first look that saw it
+        // ([`wall_age`]); it has aged where each of its parts has stood its bound with nobody
+        // seen (`upgrade::login_holds`, `upgrade::limit_holds`). At the look that first sees it
+        // it has no age yet.
         (
             "dated",
             flag((f.login && f.login_s > 0) || (f.limited && f.limit_s > 0)),
@@ -615,7 +623,7 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "HoldOutlasts",
-        reason = "The agent's real work holding the round past `upgrade::WORK_TELL_S`: the clock's step over `St::own_since`, which `St::note_wait` starts at the first own-work wait. The Tier-1 binds build it through `Facts::own_hold_s`, and the drive's hold-clock test binds the record."
+        reason = "The agent's real work holding the round past `upgrade::WORK_TELL_S`: the clock's step over the own-work episode `St::own`, which `St::note_wait` starts at the first own-work wait and keeps across changes of word and process, aterm's own unsent line and clear gaps shorter than `CLEAR_GAP_S`. The Tier-1 binds build it through `Facts::own_hold_s`, and the drive's episode tests bind the record."
     )
 )]
 #[cfg_attr(
@@ -623,7 +631,7 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "HoldBreaks",
-        reason = "A look that finds a person or a wall: the drive clears `St::own_since` where `upgrade::person_seen` holds, and `St::note_wait` on a limit's wait. The Tier-1 binds build it through `Facts::own_hold_s`, and the drive's hold-clock tests bind the record."
+        reason = "A look that finds a person or a wall: the drive ends the own-work episode `St::own` where `upgrade::person_seen` holds, at a key or hold of the person's before the line aterm left is settled (`visit_build`), and in `St::note_wait` on a person's or a limit's wait (of the words over a line aterm left, only `left-typed:unsent`, aterm's own text, is no person's). The Tier-1 binds build it through `Facts::own_hold_s`, and the drive's episode tests bind the record."
     )
 )]
 #[cfg_attr(
@@ -767,7 +775,7 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "SilentHoldOutlasts",
-        reason = "The clock's step over `St::own_since` past `upgrade::SILENT_HOLD_S`, the hold `HoldOutlasts` starts; the Tier-1 bind projects it as `Facts::own_hold_s` at that bound."
+        reason = "The clock's step over the own-work episode `St::own` past `upgrade::SILENT_HOLD_S`, the hold `HoldOutlasts` starts; the Tier-1 bind projects it as `Facts::own_hold_s` at that bound."
     )
 )]
 #[cfg_attr(
@@ -799,7 +807,15 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "DatedWallStands",
-        reason = "Claude Code's sign-in wall or usage limit on the screen, read by `aterm_phase` into `Facts::login` or `Facts::limited`; the Tier-1 bind projects it as a wall its transcript dates, within its bound."
+        reason = "Claude Code's sign-in wall or usage limit on the screen, read by `aterm_phase` into `Facts::login` or `Facts::limited`; the Tier-1 bind projects it as a wall with an age (its transcript or a look before this one dates it, `upgrade_drive::wall_age`), within its bound."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "WallSighted",
+        reason = "A look after the first that finds a wall no transcript row dates still standing (one only the screen shows, one whose transcript or keys cannot be read): the first look stamped `St::login_seen` or `St::limit_seen` (`episode::sighted`, the watch's dry look through `St::note_wait` too), and `upgrade_drive::wall_age` dates the wall from it; the Tier-1 bind projects it as `Facts::login_s` or `Facts::limit_s` above 0, and the drive's first-sighting test binds the record."
     )
 )]
 #[cfg_attr(
@@ -807,7 +823,7 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "WallAges",
-        reason = "The clock's step past the wall's bound (`upgrade::LOGIN_WALL_S`, `upgrade::LIMIT_WALL_S`) from its first transcript row (`upgrade::LoginScan::since`, `upgrade::StandingScan::since`), restarted by a key of the person's after it and read as 0 at a look that sees a person (`upgrade_drive::wall_age`); the Tier-1 bind projects it as `Facts::login_s` or `Facts::limit_s` at that bound."
+        reason = "The clock's step past the wall's bound (`upgrade::LOGIN_WALL_S`, `upgrade::LIMIT_WALL_S`) from its first transcript row (`upgrade::LoginScan::since`, `upgrade::StandingScan::since`), else from the first look that saw it (`St::login_seen`, `St::limit_seen`), restarted by a key of the person's after it and read as 0 at a look that sees a person (`upgrade_drive::wall_age`); the Tier-1 bind projects it as `Facts::login_s` or `Facts::limit_s` at that bound, and the drive's first-sighting test binds the record."
     )
 )]
 #[cfg_attr(
@@ -824,6 +840,22 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
         machine = "HarnessUpgradeQuiet",
         action = "WallHoldsForGood",
         reason = "Buggy=1 negative control only; a wall nobody lifts holding an idle round with no bound, as a login wall did before `upgrade::LOGIN_WALL_S` and a usage limit before `upgrade::LIMIT_WALL_S`. The Tier-1 bind's control keeps the wall's age below its bound, and aterm-spec's liveness sweep breaks the law with it."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "HoldRestartsAtAGap",
+        reason = "Buggy=1 negative control only; the own-work hold started again by no person and no wall: at a change of word or holding process, at a gap shorter than `CLEAR_GAP_S` between rolling background children, at a line not taken whole, or at aterm's own unsent line, as `St::own_since` was started again before the episode at each line's first key and zeroed at aterm's own unsent line (m16, 2026-11-14: a tab held 11 hours, every line left unsent, never told). The drive's replay (`a_rolling_background_hold_keeps_its_episode_and_is_told`) binds the record, and its control (`the_word_reset_clock_negative_control_fails`) replays that clock: until a line is taken no look reads more than `upgrade::WORK_TELL_S` of the hold, and the round moves later."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "WallNeverSighted",
+        reason = "Buggy=1 negative control only; a wall no transcript row dates that no look dates either, as `upgrade_drive::wall_age` read one before the first sighting was kept (ATERM-KI-1112-964: it read 0 and the wall never aged). The drive's first-sighting test (`a_wall_only_the_screen_shows_ages_from_its_first_sighting`) runs that control (no sighting kept: the round waits on the wall for good), and aterm-spec's liveness sweep breaks the law with it."
     )
 )]
 #[doc(hidden)]
@@ -3432,6 +3464,11 @@ pub(super) enum Left {
     Kept(&'static str),
 }
 
+/// What [`left_read`] keeps where the composer holds nothing but a start of the line aterm typed
+/// and could not submit: aterm's own text, the one word over such a line (`left-typed:unsent`)
+/// that is no person's ([`St::note_wait`]).
+const UNSENT: &str = "unsent";
+
 pub(super) fn compact(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
@@ -3514,7 +3551,7 @@ fn left_read(c: &mut Client, tab: &str, text: &str) -> (Left, Option<Own>) {
             caret_ends: caret_ends(&scr),
             headed: upgrade::own_words(&shown),
         };
-        (Left::Kept("unsent"), Some(own))
+        (Left::Kept(UNSENT), Some(own))
     } else if draft.starts_with(&mark) {
         (Left::Kept("mixed"), None)
     } else {
@@ -3652,7 +3689,7 @@ fn left_first(
         return None;
     }
     let mut left = settle_left(st, c, tab, left_standing);
-    if left == Left::Kept("unsent") && !opts.dry_run {
+    if left == Left::Kept(UNSENT) && !opts.dry_run {
         let text = st.left_typed.clone();
         left = under_hand(c, tab, None, |c| {
             take_back(
@@ -4458,10 +4495,19 @@ pub(super) struct St {
     /// admitted now and proven gone by its kernel start, with no native operation unresolved
     /// ([`super::relaunch::host_ended_fresh`]): no native authority outlived that process, so
     /// the record's [`Self::native_coordination`] (kept, never cleared) gates no typed line of
-    /// it. Never written to the record: it holds for this one relaunch.
+    /// it. The same holds for an exit whose native relaunches are spent, each proven to have run
+    /// nothing ([`super::relaunch::native_spent`]). Never written to the record: it holds for
+    /// this one relaunch.
     pub(super) host_ended_fresh: bool,
     /// A NotGranted retirement, never a launch grant.
     pub(super) native_retired_unissued: bool,
+    /// How many native relaunches of the exit [`Self::native_spent_of`] names ended with the
+    /// host's proof that nothing ran under them (`state=unadmitted`, `state=lapsed`). At
+    /// [`super::relaunch::NATIVE_ATTEMPTS`] that exit's relaunch is its plain typed line
+    /// ([`super::relaunch::native_spent`]), never another native plan.
+    pub(super) native_spent: u32,
+    /// The exit [`Self::native_spent`] counts: its agent's `<pid> <kernel start>`.
+    pub(super) native_spent_of: String,
     /// Unconfirmed account successor; the original binding and recipe remain above.
     pub(super) native_account_candidate: Option<super::native_account_handoff::Pending>,
     /// Completed data is never an active grant; later crash entry mints a new operation.
@@ -4526,7 +4572,14 @@ pub(super) struct St {
     pub(super) proc_start: String,
     pub(super) waits: Vec<WaitNote>,
     pub(super) wait: String,
+    /// When the recorded word ([`Self::wait`]) was first noted: the word's own clock, which the
+    /// status page's rules for one word read (how long a draft or an unreachable tab has stood).
     pub(super) wait_since: u64,
+    /// The upgrade's hold as one episode ([`Episode`], [`Self::note_wait`]): its start kept
+    /// across changes of word and of the process that holds it and across clear gaps shorter
+    /// than [`episode::CLEAR_GAP_S`], ended by a move, a person's key or a new target build. The status
+    /// page's `wait_for=` reads it.
+    pub(super) wait_episode: Episode,
     pub(super) wait_seen: u64,
     pub(super) held_by: Vec<HeldBy>,
     pub(super) idle_looks: u32,
@@ -4569,9 +4622,21 @@ pub(super) struct St {
     pub(super) stop_streak: u32,
     pub(super) notices: u32,
     pub(super) own_work_at: u64,
-    /// Since when the agent's own work has held this round, unbroken by a person or a limit
-    /// ([`St::note_wait`]); 0 for none.
-    pub(super) own_since: u64,
+    /// The agent's own work holding this round, as one episode ([`St::note_wait`]): from its
+    /// first own-work look, kept across changes of word and of the process that holds it, across
+    /// aterm's own unsent line and across clear gaps shorter than [`episode::CLEAR_GAP_S`]; ended by a
+    /// person or a wall at a look, a voided deadline, or a gap that long.
+    pub(super) own: Episode,
+    /// When a line to the agent ([`upgrade::Step::Tell`]) last may have reached the composer
+    /// without being taken whole (cut, refused after its keys, unanswered): the line is typed
+    /// again only [`upgrade::WORK_TELL_S`] after it ([`upgrade::Facts::tell_rests`]); 0 for none.
+    pub(super) tell_tried_at: u64,
+    /// The first look that saw the login wall standing ([`episode::sighted`]), which dates a wall
+    /// no transcript row dates ([`wall_age`]); 0 with no wall.
+    pub(super) login_seen: u64,
+    /// The first look that saw the usage limit standing, as [`Self::login_seen`] is the login
+    /// wall's.
+    pub(super) limit_seen: u64,
     /// How many times [`Self::told_to`] was told to the agent ([`upgrade::Step::Tell`]).
     pub(super) tells: u32,
     pub(super) told_at: u64,
@@ -4699,7 +4764,10 @@ struct History {
     notices: u32,
     waits: Vec<WaitNote>,
     own_work_at: u64,
-    own_since: u64,
+    own: Episode,
+    tell_tried_at: u64,
+    login_seen: u64,
+    limit_seen: u64,
     tells: u32,
     told_at: u64,
     told_to: String,
@@ -4989,7 +5057,10 @@ impl St {
             notices: self.notices,
             waits: self.waits.clone(),
             own_work_at: self.own_work_at,
-            own_since: self.own_since,
+            own: self.own,
+            tell_tried_at: self.tell_tried_at,
+            login_seen: self.login_seen,
+            limit_seen: self.limit_seen,
             tells: self.tells,
             told_at: self.told_at,
             told_to: self.told_to.clone(),
@@ -5007,7 +5078,10 @@ impl St {
         self.notices = history.notices;
         self.waits = history.waits;
         self.own_work_at = history.own_work_at;
-        self.own_since = history.own_since;
+        self.own = history.own;
+        self.tell_tried_at = history.tell_tried_at;
+        self.login_seen = history.login_seen;
+        self.limit_seen = history.limit_seen;
         self.tells = history.tells;
         self.told_at = history.told_at;
         self.told_to = history.told_to;
@@ -5090,6 +5164,7 @@ impl St {
                     st.from = from.to_string();
                     st.wait.clear();
                     st.wait_since = 0;
+                    st.wait_episode.end();
                     st.wait_seen = 0;
                     st.held_by.clear();
                     st.stop_streak = 0;
@@ -5101,7 +5176,10 @@ impl St {
                     st.waits.clear();
                     st.firsts.clear();
                     st.own_work_at = 0;
-                    st.own_since = 0;
+                    st.own.end();
+                    st.tell_tried_at = 0;
+                    st.login_seen = 0;
+                    st.limit_seen = 0;
                     st.tells = 0;
                     st.told_at = 0;
                     st.told_to.clear();
@@ -5130,6 +5208,10 @@ impl St {
                 st.to = to.version.to_string();
                 st.source = to.source.as_str().to_string();
                 st.pressed_at = 0;
+                // A new target build is progress: the hold on it is an episode of its own. The
+                // agent's own work keeps its episode, as its told deadline does (a newer build
+                // never starts that clock again).
+                st.wait_episode.end();
                 if st.proc_start.is_empty() && !who.start.is_empty() {
                     st.proc_start = who.start.to_string();
                 }
@@ -5359,6 +5441,7 @@ impl St {
         st.native_record = self.native_record.clone();
         self.carry_noexec(st);
         self.carry_closed(st);
+        self.carry_spent(st);
         if self.agent == st.agent
             && let Some(failed) = self
                 .carried_failed_start()
@@ -5384,6 +5467,7 @@ impl St {
         st.native_record = self.native_record.clone();
         self.carry_noexec(st);
         self.carry_closed(st);
+        self.carry_spent(st);
         st.keep_completed_native(self.native_completed_prepare.clone());
         if let Some(word) = self.owners_hold(tab) {
             st.request = word;
@@ -5427,6 +5511,35 @@ impl St {
     fn carry_closed(&self, st: &mut St) {
         if st.native_closed.is_none() {
             st.native_closed = self.native_closed.clone();
+        }
+    }
+
+    /// The native relaunches an exit spent ride on every new plan for it, as the exit they
+    /// count does ([`Self::native_spent_on`] reads them only for that exit): a plan made afresh
+    /// after one ended is no new budget.
+    fn carry_spent(&self, st: &mut St) {
+        st.native_spent = self.native_spent;
+        st.native_spent_of.clone_from(&self.native_spent_of);
+    }
+
+    /// Count a native relaunch of this record's exit (its agent, [`Self::pid`] born at
+    /// [`Self::pid_start`]) that the host proved ran nothing.
+    pub(super) fn spend_native(&mut self) {
+        let of = format!("{} {}", self.pid, self.pid_start);
+        if self.native_spent_of == of {
+            self.native_spent = self.native_spent.saturating_add(1);
+        } else {
+            self.native_spent_of = of;
+            self.native_spent = 1;
+        }
+    }
+
+    /// The native relaunches spent on the exit of the agent `pid` born at `start`.
+    pub(super) fn native_spent_on(&self, pid: u32, start: &str) -> u32 {
+        if self.native_spent_of == format!("{pid} {}", squash(start)) {
+            self.native_spent
+        } else {
+            0
         }
     }
 
@@ -5535,9 +5648,19 @@ impl St {
         self.tells = 0;
         self.told_at = 0;
         self.told_to.clear();
-        self.own_since = 0;
+        self.own.end();
     }
 
+    /// Notes the wait `word` a look at `now` found. The word's own clock ([`Self::wait_since`])
+    /// starts at a new word; the hold's episode ([`Self::wait_episode`]) keeps its start across
+    /// words, a plain next point being a clear look, not a hold. The agent's own work
+    /// ([`Self::own`]) holds at an own-work word, is broken by a person's or a wall's (the time
+    /// they hold is not the agent's), and is neither held nor broken by aterm's own unsent line
+    /// (`left-typed:`[`UNSENT`]: the composer holds nothing but a start of aterm's own text),
+    /// which is no person's. Every other person's word over a line aterm left (a box standing
+    /// on it, a person's text among aterm's, no composer to read) breaks it, as any person's
+    /// does; a next point is a clear look for it too. A wall's word dates the wall's first
+    /// sighting, the watch's dry looks included ([`wall_age`]).
     pub(super) fn note_wait(&mut self, word: &str, now: u64) {
         if self.wait != word {
             self.wait = word.to_string();
@@ -5548,13 +5671,55 @@ impl St {
         if upgrade_status::holds_by_own_work(&self.wait, false) {
             self.saw_own_work(now);
         }
-        match upgrade_status::wait_class(word) {
-            upgrade_status::WaitClass::OwnWork if self.own_since == 0 => self.own_since = now,
-            upgrade_status::WaitClass::Person | upgrade_status::WaitClass::Limit => {
-                self.own_since = 0;
-            }
+        let class = upgrade_status::wait_class(word);
+        if class == upgrade_status::WaitClass::NextPoint {
+            self.wait_episode.clear(now);
+        } else {
+            self.wait_episode.hold(now);
+        }
+        match class {
+            upgrade_status::WaitClass::OwnWork => self.own.hold(now),
+            upgrade_status::WaitClass::NextPoint => self.own.clear(now),
+            upgrade_status::WaitClass::Person
+                if word.strip_prefix("left-typed:") == Some(UNSENT) => {}
+            upgrade_status::WaitClass::Person | upgrade_status::WaitClass::Limit => self.own.end(),
             _ => {}
         }
+        match word.split_once(':').map_or(word, |(head, _)| head) {
+            "login" => self.login_seen = episode::sighted(self.login_seen, true, now),
+            "limited" => self.limit_seen = episode::sighted(self.limit_seen, true, now),
+            _ => {}
+        }
+    }
+
+    /// A line to the agent whose first key may go at `now` ([`tell`]): it rests from here until
+    /// it is taken whole ([`Self::tell_rests`]); the own-work hold keeps its episode.
+    pub(super) const fn tell_keyed(&mut self, now: u64) {
+        self.tell_tried_at = now;
+    }
+
+    /// The line typed at `now` was taken whole by the agent process `pid` ([`tell`]): the one line
+    /// on this target, and the deadline it named, which stands for that process
+    /// ([`upgrade::WORK_DEADLINE_S`]).
+    pub(super) fn told(&mut self, pid: u32, now: u64) {
+        self.tell_tried_at = 0;
+        self.tells = 1;
+        self.told_at = now;
+        self.told_to.clone_from(&self.to);
+        self.deadline_at = now.saturating_add(upgrade::WORK_DEADLINE_S);
+        self.deadline_pid = pid;
+    }
+
+    /// How long the agent's own work has held this round at `now` ([`Self::own`],
+    /// [`upgrade::Facts::own_hold_s`]).
+    pub(super) const fn own_hold_s(&self, now: u64) -> u64 {
+        self.own.age(now)
+    }
+
+    /// Whether a line to the agent that may not have been taken whole was typed within
+    /// [`upgrade::WORK_TELL_S`] of `now` ([`Self::tell_tried_at`], [`upgrade::Facts::tell_rests`]).
+    pub(super) const fn tell_rests(&self, now: u64) -> bool {
+        self.tell_tried_at != 0 && now.saturating_sub(self.tell_tried_at) < upgrade::WORK_TELL_S
     }
 
     pub(super) const fn saw_hand(&mut self, now: u64) -> bool {
@@ -5625,6 +5790,8 @@ impl St {
             }
             self.wait.clear();
             self.wait_since = 0;
+            // A move or a phase change is progress: the hold's episode ends with it.
+            self.wait_episode.end();
             self.wait_seen = 0;
             self.refused = 0;
             self.refused_at = 0;
@@ -5726,6 +5893,7 @@ impl St {
                     .unwrap_or_default(),
             ),
             ("streak_why", &self.streak_why),
+            ("native_spent_of", &self.native_spent_of),
             ("still_print", &self.still_print),
             ("proc_start", &self.proc_start),
             ("progress_key", &self.progress_key),
@@ -5863,6 +6031,8 @@ impl St {
             ("ready_since", self.ready_since),
             ("pending_since", self.pending_since),
             ("wait_since", self.wait_since),
+            ("episode_since", self.wait_episode.since),
+            ("episode_clear_at", self.wait_episode.clear_at),
             ("wait_seen", self.wait_seen),
             ("done_at", self.done_at),
             ("request_at", self.request_at),
@@ -5875,6 +6045,7 @@ impl St {
             ("failed_at", self.failed_at),
             ("noticed_at", self.noticed_at),
             ("stop_streak", u64::from(self.stop_streak)),
+            ("native_spent", u64::from(self.native_spent)),
             ("notices", u64::from(self.notices)),
             ("still_since", self.still_since),
             ("still_at", self.still_at),
@@ -5885,7 +6056,11 @@ impl St {
             ("refused_at", self.refused_at),
             ("work_seen", u64::from(self.work_seen)),
             ("own_work_at", self.own_work_at),
-            ("own_since", self.own_since),
+            ("own_since", self.own.since),
+            ("own_clear_at", self.own.clear_at),
+            ("tell_tried_at", self.tell_tried_at),
+            ("login_seen", self.login_seen),
+            ("limit_seen", self.limit_seen),
             ("tells", u64::from(self.tells)),
             ("told_at", self.told_at),
             ("deadline_at", self.deadline_at),
@@ -6002,6 +6177,20 @@ impl St {
             (Phase::Relaunched { at_s }, None) => *at_s,
             _ => n("relaunched_at"),
         };
+        let wait = s("wait");
+        let wait_since = n("wait_since");
+        // A record written before the hold's episode was kept carries no `episode_since`: the
+        // hold its wait names then counts from that word's own clock, not from this build's
+        // first look ([`episode::read_back`]).
+        let wait_episode = episode::read_back(
+            v.get("episode_since").map(|_| Episode {
+                since: n("episode_since"),
+                clear_at: n("episode_clear_at"),
+            }),
+            wait_since,
+            !wait.is_empty()
+                && upgrade_status::wait_class(&wait) != upgrade_status::WaitClass::NextPoint,
+        );
         let mut st = St {
             native_record: super::native_record::Baseline::default(),
             host_ended_fresh: false,
@@ -6151,8 +6340,9 @@ impl St {
             hold_seen_s: n("hold_seen"),
             ready_since: n("ready_since"),
             pending_since: n("pending_since"),
-            wait: s("wait"),
-            wait_since: n("wait_since"),
+            wait,
+            wait_since,
+            wait_episode,
             wait_seen: n("wait_seen"),
             held_by: list("held_by")
                 .iter()
@@ -6205,12 +6395,20 @@ impl St {
             last_stop: s("last_stop"),
             streak_why: s("streak_why"),
             stop_streak: small("stop_streak"),
+            native_spent: small("native_spent"),
+            native_spent_of: s("native_spent_of"),
             notices: small("notices"),
             still_print: s("still_print"),
             still_since: n("still_since"),
             still_at: n("still_at"),
             own_work_at: n("own_work_at"),
-            own_since: n("own_since"),
+            own: Episode {
+                since: n("own_since"),
+                clear_at: n("own_clear_at"),
+            },
+            tell_tried_at: n("tell_tried_at"),
+            login_seen: n("login_seen"),
+            limit_seen: n("limit_seen"),
             tells: small("tells"),
             told_at: n("told_at"),
             told_to: s("told_to"),
@@ -7011,14 +7209,7 @@ pub(super) fn registry_life<'a>(
     graph: Option<&'a Path>,
     known_live: &'a [String],
 ) -> impl Fn(&str) -> TabLife + 'a {
-    fn entry(graph: &Path, sid: &str) -> Option<bool> {
-        aterm_types::control_request::Sid::parse(sid)?;
-        match std::fs::symlink_metadata(graph.join(sid)) {
-            Ok(_) => Some(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
-            Err(_) => None,
-        }
-    }
+    use super::graph_records::holds as entry;
     let vouched = graph.filter(|graph| {
         std::fs::symlink_metadata(graph).is_ok_and(|m| m.is_dir())
             && !known_live.is_empty()
@@ -7041,6 +7232,34 @@ pub(super) const fn registry_vouches_for_state(
     private_state: bool,
 ) -> bool {
     private_registry == private_state
+}
+
+/// `own`'s verdict on each tab (a window's own graph, [`registry_life`]) widened to the graphs
+/// of every other running window recorded beside the agent records of the harness state `state`
+/// ([`super::graph_records::agent_folder`]) or beside the drive journals of the aterm state root
+/// `aterm_state` ([`super::graph_records::drive_folder`]), as [`super::graph_records::live`] reads
+/// them ([`drive_collect::life_across`]): a tab `own` finds gone is gone only where none of them
+/// holds it, and every tab is unknown where a folder's records do not read whole at wall second
+/// `now`. The spent records a reading names are removed. Every prune that removes what a tab's session reads judges
+/// the tab by it, since a tab gone from one window's graph may run in another's, and a window
+/// records itself beside every harness state its environment resolves
+/// ([`super::graph_records::folders`]), whatever its aterm state root.
+pub(super) fn across_records<'a>(
+    own: impl Fn(&str) -> TabLife + 'a,
+    state: &Path,
+    aterm_state: Option<&Path>,
+    now: u64,
+) -> impl Fn(&str) -> TabLife + 'a {
+    let readings: Vec<Option<Vec<PathBuf>>> =
+        std::iter::once(super::graph_records::agent_folder(state))
+            .chain(aterm_state.map(super::graph_records::drive_folder))
+            .map(|folder| super::graph_records::live(&folder, now))
+            .collect();
+    let others = readings
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .map(|graphs| graphs.concat());
+    drive_collect::life_across(own, others)
 }
 
 pub(super) fn registry_graph() -> Option<PathBuf> {
@@ -8729,6 +8948,17 @@ fn earlier_tabs_path(root: &Path, tab: &str) -> PathBuf {
 
 fn noted_earlier_tabs(root: &Path, tab: &str) -> Vec<String> {
     noted_earlier_tabs_read(root, tab, &|p| read_record_text(p).ok().flatten())
+}
+
+/// The tabs `tab`'s earlier-tabs note names ([`noted_earlier_tabs_read`]), none where there is
+/// no note.
+///
+/// # Errors
+/// A note is there but does not read whole ([`read_record_text`]: a dangling link, anything
+/// but a regular file, an oversized file or one that is not UTF-8).
+fn noted_earlier_tabs_checked(root: &Path, tab: &str) -> std::io::Result<Vec<String>> {
+    let body = read_record_text(&earlier_tabs_path(root, tab))?;
+    Ok(noted_earlier_tabs_read(root, tab, &|_| body.clone()))
 }
 
 fn noted_earlier_tabs_read(
@@ -10883,6 +11113,7 @@ fn sweep_with_roster(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> 
 /// word's place. Any other close of a look (`done:resumed`, a model confirmed) yields in a tab's
 /// own step to what the lanes say of that tab, an act or a wait: the close is in the record and
 /// the ledger already, and a wait it stood before would lose its host the wait's next look.
+/// Before the lanes, the window's collection runs under the same lock ([`drive_collect::sweep`]).
 fn sweep_with_lanes(
     opts: &Opts,
     live_tabs: Option<&[LiveTab]>,
@@ -10918,6 +11149,7 @@ fn sweep_with_lanes(
     }
     muse::sweep_prune(opts, live_tabs);
     agy::sweep_prune(opts, live_tabs);
+    drive_collect::sweep(opts, live_tabs, now_s(), &drive_collect::COLLECTED_AT);
     let mut reports = lanes(opts, live_tabs, pass);
     let mut confirmed = confirmed;
     if opts.only_sid.is_some() {
@@ -11825,6 +12057,18 @@ fn visit_build(
         // that holds the round is told.
         facts.tells = 0;
     }
+    let keyed = facts.attended || facts.typing;
+    if keyed {
+        // A person's key is progress: the hold this look finds is an episode of its own.
+        st.wait_episode.end();
+    }
+    if keyed || facts.held {
+        // A key or hold of the person's breaks the own-work hold before the line aterm left is
+        // settled, so a step that waits on that line ([`left_first`]) counts none of their time
+        // as the agent's. The draft is no person's here: until [`left_read`] proves otherwise
+        // it is aterm's own line, and the step's close below judges it.
+        st.own.end();
+    }
     if let Some(r) = left_first(opts, &r, &mut st, &mut c, &tab, sf, now) {
         return r;
     }
@@ -11844,10 +12088,12 @@ fn visit_build(
     );
     let asked = st.request_for(&tab);
     let requeued = queue_facts(&mut st, &mut facts, tail, now, &asked);
+    st.limit_seen = episode::sighted(st.limit_seen, facts.limited, now);
     facts.limit_s = wall_age(
         facts.limited,
         &facts,
         tail.and_then(upgrade::transcript_limit_since),
+        st.limit_seen,
         looked_hand,
         now,
     );
@@ -11887,13 +12133,49 @@ fn visit_build(
         asked_about = st.phase.clone();
     }
     // The relaunch the move would type from the foreground shell `shell`: the notice carries its
-    // line, and a tell, which promises the move, goes only where it can be made.
-    let plan_move = if super::native_restart::coordinated(&st) {
+    // line, and a tell, which promises the move, goes only where it can be made. A coordinated
+    // record's move is an asked upgrade, which goes only where the host can admit it now.
+    let coordinated = super::native_restart::coordinated(&st);
+    let plan_move = if coordinated {
         super::relaunch::plan_native_upgrade
     } else {
         plan
     };
+    // The foreground shell a move would type from, read once for a step that may move.
+    let foreground = matches!(
+        step,
+        Step::Tell(_) | Step::Announce | Step::Terminate | Step::Fresh
+    )
+    .then(|| foreground_shell(k.job(sf.pid)));
+    // An asked upgrade is judged on the live vendor under that shell: this round's record binds
+    // its own agent only once the move is signalled, and a round after a completed move starts
+    // with none bound. A closed restart's watch the record carries is read as the move's own
+    // settlement would leave it ([`restart`] settles it before its gate), since only that move
+    // settles it in this lane. A view reads no gate: the host's succession answer reclaims its
+    // table and may release a settlement, which no read-only connection asks for, so the view
+    // reports the step as the move would find it, and the real lane's own gate holds it.
+    let asked_ready = match foreground {
+        Some(Ok(shell)) if coordinated && !opts.dry_run => {
+            Some(super::native_restart::asked_upgrade_ready_unsettled(
+                opts,
+                &mut c,
+                &st,
+                super::native_restart::Fresh::Signal {
+                    pid: sf.pid,
+                    conversation: &sf.session_id,
+                },
+                || records.session_files(),
+                k,
+                sf.pid,
+                shell,
+            ))
+        }
+        _ => None,
+    };
     let move_plan = |shell: u32| -> Result<Plan, NoPlan> {
+        if let Some(Err(wait)) = &asked_ready {
+            return Err(wait.clone().into());
+        }
         let home = args.env_var(super::accounts::HOME_ENV);
         let homedir = home_carried(&opts.home, home, &sf.cwd, &records)?;
         let mode = resume_mode(
@@ -11926,18 +12208,20 @@ fn visit_build(
     };
     // A tell names the newer build waiting and promises aterm's move onto it, so it waits its own
     // work's word where the relaunch the move would type cannot be planned now (its shell, the
-    // HOME it carries), before the build's start is probed for a line it will not type.
+    // HOME it carries), before the build's start is probed for a line it will not type. A
+    // coordinated record's move that aterm's native restart refuses (the twin's projection, the
+    // asked upgrade's gate) waits that refusal's own word instead, its reason in the record's
+    // wait log and aterm.log: nothing would move once the agent's work ended either.
     if let Step::Tell(why) = step
-        && foreground_shell(k.job(sf.pid))
-            .ok()
+        && let Err(no) = foreground
+            .and_then(Result::ok)
             .map_or(Err(NoPlan::Wait("ids")), move_plan)
-            .is_err()
     {
-        step = Step::Wait(why);
+        step = Step::Wait(tell_unplanned(&r, &mut st, coordinated, no, why, now));
     }
     let mut proven = None;
     if matches!(step, Step::Announce | Step::Terminate | Step::Fresh) {
-        match foreground_shell(k.job(sf.pid)) {
+        match foreground.unwrap_or(Err("ids")) {
             Ok(shell) => proven = Some(shell),
             Err(why) => step = Step::Wait(why),
         }
@@ -12204,8 +12488,8 @@ fn visit_build(
     st.note_step(&result.step, &facts.status, now);
     if upgrade::person_seen(&facts) {
         // Whatever the step's word (the agent's work outranks a person in it), a look that
-        // finds a person restarts the own-work hold ([`upgrade::person_seen`]).
-        st.own_since = 0;
+        // finds a person breaks the own-work hold ([`upgrade::person_seen`]).
+        st.own.end();
     }
     st.restart_look =
         result.step.starts_with("wait:") && restart_word.as_deref() == Some(result.step.as_str());
@@ -12496,11 +12780,8 @@ pub(super) fn look_facts(
                 && records.finished(&sf.session_id, &ours) == Some(true))
             || person_left,
         unnoticed: now.saturating_sub(st.behind_since()) < upgrade::quiet_s(),
-        own_hold_s: if st.own_since == 0 {
-            0
-        } else {
-            now.saturating_sub(st.own_since)
-        },
+        own_hold_s: st.own_hold_s(now),
+        tell_rests: st.tell_rests(now),
         tells: if st.told_to == st.to { st.tells } else { 0 },
         may_tell: opts.tell != Tell::Off,
         silent: opts.tell == Tell::Silent,
@@ -12575,22 +12856,37 @@ const GAVE_UP_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 /// How long a wall that `stands` at look `f` (its login wall, [`upgrade::Facts::login_s`]; its
 /// usage limit, [`upgrade::Facts::limit_s`]) has stood with nobody at the session: since the first
 /// row of the wall its transcript stands at (`since`: [`upgrade::LoginScan::since`],
-/// [`upgrade::StandingScan::since`]), every look (the watch's dry ones too) reading the same age,
-/// or since a key of the person's (`hand`) after it. Where the key record covers only the time
-/// the host has served the session ([`HandAt::Since`]: aterm started serving it again, say after
-/// its own update), the age runs from that start at the earliest, since a key before it is not
-/// known. A look that sees a person reads 0, keys that cannot be read never age it, and nor does a
-/// wall its transcript does not date (one on the screen alone).
-pub(super) fn wall_age(stands: bool, f: &Facts, since: Option<u64>, hand: HandAt, now: u64) -> u64 {
+/// [`upgrade::StandingScan::since`]), or, where no row dates it (a wall only the screen shows, a
+/// transcript that cannot be read), since the first look that saw it (`sighted`:
+/// [`St::login_seen`], [`St::limit_seen`], kept in the record across looks and loops), every look
+/// (the watch's dry ones too) reading the same age, or since a key of the person's (`hand`) after
+/// it. Where the key record covers only the time the host has served the session
+/// ([`HandAt::Since`]: aterm started serving it again, say after its own update), the age runs from
+/// that start at the earliest, since a key before it is not known; where it cannot be read at all
+/// ([`HandAt::Unknown`]) the age runs from the first sighting at the earliest, each look since it
+/// having read the person as it read the wall, and with no sighting it reads 0. A look that sees a
+/// person reads 0.
+pub(super) fn wall_age(
+    stands: bool,
+    f: &Facts,
+    since: Option<u64>,
+    sighted: u64,
+    hand: HandAt,
+    now: u64,
+) -> u64 {
     if !stands || upgrade::person_seen(f) {
         return 0;
     }
+    let Some(dated) = since.or((sighted != 0).then_some(sighted)) else {
+        return 0;
+    };
     let keyed = match hand {
         HandAt::At(at) | HandAt::Since(at) => now.saturating_sub(at.elapsed().as_secs()),
         HandAt::Never => 0,
-        HandAt::Unknown => return 0,
+        HandAt::Unknown if sighted == 0 => return 0,
+        HandAt::Unknown => sighted,
     };
-    since.map_or(0, |since| now.saturating_sub(since.max(keyed)))
+    now.saturating_sub(dated.max(keyed))
 }
 
 fn login_facts(
@@ -12609,7 +12905,8 @@ fn login_facts(
         f.login = true;
         st.phase = upgrade::clock_held(&st.phase, f, now);
     }
-    f.login_s = wall_age(f.login, f, said.since, hand, now);
+    st.login_seen = episode::sighted(st.login_seen, f.login, now);
+    f.login_s = wall_age(f.login, f, said.since, st.login_seen, hand, now);
     if let Some(lifted) = said.lifted_at {
         let _ = st.hold_clock(lifted);
     }
@@ -12813,10 +13110,11 @@ struct Told<'a> {
 /// - a refusal before the first key, or a turn the server reports untyped (`changed`, a yield to
 ///   a person), changes nothing, and the next look types it;
 /// - a line cut short, refused after its keys or unanswered may stand in the composer or may
-///   have landed, so the own-work hold starts again from now ([`St::own_since`], saved once the
-///   fence is read, right before the first key, so a crash mid-type starts it again too): what
-///   stands is settled first ([`left_first`]), and the line is typed again only once the work
-///   has held the round [`upgrade::WORK_TELL_S`] more. A save that fails types nothing.
+///   have landed, so it rests ([`St::tell_tried_at`], saved once the fence is read, right before
+///   the first key, so a crash mid-type rests it too): what stands is settled first
+///   ([`left_first`]), and the line is typed again only [`upgrade::WORK_TELL_S`] after this one.
+///   The own-work hold keeps its episode ([`St::own`]): an untaken line is no progress, and the
+///   line typed again names the whole hold. A save that fails types nothing.
 fn tell(
     opts: &Opts,
     r: Report,
@@ -12860,7 +13158,7 @@ fn tell(
             verb,
         },
     );
-    let held_since = st.own_since;
+    let tried_before = st.tell_tried_at;
     // Whether the first key may have gone: the fence was read and the record saved.
     let mut keyed = false;
     let typed = {
@@ -12874,9 +13172,9 @@ fn tell(
             Put::Pressed,
             opts.timings.fence_every,
             &mut || {
-                st.own_since = now;
+                st.tell_keyed(now);
                 if save_checked(opts, &sf.session_id, st).is_err() {
-                    st.own_since = held_since;
+                    st.tell_tried_at = tried_before;
                     return Err(Typed::Refused("unsaved".to_string()));
                 }
                 *keyed = true;
@@ -12887,12 +13185,7 @@ fn tell(
     };
     match typed {
         Ok(()) => {
-            st.own_since = held_since;
-            st.tells = 1;
-            st.told_at = now;
-            st.told_to.clone_from(&st.to);
-            st.deadline_at = now.saturating_add(upgrade::WORK_DEADLINE_S);
-            st.deadline_pid = sf.pid;
+            st.told(sf.pid, now);
             let r = said(r, format!("told:{why}"));
             ledger(
                 opts,
@@ -12911,8 +13204,8 @@ fn tell(
         }
         Err(e) => {
             if !keyed || matches!(e, Typed::Changed | Typed::Yielded | Typed::Person) {
-                // Nothing was typed: the hold stands as it was, and the next look types it.
-                st.own_since = held_since;
+                // Nothing was typed: the line does not rest, and the next look types it.
+                st.tell_tried_at = tried_before;
             } else {
                 // Keys may have gone: what stands of the line is settled before anything else
                 // is typed, and no deadline is named by a line the agent may never have read.
@@ -13994,6 +14287,34 @@ fn status_unmoved(a: &SessionFile, looked: &SessionFile) -> bool {
     a.status == looked.status && a.status_updated_at_ms == looked.status_updated_at_ms
 }
 
+/// The wait of a tell whose move cannot be planned now (`no`): the tell's own work word `why`,
+/// but for a coordinated record (`coordinated`) whose move aterm's native restart refuses, which
+/// waits that refusal's own word (a `native-` word, aterm's own fault): a noted refusal's reason
+/// goes to aterm.log and to `st`'s wait log at `now`, as an announce's would
+/// ([`super::relaunch::noted_wait`]).
+fn tell_unplanned(
+    r: &Report,
+    st: &mut St,
+    coordinated: bool,
+    no: NoPlan,
+    why: &'static str,
+    now: u64,
+) -> &'static str {
+    match no {
+        NoPlan::Noted { word, why: reason } if coordinated => {
+            aterm_log::info!("harness @{}: the relaunch waits {word}: {reason}", r.tab);
+            st.note_wait_why(word, &reason, now);
+            word
+        }
+        NoPlan::Wait(word)
+            if coordinated && word.starts_with(upgrade_status::NATIVE_WAIT_PREFIX) =>
+        {
+            word
+        }
+        NoPlan::Wait(_) | NoPlan::Noted { .. } | NoPlan::Account(_) | NoPlan::Refused { .. } => why,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn restart(
     opts: &Opts,
@@ -14138,6 +14459,8 @@ fn restart(
             ..launch
         };
         if super::native_restart::coordinated(st) {
+            super::native_restart::asked_upgrade_ready(opts, c, st, sf.pid, proven)
+                .map_err(NoPlan::from)?;
             super::relaunch::plan_native_upgrade(opts, &launch, proven, t)
         } else {
             plan(opts, &launch, proven, t)
@@ -14148,6 +14471,7 @@ fn restart(
         line,
         tap_dropped,
         token_dropped,
+        twin_projected,
         line_dir,
         command,
         ..
@@ -14427,6 +14751,7 @@ fn restart(
         },
     );
     super::relaunch::note_dropped(opts, &r, tap_dropped.as_deref(), token_dropped.as_deref());
+    super::relaunch::note_projected(opts, &r, twin_projected.as_deref());
     relaunch(opts, r, st, c, &sf.session_id, k)
 }
 

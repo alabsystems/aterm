@@ -203,6 +203,11 @@ fn a_via_chain_is_bounded_in_hops_and_bytes() {
     );
     assert!(!via_ok(&too_many), "one hop too many");
     assert!(!via_ok(""), "a relay claim naming no relay still demotes");
+    assert!(via_ok("n-a,n-b"));
+    assert!(!via_ok("n-a@n-b"), "a hop is a BARE principal");
+    assert!(!via_ok("n-a,,n-b"), "an empty hop is not a principal");
+    assert!(!via_ok("a-a@n-b"), "a hop is a BARE principal");
+    assert!(!via_ok("a-a,,n-b"), "an empty hop is not a principal");
     assert!(!via_ok("tqn5r6e0148@n-b"), "a hop is a BARE principal");
     assert!(
         !via_ok("tqn5r6e0148,,n-b"),

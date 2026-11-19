@@ -1,26 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Tables page's one reach into the registry: a read of every collection of the generation in
-//! use, listed from the handle's compiled table ([`listed`]), at the head or as of a past
+//! The Tables page's one reach into the stored tables: a read of every collection of each table
+//! family the page lists ([`FAMILIES`]), at the generation in use, listed from the handle's
+//! compiled table ([`listed`]) under the family's title, at the head or as of a past
 //! operation (`Handle::view_at`) with what changed since (`Handle::diff`), with each cell's
 //! candidates and each operation's author, and a write of the staged cells through
-//! [`aterm_db::att::Handle::save`], the same save `aterm db table apply` makes. A collection is
+//! [`aterm_db::att::Handle::save`] of the family the sheet was read from, the same save
+//! `aterm db table apply` makes, judged by that family's own rules. A collection is
 //! read by its kind, as `aterm db table scan` reads it: a cells collection as the grid lays it
 //! out (`aterm_db::typed::grid::export`: a secret cell names its secret-store entry, and
 //! addresses and phone numbers read as stored); an owned one from the view's owned rows, one
 //! whole row for each writing Mac, read only. Where the Check view is open, a read also works
-//! out what `aterm db alab check` finds (`aterm_db::alab::command::checked`, each finding in
-//! the words of its `--tsv` form) and the store's state from the head's usage ([`checked`]).
+//! out what check finds of each family, each finding in the words of its `--tsv` form: the
+//! registry's own `aterm db alab check` (`aterm_db::alab::command::checked`), any other
+//! family's `aterm db table check` (`aterm_db::att::command::check`); and the store's state of
+//! the first family from the head's usage ([`checked`]). History and an as-of read are of the
+//! first family, the registry's ([`history`]).
 //! Each read also lists every row a reference may name and shows each reference as the words its
 //! row is known by, its key kept beside them ([`crate::native_tables::rows::targets`]), with
-//! which rows a Mac's own statement names ([`held`]) and the label each was written under.
-//! Nothing here runs on the main thread:
-//! [`crate::native_tables`]'s worker calls it.
+//! the label each was written under and, for the registry, which rows a Mac holds ([`held`]).
+//! [`crate::native_tables`]'s worker handles storage access. Before it answers, the UI lists
+//! each family's collections common to its compiled generations from schema alone.
 
 #[cfg(unix)]
 use std::collections::BTreeMap;
 
+#[cfg(unix)]
+use aterm_db::att::Entry;
 #[cfg(unix)]
 use aterm_db::typed::Faced;
 #[cfg(unix)]
@@ -33,10 +40,10 @@ use aterm_db::typed::{Face, Kind, Table};
 use crate::native_tables::rows::{Referrer, RowLife};
 #[cfg(unix)]
 use crate::native_tables::{
-    AsOf, Author, AuthorKind, ColumnKind, Group, Observed, Schema, Sheet, SheetColumn, SheetRow,
-    Shown, Since, Written, WrittenCell,
+    AsOf, Author, AuthorKind, ColumnKind, Group, Observed, Schema, SheetColumn, SheetRow, Shown,
+    Since, Written, WrittenCell,
 };
-use crate::native_tables::{Asked, Opened, Paged, Snapshot, Staged, Wrote};
+use crate::native_tables::{Asked, Opened, Paged, Sheet, Snapshot, Staged, Wrote, rows};
 #[cfg(unix)]
 use crate::native_tables::{Logged, LoggedCell, OpenedCell, Valued};
 
@@ -44,16 +51,35 @@ use crate::native_tables::{Logged, LoggedCell, OpenedCell, Valued};
 #[cfg(unix)]
 pub(crate) type Compiled = aterm_db::att::Compiled;
 
-/// No registry is read here, so no sheet names a compiled table.
+/// No table is read here, so no sheet names a compiled table.
 #[cfg(not(unix))]
 #[derive(Debug)]
 pub(crate) enum Compiled {}
 
-/// One collection the rail lists: the registry's name for it, how a person is shown it, and
-/// whether it is read as each Mac's own rows.
+/// Every table family the page lists, each by its first generation, in the rail's order: the
+/// families this build registers ([`aterm_db::att::FAMILIES`]). The first is the one History
+/// reads and an as-of read moves.
+#[cfg(unix)]
+pub(crate) const FAMILIES: &[&Compiled] = aterm_db::att::FAMILIES;
+
+/// No table is kept here.
+#[cfg(not(unix))]
+pub(crate) const FAMILIES: &[&Compiled] = &[];
+
+/// Why the page reads nothing off Unix: the store, the vault and membership compile on Unix only
+/// (design docs/DESIGN-lab-tracker-2026-11-14.md, TK-D22).
+#[cfg(not(unix))]
+const NOT_KEPT: &str = "tables are kept on macOS and Linux";
+
+/// One collection the rail lists: the page's name for its sheet ([`sheet_id`]), how a person is
+/// shown it, the title of the family it is of, and whether it is read as each Mac's own rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Listed {
     pub(crate) name: &'static str,
+    /// The title of its table family ([`aterm_db::att::Compiled::title`]), which the rail lists
+    /// it under where it lists more than one family; empty where [`listed`] was given a table and
+    /// no family.
+    pub(crate) family: &'static str,
     pub(crate) title: &'static str,
     pub(crate) singular: &'static str,
     pub(crate) face: Face,
@@ -69,10 +95,7 @@ pub(crate) struct Listed {
 /// is listed. Nothing here names a collection: a new one is listed as the table compiles it.
 #[cfg_attr(
     not(unix),
-    expect(
-        dead_code,
-        reason = "only the registry read of macOS and Linux lists its tables"
-    )
+    expect(dead_code, reason = "tables are kept on macOS and Linux")
 )]
 pub(crate) fn listed(table: &Table) -> Vec<Listed> {
     let mut listed: Vec<(usize, usize, Listed)> = table
@@ -97,6 +120,7 @@ pub(crate) fn listed(table: &Table) -> Vec<Listed> {
                 at,
                 Listed {
                     name: collection.name,
+                    family: "",
                     title: faced.map_or(collection.name, |f| f.title),
                     singular: faced.map_or(collection.name, |f| f.singular),
                     face,
@@ -107,6 +131,71 @@ pub(crate) fn listed(table: &Table) -> Vec<Listed> {
         .collect();
     listed.sort_by_key(|(place, at, listed)| (listed.face, *place, *at));
     listed.into_iter().map(|(_, _, listed)| listed).collect()
+}
+
+/// The collections available before the first read determines the local generations.
+#[cfg(unix)]
+pub(crate) fn initial_collections(families: &[&'static Compiled]) -> Vec<Listed> {
+    let mut collections = Vec::new();
+    for (index, family) in families.iter().enumerate() {
+        let mut common = family_listed(family);
+        for generation in family.chain().into_iter().skip(1) {
+            let later = family_listed(generation);
+            common.retain(|entry| later.contains(entry));
+        }
+        if index > 0 {
+            for entry in &mut common {
+                entry.name = sheet_id(family, entry.name);
+            }
+        }
+        collections.extend(common);
+    }
+    collections
+}
+
+#[cfg(not(unix))]
+pub(crate) fn initial_collections(_: &[&Compiled]) -> Vec<Listed> {
+    Vec::new()
+}
+
+/// Resolve a saved sheet name against every listed generation, before local storage is open.
+#[cfg(unix)]
+pub(crate) fn routed_collection(name: &str) -> Option<&'static str> {
+    FAMILIES.iter().enumerate().find_map(|(index, family)| {
+        let local = if index == 0 {
+            name
+        } else {
+            name.strip_prefix(family.table.role)?.strip_prefix('.')?
+        };
+        family.chain().into_iter().find_map(|generation| {
+            listed(generation.table)
+                .into_iter()
+                .find(|sheet| sheet.name == local)
+                .map(|sheet| {
+                    if index == 0 {
+                        sheet.name
+                    } else {
+                        sheet_id(family, sheet.name)
+                    }
+                })
+        })
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn routed_collection(_: &str) -> Option<&'static str> {
+    None
+}
+
+#[cfg(unix)]
+fn family_listed(compiled: &Compiled) -> Vec<Listed> {
+    listed(compiled.table)
+        .into_iter()
+        .map(|entry| Listed {
+            family: compiled.title,
+            ..entry
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -357,135 +446,556 @@ fn key_column(table: &Table, collection: &Collection, columns: &[SheetColumn]) -
     )
 }
 
-/// Read every collection of this Mac's registry the rail lists ([`listed`]), at the generation
-/// this Mac uses, as of the operation `at` names (the head where `None`), and, as of a past one,
-/// what changed in each since; and, where `check` (a view shows Check), what check finds of the
-/// registry and its store's state ([`checked`]). With it, whether the read is whole: every
-/// sealed number it asked for opened. One that is not shows a mask a key arriving later would
-/// open without moving the registry's [`Mark`], so its reader reads it again.
+/// What the page says where it is given no family to read.
+#[cfg(unix)]
+const NO_FAMILY: &str = "no table family is compiled here";
+
+/// Read every collection of each of `families` the rail lists ([`listed`]), each family at the
+/// generation this Mac uses: the first as of the operation `at` names (the head where `None`),
+/// and, as of a past one, what changed in each since, since History and its points are the first
+/// family's; every other as it is now, its sheets named apart from the first's ([`sheet_id`]).
+/// Where `check` (a view shows Check), also what check finds of each family and the first's
+/// store's state ([`checked`]). With it, whether the read is whole: every sealed number it asked
+/// for opened. One that is not shows a mask a key arriving later would open without moving the
+/// [`Mark`], so its reader reads it again. A family other than the first that cannot be read
+/// here (not declared on this Mac, say) lists nothing, and the read says so under its header.
 ///
 /// # Errors
-/// The registry cannot be read here: no Commons, or not subscribed, or its store answered busy
-/// past the read's deadline; or this Mac holds no operation `at`.
+/// The first family cannot be read here: no Commons, or not subscribed, or its store answered
+/// busy past the read's deadline; or this Mac holds no operation `at`; or `families` is empty.
 #[cfg(unix)]
 pub(crate) fn read(
     paths: &Paths,
+    families: &[&'static Compiled],
     at: Option<[u8; 32]>,
     check: bool,
 ) -> Result<(Snapshot, bool), String> {
-    use aterm_db::att::{Handle, Point, REGISTRY};
-    let handle = Handle::at(paths.clone(), &REGISTRY);
-    let compiled = handle.compiled();
-    let table = compiled.table;
-    // The head, with what its store holds where Check is shown: one read serves both.
-    let (head, usage) = if check {
-        let (view, usage) = handle.usage().map_err(|e| e.to_string())?;
-        (view, Some(usage))
-    } else {
-        (handle.view().map_err(|e| e.to_string())?, None)
-    };
-    let past = match at {
-        Some(at) => Some(handle.view_at(Point::At(at)).map_err(|e| e.to_string())?),
-        None => None,
-    };
-    let view = past.as_ref().unwrap_or(&head);
-    let history = handle.history().map_err(|e| e.to_string())?;
-    let since = match at {
-        Some(at) => {
-            handle
-                .diff(at, Point::Head)
-                .map_err(|e| e.to_string())?
-                .cells
+    combine(families.iter().enumerate().map(|(index, &family)| {
+        let at = if index == 0 { at } else { None };
+        let result = Read::open(paths, family, at, check).and_then(|read| read.all(paths));
+        (family, result)
+    }))
+}
+
+/// The current selection and the receiver of finished sheets during the first read.
+#[cfg_attr(not(unix), expect(dead_code, reason = "only Unix reads stored tables"))]
+pub(crate) struct Opening<'a> {
+    /// The active sheet, or `None` once its tab has closed.
+    pub(crate) wanted: &'a dyn Fn() -> Option<&'static str>,
+    pub(crate) publish: &'a mut dyn FnMut(Sheet, rows::Targets),
+}
+
+/// Read the head, publishing the current selection when its values, writers and reference
+/// choices are ready. Each sheet is sent once. The final snapshot holds the authoritative
+/// catalog and reference choices, with its sheets already transferred to the receiver.
+///
+/// # Errors
+/// As [`read`]. If a family fails after publishing a sheet, its sheets are absent from the
+/// final catalog. A failure of the first family invalidates the entire read. Closing the tab
+/// stops the read before the next store open or sheet layout.
+#[cfg(unix)]
+pub(crate) fn read_opening(
+    paths: &Paths,
+    families: &[&'static Compiled],
+    opening: &mut Opening<'_>,
+) -> Result<(Snapshot, bool), String> {
+    use std::ops::ControlFlow;
+    const CLOSED: &str = "the Tables tab closed";
+    (opening.wanted)().ok_or(CLOSED)?;
+    // Establish the primary store before allowing a secondary family to appear. After that,
+    // every turn can switch to another family without reopening either observation.
+    let first = families.first().ok_or(NO_FAMILY)?;
+    let primary = OpeningFamily::new(Read::open(paths, first, None, false)?);
+    let mut pending: BTreeMap<_, _> = (0..families.len()).map(|i| (i, None)).collect();
+    pending.insert(0, Some(primary));
+    let mut complete = BTreeMap::new();
+    while let Some((&first_pending, _)) = pending.first_key_value() {
+        let wanted = (opening.wanted)().ok_or(CLOSED)?;
+        let (index, local) = pending
+            .iter()
+            .find_map(|(&index, state)| {
+                let local = if index == 0 {
+                    wanted
+                } else {
+                    wanted
+                        .strip_prefix(families[index].table.role)?
+                        .strip_prefix('.')?
+                };
+                state
+                    .as_ref()
+                    .is_none_or(|state| state.waits_for(local))
+                    .then_some((index, Some(local)))
+            })
+            .unwrap_or((first_pending, None));
+        let family = families[index];
+        let next = match pending.remove(&index).flatten() {
+            Some(state) => state.step(paths, local, (index > 0).then_some(family), opening),
+            None => Read::open(paths, family, None, false)
+                .map(OpeningFamily::new)
+                .map(ControlFlow::Continue),
+        };
+        match next {
+            Ok(ControlFlow::Continue(state)) => {
+                pending.insert(index, Some(state));
+            }
+            Ok(ControlFlow::Break(read)) => {
+                complete.insert(index, Ok(read));
+            }
+            Err(why) if index == 0 => return Err(why),
+            Err(why) => {
+                complete.insert(index, Err(why));
+            }
         }
-        None => Vec::new(),
-    };
-    // A writer is named as history names its Mac now (`Entry::mac`), in a past table too:
-    // history runs past the point, and a Mac labelled since is still that Mac. An owned row
-    // whose record history does not list is named by the same join, read from the head.
-    let macs = aterm_db::att::Macs::of(&head);
-    let names = aterm_db::alab::registry::Names::of(table, &head);
-    let author = |entry: &aterm_db::att::Entry| -> Author {
-        let (label, id) = named(&entry.mac);
-        Author {
-            kind: match entry.kind {
-                aterm_db::att::EntryKind::Aterm => AuthorKind::Aterm,
-                aterm_db::att::EntryKind::Import => AuthorKind::Import,
-                aterm_db::att::EntryKind::Explicit => AuthorKind::Explicit,
-            },
-            label,
-            id,
-            at_ms: entry.authored_ms,
-            hlc: (entry.hlc.ms, entry.hlc.counter),
+    }
+    combine(
+        complete
+            .into_iter()
+            .map(|(index, result)| (families[index], result)),
+    )
+}
+
+/// A family's held observation, its raw sheets awaiting their reference names, and the names
+/// already known. A slot becomes empty once its sheet has been sent.
+#[cfg(unix)]
+struct OpeningFamily {
+    read: Read,
+    sheets: BTreeMap<&'static str, Option<Sheet>>,
+    targets: rows::Targets,
+    whole: bool,
+}
+
+#[cfg(unix)]
+impl OpeningFamily {
+    fn new(read: Read) -> Box<Self> {
+        Box::new(Self {
+            read,
+            sheets: BTreeMap::new(),
+            targets: rows::Targets::new(),
+            whole: true,
+        })
+    }
+
+    fn waits_for(&self, local: &str) -> bool {
+        self.read.listed.iter().any(|s| s.name == local)
+            && !matches!(self.sheets.get(local), Some(None))
+    }
+
+    /// Do one layout or publication and yield so a newer selection takes priority. A reference
+    /// target's own naming column and status are read raw; its outgoing references need no
+    /// resolution to name it.
+    fn step(
+        mut self: Box<Self>,
+        paths: &Paths,
+        wanted: Option<&str>,
+        secondary: Option<&'static Compiled>,
+        opening: &mut Opening<'_>,
+    ) -> Result<std::ops::ControlFlow<(Snapshot, bool), Box<Self>>, String> {
+        use std::ops::ControlFlow;
+        let mut remaining = self
+            .read
+            .listed
+            .iter()
+            .filter(|s| !matches!(self.sheets.get(s.name), Some(None)));
+        let Some(shown) = remaining
+            .clone()
+            .find(|s| Some(s.name) == wanted)
+            .or_else(|| remaining.next())
+            .copied()
+        else {
+            return Ok(ControlFlow::Break((
+                self.read.finish(paths, Vec::new(), self.targets),
+                self.whole,
+            )));
+        };
+
+        let missing = match self.sheets.get(shown.name).and_then(Option::as_ref) {
+            None => Some(shown),
+            Some(raw) => raw
+                .columns
+                .iter()
+                .filter(|c| c.group != Group::Linked)
+                .filter_map(|c| c.links.as_deref())
+                .find_map(|to| {
+                    if self.targets.contains_key(to) {
+                        return None;
+                    }
+                    self.read
+                        .listed
+                        .iter()
+                        .find(|s| !s.owned && s.name == to)
+                        .copied()
+                }),
+        };
+        if let Some(missing) = missing {
+            let (sheet, opened) = self.read.layout(&missing)?;
+            self.whole &= opened;
+            self.targets
+                .extend(self.read.targets(std::slice::from_ref(&sheet)));
+            self.sheets.insert(missing.name, Some(sheet));
+        } else if let Some(mut sheet) = self.sheets.get_mut(shown.name).and_then(Option::take) {
+            let mut related = rows::Targets::new();
+            for name in std::iter::once(sheet.name).chain(
+                sheet
+                    .columns
+                    .iter()
+                    .filter(|c| c.group != Group::Linked)
+                    .filter_map(|c| c.links.as_deref()),
+            ) {
+                if let Some((&name, named)) = self.targets.get_key_value(name) {
+                    let id = secondary.map_or(name, |family| sheet_id(family, name));
+                    related.insert(id, named.clone());
+                }
+            }
+            rows::name_references(std::slice::from_mut(&mut sheet), &self.targets);
+            if let Some(family) = secondary {
+                qualify_sheet(family, &mut sheet);
+            }
+            (opening.publish)(sheet, related);
         }
-    };
-    let by_operation: BTreeMap<[u8; 32], Author> = history
-        .iter()
-        .map(|entry| (entry.operation, author(entry)))
-        .collect();
-    let listed = listed(table);
-    // Who names each row, by the rule a retire of it is refused by, and the cells a new row's key
-    // is derived from: both as the read found the table.
-    let referrers = aterm_db::typed::check::referrers(table, &[], &view.cells);
-    let cells = std::sync::Arc::new(view.cells.clone());
-    let read = Read {
-        compiled,
-        table,
-        view,
-        now: past.as_ref().map(|_| &head),
-        history: &history,
-        by_operation: &by_operation,
-        macs: &macs,
-        names: &names,
-        listed: &listed,
-        since: &since,
-        referrers: &referrers,
-        cells: &cells,
-    };
-    let mut projections = BTreeMap::new();
-    for shown in listed.iter().filter(|shown| !shown.owned) {
-        let collection = compiled.collection(shown.name).map_err(|e| e.to_string())?;
-        let (projection, settled) = view.project_settled(collection);
-        projections.insert(
-            shown.name,
-            (collection, projection, std::sync::Arc::new(settled)),
+        Ok(ControlFlow::Continue(self))
+    }
+}
+
+/// Assemble families in rail order. A missing first family fails the read; a later one that
+/// cannot be read contributes its reason.
+#[cfg(unix)]
+fn combine(
+    mut families: impl Iterator<Item = (&'static Compiled, Result<(Snapshot, bool), String>)>,
+) -> Result<(Snapshot, bool), String> {
+    let (_, first) = families.next().ok_or(NO_FAMILY)?;
+    let (mut snapshot, mut whole) = first?;
+    let mut unread = Vec::new();
+    for (family, result) in families {
+        match result {
+            Ok((more, opened)) => {
+                whole &= opened;
+                if let Some(why) = merge(&mut snapshot, family, more) {
+                    unread.push(why);
+                }
+            }
+            Err(why) => unread.push(format!("{} could not be read: {why}", family.title)),
+        }
+    }
+    if !unread.is_empty() {
+        snapshot.refused = Some(
+            snapshot
+                .refused
+                .into_iter()
+                .chain(unread)
+                .collect::<Vec<_>>()
+                .join(". "),
         );
     }
-    let mut sheets = Vec::with_capacity(listed.len());
-    let mut whole = true;
-    for shown in &listed {
-        let collection = compiled.collection(shown.name).map_err(|e| e.to_string())?;
-        sheets.push(if shown.owned {
-            read.owned_sheet(shown, collection)
-        } else {
-            let (sheet, opened) = read.cells_sheet(&handle, shown, &projections)?;
-            whole &= opened;
-            sheet
-        });
-    }
-    // Each row a reference may name, and every reference shown as the words its row is known
-    // by: a link is chosen from rows and stored by key, never written by a label.
-    let targets = crate::native_tables::rows::targets(
-        &sheets,
-        |to, pk| names.words(to, pk).map(str::to_owned),
-        |to, pk| written_label(&projections, to, pk),
-        &held(table, view, &listed),
-    );
-    crate::native_tables::rows::name_references(&mut sheets, &targets);
-    let check = usage.map(|usage| Box::new(checked(paths, &handle, &head, &usage, &history)));
-    let cannot_write = handle.cannot_write(&head);
-    let snapshot = Snapshot {
-        listed,
-        sheets,
-        check,
-        at: at.map(|operation| AsOf {
-            operation,
-            by: by_operation.get(&operation).cloned(),
-        }),
-        read_ms: aterm_time::unix_millis().unwrap_or(0),
-        cannot_write,
-        targets,
-    };
     Ok((snapshot, whole))
+}
+
+/// The page's name for the sheet of `collection` of `family`, read after the first family: its
+/// role and the collection's name (`tracker.plan`), so two families' collections of one name
+/// (the registry's `plan` and the tracker's) are two sheets. Each name is made once and kept
+/// for the process's life; there are as many as the compiled families have collections.
+#[cfg(unix)]
+pub(crate) fn sheet_id(family: &Compiled, collection: &str) -> &'static str {
+    static IDS: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let id = format!("{}.{collection}", family.table.role);
+    let mut ids = IDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(held) = ids.get(id.as_str()) {
+        return held;
+    }
+    let held: &'static str = Box::leak(id.into_boxed_str());
+    ids.insert(held);
+    held
+}
+
+/// A collection of any generation of a later family, under its page-wide name.
+#[cfg(unix)]
+fn family_id(family: &'static Compiled, name: &str) -> Option<&'static str> {
+    family
+        .chain()
+        .into_iter()
+        .find_map(|generation| generation.table.collection(name))
+        .map(|collection| sheet_id(family, collection.name))
+}
+
+#[cfg(unix)]
+fn qualify_sheet(family: &'static Compiled, sheet: &mut Sheet) {
+    sheet.name = family_id(family, sheet.name).unwrap_or(sheet.name);
+    for column in &mut sheet.columns {
+        if let Some(links) = column.links.as_mut()
+            && let Some(to) = family_id(family, links)
+        {
+            to.clone_into(links);
+        }
+    }
+    for by in sheet.referrers.values_mut().flatten() {
+        by.sheet = family_id(family, by.sheet).unwrap_or(by.sheet);
+    }
+}
+
+/// Put `more`, a read of `family` after the first, into `into`: its rail lines, sheets and the
+/// rows its references name, each sheet under its own name ([`sheet_id`]) and each reference to
+/// a collection of `family` by that name; its check findings beside the first's, and what it
+/// holds and does not project, and why this Mac cannot write it where it cannot, said after the
+/// first's. What `family`'s Check could not work out, in words, where it could not.
+#[cfg(unix)]
+fn merge(into: &mut Snapshot, family: &'static Compiled, mut more: Snapshot) -> Option<String> {
+    let id = |name: &str| family_id(family, name);
+    for listed in &mut more.listed {
+        listed.name = id(listed.name).unwrap_or(listed.name);
+    }
+    for sheet in &mut more.sheets {
+        qualify_sheet(family, sheet);
+    }
+    // The page takes edits as the first family's writer; a later family this Mac cannot write
+    // says so, and a save to it is refused with why.
+    let cannot = more
+        .cannot_write
+        .map(|why| format!("{} cannot be written here: {why}", family.title));
+    into.listed.append(&mut more.listed);
+    into.sheets.append(&mut more.sheets);
+    into.targets.extend(
+        more.targets
+            .into_iter()
+            .map(|(name, named)| (id(name).unwrap_or(name), named)),
+    );
+    let said: Vec<String> = more
+        .refused
+        .map(|words| format!("{}: {words}", family.title))
+        .into_iter()
+        .chain(cannot)
+        .collect();
+    if !said.is_empty() {
+        into.refused = Some(
+            into.refused
+                .take()
+                .into_iter()
+                .chain(said)
+                .collect::<Vec<_>>()
+                .join(". "),
+        );
+    }
+    match (into.check.as_deref_mut(), more.check.map(|check| *check)) {
+        (Some(Ok(checked)), Some(Ok(found))) => {
+            checked
+                .findings
+                .extend(found.findings.into_iter().map(|mut finding| {
+                    if let Some(to) = id(&finding.collection) {
+                        to.clone_into(&mut finding.collection);
+                    }
+                    finding
+                }));
+            None
+        }
+        (_, Some(Err(why))) => Some(format!(
+            "{}'s check could not be worked out: {why}",
+            family.title
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+impl Read {
+    /// Read the family once. Every sheet, its writers, and its reference names share this point.
+    fn open(
+        paths: &Paths,
+        family: &'static Compiled,
+        at: Option<[u8; 32]>,
+        check: bool,
+    ) -> Result<Self, String> {
+        use aterm_db::alab::registry::{MACHINE, Names};
+        use aterm_db::att::{Handle, HistoryView, Point};
+        let handle = Handle::at(paths.clone(), family);
+        let compiled = handle.compiled();
+        let table = compiled.table;
+        // The grid and its provenance describe the same observation of the registry; where Check
+        // is shown, so does who holds the table's checkpoints back now.
+        let (observed, fence) = if check {
+            let now_ms = aterm_time::unix_millis().unwrap_or(0);
+            let (observed, fence) = handle
+                .view_with_history_fenced(now_ms)
+                .map_err(|e| e.to_string())?;
+            (observed, Some(fence))
+        } else {
+            (handle.view_with_history().map_err(|e| e.to_string())?, None)
+        };
+        let HistoryView {
+            view: head,
+            usage,
+            entries: history,
+            macs,
+            machines,
+        } = observed;
+        let past = match at {
+            Some(at) => Some(handle.view_at(Point::At(at)).map_err(|e| e.to_string())?),
+            None => None,
+        };
+        let since = match at {
+            Some(at) => {
+                handle
+                    .diff(at, Point::Head)
+                    .map_err(|e| e.to_string())?
+                    .cells
+            }
+            None => Vec::new(),
+        };
+        let author = |entry: &aterm_db::att::Entry| -> Author {
+            let (label, id) = named(&entry.mac);
+            Author {
+                kind: match entry.kind {
+                    aterm_db::att::EntryKind::Aterm => AuthorKind::Aterm,
+                    aterm_db::att::EntryKind::Import => AuthorKind::Import,
+                    aterm_db::att::EntryKind::Explicit => AuthorKind::Explicit,
+                },
+                label,
+                id,
+                at_ms: entry.authored_ms,
+                hlc: (entry.hlc.ms, entry.hlc.counter),
+                said: entry.said.clone(),
+            }
+        };
+        let mut by_operation = BTreeMap::new();
+        let mut by_collection: BTreeMap<_, Vec<usize>> = table
+            .collections
+            .iter()
+            .map(|collection| (collection.name, Vec::new()))
+            .collect();
+        for (index, entry) in history.iter().enumerate() {
+            by_operation.insert(entry.operation, author(entry));
+            for change in &entry.changes {
+                if let Some(entries) = by_collection.get_mut(change.collection.as_str())
+                    && entries.last() != Some(&index)
+                {
+                    entries.push(index);
+                }
+            }
+        }
+        let (view, now) = match past {
+            Some(past) => (past, Some(head)),
+            None => (head, None),
+        };
+        let listed = family_listed(compiled);
+        // Who names each row, by the rule a retire of it is refused by, and the cells a new row's key
+        // is derived from: both as the read found the table.
+        let referrers = aterm_db::typed::check::referrers(table, &[], &view.cells);
+        let cells = std::sync::Arc::new(view.cells.clone());
+        // History already settled the head's machine rows to name its writers. A past grid
+        // needs its own rows; its writers still use the head's bindings.
+        let mut head_machines = Some(machines);
+        let mut projections = BTreeMap::new();
+        for shown in listed.iter().filter(|shown| !shown.owned) {
+            let collection = compiled.collection(shown.name).map_err(|e| e.to_string())?;
+            let (projection, settled) = head_machines
+                .take_if(|_| now.is_none() && collection.name == MACHINE.name)
+                .unwrap_or_else(|| view.project_settled(collection));
+            projections.insert(
+                shown.name,
+                (collection, projection, std::sync::Arc::new(settled)),
+            );
+        }
+        let registry_rows = registry(compiled).then(|| RegistryRows {
+            names: Names::with_projections(table, now.as_ref().unwrap_or(&view), |name| {
+                if now.is_none() {
+                    projections.get(name).map(|(_, rows, _)| rows)
+                } else if name == MACHINE.name {
+                    head_machines.as_ref().map(|(rows, _)| rows)
+                } else {
+                    None
+                }
+            }),
+            held: held(table, &view, &listed),
+        });
+        Ok(Self {
+            compiled,
+            registry: registry_rows,
+            table,
+            handle,
+            view,
+            now,
+            by_collection,
+            by_operation,
+            history,
+            macs,
+            listed,
+            since,
+            referrers,
+            cells,
+            projections,
+            usage,
+            fence: fence.map(|f| aterm_db::att::command::fence_lines(&f)),
+            at,
+        })
+    }
+
+    /// Lay out one sheet before replacing reference keys with their display names.
+    fn layout(&self, shown: &Listed) -> Result<(Sheet, bool), String> {
+        if shown.owned {
+            let collection = self
+                .compiled
+                .collection(shown.name)
+                .map_err(|e| e.to_string())?;
+            Ok((self.owned_sheet(shown, collection), true))
+        } else {
+            self.cells_sheet(&self.handle, shown, &self.projections)
+        }
+    }
+
+    fn registry_name(&self, to: &str, pk: &str) -> Option<&str> {
+        self.registry.as_ref()?.names.words(to, pk)
+    }
+
+    fn targets(&self, raw: &[Sheet]) -> rows::Targets {
+        rows::targets(
+            raw,
+            |to, pk| self.registry_name(to, pk).map(str::to_owned),
+            |to, pk| written_label(&self.projections, to, pk),
+            self.registry.as_ref().map(|rows| &rows.held),
+        )
+    }
+
+    /// The atomic read used for refresh, Check and as-of.
+    fn all(self, paths: &Paths) -> Result<(Snapshot, bool), String> {
+        let mut sheets = Vec::with_capacity(self.listed.len());
+        let mut whole = true;
+        for shown in &self.listed {
+            let (sheet, opened) = self.layout(shown)?;
+            sheets.push(sheet);
+            whole &= opened;
+        }
+        let targets = self.targets(&sheets);
+        rows::name_references(&mut sheets, &targets);
+        Ok((self.finish(paths, sheets, targets), whole))
+    }
+
+    fn finish(self, paths: &Paths, sheets: Vec<Sheet>, targets: rows::Targets) -> Snapshot {
+        let head = self.now.as_ref().unwrap_or(&self.view);
+        let check = self.fence.map(|fence| {
+            Box::new(checked(
+                paths,
+                &self.handle,
+                head,
+                &self.usage,
+                &self.history,
+                fence,
+            ))
+        });
+        let cannot_write = self.handle.cannot_write(head);
+        Snapshot {
+            listed: self.listed,
+            sheets,
+            check,
+            at: self.at.map(|operation| AsOf {
+                operation,
+                by: self.by_operation.get(&operation).cloned(),
+            }),
+            read_ms: aterm_time::unix_millis().unwrap_or(0),
+            cannot_write,
+            refused: self.view.refused_words(),
+            targets,
+        }
+    }
 }
 
 /// The label row `pk` of collection `to` was written under, where `to` claims its labels
@@ -545,11 +1055,13 @@ fn held(
     held
 }
 
-/// What Check shows of the registry `handle` reads at `paths`, as `head` and its `usage` hold
-/// it: each finding `aterm db alab check` reports, apart from this Mac's registration preview
-/// (which reads this Mac's own probe), read as the verbs' `--tsv` form reads it
-/// ([`aterm_db::att::command::line`]); and the store's state, `history` counting the Macs that
-/// wrote it.
+/// What Check shows of the table `handle` reads at `paths`, as `head` and its `usage` hold it:
+/// of the registry each finding `aterm db alab check` reports, apart from this Mac's
+/// registration preview (which reads this Mac's own probe), and of any other family each
+/// `aterm db table check` reports (`aterm_db::att::command::check`), read as the verbs' `--tsv`
+/// form reads it ([`aterm_db::att::command::line`]); and the store's state, `history` counting
+/// the Macs that wrote it and `fence` saying who holds its checkpoints back
+/// ([`aterm_db::att::command::fence_lines`], the words `aterm db table check --fence` says).
 ///
 /// # Errors
 /// The registry's members or its phone table cannot be read: the page says so in the view.
@@ -560,18 +1072,26 @@ fn checked(
     head: &aterm_db::att::View,
     usage: &aterm_db::att::Usage,
     history: &[aterm_db::att::Entry],
+    fence: Vec<String>,
 ) -> Result<crate::native_tables_check::Checked, String> {
     use crate::native_tables_check::{Checked, Found, Store};
     use aterm_db::att::{CAPS, command};
-    let found =
-        aterm_db::alab::command::checked(paths, handle, head, usage).map_err(|e| e.to_string())?;
-    let lines: Vec<command::Line> =
+    let compiled = handle.compiled();
+    let lines: Vec<command::Line> = if registry(compiled) {
+        let found = aterm_db::alab::command::checked(paths, handle, head, usage)
+            .map_err(|e| e.to_string())?;
         aterm_db::alab::command::lab_json(&found.lab, &found.seen, &found.duplicates)
             .iter()
             .chain(&found.findings)
             .map(command::line)
-            .collect();
-    let compiled = handle.compiled();
+            .collect()
+    } else {
+        command::check(compiled, head, usage)
+            .get("findings")
+            .and_then(aterm_json::Value::as_array)
+            .map(|findings| findings.iter().map(command::line).collect())
+            .unwrap_or_default()
+    };
     let roll = lines
         .iter()
         .find(|line| line.kind == "roll")
@@ -604,6 +1124,7 @@ fn checked(
         table: compiled.name(),
         writers: writers.len(),
         roll,
+        fence,
     };
     Ok(Checked {
         findings: lines
@@ -621,24 +1142,50 @@ fn checked(
     })
 }
 
-/// What one read of the registry holds, which each sheet is laid out from.
+/// Whether `compiled` is a generation of the registry, whose own rules (who adds a row, which
+/// columns only a verb sets, which keys are made at random, `aterm db alab check`) the page
+/// follows on its sheets alone: judged by the table's name, since a constant has no one address.
 #[cfg(unix)]
-struct Read<'a> {
+fn registry(compiled: &Compiled) -> bool {
+    aterm_db::att::REGISTRY
+        .chain()
+        .into_iter()
+        .any(|generation| {
+            (generation.table.application, generation.table.role)
+                == (compiled.table.application, compiled.table.role)
+        })
+}
+
+/// Fleet-specific reference names and the registry rows held by a machine.
+#[cfg(unix)]
+struct RegistryRows {
+    names: aterm_db::alab::registry::Names,
+    held: std::collections::BTreeSet<(&'static str, String)>,
+}
+
+/// What one read of a family holds, which each sheet is laid out from.
+#[cfg(unix)]
+struct Read {
     compiled: &'static Compiled,
+    registry: Option<RegistryRows>,
     table: &'static Table,
-    view: &'a aterm_db::typed::View,
-    /// The head, where `view` is a past table: what its cells hold now.
-    now: Option<&'a aterm_db::typed::View>,
-    history: &'a [aterm_db::att::Entry],
-    by_operation: &'a BTreeMap<[u8; 32], Author>,
-    macs: &'a aterm_db::att::Macs,
-    names: &'a aterm_db::alab::registry::Names,
-    listed: &'a [Listed],
-    since: &'a [aterm_db::att::CellDiff],
-    /// The live rows that name each row, by collection and key
-    /// ([`aterm_db::typed::check::referrers`]).
-    referrers: &'a BTreeMap<(&'static str, String), Vec<(&'static str, String)>>,
-    cells: &'a std::sync::Arc<aterm_db::typed::cell::Cells>,
+    handle: aterm_db::att::Handle,
+    view: aterm_db::typed::View,
+    /// The head when reading a past point.
+    now: Option<aterm_db::typed::View>,
+    history: Vec<Entry>,
+    by_collection: BTreeMap<&'static str, Vec<usize>>,
+    by_operation: BTreeMap<[u8; 32], Author>,
+    macs: aterm_db::att::Macs,
+    listed: Vec<Listed>,
+    since: Vec<aterm_db::att::CellDiff>,
+    /// Who names each row by the rule that guards its retirement.
+    referrers: BTreeMap<(&'static str, String), Vec<(&'static str, String)>>,
+    cells: std::sync::Arc<aterm_db::typed::cell::Cells>,
+    projections: Projections,
+    usage: aterm_db::att::Usage,
+    fence: Option<Vec<String>>,
+    at: Option<[u8; 32]>,
 }
 
 /// The cells collections' projections, by name, each with how its claimed columns settled.
@@ -653,7 +1200,14 @@ type Projections = BTreeMap<
 >;
 
 #[cfg(unix)]
-impl Read<'_> {
+impl Read {
+    /// The operations touching this collection, once each in the family's causal order.
+    fn history_of(&self, collection: &Collection) -> impl Iterator<Item = &Entry> {
+        self.by_collection[collection.name]
+            .iter()
+            .map(|&index| &self.history[index])
+    }
+
     /// The writer of an owned row: the Mac that signed it, whose own statement it is.
     fn mac_author(&self, row: &aterm_db::typed::owned::OwnedRow) -> Author {
         let mut by = self
@@ -668,6 +1222,7 @@ impl Read<'_> {
                     id,
                     at_ms: 0,
                     hlc: (0, 0),
+                    said: None,
                 }
             });
         by.kind = AuthorKind::Aterm;
@@ -714,10 +1269,9 @@ impl Read<'_> {
                 return String::new();
             };
             match (target(&column.ty), value.as_str()) {
-                (Some(to), Some(pk)) => self
-                    .names
-                    .words(to, pk)
-                    .map_or_else(|| pk.to_owned(), str::to_owned),
+                // History includes records later than an as-of read, whose referenced row
+                // may exist only at the head. Use its registry name where the head has one.
+                (Some(to), Some(pk)) => self.registry_name(to, pk).unwrap_or(pk).to_owned(),
                 _ => stamp(&column.ty, value).unwrap_or_else(|| grid::show(&column.ty, value)),
             }
         };
@@ -765,7 +1319,7 @@ impl Read<'_> {
         // row whole, so a column it stated again unchanged is no change.
         let mut last: BTreeMap<&str, BTreeMap<&str, String>> = BTreeMap::new();
         let mut written = Vec::new();
-        for entry in self.history {
+        for entry in self.history_of(collection) {
             let mut changed = Vec::new();
             for change in entry
                 .changes
@@ -914,12 +1468,15 @@ impl Read<'_> {
         let (opened, whole) =
             aterm_db::att::open_every_ordinary(handle, collection, &self.view.cells)
                 .unwrap_or_default();
-        let export = self
-            .view
-            .export_grid(self.table, collection, &[])
-            .map_err(|e| e.to_string())?
-            .showing(&opened);
-        let base = export.base;
+        let mut base = Base::from_projection(
+            self.table,
+            self.view.collection(collection),
+            &self.view.cells,
+            projection,
+            &[],
+        )
+        .map_err(|e| e.to_string())?;
+        base.show_opened(&opened);
         let mut columns: Vec<SheetColumn> = base
             .header
             .iter()
@@ -1143,7 +1700,7 @@ impl Read<'_> {
             });
         }
         let mut written = Vec::new();
-        for entry in self.history {
+        for entry in self.history_of(collection) {
             let mut changed = Vec::new();
             for change in entry.changes.iter().filter(|c| c.collection == name) {
                 let Ok(key) = aterm_db::typed::cell::CellKey::parse(&change.key) else {
@@ -1202,7 +1759,7 @@ impl Read<'_> {
         // In a past table, a sealed number changed since reads as the grid at Now shows it:
         // opened as the head's cells open here. One that does not open leaves the read not
         // whole, as a number of the table shown does.
-        let (opened_now, whole_now) = self.now.map_or_else(
+        let (opened_now, whole_now) = self.now.as_ref().map_or_else(
             || (grid::Opened::new(), true),
             |head| {
                 aterm_db::att::open_every_ordinary(handle, collection, &head.cells)
@@ -1218,7 +1775,7 @@ impl Read<'_> {
             columns,
             rows,
             written,
-            since: since_then(collection, self.since, &opened_now, self.by_operation),
+            since: since_then(collection, &self.since, &opened_now, &self.by_operation),
             observed: self.observed(name, collection),
             base,
             schema: Some(Schema {
@@ -1250,14 +1807,22 @@ impl Read<'_> {
             }
             if !header.starts_with(grid::READ_ONLY) {
                 born_columns.push(name.to_owned());
-            } else if let Some(verb) = aterm_db::alab::registry::set_by(collection.name, name) {
+            } else if let Some(verb) = self
+                .registry
+                .as_ref()
+                .and_then(|_| aterm_db::alab::registry::set_by(collection.name, name))
+            {
                 set_by.push((name.to_owned(), verb));
             }
         }
         Some(RowLife {
             words: lifecycle.words,
             ends: lifecycle.ends,
-            born_elsewhere: aterm_db::alab::registry::born_elsewhere(collection.name),
+            // Another family's rows are born as its own birth rule keys them, through the grid.
+            born_elsewhere: self
+                .registry
+                .as_ref()
+                .and_then(|_| aterm_db::alab::registry::born_elsewhere(collection.name)),
             born_columns,
             set_by,
         })
@@ -1478,7 +2043,10 @@ pub(crate) fn refusals(sheet: &Sheet, staged: &BTreeMap<(String, String), String
         &born,
     ) {
         // A key made at random as the row is written (a phone's) is not this one.
-        Ok(_) if aterm_db::alab::registry::born_at_random(schema.collection.name) => {
+        Ok(_)
+            if registry(schema.compiled)
+                && aterm_db::alab::registry::born_at_random(schema.collection.name) =>
+        {
             Reading::default()
         }
         Ok(plan) => Reading {
@@ -1517,7 +2085,7 @@ fn carried(schema: &Schema, plan: &grid::Plan) -> Option<BTreeMap<(String, Strin
     Some(out)
 }
 
-/// No registry is read here, so nothing is staged to check.
+/// No table is read here, so nothing is staged to check.
 #[cfg(not(unix))]
 pub(crate) fn refusals(
     _: &crate::native_tables::Sheet,
@@ -1526,18 +2094,28 @@ pub(crate) fn refusals(
     Reading::default()
 }
 
-/// Write each collection's staged cells and new rows, each collection in one save.
+/// Write each collection's staged cells and new rows, each collection in one save of the family
+/// its sheet was read from, which that family's own rules judge (`aterm_db::att::Compiled::rules`):
+/// a save they refuse is refused in their words. What comes back names each table by its sheet.
 ///
 /// # Errors
-/// A save could not reach the registry (no Commons writer, an incomplete history here, a busy
-/// store past the deadline).
+/// None today: a save that cannot reach its table (no Commons writer, an incomplete history
+/// here, a busy store past the deadline) is named in [`Wrote::failed`] and the rest are still
+/// written.
 #[cfg(unix)]
 pub(crate) fn write(paths: &Paths, staged: Vec<Staged>) -> Result<Wrote, String> {
-    use aterm_db::att::{Handle, REGISTRY, Saved};
-    let handle = Handle::at(paths.clone(), &REGISTRY);
+    use aterm_db::att::{Handle, Saved};
     let mut wrote = Wrote::default();
-    for Staged { base, cells, born } in staged {
+    for Staged {
+        sheet,
+        compiled,
+        base,
+        cells,
+        born,
+    } in staged
+    {
         let (text, keys) = text_of(&base, &cells, &born);
+        let handle = Handle::at(paths.clone(), compiled);
         // A table that cannot be saved is named and the rest are still written.
         let saved = handle
             .compiled()
@@ -1546,9 +2124,7 @@ pub(crate) fn write(paths: &Paths, staged: Vec<Staged>) -> Result<Wrote, String>
         let saved = match saved {
             Ok(saved) => saved,
             Err(why) => {
-                wrote
-                    .failed
-                    .push((base.collection.clone(), why.to_string()));
+                wrote.failed.push((sheet.to_owned(), why.to_string()));
                 continue;
             }
         };
@@ -1560,20 +2136,18 @@ pub(crate) fn write(paths: &Paths, staged: Vec<Staged>) -> Result<Wrote, String>
                 wrote.born.extend(
                     keys.iter()
                         .zip(&plan.born)
-                        .map(|(new, pk)| (base.collection.clone(), new.clone(), pk.clone())),
+                        .map(|(new, pk)| (sheet.to_owned(), new.clone(), pk.clone())),
                 );
                 wrote.kept.extend(
                     applied
                         .stale
                         .into_iter()
-                        .map(|s| (base.collection.clone(), s.pk, s.column)),
+                        .map(|s| (sheet.to_owned(), s.pk, s.column)),
                 );
             }
             Saved::Problems(problems) => {
                 for ((pk, column), rule) in placed(&base, &keys, problems) {
-                    wrote
-                        .refused
-                        .push((base.collection.clone(), pk, column, rule));
+                    wrote.refused.push((sheet.to_owned(), pk, column, rule));
                 }
             }
         }
@@ -1658,6 +2232,7 @@ fn logged(table: &Table, entry: &aterm_db::att::Entry) -> Logged {
             id,
             at_ms: entry.authored_ms,
             hlc: (entry.hlc.ms, entry.hlc.counter),
+            said: entry.said.clone(),
         },
         machine: entry.mac.row().map(str::to_owned),
         inert: entry.inert.is_some(),
@@ -1669,18 +2244,22 @@ fn logged(table: &Table, entry: &aterm_db::att::Entry) -> Logged {
     }
 }
 
-/// What History's reader keeps between its reads ([`history`]): the registry's ordered history at
-/// one revision, so a page at that revision reads no record again. One revision of one table,
-/// replaced when the registry moves; the reader holds it for as long as it reads.
+/// What the page's reader keeps between its reads: for History ([`history`]), the registry's
+/// ordered history at one revision, so a page at that revision reads no record again (one
+/// revision of one table, replaced when the registry moves); and for History and the change
+/// check both ([`mark`]), what the last open of the registry read of its files, so either learns
+/// the registry unmoved without opening it. A reader that never reads History keeps only the
+/// second, which holds no record. The reader holds it for as long as it reads.
 #[cfg(unix)]
 pub(crate) type Kept = aterm_db::att::Kept;
 
-/// Where the registry is not kept, History reads nothing to keep.
+/// Where the registry is not kept, the reader reads nothing to keep.
 #[cfg(not(unix))]
 #[derive(Debug, Default)]
 pub(crate) struct Kept;
 
-/// One page of History ([`crate::native_tables::Asked`]): the registry's records newest first,
+/// One page of History ([`crate::native_tables::Asked`]): the first family's records (the
+/// registry's) newest first,
 /// at least `asked.limit` of those its filters keep where so many are left, read a page at a time
 /// (`aterm_db::att::Handle::history_page`, newest first). The table and kind filters are the
 /// store's; where a machine or Find is asked, the records the store serves are judged here,
@@ -1697,11 +2276,16 @@ pub(crate) struct Kept;
 /// # Errors
 /// As [`read`].
 #[cfg(unix)]
-pub(crate) fn history(paths: &Paths, asked: &Asked, kept: &mut Kept) -> Result<Paged, String> {
+pub(crate) fn history(
+    paths: &Paths,
+    families: &[&'static Compiled],
+    asked: &Asked,
+    kept: &mut Kept,
+) -> Result<Paged, String> {
     use crate::native_tables::{SCAN, place_words, words_of};
     use aterm_db::att::history::{Ask, Cursor, Filter, Revision};
-    use aterm_db::att::{Handle, Hlc, REGISTRY};
-    let handle = Handle::at(paths.clone(), &REGISTRY);
+    use aterm_db::att::{Handle, Hlc};
+    let handle = Handle::at(paths.clone(), families.first().ok_or(NO_FAMILY)?);
     let table = handle.compiled().table;
     let tables = history_tables(table);
     let title = |name: &str| {
@@ -1819,7 +2403,8 @@ pub(crate) fn history_tables(table: &Table) -> Vec<(String, String)> {
     tables
 }
 
-/// What record `operation` of the registry wrote, opened for History: each cell with what it
+/// What record `operation` of the first family (the registry) wrote, opened for History: each
+/// cell with what it
 /// wrote, what that replaced, the writes beside it it had not seen and what has written there
 /// since (`aterm_db::att::Handle::wrote_named`), each value as the grid shows it and each writer
 /// by its machine's name.
@@ -1827,9 +2412,13 @@ pub(crate) fn history_tables(table: &Table) -> Vec<(String, String)> {
 /// # Errors
 /// As [`read`]; or this machine holds no such eligible record.
 #[cfg(unix)]
-pub(crate) fn record(paths: &Paths, operation: [u8; 32]) -> Result<Opened, String> {
-    use aterm_db::att::{Handle, REGISTRY};
-    let handle = Handle::at(paths.clone(), &REGISTRY);
+pub(crate) fn record(
+    paths: &Paths,
+    families: &[&'static Compiled],
+    operation: [u8; 32],
+) -> Result<Opened, String> {
+    use aterm_db::att::Handle;
+    let handle = Handle::at(paths.clone(), families.first().ok_or(NO_FAMILY)?);
     let table = handle.compiled().table;
     let (wrote, macs) = handle.wrote_named(operation).map_err(|e| e.to_string())?;
     let cells = wrote
@@ -1970,38 +2559,72 @@ pub(crate) fn live() -> Result<Paths, String> {
 
 #[cfg(all(not(unix), not(test)))]
 pub(crate) fn live() -> Result<Paths, String> {
-    Err("the registry is kept on macOS and Linux".into())
+    Err(NOT_KEPT.into())
 }
 
-/// What a read of the registry rests on, read without opening a payload: the table's revision
-/// (`aterm_db::att::Handle::revision`), which covers the facts and machine rows that name its
-/// writers. Two reads at one point under one mark show the same page, so the page's reader
-/// reads again only once the mark moves.
+/// What a read of the page's families rests on, read without opening a payload: each table's
+/// revision, the first family's asked through what the page's reader keeps
+/// (`aterm_db::att::Handle::revision_kept`), each later one's opened
+/// (`aterm_db::att::Handle::revision`); a revision covers the facts and machine rows that name
+/// its writers. Two reads at one point under one mark show the same page, so the page's reader
+/// reads again only once the mark moves: a write to any family moves it.
 #[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Mark {
+    /// The first family's revision.
     revision: aterm_db::att::Revision,
+    /// Each later family's, `None` where it cannot be read here.
+    others: Vec<Option<aterm_db::att::Revision>>,
 }
 
 #[cfg(unix)]
 impl Mark {
-    /// The registry's revision this mark is of, as History's pages name theirs.
+    /// The first family's revision this mark is of (the registry's), as History's pages name
+    /// theirs.
     pub(crate) const fn digest(&self) -> [u8; 32] {
         self.revision.0
     }
 }
 
-/// [`Mark`] of the registry at `paths`.
+/// [`Mark`] of `families` at `paths`, asked by a reader that keeps `kept` between its reads:
+/// while the first family's table stands as the last open made with `kept` read it (this mark's
+/// or a History page's, [`history`]), every byte of its files a read takes, its custody and its
+/// membership the same, its revision is that open's and it is not opened; anywhere else it is
+/// opened, and `kept` keeps what that open read. Each later family is opened for its revision.
+/// It reads no record's payload and keeps no History.
 ///
 /// # Errors
 /// As [`read`].
 #[cfg(unix)]
-pub(crate) fn mark(paths: &Paths) -> Result<Mark, String> {
-    use aterm_db::att::{Handle, REGISTRY};
-    let revision = Handle::at(paths.clone(), &REGISTRY)
-        .revision()
+pub(crate) fn mark(
+    paths: &Paths,
+    families: &[&'static Compiled],
+    kept: &mut Kept,
+) -> Result<Mark, String> {
+    use aterm_db::att::Handle;
+    let (first, rest) = families.split_first().ok_or(NO_FAMILY)?;
+    let revision = Handle::at(paths.clone(), first)
+        .revision_kept(kept)
         .map_err(|e| e.to_string())?;
-    Ok(Mark { revision })
+    let others = rest
+        .iter()
+        .map(|family| Handle::at(paths.clone(), family).revision().ok())
+        .collect();
+    Ok(Mark { revision, others })
+}
+
+/// What Check's sentences on the registry's checkpoints rest on beside the registry itself:
+/// this Mac's hearing ledger as its file stands ([`aterm_db::att::ledger_mark`]).
+/// The page's reader reads again once it moves while Check is shown, since nothing of it moves
+/// the registry's [`Mark`].
+#[cfg(unix)]
+pub(crate) fn fence_mark(paths: &Paths) -> Option<[u8; 32]> {
+    aterm_db::att::ledger_mark(paths)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn fence_mark(_: &Paths) -> Option<[u8; 32]> {
+    None
 }
 
 #[cfg(not(unix))]
@@ -2016,28 +2639,47 @@ impl Mark {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn mark(_: &Paths) -> Result<Mark, String> {
-    Err("the registry is kept on macOS and Linux".into())
+pub(crate) fn mark(_: &Paths, _: &[&'static Compiled], _: &mut Kept) -> Result<Mark, String> {
+    Err(NOT_KEPT.into())
 }
 
 #[cfg(not(unix))]
-pub(crate) fn read(_: &Paths, _: Option<[u8; 32]>, _: bool) -> Result<(Snapshot, bool), String> {
-    Err("the registry is kept on macOS and Linux".into())
+pub(crate) fn read(
+    _: &Paths,
+    _: &[&'static Compiled],
+    _: Option<[u8; 32]>,
+    _: bool,
+) -> Result<(Snapshot, bool), String> {
+    Err(NOT_KEPT.into())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_opening(
+    _: &Paths,
+    _: &[&'static Compiled],
+    _: &mut Opening<'_>,
+) -> Result<(Snapshot, bool), String> {
+    Err(NOT_KEPT.into())
 }
 
 #[cfg(not(unix))]
 pub(crate) fn write(_: &Paths, _: Vec<Staged>) -> Result<Wrote, String> {
-    Err("the registry is kept on macOS and Linux".into())
+    Err(NOT_KEPT.into())
 }
 
 #[cfg(not(unix))]
-pub(crate) fn history(_: &Paths, _: &Asked, _: &mut Kept) -> Result<Paged, String> {
-    Err("the registry is kept on macOS and Linux".into())
+pub(crate) fn history(
+    _: &Paths,
+    _: &[&'static Compiled],
+    _: &Asked,
+    _: &mut Kept,
+) -> Result<Paged, String> {
+    Err(NOT_KEPT.into())
 }
 
 #[cfg(not(unix))]
-pub(crate) fn record(_: &Paths, _: [u8; 32]) -> Result<Opened, String> {
-    Err("the registry is kept on macOS and Linux".into())
+pub(crate) fn record(_: &Paths, _: &[&'static Compiled], _: [u8; 32]) -> Result<Opened, String> {
+    Err(NOT_KEPT.into())
 }
 
 #[cfg(all(test, unix))]

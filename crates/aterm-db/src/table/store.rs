@@ -44,6 +44,14 @@ pub(super) mod cutoff;
 pub(crate) use cutoff::Signing;
 #[cfg(unix)]
 pub use cutoff::cut_removed_writer;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "LT-E40's state open reads the run files; until then only their tests do"
+    )
+)]
+mod derived;
 mod directory;
 #[cfg(test)]
 mod enrollment_tests;
@@ -73,8 +81,12 @@ mod recovery_tests;
 mod replay;
 mod replay_index;
 mod replicas;
+mod sighting;
 mod witness;
 use replay_index::ReplayIndex;
+pub(crate) use sighting::Sighting;
+#[cfg(test)]
+pub(crate) use sighting::{permit_group, test_sightings};
 use witness::Witness;
 
 pub(crate) use held::claim_dirs;
@@ -127,6 +139,90 @@ thread_local! {
     /// written (a checkpoint group's once its permit is durable): an append whose outcome is
     /// uncertain.
     pub(crate) static APPEND_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Why [`Store::admit_table`] refuses a record past the table's quota.
+const TABLE_FULL_REASON: &str = "table operation capacity exhausted; conflict space is reserved";
+
+/// Why [`Store::admit_writer`] refuses a record past one writer's quota.
+const WRITER_FULL_REASON: &str = "table writer evidence quota exhausted";
+
+/// How [`TABLE_REFUSES`] refuses a record.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The capacity refusal a table that holds `MAX_RECORDS` operations gives.
+    Full,
+    /// The capacity refusal a writer that holds its `WRITER_RECORDS` gives.
+    WriterFull,
+    /// A refusal at the same place that is not a capacity.
+    Otherwise,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// While set, a record this thread's stores would take anew (an append or an ingest) past
+    /// the first so many is refused so, where [`Store::admit_table`] or [`Store::admit_writer`]
+    /// refuses one past its quota, with nothing written; what an open replays is admitted as ever.
+    static TABLE_REFUSES: std::cell::Cell<Option<(Refusal, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`TABLE_REFUSES`]'s refusal of `records` more records, where it is set and admits fewer;
+/// where it admits them and `take`, it admits that many fewer after.
+#[cfg(test)]
+fn table_full(records: usize, take: bool) -> Result<()> {
+    let Some((refusal, admits)) = TABLE_REFUSES.with(std::cell::Cell::get) else {
+        return Ok(());
+    };
+    if let Some(left) = admits.checked_sub(records) {
+        if take {
+            TABLE_REFUSES.with(|refuses| refuses.set(Some((refusal, left))));
+        }
+        return Ok(());
+    }
+    match refusal {
+        Refusal::Full => Err(Error::capacity(
+            crate::CapacityBound::Table,
+            TABLE_FULL_REASON,
+        )),
+        Refusal::WriterFull => Err(Error::capacity(
+            crate::CapacityBound::Writer,
+            WRITER_FULL_REASON,
+        )),
+        Refusal::Otherwise => Err(Error::new("table refused the record otherwise")),
+    }
+}
+
+/// `run`, with every record this thread's stores would take anew past the first `admits`
+/// refused as `refusal` says ([`TABLE_REFUSES`]).
+#[cfg(test)]
+pub(crate) fn with_table_refusing_after<T>(
+    refusal: Refusal,
+    admits: usize,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TABLE_REFUSES.with(|refuses| refuses.set(None));
+        }
+    }
+    TABLE_REFUSES.with(|refuses| refuses.set(Some((refusal, admits))));
+    let _reset = Reset;
+    run()
+}
+
+/// `run`, with every record this thread's stores would take anew refused as `refusal` says.
+#[cfg(test)]
+pub(crate) fn with_table_refusing<T>(refusal: Refusal, run: impl FnOnce() -> T) -> T {
+    with_table_refusing_after(refusal, 0, run)
+}
+
+/// `run`, with every table on this thread at its operation quota.
+#[cfg(test)]
+pub(crate) fn with_table_full<T>(run: impl FnOnce() -> T) -> T {
+    with_table_refusing(Refusal::Full, run)
 }
 
 #[cfg(test)]
@@ -710,6 +806,13 @@ pub struct Store {
     /// Set for a held read of a displaced table alone ([`Self::observe_displaced`]): what its
     /// checks hold in place of the claim's hold on its data folder.
     displaced: Option<Displaced>,
+    /// The files beside the claim and the journal prefix an observing open read them as, which
+    /// its revision names ([`Self::revision`]); none for a writer's store, whose appends move
+    /// them, and for a store a reopen kept ([`kept`]), which does not read them all again.
+    files: Option<sighting::Files>,
+    /// The verdict of each class this store's records were classified under, where its open
+    /// recorded them ([`Self::observe_if_exists_sighted`]): what a [`Sighting`] of it keeps.
+    classified: Option<kept::Classes>,
 }
 
 /// One writer's records in a [`Store`]: how many, and their wire bytes together.
@@ -1509,7 +1612,9 @@ impl Store {
     /// [`Self::open_claimed`], recording into `recorded`, where given, each replayed record's
     /// class and its verdict ([`crate::table::Verdict`]) in the replay's own read batch, and an
     /// observer's read of its journal: what a store kept across sessions ([`kept`]) holds its
-    /// records' classification under, and reopens from.
+    /// records' classification under, and reopens from. An open that records for a sighting
+    /// alone ([`kept::Recorded::aside`]) records the verdicts beside the batch and no journal
+    /// read: it verifies what [`Self::open_claimed`] verifies.
     ///
     /// # Errors
     /// As [`Self::open_claimed`].
@@ -1556,26 +1661,40 @@ impl Store {
         let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
         // The floor is read before replay, whose quota checks count from it, and confirmed
         // after it.
-        let floor = if pending {
-            None
+        let (floor, floor_bytes) = if pending {
+            (None, None)
         } else {
-            floor::read(&claim_dir, &claim_name, &claim)?.map(floor::Floor::new)
+            match floor::read(&claim_dir, &claim_name, &claim)? {
+                Some((body, bytes)) => (Some(floor::Floor::new(body)), Some(bytes)),
+                None => (None, None),
+            }
         };
         // A writing open's pending group permit: whether one stood past the acknowledged witness
         // when replay read the log. An observer never acts on one.
-        let (log, replay, permitted) = if read_only {
+        let (log, replay, permitted, files) = if read_only {
             // Read physical facts before their group permission: a newly observed checkpoint
             // must not be judged under a permit snapshot taken before that group began.
             let journal = journals::read(dir, &claim[..ANCHOR_LEN], capacity.journal())?;
-            if let Some(recorded) = recorded.as_deref_mut() {
+            if let Some(recorded) = recorded.as_deref_mut()
+                && !recorded.aside
+            {
                 recorded.journal = journal.held();
             }
-            let boundary = if pending {
-                acknowledged.into()
+            let (boundary, group) = if pending {
+                (acknowledged.into(), None)
             } else {
-                group::read(&claim_dir, &claim_name, &claim)?
+                group::read_with_bytes(&claim_dir, &claim_name, &claim)?
             };
-            (None, journal.witnessed(boundary)?, false)
+            // A pending claim names no files a revision is read from: its open refuses below.
+            let files = journal
+                .prefix()
+                .filter(|_| !pending)
+                .map(|prefix| sighting::Files {
+                    journal: prefix.clone(),
+                    floor: floor_bytes,
+                    group,
+                });
+            (None, journal.witnessed(boundary)?, false, files)
         } else {
             let mut log = Log::open(
                 dir,
@@ -1597,7 +1716,7 @@ impl Store {
                 group::read(&claim_dir, &claim_name, &claim)?
             };
             let replay = replay::read(&mut log, boundary, pending)?;
-            (Some(log), replay, boundary.end().is_some())
+            (Some(log), replay, boundary.end().is_some(), None)
         };
         // The scope is fixed for the open: whether it is the catalog is judged once, here, for the
         // writer quota and every record replay admits (`operation_policy_in`).
@@ -1629,6 +1748,8 @@ impl Store {
             observation: session.access_observation(),
             observed_primary: None,
             displaced,
+            files,
+            classified: None,
         };
         // The complete acknowledged prefix is verified before any opaque
         // record is considered for quarantine. The tail has no such authority.
@@ -1693,10 +1814,15 @@ impl Store {
                             catalog,
                             read_only,
                         )?;
-                        if let Some(classes) = recorded.as_deref_mut().map(|kept| &mut kept.classes)
-                            && !classes.contains_key(&class)
+                        if let Some(recorded) = recorded.as_deref_mut()
+                            && !recorded.classes.contains_key(&class)
                         {
-                            classes.insert(class, batch.class_verdict(&class)?);
+                            let verdict = if recorded.aside {
+                                batch.class_verdict_aside(&class)?
+                            } else {
+                                batch.class_verdict(&class)?
+                            };
+                            recorded.classes.insert(class, verdict);
                         }
                         store.admit(
                             &stored.header,
@@ -1985,7 +2111,8 @@ impl Store {
             || hot_bytes.saturating_add(bytes) > self.capacity.bytes
         {
             return Err(Error::capacity(
-                "table operation capacity exhausted; conflict space is reserved",
+                crate::CapacityBound::Table,
+                TABLE_FULL_REASON,
             ));
         }
         Ok(())
@@ -2010,7 +2137,10 @@ impl Store {
             .writer_records
             .saturating_add(self.room(WRITER_CHECKPOINT_ROOM, checkpoint));
         if count > quota || size > WRITER_BYTES {
-            return Err(Error::capacity("table writer evidence quota exhausted"));
+            return Err(Error::capacity(
+                crate::CapacityBound::Writer,
+                WRITER_FULL_REASON,
+            ));
         }
         Ok(())
     }
@@ -2086,6 +2216,8 @@ impl Store {
         if self.conflicted().contains(&record.header().actor) {
             return Err(Error::new("table actor has restricted signed history"));
         }
+        #[cfg(test)]
+        table_full(1, true)?;
         self.admit(
             record.header(),
             wire.len(),
@@ -2603,6 +2735,8 @@ impl Store {
             operation_policy(self.scope, record.header(), record.payload().len())?;
             bytes = bytes.saturating_add(wire.len());
             // A checkpoint, and any merge it needs, may use the room past the quotas.
+            #[cfg(test)]
+            table_full(prepared.len() + 1, false)?;
             self.admit_records(
                 self.actor,
                 prepared.len() + 1,
@@ -3337,10 +3471,18 @@ impl Store {
         cold::write(&self.data_dir, &self.claim, &key, &payloads)
     }
 
-    /// The payloads kept below this store's floor ([`cold`]): none where it stands on no floor,
-    /// and none in a recovery view, whose custody is not the floor's.
+    /// Whether a read of this store takes payloads from the cold file in its data folder
+    /// ([`cold`]): not where it stands on no floor, and not in a recovery view, whose custody is
+    /// not the floor's. A store that takes none reads no byte of that file, so its revision names
+    /// none ([`Self::revision`]) and whatever stands there refuses no read of it.
+    const fn takes_cold(&self) -> bool {
+        self.floor.is_some() && !self.is_recovery()
+    }
+
+    /// The payloads kept below this store's floor ([`cold`]): none where it takes none
+    /// ([`Self::takes_cold`]).
     fn cold_payloads(&self, session: &Session<'_>) -> Result<cold::Payloads> {
-        if self.floor.is_none() || self.is_recovery() {
+        if !self.takes_cold() {
             return Ok(cold::Payloads::new());
         }
         let key = session.cold_key(&self.scope)?;
@@ -3510,18 +3652,40 @@ impl Store {
     /// What this store holds here, as one digest that opens no payload: every retained record
     /// (its digest, whether its payload opens, is quarantined or awaits membership, and whether
     /// it is a removal cutoff), every fork or discarded-source proof (its key, whether it is
-    /// active and the source it discards), and the session's access head and basis, on which
-    /// each record's eligibility, its roster's bindings and every cutoff are judged. Two reads
-    /// under one revision see the same records judged the same way, so whatever a reader
-    /// derives from them alone (an application's eligible records, their causal clocks and
-    /// order) is the same; a record arriving, a payload opening or a membership change moves it.
+    /// active and the source it discards), the session's access head and basis, on which each
+    /// record's eligibility, its roster's bindings and every cutoff are judged, and the files the
+    /// store was read from ([`sighting::Files`]): every byte of its enrollment claim (its custody:
+    /// anchor, folder and receipt witness), of its floor and of its group permit, the length and
+    /// SHA-256 of its journal's acknowledged prefix, which name every byte of it, and, where a
+    /// read of this store takes payloads from it ([`Self::takes_cold`]: under a floor, in no
+    /// recovery view), the SHA-256 of its cold payloads' file ([`cold`]); a combined view's names
+    /// its primary's claim, floor, permit and journal too. Two reads under one revision see the
+    /// same records judged the same way, so whatever a reader derives from them alone (an
+    /// application's eligible records, their causal clocks and order) is the same; a record
+    /// arriving, a payload opening, a membership change, a custody change or any byte of those
+    /// files changing, as the open read them, moves it. Not named, because no observer reads
+    /// them: the journal's bytes past its acknowledged prefix, and a cold file beside a store
+    /// that takes no payload from it, which therefore refuses no revision either. The journal's
+    /// prefix is named as the open's read of the journal gave it (`journals`): this process
+    /// answers an ask whose folder and files stand, by their `lstat`, as its last read saw them
+    /// from that read, reading the bytes again once in so many such asks, so a fault that moves
+    /// no stamp (a bit the disk flipped: no write does it) moves the revision only at an open
+    /// that reads the bytes. A reader that holds a revision learns it unchanged without opening
+    /// the store through a [`Sighting`] ([`Self::sighted_revision`]), which does read and hash
+    /// them each time.
     ///
     /// # Errors
-    /// The store's custody no longer holds ([`Self::check`]).
+    /// The store's custody no longer holds ([`Self::check`]); the store is a writer's or one a
+    /// reopen kept, whose files no open read in full; or the cold file is named and unreadable.
     pub(crate) fn revision(&self, session: &Session<'_>) -> Result<Digest> {
+        self.revision_read(session).map(|(revision, _)| revision)
+    }
+
+    /// [`Self::revision`], with the SHA-256 of this store's own cold file it named.
+    fn revision_read(&self, session: &Session<'_>) -> Result<(Digest, Option<Digest>)> {
         self.check(session)?;
         let mut hash = aterm_digest::Sha256::new();
-        hash.update(b"aterm/commons/table-revision/1\0");
+        hash.update(b"aterm/commons/table-revision/2\0");
         hash.update(self.scope.digest());
         hash.update(session.access_observation());
         hash.update((self.records.len() as u64).to_le_bytes());
@@ -3546,7 +3710,32 @@ impl Store {
                 None => hash.update([0]),
             }
         }
-        Ok(hash.finalize())
+        let cold = self.files_into(&mut hash, self.takes_cold())?;
+        if let Some(primary) = &self.observed_primary {
+            // A combined view is a recovery view: it takes no cold payloads, its primary's
+            // neither.
+            primary.files_into(&mut hash, false)?;
+        }
+        Ok((hash.finalize(), cold))
+    }
+
+    /// Hash into a revision the files this store was read from ([`Self::revision`]) and, where
+    /// `cold`, its cold file, read now; answers that file's SHA-256, none where it is not named
+    /// or there is no file.
+    ///
+    /// # Errors
+    /// No open read this store's files in full, or the cold file is named and unreadable.
+    fn files_into(&self, hash: &mut aterm_digest::Sha256, cold: bool) -> Result<Option<Digest>> {
+        let files = self.files.as_ref().ok_or_else(|| {
+            Error::new("a table revision is read from an observation of the table's files")
+        })?;
+        let cold = if cold {
+            cold::digest(&self.data_dir, self.capacity.journal().bytes)?
+        } else {
+            None
+        };
+        files.digest_into(&self.claim, cold.as_ref(), hash);
+        Ok(cold)
     }
 
     /// Read application evidence and its next append's conservative record
@@ -3775,6 +3964,31 @@ impl Store {
     /// grows by one. An ingest of a record the store already held appends nothing.
     pub(crate) fn witnessed(&self) -> u64 {
         self.witness.count
+    }
+    /// This store's enrollment claim file and the bytes this handle holds of it: each record the
+    /// table takes, through this handle or another, renames a new claim over it, so a claim that
+    /// reads otherwise later took a record since.
+    pub(crate) fn claim(&self) -> (PathBuf, &[u8]) {
+        (self.claim_dir.join(&self.claim_name), &self.claim)
+    }
+    /// This store's custody (a digest of its enrollment claim apart from the witness, which
+    /// stays while it appends) and its custody witness, then its observed primary's where this
+    /// is a combined view: what a shared file's frontier names a read by
+    /// (`aterm_file::Frontier::stores`), and the publisher an intent's record by
+    /// (`aterm_file::At`).
+    pub(crate) fn witnesses(&self) -> Vec<aterm_file::Witnessed> {
+        let own = aterm_file::Witnessed {
+            digest: custody_of(&self.claim),
+            count: self.witness.count,
+            hash: self.witness.hash(),
+        };
+        std::iter::once(own)
+            .chain(
+                self.observed_primary
+                    .iter()
+                    .flat_map(|primary| primary.witnesses()),
+            )
+            .collect()
     }
     /// Retained positive operations from an actor, including withheld records.
     /// Application admission limits must not reset when projection hides data.

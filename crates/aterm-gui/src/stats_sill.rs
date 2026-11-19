@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Compact stats sill rendered in the window's bottom padding without re-gridding.
+//! Compact resource lanes in the window header.
 
 use aterm_vitals::ink::Rgb;
 use aterm_vitals::model::{CpuView, MemView, Resource, Snapshot, State};
@@ -12,26 +12,13 @@ use crate::stats_deck::{DeckGeom, DeckInput};
 use crate::stats_paint::{Bar, Hit, Instrument, Mark, Painter, Rung, a, panel};
 use crate::widget::{DrawPrim, rgba};
 
-/// Minimum bottom padding in points required to show the sill.
-pub(crate) const SILL_MIN_PT: f64 = 8.0;
-
-/// The sill's height in device px: the window's bottom pad when it holds the sill, else 0 (hidden).
-pub(crate) fn sill_px(pad: usize, scale: f64) -> usize {
-    if !scale.is_finite() || scale <= 0.0 {
-        return 0;
+/// Head reservation for the compact lanes, including their top and bottom margins.
+pub(crate) fn compact_height(scale: f64) -> usize {
+    if scale.is_finite() && scale > 0.0 {
+        (12.0 * scale).round() as usize
+    } else {
+        0
     }
-    let min = (SILL_MIN_PT * scale).round() as usize;
-    if pad >= min { pad } else { 0 }
-}
-
-/// The sill card's height in device px: the `sill` pad less the bottom the
-/// drop-target border keeps ([`aterm_render::drop_overlay_border_px`] of the
-/// `frame_w` × `frame_h` frame, 2–6 px), so nothing the sill draws or answers a
-/// pointer in lies under that border. At 2× a 24 px pad keeps 18 px, the three
-/// lanes' whole height; at 1× a 12 px pad over a 6 px border keeps 6, so the
-/// Tab lane yields there ([`sill_paint`]).
-pub(crate) fn sill_card_px(sill: usize, frame_w: usize, frame_h: usize) -> usize {
-    sill.saturating_sub(aterm_render::drop_overlay_border_px(frame_w, frame_h, 0))
 }
 
 /// The gap between the sill's columns, in points.
@@ -120,10 +107,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
     let fold = Fold::of((right - left) / s);
     let rows = lane_rows(s);
     let lane_bottom = rows[2].0 + rows[2].1;
-    // The card ends where the drop-target border begins (`sill_card_px`), so
-    // a lane is drawn only where it fits whole: the lanes yield bottom-up,
-    // the Tab lane first (at 1× a 12 px pad over a 6 px border holds Global
-    // and aterm). The lens and the sentences still say every figure.
+    // Only complete lanes answer the pointer.
     let fits = |i: usize| rows[i].0 + rows[i].1 <= h;
     let show_aterm = fits(1);
     let show_tab = input.tab_count >= 2 && fits(2);

@@ -4,7 +4,7 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt as _;
 
-struct Agents(Option<PathBuf>);
+pub(in crate::harness) struct Agents(pub(in crate::harness) Option<PathBuf>);
 
 impl Drop for Agents {
     fn drop(&mut self) {
@@ -12,7 +12,7 @@ impl Drop for Agents {
     }
 }
 
-fn image_at(prefix: &Path, build: &str) -> PathBuf {
+pub(in crate::harness) fn image_at(prefix: &Path, build: &str) -> PathBuf {
     let path = prefix.join("store/claude").join(build).join("bin/claude");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     // Format data only: this test never starts a process or claims a kernel outcome.
@@ -26,7 +26,8 @@ fn image_at(prefix: &Path, build: &str) -> PathBuf {
     path
 }
 
-fn factory(prefix: &Path, target: &Path) -> PathBuf {
+/// The twin atpkg lays for `target` under `prefix`'s `agents/`, with the factory's prelude.
+pub(in crate::harness) fn factory(prefix: &Path, target: &Path) -> PathBuf {
     let twin = prefix.join("agents/claude");
     std::fs::create_dir_all(twin.parent().unwrap()).unwrap();
     let mut prelude = atpkg::platform::twin_prelude(
@@ -45,6 +46,34 @@ fn factory(prefix: &Path, target: &Path) -> PathBuf {
     ])
     .unwrap();
     atpkg::platform::install_twin_to_env(&twin, target, &env, &prelude).unwrap();
+    twin
+}
+
+/// The twin atpkg lays for `target` where its helper `libexec/atpkg` has an aterm beside it: the
+/// factory's prelude with the helper's tap, its exports, and the token route ahead of the exec,
+/// spelled by atpkg's own renderers as `activate::reconcile_agents` lays it.
+pub(super) fn token_factory(prefix: &Path, target: &Path) -> PathBuf {
+    let twin = prefix.join("agents/claude");
+    std::fs::create_dir_all(twin.parent().unwrap()).unwrap();
+    let helper = prefix.join("libexec/atpkg");
+    let mut prelude = atpkg::platform::twin_prelude(
+        "claude",
+        prefix,
+        Some(&helper),
+        atpkg::selfupdate::verbs_of("claude"),
+        &atpkg::yolo::policy_of("claude"),
+    );
+    prelude.push_str(&atpkg::launch_tap::sh_prelude("claude", Some(&helper)));
+    let env = atpkg::shim_env::ShimEnv::admit(&[
+        "DISABLE_AUTOUPDATER=1".into(),
+        "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1".into(),
+    ])
+    .unwrap();
+    atpkg::platform::install_twin_to_env(&twin, target, &env, &prelude).unwrap();
+    let body = std::fs::read_to_string(&twin).unwrap();
+    let routed = atpkg::launch_tap::with_token_block("claude", body.clone(), Some(&helper));
+    assert_ne!(routed, body, "the twin carries the token route");
+    std::fs::write(&twin, routed).unwrap();
     twin
 }
 
@@ -67,6 +96,7 @@ fn select(exe: &Path, argv: &[&str], native: bool) -> Result<SelectedCommand, No
         Some("{\"statusLine\":{}}"),
         native,
         None,
+        Some(atpkg::platform::TokenBlock::JudgedOff),
     )
 }
 

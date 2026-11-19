@@ -2479,13 +2479,15 @@ impl<'m> Header<'m> {
         Some((x, self.legend_at(x, &global, &tab)))
     }
 
-    /// How wide the legend is with the machine's words `global` and the tab's `tab`.
+    /// How wide the legend is with the machine's words `global` and the tab's `tab`: two keys
+    /// where `tab` is empty, as on a page no tab owns (the System Resources page's head).
     fn legend_need(&self, global: &str, tab: &str) -> f64 {
-        3.0 * SWATCH_ADVANCE
+        let keys = if tab.is_empty() { 2.0 } else { 3.0 };
+        keys * SWATCH_ADVANCE
             + self.words(global)
             + self.words("aterm")
             + self.words(tab)
-            + 2.0 * LEGEND_GAP
+            + (keys - 1.0) * LEGEND_GAP
     }
 
     /// The legend's forms, longest first, each with the room it needs: with the machine's used
@@ -2494,8 +2496,10 @@ impl<'m> Header<'m> {
     fn legend_forms(&self, text: &HeaderText<'_>, tail: bool) -> Vec<LegendForm> {
         let machine = text.machine;
         let noun = machine.rsplit(' ').next().unwrap_or(machine);
+        // No tab, no Tab key: an empty scope stays empty in every form.
+        let short = if text.tab.is_empty() { "" } else { "Tab" };
         let tab = if self.words(text.tab) > TAB_HEAD_MAX {
-            "Tab"
+            short
         } else {
             text.tab
         };
@@ -2503,12 +2507,13 @@ impl<'m> Header<'m> {
             let need = self.legend_need(&format!("{machine} \u{b7} {}", t.widest), tab);
             (format!("{machine} \u{b7} {}", t.said), tab.to_owned(), need)
         });
-        let plain = [(machine, tab), (noun, tab), (noun, "Tab")]
+        let plain = [(machine, tab), (noun, tab), (noun, short)]
             .map(|(g, t)| (g.to_owned(), t.to_owned(), self.legend_need(g, t)));
         totals.chain(plain).collect()
     }
 
-    /// Lays the legend's three names from `x`, each after its swatch; where it ends.
+    /// Lays the legend's names from `x`, each after its swatch, the tab's only where it has
+    /// words; where it ends.
     fn legend_at(&mut self, x: f64, global: &str, tab: &str) -> f64 {
         let mut at = x;
         for (bar, words) in [
@@ -2516,6 +2521,9 @@ impl<'m> Header<'m> {
             (Bar::Aterm, "aterm"),
             (Bar::Tab, tab),
         ] {
+            if bar == Bar::Tab && words.is_empty() {
+                break;
+            }
             at += self.scope(bar, at, words.to_owned()) + LEGEND_GAP;
         }
         at - LEGEND_GAP

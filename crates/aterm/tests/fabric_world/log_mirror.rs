@@ -297,9 +297,10 @@ fn fabric_brief_folds_what_the_bus_holds() {
         .env("XDG_CONFIG_HOME", w.tmp.join("cfg"))
         .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
         .stdin(aterm_uds::spawnfd::Stdio::null());
-    let out = aterm_uds::deadline::output_until_complete_stdout(
+    let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
         &mut cmd,
-        std::time::Instant::now() + super::harness::DEADLINE,
+        super::harness::DEADLINE,
+        "aterm link fabric brief",
     )
     .expect("aterm fabric brief exits with complete stdout before the hang detector");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();

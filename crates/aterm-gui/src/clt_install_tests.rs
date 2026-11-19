@@ -52,6 +52,7 @@ fn unattended_setup_starts_the_selected_tools_install_without_another_press() {
     let permissions = Some(crate::InitialSetupPermissionPolicy {
         revision: 4,
         allowed: true,
+        person_access: false,
     });
     app.observe_initial_setup_permissions(permissions);
     app.publish_system_state(crate::SetupStatus {
@@ -79,6 +80,7 @@ fn policy(revision: u64) -> Option<crate::InitialSetupPermissionPolicy> {
     Some(crate::InitialSetupPermissionPolicy {
         revision,
         allowed: true,
+        person_access: false,
     })
 }
 
@@ -219,6 +221,7 @@ fn clt_install_a_run_can_keep_an_older_permissions_approval() {
     let permissions = Some(crate::InitialSetupPermissionPolicy {
         revision: 4,
         allowed: true,
+        person_access: false,
     });
     app.note_system_state_touch();
     app.note_system_state_apply(crate::system_state::Admission::Person);
@@ -613,25 +616,193 @@ fn a_mac_with_the_tools_still_gets_the_one_elevation_for_what_is_owed() {
 
     let gone = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
     let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-    use aterm_containment::consent::DebuggerMember::Admin;
     use aterm_containment::consent::DebuggerMode::{Disabled, Enabled, Unknown};
-    assert!(root_steps_owed_by(Disabled, Admin, Ok((0, 0o440, true)), false, false, false).any());
-    assert!(root_steps_owed_by(Enabled, Admin, gone(), false, false, false).any());
-    assert!(root_steps_owed_by(Enabled, Admin, Ok((501, 0o440, true)), false, false, false).any());
-    assert!(!root_steps_owed_by(Enabled, Admin, Ok((0, 0o440, true)), false, false, false).any());
+    let owed = |readings| root_steps_owed_by(readings).any();
+    assert!(owed(readings(Disabled, Ok((0, 0o440, true)))));
+    assert!(owed(readings(Enabled, gone())));
+    assert!(owed(readings(Enabled, Ok((501, 0o440, true)))));
+    assert!(!owed(readings(Enabled, Ok((0, 0o440, true)))));
     assert!(
-        root_steps_owed_by(Enabled, Admin, Ok((0, 0o440, true)), false, true, false).any(),
+        owed(RootReadings {
+            broker: true,
+            ..readings(Enabled, Ok((0, 0o440, true)))
+        }),
         "the broker alone owes the elevation"
     );
     assert!(
-        root_steps_owed_by(Enabled, Admin, Ok((0, 0o440, true)), false, false, true).any(),
+        owed(RootReadings {
+            spotlight: true,
+            ..readings(Enabled, Ok((0, 0o440, true)))
+        }),
         "Spotlight's scope alone owes the elevation"
     );
-    assert!(!root_steps_owed_by(Unknown, Admin, denied(), false, false, false).any());
+    assert!(!owed(readings(Unknown, denied())));
     assert!(
-        !root_steps_owed_by(Enabled, Admin, gone(), true, false, false).any(),
+        !owed(RootReadings {
+            rule_refused: true,
+            ..readings(Enabled, gone())
+        }),
         "refused stands"
     );
+    assert!(
+        !owed(RootReadings {
+            rule_removed: true,
+            ..readings(Enabled, gone())
+        }),
+        "the person's removal stands"
+    );
+    assert!(
+        owed(RootReadings {
+            rule_removed: true,
+            ..readings(Enabled, Ok((501, 0o440, true)))
+        }),
+        "a marker beside a rule that stands is no removal"
+    );
+}
+
+/// Readings that owe nothing beside `mode` and `rule`, for an admin console account.
+#[cfg(unix)]
+fn readings(
+    mode: aterm_containment::consent::DebuggerMode,
+    rule: std::io::Result<(u32, u32, bool)>,
+) -> RootReadings {
+    RootReadings {
+        mode,
+        member: aterm_containment::consent::DebuggerMember::Admin,
+        rule,
+        rule_refused: false,
+        rule_removed: false,
+        broker: false,
+        spotlight: false,
+    }
+}
+
+/// The window reads root's records through the `Reads` port at their own paths: the rule's
+/// refusal and the person's removal of it, and the broker's and developer mode's records, each
+/// for the key it reads now and a stalled line for this boot alone. NEGATIVE CONTROLS: a record
+/// for another key, a stalled line of another boot, a pending line, and a record another account
+/// owns stand for nothing. Run: a removal read hard-wired `false`, and a reader that ignores the
+/// boot, each fail it.
+#[cfg(unix)]
+#[test]
+fn the_window_reads_roots_records_at_their_paths() {
+    use aterm_containment::consent::DebuggerMode::{Disabled, Enabled};
+    use aterm_types::macos_setup::refused::{DEVELOPER_MODE, LAN_BROKER};
+    use aterm_types::macos_setup::{ADMITTED_NAME_RULE_REFUSED, ADMITTED_NAME_RULE_REMOVED};
+    let gone = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    let boot = || Some("b1".to_owned());
+    let owed = |files: &RecordFiles, readings: RootReadings| {
+        readings.with_records(files, 501, || Some("k".to_owned()), &boot)
+    };
+    let rule = |files: RecordFiles| owed(&files, readings(Enabled, gone())).other;
+    assert!(rule(RecordFiles::default()));
+    assert!(!rule(RecordFiles::default().with(
+        ADMITTED_NAME_RULE_REFUSED,
+        0,
+        ""
+    )));
+    assert!(!rule(RecordFiles::default().with(
+        ADMITTED_NAME_RULE_REMOVED,
+        0,
+        ""
+    )));
+    assert!(rule(RecordFiles::default().with(
+        "/private/etc/sudoers.d/other",
+        0,
+        ""
+    )));
+
+    let broker = |text: &str, uid: u32| {
+        let files = RecordFiles::default().with(LAN_BROKER, uid, text);
+        owed(
+            &files,
+            RootReadings {
+                broker: true,
+                ..readings(Enabled, Ok((0, 0o440, true)))
+            },
+        )
+        .other
+    };
+    assert!(!broker("k\n", 0));
+    assert!(!broker("stalled b1 k\n", 0));
+    for (why, text, uid) in [
+        ("another key", "k2\n", 0),
+        ("another boot", "stalled b0 k\n", 0),
+        ("pending", "no-verdict 1 b1 k\n", 0),
+        ("another owner", "k\n", 501),
+    ] {
+        assert!(broker(text, uid), "{why}");
+    }
+
+    let debugger = |text: &str| {
+        let files = RecordFiles::default().with(DEVELOPER_MODE, 0, text);
+        owed(&files, readings(Disabled, Ok((0, 0o440, true)))).debugger
+    };
+    assert!(!debugger("off\n"));
+    assert!(!debugger("stalled b1 off\n"));
+    assert!(debugger("stalled b0 off\n"));
+    assert!(debugger("member 501\n"));
+}
+
+/// Root's records held in memory: each path's bytes and the uid that owns it.
+#[cfg(unix)]
+#[derive(Default)]
+struct RecordFiles(std::collections::BTreeMap<std::path::PathBuf, (u32, Vec<u8>)>);
+
+#[cfg(unix)]
+impl RecordFiles {
+    fn with(mut self, path: &str, uid: u32, text: &str) -> Self {
+        self.0.insert(path.into(), (uid, text.as_bytes().to_vec()));
+        self
+    }
+}
+
+#[cfg(unix)]
+impl aterm_types::macos_setup::spotlight_scope::Reads for RecordFiles {
+    fn macos(&self) -> bool {
+        true
+    }
+
+    fn euid(&self) -> u32 {
+        501
+    }
+
+    fn home(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn entry(
+        &self,
+        path: &std::path::Path,
+    ) -> std::io::Result<aterm_types::macos_setup::spotlight_scope::Entry> {
+        let (uid, _) = self.0.get(path).ok_or(std::io::ErrorKind::NotFound)?;
+        Ok(aterm_types::macos_setup::spotlight_scope::Entry {
+            uid: *uid,
+            dir: false,
+            symlink: false,
+            id: None,
+        })
+    }
+
+    fn resolve(&self, path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        Ok(path.to_path_buf())
+    }
+
+    fn names(&self, _: &std::path::Path) -> std::io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn root_file(&self, path: &std::path::Path, max: usize) -> std::io::Result<Vec<u8>> {
+        match self.0.get(path) {
+            Some((0, bytes)) if bytes.len() <= max => Ok(bytes.clone()),
+            Some(_) => Err(std::io::ErrorKind::PermissionDenied.into()),
+            None => Err(std::io::ErrorKind::NotFound.into()),
+        }
+    }
+
+    fn volume_status(&self) -> Result<Vec<u8>, String> {
+        Err("not read".into())
+    }
 }
 
 /// An enabled developer mode still needs the root step when this account is in neither
@@ -650,7 +821,10 @@ fn enabled_mode_owes_only_a_definitely_unauthorized_console_account() {
         (DebuggerMode::Unknown, NotMember, false),
     ] {
         assert_eq!(
-            root_steps_owed_by(mode, member, Ok((0, 0o440, true)), false, false, false),
+            root_steps_owed_by(RootReadings {
+                member,
+                ..readings(mode, Ok((0, 0o440, true)))
+            }),
             RootSteps {
                 debugger: owed,
                 other: false
@@ -733,14 +907,10 @@ fn assert_debugger_setup_admission(
         Mark::at(tmp.path().join(name)),
         crate::clt_shim::Shim::at(tmp.path().join("clt-shim"), || true),
     );
-    app.root_steps_owed(root_steps_owed_by(
-        debugger.mode,
-        debugger.member,
-        Ok((0, 0o440, true)),
-        false,
-        false,
-        false,
-    ));
+    app.root_steps_owed(root_steps_owed_by(RootReadings {
+        member: debugger.member,
+        ..readings(debugger.mode, Ok((0, 0o440, true)))
+    }));
     assert_eq!(
         (
             child_mode,

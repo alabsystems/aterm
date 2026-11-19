@@ -1177,6 +1177,13 @@ impl App {
             && !self.system_state_host.stopped_access()
     }
 
+    pub(crate) fn privacy_grants_requested(&self) -> bool {
+        self.workstation_setup
+            .permissions
+            .privacy_grants_requested()
+            && !self.system_state_host.stopped_access()
+    }
+
     pub(crate) fn tick_workstation_setup(&mut self, now: Instant) {
         self.close_successful_developer_tools_tabs();
         if self.workstation_setup.pending()

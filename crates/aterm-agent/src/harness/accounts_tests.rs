@@ -3,8 +3,10 @@
 
 //! Tests for the accounts core.
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+// The tests gated `cfg(unix)` here reach what aterm has only on Unix: a file mode, a symbolic
+// link, a signal, a `/bin/sh` stand-in, or a part built only there (native credential custody,
+// native fleet renewal, the vault-token, Google and agy sign-ins, the Kimi pool's overlay
+// staging home, aterm's own browser window, the test sleep seam).
 
 use std::collections::BTreeSet;
 
@@ -138,6 +140,7 @@ fn me(label: &str) -> Me<'_> {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     }
 }
 
@@ -210,11 +213,19 @@ fn cond(roster: &Roster, state: &State, label: &str, now: i64) -> Condition {
 }
 
 fn order(roster: &Roster, state: &State, me: Option<&str>, point: &Point) -> Vec<String> {
-    candidates(roster, state, &all(roster), me, point, NOW)
-        .into_iter()
-        .filter(|(_, verdict)| verdict.is_ok())
-        .map(|(label, _)| label)
-        .collect()
+    candidates(
+        roster,
+        state,
+        &all(roster),
+        me,
+        ModelWeek::Unread,
+        point,
+        NOW,
+    )
+    .into_iter()
+    .filter(|(_, verdict)| verdict.is_ok())
+    .map(|(label, _)| label)
+    .collect()
 }
 
 fn why_not(
@@ -224,11 +235,19 @@ fn why_not(
     point: &Point,
     label: &str,
 ) -> WhyNot {
-    candidates(roster, state, enrolled, Some("main"), point, NOW)
-        .into_iter()
-        .find(|(l, _)| l == label)
-        .and_then(|(_, verdict)| verdict.err())
-        .unwrap_or_else(|| panic!("{label} is a candidate"))
+    candidates(
+        roster,
+        state,
+        enrolled,
+        Some("main"),
+        ModelWeek::Unread,
+        point,
+        NOW,
+    )
+    .into_iter()
+    .find(|(l, _)| l == label)
+    .and_then(|(_, verdict)| verdict.err())
+    .unwrap_or_else(|| panic!("{label} is a candidate"))
 }
 
 fn reference() -> String {
@@ -1922,7 +1941,15 @@ fn candidates_sort_by_one_key_fresh_dedicated_soonest_week_label() {
     let r = three();
     let mut s = state();
     limited(&mut s, "work-2", NOW + HOUR);
-    let listed = candidates(&r, &s, &all(&r), Some("main"), &wall(), NOW);
+    let listed = candidates(
+        &r,
+        &s,
+        &all(&r),
+        Some("main"),
+        ModelWeek::Unread,
+        &wall(),
+        NOW,
+    );
     assert_eq!(
         listed,
         vec![
@@ -1931,8 +1958,10 @@ fn candidates_sort_by_one_key_fresh_dedicated_soonest_week_label() {
                 Ok(Rank {
                     borrowed: false,
                     model_walled: false,
+                    peer_walled: false,
                     low: false,
                     class: Class::Pool,
+                    link: None,
                     week_reset: None
                 })
             ),
@@ -5785,7 +5814,6 @@ fn the_machine_id_is_minted_once_and_kept() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn account_selection_uses_current_bindings_and_never_turns_store_errors_into_sign_in() {
     let dir = tmp("selection");
@@ -6314,6 +6342,7 @@ fn a_process_login_names_its_row_byte_for_byte() {
             left: None,
             default_home: false,
             route: crate::harness::accounts::AuthRoute::Outside,
+            model: crate::harness::accounts::ModelWeek::Unread,
         }
     );
 }
@@ -9723,8 +9752,16 @@ fn warnings_and_credits_in_use_mark_an_account_low_and_rotate_early_ahead_of_the
     assert_eq!(ask(&s_warn, NOW), ahead);
     assert_eq!(ask_sampled(&s_warn, NOW), ahead);
     assert!(
-        candidates(&r, &s_warn, &enrolled, Some("work-2"), &Point::TurnEnd, NOW)
-            .contains(&("main".to_string(), Err(WhyNot::LowAheadOfAWall)))
+        candidates(
+            &r,
+            &s_warn,
+            &enrolled,
+            Some("work-2"),
+            ModelWeek::Unread,
+            &Point::TurnEnd,
+            NOW
+        )
+        .contains(&("main".to_string(), Err(WhyNot::LowAheadOfAWall)))
     );
     let s_sub = with_warned(false, 89, Some(NOW + 2 * HOUR));
     assert_eq!(cond(&r, &s_sub, "main", NOW), Condition::Usable);
@@ -10518,6 +10555,7 @@ fn a_workers_starter_is_the_account_its_login_file_names() {
             s,
             &enrolled,
             &plain(seen),
+            ModelWeek::Unread,
             (Mode::Wall, NOW),
             &mut |_| true,
         )
@@ -10569,7 +10607,8 @@ fn a_worker_starts_where_the_host_would_move_its_tab() {
     let r = three();
     let enrolled = all(&r);
     let start = |s: &State, mode: Mode| {
-        worker_row(&r, s, &enrolled, "main", mode, NOW).map(|row| row.label.as_str())
+        worker_row(&r, s, &enrolled, "main", mode, ModelWeek::Unread, NOW)
+            .map(|row| row.label.as_str())
     };
     let mut walled = on_main();
     limited(&mut walled, "main", NOW + 3 * HOUR);
@@ -12759,6 +12798,7 @@ fn a_rotation_off_a_limits_wall_passes_an_active_the_records_hold_off_it() {
             mover,
             "pool-a",
             limit,
+            ModelWeek::Unread,
             NOW,
         )
     };
@@ -12949,9 +12989,17 @@ fn a_signed_out_row_whose_vault_token_is_in_use_here_is_picked_by_rotation_and_s
     );
     assert_eq!(cond(&r, &on_token, "pool-a", NOW), Condition::Usable);
     assert!(
-        candidates(&r, &on_token, &enrolled, Some("main"), &wall(), NOW)
-            .iter()
-            .any(|(label, verdict)| label == "pool-a" && verdict.is_ok()),
+        candidates(
+            &r,
+            &on_token,
+            &enrolled,
+            Some("main"),
+            ModelWeek::Unread,
+            &wall(),
+            NOW
+        )
+        .iter()
+        .any(|(label, verdict)| label == "pool-a" && verdict.is_ok()),
         "rotation picks it"
     );
     let picked = launch_row(&r, &on_token, &enrolled, NOW).map(|row| row.label.as_str());
@@ -13136,6 +13184,7 @@ fn a_worker_leaves_a_starters_row_only_its_token_runs_where_the_token_would_not_
             state,
             &enrolled,
             &plain,
+            ModelWeek::Unread,
             (Mode::Wall, NOW),
             &mut |row| {
                 asked.push(row.label.clone());
@@ -13205,11 +13254,16 @@ fn a_survey_says_the_row_the_guarded_launch_starts_on() {
     note_auth(&mut s, "tok", Auth::SignedOut, NOW - DAY);
     token_read(&mut s, "tok", NOW - MIN, NOW + 365 * DAY);
     for (serves, row) in [(false, "spare"), (true, "tok")] {
-        let launched =
-            claude_worker_move(&r, &s, &enrolled, &plain, (Mode::Wall, NOW), &mut |_| {
-                serves
-            })
-            .map(|(_, to)| to.label.clone());
+        let launched = claude_worker_move(
+            &r,
+            &s,
+            &enrolled,
+            &plain,
+            ModelWeek::Unread,
+            (Mode::Wall, NOW),
+            &mut |_| serves,
+        )
+        .map(|(_, to)| to.label.clone());
         let surveyed = super::super::accounts_pool::unstarted_launch_row(
             (Cli::Claude, false, Mode::Wall),
             &r,
@@ -13376,11 +13430,19 @@ fn held_lent(r: &Roster) -> Roster {
 
 /// The labels `candidates` admits for a session on `main` at a wall, in their order.
 fn admitted(roster: &Roster, state: &State, enrolled: &BTreeSet<String>) -> Vec<String> {
-    candidates(roster, state, enrolled, Some("main"), &wall(), NOW)
-        .into_iter()
-        .filter(|(_, verdict)| verdict.is_ok())
-        .map(|(label, _)| label)
-        .collect()
+    candidates(
+        roster,
+        state,
+        enrolled,
+        Some("main"),
+        ModelWeek::Unread,
+        &wall(),
+        NOW,
+    )
+    .into_iter()
+    .filter(|(_, verdict)| verdict.is_ok())
+    .map(|(label, _)| label)
+    .collect()
 }
 
 /// THE FLEET TOKEN RUNS A ROW WITH NO LOGIN HERE (FL-135): another Mac's account, whose login was
@@ -13456,10 +13518,18 @@ fn a_row_with_no_login_here_runs_on_its_fleet_token_and_a_lease_elsewhere_still_
         ["work-2", "pool-a", "lent"]
     );
     assert!(
-        candidates(&r, &on_token, &enrolled, Some("main"), &wall(), NOW)
-            .iter()
-            .any(|(label, verdict)| label == "lent"
-                && matches!(verdict, Ok(Rank { borrowed: true, .. }))),
+        candidates(
+            &r,
+            &on_token,
+            &enrolled,
+            Some("main"),
+            ModelWeek::Unread,
+            &wall(),
+            NOW
+        )
+        .iter()
+        .any(|(label, verdict)| label == "lent"
+            && matches!(verdict, Ok(Rank { borrowed: true, .. }))),
         "ranked as borrowed"
     );
     // CONTROL: a row this Mac prefers (the lab names this Mac its home) or is the pool file's home
@@ -13878,4 +13948,302 @@ fn the_home_mac_takes_its_account_back_from_a_borrower_at_the_next_turn_end() {
             }
         ));
     }
+}
+
+/// THE EXIT TEST OF SF-09 (docs/DESIGN-shared-files-2026-11-11.md §10, "How rotation reads them"
+/// and "How sign-in reads them").
+/// ROTATION, three rows of this Mac's own whose weeks reset a, then b, then c:
+/// 1. with no snapshot ([`Fleet::default`]) rotation orders them as before the files, by week;
+/// 2. this Mac's `ai/links` ranks order them within their class, ranked first (c 1, b 2, a
+///    unranked): c, b, a;
+/// 3. a wall a peer read on c demotes it behind every row no peer walled (b, a, c), and c is still
+///    a candidate: demoted, never excluded;
+/// 4. with a and b walled here, c is the launch row, and no wait moves for the peer's wall;
+/// 5. once the peer's wall has ended, c ranks first again;
+/// 6. a store's hydrate carries what the test's fleet says ([`with_fleet`]), and with none set,
+///    under a test binary's private state root, no snapshot.
+///
+/// SIGN-IN, one upkeep pass of the real ladder over a signed-out row whose browser route is ready
+/// (`accounts_sync`'s `ladder_tests::one_pass`; Unix, as the ladder's own tests):
+/// 7. with a Mac's block of its account an hour old and its vault token in use here, no browser
+///    opens, and on macOS the vault route takes the token (`on-token`, by `vault`); elsewhere,
+///    where no launch starts on a token, the block holds it;
+/// 8. with the block and no token, no browser opens: the attempt is `no-route` in words that name
+///    the hold ([`fleet_words`]), never `blocked`;
+/// 9. a block 25 hours old holds nothing: the browser opens;
+/// 10. with no snapshot the browser opens, as before the files;
+/// 11. [`SignIn::begin`] refuses an automatic start under the block ([`Refused::Fleet`]), starts
+///     one with no snapshot, and starts a sign-in a person names under the block.
+///
+/// What the hold does across passes (recorded once, its lapse ending the ladder's wait, this
+/// Mac's own block kept, no mailbox asked), at the door's preflight, at the token capture, in
+/// `begin_native` and when the store does not load is held by its own tests, beside the code
+/// each reaches (`a_fleets_hold_is_recorded_once_and_its_lapse_ends_the_wait_it_set`,
+/// `a_hold_built_from_this_macs_own_block_keeps_that_block_on_record`,
+/// `a_held_row_asks_the_lab_for_no_mailbox`, `a_fleet_hold_leaves_a_manual_turn_for_the_next_row`,
+/// `a_fleet_hold_spaces_the_token_capture_and_begin_native`,
+/// `a_fleet_hold_that_cannot_name_its_account_starts_nothing`), and its clocks by
+/// `the_fleets_lookups_record_the_ends_they_compare`.
+///
+/// [`fleet_words`]: crate::harness::sign_in_ladder::fleet_words
+/// [`SignIn::begin`]: crate::harness::sign_in_ladder::SignIn::begin
+/// [`Refused::Fleet`]: crate::harness::sign_in_ladder::Refused::Fleet
+#[test]
+fn rotation_demotes_an_account_a_peer_walled_sign_in_takes_the_vault_token_first_and_both_run_with_no_snapshot()
+ {
+    use crate::harness::sign_in_ladder::{Refused, SignIn, Why};
+    let r = roster(&[
+        ("a", Class::Preferred, Some("/logins/a")),
+        ("b", Class::Preferred, Some("/logins/b")),
+        ("c", Class::Preferred, Some("/logins/c")),
+    ]);
+    let enrolled = all(&r);
+    let key = |label: &str| format!("ac-{}", label.repeat(16));
+    let mut base = state();
+    for (label, days) in [("a", 1), ("b", 2), ("c", 3)] {
+        let week = Sample {
+            week_reset: Some(NOW + days * DAY),
+            ..sample(10, 20)
+        };
+        assert_eq!(note_sample(&mut base, label, week, NOW).len(), 1);
+        base.accounts.get_mut(label).expect("noted").pk = Some(key(label));
+    }
+    let with = |fleet: &Fleet| State {
+        fleet: fleet.clone(),
+        ..base.clone()
+    };
+    let ranks = |pairs: &[(&str, u64)]| {
+        pairs
+            .iter()
+            .map(|(label, rank)| (key(label), *rank))
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    // 1. NO SNAPSHOT: today's order, by week.
+    assert_eq!(base.fleet, Fleet::default());
+    assert_eq!(order(&r, &base, None, &wall()), ["a", "b", "c"]);
+
+    // 2. LINK RANK: c 1, b 2, a unranked.
+    let linked = Fleet {
+        rank: ranks(&[("c", 1), ("b", 2)]),
+        ..Fleet::default()
+    };
+    let s = with(&linked);
+    assert_eq!(link_rank(&s, "c"), Some(1));
+    assert_eq!(link_rank(&s, "a"), None);
+    assert_eq!(order(&r, &s, None, &wall()), ["c", "b", "a"]);
+
+    // 3. A PEER'S WALL on c, for another hour: c goes last, and stays a candidate.
+    let walled = Fleet {
+        walls: [(key("c"), NOW + HOUR)].into_iter().collect(),
+        ..linked.clone()
+    };
+    let s = with(&walled);
+    assert_eq!(peer_wall(&s, ModelWeek::Unread, "c", NOW), Some(NOW + HOUR));
+    assert_eq!(order(&r, &s, None, &wall()), ["b", "a", "c"]);
+    let verdict = |s: &State, label: &str| {
+        candidates(&r, s, &enrolled, None, ModelWeek::Unread, &wall(), NOW)
+            .into_iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, verdict)| verdict)
+            .expect("a row")
+    };
+    assert!(
+        matches!(
+            verdict(&s, "c"),
+            Ok(Rank {
+                peer_walled: true,
+                link: Some(1),
+                ..
+            })
+        ),
+        "demoted, never excluded: {:?}",
+        verdict(&s, "c")
+    );
+
+    // 4. ONLY c USABLE: a and b walled here. c is the launch row, and the peer's wall moves no
+    // wait.
+    let mut spent = s.clone();
+    limited(&mut spent, "a", NOW + 2 * HOUR);
+    limited(&mut spent, "b", NOW + 3 * HOUR);
+    assert_eq!(
+        launch_row(&r, &spent, &enrolled, NOW).map(|row| row.label.as_str()),
+        Some("c")
+    );
+    let unwalled = State {
+        fleet: Fleet::default(),
+        ..spent.clone()
+    };
+    assert_eq!(
+        (
+            next_usable(&r, &spent, &enrolled, NOW),
+            next_opening(&r, &spent, &enrolled, NOW)
+        ),
+        (
+            next_usable(&r, &unwalled, &enrolled, NOW),
+            next_opening(&r, &unwalled, &enrolled, NOW)
+        )
+    );
+    assert_eq!(next_usable(&r, &spent, &enrolled, NOW), Some(NOW));
+
+    // 5. THE PEER'S WALL ENDED a second ago: c first again.
+    let ended = Fleet {
+        walls: [(key("c"), NOW - 1)].into_iter().collect(),
+        ..linked.clone()
+    };
+    let s = with(&ended);
+    assert_eq!(peer_wall(&s, ModelWeek::Unread, "c", NOW), None);
+    assert_eq!(order(&r, &s, None, &wall()), ["c", "b", "a"]);
+
+    // 6. WIRING: hydrate reads the store's fleet.
+    let dir = tmp("sf09-fleet");
+    let store = Store::at(dir.path());
+    let (hydrated, _) = with_fleet(walled.clone(), || store.load_judged(NOW, &r)).expect("loads");
+    assert_eq!(hydrated.fleet, walled);
+    let (hydrated, _) = store.load_judged(NOW, &r).expect("loads");
+    assert_eq!(hydrated.fleet, Fleet::default());
+
+    #[cfg(unix)]
+    {
+        use crate::harness::accounts_sync::ladder_tests::{PASS_AT, PASS_KEY, one_pass};
+        let blocked = |ago: i64| Fleet {
+            blocked: [(PASS_KEY.to_owned(), PASS_AT - ago)].into_iter().collect(),
+            ..Fleet::default()
+        };
+
+        // 7. VAULT FIRST UNDER A BLOCK: the token in use here, no browser.
+        let pass = one_pass(blocked(HOUR), true);
+        assert_eq!(pass.handed, 0, "no browser opens: {:?}", pass.logged);
+        let attempt = pass.attempt.expect("the attempt is on record");
+        if crate::harness::token_route::LAUNCHES_ON_TOKEN {
+            assert_eq!(
+                (attempt.outcome, attempt.routes.as_str()),
+                (AttemptOutcome::OnToken, "vault"),
+                "the vault route takes the token before the hold"
+            );
+        } else {
+            assert_eq!(attempt.outcome, AttemptOutcome::NoRoute, "{attempt:?}");
+        }
+
+        // 8. THE BLOCK HOLDS THE BROWSER: recorded no-route, naming the hold.
+        let pass = one_pass(blocked(HOUR), false);
+        assert_eq!(pass.handed, 0, "no browser opens: {:?}", pass.logged);
+        let attempt = pass.attempt.expect("the attempt is on record");
+        assert_eq!(attempt.outcome, AttemptOutcome::NoRoute, "{attempt:?}");
+        assert_eq!(attempt.stop, None, "{attempt:?}");
+        let hold = FleetHold::of(PASS_AT - HOUR, PASS_AT).expect("an hour-old block holds");
+        assert_eq!(hold.until, PASS_AT - HOUR + FLEET_BLOCK_S);
+        assert!(
+            attempt
+                .routes
+                .starts_with(&crate::harness::sign_in_ladder::fleet_words(&hold)),
+            "{attempt:?}"
+        );
+
+        // 9. A BLOCK 25 HOURS OLD HOLDS NOTHING.
+        let pass = one_pass(blocked(25 * HOUR), false);
+        assert_eq!(pass.handed, 1, "the browser opens: {:?}", pass.logged);
+
+        // 10. NO SNAPSHOT: the browser opens, as before the files.
+        let pass = one_pass(Fleet::default(), false);
+        assert_eq!(pass.handed, 1, "the browser opens: {:?}", pass.logged);
+    }
+
+    // 11. THE BEGIN BACKSTOP: an automatic start of d is refused under the block, and a
+    // person's is not. (A stored pk is a journal key, so d, whose key is hex.)
+    let dir = tmp("sf09-begin");
+    let store = Store::at_for(&dir.path().join("state"), Cli::Claude, dir.path());
+    std::fs::create_dir_all(&store.dir).expect("state dir");
+    std::fs::create_dir_all(store.shared_dir()).expect("shared dir");
+    store
+        .transact(NOW - 60, &mut None, |state| {
+            state.accounts.entry("d".to_owned()).or_default().pk = Some(key("d"));
+            Ok(Vec::new())
+        })
+        .expect("keyed");
+    let fresh = Fleet {
+        blocked: [(key("d"), NOW - HOUR)].into_iter().collect(),
+        ..Fleet::default()
+    };
+    let begin = |why: Why, fleet: Fleet| {
+        with_fleet(fleet, || {
+            let lock = store
+                .signin_now()
+                .expect("reads")
+                .expect("the sign-in lock is free");
+            SignIn::fixture(Cli::Claude, "d", why)
+                .begin(Cli::Claude, "d", lock, &store, NOW)
+                .map(drop)
+        })
+    };
+    let held = Err(Refused::Fleet {
+        at: NOW - HOUR,
+        until: NOW - HOUR + FLEET_BLOCK_S,
+    });
+    assert_eq!(begin(Why::Due, fresh.clone()), held);
+    assert_eq!(begin(Why::Session, fresh.clone()), held);
+    assert_eq!(begin(Why::Due, Fleet::default()), Ok(()));
+    assert_eq!(begin(Why::Asked, fresh), Ok(()));
+}
+
+/// This Mac's own reading of a model's weekly wall (FL-206's `model_walled`) outranks a peer's
+/// wall in `ai/limits` (SF-09's `peer_walled`), and both outrank this Mac's `ai/links` order: with
+/// the links ranking c, b, a, a peer's wall on b and Fable's wall read here on c, the order is a,
+/// b, c, and neither demoted row is excluded.
+#[test]
+fn a_model_wall_read_here_ranks_after_a_peers_wall() {
+    let r = roster(&[
+        ("a", Class::Preferred, Some("/logins/a")),
+        ("b", Class::Preferred, Some("/logins/b")),
+        ("c", Class::Preferred, Some("/logins/c")),
+    ]);
+    let enrolled = all(&r);
+    let key = |label: &str| format!("ac-{}", label.repeat(16));
+    let mut s = state();
+    for label in ["a", "b", "c"] {
+        note_sample(&mut s, label, sample(10, 20), NOW);
+        s.accounts.get_mut(label).expect("noted").pk = Some(key(label));
+    }
+    s.fleet = Fleet {
+        rank: [(key("c"), 1), (key("b"), 2), (key("a"), 3)]
+            .into_iter()
+            .collect(),
+        ..Fleet::default()
+    };
+    assert_eq!(order(&r, &s, None, &wall()), ["c", "b", "a"]);
+
+    s.fleet.walls = [(key("b"), NOW + HOUR)].into_iter().collect();
+    note_wall(&mut s, "c", FABLE, Some(NOW + DAY), NOW - MIN, NOW - MIN);
+    assert!(s.accounts["c"].model_walls(NOW).next().is_some());
+    assert_eq!(order(&r, &s, None, &wall()), ["a", "b", "c"]);
+    let listed = candidates(&r, &s, &enrolled, None, ModelWeek::Unread, &wall(), NOW);
+    let verdict = |label: &str| {
+        listed
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, verdict)| *verdict)
+            .expect("a row")
+    };
+    assert!(
+        matches!(
+            verdict("b"),
+            Ok(Rank {
+                model_walled: false,
+                peer_walled: true,
+                ..
+            })
+        ),
+        "{listed:?}"
+    );
+    assert!(
+        matches!(
+            verdict("c"),
+            Ok(Rank {
+                model_walled: true,
+                peer_walled: false,
+                ..
+            })
+        ),
+        "{listed:?}"
+    );
 }

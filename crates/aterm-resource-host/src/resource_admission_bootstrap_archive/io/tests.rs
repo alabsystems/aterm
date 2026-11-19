@@ -3,9 +3,9 @@
 
 //! Actual private socket DATA controls; no fabricated native completion/owner.
 use super::*;
-use std::{io::Write as _, time::Duration};
+use std::{io::Write as _, os::fd::AsFd as _};
 fn endpoint() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    crate::fixture_deadline(Instant::now())
 }
 fn sockets() -> (Socket, Socket) {
     let (a, b) = aterm_uds::kept_out(CtlStream::pair).unwrap();
@@ -84,13 +84,23 @@ fn exact_ack_requires_original_terminal_eof_and_peer_eof() {
 fn early_ack_and_peer_eof_are_not_completion() {
     let (mut delivery, mut peer) = delivery();
     peer.push(b"exact bound ack".to_vec()).unwrap();
-    peer.flush(endpoint()).unwrap();
+    assert!(peer.flush(endpoint()).unwrap());
     assert!(delivery.poll(endpoint()).is_err());
     let (mut delivery, peer) = self::delivery();
     // Establish EOF even if a concurrent fork temporarily inherited the endpoint.
+    // Dropping a socket alone can leave its nonblocking observer briefly waiting;
+    // the observed EOF still cannot complete delivery.
     peer.shutdown(std::net::Shutdown::Write).unwrap();
     drop(peer);
-    assert!(delivery.poll(endpoint()).is_err());
+    let deadline = endpoint();
+    aterm_uds::ready::until(
+        delivery.socket.stream.as_fd(),
+        aterm_uds::ready::Interest::Read,
+        deadline,
+    )
+    .unwrap();
+    assert!(matches!(delivery.socket.peek().unwrap(), Peek::Eof));
+    assert!(delivery.poll(deadline).is_err());
 }
 #[test]
 fn wrong_or_trailed_ack_refuses_after_actual_terminal_eof() {

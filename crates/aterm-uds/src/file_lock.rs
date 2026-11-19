@@ -431,6 +431,12 @@ impl LockFile {
         lock_exclusive_until(&file, deadline, busy)?;
         Ok(Self(file))
     }
+
+    /// The open file the lock is held on, for a look at which file it is
+    /// ([`crate::line_log::lock`]).
+    pub(crate) const fn file(&self) -> &std::fs::File {
+        &self.0
+    }
 }
 
 /// `InvalidData` unless `file`, opened at `path`, is a regular file (on Windows, and no reparse

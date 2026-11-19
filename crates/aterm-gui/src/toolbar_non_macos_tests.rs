@@ -16,6 +16,7 @@ fn metadata(dirty: bool, busy: bool, attention: bool) -> TabStripMetadata {
         },
         conn: None,
         closable: true,
+        panel_numbers: false,
         team: crate::tab_bar::TabTeam::NONE,
     }
 }

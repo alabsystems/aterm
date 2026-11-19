@@ -1833,6 +1833,22 @@ static ARMED: std::sync::Once = std::sync::Once::new();
 type WallMoved = Box<dyn Fn() + Send>;
 static ON_WALL_MOVED: std::sync::Mutex<Option<WallMoved>> = std::sync::Mutex::new(None);
 
+/// Whether the sampler runs where it hears a sleep's wake ([`spawn_sampler`]): from the wall
+/// watch, or off its clocks' drift while it judges.
+static SAMPLER_HEARS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a sleep's wake reaches `on_wall_moved` ([`start`]) in this process: the sampler runs,
+/// hearing the wall, and what a wall move does is installed. A background wait whose ring hangs off
+/// it (the package lane's, `crate::wake_rings::PKG_LANE`) may rest past its bounded look only
+/// then.
+pub(crate) fn wall_heard() -> bool {
+    SAMPLER_HEARS.load(std::sync::atomic::Ordering::Acquire)
+        && ON_WALL_MOVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+}
+
 fn wall_moved() {
     if let Some(on_wall_moved) = ON_WALL_MOVED
         .lock()
@@ -1885,7 +1901,12 @@ fn spawn_sampler() {
         return;
     }
     let builder = std::thread::Builder::new().name("aterm-watchdog".into());
-    let _ = builder.spawn(move || run(&MAIN, judge, wall.as_ref(), &wall_moved, &|_| true));
+    if builder
+        .spawn(move || run(&MAIN, judge, wall.as_ref(), &wall_moved, &|_| true))
+        .is_ok()
+    {
+        SAMPLER_HEARS.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Where no wall watch exists (off Unix and Windows): never made.

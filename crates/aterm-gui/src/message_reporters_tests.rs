@@ -3154,6 +3154,99 @@ fn every_notices_ask_is_its_own_row_keyed_whole() {
     );
 }
 
+/// A MEMORY STARVATION EPISODE IS A RECORD AT ITS OPENING AND ITS END, in fixed words and
+/// numbers: the opening says the rule, what the machine pushed out and read back and what it had
+/// left to hand out, and the compressor's fill where read; the end, how long it lasted and the
+/// worst it read. Each names the largest holders by footprint with their pids and tabs, a name
+/// that is no plain program name as `-`, a tab by its number (`Tab 3`) and never by a title a
+/// program chose (a parked tab's), and the sweep's age where it stalled since; with none held it
+/// says so. Both are `system/starving` records, never on any glass.
+#[test]
+fn a_starvation_episode_is_a_record_at_its_opening_and_its_end() {
+    use aterm_vitals::RowScope;
+    use aterm_vitals::starving::{Edge, Episode, Holder, Look, Why, Worst};
+    let holder = |pid, gib: u64, scope, label: Option<&str>| Holder {
+        pid,
+        name: "ty".into(),
+        bytes: gib << 30,
+        scope,
+        label: label.map(str::to_owned),
+    };
+    let episode = Episode {
+        why: Why::Thrash,
+        opened_ns: 1,
+        opened_unix_ms: 1_763_277_369_800,
+        at_open: Look {
+            push_bps: Some(259.0 * 1_048_576.0),
+            refault_bps: Some(89.0 * 1_048_576.0),
+            headroom: Some(382_055 * 16_384),
+            ram: 128 << 30,
+            wall_permille: Some(951),
+            ..Look::default()
+        },
+        worst: Worst {
+            push_bps: 300.0 * 1_048_576.0,
+            refault_bps: 90.0 * 1_048_576.0,
+            headroom: Some(914 * 16_384),
+            wall_permille: Some(1000),
+            stall_full: None,
+        },
+        holders: vec![
+            holder(77_936, 133, RowScope::Others, None),
+            holder(77_700, 83, RowScope::Tab(7), Some("Tab 3")),
+            Holder {
+                name: "a name; with words".into(),
+                ..holder(77_701, 65, RowScope::Tab(9), None)
+            },
+            holder(77_702, 41, RowScope::Tab(11), Some("rm -rf ~ ; Tab 4")),
+        ],
+        holders_age_ms: Some(255_000),
+        ended: None,
+    };
+    let opened = super::starving_record(&Edge::Opened(episode.clone()));
+    assert_eq!(
+        opened.title,
+        "Memory is starving: pages are pushed out of RAM and read back"
+    );
+    assert_eq!(
+        opened.detail,
+        [
+            "259 MiB/s pushed out, 89 MiB/s read back; 5.8 GiB of 128.0 GiB free to hand out",
+            "the compressor at 95.1 % of its segments",
+            "largest: ty 133.0 GiB (pid 77936), ty 83.0 GiB (pid 77700) in Tab 3, \
+             - 65.0 GiB (pid 77701) in a tab, ty 41.0 GiB (pid 77702) in a tab",
+            "as the sweep 4 m before named them",
+        ]
+    );
+    let ended = super::starving_record(&Edge::Ended(Episode {
+        ended: Some((1_763_277_369_800 + 671_000, Look::default())),
+        holders: Vec::new(),
+        holders_age_ms: None,
+        ..episode.clone()
+    }));
+    assert_eq!(ended.title, "Memory starvation ended after 11 m");
+    assert_eq!(
+        ended.detail,
+        [
+            "at worst 300 MiB/s pushed out, 90 MiB/s read back, 0.0 GiB free to hand out",
+            "the compressor at most at 100.0 % of its segments",
+            "no process sweep named the largest holders",
+        ]
+    );
+    let wall = super::starving_record(&Edge::Opened(Episode {
+        why: Why::Wall,
+        ..episode
+    }));
+    assert_eq!(
+        wall.title,
+        "Memory is starving: the compressor is near its wall"
+    );
+    for msg in [&opened, &ended, &wall] {
+        assert!(matches!(msg.need(), aterm_messages::need::Need::Record));
+        assert_eq!(msg.key.as_deref(), Some(super::STARVING_KEY));
+    }
+}
+
 /// A BACKED-UP EPISODE OF MACOS'S PROGRAM CHECK IS A RECORD AT EACH EDGE: the opening says how
 /// many are held and the oldest, and, when aterm started none of them, that aterm's grant does
 /// not reach them; the drain says how long it lasted (at least its longest wait) and the most at

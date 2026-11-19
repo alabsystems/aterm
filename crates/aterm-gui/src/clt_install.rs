@@ -1126,35 +1126,105 @@ impl RootSteps {
     }
 }
 
-/// What setup's one early elevation owes this Mac beside the tools, from what
-/// this account reads with no prompt (`aterm_machines::root_steps::owed` reads the same for
-/// `aterm init`): developer `mode` (`DevToolsSecurity -status`), or an enabled mode this
-/// console account is not authorized to use (`member`), or `rule`, the stat of the
-/// rule that names the Mac after admission ([`aterm_types::macos_setup::ADMITTED_NAME_RULE`]),
-/// reading no root-owned 0440 file while no refused rule stands
-/// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`], `refused`), or `broker`, the LAN
-/// broker's install owed as both read it ([`aterm_uds::lan::install::Reading::owed_with_job`]:
-/// its image or plist missing or not this build's, or its service stopped; a running image of
-/// the source's own signing team adopts with no password, and a job launchd lists switched off
-/// stays the person's, owing nothing), or `spotlight`, a folder of this account's home besides
-/// Documents and Desktop still indexed in a home setup's password has never scoped (a folder
-/// made since a password scoped it waits for the next root transaction and asks nothing by
-/// itself), which is the reading every `aterm init` shares
-/// (`aterm_machines::init_spotlight::automatic_scope_owed`).
-/// A step that cannot be read is not owed: no password is asked for want of a reading. Only
-/// macOS reads it. [`read_root_steps`] then leaves out the broker and developer mode where a
-/// root apply already failed at them for good with the inputs they read now
-/// (`aterm_types::macos_setup::refused`), as `aterm init` does for a run nobody asked for.
+/// What this account reads with no prompt of each step setup's one early elevation may owe
+/// beside the tools ([`root_steps_owed_by`]; `aterm_machines::root_steps::owed` reads the same
+/// for `aterm init`).
 #[cfg(any(target_os = "macos", all(test, unix)))]
-pub(crate) fn root_steps_owed_by(
-    mode: aterm_containment::consent::DebuggerMode,
-    member: aterm_containment::consent::DebuggerMember,
-    rule: std::io::Result<(u32, u32, bool)>,
-    refused: bool,
-    broker: bool,
-    spotlight: bool,
-) -> RootSteps {
+#[derive(Debug)]
+pub(crate) struct RootReadings {
+    /// Developer mode (`DevToolsSecurity -status`).
+    pub(crate) mode: aterm_containment::consent::DebuggerMode,
+    /// Whether this console account may use an enabled mode.
+    pub(crate) member: aterm_containment::consent::DebuggerMember,
+    /// The stat of the rule that names the Mac after admission
+    /// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE`]): its owner, its permission bits, and
+    /// whether it is a regular file.
+    pub(crate) rule: std::io::Result<(u32, u32, bool)>,
+    /// Root's record that `visudo` refused the rule stands
+    /// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`]).
+    pub(crate) rule_refused: bool,
+    /// The person's removal of the rule with its own revert stands
+    /// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REMOVED`]).
+    pub(crate) rule_removed: bool,
+    /// The LAN broker's install owed as both read it
+    /// ([`aterm_uds::lan::install::Reading::owed_with_job`]: its image or plist missing or not
+    /// this build's, or its service stopped; a running image of the source's own signing team
+    /// adopts with no password, and a job launchd lists switched off stays the person's, owing
+    /// nothing).
+    pub(crate) broker: bool,
+    /// A folder beside Applications, Documents, Desktop and the synced drives still indexed
+    /// where setup's password has never scoped this home, or never scoped the rest of the data
+    /// volume for it (a folder made since a password scoped it waits for the next root
+    /// transaction and asks nothing by itself), which is the reading every `aterm init` shares
+    /// (`aterm_machines::init_spotlight::automatic_scope_owed`).
+    pub(crate) spotlight: bool,
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+impl RootReadings {
+    /// What the elevation owes once root's records are read through `reads`, as
+    /// `aterm_machines::root_steps` reads them for a run nobody asked for: the rule's refusal and
+    /// the person's removal of it (each a stat, taking the place of `rule_refused` and
+    /// `rule_removed`), and the broker and developer mode left out where root's record stands for
+    /// the inputs they read now (`aterm_types::macos_setup::refused::stands`: the broker's
+    /// `broker_key`, developer mode's key of this mode and the account `uid`, a stalled line in
+    /// the boot `boot` reads).
+    pub(crate) fn with_records(
+        self,
+        reads: &dyn aterm_types::macos_setup::spotlight_scope::Reads,
+        uid: u32,
+        broker_key: impl FnOnce() -> Option<String>,
+        boot: &dyn Fn() -> Option<String>,
+    ) -> RootSteps {
+        use aterm_types::macos_setup::{
+            ADMITTED_NAME_RULE_REFUSED, ADMITTED_NAME_RULE_REMOVED, refused,
+        };
+        let stands = |path: &str| reads.entry(std::path::Path::new(path)).is_ok();
+        let mode = self.mode;
+        let mut owed = root_steps_owed_by(Self {
+            rule_refused: stands(ADMITTED_NAME_RULE_REFUSED),
+            rule_removed: stands(ADMITTED_NAME_RULE_REMOVED),
+            broker: self.broker && !refused::stands(reads, refused::LAN_BROKER, broker_key, boot),
+            ..self
+        });
+        if owed.debugger
+            && refused::stands(
+                reads,
+                refused::DEVELOPER_MODE,
+                || {
+                    Some(refused::developer_mode_key(
+                        mode == aterm_containment::consent::DebuggerMode::Enabled,
+                        uid,
+                    ))
+                },
+                boot,
+            )
+        {
+            owed.debugger = false;
+        }
+        owed
+    }
+}
+
+/// What setup's one early elevation owes this Mac beside the tools, from what this account
+/// reads with no prompt ([`RootReadings`]): developer mode off, or an enabled mode this console
+/// account is not authorized to use; the rule, where no root-owned 0440 file stands at its path
+/// and neither root's refusal of it nor the person's removal of it does; the broker's install;
+/// or Spotlight's scope. A step that cannot be read is not owed: no password is asked for want
+/// of a reading. Only macOS reads it. [`read_root_steps`] reads it with root's records
+/// ([`RootReadings::with_records`]), as `aterm init` does for a run nobody asked for.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) fn root_steps_owed_by(readings: RootReadings) -> RootSteps {
     use aterm_containment::consent::DebuggerMode;
+    let RootReadings {
+        mode,
+        member,
+        rule,
+        rule_refused,
+        rule_removed,
+        broker,
+        spotlight,
+    } = readings;
     let off = match mode {
         DebuggerMode::Disabled => Some(true),
         DebuggerMode::Enabled => Some(false),
@@ -1165,7 +1235,9 @@ pub(crate) fn root_steps_owed_by(
     };
     let rule_owed = match rule {
         Ok((uid, mode, file)) => !(file && uid == 0 && mode == 0o440),
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound && !refused,
+        Err(error) => {
+            error.kind() == std::io::ErrorKind::NotFound && !rule_refused && !rule_removed
+        }
     };
     RootSteps {
         debugger: off == Some(true)
@@ -1198,29 +1270,33 @@ pub(crate) fn read_root_steps() -> bool {
                 };
                 let rule = std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE)
                     .map(|meta| (meta.uid(), meta.mode() & 0o7777, meta.file_type().is_file()));
-                let refused =
-                    std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED)
-                        .is_ok();
-                // A step a root apply already failed at for good, with the inputs it reads now, is
-                // not asked for by itself again (`aterm_types::macos_setup::refused`).
-                let broker = aterm_uds::lan::install::owed_here(
-                    || aterm_secrets::service::system_job_running(aterm_uds::lan::LABEL),
-                    || aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL),
-                ) && !aterm_types::macos_setup::refused::broker_stands_here();
-                let spotlight = aterm_types::macos_setup::spotlight_scope::automatic_owed_here();
-                let mut owed =
-                    root_steps_owed_by(debugger.mode, member, rule, refused, broker, spotlight);
-                if owed.debugger
-                    && aterm_types::macos_setup::refused::developer_mode_stands_here(
-                        &aterm_types::macos_setup::refused::developer_mode_key(
-                            debugger.mode == aterm_containment::consent::DebuggerMode::Enabled,
-                            uid,
-                        ),
-                    )
-                {
-                    owed.debugger = false;
-                }
-                aterm_log::info!("System State: setup's one Mac password owes this Mac: {owed:?}");
+                let readings = RootReadings {
+                    mode: debugger.mode,
+                    member,
+                    rule,
+                    // Read with root's records below.
+                    rule_refused: false,
+                    rule_removed: false,
+                    broker: aterm_uds::lan::install::owed_here(
+                        || aterm_secrets::service::system_job_state(aterm_uds::lan::LABEL),
+                        || aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL),
+                    ),
+                    spotlight: aterm_types::macos_setup::spotlight_scope::automatic_owed_here(),
+                };
+                // Each input by name, so the journal says which step owes the password.
+                let inputs = format!("{readings:?}");
+                // A step a root apply already failed at with the inputs it reads now, for good
+                // or stalled in this boot, is not asked for by itself again
+                // (`aterm_types::macos_setup::refused`).
+                let owed = readings.with_records(
+                    &aterm_types::macos_setup::spotlight_scope::Live,
+                    uid,
+                    aterm_types::macos_setup::refused::broker_key_here,
+                    &aterm_types::macos_setup::refused::boot_here,
+                );
+                aterm_log::info!(
+                    "System State: setup's one Mac password owes this Mac: {owed:?} ({inputs})"
+                );
                 let _ = crate::workstation_setup::send_setup_wake(Wake::RootStepsOwed(owed));
             }
         });

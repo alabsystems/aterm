@@ -38,9 +38,9 @@ pub const ACCOUNTED_ATTACHED: &str = "OK resource-admission-v3 accounted-v1 atta
 /// Exact session and unique submission-attempt binding, never a credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {
-    /// The local session's ID in either form ([`crate::control_verbs::is_minted_sid`]): a minted
-    /// `t` ID, or the exact `s-` ID a tab opened before the `t` form keeps until it closes. The host names
-    /// its journal file by it, so the wire admits exactly what the journal can name.
+    /// The exact owned local session's ID ([`crate::control_request::Sid::parse`]): a current
+    /// `t` ID, or the exact `s-` ID a running shell still holds. The host names its journal
+    /// file by it; this local binding does not establish fleet requester attribution.
     pub session: String,
     /// Unique attempt identity, checked for replay by the host.
     pub attempt: [u8; 16],
@@ -230,7 +230,7 @@ fn header(bytes: &[u8], kind: u8) -> io::Result<(Binding, Decoder<'_>)> {
     Ok((binding, d))
 }
 fn validate_binding(b: &Binding) -> io::Result<()> {
-    if crate::control_verbs::is_minted_sid(&b.session) {
+    if crate::control_request::Sid::parse(&b.session).is_some() {
         Ok(())
     } else {
         Err(bad())

@@ -2944,6 +2944,7 @@ fn the_arrow_offers_a_later_build_until_its_move_lands() {
         ("account-policy-limited", "after the usage limit"),
         ("account-unattributed", ""),
         ("account-integrity", ""),
+        ("account-retained", ""),
         ("account-token", ""),
         ("account-policy-pin", ""),
         ("account-policy-lease", ""),

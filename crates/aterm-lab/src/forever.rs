@@ -154,7 +154,7 @@ pub const CHECK_KEY: &str = "done is never the end";
 pub const CONTINUE_KEY: &str = "Autopilot is Cruise: keep going";
 
 const OPEN_SUFFIX: &str = "Your report still names open work";
-const REPO_SUFFIX: &str = "Your repository still holds work";
+const REPO_SUFFIX: &str = "Your repository's local Git state still shows work";
 
 const CARRYING_ON: &str = "— carrying on";
 
@@ -821,11 +821,11 @@ impl Repo {
                 &["changed", "untracked", "unpushed", "not on"],
             ),
             Repo::Unpushed => (
-                &["1 unpushed commit", "1 commit not on origin/main"],
+                &["1 unpushed commit", "1 commit not on cached origin/main"],
                 &["changed", "untracked", "stash"],
             ),
             Repo::Unlanded => (
-                &["1 commit not on origin/main"],
+                &["1 commit not on cached origin/main"],
                 &["changed", "untracked", "stash", "unpushed"],
             ),
             Repo::Others => (
@@ -843,7 +843,7 @@ impl Repo {
             Repo::Changed => "README.md changed, not committed",
             Repo::Stashed => "a stash entry on main",
             Repo::Unpushed => "a commit no remote holds",
-            Repo::Unlanded => "a commit pushed to origin/wip, not on origin/main",
+            Repo::Unlanded => "a commit pushed to origin/wip, not on cached origin/main",
             Repo::Others => "another session's worktree, branch and stash",
             Repo::NoRemote => "committed, no remote",
             Repo::Plain => "a plain folder, no repository",

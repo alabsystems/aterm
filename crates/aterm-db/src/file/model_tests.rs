@@ -290,14 +290,23 @@ impl Walk {
         }
     }
 
-    /// How many of the records that arrived during the walk the snapshot was projected from.
+    /// How many of the records that arrived during the walk the snapshot was projected from: the
+    /// operations its history names, which the pass that wrote the snapshot wrote beside it.
+    /// The frontier names stores, not records, so it is the history that says which.
     fn snapshot_frontier(&self) -> i64 {
-        let Some(frontier) = self.stand.file(&MACHINES).frontier() else {
+        let file = self.stand.file(&MACHINES);
+        if file.frontier().is_none() {
             return 0;
-        };
+        }
+        let projected: Vec<String> = file
+            .history()
+            .iter()
+            .filter_map(|entry| entry.get("op").and_then(aterm_json::Value::as_str))
+            .map(str::to_owned)
+            .collect();
         self.grown
             .iter()
-            .filter(|operation| frontier.ids.contains(*operation))
+            .filter(|operation| projected.contains(&aterm_codec::hex::encode_lower(*operation)))
             .count() as i64
     }
 

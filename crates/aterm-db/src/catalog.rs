@@ -7,7 +7,10 @@
 
 use crate::{
     Error, Result,
-    table::{Scope, Session, store::Store},
+    table::{
+        Scope, Session,
+        store::{Sighting, Store},
+    },
 };
 use astream_wire::sync::{Actor, Digest};
 use aterm_secrets::{client::Paths, commons::journal::Trust};
@@ -28,6 +31,15 @@ pub(crate) mod ring;
 pub use descriptor::Descriptor;
 pub(crate) use descriptor::application_scope;
 pub use policy::Policy;
+
+/// What a read of a table that holds a [`Sighting`] of it finds
+/// ([`Directory::observe_table_sighted`]).
+pub(crate) enum Sighted {
+    /// The table stands as the sighting's open read it: its revision is the sighting's.
+    Unchanged,
+    /// The table, read as [`Directory::observe_table`] reads it.
+    Opened(Store),
+}
 
 /// The catalog has its own slot; applications cannot displace it.
 pub(crate) const MAX_TABLES: usize = 63;
@@ -93,9 +105,24 @@ pub struct Declaration {
 pub enum State {
     Subscribed,
     Conflict,
+    /// Sealed by its twin, and a generation of a family this build compiles that keeps every
+    /// signed record across a roll ([`release::kept`], `att::keeps_records`): nothing writes it
+    /// or reads it as the family's current generation, and every Mac still holds it and repairs
+    /// it, so a Mac that joins after the seal fetches its log and a record that reached a Mac
+    /// late still reaches the others. Its storage is never released.
+    Kept,
     Excluded,
     CreatorLimit,
     Capacity,
+}
+
+impl State {
+    /// Whether this Mac holds the table's storage and repairs it with its peers: a subscribed
+    /// table, or a sealed generation a family keeps ([`Self::Kept`]).
+    #[must_use]
+    pub const fn held(self) -> bool {
+        matches!(self, Self::Subscribed | Self::Kept)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -213,7 +240,7 @@ impl Directory {
     /// # Errors
     /// As [`Self::observe_table`], but for what [`Self::observe_held`] answers or refuses.
     pub(crate) fn observe_held_table(&self, session: &Session<'_>, scope: Scope) -> Result<Store> {
-        match self.observe_table_if_exists_as(session, scope, true)? {
+        match self.observe_table_if_exists_as(session, scope, true, false)? {
             Some(store) => Ok(store),
             None => self.observe_store(session, scope),
         }
@@ -261,18 +288,64 @@ impl Directory {
         session: &Session<'_>,
         scope: Scope,
     ) -> Result<Option<Store>> {
-        self.observe_table_if_exists_as(session, scope, false)
+        self.observe_table_if_exists_as(session, scope, false, false)
+    }
+
+    /// [`Self::observe_table`] for a reader that holds a [`Sighting`] of the table's primary
+    /// store, from an earlier read of this table here (tracker LT-25C): `Unchanged` where the
+    /// store stands as that sighting's open read it ([`Store::sighting_stands`]) and no recovery
+    /// replica is enrolled, the one thing beside it that [`Self::observe_table`] would read, so
+    /// that the table's revision is the sighting's and no record was opened. Otherwise the table
+    /// read as [`Self::observe_table`] reads it, whose answer, a refusal included, stands; its
+    /// primary's open records what a sighting of it keeps
+    /// ([`Store::observe_if_exists_sighted`]). A catalog and a recovery directory's table are
+    /// never answered `Unchanged`. The enrollment is read after the sighting stood, not before
+    /// it: a replica enrolled while the sighting was judged is then seen, and a replica enrolled
+    /// after a sighting costs one judgment that stood, once, since the combined view read next
+    /// makes no sighting.
+    ///
+    /// # Errors
+    /// As [`Self::observe_table`].
+    pub(crate) fn observe_table_sighted(
+        &self,
+        session: &Session<'_>,
+        scope: Scope,
+        sighting: Option<&Sighting>,
+    ) -> Result<Sighted> {
+        if let Some(sighting) = sighting
+            && !self.is_recovery()
+            && scope != self.catalog_scope()
+            && Store::sighting_stands(session, &self.path(scope)?, scope, sighting)
+            && matches!(
+                self.recovery().enrollment(session, scope),
+                Ok(crate::table::store::Enrollment::Absent)
+            )
+        {
+            return Ok(Sighted::Unchanged);
+        }
+        match self.observe_table_if_exists_as(session, scope, false, true)? {
+            Some(store) => Ok(Sighted::Opened(store)),
+            None => self.observe_store(session, scope).map(Sighted::Opened),
+        }
     }
 
     /// [`Self::observe_table_if_exists`]; and where `held`, a primary observation that refuses
-    /// is answered by [`Self::observe_held`].
+    /// is answered by [`Self::observe_held`]; and where `sighted`, a primary's observation records
+    /// what a [`Sighting`] of it keeps ([`Store::observe_if_exists_sighted`]).
     fn observe_table_if_exists_as(
         &self,
         session: &Session<'_>,
         scope: Scope,
         held: bool,
+        sighted: bool,
     ) -> Result<Option<Store>> {
-        match self.observe_store_if_exists(session, scope) {
+        let primary = if sighted && !self.is_recovery() {
+            self.path(scope)
+                .and_then(|dir| Store::observe_if_exists_sighted(session, &dir, scope))
+        } else {
+            self.observe_store_if_exists(session, scope)
+        };
+        match primary {
             Ok(Some(store)) if self.is_recovery() && scope != self.catalog_scope() => {
                 match self.primary().observe_store_if_exists(session, scope) {
                     Ok(Some(primary)) => store.with_observed_primary(session, primary).map(Some),
@@ -609,9 +682,7 @@ impl Directory {
             .entries
             .iter()
             .filter(|(id, entry)| {
-                entry.state == State::Subscribed
-                    && !retained.contains(*id)
-                    && !reserved_ids.contains(*id)
+                entry.state.held() && !retained.contains(*id) && !reserved_ids.contains(*id)
             })
             .count();
         if count + awaiting > CATALOG_SLOTS && !reserved {
@@ -626,16 +697,21 @@ impl Directory {
     /// Add this Mac's own declaration of a reserved table another Mac declared, as evidence
     /// that this Mac runs a build that compiles it (a registry roll seals only once every Writer
     /// shows that, `alab::roll`): `publish` coalesces onto an existing declaration, so it says
-    /// nothing of the Mac that runs it. Only a reserved table, declared alike by everyone, still
-    /// subscribed and not yet declared by this Mac, gets one; it takes no creator slot. Returns
-    /// whether a declaration was written.
+    /// nothing of the Mac that runs it. Only a reserved table, or a generation of a family that
+    /// keeps its records across a roll ([`release::compiles_kept`], whose roll waits the same way,
+    /// `att::roll`), declared alike by everyone, still subscribed and not yet declared by this
+    /// Mac, gets one. A reserved table takes no creator slot; a kept family's generation is
+    /// nominated by its roller, and this Mac's declaration nominates it too only while this Mac
+    /// has creator slots left. Returns whether a declaration was written.
     ///
     /// # Errors
     /// No Commons writer, the catalog cannot be read or written, or this Mac's catalog history
     /// is spent.
     pub(crate) fn endorse(&self, session: &Session<'_>, descriptor: &Descriptor) -> Result<bool> {
         session.writer()?;
-        if !self.is_reserved(descriptor) || descriptor.scope.trust() != self.trust {
+        if !(self.is_reserved(descriptor) || release::compiles_kept(self.trust, descriptor))
+            || descriptor.scope.trust() != self.trust
+        {
             return Ok(false);
         }
         let mut catalog = self.catalog(session)?;
@@ -982,7 +1058,7 @@ impl Directory {
             .project(session, self.discovery_records(session)?, policy)?
             .entries
             .get(&id)
-            .is_some_and(|entry| entry.state == State::Subscribed))
+            .is_some_and(|entry| entry.state.held()))
     }
     /// Observe settled subscriptions without enrolling or reserving a slot.
     /// None asks the caller to acquire a writer for first-time setup.
@@ -1035,11 +1111,7 @@ impl Directory {
     ) -> Result<Option<BTreeMap<Digest, (Scope, PathBuf)>>> {
         let scope = self.catalog_scope();
         let mut tables = BTreeMap::from([(scope.digest(), (scope, self.path(scope)?))]);
-        for entry in snapshot
-            .entries
-            .values()
-            .filter(|entry| entry.state == State::Subscribed)
-        {
+        for entry in snapshot.entries.values().filter(|entry| entry.state.held()) {
             let path = self.path(entry.scope)?;
             if !path.try_exists()? {
                 return Ok(None);
@@ -1119,11 +1191,7 @@ impl Directory {
         }
         let snapshot = self.project(session, self.discovery_records(session)?, policy)?;
         let mut tables = BTreeMap::from([(scope.digest(), (scope, self.path(scope)?))]);
-        for entry in snapshot
-            .entries
-            .values()
-            .filter(|entry| entry.state == State::Subscribed)
-        {
+        for entry in snapshot.entries.values().filter(|entry| entry.state.held()) {
             let scope = entry.scope;
             let path = self.path(scope)?;
             if !path.try_exists()? {
@@ -1257,12 +1325,24 @@ impl Directory {
         let stored = total;
         let mut free: Option<usize> = None;
         let mut reserved = BTreeSet::new();
+        // A sealed generation a family keeps takes its storage as a subscribed table does: by
+        // local policy, its creator's budget and a free slot. It is marked kept once those pass.
+        let keeps = release::kept(self.trust);
+        let mut kept = BTreeSet::new();
         for (id, entry) in &mut snapshot.entries {
             let first = &entry.declarations[0].descriptor;
             if self.is_reserved(first) {
                 reserved.insert(*id);
             }
-            entry.state = if entry.declarations.iter().any(|d| &d.descriptor != first) {
+            if keeps.iter().any(|descriptor| {
+                descriptor.scope.digest() == *id
+                    && release::sealed_by_twin(&entry.declarations, descriptor).is_some()
+            }) {
+                kept.insert(*id);
+            }
+            entry.state = if !kept.contains(id)
+                && entry.declarations.iter().any(|d| &d.descriptor != first)
+            {
                 State::Conflict
             } else if !policy.includes(self.catalog_scope().digest(), *id) {
                 State::Excluded
@@ -1312,6 +1392,13 @@ impl Directory {
                 } else {
                     *free -= 1;
                 }
+            }
+        }
+        for id in kept {
+            if let Some(entry) = snapshot.entries.get_mut(&id)
+                && entry.state == State::Subscribed
+            {
+                entry.state = State::Kept;
             }
         }
         Ok(snapshot)

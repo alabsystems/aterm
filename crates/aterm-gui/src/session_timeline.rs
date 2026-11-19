@@ -525,17 +525,23 @@ impl SessionMeta {
     }
 
     /// Open the record stream of the claimant `proven` on the aterm instance `epoch`
-    /// ([`crate::control_auth::process_instance_id`]) and return its state. The same claimant
-    /// keeps what was acknowledged (`acked`), its applied kinds and its counters across
-    /// connections, so a reopened stream resends only what follows; another claimant starts
-    /// from nothing. `in` counts aterm's records within one epoch: a new epoch starts it at 0.
+    /// ([`crate::control_auth::process_instance_id`]), served on connection `conn`, and return
+    /// its state. The same claimant keeps what was acknowledged (`acked`) and its counters
+    /// across connections, and its applied kinds while its claim stands
+    /// ([`Self::settle_stream_run`]), so a reopened stream resends only what follows; another
+    /// claimant starts from nothing. `in` counts aterm's records within one epoch: a new epoch
+    /// starts it at 0. Every open starts owed nothing: a `restart` or `policy` owed to an
+    /// earlier stream whose lane has not closed yet (busy serving a `claim` record, or blocked
+    /// writing to a peer that stopped reading) is dropped here, as its close would have dropped
+    /// it (D8), and the `policy` every open sends covers one that was due.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn open_stream(
         &mut self,
         proven: &crate::harness_claim::Proven,
         epoch: &str,
+        conn: u64,
     ) -> &mut StreamState {
-        let state = match self.stream.take() {
+        let mut state = match self.stream.take() {
             Some(mut kept) if kept.proven == *proven => {
                 if kept.epoch != epoch {
                     kept.epoch = epoch.to_string();
@@ -545,7 +551,63 @@ impl SessionMeta {
             }
             _ => StreamState::new(proven.clone(), epoch),
         };
+        state.open = Some(conn);
+        state.restarts.clear();
+        state.policy_due = false;
         self.stream.insert(state)
+    }
+
+    /// The stream of the claimant `proven`, served on connection `conn`, closed: nothing it was
+    /// owed and did not send is sent on a later stream (D8). A stream another connection opened
+    /// since is left as it is.
+    #[cfg(unix)]
+    pub(crate) fn close_stream(&mut self, proven: &crate::harness_claim::Proven, conn: u64) {
+        if let Some(state) = self
+            .stream
+            .as_mut()
+            .filter(|state| state.proven == *proven && state.open == Some(conn))
+        {
+            state.open = None;
+            state.restarts.clear();
+            state.policy_due = false;
+        }
+    }
+
+    /// The state of the record stream open now for the claim live at `now_us`: the claimant's
+    /// own stream, served on the connection the claim is bound to. `None` with no stream open,
+    /// and for a claim that left the stream's connection or is another claimant's: aterm owes
+    /// its records only to an open stream.
+    fn open_stream_state(&mut self, now_us: u64) -> Option<&mut StreamState> {
+        let open = match (self.live_claim(now_us), self.stream.as_ref()) {
+            (Some(claim), Some(stream)) => {
+                stream.open.is_some()
+                    && claim.conn == stream.open
+                    && claim
+                        .scoped
+                        .as_ref()
+                        .is_some_and(|scoped| scoped.proven == stream.proven)
+            }
+            _ => false,
+        };
+        if open { self.stream.as_mut() } else { None }
+    }
+
+    /// OWE THE OPEN STREAM A `restart` RECORD for the `restart` row `payload` (the row's text,
+    /// `cause=<cause>[ to=<label> home=<pct|->][ model=<word>]`), written under this same hold:
+    /// whether one is owed. A row written while no stream is open for the live claim owes none,
+    /// then or later (D8, D32).
+    pub(crate) fn owe_stream_restart(&mut self, payload: &str, now_us: u64) -> bool {
+        self.open_stream_state(now_us)
+            .map(|state| state.restarts.push_back(payload.to_string()))
+            .is_some()
+    }
+
+    /// OWE THE OPEN STREAM A `policy` RECORD: the person's policy moved (`harness policy`).
+    /// Whether one is owed; a stream that opens later hears a `policy` as it opens.
+    pub(crate) fn owe_stream_policy(&mut self, now_us: u64) -> bool {
+        self.open_stream_state(now_us)
+            .map(|state| state.policy_due = true)
+            .is_some()
     }
 
     /// The live claim itself at `now_us` (a lapsed `ttl=` claim reads as none).
@@ -556,12 +618,32 @@ impl SessionMeta {
             .filter(|claim| claim.expires_us.is_none_or(|at| at > now_us))
     }
 
+    /// A contract 4 claim bound to this open connection. Its only expiry is the grace
+    /// installed after the connection closes, when it no longer admits a stream.
+    #[cfg(unix)]
+    pub(crate) fn stream_claim(
+        &self,
+        conn: u64,
+    ) -> Option<(&SupervisorClaim, &crate::harness_claim::Scoped)> {
+        let claim = self
+            .supervisor
+            .as_ref()
+            .filter(|claim| claim.conn == Some(conn) && claim.expires_us.is_none())?;
+        let scoped = claim
+            .scoped
+            .as_ref()
+            .filter(|scoped| scoped.claim.contract == aterm_agent::harness::contract::UNIVERSAL)?;
+        Some((claim, scoped))
+    }
+
     /// Whether the live scoped claim's own record stream, opened in `epoch`, has applied a
     /// record of `kind` (its wire word) and the claim still holds `scope`, the scope that kind
     /// is admitted under: the stream feeds that kind, and its built-in reader stands down for
-    /// it. The stream's state and its applied kinds outlive the claim and its grant, so the
-    /// claim is read too: a released or lapsed claim, another claimant's, and one renewed
-    /// without `scope` (whose records of the kind are dropped from then on) feed nothing.
+    /// it. The stream's state outlives the claim, and its applied kinds outlive the claim's
+    /// grant until the claim ends ([`Self::settle_stream_run`]), so the claim is read too: a
+    /// released or lapsed claim (one past its `ttl=` not yet removed included), another
+    /// claimant's, and one renewed without `scope` (whose records of the kind are dropped from
+    /// then on) feed nothing.
     #[must_use]
     pub(crate) fn stream_applied(
         &self,
@@ -570,15 +652,87 @@ impl SessionMeta {
         epoch: &str,
         now_us: u64,
     ) -> bool {
+        self.stream_applied_under(kind, &[scope], epoch, now_us)
+    }
+
+    /// [`Self::stream_applied`] for a kind admitted under any one of `scopes` (`need` and
+    /// `clear`: `approvals`, `questions` or `walls`), or under none beyond the open stream
+    /// (`model`, `upgrade`: `scopes` empty).
+    #[must_use]
+    pub(crate) fn stream_applied_under(
+        &self,
+        kind: &str,
+        scopes: &[aterm_agent::harness::contract::Scope],
+        epoch: &str,
+        now_us: u64,
+    ) -> bool {
         match (self.live_scoped(now_us), &self.stream) {
             (Some(scoped), Some(stream)) => {
                 stream.proven == scoped.proven
-                    && scoped.claim.scopes.contains(scope)
+                    && (scopes.is_empty()
+                        || scopes
+                            .iter()
+                            .any(|scope| scoped.claim.scopes.contains(*scope)))
                     && stream.epoch == epoch
                     && stream.applied.contains(kind)
             }
             _ => false,
         }
+    }
+
+    /// D29 FOR THE `meta set harness_*` WRITERS: whether the live claim's own record stream,
+    /// opened on this aterm ([`crate::control_auth::process_instance_id`]), applied a record of
+    /// one of `kinds` that the claim still holds a scope of `scopes` for
+    /// ([`Self::stream_applied_under`]). From then that stream is the kind's one writer, so the
+    /// same claimant's `meta set` for it is answered `ERR usage: stream`; another claimant's,
+    /// and the same one's once its claim stops feeding the kind, are written as before.
+    #[must_use]
+    pub(crate) fn stream_writes(
+        &self,
+        kinds: &[&str],
+        scopes: &[aterm_agent::harness::contract::Scope],
+        now_us: u64,
+    ) -> bool {
+        let epoch = crate::control_auth::process_instance_id();
+        kinds
+            .iter()
+            .any(|kind| self.stream_applied_under(kind, scopes, epoch, now_us))
+    }
+
+    /// KEEP `activity` AS THE CLAIM'S CONTINUATION OBSERVATION (`meta set harness_activity`, an
+    /// `act` record of act `wait`), under the supervisor revision that stands: refused (`false`,
+    /// nothing kept) where the revision's kept one, reported by the same source, has a
+    /// `sequence` at or past it, so a resent or older report never replaces a newer one. A
+    /// report of the other source is not ordered by it: a line's `seq=` and the stream's record
+    /// `seq` count apart ([`crate::autopilot_activity::Activity::from_stream`]), and a stream's
+    /// first `wait` replaces what a line kept before it, whatever sequence that line chose.
+    /// Whether what a reader words moved: another revision's, another reason or another end.
+    pub(crate) fn keep_continuation_activity(
+        &mut self,
+        activity: crate::autopilot_activity::Activity,
+    ) -> bool {
+        let revision = self.supervisor_revision;
+        if self
+            .continuation_activity
+            .as_ref()
+            .is_some_and(|(rev, old)| {
+                *rev == revision
+                    && old.from_stream == activity.from_stream
+                    && old.sequence >= activity.sequence
+            })
+        {
+            return false;
+        }
+        let changed = self
+            .continuation_activity
+            .as_ref()
+            .is_none_or(|(rev, old)| {
+                *rev != revision
+                    || old.reason != activity.reason
+                    || old.until_ms != activity.until_ms
+            });
+        self.continuation_activity = Some((revision, activity));
+        changed
     }
 
     /// The version of the build the live scoped claim's proof admitted at `now_us`: its
@@ -649,6 +803,7 @@ impl SessionMeta {
         &mut self,
         expected: &SupervisorAuthority,
         connection: u64,
+        detached_until: Option<u64>,
         now_us: u64,
     ) -> Option<SupervisorAuthority> {
         if expected.contract() != Some(2)
@@ -658,13 +813,48 @@ impl SessionMeta {
             return None;
         }
         let mut claim = self.supervisor.clone()?;
+        if claim.expires_us != detached_until {
+            return None;
+        }
         let previous = claim.conn;
         claim.conn = Some(connection);
+        claim.expires_us = None;
         self.set_supervisor(Some(claim), now_us);
         if let Some(previous) = previous.filter(|old| *old != connection) {
             self.close_connection(previous, now_us);
         }
         Some(self.supervisor_authority(now_us))
+    }
+
+    /// Keep the exact v2 SDK claim through a bounded first-adoption window
+    /// after its connection closes. Expiry changes no authority or revision.
+    #[cfg(unix)]
+    pub(crate) fn retain_closed_native_exec_claim(
+        &mut self,
+        expected: &SupervisorAuthority,
+        until_us: u64,
+        now_us: u64,
+    ) -> bool {
+        let Some(connection) = expected.connection() else {
+            return false;
+        };
+        if expected.contract() != Some(2)
+            || expected.identity().is_none()
+            || until_us <= now_us
+            || self.supervisor_authority(now_us) != *expected
+        {
+            return false;
+        }
+        let Some(claim) = self.supervisor.as_mut() else {
+            return false;
+        };
+        if claim.expires_us.is_some_and(|expiry| expiry != until_us) {
+            return false;
+        }
+        claim.expires_us = Some(until_us);
+        // The live authority survives this EOF, but its socket bindings do not.
+        self.close_connection(connection, now_us);
+        true
     }
 
     /// A scoped claimant or the private built-in harness must name its input duty. Ordinary
@@ -882,6 +1072,7 @@ impl SessionMeta {
         if needs {
             self.claim_needs = None;
         }
+        self.settle_stream_run(claim.as_ref(), now_us);
         self.supervisor = claim;
         let claimant = self
             .supervisor
@@ -893,9 +1084,55 @@ impl SessionMeta {
         }
         if !in_place || self.supervisor_authority(now_us) != before {
             self.supervisor_revision = self.supervisor_revision.wrapping_add(1);
+            // The claim's grant or revision moved under its own open stream (a `claim` record,
+            // D7): the harness is owed a `policy` record. A claim placed from another
+            // connection is no longer the stream's, which closes.
+            if let Some(stream) = self.open_stream_state(now_us) {
+                stream.policy_due = true;
+            }
         }
         self.claim_placements = self.claim_placements.wrapping_add(1);
         (self.supervisor_revision, lapsed)
+    }
+
+    /// THE STREAM'S RUN ENDS WITH ITS CLAIM, at the placement `next` (`None`: a release or a
+    /// lapse) of [`Self::set_supervisor`], before it stands. What the claimant's stream applied
+    /// (its applied kinds) and the needs it holds open are its claim's, kept while each placement
+    /// is the same claimant's contract 4 claim over its own claim still live: a renewal, a
+    /// `claim` record, a claim placed again inside the re-exec grace. A release, a lapse,
+    /// another claimant's claim, a placement over a claim that had already lapsed and the same
+    /// process's contract 3 claim end it: the applied kinds and the open needs are emptied, so
+    /// no `meta set harness_*` line of the same claimant is stood down for a kind no stream of
+    /// its claim applied, and the needs the stream raised are lifted
+    /// ([`SessionTimeline::settle_stream_claim`]). What was acknowledged (`acked`) and the
+    /// counters stay, so a stream the claimant opens again resends only what follows. A
+    /// placement whose grant names none of [`NEED_SCOPES`] ends the open needs alone: the
+    /// scope that admitted them is gone, and they do not come back with it.
+    fn settle_stream_run(&mut self, next: Option<&SupervisorClaim>, now_us: u64) {
+        let standing = self.live_scoped(now_us).map(|scoped| scoped.proven.clone());
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        let next = next
+            .and_then(|claim| claim.scoped.as_ref())
+            .filter(|scoped| {
+                scoped.proven == stream.proven
+                    && scoped.claim.contract == aterm_agent::harness::contract::UNIVERSAL
+            });
+        match next {
+            Some(scoped) if standing.as_ref() == Some(&stream.proven) => {
+                if !NEED_SCOPES
+                    .iter()
+                    .any(|scope| scoped.claim.scopes.contains(*scope))
+                {
+                    stream.needs.clear();
+                }
+            }
+            _ => {
+                stream.applied.clear();
+                stream.needs.clear();
+            }
+        }
     }
 
     /// Connection `conn` closed at `now_us`: the waits written on it under the proven claim it was
@@ -1152,8 +1389,9 @@ impl SessionMeta {
     }
 
     /// When the claim lapses ([`crate::metrics::now_us`]), live or not: a `ttl=` claim's lease,
-    /// or the end of the re-exec grace of a contract 4 claim whose connection closed
-    /// ([`Self::keep_through_grace`]). A claim bound to an open connection has none.
+    /// the end of re-exec grace for a closed contract 4 connection, or the end of
+    /// native first-adoption grace for a closed v2 SDK connection. A claim bound
+    /// to an open connection has none.
     #[must_use]
     pub(crate) fn supervisor_expiry(&self) -> Option<u64> {
         self.supervisor.as_ref().and_then(|claim| claim.expires_us)
@@ -1575,6 +1813,59 @@ pub(crate) enum Grace {
 
 /// The `state` record's kind, by its wire word, as [`StreamState::applied`] names it.
 pub(crate) const STATE_KIND: &str = "state";
+/// The `usage` record's kind: one account's limits and the context left.
+pub(crate) const USAGE_KIND: &str = "usage";
+/// The `account` record's kind: the account and its state.
+pub(crate) const ACCOUNT_KIND: &str = "account";
+/// The `progress` record's kind: the plan's items.
+pub(crate) const PROGRESS_KIND: &str = "progress";
+/// The `goal` record's kind: the active goal.
+pub(crate) const GOAL_KIND: &str = "goal";
+/// The `compact` record's kind: the vendor compacts its context.
+pub(crate) const COMPACT_KIND: &str = "compact";
+/// The `act` record's kind: what the harness did and by which rule, its continuation
+/// observation (`wait`) and its own typing's stop (`held`); `meta set harness_act`,
+/// `harness_activity` and `harness_held` stand down for it.
+pub(crate) const ACT_KIND: &str = "act";
+/// The `need` record's kind: a need the harness raised; `meta set harness_needs` stands down
+/// for it.
+pub(crate) const NEED_KIND: &str = "need";
+/// The `clear` record's kind: a need the harness raised ended; `meta set harness_needs` stands
+/// down for it as for `need`.
+pub(crate) const CLEAR_KIND: &str = "clear";
+/// The scopes a `need` or `clear` record is admitted under, any one of them: what the `meta set
+/// harness_needs` stand-down asks the claim still holds, and what the needs the stream raised
+/// stand under ([`SessionTimeline::settle_stream_claim`]).
+pub(crate) const NEED_SCOPES: [aterm_agent::harness::contract::Scope; 3] = [
+    aterm_agent::harness::contract::Scope::Approvals,
+    aterm_agent::harness::contract::Scope::Questions,
+    aterm_agent::harness::contract::Scope::Walls,
+];
+/// The `land` record's kind: Land's state; `meta set harness_land` stands down for it.
+pub(crate) const LAND_KIND: &str = "land";
+/// The `model` record's kind: the model, its effort and what is on offer.
+pub(crate) const MODEL_KIND: &str = "model";
+/// The `upgrade` record's kind: a move to a newer vendor build.
+pub(crate) const UPGRADE_KIND: &str = "upgrade";
+
+/// A `need` record the claim's stream applied and no `clear` has ended yet, kept by the record's
+/// `seq` ([`StreamState::needs`]): what a `clear` naming that `seq` ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the Unix control stream applies a `need` record"
+    )
+)]
+pub(crate) struct StreamNeed {
+    /// The need it raised, as aterm's `mark need` words it (`review`, `decision`, `help`).
+    pub(crate) word: &'static str,
+    /// The entry it raised.
+    pub(crate) entry: String,
+    /// Each need the entry stands for, in the harness's order.
+    pub(crate) needs: Vec<String>,
+}
 
 /// A claimant's record stream (`stream @<sid> v=1`, `control_stream.rs`), kept on the session
 /// beside its claim and keyed on the claimant's proof. It names no wire type: every platform
@@ -1607,17 +1898,32 @@ pub(crate) struct StreamState {
         expect(dead_code, reason = "kept by the unix-only `control_stream::judge`")
     )]
     pub(crate) last_beat_ms: Option<u64>,
-    /// A `claim` record moved the grant's words or the claim's revision, and the harness has
-    /// not been told to read its grant again: the stream owes it a `policy` record. Set where
-    /// the record is served; the sender of aterm's own records (HX-15c) takes it.
+    /// The open stream owes its harness a `policy` record ("read your grant again"): the
+    /// person's policy moved ([`SessionMeta::owe_stream_policy`]), or a placement moved the
+    /// claim's grant or revision under its own open stream ([`SessionMeta::set_supervisor`]).
+    /// The stream's sender takes it (`control_stream.rs`); a stream that closes forgets it.
+    pub(crate) policy_due: bool,
+    /// The `need` records applied and not yet ended by a `clear`, by their `seq`: a `clear`
+    /// names the need it ends by that `seq` (after a reconnect too, as this state outlives the
+    /// connection), and the newest one left is the NEEDS YOU set the claimant's stream tells.
     #[cfg_attr(
         not(unix),
-        expect(
-            dead_code,
-            reason = "set by the unix-only `control_stream::serve_claim`"
-        )
+        allow(dead_code, reason = "kept by the unix-only `control_stream::step`")
     )]
-    pub(crate) policy_due: bool,
+    pub(crate) needs: std::collections::BTreeMap<u64, StreamNeed>,
+    /// The connection serving this stream now, `None` while no stream is open: only an open
+    /// stream is owed aterm's records, and what was owed when it closed is never sent on a
+    /// later one (D8).
+    pub(crate) open: Option<u64>,
+    /// The `restart` rows written while the stream was open and not yet sent as records, each
+    /// as the row's own text (`cause=<cause>[ to=<label> home=<pct|->][ model=<word>]`):
+    /// every platform builds this file, so nothing here names a wire type.
+    pub(crate) restarts: std::collections::VecDeque<String>,
+    /// aterm's records the harness answered `took` (`stream_took=`).
+    pub(crate) took: u64,
+    /// aterm's records the harness answered `refused` (`stream_refused=`), each logged as
+    /// `mark - refused in=<n> text=<why>`.
+    pub(crate) refused: u64,
 }
 
 impl StreamState {
@@ -1634,27 +1940,34 @@ impl StreamState {
             titles: 0,
             last_beat_ms: None,
             policy_due: false,
+            needs: std::collections::BTreeMap::new(),
+            open: None,
+            restarts: std::collections::VecDeque::new(),
+            took: 0,
+            refused: 0,
         }
     }
 
-    /// The seven `stream_*` words `meta` prints for `stream` (`-` and zeros for none).
+    /// The nine `stream_*` words `meta` prints for `stream` (`-` and zeros for none).
     pub(crate) fn meta_words(stream: Option<&Self>) -> String {
-        let (epoch, acked, sent, dropped, unknown, unapplied, titles) =
-            stream.map_or(("-", 0, 0, 0, 0, 0, 0), |s| {
-                (
-                    s.epoch.as_str(),
-                    s.acked,
-                    s.sent,
-                    s.dropped,
-                    s.unknown,
-                    s.unapplied,
-                    s.titles,
-                )
-            });
+        let Some(s) = stream else {
+            return "stream_epoch=- stream_acked=0 stream_in=0 stream_dropped=0 \
+                    stream_unknown=0 stream_unapplied=0 stream_titles=0 stream_took=0 \
+                    stream_refused=0"
+                .to_string();
+        };
         format!(
-            "stream_epoch={epoch} stream_acked={acked} stream_in={sent} \
-             stream_dropped={dropped} stream_unknown={unknown} stream_unapplied={unapplied} \
-             stream_titles={titles}"
+            "stream_epoch={} stream_acked={} stream_in={} stream_dropped={} stream_unknown={} \
+             stream_unapplied={} stream_titles={} stream_took={} stream_refused={}",
+            s.epoch,
+            s.acked,
+            s.sent,
+            s.dropped,
+            s.unknown,
+            s.unapplied,
+            s.titles,
+            s.took,
+            s.refused
         )
     }
 }
@@ -1669,6 +1982,29 @@ pub(crate) struct SupervisorClaim {
     pub(crate) proven: Option<crate::self_claim::Proven>,
     /// A proven registered harness's scoped claim (contract 3 or 4); never set with `proven`.
     pub(crate) scoped: Option<crate::harness_claim::Scoped>,
+}
+
+/// The open stream lane's one connection and claim proof. Its stop is latched under
+/// the metadata lock when that binding ends, including a release followed by replacement.
+#[cfg(unix)]
+pub(crate) struct StreamBinding {
+    pub(crate) conn: u64,
+    pub(crate) proven: crate::harness_claim::Proven,
+    pub(crate) revoked: aterm_uds::stop::Stop,
+}
+
+#[cfg(unix)]
+impl StreamBinding {
+    pub(crate) fn claim<'a>(
+        &self,
+        meta: &'a SessionMeta,
+    ) -> Option<(&'a SupervisorClaim, &'a crate::harness_claim::Scoped)> {
+        if self.revoked.is_set() {
+            return None;
+        }
+        meta.stream_claim(self.conn)
+            .filter(|(_, scoped)| scoped.proven == self.proven)
+    }
 }
 
 /// An owned observation of one session's duty authority at one revision. A missing scope set
@@ -3046,6 +3382,12 @@ fn claim_supervisor_with(
         rule == ClaimRule::Renew && standing.as_ref().is_some_and(|(_, old)| *old != identity);
     let renewed_scoped_changed = rule == ClaimRule::Renew
         && !crate::harness_claim::same_authority(meta.live_scoped(now_us), scoped.as_ref());
+    let stream_connection_changed = meta.live_claim(now_us).is_some_and(|claim| {
+        claim.conn != conn
+            && claim.scoped.as_ref().is_some_and(|scoped| {
+                scoped.claim.contract == aterm_agent::harness::contract::UNIVERSAL
+            })
+    });
     let prior = meta.supervisor_revision;
     let drain = ctx.fenced_writes.capture_drain();
     let (revision, lapsed) = meta.set_supervisor(
@@ -3077,9 +3419,8 @@ fn claim_supervisor_with(
     }
     if supervisor_changed {
         record_supervisor(ctx, &meta, Some(holder), by);
-    } else if renewed_identity_changed || renewed_scoped_changed {
-        // A renewal writes no `meta-change`, and it can still end a stream's stand-down:
-        // another process now holds the claim, or the grant no longer names `state`.
+    } else if renewed_identity_changed || renewed_scoped_changed || stream_connection_changed {
+        // A renewal can end a stream or its stand-down without writing a `meta-change`.
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         if renewed_identity_changed {
             timeline.forget_holder_acts();
@@ -3573,10 +3914,16 @@ pub(crate) fn release_closed_connection(
     grace_us: Option<u64>,
 ) -> bool {
     let grace = grace_us.map_or(Grace::None, |grace_us| {
-        ctx.meta
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .keep_through_grace(conn, now_us, grace_us)
+        let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let grace = meta.keep_through_grace(conn, now_us, grace_us);
+        #[cfg(unix)]
+        if grace == Grace::Armed {
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .settle_stream_binding(&meta);
+        }
+        grace
     });
     let released = grace == Grace::None
         && publish_release_supervisor(ctx, Some(conn), now_us, aterm_slog::Actor::Aterm)
@@ -4142,7 +4489,16 @@ pub(crate) struct SessionTimeline {
     /// The view's head the session's watchers were last rung at ([`Self::ring_rows`]).
     rows_rung: u64,
     agent: AgentPublication,
+    /// An open stream's wake, owned by its lane. It is registered under meta → timeline.
+    #[cfg(unix)]
+    stream_binding: std::sync::Weak<StreamBinding>,
+    /// The needs the claim's stream raised (`mark need`) and has not lifted, by word, each with
+    /// who raised it (the claim's holder, the tab's session): what [`Self::settle_stream_claim`]
+    /// lifts once the stream holds no need of that word open under a claim that feeds `need`.
+    stream_needs: std::collections::BTreeMap<&'static str, (String, aterm_slog::Actor)>,
     foreground_generation: u64,
+    /// Earliest provider event this foreground stretch can own.
+    foreground_since: Option<std::time::Instant>,
     claude_footer: Option<(i32, Option<u64>, aterm_agent::harness::footer::FooterFacts)>,
     muse_card_account: Option<String>,
     muse_cards_need_account: bool,
@@ -4245,6 +4601,8 @@ pub(crate) struct SessionTimeline {
     /// The conversation whose whole token counters this timeline last sent on a survey row, and
     /// since when (Unix ms) it has sent them unbroken ([`Self::token_epoch`]).
     token_epoch: Option<(String, u64)>,
+    /// The rollout's authoritative counter event and its collection time, on the session clock.
+    codex_token_clock: Option<(std::time::Instant, std::time::Instant)>,
     /// The background terminals codex-alab's own record counts for the codex process in group `.0`
     /// ([`Self::set_codex_terminals`]).
     codex_terminals: Option<(i32, u32)>,
@@ -4481,6 +4839,272 @@ pub(crate) struct StreamFed {
     pub(crate) line: String,
 }
 
+/// What every row a stream record writes is stamped with, and where the record came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the Unix control stream applies a record under one"
+    )
+)]
+pub(crate) struct StreamStamp {
+    /// The aterm instance whose stream applied the record.
+    pub(crate) epoch: String,
+    /// The record's `seq`.
+    pub(crate) hseq: u64,
+    /// The claim's holder.
+    pub(crate) holder: String,
+    /// The tab's own session, the rows' author.
+    pub(crate) by: aterm_slog::Actor,
+}
+
+/// One limit of a `usage` record, as the record names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamLimit {
+    /// Which, as the vendor names it (`session`, `weekly`, …).
+    pub(crate) name: String,
+    /// How much of it is used, in percent.
+    pub(crate) used: Option<u8>,
+    /// When it resets, in milliseconds since 1970.
+    pub(crate) resets_ms: Option<u64>,
+}
+
+/// Where one item of a `progress` record's plan is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the Unix control stream reads a `progress` record into one"
+    )
+)]
+pub(crate) enum StreamedItem {
+    Pending,
+    Active,
+    Done,
+}
+
+/// A record of one of the kinds the stream applies beside `state`, as [`SessionTimeline::
+/// publish_stream_record`] takes it: the record's own fields, under no wire type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the Unix control stream reads a record into one"
+    )
+)]
+pub(crate) enum StreamRecord {
+    /// `usage`: the tab's own account's limits and the context left.
+    Usage {
+        account: String,
+        limits: Vec<StreamLimit>,
+        context_left: Option<u8>,
+    },
+    /// `account`: the tab's own account and its state, with the record's line as the wire
+    /// codec writes it.
+    Account {
+        account: String,
+        state: String,
+        line: String,
+    },
+    /// `progress`: the plan's items, in the plan's order.
+    Progress { items: Vec<(String, StreamedItem)> },
+    /// `goal`: the active goal, `None` for none.
+    Goal { text: Option<String> },
+    /// `compact`: a compaction began, or (`done`) ended, with the context left.
+    Compact {
+        done: bool,
+        context_left: Option<u8>,
+    },
+    /// `model`: the model, its effort, the top-effort key and what is on offer (each model with
+    /// its levels), and the permission mode, each only as the vendor states it, with the
+    /// record's line as the wire codec writes it.
+    Model {
+        model: Option<String>,
+        effort: Option<String>,
+        key: Option<bool>,
+        offers: Vec<(String, Vec<String>)>,
+        permission: Option<String>,
+        line: String,
+    },
+    /// `upgrade`: where a move to a newer vendor build is (its phase's wire word: `seen`,
+    /// `waiting`, `moving`, `done`, `abandoned`) and the target version, with the record's line
+    /// as the wire codec writes it.
+    Upgrade {
+        phase: &'static str,
+        to: String,
+        line: String,
+    },
+}
+
+impl StreamRecord {
+    /// The record's kind, by its wire word, as [`StreamState::applied`] names it.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix control stream reads it")
+    )]
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Usage { .. } => USAGE_KIND,
+            Self::Account { .. } => ACCOUNT_KIND,
+            Self::Progress { .. } => PROGRESS_KIND,
+            Self::Goal { .. } => GOAL_KIND,
+            Self::Compact { .. } => COMPACT_KIND,
+            Self::Model { .. } => MODEL_KIND,
+            Self::Upgrade { .. } => UPGRADE_KIND,
+        }
+    }
+}
+
+/// THE `model` RECORD the claim's stream last applied, kept in the current-state record while
+/// that stream feeds the kind: from then `survey`'s `model=` and `effort=` and every reader of
+/// the footer's model and effort ([`SessionTimeline::claude_footer_shown`]) read it, and a tab
+/// whose stream never applied `model` keeps the footer's words. It writes no log row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamModel {
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    /// Whether the vendor's top-effort key is on; `None` where it did not say.
+    pub(crate) key: Option<bool>,
+    /// The models on offer, each with its effort levels.
+    pub(crate) offers: Vec<(String, Vec<String>)>,
+    pub(crate) permission: Option<String>,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+    /// The record as the wire codec writes it, kept as text.
+    pub(crate) line: String,
+}
+
+/// THE `upgrade` RECORD the claim's stream last applied, kept in the current-state record while
+/// that stream feeds the kind: from then `status upgrade=`, the session rows' and the survey's
+/// read it ([`SessionTimeline::upgrade_column`]) and the engine-filled row stands down. It
+/// writes no log row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamUpgrade {
+    /// The phase's wire word.
+    pub(crate) phase: &'static str,
+    /// The target version.
+    pub(crate) to: String,
+    /// When it was applied, in unix seconds: the `upgrade=` word's age.
+    pub(crate) at_s: u64,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+    /// The record as the wire codec writes it, kept as text.
+    pub(crate) line: String,
+}
+
+impl StreamUpgrade {
+    /// The `upgrade=` word, in the grammar the engine's row has
+    /// (`<state>/<to>/<why>/<age>`, [`aterm_agent::harness::upgrade_drive::Row::column`]), so
+    /// every reader of it splits it the same: `<phase>/<to>/-/<age since applied at now_s>`,
+    /// `to` cut to the characters a harness word is made of (`-` for none of them).
+    #[must_use]
+    pub(crate) fn column(&self, now_s: u64) -> String {
+        let keep =
+            |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '(' | ')');
+        let to: String = self.to.chars().filter(|c| keep(*c)).take(64).collect();
+        format!(
+            "{}/{}/-/{}",
+            self.phase,
+            if to.is_empty() { "-" } else { to.as_str() },
+            aterm_agent::harness::upgrade::span(now_s.saturating_sub(self.at_s))
+        )
+    }
+}
+
+/// The `usage` reading the claim's stream last applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamUsage {
+    pub(crate) account: String,
+    pub(crate) limits: Vec<StreamLimit>,
+    pub(crate) context_left: Option<u8>,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+}
+
+impl StreamUsage {
+    /// How much of the limit `name` is used, in percent.
+    pub(crate) fn used(&self, name: &str) -> Option<u8> {
+        self.limits
+            .iter()
+            .find(|limit| limit.name == name)
+            .and_then(|limit| limit.used)
+    }
+}
+
+/// The name a `usage` record gives the five-hour limit, and the one it gives the weekly limit:
+/// the two `h5=` and `d7=` are read from.
+pub(crate) const LIMIT_SESSION: &str = "session";
+pub(crate) const LIMIT_WEEKLY: &str = "weekly";
+
+/// THE KEPT `account` LINE: the latest `account` record a claim's stream applied, with its line
+/// as the wire codec writes it, kept as text outside the log's retention. It outlives the claim
+/// that sent it (`fed` then says the built-in readers feed `auth=` and `token=` again), so a
+/// restart after its harness died still reads the account the tab last ran on; a newer applied
+/// `account` record replaces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamAccount {
+    pub(crate) account: String,
+    /// Its state, as the harness words it.
+    pub(crate) state: String,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+    pub(crate) line: String,
+    /// The claim whose stream applied it still feeds the kind: the `auth=` and `token=`
+    /// readers stand down.
+    pub(crate) fed: bool,
+}
+
+/// The `progress` record the claim's stream last applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamProgress {
+    pub(crate) items: Vec<(String, StreamedItem)>,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+}
+
+/// The `goal` record the claim's stream last applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamGoal {
+    pub(crate) text: Option<String>,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+}
+
+/// The `compact` record the claim's stream last applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamCompact {
+    pub(crate) done: bool,
+    pub(crate) context_left: Option<u8>,
+    pub(crate) epoch: String,
+    pub(crate) hseq: u64,
+}
+
+/// The current-state record's kinds a claim's stream feeds beside `state`. Each of `usage`,
+/// `progress`, `goal`, `compact`, `model` and `upgrade` holds a value only while its claim's
+/// stream feeds that kind ([`SessionTimeline::settle_stream_claim`]), and the built-in source of
+/// that kind stands down for exactly that long; `account` keeps its line past the claim
+/// ([`StreamAccount`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamKinds {
+    pub(crate) usage: Option<StreamUsage>,
+    pub(crate) account: Option<StreamAccount>,
+    pub(crate) progress: Option<StreamProgress>,
+    pub(crate) goal: Option<StreamGoal>,
+    pub(crate) compact: Option<StreamCompact>,
+    pub(crate) model: Option<StreamModel>,
+    pub(crate) upgrade: Option<StreamUpgrade>,
+}
+
+impl StreamKinds {
+    /// The `account` record while its claim's stream feeds the kind.
+    pub(crate) fn fed_account(&self) -> Option<&StreamAccount> {
+        self.account.as_ref().filter(|account| account.fed)
+    }
+}
+
 /// THE CURRENT-STATE RECORD of one session, per kind: its program's identity, the agent state
 /// (`word`, `detail`, `rev`, since when, and its source: a built-in reader, or with `stream` set
 /// the claim's stream, by its epoch and the record's `hseq`, with the record's line kept as
@@ -4514,6 +5138,9 @@ pub(crate) struct AgentPublication {
     /// The latest `state` record the claim's stream applied, `None` while the screen reader
     /// feeds the state.
     pub(crate) stream: Option<StreamFed>,
+    /// The other kinds the claim's stream feeds: `usage`, `account` (its kept line), `progress`,
+    /// `goal` and `compact`.
+    pub(crate) streamed: StreamKinds,
 }
 
 /// What the program in front last said about itself ([`SessionTimeline::note_program_state`]).
@@ -4629,6 +5256,7 @@ impl Default for AgentPublication {
             composer: aterm_messages::presence::ComposerState::Unknown,
             screen_composer: aterm_messages::presence::ComposerState::Unknown,
             stream: None,
+            streamed: StreamKinds::default(),
         }
     }
 }
@@ -4723,6 +5351,29 @@ impl SessionTimeline {
         }
         let at = self.slog.now();
         self.slog.self_claim_act(act, holder, by, at)?;
+        self.record(HARNESS_ACT);
+        Some(self.slog.row_head())
+    }
+
+    /// THE STREAM'S ARM of [`Self::note_harness_act`]: the act of record `hseq` the claim's
+    /// stream applied, by its rule, written as `meta set harness_act` writes it but through the
+    /// stream's write arm ([`crate::session_log::SessionLog::stream_self_claim_act`]: the four
+    /// stamps, `hseq=`, and no mark limiter). `None`, with nothing kept, where the log refused
+    /// the row.
+    #[cfg(unix)]
+    pub(crate) fn note_stream_act(
+        &mut self,
+        act: &str,
+        holder: &str,
+        by: aterm_slog::Actor,
+        hseq: u64,
+    ) -> Option<u64> {
+        let at = self.slog.now();
+        self.slog.stream_self_claim_act(act, holder, by, hseq, at)?;
+        self.last_act = Some(act.to_string());
+        if act == aterm_agent::harness::acts::RULE_UPGRADE {
+            self.upgrade_recorded = true;
+        }
         self.record(HARNESS_ACT);
         Some(self.slog.row_head())
     }
@@ -4991,7 +5642,20 @@ impl SessionTimeline {
     /// to the screen reader. A claim kept live through a grace keeps the reader down. Every
     /// claim move calls this: through [`Self::record_meta_change`] where it writes a
     /// `meta-change`, and directly where it writes none. Returns whether the stand-down ended.
+    ///
+    /// The other kinds settle first: a `compact` step the stream opened is ended as aterm's
+    /// ([`crate::session_log::SessionLog::end_stream_compact`]) before the state's end hands
+    /// the word back to the screen, whose verdict may close the turn or run the step sits
+    /// under and would otherwise close the step with it.
     pub(crate) fn settle_stream_claim(&mut self, meta: &SessionMeta) -> bool {
+        #[cfg(unix)]
+        self.settle_stream_binding(meta);
+        self.settle_stream_kinds(meta);
+        // A placement that moved the claim's grant or revision under its open stream owes it a
+        // `policy` record ([`SessionMeta::set_supervisor`]): the stream looks.
+        if meta.stream.as_ref().is_some_and(|stream| stream.policy_due) {
+            self.watchers.ring_stream();
+        }
         let ended = self.agent.stream.as_ref().is_some_and(|fed| {
             !meta.stream_applied(
                 STATE_KIND,
@@ -5004,6 +5668,143 @@ impl SessionTimeline {
             self.end_stream_state();
         }
         ended
+    }
+
+    /// [`Self::settle_stream_claim`] for the kinds beside `state`: each stands only under its
+    /// own live claim holding the scope the kind is admitted under (`walls` for `usage`,
+    /// `accounts` for `account`, `state` for `progress`, `goal` and `compact`). A kind whose
+    /// claim no longer feeds it hands its words back to its built-in source; the `account`
+    /// line is kept as text and only stops standing its readers down.
+    ///
+    /// `usage` and `account` are the tab's own account's alone, and that account is the live
+    /// claim's `login=` as it stands now, not as it stood when the record arrived: a claim
+    /// placed again under another `login=` (or none) keeps neither, so the old account's
+    /// reading is not shown for the new one and its built-in readers feed again until the
+    /// stream sends a record for the account the claim now names.
+    ///
+    /// A `compact` step the stream opened and did not close ends with the feed
+    /// ([`crate::session_log::SessionLog::end_stream_compact`]).
+    fn settle_stream_kinds(&mut self, meta: &SessionMeta) {
+        use aterm_agent::harness::contract::Scope;
+        let now = crate::metrics::now_us();
+        let feeds =
+            |kind: &str, scope: Scope, epoch: &str| meta.stream_applied(kind, scope, epoch, now);
+        let own = meta
+            .live_scoped(now)
+            .and_then(|scoped| scoped.claim.login.as_deref());
+        let kinds = &mut self.agent.streamed;
+        let before = kinds.clone();
+        kinds.usage.take_if(|fed| {
+            !feeds(USAGE_KIND, Scope::Walls, &fed.epoch) || own != Some(fed.account.as_str())
+        });
+        if let Some(account) = kinds.account.as_mut() {
+            account.fed = account.fed
+                && feeds(ACCOUNT_KIND, Scope::Accounts, &account.epoch)
+                && own == Some(account.account.as_str());
+        }
+        kinds
+            .progress
+            .take_if(|fed| !feeds(PROGRESS_KIND, Scope::State, &fed.epoch));
+        kinds
+            .goal
+            .take_if(|fed| !feeds(GOAL_KIND, Scope::State, &fed.epoch));
+        kinds
+            .compact
+            .take_if(|fed| !feeds(COMPACT_KIND, Scope::State, &fed.epoch));
+        // `model` and `upgrade` need no scope beyond the open stream.
+        kinds
+            .model
+            .take_if(|fed| !meta.stream_applied_under(MODEL_KIND, &[], &fed.epoch, now));
+        kinds
+            .upgrade
+            .take_if(|fed| !meta.stream_applied_under(UPGRADE_KIND, &[], &fed.epoch, now));
+        let compact_ended = before.compact.is_some() && kinds.compact.is_none();
+        if *kinds != before {
+            self.settle_stream_down();
+        }
+        if compact_ended {
+            let at = self.slog.now();
+            if self.slog.end_stream_compact(at) {
+                self.ring_rows();
+            }
+        }
+        self.settle_stream_needs(meta);
+    }
+
+    /// [`Self::settle_stream_claim`] for the needs the stream raised ([`Self::stream_needs`]): a
+    /// need stands while the stream holds a need of its word open ([`StreamState::needs`]) under
+    /// a claim that feeds `need` (one of [`NEED_SCOPES`]). Once it does not (its claim was
+    /// released, lapsed, placed by another claimant or renewed without the scope, each of which
+    /// ends the open needs, [`SessionMeta::settle_stream_run`]), the need is lifted by the clear
+    /// the stream owed, `mark - clear word=<its word>` through the stream's arm under the stamp
+    /// that raised it and with no `hseq=` (no record sent it): the fold's clear rule lets only a
+    /// `src=harness` clear by the same session lift a need the stream raised, and no later
+    /// claimant's stream holds the record that raised it.
+    fn settle_stream_needs(&mut self, meta: &SessionMeta) {
+        if self.stream_needs.is_empty() {
+            return;
+        }
+        let now = crate::metrics::now_us();
+        let open: std::collections::BTreeSet<&str> = meta
+            .stream
+            .as_ref()
+            .filter(|stream| meta.stream_applied_under(NEED_KIND, &NEED_SCOPES, &stream.epoch, now))
+            .map(|stream| stream.needs.values().map(|need| need.word).collect())
+            .unwrap_or_default();
+        let lifted: Vec<(&'static str, (String, aterm_slog::Actor))> = self
+            .stream_needs
+            .iter()
+            .filter(|(word, _)| !open.contains(*word))
+            .map(|(word, raised)| (*word, raised.clone()))
+            .collect();
+        if lifted.is_empty() {
+            return;
+        }
+        self.stream_needs.retain(|word, _| open.contains(word));
+        let at = self.slog.now();
+        for (word, (holder, by)) in lifted {
+            if self.slog.stream_lift_need(word, &holder, by, at).is_none() {
+                aterm_log::info!(
+                    "stream: the log refused the lift of the need {word} the stream raised"
+                );
+            }
+        }
+        self.ring_rows();
+    }
+
+    /// Tell the session log which of its built-in writers the stream stands down: the usage
+    /// tap's mark and the context-left mark under `usage`, the goal edge under `goal`, the
+    /// transcript's compact step under `compact`. Each stands down by kind, not by the parts
+    /// the latest record states (D29): a `usage` record with no `context_left` still stands the
+    /// context-left mark down, so the kind never has two writers.
+    fn settle_stream_down(&mut self) {
+        let kinds = &self.agent.streamed;
+        let down = crate::session_log::StreamDown {
+            usage: kinds.usage.is_some(),
+            goal: kinds.goal.is_some(),
+            compact: kinds.compact.is_some(),
+        };
+        self.slog.set_stream_down(down);
+    }
+
+    /// Register the lane while it still holds the metadata lock that admitted its claim.
+    #[cfg(unix)]
+    pub(crate) fn watch_stream_binding(&mut self, binding: &Arc<StreamBinding>) {
+        if let Some(previous) = self.stream_binding.upgrade() {
+            let _ = previous.revoked.set();
+        }
+        self.stream_binding = Arc::downgrade(binding);
+    }
+
+    #[cfg(unix)]
+    fn settle_stream_binding(&mut self, meta: &SessionMeta) {
+        if let Some(binding) = self.stream_binding.upgrade() {
+            if binding.claim(meta).is_some() {
+                return;
+            }
+            let _ = binding.revoked.set();
+        }
+        self.stream_binding = std::sync::Weak::new();
     }
 
     /// A raw `meta-change` row for a test that pins the timeline's own shapes and not a writer's.
@@ -5405,7 +6206,8 @@ impl SessionTimeline {
             .map(|owner| owner.session_id.as_str())
     }
 
-    const fn advance_foreground_generation(&mut self) {
+    fn advance_foreground_generation(&mut self) {
+        self.foreground_since = Some(std::time::Instant::now());
         self.foreground_generation = self.foreground_generation.saturating_add(1);
     }
 
@@ -5871,6 +6673,207 @@ impl SessionTimeline {
         changed || task_changed
     }
 
+    /// THE HARNESS REFUSED aterm's record `of` (`refused`), saying `why`: the stream's write arm
+    /// logs it at the session node, whatever run is open, as `mark - refused in=<of> text=<why>`
+    /// under the claim's `holder`, by the tab `by`
+    /// ([`crate::session_log::SessionLog::stream_mark`]). The harness's words go in the
+    /// host-tier `text=`, sanitized and clamped to its bound, never in the closed `why=`; words
+    /// that leave nothing write no `text=`. Whether the mark was written.
+    #[cfg(unix)]
+    pub(crate) fn stream_refused(
+        &mut self,
+        of: u64,
+        why: &str,
+        holder: &str,
+        by: aterm_slog::Actor,
+    ) -> bool {
+        let mut fields = aterm_slog::Fields::new().u(aterm_slog::Key::In, of);
+        if let Some(text) = aterm_slog::BoundedText::new(aterm_slog::Key::Text, why) {
+            fields =
+                fields.and_then(|f| f.with(aterm_slog::Key::Text, aterm_slog::Val::Text(text)));
+        }
+        let Ok(fields) = fields else {
+            return false;
+        };
+        let at = self.slog.now();
+        let written = self
+            .slog
+            .stream_mark(
+                aterm_slog::Kind::Refused,
+                Some(aterm_slog::Node::SESSION),
+                fields,
+                holder,
+                by,
+                at,
+            )
+            .is_some();
+        self.ring_rows();
+        written
+    }
+
+    /// THE STREAM'S ARM of the kinds beside `state`: a `usage`, `account`, `progress`, `goal`,
+    /// `compact`, `model` or `upgrade` record the claim's stream applied. The record is kept in
+    /// the current-state record and its row is written under the kind's own word, stamped
+    /// `holder=`, `src=harness`, `conf=claim` and `by=<the tab's session>` ([`crate::session_log::
+    /// SessionLog::stream_mark`]); `account`, `model` and `upgrade` write no row (D31). From here
+    /// until the claim stops feeding the kind ([`Self::settle_stream_claim`]) its built-in
+    /// source stands down.
+    ///
+    /// Returns whether the record was applied. Where the log refused its row (a closed session
+    /// log, a holder that is no ID) it was not: nothing of the record is kept, what the stream
+    /// kept of that kind before is dropped, and the kind's built-in source feeds, so a kind is
+    /// never left with its built-in writer silenced and no row from the stream. The caller
+    /// takes the kind out of the applied set and acknowledges the record as refused.
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the Unix control stream applies a record")
+    )]
+    #[must_use]
+    pub(crate) fn publish_stream_record(
+        &mut self,
+        stamp: StreamStamp,
+        record: StreamRecord,
+    ) -> bool {
+        let StreamStamp {
+            epoch,
+            hseq,
+            holder,
+            by,
+        } = stamp;
+        let at = self.slog.now();
+        let kinds = &mut self.agent.streamed;
+        let written = match record {
+            StreamRecord::Usage {
+                account,
+                limits,
+                context_left,
+            } => {
+                let usage = StreamUsage {
+                    account,
+                    limits,
+                    context_left,
+                    epoch,
+                    hseq,
+                };
+                let written = self.slog.stream_usage(&usage, &holder, by, at).is_some();
+                kinds.usage = written.then_some(usage);
+                written
+            }
+            StreamRecord::Account {
+                account,
+                state,
+                line,
+            } => {
+                kinds.account = Some(StreamAccount {
+                    account,
+                    state,
+                    epoch,
+                    hseq,
+                    line,
+                    fed: true,
+                });
+                true
+            }
+            StreamRecord::Progress { items } => {
+                let done = items
+                    .iter()
+                    .filter(|(_, state)| *state == StreamedItem::Done)
+                    .count();
+                let written = self
+                    .slog
+                    .stream_progress(items.len(), done, hseq, &holder, by, at)
+                    .is_some();
+                kinds.progress = written.then_some(StreamProgress { items, epoch, hseq });
+                written
+            }
+            StreamRecord::Goal { text } => {
+                let written = self
+                    .slog
+                    .stream_goal(text.as_deref(), hseq, &holder, by, at)
+                    .is_some();
+                kinds.goal = written.then_some(StreamGoal { text, epoch, hseq });
+                written
+            }
+            StreamRecord::Compact { done, context_left } => {
+                let written = self
+                    .slog
+                    .stream_compact(done, context_left, hseq, &holder, by, at);
+                kinds.compact = written.then_some(StreamCompact {
+                    done,
+                    context_left,
+                    epoch,
+                    hseq,
+                });
+                written
+            }
+            // D31: `model` and `upgrade` write no log row of their own; each is kept here.
+            StreamRecord::Model {
+                model,
+                effort,
+                key,
+                offers,
+                permission,
+                line,
+            } => {
+                kinds.model = Some(StreamModel {
+                    model,
+                    effort,
+                    key,
+                    offers,
+                    permission,
+                    epoch,
+                    hseq,
+                    line,
+                });
+                true
+            }
+            StreamRecord::Upgrade { phase, to, line } => {
+                kinds.upgrade = Some(StreamUpgrade {
+                    phase,
+                    to,
+                    at_s: aterm_time::unix_millis().unwrap_or(0) / 1000,
+                    epoch,
+                    hseq,
+                    line,
+                });
+                true
+            }
+        };
+        self.settle_stream_down();
+        self.ring_rows();
+        written
+    }
+
+    /// A `need` (`clear` false) or `clear` RECORD's row, `mark - need|clear word=<the need's
+    /// word> [text=<its entry>] hseq= holder=`, through the stream's write arm
+    /// ([`crate::session_log::SessionLog::stream_need`]): whether the log took it. A need taken
+    /// is kept by its word with the stamp that raised it ([`Self::stream_needs`]) until a clear
+    /// of that word is taken or the stream stops holding it ([`Self::settle_stream_claim`]).
+    #[cfg(unix)]
+    pub(crate) fn note_stream_need(
+        &mut self,
+        clear: bool,
+        word: &'static str,
+        entry: Option<&str>,
+        stamp: &StreamStamp,
+    ) -> bool {
+        let at = self.slog.now();
+        let written = self
+            .slog
+            .stream_need(clear, word, entry, stamp, at)
+            .is_some();
+        if written {
+            if clear {
+                self.stream_needs.remove(word);
+            } else {
+                self.stream_needs
+                    .insert(word, (stamp.holder.clone(), stamp.by));
+            }
+        }
+        self.ring_rows();
+        written
+    }
+
     /// THE CLAIM'S STREAM APPLIED A RECORD of any kind (D15): where no agent run is open, one
     /// opens for `agent`, the agent the claim's registry row names. The one exception is a
     /// stream whose standing `state` is `ended`: the record said the agent is gone, and a
@@ -5919,12 +6922,17 @@ impl SessionTimeline {
         self.settle_composer();
     }
 
+    /// Publish the composer: the stream's while its state stands, else the screen reader's. A
+    /// move rings the open record stream, whose `hand` carries it.
     fn settle_composer(&mut self) {
-        self.agent.composer = self
+        let composer = self
             .agent
             .stream
             .as_ref()
             .map_or(self.agent.screen_composer, |fed| fed.composer);
+        if std::mem::replace(&mut self.agent.composer, composer) != composer {
+            self.watchers.ring_stream();
+        }
     }
 
     /// THE READER'S ARM of the state: an agent verdict read from the screen `stamp` names.
@@ -6979,6 +7987,35 @@ impl SessionTimeline {
         if self.agent.program_pgid != pgid {
             return false;
         }
+        let previous = self
+            .codex_survey()
+            .filter(|old| old.thread == survey.thread);
+        let same_count = previous.is_some_and(|old| {
+            old.facts.tok_at_ms == survey.facts.tok_at_ms
+                && old.facts.tok_in == survey.facts.tok_in
+                && old.facts.tok_out == survey.facts.tok_out
+        });
+        if !same_count {
+            self.codex_token_clock = survey.facts.tok_at_ms.and_then(|ms| {
+                let now = std::time::Instant::now();
+                // Keep the provider's exact intervals, including two revisions with one stamp.
+                let at = if let Some((prior, (anchored, _))) = previous
+                    .and_then(|v| v.facts.tok_at_ms)
+                    .zip(self.codex_token_clock)
+                {
+                    let delta = std::time::Duration::from_millis(ms.abs_diff(prior));
+                    if ms >= prior {
+                        anchored.checked_add(delta)?
+                    } else {
+                        anchored.checked_sub(delta)?
+                    }
+                } else {
+                    let source = std::time::Duration::from_millis(u64::try_from(ms).ok()?);
+                    now.checked_sub(aterm_time::since_epoch()?.checked_sub(source)?)?
+                };
+                (at <= now).then_some((at, now))
+            });
+        }
         let before = crate::describe::excerpts_seen(self);
         let (ctx, goal) = (survey.facts.ctx_left_pct, survey.goal.is_some());
         let held = self
@@ -7005,6 +8042,7 @@ impl SessionTimeline {
     /// Forget the rollout tap's facts and the background terminals it read off the record: its
     /// tap went. Returns whether any were cleared.
     pub(crate) fn clear_codex_survey(&mut self) -> bool {
+        self.codex_token_clock = None;
         let facts = self.codex_survey.take().is_some();
         self.codex_terminals.take().is_some() || facts
     }
@@ -7016,6 +8054,97 @@ impl SessionTimeline {
             .as_ref()
             .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
             .map(|(_, survey)| survey)
+    }
+
+    /// The token source in this terminal now, including agent replacement without shell replacement.
+    pub(crate) fn panel_token_owner(
+        &self,
+        launch: aterm_session::LaunchNonce,
+    ) -> Option<aterm_vitals::pane_tokens::Owner> {
+        use aterm_phase::Program;
+        let pgid = self.agent.program_pgid;
+        if pgid <= 0 || self.foreground_generation == u64::MAX {
+            return None;
+        }
+        let (conversation, started, floor) = match self.agent.reader? {
+            Program::Claude => {
+                let owner = self.claude_footer()?.owner.as_ref()?;
+                if owner.session_id.is_empty() {
+                    return None;
+                }
+                (
+                    format!("claude {}", owner.session_id),
+                    self.claude_footer_identity()
+                        .and_then(|(_, started)| started),
+                    owner.floor,
+                )
+            }
+            Program::Codex => {
+                let thread = &self.codex_survey()?.thread;
+                if thread.is_empty() {
+                    return None;
+                }
+                (
+                    format!("codex {thread}"),
+                    self.current_holder_image().and_then(|image| image.token),
+                    None,
+                )
+            }
+            _ => return None,
+        };
+        Some(aterm_vitals::pane_tokens::Owner {
+            launch: launch.to_hex(),
+            generation: self.foreground_generation,
+            pgid,
+            conversation,
+            started,
+            floor,
+        })
+    }
+
+    /// Collect the provider's own whole-counter evidence and timestamp without polling a provider.
+    pub(crate) fn panel_token_observation(
+        &self,
+        pane: u64,
+        launch: aterm_session::LaunchNonce,
+    ) -> Option<aterm_vitals::pane_tokens::Observation> {
+        use aterm_vitals::pane_tokens::{Counters, Observation};
+        let owner = self.panel_token_owner(launch)?;
+        let counters = (|| {
+            let whole = crate::survey::whole_tokens(
+                self.agent.reader,
+                self.agent.program_pgid,
+                self.claude_footer()
+                    .and_then(|f| Some((f.usage.as_ref()?, f.owner.as_ref()?))),
+                self.codex_survey(),
+            )?;
+            let (at, collected) = match self.agent.reader? {
+                aterm_phase::Program::Claude => {
+                    let read = self.claude_footer_read_at()?;
+                    (read, read)
+                }
+                aterm_phase::Program::Codex => self.codex_token_clock?,
+                _ => return None,
+            };
+            if at <= self.foreground_since? {
+                return None;
+            }
+            let epoch = aterm_session::terminal_stream::epoch();
+            let ns = |time: std::time::Instant| {
+                u64::try_from(time.checked_duration_since(epoch)?.as_nanos()).ok()
+            };
+            Some(Counters {
+                at_ns: ns(at)?,
+                collected_ns: ns(collected)?,
+                input: whole.tok_in,
+                output: whole.tok_out,
+            })
+        })();
+        Some(Observation {
+            pane,
+            owner,
+            counters,
+        })
     }
 
     /// Where the agent in group `pgid` works ([`aterm_agent::harness::work_record::WorkRecord`]),
@@ -7170,6 +8299,11 @@ impl SessionTimeline {
     /// resolver's facts, codex-alab's session record through the rollout tap's), or `None` while it
     /// has none or keeps none aterm reads.
     pub(crate) fn goal(&self) -> Option<&str> {
+        if let Some(fed) = &self.agent.streamed.goal {
+            // The stream feeds the goal: the built-in readers stand down, and a record that
+            // names none says there is none.
+            return fed.text.as_deref();
+        }
         self.claude_footer()
             .and_then(|facts| facts.goal.as_deref())
             .or_else(|| self.codex_survey().and_then(|codex| codex.goal.as_deref()))
@@ -7189,10 +8323,18 @@ impl SessionTimeline {
             .map(|(_, _, _, card)| card)
     }
 
-    /// What the footer shows for the group in front.
+    /// What the footer shows for the group in front. While the claim's stream feeds `model`
+    /// (D29) the footer's model and effort readers stand down: the model and effort are the
+    /// record's ([`StreamModel`]), whatever the footer read, and every other fact the footer's.
     pub(crate) fn claude_footer_shown(&self) -> Option<aterm_agent::harness::footer::FooterFacts> {
-        self.claude_footer()
-            .map(|facts| facts.filled_from(self.claude_card()))
+        self.claude_footer().map(|facts| {
+            let mut shown = facts.filled_from(self.claude_card());
+            if let Some(fed) = &self.agent.streamed.model {
+                shown.model.clone_from(&fed.model);
+                shown.effort.clone_from(&fed.effort);
+            }
+            shown
+        })
     }
 
     /// The leader read's copy and PATH answers for `pgid`
@@ -7616,8 +8758,15 @@ impl SessionTimeline {
     /// The one `upgrade=` word `status`, roster rows and the survey's session rows carry: the
     /// live-upgrade row the host last sent, judged again at `now_s` against the awake-clock
     /// reading `awake_s` (`<state>/<to>/<why>/<age>`,
-    /// [`aterm_agent::harness::upgrade_drive::Row::column`]), `-` where it sent none.
+    /// [`aterm_agent::harness::upgrade_drive::Row::column`]), `-` where it sent none. While the
+    /// claim's stream feeds `upgrade` (D29) the engine-filled row stands down and the word is
+    /// the record's ([`StreamUpgrade::column`]); the engine's row is kept, so the word is its
+    /// again once the stream stops feeding the kind, and a tab whose stream never applied
+    /// `upgrade` keeps it throughout.
     pub(crate) fn upgrade_column(&self, now_s: u64, awake_s: u64) -> String {
+        if let Some(fed) = &self.agent.streamed.upgrade {
+            return fed.column(now_s);
+        }
         self.upgrade.as_ref().map_or_else(
             || "-".to_string(),
             |(row, _)| {

@@ -20,9 +20,16 @@ use std::collections::BTreeMap;
 
 /// The format word of a snapshot.
 pub const FORMAT: &str = "aterm-file-snap/1";
-/// The most bytes of a snapshot a read takes: four faces' worth, since a row holds both
-/// spellings of each cell.
-pub const MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// The most bytes of a snapshot, or of the baseline beside it, a read takes, and so a pass
+/// writes (`File::record` keeps a projection whose snapshot or baseline passes it as too
+/// large). A snapshot row holds each cell twice (its shown text and its value), and a baseline
+/// row each column's grid register besides, so 5,000 of the publication corpus' packages wrote
+/// a 14.6 MB snapshot and a 27.1 MB baseline (TK-09's `a_5000_row_packages_family_has_a_face`):
+/// the baseline binds first, at some 24,000 packages, five times the 5,000 the tracker plans for
+/// (docs/DESIGN-lab-tracker-2026-11-14.md §7, finding 16), while a read stays a bounded
+/// allocation. The files beside a snapshot that are not its rows (the status, the frontier, the
+/// history) keep [`crate::file::SIDECAR_BYTES`].
+pub const MAX_BYTES: u64 = 128 * 1024 * 1024;
 /// The header prefix of a column no one types into.
 pub const READ_ONLY: char = '=';
 /// The key column's name; its header is `=pk@<rev>`, always last.
@@ -169,7 +176,32 @@ impl std::fmt::Display for Unreadable {
     }
 }
 
-fn row_line(row: &Row) -> String {
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The rows this thread rendered (a snapshot line, a face line, a row's face widths) or
+    /// parsed from a snapshot file, counted (never timed): what a materializer pass touched.
+    static TOUCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One row rendered or parsed ([`test_rows_touched`]).
+#[inline]
+pub(crate) fn touch() {
+    #[cfg(any(test, debug_assertions))]
+    TOUCHED.with(|touched| touched.set(touched.get() + 1));
+}
+
+/// How many rows this thread has rendered (a snapshot line, a face line, a row's face widths)
+/// or parsed from a snapshot file: `aterm-db`'s materializer tests read it before and after a
+/// pass, so a pass after one record is held to the rows that record changed.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_rows_touched() -> usize {
+    TOUCHED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn row_line(row: &Row) -> String {
+    touch();
     let mut object = Map::new();
     object.insert("pk".to_owned(), Value::from(row.pk.as_str()));
     object.insert("live".to_owned(), Value::from(row.live));
@@ -213,6 +245,13 @@ impl Snapshot {
     /// the two members and one without.
     #[must_use]
     pub fn content(&self) -> [u8; 32] {
+        let lines: Vec<String> = self.rows.iter().map(row_line).collect();
+        self.content_of(lines.iter().map(String::as_str))
+    }
+
+    /// [`Self::content`] from each row's line ([`row_line`]), in row order: a rendering that
+    /// keeps its rows' lines ([`crate::Rendered`]) digests them without rendering a row again.
+    pub(crate) fn content_of<'a>(&self, lines: impl Iterator<Item = &'a str>) -> [u8; 32] {
         let mut sha = Sha256::new();
         sha.update(b"aterm/file/snapshot-content/1\0");
         sha.update(self.name.to_string().as_bytes());
@@ -227,8 +266,8 @@ impl Snapshot {
             sha.update(handle.as_bytes());
             sha.update([0]);
         }
-        for row in &self.rows {
-            sha.update(row_line(row).as_bytes());
+        for line in lines {
+            sha.update(line.as_bytes());
             sha.update(b"\n");
         }
         sha.finalize()
@@ -237,6 +276,12 @@ impl Snapshot {
     /// The snapshot file's bytes.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
+        let lines: Vec<String> = self.rows.iter().map(row_line).collect();
+        self.encode_of(lines.iter().map(String::as_str))
+    }
+
+    /// [`Self::encode`] from each row's line ([`row_line`]), in row order.
+    pub(crate) fn encode_of<'a>(&self, lines: impl Iterator<Item = &'a str>) -> Vec<u8> {
         let mut header = Map::new();
         header.insert("format".to_owned(), Value::from(FORMAT));
         header.insert("name".to_owned(), Value::from(self.name.to_string()));
@@ -261,8 +306,8 @@ impl Snapshot {
         header.insert("rows".to_owned(), Value::from(self.rows.len() as u64));
         let mut text = Value::Object(header).to_string();
         text.push('\n');
-        for row in &self.rows {
-            text.push_str(&row_line(row));
+        for line in lines {
+            text.push_str(line);
             text.push('\n');
         }
         let digest = aterm_codec::hex::encode_lower(&Sha256::digest(text.as_bytes()));
@@ -332,6 +377,7 @@ impl Snapshot {
             .unwrap_or_default();
         let rows = lines
             .map(|line| {
+                touch();
                 let row: Value = aterm_json::from_str(line).ok()?;
                 Some(Row {
                     pk: row.get("pk")?.as_str()?.to_owned(),
@@ -370,28 +416,127 @@ impl Snapshot {
     }
 
     /// The face of this snapshot: the TSV `aterm db table export` writes, a header row and one
-    /// row per record, the last header cell `=pk@<rev>`.
+    /// row per record, the last header cell `=pk@<rev>`, of the columns [`face_columns`] keeps:
+    /// every column where they fit a face, else all but the widest.
     #[must_use]
     pub fn face(&self) -> String {
+        let widths = column_widths(&self.columns, &self.rows);
+        let kept = face_columns(&self.columns, &widths, self.rows.len());
+        let lines: Vec<String> = self
+            .rows
+            .iter()
+            .map(|row| face_line(&self.columns, &kept, row))
+            .collect();
+        self.face_of(&kept, lines.iter().map(String::as_str))
+    }
+
+    /// [`Self::face`] of the columns `kept` from each row's face line ([`face_line`]).
+    pub(crate) fn face_of<'a>(
+        &self,
+        kept: &[usize],
+        lines: impl Iterator<Item = &'a str>,
+    ) -> String {
         let mut text = String::new();
-        for (i, column) in self.columns.iter().enumerate() {
+        for (i, at) in kept.iter().enumerate() {
             if i > 0 {
                 text.push('\t');
             }
-            push_cell(&mut text, &column.header(self.rev));
+            push_cell(&mut text, &self.columns[*at].header(self.rev));
         }
         text.push('\n');
-        for row in &self.rows {
-            for (i, column) in self.columns.iter().enumerate() {
-                if i > 0 {
-                    text.push('\t');
-                }
-                push_cell(&mut text, row.cell(&column.name));
-            }
+        for line in lines {
+            text.push_str(line);
             text.push('\n');
         }
         text
     }
+
+    /// The names of the columns the face shows ([`face_columns`]), in face order, the key last.
+    #[must_use]
+    pub fn face_names(&self) -> Vec<&str> {
+        let widths = column_widths(&self.columns, &self.rows);
+        face_columns(&self.columns, &widths, self.rows.len())
+            .into_iter()
+            .map(|at| self.columns[at].name.as_str())
+            .collect()
+    }
+}
+
+/// The bytes one cell takes in a face, quoted as [`push_cell`] quotes it.
+fn cell_width(value: &str) -> u64 {
+    let quoted = value
+        .bytes()
+        .any(|byte| matches!(byte, b'\t' | b'"' | b'\r' | b'\n'));
+    if !quoted {
+        return value.len() as u64;
+    }
+    value.len() as u64 + 2 + value.bytes().filter(|byte| *byte == b'"').count() as u64
+}
+
+/// The bytes each of `columns` takes in `row`'s face line, its tab and line end left out.
+pub(crate) fn row_widths(columns: &[Column], row: &Row) -> Vec<u64> {
+    touch();
+    columns
+        .iter()
+        .map(|column| cell_width(row.cell(&column.name)))
+        .collect()
+}
+
+/// The bytes each of `columns` takes over every row of `rows` ([`row_widths`]).
+pub(crate) fn column_widths(columns: &[Column], rows: &[Row]) -> Vec<u64> {
+    let mut widths = vec![0_u64; columns.len()];
+    for row in rows {
+        for (total, width) in widths.iter_mut().zip(row_widths(columns, row)) {
+            *total += width;
+        }
+    }
+    widths
+}
+
+/// The columns a face of `rows` rows shows, by place in `columns`, in their order: every
+/// column where the face fits [`crate::MAX_FACE_BYTES`], else the columns left once the widest
+/// (by `widths`, the bytes each takes over every row; of two as wide, the later) are left out
+/// one by one until it fits. The key is never left out, and where the key alone does not fit,
+/// the face is the key alone, which is too large to write ([`crate::File::record`] then writes
+/// none). The choice reads only what a snapshot's content holds (its columns and its rows'
+/// cells), never its revision, so one content always shows the same columns: each header cell
+/// is counted at its widest, the key's at the largest revision.
+#[must_use]
+pub fn face_columns(columns: &[Column], widths: &[u64], rows: usize) -> Vec<usize> {
+    let header = |at: usize| cell_width(&columns[at].header(u64::MAX));
+    let size = |kept: &[usize]| -> u64 {
+        let k = kept.len() as u64;
+        let line_ends = k.saturating_sub(1) + 1;
+        let header: u64 = kept.iter().map(|at| header(*at)).sum::<u64>() + line_ends;
+        let body: u64 = kept.iter().map(|at| widths[*at]).sum::<u64>() + rows as u64 * line_ends;
+        header + body
+    };
+    let mut kept: Vec<usize> = (0..columns.len()).collect();
+    let mut widest: Vec<usize> = (0..columns.len())
+        .filter(|at| columns[*at].source != Source::Pk)
+        .collect();
+    // The widest last, the later of two as wide after the earlier.
+    widest.sort_by_key(|at| (widths[*at], *at));
+    while size(&kept) > crate::MAX_FACE_BYTES || kept.len() > crate::MAX_FACE_COLUMNS {
+        let Some(drop) = widest.pop() else {
+            break;
+        };
+        kept.retain(|at| *at != drop);
+    }
+    kept
+}
+
+/// One row's face line over the columns `kept` of `columns`, its line end left out.
+pub(crate) fn face_line(columns: &[Column], kept: &[usize], row: &Row) -> String {
+    touch();
+    let mut text = String::new();
+    for (i, at) in kept.iter().enumerate() {
+        if i > 0 {
+            text.push('\t');
+        }
+        push_cell(&mut text, row.cell(&columns[*at].name));
+    }
+    text
 }
 
 /// One TSV cell as amacs's table codec writes it (`amacs::table::encode`): quoted when it

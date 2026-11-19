@@ -33,7 +33,7 @@ pub struct Finding {
 
 /// What a lab finding of `kind` means, in a person's words, for each word this file's rules and
 /// `aterm db alab check` report (`duplicate-number` among them); `None` for any other word, whose
-/// sentence is the table layer's or none ([`check::said`] asks both). A sentence names no value,
+/// sentence is another layer's or none ([`check::said`] asks each). A sentence names no value,
 /// as a finding names none.
 pub fn sentence(kind: &str) -> Option<&'static str> {
     Some(match kind {

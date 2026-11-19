@@ -28,6 +28,17 @@ pub(crate) fn run_stage_prepared<'ctx>(
     cells: Option<crate::cells::PreparedRun<'ctx>>,
 ) -> Report {
     let mut r = Report::new(spec.title.clone());
+    // A skipped or failed preparation must also withdraw any previous result.
+    if let Some(group) = match spec.id {
+        StageId::RedrawBuild => Some(crate::appkit_content::REDRAW_GROUP),
+        StageId::ObjcBuild => Some(crate::appkit_content::OBJC_GROUP),
+        _ => None,
+    } {
+        ctx.prepared_appkit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(group);
+    }
     if let Err(why) = crate::test_workers::admitted_share(&ctx.env) {
         r.cannot_run(format!("{why}; no stage was run"));
         return r;
@@ -38,14 +49,19 @@ pub(crate) fn run_stage_prepared<'ctx>(
         r.skip(why);
         return r;
     }
-    if matches!(spec.id, StageId::RedrawConformance | StageId::ObjcDrives) && (ctx.screen_locked)()
+    if matches!(
+        spec.id,
+        StageId::RedrawBuild
+            | StageId::ObjcBuild
+            | StageId::RedrawConformance
+            | StageId::ObjcDrives
+    ) && (ctx.screen_locked)()
     {
-        // Each builds what it drives into the main lane's build directory: a run that skips
-        // one reports less of that directory than a run of its selection that does not, and
+        // Skipping a driver or its preparation leaves the group incomplete, and
         // its record says so ([`crate::disk::note_skipped`]).
         crate::disk::note_skipped(
             ctx,
-            if matches!(spec.id, StageId::RedrawConformance) {
+            if matches!(spec.id, StageId::RedrawConformance | StageId::RedrawBuild) {
                 "redraw-conformance"
             } else {
                 "objc-drives"
@@ -79,8 +95,10 @@ pub(crate) fn run_stage_prepared<'ctx>(
         StageId::GuiSmoke => {
             r.skip(format!("{} (unix only)", spec.title));
         }
-        StageId::RedrawConformance => redraw_conformance(ctx, &mut r),
-        StageId::ObjcDrives => objc_drives(ctx, &mut r),
+        StageId::RedrawBuild => AppkitDrivers::Redraw.build(ctx, &mut r),
+        StageId::ObjcBuild => AppkitDrivers::Objc.build(ctx, &mut r),
+        StageId::RedrawConformance => AppkitDrivers::Redraw.run(ctx, &mut r),
+        StageId::ObjcDrives => AppkitDrivers::Objc.run(ctx, &mut r),
         StageId::ForeignCells => foreign_cells(ctx, &mut r, cells),
         StageId::WasmGlue => {
             if in_checkout(ctx, &mut r, "wasm-glue") {
@@ -193,7 +211,7 @@ pub fn unit_graph(
     Ok(crate::unitgraph::Graph::union(graphs))
 }
 
-/// `targo --unverified test <scope> --no-fail-fast --tests`: the second child, run only when the first compiled: every lib, bin and integration test target with `test = true` ([`TEST_TARGETS`], which the first child compiles, beside the measuring benches where it builds them: [`crate::plan::folds_measuring`]), no doctests (the stage runs those after it: [`doctest_args`]) and no examples or benches.
+/// `targo --unverified test <scope> --no-fail-fast --tests`: the second child, run only when the first compiled: every lib, bin and integration test target with `test = true` ([`TEST_TARGETS`], which the first child compiles, beside the measuring benches where it builds them: [`crate::plan::folds_measuring`]), no doctests (the stage runs those after it: [`doctest_args`]) and every example or bench whose manifest enables tests.
 #[must_use]
 pub fn test_run_args(scope: &Scope) -> Vec<String> {
     let mut a = test_base_args(scope);
@@ -205,33 +223,35 @@ pub fn test_run_args(scope: &Scope) -> Vec<String> {
 pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 
 /// The measuring executables selected by the runner and its content receipts.
-pub const MEASURING_TARGETS: [&str; 5] = ["paint", "spin", "aos", "rewind", "size"];
+pub const MEASURING_TARGETS: [&str; 6] = ["paint", "spin", "aos", "rewind", "size", "capture"];
 
-/// The matrices applicable to the admitted assertion profile. Shipping size has no debug
-/// ceiling; the runtime matrices still judge a debug artifact's native behavior.
-fn measuring_targets(profile: Profile) -> impl Iterator<Item = &'static str> {
+/// The matrices applicable to this artifact and desktop choice. Shipping size and the
+/// production capture boundary require a release artifact. Capture has no headless row.
+fn measuring_targets(profile: Profile, no_windows: bool) -> impl Iterator<Item = &'static str> {
     MEASURING_TARGETS
         .into_iter()
-        .filter(move |target| profile == Profile::Release || *target != "size")
+        .filter(move |target| profile == Profile::Release || !matches!(*target, "size" | "capture"))
+        .filter(move |target| !no_windows || *target != "capture")
 }
 
-/// The measuring stage's one child: the paint, spin, aos and rewind matrices, and the shipping
-/// executable size matrix for a release assertion profile. Every selected matrix must report.
+/// The measuring stage's one child: the paint, spin, aos and rewind matrices, plus shipping
+/// size and windowed production capture for a release artifact. Every selected matrix reports;
+/// an omitted production window is named separately by the stage.
 #[must_use]
-pub fn measuring_args(profile: Profile) -> Vec<String> {
-    measuring_targets_args(profile)
+pub fn measuring_args(profile: Profile, no_windows: bool) -> Vec<String> {
+    measuring_targets_args(profile, no_windows)
 }
 
 /// [`measuring_args`]'s compile alone (`--no-run`): the measuring rows' prebuild, the main lane's last row before the first barrier, so the exclusive stage that runs them compiles nothing. Planned only where no workspace test compile builds them ([`crate::plan::folds_measuring`]).
 #[must_use]
 pub fn measure_prebuild_args() -> Vec<String> {
-    let mut a = measuring_targets_args(Profile::Release);
+    let mut a = measuring_targets_args(Profile::Release, false);
     a.push("--no-run".to_string());
     a
 }
 
-/// `--bench paint --bench spin --bench aos --bench rewind --bench size`: the measuring matrices' targets
-/// ([`MEASURING_TARGETS`]), which the workspace's test compile adds where it builds them
+/// All measuring matrices ([`MEASURING_TARGETS`]), including release-only production capture,
+/// which the workspace's test compile adds where it builds them
 /// ([`crate::plan::folds_measuring`]).
 #[must_use]
 pub fn measuring_bench_args() -> Vec<String> {
@@ -241,7 +261,7 @@ pub fn measuring_bench_args() -> Vec<String> {
         .collect()
 }
 
-fn measuring_targets_args(profile: Profile) -> Vec<String> {
+fn measuring_targets_args(profile: Profile, no_windows: bool) -> Vec<String> {
     let mut a: Vec<String> = [
         "--unverified",
         "bench",
@@ -253,7 +273,9 @@ fn measuring_targets_args(profile: Profile) -> Vec<String> {
     ]
     .map(String::from)
     .into();
-    a.extend(measuring_targets(profile).flat_map(|t| ["--bench".to_string(), t.to_string()]));
+    a.extend(
+        measuring_targets(profile, no_windows).flat_map(|t| ["--bench".to_string(), t.to_string()]),
+    );
     a
 }
 
@@ -1196,7 +1218,8 @@ fn test_compile(ctx: &Ctx, spec: &StageSpec, r: &mut Report) {
         }
     };
     let began = std::time::SystemTime::now();
-    let (compiled, _, artifacts) = compile_tests(ctx, r, &format!("{label}{suffix}"), &compile);
+    let (compiled, _, artifacts) =
+        compile_tests(ctx, r, &format!("{label}{suffix}"), &compile, cut.is_none());
     if !compiled {
         ctx.test_compile_failed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1263,8 +1286,21 @@ type Compiled = (
     Vec<crate::shape::Artifact>,
 );
 
-fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compiled {
+fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd, closing: bool) -> Compiled {
+    #[cfg(not(unix))]
+    let _ = closing;
     let identity_before = crate::test_index::identities(&ctx.root, &ctx.tools.targo).ok();
+    #[cfg(unix)]
+    let launches = (closing && identity_before.is_some() && !ctx.compile_only)
+        .then(|| {
+            let [_, run] = test_cmds(ctx, test_doc_binding(ctx).1);
+            crate::test_launch::Request::for_compile(ctx, compile, &run)
+        })
+        .flatten();
+    #[cfg(unix)]
+    let compile = launches
+        .as_ref()
+        .map_or(compile, crate::test_launch::Request::command);
     let Compile {
         mut run,
         stdout,
@@ -1287,22 +1323,51 @@ fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compi
 
     let artifacts = crate::shape::artifacts(&stdout);
     let refusal = crate::compile_width::refusal(&run, &stdout);
-    if run.ok {
-        let indexed = crate::test_index::identities(&ctx.root, &ctx.tools.targo)
-            .and_then(|identity| {
-                if Some(&identity) != identity_before.as_ref() {
-                    return Err(std::io::Error::other(
-                        "candidate changed during test compile",
-                    ));
+    #[cfg(unix)]
+    let mut capture = launches.filter(|_| run.ok).and_then(|request| {
+        crate::test_launch::Capture::new(request, &stdout)
+            .map_err(|why| r.raw(format!("  test launches: using the recording pass ({why})")))
+            .ok()
+    });
+    let indexed = run.ok.then(|| {
+        crate::test_index::identities(&ctx.root, &ctx.tools.targo).and_then(|identity| {
+            if Some(&identity) != identity_before.as_ref() {
+                return Err(std::io::Error::other(
+                    "candidate changed during test compile",
+                ));
+            }
+            #[cfg(unix)]
+            if let Some(capture) = capture.as_mut() {
+                return crate::test_index::Index::from_messages_with(
+                    identity.0,
+                    identity.1,
+                    &stdout,
+                    |path| capture.digest(path),
+                );
+            }
+            crate::test_index::Index::from_messages(identity.0, identity.1, &stdout)
+        })
+    });
+    let exes = crate::testrun::take_test_executables(&mut stdout);
+    if let Some(indexed) = indexed {
+        let written = indexed.and_then(|index| {
+            #[cfg(unix)]
+            if let (Some(capture), Ok(exes)) = (capture, exes.as_ref()) {
+                match crate::test_launch::Prepared::capture(capture, &index, exes) {
+                    Ok(prepared) => {
+                        *ctx.compiled_test_launches
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prepared)
+                    }
+                    Err(why) => r.raw(format!("  test launches: using the recording pass ({why})")),
                 }
-                crate::test_index::Index::from_messages(identity.0, identity.1, &stdout)
-            })
-            .and_then(|index| index.write(&ctx.state_dir().join("test-executables.json")));
-        if let Err(error) = indexed {
+            }
+            index.write(&ctx.state_dir().join("test-executables.json"))
+        });
+        if let Err(error) = written {
             r.raw(format!("test executable index unavailable: {error}"));
         }
     }
-    let exes = crate::testrun::take_test_executables(&mut stdout);
     rejoin(&mut run, stdout);
     r.raw(run.output.as_str());
     r.raw(line);
@@ -1423,7 +1488,7 @@ fn build_to_drive(
     args: Vec<String>,
     build_label: String,
     drive: &str,
-) -> bool {
+) -> Option<String> {
     let Compile {
         run: mut build,
         stdout,
@@ -1435,7 +1500,15 @@ fn build_to_drive(
     }
     if build.ok {
         r.raw(line);
-        return true;
+        return match stdout {
+            Ok(messages) => Some(messages),
+            Err(why) => {
+                r.cannot_run(format!(
+                    "{drive}: successful build has no complete compiler receipt: {why}"
+                ));
+                None
+            }
+        };
     }
     if let Ok(stdout) = &stdout {
         rejoin(&mut build, crate::compile_account::human(stdout));
@@ -1450,7 +1523,7 @@ fn build_to_drive(
             "the build above failed, so there is nothing fresh to drive",
         );
     }
-    false
+    None
 }
 
 /// Run the rainbow trail laws' full grid.
@@ -1488,7 +1561,7 @@ fn test(ctx: &Ctx, r: &mut Report) {
         not_run_behind(r, &run_label, behind);
         return;
     }
-    // The recording Cargo pass checks freshness and supplies its own target metadata.
+    // The retained launch set or the recording Cargo pass supplies the target metadata.
     crate::testrun::run_tests(ctx, r, &run_label, &run, crate::checks::Check::Test);
     doctests(ctx, r, &label, bind);
 }
@@ -1608,12 +1681,16 @@ fn measuring_tests(ctx: &Ctx, r: &mut Report) {
     {
         // Its benches were the test compile's to build: compiling them here would hold the
         // quiet machine for a build no memory claim covers.
-        let (label, _) = measuring_targo(ctx, measuring_args(artifact.profile));
+        let (label, _) = measuring_targo(ctx, measuring_args(artifact.profile, ctx.no_windows));
         not_run_behind(r, &label, "the test compile that builds its benches failed");
         return;
     }
     if let Err(why) = artifact.with_admission(ctx, |admitted| {
-        let (label, cmd) = measuring_cmd(ctx, admitted, measuring_args(admitted.profile()));
+        let (label, cmd) = measuring_cmd(
+            ctx,
+            admitted,
+            measuring_args(admitted.profile(), ctx.no_windows),
+        );
         measuring_tests_admitted(ctx, r, admitted, &label, &cmd)
     }) {
         r.cannot_run(format!("measuring matrices: {why}"));
@@ -1645,6 +1722,8 @@ fn measuring_tests_admitted(
 pub(crate) struct Subject {
     /// The assertion contract proved by the artifact that the child actually executes.
     profile: Profile,
+    /// The runtime target selection and expected summaries use the same desktop policy.
+    no_windows: bool,
     /// [`crate::AdmittedArtifact::describe`].
     name: String,
     /// This checkout's HEAD, in full, when git names it.
@@ -1659,6 +1738,7 @@ impl Subject {
         let head = crate::head_commit(&ctx.root, &ctx.path_env);
         Self {
             profile: artifact.profile(),
+            no_windows: ctx.no_windows,
             name: artifact.describe(),
             own: head.as_deref().is_some_and(|h| artifact.built_from(h)),
             head,
@@ -1864,6 +1944,9 @@ fn strip_ansi_if_any(s: &str) -> std::borrow::Cow<'_, str> {
 fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject: &Subject) {
     if subject.profile == Profile::Debug {
         r.skip("shipping executable size requires a release artifact; debug validation cannot qualify a release");
+        r.skip("production capture requires a release artifact; debug validation cannot qualify production");
+    } else if subject.no_windows {
+        r.skip("capture matrix omitted under --no-windows (it opens a native production window)");
     }
     let unanswered = unanswered_rows(&run.output);
     if subject.own && !unanswered.is_empty() {
@@ -1876,7 +1959,7 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
     let mut any_failed = false;
     let mut any_undecided = false;
     let mut all_reported = true;
-    for target in measuring_targets(subject.profile) {
+    for target in measuring_targets(subject.profile, subject.no_windows) {
         let prefix = format!("measure result: {target} ");
         let mut summaries = run.output.lines().filter_map(|l| l.strip_prefix(&prefix));
         let counts = summaries.next().and_then(MeasuringCounts::parse);
@@ -2892,13 +2975,15 @@ fn candidate_shim(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let helper = crate::released_shim::CANDIDATE_HELPER_BIN;
-    if !build_to_drive(
+    if build_to_drive(
         ctx,
         r,
         candidate_helper_build_args(),
         format!("targo build --bin {helper}"),
         "candidate-shim (this tree's shim and atpkg, each placement)",
-    ) {
+    )
+    .is_none()
+    {
         return;
     }
     let bin = main_bin(ctx, helper);
@@ -3009,138 +3094,195 @@ pub fn redraw_outcome(code: Option<i32>) -> (Outcome, String) {
     }
 }
 
-fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
-    if !ctx.tools.have_targo() {
-        r.skip("redraw conformance (no targo)");
-        return;
-    }
-    if !build_to_drive(
-        ctx,
-        r,
-        redraw_conformance_build_args(),
-        format!("targo build --bin {REDRAW_CONFORMANCE_BIN}"),
-        "redraw conformance (the verb matrix against a real proxy)",
-    ) {
-        return;
-    }
-    let bin = main_bin(ctx, REDRAW_CONFORMANCE_BIN);
-    if !is_executable_file(&bin) {
-        r.cannot_run(format!(
-            "redraw conformance: just-built harness missing ({})",
-            bin.display()
-        ));
-        return;
-    }
-    let paths = [(REDRAW_CONFORMANCE_BIN, bin.clone())];
-    let Some(runtime) = appkit_group_runtime(ctx, r, crate::appkit_content::REDRAW_GROUP, &paths)
-    else {
-        return;
-    };
-    let mut observed =
-        appkit_group_proof(ctx, crate::appkit_content::REDRAW_GROUP, &paths, &runtime);
-    if carry_appkit_group(
-        ctx,
-        r,
-        crate::appkit_content::REDRAW_GROUP,
-        &paths,
-        &runtime,
-        observed.as_ref(),
-    ) {
-        return;
-    }
-    // The second hash used by a refused carry is the nearest observation to execution.
-    if ctx
-        .passed_appkit_groups
-        .as_ref()
-        .and_then(|passed| passed.get(crate::appkit_content::REDRAW_GROUP))
-        .is_some()
-    {
-        observed = appkit_group_proof(ctx, crate::appkit_content::REDRAW_GROUP, &paths, &runtime);
-    }
-    let out = run_row(ctx, &r.title, REDRAW_CONFORMANCE_BIN, &runtime.commands[0]);
-    r.record_driven(&out, "aterm-redraw-conformance", |code, _| {
-        redraw_outcome(code)
-    });
-    finish_appkit_group(
-        ctx,
-        r,
-        crate::appkit_content::REDRAW_GROUP,
-        &paths,
-        &runtime,
-        observed,
-    );
+#[derive(Clone, Copy)]
+enum AppkitDrivers {
+    Redraw,
+    Objc,
 }
 
-fn objc_drives(ctx: &Ctx, r: &mut Report) {
-    if !cfg!(target_os = "macos") {
-        r.skip("objc drives (macOS only: the driven classes are macOS ones)");
-        return;
-    }
-    if !ctx.tools.have_targo() {
-        r.skip("objc drives (no targo)");
-        return;
-    }
-    if !build_to_drive(
-        ctx,
-        r,
-        objc_drives_build_args(),
-        "targo build -p aterm-gui (all seven objc drivers)".to_owned(),
-        "objc drives",
-    ) {
-        return;
-    }
-    let paths: Vec<(&str, std::path::PathBuf)> = OBJC_DRIVES
-        .iter()
-        .map(|drive| (drive.example, main_example(ctx, drive.example)))
-        .collect();
-    for (name, bin) in &paths {
-        if !is_executable_file(bin) {
-            r.cannot_run(format!(
-                "{name}: just-built driver missing ({})",
-                bin.display()
-            ));
-            return;
+impl AppkitDrivers {
+    fn group(self) -> &'static str {
+        match self {
+            Self::Redraw => crate::appkit_content::REDRAW_GROUP,
+            Self::Objc => crate::appkit_content::OBJC_GROUP,
         }
     }
-    let Some(runtime) = appkit_group_runtime(ctx, r, crate::appkit_content::OBJC_GROUP, &paths)
-    else {
-        return;
-    };
-    let mut observed = appkit_group_proof(ctx, crate::appkit_content::OBJC_GROUP, &paths, &runtime);
-    if carry_appkit_group(
-        ctx,
-        r,
-        crate::appkit_content::OBJC_GROUP,
-        &paths,
-        &runtime,
-        observed.as_ref(),
-    ) {
-        return;
+
+    fn paths(self, ctx: &Ctx) -> Vec<(&'static str, std::path::PathBuf)> {
+        match self {
+            Self::Redraw => vec![(
+                REDRAW_CONFORMANCE_BIN,
+                main_bin(ctx, REDRAW_CONFORMANCE_BIN),
+            )],
+            Self::Objc => OBJC_DRIVES
+                .iter()
+                .map(|drive| (drive.example, main_example(ctx, drive.example)))
+                .collect(),
+        }
     }
-    if ctx
-        .passed_appkit_groups
-        .as_ref()
-        .and_then(|passed| passed.get(crate::appkit_content::OBJC_GROUP))
-        .is_some()
-    {
-        observed = appkit_group_proof(ctx, crate::appkit_content::OBJC_GROUP, &paths, &runtime);
+
+    fn supported(self, ctx: &Ctx, r: &mut Report) -> bool {
+        if matches!(self, Self::Objc) && !cfg!(target_os = "macos") {
+            r.skip("objc drives (macOS only: the driven classes are macOS ones)");
+            return false;
+        }
+        if !ctx.tools.have_targo() {
+            r.skip(format!("{} (no targo)", self.group()));
+            return false;
+        }
+        true
     }
-    for (drive, command) in OBJC_DRIVES.iter().zip(&runtime.commands) {
-        objc_drive(ctx, r, drive, command);
+
+    fn build(self, ctx: &Ctx, r: &mut Report) {
+        if !self.supported(ctx, r) {
+            return;
+        }
+        let (args, label) = match self {
+            Self::Redraw => (
+                redraw_conformance_build_args(),
+                format!("targo build --bin {REDRAW_CONFORMANCE_BIN}"),
+            ),
+            Self::Objc => (
+                objc_drives_build_args(),
+                "targo build -p aterm-gui (all seven objc drivers)".into(),
+            ),
+        };
+        let Some(messages) = build_to_drive(ctx, r, args, label, self.group()) else {
+            return;
+        };
+        let paths = self.paths(ctx);
+        for (name, path) in &paths {
+            if !is_executable_file(path) {
+                r.cannot_run(format!(
+                    "{name}: just-built driver missing ({})",
+                    path.display()
+                ));
+                return;
+            }
+        }
+        match crate::appkit_content::Prepared::capture(
+            &paths,
+            &messages,
+            &ctx.root.join("crates/aterm-gui/Cargo.toml"),
+        ) {
+            Ok(images) => {
+                ctx.prepared_appkit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(self.group(), images);
+                r.pass(format!("built {} drivers", self.group()));
+            }
+            Err(why) => r.cannot_run(why),
+        }
     }
-    finish_appkit_group(
-        ctx,
-        r,
-        crate::appkit_content::OBJC_GROUP,
-        &paths,
-        &runtime,
-        observed,
-    );
+
+    fn run(self, ctx: &Ctx, r: &mut Report) {
+        if !self.supported(ctx, r) {
+            return;
+        }
+        let group = self.group();
+        let Some(prepared) = ctx
+            .prepared_appkit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(group)
+        else {
+            r.cannot_run(format!(
+                "AppKit {group}: no successful driver build in this run{NOT_RUN_BEHIND}"
+            ));
+            return;
+        };
+        let paths = prepared.paths();
+        let Some(runtime) = appkit_group_runtime(ctx, r, group, paths) else {
+            return;
+        };
+        // When release carry is enabled the proof already includes the current bytes.
+        // Other invocations still bind their runtime to this run's successful build.
+        let observe = || {
+            if let Some(context) = ctx.carry_context.as_deref() {
+                runtime.empty()?;
+                prepared.proof(group, context, &runtime.commands).map(Some)
+            } else {
+                prepared.validate()?;
+                Ok(None)
+            }
+        };
+        let mut observed = match observe() {
+            Ok(proof) => proof,
+            Err(why) => return r.cannot_run(why),
+        };
+        if carry_appkit_group(ctx, r, group, &prepared, &runtime, observed.as_ref()) {
+            return;
+        }
+        if ctx
+            .passed_appkit_groups
+            .as_ref()
+            .is_some_and(|passed| passed.contains_key(group))
+        {
+            observed = match observe() {
+                Ok(proof) => proof,
+                Err(why) => return r.cannot_run(why),
+            };
+        }
+        match self {
+            Self::Redraw => {
+                let out = run_appkit_row(
+                    ctx,
+                    &r.title,
+                    REDRAW_CONFORMANCE_BIN,
+                    &prepared,
+                    &runtime.commands[0],
+                );
+                r.record_driven(&out, REDRAW_CONFORMANCE_BIN, |code, _| redraw_outcome(code));
+            }
+            Self::Objc => {
+                for (drive, command) in OBJC_DRIVES.iter().zip(&runtime.commands) {
+                    objc_drive(ctx, r, drive, &prepared, command);
+                }
+            }
+        }
+        if observed.is_some() {
+            if let Err(why) = prepared.validate() {
+                r.cannot_run(why);
+                return;
+            }
+            finish_appkit_group(ctx, r, group, paths, &runtime, observed);
+        } else if let Err(why) = observe() {
+            r.cannot_run(why);
+        }
+    }
 }
 
-fn objc_drive(ctx: &Ctx, r: &mut Report, drive: &ObjcDrive, command: &Cmd) {
+pub(crate) fn run_appkit_row(
+    ctx: &Ctx,
+    stage: &str,
+    row: &str,
+    prepared: &crate::appkit_content::Prepared,
+    command: &Cmd,
+) -> exec::Run {
+    if let Err(why) = prepared.validate_program(&command.program) {
+        return exec::Run {
+            spawn_error: Some(why),
+            ..exec::Run::default()
+        };
+    }
+    let mut actual = run_row(ctx, stage, row, command);
+    if let Err(why) = prepared.validate_program(&command.program) {
+        actual.ok = false;
+        actual.spawn_error = Some(why);
+    }
+    actual
+}
+
+fn objc_drive(
+    ctx: &Ctx,
+    r: &mut Report,
+    drive: &ObjcDrive,
+    prepared: &crate::appkit_content::Prepared,
+    command: &Cmd,
+) {
     let name = drive.example;
-    let out = run_row(ctx, &r.title, name, command);
+    let out = run_appkit_row(ctx, &r.title, name, prepared, command);
     r.record_driven(&out, name, |code, transcript| {
         objc_drive_outcome(drive, code, transcript)
     });
@@ -3179,7 +3321,7 @@ const WINDOWED_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(
 /// before the lock is let go (`Drop` runs before the fields drop), so a waiter never reads it
 /// naming a run that no longer holds the lock, save one that died holding it.
 #[cfg(unix)]
-struct WindowLock {
+pub(crate) struct WindowLock {
     dir: std::path::PathBuf,
     _lock: aterm_uds::private_file::PrivateLock,
 }
@@ -3209,7 +3351,7 @@ fn windowed_holder(dir: &std::path::Path) -> Option<u32> {
 /// [`aterm_uds::private_file::PrivateLock::take`]'s refusals other than `busy`, and a holder that
 /// made no progress for `hang`, named by its pid where its record names one.
 #[cfg(unix)]
-fn take_window_lock(
+pub(crate) fn take_window_lock(
     dir: &std::path::Path,
     hang: std::time::Duration,
     mut progress: impl FnMut(Option<u32>) -> bool,
@@ -3262,7 +3404,7 @@ fn take_window_lock(
 /// process's view, each holder's tree read by a [`aterm_uds::deadline::ProcessProgressProbe`] of
 /// its own (its `read`, not `read_descendants`: the holder is no child of the waiter).
 #[cfg(unix)]
-fn holder_progress() -> impl FnMut(Option<u32>) -> bool {
+pub(crate) fn holder_progress() -> impl FnMut(Option<u32>) -> bool {
     let mut probe: Option<(u32, aterm_uds::deadline::ProcessProgressProbe)> = None;
     holder_progress_with(
         std::process::id(),
@@ -3518,7 +3660,7 @@ fn carry_appkit_group(
     ctx: &Ctx,
     r: &mut Report,
     group: &str,
-    paths: &[(&str, std::path::PathBuf)],
+    prepared: &crate::appkit_content::Prepared,
     runtime: &AppkitRuntime,
     observed: Option<&crate::appkit_content::GroupProof>,
 ) -> bool {
@@ -3532,7 +3674,11 @@ fn carry_appkit_group(
     let Some(observed) = observed.filter(|observed| *observed == prior) else {
         return false;
     };
-    let stable = appkit_group_proof(ctx, group, paths, runtime);
+    let stable = runtime.empty().ok().and_then(|()| {
+        prepared
+            .proof(group, ctx.carry_context.as_deref()?, &runtime.commands)
+            .ok()
+    });
     if stable.as_ref() != Some(observed) {
         return false;
     }

@@ -26,6 +26,9 @@ pub struct MembershipHistoryInspection {
     pub complete_inventory_sha256: [u8; 32],
     pub waiting: usize,
     pub bytes: usize,
+    /// The most bytes of records, waiting records and stubs the store this log was read from
+    /// holds ([`crate::membership_log::Log::capacity`]): its own format's, not a constant.
+    pub capacity: usize,
     pub budgets: crate::membership_log::RecordBudgets,
     /// How full the log is ([`crate::membership_log::Log::fill`]): the reading `aterm secrets
     /// status` says on its `log:` line and a refusal names, of complete records alone, since a
@@ -84,6 +87,7 @@ pub fn inspect_membership_history_until(
         complete_inventory_sha256: membership_inventory(&log),
         waiting: log.waiting(),
         bytes: log.total_bytes(),
+        capacity: log.capacity(),
         budgets: log.budgets(),
         fill: log.fill(aterm_time::unix_millis()),
     }))

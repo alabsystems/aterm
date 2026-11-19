@@ -7,6 +7,9 @@
 //! missing current file never falls back to an earlier snapshot.
 //! The pin's required reader capacity only rises, before data publication, so a smaller
 //! format-aware build refuses a later larger history instead of shortening it.
+//! The file and the prepared directory trade names by one exchange on Unix, and on Windows, which
+//! has none, by three renames that never replace, carried on by the next writer where a cut
+//! stopped them (`Context::exchange`).
 
 use crate::{Error, Result, fsx};
 use aterm_digest::Sha256;
@@ -21,11 +24,40 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Which rewrite made what a records entry holds (`rewrite::generation`): what a consumer that
+/// keeps a place in the records keeps the place under, and what a write of the records file
+/// says its store was written under ([`crate::membership_log::store::Written::generation`]).
+/// Two that are equal name one order of the records the rewrite kept; the number alone does
+/// not (`rewrite`'s "The generation is a number and the rewrite that made it"). The rewrite is
+/// Unix only; an entry on any other platform is never rewritten, and is the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordsGeneration {
+    /// How many rewrites made what the entry holds: 0 for an entry never rewritten or absent.
+    pub number: u64,
+    /// The SHA-256 of the layout header the rewrite's pin names, which binds the data the
+    /// rewrite was computed from and the data it wrote; `None` exactly where `number` is 0.
+    pub rewrite: Option<[u8; 32]>,
+}
+
+/// The rewrite of a layout's data, the second transition (`docs/DESIGN-vault-log-2026-11-14.md`
+/// step 4): dark, but for the generation a consumer reads (`rewrite::generation`). Its one
+/// caller outside the tests is a Mac that reads format 2 taking a served root into its file
+/// (`client::persist_stored`), which no running build is.
+#[cfg(unix)]
+pub(crate) mod rewrite;
+
 const DATA: &str = "current";
 const HEADER: &str = "layout";
 const MAGIC: &str = "aterm-records-layout/1";
 const PIN_MAGIC: &str = "aterm-records-pin/1";
 const META_LIMIT: usize = 1024;
+/// The most bytes a records file kept whole, or the data of the layout this transition makes of
+/// it, holds: format 1's capacity ([`crate::crossing::capacity`], the storage class of byte
+/// bound). The transition, its header and its pin (`/1`) are format 1's, as every build since
+/// the fence reads them; a rewritten layout's data is held to its own format's
+/// (`rewrite::bytes_of`).
+const DATA_LIMIT: usize =
+    crate::membership_log::Reading::Format(crate::crossing::FORMAT_ONE).capacity();
 
 /// No data or transition witness exists at this logical entry.
 pub(crate) fn absent(entry: &Path) -> Result<bool> {
@@ -47,6 +79,10 @@ pub(crate) struct Selected {
     entry: PathBuf,
     path: PathBuf,
     witnesses: Option<Witnesses>,
+    /// Whether a reader of format 2 selected it at a rewritten layout (`rewrite::selected`),
+    /// which [`data_path`] refuses: its confirmation is that reader's.
+    #[cfg(unix)]
+    rewritten: bool,
 }
 
 /// What stood at a selection's pin and entry, and at its intent where neither stands
@@ -64,6 +100,10 @@ impl Selected {
     /// selection looked at it ([`selection_witnesses`]), still stand as they were found, or the
     /// selection is resolved again, with what that refuses.
     pub(crate) fn confirm(&self) -> Result<()> {
+        #[cfg(unix)]
+        if self.rewritten {
+            return rewrite::confirm(&self.entry, &self.path);
+        }
         if self.witnesses.is_some() && selection_witnesses(&self.entry, None).ok() == self.witnesses
         {
             return Ok(());
@@ -266,6 +306,8 @@ impl Judgements {
             entry: entry.to_path_buf(),
             path,
             witnesses,
+            #[cfg(unix)]
+            rewritten: false,
         })
     }
 
@@ -349,6 +391,14 @@ pub(crate) fn data_path(entry: &Path) -> Result<PathBuf> {
                     .intent()?
                     .ok_or_else(|| refused("the preparation intent changed during resolution"))?;
                 if intent.original.is_some() {
+                    // A Windows exchange cut short between moving the original to its preserved
+                    // name and placing the folder at the entry ([`Context::exchange`]): the next
+                    // writer finishes it.
+                    #[cfg(windows)]
+                    if fsx::kind(&entry.with_file_name(parked_name(&intent)))? != fsx::Kind::Missing
+                    {
+                        return Err(refused("an interrupted transition needs its writer lock"));
+                    }
                     return Err(refused("the intended original records file is missing"));
                 }
             }
@@ -500,8 +550,9 @@ pub(crate) fn intent_path(entry: &Path) -> Result<PathBuf> {
 /// The vault's head beside `entry` (`records.head`): a cache of the data file's live state that
 /// an open reads in place of the file where it names the file as it is
 /// (`membership_log::head`). It is beside the entry, as the pin and the intent are, whatever
-/// layout the entry takes, and no transition reads, moves or needs it: a head that names another
-/// file than the one selected is not read.
+/// layout the entry takes, and no transition reads or needs it: a head that names another
+/// file than the one selected is not read. A rewrite removes it with the data it names
+/// (`records_storage::rewrite`), so it keeps none of the records the rewrite dropped.
 pub(crate) fn head_path(entry: &Path) -> Result<PathBuf> {
     side_path(entry, "head")
 }
@@ -515,11 +566,23 @@ fn side_path(entry: &Path, suffix: &str) -> Result<PathBuf> {
     Ok(entry.with_file_name(format!("{name}.{suffix}")))
 }
 
+/// A durable point of a transition of the entry, after which a test may end it as a crash would:
+/// of the first, which makes a records file a layout ([`Context::prepare`]: `Intent`, `Copied`,
+/// `Prepared`, on Windows `Parked` and `Moved` where a records file is kept whole
+/// (`Context::exchange`), `Exchanged`, `Pinned`), and of a rewrite (`records_storage::rewrite`:
+/// `Intent`, `Copied`, `Prepared`, `Pinned`, then `Exchanged` once the predecessor's files are
+/// unlinked).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     Intent,
     Copied,
     Prepared,
+    /// The prepared folder has its swap name ([`parked_name`]).
+    #[cfg(windows)]
+    Parked,
+    /// The records file kept whole has its preserved name, the entry is empty.
+    #[cfg(windows)]
+    Moved,
     Exchanged,
     Pinned,
 }
@@ -637,11 +700,7 @@ impl Context {
     }
 
     fn original(&self) -> Result<Option<File>> {
-        optional_regular(
-            &self.parent,
-            &self.name,
-            crate::membership_log::MAX_RECORDS_STREAM,
-        )
+        optional_regular(&self.parent, &self.name, DATA_LIMIT)
     }
 
     fn original_for(&self, header: &Layout) -> Result<Option<File>> {
@@ -678,7 +737,7 @@ impl Context {
         check_capacity(capacity)?;
         #[cfg(test)]
         fsx::count_read(&self.entry.join(DATA));
-        regular(&directory, DATA, crate::membership_log::MAX_RECORDS_STREAM)?;
+        regular(&directory, DATA, DATA_LIMIT)?;
         Ok(capacity)
     }
 
@@ -732,16 +791,6 @@ impl Context {
             Some(header) => header,
             None => {
                 let mut original = self.original()?;
-                // Windows has no atomic exchange of two names (`aterm_dirfd::RenameFlags::EXCHANGE`),
-                // which a records file kept whole needs to become a layout: refused before any
-                // preparation is declared, so the file stays as it is (ATERM-KI-1116-52817).
-                #[cfg(windows)]
-                if original.is_some() {
-                    return Err(refused(
-                        "a records file kept whole cannot become a layout on Windows, which has no \
-                         atomic exchange of names",
-                    ));
-                }
                 let identity = original.as_ref().map(identity).transpose()?;
                 let (len, digest) = match original.as_mut() {
                     Some(file) => copy_digest(file, &mut std::io::sink())?,
@@ -761,8 +810,16 @@ impl Context {
             }
         };
         after(Step::Intent)?;
-        let mut original = self.original_for(&header)?;
         let old_name = format!(".aterm-records-{}", header.nonce);
+        // A Windows exchange a cut stopped once its folder was parked: carried on from where the
+        // names stand, never prepared again ([`Self::exchange`]).
+        #[cfg(windows)]
+        if fsx::kind(&self.entry.with_file_name(parked_name(&header)))? != fsx::Kind::Missing {
+            self.exchange(&header, &old_name, &after)?;
+            after(Step::Exchanged)?;
+            return self.finish(after);
+        }
+        let mut original = self.original_for(&header)?;
         match fd::mkdirat(&self.parent, old_name.as_str(), Mode::RWXU) {
             Ok(()) => {}
             #[cfg(unix)]
@@ -801,18 +858,14 @@ impl Context {
                 ));
             }
         }
-        match optional_regular(&directory, DATA, crate::membership_log::MAX_RECORDS_STREAM)? {
+        match optional_regular(&directory, DATA, DATA_LIMIT)? {
             Some(mut data) => {
                 if copy_digest(&mut data, &mut std::io::sink())? != (header.len, header.digest) {
                     return Err(refused("prepared data does not match its intent"));
                 }
             }
             None => {
-                let mut data = scratch(
-                    &directory,
-                    "current.building",
-                    crate::membership_log::MAX_RECORDS_STREAM,
-                )?;
+                let mut data = scratch(&directory, "current.building", DATA_LIMIT)?;
                 let observed = match original.as_mut() {
                     Some(file) => copy_digest(file, &mut data)?,
                     None => (0, Sha256::digest(b"")),
@@ -836,21 +889,113 @@ impl Context {
         durable_dir(&directory)?;
         durable_dir(&self.parent)?;
         after(Step::Prepared)?;
-        self.original_for(&header)?;
-        syscall(fd::renameat_with(
-            &self.parent,
-            old_name.as_str(),
-            &self.parent,
-            self.name.as_str(),
-            if header.original.is_some() {
-                RenameFlags::EXCHANGE
-            } else {
-                RenameFlags::NOREPLACE
-            },
-        ))?;
+        #[cfg(unix)]
+        {
+            self.original_for(&header)?;
+            syscall(fd::renameat_with(
+                &self.parent,
+                old_name.as_str(),
+                &self.parent,
+                self.name.as_str(),
+                if header.original.is_some() {
+                    RenameFlags::EXCHANGE
+                } else {
+                    RenameFlags::NOREPLACE
+                },
+            ))?;
+        }
+        #[cfg(windows)]
+        if header.original.is_some() {
+            self.exchange(&header, &old_name, &after)?;
+        } else {
+            self.original_for(&header)?;
+            syscall(fd::renameat_with(
+                &self.parent,
+                old_name.as_str(),
+                &self.parent,
+                self.name.as_str(),
+                RenameFlags::NOREPLACE,
+            ))?;
+        }
         durable_dir(&self.parent)?;
         after(Step::Exchanged)?;
         self.finish(after)
+    }
+
+    /// Windows's exchange of the prepared folder at `preserved` (`.aterm-records-<nonce>`) with
+    /// the records file kept whole at the entry, which NTFS cannot make in one step
+    /// ([`RenameFlags::EXCHANGE`]): three renames, none of which replaces an entry, each moving
+    /// only the file it names by that file's id (`aterm_dirfd::renameat_judged`): `Parked`, the
+    /// folder to its swap name ([`parked_name`]); `Moved`, the original to `preserved`, where the
+    /// layout keeps it as its predecessor; and the folder to the entry, after which the names stand
+    /// as one exchange leaves them. Each step is taken from where the names stand, so a writer that
+    /// finds an exchange a cut stopped ([`Self::prepare`], which looks for the parked folder before
+    /// it prepares anything) takes the step the cut writer would have taken next: the original
+    /// stands at one name and the folder at one name at every step, a reader reads the original
+    /// whole while it is at the entry and is refused while the entry is empty ([`data_path`]),
+    /// and the next writer always finishes (`SwarmRecordsExchange`, `aterm-models-swarm`). The
+    /// original is held to the intent (its id and its bytes) before it moves, and
+    /// [`Self::finish`] holds it there again, at `preserved`, before the pin.
+    #[cfg(windows)]
+    fn exchange(
+        &self,
+        header: &Layout,
+        preserved: &str,
+        after: &impl Fn(Step) -> Result<()>,
+    ) -> Result<()> {
+        let (dev, ino) = header
+            .original
+            .ok_or_else(|| refused("an exchange with no records file kept whole"))?;
+        let parked = parked_name(header);
+        // The folder at `name`, private and owned, by its id.
+        let folder = |name: &str| -> Result<fd::FileId> {
+            let opened = File::from(syscall(fd::openat(
+                &self.parent,
+                name,
+                dir_flags(),
+                Mode::empty(),
+            ))?);
+            if !private_dir_at(&self.parent, name, &opened)? {
+                return Err(refused(
+                    "the preparation directory is not private and owned",
+                ));
+            }
+            let (dev, ino) = identity(&opened)?;
+            Ok(fd::FileId { dev, ino })
+        };
+        if fsx::kind(&self.entry.with_file_name(&parked))? == fsx::Kind::Missing {
+            let id = folder(preserved)?;
+            syscall(fd::renameat_judged(
+                &self.parent,
+                preserved,
+                &self.parent,
+                parked.as_str(),
+                RenameFlags::NOREPLACE,
+                id,
+            ))?;
+            after(Step::Parked)?;
+        }
+        if fsx::kind(&self.entry)? != fsx::Kind::Missing {
+            self.original_for(header)?;
+            syscall(fd::renameat_judged(
+                &self.parent,
+                self.name.as_str(),
+                &self.parent,
+                preserved,
+                RenameFlags::NOREPLACE,
+                fd::FileId { dev, ino },
+            ))?;
+            after(Step::Moved)?;
+        }
+        let id = folder(&parked)?;
+        syscall(fd::renameat_judged(
+            &self.parent,
+            parked.as_str(),
+            &self.parent,
+            self.name.as_str(),
+            RenameFlags::NOREPLACE,
+            id,
+        ))
     }
 
     fn finish(&self, after: impl Fn(Step) -> Result<()>) -> Result<()> {
@@ -862,18 +1007,14 @@ impl Context {
         {
             return Err(refused("the layout has no matching preparation intent"));
         }
-        let mut current = regular(&directory, DATA, crate::membership_log::MAX_RECORDS_STREAM)?;
+        let mut current = regular(&directory, DATA, DATA_LIMIT)?;
         if copy_digest(&mut current, &mut std::io::sink())? != (header.len, header.digest) {
             return Err(refused("prepared custody changed before pin publication"));
         }
         let old_name = format!(".aterm-records-{}", header.nonce);
         match header.original {
             Some((dev, ino)) => {
-                let mut old = regular(
-                    &self.parent,
-                    &old_name,
-                    crate::membership_log::MAX_RECORDS_STREAM,
-                )?;
+                let mut old = regular(&self.parent, &old_name, DATA_LIMIT)?;
                 if identity(&old)? != (dev, ino)
                     || copy_digest(&mut old, &mut std::io::sink())? != (header.len, header.digest)
                 {
@@ -969,7 +1110,7 @@ impl Layout {
             .and_then(|s| s.split_once(' '))
             .ok_or_else(|| refused("invalid initial custody"))?;
         let len = len.parse().map_err(|_| refused("invalid custody length"))?;
-        if len > crate::membership_log::MAX_RECORDS_STREAM {
+        if len > DATA_LIMIT {
             return Err(refused("custody exceeds its bound"));
         }
         let digest = unhex(digest).ok_or_else(|| refused("invalid custody digest"))?;
@@ -1011,6 +1152,14 @@ impl Layout {
 
 fn dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+/// The prepared folder's name beside the entry while a Windows exchange moves the records file
+/// kept whole to the folder's own name ([`Context::exchange`]): `.aterm-records-<nonce>.swap`,
+/// of the preparation `header` declares, a name no Unix build makes or reads.
+#[cfg(windows)]
+fn parked_name(header: &Layout) -> String {
+    format!(".aterm-records-{}.swap", header.nonce)
 }
 
 fn regular(parent: &File, name: &str, max: usize) -> Result<File> {
@@ -1175,7 +1324,7 @@ fn copy_digest(input: &mut File, output: &mut dyn std::io::Write) -> Result<(usi
         }
         len = len
             .checked_add(n)
-            .filter(|len| *len <= crate::membership_log::MAX_RECORDS_STREAM)
+            .filter(|len| *len <= DATA_LIMIT)
             .ok_or_else(|| refused("a record file grew past its bound"))?;
         output.write_all(&buffer[..n])?;
         digest.update(&buffer[..n]);

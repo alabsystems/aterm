@@ -229,26 +229,119 @@ fn combine(answers: Vec<Asked>) -> Asked {
 
 /// Ask the instance listening at `sock` whether the session this process belongs to may reveal.
 fn ask_one(sock: &str) -> Asked {
-    let (stream, token) = match aterm_ctl::connect_then_read_token(sock) {
-        Ok(connected) => connected,
-        Err(error) => return Asked::Failed(format!("connect: {}", error.kind())),
-    };
-    let Ok(token) = token else {
-        return Asked::Failed("its token could not be read".to_owned());
-    };
-    match aterm_ctl::exchange_lines(
+    match reveal(sock) {
+        Ok(lines) => parse(&lines),
+        Err(why) => Asked::Failed(why),
+    }
+}
+
+/// The lines of the `reveal` answer of the instance listening at `sock`, or why there are none.
+fn reveal(sock: &str) -> std::result::Result<Vec<String>, String> {
+    let (stream, token) = aterm_ctl::connect_then_read_token(sock)
+        .map_err(|error| format!("connect: {}", error.kind()))?;
+    let token = token.map_err(|_| "its token could not be read".to_owned())?;
+    aterm_ctl::exchange_lines(
         &stream,
         &token,
         "reveal",
         std::time::Duration::from_secs(10),
-    ) {
-        Ok(lines) => parse(&lines),
-        Err(error) => Asked::Failed(format!("reveal: {}", error.kind())),
+    )
+    .map_err(|error| format!("reveal: {}", error.kind()))
+}
+
+/// The aterm session this process's lineage leads to and the agent nearest it in that lineage,
+/// as an aterm instance on this Mac answers `reveal` (by the kernel's peer process and its
+/// ancestry, never by `ATERM_SESSION_ID`): what a record states as its principal's session and
+/// program (`crate::said`). The instance nearest this process in its own ancestry answers first
+/// ([`nearest_first`]): of nested instances, the inner one holds the session this process runs
+/// in, while the outer one names the session the inner instance runs in. `None` where no
+/// instance names a session: none runs here, none answered, or this process runs in none of
+/// their sessions.
+#[must_use]
+pub fn lineage() -> Option<Lineage> {
+    let instances = aterm_ctl::local_instances().ok()?;
+    let mut ancestors = Vec::new();
+    let mut at = aterm_uds::sudo::parent_pid();
+    while at > 1 && ancestors.len() < 64 {
+        ancestors.push(at);
+        let Some(parent) = aterm_uds::sudo::parent_of(at) else {
+            break;
+        };
+        at = parent;
     }
+    nearest_first(&instances, &ancestors)
+        .into_iter()
+        .find_map(|sock| reveal(sock).ok().and_then(|lines| named(&lines)))
+}
+
+/// The sockets of `instances` (pid, socket), those whose pid is in `ancestors` (this process's,
+/// nearest first) first and nearest first, then the rest in their order.
+fn nearest_first<'a>(instances: &'a [(u32, String)], ancestors: &[i32]) -> Vec<&'a String> {
+    let place = |pid: u32| {
+        ancestors
+            .iter()
+            .position(|at| i32::try_from(pid).is_ok_and(|pid| pid == *at))
+            .unwrap_or(usize::MAX)
+    };
+    let mut ordered: Vec<_> = instances.iter().collect();
+    ordered.sort_by_key(|(pid, _)| place(*pid));
+    ordered.into_iter().map(|(_, sock)| sock).collect()
+}
+
+/// What an instance's `reveal` answer names of the asking process ([`lineage`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lineage {
+    /// The session its lineage leads to: an ID aterm minted.
+    pub session: String,
+    /// The agent nearest it in that lineage (`claude`, `codex`, …), where one runs there.
+    pub program: Option<String>,
+    /// A person typed it: the instance found no agent in its lineage (`program=-`) and nothing
+    /// else acts in that session (`verdict=allowed`: not spawned, carried, held or driven by
+    /// `aterm ctl`, and no agent in the session's tree). False where the answer leaves it unknown,
+    /// such as one from an instance before `program=`.
+    pub person: bool,
+}
+
+/// The session and agent a `reveal` answer's one line names (`verdict=<word> session=<sid> …
+/// program=<agent|->`): `None` where it names no session, or names one or an agent out of
+/// grammar. An instance before `program=` names no agent and no person ([`Lineage::person`]).
+fn named(lines: &[String]) -> Option<Lineage> {
+    let [line] = lines else {
+        return None;
+    };
+    let field = |key: &str| {
+        line.split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix(key))
+    };
+    let session = field("session=")
+        .filter(|sid| aterm_types::control_request::Sid::parse(sid).is_some())?
+        .to_owned();
+    let mut person = false;
+    let program = match field("program=") {
+        None => None,
+        Some("-") => {
+            person = field("verdict=") == Some(ALLOWED);
+            None
+        }
+        Some(word)
+            if (1..=32).contains(&word.len())
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
+        {
+            Some(word.to_owned())
+        }
+        Some(_) => return None,
+    };
+    Some(Lineage {
+        session,
+        program,
+        person,
+    })
 }
 
 /// The verdict of a `reveal` answer's lines (`verdict=<word> session=<sid|->`), with the session
-/// it names: an ID aterm minted (`aterm_types::control_verbs::is_minted_sid`: a tab ID, or the
+/// it names: an exact local session ID ([`aterm_types::control_request::Sid`]): a tab ID, or the
 /// `s-` and 20 lower-case hex digits a tab opened before the `t` form keeps until it closes), or
 /// none for `-`. The instance names its own session, on this Mac, so the legacy form is read
 /// here as every reader of this Mac's own shells reads it; any other word is out of grammar.
@@ -267,7 +360,9 @@ fn parse(lines: &[String]) -> Asked {
     };
     let session = match field("session=") {
         None | Some("-") => None,
-        Some(sid) if aterm_types::control_verbs::is_minted_sid(sid) => Some(sid.to_owned()),
+        Some(sid) if aterm_types::control_request::Sid::parse(sid).is_some() => {
+            Some(sid.to_owned())
+        }
         Some(_) => return Asked::Failed("an answer whose session is no session id".to_owned()),
     };
     Asked::Answered {

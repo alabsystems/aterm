@@ -4,6 +4,44 @@
 use super::*;
 
 #[test]
+fn codex_token_observations_keep_the_provider_clock_across_unrelated_updates() {
+    let mut tl = SessionTimeline::default();
+    tl.note_foreground_group(70);
+    let now = i64::try_from(aterm_time::since_epoch().expect("clock").as_millis()).unwrap();
+    let mut survey = crate::survey::CodexSurvey {
+        thread: "fixture".into(),
+        facts: aterm_agent::harness::codex_facts::CodexFacts {
+            tok_at_ms: Some(now - 20),
+            tok_out: Some(12),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(tl.set_codex_survey(70, survey.clone()));
+    let first = tl.codex_token_clock.expect("first dated count");
+    survey.branch = Some("different branch".into());
+    assert!(tl.set_codex_survey(70, survey.clone()));
+    assert_eq!(
+        tl.codex_token_clock,
+        Some(first),
+        "a cached count retains its collection time"
+    );
+    survey.facts.tok_out = Some(13);
+    assert!(tl.set_codex_survey(70, survey.clone()));
+    assert_eq!(
+        tl.codex_token_clock.unwrap().0,
+        first.0,
+        "two revisions with the same provider stamp yield no duration"
+    );
+    survey.facts.tok_at_ms = Some(now - 10);
+    assert!(tl.set_codex_survey(70, survey));
+    assert_eq!(
+        tl.codex_token_clock.unwrap().0.duration_since(first.0),
+        std::time::Duration::from_millis(10)
+    );
+}
+
+#[test]
 fn a_screen_wall_detail_keeps_the_limit_episode_start() {
     let mut timeline = SessionTimeline::default();
     let stamp = || AgentStamp {
@@ -68,7 +106,7 @@ fn native_exec_claim_transfer_keeps_identity_and_rejects_stale_authority() {
     );
     let old = meta.supervisor_authority(100);
     let moved = meta
-        .transfer_native_exec_claim(&old, 12, 100)
+        .transfer_native_exec_claim(&old, 12, None, 100)
         .expect("same native claim");
     assert_eq!(moved.identity(), Some(&proof));
     assert_eq!(moved.connection(), Some(12));
@@ -79,9 +117,15 @@ fn native_exec_claim_transfer_keeps_identity_and_rejects_stale_authority() {
             .iter()
             .any(|(connection, _)| *connection == 11)
     );
-    assert!(meta.transfer_native_exec_claim(&old, 13, 100).is_none());
+    assert!(
+        meta.transfer_native_exec_claim(&old, 13, None, 100)
+            .is_none()
+    );
     meta.set_supervisor(None, 100);
-    assert!(meta.transfer_native_exec_claim(&moved, 13, 100).is_none());
+    assert!(
+        meta.transfer_native_exec_claim(&moved, 13, None, 100)
+            .is_none()
+    );
 }
 
 /// A `ttl=` renewal of a live claim moves only its lease, so it keeps the revision; the same claim

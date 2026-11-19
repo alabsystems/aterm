@@ -37,7 +37,6 @@ const ROWS: &[(&str, &str)] = &[
     ("NS_WINDOW_CLOSE_BUTTON",                "NSWindowCloseButton"),
     ("NS_WINDOW_MINIATURIZE_BUTTON",          "NSWindowMiniaturizeButton"),
     ("NS_WINDOW_ZOOM_BUTTON",                 "NSWindowZoomButton"),
-    ("NS_WINDOW_ABOVE",                       "NSWindowAbove"),
     ("NS_TOOLBAR_DISPLAY_MODE_ICON_ONLY",     "NSToolbarDisplayModeIconOnly"),
     (
         "NS_WINDOW_TOOLBAR_STYLE_UNIFIED_COMPACT",

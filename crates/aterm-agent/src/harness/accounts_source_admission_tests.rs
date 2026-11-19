@@ -165,7 +165,10 @@ fn resolve_with_origin(state: &State, action: &str, promote: bool) -> State {
     };
     let selected = request.chosen(Cli::Claude, &roster, Some(&config));
     next.insert("admitted", i64::from(selected.is_ok()));
-    next.insert("native", i64::from(selected.ok().flatten().is_some()));
+    next.insert(
+        "native",
+        i64::from(selected.ok().and_then(Chosen::lab).is_some()),
+    );
     next.insert("phase", 1);
     next
 }

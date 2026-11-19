@@ -8,11 +8,15 @@ use std::ops::{Deref, DerefMut};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::time::Instant;
 
 use aterm_types::native_window::{HasNativeWindow, NativeWindow};
 use aterm_wayland::globals::Registry;
-use aterm_wayland::protocols::wayland::{wl_buffer, wl_shm, wl_shm_pool, wl_surface};
-use aterm_wayland::proxy::{Display, Listener, Proxy, Queue};
+use aterm_wayland::protocols::wayland::{
+    wl_buffer, wl_callback, wl_display, wl_shm, wl_shm_pool, wl_surface,
+};
+use aterm_wayland::proxy::{Display, Flushed, Listener, Proxy, Queue};
 use aterm_window::window::Window;
 
 use super::shm_mem::ShmMem;
@@ -96,6 +100,145 @@ struct Buffer {
 }
 
 const FORMAT: u32 = wl_shm::format::XRGB8888;
+
+/// A same-connection processing barrier, placed after the captured surface commit.
+/// Only this value dispatches its queue, including while its callback is retired.
+struct SubmitSync<Owner> {
+    display: Display,
+    callback: Option<Proxy>,
+    listener: Option<Listener>,
+    queue: Queue,
+    done: Arc<AtomicBool>,
+    // Dropped after the callback, listener and queue: the borrowed display stays live.
+    _owner: Owner,
+}
+
+impl<Owner> SubmitSync<Owner> {
+    /// # Safety
+    /// `owner` keeps `display` live through its own drop. All requests for the captured
+    /// present were marshalled before this call; no later present may replace it while
+    /// this barrier is pending.
+    unsafe fn after_submit(display: Display, owner: Owner) -> Result<Self, String> {
+        let queue = Queue::new(display).map_err(|e| e.to_string())?;
+        let wrapper = queue.display_wrapper().map_err(|e| e.to_string())?;
+        // SAFETY: the wrapper borrows the live display and assigns this new callback to
+        // the private queue, which is dispatched only by this value.
+        let callback = unsafe { wl_display::sync(wrapper.proxy()) }
+            .ok_or("Wayland could not create the capture's processing callback")?;
+        let done = Arc::new(AtomicBool::new(false));
+        let heard = Arc::clone(&done);
+        // SAFETY: this newly created callback has no other listener. It and the listener
+        // stay together; Drop destroys the proxy before freeing the listener's closure.
+        let listener = unsafe {
+            callback.listen(move |_, opcode, args| {
+                if opcode == wl_callback::evt::DONE
+                    && matches!(args, [aterm_wayland::proxy::EventArg::Uint(_)])
+                {
+                    heard.store(true, Ordering::Release);
+                }
+            })
+        };
+        let listener = match listener {
+            Ok(listener) => listener,
+            Err(error) => {
+                // SAFETY: no dispatcher can run on this undispatched private queue.
+                unsafe { callback.destroy() };
+                return Err(error.to_string());
+            }
+        };
+        Ok(Self {
+            display,
+            callback: Some(callback),
+            listener: Some(listener),
+            queue,
+            done,
+            _owner: owner,
+        })
+    }
+
+    fn poll_once(
+        &mut self,
+        timeout: i32,
+        stopped: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool, String> {
+        if stopped() {
+            return Err("the Wayland capture was cancelled before submission was confirmed".into());
+        }
+        self.queue.dispatch_pending().map_err(|e| e.to_string())?;
+        if self.done.load(Ordering::Acquire) {
+            return if stopped() {
+                Err("the Wayland capture was cancelled".into())
+            } else {
+                Ok(true)
+            };
+        }
+        let Some(reading) = self.queue.prepare_read().map_err(|e| e.to_string())? else {
+            return Ok(false);
+        };
+        let queued = self.display.try_flush().map_err(|e| e.to_string())? == Flushed::Queued;
+        let mut fd = libc::pollfd {
+            fd: self.display.fd().map_err(|e| e.to_string())?,
+            events: libc::POLLIN | if queued { libc::POLLOUT } else { 0 },
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd outlives the bounded call. Its descriptor belongs
+        // to the display, kept live by _owner; polling takes no ownership of it.
+        let polled = unsafe { libc::poll(&mut fd, 1, timeout) };
+        if polled < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(format!("Wayland capture readiness: {error}"));
+        }
+        if stopped() {
+            return Err("the Wayland capture was cancelled".into());
+        }
+        if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(
+                "the Wayland compositor connection ended before capture confirmation".into(),
+            );
+        }
+        if fd.revents & libc::POLLIN != 0 {
+            reading.read().map_err(|e| e.to_string())?;
+        } else {
+            // A writable socket only permits another flush; it proves no server processing.
+            drop(reading);
+        }
+        self.queue.dispatch_pending().map_err(|e| e.to_string())?;
+        if stopped() {
+            return Err("the Wayland capture was cancelled".into());
+        }
+        Ok(self.done.load(Ordering::Acquire))
+    }
+}
+
+impl<Owner> Drop for SubmitSync<Owner> {
+    fn drop(&mut self) {
+        if let Some(callback) = self.callback.take() {
+            // SAFETY: this value alone dispatches the private queue. No callback can be
+            // executing concurrently, and destroying the proxy retires queued events.
+            unsafe { callback.destroy() };
+        }
+        self.listener.take();
+    }
+}
+
+impl<Owner: Send + 'static> super::SubmitFence for SubmitSync<Owner> {
+    fn wait(mut self: Box<Self>, stopped: &(dyn Fn() -> bool + Send + Sync)) -> Result<(), String> {
+        if stopped() {
+            return Err("the Wayland capture was cancelled".into());
+        }
+        let mut progress =
+            super::linux::SubmitProgress::new(self.display.fd().map_err(|e| e.to_string())?)?;
+        loop {
+            if self.poll_once(100, stopped)? {
+                return Ok(());
+            }
+            progress.check()?;
+        }
+    }
+}
 
 impl Buffer {
     fn new(shm: Proxy, width: i32, height: i32) -> Result<Buffer, WaylandPresentError> {
@@ -215,6 +358,14 @@ pub(crate) struct WaylandPresenter {
 unsafe impl Send for WaylandPresenter {}
 
 impl WaylandPresenter {
+    /// Fence only a capture's submitted frame, on the surface's existing connection.
+    /// The owning window keeps that connection alive while the worker waits off the UI thread.
+    pub(crate) fn capture_submit_fence(&mut self) -> Result<Box<dyn super::SubmitFence>, String> {
+        // SAFETY: the retained window owns this borrowed display, and the capture path pins
+        // its exact submitted presentation before asking for this following sync callback.
+        let fence = unsafe { SubmitSync::after_submit(self.display, Arc::clone(&self._window)) }?;
+        Ok(Box::new(fence))
+    }
     /// Attach to `window`, a Wayland window of winit's.
     pub(crate) fn new(window: Arc<Window>) -> Result<Self, WaylandPresentError> {
         let Some(NativeWindow::Wayland { display, surface }) = window.native_window() else {
@@ -377,3 +528,7 @@ impl CpuFrameBuffer for WaylandFrame<'_> {
         self.p.present(damage)
     }
 }
+
+#[cfg(test)]
+#[path = "wayland_tests.rs"]
+mod tests;

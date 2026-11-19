@@ -420,6 +420,66 @@ fn a_person_base_is_out_of_reach_of_an_older_labs_sweep() {
 }
 
 #[test]
+fn retained_runs_leave_older_person_bases_alone() {
+    let mut prep = Prep {
+        person: Some("aterm-lab-guest".to_owned()),
+        keep: true,
+        ..Prep::default()
+    };
+    let base = prep_name(IMAGE, &prep);
+    retire_older_person_bases(
+        IMAGE,
+        &prep,
+        &base,
+        || panic!("a retained run has no reason to list older bases"),
+        |name| panic!("a retained run tried to delete {name}"),
+    )
+    .unwrap();
+
+    prep.keep = false;
+    let older = format!("{}-person-digest", base_name(IMAGE, false));
+    let names = format!("{base}\n{older}\naterm-mac-dmg-base-other-person-digest\n");
+    let mut retired = Vec::new();
+    retire_older_person_bases(
+        IMAGE,
+        &prep,
+        &base,
+        || Ok(names),
+        |name| {
+            retired.push(name.to_owned());
+        },
+    )
+    .unwrap();
+    assert_eq!(retired, [older]);
+}
+
+#[test]
+fn retained_runs_refuse_sip_off_and_preserve_the_base() {
+    let base = base_name(IMAGE, false);
+    let disabled = "System Integrity Protection status: disabled.";
+    let refused = require_sip_on(disabled, &base, true, |name| {
+        panic!("a retained run tried to delete {name}")
+    })
+    .unwrap_err();
+    assert_eq!(refused.code, NOT_RUN);
+
+    let mut retired = Vec::new();
+    let refused = require_sip_on(disabled, &base, false, |name| {
+        retired.push(name.to_owned());
+        true
+    })
+    .unwrap_err();
+    assert_eq!(refused.code, NOT_RUN);
+    assert_eq!(retired, [base.clone()]);
+
+    let enabled = "System Integrity Protection status: enabled.";
+    require_sip_on(enabled, &base, false, |name| {
+        panic!("a successful boot tried to delete {name}")
+    })
+    .unwrap();
+}
+
+#[test]
 fn a_base_is_named_by_its_image_and_grant_and_is_never_a_lanes_clone() {
     let plain = base_name(IMAGE, false);
     let fda = base_name(IMAGE, true);

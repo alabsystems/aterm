@@ -15,6 +15,7 @@ mod edge;
 mod id;
 pub mod input_backlog;
 pub mod sink;
+pub mod terminal_stream;
 
 pub use edge::{ConnectionKind, Edge, EdgeDecision, EdgeTable, EdgeToken, Op, decide_edge};
 pub use id::{LaunchNonce, SessionId, is_minted_sid};

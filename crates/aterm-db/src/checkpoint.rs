@@ -27,6 +27,7 @@
 
 use crate::{Error, Result, database::Cell, documents::Cells};
 use astream_wire::sync::{Actor, Digest, FloorRecord, Index, Projection};
+#[cfg(unix)]
 use aterm_secrets::commons::finality;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -334,6 +335,7 @@ pub(crate) fn verify(history: &History<'_>, body: &Body) -> Result<()> {
 /// not in its [`astream_wire::sync::Header`]; a replica that does not hold a tip's record (a
 /// fresh one handed only the boundary's headers) finds that body final nowhere: it names an older
 /// floor or none, and judges more records as hot, never fewer.
+#[cfg(unix)] // its readers, the signing pass (`att::checkpoint`) and the documents log, are unix's
 pub(crate) fn finals<'a>(
     shares: impl IntoIterator<Item = (Actor, &'a Body)>,
     scope: Digest,

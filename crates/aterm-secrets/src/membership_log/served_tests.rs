@@ -59,6 +59,108 @@ fn behind() -> Behind {
     }
 }
 
+/// [`behind`]'s vault as a test of another module meets it (a Mac's records pass, a join): a
+/// peer pruned at a final checkpoint, and what a Mac behind its cut holds.
+pub(crate) struct PrunedVault {
+    /// The seed whose key signed the vault's genesis.
+    pub(crate) founder: [u8; 32],
+    /// The pruned peer's store, reading format 2.
+    pub(crate) peer: Store,
+    /// What the Mac behind the cut holds, the genesis first.
+    pub(crate) behind: Vec<Record>,
+    /// The checkpoint the peer is rooted at.
+    pub(crate) root: RecordId,
+    /// The sleeper's record, which follows the dropped one alone.
+    pub(crate) slept: RecordId,
+    /// The record the peer's prune dropped.
+    pub(crate) dropped: RecordId,
+    /// A record a seat signs after the prune, which the peer does not hold yet.
+    pub(crate) next: Record,
+    /// A record seat B signed on what the Mac behind the cut holds, which the peer never
+    /// took: what another writer of that Mac's records file appends to it.
+    pub(crate) stray: Record,
+}
+
+/// [`PrunedVault`] of [`behind`].
+pub(crate) fn pruned_vault() -> PrunedVault {
+    let world = behind();
+    let next = one(
+        draft(&world.peer, A, T + MIN_AGE_MS + 2 * HOUR, name("next")),
+        A,
+    );
+    let stray = one(draft(&world.behind, B, T + DAY_MS, name("stray")), B);
+    let mut records = vec![world.behind.genesis().clone()];
+    records.extend(
+        world
+            .behind
+            .records()
+            .filter(|record| record.kind() != Kind::Genesis)
+            .cloned(),
+    );
+    PrunedVault {
+        founder: crate::membership_log::checkpoint::tests::FOUNDER,
+        peer: store_of(world.peer.clone()).read_at(Reading::Format(crate::crossing::FORMAT_TWO)),
+        behind: records,
+        root: checkpoint_id(&world.body).unwrap(),
+        slept: world.slept,
+        dropped: world.dropped,
+        next,
+        stray,
+    }
+}
+
+impl PrunedVault {
+    /// Seat A, a member of the pruned peer, lets the Mac of `request` in under `name`, after
+    /// the cut: the peer then holds an `Admit` of it and a `Wrap` of the vault's `[everyone]`
+    /// epoch key to it. Returns the `Admit`'s id and the `Allowed` A signs for the new Mac's
+    /// bundle. Seat C shares the checkpoint first: the cut holds a version-1 record's stub, so
+    /// a Mac behind it takes the root only on the shares of more than half of the log's seats
+    /// ([`super::served`]), which the new Mac's seat makes four.
+    pub(crate) fn admit(
+        &mut self,
+        request: &crate::commons::binding::Request,
+        name: &str,
+    ) -> (RecordId, crate::members::Allowed) {
+        let at = T + MIN_AGE_MS + 3 * HOUR;
+        let log = self.peer.log().expect("a log");
+        let body = log.newest_root().expect("a root").body.clone();
+        let share = two(draft(log, C, at - 1, body), C, None);
+        assert_eq!(self.peer.ingest_records(vec![share]).unwrap(), 1);
+        let log = self.peer.log().expect("a log");
+        let admit = one(
+            draft(
+                log,
+                A,
+                at,
+                Body::Admit {
+                    entrant: crate::membership_log::Entrant {
+                        request: request.clone(),
+                        node_key: *request.binding().writer(),
+                        name: name.to_owned(),
+                        label: name.to_owned(),
+                    },
+                    evidence: crate::membership_log::Evidence::Phrase,
+                },
+            ),
+            A,
+        );
+        assert_eq!(self.peer.ingest_records(vec![admit.clone()]).unwrap(), 1);
+        let log = self.peer.log().expect("a log");
+        let keys = log.unwrap_epochs(&A.identity()).expect("A's epoch keys");
+        let (epoch, key) = keys.iter().next().expect("the vault's one epoch");
+        assert_eq!(keys.len(), 1);
+        let wrap = one(
+            log.draft_wrap(&A.id(), at + 1, *epoch, key, request.binding().recipient())
+                .expect("a wrap"),
+            A,
+        );
+        assert_eq!(self.peer.ingest_records(vec![wrap]).unwrap(), 1);
+        let allowed =
+            crate::members::Allowed::sign(request.binding(), name, &A.seed()).expect("A's Allowed");
+        (*admit.id(), allowed)
+    }
+}
+
 /// What a store's log holds, as two logs that took the same records and roots hold it alike:
 /// its records, its stubs, its roots, the earlier roots it keeps
 /// beside them and its heads digest.
@@ -427,6 +529,160 @@ fn vault_checkpoint_a_rooted_inventory_reads_a_dropped_record_as_known() {
         rooted.complete_missing(&BTreeSet::new(), Some(&world.dropped), usize::MAX),
         offered,
         "a cursor at a dropped record starts again at genesis"
+    );
+}
+
+/// The legacy fence counts the records a root dropped (tracker FL-148D). A rooted log tells a
+/// set-reconciling peer of every id it knows, the dropped ones among them
+/// ([`Store::complete_inventory`]), and a build before the fence reads no more than
+/// [`LEGACY_RECORDS`] ids of an inventory (aterm-db's legacy exchange, `MAX_NODES`). So what
+/// the fence counts ([`Log::known_count`]) is the size of that inventory: a rooted log within
+/// the legacy count of held records and past it with its stubs has crossed
+/// ([`crate::crossing::crossed`]) and states a fenced bound, with no mark stored, while the
+/// whole log of as many held records has not. A whole log's count is its held count.
+///
+/// NEGATIVE CONTROL: `rooted::Mutant::FenceHeldAlone` (the fence counts held records alone, as
+/// before this slice), run from the test's first line and seen to fail with ``assertion `left
+/// == right` failed: the fence counts what the inventory names``, `left: 11`, `right: 12`.
+#[cfg(unix)]
+#[test]
+fn vault_checkpoint_the_legacy_fence_counts_the_records_a_root_dropped() {
+    use crate::crossing::{FormatMark, Mark, crossed, past_legacy, stated};
+    use crate::membership_log::LEGACY_RECORDS;
+
+    let world = behind();
+    assert_eq!(world.whole.known_count(), world.whole.held_count());
+    assert_eq!(
+        world.peer.known_count(),
+        store_of(world.peer.clone()).complete_inventory().len(),
+        "the fence counts what the inventory names"
+    );
+    assert_eq!(world.peer.known_count(), world.whole.held_count());
+
+    // The same log had its roots dropped as many records as a legacy build takes.
+    let mut log = world.peer.clone();
+    let rooting = std::sync::Arc::make_mut(log.rooting.as_mut().unwrap());
+    let stub = rooting.stubs.values().next().unwrap().clone();
+    for i in 0..LEGACY_RECORDS {
+        let mut id = [0xAB; 32];
+        id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        rooting.stubs.insert(id, stub.clone());
+    }
+    let store = store_of(log);
+    let log = store.log().unwrap();
+    assert!(!past_legacy(log.held_count()));
+    let inventory = store.complete_inventory();
+    assert!(
+        inventory.len() > LEGACY_RECORDS,
+        "more ids than a build before the fence reads of an inventory"
+    );
+    assert_eq!(log.known_count(), inventory.len());
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mark = Mark::at(root.path().join("records.crossed"));
+    let format = FormatMark::at(root.path().join("records.format"));
+    assert!(crossed(&mark, &store).unwrap());
+    assert!(stated(&mark, &format, &store).unwrap().fenced());
+    let whole = store_of(world.whole.clone());
+    assert!(!crossed(&mark, &whole).unwrap());
+    assert!(!stated(&mark, &format, &whole).unwrap().fenced());
+    assert!(!mark.stored().unwrap(), "the count alone, no mark stored");
+}
+
+/// A served reply passes what its store holds by its frame's head at most (tracker FL-148D).
+/// The reply is the held records its puller lacks and the frame, which is the stubs' bytes
+/// and a head of [`Served::head_len`] bytes; the store counts its records' and its stubs'
+/// bytes in its own ([`Log::total_bytes`]), which stay within its capacity. So a joiner's
+/// reply, every held record and the frame, is exactly the store's bytes and that head, a
+/// puller that holds some of them is sent no more, and the head is at most
+/// [`MAX_SERVED_HEAD`]: while a store's capacity is one reply's, a served reply passes
+/// [`REPLY_CAP`] only from a store within that head of full
+/// ([`Store::missing_served`], rooted.rs "Not yet").
+///
+/// NEGATIVE CONTROL: `rooted::Mutant::FreeStubs` (the stubs count against no budget, so a
+/// store's bytes do not bound its reply), run from the test's first line and seen to fail with
+/// ``assertion `left == right` failed: a joiner's reply is its store's bytes and the frame's
+/// head``, `left: 5485`, `right: 5283`: the reply's bytes past the store's by its stubs'.
+#[test]
+fn vault_checkpoint_a_served_reply_passes_its_store_by_its_frames_head_at_most() {
+    assert_eq!(MAX_SERVED_HEAD, 42 + 32 * MAX_SERVED_ROOTS);
+    assert_eq!(
+        Reading::Follow.capacity(),
+        REPLY_CAP,
+        "a store holds one reply: its served reply passes the reply's bound by the head alone"
+    );
+    let once = behind();
+    let twice = twice_pruned(None);
+    let mut roots = BTreeSet::new();
+    for (peer, behind) in [
+        (once.peer.clone(), once.behind.clone()),
+        (twice.pruned(), twice.behind.clone()),
+    ] {
+        let store = store_of(peer);
+        let log = store.log().unwrap();
+        assert_eq!(log.waiting(), 0);
+        assert!(log.total_bytes() <= log.capacity());
+
+        let joiner = store.missing_served(&[], REPLY_CAP);
+        let frame = joiner
+            .served
+            .as_ref()
+            .expect("a joiner is served the roots");
+        let head = Served::head_len(frame.roots.len());
+        assert!(head <= MAX_SERVED_HEAD);
+        roots.insert(frame.roots.len());
+        assert_eq!(
+            read_reply(&joiner).unwrap().len(),
+            log.total_bytes() + head,
+            "a joiner's reply is its store's bytes and the frame's head"
+        );
+
+        let (records, served, bytes) = reply(&store, &store_of(behind));
+        assert!(served.is_some() && !records.is_empty());
+        assert!(bytes.len() <= log.total_bytes() + head);
+    }
+    assert_eq!(roots.len(), 2, "one root and two");
+}
+
+/// A log holds its bytes to the capacity of the store it is the log of (tracker FL-148D): a
+/// store gives its log its format when it makes it and when it is read at another, and every
+/// log made from that one carries it, a pruned log and a projection to heads among them (a
+/// cut's log too, which computes the same checkpoint), so none falls back to format 1's capacity where its store's is larger (tracker
+/// FL-249). A log no store made is format 1's.
+///
+/// NEGATIVE CONTROL: [`Log::rebuilt_with`] not carrying the format (a pruned log made as
+/// format 1's), seen to fail with ``assertion `left == right` failed: a pruned log carries
+/// it``, `left: Format(1)`, `right: Follow`.
+#[test]
+fn vault_checkpoint_a_log_holds_its_bytes_to_its_stores_capacity() {
+    let world = behind();
+    assert_eq!(world.whole.stored_at, Reading::ONE);
+    assert_eq!(world.whole.capacity(), Reading::ONE.capacity());
+    assert_eq!(world.whole.fill(None).bound, world.whole.capacity());
+
+    let mut store = Store::with_compiled(None).read_at(Reading::Follow);
+    assert_eq!(store.capacity(), Reading::Follow.capacity());
+    store.insert(world.whole.genesis().clone()).unwrap();
+    assert_eq!(store.log().unwrap().stored_at, Reading::Follow);
+    let one = store.read_at(Reading::ONE);
+    assert_eq!(one.log().unwrap().stored_at, Reading::ONE);
+
+    let mut whole = world.whole.clone();
+    whole.stored_at = Reading::Follow;
+    let pruned = whole.adopt(&world.body).unwrap();
+    assert_eq!(pruned.stored_at, Reading::Follow, "a pruned log carries it");
+    assert_eq!(
+        whole.project_heads(&whole.heads()).unwrap().stored_at,
+        Reading::Follow,
+        "a projection carries it"
+    );
+    let Body::Checkpoint { cut_ms, heads, .. } = &world.body else {
+        panic!("a checkpoint");
+    };
+    assert_eq!(
+        checkpoint_id(&checkpoint::plan_at(&whole, *cut_ms, heads).unwrap().body).unwrap(),
+        checkpoint_id(&world.body).unwrap(),
+        "the cut's log, made with the format, computes the same body"
     );
 }
 

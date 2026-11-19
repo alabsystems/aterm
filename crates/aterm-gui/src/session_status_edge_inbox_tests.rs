@@ -139,6 +139,45 @@ fn an_edged_session_is_named_on_the_next_wake_due_or_not() {
 }
 
 #[test]
+fn an_unnamed_foreground_group_clears_the_navigator_before_any_resolver_wake() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    const COMPILER: i32 = SHELL + 2;
+    const UNNAMED: i32 = SHELL + 3;
+    let (mut bed, t0) = Bed::new();
+    bed.names.lock().unwrap().insert(COMPILER, "rustc");
+    let session = bed.session;
+    let edge = |bed: &mut Bed, group, at| {
+        FRONT.with(|f| f.set(group));
+        bed.app.session_factory.edge_inbox.push(session);
+        sweep_mut(bed, at)
+    };
+    let t1 = t0 + Duration::from_millis(1);
+    let _ = edge(&mut bed, COMPILER, t1);
+    bed.wait_named("rustc");
+    assert_eq!(bed.app.open_navigator(false), Ok(false));
+    bed.app.publish_navigators(t1);
+    let row = |app: &App| {
+        let tree = app.navigator_tree().expect("published");
+        Arc::clone(&tree.entries[tree.index_of(session).expect("listed")].row)
+    };
+    assert_eq!(row(&bed.app).program.as_deref(), Some("rustc"));
+    let t2 = t1 + Duration::from_millis(1);
+    let _ = edge(&mut bed, COMPILER, t2);
+    let t3 = t2 + Duration::from_millis(1);
+    assert!(edge(&mut bed, COMPILER, t3).is_empty(), "steady activity");
+    let t4 = t3 + Duration::from_millis(1);
+    for changed in edge(&mut bed, UNNAMED, t4) {
+        bed.app.navigator_mark_row(changed);
+    }
+    assert!(bed.program().is_none());
+    let word = row(&bed.app).word;
+    bed.app.publish_navigators(t4);
+    let after = row(&bed.app);
+    assert_eq!(after.word, word);
+    assert!(after.program.is_none(), "the old executable left");
+}
+
+#[test]
 fn control_without_the_inbox_nothing_is_named_before_the_next_observation() {
     let (mut bed, t0) = Bed::new();
     FRONT.with(|f| f.set(CLAUDE));

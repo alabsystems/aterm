@@ -1782,15 +1782,22 @@ impl App {
         self.permission_walk.take_left(revision);
         let clock = (self.permission_walk.reach().unix_now)();
         let kept = self.permission_walk.kept(revision).to_vec();
+        let grants_requested = self.privacy_grants_requested();
+        let may_walk = |subject| subject == Subject::Accessibility || grants_requested;
         let left: Vec<Subject> = kept
             .iter()
-            .filter(|page| page.due(clock) && !self.permission_walk.walked(page.subject))
+            .filter(|page| {
+                may_walk(page.subject)
+                    && page.due(clock)
+                    && !self.permission_walk.walked(page.subject)
+            })
             .map(|page| page.subject)
             .collect();
         let (walk, by) = if left.is_empty() {
-            let first = self.permission_walk.any_walked() || self.fresh_mac();
+            let first = grants_requested && (self.permission_walk.any_walked() || self.fresh_mac());
             let missing = Subject::ORDER.map(|subject| {
-                !self.permission_walk.walked(subject)
+                may_walk(subject)
+                    && !self.permission_walk.walked(subject)
                     && !kept.iter().any(|page| page.subject == subject)
                     && (first || subject == Subject::Accessibility)
                     && !self.declined_for_the_verb(subject)

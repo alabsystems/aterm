@@ -769,6 +769,7 @@ fn codex_renewal_retained_prepare_replays_after_source_proof_is_gone() {
         cold_facts: None,
         cold_resolving: false,
         resolved_cold: None,
+        readmitted: [None, None],
         effect_started: Arc::new(AtomicBool::new(true)),
         clock: Clock::System,
         observation: None,

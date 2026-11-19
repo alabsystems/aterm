@@ -806,6 +806,8 @@ pub struct Jobs {
     read_revision: u64,
     classes: ClassTable,
     d_since: HashMap<u32, u64>,
+    /// [`Jobs::d_state_due_ms`], as the last pass left it.
+    d_state_due_ms: Option<u64>,
     /// The first reading that saw each `(pid, exec)` not started, by what keeps it
     /// ([`StartWait`]), kept for the keys the last reading held. An unavailable exec version's
     /// fallback never lends its duration to a later actual version.
@@ -1057,6 +1059,14 @@ impl Backlog {
     }
 }
 
+/// Whether `pid` is a process of this user by `tick`'s sweep (`sweep`, by pid), as the findings
+/// that name only this user's processes judge it.
+fn own_process(tick: &JobTick, sweep: &HashMap<u32, &SweepProc>, pid: u32) -> bool {
+    sweep
+        .get(&pid)
+        .is_some_and(|s| tick.self_uid.is_some() && s.uid == tick.self_uid)
+}
+
 impl Jobs {
     /// Creates an empty [`Jobs`] engine.
     #[must_use]
@@ -1115,6 +1125,17 @@ impl Jobs {
     /// Records a median progress interval for `class`.
     pub fn learn(&mut self, class: &str, median_ms: u64) {
         self.classes.learn(class, median_ms);
+    }
+
+    /// When a pass next names an uninterruptible wait ([`Findings::d_state`]): the soonest clock,
+    /// ms, at which a wait of this user's processes that the last pass dated and did not name
+    /// turns [`KERNEL_WAIT_MS`] old, each dated from the first pass that read it (by its sweep
+    /// row, or for a member by its own reading, its state or a thread's). A pass at or after it
+    /// names that wait where it reads it still waiting. `None` where the last pass left no such
+    /// wait unnamed.
+    #[must_use]
+    pub const fn d_state_due_ms(&self) -> Option<u64> {
+        self.d_state_due_ms
     }
 
     /// Admit an explicit naming request against the last probe's live job and waiting leaf.
@@ -2542,7 +2563,11 @@ impl Jobs {
                 tty: if nested_holds {
                     session_word
                 } else {
-                    tab.and_then(|t| t.tty.filter(|m| m.stamped_ms >= t.output_ms.unwrap_or(0)))
+                    tab.and_then(|t| {
+                        t.tty.filter(|m| {
+                            m.stamped_ms != 0 && t.output_ms.is_none_or(|out| m.stamped_ms >= out)
+                        })
+                    })
                 },
                 // A nested session's keys queue in its own terminal; the tab's, its relay drains.
                 queue_empty: if nested_holds {
@@ -2981,6 +3006,13 @@ impl Jobs {
             r
         };
         let findings = self.findings(tick, &sweep, &flat_on_dylib, canonical_zombies.as_deref());
+        self.d_state_due_ms = self
+            .d_since
+            .iter()
+            .filter(|(pid, _)| own_process(tick, &sweep, **pid))
+            .map(|(_, since)| since.saturating_add(KERNEL_WAIT_MS))
+            .filter(|&due| due > at)
+            .min();
         let at_person: BTreeSet<(u64, &str)> = self
             .jobs
             .iter()
@@ -3175,11 +3207,8 @@ impl Jobs {
             }
         }
         for (pid, since) in &self.d_since {
-            let own = sweep
-                .get(pid)
-                .is_some_and(|s| tick.self_uid.is_some() && s.uid == tick.self_uid);
             let for_ms = at.saturating_sub(*since);
-            if own && for_ms >= KERNEL_WAIT_MS {
+            if own_process(tick, sweep, *pid) && for_ms >= KERNEL_WAIT_MS {
                 f.d_state.push(Named {
                     pid: *pid,
                     exec_version: None,
@@ -4592,17 +4621,20 @@ fn demand_of(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Demand {
     let mut d = Demand::Idle;
     for r in rows.iter().filter(|r| r.verdict != Verdict::Exited) {
         let reads_keys = at_person.contains(&(r.tab, r.id.as_str()));
-        if (r.class == Class::Running && !reads_keys) || watched_fast(r) {
+        // A displayed terminal wait can survive one reading for the name's two-tick debounce.
+        // When its evidence is gone, schedule the reading that can replace the displayed name.
+        let shown_read = r
+            .wait
+            .as_ref()
+            .is_some_and(|w| matches!(w.name, WaitName::TtyPassword | WaitName::TtyRaw));
+        if (!reads_keys && (r.class == Class::Running || shown_read)) || watched_fast(r) {
             return Demand::Fast;
         }
         let person = reads_keys
             || matches!(r.verdict, Verdict::WaitingYou | Verdict::Parked)
-            || r.wait.as_ref().is_some_and(|w| {
-                matches!(
-                    w.name,
-                    WaitName::TtyPassword | WaitName::TtyBuiltinRead | WaitName::TtyRaw
-                )
-            });
+            || r.wait
+                .as_ref()
+                .is_some_and(|w| w.name == WaitName::TtyBuiltinRead);
         if !person {
             d = Demand::Slow;
         }

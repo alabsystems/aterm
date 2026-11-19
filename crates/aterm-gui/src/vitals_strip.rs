@@ -35,11 +35,10 @@ pub(super) const TAIL_FILE: &str = "tail.jsonl";
 /// Where a build before the append-only checkpoint kept the strip, whole, at schema 1: it restores
 /// nothing (record §9) and goes at the first base written.
 pub(super) const LEGACY_FILE: &str = "vitals-strip.json";
-/// Schema 4 (stats deck A4, step N3): the instruments' rings (compute watts, the thermal
-/// pressure level, process exits, blockage) after schema 3's, the situation spans and the usual
-/// Super clocks. Schema 3 held 20 rings: scope coverage and raw CPU charge alongside the primary
-/// CPU figures. Schema 2 held 17. [`base_of`] reads all three.
-pub(super) const STRIP_SCHEMA: u32 = 4;
+/// Schema 5 retains original marker scopes and intervals. Schema 4 added the instruments'
+/// rings, situation spans and usual clocks; schema 3 held 20 rings, schema 2 held 17.
+/// [`base_of`] preserves each older reading with unknown marker authority.
+pub(super) const STRIP_SCHEMA: u32 = 5;
 /// The bound a base is read under; a full one is held under 85 % of it by a test.
 pub(super) const STRIP_MAX_BYTES: u64 = STRIP_RINGS as u64 * 64 * 1024;
 /// The bound a tail is read under: four hours of lines at their fullest (every ring's bucket at
@@ -497,8 +496,16 @@ struct BaseDoc {
 
 /// A gap: `(start ms, end ms, kind)`.
 type GapDoc = (i64, i64, String);
-/// An event: `(at ms, kind, label)`.
-type EventDoc = (i64, String, String);
+/// Current marker provenance; the three-field form is legacy, with unknown authority.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum EventDoc {
+    Scoped((i64, String, String, ScopeDoc, Option<(i64, i64)>)),
+    Legacy((i64, String, String)),
+}
+
+/// `(scope, local key, stable sid, launch nonce)`; never rendered as product output.
+type ScopeDoc = (String, Option<u64>, String, String);
 /// A situation span: `(start ms, end ms, place, power, lid)`, each of the three its word, or
 /// empty where its reader gave none.
 type SpanDoc = (i64, i64, String, String, String);
@@ -549,18 +556,59 @@ fn gap_of((start_ms, end_ms, kind): GapDoc) -> Option<TimeGap> {
 }
 
 fn event_doc(e: &StripEvent) -> EventDoc {
-    (
+    let scope = match &e.scope {
+        aterm_vitals::events::EventScope::Unknown => {
+            ("unknown".to_owned(), None, String::new(), String::new())
+        }
+        aterm_vitals::events::EventScope::Machine => {
+            ("machine".to_owned(), None, String::new(), String::new())
+        }
+        aterm_vitals::events::EventScope::Session(source) => (
+            "session".to_owned(),
+            Some(source.local),
+            source.sid.clone(),
+            source.nonce.clone(),
+        ),
+    };
+    EventDoc::Scoped((
         e.at_unix_ms,
         strip_event_kind_word(e.kind).to_owned(),
         e.label.clone(),
-    )
+        scope,
+        e.span.map(|span| (span.onset_unix_ms, span.end_unix_ms)),
+    ))
 }
 
-fn event_of((at_unix_ms, kind, label): EventDoc) -> Option<StripEvent> {
+fn event_of(doc: EventDoc) -> Option<StripEvent> {
+    use aterm_vitals::events::{EventScope, EventSpan, SessionScope};
+    let (at_unix_ms, kind, label, scope, span) = match doc {
+        EventDoc::Legacy((at, kind, label)) => (at, kind, label, EventScope::Unknown, None),
+        EventDoc::Scoped((at, kind, label, (scope, local, sid, nonce), span)) => {
+            let scope = match (scope.as_str(), local) {
+                ("machine", None) if sid.is_empty() && nonce.is_empty() => EventScope::Machine,
+                ("session", Some(local))
+                    if aterm_session::SessionId::parse(&sid).is_some()
+                        && aterm_session::LaunchNonce::from_hex(&nonce).is_some() =>
+                {
+                    EventScope::Session(SessionScope { local, sid, nonce })
+                }
+                _ => EventScope::Unknown,
+            };
+            let span = span.and_then(|(onset_unix_ms, end_unix_ms)| {
+                (onset_unix_ms < end_unix_ms).then_some(EventSpan {
+                    onset_unix_ms,
+                    end_unix_ms,
+                })
+            });
+            (at, kind, label, scope, span)
+        }
+    };
     Some(StripEvent {
         at_unix_ms,
         kind: strip_event_kind_of(&kind)?,
         label,
+        scope,
+        span,
     })
 }
 
@@ -624,17 +672,19 @@ pub(super) fn base_json(strip: &SavedStrip, generation: u64) -> Option<String> {
 }
 
 /// The base in `text` and its generation; `None` unless it parses with a reading at a schema
-/// this reads, holding that schema's rings. Schema 4 is read as written. A schema 3 base holds
+/// this reads, holding that schema's rings. Schema 5 retains original marker provenance;
+/// schema 4's markers have unknown authority. A schema 3 base holds
 /// every ring but the instruments', and neither spans nor usual clocks: those start empty, and
 /// no value is made up for them. Schema 2 retains its measured history with explicitly unknown
 /// scope coverage.
 pub(super) fn base_of(text: &str) -> Option<(u64, SavedStrip)> {
     let doc: BaseDoc = aterm_json::from_str(text).ok()?;
     let old_coverage = doc.schema == 2;
+    let old_events = doc.schema < STRIP_SCHEMA;
     let rings = match doc.schema {
         2 => SCHEMA_2_RINGS,
         3 => SCHEMA_3_RINGS,
-        STRIP_SCHEMA => STRIP_RINGS,
+        4 | STRIP_SCHEMA => STRIP_RINGS,
         _ => return None,
     };
     if doc.rings.len() != rings || doc.last_wall_ms <= 0 {
@@ -650,7 +700,18 @@ pub(super) fn base_of(text: &str) -> Option<(u64, SavedStrip)> {
             == Some("process_counter_growth_v1"))
         .then_some(aterm_vitals::published_cpu::CpuAccounting::PUBLISHED_COUNTERS),
         time_gaps: doc.gaps.into_iter().filter_map(gap_of).collect(),
-        strip_events: doc.events.into_iter().filter_map(event_of).collect(),
+        strip_events: doc
+            .events
+            .into_iter()
+            .filter_map(event_of)
+            .map(|mut event| {
+                if old_events {
+                    event.scope = aterm_vitals::events::EventScope::Unknown;
+                    event.span = None;
+                }
+                event
+            })
+            .collect(),
         situation: doc.spans.into_iter().filter_map(span_of).collect(),
         usual: UsualClocks::restored(&doc.usual),
         ..SavedStrip::default()

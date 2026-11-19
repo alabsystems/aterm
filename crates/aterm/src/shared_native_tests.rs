@@ -316,12 +316,11 @@ fn native_policy_and_member_follow_real_successors_and_recheck_generation() {
         expected.signer.is_some(),
         "the fixture holds a signed vault"
     );
-    let expected_policy = client::read_verified_entry(original, &expected, ENTRY)
+    let predecessor_entry = client::read_verified_entry(original, &expected, ENTRY)
         .unwrap()
-        .unwrap()
-        .value()
-        .as_slice()
-        .to_vec();
+        .expect("the predecessor policy");
+    let predecessor = predecessor_entry.snapshot().version();
+    let expected_policy = predecessor_entry.value().as_slice().to_vec();
     let next = aterm_db::test_complete_writer_successor(
         temp.path(),
         original,
@@ -354,8 +353,21 @@ fn native_policy_and_member_follow_real_successors_and_recheck_generation() {
             "no policy copy is materialized under the predecessor or successor home"
         );
     }
+    let next_config = client::config(&next).unwrap().unwrap();
+    let selected = client::read_verified_entry(&next, &next_config, ENTRY)
+        .unwrap()
+        .expect("the selected policy")
+        .snapshot()
+        .version();
     let (followed_policy, followed_snapshot) =
         policy_at(original, &expected, deadline()).unwrap().unwrap();
+    let observed = followed_snapshot.version();
+    assert!(observed.not_before(&selected));
+    assert!(selected.not_before(&observed));
+    assert!(
+        !observed.not_before(&predecessor),
+        "CONTROL: the selected policy is not the predecessor's authenticated view"
+    );
     assert_eq!(followed_policy.text().as_bytes(), expected_policy);
     assert!(followed_snapshot.version().not_before(&own(&next)));
     assert!(!followed_snapshot.version().not_before(&own(original)));
@@ -369,6 +381,18 @@ fn native_policy_and_member_follow_real_successors_and_recheck_generation() {
         followed_snapshot.read(original).unwrap().is_none(),
         "the successor's policy snapshot cannot bind the predecessor's still-readable entry"
     );
+    let admin = client::admin_open(original).unwrap();
+    let mut doc = admin.doc.clone();
+    assert!(doc.unset_entry(&Audience::Everyone, ENTRY).unwrap());
+    client::admin_publish(original, &admin, &doc).unwrap();
+    assert!(
+        client::read_verified_entry(original, &expected, ENTRY)
+            .unwrap()
+            .is_none(),
+        "PRECONDITION: the predecessor's authenticated policy entry is absent"
+    );
+    let (without_predecessor, _) = policy_at(original, &expected, deadline()).unwrap().unwrap();
+    assert_eq!(without_predecessor.text().as_bytes(), expected_policy);
     assert_eq!(member(original, deadline()).unwrap(), "m2");
     let before = selection_scope(original, deadline()).unwrap();
     let replacement = Bootstrap::required(&paths[2])

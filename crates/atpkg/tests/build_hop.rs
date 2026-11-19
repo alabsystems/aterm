@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 
 use aterm_spec::wait::{MUST_HAPPEN, until_while_working, until_within};
 
+#[path = "../src/build_admit_sdk_native_tests.rs"]
+mod sdk_root;
+
 fn output_while_working(
     command: &mut aterm_uds::spawnfd::Command,
     what: &str,
@@ -57,6 +60,7 @@ esac
   echo "held $held"
   echo "fds$fds"
   echo "cover ${ATERM_CAPACITY_COVER-unset}"
+  echo "sdkroot ${SDKROOT-unset}"
   echo "child $child"
   echo "args $*"
 } > "$HOP_OUT.tmp" && mv "$HOP_OUT.tmp" "$HOP_OUT"
@@ -427,6 +431,7 @@ impl Scratch {
                 .map(PathBuf::from),
             fds: line("fds"),
             cover: line("cover"),
+            sdkroot: line("sdkroot"),
             child: line("child").parse().ok(),
         }
     }
@@ -593,6 +598,7 @@ struct Seen {
     held: Option<PathBuf>,
     fds: String,
     cover: String,
+    sdkroot: String,
     child: Option<u32>,
 }
 
@@ -632,6 +638,7 @@ fn a_claimed_build_runs_in_its_fronts_pid_under_its_holders_claim() {
     let child = s.front(&["--unverified", "test", "-p", "a"], &[]);
     let front = child.id();
     let seen = s.seen(child.id());
+    assert_eq!(seen.sdkroot, sdk_root::expected(&s));
     assert_eq!(
         (seen.pid, seen.ppid),
         (front, std::process::id()),
@@ -678,6 +685,7 @@ fn a_killed_build_dies_of_its_signal_and_its_claim_ends() {
     );
     let seen = s.seen(child.id());
     let held = seen.held.clone().expect("a claim in its own pid");
+    assert_eq!(seen.sdkroot, sdk_root::expected(&s));
     assert_eq!(seen.cover, stem(&held), "the claim's own marker");
     child.kill().expect("killed");
     let (status, _) = finish(child);
@@ -698,6 +706,7 @@ fn a_call_that_claims_nothing_becomes_its_program() {
     let child = s.front(&["--unverified", "run", "-p", "a"], &[]);
     let front = child.id();
     let seen = s.seen(child.id());
+    assert_eq!(seen.sdkroot, sdk_root::expected(&s));
     assert_eq!((seen.pid, seen.held.as_deref()), (front, None), "{seen:?}");
     assert!(s.listed().is_empty());
     let (status, err) = finish(child);
@@ -724,6 +733,7 @@ fn a_holder_that_does_not_arm_leaves_the_build_under_its_front() {
         );
         let front = child.id();
         let seen = s.seen(child.id());
+        assert_eq!(seen.sdkroot, sdk_root::expected(&s));
         assert_eq!(
             seen.ppid, front,
             "{seam}: its parent is the front: {seen:?}"
@@ -757,6 +767,7 @@ fn a_claimed_front_with_a_table_read_in_the_kernel_runs_its_build_under_its_clai
     );
     let front = child.id();
     let seen = s.seen(child.id());
+    assert_eq!(seen.sdkroot, sdk_root::expected(&s));
     assert_eq!(seen.ppid, front, "its parent is the front: {seen:?}");
     assert_ne!(seen.pid, front);
     let listed = s.listed();

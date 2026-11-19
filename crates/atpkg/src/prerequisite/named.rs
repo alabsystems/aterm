@@ -9,7 +9,7 @@ use super::*;
 #[derive(Debug)]
 pub struct HeldBuild {
     tool: HeldTool,
-    namespace: aterm_tempfile::TempDir,
+    namespace: super::CommandDirectory,
     elan_home: Option<PathBuf>,
 }
 
@@ -60,10 +60,7 @@ impl HeldBuild {
 
     pub(super) fn new(want: Prerequisite, tool: HeldTool) -> Result<Self, String> {
         want.require_namespace()?;
-        let namespace = aterm_tempfile::Builder::new()
-            .prefix("atpkg-named-prerequisite-")
-            .suffix(".noindex")
-            .tempdir()
+        let namespace = super::command_directory("atpkg-named-prerequisite-")
             .map_err(|error| error.to_string())?;
         let bin = namespace.path().join("bin");
         std::fs::create_dir(&bin).map_err(|error| error.to_string())?;

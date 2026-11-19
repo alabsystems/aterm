@@ -15,7 +15,7 @@ use super::super::tests::{
 };
 use super::*;
 use crate::claude_footer::{LogWake, rig};
-use crate::codex_rollout_tap::{Host, Image};
+use crate::codex_rollout_tap::{Host, Image, PackageLookup, RunningPackage};
 
 const PID: i32 = 300;
 
@@ -1102,8 +1102,7 @@ fn captured_start(_: u32) -> Option<String> {
 const MEASURED: Image = Image {
     start: captured_start,
     born_ms: unborn,
-    build: alab_12521,
-    version: alab_12521,
+    package: alab_12521,
     group: own_group,
     task: no_task,
     record: no_record,
@@ -1131,8 +1130,19 @@ fn no_task(_: u32) -> Option<String> {
     None
 }
 
-fn alab_12521(_: u32) -> Option<String> {
-    Some("0.164.0-dev.12521+g3d3eb12d8".to_string())
+fn test_package(version: &str) -> RunningPackage {
+    RunningPackage {
+        image: aterm_sysprobe::kproc::ImageFile {
+            device: 1,
+            inode: 1,
+        },
+        product: version.to_owned(),
+        client: version.to_owned(),
+    }
+}
+
+fn alab_12521(_: u32, _: &mut PackageLookup) -> Option<RunningPackage> {
+    Some(test_package("0.164.0-dev.12521+g3d3eb12d8"))
 }
 
 #[test]
@@ -1261,8 +1271,8 @@ fn born_late(_: u32) -> Option<u64> {
     Some(WALL0 + 3_500)
 }
 
-fn alab_unmeasured(_: u32) -> Option<String> {
-    Some("0.164.0-dev.99999+g0123abcd".to_string())
+fn alab_unmeasured(_: u32, _: &mut PackageLookup) -> Option<RunningPackage> {
+    Some(test_package("0.164.0-dev.99999+g0123abcd"))
 }
 
 #[test]
@@ -1272,8 +1282,7 @@ fn the_host_floors_at_the_claimants_start_and_holds_it_to_its_build() {
     let born = Image {
         start: captured_start,
         born_ms: born_late,
-        build: alab_12521,
-        version: alab_12521,
+        package: alab_12521,
         group: own_group,
         task: no_task,
         record: no_record,
@@ -1285,8 +1294,7 @@ fn the_host_floors_at_the_claimants_start_and_holds_it_to_its_build() {
     let unmeasured = Image {
         start: captured_start,
         born_ms: unborn,
-        build: alab_unmeasured,
-        version: alab_unmeasured,
+        package: alab_unmeasured,
         group: own_group,
         task: no_task,
         record: no_record,
@@ -1342,8 +1350,7 @@ fn each_ask_the_rollout_tap_answers_is_counted_after_its_records() {
     let unmeasured = Image {
         start: captured_start,
         born_ms: unborn,
-        build: alab_unmeasured,
-        version: alab_unmeasured,
+        package: alab_unmeasured,
         group: own_group,
         task: no_task,
         record: no_record,
@@ -1464,8 +1471,7 @@ fn claimed(
 const UNMEASURED: Image = Image {
     start: captured_start,
     born_ms: unborn,
-    build: alab_unmeasured,
-    version: alab_unmeasured,
+    package: alab_unmeasured,
     group: own_group,
     task: no_task,
     record: no_record,
@@ -1999,8 +2005,7 @@ fn the_rollout_tap_publishes_the_survey_facts_for_the_claimants_group_whatever_i
     let fields = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().slog().rollout_fields();
     let mut host = Host::default();
     let unmeasured = Image {
-        build: alab_unmeasured,
-        version: alab_unmeasured,
+        package: alab_unmeasured,
         ..MEASURED
     };
     for (name, image, word) in [

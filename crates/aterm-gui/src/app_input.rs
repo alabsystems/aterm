@@ -3260,6 +3260,8 @@ fn note_person_keyed(
     let noted = ctx
         .human_input
         .note_reaching(crate::metrics::now_us(), gesture, reaches);
+    // `human_seq` moved: an open record stream's `hand` carries it.
+    ctx.watchers.ring_stream();
     deliver_keyed(ctx, noted, reaches, key)
 }
 
@@ -4282,13 +4284,7 @@ impl App {
     ) -> InputOutcome {
         self.ensure_sparkle();
         let controller = self.person_gesture_refused();
-        match crate::input_event_handoff_class(&ev) {
-            crate::UpdateHandoffEventClass::Exempt => {}
-            crate::UpdateHandoffEventClass::Tolerated => {
-                self.note_update_handoff_tolerated_activity();
-            }
-            crate::UpdateHandoffEventClass::Revoking => self.note_update_handoff_activity(),
-        }
+        self.note_update_handoff_class(crate::input_event_handoff_class(&ev));
         let _audit = src;
         if is_present_recovery_stimulus(&ev)
             && let Some(mut ws) = self.windows.get_mut(&wid)
@@ -4507,6 +4503,44 @@ impl App {
                 _ => InputOutcome::Ok,
             };
         };
+        if matches!(src, Source::Human)
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.active_session_preview().is_some())
+        {
+            use aterm_types::keyboard::{Key as TKey, KeyEventType, Modifiers, NamedKey as TNamed};
+            if let InputEvent::Key {
+                key: key @ TKey::Named(TNamed::Escape),
+                mods,
+                event_type: KeyEventType::Press,
+                ..
+            } = &ev
+                && (*mods - (Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK)).is_empty()
+            {
+                if let Some(mut ws) = self.windows.get_mut(&wid) {
+                    ws.overlay_consumed_keys.insert(key.clone());
+                }
+                self.dismiss_session_preview(wid);
+                return InputOutcome::Ok;
+            }
+            let writes_to_program = match &ev {
+                InputEvent::Key { .. }
+                | InputEvent::Text(_)
+                | InputEvent::KeySequence(_)
+                | InputEvent::Paste(..) => true,
+                InputEvent::MouseButton { .. } | InputEvent::MouseMove { .. } => {
+                    modes.mouse_tracking_enabled()
+                }
+                InputEvent::Wheel { mods, .. } => {
+                    input::wheel_route_mirrored(&modes, *mods) != input::WheelRoute::Viewport
+                }
+                _ => false,
+            };
+            if writes_to_program {
+                return InputOutcome::Ok;
+            }
+        }
         let completion = completion.filter(|c| {
             self.pool
                 .get(session)
@@ -6495,7 +6529,7 @@ impl App {
                     crate::metrics::note_resize_arrival();
                     if let Some(mut route_guard_ws) = self.windows.get_mut(&target) {
                         let ws = &mut **route_guard_ws;
-                        ws.win_px = Some(applied);
+                        ws.set_window_pixels(applied);
                         ws.last_resized_event_at = Some(std::time::Instant::now());
                     }
                     self.sync_surface_to_window(target);
@@ -7321,10 +7355,11 @@ impl App {
             }
         }
 
-        if HARDCODED_SUPER_CHORDS
-            && (self.on_key_super_shift_chord(wid, mods, ev)
-                || self.on_key_super_chord(wid, mods, ev)
-                || self.on_key_pane_focus(wid, mods, ev))
+        if self.on_key_local_panel_number(wid, mods, ev)
+            || HARDCODED_SUPER_CHORDS
+                && (self.on_key_super_shift_chord(wid, mods, ev)
+                    || self.on_key_super_chord(wid, mods, ev)
+                    || self.on_key_pane_focus(wid, mods, ev))
         {
             self.note_consumed_press(wid, ev);
             return true;
@@ -7450,6 +7485,14 @@ impl App {
                 .as_ref()
                 .and_then(|key| crate::native_tables::TablesApp::field_input(state, key.as_str()))
                 .is_some_and(|input| input.preedit().is_some()),
+            Some(crate::native_app::AppViewState::Registry(state)) => state
+                .common
+                .last_focus
+                .as_ref()
+                .and_then(|key| {
+                    crate::native_registry::RegistryApp::field_input(state, key.as_str())
+                })
+                .is_some_and(|input| input.preedit().is_some()),
             Some(crate::native_app::AppViewState::Navigator(state)) => state
                 .common
                 .last_focus
@@ -7460,6 +7503,7 @@ impl App {
                 crate::native_app::AppViewState::About(_)
                 | crate::native_app::AppViewState::Recovery(_)
                 | crate::native_app::AppViewState::Allocation(_)
+                | crate::native_app::AppViewState::SystemResources(_)
                 | crate::native_app::AppViewState::Workers(_),
             )
             | None => false,
@@ -7563,6 +7607,12 @@ impl App {
                     }
                 }
             }
+            Some(crate::native_app::AppViewState::Registry(state)) => {
+                let key = state.common.last_focus.as_ref()?;
+                let text = crate::native_registry::RegistryApp::field_input(state, key.as_str())?
+                    .selected_text();
+                (!text.is_empty()).then(|| read(&[text]))
+            }
             Some(crate::native_app::AppViewState::Navigator(state)) => {
                 let key = state.common.last_focus.as_ref()?;
                 let text = crate::navigator::NavigatorApp::field_input(state, key.as_str())?
@@ -7573,6 +7623,7 @@ impl App {
                 crate::native_app::AppViewState::About(_)
                 | crate::native_app::AppViewState::Recovery(_)
                 | crate::native_app::AppViewState::Allocation(_)
+                | crate::native_app::AppViewState::SystemResources(_)
                 | crate::native_app::AppViewState::Workers(_),
             )
             | None => None,
@@ -7837,7 +7888,9 @@ impl App {
             self.terminal_emacs_search_pressed(wid, ev.physical_key, forward);
             return;
         }
-        if HARDCODED_SUPER_CHORDS && self.on_key_super_shift_chord(wid, mods, &ev) {
+        if self.on_key_local_panel_number(wid, mods, &ev)
+            || HARDCODED_SUPER_CHORDS && self.on_key_super_shift_chord(wid, mods, &ev)
+        {
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -7918,6 +7971,17 @@ impl App {
                 || ws.ime_compose.is_some_and(|(_, ended)| !ended)
         }) {
             self.snap_to_bottom(wid);
+            self.note_consumed_press(wid, &ev);
+            return;
+        }
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.active_session_preview().is_some())
+        {
+            if mods.is_empty() && ev.logical_key == Key::Named(NamedKey::Escape) {
+                self.dismiss_session_preview(wid);
+            }
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -8203,7 +8267,7 @@ impl App {
                     return true;
                 }
                 "m" | "M" => {
-                    let _ = self.migrate_active_tab_from_window(wid);
+                    let _ = self.return_active_tab_to_home(wid);
                     return true;
                 }
                 "l" | "L" => {
@@ -8214,6 +8278,59 @@ impl App {
             }
         }
         false
+    }
+
+    /// The Navigator view currently presenting this window's docked session organizer.
+    pub(crate) fn visible_session_organizer(
+        &self,
+        wid: WindowId,
+    ) -> Option<crate::tab_model::ViewId> {
+        let ws = self.windows.get(&wid)?;
+        if !ws.dock.roster_panel || ws.pending_close {
+            return None;
+        }
+        let view = self.dock_view(wid)?;
+        matches!(
+            self.native_runtime.view_state(view),
+            Some(crate::native_app::AppViewState::Navigator(_))
+        )
+        .then_some(view)
+    }
+
+    /// The visible session organizer owns this chord even when its number is unassigned.
+    fn on_key_local_panel_number(
+        &mut self,
+        wid: WindowId,
+        mods: ModifiersState,
+        ev: &KeyEvent,
+    ) -> bool {
+        let primary = if cfg!(target_os = "macos") {
+            ModifiersState::SUPER
+        } else {
+            ModifiersState::CONTROL | ModifiersState::SHIFT
+        };
+        if mods != primary {
+            return false;
+        }
+        fn digit(key: &Key) -> Option<u8> {
+            let Key::Character(text) = key else {
+                return None;
+            };
+            match text.as_bytes() {
+                [d @ b'1'..=b'9'] => Some(*d - b'0'),
+                _ => None,
+            }
+        }
+        // Shift produces punctuation on many number rows. Accept the actual character
+        // or the layout's unmodified digit; a keypad in navigation mode supplies neither.
+        let Some(number) = digit(&ev.logical_key).or_else(|| digit(&base_logical_key(ev))) else {
+            return false;
+        };
+        if self.visible_session_organizer(wid).is_none() {
+            return false;
+        }
+        self.activate_local_panel_number(wid, number);
+        true
     }
 
     /// Hardcoded Cmd (no Shift) chords of [`Self::on_key`].
@@ -9872,7 +9989,9 @@ impl App {
             }
             MenuAction::MoveTabToNewWindow => self.detach_active_tab(el),
             MenuAction::MoveTabToNextWindow => {
-                if let Err(why) = self.migrate_active_tab_to_next_window() {
+                if let Some(wid) = self.frontmost_window
+                    && let Err(why) = self.return_active_tab_to_home(wid)
+                {
                     self.pending_action_refusal = Some(why.to_string());
                 }
             }
@@ -10079,6 +10198,12 @@ impl App {
             }
             MenuAction::SystemState => self.open_system_state_from_menu(),
             MenuAction::Tables => self.open_tables_from_menu(),
+            MenuAction::Registry => {
+                if let Err(error) = self.open_app(crate::app_control::OpenRequest::Registry) {
+                    self.pending_action_refusal = Some(error);
+                }
+            }
+            MenuAction::SystemResources => self.open_resources_from_menu(),
             MenuAction::Allocation => {
                 if let Err(error) = self.open_allocation(true) {
                     self.pending_action_refusal = Some(error);

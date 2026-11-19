@@ -895,6 +895,11 @@ pub(crate) fn memory_detail() -> Option<MemoryDetail> {
         decompressions: vm.decompressions,
         compressions: vm.compressions,
         pageins: vm.pageins,
+        reactivations: vm.reactivations,
+        svp: sysctl_count(c"vm.compressor.svp.zval_compressions")
+            .zip(sysctl_count(c"vm.compressor.svp.nzval_compressions"))
+            .map(|(zero, one)| zero.saturating_add(one)),
+        filecache_min: sysctl_count(c"vm.vm_page_filecache_min"),
     };
     let mut detail = crate::machine::memory_detail_of(
         &pages,
@@ -906,7 +911,19 @@ pub(crate) fn memory_detail() -> Option<MemoryDetail> {
     detail.memorystatus_level_pct = sysctl_int(c"kern.memorystatus_level")
         .and_then(|v| u8::try_from(v).ok())
         .filter(|v| *v <= 100);
+    detail.wall = crate::machine::nearer_wall(
+        sysctl_count(c"vm.compressor.segment.total")
+            .zip(sysctl_count(c"vm.compressor.segment.limit")),
+        sysctl_count(c"vm.compressor.pages_compressed")
+            .zip(sysctl_count(c"vm.compressor.pages_compressed_limit")),
+    );
     Some(detail)
+}
+
+/// An integer sysctl that counts something, never negative; `None` where unread (a name an
+/// earlier macOS lacks: the `vm.compressor.` tree is macOS 27.2's).
+fn sysctl_count(name: &CStr) -> Option<u64> {
+    sysctl_int(name).and_then(|v| u64::try_from(v).ok())
 }
 
 /// The keys of `PerformanceStatistics` and of the user clients' properties, made once.

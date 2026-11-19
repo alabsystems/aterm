@@ -165,12 +165,19 @@ exit 0"#,
         crate::event_log::EventLog::open(&dir.join("phases.events")).unwrap(),
     ));
     ctx.tools.stage2_dir = dir.clone();
+    if std::env::var("PHASE_VALID_RECORD").as_deref() == Ok("yes") {
+        ctx = ctx.with_pool(Some(
+            aterm_capacity::Jobserver::new(&dir.join("recording.jobs"), 1).unwrap(),
+        ));
+    }
     let mut report = crate::Report::new("recording phase");
     crate::testrun::run_tests(
         &ctx,
         &mut report,
         "fixture",
         &crate::exec::Cmd::new(&targo)
+            .env("MAKEFLAGS", "original-recording-test-value")
+            .env("CARGO_BUILD_JOBS", "7")
             .env(RECORDING_STANDIN, &dir)
             .env(
                 "PHASE_VALID_RECORD",
@@ -219,6 +226,28 @@ fn valid_record_fixture() {
         })
         .unwrap()
         .path();
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let flags = std::env::var("CARGO_MAKEFLAGS").unwrap();
+    assert_eq!(std::env::var("MAKEFLAGS").unwrap(), flags);
+    assert_eq!(std::env::var("CARGO_BUILD_JOBS").as_deref(), Ok("1"));
+    let fifo = flags.strip_prefix("-j --jobserver-auth=fifo:").unwrap();
+    let observed = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(fifo)
+        .unwrap();
+    let expected = std::fs::metadata(dir.join("recording.jobs")).unwrap();
+    let meta = observed.metadata().unwrap();
+    assert_eq!((expected.dev(), expected.ino()), (meta.dev(), meta.ino()));
+    let mut poll = libc::pollfd {
+        fd: observed.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd points at the open private FIFO. This observes its
+    // only token without taking one away from the actual recording process.
+    assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 0);
     let executable = std::env::current_exe().unwrap();
     let record = crate::testrun::Record {
         cwd: dir.clone(),
@@ -229,17 +258,27 @@ fn valid_record_fixture() {
         ],
         env: vec![
             ("CARGO_PKG_NAME".into(), "phase-fixture".into()),
+            ("MAKEFLAGS".into(), flags.clone().into()),
+            ("CARGO_MAKEFLAGS".into(), flags.into()),
+            ("CARGO_BUILD_JOBS".into(), "1".into()),
             (RECORDING_STANDIN.into(), dir.into_os_string()),
         ],
     };
     std::fs::write(records.join("000000.rec"), record.encode()).unwrap();
+    let unit = "a".repeat(64);
+    let dispatch = aterm_json::json!({
+        "reason": "compilation-unit-dispatched", "schema": "targo.compilation-unit-dispatched.v1",
+        "trust_unit_identity_sha256": unit, "trust_compile_mode": "test", "trust_compile_kind": "host",
+        "fresh": false, "dirty_reason": "changed-env",
+    });
     let artifact = aterm_json::json!({
         "reason": "compiler-artifact", "package_id": "phase-fixture",
         "target": {"kind": ["test"], "crate_types": ["bin"], "name": "phase_fixture"},
-        "profile": {"test": true}, "executable": executable, "fresh": true,
+        "profile": {"test": true}, "executable": executable, "fresh": false,
+        "trust_unit_identity_sha256": unit, "trust_compile_mode": "test", "trust_compile_kind": "host",
     });
     println!(
-        "\n{artifact}\n     Running tests/phase_fixture.rs ({})",
+        "\n{dispatch}\n{artifact}\n     Running tests/phase_fixture.rs ({})\n{artifact}",
         executable.display()
     );
 }
@@ -248,6 +287,12 @@ fn valid_record_fixture() {
 #[test]
 fn passing_test_fixture() {
     if let Some(dir) = std::env::var_os(RECORDING_STANDIN).map(std::path::PathBuf::from) {
+        assert_eq!(
+            std::env::var("MAKEFLAGS").as_deref(),
+            Ok("original-recording-test-value")
+        );
+        assert!(std::env::var_os("CARGO_MAKEFLAGS").is_none());
+        assert_eq!(std::env::var("CARGO_BUILD_JOBS").as_deref(), Ok("7"));
         std::fs::write(dir.join("executed"), "").unwrap();
     }
 }
@@ -315,6 +360,27 @@ fn run_recording_fixture(valid: bool) -> Vec<aterm_json::Value> {
         std::fs::read_to_string(dir.path().join("stderr")).unwrap()
     );
     assert_eq!(dir.path().join("executed").exists(), valid);
+    if valid {
+        let log = std::fs::read_to_string(&path).unwrap();
+        let rebuilt: Vec<aterm_json::Value> = log
+            .lines()
+            .filter_map(|line| line.strip_prefix("verify-event: "))
+            .map(|line| aterm_json::from_str(line).unwrap())
+            .filter(|event: &aterm_json::Value| {
+                event["event"].as_str() == Some("compile-unit-finished")
+            })
+            .collect();
+        assert_eq!(
+            rebuilt.len(),
+            1,
+            "only the Cargo prelude supplies unit evidence"
+        );
+        assert_eq!(
+            rebuilt[0]["stage"].as_str(),
+            Some("fixture (recording pass)")
+        );
+        assert_eq!(rebuilt[0]["rebuild_reason"].as_str(), Some("changed-env"));
+    }
     assert_eq!(during.last().unwrap()["phase"].as_str(), Some("recording"));
     assert_eq!(
         during.last().unwrap()["event"].as_str(),

@@ -98,6 +98,7 @@ pub(crate) fn key() -> WindowEvent {
 }
 
 /// A line of scroll, a touch that reaches a window whether or not it is focused.
+#[cfg(unix)]
 pub(crate) fn scroll() -> WindowEvent {
     WindowEvent::MouseWheel {
         device_id: DeviceId::dummy(),

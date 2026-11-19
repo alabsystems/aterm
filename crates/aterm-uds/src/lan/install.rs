@@ -6,20 +6,29 @@
 //!
 //! The elevation clones the app bundle it ran from (the **source**) to [`super::IMAGE_BUNDLE`],
 //! root-owned, and writes [`super::PLIST_PATH`] ([`plist_text`]), whose job runs the clone's
-//! executable as `aterm lan serve --source <source>` ([`program_arguments`]). The install is owed
-//! when the clone is missing, when its code differs from the source's (unless both name one
-//! signing team, which the running broker adopts by itself: [`Part::Adopting`]), or when the plist
-//! differs from the one this build writes. Each of the three is readable without root: the image is
-//! `root:wheel` with read bits for everyone, and so is the plist.
+//! executable as `aterm lan serve --source <source>` ([`program_arguments`]). Both are readable
+//! without root: the image is `root:wheel` with read bits for everyone, and so is the plist.
 //!
-//! A Mac has one broker, and a team-signed one admits every client of its team (`aterm-lan`'s
-//! `server`). So a job that names another bundle asks no password where that bundle is a real
-//! one of this build's own signer and the image is its code, or adoptable by it ([`read`]): two
-//! copies of a release (the installed app and a release cut's bundle) that each read only their
-//! own name would each take the job from the other, at the price of the Mac password every
-//! time. The elevation itself is unchanged: it installs the bundle it ran from and no other,
-//! and judges the install against that bundle alone ([`read_own`]), so one that runs for any
-//! reason, `sudo aterm machines here apply --plain` included, takes the job for its own bundle.
+//! A build's number is its bundle's `CFBundleVersion` ([`build_number`]): the one the updater
+//! orders builds by, which a release stamps from its ledger and the signature seals (each
+//! CodeDirectory's Info slot). The running broker only moves up. Besides its job's source, it
+//! adopts the bundle of a team process that asked it to ([`consider_for`], `aterm-lan`'s
+//! `askers`), and each only through a root-owned clone that passed its strict check and states a
+//! strictly newer number than the image it serves. So an account reads ([`read`]):
+//! - a bundle whose executable states no team [`Signer`] of [`BUNDLE_ID`] (a development build)
+//!   owns no broker outside a VM guest ([`Part::Development`]): it owes nothing, and its LAN goes
+//!   by macOS's allowance for it first (`super::direct`, [`development_here`]);
+//! - the image as this build's code ([`Part::Current`]); an older build of this build's signer,
+//!   which the broker adopts by itself once this build asks ([`Part::Adopting`], an expectation
+//!   [`super::adoption`] bounds); a build of that signer at least as new, which it keeps
+//!   ([`Part::Kept`]) beside whatever plist that build wrote, never owed, whatever launchd holds
+//!   of its job ([`Reading::owed_with_job`]); and anything else as owed;
+//! - the plist in place where it is byte for byte the one this build writes for any bundle
+//!   ([`plist_text`]): which bundle it names owes nothing, as the broker takes every newer build
+//!   that asks, whoever's bundle the job names.
+//!
+//! The numbers an account reads decide only whether it asks; nothing root does depends on them.
+//! Root reads a candidate's number from its own sealed clone.
 //!
 //! Code is compared by the executable's **CodeDirectory** blobs ([`CodeDirectories`]), read
 //! statically from the Mach-O file: for every architecture slice, every CodeDirectory its
@@ -36,6 +45,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+pub use crate::launchd::JobState;
 
 /// The bundle identifier the broker's job is attributed to (`AssociatedBundleIdentifiers`), so
 /// macOS's background-item notice names aterm, not a file.
@@ -44,6 +56,10 @@ pub const BUNDLE_ID: &str = "com.aterm.aterm";
 /// A bundle's executable, relative to the bundle: what launchd runs in the clone
 /// ([`super::IMAGE_EXECUTABLE`]) and what the clone is compared against in the source.
 pub const BUNDLE_EXECUTABLE: &str = "Contents/MacOS/aterm";
+
+/// A bundle's property list, relative to the bundle: where its build is read ([`build_of`]), and
+/// what each CodeDirectory's Info slot seals.
+pub const BUNDLE_INFO: &str = "Contents/Info.plist";
 
 /// The longest plist [`Disk`] reads; anything longer is not one this build wrote.
 const PLIST_MAX: u64 = 64 * 1024;
@@ -130,6 +146,83 @@ pub fn source_bundle(exe: &Path) -> Option<PathBuf> {
         .skip(1)
         .find(|dir| dir.extension().is_some_and(|ext| ext == "app"))
         .map(Path::to_path_buf)
+}
+
+/// The build a bundle's `Info.plist` states ([`BUNDLE_INFO`]): its decimal `CFBundleVersion`,
+/// read where the release stamps it (`aterm_release::bundle::stamp_info_plist`): in an XML plist,
+/// the first `<key>CFBundleVersion</key>` outside a comment, then, past whitespace and comments,
+/// a `<string>` of 1 to 20 ASCII digits that is not zero and fits a `u64`. Anything else states
+/// no build: a binary plist, the template's unstamped `0`, another spelling, no key.
+#[must_use]
+pub fn build_number(plist: &[u8]) -> Option<u64> {
+    const KEY: &str = "<key>CFBundleVersion</key>";
+    let text = std::str::from_utf8(plist).ok()?;
+    let at = outside_comments(text)?
+        .into_iter()
+        .find_map(|(start, end)| text[start..end].find(KEY).map(|at| start + at))?;
+    let mut rest = &text[at + KEY.len()..];
+    loop {
+        rest = rest.trim_start();
+        let Some(comment) = rest.strip_prefix("<!--") else {
+            break;
+        };
+        rest = &comment[comment.find("-->")? + 3..];
+    }
+    let rest = rest.strip_prefix("<string>")?;
+    let digits = &rest[..rest.find("</string>")?];
+    if digits.is_empty() || digits.len() > 20 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok().filter(|build| *build != 0)
+}
+
+/// The spans of `text` outside its XML comments (`<!-- ... -->`), as byte ranges, or `None` for
+/// a comment never closed.
+fn outside_comments(text: &str) -> Option<Vec<(usize, usize)>> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(open) = text[at..].find("<!--").map(|open| at + open) {
+        spans.push((at, open));
+        at = open + 4 + text[open + 4..].find("-->")? + 3;
+    }
+    spans.push((at, text.len()));
+    Some(spans)
+}
+
+/// The build the bundle at `bundle` states ([`build_number`] of its [`BUNDLE_INFO`], read through
+/// `files`): `None` where that file is missing or unreadable, or states none.
+fn build_of(files: &dyn Files, bundle: &Path) -> Option<u64> {
+    files
+        .read(&bundle.join(BUNDLE_INFO))
+        .ok()
+        .and_then(|plist| build_number(&plist))
+}
+
+/// The whole regular file at `path`, at most [`PLIST_MAX`] bytes, read with no link anywhere on
+/// its way: `path` must be its own canonical path, and the open refuses a link on it
+/// ([`crate::nofollow::open_reader`]: `O_NOFOLLOW_ANY`, so a folder swapped for a link after the
+/// first look answers `ELOOP`) and never waits on a FIFO (`O_NONBLOCK`, then `fstat`). The broker
+/// reads a file of a bundle an account can change with it, as root.
+///
+/// # Errors
+/// `InvalidInput` for a path that is not its canonical one, the open's error (`ELOOP` for a link,
+/// `EFTYPE` for no regular file; `Unsupported` off macOS), or `InvalidData` for a file longer than
+/// any plist this build reads.
+pub fn read_unlinked(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    if std::fs::canonicalize(path)? != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not its own canonical path", path.display()),
+        ));
+    }
+    let file = std::fs::File::from(crate::nofollow::open_reader(path)?);
+    let mut bytes = Vec::new();
+    file.take(PLIST_MAX + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > PLIST_MAX {
+        return Err(bad("the file is longer than any plist this build reads"));
+    }
+    Ok(bytes)
 }
 
 /// One executable's code identity: per architecture slice (its CPU type), every CodeDirectory
@@ -299,6 +392,55 @@ impl CodeDirectories {
         }))
     }
 
+    /// The code identity of the executable at `path`, read with no link anywhere on its way
+    /// ([`crate::nofollow::open_reader`]), never waiting on a FIFO: the broker's read of an
+    /// executable in a bundle an account can change.
+    ///
+    /// # Errors
+    /// The open's error (`ELOOP` for a link on the way, `EFTYPE` for no regular file), and
+    /// [`Self::of_bytes`]'s.
+    #[cfg(target_os = "macos")]
+    pub fn of_unlinked(path: &Path) -> io::Result<Self> {
+        let file = std::fs::File::from(crate::nofollow::open_reader(path)?);
+        Self::of_held(&file)
+    }
+
+    /// Whether every CodeDirectory binds an `Info.plist`: a hash size of 20, 32 or 48 bytes that
+    /// agrees with its hash type, at least one special slot, and a nonzero Info slot (the first
+    /// special slot) inside the directory ([`info_slot_of`]). A clone the broker adopts shows it
+    /// before its number counts: an unbound plist could state any number.
+    #[must_use]
+    pub fn binds_info_plist(&self) -> bool {
+        !self.0.is_empty() && self.0.iter().all(|(_, blob)| info_slot_of(blob).is_some())
+    }
+
+    /// Whether every CodeDirectory binds `info` ([`Self::binds_info_plist`]) and its Info slot is
+    /// `info`'s digest in that directory's own hash type ([`InfoSlot::seals`]): the plist read is
+    /// the one each signed directory names, whichever the kernel ranks first.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn seals_info_plist(&self, info: &[u8]) -> bool {
+        self.binds_info_plist()
+            && self.0.iter().all(|(_, blob)| {
+                info_slot_of(blob).is_some_and(|(kind, slot)| InfoSlot::of(kind, slot).seals(info))
+            })
+    }
+
+    /// The Info slot of the CodeDirectory whose cdhash is `cdhash` (the one the kernel loaded for
+    /// a process, [`crate::process::read_loaded_code_of`]): `None` where no directory has it or
+    /// that one binds no plist ([`info_slot_of`]).
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn info_slot(&self, cdhash: [u8; 20]) -> Option<InfoSlot> {
+        self.0
+            .iter()
+            .find(|(_, blob)| {
+                blob.get(37).and_then(|kind| directory_hash(*kind, blob)) == Some(cdhash)
+            })
+            .and_then(|(_, blob)| info_slot_of(blob))
+            .map(|(kind, slot)| InfoSlot::of(kind, slot))
+    }
+
     /// Whether a CodeDirectory has the kernel's loaded cdhash. This is code identity, not
     /// signature validation: macOS still validates the image when it is executed.
     #[cfg(target_os = "macos")]
@@ -448,8 +590,54 @@ impl CodeDirectories {
     }
 }
 
+/// The Info slot of the CodeDirectory `blob`: its hash type and the slot's hash. `None` where
+/// the hash size is not 20, 32 or 48 bytes or disagrees with the hash type (SHA-1 and truncated
+/// SHA-256 20, SHA-256 32, SHA-384 48), the directory names no special slot, the slot lies outside
+/// the directory, or the slot is all zero (no plist bound).
+fn info_slot_of(blob: &[u8]) -> Option<(u8, &[u8])> {
+    let (size, kind) = (usize::from(*blob.get(36)?), *blob.get(37)?);
+    if !matches!((kind, size), (1 | 3, 20) | (2, 32) | (4, 48)) || be(blob, 24) == 0 {
+        return None;
+    }
+    let start = usize::try_from(be(blob, 16)).ok()?;
+    let slot = blob.get(start.checked_sub(size)?..start)?;
+    slot.iter().any(|b| *b != 0).then_some((kind, slot))
+}
+
+/// A CodeDirectory's Info slot ([`CodeDirectories::info_slot`]): the hash type it was made with,
+/// and the hash it holds of the bundle's `Info.plist`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InfoSlot {
+    kind: u8,
+    hash: Vec<u8>,
+}
+
+impl InfoSlot {
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "slots are digested on macOS")
+    )]
+    fn of(kind: u8, slot: &[u8]) -> Self {
+        Self {
+            kind,
+            hash: slot.to_vec(),
+        }
+    }
+
+    /// Whether `info` is the plist this slot seals: its full digest in the slot's hash type,
+    /// truncated to the slot's length as the signature truncates it, is the slot's hash.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn seals(&self, info: &[u8]) -> bool {
+        digest(self.kind, info)
+            .is_some_and(|full| full.get(..self.hash.len()) == Some(&self.hash[..]))
+    }
+}
+
+/// The full digest of `bytes` in CodeDirectory hash type `kind` (SHA-1, SHA-256 for both its full
+/// and truncated types, SHA-384), by CommonCrypto; `None` for another type.
 #[cfg(target_os = "macos")]
-fn directory_hash(kind: u8, bytes: &[u8]) -> Option<[u8; 20]> {
+fn digest(kind: u8, bytes: &[u8]) -> Option<Vec<u8>> {
     unsafe extern "C" {
         fn CC_SHA1(data: *const core::ffi::c_void, len: u32, out: *mut u8) -> *mut u8;
         fn CC_SHA256(data: *const core::ffi::c_void, len: u32, out: *mut u8) -> *mut u8;
@@ -459,15 +647,27 @@ fn directory_hash(kind: u8, bytes: &[u8]) -> Option<[u8; 20]> {
     let mut digest = [0_u8; 48];
     // SAFETY: bytes holds len readable bytes, and digest holds the largest output (SHA-384).
     // Each CommonCrypto function finishes synchronously and retains neither pointer.
-    let written = unsafe {
+    let (written, size) = unsafe {
         match kind {
-            1 => CC_SHA1(bytes.as_ptr().cast(), len, digest.as_mut_ptr()),
-            2 | 3 => CC_SHA256(bytes.as_ptr().cast(), len, digest.as_mut_ptr()),
-            4 => CC_SHA384(bytes.as_ptr().cast(), len, digest.as_mut_ptr()),
+            1 => (CC_SHA1(bytes.as_ptr().cast(), len, digest.as_mut_ptr()), 20),
+            2 | 3 => (
+                CC_SHA256(bytes.as_ptr().cast(), len, digest.as_mut_ptr()),
+                32,
+            ),
+            4 => (
+                CC_SHA384(bytes.as_ptr().cast(), len, digest.as_mut_ptr()),
+                48,
+            ),
             _ => return None,
         }
     };
-    (!written.is_null()).then(|| digest[..20].try_into().expect("fixed cdhash length"))
+    (!written.is_null()).then(|| digest[..size].to_vec())
+}
+
+/// A CodeDirectory's cdhash: its [`digest`] in its own hash type, cut to 20 bytes.
+#[cfg(target_os = "macos")]
+fn directory_hash(kind: u8, bytes: &[u8]) -> Option<[u8; 20]> {
+    digest(kind, bytes)?.get(..20)?.try_into().ok()
 }
 
 /// Who a signature says signed an executable ([`CodeDirectories::signer`]): its identifier and
@@ -510,7 +710,7 @@ impl CodeDirectories {
 
 /// What [`read`] reads with: the files themselves ([`Disk`]), or a test's.
 pub trait Files {
-    /// The whole file at `path` (the plist).
+    /// The whole file at `path` (the plist, a bundle's `Info.plist`).
     ///
     /// # Errors
     /// The read's error; `NotFound` where nothing is there.
@@ -522,17 +722,10 @@ pub trait Files {
     /// [`CodeDirectories::of_file`]'s, `NotFound` where nothing is there.
     fn code_directories(&self, path: &Path) -> io::Result<CodeDirectories>;
 
-    /// `path` with every link in it resolved, as [`std::fs::canonicalize`] answers.
-    ///
-    /// # Errors
-    /// The resolution's error; `NotFound` where nothing is there.
-    fn canonical(&self, path: &Path) -> io::Result<PathBuf>;
-
-    /// The uid that owns the file at `path` itself (a link is not followed).
-    ///
-    /// # Errors
-    /// The stat's error.
-    fn owner(&self, path: &Path) -> io::Result<u32>;
+    /// Whether this machine runs as a virtual machine's guest (`aterm_sysprobe::vm_guest`), where
+    /// a development build may own the broker ([`Part::Development`]); `None` where unread, which
+    /// counts as a real Mac.
+    fn vm_guest(&self) -> Option<bool>;
 }
 
 /// [`Files`] on this machine's disk.
@@ -567,20 +760,14 @@ impl Files for Disk {
         CodeDirectories::of_file(path)
     }
 
-    fn canonical(&self, path: &Path) -> io::Result<PathBuf> {
-        std::fs::canonicalize(path)
-    }
-
-    fn owner(&self, path: &Path) -> io::Result<u32> {
-        #[cfg(unix)]
+    fn vm_guest(&self) -> Option<bool> {
+        #[cfg(any(unix, windows))]
         {
-            use std::os::unix::fs::MetadataExt as _;
-            std::fs::symlink_metadata(path).map(|meta| meta.uid())
+            aterm_sysprobe::vm_guest()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
-            let _ = path;
-            Err(io::ErrorKind::Unsupported.into())
+            None
         }
     }
 }
@@ -588,22 +775,61 @@ impl Files for Disk {
 /// How one installed part reads against what this build would install.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Part {
-    /// As the bundle the reading is of installs it: this build's, or in a reading of a job
-    /// another bundle of this build's signer holds ([`Reading::held_by`]), that bundle's.
+    /// As this build installs it: the image is this build's code; the plist is the one this build
+    /// writes for a bundle, whichever bundle it names ([`read`]).
     Current,
     /// Not there.
     Missing,
-    /// There, and not what this build installs: another build's image, or a plist that is
-    /// neither this bundle's nor one a bundle of this build's signer holds ([`read`]).
+    /// There, and not what this build installs: another signer's image, or a plist this build
+    /// writes for no bundle.
     Differs,
-    /// The image is another build's, and it and the source state one non-ad-hoc [`Signer`]
-    /// (the team named) with [`BUNDLE_ID`]: the running broker adopts the source by itself
-    /// (`docs/DESIGN-lan-broker-2026-11-05.md` §3), so a release update owes no password. Not
-    /// current either: an elevation that runs for any reason renews it. The source is the
-    /// bundle the job names: in a held reading ([`Reading::held_by`]) the holder, not the reader.
+    /// The image is an older build of this build's own non-ad-hoc [`Signer`] (the team named) of
+    /// [`BUNDLE_ID`], or one whose number does not read while this build's does: the running
+    /// broker adopts this build by itself once it asks ([`consider_for`];
+    /// `docs/DESIGN-lan-broker-2026-11-05.md` §3), so a release update owes no password. It is
+    /// an expectation, which [`super::adoption::expect`] bounds: one the broker did not meet
+    /// reads [`Self::NotAdopted`].
     Adopting(String),
-    /// There, and it could not be read: not owed by this reading (an unreadable reading never
-    /// asks for a password), the words say why.
+    /// The image is another build of this build's own [`Signer`] of [`BUNDLE_ID`] whose number
+    /// (`image`) is at least this build's (`ours`): the broker keeps it, as it never moves to an
+    /// older build, so this build neither owes nor asks for it, nor for the plist beside it (that
+    /// newer build's, whatever it says), whatever launchd holds of its job
+    /// ([`Reading::owed_with_job`]), and its elevation never publishes its own image over it: one
+    /// launchd holds no job for is loaded in place (`aterm_machines`' LAN item).
+    Kept {
+        /// The signing team the image and this build both name.
+        team: String,
+        /// The image's build ([`build_number`]).
+        image: u64,
+        /// This build's.
+        ours: u64,
+    },
+    /// An [`Self::Adopting`] image the running broker did not take up: past its bound
+    /// ([`super::adoption::bound`]) after this account first saw it serve another build, it still
+    /// served `broker` ([`super::adoption::expect`]). Owed: the next Mac password setup asks for
+    /// its root steps, or a person's own `aterm init`, renews it, though none is asked for it
+    /// alone where the broker serves this build's protocol
+    /// (`aterm_machines::root_steps::Owed::LanBrokerAdoption`); one that speaks another serves
+    /// this build nothing, so its renewal asks (`aterm_machines::root_steps::Owed::LanBroker`).
+    /// `why` is the broker's own record of why it did not adopt this build's bundle
+    /// ([`super::adoption::Refusal`]), where it wrote one for that bundle.
+    NotAdopted {
+        /// The signing team the image and this build both name.
+        team: String,
+        /// The build the broker's hello still names.
+        broker: String,
+        /// Whether the broker speaks this build's protocol, and so still serves its LAN traffic.
+        serves: bool,
+        /// Why the broker did not adopt this build's bundle, in its own words.
+        why: Option<String>,
+    },
+    /// This build's executable states no team [`Signer`] of [`BUNDLE_ID`] (a development build:
+    /// ad hoc, self-signed, or another identifier) and this is no VM guest ([`Files::vm_guest`]):
+    /// it owns no broker, so neither part is owed, and its LAN goes by macOS's allowance for it
+    /// (`super::direct`) where one stands. Nothing else is read.
+    Development,
+    /// There, and it could not be read, or this build's own number could not be: not owed by
+    /// this reading (an unreadable reading never asks for a password), the words say why.
     Unread(String),
 }
 
@@ -611,7 +837,10 @@ impl Part {
     /// Whether the elevation owes this part.
     #[must_use]
     pub const fn owed(&self) -> bool {
-        matches!(self, Self::Missing | Self::Differs)
+        matches!(
+            self,
+            Self::Missing | Self::Differs | Self::NotAdopted { .. }
+        )
     }
 
     /// The part's state in a few words.
@@ -622,7 +851,30 @@ impl Part {
             Self::Missing => "missing".to_owned(),
             Self::Differs => "another build's".to_owned(),
             Self::Adopting(team) => {
-                format!("another build's of team {team}, which the broker adopts by itself")
+                format!("an older build's of team {team}, which the broker adopts by itself")
+            }
+            Self::Kept { team, image, ours } => format!(
+                "build {image} of team {team}, which the broker keeps over this build {ours}: it \
+                 never moves to an older build"
+            ),
+            Self::NotAdopted {
+                team,
+                broker,
+                serves,
+                why,
+            } => format!(
+                "an older build's of team {team}, which the running broker did not adopt in its \
+                 looks: it still serves {broker}{} ({})",
+                if *serves {
+                    ""
+                } else {
+                    ", on another protocol than this aterm's, so aterm's LAN traffic is down \
+                     until setup's Mac password renews it"
+                },
+                why.as_deref().unwrap_or("it recorded no reason"),
+            ),
+            Self::Development => {
+                "left alone: a development build runs the broker only in a VM guest".to_owned()
             }
             Self::Unread(why) => format!("unread ({why})"),
         }
@@ -632,27 +884,31 @@ impl Part {
 /// The broker's install as an account reads it ([`read`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reading {
-    /// The root-owned clone ([`super::IMAGE_BUNDLE`]) against the code of the bundle the reading
-    /// is of: this build's, or the holder's ([`Self::held_by`]).
+    /// The root-owned clone ([`super::IMAGE_BUNDLE`]) against this build's code.
     pub image: Part,
-    /// [`super::PLIST_PATH`] against [`plist_text`] of that bundle.
+    /// [`super::PLIST_PATH`] against [`plist_text`] of any bundle.
     pub plist: Part,
-    /// The other bundle of this build's signer that holds the job, where the reading is of its
-    /// install ([`read`]); `None` for a reading against this build's own bundle.
-    pub held_by: Option<PathBuf>,
 }
 
 impl Reading {
-    /// Whether setup's one elevation owes the broker: either part is missing or differs.
+    /// Whether setup's one elevation owes the broker: either part is missing or differs. Beside
+    /// an image the broker keeps over this build ([`Part::Kept`]) the plist is that newer build's,
+    /// whatever it says, and this build owes it nothing: an older build's elevation never rewrites
+    /// what a newer one wrote, and two builds that each owed the other's plist would ask in turn.
     #[must_use]
     pub const fn owed(&self) -> bool {
-        self.image.owed() || self.plist.owed()
+        self.image.owed() || (self.plist.owed() && !matches!(self.image, Part::Kept { .. }))
     }
 
     /// Whether setup owes a file repair or a known-stopped service, and the job is not one a
-    /// person switched off. A running older signed image adopts its update itself. An unreadable
-    /// file or job never creates service debt. `running` is read only when both files can
-    /// already serve this build or adopt it.
+    /// person switched off. A running older signed image adopts its update itself. A newer one
+    /// this build keeps ([`Part::Kept`]) is never owed, whatever launchd holds of its job: a job
+    /// it holds with no pid is stopped or between two of its starts, and one it holds none of may
+    /// be inside the newer build's own `bootout` and `bootstrap`, which a read cannot tell apart,
+    /// and no password is asked of this account for a broker it does not own. An elevation that
+    /// runs loads it in place where launchd holds none. An unreadable file or job never creates
+    /// service debt. `job` is read only when the files can already serve this build or adopt it
+    /// (the plist current).
     ///
     /// `switched_off` is read only when something would be owed: a job launchd lists switched off
     /// (`Some(true)`: its background item turned off in Login Items, or `launchctl disable`)
@@ -664,47 +920,68 @@ impl Reading {
     #[must_use]
     pub fn owed_with_job(
         &self,
-        running: impl FnOnce() -> Option<bool>,
+        job: impl FnOnce() -> Option<JobState>,
         switched_off: impl FnOnce() -> Option<bool>,
     ) -> bool {
         let owed = self.owed()
-            || (matches!(self.image, Part::Current | Part::Adopting(_))
-                && self.plist == Part::Current
-                && running() == Some(false));
+            || match self.image {
+                Part::Current | Part::Adopting(_) => {
+                    self.plist == Part::Current
+                        && matches!(job(), Some(JobState::Idle | JobState::Unloaded))
+                }
+                _ => false,
+            };
         owed && switched_off() != Some(true)
     }
 
-    /// Whether both parts are as the bundle the reading is of installs them: this build's, or
-    /// the holder's ([`Self::held_by`]).
+    /// Whether both parts are as this build installs them.
     #[must_use]
     pub fn current(&self) -> bool {
         self.image == Part::Current && self.plist == Part::Current
     }
 
-    /// The reading in one line: `image <state>, plist <state>`, and the holder where another
-    /// bundle holds the job.
+    /// Whether the install stays as it is for this build: the image is one the broker keeps over
+    /// it ([`Part::Kept`]), whose plist is that newer build's whatever it says, or the image is
+    /// this build's or none of its to own ([`Part::Development`]) and the plist is in place or
+    /// none of its to own.
+    #[must_use]
+    pub fn in_place(&self) -> bool {
+        matches!(self.image, Part::Kept { .. })
+            || (matches!(self.image, Part::Current | Part::Development)
+                && matches!(self.plist, Part::Current | Part::Development))
+    }
+
+    /// The reading in one line: `image <state>, plist <state>`.
     #[must_use]
     pub fn words(&self) -> String {
-        let parts = format!("image {}, plist {}", self.image.words(), self.plist.words());
-        match &self.held_by {
-            Some(holder) => format!(
-                "{parts}, held by another copy of this team at {}",
-                holder.display()
-            ),
-            None => parts,
-        }
+        format!("image {}, plist {}", self.image.words(), self.plist.words())
     }
 }
 
-/// The image ([`super::IMAGE_EXECUTABLE`]) against a source executable's code: the same code,
-/// another build's of the source's own team with [`BUNDLE_ID`] (which the broker adopts by
-/// itself), another's, missing or unread.
-fn image_against(files: &dyn Files, source: &CodeDirectories) -> Part {
+/// The image ([`super::IMAGE_EXECUTABLE`]) against this build's code `ours`, of the bundle at
+/// `source`: the same code; another build of this build's own [`Signer`] of [`BUNDLE_ID`], older
+/// (or of no number while this build's reads, [`Part::Adopting`]) or at least as new
+/// ([`Part::Kept`]), by [`build_of`] each bundle; this build's own number unread
+/// ([`Part::Unread`]); another's; missing or unread.
+fn image_against(files: &dyn Files, ours: &CodeDirectories, source: &Path) -> Part {
     match files.code_directories(Path::new(super::IMAGE_EXECUTABLE)) {
-        Ok(image) if image == *source => Part::Current,
-        Ok(image) => match (image.signer(), source.signer()) {
-            (Some(image), Some(source)) if image == source && source.identifier == BUNDLE_ID => {
-                Part::Adopting(source.team)
+        Ok(image) if image == *ours => Part::Current,
+        Ok(image) => match (image.signer(), ours.signer()) {
+            (Some(image), Some(ours)) if image == ours && ours.identifier == BUNDLE_ID => {
+                let Some(build) = build_of(files, source) else {
+                    return Part::Unread(format!(
+                        "{} states no build",
+                        source.join(BUNDLE_INFO).display()
+                    ));
+                };
+                match build_of(files, Path::new(super::IMAGE_BUNDLE)) {
+                    Some(kept) if kept >= build => Part::Kept {
+                        team: ours.team,
+                        image: kept,
+                        ours: build,
+                    },
+                    _ => Part::Adopting(ours.team),
+                }
             }
             _ => Part::Differs,
         },
@@ -734,124 +1011,41 @@ fn named_source(plist: &[u8]) -> Option<PathBuf> {
     (source.is_absolute() && plist == plist_text(&source).as_bytes()).then_some(source)
 }
 
-/// The reading of a job whose `plist` names another bundle, where that bundle holds the broker
-/// for this build too ([`read`]); `None` where it does not, and the reading against this build's
-/// own bundle `running` stands (`ours` is its code, `own_image` that reading's image).
-fn held_by_another(
-    files: &dyn Files,
-    running: &Path,
-    ours: &CodeDirectories,
-    own_image: &Part,
-    plist: &[u8],
-) -> Option<Reading> {
-    // An image that is missing or not this signer's is owed whoever the job names: it is no
-    // code of a holder of this signer, and none adopts it.
-    if own_image.owed() {
-        return None;
-    }
-    let signer = ours.signer().filter(|s| s.identifier == BUNDLE_ID)?;
-    let source = named_source(plist)?;
-    let exe = source.join(BUNDLE_EXECUTABLE);
-    // Root may read a bundle this account may not: a reading that then asked for the password
-    // would ask at every launch, for an install the root half may leave as it is.
-    let unread = |e: &io::Error| {
-        let why = format!("{}: {e}", exe.display());
-        Some(Reading {
-            image: Part::Unread(why.clone()),
-            plist: Part::Unread(why),
-            held_by: None,
-        })
-    };
-    let denied = |e: &io::Error| e.kind() == io::ErrorKind::PermissionDenied;
-    // No link anywhere on the way to the executable: the broker clones none, and a linked
-    // folder would lend the holder another bundle's code.
-    match files.canonical(&exe) {
-        Ok(real) if real == exe => {}
-        Err(e) if denied(&e) => return unread(&e),
-        _ => return None,
-    }
-    let theirs = match files.code_directories(&exe) {
-        Ok(theirs) => theirs,
-        Err(e) if denied(&e) => return unread(&e),
-        Err(_) => return None,
-    };
-    if theirs.signer().as_ref() != Some(&signer) {
-        return None;
-    }
-    // Another account's bundle silences no debt of this one's.
-    match (
-        files.owner(&exe),
-        files.owner(&running.join(BUNDLE_EXECUTABLE)),
-    ) {
-        (Ok(theirs), Ok(ours)) if theirs == 0 || theirs == ours => {}
-        _ => return None,
-    }
-    let image = image_against(files, &theirs);
-    (!image.owed()).then_some(Reading {
-        image,
-        plist: Part::Current,
-        held_by: Some(source),
-    })
-}
-
-fn read_with(files: &dyn Files, source: &Path, held: bool) -> Result<Reading, String> {
-    let ours_path = source.join(BUNDLE_EXECUTABLE);
-    let ours = files
-        .code_directories(&ours_path)
-        .map_err(|e| format!("{}: {e}", ours_path.display()))?;
-    let image = image_against(files, &ours);
-    let plist = match files.read(Path::new(super::PLIST_PATH)) {
-        Ok(bytes) if bytes == plist_text(source).as_bytes() => Part::Current,
-        Ok(bytes) => {
-            if held && let Some(held) = held_by_another(files, source, &ours, &image, &bytes) {
-                return Ok(held);
-            }
-            Part::Differs
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Part::Missing,
-        Err(e) => Part::Unread(format!("{}: {e}", super::PLIST_PATH)),
-    };
-    Ok(Reading {
-        image,
-        plist,
-        held_by: None,
-    })
-}
-
-/// Read the broker's install against `source`, the app bundle this build runs from, and that
-/// bundle alone: the clone's code against the source executable's (another build's of the same
-/// team the broker adopts, [`Part::Adopting`]), and the plist against [`plist_text`]. It is the
-/// elevation's reading: a root half installs its own bundle, so a job another bundle holds is
-/// another's to it ([`Part::Differs`]).
+/// Read the broker's install against `source`, the app bundle this build runs from, as an account
+/// decides whether to ask for it and as the elevation decides what it installs. A build whose
+/// executable states no team [`Signer`] of [`BUNDLE_ID`] reads [`Part::Development`] for both
+/// parts outside a VM guest, and nothing else is read. Otherwise the clone's code is read against
+/// the source executable's ([`image_against`]), and the plist is in place where it is byte for
+/// byte the one this build writes for any absolute bundle (`named_source`): the broker adopts
+/// every strictly newer team build that asks, so which bundle the job names leaves nothing owed,
+/// and a job that names a bundle since deleted, or an older one, pins nothing.
 ///
 /// # Errors
 /// The source's own code could not be read (there is nothing to compare the clone with), in one
 /// line.
-pub fn read_own(files: &dyn Files, source: &Path) -> Result<Reading, String> {
-    read_with(files, source, false)
-}
-
-/// Read the broker's install as an account decides whether to ask for it: [`read_own`]'s
-/// reading, save that a job another bundle holds is read against that bundle
-/// ([`Reading::held_by`]) and is in place where all of this holds. The plist is byte for byte
-/// the one this build writes for that bundle. The bundle's executable is there under its own
-/// name, no link on the way to it. It states this build's own non-ad-hoc [`Signer`] of
-/// [`BUNDLE_ID`], and this build's executable's owner or root owns it. And the image is that
-/// bundle's code or adoptable by it.
-///
-/// The broker then serves this build as it serves that one (it admits its team), and no
-/// password is asked to move the job; where an elevation runs anyway it moves it
-/// ([`read_own`]), and the other bundle then reads this one as the holder. The signer is read,
-/// not verified, and decides nothing root installs or runs. What a holder does decide is which
-/// build of the team the broker adopts next, as a job's source always did: an account that
-/// reads a held job does not ask to take it back while the holder stays as above. A bundle
-/// with no team signature (a development build) shares no broker: an ad-hoc broker admits its
-/// own code alone.
-///
-/// # Errors
-/// [`read_own`]'s.
 pub fn read(files: &dyn Files, source: &Path) -> Result<Reading, String> {
-    read_with(files, source, true)
+    let ours_path = source.join(BUNDLE_EXECUTABLE);
+    let ours = files
+        .code_directories(&ours_path)
+        .map_err(|e| format!("{}: {e}", ours_path.display()))?;
+    if ours
+        .signer()
+        .is_none_or(|signer| signer.identifier != BUNDLE_ID)
+        && files.vm_guest() != Some(true)
+    {
+        return Ok(Reading {
+            image: Part::Development,
+            plist: Part::Development,
+        });
+    }
+    let image = image_against(files, &ours, source);
+    let plist = match files.read(Path::new(super::PLIST_PATH)) {
+        Ok(bytes) if named_source(&bytes).is_some() => Part::Current,
+        Ok(_) => Part::Differs,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Part::Missing,
+        Err(e) => Part::Unread(format!("{}: {e}", super::PLIST_PATH)),
+    };
+    Ok(Reading { image, plist })
 }
 
 /// This process's own source: the app bundle its canonical executable runs from. `None` off
@@ -867,10 +1061,15 @@ pub fn source_here() -> Option<PathBuf> {
 }
 
 /// [`read`] on this machine for this process's [`source_here`]: `None` where there is no source.
+/// A reading that finds the image adopting asks the broker to consider this bundle
+/// ([`consider_for`]).
 #[must_use]
 pub fn read_here() -> Option<(PathBuf, Result<Reading, String>)> {
     let source = source_here()?;
     let reading = read(&Disk, &source);
+    if let Ok(found) = &reading {
+        consider_for(found);
+    }
     Some((source, reading))
 }
 
@@ -879,12 +1078,301 @@ pub fn read_here() -> Option<(PathBuf, Result<Reading, String>)> {
 /// and for a file reading that failed, so no password is asked for want of a reading.
 #[must_use]
 pub fn owed_here(
-    running: impl FnOnce() -> Option<bool>,
+    job: impl FnOnce() -> Option<JobState>,
     switched_off: impl FnOnce() -> Option<bool>,
 ) -> bool {
     read_here().is_some_and(|(_, reading)| {
-        reading.is_ok_and(|reading| reading.owed_with_job(running, switched_off))
+        reading.is_ok_and(|reading| reading.owed_with_job(job, switched_off))
     })
+}
+
+/// Whether this process is a development build on a real Mac: the code the kernel loaded for it
+/// states no team [`Signer`] of [`BUNDLE_ID`] ([`development_at`], read at the path the kernel
+/// records for its image, `proc_pidpath`, against the cdhash it loaded, so a link a build
+/// retargets since this process started changes nothing) and this is no VM guest (where a
+/// development build owns its own broker, [`Part::Development`]), read once; off macOS, none is.
+/// Such a process owns no broker: its LAN uses take its direct path (`super::direct`) first,
+/// where macOS allowed its code, and dial the installed broker only where none stands
+/// ([`super::broker`]). A test's thread may say instead ([`super::Seam::development`]).
+#[must_use]
+pub fn development_here() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(development) = super::seam().development {
+        return development;
+    }
+    static DEVELOPMENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEVELOPMENT.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        let loaded = {
+            let pid = i32::try_from(std::process::id()).unwrap_or(0);
+            crate::process::read_process_path(pid).is_some_and(|exe| {
+                development_at(&exe, crate::process::read_code_directory_hash(pid))
+            })
+        };
+        #[cfg(not(target_os = "macos"))]
+        let loaded = false;
+        loaded && Disk.vm_guest() != Some(true)
+    })
+}
+
+/// Whether the code a process loaded, the cdhash `loaded` the kernel names for it, is a
+/// development build's: the file `exe` names (every link on the way followed) holds that code's
+/// CodeDirectory, so what is read is the code the process runs and not whatever a name holds now,
+/// and states no team [`Signer`] of [`BUNDLE_ID`]. Code whose cdhash did not read, a file that no
+/// longer holds it, and a signature that does not read are not one: such a process stands on the
+/// broker's answer, as a release does. Off macOS, none is.
+#[must_use]
+pub fn development_at(exe: &Path, loaded: Option<[u8; 20]>) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(loaded) = loaded else {
+            return false;
+        };
+        exe.canonicalize()
+            .and_then(|exe| CodeDirectories::of_file(&exe))
+            .is_ok_and(|code| {
+                code.matches_loaded_hash(loaded)
+                    && code
+                        .signer()
+                        .is_none_or(|signer| signer.identifier != BUNDLE_ID)
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (exe, loaded);
+        false
+    }
+}
+
+/// What decides whether a process asks the broker to consider its bundle ([`Ask::begin`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Asking<'a> {
+    /// The process is a Cargo test binary ([`crate::test_binary::scratch_root`]).
+    pub(crate) test_binary: bool,
+    /// The process runs in a scratch world ([`crate::world::MARKER`] is set).
+    pub(crate) world: bool,
+    /// The process runs from an app bundle ([`source_here`]).
+    pub(crate) bundled: bool,
+    /// Its install's reading ([`read`]).
+    pub(crate) reading: &'a Reading,
+}
+
+impl Asking<'_> {
+    /// Whether to ask: not a test binary, not in a scratch world, run from a bundle, and the image
+    /// read [`Part::Adopting`]: so a scratch world's qualification, an older build beside a newer
+    /// broker ([`Part::Kept`]), a build the broker already serves and a development build ask
+    /// nothing.
+    const fn asks(&self) -> bool {
+        !self.test_binary
+            && !self.world
+            && self.bundled
+            && matches!(self.reading.image, Part::Adopting(_))
+    }
+}
+
+/// Which broker answers at a socket: its file's device and inode, read with no link followed. A
+/// broker binds its socket anew each time it starts, so another file is another broker, which
+/// keeps none of the asks the one before it heard: the broker keeps its askers in memory alone.
+pub(crate) type Generation = (u64, u64);
+
+/// The [`Generation`] of the broker this thread's client dials (`super::dialled_socket`): `None`
+/// where its socket does not read.
+fn socket_generation() -> Option<Generation> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(super::dialled_socket())
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// How long an ask a broker heard stands ([`Ask`]): five minutes, past which a process whose image
+/// still reads adopting asks that broker again. The broker keeps a bounded list of asks
+/// (`aterm-lan`'s `askers`), and an ask it heard may go from it before its bundle is adopted; one
+/// ask in five minutes is one admission check of this process's code in that time.
+pub(crate) const ASK_AGAIN: Duration = Duration::from_secs(5 * 60);
+
+/// What a process knows of its asks ([`Ask`]).
+#[derive(Debug, Default)]
+struct Asks {
+    /// The broker an ask last reached (it admitted this process, and the request was written),
+    /// and when.
+    reached: Option<(Generation, Instant)>,
+    /// An ask is on its way.
+    sending: bool,
+}
+
+/// A process's asks of the broker to consider its bundle ([`consider_for`]): at most one on its
+/// way; one more for each broker that did not hear one, as an ask counts only once a broker heard
+/// it and a broker that restarted (after an adoption, an elevation or a crash) heard none; and one
+/// more of the same broker each [`ASK_AGAIN`].
+pub(crate) struct Ask(std::sync::Mutex<Asks>);
+
+impl Ask {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::Mutex::new(Asks {
+            reached: None,
+            sending: false,
+        }))
+    }
+
+    fn asks(&self) -> std::sync::MutexGuard<'_, Asks> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether to start an ask at `at` where `asking` asks ([`Asking::asks`]) and the broker is of
+    /// generation `now`: none is on its way, and none reached that broker in the [`ASK_AGAIN`]
+    /// before `at` (a socket that did not read is no broker an ask reached). Starting marks one on
+    /// its way, which [`Self::end`] ends.
+    pub(crate) fn begin(&self, asking: &Asking<'_>, now: Option<Generation>, at: Instant) -> bool {
+        if !asking.asks() {
+            return false;
+        }
+        let mut asks = self.asks();
+        let heard = asks.reached.is_some_and(|(reached, when)| {
+            Some(reached) == now && at.saturating_duration_since(when) < ASK_AGAIN
+        });
+        if asks.sending || heard {
+            return false;
+        }
+        asks.sending = true;
+        true
+    }
+
+    /// The end at `at` of the ask [`Self::begin`] started: `reached`, the broker that heard it,
+    /// `None` where none did, which leaves the next reading to ask again.
+    pub(crate) fn end(&self, reached: Option<Generation>, at: Instant) {
+        let mut asks = self.asks();
+        asks.sending = false;
+        if let Some(reached) = reached {
+            asks.reached = Some((reached, at));
+        }
+    }
+}
+
+/// The most tries of one ask ([`ask_until_heard`]): about ten minutes of them, past which the
+/// next reading or served LAN use asks again.
+pub(crate) const ASK_TRIES: u32 = 8;
+
+/// How long after its `n`th failed try an ask is tried again: one of the broker's looks
+/// ([`super::ADOPTION_LOOK`]), doubling, at most five minutes: a broker restarting, at its
+/// connection bound or waiting on `trustd` answers again within that.
+pub(crate) fn ask_again_after(n: u32) -> Duration {
+    let factor = 1u32 << n.saturating_sub(1).min(31);
+    super::ADOPTION_LOOK
+        .saturating_mul(factor)
+        .min(Duration::from_secs(5 * 60))
+}
+
+/// One ask, tried until a broker hears it: `send` tries it (`true` where the broker admitted this
+/// process and the request was written), each try at the broker `generation` then names, `wait`
+/// between tries ([`ask_again_after`]), at most [`ASK_TRIES`], ending early where `still` says
+/// this process no longer asks (its image no longer reads adopting). The broker that heard it,
+/// `None` where none did.
+pub(crate) fn ask_until_heard(
+    mut send: impl FnMut() -> bool,
+    generation: impl Fn() -> Option<Generation>,
+    mut wait: impl FnMut(Duration),
+    still: impl Fn() -> bool,
+) -> Option<Generation> {
+    for n in 1..=ASK_TRIES {
+        let at = generation();
+        if send() {
+            return at;
+        }
+        if n == ASK_TRIES {
+            break;
+        }
+        wait(ask_again_after(n));
+        if !still() {
+            return None;
+        }
+    }
+    None
+}
+
+/// This process's asks ([`Ask`]).
+static ASKED: Ask = Ask::new();
+
+/// Ask the installed root broker to consider the bundle this process runs from
+/// ([`super::wire::Request::Consider`]), where `reading` (this process's install, [`read`]) finds
+/// the image adopting, this is no test binary, and no scratch world ([`crate::world::MARKER`]):
+/// the broker then authenticates the bundle by the code the kernel loaded for this process and
+/// adopts it only through a root-owned clone that passes its strict check and states a strictly
+/// newer build. The ask goes on a detached thread, tried until a broker hears it
+/// ([`ask_until_heard`]), and is made again of a broker that heard it only after [`ASK_AGAIN`]
+/// ([`Ask`]); what the broker then does is not read (one that does not know the request closes).
+pub fn consider_for(reading: &Reading) {
+    let asking = Asking {
+        test_binary: crate::test_binary::scratch_root().is_some(),
+        world: std::env::var_os(crate::world::MARKER).is_some(),
+        bundled: source_here().is_some(),
+        reading,
+    };
+    if !ASKED.begin(&asking, socket_generation(), Instant::now()) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("lan-consider".into())
+        .spawn(|| {
+            let still = || {
+                source_here().is_some_and(|source| {
+                    read(&Disk, &source)
+                        .is_ok_and(|reading| matches!(reading.image, Part::Adopting(_)))
+                })
+            };
+            let reached = ask_until_heard(
+                || super::broker::consider().is_ok(),
+                socket_generation,
+                std::thread::sleep,
+                still,
+            );
+            ASKED.end(reached, Instant::now());
+        });
+    if spawned.is_err() {
+        ASKED.end(None, Instant::now());
+    }
+}
+
+/// [`consider_for`] this process's own reading ([`read`] of [`source_here`]), looked at once per
+/// broker ([`Generation`]) and [`ASK_AGAIN`], on a detached thread: what each LAN use the
+/// installed root broker served calls (`super::broker`), so a build that never reads its install
+/// still asks, asks again of a broker that restarted, and asks again while its image still reads
+/// adopting.
+pub fn consider_here() {
+    static LOOKED: std::sync::Mutex<Option<(Generation, Instant)>> = std::sync::Mutex::new(None);
+    if crate::test_binary::scratch_root().is_some()
+        || std::env::var_os(crate::world::MARKER).is_some()
+    {
+        return;
+    }
+    let Some(now) = socket_generation() else {
+        return;
+    };
+    {
+        let mut looked = LOOKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = Instant::now();
+        if looked.is_some_and(|(generation, when)| {
+            generation == now && at.saturating_duration_since(when) < ASK_AGAIN
+        }) {
+            return;
+        }
+        *looked = Some((now, at));
+    }
+    let _ = std::thread::Builder::new()
+        .name("lan-consider".into())
+        .spawn(|| {
+            let _ = read_here();
+        });
 }
 
 /// A test's thin 64-bit Mach-O of CPU type `cpu` whose embedded signature carries `directories`
@@ -920,6 +1408,95 @@ pub fn test_image(cpu: u32, directories: &[&[u8]]) -> Vec<u8> {
     out.extend_from_slice(&index);
     out.extend_from_slice(&blobs);
     out
+}
+
+/// A test's CodeDirectory body (what follows its magic and length): `flags`, naming `identifier`
+/// and, at a nonzero `teamOffset`, `team`, at the team-supporting version; 32-byte SHA-256
+/// hashes; one code slot of `page`; and where `info` is given one special slot, the Info slot,
+/// holding its SHA-256, as a signature that binds that `Info.plist` does. For readers' tests here,
+/// in `aterm-lan` and in `aterm-machines`.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn test_directory(
+    identifier: &str,
+    team: Option<&str>,
+    flags: u32,
+    page: u8,
+    info: Option<&[u8]>,
+) -> Vec<u8> {
+    let ident_at = 52_u32;
+    let team_at = ident_at + identifier.len() as u32 + 1;
+    let strings_end = team.map_or(team_at, |team| team_at + team.len() as u32 + 1);
+    let special = u32::from(info.is_some());
+    let hash_at = strings_end + 32 * special;
+    // hashSize 32, hashType 2 (SHA-256), no platform, 4 KiB pages.
+    let sizes = (32_u32 << 24) | (2 << 16) | 12;
+    let mut body = Vec::new();
+    for word in [
+        SUPPORTS_TEAM_ID + 0x200,
+        flags,
+        hash_at,
+        ident_at,
+        special,
+        1,
+        0,
+        sizes,
+        0,
+        0,
+        team.map_or(0, |_| team_at),
+    ] {
+        body.extend_from_slice(&word.to_be_bytes());
+    }
+    body.extend_from_slice(identifier.as_bytes());
+    body.push(0);
+    if let Some(team) = team {
+        body.extend_from_slice(team.as_bytes());
+        body.push(0);
+    }
+    if let Some(info) = info {
+        body.extend_from_slice(&aterm_digest::Sha256::digest(info));
+    }
+    body.extend_from_slice(&[page; 32]);
+    body
+}
+
+/// A test's release executable: one CodeDirectory of team `team` naming [`BUNDLE_ID`], its code
+/// `page`, binding `info` ([`test_directory`]), as [`test_image`] wraps it for this machine's
+/// architecture.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn test_release(team: &str, page: u8, info: &[u8]) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    let cpu = 0x0100_0007;
+    #[cfg(not(target_arch = "x86_64"))]
+    let cpu = 0x0100_000c;
+    test_image(
+        cpu,
+        &[&test_directory(BUNDLE_ID, Some(team), 0, page, Some(info))],
+    )
+}
+
+/// The cdhash the kernel would load for a test's executable `exe` ([`test_release`]): its first
+/// CodeDirectory's, as an asker's record carries it.
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+#[must_use]
+pub fn test_cdhash(exe: &[u8]) -> Option<[u8; 20]> {
+    let code = CodeDirectories::of_bytes(exe).ok()?;
+    let (_, blob) = code.0.first()?;
+    directory_hash(*blob.get(37)?, blob)
+}
+
+/// A test's `Info.plist` stating build `build` as the release stamps it, `CFBundleVersion` among
+/// the other keys ([`build_number`]).
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn test_info(build: u64) -> Vec<u8> {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
+         \t<key>CFBundleIdentifier</key>\n\t<string>{BUNDLE_ID}</string>\n\
+         \t<key>CFBundleVersion</key>\n\t<string>{build}</string>\n</dict>\n</plist>\n"
+    )
+    .into_bytes()
 }
 
 #[cfg(test)]

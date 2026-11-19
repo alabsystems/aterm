@@ -208,7 +208,7 @@ fn covers_every_folder(home: &Path, dirs: &OwnDirs) {
     assert_eq!(
         bound(StoreWord::VaultRecords),
         files(
-            aterm_secrets::membership_log::MAX_RECORDS_STREAM as u64,
+            aterm_secrets::membership_log::Reading::ONE.capacity() as u64,
             AtBound::Refuses
         )
     );

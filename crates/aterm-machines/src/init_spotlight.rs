@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Init stops Spotlight indexing the home folders a person does not search, in its root
+//! Init keeps Spotlight to Applications, Documents, Desktop and the synced drives, in its root
 //! transaction ([`Scope`]).
 //! Cache placement also keeps Rust docs and build output out of Spotlight.
 
@@ -68,11 +68,17 @@ impl spotlight_scope::Reads for Port<'_> {
     }
 
     fn entry(&self, path: &Path) -> io::Result<spotlight_scope::Entry> {
-        self.0.stat(path).map(|stat| spotlight_scope::Entry {
+        let stat = self.0.stat(path)?;
+        Ok(spotlight_scope::Entry {
             uid: stat.uid,
             dir: stat.dir,
             symlink: stat.symlink,
+            id: self.0.file_id(path).ok().map(|id| (id.dev, id.ino)),
         })
+    }
+
+    fn resolve(&self, path: &Path) -> io::Result<PathBuf> {
+        self.0.canonicalize(path)
     }
 
     fn names(&self, dir: &Path) -> io::Result<Vec<String>> {
@@ -96,10 +102,11 @@ impl spotlight_scope::Reads for Port<'_> {
     }
 }
 
-/// The folders of `home` Spotlight should leave out ([`spotlight_scope::wanted`]).
+/// The folders Spotlight should leave out for `home` ([`spotlight_scope::wanted`]).
 ///
 /// # Errors
-/// The home folder could not be listed.
+/// The home folder, a folder on the way to a kept one or the data volume's top level could not
+/// be listed.
 fn wanted(sys: &dyn System, home: &Path) -> Result<BTreeSet<PathBuf>, String> {
     spotlight_scope::wanted(&Port(sys), home)
 }
@@ -177,7 +184,8 @@ fn ran_ok(sys: &dyn System, cmd: &Cmd) -> Result<(), String> {
 /// ([`spotlight_scope::state`]).
 ///
 /// # Errors
-/// The indexing state, the home folder, or an ordinary account's receipt could not be read.
+/// The indexing state, a folder the scope lists, or an ordinary account's receipt could not be
+/// read.
 fn scope(sys: &dyn System, home: &Path) -> Result<Standing, String> {
     spotlight_scope::state(&Port(sys), home)
 }
@@ -200,27 +208,66 @@ pub fn automatic_scope_owed(sys: &dyn System) -> bool {
     spotlight_scope::automatic_owed(&Port(sys))
 }
 
-/// `paths`' last components, comma-separated.
-fn folder_names(paths: &BTreeSet<PathBuf>) -> String {
-    paths
+/// `folders`, summed by where they are: the home's own folders by name, those anywhere in
+/// ~/Library and the rest of the data volume's by count, so a first run's couple of hundred
+/// reads as one line.
+fn summary(folders: &BTreeSet<PathBuf>, home: &Path) -> String {
+    let library = home.join(spotlight_scope::LIBRARY);
+    let named: Vec<String> = folders
         .iter()
+        .filter(|path| path.parent() == Some(home))
         .filter_map(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+    let in_library = folders
+        .iter()
+        .filter(|path| path.starts_with(&library))
+        .count();
+    let rest = folders.len() - named.len() - in_library;
+    let counted = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+    let mut parts = Vec::new();
+    if !named.is_empty() {
+        parts.push(format!(
+            "{} ({})",
+            counted(named.len(), "home folder"),
+            named.join(", ")
+        ));
+    }
+    if in_library > 0 {
+        parts.push(counted(in_library, "Library folder"));
+    }
+    if rest > 0 {
+        parts.push(counted(rest, "data-volume folder"));
+    }
+    parts.join(", ")
 }
 
-/// Stop Spotlight indexing the console account's home folders other than Documents and
-/// Desktop, in setup's existing root transaction: every other top-level folder there
-/// ([`wanted`]; [`spotlight_scope::INDEXED`] names what stays) joins the data volume's
-/// excluded folders.
+/// What the scope keeps, as a row says it.
+const KEPT_WORDS: &str = "Applications, Documents, Desktop and synced drives";
+
+/// Keep Spotlight to the owner's list, in setup's existing root transaction: Applications,
+/// Documents, Desktop and the synced drives stay indexed ([`spotlight_scope::kept`]), and every
+/// folder beside them ([`wanted`]: the console account's other home folders, its Library's other
+/// folders down the way to abrew's casks, the data volume's other top-level folders but /Users
+/// and /Volumes, and /Users//Shared) joins the data volume's excluded folders. An exclusion takes
+/// a whole subtree, so ~/Library itself is never one: its other children are, which leaves the
+/// synced drives under it indexed.
 /// Nothing of the person's is moved, renamed or marked, and what Spotlight already indexed of
 /// a folder is kept, so removing its entry makes it searchable again; the step adds a folder
-/// once and never again ([`SCOPE_RECEIPT`]).
+/// once and never again ([`SCOPE_RECEIPT`]). A folder made later beside the kept ones is
+/// indexed until the step next runs, which it asks no password for by itself: the next root
+/// transaction that runs for another reason, or the person's own setup, excludes it (a home's
+/// first scope, and the rest of the volume for a home scoped before it was part of the scope,
+/// do ask: [`automatic_scope_owed`]); one made inside an excluded
+/// folder is out by its subtree. Whole-volume indexing is no step of setup's: a volume found off
+/// is left off, and this step never runs `mdutil -i` (only the person's own [`Indexing`] does).
+/// A folder the person kept out ([`KeepOut`]) is neither on its receipt nor ever removed.
 ///
 /// The home is the console account's whoever's password runs the transaction, as its other
 /// steps are that account's (developer mode's group, the name rule): the root run is told of
-/// no other account.
+/// no other account. A home on another volume keeps its own folders: the data volume's
+/// configuration does not govern that volume's index; the data volume's folders are still
+/// left out.
 ///
 /// An ordinary account cannot do this: without root a `.metadata_never_index` file in an
 /// ordinary folder is not honoured, and only root reads the configuration. macOS reads the
@@ -322,7 +369,7 @@ impl Item for Scope {
         "spotlight"
     }
     fn title(&self) -> String {
-        "Spotlight leaves out the home folder's folders other than Documents and Desktop".into()
+        format!("Spotlight indexes {KEPT_WORDS} only")
     }
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
         if !sys.macos() {
@@ -340,11 +387,11 @@ impl Item for Scope {
                 now: "indexing disabled".into(),
             },
             Ok(Standing::Scoped(folders)) => Probe::Ok {
-                now: format!("setup has excluded each of {folders} home folders"),
+                now: format!("setup has excluded each of {folders} folders beside {KEPT_WORDS}"),
             },
-            Ok(Standing::Indexed(folders)) => Probe::Change {
-                from: format!("indexed: {}", folder_names(&folders)),
-                to: "excluded; Documents and Desktop stay indexed".into(),
+            Ok(Standing::Indexed { folders, .. }) => Probe::Change {
+                from: format!("indexed: {}", summary(&folders, &home)),
+                to: format!("excluded; {KEPT_WORDS} stay indexed"),
             },
             Err(why) => Probe::Unusable { why },
         }
@@ -385,6 +432,251 @@ impl Item for Scope {
              {KILLALL} -9 mds; setup does not add it again"
         ))
     }
+}
+
+// The person's own Spotlight steps (SD-96), each run alone from System Resources' Spotlight
+// document by `sudo aterm machines here apply --plain --only <step>` and never by setup:
+// `Indexing` pauses or resumes the data volume's indexing, `Rebuild` erases and rebuilds its
+// index, and `KeepOut` keeps one folder of theirs out. Setup's own `Scope` leaves a volume found
+// off as it is, and never removes an exclusion, so it neither lifts a pause nor takes a kept-out
+// folder back.
+
+/// `mdutil <step's arguments> /System/Volumes/Data` for `step`; `None` for a step that runs no
+/// `mdutil`.
+fn mdutil_cmd(step: aterm_types::macos_setup::root_only::Step) -> Option<Cmd> {
+    step.mdutil()
+        .map(|args| Cmd::new(MDUTIL).args(args.iter().copied()).arg(DATA_VOLUME))
+}
+
+/// The data volume's indexing turned off (`on: false`, the person's Pause indexing) or on
+/// (Resume indexing) with `mdutil -i`, read back by `mdutil -s`.
+pub(crate) struct Indexing {
+    pub(crate) on: bool,
+}
+
+impl Indexing {
+    const fn step(&self) -> aterm_types::macos_setup::root_only::Step {
+        use aterm_types::macos_setup::root_only::Step;
+        if self.on {
+            Step::SpotlightResume
+        } else {
+            Step::SpotlightPause
+        }
+    }
+
+    const fn word(on: bool) -> &'static str {
+        if on { "indexing on" } else { "indexing off" }
+    }
+}
+
+impl Item for Indexing {
+    fn id(&self) -> String {
+        format!("{ID}.{}", if self.on { "resume" } else { "pause" })
+    }
+    fn family(&self) -> &'static str {
+        self.step().family()
+    }
+    fn title(&self) -> String {
+        format!("Spotlight {} on the data volume", Self::word(self.on))
+    }
+    fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        if !sys.macos() {
+            return Probe::NotApplicable {
+                why: "Spotlight is macOS's".into(),
+            };
+        }
+        match spotlight_scope::indexing(&Port(sys)) {
+            Ok(on) if on == self.on => Probe::Ok {
+                now: Self::word(on).into(),
+            },
+            Ok(on) => Probe::Change {
+                from: Self::word(on).into(),
+                to: Self::word(self.on).into(),
+            },
+            Err(why) => Probe::Unusable { why },
+        }
+    }
+    fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        if sys.euid() != 0 {
+            return Err("only root turns Spotlight indexing off or on".into());
+        }
+        let cmd = mdutil_cmd(self.step()).ok_or("the step runs no mdutil")?;
+        ran_ok(sys, &cmd)
+    }
+    fn revert(&self) -> Option<String> {
+        Some(format!(
+            "sudo {MDUTIL} -i {} {DATA_VOLUME}",
+            if self.on { "off" } else { "on" }
+        ))
+    }
+}
+
+/// The data volume's index erased and rebuilt with `mdutil -E` (the person's Rebuild index…):
+/// indexing reads on before and after, so the rebuild is the item's refresh of a state that
+/// stands, journaled before it runs. A volume whose indexing is off has no index to rebuild.
+pub(crate) struct Rebuild;
+
+impl Item for Rebuild {
+    fn id(&self) -> String {
+        format!("{ID}.rebuild")
+    }
+    fn family(&self) -> &'static str {
+        aterm_types::macos_setup::root_only::Step::SpotlightRebuild.family()
+    }
+    fn title(&self) -> String {
+        "Spotlight's index of the data volume rebuilt".into()
+    }
+    fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        if !sys.macos() {
+            return Probe::NotApplicable {
+                why: "Spotlight is macOS's".into(),
+            };
+        }
+        match spotlight_scope::indexing(&Port(sys)) {
+            Ok(true) => Probe::Ok {
+                now: "indexing on".into(),
+            },
+            Ok(false) => Probe::Unusable {
+                why: "indexing is off on the data volume, so it has no index to rebuild".into(),
+            },
+            Err(why) => Probe::Unusable { why },
+        }
+    }
+    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        Err("a rebuild runs as the index's refresh".into())
+    }
+    fn refresh_guarded(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Option<Result<(), String>> {
+        Some(current().and_then(|()| {
+            if sys.euid() != 0 {
+                return Err("only root rebuilds Spotlight's index".into());
+            }
+            let cmd = mdutil_cmd(aterm_types::macos_setup::root_only::Step::SpotlightRebuild)
+                .ok_or("the step runs no mdutil")?;
+            ran_ok(sys, &cmd)
+        }))
+    }
+    fn refresh_changes(&self, _sys: &dyn System, _ctx: &Ctx) -> bool {
+        true
+    }
+}
+
+/// One folder the person chose kept out of Spotlight (Keep a folder out…): it joins the data
+/// volume's excluded folders by [`Scope::exclude`], the scope step's own checked edit, and
+/// [`spotlight_scope::YOURS`] records it as theirs. Setup's receipt never names it, and nothing
+/// removes an exclusion, so the scope step never takes it back. The folder is judged by its
+/// words alone against the console account's home ([`spotlight_scope::keep_out`]); nothing reads
+/// it, and a volume whose indexing is off still has it kept out, for when indexing is back on.
+pub(crate) struct KeepOut {
+    pub(crate) folder: PathBuf,
+}
+
+impl KeepOut {
+    /// The folder, judged against the console account's home and the person's other folders.
+    fn judged(&self, ctx: &Ctx, yours: &BTreeSet<PathBuf>) -> Result<PathBuf, String> {
+        let home = Scope::home(ctx).ok_or("no one is logged in at this Mac's console")?;
+        let others: BTreeSet<PathBuf> = yours
+            .iter()
+            .filter(|path| **path != self.folder)
+            .cloned()
+            .collect();
+        spotlight_scope::keep_out(&home, &others, &self.folder)
+    }
+}
+
+impl Item for KeepOut {
+    fn id(&self) -> String {
+        format!("{ID}.keep-out")
+    }
+    fn family(&self) -> &'static str {
+        aterm_types::macos_setup::root_only::Step::SpotlightKeepOut.family()
+    }
+    fn title(&self) -> String {
+        format!("{} kept out of Spotlight by you", self.folder.display())
+    }
+    fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
+        if !sys.macos() {
+            return Probe::NotApplicable {
+                why: "Spotlight is macOS's".into(),
+            };
+        }
+        let yours = match listed(sys, spotlight_scope::YOURS) {
+            Ok(yours) => yours,
+            Err(why) => return Probe::Unusable { why },
+        };
+        if let Err(why) = self.judged(ctx, &yours) {
+            return Probe::Unusable { why };
+        }
+        let out =
+            excluded(sys, Path::new(VOLUME_CONFIG)).is_ok_and(|now| now.contains(&self.folder));
+        if out && yours.contains(&self.folder) {
+            Probe::Ok {
+                now: "kept out by you".into(),
+            }
+        } else {
+            Probe::Change {
+                from: if out {
+                    "kept out, not recorded as yours".into()
+                } else {
+                    format!("indexed: {}", self.folder.display())
+                },
+                to: "kept out by you".into(),
+            }
+        }
+    }
+    /// Exclude the folder, then record it as the person's: a run cut short before the record
+    /// leaves the exclusion, and the next one only writes the record.
+    fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        if !sys.macos() {
+            return Err("Spotlight is macOS's".into());
+        }
+        if sys.euid() != 0 {
+            return Err("Spotlight's excluded folders are root's to change".into());
+        }
+        let mut yours = listed(sys, spotlight_scope::YOURS)?;
+        let folder = self.judged(ctx, &yours)?;
+        Scope::exclude(sys, &BTreeSet::from([folder.clone()]))?;
+        yours.insert(folder);
+        list(sys, spotlight_scope::YOURS, &yours)
+    }
+    fn revert(&self) -> Option<String> {
+        Some(format!(
+            "as root, remove {} from {EXCLUSIONS} in {VOLUME_CONFIG} and from {}, then {KILLALL} \
+             -9 mds",
+            self.folder.display(),
+            spotlight_scope::YOURS
+        ))
+    }
+}
+
+/// The items of the person's one Spotlight step `step` ([`HereBaseline::Only`]), `folder` being
+/// the one [`aterm_types::macos_setup::root_only::Step::SpotlightKeepOut`] keeps out.
+///
+/// [`HereBaseline::Only`]: crate::controller::commands::HereBaseline::Only
+///
+/// # Errors
+/// The step is no Spotlight step, or a keep-out names no folder.
+pub(crate) fn person_items(
+    step: aterm_types::macos_setup::root_only::Step,
+    folder: Option<&Path>,
+) -> Result<Vec<Box<dyn Item>>, String> {
+    use aterm_types::macos_setup::root_only::Step;
+    Ok(match step {
+        Step::SpotlightScope => vec![Box::new(Scope)],
+        Step::SpotlightPause => vec![Box::new(Indexing { on: false })],
+        Step::SpotlightResume => vec![Box::new(Indexing { on: true })],
+        Step::SpotlightRebuild => vec![Box::new(Rebuild)],
+        Step::SpotlightKeepOut => vec![Box::new(KeepOut {
+            folder: folder
+                .ok_or("a keep-out names its folder (--keep-out)")?
+                .to_path_buf(),
+        })],
+        Step::Power | Step::Updates => return Err(format!("{} is no Spotlight step", step.word())),
+    })
 }
 
 /// The rustup profile that installs no documentation.

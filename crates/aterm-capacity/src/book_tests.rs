@@ -728,6 +728,24 @@ fn a_test_build_refuses_a_wider_record_elsewhere_lighter_than_a_unit_of_its_crat
     assert_eq!(verify.unit_floor(&like), 5 * GIB);
     let n = need(&none, &own, Some((&verify, &like)), Some(48 * GIB));
     assert_eq!((n.bytes, &n.found), (cold, &None), "verify's analogue: {n}");
+
+    let reads = std::cell::Cell::new(0);
+    let lookup = |records: &Records| {
+        chain_with_unit_floor(&none, &own, Some((records, &like)), |source, key| {
+            reads.set(reads.get() + 1);
+            source.unit_floor(key)
+        })
+    };
+    let mut same_checkout = verify.clone();
+    same_checkout.push(key(TEST_COMPILE, "/new", &["a", "b"]), 2 * GIB, 4);
+    assert_eq!(
+        lookup(&same_checkout),
+        chain(&none, &own, Some((&same_checkout, &like)))
+    );
+    assert_eq!(reads.get(), 0, "same-checkout history answers first");
+    assert_eq!(lookup(&verify), None);
+    assert_eq!(reads.get(), 1, "the wider record elsewhere needs the floor");
+
     let plain = with(&[(key("targo test", "/far", &["a", "b"]), 2)]);
     let n = need(&plain, &own, Some((&verify, &like)), Some(48 * GIB));
     assert_eq!((n.bytes, &n.found), (cold, &None), "its own book's: {n}");

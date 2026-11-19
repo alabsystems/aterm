@@ -1339,6 +1339,123 @@ pub fn read_account_in_home(home: &Path) -> Option<Account> {
     Some(Account { email, plan })
 }
 
+/// What a Codex login file says of its credential, value-free (plan package SF-34): no field holds
+/// a token, a digest of one, a claim's text or an address, so neither can a print of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredCredential {
+    /// An API-key login (an `OPENAI_API_KEY` and no ChatGPT tokens), not an OAuth one.
+    pub api_key: bool,
+    /// It holds a refresh token, so the CLI renews its access token when that ends.
+    pub refreshable: bool,
+    /// Its `last_refresh` (Unix seconds).
+    pub refreshed_at: Option<i64>,
+    /// Its access token's `exp` claim (Unix seconds). The reader decodes the claims of the access
+    /// and id tokens' payloads (their addresses and users answer whose login it is) and keeps
+    /// only this time.
+    pub expires_at: Option<i64>,
+}
+
+/// The files a login in `home`, for the person whose home is `user_home`, is read from by
+/// [`stored_credential_in_home`], [`row_refusal`]'s journal and the credential context its word
+/// on record is scoped to (`current_context`): its `auth.json`, the refresh journal aterm keeps
+/// beside it, and the `config.toml` in `home` and in the person's own Codex home that name its
+/// credential store and usage route. A reader stamps them to know the facts may read otherwise;
+/// their contents are never looked at for that.
+#[must_use]
+pub fn credential_files_in_home(home: &Path, user_home: &Path) -> Vec<PathBuf> {
+    let mut files = vec![
+        auth_path_in_home(home),
+        beside_auth(home, JOURNAL_SUFFIX),
+        home.join("config.toml"),
+    ];
+    let user_config = user_home.join(".codex").join("config.toml");
+    if !files.contains(&user_config) {
+        files.push(user_config);
+    }
+    files
+}
+
+/// What `<home>/auth.json` says of its credential ([`StoredCredential`]), where it is the login
+/// of the account `expected_email` names, read from that file alone with no network, no refresh
+/// and no lock: `None` where it is absent or unreadable, its tokens name different users, its
+/// ChatGPT tokens name another account than `expected_email` (or name no address while one is
+/// expected, as [`refusal_standing`] reads a login), or it holds neither ChatGPT tokens nor an API
+/// key. An API key names no account, so its login is read whoever it is. The file's bytes and its
+/// parsed tree are scrubbed before it returns, and no token is copied out of them: the tokens are
+/// read in place, and of their claims only the access token's `exp` is kept.
+#[must_use]
+pub fn stored_credential_in_home(
+    home: &Path,
+    expected_email: Option<&str>,
+) -> Option<StoredCredential> {
+    let bytes = aterm_uds::secret::Secret::from_vec(read_auth_file_bounded(home)?.into_bytes());
+    let doc: Value = aterm_json::from_slice(bytes.expose()).ok()?;
+    let read = stored_credential_of(&doc, expected_email);
+    super::cli::shared_provider::wipe_json(doc);
+    read
+}
+
+/// [`stored_credential_in_home`] of the parsed login file `doc`, its strings only borrowed.
+fn stored_credential_of(doc: &Value, expected_email: Option<&str>) -> Option<StoredCredential> {
+    fn text(value: Option<&Value>) -> Option<&str> {
+        value.and_then(Value::as_str).filter(|s| !s.is_empty())
+    }
+    let chatgpt = doc
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .is_none_or(|mode| mode == "chatgpt" || mode == "chatgptAuthTokens");
+    let tokens = doc.get("tokens").and_then(Value::as_object);
+    let Some(access) = tokens
+        .and_then(|tokens| text(tokens.get("access_token")))
+        .filter(|_| chatgpt)
+    else {
+        return text(doc.get("OPENAI_API_KEY")).map(|_| StoredCredential {
+            api_key: true,
+            refreshable: false,
+            refreshed_at: None,
+            expires_at: None,
+        });
+    };
+    let id_claims = tokens
+        .and_then(|tokens| text(tokens.get("id_token")))
+        .and_then(parse_jwt_claims);
+    let access_claims = parse_jwt_claims(access);
+    if token_user_claims(id_claims.as_ref(), access_claims.as_ref()) == TokenUser::Conflicting
+        || !claims_name(id_claims.as_ref(), access_claims.as_ref(), expected_email)
+    {
+        return None;
+    }
+    Some(StoredCredential {
+        api_key: false,
+        refreshable: tokens
+            .and_then(|tokens| text(tokens.get("refresh_token")))
+            .is_some(),
+        refreshed_at: doc
+            .get("last_refresh")
+            .and_then(Value::as_str)
+            .and_then(aterm_types::rfc3339::parse_utc_fractional),
+        expires_at: access_claims.and_then(|claims| claims.exp),
+    })
+}
+
+/// Whether the claims of a login's id and access tokens name the account `expected` names, as a
+/// read of whose login it is takes them ([`refusal_standing`]): with none expected, any; else the
+/// address the id token names (the access token's where it names none) answers to it and so does
+/// every address either names. Claims that name no address name no expected account.
+fn claims_name(id: Option<&JwtClaims>, access: Option<&JwtClaims>, expected: Option<&str>) -> bool {
+    expected.is_none_or(|expected| {
+        let preferred = id
+            .and_then(|claims| claims.email.as_deref())
+            .or_else(|| access.and_then(|claims| claims.email.as_deref()));
+        preferred.is_some_and(|email| super::accounts::email_matches(expected, email))
+            && [id, access]
+                .into_iter()
+                .flatten()
+                .filter_map(|claims| claims.email.as_deref())
+                .all(|email| super::accounts::email_matches(expected, email))
+    })
+}
+
 fn preferred_email(stored: &StoredAuth) -> Option<&str> {
     stored
         .id_claims

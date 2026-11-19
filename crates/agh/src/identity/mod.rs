@@ -121,21 +121,22 @@ impl VaultEntry {
 }
 
 /// The value of vault entry `name` from the verified store under `home`, read in place
-/// (`aterm_secrets::client::read_in_place`): `Ok(None)` when this Mac has no vault or the vault
-/// holds no such entry. Off unix there is no store, so there is no entry.
+/// (`aterm_secrets::client::read_in_place`): `Ok(None)` when this host has no vault or the vault
+/// holds no such entry. The store is read on Unix and Windows, where the vault client builds;
+/// elsewhere there is no store, so there is no entry.
 ///
 /// # Errors
 /// The store cannot be read (the entry name is invalid, or local state cannot be parsed); the
 /// text names no value.
 pub fn vault_value(home: &Path, name: &str) -> Result<Option<Secret>, String> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let paths = aterm_secrets::client::Paths::locate_for_home(home);
         aterm_secrets::client::read_in_place(&paths, name)
             .map(|value| value.map(|bytes| Secret::new(bytes.as_slice())))
             .map_err(|e| e.to_string())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (home, name);
         Ok(None)
@@ -250,7 +251,7 @@ impl Profile {
 
     /// Set whether `legacy_loose` is honoured: `config::load_for_host` and
     /// `provision::add_with` (WP8) are its two callers.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn set_legacy_loose(&mut self, on: bool) {
         self.legacy_loose = on;
     }
@@ -392,7 +393,7 @@ pub enum LoadError {
     Unsupported(&'static str),
     /// The file could not be read.
     Io(String),
-    /// File credentials on a platform without unix permission checks.
+    /// File credentials on a platform without private files (neither unix nor windows).
     Unavailable(&'static str),
 }
 
@@ -504,8 +505,23 @@ fn token_link_remedy(file: &Path, home: &Path) -> String {
     }
 }
 
-/// Off unix no token file is read, so none is a link of a directory.
-#[cfg(not(unix))]
+/// The Symlink remedy for the token file `file` on windows, where `read_private` refuses a
+/// reparse point at the file or its folder, a junction as a symbolic link: agh.toml's words.
+#[cfg(windows)]
+fn token_link_remedy(file: &Path, home: &Path) -> String {
+    match file.parent() {
+        Some(dir) => format!(
+            "{} or its folder {} is a link or a junction: replace it with what it names",
+            tilde(file, home),
+            tilde(dir, home)
+        ),
+        None => FILE_LINK.to_string(),
+    }
+}
+
+/// On a host with no private files (neither unix nor windows) no token file is read, so none
+/// is a link of a directory.
+#[cfg(not(any(unix, windows)))]
 fn token_link_remedy(file: &Path, home: &Path) -> String {
     let _ = (file, home);
     FILE_LINK.to_string()
@@ -829,8 +845,24 @@ pub(crate) fn private_fix(dir: &Path, file: &Path, home: &Path, held: Held<'_>) 
     }
 }
 
-/// Off unix no token file is read, so no file is loose.
-#[cfg(not(unix))]
+/// The Loose remedy on windows, where a file is private by its access list and no chmod
+/// applies: agh.toml's words, for the token file and its folder.
+#[cfg(windows)]
+fn loose_remedy(profile: &Profile, home: &Path) -> Option<String> {
+    let Source::File(file) = &profile.source else {
+        return None;
+    };
+    Some(format!(
+        "make {} and its folder {} yours alone (a protected access list of you and SYSTEM, as \
+         agh gives what it makes)",
+        tilde(file, home),
+        tilde(file.parent()?, home)
+    ))
+}
+
+/// On a host with no private files (neither unix nor windows) no token file is read, so no
+/// file is loose.
+#[cfg(not(any(unix, windows)))]
 fn loose_remedy(profile: &Profile, home: &Path) -> Option<String> {
     let _ = (profile, home);
     None
@@ -870,14 +902,14 @@ pub(crate) fn load(profile: &Profile) -> Result<Credential, LoadError> {
 /// a file's bytes are. No file is opened, so there is no `file_id` and no mode to judge; a store
 /// that cannot be read is `Io`, and a store with no such entry `Missing`.
 fn load_entry(profile: &Profile, entry: &VaultEntry) -> Result<Credential, LoadError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (profile, entry);
         Err(LoadError::Unavailable(
-            "vault entries need this Mac's secret store, which is unix only",
+            "vault entries need this host's secret store, which builds on unix and windows only",
         ))
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         match vault_value(&entry.home, &entry.name) {
             Ok(Some(value)) => credential_from(profile, value.expose(), None),
@@ -951,18 +983,47 @@ fn load_loose_file(profile: &Profile, path: &Path) -> Result<Credential, LoadErr
     loaded
 }
 
-/// Off unix no token file is read, loose or not.
+/// Off unix there is no group or other read bit for `legacy_loose` to let through: a file
+/// source is read by the strict rules alone.
 #[cfg(not(unix))]
 fn load_loose_file(profile: &Profile, path: &Path) -> Result<Credential, LoadError> {
     load_file(profile, path)
 }
 
-/// A file source, off unix: no permission check, so no file credential.
-#[cfg(not(unix))]
+/// A file source, on windows: `read_private`, whose rule there is a file of the user's under a
+/// protected access list of the user and SYSTEM alone, with one name and no reparse point, in a
+/// folder kept so; the bytes read are scrubbed whatever the outcome. Std reads no file id off a
+/// handle there, so there is no `file_id`.
+#[cfg(windows)]
+fn load_file(profile: &Profile, path: &Path) -> Result<Credential, LoadError> {
+    use aterm_uds::private_file::{PrivateFileError, read_private};
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    let name = path.file_name().and_then(std::ffi::OsStr::to_str);
+    let (Some(dir), Some(name)) = (dir, name) else {
+        return Err(LoadError::Malformed(NO_DIRECTORY));
+    };
+    match read_private(dir, name, crate::config::TOKEN_MAX) {
+        Ok(mut bytes) => {
+            let loaded = credential_from(profile, &bytes, None);
+            aterm_uds::secret::scrub(&mut bytes);
+            loaded
+        }
+        Err(PrivateFileError::Missing) => Err(LoadError::Missing),
+        Err(PrivateFileError::NotPrivate(why)) => Err(LoadError::Loose(why.to_string())),
+        Err(PrivateFileError::Writable(writable)) => Err(LoadError::Loose(writable.to_string())),
+        Err(PrivateFileError::Symlink) => Err(LoadError::Symlink),
+        Err(PrivateFileError::Malformed(why)) => Err(LoadError::Malformed(why)),
+        Err(PrivateFileError::Io(e)) => Err(LoadError::Io(e.to_string())),
+    }
+}
+
+/// A file source on a host with no private files (neither unix nor windows): no permission
+/// check, so no file credential.
+#[cfg(not(any(unix, windows)))]
 fn load_file(profile: &Profile, path: &Path) -> Result<Credential, LoadError> {
     let _ = (profile, path);
     Err(LoadError::Unavailable(
-        "file credentials need unix permission checks",
+        "file credentials need private files, which agh has on unix and windows only",
     ))
 }
 

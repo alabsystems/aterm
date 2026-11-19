@@ -25,7 +25,7 @@ use crate::instance::{take_flag, take_value};
 use crate::mac::{NOT_RUN, PERSON_HELPER, POLL, ROW, STEP, Vm, not_run};
 use crate::mac_nux_guest::{
     APPLE_DEVTOOLS_DIALOG, Add, DEVTOOLS_CANCEL, DEVTOOLS_GOTO, DEVTOOLS_OPEN, DevtoolsActs,
-    HidProof, Presses, Procs, ReopenPresses, STALL_MS, Stall, Typed, Waited, Went, acts,
+    HidProof, Presses, Procs, ReopenPresses, STALL_MS, SetupEnd, Stall, Typed, Waited, Went, acts,
     apple_devtools_dialogs, click_latencies, completed_at, devtools_acts, dialogs, first_session,
     hid_proof, last_record, read_census, read_person, read_procs, read_reader, read_record,
     read_watch, reopen_presses, runs, session_programs, setup_field, shell_session, stage_name,
@@ -60,6 +60,8 @@ pub const USAGE: &str = "\
                 setup's one Mac password shows as a prompt nobody answers (the image's own rule needs none).
                 --no-clt: a base with the Command Line Tools removed (xcode-select -p fails); --vanilla:
                 REF's cirruslabs -vanilla image (NOT RUN when it must be pulled with under 71 GB free).
+                --keep retains each stopped guest and any failed preparation clone, and preserves
+                existing prepared bases.
                 --record also retains a built-here app's exact zip and private provenance receipt beside
                 FILE before a guest starts; an unavailable archive is recorded without stopping the run.
                 --repeat N: each row N times, each in its own clone. Every row also reads the dialog census
@@ -102,10 +104,10 @@ pub const USAGE: &str = "\
                                    (each row fails on that dialog): with no aterm on a --no-clt guest,
                                    /usr/bin/git runs and the census must list Apple's install dialog
                                    within a minute, else this row fails (NOT RUN with the tools there)
-                  first-launch     the app opened, then watched until the guest's own aterm ctl status says
-                                   setup=done (the progress record's completion on a build without the
-                                   field), or until setup stood still a minute with no new press by the
-                                   person and no app process starting or going: git and /usr/bin/git
+                  first-launch     the app opened, then watched until the guest reports setup done, a
+                                   saved read-back, a vault request off its LAN, or a completed legacy
+                                   record. The watch also stops after a minute with no new press, setup
+                                   change or app process starting or going. git and /usr/bin/git are
                                    typed in the first tab at its prompt and git again after the wait,
                                    the presses setup= waited on (the row fails on one aterm could have
                                    made, or names a Local Network step: target none) and the grants on
@@ -3055,12 +3057,41 @@ pub fn lab_join_verdict(said: &str) -> Result<String, String> {
     }
 }
 
-/// Wait for setup: until `setup=done` (the record's completion on a build without the field),
-/// until it stood still for [`STALL_MS`] with nothing new from the person or in the app's
-/// processes either (the one-minute no-progress hang detector, [`setup_reading`]), or until
-/// [`WATCH`]; its cell under `label` counts from `from_ms` (ms before the wait began). The time
-/// it ended, in ms after `from_ms`, once done.
-fn wait_setup(g: &Guest, row: &mut Row, label: &str, from_ms: u64) -> Result<Option<u64>, Fail> {
+/// The report label, frame key and captured observation for each reason the watch can end.
+fn setup_end_labels(end: SetupEnd) -> (&'static str, &'static str, &'static str) {
+    match end {
+        SetupEnd::Done => (
+            "setup done",
+            "setup-done",
+            "aterm ctl status said setup=done",
+        ),
+        SetupEnd::ReadBack => (
+            "setup last read back",
+            "setup-read-back",
+            "aterm ctl status reported the last verified setup reading",
+        ),
+        SetupEnd::VaultOffLan => (
+            "setup asking for its vault off LAN",
+            "setup-vault-off-lan",
+            "aterm ctl status reported an unanswered vault request off its LAN",
+        ),
+        SetupEnd::RecordCompleted => (
+            "setup record completed without status",
+            "setup-record-completed",
+            "the setup progress record said completed without a setup status reading",
+        ),
+    }
+}
+
+/// Watch until setup's reportable end, until it stood still for [`STALL_MS`] with nothing new
+/// from the person or in the app's processes, or until [`WATCH`]. Record the observation under
+/// `label` and return its time including the offset `from_ms` before the wait began.
+fn wait_setup(
+    g: &Guest,
+    row: &mut Row,
+    label: &str,
+    from_ms: u64,
+) -> Result<Option<(u64, SetupEnd)>, Fail> {
     let mut stall = Stall::new(STALL_MS);
     let started = Instant::now();
     loop {
@@ -3069,9 +3100,9 @@ fn wait_setup(g: &Guest, row: &mut Row, label: &str, from_ms: u64) -> Result<Opt
         let now = millis(started.elapsed());
         let at = from_ms + now;
         match stall.see(now, &reading) {
-            Waited::Done => {
-                row.cell(format!("{label}setup done"), Value::Ms(at));
-                return Ok(Some(at));
+            Waited::Ended(end) => {
+                row.cell(format!("{label}{}", setup_end_labels(end).0), Value::Ms(at));
+                return Ok(Some((at, end)));
             }
             Waited::Stalled { stood, since_ms } => {
                 row.cell(
@@ -3748,7 +3779,7 @@ fn guest(
     let zip = format!("{}/aterm.zip", crate::mac::GUEST_SHARE);
     let (app, standard) = if ask.standard_user {
         vm.sh(&standard_user_setup(&zip), STEP)?;
-        vm.stop();
+        vm.stop()?;
         vm.boot()?;
         let who = vm.sh("id -un", STEP)?;
         if who.trim() != STANDARD_USER {
@@ -4457,8 +4488,8 @@ fn launch_repairs(g: &Guest, row: &mut Row) -> Result<(), Fail> {
 }
 
 /// `first-launch`: the app opened by a person (with `--person`, one at the console), then
-/// watched until setup is done or stood still a minute with nothing new from the person or in the
-/// app's processes ([`wait_setup`]), the window captured at each milestone ([`capture`]).
+/// watched to an observed setup outcome or a minute without progress ([`wait_setup`]), with the
+/// window captured at each milestone ([`capture`]).
 fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     g.sh(PROMPT_MARKER, STEP)?;
     let around = Around::take(g)?;
@@ -4491,16 +4522,24 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     // Apple's stub (`aterm_types::clt_shim`), which only a guest without the tools can show.
     tab_git(g, row, "/usr/bin/git", "at the first prompt")?;
     let waited_from = g.clock_ms()?.saturating_sub(open_ms);
-    let done = wait_setup(g, row, "", waited_from)?;
-    match done {
-        Some(_) => captures.now(g, "setup-done", "aterm ctl status said setup=done"),
+    let setup_end = wait_setup(g, row, "", waited_from)?;
+    match setup_end {
+        Some((_, end)) => {
+            let (_, frame, why) = setup_end_labels(end);
+            captures.now(g, frame, why);
+        }
         None => captures.now(g, "end", "the wait on setup ended before setup=done"),
     }
-    presses_cells(row, &g.presses.borrow(), ask.person);
     tab_git(g, row, "git", "once setup's wait ended")?;
     fleet_member_cells(g, row)?;
-    let (elevated, broker) = elevation_cells(g, ask, row, open_ms, broker_before.as_ref())?;
-    lan::broker_cells(g, row, &broker, elevated)?;
+    let elevation = elevation_cells(g, ask, row, open_ms, broker_before.as_ref())?;
+    presses_cells(
+        row,
+        &g.presses.borrow(),
+        ask.person,
+        elevation.awaiting_password,
+    );
+    lan::broker_cells(g, row, &elevation.broker, elevation.ran)?;
     // Before the reads below: the ~/Desktop control's own consent dialog is no milestone.
     captures.stop(g);
     reopen_cells(g, ask, row, open_ms)?;
@@ -4584,7 +4623,7 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
             ),
         );
     }
-    if done.is_none() {
+    if setup_end.is_none() {
         // What the app said while setup did not finish, whole, for the run's record: the cause
         // of a launch that never starts setup is in it (the admin first-launch gap, SCR-1).
         let lines: Vec<&str> = log.lines().collect();
@@ -4596,7 +4635,9 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     }
     let launch = read_launch(&log, open_ms);
     // A line the watch never saw is the app's silence over it, said with the watch's length.
-    let watched = done.unwrap_or_else(|| g.clock_ms().unwrap_or(open_ms).saturating_sub(open_ms));
+    let watched = setup_end
+        .map(|(at, _)| at)
+        .unwrap_or_else(|| g.clock_ms().unwrap_or(open_ms).saturating_sub(open_ms));
     let within = format!("in the {} s watched", watched / 1000);
     row.cell(
         "first log line",
@@ -4769,6 +4810,36 @@ pub struct Elevations {
     pub asks: Vec<(u64, u32)>,
     /// `(first seen, epoch s; pid)` of each root half running as root.
     pub root_runs: Vec<(u64, u32)>,
+}
+
+impl Elevations {
+    /// The one observed sudo that could still own the prompt. Re-read its PID before using it:
+    /// the text can remain in a tab after sudo exits.
+    fn pending_password_pid(&self, password: bool, on_screen: usize) -> Option<u32> {
+        match self.asks.as_slice() {
+            [(_, pid)] if *pid != 0 && password && on_screen == 1 && self.root_runs.is_empty() => {
+                Some(*pid)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A live sudo of this guest app's shared setup transaction, using the two shapes the
+/// first-launch plan can run before admission supplies a name.
+fn setup_password_command(command: &str, aterm: &str) -> bool {
+    let Some(args) = command
+        .trim()
+        .strip_prefix("/usr/bin/sudo -k -p ")
+        .and_then(|s| s.strip_prefix(aterm_types::macos_setup::MAC_SETUP_PASSWORD_PROMPT))
+        .and_then(|s| s.trim_start().strip_prefix(aterm))
+    else {
+        return false;
+    };
+    matches!(
+        args,
+        " machines here apply --plain" | " machines here apply --plain --root-steps-only"
+    )
 }
 
 /// [`Elevations`] over the watch's lines ([`watch_elevations`]): the watch's own shell (whose
@@ -4951,6 +5022,12 @@ fn finish_elevations(
     ))
 }
 
+struct SetupElevation {
+    ran: bool,
+    awaiting_password: bool,
+    broker: String,
+}
+
 /// What setup's one early elevation asked and did (`docs/DESIGN-init-on-by-default-2026-10-25.md`):
 /// how many times it asked for the Mac password (the row fails on more
 /// than one), whether the account's sudo asks one at all (the image's administrator's asks none,
@@ -4965,7 +5042,7 @@ fn elevation_cells(
     row: &mut Row,
     open_ms: u64,
     before: Option<&lan::Daemon>,
-) -> Result<(bool, String), Fail> {
+) -> Result<SetupElevation, Fail> {
     let (seen, _, print) = finish_elevations(g, before, "setup")?;
     row.cell(
         "setup's Mac password asks (target 1)",
@@ -4998,14 +5075,31 @@ fn elevation_cells(
     );
     let ls = g.run(&format!("{} ctl ls 2>/dev/null", g.aterm), STEP)?;
     let mut on_screen = 0;
+    let mut setup_prompt_on_screen = false;
     for (sid, _) in session_programs(&ls) {
         let text = g.run(&format!("{} ctl @{sid} text trim 2>&1", g.aterm), STEP)?;
-        on_screen += text.lines().filter(|l| l.contains("Mac password:")).count();
+        let prompt = aterm_types::macos_setup::MAC_SETUP_PASSWORD_PROMPT.trim_end();
+        on_screen += text.lines().filter(|l| l.contains(prompt)).count();
+        setup_prompt_on_screen |= mac_setup_prompt::shown(&text);
     }
     row.cell(
         "Mac password prompts on screen at the end",
         Value::Count(on_screen as u64),
     );
+    let password_is_owed = password && !ask.standard_user && setup_prompt_on_screen;
+    let awaiting_password =
+        if let Some(pid) = seen.pending_password_pid(password_is_owed, on_screen) {
+            let command = g.sh(&format!("/bin/ps -ww -p {pid} -o command= || true"), STEP)?;
+            setup_password_command(&command, &g.aterm)
+        } else {
+            false
+        };
+    if awaiting_password {
+        row.cell(
+            "root work",
+            Value::Text("waiting at the live Mac Setup password prompt".into()),
+        );
+    }
     let developer = g.sh(
         "/usr/sbin/DevToolsSecurity -status 2>&1; \
          /usr/sbin/dseditgroup -o checkmember -m \"$(id -un)\" _developer 2>&1",
@@ -5087,7 +5181,11 @@ fn elevation_cells(
             squeeze(&keeper, 80)
         ));
     }
-    Ok((!seen.root_runs.is_empty(), print))
+    Ok(SetupElevation {
+        ran: !seen.root_runs.is_empty(),
+        awaiting_password,
+        broker: print,
+    })
 }
 
 /// Direct ordinary-user enforcement: no root wrapper, prompt or cached credential may
@@ -5694,7 +5792,7 @@ fn tab_git(g: &Guest, row: &mut Row, git: &str, label: &str) -> Result<(), Fail>
 /// asked for macOS's batch); the macOS grants on offer are no press and are listed beside it. The
 /// row fails too on a Local Network step in System State ([`Presses::local_network_step`]):
 /// aterm's own LAN use goes through the LAN broker, which macOS never asks about.
-fn presses_cells(row: &mut Row, presses: &Presses, person: bool) {
+fn presses_cells(row: &mut Row, presses: &Presses, person: bool, awaiting_setup_password: bool) {
     let step = presses.local_network_step();
     row.cell(
         "System State's Local Network step (target none)",
@@ -5711,7 +5809,7 @@ fn presses_cells(row: &mut Row, presses: &Presses, person: bool) {
                 .to_owned(),
         );
     }
-    let avoidable = presses.avoidable(person);
+    let avoidable = presses.avoidable(person, awaiting_setup_password);
     row.cell(
         "presses aterm could have made (target 0)",
         if avoidable.is_empty() {
@@ -7284,6 +7382,17 @@ exit "$collector_status""#,
     }
 }
 
+enum RowRunError {
+    Work(Fail),
+    Retirement { fail: Fail, row: Box<Row> },
+}
+
+impl From<Fail> for RowRunError {
+    fn from(fail: Fail) -> Self {
+        Self::Work(fail)
+    }
+}
+
 fn run_row(
     tart: &str,
     base: &str,
@@ -7291,12 +7400,12 @@ fn run_row(
     share: &Path,
     ask: &Ask,
     scenario: Scenario,
-) -> Result<Row, Fail> {
+) -> Result<Row, RowRunError> {
     if let Some(why) = scenario.not_run() {
-        return Err(not_run(why.to_owned()));
+        return Err(not_run(why.to_owned()).into());
     }
     let mut row = Row::new(scenario);
-    let g = guest(tart, base, run, share, ask, scenario, &mut row)?;
+    let mut g = guest(tart, base, run, share, ask, scenario, &mut row)?;
     let watchers = Watchers::start(&g)?;
     // A first launch times its readings from the app's open; every other row from its start, so
     // an alert any row raises is read by its words, not only its window's owner.
@@ -7330,15 +7439,35 @@ fn run_row(
         Ok(None) => {}
         Err(why) => row.cell("private raw evidence", Value::Missing(why)),
     }
-    drop(g);
-    // Each step's refusal is folded into the row, which keeps its cells and any guard failure.
+    let mut stopped = None;
+    // Preserve all already observed work outcomes before considering a retirement failure.
     for step in [body, read, watched, guarded, kept] {
         if let Err(fail) = step {
             if fail.stopped.is_some() {
-                return Err(fail);
+                if stopped.is_none() {
+                    stopped = Some(fail);
+                }
+            } else {
+                row.refuse(&fail);
             }
-            row.refuse(&fail);
         }
+    }
+    if let Err(retirement) = g.vm.finish() {
+        row.refuse(&retirement);
+        let fail = match stopped {
+            Some(work) => {
+                crate::mac::after_vm_cleanup::<()>(Err(work), || Err(retirement)).unwrap_err()
+            }
+            None => retirement,
+        };
+        return Err(RowRunError::Retirement {
+            fail,
+            row: Box::new(row),
+        });
+    }
+    drop(g);
+    if let Some(fail) = stopped {
+        return Err(fail.into());
     }
     Ok(row)
 }
@@ -7569,6 +7698,7 @@ pub fn cmd_nux(args: &[String]) -> Res {
         person: (ask.person || ask.reader || reads_tree).then(|| GUEST_HELPER.to_owned()),
         lan_allow: runnable.contains(&Scenario::LanAllowed),
         shape: None,
+        keep: ask.keep,
     };
     let tart = crate::mac::tart_to_run()?;
     pull_room(&tart, &ask.image, &crate::mac::prep_name(&ask.image, &prep))?;
@@ -7580,6 +7710,7 @@ pub fn cmd_nux(args: &[String]) -> Res {
         .suffix(".noindex")
         .tempdir_in(&runs)
         .map_err(|e| format!("{}: {e}", runs.display()))?;
+    let mut run_guard = crate::mac::VmScratch::new(run_guard, &runs.join("vm-lifecycle.noindex"))?;
     let run = run_guard.path();
     let share = run.join("share");
     std::fs::create_dir(&share).map_err(|e| format!("{}: {e}", share.display()))?;
@@ -7623,8 +7754,17 @@ pub fn cmd_nux(args: &[String]) -> Res {
             );
             let row = match run_row(&tart, &base, run, &share, &ask, scenario) {
                 Ok(row) => row,
-                Err(fail) if fail.stopped.is_some() => return Err(fail),
-                Err(fail) => Row::refused(scenario, &fail),
+                Err(RowRunError::Retirement { fail, row }) => {
+                    rows.push(*row);
+                    if let Err(record) =
+                        finish_nux(&ask, "### lab mac nux — VM retirement incomplete", &rows)
+                    {
+                        eprintln!("mac nux: could not publish partial rows: {:?}", record.msg);
+                    }
+                    return Err(fail);
+                }
+                Err(RowRunError::Work(fail)) if fail.stopped.is_some() => return Err(fail),
+                Err(RowRunError::Work(fail)) => Row::refused(scenario, &fail),
             };
             println!("{}", table("", std::slice::from_ref(&row)).trim());
             rows.push(row);
@@ -7666,7 +7806,11 @@ pub fn cmd_nux(args: &[String]) -> Res {
             |a| format!("{} {} ({})", a.id, a.version, a.how)
         ),
     );
-    finish_nux(&ask, &head, &rows)
+    let result = finish_nux(&ask, &head, &rows);
+    if result.is_ok() {
+        run_guard.discard_after_finish();
+    }
+    result
 }
 
 /// Publish the same table, record and exit classification even when no guest can run.
@@ -7697,6 +7841,9 @@ mod debug_successor;
 
 #[path = "mac_nux_lan.rs"]
 mod lan;
+
+#[path = "guest/mac_setup_prompt.rs"]
+mod mac_setup_prompt;
 
 #[path = "mac_nux_phrase.rs"]
 mod phrase;

@@ -6272,3 +6272,344 @@ fn initial_manifest_readings_preserve_frontend_grammar() {
         );
     }
 }
+
+#[test]
+fn raw_build_dir_hints_keep_selected_templates_and_path_bases() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("project");
+    let file = home.join("configs/nested/choices.toml");
+    for source in ["config", "environment", "cli", "file"] {
+        for value in [
+            "{workspace-root}/build.noindex/{workspace-path-hash}",
+            "{cargo-cache-home}/build.noindex/{workspace-path-hash}",
+            "build.noindex/{workspace-root}/slot",
+            "/cache.noindex{workspace-root}/slot",
+            "build.noindex/{workspace-path-hash}",
+            "plain",
+        ] {
+            let read = |path: &Path| {
+                Ok(
+                    if (source == "config" && path == cwd.join(".cargo/config.toml"))
+                        || (source == "file" && path == file)
+                    {
+                        Some(format!("build.build-dir='{value}'"))
+                    } else if path == cwd.join("Cargo.toml") {
+                        Some("[workspace]".into())
+                    } else {
+                        None
+                    },
+                )
+            };
+            let env = |name: &str| {
+                (source == "environment" && name == BUILD_DIR_ENV).then(|| value.into())
+            };
+            let machine = Machine {
+                home: Some(&home),
+                root: None,
+                cwd: Some(&cwd),
+                env: &env,
+                read: &read,
+                read_manifest: &read,
+                writable: &|_| Some(true),
+            };
+            let mut args = ["--unverified", "build", "--target-dir", "chosen"]
+                .map(str::to_owned)
+                .to_vec();
+            if source == "cli" {
+                args.extend(["--config".into(), format!("build.build-dir='{value}'")]);
+            } else if source == "file" {
+                args.extend(["--config".into(), file.display().to_string()]);
+            }
+            let selected =
+                selected_build_dir_hint(&args, Tool::Targo, &machine, &|_| UserAlias::None)
+                    .expect("resolved build-directory choice")
+                    .expect(value);
+            let base = if source == "file" {
+                file.parent().unwrap().parent().unwrap()
+            } else {
+                cwd.as_path()
+            };
+            let expected = if value.starts_with("{workspace-root}")
+                || value.starts_with("{cargo-cache-home}")
+                || Path::new(value).is_absolute()
+            {
+                PathBuf::from(value)
+            } else {
+                base.join(value)
+            };
+            assert_eq!(selected.value, expected, "{source}: {value}");
+            assert_eq!(selected.manifests, Some(vec![cwd.join("Cargo.toml")]));
+            assert_eq!(
+                selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).is_some(),
+                !value.contains('{'),
+                "only the hint reader accepts Cargo templates: {source}: {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_build_dir_hints_share_alias_and_config_precedence() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("project");
+    let alias = |name: &str| match name {
+        "before" => UserAlias::Words(
+            [
+                "--config",
+                "build.build-dir='alias.noindex/{workspace-path-hash}'",
+                "build",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        ),
+        "after" => UserAlias::Words(
+            [
+                "build",
+                "--config",
+                "build.build-dir='alias.noindex/{workspace-path-hash}'",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        ),
+        _ => UserAlias::None,
+    };
+    for (words, environment, configured, expected) in [
+        (
+            "--unverified build --config build.build-dir='cli.noindex/{workspace-path-hash}'",
+            true,
+            "config.noindex/{workspace-path-hash}",
+            "cli.noindex/{workspace-path-hash}",
+        ),
+        (
+            "--unverified before --config net.offline=true",
+            false,
+            "config.noindex/{workspace-path-hash}",
+            "config.noindex/{workspace-path-hash}",
+        ),
+        (
+            "--unverified before",
+            false,
+            "config.noindex/{workspace-path-hash}",
+            "alias.noindex/{workspace-path-hash}",
+        ),
+        (
+            "--unverified after --config net.offline=true",
+            false,
+            "config.noindex/{workspace-path-hash}",
+            "alias.noindex/{workspace-path-hash}",
+        ),
+        (
+            "--unverified run -- --config build.build-dir='program.noindex/{workspace-path-hash}'",
+            true,
+            "{unknown}",
+            "env.noindex/{workspace-path-hash}",
+        ),
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == cwd.join(".cargo/config.toml") {
+                Some(format!("build.build-dir='{configured}'"))
+            } else if path == cwd.join("Cargo.toml") {
+                Some("[workspace]".into())
+            } else {
+                None
+            })
+        };
+        let env = |name: &str| {
+            (environment && name == BUILD_DIR_ENV)
+                .then(|| "env.noindex/{workspace-path-hash}".into())
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args = words
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let selected = selected_build_dir_hint(&args, Tool::Targo, &machine, &alias)
+            .unwrap_or_else(|error| panic!("{words}: {error}"))
+            .unwrap_or_else(|| panic!("{words}"));
+        assert_eq!(selected.value, cwd.join(expected), "{words}");
+    }
+}
+
+#[test]
+fn raw_build_dir_hints_observe_foreign_paths_without_granting_custody() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = PathBuf::from(native("/foreign/project"));
+    let machine = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &|name| (name == BUILD_DIR_ENV).then(|| "build.noindex/{workspace-path-hash}".into()),
+        read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
+        writable: &|_| Some(true),
+    };
+    let args = ["--unverified", "build"].map(str::to_owned);
+    let selected = selected_build_dir_hint(&args, Tool::Targo, &machine, &|_| UserAlias::None)
+        .expect("the command is resolved")
+        .expect("a foreign producer still selects its intermediate directory");
+    assert_eq!(
+        selected.value,
+        cwd.join("build.noindex/{workspace-path-hash}")
+    );
+    assert_eq!(selected.manifests, None);
+    assert!(selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).is_none());
+    for words in ["--unverified build --help", "--unverified clean"] {
+        let args = words
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(
+                selected_build_dir_hint(&args, Tool::Targo, &machine, &|_| UserAlias::None),
+                Ok(None)
+            ),
+            "{words}"
+        );
+    }
+}
+
+#[test]
+fn raw_build_dir_hints_refuse_unresolved_explicit_frontend_choices() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("project");
+    for (tool, words) in [
+        (Tool::Targo, "trust check --target-dir chosen"),
+        (Tool::Cargo, "build --target-dir chosen"),
+    ] {
+        for source in ["none", "environment", "config", "cli"] {
+            let env = |name: &str| {
+                (source == "environment" && name == BUILD_DIR_ENV).then(|| "build".into())
+            };
+            let read = |path: &Path| {
+                Ok(
+                    if source == "config" && path == cwd.join(".cargo/config.toml") {
+                        Some("build.build-dir='build'".into())
+                    } else if path == cwd.join("Cargo.toml") {
+                        Some("[workspace]".into())
+                    } else {
+                        None
+                    },
+                )
+            };
+            let machine = Machine {
+                home: Some(&home),
+                root: None,
+                cwd: Some(&cwd),
+                env: &env,
+                read: &read,
+                read_manifest: &read,
+                writable: &|_| Some(true),
+            };
+            let mut args = words
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if source == "cli" {
+                args.extend(["--config".into(), "build.build-dir='build'".into()]);
+            }
+            let selected = selected_build_dir_hint(&args, tool, &machine, &|_| UserAlias::None);
+            if source == "none" {
+                assert!(matches!(selected, Ok(None)), "{tool:?}: {selected:?}");
+            } else {
+                assert!(selected.is_err(), "{tool:?} {source}: {selected:?}");
+            }
+            args.insert(0, "--help".into());
+            assert!(
+                matches!(
+                    selected_build_dir_hint(&args, tool, &machine, &|_| UserAlias::None),
+                    Ok(None)
+                ),
+                "a query writes no build directory: {tool:?} {source}"
+            );
+        }
+    }
+    let machine = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &|name| (name == BUILD_DIR_ENV).then(|| "build.noindex".into()),
+        read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
+        writable: &|_| Some(true),
+    };
+    assert!(
+        selected_build_dir_hint(
+            &["--unverified".into(), "unknown".into()],
+            Tool::Targo,
+            &machine,
+            &|_| UserAlias::Unknown,
+        )
+        .is_err(),
+        "an untold alias cannot hide a possible explicit root"
+    );
+}
+
+#[test]
+fn intermediate_observation_does_not_require_a_known_final_target_or_owner() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("notes");
+    let manifest = PathBuf::from(native("/foreign/missing/Cargo.toml"));
+    for explicit in [false, true] {
+        let read = |path: &Path| {
+            Ok((path == cwd.join(".cargo/config.toml"))
+                .then(|| "build.target-dir=['not-a-custody-target']".into()))
+        };
+        let env = |name: &str| (explicit && name == BUILD_DIR_ENV).then(|| "build.noindex".into());
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &env,
+            read: &read,
+            read_manifest: &|_| Ok(None),
+            writable: &|_| Some(true),
+        };
+        let args = vec![
+            "--unverified".into(),
+            "build".into(),
+            "--manifest-path".into(),
+            manifest.display().to_string(),
+        ];
+        let selected =
+            selected_build_dir_hint(&args, Tool::Targo, &machine, &|_| UserAlias::None).unwrap();
+        assert_eq!(
+            selected.as_ref().map(|hint| &hint.value),
+            explicit.then(|| cwd.join("build.noindex")).as_ref()
+        );
+        assert!(selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).is_none());
+    }
+}
+
+#[test]
+fn raw_workspace_discovery_observes_foreign_manifests_without_granting_custody() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = PathBuf::from(native("/foreign/project/member"));
+    let manifest = cwd.parent().unwrap().join("Cargo.toml");
+    let read = |path: &Path| Ok((path == manifest).then(|| "[workspace]\nmembers=[]".into()));
+    let machine = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &|name| {
+            (name == BUILD_DIR_ENV)
+                .then(|| "{workspace-root}/build.noindex/{workspace-path-hash}".into())
+        },
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    let args = ["--unverified", "build"].map(str::to_owned);
+    let selected = selected_build_dir_hint(&args, Tool::Targo, &machine, &|_| UserAlias::None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.manifests, Some(vec![manifest.clone()]));
+    assert!(selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).is_none());
+}

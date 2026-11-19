@@ -789,6 +789,8 @@ fn exit_input(world: &Path, st: &St) -> (Snapshot, Plan) {
         line: st.line.clone(),
         tap_dropped: None,
         token_dropped: None,
+        rebind: None,
+        twin_projected: None,
         line_dir: None,
         command: None,
         cold: None,
@@ -1386,6 +1388,112 @@ fn host_ended_replans_after_no_grant(retired: bool) {
     );
     let saved = load(&opts, SESSION).expect("the relaunch's record");
     assert!(host_ended_fresh(true, false, false, &saved));
+}
+
+/// S1461: this host's exit whose every native relaunch its host proves ran nothing (each launcher
+/// line it typed was refused, and the kept prepare lapses) is relaunched on its plain typed line
+/// once [`NATIVE_ATTEMPTS`] are spent; before, each pass planned another native launch and typed
+/// another dead launcher line into the person's shell, for good.
+#[test]
+fn an_exit_whose_native_relaunches_ran_nothing_falls_back_to_its_plain_line() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = options(world.path());
+    let mut exited = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
+        .spawn()
+        .unwrap();
+    let pid = exited.id();
+    exited.wait().unwrap();
+    let start = kernel_start(std::process::id()).expect("this process's kernel start");
+    let input = |st: &St| {
+        let (mut snap, mut plan) = exit_input(world.path(), st);
+        snap.pid = pid;
+        plan.command = Some(PlannedCommand {
+            dialect: Dialect::Zsh,
+            heal: None,
+            cwd: None,
+            target: std::env::current_exe().unwrap(),
+            argv: Vec::new(),
+            env: Vec::new(),
+            unset: None,
+            account_intent: None,
+        });
+        (snap, plan)
+    };
+    let mut st = lapsable_crash(false);
+    st.bind(pid, &start);
+    st.stop("stale-exit", now_s());
+    save(&opts, SESSION, &st);
+    for spent in 1..=NATIVE_ATTEMPTS {
+        let mut kept = load(&opts, SESSION).unwrap();
+        if spent > 1 {
+            // The pass before typed its own launcher, whose prepare is kept as the first was.
+            kept.native = Some(super::super::native_act::Binding {
+                id: "ab".repeat(16),
+                capability: "cd".repeat(32),
+            });
+            retain_bound_preparation(&mut kept);
+            retain_cold(&mut kept);
+            kept.native = None;
+        }
+        let (snap, plan) = input(&kept);
+        let (client, worker) = endpoint_with(lapsed_host);
+        let result = launch_after_exit(
+            &opts,
+            &snap,
+            ExitCause::Exit,
+            false,
+            report(),
+            kept,
+            plan,
+            client,
+        );
+        let seen = worker.join().unwrap();
+        assert_eq!(
+            result.step,
+            super::super::native_restart::WAIT_LAPSED,
+            "{seen:?}"
+        );
+        let saved = load(&opts, SESSION).expect("the lapsed record is saved");
+        assert_eq!(saved.native_spent_on(pid, &start), spent);
+        // The count is the record's, read back as written.
+        let reread = St::from_json(&saved.to_json()).unwrap();
+        assert_eq!(reread.native_spent_on(pid, &start), spent);
+        // A plan made afresh for the same exit keeps it; another exit starts at none.
+        let mut fresh = St::default();
+        saved.kept_by_restart(TAB, &mut fresh);
+        assert_eq!(fresh.native_spent_on(pid, &start), spent);
+        assert_eq!(fresh.native_spent_on(pid + 1, &start), 0);
+    }
+    let saved = load(&opts, SESSION).unwrap();
+    let (snap, plan) = input(&saved);
+    let (client, worker) = endpoint_with(lapsed_host);
+    let result = launch_after_exit(
+        &opts,
+        &snap,
+        ExitCause::Exit,
+        false,
+        report(),
+        saved,
+        plan,
+        client,
+    );
+    let seen = worker.join().unwrap();
+    assert!(
+        !result.step.starts_with("wait:native-"),
+        "{}: {seen:?}",
+        result.step
+    );
+    assert!(
+        seen.iter().all(|line| !line.contains(" native-act ")),
+        "a spent exit plans no native act: {seen:?}"
+    );
+    let saved = load(&opts, SESSION).expect("the relaunch's record");
+    assert!(native_spent(false, &saved));
+    assert!(
+        !native_spent(true, &saved),
+        "a deferred plan is never typed plain"
+    );
+    assert_eq!(saved.line, "fixed legacy fixture", "its plain line");
 }
 
 /// The exit lane meets a kept prepare its host keeps held (a grant may have been delivered on

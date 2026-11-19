@@ -420,6 +420,55 @@ fn fetch_wait() -> std::time::Duration {
     std::time::Duration::from_millis(FETCH_WAIT_MS)
 }
 
+/// A rule of the fetch path a test switches off for its negative control, on the thread that
+/// runs the rule ([`FETCH_CONTROL`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchControl {
+    /// [`evict_answered_fetch`] takes the first settled fetch whether or not a listed read has
+    /// yet to take it, as before ATERM-KI-1114-1414's fix: the read it was answered for wakes to
+    /// no fetch and answers `ERR no such record`.
+    EvictUnderARead,
+    /// [`deliver_fetched`] counts every listed read live, one whose caller hung up unheard
+    /// included, as before that fix: the bridge is answered `OK` for a record sent to a closed
+    /// connection.
+    HungUpReadLive,
+    /// [`deliver_fetched`] lets a later chunk or failure replace a whole answer a listed read has
+    /// yet to take, as before that fix: the line is answered `OK`, and the read the bridge was
+    /// told took the whole answer answers the failure, or parks again on the chunk.
+    ReplaceAnUntakenAnswer,
+    /// [`Inbox::forget_bus_offsets`] keeps above the fork only a fetch still pending or partial,
+    /// as before that fix: a whole answer a listed read has yet to take is dropped, and the read
+    /// wakes to no fetch and answers `ERR no such record` in place of `log-replaced`.
+    DropAnsweredOnLogSwitch,
+    /// [`Inbox::leave_fetch`] takes out a fetch with no whole answer whether or not other reads
+    /// are listed on it, as before that fix: one read of a shared offset that ends takes the
+    /// fetch off the outbox peek from under the others, so the bridge is no longer asked for it,
+    /// and they wake to no fetch and answer `ERR no such record`.
+    LeaveUnderARead,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The fetch rule this thread runs switched off ([`FetchControl`]; None: every rule as
+    /// shipped).
+    static FETCH_CONTROL: std::cell::Cell<Option<FetchControl>> =
+        const { std::cell::Cell::new(None) };
+    /// A parked fetch on this thread that wakes to its settled answer stands aside once before
+    /// it takes it ([`stand_aside_at_an_answer`]): it lets go of the Inbox, says so on the
+    /// sender, and takes the lock again once the receiver hears, so a test runs what another
+    /// thread does between an answer's ring and the read's take.
+    static TEST_FETCH_STAND_ASIDE: std::cell::RefCell<
+        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether this thread runs `control`'s rule switched off ([`FETCH_CONTROL`]).
+#[cfg(test)]
+fn fetch_control(control: FetchControl) -> bool {
+    FETCH_CONTROL.with(std::cell::Cell::get) == Some(control)
+}
+
 /// One delivered message.
 #[derive(Clone, Debug)]
 pub struct InboxRow {
@@ -898,10 +947,24 @@ pub struct Inbox {
     advisory: Option<(Hold, u64)>,
     hold_fenced: bool,
     retirements_fenced: bool,
-    fetches: VecDeque<(u64, FetchSlot)>,
+    /// The bus reads (`inbox get @<off>`) asked of the bridge and the answers kept for a later
+    /// read, at most [`FETCH_SLOTS`] ([`evict_answered_fetch`]).
+    fetches: VecDeque<FetchEntry>,
+    /// The ticket the newest read listed on a fetch took ([`FetchRead::ticket`]).
+    fetch_reads: u64,
     watches: Vec<Weak<OffsetWatch>>,
     /// The bus log this session's offsets name (its clock), as the bridge last told it.
     bus_log: Option<LogIdentity>,
+    /// The newest proved move from another log onto [`Self::bus_log`] told while this session
+    /// held it or moved onto it: `(was, fork)`, a clock's [`LogClock::proved`], so the log holds
+    /// `was`'s records below `fork` (ATERM-KI-1116-7314). Kept while the session stays on that
+    /// log, replaced by the next proved move of it told, and at its next move taken from the new
+    /// clock (none after a bare one, or a lineage's, whose fork the chain rules already bound;
+    /// [`Self::take_clock`]); [`LogClock::keep_below`] reads it where a later tell names that
+    /// `was` again. Not carried by a seamless update: a successor's session holds none until its
+    /// bridge tells the proved move again (the clock it registers on, or a tell of its log),
+    /// and forgets as before where the next tell already names another log.
+    bus_via: Option<(LogIdentity, u64)>,
     receipts: VecDeque<OwedReceipt>,
     next_receipt_id: u64,
     outbox_moves: u64,
@@ -1418,6 +1481,56 @@ enum FetchSlot {
     Failed(String),
 }
 
+/// One offset's fetch ([`Inbox::fetches`]): its answer so far, and the parked reads that have
+/// yet to take it.
+#[derive(Clone, Debug)]
+struct FetchEntry {
+    off: u64,
+    slot: FetchSlot,
+    /// THE READS PARKED ON THIS FETCH THAT HAVE YET TO TAKE ITS ANSWER (ATERM-KI-1114-1414). A
+    /// read is listed as it parks ([`Inbox::join_fetch`]) and taken off under the Inbox lock
+    /// before it returns ([`Inbox::leave_fetch`]): at its answer, which it renders (it took a
+    /// `Done` slot), at a failure, or when it ends unanswered. While one is listed the fetch is
+    /// neither evicted ([`evict_answered_fetch`]) nor dropped by a log switch
+    /// ([`Inbox::forget_bus_offsets`]), and a whole answer it has yet to take is replaced only
+    /// by another whole one ([`deliver_fetched`]); the bridge's line is answered `OK` only where
+    /// one of them is live ([`FetchRead::live`]). A listed read meets a whole answer at its next
+    /// wake, which the answer's ring brings, and takes it before it asks its deadline or its
+    /// caller, so an answer is held from eviction for its reads no longer than their parks last.
+    reads: Vec<FetchRead>,
+}
+
+/// A read listed on a fetch ([`FetchEntry::reads`]).
+#[derive(Clone, Copy, Debug)]
+struct FetchRead {
+    ticket: u64,
+    /// The connection the read serves ([`aterm_control::hangup::serving_fd`]); `None` off a
+    /// served lane (an in-process caller), which no hang-up ends. The read is listed only from
+    /// inside its own call, on the thread that serves that connection, and leaves the list
+    /// before the call returns, so while listed the descriptor is still that connection's.
+    #[cfg(unix)]
+    served: Option<std::os::fd::RawFd>,
+}
+
+impl FetchRead {
+    /// Whether the read's caller is still there to be answered, asked now of its connection as
+    /// the read itself asks ([`aterm_control::hangup::caller_hung_up`]), whether or not its
+    /// park has heard a hang-up yet (within `HANGUP_POLL`, or `ARMED_POLL` on a lost ring).
+    fn live(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.served
+                .is_none_or(|fd| !aterm_uds::hangup::fd_peer_closed(fd))
+        }
+        // Off unix no bridge answers a fetch (aterm's `link` verb refuses there), and no read
+        // hears a hang-up.
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Fetched {
     off: u64,
@@ -1484,6 +1597,20 @@ impl Fetched {
 }
 
 impl Inbox {
+    /// Puts this session on `clock`'s log, once [`LogClock::keep_below`] judged what it keeps
+    /// there. Its `via` ([`Self::bus_via`]) becomes the clock's proved move, which says that log
+    /// holds `was`'s records below the fork whatever brought the session onto it, so a session
+    /// already on the log (one a seamless update carried, its `via` not carried) takes it too, in
+    /// place of its own: both name records of that one log, and a later tell names the newer
+    /// one's `was` (the bridge's witness when it told it) until an attach leaves that for the
+    /// log told, which `held == was` keeps. Where the clock names no proved move, one already
+    /// there keeps its own, and one that moves keeps none (its own names the log it left).
+    fn take_clock(&mut self, clock: LogClock) {
+        let own = self.bus_via.filter(|_| self.bus_log == Some(clock.ident));
+        self.bus_via = clock.proved().or(own);
+        self.bus_log = Some(clock.ident);
+    }
+
     fn forget_bus_offsets(&mut self, keep_below: Option<u64>) -> Vec<u64> {
         let fork = keep_below.unwrap_or(0);
         let kept = |off: u64| off < fork;
@@ -1542,15 +1669,69 @@ impl Inbox {
         }
         self.outbox_moves += 1;
         self.trim_retired_posts();
-        self.fetches.retain(|(off, slot)| {
-            kept(*off) || matches!(slot, FetchSlot::Pending | FetchSlot::Partial(_))
+        // A fetch above the fork that a read waits on fails for it, a whole answer it has yet to
+        // take included: dropped, the read woke to no fetch and answered `ERR no such record`.
+        #[cfg(test)]
+        let drops_an_untaken_answer = fetch_control(FetchControl::DropAnsweredOnLogSwitch);
+        #[cfg(not(test))]
+        let drops_an_untaken_answer = false;
+        self.fetches.retain(|entry| {
+            kept(entry.off)
+                || if drops_an_untaken_answer {
+                    matches!(entry.slot, FetchSlot::Pending | FetchSlot::Partial(_))
+                } else {
+                    !entry.reads.is_empty()
+                }
         });
-        for (off, slot) in &mut self.fetches {
-            if !kept(*off) {
-                *slot = FetchSlot::Failed("log-replaced".to_string());
+        for entry in &mut self.fetches {
+            if !kept(entry.off) {
+                entry.slot = FetchSlot::Failed("log-replaced".to_string());
             }
         }
         retired
+    }
+
+    /// The index of the fetch of `off` ([`Self::fetches`]).
+    fn fetch_at(&self, off: u64) -> Option<usize> {
+        self.fetches.iter().position(|entry| entry.off == off)
+    }
+
+    /// List a read on the fetch of `off`, on the thread that serves its caller
+    /// ([`FetchRead::served`]), and return its ticket for [`Self::leave_fetch`].
+    fn join_fetch(&mut self, off: u64) -> u64 {
+        self.fetch_reads += 1;
+        let ticket = self.fetch_reads;
+        if let Some(i) = self.fetch_at(off) {
+            self.fetches[i].reads.push(FetchRead {
+                ticket,
+                #[cfg(unix)]
+                served: aterm_control::hangup::serving_fd(),
+            });
+        }
+        ticket
+    }
+
+    /// Take the read `ticket` (None: a read that never listed itself) off the fetch of `off`.
+    /// A fetch left with no read and no whole answer goes; a whole answer stays, kept for a later
+    /// read until [`evict_answered_fetch`] makes room past it. One other reads are still listed on
+    /// stays too: they wait on it, and the outbox peek goes on asking the bridge for it.
+    fn leave_fetch(&mut self, off: u64, ticket: Option<u64>) {
+        let Some(i) = self.fetch_at(off) else {
+            return;
+        };
+        #[cfg(test)]
+        let leaves_under_a_read = fetch_control(FetchControl::LeaveUnderARead);
+        #[cfg(not(test))]
+        let leaves_under_a_read = false;
+        let entry = &mut self.fetches[i];
+        if let Some(ticket) = ticket {
+            entry.reads.retain(|read| read.ticket != ticket);
+        }
+        if (leaves_under_a_read || entry.reads.is_empty())
+            && !matches!(entry.slot, FetchSlot::Done(_))
+        {
+            self.fetches.remove(i);
+        }
     }
 
     fn watch(&mut self, off: u64, on_log: bool) -> Arc<OffsetWatch> {
@@ -2466,6 +2647,7 @@ impl SessionFabric {
         }
         let mut inbox = self.lock();
         inbox.bus_log = carry.bus_log.as_deref().and_then(LogIdentity::parse);
+        inbox.bus_via = None;
         inbox.last_msg_id = inbox.last_msg_id.max(carry.last_msg_id);
         inbox.next_post_id = inbox.next_post_id.max(carry.last_post_id);
         inbox.next_receipt_id = inbox.next_receipt_id.max(carry.last_receipt_id);
@@ -2825,8 +3007,10 @@ impl LogClock {
     /// Below which offset a session whose clock is `held` keeps what it holds: the fork, for
     /// `was` itself or a generation between `was` and `ident`; and, across a proved move from
     /// another log, an earlier generation of `ident`'s own log or a later one of `was`'s, each
-    /// told by an attach whose witness then never moved. `None` (keep nothing) for any other
-    /// clock, or none.
+    /// told by an attach whose witness then never moved. A session whose `via` (the newest proved
+    /// move from another log onto `held`, told while the session held it or moved onto it,
+    /// [`Inbox::bus_via`], [`Inbox::take_clock`]) names `was` keeps below the lower of the fork
+    /// and `via`'s, whatever log `held` is. `None` (keep nothing) for any other clock, or none.
     ///
     /// A later generation of `was` is kept because of what such a session holds, not because
     /// the proof bounds its fork (it does not): the bridge still names `was` only while the
@@ -2837,13 +3021,41 @@ impl LogClock {
     /// `was`). So the session holds only offsets below that cut, where the generation holds
     /// `was`'s records, and the new log holds `was`'s records below the proved fork: every
     /// offset kept names the same record on all three, whichever bound is lower.
-    fn keep_below(&self, held: Option<LogIdentity>) -> Option<u64> {
+    ///
+    /// A `via` from `was` is ATERM-KI-1116-7314's second remint: the move `was`→`held` proved
+    /// and told, its attach refused or killed before its witness left `was`, then astream
+    /// reminted `held` and the next attach proves the new log from `was` again (from `was`'s
+    /// samples, or those that move took to `held` below its fork). `held` holds `was`'s records
+    /// below `via`'s fork, as the tell that moved the session there said, and `ident` holds them
+    /// below this move's, so below both every offset the session keeps names the same record on
+    /// the two logs, whatever was delivered on `held` meanwhile (the chain's bound rests on the
+    /// witness never having moved; this one on the two tells alone). It is read before the
+    /// chain rules, so a session both reach keeps below the lower.
+    fn keep_below(
+        &self,
+        held: Option<LogIdentity>,
+        via: Option<(LogIdentity, u64)>,
+    ) -> Option<u64> {
         let (was, fork) = self.continues?;
         let held = held?;
-        let in_chain = held == was
-            || (self.ident.continues_from(held) && (held.id != was.id || held.continues_from(was)))
+        if held == was {
+            return Some(fork);
+        }
+        if let Some((_, moved)) = via.filter(|(from, _)| *from == was) {
+            return Some(fork.min(moved));
+        }
+        let in_chain = (self.ident.continues_from(held)
+            && (held.id != was.id || held.continues_from(was)))
             || (held.id != self.ident.id && held.continues_from(was));
         in_chain.then_some(fork)
+    }
+
+    /// The move this clock came by where it is a proved one from another log (`proved=1`, the
+    /// one move whose `was` has another id): what a session it moves, or finds on `ident`, keeps
+    /// as its `via` ([`Inbox::take_clock`]). A lineage's move is none: a later move from its
+    /// `was` is bounded by the chain rules, at the lowest fork over the chain.
+    fn proved(self) -> Option<(LogIdentity, u64)> {
+        self.continues.filter(|(was, _)| was.id != self.ident.id)
     }
 }
 
@@ -2940,7 +3152,10 @@ const fn state_word(state: u8) -> &'static str {
     }
 }
 
-/// Publish a newly created or adopted session into the registry.
+/// Publish a newly created or adopted session into the registry, on the log the bridge last
+/// told: a session on another clock forgets what that clock's move does not keep
+/// ([`LogClock::keep_below`]), and it, or one a seamless update carried onto that log, takes the
+/// clock's proved move for its `via` ([`Inbox::take_clock`]).
 pub fn register_on_log<T>(ctx: &dyn FabricSession, publish: impl FnOnce() -> T) -> T {
     let _transition = LINK
         .log_transition
@@ -2955,7 +3170,7 @@ pub fn register_on_log<T>(ctx: &dyn FabricSession, publish: impl FnOnce() -> T) 
             .bus_log
             .map_or_else(|| inbox.holds_bus_references(), |was| was != clock.ident);
         if forget {
-            let keep_below = clock.keep_below(inbox.bus_log);
+            let keep_below = clock.keep_below(inbox.bus_log, inbox.bus_via);
             for id in inbox.forget_bus_offsets(keep_below) {
                 let fact = FabricFact::MailLanded {
                     post: id,
@@ -2965,7 +3180,7 @@ pub fn register_on_log<T>(ctx: &dyn FabricSession, publish: impl FnOnce() -> T) 
                 let _ = ctx.record_fact("post-landed", fact);
             }
         }
-        inbox.bus_log = Some(clock.ident);
+        inbox.take_clock(clock);
         ctx.fabric().changed.ring(inbox);
     }
     publish()
@@ -3658,16 +3873,16 @@ impl NodeGaps {
         self.newest = Some(gap);
     }
 
-    /// The bridge's log moved from `was` to `clock` ([`cmd_link_log`]). The newest range stays
-    /// where `clock` continues `was` past its end, exactly as each session's `given_up=` does
-    /// ([`Inbox::forget_bus_offsets`]), so that range told again on the new log is a repeat to
-    /// both; any other move forgets it, as its offsets name records of a log since replaced, and
-    /// keeps the count.
-    fn log_moved(&mut self, was: Option<LogIdentity>, clock: LogClock) {
-        if was == Some(clock.ident) {
+    /// The bridge's log moved from `was`'s to `clock` ([`cmd_link_log`]). The newest range stays
+    /// where `clock` continues `was`'s log past its end, exactly as each session's `given_up=`
+    /// does ([`Inbox::forget_bus_offsets`]; `was`'s own proved move is the `via` a session on
+    /// its log holds), so that range told again on the new log is a repeat to both; any other move
+    /// forgets it, as its offsets name records of a log since replaced, and keeps the count.
+    fn log_moved(&mut self, was: Option<LogClock>, clock: LogClock) {
+        if was.is_some_and(|was| was.ident == clock.ident) {
             return;
         }
-        let fork = clock.keep_below(was);
+        let fork = clock.keep_below(was.map(|was| was.ident), was.and_then(LogClock::proved));
         self.newest = self
             .newest
             .filter(|gap| fork.is_some_and(|fork| gap.to <= fork));
@@ -4015,6 +4230,7 @@ fn cmd_link_log(
     for ctx in &live {
         let mut inbox = ctx.fabric().lock();
         if inbox.bus_log == Some(ident) {
+            inbox.take_clock(clock);
             continue;
         }
         let forget = inbox.bus_log.map_or_else(
@@ -4027,7 +4243,7 @@ fn cmd_link_log(
                 return HOLD_BUSY.to_string();
             };
             inbox = guard;
-            let keep_below = clock.keep_below(inbox.bus_log);
+            let keep_below = clock.keep_below(inbox.bus_log, inbox.bus_via);
             let retired = inbox.forget_bus_offsets(keep_below);
             for id in retired {
                 let fact = FabricFact::MailLanded {
@@ -4039,13 +4255,13 @@ fn cmd_link_log(
             }
             changed = true;
         }
-        inbox.bus_log = Some(ident);
+        inbox.take_clock(clock);
         ctx.fabric().changed.ring(inbox);
     }
     LINK.node_gaps
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .log_moved(previous.map(|p| p.ident), clock);
+        .log_moved(previous, clock);
     *LINK.log.lock().unwrap_or_else(|p| p.into_inner()) = Some(clock);
     if changed {
         on_forgot();
@@ -5299,10 +5515,13 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
             let mut inbox = ctx.fabric().lock();
             let mut body = String::new();
             if at > 0 {
-                let partial = inbox.fetches.iter_mut().find_map(|(o, slot)| match slot {
-                    FetchSlot::Partial(p) if *o == off && p.body.len() == at => Some(p),
-                    _ => None,
-                });
+                let partial = inbox
+                    .fetches
+                    .iter_mut()
+                    .find_map(|entry| match &mut entry.slot {
+                        FetchSlot::Partial(p) if entry.off == off && p.body.len() == at => Some(p),
+                        _ => None,
+                    });
                 let Some(p) = partial else {
                     drop(inbox);
                     return refuse_fetched(ctx, off, "ERR fetch out of order\n");
@@ -5340,47 +5559,104 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
     if matches!(slot, FetchSlot::Done(_)) {
         inbox.oldest_on_bus = Some(inbox.oldest_on_bus.map_or(off, |o| o.min(off)));
     }
-    match inbox.fetches.iter().position(|(o, _)| *o == off) {
-        Some(i) => inbox.fetches[i].1 = slot,
-        None if !matches!(slot, FetchSlot::Done(_)) => return "OK unrequested=1\n".to_string(),
-        None => {
+    // A LINE IS ANSWERED `OK` ONLY WHERE A LIVE READ WILL TAKE WHAT IT CARRIES
+    // (ATERM-KI-1114-1414): a read listed on the fetch ([`FetchEntry::reads`]) whose caller is
+    // still there ([`FetchRead::live`]). It is asked under the Inbox lock, which the read needs
+    // to leave the fetch, so the read is still listed when the ring wakes it, and it renders a
+    // whole answer before it asks its deadline or its caller. Every other line is answered
+    // `OK unrequested=1`: no session was handed it, and the bridge notes an own receipt as
+    // handed only at a plain `OK` (aterm-link's `Bridge::answer_fetch`); unnoted, the worst is a
+    // second copy of the record, while noted, the bridge's retry past a cut could settle at a
+    // record no session got and lose the receipt. Those lines are a whole answer no read waits
+    // for (its read ended: timed out, futile, or a hang-up it heard, each of which takes it off
+    // the fetch), kept for a later read, room permitting; a whole answer whose only reads' callers
+    // hung up unheard (a park asks within `HANGUP_POLL`, or `ARMED_POLL` on a lost ring), kept
+    // the same way, though those reads send it to a closed connection; and a chunk or failure no
+    // read waits for, or one past a whole answer a read has yet to take, which keep nothing, as a
+    // whole answer past the slots keeps nothing. A caller that hangs up after this ask, before
+    // its read takes the answer, is as one that hangs up after its reply is written: what reached
+    // it, only the caller can tell.
+    let at = inbox.fetch_at(off);
+    let listed = at.is_some_and(|i| !inbox.fetches[i].reads.is_empty());
+    #[cfg(test)]
+    let replaces_an_untaken_answer = fetch_control(FetchControl::ReplaceAnUntakenAnswer);
+    #[cfg(not(test))]
+    let replaces_an_untaken_answer = false;
+    match (at, &slot) {
+        (Some(i), FetchSlot::Done(_)) => inbox.fetches[i].slot = slot,
+        (Some(i), _)
+            if listed
+                && (replaces_an_untaken_answer
+                    || !matches!(inbox.fetches[i].slot, FetchSlot::Done(_))) =>
+        {
+            inbox.fetches[i].slot = slot;
+        }
+        (None, FetchSlot::Done(_)) => {
             evict_answered_fetch(&mut inbox);
             if inbox.fetches.len() >= FETCH_SLOTS {
                 return "OK unrequested=1\n".to_string();
             }
-            inbox.fetches.push_back((off, slot));
+            inbox.fetches.push_back(FetchEntry {
+                off,
+                slot,
+                reads: Vec::new(),
+            });
         }
+        _ => return "OK unrequested=1\n".to_string(),
     }
+    #[cfg(test)]
+    let unheard_counts = fetch_control(FetchControl::HungUpReadLive);
+    #[cfg(not(test))]
+    let unheard_counts = false;
+    let live = at.is_some_and(|i| {
+        inbox.fetches[i]
+            .reads
+            .iter()
+            .any(|read| unheard_counts || read.live())
+    });
     if answer_ready {
         ctx.fabric().changed.ring(inbox);
         ctx.fabric_changed();
     }
-    "OK\n".to_string()
+    if live {
+        "OK\n".to_string()
+    } else {
+        "OK unrequested=1\n".to_string()
+    }
 }
 
 fn refuse_fetched(ctx: &dyn FabricSession, off: u64, reply: &str) -> String {
     let mut inbox = ctx.fabric().lock();
-    let waiting = inbox
-        .fetches
-        .iter_mut()
-        .find(|(o, s)| *o == off && matches!(s, FetchSlot::Pending | FetchSlot::Partial(_)));
-    if let Some((_, slot)) = waiting {
-        *slot = FetchSlot::Failed("malformed".to_string());
+    let waiting = inbox.fetches.iter_mut().find(|entry| {
+        entry.off == off && matches!(entry.slot, FetchSlot::Pending | FetchSlot::Partial(_))
+    });
+    if let Some(entry) = waiting {
+        entry.slot = FetchSlot::Failed("malformed".to_string());
         ctx.fabric().changed.ring(inbox);
         ctx.fabric_changed();
     }
     reply.to_string()
 }
 
+/// Make room for one more fetch where every one of the [`FETCH_SLOTS`] is in use, by taking out
+/// the oldest whose answer is settled (whole or failed) and that no listed read has yet to take
+/// ([`FetchEntry::reads`]): one kept for a later read. A settled answer a read is listed on is
+/// that read's until it takes it, at its next wake (ATERM-KI-1114-1414): taken out, the read
+/// woke to no fetch and answered `ERR no such record`, though the bridge was answered `OK`.
+/// Where none can go, the caller refuses: a read `ERR busy`, a whole answer no read waits for
+/// `OK unrequested=1`, keeping nothing.
 fn evict_answered_fetch(inbox: &mut Inbox) {
     if inbox.fetches.len() < FETCH_SLOTS {
         return;
     }
-    if let Some(i) = inbox
-        .fetches
-        .iter()
-        .position(|(_, s)| !matches!(s, FetchSlot::Pending | FetchSlot::Partial(_)))
-    {
+    #[cfg(test)]
+    let under_a_read = fetch_control(FetchControl::EvictUnderARead);
+    #[cfg(not(test))]
+    let under_a_read = false;
+    if let Some(i) = inbox.fetches.iter().position(|entry| {
+        !matches!(entry.slot, FetchSlot::Pending | FetchSlot::Partial(_))
+            && (under_a_read || entry.reads.is_empty())
+    }) {
         inbox.fetches.remove(i);
     }
 }
@@ -5742,9 +6018,9 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
                 if r.earlier_log { " log=earlier" } else { "" }
             ));
         }
-        for (off, slot) in &inbox.fetches {
-            if matches!(slot, FetchSlot::Pending | FetchSlot::Partial(_)) {
-                payload.push_str(&format!("fetch sid={sid} off={off}\n"));
+        for entry in &inbox.fetches {
+            if matches!(entry.slot, FetchSlot::Pending | FetchSlot::Partial(_)) {
+                payload.push_str(&format!("fetch sid={sid} off={}\n", entry.off));
             }
         }
     }
@@ -6470,12 +6746,12 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
     {
         return Fetched::from_row(row).render();
     }
-    match inbox.fetches.iter().position(|(o, _)| *o == off) {
-        Some(i) => match &inbox.fetches[i].1 {
+    match inbox.fetch_at(off) {
+        Some(i) => match &inbox.fetches[i].slot {
             FetchSlot::Done(f) => return f.render(),
             FetchSlot::Failed(why) => {
                 let why = why.clone();
-                inbox.fetches.remove(i);
+                inbox.leave_fetch(off, None);
                 return unfetched(&inbox, off, fetch_failure(&why, off));
             }
             FetchSlot::Pending | FetchSlot::Partial(_) => {}
@@ -6490,40 +6766,82 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
                     "ERR busy: {FETCH_SLOTS} inbox reads already waiting; retry when one answers\n"
                 );
             }
-            inbox.fetches.push_back((off, FetchSlot::Pending));
+            inbox.fetches.push_back(FetchEntry {
+                off,
+                slot: FetchSlot::Pending,
+                reads: Vec::new(),
+            });
             let _ = ctx.record_fact("fetch", FabricFact::Fetch { off });
         }
     }
+    let ticket = inbox.join_fetch(off);
     let deadline = deadline_after(wait);
     loop {
-        let Some(i) = inbox.fetches.iter().position(|(o, _)| *o == off) else {
-            // Evicted from under a parked read, though only an answered slot is evicted and this
-            // one was pending: a reader that cannot tell says "nothing" rather than hang.
+        let Some(i) = inbox.fetch_at(off) else {
+            // No path takes out a fetch a read is listed on ([`FetchEntry::reads`]): a reader
+            // that cannot tell says "nothing" rather than hang.
             return fetch_failure("no-record", off);
         };
-        match &inbox.fetches[i].1 {
-            FetchSlot::Done(f) => return f.render(),
+        // A whole answer is taken before the deadline or the caller is asked: the bridge was
+        // answered `OK` for it where this read was live at the answer ([`deliver_fetched`]).
+        match &inbox.fetches[i].slot {
+            FetchSlot::Done(f) => {
+                let answer = f.render();
+                inbox.leave_fetch(off, Some(ticket));
+                return answer;
+            }
             FetchSlot::Failed(why) => {
                 let why = why.clone();
-                inbox.fetches.remove(i);
+                inbox.leave_fetch(off, Some(ticket));
                 return unfetched(&inbox, off, fetch_failure(&why, off));
             }
             FetchSlot::Pending | FetchSlot::Partial(_) => {}
         }
         if wait_is_futile() {
-            inbox.fetches.remove(i);
+            inbox.leave_fetch(off, Some(ticket));
             let why = format!("ERR fabric {} off={off}\n", fabric_state());
             return unfetched(&inbox, off, why);
         }
         if std::time::Instant::now() >= deadline || aterm_control::hangup::caller_hung_up() {
-            inbox.fetches.remove(i);
+            inbox.leave_fetch(off, Some(ticket));
             return unfetched(&inbox, off, format!("ERR timeout off={off}\n"));
         }
         inbox = ctx
             .fabric()
             .changed
             .park(inbox, park_until(deadline), inbox_lane());
+        #[cfg(test)]
+        {
+            inbox = stand_aside_at_an_answer(ctx.fabric(), inbox, off);
+        }
     }
+}
+
+/// [`TEST_FETCH_STAND_ASIDE`]: a read that woke to its settled answer, with the stand-aside
+/// armed on its thread, lets go of the Inbox until the test says, still listed on its fetch,
+/// and returns the lock taken again.
+#[cfg(test)]
+fn stand_aside_at_an_answer<'a>(
+    fabric: &'a SessionFabric,
+    inbox: std::sync::MutexGuard<'a, Inbox>,
+    off: u64,
+) -> std::sync::MutexGuard<'a, Inbox> {
+    let settled = inbox.fetch_at(off).is_some_and(|i| {
+        !matches!(
+            inbox.fetches[i].slot,
+            FetchSlot::Pending | FetchSlot::Partial(_)
+        )
+    });
+    if !settled {
+        return inbox;
+    }
+    let Some((woke, go)) = TEST_FETCH_STAND_ASIDE.with(|aside| aside.borrow_mut().take()) else {
+        return inbox;
+    };
+    drop(inbox);
+    let _ = woke.send(());
+    let _ = go.recv();
+    fabric.lock()
 }
 
 fn unfetched(inbox: &Inbox, off: u64, why: String) -> String {

@@ -358,11 +358,94 @@ fn an_expired_mutation_budget_refuses_before_spawn_while_a_live_budget_runs_the_
             &mut |_, _| Ok(()),
         );
         if expired {
-            assert!(result.is_err());
+            assert!(matches!(result, Err(Failed::Unstarted(_))), "{result:?}");
             assert!(!marker.exists());
         } else {
             assert!(result.unwrap().status.success());
             assert_eq!(std::fs::read(marker).unwrap(), b"admitted");
         }
     }
+}
+
+/// A MUTATION THAT NEVER STARTED SENT NOTHING: one refused before its child, because the caller's
+/// interrupt read true first, its work window had already ended, or its program could not be
+/// started (through git, or through the owned transport's capture), is [`Failed::Unstarted`],
+/// saying nothing was sent, and its script never ran, so a push it carried sent nothing
+/// (`remote::unanswered`). NEGATIVE CONTROLS: one interrupted after its child started is
+/// [`Failed::Ended`], of unknown outcome, and one left alone runs to its end.
+#[test]
+fn a_mutation_that_never_started_sent_nothing() {
+    let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+    let root = aterm_tempfile::tempdir().unwrap();
+    let marker = root.path().join("ran");
+    let script = |script: &str| -> Vec<OsString> {
+        vec![
+            "-c".into(),
+            script.into(),
+            "sh".into(),
+            marker.clone().into_os_string(),
+            sleep.clone().into_os_string(),
+        ]
+    };
+    let maker = |_: &Path| aterm_uds::spawnfd::command(&shell);
+    let missing = |_: &Path| aterm_uds::spawnfd::command(root.path().join("missing"));
+    let quick = script(r#"printf ran > "$1""#);
+    let live = || Instant::now() + HANG;
+    for (case, result) in [
+        (
+            "interrupted",
+            run(root.path(), &maker, Tool::Git, &quick, live(), &mut || true),
+        ),
+        (
+            "window ended",
+            run(
+                root.path(),
+                &maker,
+                Tool::Git,
+                &quick,
+                Instant::now(),
+                &mut || false,
+            ),
+        ),
+        (
+            "unstartable",
+            run(
+                root.path(),
+                &missing,
+                Tool::Git,
+                &quick,
+                live(),
+                &mut || false,
+            ),
+        ),
+        (
+            "unstartable capture",
+            capture(&mut missing(root.path()), live(), &mut || false, LIMIT),
+        ),
+        (
+            "interrupted capture",
+            capture(&mut maker(root.path()), live(), &mut || true, LIMIT),
+        ),
+    ] {
+        match result {
+            Err(Failed::Unstarted(why)) => {
+                assert!(why.ends_with("nothing was sent"), "{case}: {why}")
+            }
+            other => panic!("{case}: {other:?}"),
+        }
+        assert!(!marker.exists(), "{case}: the write ran");
+    }
+    let held = script(r#"printf ran > "$1"; exec "$2" 60"#);
+    let ended = run(root.path(), &maker, Tool::Git, &held, live(), &mut || {
+        marker.exists()
+    });
+    assert!(matches!(ended, Err(Failed::Ended(_))), "{ended:?}");
+    std::fs::remove_file(&marker).unwrap();
+    let ran = run(root.path(), &maker, Tool::Git, &quick, live(), &mut || {
+        false
+    })
+    .unwrap();
+    assert!(ran.status.success());
+    assert_eq!(std::fs::read(&marker).unwrap(), b"ran");
 }

@@ -37,6 +37,20 @@ const PAGE: u32 = crate::transport::POST_PAGE;
 /// Verdicts kept in `journal` (must exceed [`PAGE`]).
 const JOURNAL_KEEP: usize = 1024;
 
+/// The file a log's store holds while it began as a first run beside a store the notifier held
+/// ([`Store::for_log`]): the held logs it names, one identity a line, any of whose stores a
+/// step stored later may carry into it ([`Store::unproved`], [`Store::recarry`]). A build
+/// before it never reads the name.
+const UNPROVED: &str = "unproved";
+
+/// How soon a follower whose log in hand is [`UNPROVED`] reads the steps again
+/// ([`Notifier::poll_proved`]), each read with none that reaches it doubling the wait, to
+/// [`PROVED_POLL_MAX`].
+const PROVED_POLL: Duration = Duration::from_secs(1);
+
+/// The longest a follower waits between two reads of the steps ([`PROVED_POLL`]).
+const PROVED_POLL_MAX: Duration = Duration::from_secs(64);
+
 /// Number of non-root log stores (`logs/<identity>/`) retained by [`Store::prune_logs`].
 const LOGS_KEEP: usize = 4;
 
@@ -169,7 +183,60 @@ enum Notice {
 struct ReadLog {
     id: Option<astream_broker::LogIdentity>,
     lineage: Option<astream_broker::Lineage>,
+    /// The steps a bridge proved and stored, as they stood when the reader reached the log
+    /// ([`Steps::read`]): where a log astream gave another id keeping its records continues
+    /// one held before it ([`Store::predecessor`]).
+    proved: Steps,
     ordered: bool,
+    /// The re-carries the notifier had made ([`Hold::carried`]) when the reader read its store,
+    /// read before it: a reader whose count is behind reads from a place a re-carry lowered
+    /// since, so the notifier takes none of its notices and it connects again
+    /// ([`Notifier::stale`]).
+    carried: u64,
+}
+
+/// The steps (ATERM-KI-1116-7314) one read of the steps files found ([`proved_steps`]), or why
+/// it found none: a read that failed fails only the build of a store for a log the root's is not
+/// ([`Steps::get`], [`Store::for_log`]), never a connect to a log whose store stands; a store
+/// marked [`UNPROVED`] is taken up still waiting on a step, and the next read decides
+/// ([`Store::unproved`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Steps(Result<Vec<crate::state::Proved>, (io::ErrorKind, String)>);
+
+impl Default for Steps {
+    fn default() -> Self {
+        Self(Ok(Vec::new()))
+    }
+}
+
+impl From<Vec<crate::state::Proved>> for Steps {
+    fn from(steps: Vec<crate::state::Proved>) -> Self {
+        Self(Ok(steps))
+    }
+}
+
+impl<const N: usize> From<[crate::state::Proved; N]> for Steps {
+    fn from(steps: [crate::state::Proved; N]) -> Self {
+        Self(Ok(steps.to_vec()))
+    }
+}
+
+impl Steps {
+    /// The steps `cfg`'s steps files hold now ([`proved_steps`]), or why they did not read.
+    fn read(cfg: &Config) -> Self {
+        Self(proved_steps(cfg).map_err(|e| (e.kind(), e.to_string())))
+    }
+
+    /// The steps, for a decision made by them.
+    ///
+    /// # Errors
+    /// The read's: no decision is made by a read that may have missed a step.
+    fn get(&self) -> io::Result<&[crate::state::Proved]> {
+        self.0
+            .as_ref()
+            .map(Vec::as_slice)
+            .map_err(|(kind, said)| io::Error::new(*kind, said.clone()))
+    }
 }
 
 #[derive(Debug)]
@@ -725,6 +792,11 @@ struct Hold {
     lock: StoreLock,
     /// The refusal's kind and words, set by the first check that found the path moved.
     lost: std::sync::OnceLock<(io::ErrorKind, String)>,
+    /// How many times the notifier carried a held store into a log's store that began with no
+    /// carry ([`Notifier::recarry`]), counted once the carry is on the media: each lowers that
+    /// store's cursors, so a reader that read its place before the count moved connects again
+    /// ([`ReadLog::carried`]).
+    carried: std::sync::atomic::AtomicU64,
 }
 
 impl Hold {
@@ -734,7 +806,13 @@ impl Hold {
             directory,
             lock,
             lost: std::sync::OnceLock::new(),
+            carried: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// [`Self::carried`] now.
+    fn carried(&self) -> u64 {
+        self.carried.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether the store's path still names the directory held ([`StoreLock::moved`], one `lstat`).
@@ -809,6 +887,52 @@ impl<Access> Store<Access> {
             },
             Err(error) => Err(error),
         }
+    }
+}
+
+/// What a held store's carry onto a log rests on ([`Store::carried_from`]), in the order one is
+/// preferred: a proved step, by how recently this notifier took the store up (its place in
+/// `logs/used`, [`Store::prune_logs`], one past it, and 0 for a store that file does not name:
+/// the root's before any other was taken up), below a moved generation, by the generation held.
+/// A held store of the new log's own id was taken up after any step that reached that id, or
+/// began as a first run before one did: one begun beside the held stores is marked
+/// [`UNPROVED`] ([`Store::begin_unproved`]), so a step from a log it names still carries that
+/// log's store after it ([`Store::unproved`]); one carried from a marked store is not
+/// ([`Store::carry`]), a first run for good. Either carry misses no record its source's store
+/// would judge (each cursor at most its own fork); the rank only picks the one that judges the
+/// fewest again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Carry {
+    Proved(usize),
+    Lineage(u64),
+}
+
+/// What a log's store that began with no carry ([`UNPROVED`]) is owed now
+/// ([`Store::unproved`]).
+#[derive(Debug)]
+enum Unproved {
+    /// A step stored since reaches it from a held log the marker names: carry that store below
+    /// the fork into it ([`Store::recarry`]).
+    Carry(Store<ReadOnly>, u64),
+    /// No step reaches it yet; one stored later may.
+    Wait,
+    /// Its own journal holds [`JOURNAL_KEEP`] verdicts, so it may have let go of one that a
+    /// carry would have it judge again: it can no longer prove what it paged, and no step
+    /// carries into it; its marker goes, and it stays the first run it began as.
+    Spent,
+}
+
+impl Unproved {
+    /// [`Unproved::Wait`] for `log`'s store where `what` did not read ([`Store::unproved`],
+    /// [`Store::recarry`]), said: no step is decided by a read that may have missed one, and
+    /// waiting decides nothing a later read cannot take back (the marker kept, [`Unproved::Spent`]
+    /// decided before any read).
+    fn unread(log: astream_broker::LogIdentity, what: &str, error: &io::Error) -> Self {
+        eprintln!(
+            "aterm-link notify: could not read {what} ({error}): the store of log {log} is taken \
+             up as the first run it began as, still waiting on a step, and the next read decides"
+        );
+        Self::Wait
     }
 }
 
@@ -953,35 +1077,61 @@ impl Store {
         Ok(parent)
     }
 
-    /// Return the [`Store`] for `log`.
+    /// The log the root store is the store of (its `log` file): none where no log was read yet.
+    ///
+    /// # Errors
+    /// The file is there and does not read, or names no log identity.
+    fn owner(&self) -> io::Result<Option<astream_broker::LogIdentity>> {
+        match self.read_text("log", 4096) {
+            Ok(saved) => Ok(Some(
+                astream_broker::LogIdentity::parse(saved.trim_end_matches('\n')).ok_or_else(
+                    || io::Error::new(io::ErrorKind::InvalidData, "invalid notifier log identity"),
+                )?,
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match self.metadata("log") {
+                Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(other) => Err(other),
+                Ok(_) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return the [`Store`] for `log`, built first from the store of a log it continues where
+    /// it has none ([`Store::predecessor`]: by astream's `lineage`, or by the `proved` steps).
+    /// One that continues none held is built as a first run marked [`UNPROVED`], naming every
+    /// log held then, in one publish ([`Store::begin_unproved`]), so a step a bridge stores
+    /// after this can still carry one of them into it ([`Notifier::recarry`]): a reader that
+    /// reaches the new log before the bridge proved it continues the old one takes nothing
+    /// for good. A store that has one already is returned as it is, whatever the steps.
+    ///
+    /// # Errors
+    /// The root's `log` file, a held store or a write; and, for a store it builds where no held
+    /// log's lineage reaches `log`, a steps read that failed ([`Steps::get`]).
     fn for_log(
         &self,
         log: Option<astream_broker::LogIdentity>,
         lineage: Option<&astream_broker::Lineage>,
+        proved: &Steps,
     ) -> io::Result<Store> {
         let Some(log) = log else {
             return Ok(self.clone());
         };
         let name = log.to_string();
-        let owner = match self.read_text("log", 4096) {
-            Ok(saved) => Some(
-                astream_broker::LogIdentity::parse(saved.trim_end_matches('\n')).ok_or_else(
-                    || io::Error::new(io::ErrorKind::InvalidData, "invalid notifier log identity"),
-                )?,
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => match self.metadata("log") {
-                Err(missing) if missing.kind() == io::ErrorKind::NotFound => None,
-                Err(other) => return Err(other),
-                Ok(_) => return Err(error),
-            },
-            Err(error) => return Err(error),
-        };
-        match owner {
+        match self.owner()? {
             None => {
                 self.write("log", &name, Flush::Ordered)?;
                 Ok(self.clone())
             }
-            Some(owner) if owner == log => Ok(self.clone()),
+            Some(owner) if owner == log => {
+                if let Err(error) = self.note_root_used(&name) {
+                    eprintln!(
+                        "aterm-link notify: could not note the root store's use in {}: {error}",
+                        self.root.join("logs/used").display()
+                    );
+                }
+                Ok(self.clone())
+            }
             Some(owner) => {
                 let logs = self.child("logs", true)?;
                 let absent = match logs.directory.stat(std::ffi::OsStr::new(&name)) {
@@ -990,12 +1140,28 @@ impl Store {
                     Err(error) => return Err(error),
                 };
                 if absent {
-                    if let Some((from, fork)) = self.predecessor(owner, log, lineage)? {
-                        logs.carry(&from, &name, fork)?;
+                    let held = self.held(owner)?;
+                    // A moved generation of a held log carries by astream's lineage, which
+                    // outranks every proved step ([`Carry`]): its build reads no step, so a steps
+                    // file that does not read refuses only a build no lineage decides.
+                    let by_lineage = lineage.is_some_and(|l| {
+                        held.iter().any(|(earlier, _)| {
+                            *earlier != log && log.continues(*earlier, l).is_some()
+                        })
+                    });
+                    let proved = if by_lineage { &[][..] } else { proved.get()? };
+                    let names: Vec<astream_broker::LogIdentity> = held
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .filter(|id| *id != log)
+                        .collect();
+                    match self.predecessor(held, log, lineage, proved) {
+                        Some((from, fork)) => logs.carry(&from, &name, fork)?,
+                        None => logs.begin_unproved(&name, &names)?,
                     }
                 }
                 let directory = logs.directory.child(std::ffi::OsStr::new(&name), true)?;
-                if let Err(error) = self.prune_logs(&name) {
+                if let Err(error) = self.prune_logs(&owner.to_string(), &name) {
                     eprintln!(
                         "aterm-link notify: could not prune stores under {}: {error}",
                         logs.root.display()
@@ -1010,15 +1176,15 @@ impl Store {
         }
     }
 
-    fn predecessor(
+    /// The stores this notifier holds, each with the log it is the store of: the root's
+    /// (`owner`'s) and each `logs/<id>/`, read only.
+    ///
+    /// # Errors
+    /// `logs/` or one of its stores does not open, or `logs/` does not list.
+    fn held(
         &self,
         owner: astream_broker::LogIdentity,
-        log: astream_broker::LogIdentity,
-        lineage: Option<&astream_broker::Lineage>,
-    ) -> io::Result<Option<(Store<ReadOnly>, u64)>> {
-        let Some(lineage) = lineage else {
-            return Ok(None);
-        };
+    ) -> io::Result<Vec<(astream_broker::LogIdentity, Store<ReadOnly>)>> {
         let mut held = vec![(owner, self.read_only())];
         match self.directory.child(std::ffi::OsStr::new("logs"), false) {
             Ok(logs) => {
@@ -1039,16 +1205,101 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        Ok(held
-            .into_iter()
-            .filter(|(earlier, _)| *earlier != log)
-            .filter_map(|(earlier, store)| {
-                Some((earlier.generation, store, log.continues(earlier, lineage)?))
-            })
-            .max_by_key(|(generation, _, _)| *generation)
-            .map(|(_, store, fork)| (store, fork)))
+        Ok(held)
     }
 
+    /// The held store `log`'s is built from where it has none ([`Store::for_log`]), and the fork
+    /// below which it continues that store's log: of the stores `held` ([`Store::held`]), the
+    /// one [`Store::carried_from`] ranks first. `None` where `log` continues none held.
+    fn predecessor(
+        &self,
+        held: Vec<(astream_broker::LogIdentity, Store<ReadOnly>)>,
+        log: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+        proved: &[crate::state::Proved],
+    ) -> Option<(Store<ReadOnly>, u64)> {
+        if lineage.is_none() && proved.is_empty() {
+            return None;
+        }
+        self.carried_from(held, log, lineage, proved)
+    }
+
+    /// Of the stores `held`, the one `log` continues, and its fork ([`Carry`]): one `log` is a
+    /// moved generation of by astream's `lineage`, the newest generation held, else one a bridge
+    /// proved `log` continues (ATERM-KI-1116-7314: astream gave the log another id keeping its
+    /// records, and the bridge read back the records it told). Each step stored from a held log
+    /// is a proof of its own ([`crate::state::Proved::continues`] of that step alone): of a
+    /// store's steps that reach `log`, the highest fork; and of the stores they reach it from,
+    /// the one this notifier took up last (`logs/used`), never a step's place in `proved`,
+    /// which joins two bridges' files in no order of time. A step names both logs by their
+    /// identities, so one another bridge stored of logs this notifier never held carries
+    /// nothing. `None` where `log` continues none of them.
+    fn carried_from(
+        &self,
+        held: Vec<(astream_broker::LogIdentity, Store<ReadOnly>)>,
+        log: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+        proved: &[crate::state::Proved],
+    ) -> Option<(Store<ReadOnly>, u64)> {
+        #[cfg(test)]
+        let proved = if FORGET_PROVED.with(std::cell::Cell::get) {
+            &[]
+        } else {
+            proved
+        };
+        let used = self.used();
+        held.into_iter()
+            .filter(|(earlier, _)| *earlier != log)
+            .filter_map(|(earlier, store)| {
+                let (carry, fork) = match lineage.and_then(|l| log.continues(earlier, l)) {
+                    Some(fork) => (Carry::Lineage(earlier.generation), fork),
+                    None => {
+                        let fork = proved
+                            .iter()
+                            .filter(|step| step.was == earlier)
+                            .filter_map(|step| {
+                                crate::state::Proved::continues(
+                                    std::slice::from_ref(step),
+                                    earlier,
+                                    log,
+                                    lineage,
+                                )
+                            })
+                            .max()?;
+                        let name = earlier.to_string();
+                        let at = used.iter().rposition(|u| *u == name).map_or(0, |at| at + 1);
+                        (Carry::Proved(at), fork)
+                    }
+                };
+                Some((carry, store, fork))
+            })
+            .max_by_key(|(carry, _, _)| *carry)
+            .map(|(_, store, fork)| (store, fork))
+    }
+
+    /// The logs `logs/used` names, the one taken up last last ([`Store::prune_logs`]); none
+    /// where it does not read, which only ranks a carry ([`Carry`]).
+    fn used(&self) -> Vec<String> {
+        self.read("logs/used")
+            .map(|text| {
+                text.lines()
+                    .filter(|line| astream_broker::LogIdentity::parse(line).is_some())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Build `logs/<name>/` (this is `logs/`) from `from`'s store below `fork`: every cursor at
+    /// most the fork, the verdicts below it, the standing values as they are, and no
+    /// [`UNPROVED`] marker whatever `from` holds: one carried from a store still waiting on a
+    /// step is a first run for good from its making, and what that store's own late step would
+    /// have carried into it (the records between the held cursor and its first-run start) is
+    /// never judged here. Made in a scratch directory and published whole
+    /// ([`Store::publish_store`]).
+    ///
+    /// # Errors
+    /// `from`'s journal does not read, or a write.
     fn carry(&self, from: &Store<ReadOnly>, name: &str, fork: u64) -> io::Result<()> {
         let temporary = self.directory.temporary("carry", true)?;
         let TemporaryData::Directory(directory) = &temporary.data else {
@@ -1077,7 +1328,38 @@ impl Store {
             ..journal::Verdicts::default()
         };
         built.set_verdicts(&below, Flush::Ordered)?;
-        flush_dir(&built.directory, Flush::Durable)?;
+        self.publish_store(temporary, name)
+    }
+
+    /// Build `logs/<name>/` (this is `logs/`) as a first run beside the logs `held`: empty but for
+    /// its [`UNPROVED`] marker naming them, made in a scratch directory and published whole
+    /// ([`Store::publish_store`]), so no crash leaves the store without its marker.
+    fn begin_unproved(&self, name: &str, held: &[astream_broker::LogIdentity]) -> io::Result<()> {
+        let temporary = self.directory.temporary("carry", true)?;
+        let TemporaryData::Directory(directory) = &temporary.data else {
+            return Err(io::Error::other(
+                "notify directory temporary has the wrong kind",
+            ));
+        };
+        let built = Store {
+            root: directory.path.clone(),
+            directory: Arc::clone(directory),
+            access: self.access.clone(),
+        };
+        let names: Vec<String> = held.iter().map(ToString::to_string).collect();
+        built.put(UNPROVED, &names.join("\n"))?;
+        self.publish_store(temporary, name)
+    }
+
+    /// Publish the store built in `temporary` as `name` (this is `logs/`), its entries and then
+    /// its name flushed in full; one another reader published first under the name stands.
+    fn publish_store(&self, temporary: directory::Temporary, name: &str) -> io::Result<()> {
+        let TemporaryData::Directory(built) = &temporary.data else {
+            return Err(io::Error::other(
+                "notify directory temporary has the wrong kind",
+            ));
+        };
+        flush_dir(built, Flush::Durable)?;
         match temporary.publish(&self.directory, std::ffi::OsStr::new(name)) {
             Ok(()) => flush_dir(&self.directory, Flush::Durable),
             Err(error)
@@ -1093,20 +1375,196 @@ impl Store {
         }
     }
 
-    fn prune_logs(&self, name: &str) -> io::Result<()> {
-        let mut used: Vec<String> = self
-            .read("logs/used")
-            .map(|text| {
-                text.lines()
-                    .filter(|line| {
-                        *line != name && astream_broker::LogIdentity::parse(line).is_some()
-                    })
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// What `log`'s store, built as a first run ([`UNPROVED`]) and whose journal holds `own`, is
+    /// owed by the steps `proved` now (this is the root store): `None` where it is not marked
+    /// (or is the root's own). A marker stands until a step from a log it names reaches `log`,
+    /// however long that takes and whatever [`LOGS_KEEP`] prunes, since it names the root's log,
+    /// whose store is never pruned (one whose words name no log is read as naming the root's
+    /// alone); or until `own` holds [`JOURNAL_KEEP`] verdicts ([`Unproved::Spent`]). Else, of the
+    /// root's store and the held ones the marker names ([`Store::held`]), the one
+    /// [`Store::carried_from`] ranks first a step reaches it from. Where the steps did not read
+    /// ([`Steps::get`]) or a held store does not open, [`Unproved::Wait`], said
+    /// ([`Unproved::unread`]): the store is taken up as the first run it began as, its marker
+    /// kept, and the next read decides (a follower's poll reads the steps afresh,
+    /// [`Notifier::poll_proved`]; `--once` leaves it to the next run). NEGATIVE CONTROL
+    /// ([`SKIP_RECARRY`]): `None`, the store a first run for good, as before the marker.
+    ///
+    /// # Errors
+    /// The root's `log` file or the marker does not read.
+    fn unproved(
+        &self,
+        log: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+        proved: &Steps,
+        own: &journal::Verdicts,
+    ) -> io::Result<Option<Unproved>> {
+        #[cfg(test)]
+        if SKIP_RECARRY.with(std::cell::Cell::get) {
+            return Ok(None);
+        }
+        let Some(owner) = self.owner()?.filter(|owner| *owner != log) else {
+            return Ok(None);
+        };
+        let Some(marker) = self.carry_text(&format!("logs/{log}/{UNPROVED}"))? else {
+            return Ok(None);
+        };
+        if own.lines.len() >= JOURNAL_KEEP {
+            return Ok(Some(Unproved::Spent));
+        }
+        let proved = match proved.get() {
+            Ok(proved) => proved,
+            Err(error) => return Ok(Some(Unproved::unread(log, "the steps", &error))),
+        };
+        let named: Vec<astream_broker::LogIdentity> = marker
+            .lines()
+            .filter_map(astream_broker::LogIdentity::parse)
+            .collect();
+        let held = match self.held(owner) {
+            Ok(held) => held,
+            Err(error) => return Ok(Some(Unproved::unread(log, "a held store", &error))),
+        };
+        let held: Vec<_> = held
+            .into_iter()
+            .filter(|(id, _)| *id != log && (*id == owner || named.contains(id)))
+            .collect();
+        Ok(Some(match self.carried_from(held, log, lineage, proved) {
+            Some((from, fork)) => Unproved::Carry(from, fork),
+            None => Unproved::Wait,
+        }))
+    }
+
+    /// The journal `log`'s store, built as a first run, holds once `from`'s store is carried into
+    /// it below `fork` ([`Store::recarry`]): of `own` (what it judged as a first run) and of
+    /// `from`'s (`held`), each selector's cursor the lower of its own and the held one at most
+    /// the fork (a selector only its own has keeps its own, one only the held store has takes
+    /// the held one at most the fork); the held store's verdicts below the fork, then its own,
+    /// the newest per record ([`journal::note`]: where the two pass [`JOURNAL_KEEP`], the held
+    /// store's oldest go, never its own, which a carry leaves fewer than that, [`Unproved::Spent`]),
+    /// so no record it paged as a first run pages again while the journal keeps its verdict; the
+    /// held store's standing values, as a carry at the store's making takes them
+    /// ([`Store::carry`]), never its own, which its warm-up seeded from records past the gap and
+    /// its records past its first-run start set: under them a need raised in the gap, or a token
+    /// raised and cleared there that its own records raised again, would stand unpaged. Each
+    /// record of its own that set or cleared one lies at or above the lowered cursor of a
+    /// selector both stores hold, and is judged again with its verdict kept, so a value it paged
+    /// stands again and pages nothing; or below it, where the held store judged that record too.
+    /// A selector only its own has keeps its cursor and so loses the values its records set: an
+    /// `attention` token among them can page once again (a `need` selector's warm-up seeds its
+    /// needs again). Its own stamps and count. So the records from that cursor to where it
+    /// started as a first run are judged now, none missed; those from the fork to the held
+    /// cursor again, as the carry at its making would. Each hit among them that neither store
+    /// judged (the gap's) adds a verdict, and past [`JOURNAL_KEEP`] the oldest go first, the held
+    /// store's and then its own, maybe before their records are read again: where its own
+    /// verdicts and those hits pass the bound, a record near it that either store paged can page
+    /// again (a bound on the records read is no bound on the hits, which are known only once
+    /// judged, so none is decided here). Merged again from the same held store (its marker left
+    /// standing), each cursor falls to the fork again and the held store's standing values
+    /// return, the verdicts kept: what was judged since the first merge is judged again and
+    /// pages nothing again; a journal unchanged since is merged to the same cursors, verdicts
+    /// and values.
+    fn recarried(own: journal::Verdicts, held: journal::Verdicts, fork: u64) -> journal::Verdicts {
+        let mut lines: std::collections::VecDeque<String> = held
+            .lines
+            .into_iter()
+            .filter(|line| journal::offset_of(line).is_some_and(|off| off < fork))
+            .collect();
+        for line in own.lines {
+            journal::note(&mut lines, line);
+        }
+        let mut cursors = own.cursors;
+        for (key, off) in held.cursors {
+            let off = off.min(fork);
+            cursors
+                .entry(key)
+                .and_modify(|have| *have = (*have).min(off))
+                .or_insert(off);
+        }
+        journal::Verdicts {
+            lines,
+            cursors,
+            standing: held.standing,
+            ..own
+        }
+    }
+
+    /// Carry into `file`, the journal of `log`'s store as this notifier opened it
+    /// ([`Store::load`], which salvages a damaged one), what [`Store::unproved`] says that store
+    /// is owed by the steps `proved` now (this is the root store): on [`Unproved::Carry`], the
+    /// journal [`Store::recarried`] says written again whole, ordered ([`StepsFile::rewrite_as`]),
+    /// the marker left for the caller to remove once it counted the carry
+    /// ([`Notifier::recarried`], [`Notifier::drop_marker`]). A held store whose journal does not
+    /// read carries nothing: [`Unproved::Wait`], said ([`Unproved::unread`]), `file` as it was. A
+    /// marker left standing has the next carry merge the same held store into the merged journal
+    /// again, its cursors falling to the fork again: what was judged since is judged again and
+    /// pages nothing again ([`Store::recarried`]).
+    ///
+    /// # Errors
+    /// [`Store::unproved`]'s, or the write: `file` then holds what it held.
+    fn recarry(
+        &self,
+        file: &mut StepsFile,
+        log: astream_broker::LogIdentity,
+        lineage: Option<&astream_broker::Lineage>,
+        proved: &Steps,
+    ) -> io::Result<Option<Unproved>> {
+        let owed = self.unproved(log, lineage, proved, &file.held)?;
+        if let Some(Unproved::Carry(from, fork)) = &owed {
+            let held = match from.read_verdicts() {
+                Ok(held) => held,
+                Err(error) => return Ok(Some(Unproved::unread(log, "a held store", &error))),
+            };
+            let merged = Self::recarried(file.held.clone(), held, *fork);
+            file.rewrite_as(merged, Flush::Ordered)?;
+        }
+        Ok(owed)
+    }
+
+    /// Remove this store's [`UNPROVED`] marker, flushed in full: it no longer waits on a step
+    /// ([`Notifier::drop_marker`]). A test can refuse it as it refuses a write ([`test_fault`]).
+    ///
+    /// # Errors
+    /// The unlink, but for a marker gone already, or the flush.
+    fn drop_unproved(&self) -> io::Result<()> {
+        test_fault(UNPROVED)?;
+        match self.directory.remove(std::ffi::OsStr::new(UNPROVED), false) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        flush_dir(&self.directory, Flush::Durable)
+    }
+
+    /// Note the root store, of `owner`, as the one taken up last in `logs/used`, where that file
+    /// is (so another log's store was taken up before) and names another last: a carry ranks
+    /// the stores by it ([`Carry`]).
+    fn note_root_used(&self, owner: &str) -> io::Result<()> {
+        let used = self.used();
+        if used.is_empty() || used.last().is_some_and(|last| last == owner) {
+            return Ok(());
+        }
+        let mut used: Vec<String> = used.into_iter().filter(|u| u != owner).collect();
+        used.push(owner.to_owned());
+        self.write("logs/used", &used.join("\n"), Flush::Ordered)
+    }
+
+    /// Note `name`'s store as the one taken up last in `logs/used`, and remove every other
+    /// `logs/<id>/` but the [`LOGS_KEEP`] taken up last. The root's `owner` there (its use,
+    /// [`Store::note_root_used`]) keeps its place and counts toward none.
+    fn prune_logs(&self, owner: &str, name: &str) -> io::Result<()> {
+        let mut used: Vec<String> = self.used().into_iter().filter(|u| u != name).collect();
         used.push(name.to_owned());
-        let keep = used.split_off(used.len().saturating_sub(LOGS_KEEP));
+        let mut others = 0;
+        let mut keep: Vec<String> = used
+            .into_iter()
+            .rev()
+            .filter(|u| {
+                u == owner || {
+                    others += 1;
+                    others <= LOGS_KEEP
+                }
+            })
+            .collect();
+        keep.reverse();
         self.write("logs/used", &keep.join("\n"), Flush::Ordered)?;
         let logs = self.directory.child(std::ffi::OsStr::new("logs"), false)?;
         for entry in logs.names()? {
@@ -1276,6 +1734,10 @@ pub struct Config {
     pub since: Since,
     pub once: bool,
     pub exec_timeout: Duration,
+    /// The state dir of this Mac's fabric bridge, where it dials `broker` and is not
+    /// `state_dir` ([`fabric_bridge_state`]): the steps it proved are read beside those of a
+    /// bridge sharing `state_dir` ([`proved_steps`]).
+    pub bridge_state: Option<String>,
 }
 
 /// What one run did, for the closing line and for the tests.
@@ -1373,6 +1835,20 @@ struct Notifier {
     failing: Option<Failing>,
     /// How long it waits after a refused write ([`RETRY_EVERY`]).
     retry_every: Duration,
+    /// While the log in hand's store is [`UNPROVED`], or its marker's removal is owed
+    /// ([`Self::drop_owed`]): when a follower tries again, and the wait after that try
+    /// ([`Notifier::poll_proved`]).
+    proved_poll: Option<(Instant, Duration)>,
+    /// The first of those waits ([`PROVED_POLL`]; a test's own drives the poll quickly, or
+    /// pushes it out of reach).
+    proved_every: Duration,
+    /// The log in hand's store was carried into, or can no longer be ([`Unproved::Spent`]), and
+    /// the removal of its marker was refused ([`Notifier::drop_marker`]): the follower's poll
+    /// removes it, and carries nothing again.
+    drop_owed: bool,
+    /// The lineage of the log in hand as its reader read it ([`ReadLog::lineage`]), which a
+    /// step from a log before a moved generation reaches it by ([`Notifier::recarry`]).
+    log_lineage: Option<astream_broker::Lineage>,
     /// A test's clock ([`Notifier::now`]).
     #[cfg(test)]
     clock: Option<Instant>,
@@ -1463,6 +1939,10 @@ impl Notifier {
             stalled: false,
             failing: None,
             retry_every: RETRY_EVERY,
+            proved_poll: None,
+            proved_every: PROVED_POLL,
+            drop_owed: false,
+            log_lineage: None,
             #[cfg(test)]
             clock: None,
             #[cfg(test)]
@@ -1557,6 +2037,14 @@ impl Notifier {
 
     /// Read and write cursors and verdicts as the log `log`'s from here on ([`Store::for_log`]),
     /// the cursors owed the log in hand written to its store first ([`Notifier::persist`]).
+    /// A store that began as a first run ([`UNPROVED`]) is opened ([`Store::load`]) and asked
+    /// what the steps `read` holds owe it before it is taken up ([`Store::recarry`]): carried
+    /// into, the carry counted once its journal is written ([`Notifier::recarried`]: every
+    /// reader connects again) and its marker removed after ([`Notifier::drop_marker`]); one
+    /// still waiting on a step, or whose steps or held store did not read ([`Unproved::unread`]),
+    /// is taken up as its first run and has the follower read the steps again, afresh
+    /// ([`Notifier::poll_proved`]). Nothing is taken up where the store, its journal or the
+    /// carry's write fails, so the notice that asked is taken again, and asks again.
     fn scope_to(&mut self, read: &ReadLog) -> io::Result<()> {
         let log = read.id;
         if log == self.log_now {
@@ -1564,8 +2052,23 @@ impl Notifier {
         }
         self.held()?;
         self.persist()?;
-        let scoped = self.store.for_log(log, read.lineage.as_ref())?;
-        if scoped.root != self.log_store.root {
+        let scoped = self
+            .store
+            .for_log(log, read.lineage.as_ref(), &read.proved)?;
+        let switched = scoped.root != self.log_store.root;
+        let mut file = if switched && scoped.root != self.store.root {
+            Some(scoped.load()?)
+        } else {
+            None
+        };
+        let owed = match (log, file.as_mut()) {
+            (Some(id), Some(file)) => {
+                self.store
+                    .recarry(file, id, read.lineage.as_ref(), &read.proved)?
+            }
+            _ => None,
+        };
+        if switched {
             eprintln!(
                 "aterm-link notify: the broker serves {} — its cursors and journal are {}",
                 log.map_or_else(
@@ -1574,11 +2077,7 @@ impl Notifier {
                 ),
                 scoped.root.display()
             );
-            self.log_file = if scoped.root == self.store.root {
-                None
-            } else {
-                Some(scoped.load()?)
-            };
+            self.log_file = file;
             let held = &self.log_file.as_ref().unwrap_or(&self.root_file).held;
             self.journal = held.lines.clone();
             self.standing = held.standing.clone();
@@ -1586,7 +2085,166 @@ impl Notifier {
         }
         self.log_store = scoped;
         self.log_now = log;
+        self.log_lineage.clone_from(&read.lineage);
+        self.proved_poll = None;
+        self.drop_owed = false;
+        match (log, owed) {
+            (Some(id), Some(Unproved::Carry(..))) => {
+                self.recarried(id);
+                self.drop_marker();
+            }
+            (_, Some(Unproved::Spent)) => self.drop_marker(),
+            (_, Some(Unproved::Wait)) => {
+                let now = self.now();
+                let next = now.checked_add(self.proved_every).unwrap_or(now);
+                self.proved_poll = Some((next, self.proved_every));
+            }
+            _ => {}
+        }
         Ok(())
+    }
+
+    /// CARRY INTO THE LOG IN HAND what a step stored since it was taken up proves it continues
+    /// (ATERM-KI-1116-7314): its store began as a first run beside the stores held
+    /// ([`UNPROVED`]; a reader reached the new log before the bridge stored its step), and the
+    /// steps `proved` now reach it from a log its marker names. With nothing owed or left
+    /// ([`Notifier::persist`] first), its journal, which this notifier holds open, is written
+    /// again whole ([`Store::recarry`]); the carry is counted (every reader connects again from
+    /// the carried place, [`Notifier::recarried`]), then the marker removed
+    /// ([`Notifier::drop_marker`]). A store that can no longer prove what it paged
+    /// ([`Unproved::Spent`]) has its marker removed, a first run for good. A marker whose
+    /// removal is owed is removed, and nothing carried again. Otherwise nothing: a later read
+    /// of the steps tries again ([`Notifier::poll_proved`]).
+    ///
+    /// # Errors
+    /// The store's path no longer names it, a part or cursor owed refused, the root's `log` file
+    /// or the marker that does not read ([`Store::unproved`]), or the write of the carry.
+    fn recarry(&mut self, proved: &Steps) -> io::Result<()> {
+        let Some(log) = self.log_now.filter(|_| self.proved_poll.is_some()) else {
+            return Ok(());
+        };
+        if self.drop_owed {
+            self.drop_marker();
+            return Ok(());
+        }
+        if !self.dirty.is_empty() || !self.left.is_empty() || self.stalled {
+            return Ok(());
+        }
+        self.held()?;
+        self.persist()?;
+        let Some(file) = self.log_file.as_mut() else {
+            self.proved_poll = None;
+            return Ok(());
+        };
+        match self
+            .store
+            .recarry(file, log, self.log_lineage.as_ref(), proved)?
+        {
+            Some(Unproved::Carry(..)) => {
+                self.journal = file.held.lines.clone();
+                self.standing = file.held.standing.clone();
+                self.recarried(log);
+                self.drop_marker();
+            }
+            Some(Unproved::Spent) => self.drop_marker(),
+            Some(Unproved::Wait) => {}
+            None => self.proved_poll = None,
+        }
+        Ok(())
+    }
+
+    /// Remove the log in hand's [`UNPROVED`] marker, its carry counted or no longer to be made
+    /// ([`Store::drop_unproved`]): the follower's poll ends. Refused, it is said, never
+    /// propagated, and owed ([`Self::drop_owed`]): the follower's poll removes it again
+    /// ([`Notifier::poll_proved`]; `--once` leaves it to the next run). A marker that stands
+    /// only has the next connect carry the same held store into the merged journal again: its
+    /// cursors fall to the fork again, and what was judged since is judged again, its verdicts
+    /// kept, paging nothing again ([`Store::recarried`]); one whose unlink was not yet flushed
+    /// and comes back after a power loss does the same.
+    fn drop_marker(&mut self) {
+        match self.log_store.drop_unproved() {
+            Ok(()) => {
+                self.drop_owed = false;
+                self.proved_poll = None;
+            }
+            Err(e) => {
+                eprintln!(
+                    "aterm-link notify: could not remove {} ({e}); it tries again, and until it is \
+                     gone a connect carries the store into it again, paging nothing again",
+                    self.log_store.root.join(UNPROVED).display()
+                );
+                self.drop_owed = true;
+                if self.proved_poll.is_none() {
+                    let now = self.now();
+                    let next = now.checked_add(self.proved_every).unwrap_or(now);
+                    self.proved_poll = Some((next, self.proved_every));
+                }
+            }
+        }
+    }
+
+    /// Count a carry into `log`'s store, on the media now ([`Hold::carried`]): every reader
+    /// connects again and reads from the carried place, and what any handed on before it is
+    /// dropped ([`Notifier::stale`]): the records held for durability, the scans and durable
+    /// heads told, a `need` watch's folds (its reader's warm-up folds them again), the cursors
+    /// owed (each written before the carry, [`Notifier::persist`]).
+    fn recarried(&mut self, log: astream_broker::LogIdentity) {
+        self.hold
+            .carried
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        for held in &mut self.held {
+            held.clear();
+        }
+        self.held_bytes = 0;
+        self.scanned.iter_mut().for_each(|s| *s = None);
+        self.durable.iter_mut().for_each(|d| *d = 0);
+        self.lag.clear();
+        self.need = NeedWatch::new(&self.cfg.fleet);
+        self.need_fresh = true;
+        self.proved_poll = None;
+        eprintln!(
+            "aterm-link notify: a step stored since proves that log {log} continues a log read \
+             before it: its store now carries that log's below the step's fork, and its records \
+             from there are read again"
+        );
+    }
+
+    /// While the log in hand's store waits on a step ([`UNPROVED`]), read the steps once the
+    /// wait is out ([`Steps::read`]) and carry where one reaches it ([`Notifier::recarry`]), or
+    /// remove its marker where that is owed ([`Self::drop_owed`]); a try that fails or does
+    /// nothing waits twice as long, to [`PROVED_POLL_MAX`]. A follower whose readers stay
+    /// attached learns of a step only so.
+    fn poll_proved(&mut self, now: Instant) {
+        let Some((next, wait)) = self.proved_poll else {
+            return;
+        };
+        if now < next {
+            return;
+        }
+        let proved = if self.drop_owed {
+            Steps::default()
+        } else {
+            Steps::read(&self.cfg)
+        };
+        if let Err(e) = self.recarry(&proved) {
+            eprintln!(
+                "aterm-link notify: could not carry the store of the log in hand (it began as a \
+                 first run): {e}; it tries again"
+            );
+        }
+        if self.proved_poll.is_some() {
+            let next = now.checked_add(wait).unwrap_or(now);
+            self.proved_poll = Some((next, wait.saturating_mul(2).min(PROVED_POLL_MAX)));
+        }
+    }
+
+    /// Whether reader `idx` read its place before the last carry ([`Hold::carried`]): none of
+    /// its notices is taken, a start it hands on is refused, and it connects again
+    /// ([`reader`]).
+    fn stale(&self, idx: usize) -> bool {
+        self.reader_log
+            .get(idx)
+            .is_some_and(|log| log.carried != self.hold.carried())
     }
 
     fn preflight(&self) -> Result<(), String> {
@@ -2310,14 +2968,16 @@ impl Notifier {
     }
 
     /// When the follower next has something to write by the clock: the oldest cursor owed
-    /// falling due ([`Notifier::persist_due`]), or a refused write's retry
-    /// ([`Notifier::settle`], [`Notifier::drain`]).
+    /// falling due ([`Notifier::persist_due`]), a refused write's retry
+    /// ([`Notifier::settle`], [`Notifier::drain`]), or its next read of the steps
+    /// ([`Notifier::poll_proved`]).
     fn next_due(&self) -> Option<Instant> {
         self.lag
             .values()
             .filter(|lag| !lag.retry)
             .filter_map(|lag| lag.since.checked_add(self.cursor_every))
             .chain(self.failing.map(|f| f.next))
+            .chain(self.proved_poll.map(|(next, _)| next))
             .min()
     }
 
@@ -2883,13 +3543,17 @@ impl Notifier {
 
     /// Once a refused write's retry is due, write the parts owed first ([`Notifier::rewrite`]),
     /// so what waits behind them is done at that retry; then do what a refused write left
-    /// ([`Notifier::drain`]), and write what is owed and due ([`Notifier::settle`]).
+    /// ([`Notifier::drain`]), write what is owed and due ([`Notifier::settle`]), and, all of
+    /// it done, read the steps where that is due ([`Notifier::poll_proved`]).
     fn tick(&mut self, now: Instant) -> io::Result<()> {
         if !self.dirty.is_empty() && self.writable(now) {
             let _ = self.rewrite(now);
         }
         let drained = self.drain(now);
         self.settle(self.now());
+        if drained.is_ok() {
+            self.poll_proved(self.now());
+        }
         drained
     }
 
@@ -2956,11 +3620,22 @@ impl Notifier {
                     self.durable_said[idx] = false;
                     self.over_paged[idx] = None;
                 }
+                let reached = log.id.is_some() && log.id == self.log_now;
+                let proved = log.proved.clone();
                 self.reader_log[idx] = log;
-                if !ordered && !self.held[idx].is_empty() {
+                if reached {
+                    if let Err(e) = self.recarry(&proved) {
+                        eprintln!(
+                            "aterm-link notify: could not carry the store of the log in hand (it \
+                             began as a first run): {e}; it tries again"
+                        );
+                    }
+                }
+                if !ordered && !self.held[idx].is_empty() && !self.stale(idx) {
                     self.release(idx, u64::MAX)?;
                 }
             }
+            Notice::Warm(idx, ..) | Notice::Durable(idx, _) if self.stale(idx) => {}
             Notice::Warm(idx, off, subject, body) => {
                 if self.need_fresh && matches!(self.cfg.on.get(idx), Some(Sel::Need(_))) {
                     self.need.warm(off, &subject, &body);
@@ -2970,6 +3645,9 @@ impl Notifier {
                 let Some(sel) = self.cfg.on.get(idx).cloned() else {
                     return Ok(());
                 };
+                if self.stale(idx) {
+                    return Ok(());
+                }
                 let log = self.reader_log[idx].clone();
                 if let Err(err) = self.scope_to(&log) {
                     return Err(Stalled {
@@ -2977,6 +3655,9 @@ impl Notifier {
                         err,
                         what: "the store of the log in hand",
                     });
+                }
+                if self.stale(idx) {
+                    return Ok(());
                 }
                 if let Some((err, what)) = self.owing() {
                     return Err(Stalled {
@@ -3031,6 +3712,9 @@ impl Notifier {
                 let Some(key) = self.cfg.on.get(idx).map(Sel::key) else {
                     return Ok(());
                 };
+                if self.stale(idx) {
+                    return Ok(());
+                }
                 if self.held[idx].is_empty() {
                     let log = self.reader_log[idx].clone();
                     if let Err(err) = self.scope_to(&log) {
@@ -3040,7 +3724,9 @@ impl Notifier {
                             what: "the store of the log in hand",
                         });
                     }
-                    self.checkpoint(&key, next);
+                    if !self.stale(idx) {
+                        self.checkpoint(&key, next);
+                    }
                 } else {
                     self.scanned[idx] = Some(self.scanned[idx].map_or(next, |s| s.max(next)));
                 }
@@ -3050,9 +3736,24 @@ impl Notifier {
                     return Ok(());
                 };
                 let log = self.reader_log[idx].clone();
-                let wrote = self
-                    .scope_to(&log)
-                    .and_then(|()| self.put_cursor(&key, head));
+                let carried = || {
+                    io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the store of the log was carried again since the reader read its place; \
+                         it connects again",
+                    )
+                };
+                let wrote = if self.stale(idx) {
+                    Err(carried())
+                } else {
+                    self.scope_to(&log).and_then(|()| {
+                        if self.stale(idx) {
+                            Err(carried())
+                        } else {
+                            self.put_cursor(&key, head)
+                        }
+                    })
+                };
                 if wrote.is_ok() && self.lag.get(&key).is_some_and(|lag| lag.want <= head) {
                     self.lag.remove(&key);
                 }
@@ -3078,6 +3779,9 @@ impl Notifier {
         let Some(sel) = self.cfg.on.get(idx).cloned() else {
             return Ok(());
         };
+        if self.stale(idx) {
+            return Ok(());
+        }
         let log = self.reader_log[idx].clone();
         if let Err(err) = self.scope_to(&log) {
             return Err(Stalled {
@@ -3086,7 +3790,7 @@ impl Notifier {
                 what: "the store of the log in hand",
             });
         }
-        while self.held[idx].front().is_some_and(|h| h.off < bound) {
+        while !self.stale(idx) && self.held[idx].front().is_some_and(|h| h.off < bound) {
             if let Some((err, what)) = self.owing() {
                 return Err(Stalled {
                     left: Left::Release(idx, bound),
@@ -3133,7 +3837,7 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, hold: &Arc<Hold>, tx: &mpsc::Sync
     let filter = sel.filter(&cfg.fleet);
     let key = sel.key();
     let mut seen: Option<u64> = None;
-    let mut seen_on: Option<PathBuf> = None;
+    let mut seen_on: Option<(PathBuf, u64)> = None;
     let mut backoff = Backoff::default();
     let mut outage = transport::Outage::default();
     let say = |line: Option<String>| {
@@ -3144,6 +3848,8 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, hold: &Arc<Hold>, tx: &mpsc::Sync
     loop {
         let wait = match connect_for_reader(cfg, hold, &key, &filter, &mut seen, &mut seen_on) {
             Ok((mut conn, closer, mut from, log, start)) => 'attached: {
+                let read_at = log.carried;
+                let recarried = || hold.carried() != read_at;
                 if tx.send(Notice::Log(idx, log)).is_err() {
                     return;
                 }
@@ -3216,6 +3922,10 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, hold: &Arc<Hold>, tx: &mpsc::Sync
                     }
                     let made_progress = next > from;
                     from = next;
+                    if recarried() {
+                        closed = true;
+                        break;
+                    }
                     if next >= head || !made_progress {
                         break;
                     }
@@ -3225,7 +3935,7 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, hold: &Arc<Hold>, tx: &mpsc::Sync
                         Ok(mut sub) => {
                             let _ = closer.set_read_timeout(None);
                             say(outage.attached(Instant::now()));
-                            loop {
+                            while !recarried() {
                                 match sub
                                     .recv_live_event(&closer, astream_broker::IDLE_MARK_DEADLINE)
                                 {
@@ -3284,7 +3994,9 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, hold: &Arc<Hold>, tx: &mpsc::Sync
 
 /// Connect reader `key` to the broker and find where it reads from: its cursor in the store of
 /// the log it reaches ([`Store::cursor`]), or past what this reader already handed on
-/// (`seen`), or `--since`. A reader writes nothing to the store's journal, whose one writer is
+/// (`seen`, forgotten where the store or its carry is another than when it was handed on:
+/// [`Hold::carried`], read before the store), or `--since`. A reader writes nothing to the
+/// store's journal, whose one writer is
 /// the notifier ([`Store::open`]): a start at the head it found with no cursor is handed back
 /// (the last item) for the notifier to write ([`Notice::Start`]), and the reader reads no
 /// record until the notifier answers that it is on the media, so a restart after any record
@@ -3296,16 +4008,19 @@ fn connect_for_reader(
     key: &str,
     filter: &str,
     seen: &mut Option<u64>,
-    seen_on: &mut Option<PathBuf>,
+    seen_on: &mut Option<(PathBuf, u64)>,
 ) -> io::Result<(Conn, Closer, u64, ReadLog, Option<u64>)> {
     let (mut conn, closer) = transport::connect(&cfg.broker, ack_deadline())?;
     transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
-    let log = log_of(&mut conn, cfg)?;
+    let carried = hold.carried();
+    let mut log = log_of(&mut conn, cfg)?;
+    log.carried = carried;
     let store = reader_store(hold, &log)?;
-    if seen_on.as_ref().is_some_and(|on| *on != store.root) {
+    let on = (store.root.clone(), carried);
+    if seen_on.as_ref().is_some_and(|was| *was != on) {
         *seen = None;
     }
-    *seen_on = Some(store.root.clone());
+    *seen_on = Some(on);
     let seen = *seen;
     let mut start = None;
     let from = match (store.cursor(key), seen) {
@@ -3339,10 +4054,74 @@ fn reader_store(hold: &Arc<Hold>, log: &ReadLog) -> io::Result<Store> {
         directory: Arc::clone(&hold.directory),
         access: Owned(Arc::clone(hold)),
     }
-    .for_log(log.id, log.lineage.as_ref())
+    .for_log(log.id, log.lineage.as_ref(), &log.proved)
 }
 
-/// The log `conn` reaches ([`astream_broker::Client::log_lineage`]).
+/// The steps (ATERM-KI-1116-7314) a bridge that reads `cfg.broker` proved and stored
+/// (`StateDir::proved_steps_present`, [`crate::state::Proved`]): the bridge's sharing the
+/// notifier's state dir (`link serve` and `link notify` take one default `--state`, the
+/// notifier's store `<dir>/notify/` beside the bridge's files), then this Mac's fabric bridge's
+/// ([`Config::bridge_state`]), each oldest first. A file absent is none, and a line that does not
+/// read is passed.
+///
+/// # Errors
+/// A steps file that is there and does not read: no carry is decided by a read that may have
+/// missed a step ([`Steps::get`]), so a store that would be built for a log is not (the reader
+/// connects again after its backoff, `--once` fails), and one still waiting on a step is taken
+/// up waiting, a follower's poll reading again ([`Store::unproved`], `--once`'s next run).
+fn proved_steps(cfg: &Config) -> io::Result<Vec<crate::state::Proved>> {
+    let mut steps = Vec::new();
+    for dir in std::iter::once(cfg.state_dir.as_str())
+        .chain(cfg.bridge_state.as_deref())
+        .filter(|dir| !dir.is_empty())
+    {
+        steps.extend(crate::state::StateDir::peek(dir).proved_steps_present()?);
+    }
+    Ok(steps)
+}
+
+/// The state dir of this Mac's fabric bridge where it dials `broker` and is not `state_dir`
+/// ([`fabric_bridge_of`]): of the bridge `[fabric] command` names (as aterm launches it), else
+/// of the one the rendezvous file `aterm fabric on` writes names.
+fn fabric_bridge_state(broker: &str, state_dir: &str) -> Option<String> {
+    let configured = crate::fabric::resolve_command(
+        crate::fabric::command_seam().as_deref(),
+        crate::fabric::config_path().as_deref(),
+    )
+    .ok()
+    .flatten()
+    .map(|(_, argv)| argv);
+    fabric_bridge_of(broker, state_dir, configured, || {
+        crate::enable::Rendezvous::read().ok().flatten()
+    })
+}
+
+/// [`fabric_bridge_state`]'s rule over the bridges named: the `--state` of the bridge whose
+/// words are `configured` (`aterm link serve …`, [`crate::fabric::bridge_config`]) where it
+/// dials `broker` (its `--broker`, word for word), else the `state` of the one `rendezvous`
+/// names (read only then) where its `broker` is that; none of a state dir that is `state_dir`,
+/// whose steps [`proved_steps`] reads already, nor of words that are no bridge's.
+fn fabric_bridge_of(
+    broker: &str,
+    state_dir: &str,
+    configured: Option<Vec<String>>,
+    rendezvous: impl FnOnce() -> Option<crate::enable::Rendezvous>,
+) -> Option<String> {
+    let dials = |(dialed, state): &(String, String)| dialed == broker && state != state_dir;
+    configured
+        .and_then(|argv| crate::fabric::bridge_config(&argv).ok())
+        .map(|bridge| (bridge.broker, bridge.state_dir))
+        .filter(dials)
+        .or_else(|| rendezvous().map(|r| (r.broker, r.state)).filter(dials))
+        .map(|(_, state)| state)
+}
+
+/// The log `conn` reaches ([`astream_broker::Client::log_lineage`]), with the steps proved of
+/// it as they stand now, or why they did not read ([`Steps::read`]: only a decision they make
+/// fails on that); [`ReadLog::carried`] is the caller's to set.
+///
+/// # Errors
+/// The broker's answer.
 fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<ReadLog> {
     let id = match conn.seen_log_identity() {
         Some(log) => Some(log),
@@ -3358,13 +4137,23 @@ fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<ReadLog> {
     Ok(ReadLog {
         id,
         lineage,
+        proved: Steps::read(cfg),
         ordered,
+        carried: 0,
     })
 }
 
 #[cfg(test)]
 thread_local! {
     static FORGET_LINEAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The NEGATIVE CONTROL of a proved step's carry (ATERM-KI-1116-7314): set, no proved step
+    /// carries a store [`Store::carried_from`] on this thread finds, at a store's making or
+    /// into one begun as a first run: the rule before.
+    static FORGET_PROVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The NEGATIVE CONTROL of a late step's carry: set, [`Store::unproved`] on this thread
+    /// finds no store owed one, so a store begun as a first run stays one, the rule before
+    /// [`UNPROVED`].
+    static SKIP_RECARRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Called as [`Notifier::exec`] starts a command, so a test can ask what was flushed
     /// before it.
     static AT_EXEC: std::cell::RefCell<Option<ExecSeam>> = const { std::cell::RefCell::new(None) };
@@ -3621,6 +4410,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
         since: Since::Head,
         once: false,
         exec_timeout: DEFAULT_EXEC_TIMEOUT,
+        bridge_state: None,
     };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -3690,6 +4480,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
     if cfg.state_dir.is_empty() {
         cfg.state_dir = crate::cli::default_state_dir();
     }
+    cfg.bridge_state = fabric_bridge_state(&cfg.broker, &cfg.state_dir);
     Ok(cfg)
 }
 

@@ -46,6 +46,16 @@ fn main() {
     let original = std::fs::read(target.join("debug/stamp-fixture")).unwrap();
     let expected = normalized(&original).unwrap();
     let linked = layout(&original).unwrap();
+    let table_end = 32 + u32_at(&original, 20).unwrap() as usize;
+    let commands = &original[..table_end];
+    assert_eq!(
+        layout_from_commands(commands, original.len())
+            .unwrap()
+            .stamp,
+        linked.stamp
+    );
+    assert!(layout_from_commands(&commands[..commands.len() - 1], original.len()).is_err());
+    assert!(layout_from_commands(commands, linked.stamp.end - 1).is_err());
     for end in [0, 3, 31, 32, linked.stamp.end - 1, linked.signature.start] {
         assert!(normalized(&original[..end]).is_err());
     }

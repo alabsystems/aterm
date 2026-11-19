@@ -28,9 +28,15 @@ struct Discovery {
     self_sock: RwLock<Option<(PathBuf, String)>>,
     /// The `aterm-publish` thread ([`publisher`]).
     publisher: std::sync::OnceLock<Option<Publisher>>,
+    /// This process's record of the graph folders it publishes in ([`record_graphs`]).
+    recorded: std::sync::Mutex<GraphRecord>,
     /// Test-only override for the mirror target dir ([`set_mirror_dir_override`]).
     #[cfg(test)]
     mirror_dir_override: RwLock<Option<PathBuf>>,
+    /// Test-only override for the aterm state root and the harness state the records are
+    /// written beside ([`set_record_roots_override`]).
+    #[cfg(test)]
+    record_roots_override: RwLock<Option<(PathBuf, PathBuf)>>,
 }
 
 impl Discovery {
@@ -38,8 +44,11 @@ impl Discovery {
         Self {
             self_sock: RwLock::new(None),
             publisher: std::sync::OnceLock::new(),
+            recorded: std::sync::Mutex::new(GraphRecord::new()),
             #[cfg(test)]
             mirror_dir_override: RwLock::new(None),
+            #[cfg(test)]
+            record_roots_override: RwLock::new(None),
         }
     }
 }
@@ -213,6 +222,9 @@ enum Publication {
         sock: String,
         recorded_sock: Option<String>,
     },
+    /// Remove this process's record of its graph folders ([`forget_graphs`]), behind every
+    /// retirement queued before it.
+    Forget,
     /// Answered once every write queued before it has been processed (a rendezvous
     /// channel holds the thread until the answer is taken: a test's).
     Flush(std::sync::mpsc::SyncSender<()>),
@@ -250,6 +262,7 @@ impl Publication {
                     retire(&mirror);
                 }
             }
+            Self::Forget => forget_graphs(),
             Self::Flush(done) => {
                 let _ = done.send(());
             }
@@ -327,7 +340,8 @@ pub(crate) fn flush_publications(within: std::time::Duration) -> bool {
     landed.recv_timeout(within).is_ok()
 }
 
-/// Stop session publication and queue guarded retirements for `sids`.
+/// Stop session publication and queue guarded retirements for `sids`, then the removal of this
+/// process's record of its graph folders.
 pub(crate) fn retire_own_sessions(
     dir: &Path,
     sock: &str,
@@ -348,6 +362,152 @@ pub(crate) fn retire_own_sessions(
             recorded_sock: recorded_sock.clone(),
         });
     }
+    queue_publication(Publication::Forget);
+}
+
+/// This process's records of the graph folders it publishes in, one in each records folder its
+/// environment resolves ([`record_folders`], [`aterm_agent::harness::graph_records`]): the
+/// folders it names, the record each records folder was last written with, and whether the
+/// process quit, after which none is written again.
+struct GraphRecord {
+    named: Vec<PathBuf>,
+    written: Vec<PathBuf>,
+    quit: bool,
+}
+
+impl GraphRecord {
+    const fn new() -> Self {
+        Self {
+            named: Vec::new(),
+            written: Vec::new(),
+            quit: false,
+        }
+    }
+}
+
+/// Record, in each records folder this process's environment resolves ([`record_folders`]), the
+/// graph folders it publishes `sock_dir`'s sessions in: `sock_dir`'s and its rendezvous mirror's
+/// ([`aterm_agent::harness::graph_records::record`]), so a sweep that collects by those tabs and
+/// publishes elsewhere reads them beside what it collects. Every graph entry's write runs it
+/// first ([`publish_graph_entry`]); it writes a folder's record again only where the record does
+/// not yet name every folder or is no longer there as a regular file (one that could not be
+/// written, or that was removed), and never once the process quit ([`forget_graphs`]). A host
+/// that names no process start, machine or pid namespace keeps no record.
+fn record_graphs(sock_dir: &Path) {
+    let mut graphs = vec![sock_dir.join("graph")];
+    if let Some(mirror) = rendezvous_mirror_dir(sock_dir) {
+        graphs.push(mirror.join("graph"));
+    }
+    keep_record(&graphs, None);
+}
+
+/// Write this process's records again where one is missing ([`record_graphs`] with no new
+/// folder) and move each standing one's modification time to now
+/// ([`aterm_agent::harness::graph_records::refresh`], its bytes unchanged), as the edge sweeper
+/// does every pass ([`start_edge_sweeper`]): a record removed while no tab opens is back within
+/// a pass, and a reader that cannot judge this process's pid (another machine's or pid
+/// namespace's, sharing the folder) sees it written within a pass, never abandoned while this
+/// process runs.
+#[cfg(unix)]
+pub(crate) fn keep_graph_record() {
+    keep_record(&[], Some(std::time::SystemTime::now()));
+}
+
+/// [`record_graphs`]'s write: `graphs` joined to the folders already named, each records
+/// folder's record written where it names fewer or is not there, and, at a keep pass
+/// (`refresh_at`), each standing one's modification time moved to that time, the record written
+/// again where that fails.
+fn keep_record(graphs: &[PathBuf], refresh_at: Option<std::time::SystemTime>) {
+    let mut recorded = discovery()
+        .recorded
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if recorded.quit {
+        return;
+    }
+    let mut grew = false;
+    for graph in graphs {
+        if !recorded.named.contains(graph) {
+            recorded.named.push(graph.clone());
+            grew = true;
+        }
+    }
+    if recorded.named.is_empty() {
+        return;
+    }
+    for folder in record_folders() {
+        let held = recorded
+            .written
+            .iter()
+            .position(|path| path.parent() == Some(folder.as_path()));
+        let kept = !grew
+            && held.is_some_and(|at| {
+                let path = &recorded.written[at];
+                std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+                    && refresh_at.is_none_or(|time| {
+                        aterm_agent::harness::graph_records::refresh(path, time).is_ok()
+                    })
+            });
+        if kept {
+            continue;
+        }
+        match aterm_agent::harness::graph_records::record(&folder, &recorded.named) {
+            Ok(path) => match held {
+                Some(at) => recorded.written[at] = path,
+                None => recorded.written.push(path),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return,
+            Err(e) => aterm_log::warn!(
+                "discovery: could not record this window's graph folders in {}: {e}",
+                folder.display()
+            ),
+        }
+    }
+}
+
+/// Remove this process's records of its graph folders ([`record_graphs`]) at its quit; none is
+/// written after.
+fn forget_graphs() {
+    let written = {
+        let mut recorded = discovery()
+            .recorded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        recorded.quit = true;
+        std::mem::take(&mut recorded.written)
+    };
+    for path in &written {
+        aterm_agent::harness::graph_records::forget(path);
+    }
+}
+
+/// The records folders this process records itself in: each one a sweep of its environment
+/// reads beside what it collects ([`aterm_agent::harness::graph_records::folders`], the
+/// resolver those sweeps' folders come from).
+fn record_folders() -> Vec<PathBuf> {
+    #[cfg(test)]
+    {
+        let over = discovery().record_roots_override.read();
+        if let Some((aterm_state, harness_state)) = over.unwrap_or_else(|p| p.into_inner()).clone()
+        {
+            return aterm_agent::harness::graph_records::folders_of(
+                Some(&aterm_state),
+                Some(&harness_state),
+            );
+        }
+    }
+    aterm_agent::harness::graph_records::folders()
+}
+
+/// Test-only: override the aterm state root and the harness state this process's graph records
+/// are written beside.
+#[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
+pub(crate) fn set_record_roots_override(roots: Option<(PathBuf, PathBuf)>) {
+    assert_own_discovery("redirects the graph records");
+    *discovery()
+        .record_roots_override
+        .write()
+        .unwrap_or_else(|p| p.into_inner()) = roots;
 }
 
 fn published_sock_spelling(sock: &str) -> String {
@@ -445,13 +605,15 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Publish a session's discovery entry to `sock_dir` and the default rendezvous mirror.
+/// Publish a session's discovery entry to `sock_dir` and the default rendezvous mirror, after
+/// recording both graph folders under this process's state root ([`record_graphs`]).
 pub(crate) fn publish_graph_entry(
     sock_dir: &Path,
     sid: &SessionId,
     sock_path: &str,
     nonce: &LaunchNonce,
 ) {
+    record_graphs(sock_dir);
     write_graph_entry(sock_dir, sid, sock_path, nonce);
     if let Some(rv) = rendezvous_mirror_dir(sock_dir) {
         write_graph_entry(&rv, sid, sock_path, nonce);
@@ -712,7 +874,8 @@ fn sweep_dead_edge_files(dir: &Path) {
 #[cfg(unix)]
 const EDGE_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// Start the background sweeper for dead parents' edge files.
+/// Start the background sweeper for dead parents' edge files, which also writes this process's
+/// graph record again where it went missing ([`keep_graph_record`]).
 #[cfg(unix)]
 pub(crate) fn start_edge_sweeper() {
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -725,6 +888,7 @@ pub(crate) fn start_edge_sweeper() {
                     if let Some(dir) = crate::control_auth::socket_dir() {
                         sweep_dead_edge_files(&dir.join("edges"));
                     }
+                    keep_graph_record();
                     std::thread::sleep(EDGE_SWEEP_EVERY);
                 }
             },

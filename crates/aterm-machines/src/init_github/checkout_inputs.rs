@@ -18,6 +18,7 @@ use crate::sync::repository_refresh::{
 use aterm_secrets::converge::MarkMoved;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::ops::Bound::{Included, Unbounded};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -400,42 +401,70 @@ impl Checkouts {
         self.paths.keys().cloned().collect()
     }
 
-    /// The part of this capture `within` admits, as one digest: each path watched there and
+    /// The part of this capture under `root`, as one digest: each path watched there and
     /// whether its version is read, each version read, and the owner, mode and kind of each
     /// folder there on the way to a watched path. Two parts are equal exactly when their digests
     /// are (short of a SHA-256 collision); the digest holds no path.
-    fn digest(&self, within: impl Fn(&Path) -> bool) -> CheckoutDigest {
+    fn part(&self, root: &Path) -> CheckoutDigest {
         let mut digest = aterm_digest::Sha256::new();
         digest.update(b"aterm checkout part/1\0");
         let mut field = |bytes: &[u8]| {
             digest.update((bytes.len() as u64).to_le_bytes());
             digest.update(bytes);
         };
-        for (path, (versioned, _)) in &self.paths {
-            if within(path.as_path()) {
-                field(path.as_os_str().as_encoded_bytes());
-                field(&[u8::from(*versioned)]);
-            }
+        for (path, (versioned, _)) in self
+            .paths
+            .range::<Path, _>((Included(root), Unbounded))
+            .take_while(|(path, _)| path.starts_with(root))
+        {
+            field(path.as_os_str().as_encoded_bytes());
+            field(&[u8::from(*versioned)]);
         }
-        for (path, version) in &self.metadata.versions {
-            if within(path.as_path()) {
-                field(path.as_os_str().as_encoded_bytes());
-                field(format!("{version:?}").as_bytes());
-            }
+        for (path, version) in under(root, &self.metadata.versions) {
+            field(path.as_os_str().as_encoded_bytes());
+            field(format!("{version:?}").as_bytes());
         }
-        for (path, shape) in &self.metadata.shapes {
-            if within(path.as_path()) {
-                field(path.as_os_str().as_encoded_bytes());
-                field(format!("{shape:?}").as_bytes());
-            }
+        for (path, shape) in under(root, &self.metadata.shapes) {
+            field(path.as_os_str().as_encoded_bytes());
+            field(format!("{shape:?}").as_bytes());
         }
         CheckoutDigest::new(digest.finalize())
     }
 
-    /// The checkout at `root`'s part of this capture ([`Self::digest`]): what a pass records of
-    /// it before and after each of its own effects ([`PassWrites`]).
-    fn part(&self, root: &Path) -> CheckoutDigest {
-        self.digest(|path| path.starts_with(root))
+    /// Find the checkout parts whose receipt inputs changed, before computing any digest.
+    /// `None` means the selection, account or a path shared outside the checkouts moved.
+    fn changed_parts(&self, before: &Self) -> Option<BTreeSet<&Path>> {
+        if self.home != before.home || self.uid != before.uid || self.roots != before.roots {
+            return None;
+        }
+        let changed = changed_paths(
+            before
+                .paths
+                .iter()
+                .map(|(path, value)| (path.as_path(), value)),
+            self.paths
+                .iter()
+                .map(|(path, value)| (path.as_path(), value)),
+        )
+        .chain(changed_paths(
+            path_entries(&before.metadata.versions),
+            path_entries(&self.metadata.versions),
+        ))
+        .chain(changed_paths(
+            path_entries(&before.metadata.shapes),
+            path_entries(&self.metadata.shapes),
+        ));
+        changed
+            .map(|path| {
+                // The roots are distinct children of home. Path order compares components,
+                // so if a root owns this path it is its last root at or before the path.
+                let root = self
+                    .roots
+                    .range::<Path, _>((Unbounded, Included(path)))
+                    .next_back()?;
+                path.starts_with(root).then_some(root.as_path())
+            })
+            .collect()
     }
 
     /// How the pass's own recorded writes (`writes`) account for how this later capture differs
@@ -452,16 +481,11 @@ impl Checkouts {
         writes: &CheckoutWrites,
         running: bool,
     ) -> Accounted {
-        let outside = |path: &Path| !self.roots.iter().any(|root| path.starts_with(root));
-        if self.home != before.home
-            || self.uid != before.uid
-            || self.roots != before.roots
-            || self.digest(outside) != before.digest(outside)
-        {
+        let Some(changed) = self.changed_parts(before) else {
             return Accounted::Not;
-        }
+        };
         let mut accounted = Accounted::Own { made: false };
-        for root in &self.roots {
+        for root in changed {
             let (from, to) = (before.part(root), self.part(root));
             if from == to {
                 continue;
@@ -702,12 +726,60 @@ fn by_path<'a, T>(
     was: &'a [(PathBuf, T)],
     now: &'a [(PathBuf, T)],
 ) -> impl Iterator<Item = (&'a Path, Option<&'a T>, Option<&'a T>)> {
-    use std::cmp::Ordering;
     debug_assert!(
         was.is_sorted_by(|a, b| a.0 < b.0) && now.is_sorted_by(|a, b| a.0 < b.0),
         "each list is in path order, each path once"
     );
-    let (mut was, mut now) = (was.iter().peekable(), now.iter().peekable());
+    join_paths(path_entries(was), path_entries(now)).map(|(old, new)| {
+        let path = old.or(new).expect("each joined row has an entry").0;
+        (
+            path,
+            old.map(|(_, value)| value),
+            new.map(|(_, value)| value),
+        )
+    })
+}
+
+fn path_entries<T>(entries: &[(PathBuf, T)]) -> impl Iterator<Item = (&Path, &T)> {
+    entries.iter().map(|(path, value)| (path.as_path(), value))
+}
+
+/// Descendants of a root occupy one range in component order, including the root itself.
+fn under<'a, T>(
+    root: &'a Path,
+    entries: &'a [(PathBuf, T)],
+) -> impl Iterator<Item = &'a (PathBuf, T)> {
+    let start = entries.partition_point(|(path, _)| path.as_path() < root);
+    entries[start..]
+        .iter()
+        .take_while(move |(path, _)| path.starts_with(root))
+}
+
+/// The digest encodes the path's original spelling and ignores the watch class.
+fn changed_paths<'a, T: Eq + 'a>(
+    was: impl Iterator<Item = (&'a Path, &'a T)>,
+    now: impl Iterator<Item = (&'a Path, &'a T)>,
+) -> impl Iterator<Item = &'a Path> {
+    join_paths(was, now).filter_map(|(old, new)| match (old, new) {
+        (Some((old_path, old)), Some((new_path, new)))
+            if old_path.as_os_str() == new_path.as_os_str() && old == new =>
+        {
+            None
+        }
+        (Some((path, _)), _) | (_, Some((path, _))) => Some(path),
+        (None, None) => unreachable!("each joined row has an entry"),
+    })
+}
+
+type PathEntry<'a, T> = (&'a Path, &'a T);
+type JoinedPath<'a, T> = (Option<PathEntry<'a, T>>, Option<PathEntry<'a, T>>);
+
+fn join_paths<'a, T: 'a>(
+    was: impl Iterator<Item = PathEntry<'a, T>>,
+    now: impl Iterator<Item = PathEntry<'a, T>>,
+) -> impl Iterator<Item = JoinedPath<'a, T>> {
+    use std::cmp::Ordering;
+    let (mut was, mut now) = (was.peekable(), now.peekable());
     std::iter::from_fn(move || {
         let order = match (was.peek(), now.peek()) {
             (None, None) => return None,
@@ -716,16 +788,9 @@ fn by_path<'a, T>(
             (Some((old, _)), Some((new, _))) => old.cmp(new),
         };
         Some(match order {
-            Ordering::Less => was
-                .next()
-                .map(|(path, old)| (path.as_path(), Some(old), None))?,
-            Ordering::Greater => now
-                .next()
-                .map(|(path, new)| (path.as_path(), None, Some(new)))?,
-            Ordering::Equal => {
-                let ((path, old), (_, new)) = (was.next()?, now.next()?);
-                (path.as_path(), Some(old), Some(new))
-            }
+            Ordering::Less => (was.next(), None),
+            Ordering::Greater => (None, now.next()),
+            Ordering::Equal => (was.next(), now.next()),
         })
     })
 }

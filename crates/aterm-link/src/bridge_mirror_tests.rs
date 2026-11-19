@@ -3209,6 +3209,62 @@ fn a_move_on_an_empty_pin_writes_it_on_the_media() {
     }
 }
 
+/// ANOTHER LOG'S DROP OF A PIN THAT HOLDS A WINDOW LEDGER IS WRITTEN ON THE MEDIA
+/// (ATERM-KI-1111-4's seed 355, `Bridge::write_dropped_pin`): the pin's second write is under
+/// the fence its first made, and the drop that clears its window ledger flushes the pin before the
+/// attach moves the witness, so a power cut cannot bring the old log's ledger back under the new
+/// log's witness. NEGATIVE CONTROL (`Mutant::DroppedPinUnderTheFence`, every build before seed
+/// 355): the drop is written under the fence alone, with no flush of its own. The sim's found row
+/// for the control went when ATERM-KI-1116-7314's told rows moved every trajectory (no seed of
+/// `lossy_logs_light_rebase` to 60,000 reaches it with its rule off since), so this test is its
+/// control.
+#[test]
+fn another_logs_drop_of_a_pin_holding_a_window_ledger_is_written_on_the_media() {
+    use crate::sim::world::Mutant;
+    for control in [false, true] {
+        for mode in [crate::mirror::LogMode::Auto, crate::mirror::LogMode::Off] {
+            let case = format!("{mode:?} control={control}");
+            let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            if control {
+                bridge.fx = crate::fx::Fx::os_without(Mutant::DroppedPinUnderTheFence);
+            }
+            let pin = crate::mirror::Pin {
+                inc: 3,
+                total: 4096,
+                key: Some([7; 16]),
+                win: vec![(10, 100)],
+                slots: Vec::new(),
+            };
+            bridge.state.set_logpin(&pin.render()).unwrap();
+            let before = bridge.state.ops();
+            bridge.state.set_logpin(&pin.render()).unwrap();
+            assert_eq!(
+                (bridge.state.ops() - before).fsyncs,
+                0,
+                "{case}: PRECONDITION: a write under the fence"
+            );
+            bridge.mirror = MirrorRun::new(mode, &bridge.state, Instant::now(), || None);
+            let before = bridge.state.ops();
+            bridge.mirror_forget_log().unwrap();
+            let fsyncs = (bridge.state.ops() - before).fsyncs;
+            let back = crate::mirror::Pin::parse(&bridge.state.logpin().unwrap().unwrap()).unwrap();
+            assert_eq!(
+                (back.inc, back.total, back.key, back.win.len()),
+                (3, 4096, Some([7; 16]), 0),
+                "{case}: the window ledger went, the rest of the pin stays"
+            );
+            if control {
+                assert_eq!(fsyncs, 0, "CONTROL {case}: the drop under the fence alone");
+            } else {
+                assert!(
+                    fsyncs > 0,
+                    "{case}: the drop flushed before the witness moves"
+                );
+            }
+        }
+    }
+}
+
 /// A MOVE'S DROP OF THE PINNED BATCH THAT THE DISK REFUSES REFUSES THE ATTACH (aterm-link B05
 /// review): the forget of the log's offsets returns the refusal before it forgets anything, so
 /// the attach does not go on to move the node's witness to the new log, and the next attach,

@@ -99,12 +99,28 @@ fn ada_at_oai() -> Row {
 /// The replica every frontier of these tests reads, but the ones that name another.
 const REPLICA: [u8; 32] = [7; 32];
 
+/// The one store every frontier of these tests reads, but the ones that name another.
+const STORE: [u8; 32] = [5; 32];
+
+/// A frontier of these tests: [`REPLICA`]'s read of [`STORE`] at `era`, the store having
+/// appended the records `ids` (an operation `n` is the `n`th, [`mark`]): its witness counts
+/// them, and its hash is chained over them, so two reads of as many records but other ones do
+/// not compare.
 fn frontier(era: u64, ids: &[u8]) -> Frontier {
+    let mut hash = aterm_digest::Sha256::new();
+    for id in ids.iter().collect::<BTreeSet<_>>() {
+        hash.update([*id]);
+    }
     Frontier {
         source: REPLICA,
         era,
         generation: 2,
-        ids: ids.iter().map(|id| [*id; 32]).collect::<BTreeSet<_>>(),
+        stores: vec![crate::Witnessed {
+            digest: STORE,
+            count: ids.len() as u64,
+            hash: hash.finalize(),
+        }],
+        view: [0; 32],
     }
 }
 
@@ -112,6 +128,16 @@ fn frontier(era: u64, ids: &[u8]) -> Frontier {
 /// nothing at the key a projection of the same frontier is recorded at (these tests' key is the
 /// frontier's fingerprint).
 fn opened(newest: bool, frontier: Frontier, snapshot: Option<Snapshot>) -> Pass {
+    opened_with(newest, frontier, snapshot, None)
+}
+
+/// [`opened`], its projection with `baseline` beside it.
+fn opened_with(
+    newest: bool,
+    frontier: Frontier,
+    snapshot: Option<Snapshot>,
+    baseline: Option<Vec<u8>>,
+) -> Pass {
     let key = frontier.fingerprint();
     Pass::Opened(Box::new(Opened {
         newest,
@@ -119,11 +145,12 @@ fn opened(newest: bool, frontier: Frontier, snapshot: Option<Snapshot>) -> Pass 
         key,
         projection: snapshot.map_or(Projection::Unchanged, |snapshot| {
             Projection::Fresh(Box::new(Projected {
-                snapshot,
+                snapshot: crate::Rendered::of(snapshot),
                 history: Vec::new(),
-                baseline: None,
+                baseline,
                 withheld: 0,
                 inert: 0,
+                refused: None,
             }))
         }),
     }))
@@ -702,11 +729,12 @@ fn a_pass_that_changes_nothing_writes_nothing() {
             frontier: frontier(0, &[1]),
             key: frontier(0, &[1]).fingerprint(),
             projection: Projection::Fresh(Box::new(Projected {
-                snapshot,
+                snapshot: crate::Rendered::of(snapshot),
                 history: vec![aterm_json::from_str(r#"{"op":"put"}"#).expect("JSON")],
                 baseline: Some(b"{\"cells\":[]}\n".to_vec()),
                 withheld: 0,
                 inert: 0,
+                refused: None,
             })),
         }))
     };
@@ -1200,10 +1228,8 @@ const WRITES: u32 = 5;
 /// `frontier`: a pass at a frontier that grew writes its history too, as the materializer's
 /// does.
 fn logged(newest: bool, frontier: Frontier, snapshot: Snapshot) -> Pass {
-    let history = frontier
-        .ids
-        .iter()
-        .map(|id| aterm_json::from_str(&format!(r#"{{"op":"{}"}}"#, id[0])).expect("JSON"))
+    let history = (1..=frontier.records())
+        .map(|id| aterm_json::from_str(&format!(r#"{{"op":"{id}"}}"#)).expect("JSON"))
         .collect();
     let mut pass = opened(newest, frontier, Some(snapshot));
     if let Pass::Opened(open) = &mut pass
@@ -1394,13 +1420,10 @@ fn a_pass_cut_short_before_any_write_leaves_files_the_next_pass_takes_up() {
 
 /// The monotone rule fails closed. A snapshot whose frontier file is missing, or holds bytes
 /// that are no frontier, is not replaced by a fenced home's read, which cannot be shown to be no
-/// older than it; the newest home's read replaces it and writes the frontier again. A frontier
-/// too large for the next pass to read back is not written, nor the snapshot with it: the pass
-/// after would compare its read with nothing.
-/// NEGATIVE CONTROLS: with `record` admitting any read over a frontier it cannot read, the
+/// older than it; the newest home's read replaces it and writes the frontier again.
+/// NEGATIVE CONTROL: with `record` admitting any read over a frontier it cannot read, the
 /// fenced original's rows replace the successor's:
-/// `` left: Recorded { replaced: true } right: Kept(Behind) ``; with the frontier written
-/// whatever its size, `` left: Recorded { replaced: true } right: Kept(TooLarge) ``.
+/// `` left: Recorded { replaced: true } right: Kept(Behind) ``.
 #[test]
 fn a_fenced_homes_read_never_replaces_a_snapshot_whose_frontier_is_not_here() {
     let scratch = scratch();
@@ -1461,63 +1484,21 @@ fn a_fenced_homes_read_never_replaces_a_snapshot_whose_frontier_is_not_here() {
     assert_eq!((read.status.word, read.status.why), (Word::Live, None));
     assert_eq!((read.status.rev(), read.rows()), (2, &[ada()][..]));
     assert_eq!(file.frontier(), Some(frontier(1, &[1, 2, 3])));
-
-    // The largest frontier a pass reads back is taken; one record more is not written.
-    let records = |count: usize| Frontier {
-        ids: (0..count as u64)
-            .map(|at| {
-                let mut id = [0xff; 32];
-                id[..8].copy_from_slice(&at.to_be_bytes());
-                id
-            })
-            .chain(frontier(1, &[1, 2, 3]).ids)
-            .collect(),
-        ..frontier(1, &[])
-    };
-    let limit = usize::try_from(crate::snapshot::MAX_BYTES).expect("fits");
-    let fits = (limit - frontier(1, &[1, 2, 3]).encode().len()) / 32;
-    assert_eq!(
-        file.record(
-            file.look().expect("a look"),
-            opened(true, records(fits), Some(both())),
-            4
-        )
-        .expect("records"),
-        Recorded::Recorded { replaced: true }
-    );
-    assert_eq!(
-        file.frontier().map(|frontier| frontier.ids.len()),
-        Some(fits + 3)
-    );
-    assert_eq!(
-        file.record(
-            file.look().expect("a look"),
-            opened(true, records(fits + 1), Some(accounts(vec![ada()]))),
-            5
-        )
-        .expect("records"),
-        Recorded::Kept(Kept::TooLarge)
-    );
-    let read = file.read();
-    assert_eq!(read.rows(), [ada(), ada_at_oai()]);
-    assert_eq!(
-        (read.status.word, read.status.why, read.status.rev()),
-        (Word::Held, Some(Why::Custody), 3)
-    );
-    assert_eq!(
-        file.frontier().map(|frontier| frontier.ids.len()),
-        Some(fits + 3),
-        "the frontier the next pass compares with still reads"
-    );
 }
 
-/// A projection whose snapshot a read would refuse for its size is not taken: the last snapshot
-/// a read takes stays, at its revision, and the word is not `live`. A face too large for the
-/// grid is not written, and the one a pass wrote before it is removed rather than left to be
-/// taken for an edit once the table is small again.
+/// A projection whose snapshot, or whose baseline, a read would refuse for its size is not
+/// taken: the last snapshot a read takes stays, at its revision, and the word is not `live`. A
+/// face too large for the grid leaves its widest column out (`snapshot::face_columns`); one too
+/// large even with its key alone, or with more records than the grid opens
+/// (`MAX_FACE_RECORDS`, its header one of them), is not written, and the one a pass wrote
+/// before it is removed rather than left to be taken for an edit once the table is small again.
 /// NEGATIVE CONTROLS: with `record` writing whatever it encoded, the oversized pass is taken:
 /// `` left: Recorded { replaced: true } right: Kept(TooLarge) ``; with the face a pass wrote
-/// left on disk, `` the smaller table's face is not left behind ``.
+/// left on disk, `` the smaller table's face is not left behind ``; with `face_columns`
+/// keeping every column, the wide note's face passes the bound and is not written:
+/// `` left: Missing right: Written ``; with `record` bounding the snapshot alone, the pass
+/// whose baseline passes the bound is taken: `` the baseline is held to the bound ``; with
+/// `write_face` bounding bytes alone, `` a face of more records than the grid opens ``.
 #[test]
 fn a_projection_too_large_to_read_is_not_taken_and_a_face_too_large_is_removed() {
     let scratch = scratch();
@@ -1532,7 +1513,8 @@ fn a_projection_too_large_to_read_is_not_taken_and_a_face_too_large_is_removed()
     .expect("records");
     assert_eq!(file.face(), Face::Written);
 
-    // A face over the grid's limit in a snapshot a read still takes.
+    // A face over the grid's limit in a snapshot a read still takes: the wide column is left
+    // out of it, and the snapshot keeps it.
     let wide = "n".repeat(usize::try_from(crate::MAX_FACE_BYTES).expect("fits") + 1);
     let large = accounts(vec![row("ac-1111111111111111", &[("note", &wide)])]);
     assert_eq!(
@@ -1545,11 +1527,13 @@ fn a_projection_too_large_to_read_is_not_taken_and_a_face_too_large_is_removed()
         Recorded::Recorded { replaced: true }
     );
     assert_eq!(file.read().status.rev(), 2);
+    assert_eq!(file.face(), Face::Written);
+    let shown = std::fs::read_to_string(&face).expect("a face");
     assert!(
-        !face.exists(),
-        "the smaller table's face is not left behind"
+        !shown.lines().next().expect("a header").contains("note"),
+        "the wide column is left out of the face"
     );
-    assert_eq!(file.face(), Face::Missing);
+    assert!(shown.contains("ac-1111111111111111"));
 
     // A snapshot over what a read takes: not written at all.
     let wider = "n".repeat(usize::try_from(crate::snapshot::MAX_BYTES / 2).expect("fits") + 1);
@@ -1598,6 +1582,82 @@ fn a_projection_too_large_to_read_is_not_taken_and_a_face_too_large_is_removed()
     );
     assert_eq!(file.read().status.line(), "live · rev 3 · 1 rows");
     assert_eq!(file.face(), Face::Written);
+
+    // A key too wide for any face: none is written, and the one a pass wrote is removed.
+    let key = format!(
+        "ac-{}",
+        "1".repeat(usize::try_from(crate::MAX_FACE_BYTES).expect("fits"))
+    );
+    assert_eq!(
+        file.record(
+            file.look().expect("a look"),
+            opened(
+                true,
+                frontier(0, &[1, 2, 3, 4, 5]),
+                Some(accounts(vec![row(&key, &[("note", &wide)])]))
+            ),
+            5
+        )
+        .expect("records"),
+        Recorded::Recorded { replaced: true }
+    );
+    assert!(
+        !face.exists(),
+        "the smaller table's face is not left behind"
+    );
+    assert_eq!(file.face(), Face::Missing);
+
+    // A small snapshot whose baseline passes what a read takes: neither is written, since no
+    // write could be read against that revision.
+    let baseline = vec![b' '; usize::try_from(crate::snapshot::MAX_BYTES).expect("fits") + 1];
+    assert_eq!(
+        file.record(
+            file.look().expect("a look"),
+            opened_with(
+                true,
+                frontier(0, &[1, 2, 3, 4, 5, 6]),
+                Some(accounts(vec![ada()])),
+                Some(baseline),
+            ),
+            6
+        )
+        .expect("records"),
+        Recorded::Kept(Kept::TooLarge),
+        "the baseline is held to the bound"
+    );
+    assert_eq!(file.read().status.rev(), 4);
+
+    // As many records as the grid opens, the header one of them: a face; one more row, none.
+    let rows = |n: usize| accounts((0..n).map(|n| row(&format!("ac-{n:016}"), &[])).collect());
+    assert_eq!(
+        file.record(
+            file.look().expect("a look"),
+            opened(
+                true,
+                frontier(0, &[1, 2, 3, 4, 5, 6, 7]),
+                Some(rows(crate::MAX_FACE_RECORDS - 1))
+            ),
+            7
+        )
+        .expect("records"),
+        Recorded::Recorded { replaced: true }
+    );
+    assert_eq!(file.face(), Face::Written);
+    assert_eq!(
+        file.record(
+            file.look().expect("a look"),
+            opened(
+                true,
+                frontier(0, &[1, 2, 3, 4, 5, 6, 7, 8]),
+                Some(rows(crate::MAX_FACE_RECORDS))
+            ),
+            8
+        )
+        .expect("records"),
+        Recorded::Recorded { replaced: true }
+    );
+    assert!(!face.exists(), "a face of more records than the grid opens");
+    assert_eq!(file.face(), Face::Missing);
 }
 
 /// A pass that projected nothing is that read's only where the status records the snapshot at
@@ -1758,6 +1818,7 @@ fn edit(key: &str, column: &str, text: &str, expected: &[&str]) -> crate::Edit {
         value: Value::from(text),
         text: text.to_owned(),
         expected: expected.iter().map(|entry| (*entry).to_owned()).collect(),
+        judged: crate::outbox::Judged::Text,
     }
 }
 
@@ -1828,9 +1889,17 @@ fn op(byte: u8) -> String {
 }
 
 /// A marker of the publisher's: `op` signed in the table generation these tests' frontiers read
-/// ([`frontier`]), leaving nothing said.
+/// ([`frontier`]), leaving nothing said. The operation `n` ([`op`]) is the `n`th record
+/// [`STORE`] appended: a frontier holds it once [`STORE`]'s witness counts `n`.
 fn mark(op: Option<String>) -> crate::Mark {
     crate::Mark {
+        at: op
+            .as_deref()
+            .and_then(crate::outbox::digest)
+            .map(|op| crate::At {
+                store: STORE,
+                count: u64::from(op[0]),
+            }),
         op,
         generation: 2,
         left: std::collections::BTreeMap::new(),
@@ -2579,4 +2648,319 @@ fn a_drop_while_the_publisher_holds_its_claim_is_told_the_intent_is_published() 
         crate::Dropped::Dropped
     );
     assert!(claim(&file, &dropped.id).is_none());
+}
+
+/// An intent keeps its author's statement of who made it (`OwnerAct::saying`) through the
+/// outbox and into its marker, for whichever process publishes it; once a pass projects the
+/// operation, which carries the statement, the settled marker drops it with its edits, so no
+/// count of markers holds statements of up to [`crate::outbox::MAX_SAID`] bytes each.
+#[test]
+fn an_intent_keeps_its_statement_until_its_marker_settles() {
+    let scratch = scratch();
+    let file = File::at(&scratch.root, &name("ai/accounts"));
+    file.record(
+        file.look().expect("a look"),
+        opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
+        10,
+    )
+    .expect("recorded");
+    let said = aterm_json::json!({"principal": {"session": "s-1", "program": "claude"}});
+    let act = person().saying(said.clone()).expect("a statement");
+    assert!(
+        person().saying(Value::from("x")).is_none(),
+        "a statement is a record"
+    );
+    let long = aterm_json::json!({"reason": "x".repeat(crate::outbox::MAX_SAID)});
+    assert!(person().saying(long).is_none(), "of at most MAX_SAID bytes");
+    let pk = ada().pk;
+    let intent = file
+        .write(&act, draft(vec![edit(&pk, "label", "mine", &[&op(1)])]), 20)
+        .expect("accepted");
+    assert_eq!(file.outbox().queued[0].said.as_ref(), Some(&said));
+    assert!(mark_done(&file, &intent.id, &mark(Some(op(2))), 30));
+    assert!(dequeue(&file, &intent.id));
+    assert_eq!(file.outbox().done[0].intent.said.as_ref(), Some(&said));
+    file.record(
+        file.look().expect("a look"),
+        opened(true, frontier(0, &[1, 2]), Some(accounts(vec![ada()]))),
+        40,
+    )
+    .expect("recorded");
+    file.settle_done().expect("settled");
+    let done = file.outbox().done;
+    assert!(done[0].seen);
+    assert_eq!(done[0].intent.said, None, "a settled marker drops it");
+}
+
+/// A store entry of [`STORE`] or another, at `count`, its hash chained over that many receipts
+/// of one history (`branch` another history of as many).
+fn witnessed(digest: [u8; 32], count: u64, branch: u8) -> crate::Witnessed {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(count.to_le_bytes());
+    hash.update([branch]);
+    crate::Witnessed {
+        digest,
+        count,
+        hash: hash.finalize(),
+    }
+}
+
+/// A sidecar is `aterm-file-frontier/2`: a fixed head, 72 bytes for each store read and a view
+/// root, zero-padded to 256 bytes. A table read of a primary at 1,000,000,000 records and a
+/// recovery store beside it is 256 bytes, as is one of no records; a read of the journal
+/// ring's three weeks of two stores each is the head and 72 bytes a store. Nothing in it grows
+/// with records, and it reads back as itself. A read replaces the snapshot only where it
+/// extends it: every store of the old read matched by one with a count at least as high, and
+/// the same hash where the counts are equal; another replica's read or a later home always,
+/// an earlier home never. A read that does not name every store of the old one (the recovery
+/// replica alone where the primary refused, another custody) is not admitted on any home. An
+/// earlier build's id-listing sidecar (`/1`) orders nothing: it reads as no frontier, keeping
+/// only the replica it names.
+///
+/// NEGATIVE CONTROL, run once: with `Witnessed::extends` comparing counts alone (the hash left
+/// out), a read of as many records of another history is admitted:
+/// `` a read of as many records but another history ``.
+#[test]
+fn a_frontier_over_1000000000_records_encodes_in_256_bytes_and_admits_only_a_read_that_extends_it()
+{
+    const BILLION: u64 = 1_000_000_000;
+    const RECOVERY: [u8; 32] = [6; 32];
+    let read = |primary: crate::Witnessed, recovery: Option<crate::Witnessed>| Frontier {
+        source: REPLICA,
+        era: 4,
+        generation: 2,
+        stores: std::iter::once(primary).chain(recovery).collect(),
+        view: [9; 32],
+    };
+    let old = read(
+        witnessed(STORE, BILLION, 0),
+        Some(witnessed(RECOVERY, 12, 0)),
+    );
+    let bytes = old.encode();
+    assert_eq!(bytes.len(), 256, "a billion records take 256 bytes");
+    assert_eq!(Frontier::decode(&bytes), Some(old.clone()));
+    assert_eq!(read(witnessed(STORE, 0, 0), None).encode().len(), 256);
+    let ring = Frontier {
+        stores: (0..6)
+            .map(|week| witnessed([week; 32], BILLION, 0))
+            .collect(),
+        ..old.clone()
+    };
+    assert_eq!(ring.encode().len(), 22 + 32 + 8 + 4 + 1 + 6 * 72 + 32);
+    assert_eq!(Frontier::decode(&ring.encode()), Some(ring));
+    let mut padded = bytes.clone();
+    padded[255] = 1;
+    assert_eq!(Frontier::decode(&padded), None, "padding is zeros");
+    assert_eq!(Frontier::decode(&bytes[..255]), None, "a cut file");
+
+    // Of one replica, home and generation: only a read that extends every store.
+    assert!(old.admits_over(&old), "the same read");
+    assert!(
+        read(
+            witnessed(STORE, BILLION + 1, 0),
+            Some(witnessed(RECOVERY, 12, 0))
+        )
+        .admits_over(&old),
+        "one record more"
+    );
+    assert!(
+        read(
+            witnessed(STORE, BILLION, 0),
+            Some(witnessed(RECOVERY, 13, 0))
+        )
+        .admits_over(&old),
+        "the recovery store grew"
+    );
+    assert!(
+        !read(
+            witnessed(STORE, BILLION - 1, 0),
+            Some(witnessed(RECOVERY, 12, 0))
+        )
+        .admits_over(&old),
+        "one record fewer"
+    );
+    assert!(
+        !read(
+            witnessed(STORE, BILLION, 1),
+            Some(witnessed(RECOVERY, 12, 0))
+        )
+        .admits_over(&old),
+        "a read of as many records but another history"
+    );
+    // A read that does not name every store the snapshot's did cannot say it holds what the
+    // other held: the recovery replica alone where the primary refused, or another custody.
+    assert!(
+        !read(witnessed(RECOVERY, 13, 0), None).admits_over(&old),
+        "the recovery replica's read alone"
+    );
+    assert!(
+        !read(witnessed(STORE, BILLION + 5, 0), None).admits_over(&old),
+        "a read without the recovery replica"
+    );
+    assert!(
+        !read(
+            witnessed([8; 32], BILLION + 5, 0),
+            Some(witnessed(RECOVERY, 12, 0))
+        )
+        .admits_over(&old),
+        "a read of another custody in place of the primary"
+    );
+    // Across homes and replicas the stores do not compare.
+    let later = Frontier {
+        era: 5,
+        ..read(witnessed([8; 32], 1, 0), None)
+    };
+    assert!(later.admits_over(&old) && !old.admits_over(&later));
+    let elsewhere = Frontier {
+        source: [8; 32],
+        ..read(witnessed(STORE, 1, 0), None)
+    };
+    assert!(elsewhere.admits_over(&old) && old.admits_over(&elsewhere));
+    assert_ne!(
+        old.fingerprint(),
+        read(
+            witnessed(STORE, BILLION + 1, 0),
+            Some(witnessed(RECOVERY, 12, 0))
+        )
+        .fingerprint(),
+        "a record that arrived moves the fingerprint"
+    );
+
+    // An earlier build's sidecar names records, not stores: it orders nothing, so it reads as
+    // no frontier (the newest home's read replaces it, as where a sidecar does not read), and
+    // only the replica it names is kept, for the journal ring's rows.
+    let mut legacy = b"aterm-file-frontier/1\n".to_vec();
+    legacy.extend_from_slice(&REPLICA);
+    legacy.extend_from_slice(&4u64.to_le_bytes());
+    legacy.extend_from_slice(&2u32.to_le_bytes());
+    legacy.extend_from_slice(&[1; 64]);
+    assert_eq!(Frontier::decode(&legacy), None);
+    assert_eq!(Frontier::source_of_1(&legacy), Some(REPLICA));
+}
+
+/// A done marker names the store its record was appended to and that store's witness count
+/// after the append (`at`). A snapshot holds the write once its frontier's entry for that store
+/// has counted that far: not one record before, nor a read of another store, however far along.
+/// A marker without `at` (an earlier build's) is held by no frontier of this one until a read
+/// that holds its operation stamps it with the read's one store and count
+/// (`File::stamp_done`); a read that does not hold it, or reads two stores and cannot say which
+/// holds it, stamps nothing. Stamped, the pass's snapshot holds it and its settle marks it seen.
+///
+/// NEGATIVE CONTROL, run once: with `Frontier::holds` matching the store whatever its count,
+/// the read one record short holds the write: `` one record before the append ``.
+#[test]
+fn a_done_marker_is_projected_once_the_frontiers_store_count_reaches_the_count_it_was_appended_at()
+{
+    let at_store = |count: u64| Frontier {
+        stores: vec![witnessed(STORE, count, 0)],
+        ..frontier(0, &[])
+    };
+    let scratch = scratch();
+    let file = File::at(&scratch.root, &name("ai/accounts"));
+    file.record(
+        file.look().expect("a look"),
+        opened(true, at_store(9), Some(accounts(vec![ada()]))),
+        10,
+    )
+    .expect("recorded");
+    let pk = ada().pk;
+    let intent = file
+        .write(
+            &person(),
+            draft(vec![edit(&pk, "realm", "mine", &[&op(1)])]),
+            20,
+        )
+        .expect("accepted");
+    let appended = crate::Mark {
+        at: Some(crate::At {
+            store: STORE,
+            count: 10,
+        }),
+        ..mark(Some(op(77)))
+    };
+    assert!(mark_done(&file, &intent.id, &appended, 30));
+    assert!(dequeue(&file, &intent.id));
+    let done = file.outbox().done[0].clone();
+    assert_eq!(
+        done.at, appended.at,
+        "the marker keeps where it was appended"
+    );
+    assert!(
+        !done.projected(Some(&at_store(9))),
+        "one record before the append"
+    );
+    assert!(done.projected(Some(&at_store(10))), "the append");
+    assert!(done.projected(Some(&at_store(1_000_000_000))), "later");
+    let other = Frontier {
+        stores: vec![witnessed([8; 32], 1_000_000_000, 0)],
+        ..frontier(0, &[])
+    };
+    assert!(!done.projected(Some(&other)), "another store");
+    assert!(!done.projected(None), "no frontier");
+    assert!(
+        crate::Done {
+            op: None,
+            ..done.clone()
+        }
+        .projected(None),
+        "nothing was signed"
+    );
+
+    // An earlier build's marker says nothing of where: no frontier holds it until a read that
+    // holds its operation stamps it.
+    let unstamped = crate::Done {
+        at: None,
+        ..done.clone()
+    };
+    assert!(!unstamped.projected(Some(&at_store(u64::MAX))));
+    let intent = file
+        .write(
+            &person(),
+            draft(vec![edit(&pk, "realm", "theirs", &[&op(1)])]),
+            40,
+        )
+        .expect("accepted");
+    let earlier = crate::Mark {
+        at: None,
+        ..mark(Some(op(78)))
+    };
+    assert!(mark_done(&file, &intent.id, &earlier, 50));
+    assert!(dequeue(&file, &intent.id));
+    let combined = Frontier {
+        stores: vec![witnessed(STORE, 12, 0), witnessed([6; 32], 3, 0)],
+        ..frontier(0, &[])
+    };
+    assert!(
+        !file.stamp_done(&combined, |_| true).expect("stamps"),
+        "a read of two stores cannot say which holds it"
+    );
+    assert!(
+        !file.stamp_done(&at_store(12), |_| false).expect("stamps"),
+        "a read that does not hold it"
+    );
+    assert!(
+        file.stamp_done(&at_store(12), |op| *op == [78; 32])
+            .expect("stamps")
+    );
+    let done = file.outbox().done;
+    assert_eq!(
+        done.iter().map(|done| done.at).collect::<Vec<_>>(),
+        [
+            appended.at,
+            Some(crate::At {
+                store: STORE,
+                count: 12,
+            })
+        ],
+        "only the marker without `at` is stamped"
+    );
+    // The pass that stamped it records its read, and its settle marks both seen.
+    file.record(
+        file.look().expect("a look"),
+        opened(true, at_store(12), Some(accounts(vec![ada()]))),
+        60,
+    )
+    .expect("recorded");
+    file.settle_done().expect("settled");
+    assert!(file.outbox().done.iter().all(|done| done.seen));
 }

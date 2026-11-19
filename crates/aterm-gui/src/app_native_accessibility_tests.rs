@@ -508,9 +508,11 @@ fn launch_offer_ax_navigation(action: Action) {
     // (init-on-by-default design §6.1), and navigation before it answers nothing.
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // A window 420 points tall (a headless window's scale is 1), whatever this platform's
-    // face makes a row: the page's head, with its least lockup, shows and its accounts line
-    // lies below it.
+    // The tallest window of whole rows of this platform's face, at most 420 points (a headless
+    // window's scale is 1), whose list lays the accounts line wholly below it. Where the face
+    // allows (macOS's), the page's head keeps its least lockup there; where its rows leave that
+    // line's top showing under the lockup and a row less drops the lockup (Windows'), it is a
+    // shorter window, without the lockup, that hides the line.
     let (_, cell_h) = app.win_cell_size(wid);
     let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = u16::try_from(420 / cell_h).unwrap();
@@ -529,6 +531,23 @@ fn launch_offer_ax_navigation(action: Action) {
     app.headless = true;
     assert!(request.pending());
     assert!(app.commit_glassless_native_frame(wid));
+    let accounts = UiKey::new("system-state/line/accounts");
+    while !app
+        .compiled_native_ui(wid)
+        .unwrap()
+        .semantic(&accounts)
+        .unwrap()
+        .offscreen
+    {
+        let mut window = app.windows.get_mut(&wid).unwrap();
+        assert!(
+            window.rows > 1,
+            "some window at most 420 points tall lays the accounts line below it"
+        );
+        window.rows -= 1;
+        drop(window);
+        assert!(app.commit_glassless_native_frame(wid));
+    }
     let start = Instant::now();
 
     let key = UiKey::new(if action == Action::ScrollIntoView {

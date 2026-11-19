@@ -9,8 +9,9 @@ use std::io::Write as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::patience::Patience;
 use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::{Instance, boot_session, client_command, ctl_ok, field};
@@ -73,7 +74,7 @@ fn spawn_worker(inst: &Instance, manager: &str) -> PathBuf {
             .expect("its stdin")
             .write_all(b"say hello")
             .expect("write the task");
-        child_output::wait_and_read(child, Instant::now() + HANG).expect("aterm ctl exits")
+        child_output::wait_and_read(child, HANG).expect("aterm ctl exits")
     });
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "spawn: {stdout} {:?}", out.stderr);
@@ -108,23 +109,24 @@ fn signal_and_reap(inst: &mut Instance, sig: libc::c_int) -> std::process::ExitS
     let pid = libc::pid_t::try_from(inst.child.id()).expect("a pid");
     // SAFETY: a plain signal to the child this test spawned and still owns.
     assert_eq!(unsafe { libc::kill(pid, sig) }, 0);
-    let give_up = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     loop {
         if let Some(status) = inst.child.try_wait().expect("poll the instance") {
             return status;
         }
-        assert!(
-            Instant::now() < give_up,
-            "the instance outlived signal {sig}; log:\n{}",
-            headless_boot::log_tail(&inst.log)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the instance outlived signal {sig} ({why}); log:\n{}",
+                headless_boot::log_tail(&inst.log)
+            );
+        }
         std::thread::sleep(headless_boot::POLL_GAP);
     }
 }
 
 /// Wait until session `sid` has `n` watchers (`who`), within the hang detector.
 fn until_watched(inst: &Instance, sid: &str, n: usize) {
-    let give_up = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     loop {
         let who = ctl_ok(inst, &["who"]);
         let watched = who
@@ -135,7 +137,9 @@ fn until_watched(inst: &Instance, sid: &str, n: usize) {
         if watched.is_some_and(|w| w >= n) {
             return;
         }
-        assert!(Instant::now() < give_up, "never watched: {who}");
+        if let Some(why) = patience.spent() {
+            panic!("never watched ({why}): {who}");
+        }
         std::thread::sleep(headless_boot::POLL_GAP);
     }
 }
@@ -173,7 +177,7 @@ fn sigterm_quits_a_headless_instance_as_the_quit_verb_does() {
     assert!(!exists(Path::new(&inst.sock)), "and its socket");
     assert!(!exists(&token), "and its token");
 
-    let out = child_output::wait_and_read(watcher, Instant::now() + HANG)
+    let out = child_output::wait_and_read(watcher, HANG)
         .expect("the watcher ends once the instance has quit");
     let pushed = String::from_utf8_lossy(&out.stdout);
     assert!(

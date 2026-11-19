@@ -99,6 +99,43 @@ const fn hex_digit(byte: u8) -> Option<u8> {
 /// the session id: the server still attests the helper and binds the sudo it started.
 pub const ASKPASS_SOCK_ENV: &str = "ATERM_ASKPASS_SOCK";
 
+/// The longest the password sheet's spacing refuses a request: its widest quiet window, in
+/// seconds. A quiet refusal ([`quiet_refusal`]) never names more.
+pub const QUIET_MAX_SECS: u64 = 300;
+
+/// The words before the seconds of a quiet refusal.
+const QUIET_PREFIX: &[u8] = b"ERR askpass refused quiet ";
+
+/// The server's refusal of a request inside the password sheet's spacing: no sheet is raised for
+/// `secs` more seconds, held to `1..=`[`QUIET_MAX_SECS`].
+#[must_use]
+pub fn quiet_refusal(secs: u64) -> String {
+    format!(
+        "{}{}\n",
+        String::from_utf8_lossy(QUIET_PREFIX),
+        secs.clamp(1, QUIET_MAX_SECS)
+    )
+}
+
+/// The seconds a quiet refusal names ([`quiet_refusal`]), read from its `line` without the LF:
+/// exactly `ERR askpass refused quiet ` and one to three ASCII digits with no leading zero, in
+/// `1..=`[`QUIET_MAX_SECS`], and nothing after them. `None` for any other line.
+#[must_use]
+pub fn quiet_refusal_secs(line: &[u8]) -> Option<u64> {
+    let digits = line.strip_prefix(QUIET_PREFIX)?;
+    if digits.is_empty()
+        || digits.len() > 3
+        || digits[0] == b'0'
+        || !digits.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let secs = digits
+        .iter()
+        .fold(0_u64, |secs, digit| secs * 10 + u64::from(digit - b'0'));
+    (1..=QUIET_MAX_SECS).contains(&secs).then_some(secs)
+}
+
 fn hex_word(word: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(1 + word.len() * 2);

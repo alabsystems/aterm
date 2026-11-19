@@ -3,7 +3,7 @@
 // Author: Andrew Yates
 
 //! User identity and rate-limit tests.
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use agh::Call;
 use agh::config::Dirs;

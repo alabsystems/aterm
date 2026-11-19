@@ -7,19 +7,22 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 mod host;
+mod rest;
 mod runner;
 
 pub use host::{Host, Watcher, watcher};
+pub use rest::{Rest, Ring, Told};
 pub use runner::{
-    Clock, DetachedPasses, Gate, HostHandle, LiveSettings, PassLauncher, Runner, RunningPass,
-    SLICE, Settings, SystemClock, run_host,
+    BLIND_LOOK, Clock, DetachedPasses, Gate, HostHandle, LiveSettings, PassLauncher, Runner,
+    RunningPass, Settings, SystemClock, run_host,
 };
 
 pub use super::resolve::VendorGetFn;
@@ -48,8 +51,18 @@ const BUSY_RETRY: Duration = Duration::from_secs(5);
 const SHARED_SCHEMA: u32 = 2;
 const MAX_SHARED_BYTES: u64 = 1024;
 const DURABLE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// The wall clock outrunning the monotonic clock by more than this over one slice is a wake.
+/// The wall clock outrunning the monotonic clock by more than this over one host wait is a wake
+/// ([`woke_between`]).
 pub const WAKE_GAP: Duration = Duration::from_secs(30);
+
+/// Whether one host wait, over which the wall clock moved `wall` (`None`: backwards) and the
+/// monotonic clock `mono`, spanned a sleep or a step of the wall clock forward: the wall clock
+/// outran the monotonic one by more than [`WAKE_GAP`]. Judged once per wait, however long: an
+/// NTP slew of at most 500 ppm over a six-hour wait is about 11 s, well inside the gap.
+#[must_use]
+pub fn woke_between(wall: Option<Duration>, mono: Duration) -> bool {
+    wall.is_some_and(|w| w > mono.saturating_add(WAKE_GAP))
+}
 
 /// One small, store-scoped file per vendor, also serving as its flock inode. The file is
 /// only a wake hint: neither its version nor its validator can authorize an install.
@@ -247,9 +260,19 @@ impl Watched {
 #[derive(Debug)]
 struct PendingHead {
     handle: JoinHandle<CompletedHead>,
+    /// Set by the worker's drop guard ([`RoundEnd`]) before it rings, whether the worker answered
+    /// or panicked: its answer is the host's to harvest from then on, whoever took that ring.
+    done: Arc<AtomicBool>,
     /// A machine wake while the GET was in flight moves the *next* check to the
     /// wake grace, rather than letting an older worker snapshot undo that schedule.
     wake_after: Option<SystemTime>,
+}
+
+impl PendingHead {
+    /// Whether the worker is over and its answer waits to be harvested.
+    fn done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug)]
@@ -298,13 +321,11 @@ pub struct HeadWatch {
     shared: bool,
     shared_prefix: Option<PathBuf>,
     pending: Vec<Option<PendingHead>>,
-    completed_tx: mpsc::Sender<usize>,
-    completed_rx: mpsc::Receiver<usize>,
-    /// The current park owner, if any. A watch may move between threads before
-    /// its owned GET finishes, so workers look up the parker at completion.
-    parker: Arc<Mutex<Option<thread::Thread>>>,
-    ready_notices: Vec<usize>,
-    /// A completed hint whose park was preempted by a bump, full-pass deadline,
+    /// The ring of the host's rest ([`Self::bind_ring`]): a head worker rings it when its head
+    /// moved or it is its round's last, and the host's seat and hosts waiters ring it when they
+    /// hand over the lock they waited for. `None` for a watch no rest waits on (a test's).
+    ring: Option<Ring>,
+    /// A completed hint whose wait was preempted by a bump, full-pass deadline,
     /// or index answer.
     deferred_moved: Vec<&'static str>,
     round_notes: Vec<Option<Vec<String>>>,
@@ -316,6 +337,10 @@ pub struct HeadWatch {
     /// (the store is known then) and kept: a window's for good, a session's seat for good
     /// and its rendezvous for one round.
     claim: Option<host::HostClaim>,
+    /// The seat and hosts waiters this watch's session claims arm, kept across the claims it lets
+    /// go ([`Self::release_host`]): turning Automatic updates off and on never arms a second
+    /// waiter beside one still blocked on the same lock.
+    waiters: host::Waiters,
     #[cfg(test)]
     fail_next_pending_spawn: bool,
 }
@@ -328,7 +353,6 @@ impl HeadWatch {
             .iter()
             .map(|spec| (spec, Watched::default()))
             .collect();
-        let (completed_tx, completed_rx) = mpsc::channel();
         let pending = watched.iter().map(|_| None).collect();
         let round_notes = watched.iter().map(|_| None).collect();
         Self {
@@ -338,18 +362,22 @@ impl HeadWatch {
             shared: false,
             shared_prefix: None,
             pending,
-            completed_tx,
-            completed_rx,
-            parker: Arc::new(Mutex::new(None)),
-            ready_notices: Vec::new(),
+            ring: None,
             deferred_moved: Vec::new(),
             round_notes,
             round_active: false,
             host: None,
             claim: None,
+            waiters: host::Waiters::default(),
             #[cfg(test)]
             fail_next_pending_spawn: false,
         }
+    }
+
+    /// Ring `ring` (the host's rest's [`Rest::ringer`]) when a head round has news or a waiter
+    /// handed over its lock. A claim already made keeps the ring it was made with.
+    pub fn bind_ring(&mut self, ring: Ring) {
+        self.ring = Some(ring);
     }
 
     /// `[packages].exclude` as it reads now.
@@ -381,13 +409,17 @@ impl HeadWatch {
         let Some(kind) = self.host else {
             return true;
         };
-        let claim = self
-            .claim
-            .get_or_insert_with(|| host::HostClaim::new(kind, layout));
+        let ring = self.ring.clone();
+        let claim = self.claim.get_or_insert_with(|| {
+            host::HostClaim::with_waiters(kind, layout, ring, self.waiters.clone())
+        });
         let (admit, note) = claim.admit();
         self.notes.extend(note);
         match admit {
             host::Admit::Yes => true,
+            // A waiter rings when the seat or the rendezvous frees: the heads keep their
+            // deadlines, and the host waits for the ring rather than for them.
+            host::Admit::Waits => false,
             host::Admit::Later(after) => {
                 for (_, watched) in &mut self.watched {
                     if watched.due(now) {
@@ -399,7 +431,9 @@ impl HeadWatch {
         }
     }
 
-    /// Let the host's claim go — a session whose Automatic updates were turned off.
+    /// Let the host's claim go — a session whose Automatic updates were turned off. A waiter
+    /// the claim armed that still blocks stays with this watch ([`host::Waiters`]): it lets its
+    /// lock go the moment it takes it, unless a claim made since and refused that lock took it on.
     pub fn release_host(&mut self) {
         if !self.has_pending() {
             self.claim = None;
@@ -420,9 +454,31 @@ impl HeadWatch {
             .is_some_and(host::HostClaim::window_watches)
     }
 
+    /// Whether this session's claim waits on a seat or hosts waiter's ring: nothing that needs
+    /// admission is due until it rings.
+    fn admission_waits(&self) -> bool {
+        self.claim.as_ref().is_some_and(host::HostClaim::waits)
+    }
+
+    /// Whether a waiter handed this session's claim the lock it waited for, to take at once.
+    fn admission_handed(&self) -> bool {
+        self.claim.as_ref().is_some_and(host::HostClaim::handed)
+    }
+
+    /// Take what a seat or hosts waiter handed this session's claim, with no look at the store's
+    /// folder ([`host::HostClaim::absorb`]): true when a waiter was over and is taken.
+    fn absorb_handed(&mut self) -> bool {
+        self.claim.as_mut().is_some_and(host::HostClaim::absorb)
+    }
+
     #[cfg(test)]
     fn session_admission_attempts(&self) -> u64 {
         self.claim.as_ref().map_or(0, host::HostClaim::admit_calls)
+    }
+
+    #[cfg(test)]
+    fn holds_seat(&self) -> bool {
+        self.claim.as_ref().is_some_and(host::HostClaim::holds_seat)
     }
 
     fn begin_session_update_look(&mut self, layout: &Layout, now: SystemTime) -> bool {
@@ -450,9 +506,10 @@ impl HeadWatch {
         if self.round_active || self.has_pending() {
             return true;
         }
-        let claim = self
-            .claim
-            .get_or_insert_with(|| host::HostClaim::new(Host::Window, layout));
+        let ring = self.ring.clone();
+        let claim = self.claim.get_or_insert_with(|| {
+            host::HostClaim::with_waiters(Host::Window, layout, ring, self.waiters.clone())
+        });
         let (admit, note) = claim.admit();
         self.notes.extend(note);
         admit == host::Admit::Yes
@@ -467,6 +524,32 @@ impl HeadWatch {
                 .watched
                 .iter()
                 .any(|(spec, w)| !Self::excludes(&self.exclude, spec.program) && w.due(now))
+    }
+
+    /// When this watch next has work at `now` (the wall clock), for its host's one wait: `now`
+    /// while a moved head a higher-priority end deferred waits to be replayed, and while a worker
+    /// of the round in flight is done and not yet harvested, whoever took the ring it made (a wait
+    /// that ends before the host's round, such as a stand-by while Automatic updates are off, takes
+    /// it too); `None` while every worker of the round in flight still runs, whose ring is the
+    /// event; else the earliest deadline of a head the exclusion leaves watched, `now` for one
+    /// unset or set back past `now + CADENCE + WAKE_GAP` ([`Watched::due`]). `None` too when every
+    /// head is excluded.
+    #[must_use]
+    pub fn next_due(&self, now: SystemTime) -> Option<SystemTime> {
+        if !self.deferred_moved.is_empty() || self.pending.iter().flatten().any(PendingHead::done) {
+            return Some(now);
+        }
+        if self.has_pending() {
+            return None;
+        }
+        self.watched
+            .iter()
+            .filter(|(spec, _)| !Self::excludes(&self.exclude, spec.program))
+            .map(|(_, w)| match w.next_check_at {
+                Some(at) if !w.due(now) => at,
+                _ => now,
+            })
+            .min()
     }
 
     /// Keep a completed offer when a higher-priority package event wins this park.
@@ -508,59 +591,27 @@ impl HeadWatch {
         self.pending_count() != 0
     }
 
-    /// Park until a vendor worker wakes this thread, or the ordinary package-loop slice elapses.
-    pub fn park_for_hint(&mut self, slice: Duration) {
-        if !self.deferred_moved.is_empty() {
-            return;
+    /// The host's wait spanned a sleep ([`woke_between`]), ending at `now`: every head, and the
+    /// next check of each in flight, is asked [`AFTER_WAKE`] later, once the network is back.
+    pub fn woke(&mut self, now: SystemTime) {
+        for (_, w) in &mut self.watched {
+            w.next_check_at = Some(now + AFTER_WAKE);
         }
-        *self.parker.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread::current());
-        self.take_notices();
-        if self.ready_notices.is_empty() {
-            thread::park_timeout(slice);
-        }
-        *self.parker.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        if self.take_notices() || !self.ready_notices.is_empty() {
-            thread::park_timeout(Duration::ZERO);
+        for pending in self.pending.iter_mut().flatten() {
+            pending.wake_after = Some(now + AFTER_WAKE);
         }
     }
 
-    fn take_notices(&mut self) -> bool {
-        let mut arrived = false;
-        while let Ok(index) = self.completed_rx.try_recv() {
-            arrived = true;
-            let live = self.pending.get(index).is_some_and(Option::is_some);
-            if live && !self.ready_notices.contains(&index) {
-                self.ready_notices.push(index);
-            }
-        }
-        arrived
-    }
-
-    /// One slice of the caller's park, over which the wall clock moved `wall` (`None`: backwards) and the monotonic clock `mono`.
-    pub fn note_slice(&mut self, now: SystemTime, wall: Option<Duration>, mono: Duration) -> bool {
-        let woke = wall.is_some_and(|w| w > mono.saturating_add(WAKE_GAP));
-        if woke {
-            for (_, w) in &mut self.watched {
-                w.next_check_at = Some(now + AFTER_WAKE);
-            }
-            for pending in self.pending.iter_mut().flatten() {
-                pending.wake_after = Some(now + AFTER_WAKE);
-            }
-        }
-        woke
-    }
-
-    /// One slice of a host's park (design §1.6), the unit both hosts run.
-    pub fn slice(
+    /// One round of a host's wait (design §1.6), the unit both hosts run once per wait: when
+    /// anything is due at `wall`, start every due head or harvest those that rang, and answer
+    /// the heads that moved.
+    pub fn round(
         &mut self,
         layout: &Layout,
         wall: SystemTime,
-        wall_elapsed: Option<Duration>,
-        mono_elapsed: Duration,
         get: &Arc<ConcurrentVendorGetFn<'static>>,
         index_in_flight: bool,
     ) -> Option<Vec<&'static str>> {
-        self.note_slice(wall, wall_elapsed, mono_elapsed);
         if !self.due(wall) {
             return None;
         }
@@ -599,7 +650,7 @@ impl HeadWatch {
         moved
     }
 
-    /// Start up to two independent due heads, or harvest those already finished.
+    /// Start every due, installed head in one round, or harvest those already finished.
     pub fn check_pending(
         &mut self,
         layout: &Layout,
@@ -624,16 +675,10 @@ impl HeadWatch {
         if !deferred.is_empty() {
             return deferred;
         }
-        let mut notices = std::mem::take(&mut self.ready_notices);
-        while let Ok(index) = self.completed_rx.try_recv() {
-            notices.push(index);
-        }
         let mut moved = Vec::new();
         let mut harvested = false;
         for index in 0..self.pending.len() {
-            let ready = self.pending[index]
-                .as_ref()
-                .is_some_and(|pending| pending.handle.is_finished() || notices.contains(&index));
+            let ready = self.pending[index].as_ref().is_some_and(PendingHead::done);
             if !ready {
                 continue;
             }
@@ -685,7 +730,6 @@ impl HeadWatch {
                 watched.next_check_at = Some(now + CADENCE);
             }
         }
-        due.truncate(2);
         if due.is_empty() {
             return Vec::new();
         }
@@ -694,13 +738,22 @@ impl HeadWatch {
         }
         self.round_active = true;
         let shared = self.shared;
+        // Every worker this round may spawn counts down once, from its drop guard, whether it
+        // ran, panicked or was never spawned: the round's last rings, so the round's end is
+        // heard with no deadline of its own.
+        let left = Arc::new(AtomicUsize::new(due.len()));
         for index in due {
             let spec = self.watched[index].0;
             let mut snapshot = self.watched[index].1.clone();
             let layout_copy = layout.clone();
             let get_copy = Arc::clone(get);
-            let completed_tx = self.completed_tx.clone();
-            let parker = Arc::clone(&self.parker);
+            let done = Arc::new(AtomicBool::new(false));
+            let rang = RoundEnd {
+                done: Arc::clone(&done),
+                left: Arc::clone(&left),
+                ring: self.ring.clone(),
+                moved: false,
+            };
             let fail_spawn = {
                 #[cfg(test)]
                 {
@@ -717,6 +770,7 @@ impl HeadWatch {
                 std::thread::Builder::new()
                     .name(format!("atpkg-head-{}", spec.program))
                     .spawn(move || {
+                        let mut rang = rang;
                         let (outcome, notes) = check_one(
                             &layout_copy,
                             spec,
@@ -725,12 +779,7 @@ impl HeadWatch {
                             get_copy.as_ref(),
                             shared,
                         );
-                        let _ = completed_tx.send(index);
-                        if let Some(thread) =
-                            parker.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
-                        {
-                            thread.unpark();
-                        }
+                        rang.moved = outcome.moved;
                         CompletedHead {
                             index,
                             watched: snapshot,
@@ -743,10 +792,13 @@ impl HeadWatch {
                 Ok(handle) => {
                     self.pending[index] = Some(PendingHead {
                         handle,
+                        done,
                         wake_after: None,
                     });
                 }
                 Err(error) => {
+                    // The worker's guard went down with the closure the spawn refused (or, for
+                    // the injected refusal, at the end of this turn), so it counted down too.
                     self.watched[index].1.next_check_at = Some(now + BUSY_RETRY);
                     self.round_notes[index] = Some(vec![format!(
                         "vendor head helper unavailable: {} ({error})",
@@ -839,6 +891,33 @@ impl HeadWatch {
     /// One log line each since the last call.
     pub fn take_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
+    }
+}
+
+/// A head worker's word to its host, said from its drop guard so a worker that panicked says it
+/// too: it marks its head done (from then on [`HeadWatch::next_due`] names the host's next wait
+/// zero until the head is harvested), counts its round down, and rings the host's rest only when
+/// its head moved (the host harvests that offer while others are in flight) or it is the round's
+/// last (the host harvests the unmoved heads together at the round's end).
+struct RoundEnd {
+    /// Its slot's [`PendingHead::done`].
+    done: Arc<AtomicBool>,
+    left: Arc<AtomicUsize>,
+    ring: Option<Ring>,
+    moved: bool,
+}
+
+impl Drop for RoundEnd {
+    fn drop(&mut self) {
+        // Set before the ring: a host woken by it, or one whose ring another wait took, finds
+        // this head done.
+        self.done.store(true, Ordering::Release);
+        let last = self.left.fetch_sub(1, Ordering::AcqRel) == 1;
+        if (self.moved || last)
+            && let Some(ring) = &self.ring
+        {
+            ring.ring();
+        }
     }
 }
 
@@ -1134,15 +1213,28 @@ pub fn network_get(
     crate::net::vendor_hint_get(program, url, cap, if_none_match)
 }
 
-/// Whether `layout`'s copy of `spec`'s program is one the watch keeps at its vendor's head.
+/// Whether `layout`'s copy of `spec`'s program is one the watch keeps at its vendor's head,
+/// read for a diagnostic: it changes nothing, a pins file that does not read included
+/// ([`crate::pin::would_hold_update`]).
 pub(crate) fn follows_vendor(layout: &Layout, spec: &VendorSpec) -> bool {
-    installed(layout, spec).is_some()
+    installed_unless(layout, spec, crate::pin::would_hold_update).is_some()
 }
 
+/// `spec`'s program as the watch keeps it, `None` where the watch leaves it alone; a pins file
+/// that does not read is set aside ([`crate::pin::holds_update`]).
 fn installed(layout: &Layout, spec: &VendorSpec) -> Option<Installed> {
+    installed_unless(layout, spec, crate::pin::holds_update)
+}
+
+/// [`installed`], a pin read by `held`.
+fn installed_unless(
+    layout: &Layout,
+    spec: &VendorSpec,
+    held: fn(&Layout, &str) -> bool,
+) -> Option<Installed> {
     let program = spec.program;
     if layout.removed_programs().ok()?.contains(program)
-        || crate::pin::holds_update(layout, program)
+        || held(layout, program)
         || crate::linkmode::is_linked(layout, program)
     {
         return None;

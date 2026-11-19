@@ -62,6 +62,7 @@ fn window(name: &str, used: u16, read_ago: i64) -> WindowSeen {
     WindowSeen {
         window: name.into(),
         sub: None,
+        model: None,
         figure: Some(Figure::Used {
             pct_x10: used,
             reset: Some(NOW + 3_600),
@@ -631,5 +632,204 @@ fn a_reading_older_than_its_wall_or_reset_draws_neither() {
         deck.rows[2].cell,
         Cell::AtLimit,
         "a wall still standing stands"
+    );
+}
+
+/// The `7d-model` window's wall standing until `until`, of `bucket`'s own week where the journal
+/// names one (FL-271), m3 its reader.
+fn week_wall(bucket: Option<&str>, until: i64) -> WindowSeen {
+    WindowSeen {
+        window: "7d-model".into(),
+        model: bucket.map(str::to_owned),
+        figure: None,
+        read: None,
+        wall_until: Some(Some(until)),
+        wall_by: Some((NOW - 600, "m3".into(), "0".repeat(32))),
+        ..window("7d-model", 0, 0)
+    }
+}
+
+/// A MODEL'S OWN WEEKLY WALL IS THAT MODEL'S, NEVER THE ACCOUNT'S LIMIT (FL-271): an account whose
+/// Fable week alone is walled draws its 5-hour figure, not `AtLimit`, its Quota left names the
+/// wall as Fable's beside what the account has left ("Fable week walled until …"), and its lens
+/// names that window "Fable week". A 5-hour wall beside a Fable wall draws `AtLimit` and still
+/// names Fable's; a wall of a week no bucket names (`seven_day_other`) walls every session, so it
+/// draws `AtLimit` as that week's; an older build's `7d-model` wall that names no model is no
+/// account's, and is said as the window's own. The `7d-model` window's figure, the most used of
+/// the models' weeks, binds nothing either: a Fable wall beside a 7d-model reading at 100% draws
+/// the 5-hour figure, and the reading is said in its window's line. An account with only a
+/// Fable wall says its quota is unknown, then the wall. A workspace's model wall is not said on
+/// the account's Quota left, and an account-wide wall is said once, as the limit.
+/// Negative controls, run: with `binding` taking the first window with a wall (as before), the
+/// Fable-only account draws `AtLimit`: `` left: AtLimit right: Used(380) ``; with `binding`'s
+/// figure taking the `7d-model` window again, the full-model-week account draws `Used(1000)`
+/// (`` left: Used(1000) right: Used(380) ``); with the Quota left giving only the models' walls
+/// where nothing binds, the wall-only account's reads `Fable week walled until …`; with the
+/// models' walls left out, the Fable-only account's Quota left says no Fable wall; with them
+/// naming a workspace's model wall, it ends `; Opus week walled until …`; with them naming
+/// account-wide walls among the models', the 5-hour wall is said twice (`` left: 2 right: 1
+/// ``).
+#[test]
+fn a_models_own_week_wall_is_that_models_and_never_the_accounts_limit() {
+    let lab = lab(
+        "m1",
+        vec![
+            account("ac-01", "fable-only", &[("m1", Some(1))]),
+            account("ac-02", "five-and-fable", &[("m1", Some(2))]),
+            account("ac-03", "other-week", &[("m1", Some(3))]),
+            account("ac-04", "unnamed-week", &[("m1", Some(4))]),
+            account("ac-05", "full-model-week", &[("m1", Some(5))]),
+            account("ac-06", "wall-only", &[("m1", Some(6))]),
+        ],
+    );
+    let week = NOW + 86_400;
+    let until = aterm_agent::harness::usage::rfc3339_utc(week);
+    let fable = Some("seven_day_overage_included");
+    let mut seen = Seen {
+        at: NOW,
+        ..Seen::default()
+    };
+    let with = |windows: Vec<WindowSeen>| AccountSeen {
+        windows,
+        ..AccountSeen::default()
+    };
+    // A workspace's Opus wall is the workspace's, said in its own window's line alone.
+    let mut workspace = week_wall(Some("seven_day_opus"), week);
+    workspace.sub = Some("sa-01".into());
+    seen.accounts.insert(
+        "ac-01".into(),
+        with(vec![
+            window("5h", 380, 720),
+            week_wall(fable, week),
+            workspace,
+        ]),
+    );
+    let mut five = window("5h", 1000, 120);
+    five.wall_until = Some(Some(NOW + 3_600));
+    seen.accounts
+        .insert("ac-02".into(), with(vec![five, week_wall(fable, week)]));
+    seen.accounts.insert(
+        "ac-03".into(),
+        with(vec![
+            window("5h", 200, 60),
+            week_wall(Some("seven_day_other"), week),
+        ]),
+    );
+    let read = window("7d-model", 900, 60);
+    let mut unnamed = week_wall(None, week);
+    unnamed.figure = read.figure;
+    unnamed.read = read.read;
+    seen.accounts
+        .insert("ac-04".into(), with(vec![window("5h", 100, 60), unnamed]));
+    // A /usage panel read the Fable week at 100%: the journal's 7d-model reading, of no model.
+    seen.accounts.insert(
+        "ac-05".into(),
+        with(vec![
+            window("5h", 380, 720),
+            window("7d-model", 1000, 60),
+            week_wall(fable, week),
+        ]),
+    );
+    seen.accounts
+        .insert("ac-06".into(), with(vec![week_wall(fable, week)]));
+    let deck = project(Some(&lab), Some(&seen), NOW);
+
+    let fable_only = &deck.rows[0];
+    assert_eq!(fable_only.cell, Cell::Used(380), "a Fable wall alone");
+    assert_eq!(
+        fact(fable_only, "Quota left"),
+        format!(
+            "62% of 5h left, read on m3, about 12 min ago (its clock) (statusline); Fable week \
+             walled until {until}"
+        )
+    );
+    assert!(
+        fact(fable_only, "Fable week window")
+            .starts_with(&format!("Fable week, at its limit until {until}")),
+        "{:?}",
+        fable_only.facts
+    );
+    assert!(fable_only.summary.contains("Fable week walled until"));
+    assert!(
+        !fable_only.summary.contains("7d-model"),
+        "{}",
+        fable_only.summary
+    );
+
+    let both = &deck.rows[1];
+    assert_eq!(both.cell, Cell::AtLimit, "the 5-hour wall is the account's");
+    let left = fact(both, "Quota left");
+    assert!(left.starts_with("5h at its limit until "), "{left}");
+    assert!(
+        left.ends_with(&format!("; Fable week walled until {until}")),
+        "{left}"
+    );
+    assert_eq!(
+        left.matches(" walled").count(),
+        1,
+        "the 5-hour wall is said once, as the limit: {left}"
+    );
+
+    let other = &deck.rows[2];
+    assert_eq!(
+        other.cell,
+        Cell::AtLimit,
+        "a week no bucket names walls every session"
+    );
+    assert!(
+        fact(other, "Quota left")
+            .starts_with(&format!("another model's week at its limit until {until}")),
+        "{:?}",
+        other.facts
+    );
+
+    let older = &deck.rows[3];
+    assert_eq!(
+        older.cell,
+        Cell::Used(100),
+        "an unnamed week's wall is no account's, and its figure binds nothing"
+    );
+    assert!(
+        fact(older, "Quota left").starts_with("90% of 5h left, read on m3"),
+        "{:?}",
+        older.facts
+    );
+    assert!(
+        fact(older, "Quota left").ends_with(&format!("; 7d-model walled until {until}")),
+        "{:?}",
+        older.facts
+    );
+
+    let full = &deck.rows[4];
+    assert_eq!(
+        full.cell,
+        Cell::Used(380),
+        "a model's week read full draws the account's own figure"
+    );
+    assert_eq!(
+        fact(full, "Quota left"),
+        format!(
+            "62% of 5h left, read on m3, about 12 min ago (its clock) (statusline); Fable week \
+             walled until {until}"
+        )
+    );
+    assert!(
+        fact(full, "7d-model window").starts_with("7d-model 0% left"),
+        "the models' weeks' reading is in its own line: {:?}",
+        full.facts
+    );
+
+    let wall_only = &deck.rows[5];
+    assert_eq!(wall_only.cell, Cell::Unknown);
+    assert_eq!(
+        fact(wall_only, "Quota left"),
+        format!("Unknown; no current reading in the lab journal; Fable week walled until {until}")
+    );
+    assert!(
+        wall_only
+            .summary
+            .contains(&format!("quota unknown; Fable week walled until {until}")),
+        "{}",
+        wall_only.summary
     );
 }

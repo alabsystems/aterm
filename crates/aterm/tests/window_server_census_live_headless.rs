@@ -9,29 +9,35 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
-use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use aterm_spec::host::could_not_run;
 
-use crate::{headless_boot, launch_isolation};
+use crate::patience::Patience;
+use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::{Instance, log_tail};
 
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
+/// How long a client and what it talks to may make no progress before it is killed as hung.
+const CLIENT_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(90);
 /// Long enough for a door on a timer or a lazily started worker to open.
 const IDLE: Duration = Duration::from_secs(3);
 /// How long the census waits for the positive control's line to reach the log:
 /// a hang detector for a line that must arrive, never a latency budget
 /// (AGENTS.md: a minute), so a lagging unified log on a loaded machine is waited
-/// out rather than turned into a COULD NOT RUN.
+/// out rather than turned into a COULD NOT RUN. A wall bound: tccd and the
+/// unified log write the line, and neither is a process this test started, so
+/// no reading of its tree measures them; running out decides nothing.
 const CONTROL_VISIBLE_DEADLINE: Duration = Duration::from_secs(60);
-const LOG_SHOW_DEADLINE: Duration = Duration::from_secs(60);
-/// How long the census waits for a `sys why` pull's split to land: a hang
-/// detector, never the pull's own wait (a latency budget it does not judge).
-const SPLIT_LANDED_DEADLINE: Duration = Duration::from_secs(60);
+/// How long `log show` and the osascript control may make no progress before
+/// they are killed as hung.
+const LOG_SHOW_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(60);
+/// How long the census waits, without progress, for a `sys why` pull's split
+/// to land: a hang detector, never the pull's own wait (a latency budget it
+/// does not judge).
+const SPLIT_LANDED_WINDOW: Duration = Duration::from_secs(60);
 
 /// The unified-log predicate: every line tccd writes that names WindowServer as
 /// a TCC preflight's requester, whatever its kind (`AttributionChain:`,
@@ -54,40 +60,11 @@ fn boot() -> Instance {
     headless_boot::boot("atws", &["--cpu", "--lines", "24", "--columns", "80"])
 }
 
-fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    })
-}
-
-fn bounded_wait(mut child: Child, what: &str, deadline: Duration) -> Result<Output, String> {
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let until = Instant::now() + deadline;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= until => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{what} did not exit within {}s",
-                    deadline.as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => return Err(format!("poll {what}: {e}")),
-        }
-    };
-    Ok(Output {
-        status,
-        stdout: stdout.join().expect("join the stdout drain"),
-        stderr: stderr.join().expect("join the stderr drain"),
-    })
+/// Wait for `child` to exit ([`child_output::wait_and_read`]), killed as hung after `window`
+/// without progress.
+fn bounded_wait(child: Child, what: &str, window: Duration) -> Result<Output, String> {
+    child_output::wait_and_read(child, window)
+        .map_err(|why| format!("{what} was killed before it exited: {why}"))
 }
 
 fn client_ok(inst: &Instance, args: &[&str]) -> String {
@@ -105,8 +82,12 @@ fn client_reply(inst: &Instance, args: &[&str]) -> (String, String) {
             .stderr(Stdio::piped());
         launch_isolation::apply(&mut cmd, &inst.tmp);
         let child = cmd.spawn().expect("spawn the aterm client");
-        bounded_wait(child, &format!("aterm ctl {args:?}"), CLIENT_EXIT_DEADLINE)
-            .unwrap_or_else(|e| panic!("{e}"))
+        bounded_wait(
+            child,
+            &format!("aterm ctl {args:?}"),
+            CLIENT_NO_PROGRESS_WINDOW,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
     });
     assert!(
         out.status.success(),
@@ -179,7 +160,7 @@ fn log_show(start: &str, predicate: &str) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn /usr/bin/log: {e}"))?;
-    let out = bounded_wait(child, "log show", LOG_SHOW_DEADLINE)?;
+    let out = bounded_wait(child, "log show", LOG_SHOW_NO_PROGRESS_WINDOW)?;
     if !out.status.success() {
         return Err(format!(
             "log show exited {}: {}",
@@ -249,7 +230,7 @@ fn positive_control() -> Option<u32> {
         .spawn()
         .ok()?;
     let pid = child.id();
-    let out = bounded_wait(child, "the osascript control", Duration::from_secs(60)).ok()?;
+    let out = bounded_wait(child, "the osascript control", LOG_SHOW_NO_PROGRESS_WINDOW).ok()?;
     out.status.success().then_some(pid)
 }
 
@@ -302,7 +283,7 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
         (body, head.trim().to_owned())
     };
     let why_head = why_pull(&["sys", "why"]).1;
-    let until = Instant::now() + SPLIT_LANDED_DEADLINE;
+    let mut patience = Patience::new(SPLIT_LANDED_WINDOW);
     let (mem_head, lane) = loop {
         let (body, head) = why_pull(&["sys", "why", "mem"]);
         if let Some(l) = body
@@ -311,11 +292,9 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
         {
             break (head, l.to_owned());
         }
-        assert!(
-            Instant::now() < until,
-            "no `sys why mem` pull read a split within {}s: {head:?} {body:?}",
-            SPLIT_LANDED_DEADLINE.as_secs()
-        );
+        if let Some(why) = patience.spent() {
+            panic!("no `sys why mem` pull read a split ({why}): {head:?} {body:?}");
+        }
         std::thread::sleep(Duration::from_millis(500));
     };
     let lane = if lane.starts_with("cannot ") {

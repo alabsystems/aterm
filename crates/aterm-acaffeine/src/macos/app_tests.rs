@@ -45,6 +45,8 @@ fn a_mug_that_cannot_start_off_the_main_thread_is_not_started_every_minute() {
         version: "0.0.0".into(),
         restart_on_update: false,
         instance,
+        // A test's run keeps nothing: its standard error is no job log.
+        kept: crate::launchd::keep_log(&paths),
     });
     assert_eq!(code, ExitCode::SUCCESS, "never started again by launchd");
     assert_eq!(

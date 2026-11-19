@@ -217,10 +217,22 @@ fn drain_more_nonblocking_delivers_interactive_burst_on_first_quiet_read() {
     assert_eq!(n, 1);
     let polls_before = super::BRIDGE_POLLS.with(std::cell::Cell::get);
     let mut gaps = 0u32;
-    let filled = drain_more_nonblocking(rd, &mut buf, 1, -1, -1, None, never_hot, &mut |_, _| {
-        gaps += 1;
-        false
-    });
+    let mut received = Vec::new();
+    let filled = drain_more_nonblocking_observed(
+        rd,
+        &mut buf,
+        1,
+        -1,
+        -1,
+        None,
+        never_hot,
+        &mut |_, _| {
+            gaps += 1;
+            false
+        },
+        |bytes| received.push(bytes),
+    );
+    assert_eq!(received, [3], "the initial read was already counted");
     let polls = super::BRIDGE_POLLS.with(std::cell::Cell::get) - polls_before;
     close_fd(rd);
     close_fd(wr);
@@ -282,6 +294,7 @@ fn drain_more_nonblocking_hot_caps_a_continuous_stream_at_the_hot_budget() {
                 assert_eq!(unsafe { libc::write(wr, b"x".as_ptr().cast(), 1) }, 1);
                 false
             },
+            |_| {},
         );
         let polls = super::BRIDGE_POLLS.with(std::cell::Cell::get) - polls_before;
         let budget = super::BUDGET_ENDED.with(std::cell::Cell::take);
@@ -377,6 +390,7 @@ fn drain_more_nonblocking_parks_yield_to_wake_and_leave_the_byte() {
                 gaps += 1;
                 false
             },
+            |_| {},
         );
         let took = t0.elapsed();
         let mut b = [0u8; 4];
@@ -438,6 +452,7 @@ fn drain_more_nonblocking_fence_delivers_before_a_park() {
                 }
                 false
             },
+            |_| {},
         );
         assert_eq!(
             seen_at[0],
@@ -543,6 +558,7 @@ fn the_process_watch_is_heard_before_the_master_in_every_poll() {
                 put(watch_wr, b"!");
                 false
             },
+            |_| {},
         );
         let mut rest = [0u8; 4096];
         let after = read(rd, &mut rest);
@@ -623,6 +639,7 @@ fn no_batch_ends_past_an_exec_the_watch_could_hear() {
                 }
                 heard
             },
+            |_| {},
         );
         super::BUDGET_FOR_TEST.with(|b| b.set(None));
         (filled, calls, checks() - before)
@@ -779,6 +796,7 @@ fn drain_more_nonblocking_idle_wait_bridges_refill_into_same_batch() {
             }
             false
         },
+        |_| {},
     );
     drop(release);
     writer.join().unwrap();
@@ -955,6 +973,7 @@ fn a_signal_does_not_end_an_armed_idle_wait() {
             }
             false
         },
+        |_| {},
     );
     signaller.stop().expect("join the signaller");
     assert!(

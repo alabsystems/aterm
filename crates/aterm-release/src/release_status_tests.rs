@@ -882,3 +882,94 @@ fn release_stage_validates_stage_name_and_text_status_scrubs_c1_controls() {
         "rendered text_status must contain no non-newline control chars: {rendered:?}"
     );
 }
+
+/// A PUMP'S STOP IS READ WITH ONE COMMAND. `ship release status` reads the pump's memory beside
+/// the journal: what it does or waits for and since when, whether that pump still runs (its
+/// pid and the start it recorded; a later process given the same pid has another start), its
+/// last run and the red line it holds. No memory is no pump; one that does not read says so.
+/// NEGATIVE CONTROL: the same memory read while its pid names another process is not running.
+#[test]
+fn the_pumps_reason_since_and_pid_are_read_from_its_memory() {
+    use aterm_release::pump::{Attempt, Doing, MEMORY_FILE, Memory, Red, Verb};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut none = |_: u32| -> Option<String> { panic!("no pid to read") };
+    assert!(pump_status(dir.path(), &mut none).is_null());
+    assert!(pump_lines(&aterm_json::Value::Null).is_empty());
+
+    let memory = Memory {
+        last: Some(Attempt {
+            verb: Verb::Start("c".repeat(40)),
+            key: "start 0.6.0".into(),
+            code: 1,
+            last: "REFUSED at 1/10 checks: release input is red — nothing public. fix".into(),
+            at: 1_794_900_000,
+            tip: "d".repeat(40),
+            journal: None,
+            repeats: 0,
+        }),
+        red: Some(Red {
+            version: "0.6.0".into(),
+            head: Some("c".repeat(40)),
+            journaled: true,
+            hash: "831fd1c0e6d2".into(),
+            at: 1_794_900_000,
+            last: "REFUSED at 1/10 checks: release input is red — nothing public. fix".into(),
+        }),
+        doing: Some(Doing {
+            pid: 4242,
+            started: "Tue Nov 17 10:00:00 2026".into(),
+            reason: "waiting — line v0.6.0 at ccccccccc is red".into(),
+            since: 1_794_900_060,
+        }),
+        ..Memory::default()
+    };
+    std::fs::write(
+        dir.path().join(MEMORY_FILE),
+        aterm_toml::to_string(&memory).unwrap(),
+    )
+    .unwrap();
+    let mut alive = |pid: u32| (pid == 4242).then(|| "Tue Nov 17 10:00:00 2026".to_string());
+    let pump = pump_status(dir.path(), &mut alive);
+    assert_eq!(pump["state"].as_str(), Some("running"));
+    assert_eq!(pump["pid"].as_u64(), Some(4242));
+    assert_eq!(pump["since"].as_u64(), Some(1_794_900_060));
+    assert_eq!(
+        pump["reason"].as_str(),
+        Some("waiting — line v0.6.0 at ccccccccc is red")
+    );
+    assert_eq!(
+        pump["last"]["run"].as_str(),
+        Some(format!("release --prepare --commit {}", "c".repeat(40)).as_str())
+    );
+    assert_eq!(pump["last"]["code"].as_i64(), Some(1));
+    assert_eq!(pump["red"]["input_hash"].as_str(), Some("831fd1c0e6d2"));
+    let text = text_status(&aterm_json::json!({"state": "none", "pump": pump.clone()}));
+    assert!(
+        text.contains(
+            "pump: running (pid 4242) since 2026-11-17T07:21:00Z: waiting — line v0.6.0 at \
+             ccccccccc is red"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("pump last run: release --prepare --commit"),
+        "{text}"
+    );
+    assert!(text.contains("pump red: v0.6.0 at cccc"), "{text}");
+
+    // NEGATIVE CONTROL: the pid now names a process with another start, or none.
+    let mut reused = |_: u32| Some("Tue Nov 17 11:00:00 2026".to_string());
+    let pump = pump_status(dir.path(), &mut reused);
+    assert_eq!(pump["state"].as_str(), Some("not-running"));
+    assert!(pump_lines(&pump)[0].starts_with("pump: not running (pid 4242 has ended)"));
+    let mut gone = |_: u32| None;
+    assert_eq!(
+        pump_status(dir.path(), &mut gone)["state"].as_str(),
+        Some("not-running")
+    );
+
+    std::fs::write(dir.path().join(MEMORY_FILE), "last = [").unwrap();
+    let unread = pump_status(dir.path(), &mut gone);
+    assert_eq!(unread["state"].as_str(), Some("unknown"));
+    assert!(unread["reason"].as_str().unwrap().contains(MEMORY_FILE));
+}

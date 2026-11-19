@@ -38,7 +38,7 @@ pub mod owned;
 pub mod secret;
 pub mod values;
 pub mod view;
-pub use view::{Awaiting, View};
+pub use view::{Awaiting, Unread, View, refused_words};
 
 /// A table rule's refusal of an owner write: the collection, row, column and
 /// rule, never a value. It is portable metadata independent of a live table.
@@ -160,6 +160,33 @@ pub struct Member {
     pub null: bool,
 }
 
+/// How a [`Link`] names the row it links to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Named {
+    /// By the row's own key, in the key grammar ([`pk_grammar`]).
+    Key,
+    /// By the 32-digit Commons machine uuid of the machine the row is, never by a label, which
+    /// is neither unique nor stable (docs/DESIGN-lab-tracker-2026-11-14.md §4.6): a registry
+    /// machine, which the uuid's own facts row binds.
+    Machine,
+}
+
+/// A row of another table family (docs/DESIGN-lab-tracker-2026-11-14.md §4.6): the family by
+/// its application and the role of its first generation, the collection, and how the value
+/// names the row. A [`Ty::Ref`] names a row of its own table, which every write and read can
+/// judge there; a link's row lives in another table with generations of its own, so no rule of
+/// this table judges it: following it through the family's generations, and reporting one whose
+/// row is missing or retired, is the link check's (TK-07).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub application: &'static str,
+    /// The role of the family's first generation (`registry`, whatever generation holds the
+    /// row now).
+    pub role: &'static str,
+    pub collection: &'static str,
+    pub named: Named,
+}
+
 /// A column's value type (design §3.3). Integers only: a percentage is `pct_x10`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
@@ -225,6 +252,9 @@ pub enum Ty {
     Key,
     /// A primary key of the named collection.
     Ref(&'static str),
+    /// A row of another table family, as text: its key, or for a machine its Commons machine
+    /// uuid ([`values::link`]).
+    Link(Link),
     Set(&'static Ty),
     List(&'static Ty, usize),
     Struct(&'static [Member]),
@@ -240,6 +270,27 @@ pub enum Ty {
 }
 
 impl Ty {
+    /// Whether a value of this type is, or holds, a secret: a [`Ty::Secret`] or a
+    /// [`Ty::SecretRef`], itself or as a set's or a list's member or a struct's.
+    #[must_use]
+    pub const fn holds_secret(&self) -> bool {
+        match self {
+            Self::Secret | Self::SecretRef => true,
+            Self::Set(of) | Self::List(of, _) => of.holds_secret(),
+            Self::Struct(members) => {
+                let mut n = 0;
+                while n < members.len() {
+                    if members[n].ty.holds_secret() {
+                        return true;
+                    }
+                    n += 1;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// A text set's member type, for a set of `Text`, `Prose` or `Path`: members whose element
     /// key is a digest of the text (they hold characters a key cannot) and whose element cell
     /// carries it (`cell::element`), in its normal form, white space collapsed. A command is no
@@ -301,6 +352,15 @@ impl Ty {
             Self::Secret => json!("secret"),
             Self::Key => json!("key"),
             Self::Ref(collection) => json!({"ref": collection}),
+            Self::Link(link) => json!({"link": {
+                "application": link.application,
+                "role": link.role,
+                "collection": link.collection,
+                "named": match link.named {
+                    Named::Key => "key",
+                    Named::Machine => "machine-uuid",
+                },
+            }}),
             Self::Set(inner) => json!({"set": inner.word()}),
             Self::List(inner, max) => json!({"list": inner.word(), "max": max}),
             Self::Struct(members) => json!({"struct": members
@@ -925,6 +985,28 @@ impl Table {
                 .iter()
                 .any(|column| matches!(column.ty, Ty::SecretRef) && secret_named(column.name))
         })
+    }
+
+    /// Whether this table declares a secret column: a [`Ty::Secret`] or a [`Ty::SecretRef`], at
+    /// a column or inside a set, a list or a struct. A signed record cannot be carried with a
+    /// secret value taken out, so a roll restates the history of a table that declares one
+    /// (`alab::history`) and releases its sealed generation; a family none of whose generations
+    /// declares one keeps every signed record across a roll (`att::keeps_records`).
+    #[must_use]
+    pub const fn holds_secret(&self) -> bool {
+        let mut c = 0;
+        while c < self.collections.len() {
+            let columns = self.collections[c].columns;
+            let mut n = 0;
+            while n < columns.len() {
+                if columns[n].ty.holds_secret() {
+                    return true;
+                }
+                n += 1;
+            }
+            c += 1;
+        }
+        false
     }
 }
 

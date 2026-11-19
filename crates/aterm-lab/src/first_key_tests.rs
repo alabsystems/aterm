@@ -184,10 +184,10 @@ fn rows_round_trip_through_the_tsv_and_summarize() {
     assert!(s.contains("input p99 +2.30 ms"), "{s}");
 }
 
-/// The summary counts, per arm, the presses that met an attended window; a burst press's rows
-/// are one press, and rows written before the column say nothing.
+/// The summary counts, per arm, the rows that met an attended window; a burst press's rows each
+/// count, and rows written before the column say nothing.
 #[test]
-fn the_summary_counts_the_presses_that_met_an_attended_window() {
+fn the_summary_counts_the_rows_that_met_an_attended_window() {
     let row = |press: &str, arm: &str, burst: &str, attended: Option<&str>| -> Row {
         [
             ("press", press),
@@ -210,19 +210,88 @@ fn the_summary_counts_the_presses_that_met_an_attended_window() {
         row("5", "Old", "0", None),
     ];
     let s = summarize(&rows);
+    assert!(s.contains("A: 1 of 3 rows met an attended window"), "{s}");
+    assert!(s.contains("F: 1 of 1 rows met an attended window"), "{s}");
     assert!(
-        s.contains("A: 1 of 3 presses met an attended window"),
-        "{s}"
-    );
-    assert!(
-        s.contains("F: 1 of 1 presses met an attended window"),
-        "{s}"
-    );
-    assert!(
-        s.contains("Fb: 1 of 1 presses met an attended window"),
-        "a burst's rows are one press: {s}"
+        s.contains("Fb: 2 of 2 rows met an attended window"),
+        "a burst press's rows each count: {s}"
     );
     assert!(!s.contains("Old:"), "no column, no count: {s}");
+}
+
+/// A `presses.tsv` of `rows`, each `(press, arm, attended)`, every other column a first key's.
+fn table(rows: &[(&str, &str, &str)]) -> String {
+    let mut text = format!("{}\n", COLUMNS.join("\t"));
+    for (press, arm, attended) in rows {
+        let row: Vec<&str> = COLUMNS
+            .iter()
+            .map(|c| match *c {
+                "press" => *press,
+                "arm" => *arm,
+                "attended" => *attended,
+                "burst" => "0",
+                _ => "1",
+            })
+            .collect();
+        let _ = writeln!(text, "{}", row.join("\t"));
+    }
+    text
+}
+
+/// Pooled files repeat press numbers, so the attended count is over rows: per arm, the rows
+/// whose `attended` is true, of that arm's rows whose `attended` reads as a bool (A's empty one
+/// counts in neither). Negative controls: the count keyed by `press` (a map from press number to
+/// `attended`, so each number counts once and the last file named wins) reads `A: 2 of 2` and
+/// `B: 1 of 2`, and the first assertion fails; a count over all of an arm's rows reads
+/// `A: 2 of 5`, and the first assertion fails.
+#[test]
+fn pooled_files_count_attended_rows_not_press_numbers() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a.tsv"), dir.path().join("b.tsv"));
+    let first = [
+        ("0", "A", "false"),
+        ("1", "B", "true"),
+        ("2", "B", "true"),
+        ("3", "A", "false"),
+        ("4", "A", ""),
+    ];
+    let second = [
+        ("0", "A", "true"),
+        ("1", "B", "false"),
+        ("2", "B", "true"),
+        ("3", "A", "true"),
+    ];
+    std::fs::write(&a, table(&first)).unwrap();
+    std::fs::write(&b, table(&second)).unwrap();
+    let s = summarize(&read_rows(&[a, b]).unwrap());
+    assert!(s.contains("A: 2 of 4 rows met an attended window"), "{s}");
+    assert!(s.contains("B: 3 of 4 rows met an attended window"), "{s}");
+}
+
+/// A relative `first-key summarize` path is taken from the directory the lab was started in,
+/// not from the `/` `confine_env` leaves the process in; an absolute one is kept as given.
+/// Negative control: the paths taken as given (`PathBuf::from`, the old reading) keep the
+/// relative one relative, and the first assertion fails. The read alone is no control: a test
+/// process's working directory is still the one it started in.
+#[test]
+fn a_relative_summarize_path_is_read_from_the_directory_the_lab_started_in() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let file = dir.path().join("presses.tsv");
+    std::fs::write(&file, table(&[("0", "A", "true")])).unwrap();
+    let absolute = file.to_str().unwrap();
+    let caller = PathBuf::from(crate::paths::caller_dir());
+    // The file named from the caller's directory: up to `/`, then down to it.
+    let up = caller
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count();
+    let relative = format!("{}{}", "../".repeat(up), absolute.trim_start_matches('/'));
+    let given = [relative, absolute.to_string()];
+    let paths = summarize_paths(&given);
+    assert_eq!(paths[0], caller.join(&given[0]), "{paths:?}");
+    assert_eq!(paths[1], file, "{paths:?}");
+    let rows = read_rows(&paths).unwrap();
+    assert_eq!(arm_names(&rows), ["A", "A"], "both name the one file");
 }
 
 #[test]

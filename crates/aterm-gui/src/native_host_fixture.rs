@@ -18,6 +18,18 @@ type SourceOutcomeObserver<'a> =
 #[path = "native_source_proof_fixture.rs"]
 mod source_proof;
 pub use source_proof::run_native_source_proof_fixture;
+#[path = "native_source_settle_ack_fault.rs"]
+pub(crate) mod settle_ack_fault;
+#[cfg(target_os = "macos")]
+#[path = "signed_source_settle_ack_guardian.rs"]
+pub(super) mod signed_settle_ack_guardian;
+
+#[derive(Clone, Copy)]
+struct SourceFixtureConnection<'a> {
+    observe: &'a SourceOutcomeObserver<'a>,
+    settle_ack: &'a Arc<settle_ack_fault::Fault>,
+    stopping: &'a AtomicBool,
+}
 
 /// The account services every fixture context serves with: the app's own constructor over a
 /// fresh lifetime, so a fixture's dispatch lends a renewal Attach an app-bound registry.
@@ -167,11 +179,11 @@ fn serve_connection_observed(
     context: &ControlWorkerContext,
     stream: CtlStream,
     real_child: bool,
-    observe: Option<&SourceOutcomeObserver<'_>>,
+    fixture: Option<SourceFixtureConnection<'_>>,
 ) -> io::Result<bool> {
     control_auth::peer_check(&stream).map_err(failure)?;
     stream.set_write_timeout(Some(MUST_HAPPEN))?;
-    let _connection = ConnectionScope::enter(
+    let connection = ConnectionScope::enter(
         &context.store,
         &context.proxy,
         &stream,
@@ -256,11 +268,60 @@ fn serve_connection_observed(
         let native_trace = real_child
             .then(|| fixture_native_action(&request.head()))
             .flatten();
-        let _final_reply = FINAL_REPLIES
+        let final_reply = FINAL_REPLIES
             .enter(&request.head())
             .or_else(|| context.owed_input_reply(&request));
         let dispatch_started = Instant::now();
-        let disposition = context.serve_line(request, scope, &stream, &mut reader, &mut out);
+        let attempt = fixture.and_then(|fixture| {
+            fixture
+                .settle_ack
+                .select(&line, serving_peer_pid()?, serving_connection()?)
+        });
+        let dispatch = || {
+            let serve = || context.serve_line(request, scope, &stream, &mut reader, &mut out);
+            if let Some(fixture) = fixture {
+                settle_ack_fault::observe_dispatch(fixture.settle_ack, serve)
+            } else {
+                serve()
+            }
+        };
+        let (disposition, committed) = match &attempt {
+            Some(attempt) => settle_ack_fault::witness(attempt, dispatch),
+            None => (dispatch(), None),
+        };
+        if let (Some(fixture), Some(attempt), Some(settle_ack_fault::Witness::Commit(generation))) =
+            (fixture, attempt, committed)
+        {
+            let status = out
+                .fixture_unsent_status()
+                .ok_or_else(|| failure("source settlement ACK is not a sole unsent status"))?;
+            if disposition.is_some()
+                || !CONNECTION_CLAIMED.with(std::cell::Cell::get)
+                || !fixture.settle_ack.hold(&attempt, status, generation)
+            {
+                return Err(failure(
+                    "source settlement ACK does not match the armed fault",
+                ));
+            }
+            settle_ack_fault::await_peer_eof(
+                &stream,
+                !reader.buffer().is_empty(),
+                fixture.stopping,
+                Instant::now() + MUST_HAPPEN,
+            )?;
+            // Finish the original connection's ordinary teardown without ever
+            // passing its held reply to the socket writer.
+            drop(final_reply);
+            drop(out);
+            let (_, retained) = settle_ack_fault::witness(&attempt, || drop(connection));
+            let claim = match retained {
+                Some(settle_ack_fault::Witness::Eof(claim)) => Some(claim),
+                _ => None,
+            };
+            fixture.settle_ack.record_cleanup(&attempt, claim);
+            return Ok(true);
+        }
+        let observe = fixture.map(|fixture| fixture.observe);
         let constructor = observe.and_then(|_| out.fixture_constructor_reply(&line));
         if let Some((action, class)) = constructor {
             eprintln!(
@@ -569,7 +630,8 @@ fn run_native_host_fixture_inner(
     store
         .write()
         .unwrap_or_else(|p| p.into_inner())
-        .register(handle.clone());
+        .register(handle.clone())
+        .start_mailbox();
     let active = Arc::new(Mutex::new(Some(ActiveSession {
         term,
         master: handle.master,
@@ -607,6 +669,8 @@ fn run_native_host_fixture_inner(
         recovery_count_admission: Arc::new(
             crate::keeper_link::RecoveryCountAdmission::from_retained(Vec::new()),
         ),
+        #[cfg(target_os = "macos")]
+        signed_settle_ack: None,
     };
     let worker = std::thread::Builder::new()
         .name("native-host-fixture".into())

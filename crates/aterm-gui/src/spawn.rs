@@ -4485,6 +4485,7 @@ fn spawn_pty_gather(
     id: u64,
     lat_epoch: Instant,
     latest_output_activity_ns: Arc<AtomicU64>,
+    job_feed: Arc<crate::vitals_jobs::JobFeed>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     start_gate: Option<DeferredReaderGate>,
     first_buf: Vec<u8>,
@@ -4569,6 +4570,7 @@ fn spawn_pty_gather(
                     .all(|pid| filled_tx.send(GatherMsg::Gone(pid)).is_ok())
             };
             let _ = filled_tx.send(GatherMsg::Started);
+            let output_reader = job_feed.start_output_reading(Instant::now());
             let mut owed = aterm_pty::output_queue_len(master).unwrap_or(0);
             if owed == 0 {
                 let _ = filled_tx.send(GatherMsg::CaughtUp);
@@ -4709,11 +4711,12 @@ fn spawn_pty_gather(
                         break;
                     }
                     aterm_pty::ReadOutcome::Data(n) => {
+                        output_reader.record(Instant::now(), n);
                         #[cfg(test)]
                         crate::holder_image::hold_hook::after_read(id);
                         cutter.begin();
                         let filled = if nonblock {
-                            aterm_pty::drain_more_nonblocking(
+                            aterm_pty::drain_more_nonblocking_observed(
                                 master,
                                 &mut buf,
                                 n,
@@ -4727,12 +4730,21 @@ fn spawn_pty_gather(
                                     }
                                     _ => cutter.sample(fg_probe(master), f),
                                 },
+                                |bytes| output_reader.record(Instant::now(), bytes),
                             )
                         } else {
-                            aterm_pty::drain_more_watched(master, &mut buf, n, proc_rd, &mut |f| {
-                                exec.as_mut()
-                                    .is_some_and(|x| x.heard(&mut cutter, || fg_probe(master), f))
-                            })
+                            aterm_pty::drain_more_watched_observed(
+                                master,
+                                &mut buf,
+                                n,
+                                proc_rd,
+                                &mut |f| {
+                                    exec.as_mut().is_some_and(|x| {
+                                        x.heard(&mut cutter, || fg_probe(master), f)
+                                    })
+                                },
+                                |bytes| output_reader.record(Instant::now(), bytes),
+                            )
                         };
                         let mut edge = cutter.finish(|| fg_probe(master), filled);
                         let image = match (edge.as_mut(), exec.as_mut()) {
@@ -5048,6 +5060,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
             parse_in_flight.clone(),
             journal.clone(),
         );
+        let gather_feed = job_feed.clone();
         let start_gather = move || {
             spawn_pty_gather(
                 master,
@@ -5056,6 +5069,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                 id,
                 lat_epoch,
                 activity,
+                gather_feed,
                 stop,
                 start_gate,
                 read_buf,
@@ -5745,6 +5759,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                 }
             };
             #[cfg(windows)]
+            let output_reader = job_feed.start_output_reading(Instant::now());
+            #[cfg(windows)]
             loop {
                 // Stop only before a read: bytes out of the kernel queue must reach the engine.
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -5771,7 +5787,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                     }
                     aterm_pty::ReadOutcome::Data(n) => {
                         let read_at = Instant::now();
-                        let mut filled = aterm_pty::drain_more(master, &mut buf, n);
+                        output_reader.record(read_at, n);
+                        let mut filled = n;
                         let since_epoch = |at: Instant| {
                             u64::try_from(at.saturating_duration_since(lat_epoch).as_nanos())
                                 .unwrap_or(u64::MAX)
@@ -5789,7 +5806,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                                 filled,
                                 until,
                                 || since_epoch(Instant::now()),
-                                |b, f| aterm_pty::drain_available(master, b, f),
+                                |b, f| {
+                                    aterm_pty::drain_available_observed(master, b, f, |bytes| {
+                                        output_reader.record(Instant::now(), bytes)
+                                    })
+                                },
                                 std::thread::sleep,
                                 || {
                                     !stop.load(std::sync::atomic::Ordering::Acquire)
@@ -6435,21 +6456,10 @@ impl crate::App {
         session: &Session,
         parent: Option<SessionId>,
     ) {
-        let handle = session_store::SessionHandle {
-            sid: session.ctx.self_id.clone(),
-            nonce: session.ctx.nonce,
-            local_id: session.id,
-            parent,
-            state: session_store::SessionState::Spawning,
-            title: term_lock(&session.term).title().to_string(),
-            term: session.term.clone(),
-            master: session.master,
-            shell_identity: session.shell_identity,
-            ctx: session.ctx.clone(),
-        };
+        let handle = session_store::SessionHandle::of_session(session, parent);
         crate::fabric::register_on_log(&session.ctx, || {
             let mut registry = store.write().unwrap_or_else(|p| p.into_inner());
-            registry.register(handle);
+            registry.register(handle).start_mailbox();
             if session.frozen_path {
                 registry.mark_frozen_path(session.id);
             }

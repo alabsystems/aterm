@@ -9,14 +9,14 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aterm_control::wire::pct_decode;
 
-use crate::{ctl_accept, headless_boot, launch_isolation};
+use crate::{child_output, ctl_accept, headless_boot, launch_isolation};
 
 use headless_boot::Instance;
 
@@ -24,7 +24,8 @@ fn boot() -> Instance {
     headless_boot::boot("atconn", &["--lines", "40", "--columns", "120"])
 }
 
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
+/// How long a client and what it talks to may make no progress before it is killed as hung.
+const CLIENT_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(90);
 
 fn run_client(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     ctl_accept::until_served(|| run_client_once(inst, args, extra_env))
@@ -40,39 +41,9 @@ fn run_client_once(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().expect("spawn the aterm client");
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + CLIENT_EXIT_DEADLINE;
-    loop {
-        match child.try_wait().expect("poll the aterm client") {
-            Some(status) => {
-                return Output {
-                    status,
-                    stdout: stdout.join().expect("join the stdout drain"),
-                    stderr: stderr.join().expect("join the stderr drain"),
-                };
-            }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!(
-                    "aterm {args:?} did not exit within {}s",
-                    CLIENT_EXIT_DEADLINE.as_secs()
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(25)),
-        }
-    }
+    let child = cmd.spawn().expect("spawn the aterm client");
+    child_output::wait_and_read(child, CLIENT_NO_PROGRESS_WINDOW)
+        .unwrap_or_else(|why| panic!("aterm {args:?} was killed before it exited: {why}"))
 }
 
 fn client_ok(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> String {

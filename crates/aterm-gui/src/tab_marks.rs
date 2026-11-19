@@ -455,6 +455,13 @@ impl crate::App {
             return;
         };
         for tab in ws.tab_set.tabs() {
+            if ws
+                .dock
+                .preview
+                .is_some_and(|p| p.borrowed && p.tab == tab.id)
+            {
+                continue;
+            }
             tab.root.visit(&mut |&view| {
                 let Some(crate::tab_model::View::Terminal(terminal)) =
                     self.view_store.get(view).copied()

@@ -110,5 +110,5 @@ pub fn view_for_host(dirs: &Dirs) -> Result<Configured> {
     resolve(dirs, None, true)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests;

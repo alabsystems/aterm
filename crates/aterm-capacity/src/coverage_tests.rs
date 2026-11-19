@@ -14,6 +14,53 @@ use crate::{
 
 const GIB: u64 = 1 << 30;
 
+#[test]
+fn only_the_named_public_cpu_grant_covers_a_command_without_memory() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let machine = Fixed::new(Reading::of_gib(24, 20, 14));
+    let me = std::process::id();
+    let acquire = |need| {
+        admit_with(
+            &ledger,
+            &machine,
+            need,
+            Admit::Wait,
+            Pace::default(),
+            &mut |_| {},
+        )
+        .unwrap()
+    };
+    let lookup = |pid, marker: Option<&str>| {
+        crate::covering_command(&ledger, &machine, pid, marker).unwrap()
+    };
+    let mut claim = acquire(Need::new("explicit CPU budget").cores(1).covers_command());
+    let marker = claim.record().cover_marker();
+    assert_eq!(lookup(me, Some(&marker)).unwrap().cover_marker(), marker);
+    assert!(
+        covering(&ledger, &machine, me, Some(&marker))
+            .unwrap()
+            .is_none()
+    );
+    assert!(!covered_memory(me, &[claim.record()], None));
+    assert!(lookup(me, None).is_none());
+    assert!(lookup(me, Some(NO_COVER)).is_none());
+    assert!(lookup(me.wrapping_add(1), Some(&marker)).is_none());
+    machine.set_procs(Some(line()));
+    claim.credit(&[200]).unwrap();
+    assert_eq!(lookup(200, Some(&marker)).unwrap().cover_marker(), marker);
+    assert_eq!(lookup(300, Some(&marker)).unwrap().cover_marker(), marker);
+    assert!(lookup(100, Some(&marker)).is_none());
+    assert!(lookup(300, None).is_none());
+    assert!(lookup(300, Some(NO_COVER)).is_none());
+    claim.credit(&[]).unwrap();
+    assert!(lookup(300, Some(&marker)).is_none());
+    drop(claim);
+    assert!(lookup(me, Some(&marker)).is_none());
+    let ordinary = acquire(Need::new("ordinary CPU pool").cores(1).covers());
+    assert!(lookup(me, Some(&ordinary.record().cover_marker())).is_none());
+}
+
 fn record(pid: u32, need: Need, held: bool) -> Record {
     Record {
         accounting: crate::Accounting::Holder,

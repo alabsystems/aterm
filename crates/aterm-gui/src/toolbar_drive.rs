@@ -344,6 +344,7 @@ mod macos {
             attention: crate::tab_bar::ChipLevel::Off,
             conn,
             closable: true,
+            panel_numbers: false,
             team: crate::tab_bar::TabTeam::NONE,
         }
     }
@@ -415,12 +416,15 @@ mod macos {
     fn apply(handle: &toolbar::ToolbarHandle, m: &Model) {
         toolbar::set_window_tabs(
             handle,
-            &m.titles,
-            &m.ids,
-            &m.metadata,
-            &m.tooltips,
-            &m.ext,
-            m.active,
+            crate::platform::ToolbarTabsModel {
+                titles: &m.titles,
+                ids: &m.ids,
+                metadata: &m.metadata,
+                tooltips: &m.tooltips,
+                ext: &m.ext,
+                active: m.active,
+                new_tab: true,
+            },
         );
     }
 
@@ -1484,12 +1488,12 @@ mod macos {
             pump(&mut d, &mut el);
             cx.check_focused(
                 before && focused(),
-                d.native_wakes == [
-                    (strip_window, NativeTabCommand::Select(ids[0])),
-                    (strip_window, NativeTabCommand::Move {
-                        tab: ids[0], neighbor: ids[1], forward: true,
-                    }),
-                ],
+                matches!(d.native_wakes.as_slice(), [
+                    (w1, NativeTabCommand::Select(selected)),
+                    (w2, NativeTabCommand::Move { tab, neighbor, forward: true }),
+                    (w3, NativeTabCommand::Drop { tab: dropped, .. }),
+                ] if [*w1, *w2, *w3] == [strip_window; 3] &&
+                    [*selected, *tab, *dropped] == [ids[0]; 3] && *neighbor == ids[1]),
                 format!("drag rebind_after_press={rebind_after_press} keeps the pressed adjacent pair {:?} in {strip_window:?}; saw {:?}", &ids[..2], d.native_wakes),
             );
         }
@@ -2181,6 +2185,14 @@ mod macos {
             toolbar::can_present_tab_rename(&handle),
             "can_present_tab_rename".to_owned(),
         );
+        // SAFETY: read the chip's existing title field before opening its editor.
+        let original_label = unsafe {
+            chips(strip).get(1).copied().and_then(|chip| {
+                subviews(chip).into_iter().find(|field| {
+                    name_of(*field) == "NSTextField" && !s_bool(*field, sel!(isHidden))
+                })
+            })
+        };
         let mut rename_target_cls = ClassPtr::NULL;
         d.clear_wakes();
         cx.check(
@@ -2209,6 +2221,10 @@ mod macos {
         // SAFETY: `fr` is a live responder while the editor is up; both `-delegate` sends are read-only accessors.
         unsafe {
             let ctl = s_id(fr, sel!(delegate));
+            cx.check(
+                original_label == Some(ctl),
+                "the chip’s existing title label owns the field editor".to_owned(),
+            );
             let tgt = if ctl.is_null() {
                 Id::NIL
             } else {
@@ -2246,6 +2262,28 @@ mod macos {
                 .is_some_and(|t| t.contains('Z') || t.contains('Q')),
             format!("real key events reached the field editor: {typed:?}"),
         );
+        // A new tab takes the edited tab's old slot in the same update that moves it.
+        let mut reordered = model(4);
+        reordered.ids.swap(1, 3);
+        reordered.titles.swap(1, 3);
+        reordered.metadata.swap(1, 3);
+        reordered.tooltips.swap(1, 3);
+        reordered.ext.swap(1, 3);
+        reordered.active = 3;
+        apply(&handle, &reordered);
+        // SAFETY: inspect the live strip's children and its window's current responder.
+        let follows_tab = unsafe {
+            original_label.is_some_and(|label| {
+                chips(strip)
+                    .get(3)
+                    .is_some_and(|chip| subviews(*chip).contains(&label))
+            }) && s_id(ns_window, sel!(firstResponder)) == fr
+        };
+        cx.check(
+            follows_tab && toolbar::rename_editor_text(&handle) == typed,
+            "the same focused title field and its draft follow the reordered tab".to_owned(),
+        );
+        apply(&handle, &m3);
         cx.check(
             toolbar::rename_editor_edit(&handle, crate::platform::RenameEditorEdit::SelectAll),
             "rename_editor_edit(SelectAll) found a field editor".to_owned(),

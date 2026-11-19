@@ -44,6 +44,12 @@ pub const CAP_SYNC: u8 = 0x08;
 /// window: it reads an OFFER's kept flag ([`Frame::Offer`]'s `kept`), which a keeper writes only
 /// to a window that states it.
 pub const CAP_KEEPS: u8 = 0x10;
+/// WELCOME's trailing caps bit, from a keeper: it honours a window's [`Frame::RestartWhenSafe`].
+/// Only a keeper launchd runs as its job (its place's label, or the one `--job` names) states it. It exits, so that launchd
+/// starts the program at its executable's path again, once nothing only it holds would be lost
+/// and a build at least as new stands at that path (`KeeperCore::restart_when_safe`). An older
+/// keeper reads the frame and does nothing; one that does not state it never exits for it.
+pub const CAP_RESTARTS: u8 = 0x20;
 /// An OFFER's kept flag bit: a quit's BYE kept the record past it
 /// ([`Frame::Offer`]'s `kept`), not a crash.
 const OFFER_KEPT: u8 = 0x01;
@@ -73,7 +79,8 @@ pub enum Kind {
     Orphans = 9,
     /// Either way: an empty request, or the keeper's text reply.
     Status = 10,
-    /// W→K: an updated window asks an older keeper to restart when safe (the keeper ignores it).
+    /// W→K: a window newer than its keeper asks it to restart when safe (a keeper that states
+    /// [`CAP_RESTARTS`] honours it; an older one ignores it).
     RestartWhenSafe = 11,
     /// W→K: offer me the orphans now (a live sibling answering ORPHANS).
     Adopt = 12,

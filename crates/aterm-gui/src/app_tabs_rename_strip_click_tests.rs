@@ -99,6 +99,7 @@ fn a_press_on_a_background_tabs_marks_selects_it() {
 #[test]
 fn a_second_click_on_the_same_chip_opens_the_inline_editor() {
     let (mut app, wid) = app_with_two_tabs();
+    crate::term_lock(&app.pool.get(0).unwrap().term).process(b"\x1b]2;my session\x07");
     let col = chip_col(&app, wid, 0);
     let first = a_minute_ago();
 
@@ -113,6 +114,14 @@ fn a_second_click_on_the_same_chip_opens_the_inline_editor() {
         "the second click on the SAME chip, at the interval's last instant, edits its \
          focused session"
     );
+
+    let edit = app.inline_rename_edit(wid).unwrap();
+    assert_eq!(edit.text, "my session");
+    assert!(edit.selected_all);
+    app.rename_field_edit(wid, crate::app_search::SearchEdit::MoveEnd);
+    app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert(" notes".into()));
+    app.settle_rename_edit(wid);
+    assert_eq!(pin(&app, 0).as_deref(), Some("my session notes"));
 
     let (mut app, wid) = app_with_two_tabs();
     app.handle_tab_strip_click(wid, chip_col(&app, wid, 0), first);
@@ -206,7 +215,8 @@ fn non_left_strip_and_native_page_presses_settle_rename_and_middle_click_closes_
 
     let (cw, ch) = app.win_cell_size(wid);
     let (ox, oy) = app.frame_origin(wid);
-    let col2 = chip_col(&app, wid, 2);
+    assert_eq!(app.windows[&wid].strip_tab_count(), 2);
+    let col2 = chip_col(&app, wid, 1);
     let x = ox as f64 + (app.win_pad(wid) + usize::from(col2) * cw + cw / 2) as f64;
     let y = oy as f64 + (app.win_pad_top(wid) + app.win_head(wid) + ch / 2) as f64;
     app.on_cursor_moved(wid, x, y);
@@ -217,12 +227,13 @@ fn non_left_strip_and_native_page_presses_settle_rename_and_middle_click_closes_
     assert_eq!(
         app.windows[&wid].tab_set.len(),
         2,
-        "middle-clicking the Settings chip while Settings is active closes it"
+        "middle-clicking the second session chip while Settings is active closes that session"
     );
 
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
     app.splice_tab_strip(wid);
     assert!(app.begin_session_rename(wid, tab0));
+    app.rename_field_edit(wid, crate::app_search::SearchEdit::MoveEnd);
     app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert(" body".into()));
     let (bx, by) = app.cell_centre_px(wid, 4, 4).expect("native body cell");
     app.on_cursor_moved(wid, bx, by);

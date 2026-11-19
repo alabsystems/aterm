@@ -29,6 +29,14 @@ path = "tests/artifact_fixture.rs"
 test = false
 bench = false
 
+# The released-shim tests' candidate helper: atpkg's standalone entry, as a binary of this
+# package (`atpkg::cli::standalone_entry`, the whole `main` of atpkg's own `[[bin]]`).
+[[bin]]
+name = "aterm-verify-candidate-helper"
+path = "tests/candidate_helper.rs"
+test = false
+bench = false
+
 [lib]
 name = "aterm_verify"
 path = "src/lib.rs"
@@ -157,14 +165,15 @@ aterm-types = { workspace = true }
 aterm-land-trailer = { workspace = true }
 # The generated-file seal `vendor-out` stamps its list of vendored files with. Std only.
 aterm-seal = { workspace = true }
+# Run records are archived durably (`runs::archive_record`, Unix and Windows), and the test
+# binary's flush policy (lib.rs `plain_durable_flushes_in_tests!`) covers the durable flushes
+# its dependencies make while fixtures run.
+aterm-durable = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # `verify land`'s verdict records are signed and verified by this Mac's fleet node key, as
 # records of their own domain (`NodeIdentity::sign_record`, `fleet::verifies_record`).
 aterm-net = { workspace = true }
-# The test binary's flush policy (lib.rs `plain_durable_flushes_in_tests!`) covers the
-# durable flushes its dependencies make while fixtures run.
-aterm-durable = { workspace = true }
 # The arena lanes' interrupt guard: block SIGINT/SIGTERM/SIGHUP, take them on
 # one thread with `sigwait`, and `killpg` the terminals under test.
 libc = { workspace = true }
@@ -178,7 +187,6 @@ aterm-update-core = { workspace = true }
 aterm-vz = { workspace = true }
 
 [dev-dependencies]
-aterm-durable = { workspace = true }
 # Manual journal-store admission measurement; all network and identities are fixtures.
 agh-fake = { workspace = true }
 # Tier-1 of `EndByProof` (tests/conformance_end_by_proof.rs): the model and the interpreter

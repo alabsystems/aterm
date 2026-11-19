@@ -187,8 +187,9 @@ fn a_registry_label_waits_for_its_local_writer() {
     assert_eq!(target.node, principal);
 
     // Both real command routes must spend only their caller's budget resolving a label.
-    // Ready roster facts require no wait; the expired registry read must refuse before the
-    // own-label resolution could turn into the different self-target refusal.
+    // Ready roster facts require no wait; the expired registry read gives no answer, and the book
+    // names no Mac m42 (only the registry calls this Mac that), so both refuse with the
+    // registry's cause, never as this machine itself.
     {
         let book = member::hold_book(&lab.places.state).unwrap();
         book.write_key(&[0x44; 24]).unwrap();
@@ -231,7 +232,7 @@ fn a_registry_label_waits_for_its_local_writer() {
     }
 
     let held = client::test_hold_state_lock(&lab.paths).unwrap();
-    assert!(registry_target_until(&lab.places, "m42", Instant::now()).is_err());
+    assert!(registry_target_until(&lab.places, "m42", Instant::now(), LabelFor::Reach).is_err());
     drop(held);
     assert_eq!(
         registry_target(&lab.places, "m42")
@@ -241,7 +242,7 @@ fn a_registry_label_waits_for_its_local_writer() {
         own_node().node()
     );
     assert_eq!(
-        registry_target_until(&lab.places, &principal, Instant::now())
+        registry_target_until(&lab.places, &principal, Instant::now(), LabelFor::Reach)
             .unwrap()
             .unwrap()
             .transport,
@@ -366,6 +367,519 @@ fn a_registry_label_removes_the_registrys_seat_never_the_logs_label() {
     assert!(refused.contains("does not remove itself"), "{refused}");
     assert_eq!(held(&lab), before, "a refused removal signs nothing");
     assert_eq!(standing(&lab, "m9"), Some(m9), "the log's m9 stays in");
+}
+
+/// `lab`'s book as [`Lab::new`] wrote it, but for the entries of `nodes`, with `entries` beside it.
+fn rebook(lab: &Lab, nodes: &[&str], entries: &[Peer]) {
+    let kept = std::fs::read_to_string(lab.places.state.join(PEERS_FILE)).unwrap();
+    let book: String = kept
+        .lines()
+        .filter(|line| !nodes.iter().any(|node| line.contains(node)))
+        .map(str::to_owned)
+        .chain(entries.iter().map(Peer::line))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    write_private(&lab.places.state, PEERS_FILE, book.as_bytes()).unwrap();
+}
+
+/// A fleet key for `lab`, taken under its vault, so a survey reads.
+fn take_fleet(lab: &Lab) {
+    let book = member::hold_book(&lab.places.state).unwrap();
+    book.write_key(&[0x44; 24]).unwrap();
+    crate::fleet_vault::take(&book, Vault::configured(&lab.paths).unwrap().as_ref()).unwrap();
+}
+
+/// The line [`say_target`] says for `id`, named `label` by the book.
+fn said_by_book(label: &str, id: &NodeIdentity) -> String {
+    format!(
+        "target={label} node={} transport={} by=book",
+        member::node_principal(id.key()),
+        id.node()
+    )
+}
+
+/// The refusal a survey by `host` within `within` ends in at `lab`.
+fn survey_refused(lab: &Lab, host: &str, within: Duration) -> String {
+    let Err(refused) = survey_fleet_in(
+        &lab.places,
+        &aterm_ctl::FleetAsk {
+            host: Some(host),
+            within,
+            holder: None,
+            by: None,
+        },
+    ) else {
+        panic!("a survey by {host} reads no Mac");
+    };
+    refused.why
+}
+
+/// The advice only a verb that refuses a label the registry gave no answer for gives: a removal,
+/// a grant, `peers rm`.
+const REMOVAL_ADVICE: &str = "name the Mac by the node";
+
+/// Where this Mac's registry gives no answer (its vault holds no registry, as a Mac whose Commons
+/// serves no table read), a survey and a drive by a label go to the one Mac the book names by it,
+/// by its whole node id, and say so on stderr with `by=book`; a removal by the same label reads
+/// the registry alone, refuses, and signs nothing. With no time left once the registry gave no
+/// answer, neither asks any Mac: each refuses, blaming the registry read, never as the Mac's
+/// silence.
+///
+/// NEGATIVE CONTROLS: make `host_word` return every refusal of `registry_label_node` unchanged, as
+/// before: the survey refuses with `m9: registry unread`. Drop the time check in
+/// `bind_host_word`: the survey that has no time left answers with m9's row unanswered.
+#[test]
+fn a_label_the_registry_gives_no_answer_for_is_read_by_the_book_and_never_removed_by_it() {
+    let lab = Lab::new("label-by-book");
+    assert!(
+        matches!(
+            registry_target(&lab.places, "m9"),
+            Err(LabelRefused::Unread(_))
+        ),
+        "PRECONDITION: no registry here answers for m9"
+    );
+    take_fleet(&lab);
+    // m9's own entry under the book name it signs, at a loopback port nothing listens on: no name
+    // is looked up, and the read's one dial ends at once.
+    let at = ("127.0.0.1", closed_port(), "0.146.0");
+    let m9 = Peer {
+        signed: Some(member::Signed::named_by(&lab.m9, at, NOW_MS, Some("m9")).unwrap()),
+        ..Peer::own(&lab.m9, at, NOW_MS)
+    };
+    assert_eq!(
+        m9.primary_name(),
+        Some("m9"),
+        "PRECONDITION: m9 signs its name"
+    );
+    rebook(&lab, &[lab.m9.node()], &[m9]);
+    SAID_TARGETS.take();
+    let Err(drive) = drive_fleet_in(&lab.places, "m9", Duration::ZERO) else {
+        panic!("a drive with no time left asks no Mac");
+    };
+    let survey = survey_refused(&lab, "m9", Duration::ZERO);
+    for why in [&drive.why, &survey] {
+        assert!(
+            why.starts_with("m9: registry unread")
+                && why.contains("ran out before any Mac was asked"),
+            "{why}"
+        );
+        assert!(!why.contains(REMOVAL_ADVICE), "{why}");
+    }
+    assert!(SAID_TARGETS.take().is_empty(), "no Mac was named");
+
+    let read = survey_fleet_in(
+        &lab.places,
+        &aterm_ctl::FleetAsk {
+            host: Some("m9"),
+            within: HANG,
+            holder: None,
+            by: None,
+        },
+    )
+    .unwrap_or_else(|why| panic!("m9 by the book: {why}"));
+    assert!(
+        matches!(&read.peers[..], [row] if row.node.as_deref() == Some(lab.m9.node())),
+        "the one row reads m9's node: {read:?}"
+    );
+    assert_eq!(SAID_TARGETS.take(), [said_by_book("m9", &lab.m9)]);
+    // Nothing listens at m9's port: the drive dials it, by the book, and is refused by the dial.
+    let drive = drive_fleet_in(&lab.places, "m9", HANG)
+        .err()
+        .expect("nothing listens at m9's port");
+    assert!(
+        !drive.why.contains("registry") && !drive.why.contains("book records"),
+        "the drive went to m9 by the book: {drive:?}"
+    );
+    assert_eq!(SAID_TARGETS.take(), [said_by_book("m9", &lab.m9)]);
+
+    let seat = standing(&lab, "m9").expect("CONTROL: m9 stands");
+    let before = held(&lab);
+    let refused =
+        remove_by_person(&lab, "m9").expect_err("a removal reads a label by the registry alone");
+    assert!(refused.contains("m9: registry unread"), "{refused}");
+    assert_eq!(held(&lab), before, "a refused removal signs nothing");
+    assert_eq!(standing(&lab, "m9"), Some(seat), "m9 stays in");
+    assert!(
+        SAID_TARGETS.take().is_empty(),
+        "a removal names no Mac by the book"
+    );
+}
+
+/// NEGATIVE CONTROL of the fallback: a label two Macs of the book answer to, where the registry
+/// gives no answer for it, is refused naming both, never picked; with one of them alone the word
+/// names it.
+#[test]
+fn a_label_two_book_peers_answer_to_is_refused_by_the_book() {
+    let lab = Lab::new("label-by-book-twice");
+    let mini = NodeIdentity::from_seed(&"c3".repeat(16), &[0x31; 32]).unwrap();
+    let studio = NodeIdentity::from_seed(&"f7".repeat(16), &[0x37; 32]).unwrap();
+    let entry = |id: &NodeIdentity, host: &str| Peer::own(id, (host, 7100, "0.146.0"), NOW_MS);
+    let word = || host_word(&lab.places, "m31", None, after_now(HANG)).map(|said| said.word);
+
+    rebook(&lab, &[], &[entry(&mini, "m31-mini.local")]);
+    SAID_TARGETS.take();
+    assert_eq!(
+        word(),
+        Ok(mini.node().to_owned()),
+        "CONTROL: one Mac answers"
+    );
+    assert_eq!(SAID_TARGETS.take(), [said_by_book("m31", &mini)]);
+
+    rebook(&lab, &[], &[entry(&studio, "m31-studio.local")]);
+    let refused = word().expect_err("two Macs answer to m31");
+    assert!(
+        refused.contains(mini.node()) && refused.contains(studio.node()),
+        "{refused}"
+    );
+    assert!(SAID_TARGETS.take().is_empty(), "no Mac was named");
+}
+
+/// Write `node` into the registry row `mac`, as registration's own automatic write does.
+fn renode(registry: &aterm_db::alab::Registry, mac: &str, node: &str) {
+    use aterm_db::{
+        alab::registry::MACHINE,
+        typed::cell::{self, CellKey, CellValue},
+    };
+    registry
+        .write(vec![vec![
+            cell::change(
+                &MACHINE,
+                CellKey {
+                    pk: mac,
+                    col: "node",
+                    elem: None,
+                },
+                &CellValue::automatic(MACHINE.version, aterm_json::Value::from(node)),
+            )
+            .unwrap(),
+        ]])
+        .unwrap();
+}
+
+/// Where this Mac's registry answers for a label, `host_word`, a drive and a survey take its
+/// answer, never the book's: `m31`, which no live registry row carries while the book gives it a
+/// Mac, and then `m31` on a row whose node no standing seat holds, are each refused in the
+/// registry's words, with no removal's advice, and no Mac is named by the book.
+///
+/// NEGATIVE CONTROL: make `LabelRefused::gave_no_answer` true for every refusal: each read of `m31`
+/// goes to the book's Mac.
+#[test]
+fn a_label_the_registry_answers_for_is_never_read_by_the_book() {
+    let lab = Lab::new("label-registry-answers");
+    take_fleet(&lab);
+    let (registry, mac) = label_this_mac(&lab, "m42");
+    let mini = NodeIdentity::from_seed(&"c3".repeat(16), &[0x31; 32]).unwrap();
+    rebook(
+        &lab,
+        &[],
+        &[Peer::own(
+            &mini,
+            ("m31-mini.local", 7100, "0.146.0"),
+            NOW_MS,
+        )],
+    );
+    let refusals = || {
+        SAID_TARGETS.take();
+        let word = host_word(&lab.places, "m31", None, after_now(HANG))
+            .map(|said| said.word)
+            .expect_err("the registry answers for m31");
+        let drive = drive_fleet_in(&lab.places, "m31", HANG)
+            .err()
+            .expect("the registry answers for m31")
+            .why;
+        let survey = survey_refused(&lab, "m31", HANG);
+        assert!(SAID_TARGETS.take().is_empty(), "no Mac was named");
+        [word, drive, survey]
+    };
+
+    assert!(
+        matches!(
+            registry_target(&lab.places, "m31"),
+            Err(LabelRefused::Absent(_))
+        ),
+        "PRECONDITION: no live registry row carries m31"
+    );
+    for why in refusals() {
+        assert!(
+            why.contains("no live registry row carries the label") && !why.contains(REMOVAL_ADVICE),
+            "{why}"
+        );
+    }
+
+    relabel(&registry, &mac, "m31");
+    renode(&registry, &mac, "fedcba9876543210");
+    assert!(
+        matches!(
+            registry_target(&lab.places, "m31"),
+            Err(LabelRefused::Disputed(_))
+        ),
+        "PRECONDITION: m31's row names a node no standing seat holds"
+    );
+    for why in refusals() {
+        assert!(
+            why.contains("registry and seat disagree") && !why.contains(REMOVAL_ADVICE),
+            "{why}"
+        );
+    }
+}
+
+/// Each refusal the registry gives a label, as a drive or a read binds it (`bind_host_word`): no
+/// answer at all (unread, its history incomplete, the seats unread) reads the book, and where the
+/// registry's row named a node, only that node's Mac; an answer (no live row, a conflicted
+/// binding, a dispute) refuses in the registry's words, and no Mac is named by the book.
+///
+/// NEGATIVE CONTROLS: with `gave_no_answer` true for `Unread` alone, the incomplete and unseated
+/// reads refuse; with it true for every refusal, the answers name the book's m9; with the
+/// registry's node unchecked in `book_label_node`, the book's m9 stands in for the registry's
+/// other Mac.
+#[test]
+fn only_a_registry_that_gave_no_answer_lets_the_book_name_a_label() {
+    let lab = Lab::new("label-refusals-by-kind");
+    let m9 = member::node_principal(lab.m9.key());
+    let bind = |refused| {
+        SAID_TARGETS.take();
+        let bound = bind_host_word(&lab.places, "m9", None, after_now(HANG), Err(refused))
+            .map(|said| said.word);
+        (bound, SAID_TARGETS.take())
+    };
+    let unseated = |node: &str| LabelRefused::NoMembership {
+        said: "m9: no acknowledged membership".into(),
+        node: Some(node.to_owned()),
+    };
+    for refused in [
+        LabelRefused::Unread("m9: registry unread: no Commons".into()),
+        LabelRefused::Incomplete("m9: registry history incomplete".into()),
+        unseated(&m9[2..]),
+    ] {
+        let kind = format!("{refused:?}");
+        assert_eq!(
+            bind(refused),
+            (
+                Ok(lab.m9.node().to_owned()),
+                vec![said_by_book("m9", &lab.m9)]
+            ),
+            "{kind}"
+        );
+    }
+
+    let (bound, said) = bind(unseated("fedcba9876543210"));
+    let why = bound.expect_err("the book's m9 is not the Mac the registry's row names");
+    assert!(
+        why.contains("n-fedcba9876543210") && why.contains(&m9),
+        "{why}"
+    );
+    assert!(said.is_empty(), "no Mac was named: {said:?}");
+
+    for refused in [
+        LabelRefused::Absent("m9: no live registry row carries the label".into()),
+        LabelRefused::Conflicted("m9: label binding is missing or conflicted".into()),
+        LabelRefused::Disputed("m9: registry and seat disagree".into()),
+    ] {
+        let words = refused.cause().to_owned();
+        let (bound, said) = bind(refused);
+        assert_eq!(bound, Err(words));
+        assert!(said.is_empty(), "no Mac was named: {said:?}");
+    }
+}
+
+/// A label the registry gives no answer for, which this member's held copy of its issuer's book
+/// does not name yet, is read again from the book the issuer serves, as every word that names no
+/// Mac is (`copy_again`), and reaches the member that joined since, by the book.
+///
+/// NEGATIVE CONTROL: make `book_label_node` refuse a label no book here names, as before: the
+/// survey refuses with `m83: registry unread`.
+#[test]
+fn a_label_the_held_copy_lacks_is_read_again_from_the_issuers_book() {
+    let pair = super::deny_wait::fleet_pair("label-copy-again");
+    super::deny_wait::vault_beside(&pair.member);
+    let places = &pair.member.places;
+    assert!(
+        matches!(registry_target(places, "m83"), Err(LabelRefused::Unread(_))),
+        "PRECONDITION: no registry here answers for m83"
+    );
+    assert!(
+        places.state.join(ISSUER_BOOK_FILE).exists(),
+        "PRECONDITION: the member holds a copy, so no drive or read reads its issuer first"
+    );
+    // m83 joins after the copy, under the name it signs, at a loopback port nothing listens on.
+    let m83 = NodeIdentity::from_seed(&"c8".repeat(16), &[0x83; 32]).unwrap();
+    let at = ("127.0.0.1", closed_port(), "0.146.0");
+    let joined = Peer {
+        signed: Some(member::Signed::named_by(&m83, at, NOW_MS, Some("m83")).unwrap()),
+        ..Peer::own(&m83, at, NOW_MS)
+    };
+    member::update_peers(&pair.issuer.places.state, |book| {
+        book.push(joined);
+        Ok(())
+    })
+    .unwrap();
+    SAID_TARGETS.take();
+    let read = with_issuer_serving(|| {
+        survey_fleet_in(
+            places,
+            &aterm_ctl::FleetAsk {
+                host: Some("m83"),
+                within: HANG,
+                holder: None,
+                by: None,
+            },
+        )
+    })
+    .unwrap_or_else(|why| panic!("m83 by the issuer's book: {why}"));
+    assert!(
+        matches!(&read.peers[..], [row] if row.node.as_deref() == Some(m83.node())),
+        "the one row reads m83's node: {read:?}"
+    );
+    assert_eq!(SAID_TARGETS.take(), [said_by_book("m83", &m83)]);
+}
+
+/// A person's removal by the label of a registry row whose Mac holds two standing seats (a second
+/// home on that Mac: each home's own signed facts bind the row's Mac) is refused, naming both
+/// seats, signs nothing and leaves both standing, while a drive's or a read's resolution of the
+/// same label takes the seat that holds the row's node. Three founders of one vault and one
+/// Commons: m1 removes; m2 and m3 are the two homes of the Mac the registry labels `m7`, whose
+/// node cell names m2's node.
+///
+/// NEGATIVE CONTROL: make `registry_target` resolve for `LabelFor::Reach`: the removal takes out
+/// m2's seat, the one that holds the row's node, and leaves m3's standing, wrapped into every
+/// later epoch.
+#[test]
+fn a_removal_by_label_of_a_mac_with_two_standing_seats_signs_nothing() {
+    use aterm_db::{
+        alab::registry::{MACHINE, MACHINE_FACTS},
+        table::fixture::{Lab as Commons, repair_commons},
+        typed::cell::{self, CellKey, CellValue},
+    };
+    let commons = Commons::with_foundation(&[
+        aterm_secrets::commons::roster::Role::Writer,
+        aterm_secrets::commons::roster::Role::Writer,
+        aterm_secrets::commons::roster::Role::Writer,
+    ]);
+    let paths = &commons.paths;
+    client::seed_vault_genesis(&paths[0], &paths[0].home.join("genesis")).unwrap();
+    client::admin_mirror_log(&paths[0], &[]).unwrap();
+    let records = |n: usize| -> Vec<_> {
+        client::load_records(&paths[n])
+            .unwrap()
+            .log()
+            .unwrap()
+            .records()
+            .cloned()
+            .collect()
+    };
+    for n in [1, 2] {
+        client::ingest_mesh_records(&paths[n], records(0)).unwrap();
+        client::sync_records(&paths[n], None).unwrap();
+    }
+    let nodes: Vec<NodeIdentity> = [(0xa1_u8, 0x11_u8), (0xb2, 0x22), (0xc3, 0x33)]
+        .iter()
+        .map(|(id, seed)| {
+            NodeIdentity::from_seed(&format!("{id:02x}").repeat(16), &[*seed; 32]).unwrap()
+        })
+        .collect();
+    // Each founder binds its node key, and every home then reads every home's records.
+    for (n, node) in nodes.iter().enumerate() {
+        client::publish_local_node_key(&paths[n], *node.key().bytes(), |network, actor| {
+            let mut body = network.to_vec();
+            body.extend_from_slice(actor);
+            node.sign_record("membership node", &body)
+        })
+        .unwrap();
+    }
+    for n in 0..paths.len() {
+        for other in (0..paths.len()).filter(|other| *other != n) {
+            client::ingest_mesh_records(&paths[n], records(other)).unwrap();
+        }
+        client::sync_records(&paths[n], None).unwrap();
+    }
+    let principal = |n: usize| member::node_principal(nodes[n].key());
+
+    // The owner labels the Mac `m7` and names m2's node; m2's and m3's own facts each bind it.
+    let mac = "mc-0000000000000007";
+    let registry = aterm_db::alab::Registry::at(paths[0].clone());
+    registry.open().unwrap();
+    let owner = |col: &str, x: &str| {
+        cell::change(
+            &MACHINE,
+            CellKey {
+                pk: mac,
+                col,
+                elem: None,
+            },
+            &CellValue::owner(MACHINE.version, aterm_json::Value::from(x)),
+        )
+        .unwrap()
+    };
+    registry
+        .write(vec![vec![
+            owner("label", "m7"),
+            owner("node", &principal(1)[2..]),
+        ]])
+        .unwrap();
+    repair_commons(&commons, 6);
+    for n in [1, 2] {
+        aterm_db::alab::Registry::at(paths[n].clone())
+            .write(vec![vec![aterm_db::database::Change {
+                collection: MACHINE_FACTS.name.into(),
+                key: aterm_codec::hex::encode_lower(&commons.machine(n)),
+                value: Some(aterm_json::json!({ "mac": mac, "n": 1 })),
+            }]])
+            .unwrap();
+    }
+    repair_commons(&commons, 6);
+
+    let places = Places {
+        state: paths[0].home.join("state"),
+        config: paths[0].home.join("cfg/aterm/aterm.toml"),
+    };
+    member::ensure_private_dir(&places.state).unwrap();
+    SAID_TARGETS.take();
+    assert_eq!(
+        registry_label_node(&places, "m7", None)
+            .unwrap_or_else(|why| panic!("CONTROL: a drive or a read reads m7: {why}"))
+            .as_deref(),
+        Some(principal(1).as_str()),
+        "CONTROL: a drive or a read takes the seat that holds the row's node"
+    );
+    SAID_TARGETS.take();
+
+    let seated = |n: usize| {
+        let store = client::load_records(&paths[0]).unwrap();
+        let membership = store.log().unwrap().membership();
+        membership.members().iter().any(|(actor, seat)| {
+            seat.node_key == Some(*nodes[n].key().bytes()) && membership.removal(actor).is_none()
+        })
+    };
+    assert!(seated(1) && seated(2), "PRECONDITION: m2 and m3 stand");
+    let before = client::load_records(&paths[0]).unwrap().inventory();
+    let words = ["remove".to_owned(), "m7".to_owned()];
+    let Ok(crate::members_cli::LabVerb::Remove(args)) =
+        crate::members_cli::parse_lab(crate::members_cli::Front::Members, &words)
+    else {
+        panic!("remove m7 is a removal");
+    };
+    let refused = crate::members_cli::remove_said(&paths[0], &args, &|word| {
+        removal_seat_at(&places, &paths[0], word)
+    })
+    .expect_err("a removal names neither of two seats of one Mac");
+    for evidence in [
+        principal(1),
+        principal(2),
+        format!("2 standing seats are the registry's Mac {mac}"),
+        "remove each by its node id".to_owned(),
+    ] {
+        assert!(
+            refused.contains(&evidence),
+            "missing evidence {evidence}: {refused}"
+        );
+    }
+    assert!(SAID_TARGETS.take().is_empty(), "no Mac was named");
+    assert_eq!(
+        client::load_records(&paths[0]).unwrap().inventory(),
+        before,
+        "a refused removal signs nothing"
+    );
+    assert!(seated(1) && seated(2), "m2 and m3 both stay in");
 }
 
 struct Lab {
@@ -716,6 +1230,15 @@ impl Lab {
             Some(vec![self.m9.node().to_owned()]),
             "{when}"
         );
+        // A unit source asks only these (DC-24b): not the denied m8, nor m7 the log holds out.
+        assert_eq!(
+            admitted_members_in(&self.places)
+                .into_iter()
+                .map(|(peer, key)| (peer.node, key))
+                .collect::<Vec<_>>(),
+            [(Some(self.m9.node().to_owned()), self.m9.key())],
+            "{when}"
+        );
         let (_, log) = denied_and_log(&self.places).expect("both reads succeed");
         assert!(log.is_some(), "{when}: the log reads");
         let census = self.census().unwrap();
@@ -753,6 +1276,10 @@ impl Lab {
             );
         }
         assert_eq!(driving(&self.places), None, "{when}");
+        assert!(
+            admitted_members_in(&self.places).is_empty(),
+            "{when}: a unit source asks no member while the vault does not read"
+        );
         assert!(
             denied_and_log(&self.places).is_err(),
             "{when}: read whole or not at all"

@@ -10,7 +10,7 @@ use aterm_vitals::history::{WEEK_BUCKET_S, WEEK_BUCKETS};
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
 use aterm_vitals::model::{
     CpuView, DeedBy, DeedKind, DiskDeed, DiskFacts, HeatCell, LinkKind, Pressure, ProcScope,
-    Resource, ResourceView, Snapshot, StripEventKind, VolumeSample,
+    Resource, ResourceView, Snapshot, State, StripEventKind, VolumeSample,
 };
 use aterm_vitals::ring::{Agg, Cell, GapKind};
 use aterm_vitals::sys::{exe_word, held};
@@ -68,6 +68,14 @@ impl DiskSpan {
         match self {
             Self::Day => Self::Weeks,
             Self::Weeks => Self::Day,
+        }
+    }
+
+    /// Its label among the chart's span labels, and the page's span button's value.
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Day => "24 h",
+            Self::Weeks => "3 weeks",
         }
     }
 }
@@ -231,8 +239,7 @@ pub(crate) fn lens_geom(
     let x = (grid_x + (grid_w - shell_w) / 2.0).round();
     let gap = (4.0 * s).round();
     let y = match form {
-        StatsBars::Deck => card_dy as f32 + card_h + gap,
-        StatsBars::Sill => card_dy as f32 - gap - shell_h,
+        StatsBars::Deck | StatsBars::Sill => card_dy as f32 + card_h + gap,
         StatsBars::Off => grid_y + gap,
     }
     .max(0.0);
@@ -254,10 +261,14 @@ pub(crate) fn how_to_read_words(platform: Platform) -> String {
          older intervals to the right; the time scale over the strips says how far back they \
          reach: up to 6 hours where a strip has the room, 4 hours, 6 minutes or a minute on a \
          narrower one. Cells are blocks of 1 second, 10 seconds, 1 minute, 10 minutes and 1 \
-         hour, from live now outward, each size starting where the scale marks it. Colour runs \
-         from cold, 0 percent of the resource's maximum, to hot, 100 percent; the now cell is \
-         coloured as the strip's cells are. A mark above a cell means the resource ran over its \
-         maximum. An outlined cell or shaded gap was not read (sleep, crash or pause), and \
+         hour, from live now outward, each size starting where the scale marks it. On CPU, GPU, \
+         Network and Processes, which measure work, colour runs from cold, 0 percent of the \
+         resource's maximum, to hot, 100 percent; the now cell is coloured as the strip's cells \
+         are. Memory and Disk hold an amount: a cell's height is how full it was, and it is \
+         grey at rest. A Memory cell is amber or red where the kernel read memory pressure warn \
+         or critical in it; Disk's now cell takes the disk's state, and its older cells stay \
+         grey. A mark above a cell means the resource ran over its maximum. An outlined cell or shaded \
+         gap was not read (sleep, crash or pause), and \
          vertical lines mark crash, wake or pressure events. The bar right of the strip, or on \
          a narrow deck the line under each percent figure, shows {machine} in grey, aterm in \
          green and this tab in bright green, named once over the bars. Where it fits, the \
@@ -374,6 +385,8 @@ type Draw<'d> = Box<dyn Fn(&mut Pen<'_>, Place) + 'd>;
 /// One form a section can take.
 pub(crate) struct Form<'d> {
     h: f64,
+    /// Height of the complete first form on a scrolling page.
+    page: f64,
     grow: bool,
     /// Whether it fits only as its column's last section (Cores' grow form over Why now).
     last: bool,
@@ -385,6 +398,7 @@ pub(crate) struct Form<'d> {
 fn form<'d>(h: f64, draw: impl Fn(&mut Pen<'_>, Place) + 'd) -> Form<'d> {
     Form {
         h,
+        page: h,
         grow: false,
         last: false,
         label: None,
@@ -392,9 +406,10 @@ fn form<'d>(h: f64, draw: impl Fn(&mut Pen<'_>, Place) + 'd) -> Form<'d> {
     }
 }
 
-fn grow<'d>(h: f64, draw: impl Fn(&mut Pen<'_>, Place) + 'd) -> Form<'d> {
+fn grow<'d>(h: f64, page: f64, draw: impl Fn(&mut Pen<'_>, Place) + 'd) -> Form<'d> {
     Form {
         h,
+        page,
         grow: true,
         last: false,
         label: None,
@@ -407,6 +422,7 @@ fn line_form<'d>(label: &str, forms: Vec<String>) -> Form<'d> {
     let owned = label.to_owned();
     Form {
         h: LINE_H,
+        page: LINE_H,
         grow: false,
         last: false,
         label: Some(label.to_owned()),
@@ -547,6 +563,7 @@ fn stack(
 pub(crate) struct TextBox {
     pub(crate) text: String,
     pub(crate) r: [f64; 4],
+    pub(crate) ink: Rgb,
 }
 
 pub(crate) struct Pen<'a> {
@@ -563,6 +580,9 @@ pub(crate) struct Pen<'a> {
     draw: bool,
     /// Where the one-liners stacked in this section's column start their words.
     line_tab: f64,
+    /// What a button over the span labels [`span_chips`] last laid takes, pt from the corner it
+    /// lays in: a page lays its span button there ([`PageLaid::span_chips`]).
+    chips: Option<Place>,
     #[cfg(test)]
     boxes: Vec<TextBox>,
 }
@@ -592,6 +612,7 @@ impl<'a> Pen<'a> {
         self.boxes.push(TextBox {
             text: s.to_owned(),
             r: [x, base - ASCENT_EM * pt, x + w, base + DESCENT_EM * pt],
+            ink,
         });
         if self.draw {
             let px = (pt * self.s) as f32;
@@ -1197,9 +1218,19 @@ struct Trace {
     events: Vec<TraceEvent>,
     /// Removals the software made, at fractional bucket indices: a short tick under the axis each.
     removals: Vec<f64>,
-    /// The span chosen, where the heading names the spans it can switch between (the Disk lens's
+    /// The span labels, where the heading names the spans it can switch between (the Disk lens's
     /// used-space chart); `None` where it names none.
-    chips: Option<DiskSpan>,
+    chips: Option<SpanChips>,
+}
+
+/// A trace heading's span labels ([`span_chips`]).
+#[derive(Clone, Copy)]
+struct SpanChips {
+    /// The span chosen.
+    chosen: DiskSpan,
+    /// Whether the labels are the surface's one way to switch the span: the System Resources page
+    /// takes no key, and lays its span button over them ([`PageLaid::span_chips`]).
+    sole: bool,
 }
 
 /// Maps `snap`'s discontinuity gaps and strip event markers onto fractional bucket coordinates of a
@@ -1385,7 +1416,7 @@ fn trace_boxes(
                 max: t.peaks.get(j).copied().flatten().map(share),
                 over: h.over,
             };
-            let heat = BoxHeat {
+            let heat = BoxHeat::Shares {
                 mean: h.heat,
                 max: h.max,
             };
@@ -1654,13 +1685,20 @@ fn draw_removal_ticks(pen: &mut Pen<'_>, t: &Trace, (x0, x1): (f64, f64), (ya, y
 }
 
 /// The span labels at a trace heading's right end, `24 h · 3 weeks`, the chosen one in the words
-/// ink and underlined, the other in the secondary ink (the key hint on line 1 names Tab, which
-/// switches them). Drawn only where they fit beside `name` and the first of `subs` that fits
-/// without them, so they never cost the heading its growth words, which keep the form they have
-/// without the labels. The width they take with their gap, else 0.
-fn span_chips(pen: &mut Pen<'_>, p: Place, name: &str, subs: &[String], chosen: DiskSpan) -> f64 {
+/// ink and underlined, the other in the secondary ink. Where they are the one way to switch the
+/// span (the page's button lies over them, or the three weeks are chosen and they are the way back
+/// to the day) they are drawn wherever they fit the line at all, and the heading sheds its growth
+/// words, then cuts its name, for them; so the page's button lies wherever the line holds the
+/// labels, whatever growth words a reading brings. Otherwise (the card on the day, whose key hint
+/// on line 1 names Tab, which switches them) they are drawn only where they fit beside `name` and
+/// the first of `subs` that fits without them, so they never cost the heading its growth words,
+/// which keep the form they have without the labels. The width they take with their gap, else 0.
+fn span_chips(pen: &mut Pen<'_>, p: Place, name: &str, subs: &[String], chips: SpanChips) -> f64 {
     const PAD: f64 = 4.0;
-    let spans = [(DiskSpan::Day, "24 h"), (DiskSpan::Weeks, "3 weeks")];
+    // How far under its baseline the chosen label's rule (one device px) lies.
+    const RULE_BELOW: f64 = 2.0;
+    let chosen = chips.chosen;
+    let spans = [DiskSpan::Day, DiskSpan::Weeks].map(|span| (span, span.word()));
     let dot_w = pen.width("\u{b7}", NOTE_PT, false);
     let w = spans
         .iter()
@@ -1668,16 +1706,31 @@ fn span_chips(pen: &mut Pen<'_>, p: Place, name: &str, subs: &[String], chosen: 
         .sum::<f64>()
         + dot_w
         + 2.0 * PAD;
-    // What [`heading`] lays at the full width: its name, and the growth words that fit beside it.
-    let name_w = pen.width(&pen.cut(name, p.w, HEAD_PT, true), HEAD_PT, true);
-    let sub_w = first_fit(pen.m, subs, p.w - name_w - 8.0, NOTE_PT, false)
-        .map_or(0.0, |sub| 8.0 + pen.width(&sub, NOTE_PT, false));
-    if name_w + sub_w + 8.0 + w > p.w + EPS {
+    let fits = if chips.sole || chosen == DiskSpan::Weeks {
+        w <= p.w + EPS
+    } else {
+        // What [`heading`] lays at the full width: its name, and the growth words that fit beside
+        // it.
+        let name_w = pen.width(&pen.cut(name, p.w, HEAD_PT, true), HEAD_PT, true);
+        let sub_w = first_fit(pen.m, subs, p.w - name_w - 8.0, NOTE_PT, false)
+            .map_or(0.0, |sub| 8.0 + pen.width(&sub, NOTE_PT, false));
+        name_w + sub_w + 8.0 + w <= p.w + EPS
+    };
+    if !fits {
         return 0.0;
     }
     let base = p.y + HEAD_BASE;
     let inks = pen.inks;
     let mut x = p.x + p.w - w;
+    // What a button over them takes: the heading's line from the section's top to 3 pt under the
+    // chosen label's rule, and a pad either side of the labels' ink (the right one in the column's
+    // side margin), so a ring or wash drawn just inside it clears the words and the rule.
+    pen.chips = Some(Place {
+        x: x - PAD,
+        y: p.y,
+        w: w + 2.0 * PAD,
+        h: HEAD_BASE + RULE_BELOW + 4.0,
+    });
     for (k, (span, words)) in spans.into_iter().enumerate() {
         if k > 0 {
             x += pen.text(x + PAD, base, "\u{b7}", NOTE_PT, false, inks.words2) + 2.0 * PAD;
@@ -1689,7 +1742,7 @@ fn span_chips(pen: &mut Pen<'_>, p: Place, name: &str, subs: &[String], chosen: 
         };
         let sw = pen.text(x, base, words, NOTE_PT, false, ink);
         if span == chosen {
-            pen.rule(x, base + 2.0, sw, rgba(ink, 0xFF));
+            pen.rule(x, base + RULE_BELOW, sw, rgba(ink, 0xFF));
         }
         x += sw;
     }
@@ -1724,7 +1777,7 @@ fn trace_section<'d>(
             let draw = move |pen: &mut Pen<'_>, p: Place| {
                 let chips = trace
                     .chips
-                    .map_or(0.0, |span| span_chips(pen, p, &name, &subs, span));
+                    .map_or(0.0, |chips| span_chips(pen, p, &name, &subs, chips));
                 heading(
                     pen,
                     Place {
@@ -1737,7 +1790,7 @@ fn trace_section<'d>(
                 draw_trace(pen, p, &trace);
             };
             forms.push(if c.two {
-                grow(trace_h(ch), draw)
+                grow(trace_h(ch), trace_h(56.0), draw)
             } else {
                 form(trace_h(ch), draw)
             });
@@ -1944,8 +1997,12 @@ struct Ctx<'d> {
     two: bool,
     cw: f64,
     fresh: bool,
+    /// Whether this surface takes the CPU document's key commands.
+    keys: bool,
     /// The span the Disk lens's used-space chart draws.
     disk_span: DiskSpan,
+    /// Whether the App's CPU policy collection is pending ([`DeckInput::cpu_policy_pending`]).
+    cpu_policy_pending: bool,
 }
 
 impl Ctx<'_> {
@@ -2629,7 +2686,10 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
         gaps,
         events,
         removals: Vec::new(),
-        chips: spans_offered(snap, DiskSpan::Day).then_some(DiskSpan::Day),
+        chips: spans_offered(snap, DiskSpan::Day).then_some(SpanChips {
+            chosen: DiskSpan::Day,
+            sole: !c.keys,
+        }),
     };
     let mut said = trace_said(
         "GB used over the last 24 hours",
@@ -2761,7 +2821,10 @@ fn weeks_trace_of(c: Ctx<'_>, merge: usize) -> (Trace, i64) {
         gaps: Vec::new(),
         events: Vec::new(),
         removals,
-        chips: Some(DiskSpan::Weeks),
+        chips: Some(SpanChips {
+            chosen: DiskSpan::Weeks,
+            sole: !c.keys,
+        }),
     };
     (trace, start)
 }
@@ -4049,20 +4112,28 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
         // actions first so smaller lenses do not hide them below the channel
         // list, each wrapped to the column so no width cuts what one says.
         #[cfg(target_os = "macos")]
-        let policy = Some(if crate::cpu_policy_authorization::pending() {
+        let policy = Some(if c.cpu_policy_pending {
             "Authorized collection pending; ⌘⇧X cancels. No new collection until its exact collector exits.".to_owned()
         } else {
             CPU_POLICY_KEY.to_owned()
         });
         #[cfg(not(target_os = "macos"))]
-        let policy: Option<String> = None;
-        let keys: Vec<String> = cpu_report_key(c.loc.platform)
-            .then(|| {
-                "\u{2318}\u{21e7}C copies the diagnostic report. Cause not established.".to_owned()
-            })
-            .into_iter()
-            .chain(policy)
-            .collect();
+        let policy: Option<String> = {
+            let _ = c.cpu_policy_pending;
+            None
+        };
+        let keys: Vec<String> = if c.keys {
+            cpu_report_key(c.loc.platform)
+                .then(|| {
+                    "\u{2318}\u{21e7}C copies the diagnostic report. Cause not established."
+                        .to_owned()
+                })
+                .into_iter()
+                .chain(policy)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let items: Vec<Vec<String>> = keys
             .iter()
             .map(|k| wrap(c.m, k, c.cw, BODY_PT))
@@ -4144,7 +4215,7 @@ fn cores_section(c: Ctx<'_>, under: bool) -> Section<'_> {
         forms.push(if grows {
             Form {
                 last: under,
-                ..grow(strip_h(rh), draw)
+                ..grow(strip_h(rh), strip_h(4.0), draw)
             }
         } else {
             form(strip_h(rh), draw)
@@ -5115,7 +5186,7 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
     let n = lines.len();
     let mut forms = Vec::new();
     if c.two {
-        forms.push(grow(rows_h(1, false), draw_jobs));
+        forms.push(grow(rows_h(1, false), rows_h(n, false), draw_jobs));
     } else {
         let draw = std::rc::Rc::new(draw_jobs);
         let mut counts = vec![n.min(4), n.min(2)];
@@ -5125,6 +5196,9 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
             let rows = if k < n { k + 1 } else { k };
             forms.push(form(rows_h(rows, false), move |pen, p| draw(pen, p)));
         }
+    }
+    if let Some(first) = forms.first_mut() {
+        first.page = rows_h(n, false);
     }
     let line = vec![summary];
     forms.push(line_form("Jobs", line));
@@ -5144,24 +5218,34 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
     let mut sections = Vec::new();
     let heat_words = ["cold, under 5% of the maximum", "under 5%"];
     let hot_words = ["hot, 95% and over", "95%+"];
+    let held_words: [String; 3] = [
+        "Memory, Disk: grey at rest, amber or red in a warn or critical state".into(),
+        "Memory, Disk: grey at rest, amber or red in a state".into(),
+        "Memory, Disk: by state".into(),
+    ];
     sections.push(Section {
         name: "Heat".into(),
         words: vec![
-            "A cell's colour is its share of the row's maximum: cold under 5 percent, hot at \
-             95 percent and over."
+            "On CPU, GPU, Network and Processes a cell's colour is its share of the row's \
+             maximum: cold under 5 percent, hot at 95 percent and over. Memory and Disk cells \
+             are grey at rest; a Memory cell is amber or red where memory pressure was warn or \
+             critical in it, and Disk's now cell is in a warn or critical disk state."
                 .into(),
         ],
         right: false,
         parts: Vec::new(),
         forms: vec![
-            form(38.0, move |pen, p| {
+            form(38.0 + PITCH, move |pen, p| {
                 heading(
                     pen,
                     p,
                     "Heat",
                     &[
-                        "a cell's colour: its share of the row's maximum".into(),
-                        "share of max".into(),
+                        "CPU, GPU, Network, Processes: a cell's colour is its share of the row's \
+                         maximum"
+                            .into(),
+                        "CPU, GPU, Network, Processes: share of max".into(),
+                        "work rows: share of max".into(),
                     ],
                 );
                 let sw = ((p.w.min(280.0) + 2.0) / 7.0 - 2.0).max(4.0);
@@ -5194,12 +5278,26 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                         break;
                     }
                 }
+                // Memory and Disk: a held amount's inks (stats_skyline::held_ink), at rest, warn
+                // and critical.
+                let base = base + PITCH;
+                let mut x = p.x;
+                for state in [None, Some(State::Warn), Some(State::Critical)] {
+                    let ink = skyline::held_ink(&pen.inks, state, pen.ic);
+                    pen.rect(x, base - 7.0, 10.0, 7.0, 1.0, rgba(ink, 0xFF));
+                    x += 12.0;
+                }
+                let held = fit_cut(pen.m, &held_words, (p.x + p.w - x - 2.0).max(0.0), BODY_PT, false);
+                pen.text(x + 2.0, base, &held, BODY_PT, false, words2);
             }),
             line_form(
                 "Heat",
                 vec![
-                    "cold under 5% to hot at 95% of max".into(),
-                    "share of max".into(),
+                    "CPU, GPU, Network, Processes: cold under 5% to hot at 95% of max \u{b7} Memory, \
+                     Disk: grey, amber or red by state"
+                        .into(),
+                    "work: share of max \u{b7} Memory, Disk: by state".into(),
+                    "share of max \u{b7} Memory, Disk: state".into(),
                 ],
             ),
         ],
@@ -6090,13 +6188,12 @@ fn hint_w(m: &FaceMetrics, hint: &[Seg]) -> f64 {
         .sum()
 }
 
-/// Draw the header while it clears the foot and leaves `reserve` pt of body; `spans`: the lens is
-/// a Disk lens whose chart offers its two spans ([`hints`]).
+/// Draw the header while it clears the foot and leaves `reserve` pt of body, choosing one of
+/// `hints` to fit beside the source. One empty hint draws the source without key help.
 fn head(
     pen: &mut Pen<'_>,
     doc: &LensDoc<'_>,
-    how: Opened,
-    spans: bool,
+    hints: &[&[Seg]],
     lw: f64,
     lh: f64,
     reserve: f64,
@@ -6111,7 +6208,6 @@ fn head(
     let name = pen.cut(doc.name, right - SIDE, NAME_PT, true);
     let nw = pen.text(SIDE, LINE1_BASE, &name, NAME_PT, true, inks.words);
     let tx = SIDE + nw + 8.0;
-    let hints = hints(how, spans);
     let mut chosen: Option<(usize, Option<usize>)> = None;
     'hints: for (hi, hint) in hints.iter().enumerate() {
         let hw = hint_w(m, hint);
@@ -6226,6 +6322,838 @@ pub(crate) struct LensLaid {
     pub(crate) boxes: Vec<TextBox>,
 }
 
+/// One row of a table section: its cells, which of them takes the warning ink, and the lines
+/// under it (already wrapped), in the warning ink where the row takes it.
+struct TableRow {
+    cells: Vec<String>,
+    warn: Option<usize>,
+    note: Vec<String>,
+}
+
+/// The gap between a table's columns, pt.
+const COLUMN_GAP: f64 = 12.0;
+
+/// A heading over a table. `head` names the columns after the first (none where it is empty).
+/// The columns after the first are each as wide as their widest cell, the last ending at the
+/// section's right edge, their cells right-aligned where `figures`; the first takes the room left
+/// and is cut to it. A row's note lines sit under it. The page lays a table whole: it has one
+/// form.
+fn table_section<'d>(
+    name: &'static str,
+    subs: Vec<String>,
+    head: Vec<String>,
+    rows: Vec<TableRow>,
+    figures: bool,
+    words: Vec<String>,
+    right: bool,
+) -> Section<'d> {
+    let lines = usize::from(!head.is_empty())
+        + rows
+            .iter()
+            .map(|row| usize::from(!row.cells.is_empty()) + row.note.len())
+            .sum::<usize>();
+    let draw = move |pen: &mut Pen<'_>, p: Place| {
+        heading(pen, p, name, &subs);
+        let columns = rows.iter().map(|row| row.cells.len()).max().unwrap_or(0);
+        let mut widths = vec![0.0_f64; columns];
+        for (j, width) in widths.iter_mut().enumerate().skip(1) {
+            let header = head
+                .get(j - 1)
+                .map_or(0.0, |h| pen.width(h, NOTE_PT, false));
+            *width = rows
+                .iter()
+                .filter_map(|row| row.cells.get(j))
+                .map(|cell| pen.width(cell, BODY_PT, false))
+                .fold(header, f64::max);
+        }
+        let mut starts = vec![p.x; columns];
+        let mut end = p.x + p.w;
+        for j in (1..columns).rev() {
+            starts[j] = end - widths[j];
+            end = starts[j] - COLUMN_GAP;
+        }
+        let first_room = (end - p.x).max(0.0);
+        let mut base = p.y + ROW0_BASE;
+        if !head.is_empty() {
+            let ink = pen.inks.words2;
+            for (j, h) in head.iter().enumerate() {
+                let j = j + 1;
+                if j < columns {
+                    let x = if figures {
+                        starts[j] + widths[j] - pen.width(h, NOTE_PT, false)
+                    } else {
+                        starts[j]
+                    };
+                    pen.text(x, base, h, NOTE_PT, false, ink);
+                }
+            }
+            base += PITCH;
+        }
+        for row in &rows {
+            let warn = pen.inks.warn_text;
+            for (j, cell) in row.cells.iter().enumerate() {
+                let ink = if row.warn == Some(j) {
+                    warn
+                } else if j == 0 {
+                    pen.inks.words
+                } else {
+                    pen.inks.words2
+                };
+                if j == 0 {
+                    let room = if columns > 1 { first_room } else { p.w };
+                    let cut = pen.cut(cell, room, BODY_PT, false);
+                    pen.text(p.x, base, &cut, BODY_PT, false, ink);
+                } else if figures {
+                    pen.text_end(starts[j] + widths[j], base, cell, BODY_PT, false, ink);
+                } else {
+                    pen.text(starts[j], base, cell, BODY_PT, false, ink);
+                }
+            }
+            if !row.cells.is_empty() {
+                base += PITCH;
+            }
+            let (x, ink) = if row.cells.is_empty() {
+                (p.x, pen.inks.words2)
+            } else if row.warn.is_some() {
+                (p.x + SIDE, warn)
+            } else {
+                (p.x + SIDE, pen.inks.words2)
+            };
+            for line in &row.note {
+                let cut = pen.cut(line, p.x + p.w - x, BODY_PT, false);
+                pen.text(x, base, &cut, BODY_PT, false, ink);
+                base += PITCH;
+            }
+        }
+    };
+    Section {
+        name: name.to_owned(),
+        words,
+        right,
+        parts: Vec::new(),
+        forms: vec![form(rows_h(lines, false), draw)],
+    }
+}
+
+/// A Spotlight signing identifier as a person reads it: `mds_stores`, not `com.apple.mds_stores`.
+fn spotlight_name(signing_id: &str) -> &str {
+    signing_id.strip_prefix("com.apple.").unwrap_or(signing_id)
+}
+
+/// CPU time as `ps` prints it: `m:ss`, from an hour `h:mm:ss`.
+fn cpu_time(ns: u64) -> String {
+    let s = ns / 1_000_000_000;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Cores' worth, two places.
+fn cores_word(mc: f64) -> String {
+    format!("{:.2} cores", mc / 1000.0)
+}
+
+/// The family's footprint: exact where every share's was read, `≥` where some were not, and
+/// `not read` where none was (as `sys` says it).
+fn spotlight_footprint(r: &aterm_vitals::spotlight::Reading) -> String {
+    match r.footprint_bytes() {
+        Some(bytes) => words::mem(bytes),
+        None if r.footprint_unread() => "not read".to_owned(),
+        None => format!("\u{2265}{}", words::mem(r.footprint.bytes)),
+    }
+}
+
+/// One process row of the family: the shares of one signing identifier summed.
+struct SpotlightProcess {
+    name: String,
+    /// Its processes now: the shares' live members, at least one a share.
+    count: u32,
+    footprint: Option<u64>,
+    unread: bool,
+    cpu_mc: i64,
+    cpu_total_ns: u64,
+}
+
+/// The family's shares by signing identifier, largest footprint first.
+fn spotlight_processes(r: &aterm_vitals::spotlight::Reading) -> Vec<SpotlightProcess> {
+    let mut by: Vec<SpotlightProcess> = Vec::new();
+    for share in &r.shares {
+        let name = spotlight_name(share.signing_id);
+        let at = match by.iter().position(|p| p.name == name) {
+            Some(at) => at,
+            None => {
+                by.push(SpotlightProcess {
+                    name: name.to_owned(),
+                    count: 0,
+                    footprint: None,
+                    unread: false,
+                    cpu_mc: 0,
+                    cpu_total_ns: 0,
+                });
+                by.len() - 1
+            }
+        };
+        let p = &mut by[at];
+        p.count = p.count.saturating_add(share.live.max(1));
+        match share.footprint {
+            Some(bytes) => p.footprint = Some(p.footprint.unwrap_or(0).saturating_add(bytes)),
+            None => p.unread = true,
+        }
+        p.cpu_mc = p.cpu_mc.saturating_add(share.cpu_mc);
+        p.cpu_total_ns = p.cpu_total_ns.saturating_add(share.cpu_total_ns);
+    }
+    by.sort_by(|a, b| {
+        b.footprint
+            .cmp(&a.footprint)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    by
+}
+
+impl SpotlightProcess {
+    fn label(&self) -> String {
+        if self.count > 1 {
+            format!("{} \u{d7}{}", self.name, self.count)
+        } else {
+            self.name.clone()
+        }
+    }
+
+    fn memory(&self) -> String {
+        match (self.footprint, self.unread) {
+            (Some(bytes), false) => words::mem(bytes),
+            (Some(bytes), true) => format!("\u{2265}{}", words::mem(bytes)),
+            (None, _) => "not read".to_owned(),
+        }
+    }
+}
+
+/// The index's size on disk as the root broker last walked it (SD-94), or why it was not read:
+/// the Spotlight activity's own cannot line ([`aterm_vitals::spotlight::cannot`]), so the page
+/// and `sys why` say it from one table.
+fn index_words(r: Option<&aterm_vitals::spotlight::Reading>) -> String {
+    let Some(r) = r else {
+        return "Not read yet.".to_owned();
+    };
+    let age = r
+        .store_age_ms
+        .map(|ms| format!(", read {} ago", words::duration_approx(ms as f64 / 1000.0)))
+        .unwrap_or_default();
+    match r.index_bytes() {
+        Some((bytes, None)) => format!("{} on disk{age}.", gb(bytes as f64)),
+        Some((bytes, Some(cut))) => format!(
+            "At least {} on disk{age}: partial, the walk {}.",
+            gb(bytes as f64),
+            match cut {
+                aterm_vitals::spotlight::StoreCut::Entries => "stopped at its entry limit",
+                aterm_vitals::spotlight::StoreCut::Time => "stopped at its time limit",
+                aterm_vitals::spotlight::StoreCut::Unreadable => {
+                    "stopped at a folder it could not read"
+                }
+            }
+        ),
+        None if r.store_stale_ms.is_some() => format!(
+            "Not read now: aterm's root LAN broker last answered {} ago, and an answer older \
+             than {} is not shown.",
+            words::duration_approx(r.store_stale_ms.unwrap_or_default() as f64 / 1000.0),
+            words::duration_approx(aterm_vitals::spotlight::STORE_STALE_MS as f64 / 1000.0)
+        ),
+        None => {
+            let why = aterm_vitals::spotlight::cannot(r)
+                .into_iter()
+                .find(|(what, _)| *what == "index_folder")
+                .map_or("unread", |(_, why)| why);
+            match why {
+                "needs_privilege:root" => "Not read: only root can read the index's folder, \
+                                           and aterm's root LAN broker has not answered."
+                    .to_owned(),
+                other => format!("Not read ({other})."),
+            }
+        }
+    }
+}
+
+/// A day trace of the family's history: each 10-minute bucket's `figure` over `unit`, heat its
+/// share of `capacity`; an unread bucket is a gap, never 0.
+fn spotlight_day_trace(
+    c: Ctx<'_>,
+    figure: impl Fn(&aterm_vitals::history::SpotlightBucket) -> Option<f64>,
+    unit: f64,
+    capacity: Option<f64>,
+    min_span: f64,
+) -> (Trace, i64) {
+    const BUCKET_MS: i64 = aterm_vitals::history::FREE_BUCKET_S * 1000;
+    let snap = c.snap;
+    let now = snap.at_unix_ms;
+    let day = snap.spotlight_day.day(now);
+    let vals: Vec<Option<f64>> = day
+        .iter()
+        .map(|b| b.as_ref().and_then(&figure).map(|v| (v / unit).max(0.0)))
+        .collect();
+    let heat = vals
+        .iter()
+        .map(|v| HeatCell {
+            heat: v
+                .zip(capacity.filter(|c| *c > 0.0))
+                .map(|(v, cap)| (v * unit / cap).clamp(0.0, 1.0) as f32),
+            ..HeatCell::default()
+        })
+        .collect();
+    let n = vals.len() as i64;
+    let start_ms = (now.div_euclid(BUCKET_MS) + 1 - n) * BUCKET_MS;
+    let (gaps, events) = trace_overlays(snap, start_ms, BUCKET_MS, vals.len());
+    let peaks = vec![None; vals.len()];
+    (
+        Trace {
+            vals,
+            peaks,
+            heat,
+            under: DAY,
+            min_span,
+            mark: None,
+            gaps,
+            events,
+            removals: Vec::new(),
+            chips: None,
+        },
+        start_ms,
+    )
+}
+
+/// Spotlight's document on the System Resources page (SD-95): the family's cost now and over
+/// the day (SD-93's reading), its processes, each volume's indexing, the index's size on disk
+/// (SD-94), and what is indexed against the wanted scope (FL-127, [`crate::resources_spotlight`]).
+/// No band row opens it.
+fn spotlight_doc<'d>(
+    c: Ctx<'d>,
+    scope: Option<&crate::resources_spotlight::ScopeReading>,
+) -> LensDoc<'d> {
+    use crate::resources_spotlight::{Now, wanted_words, what_is_indexed};
+    let snap = c.snap;
+    let r = snap.spotlight.as_ref();
+    // The person's pause is theirs until Resume, whatever the volumes' last reading says
+    // (SD-96); a resume reads Resuming until a reading made after it; indexing off on the data
+    // volume reads Off.
+    let state = match crate::resources_spotlight::pause_of(scope, snap) {
+        aterm_types::macos_setup::spotlight_scope::Pause::ByYou { since_unix_ms } => format!(
+            "Paused by you since {}",
+            c.loc.clock(since_unix_ms, snap.at_unix_ms)
+        ),
+        aterm_types::macos_setup::spotlight_scope::Pause::Resuming => "Resuming".to_owned(),
+        // The data volume's own block reads off: indexing is off there, whatever the other
+        // volumes read.
+        aterm_types::macos_setup::spotlight_scope::Pause::Off => "Off".to_owned(),
+        _ => r
+            .map_or("Not read yet", |r| match r.state {
+                aterm_vitals::spotlight::State::Idle => "Idle",
+                aterm_vitals::spotlight::State::Indexing => "Indexing",
+                aterm_vitals::spotlight::State::Off => "Off",
+            })
+            .to_owned(),
+    };
+    let sources = vec![
+        format!("{state} \u{b7} wanted: {}", wanted_words()),
+        state.clone(),
+    ];
+    let explainer = "Spotlight is macOS's search index: its processes read new and changed files \
+                     to index them, which costs CPU, disk reads and memory. aterm's setup asks it to \
+                     index only what you search for and to keep everything else on the data \
+                     volume out; What is indexed says how this Mac stands."
+        .to_owned();
+    let row = |label: &str, value: String| TableRow {
+        cells: vec![label.to_owned(), value],
+        warn: None,
+        note: Vec::new(),
+    };
+    let said = |rows: &[TableRow]| -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                let mut s = row.cells.join(": ");
+                for line in &row.note {
+                    s.push(' ');
+                    s.push_str(line);
+                }
+                s
+            })
+            .collect()
+    };
+    let wrapped = |text: &str, indent: f64| wrap(c.m, text, (c.cw - indent).max(1.0), BODY_PT);
+    let processes = r.map(spotlight_processes).unwrap_or_default();
+    // Spotlight's figures come from the split by coalition: where that lane is off, nothing
+    // will be read, which every section says rather than "not read yet".
+    let lane_off = snap.coal_lane == aterm_vitals::explain::CoalLane::Off;
+    let unread_now = if lane_off {
+        "Not read: Spotlight's figures come from a split of the CPU by coalition, and that \
+         lane is off on this Mac (lane_off:coalitions)."
+            .to_owned()
+    } else {
+        format!(
+            "Not read yet: Spotlight's figures come from a split of the CPU by coalition, \
+             which this page asks for every {} seconds.",
+            crate::vitals_host::SPLIT_EVERY.as_secs()
+        )
+    };
+    let unread_short = if lane_off {
+        "Not read: the coalition lane is off."
+    } else {
+        "Not read yet."
+    };
+
+    // Now.
+    let (now_rows, now_subs) = match r {
+        Some(r) => {
+            let count: u32 = processes.iter().map(|p| p.count).sum();
+            let mut held = format!(
+                "{count} {}",
+                if count == 1 { "process" } else { "processes" }
+            );
+            if let Some(big) = processes.first().filter(|p| p.footprint.is_some()) {
+                held.push_str(&format!(" \u{b7} {} holds {}", big.name, big.memory()));
+            }
+            (
+                vec![
+                    row("CPU", cores_word(r.cpu_mc as f64)),
+                    row("Disk reads", mb_s(r.read_bps as f64)),
+                    row("Memory", spotlight_footprint(r)),
+                    row("Processes", held),
+                ],
+                vec![
+                    format!(
+                        "over {} \u{b7} as of {}",
+                        words::duration_approx(r.window_ms as f64 / 1000.0),
+                        c.loc.clock(r.at_unix_ms, snap.at_unix_ms)
+                    ),
+                    format!("as of {}", c.loc.clock(r.at_unix_ms, snap.at_unix_ms)),
+                ],
+            )
+        }
+        None => (
+            vec![TableRow {
+                cells: Vec::new(),
+                warn: None,
+                note: wrapped(&unread_now, 0.0),
+            }],
+            Vec::new(),
+        ),
+    };
+    let now_words = said(&now_rows);
+    let mut sections = vec![table_section(
+        "Now",
+        now_subs,
+        Vec::new(),
+        now_rows,
+        false,
+        now_words,
+        false,
+    )];
+
+    // The day.
+    let cores = snap.total_cores().map(|n| n as f64 * 1000.0);
+    let (cpu, cpu_start) = spotlight_day_trace(c, |b| Some(b.cpu_mc), 1000.0, cores, 0.5);
+    let cpu_said = trace_said(
+        "Spotlight's CPU over the last 24 hours",
+        "cores",
+        &cpu,
+        (cpu_start, aterm_vitals::history::FREE_BUCKET_S * 1000),
+        &c.loc,
+    );
+    let total = snap.mem.as_ref().map(|m| m.sample.total as f64);
+    let (mem, mem_start) = spotlight_day_trace(c, |b| b.footprint_max, 1e9, total, 0.5);
+    let mem_said = trace_said(
+        "Spotlight's memory over the last 24 hours",
+        "GB",
+        &mem,
+        (mem_start, aterm_vitals::history::FREE_BUCKET_S * 1000),
+        &c.loc,
+    );
+    // The newest bucket read, named by when it began: never a bucket of hours ago called the
+    // last 10 minutes.
+    let line = |t: &Trace, start_ms: i64, unit: &str| -> Vec<String> {
+        const BUCKET_MS: i64 = aterm_vitals::history::FREE_BUCKET_S * 1000;
+        match t
+            .vals
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, v)| Some((i, (*v)?)))
+        {
+            Some((i, v)) => vec![format!(
+                "{v:.2} {unit} in the 10 minutes from {}",
+                c.loc
+                    .clock(start_ms + i as i64 * BUCKET_MS, snap.at_unix_ms)
+            )],
+            None => vec!["not read in the last 24 hours".to_owned()],
+        }
+    };
+    let (cpu_line, mem_line) = (line(&cpu, cpu_start, "cores"), line(&mem, mem_start, "GB"));
+    sections.push(trace_section(
+        c,
+        "CPU, last 24 hours",
+        vec!["cores, each 10 minutes' mean".into(), "cores".into()],
+        cpu,
+        cpu_said,
+        "CPU",
+        cpu_line,
+        false,
+    ));
+    sections.push(trace_section(
+        c,
+        "Memory, last 24 hours",
+        vec!["GB, each 10 minutes' most".into(), "GB".into()],
+        mem,
+        mem_said,
+        "Memory",
+        mem_line,
+        false,
+    ));
+
+    // Processes.
+    let rows: Vec<TableRow> = if processes.is_empty() {
+        vec![TableRow {
+            cells: Vec::new(),
+            warn: None,
+            note: vec![if r.is_some() {
+                "None ran in the window.".to_owned()
+            } else {
+                unread_short.to_owned()
+            }],
+        }]
+    } else {
+        processes
+            .iter()
+            .map(|p| TableRow {
+                cells: vec![
+                    p.label(),
+                    p.memory(),
+                    cores_word(p.cpu_mc as f64),
+                    cpu_time(p.cpu_total_ns),
+                ],
+                warn: None,
+                note: Vec::new(),
+            })
+            .collect()
+    };
+    let words = processes
+        .iter()
+        .map(|p| {
+            format!(
+                "{}: {} memory, {} now, {} of CPU since it began",
+                p.label(),
+                p.memory(),
+                cores_word(p.cpu_mc as f64),
+                cpu_time(p.cpu_total_ns)
+            )
+        })
+        .collect::<Vec<_>>();
+    let head = if processes.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            "Memory".to_owned(),
+            "CPU now".to_owned(),
+            "CPU since it began".to_owned(),
+        ]
+    };
+    let words = if words.is_empty() { said(&rows) } else { words };
+    sections.push(table_section(
+        "Processes",
+        Vec::new(),
+        head,
+        rows,
+        true,
+        words,
+        true,
+    ));
+
+    // Volumes.
+    let (rows, subs) = match r.and_then(|r| r.volumes.as_ref().map(|v| (v, r.volumes_age_ms))) {
+        Some((volumes, age)) if !volumes.is_empty() => (
+            volumes
+                .iter()
+                .map(|v| row(&v.path, format!("indexing {}", v.indexing.word())))
+                .collect::<Vec<_>>(),
+            age.map(|ms| {
+                vec![format!(
+                    "read {} ago",
+                    words::duration_approx(ms as f64 / 1000.0)
+                )]
+            })
+            .unwrap_or_default(),
+        ),
+        _ => (
+            vec![TableRow {
+                cells: Vec::new(),
+                warn: None,
+                note: vec![if r.is_some() || !lane_off {
+                    "Not read yet.".to_owned()
+                } else {
+                    unread_short.to_owned()
+                }],
+            }],
+            Vec::new(),
+        ),
+    };
+    let words = said(&rows);
+    sections.push(table_section(
+        "Volumes",
+        subs,
+        Vec::new(),
+        rows,
+        false,
+        words,
+        true,
+    ));
+
+    // Index on disk.
+    let index = match r {
+        None => unread_short.to_owned(),
+        Some(_) => index_words(r),
+    };
+    let rows = vec![TableRow {
+        cells: Vec::new(),
+        warn: None,
+        note: wrapped(&index, 0.0),
+    }];
+    sections.push(table_section(
+        "Index on disk",
+        Vec::new(),
+        Vec::new(),
+        rows,
+        false,
+        vec![index],
+        true,
+    ));
+
+    // What is indexed.
+    let data = r
+        .and_then(|r| r.volumes.as_ref())
+        .and_then(|v| {
+            v.iter()
+                .find(|v| v.path == aterm_types::macos_setup::spotlight_scope::DATA_VOLUME)
+        })
+        .map(|v| &v.indexing);
+    let judged = what_is_indexed(scope, data);
+    let words = judged.iter().map(|row| row.said()).collect();
+    let rows = judged
+        .iter()
+        .map(|j| TableRow {
+            cells: vec![
+                j.name.clone(),
+                j.now.word().to_owned(),
+                j.wanted.word().to_owned(),
+            ],
+            warn: j.differs().then_some(1),
+            note: if j.differs() {
+                wrapped(&format!("Differs from wanted: {}.", j.words), SIDE)
+            } else if j.now == Now::Unread {
+                wrapped(&format!("{}.", j.words), SIDE)
+            } else {
+                Vec::new()
+            },
+        })
+        .collect();
+    sections.push(table_section(
+        "What is indexed",
+        vec!["now, against what is wanted".to_owned()],
+        vec!["Now".to_owned(), "Wanted".to_owned()],
+        rows,
+        false,
+        words,
+        false,
+    ));
+
+    LensDoc {
+        name: "Spotlight",
+        sources,
+        explainer,
+        answer: None,
+        sections,
+        two_order: Vec::new(),
+        keeps_first: false,
+    }
+}
+
+/// A complete document on the scrolling System Resources page.
+#[derive(Clone, Copy)]
+pub(crate) enum PageDoc<'a> {
+    Lens(Instrument),
+    /// Spotlight's, with the scope as the host's probe last read it.
+    Spotlight(Option<&'a crate::resources_spotlight::ScopeReading>),
+}
+
+/// A document laid without a height constraint, in points from the node's corner.
+pub(crate) struct PageLaid {
+    pub(crate) prims: Vec<DrawPrim>,
+    pub(crate) height_pt: f64,
+    pub(crate) title: String,
+    /// The head line's longest source: where the reading comes from, or Spotlight's state.
+    pub(crate) source: Option<String>,
+    pub(crate) explainer: String,
+    pub(crate) wells: Vec<(String, String)>,
+    /// The name/source line's rectangle, available to native controls.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "returned for native controls over the document head"
+        )
+    )]
+    pub(crate) head: Place,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "returned for native controls over each section")
+    )]
+    pub(crate) placed: Vec<Placed>,
+    /// The rectangle a button over the span labels takes where the document draws them (the Disk
+    /// document's used-space chart while [`spans_offered`] answers yes and [`span_chips`] finds
+    /// room), pt: the page lays its span button there.
+    pub(crate) span_chips: Option<Place>,
+    /// The number of sections in the builder's complete document.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the complete section count is checked against placement by the page law"
+        )
+    )]
+    pub(crate) of: usize,
+    #[cfg(test)]
+    pub(crate) boxes: Vec<TextBox>,
+}
+
+/// Lay every section in its first form. Unlike the card, the page grows to hold the document.
+/// The scope is `bar` over `input`'s sessions ([`DeckInput::tab_panes`], [`DeckInput::tab_label`]),
+/// as a card's is its lens's bar over the same input: the page's scope row chooses both.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a page document is the card's Ctx laid whole: its width, input, document, scope bar, \
+              scale, font, metrics and whether it draws are each the caller's"
+)]
+pub(crate) fn lay_page(
+    width_pt: f64,
+    input: &DeckInput<'_>,
+    what: PageDoc<'_>,
+    bar: Bar,
+    scale: f32,
+    font_px: f32,
+    m: &FaceMetrics,
+    draw: bool,
+) -> PageLaid {
+    let mut inks = input.inks;
+    if input.contrast {
+        inks.hollow = inks.words2;
+        inks.rim = inks.words2;
+    }
+    let mut pen = Pen {
+        p: Painter::new(&inks, scale, font_px, input.dwc),
+        m,
+        inks,
+        ic: input.contrast,
+        s: f64::from(scale.max(0.5)),
+        ox: 0.0,
+        oy: 0.0,
+        draw,
+        line_tab: 0.0,
+        chips: None,
+        #[cfg(test)]
+        boxes: Vec::new(),
+    };
+    let (two, cw) = columns(width_pt);
+    let empty = Snapshot::default();
+    let c = Ctx {
+        snap: input.snap.unwrap_or(&empty),
+        m,
+        panes: &input.tab_panes,
+        tab_label: &input.tab_label,
+        loc: input.locale,
+        bar,
+        two,
+        cw,
+        fresh: input.live.fresh,
+        keys: false,
+        disk_span: input.disk_span,
+        cpu_policy_pending: input.cpu_policy_pending,
+    };
+    let doc = match what {
+        PageDoc::Lens(focus) => doc_for(c, focus),
+        PageDoc::Spotlight(scope) => spotlight_doc(c, scope),
+    };
+    // One empty hint still lets head choose a fitting source line.
+    let top = head(&mut pen, &doc, &[&[]], width_pt, f64::INFINITY, 0.0);
+    let order: Vec<usize> = if two && !doc.two_order.is_empty() {
+        doc.two_order.clone()
+    } else {
+        (0..doc.sections.len()).collect()
+    };
+    let mut bottoms = [top; 2];
+    let mut placed = Vec::with_capacity(doc.sections.len());
+    for (column, bottom) in bottoms.iter_mut().enumerate().take(usize::from(two) + 1) {
+        for section in order
+            .iter()
+            .copied()
+            .filter(|&section| !two || usize::from(doc.sections[section].right) == column)
+        {
+            let sec = &doc.sections[section];
+            let place = Place {
+                x: if column == 0 { SIDE } else { 2.0 * SIDE + cw },
+                y: *bottom,
+                w: cw,
+                h: sec.forms[0].page,
+            };
+            *bottom = place.y + place.h + GAP;
+            placed.push(Placed {
+                section,
+                form: 0,
+                place,
+            });
+        }
+    }
+    let tab_of = |x: f64| {
+        placed
+            .iter()
+            .filter(|pl| pl.place.x == x)
+            .filter_map(|pl| doc.sections[pl.section].forms[pl.form].label.as_deref())
+            .map(|label| tab_after(m.width(label, HEAD_PT, true)))
+            .fold(0.0, f64::max)
+    };
+    let mut wells = Vec::new();
+    if let Some((label, text, _)) = &doc.answer {
+        wells.push(((*label).to_owned(), text.clone()));
+    }
+    for pl in &placed {
+        let sec = &doc.sections[pl.section];
+        pen.line_tab = tab_of(pl.place.x);
+        (sec.forms[pl.form].draw)(&mut pen, pl.place);
+        wells.push((sec.name.clone(), sec.words.join(" ")));
+        wells.extend(sec.parts.iter().cloned());
+    }
+    let bottom = placed
+        .iter()
+        .map(|pl| pl.place.y + pl.place.h)
+        .fold(top, f64::max);
+    PageLaid {
+        prims: pen.p.prims,
+        height_pt: bottom + FOOT,
+        title: doc.name.to_owned(),
+        source: doc.sources.first().cloned(),
+        explainer: doc.explainer,
+        wells,
+        head: Place {
+            x: SIDE,
+            y: LINE1_BASE - ASCENT_EM * NAME_PT,
+            w: (width_pt - 2.0 * SIDE).max(0.0),
+            h: (ASCENT_EM + DESCENT_EM) * NAME_PT,
+        },
+        of: doc.sections.len(),
+        placed,
+        span_chips: pen.chips,
+        #[cfg(test)]
+        boxes: pen.boxes,
+    }
+}
+
 /// Lay the lens `lens` on `lg` from `input`, measuring its words with `m`.
 pub(crate) fn lay_lens(
     lg: &LensGeom,
@@ -6251,6 +7179,7 @@ pub(crate) fn lay_lens(
         oy: lg.margin,
         draw,
         line_tab: 0.0,
+        chips: None,
         #[cfg(test)]
         boxes: Vec::new(),
     };
@@ -6292,7 +7221,7 @@ pub(crate) fn lay_lens(
                 two_order: Vec::new(),
                 keeps_first: false,
             };
-            let _ = head(&mut pen, &doc, lens.how, false, lw, lh, 0.0);
+            let _ = head(&mut pen, &doc, hints(lens.how, false), lw, lh, 0.0);
             laid.explainer = doc.explainer;
         }
         Some(snap) => {
@@ -6306,7 +7235,9 @@ pub(crate) fn lay_lens(
                 two,
                 cw,
                 fresh: input.live.fresh,
+                keys: true,
                 disk_span: input.disk_span,
+                cpu_policy_pending: input.cpu_policy_pending,
             };
             let mut doc = if lens.focus == Instrument::NetworkState {
                 lab_network_doc(
@@ -6342,7 +7273,7 @@ pub(crate) fn lay_lens(
                 .and_then(|s| s.forms.last())
                 .map_or(0.0, |f| f.h);
             let spans = lens.focus == Instrument::Disk && spans_offered(snap, input.disk_span);
-            let top = head(&mut pen, &doc, lens.how, spans, lw, lh, reserve);
+            let top = head(&mut pen, &doc, hints(lens.how, spans), lw, lh, reserve);
             let placed = lens_body(
                 (two, cw),
                 top,
@@ -6481,6 +7412,10 @@ impl crate::App {
                 .windows
                 .get(&wid)
                 .map_or(DiskSpan::Day, |ws| ws.stats_lens.disk_span),
+            #[cfg(target_os = "macos")]
+            cpu_policy_pending: self.cpu_policy_pending(),
+            #[cfg(not(target_os = "macos"))]
+            cpu_policy_pending: false,
             snap: self.vitals.snapshot.as_deref(),
             prev_snap: None,
             tab_panes: f.tab_panes.clone(),
@@ -6541,6 +7476,8 @@ impl crate::App {
             .get(&wid)
             .map(|ws| (ws.stats_lens.network_target, ws.stats_lens.disk_span))
             .hash(&mut h);
+        #[cfg(target_os = "macos")]
+        self.cpu_policy_pending().hash(&mut h);
         lens.hash(&mut h);
         if lens.focus != Instrument::NetworkState {
             f.live.fresh.hash(&mut h);
@@ -6803,7 +7740,7 @@ impl crate::App {
         self.windows.values().any(|ws| ws.stats_lens.open.is_some())
     }
 
-    /// The rows whose lens a window holds open, each once ([`crate::vitals_host::Request::lenses`]).
+    /// The rows whose lens a window or the on-screen resources page holds open, each once ([`crate::vitals_host::Request::lenses`]).
     pub(crate) fn open_lens_rows(&self) -> Vec<Resource> {
         let mut rows = Vec::new();
         for row in self
@@ -6813,6 +7750,16 @@ impl crate::App {
         {
             if !rows.contains(&row) {
                 rows.push(row);
+            }
+        }
+        if self.resources_page_on_screen() {
+            for row in Instrument::page_order()
+                .into_iter()
+                .filter_map(Instrument::resource)
+            {
+                if !rows.contains(&row) {
+                    rows.push(row);
+                }
             }
         }
         rows
@@ -7096,7 +8043,7 @@ impl crate::App {
             surface.height as usize,
             frame_w,
             self.stats_frame_h(wid),
-            aterm_render::SideInsetPx(self.win_side_inset_px(wid)),
+            self.frame_insets(wid),
         );
         let within = |start: u32, len: u32, axis: aterm_render::AxisPlacement| {
             let start = start as usize;
@@ -7207,7 +8154,9 @@ impl crate::App {
             }
             #[cfg(target_os = "macos")]
             if open.focus == Instrument::Cpu && command("p") && mods.shift_key() {
-                let _ = self.collect_cpu_policy(wid);
+                // A person's own key lets its sheet past the spacing a sheet nobody touched set;
+                // a key no person is known to stand behind starts it as a control client would.
+                let _ = self.collect_cpu_policy(wid, self.cpu_policy_starter());
                 return true;
             }
             #[cfg(target_os = "macos")]

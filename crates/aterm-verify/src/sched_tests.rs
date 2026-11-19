@@ -382,6 +382,13 @@ fn windowed_stages_serialize_without_blocking_independent_headless_work() {
     let mut started = vec![false; specs.len()];
     let mut done = vec![false; specs.len()];
 
+    // This window-arbitration timeline starts after the headless driver builds.
+    for id in [StageId::RedrawBuild, StageId::ObjcBuild] {
+        let build = at(id);
+        started[build] = true;
+        done[build] = true;
+    }
+
     assert!(ready(&specs, &started, &done, 0, browser, u64::MAX));
     assert!(!ready(&specs, &started, &done, 0, redraw, u64::MAX));
     started[browser] = true;

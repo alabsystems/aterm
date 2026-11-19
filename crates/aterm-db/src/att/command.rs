@@ -9,7 +9,9 @@
 
 use super::{
     Ask, CAPS, Capacity, Compiled, Cursor, Diff, EntryKind, Filter, Handle, Inert, Page, Point,
-    Revision, Roll, Saved, TABLES, Usage, View, Writer, edit, find,
+    Revision, Roll, Saved, Usage, View, Writer,
+    checkpoint::{Fence, Seats},
+    edit, find,
 };
 use crate::{
     Error, Result,
@@ -26,7 +28,13 @@ use crate::{
 use astream_wire::sync::Actor;
 use aterm_codec::hex;
 use aterm_json::{Map, Value, json};
-use aterm_secrets::client::Paths;
+use aterm_secrets::{
+    client::Paths,
+    commons::{
+        hearing::{Hold, READS_CHECKPOINTS, Version},
+        roster::MAX_MEMBERS,
+    },
+};
 use std::{collections::BTreeMap, io::Write, path::Path, process::ExitCode};
 
 /// The verbs' help.
@@ -48,12 +56,24 @@ pub const USAGE: &str = "aterm db table — typed ATT/1 tables on Commons (Unix)
                                         from the top, since the table moved under the cursor.\n\
                                         Each writer is named by the machine row its Mac's\n\
                                         facts bind; --tsv prints one line per changed cell:\n\
-                                        the time, the Mac, the kind, the place and the value\n\
+                                        the time, the Mac, the kind, the place and the value,\n\
+                                        then who made it, why and on what evidence where its\n\
+                                        record says\n\
   diff <app>/<role> [<collection>] <from> [<to>|head]\n\
                                         the cells added, retired, changed and conflict-changed\n\
                                         from one point to a later one, and who made each\n\
-  check <app>/<role> [--tsv]            conflicts, dangling references, unique clashes;\n\
-                                        --tsv says each in words, a line each\n\
+                                        (its Mac and, where its record says, its principal,\n\
+                                        reason and evidence). History and diff name, in\n\
+                                        `refused`, the records held and not read: how many,\n\
+                                        whose and why\n\
+  check <app>/<role> [--tsv|--fence]    conflicts, dangling references, unique clashes;\n\
+                                        --tsv says each in words, a line each, and nothing\n\
+                                        else. The JSON's `fence` says whether this machine\n\
+                                        may sign a checkpoint of the table and names each\n\
+                                        machine that holds checkpoints back, with why: an\n\
+                                        older aterm, no version report, or not heard from in\n\
+                                        7 days. --fence prints only that, in three sentences\n\
+                                        with how many machines for each reason and no names\n\
   revert <app>/<role> <operation> [--request <hex>]\n\
   export <app>/<role> <collection> --tsv <file> [--where col=val]... [--at <operation>]\n\
   apply <file>                          write an exported file's changed cells\n\
@@ -113,6 +133,8 @@ struct Args {
     operands: Vec<String>,
     json: bool,
     tsv: bool,
+    /// `check --fence`: only who holds the table's checkpoints back, in words.
+    fence: bool,
     publish: bool,
     file: Option<String>,
     request: Option<String>,
@@ -145,6 +167,7 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 args.file = Some(value("--tsv")?);
             }
             "--tsv" if matches!(verb, "scan" | "history" | "check") => args.tsv = true,
+            "--fence" if verb == "check" => args.fence = true,
             "--request" if verb == "revert" => {
                 if args.request.is_some() {
                     return Err(Error::new("revert takes one --request <hex>"));
@@ -210,6 +233,9 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
     if args.tsv && args.json {
         return Err(Error::new(&format!("{verb} takes either --tsv or --json")));
     }
+    if args.tsv && args.fence {
+        return Err(Error::new("check takes either --tsv or --fence"));
+    }
     Ok(args)
 }
 
@@ -266,8 +292,7 @@ pub fn run(
     match verb {
         "ls" => {
             args.at_most(0)?;
-            Ok(Output::Json(json!({"tables": TABLES
-                .iter()
+            Ok(Output::Json(json!({"tables": crate::att::generations()
                 .map(|compiled| ls(&Handle::at(paths.clone(), compiled)))
                 .collect::<Vec<_>>()})))
         }
@@ -382,8 +407,18 @@ pub fn run(
         "check" => {
             args.at_most(1)?;
             let handle = handle(args.operand(0, "<app>/<role>")?)?;
-            let (view, usage) = handle.usage()?;
-            let checked = check(handle.compiled(), &view, &usage);
+            // The clock is read once, here: who holds the fence is judged at one time.
+            let now_ms = aterm_time::unix_millis().unwrap_or(0);
+            let (view, usage, fence) = handle.usage_fenced(now_ms)?;
+            if args.fence {
+                let mut said = fence_lines(&fence).join("\n");
+                said.push('\n');
+                return Ok(Output::Text(said));
+            }
+            let mut checked = check(handle.compiled(), &view, &usage);
+            if let Some(object) = checked.as_object_mut() {
+                object.insert("fence".to_owned(), fence_json(&fence));
+            }
             if args.tsv {
                 let findings = checked["findings"]
                     .as_array()
@@ -902,7 +937,7 @@ pub(crate) fn capacity_json(table: &Table, found: &Capacity, me: &Actor) -> Valu
             }});
             // The registry's roll is its own verb (design §3.8); a table with no later
             // generation this build rolls to names none.
-            if crate::att::TABLES.iter().any(|compiled| {
+            if crate::att::generations().any(|compiled| {
                 (compiled.table.application, compiled.table.role) == (table.application, table.role)
                     && compiled
                         .successor
@@ -934,7 +969,7 @@ pub fn schema_findings(table: &Table, view: &View) -> Vec<Value> {
 /// `check` of `compiled` as `view` reads it: the generic findings, a split schema, capacity, and
 /// the inert records as `ls` counts those of its cells (past their writer's quota, or holding a
 /// write the authority rules hold inert).
-pub(crate) fn check(compiled: &Compiled, view: &View, usage: &Usage) -> Value {
+pub fn check(compiled: &Compiled, view: &View, usage: &Usage) -> Value {
     let cells: Vec<&Collection> = compiled
         .table
         .collections
@@ -960,6 +995,157 @@ pub(crate) fn check(compiled: &Compiled, view: &View, usage: &Usage) -> Value {
         "inert": view.quota.over.len() + view.inert.total(),
         "refused": view.refused.iter().map(|id| hex::encode_lower(id)).collect::<Vec<_>>(),
         "malformed": projections.values().map(|p| p.malformed).sum::<usize>()})
+}
+
+/// The most seats each list of `check`'s `fence` names ([`fence_json`], which prints it as
+/// `limit`): the most a roster holds ([`MAX_MEMBERS`], 255). A shorter list would hide the
+/// seats this read exists to name (254 of them were unheard on one Mac the day it was asked
+/// for), and the roster's own cap already bounds what `check` prints of them to about 90 KB.
+/// So every list is whole unless the roster's cap grows past this one, and the counts beside
+/// the lists are always whole.
+pub const FENCE_SEATS: usize = MAX_MEMBERS;
+
+/// Why a seat holds the fence, as `check` counts and names it: `older` (heard in the last 7
+/// days on an aterm older than [`READS_CHECKPOINTS`]), `no_report` (heard in that time with no
+/// version report that still counts) or `unheard` (not heard in that time, whether or not this
+/// Mac watched that long).
+const fn why(hold: &Hold) -> &'static str {
+    match hold {
+        Hold::Older(Some(_)) => "older",
+        Hold::Older(None) => "no_report",
+        Hold::Unheard | Hold::Unwatched => "unheard",
+    }
+}
+
+/// How many of `seats` hold the fence for each reason ([`why`]): older, no report, unheard.
+fn held_counts(seats: &Seats) -> [usize; 3] {
+    let of = |kind: &str| {
+        seats
+            .holders
+            .iter()
+            .filter(|(_, hold)| why(hold) == kind)
+            .count()
+    };
+    [of("older"), of("no_report"), of("unheard")]
+}
+
+/// How many machines of `seats` hold checkpoints back for each reason, in words a comma apart:
+/// on an aterm older than the first that reads checkpoints (with the release they run, or the
+/// oldest and newest of them), with no version report in 7 days, not heard from in 7 days.
+/// `none holds checkpoints back` where none does.
+fn held_words(seats: &Seats) -> String {
+    let versions = || {
+        seats.holders.iter().filter_map(|(_, hold)| match hold {
+            Hold::Older(version) => *version,
+            Hold::Unheard | Hold::Unwatched => None,
+        })
+    };
+    let [older, silent, unheard] = held_counts(seats);
+    let mut kinds = Vec::new();
+    if let (Some(least), Some(most)) = (versions().min(), versions().max()) {
+        let run: String = if least == most {
+            least.to_string()
+        } else {
+            format!("{least} to {most}")
+        };
+        kinds.push(format!(
+            "{older} on aterm older than {READS_CHECKPOINTS} ({run})"
+        ));
+    }
+    if silent > 0 {
+        kinds.push(format!("{silent} with no version report in 7 days"));
+    }
+    if unheard > 0 {
+        kinds.push(format!("{unheard} not heard from in 7 days"));
+    }
+    if kinds.is_empty() {
+        return "none holds checkpoints back".to_owned();
+    }
+    kinds.join(", ")
+}
+
+/// Who holds a table's checkpoints back, as a person reads it ([`Handle::usage_fenced`]): a
+/// sentence each for whether this machine may sign one, the enrolled machines (the seats on the
+/// roster), and those of them that wrote a record in the last 30 days, each with how many hold
+/// checkpoints back for each reason. It names no machine: the JSON does ([`fence_json`]).
+/// `aterm db table check --fence` prints these, its JSON carries them as `fence.said`, and the
+/// Tables page's Check view lists them under the store's state.
+#[must_use]
+pub fn fence_lines(fence: &Fence) -> Vec<String> {
+    let machines = |n: usize| if n == 1 { "machine" } else { "machines" };
+    let (all, recent) = (fence.roster.seats.len(), fence.recent.seats.len());
+    vec![
+        if fence.open() {
+            "No machine holds checkpoints back, so this machine may sign one".to_owned()
+        } else {
+            "Checkpoints are held back, so this machine signs no new one".to_owned()
+        },
+        format!(
+            "Of {all} enrolled {}: {}",
+            machines(all),
+            held_words(&fence.roster)
+        ),
+        if recent == 0 {
+            "No machine wrote a record in the last 30 days".to_owned()
+        } else {
+            format!(
+                "Of the {recent} that wrote a record in the last 30 days: {}",
+                held_words(&fence.recent)
+            )
+        },
+    ]
+}
+
+/// One set of seats as `check`'s JSON prints it: how many there are, how many hold the fence
+/// and how many for each reason ([`why`]), and the first [`FENCE_SEATS`] of the seats by id (a
+/// seat's id is its Commons writer in hex, as a quota finding prints a writer).
+fn seats_json(seats: &Seats) -> Value {
+    let [older, no_report, unheard] = held_counts(seats);
+    json!({
+        "count": seats.seats.len(),
+        "holding": seats.holders.len(),
+        "older": older,
+        "no_report": no_report,
+        "unheard": unheard,
+        "seats": seats.seats.iter().take(FENCE_SEATS).map(|seat| hex::encode_lower(seat))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `check`'s `fence`: whether the table's checkpoint fence is open, what [`fence_lines`] says
+/// of it, the seats on the roster and those that signed a record in the last 30 days
+/// ([`seats_json`]), and each seat that holds the fence, once: its id, `why` ([`why`]), the
+/// `version` it reported where an older aterm is why (else `null`), and whether it is one of
+/// the `recent` seats. Every list is sorted by id and names at most `limit` seats
+/// ([`FENCE_SEATS`]); the counts are whole.
+#[must_use]
+pub fn fence_json(fence: &Fence) -> Value {
+    let holders: Vec<Value> = fence
+        .roster
+        .holders
+        .iter()
+        .take(FENCE_SEATS)
+        .map(|(seat, hold)| {
+            let version = match hold {
+                Hold::Older(Some(version)) => Value::String(Version::to_string(version)),
+                _ => Value::Null,
+            };
+            json!({
+                "seat": hex::encode_lower(seat),
+                "why": why(hold),
+                "version": version,
+                "recent": fence.recent.seats.contains(seat),
+            })
+        })
+        .collect();
+    json!({
+        "open": fence.open(),
+        "said": fence_lines(fence),
+        "limit": FENCE_SEATS,
+        "roster": seats_json(&fence.roster),
+        "recent": seats_json(&fence.recent),
+        "holders": holders,
+    })
 }
 
 /// One change as history shows it: a typed cell's value in its grid spelling (a secret cell's
@@ -1036,17 +1222,35 @@ fn diff_json(handle: &Handle, diff: &Diff, only: Option<&str>) -> Value {
                     "operation": hex::encode_lower(&by.operation),
                     "author": hex::encode_lower(&by.actor),
                     "machine": by.machine.as_ref().map(keys::uuid32),
+                    "principal": said_json(by.said.as_ref()).0,
+                    "reason": said_json(by.said.as_ref()).1,
+                    "evidence": said_json(by.said.as_ref()).2,
                 })).collect::<Vec<_>>(),
             })
         })
         .collect();
     json!({"table": handle.compiled().name(), "from": point(&Point::At(diff.from)),
-        "to": point(&diff.to), "cells": cells})
+        "to": point(&diff.to), "cells": cells,
+        "refused": crate::typed::refused_words(&diff.refused)})
+}
+
+/// What a version 2 record says of who made it, as history and diff print it: its principal,
+/// its reason and its evidence; `null`, `null` and `[]` for a version 1 record, which names only
+/// the Mac that signed it.
+fn said_json(said: Option<&crate::said::Said>) -> (Value, Value, Value) {
+    said.map_or((Value::Null, Value::Null, json!([])), |said| {
+        (
+            said.principal_value(),
+            said.reason.clone().map_or(Value::Null, Value::String),
+            Value::Array(said.evidence_values()),
+        )
+    })
 }
 
 /// `history`'s page: each entry with the changes of it `filter` names, its kind and, where it
 /// projects nothing, why; the revision it was read at, whether that moved under the cursor
-/// asked, and the cursor of the next page.
+/// asked, the cursor of the next page, and what the table holds and does not project
+/// ([`crate::typed::refused_words`], `null` where it holds none).
 fn history(handle: &Handle, page: &Page, filter: &Filter) -> Value {
     let operations: Vec<Value> = page
         .entries
@@ -1063,6 +1267,9 @@ fn history(handle: &Handle, page: &Page, filter: &Filter) -> Value {
                 "reverts": entry.reverts.as_ref().map(|r| hex::encode_lower(r)),
                 "kind": entry.kind.word(),
                 "inert": entry.inert.map(Inert::word),
+                "principal": said_json(entry.said.as_ref()).0,
+                "reason": said_json(entry.said.as_ref()).1,
+                "evidence": said_json(entry.said.as_ref()).2,
                 "changes": entry.changes.iter().filter(|c| filter.wants(c))
                     .map(|c| change_json(handle, c)).collect::<Vec<_>>(),
             })
@@ -1070,6 +1277,7 @@ fn history(handle: &Handle, page: &Page, filter: &Filter) -> Value {
         .collect();
     json!({"table": handle.compiled().name(), "revision": page.revision.text(),
         "moved": page.moved, "next": page.next.as_ref().map(Cursor::text),
+        "refused": crate::typed::refused_words(&page.refused),
         "operations": operations})
 }
 
@@ -1079,8 +1287,12 @@ fn history(handle: &Handle, page: &Page, filter: &Filter) -> Value {
 /// value never took effect), and the change's collection, row, column and value as
 /// [`stored_json`] shows it, a set member as `+ member` or `− member`, a removed value as
 /// nothing. A key the JSON conceals ([`safe_key`] of the whole key) shows as the JSON shows
-/// it, in the row's place, and so does each part that is credential-shaped by itself. A page that moved under its cursor says so first; one with more after it names the
-/// next page's options last. Each comment line starts with `#`.
+/// it, in the row's place, and so does each part that is credential-shaped by itself. After
+/// the operation, what a version 2 record says of itself: who made it ([`crate::said::Said::who`]), why,
+/// and its evidence, each piece as it is spelled, separated by spaces; empty for a record that
+/// says nothing. A page that moved under its cursor says so first, and one that holds records
+/// it does not read says how many, whose and why ([`crate::typed::refused_words`]); one with
+/// more after it names the next page's options last. Each comment line starts with `#`.
 fn history_tsv(handle: &Handle, page: &Page, filter: &Filter) -> String {
     let field =
         |text: &str| amacs::table::encode(text, amacs::table::Delimiter::Tab, false).into_owned();
@@ -1088,10 +1300,25 @@ fn history_tsv(handle: &Handle, page: &Page, filter: &Filter) -> String {
     if page.moved {
         text.push_str("# the table moved under the cursor: this page starts from the top\n");
     }
-    text.push_str("time\tmac\tkind\tinert\tcollection\trow\tcolumn\tvalue\toperation\n");
+    if let Some(refused) = crate::typed::refused_words(&page.refused) {
+        text.push_str(&format!("# refused: {refused}\n"));
+    }
+    text.push_str(
+        "time\tmac\tkind\tinert\tcollection\trow\tcolumn\tvalue\toperation\tby\treason\tevidence\n",
+    );
     for entry in &page.entries {
         let time = utc(entry.hlc.ms);
         let mac = entry.mac.name();
+        let said = entry.said.as_ref();
+        let by = said.map(crate::said::Said::who).unwrap_or_default();
+        let reason = said.and_then(|said| said.reason.as_deref()).unwrap_or("");
+        let evidence = said.map_or_else(String::new, |said| {
+            said.evidence
+                .iter()
+                .map(crate::typed::values::Evidence::spell)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
         for change in entry.changes.iter().filter(|c| filter.wants(c)) {
             let concealed = safe_key(&change.key) != change.key.as_str();
             let typed = handle
@@ -1127,6 +1354,9 @@ fn history_tsv(handle: &Handle, page: &Page, filter: &Filter) -> String {
                 column,
                 &value,
                 &hex::encode_lower(&entry.operation),
+                &by,
+                reason,
+                &evidence,
             ]
             .map(field)
             .join("\t");

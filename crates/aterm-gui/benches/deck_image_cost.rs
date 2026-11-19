@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! targo --unverified build -p aterm-gui --profile opt-test --features bench-support --bench deck_image_cost
-//! <build-dir>/opt-test/build/aterm-gui/<hash>/out/deck_image_cost-<hash> <recordings-dir> <out-dir> [frames] [encodes] [run] [calls]
+//! <build-dir>/opt-test/build/aterm-gui/<hash>/out/deck_image_cost-<hash> <recordings-dir> <out-dir> [frames] [encodes] [run] [calls] [pages]
 //! ```
 //!
 //! `<recordings-dir>` is `docs/measured/stats-deck-a4-recordings-2026-11-06`; `<out-dir>` gets
@@ -21,7 +21,8 @@
 //! ([`aterm_gui::deck_image_probe::DeckImageRig::call`]: the frame on this thread at the app's
 //! main-thread QoS, the PNG on an encode lane spawned as the app's is), into `calls-<run>.csv`.
 //! The binary keeps its Cargo name (`deck_image_cost-<16 hex>`), so it runs on a test binary's
-//! scratch root.
+//! scratch root. Pass `pages` after `calls` to time each complete resource document at narrow
+//! and wide widths, without raster or PNG work.
 
 #[cfg(unix)]
 mod heap {
@@ -211,7 +212,7 @@ mod run {
             .collect();
         let (Some(rec), Some(out)) = (args.first(), args.get(1)) else {
             return Err(
-                "usage: deck_image_cost <recordings-dir> <out-dir> [frames] [encodes] [run] [calls]"
+                "usage: deck_image_cost <recordings-dir> <out-dir> [frames] [encodes] [run] [calls] [pages]"
                     .into(),
             );
         };
@@ -223,6 +224,33 @@ mod run {
         std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
         let footprint_start = footprint_bytes();
         let rig = DeckImageRig::recorded(Path::new(rec))?;
+        if args.get(6).is_some_and(|arg| arg == "pages") {
+            for width_pt in [396.0, 1152.0] {
+                let case = DeckImageCase {
+                    form: "full",
+                    width_pt,
+                    scale: 2.0,
+                    theme: "dark",
+                };
+                for _ in 0..WARM {
+                    std::hint::black_box(rig.page_documents(case));
+                }
+                let mut readings: std::collections::BTreeMap<&str, Vec<f64>> =
+                    std::collections::BTreeMap::new();
+                for _ in 0..frames {
+                    for (name, wall_ns, _) in rig.page_documents(case) {
+                        readings.entry(name).or_default().push(us(wall_ns));
+                    }
+                }
+                for (name, values) in readings {
+                    println!(
+                        "{{\"kind\":\"page-document\",\"document\":\"{name}\",\"width_pt\":{width_pt},\"n\":{frames},{}}}",
+                        stat("layout_us", values),
+                    );
+                }
+            }
+            return Ok(());
+        }
         let cases = DeckImageCase::all();
         let mut summary = String::new();
         let _ = writeln!(

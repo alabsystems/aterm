@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 
 thread_local! {
     static CUSTODY: Cell<u64> = const { Cell::new(0) };
+    static TOWARD: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static BETWEEN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static STANDING: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static CARRIED: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
@@ -106,6 +107,17 @@ pub(crate) fn carried_read() {
 /// (`observed_bootstrap`).
 pub(crate) fn custody() {
     CUSTODY.with(|count| count.set(count.get() + 1));
+    let step = TOWARD.with(|slot| slot.borrow_mut().take());
+    if let Some(step) = step {
+        step();
+    }
+}
+
+/// Run `step` once, where this thread next starts toward custody ([`custody`]), before that
+/// open has waited for or read anything: a hold a test took ends exactly as a read turns to
+/// its table.
+pub(crate) fn toward_custody(step: impl FnOnce() + 'static) {
+    TOWARD.with(|slot| *slot.borrow_mut() = Some(Box::new(step)));
 }
 
 /// How often this thread has started toward custody.
@@ -148,6 +160,13 @@ pub(crate) fn owner() -> aterm_file::OwnerAct {
     )]
     let act = aterm_file::owner_act_for_test("person", None);
     act.expect("an owner act")
+}
+
+/// The guard the outbox holds a cell of a column of type `ty` to, as a write verb stamps each
+/// edit it queues, for a test outside `file` that queues an intent of a family no shared file
+/// of this build names yet.
+pub(crate) fn judged(ty: &crate::typed::Ty) -> aterm_file::outbox::Judged {
+    super::write::judged(ty)
 }
 
 /// What `aterm file set <name> <row> <column> [<value>]` would queue over `paths`, for a test

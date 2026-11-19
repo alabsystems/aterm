@@ -514,7 +514,7 @@ struct Sinks {
     external: Option<File>,
     retained: Option<Retained>,
     /// The lines written before the retained companion attached, the first [`EARLY_KEPT`]: what
-    /// a run said before its log opened (the judgment turn's wait, `crate::turn::take`), which
+    /// a run said before its log opened (the judgment turn's wait, `crate::turn::Prepared::take`), which
     /// [`EventLog::retain_early`] writes into the companion once its first record is there.
     early: Vec<String>,
 }

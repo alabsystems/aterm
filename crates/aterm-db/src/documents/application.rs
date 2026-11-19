@@ -4,11 +4,11 @@
 use crate::admission::deadline as admission_deadline;
 use crate::{
     Error, Result,
-    catalog::{Descriptor, Directory, State},
+    catalog::{Descriptor, Directory, Sighted, State},
     database::Command,
     table::{
         Scope, Session,
-        store::{Receipt, Store},
+        store::{Receipt, Sighting, Store},
     },
 };
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
@@ -245,25 +245,89 @@ pub(crate) fn observe_store_if_declared_within<T>(
 ) -> Result<Option<T>> {
     pass_current(read_by)?;
     let paths = crate::generation::observed_generation_until(paths, read_by)?;
-    observe_selected_if_declared(&paths, descriptor, read_by, wait, false, action)
+    observe_selected_if_declared(
+        &paths,
+        descriptor,
+        read_by,
+        wait,
+        false,
+        observed(read_by, false, action),
+    )
+}
+
+/// [`observe_store`] for a reader that holds a [`Sighting`] of the table from an earlier read
+/// here (tracker LT-25C): the same observation, whose table read answers `Unchanged`, having
+/// opened no record, where the table stands as that sighting's open read it, and otherwise the
+/// table read as [`observe_store`] reads it ([`Directory::observe_table_sighted`]).
+///
+/// The reader names its sighting once the read has its home: `sighting` is handed the home
+/// whose custody the session authenticated ([`Session::paths`]), which is `paths` or the
+/// successor a completed writer succession selected in its place, and answers the sighting it
+/// holds of the table at that home, or none. A sighting made of the table at `paths` before a
+/// succession is so never asked of the successor home's store.
+///
+/// # Errors
+/// As [`observe_store`].
+pub(crate) fn observe_store_sighted<'s, T>(
+    paths: &Paths,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    sighting: impl FnOnce(&Paths) -> Option<&'s Sighting>,
+    action: impl FnOnce(&Session<'_>, Sighted, Scope) -> Result<T>,
+) -> Result<T> {
+    let read_by = admission_deadline();
+    pass_current(read_by)?;
+    let paths = crate::generation::observed_generation_until(paths, read_by)?;
+    observe_selected_if_declared(
+        &paths,
+        descriptor,
+        read_by,
+        &|| read_by,
+        false,
+        |session, directory, scope| {
+            let read =
+                directory.observe_table_sighted(session, scope, sighting(session.paths()))?;
+            pass_current(read_by)?;
+            action(session, read, scope)
+        },
+    )?
+    .ok_or_else(|| Error::new("application table is not initialized"))
+}
+
+/// The declared table's read for [`observe_declared`]: the table observed as
+/// [`Directory::observe_table`] observes it, or where `held` as [`Directory::observe_held_table`]
+/// does, then `action` on it, refused past `deadline` before `action`.
+fn observed<T>(
+    deadline: std::time::Instant,
+    held: bool,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> impl FnOnce(&Session<'_>, &Directory, Scope) -> Result<T> {
+    move |session, directory, scope| {
+        let store = if held {
+            directory.observe_held_table(session, scope)?
+        } else {
+            directory.observe_table(session, scope)?
+        };
+        pass_current(deadline)?;
+        action(session, &store, scope)
+    }
 }
 
 /// [`observe_store_if_declared_within`] at `selected`, the home
 /// [`crate::generation::observed_generation_until`] named: its established custody opened, then
 /// its session ([`observed_session`]), then the declared table read ([`observe_declared`], which
-/// `held` is for).
+/// `held` and `read` are for).
 fn observe_selected_if_declared<T>(
     selected: &Paths,
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
     read_by: std::time::Instant,
     wait: &dyn Fn() -> std::time::Instant,
     held: bool,
-    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+    read: impl FnOnce(&Session<'_>, &Directory, Scope) -> Result<T>,
 ) -> Result<Option<T>> {
     let (bootstrap, journal) = Bootstrap::established_with_journal_until(selected, wait())
         .map_err(crate::table::failure)?;
     let session = observed_session(&bootstrap, journal, read_by, wait)?;
-    observe_declared(&session, descriptor(&bootstrap)?, read_by, held, action)
+    observe_declared(&session, descriptor(&bootstrap)?, read_by, held, read)
 }
 
 /// A read-only session of the selected home whose established custody is `bootstrap`, with its
@@ -320,21 +384,28 @@ pub(crate) fn observe_declared_in_session<T>(
     deadline: std::time::Instant,
     action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
 ) -> Result<Option<T>> {
-    observe_declared(session, descriptor, deadline, false, action)
+    observe_declared(
+        session,
+        descriptor,
+        deadline,
+        false,
+        observed(deadline, false, action),
+    )
 }
 
-/// The table `descriptor` declares, observed in `session` where its catalog retains that
-/// declaration. Where `held`, a catalog or declared table whose directory binding was lost to a
-/// relocation is answered from its witnessed prefix if `session`'s home is a fenced original
-/// whose selection record holds no completion and that holds no completion mark
-/// ([`Directory::observe_held_table`]); otherwise,
-/// and for every reader that does not ask, such a table refuses.
+/// The table `descriptor` declares, read by `read` in `session` where its catalog retains that
+/// declaration ([`observed`] observes it). Where `held`, the catalog is read as a held read
+/// reads it, and a catalog or declared table whose directory binding was lost to a relocation is
+/// answered from its witnessed prefix if `session`'s home is a fenced original whose selection
+/// record holds no completion and that holds no completion mark
+/// ([`Directory::observe_held_table`]); otherwise, and for every reader that does not ask, such a
+/// table refuses.
 fn observe_declared<T>(
     session: &Session<'_>,
     descriptor: Descriptor,
     deadline: std::time::Instant,
     held: bool,
-    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+    read: impl FnOnce(&Session<'_>, &Directory, Scope) -> Result<T>,
 ) -> Result<Option<T>> {
     pass_current(deadline)?;
     let directory = Directory::new(session.paths(), session.trust());
@@ -357,13 +428,7 @@ fn observe_declared<T>(
             "application table has an incompatible or unavailable descriptor",
         ));
     }
-    let store = if held {
-        directory.observe_held_table(session, descriptor.scope)?
-    } else {
-        directory.observe_table(session, descriptor.scope)?
-    };
-    pass_current(deadline)?;
-    action(session, &store, descriptor.scope).map(Some)
+    read(session, &directory, descriptor.scope).map(Some)
 }
 
 /// [`observe_store_if_declared`] on a Mac that may hold no Commons: `None` there too, as
@@ -396,7 +461,14 @@ pub(crate) fn observe_store_if_here<T>(
     if !commons_here(&selected)? {
         return Ok(None);
     }
-    observe_selected_if_declared(&selected, descriptor, deadline, &|| deadline, true, action)
+    observe_selected_if_declared(
+        &selected,
+        descriptor,
+        deadline,
+        &|| deadline,
+        true,
+        observed(deadline, true, action),
+    )
 }
 
 /// This Mac's lab and the catalog it holds, read as an observer that creates no table, catalog

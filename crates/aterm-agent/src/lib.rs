@@ -89,6 +89,10 @@ pub mod name_cli;
 pub mod service_activation;
 /// Bounded signed service repair over the native fleet Drive transport.
 pub mod service_repair_rpc;
+/// `aterm pkg unit-source`: the unit source a Full Access Mac's builds name to targo, and the
+/// fleet listener's answer to a member's ask for a shared dependency unit (DC-24b).
+#[cfg(unix)]
+pub mod unit_source;
 /// The notification a fleet verb run in this process posts for its state home.
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub use fleet_member::announced_here as fleet_access_announced_here;
@@ -432,7 +436,10 @@ fn is_read_request(line: &str) -> bool {
         Some("native-act") => words.next() == Some("info") && words.next().is_none(),
         Some("metrics") => {
             let mut command = words.filter(|w| !matches!(*w, "json" | "--json"));
-            matches!(command.next(), None | Some("percentiles")) && command.next().is_none()
+            matches!(
+                command.next(),
+                None | Some("percentiles" | "commons" | "cadence")
+            ) && command.next().is_none()
         }
         Some("doc") => matches!(words.next(), Some("ls" | "read" | "log")),
         Some(verb) => READ_VERBS.contains(&verb),

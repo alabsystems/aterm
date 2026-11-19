@@ -119,7 +119,9 @@ impl TransparentCommand {
     /// Capture a native exec's environment, C strings, executable search and platform objects
     /// before waiting for a grant. This neither executes nor holds a spawn lock.
     ///
-    /// A bare program name is resolved now; a later PATH change cannot select another image.
+    /// A bare program name is resolved now; a later PATH change cannot select another image. On
+    /// Darwin a `#!` file's line is read now too: its interpreter is what the dispatch execs, and
+    /// a line the kernel refuses fails the dispatch with the kernel's `ENOEXEC`.
     /// Relative paths still require the caller to keep its working directory unchanged.
     ///
     /// # Errors

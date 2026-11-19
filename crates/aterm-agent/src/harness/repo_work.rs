@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a session's repository holds that no remote main has, and its hygiene for the fact
-//! menus.
+//! A session's work from local Git observations, and its repository hygiene for the fact menus.
 
 use std::cell::Cell;
 use std::path::{Component, Path, PathBuf};
@@ -33,7 +32,7 @@ pub const STATE_FILES: usize = 4096;
 
 pub(crate) const PATH_CHARS: usize = 72;
 
-/// What one repository holds that no remote main has ([`probe`]).
+/// What local Git observations found in one repository ([`probe`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoWork {
     /// The repository's top-level directory, as `git rev-parse --show-toplevel` names it.
@@ -45,12 +44,13 @@ pub struct RepoWork {
     pub untracked: usize,
     /// Stash entries.
     pub stashes: usize,
-    /// Commits on `HEAD` no remote-tracking ref or verified Cargo source baseline contains.
+    /// Commits on `HEAD` not covered by cached remote refs, a verified Cargo source baseline,
+    /// or validated commit tips recorded as fetched from a configured remote.
     pub unpushed: usize,
-    /// Commits on `HEAD` beyond a verified Cargo source baseline that the remote's default
-    /// branch ([`Self::main_ref`]) does not contain.
+    /// Commits on `HEAD` beyond a verified Cargo source baseline that the cached remote default
+    /// branch ([`Self::main_ref`]) does not contain; no fresh remote read is implied.
     pub unlanded: usize,
-    /// The remote default branch [`Self::unlanded`] counts against.
+    /// The cached remote default branch [`Self::unlanded`] counts against.
     pub main_ref: String,
     /// Commits a populated submodule's checkout, or the commit recorded for it, holds that no
     /// remote of the submodule has, at every level of submodules: a pushed record of one nobody
@@ -173,11 +173,11 @@ impl RepoWork {
         }
         if self.unlanded > 0 {
             tail.push(format!(
-                "{} commit{} not on {}",
+                "{} commit{} not on cached {}",
                 self.unlanded,
                 if self.unlanded == 1 { "" } else { "s" },
                 if self.main_ref.is_empty() {
-                    "the remote main"
+                    "remote main"
                 } else {
                     &self.main_ref
                 }
@@ -190,9 +190,9 @@ impl RepoWork {
                 if self.parked == 1 { "" } else { "s" },
                 self.parked_on.join(", "),
                 if self.main_ref.is_empty() {
-                    "any remote"
+                    "any remote".to_owned()
                 } else {
-                    &self.main_ref
+                    format!("cached {}", self.main_ref)
                 }
             ));
         }
@@ -1208,13 +1208,7 @@ fn repo_reads(
             .filter(|entry| entry.trim_end_matches('\0') != "?? .cargo-ok")
             .collect();
     }
-    let pushed = remote.then(|| {
-        let mut args = vec!["rev-list", "--count", "HEAD", "--not", "--remotes"];
-        if let Some(source) = source.as_deref() {
-            args.push(source);
-        }
-        git_count(&root, &args, reads).and_then(|n| crate::parse_uint(n.trim()))
-    });
+    let pushed = remote.then(|| unpublished_count(&root, source.as_deref(), reads));
     let unpushed = pushed.flatten().unwrap_or(0);
     let main = main_ref(&root, reads);
     let landed = main.as_ref().map(|full| {
@@ -1318,6 +1312,31 @@ fn repo_reads(
             }
         });
     Some(RepoRead::Found(work))
+}
+
+/// Commits not covered by locally recorded publication roots. Fetched tips prove publication
+/// only: they never participate in the separate cached default-branch comparison.
+fn unpublished_count(root: &Path, source: Option<&str>, reads: &Reads<'_>) -> Option<usize> {
+    let mut args = vec!["rev-list", "--count", "HEAD", "--not", "--remotes"];
+    if let Some(source) = source {
+        args.push(source);
+    }
+    let count =
+        git_offline_count(root, &args, reads).and_then(|n| crate::parse_uint::<usize>(n.trim()));
+    let count = match count {
+        Some(count) => count,
+        None if !reads.cut.get() && branch_unborn(root, reads) => return Some(0),
+        None => return None,
+    };
+    if count == 0 {
+        return Some(0);
+    }
+    let fetched = remote_fetch_heads(root, reads)?;
+    if fetched.is_empty() {
+        return Some(count);
+    }
+    args.extend(fetched.iter().map(String::as_str));
+    git_offline_count(root, &args, reads).and_then(|n| crate::parse_uint(n.trim()))
 }
 
 /// The fetched source of a Cargo-managed `git/checkouts/<package>/<short-sha>` snapshot.
@@ -2100,25 +2119,27 @@ fn submodule_records(
     )
 }
 
-fn open_git_file(path: &Path) -> Option<(std::fs::File, std::fs::Metadata)> {
+fn open_git_file(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-            .ok()?
+            .open(path)?
     };
     #[cfg(not(unix))]
     let file = {
-        if !std::fs::symlink_metadata(path).ok()?.is_file() {
-            return None;
+        if !std::fs::symlink_metadata(path)?.is_file() {
+            return Err(std::io::ErrorKind::InvalidData.into());
         }
-        std::fs::File::open(path).ok()?
+        std::fs::File::open(path)?
     };
-    let meta = file.metadata().ok()?;
-    meta.is_file().then_some((file, meta))
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok((file, meta))
 }
 
 /// The boundary commits of the shallow clone at `dir` (its `shallow` file, the first
@@ -2128,7 +2149,7 @@ fn open_git_file(path: &Path) -> Option<(std::fs::File, std::fs::Metadata)> {
 fn shallow_roots(dir: &Path, reads: &Reads<'_>) -> Option<std::collections::HashSet<String>> {
     let at = git_offline(dir, &["rev-parse", "--git-path", "shallow"], reads, None)?;
     let mut text = String::new();
-    if let Some((file, meta)) = open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) {
+    if let Ok((file, meta)) = open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) {
         text.reserve(
             usize::try_from(meta.len().min(SHALLOW_BYTES))
                 .unwrap_or(0)
@@ -2146,47 +2167,58 @@ fn shallow_roots(dir: &Path, reads: &Reads<'_>) -> Option<std::collections::Hash
     )
 }
 
-/// The commits `FETCH_HEAD` at `dir` (its first [`FETCH_HEAD_BYTES`]) records as fetched from one
-/// of `dir`'s configured remotes, resolved to present commit objects ([`commits_available`]) and
-/// capped at [`FETCH_HEAD_COMMITS`]. `git submodule update --depth N` (`N > 1`) at a commit no
-/// remote-tracking ref reaches writes the fetched tip here rather than to `refs/remotes/*`, while
-/// `shallow` holds only the boundary `N - 1` commits below it. `None` where a read is refused or
-/// cut.
+/// The present commit tips a complete bounded `FETCH_HEAD` records as fetched from configured
+/// remotes. These are publication observations, not default-branch provenance. A missing optional
+/// file adds no root; a refused, malformed, changing or capped read is unknown.
 fn remote_fetch_heads(dir: &Path, reads: &Reads<'_>) -> Option<Vec<String>> {
-    let at = git_offline(dir, &["rev-parse", "--git-path", "FETCH_HEAD"], reads, None)?;
-    let Some((file, meta)) = open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) else {
-        return Some(Vec::new());
+    let at = git_offline_count(dir, &["rev-parse", "--git-path", "FETCH_HEAD"], reads)?;
+    let (mut file, meta) = match open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
     };
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(meta.len().min(FETCH_HEAD_BYTES))
-            .unwrap_or(0)
-            .saturating_add(1),
-    );
-    let _ =
-        std::io::Read::read_to_end(&mut std::io::Read::take(file, FETCH_HEAD_BYTES), &mut bytes);
-    let text = String::from_utf8_lossy(&bytes);
-    if text.trim().is_empty() {
+    if meta.len() > FETCH_HEAD_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).ok()?.saturating_add(1));
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&mut file, FETCH_HEAD_BYTES + 1),
+        &mut bytes,
+    )
+    .ok()?;
+    let after = file.metadata().ok()?;
+    let len = u64::try_from(bytes.len()).ok()?;
+    if len > FETCH_HEAD_BYTES
+        || len != meta.len()
+        || len != after.len()
+        || meta.modified().ok()? != after.modified().ok()?
+    {
+        return None;
+    }
+    if bytes.is_empty() {
         return Some(Vec::new());
     }
+    if !bytes.ends_with(b"\n") {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
     let remotes = git_offline_count(dir, &["remote"], reads)?;
-    let mut urls: Vec<String> = Vec::new();
-    for remote in remotes
+    let remotes: Vec<_> = remotes
         .lines()
         .map(str::trim)
         .filter(|r| !r.is_empty())
-        .take(FETCH_REMOTES)
-    {
-        if let Some(configured) =
-            git_offline(dir, &["remote", "get-url", "--all", remote], reads, None)
-        {
-            for raw in configured.lines().map(str::trim).filter(|u| !u.is_empty()) {
-                let display = fetch_head_display_url(raw);
-                if !display.is_empty() && !urls.contains(&display) {
-                    urls.push(display);
-                }
+        .collect();
+    if remotes.len() > FETCH_REMOTES {
+        return None;
+    }
+    let mut urls: Vec<String> = Vec::new();
+    for remote in remotes {
+        let configured = git_offline_count(dir, &["remote", "get-url", "--all", remote], reads)?;
+        for raw in configured.lines().map(str::trim).filter(|u| !u.is_empty()) {
+            let display = fetch_head_display_url(raw);
+            if !display.is_empty() && !urls.contains(&display) {
+                urls.push(display);
             }
-        } else if reads.cut.get() {
-            return None;
         }
     }
     if urls.is_empty() {
@@ -2194,23 +2226,19 @@ fn remote_fetch_heads(dir: &Path, reads: &Reads<'_>) -> Option<Vec<String>> {
     }
     let mut shas: Vec<String> = Vec::new();
     for line in text.lines() {
-        if shas.len() >= FETCH_HEAD_COMMITS {
-            break;
-        }
-        let Some((sha, rest)) = line.split_once('\t') else {
-            continue;
-        };
-        let Some((merge, note)) = rest.split_once('\t') else {
-            continue;
-        };
+        let (sha, rest) = line.split_once('\t')?;
+        let (merge, note) = rest.split_once('\t')?;
         if !is_head(sha) || !matches!(merge, "" | "not-for-merge") {
-            continue;
+            return None;
         }
         let note = note.trim_end_matches('\r');
         let from_remote = urls
             .iter()
-            .any(|u| note == u || note.ends_with(&format!("' of {u}")));
+            .any(|url| note == url || note.ends_with(&format!("' of {url}")));
         if from_remote && !shas.iter().any(|s| s == sha) {
+            if shas.len() >= FETCH_HEAD_COMMITS {
+                return None;
+            }
             shas.push(sha.to_string());
         }
     }
@@ -2531,7 +2559,7 @@ pub fn probe_hygiene(dir: &Path, home: Option<&Path>, limit: Duration) -> Option
     .unwrap_or_default();
     let stash = git(&root, &["stash", "list", "--format=%gs"], reads).unwrap_or_default();
     let stash = stashes_on(&stash, branch.as_deref());
-    let remotes = git(
+    let remotes = git_offline_count(
         &root,
         &[
             "for-each-ref",
@@ -2540,18 +2568,16 @@ pub fn probe_hygiene(dir: &Path, home: Option<&Path>, limit: Duration) -> Option
             "refs/remotes",
         ],
         reads,
-    )
-    .unwrap_or_default();
-    let unpushed = if remotes.trim().is_empty() {
-        0
+    )?;
+    let configured = git_offline_count(&root, &["remote"], reads)?;
+    let remote = !remotes.trim().is_empty() || !configured.trim().is_empty();
+    let source = remote
+        .then(|| cargo_source_baseline(&root, &table, reads))
+        .flatten();
+    let unpushed = if remote {
+        unpublished_count(&root, source.as_deref(), reads)?
     } else {
-        git(
-            &root,
-            &["rev-list", "--count", "HEAD", "--not", "--remotes"],
-            reads,
-        )
-        .and_then(|n| crate::parse_uint(n.trim()))
-        .unwrap_or(0)
+        0
     };
     let (worktree_bytes, temp_bytes) = probe_hygiene_disk(&root, &worktree_list, &table, reads);
     // Last, so its reads, which share the one deadline, starve none of the others: one that runs
@@ -2845,7 +2871,7 @@ fn reflog_tail(path: &Path) -> Option<std::fs::File> {
 /// [`reflog_tail`] together with the remaining byte count from the seek offset.
 fn reflog_tail_with_rem(path: &Path) -> Option<(std::fs::File, u64)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let (mut file, meta) = open_git_file(path)?;
+    let (mut file, meta) = open_git_file(path).ok()?;
     let len = meta.len();
     let mut start = len.saturating_sub(LAG_REFLOG);
     if start > 0 {

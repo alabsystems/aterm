@@ -653,3 +653,28 @@ fn headers_and_urls_with_line_breaks_or_nuls_are_refused_before_spawning_curl() 
         assert!(head_size(bad_url, &[]).is_none());
     }
 }
+
+#[test]
+fn a_unit_test_fetches_only_local_urls() {
+    for local in [
+        "file:///tmp/x.json",
+        "http://127.0.0.1:8080/api/formula.json",
+        "http://localhost/x",
+        "http://[::1]:9/x",
+        "https://someone@127.0.0.1/x",
+    ] {
+        assert_eq!(refused(local), None, "{local}");
+    }
+    for remote in [
+        "https://formulae.brew.sh/api/formula.json",
+        "https://ghcr.io/v2/homebrew/core/wget/blobs/sha256:abc",
+        "https://127.0.0.1.example.com/x",
+        "http://example.invalid/?h=127.0.0.1",
+    ] {
+        assert!(refused(remote).is_some(), "{remote}");
+    }
+    let error = curl_get_with_status("https://formulae.brew.sh/api/formula/none.json", &[])
+        .expect_err("a unit test reaches no remote host");
+    assert!(!error.is_not_found(), "a refused fetch is no 404");
+    assert!(head_size("https://formulae.brew.sh/api/formula.json", &[]).is_none());
+}

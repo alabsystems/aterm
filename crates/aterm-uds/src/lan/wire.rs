@@ -6,8 +6,8 @@
 //!
 //! A connection carries a hello each way ([`Frame::Hello`]: the protocol and the build), then the
 //! client's one [`Request`], then the broker's answer: a [`Frame::Socket`] carrying the made
-//! socket as its one passed descriptor, [`Frame::Addresses`], a stream of [`Frame::Event`]s until
-//! either side closes, or a [`Frame::Error`]. A broker that refuses the client's code sends
+//! socket as its one passed descriptor, [`Frame::Addresses`], [`Frame::SpotlightStores`], a
+//! stream of [`Frame::Event`]s until either side closes, or a [`Frame::Error`]. A broker that refuses the client's code sends
 //! [`Frame::Refused`] instead of its hello, and one that did not judge it [`Frame::Unchecked`]. A
 //! frame is a big-endian `u32` body length (at most [`MAX_FRAME`]) and the body: a tag byte and
 //! the frame's fields.
@@ -126,6 +126,52 @@ pub enum Request {
     },
     /// A Bonjour advert, for as long as the connection lasts.
     Register(Advert),
+    /// The size of Spotlight's store on each mounted local volume, as the broker last walked it
+    /// (SD-94): read-only, and it carries nothing, so no client names a path the broker reads.
+    SpotlightStore,
+    /// Consider the bundle this process runs from for adoption: no fields, as the broker reads
+    /// who asks from the kernel (the asking process's uid, the code it loaded and its path), never
+    /// from the request. The broker answers nothing and closes. A broker of a wire that predates
+    /// it reads the unknown tag as malformed and closes too, so the client reads no answer either
+    /// way (`super::install::consider_for`). Tag 18; the next request takes 19.
+    Consider,
+}
+
+/// How a walk of one volume's Spotlight store stopped short of the whole store: its figures are
+/// then only what it counted, a lower bound, never a whole answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreBound {
+    /// The walk reached its most entries.
+    Entries,
+    /// The walk reached its longest time.
+    Time,
+    /// A folder or entry in the store could not be read, or a folder lay deeper than the walk
+    /// enters (one that went away or was replaced mid-walk is not this).
+    Unreadable,
+}
+
+/// One volume's Spotlight store, as one walk of it counted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreVolume {
+    /// The volume's mount point (`/System/Volumes/Data`).
+    pub volume: String,
+    /// The store's size on disk: every entry's allocated blocks, bytes.
+    pub bytes: u64,
+    /// The entries counted, the store's own folder included.
+    pub entries: u64,
+    /// Where the walk stopped short, `None` for the whole store.
+    pub partial: Option<StoreBound>,
+}
+
+/// Spotlight's stores as the broker last walked them ([`Request::SpotlightStore`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpotlightStores {
+    /// How long ago the walk ended, ms: the broker keeps one walk's answer between walks.
+    pub age_ms: u64,
+    /// How long the walk took, ms.
+    pub walk_ms: u64,
+    /// Each local volume that has a store, in mount order.
+    pub volumes: Vec<StoreVolume>,
 }
 
 /// One service instance a browse heard.
@@ -215,6 +261,8 @@ pub enum Frame {
     },
     /// A resolution's addresses.
     Addresses(Vec<IpAddr>),
+    /// The answer to [`Request::SpotlightStore`].
+    SpotlightStores(SpotlightStores),
     /// What a Bonjour request heard.
     Event(Event),
     /// The request failed: an `errno` (a socket request's) or a DNS-SD error code (a Bonjour
@@ -237,10 +285,13 @@ const BROWSE: u8 = 13;
 const RESOLVE_SERVICE: u8 = 14;
 const QUERY: u8 = 15;
 const REGISTER: u8 = 16;
+const SPOTLIGHT_STORE: u8 = 17;
+const CONSIDER: u8 = 18;
 const SOCKET: u8 = 30;
 const ADDRESSES: u8 = 31;
 const EVENT: u8 = 32;
 const ERROR: u8 = 33;
+const SPOTLIGHT_STORES: u8 = 34;
 
 const ADDED: u8 = 1;
 const REMOVED: u8 = 2;
@@ -250,6 +301,11 @@ const REGISTERED: u8 = 5;
 
 const HOST: u8 = 1;
 const ADDR: u8 = 2;
+
+const WHOLE: u8 = 0;
+const BOUND_ENTRIES: u8 = 1;
+const BOUND_TIME: u8 = 2;
+const BOUND_UNREADABLE: u8 = 3;
 
 fn invalid(what: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.into())
@@ -285,6 +341,9 @@ impl<B: WireBuffer> Out<B> {
         self.0.put(&value.to_be_bytes());
     }
     fn i32(&mut self, value: i32) {
+        self.0.put(&value.to_be_bytes());
+    }
+    fn u64(&mut self, value: u64) {
         self.0.put(&value.to_be_bytes());
     }
     fn bool(&mut self, value: bool) {
@@ -386,6 +445,9 @@ impl<'a, const OWN: bool> In<'a, OWN> {
     }
     fn i32(&mut self) -> io::Result<i32> {
         Ok(i32::from_be_bytes(self.array()?))
+    }
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_be_bytes(self.array()?))
     }
     fn bool(&mut self) -> io::Result<bool> {
         match self.u8()? {
@@ -550,6 +612,23 @@ fn frame_body<B: WireBuffer>(out: &mut Out<B>, frame: &Frame) {
                 out.ip(*addr);
             }
         }
+        Frame::SpotlightStores(stores) => {
+            out.u8(SPOTLIGHT_STORES);
+            out.u64(stores.age_ms);
+            out.u64(stores.walk_ms);
+            out.count(stores.volumes.len());
+            for volume in &stores.volumes {
+                out.text(&volume.volume);
+                out.u64(volume.bytes);
+                out.u64(volume.entries);
+                out.u8(match volume.partial {
+                    None => WHOLE,
+                    Some(StoreBound::Entries) => BOUND_ENTRIES,
+                    Some(StoreBound::Time) => BOUND_TIME,
+                    Some(StoreBound::Unreadable) => BOUND_UNREADABLE,
+                });
+            }
+        }
         Frame::Event(event) => event_body(out, event),
         Frame::Error { code, words } => {
             out.u8(ERROR);
@@ -643,6 +722,8 @@ fn request_body<B: WireBuffer>(out: &mut Out<B>, request: &Request) {
                 out.ip(*addr);
             }
         }
+        Request::SpotlightStore => out.u8(SPOTLIGHT_STORE),
+        Request::Consider => out.u8(CONSIDER),
     }
 }
 
@@ -776,6 +857,34 @@ fn decode_by<const OWN: bool>(body: &[u8]) -> io::Result<Frame> {
             reached: at.bool()?.then(|| at.sockaddr()).transpose()?,
         },
         ADDRESSES => Frame::Addresses(at.ips()?),
+        SPOTLIGHT_STORE => Frame::Request(Request::SpotlightStore),
+        CONSIDER => Frame::Request(Request::Consider),
+        SPOTLIGHT_STORES => {
+            let age_ms = at.u64()?;
+            let walk_ms = at.u64()?;
+            let n = at.count(MAX_ITEMS)?;
+            let volumes = at.items(n, |at| {
+                Ok(StoreVolume {
+                    volume: at.text()?,
+                    bytes: at.u64()?,
+                    entries: at.u64()?,
+                    partial: match at.u8()? {
+                        WHOLE => None,
+                        BOUND_ENTRIES => Some(StoreBound::Entries),
+                        BOUND_TIME => Some(StoreBound::Time),
+                        BOUND_UNREADABLE => Some(StoreBound::Unreadable),
+                        other => {
+                            return Err(invalid(format!("a broker store bound of kind {other}")));
+                        }
+                    },
+                })
+            })?;
+            Frame::SpotlightStores(SpotlightStores {
+                age_ms,
+                walk_ms,
+                volumes,
+            })
+        }
         EVENT => Frame::Event(match at.u8()? {
             ADDED => Event::Added(at.instance()?),
             REMOVED => Event::Removed(at.instance()?),

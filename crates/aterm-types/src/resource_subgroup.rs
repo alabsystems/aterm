@@ -37,9 +37,8 @@ pub fn hello(job: &Binding) -> io::Result<Vec<u8>> {
             ]
         })
         .collect::<String>();
-    // Binding validation limits session to a tab ID (`t` and lower-case base32, or `s-` and
-    // lower-case hex), so neither string can contain JSON escapes or inject additional routing
-    // fields.
+    // Binding validation limits session to an exact local tab ID in either minted form,
+    // so it cannot contain JSON escapes or inject additional routing fields.
     Ok(format!(
         "{{\"version\":3,\"role\":\"member\",\"session\":\"{}\",\"attempt\":\"{attempt}\"}}",
         job.session

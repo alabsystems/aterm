@@ -73,7 +73,8 @@ pub fn open_broker_unretained(log: impl AsRef<Path>, opts: &OpenOptions) -> Brok
 
 /// The fleet every test runs in.
 pub const FLEET: &str = "f1";
-/// The ceiling on every wait.
+/// The hang detector's window: how long what a test started may make no progress before a wait
+/// on it is named hung ([`crate::patience::Patience`]), or the budget of a wall-clock wait.
 pub const DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// How long a test's bridge reads a broker subscription with nothing arriving before it takes
@@ -102,12 +103,21 @@ fn assert_sock_fits(sock: &str) {
     );
 }
 
-/// Wait until `f` answers `Some`, or fail with `what`.
+/// Wait until `f` answers `Some`, for as long as what this test binary started makes progress
+/// ([`crate::patience::until`] over [`DEADLINE`]), or fail with `what`.
+#[track_caller]
 pub fn until<T>(what: &str, f: impl FnMut() -> Option<T>) -> T {
-    until_within(DEADLINE, what, f)
+    match crate::patience::until(DEADLINE, Duration::from_millis(10), f) {
+        Ok(value) => value,
+        Err(why) => panic!("{why} while waiting for: {what}"),
+    }
 }
 
 /// [`until`] with a stated budget, for an observable with a period of its own.
+#[allow(
+    unused_imports,
+    reason = "the fabric measurement mounts this harness and calls no budgeted wait"
+)]
 pub use aterm_spec::wait::until_within;
 
 /// A copy of `/bin/bash`, signed ad hoc ([`aterm_uds::deadline::ad_hoc_copy`]), named `name` in
@@ -631,9 +641,10 @@ fn line_to(pid: i32, ancestor: u32) -> Option<Vec<u32>> {
     None
 }
 
-/// Waits up to [`DEADLINE`] for each watched exit, noting in `failures` each one unconfirmed.
+/// Waits for each watched exit while a [`crate::patience::Patience`] over [`DEADLINE`] lasts,
+/// noting in `failures` each one unconfirmed.
 fn await_exits(mut watches: Vec<(i32, std::os::fd::OwnedFd)>, failures: &mut Vec<String>) {
-    let end = Instant::now() + DEADLINE;
+    let mut patience = crate::patience::Patience::new(DEADLINE);
     while !watches.is_empty() {
         let mut pending = Vec::new();
         for (pid, fd) in watches {
@@ -647,9 +658,9 @@ fn await_exits(mut watches: Vec<(i32, std::os::fd::OwnedFd)>, failures: &mut Vec
         if watches.is_empty() {
             break;
         }
-        if Instant::now() >= end {
+        if let Some(why) = patience.spent() {
             failures.push(format!(
-                "child exits unconfirmed: {:?}",
+                "child exits unconfirmed ({why}): {:?}",
                 watches.iter().map(|(pid, _)| pid).collect::<Vec<_>>()
             ));
             break;
@@ -707,7 +718,7 @@ fn exited(fd: &std::os::fd::OwnedFd) -> Result<bool, String> {
 fn end_owned_child(child: &mut OwnedChild) -> Result<(), String> {
     let mut killed = false;
     for phase in 0..2 {
-        let end = Instant::now() + DEADLINE;
+        let mut patience = crate::patience::Patience::new(DEADLINE);
         let mut exit = aterm_uds::deadline::ExitWait::new(child);
         loop {
             if let Some(status) = child
@@ -720,11 +731,10 @@ fn end_owned_child(child: &mut OwnedChild) -> Result<(), String> {
                     Err(format!("instance did not finish a graceful quit: {status}"))
                 };
             }
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if patience.spent().is_some() {
                 break;
             }
-            exit.wait(left);
+            exit.wait(Duration::from_millis(100));
         }
         if phase == 0 {
             child

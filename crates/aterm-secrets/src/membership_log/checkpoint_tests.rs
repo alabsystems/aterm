@@ -58,8 +58,11 @@ impl Mac {
 /// A log founded by `macs`, its genesis authored at 1 ms.
 pub(in crate::membership_log) fn found(macs: &[Mac]) -> Log {
     let founders = macs.iter().map(|m| m.entrant()).collect();
-    Log::new(Record::found(&[99; 32], founders, 1).unwrap()).unwrap()
+    Log::new(Record::found(&FOUNDER, founders, 1).unwrap()).unwrap()
 }
+
+/// The seed whose key signs every genesis [`found`] makes.
+pub(in crate::membership_log) const FOUNDER: [u8; 32] = [99; 32];
 
 /// Hold `record` in `log`, and hand it back.
 pub(in crate::membership_log) fn hold(log: &mut Log, record: Record) -> Record {

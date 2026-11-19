@@ -196,6 +196,25 @@ impl Segment {
 }
 
 impl Outbox {
+    /// A fault may suppress one status only if none of it has been written or
+    /// combined with another reply or handoff.
+    #[cfg(all(unix, debug_assertions))]
+    pub(super) fn fixture_unsent_status(&self) -> Option<&[u8]> {
+        if self.sent != 0
+            || self.segments.len() != 1
+            || self.then_close
+            || self.written.is_some()
+            || self.handoff.is_some()
+            || self.final_reply.is_some()
+        {
+            return None;
+        }
+        let Segment::Bytes(bytes) = self.segments.front()? else {
+            return None;
+        };
+        Some(bytes)
+    }
+
     /// The explicit Rust-only host fixture records a decision, never reply data
     /// (native replies may contain operation capabilities).
     #[cfg(all(unix, debug_assertions))]
@@ -505,7 +524,7 @@ impl Outbox {
     }
 
     fn deadline(&self) -> Option<Instant> {
-        self.handoff.as_ref().map(PendingHandoff::deadline)
+        self.handoff.as_ref().and_then(PendingHandoff::deadline)
     }
 
     const fn awaiting_ack(&self) -> bool {
@@ -532,7 +551,9 @@ impl Outbox {
         self.then_close = true;
         match self.handoff.take() {
             Some(PendingHandoff::Acknowledged(ack)) if acknowledged => {
-                ack.acknowledged(stream);
+                if let Some(released) = ack.acknowledged(stream) {
+                    self.push_owned(released.into_bytes());
+                }
                 ArtifactAckOutcome::PeerAcknowledged
             }
             handoff => {
@@ -660,7 +681,11 @@ impl Outbox {
             return Ok(None);
         }
         let acknowledged = super::read_ack_until(stream, reader, &ack.nonce, ack.deadline);
-        Ok(Some(self.settle(acknowledged, stream)))
+        let verdict = self.settle(acknowledged, stream);
+        if self.owed() {
+            self.deliver(stream, false)?;
+        }
+        Ok(Some(verdict))
     }
 
     /// The nonce a guarded answer's challenge carries.
@@ -2171,7 +2196,11 @@ impl Lanes {
                 }
             }
             if reply.then_close {
-                return Here::Closed;
+                return if reply.owed() {
+                    Here::Idle
+                } else {
+                    Here::Closed
+                };
             }
             let request = match pending.take() {
                 Some(request) => request,
@@ -2757,7 +2786,11 @@ impl Conn {
                 match self.reply.ack_verdict(self.carry.as_slice(), false) {
                     Some(acknowledged) => {
                         self.reply.settle(acknowledged, &self.stream);
-                        Step::Close
+                        if self.reply.owed() {
+                            Step::Stay
+                        } else {
+                            Step::Close
+                        }
                     }
                     None => Step::Stay,
                 }
@@ -2789,7 +2822,11 @@ impl Conn {
             Gathered::Broken => None,
         };
         self.reply.settle(acknowledged == Some(true), &self.stream);
-        Step::Close
+        if self.reply.owed() {
+            Step::Stay
+        } else {
+            Step::Close
+        }
     }
 
     fn gather_parked(&mut self) -> Step {

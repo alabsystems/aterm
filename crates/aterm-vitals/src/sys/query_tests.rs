@@ -37,6 +37,89 @@ fn every_view_word_parses_with_its_options() {
 }
 
 #[test]
+fn sys_groups_parses_scopes_without_granting_caller_or_instance_authority() {
+    for text in [
+        "groups",
+        "groups scope=global",
+        "scope=aterm groups top=3 --json caller=s-advisory",
+    ] {
+        let q = SysQuery::parse(text).unwrap();
+        assert_eq!(q.view, View::Groups);
+        assert!(
+            q.target_rows_only(),
+            "the renderer must intersect authenticated caller keys: {text}"
+        );
+    }
+    assert_eq!(
+        SysQuery::parse("groups").unwrap().effective_scope(),
+        Some(ScopeArg::Global)
+    );
+    for text in [
+        "groups instances=all",
+        "groups depth=2",
+        "groups held",
+        "groups procs",
+    ] {
+        assert_eq!(SysQuery::parse(text), Err(USAGE), "{text}");
+    }
+}
+
+#[test]
+fn history_selects_unique_machine_rows_and_existing_bands_without_new_geometry() {
+    let q = SysQuery::parse("history cpu memory net res=10s --json").unwrap();
+    assert_eq!(q.view, View::History);
+    assert_eq!(
+        q.history_rows,
+        [Resource::Cpu, Resource::Memory, Resource::Network]
+    );
+    assert_eq!(q.history_res, Some(HistoryResolution::TenSeconds));
+    assert_eq!(q.history_res.unwrap().period_ms(), 10_000);
+    assert!(q.target_rows_only());
+    assert_eq!(q.effective_scope(), None);
+    assert!(SysQuery::parse("history").unwrap().history_rows.is_empty());
+    for (word, ms) in [
+        ("1s", 1000),
+        ("10s", 10_000),
+        ("1m", 60_000),
+        ("10m", 600_000),
+        ("1h", 3_600_000),
+    ] {
+        let q = SysQuery::parse(&format!("history res={word}")).unwrap();
+        assert_eq!(q.history_res.unwrap().period_ms(), ms);
+    }
+    assert_eq!(
+        SysQuery::parse("history cpu gpu mem disk net tokens procs")
+            .unwrap()
+            .history_rows
+            .len(),
+        7
+    );
+    for bad in [
+        "history cpu cpu",
+        "history mem memory",
+        "history nope",
+        "history res=5s",
+        "history res=1s res=1m",
+        "history scope=tab",
+        "history top=1",
+        "history depth=1",
+        "history instances=all",
+        "history since=7.8",
+        "events cpu",
+        "events res=1s",
+        "events top=1",
+        "events scope=tab",
+        "procs res=1s",
+    ] {
+        assert_eq!(SysQuery::parse(bad), Err(USAGE), "{bad}");
+    }
+    let events = SysQuery::parse("events since=7.8 --json").unwrap();
+    assert_eq!(events.view, View::Events);
+    assert!(events.target_rows_only());
+    assert_eq!(events.since, Some(Cursor { epoch: 7, seq: 8 }));
+}
+
+#[test]
 fn boot_reads_bounded_saved_aggregates_without_scope_or_instance_escalation() {
     let query = SysQuery::parse("boot top=3 fresh=0 since=7f3a.2 caller=s-origin --json").unwrap();
     assert_eq!(query.view, View::Boot);

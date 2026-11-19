@@ -80,11 +80,25 @@ fn pinned(macs: &TwoMacs, name: &str) -> Paths {
 /// check before possession (`checks_first`) or going straight to its decision.
 #[cfg(unix)]
 fn proof(
+    member: (&Paths, Local),
+    joiner: &Paths,
+    pair: &Ed25519KeyPair,
+    from: IpAddr,
+    desk: (bool, bool),
+) -> std::result::Result<Joined, Missed> {
+    let dials = std::sync::atomic::AtomicUsize::new(0);
+    proof_dialing(member, joiner, pair, from, desk, &dials)
+}
+
+/// [`proof`], counting in `dials` each connection the joiner opens to the member.
+#[cfg(unix)]
+fn proof_dialing(
     (member, local): (&Paths, Local),
     joiner: &Paths,
     pair: &Ed25519KeyPair,
     from: IpAddr,
     (live, checks_first): (bool, bool),
+    dials: &std::sync::atomic::AtomicUsize,
 ) -> std::result::Result<Joined, Missed> {
     let desk = Mutex::new(Desk::new(local));
     let device = crate::commons::bootstrap::Device::open(joiner)
@@ -107,6 +121,7 @@ fn proof(
     let now = aterm_time::unix_millis().unwrap();
     std::thread::scope(|scope| {
         let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
+            dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
             for end in [&ours, &theirs] {
                 end.set_read_timeout(Some(Duration::from_secs(60)))?;
@@ -408,4 +423,121 @@ fn a_member_whose_vault_is_read_from_a_path_signs_nothing_for_a_phrase_run() {
         before,
         "the path member keeps no Admit for a Mac it handed nothing"
     );
+}
+
+/// A Mac proves itself into a format-2 vault, asking twice (tracker FL-148E2,
+/// `crate::membership_log::follow`). The member, whose format mark is stored, refuses the proof
+/// that states format 1 before its possession challenge, naming its format (`NO later=2`), and
+/// signs nothing. A Mac whose build reads format 2 proves itself to the member once more,
+/// stating format 2, is handed the member's log, and on the member's signed version-2 record
+/// in it stores its own mark before its configuration and records. A Mac whose build reads no
+/// format 2 proves itself once, fails with the member's reason, and holds no mark; no member
+/// may have signed for it.
+///
+/// NEGATIVE CONTROLS, each a change to the code run against this test and seen to fail:
+/// - `desk::later_refused` answering `None` (a plain `NO`, as before this fix): ``the proof
+///   lets in a Mac that reads format 2``, the member's format reason, the Mac having asked
+///   once.
+/// - `join::prove_first_with` running one round whatever a member answered: the same failure.
+/// - `client::later_records_bound` not asking [`crate::crossing::FormatMark::follows`] (every
+///   Mac proves itself again): the dark Mac's proof no longer ends with the member's reason
+///   and nothing signed, ``assertion failed: missed.refused[0].1.contains("format 2") &&
+///   !missed.signed_maybe``.
+#[cfg(unix)]
+#[test]
+fn vault_checkpoint_a_proving_mac_asks_again_at_format_two() {
+    use crate::crossing::{FORMAT_TWO, Faults, FormatMark, inject};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"lab-v1".as_slice())]);
+    let m7 = &macs.m7;
+    lab_lan::write(m7, &lab_lan::Cidr::parse("192.168.1.0/24").unwrap()).unwrap();
+    let dark = pinned(&macs, "dark");
+    let fresh = pinned(&macs, "fresh");
+    let follows = Faults {
+        follows: true,
+        ..Faults::default()
+    };
+
+    // The vault moves into format 2: m7 follows on a version-2 `Put` it signs, and the vault's
+    // server, whose build reads format 2 too, follows on m7's post of it, so m7 reads the
+    // vault's newest records from it as a member that lets a Mac in must.
+    let server_mark = FormatMark::at(
+        macs.root
+            .path()
+            .join("s1")
+            .join(format!("{}.format", crate::ALAB_VAULT)),
+    );
+    inject(server_mark.path(), follows);
+    let two = super::super::follow_tests::follows_on_its_own_put(m7);
+    post_records_to_servers(m7).expect("m7's records reach the vault's server");
+    assert_eq!(server_mark.stored().unwrap(), FORMAT_TWO);
+
+    let local = || {
+        script_here(at_home(), || Local::of(m7))
+            .expect("m7's state reads")
+            .expect("m7 is a member")
+    };
+    let records = || load_records(m7).unwrap().log().unwrap().records().count();
+    let before = records();
+    let on_lan: IpAddr = "192.168.1.45".parse().unwrap();
+    let dials = AtomicUsize::new(0);
+
+    // A build that reads no format 2: one proof, the member's reason, nothing signed.
+    let missed = proof_dialing(
+        (m7, local()),
+        &dark,
+        &node_pair(41),
+        on_lan,
+        (false, true),
+        &dials,
+    )
+    .expect_err("format 1 and format 2 exchange no log");
+    assert!(
+        missed.refused[0].1.contains("format 2") && !missed.signed_maybe,
+        "{missed:?}"
+    );
+    assert_eq!(
+        dials.swap(0, Ordering::SeqCst),
+        1,
+        "a build that reads no format 2 proves itself once"
+    );
+    assert_eq!(records(), before, "m7 signed nothing for it");
+    assert!(!format_mark(&dark).path().exists());
+    assert_eq!(load_state(&dark).unwrap().membership, Stored::Pending);
+
+    inject(format_mark(&fresh).path(), follows);
+    let joined = proof_dialing(
+        (m7, local()),
+        &fresh,
+        &node_pair(42),
+        on_lan,
+        (false, true),
+        &dials,
+    )
+    .unwrap_or_else(|missed| panic!("the proof lets in a Mac that reads format 2: {missed:?}"));
+    assert!(matches!(joined.admission, join::Admission::Logged));
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        2,
+        "refused at format 1, then proved again stating format 2"
+    );
+    assert_eq!(format_mark(&fresh).stored().unwrap(), FORMAT_TWO);
+    assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
+    assert!(load_records(&fresh).unwrap().holds(two.id()));
+    assert_eq!(
+        crate::client::stored(&fresh, "format-two-value").unwrap(),
+        b"synthetic-two"
+    );
+    assert!(records() > before, "m7 signed the Mac's Admit");
+    for mark in [
+        format_mark(m7),
+        format_mark(&dark),
+        format_mark(&fresh),
+        server_mark,
+    ] {
+        inject(mark.path(), Faults::default());
+    }
+    macs.server.stop();
+    drop(macs.root);
 }

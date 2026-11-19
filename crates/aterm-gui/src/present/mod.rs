@@ -58,6 +58,18 @@ pub(crate) struct DamageRect {
     pub height: NonZeroU32,
 }
 
+/// A capture-only native ordering barrier queued after one exact submitted frame.
+/// Waiting happens on the capture worker, while UI dispatch continues. Dropping
+/// the fence must retire its private native reply/queue without closing the UI connection.
+#[cfg(any(
+    test,
+    target_os = "linux",
+    all(unix, feature = "bench-support", debug_assertions)
+))]
+pub(crate) trait SubmitFence: Send {
+    fn wait(self: Box<Self>, stopped: &(dyn Fn() -> bool + Send + Sync)) -> Result<(), String>;
+}
+
 /// Per-window CPU presentation target that owns the platform surface and hands out frame buffers.
 pub(crate) trait CpuPresenter: Sized {
     /// Backend-native presentation error.
@@ -76,6 +88,17 @@ pub(crate) trait CpuPresenter: Sized {
 
     /// Acquire the next paintable frame buffer.
     fn buffer_mut(&mut self) -> Result<Self::Buffer<'_>, Self::Error>;
+
+    /// Establish that the native display server processed this presenter's last
+    /// submit. Ordinary images and presents never require this capability.
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    fn capture_submit_fence(&mut self) -> Result<Box<dyn SubmitFence>, String> {
+        Err("this CPU backend has no native display submission confirmation".into())
+    }
 
     /// Whether the window system requires a repaint on the next presentation pass.
     fn owes_repaint(&self) -> bool {

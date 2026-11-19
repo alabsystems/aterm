@@ -400,6 +400,10 @@ pub(super) fn readable_log(
 /// A publish by a writer with no seat in the log, or whose log is behind the version it edits,
 /// carries none.
 const STAMP_PREFIX: &str = "# log-heads";
+/// The most bytes of records a held draft's file holds: what the store they are held for
+/// holds, whichever format this Mac's mark names
+/// ([`crate::membership_log::Reading::STORE_BYTES`], the storage class of byte bound).
+const HELD_LIMIT: usize = crate::membership_log::Reading::STORE_BYTES;
 /// The most heads a stamp names: a log with more heads stamps nothing, and its envelope is read
 /// as one a writer with no seat published.
 const MAX_STAMP_HEADS: usize = 32;
@@ -2902,9 +2906,7 @@ impl Held {
 /// # Errors
 /// The file cannot be read, or does not start as [`HELD_MAGIC`] says.
 fn read_held(path: &Path) -> crate::Result<Option<Held>> {
-    let Some(bytes) =
-        fsx::read_private(path, crate::membership_log::MAX_RECORDS_STREAM + (64 << 10))?
-    else {
+    let Some(bytes) = fsx::read_private(path, HELD_LIMIT + (64 << 10))? else {
         return Ok(None);
     };
     let bad = || {
@@ -3178,8 +3180,7 @@ fn settle_held_drafts_locked(paths: &Paths, seq: u64, parents: &[[u8; 32]], took
         }
     }
     let unversioned = unversioned_held_draft_file(paths);
-    if let Ok(Some(held)) =
-        fsx::read_private(&unversioned, crate::membership_log::MAX_RECORDS_STREAM)
+    if let Ok(Some(held)) = fsx::read_private(&unversioned, HELD_LIMIT)
         && unversioned_goes(held.as_slice(), super::load_records(paths).ok().as_ref())
     {
         let _ = std::fs::remove_file(unversioned);
@@ -3358,7 +3359,7 @@ pub(super) fn adopt_held_draft(
         let held = if versioned {
             read_held(&path)?
         } else {
-            fsx::read_private(&path, crate::membership_log::MAX_RECORDS_STREAM)?.map(|bytes| Held {
+            fsx::read_private(&path, HELD_LIMIT)?.map(|bytes| Held {
                 reach: Vec::new(),
                 bytes,
                 records_at: 0,

@@ -96,10 +96,17 @@ impl WakeTable {
     }
 }
 
-/// UI-thread map from each [`crate::Wake`] discriminant to its [`WakeTable`] slot.
+/// What the census tells wakes apart by: a [`crate::Wake`]'s variant, and beside it a host
+/// note's own ([`crate::harness_host::HostNote`]), so a take names the note that woke it.
+type CensusKey = (
+    Discriminant<crate::Wake>,
+    Option<Discriminant<crate::harness_host::HostNote>>,
+);
+
+/// UI-thread map from each [`CensusKey`] to its [`WakeTable`] slot.
 pub(crate) struct WakeCensus {
     table: &'static WakeTable,
-    slots: aterm_hash::FxHashMap<Discriminant<crate::Wake>, usize>,
+    slots: aterm_hash::FxHashMap<CensusKey, usize>,
 }
 
 impl Default for WakeCensus {
@@ -116,14 +123,32 @@ impl WakeCensus {
         }
     }
 
-    /// Count one delivered proxy event by its variant.
+    /// Count one delivered proxy event by its variant, a host note by its note's
+    /// (`HostNote.<note>`).
     pub(crate) fn note(&mut self, ev: &crate::Wake) {
         let table = self.table;
         let slot = *self
             .slots
-            .entry(std::mem::discriminant(ev))
-            .or_insert_with(|| table.slot(&variant_name(ev)));
+            .entry(census_key(ev))
+            .or_insert_with(|| table.slot(&census_name(ev)));
         table.note_slot(slot);
+    }
+}
+
+fn census_key(ev: &crate::Wake) -> CensusKey {
+    let note = match ev {
+        crate::Wake::HostNote(note) => Some(std::mem::discriminant(note)),
+        _ => None,
+    };
+    (std::mem::discriminant(ev), note)
+}
+
+/// A wake's census name: its variant's, and a host note's joined to its note's by a `.`, which no
+/// identifier holds and the `name:count` pairs of `wakes_by_variant` leave alone.
+fn census_name(ev: &crate::Wake) -> String {
+    match ev {
+        crate::Wake::HostNote(note) => format!("{}.{}", variant_name(ev), variant_name(note)),
+        _ => variant_name(ev),
     }
 }
 

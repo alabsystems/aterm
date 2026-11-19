@@ -138,6 +138,52 @@ fn shared_file_holds_and_each_law_falls_to_exactly_its_one_named_mutant() {
     );
 }
 
+/// LoginEvidence (aterm-evidence's ledger) is registered, holds with no mutant on while every
+/// action fires, and each of its four laws falls to exactly the one mutant
+/// `LOGIN_EVIDENCE_LAWS` names for it, StickyWord (the stored "signed out" of 2026-11-13) first.
+#[test]
+fn login_evidence_laws_each_fall_to_their_one_named_mutant() {
+    use aterm_spec::interp;
+    let _domains = aterm_models::link_all();
+    let registered = aterm_spec::xref::model_configurations();
+    let configs = registered
+        .iter()
+        .find(|configs| configs[0].name == "LoginEvidence")
+        .expect("LoginEvidence is not registered in this binary, so no sweep reads it");
+    let model = &configs[0];
+    let faults = aterm_spec::verify::sweep_faults(configs);
+    assert!(
+        faults.is_empty(),
+        "the sweep's faults:\n  {}",
+        faults.join("\n  ")
+    );
+    let states = interp::bmc(model)
+        .unwrap_or_else(|(state, law)| panic!("{law} is broken with no mutant on, at {state:?}"));
+    let fired = interp::fired_actions(model);
+    assert!(
+        model
+            .actions
+            .iter()
+            .all(|action| fired.contains(action.name)),
+        "an action never fires: {fired:?}"
+    );
+    let laws = aterm_models_harness::LOGIN_EVIDENCE_LAWS;
+    assert_eq!(model.mutant_dials(), [1, 2, 3, 4], "one mutant to a law");
+    for (dial, (law, mutant)) in (1..).zip(laws) {
+        let broken = interp::violated_invariants(&interp::with_buggy(model, dial));
+        assert_eq!(
+            broken,
+            std::collections::BTreeSet::from([law]),
+            "mutant {dial} ({mutant}) breaks {law} and nothing else"
+        );
+    }
+    eprintln!(
+        "LoginEvidence: {states} states with no mutant on; {} laws, each broken by exactly its \
+         one named mutant",
+        laws.len()
+    );
+}
+
 /// Every fault `check` finds across `items`, sorted.
 fn faults_across<T: Sync>(
     items: &[T],

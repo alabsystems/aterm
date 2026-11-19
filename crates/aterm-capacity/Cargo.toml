@@ -76,6 +76,11 @@ trust-resource-provenance = { workspace = true }
 # aterm-libc, first-party, which aterm-toolchain already links.
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# Handle-relative opens that tell a file whose delete is pending (`STATUS_DELETE_PENDING`) from
+# a refusal, which `CreateFileW` flattens into one `ERROR_ACCESS_DENIED`.
+aterm-dirfd = { workspace = true }
+
 [dev-dependencies]
 aterm-models-capacity = { workspace = true }
 trust-exec-policy = { workspace = true }

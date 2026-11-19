@@ -195,8 +195,16 @@ pub enum OpenAppRequest<'a> {
     SystemState,
     /// Show the window's Workers list, where it has one.
     Workers,
-    /// Focus or create the Tables page: the registry's stored tables.
+    /// Focus or create the general Tables browser.
     Tables,
+    /// Focus or create aRegistry for fleet machines, their assigned AI accounts and signed observations.
+    Registry,
+    /// Focus or create the System Resources page in the front window: this Mac's resources, live;
+    /// with a section, scrolled to it.
+    SystemResources {
+        /// The section to scroll to (`section=<word>`).
+        section: Option<ResourcesSection>,
+    },
     /// Open the navigator: every live session of every window.
     Navigator {
         /// Prefer the left pane of the active tab; a tab with no room for it opens a tab.
@@ -219,6 +227,40 @@ pub enum OpenAppRequest<'a> {
         /// Owner-supplied URI; the host must still canonicalize and authorize it.
         uri: &'a str,
     },
+}
+
+/// A section of the System Resources page an open scrolls to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourcesSection {
+    /// macOS configuration: the macOS settings that change what this Mac spends (SD-97).
+    MacosConfiguration,
+}
+
+impl ResourcesSection {
+    /// Every section.
+    pub const ALL: [Self; 1] = [Self::MacosConfiguration];
+
+    /// Its word after `section=`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::MacosConfiguration => "macos-configuration",
+        }
+    }
+
+    /// The page's key of the block that heads it.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::MacosConfiguration => "resources/macos-configuration",
+        }
+    }
+
+    /// The section `word` names.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|section| section.word() == word)
+    }
 }
 
 impl OpenAppRequest<'_> {}
@@ -341,13 +383,13 @@ pub fn parse_act(rest: &str) -> Result<ActRequest<'_>, ParseError> {
     })
 }
 
-/// Parse `open app` arguments (`about`, `system-state`, `navigator [split|dock]`, `settings [route]`, `markdown <uri>`, or `editor <uri>`).
+/// Parse `open app` arguments (`about`, `system-state`, `tables`, `registry`, `system-resources [section=<word>]`, `navigator [split|dock]`, `settings [route]`, `markdown <uri>`, or `editor <uri>`).
 pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
     reject_line_break(rest, "open payload")?;
     let mut input = rest;
     if take_token(&mut input) != Some("app") {
         return Err(ParseError::Usage(
-            "open app <allocation [split]|mail|about|system-state|workers|tables|navigator [split|dock]|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <allocation [split]|mail|about|system-state|workers|tables|registry|system-resources [section=macos-configuration]|navigator [split|dock]|settings [route]|markdown <uri>|editor <uri>>",
         ));
     }
     match take_token(&mut input) {
@@ -361,6 +403,21 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
         Some("system-state") if remainder(input).is_empty() => Ok(OpenAppRequest::SystemState),
         Some("workers") if remainder(input).is_empty() => Ok(OpenAppRequest::Workers),
         Some("tables") if remainder(input).is_empty() => Ok(OpenAppRequest::Tables),
+        Some("registry" | "aRegistry" | "aregistry") if remainder(input).is_empty() => {
+            Ok(OpenAppRequest::Registry)
+        }
+        Some("system-resources") if remainder(input).is_empty() => {
+            Ok(OpenAppRequest::SystemResources { section: None })
+        }
+        Some("system-resources") => remainder(input)
+            .strip_prefix("section=")
+            .and_then(ResourcesSection::parse)
+            .map(|section| OpenAppRequest::SystemResources {
+                section: Some(section),
+            })
+            .ok_or(ParseError::Usage(
+                "open app system-resources [section=macos-configuration]",
+            )),
         Some("navigator") if remainder(input) == "dock" => Ok(OpenAppRequest::NavigatorDock),
         Some("navigator") if matches!(remainder(input), "" | "split") => {
             Ok(OpenAppRequest::Navigator {
@@ -391,7 +448,7 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
         }
         Some(_) => Err(ParseError::UnknownApp),
         None => Err(ParseError::Usage(
-            "open app <allocation [split]|mail|about|system-state|workers|tables|navigator [split|dock]|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <allocation [split]|mail|about|system-state|workers|tables|registry|system-resources [section=macos-configuration]|navigator [split|dock]|settings [route]|markdown <uri>|editor <uri>>",
         )),
     }
 }

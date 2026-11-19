@@ -1386,9 +1386,8 @@ impl Registry {
         } else {
             super::upgrade_drive::twin_build(selected, "codex").ok_or(Error::Unsupported)?
         };
-        if !super::codex_alab::alab_bytes(&executable)
-            || !super::codex_alab::managed_credential_capable(&executable, true)
-                .map_err(|_| Error::Unavailable)?
+        if !super::codex_alab::source_credential_capable(&executable)
+            .map_err(|_| Error::Unavailable)?
         {
             return Err(Error::Unsupported);
         }

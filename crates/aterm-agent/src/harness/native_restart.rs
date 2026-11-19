@@ -7,8 +7,9 @@
 use super::contract::Scope;
 use super::native_act::{
     self, AskedIntent, AskedUpgradeIntent, Binding, Constructor, Decision, Image, ImagePhase,
-    NativePlan, Prepare, Process, Reply, Request,
+    NativePlan, Prepare, Process, Reply, Request, Succession,
 };
+use super::relaunch::NoPlan;
 use super::upgrade_drive::{self, Client, Opts, St, Terminated, Typed};
 
 #[cfg(all(test, unix))]
@@ -552,10 +553,13 @@ pub(super) fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
             Reply::Committed(_) | Reply::RestartCommitted(_) if completed_inactive(st) => {
                 Some(Recovery::Completed)
             }
-            Reply::ColdRestartCommitted { .. }
+            // A warm restart's repeated answer names the intent its completion already kept.
+            Reply::AdmittedRestartCommitted { intent, .. }
                 if completed_inactive(st)
                     && st.native_completed_prepare.as_ref().is_some_and(|prepare| {
-                        matches!(prepare.plan, NativePlan::Restart { cold: Some(_), .. })
+                        admitted_answers(prepare, phase(st), intent)
+                            && (matches!(prepare.plan, NativePlan::Restart { cold: Some(_), .. })
+                                || st.account_intent.as_ref() == Some(&**intent))
                     }) =>
             {
                 Some(Recovery::Completed)
@@ -590,15 +594,15 @@ pub(super) fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
     }
     let outcome = match reply {
         Reply::Decision(Decision::ProvenNotCommittedRollbackSafe) => Recovery::Cancelled,
-        Reply::Committed(_) | Reply::RestartCommitted(_) | Reply::ColdRestartCommitted { .. } => {
-            Recovery::Completed
-        }
+        Reply::Committed(_)
+        | Reply::RestartCommitted(_)
+        | Reply::AdmittedRestartCommitted { .. } => Recovery::Completed,
         Reply::Decision(Decision::Retired(_)) => Recovery::Retired,
         _ => return None,
     };
     let prepare = retained_prepare(st).ok()?;
-    if matches!(reply, Reply::ColdRestartCommitted { .. })
-        && !matches!(&prepare.plan, NativePlan::Restart { cold: Some(_), .. })
+    if let Reply::AdmittedRestartCommitted { intent, .. } = reply
+        && !admitted_answers(&prepare, phase(st), intent)
     {
         return None;
     }
@@ -618,10 +622,10 @@ pub(super) fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
         st.native_completed_prepare = Some(prepare);
         st.native_observation = match reply {
             Reply::RestartCommitted(observation) => Some((**observation).clone()),
-            Reply::ColdRestartCommitted { observation, .. } => observation.as_deref().cloned(),
+            Reply::AdmittedRestartCommitted { observation, .. } => observation.as_deref().cloned(),
             _ => None,
         };
-        if let Reply::ColdRestartCommitted { intent, .. } = reply {
+        if let Reply::AdmittedRestartCommitted { intent, .. } = reply {
             st.account_intent = Some((**intent).clone());
         }
     }
@@ -652,6 +656,26 @@ pub(super) fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
         st.stop("native-cohort-retired", upgrade_drive::now_s());
     }
     Some(outcome)
+}
+
+/// Whether a completion naming `intent` as the account intent its Execute admitted
+/// ([`Reply::AdmittedRestartCommitted`]) answers `prepare`, the restart whose `phase` command ran:
+/// a cold restart's helper resolution selects its intent, so it may name any; a warm restart's
+/// Execute admits its command's own intent or, where only that stored login's credential
+/// generation moved since the plan, the same login captured afresh
+/// ([`super::accounts_pool::ExecutionIntent::same_login`]), never another owner row, namespace,
+/// selector, route or purpose.
+fn admitted_answers(
+    prepare: &Prepare,
+    phase: ImagePhase,
+    intent: &super::accounts_pool::ExecutionIntent,
+) -> bool {
+    match &prepare.plan {
+        NativePlan::Restart { cold: Some(_), .. } => true,
+        plan => super::native_account_recipe::active_command(plan, phase)
+            .and_then(|command| command.account_intent.as_deref())
+            .is_some_and(|planned| intent.same_login(planned)),
+    }
 }
 
 /// Record that the retained restart `id` reached its close uncommitted ([`Recovery::Closed`]): its
@@ -817,13 +841,15 @@ fn lapsed(st: &mut St, id: &str) -> Result<Recovery, &'static str> {
     st.native = None;
     st.native_prepare.clear();
     st.native_rollback = false;
+    st.spend_native();
     Ok(Recovery::Lapsed)
 }
 
 /// Drop the saved prepare the host proved it never admitted. Only a record that kept that exact
 /// restart prepare and no binding may: a binding is the receipt of an admission, and a terminal
 /// record of the same id is a completion. Nothing is recorded completed; the coordination and
-/// any earlier completion stay for the lane that plans afresh.
+/// any earlier completion stay for the lane that plans afresh. Like a lapse, it spends one of its
+/// exit's native relaunches ([`St::native_spent`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -855,7 +881,324 @@ fn unadmitted(st: &mut St, id: &str) -> Result<Recovery, &'static str> {
     }
     st.native_prepare.clear();
     st.native_rollback = false;
+    st.spend_native();
     Ok(Recovery::Unadmitted)
+}
+
+/// The wait of a fresh asked move into a host that binds no succession while it holds no
+/// current-epoch passive registration of the live vendor yet ([`reentry`]); the next snapshot
+/// registers one.
+pub(super) const REENTRY_UNOBSERVED: &str = "native-reentry-unobserved";
+
+/// The wait of a fresh asked move whose host binds its epoch otherwise ([`Succession::Bound`]),
+/// noted with the stage the host names: another operation of its epoch is in flight, unresolved
+/// or still owes its terminal append, a receipt flight or an account lineage, or the host settled
+/// another predecessor, or this one whose resulting vendor lives but is not now what
+/// qualification requires yet can be again (out of the foreground, unread, a foreign claim on
+/// Relaunch live now). An operation that ended owing nothing, and a settlement nothing that runs
+/// can inherit (its vendor or shell ended or replaced, another conversation current, the built-in
+/// relaunch continuity broken), bind nothing: the host answers a re-entry. The host would deny
+/// both an upgrade naming the record's predecessor and a re-entry, so nothing is told or prepared
+/// until that changes or the host is recreated.
+pub(super) const REENTRY_BOUND: &str = "native-reentry-bound";
+
+/// The wait of a fresh asked move whose host's succession answer ([`Request::Succession`]) did
+/// not read, noted with what the exchange read instead.
+pub(super) const SUCCESSION_UNREAD: &str = "native-host-succession";
+
+/// The wait of a fresh asked move whose record still holds a native operation it cannot start
+/// over, noted with which.
+const UNRESOLVED: &str = "native-unresolved-operation";
+
+/// A wait of a coordinated record's asked-move gate ([`asked_upgrade_ready`]): its word, and the
+/// reason where the word cannot say which check of the host or the record held it, which the
+/// caller notes in aterm.log and the record's wait log ([`NoPlan::Noted`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct GateWait {
+    pub(super) word: &'static str,
+    pub(super) why: Option<String>,
+}
+
+impl GateWait {
+    fn noted(word: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            word,
+            why: Some(why.into()),
+        }
+    }
+
+    /// [`UNRESOLVED`], naming what the record holds.
+    fn unresolved(what: &str) -> Self {
+        Self::noted(UNRESOLVED, format!("the record holds {what}"))
+    }
+}
+
+impl From<&'static str> for GateWait {
+    fn from(word: &'static str) -> Self {
+        Self { word, why: None }
+    }
+}
+
+impl From<GateWait> for NoPlan {
+    fn from(wait: GateWait) -> Self {
+        match wait.why {
+            Some(why) => Self::Noted {
+                word: wait.word,
+                why,
+            },
+            None => Self::Wait(wait.word),
+        }
+    }
+}
+
+/// The host's current epoch and what it admits now after the record's completed predecessor
+/// `previous`, or after none ([`Request::Succession`]): the host's own reading of its operation
+/// table, never the record's guess from the epoch that settled `previous`.
+fn host_succession(
+    client: &mut Client,
+    tab: &str,
+    previous: Option<&Prepare>,
+) -> Result<(String, Succession), GateWait> {
+    let request = Request::Succession(previous.map(|previous| previous.id.clone()));
+    match native_act::exchange(client, tab, &request) {
+        Ok(Reply::Succession { epoch, admits }) => Ok((epoch, admits)),
+        Ok(_) => Err(GateWait::noted(
+            SUCCESSION_UNREAD,
+            "the host answered other than its succession",
+        )),
+        Err(error) => Err(GateWait::noted(SUCCESSION_UNREAD, error.to_string())),
+    }
+}
+
+/// What a coordinated record's next asked move succeeds on the host ([`basis`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Basis {
+    /// The record's completed predecessor, by its operation id, which this host's current epoch
+    /// settled.
+    Predecessor(String),
+    /// A re-entry, named by the host's own current-epoch registration of the live pair.
+    Reentry(super::native_observe::ObservationBinding),
+}
+
+impl Basis {
+    /// The asked move on this basis: an upgrade (`ask` none) or a Memory restart carrying its
+    /// `ask`, naming the predecessor or re-entering.
+    fn intent(self, ask: Option<String>) -> AskedIntent {
+        match (self, ask) {
+            (Self::Predecessor(predecessor), None) => {
+                AskedIntent::Upgrade(AskedUpgradeIntent { predecessor })
+            }
+            (Self::Predecessor(predecessor), Some(ask)) => {
+                AskedIntent::Relaunch(native_act::AskedRelaunchIntent { predecessor, ask })
+            }
+            (Self::Reentry(observation), ask) => {
+                AskedIntent::Reentry(native_act::AskedReentryIntent { observation, ask })
+            }
+        }
+    }
+}
+
+/// What the record's next asked move names on the host whose current epoch is `epoch` and which
+/// admits `admits` after the record's completed predecessor `previous` (none for a record whose
+/// native operations never completed one): that predecessor, where this very epoch settled it; a
+/// re-entry qualified by the host's own current-epoch registration of the live vendor under its
+/// shell, read by `live` ([`reentry`]), where the host binds nothing, which needs no predecessor;
+/// otherwise the move waits [`REENTRY_BOUND`], noted with the host's stage. No host is asked to
+/// prove a predecessor it does not hold, nor to re-enter an epoch it has bound.
+fn basis(
+    opts: &Opts,
+    st: &St,
+    previous: Option<&Prepare>,
+    epoch: &str,
+    admits: &Succession,
+    live: impl FnOnce() -> Result<(Process, Process), &'static str>,
+) -> Result<Basis, GateWait> {
+    match (admits, previous) {
+        (Succession::Predecessor, Some(previous)) if previous.host_epoch == epoch => {
+            Ok(Basis::Predecessor(previous.id.clone()))
+        }
+        (Succession::Reentry, _) => {
+            let (process, shell) = live()?;
+            reentry(opts, st, epoch, &process, &shell).map(Basis::Reentry)
+        }
+        (Succession::Predecessor, Some(previous)) => Err(GateWait::noted(
+            REENTRY_BOUND,
+            format!(
+                "the host settled the predecessor in its epoch {epoch}, which the record holds \
+                 from epoch {}",
+                previous.host_epoch
+            ),
+        )),
+        (Succession::Predecessor, None) => Err(GateWait::noted(
+            SUCCESSION_UNREAD,
+            "the host answered a predecessor for a record that names none",
+        )),
+        (Succession::Bound(stage), _) => Err(GateWait::noted(
+            REENTRY_BOUND,
+            format!("the host holds its epoch at {stage}"),
+        )),
+    }
+}
+
+/// Save `registration` and its `binding` as `tab`'s passive observation under `state`, as the
+/// observer does ([`observe_live`]): for a fixture standing in for the observer.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(super) fn observed_for_fixture(
+    state: &std::path::Path,
+    tab: &str,
+    registration: super::native_observe::Registration,
+    binding: super::native_observe::ObservationBinding,
+) -> std::io::Result<()> {
+    let turn = observation::Turn::take(state, tab)
+        .ok_or_else(|| std::io::Error::other("another observer has the record's turn"))?;
+    observation::save(
+        &turn,
+        &observation::Observed {
+            registration,
+            binding: Some(binding),
+        },
+    )
+}
+
+/// The passive observation binding a re-entry names: the host's registration of exactly
+/// `process` under `shell` in its current epoch `epoch`, as this record's observer saved it
+/// ([`observe_live`]). A record still holding any native operation never re-enters: a retained
+/// or recovered binding, a prepare, a closed restart's watch, an account candidate, a rollback or
+/// an unissued retirement each refuses as unresolved. A no-exec prepare is not one: it is a
+/// positive terminal fact ([`noexec_prepare`]) that the next prepare replaces, as an upgrade's
+/// does. Whether the host's epoch is unbound is the host's to say, not this record's (the record
+/// cannot tell an operation that left nothing bound from one still owed): only a host that
+/// answered [`Succession::Reentry`] is re-entered ([`basis`]).
+fn reentry(
+    opts: &Opts,
+    st: &St,
+    epoch: &str,
+    process: &Process,
+    shell: &Process,
+) -> Result<super::native_observe::ObservationBinding, GateWait> {
+    if let Some(what) = [
+        (st.native.is_some(), "a retained native binding"),
+        (!st.native_prepare.is_empty(), "a retained prepare"),
+        (
+            st.native_account_candidate.is_some(),
+            "an account candidate",
+        ),
+        (st.native_closed.is_some(), "a closed restart's watch"),
+        (st.native_retired_unissued, "an unissued retirement"),
+        (st.native_rollback, "a rollback"),
+    ]
+    .into_iter()
+    .find_map(|(held, what)| held.then_some(what))
+    {
+        return Err(GateWait::unresolved(what));
+    }
+    let Some(observed) = observation::read(&opts.state, &st.tab) else {
+        return Err(GateWait::noted(
+            REENTRY_UNOBSERVED,
+            "the observer has saved no registration for the tab",
+        ));
+    };
+    let saved = &observed.registration;
+    if saved.host_epoch != epoch || saved.vendor != *process || saved.shell != *shell {
+        return Err(GateWait::noted(
+            REENTRY_UNOBSERVED,
+            format!(
+                "the saved registration names pid {} under shell {} in epoch {}, not the live pid \
+                 {} under shell {} in epoch {epoch}",
+                saved.vendor.pid, saved.shell.pid, saved.host_epoch, process.pid, shell.pid
+            ),
+        ));
+    }
+    observed
+        .binding
+        .filter(|binding| binding.host_epoch == epoch)
+        .ok_or_else(|| {
+            GateWait::noted(
+                REENTRY_UNOBSERVED,
+                "the host has bound no saved registration of the live pair yet",
+            )
+        })
+}
+
+/// Whether a coordinated record's next asked move can be admitted by the host as it stands now,
+/// read before any tell promises it ([`super::relaunch::plan_native_upgrade`]) and before a
+/// Memory restart lets its agent exit: a retained operation replays first and is not refused
+/// here; otherwise the host's own answer for the record's completed predecessor, or for none
+/// ([`Request::Succession`]), admits either that predecessor, settled by its current epoch, or a
+/// re-entry, which finds the host's own current-epoch registration of the live vendor `vendor`
+/// under its foreground shell `shell` ([`reentry`]). A record whose first native operation never
+/// completed (cancelled, unadmitted, lapsed or closed before any effect) names no predecessor and
+/// is coordinated for good: it re-enters, never waits for a predecessor nothing can mint. A host
+/// whose epoch is bound otherwise waits [`REENTRY_BOUND`], never a tell and a prepare it would
+/// deny.
+///
+/// The two are the live session's, read by the caller this round, never the record's: a round's
+/// record binds its agent ([`St::pid`], [`St::shell`]) only once the move is signalled, after this
+/// gate, and a round that starts after a completed move starts unbound (pid 0), so a gate that
+/// read the record never passed and held every re-entry at `native-process` for good.
+///
+/// # Errors
+/// The wait word: the record's unresolved operation, the host's succession answer unread, a host
+/// epoch bound otherwise, the live vendor or shell unread, or a re-entry with no current-epoch
+/// registration.
+pub(super) fn asked_upgrade_ready(
+    opts: &Opts,
+    client: &mut Client,
+    st: &St,
+    vendor: u32,
+    shell: u32,
+) -> Result<(), GateWait> {
+    if st.native_retired_unissued {
+        return Err(GateWait::unresolved("an unissued retirement"));
+    }
+    if st.native_account_candidate.is_some() {
+        return Err(GateWait::unresolved("an account candidate"));
+    }
+    if st.native.is_some() || !st.native_prepare.is_empty() {
+        return Ok(());
+    }
+    if st.native_rollback {
+        return Err(GateWait::unresolved("a rollback"));
+    }
+    closed_refusal(st)?;
+    let previous = st.native_completed_prepare.as_deref();
+    let (epoch, admits) = host_succession(client, &st.tab, previous)?;
+    basis(opts, st, previous, &epoch, &admits, || {
+        Ok((
+            Process::observe(vendor).ok_or("native-process")?,
+            Process::observe(shell).ok_or("native-shell")?,
+        ))
+    })
+    .map(|_| ())
+}
+
+/// [`asked_upgrade_ready`] for a step whose move has not settled the record's closed restart watch
+/// yet ([`settle_closed`], which the move runs first, with `fresh`): the gate reads the record as
+/// that settlement would leave it, and keeps nothing. A watch the move's own settlement clears (its
+/// relaunch is the very agent the move signals, or nothing the closed restart started runs) is no
+/// refusal here, since the gate otherwise held the move at `native-closed-grantee` before the
+/// only lane that settles it ([`super::upgrade_drive`]'s restart) could run; a watch it keeps waits
+/// as that settlement would.
+///
+/// # Errors
+/// The closed watch's refusal, or [`asked_upgrade_ready`]'s.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn asked_upgrade_ready_unsettled(
+    opts: &Opts,
+    client: &mut Client,
+    st: &St,
+    fresh: Fresh<'_>,
+    files: impl FnOnce() -> Option<Vec<super::upgrade::SessionFile>>,
+    k: &dyn upgrade_drive::Kernel,
+    vendor: u32,
+    shell: u32,
+) -> Result<(), GateWait> {
+    if st.native_closed.is_none() {
+        return asked_upgrade_ready(opts, client, st, vendor, shell);
+    }
+    let mut settled = st.clone();
+    settle_closed(&mut settled, fresh, files, k)?;
+    asked_upgrade_ready(opts, client, &settled, vendor, shell)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -869,7 +1212,10 @@ pub(super) fn begin(
     command: Option<&super::relaunch::PlannedCommand>,
     rollback: Option<&super::relaunch::PlannedCommand>,
 ) -> Result<Recovery, &'static str> {
-    let asked = if duty == Scope::Upgrade && coordinated(st) {
+    // A coordinated record's upgrade is an asked move: its predecessor or re-entry is the host's
+    // to say ([`begin_plan`]), with or without a completed predecessor on the record.
+    let asked = duty == Scope::Upgrade && coordinated(st);
+    if asked {
         if st.native_retired_unissued || st.native_account_candidate.is_some() {
             return Err("native-unresolved-operation");
         }
@@ -880,29 +1226,9 @@ pub(super) fn begin(
             return Err("native-unresolved-operation");
         }
         closed_refusal(st)?;
-        let previous = st
-            .native_completed_prepare
-            .as_deref()
-            .ok_or("native-asked-predecessor-unproven")?;
-        Some(AskedIntent::Upgrade(AskedUpgradeIntent {
-            predecessor: previous.id.clone(),
-        }))
-    } else {
-        None
-    };
+    }
     begin_plan(
-        opts,
-        client,
-        st,
-        session,
-        duty,
-        target,
-        command,
-        rollback,
-        None,
-        None,
-        asked.as_ref(),
-        None,
+        opts, client, st, session, duty, target, command, rollback, None, None, asked, None,
     )
 }
 
@@ -936,11 +1262,8 @@ pub(super) fn begin_relaunch(
     }) {
         return Err("native-checked-token-route");
     }
-    if st.native_completed_prepare.is_none() {
-        return Err("native-asked-predecessor-unproven");
-    }
     begin_plan(
-        opts, client, st, session, duty, target, command, rollback, None, None, None, checked,
+        opts, client, st, session, duty, target, command, rollback, None, None, false, checked,
     )
 }
 
@@ -1035,7 +1358,7 @@ pub(super) fn begin_crash(
         None,
         observed,
         cold,
-        None,
+        false,
         None,
     )
 }
@@ -1121,7 +1444,7 @@ pub(super) fn begin_completed_rollback(
         None,
         Some((observed.registration, observed.binding)),
         None,
-        None,
+        false,
         None,
     )
 }
@@ -1176,7 +1499,7 @@ fn begin_plan(
         super::native_observe::ObservationBinding,
     )>,
     cold: Option<&super::native_act::ColdIntent>,
-    asked: Option<&AskedIntent>,
+    asked: bool,
     checked: Option<(
         &super::relaunch::CheckedSource,
         &dyn super::relaunch::RelaunchAuthorizer,
@@ -1195,7 +1518,7 @@ fn begin_plan(
     closed_refusal(st)?;
     // CLI/operator constructors preserve their independent legacy authority. Only the real
     // private host opts contain this token; holder/as=person words never select this branch.
-    if asked.is_some() || checked.is_some() {
+    if asked || checked.is_some() {
         let constructor = if checked.is_some() {
             Constructor::AskedRelaunch
         } else {
@@ -1256,7 +1579,7 @@ fn begin_plan(
     let target = Image::at(target).ok_or("native-target")?;
     let forward = command
         .and_then(|command| {
-            if asked.is_some() || checked.is_some() {
+            if asked || checked.is_some() {
                 command.capture_native()
             } else {
                 command.capture()
@@ -1290,6 +1613,27 @@ fn begin_plan(
     else {
         return Err("native-host-epoch");
     };
+    // An asked move, an upgrade or a Memory restart, names the record's completed predecessor
+    // only to the host epoch that settled it, and otherwise re-enters a host that binds nothing
+    // from that host's own current-epoch registration of this very live pair ([`basis`]), by the
+    // host's own answer read in that same epoch. A record that completed no native operation
+    // names no predecessor and can only re-enter.
+    let succeeds = if asked || checked.is_some() {
+        let previous = st.native_completed_prepare.as_deref();
+        let (epoch, admits) =
+            host_succession(client, &st.tab, previous).map_err(|wait| wait.word)?;
+        if epoch != host_epoch {
+            return Err("native-host-epoch");
+        }
+        Some(
+            basis(opts, st, previous, &host_epoch, &admits, || {
+                Ok((process.clone(), shell.clone()))
+            })
+            .map_err(|wait| wait.word)?,
+        )
+    } else {
+        None
+    };
     let rejection_domain = match native_act::exchange(client, &st.tab, &Request::RejectionDomain) {
         Ok(Reply::RejectionDomain(domain)) => Some(domain),
         Err(error)
@@ -1303,10 +1647,16 @@ fn begin_plan(
     let deadline_us = native_act::monotonic_us()
         .and_then(|now| now.checked_add(120_000_000))
         .ok_or("native-clock")?;
+    // An upgrade's intent is whole here; a Memory restart's carries its ask, named only once its
+    // checked source agrees to the prepare without it.
+    let (asked, relaunch_basis) = match checked {
+        Some(_) => (None, succeeds),
+        None => (succeeds.map(|basis| basis.intent(None)), None),
+    };
     let mut prepare = Prepare {
         receipt_mode: None,
         rejection_domain,
-        asked: asked.cloned(),
+        asked,
         id: native_act::operation_id().map_err(|_| "native-entropy")?,
         host_epoch,
         holder: upgrade_drive::hand_name(),
@@ -1334,16 +1684,10 @@ fn begin_plan(
         if !source.agrees(&prepare) {
             return Err("native-checked-source-changed");
         }
-        let predecessor = st
-            .native_completed_prepare
-            .as_ref()
-            .ok_or("native-asked-predecessor-unproven")?
-            .id
-            .clone();
-        prepare.asked = Some(AskedIntent::Relaunch(native_act::AskedRelaunchIntent {
-            predecessor,
-            ask: source.ask().to_owned(),
-        }));
+        // A host that settled no predecessor of this record's in its epoch (recreated since it
+        // settled one, unbound again, or the record completed none) is re-entered from its own
+        // registration, as an upgrade is: an old predecessor's relaunch would be denied for good.
+        prepare.asked = relaunch_basis.map(|basis| basis.intent(Some(source.ask().to_owned())));
     }
     let request = Request::prepare(prepare);
     st.native_prepare = request.encode().ok_or("native-plan")?;
@@ -1546,7 +1890,20 @@ pub(super) fn recover(
     upgrade_drive::save_checked(opts, session, st).map_err(|_| "native-unsaved")?;
     let reply = native_act::exchange_retained(client, tab, &request, &st.native_prepare).map_err(
         |error| {
-            aterm_log::debug!("native prepare replay error kind={:?}", error.kind());
+            // The host's own refusal line (`ERR busy unresolved native operation`, say) or the
+            // transport's error: the reason this prepare stays unknown, which the lane's step
+            // word alone does not say.
+            let said = error.to_string();
+            let said: String = said
+                .trim_end()
+                .replace(['\n', '\r'], " ")
+                .chars()
+                .take(200)
+                .collect();
+            aterm_log::info!(
+                "harness @{tab}: native prepare unanswered ({:?}): {said}",
+                error.kind()
+            );
             "native-unknown"
         },
     )?;

@@ -93,6 +93,8 @@ pub fn spawn_cloexec_default(program: &str, args: &[&str]) -> io::Result<u32> {
     }
     let mut pid: i32 = 0;
     if result.is_ok() {
+        #[cfg(any(test, debug_assertions))]
+        crate::spawnfd::note_handed(&program_c, false, None);
         let _spawning = crate::spawn_lock::spawning();
         // SAFETY: `argv` is NUL-terminated and its strings outlive the call;
         // `environ` is the process environment block.

@@ -224,10 +224,6 @@ fn a_take_of_the_state_lock_under_a_look_panics_rather_than_wait_on_it() {
     }
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn a_memo_observes_current_data_and_refuses_a_missing_layout_file() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -257,10 +253,6 @@ fn a_memo_observes_current_data_and_refuses_a_missing_layout_file() {
 /// fewer records than the layout pins, which the selection refuses (`check_capacity`).
 /// NEGATIVE CONTROL: with the capacity left out of a layout's judgement
 /// (`records_storage::Judged`), the memo answers the records it read under the larger one.
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn a_pinned_layout_is_read_again_under_a_smaller_record_capacity() {
     fn budget(held: usize) -> crate::membership_log::RecordBudgets {
@@ -303,10 +295,6 @@ fn a_pinned_layout_is_read_again_under_a_smaller_record_capacity() {
 /// with the selection's witnesses looking at the intent whatever stands and a plain file only
 /// where no intent stands beside it (both as eb0e73e0f1 had them), a file with an intent beside it
 /// is unjudged.
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn records_the_selection_refuses_are_unjudged() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -357,10 +345,6 @@ fn records_the_selection_refuses_are_unjudged() {
 /// (2026-11-11): with the witnesses looking at the intent whatever stands (before this law), the
 /// stamps take `[1, 2, 1]`, the pinned layout's first judgement looking at its witnesses again
 /// after it (`records_storage::Judgements::layout`).
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn a_records_selection_looks_at_its_intent_only_where_it_reads_it() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -397,10 +381,6 @@ fn a_records_selection_looks_at_its_intent_only_where_it_reads_it() {
 /// selection, and the standing moves with it (`data_path` refuses this one). NEGATIVE CONTROL
 /// (2026-11-11): with the witnesses looking at the intent whatever stands (before this law), the
 /// plain file's standing moves (`a plain records file: an intent beside it moves no stamp`).
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn an_intent_beside_records_read_past_it_moves_nothing_a_reader_holds() {
     let c = crate::membership_log::store::classified_tests::chain();

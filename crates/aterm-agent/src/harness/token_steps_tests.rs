@@ -364,7 +364,7 @@ fn a_route_is_dated_by_its_own_files() {
         .tempdir()
         .unwrap();
     assert_eq!(
-        route_at(&store, Some(home.path()), "person@example.com"),
+        route_at(&store, Some(home.path()), Some("person@example.com")),
         None
     );
     let secrets = home.path().join(".secrets");
@@ -376,7 +376,7 @@ fn a_route_is_dated_by_its_own_files() {
         std::fs::write(secrets.join(name), b"").unwrap();
     }
     assert_eq!(
-        route_at(&store, Some(home.path()), "person@example.com"),
+        route_at(&store, Some(home.path()), Some("person@example.com")),
         None,
         "a file under ~/.secrets dated a route"
     );
@@ -394,7 +394,7 @@ fn a_route_is_dated_by_its_own_files() {
             .as_secs()
     };
     assert_eq!(
-        route_at(&store, Some(home.path()), "person@example.com"),
+        route_at(&store, Some(home.path()), Some("person@example.com")),
         Some(written(&config))
     );
     // The account's saved Google mail grant, where the mail crate keeps it, written later.
@@ -411,7 +411,7 @@ fn a_route_is_dated_by_its_own_files() {
         .set_modified(later)
         .unwrap();
     assert_eq!(
-        route_at(&store, Some(home.path()), "person@example.com"),
+        route_at(&store, Some(home.path()), Some("person@example.com")),
         Some(written(&grant)),
         "a saved Google grant was not seen"
     );
@@ -422,7 +422,7 @@ fn a_route_is_dated_by_its_own_files() {
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, b"person@example.com").unwrap();
         assert_eq!(
-            route_at(&store, None, "person@example.com"),
+            route_at(&store, None, Some("person@example.com")),
             Some(written(&marker))
         );
     }

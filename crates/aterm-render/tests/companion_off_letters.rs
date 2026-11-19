@@ -3265,6 +3265,19 @@ pub fn walled(
 /// (`aterm_spec::check::each`), so its replays take the cores the test was granted, not one.
 type WalledRun = (Drive, u16, &'static str, Look, &'static [OldPath]);
 
+/// The pages the wall's laws on the last row replay on
+/// ([`at_the_wall_the_caret_s_cell_is_no_seat`],
+/// [`a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page`]): a dark page and a light
+/// one. The page moves no frame's companion there: on Dark, Solarized Dark, GitHub Light and
+/// Default Light alike each frame's box, alpha, caret pixels, box on the caret and lettered cells
+/// under the box read the same, for every companion style, both ways of typing and every width
+/// those laws replay, with every law on and, on the last row, with its hide reverted (the last row
+/// and its spaced line at 72, 71 and 70 columns: 48 replays with every law and 12 of the shipped
+/// cat and dog with the hide reverted, no frame of any apart from Dark's on another page, macOS,
+/// 2026-11-13 and 2026-11-17). The last row's wall is
+/// replayed on every page by [`a_last_row_that_holds_no_seat_hides_the_companion`].
+const WALL_PAGES: [Look; 2] = [DARK, GITHUB_LIGHT];
+
 /// Whether a frame's companion lies on the caret's cell: its art drawn under the letters there
 /// ([`Coat::caret_px`]), or its box over the cell as the brain judges one ([`Coat::box_on_caret`]),
 /// which reads a body drawn over blank ground too, where the knock layer has no runs.
@@ -3322,9 +3335,9 @@ fn on_the_caret_or_letters(judged: &[Judged], span: (u64, u64)) -> Vec<Met> {
 /// on that seat; [`a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page`] judges it
 /// with every law.
 ///
-/// Every companion style on every page, the keys typed through the console and, as the gallery
-/// types them, past it. Negative controls, each with the hide reverted (with it, at 71 and 70
-/// columns, the body is off the glass whatever either law does):
+/// Every companion style on dark and a light page ([`WALL_PAGES`]), the keys typed through the
+/// console and, as the gallery types them, past it. Negative controls, each with the hide reverted
+/// (with it, at 71 and 70 columns, the body is off the glass whatever either law does):
 /// [`OldPath::CaretCellIsNoSeat`] reverted too, at 71 and 70 columns it rests in the caret's cell;
 /// [`OldPath::SeatRidesThePage`] reverted too, it stays on its row of the glass, on the letters
 /// of the line it left.
@@ -3337,7 +3350,7 @@ fn at_the_wall_the_caret_s_cell_is_no_seat() {
     let mut runs: Vec<WalledRun> = Vec::new();
     for drive in [Drive::Console, Drive::Ctl] {
         for cols in [72, 71, 70] {
-            for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
+            for look in WALL_PAGES {
                 for style in COMPANIONS {
                     if !swept(style, look) {
                         continue;
@@ -3618,9 +3631,10 @@ fn last_row_spaced(cols: u16) -> (Played, (u64, u64)) {
 /// or its box on a lettered cell: it rode up with the rows it sat among
 /// ([`OldPath::SeatRidesThePage`]).
 ///
-/// Every law, every companion style on every page, the keys typed through the console and past
-/// it. Negative controls, each reverting one law alone: [`OldPath::CaretCellIsNoSeat`], at 71 and
-/// 70 columns the body rests at the wall with its box on the caret's cell; and
+/// Every law, every companion style on dark and a light page ([`WALL_PAGES`]), the keys typed
+/// through the console and past it. Negative controls, each reverting one law alone:
+/// [`OldPath::CaretCellIsNoSeat`], at 71 and 70 columns the body rests at the wall with its box on
+/// the caret's cell; and
 /// [`OldPath::SeatRidesThePage`], it stays on its row of the glass after the Enter, on the letters
 /// the scroll brought there.
 #[test]
@@ -3631,7 +3645,7 @@ fn a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page() {
     let mut runs: Vec<WalledRun> = Vec::new();
     for drive in [Drive::Console, Drive::Ctl] {
         for cols in [72, 71, 70] {
-            for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
+            for look in WALL_PAGES {
                 for style in COMPANIONS {
                     if !swept(style, look) {
                         continue;

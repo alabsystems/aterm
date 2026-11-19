@@ -251,6 +251,7 @@ fn accounts(state: Option<&'static str>) -> ClaudeAccounts {
         renew_by: None,
         on_token_until: None,
         limited_until: None,
+        model_walls: std::collections::BTreeMap::new(),
         served_at: None,
         renewed_at: None,
         signed_out_at: None,

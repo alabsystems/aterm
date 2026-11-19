@@ -481,6 +481,9 @@ struct LogFacts {
     stall_open: bool,
     /// The last pressure level its lines report.
     pressure: Option<Pressure>,
+    /// Whether a memory starvation episode its lines opened was still open at its last line
+    /// (`memory_starving`'s lines).
+    starving: bool,
 }
 
 impl LogFacts {
@@ -492,11 +495,15 @@ impl LogFacts {
         }
     }
 
+    /// The pressure its lines leave: an episode still open first, since the dispatch source's
+    /// level comes last, to one process at a time (on 2026-11-15 this process logged none before
+    /// it stalled), then the last level reported.
     const fn pressure(self) -> Pressure {
-        match (self.lines, self.pressure) {
-            (0, _) => Pressure::Unknown,
-            (_, None) => Pressure::None,
-            (_, Some(p)) => p,
+        match (self.lines, self.starving, self.pressure) {
+            (0, _, _) => Pressure::Unknown,
+            (_, true, _) => Pressure::Starving,
+            (_, false, None) => Pressure::None,
+            (_, false, Some(p)) => p,
         }
     }
 
@@ -507,6 +514,11 @@ impl LogFacts {
             self.stall_open = false;
         } else if body.contains(STALL_LINE) {
             self.stall_open = true;
+        }
+        if body.contains(crate::memory_starving::OPENED_LINE) {
+            self.starving = true;
+        } else if body.contains(crate::memory_starving::ENDED_LINE) {
+            self.starving = false;
         }
         if let Some(level) = body.split(PRESSURE_LINE).nth(1) {
             let level = level.trim_start();

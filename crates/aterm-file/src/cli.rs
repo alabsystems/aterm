@@ -74,6 +74,10 @@ usage: aterm file <verb> [--json]
   commit <name>                          queue what the face's changed cells say
   restore <name>                         rewrite the face from the snapshot, keeping edits no
                                          commit took as <leaf>.rejected.<ext>
+  a write verb takes --reason <line> and --evidence <piece>... (commit:<repo>@<commit>,
+  path:<repo>:<path>, measure:<metric>=<n>, note:<text>, an https URL): its intent keeps them
+  with who made it (the aterm session and agent its process descends from), and a table that
+  takes version 2 records signs them into the record
 A face is a TSV whose last header cell is =pk@<rev>, the revision it was written at. Nothing
 reads a face but a commit: a saved face changes nothing until `commit` (or a save in an Editor
 tab) by name, only cells whose text differs from that revision's become writes, and a row left
@@ -793,8 +797,8 @@ fn history(file: &File, rest: &[&str], json: bool) -> Answer {
     }
 }
 
-/// One queued or held intent as `outbox` lists it: which, when, whose and which cells, never
-/// a value.
+/// One queued or held intent as `outbox` lists it: which, when, whose (with what its verb
+/// stated of who made it, why and on what evidence) and which cells, never a value.
 fn intent_json(intent: &Intent, state: &str, why: Option<&str>) -> Value {
     let mut object = Map::new();
     object.insert("id".to_owned(), Value::from(intent.id.as_str()));
@@ -803,6 +807,10 @@ fn intent_json(intent: &Intent, state: &str, why: Option<&str>) -> Value {
     object.insert("ms".to_owned(), Value::from(intent.ms));
     object.insert("by".to_owned(), Value::from(intent.by.as_str()));
     object.insert("session".to_owned(), Value::from(intent.session.as_deref()));
+    object.insert(
+        "said".to_owned(),
+        intent.said.clone().unwrap_or(Value::Null),
+    );
     object.insert("born".to_owned(), Value::from(intent.born));
     object.insert("revert".to_owned(), Value::from(intent.revert.as_deref()));
     object.insert(

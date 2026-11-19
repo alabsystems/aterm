@@ -3,11 +3,18 @@
 
 //! `sys` JSON value representation and shape contract checker.
 
+/// A finite JSON number, constructed only by [`Jv::number`]. Its canonical numeric text
+/// preserves the input floating-point value without exposing a raw-text constructor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FiniteNumber(String);
+
 /// A JSON value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Jv {
     /// An integer.
     Int(i64),
+    /// A finite number outside the exact integer representation.
+    Number(FiniteNumber),
     /// A string.
     Str(String),
     /// A boolean.
@@ -19,6 +26,21 @@ pub enum Jv {
 }
 
 impl Jv {
+    /// A finite numeric value. Exact integers in the signed range keep the integer
+    /// representation; fractions and larger finite values retain their numeric text.
+    /// Non-finite inputs cannot be represented by JSON and return `None`.
+    #[must_use]
+    pub fn number(value: f64) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        if value.fract() == 0.0 && value >= i64::MIN as f64 && value < -(i64::MIN as f64) {
+            Some(Self::Int(value as i64))
+        } else {
+            Some(Self::Number(FiniteNumber(value.to_string())))
+        }
+    }
+
     /// An object from `(key, value)` pairs.
     #[must_use]
     pub fn obj<K: Into<String>>(pairs: impl IntoIterator<Item = (K, Jv)>) -> Self {
@@ -123,6 +145,7 @@ impl Jv {
     fn write(&self, out: &mut String) {
         match self {
             Self::Int(n) => out.push_str(&n.to_string()),
+            Self::Number(n) => out.push_str(&n.0),
             Self::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             Self::Str(s) => write_str(out, s),
             Self::Arr(items) => {
@@ -250,7 +273,7 @@ fn walk(v: &Jv, path: &str, out: &mut Vec<String>) {
                 walk(child, &child_path, out);
             }
         }
-        Jv::Int(_) | Jv::Str(_) | Jv::Bool(_) => {}
+        Jv::Int(_) | Jv::Number(_) | Jv::Str(_) | Jv::Bool(_) => {}
     }
 }
 

@@ -206,6 +206,87 @@ fn command_scope_hardcoded_tab_navigation_keys_keep_their_originating_window() {
     }
 }
 
+#[test]
+fn visible_local_panel_digits_select_sessions_from_an_editor_and_a_terminal() {
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key as WinitKey, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr,
+    };
+    let wid = WindowId(0);
+    let mut app = App::headless_for_test();
+    let first = app.focused_session_id(wid).unwrap();
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("draft.txt");
+    fs::write(&path, "").unwrap();
+    app.open_document_tab(AppKind::Editor, &file_uri(&path))
+        .unwrap();
+    let editor = app.active_native_view(wid).unwrap();
+    let document = app.native_runtime.document_id(editor.0).unwrap();
+    let second = crate::app_workers_tests::person_tab(&mut app);
+    app.switch_tab_in(wid, 1);
+    assert_eq!(app.active_native_view(wid), Some(editor));
+    let size = app.window_frame_px_for(wid, 32, 140);
+    app.windows.get_mut(&wid).unwrap().win_px = Some(size);
+    app.set_dock(wid, 24).unwrap();
+    assert!(app.visible_session_organizer(wid).is_some());
+    let primary = if cfg!(target_os = "macos") {
+        ModifiersState::SUPER
+    } else {
+        ModifiersState::CONTROL | ModifiersState::SHIFT
+    };
+    let press = |app: &mut App, code, text: &str, mods| {
+        app.windows.get_mut(&wid).unwrap().mods = mods;
+        for state in [ElementState::Pressed, ElementState::Released] {
+            app.on_key(
+                wid,
+                KeyEvent::synthetic_for_test(
+                    PhysicalKey::Code(code),
+                    WinitKey::Character(SmolStr::new(text)),
+                    Some(SmolStr::new(text)),
+                    KeyLocation::Standard,
+                    state,
+                    false,
+                ),
+            );
+        }
+    };
+    press(&mut app, KeyCode::Digit2, "2", ModifiersState::empty());
+    assert_eq!(
+        app.document_store.snapshot(document).unwrap().text.as_ref(),
+        "2"
+    );
+    // There is a third tab and no third session. This press must not open that tab.
+    press(&mut app, KeyCode::Digit3, "3", primary);
+    assert_eq!(app.active_native_view(wid), Some(editor));
+    press(&mut app, KeyCode::Digit2, "2", primary);
+    assert_eq!(app.focused_session_id(wid), Some(second));
+    press(&mut app, KeyCode::Digit1, "1", ModifiersState::empty());
+    assert_eq!(app.focused_session_id(wid), Some(second));
+    press(&mut app, KeyCode::Digit1, "1", primary);
+    assert_eq!(app.focused_session_id(wid), Some(first));
+    let foreign = app.next_session_id;
+    let session = crate::stub_session(foreign);
+    App::register_session(&app.store, &session, None);
+    let aux = app.insert_logical_window(session, 24, 80);
+    app.note_window_focused(wid);
+    let shown = app.windows[&wid].strip_tab_count();
+    press(&mut app, KeyCode::Digit3, "3", primary);
+    assert_eq!(app.local_panel_roster.number(foreign), Some(3));
+    let preview = app.windows[&wid].active_session_preview().unwrap();
+    assert_eq!(preview.session, foreign);
+    assert!(preview.borrowed);
+    assert_eq!(app.windows[&wid].strip_tab_count(), shown);
+    assert_eq!(app.focused_session_id(aux), Some(foreign));
+    press(&mut app, KeyCode::Digit1, "1", primary);
+    assert_eq!(app.focused_session_id(wid), Some(first));
+    assert!(app.windows[&wid].active_session_preview().is_none());
+    assert_eq!(
+        app.document_store.snapshot(document).unwrap().text.as_ref(),
+        "2"
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), "");
+}
+
 fn check_tab_navigation_keyboard_window_scope(configured: bool) {
     use crate::keybinding::Keybindings;
     use aterm_window::event::{ElementState, KeyEvent};

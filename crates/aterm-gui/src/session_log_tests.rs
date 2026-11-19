@@ -7215,12 +7215,12 @@ fn a_told_epoch_at_the_top_saturates_nothing() {
 /// A TAB'S OPEN IS NEVER LOST TO ITS REQUESTER (ATERM-KI-1109-3): a fleet drive's open (no parent
 /// tab, as a drive's spawn has none) names a whole requesting sid in `by=` and the requester's
 /// program, model and account at their caps beside a short `why_text=`, within
-/// [`aterm_slog::MAX_RECORD_BYTES`]. With the longest `why_text=` a request admits it gives up the
-/// account and keeps the rest; with every field at its longest (a legacy tab's ID as the parent,
-/// the widest window) it gives up the model too. Each time the mark, its `why_text=` and its
-/// `by=` are kept. The requesting sid is a legacy tab's, the longest a fleet drive's token names
-/// (`fleet:<head>:` and 22 bytes, 37 in all): the requester line takes it, and the actor names
-/// what that line admitted.
+/// [`aterm_slog::MAX_RECORD_BYTES`] (512 bytes, excluding a newline). With the longest
+/// `why_text=` a request admits it gives up the account and keeps the rest; with an exact
+/// 22-byte legacy parent, maximum window and wall timestamp it gives up the model too.
+/// Re-adding each omitted field exceeds the real encoder's byte bound. Each time the mark,
+/// its `why_text=` and its `by=` are kept. A fleet drive names its requester's session by
+/// the current `t` form alone.
 #[test]
 fn open_mark_fits_at_max_sizes() {
     use aterm_types::control_verbs::{
@@ -7231,16 +7231,22 @@ fn open_mark_fits_at_max_sizes() {
         aterm_codec::pct::encoded_len(&longest_why),
         REQUEST_WHY_BYTES
     );
-    let sid = "s-0123456789abcdef0123";
+    let sid = "tqn5r6e0148";
+    assert!(
+        aterm_types::tab_id::is_tab_id(sid),
+        "a current requester ID"
+    );
     let requester = Arc::new(Requester::of(
         Some(sid),
         Some(&"p".repeat(REQUESTER_TOKEN_MAX)),
         Some(&"m".repeat(REQUESTER_TOKEN_MAX)),
         Some(&"a".repeat(REQUESTER_ACCOUNT_BYTES)),
     ));
+    assert_eq!(requester.sid(), Some(sid));
     assert!(requester.program().is_some() && requester.account().is_some());
     let by = Actor::fleet_drive(&"ab".repeat(16), Some(sid));
-    let opened = |why: &str, parent: Option<aterm_slog::ShortId>, window: u64| -> String {
+    assert_eq!(by.word(), format!("fleet:abababab:{sid}"));
+    let opened = |why: &str, parent: Option<aterm_slog::ShortId>, window: u64, stamp: Stamp| {
         let epochs = process(None);
         let mut log = spawned_in(&epochs, 1_000, 0);
         let asked = TabAsked {
@@ -7249,7 +7255,7 @@ fn open_mark_fits_at_max_sizes() {
         };
         log.open_tab(
             TabPlace {
-                opened_wall: at(1_000).wall_ms,
+                opened_wall: stamp.wall_ms,
                 window,
                 parked: true,
                 parent,
@@ -7257,23 +7263,29 @@ fn open_mark_fits_at_max_sizes() {
             "spawn",
             &asked,
             by,
-            at(1_000),
+            stamp,
         );
-        let opens: Vec<String> = log
+        let opens: Vec<_> = log
             .log()
             .window()
             .filter(|r| r.k == Kind::Tab)
-            .map(|r| aterm_slog::encode(r, Tier::Content).expect("fits"))
+            .cloned()
             .collect();
         assert_eq!(opens.len(), 1, "the open is kept: {opens:?}");
-        let open = opens.into_iter().next().expect("one open");
+        let record = opens.into_iter().next().expect("one open");
+        let open = aterm_slog::encode(&record, Tier::Content).expect("fits");
+        assert!(
+            open.len() <= aterm_slog::MAX_RECORD_BYTES && !open.contains('\n'),
+            "the retained record fits without a newline: {} bytes: {open}",
+            open.len()
+        );
         for want in [
             format!("why_text={}", aterm_codec::pct::encode(why)),
             format!("by=fleet:abababab:{sid}"),
         ] {
             assert!(open.split(' ').any(|word| word == want), "{want}: {open}");
         }
-        open
+        (open, record)
     };
     let named = |open: &str| -> Vec<&'static str> {
         ["agent", "model", "account"]
@@ -7284,26 +7296,55 @@ fn open_mark_fits_at_max_sizes() {
             })
             .collect()
     };
-    let short = opened("check the m72 disk", None, 1);
+    let (short, _) = opened("check the m72 disk", None, 1, at(1_000));
     assert!(short.contains(&format!(" agent={} ", "p".repeat(REQUESTER_TOKEN_MAX))));
     assert!(short.contains(&format!(" model={} ", "m".repeat(REQUESTER_TOKEN_MAX))));
     assert!(short.contains(&format!(
         " account={} ",
         "a".repeat(REQUESTER_ACCOUNT_BYTES)
     )));
+    let (without_account, account_record) = opened(&longest_why, None, 1, at(1_000));
+    let mut account_candidate = account_record.clone();
     assert_eq!(
-        named(&opened(&longest_why, None, 1)),
+        named(&without_account),
         ["agent", "model"],
         "the account goes first"
     );
+    account_candidate.f = account_candidate
+        .f
+        .clone()
+        .text(Key::Account, requester.account().expect("an account"))
+        .expect("a legal account field");
+    let overfull = aterm_slog::encode(&account_candidate, Tier::Content);
+    assert!(
+        matches!(&overfull, Err(aterm_slog::EncodeError::TooLarge(_))),
+        "the omitted account exceeds the byte bound: {overfull:?}"
+    );
+
+    let parent_text = "s-0123456789abcdef0123";
+    assert_eq!(parent_text.len(), 22);
+    let parent = aterm_slog::ShortId::new(parent_text).expect("an exact 22-byte legacy parent");
+    let (without_model, model_record) = opened(
+        &longest_why,
+        Some(parent),
+        u64::MAX,
+        Stamp::new(u64::MAX, 1_000),
+    );
+    let mut model_candidate = model_record.clone();
     assert_eq!(
-        named(&opened(
-            &longest_why,
-            aterm_slog::ShortId::new(sid),
-            u64::MAX
-        )),
+        named(&without_model),
         ["agent"],
-        "then the model; the program stays even at every field's longest"
+        "then the model; the program stays with an exact 22-byte legacy parent, maximum window and timestamp"
+    );
+    model_candidate.f = model_candidate
+        .f
+        .clone()
+        .tok(Key::Model, requester.model().expect("a model"))
+        .expect("a legal model field");
+    let overfull = aterm_slog::encode(&model_candidate, Tier::Content);
+    assert!(
+        matches!(&overfull, Err(aterm_slog::EncodeError::TooLarge(_))),
+        "the omitted model exceeds the byte bound: {overfull:?}"
     );
 }
 

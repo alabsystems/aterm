@@ -31,7 +31,9 @@ impl Location {
         })
     }
 
-    fn conflicts(&self, other: &Self) -> bool {
+    /// Whether `other` is shown to be this directory: one resolved path, or one node. What owns a
+    /// login is judged by this alone ([`rows_at`]).
+    fn same(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Default, Self::Default) => true,
             (
@@ -43,16 +45,23 @@ impl Location {
                     path: right,
                     node: rn,
                 },
-            ) => {
-                left == right
-                    || ln.is_some() && ln == rn
-                    || left
-                        .to_str()
-                        .zip(right.to_str())
-                        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
-            }
+            ) => left == right || ln.is_some() && ln == rn,
             _ => false,
         }
+    }
+
+    /// Whether `other` may be this directory: [`Self::same`], or one spelling but for ASCII case,
+    /// which a case-insensitive volume makes one directory and a case-sensitive one two. A
+    /// conservative collision rule, for refusing; it never attributes a directory to an owner.
+    fn conflicts(&self, other: &Self) -> bool {
+        self.same(other)
+            || match (self, other) {
+                (Self::Directory { path: left, .. }, Self::Directory { path: right, .. }) => left
+                    .to_str()
+                    .zip(right.to_str())
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)),
+                _ => false,
+            }
     }
 }
 
@@ -144,7 +153,7 @@ pub(in crate::harness) fn retained_directory_owner_at<'a>(
 ) -> Result<Option<&'a str>, String> {
     let wanted = Location::of(Some(dir), None)?;
     for row in rows.iter().filter(|row| row.label != label) {
-        if wanted.conflicts(&Location::of(row.dir.as_deref(), default)?) {
+        if row_at(&wanted, row, default)? {
             return Ok(Some(row.label.as_str()));
         }
     }
@@ -160,6 +169,71 @@ pub(in crate::harness) fn retained_directory_owner_at<'a>(
         }
     }
     Ok(None)
+}
+
+/// How the rows of a roster stand to one login directory ([`rows_at`]).
+#[derive(Debug, Default)]
+pub(in crate::harness) struct RowsAt<'a> {
+    /// The rows whose login directory is shown to be it: one resolved path or one node. Only
+    /// these own the login.
+    pub(in crate::harness) same: Vec<&'a Row>,
+    /// The rows whose login directory only [`retained_directory_owner_at`]'s collision rule
+    /// relates to it: one spelling but for ASCII case, never shown to be one directory (a leaf
+    /// not made yet, or two directories on a case-sensitive volume). Such a row neither owns the
+    /// login nor leaves it unowned, so its account is never charged for a credential it was not
+    /// shown to hold, and no login is admitted beside it as no account's.
+    pub(in crate::harness) case_only: Vec<&'a Row>,
+}
+
+/// How the rows of `rows` stand to the login directory `dir` (a row that names none: the native
+/// default home, `default`): the rows it is shown to be ([`RowsAt::same`]), and those only one
+/// spelling but for ASCII case relates to it ([`RowsAt::case_only`]), together every row
+/// [`retained_directory_owner_at`] finds there. Execution admission finds a login's owner rows by
+/// this, so a current row's directory reached by another path or spelling is that row's where it
+/// is the same node, and never reads as a directory only a binding retains.
+/// # Errors
+/// A directory's ownership cannot be established (an unreadable, dangling or unresolvable path).
+pub(in crate::harness) fn rows_at<'a>(
+    rows: &'a [Row],
+    dir: &str,
+    default: &Path,
+) -> Result<RowsAt<'a>, String> {
+    let wanted = Location::of(Some(dir), None)?;
+    let mut at = RowsAt::default();
+    for row in rows {
+        let there = Location::of(row.dir.as_deref(), Some(default))?;
+        if wanted.same(&there) {
+            at.same.push(row);
+        } else if wanted.conflicts(&there) {
+            at.case_only.push(row);
+        }
+    }
+    Ok(at)
+}
+
+/// Whether `row`'s login directory (`default` where it names none) may be `wanted`
+/// ([`Location::conflicts`]), as [`retained_directory_owner_at`] holds a row's directory to it: a
+/// row [`rows_at`] reports as the same directory or as only one spelling but for case.
+fn row_at(wanted: &Location, row: &Row, default: Option<&Path>) -> Result<bool, String> {
+    Ok(wanted.conflicts(&Location::of(row.dir.as_deref(), default)?))
+}
+
+/// Whether `was` lists a directory shown to be `dir` (one resolved path or one node, never one
+/// spelling but for case alone, [`Location::same`]): whether a process on `dir` runs on a login
+/// the row whose `was` it is left, which attributes that process to the row.
+/// # Errors
+/// A directory's ownership cannot be established (an unreadable, dangling or unresolvable path).
+pub(in crate::harness) fn left_directory(
+    was: &[Option<String>],
+    dir: &str,
+) -> Result<bool, String> {
+    let wanted = Location::of(Some(dir), None)?;
+    for kept in was.iter().flatten() {
+        if wanted.same(&Location::of(Some(kept), None)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `was` lists the directory `dir`, as [`retained_directory_owner`] compares directories.

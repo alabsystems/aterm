@@ -148,7 +148,10 @@ fn registry_keys_survive_label_collisions_and_missing_labels_across_roster_opera
         assert_eq!(kept.rows[0].class, Class::Preferred);
         with_lab(lab.clone(), || {
             assert!(names_this_mac());
-            assert!(chosen(Cli::Claude, None, None, None).unwrap().is_some());
+            assert!(matches!(
+                chosen(Cli::Claude, None, None, None),
+                Ok(Chosen::Lab(_))
+            ));
         });
     }
 }
@@ -282,7 +285,10 @@ fn a_bound_name_conflict_stays_bound_without_a_display_label() {
         );
         assert_eq!(machine_name(), RegistryNameRead::Bound(Err(why.clone())));
         assert!(
-            chosen(Cli::Claude, None, None, None).is_err(),
+            matches!(
+                chosen(Cli::Claude, None, None, None),
+                Ok(Chosen::Pending(_))
+            ),
             "a binding without a usable key cannot authorize legacy discovery"
         );
         while_pending(|| {
@@ -295,7 +301,7 @@ fn a_bound_name_conflict_stays_bound_without_a_display_label() {
     });
     with_lab(keyed, || {
         assert!(
-            matches!(chosen(Cli::Claude, None, None, None), Ok(Some(_))),
+            matches!(chosen(Cli::Claude, None, None, None), Ok(Chosen::Lab(_))),
             "a conflicted display name must not disable a usable stable machine key"
         );
     });
@@ -535,34 +541,35 @@ fn a_source_the_owner_set_wins_over_the_lab() {
     with_lab(lab, || {
         assert!(matches!(
             chosen(Cli::Claude, None, None, Some(&keyed)),
-            Ok(None)
+            Ok(Chosen::Unnamed)
         ));
         assert!(matches!(
             chosen(Cli::Claude, None, None, Some(&plain)),
-            Ok(Some(_))
+            Ok(Chosen::Lab(_))
         ));
         assert!(matches!(
             chosen(Cli::Kimi, None, None, Some(&keyed)),
-            Ok(Some(_))
+            Ok(Chosen::Lab(_))
         ));
         assert!(
             matches!(
                 chosen(Cli::Claude, None, Some(SOURCE), Some(&keyed)),
-                Ok(Some(_))
+                Ok(Chosen::Lab(_))
             ),
             "naming `alab` still reads the lab"
         );
     });
 }
 
-/// A lab that may name this Mac but could not be read yet ([`pending`]) refuses a sync with no
-/// source named, so neither the sheet nor legacy discovery labels a row after a machine meanwhile;
-/// a source the owner named elsewhere is still read. With nothing pending and no lab, the sync
-/// reads what it always read.
-/// NEGATIVE CONTROL: with `chosen`'s `pending` refusal removed, the pending sync falls through to
-/// legacy discovery (`refused while pending`).
+/// A lab that may name this Mac but could not be read yet ([`pending`]) refuses no sync: one with
+/// no source named, or with `alab` named, is [`Chosen::Pending`], so neither the sheet nor legacy
+/// discovery labels a row after a machine meanwhile and the roster stands; a source the owner
+/// named elsewhere is still read. With nothing pending and no lab, the sync reads what it always
+/// read.
+/// NEGATIVE CONTROL: with `chosen_captured`'s `pending` arm removed, the pending sync falls through
+/// to legacy discovery (`pending, not unnamed`); with the old refusal back, it is an error.
 #[test]
-fn a_pending_lab_refuses_a_sync_with_no_source_named() {
+fn a_pending_lab_goes_on_with_the_roster_and_reads_no_other_source() {
     let dir = aterm_tempfile::TempDir::new().unwrap();
     let plain = dir.path().join("plain.toml");
     fs::write(&plain, "").unwrap();
@@ -574,14 +581,27 @@ fn a_pending_lab_refuses_a_sync_with_no_source_named() {
     .unwrap();
     assert!(matches!(
         chosen(Cli::Claude, None, None, Some(&plain)),
-        Ok(None)
+        Ok(Chosen::Unnamed)
     ));
     while_pending(|| {
         assert!(
-            chosen(Cli::Claude, None, None, Some(&plain)).is_err(),
-            "refused while pending"
+            matches!(
+                chosen(Cli::Claude, None, None, Some(&plain)),
+                Ok(Chosen::Pending(_))
+            ),
+            "pending, not unnamed"
         );
-        assert!(chosen(Cli::Kimi, None, None, Some(&plain)).is_err());
+        assert!(matches!(
+            chosen(Cli::Kimi, None, None, Some(&plain)),
+            Ok(Chosen::Pending(_))
+        ));
+        assert!(
+            matches!(
+                chosen(Cli::Claude, None, Some(SOURCE), Some(&plain)),
+                Ok(Chosen::Pending(_))
+            ),
+            "naming `alab` while it is unread is no refusal either"
+        );
         assert!(matches!(
             chosen(
                 Cli::Claude,
@@ -589,11 +609,11 @@ fn a_pending_lab_refuses_a_sync_with_no_source_named() {
                 Some("/fleet/accounts.toml"),
                 Some(&plain)
             ),
-            Ok(None)
+            Ok(Chosen::Unnamed)
         ));
         assert!(matches!(
             chosen(Cli::Claude, None, None, Some(&keyed)),
-            Ok(None)
+            Ok(Chosen::Unnamed)
         ));
     });
 }
@@ -965,6 +985,7 @@ fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
     with_lab(lab.clone(), || {
         let fleet = chosen(Cli::Claude, None, None, Some(&plain))
             .unwrap()
+            .lab()
             .expect("the lab is the source");
         assert!(fleet.accounts.is_empty());
         assert_eq!(fleet.alab.as_ref(), Some(&test_machine("m1")));
@@ -981,7 +1002,7 @@ fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
     with_lab(Lab { me: None, ..lab }, || {
         assert!(matches!(
             chosen(Cli::Claude, None, None, Some(&plain)),
-            Ok(None)
+            Ok(Chosen::Unnamed)
         ))
     });
 }

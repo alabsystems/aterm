@@ -138,7 +138,7 @@ fn standin_halted_run() {
         },
     )
     .expect("the result written");
-    crate::end_run(&ctx, &scratch);
+    crate::end_run(&ctx, &scratch, None);
     std::process::exit(code);
 }
 

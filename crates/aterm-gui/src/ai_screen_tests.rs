@@ -477,6 +477,7 @@ fn a_claude_row_whose_sign_in_starts_nothing_offers_no_sign_in() {
         renew_by: None,
         on_token_until: None,
         limited_until: None,
+        model_walls: std::collections::BTreeMap::new(),
         served_at: None,
         renewed_at: None,
         signed_out_at: None,

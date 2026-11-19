@@ -397,6 +397,7 @@ fn an_unbound_typed_asked_answer_clears_only_its_exact_wire_and_rollback() {
         let mut expected = st.clone();
         expected.native_prepare.clear();
         expected.native_rollback = false;
+        expected.spend_native();
         assert_eq!(unadmitted_reply(&mut st), Ok(Recovery::Unadmitted));
         assert_eq!(st, expected);
         assert!(st.native_coordination);
@@ -481,6 +482,7 @@ fn a_lapsed_answer_drops_exactly_the_operation_of_a_cold_or_asked_restart_bound_
             expected.native = None;
             expected.native_prepare.clear();
             expected.native_rollback = false;
+            expected.spend_native();
             assert_eq!(
                 lapsed_reply(&mut st),
                 Ok(Recovery::Lapsed),
@@ -488,7 +490,8 @@ fn a_lapsed_answer_drops_exactly_the_operation_of_a_cold_or_asked_restart_bound_
             );
             assert_eq!(
                 st, expected,
-                "asked={asked} bound={bound}: only the operation, its binding and its phase go"
+                "asked={asked} bound={bound}: only the operation, its binding and its phase go, \
+                 and the exit spends one native relaunch"
             );
             assert_eq!(refusal_word(Ok(Recovery::Lapsed)), "native-lapsed");
         }

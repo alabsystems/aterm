@@ -659,6 +659,14 @@ pub(crate) struct Host {
     /// only this one: the plan's changes still wait for Set up now or a group.
     stopped_access: bool,
     latest_status: SetupStatus,
+    /// System Resources' Spotlight probe reading last walked, with the folders it found a person
+    /// took back ([`App::spotlight_taken_back`]): a reading is walked once, when the probe
+    /// publishes it, not at each vitals sample that publishes the page. Held by the reading
+    /// itself, so a reading of another slot is never taken for it.
+    spotlight_read: Option<(
+        std::sync::Arc<crate::resources_spotlight::ScopeReading>,
+        Vec<String>,
+    )>,
     /// Read the worker's current owned facts at delivery. No observation or
     /// admission is retained here, and full status replies keep their other fields.
     readings: Option<fn() -> SetupReadings>,
@@ -1352,6 +1360,7 @@ impl App {
         if !self.system_state_host.showing_fixture() {
             self.settle_missing_tools_exception();
             status.tools_owed = self.developer_tools_owed(status.repositories_reading());
+            status.spotlight_taken_back = self.spotlight_taken_back();
             let step = tools_step.unwrap_or_else(|| self.developer_tools_page_step(&status));
             status.mac_setup = step;
             if status.repositories_tools_wait().is_some() {
@@ -1430,6 +1439,46 @@ impl App {
     /// it. The status poll is left as it was.
     pub(crate) fn republish_system_state_access_step(&mut self) {
         if !self.system_state_window_moved(Instant::now()) {
+            return;
+        }
+        let (in_flight, next) = (
+            self.system_state_host.status_in_flight,
+            self.system_state_host.next_status,
+        );
+        self.publish_system_state(self.system_state_host.latest_status.clone());
+        self.system_state_host.status_in_flight = in_flight;
+        self.system_state_host.next_status = next;
+    }
+
+    /// The folders System Resources' Spotlight probe last found a person took back since setup
+    /// kept them out ([`SetupStatus::spotlight_taken_back`]): an in-memory read of its slot,
+    /// each reading walked once.
+    ///
+    /// The probe asks only while System Resources is on screen, and keeps nothing across a
+    /// restart: until it has read, the row reads the scope as setup's receipt names it.
+    fn spotlight_taken_back(&mut self) -> Vec<String> {
+        let Some((scope, _)) = self.vitals.spotlight_scope.reading() else {
+            return Vec::new();
+        };
+        if let Some((read, taken)) = &self.system_state_host.spotlight_read
+            && std::sync::Arc::ptr_eq(read, &scope)
+        {
+            return taken.clone();
+        }
+        let taken = scope.taken_back();
+        self.system_state_host.spotlight_read = Some((scope, taken.clone()));
+        taken
+    }
+
+    /// Republish System State when the folders a person took back into Spotlight moved since
+    /// the last publish (FL-188's Kept as you set it), leaving the status poll as it was. Only a
+    /// status the window showed is shown again.
+    pub(crate) fn republish_system_state_spotlight(&mut self) {
+        if self.system_state_host.showing_fixture() || !self.system_state_host.status_shown {
+            return;
+        }
+        let taken = self.spotlight_taken_back();
+        if self.system_state_host.latest_status.spotlight_taken_back == taken {
             return;
         }
         let (in_flight, next) = (
@@ -2131,6 +2180,16 @@ impl App {
                 let _ = self.take_system_state_press();
                 if !self.go_to_developer_tools_tab() {
                     aterm_log::info!("system state: Go to tab found no Mac Setup tab");
+                }
+            }
+            SystemStateAction::OpenSystemResources => {
+                let _ = self.take_system_state_press();
+                let section =
+                    Some(aterm_types::app_inspection::ResourcesSection::MacosConfiguration);
+                if let Err(why) =
+                    self.open_app(crate::app_control::OpenRequest::SystemResources { section })
+                {
+                    aterm_log::info!("system state: Open System Resources: {why}");
                 }
             }
             SystemStateAction::GoToToolsInstaller => {

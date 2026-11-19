@@ -2298,8 +2298,6 @@ fn copy_details_holds_every_fact_emails_and_both_clocks() {
     token.made_on = Some("m20".into());
     token.verified_on = Some("m12".into());
     token.vault_words = Some("in the vault, shared with 2 Macs".into());
-    token.peers = vec!["m15".into(), "m22".into()];
-    token.peers_read_at = u64::try_from(TODAY_13_05).ok();
     token.step = Some("stopped 11 Nov: the consent page carried a human check".into());
     let progress = facts.account_progress.as_mut().expect("progress");
     progress.details = vec!["sol.m20.2@proton.me: no usable sign-in route".into(); 3];
@@ -2325,7 +2323,6 @@ fn copy_details_holds_every_fact_emails_and_both_clocks() {
         "Token verified on: m12",
         "Vault: in the vault, shared with 2 Macs",
         "Token step: stopped 11 Nov: the consent page carried a human check",
-        "Other Macs on the token: m15, m22, read 13:05 (2026-11-11T13:05:00Z)",
         "Assigned to: m22, this Mac (m20)",
         "Claim: m22, since 09:40 (2026-11-11T09:40:00Z), until 21:40 (2026-11-11T21:40:00Z)",
         "Claim: this Mac (m20), since 13:05",

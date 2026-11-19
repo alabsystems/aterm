@@ -473,8 +473,8 @@ impl<'a> Reading<'a> {
             )),
         }
         let memory = (subject == WhySubject::Mem).then(|| r.footprint_account());
-        let owner = memory.as_ref().map_or_else(
-            || match r.part {
+        let owner = memory.as_ref().map_or(
+            match r.part {
                 Part::Aterm => FootprintOwner::Aterm,
                 part => FootprintOwner::Outside(part),
             },
@@ -709,13 +709,87 @@ impl<'a> Reading<'a> {
                 ),
             ));
         }
+        out.extend(self.index_line());
         out.extend(self.cannot_lines());
         out
     }
 
+    /// What cannot be read: the account's limits, then the Spotlight activity's where the reply
+    /// touches it ([`Self::spotlight`]), less each one the root broker's store answer meets
+    /// ([`crate::spotlight::cannot`]).
+    fn cannot(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = self.a.cannot.clone();
+        if let Some(r) = self.spotlight() {
+            out.extend(crate::spotlight::cannot(r));
+        }
+        out
+    }
+
+    /// The Spotlight family's reading where this reply touches its limits: a CPU reply (the
+    /// calm one included), whose attribution of Spotlight's indexing work they bound. A memory
+    /// reply touches neither the index's progress nor its folder, so it names neither.
+    fn spotlight(&self) -> Option<&crate::spotlight::Reading> {
+        (self.a.subject == WhySubject::Cpu)
+            .then_some(())
+            .and(self.s.spotlight.as_ref())
+    }
+
+    /// The Spotlight index's size on disk, as aterm's root LAN broker walked its stores (SD-94):
+    /// `≥` and the bound where a walk stopped short. `None` without the broker's answer, where
+    /// the `index_folder` cannot line stands instead.
+    fn index_line(&self) -> Option<Line> {
+        let r = self.spotlight()?;
+        let (bytes, cut) = r.index_bytes()?;
+        let size = match cut {
+            None => format!("index_size={bytes}"),
+            Some(cut) => format!("index_size=\u{2265}{bytes} partial={}", cut.word()),
+        };
+        Some(line(
+            "index",
+            format!(
+                "index {size} volumes={} age_ms={} src=root_daemon",
+                r.store.as_ref().map_or(0, Vec::len),
+                r.store_age_ms.unwrap_or(0)
+            ),
+        ))
+    }
+
+    /// The index's size as `sys why --json` carries it: `{"size_bytes", "volumes", "age_ms",
+    /// "src"}`, a walk cut short a lower bound in each figure it cut; `None` without the
+    /// broker's answer.
+    fn index_json(&self) -> Option<Jv> {
+        let r = self.spotlight()?;
+        let (bytes, cut) = r.index_bytes()?;
+        let store = r.store.as_deref().unwrap_or_default();
+        let figure = |n: u64, cut: Option<crate::spotlight::StoreCut>| match cut {
+            None => Jv::u(n),
+            Some(cut) => Jv::at_least(n, cut.word()),
+        };
+        Some(Jv::obj([
+            ("size_bytes", figure(bytes, cut)),
+            (
+                "volumes",
+                Jv::Arr(
+                    store
+                        .iter()
+                        .map(|v| {
+                            Jv::obj([
+                                ("volume", Jv::s(v.volume.clone())),
+                                ("size_bytes", figure(v.bytes, v.cut)),
+                                ("entries", figure(v.entries, v.cut)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+            ("age_ms", Jv::u(r.store_age_ms.unwrap_or(0))),
+            ("src", Jv::s("root_daemon")),
+        ]))
+    }
+
     fn cannot_lines(&self) -> Vec<Line> {
         let mut out = Vec::new();
-        for (what, why) in &self.a.cannot {
+        for (what, why) in &self.cannot() {
             out.push(line(
                 format!("cannot {what}"),
                 format!("cannot what={what} why={why}"),
@@ -826,6 +900,7 @@ pub fn why_text(
             lines.push(w.calm_sentence());
             lines.push(w.you_line(WhySubject::Cpu));
             lines.extend(self_cpu::text(&s.self_cpu));
+            lines.extend(w.index_line());
             lines.extend(w.cannot_lines());
             return;
         }
@@ -934,8 +1009,7 @@ impl Reading<'_> {
     /// The same attribution limits as the text reply, including its calm form.
     fn cannot_json(&self) -> Jv {
         Jv::Arr(
-            self.a
-                .cannot
+            self.cannot()
                 .iter()
                 .map(|(what, why)| {
                     Jv::obj([
@@ -1140,8 +1214,8 @@ impl Reading<'_> {
             o.set("team", Jv::s(team));
         }
         let memory = (subject == WhySubject::Mem).then(|| r.footprint_account());
-        let owner = memory.as_ref().map_or_else(
-            || match r.part {
+        let owner = memory.as_ref().map_or(
+            match r.part {
                 Part::Aterm => FootprintOwner::Aterm,
                 part => FootprintOwner::Outside(part),
             },
@@ -1373,6 +1447,9 @@ pub fn why_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
             o.set("calm", Jv::Bool(true));
             o.set("figure", w.figure_json(WhySubject::Cpu));
             o.set("you", w.you_json(WhySubject::Cpu));
+            if let Some(index) = w.index_json() {
+                o.set("index", index);
+            }
             o.set("cannot", w.cannot_json());
             if let Some(value) = self_cpu::json(&s.self_cpu) {
                 o.set("self_cpu", value);
@@ -1468,6 +1545,9 @@ pub fn why_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
                 .collect(),
         ),
     );
+    if let Some(index) = w.index_json() {
+        o.set("index", index);
+    }
     o.set("cannot", w.cannot_json());
 }
 

@@ -984,7 +984,9 @@ fn with_ctx<R>(input: &DeckInput<'_>, m: &FaceMetrics, f: impl FnOnce(Ctx<'_>) -
         two: false,
         cw: 0.0,
         fresh: input.live.fresh,
+        keys: false,
         disk_span: DiskSpan::Weeks,
+        cpu_policy_pending: input.cpu_policy_pending,
     })
 }
 
@@ -1024,6 +1026,7 @@ pub(crate) fn paint_doc(
         oy: top,
         draw: true,
         line_tab: 0.0,
+        chips: None,
         #[cfg(test)]
         boxes: Vec::new(),
     };

@@ -757,6 +757,12 @@ fn drain_roster(
             let live = g.live_sids();
             diff_session_events(&live, &cursor.known, &mark, out);
             cursor.known = live;
+            #[cfg(any(unix, test))]
+            if let Some((seq, bye)) = g.last_bye()
+                && seq > cursor.seq
+            {
+                out.push_str(&format!("EVENT * bye {}\n", bye.word()));
+            }
         }
     }
     cursor.seq = high;
@@ -1588,17 +1594,37 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, L: PeerLiveness>(
         streams, instance, ..
     } = scopes;
 
+    let mut sub = Subscription::new();
+    // Register before the snapshot: an exit word is either in that snapshot or
+    // rings this watcher and is drained past its roster watermark.
+    let instance_dirty = (instance.sessions() || scopes.adopt.on()).then(|| {
+        sub.watch(
+            &store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .instance_watchers(),
+        )
+    });
+    #[cfg(any(unix, test))]
+    let mut initial_bye = None;
     let (roster, reader) = instance
         .sessions()
         .then(|| {
             let g = store.read().unwrap_or_else(|p| p.into_inner());
             let seq = g.roster_seq();
+            #[cfg(any(unix, test))]
+            let written = {
+                initial_bye = g.last_bye();
+                initial_bye.map_or(seq, |(seq, _)| seq.saturating_sub(1))
+            };
+            #[cfg(not(any(unix, test)))]
+            let written = seq;
             (
                 RosterCursor {
                     seq,
                     known: g.live_sids(),
                 },
-                RosterReader::join(store, seq),
+                RosterReader::join(store, written),
             )
         })
         .unzip();
@@ -1608,18 +1634,9 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, L: PeerLiveness>(
         .map(|t| new_watch(t, streams, &opts))
         .collect();
 
-    let mut sub = Subscription::new();
     for w in &mut watches {
         w.dirty = watch_session(&mut sub, &w.src.watchers, streams);
     }
-    let instance_dirty = (roster.is_some() || scopes.adopt.on()).then(|| {
-        sub.watch(
-            &store
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .instance_watchers(),
-        )
-    });
     if let Some(peer) = liveness.rings() {
         let _ = sub.watch(peer);
     }
@@ -1639,6 +1656,20 @@ pub(crate) fn push_loop_with_peer_probe<W: Write, L: PeerLiveness>(
         instance_dirty,
         reader,
     };
+    #[cfg(any(unix, test))]
+    if let Some((_, bye)) = initial_bye {
+        let frame = Frame::text(
+            Tag::Instance,
+            crate::metrics::now_us(),
+            format!("EVENT * bye {}\n", bye.word()),
+        );
+        if egress.send(vec![frame]).is_err() {
+            return;
+        }
+        if let (Some(reader), Some(cursor)) = (cursors.reader.as_mut(), cursors.roster.as_ref()) {
+            reader.wrote(cursor.seq);
+        }
+    }
     let _ = pump(
         store,
         &mut sub,

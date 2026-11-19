@@ -222,6 +222,7 @@ fn compare_received(
         stream,
         whole,
         batch,
+        served: _,
     } = judge_received_records(initial, "team", received);
     let encoded = batch
         .as_ref()

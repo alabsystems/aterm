@@ -403,6 +403,7 @@ impl Client {
             left: None,
             default_home: true,
             route: aterm_agent::harness::accounts::AuthRoute::Stored,
+            model: aterm_agent::harness::accounts::ModelWeek::Unread,
         };
         let advice = accounts::advise(
             &roster(),

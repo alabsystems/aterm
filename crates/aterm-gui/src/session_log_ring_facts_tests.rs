@@ -93,7 +93,7 @@ fn each_ring_only_fact_wakes_a_parked_await_log() {
     let got = returned(&rx, "mark_alive");
     assert!(got.contains(" mark - state state=alive "), "{got}");
     let rx = parked_log_await(&h, &store, "policy");
-    crate::harness_policy_verb::record_policy_move(&h.ctx.timeline, 7);
+    crate::harness_policy_verb::record_policy_move(&h.ctx, 7);
     let got = returned(&rx, "policy");
     assert!(got.contains(" mark - policy gen=7 "), "{got}");
     let rx = parked_log_await(&h, &store, "topic");

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::park_bell::ParkBell;
+use aterm_uds::park_bell::ParkBell;
 
 /// The backstop between two writes while nothing rings: a window that crashed reads at most this
 /// long before its end.

@@ -8,8 +8,9 @@
 # toolchain is rechecked by. Std plus the first-party TOML parser for configured
 # target custody, aterm-libc's signal declarations,
 # aterm-sysprobe's process sweep (a wait's stuck holder), aterm-uds's account
-# home (where a wait is marked) and aterm-digest's SHA-256 (the status digest),
-# so the check runner (aterm-verify), the libc oracle's gate and the package
+# home (where a wait is marked), aterm-digest's SHA-256 (the status digest) and,
+# on Windows, aterm-dirfd's handle-relative opens and access lists (the Cargo
+# source-cache guard), so the check runner (aterm-verify), the libc oracle's gate and the package
 # manager (atpkg, which re-exports every module under its old path) depend on it
 # instead of compiling a file of another crate by `#[path]`.
 
@@ -54,6 +55,14 @@ libc = { workspace = true }
 # every crate that depends on this one already depends on it, and it does not depend on this
 # one.
 aterm-uds = { workspace = true }
+
+# The Windows arm of the Cargo source-cache guard (`src/cargo_cache_win.rs`): the lock files
+# opened relative to the retained Cargo home and never through a reparse point (`openat`), read
+# through their handles (`fstat`), and their owner and access list (`acl`), as the unix arm reads
+# them with `openat` and `fstat`. Workspace crate with no dependencies on Windows; aterm-uds,
+# which every crate that depends on this one already reaches, depends on it.
+[target.'cfg(windows)'.dependencies]
+aterm-dirfd = { workspace = true }
 
 [dev-dependencies]
 # The lease tests' scratch prefixes, and their one-minute hang detector.

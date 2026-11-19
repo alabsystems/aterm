@@ -15,6 +15,11 @@
 //! `ship`: each claims for the work it starts), `metadata`, `clean`, or a call for help or a
 //! version: those start unclaimed, as before.
 //!
+//! A macOS build or run whose caller supplied no SDK root gets the selected developer SDK as
+//! an explicit child environment input. Queries do not discover tools; Apple mobile targets
+//! keep their platform lookup. The same prepared environment reaches an exec and every
+//! supervised-child fallback, without changing this front's process-global environment.
+//!
 //! What it claims ([`need`]): the most the same work took, read by [`aterm_capacity::book::chain`]
 //! from what earlier builds of it kept here and elsewhere ([`aterm_capacity::book::TARGO_RECORD`])
 //! and verify's run of the stage whose work holds its own, its analogue
@@ -77,6 +82,26 @@ use aterm_capacity::{Admit, Claim, Error, Ledger, Machine, Need, Pace, Record};
 
 use crate::build_cache::Tool;
 
+#[path = "build_admit_sdk.rs"]
+mod sdk;
+
+/// One native launch and its explicit child-only environment additions.
+struct Target<'a> {
+    path: &'a Path,
+    environment: &'a [(std::ffi::OsString, std::ffi::OsString)],
+}
+
+#[cfg(unix)]
+impl Target<'_> {
+    fn command(&self) -> aterm_uds::spawnfd::Command {
+        let mut command = aterm_uds::spawnfd::transparent(self.path).into_command();
+        for (key, value) in self.environment {
+            command.env(key, value);
+        }
+        command
+    }
+}
+
 #[cfg(unix)]
 #[path = "build_admit_output.rs"]
 mod output;
@@ -93,6 +118,12 @@ pub const VERB: &str = aterm_uds::build_front::ADMIT_VERB;
 /// Version-one fronts do not promise that ownership check, so a new shim cannot name them
 /// in its hop ([`crate::build_cache::registered::helper_speaks_hop`]).
 pub const HOP_CAPABILITY: &str = "aterm-build-admit-hop-v2";
+
+#[cfg(target_os = "macos")]
+#[path = "build_admit_claim.rs"]
+mod public_claim;
+#[cfg(target_os = "macos")]
+pub(crate) use public_claim::claim_exec;
 
 #[path = "build_admit_reader.rs"]
 pub mod reader;
@@ -589,12 +620,16 @@ pub fn need(
     verify: &dyn book::ShapingSource,
     physical: Option<u64>,
 ) -> BuildNeed {
-    let like = build.analogue.map(|stage| Key {
+    let like = analogue_key(build, key);
+    book::need(own, key, like.as_ref().map(|l| (verify, l)), physical)
+}
+
+fn analogue_key(build: &Build, key: &Key) -> Option<Key> {
+    build.analogue.map(|stage| Key {
         stage: stage.to_owned(),
         variant: None,
         ..key.clone()
-    });
-    book::need(own, key, like.as_ref().map(|l| (verify, l)), physical)
+    })
 }
 
 /// WHERE A BUILD CLAIMS: the ledger, the machine read, the records, how it is admitted, and who
@@ -1141,7 +1176,12 @@ fn admit_for(
         }
     }
     if !independent {
-        match aterm_capacity::covering(ledger, seat.machine, seat.pid, seat.marker.as_deref()) {
+        match aterm_capacity::covering_command(
+            ledger,
+            seat.machine,
+            seat.pid,
+            seat.marker.as_deref(),
+        ) {
             Ok(Some(_)) if cohort => {
                 return refuse(
                     say,
@@ -1185,13 +1225,10 @@ fn admit_for(
     }
     let key = key(build, cwd);
     let own = seat.own.as_deref().map(Records::load).unwrap_or_default();
-    let verify = seat
-        .verify
-        .as_deref()
-        .map(book::ShapingHistory::load)
-        .unwrap_or_default();
+    let like = analogue_key(build, &key);
+    let found = book::chain_from_verify_path(&own, &key, seat.verify.as_deref().zip(like.as_ref()));
     let reading = seat.machine.read(None);
-    let need = need(build, &key, &own, &verify, reading.physical);
+    let need = BuildNeed::from_found(found, reading.physical);
     // What its run phase claims, kept apart from its compile's (CAP3): its holder steps the claim
     // down to it once its tree runs what it built, and a run heavier than its compile is its peak.
     let run = aterm_capacity::phase::run_need(&own, &key, reading.physical);
@@ -1894,6 +1931,10 @@ thread_local! {
     /// Whether this thread's next [`supervise_launch`] reaps its root at once, as a cohort's
     /// capture does a root that ended before it ([`reap_at_launch`]).
     static REAP_AT_LAUNCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread's fixture observes its actual bound, owned, unreaped root.
+    #[cfg(target_os = "macos")]
+    static HEADLESS_ROOT_STARTED: std::cell::RefCell<Option<std::sync::mpsc::Sender<u32>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Make this thread's next [`supervise_launch`] reap its root as soon as it is launched, with
@@ -2287,7 +2328,19 @@ fn launch_held(
         };
     };
     match held.claim.launch_cohort(command) {
-        Ok(child) => Ok((SupervisedChild::Bound(Box::new(child)), None)),
+        Ok(child) => {
+            #[cfg(all(test, target_os = "macos"))]
+            let child = {
+                let mut child = child;
+                HEADLESS_ROOT_STARTED.with(|slot| {
+                    if let Some(started) = slot.borrow_mut().take() {
+                        let _ = started.send(child.child_mut().id());
+                    }
+                });
+                child
+            };
+            Ok((SupervisedChild::Bound(Box::new(child)), None))
+        }
         Err(LaunchError::Refused(error)) => Err(error),
         Err(LaunchError::NotSpawned(proof)) => {
             let error = std::io::Error::new(proof.error().kind(), proof.error().to_string());
@@ -2432,10 +2485,10 @@ fn end_tree(
     }
 }
 
-/// Replace this process with `target` run on `args`, unchanged: what a call that claims nothing
+/// Replace this process with `target` run on `args` and its prepared environment: what a call that claims nothing
 /// runs. Returns when the exec failed (127, said) or, on macOS, with the build's own end where
 /// it ran as this process's child ([`exec_marked`]).
-fn exec<A: AsRef<std::ffi::OsStr>>(target: &Path, args: &[A]) -> std::process::ExitCode {
+fn exec<A: AsRef<std::ffi::OsStr>>(target: &Target<'_>, args: &[A]) -> std::process::ExitCode {
     exec_marked(target, args, None)
 }
 
@@ -2445,7 +2498,7 @@ fn exec<A: AsRef<std::ffi::OsStr>>(target: &Path, args: &[A]) -> std::process::E
 /// build is not exec'ed but run as this process's child (`run_as_child`): the build's end is
 /// then returned.
 fn exec_marked<A: AsRef<std::ffi::OsStr>>(
-    target: &Path,
+    target: &Target<'_>,
     args: &[A],
     marker: Option<&str>,
 ) -> std::process::ExitCode {
@@ -2457,7 +2510,7 @@ fn exec_marked<A: AsRef<std::ffi::OsStr>>(
             reason = "`Reading` is the macOS-only arm"
         )
     )]
-    let err = match becoming::become_build(target, args, marker) {
+    let err = match becoming::become_build(target.path, args, marker, target.environment) {
         becoming::Stayed::Failed(err) => err,
         #[cfg(target_os = "macos")]
         becoming::Stayed::Reading(still) => return run_as_child(target, args, marker, still),
@@ -2468,22 +2521,28 @@ fn exec_marked<A: AsRef<std::ffi::OsStr>>(
             clippy::disallowed_types,
             reason = "a pass-through by exec: its caller's descriptors are the program's"
         )]
-        let mut command = std::process::Command::new(target);
+        let mut command = std::process::Command::new(target.path);
         aterm_uds::spawn::set_flags(&mut command, 0);
         command.args(args);
+        for (key, value) in target.environment {
+            command.env(key, value);
+        }
         if let Some(marker) = marker {
             command.env(aterm_capacity::COVER_ENV, marker);
         }
         crate::platform::exec_or_run(&mut command)
     };
-    eprintln!("atpkg {VERB}: failed to exec {}: {err}", target.display());
+    eprintln!(
+        "atpkg {VERB}: failed to exec {}: {err}",
+        target.path.display()
+    );
     std::process::ExitCode::from(127)
 }
 
 /// RUN THE BUILD AS THIS FRONT'S CHILD, where the front may not become it
 /// (`becoming::Stayed::Reading`: an exec would wait, for as long as another process's exec
 /// takes and with no way to end the wait, on this front's own thread in the process table):
-/// `target` on `args` with this process's descriptors and environment, [`aterm_capacity::COVER_ENV`]
+/// `target` on `args` with this process's descriptors and its prepared environment, [`aterm_capacity::COVER_ENV`]
 /// set to `marker` where one is given, supervised as a build that claims nothing ([`supervise`]:
 /// every signal that reaches this front for it passed on). Unlike the exec, the child starts
 /// with `SIGPIPE` at its default and no signal blocked, whatever this front was started with.
@@ -2493,7 +2552,7 @@ fn exec_marked<A: AsRef<std::ffi::OsStr>>(
 /// 127, said, where the build did not start.
 #[cfg(target_os = "macos")]
 fn run_as_child<A: AsRef<std::ffi::OsStr>>(
-    target: &Path,
+    target: &Target<'_>,
     args: &[A],
     marker: Option<&str>,
     still: aterm_sysprobe::exec_gate::StillReading,
@@ -2502,7 +2561,7 @@ fn run_as_child<A: AsRef<std::ffi::OsStr>>(
     say(&format!(
         "{SAYS}: {still}; an exec would wait on it, so the build runs as this front's child"
     ));
-    let mut command = aterm_uds::spawnfd::transparent(target).into_command();
+    let mut command = target.command();
     command.args(args.iter().map(AsRef::as_ref));
     if let Some(marker) = marker {
         command.env(aterm_capacity::COVER_ENV, marker);
@@ -2519,7 +2578,6 @@ fn run_as_child<A: AsRef<std::ffi::OsStr>>(
 }
 
 /// The tool `target` is, by its name: the lint's own binary, else `targo`.
-#[cfg(unix)]
 fn tool_of(target: &Path) -> Tool {
     match target.file_name().and_then(|n| n.to_str()) {
         Some("targo-tippy") => Tool::Tippy,
@@ -2725,11 +2783,27 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
     }
     #[cfg(not(unix))]
     let _ = built;
+    let tool = shim.map_or_else(|| tool_of(target), |(tool, _)| tool);
+    let mut environment = sdk::environment(tool, rest);
+    // DC-24b: a Mac at Full Access names its unit source to the targo it starts; a call that
+    // names its own keeps it.
+    if tool == Tool::Targo
+        && let Some(source) = crate::build_cache::unit_source::for_front(
+            std::env::var_os(crate::build_cache::unit_source::UNIT_SOURCE_ENV).as_deref(),
+            aterm_types::dirs::state_dir().as_deref(),
+            std::env::current_exe().ok().as_deref(),
+        )
+    {
+        environment.push(source);
+    }
+    let target = Target {
+        path: target,
+        environment: &environment,
+    };
     #[cfg(unix)]
     if let Some(args) = words
         && let Ok(cwd) = std::env::current_dir()
     {
-        let tool = shim.map_or_else(|| tool_of(target), |(tool, _)| tool);
         // Registration above consumes the shim's original leading placement pair. The
         // compiler then gets every config in one parser, past its command boundary.
         let args = if tool == Tool::Targo {
@@ -2760,9 +2834,9 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
             crate::build_start::note(tab, &built.workspace, built.build_dir.as_deref());
         }
         let hold = DiskHold::live(built.as_ref().and_then(|b| b.build_dir.clone()));
-        return front_exec_bounded(target, &args, tool, &cwd, &seat, &possible_lock, hold);
+        return front_exec_bounded(&target, &args, tool, &cwd, &seat, &possible_lock, hold);
     }
-    exec(target, rest)
+    exec(&target, rest)
 }
 
 /// Candidate lock-file names for a possible-cycle hint, never ownership or admission proof.
@@ -2854,7 +2928,7 @@ fn usage() -> std::process::ExitCode {
 /// this one.
 #[cfg(unix)]
 fn front_exec_bounded(
-    target: &Path,
+    target: &Target<'_>,
     args: &[String],
     tool: Tool,
     cwd: &Path,
@@ -2918,13 +2992,13 @@ fn front_exec_bounded(
 #[cfg(unix)]
 fn under_this_front(
     held: Held,
-    target: &Path,
+    target: &Target<'_>,
     args: &[String],
     why: &str,
     say: &mut dyn FnMut(&str),
 ) -> std::process::ExitCode {
     say(&format!("{SAYS}: {why}; the build runs under this front"));
-    let mut command = aterm_uds::spawnfd::transparent(target).into_command();
+    let mut command = target.command();
     command.args(args);
     match supervise(Some(held), &mut command, say) {
         Ok(status) => end_like(status),

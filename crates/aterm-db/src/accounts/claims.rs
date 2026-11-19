@@ -190,6 +190,7 @@ fn command(machine: &[u8; 16], body: &Value) -> Result<Command> {
             key,
             value: Some(body.clone()),
         }],
+        said: None,
     })
 }
 
@@ -207,7 +208,10 @@ fn canonical(body: &Value) -> Result<Vec<u8>> {
 
 /// The row fields a decoded command carries (`machine`, `body`, `key`, `request`).
 fn row_fields(command: &Command) -> Result<([u8; 16], &Value, &str, &[u8; 16])> {
-    let Command::Write { request, changes } = command else {
+    let Command::Write {
+        request, changes, ..
+    } = command
+    else {
         return Err(Error::new("claim command is not a write"));
     };
     let [change] = changes.as_slice() else {
@@ -788,12 +792,13 @@ fn write_started(
     if sealed_legacy {
         snapshot = directory.snapshot_if_exists(&session).ok();
     }
-    let state = directory.retire(&session, &CLAIMS, now)?;
+    let state = directory.retired(&session, &CLAIMS, now)?;
     // The registry roll's housekeeping rides the same writer pass as the ring's retirement: this
     // Mac declares each registry generation it compiles that another Mac declared, which is what
     // lets a roll seal the one before (`alab::roll::endorse`), and at most daily each sealed
     // table whose rows lapsed or were carried frees its directory (`catalog::release`). Neither
-    // ever fails the write.
+    // ever fails the write. A family that keeps its records across a roll is declared the same
+    // way (`att::roll::endorse`); none of its generations is ever released.
     if let Some(snapshot) = &snapshot {
         crate::alab::roll::endorse(
             &session,
@@ -801,6 +806,7 @@ fn write_started(
             snapshot,
             &crate::alab::secret::store(paths),
         );
+        crate::att::roll::endorse(&session, &directory, snapshot);
         let _ = directory.release_due(&session, snapshot, now, &crate::alab::roll::covered);
     }
 

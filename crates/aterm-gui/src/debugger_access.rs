@@ -24,16 +24,32 @@ pub(crate) const RESULT_RECHECK: Duration = Duration::from_secs(5);
 /// The marker beside `aterm.toml` naming a change child in flight.
 pub(crate) const CHANGE_MARKER: &str = "privacy-debugger-change";
 
-/// The marker beside `aterm.toml` holding the last observed mode, when aterm first saw it, and
-/// who set it (design §3.5).
-pub(crate) const OBSERVED_MARKER: &str = "privacy-debugger-observed";
+/// The marker beside `aterm.toml` that held the last observed mode, when aterm first saw it, and
+/// who set it (design §3.5) before each Mac kept its own ([`own_observed`],
+/// [`aterm_types::macos_setup::debugger_record`]): builds before that write and read it, and this
+/// one only reads it ([`observed_marker`]).
+pub(crate) const OBSERVED_MARKER: &str = aterm_types::macos_setup::debugger_record::OBSERVED;
+
+/// The name of this Mac's own observed record beside `aterm.toml`, the one a run aterm decided
+/// reads too ([`aterm_types::macos_setup::debugger_record::observed_on`] of this Mac's hardware
+/// UUID): `None` where the UUID cannot be read, and then no record is this Mac's. A test's
+/// window runs on a Mac of its own, whose UUID the test fixes on every platform, so no test
+/// needs the UUID only macOS has or touches the record of the Mac it runs on.
+pub(crate) fn own_observed() -> Option<String> {
+    #[cfg(not(test))]
+    let host = aterm_containment::consent::host_uuid();
+    #[cfg(test)]
+    let host = Some(tests::THIS_MAC.to_owned());
+    host.as_deref()
+        .and_then(aterm_types::macos_setup::debugger_record::observed_on)
+}
 
 /// The Mac-wide change lock beside `aterm.toml`.
 pub(crate) const CHANGE_LOCK: &str = "privacy-debugger-change.lock";
 
 /// Both markers hold one short line; anything bigger is not a record this build wrote, and
 /// reads as nothing.
-pub(crate) const MAX_MARKER_BYTES: usize = 96;
+pub(crate) const MAX_MARKER_BYTES: usize = aterm_types::macos_setup::debugger_record::MAX_BYTES;
 
 /// Wall-clock seconds since the epoch: the markers' and the page's clock.
 pub(crate) fn now_secs() -> u64 {
@@ -108,33 +124,12 @@ impl ChangeMarker {
 }
 
 /// Who set the mode an [`ObservedMarker`] records.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Origin {
-    Aterm,
-    Outside,
-    Unknown,
-}
+pub(crate) use aterm_types::macos_setup::debugger_record::Origin;
 
-impl Origin {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Aterm => "aterm",
-            Self::Outside => "outside",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    fn from_token(token: &str) -> Option<Self> {
-        match token {
-            "aterm" => Some(Self::Aterm),
-            "outside" => Some(Self::Outside),
-            "unknown" => Some(Self::Unknown),
-            _ => None,
-        }
-    }
-}
-
-/// The `privacy-debugger-observed` record: `<enabled|disabled> <since> <origin>`.
+/// An observed record: `<enabled|disabled> <since> <origin>`, in
+/// [`aterm_types::macos_setup::debugger_record::Observed`]'s bytes, in this Mac's own file
+/// ([`own_observed`]), which a run aterm decided reads too. Only an enabled or a disabled mode is
+/// ever recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ObservedMarker {
     pub(crate) mode: DebuggerMode,
@@ -144,35 +139,28 @@ pub(crate) struct ObservedMarker {
 }
 
 impl ObservedMarker {
+    /// The record as [`aterm_types::macos_setup::debugger_record`] holds it.
+    fn record(&self) -> aterm_types::macos_setup::debugger_record::Observed {
+        aterm_types::macos_setup::debugger_record::Observed {
+            enabled: self.mode == DebuggerMode::Enabled,
+            since: self.since,
+            origin: self.origin,
+        }
+    }
+
     pub(crate) fn encode(&self) -> String {
-        format!(
-            "{} {} {}",
-            self.mode.as_str(),
-            self.since,
-            self.origin.as_str()
-        )
+        self.record().encode()
     }
 
     pub(crate) fn parse(text: &str) -> Option<Self> {
-        let mut words = text.split_whitespace();
-        let mode = match words.next()? {
-            "enabled" => DebuggerMode::Enabled,
-            "disabled" => DebuggerMode::Disabled,
-            _ => return None,
-        };
-        let since = words
-            .next()
-            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
-            .parse()
-            .ok()?;
-        let origin = Origin::from_token(words.next()?)?;
-        if words.next().is_some() {
-            return None;
-        }
-        Some(Self {
-            mode,
-            since,
-            origin,
+        aterm_types::macos_setup::debugger_record::Observed::parse(text).map(|record| Self {
+            mode: if record.enabled {
+                DebuggerMode::Enabled
+            } else {
+                DebuggerMode::Disabled
+            },
+            since: record.since,
+            origin: record.origin,
         })
     }
 }
@@ -197,6 +185,24 @@ fn write_debugger_marker(
         ));
     };
     crate::config_marker::write_marker(&path, text, MAX_MARKER_BYTES, flush)
+}
+
+/// [`write_debugger_marker`] only where no marker `name` stands yet
+/// ([`crate::config_marker::create_marker`]): `Ok(false)` where one does, left as it stands.
+fn create_debugger_marker(
+    config_path: &Path,
+    name: &str,
+    text: &str,
+    flush: crate::durable::Flush,
+) -> std::io::Result<bool> {
+    let _serial = DEBUGGER_MARKS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(path) = marker_path(config_path, name) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no config directory to record in",
+        ));
+    };
+    crate::config_marker::create_marker(&path, text, MAX_MARKER_BYTES, flush)
 }
 
 fn remove_debugger_marker(config_path: &Path, name: &str) -> std::io::Result<()> {
@@ -325,8 +331,9 @@ fn take_change_lock_with_clock(
     }
 }
 
-/// Write the observed record, then, under the change lock, remove an ended change's marker if
-/// it still names `release`'s child.
+/// Write this Mac's observed record ([`own_observed`]; none where this Mac's UUID cannot be
+/// read), then, under the change lock, remove an ended change's marker if it still names
+/// `release`'s child.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -340,11 +347,24 @@ pub(crate) fn settle_markers(
     observed: Option<ObservedMarker>,
     release: Option<&DevtoolsChild>,
 ) {
+    settle_markers_as(config_path, own_observed().as_deref(), observed, release);
+}
+
+/// [`settle_markers`] as the window whose own observed record is named `own` ([`own_observed`])
+/// writes it: another Mac's record, and the one from before records named their Mac, are left
+/// as they stand, and with no name nothing is written.
+pub(crate) fn settle_markers_as(
+    config_path: &Path,
+    own: Option<&str>,
+    observed: Option<ObservedMarker>,
+    release: Option<&DevtoolsChild>,
+) {
     let lock = release.map(|_| take_change_lock(config_path, change_lock_patience()));
     if let Some(marker) = observed
+        && let Some(own) = own
         && let Err(error) = write_debugger_marker(
             config_path,
-            OBSERVED_MARKER,
+            own,
             &marker.encode(),
             crate::durable::Flush::Ordered,
         )
@@ -404,7 +424,8 @@ pub(crate) struct RecordsRead {
 }
 
 /// Read both markers, off the UI thread, judging a change marker's child by pid and birth
-/// (`alive`), since a pid may be reused.
+/// (`alive`), since a pid may be reused; the observed mode is this Mac's own record's
+/// ([`observed_marker`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -422,6 +443,16 @@ pub(crate) struct RecordsRead {
     )
 )]
 pub(crate) fn read_records(config_path: &Path, alive: fn(&DevtoolsChild) -> bool) -> RecordsRead {
+    read_records_as(config_path, own_observed().as_deref(), alive)
+}
+
+/// [`read_records`] as the window whose own observed record is named `own` ([`own_observed`])
+/// reads them.
+pub(crate) fn read_records_as(
+    config_path: &Path,
+    own: Option<&str>,
+    alive: fn(&DevtoolsChild) -> bool,
+) -> RecordsRead {
     let mut read = RecordsRead::default();
     let change = match read_debugger_marker(config_path, CHANGE_MARKER) {
         Some(text) => Some(text),
@@ -463,9 +494,57 @@ pub(crate) fn read_records(config_path: &Path, alive: fn(&DevtoolsChild) -> bool
             },
         }
     }
-    read.observed = read_debugger_marker(config_path, OBSERVED_MARKER)
-        .and_then(|text| ObservedMarker::parse(&text));
+    read.observed = observed_marker(config_path, own);
     read
+}
+
+/// The observed mode as the window whose own record is named `own` ([`own_observed`]) reads it:
+/// that record alone, never another Mac's own, which a dotfiles folder synced live between Macs
+/// or carried by Migration Assistant holds beside it. Where this Mac has no record yet, the one
+/// from before records named their Mac ([`OBSERVED_MARKER`]) keeps its word, as it did, and is
+/// kept once as this Mac's own, so a run aterm decided reads it from then on. That record names
+/// no Mac: in a folder Macs share it may be another Mac's older build's, and it is taken as this
+/// Mac's all the same, as every build before took it. It is kept only where this Mac's record is
+/// still missing, so a newer one another window of this Mac wrote meanwhile stands and is read,
+/// and it is left as it stands for the builds that still write it. With no name (this Mac's UUID
+/// unread) that earlier record alone is read and nothing is written.
+fn observed_marker(config_path: &Path, own: Option<&str>) -> Option<ObservedMarker> {
+    observed_marker_between(config_path, own, || {})
+}
+
+/// [`observed_marker`], running `between` once this Mac's record read as missing and before the
+/// earlier record is kept as it: where a test puts another window.
+fn observed_marker_between(
+    config_path: &Path,
+    own: Option<&str>,
+    between: impl FnOnce(),
+) -> Option<ObservedMarker> {
+    let read = |name: &str| {
+        read_debugger_marker(config_path, name).and_then(|text| ObservedMarker::parse(&text))
+    };
+    let Some(own) = own else {
+        return read(OBSERVED_MARKER);
+    };
+    if let Some(mine) = read(own) {
+        return Some(mine);
+    }
+    let was = read(OBSERVED_MARKER)?;
+    between();
+    match create_debugger_marker(
+        config_path,
+        own,
+        &was.encode(),
+        crate::durable::Flush::Ordered,
+    ) {
+        Ok(true) => Some(was),
+        Ok(false) => read(own).or(Some(was)),
+        Err(error) => {
+            aterm_log::warn!(
+                "debugger access: the earlier observed mode not kept as this Mac's: {error}"
+            );
+            Some(was)
+        }
+    }
 }
 
 /// Start the one records reader.
@@ -1751,11 +1830,13 @@ impl DebuggerChangeLane {
 
 /// Whether debugger access reading off is the person's choice: this process saw it go off
 /// (`drift`), or the observed record says it was allowed or that aterm or something else turned
-/// it off. Pure, so every launch judges it the same way.
+/// it off ([`aterm_types::macos_setup::debugger_record::off_is_chosen`], which a run aterm
+/// decided judges by too).
 pub(crate) fn off_is_chosen(drift: bool, recorded: Option<ObservedMarker>) -> bool {
-    drift
-        || recorded
-            .is_some_and(|was| was.mode == DebuggerMode::Enabled || was.origin != Origin::Unknown)
+    aterm_types::macos_setup::debugger_record::off_is_chosen(
+        drift,
+        recorded.map(|was| was.record()).as_ref(),
+    )
 }
 
 /// A change child in flight, for the row's "waiting" line (since `<time>`).

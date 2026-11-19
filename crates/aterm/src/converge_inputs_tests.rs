@@ -969,6 +969,7 @@ fn inputs_owe_their_next_look_by_what_no_watch_hears() {
             state: None,
             ready: readiness.ready.take(),
         },
+        requests: RequestsInputs::new(&readiness.paths),
         watched: None,
         fixed: BTreeSet::new(),
     };
@@ -1211,4 +1212,159 @@ fn a_passs_own_checkout_writes_call_for_no_repair() {
         ((), Wrote::Own)
     });
     assert_eq!(inputs.changed(&sys, true, minute(7)).unwrap(), None);
+}
+
+/// A FULL TABLE'S REFUSAL WAKES `sync.requests` WHEN ITS INPUTS MOVE (ATERM-KI-1116-3474): the
+/// runner's recheck runs the passes against a full table anyway, and a move that can let the
+/// table take this Mac's records starts one at once. A look that finds the refusal standing asks
+/// for nothing and watches the record, the ledger and the table's claim; one after the claim was
+/// renamed (the table took a record) or a need was raised asks for a pass, once, and not while
+/// sharing is held; one that finds the refusal gone (a pass the table took an append of forgot
+/// it) asks for none. A spent writer quota, which other Macs' records do not lift, watches no
+/// claim.
+/// NEGATIVE CONTROL: with `RequestsInputs::request` returning `None` on a moved refusal, a raised
+/// need waits for the runner's recheck to be posted.
+#[test]
+fn a_full_tables_refusal_asks_for_a_pass_once_its_inputs_move() {
+    use aterm_secrets::need::{self, full, full::Bound, full::By};
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&std::fs::canonicalize(scratch.path()).unwrap());
+    let claims = paths.dir.join("commons/table-claims");
+    std::fs::create_dir_all(&claims).unwrap();
+    let claim = claims.join("table.claim");
+    let put_claim = |bytes: &[u8]| aterm_uds::atomic_file::write(&claim, bytes, 0o600).unwrap();
+    put_claim(b"claim at 8192");
+    let mut inputs = RequestsInputs::new(&paths);
+    let read = |paths: &Paths| aterm_db::credentials::full(paths).ok();
+    let look = |inputs: &mut RequestsInputs, allowed: bool| inputs.request(read, || allowed);
+    let repair = Some(aterm_secrets::converge::RepositoryRequest::Repair);
+    assert_eq!(look(&mut inputs, true), None, "nothing recorded");
+
+    full::record(
+        &paths,
+        By::Member,
+        Bound::Table,
+        8192,
+        &claim,
+        b"claim at 8192",
+    )
+    .unwrap();
+    assert_eq!(look(&mut inputs, true), None, "the refusal stands");
+    assert_eq!(
+        inputs.watched().collect::<Vec<_>>(),
+        vec![
+            Watch::File(paths.dir.join(full::FILE)),
+            Watch::File(paths.dir.join("needs.toml")),
+            Watch::File(claim.clone()),
+        ]
+    );
+
+    // The table took a record.
+    put_claim(b"claim at 8193");
+    assert_eq!(look(&mut inputs, true), repair, "the table moved");
+    assert_eq!(look(&mut inputs, true), None, "asked once");
+
+    // The pass met the table full again; then a need is raised, under a sharing hold first.
+    full::record(
+        &paths,
+        By::Member,
+        Bound::Table,
+        8193,
+        &claim,
+        b"claim at 8193",
+    )
+    .unwrap();
+    assert_eq!(look(&mut inputs, true), None, "standing again");
+    need::raise(
+        &paths,
+        need::Want::Gh(need::GhProfile::Dev),
+        need::Purpose::AghDev,
+    )
+    .unwrap();
+    assert_eq!(look(&mut inputs, false), None, "held");
+    assert_eq!(
+        look(&mut inputs, true),
+        repair,
+        "a raised need, asked once the hold lifts"
+    );
+
+    // A pass the table took an append of forgot the refusal: that pass ran, so none is asked.
+    full::forget(&paths, By::Member).unwrap();
+    assert_eq!(look(&mut inputs, true), None, "forgotten");
+
+    // This Mac's writer quota: another Mac's record renames the claim and asks for nothing.
+    full::record(
+        &paths,
+        By::Member,
+        Bound::Writer,
+        4096,
+        &claim,
+        b"claim at 8193",
+    )
+    .unwrap();
+    assert_eq!(look(&mut inputs, true), None, "the quota stands");
+    assert_eq!(
+        inputs.watched().collect::<Vec<_>>(),
+        vec![
+            Watch::File(paths.dir.join(full::FILE)),
+            Watch::File(paths.dir.join("needs.toml")),
+        ]
+    );
+    put_claim(b"claim at 8194");
+    assert_eq!(
+        look(&mut inputs, true),
+        None,
+        "another Mac's record lifts no quota of this Mac's"
+    );
+}
+
+/// A WAKE NO PASS ANSWERED ASKS AGAIN AT A LATER MOVE (ATERM-KI-1116-3474): a look asks for one
+/// pass per reading of a refusal that no longer stands, so a pass that appended nothing (it leaves
+/// the record as it read) asks nothing more of that reading, and a need raised after it reads anew
+/// and asks again rather than waiting for the runner's recheck.
+/// NEGATIVE CONTROL: with `RequestsInputs` remembering only that it asked (a flag, not the
+/// reading), the second need waits for the recheck.
+#[test]
+fn an_unanswered_wake_asks_again_at_a_later_move() {
+    use aterm_secrets::need::{self, full, full::Bound, full::By};
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&std::fs::canonicalize(scratch.path()).unwrap());
+    let claims = paths.dir.join("commons/table-claims");
+    std::fs::create_dir_all(&claims).unwrap();
+    let claim = claims.join("table.claim");
+    aterm_uds::atomic_file::write(&claim, b"claim at 8192", 0o600).unwrap();
+    let mut inputs = RequestsInputs::new(&paths);
+    let read = |paths: &Paths| aterm_db::credentials::full(paths).ok();
+    let look = |inputs: &mut RequestsInputs| inputs.request(read, || true);
+    let repair = Some(aterm_secrets::converge::RepositoryRequest::Repair);
+    full::record(
+        &paths,
+        By::Member,
+        Bound::Table,
+        8192,
+        &claim,
+        b"claim at 8192",
+    )
+    .unwrap();
+    assert_eq!(look(&mut inputs), None, "the refusal stands");
+
+    need::raise(
+        &paths,
+        need::Want::Gh(need::GhProfile::Dev),
+        need::Purpose::AghDev,
+    )
+    .unwrap();
+    assert_eq!(look(&mut inputs), repair, "the first need");
+    assert_eq!(look(&mut inputs), None, "asked once for that reading");
+
+    // A pass that appended nothing left the record as it read.
+    assert_eq!(look(&mut inputs), None, "nothing moved since it asked");
+
+    need::raise(&paths, need::Want::Notary, need::Purpose::ByHand).unwrap();
+    assert_eq!(
+        look(&mut inputs),
+        repair,
+        "a later need asks again, though no pass answered the first"
+    );
+    assert_eq!(look(&mut inputs), None, "asked once for that reading");
 }

@@ -25,9 +25,11 @@ fn auth(value: i64) -> accounts::Auth {
 }
 
 fn with_auth(a: &Accts, state: &mut accounts::State, value: i64) {
+    // The word on record, as the only reading of its login.
     let row = state.accounts.entry("main".into()).or_default();
     row.auth = auth(value);
     row.auth_at = (value > 0).then_some(a.clock());
+    row.login = accounts::LoginLedger::of_word(row.auth, row.auth_at);
 }
 
 fn set_auth(a: &Accts, value: i64) {

@@ -23,10 +23,83 @@ pub const DISK_LINE_BYTES: u64 = 1_000_000_000;
 pub struct Event {
     /// The sequence of the snapshot that raised it.
     pub seq: u64,
-    /// That snapshot's monotonic stamp, ns.
+    /// The producer's observation stamp, or the publication stamp for a restored strip marker;
+    /// never an execution timestamp.
     pub at_ns: u64,
+    /// The original source's wall timestamp, never recomputed through a later reading.
+    pub at_unix_ms: Option<i64>,
+    /// The principal captured by the producer; unknown provenance grants no private access.
+    pub scope: EventScope,
     /// What happened.
     pub kind: EventKind,
+}
+
+/// An interval the original producer actually observed; point events carry no interval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventSpan {
+    /// Original wall-clock onset, Unix ms.
+    pub onset_unix_ms: i64,
+    /// Original wall-clock end, Unix ms.
+    pub end_unix_ms: i64,
+}
+
+impl Event {
+    /// The interval retained by the original producer, where one was known.
+    #[must_use]
+    pub fn span(&self) -> Option<EventSpan> {
+        match &self.kind {
+            EventKind::Strip { marker, .. } => marker
+                .span
+                .filter(|span| span.onset_unix_ms < span.end_unix_ms),
+            _ => None,
+        }
+    }
+}
+
+/// A session generation captured with the source that observed an event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionScope {
+    /// The process-local session key.
+    pub local: u64,
+    /// The original stable session id.
+    pub sid: String,
+    /// The original per-launch nonce, in its public hexadecimal form.
+    pub nonce: String,
+}
+
+/// An event's immutable producer authority. A local key alone is never authority.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum EventScope {
+    /// Legacy, imported, or otherwise unbound metadata; owner access only.
+    #[default]
+    Unknown,
+    /// An explicitly machine-wide producer.
+    Machine,
+    /// A private session generation, captured with the original reading.
+    Session(SessionScope),
+}
+
+impl EventScope {
+    /// Bind a key only when the original source contains exactly one matching principal.
+    #[must_use]
+    pub fn session(local: u64, sources: &[SessionScope]) -> Self {
+        let mut matching = sources.iter().filter(|source| source.local == local);
+        match (matching.next(), matching.next()) {
+            (Some(source), None) if !source.sid.is_empty() && !source.nonce.is_empty() => {
+                Self::Session(source.clone())
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// What the canonical marker admission changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StripChangeKind {
+    /// A new marker was admitted.
+    Insert,
+    /// An existing marker gained an earlier or more precise source detail.
+    Update,
 }
 
 /// Which scope a `load` event is about.
@@ -66,6 +139,13 @@ impl DiskLine {
 /// What an event says.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EventKind {
+    /// A marker admitted by the existing strip's deduplication and coalescing authority.
+    Strip {
+        /// Its original timestamp, label, category, and producer scope.
+        marker: crate::model::StripEvent,
+        /// Whether this admission inserted or corrected a marker.
+        change: StripChangeKind,
+    },
     /// Memory pressure moved.
     Pressure {
         /// The level before.
@@ -154,6 +234,9 @@ pub enum EventKind {
         /// The exit status, once known.
         exit: Option<i32>,
     },
+    /// A memory starvation episode opened or ended ([`crate::starving`]): a health episode,
+    /// which the host journals at each edge.
+    Starving(Box<crate::starving::Edge>),
 }
 
 impl EventKind {
@@ -161,6 +244,12 @@ impl EventKind {
     #[must_use]
     pub fn word(&self) -> &'static str {
         match self {
+            Self::Strip { marker, .. } => match marker.kind {
+                crate::model::StripEventKind::SleepWake => "sleep",
+                crate::model::StripEventKind::PressureSpike => "pressure_spike",
+                crate::model::StripEventKind::Restart => "restart",
+                crate::model::StripEventKind::Crash => "crash",
+            },
             Self::Pressure { .. } => "pressure",
             Self::Thermal { .. } => "thermal",
             Self::Swap { .. } => "swap",
@@ -170,9 +259,14 @@ impl EventKind {
             Self::Lane { .. } => "lane",
             Self::Orphan { .. } => "orphan",
             Self::Job { .. } => "job",
+            Self::Starving(_) => STARVING_WORD,
         }
     }
 }
+
+/// The memory starvation episode's kind word: its events' `kind=`, its `await sys` term and its
+/// journal records' key (`system/starving`).
+pub const STARVING_WORD: &str = "starving";
 
 /// A scope's load watch: the level last reported, and a move in progress.
 #[derive(Clone, Copy, Debug, Default)]
@@ -191,24 +285,65 @@ pub struct Detector {
     disk: Option<(String, [bool; 3])>,
     load: HashMap<LoadScope, LoadWatch>,
     tabs: Option<HashMap<u64, String>>,
+    /// Original source bindings travel with the prior tab metadata through a closure.
+    tab_sources: HashMap<u64, EventScope>,
     lanes: [Option<bool>; 5],
     /// Whether the last facts' coalition lane read.
     coalitions: Option<bool>,
     /// Each tab's live processes in the last snapshot that swept them, for `orphan`.
     tab_procs: HashMap<u64, Vec<(u32, String, f32)>>,
+    /// The memory starvation episode's watch.
+    starving: crate::starving::Watch,
 }
 
 impl Detector {
+    /// The memory starvation episode open now, if one is open.
+    #[must_use]
+    pub fn starving(&self) -> Option<&crate::starving::Episode> {
+        self.starving.open()
+    }
+
     /// The events `s` raises against what came before.
-    pub fn detect(&mut self, s: &Snapshot) -> Vec<Event> {
+    pub fn detect(&mut self, s: &Snapshot, sources: &[SessionScope]) -> Vec<Event> {
         let mut out = Vec::new();
+        let previous_sources = self.tab_sources.clone();
         let mut push = |kind| {
+            let scope = match &kind {
+                EventKind::Tab {
+                    key, opened: false, ..
+                }
+                | EventKind::Orphan { key, .. } => {
+                    previous_sources.get(key).cloned().unwrap_or_default()
+                }
+                EventKind::Tab { key, .. } => EventScope::session(*key, sources),
+                EventKind::Load {
+                    scope: LoadScope::Tab(key),
+                    ..
+                } => EventScope::session(*key, sources),
+                EventKind::Job { tab, .. } => EventScope::session(*tab, sources),
+                EventKind::Strip { marker, .. } => marker.scope.clone(),
+                EventKind::Pressure { .. }
+                | EventKind::Thermal { .. }
+                | EventKind::Swap { .. }
+                | EventKind::Disk { .. }
+                | EventKind::Lane { .. }
+                | EventKind::Starving(_)
+                | EventKind::Load {
+                    scope: LoadScope::Global | LoadScope::Aterm,
+                    ..
+                } => EventScope::Machine,
+            };
             out.push(Event {
                 seq: s.seq,
                 at_ns: s.at_ns,
+                at_unix_ms: (s.at_unix_ms != 0).then_some(s.at_unix_ms),
+                scope,
                 kind,
             });
         };
+        if let Some(edge) = self.starving.step(s) {
+            push(EventKind::Starving(Box::new(edge)));
+        }
         if let Some(m) = s.mem.as_ref() {
             let now = m.sample.pressure;
             if now != Pressure::Unknown {
@@ -323,6 +458,12 @@ impl Detector {
                         });
                     }
                 }
+            }
+            if !s.machine_only {
+                self.tab_sources = now
+                    .keys()
+                    .map(|key| (*key, EventScope::session(*key, sources)))
+                    .collect();
             }
             self.tabs = Some(now);
         }
@@ -449,7 +590,14 @@ pub struct JobWatch {
 
 impl JobWatch {
     /// The events `view` raises against the last view, numbered by snapshot `seq` taken at `at_ns`.
-    pub fn step(&mut self, view: &JobsView, seq: u64, at_ns: u64) -> Vec<Event> {
+    pub fn step(
+        &mut self,
+        view: &JobsView,
+        seq: u64,
+        at_ns: u64,
+        at_unix_ms: Option<i64>,
+        sources: &[SessionScope],
+    ) -> Vec<Event> {
         let mut out = Vec::new();
         let mut now: HashMap<(u64, String), Verdict> = HashMap::with_capacity(view.rows.len());
         for r in &view.rows {
@@ -463,6 +611,8 @@ impl JobWatch {
                 out.push(Event {
                     seq,
                     at_ns,
+                    at_unix_ms,
+                    scope: EventScope::session(r.tab, sources),
                     kind: EventKind::Job {
                         tab: r.tab,
                         id: r.id.clone(),

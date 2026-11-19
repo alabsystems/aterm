@@ -197,6 +197,62 @@ fn snapshot(root: &Path) -> Option<BTreeMap<PathBuf, Claim>> {
     same(&before, &std::fs::symlink_metadata(root).ok()?).then_some(result)
 }
 
+/// One complete pool-specific observation, including files beyond the diagnostic
+/// observer's slot limit. Preserve unknown claims rather than dropping them.
+pub(super) fn for_pool(root: &Path, pool: &Path) -> Option<BTreeMap<PathBuf, super::AdoptedSlot>> {
+    let pool = std::fs::canonicalize(pool).ok()?;
+    let mut result = BTreeMap::new();
+    for (path, claim) in snapshot(root)? {
+        if path.parent() != Some(pool.as_path()) {
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("slot-"))
+        else {
+            continue;
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            continue;
+        }
+        let before = std::fs::symlink_metadata(&path).ok()?;
+        // SAFETY: geteuid has no preconditions.
+        if !before.is_file()
+            || before.nlink() != 1
+            || before.uid() != unsafe { libc::geteuid() }
+            || before.mode() & 0o022 != 0
+        {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+            .ok()?;
+        if !same(&before, &file.metadata().ok()?)
+            || !same(&before, &std::fs::symlink_metadata(&path).ok()?)
+        {
+            return None;
+        }
+        result.insert(
+            path,
+            super::AdoptedSlot {
+                file: (before.dev() as u32, before.ino()),
+                claim: match claim {
+                    Claim::Held(holder) => super::AdoptionClaim::Held(holder),
+                    Claim::Unknown => super::AdoptionClaim::Unknown,
+                },
+            },
+        );
+    }
+    Some(result)
+}
+
 fn combine(sight: &Sight, claim: Claim) -> Sight {
     match (sight, claim) {
         (Sight::Empty | Sight::NotHeld { .. }, Claim::Held(holder)) => Sight::Sighted(holder),

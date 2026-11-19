@@ -2265,6 +2265,8 @@ impl Drop for BackgroundWaiter {
 #[cfg(unix)]
 #[test]
 fn a_release_queued_while_background_waits_stops_before_grant() {
+    use aterm_spec::wait::until_while_working;
+
     let Some(dir) = std::env::var_os(RELEASE_DURING_BACKGROUND_WAIT).map(PathBuf::from) else {
         let s = scratch("release-during-background-wait");
         let machine = mac48();
@@ -2280,6 +2282,7 @@ fn a_release_queued_while_background_waits_stops_before_grant() {
                 "--nocapture",
             ])
             .env(RELEASE_DURING_BACKGROUND_WAIT, s.dir.path())
+            .stderr(std::fs::File::create(s.dir.path().join("child-stderr")).unwrap())
             .process_group(0)
             .spawn()
             .expect("the dedicated Background stand-in");
@@ -2287,9 +2290,11 @@ fn a_release_queued_while_background_waits_stops_before_grant() {
             child,
             abort: s.dir.path().join("abort"),
         };
-        until_within(MUST_HAPPEN, "Background to wait behind Ordinary", || {
-            s.dir.path().join("waiting").exists().then_some(())
-        });
+        until_while_working(
+            background.child.id(),
+            "Background to wait behind Ordinary",
+            || s.dir.path().join("waiting").exists().then_some(()),
+        );
         let waiting = s
             .ledger
             .list()
@@ -2315,10 +2320,16 @@ fn a_release_queued_while_background_waits_stops_before_grant() {
             .find(|row| row.need.what == "release during wait")
             .expect("the Release is queued");
         assert!(release_row.held.is_none(), "the Release is still queued");
-        let status = until_within(MUST_HAPPEN, "Release to end the Background wait", || {
-            background.child.try_wait().unwrap()
-        });
-        assert!(status.success(), "the race stand-in succeeded: {status}");
+        let status = until_while_working(
+            background.child.id(),
+            "Release to end the Background wait",
+            || background.child.try_wait().unwrap(),
+        );
+        assert!(
+            status.success(),
+            "Background stand-in exited {status}: {}",
+            std::fs::read_to_string(s.dir.path().join("child-stderr")).unwrap()
+        );
         assert!(s.dir.path().join("stopped").exists());
         assert!(!s.dir.path().join("granted").exists());
         assert_eq!(ordinary.cores(), 14, "Ordinary kept the overlapping cores");
@@ -2343,23 +2354,32 @@ fn a_release_queued_while_background_waits_stops_before_grant() {
     let parent = std::os::unix::process::parent_id();
     let waiting = dir.join("waiting");
     let abort = dir.join("abort");
+    let aborted = || abort.exists() || std::os::unix::process::parent_id() != parent;
     let stopped = admit_until(
         &ledger,
         &mac48(),
         Need::new("waiting background").cores(14),
         Admit::Preemptible,
-        Pace {
-            poll: Duration::from_millis(5),
-            ..Pace::default()
-        },
-        &mut |_| {
-            if !waiting.exists() {
-                let part = waiting.with_extension("part");
-                std::fs::write(&part, "").expect("write the wait marker");
-                std::fs::rename(part, &waiting).expect("publish the wait marker");
+        Pace::default(),
+        &mut |_| {},
+        &|| {
+            // Hold the in-progress poll under its ledger turn, before its grant. A
+            // waiter can join the queue without that turn. The parent publishes the
+            // real Release here, so this always exercises cancellation inside poll.
+            if ledger.turn_tries() != 0 && !waiting.exists() {
+                std::fs::write(&waiting, "").expect("publish the wait marker");
+                until_while_working(parent, "Release to enter during the poll", || {
+                    (aborted()
+                        || ledger
+                            .list()
+                            .unwrap()
+                            .iter()
+                            .any(|r| r.need.rank == crate::Rank::Release))
+                    .then_some(())
+                });
             }
+            aborted()
         },
-        &|| abort.exists() || std::os::unix::process::parent_id() != parent,
     );
     match stopped {
         Err(Error::Stopped { signal: None, .. }) if !abort.exists() => {

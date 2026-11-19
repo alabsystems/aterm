@@ -13,14 +13,14 @@ use crate::error::{Error, Result};
 
 /// Maximum bytes retained in one machine-hour. Crossing it reports incomplete
 /// attribution at the caller; it never suppresses a GitHub operation.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const HOUR_MAX: usize = aterm_ctl::github_usage::HOUR_MAX;
 
 impl RateBook {
     /// Append one attempt's attribution. The caller reports any failure, including
     /// the explicit per-hour storage bound, separately from its GitHub result.
     pub(crate) fn record_call(&self, now: u64, row: &Value) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use aterm_uds::private_file::{
                 PrivateLock, create_private_dir, open_private_rw, write_private,
@@ -33,7 +33,7 @@ impl RateBook {
             // An answer without rate headers still deserves an attribution row.
             if let Some(parent) = root.parent() {
                 if let Some(grand) = parent.parent() {
-                    std::fs::create_dir_all(grand).map_err(local)?;
+                    crate::config::make_parents(grand).map_err(local)?;
                 }
                 create_private_dir(parent).map_err(local)?;
             }
@@ -85,7 +85,7 @@ impl RateBook {
                 return Err(local(error));
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let _ = (now, row);
         Ok(())
     }
@@ -95,7 +95,7 @@ impl RateBook {
     /// # Errors
     /// Unreadable, oversized or incomplete attribution, or an unavailable rate book.
     pub fn calls_in_hour(&self, hour: u64) -> Result<Vec<Value>> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use aterm_uds::private_file::{PrivateFileError, PrivateLock, read_private};
             let root = self
@@ -143,19 +143,19 @@ impl RateBook {
                 .map(|line| aterm_json::from_slice(line).map_err(local))
                 .collect()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = hour;
-            Err(Error::local("rate attribution requires Unix"))
+            Err(Error::local("rate attribution requires Unix or Windows"))
         }
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn local(error: impl std::fmt::Display) -> Error {
     Error::local(format!("rate attribution: {error}"))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 #[path = "usage_tests.rs"]
 mod tests;

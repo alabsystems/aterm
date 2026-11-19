@@ -475,6 +475,9 @@ pub(crate) struct NativeRoles {
     pub(crate) control_track: [u8; 3],
     pub(crate) elevated: [u8; 3],
     pub(crate) danger: [u8; 3],
+    /// What needs the person, apart from work that failed or is still under way.
+    /// Held to the native mark floor on the page and card; painters also hold their own washes.
+    pub(crate) needs_person: [u8; 3],
     pub(crate) success: [u8; 3],
     /// "Not written": what a page has staged and not yet written, and nothing else
     /// ([`NOT_WRITTEN`], held 3:1 on the page's grounds). Fixed: it follows neither the theme's
@@ -495,6 +498,12 @@ pub(crate) struct NativeRoles {
 pub(crate) const NOT_WRITTEN: SystemAccent = SystemAccent {
     on_dark: [0x5B, 0x9E, 0xF0],
     on_light: [0x2F, 0x6F, 0xC4],
+};
+
+/// The warm semantic seed for work only the person can advance, independent of either accent.
+const NEEDS_PERSON: SystemAccent = SystemAccent {
+    on_dark: [0xFF, 0x9F, 0x0A],
+    on_light: [0xFF, 0x95, 0x00],
 };
 
 /// The most a staged cell's ground is washed toward [`NativeRoles::unwritten`]; less where its
@@ -866,6 +875,7 @@ fn solve_roles(
         &grounds,
         4.5,
     );
+    let needs_person = ensure_contrast_on(NEEDS_PERSON.for_surface(bg), &grounds, ACCENT_INK_FLOOR);
 
     let unwritten = ensure_contrast_on(NOT_WRITTEN.for_surface(bg), &grounds, ACCENT_INK_FLOOR);
     let unwritten_wash = sheet_ground(
@@ -895,6 +905,7 @@ fn solve_roles(
         control_track,
         elevated,
         danger,
+        needs_person,
         success,
         unwritten,
         unwritten_wash,

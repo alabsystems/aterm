@@ -29,10 +29,10 @@ pub const SERVICE_TYPE: &str = "_alab-vault._tcp";
 /// - peers are told apart, and this server from them, by the addresses they resolve to, never by
 ///   a TXT's `label`, and an instance only adds to what its endpoints are pulled for, but for one
 ///   naming a `rec` on the host an `alab-secrets` instance's `label` names, which stands for the
-///   records of that instance, whose TXT names none, where both resolve to the same endpoints,
-///   in its round and those up to the server's `NAMED_FOR` after it until a catch-up (the
-///   server's `pull_due`, `PullGate::names_rec`), so a forged one holds them back within the
-///   bound above.
+///   records of that instance, whose TXT names none, where both resolve to the same endpoints and
+///   this server held since or proved there the `rec` it named, in its round and those up to the
+///   server's `NAMED_FOR` after it until a catch-up (the server's `pull_due`,
+///   `PullGate::names_rec`), so a forged one holds them back within the bound above.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultTxt {
     /// Vault name (`[a-z0-9][a-z0-9-]{0,62}`).

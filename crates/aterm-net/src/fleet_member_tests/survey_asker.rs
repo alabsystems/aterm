@@ -71,7 +71,7 @@ fn peer(knows_asker: bool) -> (u16, Arc<Stop>, Arc<Mutex<Vec<String>>>) {
 
 #[test]
 fn a_survey_naming_its_asker_is_asked_again_without_it_of_an_older_aterm() {
-    const MARKED: &str = "survey by=s-0123456789abcdef0123";
+    const MARKED: &str = "survey by=tqn5r6e0148";
     for (knows_asker, lines) in [(true, vec![MARKED]), (false, vec![MARKED, "survey"])] {
         let (port, stop, asked) = peer(knows_asker);
         let held = Arc::new(HeldAddrs::default());

@@ -2542,6 +2542,11 @@ impl Bootstrap {
         self.journal_dir.parent().unwrap().join("heard")
     }
 
+    /// This device's kept signed version reports ([`super::hearing::Reports`]).
+    pub fn reports_file(&self) -> PathBuf {
+        self.journal_dir.parent().unwrap().join("reports")
+    }
+
     fn history_dir(&self) -> PathBuf {
         self.journal_dir.parent().unwrap().join("history")
     }

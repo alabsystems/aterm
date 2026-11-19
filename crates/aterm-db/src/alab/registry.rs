@@ -42,9 +42,21 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const APPLICATION: &str = "alab";
 /// The registry's role.
 pub const ROLE: &str = "registry";
+
+/// A link to a registry machine from a row of another table family
+/// (docs/DESIGN-lab-tracker-2026-11-14.md §4.6): the machine by its Commons machine uuid,
+/// whatever generation of the registry holds its row now.
+pub const MACHINE_LINK: crate::typed::Link = crate::typed::Link {
+    application: APPLICATION,
+    role: ROLE,
+    collection: "machine",
+    named: crate::typed::Named::Machine,
+};
 /// The table descriptor's version: 1 for the table's life. A collection's own version moves
 /// instead (design §4.1); a breaking change is a new role (`registry.2`).
 pub const VERSION: u32 = 1;
+/// What a person calls the family: the heading the Tables page lists its tables under.
+pub const TITLE: &str = "Registry";
 /// Automatic records (births, seeds, owned rows) one writer may retain in the table: 128 Macs
 /// fill at most 3,072 of its 8,192 lifetime records, leaving the rest to the owner (§3.9).
 pub const SELF_QUOTA: usize = 24;
@@ -2131,40 +2143,54 @@ impl Names {
     /// The words for every machine and account row `view` of `table` holds, retired ones too: a
     /// reference outlives the row's life.
     pub fn of(table: &Table, view: &View) -> Self {
-        let text = |row: &cell::Row, column: &str| {
+        Self::with_projections(table, view, |_| None)
+    }
+
+    /// Name references using projections the caller already holds for this view. A collection
+    /// the caller has not projected is read from the same view; a generation may omit it.
+    pub fn with_projections<'p>(
+        table: &Table,
+        view: &View,
+        known: impl Fn(&str) -> Option<&'p cell::Projection>,
+    ) -> Self {
+        let rows = |name| {
+            let collection = table.collection(name)?;
+            Some(match known(name) {
+                Some(rows) => std::borrow::Cow::Borrowed(rows),
+                None => std::borrow::Cow::Owned(view.project(collection)),
+            })
+        };
+        fn text<'r>(row: &'r cell::Row, column: &str) -> Option<&'r str> {
             row.get(column)
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
-                .map(str::to_owned)
-        };
+        }
         let mut names = Self::default();
-        if let Some(machine) = table.collection(MACHINE.name) {
-            for (pk, row) in view.project(machine).rows {
-                if let Some(label) = text(&row, "label") {
-                    names.machines.insert(pk, label);
+        if let Some(machines) = rows(MACHINE.name) {
+            for (pk, row) in &machines.rows {
+                if let Some(label) = text(row, "label") {
+                    names.machines.insert(pk.clone(), label.to_owned());
                 }
             }
         }
-        let addresses = table
-            .collection(ACCOUNT_ADDRESS)
-            .map(|address| view.project(address))
-            .unwrap_or_default();
-        if let Some(account) = table.collection(ACCOUNT.name) {
-            for (pk, row) in view.project(account).rows {
-                let address = text(&row, "login")
-                    .and_then(|login| addresses.rows.get(&login).and_then(|a| text(a, "addr")));
+        if let Some(accounts) = rows(ACCOUNT.name) {
+            let addresses = rows(ACCOUNT_ADDRESS);
+            for (pk, row) in &accounts.rows {
+                let address = text(row, "login")
+                    .and_then(|login| addresses.as_deref()?.rows.get(login))
+                    .and_then(|address| text(address, "addr"));
                 // Without an address, the label the owner gave it: a read admits no other
                 // (`typed::authority`), and an account has no default label.
-                let words = match (text(&row, "provider"), address) {
+                let words = match (text(row, "provider"), address) {
                     (Some(provider), Some(address)) => format!("{provider} \u{b7} {address}"),
-                    (Some(provider), None) => match text(&row, "label") {
+                    (Some(provider), None) => match text(row, "label") {
                         Some(label) => format!("{provider} \u{b7} {label}"),
-                        None => provider,
+                        None => provider.to_owned(),
                     },
-                    (None, Some(address)) => address,
+                    (None, Some(address)) => address.to_owned(),
                     (None, None) => continue,
                 };
-                names.accounts.insert(pk, words);
+                names.accounts.insert(pk.clone(), words);
             }
         }
         names

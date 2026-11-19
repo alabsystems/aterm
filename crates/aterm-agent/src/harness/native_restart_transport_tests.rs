@@ -30,6 +30,9 @@ mod noexec;
 #[path = "native_restart_cadence_tests.rs"]
 mod cadence;
 
+#[path = "native_readmitted_completion_tests.rs"]
+mod readmitted;
+
 const SID: &str = "s-native-transport";
 
 #[test]
@@ -319,7 +322,7 @@ fn a_completed_cold_predecessor_keeps_the_new_asked_prepare_exact_across_lost_ac
     assert_eq!(
         terminal_reply(
             &mut st,
-            &Reply::ColdRestartCommitted {
+            &Reply::AdmittedRestartCommitted {
                 claim: ClaimOutcome::Builtin,
                 observation: None,
                 intent: Box::new(super::super::accounts_pool::ExecutionIntent::Stored {
@@ -384,7 +387,10 @@ fn a_completed_cold_predecessor_keeps_the_new_asked_prepare_exact_across_lost_ac
         common(line).or_else(|| match request(line) {
             Request::Prepare(plan) => {
                 assert_eq!(plan.constructor(), Constructor::AskedUpgrade);
-                assert_eq!(plan.asked.unwrap().predecessor(), expected_predecessor);
+                assert_eq!(
+                    plan.asked.unwrap().predecessor(),
+                    Some(expected_predecessor.as_str())
+                );
                 None
             }
             other => panic!("lost asked Prepare never dispatches {other:?}"),
@@ -914,6 +920,10 @@ fn common(line: &str) -> Option<String> {
             "34".repeat(16)
         ));
     }
+    // The host settled the record's predecessor in the epoch Info reports.
+    if line.starts_with(&format!("@{SID} native-act succession predecessor=")) {
+        return native_act::succession_reply(&"34".repeat(16), &Succession::Predecessor);
+    }
     None
 }
 
@@ -1108,7 +1118,7 @@ fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_wit
             ..St::default()
         };
         assert!(st.account_intent.is_none());
-        let receipt = Reply::ColdRestartCommitted {
+        let receipt = Reply::AdmittedRestartCommitted {
             claim: ClaimOutcome::Builtin,
             observation: observation.clone(),
             intent: Box::new(intent.clone()),
@@ -1206,6 +1216,10 @@ fn fresh_private_constructor_keeps_legacy_before_any_prepare_when_kind_is_disabl
     }
 }
 
+/// A record whose native operation was cancelled before any effect stays coordinated and never
+/// falls back to a raw relaunch: its upgrade is an asked move (a re-entry, since it completed no
+/// predecessor), which a host enabling no asked upgrade refuses at its constructors, and which a
+/// harness without the private token refuses before any request.
 #[test]
 fn unproven_completed_history_never_restores_raw_fallback_after_native_coordination() {
     let world = aterm_tempfile::tempdir().unwrap();
@@ -1240,9 +1254,10 @@ fn unproven_completed_history_never_restores_raw_fallback_after_native_coordinat
     );
     drop(client);
     let seen = worker.join().unwrap();
-    assert_eq!(result, Err("native-asked-predecessor-unproven"));
+    assert_eq!(result, Err("native-asked-constructor-disabled"));
     assert!(st.native_coordination);
-    assert!(seen.is_empty());
+    assert_eq!(seen, [format!("@{SID} native-act constructors")]);
+    assert!(st.native_prepare.is_empty() && st.native.is_none());
     let mut no_private_token = opts.clone();
     no_private_token.token = None;
     let (mut client, worker) =
@@ -1259,7 +1274,7 @@ fn unproven_completed_history_never_restores_raw_fallback_after_native_coordinat
     );
     drop(client);
     assert!(worker.join().unwrap().is_empty());
-    assert_eq!(result, Err("native-asked-predecessor-unproven"));
+    assert_eq!(result, Err("native-asked-upgrade-unqualified"));
 }
 
 #[test]
@@ -1781,6 +1796,7 @@ fn a_bound_record_replays_its_prepare_and_a_lapse_ends_its_retirement_or_abort()
         expected.native = None;
         expected.native_prepare.clear();
         expected.native_rollback = false;
+        expected.spend_native();
         let (mut client, worker) = endpoint(|line| match request(line) {
             Request::Prepare(plan) => native_act::lapsed_reply(&plan.id),
             other => panic!("a lapse needs nothing more: {other:?}"),
@@ -2276,4 +2292,741 @@ fn passive_observation_refuses_symlinked_state_directories() {
     assert!(read(&linked_sub, SID).is_none());
     assert!(save(&linked_sub, "other-tab", &observed).is_err());
     assert!(read(&real_opts, "other-tab").is_none());
+}
+
+/// A RE-ENTRY NAMES ONLY THE RECREATED HOST'S OWN REGISTRATION, AND ONLY FROM A RESOLVED RECORD
+/// (`m16`'s asked upgrades after an aterm restart were denied `settlement-unknown` for good: the
+/// new host process never settled the predecessor they named): where the host answers that its
+/// current epoch settled the record's completed predecessor, the asked move stays an upgrade
+/// naming it; where it answers that it binds nothing, the move re-enters with the passive binding
+/// the observer saved for exactly the live vendor under its shell in that current epoch, whatever
+/// epoch the record's predecessor names; where it answers bound, or names as settled a predecessor
+/// another epoch settled, the move waits `native-reentry-bound`. A record that completed no native
+/// operation (its first one cancelled before any effect) names no predecessor and re-enters the
+/// same way; a host answering it a predecessor is unread. Before that registration exists,
+/// or where the saved one is an earlier epoch's or another vendor's or shell's, it waits
+/// `native-reentry-unobserved`. A record still holding a retained prepare or binding, a closed
+/// restart's watch, an unissued retirement or a rollback refuses as unresolved; a no-exec prepare,
+/// a positive terminal fact the next prepare replaces, does not.
+#[test]
+fn a_reentry_names_the_hosts_own_registration_only_from_a_resolved_record() {
+    use super::super::native_observe::{ObservationBinding, Registration};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(dir.path());
+    let vendor = Process::observe(std::process::id()).expect("the test process");
+    let shell = Process {
+        pid: vendor.pid + 1,
+        birth: vendor.birth + 1,
+        ..vendor.clone()
+    };
+    let epoch = "ab".repeat(16);
+    let earlier = "cd".repeat(16);
+    let st = St {
+        tab: SID.into(),
+        ..St::default()
+    };
+    let binding = |epoch: &str| ObservationBinding {
+        id: "12".repeat(16),
+        host_epoch: epoch.into(),
+        capability: "34".repeat(32),
+    };
+    let save = |epoch: &str, vendor: &Process, shell: &Process| {
+        let turn = observation::Turn::take(&opts.state, SID).expect("the record's turn");
+        observation::save(
+            &turn,
+            &observation::Observed {
+                registration: Registration {
+                    id: "12".repeat(16),
+                    host_epoch: epoch.into(),
+                    vendor: vendor.clone(),
+                    shell: shell.clone(),
+                },
+                binding: Some(binding(epoch)),
+            },
+        )
+        .expect("the saved observation");
+    };
+    assert_eq!(
+        reentry(&opts, &st, &epoch, &vendor, &shell).map_err(|wait| wait.word),
+        Err(REENTRY_UNOBSERVED)
+    );
+    save(&earlier, &vendor, &shell);
+    assert_eq!(
+        reentry(&opts, &st, &epoch, &vendor, &shell).map_err(|wait| wait.word),
+        Err(REENTRY_UNOBSERVED),
+        "the previous host process's registration"
+    );
+    save(&epoch, &vendor, &shell);
+    assert_eq!(
+        reentry(&opts, &st, &epoch, &vendor, &shell).map_err(|wait| wait.word),
+        Ok(binding(&epoch))
+    );
+    assert_eq!(
+        reentry(&opts, &st, &epoch, &shell, &shell).map_err(|wait| wait.word),
+        Err(REENTRY_UNOBSERVED),
+        "another vendor"
+    );
+    assert_eq!(
+        reentry(&opts, &st, &epoch, &vendor, &vendor).map_err(|wait| wait.word),
+        Err(REENTRY_UNOBSERVED),
+        "another shell"
+    );
+
+    let Some(Request::Prepare(prepare)) =
+        Request::parse(&super::retirement_debt_tests::pending().native_prepare)
+    else {
+        panic!("the fixture keeps a preparation");
+    };
+    let unresolved = [
+        St {
+            native_prepare: super::retirement_debt_tests::pending().native_prepare,
+            ..st.clone()
+        },
+        St {
+            native: Some(Binding {
+                id: "ab".repeat(16),
+                capability: "cd".repeat(32),
+            }),
+            ..st.clone()
+        },
+        St {
+            native_closed: Some(prepare.clone()),
+            ..st.clone()
+        },
+        St {
+            native_retired_unissued: true,
+            ..st.clone()
+        },
+        St {
+            native_rollback: true,
+            ..st.clone()
+        },
+    ];
+    for held in &unresolved {
+        assert_eq!(
+            reentry(&opts, held, &epoch, &vendor, &shell).map_err(|wait| wait.word),
+            Err("native-unresolved-operation"),
+            "{held:?}"
+        );
+    }
+    let noexec = St {
+        native_noexec_prepare: Some(prepare.clone()),
+        ..st.clone()
+    };
+    assert_eq!(
+        reentry(&opts, &noexec, &epoch, &vendor, &shell).map_err(|wait| wait.word),
+        Ok(binding(&epoch))
+    );
+
+    // The host's current epoch settled the predecessor: the upgrade names it.
+    let reentered = Ok(AskedIntent::Reentry(native_act::AskedReentryIntent {
+        observation: binding(&epoch),
+        ask: None,
+    }));
+    let mut settled_here = (*prepare).clone();
+    settled_here.host_epoch = epoch.clone();
+    let mut completed = st.clone();
+    completed.native_completed_prepare = Some(Box::new(settled_here));
+    let bound = Succession::Bound("qualification-foreground".into());
+    let moved = |record: &St, admits: &Succession| {
+        basis(
+            &opts,
+            record,
+            record.native_completed_prepare.as_deref(),
+            &epoch,
+            admits,
+            || Ok((vendor.clone(), shell.clone())),
+        )
+        .map(|basis| basis.intent(None))
+        .map_err(|wait| wait.word)
+    };
+    assert_eq!(
+        moved(&completed, &Succession::Predecessor),
+        Ok(AskedIntent::Upgrade(AskedUpgradeIntent {
+            predecessor: prepare.id.clone(),
+        }))
+    );
+    // The same epoch binds nothing again (every operation since aborted with no effect): it is
+    // re-entered from its own registration, never asked to prove a predecessor it dropped.
+    assert_eq!(moved(&completed, &Succession::Reentry), reentered);
+    assert_eq!(moved(&completed, &bound), Err(REENTRY_BOUND));
+    let mut settled_before = (*prepare).clone();
+    settled_before.host_epoch = earlier.clone();
+    completed.native_completed_prepare = Some(Box::new(settled_before));
+    assert_eq!(moved(&completed, &Succession::Reentry), reentered);
+    assert_eq!(
+        moved(&completed, &Succession::Predecessor),
+        Err(REENTRY_BOUND),
+        "a settlement another epoch made is no predecessor this one holds"
+    );
+    // A record that completed no native operation names no predecessor: it re-enters, and a host
+    // that answered a predecessor for it is unread.
+    assert_eq!(moved(&noexec, &Succession::Reentry), reentered);
+    assert_eq!(moved(&st, &Succession::Reentry), reentered);
+    assert_eq!(
+        moved(&noexec, &Succession::Predecessor),
+        Err(SUCCESSION_UNREAD)
+    );
+    assert_eq!(moved(&noexec, &bound), Err(REENTRY_BOUND));
+}
+
+/// THE ASKED-UPGRADE GATE READS THE LIVE VENDOR, NEVER THE ROUND'S UNBOUND RECORD (every stalled
+/// session's re-entry once its host is recreated, as installing this fix recreates it): a round
+/// that starts after a completed move holds a record with no agent bound (`St::fresh` and
+/// `St::retarget` leave pid and shell 0; only the move's signal binds them, after this gate). Where
+/// the host's current epoch did not settle the completed predecessor, the gate re-enters on the
+/// live vendor and shell the caller read this round, and finds the registration the observer
+/// saved for exactly them; another vendor is unobserved, and the record's own unbound agent is no
+/// live process at all.
+///
+/// NEGATIVE CONTROL: with the gate reading `st.pid` and `st.shell` again, the live pair waits
+/// `native-process`.
+#[test]
+fn the_asked_upgrade_gate_reads_the_live_vendor_not_the_rounds_unbound_record() {
+    use super::super::native_observe::{ObservationBinding, Registration};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(dir.path());
+    let vendor = Process::observe(std::process::id()).expect("the test process");
+    // A live process other than the vendor to stand as its shell: a child of this test, proven
+    // running by the line it echoes, and killed when the test ends. The test's parent is no such
+    // process: under a test runner it may already have exited, or be unreadable.
+    struct Companion(aterm_uds::spawnfd::Child);
+    impl Drop for Companion {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut command =
+        aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/cat")));
+    command
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    let mut companion = Companion(command.spawn().expect("the shell stand-in"));
+    let _input = aterm_uds::deadline::cat_echoes(&mut companion.0);
+    let shell = Process::observe(companion.0.id()).expect("the shell stand-in");
+    // The epoch `common`'s Info answers, and the earlier one that settled the predecessor.
+    let epoch = "34".repeat(16);
+    let Some(Request::Prepare(prepare)) =
+        Request::parse(&super::retirement_debt_tests::pending().native_prepare)
+    else {
+        panic!("the fixture keeps a preparation");
+    };
+    let mut settled_before = (*prepare).clone();
+    settled_before.host_epoch = "cd".repeat(16);
+    // What a round after the completed move starts from: coordinated, the predecessor kept, no
+    // agent bound.
+    let st = St {
+        tab: SID.into(),
+        native_coordination: true,
+        native_completed_prepare: Some(Box::new(settled_before)),
+        ..St::default()
+    };
+    assert_eq!(
+        (st.pid, st.shell),
+        (0, 0),
+        "a round's record binds no agent"
+    );
+    let turn = observation::Turn::take(&opts.state, SID).expect("the record's turn");
+    observation::save(
+        &turn,
+        &observation::Observed {
+            registration: Registration {
+                id: "12".repeat(16),
+                host_epoch: epoch.clone(),
+                vendor: vendor.clone(),
+                shell: shell.clone(),
+            },
+            binding: Some(ObservationBinding {
+                id: "12".repeat(16),
+                host_epoch: epoch.clone(),
+                capability: "34".repeat(32),
+            }),
+        },
+    )
+    .expect("the saved observation");
+    drop(turn);
+    let (mut client, worker) = endpoint(|line| {
+        line.starts_with(&format!("@{SID} native-act succession "))
+            .then(|| native_act::succession_reply(&"34".repeat(16), &Succession::Reentry))
+            .flatten()
+    });
+    assert_eq!(
+        asked_upgrade_ready(&opts, &mut client, &st, vendor.pid, shell.pid)
+            .map_err(|wait| wait.word),
+        Ok(()),
+        "the live vendor under its shell, registered in the current epoch"
+    );
+    assert_eq!(
+        asked_upgrade_ready(&opts, &mut client, &st, shell.pid, shell.pid)
+            .map_err(|wait| wait.word),
+        Err(REENTRY_UNOBSERVED),
+        "another vendor"
+    );
+    assert_eq!(
+        asked_upgrade_ready(&opts, &mut client, &st, st.pid, st.shell).map_err(|wait| wait.word),
+        Err("native-process"),
+        "the record's own unbound agent"
+    );
+    drop(client);
+    let seen = worker.join().unwrap();
+    let predecessor = st.native_completed_prepare.as_ref().unwrap().id.clone();
+    assert!(
+        seen.iter()
+            .all(|line| line == &format!("@{SID} native-act succession predecessor={predecessor}")),
+        "the gate only reads the host's succession answer: {seen:?}"
+    );
+}
+
+/// A CARRIED CLOSED RESTART'S WATCH IS GATED AS THE MOVE'S OWN SETTLEMENT LEAVES IT (an ask-flow
+/// upgrade of a record carrying a closed watch waited `native-closed-grantee` in every attended
+/// round: the gate before the tell refused the watch, so no notice went out and the restart that
+/// follows it, the one lane that settles the watch, never ran): where the closed restart's
+/// relaunch is the very agent the move signals, the gate passes on the host's answer, and the
+/// record keeps its watch for that restart to settle; a watch the move's settlement would keep
+/// (another agent holds the conversation) still waits `native-closed-grantee`, before any host
+/// read.
+///
+/// NEGATIVE CONTROL: with `asked_upgrade_ready_unsettled` gating the record as it stands, the
+/// adopted relaunch waits `native-closed-grantee`.
+#[test]
+fn a_carried_closed_watch_is_gated_as_the_moves_own_settlement_leaves_it() {
+    use super::closed_tests::{CONVERSATION, Watched, closed_record, registered, shell_start};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(dir.path());
+    let mut st = closed_record();
+    let closed = st
+        .native_closed
+        .clone()
+        .expect("the closed restart's watch");
+    let NativePlan::Restart { shell, .. } = &closed.plan else {
+        unreachable!("a restart plan")
+    };
+    let shell = shell.pid;
+    let relaunched = 4343;
+    st.tab = SID.into();
+    st.native = None;
+    st.native_prepare.clear();
+    st.native_rollback = false;
+    let mut previous = (*closed).clone();
+    previous.id = "5e".repeat(16);
+    previous.host_epoch = "34".repeat(16);
+    st.native_completed_prepare = Some(Box::new(previous.clone()));
+    // The relaunch the closed restart started holds the conversation, a child of its shell, which
+    // no longer holds the tab.
+    let adopting = Watched {
+        parents: vec![(relaunched, shell)],
+        children: Some(vec![relaunched]),
+        holds_tab: Some(false),
+        shell_start: Some(shell_start(&closed)),
+        ..Watched::default()
+    };
+    let files = || Some(vec![registered(relaunched, CONVERSATION)]);
+    let signal = |pid| Fresh::Signal {
+        pid,
+        conversation: CONVERSATION,
+    };
+    let carried = st.clone();
+    let (mut client, worker) = endpoint(move |line| {
+        assert_eq!(
+            line,
+            format!("@{SID} native-act succession predecessor={}", previous.id),
+            "the gate reads only the host's succession answer"
+        );
+        native_act::succession_reply(&"34".repeat(16), &Succession::Predecessor)
+    });
+    assert_eq!(
+        asked_upgrade_ready(&opts, &mut client, &st, relaunched, shell).map_err(|wait| wait.word),
+        Err(CLOSED_GRANTEE),
+        "the record as it stands holds the watch"
+    );
+    assert_eq!(
+        asked_upgrade_ready_unsettled(
+            &opts,
+            &mut client,
+            &st,
+            signal(relaunched),
+            files,
+            &adopting,
+            relaunched,
+            shell
+        ),
+        Ok(()),
+        "the move signals the closed restart's own relaunch"
+    );
+    assert_eq!(st, carried, "the watch stays for the restart to settle");
+    assert_eq!(
+        asked_upgrade_ready_unsettled(
+            &opts,
+            &mut client,
+            &st,
+            signal(relaunched + 1),
+            files,
+            &adopting,
+            relaunched + 1,
+            shell
+        ),
+        Err(CLOSED_GRANTEE.into()),
+        "another agent holds the conversation the watch keeps"
+    );
+    drop(client);
+    assert_eq!(worker.join().unwrap().len(), 1, "one host read");
+}
+
+/// A HOST WHOSE EPOCH IS BOUND IS NEITHER TOLD NOR PREPARED FOR (a record whose re-entry or cold
+/// relaunch ended rollback-safe after an effect kept its no-exec prepare and its older
+/// predecessor, and every later upgrade was told, prepared and denied
+/// `qualification-reentry-bound`, its prepare replayed to its deadline and minted again, until
+/// the host was recreated): the record cannot tell an effect-free abort from one after an effect,
+/// so the gate and the plan ask the host which move it admits. A host that binds its epoch
+/// otherwise waits `native-reentry-bound` at the gate and in the plan, with no prepare sent; one
+/// that binds nothing is re-entered from the saved registration.
+///
+/// NEGATIVE CONTROL: with the gate re-entering wherever the predecessor's epoch is not the host's
+/// (the record's guess), the bound host's gate passes.
+#[test]
+fn a_bound_host_epoch_waits_native_reentry_bound_with_no_tell_or_prepare() {
+    use super::super::native_observe::{ObservationBinding, Registration};
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(world.path());
+    let command = planned();
+    let (mut st, _) = state(&command);
+    let vendor = Process::observe(st.pid).expect("the test process");
+    let shell = Process::observe(st.shell).expect("the test process as its shell");
+    let epoch = "34".repeat(16);
+    let Some(Request::Prepare(prepare)) =
+        Request::parse(&super::retirement_debt_tests::pending().native_prepare)
+    else {
+        panic!("the fixture keeps a preparation");
+    };
+    let mut settled_before = (*prepare).clone();
+    settled_before.host_epoch = "cd".repeat(16);
+    let mut aborted = (*prepare).clone();
+    aborted.id = "ac".repeat(16);
+    aborted.host_epoch = epoch.clone();
+    st.tab = SID.into();
+    st.native_coordination = true;
+    st.native_completed_prepare = Some(Box::new(settled_before.clone()));
+    st.native_noexec_prepare = Some(Box::new(aborted));
+    let turn = observation::Turn::take(&opts.state, SID).expect("the record's turn");
+    observation::save(
+        &turn,
+        &observation::Observed {
+            registration: Registration {
+                id: "12".repeat(16),
+                host_epoch: epoch.clone(),
+                vendor: vendor.clone(),
+                shell: shell.clone(),
+            },
+            binding: Some(ObservationBinding {
+                id: "12".repeat(16),
+                host_epoch: epoch.clone(),
+                capability: "34".repeat(32),
+            }),
+        },
+    )
+    .expect("the saved observation");
+    drop(turn);
+    let host = |admits: Succession| {
+        let epoch = epoch.clone();
+        move |line: &str| {
+            if line.starts_with(&format!("@{SID} native-act succession ")) {
+                return native_act::succession_reply(&epoch, &admits);
+            }
+            if line == format!("@{SID} native-act constructors") {
+                return Some("OK native-act state=constructors plans=asked-upgrade\n".into());
+            }
+            common(line).or_else(|| panic!("a bound host is sent no {line}"))
+        }
+    };
+    let (mut client, worker) = endpoint(host(Succession::Bound("settlement-unresolved".into())));
+    assert_eq!(
+        asked_upgrade_ready(&opts, &mut client, &st, vendor.pid, shell.pid)
+            .map_err(|wait| wait.word),
+        Err(REENTRY_BOUND)
+    );
+    let before = st.clone();
+    assert_eq!(
+        begin(
+            &opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &command.target,
+            Some(&command),
+            Some(&command)
+        ),
+        Err(REENTRY_BOUND)
+    );
+    assert_eq!(st, before, "nothing is prepared or saved");
+    drop(client);
+    let seen = worker.join().unwrap();
+    assert!(
+        !seen
+            .iter()
+            .any(|line| matches!(actual_request(line), Some(Request::Prepare(_)))),
+        "{seen:?}"
+    );
+    let (mut client, worker) = endpoint(host(Succession::Reentry));
+    assert_eq!(
+        asked_upgrade_ready(&opts, &mut client, &st, vendor.pid, shell.pid)
+            .map_err(|wait| wait.word),
+        Ok(()),
+        "a host that binds nothing is re-entered from its own registration"
+    );
+    drop(client);
+    worker.join().unwrap();
+}
+
+/// A COORDINATED RECORD THAT COMPLETED NO NATIVE OPERATION RE-ENTERS, NEVER WAITS FOR A PREDECESSOR
+/// (a conversation whose first native operation, an exit lane's cold relaunch, was cancelled before
+/// any effect, or never admitted, kept its no-exec prepare and its coordination for good, and every
+/// later upgrade and Memory restart waited `native-asked-predecessor-unproven` before any host
+/// read, though nothing could ever mint the completed predecessor that word asked for): the gate
+/// asks the host what it admits after no predecessor (`predecessor=-`), and a host that binds
+/// nothing is re-entered from its own current-epoch registration of the live pair, whether the
+/// record holds a no-exec prepare or only its coordination; the upgrade prepares a re-entry naming
+/// that registration, which the host admits.
+///
+/// NEGATIVE CONTROL: with the gate and `begin` requiring a completed predecessor again, both wait
+/// `native-asked-predecessor-unproven` and send nothing.
+#[test]
+fn a_coordinated_record_with_no_completed_predecessor_reenters() {
+    use super::super::native_observe::{ObservationBinding, Registration};
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(world.path());
+    let command = planned();
+    let (base, _) = state(&command);
+    let vendor = Process::observe(base.pid).expect("the test process");
+    let shell = Process::observe(base.shell).expect("the test process as its shell");
+    let epoch = "34".repeat(16);
+    let observation = ObservationBinding {
+        id: "12".repeat(16),
+        host_epoch: epoch.clone(),
+        capability: "34".repeat(32),
+    };
+    let turn = observation::Turn::take(&opts.state, SID).expect("the record's turn");
+    observation::save(
+        &turn,
+        &observation::Observed {
+            registration: Registration {
+                id: "12".repeat(16),
+                host_epoch: epoch.clone(),
+                vendor: vendor.clone(),
+                shell: shell.clone(),
+            },
+            binding: Some(observation.clone()),
+        },
+    )
+    .expect("the saved observation");
+    drop(turn);
+    let Some(Request::Prepare(prepare)) =
+        Request::parse(&super::retirement_debt_tests::pending().native_prepare)
+    else {
+        panic!("the fixture keeps a preparation");
+    };
+    let mut cancelled = (*prepare).clone();
+    cancelled.host_epoch = "cd".repeat(16);
+    let noexec = St {
+        tab: SID.into(),
+        native_coordination: true,
+        native_noexec_prepare: Some(Box::new(cancelled)),
+        ..base.clone()
+    };
+    let coordination = St {
+        tab: SID.into(),
+        native_coordination: true,
+        ..base
+    };
+    for (what, session, mut st) in [
+        ("a no-exec prepare", "conversation-noexec", noexec),
+        (
+            "coordination alone",
+            "conversation-coordinated",
+            coordination,
+        ),
+    ] {
+        assert!(
+            coordinated(&st) && st.native_completed_prepare.is_none(),
+            "{what}"
+        );
+        let prepared = std::sync::Arc::new(std::sync::Mutex::new(None::<Prepare>));
+        let kept = prepared.clone();
+        let host_epoch = epoch.clone();
+        let (mut client, worker) = endpoint(move |line| {
+            if line.starts_with(&format!("@{SID} native-act succession ")) {
+                assert_eq!(line, format!("@{SID} native-act succession predecessor=-"));
+                return native_act::succession_reply(&host_epoch, &Succession::Reentry);
+            }
+            if line == format!("@{SID} native-act constructors") {
+                return Some("OK native-act state=constructors plans=asked-upgrade\n".into());
+            }
+            common(line).or_else(|| match request(line) {
+                Request::Prepare(plan) => {
+                    let reply = format!(
+                        "OK native-act state=admitted id={} cap={}\n",
+                        plan.id,
+                        binding().capability
+                    );
+                    *kept.lock().unwrap() = Some(*plan);
+                    Some(reply)
+                }
+                other => panic!("{other:?}"),
+            })
+        });
+        assert_eq!(
+            asked_upgrade_ready(&opts, &mut client, &st, vendor.pid, shell.pid)
+                .map_err(|wait| wait.word),
+            Ok(()),
+            "{what}: the gate re-enters"
+        );
+        assert_eq!(
+            begin(
+                &opts,
+                &mut client,
+                &mut st,
+                session,
+                Scope::Upgrade,
+                &command.target,
+                Some(&command),
+                Some(&command)
+            ),
+            Ok(Recovery::Admitted),
+            "{what}"
+        );
+        drop(client);
+        worker.join().unwrap();
+        let prepared = prepared
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the upgrade prepared");
+        assert_eq!(
+            prepared.asked,
+            Some(AskedIntent::Reentry(native_act::AskedReentryIntent {
+                observation: observation.clone(),
+                ask: None,
+            })),
+            "{what}"
+        );
+        assert!(prepared.asked_restart_shape(), "{what}");
+        assert_eq!(prepared.host_epoch, epoch, "{what}");
+        assert!(
+            st.native_noexec_prepare.is_none(),
+            "{what}: the new prepare replaces it"
+        );
+    }
+}
+
+/// A BOUND HOST'S GATE NOTES THE STAGE THAT HOLDS IT (the gate's waits recorded only their word:
+/// `native-reentry-bound` alone covers an operation in flight, an unresolved one, an owed terminal
+/// append, a receipt flight, an account lineage, another predecessor's settlement and a settled
+/// vendor out of the foreground, some of which clear in seconds and some never while that vendor
+/// lives, and `aterm harness upgrade --status` said "the wait log names why" of a wait log that
+/// held the word alone): the host's answer names its stage (`admits=bound why=<stage>`), and the
+/// gate's wait carries it, which the lane's plan notes in the record's wait log and aterm.log. The
+/// gate's other words a check cannot say alone carry theirs: an unread succession answer what the
+/// exchange read, an unobserved re-entry what the observer saved, an unresolved operation what the
+/// record holds.
+///
+/// NEGATIVE CONTROL: with a gate wait made a plain `NoPlan::Wait` of its word, the plan notes no
+/// reason: the wait log takes no entry for it.
+#[test]
+fn a_bound_hosts_gate_notes_the_stage_that_holds_it() {
+    use super::super::relaunch::unplanned;
+    use super::super::upgrade_drive::Report;
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(world.path());
+    let command = planned();
+    let (mut st, _) = state(&command);
+    let vendor = Process::observe(st.pid).expect("the test process");
+    let shell = Process::observe(st.shell).expect("the test process as its shell");
+    let epoch = "34".repeat(16);
+    let Some(Request::Prepare(prepare)) =
+        Request::parse(&super::retirement_debt_tests::pending().native_prepare)
+    else {
+        panic!("the fixture keeps a preparation");
+    };
+    let mut settled_here = (*prepare).clone();
+    settled_here.host_epoch = epoch.clone();
+    st.tab = SID.into();
+    st.native_coordination = true;
+    st.native_completed_prepare = Some(Box::new(settled_here));
+    let report = || Report {
+        rung: None,
+        pid: vendor.pid,
+        tab: SID.into(),
+        session: "aaaaaaaa-0000-0000-0000-000000000016".into(),
+        from: "-".into(),
+        to: "-".into(),
+        step: "current".into(),
+    };
+    let answering = |admits: Succession| {
+        let epoch = epoch.clone();
+        move |line: &str| {
+            line.starts_with(&format!("@{SID} native-act succession "))
+                .then(|| native_act::succession_reply(&epoch, &admits))
+                .flatten()
+        }
+    };
+    let (mut client, worker) = endpoint(answering(Succession::Bound(
+        "qualification-foreground".into(),
+    )));
+    let wait = asked_upgrade_ready(&opts, &mut client, &st, vendor.pid, shell.pid)
+        .expect_err("a bound host's gate waits");
+    drop(client);
+    worker.join().unwrap();
+    assert_eq!(wait.word, REENTRY_BOUND);
+    let mut noted = st.clone();
+    let r = unplanned(&opts, report(), &mut noted, wait.into());
+    assert_eq!(r.step, format!("wait:{REENTRY_BOUND}"));
+    let last = noted.waits.last().expect("the wait noted");
+    assert_eq!(last.word, REENTRY_BOUND);
+    assert!(
+        last.note.contains("qualification-foreground"),
+        "the wait log names the host's stage: {last:?}"
+    );
+
+    // An unread succession answer notes what the exchange read.
+    let (mut client, worker) = endpoint(|_| Some("OK native-act state=unwritten\n".into()));
+    let wait = asked_upgrade_ready(&opts, &mut client, &st, vendor.pid, shell.pid)
+        .expect_err("an unread answer waits");
+    drop(client);
+    worker.join().unwrap();
+    assert_eq!(wait.word, SUCCESSION_UNREAD);
+    assert!(wait.why.is_some(), "{wait:?}");
+
+    // A re-entry with nothing saved notes that the observer saved nothing.
+    let (mut client, worker) = endpoint(answering(Succession::Reentry));
+    let wait = asked_upgrade_ready(&opts, &mut client, &st, vendor.pid, shell.pid)
+        .expect_err("an unobserved re-entry waits");
+    drop(client);
+    worker.join().unwrap();
+    assert_eq!(wait.word, REENTRY_UNOBSERVED);
+    assert!(
+        wait.why
+            .as_deref()
+            .is_some_and(|why| why.contains("no registration")),
+        "{wait:?}"
+    );
+
+    // An unresolved operation names what the record holds, before any host read.
+    let rollback = St {
+        native_rollback: true,
+        ..st.clone()
+    };
+    let (mut client, worker) = endpoint(|line| panic!("an unresolved record reads no {line}"));
+    let wait = asked_upgrade_ready(&opts, &mut client, &rollback, vendor.pid, shell.pid)
+        .expect_err("an unresolved record waits");
+    drop(client);
+    assert!(worker.join().unwrap().is_empty());
+    assert_eq!(
+        wait,
+        GateWait {
+            word: "native-unresolved-operation",
+            why: Some("the record holds a rollback".into()),
+        }
+    );
 }

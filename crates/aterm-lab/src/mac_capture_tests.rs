@@ -91,3 +91,88 @@ fn runtime_capture_refuses_either_oversized_stream_instead_of_returning_a_tail()
         );
     }
 }
+
+#[test]
+fn retirement_transport_requires_complete_streams_and_the_actual_failed_status() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let stdout_file = world.path().join("stdout");
+    let stderr_file = world.path().join("stderr");
+    let stdout = binary_bytes(4097, b"observer\0\xff");
+    let stderr = binary_bytes(8193, b"diagnostic\0\xfe");
+    std::fs::write(&stdout_file, &stdout).unwrap();
+    std::fs::write(&stderr_file, &stderr).unwrap();
+    let output = super::capture_retirement_output(
+        &mut emitter(&stdout_file, &stderr_file),
+        8193,
+        |_| {},
+        || false,
+    )
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, stdout);
+    assert_eq!(output.stderr, stderr);
+    for (out, err) in [(&stdout_file, &stderr_file), (&stderr_file, &stdout_file)] {
+        assert!(
+            super::capture_retirement_output(&mut emitter(out, err), 4096, |_| {}, || false)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn cancelled_retirement_transport_reaps_its_actual_local_child_without_claiming_guest_closure() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let marker = world.path().join("observer-started");
+    let mut command = aterm_uds::spawnfd::command(stand_in(Path::new("/bin/sh")));
+    command
+        .args(["-c", "printf '%s\\n' $$ > \"$1\"; \"$2\" 1000", "observer"])
+        .arg(&marker)
+        .arg(stand_in(Path::new("/bin/sleep")));
+    let actual_pid = std::cell::Cell::new(None);
+    let mut original = None;
+    let mut probe = aterm_uds::deadline::ProcessProgressProbe::default();
+    let mut progress =
+        aterm_uds::deadline::ProgressWindow::new(aterm_spec::wait::MUST_HAPPEN, Instant::now());
+    let result = super::capture_retirement_output(
+        &mut command,
+        4096,
+        |pid| actual_pid.set(Some(pid)),
+        || {
+            let Some(pid) = actual_pid.get() else {
+                // The canonical collector also asks about cancellation before spawning.
+                return false;
+            };
+            if std::fs::read(&marker).ok().as_deref() == Some(format!("{pid}\n").as_bytes()) {
+                original = aterm_uds::process::read_identity(pid as i32);
+                if original.is_some() {
+                    return true;
+                }
+            }
+            let work = probe.read(pid);
+            assert!(
+                !progress.observe(Instant::now(), 0, || work).is_zero(),
+                "the actual observer made no native progress before its complete self-write"
+            );
+            false
+        },
+    );
+    assert!(result.unwrap_err().contains("cancelled"));
+    let original = original.expect("cancellation follows an observed actual child");
+    let mut status = 0;
+    // SAFETY: this known child has already been retired by the owning collector. WNOHANG
+    // cannot wait; ECHILD proves no unreaped original remains even if its PID was reused.
+    #[expect(
+        unsafe_code,
+        reason = "nonblocking wait proves the actual owned collector already reaped its child"
+    )]
+    let waited = unsafe { libc::waitpid(original.pid, &mut status, libc::WNOHANG) };
+    assert_eq!(waited, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert_ne!(
+        aterm_uds::process::read_identity(original.pid),
+        Some(original)
+    );
+}

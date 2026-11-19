@@ -755,6 +755,51 @@ fn cleanup_record(path: &Path, text: &str) -> Option<Record> {
     Some(Record::parse(text))
 }
 
+/// Decode a complete raw archive as diagnostic data, never as native ownership or signal
+/// authority. The strict current record protocol, one terminal `end`, and every observed
+/// nonzero group generation's own `closed` line must be present. A zero-group run may finish.
+#[must_use]
+pub fn completed_archive(text: &str) -> Option<Record> {
+    if text.len() as u64 > RECORD_BYTES {
+        return None;
+    }
+    let header = text.lines().next()?;
+    let fields = cleanup_fields(header, &["v", "boot", "id", "uniqueid", "start", "sid"])?;
+    let id = RunId::parse(fields.get(2)?)?;
+    let name = format!("{}.run", id.text());
+    let record = cleanup_record(Path::new(&name), text)?;
+    let mut latest = std::collections::BTreeMap::<u32, bool>::new();
+    let mut ended = false;
+    for line in text.lines() {
+        if ended {
+            return None;
+        }
+        match line.split_whitespace().next()? {
+            "group" => {
+                let fields =
+                    cleanup_fields(line, &["pgid", "leader_birth", "leader_uniqueid", "stage"])?;
+                latest.insert(fields.first()?.parse().ok()?, false);
+            }
+            "closed" => {
+                let fields = cleanup_fields(line, &["pgid"])?;
+                let generation = latest.get_mut(&fields.first()?.parse::<u32>().ok()?)?;
+                if *generation {
+                    return None;
+                }
+                *generation = true;
+            }
+            "end" => ended = true,
+            _ => {}
+        }
+    }
+    (ended
+        && record
+            .groups
+            .iter()
+            .all(|group| group.closed && group.leader_birth.0 != 0 && group.leader_uniqueid != 0))
+    .then_some(record)
+}
+
 /// A complete admitted snapshot of the records in `dir`, or unknown: one record that does not
 /// read complete refuses the whole snapshot, never a partial set of competing claims. A
 /// directory not made yet holds none.
@@ -1070,3 +1115,7 @@ mod append_tests;
 #[cfg(test)]
 #[path = "runs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "runs_completed_archive_tests.rs"]
+mod completed_archive_tests;

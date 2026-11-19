@@ -12,6 +12,8 @@
 //! m2") read both, and neither is a limit. No provider is called and nothing is written; the
 //! caller caches the view and projects again only when the inventory moves.
 
+pub mod inventory;
+
 #[cfg(unix)]
 use super::journal::place::{Places, Why};
 use super::{
@@ -258,6 +260,26 @@ fn sort_preferences(preferences: &mut [Preference]) {
     });
 }
 
+/// The configured preference links between the admitted machine and account rows.
+fn preferences(projected: Projection, admits: impl Fn(&str, &str) -> bool) -> Vec<Preference> {
+    let mut preferences: Vec<Preference> = projected
+        .rows
+        .into_values()
+        .filter(|row| row.live())
+        .filter_map(|row| {
+            let machine = row.get("machine").and_then(Value::as_str)?;
+            let account = row.get("account").and_then(Value::as_str)?;
+            admits(machine, account).then(|| Preference {
+                machine: machine.to_owned(),
+                account: account.to_owned(),
+                rank: row.get("rank").and_then(Value::as_u64),
+            })
+        })
+        .collect();
+    sort_preferences(&mut preferences);
+    preferences
+}
+
 impl LabView {
     /// Read canonical identities from the authenticated registry view, with every Mac's
     /// `account-obs` rows as that view holds them.
@@ -379,22 +401,9 @@ impl LabView {
             })
             .collect();
         let me = me_uuid.and_then(|uuid| bound.get(uuid)).cloned();
-        let mut preferences: Vec<Preference> = cell::project(&PREFERENCE, cells)
-            .rows
-            .into_iter()
-            .filter(|(_, row)| row.live())
-            .filter_map(|(_, row)| {
-                let machine = row.get("machine").and_then(Value::as_str)?;
-                let account = row.get("account").and_then(Value::as_str)?;
-                (machines.get(machine).is_some_and(|m| m.live) && accounts.contains_key(account))
-                    .then(|| Preference {
-                        machine: machine.to_owned(),
-                        account: account.to_owned(),
-                        rank: row.get("rank").and_then(Value::as_u64),
-                    })
-            })
-            .collect();
-        sort_preferences(&mut preferences);
+        let preferences = preferences(cell::project(&PREFERENCE, cells), |machine, account| {
+            machines.get(machine).is_some_and(|m| m.live) && accounts.contains_key(account)
+        });
         let observed = mail::observed(obs.rows.iter().map(|(key, row)| (key.as_str(), &row.value)));
         let address_index = AddressIndex::of(&addresses);
         Self {

@@ -154,6 +154,84 @@ impl Holder {
     pub fn running(&self) -> bool {
         crate::kproc::record(self.pid).is_some_and(|p| birth_us(&p) == self.birth_us)
     }
+
+    /// Whether this exact native process still holds the given vnode open.
+    /// This is read-only possession evidence, not lock or CPU admission authority.
+    /// Unsupported or refused process/descriptor reads return false.
+    #[must_use]
+    pub fn holds_file(self, device: u32, inode: u64) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            live::holder(
+                Record {
+                    pid: self.pid,
+                    started_us: self.birth_us,
+                    cwd: None,
+                },
+                (device, inode),
+                None,
+            ) == Sight::Sighted(self)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (device, inode);
+            false
+        }
+    }
+}
+
+/// A process-bound adoption's state in one complete registry snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdoptionClaim {
+    /// The exact native PID and birth still identify the adopted process.
+    Held(Holder),
+    /// Conflicting or unprovable process ownership, never a free reservation.
+    Unknown,
+}
+
+/// One adopted canonical slot and the physical file it named during the snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdoptedSlot {
+    /// Device and inode, checked again by a complete production census.
+    pub file: (u32, u64),
+    /// Positive process identity or explicit uncertainty.
+    pub claim: AdoptionClaim,
+}
+
+/// Complete process-bound adoptions for direct slot files in this physical pool.
+/// This has no diagnostic slot-count truncation. `None` is unknown, never empty.
+#[must_use]
+pub fn adoptions_for_pool(
+    registry: &Path,
+    pool: &Path,
+) -> Option<std::collections::BTreeMap<PathBuf, AdoptedSlot>> {
+    #[cfg(target_os = "macos")]
+    {
+        adoptions::for_pool(registry, pool)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (registry, pool);
+        None
+    }
+}
+
+/// The original native writer/descriptor check without a diagnostic directory
+/// census or adoption overlay. Refused, changed and unsupported reads are unknown.
+#[must_use]
+pub fn record_holder(record: Record, device: u32, inode: u64) -> Option<Holder> {
+    #[cfg(target_os = "macos")]
+    {
+        match live::holder(record, (device, inode), None) {
+            Sight::Sighted(holder) => Some(holder),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (record, device, inode);
+        None
+    }
 }
 
 /// Single-read observation of one slot file.
@@ -842,3 +920,7 @@ mod adoptions;
 #[cfg(test)]
 #[path = "slots_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "slots_holder_tests.rs"]
+mod holder_tests;

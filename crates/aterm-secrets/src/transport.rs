@@ -531,8 +531,10 @@ pub const NO_WAIT_HEADER: &str = "X-Aterm-No-Wait";
 
 /// Header a `/records` GET sends (`"1"`) when its reader takes a served frame after the records
 /// (`membership_log::served`): a server whose store is rooted at a final checkpoint sends its
-/// roots and stubs only to such a GET, and every other reader is sent records alone. No client of
-/// this build sends it (tracker FL-148c).
+/// roots and stubs only to such a GET, and every other reader is sent records alone. A puller
+/// sends it only where it reads format 2 ([`crate::membership_log::Reading::admits_two`]: its
+/// format mark names it on a build that reads it, or it asks a source again to follow it there,
+/// `crate::membership_log::follow`), so no running build does.
 pub const RECORDS_SERVED_HEADER: &str = "X-Aterm-Records-Served";
 
 /// Header on a `>= 0.146` server's `/records` GET reply (`"1"`) when the caller's `?have=` frontier
@@ -1355,6 +1357,22 @@ struct Pull<'a> {
     subscriber: Option<&'a str>,
     bound: crate::crossing::RecordsBound,
     limit: usize,
+    /// The format the puller reads the answer's records at
+    /// ([`crate::membership_log::Reading`]): format 1 for every node but one that follows a
+    /// format-2 vault (`crate::membership_log::follow`).
+    reading: crate::membership_log::Reading,
+    /// Whether the puller takes a served frame after the records ([`RECORDS_SERVED_HEADER`]):
+    /// only one whose `reading` reads format 2 does ([`Pull::takes_served`]).
+    served: bool,
+}
+
+impl Pull<'_> {
+    /// Whether this pull asks for a served frame and reads one: its caller takes one, and it
+    /// reads format 2. A format-1 reader refuses a version-2 record's stub, and a rooted store
+    /// is format 2's, so a pull that reads format 1 never asks, whatever its caller says.
+    const fn takes_served(&self) -> bool {
+        self.served && self.reading.admits_two()
+    }
 }
 
 fn records_exchange(
@@ -1395,14 +1413,18 @@ impl RecordReception {
         exchange: aterm_http::Exchange,
         local: crate::crossing::RecordsBound,
         url: &str,
+        reading: crate::membership_log::Reading,
+        served: bool,
     ) -> Result<Self, aterm_http::SendError> {
-        Self::read_with_known(exchange, local, url, |_| None)
+        Self::read_with_known(exchange, local, url, reading, served, |_| None)
     }
 
     fn read_with_known(
         exchange: aterm_http::Exchange,
         local: crate::crossing::RecordsBound,
         url: &str,
+        reading: crate::membership_log::Reading,
+        served: bool,
         known: impl FnMut(&crate::membership_log::RecordId) -> Option<crate::membership_log::Record>,
     ) -> Result<Self, aterm_http::SendError> {
         let bound = ReplyBound::of(exchange.header_all(RECORDS_BOUND_HEADER));
@@ -1422,7 +1444,7 @@ impl RecordReception {
         let said_more = exchange.header(RECORDS_MORE_HEADER) == Some("1");
         let heads = records_heads(exchange.header(RECORDS_HEADS_HEADER)).filter(|_| !said_more);
         let received = exchange.consume_body(|reader| {
-            crate::membership_log::untaken::ReceivedFrames::read_from_with_known(reader, known)
+            crate::membership_log::untaken::ReceivedFrames::read_at(reader, reading, served, known)
         })?;
         // Only a cut reply says more follow: a server of the fence states a bound, and a cut
         // carries at least one record (`Store::missing_within`). Any other answer that says so
@@ -1479,7 +1501,11 @@ pub(crate) fn fetch_records_sync(
         total,
         subscriber,
         bound,
-        limit: crate::membership_log::MAX_RECORDS_STREAM,
+        limit: crate::membership_log::REPLY_CAP,
+        // The body is collected as bytes and no frame of it is read here, so this reading
+        // reads nothing: what decodes the bytes says at which format.
+        reading: crate::membership_log::Reading::ONE,
+        served: false,
     };
     let response = records_exchange(url, pull).and_then(aterm_http::Exchange::collect);
     match completed_records(response, url, wait)? {
@@ -1489,7 +1515,9 @@ pub(crate) fn fetch_records_sync(
 }
 
 /// The ordinary client records pull, stating `bound` of the puller's records and staging frames
-/// while the response is read.
+/// while the response is read, each read at `reading` (the format the puller's store reads,
+/// [`crate::membership_log::Store::reading`]). A puller that reads format 2 asks for a served
+/// frame and takes the one the server sends ([`RECORDS_SERVED_HEADER`], [`Pull::takes_served`]).
 #[cfg(any(unix, windows))]
 pub(crate) fn fetch_record_frames_sync(
     url: &str,
@@ -1498,12 +1526,32 @@ pub(crate) fn fetch_record_frames_sync(
     total: Duration,
     subscriber: Option<&str>,
     bound: crate::crossing::RecordsBound,
+    reading: crate::membership_log::Reading,
 ) -> crate::Result<ReceivedRecordsAnswer> {
-    fetch_record_frames_with_known(url, have, wait, total, subscriber, bound, |_| None)
+    let pull = Pull {
+        have,
+        wait,
+        total,
+        subscriber,
+        bound,
+        limit: crate::membership_log::REPLY_CAP,
+        reading,
+        served: true,
+    };
+    pull_record_frames(url, pull, |_| None)
 }
 
-/// A records pull that can reuse exact immutable owners already held in memory.
-#[cfg(any(unix, windows))]
+/// A records pull that can reuse exact immutable owners already held in memory, each frame
+/// read at `reading`: the format the puller reads its records at (a vault server's,
+/// `server::Shared::records_reading`), or a follow copy's where it asks a peer again stating
+/// format 2 (`crate::membership_log::follow`). It asks for no served frame
+/// ([`RECORDS_SERVED_HEADER`]): its one caller is the vault server's peer pull, whose records
+/// file has no rewritten form to hold a root in.
+#[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a records pull's six inputs, and the owners it may reuse"
+)]
 pub(crate) fn fetch_record_frames_with_known(
     url: &str,
     have: &[crate::membership_log::RecordId],
@@ -1511,6 +1559,7 @@ pub(crate) fn fetch_record_frames_with_known(
     total: Duration,
     subscriber: Option<&str>,
     bound: crate::crossing::RecordsBound,
+    reading: crate::membership_log::Reading,
     known: impl FnMut(&crate::membership_log::RecordId) -> Option<crate::membership_log::Record>,
 ) -> crate::Result<ReceivedRecordsAnswer> {
     let pull = Pull {
@@ -1519,19 +1568,39 @@ pub(crate) fn fetch_record_frames_with_known(
         total,
         subscriber,
         bound,
-        limit: crate::membership_log::MAX_RECORDS_STREAM,
+        limit: crate::membership_log::REPLY_CAP,
+        reading,
+        served: false,
     };
-    let response = records_exchange(url, pull)
-        .and_then(|exchange| RecordReception::read_with_known(exchange, bound, url, known));
-    match completed_records(response, url, wait)? {
-        Some(response) => response.into_answer(url, bound),
+    pull_record_frames(url, pull, known)
+}
+
+/// One records GET as `pull` says, its frames staged while the response is read.
+#[cfg(any(unix, windows))]
+fn pull_record_frames(
+    url: &str,
+    pull: Pull<'_>,
+    known: impl FnMut(&crate::membership_log::RecordId) -> Option<crate::membership_log::Record>,
+) -> crate::Result<ReceivedRecordsAnswer> {
+    let response = records_exchange(url, pull).and_then(|exchange| {
+        RecordReception::read_with_known(
+            exchange,
+            pull.bound,
+            url,
+            pull.reading,
+            pull.takes_served(),
+            known,
+        )
+    });
+    match completed_records(response, url, pull.wait)? {
+        Some(response) => response.into_answer(url, pull.bound),
         None => Ok(ReceivedRecordsAnswer::none()),
     }
 }
 
 /// [`fetch_record_frames_sync`] of a server that does not wait ([`NO_WAIT_HEADER`]), reading a body of at
-/// most `limit` bytes (and never more than [`crate::membership_log::MAX_RECORDS_STREAM`]): a longer
-/// one is [`Pulled::Larger`] (past [`crate::membership_log::MAX_RECORDS_STREAM`], where
+/// most `limit` bytes (and never more than [`crate::membership_log::REPLY_CAP`]): a longer
+/// one is [`Pulled::Larger`] (past [`crate::membership_log::REPLY_CAP`], where
 /// [`fetch_records_sync`] fails as [`past_any_records_stream`] says). A records pass reads its
 /// peers so, all at once under a small limit first (`crate::client`'s `fan_out::RECORDS`).
 #[cfg(any(unix, windows))]
@@ -1542,6 +1611,7 @@ pub(crate) fn fetch_records_within(
     subscriber: Option<&str>,
     bound: crate::crossing::RecordsBound,
     limit: usize,
+    reading: crate::membership_log::Reading,
 ) -> crate::Result<Pulled<ReceivedRecordsAnswer>> {
     let pull = Pull {
         have,
@@ -1550,10 +1620,12 @@ pub(crate) fn fetch_records_within(
         subscriber,
         bound,
         limit,
+        reading,
+        served: true,
     };
-    match records_exchange(url, pull)
-        .and_then(|exchange| RecordReception::read(exchange, bound, url))
-    {
+    match records_exchange(url, pull).and_then(|exchange| {
+        RecordReception::read(exchange, bound, url, reading, pull.takes_served())
+    }) {
         Ok(response) => response.into_answer(url, bound).map(Pulled::Fetched),
         Err(aterm_http::SendError {
             error: aterm_http::Error::TooLarge { .. },
@@ -1566,7 +1638,7 @@ pub(crate) fn fetch_records_within(
 }
 
 /// How [`fetch_records_sync`] fails at `url` when the records it answers are longer than
-/// [`crate::membership_log::MAX_RECORDS_STREAM`], which [`fetch_records_within`] takes for
+/// [`crate::membership_log::REPLY_CAP`], which [`fetch_records_within`] takes for
 /// [`Pulled::Larger`].
 #[cfg(any(unix, windows))]
 pub(crate) fn past_any_records_stream(url: &str) -> Error {
@@ -1574,14 +1646,14 @@ pub(crate) fn past_any_records_stream(url: &str) -> Error {
         "fetching records from",
         url,
         &aterm_http::Error::TooLarge {
-            limit: crate::membership_log::MAX_RECORDS_STREAM,
+            limit: crate::membership_log::REPLY_CAP,
         },
     )
 }
 
 /// A records GET of `url` naming `pull.have` (`GET <url>/records?have=…`) on `http`, stating
 /// `pull.bound` ([`RECORDS_BOUND_HEADER`]), for `pull.subscriber` where given, reading a body of
-/// at most `pull.limit` bytes (never more than [`crate::membership_log::MAX_RECORDS_STREAM`]).
+/// at most `pull.limit` bytes (never more than [`crate::membership_log::REPLY_CAP`]).
 /// With no `pull.wait`, it asks the server not to ([`NO_WAIT_HEADER`]) and dials within
 /// [`PROBE_CONNECT`] (or `pull.total`, where shorter).
 fn records_request<'a>(
@@ -1592,10 +1664,15 @@ fn records_request<'a>(
     let request = http
         .get(&records_have_url(url, pull.have))
         .header(RECORDS_BOUND_HEADER, &pull.bound.value())
-        .limit(pull.limit.min(crate::membership_log::MAX_RECORDS_STREAM));
+        .limit(pull.limit.min(crate::membership_log::REPLY_CAP));
     let request = match pull.subscriber {
         Some(sub) => request.header(SUBSCRIBER_HEADER, sub),
         None => request,
+    };
+    let request = if pull.takes_served() {
+        request.header(RECORDS_SERVED_HEADER, "1")
+    } else {
+        request
     };
     if pull.wait.is_none() {
         request
@@ -1634,12 +1711,22 @@ fn records_answer(
             bound,
         }),
         404 => Ok(RecordsAnswer::stating(bound)),
-        status => Err(refused(
-            "fetching records from",
-            url,
-            status,
-            response.body(),
-        )),
+        status => {
+            let error = refused("fetching records from", url, status, response.body());
+            // A server whose records are in a later format than the puller stated answers `409`
+            // beside its own bound: the refusal says so by a kind of its own
+            // ([`ErrorKind::LaterFormat`]), which no other refusal has (a reply the puller
+            // cannot take for its capacity or its crossing is [`check_records_reply`]'s
+            // [`ErrorKind::Refused`]), so a puller whose build reads that format asks that
+            // server again stating it, and no other (`crate::membership_log::follow`). No
+            // server states a later format than 1 while no node stores a format mark.
+            Err(match bound {
+                ReplyBound::Stated(peer) if status == 409 && peer.format > local.format => {
+                    Error::of_kind(ErrorKind::LaterFormat, error.0)
+                }
+                _ => error,
+            })
+        }
     }
 }
 
@@ -1788,7 +1875,7 @@ pub fn fetch_heard(url: &str) -> crate::Result<Option<Heard>> {
 /// posts state its own ([`post_records_answered_until`]).
 ///
 /// # Errors
-/// `records` exceeds [`crate::membership_log::MAX_RECORDS_STREAM`], transport fails, or the server
+/// `records` exceeds [`crate::membership_log::REPLY_CAP`], transport fails, or the server
 /// refuses the records (`400`, `403`, `507`, …).
 pub fn post_records(url: &str, records: &[u8]) -> crate::Result<()> {
     post_records_answered(url, records)?
@@ -1802,7 +1889,7 @@ pub fn post_records(url: &str, records: &[u8]) -> crate::Result<()> {
 /// the same POST may land.
 ///
 /// # Errors
-/// `records` exceeds [`crate::membership_log::MAX_RECORDS_STREAM`], transport fails, or the server
+/// `records` exceeds [`crate::membership_log::REPLY_CAP`], transport fails, or the server
 /// answers `408`, `429` or a `5xx` other than `507`.
 pub(crate) fn post_records_answered(url: &str, records: &[u8]) -> crate::Result<crate::Result<()>> {
     post_records_answered_until(
@@ -1859,7 +1946,7 @@ fn post_records_body_answered_until(
     bound: crate::crossing::RecordsBound,
     deadline: Option<std::time::Instant>,
 ) -> crate::Result<crate::Result<()>> {
-    let max = crate::membership_log::MAX_RECORDS_STREAM;
+    let max = crate::membership_log::REPLY_CAP;
     let len = match &body {
         aterm_http::Body::Empty => 0,
         aterm_http::Body::Bytes(bytes) => bytes.len() as u64,

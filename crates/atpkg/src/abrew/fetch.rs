@@ -136,6 +136,34 @@ fn check_headers(headers: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Why this process may not fetch `url`, or `None` when it may. A unit test fetches only local
+/// URLs (`file://`, a loopback host), so no test's verdict depends on formulae.brew.sh, GitHub or
+/// the machine's network: a remote fetch fails before curl starts, as an unreachable host fails,
+/// which every caller already meets offline. Outside unit tests every URL [`check_url`] admits
+/// is fetched.
+fn refused(url: &str) -> Option<&'static str> {
+    #[cfg(test)]
+    {
+        let authority = url.split_once("://").map_or("", |(_, rest)| {
+            rest.split(['/', '?', '#']).next().unwrap_or("")
+        });
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let host = match host.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => host.split(':').next().unwrap_or(""),
+        };
+        let local = url.starts_with("file://") || matches!(host, "localhost" | "127.0.0.1" | "::1");
+        (!local).then_some("a unit test reaches no remote host")
+    }
+    #[cfg(not(test))]
+    {
+        let _ = url;
+        None
+    }
+}
+
 /// Redirect protocols: https never downgrades.
 fn proto_args(url: &str) -> [&'static str; 4] {
     if url.starts_with("https://") {
@@ -233,6 +261,14 @@ pub(super) fn curl_get_with_status(url: &str, headers: &[&str]) -> Result<Vec<u8
         args.push(h);
     }
     args.extend(["--", url]);
+    if let Some(why) = refused(url) {
+        // curl's own exit for a host it could not connect to.
+        return Err(GetError {
+            code: Some(7),
+            status: None,
+            message: format!("abrew: download failed ({url}): {why}"),
+        });
+    }
     let out = run_capture(aterm_uds::os_path!("curl"), &args).map_err(GetError::other)?;
     parse_get_response(url, out.status.code(), out.stdout, &out.stderr)
 }
@@ -298,6 +334,9 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
         args.push(&header_cfg);
     }
     args.extend(["--url", url]);
+    if let Some(why) = refused(url) {
+        return Err(format!("abrew: download failed ({url}): {why}"));
+    }
     let code = run_inherit(aterm_uds::os_path!("curl"), &args);
     if code != 0 {
         return Err(format!("abrew: download failed ({url}), curl exit {code}"));
@@ -341,6 +380,9 @@ pub fn head_size(url: &str, headers: &[&str]) -> Option<u64> {
     args.push("--url".into());
     args.push(url.to_string());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if refused(url).is_some() {
+        return None;
+    }
     let out = run_capture(aterm_uds::os_path!("curl"), &refs).ok()?;
     if !out.status.success() {
         return None;

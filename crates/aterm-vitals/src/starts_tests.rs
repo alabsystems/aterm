@@ -157,6 +157,7 @@ fn moved_counts_aterms_own_coalition_and_linux_forks() {
             exits: Some(1),
             own_starts: Some(3),
             heat: None,
+            energy: None,
         })
     );
     let unowned = StartCount::Coalitions {
@@ -171,6 +172,7 @@ fn moved_counts_aterms_own_coalition_and_linux_forks() {
             exits: None,
             own_starts: None,
             heat: None,
+            energy: None,
         })
     );
     assert_eq!(
@@ -187,16 +189,17 @@ fn a_flow_is_its_counts_over_the_interval() {
         exits: Some(38),
         own_starts: Some(4),
         heat: None,
+        energy: None,
     };
     assert_eq!(
-        TaskFlow::of(m, 2.0),
+        TaskFlow::of(m.clone(), 2.0),
         Some(TaskFlow {
             starts_ps: 18.5,
             exits_ps: Some(19.0),
             aterm_starts_ps: Some(2.0),
         })
     );
-    assert_eq!(TaskFlow::of(m, 0.0), None);
+    assert_eq!(TaskFlow::of(m.clone(), 0.0), None);
     assert_eq!(TaskFlow::of(m, f64::NAN), None);
 }
 
@@ -349,4 +352,71 @@ fn a_book_with_another_count_than_the_rows_is_refused() {
     let once = CoalTaskRead::of(Some(2), false, [row(1, 1, 0), row(2, 1, 0)])
         .with_heat(heat_book(1, &[(1, w), (2, w)]));
     assert!(once.heat().is_some_and(|b| b.total.is_ok()), "control");
+}
+
+/// Only the same supported starts/heat transition can supply per-id energy. A missing heat
+/// endpoint breaks the chain on both sides; a cut list, unbased coalition or changed source
+/// kind cannot produce a receipt, even when some individual counters remain readable.
+#[test]
+fn group_book_energy_uses_the_existing_start_transition_and_its_missing_controls() {
+    let w = |n| [n; crate::heat::COUNTERS];
+    let then = read(20, &[(10, 4, 0)]).with_heat(heat_book(7_000_000_000, &[(10, w(10))]));
+    let now = read(20, &[(10, 5, 0)]).with_heat(heat_book(9_000_000_000, &[(10, w(13))]));
+    let count = |read: &CoalTaskRead| StartCount::Coalitions {
+        read: read.clone(),
+        own: None,
+    };
+    let transition = moved(&count(&then), &count(&now)).expect("supported transition");
+    let energy = transition
+        .energy
+        .expect("heat was sampled")
+        .expect("same current counters");
+    assert_eq!(
+        (energy.before_ns(), energy.at_ns(), energy.window_ns()),
+        (7_000_000_000, 9_000_000_000, 2_000_000_000)
+    );
+    assert_eq!(energy.get(10).expect("named coalition").cpu_mw(), 0.0000015);
+    let bare = read(20, &[(10, 5, 0)]);
+    for (a, b) in [(&then, &bare), (&bare, &now)] {
+        let transition = moved(&count(a), &count(b)).expect("task counters still read");
+        assert_eq!(transition.heat, Some(Err("heat_unread")));
+        assert_eq!(transition.energy, Some(Err("heat_unread")));
+    }
+    assert_eq!(
+        moved(&count(&bare), &count(&bare))
+            .expect("no heat reader")
+            .energy,
+        None
+    );
+
+    let mut cut = now.clone();
+    cut.truncated = true;
+    assert!(moved(&count(&then), &count(&cut)).is_none());
+    assert!(moved(&count(&cut), &count(&now)).is_none());
+    let unbased = read(20, &[(10, 5, 0), (15, 1, 0)])
+        .with_heat(heat_book(9_000_000_000, &[(10, w(13)), (15, w(1))]));
+    assert!(moved(&count(&then), &count(&unbased)).is_none());
+    assert!(moved(&count(&then), &StartCount::Forks(100)).is_none());
+    assert!(moved(&StartCount::Forks(100), &count(&now)).is_none());
+}
+
+/// A raw heat record cannot name another coalition than the task record the same copy loop
+/// handed over, even if its count and aggregate still happen to agree.
+#[test]
+fn group_book_energy_refuses_different_ids_at_the_same_raw_row_count() {
+    let w = |n| [n; crate::heat::COUNTERS];
+    let then = read(20, &[(10, 4, 0)]).with_heat(heat_book(1, &[(10, w(10))]));
+    let wrong = read(20, &[(10, 5, 0)]).with_heat(heat_book(2, &[(15, w(13))]));
+    let count = |read| StartCount::Coalitions { read, own: None };
+    let moved = moved(&count(then.clone()), &count(wrong)).expect("task counters still read");
+    assert!(moved.heat.expect("existing aggregate").is_ok());
+    assert_eq!(moved.energy, Some(Err("rows")));
+    let right = read(20, &[(10, 5, 0)]).with_heat(heat_book(2, &[(10, w(13))]));
+    assert!(
+        super::moved(&count(then), &count(right))
+            .expect("task counters read")
+            .energy
+            .expect("heat reader")
+            .is_ok()
+    );
 }

@@ -6,6 +6,9 @@ use aterm_spec::derive::Model;
 /// A retained projection is absent, unbound or bound. A read is absent, newly
 /// unbound, newly bound, partial or failed. Policy is enabled,
 /// disabled or unavailable. One local observation has 45 possible inputs.
+/// While it is pending no sheet is admitted, and a sync with no source named still goes on
+/// (`synced`): pending refuses nothing. That such a sync writes nothing is the sync's own tests'
+/// (`accounts_source_pending_tests.rs`); no projection here could fail on it.
 /// This proves no transport, membership, credential or provider property.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -17,6 +20,7 @@ pub fn lab_source_availability_model() -> Model {
             var retained = 0; var visible = 0; var pending = 0;
             var naming = 0; var sheet = 0; var phase = 0;
             var revision = 0; var exposed = 0;
+            var synced = 0;
 
             action Held when (phase == 0 && 2 > held) { held = held + 1; }
             action Read when (phase == 0 && 4 > read) { read = read + 1; }
@@ -41,6 +45,8 @@ pub fn lab_source_availability_model() -> Model {
                 exposed = if Buggy == 8 && policy > 0 {1}
                     else if policy > 0 || read == 0 {0}
                     else if read == 1 {3} else if read == 2 {4} else {held};
+                synced = if Buggy == 9
+                    && (policy == 2 || (policy == 0 && read > 2 && held == 0)) {0} else {1};
                 phase = 1;
             }
 
@@ -68,10 +74,11 @@ pub fn lab_source_availability_model() -> Model {
                 || (read == 2 && revision == 4) || (read > 2 && revision == held);
             invariant VisibleRevision: phase == 0
                 || (policy == 0 && exposed == revision) || (policy > 0 && exposed == 0);
+            invariant PendingSyncs: phase == 0 || pending == 0 || synced == 1;
             bound ObservationBox: held <= 2 && read <= 4 && policy <= 2
                 && retained <= 2 && visible <= 1 && pending <= 1
                 && naming <= 2 && sheet <= 1 && phase <= 1
-                && revision <= 4 && exposed <= 4;
+                && revision <= 4 && exposed <= 4 && synced <= 1;
         }
     }
 }

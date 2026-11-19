@@ -687,7 +687,59 @@ fn exercise(case: Case) -> io::Result<()> {
     );
     // Reap is terminal: no post-reap cleanup may touch this pid/group, even on a later panic.
     assert!(fixture.reaped);
+    // A launcher that ran nothing says why where its line was typed, naming the step that
+    // refused and the host's own answer; one that exec'd says nothing of its own.
+    let said = std::fs::read_to_string(fixture.world.join("helper-stderr.txt"))?;
+    let refusal = match case {
+        Case::Denied => Some("exec grant: ERR denied native exec"),
+        Case::LostAck => Some("exec grant: "),
+        Case::Plaintext => Some("exec: "),
+        Case::FastExit | Case::Stdio => None,
+    };
+    match refusal {
+        Some(refusal) => assert!(
+            said.contains(&format!("aterm harness native-launch: {refusal}")),
+            "{} said {said:?}",
+            case.word()
+        ),
+        None => assert!(
+            !said.contains("aterm harness native-launch:"),
+            "{} said {said:?}",
+            case.word()
+        ),
+    }
     Ok(())
+}
+
+/// A launcher whose line is malformed, or whose host cannot be reached, says so on its error
+/// stream and exits 126; it never ends silent.
+#[test]
+fn native_launcher_says_why_it_ran_nothing() {
+    let (exit, said) = super::native_launch::said(&["native-launch".into(), "id=x".into()]);
+    assert_eq!(exit, Some(std::process::ExitCode::from(126)));
+    assert_eq!(said, "aterm harness native-launch: malformed arguments\n");
+    let world = aterm_tempfile::tempdir().expect("scratch world");
+    let socket = world.path().join("absent.sock");
+    let b = binding();
+    let (exit, said) = super::native_launch::said(&[
+        "native-launch".into(),
+        "contract=1".into(),
+        OsString::from(format!(
+            "socket={}",
+            aterm_codec::hex::encode_lower(socket.as_os_str().as_encoded_bytes())
+        )),
+        OsString::from(format!("session={SID}")),
+        OsString::from(format!("id={}", b.id)),
+        OsString::from(format!("cap={}", b.capability)),
+        "phase=forward".into(),
+    ]);
+    assert_eq!(exit, Some(std::process::ExitCode::from(126)));
+    assert!(
+        said.starts_with("aterm harness native-launch: host socket: ") && said.ends_with('\n'),
+        "{said:?}"
+    );
+    assert_eq!(said.lines().count(), 1, "{said:?}");
+    assert_eq!(super::native_launch::said(&["other".into()]).0, None);
 }
 
 /// Direct entry only: no normal harness setup, account lookup, provider, shell or worker.

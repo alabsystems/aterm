@@ -50,6 +50,7 @@ fn write(request: u8, key: &str, value: Value) -> Command {
             key: key.into(),
             value: Some(value),
         }],
+        said: None,
     }
 }
 
@@ -92,7 +93,8 @@ fn private_database_writes_and_retries_survive_wide_frontiers() {
         assert!(
             db.commit(Command::Write {
                 request: [8; 16],
-                changes: vec![]
+                changes: vec![],
+                said: None
             })
             .is_err()
         );

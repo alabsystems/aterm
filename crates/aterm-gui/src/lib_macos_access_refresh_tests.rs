@@ -69,6 +69,7 @@ mod fda_grant_history_tests {
         app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
             revision,
             allowed: true,
+            person_access: true,
         }));
         app
     }
@@ -107,6 +108,7 @@ mod fda_grant_history_tests {
         app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
             revision: revision + 1,
             allowed: true,
+            person_access: true,
         }));
         std::fs::remove_dir(&record).unwrap();
         std::fs::rename(&retained, &record).unwrap();
@@ -467,6 +469,7 @@ fn new_mac() -> App {
     app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
         revision: 1,
         allowed: true,
+        person_access: true,
     }));
     app
 }
@@ -529,6 +532,47 @@ fn setup_permission_hold_defers_queued_launch_decisions_and_automatic_page_effec
         "the owner's explicit button still works"
     );
     assert!(app.devtools_helper.next_deadline(now, || true).is_some());
+}
+
+#[test]
+fn an_automatic_plan_offers_privacy_pages_until_a_request_arrives() {
+    use crate::consent_launch::FdaLaunch;
+    use crate::devtools_helper::{HandOver, Origin, Refusal, test_arms};
+    let mut app = new_mac();
+    app.hold_initial_setup_permissions();
+    assert!(app.consent_card.begin_deciding(Instant::now()));
+    app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
+    assert_eq!(app.devtools_helper.fda_queued(), Some(Origin::Automatic));
+    let fda_opens = test_arms::fda_counts().0;
+    let devtools_opens = test_arms::opens();
+
+    app.recheck_initial_setup_permissions();
+    let automatic = crate::InitialSetupPermissionPolicy {
+        revision: 1,
+        allowed: true,
+        person_access: false,
+    };
+    app.observe_initial_setup_permissions(Some(automatic));
+    assert!(app.permission_steps_admitted());
+    app.rearm_access_steps(Instant::now());
+    assert_eq!(app.devtools_helper.fda_queued(), None);
+    assert_eq!(app.consent_launch.fda(), FdaLaunch::NotAsked);
+    app.look_for_fda_moment(Instant::now(), quiet);
+    assert_eq!(test_arms::fda_counts().0, fda_opens);
+    assert_eq!(
+        app.devtools_hand_over_after_listing(Origin::Automatic, Ok(()), Instant::now()),
+        HandOver::Refused(Refusal::NotRequested)
+    );
+    assert_eq!(test_arms::opens(), devtools_opens);
+
+    app.observe_initial_setup_permissions(Some(crate::InitialSetupPermissionPolicy {
+        person_access: true,
+        ..automatic
+    }));
+    app.rearm_access_steps(Instant::now());
+    assert_eq!(app.devtools_helper.fda_queued(), Some(Origin::Automatic));
+    app.look_for_fda_moment(Instant::now(), quiet);
+    assert_eq!(test_arms::fda_counts().0, fda_opens + 1);
 }
 
 /// A new Mac's launch check: the card settles and the window's own Full Disk Access

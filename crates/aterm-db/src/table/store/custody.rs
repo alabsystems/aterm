@@ -303,7 +303,7 @@ pub(crate) fn witnessed_prefix(
     let replay = replay::read_observed(records, boundary)?;
     let prefix = WitnessedPrefix {
         scope,
-        entries: replay.entries,
+        entries: replay.entries.into_iter().collect(),
         claims,
         name,
         claim,

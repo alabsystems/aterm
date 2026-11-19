@@ -222,29 +222,25 @@ impl Drop for Attached {
 }
 
 #[test]
-fn only_a_change_into_or_out_of_the_deck_moves_the_head() {
+fn each_resource_form_has_its_own_head_height() {
     const CELL: usize = 28;
     let head = |bars, deck| chrome_head_px(28.0, 2.0, bars, deck, CELL);
     for deck in [DeckForm::Folded, DeckForm::Full] {
         for a in StatsBars::ALL {
             for b in StatsBars::ALL {
                 let moved = head(a, deck) != head(b, deck);
-                assert_eq!(
-                    a.takes_room() != b.takes_room(),
-                    moved,
-                    "{a:?} to {b:?}, {deck:?}"
-                );
+                assert_eq!(a != b, moved, "{a:?} to {b:?}, {deck:?}");
             }
         }
     }
     for bars in StatsBars::ALL {
         let unfold = head(bars, DeckForm::Full) - head(bars, DeckForm::Folded);
-        assert_eq!(unfold != 0, bars.takes_room(), "{bars:?}");
+        assert_eq!(unfold != 0, bars == StatsBars::Deck, "{bars:?}");
         assert_eq!(unfold % CELL, 0, "{bars:?}");
     }
     assert_eq!(
         head(StatsBars::Sill, DeckForm::Folded),
-        head(StatsBars::Off, DeckForm::Full)
+        head(StatsBars::Off, DeckForm::Full) + crate::stats_sill::compact_height(2.0)
     );
 }
 
@@ -940,6 +936,7 @@ pub(crate) fn input(snap: &Snapshot) -> DeckInput<'_> {
         network_place: None,
         network_target: crate::network_deck::Target::Overview,
         disk_span: crate::stats_lens::DiskSpan::Day,
+        cpu_policy_pending: false,
         lab: None,
         fleet: None,
         snap: Some(snap),
@@ -1245,6 +1242,105 @@ fn the_same_snapshot_lays_the_same_pixels() {
         let a = deck_prims(&GEOM, &i);
         let b = deck_prims(&GEOM, &i);
         assert_eq!(prims_fp(&a), prims_fp(&b), "{form:?}");
+    }
+}
+
+/// THE DECK DRAWS NOTHING OF ATERM'S OWN THREADS OR THE NEURAL ENGINE'S POWER: over scripted
+/// resting readings, the deck's prims, full and folded, are the same whether each reading read
+/// aterm's own threads and the engine's power, as every reading did before, or neither, carrying
+/// only the engine's reading from the reader's start, as a resting reading does now. NEGATIVE
+/// CONTROLS: a deck whose layout read either (its height one pixel short where the reading read
+/// aterm's threads, or where the engine was off) lays other prims.
+#[test]
+fn resting_readings_lay_the_same_deck_with_or_without_self_cpu_and_neural_engine_reads() {
+    use aterm_vitals::self_cpu::{
+        OwnCpuCounter, OwnCpuCoverage, OwnCpuCut, OwnCpuProcess, OwnCpuThread, OwnCpuView,
+    };
+    let cut = |t: u64| {
+        let counter = |ns| OwnCpuCounter {
+            ns,
+            precision_ns: 0,
+        };
+        OwnCpuCut {
+            process: OwnCpuProcess {
+                pid: 100,
+                start: 1,
+                version: 1,
+            },
+            begin_ns: t * 1_000_000_000,
+            end_ns: t * 1_000_000_000 + 1,
+            process_before: counter(t * 1_000),
+            process_after: counter(t * 1_000 + 1),
+            threads: vec![OwnCpuThread {
+                id: 1,
+                name: Some("aterm-vitals".into()),
+                cpu: Some(counter(t * 500)),
+            }],
+            coverage: OwnCpuCoverage {
+                listed: 1,
+                inspected: 1,
+                unread: 0,
+                capped: false,
+            },
+        }
+    };
+    let readings: [(u64, &[u64], &[u64]); 4] = [
+        (10, &[0; 10], &[0, 0]),
+        (11, &[20, 30, 10, 0, 5, 5, 5, 5, 5, 5], &[100, 400]),
+        (
+            12,
+            &[120, 130, 60, 10, 10, 10, 10, 10, 10, 10],
+            &[200, 1200],
+        ),
+        (
+            13,
+            &[220, 230, 110, 20, 15, 15, 15, 15, 15, 15],
+            &[300, 2000],
+        ),
+    ];
+    let start = Some(Ok(aterm_vitals::AneSample {
+        cores: 16,
+        powered: true,
+    }));
+    let run = |read: bool| {
+        let mut v = aterm_vitals::Vitals::new();
+        readings
+            .iter()
+            .map(|&(t, busy, cpu)| {
+                let mut s = sample_at(t, busy, cpu);
+                if read {
+                    s.self_cpu = Some(Ok(cut(t)));
+                    s.self_cpu_read = true;
+                    s.ane = Some(Ok(aterm_vitals::AneSample {
+                        cores: 16,
+                        powered: t % 2 == 0,
+                    }));
+                } else {
+                    s.ane = start;
+                }
+                v.absorb(&s)
+            })
+            .collect::<Vec<_>>()
+    };
+    let (with, without) = (run(true), run(false));
+    assert!(
+        matches!(
+            with.last().map(|s| &s.self_cpu),
+            Some(OwnCpuView::Observed(_))
+        ),
+        "the reads the deck must not draw are there"
+    );
+    for (n, (a, b)) in with.iter().zip(&without).enumerate() {
+        assert_ne!(a.self_cpu, b.self_cpu);
+        for form in [DeckForm::Full, DeckForm::Folded] {
+            let (mut i, mut j) = (input(a), input(b));
+            (i.form, j.form) = (form, form);
+            assert_eq!(
+                prims_fp(&deck_prims(&GEOM, &i)),
+                prims_fp(&deck_prims(&GEOM, &j)),
+                "reading {n}, {form:?}"
+            );
+        }
     }
 }
 

@@ -215,7 +215,12 @@ pub const CHECKS: [Spec; 19] = [
     Spec {
         check: Check::Appkit,
         name: "appkit",
-        stages: &[StageId::RedrawConformance, StageId::ObjcDrives],
+        stages: &[
+            StageId::RedrawBuild,
+            StageId::ObjcBuild,
+            StageId::RedrawConformance,
+            StageId::ObjcDrives,
+        ],
         reach: Reach::WholeTree,
         needs: &["desktop"],
         also: "macOS",
@@ -242,7 +247,7 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::WholeTree,
         needs: &["desktop"],
         also: "--app <APP>",
-        runs: "aterm-conformance's paint/spin/aos/rewind/size rows, then the GUI typing smoke, on <APP> (alone); \
+        runs: "aterm-conformance's paint/spin/aos/rewind/size/capture rows, then the GUI typing smoke, on <APP> (alone); \
                a row a bundle this checkout's HEAD did not build has no answer to is named, not judged",
     },
     Spec {

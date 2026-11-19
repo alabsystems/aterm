@@ -47,6 +47,10 @@ struct Changing {
     withdraw_on_receive: bool,
     received: Mutex<Vec<Vec<u8>>>,
     lookups: Mutex<Vec<usize>>,
+    /// Whether its membership records ride the members lane ([`Stores::members_lane`]): shut
+    /// for a stand-in of a Mac whose records are past format 1, which the lane then reads an
+    /// empty log, as the vault's stores do.
+    lane: AtomicBool,
 }
 
 impl Changing {
@@ -58,6 +62,7 @@ impl Changing {
             withdraw_on_receive,
             received: Mutex::new(Vec::new()),
             lookups: Mutex::new(Vec::new()),
+            lane: AtomicBool::new(true),
         })
     }
 
@@ -209,15 +214,21 @@ impl Stores for Changing {
         Ok(self.wires(keys.len(), |wire| keys.contains(&proof_key(wire))))
     }
 
+    fn members_lane(&self) -> io::Result<bool> {
+        Ok(self.lane.load(Ordering::Acquire))
+    }
+
     fn members_inventory(&self) -> io::Result<BTreeSet<Digest>> {
-        Ok(if self.unit == Unit::Members {
-            self.records()
-                .iter()
-                .map(|wire| crate::stores::digest(wire))
-                .collect()
-        } else {
-            BTreeSet::new()
-        })
+        Ok(
+            if self.unit == Unit::Members && self.lane.load(Ordering::Acquire) {
+                self.records()
+                    .iter()
+                    .map(|wire| crate::stores::digest(wire))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            },
+        )
     }
 
     fn members_wires(&self, ids: &[Digest]) -> io::Result<Vec<Vec<u8>>> {
@@ -402,6 +413,100 @@ fn every_inventory_unit_fetches_current_wires_after_the_receive_turn() {
                 "only eligibility changed, not custody"
             );
         }
+    }
+}
+
+/// One `Inventory` exchange between two membership stand-ins, the first the initiator: what
+/// each side moved.
+fn exchange_members(a: &Arc<Changing>, b: &Arc<Changing>) -> (Moved, Moved) {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let left_dir = root.path().join("left");
+    let right_dir = root.path().join("right");
+    std::fs::create_dir_all(&left_dir).unwrap();
+    std::fs::create_dir_all(&right_dir).unwrap();
+    let left_egress = Egress::new(Arc::clone(a) as Arc<dyn Stores>, &left_dir);
+    let right_egress = Egress::new(Arc::clone(b) as Arc<dyn Stores>, &right_dir);
+    let left_summary = summary(a.as_ref()).unwrap();
+    let right_summary = summary(b.as_ref()).unwrap();
+    let (left, right) = UnixStream::pair().unwrap();
+    for stream in [&left, &right] {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+    }
+    let (mut left, mut right) = (Buffered::new(left), Buffered::new(right));
+    std::thread::scope(|scope| {
+        let responder = scope.spawn(|| {
+            exchange_stream(
+                b.as_ref(),
+                &right_egress,
+                &mut right,
+                right_summary,
+                false,
+                false,
+            )
+            .unwrap()
+        });
+        let sent = exchange_stream(
+            a.as_ref(),
+            &left_egress,
+            &mut left,
+            left_summary,
+            true,
+            false,
+        )
+        .unwrap();
+        (sent, responder.join().unwrap())
+    })
+}
+
+/// A MAC PAST RECORDS FORMAT 1 LEAVES THE MEMBERSHIP UNIT OUT OF A REPAIR ROUND
+/// (ATERM-KI-1116-1471, tracker FL-148E): its lane is shut ([`Stores::members_lane`]), so it
+/// sends no snapshot of the unit, and a format-1 neighbour that holds a record offers it
+/// nothing, whichever of the two starts the exchange; the marked Mac offers nothing either and
+/// its store takes no record. Two Macs whose lanes are open trade the record as before.
+///
+/// NEGATIVE CONTROL: with `exchange_stream` sending the membership snapshot whatever
+/// `members_lane` says (the empty log the lane reads of a marked Mac), the format-1 neighbour
+/// offers its record at each round: `a marked Mac is offered no membership record  left: 1
+/// right: 0`.
+#[test]
+fn a_mac_past_format_one_leaves_the_membership_unit_out_of_a_repair_round() {
+    let pair = || {
+        (
+            Changing::new(Unit::Members, b"a format-1 Mac's record", false),
+            Changing::new(Unit::Members, b"a marked Mac's record", false),
+        )
+    };
+    // Both lanes open: each side gives the other its record.
+    let (one, other) = pair();
+    let (sent, answered) = exchange_members(&one, &other);
+    assert_eq!((sent.sent, sent.received), (1, 1));
+    assert_eq!((answered.sent, answered.received), (1, 1));
+
+    for marked_starts in [false, true] {
+        let (one, marked) = pair();
+        marked.lane.store(false, Ordering::Release);
+        let (of_one, of_marked) = if marked_starts {
+            let (of_marked, of_one) = exchange_members(&marked, &one);
+            (of_one, of_marked)
+        } else {
+            exchange_members(&one, &marked)
+        };
+        assert_eq!(
+            of_one.sent, 0,
+            "a marked Mac is offered no membership record"
+        );
+        assert_eq!(
+            of_marked.sent, 0,
+            "a marked Mac offers no membership record"
+        );
+        assert!(of_one.nothing() && of_marked.nothing());
+        assert!(marked.received.lock().unwrap().is_empty());
+        assert!(one.received.lock().unwrap().is_empty());
     }
 }
 

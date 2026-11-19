@@ -62,6 +62,13 @@ pub(crate) const FOCUSED_PERIOD: Duration = Duration::from_secs(1);
 pub(crate) const BACKGROUND_PERIOD: Duration = Duration::from_secs(5);
 /// The machine counters every ten seconds while every window that draws the bars is hidden.
 pub(crate) const HIDDEN_PERIOD: Duration = Duration::from_secs(10);
+/// How long the probe thread waits for an ask before it reads the machine's counters on its own,
+/// while its newest reading found memory tight or a starvation episode open
+/// ([`aterm_vitals::starving::watching`]): twice [`HIDDEN_PERIOD`], so a host that paces
+/// readings at a hidden deck's cadence or faster is never doubled, while one whose main thread
+/// stops asking (a starving machine stalls it first) or asks none (no window in view draws the
+/// bars) leaves memory judged. A machine with room arms none, so it adds no wake at rest.
+pub(crate) const MEMORY_WATCH_EVERY: Duration = Duration::from_secs(20);
 const PEAKS_EVERY: Duration = Duration::from_secs(600);
 const PEAKS_FILE: &str = "vitals-peaks.json";
 const PEAKS_SCHEMA: u32 = 1;
@@ -97,9 +104,11 @@ const SPOTLIGHT_SCHEMA: u32 = 1;
 /// How long a run of `mdutil -s -a` may take before it is killed and the volumes count as
 /// unread this time: it measured 0.01 s on m42, and it runs on the probe thread at most once a
 /// minute ([`aterm_vitals::spotlight::Cadence`]).
+#[cfg(target_os = "macos")]
 const MDUTIL_WAIT: Duration = Duration::from_secs(2);
 /// How long a killed `mdutil` is given to be reaped before it is left to the reaper: the probe
 /// thread waits on a run at most [`MDUTIL_WAIT`] plus this.
+#[cfg(target_os = "macos")]
 const MDUTIL_REAP: Duration = Duration::from_millis(250);
 /// How often the probe thread reads the disk journal's tail again once it changed, while a window
 /// holds a Disk lens open or a window in view draws the bars (the Disk Custody band shows the
@@ -152,6 +161,9 @@ pub(crate) const MIN_WINDOW: Duration = Duration::from_millis(250);
 /// Minimum interval between pane-layout checks between readings.
 pub(crate) const LAYOUT_EVERY: Duration = Duration::from_millis(250);
 const JOB_EVENTS_CAP: usize = 256;
+/// Health episodes' edges the hand-over keeps for the loop: each episode makes two, so a loop
+/// that has not adopted for a while loses only the oldest past this many.
+const HEALTH_EVENTS_CAP: usize = 16;
 /// How often the bars refresh signature and timeline details. Every whole reading retains
 /// current process/coalition counters; intervening readings reuse only version-checked details.
 pub(crate) const SPLIT_EVERY: Duration = Duration::from_secs(5);
@@ -167,13 +179,28 @@ const WHY_FIXTURE_SEAM: &str = "ATERM_DEV_WHY_FIXTURE";
 /// Pulls that arm the split set: `sys why` and the `sys` queries that print the family, an
 /// `await sys` naming `spotlight`, and a parked `await wake` whose wake names it.
 pub(crate) static SPLIT_ARMED: Arming = Arming::new();
-/// Queries that print CPU hardware (`sys cores`, `sys report`, a forced `sys why`): a pull that
-/// begins while one waits takes a CPU Stats sample ([`Request::hardware`]), which no other
-/// reading of the deck takes (A2 §6.4).
+/// Queries that print CPU hardware (`sys cores`, `sys report`, a forced `sys why`): a worker's
+/// pull ([`Msg::Pull`]) that begins while one waits takes a CPU Stats sample
+/// ([`Request::hardware`]), which no other reading of the deck takes (A2 §6.4). A memory
+/// consumer's census ([`Msg::MemoryPull`]) reads no arming.
 pub(crate) static HARDWARE_ARMED: Arming = Arming::new();
 /// Pulls that arm the stuck engine (`sys jobs`): such a pull's reading makes a new jobs view
 /// inside the engine's cadence, which every other pull keeps.
 pub(crate) static JOBS_ARMED: Arming = Arming::new();
+/// Queries that print each process's scheduling
+/// ([`aterm_vitals::sys::SysQuery::prints_scheduling`]): a worker's pull ([`Msg::Pull`]) that
+/// begins while one waits asks its sweep for it ([`Request::scheduling`]), which a reading
+/// nothing else asks reads none of. A memory consumer's census ([`Msg::MemoryPull`]) reads no
+/// arming.
+pub(crate) static SCHEDULING_ARMED: Arming = Arming::new();
+/// Queries that print aterm's own thread CPU ([`aterm_vitals::sys::SysQuery::prints_self_cpu`]:
+/// `sys why`, bare or of CPU), which wait here only where a reader reads them (macOS:
+/// [`crate::sys_host::Shared`]'s `self_cpu_reads`): a worker's pull ([`Msg::Pull`]) that begins
+/// while one waits reads aterm's threads ([`Request::self_cpu`]), which no other reading reads,
+/// and reads them twice, [`COLD_PAIR`] apart, where the thread's last reading read none within
+/// [`COLD_AFTER`] ([`Source::self_cpu_cold`]). A memory consumer's census ([`Msg::MemoryPull`])
+/// reads no arming.
+pub(crate) static SELF_CPU_ARMED: Arming = Arming::new();
 
 /// How soon a reading no window shows is due again after one that gave `view` and `left`, for
 /// what no edge tells: Slow's 30 s while [`held_on_slow`](crate::vitals_jobs::held_on_slow) (the
@@ -366,6 +393,8 @@ pub(crate) struct Handover {
     began: Option<Instant>,
     words: Vec<WordSeen>,
     job_events: Vec<aterm_vitals::events::Event>,
+    /// Health episodes' edges (a memory starvation episode's), for the loop's records.
+    health_events: Vec<aterm_vitals::events::Event>,
 }
 
 /// Who would see a reading now.
@@ -533,19 +562,31 @@ pub(crate) struct Request {
     pub(crate) machine_only: bool,
     /// The stuck engine looks at this reading even inside its own cadence.
     pub(crate) jobs_now: bool,
-    /// A control worker's pull ([`Msg::Pull`]; the thread sets it): it reads
-    /// the split set only while a `sys why` arms it ([`SPLIT_ARMED`]), and its readings stand
-    /// for an instant in the rings ([`aterm_vitals::model::Sample::pull`]).
+    /// A control worker's pull ([`Msg::Pull`]) or a memory consumer's census
+    /// ([`Msg::MemoryPull`]; the thread sets it): it reads the split set only while a query or
+    /// wait arms it ([`SPLIT_ARMED`] names which), and its readings stand for an instant in the
+    /// rings ([`aterm_vitals::model::Sample::pull`]).
     pub(crate) pull: bool,
-    /// A pull that a `sys cores`, `sys report` or forced `sys why` had armed when it began
-    /// ([`HARDWARE_ARMED`]; the thread sets it): its readings take a CPU Stats sample. The pull
-    /// reads the arming once, so a reading begun before a query armed takes none, and the query
-    /// answers from its own pull's pair.
+    /// A worker's pull ([`Msg::Pull`]) that a `sys cores`, `sys report` or forced `sys why` had
+    /// armed when it began ([`HARDWARE_ARMED`]; `pull` sets it): its readings take a CPU Stats
+    /// sample. The pull reads the arming once, so a reading begun before a query armed takes
+    /// none, and the query answers from its own pull's pair. A memory census
+    /// ([`Msg::MemoryPull`]) leaves it false.
     pub(crate) hardware: bool,
-    /// A window in view shows the bars, as the Deck or the Sill (the Fleet Monitor tab alone shows
-    /// none): only then is the bars' reading a split tick ([`split_due`]). The Sill draws no cause
-    /// clause, but a close-up opens from it as from the Deck, and a close-up's causes are the
-    /// episodes already open.
+    /// A worker's pull ([`Msg::Pull`]) that a query printing each process's scheduling had
+    /// armed when it began ([`SCHEDULING_ARMED`]; `pull` sets it): its readings ask their sweep
+    /// for it ([`Reader::sweep_reads_scheduling`]). A memory census ([`Msg::MemoryPull`]) leaves
+    /// it false.
+    pub(crate) scheduling: bool,
+    /// A worker's pull ([`Msg::Pull`]) that a query printing aterm's own thread CPU had armed
+    /// when it began ([`SELF_CPU_ARMED`]; `pull` sets it): its readings read aterm's threads
+    /// (`task_threads` and each thread's `thread_info` on macOS), which a reading nothing asks
+    /// reads none of. A memory census ([`Msg::MemoryPull`]) leaves it false.
+    pub(crate) self_cpu: bool,
+    /// A window in view shows the bars, as the Deck or the Sill, or the System Resources page
+    /// (whose head draws the Full Deck): only then is the reading a split tick ([`split_due`]).
+    /// The Sill draws no cause clause, but a close-up opens from it as from the Deck, and a
+    /// close-up's causes are the episodes already open.
     pub(crate) deck: bool,
     /// A window in view shows the bars or a page that reads them ([`Audience::in_view`]): when
     /// none does, Linux's all-states TCP dump paces itself to a hidden deck's minute
@@ -553,6 +594,8 @@ pub(crate) struct Request {
     pub(crate) in_view: bool,
     /// Every agent session's token totals, each session once.
     pub(crate) tokens: Vec<TokenRow>,
+    /// Individual dated provider folds, collected even when the terminal has no open view.
+    pub(crate) pane_token_observations: Vec<aterm_vitals::pane_tokens::Observation>,
     /// The front tab's plan usage, while current.
     pub(crate) plan: Option<PlanFact>,
     /// The rows whose lens a window holds open: the CPU lens's asks each reading for CPU Stats
@@ -946,6 +989,8 @@ pub(crate) struct VitalsHost {
     screens: std::collections::HashMap<u64, u64>,
     parked: std::collections::HashMap<u64, Parked>,
     job_events: Vec<aterm_vitals::events::Event>,
+    /// Health episodes' edges handed over and not yet recorded ([`Self::take_health_events`]).
+    health_events: Vec<aterm_vitals::events::Event>,
     job_revs: std::collections::HashMap<u64, u64>,
     delegated_active: bool,
     chips_shown: bool,
@@ -953,6 +998,9 @@ pub(crate) struct VitalsHost {
     pending_cpu_policy: Option<aterm_vitals::sys::json::Jv>,
     #[cfg(target_os = "macos")]
     cpu_policy_generation: Option<(u64, u64)>,
+    /// This App's own among CPU policy operations ([`App::cpu_policy_owner`]).
+    #[cfg(target_os = "macos")]
+    cpu_policy_owner: crate::cpu_policy_authorization::Owner,
     pending_events: Vec<aterm_vitals::StripEvent>,
     /// Whether the run before this one handed it its place (a seamless adoption, a relaunch of
     /// the running app for an update, or Windows' update spawn) and the startup scan found no
@@ -974,6 +1022,10 @@ pub(crate) struct VitalsHost {
     /// [`STRIP_LOCK`]. Set before the probe thread starts ([`Self::note_killed_run_launch`]).
     killed_since: Option<i64>,
     survey: Arc<Where>,
+    /// The System Resources page's Spotlight scope probe ([`crate::resources_spotlight`]).
+    pub(crate) spotlight_scope: Arc<crate::resources_spotlight::ScopeSlot>,
+    /// The System Resources page's macOS configuration reader ([`crate::resources_macos`]).
+    pub(crate) macos_config: Arc<crate::resources_macos::MacosSlot>,
     board: &'static crate::vitals_jobs::JobsBoard,
     proc_edge: &'static ProcEdge,
     /// The wall clock the reading cadence keeps to.
@@ -1027,6 +1079,7 @@ impl Default for VitalsHost {
             screens: std::collections::HashMap::new(),
             parked: std::collections::HashMap::new(),
             job_events: Vec::new(),
+            health_events: Vec::new(),
             job_revs: std::collections::HashMap::new(),
             delegated_active: false,
             chips_shown: false,
@@ -1035,10 +1088,14 @@ impl Default for VitalsHost {
             pending_cpu_policy: None,
             #[cfg(target_os = "macos")]
             cpu_policy_generation: None,
+            #[cfg(target_os = "macos")]
+            cpu_policy_owner: crate::cpu_policy_authorization::Owner::next(),
             handed_off: false,
             crashed_at: None,
             killed_since: None,
             survey: Arc::default(),
+            spotlight_scope: Arc::default(),
+            macos_config: Arc::default(),
             board: &crate::vitals_jobs::BOARD,
             proc_edge: if cfg!(test) {
                 Box::leak(Box::new(ProcEdge::new()))
@@ -1067,13 +1124,14 @@ impl VitalsHost {
     /// Adopts the thread's newest snapshot if newer than the held one, along with its job events.
     pub(crate) fn adopt(&mut self, now: Instant) -> bool {
         self.require_changed_jobs(now);
-        let (fresh, began, words, events, leases, sampled_at, jobs_continuous) = {
+        let (fresh, began, words, events, health, leases, sampled_at, jobs_continuous) = {
             let mut h = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
             (
                 h.snap.take(),
                 h.began.take(),
                 std::mem::take(&mut h.words),
                 std::mem::take(&mut h.job_events),
+                std::mem::take(&mut h.health_events),
                 h.cpu_leases.take(),
                 h.sampled_at.take(),
                 h.jobs_continuous,
@@ -1081,6 +1139,11 @@ impl VitalsHost {
         };
         if leases.is_some() {
             self.cpu_leases = leases;
+        }
+        self.health_events.extend(health);
+        if self.health_events.len() > HEALTH_EVENTS_CAP {
+            let over = self.health_events.len() - HEALTH_EVENTS_CAP;
+            self.health_events.drain(..over);
         }
         self.job_events.extend(events);
         if self.job_events.len() > JOB_EVENTS_CAP {
@@ -1239,6 +1302,11 @@ impl VitalsHost {
     /// Takes the job events handed over from the thread.
     pub(crate) fn take_job_events(&mut self) -> Vec<aterm_vitals::events::Event> {
         std::mem::take(&mut self.job_events)
+    }
+
+    /// Takes the health episodes' edges handed over from the thread.
+    pub(crate) fn take_health_events(&mut self) -> Vec<aterm_vitals::events::Event> {
+        std::mem::take(&mut self.health_events)
     }
 
     /// Returns the next `rev=` number for session `key`'s job events.
@@ -1410,6 +1478,17 @@ trait Source: Sized {
     fn process_receipt(&self) -> Option<Arc<crate::vitals_host::memory::Receipt>> {
         None
     }
+    /// Where a memory starvation edge's line goes before its reading is handed over
+    /// ([`crate::memory_starving::Journal`]): aterm.log's, which a stand-in replaces to see when
+    /// the loop writes it.
+    fn starving_sink(&self) -> &dyn crate::memory_starving::Sink {
+        crate::logging::starving_sink()
+    }
+    /// How long the thread waits for an ask before it reads memory on its own while that memory
+    /// is tight ([`MEMORY_WATCH_EVERY`]).
+    fn memory_watch_every(&self) -> Duration {
+        MEMORY_WATCH_EVERY
+    }
     fn model(&mut self) -> &mut aterm_vitals::Vitals;
     fn machine(&self) -> Option<&Machine> {
         None
@@ -1465,6 +1544,23 @@ trait Source: Sized {
     /// Whether a `sys jobs` waiting on a pull arms the stuck engine for its reading
     /// ([`JOBS_ARMED`]).
     fn jobs_armed(&self) -> bool {
+        false
+    }
+    /// Whether a query that prints each process's scheduling arms a pull beginning now
+    /// ([`SCHEDULING_ARMED`]).
+    fn scheduling_armed(&self) -> bool {
+        false
+    }
+    /// Whether a query that prints aterm's own thread CPU arms a pull beginning now
+    /// ([`SELF_CPU_ARMED`]).
+    fn self_cpu_armed(&self) -> bool {
+        false
+    }
+    /// Whether the thread's last reading read no cut of aterm's own threads within
+    /// [`COLD_AFTER`], so a pull that prints them reads its pair [`COLD_PAIR`] apart and the
+    /// second cut's changes are from the first: a reading that reads none clears the model's
+    /// continuity ([`aterm_vitals::self_cpu::OwnCpuState::absorb`]).
+    fn self_cpu_cold(&self) -> bool {
         false
     }
     /// The host's tellings, by closed tab's key ([`Request::left_told`]): the leftover pass keeps
@@ -1550,6 +1646,20 @@ impl Source for Reader {
 
     fn jobs_armed(&self) -> bool {
         self.jobs_armed.armed()
+    }
+
+    fn scheduling_armed(&self) -> bool {
+        self.scheduling_armed.armed()
+    }
+
+    fn self_cpu_armed(&self) -> bool {
+        self.self_cpu_armed.armed()
+    }
+
+    fn self_cpu_cold(&self) -> bool {
+        let now = (self.clock)();
+        self.self_cpu_last
+            .is_none_or(|at| now.saturating_duration_since(at) > COLD_AFTER)
     }
 
     fn note_told(&mut self, told: &[u64]) {
@@ -1806,10 +1916,16 @@ fn run(
     let no_machine = Machine::default();
     let mut req = Request::default();
     let mut last_whole: Option<Instant> = None;
+    let mut journal = crate::memory_starving::Journal::default();
+    // When the newest reading ended, while its memory keeps the thread reading on its own.
+    let mut watch_from: Option<Instant> = None;
     loop {
         // Initial layout facts precede the first scheduled capture. Completion notices wake
         // this worker after restore; no polling timer or UI event is needed for persistence.
-        let first = match (req.self_pid != 0).then(|| source.boot_after()).flatten() {
+        // The memory watch is the one timer of its own, and only while memory is tight.
+        let boot = (req.self_pid != 0).then(|| source.boot_after()).flatten();
+        let watch = watch_from.map(|at| source.memory_watch_every().saturating_sub(at.elapsed()));
+        let first = match boot.into_iter().chain(watch).min() {
             Some(after) => match rx.recv_timeout(after) {
                 Ok(message) => Some(message),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -1820,7 +1936,10 @@ fn run(
                 Err(_) => break,
             },
         };
-        let checkpoint = first.is_none();
+        // A boot target due no later than the watch is the checkpoint's whole reading, which
+        // judges memory as well.
+        let checkpoint = first.is_none() && boot.is_some_and(|b| watch.is_none_or(|w| b <= w));
+        let watching = first.is_none() && !checkpoint;
         let mut asked = Asked::default();
         if let Some(first) = first {
             asked.take(first, &mut req);
@@ -1850,7 +1969,7 @@ fn run(
         {
             sys.set_facts(req.layout.clone());
         }
-        if !(asked.read || asked.pull || asked.memory || checkpoint) {
+        if !(asked.read || asked.pull || asked.memory || checkpoint || watching) {
             continue;
         }
         if req.self_pid == 0 {
@@ -1872,6 +1991,16 @@ fn run(
             checkpoint_req.machine_only = false;
             checkpoint_req.assessment_only = false;
             source.reading(&checkpoint_req)
+        } else if watching {
+            // No one asked: the machine's counters alone, as a hidden deck reads them, with no
+            // process sweep, which stalls first on a starving machine.
+            let mut watch_req = req.clone();
+            watch_req.machine_only = true;
+            watch_req.assessment_only = false;
+            watch_req.jobs_now = false;
+            watch_req.in_view = false;
+            watch_req.cadence_ms = duration_ms(source.memory_watch_every());
+            source.reading(&watch_req)
         } else {
             source.reading(&req)
         };
@@ -1889,6 +2018,8 @@ fn run(
         if let Some(record) = cpu_report_record(&snap) {
             current_report = Some(record);
         }
+        journal.note(&snap, source.starving_sink());
+        watch_from = aterm_vitals::starving::watching(&snap).then(Instant::now);
         let snap = Arc::new(snap);
         if !snap.machine_only {
             last_whole = Some(Instant::now());
@@ -1908,7 +2039,7 @@ fn run(
                 at: Instant::now(),
             })
         });
-        let hidden = !req.in_view;
+        let hidden = !req.in_view || watching;
         let observed_at = source.observed_at().unwrap_or(memory::ObservedAt {
             instant: source.machine_at().unwrap_or(began),
             continuous_ns: None,
@@ -2015,14 +2146,18 @@ fn pull(
         std::thread::sleep(MIN_WINDOW.saturating_sub(t.elapsed()));
     }
     let hardware = source.hardware_armed();
+    let self_cpu = source.self_cpu_armed();
     let cold = last_whole.is_none_or(|t| t.elapsed() > COLD_AFTER)
         || source.split_cold()
-        || (hardware && source.hardware_cold());
+        || (hardware && source.hardware_cold())
+        || (self_cpu && source.self_cpu_cold());
     let mut pull = req.clone();
     pull.machine_only = false;
     pull.jobs_now = false;
     pull.pull = true;
     pull.hardware = hardware;
+    pull.scheduling = source.scheduling_armed();
+    pull.self_cpu = self_cpu;
     pull.cadence_ms = duration_ms(if cold { COLD_PAIR } else { COLD_AFTER }).max(req.cadence_ms);
     let warm = cold.then(|| {
         pull.reread_words();
@@ -2057,6 +2192,7 @@ fn duration_ms(d: Duration) -> u32 {
 }
 
 fn keep_warm_events(warm: Snapshot, snap: &mut Snapshot) {
+    snap.events_lost = snap.events_lost.saturating_add(warm.events_lost);
     let mut events = warm.events;
     events.append(&mut snap.events);
     snap.events = events;
@@ -2100,6 +2236,12 @@ fn hand_over_allocation(
         .filter(|e| matches!(e.kind, aterm_vitals::events::EventKind::Job { .. }))
         .cloned()
         .collect();
+    let health: Vec<_> = snap
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, aterm_vitals::events::EventKind::Starving(_)))
+        .cloned()
+        .collect();
     let mut h = latest.lock().unwrap_or_else(PoisonError::into_inner);
     let same_view = match (
         h.snap.as_ref().and_then(|s| s.jobs.as_ref()),
@@ -2118,11 +2260,16 @@ fn hand_over_allocation(
     h.jobs_continuous = jobs_continuous;
     h.cpu_leases = leases;
     h.words = words;
-    let moved = !events.is_empty();
+    let moved = !events.is_empty() || !health.is_empty();
     h.job_events.extend(events);
     if h.job_events.len() > JOB_EVENTS_CAP {
         let over = h.job_events.len() - JOB_EVENTS_CAP;
         h.job_events.drain(..over);
+    }
+    h.health_events.extend(health);
+    if h.health_events.len() > HEALTH_EVENTS_CAP {
+        let over = h.health_events.len() - HEALTH_EVENTS_CAP;
+        h.health_events.drain(..over);
     }
     moved
 }
@@ -3292,6 +3439,7 @@ impl WhyFixture {
             gpu: live.gpu.clone(),
             gpu_clients: live.gpu_clients.clone(),
             ane: live.ane,
+            self_cpu_read: live.self_cpu_read,
             volume: live.volume.clone(),
             cadence_ms: live.cadence_ms,
             machine_only: live.machine_only,
@@ -3310,6 +3458,7 @@ impl WhyFixture {
             starts: live.starts.clone(),
             disk: live.disk.clone(),
             tokens: live.tokens.clone(),
+            pane_token_observations: live.pane_token_observations.clone(),
             plan: live.plan.clone(),
             note_events: live.note_events.clone(),
             note_gaps: live.note_gaps.clone(),
@@ -3346,6 +3495,23 @@ impl WhyFixture {
     }
 }
 
+/// The principal captured with each usable shell root in this same request.
+fn event_sources(req: &Request) -> Vec<aterm_vitals::events::SessionScope> {
+    req.pane_sources
+        .iter()
+        .filter(|pane| {
+            req.tabs
+                .iter()
+                .any(|root| root.key == pane.local && root.shell_pid > 0)
+        })
+        .map(|pane| aterm_vitals::events::SessionScope {
+            local: pane.local,
+            sid: pane.sid.as_str().to_owned(),
+            nonce: pane.nonce.to_hex(),
+        })
+        .collect()
+}
+
 /// The readers and the model: one per thread.
 pub(crate) struct Reader {
     boot: crate::vitals_host::boot_capture::BootCapture,
@@ -3355,11 +3521,23 @@ pub(crate) struct Reader {
     ownership: ownership::Images,
     hardware: aterm_sysprobe::cpu_hardware::Probe,
     hardware_read: HardwareProbe,
-    /// Own-process thread observations; test readers never inspect the host.
+    /// Own-process thread observations, read only by a reading a pull that prints them asked
+    /// ([`Request::self_cpu`]) where the reader reads them ([`self_cpu::Probe::reads`]: macOS);
+    /// test readers never inspect the host.
     self_cpu_read: self_cpu::Probe,
+    /// The queries that arm a pull's read of aterm's own threads ([`SELF_CPU_ARMED`]; a unit
+    /// test's reader has its own), read once as each pull begins ([`Request::self_cpu`]).
+    self_cpu_armed: &'static Arming,
+    /// When the last reading read a cut of aterm's own threads, on the pass's clock; `None`
+    /// where it read none or its read failed, which clears the model's continuity
+    /// ([`Source::self_cpu_cold`]).
+    self_cpu_last: Option<Instant>,
     /// The queries that arm a pull's CPU Stats ([`HARDWARE_ARMED`]; a unit test's reader has its
     /// own), read once as each pull begins ([`Request::hardware`]).
     hardware_armed: &'static Arming,
+    /// The queries that arm a pull's process scheduling ([`SCHEDULING_ARMED`]; a unit test's
+    /// reader has its own), read once as each pull begins ([`Request::scheduling`]).
+    pub(crate) scheduling_armed: &'static Arming,
     /// The last CPU Stats sample and when it was taken: a reading whose demands stand but none is
     /// due carries it ([`HardwarePlan::Carry`]).
     hardware_last: Option<(Instant, aterm_vitals::hardware::Sample)>,
@@ -3387,9 +3565,17 @@ pub(crate) struct Reader {
     spotlight: aterm_vitals::spotlight::Cadence,
     /// Its port: [`MDUTIL_LIVE`], or a unit test's inert arm.
     pub(crate) mdutil: aterm_vitals::spotlight::MdutilProbe,
-    /// The Neural Engine reader (A2 §3.1), which every reading reads beside the GPU; `None`
-    /// where the OS has none, and in a unit test's reader, which reads no registry.
-    pub(crate) ane: Option<aterm_sysprobe::neural_engine::Reader>,
+    /// When aterm's root LAN broker is asked for Spotlight's stores (SD-94), off this thread
+    /// ([`aterm_vitals::spotlight::StoreAsk`]).
+    spotlight_store: aterm_vitals::spotlight::StoreAsk,
+    /// Its port: [`STORE_LIVE`], or a unit test's inert arm.
+    pub(crate) store_probe: aterm_vitals::spotlight::StoreProbe,
+    /// The Neural Engine as its reader read it once, as this reader started (A2 §3.1:
+    /// [`ane_at_start`]), which every reading carries: whether it reads here, its cores, and
+    /// whether it was powered then. No reading reads its power again: nothing draws it yet
+    /// (its one reader, [`crate::stats_units::UnitFacts::of`], is called only by tests). `None`
+    /// where the OS has no reader, and in a unit test's reader, which reads no registry.
+    pub(crate) ane: Option<Result<AneSample, AneCheck>>,
     slots: aterm_sysprobe::slots::SlotReader,
     /// The split set's lane and what it keeps between split ticks.
     pub(crate) split: SplitReader,
@@ -3583,21 +3769,32 @@ impl Reader {
             } else {
                 self_cpu::Probe::NATIVE
             },
+            self_cpu_armed: if cfg!(test) {
+                Box::leak(Box::new(Arming::new()))
+            } else {
+                &SELF_CPU_ARMED
+            },
+            self_cpu_last: None,
             hardware_armed: if cfg!(test) {
                 Box::leak(Box::new(Arming::new()))
             } else {
                 &HARDWARE_ARMED
             },
+            scheduling_armed: if cfg!(test) {
+                Box::leak(Box::new(Arming::new()))
+            } else {
+                &SCHEDULING_ARMED
+            },
             hardware_last: None,
             clusters,
-            vitals: aterm_vitals::Vitals::new(),
+            vitals: aterm_vitals::Vitals::with_group_book(aterm_vitals::groups::GroupBook::new()),
             assessment: assessment::Lane::new(),
             machine_observed_at: None,
             observed_at: memory::ObservedAt {
                 instant: Instant::now(),
                 continuous_ns: None,
             },
-            epoch: Instant::now(),
+            epoch: aterm_session::terminal_stream::epoch(),
             clock: Instant::now,
             slots: aterm_sysprobe::slots::SlotReader::new(
                 aterm_sysprobe::slots::default_dir(&home),
@@ -3643,10 +3840,16 @@ impl Reader {
             } else {
                 MDUTIL_LIVE
             },
+            spotlight_store: aterm_vitals::spotlight::StoreAsk::default(),
+            store_probe: if cfg!(test) {
+                aterm_vitals::spotlight::StoreProbe::INERT
+            } else {
+                STORE_LIVE
+            },
             ane: if cfg!(test) {
                 None
             } else {
-                aterm_sysprobe::neural_engine::Reader::native()
+                ane_at_start(aterm_sysprobe::neural_engine::Reader::native())
             },
             split,
             jobs_armed: if cfg!(test) {
@@ -3811,11 +4014,17 @@ impl Reader {
         now
     }
 
-    fn watch_jobs(&mut self, snap: &mut Snapshot) {
+    fn watch_jobs(&mut self, snap: &mut Snapshot, context: Option<&assessment::EventContext>) {
         if let Some(view) = snap.jobs.as_ref()
             && !self.watched.as_ref().is_some_and(|w| Arc::ptr_eq(w, view))
         {
-            let events = self.job_watch.step(view, snap.seq, snap.at_ns);
+            let events = self.job_watch.step(
+                view,
+                snap.seq,
+                context.map_or(snap.at_ns, |context| context.at_ns),
+                context.and_then(|context| context.at_unix_ms),
+                context.map_or(&[], |context| context.sources.as_slice()),
+            );
             snap.events.extend(events);
             self.watched = Some(Arc::clone(view));
         }
@@ -3862,7 +4071,9 @@ impl Reader {
         // coalitions, and with them keeps each name at the short name's cut
         // in `SplitReader::coalition_ids` across readings (a stalled ask
         // loses them, `read_procs`); with the lane off the sweep reads such
-        // a name whole every reading.
+        // a name whole every reading. Each process's scheduling is read only where a reader
+        // of it asks (`sweep_reads_scheduling`).
+        let scheduling = self.sweep_reads_scheduling(req);
         let ProcReads {
             sweep,
             pids,
@@ -3873,6 +4084,7 @@ impl Reader {
             Some(aterm_sysprobe::SweepOpts {
                 coalitions: live_accounting,
                 versions: true,
+                scheduling,
             }),
             Some(req),
         );
@@ -3906,10 +4118,14 @@ impl Reader {
         sample.stalled = stalled;
         sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.machine_only = false;
+        sample.scheduling_read = scheduling;
         sample.spotlight_volumes = self
             .spotlight
             .step(sample.mono_ms, self.vitals.spotlight_busy(), &self.mdutil)
             .cloned();
+        if let Some(store) = self.spotlight_store.step(sample.mono_ms, &self.store_probe) {
+            self.vitals.note_spotlight_store(store);
+        }
         if let aterm_vitals::blockage::DStateRead::Census(pass) = &mut sample.dstate {
             *pass = self.census.step(now, self.epoch);
         }
@@ -3967,7 +4183,7 @@ impl Reader {
         // discovery can be slow, so it runs only after those readings finish.
         self.attach_hardware(&mut sample, req);
         let place = self.situate(&mut sample);
-        let scene = self
+        let mut scene = self
             .fixture
             .as_mut()
             .filter(|fixture| fixture.is_recorded())
@@ -3977,6 +4193,9 @@ impl Reader {
                 }
                 fixture.reading(&sample, split)
             });
+        if let Some(scene) = scene.as_mut() {
+            scene.event_sources.clear();
+        }
         if scene.is_none() {
             sample.ownership_incomplete =
                 crate::resource_jobs::restore_origins(&mut self.vitals, &req.session_ids);
@@ -4043,6 +4262,8 @@ impl Reader {
                 process_facts,
                 req,
                 u64::try_from(at_unix_ms).unwrap_or(0),
+                sample.at_ns,
+                (at_unix_ms != 0).then_some(at_unix_ms),
                 thrashing,
             ),
             !req.assessment_only,
@@ -4052,11 +4273,17 @@ impl Reader {
             pass_ms(self.epoch, (self.clock)()),
         );
         snap.set_left(assessed.left);
-        snap.set_jobs(assessed.jobs);
+        let context = assessed.event_context.as_deref();
+        snap.set_jobs_observed(
+            assessed.jobs,
+            context.and_then(|context| context.at_unix_ms),
+            context.map_or(&[], |context| context.sources.as_slice()),
+        );
         for ev in snap.strip_events[events_before..].iter().cloned() {
             self.vitals.record_strip_event(ev);
         }
-        self.watch_jobs(&mut snap);
+        self.watch_jobs(&mut snap, context);
+        self.vitals.drain_strip_events(&mut snap);
         self.process_receipt = memory.filter(|_| scene.is_none()).map(|memory| {
             let panes = req
                 .pane_sources
@@ -4104,15 +4331,19 @@ impl Reader {
         let mut sample = self.machine_sample(req, unix_ms_now(), None, pids);
         sample.stalled = stalled;
         sample.machine_only = true;
+        sample.event_sources.clear();
         sample.spotlight_volumes = self.spotlight.last().cloned();
         sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.timeline = self.split.timeline();
         let place = self.situate(&mut sample);
-        let scene = self
+        let mut scene = self
             .fixture
             .as_mut()
             .filter(|fixture| fixture.is_recorded())
             .map(|fixture| fixture.reading(&sample, false));
+        if let Some(scene) = scene.as_mut() {
+            scene.event_sources.clear();
+        }
         let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
         if scene.is_none() {
             snap.boot_cost = Some(self.boot.report());
@@ -4125,13 +4356,32 @@ impl Reader {
             assessed.jobs.as_deref(),
             pass_ms(self.epoch, (self.clock)()),
         );
-        snap.set_jobs(assessed.jobs);
+        let context = assessed.event_context.as_deref();
+        snap.set_jobs_observed(
+            assessed.jobs,
+            context.and_then(|context| context.at_unix_ms),
+            context.map_or(&[], |context| context.sources.as_slice()),
+        );
         snap.set_left(assessed.left);
         for ev in snap.strip_events[events_before..].iter().cloned() {
             self.vitals.record_strip_event(ev);
         }
-        self.watch_jobs(&mut snap);
+        self.watch_jobs(&mut snap, context);
+        self.vitals.drain_strip_events(&mut snap);
         self.fixture_snapshot(snap)
+    }
+
+    /// Whether whole reading `req`'s sweep reads each process's scheduling (two `getpriority`
+    /// calls a process on macOS, `aterm_sysprobe::SweepOpts::scheduling`): only where a reader of
+    /// it asks. Those are a pull a query that prints it armed ([`Request::scheduling`]), the CPU
+    /// lens open (its diagnostic export copies each worker's,
+    /// `stats_lens::cpu_diagnostic_report`), and the model's CPU reports
+    /// ([`aterm_vitals::Vitals::cpu_reports_copy_scheduling`]: the recorder's frames, the report
+    /// the host saves while a bundle or a CPU policy is held). The deck draws none.
+    pub(crate) fn sweep_reads_scheduling(&self, req: &Request) -> bool {
+        req.scheduling
+            || req.lenses.contains(&aterm_vitals::Resource::Cpu)
+            || self.vitals.cpu_reports_copy_scheduling()
     }
 
     /// Attaches CPU Stats to whole reading `sample` where a demand asks for it (A2 §6.4): a
@@ -4185,6 +4435,7 @@ impl Reader {
             home: volume,
             key,
             block,
+            home_device_id,
         } = machine_volumes(
             &self.home,
             shelf.watched(),
@@ -4215,12 +4466,21 @@ impl Reader {
         disk.journal_read = self.journal.read;
         disk.held = self.holdings.rows();
         disk.held_age_s = self.holdings.age_s(Instant::now());
+        // aterm's own threads only where a pull that prints them asked (`Request::self_cpu`), or
+        // where the reader reads none and answers why at once (off macOS, `unsupported`): a
+        // reading that reads none leaves the model's continuity cleared, which such a pull's
+        // pair restores (`Source::self_cpu_cold`).
+        let self_cpu = self.self_cpu_read.sample(
+            self.epoch,
+            self.fixture.as_ref().is_some_and(WhyFixture::is_recorded),
+            req.self_cpu,
+        );
+        self.self_cpu_last = matches!(self_cpu, Some(Ok(_))).then(self.clock);
         let mut sample = Sample {
-            self_cpu: self.self_cpu_read.sample(
-                self.epoch,
-                self.fixture.as_ref().is_some_and(WhyFixture::is_recorded),
-            ),
+            self_cpu,
+            self_cpu_read: req.self_cpu,
             hardware: None,
+            scheduling_read: false,
             at_ns: u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
             cores: self.probe.core_ticks().map(|cores| {
                 cores
@@ -4239,7 +4499,7 @@ impl Reader {
             host_watts: self.heat.host_watts(gpu.as_ref()),
             gpu: gpu.map(gpu_sample),
             gpu_clients: None,
-            ane: self.ane.as_mut().map(|engine| ane_sample(engine.read())),
+            ane: self.ane,
             volume: volume.map(|v| VolumeSample {
                 total: v.total,
                 free: v.free,
@@ -4297,6 +4557,7 @@ impl Reader {
                     ..row.totals.clone()
                 })
                 .collect(),
+            pane_token_observations: req.pane_token_observations.clone(),
             plan: req.plan.clone(),
             procs_truncated: false,
             coalitions: None,
@@ -4304,8 +4565,10 @@ impl Reader {
             timeline: None,
             coal_lane: self.split.lane,
             note_events: req.note_events.clone(),
+            event_sources: event_sources(req),
             note_gaps: req.note_gaps.clone(),
             block,
+            home_device_id,
             situation: self.situation.read(at_unix_ms),
             // What a reading takes of its surroundings is handed in once it is whole
             // ([`Self::situate`]).
@@ -4486,9 +4749,15 @@ fn mem_sample(m: aterm_sysprobe::MemoryDetail) -> MemSample {
             compressions: c.compressions,
             pageins: c.pageins,
             page_bytes: c.page_bytes,
+            pushed: c.pushed,
+            refaulted: c.refaulted,
+            stall_us: c.stall_us,
         }),
         memorystatus_level_pct: m.memorystatus_level_pct,
         exact: m.exact,
+        headroom: m.headroom,
+        wall: m.wall,
+        kept_permille: m.kept_permille(),
     }
 }
 
@@ -4512,6 +4781,15 @@ fn block_sample(b: aterm_sysprobe::blockio::BlockReading) -> aterm_vitals::Block
         read_ns: b.counters.read_ns,
         write_ns: b.counters.write_ns,
     }
+}
+
+/// The Neural Engine reader's one reading, made as the host's reader starts (A2 §3.1): its
+/// self-check's start (the engine's class matched, its core count) and one power-state read, or
+/// the check that failed; `None` where the OS has no reader.
+fn ane_at_start(
+    engine: Option<aterm_sysprobe::neural_engine::Reader>,
+) -> Option<Result<AneSample, AneCheck>> {
+    engine.map(|mut engine| ane_sample(engine.read()))
 }
 
 /// The Neural Engine reader's answer as the model takes it.
@@ -4645,8 +4923,10 @@ struct MachineVolumes {
     home: Option<aterm_sysprobe::VolumeReading>,
     /// Its key, while the shelf watches it.
     key: Option<VolumeKey>,
-    /// The devices home's volume and the front tab's are stored on, home's first.
+    /// The readable devices under home's volume and the front tab's, in request order.
     block: Vec<aterm_vitals::BlockSample>,
+    /// Home's device bound during this same block read, before counter refusal or deduplication.
+    home_device_id: Option<String>,
 }
 
 /// Home's volume, its key and the devices under home's and `front`'s volumes, which
@@ -4655,9 +4935,7 @@ fn machine_volumes(
     home: &Path,
     keyed: bool,
     front: Option<&Path>,
-    read_block: impl FnOnce(
-        &[&aterm_sysprobe::volumes::Mount],
-    ) -> Vec<aterm_sysprobe::blockio::BlockReading>,
+    read_block: impl FnOnce(&[&aterm_sysprobe::volumes::Mount]) -> aterm_sysprobe::blockio::BlockBatch,
 ) -> MachineVolumes {
     #[cfg(windows)]
     {
@@ -4674,6 +4952,7 @@ fn machine_volumes(
             home: aterm_sysprobe::volume(home),
             key,
             block: Vec::new(),
+            home_device_id: None,
         }
     }
     #[cfg(not(windows))]
@@ -4683,32 +4962,65 @@ fn machine_volumes(
             .then(|| aterm_agent::harness::disk::volume_of(home, &table).ok())
             .flatten()
             .map(|r| r.key);
+        let volume = local_volume(home, &table, aterm_sysprobe::volume);
+        let mounts = block_mounts(home, front, &table);
+        let batch = read_block(&mounts.mounts);
+        let home_device_id = mounts.home_device_id(&batch);
         MachineVolumes {
-            home: local_volume(home, &table, aterm_sysprobe::volume),
+            home: volume,
             key,
-            block: read_block(&block_mounts(home, front, &table))
-                .into_iter()
-                .map(block_sample)
-                .collect(),
+            block: batch.devices.into_iter().map(block_sample).collect(),
+            home_device_id,
         }
     }
 }
 
+/// Original block requests with the home role kept independently of missing mounts.
+#[cfg(not(windows))]
+#[derive(Default)]
+struct BlockMounts<'t> {
+    mounts: Vec<&'t aterm_sysprobe::volumes::Mount>,
+    home: Option<usize>,
+}
+
+#[cfg(not(windows))]
+impl BlockMounts<'_> {
+    fn home_device_id(&self, batch: &aterm_sysprobe::blockio::BlockBatch) -> Option<String> {
+        if batch.mounts.len() != self.mounts.len() {
+            return None;
+        }
+        self.home
+            .and_then(|index| batch.mounts.get(index))
+            .and_then(Option::as_deref)
+            .filter(|id| aterm_vitals::units::is_device_id(id))
+            .map(str::to_owned)
+    }
+}
+
 /// The local mounts holding `home` and `front`, home's first, each once: a front tab under home's
-/// volume (the usual case) asks the block reader for one mount, not the same one twice.
+/// volume (the usual case) asks the block reader for one mount, not the same one twice. The home
+/// role remains unknown when home's mount is absent, even when the front supplies request zero.
 #[cfg(not(windows))]
 fn block_mounts<'t>(
     home: &Path,
     front: Option<&Path>,
     table: &'t aterm_sysprobe::volumes::Table,
-) -> Vec<&'t aterm_sysprobe::volumes::Mount> {
-    let mut out: Vec<&aterm_sysprobe::volumes::Mount> = Vec::new();
-    for m in std::iter::once(home)
-        .chain(front)
-        .filter_map(|p| local_mount(p, table))
-    {
-        if !out.iter().any(|o| o.on == m.on) {
-            out.push(m);
+) -> BlockMounts<'t> {
+    let mut out = BlockMounts::default();
+    for (is_home, path) in std::iter::once((true, home)).chain(front.map(|path| (false, path))) {
+        let Some(mount) = local_mount(path, table) else {
+            continue;
+        };
+        let index = match out.mounts.iter().position(|other| other.on == mount.on) {
+            Some(index) => index,
+            None => {
+                let index = out.mounts.len();
+                out.mounts.push(mount);
+                index
+            }
+        };
+        if is_home {
+            out.home = Some(index);
         }
     }
     out
@@ -5554,9 +5866,9 @@ fn spotlight_of(text: &str, now_unix_ms: i64) -> Option<SpotlightHistory> {
     })
 }
 
-/// `mdutil -s -a`: every local volume's Spotlight indexing, which needs no root, killed at
-/// [`MDUTIL_WAIT`] and reaped within [`MDUTIL_REAP`], past which a child that has not died is
-/// the reaper's, so the probe thread never waits on it longer. macOS alone has Spotlight.
+/// Read every local macOS volume's Spotlight indexing without root, under bounded run and
+/// reap intervals. A child that outlives those intervals is left to the reaper; other
+/// platforms report unsupported.
 fn mdutil_status_all() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
@@ -5586,6 +5898,40 @@ fn mdutil_status_all() -> Result<String, String> {
 /// The live arm of the Spotlight volumes' port ([`aterm_vitals::spotlight::MdutilProbe`]).
 const MDUTIL_LIVE: aterm_vitals::spotlight::MdutilProbe = aterm_vitals::spotlight::MdutilProbe {
     status_all: mdutil_status_all,
+};
+
+/// Spotlight's stores as aterm's root LAN broker last walked them (SD-94), in the model's terms:
+/// each store and the answer's age. No broker installed, one too old to know the request, and
+/// the broker's error are each no answer.
+#[cfg(target_os = "macos")]
+fn spotlight_stores_asked() -> aterm_vitals::spotlight::StoreAnswer {
+    use aterm_uds::lan::StoreBound;
+    use aterm_vitals::spotlight::{Store, StoreCut};
+    let answer = aterm_uds::lan::spotlight_stores().map_err(|error| error.to_string())?;
+    let stores = answer
+        .volumes
+        .into_iter()
+        .map(|v| Store {
+            volume: v.volume,
+            bytes: v.bytes,
+            entries: v.entries,
+            cut: v.partial.map(|bound| match bound {
+                StoreBound::Entries => StoreCut::Entries,
+                StoreBound::Time => StoreCut::Time,
+                StoreBound::Unreadable => StoreCut::Unreadable,
+            }),
+        })
+        .collect();
+    Ok((stores, answer.age_ms))
+}
+
+/// The live arm of the Spotlight stores' port ([`aterm_vitals::spotlight::StoreProbe`]): the root
+/// broker, on macOS alone, which alone has Spotlight.
+const STORE_LIVE: aterm_vitals::spotlight::StoreProbe = aterm_vitals::spotlight::StoreProbe {
+    #[cfg(target_os = "macos")]
+    ask: Some(spotlight_stores_asked),
+    #[cfg(not(target_os = "macos"))]
+    ask: None,
 };
 
 fn weeks_json(weeks: &FreeWeeks) -> Option<String> {
@@ -6036,7 +6382,13 @@ impl crate::App {
                 .values()
                 .filter(|ws| crate::stats_deck::stats_drawn_on(ws))
         };
-        let page = self.allocation_visible() || self.tabs_page_on_screen();
+        let panel = self.windows.values().any(|ws| {
+            ws.dock.roster_panel && ws.dock.view.is_some() && ws.dock.cells > 0 && !ws.occluded
+        });
+        let page = self.allocation_visible()
+            || self.tabs_page_on_screen()
+            || self.resources_page_on_screen()
+            || panel;
         let in_view = page
             || self.deck_in_view()
             || (self.tabs_page_shown() && self.windows.values().any(|ws| !ws.occluded));
@@ -6208,6 +6560,12 @@ impl crate::App {
         if self.tabs_page_shown() && self.harness_screen.fleet_sweep_due(now) {
             self.start_harness_stats_refresh_at(now);
         }
+    }
+
+    /// Which CPU policy operation is this App's: the one it reads as pending, cancels and reaps.
+    #[cfg(target_os = "macos")]
+    pub(crate) const fn cpu_policy_owner(&self) -> crate::cpu_policy_authorization::Owner {
+        self.vitals.cpu_policy_owner
     }
 
     #[cfg(target_os = "macos")]
@@ -6429,7 +6787,15 @@ impl crate::App {
             else {
                 continue;
             };
-            let Some(timeline) = self.pool.get(tab).map(|p| Arc::clone(&p.ctx.timeline)) else {
+            let Some(timeline) = self.pool.get(tab).and_then(|p| {
+                let aterm_vitals::events::EventScope::Session(source) = &e.scope else {
+                    return None;
+                };
+                (source.local == tab
+                    && source.sid == p.ctx.self_id.as_str()
+                    && source.nonce == p.ctx.nonce.to_hex())
+                .then(|| Arc::clone(&p.ctx.timeline))
+            }) else {
                 continue;
             };
             let rev = self.vitals.next_job_rev(tab);
@@ -6459,12 +6825,14 @@ impl crate::App {
         let before = self.vitals.snapshot.as_ref().and_then(|s| s.jobs.clone());
         let adopted = self.vitals.adopt(now);
         self.record_job_events();
+        self.note_health_episodes();
         if !adopted {
             return false;
         }
         if self.allocation_visible() {
             self.publish_allocation();
         }
+        self.publish_resources();
         self.vitals.landed_period = audience
             .cadence(self.any_stats_lens_open())
             .map(|(period, _)| period);
@@ -6545,6 +6913,17 @@ impl crate::App {
         }
         for link in crate::message_reporters::newly_dangling(&mut self.vitals.links_told, &view) {
             let _ = self.post_message(crate::message_reporters::link_record(link));
+        }
+    }
+
+    /// Posts the record of each health episode's edge the probe thread handed over (a memory
+    /// starvation episode's, [`crate::message_reporters::starving_record`]); the thread wrote its
+    /// aterm.log line and tried to order it to disk as it read it.
+    fn note_health_episodes(&mut self) {
+        for e in self.vitals.take_health_events() {
+            if let aterm_vitals::events::EventKind::Starving(edge) = &e.kind {
+                let _ = self.post_message(crate::message_reporters::starving_record(edge));
+            }
         }
     }
 
@@ -6786,6 +7165,8 @@ impl crate::App {
         let mut tabs = Vec::new();
         let mut layout = Vec::new();
         let mut tokens = Vec::new();
+        let mut pane_token_observations = Vec::new();
+        let mut token_panes = std::collections::BTreeSet::new();
         let mut accounts: Vec<AccountKey> = Vec::new();
         let mut front_plan = None;
         let mut front_dir = None;
@@ -6815,6 +7196,7 @@ impl crate::App {
                     let Some(s) = self.pool.get(pane) else {
                         continue;
                     };
+                    token_panes.insert(pane);
                     let tl = s
                         .ctx
                         .timeline
@@ -6842,9 +7224,6 @@ impl crate::App {
                         });
                     }
                     let facts = tl.claude_footer();
-                    let key = focused.unwrap_or(pane);
-                    tokens
-                        .extend(facts.and_then(|f| tab_tokens(key, f, tl.claude_footer_read_at())));
                     if let Some(p) = facts.and_then(|f| f.plan) {
                         if !accounts.contains(&p.account) {
                             accounts.push(p.account);
@@ -6897,6 +7276,25 @@ impl crate::App {
             });
         }
         drop(store);
+        // A view can already hold its terminal while registry publication follows. Parked
+        // terminals have the opposite shape, and a mirrored terminal occurs in both sets.
+        token_panes.extend(live_ids.iter().map(|(pane, _)| *pane));
+        for pane in token_panes {
+            let Some(session) = self.pool.get(pane) else {
+                continue;
+            };
+            let tl = session
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(f) = tl.claude_footer() {
+                tokens.extend(tab_tokens(pane, f, tl.claude_footer_read_at()));
+            }
+            if !machine_only {
+                pane_token_observations.extend(tl.panel_token_observation(pane, session.ctx.nonce));
+            }
+        }
         for root in &mut tabs[windowless..] {
             root.agent_leader = self.pool.get(root.key).and_then(|s| {
                 agent_leader(
@@ -6953,9 +7351,12 @@ impl crate::App {
             jobs_now: false,
             pull: false,
             hardware: false,
-            deck: self.deck_in_view(),
+            scheduling: false,
+            self_cpu: false,
+            deck: self.deck_in_view() || self.resources_page_on_screen(),
             in_view: self.vitals_audience().in_view(),
             tokens: each_session_once(tokens),
+            pane_token_observations,
             plan: front_plan.and_then(|p| plan_fact(&p, &accounts, now)),
             lenses: self.open_lens_rows(),
             note_gaps: Vec::new(),

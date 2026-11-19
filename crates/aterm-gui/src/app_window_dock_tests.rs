@@ -129,6 +129,8 @@ fn dock_image(app: &mut App, view: ViewId) -> (usize, usize, Vec<u8>) {
             session: None,
             want_bytes: true,
             want_metadata: true,
+            whole_client: false,
+            presentation: None,
             frame_metadata: std::sync::Arc::clone(&metadata),
             cancel: crate::control::CaptureCancellation::new(),
             reply,
@@ -230,6 +232,579 @@ fn a_docked_view_paints_and_captures_beside_the_grid() {
         })
         .expect("the window-owned view answers inspect");
     assert!(inspected.iter().any(|line| line.contains("idle")));
+}
+
+#[test]
+fn local_panel_roster_leading_capture_hits_and_resize_ledger_agree() {
+    let mut app = fixture();
+    let first = app.focused_session_id(WID).unwrap();
+    let second = person_tab(&mut app);
+    app.switch_tab_in(WID, 0);
+    let ws = &app.windows[&WID];
+    let held = app.window_frame_px_for(WID, ws.rows, ws.cols);
+    app.windows.get_mut(&WID).unwrap().win_px = Some(held);
+    app.on_resize(WID, held);
+    let sessions = [first, second];
+    let booked = sessions.map(|sid| resizes_booked(&app, sid));
+    let cols = app.windows[&WID].cols;
+    let now = Instant::now();
+    app.windows.get_mut(&WID).unwrap().dock.pref = Some(30);
+    app.refresh_local_panel_roster();
+    app.set_roster_dock_at(WID, 30, now).unwrap();
+    app.publish_navigators(now);
+    app.redraw_window(WID);
+    let view = dock_view(&app);
+    let frame_w = app.terminal_frame_width_px(WID);
+    let (frame_x, frame_y) = app.frame_origin(WID);
+    let host = app.retained_native_pointer_artifact(WID, view).unwrap();
+    let rect = (
+        usize::try_from(host.device_x).unwrap(),
+        usize::try_from(host.device_y).unwrap(),
+        host.width as usize,
+        host.height as usize,
+    );
+    assert_eq!(rect.0, 0);
+    assert!(rect.2 as i64 <= frame_x);
+    let (width, height, card) = dock_image(&mut app, view);
+    assert_eq!((width, height), (rect.2, rect.3));
+    assert!(card.chunks_exact(4).any(|px| px != &card[..4]));
+    assert!(card == glass_rgba(&mut app, rect));
+    let (frame, _, _) = image_meta(&mut app, false);
+    assert_eq!(frame.0, frame_w);
+    assert!(
+        frame.2
+            == glass_rgba(
+                &mut app,
+                (
+                    frame_x.max(0) as usize,
+                    frame_y.max(0) as usize,
+                    frame.0,
+                    frame.1
+                )
+            )
+    );
+
+    let point = row_point(&app, view, second);
+    assert!(app.in_side_inset(WID, point.0));
+    assert!(!app.in_side_inset(WID, (frame_x + frame_w as i64 - 1) as f64));
+    assert_eq!(app.focused_session_id(WID), Some(first));
+    app.on_cursor_moved(WID, point.0, point.1);
+    app.on_mouse_input(WID, ElementState::Pressed, MouseButton::Left);
+    app.on_mouse_input(WID, ElementState::Released, MouseButton::Left);
+    assert_eq!(app.focused_session_id(WID), Some(second));
+    assert_eq!(app.windows[&WID].reported_buttons, 0);
+    assert!(!app.windows[&WID].selecting);
+    assert_eq!(app.windows[&WID].cols, cols - 30);
+    app.set_roster_dock_at(WID, 30, now).unwrap();
+    for (sid, before) in sessions.into_iter().zip(booked) {
+        assert_eq!(resizes_booked(&app, sid), before + 1);
+        assert!(ledger(&app, sid).contains("site=dock"));
+    }
+    // Crossing back below the threshold returns the reserved columns immediately, even
+    // inside the explicit Show/Hide debounce, and preserves the saved width.
+    app.set_roster_dock_at(WID, 0, now).unwrap();
+    assert!(app.dock_view(WID).is_none());
+    assert_eq!(app.windows[&WID].dock.written(), Some(30));
+    assert_eq!(app.windows[&WID].cols, cols);
+    for (sid, before) in sessions.into_iter().zip(booked) {
+        assert_eq!(resizes_booked(&app, sid), before + 2);
+    }
+}
+
+#[test]
+fn local_panel_cpu_stream_the_native_panel_reads_split_mirrored_and_parked_producers() {
+    let mut app = fixture();
+    let first = app.focused_session_id(WID).unwrap();
+    let mirror = app.open_active_session_in_new_window_logical().unwrap();
+    assert_eq!(app.focused_session_id(mirror), Some(first));
+    app.frontmost_window = Some(WID);
+    let split = app.split_active_stub_tab(WID);
+    app.sync_window(WID);
+    let parked = crate::app_workers_tests::land_worker(&mut app);
+    assert!(app.session_is_parked(parked));
+    for (id, title) in [
+        (first, "Compile Trust"),
+        (split, "Lean checks"),
+        (parked, "Session steward"),
+    ] {
+        app.write_session_title_pin(id, title).unwrap();
+    }
+    let start = panel_resource_sweeps(&mut app, first);
+    app.config
+        .sys
+        .get_or_insert_with(Default::default)
+        .stats_bars = Some("off".into());
+    #[cfg(unix)]
+    let _reader = app.vitals.attach_test_reader();
+    let reader = |sid| {
+        app.pool
+            .get(sid)
+            .unwrap()
+            .ctx
+            .job_feed
+            .start_output_reading(start)
+    };
+    let first_reader = reader(first);
+    let parked_reader = reader(parked);
+    let now = start + Duration::from_secs(65);
+    for (index, bytes) in [0, 10, 40, 120, 260, 310, 220, 85, 35, 60, 125, 250]
+        .into_iter()
+        .enumerate()
+    {
+        first_reader.record(start + Duration::from_secs(5 + index as u64 * 5), bytes);
+    }
+    parked_reader.record(now - Duration::from_secs(2), 500);
+    app.switch_tab_in(WID, 0);
+    let ws = &app.windows[&WID];
+    // Keep all three native rows in the capture at the normal 30-column dock width.
+    let held = app.window_frame_px_for(WID, 48, ws.cols);
+    app.windows.get_mut(&WID).unwrap().win_px = Some(held);
+    app.on_resize(WID, held);
+    app.windows.get_mut(&WID).unwrap().dock.pref = Some(30);
+    app.refresh_local_panel_roster();
+    app.set_roster_dock_at(WID, 30, now).unwrap();
+    #[cfg(unix)]
+    assert!(
+        matches!(app.vitals_audience().cadence(false), Some((_, false))),
+        "the panel receives full existing vitals sweeps with the machine strip off"
+    );
+    app.publish_navigators(now);
+    app.redraw_window(WID);
+    let view = dock_view(&app);
+    let artifact = app.retained_native_pointer_artifact(WID, view).unwrap_or_else(|| {
+        let ws = &app.windows[&WID];
+        panic!("session panel has no presented action surface: desired {:?}, presented {:?}, client {:?}, card {}, overlay {}, active plan {}", app.dock_geometry(WID), ws.dock.presented, ws.win_px, ws.dock_card.is_some(), ws.overlay.is_some(), app.active_visible_leaf_plan(WID).is_some());
+    });
+    let spoken = |sid| {
+        artifact
+            .compiled
+            .semantic(&crate::native_ui::UiKey::new(format!(
+                "navigator/row/{sid}"
+            )))
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap()
+    };
+    for (id, expected) in [
+        (
+            first,
+            "Terminal output 50 bytes per second, scale 0 to 100 bytes per second, 12 of 12 observed. 0, 2, 8, 24, 52, 62, 44, 17, 7, 12, 25, 50",
+        ),
+        (
+            parked,
+            "Terminal output 100 bytes per second, scale 0 to 100 bytes per second",
+        ),
+        (
+            split,
+            "Terminal output unavailable, scale 0 to 100 bytes per second, 0 of 12 observed",
+        ),
+    ] {
+        assert!(spoken(id).contains(expected), "{}", spoken(id));
+        assert!(
+            spoken(id).contains("Terminal input unavailable"),
+            "the stub has no PTY writer"
+        );
+    }
+    for value in [
+        "Memory footprint 405 MiB",
+        "Disk read 256 bytes per second",
+        "Disk write 0 bytes per second",
+        "Model input 8 tokens per second",
+        "Model output 16 tokens per second",
+    ] {
+        assert!(spoken(first).contains(value), "{}", spoken(first));
+    }
+    for id in [split, parked] {
+        assert!(
+            spoken(id).contains("Memory footprint unavailable"),
+            "{}",
+            spoken(id)
+        );
+        assert!(
+            spoken(id).contains("Disk read unavailable"),
+            "{}",
+            spoken(id)
+        );
+        assert!(
+            spoken(id).contains("Model output unavailable"),
+            "{}",
+            spoken(id)
+        );
+    }
+    assert_eq!(rows_on_screen(&app, view).len(), 3);
+    #[cfg(a11y_tree)]
+    {
+        use crate::native_accessibility::stable_node_id_for_view;
+        let id = stable_node_id_for_view(
+            view,
+            &crate::native_ui::UiKey::new(format!("navigator/row/{first}")),
+        );
+        app.windows.get_mut(&WID).unwrap().a11y_active = true;
+        app.push_a11y_tree(WID);
+        let tree = app.windows[&WID].a11y_sent.last().unwrap();
+        let (_, node) = tree
+            .nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == id)
+            .unwrap();
+        let description = node.description().unwrap();
+        for value in [
+            "Terminal output 50 bytes per second, scale 0 to 100 bytes per second",
+            "Memory footprint 405 MiB",
+            "Disk read 256 bytes per second",
+            "Disk write 0 bytes per second",
+            "Model output 16 tokens per second",
+        ] {
+            assert!(description.contains(value), "{description}");
+        }
+    }
+    let (width, height, rgba) = dock_image(&mut app, view);
+    assert!(rgba.chunks_exact(4).any(|pixel| pixel != &rgba[..4]));
+    write_dock_gallery("local-session-panel.png", width, height, &rgba);
+}
+
+fn write_dock_gallery(filename: &str, width: usize, height: usize, rgba: &[u8]) {
+    if let Some(dir) = std::env::var_os("ATERM_SESSION_PANEL_GALLERY") {
+        let png = crate::app_introspect::encode_rgba8_png(
+            rgba,
+            width.try_into().unwrap(),
+            height.try_into().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(std::path::Path::new(&dir).join(filename), png).unwrap();
+    }
+}
+
+#[test]
+fn local_panel_original_topic_fits_the_native_dock_at_large_text_and_its_shortcut_selects_the_producer()
+ {
+    use crate::native_appearance::{
+        AppearancePreferences, current_preferences, install_preferences,
+    };
+    use crate::native_ui::{LogicalRect, UiContent};
+    use crate::task_record::{TaskMark, TaskState, mark_session_task, task_line};
+    use aterm_window::event::KeyEvent;
+    use aterm_window::keyboard::{
+        Key as WinitKey, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr,
+    };
+
+    let mut app = fixture();
+    let first = app.focused_session_id(WID).unwrap();
+    let other = person_tab(&mut app);
+    let session = app.pool.get(first).unwrap();
+    mark_session_task(&session.ctx, first, &TaskMark::new(TaskState::Working)).unwrap();
+    {
+        let mut timeline = session.ctx.timeline.lock().unwrap();
+        timeline.set_task_line(task_line(b"Compile Trust\nCheck the resulting compiler"));
+        timeline.note_foreground_group(101);
+        timeline.set_program(101, Some("codex-alab".into()));
+    }
+    {
+        let mut terminal = crate::term_lock(&session.term);
+        terminal.process(b"\x1b]2;Current compiler output\x07");
+        assert_eq!(terminal.title(), "Current compiler output");
+    }
+    app.on_task_changed(first);
+    app.on_program_resolved(first);
+    let pref = current_preferences();
+    install_preferences(AppearancePreferences {
+        text_scale: 1.5,
+        ..pref
+    });
+    let frame = app.window_frame_px_for(WID, 48, app.windows[&WID].cols);
+    app.windows.get_mut(&WID).unwrap().win_px = Some(frame);
+    app.on_resize(WID, frame);
+    app.windows.get_mut(&WID).unwrap().dock.pref = Some(30);
+    app.refresh_local_panel_roster();
+    let now = Instant::now();
+    app.set_roster_dock_at(WID, 30, now).unwrap();
+    app.publish_navigators(now);
+    app.redraw_window(WID);
+    let view = dock_view(&app);
+    let shown = app.retained_native_pointer_artifact(WID, view).unwrap();
+    let ui = shown.compiled;
+    assert_eq!(ui.bounds.width, 210.);
+    assert_eq!(crate::native_appearance::text_scale(), 1.5);
+    let painted = |suffix: &str| {
+        let key = format!("navigator/item/{first}/{suffix}");
+        let node = ui.paint.iter().find(|n| n.key.as_str() == key)?;
+        let UiContent::Text(text) = &node.content else {
+            panic!("{key} is not text")
+        };
+        let visible = node.rect.intersect(node.clip).expect("the text is visible");
+        let width = crate::native_workers::text_width(&text.text, text.role, text.style);
+        let ink = LogicalRect::new(node.rect.x, node.rect.y, width, node.rect.height);
+        assert!(
+            visible.x <= ink.x + 0.5
+                && visible.right() + 0.5 >= ink.right()
+                && visible.y <= ink.y + 0.5
+                && visible.bottom() + 0.5 >= ink.bottom(),
+            "{} must fit its visible paint bounds {visible:?}, measured {ink:?}",
+            text.text
+        );
+        Some((text.text.as_str(), ink))
+    };
+    let (title, first_line) = painted("title").unwrap();
+    let continuation = painted("title-continued");
+    let (topic, last_line) = match continuation {
+        Some((rest, line)) => {
+            assert!(first_line.bottom() <= line.y + 0.5);
+            (format!("{title} {rest}"), line)
+        }
+        None => (title.to_owned(), first_line),
+    };
+    assert_eq!(topic, "Compile Trust");
+    let (program, program_box) = painted("meta").unwrap();
+    let (chord, chord_box) = painted("shortcut").unwrap();
+    assert_eq!(program, "codex-alab");
+    assert_eq!(
+        chord,
+        if cfg!(target_os = "macos") {
+            "⌘1"
+        } else {
+            "Ctrl+Shift+1"
+        }
+    );
+    assert!(last_line.bottom() <= program_box.y + 0.5);
+    if cfg!(target_os = "macos") {
+        assert!((program_box.y - chord_box.y).abs() < 0.5);
+    } else {
+        // The longer Ctrl+Shift chord can need a line of its own.
+        assert!(chord_box.y + 0.5 >= program_box.y);
+    }
+    assert!(program_box.intersect(chord_box).is_none());
+    let (width, height, rgba) = dock_image(&mut app, view);
+    write_dock_gallery("native-session-topic-large-text.png", width, height, &rgba);
+    install_preferences(pref);
+
+    assert_eq!(app.focused_session_id(WID), Some(other));
+    app.windows.get_mut(&WID).unwrap().mods = if cfg!(target_os = "macos") {
+        ModifiersState::SUPER
+    } else {
+        ModifiersState::CONTROL | ModifiersState::SHIFT
+    };
+    for state in [ElementState::Pressed, ElementState::Released] {
+        app.on_key(
+            WID,
+            KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(KeyCode::Digit1),
+                WinitKey::Character(SmolStr::new("1")),
+                Some(SmolStr::new("1")),
+                KeyLocation::Standard,
+                state,
+                false,
+            ),
+        );
+    }
+    assert_eq!(app.focused_session_id(WID), Some(first));
+}
+
+/// Send the deck's scripted shell, child and completed usage readings through ordinary Vitals
+/// aggregation. Only the first session owns them. No process or provider on this machine is read.
+fn panel_resource_sweeps(app: &mut App, first: u64) -> Instant {
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+    use aterm_agent::harness::session_usage::{ModelTokens, UsageFacts};
+
+    let mut vitals = aterm_vitals::Vitals::new();
+    let mut store = app.store.write().unwrap();
+    let mut handle = store.by_local(first).unwrap().clone();
+    let timeline = std::sync::Arc::clone(&handle.ctx.timeline);
+    let launch = handle.nonce;
+    let source = aterm_vitals::events::SessionScope {
+        local: first,
+        sid: handle.sid.as_str().to_owned(),
+        nonce: handle.nonce.to_hex(),
+    };
+    handle.shell_identity = aterm_pty::ShellIdentity::unproven(200);
+    store.register(handle);
+    drop(store);
+    let mut timeline = timeline.lock().unwrap();
+    timeline.note_foreground_group(201);
+    timeline.set_agent_reader_program_for_test(Some(aterm_phase::Program::Claude));
+    let epoch = aterm_session::terminal_stream::epoch();
+    let bucket_ns = aterm_vitals::pane_cpu::BUCKET_NS;
+    let elapsed_ns = u64::try_from(epoch.elapsed().as_nanos()).unwrap();
+    let start_ns = elapsed_ns.div_ceil(bucket_ns) * bucket_ns;
+    let start = epoch + Duration::from_nanos(start_ns);
+    for second in (5..=65).step_by(5) {
+        let mut sample = crate::stats_deck::tests::sample_at(second, &[0; 10], &[0, second]);
+        sample.tabs[0].key = first;
+        sample.tabs[0].tab = first;
+        sample.event_sources.push(source.clone());
+        sample.at_ns += start_ns;
+        sample.mono_ms = sample.at_ns / 1_000_000;
+        sample.at_unix_ms = i64::try_from(sample.mono_ms).unwrap();
+        sample.cadence_ms = 5_000;
+        for process in sample.procs.as_mut().unwrap() {
+            process.disk_written = Some(0);
+            process.disk_read = if process.pid == 201 {
+                (second != 30).then_some(second * 256)
+            } else {
+                Some(0)
+            };
+        }
+        let footer = FooterFacts {
+            owner: Some(FactsOwner {
+                session_id: "compile-trust".into(),
+                floor: None,
+            }),
+            usage: Some(UsageFacts {
+                complete: true,
+                models: vec![ModelTokens {
+                    label: "sonnet".into(),
+                    input: second * 8,
+                    output: second * 16,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(timeline.set_claude_footer(201, Some(1), Some(footer)));
+        let at = start + Duration::from_secs(second);
+        timeline.note_claude_footer_read(201, at);
+        sample
+            .pane_token_observations
+            .push(timeline.panel_token_observation(first, launch).unwrap());
+        app.vitals.snapshot = Some(std::sync::Arc::new(vitals.absorb(&sample)));
+    }
+    start
+}
+
+#[cfg(a11y_tree)]
+#[test]
+fn assistive_client_can_read_and_activate_the_session_panel() {
+    use crate::native_accessibility::stable_node_id_for_view;
+    use crate::native_ui::UiKey;
+    use aterm_a11y::model::{Action, Role};
+
+    let mut app = fixture();
+    let first = app.focused_session_id(WID).unwrap();
+    let second = crate::app_workers_tests::land_worker(&mut app);
+    assert!(app.session_is_parked(second));
+    app.switch_tab_in(WID, 0);
+    app.windows.get_mut(&WID).unwrap().a11y_active = true;
+    app.push_a11y_tree(WID);
+    let grid_focus = app.windows[&WID].a11y_sent.last().unwrap().focus;
+    let now = Instant::now();
+    app.set_dock(WID, 30).unwrap();
+    app.publish_navigators(now);
+    app.redraw_window(WID);
+    app.push_a11y_tree(WID);
+
+    let view = dock_view(&app);
+    let row_key = format!("{}{second}", crate::navigator::ROW);
+    let row_id = stable_node_id_for_view(view, &UiKey::new(row_key.as_str()));
+    let host = app
+        .dock_geometry(WID)
+        .expect("the visible panel's device-pixel placement");
+    assert!(host.origin.0 + i64::from(host.size.0) <= app.frame_origin(WID).0);
+    let panel_root = stable_node_id_for_view(view, &UiKey::new("navigator/root"));
+    let tree = app.windows[&WID].a11y_sent.last().unwrap();
+    let node = |id| &tree.nodes.iter().find(|(node, _)| *node == id).unwrap().1;
+    assert_eq!(tree.focus, grid_focus);
+    assert_eq!(node(grid_focus).label(), Some(crate::accessibility::LABEL));
+    assert!(
+        node(tree.tree.as_ref().unwrap().root)
+            .children()
+            .contains(&panel_root)
+    );
+    let transform = node(panel_root).transform().unwrap().as_coeffs();
+    assert_eq!(
+        (transform[4], transform[5]),
+        (host.origin.0 as f64, host.origin.1 as f64)
+    );
+    assert_eq!(node(row_id).role(), Role::Button);
+    let spoken = node(row_id).label().unwrap();
+    let roster = app.navigator_tree().unwrap();
+    assert!(spoken.contains(&roster.entries[roster.index_of(second).unwrap()].row.title));
+    assert!(spoken.contains(if cfg!(target_os = "macos") {
+        "Command 2"
+    } else {
+        "Control Shift 2"
+    }));
+    let size = app.windows[&WID].win_px;
+    app.windows.get_mut(&WID).unwrap().win_px = None;
+    app.push_a11y_tree(WID);
+    assert!(
+        app.windows[&WID]
+            .a11y_sent
+            .last()
+            .unwrap()
+            .nodes
+            .iter()
+            .any(|(id, _)| *id == row_id),
+        "a virtual surface puts its panel beside the frame without a desktop client"
+    );
+    let empty_client = aterm_window::dpi::PhysicalSize::new(0, 0);
+    app.windows.get_mut(&WID).unwrap().win_px = Some(empty_client);
+    assert!(!app.dock_geometry(WID).unwrap().intersects(empty_client));
+    app.push_a11y_tree(WID);
+    assert!(
+        app.windows[&WID]
+            .a11y_sent
+            .last()
+            .unwrap()
+            .nodes
+            .iter()
+            .all(|(id, _)| *id != panel_root)
+    );
+    app.windows.get_mut(&WID).unwrap().win_px = size;
+    // A parked present still lets a reader work the model. A pointer awaits a painted hit.
+    app.windows.get_mut(&WID).unwrap().dock.presented = None;
+    app.push_a11y_tree(WID);
+    let request = app.request_on_the_sent_tree(WID, view, &row_key, Action::Click, None);
+    app.on_accessibility_action(WID, request);
+    assert_eq!(app.focused_session_id(WID), Some(second));
+    assert_eq!(
+        app.windows[&WID].active_session_preview().unwrap().session,
+        second
+    );
+    assert!(app.session_is_parked(second));
+
+    // A utility and the panel each own their controls even when both show the same roster.
+    app.open_navigator(false).unwrap();
+    let utility = app.windows[&WID].tab_set.active().unwrap().focus;
+    app.publish_navigators(now);
+    app.redraw_window(WID);
+    app.push_a11y_tree(WID);
+    let first_key = format!("{}{first}", crate::navigator::ROW);
+    let panel_click = app.request_on_the_sent_tree(WID, view, &first_key, Action::Click, None);
+    let utility_click = app.request_on_the_sent_tree(WID, utility, &first_key, Action::Click, None);
+    assert_ne!(panel_click.target_node, utility_click.target_node);
+    app.on_accessibility_action(WID, panel_click);
+    assert_eq!(app.focused_session_id(WID), Some(first));
+    app.publish_navigators(now);
+    app.push_a11y_tree(WID);
+    let window_key = format!("navigator/window/{utility}");
+    let window_row = app.request_on_the_sent_tree(WID, view, &window_key, Action::Click, None);
+    app.on_accessibility_action(WID, window_row);
+    assert_eq!(
+        app.active_native_view(WID).map(|(_, view)| view),
+        Some(utility)
+    );
+    app.publish_navigators(now);
+    app.push_a11y_tree(WID);
+    let utility_click = app.request_on_the_sent_tree(WID, utility, &first_key, Action::Click, None);
+    app.on_accessibility_action(WID, utility_click);
+    assert_eq!(app.focused_session_id(WID), Some(first));
+    assert!(app.windows[&WID].active_session_preview().is_none());
+    app.publish_navigators(now);
+    app.push_a11y_tree(WID);
+    let previous = app.request_on_the_sent_tree(WID, view, &row_key, Action::Click, None);
+    app.set_dock(WID, 0).unwrap();
+    app.settle_dock_fall(Instant::now() + Duration::from_secs(1));
+    app.push_a11y_tree(WID);
+    let hidden = app.windows[&WID].a11y_sent.last().unwrap();
+    assert!(
+        hidden
+            .nodes
+            .iter()
+            .all(|(id, _)| *id != row_id && *id != panel_root)
+    );
+    assert_eq!(hidden.focus, grid_focus);
+    app.on_accessibility_action(WID, previous);
+    assert_eq!(app.focused_session_id(WID), Some(first));
 }
 
 #[test]
@@ -906,6 +1481,7 @@ fn the_view_menu_has_show_navigator_on_option_command_o() {
 #[test]
 fn the_open_app_dock_form_seats_chrome_and_preserves_the_old_tab_forms() {
     let mut app = fixture();
+    person_tab(&mut app);
     let tabs = app.windows[&WID].tab_set.tabs().len();
     let request =
         crate::app_control::parse_open("app navigator dock").expect("the dock form parses");
@@ -1003,6 +1579,35 @@ fn a_dock_press_released_after_leaving_the_window_is_cancelled() {
             .pressed
             .is_none()
     );
+}
+
+#[test]
+fn a_compositor_claimed_row_drop_releases_the_native_button_before_returning() {
+    let mut app = fixture();
+    let first = app.focused_session_id(WID).unwrap();
+    let second = person_tab(&mut app);
+    app.switch_tab_in(WID, 0);
+    let view = show(&mut app, Instant::now());
+    let (x, y) = row_point(&app, view, second);
+    app.on_cursor_moved(WID, x, y);
+    app.on_mouse_input(WID, ElementState::Pressed, MouseButton::Left);
+    assert!(app.windows[&WID].native_button_owners.contains(&Some(view)));
+    assert_ne!(app.windows[&WID].page_buttons, 0);
+    app.on_cursor_left(WID);
+    assert!(app.claim_surface_drop(WID, |token| token[1] == second));
+    let ws = &app.windows[&WID];
+    assert!(ws.dock.session_drag.is_none());
+    assert_eq!(ws.native_button_owners, [None; 5]);
+    assert_eq!(ws.page_buttons, 0);
+    assert!(
+        app.native_runtime
+            .view_state(view)
+            .unwrap()
+            .common()
+            .pressed
+            .is_none()
+    );
+    assert_eq!(app.focused_session_id(WID), Some(first));
 }
 
 /// A modal layer takes a press or wheel over the dock instead of the list, never as well as it:
@@ -1235,6 +1840,7 @@ fn a_dock_release_claimed_by_stats_retires_its_press_without_later_activation() 
 fn a_show_the_window_has_no_room_for_is_refused_and_books_nothing() {
     use aterm_window::dpi::PhysicalSize;
     let mut app = fixture();
+    person_tab(&mut app);
     let session = app.focused_session_id(WID).unwrap();
     let (cw, _) = app.win_cell_size(WID);
     let least = app.least_window_size(WID);
@@ -2240,6 +2846,7 @@ fn with_the_dock_hidden_a_control_in_the_window_padding_takes_its_press() {
 #[test]
 fn the_show_navigator_act_shows_hides_and_cancels_a_waiting_hide() {
     let mut app = fixture();
+    person_tab(&mut app);
     let mut palette = crate::palette::PaletteState::new();
     palette.resolve(&app.palette_live());
     assert_eq!(
@@ -2593,4 +3200,190 @@ fn one_dock_rows_change_patches_its_card_in_place() {
     );
     assert!(card.rgba == raster.rgba, "the card is the raster's copy");
     assert!(app.native_dock_artifact(WID, true, true).is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hidden_row_previews_read_only_and_a_second_click_keeps_the_live_session() {
+    let mut app = fixture();
+    let anchor = app.windows[&WID].tab_set.active_id().unwrap();
+    let (mut wire, sink) = observer();
+    let session = app.next_session_id;
+    app.next_session_id += 1;
+    let worker = crate::stub_session_with_sink(session, sink);
+    app.install_tab_session_parked(WID, worker, None, false);
+    let at = Instant::now();
+    let dock = show(&mut app, at);
+    let (x, y) = row_point(&app, dock, session);
+    let click = |app: &mut App, at| {
+        app.on_cursor_moved(WID, x, y);
+        app.on_mouse_input_at(WID, ElementState::Pressed, MouseButton::Left, at);
+        app.on_mouse_input_at(WID, ElementState::Released, MouseButton::Left, at);
+    };
+    click(&mut app, at);
+    assert_eq!(app.focused_session_id(WID), Some(session));
+    assert_eq!(app.windows[&WID].dock.preview.unwrap().anchor, Some(anchor));
+    assert!(app.windows[&WID].tab_set.active_is_parked());
+    assert_eq!(
+        app.capture_restore_manifest().windows[0].active_item,
+        Some(0)
+    );
+    app.input(
+        WID,
+        crate::input::InputEvent::Text("quiet".into()),
+        crate::input::Source::Human,
+    );
+    assert_eq!(written_before_marker(&mut app, session, &mut wire), "");
+    app.publish_navigators(at);
+    app.redraw_window(WID);
+    let hit = app
+        .retained_native_pointer_artifact(WID, dock)
+        .unwrap()
+        .compiled
+        .semantic(&crate::native_ui::UiKey::new(format!(
+            "{}{session}",
+            crate::navigator::ROW
+        )))
+        .unwrap();
+    assert!(hit.label.contains("Preview"));
+    click(&mut app, at + Duration::from_millis(60));
+    assert_eq!(app.focused_session_id(WID), Some(session));
+    assert!(app.windows[&WID].dock.preview.is_none());
+    assert!(!app.windows[&WID].tab_set.active_is_parked());
+    app.input(
+        WID,
+        crate::input::InputEvent::Text("edit".into()),
+        crate::input::Source::Human,
+    );
+    assert_eq!(written_before_marker(&mut app, session, &mut wire), "edit");
+}
+
+#[test]
+fn closing_or_escaping_a_local_preview_keeps_the_parked_session_alive() {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    let mut app = App::headless_for_test();
+    let anchor = app.windows[&WID].tab_set.active_id().unwrap();
+    let session = app.next_session_id;
+    app.next_session_id += 1;
+    app.install_tab_session_parked(WID, crate::stub_session(session), None, false);
+    app.select_dock_session(WID, session);
+    let parked = app.windows[&WID].tab_set.active_id().unwrap();
+    assert_eq!(app.close_active_tab_in(WID), None);
+    assert_eq!(app.windows[&WID].tab_set.active_id(), Some(anchor));
+    assert!(app.windows[&WID].tab_set.get(parked).unwrap().parked);
+    app.select_dock_session(WID, session);
+    app.input(
+        WID,
+        crate::input::InputEvent::Key {
+            key: Key::Named(NamedKey::Escape),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            layout_text: None,
+            event_type: KeyEventType::Press,
+        },
+        crate::input::Source::Human,
+    );
+    assert_eq!(app.windows[&WID].tab_set.active_id(), Some(anchor));
+    assert!(app.windows[&WID].tab_set.get(parked).unwrap().parked);
+    assert_eq!(app.pool.views(session), Some(1));
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn a_borrowed_preview_releases_its_view_or_brings_the_original_tab_back() {
+    let mut app = App::headless_for_test();
+    let anchor = app.focused_session_id(WID).unwrap();
+    let session = person_tab(&mut app);
+    let tab = app.windows[&WID].tab_set.active_id().unwrap();
+    let other = app.detach_active_tab_in_window_logical(WID).unwrap();
+    app.frontmost_window = Some(WID);
+    app.select_dock_session(WID, session);
+    assert_eq!(app.frontmost_window, Some(WID));
+    assert_eq!(app.pool.views(session), Some(2));
+    assert_eq!(app.focused_session_id(WID), Some(session));
+    assert_eq!(app.windows[&other].tab_set.active_id(), Some(tab));
+    let captured = app.capture_restore_manifest();
+    assert_eq!(captured.windows[0].restored_tabs.len(), 1);
+    assert_eq!(captured.windows[0].active_item, Some(0));
+    assert_eq!(captured.windows[1].restored_tabs.len(), 1);
+    app.select_dock_session(WID, anchor);
+    assert_eq!(app.pool.views(session), Some(1));
+    app.select_dock_session(WID, session);
+    assert!(app.keep_dock_session(WID, session));
+    assert_eq!(app.windows[&WID].tab_set.active_id(), Some(tab));
+    assert_eq!(app.pool.views(session), Some(1));
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn the_window_organizer_reopens_an_existing_app_without_a_session_tab() {
+    use crate::app_mouse::{NativePointerTarget, PointerAction};
+    let mut app = fixture();
+    let session = app.focused_session_id(WID).unwrap();
+    assert!(app.open_about_tab_in_window(WID));
+    let (_, about) = app.active_native_view(WID).expect("About view");
+    app.switch_tab_in(WID, 0);
+    let dock = show(&mut app, Instant::now());
+    assert_eq!(app.windows[&WID].strip_tab_count(), 1);
+    let key = format!("navigator/window/{about}");
+    let nodes = app
+        .retained_native_pointer_artifact(WID, dock)
+        .unwrap()
+        .compiled;
+    assert!(
+        nodes
+            .semantic(&crate::native_ui::UiKey::new(key.clone()))
+            .unwrap()
+            .label
+            .contains("About")
+    );
+    app.pointer_request(PointerAction::MoveNative(NativePointerTarget::Key(key)))
+        .unwrap();
+    app.pointer_request(PointerAction::Click).unwrap();
+    assert_eq!(app.active_native_view(WID).map(|(_, v)| v), Some(about));
+    assert_eq!(app.windows[&WID].strip_tab_count(), 1);
+    assert!(app.pool.get(session).is_some());
+}
+
+#[test]
+fn dragging_across_the_session_divider_hides_and_restores_the_same_tab() {
+    let mut app = fixture();
+    let first = app.focused_session_id(WID).unwrap();
+    let second = person_tab(&mut app);
+    let tab = app.windows[&WID].tab_set.active_id().unwrap();
+    let now = Instant::now();
+    let dock = show(&mut app, now);
+    let start = row_point(&app, dock, second);
+    let divider = {
+        let page = app.retained_native_pointer_artifact(WID, dock).unwrap();
+        let rect = page
+            .compiled
+            .semantic(&crate::native_ui::UiKey::new("navigator/machine"))
+            .unwrap()
+            .rect;
+        (
+            page.device_x as f64 + f64::from(rect.x + 4.0) * page.scale,
+            page.device_y as f64 + f64::from(rect.y + rect.height / 2.0) * page.scale,
+        )
+    };
+    let drag = |app: &mut App, from: (f64, f64), to: (f64, f64)| {
+        app.on_cursor_moved(WID, from.0, from.1);
+        app.on_mouse_input_at(WID, ElementState::Pressed, MouseButton::Left, now);
+        app.on_cursor_moved(WID, to.0, to.1);
+        app.on_mouse_input_at(WID, ElementState::Released, MouseButton::Left, now);
+    };
+    drag(&mut app, start, divider);
+    assert!(app.windows[&WID].tab_set.get(tab).unwrap().parked);
+    assert!(!app.windows[&WID].tab_set.get(tab).unwrap().ephemeral);
+    assert_eq!(app.pool.views(second), Some(1));
+    app.publish_navigators(now);
+    app.redraw_window(WID);
+    let hidden = row_point(&app, dock, second);
+    let (x, y) = row_point(&app, dock, first);
+    drag(&mut app, hidden, (x, y - 1.0));
+    let ws = &app.windows[&WID];
+    assert_eq!(ws.tab_set.shown()[0].id, tab);
+    assert!(ws.tab_set.parked().is_empty());
+    assert!(app.structural_invariants_ok());
 }

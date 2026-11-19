@@ -1552,11 +1552,13 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
                 eprintln!("{say}");
             }
             let placed = if upstream == "cargo" && !machine.passthrough {
-                let identity = (machine.resolve)(&target, explicit_toolchain(&args)).identity;
+                let resolved = (machine.resolve)(&target, explicit_toolchain(&args));
+                let identity = resolved.identity;
                 match checked_cargo_placement(
                     &args,
                     upstream_cargo_tool(&identity),
                     cwd.as_deref(),
+                    resolved.rustup_proxy,
                     |placement_machine| {
                         upstream_cargo_placement(&args, &identity, &|args, tool| {
                             placement_for(args, tool, placement_machine)
@@ -1588,6 +1590,7 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
                     &args,
                     crate::build_cache::Tool::Targo,
                     cwd.as_deref(),
+                    false,
                     |placement_machine| {
                         placement_for(&args, crate::build_cache::Tool::Targo, placement_machine)
                             .map(|args| (crate::build_cache::Tool::Targo, args))
@@ -1640,26 +1643,72 @@ fn checked_cargo_placement(
     args: &[String],
     original_tool: crate::build_cache::Tool,
     cwd: Option<&Path>,
+    rustup_proxy: bool,
     select: impl FnOnce(&crate::build_cache::Machine<'_>) -> Option<CargoPlacement>,
 ) -> std::io::Result<Option<CargoPlacement>> {
     use crate::build_cache::registered;
     registered::with_live_machine(cwd, |machine| {
-        let placed = select(machine);
-        if let Some((tool, words)) = &placed {
-            registered::observe_placed_command_with(args, words, *tool, machine)?;
-        } else {
-            registered::observe_command_with(args, original_tool, machine)?;
+        with_cargo_environment(rustup_proxy, machine, |machine| {
+            let placed = select(machine);
+            if let Some((tool, words)) = &placed {
+                registered::observe_placed_command_with(args, words, *tool, machine)?;
+            } else {
+                registered::observe_command_with(args, original_tool, machine)?;
+            }
+            Ok(placed)
+        })
+    })
+}
+
+/// Rustup exports the home resolved against its launch directory before Cargo handles `-C`.
+/// Its `home` crate ignores an empty `CARGO_HOME` and never reads `TARGO_HOME`.
+fn with_cargo_environment<T>(
+    rustup_proxy: bool,
+    machine: &crate::build_cache::Machine<'_>,
+    read: impl FnOnce(&crate::build_cache::Machine<'_>) -> T,
+) -> T {
+    if !rustup_proxy || machine.cwd.is_none() {
+        return read(machine);
+    }
+    let home = match (machine.env)("CARGO_HOME").filter(|value| !value.is_empty()) {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                machine.cwd.map(|cwd| cwd.join(path))
+            }
         }
-        Ok(placed)
+        None => (machine.env)(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| machine.home.map(Path::to_path_buf))
+            .map(|home| home.join(".cargo")),
+    };
+    // If rustup cannot resolve a home, its set_env leaves the original environment in place.
+    let env = |name: &str| {
+        if name == "CARGO_HOME" {
+            home.as_ref()
+                .map(|home| home.as_os_str().to_owned())
+                .or_else(|| (machine.env)(name))
+        } else {
+            (machine.env)(name)
+        }
+    };
+    read(&crate::build_cache::Machine {
+        env: &env,
+        ..*machine
     })
 }
 
 fn upstream_cargo_tool(identity: &crate::upstream_identity::Identity) -> crate::build_cache::Tool {
+    // Only a known stock compiler establishes that Trust's environment twins are ignored.
+    // Unknown identity stays conservative for observation; placement still needs a known release.
     match identity {
-        crate::upstream_identity::Identity::Known(vv) if vv.trust.is_some() => {
-            crate::build_cache::Tool::CargoCompat
+        crate::upstream_identity::Identity::Known(vv) if vv.trust.is_none() => {
+            crate::build_cache::Tool::Cargo
         }
-        _ => crate::build_cache::Tool::Cargo,
+        _ => crate::build_cache::Tool::CargoCompat,
     }
 }
 

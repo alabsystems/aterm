@@ -236,22 +236,44 @@ fn scoped_relaunch_pid(ctx: &SessionCtx, now_us: u64) -> Option<u32> {
         .map(|scoped| scoped.proven.pid)
 }
 
-fn record_restart(ctx: &SessionCtx, cause: Cause) {
+/// TELL A SCOPED HARNESS TO RESTART ITS CHILD for `cause`: the `restart` row `cause=<cause>`
+/// ([`write_restart_row`]). The `restart` verb's scoped event writes it, and so will the
+/// watchdog's beat and memory causes (D32).
+pub(crate) fn record_restart(ctx: &SessionCtx, cause: Cause) {
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    write_restart_row(ctx, meta, format!("cause={}", cause.word()));
+}
+
+/// THE ONE WRITER OF A `restart` ROW, under the held `meta` (meta, then the timeline): the row
+/// `payload` for the session's subscribers, and, where the live claim's record stream is open,
+/// the same text owed to that stream as a `restart` record (HX-15c, D32), which wakes it. A row
+/// written while no stream is open is owed to none.
+fn write_restart_row(
+    ctx: &SessionCtx,
+    mut meta: crate::session_timeline::MetaGuard<'_>,
+    payload: String,
+) {
+    let owed = meta.owe_stream_restart(&payload, crate::metrics::now_us());
     ctx.timeline
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .record_row(RESTART_EVENT, format!("cause={}", cause.word()));
+        .record_row(RESTART_EVENT, payload);
+    drop(meta);
+    if owed {
+        ctx.watchers.ring_stream();
+    }
 }
 
-/// The pid of the live scoped claim on `ctx` that hears a restart's model
+/// The pid of the live scoped claim in `meta` that hears a restart's model
 /// ([`crate::harness_claim::Scoped::hears_restart`]) and, where the restart moves its child's
 /// `account`, an account move ([`crate::harness_claim::Scoped::hears_account_move`]: a claim
 /// granted `accounts`), read in one look at the claim.
-fn scoped_restart_pid(ctx: &SessionCtx, now_us: u64, account: bool) -> Option<u32> {
-    ctx.meta
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .live_scoped(now_us)
+fn scoped_restart_pid(
+    meta: &crate::session_timeline::SessionMeta,
+    now_us: u64,
+    account: bool,
+) -> Option<u32> {
+    meta.live_scoped(now_us)
         .filter(|scoped| scoped.hears_restart() && (!account || scoped.hears_account_move()))
         .map(|scoped| scoped.proven.pid)
 }
@@ -302,7 +324,8 @@ pub(crate) fn record_scoped_restart(
     {
         return false;
     }
-    if scoped_restart_pid(ctx, crate::metrics::now_us(), account.is_some()).is_none() {
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    if scoped_restart_pid(&meta, crate::metrics::now_us(), account.is_some()).is_none() {
         return false;
     }
     let mut payload = format!("cause={cause}");
@@ -316,10 +339,7 @@ pub(crate) fn record_scoped_restart(
     if let Some(model) = model {
         payload.push_str(&format!(" model={model}"));
     }
-    ctx.timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .record_row(RESTART_EVENT, payload);
+    write_restart_row(ctx, meta, payload);
     true
 }
 

@@ -838,3 +838,272 @@ fn retained_rows_stay_under_the_guest_run_and_disk_units_match_tart() {
     assert!(parse(&args("--app a --record r --cpus 0")).is_err());
     assert!(parse(&args("--app a --record r --memory-gib 4294967295")).is_err());
 }
+
+fn injected_output(code: i32, stdout: &[u8], stderr: &[u8]) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt as _;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.to_vec(),
+        stderr: stderr.to_vec(),
+    }
+}
+
+#[test]
+fn unknown_cleanup_cannot_publish_success_and_preserves_a_red_or_interrupt() {
+    use std::cell::Cell;
+    let calls = Cell::new(0);
+    for work in [
+        Ok(()),
+        Err(Fail::die("observed red")),
+        Err(Fail {
+            code: 130,
+            stopped: Some(2),
+            msg: None,
+        }),
+    ] {
+        let was_red = work.as_ref().err().is_some_and(|error| error.code == 1);
+        let was_stopped = work.as_ref().err().and_then(|error| error.stopped);
+        let result = after_cleanup(work, || {
+            calls.set(calls.get() + 1);
+            Err(not_run("unconfirmed actual owner finish"))
+        })
+        .unwrap_err();
+        assert_eq!(
+            result.code,
+            if was_red {
+                1
+            } else if was_stopped.is_some() {
+                130
+            } else {
+                3
+            }
+        );
+        assert_eq!(result.stopped, was_stopped);
+    }
+    assert_eq!(
+        calls.get(),
+        3,
+        "every path must attempt its actual owner cleanup"
+    );
+    assert!(after_cleanup(Ok(()), || Ok(())).is_ok());
+    assert_eq!(
+        preserve_observed(
+            Some(injected_output(1, b"", b"").status),
+            not_run("late cleanup refusal")
+        )
+        .code,
+        1
+    );
+}
+
+#[test]
+fn exact_created_driver_target_is_required_before_any_control() {
+    let label = "systems.alab.aterm.runtime.take-1";
+    let target = format!("gui/501/{label}");
+    assert_eq!(
+        created_driver_target(format!("aterm-runtime-target={target}\n").as_bytes(), label)
+            .unwrap(),
+        target
+    );
+    for bytes in [
+        b"no target\n".to_vec(),
+        format!("aterm-runtime-target=gui/501/other\n").into_bytes(),
+        format!("aterm-runtime-target=gui/unread/{label}\n").into_bytes(),
+        format!("aterm-runtime-target={target}\naterm-runtime-target={target}\n").into_bytes(),
+    ] {
+        assert!(created_driver_target(&bytes, label).is_err());
+    }
+}
+
+#[test]
+fn driver_retirement_requires_bound_ended_evidence_checked_bootout_and_raw_diagnostics() {
+    let target = "gui/501/systems.alab.aterm.runtime.take-1";
+    let dir = "/owned/driver/take-1";
+    let nonce = "0123456789abcdef0123456789abcdef";
+    for defect in [
+        "none",
+        "state-read",
+        "wrong-target",
+        "successor",
+        "raw-mismatch",
+        "active",
+        "unknown",
+        "wrong-nonce",
+        "partial",
+        "cancelled",
+        "bootout",
+        "diagnostic",
+    ] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let mut calls = Vec::new();
+        let mut observed = false;
+        let result = retire_driver_using(
+            tmp.path(),
+            "take-1",
+            dir,
+            target,
+            nonce,
+            |script| {
+                calls.push(script.to_owned());
+                if script.contains("launchctl bootout") {
+                    return Ok(injected_output(
+                        if defect == "bootout" { 5 } else { 0 },
+                        b"",
+                        b"bootout detail",
+                    ));
+                }
+                if script.contains("driver.stdout") {
+                    return Ok(injected_output(0, b"driver\0out\xff", b""));
+                }
+                assert!(
+                    script.contains("driver.stderr"),
+                    "unexpected owned operation {script}"
+                );
+                Ok(injected_output(
+                    if defect == "diagnostic" { 7 } else { 0 },
+                    b"driver\0err\xfe",
+                    b"",
+                ))
+            },
+            |script| {
+                observed = true;
+                assert!(script.contains("observe-driver"));
+                assert!(script.contains(nonce));
+                if defect == "state-read" {
+                    return Err(not_run(defect));
+                }
+                if defect == "cancelled" {
+                    let mut error = Fail::from(stop::Stopped(libc::SIGINT));
+                    error.msg = Some("observer transport cancelled".into());
+                    return Err(error);
+                }
+                let heading = if defect == "wrong-target" {
+                    "gui/999/another-job"
+                } else {
+                    target
+                };
+                let job = format!(
+                    "{heading} = {{\n\tstate = not running\n\truns = {}\n}}\n",
+                    if defect == "successor" { 2 } else { 1 }
+                );
+                let wire = json!({"schema":"aterm-runtime-driver-observation-v1", "nonce":if defect == "wrong-nonce" { "other" } else { nonce },
+                    "directory":dir, "target":target, "outcome":match defect { "active" => "idle", "unknown" => "unknown", _ => "ended" },
+                    "original_identity":null, "observations":1, "incomparable":0, "reason":"injected observation", "job_output_complete":true,
+                    "job_stdout":if defect == "raw-mismatch" { b"other".as_slice() } else { job.as_bytes() }, "job_stderr":[], "job":job});
+                let mut bytes = aterm_json::to_string(&wire).unwrap().into_bytes();
+                if defect == "partial" {
+                    bytes.pop();
+                }
+                Ok(injected_output(0, &bytes, b"observer detail"))
+            },
+        );
+        assert!(observed);
+        assert_eq!(result.is_ok(), defect == "none", "{defect}");
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == &format!("/bin/launchctl bootout {}", q(target)))
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("take-1.driver.stdout")).unwrap(),
+            b"driver\0out\xff"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("take-1.driver.stderr")).unwrap(),
+            b"driver\0err\xfe"
+        );
+        let receipt: Value = aterm_json::from_slice(
+            &std::fs::read(tmp.path().join("take-1.driver-closure.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["complete"], json!(defect == "none"));
+        assert_eq!(receipt["target"], json!(target));
+        let normal = matches!(defect, "none" | "bootout" | "diagnostic");
+        assert_eq!(receipt["direct_job_ended"], json!(normal));
+        assert_eq!(
+            receipt["retirement"],
+            json!(if defect == "cancelled" {
+                "cancelled-forced-cleanup"
+            } else if normal {
+                "normal-ended"
+            } else {
+                "forced-without-ended-evidence"
+            })
+        );
+        assert!(tmp.path().join("take-1.driver-observation.json").is_file());
+        assert!(!tmp.path().join("take-1.driver-state-1.json").exists());
+    }
+}
+
+#[test]
+fn guest_artifacts_are_exact_adjacent_files_and_an_open_archive_stays_incomplete() {
+    let path = format!("{ROOT}/target.noindex/verify/runs.noindex/1-42.log");
+    let closed = "run v=1 boot=own-boot id=42-100 uniqueid=400 start=1000 sid=-\nroot path=/owned/source\ngroup pgid=43 leader_birth=101 leader_uniqueid=401 stage=own\nclosed pgid=43\nend at=2000\n";
+    for (defect, raw) in [
+        ("none", closed.to_owned()),
+        ("open", closed.replace("closed pgid=43\n", "")),
+        ("no-end", closed.replace("end at=2000\n", "")),
+        ("missing-events", closed.to_owned()),
+    ] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let ask = parse(&[
+            "--app".into(),
+            "unused".into(),
+            "--record".into(),
+            tmp.path().display().to_string(),
+        ])
+        .unwrap();
+        let mut requested = Vec::new();
+        let result = collect_using(&ask, "take-1", &format!("log: {path}\n"), |script| {
+            requested.push(script.to_owned());
+            for (suffix, bytes) in [
+                ("", b"human log".as_slice()),
+                (".events", b"exact event bytes\0".as_slice()),
+                (".run", raw.as_bytes()),
+            ] {
+                if script == format!("cat -- {}", q(&format!("{path}{suffix}"))) {
+                    if defect == "missing-events" && suffix == ".events" {
+                        return Err(not_run("events missing"));
+                    }
+                    return Ok(bytes.to_vec());
+                }
+            }
+            panic!("collection escaped its exact artifact paths: {script}")
+        });
+        assert_eq!(result.is_ok(), defect == "none", "{defect}");
+        assert_eq!(requested[0], format!("cat -- {}", q(&path)));
+        assert!(tmp.path().join("take-1.verifier.log").is_file());
+        if defect != "missing-events" {
+            assert_eq!(
+                std::fs::read(tmp.path().join("take-1.verifier.log.run")).unwrap(),
+                raw.as_bytes()
+            );
+            assert_eq!(requested.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn host_log_archival_keeps_binary_bytes_and_labels_unconfirmed_retirement() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let record = aterm_tempfile::tempdir().unwrap();
+    let bytes = b"tart\0log\xff";
+    std::fs::write(scratch.path().join("tart-run.log"), bytes).unwrap();
+    retain_host_log(&scratch.path().join("tart-run.log"), record.path(), false).unwrap();
+    assert_eq!(
+        std::fs::read(record.path().join("tart-run.log")).unwrap(),
+        bytes
+    );
+    let receipt: Value =
+        aterm_json::from_slice(&std::fs::read(record.path().join("tart-run-log.json")).unwrap())
+            .unwrap();
+    assert_eq!(receipt["complete"], json!(false));
+    assert_eq!(
+        receipt["sha256"],
+        json!(aterm_codec::hex::encode_lower(
+            &aterm_digest::Sha256::digest(bytes)
+        ))
+    );
+    std::fs::remove_file(scratch.path().join("tart-run.log")).unwrap();
+    assert!(retain_host_log(&scratch.path().join("tart-run.log"), record.path(), true).is_err());
+}

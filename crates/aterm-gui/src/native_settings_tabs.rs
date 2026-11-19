@@ -18,6 +18,11 @@ pub(crate) const TABS_ACTION_PREFIX: &str = "tabs/";
 /// Key and action for the Refresh button.
 pub(crate) const TABS_REFRESH: &str = "tabs/refresh";
 
+/// Local cleanup action, shared by the visible button and the command palette.
+pub(crate) const TABS_CLOSE_IDLE: &str = "tabs/close-idle";
+pub(crate) const CAN_CLOSE_IDLE_TABS: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+const CLEANUP_SCOPE: &str = "Closes idle background terminal tabs across this aterm’s windows. Each window keeps its selected tab.";
+
 /// Prefix for a local tab row's `Show tab` action (`tabs/show/<local_id>`).
 pub(crate) const TABS_SHOW_PREFIX: &str = "tabs/show/";
 
@@ -146,7 +151,7 @@ pub(super) fn tabs_page_subtitle(width: SettingsWidth) -> &'static str {
 
 /// The page's Command Palette commands while it is the active route.
 pub(super) fn tabs_commands(harness: &crate::harness_screen::HarnessState) -> Vec<Command> {
-    vec![
+    let mut commands = vec![
         Command {
             id: ActionId::new(TABS_REFRESH),
             title: "Tab Control: Refresh".to_string(),
@@ -165,7 +170,16 @@ pub(super) fn tabs_commands(harness: &crate::harness_screen::HarnessState) -> Ve
             shortcut: None,
             enabled: true,
         },
-    ]
+    ];
+    if CAN_CLOSE_IDLE_TABS {
+        commands.push(Command {
+            id: ActionId::new(TABS_CLOSE_IDLE),
+            title: "Tab Control: Close Idle Tabs".to_string(),
+            shortcut: None,
+            enabled: true,
+        });
+    }
+    commands
 }
 
 impl SettingsApp {
@@ -180,6 +194,11 @@ impl SettingsApp {
             view.live_row_heights.get_mut().forget();
             cx.harness(HarnessRequest::Refresh);
             view.feedback = Some("Refreshing computers, sessions, and tabs\u{2026}".to_string());
+        } else if action == TABS_CLOSE_IDLE
+            && CAN_CLOSE_IDLE_TABS
+            && view.route == SettingsRoute::Tabs
+        {
+            cx.clean_up_idle_tabs();
         } else if let Some(rest) = action.strip_prefix(TABS_SHOW_PREFIX)
             && !rest.is_empty()
             && rest.bytes().all(|b| b.is_ascii_digit())
@@ -260,6 +279,9 @@ fn tabs_cards(
     }
     cards.extend(summary);
     cards.push(tabs_actions(tabs, card_width));
+    if CAN_CLOSE_IDLE_TABS {
+        cards.push(header_line("tabs/cleanup-scope", CLEANUP_SCOPE, card_width));
+    }
     let mut spreadsheet = spreadsheet_rows(tabs, width, inner, room, held);
     held.hold(&mut spreadsheet);
     cards.extend(row_cards(
@@ -288,7 +310,7 @@ fn tabs_cards(
     cards
 }
 
-/// Refresh, Coding Agent Harness and AI CLIs: as many to a line as the card
+/// The page's actions: as many to a line as the card
 /// holds, each at its words' width, a label wider than the line on as many
 /// lines as it needs ([`page_button_lines`]) — never cut ("Coding Agent
 /// Har…" at 22 columns).
@@ -296,21 +318,28 @@ fn tabs_actions(tabs: &TabControlProjection, card_width: f32) -> (UiNode, f32) {
     let specs = [
         (
             TABS_REFRESH,
-            "Refresh",
+            ButtonSpec::new("Refresh"),
             tabs.collecting,
             StyleRef::Primary,
             ActionId::new(TABS_REFRESH),
         ),
         (
+            TABS_CLOSE_IDLE,
+            ButtonSpec::new("Close Idle Tabs").description(CLEANUP_SCOPE),
+            false,
+            StyleRef::Secondary,
+            ActionId::new(TABS_CLOSE_IDLE),
+        ),
+        (
             TABS_TO_HARNESS,
-            "Coding Agent Harness",
+            ButtonSpec::new("Coding Agent Harness"),
             false,
             StyleRef::Secondary,
             route_action(SettingsRoute::Harness),
         ),
         (
             TABS_TO_AI,
-            "AI CLIs",
+            ButtonSpec::new("AI CLIs"),
             false,
             StyleRef::Secondary,
             route_action(SettingsRoute::Ai),
@@ -318,11 +347,12 @@ fn tabs_actions(tabs: &TabControlProjection, card_width: f32) -> (UiNode, f32) {
     ];
     let buttons = specs
         .into_iter()
-        .map(|(key, label, busy, style, action)| {
+        .filter(|(key, ..)| *key != TABS_CLOSE_IDLE || CAN_CLOSE_IDLE_TABS)
+        .map(|(key, spec, busy, style, action)| {
             UiNode::new(
                 key,
                 UiContent::Button(
-                    Control::new(ButtonSpec::new(label), action)
+                    Control::new(spec, action)
                         .state(ControlState {
                             busy,
                             ..ControlState::default()

@@ -186,6 +186,18 @@ impl AutopilotView {
         }
     }
 
+    /// WHETHER A HARNESS'S LANDING MAY FINISH the task of a session seen as this view, whose own
+    /// word is `word`: the mode it runs under (this view's, else its word) is Land, or no mode
+    /// is known. Nothing ends a Cruise or an Off task, so a landing under either marks nothing:
+    /// a proven self-claim's landed face (`App::self_claim_may_land`) and a stream's `landed`
+    /// record (`control_stream::finish_landed`) are held to it alike.
+    #[must_use]
+    pub(crate) fn may_land(self, word: Option<Autopilot>) -> bool {
+        self.mode()
+            .or(word)
+            .is_none_or(|mode| mode == Autopilot::Land)
+    }
+
     /// The view as a small number (`0..=10`), distinct for every view.
     #[must_use]
     pub(crate) const fn code(self) -> u64 {
@@ -724,7 +736,7 @@ fn fleet_words(token: &str, fleet_name: impl FnOnce(&str) -> Option<String>) -> 
         .unwrap_or(token);
     let (head, sid) = rest.split_once(':').unwrap_or((rest, "-"));
     let mac = fleet_name(head).unwrap_or_else(|| format!("node {head}"));
-    if aterm_types::control_verbs::is_minted_sid(sid) {
+    if aterm_types::control_request::Sid::parse(sid).is_some() {
         format!(
             "over the fleet from {mac} (session {})",
             crate::presence::short_sid(sid)

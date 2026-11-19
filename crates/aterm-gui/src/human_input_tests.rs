@@ -423,10 +423,16 @@ fn the_sheet_spacing_crosses_a_seamless_update_onto_the_window_that_shows_its_se
 
     let (mut outgoing, [spaced, other], [w_spaced, w_other]) = two_windows();
     let t0 = Instant::now();
-    outgoing.askpass_backoff.on_cancel(w_spaced, t0, t0);
-    outgoing.askpass_backoff.on_cancel(w_spaced, t0, t0);
+    outgoing
+        .askpass_backoff
+        .on_cancel(w_spaced, Some(spaced), t0, t0);
+    outgoing
+        .askpass_backoff
+        .on_cancel(w_spaced, Some(spaced), t0, t0);
     // The other window's quiet time ran out before the handoff: nothing of it crosses.
-    outgoing.askpass_backoff.on_cancel(w_other, t0, t0);
+    outgoing
+        .askpass_backoff
+        .on_cancel(w_other, Some(other), t0, t0);
     let at = t0 + QUIET_BASE + Duration::from_secs(2);
     let rows = outgoing.askpass_spacing_rows(&[spaced, other], at);
     assert_eq!(
@@ -471,9 +477,9 @@ fn the_sheet_spacing_crosses_a_seamless_update_onto_the_window_that_shows_its_se
                 successor.askpass_backoff.carried(window, after),
             )
         };
-        (quiet(wa), quiet(wb), successor, wb)
+        (quiet(wa), quiet(wb), successor, wb, b)
     };
-    let (other_window, spaced_window, mut successor, wb) = take(Some(path.clone()));
+    let (other_window, spaced_window, mut successor, wb, b) = take(Some(path.clone()));
     assert!(!path.exists(), "the sidecar was consumed");
     assert_eq!(other_window, (None, None));
     // Taken up at an instant between `before` and `after`: at least the carried 8 s is left
@@ -489,7 +495,9 @@ fn the_sheet_spacing_crosses_a_seamless_update_onto_the_window_that_shows_its_se
     );
     // The next unanswered sheet there is the third of the streak.
     let later = Instant::now() + Duration::from_secs(9);
-    successor.askpass_backoff.on_cancel(wb, later, later);
+    successor
+        .askpass_backoff
+        .on_cancel(wb, Some(b), later, later);
     assert_eq!(
         successor.askpass_backoff.quiet_for(wb, later),
         Some(QUIET_BASE * 4)

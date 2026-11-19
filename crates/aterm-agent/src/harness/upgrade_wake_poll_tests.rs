@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(unix)]
 fn replace(path: &Path) {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, b"").unwrap();

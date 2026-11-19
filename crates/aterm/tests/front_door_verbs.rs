@@ -135,6 +135,47 @@ fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
 }
 
 #[test]
+fn prepare_resident_uses_the_window_hosts_state_and_only_on_explicit_request() {
+    let root = private_root();
+    let state = aterm_types::dirs::resolve_state_dir(
+        None,
+        aterm_types::dirs::StatePlatform {
+            home: Some(root.path().join("home")),
+            xdg_state_home: Some(root.path().join("state")),
+            local_app_data: None,
+        },
+    )
+    .expect("private instance state");
+    let resident = aterm_agent::harness::cli::harness_state_in(&state).join("resident");
+    let other = root.path().join("other-harness");
+    let run = |args: &[&str]| {
+        isolated(&mut aterm_cmd(), root.path())
+            .env_remove("ATERM_STATE_HOME")
+            .env("ATERM_HARNESS_STATE", &other)
+            .args(["agents", "prepare-resident"])
+            .args(args)
+            .output()
+            .expect("run prepare-resident")
+    };
+
+    assert!(run(&["--help"]).status.success());
+    assert_eq!(run(&["worker"]).status.code(), Some(2));
+    assert!(!resident.exists());
+    let out = run(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        resident.to_str().unwrap()
+    );
+    assert!(resident.join("CLAUDE.md").is_file());
+    assert!(!other.exists());
+}
+
+#[test]
 fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
     let root = private_root();
     let aterm = launch_isolation::aterm_executable();

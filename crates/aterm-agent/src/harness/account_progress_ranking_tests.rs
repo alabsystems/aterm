@@ -80,6 +80,7 @@ fn project(case: i64, raw_ranking: bool) -> [(&'static str, i64); 7] {
         },
         default_home: case != 21,
         route: crate::harness::accounts::AuthRoute::Stored.unless(case == 22),
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let point = match case {
         0 | 16 => None,
@@ -139,7 +140,15 @@ fn project(case: i64, raw_ranking: bool) -> [(&'static str, i64); 7] {
         ));
     }
     let ranked = effective.as_ref().map(|point| {
-        accounts::candidates(&roster, &state, &enrolled, me.label(), point.as_ref(), NOW)
+        accounts::candidates(
+            &roster,
+            &state,
+            &enrolled,
+            me.label(),
+            accounts::ModelWeek::Unread,
+            point.as_ref(),
+            NOW,
+        )
     });
     if let Some(point @ Point::Wall { .. }) = point.as_ref() {
         assert_eq!(effective.as_ref().unwrap().as_ref(), point);
@@ -175,9 +184,17 @@ fn project(case: i64, raw_ranking: bool) -> [(&'static str, i64); 7] {
     );
     if raw_ranking {
         // The previous implementation ranked the raw trigger after advice had yielded.
-        let raw = point
-            .as_ref()
-            .map(|point| accounts::candidates(&roster, &state, &enrolled, me.label(), point, NOW));
+        let raw = point.as_ref().map(|point| {
+            accounts::candidates(
+                &roster,
+                &state,
+                &enrolled,
+                me.label(),
+                accounts::ModelWeek::Unread,
+                point,
+                NOW,
+            )
+        });
         progress.eligible = raw
             .as_ref()
             .map(|rows| rows.iter().filter(|(_, verdict)| verdict.is_ok()).count());

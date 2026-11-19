@@ -25,6 +25,40 @@ const READER_CLOSE_GRACE: Duration = Duration::from_millis(500);
 /// The process may close stdout before it exits.
 const REAP_CHECK: Duration = Duration::from_millis(20);
 
+/// How long what an owned capture's child left in its job (Windows) is given to leave by itself
+/// once the child exited, before the job is ended: twice the grace a sign-in's opener gives the
+/// browser it closes ([`super::headless_oauth::BROWSER_EXIT_GRACE`]), whose kill before then
+/// would cost the profile's cookies.
+#[cfg(windows)]
+const LEFT_GRACE: Duration = super::headless_oauth::BROWSER_EXIT_GRACE.saturating_mul(2);
+
+/// The hang detector of an owned capture's job end (Windows): the kernel ends every process in
+/// the job at once, and this bounds the wait until none is left.
+#[cfg(windows)]
+const JOB_END: Duration = Duration::from_secs(60);
+
+/// Windows' own process variables a capture passes to its child as this process has them,
+/// beside `PATH`: a child started without them finds no system folder (`SystemRoot`, `windir`,
+/// `SystemDrive`), no profile or its folders (`USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `APPDATA`,
+/// `LOCALAPPDATA`, `ProgramData`), no temporary folder (`TEMP`, `TMP`), no command shell
+/// (`ComSpec`) and no program extensions (`PATHEXT`).
+#[cfg(windows)]
+const WINDOWS_PASS: [&str; 13] = [
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "TEMP",
+    "TMP",
+    "ComSpec",
+    "PATHEXT",
+];
+
 #[cfg(all(test, unix))]
 type ChildReady = Box<dyn FnOnce(&mut Child) + Send>;
 
@@ -102,6 +136,16 @@ struct CaptureOwner {
     /// Non-Unix keeps the incoming child-only end semantics; no reader-join guarantee.
     #[cfg(not(unix))]
     done: bool,
+    /// An owned capture's kill-on-close job on Windows, which the child was born in
+    /// ([`aterm_uds::deadline::spawn_in_job`]): the child and everything it starts end when it
+    /// is ended or closed, and when this process ends, by the job's handle alone.
+    #[cfg(windows)]
+    job: Option<aterm_uds::deadline::JobHold>,
+    /// When the capture's deadline falls, as this process's clock reads it: the end of the grace
+    /// what the child left gets where the capture lets its child go ([`Drop`]); `None` for a
+    /// deadline past what the clock can name, where [`LEFT_GRACE`] alone bounds it.
+    #[cfg(windows)]
+    settle_by: Option<Instant>,
 }
 
 #[cfg(unix)]
@@ -318,6 +362,15 @@ impl Drop for CaptureOwner {
         if !self.done {
             let _ = self.stop(false);
         }
+        // A child that exited by itself: what it left in its job goes after its grace, which
+        // ends by the capture's deadline.
+        #[cfg(windows)]
+        {
+            let left = self.settle_by.map_or(LEFT_GRACE, |by| {
+                by.saturating_duration_since(Instant::now())
+            });
+            self.settle_job(left, |_| false);
+        }
     }
 }
 
@@ -328,6 +381,10 @@ impl CaptureOwner {
             child,
             observer,
             done: false,
+            #[cfg(windows)]
+            job: None,
+            #[cfg(windows)]
+            settle_by: None,
         }
     }
 
@@ -344,9 +401,14 @@ impl CaptureOwner {
         result
     }
 
+    /// End the child (on Windows, with everything in its job, at once), then reap it.
     fn stop(&mut self, _report: bool) -> Result<(), String> {
+        #[cfg(windows)]
+        let ended = self.end_job();
+        #[cfg(not(windows))]
+        let ended: Result<(), String> = Ok(());
         if self.done {
-            return Ok(());
+            return ended;
         }
         self.done = true;
         let _ = self.child.kill();
@@ -355,8 +417,55 @@ impl CaptureOwner {
         if reaped.is_ok() {
             mark_capture_child_reaped(&self.observer);
         }
-        reaped.map(|_| ())
+        reaped.map(|_| ())?;
+        ended
     }
+}
+
+#[cfg(windows)]
+impl CaptureOwner {
+    /// End every process in the child's job now, by the job's handle (none where the capture
+    /// owns no job), and wait, at most [`JOB_END`], until none is left.
+    fn end_job(&mut self) -> Result<(), String> {
+        let Some(job) = self.job.take() else {
+            return Ok(());
+        };
+        match job.end(JOB_END) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("its capture job still held a process after its end".to_owned()),
+            Err(_) => Err("its capture job could not be ended".to_owned()),
+        }
+    }
+
+    /// After the child's own exit: what it left in its job is given its grace to leave by itself
+    /// (a sign-in's opener closing its browser), [`LEFT_GRACE`] or what is `left` of the
+    /// capture's deadline where that is less ([`settle_grace`]), and `stop` is asked each
+    /// [`REAP_CHECK`] meanwhile (the capture's watch: a cancelled scope ends the grace); then the
+    /// job is ended, so nothing it started outlives the capture or holds its output.
+    fn settle_job(
+        &mut self,
+        left: Duration,
+        mut stop: impl FnMut(&mut aterm_uds::spawnfd::Child) -> bool,
+    ) {
+        let Some(job) = self.job.as_ref() else {
+            return;
+        };
+        let by = Instant::now() + settle_grace(left);
+        while job.active().is_ok_and(|left| left > 0)
+            && Instant::now() < by
+            && !stop(&mut self.child)
+        {
+            std::thread::sleep(REAP_CHECK);
+        }
+        let _ = self.end_job();
+    }
+}
+
+/// The grace an owned capture's job gets after its child's exit ([`CaptureOwner::settle_job`])
+/// with `left` of the capture's deadline: [`LEFT_GRACE`], never past that deadline.
+#[cfg(windows)]
+fn settle_grace(left: Duration) -> Duration {
+    LEFT_GRACE.min(left)
 }
 
 type CaptureChild = CaptureOwner;
@@ -499,7 +608,9 @@ impl Captured {
 
 /// Run one bounded child and hand back its stdout, or the sentence that says
 /// why there is none: a deadline-free `wait_with_output` would hang on a stale
-/// mount or a looping command.
+/// mount or a looping command. The child's environment is cleared but for what the
+/// caller set, `PATH`, `HOME` and `TMPDIR`, and on Windows Windows' own process
+/// variables (`WINDOWS_PASS`), each as this process has it.
 ///
 /// # Errors
 ///
@@ -575,6 +686,14 @@ pub fn capture_bounded_until(
 /// Unix cleanup retains its caller until positive owning reap and reader join, even past the
 /// work deadline. Group signaling is not descendant-quiescence evidence. Other hosts retain
 /// their blocking-reader limitation; they have no new Unix settlement guarantee.
+/// On Windows the child is born suspended in a kill-on-close job of its own
+/// ([`aterm_uds::deadline::spawn_in_job`]), so this process's end, by any means, ends it and
+/// everything it started; every way this call stops waiting while the child runs ends the whole
+/// job; and once the child exits by itself, what it left there is given `LEFT_GRACE` to leave
+/// (never past the budget, and, for [`capture_bounded_owned_watching`], only until its watch
+/// asks for a stop) and is then ended, which also closes any output it held, so the call answers
+/// the exit with what the child printed. A capture on Windows hands its child Windows' own process variables
+/// too (`WINDOWS_PASS`).
 ///
 /// # Errors
 ///
@@ -847,6 +966,12 @@ fn capture_with(
             cmd.env(pass, value);
         }
     }
+    #[cfg(windows)]
+    for pass in WINDOWS_PASS {
+        if let Some(value) = std::env::var_os(pass) {
+            cmd.env(pass, value);
+        }
+    }
     for (name, value) in keep {
         cmd.env(name, value);
     }
@@ -856,8 +981,23 @@ fn capture_with(
     let deadline = Deadline::with_clocks(budget, &Instant::now, &continuous);
     #[cfg(all(test, unix))]
     observed_step(&observer, |o| &o.before_spawn);
+    // On Windows an owned child is born suspended in a kill-on-close job of its own, so it and
+    // everything it starts end with the capture's end, and with this process's.
+    #[cfg(windows)]
+    let (child, job) = if owned {
+        aterm_uds::deadline::spawn_in_job(&mut cmd).map(|(child, job)| (child, Some(job)))
+    } else {
+        cmd.spawn().map(|child| (child, None))
+    }
+    .map_err(|e| format!("it will not run: {e}"))?;
+    #[cfg(not(windows))]
     let child = cmd.spawn().map_err(|e| format!("it will not run: {e}"))?;
     let mut child = CaptureOwner::new(child, observer.clone());
+    #[cfg(windows)]
+    {
+        child.job = job;
+        child.settle_by = Instant::now().checked_add(deadline.remaining().unwrap_or_default());
+    }
     #[cfg(unix)]
     if owned {
         child.watch_owned();
@@ -1006,15 +1146,34 @@ fn capture_with(
         }
     };
     // A watched capture asks its watch again each REAP_CHECK while the child's output is open,
-    // as on Unix: an opener's recorded failure or a code to type ends that wait.
+    // as on Unix: an opener's recorded failure or a code to type ends that wait. An owned one
+    // on Windows looks at its child's exit as often.
     #[cfg(not(unix))]
     let waited = loop {
         let remaining = deadline.remaining().unwrap_or_default();
-        if watch.is_none() {
+        if watch.is_none() && !(owned && cfg!(windows)) {
             break rx.recv_timeout(remaining);
         }
         match rx.recv_timeout(remaining.min(REAP_CHECK)) {
             Err(mpsc::RecvTimeoutError::Timeout) if !remaining.is_zero() => {
+                // An owned child's own exit is its end, as on Unix, even while something it left
+                // holds its output: what it left in its job is given its grace to leave and then
+                // ended, which closes that output, so the reader answers what the child printed.
+                #[cfg(windows)]
+                if owned && !matches!(child.child.try_wait(), Ok(None)) {
+                    // The exit stands as the answer: a stop the watch asks for meanwhile (a
+                    // cancelled scope) only ends the grace of what the child left.
+                    child.settle_job(deadline.remaining().unwrap_or_default(), |exited| {
+                        !matches!(
+                            check_capture_watch(&mut watch, exited, deadline, &observer),
+                            Ok(false)
+                        )
+                    });
+                    break rx.recv_timeout(deadline.remaining().unwrap_or_default());
+                }
+                if watch.is_none() {
+                    continue;
+                }
                 let checked =
                     check_capture_watch(&mut watch, &mut child.child, deadline, &observer);
                 if !matches!(checked, Ok(false)) {

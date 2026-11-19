@@ -20,7 +20,7 @@ use super::{Paths, fsx};
 use crate::age::Identity;
 use crate::{
     Error, SecretBytes,
-    membership_log::{MAX_RECORDS_STREAM, RecordBudgets, Store, head},
+    membership_log::{RecordBudgets, Store, head},
 };
 use std::{
     collections::VecDeque,
@@ -179,8 +179,13 @@ impl Cache {
         entries
             .iter()
             .filter(|entry| {
+                // A rewritten file of a rooted log begins with its frame
+                // ([`Store::file_lead`]), which the records follow.
                 entry.stamps.contains(&Some(stamp))
-                    && u64::try_from(entry.store.encoded_len()).ok() == Some(stamp.len)
+                    && u64::try_from(entry.store.encoded_len())
+                        .ok()
+                        .and_then(|records| records.checked_add(entry.store.file_lead()))
+                        == Some(stamp.len)
             })
             .find_map(|entry| store.extends(&entry.store))
     }
@@ -282,7 +287,7 @@ impl Cache {
         after_observation: impl FnOnce(),
         opened: &mut Option<(std::path::PathBuf, fsx::FileStamp)>,
     ) -> crate::Result<Store> {
-        let selected = crate::records_storage::selected(&paths.records_file())?;
+        let selected = select(paths, store.reading())?;
         let began = fsx::read_began();
         let Some(mut reader) = fsx::open_owned_reader(selected.path())? else {
             selected.confirm()?;
@@ -293,11 +298,15 @@ impl Cache {
         let keys = store.keys().map(<[[u8; 32]]>::to_vec);
         let network = store.pinned_network();
         let budgets = store.budgets();
+        // The format the store reads at is part of its context: the same bytes recover to
+        // other records at another (a version-2 record is read only at format 2).
+        let reading = store.reading();
         let same_context = |entry: &Entry| {
             entry.vault == vault
                 && entry.keys == keys
                 && entry.network == network
                 && entry.budgets == budgets
+                && entry.store.reading() == reading
         };
         // A recovered store roots another genesis under different admitted
         // keys, and keeps other records under other budgets. Reuse only under
@@ -340,7 +349,7 @@ impl Cache {
         #[cfg(test)]
         self.observations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let observed = observe(&mut reader)?;
+        let observed = observe(&mut reader, store.capacity())?;
         reader.check_unchanged()?;
         after_observation();
         if let Observed::Small(bytes) = &observed
@@ -375,17 +384,18 @@ impl Cache {
             return Ok(query.publication.snapshot(entry.store.clone()));
         }
         let (mut store, bytes) = match observed {
-            Observed::Small(bytes) => (store.recovering(bytes.as_slice()), Some(bytes)),
+            Observed::Small(bytes) => (recovered(store, bytes.as_slice())?, Some(bytes)),
             Observed::Large(_) => {
                 reader
                     .file()
                     .seek(SeekFrom::Start(0))
                     .map_err(|e| Error::new(format!("membership record seek failed: {e}")))?;
-                let recovered = recover_observation(
-                    store,
-                    reader.file().take(MAX_RECORDS_STREAM as u64),
-                    digest,
-                )?;
+                let capacity = store.capacity() as u64;
+                let recovered = if reading.admits_two() {
+                    recover_stored_observation(store, reader.file().take(capacity), digest)?
+                } else {
+                    recover_observation(store, reader.file().take(capacity), digest)?
+                };
                 #[cfg(test)]
                 self.hashes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -433,6 +443,7 @@ impl Cache {
                 && entry.keys == keys
                 && entry.network == network
                 && entry.budgets == budgets
+                && entry.store.reading() == store.reading()
                 && entry.digest == digest
         };
         // The context keys and the cloned store each retain a lineage vector. Even an
@@ -514,6 +525,55 @@ enum Observed {
     Large([u8; 32]),
 }
 
+/// The data file a read selects for a store that reads at `reading`: a reader of format 2
+/// takes a rewritten layout (`records_storage::rewrite::selected`), which every other reader
+/// refuses ([`crate::records_storage::selected`]). A store reads format 2 only once its Mac's
+/// format mark names it on a build that reads it (`crate::membership_log::follow::reading`).
+fn select(
+    paths: &Paths,
+    reading: crate::membership_log::Reading,
+) -> crate::Result<crate::records_storage::Selected> {
+    #[cfg(unix)]
+    if reading.admits_two() {
+        return crate::records_storage::rewrite::selected(&paths.records_file());
+    }
+    let _ = reading;
+    crate::records_storage::selected(&paths.records_file())
+}
+
+/// `store` recovered from a records file's `bytes`: a store that reads format 2 reads a
+/// rewritten file's frame ahead of its records ([`Store::recovering_stored`]), and a file
+/// with none as every store reads it ([`Store::recovering`]).
+///
+/// # Errors
+/// The file begins with a frame that does not read ([`Store::recovering_stored`]).
+fn recovered(store: Store, bytes: &[u8]) -> crate::Result<Store> {
+    if store.reading().admits_two() {
+        store.recovering_stored(bytes)
+    } else {
+        Ok(store.recovering(bytes))
+    }
+}
+
+/// [`recover_observation`] for a store that reads format 2: a rewritten file's frame is read
+/// whole before its records place ([`Store::recovering_stored`]), so the file's bytes are held
+/// while it is read, within the capacity `input` is cut to.
+fn recover_stored_observation(
+    store: Store,
+    input: impl Read,
+    expected: [u8; 32],
+) -> crate::Result<Store> {
+    let mut input = Hashed::new(input);
+    let mut bytes = Zeroizing::new(Vec::new());
+    input
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::new(format!("membership record read failed: {e}")))?;
+    if input.finish() != expected {
+        return Err(Error::new("membership records changed between reads"));
+    }
+    store.recovering_stored(&bytes)
+}
+
 fn recover_observation(store: Store, input: impl Read, expected: [u8; 32]) -> crate::Result<Store> {
     let mut input = Hashed::new(input);
     let recovered = store.recovering_read(&mut input)?;
@@ -523,12 +583,15 @@ fn recover_observation(store: Store, input: impl Read, expected: [u8; 32]) -> cr
     Ok(recovered)
 }
 
-fn observe(reader: &mut fsx::OwnedReader) -> crate::Result<Observed> {
+/// What the records file `reader` is open on holds, within the first `capacity` bytes of it:
+/// what a store of its reader's format holds ([`Store::capacity`], the storage class of byte
+/// bound), past which no reader of it reads.
+fn observe(reader: &mut fsx::OwnedReader, capacity: usize) -> crate::Result<Observed> {
     let mut small = (reader.len() <= MAX_INPUT_BYTES as u64)
         .then(|| Zeroizing::new(Vec::with_capacity(reader.len() as usize + 1)));
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buffer = Zeroizing::new([0; 16 * 1024]);
-    let mut input = reader.file().take(MAX_RECORDS_STREAM as u64);
+    let mut input = reader.file().take(capacity as u64);
     loop {
         let n = match input.read(&mut *buffer) {
             Ok(0) => break,

@@ -1673,6 +1673,7 @@ mod commons {
             let command = Command::Write {
                 request: crate::crypto::random()?,
                 changes,
+                said: None,
             };
             application::append(session, store, &command.encode()?).map(drop)
         })

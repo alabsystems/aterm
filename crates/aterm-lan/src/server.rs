@@ -8,8 +8,8 @@ use std::net::IpAddr;
 use std::os::fd::AsFd as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_keeper::identity::CheckError;
@@ -19,6 +19,7 @@ use aterm_uds::lan::{ConnectOptions, UdpOptions, here};
 
 use crate::bonjour::{self, Bonjour};
 use crate::counts::{Count, Counts, Sink};
+use crate::store::Store;
 
 /// The most connections served at once: one more is told the broker is busy
 /// ([`Frame::Unchecked`]) and closed.
@@ -50,9 +51,17 @@ pub struct Opts {
     pub socket: PathBuf,
 }
 
-/// One line to the broker's bounded log on launchd's existing stderr inode.
+/// One line to the broker's log, dated: launchd's job log, kept bounded ([`keep_log`]).
 pub(crate) fn log(line: std::fmt::Arguments<'_>) {
-    crate::log::line(line);
+    aterm_uds::job_log::line(format_args!("aterm-lan: {line}"));
+}
+
+/// Keep the broker's log bounded where this process's standard output or error is it
+/// ([`aterm_uds::job_log::keep`]): [`aterm_uds::lan::LOG_PATH`], the file its plist names for
+/// both ([`aterm_uds::lan::install::plist_text`]). `aterm lan serve` calls it first and hands
+/// what it kept to [`serve`], which takes nothing else in its place.
+pub fn keep_log() -> aterm_uds::job_log::Kept {
+    aterm_uds::job_log::keep(&[Path::new(aterm_uds::lan::LOG_PATH)])
 }
 
 /// Who a connection must be to be served.
@@ -92,24 +101,25 @@ pub(crate) struct Scripted {
 /// The one path every admission by code takes: the full check `check` of the process `token`
 /// names, counted where it is called ([`Count::ChecksRun`]: a call, whether or not a check then
 /// starts), and as it returns the requesting process counted by its token with what the check
-/// said of it.
+/// said of it. An admission answers the token it checked.
 fn full_check(
     counts: &Counts,
     token: Option<aterm_uds::peer::AuditToken>,
     check: impl FnOnce(Option<aterm_uds::peer::AuditToken>) -> Result<(), CheckError>,
-) -> Result<(), CheckError> {
+) -> Result<Option<aterm_uds::peer::AuditToken>, CheckError> {
     counts.add(Count::ChecksRun);
     let verdict = check(token);
     counts.requester(token, verdict.is_ok());
-    verdict
+    verdict.map(|()| token)
 }
 
 /// Resolve this image once. Only the canonical team branch supplies an update
-/// checker; an ad-hoc designated peer requirement grants no adoption policy.
+/// checker and the askers it adopts from; an ad-hoc designated peer requirement grants no
+/// adoption policy.
 struct ImageAdmission {
     peers: Admission,
     #[cfg(target_os = "macos")]
-    updates: Option<Arc<aterm_keeper::identity::Identity>>,
+    updates: Option<crate::adopt::Updates>,
 }
 
 impl Admission {
@@ -136,7 +146,10 @@ impl Admission {
             let identity = Arc::new(identity.regardless_of_uid());
             Ok(ImageAdmission {
                 peers: Self::Code(Arc::clone(&identity)),
-                updates: team.then_some(identity),
+                updates: team.then(|| crate::adopt::Updates {
+                    checker: identity,
+                    askers: Arc::default(),
+                }),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -148,12 +161,17 @@ impl Admission {
         }
     }
 
-    /// Whether the peer on `stream` is admitted: a refusal of its uid or code, or a check that
+    /// Whether the peer on `stream` is admitted, and by the audit token its code was checked
+    /// under (`None` for one admitted by uid): a refusal of its uid or code, or a check that
     /// could not run or finish, which judged nothing.
-    fn check(&self, stream: &CtlStream, counts: &Counts) -> Result<(), CheckError> {
+    fn check(
+        &self,
+        stream: &CtlStream,
+        counts: &Counts,
+    ) -> Result<Option<aterm_uds::peer::AuditToken>, CheckError> {
         match self {
             Self::SameUid => match aterm_uds::peer::peer_uid(stream) {
-                Some(uid) if uid == aterm_uds::peer::our_uid() => Ok(()),
+                Some(uid) if uid == aterm_uds::peer::our_uid() => Ok(None),
                 Some(uid) => Err(CheckError::Refused(format!("peer uid {uid} is not ours"))),
                 None => Err(CheckError::Unchecked(
                     "the kernel did not name the peer's uid".to_owned(),
@@ -218,8 +236,8 @@ pub(crate) fn team_requirement(team: &str) -> io::Result<String> {
 /// # Errors
 /// Not root (outside a test binary), off macOS, the socket's folder or the socket that cannot be
 /// made, or the admission requirement that cannot be read. Failures are reported through the
-/// broker's bounded log.
-pub fn serve(opts: Opts) -> io::Result<()> {
+/// broker's log, kept bounded by what its start kept (`kept`, from [`keep_log`]).
+pub fn serve(opts: Opts, _kept: aterm_uds::job_log::Kept) -> io::Result<()> {
     serve_inner(opts).inspect_err(|error| log(format_args!("serve: {error}")))
 }
 
@@ -231,7 +249,17 @@ fn serve_inner(opts: Opts) -> io::Result<()> {
         ));
     }
     let admission = Admission::of_this_image()?;
-    let server = Server::bind(&opts.socket, admission.peers, bonjour::system())?;
+    #[cfg(target_os = "macos")]
+    let askers = (admission.updates.as_ref()).map(|updates| Arc::clone(&updates.askers));
+    #[cfg(not(target_os = "macos"))]
+    let askers = None;
+    let server = Server::bind(
+        &opts.socket,
+        admission.peers,
+        askers,
+        bonjour::system(),
+        Store::system(),
+    )?;
     log(format_args!(
         "serving {} (protocol {}, build {}), source {}",
         opts.socket.display(),
@@ -239,6 +267,17 @@ fn serve_inner(opts: Opts) -> io::Result<()> {
         aterm_uds::lan::hello_build(),
         opts.source.display()
     ));
+    // Once the installed image has served a peer it admitted, root's record of its install
+    // failing is over; a bind alone proves nothing, as a broker can die before any hello.
+    #[cfg(target_os = "macos")]
+    if let Ok(own) = std::env::current_exe()
+        && own == Path::new(aterm_uds::lan::IMAGE_EXECUTABLE)
+    {
+        let source = opts.source.clone();
+        server.shared.after_first_hello(Box::new(move || {
+            crate::install_refused::serving(&source, &own);
+        }));
+    }
     #[cfg(target_os = "macos")]
     crate::adopt::watch(opts.source, admission.updates)?;
     server.run()
@@ -256,9 +295,22 @@ pub(crate) struct Server {
     pub(crate) sink: Sink,
 }
 
+/// What the kernel says of the process an audit token names: the cdhash of the code it loaded and
+/// its executable's path ([`aterm_uds::process::read_loaded_code_of`]).
+pub(crate) type Loaded = fn(&aterm_uds::peer::AuditToken) -> Option<([u8; 20], PathBuf)>;
+
 pub(crate) struct Shared {
     admission: Admission,
     bonjour: Box<dyn Bonjour>,
+    /// Who answers a request for Spotlight's stores: the broker's walker, or no one on the
+    /// direct path.
+    store: Store,
+    /// Where an admitted process's ask to consider its bundle is kept (`crate::askers`): the
+    /// running image's, which adopts from it; `None` for a broker that adopts nothing (an ad-hoc
+    /// image, a test binary's) and for the direct path, which keeps no ask.
+    pub(crate) askers: Option<Arc<crate::askers::Askers>>,
+    /// How an asker's loaded code is read.
+    pub(crate) loaded: Loaded,
     /// Where a connection's lines go: the broker's [`log`], or nowhere when the one client is
     /// this process (the direct path), which hears each failure itself as a frame.
     log: fn(std::fmt::Arguments<'_>),
@@ -269,6 +321,9 @@ pub(crate) struct Shared {
     /// What this server counts of its connections ([`crate::counts`]). Only a served socket's
     /// accept loop writes them to a file; the direct path's are counted and read by nobody.
     pub(crate) counts: Counts,
+    /// What runs once the first admitted peer says this protocol's hello
+    /// ([`Self::after_first_hello`]); taken when it runs.
+    first_hello: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The test seam the server was bound under, carried into each connection's thread.
     #[cfg(any(test, debug_assertions))]
     seam: aterm_uds::lan::Seam,
@@ -279,18 +334,58 @@ impl Shared {
     pub(crate) fn new(
         admission: Admission,
         bonjour: Box<dyn Bonjour>,
+        store: Store,
         log: fn(std::fmt::Arguments<'_>),
     ) -> Self {
         Self {
             admission,
             bonjour,
+            store,
+            askers: None,
+            loaded: aterm_uds::process::read_loaded_code_of,
             log,
             peers: crate::peers::Peers::default(),
             clock: Instant::now,
             live: AtomicUsize::new(0),
             counts: Counts::new(),
+            first_hello: Mutex::new(None),
             #[cfg(any(test, debug_assertions))]
             seam: aterm_uds::lan::seam(),
+        }
+    }
+
+    /// Run `then` once, the first time a peer this server admitted says this protocol's hello:
+    /// what only a broker that has served may do (`crate::install_refused`). A bind proves no
+    /// serving (a broker can bind and die before any hello), and neither does a peer refused
+    /// admission or one that speaks another protocol. `then` runs on a thread of its own, off
+    /// the connection's path; where that thread cannot start, that is logged and `then` does not
+    /// run in this process. Only the macOS broker has such work.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn after_first_hello(&self, then: Box<dyn FnOnce() + Send>) {
+        *self
+            .first_hello
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(then);
+    }
+
+    /// An admitted peer said this protocol's hello: run what waited for one
+    /// ([`Self::after_first_hello`]), the first time only.
+    fn said_hello(&self) {
+        let Some(then) = self
+            .first_hello
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        if let Err(error) = std::thread::Builder::new()
+            .name("lan-served".into())
+            .spawn(then)
+        {
+            (self.log)(format_args!(
+                "served; could not start reading the record of its install: {error}"
+            ));
         }
     }
 }
@@ -366,18 +461,24 @@ pub(crate) fn prepare_at(socket: &Path, started: Instant) -> io::Result<()> {
 
 impl Server {
     /// Bind `socket` (its folder made, a stale socket cleared, mode 0666: clients are admitted by
-    /// code, not by the socket's mode).
+    /// code, not by the socket's mode), its admitted askers kept in `askers`
+    /// ([`Shared::askers`]).
     pub(crate) fn bind(
         socket: &Path,
         admission: Admission,
+        askers: Option<Arc<crate::askers::Askers>>,
         bonjour: Box<dyn Bonjour>,
+        store: Store,
     ) -> io::Result<Self> {
         prepare(socket)?;
         let listener = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(socket))?;
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
         Ok(Self {
             listener,
-            shared: Arc::new(Shared::new(admission, bonjour, log)),
+            shared: Arc::new(Shared {
+                askers,
+                ..Shared::new(admission, bonjour, store, log)
+            }),
             sink: Sink::beside(socket),
         })
     }
@@ -503,16 +604,19 @@ fn served(
     spent: &mut dyn FnMut(),
 ) -> Count {
     let pid = aterm_uds::fdpass::peer_pid(stream).unwrap_or(0);
-    if let Err(why) = shared.admission.check(stream, &shared.counts) {
-        let (judged, ended) = match why {
-            CheckError::Refused(_) => ("refused", Count::Refused),
-            CheckError::Unchecked(_) => ("could not check", Count::Unchecked),
-            CheckError::Unanswered(_) => ("could not check", Count::Unanswered),
-        };
-        (shared.log)(format_args!("{judged} pid {pid}: {why}"));
-        let _ = wire::send(stream, &not_admitted(why));
-        return ended;
-    }
+    let token = match shared.admission.check(stream, &shared.counts) {
+        Ok(token) => token,
+        Err(why) => {
+            let (judged, ended) = match why {
+                CheckError::Refused(_) => ("refused", Count::Refused),
+                CheckError::Unchecked(_) => ("could not check", Count::Unchecked),
+                CheckError::Unanswered(_) => ("could not check", Count::Unanswered),
+            };
+            (shared.log)(format_args!("{judged} pid {pid}: {why}"));
+            let _ = wire::send(stream, &not_admitted(why));
+            return ended;
+        }
+    };
     shared.counts.add(Count::Admitted);
     let hello = Frame::Hello {
         protocol: aterm_uds::lan::PROTOCOL,
@@ -524,12 +628,24 @@ fn served(
     let mut reader = Reader::new(0);
     let deadline = Some(started() + REQUEST_HANG);
     match reader.frame(stream, deadline) {
-        Ok(Some(Frame::Hello { protocol, .. })) if protocol == aterm_uds::lan::PROTOCOL => {}
+        Ok(Some(Frame::Hello { protocol, .. })) if protocol == aterm_uds::lan::PROTOCOL => {
+            shared.said_hello();
+        }
         Ok(Some(Frame::Hello { protocol, build })) => {
             (shared.log)(format_args!(
                 "pid {pid} speaks protocol {protocol} (build {build}), this broker {}",
                 aterm_uds::lan::PROTOCOL
             ));
+            // A build of another protocol is served nothing, but its ask to be considered is
+            // kept: `Consider` carries no fields and keeps its tag, 18, in every protocol that has
+            // it, and this broker adopting a newer build is how that build's protocol comes to be
+            // served. One more frame is read, by the same deadline and within the reader's frame
+            // bound; anything but that ask (a tag-17 frame is `SpotlightStore`, never an ask) is
+            // not read further.
+            if let Ok(Some(Frame::Request(Request::Consider))) = reader.frame(stream, deadline) {
+                shared.counts.add(Count::Considered);
+                considered(shared, stream, token);
+            }
             return Count::WrongProtocol;
         }
         Ok(None) => return Count::ClosedUnsaid,
@@ -567,7 +683,13 @@ fn served(
         Request::ResolveService { .. } => Count::ResolveService,
         Request::Query { .. } => Count::Query,
         Request::Register(_) => Count::Register,
+        Request::SpotlightStore => Count::SpotlightStore,
+        Request::Consider => Count::Considered,
     });
+    if let Request::Consider = request {
+        considered(shared, stream, token);
+        return Count::Answered;
+    }
     let connecting = matches!(&request, Request::Connect { .. });
     match answer(shared, stream, request, spent) {
         Ok(()) => Count::Answered,
@@ -580,6 +702,29 @@ fn served(
             let _ = wire::send(stream, &Frame::Error { code, words });
             Count::Failed
         }
+    }
+}
+
+/// Keep the admitted process on `stream`, whose code was checked under `token`, as an asker
+/// ([`crate::askers::Askers::asked`]): its uid, and the cdhash of the code the kernel loaded for
+/// it and its executable's path, both read by that token, so a pid reused or an exec since the
+/// check reads nothing and nothing is kept. Nothing of its bundle is read here, on a connection's
+/// thread: the adoption loop reads it (`crate::adopt`). Answers nothing: the connection closes.
+fn considered(shared: &Shared, stream: &CtlStream, token: Option<aterm_uds::peer::AuditToken>) {
+    let (Some(askers), Some(token)) = (&shared.askers, token) else {
+        return;
+    };
+    let (Some(uid), Some((cdhash, exe))) =
+        (aterm_uds::peer::peer_uid(stream), (shared.loaded)(&token))
+    else {
+        return;
+    };
+    if askers.asked(uid, cdhash, &exe) {
+        (shared.log)(format_args!(
+            "uid {uid} asked it to consider {} (pid {})",
+            exe.display(),
+            token.pid()
+        ));
     }
 }
 
@@ -723,6 +868,10 @@ fn answer(
                 }
             }
             wire::send(stream, &Frame::Addresses(addrs)).map_err(|e| failure(&e))
+        }
+        Request::SpotlightStore => {
+            let stores = shared.store.answer(&shared.counts)?;
+            wire::send(stream, &Frame::SpotlightStores(stores)).map_err(|e| failure(&e))
         }
         bonjour_request => {
             let mut live = shared.bonjour.start(&bonjour_request)?;

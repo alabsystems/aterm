@@ -174,6 +174,96 @@ fn reader_context_ignores_product_version_but_binds_configuration_and_environmen
 }
 
 #[test]
+fn source_reader_items_follow_pinned_policy_bytes_and_full_records_follow_the_commit() {
+    let source = aterm_tempfile::tempdir().unwrap();
+    let policy = aterm_tempfile::tempdir().unwrap();
+    let root = source.path();
+    let repo = policy.path();
+    for dir in [root, repo] {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Fixture"]);
+        git(dir, &["config", "user.email", "fixture@example.invalid"]);
+    }
+    git(root, &["commit", "--allow-empty", "-qm", "source base"]);
+    let base = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join("source.txt"), "source\n").unwrap();
+    git(root, &["add", "source.txt"]);
+    git(root, &["commit", "-qm", "unreceipted source"]);
+    let tip = git(root, &["rev-parse", "HEAD"]);
+    let command = |engine: &EngineInput| {
+        let mut command = Command::new("fixture-verifier");
+        engine.apply(&mut command);
+        command.current_dir(root);
+        command
+    };
+    let reader = |engine: &EngineInput| context(root, engine, "tools", &command(engine)).unwrap();
+    let judgment = |engine: &EngineInput| {
+        identity(
+            &crate::ledger::GitCli::new(root),
+            root,
+            engine,
+            &tip,
+            &base,
+            "tools",
+            &command(engine),
+        )
+        .unwrap()
+    };
+    let baseline = repo.join(aterm_census::export_scan::rows::BASELINE);
+    let registry = repo.join(aterm_verify::export_scan::REGISTRY);
+    for path in [&baseline, &registry] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "original\n").unwrap();
+    }
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "pinned policy"]);
+    let first = selected_engine(repo);
+    let items = reader(&first);
+    let mut ctx = aterm_verify::Ctx::new(
+        root.to_owned(),
+        aterm_verify::Scope::workspace(),
+        aterm_verify::EnvSnapshot::default(),
+        root.join("scratch"),
+    );
+    ctx.carry_context = Some(items.clone());
+    let receipt = aterm_verify::input_content::Proof::new(
+        &ctx,
+        "export-scan",
+        "source selection",
+        vec![aterm_census::inputs::file(root, "source.txt").unwrap()],
+    )
+    .unwrap();
+    ctx.input_items.push(receipt.clone());
+    std::fs::write(repo.join("plan.md"), "new plan\n").unwrap();
+    git(repo, &["add", "plan.md"]);
+    git(repo, &["commit", "-qm", "plan update"]);
+    let after = selected_engine(repo);
+    let after_plan = reader(&after);
+    assert_eq!(items, after_plan);
+    assert_ne!(judgment(&first), judgment(&after));
+    ctx.carry_context = Some(after_plan);
+    assert!(aterm_verify::input_content::exact(&ctx, &receipt));
+    for path in [&baseline, &registry] {
+        std::fs::write(path, "revised\n").unwrap();
+        git(repo, &["commit", "-qam", "revise policy input"]);
+        ctx.carry_context = Some(reader(&selected_engine(repo)));
+        assert!(!aterm_verify::input_content::exact(&ctx, &receipt));
+        std::fs::write(path, "original\n").unwrap();
+        git(repo, &["commit", "-qam", "restore policy input"]);
+    }
+    std::fs::remove_file(&registry).unwrap();
+    git(repo, &["commit", "-qam", "incomplete policy"]);
+    let missing = reader(&selected_engine(repo));
+    assert_ne!(items, missing);
+    git(
+        repo,
+        &["commit", "--allow-empty", "-qm", "still incomplete"],
+    );
+    assert_ne!(missing, reader(&selected_engine(repo)));
+    assert_eq!(reader(&first), items);
+}
+
+#[test]
 fn one_writer_per_input_key_without_blocking_other_keys() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let other = dir.path().join("other-key");

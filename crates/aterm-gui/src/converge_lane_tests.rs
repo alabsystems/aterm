@@ -4,16 +4,21 @@
 use super::*;
 
 #[cfg(unix)]
+fn maintenance_request() -> RepositoryRequest {
+    RepositoryRequest::Refresh(RefreshRequest::ensure(None, RefreshVersion::default()))
+}
+
+#[cfg(unix)]
 #[test]
 fn a_standing_row_waits_on_inputs_and_never_starts_for_a_timer() {
     use aterm_secrets::converge::{MarkMoved, RepositoryWork};
     let calls = std::cell::Cell::new(0);
     let mut waits = Vec::new();
     let mut wakes = [
-        Some(LaneWake::Network(crate::network_moved::Woke::Timer)),
-        Some(LaneWake::Network(crate::network_moved::Woke::Timer)),
+        Some(LaneWake::Timer),
+        Some(LaneWake::Timer),
         Some(LaneWake::Inputs(
-            RepositoryWork::Repair,
+            RepositoryRequest::Repair,
             MarkMoved::default(),
             1,
         )),
@@ -50,7 +55,8 @@ fn lane_plain(
 ) {
     let clock = std::time::Instant::now();
     lane(
-        &mut |trigger, work, _| pass(trigger, work),
+        maintenance_request(),
+        &mut |trigger, request, _| pass(trigger, request.work()),
         log,
         wait,
         &mut || u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -69,7 +75,7 @@ fn lane_plain(
 fn each_window_pass_is_started_under_a_note_of_its_causes() {
     use crate::network_moved::Woke;
     use aterm_secrets::converge::MarkMoved;
-    use aterm_secrets::converge::RepositoryWork::Repair;
+    use aterm_secrets::converge::RepositoryRequest::Repair;
     let mut ends = [
         Ended::Ran,
         Ended::Failed(Some(1)),
@@ -82,17 +88,18 @@ fn each_window_pass_is_started_under_a_note_of_its_causes() {
     ]
     .into_iter();
     let mut wakes = [
-        LaneWake::Network(Woke::Timer),
-        LaneWake::Network(Woke::Timer),
-        LaneWake::Network(Woke::Timer),
+        LaneWake::Timer,
+        LaneWake::Timer,
+        LaneWake::Timer,
         LaneWake::Inputs(Repair, MarkMoved::default(), 0),
-        LaneWake::Network(Woke::Route),
+        LaneWake::Network(Woke::Route, RefreshVersion::default()),
         LaneWake::Inputs(Repair, MarkMoved::CONFIG, 2),
-        LaneWake::Network(Woke::Timer),
+        LaneWake::Timer,
     ]
     .into_iter();
     let mut notes = Vec::new();
     lane(
+        maintenance_request(),
         &mut |_, _, note| {
             notes.push(note.word());
             ends.next().expect("a scripted pass")
@@ -128,18 +135,22 @@ fn each_window_pass_is_started_under_a_note_of_its_causes() {
 #[cfg(unix)]
 #[test]
 fn the_window_pass_starts_its_runner_under_its_note() {
-    use aterm_secrets::converge::{Causes, MarkMoved, RepositoryWork, START_NOTE_ENV, StartNote};
+    use aterm_secrets::converge::{
+        Causes, MarkMoved, RefreshRequest, RefreshScope, RefreshVersion, START_NOTE_ENV, StartNote,
+    };
     use std::os::unix::fs::PermissionsExt as _;
     let dir = aterm_tempfile::tempdir().unwrap();
     let said = dir.path().join("said");
+    let argv = dir.path().join("request");
     let runner = dir.path().join("runner");
     let sh = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sh"));
     std::fs::write(
         &runner,
         format!(
-            "#!{}\nprintf '%s' \"${START_NOTE_ENV}\" > '{}'\nexit 0\n",
+            "#!{}\nprintf '%s' \"${START_NOTE_ENV}\" > '{}'\nprintf '%s\\n%s' \"$5\" \"$6\" > '{}'\nexit 0\n",
             sh.display(),
-            said.display()
+            said.display(),
+            argv.display(),
         ),
     )
     .unwrap();
@@ -149,15 +160,26 @@ fn the_window_pass_starts_its_runner_under_its_note() {
         moved: MarkMoved::INDEX,
         moves: 1,
     };
-    let ended = window_pass(&runner)(
-        aterm_secrets::converge::WINDOW,
-        RepositoryWork::Refresh,
-        &note,
-    );
+    let request = RepositoryRequest::Refresh(RefreshRequest::inputs(
+        RefreshScope::new([42; 32]),
+        RefreshVersion {
+            input: 8,
+            attempt: 9,
+            fulfilled: 7,
+        },
+    ));
+    let ended = window_pass(&runner)(aterm_secrets::converge::WINDOW, request, &note);
     assert_eq!(ended, Ended::Ran);
     assert_eq!(
         std::fs::read_to_string(&said).unwrap(),
         "c=input-repair,m=index,n=1"
+    );
+    let args = std::fs::read_to_string(argv).unwrap();
+    let (flag, payload) = args.split_once('\n').unwrap();
+    assert_eq!(flag, "--repository-request");
+    assert_eq!(
+        aterm_json::from_str::<RepositoryRequest>(payload).unwrap(),
+        request
     );
     for (status, expected) in [
         (1, Ended::Failed(Some(129))),
@@ -169,7 +191,7 @@ fn the_window_pass_starts_its_runner_under_its_note() {
         assert_eq!(
             window_pass(&runner)(
                 aterm_secrets::converge::WINDOW,
-                RepositoryWork::Refresh,
+                maintenance_request(),
                 &note,
             ),
             expected,
@@ -228,6 +250,7 @@ fn a_window_pass_meeting_a_held_lock_waits_for_it_and_runs_once_it_is_let_go() {
             let mut ends = Vec::new();
             let mut waits = Vec::new();
             lane(
+                maintenance_request(),
                 &mut |trigger, work, note| {
                     let ended = pass(&runner, trigger, work, note);
                     ends.push(ended.clone());
@@ -270,29 +293,89 @@ fn a_window_pass_meeting_a_held_lock_waits_for_it_and_runs_once_it_is_let_go() {
 /// returns an input look's work with the classes and the number of looks its snapshot took
 /// (`aterm_secrets::client::ConvergenceInputs::with_moved`), which the lane puts in the next
 /// pass's note.
-/// NEGATIVE CONTROL: an `until_moved` that drops them returns `Inputs(Repair, MarkMoved(0), 0)`
-/// where `Inputs(Repair, MarkMoved(36), 2)` is wanted.
+/// A source transition during a failed route refresh keeps both boundaries through retry.
 #[cfg(unix)]
 #[test]
 fn an_input_wake_carries_what_moved_the_inputs_mark() {
     use aterm_secrets::client::{ConvergenceInputs, ConvergenceWake};
-    use aterm_secrets::converge::{MarkMoved, RepositoryRequest, RepositoryWork};
+    use aterm_secrets::converge::{MarkMoved, RefreshRequest, RefreshScope, RefreshVersion};
     let both = MarkMoved::CONFIG.with(MarkMoved::INDEX);
-    let mut inputs = ConvergenceInputs::new(Box::new(|_| Some(RepositoryRequest::Repair)))
+    let input = RefreshRequest::inputs(
+        RefreshScope::new([9; 32]),
+        RefreshVersion {
+            input: 3,
+            attempt: 4,
+            fulfilled: 2,
+        },
+    );
+    let request = RepositoryRequest::Refresh(input);
+    let mut inputs = ConvergenceInputs::new(Box::new(move |_| Some(request)))
         .with_moved(Box::new(move || (both, 2)));
     let moved = std::sync::Arc::new(crate::network_moved::Moved::new());
     let mut network = moved.watch();
     let mut wake = ConvergenceWake::default();
     // An input event since the wake was made: the wait looks at once.
     ConvergenceInputs::identity_changed();
+    let observed = until_moved(
+        &mut network,
+        &mut wake,
+        &mut inputs,
+        Some(std::time::Duration::from_secs(60)),
+    );
+    assert_eq!(observed, Some(LaneWake::Inputs(request, both, 2)));
+    let route_version = RefreshVersion {
+        input: 2,
+        attempt: 7,
+        fulfilled: 6,
+    };
+    let route_request = RepositoryRequest::Refresh(RefreshRequest::after(None, route_version));
+    let combined = RepositoryRequest::Refresh(RefreshRequest {
+        after_attempt: Some(7),
+        ..input
+    });
+    let mut wakes = [
+        Some(LaneWake::Network(
+            crate::network_moved::Woke::Route,
+            route_version,
+        )),
+        observed,
+        Some(LaneWake::Timer),
+        Some(LaneWake::Inputs(
+            RepositoryRequest::Repair,
+            MarkMoved::INDEX,
+            1,
+        )),
+        None,
+    ]
+    .into_iter();
+    let mut ends = [
+        Ended::Ran,
+        Ended::Failed(Some(1)),
+        Ended::Unfinished,
+        Ended::Unfinished,
+        Ended::Ran,
+    ]
+    .into_iter();
+    let mut jobs = Vec::new();
+    lane(
+        maintenance_request(),
+        &mut |_, work, _| {
+            jobs.push(work);
+            ends.next().unwrap()
+        },
+        &mut |_| {},
+        &mut |_| wakes.next().unwrap(),
+        &mut || 0,
+    );
     assert_eq!(
-        until_moved(
-            &mut network,
-            &mut wake,
-            &mut inputs,
-            Some(std::time::Duration::from_secs(60))
-        ),
-        Some(LaneWake::Inputs(RepositoryWork::Repair, both, 2))
+        jobs,
+        [
+            maintenance_request(),
+            route_request,
+            combined,
+            combined,
+            combined,
+        ]
     );
 }
 
@@ -430,8 +513,7 @@ fn the_lane_runs_at_once_and_retries_before_the_mend_interval() {
             waits.push(every);
             let mut events = events.borrow_mut();
             events.push("wait".to_owned());
-            (events.iter().filter(|event| *event == "wait").count() < 4)
-                .then_some(LaneWake::Network(crate::network_moved::Woke::Timer))
+            (events.iter().filter(|event| *event == "wait").count() < 4).then_some(LaneWake::Timer)
         },
     );
     assert_eq!(
@@ -511,7 +593,7 @@ fn the_lane_runs_at_once_and_retries_before_the_mend_interval() {
             1 | 3 => until_moved(&mut network, &mut wake, &mut inputs, every),
             2 => {
                 retry_wait = every;
-                Some(LaneWake::Network(crate::network_moved::Woke::Timer))
+                Some(LaneWake::Timer)
             }
             _ => None,
         },
@@ -552,7 +634,7 @@ fn the_lane_runs_at_once_and_retries_before_the_mend_interval() {
         &mut |_| {
             waits += 1;
             (waits == 1).then_some(LaneWake::Inputs(
-                RepositoryWork::Repair,
+                RepositoryRequest::Repair,
                 aterm_secrets::converge::MarkMoved::default(),
                 0,
             ))
@@ -590,8 +672,7 @@ fn unfinished_work_retries_quietly_until_its_prerequisite_is_ready() {
             &mut |line| logged.push(line.to_owned()),
             &mut |every| {
                 waits.push(every);
-                (passes.get() < total)
-                    .then_some(LaneWake::Network(crate::network_moved::Woke::Timer))
+                (passes.get() < total).then_some(LaneWake::Timer)
             },
         );
         assert_eq!(waits, expected.into_iter().map(Some).collect::<Vec<_>>());
@@ -649,7 +730,7 @@ fn the_converge_lane_wakes_on_a_route_change_and_says_why() {
     );
     assert_eq!(
         woke.get(),
-        Some(LaneWake::Network(Woke::Route)),
+        Some(LaneWake::Network(Woke::Route, RefreshVersion::default())),
         "{logged:?}"
     );
     assert_eq!(passes.get(), 2);

@@ -104,6 +104,24 @@ pub fn boot_clocks(sys: &dyn System) -> Option<BootClocks> {
     })
 }
 
+/// This boot as root's records of a refused root step spell it
+/// (`aterm_types::macos_setup::refused::boot_word`), from `sysctl -n kern.bootsessionuuid`:
+/// `None` where the run fails or prints anything but one boot id.
+#[must_use]
+pub fn boot_session(sys: &dyn System) -> Option<String> {
+    let ran = sys
+        .run(&Cmd::new("/usr/sbin/sysctl").args(["-n", "kern.bootsessionuuid"]))
+        .ok()
+        .filter(Ran::success)?;
+    let out = ran.out();
+    let session = out.trim();
+    if is_boot_id(session) {
+        aterm_types::macos_setup::refused::boot_word(session)
+    } else {
+        None
+    }
+}
+
 /// Whether `word` has `kern.bootsessionuuid`'s form.
 fn is_boot_id(word: &str) -> bool {
     word.len() == 36

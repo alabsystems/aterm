@@ -20,6 +20,9 @@ use crate::needs;
 #[path = "journal_migration_tests.rs"]
 mod migration;
 
+#[path = "journal_atomic_tests.rs"]
+mod atomic_scopes;
+
 /// The simulated clock's start, as `tests/common.rs` names it.
 const SIM_START: u64 = 1_760_000_000;
 /// The hang detector for a wait that must end (plan §1).
@@ -61,6 +64,7 @@ fn draft(op: WriteOp, key: &str) -> IntentDraft {
         after: None,
         writer: None,
         refs: Vec::new(),
+        atomic_admission: None,
     }
 }
 

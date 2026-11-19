@@ -60,7 +60,7 @@ fn every_drive_kind_has_its_plain_type_or_is_a_service() {
 #[test]
 fn a_poll_is_not_counted_and_a_sessions_read_is() {
     for kind in DriveKind::ALL {
-        for by in [SID, LEGACY] {
+        for by in [SID, "t0123456789"] {
             let asked = counted(kind, Some(by));
             assert_eq!(asked, Plain::of(kind), "{kind:?}: {by}");
             if let Some(row) = Row::of(1, Way::In, (A, None), kind, Some(by), Outcome::Admitted) {
@@ -82,9 +82,14 @@ fn a_poll_is_not_counted_and_a_sessions_read_is() {
             "{kind:?}"
         );
     }
-    // A malformed requester names nobody. Its read is a poll; another request keeps its type
-    // without that attribution. An exact legacy session remains valid requester metadata.
-    for other in ["me", "s-0123456789abcdef012", "s-0123456789ABCDEF0123"] {
+    // A requester outside the current grammar names nobody. Its read is a poll; another
+    // request keeps its type without that attribution, including an exact local legacy ID.
+    for other in [
+        "me",
+        LEGACY,
+        "s-0123456789abcdef012",
+        "s-0123456789ABCDEF0123",
+    ] {
         assert!(
             Row::of(
                 1,
@@ -125,6 +130,85 @@ fn a_poll_is_not_counted_and_a_sessions_read_is() {
 }
 
 #[test]
+fn minted_ids_attribute_and_malformed_ids_do_not_attribute_fleet_activity() {
+    for sid in [SID, "t0123456789"] {
+        assert_eq!(survey_asker(&format!("by={sid}")), Some(sid));
+        let read = Row::of(
+            1,
+            Way::In,
+            (A, None),
+            DriveKind::Read,
+            Some(sid),
+            Outcome::Admitted,
+        )
+        .expect("a minted requester makes the read count");
+        assert_eq!(read.by.as_deref(), Some(sid));
+        assert_eq!(read.what, Plain::Read);
+        assert_eq!(Row::parse(&read.line()), Some(read));
+    }
+    let current = Row::of(
+        1,
+        Way::In,
+        (A, None),
+        DriveKind::Turn,
+        Some(SID),
+        Outcome::Admitted,
+    )
+    .expect("a current requester");
+    assert_eq!(current.by.as_deref(), Some(SID));
+    assert_eq!(Row::parse(&current.line()), Some(current.clone()));
+    let other = Row::of(
+        1,
+        Way::In,
+        (A, None),
+        DriveKind::Turn,
+        Some("t0123456789"),
+        Outcome::Admitted,
+    )
+    .expect("another current requester remains attributed");
+    assert_eq!(other.by.as_deref(), Some("t0123456789"));
+    assert_eq!(other.what, Plain::Typed);
+    assert_eq!(Row::parse(&other.line()), Some(other));
+
+    // An exact legacy ID remains valid locally, but neither it nor a malformed ID
+    // establishes current fleet attribution.
+    for unattributed in [LEGACY, "s-a"] {
+        assert_eq!(survey_asker(&format!("by={unattributed}")), None);
+        assert_eq!(
+            Row::of(
+                1,
+                Way::In,
+                (A, None),
+                DriveKind::Read,
+                Some(unattributed),
+                Outcome::Admitted,
+            ),
+            None,
+            "an unrecognized requester does not turn a poll into a counted read"
+        );
+        let typed = Row::of(
+            1,
+            Way::In,
+            (A, None),
+            DriveKind::Turn,
+            Some(unattributed),
+            Outcome::Admitted,
+        )
+        .expect("the action remains counted without requester attribution");
+        assert_eq!(typed.by, None);
+        assert_eq!(typed.what, Plain::Typed);
+        let line = current
+            .line()
+            .replace(&format!("by={SID}"), &format!("by={unattributed}"));
+        assert_eq!(
+            Row::parse(&line),
+            Some(typed),
+            "a valid row loses only unrecognized attribution"
+        );
+    }
+}
+
+#[test]
 fn a_row_reads_back_from_its_line() {
     let rows = [
         row(1_000, Way::In, A, DriveKind::Turn, Outcome::Admitted),
@@ -159,10 +243,10 @@ fn a_row_reads_back_from_its_line() {
     assert_eq!(
         Row::parse(&legacy),
         Some(Row {
-            by: Some(LEGACY.to_owned()),
+            by: None,
             ..row(1_000, Way::In, A, DriveKind::Turn, Outcome::Admitted)
         }),
-        "an exact legacy requester remains attributed"
+        "an exact local legacy ID loses only fleet attribution"
     );
     // A mesh node's id is its key's principal.
     let mesh = Row::of(
@@ -664,7 +748,7 @@ fn a_survey_line_names_the_session_that_asked() {
         let rest = line.strip_prefix("survey").expect("a survey");
         assert_eq!(survey_asker(rest), None, "{line:?} is a poll");
         assert_eq!(survey_unmarked(line), None);
-        for by in [SID, LEGACY] {
+        for by in [SID, "t0123456789"] {
             let marked = survey_marked(line, by);
             let rest = marked.strip_prefix("survey").expect("a survey");
             assert_eq!(survey_asker(rest), Some(by), "{marked:?}");
@@ -673,10 +757,12 @@ fn a_survey_line_names_the_session_that_asked() {
     }
     assert_eq!(survey_asker("by=me"), None);
     assert_eq!(survey_asker("by="), None);
+    assert_eq!(survey_asker(&format!("by={LEGACY}")), None);
     assert_eq!(survey_asker("by=s-0123456789abcdef012"), None);
     assert_eq!(survey_asker("by=s-0123456789ABCDEF0123"), None);
     // A word that names no session is left for whoever serves the line to refuse.
     assert_eq!(survey_unmarked("survey by=me"), None);
+    assert_eq!(survey_unmarked(&format!("survey by={LEGACY}")), None);
     assert_eq!(survey_unmarked("survey by=s-0123456789abcdef012"), None);
     assert_eq!(survey_unmarked("survey by=s-0123456789ABCDEF0123"), None);
 }

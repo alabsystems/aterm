@@ -790,3 +790,130 @@ fn a_wait_between_the_passs_programs_says_how_far_the_pass_is() {
         assert!(line.chars().count() + 2 <= 80, "{line}");
     }
 }
+
+/// Set, the test binary is [`standin_opens_fresh_lock_files`] in the directory it names.
+#[cfg(unix)]
+const FRESH_RACE: &str = "ATPKG_LOCK_FRESH_RACE_DIR";
+
+/// Rounds of [`two_processes_opening_a_fresh_lock_file_both_open_it`], and the time between them.
+#[cfg(unix)]
+const FRESH_ROUNDS: u32 = 64;
+#[cfg(unix)]
+const FRESH_GAP: Duration = Duration::from_millis(2);
+
+/// Wall-clock time, which two processes share, since the Unix epoch.
+#[cfg(unix)]
+fn wall() -> Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+/// Run by [`two_processes_opening_a_fresh_lock_file_both_open_it`] in a process of its own: it
+/// writes `ready-<pid>`, waits for its stdin to close, reads the shared start from `start`, and
+/// at each round's moment opens that round's new lock file, writing each failure to
+/// `failed-<pid>`.
+#[cfg(unix)]
+#[test]
+fn standin_opens_fresh_lock_files() {
+    let Some(dir) = std::env::var_os(FRESH_RACE).map(PathBuf::from) else {
+        return;
+    };
+    let pid = std::process::id();
+    std::fs::write(dir.join(format!("ready-{pid}")), "ready").expect("say ready");
+    let mut rest = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut rest);
+    let start = Duration::from_nanos(
+        std::fs::read_to_string(dir.join("start"))
+            .expect("the start")
+            .trim()
+            .parse()
+            .expect("start nanoseconds"),
+    );
+    let mut failed = String::new();
+    for round in 0..FRESH_ROUNDS {
+        let at = start + FRESH_GAP * round;
+        // Sleep to just short of the moment, then wait it out exactly, as the other process does.
+        if let Some(ahead) = at.checked_sub(wall() + Duration::from_micros(500)) {
+            std::thread::sleep(ahead);
+        }
+        while wall() < at {
+            std::hint::spin_loop();
+        }
+        if let Err(error) = open_lock_file(&dir.join(format!("round-{round}.lock"))) {
+            failed.push_str(&format!("round {round}: {error}\n"));
+        }
+    }
+    std::fs::write(dir.join(format!("failed-{pid}")), failed).expect("say what failed");
+}
+
+/// A stand-in process, killed if the test ends before it does.
+#[cfg(unix)]
+struct Standin(aterm_uds::spawnfd::Child);
+
+#[cfg(unix)]
+impl Drop for Standin {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// TWO PROCESSES OPENING A FRESH LOCK FILE BOTH OPEN IT: macOS 27.0.1 answers `ENOENT` to one of
+/// two `O_CREAT` opens racing for a name neither finds, so two processes taking a metadata lock
+/// nobody had made yet (two unattended passes setting aside one damaged pins file) had one fail.
+/// Two processes open each of 64 new lock files at the same moment; every open must succeed.
+/// (Threads of one process cannot race here: creation holds the process's spawn lock.)
+/// NEGATIVE CONTROL: with [`open_lock_file`] back to one `O_CREAT` open, rounds fail with
+/// `No such file or directory`.
+#[cfg(unix)]
+#[test]
+fn two_processes_opening_a_fresh_lock_file_both_open_it() {
+    let dir = crate::testdir::dir("atpkg-lock-fresh-race-");
+    let spawn = || {
+        Standin(
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "lock::tests::standin_opens_fresh_lock_files",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(FRESH_RACE, dir.as_os_str())
+                .stdin(aterm_uds::spawnfd::Stdio::piped())
+                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .expect("the stand-in"),
+        )
+    };
+    let mut standins = [spawn(), spawn()];
+    let count = |what: &str| {
+        std::fs::read_dir(&*dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(what))
+            .count()
+    };
+    aterm_spec::wait::until_while_descendants_work("both stand-ins ready", || {
+        (count("ready-") == 2).then_some(())
+    });
+    let start = wall() + Duration::from_millis(50);
+    std::fs::write(dir.join("start"), start.as_nanos().to_string()).unwrap();
+    for standin in &mut standins {
+        drop(standin.0.stdin.take());
+    }
+    let mut failed = Vec::new();
+    for standin in &mut standins {
+        let pid = standin.0.id();
+        let status = aterm_spec::wait::until_while_working(pid, "the stand-in's end", || {
+            standin.0.try_wait().ok().flatten()
+        });
+        assert!(status.success(), "{status}");
+        let said = std::fs::read_to_string(dir.join(format!("failed-{pid}"))).unwrap();
+        failed.extend(said.lines().map(|line| format!("{pid} {line}")));
+    }
+    assert!(failed.is_empty(), "{failed:?}");
+}

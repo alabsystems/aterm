@@ -44,15 +44,26 @@ fn binding(claim: &[u8]) -> Result<[u8; 32]> {
     Ok(hash.finalize())
 }
 
-/// The floor recorded for the custody `claim`, if any.
+/// The floor file's bytes beside the claim `claim_name`, as [`read`] reads them; none without a
+/// file.
+///
+/// # Errors
+/// The file is unreadable.
+pub(super) fn bytes(dir: &Path, claim_name: &str) -> Result<Option<Vec<u8>>> {
+    match private_file::read_private(dir, &name(claim_name), MAX_LEN) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(PrivateFileError::Missing) => Ok(None),
+        Err(_) => Err(Error::new("table floor is unreadable")),
+    }
+}
+
+/// The floor recorded for the custody `claim`, if any, with the file's bytes it was read from.
 ///
 /// # Errors
 /// The file is unreadable, of another custody, or not a checkpoint body in its one encoding.
-pub(super) fn read(dir: &Path, claim_name: &str, claim: &[u8]) -> Result<Option<Body>> {
-    let bytes = match private_file::read_private(dir, &name(claim_name), MAX_LEN) {
-        Ok(bytes) => bytes,
-        Err(PrivateFileError::Missing) => return Ok(None),
-        Err(_) => return Err(Error::new("table floor is unreadable")),
+pub(super) fn read(dir: &Path, claim_name: &str, claim: &[u8]) -> Result<Option<(Body, Vec<u8>)>> {
+    let Some(bytes) = bytes(dir, claim_name)? else {
+        return Ok(None);
     };
     let rest = bytes
         .strip_prefix(MAGIC.as_slice())
@@ -61,9 +72,9 @@ pub(super) fn read(dir: &Path, claim_name: &str, claim: &[u8]) -> Result<Option<
     let Some((_, body)) = rest else {
         return Err(Error::new("table floor has another custody identity"));
     };
-    crate::checkpoint::decode(body)
-        .map(Some)
-        .ok_or_else(|| Error::new("table floor is not a checkpoint body"))
+    let body = crate::checkpoint::decode(body)
+        .ok_or_else(|| Error::new("table floor is not a checkpoint body"))?;
+    Ok(Some((body, bytes)))
 }
 
 /// Record `body` as the floor of the custody `claim`, durably.

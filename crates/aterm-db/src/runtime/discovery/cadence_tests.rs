@@ -41,11 +41,14 @@ fn units(state: &State, var: &str) -> u32 {
     u32::try_from(state[var]).expect("a small count")
 }
 
-/// One endpoint, `10.1.1.2:1234`, in the abstract `state` at `now`.
+/// One endpoint, `10.1.1.2:1234`, in the abstract `state` at `now`. One its seat was heard by,
+/// in a round dialled in from its address since its last silence (`vouched`), last beaconed as
+/// long ago as a silence: only that round keeps it from going silent.
 fn endpoint(state: &State, now: Instant) -> (Hints, SocketAddr) {
     let address: SocketAddr = "10.1.1.2:1234".parse().unwrap();
     let mut hints = Hints::new([4; 32]);
     let silent = state["silent"] == 1;
+    let vouched = state["vouched"] == 1;
     let busy = state["busy"] == 1;
     let rest = state["rest"] == 1;
     let failing = state["failing"] == 1;
@@ -66,7 +69,14 @@ fn endpoint(state: &State, now: Instant) -> (Hints, SocketAddr) {
         pulled: state["pulled"] == 1,
         dialled: busy.then_some(ACTOR),
         began: if busy { now } else { seen },
-        beacon: (state["beaconed"] == 1).then(|| if silent { now - silence() } else { now }),
+        beacon: (state["beaconed"] == 1).then(|| {
+            if silent || vouched {
+                now - silence()
+            } else {
+                now
+            }
+        }),
+        dialled_in: vouched.then(|| if silent { now - silence() } else { now }),
         probed: state["probed"] == 1,
         standing: Standing::There,
         // At rest its next dial is its audit ([`Peer::resting`]); else its audit is further off
@@ -83,12 +93,23 @@ fn endpoint(state: &State, now: Instant) -> (Hints, SocketAddr) {
     (hints, address)
 }
 
-/// Whether `peer` has gone silent at `now`: it beaconed, and neither a beacon nor a completed
-/// round was heard for longer than any probe's jitter.
+/// Whether `peer` has gone silent at `now`: it beaconed, and neither a beacon, a completed round
+/// nor a round its seat dialled in from its address was heard for longer than any probe's
+/// jitter.
 fn silent(peer: &Peer, now: Instant) -> bool {
     peer.beacon.is_some_and(|beacon| {
-        beacon.max(peer.seen) + SILENCE + Duration::from_millis(SILENCE_JITTER_MS) <= now
+        heard_since(
+            beacon
+                .max(peer.seen)
+                .max(peer.dialled_in.unwrap_or(peer.seen)),
+            now,
+        )
     })
+}
+
+/// Whether what was heard `at` is no longer heard at `now`: longer ago than any probe's jitter.
+fn heard_since(at: Instant, now: Instant) -> bool {
+    at + SILENCE + Duration::from_millis(SILENCE_JITTER_MS) <= now
 }
 
 /// Read the endpoint at `address` back into `next`.
@@ -107,6 +128,10 @@ fn read(next: &mut State, hints: &Hints, address: SocketAddr, now: Instant) {
     next.insert("beaconed", i64::from(peer.beacon.is_some()));
     next.insert("silent", i64::from(silent(peer, now)));
     next.insert("probed", i64::from(peer.probed));
+    next.insert(
+        "vouched",
+        i64::from(peer.dialled_in.is_some_and(|at| !heard_since(at, now))),
+    );
 }
 
 /// What a beacon, a round or a vouch may not move unless it is a grant: the endpoint's wait,
@@ -159,8 +184,8 @@ fn round(state: &State) -> (Repair, Outcome) {
     let report = crate::replica::Report {
         table: Some(OTHER),
         caught_up: true,
-        witnesses_asked: true,
-        regular: true,
+        asked: Some(crate::replica::Ask::First),
+        turn: Some(crate::replica::TableTurn::Regular),
         ..Default::default()
     };
     let mut repair = if state["sweeps"] == 1 {
@@ -207,6 +232,15 @@ fn walk(state: &State, start: Instant) -> (Hints, Vec<(SocketAddr, Actor)>) {
     (hints, seats)
 }
 
+/// A completed round with the seat `actor` in which this side listed short
+/// (`crate::replica::Report::listed_short`): its selection fell back to the recovery region.
+fn short(actor: Actor) -> Repair {
+    Repair::heard_from(actor).applied(crate::replica::Report {
+        primary_unread: true,
+        ..Default::default()
+    })
+}
+
 /// Read the walk back into `next`.
 fn read_walk(next: &mut State, hints: &Hints) {
     let hot = hints.hot.get(&Subject::Table(MOVED));
@@ -235,6 +269,7 @@ pub(crate) fn dial_cadence_transition(state: &State, action: &str) -> State {
         }
         "Silence" => {
             next.insert("silent", 1);
+            next.insert("vouched", 0);
         }
         "Owes" => {
             next.insert("owes", 1);
@@ -282,6 +317,9 @@ pub(crate) fn dial_cadence_transition(state: &State, action: &str) -> State {
             }
             if probing {
                 next.insert("probes", (state["probes"] + 1).min(2));
+                if state["vouched"] == 1 {
+                    next.insert("misprobed", 1);
+                }
             }
         }
         "Finish" => {
@@ -326,12 +364,44 @@ pub(crate) fn dial_cadence_transition(state: &State, action: &str) -> State {
                 ..Default::default()
             };
             let repair = Repair::heard_from(actor).applied(report);
-            hints.settle(actor, Some(address), now, &repair);
+            hints.settle(actor, Some(address), now, &repair, now);
             let outcome = Outcome::of(true, &repair, None);
             hints.finish(address, repair, outcome, now);
             hints.cool();
             read_walk(&mut next, &hints);
             next.insert("walked", (state["walked"] + 1).min(4));
+        }
+        "Owe" => {
+            let (mut hints, seats) = walk(state, now - Duration::from_secs(1));
+            let (_, actor) = seats[0];
+            hints.settle(actor, None, now, &short(actor), now);
+            read_walk(&mut next, &hints);
+            next.insert("owed", i64::from(hints.owes(actor)));
+            next.insert("owedwalks", 0);
+        }
+        "WalkOwed" => {
+            // The seats of a walk with nothing moved: only the owe asks for a dial.
+            let mut quiet = state.clone();
+            quiet.insert("hot", 0);
+            let (mut hints, seats) = walk(&quiet, now - Duration::from_secs(1));
+            let (address, actor) = seats[0];
+            hints.settle(actor, None, now, &short(actor), now);
+            let later = now + Duration::from_secs(10);
+            let Some((chosen, repair)) = hints.next(later) else {
+                return next;
+            };
+            assert_eq!(chosen, address, "the walk dials the seat it owes");
+            assert!(!repair.audited(), "an owed round is no audit");
+            let whole = Repair::heard_from(actor).applied(crate::replica::Report {
+                table: Some(OTHER),
+                caught_up: true,
+                ..Default::default()
+            });
+            hints.settle(actor, Some(address), later, &whole, later);
+            let outcome = Outcome::of(true, &whole, None);
+            hints.finish(address, whole, outcome, later);
+            next.insert("owed", i64::from(hints.owes(actor)));
+            next.insert("owedwalks", (state["owedwalks"] + 1).min(2));
         }
         _ => panic!("unknown DbDialCadence action {action}"),
     }
@@ -373,8 +443,9 @@ fn steps(model: &aterm_spec::derive::Model) -> (BTreeMap<&'static str, usize>, V
 }
 
 /// The scheduler refines `DbDialCadence`: from every reachable state, each enabled action's code
-/// step lands on one of the model's successors, and under each of five code mutants some step
-/// lands on none.
+/// step lands on one of the model's successors, and under each of nine code mutants some step
+/// lands on none. A round its seat dialled in from its address ends a silence, so a dial from a
+/// state that round was heard in probes nothing, and a probe already spent stays spent.
 ///
 /// NEGATIVE CONTROLS (run here), each a code mutant whose step leaves the model or breaks its law:
 /// `BEACON_DEFERS_AUDIT` (a beacon moves a due endpoint's wait: `BeaconGrantsNothing`),
@@ -382,12 +453,15 @@ fn steps(model: &aterm_spec::derive::Model) -> (BTreeMap<&'static str, usize>, V
 /// round that owes rests: `PendingNeverRests`), `UNFINISHED_FINISHES` (a round that broke off
 /// counts as a quiet one and rests: `PendingNeverRests`), `REPULLS` (a round dialled in pulls in
 /// a resting endpoint: `HealthyVouchInert`), `QUIET_REDIALS` (a quiet round's endpoint does not
-/// rest: no successor) and `LED_UNSETTLED` (a seat that lacks the table is never settled:
-/// `WalkEnds`).
+/// rest: no successor), `LED_UNSETTLED` (a seat that lacks the table is never settled:
+/// `WalkEnds`), `INBOUND_UNHEARD` (a silence heard over by a round dialled in is probed:
+/// `VouchEndsSilence`), `VOUCH_REARMS` (a round dialled in re-arms a spent probe: no
+/// successor), `SHORT_UNOWED` (a short list owes nothing: no successor) and `OWED_KEPT` (the
+/// owed round leaves the owe standing: `OwedWalksOnce`).
 #[test]
 fn the_dial_scheduler_conforms_to_its_cadence_model() {
     let model = aterm_models_db::dial_cadence_model();
-    assert_eq!(model.mutant_dials(), (1..=6).collect::<Vec<_>>());
+    assert_eq!(model.mutant_dials(), (1..=8).collect::<Vec<_>>());
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let (observed, strays) = steps(&model);
     assert_eq!(strays, [], "code steps that leave the model");
@@ -404,6 +478,10 @@ fn the_dial_scheduler_conforms_to_its_cadence_model() {
         &QUIET_REDIALS,
         &REPULLS,
         &LED_UNSETTLED,
+        &INBOUND_UNHEARD,
+        &VOUCH_REARMS,
+        &SHORT_UNOWED,
+        &OWED_KEPT,
     ] {
         assert!(
             !under(flag, || steps(&model)).1.is_empty(),
@@ -431,6 +509,39 @@ fn the_dial_scheduler_conforms_to_its_cadence_model() {
     );
     let again = under(&PROBE_REPEATS, || dial_cadence_transition(&probed, "Dial"));
     assert!(!model.check_invariant("SilenceProbesOnce", &again));
+
+    let heard = dial_cadence_transition(&probed, "Vouch");
+    assert!(
+        model.successors("Vouch", &probed).contains(&heard),
+        "{heard:?}"
+    );
+    assert_eq!(
+        (heard["silent"], heard["probed"], heard["vouched"]),
+        (0, 1, 1),
+        "a round dialled in ends the silence and keeps its probe spent"
+    );
+    let rearmed = under(&VOUCH_REARMS, || dial_cadence_transition(&probed, "Vouch"));
+    assert!(!model.successors("Vouch", &probed).contains(&rearmed));
+
+    let mut vouched = model.init_state();
+    for (var, value) in [
+        ("beaconed", 1),
+        ("vouched", 1),
+        ("wait", 3),
+        ("rest", 1),
+        ("age", 1),
+    ] {
+        vouched.insert(var, value);
+    }
+    assert_eq!(
+        dial_cadence_transition(&vouched, "Dial"),
+        vouched,
+        "a round dialled in puts the silence's probe off"
+    );
+    let unheard = under(&INBOUND_UNHEARD, || {
+        dial_cadence_transition(&vouched, "Dial")
+    });
+    assert!(!model.check_invariant("VouchEndsSilence", &unheard));
 
     let mut owing = model.init_state();
     owing.insert("busy", 1);
@@ -472,5 +583,22 @@ fn the_dial_scheduler_conforms_to_its_cadence_model() {
     assert!(
         !model.check_invariant("WalkEnds", &unending),
         "{unending:?}"
+    );
+
+    let owing = dial_cadence_transition(&model.init_state(), "Owe");
+    assert_eq!(owing["owed"], 1, "a short list owes the seat a round");
+    let paid = dial_cadence_transition(&owing, "WalkOwed");
+    assert_eq!((paid["owed"], paid["owedwalks"]), (0, 1), "{paid:?}");
+    let unowed = under(&SHORT_UNOWED, || {
+        dial_cadence_transition(&model.init_state(), "Owe")
+    });
+    assert_eq!(unowed["owed"], 0, "MUTANT: nothing owed");
+    let kept = under(&OWED_KEPT, || {
+        let once = dial_cadence_transition(&owing, "WalkOwed");
+        dial_cadence_transition(&once, "WalkOwed")
+    });
+    assert!(
+        !model.check_invariant("OwedWalksOnce", &kept),
+        "MUTANT: {kept:?}"
     );
 }

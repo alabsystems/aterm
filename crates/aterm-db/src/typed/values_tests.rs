@@ -88,9 +88,60 @@ fn a_decimal_is_exact_text_with_no_leading_zero_and_no_signed_zero() {
     }
 }
 
-/// A principal names its session, its program or what an imported record said; its Mac is a
-/// label or machine uuid, its account a key, and no member it does not name rides along. Its
-/// value reads back as itself.
+/// A link to a row of another table family (design §4.6) is its own type: its schema word names
+/// the family, the collection and how the row is named, and its value is the row's key or, for
+/// a machine, the 32-digit Commons machine uuid, never the label a person calls the machine.
+/// NEGATIVE CONTROL, observed: with `link` taking `keys::is_label` for a machine too, `` a
+/// label is no link to a machine `` fails.
+#[test]
+fn a_link_names_another_familys_row_and_a_machine_by_its_uuid() {
+    use crate::alab::registry::MACHINE_LINK;
+    use crate::typed::{Link, Named, Ty, cell};
+    assert_eq!(
+        Ty::Link(MACHINE_LINK).word(),
+        json!({"link": {
+            "application": "alab",
+            "role": "registry",
+            "collection": "machine",
+            "named": "machine-uuid",
+        }})
+    );
+    let machine = Ty::Link(MACHINE_LINK);
+    assert_eq!(
+        cell::rule(&machine, &json!("0123456789abcdef0123456789abcdef"), false),
+        Ok(())
+    );
+    for (bad, why) in [
+        (json!("m72"), "a label"),
+        (json!("mc-0011223344556677"), "the row's key"),
+        (json!("0123456789ABCDEF0123456789ABCDEF"), "upper-case hex"),
+        (json!("0123456789abcdef"), "half a uuid"),
+        (json!(7), "a number"),
+    ] {
+        assert!(
+            cell::rule(&machine, &bad, false).is_err(),
+            "{why} is no link to a machine"
+        );
+    }
+    let by_key = Ty::Link(Link {
+        named: Named::Key,
+        ..MACHINE_LINK
+    });
+    assert_eq!(by_key.word()["link"]["named"], json!("key"));
+    assert_eq!(
+        cell::rule(&by_key, &json!("mc-0011223344556677"), false),
+        Ok(())
+    );
+    for bad in ["a.b", "two words", ""] {
+        assert!(cell::rule(&by_key, &json!(bad), false).is_err(), "{bad:?}");
+    }
+    assert_eq!(cell::rule(&machine, &Value::Null, true), Ok(()));
+}
+
+/// A principal names its session, its program or what an imported record said; its machine is
+/// a label or machine uuid, its account a key, and no member it does not name rides along (the
+/// name `mac`, which the member had before any record held one, is such a member). Its value
+/// reads back as itself.
 /// NEGATIVE CONTROL: with `principal` not asking for a session, program or `said`, `` only a
 /// model is no principal `` fails.
 #[test]
@@ -98,7 +149,7 @@ fn a_principal_names_who_acted_and_reads_back_as_itself() {
     let agent = Principal {
         session: Some("s-47051b9a207955a92b14".into()),
         program: Some("claude".into()),
-        mac: Some("m72".into()),
+        machine: Some("m72".into()),
         account: Some("ac-0011223344556677".into()),
         model: Some("claude-opus-5-5".into()),
         harness: Some("land".into()),
@@ -110,15 +161,19 @@ fn a_principal_names_who_acted_and_reads_back_as_itself() {
     let imported = Principal::said("s595dac on m18 (disk-custody design session)");
     assert_eq!(principal(&imported.to_value()), Ok(()));
     assert_eq!(
-        principal(&json!({"session": "15", "mac": "0123456789abcdef0123456789abcdef"})),
+        principal(&json!({"session": "15", "machine": "0123456789abcdef0123456789abcdef"})),
         Ok(())
     );
     for (bad, why) in [
         (json!({"model": "claude-opus-5-5"}), "only a model"),
         (json!({}), "nothing"),
         (
-            json!({"session": "15", "mac": "m72 desk"}),
-            "a Mac in words",
+            json!({"session": "15", "machine": "m72 desk"}),
+            "a machine in words",
+        ),
+        (
+            json!({"session": "15", "mac": "m72"}),
+            "the member's name before it was machine",
         ),
         (json!({"session": "15", "email": "a"}), "an unnamed member"),
         (json!({"session": "s 15"}), "a session with a space"),

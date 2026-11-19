@@ -179,8 +179,10 @@ pub fn run_redraw_conformance() -> i32 {
     let handle = registered_session(SID, &term);
     {
         let mut registry = store.write().unwrap_or_else(|p| p.into_inner());
-        registry.register(handle.clone());
-        registry.register(registered_session(SIBLING_SID, &sibling_term));
+        registry.register(handle.clone()).start_mailbox();
+        registry
+            .register(registered_session(SIBLING_SID, &sibling_term))
+            .start_mailbox();
     }
     let host = GuiHost::with_fleet(SID, &term, Some(&proxy), &store, &handle.ctx);
 

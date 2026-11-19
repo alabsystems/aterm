@@ -159,34 +159,13 @@ fn a_headless_window_starts_with_the_dock_hidden() {
     assert!(app.dock_view(WID).is_some());
 }
 
-/// Window `child` was born with a dock of its own at `parent`'s state: 30 cells, a view that
-/// is not the parent's, and a frame 30 cells wider than its grid's.
-fn assert_born_docked_like(app: &mut App, parent: WindowId, child: WindowId, how: &str) {
-    assert_eq!(
-        app.windows[&child].dock.pref,
-        Some(30),
-        "{how}: the child took the parent's record"
-    );
-    let bare = own_frame(app, child);
-    assert!(app.seat_birth_dock(child), "{how}: seated");
-    let ws = &app.windows[&child];
-    assert_eq!(ws.dock.cells, 30, "{how}");
-    let view = app.dock_view(child).expect("a dock view of its own");
-    assert_ne!(Some(view), app.dock_view(parent), "{how}: its own view");
-    let cw = app.win_cell_size(child).0;
-    let docked = own_frame(app, child);
-    assert_eq!(
-        docked.width,
-        bare.width + 30 * u32::try_from(cw).unwrap(),
-        "{how}: born wider by the dock"
-    );
-    assert_eq!(docked.height, bare.height, "{how}");
-    let (rows, cols) = (ws.rows, ws.cols);
-    assert_eq!(app.grid_dims_for(child, docked), (rows, cols), "{how}");
+fn assert_aux_starts_compact(app: &mut App, child: WindowId, how: &str) {
+    assert!(!app.seat_birth_dock(child), "{how}");
+    assert_eq!(app.dock_view(child), None, "{how}");
 }
 
 #[test]
-fn a_new_window_takes_the_dock_state_of_the_one_it_came_from() {
+fn auxiliary_windows_are_born_without_a_navigator() {
     let now = std::time::Instant::now();
     // A parent the person showed the dock in.
     let mut app = docking_app();
@@ -198,20 +177,20 @@ fn a_new_window_takes_the_dock_state_of_the_one_it_came_from() {
     // A new window (Cmd-N's logical half).
     let session = app.next_session_id;
     let child = app.insert_logical_window(crate::stub_session(session), 24, 80);
-    assert_born_docked_like(&mut app, WID, child, "new window");
+    assert_aux_starts_compact(&mut app, child, "new window");
 
     // Open Active Session in New Window, from the parent.
     app.frontmost_window = Some(WID);
     let viewed = app
         .open_active_session_in_new_window_logical()
         .expect("a view of the parent's session");
-    assert_born_docked_like(&mut app, WID, viewed, "session in new window");
+    assert_aux_starts_compact(&mut app, viewed, "session in new window");
 
     // Move Tab to New Window, from the parent.
     app.frontmost_window = Some(WID);
     crate::app_workers_tests::person_tab(&mut app);
     let detached = app.detach_active_tab_logical().expect("a torn-off tab");
-    assert_born_docked_like(&mut app, WID, detached, "detached tab");
+    assert_aux_starts_compact(&mut app, detached, "detached tab");
 
     // A detach whose source is not the front window takes the source's state.
     crate::app_workers_tests::person_tab(&mut app);
@@ -222,7 +201,7 @@ fn a_new_window_takes_the_dock_state_of_the_one_it_came_from() {
     let from_back = app
         .detach_active_tab_in_window_logical(WID)
         .expect("a torn-off tab of the window behind");
-    assert_born_docked_like(&mut app, WID, from_back, "detached from behind the front");
+    assert_aux_starts_compact(&mut app, from_back, "detached from behind the front");
 
     // CONTROL: a parent its person hid gives a hidden child, the setting on: the inheritance,
     // not the default, decided.
@@ -235,7 +214,7 @@ fn a_new_window_takes_the_dock_state_of_the_one_it_came_from() {
     assert_eq!(app.windows[&WID].dock.pref, Some(0));
     let session = app.next_session_id;
     let child = app.insert_logical_window(crate::stub_session(session), 24, 80);
-    assert_eq!(app.windows[&child].dock.pref, Some(0));
+    assert_eq!(app.windows[&child].dock.pref, None);
     assert!(!app.seat_birth_dock(child));
     assert_eq!(app.windows[&child].dock.cells, 0);
     assert_eq!(app.dock_view(child), None);
@@ -699,19 +678,12 @@ fn a_tile_is_judged_against_named_screens_never_the_one_the_window_stands_on() {
 #[test]
 fn a_failed_attach_leaves_no_dock_view() {
     let mut app = docking_app();
-    app.windows.get_mut(&WID).unwrap().win_px = Some(own_frame(&app, WID));
-    crate::app_workers_tests::person_tab(&mut app);
-    let detached = app.detach_active_tab_logical().expect("a torn-off tab");
     let views = app.view_store.len();
-    assert!(app.seat_birth_dock(detached));
-    let view = app.windows[&detached].dock.view.expect("seated");
-    assert_eq!(app.view_store.len(), views + 1);
-    // What `attach_os_window` does when the OS window or its surface fails.
-    app.unseat_birth_dock(detached);
-    app.detach_rollback_logical(Some(WID), detached);
+    assert!(app.seat_birth_dock(WID));
+    let view = app.windows[&WID].dock.view.unwrap();
+    app.unseat_birth_dock(WID);
     assert!(app.view_store.get(view).is_none());
     assert_eq!(app.view_store.len(), views);
-    assert!(!app.windows.contains_key(&detached));
 }
 
 #[test]
@@ -743,12 +715,9 @@ fn a_dock_fall_is_not_paid_inside_another_entry_point() {
     assert_eq!(&after[before.len()..], ["site=dock"]);
 }
 
-/// A WINDOW LANDED OFF THE LOOP TAKES THE RECORD OF THE WINDOW IT WAS OPENED FROM. Cmd-N books
-/// its shell off the loop and lands the window later; the person may focus another window in
-/// between. The booking reserves its origin, and the landing gives the new window that window's
-/// record, not the front's at the landing. CONTROL: an origin closed since leaves the front's.
+/// A new auxiliary window starts compact even if focus changes while its shell is starting.
 #[test]
-fn a_window_landed_off_the_loop_takes_the_record_of_the_window_it_was_opened_from() {
+fn an_auxiliary_window_landed_after_focus_moves_starts_with_its_own_dock_record() {
     for origin_closes in [false, true] {
         let mut app = docking_app();
         app.tab_spawns.unsent = true;
@@ -779,9 +748,8 @@ fn a_window_landed_off_the_loop_takes_the_record_of_the_window_it_was_opened_fro
             }),
             "PRECONDITION: the window landed"
         );
-        let want = if origin_closes { Some(30) } else { Some(0) };
         assert_eq!(
-            app.windows[&booked.1].dock.pref, want,
+            app.windows[&booked.1].dock.pref, None,
             "origin_closes={origin_closes}"
         );
     }
@@ -927,4 +895,57 @@ fn a_default_dock_the_os_refuses_the_wider_frame_for_goes_inside() {
         app.windows[&WID].dock.cells, 30,
         "CONTROL: a later drag keeps it"
     );
+}
+
+#[test]
+fn local_panel_session_count_preserves_each_windows_visibility_and_preferred_width() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut app = docking_app();
+    let first = app.focused_session_id(WID).unwrap();
+    app.windows.get_mut(&WID).unwrap().win_px = Some(own_frame(&app, WID));
+    app.take_dock_record(WID, person(Some(0), DockBirth::default()));
+    assert!(!app.seat_local_panel_at_birth(WID));
+    let now = std::time::Instant::now();
+    let second = crate::app_workers_tests::person_tab(&mut app);
+    app.publish_navigators(now);
+    assert_eq!(app.local_panel_roster.len(), 2);
+    assert_eq!(app.windows[&WID].dock.written(), Some(0));
+    assert!(app.dock_view(WID).is_none());
+
+    assert!(app.close_session_tab_for_test(second));
+    app.publish_navigators(now);
+    let before = resize_sites(&app, first);
+    app.set_dock(WID, 23).unwrap();
+    assert_eq!(app.windows[&WID].dock.cells, 23);
+    let shown = resize_sites(&app, first);
+    assert_eq!(&shown[before.len()..], ["site=dock"]);
+    let second = crate::app_workers_tests::person_tab(&mut app);
+    app.publish_navigators(now);
+    assert!(app.close_session_tab_for_test(second));
+    app.publish_navigators(now);
+    assert_eq!(app.local_panel_roster.len(), 1);
+    assert_eq!(app.windows[&WID].dock.cells, 23);
+    assert_eq!(app.windows[&WID].dock.written(), Some(23));
+    assert_eq!(resize_sites(&app, first), shown);
+}
+
+#[test]
+fn a_set_down_dock_stays_down_when_the_same_reload_turns_its_default_off() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut app = docking_app();
+    crate::app_workers_tests::person_tab(&mut app);
+    assert!(app.seat_local_panel_at_birth(WID));
+    let held = own_frame(&app, WID);
+    let narrow = aterm_window::dpi::PhysicalSize::new(1, held.height);
+    assert!(app.fit_dock_to_metrics(WID, narrow));
+    assert_eq!(app.windows[&WID].dock.set_down, Some(DOCK_CELLS));
+    dock_setting(&mut app, Some(false));
+    // Config installs the new setting before the synchronous metrics rebuild. The wider
+    // client fits the old panel, while this window now follows a disabled default.
+    assert!(!app.fit_dock_to_metrics(WID, held));
+    assert_eq!(app.windows[&WID].dock.cells, 0);
+    app.local_panel_roster.request_layout();
+    app.reconcile_local_panel_layout(std::time::Instant::now());
+    assert_eq!(app.windows[&WID].dock.cells, 0);
+    assert_eq!(app.windows[&WID].dock.set_down, None);
 }

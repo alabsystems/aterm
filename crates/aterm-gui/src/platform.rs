@@ -19,11 +19,14 @@ use crate::{Wake, WindowId, menu, toolbar};
 #[derive(Clone, Copy)]
 pub(crate) struct ToolbarTabsModel<'a> {
     pub(crate) titles: &'a [String],
+    #[cfg(target_os = "macos")]
     pub(crate) ids: &'a [crate::tab_model::TabId],
     pub(crate) metadata: &'a [crate::tab_bar::TabStripMetadata],
     pub(crate) tooltips: &'a [Option<String>],
     pub(crate) ext: &'a [crate::session_chrome::TabChromeExt],
     pub(crate) active: usize,
+    #[cfg(target_os = "macos")]
+    pub(crate) new_tab: bool,
 }
 
 /// One editing command a menu key equivalent must hand to the inline rename field instead of to the terminal while an editor is open (see [`AppRt::rename_editor_edit`]).
@@ -162,7 +165,7 @@ pub(crate) trait AppRt {
         false
     }
 
-    /// Open the inline session-rename editor over the strip's `tab` chip, seeded with `seed` (the current pin, empty when unpinned) and placeheld with `placeholder` (the label the ladder falls back to).
+    /// Open the inline session-rename editor over the strip's `tab` chip, holding the editable title or metadata value. An empty metadata field may show a placeholder.
     fn begin_tab_rename(
         &self,
         handle: &toolbar::ToolbarHandle,
@@ -682,15 +685,7 @@ impl AppRt for AppRtMacOS {
     }
 
     fn set_toolbar_tabs(&self, handle: &toolbar::ToolbarHandle, tabs: ToolbarTabsModel<'_>) {
-        let ToolbarTabsModel {
-            titles,
-            ids,
-            metadata,
-            tooltips,
-            ext,
-            active,
-        } = tabs;
-        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
+        toolbar::set_window_tabs(handle, tabs);
     }
 
     fn reflow_toolbar_tabs(&self, handle: &toolbar::ToolbarHandle) {
@@ -1603,15 +1598,7 @@ impl AppRt for AppRtLinux {
     }
 
     fn set_toolbar_tabs(&self, handle: &toolbar::ToolbarHandle, tabs: ToolbarTabsModel<'_>) {
-        let ToolbarTabsModel {
-            titles,
-            ids,
-            metadata,
-            tooltips,
-            ext,
-            active,
-        } = tabs;
-        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
+        toolbar::set_window_tabs(handle, tabs);
     }
 
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {

@@ -637,6 +637,7 @@ mod mac {
                         SweepOpts {
                             coalitions: false,
                             versions: true,
+                            scheduling: false,
                         },
                         &mut ids,
                     );
@@ -1002,6 +1003,7 @@ mod mac {
                 SweepOpts {
                     coalitions: false,
                     versions: true,
+                    scheduling: false,
                 },
                 &mut self.ids,
             );

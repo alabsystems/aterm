@@ -142,6 +142,7 @@ pub fn simulate_tap_wall_step(
                 default_home: true,
                 route: aterm_agent::harness::accounts::AuthRoute::Stored,
                 left: None,
+                model: aterm_agent::harness::accounts::ModelWeek::Unread,
             };
             accounts::advise_past_probe(
                 roster,

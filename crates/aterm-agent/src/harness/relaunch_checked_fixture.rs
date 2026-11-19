@@ -367,6 +367,58 @@ impl World {
         save_checked(&self.opts, SESSION, &state).map_err(|error| error.to_string())
     }
 
+    /// Save the host's passive `registration` of this world's source and its `binding` as the
+    /// record's observation, as the observer does once the host registered the live vendor.
+    ///
+    /// # Errors
+    /// The record's observation could not be written.
+    pub fn observed(
+        &self,
+        registration: super::super::native_observe::Registration,
+        binding: super::super::native_observe::ObservationBinding,
+    ) -> std::io::Result<()> {
+        super::super::native_restart::observed_for_fixture(
+            &self.opts.state,
+            self.tab(),
+            registration,
+            binding,
+        )
+    }
+
+    /// Rewrite the saved record as one whose native operation never completed, as a cancellation
+    /// before any effect leaves it: the completed predecessor kept only as its positive no-exec
+    /// fact, the record coordinated for good.
+    ///
+    /// # Errors
+    /// The record did not read, holds no completed predecessor, or could not be written.
+    pub fn uncompleted(&self) -> Result<(), String> {
+        let mut state = load_record(&self.opts, SESSION)
+            .map_err(|error| error.to_string())?
+            .ok_or("no saved record")?;
+        state.native_noexec_prepare = Some(
+            state
+                .native_completed_prepare
+                .take()
+                .ok_or("no completed predecessor")?,
+        );
+        save_checked(&self.opts, SESSION, &state).map_err(|error| error.to_string())
+    }
+
+    /// The saved record's wait log, oldest first: each wait's word and the reason noted with it.
+    pub fn waits(&self) -> Vec<(String, String)> {
+        load_record(&self.opts, SESSION)
+            .ok()
+            .flatten()
+            .map(|state| {
+                state
+                    .waits
+                    .iter()
+                    .map(|wait| (wait.word.clone(), wait.note.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn run(
         &mut self,
         why: &Restart,

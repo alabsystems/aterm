@@ -78,6 +78,10 @@ impl Round<'_> {
                 let log = Log::read_with(session, store, scope, decode)?;
                 let eligible = log.eligible();
                 let book = Book::from_eligible(&eligible, &context);
+                #[cfg(test)]
+                let lapsed = LAPSED.with(std::cell::Cell::get);
+                #[cfg(not(test))]
+                let lapsed = false;
                 let thread = book
                     .threads
                     .get(&request)
@@ -87,6 +91,7 @@ impl Round<'_> {
                             && thread.published.is_none()
                             && thread.offers.contains(&holder)
                             && now.saturating_sub(thread.heard_ms) < need::LAPSE_SECS * MS
+                            && !lapsed
                     })
                     .ok_or_else(|| Error::new("credential request is no longer open"))?;
                 if !context.policy.allows(&thread.want) {
@@ -117,9 +122,17 @@ impl Round<'_> {
                     .sight
                     .as_ref()
                     .ok_or_else(|| Error::new("the vault has no applied signer"))?;
+                #[cfg(test)]
+                let signer = if SIGNER_MOVED.with(std::cell::Cell::get) {
+                    sight.signer.map(|byte| !byte)
+                } else {
+                    sight.signer
+                };
+                #[cfg(not(test))]
+                let signer = sight.signer;
                 Ok(Admission {
                     thread: thread.clone(),
-                    signer: sight.signer,
+                    signer,
                     vault: sight.vault.clone(),
                     recipient,
                     writer,
@@ -128,7 +141,17 @@ impl Round<'_> {
         )
     }
 
-    fn candidate(&self, admin: &client::Admin) -> Result<Option<([u8; 16], Digest)>> {
+    /// The Offer by the peer a take tries first, if any, with whether a take of it by this owner
+    /// was refused before ([`CredentialOwner::was_refused`]): of the requests still open that
+    /// policy allows and the administrator here does not hold the first entry of, skipping one a
+    /// round is taking now, the least by Offer id of those no take was refused, else the least of
+    /// those refused. An Offer whose take came to nothing waits behind each one the holder offers
+    /// that no take was refused yet. `unrefused_first` false orders by id alone (a mutant's).
+    fn candidate(
+        &self,
+        admin: &client::Admin,
+        unrefused_first: bool,
+    ) -> Result<Option<([u8; 16], Digest, bool)>> {
         self.check()?;
         let now = now_ms();
         let facts = facts(&self.logical_paths()?, now)?;
@@ -143,7 +166,7 @@ impl Round<'_> {
                 let eligible = log.eligible();
                 let book = Book::from_eligible(&eligible, &context);
                 let inert_ids: BTreeSet<Digest> = book.inert.iter().map(|(id, _)| *id).collect();
-                let mut best: Option<(Digest, [u8; 16])> = None;
+                let mut best: Option<((bool, Digest), [u8; 16], bool)> = None;
                 for (operation, command) in eligible {
                     if operation.header.actor != self.peer
                         || self.owner.offer_in_flight(&operation.header.id)
@@ -167,11 +190,14 @@ impl Round<'_> {
                                 !admin.doc.entries().iter().any(|entry| entry.name == *first)
                             })
                     }) {
-                        let candidate = (operation.header.id, request);
-                        best = Some(best.map_or(candidate, |cur| cur.min(candidate)));
+                        let refused = self.owner.was_refused(&operation.header.id);
+                        let rank = (refused && unrefused_first, operation.header.id);
+                        if best.is_none_or(|(least, ..)| rank < least) {
+                            best = Some((rank, request, refused));
+                        }
                     }
                 }
-                Ok(best.map(|(offer, request)| (request, offer)))
+                Ok(best.map(|((_, offer), request, refused)| (request, offer, refused)))
             },
         )
         .map(Option::flatten)
@@ -189,8 +215,92 @@ fn refused(stream: &mut (impl Read + Write)) -> Result<usize> {
     Ok(0)
 }
 
+/// Whether the side that answered a handoff owes the peer a round that it begins, in which it
+/// takes ([`Handed::owing`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Owing {
+    /// It owes none: its own take ran to its end in the round, it administers no vault (no
+    /// custodian takes), or it holds no Offer by the peer that a round it begins would try.
+    #[default]
+    Nothing,
+    /// Its take did not run to its end in the round (the wire lets only the side that dials
+    /// take, or the exchange broke off), and it holds this Offer by the peer, the one a round it
+    /// begins would try ([`takes_from_peer`]).
+    Take(Digest),
+    /// It could not tell: its store, policy or administrator could not be read now. A round owed
+    /// before stays owed, and none is owed for this one; the dial scheduler judges again, off the
+    /// serving loop ([`owed_take`]), until a judgement tells (`crate::runtime::discovery::
+    /// Hints::judged`).
+    Unknown,
+}
+
+/// What one handoff exchange did ([`exchange`]).
+#[derive(Debug)]
+pub(crate) struct Handed {
+    /// Holder values handed across and published, or why the exchange failed.
+    pub(crate) count: Result<usize>,
+    /// Whether this side, where it answered, owes the peer a round it begins: the peer's own
+    /// rounds cannot hand across what this round left. A dialling side owes none.
+    pub(crate) owing: Owing,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT, on for one test thread: an answering custodian never tells that it holds an Offer
+    /// by the peer to take ([`Handed::owing`]).
+    pub(crate) static TAKE_UNTOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT, on for one test thread: an answering custodian tells it owes the peer a round for
+    /// any candidate Offer ([`takes_from_peer`]), though [`take`] refuses one it cannot admit.
+    pub(crate) static TAKE_TOLD_UNADMITTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT, on for one test thread: an answering custodian tells it owes the peer a round for
+    /// an Offer it admits whatever signer the admission names ([`takes_from_peer`]), though
+    /// [`take`] refuses one whose signer is not the one this Mac's administrator signs with.
+    pub(crate) static TAKE_TOLD_UNSIGNED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT, on for one test thread: an answering custodian tells it owes the peer a round for
+    /// an Offer whose take a round of its own already saw refused
+    /// ([`CredentialOwner::was_refused`]), so an Offer whose take came to nothing has its holder
+    /// dialled after each of its rounds.
+    pub(crate) static TAKE_RETOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT, on for one test thread: a take tries the least Offer by id, a refused one
+    /// included, while the owed check ([`takes_from_peer`]) names the least one no take was
+    /// refused ([`Round::candidate`]): the round owed for one Offer tries another, which its
+    /// holder refuses again, and the owed one is never taken.
+    pub(crate) static TAKE_BY_ID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT, on for one test thread: a Mac whose cached administrator does not open tells it
+    /// could not tell ([`takes_from_peer`]) whether or not it administers its vault, so every
+    /// Mac but the custodian answers a one-way round with `Owing::Unknown` and judges the take
+    /// again, six times, for nothing.
+    pub(crate) static NO_ADMIN_UNTOLD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT, on for one test thread: an answering side whose exchange broke off owes nothing
+    /// ([`Handed::owing`]), as when [`exchange`] returned at the error: the Offer its round
+    /// brought waits for the pair's next round.
+    pub(crate) static OWING_LOST_ON_ERROR: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT, on for one test thread: a take records its Offer refused once it holds it
+    /// ([`CredentialOwner::refused`]), before the holder answers, so a take that broke off with
+    /// no answer leaves the Offer owed no round after the holder's.
+    pub(crate) static REFUSED_AT_TRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// SEAM, on for one test thread: [`Round::admit`] reads every request as unheard past its
+    /// lapse ([`need::LAPSE_SECS`]), as a request is from its lapse until the custodian's next
+    /// pass retires it. [`Round::candidate`] does not read the lapse.
+    pub(crate) static LAPSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// SEAM, on for one test thread: [`Round::admit`] names a vault signer other than the one
+    /// this Mac's administrator signs with (`client::Admin::custodian_signer`), as an admission
+    /// does once the vault applied a signer this Mac's cached administrator does not hold.
+    pub(crate) static SIGNER_MOVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Both callers are the runtime transport's admitted, exporter-bound endpoints. A
 /// detached endpoint has no owner permit and cannot negotiate this exchange.
+///
+/// The side that dials takes ([`take`]), and where `bidirectional` (`atdb/6` and later) the
+/// side that answers then takes too. Where the answering side's take did not run to its end
+/// (the wire is one way, or the exchange broke off before or during it), it says whether it
+/// holds an Offer of the peer's that a round it begins would try ([`Handed::owing`]): its own
+/// round with the peer takes it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exchange(
     paths: &Paths,
@@ -202,7 +312,7 @@ pub(crate) fn exchange(
     side: Side,
     bidirectional: bool,
     stream: &mut (impl Read + Write),
-) -> Result<usize> {
+) -> Handed {
     let round = Round {
         paths,
         config,
@@ -211,18 +321,132 @@ pub(crate) fn exchange(
         local,
         peer,
     };
-    let first = match side {
-        Side::Initiator => take(&round, stream),
-        Side::Responder => give(&round, stream),
-    }?;
-    if !bidirectional {
-        return Ok(first);
+    if side == Side::Initiator {
+        let count = take(&round, stream).and_then(|took| {
+            Ok(took
+                + if bidirectional {
+                    give(&round, stream)?
+                } else {
+                    0
+                })
+        });
+        return Handed {
+            count,
+            owing: Owing::Nothing,
+        };
     }
-    let second = match side {
-        Side::Initiator => give(&round, stream),
-        Side::Responder => take(&round, stream),
-    }?;
-    Ok(first + second)
+    let given = give(&round, stream);
+    let count = match given {
+        Ok(given) if bidirectional => match take(&round, stream) {
+            Ok(took) => {
+                return Handed {
+                    count: Ok(given + took),
+                    owing: Owing::Nothing,
+                };
+            }
+            Err(error) => Err(error),
+        },
+        given => given,
+    };
+    #[cfg(test)]
+    if count.is_err() && OWING_LOST_ON_ERROR.with(std::cell::Cell::get) {
+        return Handed {
+            count,
+            owing: Owing::Nothing,
+        };
+    }
+    Handed {
+        count,
+        owing: takes_from_peer(&round),
+    }
+}
+
+/// Whether this side, the custodian, holds an Offer by the round's peer that a round it begins
+/// would try ([`take`]) and whose take no round of its own saw refused: the candidate
+/// [`Round::candidate`] finds for [`take`], which tries one no take was refused before any that
+/// one was, admitted as [`take`] admits it ([`Round::admit`]: the request heard within its
+/// lapse, its requester a member, a vault signer applied) and under the signer this Mac's
+/// administrator signs with. An Offer [`take`] would refuse before trying it (a request that
+/// lapsed and that the custodian's next pass has not retired yet, a signer that moved) is owed
+/// no round, for that round would take nothing, nor is one whose take was refused.
+///
+/// What it cannot read now tells [`Owing::Unknown`]: the logical paths, the cached
+/// administrator of a Mac that administers its vault or cannot tell whether it does (its vault
+/// state being changed, `client::can_administer`), the candidate's store or policy, the signer,
+/// or an admission that met a busy store or its deadline (another admission failure is the
+/// refusal a take meets too). A Mac that administers no vault takes nothing, ever, and tells
+/// [`Owing::Nothing`]. It reads, and takes no lease.
+fn takes_from_peer(round: &Round<'_>) -> Owing {
+    #[cfg(test)]
+    let (untold, unadmitted, unsigned, retold, no_admin_untold) = (
+        TAKE_UNTOLD.with(std::cell::Cell::get),
+        TAKE_TOLD_UNADMITTED.with(std::cell::Cell::get),
+        TAKE_TOLD_UNSIGNED.with(std::cell::Cell::get),
+        TAKE_RETOLD.with(std::cell::Cell::get),
+        NO_ADMIN_UNTOLD.with(std::cell::Cell::get),
+    );
+    #[cfg(not(test))]
+    let (untold, unadmitted, unsigned, retold, no_admin_untold) =
+        (false, false, false, false, false);
+    if untold {
+        return Owing::Nothing;
+    }
+    let Ok(paths) = round.logical_paths() else {
+        return Owing::Unknown;
+    };
+    let Ok(admin) = client::admin_cached(&paths) else {
+        // Every member but the custodian lands here on every one-way round it answers: one that
+        // administers no vault owes nothing and is judged no more. Only one that does, or cannot
+        // tell now, could not tell.
+        return match client::can_administer(&paths) {
+            Ok(false) if !no_admin_untold => Owing::Nothing,
+            _ => Owing::Unknown,
+        };
+    };
+    let (request, offer, refused) = match round.candidate(&admin, true) {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => return Owing::Nothing,
+        Err(_) => return Owing::Unknown,
+    };
+    if refused && !retold {
+        return Owing::Nothing;
+    }
+    if unadmitted {
+        return Owing::Take(offer);
+    }
+    let admission = match round.admit(request, offer, round.peer) {
+        Ok(admission) => admission,
+        Err(error) if error.is_busy() || error.is_out_of_time() => return Owing::Unknown,
+        Err(_) => return Owing::Nothing,
+    };
+    match admin.custodian_signer() {
+        Ok(signer) if unsigned || signer == admission.signer => Owing::Take(offer),
+        Ok(_) => Owing::Nothing,
+        Err(_) => Owing::Unknown,
+    }
+}
+
+/// Whether this Mac, the custodian, owes `peer` a round that it begins, in which it takes
+/// ([`takes_from_peer`]), judged with no round: the judgement a handoff that answered `peer`
+/// makes as it ends, made again where that one could not tell ([`Owing::Unknown`]). It reads,
+/// and takes no lease, so the dial scheduler makes it off the serving loop
+/// (`crate::runtime::transport::Transport::check_takes`).
+pub(crate) fn owed_take(
+    paths: &Paths,
+    config: &Path,
+    owner: &CredentialOwner,
+    network: [u8; 16],
+    local: Actor,
+    peer: Actor,
+) -> Owing {
+    takes_from_peer(&Round {
+        paths,
+        config,
+        owner,
+        network,
+        local,
+        peer,
+    })
 }
 
 fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
@@ -230,8 +454,12 @@ fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
         send(stream, b"AQN1")?;
         return Ok(0);
     };
-    let candidate = round.candidate(&admin);
-    let Some((request, offer)) = candidate.as_ref().ok().copied().flatten() else {
+    #[cfg(test)]
+    let by_id = TAKE_BY_ID.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let by_id = false;
+    let candidate = round.candidate(&admin, !by_id);
+    let Some((request, offer, _)) = candidate.as_ref().ok().copied().flatten() else {
         send(stream, b"AQN1")?;
         return candidate.map(|_| 0);
     };
@@ -246,6 +474,16 @@ fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
         send(stream, b"AQN1")?;
         return Ok(0);
     };
+    // The Offer is recorded refused once the holder or this side refuses it
+    // ([`CredentialOwner::refused`]), never when the exchange breaks off with no answer.
+    #[cfg(test)]
+    if REFUSED_AT_TRY.with(std::cell::Cell::get) {
+        round.owner.refused(offer);
+    }
+    let refuse = |stream: &mut _| {
+        round.owner.refused(offer);
+        refused(stream)
+    };
     let started = Instant::now();
     let nonce = crate::crypto::random::<32>()?;
     let mut hello = [0u8; 100];
@@ -257,6 +495,7 @@ fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
     send(stream, &hello)?;
     let reply = receive(stream, 36)?;
     if reply == b"AQR1" {
+        round.owner.refused(offer);
         return Ok(0);
     }
     if reply.len() != 36 || &reply[..4] != b"AQN2" {
@@ -284,19 +523,20 @@ fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
     send(stream, &proof)?;
     let delivery = receive(stream, MAX_DELIVERY)?;
     if delivery == b"AQR1" {
+        round.owner.refused(offer);
         return Ok(0);
     }
     // All authorization is re-read after the holder's response, before decryption.
     let current = round.admit(request, offer, round.peer)?;
     if current.signer != admission.signer || current.recipient != exchange.recipient {
-        return refused(stream);
+        return refuse(stream);
     }
     let identity = client::read_machine_identity(round.paths)
         .map_err(crate::table::failure)?
         .ok_or_else(|| Error::new("the custodian identity is unavailable"))?;
     let values = match exchange.open(&current.writer, identity, started.elapsed(), &delivery) {
         Ok(values) => values,
-        Err(_) => return refused(stream),
+        Err(_) => return refuse(stream),
     };
     let published = publish(
         round.paths,
@@ -313,7 +553,7 @@ fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
             send(stream, &ok)?;
             Ok(1)
         }
-        Err(_) => refused(stream),
+        Err(_) => refuse(stream),
     }
 }
 

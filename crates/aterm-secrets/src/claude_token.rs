@@ -689,8 +689,10 @@ pub fn listed(paths: &Paths) -> Result<Lookup<Vec<Standing>>> {
 /// value-free, one per account.
 const REFUSALS: &str = "claude-token-refusals.json";
 
-/// Where this Mac keeps its refusals ([`REFUSALS`]), which every standing read here judges by.
-pub(crate) fn refusals_file(paths: &Paths) -> std::path::PathBuf {
+/// Where this Mac keeps its refusals ([`REFUSALS`]), which every standing read here judges by: a
+/// value-free file a reader may stamp to know a refusal was recorded ([`refused_here`]).
+#[must_use]
+pub fn refusals_file(paths: &Paths) -> std::path::PathBuf {
     paths.dir.join(REFUSALS)
 }
 
@@ -752,6 +754,36 @@ fn refusals(paths: &Paths) -> BTreeMap<String, Refusal> {
                     status,
                 },
             ))
+        })
+        .collect()
+}
+
+/// One refusal of an account's token this Mac recorded ([`note_refused`]), value-free: the refused
+/// token's `minted_at` and when the refusal was recorded here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefusedHere {
+    /// The refused token's `minted_at`, its meta's: the token, never another of the account's.
+    pub minted_at: u64,
+    /// When this Mac recorded the refusal (Unix seconds).
+    pub at: u64,
+}
+
+/// This Mac's refusals ([`note_refused`]) by account key, as [`RefusedHere`]: read from the
+/// refusals file beside its vault state alone ([`refusals_file`]), with no vault read, so a
+/// reader of value-free facts (the journal's `ai/logins` rows, plan package SF-34) knows which
+/// token Claude Code refused here. Empty where the file is absent or does not read.
+#[must_use]
+pub fn refused_here(paths: &Paths) -> BTreeMap<String, RefusedHere> {
+    refusals(paths)
+        .into_iter()
+        .map(|(key, refusal)| {
+            (
+                key,
+                RefusedHere {
+                    minted_at: refusal.minted_at,
+                    at: refusal.at,
+                },
+            )
         })
         .collect()
 }

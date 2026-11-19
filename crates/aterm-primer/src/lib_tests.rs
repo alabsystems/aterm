@@ -498,7 +498,7 @@ fn skill_rows(out: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// CODEX GETS EVERY ATERM SKILL CLAUDE CODE GETS, WHERE CODEX READS ONE: `install codex`
+/// Codex gets every shared aterm skill where it reads one. `install codex`
 /// writes each, Claude Code's body, as `<codex home>/skills/<name>/SKILL.md`, the codex home
 /// `~/.codex` or the `$CODEX_HOME` that moves it; a second install reports every one current;
 /// `remove` deletes the marked ones and keeps the copy whose marker line the user deleted.
@@ -514,9 +514,8 @@ fn codex_gets_every_aterm_skill_where_codex_reads_skills() {
             .map(|s| doc_label(s.path))
             .collect()
     };
-    assert_eq!(names("codex"), names("claude"));
     assert_eq!(
-        names("claude"),
+        names("codex"),
         [
             "drive-aterm",
             "supervise-agent",
@@ -680,6 +679,61 @@ fn codex_gets_every_aterm_skill_where_codex_reads_skills() {
             );
         }
     }
+}
+
+#[test]
+fn the_brief_names_its_recipe_version() {
+    let method = format!("`cz@{RESIDENT_BRIEF_VERSION}`");
+    assert!(RESIDENT_BRIEF.contains(&method));
+    assert!(!primer_block(Some("claude")).contains(&method));
+}
+
+#[test]
+fn the_resident_brief_distinguishes_fleet_delivery_from_worker_input() {
+    let commands: Vec<_> = RESIDENT_SKILL_BODY
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter_map(|example| example.strip_prefix("aterm ctl "))
+        .filter_map(|rest| rest.split_whitespace().nth(1))
+        .collect();
+    assert!(commands.contains(&"post"));
+    assert!(
+        !commands
+            .iter()
+            .any(|verb| matches!(*verb, "send" | "key" | "turn"))
+    );
+}
+
+#[test]
+fn the_resident_skill_is_installed_for_claude_code() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    for agent in AGENT_FILES {
+        assert_eq!(
+            skills_for(agent.name)
+                .iter()
+                .any(|skill| doc_label(skill.path) == "aterm-resident"),
+            agent.name == "claude",
+            "{}",
+            agent.name
+        );
+    }
+    let path = home.path().join(".claude/skills/aterm-resident/SKILL.md");
+    let codex_path = home.path().join(".codex/skills/aterm-resident/SKILL.md");
+    let (out, code) = agents_report(home.path(), &["install".into(), "codex".into()]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!path.exists());
+    assert!(!codex_path.exists());
+    let (out, code) = agents_report(home.path(), &["install".into(), "claude".into()]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), RESIDENT_SKILL_BODY);
+    assert_eq!(
+        std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap(),
+        primer_block(Some("claude"))
+    );
+    let (out, code) = agents_report(home.path(), &["remove".into(), "claude".into()]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!path.exists());
 }
 
 /// THE CODEX CUSTOM PROMPT AN EARLIER ATERM WROTE IS DELETED by the automatic pass,
@@ -986,19 +1040,28 @@ fn a_skills_folder_two_agents_share_settles_and_outlives_one_agents_remove() {
     let (out, code) = agents_report(home.path(), &["install".to_string()]);
     assert_eq!(code, 0, "{out}");
     let rows = skill_rows(&out);
-    assert_eq!(rows.len(), 2 * n, "{out}");
+    let shared = skills_for("codex").len();
+    assert_eq!(rows.len(), n + shared, "{out}");
     assert!(rows.iter().all(|(_, v)| v == "already installed"), "{out}");
 
     for (agent, other) in [("codex", "claude"), ("claude", "codex")] {
         let (out, code) = agents_report(home.path(), &["remove".into(), agent.into()]);
         assert_eq!(code, 0, "{out}");
         let rows = skill_rows(&out);
-        assert_eq!(rows.len(), n, "{out}");
+        assert_eq!(rows.len(), skills_for(agent).len(), "{out}");
         let kept = format!("kept — {other} reads it too");
-        assert!(rows.iter().all(|(_, v)| v.starts_with(&kept)), "{out}");
-        assert_eq!(current(), n, "{agent}: {out}");
+        for (path, verdict) in &rows {
+            if doc_label(path) == "aterm-resident" {
+                assert_eq!(verdict, "removed", "{out}");
+            } else {
+                assert!(verdict.starts_with(&kept), "{out}");
+            }
+        }
+        assert_eq!(current(), skills_for(other).len(), "{agent}: {out}");
     }
 
+    let (out, code) = agents_report(home.path(), &["install".into(), "claude".into()]);
+    assert_eq!(code, 0, "{out}");
     let (out, code) = agents_report(
         home.path(),
         &["remove".into(), "claude".into(), "codex".into()],
@@ -1008,7 +1071,7 @@ fn a_skills_folder_two_agents_share_settles_and_outlives_one_agents_remove() {
     let verdicts: Vec<String> = skill_rows(&out).into_iter().map(|(_, v)| v).collect();
     assert_eq!(
         verdicts,
-        [vec!["removed"; n], vec!["nothing to remove"; n]].concat(),
+        [vec!["removed"; n], vec!["nothing to remove"; shared]].concat(),
         "{out}"
     );
 }

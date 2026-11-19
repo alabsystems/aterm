@@ -42,6 +42,9 @@ mod constructor_capabilities;
 #[path = "native_account_execution_tests.rs"]
 mod account_execution;
 #[cfg(unix)]
+#[path = "native_account_readmission_tests.rs"]
+mod account_readmission;
+#[cfg(unix)]
 #[path = "native_handoff_hold_tests.rs"]
 mod handoff_hold;
 #[cfg(unix)]
@@ -148,6 +151,9 @@ struct Facts {
     constructor_gate: Mutex<Option<PublicationGate>>,
     physical_target: Option<Vec<u8>>,
     account_allowed: AtomicBool,
+    /// What the account seat admits at Execute in place of the command's intent: the same login
+    /// captured afresh once its credential generation moved (`accounts_pool::execution_readmission`).
+    account_readmitted: Mutex<Option<aterm_agent::harness::accounts_pool::ExecutionIntent>>,
     reservation: Option<(Arc<Barrier>, Arc<Barrier>)>,
     completion_seen: AtomicBool,
     outcome_gate: Option<PublicationGate>,
@@ -344,6 +350,7 @@ impl Facts {
             constructor_gate: Mutex::new(None),
             physical_target: None,
             account_allowed: AtomicBool::new(true),
+            account_readmitted: Mutex::new(None),
             reservation: None,
             completion_seen: AtomicBool::new(false),
             outcome_gate: None,
@@ -910,11 +917,18 @@ impl Kernel for Facts {
         _: &RestartCommand,
         _: u32,
         _: Option<&ColdEnvironmentFacts>,
-    ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
-        self.account_allowed
-            .load(Ordering::SeqCst)
-            .then_some(None)
-            .ok_or(())
+        at: AccountAt,
+    ) -> Result<AccountGrant, ()> {
+        if !self.account_allowed.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        Ok((
+            None,
+            match at {
+                AccountAt::Execute => self.account_readmitted.lock().unwrap().clone(),
+                AccountAt::Signal => None,
+            },
+        ))
     }
     fn constructor_enabled(&self, _: Constructor) -> bool {
         let gate = self.constructor_gate.lock().unwrap().take();

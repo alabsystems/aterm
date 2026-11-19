@@ -246,6 +246,8 @@ pub(crate) enum Refusal {
     /// Another app is responsible for this window ([`FdaFacts::own`]): the probe read that app's
     /// grant, which aterm's page cannot change.
     NotOwn,
+    /// Nobody requested the offered grant on this Mac.
+    NotRequested,
 }
 
 impl Refusal {
@@ -261,6 +263,7 @@ impl Refusal {
             Self::Shown => "shown",
             Self::NoFullDiskAccess => "waits on full disk access",
             Self::NotOwn => "not own",
+            Self::NotRequested => "not requested",
         }
     }
 }
@@ -3384,6 +3387,24 @@ impl Lane {
     /// The grant reads held: nothing waits for the Full Disk Access page any longer.
     pub(crate) fn drop_queued_fda(&mut self) {
         self.fda_queued = None;
+    }
+
+    /// Retire queued automatic pages when the current setup has no request for these grants.
+    /// An explicit hand-over riding an automatic queue keeps its place. Returns whether the
+    /// launch's Full Disk Access hand-over was retired.
+    pub(crate) fn keep_explicit_handovers(&mut self, now: Instant) -> bool {
+        let launch_retired = self
+            .fda_queued
+            .as_ref()
+            .is_some_and(|q| q.origin == Origin::Automatic);
+        for slot in [&mut self.queued, &mut self.fda_queued] {
+            if slot.as_ref().is_some_and(|q| q.origin == Origin::Automatic) {
+                let rider = slot.take().and_then(|q| q.rider);
+                *slot =
+                    rider.map(|ask| Queued::in_place_of(None, ask.origin, ask.at, now, ask.listed));
+            }
+        }
+        launch_retired
     }
 
     /// [`Self::page_came_up`] for the Full Disk Access page.

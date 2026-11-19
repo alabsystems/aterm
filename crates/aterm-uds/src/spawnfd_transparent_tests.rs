@@ -348,13 +348,22 @@ fn a_variable_set_on_a_transparent_command_reaches_its_child_over_the_inherited_
 
 /// The staged half of [`a_transparent_run_is_the_std_run_it_replaces`].
 fn staged_signals() {
-    // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL`, and a mask change for this
-    // thread; each takes plain integers or a live local.
+    // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL` and the mask changes for this thread take
+    // plain integers or live locals.
     unsafe {
         signal(SIGHUP, SIG_DFL);
         signal(SIGUSR2, SIG_IGN);
+        // Model a launcher that leaves SIGINT blocked, then install the exact test mask.
+        let inherited = set_of(&[libc::SIGINT]);
+        assert_eq!(
+            pthread_sigmask(SIG_BLOCK, &inherited, std::ptr::null_mut()),
+            0
+        );
         let block = set_of(&[SIGUSR1, SIGTERM]);
-        assert_eq!(pthread_sigmask(SIG_BLOCK, &block, std::ptr::null_mut()), 0);
+        assert_eq!(
+            pthread_sigmask(libc::SIG_SETMASK, &block, std::ptr::null_mut()),
+            0
+        );
     }
     let dir = std::env::temp_dir().join(format!("spawnfd-transparent-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");

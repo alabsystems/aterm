@@ -29,6 +29,8 @@ pub enum Item {
     Halt(Record),
     /// One `EVENT …` line off aterm's push lane.
     Event(String),
+    /// The verb lane failed. This says nothing about the push lane's final bytes or EOF.
+    CommandLost,
     /// A `/f/<F>/in/<node>/>` record from the durable group, with the origin its tail stamped.
     Inbox(Record, Origin),
     /// A `/f/<F>/pub/*/*/say/>` broadcast record.
@@ -334,12 +336,19 @@ struct Queues {
     events_pushed: u64,
     inbox: Face,
     say: Face,
-    /// Closure notices, in arrival order: `Item::Closed`, `Item::Lost` and `Item::Refused` only.
+    /// Terminal notices, in arrival order: `Closed`, `CommandLost`, `Lost` and `Refused`.
     closed: VecDeque<Item>,
     /// Paused faces whose queue has drained: `Item::Resume`'s.
     resume: VecDeque<(Source, u64)>,
     /// The last `EVENT * bye <word>` the push reader read.
     bye: Option<aterm_types::fabric_grammar::Bye>,
+    /// Only the event reader supplies this terminal outcome, after its preceding bytes.
+    aterm_end: Option<End>,
+    command_lost: bool,
+    /// Teardown takes final words without blocking behind events the departed loop cannot serve.
+    aterm_draining: bool,
+    #[cfg(test)]
+    event_waiters: usize,
     /// How many of aterm's events the loop has taken in a row while an inbox record waited.
     events_run: u32,
     /// The inbox items the turn under way still takes: those queued when it began, at most
@@ -623,7 +632,7 @@ impl Queues {
         let at = self
             .closed
             .iter()
-            .position(|item| !matches!(item, Item::Closed(Source::Aterm)))?;
+            .position(|item| !matches!(item, Item::Closed(Source::Aterm) | Item::CommandLost))?;
         self.closed.remove(at)
     }
 
@@ -737,6 +746,19 @@ impl Mailbox {
         let face = &q.inbox;
         let unread = below.is_some_and(|to| to > 0 && face.unread(to - 1));
         (queued, unread)
+    }
+
+    /// Each inbox-group record queued for the loop whose subject starts with `prefix`, with its
+    /// offset and the origin its tail stamped: read off the bus, not yet handled
+    /// (`Bridge::take_undecided_in_hand`).
+    pub(crate) fn inbox_queued_records(&self, prefix: &str) -> Vec<(Record, Origin)> {
+        self.lock()
+            .inbox
+            .records
+            .iter()
+            .filter(|((_, subject, _), ..)| subject.starts_with(prefix))
+            .map(|(record, origin, ..)| (record.clone(), *origin))
+            .collect()
     }
 
     /// Whether a mark came to the inbox face's readers of the current generation: only the
@@ -904,8 +926,19 @@ impl Mailbox {
     /// Push one aterm `EVENT` line, waiting while the event queue is over its row bound.
     pub fn push_event(&self, line: String) {
         let mut q = self.lock();
-        while over_bound(q.events.len(), 0) {
+        while !q.aterm_draining && over_bound(q.events.len(), 0) {
+            #[cfg(test)]
+            {
+                q.event_waiters += 1;
+            }
             q = self.wait_for_room(q);
+            #[cfg(test)]
+            {
+                q.event_waiters -= 1;
+            }
+        }
+        if q.aterm_draining {
+            return;
         }
         let pushed = q.events_pushed;
         q.events_pushed = pushed.saturating_add(1);
@@ -959,8 +992,49 @@ impl Mailbox {
 
     /// Report that aterm went away.
     pub fn push_aterm_closed(&self) {
-        self.lock().closed.push_back(Item::Closed(Source::Aterm));
+        self.push_aterm_ended(End::Eof);
+    }
+
+    /// The push reader's own terminal result, never inferred from another connection's failure.
+    pub(crate) fn push_aterm_ended(&self, end: End) {
+        let mut q = self.lock();
+        q.aterm_end = Some(end);
+        q.closed.push_back(Item::Closed(Source::Aterm));
+        drop(q);
         self.ready.notify_all();
+    }
+
+    pub(crate) fn push_command_lost(&self) {
+        let mut q = self.lock();
+        if !q.command_lost {
+            q.command_lost = true;
+            q.closed.push_back(Item::CommandLost);
+        }
+        drop(q);
+        self.ready.notify_all();
+    }
+
+    pub(crate) fn command_lost(&self) -> bool {
+        self.lock().command_lost
+    }
+
+    pub(crate) fn aterm_end(&self) -> Option<End> {
+        self.lock().aterm_end
+    }
+
+    /// Stop waiting for event-queue room; the reader now drains only final protocol words.
+    pub(crate) fn drain_aterm(&self) {
+        self.lock().aterm_draining = true;
+        self.drained.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn event_waiters(&self) -> usize {
+        self.lock().event_waiters
+    }
+
+    pub(crate) fn aterm_draining(&self) -> bool {
+        self.lock().aterm_draining
     }
 
     /// Whether aterm's closure ([`Mailbox::push_aterm_closed`]) is queued.

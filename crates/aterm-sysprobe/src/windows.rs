@@ -488,6 +488,8 @@ pub fn memory_detail_of(
         exact: false,
         counters: None,
         memorystatus_level_pct: None,
+        headroom: None,
+        wall: None,
     })
 }
 

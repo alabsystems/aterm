@@ -180,7 +180,7 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
     until("fabric=connected after the restart", || {
         status(&w).contains(" fabric=connected ").then_some(())
     });
-    let landed_by = Instant::now() + harness::DEADLINE;
+    let mut patience = crate::patience::Patience::new(harness::DEADLINE);
     loop {
         if w.inbox(&sid)
             .iter()
@@ -188,15 +188,16 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
         {
             break;
         }
-        assert!(
-            Instant::now() < landed_by,
-            "the queued post never landed after the reconnect\n  inbox: {:#?}\n  ev: {:#?}\n  \
-             fabric status: {}\n  log tail:\n{}",
-            w.verb(&format!("@{sid} inbox --peek")).rows(),
-            w.ev(),
-            fabric_status(&w),
-            w.log_tail()
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the queued post never landed after the reconnect ({why})\n  inbox: {:#?}\n  \
+                 ev: {:#?}\n  fabric status: {}\n  log tail:\n{}",
+                w.verb(&format!("@{sid} inbox --peek")).rows(),
+                w.ev(),
+                fabric_status(&w),
+                w.log_tail()
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     let s = status(&w);

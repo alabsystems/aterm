@@ -546,6 +546,7 @@ pub(crate) fn owner_input(snap: &Snapshot) -> DeckInput<'_> {
         network_place: None,
         network_target: crate::network_deck::Target::Overview,
         disk_span: crate::stats_lens::DiskSpan::Day,
+        cpu_policy_pending: false,
         lab: None,
         fleet: None,
         snap: Some(snap),

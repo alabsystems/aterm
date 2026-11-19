@@ -15,7 +15,15 @@
 //! it. Selection policy (signed out or not enrolled, a usage limit, the owner's pin or a pending
 //! one, and `accounts = "off"` naming another login) is checked only for a [`Purpose::Select`]
 //! intent: a [`Purpose::SameLogin`] relaunch replaces the process already running on that exact
-//! credential and chooses nothing.
+//! credential and chooses nothing, and a [`Purpose::Rebind`] relaunch moves that process's
+//! account off a login its row left onto the row's current one, so only that new login's sign-in
+//! here is asked of it.
+//!
+//! A login no row holds now that a row or binding retains (the login a renewal or a sign-in moved
+//! its row off, or one a withdrawn account kept) identifies an account but never authorizes
+//! running that superseded credential again ([`RefusalKind::Retained`]): a relaunch moves onto the
+//! row's current login instead ([`relaunch_rebind`]), as a cold relaunch and a turn end's login
+//! follow do.
 
 use super::*;
 
@@ -25,6 +33,14 @@ pub enum Purpose {
     /// The command keeps the exact credential the process it replaces runs on (the same stored
     /// login under the same home, or the same token route): integrity alone.
     SameLogin,
+    /// The command moves the process it replaces, on a login its account's row left for a newer
+    /// one ([`Row::was`]), onto that row's current login ([`relaunch_rebind`]): integrity, and the
+    /// row's current stored login signed in here, since the credential changes. Never a usage
+    /// limit or a pin: the account is the one the process runs on, so their standing is what it
+    /// was on the login it left, as for [`Self::SameLogin`]. Only a command that replaces a live
+    /// process rebinds: a relaunch after its agent ended (a cold relaunch included) starts a new
+    /// runner on the row's current login, and selects.
+    Rebind,
     /// The command selects its login: integrity and the selection policy. A record that names no
     /// purpose reads as this one, the stricter.
     Select,
@@ -36,8 +52,16 @@ impl Purpose {
     const fn word(self) -> Option<&'static str> {
         match self {
             Self::SameLogin => Some("same-login"),
+            Self::Rebind => Some("rebind"),
             Self::Select => None,
         }
+    }
+
+    /// The purpose whose [`Self::word`] a record names: `None` for any word no purpose writes.
+    fn of_word(word: &str) -> Option<Self> {
+        [Self::SameLogin, Self::Rebind]
+            .into_iter()
+            .find(|purpose| purpose.word() == Some(word))
     }
 }
 
@@ -56,9 +80,17 @@ pub enum RefusalKind {
     Unattributed,
     /// The account records, the login's files or the selection configuration cannot be read.
     Unread,
-    /// The login's ownership or identity does not hold: an ambiguous or unbound owner, a token
-    /// entry or an identity of another account, a custom home over managed storage.
+    /// The login's ownership or identity does not hold: an ambiguous owner, a login that differs
+    /// from a row's only in letter case (never shown to be one directory), a token entry or an
+    /// identity of another account (a retained login whose own file names another account than
+    /// the row that left it included), a custom home over managed storage.
     Integrity,
+    /// The login is one no row holds now that a row or binding retains: the login its account's
+    /// row left for a newer one, or one an account no longer listed here kept. A superseded
+    /// credential is never run again; a relaunch moves onto the row's current login instead
+    /// ([`relaunch_rebind`]), so what is left waits on a person: the account listed again, or the
+    /// session moved.
+    Retained,
     /// The vault token the route names is not in use on this Mac (none, ended, rejected,
     /// mismatched, unreadable here, unverified with windows that differ here, or unverified off
     /// the Mac that minted it at a person's terminal), or this platform has no token route: a new
@@ -81,12 +113,13 @@ pub enum RefusalKind {
 
 impl RefusalKind {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Lock,
         Self::Changing,
         Self::Unattributed,
         Self::Unread,
         Self::Integrity,
+        Self::Retained,
         Self::Token,
         Self::SignedOut,
         Self::Limited,
@@ -107,6 +140,7 @@ impl RefusalKind {
             Self::Unattributed => "account-unattributed",
             Self::Unread => "account-unread",
             Self::Integrity => "account-integrity",
+            Self::Retained => "account-retained",
             Self::Token => "account-token",
             Self::SignedOut => "account-policy-signed-out",
             Self::Limited => "account-policy-limited",
@@ -122,7 +156,9 @@ impl RefusalKind {
         Self::ALL.into_iter().find(|kind| kind.word() == word)
     }
 
-    /// Whether only a [`Purpose::Select`] admission refuses for this kind.
+    /// Whether this kind is the selection policy's: a [`Purpose::Select`] admission holds its
+    /// login's row to each one, a [`Purpose::Rebind`] to its new login's sign-in alone
+    /// ([`Self::SignedOut`]), and a [`Purpose::SameLogin`] to none.
     #[must_use]
     pub const fn policy(self) -> bool {
         match self {
@@ -131,6 +167,7 @@ impl RefusalKind {
             | Self::Unattributed
             | Self::Unread
             | Self::Integrity
+            | Self::Retained
             | Self::Token
             | Self::Lease
             | Self::Held => false,
@@ -355,6 +392,60 @@ impl ExecutionIntent {
             }
     }
 
+    /// Whether this intent may stand for a command that replaces the live process `who` (its exec
+    /// environment, independently observed): [`Self::matches_process`], with the owner's token
+    /// entry read from `roster` where `who` runs on a vault token; or, for a [`Purpose::Rebind`]
+    /// intent, `who` on its own account's credential (its stored login, or the vault token of the
+    /// intent's owner row) under the same user home, on a login that row left ([`Row::was`] of
+    /// `roster`, bound by this Mac's login records, [`accounts::bound`]; a directory shown to be
+    /// one it lists, never one spelling but for case alone, [`accounts::left_directory`]): the
+    /// command moves that very account onto its row's current login. `None` for `roster` names no
+    /// owner row, so it admits only what [`Self::matches_process`] admits with no token entry.
+    #[must_use]
+    pub fn replaces_process(
+        &self,
+        who: &accounts::ProcessLogin,
+        same_user_home: bool,
+        roster: Option<&Roster>,
+    ) -> bool {
+        let owner_entry = match who.route {
+            accounts::AuthRoute::VaultToken { .. } => {
+                roster.and_then(|roster| self.owner_entry(roster))
+            }
+            accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => None,
+        };
+        if self.matches_process(who, same_user_home, owner_entry) {
+            return true;
+        }
+        let (Self::Stored {
+            owner,
+            purpose: Purpose::Rebind,
+            ..
+        }
+        | Self::Token {
+            owner,
+            purpose: Purpose::Rebind,
+            ..
+        }) = self
+        else {
+            return false;
+        };
+        let Some(row) = owner
+            .as_deref()
+            .and_then(|label| roster.and_then(|roster| roster.row(label)))
+        else {
+            return false;
+        };
+        let on_row = match who.route {
+            accounts::AuthRoute::Stored => true,
+            accounts::AuthRoute::VaultToken { entry } => {
+                Some(entry) == accounts::TokenEntry::of_row(row)
+            }
+            accounts::AuthRoute::Outside => false,
+        };
+        same_user_home && who.default_home && on_row && left_login(row, who.login.as_deref())
+    }
+
     /// Canonical storage containing no credential values or file contents.
     #[must_use]
     pub fn to_value(&self) -> aterm_json::Value {
@@ -488,8 +579,7 @@ impl ExecutionIntent {
                 // selection's, the stricter; a named one is only the word `with_purpose` writes.
                 let purpose = match value.get("purpose") {
                     None => Purpose::Select,
-                    Some(word) if word.as_str() == Purpose::SameLogin.word() => Purpose::SameLogin,
-                    Some(_) => return None,
+                    Some(word) => Purpose::of_word(word.as_str()?)?,
                 };
                 if route == "token" {
                     Self::Token {
@@ -801,6 +891,97 @@ fn owner_may_run_here(row: &Row, state: &accounts::State, now: i64) -> Result<()
     })
 }
 
+/// Whether `row`'s current stored login is signed in here ([`accounts::stored_login_wants_sign_in`]
+/// says it wants none: a login is made here and is not signed out, whatever its walls say): what a
+/// [`Purpose::Rebind`] asks of the login it moves onto, and whether the row can take a relaunch off
+/// a login it left ([`relaunch_rebind`]).
+fn serves_stored(cli: Cli, seat: &Seat<'_>, snapshot: &PoolSnapshot, row: &Row) -> bool {
+    let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
+    !accounts::stored_login_wants_sign_in(
+        row,
+        &snapshot.state,
+        enrolled.contains(&row.label),
+        seat.now,
+    )
+}
+
+/// Whether `row` left the login `login` (`None` or empty: the default home's) for a newer one: its
+/// [`Row::was`] lists a directory shown to be it, never one spelling but for case alone
+/// ([`accounts::left_directory`]). A directory that cannot be resolved is not shown to be one.
+fn left_login(row: &Row, login: Option<&str>) -> bool {
+    match login.filter(|login| !login.is_empty()) {
+        None => row.was.contains(&None),
+        Some(login) => accounts::left_directory(&row.was, login).unwrap_or(false),
+    }
+}
+
+/// Whether `intent`'s owner row, as `snapshot` binds it, left the login the intent names for a
+/// newer one ([`left_login`]) and does not hold it now ([`accounts::rows_at`], `default` the
+/// native default home's canonical login): that login is the account's superseded credential, which
+/// no admission grants again and no plan made now names, since a relaunch moves onto the row's
+/// current login ([`relaunch_rebind`]). `false` for an intent that names no owner row, or an owner
+/// the roster no longer lists.
+fn owner_left(intent: &ExecutionIntent, snapshot: &PoolSnapshot, default: &Path) -> bool {
+    let (ExecutionIntent::Stored { login, owner, .. }
+    | ExecutionIntent::Token { login, owner, .. }) = intent
+    else {
+        return false;
+    };
+    let Some(row) = owner
+        .as_deref()
+        .and_then(|label| snapshot.roster.row(label))
+    else {
+        return false;
+    };
+    let Some(directory) = login.as_deref().or_else(|| default.to_str()) else {
+        return false;
+    };
+    left_login(row, login.as_deref())
+        && accounts::rows_at(std::slice::from_ref(row), directory, default)
+            .is_ok_and(|at| at.same.is_empty())
+}
+
+/// Why [`execution_readmission`] stops an intent whose owner row left its login since the plan
+/// ([`owner_left`]).
+const OWNER_LEFT: &str = "execution login is one its account left for a newer login since its plan";
+
+/// The refusal of `login` (`None`: the default home's), which no row holds now and `retainer`'s
+/// row or binding retains ([`accounts::retained_directory_owner_at`]): never run again, and never
+/// read as a fault of the records ([`RefusalKind::Retained`]) unless it contradicts them. Where
+/// `retainer` is a row of `roster`, that row left the login for a newer one: the login is that
+/// row's superseded credential, unless its own file names another account than the row's, an
+/// identity contradiction ([`RefusalKind::Integrity`], as [`check_login_identity`] reads it, so a
+/// login that names an account no row lists is never filed under the row that left it). Where no
+/// row of `roster` is `retainer`, an account no longer listed here kept it.
+fn retained(
+    cli: Cli,
+    home: &Path,
+    roster: &Roster,
+    retainer: &str,
+    login: Option<&str>,
+) -> Refusal {
+    let Some(row) = roster.row(retainer) else {
+        return Refusal::new(
+            RefusalKind::Retained,
+            "execution login belongs to an account no longer listed here",
+        );
+    };
+    let at = Row {
+        dir: login.map(str::to_owned),
+        ..row.clone()
+    };
+    match check_login_identity(cli, &at, home) {
+        Err(_) => Refusal::new(
+            RefusalKind::Integrity,
+            "execution login names another account than the one that left it",
+        ),
+        Ok(()) => Refusal::new(
+            RefusalKind::Retained,
+            "execution login is one its account left for a newer login",
+        ),
+    }
+}
+
 pub(super) fn capture_held(
     seat: &Seat<'_>,
     cli: Cli,
@@ -844,18 +1025,32 @@ pub(super) fn capture_held(
         ));
     }
     let mode = config.accounts_for(cli.program());
-    let mut label = None;
-    for row in &snapshot.roster.rows {
-        let row_directory =
-            accounts::canonical_directory(row.dir.as_deref().map(Path::new).unwrap_or(&default))
-                .map_err(Refusal::of(Unread))?;
-        if row_directory == directory && label.replace(row.label.as_str()).is_some() {
+    let directory = directory
+        .to_str()
+        .ok_or_else(|| Refusal::new(Integrity, "execution login is not UTF-8"))?;
+    // The rows whose login this is, shown to be one directory ([`accounts::rows_at`]): a current
+    // row's directory reached by another path is that row's. A row's directory that only one
+    // spelling but for ASCII case relates to it may be another directory (a leaf not made yet, a
+    // case-sensitive volume): this login is then neither that row's, whose identity and binding
+    // say nothing of it, nor no account's, so it is refused, as the retained check below would.
+    let at = accounts::rows_at(&snapshot.roster.rows, directory, &default)
+        .map_err(Refusal::of(Unread))?;
+    if !at.case_only.is_empty() {
+        return Err(Refusal::new(
+            Integrity,
+            "execution login differs from an account's login only in letter case",
+        ));
+    }
+    let label = match at.same.as_slice() {
+        [] => None,
+        [row] => Some(row.label.as_str()),
+        [_, _, ..] => {
             return Err(Refusal::new(
                 Integrity,
                 "execution login has ambiguous account ownership",
             ));
         }
-    }
+    };
     let selection = match purpose {
         Purpose::Select => Some(Selection::read(
             seat,
@@ -865,25 +1060,35 @@ pub(super) fn capture_held(
             label,
             login.is_some(),
         )?),
-        Purpose::SameLogin => None,
+        Purpose::SameLogin | Purpose::Rebind => None,
     };
     let (owner, generation) = match label {
+        // A rebind moves onto its row's current login: one no row holds is no longer the login
+        // its plan named. Before the signal the next look plans again; once its agent ended no
+        // plan names the intent again, and its readmission stops where the owner row left the
+        // login ([`owner_left`]).
+        None if purpose == Purpose::Rebind => {
+            return Err(Refusal::new(
+                Changing,
+                "execution account's current login moved before admission",
+            ));
+        }
         None => {
-            if accounts::retained_directory_owner_at(
+            if let Some(retainer) = accounts::retained_directory_owner_at(
                 &snapshot.logins,
                 &snapshot.roster.rows,
                 "",
-                directory
-                    .to_str()
-                    .ok_or_else(|| Refusal::new(Integrity, "execution login is not UTF-8"))?,
+                directory,
                 Some(&default),
             )
             .map_err(Refusal::of(Unread))?
-            .is_some()
             {
-                return Err(Refusal::new(
-                    Integrity,
-                    "execution login has no current account binding",
+                return Err(retained(
+                    cli,
+                    seat.home,
+                    &snapshot.roster,
+                    retainer,
+                    login.as_deref(),
                 ));
             }
             match token {
@@ -917,6 +1122,18 @@ pub(super) fn capture_held(
             owner_may_run_here(row, &snapshot.state, seat.now)?;
             if let Some(selection) = &selection {
                 selection.admits(row, &snapshot.state, seat.now, token.is_none())?;
+            }
+            // A rebind's credential changes: the row's current stored login must be signed in
+            // here, as [`Selection::admits`] asks of a stored login, and nothing else of the
+            // selection policy. A token route keeps the token it runs on, whatever the login.
+            if purpose == Purpose::Rebind
+                && token.is_none()
+                && !serves_stored(cli, seat, snapshot, row)
+            {
+                return Err(Refusal::new(
+                    RefusalKind::SignedOut,
+                    "execution account's new login is not signed in here",
+                ));
             }
             match token {
                 None => {
@@ -1028,6 +1245,111 @@ pub fn capture_execution(
     let snapshot =
         snapshot_held(seat, cli, &store, &held).map_err(Refusal::of(RefusalKind::Unread))?;
     capture_held(seat, cli, who, &snapshot, purpose)
+}
+
+/// What an in-place relaunch starts on in place of the login its process runs on, where that is a
+/// login its account's row left for a newer one ([`relaunch_rebind`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Rebind {
+    /// The row's current login, which is signed in here (or the process runs on the row's vault
+    /// token, which keeps serving it): the line's intent is a [`Purpose::Rebind`] where it
+    /// replaces the live process on the login the row left.
+    Row(LoginEnv),
+    /// The pool's pick on the records, where the row's current login is not signed in here: the
+    /// owner's pin first, then the row's current login on the row's own vault token, where only
+    /// that token runs the row here and the line serves it, then [`accounts::launch_row`]'s pick
+    /// of another row, each under the launch-time token guard as the line starts it. A move onto
+    /// the row's vault token or onto another account, whose intent selects ([`Purpose::Select`]):
+    /// either starts a new runner on a credential the live process does not run on.
+    Pick(LoginEnv),
+}
+
+impl Rebind {
+    /// The login the line carries.
+    #[must_use]
+    pub const fn login(&self) -> &LoginEnv {
+        match self {
+            Self::Row(login) | Self::Pick(login) => login,
+        }
+    }
+}
+
+/// What an in-place relaunch of a Claude Code process on `who` (an upgrade, a native upgrade, a
+/// restart in place) starts on, where `who` runs on its own credential in the default home, on a
+/// login no row holds now and a row is attributed (the row that left it, or the row its login
+/// file names: [`rebound_login`], the one rule a cold relaunch follows too): that row's current
+/// login where it is signed in here ([`Rebind::Row`]), else the pool's pick on the records, taking
+/// no usage read and writing nothing ([`Rebind::Pick`]). The pick judges each row as the line
+/// starts it: a row only its vault token keeps running here is picked only where `serves`, the
+/// line's own token judgment of a start on that row, says the token serves it (never for a line
+/// that cannot carry the wrapper), since the line otherwise starts on the row's lapsed stored
+/// login, which its admission refuses on every pass while the records stand
+/// ([`accounts::token_guarded`], the cold relaunch's guard). Past the owner's pin, the pick is the
+/// row itself where only its vault token runs it here and the relaunch keeps it by the cold
+/// relaunch's rule (no other Mac holds it, the claims admit this Mac, no limit holds it, and
+/// `serves` says the token serves the line): its current login on that token, a move onto the
+/// token that selects as every such move does. It never stops at the row itself while another
+/// row serves. A retained login is never run again
+/// ([`RefusalKind::Retained`]), so the relaunch moves off it, as a turn end's login follow and a
+/// cold relaunch do. `Ok(None)` keeps the login: a row holds it now, no row is attributed (a login
+/// its admission then judges: an unowned login, a retained one, or one whose file names an
+/// account no row lists), the route is not the account's own, or the home is custom.
+///
+/// # Errors
+/// [`RefusalKind::SignedOut`] where the row's current login is not signed in here, its vault token
+/// does not carry the line, and no other row serves (rotation off, the pin's row unavailable, or
+/// no row usable); [`RefusalKind::Integrity`]
+/// where several rows left the login and nothing the process runs on names one of them, so the
+/// records cannot say whose account it runs on; [`RefusalKind::Lock`] or [`RefusalKind::Unread`]
+/// where the account records cannot be read under the writer.
+pub fn relaunch_rebind(
+    seat: &Seat<'_>,
+    who: &accounts::ProcessLogin,
+    serves: &mut dyn FnMut(&Row) -> bool,
+) -> Result<Option<Rebind>, Refusal> {
+    let cli = Cli::Claude;
+    let own = match who.route {
+        accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => true,
+        accounts::AuthRoute::Outside => false,
+    };
+    if !own || !who.default_home || !cli.accounts().measured || seat.keyring_held(cli) {
+        return Ok(None);
+    }
+    let store = seat.store(cli);
+    let held = writer(&store)?;
+    let snapshot =
+        snapshot_held(seat, cli, &store, &held).map_err(Refusal::of(RefusalKind::Unread))?;
+    drop(held);
+    let Some(row) = rebound_login(cli, &snapshot.roster, who, seat.home)
+        .map_err(|why| Refusal::new(RefusalKind::Integrity, why))?
+    else {
+        return Ok(None);
+    };
+    let (var, value) = accounts::login_env_for(cli, row);
+    let current = LoginEnv {
+        label: row.label.clone(),
+        var,
+        value,
+    };
+    let token = matches!(who.route, accounts::AuthRoute::VaultToken { .. });
+    if token || serves_stored(cli, seat, &snapshot, row) {
+        return Ok(Some(Rebind::Row(current)));
+    }
+    let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
+    (seat.mode_for(cli) != Mode::Off)
+        .then(|| records_pick(seat, cli, &snapshot, &enrolled, row, serves))
+        .flatten()
+        .map(|pick| Some(Rebind::Pick(pick)))
+        .ok_or_else(|| {
+            Refusal::new(
+                RefusalKind::SignedOut,
+                format!(
+                    "execution account {}'s new login is not signed in here, and no other account \
+                     serves",
+                    row.label
+                ),
+            )
+        })
 }
 
 /// Admit a custom stored-login route only while its effective credential
@@ -1178,8 +1500,9 @@ pub enum Unadmitted {
     /// A refusal that may lift ([`execution_admission`]'s): the next look admits again.
     Refused(Refusal),
     /// The login is no longer filed as the retained intent names it: captured afresh for its
-    /// purpose, it names another owner row or another namespace, so no admission of that intent
-    /// can match again. Its kind is [`RefusalKind::Changing`].
+    /// purpose, it names another owner row or another namespace, or the intent's owner row left
+    /// it for a newer login since ([`owner_left`]), so no admission of that intent can match
+    /// again. Its kind is [`RefusalKind::Changing`].
     Moved(Refusal),
 }
 
@@ -1201,11 +1524,14 @@ impl Unadmitted {
 /// the caller to keep before it executes. The fresh capture holds every check the purpose names,
 /// and it names the same namespace, selector, owner row and route, so it grants the same login
 /// that a plan made now would. Every other refusal is [`execution_admission`]'s, and a fresh
-/// capture naming another owner row or namespace is [`Unadmitted::Moved`].
+/// capture naming another owner row or namespace is [`Unadmitted::Moved`], as is a login the
+/// intent's owner row left for a newer one since (a renewal or a sign-in of that row after the
+/// signal): no plan names the intent again to move its line onto the row's current login.
 ///
 /// # Errors
 /// [`Unadmitted::Refused`] as [`execution_admission`] refuses; [`Unadmitted::Moved`] where the
-/// login is filed under another owner row or namespace than the intent names.
+/// login is filed under another owner row or namespace than the intent names, or its owner row
+/// left it.
 pub fn execution_readmission(
     seat: &Seat<'_>,
     cli: Cli,
@@ -1214,33 +1540,39 @@ pub fn execution_readmission(
     admission(seat, cli, intent, true)
 }
 
-/// Whether `current`, captured afresh for `retained`'s purpose, names the same login on the same
-/// route for the same owner row in the same namespace as `retained`: equal but for a stored
-/// login's credential generation.
-fn same_login(current: &ExecutionIntent, retained: &ExecutionIntent) -> bool {
-    match (current, retained) {
-        (
-            ExecutionIntent::Stored {
-                namespace,
-                login,
-                owner,
-                purpose,
-                generation: _,
-            },
-            ExecutionIntent::Stored {
-                namespace: was_namespace,
-                login: was_login,
-                owner: was_owner,
-                purpose: was_purpose,
-                generation: _,
-            },
-        ) => {
-            namespace == was_namespace
-                && login == was_login
-                && owner == was_owner
-                && purpose == was_purpose
+impl ExecutionIntent {
+    /// Whether this intent, captured afresh for `retained`'s purpose, names the same login on the
+    /// same route for the same owner row in the same namespace as `retained`: equal but for a
+    /// stored login's credential generation. It is what [`execution_readmission`] admits in
+    /// place of `retained`, and all a reader of that admission (a native restart's completion,
+    /// which names the intent its Execute admitted) may take in its place: never another owner,
+    /// namespace, selector, route or purpose.
+    #[must_use]
+    pub fn same_login(&self, retained: &Self) -> bool {
+        match (self, retained) {
+            (
+                Self::Stored {
+                    namespace,
+                    login,
+                    owner,
+                    purpose,
+                    generation: _,
+                },
+                Self::Stored {
+                    namespace: was_namespace,
+                    login: was_login,
+                    owner: was_owner,
+                    purpose: was_purpose,
+                    generation: _,
+                },
+            ) => {
+                namespace == was_namespace
+                    && login == was_login
+                    && owner == was_owner
+                    && purpose == was_purpose
+            }
+            _ => self == retained,
         }
-        _ => current == retained,
     }
 }
 
@@ -1279,7 +1611,7 @@ fn admission(
     let held = writer(&store).map_err(Unadmitted::Refused)?;
     let snapshot = execution_snapshot_readonly(seat, cli, &store, &held)
         .map_err(|why| Unadmitted::Refused(Refusal::new(Unread, why)))?;
-    let current = capture_held(
+    let current = match capture_held(
         seat,
         cli,
         &accounts::ProcessLogin {
@@ -1289,8 +1621,20 @@ fn admission(
         },
         &snapshot,
         purpose,
-    )
-    .map_err(Unadmitted::Refused)?;
+    ) {
+        Ok(current) => current,
+        // Once its agent ended nothing plans the intent again, so a login its owner row left
+        // since the plan (a renewal or a sign-in after the signal) can never be admitted again:
+        // the readmission stops rather than waits, whatever the capture's own refusal says.
+        Err(_)
+            if renew
+                && accounts::canonical_directory(&seat.home.join(cli.accounts().default_home))
+                    .is_ok_and(|default| owner_left(intent, &snapshot, &default)) =>
+        {
+            return Err(Unadmitted::Moved(Refusal::new(Changing, OWNER_LEFT)));
+        }
+        Err(refusal) => return Err(Unadmitted::Refused(refusal)),
+    };
     // The whole intent, its purpose included: a capture for one purpose never stands for the
     // other's. A readmission takes a fresh capture of the same login in its place.
     let renewed = if current == *intent {
@@ -1300,7 +1644,7 @@ fn admission(
             Changing,
             "execution account namespace or credential generation changed",
         )));
-    } else if same_login(&current, intent) {
+    } else if current.same_login(intent) {
         Some(current)
     } else {
         return Err(Unadmitted::Moved(Refusal::new(

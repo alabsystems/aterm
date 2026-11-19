@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The tests gated `cfg(unix)` here start a manual renewal or a native enrollment, which only
-// Unix runs (`accounts::manual_signin_capability`).
-#![cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "some helpers serve only the tests gated `cfg(unix)`"
-    )
-)]
+// The tests gated `cfg(unix)` here reach what aterm has only on Unix: a file mode, a symbolic
+// link, a signal, a `/bin/sh` stand-in, or a part built only there (native credential custody,
+// native fleet renewal, the vault-token, Google and agy sign-ins, the Kimi pool's overlay
+// staging home, aterm's own browser window, the test sleep seam).
 
 use super::*;
 use std::cell::RefCell;
@@ -212,7 +207,6 @@ impl Bed {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn manual_renewals_recover_or_refuse_before_dispatching_any_provider() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Kimi, Cli::Grok] {
@@ -983,7 +977,6 @@ fn native_enrollment_keeps_completed_held_artifact_running_without_a_second_prov
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn queued_due_reread_recovers_a_completed_checkpoint_with_its_original_signer() {
     struct Queued<'a> {

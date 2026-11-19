@@ -195,6 +195,8 @@ fn a_verified_peers_new_port_is_dialled_before_the_crowd() {
 ///
 /// NEGATIVE CONTROL (run here): with no candidate leading ([`UNLED`]), the old address order
 /// dials the crowd first after a restart.
+/// NEGATIVE CONTROL (2026-11-15, an inverse edit then undone): with the bound read as 32, as it
+/// was, 256 seats kept 32 (`left: 32, right: 255`).
 #[test]
 fn a_remembered_endpoint_is_dialled_first_after_a_restart() {
     let (heard, unheard, stale): (SocketAddr, SocketAddr, SocketAddr) = (
@@ -296,17 +298,74 @@ fn a_remembered_endpoint_is_dialled_first_after_a_restart() {
 
     let mut many = hints();
     let now = Instant::now() + Duration::from_secs(3600);
-    for n in 0..=MAX_REMEMBERED as u8 {
-        let address = SocketAddr::from(([10, 1, 3, n + 1], 1000));
-        many.keep([n; 48], address, now - Duration::from_secs(u64::from(n)));
+    let seats = u16::try_from(MAX_REMEMBERED).unwrap() + 1;
+    for n in 0..seats {
+        many.keep(
+            numbered(n),
+            numbered_at(n),
+            now - Duration::from_secs(u64::from(n)),
+        );
     }
     let kept = many.remembered(now, wall_ms).unwrap();
     assert_eq!(kept.len(), MAX_REMEMBERED);
     assert!(
-        kept.iter()
-            .all(|entry| entry.actor != [MAX_REMEMBERED as u8; 48]),
+        kept.iter().all(|entry| entry.actor != numbered(seats - 1)),
         "the oldest seat is the one forgotten"
     );
+    let bytes = Remembered::encode(&scope, &kept);
+    assert_eq!(
+        bytes.len(),
+        REMEMBERED_MAX,
+        "a full file is the most there is to read"
+    );
+    assert_eq!(
+        bytes[REMEMBERED_MAGIC.len() + scope.len()],
+        u8::try_from(MAX_REMEMBERED).unwrap()
+    );
+    let mut sorted = kept.clone();
+    sorted.sort_by_key(|entry| entry.actor);
+    assert_eq!(Remembered::decode(&scope, &bytes), Some(sorted));
+}
+
+/// The `n`th of many seats (tests).
+fn numbered(n: u16) -> Actor {
+    let mut actor = [0x5a; 48];
+    actor[..2].copy_from_slice(&n.to_be_bytes());
+    actor
+}
+
+/// The `n`th of many seats' endpoint, each at an address of its own (tests).
+fn numbered_at(n: u16) -> SocketAddr {
+    let [high, low] = n.to_be_bytes();
+    SocketAddr::from(([10, 2, high, low], 1000))
+}
+
+/// The remembered endpoints' file is written as the seats it keeps change, never while the same
+/// seats keep answering: 64 seats, each at its own address, take ten turns each, one round a
+/// second, and each turn reads what to keep as a transport's tick does
+/// ([`Hints::remembered`]). The first pass meets each seat, a change each; the nine after it
+/// change nothing, under the hour after which kept times are refreshed.
+///
+/// NEGATIVE CONTROL (2026-11-15, an inverse edit then undone): with the bound read as 32, as it
+/// was, each pass forgot every seat before its next round and kept it again, 64 changes a pass
+/// (`left: [64, 64, 64, 64, 64, 64, 64, 64, 64, 64]`).
+#[test]
+fn the_remembered_file_is_not_rewritten_while_the_same_seats_keep_answering() {
+    let mut hints = hints();
+    let start = Instant::now() + Duration::from_secs(3600);
+    let mut changes = Vec::new();
+    let mut at = start;
+    for _ in 0..10 {
+        let mut pass = 0;
+        for n in 0..64 {
+            at += Duration::from_secs(1);
+            hints.keep(numbered(n), numbered_at(n), at);
+            pass += usize::from(hints.remembered(at, 0).is_some());
+        }
+        changes.push(pass);
+    }
+    assert!(at < start + REMEMBER_REFRESH);
+    assert_eq!(changes, [64, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 }
 /// CR1: beacons forged from a peer's address, a new port every few hundred ms, lead one
 /// dial per round the peer makes from there: a led dial that authenticates nobody spends the
@@ -1049,8 +1108,10 @@ fn dials_in_ten_minutes(mut outcome: impl FnMut(usize) -> Outcome) -> usize {
 
 /// One established endpoint over sixty virtual minutes of ticks 100 ms apart, with no beacon
 /// to time a probe: each dial completes at once as a round that moved nothing and had no table
-/// exchange, and where `dials_in` its seat completes a round dialled in every two seconds
-/// ([`Hints::vouch`]). When each of this side's own dials began, with whether it was an audit.
+/// exchange, and where `dials_in` its seat completes a round dialled in every two seconds, whose
+/// table lists were whole, each settled and vouched as the transport takes it
+/// ([`Hints::settle`], [`Hints::vouch`]). When each of this side's own dials began, with whether
+/// it was an audit.
 fn own_dials_in_an_hour(
     dials_in: bool,
     flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
@@ -1070,11 +1131,15 @@ fn own_dials_in_an_hour(
             let since = Duration::from_millis(100 * tick);
             let now = start + since;
             if dials_in && tick > 0 && tick % 20 == 0 {
+                let incoming = Repair::heard_from(actor).applied(crate::replica::Report::default());
+                hints.settle(actor, None, now, &incoming, now);
                 hints.vouch(peer.ip(), actor, now);
             }
             if let Some((address, repair)) = hints.next(now) {
                 dialled.push((since, repair.audited()));
-                hints.finish(address, Repair::heard_from(actor), quiet, now);
+                let round = Repair::heard_from(actor);
+                hints.settle(actor, Some(address), now, &round, now);
+                hints.finish(address, round, quiet, now);
             }
             assert!(
                 hints.established(peer),
@@ -1093,6 +1158,9 @@ fn own_dials_in_an_hour(
 /// held for its quiet-round hold, which this rest replaces).
 /// MUTANT (`QUIET_REDIALS`): a quiet round's endpoint is due an ordinary interval on, as before
 /// the rest: over 700 dials an hour.
+/// NEGATIVE CONTROL (2026-11-16, run once): with every round dialled in owing the seat a round
+/// (`Hints::owe` arming a take for each, whatever its handoff said), the run with rounds dialled
+/// in made 1,800 dials of its own in the hour, one after each of them.
 #[test]
 fn a_settled_endpoint_is_dialled_once_an_audit_whoever_dials_in() {
     // Rounds dialled in draw this side's jitter afresh, so each run's audits fall apart; each
@@ -1174,8 +1242,8 @@ fn audited_round(table: Digest) -> crate::replica::Report {
     crate::replica::Report {
         table: Some(table),
         caught_up: true,
-        witnesses_asked: true,
-        regular: true,
+        asked: Some(crate::replica::Ask::First),
+        turn: Some(crate::replica::TableTurn::Regular),
         ..Default::default()
     }
 }
@@ -1285,21 +1353,21 @@ fn an_audit(
             ..Default::default()
         };
         let led = swept().applied(led);
-        hints.settle(actor, Some(address), walked, &led);
+        hints.settle(actor, Some(address), walked, &led, walked);
         hints.finish(address, led, quiet, walked);
         let kept = hints.next_at(peer) == due;
 
         let now = hints.next_at(peer);
         let (address, first) = hints.next(now).expect("its audit");
         let differed = crate::replica::Report {
-            regular: false,
+            turn: Some(crate::replica::TableTurn::Visit),
             ..audited_round(moved)
         };
         hints.finish(address, swept().applied(differed), quiet, now);
         let now = hints.next_at(peer);
         let (address, second) = hints.next(now).expect("the audit goes on");
         let turned = crate::replica::Report {
-            witnesses_asked: false,
+            asked: None,
             ..audited_round(table)
         };
         hints.finish(address, swept().applied(turned), quiet, now);
@@ -1593,7 +1661,7 @@ fn completes(
         Some(report) => repair.applied(report),
         None => repair,
     };
-    hints.settle(actor, Some(address), started, &repair);
+    hints.settle(actor, Some(address), started, &repair, now);
     let outcome = Outcome::of(true, &repair, None);
     hints.finish(address, repair, outcome, now);
 }
@@ -1838,7 +1906,7 @@ fn a_seat_that_dials_in_is_settled_by_a_round_over_the_table() {
         let now = start + Duration::from_secs(1);
         hints.moved(Subject::Table(table), None, [], now);
         let round = Repair::heard_from(seats[0].1).applied(over(taken, 0));
-        hints.settle(seats[0].1, None, now, &round);
+        hints.settle(seats[0].1, None, now, &round, now);
         assert_eq!(
             hints.next(now).map(|(address, _)| address),
             Some(SocketAddr::from(([10, 1, 1, next], 1234)))
@@ -1881,7 +1949,7 @@ fn an_unfinished_round_neither_rests_nor_completes_its_audit() {
         for round in 0..=QUICK_BUSY_RETRIES {
             let (address, _) = hints.next(now).expect("its retry");
             let asked = crate::replica::Report {
-                witnesses_asked: round == 0,
+                asked: (round == 0).then_some(crate::replica::Ask::First),
                 ..Default::default()
             };
             let broken = broken_off(actor).swept(4).interrupted(asked);
@@ -1915,7 +1983,7 @@ fn an_unfinished_round_neither_rests_nor_completes_its_audit() {
         let turned = crate::replica::Report {
             table: Some([1; 32]),
             caught_up: true,
-            regular: true,
+            turn: Some(crate::replica::TableTurn::Regular),
             ..Default::default()
         };
         let finished = Repair::heard_from(actor).swept(4).applied(turned);
@@ -1949,7 +2017,7 @@ fn an_unfinished_round_settles_its_seat_for_the_control_journal_alone() {
         assert!(address == seat.0 && repair.leads(&table));
         let broken = broken_off(seat.1);
         under(mutant.then_some(&UNFINISHED_SETTLES), || {
-            hints.settle(seat.1, Some(address), now, &broken);
+            hints.settle(seat.1, Some(address), now, &broken, now);
         });
         let outcome = Outcome::of(true, &broken, None);
         hints.finish(address, broken, outcome, now);
@@ -2028,13 +2096,13 @@ fn a_move_passed_by_on_a_seats_older_lists_is_offered_once_its_lists_take_it() {
             if let Some(repair) = dial {
                 // As `Transport::finish` takes a dial's end.
                 let ended = repair.listing_at([table], [], listed);
-                hints.settle(actor, Some(address), now, &ended);
+                hints.settle(actor, Some(address), now, &ended, now);
                 hints.finish(address, ended, quiet, now);
                 now += WALK_GAP;
             } else {
                 // The seat's round, which began before the move was seen, ends.
                 let incoming = Repair::heard_from(actor).listing_at([table], [], listed);
-                hints.settle(actor, None, start, &incoming);
+                hints.settle(actor, None, start, &incoming, start);
             }
             let walked = hints.next(now);
             if mutant {
@@ -2102,7 +2170,7 @@ fn a_later_rounds_lists_never_narrow_what_this_macs_own_round_found_a_seat_takin
                 // table out.
                 let later = now + Duration::from_millis(200);
                 let left_out = Repair::heard_from(actor).listing_at([table], [table], later);
-                hints.settle(actor, None, now, &left_out);
+                hints.settle(actor, None, now, &left_out, now);
                 hints.moved(Subject::Table(table), Some(start), [], now);
                 if let Some(repair) = dial {
                     assert!(hints.next(now).is_none(), "{case}: the seat's dial flies");
@@ -2122,7 +2190,7 @@ fn a_later_rounds_lists_never_narrow_what_this_macs_own_round_found_a_seat_takin
                     let ended = repair
                         .applied(crate::replica::Report::default())
                         .listing_at([table], [], now + Duration::from_millis(100));
-                    hints.settle(actor, Some(address), now, &ended);
+                    hints.settle(actor, Some(address), now, &ended, now);
                     hints.finish(address, ended, quiet, now);
                     now += WALK_GAP;
                 }
@@ -2136,6 +2204,739 @@ fn a_later_rounds_lists_never_narrow_what_this_macs_own_round_found_a_seat_takin
                 assert!(repair.leads(&table), "{case}");
             });
         }
+    }
+}
+
+/// A completed round with the seat `actor` whose scan has gone round, over another table and
+/// moving nothing, in which this side listed short (`crate::replica::Report::listed_short`: its
+/// selection fell back to the recovery region) or whole. It completes no audit: it asked no peer
+/// which tables differ.
+fn listing(actor: Actor, short: bool) -> Repair {
+    Repair::heard_from(actor)
+        .swept(4)
+        .applied(crate::replica::Report {
+            table: Some([8; 32]),
+            caught_up: true,
+            primary_unread: short,
+            ..Default::default()
+        })
+}
+
+/// One seat at rest after a quiet round at `start`, with no beacon to time a probe: its next
+/// dial is its audit, which this returns.
+fn resting_seat(hints: &mut Hints, start: Instant) -> ((SocketAddr, Actor), Instant) {
+    let seat = seats(hints, 1, start)[0];
+    hints.peers.get_mut(&seat.0).unwrap().beacon = None;
+    assert!(hints.rests(seat.0));
+    let audit = hints.next_at(seat.0);
+    assert_eq!(hints.next_dial_at(start, true), Some(audit), "it rests");
+    (seat, audit)
+}
+
+/// A round in which this Mac listed short (its selection fell back to the recovery region or
+/// dropped its ring tables) leaves the seat holding lists that may leave out a table this Mac's
+/// selection takes again with no round, and the seat passes this Mac over for a write to that
+/// table until a round lists it (`may_take`). So, whichever side began the round, this Mac owes
+/// the seat one: its walk dials the seat at rest, nothing moved here, at the first rung (5 s and
+/// this node's jitter), leading nothing and asking no audit. A whole round pays it, and the
+/// endpoint rests until the same audit as before. Owed rounds that come back short dial at
+/// gaps that double to two minutes, and after six in a row the endpoint rests until its audit.
+/// A dial in flight that began before the debt pays nothing: the seat may hold the short lists
+/// as the newer, so the walk still dials it. The census reads `owes-round` for an owed round
+/// exactly where the walk dials the seat before its endpoint's own next dial ([`Verdict::next`]):
+/// each that came back short and left one more owed, and not the last, after which nothing is
+/// owed, nor the whole round that pays, which read `rest`.
+/// MUTANT (`SHORT_UNOWED`): no dial before the audit. MUTANT (`RELIST_UNBOUNDED`): the owed rounds
+/// never stop. MUTANT (`OWED_CLEARED_BY_EARLIER`): the dial in flight pays the debt, and nothing
+/// dials the seat before its audit.
+/// NEGATIVE CONTROL (2026-11-16, an exact-string edit undone by its inverse): with the
+/// `owes-round` branch taken out of [`Hints::finish`], the first owed round that came back short
+/// read `rest` though the walk dialled its seat before its audit.
+#[test]
+fn a_seat_this_mac_listed_short_is_walked_until_a_whole_list_reaches_it() {
+    let quiet = Outcome::Repaired { transferred: false };
+    for mutant in [false, true] {
+        under(mutant.then_some(&SHORT_UNOWED), || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let ((address, actor), audit) = resting_seat(&mut hints, start);
+            let now = start + Duration::from_secs(1);
+            // The seat dialled in, and this Mac's list was short.
+            hints.settle(actor, None, now, &listing(actor, true), now);
+            let due = hints.next_dial_at(now, true).unwrap();
+            if mutant {
+                assert_eq!(due, audit, "MUTANT: nothing before the audit");
+                return;
+            }
+            assert!(
+                due >= now + BACKOFF_FIRST && due < now + BACKOFF_FIRST + Duration::from_secs(2),
+                "the first rung: {:?}",
+                due - now
+            );
+            assert!(hints.next(due - Duration::from_millis(1)).is_none());
+            let (dialled, repair) = hints.next(due).expect("the walk dials the seat it owes");
+            assert_eq!(dialled, address);
+            assert!(!repair.audited(), "an owed round is no audit");
+            assert!(!repair.pending(), "it leads nothing");
+            let whole = listing(actor, false);
+            hints.settle(actor, Some(address), due, &whole, due);
+            let paid = hints.finish(address, whole, quiet, due).expect("held");
+            assert!(!hints.owes(actor), "the whole round paid it");
+            assert_eq!(paid.next, census::Next::Rest);
+            assert!(hints.rests(address));
+            assert_eq!(
+                hints.next_dial_at(due, true),
+                Some(audit),
+                "the audit stands"
+            );
+        });
+    }
+
+    // Owed rounds that keep coming back short.
+    for mutant in [false, true] {
+        under(mutant.then_some(&RELIST_UNBOUNDED), || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let ((address, actor), audit) = resting_seat(&mut hints, start);
+            let mut at = start + Duration::from_secs(1);
+            hints.settle(actor, None, at, &listing(actor, true), at);
+            let (mut gaps, mut ends) = (Vec::new(), Vec::new());
+            while hints.owes(actor) && gaps.len() < RELIST_TRIES as usize + 2 {
+                let due = hints.next_dial_at(at, true).unwrap();
+                let (dialled, _) = hints.next(due).expect("the owed round");
+                assert_eq!(dialled, address);
+                gaps.push(due - at);
+                let short = listing(actor, true);
+                hints.settle(actor, Some(address), due, &short, due);
+                let next = hints.finish(address, short, quiet, due).expect("held").next;
+                let walked_sooner = hints
+                    .next_dial_at(due, true)
+                    .is_some_and(|walk| walk < hints.next_at(address));
+                assert_eq!(
+                    next == census::Next::OwesRound,
+                    walked_sooner,
+                    "round {}: {next:?}",
+                    gaps.len()
+                );
+                ends.push(next);
+                at = due;
+            }
+            if mutant {
+                assert_eq!(gaps.len(), RELIST_TRIES as usize + 2, "MUTANT: {gaps:?}");
+                return;
+            }
+            assert_eq!(gaps.len(), RELIST_TRIES as usize, "{gaps:?}");
+            // Each but the last left the seat owed the next; after the last, nothing is owed.
+            let mut owing = vec![census::Next::OwesRound; RELIST_TRIES as usize - 1];
+            owing.push(census::Next::Rest);
+            assert_eq!(ends, owing);
+            for (rung, gap) in (0..).zip(&gaps) {
+                let wait = (BACKOFF_FIRST * (1 << rung)).min(BACKOFF_MAX);
+                assert!(
+                    *gap >= wait && *gap < wait + Duration::from_secs(2),
+                    "rung {rung}: {gaps:?}"
+                );
+            }
+            assert!(at < audit, "every owed round came before the audit");
+            assert!(hints.rests(address));
+            assert_eq!(hints.next_dial_at(at, true), Some(audit), "then it rests");
+        });
+    }
+
+    // A dial in flight that began before the debt.
+    for mutant in [false, true] {
+        under(mutant.then_some(&OWED_CLEARED_BY_EARLIER), || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let ((address, actor), audit) = resting_seat(&mut hints, start);
+            let now = start + Duration::from_secs(1);
+            hints.moved(Subject::Control, None, [], now);
+            let (dialled, _) = hints.next(now).expect("the control journal's walk");
+            assert_eq!(dialled, address);
+            let later = now + Duration::from_secs(1);
+            hints.settle(actor, None, later, &listing(actor, true), later);
+            // The dial in flight ends whole after the seat's round.
+            let ended = now + Duration::from_secs(2);
+            let whole = listing(actor, false);
+            hints.settle(actor, Some(address), now, &whole, ended);
+            hints.finish(address, whole, quiet, ended);
+            let due = hints.next_dial_at(ended, true).unwrap();
+            if mutant {
+                assert_eq!(due, audit, "MUTANT: the earlier dial paid it");
+                return;
+            }
+            assert!(
+                due < later + BACKOFF_FIRST + Duration::from_secs(2),
+                "{due:?}"
+            );
+            let (dialled, _) = hints.next(due).expect("the walk dials the seat it owes");
+            assert_eq!(dialled, address);
+        });
+    }
+}
+
+/// One seat whose run of short lists spent its owed rounds ([`RELIST_TRIES`]): this Mac listed
+/// short to it in a round the seat began, and in each round it then owed the seat. Nothing is
+/// owed after the last, which ended at the second instant returned, and the seat rests until its
+/// audit, the first.
+fn spent_seat(hints: &mut Hints, start: Instant) -> ((SocketAddr, Actor), Instant, Instant) {
+    let quiet = Outcome::Repaired { transferred: false };
+    let ((address, actor), audit) = resting_seat(hints, start);
+    let mut at = start + Duration::from_secs(1);
+    hints.settle(actor, None, at, &listing(actor, true), at);
+    assert!(
+        !hints.spent(at),
+        "CONTROL: while a round is owed for the short list, no read is asked"
+    );
+    while hints.owes(actor) {
+        let due = hints.next_dial_at(at, true).unwrap();
+        let (dialled, _) = hints.next(due).expect("the owed round");
+        assert_eq!(dialled, address);
+        let short = listing(actor, true);
+        hints.settle(actor, Some(address), due, &short, due);
+        hints.finish(address, short, quiet, due);
+        at = due;
+    }
+    assert!(
+        at < audit,
+        "CONTROL: every owed round came before the audit"
+    );
+    assert_eq!(
+        hints.next_dial_at(at, true),
+        Some(audit),
+        "CONTROL: the run spent, the seat rests until its audit"
+    );
+    ((address, actor), audit, at)
+}
+
+/// A run of short lists that spent its owed rounds leaves the seat holding short lists with no
+/// round owed it, at rest until the pair's audit, though this Mac's selection may read whole
+/// long before: the scheduler then asks for reads of the selection ([`Hints::spent`]), and one
+/// that finds it whole owes the seat a round ([`Hints::relist_spent`]). The walk dials the seat
+/// at once, nothing moved here, leading nothing and asking no audit. A whole list pays it and
+/// ends the run: no read is asked after, and the audit stands. Where the round a read owed lists
+/// short again, or trades no lists, nothing more is owed for it, and no read owes the seat
+/// another until the backoff of how many reads owed it one in the run (5 s, then 10 s, each
+/// with this node's jitter), however many reads find the selection whole before.
+/// MUTANT (`WHOLE_UNTOLD`): a whole selection owes nothing, and nothing dials the seat before its
+/// audit. MUTANT (`REREAD_AT_ONCE`): a read may owe the seat another round as soon as the last
+/// came back short.
+#[test]
+fn a_seat_whose_owed_rounds_are_spent_is_owed_one_once_the_selection_reads_whole() {
+    let quiet = Outcome::Repaired { transferred: false };
+    for mutant in [false, true] {
+        under(mutant.then_some(&WHOLE_UNTOLD), || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let ((address, actor), audit, at) = spent_seat(&mut hints, start);
+            assert!(hints.spent(at), "only a read of the selection tells now");
+            // The selection reads whole half a minute on, with no round between.
+            let read = at + Duration::from_secs(30);
+            assert!(read < audit, "CONTROL: the audit is still ahead");
+            hints.relist_spent(read);
+            let due = hints.next_dial_at(read, true).unwrap();
+            if mutant {
+                assert_eq!(due, audit, "MUTANT: nothing before the audit");
+                return;
+            }
+            assert!(due <= read + WALK_GAP, "at once: {:?}", due - read);
+            assert!(!hints.spent(read), "a round is owed: no read is asked");
+            let (dialled, repair) = hints.next(due).expect("the walk dials the seat it owes");
+            assert_eq!(dialled, address);
+            assert!(!repair.audited(), "an owed round is no audit");
+            assert!(!repair.pending(), "it leads nothing");
+            let whole = listing(actor, false);
+            hints.settle(actor, Some(address), due, &whole, due);
+            hints.finish(address, whole, quiet, due);
+            assert!(!hints.owes(actor), "the whole round paid it");
+            assert!(hints.rests(address));
+            assert_eq!(
+                hints.next_dial_at(due, true),
+                Some(audit),
+                "the audit stands"
+            );
+            // The run is over: no read is asked, and one that came anyway owes nothing.
+            let later = due + BACKOFF_MAX;
+            assert!(!hints.spent(later));
+            hints.relist_spent(later);
+            assert!(!hints.owes(actor));
+        });
+    }
+
+    // The rounds a read owed come back short, and then with no lists.
+    for mutant in [false, true] {
+        under(mutant.then_some(&REREAD_AT_ONCE), || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let ((address, actor), audit, at) = spent_seat(&mut hints, start);
+            let mut read = at + Duration::from_secs(1);
+            for (rung, lists) in [(0, true), (1, false), (2, true)] {
+                assert!(read < audit, "CONTROL: the audit is still ahead");
+                assert!(
+                    hints.spent(read),
+                    "rung {rung}: a read may owe the seat a round"
+                );
+                hints.relist_spent(read);
+                let due = hints.next_dial_at(read, true).unwrap();
+                assert!(due <= read + WALK_GAP, "rung {rung}: {:?}", due - read);
+                let (dialled, repair) = hints.next(due).expect("the round the read owed");
+                assert_eq!(dialled, address);
+                let ended = if lists {
+                    listing(actor, true)
+                } else {
+                    // Its table exchange was never reached: it traded no lists.
+                    repair
+                };
+                hints.settle(actor, Some(address), due, &ended, due);
+                hints.finish(address, ended, quiet, due);
+                assert!(
+                    !hints.owes(actor),
+                    "rung {rung}: past the run's rounds none is owed"
+                );
+                if mutant {
+                    assert!(
+                        hints.spent(due),
+                        "MUTANT: the next read may owe it one at once"
+                    );
+                    return;
+                }
+                let wait = (BACKOFF_FIRST * (1 << rung)).min(BACKOFF_MAX);
+                let early = read + wait - Duration::from_millis(1);
+                assert!(!hints.spent(due) && !hints.spent(early), "rung {rung}");
+                // A read that finds the selection whole before then owes the seat nothing.
+                hints.relist_spent(early);
+                assert!(!hints.owes(actor), "rung {rung}: no round after every read");
+                assert_eq!(hints.next_dial_at(early, true), Some(audit), "rung {rung}");
+                read += wait + Duration::from_secs(2);
+            }
+            assert!(hints.spent(read), "then a read may owe it one again");
+        });
+    }
+}
+
+/// A round the seat began whose credential handoff left this Mac an Offer of the seat's to take,
+/// over a wire on which only the dialler takes (`Repair::owing`), owes the seat a round this
+/// Mac begins: its walk dials the seat at rest at once (within [`WALK_GAP`]), nothing moved here,
+/// leading nothing and asking no audit. That round's handoff pays it, and the endpoint rests until
+/// the same audit as before; a later round of the seat's that leaves nothing owed asks nothing.
+/// MUTANT (`OWED_UNWALKED`): nothing dials the seat before its audit. MUTANT (`OWED_KEPT`): the
+/// paying round leaves the debt, and the walk dials the seat again.
+#[test]
+fn a_seat_owed_a_take_is_walked_once_with_nothing_moved_and_rests_after() {
+    let quiet = Outcome::Repaired { transferred: false };
+    for (unwalked, kept) in [(false, false), (true, false), (false, true)] {
+        let flag = if unwalked {
+            Some(&OWED_UNWALKED)
+        } else {
+            kept.then_some(&OWED_KEPT)
+        };
+        under(flag, || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let ((address, actor), audit) = resting_seat(&mut hints, start);
+            let now = start + Duration::from_secs(1);
+            let incoming = listing(actor, false).handed(Some(0), Owing::Take([5; 32]));
+            hints.settle(actor, None, now, &incoming, now);
+            let due = hints.next_dial_at(now, true).unwrap();
+            if unwalked {
+                assert_eq!(due, audit, "MUTANT: nothing before the audit");
+                return;
+            }
+            assert!(due <= now + WALK_GAP, "at once: {:?}", due - now);
+            let (dialled, repair) = hints.next(due).expect("the walk dials the seat it owes");
+            assert_eq!(dialled, address);
+            assert!(!repair.audited(), "an owed round is no audit");
+            assert!(!repair.pending(), "it leads nothing");
+            // Its handoff ran, this Mac dialling: whatever it took, nothing is owed after it.
+            let took = listing(actor, false).handed(Some(0), Owing::Nothing);
+            hints.settle(actor, Some(address), due, &took, due);
+            hints.finish(address, took, quiet, due);
+            let next = hints.next_dial_at(due, true).unwrap();
+            if kept {
+                assert!(hints.owes_take(actor), "MUTANT: the debt stands");
+                assert!(next < audit, "MUTANT: walked again at {:?}", next - due);
+                return;
+            }
+            assert!(!hints.owes_take(actor), "its own round paid it");
+            assert!(hints.rests(address));
+            assert_eq!(next, audit, "the audit stands");
+            let later = due + Duration::from_secs(5);
+            let nothing = listing(actor, false).handed(Some(0), Owing::Nothing);
+            hints.settle(actor, None, later, &nothing, later);
+            assert_eq!(hints.next_dial_at(later, true), Some(audit), "nothing owed");
+        });
+    }
+}
+
+/// What the seat's rounds tell of a take owed it: one whose handoff broke off after finding the
+/// seat's Offer owes the take as one that ran does (`Owing::Take`); one that could not tell
+/// (`Owing::Unknown`, its store or policy unread now, whether its handoff ended or broke off)
+/// neither pays the take owed nor owes one, so the walk still dials; one that tells nothing is
+/// owed pays it, and the seat rests until the same audit as before.
+/// MUTANT (`UNTOLD_PAYS`): the round that could not tell pays the debt, and nothing dials the
+/// seat before its audit.
+#[test]
+fn a_take_owed_a_seat_is_paid_only_by_a_round_that_tells_nothing_is_owed() {
+    for mutant in [false, true] {
+        under(mutant.then_some(&UNTOLD_PAYS), || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let ((_, actor), audit) = resting_seat(&mut hints, start);
+            let now = start + Duration::from_secs(1);
+            let broke_off = listing(actor, false).handed(None, Owing::Take([5; 32]));
+            hints.settle(actor, None, now, &broke_off, now);
+            assert!(
+                hints.owes_take(actor),
+                "a broken-off handoff that found it owes a take"
+            );
+            let later = now + Duration::from_millis(300);
+            for untold in [
+                listing(actor, false).handed(None, Owing::Unknown),
+                listing(actor, false).handed(Some(0), Owing::Unknown),
+            ] {
+                hints.settle(actor, None, later, &untold, later);
+            }
+            let due = hints.next_dial_at(later, true).unwrap();
+            if mutant {
+                assert!(!hints.owes_take(actor), "MUTANT: paid");
+                assert_eq!(due, audit, "MUTANT: nothing before the audit");
+                return;
+            }
+            assert!(
+                hints.owes_take(actor),
+                "a round that could not tell pays nothing"
+            );
+            assert!(due <= later + WALK_GAP, "still walked: {:?}", due - later);
+            let after = later + Duration::from_millis(300);
+            let nothing = listing(actor, false).handed(Some(0), Owing::Nothing);
+            hints.settle(actor, None, after, &nothing, after);
+            assert!(
+                !hints.owes_take(actor),
+                "a round that tells nothing is owed pays it"
+            );
+            assert_eq!(hints.next_dial_at(after, true), Some(audit));
+            let untold = listing(actor, false).handed(None, Owing::Unknown);
+            hints.settle(actor, None, after, &untold, after);
+            assert!(
+                !hints.owes_take(actor),
+                "a round that could not tell owes nothing"
+            );
+        });
+    }
+}
+
+/// A round the seat began whose credential handoff could not tell what this Mac owes
+/// (`Owing::Unknown`: this Mac's store busy, its administrator unreadable) owes no take, and owes
+/// the seat a judgement made again with no round ([`Hints::judging`]): at the first rung of a
+/// backoff, 5 s doubling to two minutes, each judgement that still cannot tell the next, six in
+/// a row at most; past them none is due. A round this Mac began meanwhile leaves the judgement
+/// due (its take may have met the same unread state); the seat's handoff that tells nothing is
+/// owed ends it. A judgement that finds the seat's Offer owes the take, which the walk dials at
+/// once, nothing moved here.
+/// MUTANT (`UNTOLD_UNJUDGED`): the untold round owes no judgement, and nothing is due.
+/// MUTANT (`JUDGED_UNBOUNDED`): a seventh judgement that cannot tell is due again.
+#[test]
+fn a_take_no_handoff_could_tell_is_judged_again_at_doubling_gaps_six_times_at_most() {
+    let quiet = Outcome::Repaired { transferred: false };
+    for (unjudged, unbounded) in [(false, false), (true, false), (false, true)] {
+        let flag = if unjudged {
+            Some(&UNTOLD_UNJUDGED)
+        } else {
+            unbounded.then_some(&JUDGED_UNBOUNDED)
+        };
+        under(flag, || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let ((address, actor), audit) = resting_seat(&mut hints, start);
+            let now = start + Duration::from_secs(1);
+            let untold = listing(actor, false).handed(Some(0), Owing::Unknown);
+            hints.settle(actor, None, now, &untold, now);
+            assert!(
+                !hints.owes_take(actor),
+                "a handoff that could not tell owes no take"
+            );
+            assert_eq!(hints.next_dial_at(now, true), Some(audit), "and no dial");
+            if unjudged {
+                assert_eq!(hints.judge_at(actor), None, "MUTANT: no judgement");
+                assert!(hints.judging(now + BACKOFF_MAX * 4).is_empty());
+                return;
+            }
+            let mut at = hints.judge_at(actor).expect("a judgement is owed");
+            assert!(
+                at >= now + BACKOFF_FIRST && at < now + BACKOFF_FIRST + Duration::from_secs(2),
+                "the first rung: {:?}",
+                at - now
+            );
+            assert!(
+                hints.judging(at - Duration::from_millis(1)).is_empty(),
+                "none before its rung"
+            );
+            // This Mac's own round with the seat, begun since, leaves it due.
+            let (dialled, _) = hints.next(audit).expect("the audit");
+            assert_eq!(dialled, address);
+            let own = listing(actor, false).handed(Some(0), Owing::Nothing);
+            hints.settle(actor, Some(address), audit, &own, audit);
+            hints.finish(address, own, quiet, audit);
+            assert_eq!(
+                hints.judge_at(actor),
+                Some(at),
+                "a round of its own tells nothing"
+            );
+            // The first judgement is made then, and still cannot tell.
+            at = audit;
+            for rung in 2..=RELIST_TRIES {
+                let [request] = hints.judging(at).try_into().unwrap();
+                assert_eq!(request.seat(), actor, "rung {}", rung - 1);
+                hints.judged(request, Owing::Unknown, at);
+                let wait = (BACKOFF_FIRST * (1 << (rung - 1))).min(BACKOFF_MAX);
+                let next = hints.judge_at(actor).expect("judged again");
+                assert!(
+                    next >= at + wait && next < at + wait + Duration::from_secs(2),
+                    "rung {rung}: {:?}",
+                    next - at
+                );
+                at = next;
+            }
+            let [request] = hints.judging(at).try_into().unwrap();
+            hints.judged(request, Owing::Unknown, at);
+            if unbounded {
+                assert!(hints.judge_at(actor).is_some(), "MUTANT: a seventh is due");
+                return;
+            }
+            assert_eq!(hints.judge_at(actor), None, "six at most");
+            assert!(hints.judging(at + BACKOFF_MAX * 4).is_empty());
+            assert!(!hints.owes_take(actor), "and no take is owed for them");
+
+            // A run the seat's own handoff ends: it tells nothing is owed.
+            let later = at + Duration::from_secs(1);
+            hints.settle(actor, None, later, &untold, later);
+            assert!(hints.judge_at(actor).is_some(), "a new run");
+            let nothing = listing(actor, false).handed(Some(0), Owing::Nothing);
+            hints.settle(actor, None, later, &nothing, later);
+            assert_eq!(hints.judge_at(actor), None, "the seat's handoff told");
+
+            // A run a judgement ends: it finds the seat's Offer to take.
+            let again = later + Duration::from_secs(1);
+            hints.settle(actor, None, again, &untold, again);
+            let due = hints.judge_at(actor).unwrap();
+            let [request] = hints.judging(due).try_into().unwrap();
+            hints.judged(request, Owing::Take([5; 32]), due);
+            assert_eq!(hints.judge_at(actor), None, "the judgement told");
+            assert!(hints.owes_take(actor), "it owes the take");
+            let dial = hints.next_dial_at(due, true).unwrap();
+            assert!(dial <= due + WALK_GAP, "walked at once: {:?}", dial - due);
+            let (walked, repair) = hints.next(dial.max(due)).expect("the walk");
+            assert_eq!(walked, address);
+            assert!(!repair.audited(), "an owed round is no audit");
+        });
+    }
+}
+
+/// A completed read belongs only to the request it began with. Clearing or exhausting and
+/// recreating the debt, and replacing the entire context, invalidate it for every result. The
+/// replacement context deliberately has identical seat and debt instants.
+#[test]
+fn replaced_take_judgements_ignore_every_stale_result() {
+    for result in [Owing::Nothing, Owing::Take([9; 32]), Owing::Unknown] {
+        for replacement in 0..3 {
+            let mut current = hints();
+            let start = Instant::now();
+            let ((_, actor), _) = resting_seat(&mut current, start);
+            let now = start + Duration::from_secs(1);
+            let unknown = listing(actor, false).handed(Some(0), Owing::Unknown);
+            current.settle(actor, None, now, &unknown, now);
+            let old_due = current.judge_at(actor).unwrap();
+            let [old] = current.judging(old_due).try_into().unwrap();
+            match replacement {
+                0 => {
+                    let nothing = listing(actor, false).handed(Some(0), Owing::Nothing);
+                    current.settle(actor, None, old_due, &nothing, old_due);
+                    assert_eq!(current.judge_at(actor), None);
+                    current.settle(actor, None, old_due, &unknown, old_due);
+                }
+                1 => {
+                    for _ in 1..=RELIST_TRIES {
+                        current.settle(actor, None, old_due, &unknown, old_due);
+                    }
+                    assert_eq!(current.judge_at(actor), None, "the run was exhausted");
+                    current.settle(actor, None, old_due, &unknown, old_due);
+                }
+                _ => {
+                    current = hints();
+                    assert_eq!(resting_seat(&mut current, start).0.1, actor);
+                    current.settle(actor, None, now, &unknown, now);
+                    assert_eq!(current.judge_at(actor), Some(old_due));
+                }
+            }
+            let due = current.judge_at(actor).unwrap();
+            let before = {
+                let owed = &current.owed[&actor];
+                (owed.judge.as_ref().unwrap().debt.since, due, owed.untold)
+            };
+            current.judged(old, result, due);
+            let owed = &current.owed[&actor];
+            assert_eq!(
+                (
+                    owed.judge.as_ref().unwrap().debt.since,
+                    current.judge_at(actor).unwrap(),
+                    owed.untold
+                ),
+                before,
+                "stale {result:?}, replacement {replacement}"
+            );
+            assert!(
+                !current.owes_take(actor),
+                "stale {result:?} creates no take"
+            );
+            let [fresh] = current.judging(due).try_into().unwrap();
+            current.judged(fresh, Owing::Take([5; 32]), due);
+            assert!(
+                current.owes_take(actor),
+                "the matching new read still applies"
+            );
+            assert_eq!(current.judge_at(actor), None);
+        }
+    }
+}
+
+#[test]
+fn incoming_unknown_keeps_an_outstanding_take_judgement_and_its_original_since() {
+    let mut current = hints();
+    let start = Instant::now();
+    let ((_, actor), _) = resting_seat(&mut current, start);
+    let unknown = listing(actor, false).handed(Some(0), Owing::Unknown);
+    current.settle(actor, None, start, &unknown, start);
+    let due = current.judge_at(actor).unwrap();
+    let [request] = current.judging(due).try_into().unwrap();
+    let mut now = due;
+    for rung in 2..=3 {
+        now += Duration::from_secs(1);
+        current.settle(actor, None, now, &unknown, now);
+        let owed = &current.owed[&actor];
+        assert_eq!(owed.judge.as_ref().unwrap().debt.since, start);
+        assert_eq!(owed.untold, rung);
+        let next = current.judge_at(actor).unwrap();
+        let wait = BACKOFF_FIRST * (1 << (rung - 1));
+        assert!(next >= now + wait && next < now + wait + Duration::from_secs(2));
+    }
+    current.judged(request, Owing::Take([5; 32]), now);
+    assert!(
+        current.owes_take(actor),
+        "unread observations did not consume the read"
+    );
+    assert_eq!(current.judge_at(actor), None);
+}
+
+#[test]
+fn matching_take_judgements_keep_unknown_backoff_and_take_receipt_semantics() {
+    for result in [Owing::Nothing, Owing::Take([5; 32]), Owing::Unknown] {
+        let mut current = hints();
+        let start = Instant::now();
+        let ((address, actor), _) = resting_seat(&mut current, start);
+        let now = start + Duration::from_secs(1);
+        let unknown = listing(actor, false).handed(Some(0), Owing::Unknown);
+        current.settle(actor, None, now, &unknown, now);
+        let due = current.judge_at(actor).unwrap();
+        let [request] = current.judging(due).try_into().unwrap();
+        let consumed = request.clone();
+        current.judged(request, result, due);
+        match result {
+            Owing::Nothing => {
+                assert_eq!(current.judge_at(actor), None);
+                assert!(!current.owes_take(actor));
+            }
+            Owing::Unknown => {
+                let owed = &current.owed[&actor];
+                assert_eq!(owed.judge.as_ref().unwrap().debt.since, now);
+                assert_eq!(owed.untold, 2);
+                let next = current.judge_at(actor).unwrap();
+                assert!(next >= due + BACKOFF_FIRST * 2);
+                assert!(!current.owes_take(actor));
+                for repeated in [Owing::Nothing, Owing::Take([9; 32]), Owing::Unknown] {
+                    current.judged(consumed.clone(), repeated, next);
+                    assert_eq!(current.judge_at(actor), Some(next));
+                    assert_eq!(current.owed[&actor].untold, 2);
+                    assert!(
+                        !current.owes_take(actor),
+                        "a consumed read cannot apply again"
+                    );
+                }
+            }
+            Owing::Take(_) => {
+                assert_eq!(current.judge_at(actor), None);
+                let debt = current.owed[&actor].take.unwrap();
+                current.settle(actor, None, due, &unknown, due);
+                assert_eq!(current.owed[&actor].take, Some(debt));
+                assert_eq!(current.judge_at(actor), None, "an existing take stays owed");
+                let took = listing(actor, false).handed(Some(1), Owing::Nothing);
+                current.settle(actor, Some(address), now, &took, due);
+                assert!(current.owes_take(actor), "an earlier round cannot pay it");
+                current.settle(actor, Some(address), due, &took, due);
+                assert!(!current.owes_take(actor), "its own later receipt pays it");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_stale_take_judgement_cannot_change_a_new_handoffs_take_debt() {
+    for result in [Owing::Nothing, Owing::Take([9; 32]), Owing::Unknown] {
+        let mut current = hints();
+        let start = Instant::now();
+        let ((_, actor), _) = resting_seat(&mut current, start);
+        let unknown = listing(actor, false).handed(Some(0), Owing::Unknown);
+        current.settle(actor, None, start, &unknown, start);
+        let due = current.judge_at(actor).unwrap();
+        let [old] = current.judging(due).try_into().unwrap();
+        let offered = listing(actor, false).handed(Some(0), Owing::Take([5; 32]));
+        current.settle(actor, None, due, &offered, due);
+        let debt = current.owed[&actor].take.unwrap();
+        current.judged(old, result, due);
+        assert_eq!(current.owed[&actor].take, Some(debt), "stale {result:?}");
+        assert_eq!(current.judge_at(actor), None);
+    }
+}
+
+/// A take owed the seat again for the same Offer, by a round of the seat's that ended while the
+/// round this Mac began for it was in flight, keeps when it was first owed: the round in flight
+/// tries that Offer and pays it, and the seat rests until the same audit. One owed for another
+/// Offer (the first in flight here, which the seat's round passed over) is owed from that
+/// round's end: the round in flight pays nothing, and the walk dials the seat again for it.
+/// MUTANT (`TAKE_REARMED`): the take owed again for the same Offer is owed from the later
+/// round's end, so the walk dials the seat again for nothing.
+#[test]
+fn a_take_owed_again_for_its_offer_is_paid_by_the_round_in_flight() {
+    let quiet = Outcome::Repaired { transferred: false };
+    for (mutant, other) in [(false, false), (true, false), (false, true)] {
+        under(mutant.then_some(&TAKE_REARMED), || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let ((address, actor), audit) = resting_seat(&mut hints, start);
+            let now = start + Duration::from_secs(1);
+            let brought = listing(actor, false).handed(Some(0), Owing::Take([5; 32]));
+            hints.settle(actor, None, now, &brought, now);
+            let due = hints.next_dial_at(now, true).unwrap();
+            let (dialled, _) = hints.next(due).expect("the walk dials the seat it owes");
+            assert_eq!(dialled, address);
+            // The seat's follow-up round ends while that dial is in flight.
+            let follow = due + Duration::from_millis(300);
+            let offer = if other { [6; 32] } else { [5; 32] };
+            let again = listing(actor, false).handed(Some(0), Owing::Take(offer));
+            hints.settle(actor, None, follow, &again, follow);
+            // The dial in flight ends, having taken the Offer.
+            let end = follow + Duration::from_millis(300);
+            let took = listing(actor, false).handed(Some(1), Owing::Nothing);
+            hints.settle(actor, Some(address), due, &took, end);
+            hints.finish(address, took, quiet, end);
+            let next = hints.next_dial_at(end, true).unwrap();
+            if mutant || other {
+                assert!(hints.owes_take(actor), "still owed: mutant {mutant}");
+                assert!(next < audit, "walked again at {:?}", next - end);
+                return;
+            }
+            assert!(!hints.owes_take(actor), "the round in flight paid it");
+            assert_eq!(next, audit, "the audit stands");
+        });
     }
 }
 
@@ -2288,7 +3089,7 @@ fn an_incoming_table_discovery_enables_its_reverse_walk_without_replacing_repair
                 [],
                 start + Duration::from_secs(1),
             );
-            hints.settle(actor, None, start, &incoming);
+            hints.settle(actor, None, start, &incoming, start);
             let peer = &hints.peers[&address];
             assert_eq!(
                 (
@@ -2352,7 +3153,7 @@ fn an_outgoing_completion_cannot_roll_back_incoming_table_lists() {
                 [],
                 began + Duration::from_secs(2),
             );
-            hints.settle(actor, None, began, &incoming);
+            hints.settle(actor, None, began, &incoming, began);
             assert!(hints.peers[&address].busy);
             assert_eq!(hints.peers[&address].repair.actor(), None);
             assert!(may_take(
@@ -2361,8 +3162,8 @@ fn an_outgoing_completion_cannot_roll_back_incoming_table_lists() {
                 &unheld()
             ));
             let returned = Repair::heard_from(actor).applied(crate::replica::Report {
-                regular: true,
-                witnesses_asked: true,
+                turn: Some(crate::replica::TableTurn::Regular),
+                asked: Some(crate::replica::Ask::First),
                 ..over(other, 0)
             });
             let returned = match listed_second {
@@ -2375,7 +3176,7 @@ fn an_outgoing_completion_cannot_roll_back_incoming_table_lists() {
             }
             .swept(1);
             let finished = began + Duration::from_secs(4);
-            hints.settle(actor, Some(address), began, &returned);
+            hints.settle(actor, Some(address), began, &returned, began);
             hints.finish(
                 address,
                 returned,
@@ -2422,7 +3223,7 @@ fn tied_incoming_table_lists_keep_a_reverse_write_walkable() {
                 at,
             );
             let incoming = Repair::heard_from(actor).listing_at([table, other], [], at);
-            hints.settle(actor, None, at, &incoming);
+            hints.settle(actor, None, at, &incoming, at);
             let old = Repair::heard_from(actor).listing_at([table, other], [table], start);
             hints.finish(address, old, quiet, at + Duration::from_secs(1));
             let now = at + Duration::from_secs(2);
@@ -2440,7 +3241,7 @@ fn tied_incoming_table_lists_keep_a_reverse_write_walkable() {
                 [table],
                 at + Duration::from_secs(3),
             );
-            hints.settle(actor, None, now, &newer);
+            hints.settle(actor, None, now, &newer, now);
             assert!(!may_take(
                 &hints.peers[&address],
                 &Subject::Table(table),
@@ -2481,13 +3282,13 @@ fn incoming_table_lists_belong_to_the_authenticated_seat() {
         [table],
         start + Duration::from_secs(1),
     );
-    hints.settle(second, None, start, &incoming);
+    hints.settle(second, None, start, &incoming, start);
     let former = Repair::heard_from(first).listing_at(
         [table, other],
         [other],
         start + Duration::from_secs(2),
     );
-    hints.settle(first, None, start, &former);
+    hints.settle(first, None, start, &former, start);
     assert!(!may_take(
         &hints.peers[&address],
         &Subject::Table(table),
@@ -2584,12 +3385,14 @@ fn the_next_dial_is_due_now_while_a_walk_has_a_seat_to_dial() {
 /// A seat's dials over ten minutes, read once a second. Its one endpoint rests until second
 /// 500, as a settled endpoint does between two audits, and for good after that dial; its
 /// beacons are heard at the seconds `beacons` names, or it was never heard by beacon at all
-/// (`heard` false: an endpoint this Mac remembered). Every dial completes quiet at once. The
-/// second each dial began at with whether it was an audit, and whether one began before
-/// [`Hints::next_dial_at`] said a dial was due.
+/// (`heard` false: an endpoint this Mac remembered), and its seat completes a round it dialled
+/// in from the address `dials_in` names at a second, if any ([`Hints::vouch`]). Every dial
+/// completes quiet at once. The second each dial began at with whether it was an audit, and
+/// whether one began before [`Hints::next_dial_at`] said a dial was due.
 fn dials_at_rest(
     heard: bool,
     beacons: impl Fn(u64) -> bool,
+    dials_in: impl Fn(u64) -> Option<IpAddr>,
     flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
 ) -> (Vec<(u64, bool)>, bool) {
     let mut hints = hints();
@@ -2608,6 +3411,9 @@ fn dials_at_rest(
             let now = start + Duration::from_secs(second);
             if heard && beacons(second) {
                 hints.observe(&wire(seat.0.port()), seat.0, now);
+            }
+            if let Some(ip) = dials_in(second) {
+                hints.vouch(ip, seat.1, now);
             }
             let due = hints.next_dial_at(now, false);
             if let Some((address, repair)) = hints.next_allowed(now, false) {
@@ -2635,38 +3441,181 @@ fn dials_at_rest(
 #[test]
 fn a_beacon_never_dials_or_defers_and_a_silence_is_probed_once() {
     let beaconing = |second: u64| second % 5 == 0;
+    let none = |_| None;
     // Heard at seconds 0, 5 and 10, and again at 200.
     let silent = |second: u64| second <= 10 && second % 5 == 0 || second == 200;
     assert_eq!(
-        dials_at_rest(true, beaconing, None),
+        dials_at_rest(true, beaconing, none, None),
         (vec![(500, true)], false),
         "its own wait, its audit, and no beacon's"
     );
     assert_eq!(
-        dials_at_rest(false, beaconing, None),
+        dials_at_rest(false, beaconing, none, None),
         (vec![(500, true)], false),
         "never heard by beacon: no silence to probe"
     );
     assert_eq!(
-        dials_at_rest(true, silent, None),
+        dials_at_rest(true, silent, none, None),
         (vec![(40, true), (230, true), (500, false)], false),
         "one probe a silence, each an audit, then its own wait"
     );
     assert_eq!(
-        dials_at_rest(true, beaconing, Some(&BEACON_DEFERS_AUDIT)).0,
+        dials_at_rest(true, beaconing, none, Some(&BEACON_DEFERS_AUDIT)).0,
         [],
         "MUTANT: beacons put its own dial off for ever"
     );
-    let repeats = dials_at_rest(true, silent, Some(&PROBE_REPEATS)).0;
+    let repeats = dials_at_rest(true, silent, none, Some(&PROBE_REPEATS)).0;
     assert_eq!(
         repeats[..4],
         [(40, true), (70, true), (100, true), (130, true)],
         "MUTANT: the silence is probed again and again"
     );
     assert_eq!(
-        dials_at_rest(true, silent, Some(&PROBE_UNTIMED)),
+        dials_at_rest(true, silent, none, Some(&PROBE_UNTIMED)),
         (vec![(40, true), (230, true), (500, false)], true),
         "MUTANT: a probe begins with no dial said due"
+    );
+}
+
+/// A round its seat dials in from the endpoint's address counts as hearing it: dialling in
+/// every 3 s from second 12 to 60, a seat last heard by beacon at second 10 is probed 30 s after
+/// its last round dialled in, at 90, not at 40; a round dialled in at 150, once that silence was
+/// probed, arms no second probe; the beacon at 200 starts over, and the probe at 230 and its own
+/// wait follow as before. The same rounds dialled in from another address (an attachment the
+/// endpoint is not at) put off nothing: its probe stays at 40.
+///
+/// MUTANT (`INBOUND_UNHEARD`): the rounds dialled in are not heard, and the probe comes at 40.
+/// MUTANT (`VOUCH_REARMS`): the round dialled in at 150 re-arms the probe, which comes again at
+/// 180. MUTANT (`INBOUND_HEARS_EVERY_ENDPOINT`): the rounds from the other address are heard,
+/// and its probe comes at 90.
+#[test]
+fn a_round_dialled_in_from_its_address_puts_off_the_silences_probe_and_rearms_none() {
+    let silent = |second: u64| second <= 10 && second % 5 == 0 || second == 200;
+    let own: IpAddr = [10, 1, 1, 1].into();
+    let other: IpAddr = [10, 9, 9, 9].into();
+    let from = |ip: IpAddr| {
+        move |second: u64| {
+            ((12..=60).contains(&second) && second % 3 == 0 || second == 150).then_some(ip)
+        }
+    };
+    let probed = [(90, true), (230, true), (500, false)];
+    assert_eq!(
+        dials_at_rest(true, silent, from(own), None),
+        (probed.to_vec(), false)
+    );
+    assert_eq!(
+        dials_at_rest(true, silent, from(other), None),
+        (vec![(40, true), (230, true), (500, false)], false),
+        "a round from another address hears nothing of this endpoint"
+    );
+    assert_eq!(
+        dials_at_rest(true, silent, from(own), Some(&INBOUND_UNHEARD)).0[0],
+        (40, true),
+        "MUTANT: the rounds dialled in are not heard"
+    );
+    assert_eq!(
+        dials_at_rest(true, silent, from(own), Some(&VOUCH_REARMS)).0,
+        [(90, true), (180, true), (230, true), (500, false)],
+        "MUTANT: the round at 150 re-arms the probe"
+    );
+    assert_eq!(
+        dials_at_rest(
+            true,
+            silent,
+            from(other),
+            Some(&INBOUND_HEARS_EVERY_ENDPOINT)
+        )
+        .0[0],
+        (90, true),
+        "MUTANT: a round from anywhere is heard"
+    );
+}
+
+/// Two endpoints at `10.1.1.1`, read at second 120 under `flag`: for each, the second its
+/// silence's probe counts from ([`Hints::probe_at`] less [`SILENCE`] and its jitter), or None
+/// where it is not probed. The first, `:1234`, is the seat `[1; 48]`'s, established by a quiet
+/// round and last beaconed at second 0. The second, `:2345`, beacons every 5 s from second 5 to
+/// 70 (this Mac misses the later ones), and a round this side dials there at second 5 binds it
+/// to the seat `seat`, or no dial reaches it (`seat` None). The seat `[1; 48]` dials in from the
+/// address every 3 s from second 6 to 120.
+fn heard_at_two_ports(
+    seat: Option<Actor>,
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> (Option<u64>, Option<u64>) {
+    let mut hints = hints();
+    let start = Instant::now();
+    let (first, actor) = seats(&mut hints, 1, start)[0];
+    let second = SocketAddr::from((first.ip(), 2345));
+    under(flag, || {
+        for at in 1..=120 {
+            let now = start + Duration::from_secs(at);
+            if (5..=70).contains(&at) && at % 5 == 0 {
+                let source = SocketAddr::from((first.ip(), 50_000));
+                hints.observe(&wire(second.port()), source, now);
+            }
+            if let Some(seat) = seat
+                && at == 5
+            {
+                let (chosen, _) = hints.next(now).expect("the new port is due");
+                assert_eq!(chosen, second);
+                let quiet = Outcome::Repaired { transferred: false };
+                hints.finish(second, Repair::heard_from(seat), quiet, now);
+                assert!(hints.established(second));
+            }
+            if at >= 6 && at % 3 == 0 {
+                hints.vouch(first.ip(), actor, now);
+            }
+        }
+        let heard = |address: SocketAddr| {
+            let jitter = Duration::from_millis(hints.spread(&address) % SILENCE_JITTER_MS);
+            hints
+                .probe_at(&address, &hints.peers[&address])
+                .map(|probe| (probe - SILENCE - jitter - start).as_secs())
+        };
+        (heard(first), heard(second))
+    })
+}
+
+/// A round dialled in comes from a port of its own, so it tells only its seat's address: it is
+/// heard by the seat's endpoint there that no other port has beaconed from since. After the
+/// seat restarts on a new port, its rounds dialled in leave its old port's probe where its last
+/// beacon put it, at second 0, whether or not a dial has reached the new port yet; once one has
+/// bound it to the seat, they put off the new port's probe, to their last at second 120. A port
+/// at the address bound to another seat is not one the seat beaconed from: beside it, the seat's
+/// one endpoint is heard as if alone, and the other seat's keeps its own last beacon, at 70.
+///
+/// MUTANT (`INBOUND_HEARS_OLD_PORTS`): the old port is heard as well, and its probe moves to
+/// second 120. MUTANT (`INBOUND_WEIGHS_OTHER_SEATS`): the other seat's beacons put the seat's
+/// own endpoint aside, and its probe stays at second 0.
+#[test]
+fn a_round_dialled_in_is_heard_by_the_port_its_seat_beacons_from_not_one_it_left() {
+    let (seat, other) = ([1; 48], [9; 48]);
+    assert_eq!(
+        heard_at_two_ports(None, None),
+        (Some(0), None),
+        "the old port keeps its probe beside a new port no dial has reached"
+    );
+    assert_eq!(
+        heard_at_two_ports(Some(seat), None),
+        (Some(0), Some(120)),
+        "the old port keeps its probe, and the new port is heard"
+    );
+    assert_eq!(
+        heard_at_two_ports(Some(other), None),
+        (Some(120), Some(70)),
+        "another seat's port says nothing of this seat's"
+    );
+    for seat in [None, Some(seat)] {
+        assert_eq!(
+            heard_at_two_ports(seat, Some(&INBOUND_HEARS_OLD_PORTS)).0,
+            Some(120),
+            "MUTANT: the old port is heard"
+        );
+    }
+    assert_eq!(
+        heard_at_two_ports(Some(other), Some(&INBOUND_WEIGHS_OTHER_SEATS)).0,
+        Some(0),
+        "MUTANT: another seat's beacons put this seat's endpoint aside"
     );
 }
 
@@ -3268,5 +4217,423 @@ fn a_full_macs_endpoint_is_verified_again_before_it_expires_whoever_dials_in() {
     assert!(
         !held(&unpicked),
         "MUTANT: an audit left to the scan's turn: {unpicked:?}"
+    );
+}
+
+/// What happens to a first round's endpoint while the round is in flight
+/// ([`first_rounds_come_to`]).
+#[derive(Clone, Copy)]
+enum Meanwhile {
+    Nothing,
+    /// A push hurries it ([`Hints::hurry`]).
+    Pushed,
+    /// Its audit is due this long after the round began, and what its rest stood on moves
+    /// ([`Hints::unsettle`]).
+    Unsettled(Duration),
+}
+
+/// What each shape of one endpoint's first round came to, each dialled at once and ended at
+/// once with its own fresh scheduler: the census's word for its end ([`Verdict::next`]) and
+/// whether its endpoint then rests. A round that owes, sweeps or audits is told apart from one
+/// that rests; the rows that a round's own state decides (`deferred for quota`, `deferred`,
+/// `broken off`) take their outcome from that state ([`Outcome::of`]), as a transport's do. An
+/// unsettled row's endpoint is established with its audit due at the row's time, and its round
+/// leaves the audit incomplete, so that due time stands.
+fn first_rounds_come_to(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> Vec<(&'static str, census::Next, bool)> {
+    use aterm_types::network_state::RepairCause;
+    let actor = [2; 48];
+    let quiet = Outcome::Repaired { transferred: false };
+    let swept = || {
+        Repair::heard_from(actor)
+            .swept(4)
+            .applied(audited_round([1; 32]))
+    };
+    let leading = || {
+        let mut leading = swept();
+        assert!(leading.lead([7; 32]));
+        leading
+    };
+    let unasked = crate::replica::Report {
+        asked: None,
+        ..audited_round([1; 32])
+    };
+    let unaudited = || Repair::heard_from(actor).swept(4).applied(unasked);
+    let shapes = [
+        (
+            "swept and audited",
+            swept(),
+            Some(quiet),
+            Meanwhile::Nothing,
+        ),
+        (
+            "a differing table left",
+            swept().differing([9; 32]),
+            Some(quiet),
+            Meanwhile::Nothing,
+        ),
+        ("a lead left", leading(), Some(quiet), Meanwhile::Nothing),
+        (
+            "its first sweep",
+            Repair::heard_from(actor).applied(audited_round([1; 32])),
+            Some(quiet),
+            Meanwhile::Nothing,
+        ),
+        (
+            "its audit incomplete",
+            unaudited(),
+            Some(quiet),
+            Meanwhile::Nothing,
+        ),
+        (
+            "transferred",
+            swept(),
+            Some(Outcome::Repaired { transferred: true }),
+            Meanwhile::Nothing,
+        ),
+        ("pushed", swept(), Some(quiet), Meanwhile::Pushed),
+        (
+            "unsettled, its audit due sooner",
+            unaudited(),
+            Some(quiet),
+            Meanwhile::Unsettled(UNSETTLED - Duration::from_secs(20)),
+        ),
+        (
+            "unsettled, its audit due later",
+            unaudited(),
+            Some(quiet),
+            Meanwhile::Unsettled(UNSETTLED + Duration::from_secs(30)),
+        ),
+        (
+            "deferred for quota",
+            Repair::heard_from(actor)
+                .swept(4)
+                .deferred_for(RepairCause::Quota),
+            None,
+            Meanwhile::Nothing,
+        ),
+        (
+            "deferred",
+            Repair::heard_from(actor)
+                .swept(4)
+                .deferred_for(RepairCause::Io),
+            None,
+            Meanwhile::Nothing,
+        ),
+        (
+            "broken off",
+            broken_off(actor).swept(4),
+            None,
+            Meanwhile::Nothing,
+        ),
+        (
+            "busy",
+            Repair::default(),
+            Some(Outcome::Busy),
+            Meanwhile::Nothing,
+        ),
+        (
+            "refused",
+            nothing_there(Repair::default()),
+            Some(Outcome::Refused),
+            Meanwhile::Nothing,
+        ),
+        (
+            "unasked",
+            Repair::default(),
+            Some(Outcome::Unasked),
+            Meanwhile::Nothing,
+        ),
+    ];
+    under(flag, || {
+        shapes
+            .into_iter()
+            .map(|(shape, repair, outcome, meanwhile)| {
+                let outcome = outcome.unwrap_or_else(|| Outcome::of(true, &repair, None));
+                let mut hints = hints();
+                let start = Instant::now();
+                let peer: SocketAddr = "10.1.1.2:1234".parse().unwrap();
+                hints.observe(&wire(1234), SocketAddr::from((peer.ip(), 1)), start);
+                let endpoint = hints.peers.get_mut(&peer).unwrap();
+                endpoint.beacon = None;
+                // Only a verified endpoint is hurried ([`Hints::hurry`]); only an established one
+                // is unsettled ([`Hints::unsettle`]).
+                endpoint.verified = !matches!(meanwhile, Meanwhile::Nothing);
+                if let Meanwhile::Unsettled(due) = meanwhile {
+                    endpoint.audit_due = Some(start + due);
+                }
+                let (address, _) = hints.next(start).unwrap();
+                match meanwhile {
+                    Meanwhile::Nothing => {}
+                    Meanwhile::Pushed => assert_eq!(hints.hurry(start), 1),
+                    Meanwhile::Unsettled(_) => {
+                        hints.unsettle(start, Duration::ZERO);
+                        assert!(hints.peers[&peer].unsettled, "{shape}");
+                    }
+                }
+                let verdict = hints
+                    .finish(address, repair, outcome, start)
+                    .expect("its endpoint is held");
+                (shape, verdict.next, hints.peers[&peer].resting())
+            })
+            .collect()
+    })
+}
+
+/// Each round this side dialled names why its endpoint rests or does not ([`Verdict::next`],
+/// which the census counts): its endpoint rests exactly where the round reads `rest`, and every
+/// other shape reads the word for what put its rest off or what it came to.
+///
+/// MUTANT (`RESTS_PENDING`): the round that owes a differing table, the one that owes a lead and
+/// the one still sweeping each read `rest`, and rest.
+/// MUTANT (`QUIET_REDIALS`): the swept and audited round reads `auditing`, and does not rest.
+/// MUTANT (`UNFINISHED_FINISHES`): the broken-off round reads `rest`, and rests.
+/// NEGATIVE CONTROL (2026-11-15, an inverse edit then undone): with the quota read through
+/// `Repair::application_cause`, which a deferred round never carries, the quota row read
+/// `deferred`; with any unsettled round read `unsettled`, as before that date, the round whose
+/// audit was due sooner than [`UNSETTLED`] read `unsettled` though its endpoint rested.
+#[test]
+fn each_dialled_rounds_end_names_why_its_endpoint_rests_or_does_not() {
+    use census::Next;
+    let expected = [
+        ("swept and audited", Next::Rest),
+        ("a differing table left", Next::OwesDiffering),
+        ("a lead left", Next::OwesLead),
+        ("its first sweep", Next::Sweeping),
+        ("its audit incomplete", Next::Auditing),
+        ("transferred", Next::Transferred),
+        ("pushed", Next::Pushed),
+        ("unsettled, its audit due sooner", Next::Rest),
+        ("unsettled, its audit due later", Next::Unsettled),
+        ("deferred for quota", Next::DeferredQuota),
+        ("deferred", Next::Deferred),
+        ("broken off", Next::Unfinished),
+        ("busy", Next::Busy),
+        ("refused", Next::Failed),
+        ("unasked", Next::Unasked),
+    ];
+    let came = first_rounds_come_to(None);
+    let words: Vec<_> = came
+        .iter()
+        .map(|(shape, next, _)| (*shape, *next))
+        .collect();
+    assert_eq!(words, expected);
+    for (shape, next, rests) in &came {
+        assert_eq!(*rests, *next == Next::Rest, "{shape}");
+    }
+    let word = |came: &[(&str, Next, bool)], shape: &str| {
+        came.iter()
+            .find(|(seen, ..)| *seen == shape)
+            .map(|(_, next, rests)| (*next, *rests))
+            .unwrap()
+    };
+    let rests_pending = first_rounds_come_to(Some(&RESTS_PENDING));
+    for shape in ["a differing table left", "a lead left", "its first sweep"] {
+        assert_eq!(
+            word(&rests_pending, shape),
+            (Next::Rest, true),
+            "MUTANT: {shape}"
+        );
+    }
+    assert_eq!(
+        word(
+            &first_rounds_come_to(Some(&QUIET_REDIALS)),
+            "swept and audited"
+        ),
+        (Next::Auditing, false),
+        "MUTANT: a quiet round redials"
+    );
+    assert_eq!(
+        word(
+            &first_rounds_come_to(Some(&UNFINISHED_FINISHES)),
+            "broken off"
+        ),
+        (Next::Rest, true),
+        "MUTANT: a broken round finishes"
+    );
+}
+
+/// Dial whatever `hints` dials at `now`, with what chose the dial and what it was besides.
+fn dial_marked(hints: &mut Hints, now: Instant) -> (SocketAddr, Repair, Marks) {
+    let (address, repair) = hints.next(now).expect("a dial");
+    let marks = hints.peers[&address].marks.expect("a dial is marked");
+    (address, repair, marks)
+}
+
+/// What chose each dial of a few endpoints' lives, and what each dial was besides: a verified
+/// seat's new port, a first meeting, a sweep's next round, a transfer's follow-up, a walk to a
+/// resting seat, its audit, a silent endpoint's probe, the first dial after a night's sleep, and
+/// a walk to a resting seat this Mac owes a round.
+fn dials_marked(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> Vec<(&'static str, Marks)> {
+    under(flag, || {
+        let quiet = Outcome::Repaired { transferred: false };
+        let actor = [2; 48];
+        let peer: SocketAddr = "10.1.1.2:1234".parse().unwrap();
+        let fresh = || Repair::heard_from(actor).swept(4);
+        let swept = || fresh().applied(audited_round([1; 32]));
+        let start = Instant::now();
+        let mut marked = Vec::new();
+
+        // A verified seat's listener went with its restart; its new port leads as kin.
+        let mut dialler = hints();
+        let old: SocketAddr = "10.1.9.9:1000".parse().unwrap();
+        dialler.observe(&wire(old.port()), old, start);
+        let endpoint = dialler.peers.get_mut(&old).unwrap();
+        endpoint.verified = true;
+        endpoint.failed = true;
+        endpoint.failures = 4;
+        endpoint.next = start + BACKOFF_MAX;
+        let new: SocketAddr = "10.1.9.9:2000".parse().unwrap();
+        dialler.observe(&wire(new.port()), new, start);
+        let (address, _, marks) = dial_marked(&mut dialler, start);
+        assert_eq!(address, new);
+        marked.push(("a verified seat's new port", marks));
+
+        let mut dialler = hints();
+        dialler.observe(&wire(1234), SocketAddr::from((peer.ip(), 1)), start);
+        dialler.peers.get_mut(&peer).unwrap().beacon = None;
+        let (address, _, marks) = dial_marked(&mut dialler, start);
+        marked.push(("first met", marks));
+        let sweeping = Repair::heard_from(actor).applied(audited_round([1; 32]));
+        dialler.finish(address, sweeping, quiet, start);
+        let now = dialler.next_at(peer);
+        let (address, _, marks) = dial_marked(&mut dialler, now);
+        marked.push(("sweeping", marks));
+        let transferred = Outcome::Repaired { transferred: true };
+        dialler.finish(address, swept(), transferred, now);
+        let now = dialler.next_at(peer);
+        let (address, _, marks) = dial_marked(&mut dialler, now);
+        marked.push(("a transfer's follow-up", marks));
+        let verdict = dialler.finish(address, swept(), quiet, now).expect("held");
+        assert_eq!(
+            verdict.marks,
+            Some(marks),
+            "the round's end tells its marks"
+        );
+        assert_eq!(dialler.peers[&peer].marks, None, "and they go with it");
+        assert!(dialler.peers[&peer].resting());
+
+        let walked = now + Duration::from_secs(200);
+        dialler.moved(Subject::Table([7; 32]), None, [], walked);
+        let (address, _, marks) = dial_marked(&mut dialler, walked);
+        marked.push(("a walk", marks));
+        let led = fresh().applied(crate::replica::Report {
+            table: Some([7; 32]),
+            caught_up: true,
+            ..Default::default()
+        });
+        dialler.settle(actor, Some(address), walked, &led, walked);
+        dialler.finish(address, led, quiet, walked);
+        let now = dialler.next_at(peer);
+        let (_, _, marks) = dial_marked(&mut dialler, now);
+        marked.push(("its audit due", marks));
+
+        let mut dialler = hints();
+        dialler.observe(&wire(1234), SocketAddr::from((peer.ip(), 1)), start);
+        let (address, _, _) = dial_marked(&mut dialler, start);
+        dialler.finish(address, swept(), quiet, start);
+        let probe = (1..=1_200)
+            .find_map(|tick| {
+                let now = start + Duration::from_millis(100 * tick);
+                let (address, _) = dialler.next(now)?;
+                dialler.peers[&address].marks
+            })
+            .expect("the silence's probe");
+        marked.push(("silent", probe));
+
+        let mut dialler = hints();
+        dialler.observe(&wire(1234), SocketAddr::from((peer.ip(), 1)), start);
+        dialler.peers.get_mut(&peer).unwrap().beacon = None;
+        let (address, _, _) = dial_marked(&mut dialler, start);
+        dialler.finish(address, swept(), quiet, start);
+        let woke = start + Duration::from_secs(100);
+        dialler.unsettle(woke, ABSENT);
+        let (_, _, marks) = dial_marked(&mut dialler, woke);
+        marked.push(("after a night's sleep", marks));
+
+        // A seat at rest that this Mac's round listed short to is owed a round ([`Owed`]), and
+        // nothing moved here: the walk dials it for that alone.
+        let mut dialler = hints();
+        let ((_, seat), _) = resting_seat(&mut dialler, start);
+        let short = start + Duration::from_secs(1);
+        dialler.settle(seat, None, short, &listing(seat, true), short);
+        let due = dialler.next_dial_at(short, true).expect("a dial");
+        let (_, _, marks) = dial_marked(&mut dialler, due);
+        marked.push(("owed a round", marks));
+        marked
+    })
+}
+
+/// Each dial names the turn that chose it and what it was besides ([`Marks`], which the census
+/// counts): a verified seat's new port leads, and is met again; a seat first met is the scan's,
+/// and met again; a sweep's next round is the scan's; a transfer's next round is its follow-up;
+/// a move offered to a resting seat is a walk; an audit due is the audit's; a silent endpoint's
+/// dial is the scan's and its probe; the first dial after a sleep past [`ABSENT`] is away; and a
+/// walk to a resting seat that is owed a round, nothing moved here, is owed and no walk's offer.
+///
+/// MUTANT (`UNLED`): the new port is the scan's.
+/// MUTANT (`AUDIT_UNPICKED`): the audit due is the scan's.
+/// MUTANT (`ABSENCE_KEEPS_CYCLE`): no dial is met again or away.
+/// MUTANT (`OWED_UNWALKED`): the seat owed a round is next dialled by its audit.
+#[test]
+fn each_dial_names_the_turn_that_chose_it() {
+    use census::Dial;
+    let marks = |chose, probe, met_again, away| Marks {
+        chose,
+        probe,
+        met_again,
+        away,
+    };
+    let expected = [
+        (
+            "a verified seat's new port",
+            marks(Dial::Lead, false, true, false),
+        ),
+        ("first met", marks(Dial::Scan, false, true, false)),
+        ("sweeping", marks(Dial::Scan, false, false, false)),
+        (
+            "a transfer's follow-up",
+            marks(Dial::FollowUp, false, false, false),
+        ),
+        ("a walk", marks(Dial::Walk, false, false, false)),
+        ("its audit due", marks(Dial::Audit, false, false, false)),
+        ("silent", marks(Dial::Scan, true, false, false)),
+        (
+            "after a night's sleep",
+            marks(Dial::Scan, false, false, true),
+        ),
+        ("owed a round", marks(Dial::Owed, false, false, false)),
+    ];
+    assert_eq!(dials_marked(None), expected);
+    let of = |marked: Vec<(&'static str, Marks)>, shape: &str| {
+        marked
+            .into_iter()
+            .find(|(seen, _)| *seen == shape)
+            .map(|(_, marks)| marks)
+            .unwrap()
+    };
+    assert_eq!(
+        of(dials_marked(Some(&UNLED)), "a verified seat's new port").chose,
+        Dial::Scan,
+        "MUTANT: unled"
+    );
+    assert_eq!(
+        of(dials_marked(Some(&AUDIT_UNPICKED)), "its audit due").chose,
+        Dial::Scan,
+        "MUTANT: the audit left to the scan"
+    );
+    assert_eq!(
+        of(dials_marked(Some(&OWED_UNWALKED)), "owed a round").chose,
+        Dial::Audit,
+        "MUTANT: the owed round left to the audit"
+    );
+    let kept = dials_marked(Some(&ABSENCE_KEEPS_CYCLE));
+    assert!(
+        kept.iter()
+            .all(|(_, marks)| !marks.met_again && !marks.away),
+        "MUTANT: the cycle kept: {kept:?}"
     );
 }

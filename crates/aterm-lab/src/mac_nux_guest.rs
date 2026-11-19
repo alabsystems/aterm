@@ -275,16 +275,19 @@ impl Presses {
     /// The presses aterm could have made itself. The required `local-network` and `network-auth`
     /// observations need macOS's app authorization and authenticated ALab admission, respectively;
     /// neither authority is a press aterm can make. They remain pending in both person modes.
-    /// Other rows that waited on a press are avoidable, except the legacy grants only a person
-    /// gives ([`MACOS_PERSON_ROWS`]) once someone at the console asked for their batch.
+    /// A live shared setup password prompt also accounts for its root steps: the person can give
+    /// the password and aterm already opened the prompt. All other rows that waited on a press
+    /// are avoidable, except the grants only a person gives ([`MACOS_PERSON_ROWS`]) once someone
+    /// at the console asked for their batch.
     #[must_use]
-    pub fn avoidable(&self, person: bool) -> Vec<&str> {
+    pub fn avoidable(&self, person: bool, awaiting_setup_password: bool) -> Vec<&str> {
         self.needs
             .iter()
             .map(String::as_str)
-            .filter(|row| {
-                !matches!(*row, "local-network" | "network-auth")
-                    && (!person || !MACOS_PERSON_ROWS.contains(row))
+            .filter(|row| match *row {
+                "local-network" | "network-auth" => false,
+                "name-rule" | "network-helper" | "spotlight-scope" => !awaiting_setup_password,
+                _ => !person || !MACOS_PERSON_ROWS.contains(row),
             })
             .collect()
     }
@@ -970,6 +973,19 @@ pub struct Reading {
     pub acts: usize,
 }
 
+/// The observation that lets a lab watch stop without waiting for another setup transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupEnd {
+    /// System State reported current completion.
+    Done,
+    /// System State reported previous verification of private rows.
+    ReadBack,
+    /// The vault remains unanswered on a known other network or offline.
+    VaultOffLan,
+    /// The progress record said completed without a status field to confirm it.
+    RecordCompleted,
+}
+
 /// How many things the guest's records hold that move a first launch on while `setup=` and the
 /// progress record stand still: the person's presses (`click`) and typings (`typed`), and the
 /// app's processes starting (`up`) and going (`down`), each read without its time. A press the
@@ -997,28 +1013,46 @@ pub fn acts(text: &str) -> usize {
 }
 
 impl Reading {
-    /// Done: `setup=done`, `read-back:<rows>` (everything else as for `done`, those rows set up
-    /// as last read longer ago than a reading stands, which is how a finished run nobody watches
-    /// reads ten minutes on), or `asking:vault` when the same reading places the guest on a
+    /// The watch can stop at `setup=done`, `read-back:<rows>` (everything else as for `done`,
+    /// with those rows verified as last read longer ago than a reading stands), or `asking:vault`
+    /// when the same reading places the guest on a
     /// remote network or offline: no wait of the lab's answers that vault request. Other
     /// requests, and unknown network places, remain unfinished. From a build without the field,
     /// the record must have completed. Their tails (`;offered:`, `;asking:`, `;at-login:`,
     /// `;changed:`) hold nothing
     /// back. A head that names a step left or a row unread is not done.
     #[must_use]
-    pub fn done(&self) -> bool {
+    fn setup_end(&self) -> Option<SetupEnd> {
         match &self.setup {
             Some(field) => {
                 let head = field.split(';').next().unwrap_or_default();
-                head == "done"
-                    || head
-                        .strip_prefix("read-back:")
-                        .is_some_and(|rows| !rows.is_empty())
-                    || (head == "asking:vault"
-                        && matches!(self.network.as_deref(), Some("remote" | "offline")))
+                if head == "done" {
+                    Some(SetupEnd::Done)
+                } else if head
+                    .strip_prefix("read-back:")
+                    .is_some_and(|rows| !rows.is_empty())
+                {
+                    Some(SetupEnd::ReadBack)
+                } else if head == "asking:vault"
+                    && matches!(self.network.as_deref(), Some("remote" | "offline"))
+                {
+                    Some(SetupEnd::VaultOffLan)
+                } else {
+                    None
+                }
             }
-            None => self.record.as_ref().is_some_and(|r| r.state == "completed"),
+            None => self
+                .record
+                .as_ref()
+                .is_some_and(|r| r.state == "completed")
+                .then_some(SetupEnd::RecordCompleted),
         }
+    }
+
+    /// Whether the lab can stop watching without another setup transition.
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.setup_end().is_some()
     }
 
     /// What it says, on one line: what [`Stall`] compares.
@@ -1054,7 +1088,7 @@ pub const STALL_MS: u64 = 60_000;
 /// What one look told the wait.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Waited {
-    Done,
+    Ended(SetupEnd),
     /// Not done; it moved within the last [`STALL_MS`] (or this is the first look).
     Moving,
     /// It said the same for [`STALL_MS`]: what it said, and since when (ms on the wait's clock).
@@ -1084,8 +1118,8 @@ impl Stall {
 
     /// Take one look, made at `now_ms`.
     pub fn see(&mut self, now_ms: u64, reading: &Reading) -> Waited {
-        if reading.done() {
-            return Waited::Done;
+        if let Some(end) = reading.setup_end() {
+            return Waited::Ended(end);
         }
         let said = reading.said();
         match &self.last {

@@ -646,18 +646,7 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
             format!("git push-delete {slug}\nref {reference}\nexpect {expect}")
         }
         GitOp::PushRefs { batch, dry_run, .. } => {
-            let mut text = format!("git push-refs {slug}\ndry-run {dry_run}");
-            if let Some(main) = batch.observed_main() {
-                let _ = write!(text, "\nobserved-main {main}");
-            }
-            for update in batch.updates() {
-                let _ = write!(
-                    text,
-                    "\nref {}\nbefore {}\nafter {}",
-                    update.reference, update.before, update.after
-                );
-            }
-            text
+            native_refs_text(&slug.to_string(), batch, *dry_run)
         }
         GitOp::PushControl {
             transaction,
@@ -687,6 +676,27 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
         }
     };
     text.into_bytes()
+}
+
+/// The exact native batch declaration, shared with journal conflict classification.
+/// This is canonical request DATA, not permission to prepare or execute a write.
+pub(crate) fn native_refs_text(
+    slug: &str,
+    batch: &crate::github::refs::AtomicRefBatch,
+    dry_run: bool,
+) -> String {
+    let mut text = format!("git push-refs {slug}\ndry-run {dry_run}");
+    if let Some(main) = batch.observed_main() {
+        let _ = write!(text, "\nobserved-main {main}");
+    }
+    for update in batch.updates() {
+        let _ = write!(
+            text,
+            "\nref {}\nbefore {}\nafter {}",
+            update.reference, update.before, update.after
+        );
+    }
+    text
 }
 
 /// One stream's pieces for `git_reply`: `{name} {n}`, then each piece, shaped.

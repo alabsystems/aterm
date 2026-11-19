@@ -97,6 +97,7 @@ fn project(case: i64, fault: Fault) -> [(&'static str, i64); 9] {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let point = match case {
         10 => None,
@@ -115,6 +116,7 @@ fn project(case: i64, fault: Fault) -> [(&'static str, i64); 9] {
                 &state,
                 &enrolled,
                 me.label(),
+                me.model,
                 effective.as_ref(),
                 NOW,
             )

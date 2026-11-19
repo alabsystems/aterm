@@ -873,9 +873,16 @@ mod program_search {
     }
 }
 
+/// Darwin's `#!` interpretation, made in user space because the kernel's own leaks
+/// ([`shebang::interpret`]); its line parse is tested on every platform.
+#[cfg(any(target_vendor = "apple", test))]
+#[path = "spawnfd_shebang.rs"]
+mod shebang;
+
 #[cfg(target_vendor = "apple")]
 mod platform {
     use super::program_search::{candidates, exists, rebase, runnable};
+    use super::shebang::{Outcome, interpret};
     use super::{
         BSHELL, ENOEXEC, ExecImage, F_GETFD, Image, Placement, Source, exec_dispatch, exec_now_us,
         fcntl,
@@ -954,6 +961,11 @@ mod platform {
         /// Each descriptor a `dup2` action hands the child, which the spawn unmarks for it alone
         /// (`crate::spawn_lock::handing`).
         handed: Vec<i32>,
+        /// Where the child resolves a relative path, for the test seam's read of each file
+        /// handed the kernel (`super::note_handed`): whether a file action moves its working
+        /// directory from this process's, and the directory it moves to where that is known.
+        #[cfg(any(test, debug_assertions))]
+        child_dir: (bool, Option<std::path::PathBuf>),
     }
 
     impl Objects {
@@ -972,6 +984,8 @@ mod platform {
                 attr,
                 actions,
                 handed: Vec::new(),
+                #[cfg(any(test, debug_assertions))]
+                child_dir: (false, None),
             })
         }
 
@@ -985,13 +999,17 @@ mod platform {
             self.spawn_unguarded(path, argv, envp)
         }
 
-        /// The caller holds the spawn lock through the raw native dispatch.
+        /// The caller holds the spawn lock through the raw native dispatch. Every `posix_spawn`
+        /// of this module is this one, so the test seam counts each file it hands the kernel
+        /// here, whichever path chose it (`super::note_handed`).
         fn spawn_unguarded(
             &self,
             path: &CStr,
             argv: &[*const c_char],
             envp: &[*const c_char],
         ) -> Result<i32, i32> {
+            #[cfg(any(test, debug_assertions))]
+            super::note_handed(path, self.child_dir.0, self.child_dir.1.as_deref());
             let mut pid = 0;
             // SAFETY: both objects were initialised by `new`; `path` is a C string and `argv`/`envp` NULL-terminated arrays of C strings, all of which outlive the call and none of which it retains.
             let rc = unsafe {
@@ -1029,6 +1047,9 @@ mod platform {
     pub(super) struct PreparedExec {
         image: ExecImage,
         objects: Objects,
+        /// The kernel's error for the file, read at preparation ([`interpret`]), which the
+        /// dispatch returns in place of an exec.
+        refused: Option<i32>,
     }
 
     impl PreparedExec {
@@ -1080,14 +1101,27 @@ mod platform {
                 ))?;
                 check(posix_spawnattr_setsigdefault(&mut objects.attr, &defaults))?;
             }
+            // A `#!` file is interpreted now, before any grant: the dispatch only execs.
+            let (image, path, refused) = match interpret(&path, &image.argv, false, None) {
+                Outcome::Kernel => (image, path, None),
+                Outcome::Refuse(errno) => (image, path, Some(errno)),
+                Outcome::Run {
+                    path: interpreter,
+                    argv,
+                } => (Image { argv, ..image }, interpreter, None),
+            };
             Ok(Self {
                 image: ExecImage::new(image, path),
                 objects,
+                refused,
             })
         }
 
         pub(super) fn exec_until(self, deadline_us: u64) -> io::Error {
             self.exec_with(deadline_us, exec_now_us, |prepared| {
+                if let Some(errno) = prepared.refused {
+                    return io::Error::from_raw_os_error(errno);
+                }
                 let image = &prepared.image;
                 match prepared
                     .objects
@@ -1140,6 +1174,13 @@ mod platform {
         let envp = Image::pointers(&image.envp);
         let disclaim = place.disclaim.map(disclaimer).transpose()?;
         let mut objects = Objects::new()?;
+        #[cfg(any(test, debug_assertions))]
+        {
+            objects.child_dir = (
+                place.cwd.is_some(),
+                place.base.map(std::path::Path::to_path_buf),
+            );
+        }
         let empty: u32 = 0;
         // Darwin has signals 1..31. SIGKILL and SIGSTOP have no settable disposition.
         let defaults: u32 = if place.default_signals {
@@ -1260,10 +1301,30 @@ mod platform {
                 .spawn(BSHELL, &script, envp)
                 .map_err(io::Error::from_raw_os_error)
         };
+        // A refusal is the kernel's answer only where nothing its `posix_spawn` does before it
+        // reads the file can fail first. Its chdir file action can: the kernel answers a missing
+        // working directory's error, not `ENOEXEC`, so a native-image spawn with one leaves the
+        // refusal to the kernel, and any other meets that error in its spawn of the shell. Its
+        // other file actions open `/dev/null` or hand on descriptors this spawn holds open, and
+        // it sets a process group after it reads the file (macOS 26.6 answers `ENOEXEC` for a
+        // malformed `#!` line in a group the child may not join, `EPERM` for a Mach-O there).
+        let refuses_exactly = !place.native_image || place.cwd.is_none();
+        // One attempt at `path`: a `#!` file the kernel would interpret is spawned as its
+        // interpreter, with the same objects, wherever that is exact ([`interpret`]). Its
+        // answer, the kernel's raw errno included, is the attempt's.
+        let attempt =
+            |path: &CStr| match interpret(path, &image.argv, place.cwd.is_some(), place.base) {
+                Outcome::Refuse(errno) if refuses_exactly => Err(errno),
+                Outcome::Kernel | Outcome::Refuse(_) => objects.spawn(path, argv, envp),
+                Outcome::Run {
+                    path: interpreter,
+                    argv,
+                } => objects.spawn(&interpreter, &Image::pointers(&argv), envp),
+            };
         let program = image.program.as_bytes();
         if program.contains(&b'/') {
             let path = rebase(program, place.base)?;
-            return match objects.spawn(&path, argv, envp) {
+            return match attempt(&path) {
                 Ok(pid) => Ok(pid),
                 Err(ENOEXEC) if !place.native_image => as_script(&path),
                 Err(rc) => Err(io::Error::from_raw_os_error(rc)),
@@ -1283,7 +1344,7 @@ mod platform {
             if !exists(&candidate)? {
                 continue;
             }
-            let rc = match objects.spawn(&candidate, argv, envp) {
+            let rc = match attempt(&candidate) {
                 Ok(pid) => return Ok(pid),
                 Err(rc) => rc,
             };
@@ -1888,6 +1949,50 @@ pub fn spawns_during<R>(body: impl FnOnce() -> R) -> (R, usize) {
         SPAWNS.with(|count| count.set(Some(outer.saturating_add(spawned))));
     }
     (result, spawned)
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The files this thread handed the kernel to interpret while [`kernel_scripts_during`]
+    /// counts them; `None` while it does not.
+    static KERNEL_SCRIPTS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Count `path`, a file a Darwin spawn or exec of this thread hands `posix_spawn`, where
+/// [`kernel_scripts_during`] counts and that file is, or may be, a `#!` script
+/// (`shebang::handed_script`; a relative `path` resolves in `base` when a file action moves the
+/// child's working directory, `moved`). Outside a count it reads nothing.
+#[cfg(all(target_vendor = "apple", any(test, debug_assertions)))]
+pub(crate) fn note_handed(path: &std::ffi::CStr, moved: bool, base: Option<&std::path::Path>) {
+    if KERNEL_SCRIPTS.with(|count| count.get().is_none()) {
+        return;
+    }
+    if shebang::handed_script(path, moved, base) {
+        KERNEL_SCRIPTS.with(|count| count.set(count.get().map(|n| n.saturating_add(1))));
+    }
+}
+
+/// Test seam: `body`'s result, and how many files this thread's Darwin spawns and execs handed
+/// `posix_spawn` as they were while it ran though each was, or may have been, a `#!` script,
+/// which the kernel then interprets, leaking a kernel element, or refuses. Each file is read
+/// where it is handed (this module's spawns and in-place execs, whichever path chose the file,
+/// and [`crate::pspawn::spawn_cloexec_default`]), so a spawn that skipped this layer's own
+/// interpretation counts too: one whose head starts `#!` or could not be read, or a relative
+/// path in a child directory this layer cannot name (`note_handed`). An interpreter this layer
+/// runs in a script's place is no script, and no regular file at the path, which the kernel
+/// never activates, is not counted. Counted on the calling thread alone, as [`spawns_during`]
+/// counts, and a count nested in another adds to it; off Darwin the count is 0.
+#[cfg(any(test, debug_assertions))]
+pub fn kernel_scripts_during<R>(body: impl FnOnce() -> R) -> (R, usize) {
+    let outer = KERNEL_SCRIPTS.with(|count| count.replace(Some(0)));
+    let result = body();
+    let handed = KERNEL_SCRIPTS
+        .with(|count| count.replace(outer))
+        .unwrap_or(0);
+    if let Some(outer) = outer {
+        KERNEL_SCRIPTS.with(|count| count.set(Some(outer.saturating_add(handed))));
+    }
+    (result, handed)
 }
 
 #[path = "spawnfd_command.rs"]

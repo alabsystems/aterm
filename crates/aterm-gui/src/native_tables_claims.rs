@@ -379,9 +379,9 @@ fn named(app: &TablesApp, sheet: &Sheet, pk: &str) -> String {
         return format!("a new {}", sheet.singular.to_lowercase());
     }
     let words = app
-        .snapshot
-        .as_ref()
-        .and_then(|s| s.targets.get(sheet.name)?.rows.get(pk))
+        .targets()
+        .get(sheet.name)
+        .and_then(|named| named.rows.get(pk))
         .map_or(pk, |target| target.words.as_str());
     let keys: Vec<&str> = sheet.rows.iter().map(|row| row.pk.as_str()).collect();
     format!("{words} \u{b7} \u{2026}{}", super::rows::ending(pk, &keys))

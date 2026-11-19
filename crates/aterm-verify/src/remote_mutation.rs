@@ -3,8 +3,8 @@
 
 //! Retain an admitted native writer through cooperative cancellation and settlement.
 
-use super::{Command, Output, Path, Tool};
-use aterm_uds::deadline::ChildOutput;
+use super::{Command, Failed, Output, Path, Tool};
+use aterm_uds::deadline::{ChildOutput, CompleteOutputError, RunError};
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::io;
@@ -16,6 +16,15 @@ const KEEP: usize = 512 * 1024 * 1024;
 /// The native work window bounds the cancellation request, never the writer's cleanup.
 /// Once started, a timeout or interrupt closes only its control peer and keeps draining until
 /// the actual owner returns. Transport damage remains an error even if it later exits zero.
+/// The landing's watchdog is held from before `stopped` is first read until the owner returns,
+/// and no child starts once `stopped` reads true or the window has ended: such a write, like
+/// one whose command could not be made or started, sent nothing. A local repository's git,
+/// which opens no intent, is ended at the window or the interrupt.
+///
+/// # Errors
+/// [`Failed::Unstarted`] where no child started, so nothing was sent; [`Failed::Ended`], of
+/// unknown outcome, where one started and its output was not whole, or it was ended or asked to
+/// stop.
 pub(crate) fn run(
     root: &Path,
     git: &dyn Fn(&Path) -> Command,
@@ -23,16 +32,36 @@ pub(crate) fn run(
     args: &[OsString],
     until: Instant,
     stopped: &mut dyn FnMut() -> bool,
-) -> Result<Output, String> {
+) -> Result<Output, Failed> {
+    let _held = crate::exec::group::hold();
+    let refused =
+        |why: &str| Failed::Unstarted(format!("{tool:?} remote write: {why}; nothing was sent"));
+    if stopped() {
+        return Err(refused("interrupted before the write started"));
+    }
+    if Instant::now() >= until {
+        return Err(refused("its work window ended before the write started"));
+    }
     match tool {
         Tool::Git => {
-            let _held = crate::exec::group::hold();
-            super::run_unless(root, git, tool, args, until, stopped)
+            let mut cmd = super::command(root, git, tool, args)
+                .map_err(|why| refused(&format!("could not be made: {why}")))?;
+            aterm_uds::deadline::output_until_complete_stdout_from_unless(
+                &mut cmd,
+                aterm_uds::spawnfd::Stdio::null(),
+                until,
+                stopped,
+            )
+            .map_err(|error| match error {
+                CompleteOutputError::Run(RunError::Spawn(_)) => refused(&error.to_string()),
+                _ => Failed::Ended(format!("{tool:?} remote operation: {error}")),
+            })
         }
         Tool::Agh => {
-            let mut cmd = super::agh_command(root, true)?;
+            let mut cmd = super::agh_command(root, true)
+                .map_err(|why| refused(&format!("could not be made: {why}")))?;
             cmd.args(args);
-            capture(&mut cmd, until, stopped, KEEP).map_err(|why| why.to_string())
+            capture(&mut cmd, until, stopped, KEEP)
         }
     }
 }
@@ -42,7 +71,7 @@ fn capture(
     until: Instant,
     stopped: &mut dyn FnMut() -> bool,
     keep: usize,
-) -> io::Result<Output> {
+) -> Result<Output, Failed> {
     capture_with(cmd, until, stopped, keep, &mut Instant::now, &mut |_, _| {
         Ok(())
     })
@@ -55,9 +84,13 @@ fn capture_with(
     keep: usize,
     now: &mut dyn FnMut() -> Instant,
     observe: &mut dyn FnMut(ChildOutput, &[u8]) -> io::Result<()>,
-) -> io::Result<Output> {
+) -> Result<Output, Failed> {
     let _held = crate::exec::group::hold();
-    let (parent, child) = aterm_uds::kept_out(aterm_uds::CtlStream::pair)?;
+    let (parent, child) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).map_err(|why| {
+        Failed::Unstarted(format!(
+            "native mutation control could not be made: {why}; nothing was sent"
+        ))
+    })?;
     let parent = RefCell::new(Some(parent));
     let close = || {
         parent.borrow_mut().take();
@@ -103,11 +136,21 @@ fn capture_with(
             damaged.borrow().is_some() && !started.get()
         },
         Some(&mut retire),
-    )?;
+    );
+    // Whether the child started decides what a write that gave no whole output means.
+    let started = started.get();
+    let failed = |why: String| {
+        if started {
+            Failed::Ended(why)
+        } else {
+            Failed::Unstarted(format!("{why}; nothing was sent"))
+        }
+    };
+    let status = status.map_err(|why| failed(why.to_string()))?;
     if let Some(why) = damaged.into_inner() {
-        return Err(io::Error::other(why));
+        return Err(failed(why));
     }
-    let status = status.ok_or_else(|| io::Error::other("native mutation did not start"))?;
+    let status = status.ok_or_else(|| failed("native mutation did not start".to_owned()))?;
     Ok(Output {
         status,
         stdout,

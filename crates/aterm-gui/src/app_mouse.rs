@@ -607,7 +607,7 @@ fn divider_drag_off_axis(g: usize, raw: u16, cell: usize) -> u16 {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PointerGeometry {
-    inset: usize,
+    inset: aterm_render::FrameInsets,
     cell: (usize, usize),
     pad: usize,
     pad_top: usize,
@@ -2108,7 +2108,7 @@ impl App {
 
     fn pointer_geometry(&self, wid: WindowId) -> PointerGeometry {
         PointerGeometry {
-            inset: self.win_side_inset_px(wid),
+            inset: self.frame_insets(wid),
             cell: self.win_cell_size(wid),
             pad: self.win_pad(wid),
             pad_top: self.win_pad_top(wid),
@@ -2926,7 +2926,7 @@ impl App {
     pub(crate) fn frame_origin(&self, wid: WindowId) -> (i64, i64) {
         // A headless surface is the frame plus its side inset.
         if !self.windows.get(&wid).is_some_and(|ws| ws.win_px.is_some()) {
-            return (self.win_side_inset_px(wid) as i64, 0);
+            return (self.frame_insets(wid).left as i64, 0);
         }
         self.frame_origin_with(wid, self.pointer_geometry(wid))
     }
@@ -2936,7 +2936,7 @@ impl App {
             return (0, 0);
         };
         let Some(size) = ws.win_px else {
-            return (geom.inset as i64, 0);
+            return (geom.inset.left as i64, 0);
         };
         let (cw, ch) = geom.cell;
         let (pad, pad_top, head) = (geom.pad, geom.pad_top, geom.head);
@@ -2954,7 +2954,7 @@ impl App {
             size.height as usize,
             frame_w,
             frame_h,
-            aterm_render::SideInsetPx(geom.inset),
+            geom.inset,
         );
         (place.x.origin, place.y.origin)
     }
@@ -2962,9 +2962,8 @@ impl App {
     /// The reserved side space not covered by the visible frame. An oversized frame may
     /// overlap the nominal inset; those painted pixels retain their normal pointer routes.
     pub(crate) fn in_side_inset(&self, wid: WindowId, x: f64) -> bool {
-        x >= 0.0
-            && x < self.win_side_inset_px(wid) as f64
-            && x < self.frame_origin(wid).0.max(0) as f64
+        let width = self.win_side_inset_px(wid);
+        width != 0 && x >= 0.0 && x < width as f64 && x < self.frame_origin(wid).0.max(0) as f64
     }
 
     fn pointer_gesture_live(&self, wid: WindowId) -> bool {
@@ -3194,7 +3193,13 @@ impl App {
                 Some(
                     crate::tab_bar::TabHit::Select(index) | crate::tab_bar::TabHit::Close(index),
                 ) => {
-                    let _ = self.open_tab_context_menu(wid, index, col, false);
+                    if let Some(index) = self
+                        .windows
+                        .get(&wid)
+                        .and_then(|ws| ws.painted_tab_index(index))
+                    {
+                        let _ = self.open_tab_context_menu(wid, index, col, false);
+                    }
                 }
                 _ => {
                     #[cfg(windows)]
@@ -3634,7 +3639,13 @@ impl App {
         col: u16,
     ) -> Option<(usize, usize)> {
         let ws = self.windows.get(&wid)?;
-        let from = ws.tab_set.tabs().iter().position(|t| t.id == tab)?;
+        let from = ws.strip_index_of(tab)?;
+        let step = |to| {
+            Some((
+                ws.strip_index_to_tab_index(from)?,
+                ws.strip_index_to_tab_index(to)?,
+            ))
+        };
         let segment = |index: usize| {
             ws.tab_segments
                 .iter()
@@ -3646,20 +3657,20 @@ impl App {
         if let Some(next) = segment(from + 1)
             && col >= mid(next)
         {
-            return Some((from, from + 1));
+            return step(from + 1);
         }
         if let Some(prev) = from.checked_sub(1).and_then(segment)
             && col < mid(prev)
         {
-            return Some((from, from - 1));
+            return step(from - 1);
         }
         let held = segment(from)?;
-        let tabs = ws.tab_set.shown_len();
+        let tabs = ws.strip_tabs().count();
         if from + 1 < tabs && segment(from + 1).is_none() && col >= held.end_col {
-            return Some((from, from + 1));
+            return step(from + 1);
         }
         if from > 0 && segment(from - 1).is_none() && col < held.start_col {
-            return Some((from, from - 1));
+            return step(from - 1);
         }
         None
     }
@@ -3868,7 +3879,10 @@ impl App {
             self.set_dock_hover_cursor(wid, over_control);
             return Resolved(None);
         }
-        if self.in_side_inset(wid, px) && !self.pointer_gesture_live(wid) {
+        if self.in_side_inset(wid, px)
+            && !self.pointer_gesture_live(wid)
+            && !self.stats_owns_pointer(wid)
+        {
             self.clear_side_inset_hover(wid);
             return Resolved(None);
         }
@@ -4659,6 +4673,7 @@ impl App {
         if self.in_side_inset(wid, x)
             && !self.pointer_gesture_live(wid)
             && self.dock_under_pointer(wid).is_none()
+            && !self.stats_owns_pointer(wid)
         {
             self.clear_side_inset_hover(wid);
             return;
@@ -5773,6 +5788,21 @@ impl App {
             None
         };
         let target = self.route_mouse_input(wid, state, button, at);
+        if state == ElementState::Released
+            && let Some(button) = winit_mouse_button(button)
+        {
+            self.finish_mouse_release(wid, button, released_native);
+        }
+        target
+    }
+
+    /// End pointer capture after either content or window chrome consumes the release.
+    pub(crate) fn finish_mouse_release(
+        &mut self,
+        wid: WindowId,
+        button: aterm_types::mouse::MouseButton,
+        released_native: Option<crate::tab_model::ViewId>,
+    ) {
         // A modal or chrome claim can return before the native reducer. Retire any remaining
         // left press while its owner is still known, after normal routing had its one chance to act.
         if let Some(view) = released_native
@@ -5787,17 +5817,12 @@ impl App {
             self.invalidate_native_pointer_style(wid, view);
             self.request_redraw_all_windows();
         }
-        if state == ElementState::Released
-            && let Some(button) = winit_mouse_button(button)
-        {
-            self.end_unpaired_release(wid, button);
-            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
-                let ws = &mut **route_guard_ws;
-                ws.page_buttons &= !(1 << button.slot());
-                ws.native_button_owners[usize::from(button.slot())] = None;
-            }
+        self.end_unpaired_release(wid, button);
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            ws.page_buttons &= !(1 << button.slot());
+            ws.native_button_owners[usize::from(button.slot())] = None;
         }
-        target
     }
 
     fn end_unpaired_release(&mut self, wid: WindowId, button: aterm_types::mouse::MouseButton) {
@@ -6026,17 +6051,28 @@ impl App {
                 ws.caption_move = None;
             }
         }
+        if button == WinitMouseButton::Left {
+            let drag = self.windows.get_mut(&wid).and_then(|mut ws| {
+                let (session, origin) = ws.dock.session_drag.take()?;
+                let point = ws.last_cursor_px;
+                let distance = (point.0 - origin.0).hypot(point.1 - origin.1);
+                let moved = !ws.pointer_position_known
+                    || distance >= crate::client_frame::MOVE_THRESHOLD_LOGICAL_PX * ws.scale;
+                (!pressed && moved && !ws.overlay_open()).then_some((session, point))
+            });
+            if let Some((session, point)) = drag {
+                self.finish_dock_session_drag(wid, session, point);
+                return None;
+            }
+        }
         if pressed {
             self.clear_claude_light_selection(wid);
         }
         if pressed {
             crate::input_hint::arm();
         }
-        if !pressed
-            && button == WinitMouseButton::Left
-            && let Some(mut ws) = self.windows.get_mut(&wid)
-        {
-            ws.strip_drag = None;
+        if !pressed && button == WinitMouseButton::Left && self.finish_grid_tab_drop(wid) {
+            return None;
         }
         if !pressed && button == WinitMouseButton::Left && self.scrollbar_release(wid) {
             return None;
@@ -6119,6 +6155,7 @@ impl App {
                 .get(&wid)
                 .is_some_and(|ws| self.in_side_inset(wid, ws.last_cursor_px.0))
             && self.dock_under_pointer(wid).is_none()
+            && !self.stats_owns_pointer(wid)
         {
             // Above the dock the inset is the header's: a left press there is one on its bare
             // band, so a client-side header is dragged and double-pressed by its whole width.
@@ -6423,6 +6460,26 @@ impl App {
                         let ws = &mut **route_guard_ws;
                         ws.native_rehover = true;
                     }
+                    if dock_event == Some(release_view)
+                        && let Some(session) = crate::navigator::row_session(release.key.as_str())
+                        && self.windows.get_mut(&wid).is_some_and(|mut ws| {
+                            let prior = ws.dock.session_click.replace((session, at, (px, py)));
+                            let twice = prior.is_some_and(|(last, was, point)| {
+                                last == session
+                                    && at.saturating_duration_since(was).as_millis()
+                                        <= crate::multi_click_ms()
+                                    && (point.0 - px).hypot(point.1 - py)
+                                        <= crate::client_frame::MOVE_THRESHOLD_LOGICAL_PX * ws.scale
+                            });
+                            if twice {
+                                ws.dock.session_click = None;
+                            }
+                            twice
+                        })
+                    {
+                        self.keep_dock_session(wid, session);
+                        return native_press;
+                    }
                     let _ = self.dispatch_native_pointer_action(
                         wid,
                         release_view,
@@ -6569,6 +6626,12 @@ impl App {
                                 presses: NativePointerRest::presses(ws.native_rest.as_ref()),
                             });
                         }
+                    }
+                    if dock_event == Some(target_view)
+                        && let Some(session) = crate::navigator::row_session(key.as_str())
+                        && let Some(mut ws) = self.windows.get_mut(&wid)
+                    {
+                        ws.dock.session_drag = Some((session, (px, py)));
                     }
                     self.invalidate_native_pointer_style(wid, target_view);
                     self.request_redraw_all_windows();
@@ -7172,6 +7235,7 @@ impl App {
                 .get(&wid)
                 .is_some_and(|ws| self.in_side_inset(wid, ws.last_cursor_px.0))
             && self.dock_under_pointer(wid).is_none()
+            && !self.stats_owns_pointer(wid)
         {
             return;
         }

@@ -5538,15 +5538,31 @@ fn node_and_subscriber_share_a_source_refresh_wave_using_the_alignment_record() 
             .observe(Some(&initial_mark), latest, None)
             .is_none()
     );
-    let forced = RefreshRequest::after(Some(scope), latest.version);
+    // The window's maintenance request binds the real scope at admission. A fresh shared
+    // receipt keeps it from doing the same remote work as the node and subscriber.
+    let maintenance = RefreshRequest::ensure(None, latest.version);
+    let (rows, maintenance_record) = apply(inputs.clone(), maintenance);
+    assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+    assert_eq!(maintenance_record, expected);
+    assert_eq!(network(), (1, 1), "window maintenance shares the wave");
+
+    let window_route = RefreshRequest::after(None, latest.version);
     let third = repos.advance("third.txt", "source three\n");
-    let (rows, refreshed) = apply(inputs.clone(), forced);
+    let (rows, refreshed) = apply(inputs.clone(), window_route);
     assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
     assert_eq!(repos.head(&repos.work), third);
     assert_eq!(
         network(),
         (2, 2),
         "a later explicit boundary refreshes the same source again"
+    );
+    let (rows, retried) = apply(inputs.clone(), window_route);
+    assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+    assert_eq!(retried, refreshed);
+    assert_eq!(
+        network(),
+        (2, 2),
+        "the window's retry retains that boundary"
     );
     let generic = |mut record: crate::sync::Record| {
         record.repositories = None;
@@ -5575,6 +5591,7 @@ fn node_and_subscriber_share_a_source_refresh_wave_using_the_alignment_record() 
     // A request made for the old source is admitted for the source there is now: it asked
     // for a refresh after its boundary, and the wave it gets reads the new source. Refused
     // instead (0.200.0), the pass failed and was asked again with the same stale scope.
+    let forced = RefreshRequest::after(Some(scope), latest.version);
     let (rows, adopted) = apply(changed.clone(), forced);
     assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
     assert_eq!(repos.head(&repos.work), fourth);

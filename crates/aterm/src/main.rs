@@ -59,6 +59,12 @@ aterm_durable::plain_durable_flushes_in_tests!();
 /// A stop during the follow-up says [`FOLLOW_UP_STOPPED`] and ends the command as that stop
 /// would have ([`aterm_machines::port::say_on_stop`]).
 fn package_entry(args: Vec<OsString>) -> ExitCode {
+    // `aterm pkg unit-source` (DC-24b), plumbing: its source reads this Mac's fleet, which the
+    // package pass does not link.
+    #[cfg(unix)]
+    if args.len() == 1 && args[0] == "unit-source" {
+        return aterm_agent::unit_source::main_entry();
+    }
     package_entry_with(
         args,
         a_person_at_their_own_account(),
@@ -300,6 +306,45 @@ macro_rules! println {
     }};
 }
 
+fn prepare_resident(args: &[OsString]) -> ExitCode {
+    const USAGE: &str = "usage: aterm agents prepare-resident";
+    if let [flag] = args
+        && matches!(flag.to_str(), Some("--help" | "-h" | "help"))
+    {
+        println!(
+            "{USAGE}\nPrepare the resident's private working directory and standing brief on Unix. Prints the directory."
+        );
+        return ExitCode::SUCCESS;
+    }
+    if let Some(extra) = args.first() {
+        eprintln!("aterm agents prepare-resident: unexpected argument {extra:?}\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    #[cfg(unix)]
+    {
+        let Some(root) = aterm_types::dirs::state_dir() else {
+            eprintln!("aterm agents prepare-resident: the aterm state root is unknown");
+            return ExitCode::FAILURE;
+        };
+        let harness_state = aterm_agent::harness::cli::harness_state_in(&root);
+        match aterm_agent::harness::resident::prepare_resident(&harness_state) {
+            Ok(folder) => {
+                println!("{}", folder.display());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("aterm agents prepare-resident: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        eprintln!("aterm agents prepare-resident: unavailable on this platform (Unix only)");
+        ExitCode::FAILURE
+    }
+}
+
 /// `aterm link` and `aterm fabric` where the fabric bridge cannot exist: `aterm-link` is a
 /// `cfg(unix)` dependency, so the verbs stay on the roster and refuse by name.
 #[cfg(not(unix))]
@@ -516,13 +561,21 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
             );
             return ExitCode::from(2);
         }
+        let Some(state) = aterm_types::dirs::state_dir() else {
+            eprintln!("aterm node serve: state directory is unavailable");
+            return ExitCode::FAILURE;
+        };
         // Every thread the job starts runs at utility, as the `Standard` launchd job it ran in
         // clamped it, but per thread, so the fleet book's lock lifts its holder to the default
         // class while it holds it (`node_service::node_plist_text`'s `Interactive` job caps no
         // thread). Unlike that clamp, the hold leaves a child started outside a role's
         // `qos::command` (its Bonjour advert) at the default class, and a dispatch worker's item
-        // at its queue's class. First, as a thread started earlier keeps the default class.
+        // at its queue's class. Before any thread starts (the log's own included), as a thread
+        // started earlier keeps the default class.
         aterm_gui::hold_process_as_background_work();
+        // The job's log, bounded while it serves, where its standard output or error is the file
+        // its plist names (aterm_uds::job_log): serving takes what this kept.
+        let kept = aterm_agent::node_service::keep_log(&state);
         aterm_gui::install_session_log();
         // The job's lock first, then its boot: a build this job staged and ended its last run
         // for goes in now, with no window here to apply it, and that boot execs the build it
@@ -557,9 +610,9 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
         // SIGTERM, the job's usual end) and so does the serve loop's return below.
         aterm_gui::install_host_quit(node_commons_stop_at_quit);
         #[cfg(target_os = "macos")]
-        let code = input_attachments::node_serve(startup);
+        let code = input_attachments::node_serve(startup, kept);
         #[cfg(not(target_os = "macos"))]
-        let code = aterm_gui::run_node_serve_owning(startup);
+        let code = aterm_gui::run_node_serve_owning(startup, kept);
         node_commons_stop_at_quit();
         return code;
     }
@@ -1038,6 +1091,10 @@ fn front_door_main(
         AliasRoute::MachinesAskpass => return aterm_machines::askpass::main(&rest),
         #[cfg(not(target_os = "macos"))]
         AliasRoute::MachinesAskpass => return machines_unavailable(),
+        #[cfg(unix)]
+        AliasRoute::UnitSource => return aterm_agent::unit_source::main_entry(),
+        #[cfg(not(unix))]
+        AliasRoute::UnitSource => return ExitCode::SUCCESS,
         AliasRoute::Pkg => return package_entry(rest),
         AliasRoute::Abrew => return atpkg::abrew::main_entry(rest),
         AliasRoute::Agh => return agh::cli::main_entry(rest),
@@ -1113,6 +1170,9 @@ fn front_door_main(
     if let Some(verb) = aterm_cli::Verb::from_operand(&first) {
         drop(first);
         if matches!(verb, aterm_cli::Verb::Agents) {
+            if rest.get(1).is_some_and(|arg| arg == "prepare-resident") {
+                return prepare_resident(&rest[2..]);
+            }
             let _ = aterm_cli::parse_args(rest);
             return ExitCode::SUCCESS;
         }
@@ -1460,17 +1520,24 @@ fn front_door_main(
         let build = aterm_gui::running_build_number();
         #[cfg(target_os = "linux")]
         start_linux_session_trial(build);
-        // Linux's resume-cancelled timer needs no acknowledgement. A macOS session registers no
-        // power client: stopped by Ctrl-Z or a debugger it could not acknowledge a will-sleep, and
-        // each sleep of the Mac would wait 30 s for it, so its check reads its clocks every 5 s.
-        #[cfg(target_os = "linux")]
-        let _ = aterm_update::hear_wakes();
         aterm_update::spawn_background_check_with_settings(
             build,
             std::sync::Arc::new(aterm_gui::configured_update_settings),
             None,
             None,
             None,
+            aterm_update::Wakes {
+                // Linux's resume-cancelled timer needs no acknowledgement. A macOS session
+                // registers no power client: stopped by Ctrl-Z or a debugger it could not
+                // acknowledge a will-sleep, and each sleep of the Mac would wait 30 s for it, so
+                // its check reads its clocks every 5 s.
+                sleeps: if cfg!(target_os = "linux") {
+                    aterm_update::Sleeps::Heard
+                } else {
+                    aterm_update::Sleeps::Unheard
+                },
+                network: None,
+            },
         );
         startup.map(|mut startup| {
             Box::new(move || startup.maintain()) as aterm_cli::SessionMaintenance
@@ -9689,6 +9756,7 @@ fn initial_setup_status_with(
             Some(aterm_gui::InitialSetupPermissionPolicy {
                 revision: snapshot.access_revision,
                 allowed: snapshot.permissions_allowed,
+                person_access: snapshot.person_access,
             }),
             snapshot
                 .rows

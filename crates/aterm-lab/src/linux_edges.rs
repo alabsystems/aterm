@@ -3,15 +3,21 @@
 
 //! The Linux proof's edge rows (`linux edges`): the X11 and Wayland server variants of LW.5-LW.7 (`docs/AUDIT-third-party-2026-10-15.md`) that its other rows do not run, one per [`Edge`].
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::linux::{self, Up};
 use crate::linux_a11y::Cell;
-use crate::linux_baseline::{Caption, dims_summary, frame_requests, parse_caption};
+use crate::linux_baseline::{
+    Caption, NativeGeometry, dimension, dims_summary, frame_requests, parse_caption,
+};
 use crate::linux_guest::{self as guest, Display, Unit};
 use crate::linux_proof::{self as proof, Gui, Row, Verdict};
 use crate::stop::Stopped;
+
+#[path = "linux_edges_pointer.rs"]
+mod native_pointer;
 
 const HANG_SECS: u32 = 60;
 const HANG: Duration = Duration::from_secs(60);
@@ -203,10 +209,9 @@ pub(crate) fn rows(
             cell,
             gui,
             lane_wl: lane_wl.as_deref(),
+            invocation: RefCell::new(None),
         };
-        let (verdict, detail) = row.run(edge);
-        row.gui.stop();
-        cell.up.stop_units();
+        let (verdict, detail) = row.finish(row.run(edge));
         println!("  {} {detail}", verdict.label());
         rows.push(Row {
             name,
@@ -432,6 +437,49 @@ struct Run<'a> {
     cell: &'a Cell<'a>,
     gui: Gui<'a>,
     lane_wl: Result<&'a str, &'a String>,
+    invocation: RefCell<Option<Launch>>,
+}
+
+/// Attribution for the current launch only, including an unavailable InvocationID.
+struct Launch {
+    invocation: String,
+    status: String,
+    manager_record: bool,
+}
+
+fn main_exit(text: &str, invocation: &str) -> Result<String, &'static str> {
+    if invocation.len() != 32 || !invocation.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("saved InvocationID unavailable or malformed");
+    }
+    let lines: Vec<_> = text.lines().collect();
+    if !text.ends_with('\n') || lines.len() != 5 || lines[0] != "schema=1" {
+        return Err("main-exit record incomplete or malformed");
+    }
+    if lines[1].strip_prefix("invocation=") != Some(invocation) {
+        return Err("main-exit record belongs to a different invocation");
+    }
+    let code = lines[2]
+        .strip_prefix("code=")
+        .ok_or("main-exit code absent")?;
+    let status = lines[3]
+        .strip_prefix("status=")
+        .ok_or("main-exit status absent")?;
+    let result = lines[4]
+        .strip_prefix("result=")
+        .ok_or("main-exit result absent")?;
+    let word = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    if !matches!(code, "exited" | "killed" | "dumped") || !word(status) || !word(result) {
+        return Err("main-exit fields unavailable or malformed");
+    }
+    if code == "exited" && !status.parse::<u8>().is_ok_and(|n| n.to_string() == status) {
+        return Err("main-exit numeric status malformed");
+    }
+    Ok(format!("code={code} status={status} result={result}"))
 }
 
 impl Run<'_> {
@@ -446,6 +494,10 @@ impl Run<'_> {
 
     fn stderr(&self) -> String {
         format!("{}/gui.stderr", self.gui.dir)
+    }
+
+    fn exit_status(&self) -> String {
+        format!("{}/gui.status", self.gui.dir)
     }
 
     fn marks(&self) -> String {
@@ -473,17 +525,23 @@ impl Run<'_> {
     }
 
     fn prepare(&self, top: &str) -> Result<(), String> {
+        self.prepare_config(top, "")
+    }
+
+    fn prepare_config(&self, top: &str, tail: &str) -> Result<(), String> {
+        *self.invocation.borrow_mut() = None;
         self.gui.prepare()?;
-        if !top.is_empty() {
+        if !top.is_empty() || !tail.is_empty() {
             let path = format!("{}/cfg/aterm/aterm.toml", self.gui.dir);
             let out = self.sh(&[
                 "sh",
                 "-c",
                 // chmod 600: the guest umask would rebuild the config group-writable, and the GUI refuses those.
-                "printf '%s' \"$1\" | cat - \"$2\" > \"$2.new\" && chmod 600 \"$2.new\" && mv \"$2.new\" \"$2\"",
+                "printf '%s' \"$1\" | cat - \"$2\" > \"$2.new\" && printf '%s' \"$3\" >> \"$2.new\" && chmod 600 \"$2.new\" && mv \"$2.new\" \"$2\"",
                 "config",
                 top,
                 &path,
+                tail,
             ]);
             if !out.ok() {
                 return Err(format!("{path}: {}", out.tail(2)));
@@ -506,7 +564,7 @@ impl Run<'_> {
         client: &[(String, String)],
         extra: &[(String, String)],
     ) -> Result<(), String> {
-        self.gui.start_logged_with(client, extra, &self.stderr())?;
+        self.start(client, extra)?;
         if !self
             .up()
             .sh(&guest::wait_socket(&self.gui.sock(), HANG_SECS))
@@ -522,6 +580,187 @@ impl Run<'_> {
             Ok(())
         } else {
             Err(format!("`ready` answered {r}"))
+        }
+    }
+
+    fn start(&self, client: &[(String, String)], extra: &[(String, String)]) -> Result<(), String> {
+        let status = self.exit_status();
+        *self.invocation.borrow_mut() = Some(Launch {
+            invocation: String::new(),
+            status: status.clone(),
+            manager_record: true,
+        });
+        let removed = self.sh(&["rm", "-f", &status, &format!("{status}.part")]);
+        if !removed.ok() {
+            return Err(format!(
+                "could not clear the previous GUI status: {}",
+                removed.tail(3)
+            ));
+        }
+        let invocation = self
+            .gui
+            .start_recorded_with(client, extra, &self.stderr(), &status)?;
+        self.invocation
+            .borrow_mut()
+            .as_mut()
+            .expect("attempted launch")
+            .invocation = invocation;
+        Ok(())
+    }
+
+    /// Retain the failed launch while its unit, world and lane still belong to this row.
+    /// Stopping a unit first would replace its state; --collect can also forget a dead unit,
+    /// so its atomically published main-exit record is retained independently.
+    fn finish(&self, (verdict, mut detail): Ended) -> Ended {
+        if verdict != Verdict::Pass {
+            if let Some(launch) = self.invocation.borrow().as_ref() {
+                detail.push_str(&self.failure_evidence(launch));
+            }
+        }
+        self.gui.stop();
+        self.up().stop_units();
+        (verdict, detail)
+    }
+
+    fn failure_evidence(&self, launch: &Launch) -> String {
+        let invocation = &launch.invocation;
+        let mut evidence = format!("launch InvocationID: {invocation:?}\n");
+        let mut retain = |label: &str, argv: &[String]| {
+            let out = self.gui.diagnostic(argv);
+            evidence.push_str(&format!(
+                "\n=== {label}: {} ===\n{}\n",
+                out.status(),
+                out.text
+            ));
+            out
+        };
+        let label = if launch.manager_record {
+            "manager main-exit record (before cleanup)"
+        } else {
+            "original GUI wait status (before cleanup)"
+        };
+        let status = retain(label, &["cat".into(), launch.status.clone()]);
+        retain("GUI stderr (tail)", &["cat".into(), self.stderr()]);
+        let state = retain("current unit state (before cleanup)", &[
+            "systemctl".into(), "--user".into(), "show".into(),
+            "--property=InvocationID,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,ExecStopPost,MainPID".into(),
+            Gui::unit_name(),
+        ]);
+        let current = state
+            .text
+            .lines()
+            .find_map(|line| line.strip_prefix("InvocationID="));
+        let same = state.ok() && !invocation.is_empty() && current == Some(invocation.as_str());
+        if !same {
+            evidence.push_str("\nUnit state is unavailable or belongs to a different invocation; it is not the saved GUI's exit status.\n");
+        }
+        if invocation.len() == 32 && invocation.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let out = self.gui.diagnostic(&[
+                "journalctl".into(),
+                "--user".into(),
+                "--no-pager".into(),
+                "-o".into(),
+                "cat".into(),
+                "--lines=120".into(),
+                format!("_SYSTEMD_INVOCATION_ID={invocation}"),
+            ]);
+            evidence.push_str(&format!(
+                "\n=== saved invocation journal (last 120 entries): {} ===\n{}\n",
+                out.status(),
+                out.text
+            ));
+        } else {
+            evidence.push_str("\nSaved InvocationID unavailable or malformed; no unit-name journal was substituted.\n");
+        }
+        let kept = self.gui.keep_crash_reports(self.cell.results);
+        evidence.push_str(&kept);
+        let main = if launch.manager_record {
+            if status.ok() {
+                main_exit(&status.text, invocation)
+                    .unwrap_or_else(|why| format!("unavailable: {why}"))
+            } else {
+                format!("unavailable: {}", status.status())
+            }
+        } else {
+            format!(
+                "original watched GUI wait: {} ({})",
+                crate::util::one_line(&status.text, 160),
+                status.status()
+            )
+        };
+        evidence.push_str(&format!("\nGUI main exit: {main}\n"));
+        let path = self
+            .cell
+            .results
+            .join(format!("{}-failure.txt", self.gui.name));
+        let saved = match crate::util::write_fresh_mode(&path, &evidence, 0o600) {
+            Ok(()) => format!("\n    GUI failure evidence: {}", path.display()),
+            Err(error) => format!(
+                "\n    GUI failure evidence could not be saved at {}: {error}",
+                path.display()
+            ),
+        };
+        format!("{saved}\n    GUI main exit: {main}{kept}")
+    }
+
+    /// Exercise the real manager hook on an owned, non-GUI main that exits 37. --wait
+    /// includes ExecStopPost, so this reads the complete record after the --collect unit
+    /// has finished, without changing any GUI's MainPID or waiting on a latency budget.
+    fn exit_record_control(&self) -> Result<String, String> {
+        self.prepare("")?;
+        let record = format!(
+            "{}/exit-control %i $literal 'quote' \"double\"",
+            self.gui.dir
+        );
+        let unit = Unit {
+            name: format!("{}exit-control", guest::UNIT_PREFIX),
+            env: Vec::new(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'control-invocation='; /usr/bin/printenv INVOCATION_ID; exit 37".into(),
+            ],
+            socket: String::new(),
+        };
+        let mut argv = guest::run_unit_with_exit_record(&unit, None, &record);
+        let separator = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("unit command separator");
+        argv.splice(separator..separator, ["--wait".into(), "--pipe".into()]);
+        let out = self.gui.diagnostic(&argv);
+        let captured = self.gui.diagnostic(&["cat".into(), record]);
+        let ids: Vec<_> = out
+            .text
+            .lines()
+            .filter_map(|line| line.strip_prefix("control-invocation="))
+            .collect();
+        let parsed = match ids.as_slice() {
+            [id] if captured.ok() => main_exit(&captured.text, id),
+            _ => Err("control invocation or complete record unavailable"),
+        };
+        let evidence = format!(
+            "owned exit-control: {}\n{}\nrecord read: {}\n{}\ninterpretation: {parsed:?}\n",
+            out.status(),
+            out.text,
+            captured.status(),
+            captured.text
+        );
+        let path = self
+            .cell
+            .results
+            .join(format!("{}-exit-control.txt", self.gui.name));
+        crate::util::write_fresh_mode(&path, &evidence, 0o600)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if out.code == Some(37) && parsed.as_deref() == Ok("code=exited status=37 result=exit-code")
+        {
+            Ok("manager exit-record control: native main 37, matching complete record after --wait/--collect".into())
+        } else {
+            Err(format!(
+                "manager exit-record control failed ({}; {parsed:?}); evidence {}",
+                out.status(),
+                path.display()
+            ))
         }
     }
 
@@ -740,7 +979,17 @@ impl Run<'_> {
     fn refused(&self, client: &[(String, String)], extension: &str) -> Result<String, String> {
         self.prepare("")?;
         let status = format!("{}/status", self.gui.dir);
-        self.gui.start_watched_on(client, &self.stderr(), &status)?;
+        *self.invocation.borrow_mut() = Some(Launch {
+            invocation: String::new(),
+            status: status.clone(),
+            manager_record: false,
+        });
+        let invocation = self.gui.start_watched_on(client, &self.stderr(), &status)?;
+        self.invocation
+            .borrow_mut()
+            .as_mut()
+            .expect("attempted launch")
+            .invocation = invocation;
         if !self.up().sh(&guest::wait_file(&status, HANG_SECS)).ok() {
             return Err(format!(
                 "aterm-gui did not end within {HANG_SECS} s: it neither refused the display nor \
@@ -1058,11 +1307,107 @@ impl Run<'_> {
     }
 
     fn cell_px(&self, row: i32, col: i32) -> Result<(i32, i32), String> {
-        let at = self.ctl(&["pointer", "move", &row.to_string(), &col.to_string()])?;
-        proof::field(&at, "px")
-            .and_then(|p| p.split_once(','))
-            .and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?)))
-            .ok_or_else(|| format!("`pointer move {row} {col}` read no px: {at}"))
+        native_pointer::grid_cell(&self.dims()?, row, col)
+    }
+
+    fn native_pointer_work(&self, pid: u32) -> native_pointer::Reading {
+        let stat = format!("/proc/{pid}/stat");
+        let io = format!("/proc/{pid}/io");
+        let out = self.sh(&["cat", &stat, &io, &stat]);
+        if out.ok() {
+            native_pointer::reading(pid, &out.text)
+        } else if self.sh(&["test", "-d", &format!("/proc/{pid}")]).code == Some(1) {
+            native_pointer::Reading::Ended
+        } else {
+            native_pointer::Reading::Unknown(None)
+        }
+    }
+
+    fn native_pointer_at(
+        &self,
+        want: (i32, i32),
+        cursor: native_pointer::Cursor,
+        owners: &[u32],
+    ) -> Result<String, String> {
+        let wire = self.native_pointer_until(want, owners, |wire| {
+            Ok(native_pointer::handled(wire, want, cursor))
+        })?;
+        // In-surface motion has no backend cursor replay. A later cursor response
+        // comes from the GUI's native-event drain; its queued motions finish
+        // before the next control UserEvent. This single read cannot overtake
+        // them, and does not poll application state into place.
+        self.require_pointer_at(want)?;
+        Ok(wire)
+    }
+
+    fn require_pointer_at(&self, want: (i32, i32)) -> Result<(), String> {
+        let reply = self.ctl(&["pointer", "status"])?;
+        let actual = proof::field(&reply, "px")
+            .and_then(|px| px.split_once(','))
+            .and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?)));
+        if actual == Some(want) {
+            return Ok(());
+        }
+        Err(format!(
+            "the consumed native pointer is {actual:?}, not window pixel {want:?}: {reply}"
+        ))
+    }
+
+    fn native_pointer_wire(&self) -> Result<String, String> {
+        let log = self.sh(&["cat", &self.stderr()]);
+        if !log.ok() {
+            return Err(format!(
+                "the native pointer wire log is unread: {}",
+                log.tail(3)
+            ));
+        }
+        Ok(log.text)
+    }
+
+    fn native_pointer_until(
+        &self,
+        want: (i32, i32),
+        owners: &[u32],
+        ready: impl Fn(&str) -> Result<bool, String>,
+    ) -> Result<String, String> {
+        let mut work = native_pointer::Progress::new(owners);
+        let mut window = aterm_uds::deadline::ProgressWindow::new(HANG, Instant::now());
+        let mut last_wire = None;
+        let waited: Result<(), String> = (|| {
+            loop {
+                crate::stop::check().map_err(|stopped| format!("{stopped:?}"))?;
+                last_wire = Some(self.native_pointer_wire()?);
+                if let Some(wire) = &last_wire
+                    && ready(wire)?
+                {
+                    return Ok(());
+                }
+                let generation = work.observe(|pid| self.native_pointer_work(pid))?;
+                let left = window.observe(Instant::now(), 0, || generation);
+                if left.is_zero() {
+                    return Err(format!(
+                        "the native pointer never acknowledged window pixel {want:?}; its GUI and \
+                         compositor made no CPU or I/O progress for a minute"
+                    ));
+                }
+                crate::stop::sleep(left).map_err(|stopped| format!("{stopped:?}"))?;
+            }
+        })();
+        match (waited, last_wire) {
+            (Ok(()), Some(wire)) => Ok(wire),
+            (Ok(()), None) => Err("the native pointer produced no wire observation".into()),
+            (Err(why), None) => Err(why),
+            (Err(why), Some(wire)) => {
+                let path = self
+                    .cell
+                    .results
+                    .join(format!("{}-native-pointer-failed-wire.txt", self.gui.name,));
+                match crate::util::write_fresh(&path, &wire) {
+                    Ok(()) => Err(format!("{why}; native wire: {}", path.display())),
+                    Err(error) => Err(format!("{why}; native wire not retained: {error}")),
+                }
+            }
+        }
     }
 
     fn aim(&self, name: &str, origin: (i32, i32), px: (i32, i32)) -> Result<(), String> {
@@ -1133,13 +1478,16 @@ impl Run<'_> {
         let caption = self.caption()?;
         self.photograph(what)?;
         let d = self.dims()?;
-        let band_y = num(&d, "pad_top").unwrap_or(0)
-            + num(&d, "head").unwrap_or(0)
-            + num(&d, "cell_h").unwrap_or(0) / 2;
-        let (cw, pad) = (num(&d, "cell_w").unwrap_or(0), num(&d, "pad").unwrap_or(0));
-        let cols = u16::try_from(num(&d, "window_cols").unwrap_or(0)).unwrap_or(0);
+        let geometry = NativeGeometry::parse(&d)?;
+        let band_y =
+            dimension(&d, "pad_top")? + dimension(&d, "head")? + dimension(&d, "cell_h")? / 2;
+        let (cw, pad) = (dimension(&d, "cell_w")?, dimension(&d, "pad")?);
+        let cols = u16::try_from(dimension(&d, "window_cols")?).map_err(|e| e.to_string())?;
         let end = i32::from(caption.right_end(cols));
-        let band_x = pad + (end - 4).max(0) * cw;
+        let (band_x, band_y) = geometry.frame_point(
+            i64::from(pad) + i64::from((end - 4).max(0)) * i64::from(cw),
+            i64::from(band_y),
+        )?;
         let steps = [
             "make".to_string(),
             format!("at:{},{}", LAYOUT.0 / 2, LAYOUT.1 / 2),
@@ -1176,7 +1524,15 @@ impl Run<'_> {
             Err(why) => return not_run(why),
         };
         Self::verdict((|| {
-            let text = self.hover(&sway, &sway.socket, "shapes", false)?;
+            let text = self
+                .hover(
+                    &sway,
+                    &sway.socket,
+                    "shapes",
+                    false,
+                    native_pointer::Cursor::Shape(9),
+                )
+                .map_err(|why| format!("direct text hover: {why}"))?;
             if !text.0.iter().any(|s| s == "text") {
                 return Err(format!(
                     "over the text the window set {}, never text",
@@ -1185,7 +1541,15 @@ impl Run<'_> {
             }
             self.gui.stop();
             let hidden = self.wlhide(&sway, &[&format!("hide:{DECORATION}")])?;
-            let edge = self.hover(&sway, &hidden, "shapes-edge", true)?;
+            let edge = self
+                .hover(
+                    &sway,
+                    &hidden,
+                    "shapes-edge",
+                    true,
+                    native_pointer::Cursor::Shape(18),
+                )
+                .map_err(|why| format!("decoration-hidden resize hover: {why}"))?;
             if !edge.0.iter().any(|s| s.ends_with("_resize")) {
                 return Err(format!(
                     "over the right edge the window set {}, no resize shape",
@@ -1195,7 +1559,15 @@ impl Run<'_> {
             self.gui.stop();
             self.stop_wlhide();
             let hidden = self.wlhide(&sway, &["hide:wp_cursor_shape_manager_v1"])?;
-            let control = self.hover(&sway, &hidden, "shapes-hidden", false)?;
+            let control = self
+                .hover(
+                    &sway,
+                    &hidden,
+                    "shapes-hidden",
+                    false,
+                    native_pointer::Cursor::Surface,
+                )
+                .map_err(|why| format!("shape-manager-hidden text hover: {why}"))?;
             if !control.0.is_empty() || control.1 == 0 {
                 return Err(format!(
                     "with the shape manager hidden the window set shapes {} and {} cursor \
@@ -1220,6 +1592,7 @@ impl Run<'_> {
         socket: &str,
         what: &str,
         edge: bool,
+        cursor: native_pointer::Cursor,
     ) -> Result<(Vec<String>, usize), String> {
         self.prepare("")?;
         self.launch_wayland(sway, socket)?;
@@ -1227,38 +1600,90 @@ impl Run<'_> {
             self.swaymsg(sway, &["floating", "enable"])?;
             self.caption_until("resize edges", &|c| c.edges)?;
         }
+        let pid_of = |unit: &str| {
+            proof::unit_pid(self.up(), unit)
+                .and_then(|pid| pid.parse::<u32>().ok())
+                .filter(|pid| *pid != 0)
+                .ok_or_else(|| format!("native pointer owner {unit} has no main pid"))
+        };
+        let gui_pid = pid_of(&Gui::unit_name())?;
+        let sway_pid = pid_of(&format!("{}sway", guest::UNIT_PREFIX))?;
+        // The relay opens its upstream socket in the wlhide process and pumps it
+        // on threads. Sway therefore identifies that unit as the proxied client.
+        let peer_pid = if socket == sway.socket {
+            gui_pid
+        } else if socket == format!("{SWAY_DIR}/rt/hidden") {
+            pid_of(&format!("{}wlhide", guest::UNIT_PREFIX))?
+        } else {
+            return Err(format!(
+                "the native pointer uses an unknown Wayland route: {socket}"
+            ));
+        };
+        let mut owners = vec![gui_pid, sway_pid, peer_pid];
+        owners.sort_unstable();
+        owners.dedup();
+        let d = self.dims()?;
+        let geometry = NativeGeometry::parse(&d)?;
+        let origin = native_pointer::client_origin(
+            &self.swaymsg(sway, &["-r", "-t", "get_tree"])?,
+            peer_pid,
+            geometry,
+        )?;
+        let warmup = native_pointer::grid_cell(&d, 1, 1)?;
+        let target = if edge {
+            geometry.right_midpoint(-2)?
+        } else {
+            geometry.grid_midpoint(&d)?
+        };
+        // Hold at the warmup until its fresh native arrival is observed. Merely
+        // sending both moves, even with server roundtrips, lets the compositor
+        // coalesce them and enter directly at the seed. The later seed/target
+        // moves must remain distinct in-surface motions, with GUI acknowledgments.
+        // Padding can retain the text cursor and correctly emit no cursor change.
+        // The observed strip changes it to Default before the text or resize target.
+        let seed = native_pointer::strip_point(&d)?;
+        if seed == target || seed == warmup || warmup == target {
+            return Err(format!(
+                "the native pointer seed equals its target {target:?}"
+            ));
+        }
+        self.aim("warmup", origin, warmup)?;
+        self.aim("seed", origin, seed)?;
+        self.aim("target", origin, target)?;
         let steps = [
             "make".to_string(),
-            format!("at:{},{}", LAYOUT.0 / 2, LAYOUT.1 / 2),
-            format!("touch:{}", self.mark("centred")),
+            format!("at:@{}", self.mark("warmup")),
+            format!("wait:{}", self.mark("warmup-arrived")),
+            format!("at:@{}", self.mark("seed")),
             format!("wait:{}", self.mark("aimed")),
             format!("at:@{}", self.mark("target")),
-            "sleep:300".into(),
-            format!("touch:{}", self.mark("there")),
             format!("wait:{}", self.mark("done")),
         ];
+        let checkpoint = self.native_pointer_wire()?;
         self.pointer(socket, &steps)?;
-        self.reached("centred")?;
-        let px = self.pointer_px()?;
-        let origin = Self::origin(px);
-        let target = if edge {
-            let d = self.dims()?;
-            (
-                num(&d, "frame_w").unwrap_or(0) - 2,
-                num(&d, "frame_h").unwrap_or(0) / 2,
-            )
-        } else {
-            self.cell_px(2, 2)?
-        };
-        self.aim("target", origin, target)?;
-        self.go("aimed");
-        self.reached("there")?;
+        let result = (|| {
+            self.native_pointer_until(warmup, &owners, |wire| {
+                native_pointer::arrived(wire, &checkpoint, warmup)
+            })?;
+            // Raw arrival can precede CursorMoved. UserEvents are taken once per
+            // Wayland iteration before WindowEvents: the second sequential read
+            // therefore follows the native drain, even if the first preceded it.
+            // This only primes the text hover; seed and target still need their
+            // independent native cursor responses below.
+            self.ctl(&["pointer", "status"])?;
+            self.require_pointer_at(warmup)?;
+            self.go("warmup-arrived");
+            self.native_pointer_at(seed, native_pointer::Cursor::Any, &owners)?;
+            self.go("aimed");
+            self.native_pointer_at(target, cursor, &owners)?;
+            let wire = self.keep(&format!("{what}-wire"));
+            Ok((
+                shapes_set(&wire),
+                requests_of(&wire, "wl_pointer", "set_cursor"),
+            ))
+        })();
         self.go("done");
-        let wire = self.keep(&format!("{what}-wire"));
-        Ok((
-            shapes_set(&wire),
-            requests_of(&wire, "wl_pointer", "set_cursor"),
-        ))
+        result
     }
 
     fn output_hotplug(&self) -> Ended {
@@ -1521,13 +1946,14 @@ impl Run<'_> {
             Err(why) => return not_run(why),
         };
         Self::verdict((|| {
+            let exit_control = self.exit_record_control()?;
             let hidden = self.wlhide(&sway, &[&format!("hide:{DECORATION}")])?;
             let zero = self.edge_press(&sway, &hidden, "window_padding = 0\n", "padding0")?;
             self.gui.stop();
             let control = self.edge_press(&sway, &hidden, "", "padding-default")?;
             let resized = |r: &str| r.split(' ').any(|q| q.starts_with("resize("));
             let line = format!(
-                "padding 0: left edge selected {:?}, last row selected {:?}, requests {}; \
+                "{exit_control}; padding 0: left edge selected {:?}, last row selected {:?}, requests {}; \
                  default padding: the same left press asked for {} (the last row's press \
                  selected {:?})",
                 zero.0, zero.1, zero.2, control.2, control.1
@@ -1551,7 +1977,9 @@ impl Run<'_> {
         top: &str,
         what: &str,
     ) -> Result<(String, String, String), String> {
-        self.prepare(top)?;
+        // This row holds the terminal's zero/default padding to the outer resize edge.
+        // A dock beside it would put the terminal's left edge inside the window instead.
+        self.prepare_config(top, "\n[navigator]\ndock = false\n")?;
         self.launch_wayland(sway, socket)?;
         self.swaymsg(sway, &["floating", "enable"])?;
         self.caption_until("resize edges", &|c| c.edges)?;
@@ -1593,24 +2021,28 @@ impl Run<'_> {
         self.reached("centred")?;
         let origin = Self::origin(self.pointer_px()?);
         let d = self.dims()?;
+        let geometry = NativeGeometry::parse(&d)?;
+        if geometry.frame_point(0, 0)? != (0, 0) {
+            return Err(format!(
+                "padding row's terminal does not start at the window edge: {d}"
+            ));
+        }
         let (cw, ch, h) = (
-            num(&d, "cell_w").unwrap_or(0),
-            num(&d, "cell_h").unwrap_or(0),
-            num(&d, "frame_h").unwrap_or(0),
+            dimension(&d, "cell_w")?,
+            dimension(&d, "cell_h")?,
+            geometry.frame_height,
         );
-        let rows = d
-            .split_whitespace()
-            .nth(1)
-            .and_then(|r| r.parse::<i32>().ok())
-            .unwrap_or(1);
+        let rows = dimension(&d, "window_rows")?;
         let row0 = self.cell_px(0, 0)?;
-        self.aim("left", origin, (1, row0.1))?;
-        self.aim("left-to", origin, (1 + 4 * cw, row0.1))?;
+        let left = geometry.frame_point(1, 0)?.0;
+        self.aim("left", origin, (left, row0.1))?;
+        self.aim("left-to", origin, (left + 4 * cw, row0.1))?;
         self.go("aimed");
         self.reached("left-done")?;
         let left = self.ctl(&["selection"])?;
         let last = self.cell_px(rows - 1, 2)?;
-        let bottom = (last.1 + ch / 2 - 1).min(h - 1);
+        let frame_bottom = geometry.frame_point(0, i64::from(h) - 1)?.1;
+        let bottom = (last.1 + ch / 2 - 1).min(frame_bottom);
         self.aim("bottom", origin, (last.0, bottom))?;
         self.aim("bottom-to", origin, (last.0 + 3 * cw, bottom))?;
         self.go("aimed-bottom");
@@ -1650,14 +2082,12 @@ impl Run<'_> {
             self.reached("centred")?;
             let origin = Self::origin(self.pointer_px()?);
             let d = self.dims()?;
-            let (w, h) = (
-                num(&d, "frame_w").unwrap_or(0),
-                num(&d, "frame_h").unwrap_or(0),
-            );
+            let geometry = NativeGeometry::parse(&d)?;
+            let edge = geometry.right_midpoint(0)?;
             let shot = self.screenshot(&sway, "shadow-screen");
             self.go("shot");
             let shot = shot?;
-            let (x, y) = (origin.0 + w, origin.1 + h / 2);
+            let (x, y) = (origin.0 + edge.0, origin.1 + edge.1);
             let at = |dx: i32| shot.at(x + dx, y);
             let (border, near, far) = (at(0), at(1), at(80));
             let pixels =
@@ -1670,7 +2100,10 @@ impl Run<'_> {
                     "no shadow darkening the ground beyond the border: {pixels}"
                 ));
             }
-            Ok(format!("{w}x{h} at {},{}: {pixels}", origin.0, origin.1))
+            Ok(format!(
+                "{}x{} at {},{}: {pixels}",
+                geometry.width, geometry.height, origin.0, origin.1
+            ))
         })())
     }
 
@@ -1842,11 +2275,8 @@ impl Run<'_> {
             )?;
             self.caption_until("resize edges", &|c| c.client && c.edges)?;
             let d = self.dims()?;
-            let (w, h) = (
-                num(&d, "frame_w").unwrap_or(0),
-                num(&d, "frame_h").unwrap_or(0),
-            );
-            let scale = scale_of(&d).filter(|s| *s > 0.0).unwrap_or(1.0);
+            let geometry = NativeGeometry::parse(&d)?;
+            let (w, h, scale) = (geometry.width, geometry.height, geometry.scale);
             let logical = |px: i32| (f64::from(px) / scale).round() as i32;
             let mark = |name: &str| self.mark(name);
             let steps = [
@@ -1876,7 +2306,8 @@ impl Run<'_> {
             self.seat(&steps)?;
             self.seat_reached("centred")?;
             let (x, y) = self.settled_px()?;
-            let to_handle = (logical(w - x) + 6, logical(h / 2 - y));
+            let edge = geometry.right_midpoint(0)?;
+            let to_handle = (logical(edge.0 - x) + 6, logical(edge.1 - y));
             self.put(
                 &mark("to-handle"),
                 &format!("{} {}", to_handle.0, to_handle.1),

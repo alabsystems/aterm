@@ -148,9 +148,14 @@ impl Tri {
     }
 }
 
-/// The last memory-pressure level the OS reported to a run.
+/// The last memory-pressure level the OS reported to a run, or the starvation episode its vitals
+/// had open at its last line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pressure {
+    /// A memory starvation episode its vitals opened was still open at its last line (the
+    /// episode's aterm.log lines, `memory starving: opened` and `… ended`): the machine pushed
+    /// pages out of RAM and read them back with no headroom, whatever level the OS reported.
+    Starving,
     /// The last report was critical.
     Critical,
     /// The last report was a warning.
@@ -166,6 +171,7 @@ pub enum Pressure {
 impl Pressure {
     const fn token(self) -> &'static str {
         match self {
+            Self::Starving => "starving",
             Self::Critical => "critical",
             Self::Warn => "warn",
             Self::Normal => "normal",
@@ -176,6 +182,7 @@ impl Pressure {
 
     fn parse(token: &str) -> Option<Self> {
         Some(match token {
+            "starving" => Self::Starving,
             "critical" => Self::Critical,
             "warn" => Self::Warn,
             "normal" => Self::Normal,
@@ -857,6 +864,8 @@ pub struct Summary {
     pub unexpected_stalled: usize,
     /// See [`Self::unexpected_stalled`].
     pub unexpected_critical: usize,
+    /// Of the unexpected ends, how many ended with a memory starvation episode open.
+    pub unexpected_starving: usize,
     /// The newest row that recorded an unexpected end.
     pub last_unexpected: Option<Row>,
 }
@@ -879,6 +888,7 @@ pub fn summarize(rows: &[Row]) -> Summary {
         ends: Vec::new(),
         unexpected_stalled: 0,
         unexpected_critical: 0,
+        unexpected_starving: 0,
         last_unexpected: None,
     };
     for row in rows {
@@ -893,6 +903,7 @@ pub fn summarize(rows: &[Row]) -> Summary {
         if class.is_unexpected() {
             summary.unexpected_stalled += usize::from(row.prev.stall == Tri::Yes);
             summary.unexpected_critical += usize::from(row.prev.pressure == Pressure::Critical);
+            summary.unexpected_starving += usize::from(row.prev.pressure == Pressure::Starving);
             summary.last_unexpected = Some(row.clone());
         }
     }
@@ -955,6 +966,7 @@ pub fn doctor_lines(rows: &[Row], path: &Path) -> (Vec<String>, bool) {
             Tri::Unknown => "stall not known".to_string(),
         });
         words.push(match prev.pressure {
+            Pressure::Starving => "memory starving".to_string(),
             Pressure::Critical => "memory pressure critical".to_string(),
             Pressure::Warn => "memory pressure at warning".to_string(),
             Pressure::Normal | Pressure::None => "memory pressure normal".to_string(),
@@ -965,11 +977,15 @@ pub fn doctor_lines(rows: &[Row], path: &Path) -> (Vec<String>, bool) {
             aterm_types::rfc3339::format_rfc3339(row.at),
             words.join("; ")
         ));
-        if summary.unexpected_stalled + summary.unexpected_critical > 0 {
+        if summary.unexpected_stalled + summary.unexpected_critical + summary.unexpected_starving
+            > 0
+        {
             lines.push(format!(
                 "unexpected ends: {} with a stalled main thread, {} with critical \
-                 memory pressure",
-                summary.unexpected_stalled, summary.unexpected_critical
+                 memory pressure, {} while memory starved",
+                summary.unexpected_stalled,
+                summary.unexpected_critical,
+                summary.unexpected_starving
             ));
         }
     }

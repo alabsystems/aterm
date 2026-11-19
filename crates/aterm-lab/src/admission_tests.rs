@@ -834,3 +834,184 @@ fn independent_comparison_owners_serialize_until_the_original_guard_releases() {
         "release permits a fresh quad to requeue normally"
     );
 }
+
+fn reported_need() -> Need {
+    Need::timing("reported GUI fixture").patience(aterm_capacity::Patience {
+        reserve: std::time::Duration::ZERO,
+        start: std::time::Duration::ZERO,
+        hold: MUST_HAPPEN,
+    })
+}
+
+fn loaded_machine() -> Measured {
+    let mut reading = Reading::of_gib(48, 40, 14);
+    reading.load1 = Some(200.0);
+    Measured {
+        fixed: Fixed::new(reading),
+        ..machine()
+    }
+}
+
+#[test]
+fn reported_timing_admits_loaded_once_and_retains_the_original_exclusion() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(scratch.path().join("ledger"));
+    let mut work = 0;
+    let admitted = reported_timing_in(
+        Some(&ledger),
+        &loaded_machine(),
+        reported_need(),
+        "reported GUI fixture",
+        Admit::Wait,
+        Pace {
+            poll: std::time::Duration::ZERO,
+            ..Pace::default()
+        },
+        &mut |_| {},
+    )
+    .inspect(|_| {
+        work += 1;
+    })
+    .unwrap();
+    assert_eq!(work, 1);
+    let aterm_capacity::Protection::Loaded(observed) = admitted.protection() else {
+        panic!("busy admission must retain its loaded observation");
+    };
+    assert_eq!(observed.load1, 200.0);
+    assert!(observed.load1 > observed.max);
+    assert!(observed.window.interval_ns > 0);
+    assert_eq!(
+        admitted._claim.timing_admission(),
+        Err(aterm_capacity::TimingIssue::Loaded)
+    );
+    let records = ledger.list().unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "one original resource claim, never a diagnostic substitute"
+    );
+    assert!(records[0].held.is_some());
+    assert!(records[0].need.quiet.is_some());
+    assert_eq!(records[0].timing.cause, aterm_capacity::TimingCause::Loaded);
+    drop(admitted);
+    assert!(
+        ledger.list().unwrap().is_empty(),
+        "the scoped owner releases exclusion"
+    );
+
+    // The strict validator rejects the same actual loaded admission even when its resource
+    // request would permit running loaded. Replacing that validator with protection breaks this.
+    let refused = quiet_in(
+        Some(&ledger),
+        &loaded_machine(),
+        reported_need().runs_loaded(),
+        "strict GUI fixture",
+        Admit::Wait,
+        Pace {
+            poll: std::time::Duration::ZERO,
+            ..Pace::default()
+        },
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(refused.code, crate::linux::NOT_RUN);
+    assert!(ledger.list().unwrap().is_empty());
+    assert_eq!(work, 1);
+}
+
+#[test]
+fn reported_timing_keeps_quiet_admission_and_refuses_unread_or_forced_evidence() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(scratch.path().join("ledger"));
+    let pace = Pace {
+        poll: std::time::Duration::ZERO,
+        ..Pace::default()
+    };
+    let admitted = reported_timing_in(
+        Some(&ledger),
+        &machine(),
+        reported_need(),
+        "quiet reported fixture",
+        Admit::Wait,
+        pace,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(
+        matches!(admitted.protection(), aterm_capacity::Protection::Qualified(window) if window.ready())
+    );
+    assert!(admitted._claim.timing_admission().is_ok());
+    drop(admitted);
+    assert!(ledger.list().unwrap().is_empty());
+
+    struct FrozenCpu(Measured);
+    impl Machine for FrozenCpu {
+        fn read(&self, path: Option<&Path>) -> Reading {
+            self.0.read(path)
+        }
+        fn procs(&self) -> Option<aterm_capacity::Procs> {
+            self.0.procs()
+        }
+        fn cpu_point(&self) -> Option<aterm_capacity::CpuPoint> {
+            let mut point = self.0.cpu_point()?;
+            for ticks in &mut point.ticks {
+                *ticks = Default::default();
+            }
+            Some(point)
+        }
+    }
+    let blind = FrozenCpu(machine());
+    let unread_cpu = Fixed::new(Reading::of_gib(48, 40, 14));
+    let mut reading = Reading::of_gib(48, 40, 14);
+    reading.load1 = None;
+    let unread_load = Measured {
+        fixed: Fixed::new(reading),
+        ..machine()
+    };
+    let measured = machine();
+    for (book, source, mode) in [
+        (Some(&ledger), &blind as &dyn Machine, Admit::Wait),
+        (Some(&ledger), &unread_cpu as &dyn Machine, Admit::Wait),
+        (Some(&ledger), &unread_load as &dyn Machine, Admit::Wait),
+        (Some(&ledger), &measured as &dyn Machine, Admit::Now),
+        (None, &measured as &dyn Machine, Admit::Wait),
+    ] {
+        let mut work = 0;
+        let refused = reported_timing_in(
+            book,
+            source,
+            reported_need(),
+            "unread reported fixture",
+            mode,
+            pace,
+            &mut |_| {},
+        )
+        .inspect(|_| {
+            work += 1;
+        })
+        .unwrap_err();
+        assert_eq!(refused.code, crate::linux::NOT_RUN);
+        assert_eq!(
+            work, 0,
+            "unknown observations never authorize diagnostic work"
+        );
+        assert!(ledger.list().unwrap().is_empty());
+    }
+    let expired = reported_need().patience(aterm_capacity::Patience {
+        reserve: std::time::Duration::ZERO,
+        start: std::time::Duration::ZERO,
+        hold: std::time::Duration::ZERO,
+    });
+    let refused = reported_timing_in(
+        Some(&ledger),
+        &machine(),
+        expired,
+        "expired reported fixture",
+        Admit::Wait,
+        pace,
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(refused.code, crate::linux::NOT_RUN);
+    assert!(ledger.list().unwrap().is_empty());
+}

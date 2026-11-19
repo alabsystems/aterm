@@ -225,17 +225,25 @@ impl WakeSignal {
     }
 }
 
-/// Whether this process runs in a virtual machine's guest (macOS's `kern.hv_vmm_present`). A
-/// test build answers no, so no test's decision reads the machine it runs on.
+/// Whether this process runs in a virtual machine's guest, as [`guest_from`] reads macOS's
+/// `kern.hv_vmm_present` ([`aterm_sysprobe::hv_vmm_present`], `None` off macOS). A test build
+/// answers no, so no test's decision reads the machine it runs on.
 fn hypervisor_guest() -> bool {
-    #[cfg(all(target_os = "macos", not(test)))]
+    #[cfg(not(test))]
     {
-        aterm_sysprobe::hv_vmm_present() == Some(true)
+        guest_from(aterm_sysprobe::hv_vmm_present)
     }
-    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg(test)]
     {
         false
     }
+}
+
+/// Whether the guest flag `probe` reads says this process runs in a virtual machine's guest:
+/// only a reading of yes does. No reading (off macOS, or a kernel with no such name) is a host,
+/// which arms one long leg as before the guest refusal.
+fn guest_from(probe: impl FnOnce() -> Option<bool>) -> bool {
+    probe() == Some(true)
 }
 
 /// Process-wide system wake and network-change signal.

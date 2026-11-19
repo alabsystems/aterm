@@ -46,10 +46,7 @@ fn compile(
             aterm_toolchain::build_cache::BUILD_DIR_ENV,
             target.join("build.noindex"),
         )
-        .env(
-            "CARGO_LOG",
-            "targo::core::compiler::fingerprint=info,cargo::core::compiler::fingerprint=info",
-        );
+        .env("CARGO_LOG", FINGERPRINT_LOG);
     for (name, _) in std::env::vars_os() {
         if aterm_toolchain::build_cache::said_by_cargo_run(&name.to_string_lossy()) {
             cmd.env_remove(name);

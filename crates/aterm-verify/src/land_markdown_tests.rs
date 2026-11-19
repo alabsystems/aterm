@@ -696,7 +696,7 @@ fn a_merge_unlike_the_tested_tree_is_judged_in_full() {
                 }
                 said.borrow_mut().push(line.to_owned());
             },
-            remote: &remote_step,
+            remote: &live_remote,
             pause: &no_retry,
         },
     );
@@ -1060,7 +1060,7 @@ fn shared_markdown_a_members_file_may_read_is_judged_by_a_round_over_its_readers
         let (exit, said, bases, rechecks) = land_seamed(
             &world,
             &pathspecs,
-            &remote_step,
+            &live_remote,
             &no_retry,
             &reach,
             |_, n, poll| {
@@ -1482,7 +1482,7 @@ fn a_resumed_round_of_shared_markdown_lands_as_markdown() {
             moves.set(moves.get() + 1);
             rival_moves(&world, "b/y.txt", &format!("b moved {}\n", moves.get()));
         }
-        remote_step(root, git, tool, args, until, mode)
+        live_remote(root, git, tool, args, until, mode)
     };
     let (code, said, _, rounds) = land_wired(
         &world,

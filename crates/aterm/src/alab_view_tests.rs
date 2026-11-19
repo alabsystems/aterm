@@ -153,8 +153,10 @@ fn a_write_of_this_macs_own_moves_the_lab_a_cache_holds() {
         session: None,
         now_ms: 1,
         attempt: std::time::Duration::ZERO,
+        journal: None,
         json: false,
         stdin: None,
+        said: None,
         editor: &|_, _, _| Err("a rename opens no editor".to_owned()),
         say: &|_| {},
     };

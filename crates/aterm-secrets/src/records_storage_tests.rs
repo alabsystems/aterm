@@ -81,7 +81,7 @@ fn a_reader_resolves_an_unchanged_layout_once_and_a_changed_one_again() {
                     .write(true)
                     .open(entry.join(DATA))
                     .unwrap()
-                    .set_len(crate::membership_log::MAX_RECORDS_STREAM as u64 + 1)
+                    .set_len(crate::membership_log::Reading::ONE.capacity() as u64 + 1)
                     .unwrap();
             },
         },
@@ -117,10 +117,6 @@ fn a_reader_resolves_an_unchanged_layout_once_and_a_changed_one_again() {
     }
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn a_stale_snapshot_never_prepares_or_raises_the_layout() {
     for fenced in [false, true] {
@@ -155,10 +151,6 @@ fn an_absent_snapshot_refuses_a_new_file_before_preparing_a_layout() {
     assert!(!intent_path(&entry).unwrap().exists());
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn a_larger_writer_fences_format_aware_smaller_readers_before_changing_data() {
     let (_root, entry) = fixture();
@@ -179,10 +171,6 @@ fn a_larger_writer_fences_format_aware_smaller_readers_before_changing_data() {
     });
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn a_smaller_writer_cannot_finish_a_larger_pending_layout() {
     for cut in [Step::Intent, Step::Exchanged] {
@@ -204,10 +192,6 @@ fn a_smaller_writer_cannot_finish_a_larger_pending_layout() {
     }
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn the_write_target_keeps_a_process_shared_lock_until_the_write_finishes() {
     let (_root, entry) = fixture();
@@ -234,10 +218,6 @@ fn the_write_target_keeps_a_process_shared_lock_until_the_write_finishes() {
     drop(inherited);
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn layout_preserves_the_original_and_selects_later_writes() {
     let (root, entry) = fixture();
@@ -259,16 +239,16 @@ fn layout_preserves_the_original_and_selects_later_writes() {
     assert!(fsx::write_atomic(&entry, b"old writer", 0o600).is_err());
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn interruption_keeps_custody_and_only_a_writer_finishes_a_pending_transition() {
     for cut in [
         Step::Intent,
         Step::Copied,
         Step::Prepared,
+        #[cfg(windows)]
+        Step::Parked,
+        #[cfg(windows)]
+        Step::Moved,
         Step::Exchanged,
         Step::Pinned,
     ] {
@@ -277,7 +257,13 @@ fn interruption_keeps_custody_and_only_a_writer_finishes_a_pending_transition() 
         assert!(stop_at(&context, cut).is_err());
         let before = fsx::kind(&pin_path(&entry).unwrap()).unwrap();
         let read = data_path(&entry);
-        assert_eq!(read.is_err(), cut == Step::Exchanged);
+        // The entry is the original's until the exchange begins to empty it (Windows) or swaps it
+        // (Unix), and the layout's once the pin stands.
+        #[cfg(unix)]
+        let unreadable = cut == Step::Exchanged;
+        #[cfg(windows)]
+        let unreadable = matches!(cut, Step::Moved | Step::Exchanged);
+        assert_eq!(read.is_err(), unreadable, "{cut:?}: {read:?}");
         assert_eq!(fsx::kind(&pin_path(&entry).unwrap()).unwrap(), before);
         recover_pending(&entry).unwrap();
         let selected = data_path(&entry).unwrap();
@@ -288,10 +274,6 @@ fn interruption_keeps_custody_and_only_a_writer_finishes_a_pending_transition() 
     }
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn preparation_retries_reuse_one_declared_generation() {
     let (root, entry) = fixture();
@@ -325,10 +307,6 @@ fn preparation_retries_reuse_one_declared_generation() {
     );
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn an_interrupted_derived_copy_resumes_from_its_existing_intent() {
     let (_root, entry) = fixture();
@@ -346,10 +324,6 @@ fn an_interrupted_derived_copy_resumes_from_its_existing_intent() {
     );
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn an_interrupted_pin_write_resumes_without_moving_the_prepared_files() {
     let (_root, entry) = fixture();
@@ -373,10 +347,6 @@ fn an_interrupted_pin_write_resumes_without_moving_the_prepared_files() {
     );
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn an_intent_does_not_turn_a_missing_original_into_empty_custody() {
     let (root, entry) = fixture();
@@ -389,10 +359,6 @@ fn an_intent_does_not_turn_a_missing_original_into_empty_custody() {
     assert_eq!(std::fs::read(saved).unwrap(), b"original history");
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn an_active_pin_never_falls_back_after_current_or_layout_is_lost() {
     let (root, entry) = fixture();
@@ -412,10 +378,6 @@ fn an_active_pin_never_falls_back_after_current_or_layout_is_lost() {
     );
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn a_changed_predecessor_refuses_pending_recovery_without_losing_either_copy() {
     let (root, entry) = fixture();
@@ -438,10 +400,6 @@ fn a_changed_predecessor_refuses_pending_recovery_without_losing_either_copy() {
 /// `selection_witnesses`, the entry's arm confirms the replaced entry
 /// (`the selection still stood`); with the intent's stamp replaced the same way, the intent's
 /// arm does.
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn a_selection_resolves_again_once_its_entry_or_its_intent_moved() {
     let refusal = |held: &Selected| {
@@ -615,10 +573,6 @@ fn a_fresh_layout_has_no_invented_predecessor() {
     );
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
-)]
 #[test]
 fn an_old_open_descriptor_can_only_change_the_preserved_predecessor() {
     let (_root, entry) = fixture();
@@ -635,28 +589,282 @@ fn an_old_open_descriptor_can_only_change_the_preserved_predecessor() {
     assert_eq!(std::fs::read(data).unwrap(), b"original history");
 }
 
-/// Windows has no atomic exchange of two names (ATERM-KI-1116-52817), so a records file kept
-/// whole is refused as a layout before any preparation is declared: the file stays as it was, and
-/// no intent, pin or preserved folder is left beside it. A fresh layout, which exchanges nothing,
-/// is made there as on Unix ([`a_fresh_layout_has_no_invented_predecessor`]).
+/// `SwarmRecordsExchange`'s names as they stand beside `entry` (`e` the entry, `f` the preserved
+/// name of the preparation `nonce` names, `t` its swap name; 0 nothing, 1 a file, 2 a folder), each
+/// file the original records file whole and each folder's data a whole copy of it, and `pin`.
+#[cfg(windows)]
+fn exchange_names(entry: &Path, nonce: &str) -> [(&'static str, i64); 4] {
+    let at = |path: &Path| match fsx::kind(path).unwrap() {
+        fsx::Kind::Missing => 0,
+        fsx::Kind::File => {
+            assert_eq!(std::fs::read(path).unwrap(), b"original history");
+            1
+        }
+        fsx::Kind::Dir => {
+            assert_eq!(std::fs::read(path.join(DATA)).unwrap(), b"original history");
+            2
+        }
+        other => panic!("{other:?} at {}", path.display()),
+    };
+    let preserved = entry.with_file_name(format!(".aterm-records-{nonce}"));
+    let parked = entry.with_file_name(format!(".aterm-records-{nonce}.swap"));
+    [
+        ("e", at(entry)),
+        ("f", at(&preserved)),
+        ("t", at(&parked)),
+        ("pin", i64::from(pin_path(entry).unwrap().exists())),
+    ]
+}
+
+/// `SwarmRecordsExchange`'s `rd`: what a reader with no lock gets at `entry` ([`data_path`], and
+/// [`selected`], which must answer the same): 1 the original whole at the entry, 2 the layout's
+/// data whole, 3 a refusal, 4 the entry as no records at all.
+#[cfg(windows)]
+fn exchange_read(entry: &Path) -> i64 {
+    let read = data_path(entry);
+    let held = selected(entry).map(|held| held.path().to_path_buf());
+    assert_eq!(
+        read.as_ref().ok(),
+        held.as_ref().ok(),
+        "data_path and selected"
+    );
+    match read {
+        Err(_) => 3,
+        Ok(path) if path == entry && fsx::kind(entry).unwrap() == fsx::Kind::Missing => 4,
+        Ok(path) => {
+            assert_eq!(std::fs::read(&path).unwrap(), b"original history");
+            if path == entry {
+                1
+            } else {
+                assert_eq!(path, entry.join(DATA));
+                2
+            }
+        }
+    }
+}
+
+/// One replay of [`a_windows_exchange_conforms_to_the_records_exchange_model`]: the model's state
+/// it has reached, every state it has judged, and the model steps the running writer takes before
+/// it is cut (`None`: it runs to its pin).
+#[cfg(windows)]
+struct ExchangeReplay<'m> {
+    model: &'m aterm_spec::derive::Model,
+    entry: PathBuf,
+    nonce: std::cell::RefCell<String>,
+    state: std::cell::RefCell<aterm_spec::interp::State>,
+    seen: std::cell::RefCell<std::collections::BTreeSet<aterm_spec::interp::State>>,
+    left: std::cell::Cell<Option<usize>>,
+    /// Whether the running writer has reached the model's state: the first at its `Prepared`,
+    /// the model's start, and one started after a cut at once.
+    begun: std::cell::Cell<bool>,
+    path: std::cell::RefCell<Vec<String>>,
+}
+
+#[cfg(windows)]
+impl ExchangeReplay<'_> {
+    /// The model's one successor of its state by `action`, which must be `observed`.
+    fn take(&self, action: &'static str, observed: &aterm_spec::interp::State) {
+        let state = self.state.borrow().clone();
+        self.path.borrow_mut().push(action.to_owned());
+        assert_eq!(
+            self.model.successors(action, &state),
+            vec![observed.clone()],
+            "{action} after {:?}",
+            self.path.borrow()
+        );
+        *self.state.borrow_mut() = observed.clone();
+        let mut seen = observed.clone();
+        seen.remove("rd");
+        self.seen.borrow_mut().insert(seen);
+    }
+
+    /// The state with the names as they stand.
+    fn names(&self) -> aterm_spec::interp::State {
+        let mut state = self.state.borrow().clone();
+        state.extend(exchange_names(&self.entry, &self.nonce.borrow()));
+        state
+    }
+
+    /// A reader's look, then the cut where the writer has taken all its steps (`stepped`: one
+    /// more, else none yet).
+    fn read_then_cut(&self, stepped: bool) -> Result<()> {
+        let mut read = self.state.borrow().clone();
+        read.insert("rd", exchange_read(&self.entry));
+        self.take("Read", &read);
+        if stepped && let Some(left) = self.left.get() {
+            self.left.set(Some(left - 1));
+        }
+        if self.left.get() == Some(0) {
+            return Err(refused("the replay's cut"));
+        }
+        Ok(())
+    }
+
+    /// The writer's hook: a model step where the step is one (`Parked`, `Moved`, `Exchanged`, its
+    /// `Place`, and `Pinned`), and elsewhere the names as they stood.
+    fn after(&self, step: Step) -> Result<()> {
+        let action = match step {
+            Step::Parked => "Park",
+            Step::Moved => "Move",
+            Step::Exchanged => "Place",
+            Step::Pinned => "Pin",
+            Step::Intent | Step::Copied | Step::Prepared => {
+                if !self.begun.get() {
+                    if step != Step::Prepared {
+                        return Ok(());
+                    }
+                    let intent = Context::new(&self.entry).unwrap().intent().unwrap();
+                    *self.nonce.borrow_mut() = intent.expect("declared").nonce;
+                    let start = self.model.init_state();
+                    assert_eq!(self.names(), start, "Prepared");
+                    let mut seen = start;
+                    seen.remove("rd");
+                    self.seen.borrow_mut().insert(seen);
+                    self.begun.set(true);
+                    return self.read_then_cut(false);
+                }
+                assert_eq!(
+                    self.names(),
+                    *self.state.borrow(),
+                    "{step:?} after {:?}",
+                    self.path.borrow()
+                );
+                return Ok(());
+            }
+        };
+        let mut observed = self.names();
+        if action == "Pin" {
+            observed.insert("run", 0);
+        }
+        self.take(action, &observed);
+        self.read_then_cut(true)
+    }
+
+    /// Run a writer to its pin, or to its cut after `steps` model steps, from where the names
+    /// stand: the first one from the records file kept whole, each later one under the writer
+    /// lock as [`recover_pending`] takes it.
+    fn writer(&self, steps: Option<usize>) {
+        self.left.set(steps);
+        let first = !self.begun.get();
+        if !first {
+            assert!(pending(&self.entry).unwrap());
+            let mut restarted = self.state.borrow().clone();
+            restarted.insert("run", 2);
+            restarted.insert("restarts", restarted["restarts"] + 1);
+            self.take("Restart", &restarted);
+        }
+        let ran = {
+            let _guard = writer_lock(&self.entry).unwrap();
+            if steps == Some(0) && !first {
+                // Cut holding the lock, before its first look: no hook comes before a step
+                // where the entry is the layout's folder (`prepare` goes straight to its pin).
+                Err(refused("the replay's cut"))
+            } else {
+                Context::new(&self.entry)
+                    .unwrap()
+                    .prepare(|step| self.after(step))
+            }
+        };
+        match steps {
+            None => {
+                ran.unwrap();
+                assert_eq!(self.state.borrow()["pin"], 1);
+            }
+            Some(_) => {
+                assert!(ran.is_err(), "the cut writer finished");
+                let mut cut = self.names();
+                cut.insert("run", 0);
+                self.take("Cut", &cut);
+            }
+        }
+    }
+}
+
+/// The Windows exchange refines `SwarmRecordsExchange` (`aterm-models-swarm`): a records file kept
+/// whole becomes a layout through every schedule of cuts the model allows (a writer cut after any
+/// of its steps, or before its first, and at most two writers started after cuts, each under the
+/// writer lock as [`recover_pending`] takes it), each model step the names as the code leaves them
+/// (each copy whole wherever it stands), every look a reader takes between them what the model's
+/// `Read` gives, and the replays together reach every state the model reaches. Each writer that
+/// is not cut pins the layout over the original kept whole at its preserved name.
 ///
-/// NEGATIVE CONTROL (2026-11-16): without `prepare`'s Windows refusal the preparation is declared
-/// and copied, and its exchange is refused only at the end (os error 120, aterm-dirfd's
-/// `Errno::NOSYS`): the test fails on that refusal.
+/// NEGATIVE CONTROLS (2026-11-17), each a temporary mutant, run and reverted: with `prepare`'s
+/// look for a parked folder gone (the model's mutant 1, a writer that knows no swap name), a
+/// writer started after a cut at `Parked` prepares a second folder at the preserved name
+/// (`Copied after [.., "Park", "Read", "Cut", "Restart"]`: `f` 2 where the model has 0); with
+/// `data_path`'s missing entry read without its intent (mutant 2), a reader after `Moved` reads
+/// the entry as no records (`Read after ["Read", "Park", "Read", "Move"]`: `rd` 4 where the model
+/// has 3).
 #[cfg(windows)]
 #[test]
-fn a_records_file_kept_whole_is_refused_as_a_layout_and_stays_as_it_was() {
-    let (root, entry) = fixture();
-    let error = write_path(&entry, true).err().expect("refused");
-    assert!(error.to_string().contains("no atomic exchange"), "{error}");
-    assert_eq!(std::fs::read(&entry).unwrap(), b"original history");
-    assert!(!intent_path(&entry).unwrap().exists(), "an intent was left");
-    assert!(!pin_path(&entry).unwrap().exists(), "a pin was left");
-    for name in std::fs::read_dir(root.path()).unwrap() {
-        let name = name.unwrap().file_name();
-        assert!(
-            !name.to_string_lossy().starts_with(".aterm-records-"),
-            "{name:?} was left"
-        );
+fn a_windows_exchange_conforms_to_the_records_exchange_model() {
+    fn plan(
+        left: usize,
+        restarts: usize,
+        so_far: &[Option<usize>],
+        out: &mut Vec<Vec<Option<usize>>>,
+    ) {
+        out.push([so_far, &[None][..]].concat());
+        for steps in 0..left {
+            let cut = [so_far, &[Some(steps)][..]].concat();
+            if restarts == 2 {
+                out.push(cut);
+            } else {
+                plan(left - steps, restarts + 1, &cut, out);
+            }
+        }
     }
+    let model = aterm_models_swarm::records_exchange_model();
+    let mut schedules = Vec::new();
+    plan(4, 0, &[], &mut schedules);
+    let mut seen = std::collections::BTreeSet::new();
+    for schedule in &schedules {
+        let (_root, entry) = fixture();
+        let replay = ExchangeReplay {
+            model: &model,
+            entry: entry.clone(),
+            nonce: std::cell::RefCell::new(String::new()),
+            state: std::cell::RefCell::new(model.init_state()),
+            seen: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            left: std::cell::Cell::new(None),
+            begun: std::cell::Cell::new(false),
+            path: std::cell::RefCell::new(Vec::new()),
+        };
+        for steps in schedule {
+            replay.writer(*steps);
+        }
+        if schedule.last() == Some(&None) {
+            let data = data_path(&entry).unwrap();
+            assert_eq!(data, entry.join(DATA), "{schedule:?}");
+            let kept = entry.with_file_name(format!(".aterm-records-{}", replay.nonce.borrow()));
+            assert_eq!(std::fs::read(kept).unwrap(), b"original history");
+            assert_eq!(
+                std::fs::read(prepare_path(&entry)).unwrap(),
+                b"original history"
+            );
+        }
+        seen.extend(replay.seen.into_inner());
+    }
+
+    // Every state the model reaches by its writers' steps, cuts and restarts.
+    let mut reached = std::collections::BTreeSet::new();
+    let mut queue = std::collections::VecDeque::from([model.init_state()]);
+    while let Some(state) = queue.pop_front() {
+        let mut unread = state.clone();
+        unread.remove("rd");
+        if !reached.insert(unread) {
+            continue;
+        }
+        for action in &model.actions {
+            if action.name != "Read" {
+                queue.extend(model.successors(action.name, &state));
+            }
+        }
+    }
+    assert_eq!(seen, reached, "{} schedules", schedules.len());
+    eprintln!(
+        "SwarmRecordsExchange: {} states on {} schedules",
+        seen.len(),
+        schedules.len()
+    );
 }

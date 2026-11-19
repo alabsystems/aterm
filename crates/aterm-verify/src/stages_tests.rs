@@ -778,7 +778,7 @@ fn a_successful_clean_compile_indexes_its_executables_but_a_failure_or_edit_does
         let _ = std::fs::remove_file(&path);
         let cmd = Cmd::new("/bin/sh").args(["-c", script, "compile-index", code]);
         let mut report = Report::new("test compile");
-        let _ = compile_tests(&ctx, &mut report, "test compile", &cmd);
+        let _ = compile_tests(&ctx, &mut report, "test compile", &cmd, true);
         let index = crate::test_index::Index::read(&path);
         assert_eq!(index.is_some(), indexed, "{}", report.render());
         if let Some(index) = index {
@@ -814,7 +814,7 @@ fn compiler_stderr_cannot_supply_unit_artifacts_or_test_executables() {
         };
         let cmd = Cmd::new("/bin/sh").args(["-c", script, "machine-fixture", &code.to_string()]);
         let mut report = Report::new("machine stream");
-        let (ok, exes, artifacts) = compile_tests(&c, &mut report, "machine stream", &cmd);
+        let (ok, exes, artifacts) = compile_tests(&c, &mut report, "machine stream", &cmd, true);
         assert_eq!(ok, code == 0);
         let exes = exes.expect("complete wire");
         let raw = report.render();
@@ -848,7 +848,7 @@ fn compiler_stderr_cannot_supply_unit_artifacts_or_test_executables() {
             &code.to_string(),
         ]);
         let mut report = Report::new("invalid machine stream");
-        let (ok, exes, artifacts) = compile_tests(&c, &mut report, "invalid stream", &cmd);
+        let (ok, exes, artifacts) = compile_tests(&c, &mut report, "invalid stream", &cmd, true);
         assert!(!ok);
         assert!(exes.is_err() && artifacts.is_empty());
         let raw = report.render();
@@ -922,7 +922,7 @@ fn a_driven_binarys_build_writes_its_compile_line_whether_it_builds_or_not() {
             "targo build --bin driven".into(),
             "the verb matrix",
         );
-        assert_eq!(ok, code == 0);
+        assert_eq!(ok.is_some(), code == 0);
         let block = r.render();
         let lines = compile_lines(&block, "redraw conformance/targo build --bin driven");
         let out = format!(", {} out", aterm_capacity::size(2 << 20));
@@ -1244,7 +1244,7 @@ fn the_measuring_stage_hands_paint_and_spin_the_private_admitted_bundle() {
             .find(|(k, _)| k.to_str() == Some(key))
             .map(|(_, v)| PathBuf::from(v))
     };
-    let (_, run) = measuring_cmd(&c, &admitted, measuring_args(Profile::Release));
+    let (_, run) = measuring_cmd(&c, &admitted, measuring_args(Profile::Release, false));
     let (_, prebuild) = measuring_targo(&c, measure_prebuild_args());
     for var in ["ATERM_PAINT_BIN", "ATERM_SPIN_BIN"] {
         assert_eq!(
@@ -1265,7 +1265,7 @@ fn the_measuring_stage_hands_paint_and_spin_the_private_admitted_bundle() {
         "windows by default"
     );
     let quiet = ctx(Scope::workspace()).with_no_windows(true);
-    let (_, quiet_run) = measuring_cmd(&quiet, &admitted, measuring_args(Profile::Release));
+    let (_, quiet_run) = measuring_cmd(&quiet, &admitted, measuring_args(Profile::Release, true));
     assert_eq!(
         env_of(&quiet_run, "ATERM_MEASURE_NO_WINDOWS"),
         Some(PathBuf::from("1")),
@@ -2058,7 +2058,10 @@ fn every_argv_reaches_its_whole_selection() {
             assert!(lint[..sep].contains(c), "{c}: {lint:?}");
         }
     }
-    for argv in [measuring_args(Profile::Release), measure_prebuild_args()] {
+    for argv in [
+        measuring_args(Profile::Release, false),
+        measure_prebuild_args(),
+    ] {
         assert!(has(&argv, "--no-fail-fast"), "{argv:?}");
     }
     let g = tippy_gated_args(&Scope::workspace(), &fixture_gated()).expect("gated");
@@ -2315,10 +2318,10 @@ fn compile_only_children_yield_and_children_that_run_code_do_not() {
             source: &artifact,
             app: std::path::Path::new("/retained/admitted.app"),
         };
-        let (_, measuring) = measuring_cmd(&c, &admitted, measuring_args(Profile::Release));
+        let (_, measuring) = measuring_cmd(&c, &admitted, measuring_args(Profile::Release, false));
         assert!(
             !measuring.demoted,
-            "the measuring benches run the paint, spin, aos, rewind and size guards"
+            "the measuring benches run their selected artifact guards"
         );
     }
     assert!(
@@ -3107,7 +3110,7 @@ fn no_targo_is_fail_closed_at_the_test_compile_and_honest_everywhere_after() {
         "{label}"
     );
 
-    let dependent: [fn(&Ctx, &mut Report); 8] = [
+    let dependent: [fn(&Ctx, &mut Report); 9] = [
         test,
         measuring_tests,
         measure_prebuild,
@@ -3115,7 +3118,8 @@ fn no_targo_is_fail_closed_at_the_test_compile_and_honest_everywhere_after() {
         spec_checkers,
         export,
         libc_oracle,
-        redraw_conformance,
+        |ctx, r| AppkitDrivers::Redraw.build(ctx, r),
+        |ctx, r| AppkitDrivers::Redraw.run(ctx, r),
     ];
     for stage in dependent {
         let mut r = Report::new("s");
@@ -3408,16 +3412,48 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
         std::fs::create_dir(&scratch).expect("scratch");
         let targo = root.join("bin/targo");
         let built = root.join("build-ran");
+        #[cfg(not(target_os = "macos"))]
         let driven = root.join("driver-ran");
         let cwd_seen = root.join("driver-cwd");
         crate::standin_body(&targo, &format!("printf built >> '{}'", built.display()));
         let binary = target.join("debug").join(REDRAW_CONFORMANCE_BIN);
+        #[cfg(target_os = "macos")]
+        aterm_tempfile::copy_to_new_file(
+            aterm_tempfile::bin_exe("aterm-verify-artifact-fixture"),
+            &binary,
+        )
+        .expect("native typed driver stand-in");
+        #[cfg(not(target_os = "macos"))]
         crate::standin_body(
             &binary,
             &format!(
                 "printf driven >> '{}'; printf '%s' \"$PWD\" > '{}'; exit 0",
                 driven.display(),
                 cwd_seen.display()
+            ),
+        );
+        let manifest = root.join("crates/aterm-gui/Cargo.toml");
+        let receipt = aterm_json::json!({
+            "reason":"compiler-artifact", "manifest_path":manifest,
+            "target":{"name":REDRAW_CONFORMANCE_BIN,"kind":["bin"]},
+            "executable":binary, "trust_compile_mode":"build", "trust_compile_kind":"host",
+            "trust_compile_target":format!("{}-apple-darwin",std::env::consts::ARCH),
+            "trust_unit_identity_sha256":"a".repeat(64),
+            "trust_executable_sha256":crate::test_index::digest(&binary).unwrap(),
+            "profile":{"test":false,"debug_assertions":true}
+        });
+        let messages = format!(
+            "{}\n{{\"reason\":\"build-finished\",\"success\":true}}\n",
+            aterm_json::to_string(&receipt).unwrap()
+        );
+        let receipt_file = root.join("producer.jsonl");
+        std::fs::write(&receipt_file, &messages).unwrap();
+        crate::standin_body(
+            &targo,
+            &format!(
+                "printf built >> '{}'; /bin/cat '{}'",
+                built.display(),
+                receipt_file.display()
             ),
         );
         let runtime_home = crate::mktemp_dir("atv-appkit-runtime").expect("runtime home");
@@ -3433,7 +3469,12 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
         .with_carry_context(Some(CONTEXT.to_owned()))
         .with_appkit_runtime(runtime_home.join("runtime"));
         c.tools.targo = targo;
-        let paths = [(REDRAW_CONFORMANCE_BIN, binary.clone())];
+        let original_paths = [(REDRAW_CONFORMANCE_BIN, binary.clone())];
+        let prior_images =
+            crate::appkit_content::Prepared::capture(&original_paths, &messages, &manifest)
+                .expect("the prior build's selected images");
+        let paths = prior_images.paths();
+        let selected = &paths[0].1;
         let mut prepared = Report::new("prepare exact prior AppKit runtime");
         let prior_runtime = appkit_group_runtime(
             &c,
@@ -3461,7 +3502,7 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
         if carried {
             let cwd_drift_path = root.join("candidate-cwd-drift");
             std::fs::create_dir(&cwd_drift_path).expect("cwd drift");
-            let cwd_drift = finalized_appkit_command(&c, &binary, &cwd_drift_path, Vec::new())
+            let cwd_drift = finalized_appkit_command(&c, selected, &cwd_drift_path, Vec::new())
                 .expect("finalized cwd drift");
             let cwd_drift = crate::appkit_content::GroupProof::from_paths_and_commands(
                 crate::appkit_content::REDRAW_GROUP,
@@ -3475,7 +3516,7 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
 
             let env_drift = finalized_appkit_command(
                 &c,
-                &binary,
+                selected,
                 &runtime_cwd,
                 vec![("HOME".into(), "/different".into())],
             )
@@ -3495,9 +3536,11 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
         std::fs::write(runtime_cwd.join("stale"), b"not an input").expect("stale entry");
         c.passed_appkit_groups = Some(BTreeMap::from([(prior.group.clone(), prior)]));
         let mut report = Report::new("redraw conformance");
-        redraw_conformance(&c, &mut report);
+        AppkitDrivers::Redraw.build(&c, &mut report);
+        AppkitDrivers::Redraw.run(&c, &mut report);
 
         assert!(built.exists(), "the headless build always ran");
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(driven.exists(), !carried, "windowed child execution");
         assert!(
             report.outcomes().all(|(outcome, _)| outcome == Outcome::Ok),
@@ -3507,11 +3550,37 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
         if carried {
             assert!(report.render().contains("carried prior ok"));
             assert!(!cwd_seen.exists());
+            #[cfg(target_os = "macos")]
+            assert!(
+                !report
+                    .render()
+                    .lines()
+                    .any(|line| line.trim().starts_with("__snapshot_")),
+                "carrying success must not also execute the native fixture child"
+            );
         } else {
+            #[cfg(not(target_os = "macos"))]
             assert_eq!(
                 std::fs::read_to_string(&cwd_seen).expect("driver cwd"),
                 runtime_cwd.display().to_string()
             );
+            #[cfg(target_os = "macos")]
+            {
+                assert!(
+                    report
+                        .render()
+                        .lines()
+                        .any(|line| line.trim()
+                            == format!("__snapshot_cwd={}", runtime_cwd.display())),
+                    "the admitted native child proves its exact private cwd: {}",
+                    report.render()
+                );
+                assert!(
+                    report.render().lines().any(|line| line.trim()
+                        == format!("__snapshot_executable={}", selected.display())),
+                    "the native child must name the retained image it actually ran"
+                );
+            }
         }
         assert!(!runtime_cwd.exists(), "the stable group cwd is cleaned");
         std::fs::remove_dir_all(root).ok();
@@ -3749,7 +3818,7 @@ fn a_locked_console_skips_native_drives_but_an_unlocked_one_keeps_findings() {
     let spec = crate::plan::plan(&unlocked)
         .expect("complete graph and plan")
         .into_iter()
-        .find(|spec| spec.id == StageId::RedrawConformance)
+        .find(|spec| spec.id == StageId::RedrawBuild)
         .unwrap();
     assert!(
         run_stage(&unlocked, &spec)
@@ -3778,9 +3847,14 @@ fn no_windows_skips_each_windowed_stage_by_name_and_nothing_else() {
     let quiet = base().with_no_windows(true);
     let planned = plan(&quiet).expect("complete graph and plan");
     assert_eq!(
-        planned,
-        plan(&plain).expect("complete graph and plan"),
-        "the flag removes no stage"
+        planned.iter().map(|s| s.id).collect::<Vec<_>>(),
+        plan(&plain)
+            .expect("complete graph and plan")
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| !matches!(id, StageId::RedrawBuild | StageId::ObjcBuild))
+            .collect::<Vec<_>>(),
+        "only preparations for omitted windowed work drop out"
     );
     let mut seen = Vec::new();
     for spec in &planned {
@@ -3971,6 +4045,7 @@ fn measured_result(
 fn measured_subject(own: bool) -> Subject {
     Subject {
         profile: Profile::Release,
+        no_windows: false,
         name: "aterm 0.137.0 (22cb722a2ec9) at /Applications/aterm.app".into(),
         head: Some("215fb53331abd9acb2a33e7d7a21d1fa3c2bd8f2".into()),
         own,
@@ -3995,7 +4070,7 @@ fn decide_measured(ok: bool, output: String, subject: &Subject) -> Vec<(Outcome,
 }
 
 #[test]
-fn debug_measurements_name_shipping_size_as_inapplicable_and_keep_runtime_failures() {
+fn debug_measurements_name_release_only_rows_as_inapplicable_and_keep_runtime_failures() {
     let runtime_targets = ["paint", "spin", "aos", "rewind"];
     let runtime: String = runtime_targets
         .into_iter()
@@ -4005,13 +4080,13 @@ fn debug_measurements_name_shipping_size_as_inapplicable_and_keep_runtime_failur
     let mut debug = measured_subject(true);
     debug.profile = Profile::Debug;
     let rows = decide_measured(true, runtime.clone(), &debug);
-    assert_eq!(rows.iter().filter(|(o, _)| *o == Outcome::Skip).count(), 1);
+    assert_eq!(rows.iter().filter(|(o, _)| *o == Outcome::Skip).count(), 2);
     assert!(rows.iter().any(|(o, _)| *o == Outcome::Ok));
     assert!(
         !rows.iter().any(|(o, _)| matches!(o, Outcome::Fail(_))),
         "{rows:?}"
     );
-    let debug_args = measuring_args(Profile::Debug);
+    let debug_args = measuring_args(Profile::Debug, false);
     assert_eq!(
         debug_args
             .windows(2)
@@ -4020,14 +4095,17 @@ fn debug_measurements_name_shipping_size_as_inapplicable_and_keep_runtime_failur
             .collect::<Vec<_>>(),
         runtime_targets
     );
-    let release_args = measuring_args(Profile::Release);
-    assert!(
-        release_args
-            .windows(2)
-            .any(|pair| pair == ["--bench", "size"])
-    );
+    let release_args = measuring_args(Profile::Release, false);
+    for target in ["size", "capture"] {
+        assert!(
+            release_args
+                .windows(2)
+                .any(|pair| pair == ["--bench", target])
+        );
+    }
 
-    // The same four successful runtime reports cannot qualify a release without size evidence.
+    // The same four successful runtime reports cannot qualify a release without its two
+    // production-artifact matrices.
     let rows = decide_measured(true, runtime.clone(), &release);
     assert!(
         rows.iter()
@@ -4047,7 +4125,8 @@ fn debug_measurements_name_shipping_size_as_inapplicable_and_keep_runtime_failur
             "missing {missing}: {rows:?}"
         );
     }
-    let oversized = runtime + &measured_result("size", 1, 0, 1, 0);
+    let oversized =
+        runtime + &measured_result("size", 1, 0, 1, 0) + &measured_result("capture", 1, 1, 0, 0);
     let rows = decide_measured(false, oversized, &release);
     assert!(
         rows.iter()
@@ -4069,6 +4148,7 @@ fn debug_measurements_name_shipping_size_as_inapplicable_and_keep_runtime_failur
             .collect();
         if subject.profile == Profile::Release {
             failed.push_str(&measured_result("size", 1, 1, 0, 0));
+            failed.push_str(&measured_result("capture", 1, 1, 0, 0));
         }
         let rows = decide_measured(false, failed, subject);
         assert!(
@@ -4080,14 +4160,85 @@ fn debug_measurements_name_shipping_size_as_inapplicable_and_keep_runtime_failur
 }
 
 #[test]
+fn no_windows_omits_capture_execution_and_names_the_missing_window_coverage() {
+    let targets = |no_windows| {
+        let args = measuring_args(Profile::Release, no_windows);
+        args.windows(2)
+            .filter(|pair| pair[0] == "--bench")
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(targets(false).iter().any(|target| target == "capture"));
+    assert!(!targets(true).iter().any(|target| target == "capture"));
+    assert!(
+        measure_prebuild_args()
+            .windows(2)
+            .any(|pair| pair == ["--bench", "capture"])
+    );
+    let reports = ["paint", "spin", "aos", "rewind", "size"]
+        .into_iter()
+        .map(|target| measured_result(target, 1, 1, 0, 0))
+        .collect::<String>();
+    let mut headless = measured_subject(true);
+    headless.no_windows = true;
+    let rows = decide_measured(true, reports.clone(), &headless);
+    assert_eq!(
+        rows.iter()
+            .filter(|(outcome, _)| *outcome == Outcome::Skip)
+            .count(),
+        1,
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|(outcome, label)| *outcome == Outcome::Skip
+            && label.contains("capture")
+            && label.contains("--no-windows")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|(outcome, _)| *outcome == Outcome::Ok),
+        "{rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|(outcome, _)| matches!(outcome, Outcome::Fail(_))),
+        "{rows:?}"
+    );
+
+    let windowed = decide_measured(true, reports, &measured_subject(true));
+    assert!(
+        windowed.iter().any(
+            |(outcome, label)| *outcome == Outcome::Fail(Severity::CouldNotRun)
+                && label.contains("capture")
+        ),
+        "{windowed:?}"
+    );
+    let incomplete = ["paint", "spin", "aos", "rewind"]
+        .into_iter()
+        .map(|target| measured_result(target, 1, 1, 0, 0))
+        .collect();
+    let rows = decide_measured(true, incomplete, &headless);
+    assert!(
+        rows.iter().any(
+            |(outcome, label)| *outcome == Outcome::Fail(Severity::CouldNotRun)
+                && label.contains("size")
+        ),
+        "{rows:?}"
+    );
+}
+
+#[test]
 fn a_measuring_child_requires_complete_decided_matrices() {
     let result = measured_result;
     let paint = result("paint", 23, 23, 0, 0);
     let size = result("size", 1, 1, 0, 0);
+    let capture = result("capture", 1, 1, 0, 0);
     let spin = result("spin", 2, 2, 0, 0)
         + &result("aos", 1, 1, 0, 0)
         + &result("rewind", 2, 2, 0, 0)
-        + &size;
+        + &size
+        + &capture;
     let decide = |ok: bool, output: String| {
         decide_measured(ok, output, &measured_subject(true))
             .into_iter()
@@ -4139,7 +4290,8 @@ fn a_measuring_child_requires_complete_decided_matrices() {
              unanswered=0 undecided={undecided}\n"
         )
     };
-    let base = paint.clone() + &result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &size;
+    let base =
+        paint.clone() + &result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &size + &capture;
     let one = undecided("cost") + &spread(1, 1);
     let (outcome, label) = decide(true, base.clone() + &one);
     assert_eq!(
@@ -4163,6 +4315,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
         + &result("spin", 2, 0, 0, 0).replace("undecided=0", "undecided=2")
         + &result("aos", 1, 0, 0, 0).replace("undecided=0", "undecided=1")
         + &result("size", 1, 0, 0, 0).replace("undecided=0", "undecided=1")
+        + &result("capture", 1, 0, 0, 0).replace("undecided=0", "undecided=1")
         + &undecided("cost,steps")
         + &spread(0, 2);
     let (outcome, label) = decide(true, all_undecided.clone());
@@ -4204,6 +4357,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
                 + &result("spin", 2, 2, 0, 0)
                 + &result("aos", 1, 1, 0, 0)
                 + &size
+                + &capture
                 + &spread(2, 0)
                 + loaded
         )
@@ -4213,7 +4367,8 @@ fn a_measuring_child_requires_complete_decided_matrices() {
     );
     let refused = "measure paint: COULD NOT RUN — cannot acquire its exclusive timing \
                    claim: timing not qualified: no CPU window formed at its patience bound\n";
-    let rest = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &size + &spread(2, 0);
+    let rest =
+        result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &size + &capture + &spread(2, 0);
     assert_eq!(
         decide(false, rest.clone() + refused).0,
         could_not_run,
@@ -4224,7 +4379,8 @@ fn a_measuring_child_requires_complete_decided_matrices() {
         Outcome::Fail(Severity::GateFailed),
         "a missing summary with no refusal and a nonzero exit is the child's failure"
     );
-    let crashed = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &size + refused;
+    let crashed =
+        result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &size + &capture + refused;
     assert_eq!(
         decide(false, crashed).0,
         Outcome::Fail(Severity::GateFailed),
@@ -4237,6 +4393,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
                 + &result("spin", 2, 2, 0, 0)
                 + &result("aos", 1, 1, 0, 0)
                 + &size
+                + &capture
                 + &one
         )
         .0,
@@ -4260,6 +4417,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
                 + &result("aos", 1, 0, 0, 1)
                 + &result("rewind", 2, 0, 0, 2)
                 + &result("size", 1, 0, 0, 1)
+                + &result("capture", 1, 0, 0, 1)
         )
         .0,
         could_not_run,
@@ -4273,6 +4431,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
                 + &result("aos", 1, 0, 0, 1)
                 + &result("rewind", 2, 0, 0, 2)
                 + &result("size", 1, 0, 0, 1)
+                + &result("capture", 1, 0, 0, 1)
         )
         .0,
         Outcome::Fail(Severity::GateFailed),
@@ -4308,7 +4467,9 @@ fn an_unanswered_row_fails_heads_build_and_is_named_on_another() {
                 measure result: spin planned=3 passed=2 failed=0 refused=0 unanswered=1 undecided=0\n";
     let aos = "measure row: aos::a_repair UNANSWERED\naos repair named no main_us=\n\
                measure result: aos planned=1 passed=0 failed=0 refused=0 unanswered=1 undecided=0\n";
-    let rewind = measured_result("rewind", 2, 2, 0, 0) + &measured_result("size", 1, 1, 0, 0);
+    let rewind = measured_result("rewind", 2, 2, 0, 0)
+        + &measured_result("size", 1, 1, 0, 0)
+        + &measured_result("capture", 1, 1, 0, 0);
     let output = paint.clone()
         + spin
         + &bench_exit("spin", "exit status: 3")
@@ -4372,7 +4533,8 @@ fn an_unanswered_row_never_hides_a_crash_after_the_summaries() {
     let paint = measured_result("paint", 23, 23, 0, 0);
     let rest = measured_result("spin", 2, 2, 0, 0)
         + &measured_result("aos", 1, 1, 0, 0)
-        + &measured_result("size", 1, 1, 0, 0);
+        + &measured_result("size", 1, 1, 0, 0)
+        + &measured_result("capture", 1, 1, 0, 0);
     let other = measured_subject(false);
     let first = |output: String| decide_measured(false, output, &other)[0].clone();
     let decided = |output: String| first(output).0;

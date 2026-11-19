@@ -3578,6 +3578,7 @@ fn the_picks_are_the_same_with_the_journal_on_and_off() {
                 windows: vec![WindowSeen {
                     window: alab_seen::WEEK.into(),
                     sub: None,
+                    model: None,
                     figure: Some(Figure::Used {
                         pct_x10: 990,
                         reset: Some(SAT8),
@@ -3611,7 +3612,15 @@ fn the_picks_are_the_same_with_the_journal_on_and_off() {
             let ranked = points
                 .iter()
                 .map(|point| {
-                    candidates(&fx.roster, &fx.state, &fx.enrolled, Some("me"), point, NOW)
+                    candidates(
+                        &fx.roster,
+                        &fx.state,
+                        &fx.enrolled,
+                        Some("me"),
+                        crate::harness::accounts::ModelWeek::Unread,
+                        point,
+                        NOW,
+                    )
                 })
                 .collect::<Vec<_>>();
             let launch =

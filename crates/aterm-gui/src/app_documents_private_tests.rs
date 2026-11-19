@@ -396,6 +396,8 @@ fn a_private_front_refuses_image_video_and_controller_input() {
             session: None,
             want_bytes: true,
             want_metadata: false,
+            whole_client: false,
+            presentation: None,
             frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
             cancel: crate::control::CaptureCancellation::new(),
             reply,

@@ -19,7 +19,7 @@ struct Fixture {
 fn apply(operation: i64, state: &mut State, logins: &mut Logins) -> Vec<Event> {
     match operation {
         1 => note_login_end(state, logins, "main", NOW),
-        2 => note_signed_back(state, logins, "main", NOW),
+        2 => observe_served(state, logins, "main", NOW),
         3 => {
             note_served_login(logins, "main", NOW);
             Vec::new()
@@ -29,7 +29,7 @@ fn apply(operation: i64, state: &mut State, logins: &mut Logins) -> Vec<Event> {
             Vec::new()
         }
         5 => {
-            let mut events = note_signed_back(state, logins, "main", NOW);
+            let mut events = observe_served(state, logins, "main", NOW);
             events.extend(prove_in_context(state, logins, "main", NOW));
             events.extend(note_session(state, "session-one", "main", None, NOW));
             events

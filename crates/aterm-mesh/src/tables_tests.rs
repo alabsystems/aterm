@@ -9,11 +9,11 @@
 //! one-minute hang detector.
 
 use super::{HANG, Lab, Mac, lock, seating};
-use crate::egress::{Egress, Feed, Wake};
+use crate::egress::{Egress, Feed, Handed, MembersCursor, Mutant, Wake};
 use crate::inventory::Reason;
 use crate::logs::MESH_DIR;
 use crate::presence::{self, Presence, PresenceConfig};
-use crate::stores::{self, Digest, Held, Kind, ProofKey, Stores, TableKey, Verdict};
+use crate::stores::{self, Digest, Generation, Held, Kind, ProofKey, Stores, TableKey, Verdict};
 use crate::{Event, MeshLog};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write as _};
@@ -50,6 +50,12 @@ struct Fake {
     /// it answers) then append it once, so its egress steps past the one delivered copy and
     /// publishes none ([`Stores`]: an id that enters through ingest is never published again).
     ingesting: Mutex<()>,
+    /// The membership log's rewrite generation ([`Self::rewrite_members`]), read and moved
+    /// under [`FILES`] with the file, as a records entry's pin and its data change together.
+    generation: Mutex<Generation>,
+    /// Whether the stand-in's membership records ride no members lane, as a vault's whose
+    /// format mark names a later format than 1 ([`Self::shut_lane`]).
+    lane_shut: AtomicBool,
 }
 
 /// Every stand-in store file is read and written under this, in this process: a store's own writes
@@ -124,6 +130,8 @@ impl Fake {
             refuses: AtomicBool::new(false),
             excludes: Mutex::new(BTreeSet::new()),
             ingesting: Mutex::new(()),
+            generation: Mutex::new(Generation::default()),
+            lane_shut: AtomicBool::new(false),
         })
     }
 
@@ -138,6 +146,12 @@ impl Fake {
     /// The egress this store's appends feed, as a process's sink does.
     fn serve(&self, egress: &Arc<Egress>) {
         *lock(&self.egress) = Some(Arc::downgrade(egress));
+    }
+
+    /// Shut the members lane, as a format mark stored past format 1 does
+    /// ([`Stores::members_lane`]).
+    fn shut_lane(&self) {
+        self.lane_shut.store(true, Ordering::SeqCst);
     }
 
     /// Feed no egress: an append after this is one whose feed the egress never reads.
@@ -242,13 +256,54 @@ impl Fake {
         append_line(&self.members_file(), &hex(record));
         if let Some(egress) = self.egress() {
             let all = self.members();
-            let from = egress.members_cursor().unwrap_or(0);
+            let cursor = egress.members_cursor();
             egress.feed(Feed::Members {
                 length: all.len(),
-                records: Some((from, all.get(from..).unwrap_or_default().to_vec())),
+                records: Some(Handed {
+                    from: cursor.from,
+                    generation: *lock(&self.generation),
+                    records: all.get(cursor.from..).unwrap_or_default().to_vec(),
+                }),
             });
         }
         self.bump();
+    }
+
+    /// Rewrite the membership log to the records of it `keep` holds, in their order, under
+    /// the next generation, as a prune rewrites a records file: no egress is fed, as where
+    /// another process made it and its wake was lost.
+    fn rewrite_members(&self, keep: impl Fn(&[u8]) -> bool) {
+        self.rewrite_members_to(|record| keep(record).then(|| record.to_vec()));
+    }
+
+    /// Rewrite the membership log to what `kept` answers for each record it holds, in their
+    /// order, under the next generation: a record it answers other bytes for is one a shed
+    /// rewrote, of the same id ([`Fake::member_id`]). No egress is fed.
+    fn rewrite_members_to(&self, kept: impl Fn(&[u8]) -> Option<Vec<u8>>) {
+        let records: Vec<Vec<u8>> = self
+            .members()
+            .iter()
+            .filter_map(|record| kept(record))
+            .collect();
+        let number = lock(&self.generation).number + 1;
+        self.hold_members(&records, number);
+    }
+
+    /// Hold `records` as the membership log, under the generation `number` and the rewrite
+    /// their bytes name: with the number the log is at, a rewrite made again (its commit lost
+    /// to a power cut, then made from what the log held by then), which is another rewrite of
+    /// the same number. No egress is fed.
+    fn hold_members(&self, records: &[Vec<u8>], number: u64) {
+        let text: String = records
+            .iter()
+            .map(|record| format!("{}\n", hex(record)))
+            .collect();
+        let _files = lock(&FILES);
+        std::fs::write(self.members_file(), &text).expect("the rewritten membership log");
+        *lock(&self.generation) = Generation {
+            number,
+            rewrite: Some(stores::digest(text.as_bytes())),
+        };
     }
 
     /// Fail (`on`) or serve every read of this stand-in's inventory.
@@ -385,6 +440,21 @@ impl Stores for Fake {
     fn members_held(&self, from: usize) -> io::Result<(Vec<Vec<u8>>, usize)> {
         let all = self.members();
         Ok((all.get(from..).unwrap_or_default().to_vec(), all.len()))
+    }
+
+    fn members_generation(&self) -> io::Result<Generation> {
+        let _files = lock(&FILES);
+        Ok(*lock(&self.generation))
+    }
+
+    fn members_lane(&self) -> io::Result<bool> {
+        Ok(!self.lane_shut.load(Ordering::SeqCst))
+    }
+
+    /// A stand-in record's id is the digest of its bytes up to a `~`: what follows one is what
+    /// a shed drops, as a version-2 record's ciphertext, so the record keeps its id through it.
+    fn member_id(&self, wire: &[u8]) -> Digest {
+        stores::digest(wire.split(|byte| *byte == b'~').next().unwrap_or(wire))
     }
 
     fn tables(&self) -> io::Result<BTreeSet<Digest>> {
@@ -825,6 +895,65 @@ fn an_operation_whose_writers_seat_has_not_arrived_waits_and_applies_after_it() 
             assert_eq!(ingest.waiting(), 1);
         }
     }
+}
+
+/// The waiting set is bounded by its records' bytes, not their count: 24 records of some 400 bytes
+/// whose writer is not seated on B fill a 4 KiB waiting set with about ten of them, and B's
+/// ingest then takes no more (the rest stay behind it on `tables.log`, unsettled) and asks A for
+/// the membership log. Once the writer's seat lands on B every one of the 24 applies: none was
+/// dropped. With a count bound of the records, as before, all 24 would wait at once, past the
+/// bytes.
+#[test]
+fn a_full_waiting_set_holds_the_sender_back_by_bytes_and_drops_no_record() {
+    const BOUND: usize = 4096;
+    const RECORDS: usize = 24;
+    let lab = Lab::new();
+    let mut macs: Vec<(Mac, Arc<Fake>)> = (1..=2).map(|tag| tables_mac(&lab, tag, &[])).collect();
+    start_all(&lab, &mut macs);
+    let (a, b) = (&macs[0], &macs[1]);
+    let ingest = b.0.mesh().ingest().expect("an ingest consumer");
+    ingest.bound_waiting_for_test(BOUND);
+    let text = |n: usize| format!("r{n:02}-{}", "x".repeat(400));
+    // What one waiting record holds: its kind byte and its wire, `late|<text>`.
+    let record = 1 + "late|".len() + text(0).len();
+    assert!(RECORDS * record > 2 * BOUND);
+    let mark = b.0.seen.mark();
+    for n in 0..RECORDS {
+        a.1.write("late", &text(n));
+    }
+    b.0.seen
+        .until("the waiting set fills", |_| ingest.waiting_bytes() >= BOUND);
+    let held = ingest.waiting();
+    // Full, the worker takes nothing more: by the time the Inventory of the membership log it
+    // asked for has run, the waiting set is what it was.
+    b.0.seen.until("the membership log's Inventory", |events| {
+        events.iter().skip(mark).any(|event| {
+            matches!(
+                event,
+                Event::Inventory {
+                    reason: Some(Reason::Members),
+                    ..
+                }
+            )
+        })
+    });
+    assert_eq!(ingest.waiting(), held);
+    assert!(
+        held < RECORDS && ingest.waiting_bytes() < BOUND + record,
+        "{held} records, {} bytes wait",
+        ingest.waiting_bytes()
+    );
+    assert!((0..RECORDS).all(|n| !b.1.holds(&text(n))));
+
+    // The writer's seat lands on B, and the standings watch kicks the ingest.
+    b.1.append_member(b"seat:late");
+    ingest.kick();
+    for n in 0..RECORDS {
+        b.1.until_holds(&text(n));
+    }
+    b.0.seen
+        .until("the waiting set empties", |_| ingest.waiting() == 0);
+    assert_eq!(ingest.waiting_bytes(), 0);
 }
 
 /// A record cut from `tables.log` below a sleeping Mac's cursor reaches it by one `Inventory`,
@@ -1800,6 +1929,441 @@ fn one_append_yields_exactly_one_egress_record_in_process_and_from_a_second_proc
         ])
     );
     assert_eq!(egress.published(), 4);
+}
+
+/// What this Mac published of its membership log, in order, where the log is rewritten under
+/// its egress with the members cursor's placing broken as `broken` says (or whole).
+///
+/// It writes `a`, `b` and `c`, which are published; the log is rewritten without `a` (a prune
+/// drops it), fed to no egress; then it writes `d` and `e`. Then a feed hands over one record
+/// written before the rewrite, under the generation it was written under, at a cursor whose
+/// count is the cursor's now, and it writes `f`. The stand-in's hook hands over the records
+/// after the cursor with the generation its log is at, so what the egress takes of them is its
+/// own judgement.
+fn published_across_a_rewrite(broken: Option<Mutant>) -> (Vec<String>, MembersCursor) {
+    let lab = Lab::new();
+    let (mut mac, fake) = tables_mac(&lab, 1, &["w"]);
+    mac.read(seating(&[&mac]));
+    mac.start(&lab);
+    let egress = mac.mesh().egress().expect("an egress");
+    egress.break_for_test(broken);
+    fake.serve(&egress);
+    let deadline = || Instant::now() + HANG;
+    let start = fake.members().len();
+    for seat in ["seat:a", "seat:b", "seat:c"] {
+        fake.append_member(seat.as_bytes());
+    }
+    assert!(egress.wait_members_published(start + 3, deadline()));
+    assert_eq!(
+        egress.members_cursor(),
+        MembersCursor {
+            from: start + 3,
+            generation: Generation::default()
+        }
+    );
+
+    fake.rewrite_members(|record| record != b"seat:a");
+    assert_eq!(fake.members().len(), start + 2);
+    fake.append_member(b"seat:d");
+    fake.append_member(b"seat:e");
+    assert!(egress.wait_members_published(start + 4, deadline()));
+    // Read before the rewrite, at a count that is the cursor's now `e` is published.
+    egress.feed(Feed::Members {
+        length: start + 5,
+        records: Some(Handed {
+            from: start + 4,
+            generation: Generation::default(),
+            records: vec![b"seat:stale".to_vec()],
+        }),
+    });
+    fake.append_member(b"seat:f");
+    assert!(egress.wait_members_published(start + 5, deadline()));
+    let subject = stores::members_subject(&mac.principal);
+    let published = own(&mac)
+        .into_iter()
+        .filter(|(s, _)| *s == subject)
+        .map(|(_, payload)| payload)
+        .collect();
+    (published, egress.members_cursor())
+}
+
+/// A rewrite of the membership log places the egress's members cursor again
+/// ([`MembersCursor`]). The cursor counts the log's records in held order, and a rewrite drops
+/// records: here the log loses one record the egress published, so it is one shorter than the
+/// cursor, and the next two writes are published all the same, each once, with nothing
+/// published again: the cursor is placed just past the last record it stepped past, under the
+/// log's new generation. Records a write made before the rewrite hands over are not taken,
+/// though their count is the cursor's: they were written under another generation.
+///
+/// NEGATIVE CONTROLS, each run here and seen to give what it names:
+/// - `Mutant::GenerationUnread` (the cursor stays, as before FL-148D): the write after the
+///   rewrite, `d`, is never published, its log no longer than the cursor.
+/// - `Mutant::FromFirst` (a rewritten log is published from its first record): `b` and `c`
+///   are published twice, and the seat the log held before the mesh once.
+/// - `Mutant::AnyGeneration` (records handed over are taken by their count alone, whatever
+///   generation their write names): the record written before the rewrite is published, and
+///   `f`, which the cursor then passed, is not.
+#[test]
+fn a_rewrite_of_the_membership_log_places_the_members_cursor_again() {
+    let seats = |names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| format!("seat:{name}")).collect()
+    };
+    let (published, cursor) = published_across_a_rewrite(None);
+    assert_eq!(published, seats(&["a", "b", "c", "d", "e", "f"]));
+    assert_eq!(cursor.generation.number, 1);
+
+    let (published, cursor) = published_across_a_rewrite(Some(Mutant::GenerationUnread));
+    assert_eq!(published, seats(&["a", "b", "c", "e", "stale"]));
+    assert_eq!(cursor.generation, Generation::default());
+
+    let (published, _) = published_across_a_rewrite(Some(Mutant::FromFirst));
+    assert_eq!(
+        published,
+        seats(&["a", "b", "c", "w", "b", "c", "d", "e", "f"])
+    );
+
+    let (published, _) = published_across_a_rewrite(Some(Mutant::AnyGeneration));
+    assert_eq!(published, seats(&["a", "b", "c", "d", "e", "stale"]));
+}
+
+/// What this Mac published of its membership log, in order, where a write of a rewritten log
+/// hands its records over under the log's generation, with the members cursor's placing broken
+/// as `broken` says (or whole).
+///
+/// It writes `a`, `b` and `c`, which are published; the log is rewritten without `a` and the
+/// egress places its cursor under that rewrite. Then the log takes `d`, and the write's feed
+/// hands `d` over under the rewritten log's generation, as bytes the store does not hold (the
+/// same id, [`Fake::member_id`]): so what is published says whether the egress took the
+/// write's records or read the store. Then it writes `e`.
+fn published_by_a_write_of_a_rewritten_log(broken: Option<Mutant>) -> Vec<String> {
+    let lab = Lab::new();
+    let (mac, fake, egress, start) = members_mac(&lab, broken);
+    let deadline = || Instant::now() + HANG;
+    for seat in ["seat:a", "seat:b", "seat:c"] {
+        fake.append_member(seat.as_bytes());
+    }
+    assert!(egress.wait_members_published(start + 3, deadline()));
+
+    fake.rewrite_members(|record| record != b"seat:a");
+    egress.feed(Feed::Members {
+        length: start + 2,
+        records: None,
+    });
+    // Fed after it, so published once that feed was read: the cursor is placed by then.
+    fake.write("w", "after the rewrite");
+    let key = TableKey {
+        table: TABLE,
+        recovery: false,
+    };
+    assert!(egress.wait_published(key, 1, deadline()));
+    let placed = egress.members_cursor();
+    assert_eq!((placed.from, placed.generation.number), (start + 2, 1));
+
+    append_line(&fake.members_file(), &hex(b"seat:d"));
+    egress.feed(Feed::Members {
+        length: start + 3,
+        records: Some(Handed {
+            from: placed.from,
+            generation: placed.generation,
+            records: vec![b"seat:d~handed".to_vec()],
+        }),
+    });
+    fake.append_member(b"seat:e");
+    assert!(egress.wait_members_published(start + 4, deadline()));
+    members_published(&mac)
+}
+
+/// A write of a rewritten membership log hands its records over under the generation it wrote
+/// them, and the egress takes them where that is its cursor's (tracker FL-148E, carried from
+/// FL-148D; [`MembersCursor`]): it publishes the write's own records and does not read the log
+/// again for them, as it does not of a log never rewritten.
+///
+/// NEGATIVE CONTROL: `Mutant::UnrewrittenAlone` (records handed over are taken only of a log
+/// never rewritten, as before the write said its generation), run here and seen to publish
+/// `d` as the store holds it: the egress dropped what the write handed it and read the log.
+#[test]
+fn a_write_of_a_rewritten_log_hands_its_records_under_its_generation() {
+    let seats = |names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| format!("seat:{name}")).collect()
+    };
+    assert_eq!(
+        published_by_a_write_of_a_rewritten_log(None),
+        seats(&["a", "b", "c", "d~handed", "e"])
+    );
+    assert_eq!(
+        published_by_a_write_of_a_rewritten_log(Some(Mutant::UnrewrittenAlone)),
+        seats(&["a", "b", "c", "d", "e"])
+    );
+}
+
+/// What this Mac published of its membership log where a write's feed is read after the
+/// members lane shut, with the egress broken as `broken` says (or whole).
+///
+/// It writes `a`, which is published. Then the lane shuts (its format mark is stored past
+/// format 1), and the egress reads a feed that carries `late`, a record a write handed over
+/// under the cursor's own generation and count: one queued while the lane was open. A table
+/// write is fed after it, so once that is published the feed before it was read.
+fn published_past_a_shut_lane(broken: Option<Mutant>) -> Vec<String> {
+    let lab = Lab::new();
+    let (mac, fake, egress, start) = members_mac(&lab, broken);
+    let deadline = || Instant::now() + HANG;
+    fake.append_member(b"seat:a");
+    assert!(egress.wait_members_published(start + 1, deadline()));
+    let cursor = egress.members_cursor();
+
+    fake.shut_lane();
+    egress.feed(Feed::Members {
+        length: start + 2,
+        records: Some(Handed {
+            from: cursor.from,
+            generation: cursor.generation,
+            records: vec![b"seat:late".to_vec()],
+        }),
+    });
+    fake.write("w", "after the lane shut");
+    let key = TableKey {
+        table: TABLE,
+        recovery: false,
+    };
+    assert!(egress.wait_published(key, 1, deadline()));
+    members_published(&mac)
+}
+
+/// A MAC WHOSE LANE SHUT PUBLISHES NO MEMBERSHIP RECORD, ONE A WRITE HANDED OVER BEFORE IT
+/// AMONG THEM (tracker FL-148E, ATERM-KI-1116-1471: "a marked Mac neither feeds nor takes the
+/// mesh members lane"). A write asks whether the lane is open before it hands its records to
+/// the egress, and the egress reads that feed later, on its own thread: a format mark stored
+/// between the two (by another process, or by this one's follow) must not leave the records
+/// to be published by a Mac that is then past format 1. The egress asks at each feed
+/// ([`Stores::members_lane`]) and drops what a shut lane's feed carries.
+///
+/// NEGATIVE CONTROL: `Mutant::LaneUnasked` (the feed is published unasked, as before the slice
+/// B review), run here and seen to publish `late`.
+#[test]
+fn a_feed_read_after_the_lane_shut_publishes_nothing() {
+    assert_eq!(published_past_a_shut_lane(None), vec!["seat:a".to_owned()]);
+    assert_eq!(
+        published_past_a_shut_lane(Some(Mutant::LaneUnasked)),
+        vec!["seat:a".to_owned(), "seat:late".to_owned()]
+    );
+}
+
+/// A Mac whose egress runs over a stand-in store that holds one seat, its writes fed to that
+/// egress, the members cursor's placing broken as `broken` says (or whole): the Mac, its store,
+/// its egress and how many records the log held before the mesh.
+fn members_mac(lab: &Lab, broken: Option<Mutant>) -> (Mac, Arc<Fake>, Arc<Egress>, usize) {
+    let (mut mac, fake) = tables_mac(lab, 1, &["w"]);
+    mac.read(seating(&[&mac]));
+    mac.start(lab);
+    let egress = mac.mesh().egress().expect("an egress");
+    egress.break_for_test(broken);
+    fake.serve(&egress);
+    let start = fake.members().len();
+    (mac, fake, egress, start)
+}
+
+/// The membership records a Mac published, in order.
+fn members_published(mac: &Mac) -> Vec<String> {
+    let subject = stores::members_subject(&mac.principal);
+    own(mac)
+        .into_iter()
+        .filter(|(s, _)| *s == subject)
+        .map(|(_, payload)| payload)
+        .collect()
+}
+
+/// What this Mac published of its membership log, in order, where a rewrite of the log is
+/// made again under its number, with the members cursor's placing broken as `broken` says
+/// (or whole).
+///
+/// It writes `a`, `b` and `c`, which are published; the log is rewritten without `a` and
+/// the egress places its cursor under that rewrite. Then the rewrite's commit is lost (a
+/// power cut took its pin's rename back), other processes write `e` and `f`, whose wakes are
+/// lost, and the rewrite is made again from what the log holds by then, without `a` and `b`:
+/// the same number, another rewrite, another order. One wake names the log's length.
+fn published_across_a_rewrite_made_again(broken: Option<Mutant>) -> Vec<String> {
+    let lab = Lab::new();
+    let (mac, fake, egress, start) = members_mac(&lab, broken);
+    let deadline = || Instant::now() + HANG;
+    for seat in ["seat:a", "seat:b", "seat:c"] {
+        fake.append_member(seat.as_bytes());
+    }
+    assert!(egress.wait_members_published(start + 3, deadline()));
+
+    fake.rewrite_members(|record| record != b"seat:a");
+    egress.feed(Feed::Members {
+        length: start + 2,
+        records: None,
+    });
+    // Fed after it, so published once that feed was read: the cursor is placed by then.
+    fake.write("w", "after the rewrite");
+    let key = TableKey {
+        table: TABLE,
+        recovery: false,
+    };
+    assert!(egress.wait_published(key, 1, deadline()));
+    let placed = egress.members_cursor();
+    assert_eq!((placed.from, placed.generation.number), (start + 2, 1));
+
+    let again: Vec<Vec<u8>> = ["seat:w", "seat:c", "seat:e", "seat:f"]
+        .iter()
+        .map(|seat| seat.as_bytes().to_vec())
+        .collect();
+    fake.hold_members(&again, 1);
+    let made_again = fake.members_generation().expect("the generation");
+    assert_eq!(made_again.number, placed.generation.number);
+    assert_ne!(made_again, placed.generation);
+    egress.feed(Feed::Members {
+        length: again.len(),
+        records: None,
+    });
+    assert!(egress.wait_members_published(again.len(), deadline()));
+    members_published(&mac)
+}
+
+/// A generation is the rewrite that made it, not only its number ([`MembersCursor`]): a
+/// rewrite made again under the number the cursor was placed under holds another order, and
+/// the cursor is placed again, just past the last record it stepped past, so the two records
+/// written since are both published, each once.
+///
+/// NEGATIVE CONTROL: `Mutant::NumberAlone` (two generations of one number read as one, as
+/// before the slice B review), run here and seen to publish `f` alone: `e`, which the
+/// rewritten log holds below the cursor's count, never leaves this Mac but by `Inventory`.
+#[test]
+fn a_rewrite_made_again_under_its_number_places_the_members_cursor_again() {
+    let seats = |names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| format!("seat:{name}")).collect()
+    };
+    assert_eq!(
+        published_across_a_rewrite_made_again(None),
+        seats(&["a", "b", "c", "e", "f"])
+    );
+    assert_eq!(
+        published_across_a_rewrite_made_again(Some(Mutant::NumberAlone)),
+        seats(&["a", "b", "c", "f"])
+    );
+}
+
+/// What this Mac published of its membership log, in order, where a rewrite sheds the body
+/// of the last record its egress stepped past, with the members cursor's placing broken as
+/// `broken` says (or whole).
+///
+/// It writes `a`, `b` and `c~body`, which are published; the log is rewritten without `a`
+/// and with `c`'s body shed (`c~`: other bytes, the same id), fed to no egress; then it
+/// writes `d` and `e`.
+fn published_across_a_shed(broken: Option<Mutant>) -> Vec<String> {
+    let lab = Lab::new();
+    let (mac, fake, egress, start) = members_mac(&lab, broken);
+    let deadline = || Instant::now() + HANG;
+    for seat in ["seat:a", "seat:b", "seat:c~body"] {
+        fake.append_member(seat.as_bytes());
+    }
+    assert!(egress.wait_members_published(start + 3, deadline()));
+    fake.rewrite_members_to(|record| match record {
+        b"seat:a" => None,
+        b"seat:c~body" => Some(b"seat:c~".to_vec()),
+        kept => Some(kept.to_vec()),
+    });
+    fake.append_member(b"seat:d");
+    fake.append_member(b"seat:e");
+    assert!(egress.wait_members_published(start + 4, deadline()));
+    members_published(&mac)
+}
+
+/// The cursor is placed again by the id of the last record it stepped past, not by the
+/// digest of that record's bytes ([`MembersCursor`], [`Stores::member_id`]): a shed keeps a
+/// record's id and changes its bytes, and the writes after it are published, each once, with
+/// nothing published again.
+///
+/// NEGATIVE CONTROL: `Mutant::PlacedByBytes` (the record known by the digest of its bytes, as
+/// before the slice B review), run here and seen to miss the shed record and publish the
+/// rewritten log from its first record: the seat the log held before the mesh, `b` and the
+/// shed `c` a second time.
+#[test]
+fn a_shed_of_the_last_record_stepped_past_keeps_the_members_cursors_place() {
+    let seats = |names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| format!("seat:{name}")).collect()
+    };
+    assert_eq!(
+        published_across_a_shed(None),
+        seats(&["a", "b", "c~body", "d", "e"])
+    );
+    assert_eq!(
+        published_across_a_shed(Some(Mutant::PlacedByBytes)),
+        seats(&["a", "b", "c~body", "w", "b", "c~", "d", "e"])
+    );
+}
+
+/// What an egress that has stepped past no record reads as unpublished after a rewrite, with
+/// the members cursor's placing broken as `broken` says (or whole): the index it reads from
+/// and the records. Its store holds `w` and `x` before it starts, with the cursor file
+/// `cursors` where one is given (a build before FL-148D's, which names no record) and none
+/// otherwise (the first start of all). It reads the log once, as its first catch-up does;
+/// then the log is rewritten without `w` and another process writes `d`.
+fn unpublished_after_a_rewrite_with_no_step(
+    cursors: Option<&str>,
+    broken: Option<Mutant>,
+) -> (usize, Vec<String>) {
+    let dir = aterm_tempfile::tempdir().expect("a scratch dir");
+    let fake = Fake::new(&dir.path().join("stores"));
+    fake.seed_seat("w");
+    fake.seed_seat("x");
+    let kept = dir.path().join("kept");
+    aterm_uds::private_file::ensure_private_dir(&kept).expect("the cursors' folder");
+    if let Some(text) = cursors {
+        aterm_uds::private_file::write_private(&kept, crate::egress::CURSORS_FILE, text.as_bytes())
+            .expect("the cursor file");
+    }
+    let egress = Egress::new(Arc::clone(&fake) as Arc<dyn Stores>, &kept);
+    egress.break_for_test(broken);
+    egress.begin().expect("the egress begins");
+    assert_eq!(
+        egress.members_unpublished().expect("the log"),
+        (2, Vec::new(), 2)
+    );
+    if broken.is_none() {
+        let named = format!("m 2\ng 0 - {}\n", hex(&stores::digest(b"seat:x")));
+        assert_eq!(
+            std::fs::read_to_string(kept.join(crate::egress::CURSORS_FILE)).expect("the file"),
+            named,
+            "the record before the cursor names its place, on disk"
+        );
+    }
+
+    fake.rewrite_members(|record| record != b"seat:w");
+    fake.append_member(b"seat:d");
+    let (from, records, length) = egress.members_unpublished().expect("the rewritten log");
+    assert_eq!(length, 2);
+    let records = records
+        .into_iter()
+        .map(|record| String::from_utf8(record).expect("a seat"))
+        .collect();
+    (from, records)
+}
+
+/// A record names the cursor's place before the cursor steps past any ([`MembersCursor`]): a
+/// cursor that starts at the log's length, on the first start of all or from a file a build
+/// before FL-148D wrote, reads the record before it at its first read of the log, so a
+/// rewrite that comes before this Mac publishes anything leaves exactly the writes since
+/// unpublished.
+///
+/// NEGATIVE CONTROL: `Mutant::Unanchored` (no record read for a cursor that stepped past
+/// none, as before the slice B review), run here and seen to read the rewritten log from its
+/// first record, `x` with `d`: each Mac would publish its whole log at its first rewrite.
+#[test]
+fn a_cursor_that_stepped_past_no_record_is_named_before_a_rewrite() {
+    for cursors in [None, Some("m 2\n")] {
+        assert_eq!(
+            unpublished_after_a_rewrite_with_no_step(cursors, None),
+            (1, vec!["seat:d".to_owned()]),
+            "{cursors:?}"
+        );
+        assert_eq!(
+            unpublished_after_a_rewrite_with_no_step(cursors, Some(Mutant::Unanchored)),
+            (0, vec!["seat:x".to_owned(), "seat:d".to_owned()]),
+            "{cursors:?}"
+        );
+    }
 }
 
 /// A record the mesh delivered whose feed the egress never read (dropped from a full queue, or

@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     Error, Result,
-    att::{Compiled, View, decode, pack},
+    att::{Compiled, View, pack},
     catalog::Descriptor,
     database::Command,
     documents::{application, log::Log},
@@ -586,6 +586,7 @@ impl Registry {
                 let command = Command::Write {
                     request: crate::crypto::random()?,
                     changes,
+                    said: None,
                 };
                 application::append(session, store, &command.encode()?)?;
                 Ok(scope)
@@ -677,7 +678,7 @@ impl Registry {
             |session, store, scope| {
                 session.writer()?;
                 let mut seeded = Seeded::default();
-                let mut log = Log::read_with(session, store, scope, decode)?;
+                let mut log = Log::read_with(session, store, scope, compiled.decoder())?;
                 log.writable(session.actor())?;
                 let mut view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
@@ -692,7 +693,11 @@ impl Registry {
                 for (index, mut changes) in packed.into_iter().enumerate() {
                     crate::att::conform(compiled.table, &mut changes)?;
                     let request = typed::request_id(APPLICATION, compiled.table.role, &changes)?;
-                    let command = Command::Write { request, changes };
+                    let command = Command::Write {
+                        request,
+                        changes,
+                        said: None,
+                    };
                     if log.retry(session.actor(), &command)?.is_some() {
                         seeded.retried += 1;
                         continue;
@@ -707,7 +712,7 @@ impl Registry {
                     seeded.records += 1;
                     if index + 1 < packed_len {
                         // Re-read before admitting another append (`Log::append_records_bound`).
-                        log = Log::read_with(session, store, scope, decode)?;
+                        log = Log::read_with(session, store, scope, compiled.decoder())?;
                         view = View::read(compiled.table, session, &log)?;
                     }
                 }
@@ -828,7 +833,7 @@ impl Registry {
             descriptor(compiled),
             |session, store, scope| {
                 session.writer()?;
-                let mut log = Log::read_with(session, store, scope, decode)?;
+                let mut log = Log::read_with(session, store, scope, compiled.decoder())?;
                 log.writable(session.actor())?;
                 let mut view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
@@ -849,11 +854,15 @@ impl Registry {
                         }
                         let request =
                             typed::request_id(APPLICATION, compiled.table.role, &changes)?;
-                        let command = Command::Write { request, changes };
+                        let command = Command::Write {
+                            request,
+                            changes,
+                            said: None,
+                        };
                         if log.retry(session.actor(), &command)?.is_none() {
                             application::append(session, store, &command.encode()?)?;
                             migrated += 1;
-                            log = Log::read_with(session, store, scope, decode)?;
+                            log = Log::read_with(session, store, scope, compiled.decoder())?;
                             view = View::read(compiled.table, session, &log)?;
                         }
                     }
@@ -873,6 +882,7 @@ impl Registry {
                 let command = Command::Write {
                     request,
                     changes: plan.changes,
+                    said: None,
                 };
                 if log.retry(session.actor(), &command)?.is_some() {
                     return Ok(Registered {
@@ -933,7 +943,7 @@ impl Registry {
             descriptor(compiled),
             |session, store, scope| {
                 session.writer()?;
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, compiled.decoder())?;
                 log.writable(session.actor())?;
                 let view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
@@ -963,7 +973,11 @@ impl Registry {
                     });
                 }
                 let request = typed::request_id(APPLICATION, compiled.table.role, &changes)?;
-                let command = Command::Write { request, changes };
+                let command = Command::Write {
+                    request,
+                    changes,
+                    said: None,
+                };
                 if log.retry(session.actor(), &command)?.is_some() {
                     return Ok(Discovered {
                         outcome,
@@ -1026,7 +1040,7 @@ impl Registry {
             descriptor(compiled),
             |session, store, scope| {
                 session.writer()?;
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, compiled.decoder())?;
                 log.writable(session.actor())?;
                 let view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
@@ -1066,7 +1080,11 @@ impl Registry {
                     return Ok(done(0));
                 }
                 let request = typed::request_id(APPLICATION, compiled.table.role, &changes)?;
-                let command = Command::Write { request, changes };
+                let command = Command::Write {
+                    request,
+                    changes,
+                    said: None,
+                };
                 if log.retry(session.actor(), &command)?.is_some() {
                     return Ok(done(0));
                 }
@@ -1097,7 +1115,7 @@ impl Registry {
             &self.paths,
             descriptor(compiled),
             |session, store, scope| {
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, compiled.decoder())?;
                 let view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
                     return Ok(quiet(Outcome::Incomplete));
@@ -1133,7 +1151,7 @@ impl Registry {
             &self.paths,
             descriptor(compiled),
             |session, store, scope| {
-                let log = Log::read_with(session, store, scope, decode)?;
+                let log = Log::read_with(session, store, scope, compiled.decoder())?;
                 let view = View::read(compiled.table, session, &log)?;
                 let inventory = || {
                     let ids: BTreeSet<Digest> = view.ops.iter().map(|op| op.id).collect();
@@ -1231,6 +1249,7 @@ impl Registry {
                     let command = Command::Write {
                         request: crate::crypto::random()?,
                         changes,
+                        said: None,
                     };
                     application::append(session, store, &command.encode()?)?;
                 }

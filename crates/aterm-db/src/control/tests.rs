@@ -285,7 +285,7 @@ fn a_dial_its_peer_closes_before_answering_for_contention_is_busy() {
         let mut preferred = Repair::default();
         let _round = low
             .peers
-            .acquire_on(high.actor, &mut preferred, true, until)
+            .acquire_on(high.actor, &mut preferred, true, true, until)
             .unwrap();
         let (responded, dialed, repair) = dial(low, high);
         let refusal = responded.unwrap_err().to_string();
@@ -1559,7 +1559,7 @@ fn either_direction_refuses_a_second_channel_for_the_same_peer_before_inventory(
         let mut held = Repair::default();
         let lease = endpoint
             .peers
-            .acquire_on(peer.actor, &mut held, true, Instant::now())
+            .acquire_on(peer.actor, &mut held, true, true, Instant::now())
             .unwrap();
         let proof = NodeProof {
             node: peer.identity.node().into(),
@@ -3891,5 +3891,37 @@ impl<S: Write> Write for Tally<'_, S> {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// What each negotiated database protocol lets table repair do: `atdb/9` reconciles conflict
+/// proofs by range; the released `atdb/7` (0.203.0) and `atdb/8` (0.204.0 to 0.206.0) keep the
+/// whole proof list their builds read, which a range frame would break; every protocol before
+/// `atdb/7`, and a peer that offers none, is refused table repair by the ALPN it was negotiated by.
+#[test]
+fn each_database_protocol_maps_to_the_table_repair_its_peers_speak() {
+    use crate::replica::Tables;
+    for (alpn, tables) in [
+        (Some(fleet::ALPN_DATABASE_PROOFS), Tables::Ranges),
+        (Some(fleet::ALPN_DATABASE_RANGES), Tables::ProofList),
+        (Some(fleet::ALPN_DATABASE_RECONCILE), Tables::ProofList),
+        (Some(fleet::ALPN_DATABASE_DUPLEX), Tables::Refused("atdb/6")),
+        (Some(fleet::ALPN_DATABASE_DELTA), Tables::Refused("atdb/5")),
+        (
+            Some(fleet::ALPN_DATABASE_FRONTIER),
+            Tables::Refused("atdb/4"),
+        ),
+        (
+            Some(fleet::ALPN_DATABASE_CREDENTIALS),
+            Tables::Refused("atdb/3"),
+        ),
+        (Some(fleet::ALPN_DATABASE_REPAIR), Tables::Refused("atdb/2")),
+        (None, Tables::Refused("no ALPN")),
+    ] {
+        let protocol = Protocol::from_alpn(alpn);
+        assert_eq!(protocol.tables(), tables, "{}", protocol.alpn());
+        if let Some(alpn) = alpn {
+            assert_eq!(protocol.alpn().as_bytes(), alpn);
+        }
     }
 }

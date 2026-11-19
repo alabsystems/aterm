@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aterm_agent::ready::{Ready, Signal};
 use aterm_spec::host::could_not_run;
@@ -795,8 +795,9 @@ pub fn thread_stack(pid: u32, log: &Path, thread: Option<&str>) -> String {
         .join("\n")
 }
 
-/// A `ctl` client that has not exited by now is hung.
-pub const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
+/// A `ctl` client still running once what this test binary started (the client, the instance it
+/// asks) made no CPU or I/O progress for this long is hung ([`crate::patience`]).
+pub const CLIENT_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(120);
 
 /// `aterm ctl --sock <sock> <args…>` against `inst`. A discovery verb's probe (`ls`, `survey`,
 /// `brief`) waits the hang detector ([`aterm_ctl::PROBE_WITHIN_SEAM`]), not its 2 s: the instance
@@ -820,8 +821,8 @@ pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
     cmd
 }
 
-/// Run `aterm drive <args…>` in `root`'s scratch environment with `extra` and `cwd` under
-/// [`CLIENT_EXIT_DEADLINE`].
+/// Run `aterm drive <args…>` in `root`'s scratch environment with `extra` and `cwd`, killed as
+/// hung after [`CLIENT_NO_PROGRESS_WINDOW`] without progress.
 pub fn drive_in(root: &Path, args: &[&str], extra: &[(&str, &str)], cwd: Option<&Path>) -> Output {
     let aterm = launch_isolation::aterm_executable();
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
@@ -839,8 +840,8 @@ pub fn drive_in(root: &Path, args: &[&str], extra: &[(&str, &str)], cwd: Option<
         cmd.current_dir(cwd);
     }
     let child = cmd.spawn().expect("spawn aterm drive");
-    child_output::wait_and_read(child, Instant::now() + CLIENT_EXIT_DEADLINE)
-        .unwrap_or_else(|| panic!("aterm drive {args:?} did not exit in time"))
+    child_output::wait_and_read(child, CLIENT_NO_PROGRESS_WINDOW)
+        .unwrap_or_else(|why| panic!("aterm drive {args:?} was killed before it exited: {why}"))
 }
 
 /// What a finished client `out` said, for a failure's message.
@@ -857,8 +858,8 @@ pub fn said(out: &Output) -> String {
 pub fn ctl(inst: &Instance, args: &[&str]) -> Output {
     until_served(|| {
         let child = client_command(inst, args).spawn().expect("spawn aterm ctl");
-        child_output::wait_and_read(child, Instant::now() + CLIENT_EXIT_DEADLINE)
-            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+        child_output::wait_and_read(child, CLIENT_NO_PROGRESS_WINDOW)
+            .unwrap_or_else(|why| panic!("aterm ctl {args:?} was killed before it exited: {why}"))
     })
 }
 
@@ -866,7 +867,7 @@ pub fn ctl(inst: &Instance, args: &[&str]) -> Output {
 pub fn subscribed(inst: &Instance, args: &[&str]) -> Child {
     let mut request = vec!["subscribe"];
     request.extend_from_slice(args);
-    let give_up = Instant::now() + MUST_HAPPEN;
+    let mut patience = crate::patience::Patience::new(MUST_HAPPEN);
     loop {
         let mut child = client_command(inst, &request)
             .spawn()
@@ -877,20 +878,28 @@ pub fn subscribed(inst: &Instance, args: &[&str]) -> Child {
                 line.trim_start_matches("aterm-ctl: ")
                     .starts_with("OK subscribe")
             },
-            Instant::now() + CLIENT_EXIT_DEADLINE,
+            CLIENT_NO_PROGRESS_WINDOW,
         );
         match acked {
             Ok(()) => return child,
             Err(child_output::NoLine::Exited(out))
-                if (was_never_accepted(&out) || was_turned_away(&out))
-                    && Instant::now() < give_up => {}
+                if was_never_accepted(&out) || was_turned_away(&out) =>
+            {
+                if let Some(why) = patience.spent() {
+                    panic!(
+                        "aterm ctl {request:?} was never served ({why}); its last answer:\n{}",
+                        said(&out)
+                    );
+                }
+            }
             Err(child_output::NoLine::Exited(out)) => panic!(
                 "aterm ctl {request:?} ended before its subscription was acknowledged:\n{}",
                 said(&out)
             ),
-            Err(child_output::NoLine::Hung(stderr)) => panic!(
-                "aterm ctl {request:?} was not acknowledged within {}s; its stderr:\n{stderr}",
-                CLIENT_EXIT_DEADLINE.as_secs()
+            Err(child_output::NoLine::Hung { why, stderr }) => panic!(
+                "aterm ctl {request:?} was given up on before its subscription was \
+                 acknowledged (reaped, killed first where it still ran): {why}; its \
+                 stderr:\n{stderr}"
             ),
             Err(child_output::NoLine::OutputLimit { stream, captured }) => panic!(
                 "aterm ctl {request:?} reached the {} byte {stream} diagnostic limit before \

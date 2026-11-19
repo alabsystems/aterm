@@ -120,8 +120,16 @@ fn complete_with(
         completed.email = Some(seen.clone());
     }
     // Capture source policy before taking the login locks. The final receipt
-    // also checks the retained source under its native admission locks.
-    let source = super::super::accounts_sync::codex_completion_source(env, &completed)?;
+    // also checks the retained source under its native admission locks. A lab not read yet
+    // vouches for no account's metadata: the automatic completion has nothing to do until it is
+    // read, and one a person asked for is refused in its words.
+    let source = match super::super::accounts_sync::codex_completion_read(env, &completed)? {
+        super::super::accounts_sync::CodexCompletion::Read(source) => source,
+        super::super::accounts_sync::CodexCompletion::LabPending(_) if asked.is_none() => {
+            return Ok(None);
+        }
+        super::super::accounts_sync::CodexCompletion::LabPending(why) => return Err(why),
+    };
     let _signing = take(&store)?;
     let _held = store
         .acquire_bounded()

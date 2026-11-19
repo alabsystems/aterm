@@ -38,7 +38,7 @@ use crate::model::Probe;
 use crate::port::{Cmd, System};
 use aterm_process_facts::services::Service;
 use aterm_uds::services::Look;
-use aterm_vitals::services::{FSEVENTSD, Size, followed_from, large_bar, size};
+use aterm_vitals::services::{FSEVENTSD, Size, followed_from, size};
 use aterm_vitals::words::mem;
 
 /// The item's id, as `aterm init --only` and every remedy that names it spell it.
@@ -51,11 +51,8 @@ pub const RESTART_WITHIN: Duration = Duration::from_secs(90);
 /// How often that wait looks.
 pub const POLL: Duration = Duration::from_millis(250);
 
-/// How long after a restart was sent no run restarts fseventsd again.
-pub const RECENT: Duration = Duration::from_mins(5);
-
-/// The file under the account's state root that records the last restart sent ([`Sent`]).
-pub const STAMP: &str = "fseventsd-restart";
+pub use aterm_types::macos_setup::fseventsd::{RECENT, STAMP, Sent, stamp_path};
+use aterm_types::macos_setup::fseventsd::{followed, holds};
 
 /// `sudo`'s path.
 const SUDO: &str = "/usr/bin/sudo";
@@ -68,44 +65,6 @@ pub const NO_TTY: &str = "restarting it asks for your password, and this run has
 pub const NOT_ADMIN: &str = "restarting it takes an administrator's password, and this account \
                              is not an administrator of this Mac: an administrator's account \
                              restarts it, as does a restart of the Mac";
-
-/// One restart sent: the process signalled, by pid and start second, and when, unix seconds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Sent {
-    /// The pid signalled.
-    pub pid: u32,
-    /// When that process started, unix seconds.
-    pub start_s: u64,
-    /// When the signal was sent, unix seconds.
-    pub at_s: u64,
-}
-
-impl Sent {
-    /// The record's one line: `<pid> <start second> <sent second>`.
-    #[must_use]
-    pub fn line(&self) -> String {
-        format!("{} {} {}\n", self.pid, self.start_s, self.at_s)
-    }
-
-    /// The record `bytes` hold; `None` for anything but one such line.
-    #[must_use]
-    pub fn parse(bytes: &[u8]) -> Option<Self> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let mut words = text.split_whitespace();
-        let sent = Self {
-            pid: crate::parse_uint(words.next()?)?,
-            start_s: crate::parse_uint(words.next()?)?,
-            at_s: crate::parse_uint(words.next()?)?,
-        };
-        words.next().is_none().then_some(sent)
-    }
-}
-
-/// Where restarts are recorded: [`STAMP`] under this account's state root.
-#[must_use]
-pub fn stamp_path() -> Option<PathBuf> {
-    aterm_types::dirs::account_state_dir().map(|root| root.join(STAMP))
-}
 
 /// `init.fseventsd`: restarts fseventsd as root while it holds past its bar, as the port reads
 /// it ([`System::service`]), in a run whose `--only` names the item.
@@ -162,7 +121,7 @@ impl Fseventsd {
     /// the service holds from the margin under the large bar ([`followed_from`]), as the
     /// window's watch keeps a service large, and it is alone in its coalition.
     fn wants(&self, service: &Service, total: u64) -> bool {
-        self.named && service.live == 1 && service.footprint >= followed_from(total)
+        self.named && followed(service.footprint, service.live, total)
     }
 
     /// The restart sent within [`RECENT`], as [`Self::stamp`] records it.
@@ -213,21 +172,6 @@ pub fn place() -> crate::engine::Place {
         remedy: aterm_converge::Remedy::Init {
             only: ID.to_owned(),
         },
-    }
-}
-
-/// What a fseventsd of `footprint` bytes holds on a Mac of `total`, against the bar.
-fn holds(footprint: u64, total: u64) -> String {
-    let bar = mem(large_bar(total));
-    match size(footprint, total) {
-        Size::Usual if footprint >= followed_from(total) => format!(
-            "fseventsd holds {}, within an eighth under the {bar} bar",
-            mem(footprint)
-        ),
-        Size::Usual => format!("fseventsd holds {}, under the {bar} bar", mem(footprint)),
-        Size::Large | Size::Huge => {
-            format!("fseventsd holds {}, past the {bar} bar", mem(footprint))
-        }
     }
 }
 

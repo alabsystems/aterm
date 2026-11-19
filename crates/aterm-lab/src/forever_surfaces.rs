@@ -2967,7 +2967,7 @@ pub fn local_of(ls: &str, sid: &str) -> Option<String> {
         let f: Vec<&str> = l.split_whitespace().collect();
         let at = f
             .iter()
-            .position(|t| aterm_types::control_verbs::is_minted_sid(t))?;
+            .position(|t| aterm_types::control_request::Sid::parse(t).is_some())?;
         let local = f[..at].last()?;
         (f[at] == sid && local.bytes().all(|b| b.is_ascii_digit())).then(|| (*local).to_string())
     })

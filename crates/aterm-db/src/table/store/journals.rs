@@ -48,26 +48,26 @@
 //!
 //! What is retained is bounded by its allocation charge: owned path capacity and anchor bytes,
 //! shared table objects and inline cache metadata, the slot array's capacity, and either full
-//! wire/link allocations or compact facts' vector capacity and shared allocations. The bounds
-//! are [`KEPT_TABLES`] tables, [`JOURNAL_BYTES`] per table and [`KEPT_BYTES`] across all entries.
+//! wire allocations with record and custody-digest slices, or compact facts' vector capacity and
+//! shared allocations. The bounds are [`KEPT_TABLES`] tables, [`JOURNAL_BYTES`] per table and
+//! [`KEPT_BYTES`] across all entries.
 //! Asks of one table in a row count as one ask, as the opens of one table in a repair round are.
 //! Where a table's payload does not fit, only tables last asked before its own previous ask (so
 //! it was asked twice since they were) yield room, oldest first; a first ask takes only free room.
 //! When all keys fit, a cycle with more payloads than fit retains those admitted and reads the
 //! rest freshly. New metadata can retire the least recently asked key to obey both bounds; a key
 //! that cannot fit alone is never listed. Outside the entry charge are the cache container and
-//! its single synchronization primitive, allocator rounding, each open's copies, and links still
-//! held by an open after the cache lets them go.
+//! its single synchronization primitive, allocator rounding, each open's selected records, and
+//! slices still held by an open after the cache lets them go.
 
 use super::{
     group::Boundary,
-    replay::{self, Linked, Replay},
+    replay::{self, Links, Replay},
 };
 use crate::{Error, Result, table::signatures::Facts};
 use aterm_journal::{Committed, Limits, Prefix, Retain};
 use aterm_secrets::fsx::JournalSeen;
 use std::{
-    borrow::Cow,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::SystemTime,
@@ -138,7 +138,7 @@ struct Table {
 struct Kept {
     /// Its acknowledgement alone ([`Retain::Digest`]).
     prefix: Prefix,
-    links: Arc<Vec<Linked>>,
+    links: Arc<Links>,
     /// The journal as it stood before the read that kept `links`, where it stands for what that
     /// read found ([`JournalSeen::stands_for`]).
     witnessed: Option<JournalSeen>,
@@ -157,8 +157,8 @@ impl Kept {
     }
 
     fn compact(&mut self) {
-        let facts = Facts::of(self.links.iter().map(|link| &link.wire));
-        self.links = Arc::new(Vec::new());
+        let facts = Facts::of(self.links.wires());
+        self.links = Arc::new(Links::empty());
         self.heap_bytes = charge(&self.links) + facts.allocation_bytes();
         self.detached = Some(facts);
         self.witnessed = None;
@@ -180,9 +180,13 @@ const _: () = {
 /// What one read of a table journal gave: its identified records, the refusal that stopped
 /// their identification, if any, and the witness that stands for the read, if one does.
 pub(super) struct Read {
-    links: Arc<Vec<Linked>>,
+    links: Arc<Links>,
     refused: Option<Error>,
     seen: Option<JournalSeen>,
+    /// The acknowledged prefix `links` were identified from ([`aterm_journal::Retain::Digest`]):
+    /// its file, length and SHA-256, which a later read handed it answers unchanged only where
+    /// every byte hashes to it again (`super::sighting`). Every read of a journal gives it.
+    prefix: Option<Prefix>,
 }
 
 /// What a store kept across sessions keeps of the read of its journal it last stood on
@@ -193,7 +197,8 @@ pub(super) struct Read {
 #[derive(Clone)]
 pub(super) struct Held {
     seen: JournalSeen,
-    links: Arc<Vec<Linked>>,
+    links: Arc<Links>,
+    prefix: Option<Prefix>,
 }
 
 impl Read {
@@ -204,7 +209,13 @@ impl Read {
         Some(Held {
             seen,
             links: Arc::clone(&self.links),
+            prefix: self.prefix.clone(),
         })
+    }
+
+    /// The acknowledged prefix this read's records were identified from.
+    pub(super) const fn prefix(&self) -> Option<&Prefix> {
+        self.prefix.as_ref()
     }
 
     /// The witnessed operation IDs, without copying wires or authenticating their envelopes.
@@ -216,15 +227,11 @@ impl Read {
         replay::repair_ids(&self.links, self.refused, acknowledged)
     }
 
-    /// This read's records witnessed against `acknowledged` ([`replay::witnessed`]). Replay clones
-    /// share immutable wires and their signature facts. A store taking a wire's bytes moves them
-    /// where nothing keeps them, and copies them where a kept table does.
+    /// Witness the complete boundary before exposing selected records.
+    /// Replays share bounded immutable blocks when ownership fits the eager
+    /// allocation bound; other ranges own only their selected entries.
     pub(super) fn witnessed(self, acknowledged: impl Into<Boundary>) -> Result<Replay> {
-        let acknowledged = acknowledged.into();
-        match Arc::try_unwrap(self.links) {
-            Ok(links) => replay::witnessed(Cow::Owned(links), self.refused, acknowledged),
-            Err(links) => replay::witnessed(Cow::Borrowed(&links), self.refused, acknowledged),
-        }
+        replay::witnessed_cached(self.links, self.refused, acknowledged)
     }
 
     /// This read's records after the prefix `held` witnesses, which a store kept across sessions
@@ -234,7 +241,7 @@ impl Read {
         acknowledged: impl Into<Boundary>,
         held: super::Witness,
     ) -> Result<Option<Replay>> {
-        replay::witnessed_after(&self.links, self.refused, acknowledged, held)
+        replay::witnessed_after(self.links, self.refused, acknowledged, held)
     }
 }
 
@@ -275,6 +282,7 @@ pub(super) fn read_held(
             links: Arc::clone(&held.links),
             refused: None,
             seen: Some(held.seen),
+            prefix: held.prefix.clone(),
         });
     }
     read(dir, anchor, limits)
@@ -340,15 +348,9 @@ impl List {
     }
 }
 
-/// The shared vector object, link capacity and complete wire allocations.
-fn charge(links: &Vec<Linked>) -> usize {
-    size_of::<Vec<Linked>>()
-        + 2 * size_of::<usize>()
-        + links
-            .iter()
-            .map(|link| link.wire.allocation_bytes())
-            .sum::<usize>()
-        + links.capacity() * size_of::<Linked>()
+/// Both immutable slices, their shared objects and complete wire allocations.
+fn charge(links: &Links) -> usize {
+    links.allocation_bytes()
 }
 
 impl Journals {
@@ -397,6 +399,7 @@ impl Journals {
                     links: Arc::clone(&kept.links),
                     refused: None,
                     seen,
+                    prefix: Some(kept.prefix.clone()),
                 });
             }
             list.slots
@@ -432,15 +435,16 @@ impl Journals {
                 (known.prefix.clone(), Arc::clone(&known.links), None)
             }
             Committed::Extended { records, prefix } => {
-                let mut links = known.as_ref().ok_or_else(unknown)?.links.as_ref().clone();
-                links.reserve_exact(records.len());
-                let refused = replay::identify_onto(&mut links, records).err();
+                let (links, refused) = Links::identify(
+                    Some(known.as_ref().ok_or_else(unknown)?.links.as_ref()),
+                    records,
+                    None,
+                );
                 (prefix, Arc::new(links), refused)
             }
             Committed::Rebuilt { records, prefix } => {
-                let mut links = Vec::with_capacity(records.len());
                 let facts = known.as_ref().and_then(|known| known.detached.as_ref());
-                let refused = replay::identify_onto_with(&mut links, records, facts).err();
+                let (links, refused) = Links::identify(None, records, facts);
                 (prefix, Arc::new(links), refused)
             }
         };
@@ -449,7 +453,7 @@ impl Journals {
                 &table,
                 previous,
                 Kept {
-                    prefix,
+                    prefix: prefix.clone(),
                     links: Arc::clone(&links),
                     witnessed,
                     hits: 0,
@@ -463,6 +467,7 @@ impl Journals {
             links,
             refused,
             seen: witnessed,
+            prefix: Some(prefix),
         })
     }
 

@@ -80,11 +80,11 @@ impl EngineInput {
             git_dir,
             commit,
         };
-        selected.validate()?;
+        selected.pinned_commit()?;
         Ok(selected)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn pinned_commit(&self) -> Result<aterm_verify::engine::Commit, String> {
         let named = aterm_verify::engine::Named::Pinned {
             git_dir: self.git_dir.clone(),
             commit: self.commit.clone(),
@@ -92,7 +92,6 @@ impl EngineInput {
         aterm_verify::engine::Commit::read(&named, &aterm_verify::engine::bounded, &|_, _| {
             Err("a selected release-input engine never imports another policy".into())
         })
-        .map(|_| ())
         .map_err(|error| error.why)
     }
 
@@ -107,7 +106,6 @@ impl EngineInput {
         &self,
         command: &Command,
     ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, String> {
-        self.validate()?;
         let mut environment = crate::check_content::effective_environment(command);
         let encoded = crate::check_content::os_bytes;
         for (name, expected) in [
@@ -133,7 +131,7 @@ impl EngineInput {
         Ok(environment)
     }
 
-    fn bind(&self, part: &mut impl FnMut(&[u8])) {
+    fn bind_authority(&self, part: &mut impl FnMut(&[u8])) {
         match &self.source {
             EnginePolicySource::Repository(repository) => {
                 part(b"repository");
@@ -142,7 +140,6 @@ impl EngineInput {
             #[cfg(test)]
             EnginePolicySource::LocalFixture => part(b"local-fixture"),
         }
-        part(self.commit.as_bytes());
     }
 }
 
@@ -1279,6 +1276,7 @@ pub fn detach_launcher(command: &mut Command) {
 /// Explain a key without retaining environment values. These digests make a missed reuse
 /// attributable to a changed input rather than an opaque change of the combined seal.
 pub fn describe(command: &Command, seal: &str, engine: &EngineInput) -> Result<String, String> {
+    engine.pinned_commit()?;
     let _validated = engine.environment(command)?;
     let digest = |bytes: &[u8]| {
         let mut hash = aterm_digest::Sha256::new();
@@ -1339,8 +1337,30 @@ pub fn context(
         hash.update((bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
     };
-    part(b"aterm-preflight-context-v2");
-    engine.bind(&mut part);
+    part(b"aterm-preflight-reader-context-v3");
+    let mut environment = engine.environment(command)?;
+    engine.bind_authority(&mut part);
+    // Only individual successful readers can carry across policy-equivalent commits.
+    // Keep the complete judgment pinned to the selected commit in identity() below.
+    let aterm_verify::engine::Files {
+        baseline,
+        registry,
+        sha: _,
+        shown: _,
+    } = aterm_verify::engine::Files::at_commit(
+        &engine.pinned_commit()?,
+        &aterm_verify::engine::bounded,
+    );
+    if let (Ok(baseline), Ok(registry)) = (baseline, registry) {
+        part(b"source-reader-policy");
+        part(baseline.as_bytes());
+        part(registry.as_bytes());
+        environment.remove(aterm_verify::engine::COMMIT_ENV.as_bytes());
+    } else {
+        // An incomplete policy can never establish equivalence to another commit.
+        part(b"pinned-commit");
+        part(engine.commit.as_bytes());
+    }
     part(
         crate::check_content::context_with_environment(
             &driver,
@@ -1348,7 +1368,7 @@ pub fn context(
             command,
             crate::check_content::ReleaseHalf::Tree,
             crate::check_content::Admission::WaitDefault,
-            engine.environment(command)?,
+            environment,
         )
         .as_bytes(),
     );
@@ -1409,7 +1429,9 @@ pub fn identity(
         hash.update(bytes);
     };
     part(b"aterm-release-input-v2");
-    engine.bind(&mut part);
+    engine.pinned_commit()?;
+    engine.bind_authority(&mut part);
+    part(engine.commit.as_bytes());
     part(tree.as_bytes());
     part(base.as_bytes());
     let base_commit = git

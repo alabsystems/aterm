@@ -33,20 +33,28 @@
 //! reads a committed cell, a queued new row or a held write's cell as a change again.
 
 use super::write::{self, Env, Refusal, Said, Target, Wrote, problem};
-use crate::{
-    att,
-    typed::{
-        Collection,
-        grid::{self, Absent, Base, Seen},
-    },
+use crate::typed::{
+    Collection,
+    grid::{self, Absent, Base, Seen},
 };
-use aterm_file::{Draft, Face, File, Name, OwnerAct, Snapshot, exit, snapshot::PK};
+use aterm_file::{Draft, Face, File, Name, OwnerAct, exit, snapshot::PK};
 use aterm_json::{Map, Value};
 use aterm_secrets::client::Paths;
 use std::{cell::Cell, collections::BTreeMap, path::Path};
 
-/// The format word of a stored baseline.
-pub const FORMAT: &str = "aterm-file-base/1";
+/// The format word of a stored baseline: JSON Lines, a header, one line a row in key order
+/// ([`Baseline::row_line`]) and a last line holding the SHA-256 of every byte before it, so a
+/// pass after one record writes the baseline from the lines it kept of every other row
+/// (package TK-09) and a read never takes a cut file for a short table.
+pub const FORMAT: &str = "aterm-file-base/2";
+
+// The face's bounds are the grid's that opens it: aterm-file cannot name amacs, so they are
+// held equal here.
+const _: () = assert!(
+    aterm_file::MAX_FACE_BYTES == amacs::table::MAX_TABLE_BYTES as u64
+        && aterm_file::MAX_FACE_RECORDS == amacs::table::MAX_TABLE_RECORDS
+        && aterm_file::MAX_FACE_COLUMNS == amacs::table::MAX_TABLE_COLUMNS
+);
 
 /// How long a commit waits for another commit of the same face: past one publisher bound and
 /// the pass after it.
@@ -55,73 +63,186 @@ const COMMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// What one revision's face showed, and what each cell's register held then.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Baseline {
-    /// The grid's baseline of the projection: every stored cell's text and candidates.
+    /// The grid's baseline of the projection: every stored cell's text and candidates, of every
+    /// column, the ones the face leaves out included (`aterm file set` writes against them).
     pub(super) grid: Base,
-    /// The face's header cells but the key's, in face order.
+    /// The face's header cells but the key's, in face order: the columns the face shows
+    /// ([`aterm_file::snapshot::face_columns`]).
     pub(super) header: Vec<String>,
     /// Each row's non-empty face cells by column name, the computed ones included.
     pub(super) cells: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Baseline {
-    /// The baseline of `snapshot`, projected with the grid baseline `grid`: the bytes a pass
-    /// keeps beside the snapshot under its revision.
-    pub(super) fn encode(grid: &Base, snapshot: &Snapshot) -> Option<Vec<u8>> {
-        let header: Vec<Value> = snapshot
-            .columns
+    /// The header line of a baseline of `grid`'s table and collection whose face shows
+    /// `face`'s columns (every column of the snapshot but its key, in face order).
+    pub(super) fn header_line(grid: &Base, face: &[&aterm_file::Column]) -> String {
+        let header: Vec<Value> = face
             .iter()
             .filter(|column| column.name != PK)
             .map(|column| Value::from(column.header(0)))
             .collect();
-        let rows: Map = snapshot
-            .rows
-            .iter()
-            .map(|row| {
-                let cells: Map = row
-                    .cells
+        let mut object = Map::new();
+        object.insert("format".to_owned(), Value::from(FORMAT));
+        object.insert("table".to_owned(), Value::from(grid.table.as_str()));
+        object.insert(
+            "collection".to_owned(),
+            Value::from(grid.collection.as_str()),
+        );
+        object.insert("version".to_owned(), Value::from(grid.version));
+        object.insert(
+            "grid".to_owned(),
+            Value::Array(
+                grid.header
                     .iter()
-                    .map(|(name, text)| (name.clone(), Value::from(text.as_str())))
-                    .collect();
-                (row.pk.clone(), Value::Object(cells))
+                    .map(|cell| Value::from(cell.as_str()))
+                    .collect(),
+            ),
+        );
+        object.insert("header".to_owned(), Value::Array(header));
+        Value::Object(object).to_string()
+    }
+
+    /// One row's line: what the grid showed of each of its cells and the candidates each held
+    /// (`seen`), and each non-empty cell as the snapshot shows it (`cells`).
+    pub(super) fn row_line(
+        pk: &str,
+        seen: &BTreeMap<String, Seen>,
+        cells: &BTreeMap<String, String>,
+    ) -> String {
+        let digests = |ops: &[astream_wire::sync::Digest]| {
+            Value::Array(
+                ops.iter()
+                    .map(|op| Value::from(aterm_codec::hex::encode_lower(op)))
+                    .collect(),
+            )
+        };
+        let grid: Map = seen
+            .iter()
+            .map(|(name, seen)| {
+                let mut cell = Map::new();
+                cell.insert("shown".to_owned(), Value::from(seen.shown.as_str()));
+                cell.insert("candidates".to_owned(), digests(&seen.candidates));
+                cell.insert(
+                    "elements".to_owned(),
+                    Value::Object(
+                        seen.elements
+                            .iter()
+                            .map(|(element, ops)| (element.clone(), digests(ops)))
+                            .collect(),
+                    ),
+                );
+                cell.insert("raw".to_owned(), Value::from(seen.raw));
+                (name.clone(), Value::Object(cell))
             })
             .collect();
         let mut object = Map::new();
-        object.insert("format".to_owned(), Value::from(FORMAT));
-        object.insert("grid".to_owned(), grid.to_json());
-        object.insert("header".to_owned(), Value::Array(header));
-        object.insert("cells".to_owned(), Value::Object(rows));
-        aterm_json::to_vec(&Value::Object(object)).ok()
+        object.insert("pk".to_owned(), Value::from(pk));
+        object.insert("grid".to_owned(), Value::Object(grid));
+        object.insert(
+            "cells".to_owned(),
+            Value::Object(
+                cells
+                    .iter()
+                    .map(|(name, text)| (name.clone(), Value::from(text.as_str())))
+                    .collect(),
+            ),
+        );
+        Value::Object(object).to_string()
     }
 
-    /// Read a stored baseline; `None` for bytes this build does not read.
+    /// A baseline's bytes from its header line and its rows' lines, in key order.
+    pub(super) fn assemble<'a>(header: &str, rows: impl Iterator<Item = &'a str>) -> Vec<u8> {
+        let mut text = String::with_capacity(header.len() + 1);
+        text.push_str(header);
+        text.push('\n');
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        let digest = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(text.as_bytes()));
+        text.push_str(&format!("{{\"end\":\"{digest}\"}}\n"));
+        text.into_bytes()
+    }
+
+    /// Read a stored baseline; `None` for bytes this build does not read: another format, cut
+    /// short, or changed since they were written.
     pub(super) fn decode(bytes: &[u8]) -> Option<Self> {
-        let value: Value = aterm_json::from_slice(bytes).ok()?;
-        if value.get("format")?.as_str()? != FORMAT {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let (body, last) = text.strip_suffix('\n')?.rsplit_once('\n')?;
+        let end: Value = aterm_json::from_str(last).ok()?;
+        let covered = &text[..=body.len()];
+        if end.get("end")?.as_str()?
+            != aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(covered.as_bytes()))
+        {
             return None;
         }
-        let grid = Base::from_json(value.get("grid")?).ok()?;
-        let header = value
-            .get("header")?
-            .as_array()?
-            .iter()
-            .map(|cell| cell.as_str().map(str::to_owned))
-            .collect::<Option<Vec<_>>>()?;
-        let cells = value
-            .get("cells")?
-            .as_object()?
-            .iter()
-            .map(|(pk, row)| {
-                let row = row
-                    .as_object()?
-                    .iter()
-                    .map(|(name, text)| Some((name.clone(), text.as_str()?.to_owned())))
-                    .collect::<Option<BTreeMap<_, _>>>()?;
-                Some((pk.clone(), row))
-            })
-            .collect::<Option<BTreeMap<_, _>>>()?;
+        let mut lines = body.split('\n');
+        let head: Value = aterm_json::from_str(lines.next()?).ok()?;
+        if head.get("format")?.as_str()? != FORMAT {
+            return None;
+        }
+        let strings = |value: &Value| -> Option<Vec<String>> {
+            value
+                .as_array()?
+                .iter()
+                .map(|cell| cell.as_str().map(str::to_owned))
+                .collect()
+        };
+        let digests = |value: &Value| -> Option<Vec<astream_wire::sync::Digest>> {
+            let mut ops = value
+                .as_array()?
+                .iter()
+                .map(|op| crate::database::decode_hex::<32>(op.as_str()?).ok())
+                .collect::<Option<Vec<_>>>()?;
+            ops.sort_unstable();
+            Some(ops)
+        };
+        let mut rows = Vec::new();
+        let mut cells = BTreeMap::new();
+        for line in lines {
+            let row: Value = aterm_json::from_str(line).ok()?;
+            let pk = row.get("pk")?.as_str()?.to_owned();
+            let seen = row
+                .get("grid")?
+                .as_object()?
+                .iter()
+                .map(|(name, cell)| {
+                    let elements = cell
+                        .get("elements")?
+                        .as_object()?
+                        .iter()
+                        .map(|(element, ops)| Some((element.clone(), digests(ops)?)))
+                        .collect::<Option<BTreeMap<_, _>>>()?;
+                    Some((
+                        name.clone(),
+                        Seen {
+                            shown: cell.get("shown")?.as_str()?.to_owned(),
+                            candidates: digests(cell.get("candidates")?)?,
+                            elements,
+                            raw: cell.get("raw")?.as_bool()?,
+                        },
+                    ))
+                })
+                .collect::<Option<BTreeMap<_, _>>>()?;
+            let shown = row
+                .get("cells")?
+                .as_object()?
+                .iter()
+                .map(|(name, text)| Some((name.clone(), text.as_str()?.to_owned())))
+                .collect::<Option<BTreeMap<_, _>>>()?;
+            cells.insert(pk.clone(), shown);
+            rows.push((pk, seen));
+        }
         Some(Self {
-            grid,
-            header,
+            grid: Base {
+                table: head.get("table")?.as_str()?.to_owned(),
+                collection: head.get("collection")?.as_str()?.to_owned(),
+                version: u32::try_from(head.get("version")?.as_u64()?).ok()?,
+                header: strings(head.get("grid")?)?,
+                rows,
+            },
+            header: strings(head.get("header")?)?,
             cells,
         })
     }
@@ -232,9 +353,9 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
             "the face was written at revision {rev}, whose baseline is no longer kept here"
         ));
     };
-    let compiled = match att::find(&baseline.grid.table) {
-        Ok(compiled) => compiled,
-        Err(_) => {
+    let compiled = match target.generation(&baseline.grid.table) {
+        Some(compiled) => compiled,
+        None => {
             return Planned::Refused(format!(
                 "revision {rev} was projected from a table this build does not compile"
             ));
@@ -330,6 +451,30 @@ pub(super) fn plan(target: &Target, text: &str) -> Planned {
                     .all(|(column, text)| row.cell(column) == text.as_str())
         })
     };
+    // A face that leaves out a column a new row needs (`aterm_file::snapshot::face_columns`)
+    // cannot give one its value: such a row is added with `aterm file add`.
+    if !planned.born.is_empty() {
+        let shown: Vec<&str> = baseline
+            .header
+            .iter()
+            .map(|cell| cell.trim_start_matches(grid::READ_ONLY))
+            .collect();
+        let missing: Vec<String> = collection
+            .columns
+            .iter()
+            .filter(|schema| write::required(collection, schema) && !shown.contains(&schema.name))
+            .map(|schema| {
+                format!(
+                    "{}: a new row needs a value here, and this face leaves the column out; add \
+                     the row with `aterm file add {name}`",
+                    schema.name
+                )
+            })
+            .collect();
+        if !missing.is_empty() {
+            return Planned::Problems(missing);
+        }
+    }
     let mut drafts = Vec::new();
     for (pk, edits) in planned.rows {
         let new = planned.born.contains(&pk);

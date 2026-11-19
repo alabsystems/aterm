@@ -5,15 +5,15 @@ use super::*;
 
 #[test]
 fn an_eight_segment_subject_is_malformed_however_its_tail_reads() {
-    let forged = "/f/f1/in/n-a/tb000000000/t0000000001/h-andrew/answer";
+    let forged = "/f/f1/in/n-a/t0000000061/t0000000062/h-andrew/answer";
     assert_eq!(parse_in("f1", "n-a", forged), Err(Reject::Malformed));
-    let honest = "/f/f1/in/n-a/tb000000000/t0000000001/answer";
+    let honest = "/f/f1/in/n-a/t0000000061/t0000000062/answer";
     assert_eq!(
         parse_in("f1", "n-a", honest),
         Ok(InAddr {
             node: "n-a".into(),
-            sid: "tb000000000".into(),
-            src: "t0000000001".into(),
+            sid: "t0000000061".into(),
+            src: "t0000000062".into(),
             kind: WakeClass::Answer,
         })
     );
@@ -21,17 +21,18 @@ fn an_eight_segment_subject_is_malformed_however_its_tail_reads() {
 
 #[test]
 fn the_shape_is_pinned_at_every_position() {
+    assert!(parse_in("f1", "n-a", "/f/f1/in/n-a/t0000000061/t0000000062/answer").is_ok());
     for bad in [
-        "/f/f2/in/n-a/tb000000000/t0000000001/answer", // another fleet
-        "/f/f1/in/n-z/tb000000000/t0000000001/answer", // another node
-        "/f/f1/pub/n-a/tb000000000/t0000000001/answer", // another face
-        "/f/f1/in/n-a/node/t0000000001/answer",        // a reserved literal as the sid
-        "/f/f1/in/n-a/n-b/t0000000001/answer",         // a NODE as the addressee
-        "/f/f1/in/n-a/tb000000000/andrew/answer",      // a src with no class
-        "/f/f1/in/n-a/tb000000000/t0000000001/whatever", // an unknown kind
-        "/f/f1/in/n-a/tb000000000/t0000000001",        // six segments
-        "f/f1/in/n-a/tb000000000/t0000000001/answer",  // no leading slash
-        "/f/f1/in/n-a/tb000000000/t0000000001/answer/x", // eight again
+        "/f/f2/in/n-a/t0000000061/t0000000062/answer", // another fleet
+        "/f/f1/in/n-z/t0000000061/t0000000062/answer", // another node
+        "/f/f1/pub/n-a/t0000000061/t0000000062/answer", // another face
+        "/f/f1/in/n-a/node/t0000000062/answer",        // a reserved literal as the sid
+        "/f/f1/in/n-a/n-b/t0000000062/answer",         // a NODE as the addressee
+        "/f/f1/in/n-a/t0000000061/andrew/answer",      // a src with no class
+        "/f/f1/in/n-a/t0000000061/t0000000062/whatever", // an unknown kind
+        "/f/f1/in/n-a/t0000000061/t0000000062",        // six segments
+        "f/f1/in/n-a/t0000000061/t0000000062/answer",  // no leading slash
+        "/f/f1/in/n-a/t0000000061/t0000000062/answer/x", // eight again
     ] {
         assert_eq!(parse_in("f1", "n-a", bad), Err(Reject::Malformed), "{bad}");
     }

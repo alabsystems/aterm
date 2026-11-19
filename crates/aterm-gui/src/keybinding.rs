@@ -44,7 +44,7 @@ pub(crate) enum Action {
     NextTab,
     /// Cycle to the previous tab (Cmd-Shift-).
     PrevTab,
-    /// Switch to tab `n` (1-based, as the user wrote it; Cmd-1..Cmd-9).
+    /// Switch to shown tab `n` (1-based), independent of session panel numbering.
     SwitchTab(u8),
     /// Split the focused pane vertically — side by side (Cmd-D).
     SplitVertical,
@@ -182,7 +182,7 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+q", "Quit aterm"),
     ("cmd+shift+t", "Reopen Closed Tab"),
     ("cmd+shift+n", "Move Tab to New Window"),
-    ("cmd+shift+m", "Move Tab to Next Window"),
+    ("cmd+shift+m", "Move Tab to Main Window"),
     ("cmd+shift+o", "Open Session in New Window"),
     ("cmd+d", "Split Right"),
     ("cmd+shift+d", "Split Down"),
@@ -200,15 +200,15 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+shift+=", "Increase Font Size"),
     ("cmd+-", "Decrease Font Size"),
     ("cmd+0", "Actual Size"),
-    ("cmd+1", "Switch to Tab 1"),
-    ("cmd+2", "Switch to Tab 2"),
-    ("cmd+3", "Switch to Tab 3"),
-    ("cmd+4", "Switch to Tab 4"),
-    ("cmd+5", "Switch to Tab 5"),
-    ("cmd+6", "Switch to Tab 6"),
-    ("cmd+7", "Switch to Tab 7"),
-    ("cmd+8", "Switch to Tab 8"),
-    ("cmd+9", "Switch to Tab 9"),
+    ("cmd+1", "Select Session 1 (Tab 1 with Panel Hidden)"),
+    ("cmd+2", "Select Session 2 (Tab 2 with Panel Hidden)"),
+    ("cmd+3", "Select Session 3 (Tab 3 with Panel Hidden)"),
+    ("cmd+4", "Select Session 4 (Tab 4 with Panel Hidden)"),
+    ("cmd+5", "Select Session 5 (Tab 5 with Panel Hidden)"),
+    ("cmd+6", "Select Session 6 (Tab 6 with Panel Hidden)"),
+    ("cmd+7", "Select Session 7 (Tab 7 with Panel Hidden)"),
+    ("cmd+8", "Select Session 8 (Tab 8 with Panel Hidden)"),
+    ("cmd+9", "Select Session 9 (Tab 9 with Panel Hidden)"),
 ];
 
 /// The macOS menu bar's other key equivalents: shortcuts `on_key` never sees, because AppKit hands a key equivalent to the menu before the window gets the key.

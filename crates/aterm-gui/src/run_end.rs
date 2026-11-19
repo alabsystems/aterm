@@ -293,6 +293,10 @@ impl App {
         if let Some(host) = self.harness.as_ref() {
             host.shutdown_and_join();
         }
+        // A password sheet still up goes down unanswered with the quit, so the spacing record
+        // names its end and no standing sheet (`App::end_askpass_sheet_at_quit`).
+        #[cfg(target_os = "macos")]
+        self.end_askpass_sheet_at_quit();
         // THE QUIT CLOSES EVERY TAB (but those it carries), THEN EVERY LIVE SESSION'S LOG, HERE
         // (fix unit Q1), where its bye stood: on unix `bye_at_quit` closes the logs, gives the bus
         // those closes within the quit budget, then says `bye quit`; elsewhere they close alone.

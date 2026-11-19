@@ -66,7 +66,7 @@
 use crate::checkout::{self, NO_SIDE_RUNS, NoLazyFetch, NotFetched};
 use crate::engine::Place;
 use crate::init::Holds;
-use crate::init_github::{self, PassWrites, VaultClones, Wrote as PassWrote};
+use crate::init_github::{self, PassWrites, VaultClones};
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
 use crate::port::{Cmd, FileId, Ran, Scratch, System};
@@ -343,7 +343,7 @@ fn apply_with(
         let mut tuned = || {
             (
                 tune(sys, git, clone, &mut record, &dir, &mut failed),
-                PassWrote::Own,
+                init_github::Wrote::Own,
             )
         };
         let tuning = match &writes {

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use agh::cli::{self, Captured, Ctx};
 use agh::config;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use agh::config::Dirs;
 use agh::fx::Fx;
 #[cfg(unix)]
@@ -61,8 +61,9 @@ pub fn scratch(label: &str) -> aterm_tempfile::TempDir {
         .expect("a scratch directory")
 }
 
-/// Creates `dir` (`0700`) and writes `{token}\n` to `dir/name` (`0600`).
-#[cfg(unix)]
+/// Creates `dir` (`0700`) and writes `{token}\n` to `dir/name` (`0600`); on windows each is
+/// made private by its protected access list of the user and SYSTEM.
+#[cfg(any(unix, windows))]
 pub fn write_token(dir: &Path, name: &str, token: &str) -> PathBuf {
     aterm_uds::private_file::create_private_dir(dir).expect("the token directory");
     setup_file(&dir.join(name), format!("{token}\n").as_bytes());
@@ -84,15 +85,25 @@ fn setup_file(path: &Path, bytes: &[u8]) {
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
+/// Writes `path` as a private file: the token user's under a protected access list of the user
+/// and SYSTEM, made so at its creation (`write_private`), in a folder kept so.
+#[cfg(windows)]
+fn setup_file(path: &Path, bytes: &[u8]) {
+    let dir = path.parent().expect("a folder");
+    let name = path.file_name().and_then(|n| n.to_str()).expect("a name");
+    aterm_uds::private_file::write_private(dir, name, bytes)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
 /// `token` and a newline published as vault entry `name` of the store under `home`
 /// (`vault::put_entry_for_tests`): what agh reads in place. No file under `home/.secrets` is read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn vault_entry(home: &Path, name: &str, token: &str) {
     agh::identity::vault::put_entry_for_tests(home, name, Some(format!("{token}\n").as_bytes()));
 }
 
 /// Creates `dirs.config` (`0700`) and writes `text` to `agh.toml` (`0600`).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn write_config(dirs: &Dirs, text: &str) {
     if let Some(parent) = dirs.config.parent() {
         std::fs::create_dir_all(parent).expect("the config directory's parent");
@@ -112,7 +123,7 @@ pub fn canonical_config(root: &Path) -> String {
 }
 
 /// Registers canonical dev/release tokens with `fake` and writes requested token files.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn canonical_tokens(root: &Path, fake: &FakeGithub, dev: bool, release: bool) {
     let dev_token = agh_fake::token("dev");
     let release_token = agh_fake::token("release");
@@ -214,6 +225,20 @@ pub fn chmod(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
+/// `path`, a file or folder made private, opened to every user to read, as `chmod 644` or
+/// `755` opens one on unix: its protected access list of the user and SYSTEM gains an
+/// Everyone read entry (passed on to what a folder holds).
+#[cfg(windows)]
+pub fn open_to_everyone(path: &Path) {
+    use aterm_uds::acl::{Descriptor, Parts, Sid};
+    let me = Sid::token_user().expect("this token's user");
+    let inherit = if path.is_dir() { "OICI" } else { "" };
+    let sddl = format!("D:P(A;{inherit};FA;;;{me})(A;{inherit};FA;;;SY)(A;{inherit};FR;;;WD)");
+    Descriptor::from_sddl(&sddl)
+        .and_then(|open| open.apply_to_path(path, Parts::DACL | Parts::PROTECTED_DACL))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
 /// A fresh path for a tape in `dir` that does not exist yet: `{dir}/{label}.atape`.
 pub fn tape_path(dir: &Path, label: &str) -> PathBuf {
     dir.join(format!("{label}.atape"))
@@ -233,13 +258,13 @@ pub fn run_cli(ctx: &mut Ctx, args: &[&str]) -> u8 {
 }
 
 /// The `[[writers]]` row the M2 tests grant: `fixture-caller` on `alabsystems/aterm`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub const WRITERS: &str =
     "\n[[writers]]\ncaller = \"fixture-caller\"\nrepos = [\"alabsystems/aterm\"]\n";
 
 /// The canonical config plus `extra`, written as agh.toml under `Dirs::under(root)`, and the
 /// router `config::load_for_host` reads back (origin File, so grants count).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn file_router(root: &Path, extra: &str) -> (Dirs, Router) {
     let dirs = Dirs::under(root);
     write_config(&dirs, &format!("{}{extra}", canonical_config(root)));

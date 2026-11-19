@@ -83,6 +83,7 @@ fn a_wait_with_no_deadline_polls_with_none_and_wakes_for_the_keeper() {
             frame_wait: aterm_spec::wait::MUST_HAPPEN,
             policy: IdentityPolicy::SameUid,
             keeper_caps: Cell::new(0),
+            keeper_version: OnceCell::new(),
             syncs: Cell::new(0),
             synced: Cell::new(0),
             retiring: RefCell::new(Vec::new()),

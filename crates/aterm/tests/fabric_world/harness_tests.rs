@@ -166,9 +166,10 @@ fn the_harness_s_aterm_children_go_without_the_runner_s_aterm_settings_but_the_m
     for name in SETTINGS {
         run.env(name, "the-runner's");
     }
-    let out = aterm_uds::deadline::output_until_complete_stdout(
+    let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
         &mut run,
-        Instant::now() + crate::harness::DEADLINE,
+        crate::harness::DEADLINE,
+        "the check's run",
     )
     .unwrap_or_else(|e| panic!("the check's run exits within the hang detector: {e}"));
     let stdout = String::from_utf8_lossy(&out.stdout);

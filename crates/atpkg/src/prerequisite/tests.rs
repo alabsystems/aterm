@@ -1615,6 +1615,17 @@ fn private_namespace_is_fixed_to_held_commands_without_exposing_lean_or_global_s
     let set = session
         .acquire_all(&[Prerequisite::Lake, Prerequisite::Lake])
         .unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let parent = command_directory_parent(&aterm_uds::account::home().unwrap()).unwrap();
+        assert!(set.directory().starts_with(parent));
+        let other = session.acquire_all(&[Prerequisite::Lake]).unwrap();
+        let path = other.directory().to_owned();
+        assert_ne!(set.directory(), path);
+        drop(other);
+        assert!(!path.exists());
+        assert!(set.directory().join("lake").is_file());
+    }
     let entries: Vec<_> = std::fs::read_dir(set.directory.path())
         .unwrap()
         .map(|e| e.unwrap().file_name())
@@ -1662,6 +1673,75 @@ fn private_namespace_is_fixed_to_held_commands_without_exposing_lean_or_global_s
         initial,
         "reapplying an operation namespace is idempotent"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn prerequisite_namespaces_leave_shared_or_redirected_cache_ancestors_untouched() {
+    use std::os::unix::fs::symlink;
+    let home = aterm_tempfile::tempdir().unwrap();
+    let root = command_directory_parent(home.path()).unwrap();
+    let physical = home.path().canonicalize().unwrap();
+    assert_eq!(
+        root,
+        physical.join("Library/Caches/aterm/prerequisite-scopes.noindex")
+    );
+    aterm_uds::private_file::check_private_dir(&root).unwrap();
+    let parent = root.parent().unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(command_directory_parent(&physical).is_err());
+    assert_eq!(
+        std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+        0o770
+    );
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let saved = parent.with_file_name("original");
+    std::fs::rename(parent, &saved).unwrap();
+    symlink(&saved, parent).unwrap();
+    assert!(command_directory_parent(&physical).is_err());
+    assert!(parent.is_symlink());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn overlapping_prerequisites_preserve_live_command_directory_ancestors() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let home = aterm_tempfile::tempdir().unwrap();
+    let root = command_directory_parent(home.path()).unwrap();
+    let acquire = || command_directory_in(&aterm_tempfile::Builder::new(), root.clone()).unwrap();
+    let stamps = |directory: &CommandDirectory| {
+        directory
+            .path()
+            .ancestors()
+            .take_while(|p| p.starts_with(&root))
+            .map(|p| {
+                let m = std::fs::symlink_metadata(p).unwrap();
+                (
+                    m.dev(),
+                    m.ino(),
+                    m.ctime(),
+                    m.ctime_nsec(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = acquire();
+    let initial = stamps(&first);
+    let second = acquire();
+    let third = acquire();
+    assert_eq!(stamps(&first), initial);
+    let third_before = stamps(&third);
+    let retired = first.path().to_owned();
+    drop(first);
+    drop(second);
+    assert!(!retired.exists());
+    let next = acquire();
+    assert_eq!(next.path().parent(), retired.parent());
+    assert_ne!(next.path(), retired);
+    assert_eq!(stamps(&third), third_before);
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

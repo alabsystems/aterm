@@ -1162,7 +1162,17 @@ pub fn drain_more(_master: i32, _buf: &mut [u8], filled: usize) -> usize {
 }
 
 /// Top `buf[filled..]` up with ConPTY output that is already waiting in the pipe, never blocking.
-pub fn drain_available(master: i32, buf: &mut [u8], mut filled: usize) -> usize {
+pub fn drain_available(master: i32, buf: &mut [u8], filled: usize) -> usize {
+    drain_available_observed(master, buf, filled, |_| {})
+}
+
+/// As [`drain_available`], reporting each completed pipe read as the bytes arrive.
+pub fn drain_available_observed(
+    master: i32,
+    buf: &mut [u8],
+    mut filled: usize,
+    mut observed: impl FnMut(usize),
+) -> usize {
     let Some(s) = session(master) else {
         return filled;
     };
@@ -1187,6 +1197,7 @@ pub fn drain_available(master: i32, buf: &mut [u8], mut filled: usize) -> usize 
         if n <= 0 {
             break;
         }
+        observed(n as usize);
         filled += n as usize;
     }
     filled

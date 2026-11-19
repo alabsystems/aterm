@@ -3,14 +3,81 @@
 
 //! macOS Software Update [`Pref`] items and [`Schedule`] check.
 
-use super::defaults::{Pref, Target, Want};
+use super::defaults::{Exports, Pref, Target, Want};
 use super::{Ctx, Item};
-use crate::model::{Effect, PValue, Probe};
+use crate::model::{Effect, PValue, Probe, Read};
 use crate::port::{Cmd, System};
 use serde::Deserialize;
+use std::cell::RefCell;
 
-/// The domain, under `/Library/Preferences`.
-pub const DOMAIN: &str = "com.apple.SoftwareUpdate";
+use aterm_types::macos_setup::baseline::Updates;
+use aterm_types::macos_setup::updates;
+pub use aterm_types::macos_setup::updates::DOMAIN;
+
+/// `softwareupdate`, whose `--schedule` reads and sets checking for updates: a root tool only
+/// this crate runs (census `machines-root-door`).
+pub use super::developer::SOFTWAREUPDATE;
+
+/// [`updates::Reads`] answered from the port's [`System`] as this module's items read it:
+/// `softwareupdate --schedule` as [`Schedule`] reads it, and each key through one
+/// [`Exports`] of [`DOMAIN`] ([`Target::system`], `defaults export` with its path checks and
+/// its empty-domain confirmation), judged as [`Pref`] judges it ([`held`]). `aterm machines
+/// macos-reading` reads through it, as the person: the domain's file is root's own and
+/// world-readable.
+pub(crate) struct Port<'a> {
+    sys: &'a dyn System,
+    exports: RefCell<Exports>,
+}
+
+impl<'a> Port<'a> {
+    /// A reading of `sys`, its domain read once at the first key asked.
+    pub(crate) fn new(sys: &'a dyn System) -> Self {
+        Self {
+            sys,
+            exports: RefCell::new(Exports::default()),
+        }
+    }
+}
+
+impl updates::Reads for Port<'_> {
+    fn schedule(&self) -> Result<String, String> {
+        let cmd = Cmd::new(SOFTWAREUPDATE).arg("--schedule");
+        match self.sys.run(&cmd) {
+            Ok(ran) if ran.success() => Ok(ran.out()),
+            Ok(ran) => Err(format!("softwareupdate --schedule: {}", ran.describe())),
+            Err(e) => Err(format!("softwareupdate --schedule: {e}")),
+        }
+    }
+
+    fn pref(&self, key: &str) -> Result<updates::Held, String> {
+        held(
+            &self
+                .exports
+                .borrow_mut()
+                .read(self.sys, &Target::system(DOMAIN, key)),
+        )
+    }
+}
+
+/// What `read` holds, as [`Pref`]'s `Want::Value(PValue::Bool(_))` judges it: a value that
+/// satisfies a switch ([`PValue::same`]: a boolean, or the `1`/`0` integer) is that switch, no
+/// value is unset, and any other value satisfies neither.
+///
+/// # Errors
+/// The read's reason where it was unusable.
+pub(crate) fn held(read: &Read<PValue>) -> Result<updates::Held, String> {
+    match read {
+        Read::Unusable(why) => Err(why.clone()),
+        Read::Absent => Ok(updates::Held::Unset),
+        Read::Value(value) => Ok([true, false]
+            .into_iter()
+            .find(|on| value.same(&PValue::Bool(*on)))
+            .map_or_else(
+                || updates::Held::Other(value.to_string()),
+                updates::Held::Switch,
+            )),
+    }
+}
 
 /// The `[updates]` table.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -30,48 +97,26 @@ pub struct Table {
 /// The items `table` asks for, one per key, in the order System Settings lists them.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let _ = ctx;
-    let rows: [(Option<bool>, &str, &str, &str); 4] = [
-        (
-            table.automatic_download,
-            "updates.automatic-download",
-            "AutomaticDownload",
-            "download new updates when available",
-        ),
-        (
-            table.automatic_macos_install,
-            "updates.automatic-macos-install",
-            "AutomaticallyInstallMacOSUpdates",
-            "install macOS updates",
-        ),
-        (
-            table.critical,
-            "updates.critical",
-            "CriticalUpdateInstall",
-            "install Security Responses and system files",
-        ),
-        (
-            table.critical,
-            "updates.config-data",
-            "ConfigDataInstall",
-            "install XProtect and other configuration data",
-        ),
-    ];
+    let wanted = Updates::from(table);
     let mut items: Vec<Box<dyn Item>> = Vec::new();
     if let Some(on) = table.automatic_check {
         items.push(Box::new(Schedule { on }));
     }
-    for (wanted, id, key, what) in rows {
-        let Some(on) = wanted else {
+    for key in updates::KEYS {
+        let Some(on) = key.field.of(&wanted) else {
             continue;
         };
         let state = if on { "on" } else { "off" };
-        let title = format!("Software Update: {what} {state} ({DOMAIN} {key})");
+        let title = format!(
+            "Software Update: {} {state} ({DOMAIN} {})",
+            key.what, key.key
+        );
         items.push(Box::new(
             Pref::new(
                 "updates",
-                id.to_owned(),
+                key.id.to_owned(),
                 title,
-                Target::system(DOMAIN, key),
+                Target::system(DOMAIN, key.key),
                 Want::Value(PValue::Bool(on)),
             )
             .felt(Effect::Now)
@@ -81,6 +126,17 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
         ));
     }
     Ok(items)
+}
+
+impl From<&Table> for Updates {
+    fn from(table: &Table) -> Self {
+        Self {
+            automatic_check: table.automatic_check,
+            automatic_download: table.automatic_download,
+            automatic_macos_install: table.automatic_macos_install,
+            critical: table.critical,
+        }
+    }
 }
 
 /// Why checking for updates is not turned off on a Mac running `os_version`.
@@ -94,9 +150,6 @@ fn off_blocked(os_version: &str) -> String {
         other => format!("{why}; this Mac runs macOS {other}, where that was not measured"),
     }
 }
-
-/// `softwareupdate`, whose `--schedule` reads and sets checking for updates.
-const SOFTWAREUPDATE: &str = "/usr/sbin/softwareupdate";
 
 /// Checking for updates, as `softwareupdate --schedule` reports it.
 struct Schedule {
@@ -140,11 +193,7 @@ impl Item for Schedule {
             }
         };
         let text = ran.out();
-        let now = if text.contains("is turned on") {
-            true
-        } else if text.contains("is turned off") {
-            false
-        } else {
+        let Some(now) = updates::schedule(&text) else {
             return Probe::Unusable {
                 why: format!("softwareupdate --schedule printed {:?}", text.trim()),
             };

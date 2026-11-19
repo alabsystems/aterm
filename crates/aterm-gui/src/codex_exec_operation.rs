@@ -448,6 +448,7 @@ fn serve_current(
             let Some(transferred) = meta.transfer_native_exec_claim(
                 &op.authority,
                 connection,
+                None,
                 crate::metrics::now_us(),
             ) else {
                 return DENIED.into();

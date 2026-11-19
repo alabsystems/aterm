@@ -1,52 +1,49 @@
 # aterm Linux lane baseline (LW.4): x86_64 (Rosetta) under mutter-scale1.5 (Wayland)
 # = behaviour, compared exactly by the replay; ~ measured, shown when it moves; @ the stack
 # replay: targo --unverified lab linux baseline --arch x86_64 --screen mutter-scale1.5 (add --record to rewrite this file)
-@ crate.aterm-dl 0.106.0 (path)
-@ crate.aterm-wayland 0.106.0 (path)
-@ crate.aterm-x11 0.106.0 (path)
-@ crate.aterm-xkb 0.106.0 (path)
-@ crate.softbuffer 0.4.8
-@ crate.wgpu 29.0.3
-@ crate.wgpu-hal 29.0.3
-@ crate.winit 0.30.13 (path)
-= start.dims 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1157 surface_h=792 offset_x=0 offset_y=0 band_left=0 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
+@ crate.aterm-dl 0.0.0 (path)
+@ crate.aterm-wayland 0.0.0 (path)
+@ crate.aterm-window 0.30.13 (path)
+@ crate.aterm-x11 0.0.0 (path)
+@ crate.aterm-xkb 0.0.0 (path)
+= start.dims 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1577 surface_h=792 offset_x=420 offset_y=0 band_left=420 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
 = echo typed `echo LANE-$((6*7))`, LANE-42 appeared
 = atspi.walk.start apps 1
 = atspi.walk.start.1 depth=0 role=application name="aterm-gui" description="" states=- interfaces=Accessible,Application attributes=ERR(org.freedesktop.DBus.Error.UnknownMethod:_Unknown_method_'GetAttributes') children=1 child_count=1
 ~ atspi.path.start.1 /org/a11y/atspi/accessible/root
-= atspi.walk.start.2 depth=1 role=frame name="~" description="" states=enabled,sensitive,showing,visible interfaces=Accessible,Component attributes=- extents_window=0,0,1157,792 extents_screen=0,0,1157,792 children=1 child_count=1
+= atspi.walk.start.2 depth=1 role=frame name="~" description="" states=enabled,sensitive,showing,visible interfaces=Accessible,Component attributes=- extents_window=0,0,1577,792 extents_screen=0,0,1577,792 children=1 child_count=1
 ~ atspi.path.start.2 /org/a11y/atspi/accessible/0/0
-= atspi.walk.start.3 depth=2 role=terminal name="aterm terminal" description="" states=enabled,focusable,sensitive,showing,visible interfaces=Accessible,Component,Text attributes=- characters=60 caret=38 text="lane$ echo LANE-$((6*7))\nLANE-42\nlane$\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n" extents_window=18,54,1120,720 extents_screen=18,54,1120,720 children=0 child_count=0
+= atspi.walk.start.3 depth=2 role=terminal name="aterm terminal" description="" states=enabled,focusable,sensitive,showing,visible interfaces=Accessible,Component,Text attributes=- characters=60 caret=38 text="lane$ echo LANE-$((6*7))\nLANE-42\nlane$\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n" extents_window=438,54,1120,720 extents_screen=438,54,1120,720 children=0 child_count=0
 ~ atspi.path.start.3 /org/a11y/atspi/accessible/0/18446744073709551616
-= resize.input.30x100 30x100 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=30 window_cols=100 grid_w=1400 grid_h=900 frame_w=1436 frame_h=972 surface_w=1436 surface_h=972 offset_x=0 offset_y=0 band_left=0 band_right=0 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
-= resize.input.24x80 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1157 surface_h=792 offset_x=0 offset_y=0 band_left=0 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
-= resize.input.flap 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1157 surface_h=792 offset_x=0 offset_y=0 band_left=0 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
-= resize.os.tiled-left 37x66 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=37 window_cols=66 grid_w=924 grid_h=1110 frame_w=960 frame_h=1182 surface_w=960 surface_h=1200 offset_x=0 offset_y=0 band_left=0 band_right=0 band_top=0 band_bottom=18 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
-= resize.os.restored 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1157 surface_h=792 offset_x=0 offset_y=0 band_left=0 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
+= resize.input.30x100 30x100 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=30 window_cols=100 grid_w=1400 grid_h=900 frame_w=1436 frame_h=972 surface_w=1856 surface_h=972 offset_x=420 offset_y=0 band_left=420 band_right=0 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
+= resize.input.24x80 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1577 surface_h=792 offset_x=420 offset_y=0 band_left=420 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
+= resize.input.flap 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1577 surface_h=792 offset_x=420 offset_y=0 band_left=420 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
+= resize.os.tiled-left 37x36 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=37 window_cols=36 grid_w=504 grid_h=1110 frame_w=540 frame_h=1182 surface_w=960 surface_h=1200 offset_x=420 offset_y=0 band_left=420 band_right=0 band_top=0 band_bottom=18 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
+= resize.os.restored 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1577 surface_h=792 offset_x=420 offset_y=0 band_left=420 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
 = status render=ok resizes=6
 ~ status.flaps 0
 = resizes.1 1 ord=1 from=80x24 to=100x30 alt=0 sync=0 site=input win=100x30 chrome=1
-~ resizes.1.rows 1 run=1 ord=1 from=80x24 to=100x30 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=6 restored=0 shift=+0 cut=0 site=input win=100x30 chrome=1
+~ resizes.1.rows 1 run=1 ord=1 from=80x24 to=100x30 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=100x30 chrome=1
 = resizes.2 2 ord=2 from=100x30 to=80x24 alt=0 sync=0 site=input win=80x24 chrome=1
-~ resizes.2.rows 2 run=2 ord=2 from=100x30 to=80x24 alt=0 sync=0 trimmed=6 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x24 chrome=1
+~ resizes.2.rows 2 run=2 ord=2 from=100x30 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x24 chrome=1
 = resizes.3 3 ord=3 from=80x24 to=80x23 alt=0 sync=0 site=input win=80x23 chrome=1
 ~ resizes.3.rows 3 run=3 ord=3 from=80x24 to=80x23 alt=0 sync=0 trimmed=1 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x23 chrome=1
 = resizes.4 4 ord=4 from=80x23 to=80x24 alt=0 sync=0 site=input win=80x24 chrome=1
 ~ resizes.4.rows 4 run=4 ord=4 from=80x23 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=1 restored=0 shift=+0 cut=0 site=input win=80x24 chrome=1
-= resizes.5 5 ord=5 from=80x24 to=66x37 alt=0 sync=0 site=window win=66x37 chrome=1
-~ resizes.5.rows 5 run=5 ord=5 from=80x24 to=66x37 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=13 restored=0 shift=+0 cut=0 site=window win=66x37 chrome=1
-= resizes.6 6 ord=6 from=66x37 to=80x24 alt=0 sync=0 site=window win=80x24 chrome=1
-~ resizes.6.rows 6 run=6 ord=6 from=66x37 to=80x24 alt=0 sync=0 trimmed=13 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=window win=80x24 chrome=1
+= resizes.5 5 ord=5 from=80x24 to=36x37 alt=0 sync=0 site=window win=36x37 chrome=1
+~ resizes.5.rows 5 run=5 ord=5 from=80x24 to=36x37 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=window win=36x37 chrome=1
+= resizes.6 6 ord=6 from=36x37 to=80x24 alt=0 sync=0 site=window win=80x24 chrome=1
+~ resizes.6.rows 6 run=6 ord=6 from=36x37 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=window win=80x24 chrome=1
 ~ runs.1 1 n=1 alt=0 geom=80x24>100x30 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
 ~ runs.2 2 n=1 alt=0 geom=100x30>80x24 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
 ~ runs.3 3 n=1 alt=0 geom=80x24>80x23 net=changed displaced=+0 verdict=none first_out_ms=- healed_ms=-
 ~ runs.4 4 n=1 alt=0 geom=80x23>80x24 net=changed displaced=+0 verdict=none first_out_ms=- healed_ms=-
-~ runs.5 5 n=1 alt=0 geom=80x24>66x37 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
-~ runs.6 6 n=1 alt=0 geom=66x37>80x24 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
+~ runs.5 5 n=1 alt=0 geom=80x24>36x37 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
+~ runs.6 6 n=1 alt=0 geom=36x37>80x24 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
 = resizes.summary total=6 risks=0 render=ok unledgered=0 lost=0
 ~ resizes.summary.detail total=6 runs=6 flaps=0 risks=0 render=ok unledgered=0 lost=0 nudge=idle nudged=0
 = cast.drift verdict=clean fidelity=pass against=screen drift_rows=0 culprit=- geom=80x24
-~ cast.drift.detail OK 1 verdict=clean fidelity=pass against=screen drift_rows=0 runs=3 candidates=1 capped=0 culprit=- seed=primary seed_basis=live geom=80x24 evicted=0 dropped=0 cut=quiescent folds=2
+~ cast.drift.detail OK 1 verdict=clean fidelity=pass against=screen drift_rows=0 runs=4 candidates=1 capped=0 culprit=- seed=primary seed_basis=live geom=80x24 evicted=0 dropped=0 cut=quiescent folds=2 fold_events=38
 = clipboard.out Ctrl+Shift+C; wl-paste read "LANE-42"
 = clipboard.in wl-copy's WLCOPY-42 pasted by Ctrl+Shift+V: x-wlcopy-42
 = primary.out drag; wl-paste --primary read "LANE-42"
@@ -68,41 +65,43 @@
 = header.pixels drawn,drawn,drawn
 ~ header.pixels.differ 1116,1116,1116
 = header.maximize buttons=minimize,restore,close edges=false
-= header.maximize.dims 37x134 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=37 window_cols=134 grid_w=1876 grid_h=1110 frame_w=1912 frame_h=1182 surface_w=1920 surface_h=1200 offset_x=4 offset_y=0 band_left=4 band_right=4 band_top=0 band_bottom=18 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
+= header.maximize.dims 37x104 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=37 window_cols=104 grid_w=1456 grid_h=1110 frame_w=1492 frame_h=1182 surface_w=1920 surface_h=1200 offset_x=424 offset_y=0 band_left=424 band_right=4 band_top=0 band_bottom=18 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
 = header.restore buttons=minimize,maximize,close
-= header.restore.dims 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1157 surface_h=792 offset_x=0 offset_y=0 band_left=0 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
+= header.restore.dims 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1577 surface_h=792 offset_x=420 offset_y=0 band_left=420 band_right=1 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
 = atspi.walk.end apps 1
 = atspi.walk.end.1 depth=0 role=application name="aterm-gui" description="" states=- interfaces=Accessible,Application attributes=ERR(org.freedesktop.DBus.Error.UnknownMethod:_Unknown_method_'GetAttributes') children=1 child_count=1
 ~ atspi.path.end.1 /org/a11y/atspi/accessible/root
-= atspi.walk.end.2 depth=1 role=frame name="~" description="" states=enabled,sensitive,showing,visible interfaces=Accessible,Component attributes=- extents_window=0,0,1157,792 extents_screen=0,0,1157,792 children=1 child_count=1
+= atspi.walk.end.2 depth=1 role=frame name="~" description="" states=enabled,sensitive,showing,visible interfaces=Accessible,Component attributes=- extents_window=0,0,1577,792 extents_screen=0,0,1577,792 children=1 child_count=1
 ~ atspi.path.end.2 /org/a11y/atspi/accessible/0/0
-= atspi.walk.end.3 depth=2 role=terminal name="aterm terminal" description="" states=enabled,focusable,sensitive,showing,visible interfaces=Accessible,Component,Text attributes=- characters=181 caret=165 text="lane$ echo LANE-$((6*7))\nLANE-42\nlane$ echo X-WLCOPY-42 | tr A-Z a-z\nx-wlcopy-42\nlane$ echo X-WLPRIMARY-42 | tr A-Z a-z\nx-wlprimary-42\nlane$ echo X-xé-Y\nX-xé-Y\nlane$\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n" extents_window=18,54,1120,720 extents_screen=18,54,1120,720 children=0 child_count=0
+= atspi.walk.end.3 depth=2 role=terminal name="aterm terminal" description="" states=enabled,focusable,sensitive,showing,visible interfaces=Accessible,Component,Text attributes=- characters=181 caret=165 text="lane$ echo LANE-$((6*7))\nLANE-42\nlane$ echo X-WLCOPY-42 | tr A-Z a-z\nx-wlcopy-42\nlane$ echo X-WLPRIMARY-42 | tr A-Z a-z\nx-wlprimary-42\nlane$ echo X-xé-Y\nX-xé-Y\nlane$\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n" extents_window=438,54,1120,720 extents_screen=438,54,1120,720 children=0 child_count=0
 ~ atspi.path.end.3 /org/a11y/atspi/accessible/0/18446744073709551616
 @ gpu llvmpipe (LLVM 20.1.2, 256 bits) (Gl)
-~ present.software software rendering (llvmpipe (LLVM 20.1.2, 256 bits) (Gl)): n_present=57 present_p50/p95/p99_ms=10.49/27.26/402.65
-~ input.software n_input=46 input_p50/p95/p99_ms=10.49/18.87/402.65
+@ gpu.window llvmpipe (LLVM 20.1.2, 256 bits)
+~ present.software software rendering (llvmpipe (LLVM 20.1.2, 256 bits)): n_present=57 present_p50/p95/p99_ms=11.321344/57.769984/220.200960
+~ input.software n_input=46 input_p50/p95/p99_ms=11.132928/22.020096/31.506432
+~ present.slowest 220.10 ms, ending in resizes +919 ms; gap 225.09 ms; max_frame_render_ms=851.92 max_redraw_total_ms=873.15 max_turn_ms=893.58 max_turn_owner=window_event
 = atspi.events.kinds Object.ActiveDescendantChanged@application Object.BoundsChanged@terminal Object.ChildrenChanged:add@application Object.StateChanged:active=0@frame Object.StateChanged:active=1@frame Object.StateChanged:focused=0@terminal Object.StateChanged:focused=1@terminal Object.TextCaretMoved@terminal Object.TextChanged:delete@terminal Object.TextChanged:insert@terminal Object.TextSelectionChanged@terminal Window.Activate@frame Window.Deactivate@frame
 = atspi.events.text the text changes undo cleanly from the end walk's text; the end walk's caret is not the last caret event's
-~ atspi.events.count 305
+~ atspi.events.count 307
 ~ atspi.event.1 Object.ChildrenChanged <application> detail="add" d1=0 d2=0 any=ref(<frame>)
 ~ atspi.event.2 Object.TextChanged <terminal> detail="insert" d1=5 d2=19 any=" echo LANE-$((6*7))"
 ~ atspi.event.3 Object.TextChanged <terminal> detail="delete" d1=25 d2=1 any="\n"
 ~ atspi.event.4 Object.TextChanged <terminal> detail="insert" d1=25 d2=13 any="LANE-42\nlane$"
 ~ atspi.event.5 Object.TextChanged <terminal> detail="insert" d1=60 d2=6 any="\n\n\n\n\n\n"
-~ atspi.event.6 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(18,54,1400,900)
+~ atspi.event.6 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(438,54,1400,900)
 ~ atspi.event.7 Object.TextChanged <terminal> detail="delete" d1=60 d2=6 any="\n\n\n\n\n\n"
-~ atspi.event.8 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(18,54,1120,720)
+~ atspi.event.8 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(438,54,1120,720)
 ~ atspi.event.9 Object.TextChanged <terminal> detail="delete" d1=59 d2=1 any="\n"
-~ atspi.event.10 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(18,54,1120,690)
+~ atspi.event.10 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(438,54,1120,690)
 ~ atspi.event.11 Object.TextChanged <terminal> detail="insert" d1=59 d2=1 any="\n"
-~ atspi.event.12 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(18,54,1120,720)
+~ atspi.event.12 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(438,54,1120,720)
 ~ atspi.event.13 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
 ~ atspi.event.14 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
 ~ atspi.event.15 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
 ~ atspi.event.16 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
 ~ atspi.event.17 Object.TextCaretMoved <terminal> detail="" d1=38 d2=0 any=0
 ~ atspi.event.18 Object.TextChanged <terminal> detail="insert" d1=60 d2=13 any="\n\n\n\n\n\n\n\n\n\n\n\n\n"
-~ atspi.event.19 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(18,54,924,1110)
+~ atspi.event.19 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(438,54,504,1110)
 ~ atspi.event.20 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
 ~ atspi.event.21 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
 ~ atspi.event.22 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
@@ -112,7 +111,7 @@
 ~ atspi.event.26 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
 ~ atspi.event.27 Object.TextCaretMoved <terminal> detail="" d1=38 d2=0 any=0
 ~ atspi.event.28 Object.TextChanged <terminal> detail="delete" d1=60 d2=13 any="\n\n\n\n\n\n\n\n\n\n\n\n\n"
-~ atspi.event.29 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(18,54,1120,720)
+~ atspi.event.29 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(438,54,1120,720)
 ~ atspi.event.30 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
 ~ atspi.event.31 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
 ~ atspi.event.32 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
@@ -191,204 +190,206 @@
 ~ atspi.event.105 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
 ~ atspi.event.106 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
 ~ atspi.event.107 Object.TextChanged <terminal> detail="insert" d1=55 d2=13 any=" | tr A-Z a-z"
-~ atspi.event.108 Object.TextChanged <terminal> detail="delete" d1=69 d2=1 any="\n"
-~ atspi.event.109 Object.TextChanged <terminal> detail="insert" d1=69 d2=17 any="x-wlcopy-42\nlane$"
-~ atspi.event.110 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.111 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.112 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.113 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.114 Object.TextCaretMoved <terminal> detail="" d1=86 d2=0 any=0
-~ atspi.event.115 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
-~ atspi.event.116 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
-~ atspi.event.117 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.118 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.119 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.120 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.121 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.122 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.123 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.124 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
-~ atspi.event.125 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
-~ atspi.event.126 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.127 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.128 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.129 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.130 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.131 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.132 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.133 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
-~ atspi.event.134 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
-~ atspi.event.135 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.136 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.137 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.138 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.139 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.140 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.141 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.142 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
-~ atspi.event.143 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
-~ atspi.event.144 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.145 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.146 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.147 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.148 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.149 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.150 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.151 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
-~ atspi.event.152 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
-~ atspi.event.153 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.154 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.155 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.156 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.157 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.158 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.159 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.160 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
-~ atspi.event.161 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
-~ atspi.event.162 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.163 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.164 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.165 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.166 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.167 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.168 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.169 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
-~ atspi.event.170 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
-~ atspi.event.171 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.172 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.173 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.174 Object.TextChanged <terminal> detail="insert" d1=86 d2=8 any=" echo X-"
-~ atspi.event.175 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.176 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.177 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.178 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.179 Object.TextCaretMoved <terminal> detail="" d1=94 d2=0 any=0
-~ atspi.event.180 Object.TextChanged <terminal> detail="insert" d1=94 d2=12 any="WLPRIMARY-42"
-~ atspi.event.181 Object.TextCaretMoved <terminal> detail="" d1=106 d2=0 any=0
-~ atspi.event.182 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.183 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.184 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.185 Object.TextChanged <terminal> detail="insert" d1=106 d2=13 any=" | tr A-Z a-z"
-~ atspi.event.186 Object.TextChanged <terminal> detail="delete" d1=120 d2=1 any="\n"
-~ atspi.event.187 Object.TextChanged <terminal> detail="insert" d1=120 d2=20 any="x-wlprimary-42\nlane$"
-~ atspi.event.188 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.189 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.190 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.191 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.192 Object.TextCaretMoved <terminal> detail="" d1=140 d2=0 any=0
-~ atspi.event.193 Object.TextChanged <terminal> detail="insert" d1=140 d2=2 any=" a"
-~ atspi.event.194 Object.TextCaretMoved <terminal> detail="" d1=142 d2=0 any=0
-~ atspi.event.195 Object.TextChanged <terminal> detail="insert" d1=142 d2=1 any="a"
-~ atspi.event.196 Object.TextCaretMoved <terminal> detail="" d1=143 d2=0 any=0
-~ atspi.event.197 Object.TextChanged <terminal> detail="insert" d1=143 d2=1 any="a"
-~ atspi.event.198 Object.TextCaretMoved <terminal> detail="" d1=144 d2=0 any=0
-~ atspi.event.199 Object.TextChanged <terminal> detail="insert" d1=144 d2=1 any="a"
-~ atspi.event.200 Object.TextCaretMoved <terminal> detail="" d1=145 d2=0 any=0
-~ atspi.event.201 Object.TextChanged <terminal> detail="insert" d1=145 d2=1 any="a"
-~ atspi.event.202 Object.TextCaretMoved <terminal> detail="" d1=146 d2=0 any=0
-~ atspi.event.203 Object.TextChanged <terminal> detail="insert" d1=146 d2=1 any="a"
-~ atspi.event.204 Object.TextCaretMoved <terminal> detail="" d1=147 d2=0 any=0
-~ atspi.event.205 Object.TextChanged <terminal> detail="insert" d1=147 d2=1 any="a"
-~ atspi.event.206 Object.TextCaretMoved <terminal> detail="" d1=148 d2=0 any=0
-~ atspi.event.207 Object.TextChanged <terminal> detail="insert" d1=148 d2=1 any="a"
-~ atspi.event.208 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
-~ atspi.event.209 Object.TextChanged <terminal> detail="insert" d1=149 d2=1 any="a"
-~ atspi.event.210 Object.TextCaretMoved <terminal> detail="" d1=150 d2=0 any=0
-~ atspi.event.211 Object.TextChanged <terminal> detail="insert" d1=150 d2=1 any="a"
-~ atspi.event.212 Object.TextCaretMoved <terminal> detail="" d1=151 d2=0 any=0
-~ atspi.event.213 Object.TextChanged <terminal> detail="insert" d1=151 d2=1 any="a"
-~ atspi.event.214 Object.TextCaretMoved <terminal> detail="" d1=152 d2=0 any=0
-~ atspi.event.215 Object.TextChanged <terminal> detail="insert" d1=152 d2=1 any="a"
-~ atspi.event.216 Object.TextCaretMoved <terminal> detail="" d1=153 d2=0 any=0
-~ atspi.event.217 Object.TextChanged <terminal> detail="insert" d1=153 d2=1 any="a"
-~ atspi.event.218 Object.TextCaretMoved <terminal> detail="" d1=154 d2=0 any=0
-~ atspi.event.219 Object.TextChanged <terminal> detail="insert" d1=154 d2=1 any="a"
-~ atspi.event.220 Object.TextCaretMoved <terminal> detail="" d1=155 d2=0 any=0
-~ atspi.event.221 Object.TextChanged <terminal> detail="insert" d1=155 d2=1 any="a"
-~ atspi.event.222 Object.TextCaretMoved <terminal> detail="" d1=156 d2=0 any=0
-~ atspi.event.223 Object.TextChanged <terminal> detail="insert" d1=156 d2=1 any="a"
-~ atspi.event.224 Object.TextCaretMoved <terminal> detail="" d1=157 d2=0 any=0
-~ atspi.event.225 Object.TextChanged <terminal> detail="insert" d1=157 d2=1 any="a"
-~ atspi.event.226 Object.TextCaretMoved <terminal> detail="" d1=158 d2=0 any=0
-~ atspi.event.227 Object.TextChanged <terminal> detail="insert" d1=158 d2=1 any="a"
-~ atspi.event.228 Object.TextCaretMoved <terminal> detail="" d1=159 d2=0 any=0
-~ atspi.event.229 Object.TextChanged <terminal> detail="insert" d1=159 d2=1 any="a"
-~ atspi.event.230 Object.TextCaretMoved <terminal> detail="" d1=160 d2=0 any=0
-~ atspi.event.231 Object.TextChanged <terminal> detail="insert" d1=160 d2=1 any="a"
-~ atspi.event.232 Object.TextCaretMoved <terminal> detail="" d1=161 d2=0 any=0
-~ atspi.event.233 Object.TextChanged <terminal> detail="insert" d1=161 d2=1 any="a"
-~ atspi.event.234 Object.TextCaretMoved <terminal> detail="" d1=162 d2=0 any=0
-~ atspi.event.235 Object.TextChanged <terminal> detail="insert" d1=162 d2=1 any="a"
-~ atspi.event.236 Object.TextCaretMoved <terminal> detail="" d1=163 d2=0 any=0
-~ atspi.event.237 Object.TextChanged <terminal> detail="insert" d1=163 d2=1 any="a"
-~ atspi.event.238 Object.TextCaretMoved <terminal> detail="" d1=164 d2=0 any=0
-~ atspi.event.239 Object.TextChanged <terminal> detail="insert" d1=164 d2=1 any="a"
-~ atspi.event.240 Object.TextCaretMoved <terminal> detail="" d1=165 d2=0 any=0
-~ atspi.event.241 Object.TextChanged <terminal> detail="insert" d1=165 d2=1 any="a"
-~ atspi.event.242 Object.TextCaretMoved <terminal> detail="" d1=166 d2=0 any=0
-~ atspi.event.243 Object.TextChanged <terminal> detail="insert" d1=166 d2=1 any="a"
-~ atspi.event.244 Object.TextCaretMoved <terminal> detail="" d1=167 d2=0 any=0
-~ atspi.event.245 Object.TextChanged <terminal> detail="insert" d1=167 d2=1 any="a"
-~ atspi.event.246 Object.TextCaretMoved <terminal> detail="" d1=168 d2=0 any=0
-~ atspi.event.247 Object.TextChanged <terminal> detail="insert" d1=168 d2=1 any="a"
-~ atspi.event.248 Object.TextCaretMoved <terminal> detail="" d1=169 d2=0 any=0
-~ atspi.event.249 Object.TextChanged <terminal> detail="insert" d1=169 d2=1 any="a"
-~ atspi.event.250 Object.TextCaretMoved <terminal> detail="" d1=170 d2=0 any=0
-~ atspi.event.251 Object.TextChanged <terminal> detail="insert" d1=170 d2=1 any="a"
-~ atspi.event.252 Object.TextCaretMoved <terminal> detail="" d1=171 d2=0 any=0
-~ atspi.event.253 Object.TextChanged <terminal> detail="insert" d1=171 d2=1 any="a"
-~ atspi.event.254 Object.TextCaretMoved <terminal> detail="" d1=172 d2=0 any=0
-~ atspi.event.255 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.256 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.257 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.258 Object.TextChanged <terminal> detail="delete" d1=140 d2=32 any=" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-~ atspi.event.259 Object.TextChanged <terminal> detail="insert" d1=140 d2=8 any=" echo X-"
-~ atspi.event.260 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.261 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.262 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.263 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.264 Object.TextCaretMoved <terminal> detail="" d1=148 d2=0 any=0
-~ atspi.event.265 Object.TextChanged <terminal> detail="insert" d1=148 d2=1 any="x"
-~ atspi.event.266 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
-~ atspi.event.267 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.268 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.269 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.270 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.271 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.272 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.273 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.274 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
-~ atspi.event.275 Object.TextChanged <terminal> detail="insert" d1=149 d2=1 any="é"
-~ atspi.event.276 Object.TextCaretMoved <terminal> detail="" d1=150 d2=0 any=0
-~ atspi.event.277 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.278 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.279 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.280 Object.TextChanged <terminal> detail="insert" d1=150 d2=2 any="-Y"
-~ atspi.event.281 Object.TextChanged <terminal> detail="delete" d1=153 d2=1 any="\n"
-~ atspi.event.282 Object.TextChanged <terminal> detail="insert" d1=153 d2=12 any="X-xé-Y\nlane$"
-~ atspi.event.283 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.284 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.285 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.286 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.287 Object.TextCaretMoved <terminal> detail="" d1=165 d2=0 any=0
-~ atspi.event.288 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.289 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.290 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.291 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.292 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
-~ atspi.event.293 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
-~ atspi.event.294 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
-~ atspi.event.295 Object.TextCaretMoved <terminal> detail="" d1=165 d2=0 any=0
-~ atspi.event.296 Object.TextChanged <terminal> detail="insert" d1=165 d2=38 any=" /tmp/aterm-lane-dnd/dropped\\ file.txt"
-~ atspi.event.297 Object.TextCaretMoved <terminal> detail="" d1=203 d2=0 any=0
-~ atspi.event.298 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
-~ atspi.event.299 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
-~ atspi.event.300 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
-~ atspi.event.301 Object.TextChanged <terminal> detail="delete" d1=165 d2=38 any=" /tmp/aterm-lane-dnd/dropped\\ file.txt"
-~ atspi.event.302 Object.TextChanged <terminal> detail="insert" d1=181 d2=13 any="\n\n\n\n\n\n\n\n\n\n\n\n\n"
-~ atspi.event.303 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(18,54,1876,1110)
-~ atspi.event.304 Object.TextChanged <terminal> detail="delete" d1=181 d2=13 any="\n\n\n\n\n\n\n\n\n\n\n\n\n"
-~ atspi.event.305 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(18,54,1120,720)
+~ atspi.event.108 Object.PropertyChange <frame> detail="accessible-name" d1=0 d2=0 any="echo X-WLCOPY-42 | tr A-Z a-z"
+~ atspi.event.109 Object.TextChanged <terminal> detail="delete" d1=69 d2=1 any="\n"
+~ atspi.event.110 Object.TextChanged <terminal> detail="insert" d1=69 d2=17 any="x-wlcopy-42\nlane$"
+~ atspi.event.111 Object.PropertyChange <frame> detail="accessible-name" d1=0 d2=0 any="~"
+~ atspi.event.112 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.113 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.114 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.115 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.116 Object.TextCaretMoved <terminal> detail="" d1=86 d2=0 any=0
+~ atspi.event.117 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
+~ atspi.event.118 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
+~ atspi.event.119 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.120 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.121 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.122 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.123 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.124 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.125 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.126 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
+~ atspi.event.127 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
+~ atspi.event.128 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.129 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.130 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.131 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.132 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.133 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.134 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.135 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
+~ atspi.event.136 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
+~ atspi.event.137 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.138 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.139 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.140 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.141 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.142 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.143 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.144 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
+~ atspi.event.145 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
+~ atspi.event.146 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.147 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.148 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.149 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.150 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.151 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.152 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.153 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
+~ atspi.event.154 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
+~ atspi.event.155 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.156 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.157 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.158 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.159 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.160 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.161 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.162 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
+~ atspi.event.163 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
+~ atspi.event.164 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.165 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.166 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.167 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.168 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.169 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.170 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.171 Object.TextSelectionChanged <terminal> detail="" d1=0 d2=0 any=0
+~ atspi.event.172 Object.TextCaretMoved <terminal> detail="" d1=32 d2=0 any=0
+~ atspi.event.173 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.174 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.175 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.176 Object.TextChanged <terminal> detail="insert" d1=86 d2=8 any=" echo X-"
+~ atspi.event.177 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.178 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.179 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.180 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.181 Object.TextCaretMoved <terminal> detail="" d1=94 d2=0 any=0
+~ atspi.event.182 Object.TextChanged <terminal> detail="insert" d1=94 d2=12 any="WLPRIMARY-42"
+~ atspi.event.183 Object.TextCaretMoved <terminal> detail="" d1=106 d2=0 any=0
+~ atspi.event.184 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.185 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.186 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.187 Object.TextChanged <terminal> detail="insert" d1=106 d2=13 any=" | tr A-Z a-z"
+~ atspi.event.188 Object.TextChanged <terminal> detail="delete" d1=120 d2=1 any="\n"
+~ atspi.event.189 Object.TextChanged <terminal> detail="insert" d1=120 d2=20 any="x-wlprimary-42\nlane$"
+~ atspi.event.190 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.191 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.192 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.193 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.194 Object.TextCaretMoved <terminal> detail="" d1=140 d2=0 any=0
+~ atspi.event.195 Object.TextChanged <terminal> detail="insert" d1=140 d2=2 any=" a"
+~ atspi.event.196 Object.TextCaretMoved <terminal> detail="" d1=142 d2=0 any=0
+~ atspi.event.197 Object.TextChanged <terminal> detail="insert" d1=142 d2=1 any="a"
+~ atspi.event.198 Object.TextCaretMoved <terminal> detail="" d1=143 d2=0 any=0
+~ atspi.event.199 Object.TextChanged <terminal> detail="insert" d1=143 d2=1 any="a"
+~ atspi.event.200 Object.TextCaretMoved <terminal> detail="" d1=144 d2=0 any=0
+~ atspi.event.201 Object.TextChanged <terminal> detail="insert" d1=144 d2=1 any="a"
+~ atspi.event.202 Object.TextCaretMoved <terminal> detail="" d1=145 d2=0 any=0
+~ atspi.event.203 Object.TextChanged <terminal> detail="insert" d1=145 d2=1 any="a"
+~ atspi.event.204 Object.TextCaretMoved <terminal> detail="" d1=146 d2=0 any=0
+~ atspi.event.205 Object.TextChanged <terminal> detail="insert" d1=146 d2=1 any="a"
+~ atspi.event.206 Object.TextCaretMoved <terminal> detail="" d1=147 d2=0 any=0
+~ atspi.event.207 Object.TextChanged <terminal> detail="insert" d1=147 d2=1 any="a"
+~ atspi.event.208 Object.TextCaretMoved <terminal> detail="" d1=148 d2=0 any=0
+~ atspi.event.209 Object.TextChanged <terminal> detail="insert" d1=148 d2=1 any="a"
+~ atspi.event.210 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
+~ atspi.event.211 Object.TextChanged <terminal> detail="insert" d1=149 d2=1 any="a"
+~ atspi.event.212 Object.TextCaretMoved <terminal> detail="" d1=150 d2=0 any=0
+~ atspi.event.213 Object.TextChanged <terminal> detail="insert" d1=150 d2=1 any="a"
+~ atspi.event.214 Object.TextCaretMoved <terminal> detail="" d1=151 d2=0 any=0
+~ atspi.event.215 Object.TextChanged <terminal> detail="insert" d1=151 d2=1 any="a"
+~ atspi.event.216 Object.TextCaretMoved <terminal> detail="" d1=152 d2=0 any=0
+~ atspi.event.217 Object.TextChanged <terminal> detail="insert" d1=152 d2=1 any="a"
+~ atspi.event.218 Object.TextCaretMoved <terminal> detail="" d1=153 d2=0 any=0
+~ atspi.event.219 Object.TextChanged <terminal> detail="insert" d1=153 d2=1 any="a"
+~ atspi.event.220 Object.TextCaretMoved <terminal> detail="" d1=154 d2=0 any=0
+~ atspi.event.221 Object.TextChanged <terminal> detail="insert" d1=154 d2=1 any="a"
+~ atspi.event.222 Object.TextCaretMoved <terminal> detail="" d1=155 d2=0 any=0
+~ atspi.event.223 Object.TextChanged <terminal> detail="insert" d1=155 d2=1 any="a"
+~ atspi.event.224 Object.TextCaretMoved <terminal> detail="" d1=156 d2=0 any=0
+~ atspi.event.225 Object.TextChanged <terminal> detail="insert" d1=156 d2=1 any="a"
+~ atspi.event.226 Object.TextCaretMoved <terminal> detail="" d1=157 d2=0 any=0
+~ atspi.event.227 Object.TextChanged <terminal> detail="insert" d1=157 d2=1 any="a"
+~ atspi.event.228 Object.TextCaretMoved <terminal> detail="" d1=158 d2=0 any=0
+~ atspi.event.229 Object.TextChanged <terminal> detail="insert" d1=158 d2=1 any="a"
+~ atspi.event.230 Object.TextCaretMoved <terminal> detail="" d1=159 d2=0 any=0
+~ atspi.event.231 Object.TextChanged <terminal> detail="insert" d1=159 d2=1 any="a"
+~ atspi.event.232 Object.TextCaretMoved <terminal> detail="" d1=160 d2=0 any=0
+~ atspi.event.233 Object.TextChanged <terminal> detail="insert" d1=160 d2=1 any="a"
+~ atspi.event.234 Object.TextCaretMoved <terminal> detail="" d1=161 d2=0 any=0
+~ atspi.event.235 Object.TextChanged <terminal> detail="insert" d1=161 d2=1 any="a"
+~ atspi.event.236 Object.TextCaretMoved <terminal> detail="" d1=162 d2=0 any=0
+~ atspi.event.237 Object.TextChanged <terminal> detail="insert" d1=162 d2=1 any="a"
+~ atspi.event.238 Object.TextCaretMoved <terminal> detail="" d1=163 d2=0 any=0
+~ atspi.event.239 Object.TextChanged <terminal> detail="insert" d1=163 d2=1 any="a"
+~ atspi.event.240 Object.TextCaretMoved <terminal> detail="" d1=164 d2=0 any=0
+~ atspi.event.241 Object.TextChanged <terminal> detail="insert" d1=164 d2=1 any="a"
+~ atspi.event.242 Object.TextCaretMoved <terminal> detail="" d1=165 d2=0 any=0
+~ atspi.event.243 Object.TextChanged <terminal> detail="insert" d1=165 d2=1 any="a"
+~ atspi.event.244 Object.TextCaretMoved <terminal> detail="" d1=166 d2=0 any=0
+~ atspi.event.245 Object.TextChanged <terminal> detail="insert" d1=166 d2=1 any="a"
+~ atspi.event.246 Object.TextCaretMoved <terminal> detail="" d1=167 d2=0 any=0
+~ atspi.event.247 Object.TextChanged <terminal> detail="insert" d1=167 d2=1 any="a"
+~ atspi.event.248 Object.TextCaretMoved <terminal> detail="" d1=168 d2=0 any=0
+~ atspi.event.249 Object.TextChanged <terminal> detail="insert" d1=168 d2=1 any="a"
+~ atspi.event.250 Object.TextCaretMoved <terminal> detail="" d1=169 d2=0 any=0
+~ atspi.event.251 Object.TextChanged <terminal> detail="insert" d1=169 d2=1 any="a"
+~ atspi.event.252 Object.TextCaretMoved <terminal> detail="" d1=170 d2=0 any=0
+~ atspi.event.253 Object.TextChanged <terminal> detail="insert" d1=170 d2=1 any="a"
+~ atspi.event.254 Object.TextCaretMoved <terminal> detail="" d1=171 d2=0 any=0
+~ atspi.event.255 Object.TextChanged <terminal> detail="insert" d1=171 d2=1 any="a"
+~ atspi.event.256 Object.TextCaretMoved <terminal> detail="" d1=172 d2=0 any=0
+~ atspi.event.257 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.258 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.259 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.260 Object.TextChanged <terminal> detail="delete" d1=140 d2=32 any=" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+~ atspi.event.261 Object.TextChanged <terminal> detail="insert" d1=140 d2=8 any=" echo X-"
+~ atspi.event.262 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.263 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.264 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.265 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.266 Object.TextCaretMoved <terminal> detail="" d1=148 d2=0 any=0
+~ atspi.event.267 Object.TextChanged <terminal> detail="insert" d1=148 d2=1 any="x"
+~ atspi.event.268 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
+~ atspi.event.269 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.270 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.271 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.272 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.273 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.274 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.275 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.276 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
+~ atspi.event.277 Object.TextChanged <terminal> detail="insert" d1=149 d2=1 any="é"
+~ atspi.event.278 Object.TextCaretMoved <terminal> detail="" d1=150 d2=0 any=0
+~ atspi.event.279 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.280 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.281 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.282 Object.TextChanged <terminal> detail="insert" d1=150 d2=2 any="-Y"
+~ atspi.event.283 Object.TextChanged <terminal> detail="delete" d1=153 d2=1 any="\n"
+~ atspi.event.284 Object.TextChanged <terminal> detail="insert" d1=153 d2=12 any="X-xé-Y\nlane$"
+~ atspi.event.285 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.286 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.287 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.288 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.289 Object.TextCaretMoved <terminal> detail="" d1=165 d2=0 any=0
+~ atspi.event.290 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.291 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.292 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.293 Window.Activate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.294 Object.StateChanged <frame> detail="active" d1=1 d2=0 any=0
+~ atspi.event.295 Object.ActiveDescendantChanged <application> detail="" d1=0 d2=0 any=ref(<frame>)
+~ atspi.event.296 Object.StateChanged <terminal> detail="focused" d1=1 d2=0 any=0
+~ atspi.event.297 Object.TextCaretMoved <terminal> detail="" d1=165 d2=0 any=0
+~ atspi.event.298 Object.TextChanged <terminal> detail="insert" d1=165 d2=38 any=" /tmp/aterm-lane-dnd/dropped\\ file.txt"
+~ atspi.event.299 Object.TextCaretMoved <terminal> detail="" d1=203 d2=0 any=0
+~ atspi.event.300 Window.Deactivate <frame> detail="" d1=0 d2=0 any="~"
+~ atspi.event.301 Object.StateChanged <frame> detail="active" d1=0 d2=0 any=0
+~ atspi.event.302 Object.StateChanged <terminal> detail="focused" d1=0 d2=0 any=0
+~ atspi.event.303 Object.TextChanged <terminal> detail="delete" d1=165 d2=38 any=" /tmp/aterm-lane-dnd/dropped\\ file.txt"
+~ atspi.event.304 Object.TextChanged <terminal> detail="insert" d1=181 d2=13 any="\n\n\n\n\n\n\n\n\n\n\n\n\n"
+~ atspi.event.305 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(442,54,1456,1110)
+~ atspi.event.306 Object.TextChanged <terminal> detail="delete" d1=181 d2=13 any="\n\n\n\n\n\n\n\n\n\n\n\n\n"
+~ atspi.event.307 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(438,54,1120,720)
 @ server.globals gtk_shell1@5,wl_compositor@6,wl_data_device_manager@3,wl_output@4,wl_seat@8,wl_shm@1,wl_subcompositor@1,wp_fractional_scale_manager_v1@1,wp_presentation@1,wp_single_pixel_buffer_manager_v1@1,wp_viewporter@1,xdg_activation_v1@1,xdg_wm_base@6,zwp_idle_inhibit_manager_v1@1,zwp_keyboard_shortcuts_inhibit_manager_v1@1,zwp_linux_dmabuf_v1@3,zwp_pointer_constraints_v1@1,zwp_pointer_gestures_v1@3,zwp_primary_selection_device_manager_v1@1,zwp_relative_pointer_manager_v1@1,zwp_tablet_manager_v2@1,zwp_text_input_manager_v3@1,zxdg_exporter_v1@1,zxdg_exporter_v2@1,zxdg_importer_v1@1,zxdg_importer_v2@1,zxdg_output_manager_v1@3
 @ guest.at-spi2-core:arm64 2.52.0-1build1
 @ guest.dbus:arm64 1.14.10-4ubuntu4.1
@@ -410,16 +411,16 @@
 @ guest.xvfb:arm64 2:21.1.12-1ubuntu1.9
 @ guest.xwayland:arm64 2:23.2.6-1ubuntu0.8
 = text-input-v3.client binds zwp_text_input_manager_v3 v1; requests zwp_text_input_manager_v3.get_text_input zwp_text_input_v3.enable zwp_text_input_v3.set_content_type(0, 13) zwp_text_input_v3.commit zwp_text_input_v3.set_cursor_rectangle zwp_text_input_v3.destroy; events zwp_text_input_v3.enter
-~ header.gesture.centred px=579,465
+~ header.gesture.centred px=789,465
 = header.move followed
-~ header.gesture.moved px=913,39
+~ header.gesture.moved px=1334,39
 = header.resize wider
-~ header.resize.dims 24x86 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=86 grid_w=1204 grid_h=720 frame_w=1240 frame_h=792 surface_w=1245 surface_h=792 offset_x=2 offset_y=0 band_left=2 band_right=3 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
+~ header.resize.dims 24x86 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=86 grid_w=1204 grid_h=720 frame_w=1240 frame_h=792 surface_w=1665 surface_h=792 offset_x=422 offset_y=0 band_left=422 band_right=3 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
 = header.requests move resize(right) show_window_menu
 = touch.wire requests wl_seat.get_touch wl_touch.release; events wl_touch.down wl_touch.frame wl_touch.motion wl_touch.up
 = touch.screen the screen as it was
-~ touch.at touch id 896 at 385.83203125,310.00000000; the pointer at 386.00,310.00
-@ ime.gnome-shell 46.0-0ubuntu6~24.04.16
+~ touch.at touch id 896 at 525.83203125,310.00000000; the pointer at 526.00,310.00
+@ ime.gnome-shell 46.0-0ubuntu6~24.04.17
 @ ime.ibus 1.5.29-2
 = text-input-v3.ime X-é-Y printed; IME events
 = text-input-v3.ime.wire binds zwp_text_input_manager_v3 v1; requests zwp_text_input_manager_v3.get_text_input zwp_text_input_v3.enable zwp_text_input_v3.set_content_type(0, 13) zwp_text_input_v3.commit zwp_text_input_v3.set_cursor_rectangle zwp_text_input_v3.destroy; events zwp_text_input_v3.enter zwp_text_input_v3.done zwp_text_input_v3.preedit_string zwp_text_input_v3.commit_string

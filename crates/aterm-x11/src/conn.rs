@@ -112,6 +112,26 @@ impl fmt::Debug for Connection {
 }
 
 impl Connection {
+    /// Connect on an already owned X11 transport, with no authority-file lookup.
+    /// The descriptor transfers to libxcb when its constructor is called, including
+    /// connection/setup failure; failure to load libxcb leaves Rust to close it.
+    #[cfg(any(test, debug_assertions))]
+    pub fn from_fd(fd: OwnedFd) -> Result<Self, Error> {
+        let xcb = sys::xcb().map_err(Error::Load)?;
+        // SAFETY: libxcb takes this owned descriptor. Null auth selects no cookie.
+        let raw = unsafe { (xcb.connect_to_fd)(fd.into_raw_fd(), std::ptr::null_mut()) };
+        let raw = NonNull::new(raw).ok_or(Error::Connection(1))?;
+        // SAFETY: a libxcb connection, including an error connection, is queried and
+        // disconnected through libxcb rather than closing its descriptor twice.
+        let code = unsafe { (xcb.has_error)(raw.as_ptr()) };
+        if code != 0 {
+            unsafe { (xcb.disconnect)(raw.as_ptr()) };
+            return Err(Error::Connection(code));
+        }
+        // SAFETY: the constructor transferred ownership of this live connection.
+        unsafe { Connection::adopt(xcb, raw, true) }
+    }
+
     /// Connect to `display` (`$DISPLAY` when `None`).
     pub fn connect(display: Option<&CStr>) -> Result<(Connection, usize), Error> {
         let xcb = sys::xcb().map_err(Error::Load)?;
@@ -359,6 +379,34 @@ impl Connection {
         let mut err: *mut u8 = std::ptr::null_mut();
         // SAFETY: a live connection, a sequence this connection issued, and a live out-parameter.
         let reply = unsafe { (self.xcb.wait_for_reply64)(self.raw.as_ptr(), sequence, &mut err) };
+        // SAFETY: libxcb returned its owned complete reply/error packets.
+        unsafe { self.reply_bytes(reply, err) }
+    }
+
+    /// Take a reply or error already available for this connection's exact request.
+    /// `None` leaves the request pending; the caller retains discard responsibility.
+    pub fn poll_reply<R: Reply>(&self, sequence: u64) -> Result<Option<R>, Error> {
+        let mut reply = std::ptr::null_mut();
+        let mut error = std::ptr::null_mut();
+        // SAFETY: this live connection owns the sequence; both packet outputs live
+        // through the call and are consumed below only once libxcb reports completion.
+        let ready = unsafe {
+            (self.xcb.poll_for_reply64)(self.raw.as_ptr(), sequence, &mut reply, &mut error)
+        };
+        if ready == 0 {
+            self.status()?;
+            return Ok(None);
+        }
+        // SAFETY: completion transfers libxcb's complete malloc'd packets here.
+        let bytes = unsafe { self.reply_bytes(reply, error) }?;
+        Ok(Some(R::parse(&bytes)?))
+    }
+
+    /// Consume the complete malloc'd packet outputs of libxcb's reply functions.
+    /// # Safety
+    /// Non-null pointers are libxcb-owned complete reply/error allocations transferred
+    /// to this call; they are consumed here and must not be reused by the caller.
+    unsafe fn reply_bytes(&self, reply: *mut u8, err: *mut u8) -> Result<Vec<u8>, Error> {
         if let Some(e) = NonNull::new(err) {
             // SAFETY: libxcb's malloc'd 32-byte error packet, freed here.
             let parsed = unsafe { take_packet(e, 32) };
@@ -379,8 +427,11 @@ impl Connection {
             let len = usize::try_from(length)
                 .ok()
                 .and_then(|l| l.checked_mul(4))
-                .and_then(|l| l.checked_add(32))
-                .ok_or(Error::Parse(ParseError::Short))?;
+                .and_then(|l| l.checked_add(32));
+            let Some(len) = len else {
+                libc::free(reply.as_ptr().cast());
+                return Err(Error::Parse(ParseError::Short));
+            };
             Ok(take_packet(reply, len))
         }
     }

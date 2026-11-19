@@ -254,6 +254,220 @@ fn the_change_marker_stays_durable_and_the_observed_mode_is_only_ordered() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The hardware UUID of the Mac a test's window runs on ([`own_observed`]), fixed on every
+/// platform: no test needs the UUID only macOS has, nor touches the record of the Mac it runs on.
+pub(super) const THIS_MAC: &str = "3C5D7E9F-1A2B-4C6D-8E0F-A1B2C3D4E5F6";
+
+/// This Mac's own observed record ([`own_observed`]), as a test's window writes it.
+fn mine() -> String {
+    own_observed().expect("a test's Mac has a UUID")
+}
+
+/// A test's window is a Mac of its own: its record's name comes from the test's fixed UUID on
+/// every platform, never from the Mac the test runs on, whose UUID only macOS has and whose
+/// record no test touches. NEGATIVE CONTROL (run): a test build that reads this Mac's UUID
+/// names the record of the Mac the test runs on.
+#[test]
+fn a_tests_window_is_a_mac_of_its_own() {
+    use aterm_types::macos_setup::debugger_record::observed_on;
+    assert_eq!(own_observed(), observed_on(THIS_MAC));
+    if let Some(host) = aterm_containment::consent::host_uuid() {
+        assert_ne!(
+            own_observed(),
+            observed_on(&host),
+            "not the record of this Mac"
+        );
+    }
+}
+
+/// The record from before records named their Mac is kept as this Mac's own only where this
+/// Mac's is still missing: a newer record another window of this Mac wrote between this window's
+/// reading and its keeping stands, and is what this window reads. NEGATIVE CONTROL (run): a
+/// carry-over that replaces whatever stands writes the earlier mode over the newer one.
+#[test]
+fn the_earlier_record_never_lands_over_a_newer_one_of_this_mac() {
+    let dir = scratch("observed-earlier-raced");
+    let config = dir.join("aterm.toml");
+    let before = ObservedMarker {
+        mode: DebuggerMode::Disabled,
+        since: 100,
+        origin: Origin::Outside,
+    };
+    write_debugger_marker(
+        &config,
+        OBSERVED_MARKER,
+        &before.encode(),
+        crate::durable::Flush::Ordered,
+    )
+    .unwrap();
+    let newer = ObservedMarker {
+        mode: DebuggerMode::Enabled,
+        since: 200,
+        origin: Origin::Aterm,
+    };
+    let own = mine();
+    let read = observed_marker_between(&config, Some(&own), || {
+        settle_markers(&config, Some(newer), None);
+    });
+    assert_eq!(
+        read_debugger_marker(&config, &own).map(|text| text.trim().to_owned()),
+        Some(newer.encode()),
+        "the newer record stands"
+    );
+    assert_eq!(read, Some(newer));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two Macs that share one config folder (a dotfiles folder synced live between them) each keep
+/// their own observed record: B's window reads none of A's, its first sight of its own mode is
+/// written over nothing of A's, and A still reads the person's choice it recorded; the record
+/// from before records named their Mac is not written. NEGATIVE CONTROL (run): a window that
+/// writes one shared record lets B read A's choice as its own and write over it.
+#[test]
+fn two_macs_sharing_a_config_folder_keep_each_their_own_record() {
+    use aterm_types::macos_setup::debugger_record::observed_on;
+    let a = observed_on("0F9E8D7C-6B5A-4F3E-2D1C-0B9A8F7E6D5C").unwrap();
+    let b = observed_on("6A1E64F2-1C3B-4D5E-8F90-0A1B2C3D4E5F").unwrap();
+    let dir = scratch("observed-two-macs");
+    let config = dir.join("aterm.toml");
+    let chosen = ObservedMarker {
+        mode: DebuggerMode::Disabled,
+        since: 100,
+        origin: Origin::Outside,
+    };
+    settle_markers_as(&config, Some(&a), Some(chosen), None);
+    assert_eq!(
+        read_records_as(&config, Some(&b), |_| false).observed,
+        None,
+        "A's record says nothing on B"
+    );
+    let seen = ObservedMarker {
+        mode: DebuggerMode::Enabled,
+        since: 200,
+        origin: Origin::Unknown,
+    };
+    settle_markers_as(&config, Some(&b), Some(seen), None);
+    assert_eq!(
+        read_records_as(&config, Some(&b), |_| false).observed,
+        Some(seen)
+    );
+    assert_eq!(
+        read_records_as(&config, Some(&a), |_| false).observed,
+        Some(chosen),
+        "A keeps the person's choice"
+    );
+    assert_eq!(read_debugger_marker(&config, OBSERVED_MARKER), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A window that cannot read this Mac's UUID has no record of this Mac: it reads the record
+/// from before records named their Mac and keeps its word, judges no other Mac's, and writes
+/// nothing, so that record and every Mac's own stay as they stand. NEGATIVE CONTROL (run): a
+/// window that writes the earlier record where it has no name of its own writes over it.
+#[test]
+fn a_window_that_cannot_read_this_macs_uuid_writes_no_observed_record() {
+    use aterm_types::macos_setup::debugger_record::observed_on;
+    let dir = scratch("observed-no-uuid");
+    let config = dir.join("aterm.toml");
+    let before = ObservedMarker {
+        mode: DebuggerMode::Disabled,
+        since: 100,
+        origin: Origin::Outside,
+    };
+    let other = observed_on("0F9E8D7C-6B5A-4F3E-2D1C-0B9A8F7E6D5C").unwrap();
+    for name in [OBSERVED_MARKER, other.as_str()] {
+        write_debugger_marker(
+            &config,
+            name,
+            &before.encode(),
+            crate::durable::Flush::Ordered,
+        )
+        .unwrap();
+    }
+    let listed = || {
+        let mut names: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    text,
+                )
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let was = listed();
+    assert_eq!(
+        read_records_as(&config, None, |_| false).observed,
+        Some(before)
+    );
+    let seen = ObservedMarker {
+        mode: DebuggerMode::Enabled,
+        since: 200,
+        origin: Origin::Unknown,
+    };
+    settle_markers_as(&config, None, Some(seen), None);
+    assert_eq!(listed(), was, "nothing written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The record from before records named their Mac keeps its word on a Mac with no record of
+/// its own yet, and is written once as this Mac's own, so a run aterm decided, which reads only
+/// this Mac's, has it too; the earlier record is left as it stands for the builds that still
+/// write it, and a later change of it by one of them is not taken again. NEGATIVE CONTROL (run):
+/// a window that reads the earlier record without writing it as its own leaves this Mac with
+/// none.
+#[test]
+fn the_earlier_record_is_kept_once_as_this_macs_own() {
+    use aterm_types::macos_setup::debugger_record::observed_on;
+    let own = observed_on("6A1E64F2-1C3B-4D5E-8F90-0A1B2C3D4E5F").unwrap();
+    let dir = scratch("observed-earlier");
+    let config = dir.join("aterm.toml");
+    let was_on = ObservedMarker {
+        mode: DebuggerMode::Enabled,
+        since: 50,
+        origin: Origin::Unknown,
+    };
+    let write_before = |marker: ObservedMarker| {
+        write_debugger_marker(
+            &config,
+            OBSERVED_MARKER,
+            &marker.encode(),
+            crate::durable::Flush::Ordered,
+        )
+        .unwrap();
+    };
+    write_before(was_on);
+    assert_eq!(
+        read_records_as(&config, Some(&own), |_| false).observed,
+        Some(was_on)
+    );
+    assert_eq!(
+        read_debugger_marker(&config, &own).map(|text| text.trim().to_owned()),
+        Some(was_on.encode()),
+        "written as this Mac's own"
+    );
+    assert_eq!(
+        read_debugger_marker(&config, OBSERVED_MARKER).map(|text| text.trim().to_owned()),
+        Some(was_on.encode()),
+        "left as it stands"
+    );
+    write_before(ObservedMarker {
+        mode: DebuggerMode::Disabled,
+        since: 60,
+        origin: Origin::Unknown,
+    });
+    assert_eq!(
+        read_records_as(&config, Some(&own), |_| false).observed,
+        Some(was_on),
+        "taken once"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(unix)]
 #[test]
 fn the_records_reader_keeps_a_live_child_names_a_stale_one_and_drops_an_unreadable_one() {
@@ -275,7 +489,7 @@ fn the_records_reader_keeps_a_live_child_names_a_stale_one_and_drops_an_unreadab
     };
     write_debugger_marker(
         &config,
-        OBSERVED_MARKER,
+        &mine(),
         &observed.encode(),
         crate::durable::Flush::Ordered,
     )
@@ -705,7 +919,7 @@ fn a_peer_aterms_change_is_judged_against_the_shared_record() {
     let write = |marker: ObservedMarker| {
         write_debugger_marker(
             &config,
-            OBSERVED_MARKER,
+            &mine(),
             &marker.encode(),
             crate::durable::Flush::Ordered,
         )
@@ -748,7 +962,7 @@ fn a_peer_aterms_change_is_judged_against_the_shared_record() {
     let facts = b.facts(true, probe(DebuggerMode::Enabled), SelfHardening::Hardened);
     assert_eq!(facts.recorded.map(|m| m.origin), Some(Origin::Aterm));
     assert_eq!(
-        read_debugger_marker(&config, OBSERVED_MARKER)
+        read_debugger_marker(&config, &mine())
             .and_then(|text| ObservedMarker::parse(&text))
             .map(|m| (m.since, m.origin)),
         Some((302, Origin::Aterm)),
@@ -801,7 +1015,7 @@ fn a_peer_reading_between_a_changes_result_and_its_record_files_it_as_aterms() {
     };
     write_debugger_marker(
         &config,
-        OBSERVED_MARKER,
+        &mine(),
         &before.encode(),
         crate::durable::Flush::Ordered,
     )
@@ -858,7 +1072,7 @@ fn a_peer_reading_between_a_changes_result_and_its_record_files_it_as_aterms() {
         assert_eq!(facts.recorded.map(|m| m.origin), Some(Origin::Aterm));
     }
     assert_eq!(
-        read_debugger_marker(&config, OBSERVED_MARKER)
+        read_debugger_marker(&config, &mine())
             .and_then(|text| ObservedMarker::parse(&text))
             .map(|m| (m.mode, m.origin)),
         Some((DebuggerMode::Enabled, Origin::Aterm))
@@ -884,7 +1098,7 @@ fn a_released_changes_marker_read_before_its_removal_is_not_adopted_again() {
     };
     write_debugger_marker(
         &config,
-        OBSERVED_MARKER,
+        &mine(),
         &ObservedMarker {
             mode: DebuggerMode::Disabled,
             since: 100,
@@ -954,7 +1168,7 @@ fn a_records_read_naming_the_jobs_own_exited_child_keeps_its_marker() {
     };
     write_debugger_marker(
         &config,
-        OBSERVED_MARKER,
+        &mine(),
         &ObservedMarker {
             mode: DebuggerMode::Disabled,
             since: 100,
@@ -1035,7 +1249,7 @@ fn a_re_probe_judged_at_a_pending_records_read_keeps_the_marker_until_then() {
     };
     write_debugger_marker(
         &config,
-        OBSERVED_MARKER,
+        &mine(),
         &ObservedMarker {
             mode: DebuggerMode::Enabled,
             since: 100,

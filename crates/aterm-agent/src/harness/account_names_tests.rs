@@ -1223,12 +1223,10 @@ fn import(bench: &Bench, words: &[&str]) -> Took {
 /// installed (a path nothing runs), a window that ends `done` (running `during` while it is
 /// open) and a pass after it that drops no cookie and asks after no session (Claude Code's, which
 /// aterm cannot see); every sign-in a panic, as [`NoSignIn`]'s.
-#[cfg(unix)]
 struct Desk {
     during: Option<Box<dyn Fn()>>,
 }
 
-#[cfg(unix)]
 impl cli::AccountsHost for Desk {
     fn stdin_is_terminal(&self) -> bool {
         true
@@ -1333,13 +1331,6 @@ fn browser(bench: &Bench, words: &[&str]) -> Took {
     }
 }
 
-/// Off Unix, no run at a desk: each starts a person's sign-in, which only Unix queues
-/// (`accounts::manual_signin_capability`).
-#[cfg(not(unix))]
-fn browser_at_a_desk(_: &Bench, _: &str, _: &str) -> (Vec<String>, Vec<String>) {
-    (Vec::new(), Vec::new())
-}
-
 /// `accounts browser <pk>`, the account `typed` reached, run at a desk ([`Desk`]) on a bench of
 /// its own over the same roster and lab, three times: a window that closes done, which names the
 /// account by its names as it opens and closes (`opening the browser profile aterm keeps for
@@ -1347,9 +1338,7 @@ fn browser_at_a_desk(_: &Bench, _: &str, _: &str) -> (Vec<String>, Vec<String>) 
 /// during which the roster changes, whose result is not recorded, said with no label (`result
 /// was not recorded: …`), exiting 1; and one while the row is in shared custody, refused naming
 /// the account by its names (`<shown>: this account requires a fresh root-authorized shared
-/// renewal`). What each printed, and what is wrong with each run. Unix alone, as each starts a
-/// person's sign-in, which only Unix queues.
-#[cfg(unix)]
+/// renewal`). What each printed, and what is wrong with each run.
 fn browser_at_a_desk(bench: &Bench, typed: &str, pk: &str) -> (Vec<String>, Vec<String>) {
     let (mut printed, mut faults) = (Vec::new(), Vec::new());
     let own = Bench::new(&Fixture {

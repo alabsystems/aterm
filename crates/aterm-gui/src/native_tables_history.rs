@@ -265,6 +265,13 @@ pub(crate) enum Line {
         by: Author,
         cell: Entry,
     },
+    /// One line of what the record over it says of itself (`By:`, `Why:`, `Evidence:`; a
+    /// version 2 record's statement, [`Author::statement`]), the `n`th of its record's.
+    Said {
+        operation: [u8; 32],
+        n: usize,
+        text: String,
+    },
     /// Row or Cell scope with nothing selected.
     Unselected,
     /// The last line: nothing older was read.
@@ -638,6 +645,13 @@ pub(crate) fn lines(
         {
             cell.ringed = true;
         }
+        // What the record says of who made it, why and on what evidence, under its line.
+        let said = written
+            .by
+            .statement()
+            .into_iter()
+            .enumerate()
+            .map(|(n, text)| Line::Said { operation, n, text });
         if let [_] = cells.as_slice() {
             let cell = cells.remove(0);
             out.push(Line::One {
@@ -646,6 +660,7 @@ pub(crate) fn lines(
                 here,
                 cell,
             });
+            out.extend(said);
             continue;
         }
         let rows = cells
@@ -665,6 +680,7 @@ pub(crate) fn lines(
             open,
             ringed: folded && cells.iter().any(|cell| cell.ringed),
         });
+        out.extend(said);
         if !folded {
             out.extend(cells.into_iter().map(|cell| Line::Cell {
                 operation,
@@ -852,9 +868,12 @@ fn key_of(line: &Line) -> Option<String> {
         )),
         Line::More => Some(MORE.to_owned()),
         Line::Choice { which, n, .. } => Some(format!("{CHOOSE}{}/{n}", which.slug())),
-        Line::NotWrittenHead | Line::Day(_) | Line::Unselected | Line::Start | Line::Note(_) => {
-            None
-        }
+        Line::NotWrittenHead
+        | Line::Day(_)
+        | Line::Said { .. }
+        | Line::Unselected
+        | Line::Start
+        | Line::Note(_) => None,
     }
 }
 
@@ -896,9 +915,12 @@ fn controls(line: &Line) -> Vec<String> {
         | Line::Wrote { .. }
         | Line::More
         | Line::Choice { .. } => key_of(line).into_iter().collect(),
-        Line::NotWrittenHead | Line::Day(_) | Line::Unselected | Line::Start | Line::Note(_) => {
-            Vec::new()
-        }
+        Line::NotWrittenHead
+        | Line::Day(_)
+        | Line::Said { .. }
+        | Line::Unselected
+        | Line::Start
+        | Line::Note(_) => Vec::new(),
     }
 }
 
@@ -1696,6 +1718,17 @@ fn nodes(lines: &[Line], look: &Look) -> (Vec<UiNode>, BTreeMap<String, usize>, 
         out.push(match each {
             Line::NotWrittenHead => note("tables/history/unwritten".to_owned(), "NOT WRITTEN"),
             Line::Day(day) => note(format!("tables/history/day/{n}"), day),
+            Line::Said {
+                operation,
+                n: m,
+                text,
+            } => note(
+                format!(
+                    "tables/history/said/{}/{m}",
+                    aterm_codec::hex::encode_lower(operation)
+                ),
+                text,
+            ),
             Line::Unselected => note(
                 "tables/history/unselected".to_owned(),
                 "Select a cell to see its history",

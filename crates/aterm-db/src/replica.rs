@@ -40,10 +40,16 @@ pub const MAX_TABLES: usize = 64;
 
 /// One selected table's digest, operation digests, and conflict proof keys.
 pub type MeshTableSummary = (Digest, BTreeSet<Digest>, BTreeSet<ProofKey>);
-/// The bound of one table's operation inventory.
-pub const MAX_RECORDS: usize = 8192;
-/// The bound of one table's conflict-proof inventory.
-pub const MAX_PROOFS: usize = MAX_RECORDS * 2 + aterm_secrets::commons::constraints::MAX_BINDINGS;
+/// The most conflict-proof keys one whole list carries on `atdb/7` and `atdb/8`
+/// ([`Tables::ProofList`]): what the builds that speak them (0.203.0 to 0.206.0) take, their
+/// `MAX_PROOFS` (twice their 8,192-record table inventory and a roster's bindings). It bounds that
+/// released wire alone: on `atdb/9` the proofs reconcile by range ([`reconcile_proofs`]) and no
+/// count of a table's records or proofs bounds them.
+const LISTED_PROOFS: usize = 2 * 8192 + aterm_secrets::commons::constraints::MAX_BINDINGS;
+/// The bytes of operation IDs the backfill hints remember across every table ([`Backfill`]):
+/// 32 bytes an ID, so 131,072 IDs. Past it the hints keep what they hold and remember no more;
+/// the regular scan still visits every table and its round still drains the whole difference.
+const WANTED_BYTES: usize = 4 << 20;
 /// The records of one batch, each way; also the bound of a round's history-key needs.
 pub const BATCH: usize = 16;
 /// How many table stores a replica keeps between sessions ([`Replica`]'s `stores`): a round
@@ -388,6 +394,15 @@ pub struct Report {
     pub matching_inventory: Option<MatchingInventory>,
     /// This round used receive-only recovery storage. It restores no primary writer custody.
     pub recovery: bool,
+    /// This side's selection for the round could not read the primary catalog and fell back to
+    /// the recovery region's tables (`Round::select_tables`), so its list may leave out tables
+    /// its selection takes once the primary reads again ([`Self::listed_short`]). A table served
+    /// from its recovery store beside a primary catalog that reads ([`Self::recovery`]) is no
+    /// such fallback.
+    pub primary_unread: bool,
+    /// This side's selection for the round could not take up its ring tables (the writer's ring
+    /// read failed) and listed none of them ([`Self::listed_short`]).
+    pub rings_unlisted: bool,
     /// The selected table, if both peers had one in common.
     pub table: Option<Digest>,
     /// The selected table's scope, whose digest is [`Self::table`]: which application table the
@@ -424,13 +439,18 @@ pub struct Report {
     /// a round repaired nothing of its table: it is no success (`crate::runtime`'s discovery
     /// retries it soon), and the initiator takes the table again in its next round.
     pub table_deferred: bool,
-    /// This side initiated the round and asked the peer which tables differ (`witness`).
-    pub witnesses_asked: bool,
-    /// This side initiated the round and its table came from the scan over the tables both sides
-    /// list: not a push or a lead, a follow-up, a backfill hint, or a table whose witness
-    /// differed. Once the scan has taken one such turn with a peer, only such a round moves its
-    /// place ([`crate::control::Repair::cycled`]).
-    pub regular: bool,
+    /// Why this side, which initiated the round, asked the peer which tables differ (`witness`);
+    /// none where it did not ask or did not initiate ([`Self::witnesses_asked`]).
+    pub asked: Option<Ask>,
+    /// Which of this side's turns took the round's table, where this side initiated the round and
+    /// selected one ([`TableTurn`]); none for a responder or a round that selected none. Once the
+    /// scan has taken one regular turn with a peer, only such a round moves its place
+    /// ([`Self::regular`], [`crate::control::Repair::cycled`]).
+    pub turn: Option<TableTurn>,
+    /// What a restart of the scan's cycle with this peer threw away ([`Repair::restart_cycle`]),
+    /// where this round, which this side initiated, is the first since one to trade table lists;
+    /// none where no restart came since the last round that did.
+    pub sweep: Option<Sweep>,
     /// Encrypted historical handoffs written to the peer in this
     /// round. This is not a separate durable key-receipt acknowledgement.
     pub keys_sent: usize,
@@ -445,6 +465,96 @@ pub struct Report {
     /// this round read its inventory counts in those and not here.
     pub added: usize,
 }
+
+impl Report {
+    /// Whether the tables this side listed in the round may leave out some its selection takes:
+    /// it fell back to the recovery region ([`Self::primary_unread`]) or dropped its ring tables
+    /// ([`Self::rings_unlisted`]). The peer reads such lists as this side leaving those tables out
+    /// ([`Listing::takes`]), and a later selection that takes them again tells it nothing, so this
+    /// side owes the peer a round whose lists are whole
+    /// (`crate::runtime::discovery::Hints::settle`).
+    #[must_use]
+    pub const fn listed_short(&self) -> bool {
+        self.primary_unread || self.rings_unlisted
+    }
+
+    /// This side initiated the round and its table came from the scan over the tables both sides
+    /// list ([`TableTurn::Regular`]): not a push or a lead, a follow-up, a backfill hint, or a
+    /// table whose witness differed.
+    #[must_use]
+    pub const fn regular(&self) -> bool {
+        matches!(self.turn, Some(TableTurn::Regular))
+    }
+
+    /// This side initiated the round and asked the peer which tables differ ([`Self::asked`]).
+    #[must_use]
+    pub const fn witnesses_asked(&self) -> bool {
+        self.asked.is_some()
+    }
+}
+
+/// Which of the initiator's turns took a round's table ([`Report::turn`]), by the chain that picks
+/// it: a push's table, then a follow-up, then a led table, then a backfill hint, then the regular
+/// turn, which visits a table whose witness differed while any remain and otherwise takes the
+/// scan's next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TableTurn {
+    /// The table a push names (`crate::runtime::Pusher`).
+    Pushed,
+    /// The follow-up of a round that moved a full [`BATCH`] of the table.
+    Batch,
+    /// The follow-up of a round that deferred the table: its one retry.
+    Retry,
+    /// A led table ([`Repair::lead`]).
+    Led,
+    /// A backfill hint: a table a peer's inventory showed records of that this Mac lacks.
+    Hinted,
+    /// The regular turn's visit to a table whose witness differed when this side last asked.
+    Visit,
+    /// The scan's turn over the tables both sides list: the turn that moves the scan's place and
+    /// counts toward its cycle ([`Repair::cycled`]).
+    Regular,
+}
+
+/// Why a round this side initiated asked the peer which tables differ ([`Report::asked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Ask {
+    /// This side had traded no table list with the peer as initiator: a first round.
+    First,
+    /// The last table list this side traded as initiator is [`WITNESS_GAP_MS`] old by the wall
+    /// clock.
+    Gap,
+    /// The dial scheduler asked the round to audit ([`Repair::audit`]).
+    Audit,
+    /// The dial scheduler asked the round to ask ([`Repair::ask`]).
+    Asked,
+    /// The peer asked this side, in a round it began outside the gap of this side's own last
+    /// ask: this side's next round asks back, once.
+    Peer,
+}
+
+/// What a restart of the scan's cycle with a peer threw away ([`Repair::restart_cycle`]), as the
+/// first round to trade table lists after it reports ([`Report::sweep`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Sweep {
+    /// The scan had not yet taken its turn at each table both list: no completed cycle was lost.
+    Restarted,
+    /// The scan had completed its cycle ([`Repair::cycled`]), which the restart threw away.
+    Discarded,
+}
+
+/// Work a peer's state names for this side's next round with it ([`Repair::owed`]), in the order
+/// a round takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Owed {
+    /// A follow-up: a deferred table's retry, or the next batch of a table that moved a full one.
+    FollowUp,
+    /// A led table.
+    Lead,
+    /// A table whose witness differed and is not yet visited.
+    Differing,
+}
+
 /// Why a completed table round could not exchange an inventory. This is a
 /// local observation; an unavailable peer inventory carries no remote cause.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -542,20 +652,52 @@ impl Listing {
     pub(crate) fn same_tables(&self, other: &Self) -> bool {
         self.listed == other.listed && self.unlisted == other.unlisted
     }
+
+    /// Whether these lists were read at or after `at`: a round that began then traded them.
+    pub(crate) fn read_since(&self, at: Instant) -> bool {
+        self.at >= at
+    }
+}
+
+/// What a session's database protocol lets table repair do: set by the control session for each
+/// connection, from the protocol it negotiated (`crate::control`'s `Protocol::tables`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tables {
+    /// `atdb/9`: each table's operation inventory and its conflict-proof inventory are reconciled
+    /// by range ([`reconcile_inventory`], [`reconcile_proofs`]), and the operations' whole
+    /// difference drained in one round, parents first.
+    #[default]
+    Ranges,
+    /// `atdb/7` and `atdb/8` (0.203.0 to 0.206.0): the operations as [`Self::Ranges`], the
+    /// conflict proofs traded as one whole list of at most [`LISTED_PROOFS`] keys each way, as
+    /// those builds trade them.
+    ProofList,
+    /// A protocol before `atdb/7` (the ALPN it was negotiated by): aterm 0.202.0 and older, whose
+    /// table round trades whole operation lists. The round is refused before it reads or sends
+    /// anything of a table, with a line naming that protocol and the builds that speak it
+    /// ([`refused_below_atdb_7`]).
+    Refused(&'static str),
+}
+
+/// The line a round with a peer whose protocol `alpn` comes before `atdb/7` is refused table
+/// repair with ([`Tables::Refused`]): the protocol it offered and the builds that speak it.
+#[must_use]
+pub fn refused_below_atdb_7(alpn: &str) -> String {
+    format!(
+        "table repair refused: the peer offered {alpn}, the database protocol of aterm 0.202.0 \
+         and older; table repair takes atdb/7 or later (aterm 0.203.0 and newer)"
+    )
 }
 
 /// Volatile fairness hints. Inventory and durable receipts decide what is missing.
 #[derive(Clone, Default, Debug)]
 pub struct Repair {
-    /// This session speaks `atdb/7`: each table's operation inventory is reconciled by range and
-    /// its whole difference drained in one round, parents first ([`reconcile_inventory`]). Set
-    /// by the control session for each connection, from the protocol it negotiated.
-    pub(crate) reconcile: bool,
+    /// What this session's protocol lets table repair do ([`Tables`]).
+    pub(crate) tables: Tables,
     history: Option<Digest>,
     table: Option<Digest>,
     table_follow_up: Option<(Digest, usize)>,
     table_yield: bool,
-    records: BTreeMap<Digest, Digest>,
     conflicts: BTreeMap<Digest, ProofKey>,
     legacy_probe: bool,
     pub(crate) retry_probe: bool,
@@ -571,6 +713,13 @@ pub struct Repair {
     /// When (unix ms) this side last asked the peer for witnesses: a peer's ask heard within
     /// [`WITNESS_GAP_MS`] of it answers this side's own, and is not echoed back.
     asked_ms: Option<u64>,
+    /// Why the next round this side initiates asks the peer which tables differ, where something
+    /// asked it to ([`Ask`]): [`Self::ask`], [`Self::audit`], or a peer's ask this side heard. The
+    /// next round to trade lists as initiator takes it, and reports it if it asks.
+    ask_why: Option<Ask>,
+    /// What [`Self::restart_cycle`] threw away, until the next round this side initiates trades
+    /// table lists and reports it ([`Report::sweep`]).
+    restarted: Option<Sweep>,
     /// The common tables whose witnesses differed when this side last asked ([`witness`]): the
     /// regular turn visits these alone while any remain; a table leaves as it is selected. A
     /// peer's answer replaces the set, so nothing that must outlive an ask is kept here
@@ -625,7 +774,7 @@ impl Repair {
     /// else names again (a table the lists newly share) would otherwise wait for the scan's turn
     /// or an audit; the next round to choose the table spends the lead whatever that round's
     /// exchange does ([`Self::chose`]), so a table whose exchange fails each time is owed nothing
-    /// after its second try, and leaves no work pending ([`Self::pending`]) unless the scheduler
+    /// after its second try, and leaves no work pending ([`Self::owed`]) unless the scheduler
     /// names it again. Led tables are taken in turn, each after the one last taken,
     /// and the [`TABLE_BURST`]th led round in a row yields the next round to the regular turn,
     /// so the scan's place stays its own and it still gets one round in `TABLE_BURST + 1`. A
@@ -726,6 +875,7 @@ impl Repair {
     /// comes first.
     pub(crate) fn audit(&mut self) {
         self.ask();
+        self.ask_why = Some(Ask::Audit);
         #[cfg(test)]
         if AUDIT_FOLLOWS.with(std::cell::Cell::get) {
             return;
@@ -737,6 +887,9 @@ impl Repair {
     /// (`witness`), as a first round does. The ask otherwise waits for [`WITNESS_GAP_MS`] of wall
     /// time since the last table list traded, which a clock set back never reaches.
     pub(crate) fn ask(&mut self) {
+        if self.ask_why != Some(Ask::Audit) {
+            self.ask_why = Some(Ask::Asked);
+        }
         #[cfg(test)]
         if ASK_BY_CLOCK.with(std::cell::Cell::get) {
             self.listed_ms = self.listed_ms.map(|at| at.saturating_sub(WITNESS_GAP_MS));
@@ -745,10 +898,19 @@ impl Repair {
         self.listed_ms = None;
     }
 
-    /// Work this state already names for this side's next round with this peer: a led table, a
-    /// table whose witness differed and is not yet visited, or a follow-up.
-    pub(crate) fn pending(&self) -> bool {
-        !self.lead.is_empty() || !self.differing.is_empty() || self.table_follow_up.is_some()
+    /// Work this state already names for this side's next round with this peer ([`Owed`]): a
+    /// follow-up, a led table, or a table whose witness differed and is not yet visited, the
+    /// first a round takes.
+    pub(crate) fn owed(&self) -> Option<Owed> {
+        if self.table_follow_up.is_some() {
+            Some(Owed::FollowUp)
+        } else if !self.lead.is_empty() {
+            Some(Owed::Lead)
+        } else if !self.differing.is_empty() {
+            Some(Owed::Differing)
+        } else {
+            None
+        }
     }
 
     /// The scan has taken as many regular turns ([`Report::regular`]) since
@@ -762,8 +924,17 @@ impl Repair {
 
     /// Count the scan's regular turns from none again ([`Self::cycled`]), as for a peer first
     /// met. The scan keeps its place, which a visit to a table whose witness differs moves again
-    /// until the next regular turn.
+    /// until the next regular turn. What it threw away waits for the next round this side
+    /// initiates that trades table lists, which reports it ([`Report::sweep`]); where several
+    /// restarts come before that round, it reports a completed cycle if any of them threw one
+    /// away.
     pub(crate) fn restart_cycle(&mut self) {
+        let lost = if self.cycled() {
+            Sweep::Discarded
+        } else {
+            Sweep::Restarted
+        };
+        self.restarted = self.restarted.max(Some(lost));
         self.turns = 0;
         self.common = None;
     }
@@ -803,6 +974,13 @@ impl Repair {
         self.common = Some(common);
         self.turns = common;
     }
+
+    /// This state once a witness ask named `table` as differing, not yet visited
+    /// ([`Self::owed`]) (tests).
+    #[cfg(test)]
+    pub(crate) fn differs(&mut self, table: Digest) {
+        self.differing.insert(table);
+    }
 }
 
 /// Volatile work hints learned from authenticated inventory exchanges. These
@@ -833,19 +1011,31 @@ impl Backfill {
         if !self.wanted.contains_key(&table) && self.wanted.len() >= MAX_TABLES {
             return;
         }
+        if let Some(wanted) = self.wanted.get_mut(&table) {
+            wanted.retain(|record| !known.contains(record));
+        }
+        // Different peers can advertise disjoint sets. Bound the remembered union by its bytes
+        // across every table ([`WANTED_BYTES`]); ordinary scans still visit every table.
+        let mut room = (WANTED_BYTES / std::mem::size_of::<Digest>())
+            .saturating_sub(self.wanted.values().map(BTreeSet::len).sum());
         let wanted = self.wanted.entry(table).or_default();
-        wanted.retain(|record| !known.contains(record));
-        // Different peers can advertise disjoint sets. Bound the remembered
-        // union by one inventory's limit; ordinary scans still visit every table.
         for record in remote.difference(known) {
-            if wanted.len() == MAX_RECORDS {
+            if room == 0 {
                 break;
             }
-            wanted.insert(*record);
+            if wanted.insert(*record) {
+                room -= 1;
+            }
         }
         if wanted.is_empty() {
             self.wanted.remove(&table);
         }
+    }
+
+    /// The operation IDs the hints remember, across every table (tests).
+    #[cfg(test)]
+    pub(crate) fn wanted_ids(&self) -> usize {
+        self.wanted.values().map(BTreeSet::len).sum()
     }
 
     fn retained(&mut self, table: Digest, record: Digest) {
@@ -944,6 +1134,11 @@ pub struct Replica {
     /// thread-local, because a test's responder runs on its own thread.
     #[cfg(test)]
     echoes: bool,
+    /// A source that leaves a backlog (tests): each round sends at most this many operation
+    /// batches and then says nothing is left, as a round cut short by a sender whose offer
+    /// changed does.
+    #[cfg(test)]
+    drain_batches: Option<usize>,
 }
 /// One period and the claims ring's tables within [`crate::clock::BAND`] periods of it, each
 /// table's digest with its period ([`Replica::offers`]).
@@ -988,6 +1183,8 @@ impl Replica {
             ring_clock: None,
             #[cfg(test)]
             echoes: false,
+            #[cfg(test)]
+            drain_batches: None,
         })
     }
     /// Automatic catalog and application subscriptions. Construction performs
@@ -1068,6 +1265,8 @@ impl Replica {
             ring_clock: None,
             #[cfg(test)]
             echoes: false,
+            #[cfg(test)]
+            drain_batches: None,
         }
     }
 
@@ -1097,6 +1296,13 @@ impl Replica {
     #[cfg(test)]
     pub(crate) const fn with_marks(mut self, marks: bool) -> Self {
         self.marks = marks;
+        self
+    }
+
+    /// Send at most `batches` operation batches a round ([`Self::drain_batches`], tests).
+    #[cfg(test)]
+    pub(crate) const fn with_drain_batches(mut self, batches: usize) -> Self {
+        self.drain_batches = Some(batches);
         self
     }
 
@@ -1643,6 +1849,12 @@ impl Replica {
         repair.batch_deferral = None;
         repair.interrupted = None;
         repair.clock = None;
+        if let Tables::Refused(alpn) = repair.tables {
+            return Err(Error::repair(
+                &refused_below_atdb_7(alpn),
+                aterm_types::network_state::RepairCause::NeedsUpdate,
+            ));
+        }
         // The round's read admissions with no call on `stream` between them share one look
         // (`GroupLook`); every call on it lets that look go first (`Wire`), and the group drops
         // here, before the control exchange's next network step.
@@ -1905,6 +2117,21 @@ impl Replica {
         Ok(taken.is_ok_and(|taken| taken.contains_key(&table)))
     }
 
+    /// Whether this Mac's selection lists short now ([`Report::listed_short`]): the selection a
+    /// round makes (`Round::select_tables`), made with no peer, so it takes up what a round's
+    /// would (it enrolls the subscriptions where none is established, and asks the writer for
+    /// ring state it cannot read) and tells nobody anything. The dial scheduler asks once the
+    /// rounds a short list owed a seat are spent (`crate::runtime::discovery::Hints::spent`).
+    ///
+    /// # Errors
+    /// Custody, admission or the subscription read fails.
+    pub(crate) fn listed_short(&self) -> Result<bool> {
+        let mut round = self.round(None)?;
+        let mut report = Report::default();
+        round.select_tables(None, &mut report)?;
+        Ok(report.listed_short())
+    }
+
     /// The tables this replica selects (its subscriptions), by digest.
     ///
     /// # Errors
@@ -2006,8 +2233,8 @@ enum OfferedIds {
 
 struct Inventory {
     known: BTreeSet<Digest>,
-    /// On `atdb/7`, the reconciliation snapshot of `known` over the store's causal index, read in
-    /// the same open ([`reconcile_inventory`]).
+    /// The reconciliation snapshot of `known` over the store's causal index, read in the same
+    /// open where the round reconciles it ([`reconcile_inventory`]).
     snapshot: Option<astream_wire::sync::rbsr::Snapshot>,
     offered: OfferedIds,
     offered_count: usize,
@@ -2081,59 +2308,6 @@ impl Inventory {
             OfferedIds::Only(ids) => ids.contains(id),
             OfferedIds::Except(excluded) => self.known.contains(id) && !excluded.contains(id),
         }
-    }
-
-    fn offered_cycle(&self, after: Option<Digest>) -> impl Iterator<Item = &Digest> {
-        use std::ops::Bound::{Excluded, Included, Unbounded};
-        (self.offered_count != 0)
-            .then(|| {
-                let tail = self.offered_range(match after {
-                    Some(after) => (Excluded(after), Unbounded),
-                    None => (Unbounded, Unbounded),
-                });
-                let head = after
-                    .into_iter()
-                    .flat_map(move |after| self.offered_range((Unbounded, Included(after))));
-                tail.chain(head)
-            })
-            .into_iter()
-            .flatten()
-    }
-
-    fn offered_range(
-        &self,
-        bounds: (std::ops::Bound<Digest>, std::ops::Bound<Digest>),
-    ) -> impl Iterator<Item = &Digest> {
-        let (included, exclusions) = match &self.offered {
-            OfferedIds::All => (&self.known, None),
-            OfferedIds::Only(ids) => (ids, None),
-            OfferedIds::Except(excluded) => (&self.known, Some(excluded)),
-        };
-        let all = exclusions.is_none();
-        let mut excluded = exclusions
-            .map(|excluded| excluded.range(bounds))
-            .into_iter()
-            .flatten()
-            .peekable();
-        included.range(bounds).filter(move |id| {
-            if all {
-                return true;
-            }
-            // Both ranges are sorted. Advance each excluded ID at most once instead of searching the
-            // exclusion tree again for each retained ID.
-            loop {
-                match excluded.peek().map(|blocked| (*blocked).cmp(*id)) {
-                    Some(std::cmp::Ordering::Less) => {
-                        excluded.next();
-                    }
-                    Some(std::cmp::Ordering::Equal) => {
-                        excluded.next();
-                        return false;
-                    }
-                    Some(std::cmp::Ordering::Greater) | None => return true,
-                }
-            }
-        })
     }
 }
 
@@ -2606,10 +2780,18 @@ impl Round<'_> {
         Ok(wires)
     }
 
-    /// Selected identities may become withheld while the peer sends its batch.
-    /// Recheck the actual send turn and restart a legacy round rather than
-    /// encoding an unavailable selection as an empty, apparently drained batch.
-    fn prepare_operations(
+    /// One operation batch of `store`: the wires of `ids` in their order ([`wires_of`]), keeping
+    /// the store once they are all read.
+    fn batch_of(&self, store: OpenStore, ids: &[Digest]) -> Result<Vec<Vec<u8>>> {
+        let wires = wires_of(&store, ids)?;
+        self.keep(store);
+        Ok(wires)
+    }
+
+    /// The operation batch of `ids` as a round's drain prepares it, in the order given: none
+    /// opens no store (tests).
+    #[cfg(test)]
+    pub(crate) fn prepare_operations(
         &self,
         session: &Session<'_>,
         id: Digest,
@@ -2618,13 +2800,7 @@ impl Round<'_> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let store = self.open(session, id)?;
-        let wires = store.replication_wires_unchecked(ids);
-        if wires.len() != ids.len() {
-            return Err(Error::snapshot_changed());
-        }
-        self.keep(store);
-        Ok(wires)
+        self.batch_of(self.open(session, id)?, ids)
     }
 
     fn retain_primary(&self, peer: Actor, id: Digest) -> Result<bool> {
@@ -2947,28 +3123,47 @@ impl Round<'_> {
                 }
             }
         });
+        #[cfg(test)]
+        let (fallback_untold, rings_untold) = (
+            FALLBACK_UNTOLD.with(std::cell::Cell::get),
+            RINGS_DROP_UNTOLD.with(std::cell::Cell::get),
+        );
+        #[cfg(not(test))]
+        let (fallback_untold, rings_untold) = (false, false);
         if recovery.get() {
             self.commons = Some((directory.recovery(), config));
             report.recovery = true;
+            // The recovery region's tables stand in for the selection: the list says so.
+            report.primary_unread = !fallback_untold;
         }
         let existing = existing?;
         let Some((directory, _)) = &self.commons else {
             return Ok(());
         };
+        // Ring tables whose state the writer cannot read or rebuild are left out of this
+        // round's list, and the list says so: the next writer pass may take them up again.
+        let rings_unlisted = std::cell::Cell::new(false);
         self.tables = match existing {
             Some(tables) => tables,
             None => self.local_write(peer, |session| {
                 let mut tables = directory.subscriptions(session, &policy)?;
                 if !directory.is_recovery() {
-                    tables.extend(
-                        directory
-                            .ring_subscriptions(session, &policy, self.now)
-                            .unwrap_or_default(),
-                    );
+                    let rings = directory.ring_subscriptions(session, &policy, self.now);
+                    #[cfg(test)]
+                    let rings = if RINGS_REFUSED.with(std::cell::Cell::get) {
+                        Err(Error::new("ring table state refused (test)"))
+                    } else {
+                        rings
+                    };
+                    match rings {
+                        Ok(rings) => tables.extend(rings),
+                        Err(_) => rings_unlisted.set(true),
+                    }
                 }
                 Ok(tables)
             })?,
         };
+        report.rings_unlisted = rings_unlisted.get() && !rings_untold;
         Ok(())
     }
 
@@ -2983,7 +3178,6 @@ impl Round<'_> {
         let read = Instant::now();
         self.keys(stream, peer, side, repair, report)?;
         self.select_tables(Some(peer), report)?;
-        repair.records.retain(|id, _| self.tables.contains_key(id));
         repair
             .conflicts
             .retain(|id, _| self.tables.contains_key(id));
@@ -3044,6 +3238,7 @@ impl Round<'_> {
                         })
                     {
                         repair.listed_ms = None;
+                        repair.ask_why.get_or_insert(Ask::Peer);
                     }
                     let common: BTreeSet<_> = local
                         .intersection(&received)
@@ -3117,6 +3312,9 @@ impl Round<'_> {
             listed: local.clone(),
         });
         if side == Side::Initiator {
+            // Whatever asked this round to ask is spent by its list trade, whether or not the
+            // list had room for the ask.
+            let why = repair.ask_why.take();
             if let Some(salt) = salt
                 && !answered.chunks.is_empty()
                 && let Some(differing) = witness::differing(
@@ -3129,8 +3327,22 @@ impl Round<'_> {
             }
             if salt.is_some() {
                 repair.asked_ms = listed_ms;
-                report.witnesses_asked = true;
+                report.asked = Some(why.unwrap_or(if repair.listed_ms.is_none() {
+                    Ask::First
+                } else {
+                    Ask::Gap
+                }));
             }
+            // The first list trade since a restart of the cycle reports what it threw away, once.
+            #[cfg(test)]
+            let kept = SWEEP_KEPT.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let kept = false;
+            report.sweep = if kept {
+                repair.restarted
+            } else {
+                repair.restarted.take()
+            };
             repair.listed_ms = listed_ms;
             repair.differing.retain(|id| common.contains(id));
             repair.common = Some(common.len());
@@ -3205,6 +3417,24 @@ impl Round<'_> {
         #[cfg(not(test))]
         let unwitnessed = false;
         let scans = unwitnessed || repair.differing.is_empty();
+        // Which turn takes the table, by the chain `priority` follows ([`TableTurn`]).
+        let table_turn = if pushed.is_some() {
+            TableTurn::Pushed
+        } else if let Some((_, completed)) = follow_up {
+            if completed == 0 {
+                TableTurn::Retry
+            } else {
+                TableTurn::Batch
+            }
+        } else if led.is_some() {
+            TableTurn::Led
+        } else if hinted.is_some() {
+            TableTurn::Hinted
+        } else if scans {
+            TableTurn::Regular
+        } else {
+            TableTurn::Visit
+        };
         let turn = if scans { &common } else { &repair.differing };
         let selected = match side {
             Side::Initiator => {
@@ -3293,7 +3523,7 @@ impl Round<'_> {
         }
         report.table = Some(id);
         report.scope = self.tables.get(&id).map(|(scope, _)| *scope);
-        report.regular = regular;
+        report.turn = (side == Side::Initiator).then_some(table_turn);
         let deferred = report.deferred;
         self.table(stream, peer, side, id, repair, report)?;
         // The exchange ended, so a led table leaves ([`Repair::lead`]); every return above left
@@ -3725,7 +3955,7 @@ impl Round<'_> {
             &mut local_cause,
         )?;
         report.recovery |= ready == Some(false);
-        // Sent only after the authorize that `exchange_inventory` runs first, which checks the
+        // Sent only after the authorize that the proof exchange runs first, which checks the
         // table's subscription (`Gate`).
         let local = self.local_policy_only(peer, |session| {
             if ready != Some(true) {
@@ -3746,10 +3976,25 @@ impl Round<'_> {
             Ok(Some(proofs))
         });
         let local = Self::table_read(local, &mut local_error, &mut local_cause)?;
-        let remote = exchange_inventory(stream, side, local.as_ref(), MAX_PROOFS, || {
-            self.local(peer, |_| Ok(()))
-        })?;
-        let peer_unavailable = remote.is_none();
+        let authorize = || self.local(peer, |_| Ok(()));
+        let (remote, peer_unavailable) = match repair.tables {
+            Tables::Ranges => {
+                let heard = reconcile_proofs(stream, side, local.as_ref(), authorize)?;
+                (heard.remote.map(PeerProofs::Reconciled), !heard.peer_ready)
+            }
+            Tables::ProofList => {
+                // A whole list is read whether or not this side's own was available.
+                let remote = exchange_proof_list(stream, side, local.as_ref(), authorize)?;
+                let unavailable = remote.is_none();
+                (remote.map(PeerProofs::Listed), unavailable)
+            }
+            Tables::Refused(alpn) => {
+                return Err(Error::repair(
+                    &refused_below_atdb_7(alpn),
+                    aterm_types::network_state::RepairCause::NeedsUpdate,
+                ));
+            }
+        };
         let (Some(local), Some(remote)) = (local, remote) else {
             repair.deferral = Some(InventoryDeferral {
                 inventory: "conflicts",
@@ -3761,16 +4006,7 @@ impl Round<'_> {
             report.deferred += 1;
             return Ok(false);
         };
-        let proofs: Vec<_> = cycle(&local, repair.conflicts.get(&id).copied())
-            .filter(|key| {
-                let mut fork = [0; 81];
-                fork[..48].copy_from_slice(&key[..48]);
-                fork[48] = 1;
-                !remote.contains(*key) && !remote.contains(&fork)
-            })
-            .take(BATCH)
-            .copied()
-            .collect();
+        let proofs = lacked_proofs(&local, &remote, repair.conflicts.get(&id).copied());
         if let Some(last) = proofs.last() {
             repair.conflicts.insert(id, *last);
         }
@@ -3840,36 +4076,29 @@ impl Round<'_> {
         // Reopen after negative evidence is durably applied in both directions.
         let mut local_error = None;
         let mut local_cause = None;
-        // Sent only after the authorize that `exchange_inventory` runs first, which checks the
+        // Sent only after the authorize that the reconciliation runs first, which checks the
         // table's subscription (`Gate`).
         let mut local = self
             .inventory_read_gated(
                 peer,
                 id,
                 Gate::Policy,
-                repair.reconcile,
+                true,
                 &mut local_error,
                 &mut local_cause,
             )
             .map_err(|error| at("operation inventory", error))?;
-        let remote = if repair.reconcile {
-            // The snapshot's headers are physical facts read with the inventory; the batches
-            // below recheck access as they always do.
-            let snapshot = local
-                .as_mut()
-                .and_then(|inventory| inventory.snapshot.take());
-            reconcile_inventory(stream, side, snapshot, || self.local(peer, |_| Ok(())))
-        } else {
-            exchange_inventory(
-                stream,
-                side,
-                local.as_ref().map(|inventory| &inventory.known),
-                MAX_RECORDS,
-                || self.local(peer, |_| Ok(())),
-            )
-        }
-        .map_err(|error| at("inventory exchange", error))?;
-        let peer_unavailable = remote.is_none();
+        // The snapshot's headers are physical facts read with the inventory; the batches below
+        // recheck access as they always do.
+        let snapshot = local
+            .as_mut()
+            .and_then(|inventory| inventory.snapshot.take());
+        let Heard { peer_ready, remote } =
+            reconcile_heard(stream, side, snapshot, RECONCILE_REMOTE_RECORDS, || {
+                self.local(peer, |_| Ok(()))
+            })
+            .map_err(|error| at("inventory exchange", error))?;
+        let peer_unavailable = !peer_ready;
         let (Some(local), Some(remote)) = (local, remote) else {
             repair.deferral = Some(InventoryDeferral {
                 inventory: "operations",
@@ -3893,98 +4122,66 @@ impl Round<'_> {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .observe(id, &local.known, &remote);
-        if repair.reconcile {
-            // The whole difference, parents first, in receipted batches until neither side has
-            // anything left to send: no per-round cap.
-            let ids: Vec<Digest> = local
-                .known
-                .iter()
-                .filter(|id| !remote.contains(*id) && local.offers(id))
-                .copied()
-                .collect();
-            self.inventory_read
-                .replace(Some((local.observation, local.fence)));
-            // Ordered parents first in the first batch's own store open, so the drain opens the
-            // store no more than its batches do.
-            let ordered = std::cell::RefCell::new(None::<Vec<Digest>>);
-            let sent = report.sent;
-            let mut next = 0;
-            loop {
-                let take = BATCH.min(ids.len() - next);
-                let prepare = |session: &Session<'_>| {
-                    if take == 0 {
-                        return Ok(Vec::new());
-                    }
-                    let store = self
-                        .open(session, id)
-                        .map_err(|error| at("batch preparation", error))?;
-                    let mut ordered = ordered.borrow_mut();
-                    let order = ordered.get_or_insert_with(|| store.causal_order_of(&ids));
-                    let wires = store.replication_wires_unchecked(&order[next..next + take]);
-                    if wires.len() != take {
-                        return Err(at("batch preparation", Error::snapshot_changed()));
-                    }
-                    self.keep(store);
-                    Ok(wires)
-                };
-                let received = match side {
-                    Side::Initiator => {
-                        self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
-                            .map_err(|error| at("operation send", error))?;
-                        self.receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
-                            .map_err(|error| at("operation receive", error))?
-                    }
-                    Side::Responder => {
-                        let received = self
-                            .receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
-                            .map_err(|error| at("operation receive", error))?;
-                        self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
-                            .map_err(|error| at("operation send", error))?;
-                        received
-                    }
-                };
-                next += take;
-                if take == 0 && received == 0 {
-                    break;
-                }
-            }
-            report.caught_up = report.sent - sent == ids.len();
-            return Ok(());
-        }
-        let mut ids: Vec<_> = local
-            .offered_cycle(repair.records.get(&id).copied())
-            .filter(|v| !remote.contains(*v))
-            .take(BATCH + 1)
+        // The whole difference, parents first, in receipted batches until neither side has
+        // anything left to send: no per-round cap.
+        let ids: Vec<Digest> = local
+            .known
+            .iter()
+            .filter(|id| !remote.contains(*id) && local.offers(id))
             .copied()
             .collect();
         self.inventory_read
             .replace(Some((local.observation, local.fence)));
-        // One more than a batch says the peer lacks more than this round sends.
-        let whole = ids.len() <= BATCH;
-        ids.truncate(BATCH);
-        if let Some(last) = ids.last() {
-            repair.records.insert(id, *last);
-        }
-        let prepare = |session: &Session<'_>| {
-            self.prepare_operations(session, id, &ids)
-                .map_err(|error| at("batch preparation", error))
-        };
+        // Ordered parents first in the first batch's own store open, so the drain opens the
+        // store no more than its batches do.
+        let ordered = std::cell::RefCell::new(None::<Vec<Digest>>);
         let sent = report.sent;
-        match side {
-            Side::Initiator => {
-                self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
-                    .map_err(|error| at("operation send", error))?;
-                self.receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
-                    .map_err(|error| at("operation receive", error))?;
-            }
-            Side::Responder => {
-                self.receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
-                    .map_err(|error| at("operation receive", error))?;
-                self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
-                    .map_err(|error| at("operation send", error))?;
+        let mut next = 0;
+        loop {
+            let take = BATCH.min(ids.len() - next);
+            #[cfg(test)]
+            let take = if self
+                .drain_batches
+                .is_some_and(|batches| next >= batches * BATCH)
+            {
+                0
+            } else {
+                take
+            };
+            let prepare = |session: &Session<'_>| {
+                if take == 0 {
+                    return Ok(Vec::new());
+                }
+                let store = self
+                    .open(session, id)
+                    .map_err(|error| at("batch preparation", error))?;
+                let mut ordered = ordered.borrow_mut();
+                let order = ordered.get_or_insert_with(|| store.causal_order_of(&ids));
+                self.batch_of(store, &order[next..next + take])
+                    .map_err(|error| at("batch preparation", error))
+            };
+            let received = match side {
+                Side::Initiator => {
+                    self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
+                        .map_err(|error| at("operation send", error))?;
+                    self.receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
+                        .map_err(|error| at("operation receive", error))?
+                }
+                Side::Responder => {
+                    let received = self
+                        .receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
+                        .map_err(|error| at("operation receive", error))?;
+                    self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
+                        .map_err(|error| at("operation send", error))?;
+                    received
+                }
+            };
+            next += take;
+            if take == 0 && received == 0 {
+                break;
             }
         }
-        report.caught_up = whole && report.sent - sent == ids.len();
+        report.caught_up = report.sent - sent == ids.len();
         Ok(())
     }
     /// Send a batch this side prepares and read its receipts. A table that keeps advancing through
@@ -4257,6 +4454,10 @@ thread_local! {
     pub(crate) static ASK_BY_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Mutant (tests): an audit asks and leaves a saved follow-up its table.
     pub(crate) static AUDIT_FOLLOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a round reports a restart of the cycle without taking it
+    /// ([`Report::sweep`]), as a flag on the peer's state would, which the endpoint's peer cache
+    /// keeps and brings back to every later round.
+    pub(crate) static SWEEP_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Mutant (tests): a table this side did not list in a round's lists may be taken whatever
     /// the age of its store here ([`Listing::takes`]), so one it holds and never lists is offered
     /// to the peer at every write.
@@ -4266,6 +4467,15 @@ thread_local! {
     pub(crate) static TAKES_ONLY_LISTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Mutant (tests): a table the lists newly share is left to the scan's turn.
     pub(crate) static TAKEN_UP_UNLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Seam (tests): the selection's writer reads its ring tables as a failure
+    /// ([`Round::select_tables`]), as a ring state it can neither read nor rebuild reads.
+    pub(crate) static RINGS_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a selection that dropped its ring tables lists short and does not say so
+    /// ([`Report::rings_unlisted`]).
+    pub(crate) static RINGS_DROP_UNTOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a selection that fell back to the recovery region lists short and does not
+    /// say so ([`Report::primary_unread`]).
+    pub(crate) static FALLBACK_UNTOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Mutant (tests): a led table leaves as a round selects it ([`Repair::chose`]), so a round
     /// that breaks off before its exchange of the table ends spends the lead.
     pub(crate) static LEAD_SPENT_ON_SELECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -4378,31 +4588,123 @@ fn receive_ids<const N: usize>(stream: &mut impl Read, max: usize) -> Result<BTr
     }
     Ok(ids)
 }
-/// [`exchange_ids`] where either side may say its inventory is unavailable (`None`), as a store
-/// it cannot read now.
+/// The replication wires of `ids` in `store`, in their order. A selection that became withheld or
+/// absent since the inventory was read fails with a changed snapshot, so the round restarts
+/// rather than send a short batch, which the peer would read as this side holding nothing more.
+fn wires_of(store: &Store, ids: &[Digest]) -> Result<Vec<Vec<u8>>> {
+    let wires = store.replication_wires_unchecked(ids);
+    if wires.len() != ids.len() {
+        return Err(Error::snapshot_changed());
+    }
+    Ok(wires)
+}
+
+/// What a round learned of the peer's conflict-proof inventory ([`Round::conflicts`]).
+enum PeerProofs {
+    /// The whole list an `atdb/7` or `atdb/8` peer sent ([`Tables::ProofList`]).
+    Listed(BTreeSet<ProofKey>),
+    /// The identities ([`proof_id`]) of every proof key the peer holds, as the reconciliation by
+    /// range on `atdb/9` agreed them ([`reconcile_proofs`]).
+    Reconciled(BTreeSet<Digest>),
+}
+
+impl PeerProofs {
+    /// Whether the peer holds the proof `key`.
+    fn holds(&self, key: &ProofKey) -> bool {
+        match self {
+            Self::Listed(keys) => keys.contains(key),
+            Self::Reconciled(ids) => ids.contains(&proof_id(key)),
+        }
+    }
+}
+
+/// The next batch of `local`'s proof keys, in turn after `after`, that the peer lacks: it holds
+/// neither the key nor its binding's fork proof ([`fork_of`]).
+fn lacked_proofs(
+    local: &BTreeSet<ProofKey>,
+    remote: &PeerProofs,
+    after: Option<ProofKey>,
+) -> Vec<ProofKey> {
+    cycle(local, after)
+        .filter(|key| !remote.holds(key) && !remote.holds(&fork_of(key)))
+        .take(BATCH)
+        .copied()
+        .collect()
+}
+
+/// The fork proof of the binding `key` names: a peer that holds it needs no other proof of that
+/// binding.
+fn fork_of(key: &ProofKey) -> ProofKey {
+    let mut fork = [0; 81];
+    fork[..48].copy_from_slice(&key[..48]);
+    fork[48] = 1;
+    fork
+}
+
+/// The identity a conflict-proof key reconciles by on `atdb/9` ([`reconcile_proofs`]): SHA-256
+/// of a domain tag and the key. Range reconciliation sums uniformly spread 32-byte identities,
+/// and a proof key's first 48 bytes are a writer's actor, shared by its proofs.
+#[must_use]
+pub fn proof_id(key: &ProofKey) -> Digest {
+    Sha256::digest([&b"aterm-db conflict proof v1\0"[..], &key[..]].concat())
+}
+
+/// Trade two conflict-proof inventories as whole lists of at most [`LISTED_PROOFS`] keys, as
+/// `atdb/7` and `atdb/8` do ([`Tables::ProofList`]): each side first says whether its inventory
+/// is available (`None` for a store it cannot read now), the initiator sends first, and
+/// `authorize` runs before this side sends its own.
 ///
 /// # Errors
-/// As [`exchange_ids`], or an invalid ready byte.
-pub fn exchange_inventory<const N: usize>(
+/// A list past [`LISTED_PROOFS`] or not sorted and unique, an invalid ready byte, `authorize`
+/// refuses, or the stream fails.
+fn exchange_proof_list(
     stream: &mut (impl Read + Write),
     side: Side,
-    local: Option<&BTreeSet<[u8; N]>>,
-    maximum: usize,
+    local: Option<&BTreeSet<ProofKey>>,
     authorize: impl Fn() -> Result<()>,
-) -> Result<Option<BTreeSet<[u8; N]>>> {
+) -> Result<Option<BTreeSet<ProofKey>>> {
     match side {
         Side::Initiator => {
             authorize()?;
-            send_inventory(stream, local, maximum)?;
-            receive_inventory(stream, maximum)
+            send_inventory(stream, local, LISTED_PROOFS)?;
+            receive_inventory(stream, LISTED_PROOFS)
         }
         Side::Responder => {
-            let remote = receive_inventory(stream, maximum)?;
+            let remote = receive_inventory(stream, LISTED_PROOFS)?;
             authorize()?;
-            send_inventory(stream, local, maximum)?;
+            send_inventory(stream, local, LISTED_PROOFS)?;
             Ok(remote)
         }
     }
+}
+
+/// Reconcile two conflict-proof inventories by range, as `atdb/9` does ([`Tables::Ranges`]):
+/// [`reconcile_inventory`] over each key's identity ([`proof_id`]), which returns the identities of
+/// every key the peer holds. The bytes track the difference, not the inventories, and no count
+/// bounds either side's proofs but the reconciliation's own memory budget
+/// ([`RECONCILE_REMOTE_RECORDS`]).
+///
+/// # Errors
+/// As [`reconcile_inventory`].
+pub fn reconcile_proofs(
+    stream: &mut (impl Read + Write),
+    side: Side,
+    local: Option<&BTreeSet<ProofKey>>,
+    authorize: impl Fn() -> Result<()>,
+) -> Result<Heard> {
+    let snapshot = local
+        .map(|keys| astream_wire::sync::rbsr::Snapshot::new(keys.iter().map(proof_id).collect()));
+    reconcile_heard(stream, side, snapshot, RECONCILE_REMOTE_RECORDS, authorize)
+}
+
+/// What one range reconciliation heard ([`reconcile_inventory`]).
+#[derive(Debug)]
+pub struct Heard {
+    /// The peer said its inventory was available. Read before anything else, so a side whose
+    /// own inventory is not still learns whether the peer's was.
+    pub peer_ready: bool,
+    /// The peer's whole inventory, where both sides' were available.
+    pub remote: Option<BTreeSet<Digest>>,
 }
 
 /// The remote inventory count one range reconciliation admits ([`reconcile_inventory`]): an
@@ -4414,8 +4716,9 @@ pub const RECONCILE_REMOTE_RECORDS: u64 = 1 << 22;
 /// each), for a difference of up to this many pages.
 pub const RECONCILE_MESSAGES: u64 = 1 << 17;
 
-/// [`exchange_inventory`] on `atdb/7`: each side first says whether its inventory is available,
-/// as there, and then, where both are, the initiator reconciles the two snapshots with the
+/// Reconcile a table's operation inventory by range (`atdb/7` and later): each side first says
+/// whether its inventory is available, as a store it cannot read now is not, and then, where both
+/// are, the initiator reconciles the two snapshots with the
 /// responder: each writer's dense unforked prefix first, by its frontier, then the rest by range
 /// (astream-wire's RBSR, frames of at most
 /// [`astream_wire::sync::rbsr::codec::MAX_FRAME_BYTES`]). The bytes track the difference, not
@@ -4449,6 +4752,20 @@ pub(crate) fn reconcile_inventory_within(
     remote_records: u64,
     authorize: impl Fn() -> Result<()>,
 ) -> Result<Option<BTreeSet<Digest>>> {
+    reconcile_heard(stream, side, local, remote_records, authorize).map(|heard| heard.remote)
+}
+
+/// [`reconcile_inventory_within`], with whether the peer's inventory was available.
+///
+/// # Errors
+/// As [`reconcile_inventory_within`].
+fn reconcile_heard(
+    stream: &mut (impl Read + Write),
+    side: Side,
+    local: Option<astream_wire::sync::rbsr::Snapshot>,
+    remote_records: u64,
+    authorize: impl Fn() -> Result<()>,
+) -> Result<Heard> {
     use astream_wire::sync::rbsr::{
         codec::{MAX_FRAME_BYTES, Message},
         exchange::{ExchangeError, Limits, Responder, reconcile},
@@ -4481,7 +4798,10 @@ pub(crate) fn reconcile_inventory_within(
         }
     };
     let (Some(local), true) = (local, peer_ready) else {
-        return Ok(None);
+        return Ok(Heard {
+            peer_ready,
+            remote: None,
+        });
     };
     fn refused(error: astream_wire::sync::rbsr::Error) -> Error {
         Error::repair(
@@ -4528,7 +4848,10 @@ pub(crate) fn reconcile_inventory_within(
         remote.remove(id);
     }
     remote.extend(difference.want.iter().copied());
-    Ok(Some(remote))
+    Ok(Heard {
+        peer_ready,
+        remote: Some(remote),
+    })
 }
 
 fn send_inventory<const N: usize>(

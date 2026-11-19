@@ -415,27 +415,26 @@ impl Causality<'_> {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static PROJECTS: std::cell::RefCell<BTreeMap<&'static str, usize>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// Count this collection's claim projections on the current thread from its first observation.
+/// A drive takes a difference across the operation it exercises. Unobserved collections keep no counts.
+#[cfg(any(test, debug_assertions))]
+pub fn projection_count(collection: &'static str) -> usize {
+    PROJECTS.with_borrow_mut(|counts| *counts.entry(collection).or_default())
+}
+
 #[cfg(test)]
 thread_local! {
-    /// How many claim projections ([`project`]) this thread ran, by collection name, counted
-    /// (never timed): the `files-idle` lane's drive (`crate::alab::upkeep`'s tests) reads it
-    /// before and after each materializer pass.
-    pub(crate) static PROJECTS: std::cell::RefCell<BTreeMap<&'static str, usize>> =
-        const { std::cell::RefCell::new(BTreeMap::new()) };
     /// How many claim contexts (`context`: the activity, the history and the causality of one
     /// collection's claim events) this thread built, by collection name: one for each
     /// [`project`], [`interpreted_cells`] and [`snapshot`].
     pub(crate) static CONTEXTS: std::cell::RefCell<BTreeMap<&'static str, usize>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
-}
-
-/// One more of `counter` for `collection`.
-#[cfg(test)]
-fn count(
-    counter: &'static std::thread::LocalKey<std::cell::RefCell<BTreeMap<&'static str, usize>>>,
-    collection: &Collection,
-) {
-    counter.with_borrow_mut(|counts| *counts.entry(collection.name).or_default() += 1);
 }
 
 fn context<'a>(
@@ -444,10 +443,14 @@ fn context<'a>(
     index: &'a Index,
 ) -> (History, Causality<'a>) {
     #[cfg(test)]
-    count(&CONTEXTS, collection);
+    CONTEXTS.with_borrow_mut(|counts| *counts.entry(collection.name).or_default() += 1);
     let operations: Vec<_> = operations.collect();
     let operations: Vec<&Op> = operations.iter().map(std::borrow::Borrow::borrow).collect();
-    let activity = activity::Activity::read(collection, &operations, index);
+    let (activity, order) = {
+        let projection = index.project();
+        let activity = activity::Activity::read(collection, &operations, index, &projection);
+        (activity, projection.ordered)
+    };
     let mut history = History::new();
     let mut evidence = BTreeMap::<(Coordinate, Digest), (Provenance, BTreeSet<Digest>)>::new();
     let mut epochs = BTreeMap::<(Coordinate, Digest), activity::Proof>::new();
@@ -498,7 +501,6 @@ fn context<'a>(
                 .insert(operation.id, value);
         }
     }
-    let order = index.project().ordered;
     let mut implicit = BTreeSet::new();
     for id in &order {
         let Some(pks) = activity.reentries.get(id) else {
@@ -794,8 +796,12 @@ fn judged(
     causal: &Index,
     mut keep: Option<&mut Settlements>,
 ) -> Projection {
-    #[cfg(test)]
-    count(&PROJECTS, collection);
+    #[cfg(any(test, debug_assertions))]
+    PROJECTS.with_borrow_mut(|counts| {
+        if let Some(count) = counts.get_mut(collection.name) {
+            *count += 1;
+        }
+    });
     let operations: Vec<_> = operations.collect();
     let refs = || operations.iter().map(std::borrow::Borrow::borrow);
     let mut cells = restored_cells(collection, cells, refs());

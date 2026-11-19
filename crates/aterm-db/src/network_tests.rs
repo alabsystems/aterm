@@ -136,6 +136,7 @@ fn repair_sweeps_past_a_deferred_page_after_retry_hints_expire() {
                 key: format!("r{n}"),
                 value: Some(json!(n as u64)),
             }],
+            said: None,
         })
         .unwrap();
     }
@@ -179,6 +180,7 @@ fn bounded_listener_repairs_both_replicas_and_stops_without_a_peer() {
                     key: key.into(),
                     value: Some(json!(request)),
                 }],
+                said: None,
             })
             .unwrap();
     }
@@ -251,6 +253,7 @@ fn an_authenticated_peer_waiting_for_its_next_frame_does_not_hold_the_writer_loc
                 key: "local".into(),
                 value: Some(json!("works")),
             }],
+            said: None,
         })
         .unwrap();
     stream.write_all(&0u32.to_le_bytes()).unwrap();
@@ -271,6 +274,7 @@ fn a_refused_frame_is_not_a_durable_ack_and_does_not_stop_the_next_operation() {
                 key: "valid".into(),
                 value: Some(json!(true)),
             }],
+            said: None,
         })
         .unwrap();
     let wire = crate::tests::wires(&b).pop().unwrap();

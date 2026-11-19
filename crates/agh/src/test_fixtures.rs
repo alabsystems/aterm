@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::config::Dirs;
 
 /// `path` as the inside of a TOML basic string: its backslashes and quotes escaped.
@@ -39,6 +39,18 @@ pub(crate) fn setup_file(path: &Path, bytes: &[u8]) {
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
+/// Write `bytes` to a new private file at `path`, or panic naming it: on windows the token
+/// user's under a protected access list of the user and SYSTEM, made so at its creation
+/// (`write_private_new`), in a folder kept so.
+#[cfg(windows)]
+pub(crate) fn setup_file(path: &Path, bytes: &[u8]) {
+    let dir = path.parent().expect("a folder");
+    let name = path.file_name().and_then(|n| n.to_str()).expect("a name");
+    let made = aterm_uds::private_file::write_private_new(dir, name, bytes, |_| Ok(()))
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(made, "{}: there is one already", path.display());
+}
+
 /// Creates a `.noindex` scratch directory for tests with a short UTF-8-safe prefix.
 pub(crate) fn scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
     let end = tag.floor_char_boundary(24);
@@ -52,7 +64,7 @@ pub(crate) fn scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
 
 /// Write `text` as `dirs`' agh.toml (`Dirs::config_file`), making the config directory
 /// private and its parent first.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn write_config(dirs: &Dirs, text: &str) {
     let parent = dirs.config.parent().expect("the config's parent");
     std::fs::create_dir_all(parent).expect("the config's parent");

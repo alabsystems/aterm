@@ -1529,7 +1529,7 @@ fn the_tab_mark_is_appended_local_and_its_samples_say_unavailable() {
     );
 }
 
-/// THE DESC MARK (a description claim) is the last kind, appended after `tab`, local, and names no
+/// THE DESC MARK (a description claim) is appended after `tab`, local, and names no
 /// key of its own: the slot, `upto` and `ttl` are wire facts, the claim's text, its author's
 /// declared name and what it is about are host facts, so the journal holds them and the wire tier
 /// and the bus never do. A program's own title rides in `title=` instead and stays content tier.
@@ -1538,7 +1538,6 @@ fn the_tab_mark_is_appended_local_and_its_samples_say_unavailable() {
 /// refused whole, never cut.
 #[test]
 fn the_desc_mark_is_appended_local_and_its_text_is_a_host_fact() {
-    assert_eq!(Kind::ALL.last(), Some(&Kind::Desc), "the last kind");
     let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
     assert_eq!(kind_at(Kind::Desc), kind_at(Kind::Tab).map(|i| i + 1));
     assert_eq!(Kind::Desc.word(), "desc");
@@ -1688,6 +1687,56 @@ fn a_requests_why_text_is_appended_host_text_and_reads_back() {
     assert!(!wire.contains("why_text"), "CONTROL: {wire}");
 }
 
+/// A HARNESS'S REFUSAL OF AN ATERM RECORD (HX-15c) is the `refused` mark, the last kind, appended
+/// after `desc`, local: `in=`, the last key, appended after `hseq=`, is the number of aterm's
+/// record it answers, a wire fact; the harness's words ride in `text=`, host tier, never in the
+/// closed `why=`. It reads back whole. NEGATIVE CONTROL: the wire encode keeps `in=` and drops
+/// the text.
+#[test]
+fn a_stream_refusal_is_the_appended_refused_mark_and_in_its_appended_key() {
+    assert_eq!(Kind::ALL.last(), Some(&Kind::Refused), "the last kind");
+    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
+    assert_eq!(kind_at(Kind::Refused), kind_at(Kind::Desc).map(|i| i + 1));
+    assert_eq!(Kind::Refused.word(), "refused");
+    assert!(Kind::Refused.is_mark() && Kind::Refused.node_level().is_none());
+    assert_eq!(Kind::from_word("refused"), Kind::Refused);
+    let key_at = |key: Key| FIELDS.iter().position(|(k, ..)| *k == key);
+    assert_eq!(
+        key_at(Key::Hseq).map(|i| i + 1),
+        key_at(Key::In),
+        "appended: every earlier key keeps its index"
+    );
+    assert_eq!(
+        FIELDS.last().map(|(k, ..)| *k),
+        Some(Key::In),
+        "the last key"
+    );
+    assert_eq!(
+        (Key::In.word(), Key::In.tier(), Key::In.cap()),
+        ("in", Tier::Wire, Cap::U)
+    );
+    let f = Fields::new()
+        .u(Key::In, 2)
+        .and_then(|f| f.text(Key::Text, "no relaunch grant"))
+        .expect("fields");
+    let refused = rec(Op::Mark, Node::SESSION, Kind::Refused, f);
+    let host = encode(&refused, Tier::Host).expect("fits");
+    assert!(
+        host.contains(" mark - refused ")
+            && host.contains(" in=2 ")
+            && host.contains(" text=no%20relaunch%20grant ")
+            && !host.contains(" why="),
+        "{host}"
+    );
+    let read = decode(&host).expect("decodes");
+    assert_eq!((read.k, read.f.clone()), (Kind::Refused, refused.f.clone()));
+    let wire = encode(&refused, Tier::Wire).expect("fits");
+    assert!(
+        wire.contains(" in=2 ") && !wire.contains("text="),
+        "CONTROL: {wire}"
+    );
+}
+
 /// A FLEET DRIVE'S ACTOR is `fleet:<head>:<sid>` (`Actor::fleet_drive`): the driving node's
 /// first eight characters held to the id alphabet, and the requesting session whole, `-` for a
 /// drive that names none. It reads back as itself.
@@ -1706,21 +1755,28 @@ fn a_fleet_drives_actor_names_node_head_and_session() {
     assert_eq!(Actor::fleet_drive("  ", None), Actor::Nobody, "CONTROL");
 }
 
-/// A FLEET DRIVE KEEPS THE WHOLE MINTED SID: the longest is a legacy tab's `s-` ID, which the
-/// drive's requester line names for a tab opened before the `t` form (`Requester::parse`), so
-/// 6 + 8 + 1 + 22 = 37 bytes, within the 40 an actor takes, and it reads back as itself.
-/// NEGATIVE CONTROL: a second legacy tab of the same Mac is another actor, not the first one's.
+/// STORED FLEET ACTORS KEEP DISTINCT LEGACY TABS: each exact historical token uses 37 bytes
+/// within the 40 an actor takes, and a raw line decodes and encodes with that spelling whole.
+/// NEGATIVE CONTROL: a second historical tab of the same Mac is another actor.
 #[test]
-fn fleet_drive_keeps_whole_minted_sid() {
-    let node = "ab".repeat(16);
-    let sid = "s-0123456789abcdef0123";
-    let drive = Actor::fleet_drive(&node, Some(sid));
-    assert_eq!(drive.word(), format!("fleet:abababab:{sid}"));
-    assert_eq!(drive.word().len(), 37);
-    assert!(drive.word().len() <= ShortId::MAX);
-    assert_eq!(Actor::from_word(drive.word()), drive);
-    let other = Actor::fleet_drive(&node, Some("s-fedcba9876543210fedc"));
-    assert_eq!(other.word(), "fleet:abababab:s-fedcba9876543210fedc");
+fn stored_fleet_drive_actors_keep_legacy_tabs_whole() {
+    let first = "fleet:abababab:s-0123456789abcdef0123";
+    let second = "fleet:abababab:s-fedcba9876543210fedc";
+    let drive = Actor::from_word(first);
+    let other = Actor::from_word(second);
+    for word in [first, second, "fleet:abababab:s-00000000000000000000"] {
+        let actor = Actor::from_word(word);
+        assert!(matches!(actor, Actor::Fleet(_)), "{actor:?}");
+        assert_eq!(actor.word(), word);
+        assert_eq!(actor.word().len(), 37);
+        assert!(actor.word().len() <= ShortId::MAX);
+        assert_eq!(Actor::from_word(actor.word()), actor);
+        assert!(!actor.is_owner() && !actor.is_trusted() && !actor.is_proven());
+        let line = format!("412 open t17 turn by={word} src=screen conf=strong t=1760545012345");
+        let stored = decode(&line).expect("a stored historical fleet actor");
+        assert_eq!(stored.by, actor);
+        assert_eq!(encode(&stored, Tier::Host).as_deref(), Ok(line.as_str()));
+    }
     assert_ne!(other, drive, "CONTROL");
 }
 
@@ -1731,11 +1787,13 @@ fn fleet_drive_keeps_whole_minted_sid() {
 #[test]
 fn fleet_drive_keeps_a_t_tab_id_whole() {
     let node = "ab".repeat(16);
-    for sid in ["tqn5r6e0148", "t0000000000", "tzzzzzzzzzz"] {
+    for sid in ["tqn5r6e0148", "t0123456789", "t0000000000", "tzzzzzzzzzz"] {
         let drive = Actor::fleet_drive(&node, Some(sid));
         assert_eq!(drive.word(), format!("fleet:abababab:{sid}"));
         assert_eq!(drive.word().len(), 26);
+        assert!(drive.word().len() <= ShortId::MAX);
         assert_eq!(Actor::from_word(drive.word()), drive);
+        assert!(!drive.is_owner() && !drive.is_trusted() && !drive.is_proven());
     }
     for bad in [
         "tqn5r6e014",
@@ -1752,8 +1810,8 @@ fn fleet_drive_keeps_a_t_tab_id_whole() {
     }
 }
 
-/// A STORED FLEET ACTOR THAT NAMES A LEGACY TAB READS BACK WHOLE: the longest actor token an
-/// earlier build's rows hold, 37 of the 40 bytes an actor takes.
+/// A STORED FLEET ACTOR THAT NAMES A LEGACY TAB READS BACK WHOLE: this exact historical token
+/// uses 37 of the 40 bytes an actor takes.
 /// NEGATIVE CONTROL: the same token one byte past the 40 reads as nobody.
 #[test]
 fn a_stored_fleet_actor_naming_a_legacy_tab_reads_back() {
@@ -1773,7 +1831,15 @@ fn a_stored_fleet_actor_naming_a_legacy_tab_reads_back() {
 #[test]
 fn fleet_drive_unminted_sid_is_dash() {
     let node = "ab".repeat(16);
-    for unminted in ["s-7725", "s-0123456789ABCDEF0123", "worker", ""] {
+    for unminted in [
+        "s-0123456789abcdef0123",
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
+        "s-7725",
+        "s-0123456789ABCDEF0123",
+        "worker",
+        "",
+    ] {
         assert_eq!(
             Actor::fleet_drive(&node, Some(unminted)).word(),
             "fleet:abababab:-",

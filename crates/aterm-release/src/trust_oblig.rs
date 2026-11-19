@@ -39,6 +39,11 @@ pub fn is_backstop(stop: &str) -> bool {
     stop.ends_with("-backstop")
 }
 
+/// Trust assigns these statuses the solved stop before examining the outcome's text.
+fn solved(status: &str) -> bool {
+    matches!(status, "proved" | "failed")
+}
+
 /// The standard library's crates, as a toolchain prints their sources.
 const SYSROOT: &[&str] = &[
     "alloc",
@@ -87,8 +92,8 @@ pub struct Obligation {
     pub span: Span,
     /// The report's `outcome.status`; only `proved` is proved.
     pub status: String,
-    /// What stopped it, as the report's `[stop:…]` tag names it (`wall-backstop` for a
-    /// `timeout` that names none), or [`NO_STOP`].
+    /// What stopped an unsolved row, as the report's `[stop:…]` tag names it
+    /// (`wall-backstop` for a `timeout` that names none), or [`NO_STOP`].
     pub stop: String,
     /// The span's source text ([`anchor_of`]); `-` out of the tree.
     pub anchor: String,
@@ -102,10 +107,11 @@ impl Obligation {
         self.status == "proved"
     }
 
-    /// Left unproved because a backstop stopped it ([`is_backstop`]).
+    /// Left unproved because a backstop stopped it ([`is_backstop`]). Older records can
+    /// carry a stop-looking counterexample value on a failed row.
     #[must_use]
     pub fn backstopped(&self) -> bool {
-        !self.proved() && is_backstop(&self.stop)
+        !solved(&self.status) && is_backstop(&self.stop)
     }
 
     /// Its name across runs: its function, kind, file, anchor and description (a MIR local and
@@ -191,6 +197,20 @@ impl Record {
         out
     }
 
+    /// Read the recorded obligations for the Cargo package selected by the proof lane.
+    /// # Errors
+    /// The record is malformed or belongs to another package.
+    pub fn parse_for(text: &str, package: &str) -> std::result::Result<Record, String> {
+        let record = Self::parse(text)?;
+        if record.package != package {
+            return Err(format!(
+                "the record is of package {}, not {package}",
+                record.package
+            ));
+        }
+        Ok(record)
+    }
+
     /// Read a record ([`Record::to_text`]), held to its shape: every field in its form, the
     /// header's counts the rows', and an `end` line (a record cut short has none).
     ///
@@ -213,6 +233,7 @@ impl Record {
         };
         let package = head("package")?.to_string();
         let unit = head("unit")?.to_string();
+        check_unit_package(&unit, &package)?;
         let number = |s: &str, what: &str| {
             (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
                 .then(|| s.parse::<u64>().ok())
@@ -476,6 +497,8 @@ struct RawRecord {
     obligations: Option<Vec<RawObligation>>,
     #[serde(default)]
     functions_emitted: Option<u64>,
+    expected_functions: Option<u64>,
+    function_records_sha256: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -524,9 +547,9 @@ impl RawOutcome {
     }
 }
 
-/// What stopped an obligation: the `[stop:<word>]` tag its outcome's text carries (a backstop's
-/// first, when it carries several), `wall-backstop` for a `timeout` that names none (a
-/// per-obligation clock ran out), else [`NO_STOP`].
+/// An unsolved obligation's `[stop:<word>]` tag (a backstop's first when it carries
+/// several), `wall-backstop` for an untagged timeout, or [`NO_STOP`] for a solved row
+/// or another untagged outcome.
 fn stop_of(o: &RawOutcome) -> String {
     fn tags<'a>(v: &'a aterm_json::Value, out: &mut Vec<&'a str>) {
         match v {
@@ -548,6 +571,9 @@ fn stop_of(o: &RawOutcome) -> String {
             _ => {}
         }
     }
+    if solved(&o.status) {
+        return NO_STOP.into();
+    }
     let mut found = Vec::new();
     tags(&o.all, &mut found);
     if let Some(b) = found.iter().copied().find(|t| is_backstop(t)) {
@@ -560,14 +586,27 @@ fn stop_of(o: &RawOutcome) -> String {
     }
 }
 
-/// The `package="…"` of a report's `cargo-target(…)` unit.
-fn package_of(unit: &str) -> Option<&str> {
-    if !unit.starts_with("cargo-target(") || !unit.ends_with(')') {
-        return None;
+/// Check the package field of the compiler's `cargo-target(…)` unit.
+fn check_unit_package(unit: &str, expected: &str) -> std::result::Result<(), String> {
+    let package = unit
+        .strip_prefix("cargo-target(")
+        .and_then(|s| s.strip_suffix(')'))
+        .and_then(|fields| {
+            // Cargo names contain no commas. Quotes inside other fields are escaped by Trust.
+            let mut names = fields
+                .split(',')
+                .filter_map(|f| f.strip_prefix("package=\""));
+            let name = names.next()?.strip_suffix('"')?;
+            (!name.is_empty() && names.next().is_none()).then_some(name)
+        });
+    match package {
+        Some(name) if name == expected => Ok(()),
+        Some(name) => Err(format!("the report is of package {name}, not {expected}")),
+        None => Err(format!(
+            "the header's unit is no cargo-target(…) naming a package: {}",
+            one_line(unit)
+        )),
     }
-    let at = unit.find("package=\"")? + "package=\"".len();
-    let len = unit[at..].find('"')?;
-    Some(&unit[at..at + len])
 }
 
 /// The sources a check's spans point into, read once each.
@@ -1069,7 +1108,9 @@ pub fn reduce(
     let mut src = Sources::new(repo, manifest)?;
     let snapshot =
         snapshot::Snapshot::read(file).map_err(|e| format!("{}: {e}", report.display()))?;
-    let mut unit: Option<String> = None;
+    let mut header: Option<(String, u64)> = None;
+    let mut records_digest = Sha256::new();
+    records_digest.update(b"trust.report.ndjson.function-records.v2");
     let mut footer = false;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut rec = Record {
@@ -1077,15 +1118,15 @@ pub fn reduce(
         ..Record::default()
     };
     const RETAINED_RECORD_BUDGET: usize = 16 * 1024 * 1024;
-    for (i, mut buf) in snapshot
+    for (i, line) in snapshot
         .bytes()
         .split_inclusive(|b| *b == b'\n')
         .enumerate()
     {
         let n = i + 1;
-        while matches!(buf.last(), Some(b'\n' | b'\r')) {
-            buf = &buf[..buf.len() - 1];
-        }
+        let buf = line
+            .strip_suffix(b"\n")
+            .map_or(line, |row| row.strip_suffix(b"\r").unwrap_or(row));
         if footer {
             return Err(format!("line {n} follows the footer"));
         }
@@ -1101,7 +1142,7 @@ pub fn reduce(
                 other.unwrap_or("(none)")
             )),
         };
-        match (raw.record_type.as_str(), unit.as_deref()) {
+        match (raw.record_type.as_str(), header.as_ref()) {
             ("header", None) if n == 1 => {
                 schema_ok("header")?;
                 let u = raw
@@ -1110,28 +1151,23 @@ pub fn reduce(
                 if u.chars().any(char::is_control) {
                     return Err("the header's unit is not one line".into());
                 }
-                match package_of(&u) {
-                    Some(p) if p == package => {}
-                    Some(p) => {
-                        return Err(format!("the report is of package {p}, not {package}"));
-                    }
-                    None => {
-                        return Err(format!(
-                            "the header's unit is no cargo-target(…) naming a package: {}",
-                            one_line(&u)
-                        ));
-                    }
-                }
+                check_unit_package(&u, package)?;
                 rec.unit = u.clone();
-                unit = Some(u);
+                let expected = raw
+                    .expected_functions
+                    .ok_or("the header omits expected_functions")?;
+                records_digest.update(expected.to_be_bytes());
+                header = Some((u, expected));
             }
             (t, None) => {
                 return Err(format!("line {n}: a `{t}` record before the header"));
             }
-            ("function", Some(u)) => {
+            ("function", Some((u, _))) => {
+                records_digest.update((buf.len() as u64).to_be_bytes());
+                records_digest.update(buf);
                 let full = raw.function.as_deref().unwrap_or("");
                 let path = full
-                    .strip_prefix(u)
+                    .strip_prefix(u.as_str())
                     .and_then(|r| r.strip_prefix("::"))
                     .filter(|p| !p.is_empty())
                     .ok_or_else(|| {
@@ -1175,7 +1211,7 @@ pub fn reduce(
                 }
                 rec.functions += 1;
             }
-            ("footer", Some(_)) => {
+            ("footer", Some((_, expected))) => {
                 schema_ok("footer")?;
                 let s = raw.summary.as_ref();
                 let (t, p) = (
@@ -1196,6 +1232,19 @@ pub fn reduce(
                         rec.proved()
                     ));
                 }
+                if *expected != rec.functions {
+                    return Err(format!(
+                        "the header expects {expected} functions but the report holds {}",
+                        rec.functions
+                    ));
+                }
+                let digest = format!(
+                    "sha256:{}",
+                    hex(&std::mem::take(&mut records_digest).finalize())
+                );
+                if raw.function_records_sha256.as_deref() != Some(digest.as_str()) {
+                    return Err("the footer’s function_records_sha256 is missing or does not match the ordered function records".into());
+                }
                 footer = true;
             }
             ("header", Some(_)) => return Err(format!("line {n}: a second header")),
@@ -1207,7 +1256,7 @@ pub fn reduce(
             }
         }
     }
-    if unit.is_none() {
+    if header.is_none() {
         return Err("the report is empty".into());
     }
     if !footer {

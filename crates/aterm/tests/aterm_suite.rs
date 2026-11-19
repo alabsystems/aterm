@@ -38,6 +38,10 @@ mod live_ctl;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[path = "support/native_claude.rs"]
 mod native_claude;
+#[path = "support/patience.rs"]
+mod patience;
+#[path = "support/patience_tests.rs"]
+mod patience_tests;
 #[cfg(unix)]
 #[path = "support/standin.rs"]
 mod standin;
@@ -143,6 +147,8 @@ mod tether_live;
 mod turn_submit_live_headless;
 #[cfg(unix)]
 mod typed_by_live_headless;
+#[cfg(target_os = "macos")]
+mod unit_source_live_headless;
 #[cfg(unix)]
 mod window_resize_replies_live_headless;
 #[cfg(target_os = "macos")]

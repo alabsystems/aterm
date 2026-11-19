@@ -28,7 +28,7 @@ fn entrant(tag: u8, label: &str) -> ([u8; 32], [u8; 16], MemberId, Entrant) {
 
 /// A store's copy shares its records' bytes. A server copies its store to try each POST
 /// against it (`server::post_records`), which any LAN host may send, and that copy held
-/// every record's bytes again, up to `MAX_RECORDS_STREAM` (about 64 MiB), once per POST.
+/// every record's bytes again, up to its store's capacity (about 64 MiB), once per POST.
 /// NEGATIVE CONTROL: a `Record` that owns its bytes (`wire: Vec<u8>`, main before this fix)
 /// copies them with the store, and the test fails "the copy holds the record's bytes again".
 #[test]
@@ -1109,7 +1109,7 @@ fn oversized_waiting_records_stay_within_stream_bound_and_yield_to_complete_reco
         .expect("complete put");
 
     // 65 waiting `Put` records (~1 MiB each) from a seated key, each missing its parent:
-    // far fewer than `MAX_WAITING` (4096), yet > `MAX_RECORDS_STREAM` (64 MiB) in bytes.
+    // far fewer than `MAX_WAITING` (4096), yet more than the store's capacity (64 MiB) in bytes.
     let ciphertext = vec![0xAAu8; crate::text::MAX_VALUE + 32];
     let mut waiting_puts: Vec<Record> = (0..66)
         .map(|i| {
@@ -1138,7 +1138,7 @@ fn oversized_waiting_records_stay_within_stream_bound_and_yield_to_complete_reco
     for record in &waiting_puts {
         let _ = store.insert(record.clone());
     }
-    assert!(store.encode().len() <= MAX_RECORDS_STREAM - MAX_RECORD);
+    assert!(store.encode().len() <= store.capacity() - MAX_RECORD);
     assert!(store.insert(extra.clone()).is_err());
 
     // The genesis and complete records (including a 1 MiB Put) land and displace waiting
@@ -1153,17 +1153,17 @@ fn oversized_waiting_records_stay_within_stream_bound_and_yield_to_complete_reco
     assert!(store.insert(complete_put.clone()).expect("1 MiB Put lands"));
     let encoded = store.encode();
     assert!(
-        encoded.len() <= MAX_RECORDS_STREAM,
-        "encoded len {} exceeded MAX_RECORDS_STREAM {}",
+        encoded.len() <= store.capacity(),
+        "encoded len {} exceeded the store's capacity {}",
         encoded.len(),
-        MAX_RECORDS_STREAM
+        store.capacity()
     );
     assert!(store.insert(extra).is_err());
 
     let mut reloaded = Store::with_compiled(store.compiled);
     reloaded
         .ingest(&encoded)
-        .expect("stream reloads within MAX_RECORDS_STREAM");
+        .expect("stream reloads within the store's capacity");
     assert!(
         reloaded
             .log()

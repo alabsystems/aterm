@@ -6,11 +6,197 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use aterm_stamp::release_version::ReleaseVersion;
+
 use crate::identity::Identity;
 use crate::wire::Birth;
 
 /// Variable naming the executable a keeper was started as.
 pub const ORIGIN_ENV: &str = "ATERM_KEEPER_ORIGIN";
+
+/// Variable naming, across the re-exec into the copy, the file that stood at [`ORIGIN_ENV`]'s
+/// path when the copy was made ([`FileStamp::encode`]).
+pub const ORIGIN_STAMP_ENV: &str = "ATERM_KEEPER_ORIGIN_STAMP";
+
+/// Which file stands at a path: its device, inode, size and modification time. A file renamed
+/// over the path, and one rewritten in place, read as another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileStamp {
+    /// The file at `path` now (links followed).
+    /// # Errors
+    /// `path` not reading.
+    pub fn read(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(path)?;
+        Ok(Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+        })
+    }
+
+    /// `dev:ino:size:mtime:mtime_nsec`, what [`Self::parse`] reads.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.dev, self.ino, self.size, self.mtime, self.mtime_nsec
+        )
+    }
+
+    /// What [`Self::encode`] wrote, or `None` for anything else.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut parts = s.split(':');
+        let stamp = Self {
+            dev: parts.next()?.parse().ok()?,
+            ino: parts.next()?.parse().ok()?,
+            size: parts.next()?.parse().ok()?,
+            mtime: parts.next()?.parse().ok()?,
+            mtime_nsec: parts.next()?.parse().ok()?,
+        };
+        parts.next().is_none().then_some(stamp)
+    }
+}
+
+/// The executable a keeper was started as, and the file that stood at its path then: launchd
+/// starts whatever stands there when the keeper exits, so a wanted restart goes only once
+/// another file does, a build at least as new as the keeper's own version
+/// ([`crate::core::KeeperCore::restart_when_safe`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExeImage {
+    path: PathBuf,
+    stamp: FileStamp,
+    /// The keeper's own release version ([`Self::serving`]); `None` ranks no replacement.
+    own: Option<ReleaseVersion>,
+}
+
+impl ExeImage {
+    /// `path` and the file at it when the keeper started, for a keeper of no known version (see
+    /// [`Self::serving`]).
+    #[must_use]
+    pub const fn new(path: PathBuf, stamp: FileStamp) -> Self {
+        Self {
+            path,
+            stamp,
+            own: None,
+        }
+    }
+
+    /// This image for a keeper of version `version`: a replacement counts only when its bundle
+    /// says it is a release at least as new ([`Self::look`]). A version that is no release
+    /// version (a dev build's, a test's) ranks none.
+    #[must_use]
+    pub fn serving(self, version: &str) -> Self {
+        Self {
+            own: ReleaseVersion::parse(version),
+            ..self
+        }
+    }
+
+    /// `path` and the file at it now.
+    /// # Errors
+    /// `path` not reading.
+    pub fn at(path: &Path) -> io::Result<Self> {
+        Ok(Self::new(path.to_path_buf(), FileStamp::read(path)?))
+    }
+
+    /// The executable's path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The file that stood at [`Self::path`] when the keeper started.
+    #[must_use]
+    pub const fn stamp(&self) -> FileStamp {
+        self.stamp
+    }
+
+    /// What stands at [`Self::path`] now, beside the file the keeper started as: another file
+    /// is [`ImageLook::Replaced`](crate::core::ImageLook::Replaced) only when its bundle's
+    /// version ([`bundle_version`]) is at least this keeper's ([`Self::serving`]), so a downgrade
+    /// never restarts the keeper into an older build.
+    #[must_use]
+    pub fn look(&self) -> crate::core::ImageLook {
+        use crate::core::ImageLook;
+        match FileStamp::read(&self.path) {
+            Ok(now) if now == self.stamp => ImageLook::Same,
+            Ok(_) => {
+                let path = self.path.display().to_string();
+                match (bundle_version(&self.path), self.own) {
+                    (Some(found), Some(own)) if found >= own => ImageLook::Replaced(path),
+                    _ => ImageLook::Older(path),
+                }
+            }
+            Err(_) => ImageLook::Unknown,
+        }
+    }
+}
+
+/// The largest `Info.plist` [`bundle_version`] reads.
+const PLIST_MAX: u64 = 1 << 20;
+
+/// The release version of the bundle whose executable is `exe` (`<bundle>/Contents/MacOS/<exe>`):
+/// its `Contents/Info.plist`'s `CFBundleShortVersionString`. `None` for an executable outside a
+/// `MacOS` directory, an `Info.plist` that does not read or is not XML, and a value that is no
+/// release version.
+#[must_use]
+pub fn bundle_version(exe: &Path) -> Option<ReleaseVersion> {
+    use std::io::Read as _;
+    let macos = exe.parent()?;
+    if macos.file_name()? != "MacOS" {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(macos.parent()?.join("Info.plist"))
+        .ok()?
+        .take(PLIST_MAX)
+        .read_to_string(&mut text)
+        .ok()?;
+    plist_short_version(&text)
+}
+
+/// The `CFBundleShortVersionString` of an XML plist's `text`, outside its comments, as a release
+/// version.
+fn plist_short_version(text: &str) -> Option<ReleaseVersion> {
+    const KEY: &str = "<key>CFBundleShortVersionString</key>";
+    let mut plain = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("<!--") {
+        plain.push_str(&rest[..at]);
+        let end = rest[at..].find("-->")?;
+        rest = &rest[at + end + "-->".len()..];
+    }
+    plain.push_str(rest);
+    let at = plain.find(KEY)? + KEY.len();
+    let value = plain[at..].trim_start().strip_prefix("<string>")?;
+    ReleaseVersion::parse(value[..value.find("</string>")?].trim())
+}
+
+/// The image a keeper serves as ([`ExeImage`]): run from its own copy, the origin `exe` with the
+/// stamp the process that made the copy took of it before copying ([`ORIGIN_STAMP_ENV`]), so
+/// that an update landing during the copy reads as a replacement; run from `exe` itself, that
+/// file now. `None` with no `exe`, or no stamp to read.
+#[must_use]
+pub fn started_image(from_copy: bool, exe: Option<&Path>) -> Option<ExeImage> {
+    let exe = exe?;
+    if from_copy {
+        let stamp = std::env::var(ORIGIN_STAMP_ENV).ok()?;
+        return Some(ExeImage::new(exe.to_path_buf(), FileStamp::parse(&stamp)?));
+    }
+    ExeImage::at(exe).ok()
+}
 
 /// Marker file written into the copy's directory ([`mark_ran`], [`sweep`]).
 pub const RAN: &str = aterm_uds::deadline::RAN;
@@ -66,15 +252,21 @@ pub fn origin_exe(from_copy: bool) -> Option<PathBuf> {
     }
 }
 
-/// Copy `exe`'s code into `dir` and re-execute from it with [`ORIGIN_ENV`] naming `exe`.
+/// Copy `exe`'s code into `dir` and re-execute from it with [`ORIGIN_ENV`] naming `exe` and
+/// [`ORIGIN_STAMP_ENV`] the file `image` found there before the copy.
 #[must_use]
-pub fn run_from_own_copy(exe: &Path, dir: &Path, identity: &Identity) -> String {
+pub fn run_from_own_copy(
+    exe: &Path,
+    dir: &Path,
+    identity: &Identity,
+    image: Option<&ExeImage>,
+) -> String {
     let copy = match copy_own_code(exe, dir, identity) {
         Ok(copy) => copy,
         Err(why) => return why,
     };
     aterm_uds::deadline::stamp_exec(&copy.home);
-    let failed = reexec(&copy.exe, exe);
+    let failed = reexec(&copy.exe, exe, image.map(ExeImage::stamp));
     let _ = std::fs::remove_dir_all(&copy.home);
     format!("re-running from {}: {failed}", copy.exe.display())
 }
@@ -219,14 +411,20 @@ fn copy_tree_kind(src: &Path, dst: &Path, kind: std::fs::FileType) -> io::Result
     }
 }
 
-/// Become `copy`, with [`ORIGIN_ENV`] naming `origin`.
-fn reexec(copy: &Path, origin: &Path) -> io::Error {
+/// Become `copy`, with [`ORIGIN_ENV`] naming `origin` and [`ORIGIN_STAMP_ENV`] its `stamp`
+/// (none removes one this process inherited, which names another file).
+fn reexec(copy: &Path, origin: &Path, stamp: Option<FileStamp>) -> io::Error {
     let mut args = std::env::args_os();
     let mut cmd = aterm_uds::spawnfd::command(copy);
     if let Some(arg0) = args.next() {
         cmd.arg0(arg0);
     }
-    cmd.args(args).env(ORIGIN_ENV, origin).exec()
+    cmd.args(args).env(ORIGIN_ENV, origin);
+    match stamp {
+        Some(stamp) => cmd.env(ORIGIN_STAMP_ENV, stamp.encode()),
+        None => cmd.env_remove(ORIGIN_STAMP_ENV),
+    };
+    cmd.exec()
 }
 
 /// Remove every copy in `dir` whose keeper is gone.

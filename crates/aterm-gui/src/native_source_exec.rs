@@ -45,15 +45,42 @@ struct State {
     phase: Phase,
     custody: Option<Arc<NativeCustody>>,
     data: Option<runtime_data::Pin>,
-    requested: bool,
+    execution: Execution,
     possible: bool,
-    granted: bool,
     snapshot: Option<StoredSnapshot>,
     successor: Option<(Process, i32)>,
     /// The claim the control EOF kept for this operation ([`retain_claim`]), handed back when
     /// its custody ends ([`hold_to_end`]).
     kept_claim: Option<KeptClaim>,
 }
+
+/// The worker can take a request and retry if it fails before granting the
+/// constructor. Once Go is granted, no queued or later request can redo it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Execution {
+    Idle,
+    Requested,
+    Granted,
+}
+
+impl Execution {
+    fn request(&mut self) -> bool {
+        if *self != Self::Idle {
+            return false;
+        }
+        *self = Self::Requested;
+        true
+    }
+
+    fn take_request(&mut self) -> bool {
+        if *self != Self::Requested {
+            return false;
+        }
+        *self = Self::Idle;
+        true
+    }
+}
+
 /// A claim a control connection's EOF left with a possible execution ([`retain_claim`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct KeptClaim {
@@ -81,8 +108,56 @@ struct Activation {
     generation: i32,
     authority: SupervisorAuthority,
     settled: bool,
+    first_adoption: Option<PendingAdoption>,
     adopted: bool,
     disconnected: bool,
+}
+
+fn entered_activation(process: &Process, expected_generation: i32, payload: &Payload) -> bool {
+    Process::observe(process.pid).as_ref() == Some(process)
+        && generation(process.pid) == Some(expected_generation)
+        && payload
+            .constructor
+            .reservation
+            .as_ref()
+            .is_some_and(|ctor| ctor.entered(process) == Ok(true))
+}
+
+/// A live settlement has released runtime DATA and preparation custody. Only
+/// the SDK socket may still carry the claim until independent adoption.
+#[derive(Debug, Default)]
+struct PendingAdoption {
+    closed_until: Option<u64>,
+}
+
+impl PendingAdoption {
+    fn released_after_eof(&self, now: u64) -> Option<bool> {
+        match self.closed_until {
+            None => Some(false),
+            Some(until) if now < until => Some(true),
+            Some(_) => None,
+        }
+    }
+
+    fn retain_at_eof(
+        &mut self,
+        meta: &mut crate::session_timeline::SessionMeta,
+        expected: &SupervisorAuthority,
+        now: u64,
+        until: Option<u64>,
+        constructor_current: impl FnOnce() -> bool,
+    ) -> bool {
+        let until = *self.closed_until.get_or_insert(until.unwrap_or(now));
+        if until > now
+            && meta.supervisor_authority(now) == *expected
+            && constructor_current()
+            && meta.retain_closed_native_exec_claim(expected, until, now)
+        {
+            return true;
+        }
+        self.closed_until = Some(now);
+        false
+    }
 }
 struct Payload {
     // Rust drops fields in declaration order: revoke and reap the constructor
@@ -145,8 +220,9 @@ impl Operation {
     /// The operation's close: its deadline plus the
     /// [`aterm_agent::harness::native_act::COMPLETION_US`] a native restart's close adds,
     /// since a successor enters through the same registry constructor a restart's does. A
-    /// successor activated before the deadline may settle until the close; at the close its
-    /// worker ends the operation, whatever is still to come ([`hold_to_end`]).
+    /// successor activated before the deadline may settle and first adopt until the close.
+    /// Settlement frees the worker early ([`hold_to_end`]); a closed SDK claim awaiting
+    /// its first adoption lapses at the close.
     fn close_us(&self) -> u64 {
         self.deadline
             .saturating_add(aterm_agent::harness::native_act::COMPLETION_US)
@@ -175,6 +251,25 @@ impl Operation {
         self.input_sealed
             .store(true, std::sync::atomic::Ordering::Release);
         true
+    }
+
+    #[cfg(debug_assertions)]
+    fn fixture_observation<'a>(
+        &'a self,
+        ctx: &'a crate::SessionCtx,
+        peer: &Process,
+        generation: i32,
+    ) -> crate::control::native_host_fixture::settle_ack_fault::NativeObservation<'a> {
+        crate::control::native_host_fixture::settle_ack_fault::NativeObservation {
+            sid: ctx.self_id.as_str(),
+            operation: &self.recipe.operation,
+            primary: &self.recipe.primary,
+            build: self.recipe.build,
+            source_build: self.recipe.source_build,
+            pid: peer.pid,
+            birth: peer.birth,
+            generation,
+        }
     }
 
     fn status(&self) -> String {
@@ -245,29 +340,80 @@ impl Operation {
         drop(old);
         self.wake.notify_all();
     }
-    /// End a possible execution once [`hold_to_end`] proves nothing of it can
-    /// run on, or its close has passed: its constructor, leases, input custody
-    /// and DATA pin go, and the claim the control EOF kept for it is returned.
-    fn end(&self, mut state: std::sync::MutexGuard<'_, State>) -> Option<KeptClaim> {
+    /// Close the live operation and release its input custody. Only a dead, granted source
+    /// with the checkpoint recorded for Go leaves evidence until the original close.
+    fn end(
+        &self,
+        mut state: std::sync::MutexGuard<'_, State>,
+        source_gone: bool,
+    ) -> (Option<KeptClaim>, Option<RecoveryEvidence>) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
         let kept = state.kept_claim.take();
-        let old = (
-            std::mem::replace(&mut state.phase, Phase::Closed),
-            state.custody.take(),
-            state.data.take(),
-        );
+        let phase = std::mem::replace(&mut state.phase, Phase::Closed);
+        let custody = state.custody.take();
+        let data = state.data.take();
+        let checkpoint = if source_gone && state.execution == Execution::Granted && state.possible {
+            state.snapshot
+        } else {
+            None
+        };
         drop(state);
-        drop(old);
+        drop(custody);
         self.wake.notify_all();
-        kept
+        let evidence = data.and_then(|pin| {
+            let saved = checkpoint?;
+            // Settlement releases this exact DATA. Its journaled digest alone cannot retain it.
+            let (size, digest) = pin.retained()?;
+            (size == saved.bytes && digest == aterm_codec::hex::encode_lower(&saved.digest))
+                .then_some(RecoveryEvidence { _phase: phase, pin })
+        });
+        (kept, evidence)
+    }
+}
+
+/// The original signed images and constructor, journal and pinned DATA, removed from the
+/// operation's executable phase. This owner grants no right to read or restore a checkpoint.
+struct RecoveryEvidence {
+    _phase: Phase,
+    pin: runtime_data::Pin,
+}
+
+impl RecoveryEvidence {
+    fn hold_to_close(self, op: &Operation, session: &Weak<crate::SessionCtx>, clock: &Clock) {
+        // Only the passive pin needs this DATA now. A new proven source can reserve its own
+        // slot while we retain the old checkpoint and signed images to the original close.
+        if let Some(ctx) = session.upgrade() {
+            let old = {
+                let mut table = ctx
+                    .fenced_writes
+                    .native
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                self.pin.detach(&mut table.runtime_data)
+            };
+            drop(old);
+        } else {
+            return;
+        }
+        let mut state = op.state.lock().unwrap_or_else(|p| p.into_inner());
+        while session.strong_count() > 0 {
+            let Some(left) = clock.remaining(op.close_us()) else {
+                break;
+            };
+            (state, _) = op
+                .wake
+                .wait_timeout(state, left.min(Duration::from_secs(1)))
+                .unwrap_or_else(|p| p.into_inner());
+        }
     }
 }
 
 /// What one pass of [`hold_to_end`] does with a possible execution's custody.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pass {
-    /// Its custody, DATA and leases go, and the claim kept for it is handed back.
+    /// End its live custody and hand back the claim. A granted dead source's evidence has
+    /// the original close as its last owner, independent of the input and supervisor.
     End,
     /// It stops holding the app handoff and keeps its input position, DATA and kept claim.
     FreeHandoff,
@@ -328,7 +474,7 @@ impl Standing {
 /// grants nothing once [`run`] has returned. An ended operation hands back the
 /// claim the control EOF kept for it, and the window hears that the session's
 /// metadata moved, as it does when the EOF hands a claim back itself.
-fn hold_to_end(op: &Operation, session: &Weak<crate::SessionCtx>) {
+fn hold_to_end(op: &Operation, session: &Weak<crate::SessionCtx>, clock: &Clock) {
     loop {
         if session.strong_count() == 0 {
             // The tab closed: its operation table drops the custody.
@@ -342,16 +488,16 @@ fn hold_to_end(op: &Operation, session: &Weak<crate::SessionCtx>) {
             return;
         };
         let standing = Standing {
-            granted: state.granted,
+            granted: state.execution == Execution::Granted,
             source_gone,
             cancelled: op.cancelled.load(std::sync::atomic::Ordering::Acquire),
             activated: matches!(state.phase, Phase::Activated(_)),
-            past_deadline: remaining(op.deadline).is_none(),
-            past_close: remaining(op.close_us()).is_none(),
+            past_deadline: clock.remaining(op.deadline).is_none(),
+            past_close: clock.remaining(op.close_us()).is_none(),
         };
         match standing.pass() {
             Pass::End => {
-                let kept = op.end(state);
+                let (kept, evidence) = op.end(state, source_gone);
                 if let (Some(kept), Some(ctx)) = (kept, session.upgrade())
                     && crate::session_timeline::release_closed_connection(
                         &ctx,
@@ -361,6 +507,9 @@ fn hold_to_end(op: &Operation, session: &Weak<crate::SessionCtx>) {
                     )
                 {
                     crate::presence::post_meta_changed(kept.local);
+                }
+                if let Some(evidence) = evidence {
+                    evidence.hold_to_close(op, session, clock);
                 }
                 return;
             }
@@ -428,9 +577,8 @@ fn recipe(fields: &BTreeMap<&str, &str>) -> Option<Recipe> {
 }
 
 /// Use the existing native operation channel and its action classification.
-/// `prepare source-exec` inherits prepare's connection/EOF tracking. Only
-/// `info source-exec` is read-only; query and cancellation retain native-act's
-/// normal authorization, while the worker independently closes on a hold.
+/// `prepare source-exec` inherits prepare's connection/EOF tracking.
+/// `settled source-exec` observes the exact replacement after the SDK EOF.
 pub(super) fn route(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> Option<String> {
     let mut words = line.split_ascii_whitespace();
     let action = words.next()?;
@@ -439,7 +587,7 @@ pub(super) fn route(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> Op
     }
     let action = match action {
         "info" | "prepare" | "seal-input" | "query" | "execute" | "load" | "activate"
-        | "settle" | "adopt" => action,
+        | "settle" | "settled" | "adopt" => action,
         "cancel-prepare" => "abort",
         _ => return Some(REFUSED.into()),
     };
@@ -467,7 +615,15 @@ fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
     }
     if !matches!(
         verb,
-        "seal-input" | "query" | "abort" | "execute" | "load" | "activate" | "settle" | "adopt"
+        "seal-input"
+            | "query"
+            | "abort"
+            | "execute"
+            | "load"
+            | "activate"
+            | "settle"
+            | "settled"
+            | "adopt"
     ) || fields.len() != 1
     {
         return REFUSED.into();
@@ -488,7 +644,7 @@ fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
     let Some(op) = op.filter(|op| op.recipe.operation == *operation) else {
         return REFUSED.into();
     };
-    if matches!(verb, "load" | "activate" | "settle" | "adopt") {
+    if matches!(verb, "load" | "activate" | "settle" | "settled" | "adopt") {
         return successor(ctx, &op, &peer, verb);
     }
     if op.source != peer || !op.source_current() {
@@ -520,14 +676,15 @@ fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
         {
             return REFUSED.into();
         }
-        state.requested = true;
-        op.wake.notify_all();
+        if state.execution.request() {
+            op.wake.notify_all();
+        }
     }
     if matches!(verb, "query" | "execute") {
         let seen = Seen::of(ctx);
         if op.current(ctx, &seen) {
             let state = op.state.lock().unwrap_or_else(|p| p.into_inner());
-            if state.granted
+            if state.execution == Execution::Granted
                 && let (Phase::Possible(payload), Some(snapshot)) = (&state.phase, state.snapshot)
             {
                 return format!(
@@ -555,6 +712,9 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
     if verb == "settle" {
         return settle(ctx, op, peer, generation);
     }
+    if verb == "settled" {
+        return observe_settlement(ctx, op, peer, generation);
+    }
     if verb == "adopt" {
         return adopt(ctx, op, peer, generation);
     }
@@ -567,7 +727,7 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
             }
             activation._payload.clone()
         } else {
-            if !op.current(ctx, &seen) || !state.granted {
+            if !op.current(ctx, &seen) || state.execution != Execution::Granted {
                 return REFUSED.into();
             }
             let Phase::Possible(payload) = &state.phase else {
@@ -655,9 +815,11 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
         {
             return REFUSED.into();
         }
-        let Some(authority) = seen.meta.transfer_native_exec_claim(
+        let Some(authority) = crate::control::transfer_served_native_exec_claim(
+            &mut seen.meta,
             &op.authority,
             connection,
+            None,
             crate::metrics::now_us(),
         ) else {
             return REFUSED.into();
@@ -670,6 +832,7 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
                 generation,
                 authority,
                 settled: false,
+                first_adoption: None,
                 adopted: false,
                 disconnected: false,
             }),
@@ -679,7 +842,7 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
     op.wake.notify_all();
     activation_reply(op)
 }
-fn activation_current(
+fn activation_owned(
     op: &Operation,
     peer: &Process,
     generation: i32,
@@ -688,12 +851,22 @@ fn activation_current(
 ) -> bool {
     activation.process == *peer
         && activation.generation == generation
-        && activation.authority.connection() == crate::control::serving_connection()
         && seen.authority == activation.authority
         && !seen.held
         && !op.cancelled.load(std::sync::atomic::Ordering::Acquire)
         && Process::observe(peer.pid).as_ref() == Some(peer)
         && self::generation(peer.pid) == Some(generation)
+}
+
+fn activation_current(
+    op: &Operation,
+    peer: &Process,
+    generation: i32,
+    seen: &Seen<'_>,
+    activation: &Activation,
+) -> bool {
+    activation.authority.connection() == crate::control::serving_connection()
+        && activation_owned(op, peer, generation, seen, activation)
 }
 
 fn adoption_current(
@@ -704,13 +877,8 @@ fn adoption_current(
     activation: &Activation,
 ) -> bool {
     activation.settled
-        && activation.process == *peer
-        && activation.generation == generation
-        && seen.authority == activation.authority
-        && !seen.held
-        && !op.cancelled.load(std::sync::atomic::Ordering::Acquire)
-        && Process::observe(peer.pid).as_ref() == Some(peer)
-        && self::generation(peer.pid) == Some(generation)
+        && (activation.adopted || remaining(op.close_us()).is_some())
+        && activation_owned(op, peer, generation, seen, activation)
 }
 
 /// Transfer supervision to its independent control socket only after actual
@@ -763,14 +931,21 @@ fn adopt(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, generation: i3
         );
     }
     if !activation.adopted || activation.authority.connection() != Some(connection) {
-        let Some(authority) = seen.meta.transfer_native_exec_claim(
+        let detached_until = activation
+            .first_adoption
+            .as_ref()
+            .and_then(|pending| pending.closed_until);
+        let Some(authority) = crate::control::transfer_served_native_exec_claim(
+            &mut seen.meta,
             &activation.authority,
             connection,
+            detached_until,
             crate::metrics::now_us(),
         ) else {
             return REFUSED.into();
         };
         activation.authority = authority;
+        activation.first_adoption = None;
         activation.adopted = true;
         activation.disconnected = false;
     }
@@ -817,7 +992,7 @@ fn settle(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, generation: i
             return REFUSED.into();
         }
         if activation.settled {
-            return settlement_reply(op);
+            return settlement_reply(op, "settled");
         }
         let Some(snapshot) = state.snapshot else {
             return REFUSED.into();
@@ -834,15 +1009,103 @@ fn settle(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, generation: i
             unreachable!()
         };
         activation.settled = true;
+        activation.first_adoption = Some(PendingAdoption::default());
         (released, state.custody.take(), state.data.take())
     };
     drop(old);
     op.wake.notify_all();
-    settlement_reply(op)
+    #[cfg(debug_assertions)]
+    if let Some(connection) = crate::control::serving_connection() {
+        crate::control::native_host_fixture::settle_ack_fault::record_commit(
+            ctx.self_id.as_str(),
+            &op.recipe.operation,
+            peer.pid,
+            connection,
+            generation,
+        );
+    }
+    settlement_reply(op, "settled")
 }
-fn settlement_reply(op: &Operation) -> String {
+
+fn settlement_observation(
+    ctx: &crate::SessionCtx,
+    op: &Operation,
+    peer: &Process,
+    generation: i32,
+) -> Option<(Arc<Payload>, bool)> {
+    let connection = crate::control::serving_connection()?;
+    let seen = Seen::of(ctx);
+    // Preparation cannot replace the operation while this decision holds Meta.
+    let current = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .source_exec
+        .as_ref()
+        .is_some_and(|current| std::ptr::eq(current.as_ref(), op));
+    if !current {
+        return None;
+    }
+    let state = op.state.lock().unwrap_or_else(|p| p.into_inner());
+    let Phase::Activated(activation) = &state.phase else {
+        return None;
+    };
+    if activation.adopted
+        || activation.authority.connection() == Some(connection)
+        || remaining(op.close_us()).is_none()
+        || !activation_owned(op, peer, generation, &seen, activation)
+    {
+        return None;
+    }
+    let released = if activation.settled {
+        activation
+            .first_adoption
+            .as_ref()?
+            .released_after_eof(crate::metrics::now_us())?
+    } else {
+        false
+    };
+    Some((activation._payload.clone(), released))
+}
+
+/// Read back settlement after a lost acknowledgement. Only the old SDK's
+/// actual EOF proves its serving thread has finished releasing custody.
+fn observe_settlement(
+    ctx: &crate::SessionCtx,
+    op: &Operation,
+    peer: &Process,
+    generation: i32,
+) -> String {
+    let Some((payload, released)) = settlement_observation(ctx, op, peer, generation) else {
+        return REFUSED.into();
+    };
+    if released && payload._target.validate().is_err() {
+        return REFUSED.into();
+    }
+    if !entered_activation(peer, generation, &payload) {
+        return REFUSED.into();
+    }
+    if !settlement_observation(ctx, op, peer, generation).is_some_and(
+        |(current, currently_released)| {
+            (!released || currently_released) && Arc::ptr_eq(&current, &payload)
+        },
+    ) {
+        return REFUSED.into();
+    }
+    #[cfg(debug_assertions)]
+    if released && let Some(connection) = crate::control::serving_connection() {
+        crate::control::native_host_fixture::settle_ack_fault::record_readback(
+            op.fixture_observation(ctx, peer, generation),
+            connection,
+        );
+    }
+    settlement_reply(op, if released { "settled" } else { "waiting" })
+}
+
+fn settlement_reply(op: &Operation, state: &str) -> String {
     format!(
-        "OK native source-exec state=settled operation={} primary={} build={}\n",
+        "OK native source-exec state={state} operation={} primary={} build={}\n",
         op.recipe.operation, op.recipe.primary, op.recipe.build
     )
 }
@@ -852,6 +1115,57 @@ fn activation_reply(op: &Operation) -> String {
         "OK native source-exec state=activated operation={} primary={} build={}\n",
         op.recipe.operation, op.recipe.primary, op.recipe.build
     )
+}
+
+fn source_claim_allows_prepare(
+    authority: &SupervisorAuthority,
+    proof: &crate::self_claim::Proven,
+    connection: u64,
+) -> bool {
+    authority.contract() == Some(2)
+        && authority.identity() == Some(proof)
+        && authority.connection() == Some(connection)
+        && authority.external_takes(&crate::harness_host::holder(), Scope::Upgrade)
+}
+
+struct PrepareSource<'a> {
+    proof: &'a crate::self_claim::Proven,
+    connection: u64,
+    process: Process,
+    generation: i32,
+}
+
+impl PrepareSource<'_> {
+    fn authorize<'ctx>(&self, ctx: &'ctx crate::SessionCtx) -> Option<Seen<'ctx>> {
+        let seen = Seen::of(ctx);
+        (source_claim_allows_prepare(&seen.authority, self.proof, self.connection)
+            && !seen.held
+            && Process::observe(self.process.pid).as_ref() == Some(&self.process)
+            && generation(self.process.pid) == Some(self.generation))
+        .then_some(seen)
+    }
+
+    fn existing_reply(&self, old: Option<&Operation>, recipe: &Recipe) -> Option<String> {
+        let old = old?;
+        if old.recipe.operation == recipe.operation {
+            return Some(
+                if old.recipe == *recipe
+                    && old.source == self.process
+                    && old.generation == self.generation
+                {
+                    old.status()
+                } else {
+                    REFUSED.into()
+                },
+            );
+        }
+        old.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .custody
+            .is_some()
+            .then(|| REFUSED.into())
+    }
 }
 
 fn prepare(ctx: &Arc<crate::SessionCtx>, master: i32, recipe: Recipe) -> String {
@@ -868,9 +1182,47 @@ fn prepare(ctx: &Arc<crate::SessionCtx>, master: i32, recipe: Recipe) -> String 
     else {
         return REFUSED.into();
     };
-    let (Some(source), Some(generation)) = (Process::observe(pid), generation(pid)) else {
+    let Some(connection) = crate::control::serving_connection() else {
         return REFUSED.into();
     };
+    let (Some(process), Some(generation)) = (Process::observe(pid), generation(pid)) else {
+        return REFUSED.into();
+    };
+    prepare_source(
+        ctx,
+        recipe,
+        PrepareSource {
+            proof: &proof,
+            connection,
+            process,
+            generation,
+        },
+        &WORKERS,
+    )
+}
+
+fn prepare_source(
+    ctx: &Arc<crate::SessionCtx>,
+    recipe: Recipe,
+    source: PrepareSource<'_>,
+    workers: &Arc<crate::budget::Slots>,
+) -> String {
+    {
+        let Some(_seen) = source.authorize(ctx) else {
+            return REFUSED.into();
+        };
+        let table = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(reply) = source.existing_reply(table.source_exec.as_deref(), &recipe) {
+            return reply;
+        }
+    }
+
+    // Only a new preparation captures the launch inputs and reserves a worker.
+    let pid = source.process.pid;
     let Some(args) = atpkg::caller_shell::process_args(pid) else {
         return REFUSED.into();
     };
@@ -881,82 +1233,77 @@ fn prepare(ctx: &Arc<crate::SessionCtx>, master: i32, recipe: Recipe) -> String 
     let Ok(env) = codex_account_env() else {
         return REFUSED.into();
     };
-    let Some(registry) = crate::control::source_registry() else {
+    let Some(registry) = crate::control::serving_source_registry() else {
         return REFUSED.into();
     };
-    let Some(worker) = Worker::reserve() else {
+    let Some(worker) = Worker::reserve(workers) else {
         return REFUSED.into();
     };
-    let seen = Seen::of(ctx);
-    let authority = seen.authority.clone();
-    if authority.contract() != Some(2)
-        || authority.identity() != Some(&proof)
-        || authority.connection() != crate::control::serving_connection()
-        || authority
-            .scopes()
-            .is_none_or(|scopes| !scopes.contains(Scope::Upgrade))
-        || seen.held
-        || Process::observe(pid).as_ref() != Some(&source)
-        || self::generation(pid) != Some(generation)
-    {
+
+    // A concurrent prepare or a changed claim may win while the inputs are read.
+    let Some(seen) = source.authorize(ctx) else {
         return REFUSED.into();
-    }
+    };
     let mut table = ctx
         .fenced_writes
         .native
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if let Some(old) = &table.source_exec {
-        if old.recipe.operation == recipe.operation {
-            return if old.recipe == recipe && old.source == source && old.generation == generation {
-                old.status()
-            } else {
-                REFUSED.into()
-            };
-        }
-        if old
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .custody
-            .is_some()
-        {
-            return REFUSED.into();
-        }
+    if let Some(reply) = source.existing_reply(table.source_exec.as_deref(), &recipe) {
+        return reply;
     }
-    if table
-        .runtime_data
-        .as_ref()
-        .is_none_or(|slot| slot.reusable_by(&recipe.operation, &source))
-    {
-        table.runtime_data = Some(runtime_data::Slot::reserved(
-            recipe.operation.clone(),
-            source.clone(),
-        ));
-    }
-    let Some(data) = table
-        .runtime_data
-        .as_ref()
-        .and_then(|slot| slot.pin(&recipe.operation, &source))
-    else {
+    let Some((op, previous)) = publish_preparation(
+        ctx,
+        &mut table,
+        recipe,
+        source.process,
+        source.generation,
+        seen.authority.clone(),
+        aterm_types::update_boundary::Boundary::process(),
+    ) else {
         return REFUSED.into();
     };
-    let Some(boundary) = aterm_types::update_boundary::Boundary::process()
-        .try_hold(aterm_types::update_boundary::GuardedItem::HarnessNativeMutation)
-    else {
-        return REFUSED.into();
-    };
-    let Ok(custody) =
-        ctx.fenced_writes
-            .reserve_native(authority.revision(), &recipe.operation, boundary)
-    else {
-        return REFUSED.into();
-    };
-    let Some(deadline) = aterm_agent::harness::native_act::monotonic_us()
-        .and_then(|now| now.checked_add(120_000_000))
-    else {
-        return REFUSED.into();
-    };
+    drop(table);
+    drop(seen);
+    drop(previous);
+    #[cfg(debug_assertions)]
+    crate::control::native_host_fixture::settle_ack_fault::record_prepare(op.fixture_observation(
+        ctx,
+        &op.source,
+        op.generation,
+    ));
+    worker.start(Job {
+        ctx: Arc::downgrade(ctx),
+        op: op.clone(),
+        env,
+        registry,
+        args,
+        cwd,
+    });
+    op.status()
+}
+
+/// Admit the preparation while Meta and the operation table are held. Publish its data
+/// slot and operation together once no admission step can refuse. Return the previous
+/// operation so its resources are dropped outside both locks.
+fn publish_preparation(
+    ctx: &crate::SessionCtx,
+    table: &mut Operations,
+    recipe: Recipe,
+    source: Process,
+    generation: i32,
+    authority: SupervisorAuthority,
+    boundary: &'static aterm_types::update_boundary::Boundary,
+) -> Option<(Arc<Operation>, Option<Arc<Operation>>)> {
+    let mut slot = table.runtime_data.clone();
+    let data = runtime_data::Slot::reserve_pinned(&mut slot, &recipe.operation, &source)?;
+    let boundary =
+        boundary.try_hold(aterm_types::update_boundary::GuardedItem::HarnessNativeMutation)?;
+    let custody = ctx
+        .fenced_writes
+        .reserve_native(authority.revision(), &recipe.operation, boundary)
+        .ok()?;
+    let deadline = aterm_agent::harness::native_act::monotonic_us()?.checked_add(120_000_000)?;
     let op = Arc::new(Operation {
         recipe,
         source,
@@ -970,28 +1317,17 @@ fn prepare(ctx: &Arc<crate::SessionCtx>, master: i32, recipe: Recipe) -> String 
             phase: Phase::Preparing,
             custody: Some(Arc::new(custody)),
             data: Some(data),
-            requested: false,
+            execution: Execution::Idle,
             possible: false,
-            granted: false,
             snapshot: None,
             successor: None,
             kept_claim: None,
         }),
         wake: std::sync::Condvar::new(),
     });
+    table.runtime_data = slot;
     let previous = table.source_exec.replace(op.clone());
-    drop(table);
-    drop(seen);
-    drop(previous);
-    worker.start(Job {
-        ctx: Arc::downgrade(ctx),
-        op: op.clone(),
-        env,
-        registry,
-        args,
-        cwd,
-    });
-    op.status()
+    Some((op, previous))
 }
 
 struct Job {
@@ -1004,8 +1340,8 @@ struct Job {
 }
 struct Worker(mpsc::SyncSender<Job>);
 impl Worker {
-    fn reserve() -> Option<Self> {
-        let budget = WORKERS.try_take()?;
+    fn reserve(workers: &Arc<crate::budget::Slots>) -> Option<Self> {
+        let budget = workers.try_take()?;
         let (send, receive) = mpsc::sync_channel::<Job>(1);
         std::thread::Builder::new()
             .name("codex-source-prepare".into())
@@ -1015,7 +1351,7 @@ impl Worker {
                     let op = job.op.clone();
                     let session = job.ctx.clone();
                     guarded(&op, || run(job));
-                    guarded(&op, || hold_to_end(&op, &session));
+                    guarded(&op, || hold_to_end(&op, &session, &Clock::System));
                 }
             })
             .ok()?;
@@ -1161,7 +1497,7 @@ fn execute(job: &Job, ctx: &crate::SessionCtx, payload: &Arc<Payload>) {
         return;
     }
     let mut state = job.op.state.lock().unwrap_or_else(|p| p.into_inner());
-    state.granted = true;
+    state.execution = Execution::Granted;
     job.op.wake.notify_all();
 }
 
@@ -1349,8 +1685,7 @@ fn run(job: Job) {
         if let Some(result) = result.take() {
             state.phase = Phase::Prepared(Arc::new(result));
         }
-        if state.requested {
-            state.requested = false;
+        if state.execution.take_request() {
             let payload = match &state.phase {
                 Phase::Prepared(payload) | Phase::Possible(payload) => Some(payload.clone()),
                 _ => None,
@@ -1369,11 +1704,27 @@ fn run(job: Job) {
     }
 }
 
+/// A live renewal leaves the authority revision unchanged. A release and
+/// retake can restore the same actor and connection under a new tenure.
+fn record_adopted_eof(
+    expected: &SupervisorAuthority,
+    current: &SupervisorAuthority,
+    disconnected: &mut bool,
+    constructor_current: impl FnOnce() -> bool,
+) -> bool {
+    if current != expected || !constructor_current() {
+        return false;
+    }
+    *disconnected = true;
+    true
+}
+
 /// EOF cannot retract possible execution or return this exact claim's input
 /// duty to the built-in harness while the operation retains native custody.
 /// The claim kept moves to a successor's connection when one activates or
-/// adopts (`transfer_native_exec_claim` closes the old one), and otherwise
-/// goes back when the custody ends ([`hold_to_end`]). `local` is the window's
+/// adopts (`transfer_native_exec_claim` closes the old one). An unsettled
+/// claim goes back when custody ends ([`hold_to_end`]). A settled SDK claim
+/// gains a bounded first-adoption expiry at its EOF. `local` is the window's
 /// id of the session `ctx` is.
 pub(super) fn retain_claim(ctx: &crate::SessionCtx, local: u64, connection: u64) -> bool {
     let op = ctx
@@ -1384,38 +1735,59 @@ pub(super) fn retain_claim(ctx: &crate::SessionCtx, local: u64, connection: u64)
         .source_exec
         .clone();
     let Some(op) = op else { return false };
-    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    let current = meta.supervisor_authority(crate::metrics::now_us());
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let mut state = op.state.lock().unwrap_or_else(|p| p.into_inner());
+    let now = crate::metrics::now_us();
+    let current = meta.supervisor_authority(now);
     if let Phase::Activated(activation) = &mut state.phase {
         if activation.authority.connection() != Some(connection) {
             return false;
         }
-        if activation.settled && activation.adopted {
-            if current.connection() != Some(connection)
-                || current.contract() != Some(2)
-                || current.identity() != activation.authority.identity()
-            {
-                return false;
+        if let Some(pending) = &mut activation.first_adoption {
+            // Convert the remaining cross-exec budget to the app's metadata clock.
+            let until = remaining(op.close_us())
+                .and_then(|left| u64::try_from(left.as_micros()).ok())
+                .and_then(|left| now.checked_add(left));
+            let kept = pending.retain_at_eof(&mut meta, &activation.authority, now, until, || {
+                !op.cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    && entered_activation(
+                        &activation.process,
+                        activation.generation,
+                        &activation._payload,
+                    )
+            });
+            #[cfg(debug_assertions)]
+            if kept && let Some(expires_us) = pending.closed_until {
+                crate::control::native_host_fixture::settle_ack_fault::record_eof(
+                    ctx.self_id.as_str(),
+                    &op.recipe.operation,
+                    activation.process.pid,
+                    connection,
+                    activation.authority.revision(),
+                    expires_us,
+                );
             }
+            drop(state);
+            drop(meta);
+            // Retention bypasses the control lane's ordinary EOF metadata wake.
+            crate::presence::post_meta_changed(local);
+            return kept;
+        }
+        if activation.settled && activation.adopted {
             // Called only from the actual control-socket EOF path. Keep the
             // original live claim while its same fresh SDK actor reconnects.
-            if Process::observe(activation.process.pid).as_ref() != Some(&activation.process)
-                || generation(activation.process.pid) != Some(activation.generation)
-                || activation
-                    ._payload
-                    .constructor
-                    .reservation
-                    .as_ref()
-                    .is_none_or(|ctor| ctor.entered(&activation.process) != Ok(true))
-            {
-                return false;
-            }
-            // Ordinary acts may have renewed this same live claim's revision.
-            // Capture only the native authority observed at this actual EOF.
-            activation.authority = current;
-            activation.disconnected = true;
-            return true;
+            return record_adopted_eof(
+                &activation.authority,
+                &current,
+                &mut activation.disconnected,
+                || {
+                    entered_activation(
+                        &activation.process,
+                        activation.generation,
+                        &activation._payload,
+                    )
+                },
+            );
         }
     }
     let authority = match &state.phase {
@@ -1428,6 +1800,48 @@ pub(super) fn retain_claim(ctx: &crate::SessionCtx, local: u64, connection: u64)
         state.kept_claim = Some(KeptClaim { connection, local });
     }
     kept
+}
+
+fn first_adoption_deadline(phase: &Phase) -> Option<u64> {
+    match phase {
+        Phase::Activated(activation) => activation.first_adoption.as_ref()?.closed_until,
+        _ => None,
+    }
+}
+
+pub(super) fn adoption_deadline(ctx: &crate::SessionCtx) -> Option<u64> {
+    let op = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .source_exec
+        .clone()?;
+    let state = op.state.lock().unwrap_or_else(|p| p.into_inner());
+    first_adoption_deadline(&state.phase)
+}
+
+pub(super) fn expire_adoption(ctx: &crate::SessionCtx, now: u64) {
+    let op = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .source_exec
+        .clone();
+    let Some(op) = op else { return };
+    let expired = {
+        let mut state = op.state.lock().unwrap_or_else(|p| p.into_inner());
+        if first_adoption_deadline(&state.phase).is_none_or(|at| at > now) {
+            return;
+        }
+        std::mem::replace(&mut state.phase, Phase::Closed)
+    };
+    // Package and registry disposal may do I/O. A short cleanup after the
+    // timer fires needs no preparation slot and holds no session locks.
+    let _ = std::thread::Builder::new()
+        .name("codex-source-adoption-expiry".into())
+        .spawn(move || drop(expired));
 }
 
 pub(super) fn pending(ctx: &crate::SessionCtx) -> bool {

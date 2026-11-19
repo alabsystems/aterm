@@ -11,8 +11,9 @@ mod scenarios;
 
 use aterm_vitals::jobs::wire::{exe_word, is_exe_word};
 use aterm_vitals::jobs::{
-    Block, Class, Consumer, Demand, Findings, GateWord, HeldEpisode, JobKind, JobsView, MuFrom,
-    Named, NamedWait, OWN_MIN, ProcState, TermWord, TierB, Verdict, WaitName, command_class,
+    Block, Class, Consumer, Demand, Findings, GateWord, HeldEpisode, JobKind, JobsView,
+    KERNEL_WAIT_MS, MuFrom, Named, NamedWait, OWN_MIN, ProcState, TermWord, TierB, Verdict,
+    WaitName, command_class,
 };
 use scenarios::{TICK_MS, curl, follow_fds, pipe_end, sleeper, socket_fd, spinner, tcp_fd};
 use world::{OutFile, Proc, World, hint};
@@ -959,6 +960,46 @@ fn findings_count_stopped_d_state_and_the_process_table() {
         lines.contains(&"finding kind=process-table own=3 limit=5333".to_owned()),
         "{lines:?}"
     );
+}
+
+/// A WAIT IS DUE TO BE NAMED AT ITS KERNEL WAIT: the engine dates a process in an uninterruptible
+/// wait from the first pass that reads it, and `Jobs::d_state_due_ms` is when a pass first names
+/// one of this user's: that pass's clock plus `KERNEL_WAIT_MS` until a pass names it, then none.
+/// Another user's wait, dated a pass later, which no finding names, is never due. NEGATIVE
+/// CONTROL: judge every dated wait, and the pass that names this user's is due at the other's.
+#[test]
+fn a_wait_of_this_users_is_due_to_be_named_at_its_kernel_wait() {
+    let mut w = World::new();
+    let mut d = sleeper(7001, "fsck");
+    d.ppid = 1;
+    d.d_state = true;
+    w.add(d);
+    let mut other = sleeper(7004, "nfsd");
+    other.ppid = 1;
+    other.uid = 0;
+    w.add(other);
+    let first = w.tick(TICK_MS);
+    let dated = w.at;
+    assert_eq!(first.findings.d_state, []);
+    assert_eq!(w.jobs.d_state_due_ms(), Some(dated + KERNEL_WAIT_MS));
+    w.p(7004).d_state = true;
+    while w.at + TICK_MS < dated + KERNEL_WAIT_MS {
+        let v = w.tick(TICK_MS);
+        assert_eq!(v.findings.d_state, [], "{} ms on", w.at - dated);
+        assert_eq!(w.jobs.d_state_due_ms(), Some(dated + KERNEL_WAIT_MS));
+    }
+    let named = w.tick(TICK_MS);
+    assert_eq!(w.at, dated + KERNEL_WAIT_MS);
+    assert_eq!(
+        named
+            .findings
+            .d_state
+            .iter()
+            .map(|n| n.pid)
+            .collect::<Vec<_>>(),
+        [7001]
+    );
+    assert_eq!(w.jobs.d_state_due_ms(), None, "named, and none of ours due");
 }
 
 /// On Linux the per-user limit (`RLIMIT_NPROC`) counts a user's threads, so the process table's
@@ -5775,6 +5816,46 @@ fn a_full_screen_program_waking_often_with_no_key_queued_reads_keys_not_polling(
     w.run_fg(1, 51, "./poller", p);
     let v = run_to(&mut w, 60_000, |_, _| {});
     assert_eq!(v.row("b51").map(|r| r.class), Some(Class::Polling));
+}
+
+#[test]
+fn a_redraw_invalidates_a_terminal_wait_before_its_output_stamp_is_sampled() {
+    let mut w = World::new();
+    w.run_fg(1, 51, "./muse", sleeper(1000, "muse"));
+    w.tty_mode(1, false, false);
+    let wait = |v: &JobsView| v.row("b51").unwrap().wait.as_ref().unwrap().name;
+    let fresh = run_to(&mut w, 20_000, |_, _| {});
+    assert_eq!(
+        (wait(&fresh), fresh.demand),
+        (WaitName::TtyRaw, Demand::Idle)
+    );
+
+    let tab = &mut w.tab(1).tab;
+    assert_eq!(tab.output_ms, None);
+    tab.tty.as_mut().unwrap().stamped_ms = 0;
+    let after_draw = w.tick(TICK_MS);
+    assert!(after_draw.parked_tabs.is_empty());
+    assert_eq!(
+        after_draw.demand,
+        Demand::Fast,
+        "schedule the next observation despite the displayed name's debounce"
+    );
+    let confirmed = w.tick(TICK_MS);
+    assert_eq!(
+        (wait(&confirmed), confirmed.demand),
+        (WaitName::Unnamed, Demand::Fast)
+    );
+
+    w.tty_mode(1, false, false);
+    // Both the displayed name and the legitimacy of the returning terminal read must settle.
+    assert_eq!(w.tick(TICK_MS).demand, Demand::Fast);
+    assert_eq!(w.tick(TICK_MS).demand, Demand::Fast);
+    let reread = w.tick(TICK_MS);
+    assert_eq!(reread.parked_tabs, [1]);
+    assert_eq!(
+        (wait(&reread), reread.demand),
+        (WaitName::TtyRaw, Demand::Idle)
+    );
 }
 
 #[test]

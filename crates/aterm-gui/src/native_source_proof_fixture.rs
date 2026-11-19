@@ -29,6 +29,8 @@ struct Command {
     member: Option<String>,
     #[serde(default)]
     credential_generation: Option<u64>,
+    #[serde(default)]
+    expect: Option<settle_ack_fault::Expectation>,
 }
 
 #[derive(Default)]
@@ -239,7 +241,8 @@ fn run_source_protocol_fixture(frame: String) -> Result<(), String> {
     store
         .write()
         .unwrap_or_else(|p| p.into_inner())
-        .register(handle.clone());
+        .register(handle.clone())
+        .start_mailbox();
     let context = Arc::new(ControlWorkerContext {
         active: Arc::new(Mutex::new(Some(ActiveSession {
             term: Arc::clone(&term),
@@ -255,12 +258,15 @@ fn run_source_protocol_fixture(frame: String) -> Result<(), String> {
         recovery_count_admission: Arc::new(
             crate::keeper_link::RecoveryCountAdmission::from_retained(Vec::new()),
         ),
+        #[cfg(target_os = "macos")]
+        signed_settle_ack: None,
     });
     let listener = CtlListener::bind(&socket).map_err(|_| "source fixture listener unavailable")?;
     listener
         .set_nonblocking(true)
         .map_err(|_| "source fixture listener unavailable")?;
     let stopping = Arc::new(AtomicBool::new(false));
+    let settle_ack = Arc::new(settle_ack_fault::Fault::new(sid.clone()));
     let trace = Arc::new(Mutex::new(Trace::default()));
     let observed_trace = Arc::clone(&trace);
     let observed_registry = Arc::clone(&registry);
@@ -423,6 +429,7 @@ fn run_source_protocol_fixture(frame: String) -> Result<(), String> {
     let server_stop = Arc::clone(&stopping);
     let server_context = Arc::clone(&context);
     let server_observe = Arc::clone(&observe);
+    let server_settle_ack = Arc::clone(&settle_ack);
     let server = std::thread::Builder::new()
         .name("source-proof-native-control".into())
         .spawn(move || {
@@ -481,10 +488,21 @@ fn run_source_protocol_fixture(frame: String) -> Result<(), String> {
                         let held = stream.try_clone()?;
                         let context = Arc::clone(&server_context);
                         let observe = Arc::clone(&server_observe);
+                        let settle_ack = Arc::clone(&server_settle_ack);
+                        let stopping = Arc::clone(&server_stop);
                         workers.push((
                             held,
                             std::thread::spawn(move || {
-                                serve_connection_observed(&context, stream, true, Some(&*observe))
+                                serve_connection_observed(
+                                    &context,
+                                    stream,
+                                    true,
+                                    Some(SourceFixtureConnection {
+                                        observe: &*observe,
+                                        settle_ack: &settle_ack,
+                                        stopping: &stopping,
+                                    }),
+                                )
                             }),
                         ));
                     }
@@ -609,16 +627,19 @@ fn run_source_protocol_fixture(frame: String) -> Result<(), String> {
                         launch.guardian_peer_failure(driver_pid)
                     ));
                 }
+                let fields = (
+                    command.member.is_some(),
+                    command.credential_generation.is_some(),
+                    command.expect.is_some(),
+                );
                 if command.schema != 1
                     || !aterm_codec::hex::is_lower(&command.request, 32)
                     || !matches!(
-                        command.action.as_str(),
-                        "advance" | "observe" | "arm-ready-loss"
+                        (command.action.as_str(), fields),
+                        ("advance" | "observe", (false, false, false))
+                            | ("arm-ready-loss", (true, true, false))
+                            | ("arm-settle-ack-loss", (false, false, true))
                     )
-                    || (command.action == "arm-ready-loss")
-                        != (command.member.is_some() && command.credential_generation.is_some())
-                    || (command.action != "arm-ready-loss"
-                        && (command.member.is_some() || command.credential_generation.is_some()))
                 {
                     return Err("invalid source proof guardian command".into());
                 }
@@ -645,6 +666,9 @@ fn run_source_protocol_fixture(frame: String) -> Result<(), String> {
                     return Err("source proof request sequence changed".into());
                 }
                 request_prefix = Some(prefix.to_owned());
+                if let Some(expected) = &command.expect {
+                    settle_ack.arm(expected.clone())?;
+                }
                 if command.action == "arm-ready-loss" {
                     let member = command
                         .member
@@ -691,7 +715,7 @@ fn run_source_protocol_fixture(frame: String) -> Result<(), String> {
                 let outcomes = trace.outcomes.iter().collect::<Vec<_>>();
                 let mut reply = aterm_json::to_vec(&aterm_json::json!({"schema":1,
                 "request":command.request,"action":command.action,"outcome":if pending.is_some() {"pending"} else {"ok"},
-                "generation":promoted_generation,"observation":trace.last.as_ref(),"readySeen":trace.ready_seen,"closedSeen":trace.closed_seen,"outcomes":outcomes,"outcomeSequence":trace.outcome_sequence,"readyLoss":trace.ready_loss}))
+                "generation":promoted_generation,"observation":trace.last.as_ref(),"readySeen":trace.ready_seen,"closedSeen":trace.closed_seen,"outcomes":outcomes,"outcomeSequence":trace.outcome_sequence,"readyLoss":trace.ready_loss,"settleAckLoss":settle_ack.observation()}))
                 .map_err(|_| "source proof guardian encoding failed")?;
                 if reply.len()
                     > aterm_agent::harness::codex_source_registry::SOURCE_PROOF_OBSERVATION_LIMIT

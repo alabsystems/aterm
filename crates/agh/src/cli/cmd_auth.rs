@@ -25,9 +25,14 @@ use crate::slug::Slug;
 /// `platform` in `auth status`'s report.
 #[cfg(unix)]
 const PLATFORM: &str = "unix";
+/// `platform` in `auth status`'s report: agh.toml, the adoption record and token files are read
+/// on windows as on unix, as private files (a protected access list of the user and SYSTEM in
+/// place of 0600 and 0700), and the vault's entries from this host's store.
+#[cfg(windows)]
+const PLATFORM: &str = "windows";
 /// `platform` in `auth status`'s report.
-#[cfg(not(unix))]
-const PLATFORM: &str = "windows: anonymous only (file credentials need unix permission checks)";
+#[cfg(not(any(unix, windows)))]
+const PLATFORM: &str = "anonymous only (no private files on this platform)";
 
 fn check_name(name: &str) -> Result<()> {
     match crate::config::profile_name_fault(name) {
@@ -209,15 +214,16 @@ pub(crate) fn auth_remove(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 type Read = Option<std::result::Result<crate::config::Validated, Vec<ConfigFault>>>;
 
 /// agh.toml read and judged by `policy check`'s rules.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn read_config(dirs: &crate::config::Dirs) -> Read {
     use crate::config::{self, CONFIG_FILE};
     let read = config::read_config(&dirs.config, CONFIG_FILE, &dirs.home);
     config::faults_of(read, &dirs.home).map(|judged| judged.verdict)
 }
 
-/// Off unix agh never reads agh.toml (design §6.6): every read is anonymous.
-#[cfg(not(unix))]
+/// A host with no private files (neither unix nor windows) never reads agh.toml (design
+/// §6.6): every read is anonymous.
+#[cfg(not(any(unix, windows)))]
 fn read_config(dirs: &crate::config::Dirs) -> Read {
     let _ = dirs;
     None

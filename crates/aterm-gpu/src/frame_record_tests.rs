@@ -1531,7 +1531,7 @@ fn blit_uniform(
         sh,
         dw,
         dh,
-        c.inset,
+        aterm_render::SideInsetPx(c.inset as usize).into(),
         gpu.theme.bg,
     );
     want.chrome_y0 = win.chrome_y0 as f32;

@@ -20,7 +20,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "atpkg"
 path = "src/main.rs"
-# A shim over `atpkg::cli::main_entry` with no tests; the integration tests still get the
+# A shim over `atpkg::cli::standalone_entry` with no tests; the integration tests still get the
 # built binary.
 test = false
 
@@ -31,7 +31,8 @@ name = "atpkg-abrew"
 path = "src/abrew_main.rs"
 test = false
 
-# Development fixture: native tether and captured compiler controls without app startup.
+# Development fixture: native tether, captured compiler and argv-recording stand-in controls
+# without app startup.
 [[bin]]
 name = "atpkg-status-fixture"
 path = "tests/status_fixture.rs"
@@ -221,6 +222,11 @@ path = "tests/packages_log_lanes.rs"
 [[test]]
 name = "typed_lock_wait_tty"
 path = "tests/typed_lock_wait_tty.rs"
+
+# Alone: the public claim protocol execs this target as its same-PID command actor.
+[[test]]
+name = "claim_exec"
+path = "tests/claim_exec.rs"
 
 # Explicit mounted-volume acceptance; not an ordinary test or a release dependency.
 [[bench]]

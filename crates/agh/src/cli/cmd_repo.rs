@@ -78,7 +78,15 @@ pub(crate) fn repo_check_local(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcom
     })
 }
 
-/// Publish exact local objects with one explicit atomic lease batch.
+/// Publish exact local objects with one explicit atomic lease batch. With no
+/// `--timeout`, each native Git child of the write is bounded by a 60 s
+/// inactivity window instead of a wall bound, over its process tree and its
+/// HTTP transfer alike, so a caller that never ends the write for elapsed time
+/// leaves agh to end a stalled child, a silent remote's included, and settle
+/// its own intent: a push that may have reached the remote is never made
+/// again, and unless a re-read of its refs finds it landed it is settled
+/// Unknown and stays open until it is reconciled. An explicit `--timeout`
+/// keeps its wall cap, and a dry run keeps the wall bound.
 ///
 /// # Errors
 /// Input and repository usage errors, writer policy and local Git refusals,

@@ -17,6 +17,7 @@ use crate::{
     typed::{
         Kind, Table, Ty,
         cell::{CellKey, CellValue},
+        owned,
     },
 };
 use astream_wire::sync::{Actor, Digest};
@@ -72,20 +73,22 @@ impl Delta {
 }
 
 /// The operation that made a difference, its writer and the writer's Commons machine (from the
-/// binding in the roster the record names, as history resolves it).
+/// binding in the roster the record names, as history resolves it), and what a version 2 record
+/// says of who made it, why and on what evidence ([`crate::said`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Maker {
     pub operation: Digest,
     pub actor: Actor,
     pub machine: Option<[u8; 16]>,
+    pub said: Option<crate::said::Said>,
 }
 
-/// One cell, or one owned row, that differs between two points.
+/// One cell, one owned row, or one log entry, that differs between two points.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellDiff {
     pub collection: String,
-    /// The stored cell key (`<pk>.<column>`, `<pk>.<column>.<member>` for a set's member), or an
-    /// owned collection's row key.
+    /// The stored cell key (`<pk>.<column>`, `<pk>.<column>.<member>` for a set's member), an
+    /// owned collection's row key, or a log's entry key (`<uuid32>.<n>`).
     pub key: String,
     pub delta: Delta,
     /// The candidates at the first point, and at the second, as stored.
@@ -102,6 +105,9 @@ pub struct Diff {
     pub from: Digest,
     pub to: Point,
     pub cells: Vec<CellDiff>,
+    /// The records the later point holds and does not project: what
+    /// [`crate::typed::refused_words`] says of them.
+    pub refused: Vec<crate::typed::Unread>,
 }
 
 /// A candidate's value as its column reads it: a typed cell's `x`, a stored null (a revert back
@@ -160,25 +166,29 @@ fn is_member(table: &Table, collection: &str, key: &str) -> bool {
     })
 }
 
-/// Every cell and owned row of `table` that differs from `before` to `after`, in collection and
-/// key order, each with the operations that made it, as `maker` resolves them.
+/// Every cell, owned row and log entry of `table` that differs from `before` to `after`, in
+/// collection and key order, each with the operations that made it, as `maker` resolves them.
+/// An owned row and a log entry are compared as each view reads them (`View::owned`,
+/// `View::logs`), never as registers: a view of a family that keeps its records holds those
+/// of its sealed generations, which no register of a later generation restates ([`super::kept`]),
+/// and a write a reader holds inert (another Mac's key, a reused counter) is no difference.
 pub(crate) fn between(
     table: &Table,
     before: &View,
     after: &View,
     maker: impl Fn(&Digest) -> Option<Maker>,
 ) -> Vec<CellDiff> {
-    let owned = |name: &str| {
+    let rows = |name: &str| {
         table
             .collection(name)
-            .is_some_and(|c| c.kind == Kind::Owned)
+            .is_some_and(|c| c.kind != Kind::Cells)
     };
     let empty = Cell::default();
     let keys: BTreeSet<&(String, String)> = before
         .cells
         .keys()
         .chain(after.cells.keys())
-        .filter(|(collection, _)| !owned(collection))
+        .filter(|(collection, _)| !rows(collection))
         .collect();
     let mut found = Vec::new();
     let mut push = |collection: &str, key: &str, before: Vec<Candidate>, after: Vec<Candidate>| {
@@ -213,25 +223,35 @@ pub(crate) fn between(
             is.candidates.clone(),
         );
     }
-    for collection in table.collections.iter().filter(|c| c.kind == Kind::Owned) {
-        let rows = |view: &View| {
-            view.owned
+    for collection in table.collections.iter().filter(|c| c.kind != Kind::Cells) {
+        let rows = |view: &View| -> std::collections::BTreeMap<String, Candidate> {
+            let owned = view
+                .owned
                 .get(collection.name)
-                .map(|read| {
-                    read.rows
-                        .iter()
-                        .map(|(pk, row)| {
-                            (
-                                pk.clone(),
-                                Candidate {
-                                    operation: row.operation,
-                                    value: row.value.clone(),
-                                },
-                            )
-                        })
-                        .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .flat_map(|read| {
+                    read.rows.iter().map(|(pk, row)| {
+                        (
+                            pk.clone(),
+                            Candidate {
+                                operation: row.operation,
+                                value: row.value.clone(),
+                            },
+                        )
+                    })
+                });
+            let entries = view.logs.get(collection.name).into_iter().flat_map(|read| {
+                read.entries.iter().map(|entry| {
+                    (
+                        owned::log_entry_key(&entry.machine, entry.n),
+                        Candidate {
+                            operation: entry.operation,
+                            value: entry.value.clone(),
+                        },
+                    )
                 })
-                .unwrap_or_default()
+            });
+            owned.chain(entries).collect()
         };
         let (was, is) = (rows(before), rows(after));
         let pks: BTreeSet<&String> = was.keys().chain(is.keys()).collect();

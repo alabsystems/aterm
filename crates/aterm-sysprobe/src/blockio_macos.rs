@@ -7,7 +7,7 @@
 use std::ffi::CString;
 
 use crate::blockio::{
-    BlockCounters, BlockReading, Device, DeviceWords, KEPT_VOLUMES, Prop, Registry,
+    BlockBatch, BlockCounters, BlockReading, Device, DeviceWords, KEPT_VOLUMES, Prop, Registry,
     STATISTICS_KEYS, counters_of, device_of_walk, drivers_above,
 };
 use crate::iokit::{self, MAIN_PORT_DEFAULT, io_object_t};
@@ -168,14 +168,18 @@ impl Reader {
         }
     }
 
-    /// One reading per device of the mounts that was found and read, in their order: a mount
-    /// whose device an earlier one read gives none.
-    pub(crate) fn read(&mut self, mounts: &[&Mount]) -> Vec<BlockReading> {
+    /// The resolved device of each original mount, and distinct readable devices in request
+    /// order. Counter refusal and deduplication never move another mount into its slot.
+    pub(crate) fn read(&mut self, mounts: &[&Mount]) -> BlockBatch {
+        let mut batch = BlockBatch {
+            mounts: vec![None; mounts.len()],
+            ..BlockBatch::default()
+        };
         let Some(keys) = self.keys.as_ref() else {
-            return Vec::new();
+            return batch;
         };
         let mut out = Vec::new();
-        for m in mounts {
+        for (index, m) in mounts.iter().enumerate() {
             let Some(bsd) = m.from.strip_prefix("/dev/").filter(|b| !b.is_empty()) else {
                 continue;
             };
@@ -186,6 +190,7 @@ impl Reader {
                     None => continue,
                 },
             };
+            batch.mounts[index] = Some(kept.device.id.clone());
             // Another volume of a device this reading already copied (one of its container's,
             // or the same mount asked twice) copies its drivers' `Statistics` no second time.
             if out.iter().any(|r: &BlockReading| r.id == kept.device.id) {
@@ -207,7 +212,8 @@ impl Reader {
             self.kept.insert(0, kept);
             self.kept.truncate(KEPT_VOLUMES);
         }
-        out
+        batch.devices = out;
+        batch
     }
 }
 

@@ -7,9 +7,9 @@
 //!
 //! A pull names [`Store::have`], and a server answers every complete record past the ids named
 //! ([`Store::missing`]). A record this store cannot take (a kind only a newer build writes, a
-//! store at one of its budgets ([`super::RecordBudgets`]) or [`super::MAX_RECORDS_STREAM`], a
-//! record [`super::Log::insert`] refuses) never enters `have`, so every server answered it again on
-//! every pass, up to [`super::MAX_RECORDS_STREAM`] each. [`Untaken`] keeps, for each server, the
+//! store at one of its budgets ([`super::RecordBudgets`]) or its byte capacity
+//! ([`Store::capacity`]), a record [`super::Log::insert`] refuses) never enters `have`, so every server answered it again on
+//! every pass, up to [`super::REPLY_CAP`] each. [`Untaken`] keeps, for each server, the
 //! heads of what it sent that the store did not take, and the next pull to it names those heads
 //! first ([`Untaken::have`]), so the server counts their causal closure as known.
 //!
@@ -41,7 +41,7 @@ use super::store::framed::{FrameReadError, FrameReader, LayoutFrame};
 #[cfg(test)]
 use super::store::frames;
 use super::store::{Frame, readable_mask};
-use super::{MAX_HELD_RECORDS, MAX_RECORDS_STREAM, Record, RecordId, Store};
+use super::{MAX_HELD_RECORDS, REPLY_CAP, Reading, Record, RecordId, Store};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -93,6 +93,9 @@ pub(crate) struct ReceivedFrames {
     decoded: Vec<Option<Record>>,
     byte_len: usize,
     complete: bool,
+    /// The served frame that ended the response ([`super::Served`]), where its reader takes
+    /// one ([`Self::read_at`]) and the server sent one.
+    served: Option<super::Served>,
 }
 
 impl ReceivedFrames {
@@ -102,12 +105,13 @@ impl ReceivedFrames {
             decoded: Vec::new(),
             byte_len: 0,
             complete: true,
+            served: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn read(bytes: &[u8]) -> Self {
-        if bytes.len() > MAX_RECORDS_STREAM {
+        if bytes.len() > REPLY_CAP {
             let mut received = Self::empty();
             received.complete = false;
             received.byte_len = bytes.len();
@@ -124,17 +128,37 @@ impl ReceivedFrames {
         Self::read_from_with_known(reader, |_| None)
     }
 
-    /// Reuse an already verified immutable owner only after hashing the complete frame.
-    /// The lookup must not refresh files or retain a lock across another reader call.
+    /// [`Self::read_at`] as a node of format 1 reads ([`Reading::ONE`]).
+    #[cfg(test)]
     pub(crate) fn read_from_with_known<R: Read + ?Sized>(
         reader: &mut R,
+        known: impl FnMut(&RecordId) -> Option<Record>,
+    ) -> io::Result<Self> {
+        Self::read_at(reader, Reading::ONE, false, known)
+    }
+
+    /// Read the input's frames as `reading` reads them, reusing an already verified immutable
+    /// owner only after naming the complete frame ([`Self::push`]).
+    /// The lookup must not refresh files or retain a lock across another reader call.
+    ///
+    /// With `takes_served`, the reader asked for a served frame
+    /// ([`crate::transport::RECORDS_SERVED_HEADER`]): one frame that begins with
+    /// [`super::served::SERVED_MAGIC`] may follow the records and end the input, and is kept
+    /// ([`Self::served`]) where it reads as `reading` reads it ([`super::Served::decode`]). A
+    /// served frame that does not read, or bytes after it, refuse the whole response as any
+    /// layout failure does. Without `takes_served` such a frame is bytes no record begins with,
+    /// as it was before any reader took one.
+    pub(crate) fn read_at<R: Read + ?Sized>(
+        reader: &mut R,
+        reading: Reading,
+        takes_served: bool,
         mut known: impl FnMut(&RecordId) -> Option<Record>,
     ) -> io::Result<Self> {
         let mut input = Counted { reader, bytes: 0 };
         let mut received = Self::empty();
-        let mut frames = FrameReader::new();
+        let mut frames = FrameReader::at(reading);
         loop {
-            if received.sent.0.len() == MAX_HELD_RECORDS || input.bytes == MAX_RECORDS_STREAM {
+            if received.sent.0.len() == MAX_HELD_RECORDS || input.bytes == REPLY_CAP {
                 let mut extra = [0];
                 if read_once(&mut input, &mut extra)? == 0 {
                     break;
@@ -144,12 +168,21 @@ impl ReceivedFrames {
                 break;
             }
             let start = input.bytes;
-            match frames.read_layout(&mut input, MAX_RECORDS_STREAM - start) {
+            match frames.read_layout(&mut input, REPLY_CAP - start) {
                 Ok(None) => break,
                 Ok(Some(frame)) => {
-                    received.push(frame, start..input.bytes, &mut known);
+                    received.push(frame, start..input.bytes, reading, &mut known);
                 }
                 Err(FrameReadError::Invalid(_)) => {
+                    let prefix = frames.refused_prefix();
+                    if takes_served
+                        && prefix.starts_with(super::served::SERVED_MAGIC)
+                        && let Some(served) =
+                            read_served(prefix, &mut input, REPLY_CAP - start, reading)?
+                    {
+                        received.served = Some(served);
+                        break;
+                    }
                     received.invalidate();
                     drain(&mut input)?;
                     break;
@@ -165,16 +198,33 @@ impl ReceivedFrames {
         self.sent.0.clear();
         self.decoded.clear();
         self.complete = false;
+        self.served = None;
+    }
+
+    /// The served frame that ended the response, where its reader took one and every frame
+    /// before it was framed ([`Self::read_at`]).
+    pub(crate) fn take_served(&mut self) -> Option<super::Served> {
+        self.served.take()
     }
 
     fn push(
         &mut self,
         frame: LayoutFrame,
         _range: std::ops::Range<usize>,
+        reading: Reading,
         known: &mut impl FnMut(&RecordId) -> Option<Record>,
     ) {
-        let id = aterm_digest::Sha256::digest(&frame.wire);
-        let decoded = known(&id).or_else(|| Record::decode(&frame.wire).ok());
+        // A frame is named by its record's id ([`super::record_id`]), which the store's ids
+        // are ([`Sent::left_in`], [`Untaken::note`]): the SHA-256 of its bytes for a version-1
+        // record, and for a version-2 record the one id its whole and its shed form share,
+        // which the SHA-256 of either's bytes is not. Bytes no layout names keep their digest.
+        let id = super::record_id(&frame.wire)
+            .unwrap_or_else(|| aterm_digest::Sha256::digest(&frame.wire));
+        // The owner the puller holds stands for the frame only where it is the same bytes: a
+        // version-2 record held shed is not the whole one a peer sends under the same id.
+        let decoded = known(&id)
+            .filter(|held| held.wire_len() == frame.wire.len())
+            .or_else(|| Record::decode_in(&frame.wire, reading).ok());
         self.sent.0.push(Frame {
             id,
             parents: frame.parents,
@@ -208,6 +258,27 @@ impl ReceivedFrames {
     pub(crate) fn into_sent(self) -> Sent {
         self.sent
     }
+}
+
+/// The served frame whose first bytes are `prefix` and whose rest is `input` to its end, read
+/// as `reading` reads it: `None` where the frame is longer than `room` bytes (what is left of
+/// one reply at the frame's start) or does not decode ([`super::Served::decode`], which also
+/// refuses bytes after the frame). The input is read to its end, or one byte past `room`.
+fn read_served<R: Read>(
+    prefix: &[u8],
+    input: &mut R,
+    room: usize,
+    reading: Reading,
+) -> io::Result<Option<super::Served>> {
+    let Some(left) = room.checked_sub(prefix.len()) else {
+        return Ok(None);
+    };
+    let mut bytes = prefix.to_vec();
+    input.take(left as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > room {
+        return Ok(None);
+    }
+    Ok(super::Served::decode(&bytes, reading).ok())
 }
 
 struct Counted<'a, R: ?Sized> {

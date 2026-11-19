@@ -24,6 +24,9 @@
 #[cfg(unix)]
 #[path = "../tests/fabric_world/harness.rs"]
 mod harness;
+#[cfg(unix)]
+#[path = "../tests/support/patience.rs"]
+mod patience;
 
 #[cfg(unix)]
 #[path = "../tests/fabric_bench/census.rs"]

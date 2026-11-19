@@ -9,6 +9,7 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
+use crate::patience::Patience;
 use crate::{child_output, headless_boot, launch_isolation};
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// How long what this test started may make no progress before a wait names it hung.
 const CEILING: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(50);
 
@@ -46,8 +48,8 @@ fn ctl(inst: &headless_boot::Instance, args: &[&str]) -> Output {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = cmd.spawn().expect("spawn aterm ctl");
-        child_output::wait_and_read(child, Instant::now() + CEILING)
-            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+        child_output::wait_and_read(child, CEILING)
+            .unwrap_or_else(|why| panic!("aterm ctl {args:?} was killed before it exited: {why}"))
     })
 }
 
@@ -64,7 +66,7 @@ fn kept_with_line(prefix: &str, name: &str, body: &str, line: &str) {
         |_| true,
     );
     let began = Instant::now();
-    let deadline = began + CEILING;
+    let mut patience = Patience::new(CEILING);
     let text = loop {
         let text = stdout(&ctl(&inst, &["text"]));
         if text.contains(line) {
@@ -77,10 +79,9 @@ fn kept_with_line(prefix: &str, name: &str, body: &str, line: &str) {
             began.elapsed(),
             headless_boot::log_tail(&inst.log)
         );
-        assert!(
-            Instant::now() < deadline,
-            "the pane never said {line:?}; it shows:\n{text}"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("the pane never said {line:?} ({why}); it shows:\n{text}");
+        }
         std::thread::sleep(POLL);
     };
     assert_eq!(
@@ -141,17 +142,17 @@ fn ends_by_itself(prefix: &str, extra: impl FnOnce(&Path, &mut Command)) {
     let _lifeline = launch_isolation::lifeline(&mut cmd, &root);
     extra(&root, &mut cmd);
     let mut child = cmd.spawn().expect("launch aterm --headless");
-    let deadline = Instant::now() + CEILING;
+    let mut patience = Patience::new(CEILING);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll the instance") {
             break status;
         }
-        if Instant::now() >= deadline {
+        if let Some(why) = patience.spent() {
             let _ = child.kill();
             let _ = child.wait();
             let tail = headless_boot::log_tail(&log);
             let _ = std::fs::remove_dir_all(&root);
-            panic!("the instance outlived its shell; log tail:\n{tail}");
+            panic!("the instance outlived its shell ({why}); log tail:\n{tail}");
         }
         std::thread::sleep(POLL);
     };

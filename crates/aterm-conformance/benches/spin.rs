@@ -288,53 +288,82 @@ mod measuring {
                 min_hidden_parked: None,
             },
         ),
-        // A window at the shipped motion, rest and effect defaults (its head writes no motion,
-        // rest or effect line: `motion = "auto"`, the window never rests, the rainbow cursor
-        // beside the cat) in the take's scratch world (its bell silent and its automatic lanes
-        // off), raised and then left untouched: the take waits out the attention window after the
-        // raise (40 s, `window_rest::ATTENTION`; the focus the raise brings is a touch), then for
-        // `trail status` to read it focused, unattended, on glass and with its pet in deep sleep
-        // or not drawn. That wait is refused once the instance made no CPU or I/O progress for a
-        // minute; an instance that still answers its reads or takes its readings works, and is
-        // waited on for up to the 15-minute guard the take's budget holds. It then lets the
-        // readings settle on their background cadence (5 s, `unattended::SETTLE`) and measures
-        // 60 s from `metrics reset`. Its motion stage and shed are recorded, never required. A
-        // window event in the window, or an edge that lost that state, is a refusal
+        // A window at the shipped motion, rest and effect defaults (its head writes no motion, rest
+        // or effect line: `motion = "auto"`, the window never rests, the rainbow cursor beside the
+        // cat) in the take's scratch world (its bell silent and its automatic lanes off), raised
+        // and then left untouched: the take waits out the attention window after the raise (40 s,
+        // `window_rest::ATTENTION`; the focus the raise brings is a touch), then for `trail status`
+        // to read it focused, unattended, on glass and with its pet in deep sleep or not drawn.
+        // That wait is refused once the instance made no CPU or I/O progress for a minute; an
+        // instance that still answers its reads or takes its readings works, and is waited on for
+        // up to the 15-minute guard the take's budget holds. Each of its reads comes just after a
+        // `metrics reset`, so every count the take reads runs from the reset before the read that
+        // ended the wait. That read stands for the window's opening edge: the window opens with no
+        // `trail status` of its own, a wake that is activity, whose crash-journal capture and read
+        // of the panes' facts would book in it. It then lets the readings settle on their
+        // background cadence (5 s, `unattended::SETTLE`), which also outlasts that read's own
+        // capture and read on a loop less than 0.5 s late, and measures 60 s between two `metrics`
+        // reads. Its motion stage and shed are recorded, never required. A window event from that
+        // reset to the window's end, or an edge that lost that state, is a refusal
         // (`unattended::decide`). An unattended deck holds still (`window_rest::Rest::deck_moves`
         // needs attention), its needle with it, and a pet in deep sleep takes no frame, so the
         // needle and cursor-effect lanes are bounded at 0. The deck's live edge then fires only at
         // its grey, 15 s after the newest reading's sample: the decision leaves a take with a few
-        // such fires undecided (a reading handed over that late, as by a starved probe thread)
-        // and fails one with more than a grey a reading slot and one more (a live edge that
-        // moved). What such a window still does is its shared readings, one every 5 s on a
-        // wall-clock grid (`vitals_host::BACKGROUND_PERIOD`, `due_on_phase`), a frame each, and
-        // in a scratch world the Network State band's poll every 60 s (`lab_deck::Feed::EVERY`)
-        // under the same owner, `system_vitals`: more fires than the slots of those two grids the
-        // window can touch (15 over a 60.15 s window) is work under that owner they do not
-        // account for, a fail, and fewer than a reading for each whole 5 s and a poll for each
-        // whole 60 s, less one fire another owner's wake may book (12), is a loop that fell
-        // behind their cadence, undecided. Its frames are bounded at a frame for each slot of the
-        // readings' and the band's grids the window can touch and for each blink fire (a reduced
-        // motion stage leaves the caret to its 530 ms blink clock, `BLINK_INTERVAL`): 15 over a
-        // 60.15 s window without the blink. Frames past that which only a grey, or a flip a wake
-        // of another owner carried where the blink ran, explains leave the take undecided; more
-        // fail it. Its wakes are bounded at the resting row's 60 a 20 s window held over the 60 s
-        // (180), two for each blink fire and grey (its timer, and its frame's surface-ready wake
-        // where that frame waits for its drawable), and one for each flip another owner's wake
-        // may carry. The CPU the window took is reported (`cpu_ms_per_s`,
-        // from `proc_pid_rusage` samples every 50 ms), never judged. Taken 2026-11-17 on m111 (18
-        // cores), three takes on each build of 03735595bf8, every window focused, unattended, on
-        // glass and its pet in deep sleep at both edges, and every take a pass: its dev bundle,
-        // admitted at one-minute loads of 7.4, 4.6 and 5.3, measured 13 readings, 12 frames, no
-        // live-edge, needle, cursor-effect or blink fire, and 48, 44 and 44 wakes (31, 29 and 29
-        // timer wakes, 12 of them devtools hand-overs); its debug build, at 5.6, 4.1 and 3.5, the
-        // same readings, frames and fires and 32 wakes (17 timer wakes) each. Proven red that day
-        // on the debug build by three mutants (never committed), each failed on its first take:
-        // `Rest::deck_moves` without its `self.attended` term (load 5.3), why= "deck_clock fired
-        // 50 times, at most 0; stats_live fired 35 times, past the 14 greys …; frames=101, past
-        // the 29 …"; a deadline 100 ms ahead folded on every turn under the owner `none` (6.7),
-        // why= "event_wakes=615, past the 180 …"; `BACKGROUND_PERIOD` cut to 2 s (9.8), why=
-        // "system_vitals fired 31 times, past the 15 …; frames=30, past the 15 …".
+        // such fires undecided (a reading handed over that late, as by a starved probe thread) and
+        // fails one with more than a grey a reading slot and one more (a live edge that moved).
+        // What such a window still does is its shared readings, one every 5 s on a wall-clock grid
+        // (`vitals_host::BACKGROUND_PERIOD`, `due_on_phase`), a frame each, and in a scratch world
+        // the Network State band's poll every 60 s (`lab_deck::Feed::EVERY`) under the same owner,
+        // `system_vitals`: more fires than the slots of those two grids the window can touch (15
+        // over a 60.15 s window) is work under that owner they do not account for, a fail, and
+        // fewer than a reading for each whole 5 s and a poll for each whole 60 s, less one fire
+        // another owner's wake may book (12), is a loop that fell behind their cadence, undecided.
+        // Its frames are bounded at a frame for each slot of the readings' and the band's grids the
+        // window can touch and for each blink fire (a reduced motion stage leaves the caret to its
+        // 530 ms blink clock, `BLINK_INTERVAL`): 15 over a 60.15 s window without the blink. Frames
+        // past that which only a grey, or a flip a wake of another owner carried where the blink
+        // ran, explains leave the take undecided; more fail it. Its wakes are bounded at the
+        // resting row's 60 a 20 s window held over the 60 s (180), two for each blink fire and grey
+        // (its timer, and its frame's surface-ready wake where that frame waits for its drawable),
+        // and one for each flip another owner's wake may carry. The crash journal (`crash_journal`)
+        // and the read of the panes' facts (`disk_facts`) fire only for a mark that the desk may
+        // have moved (`desk_activity`: a wake that is activity, a window event, a pane's front
+        // program moving): at most two and one for each mark in the window or in its settle,
+        // beside what the marks before the settle may book in the window on a loop as late as its
+        // slowest timer wake and longest turn (`unattended::spilled`: a second journal fire from
+        // 0.5 s late, both from 3 s, the facts' read from 4 s). Fires within that spill leave the
+        // take undecided, and more fail it by the owner's name. The CPU the window took is reported
+        // (`cpu_ms_per_s`, from `proc_pid_rusage` samples every 50 ms), never judged. Taken
+        // 2026-11-17 on m111 (18 cores), three takes on each build of 03735595bf8, with the
+        // window's own opening `trail status`, every window focused, unattended, on glass and its
+        // pet in deep sleep at both edges, and every take a pass: its dev bundle, admitted at
+        // one-minute loads of 7.4, 4.6 and 5.3, measured 13 readings, 12 frames, no live-edge,
+        // needle, cursor-effect or blink fire, and 48, 44 and 44 wakes (31, 29 and 29 timer wakes,
+        // 12 of them devtools hand-overs); its debug build, at 5.6, 4.1 and 3.5, the same readings,
+        // frames and fires and 32 wakes (17 timer wakes) each. Every window's census held its 12
+        // readings, one host note and that opening read, with two `crash_journal` and two
+        // `disk_facts` fires; one dev-bundle window's held a `ReduceMotionChanged` wake too, with
+        // three of each. Proven red that day on that debug build by three mutants (never
+        // committed), each failed on its first take: `Rest::deck_moves` without its `self.attended`
+        // term (load 5.3), why= "deck_clock fired 50 times, at most 0; stats_live fired 35 times,
+        // past the 14 greys …; frames=101, past the 29 …"; a deadline 100 ms ahead folded on every
+        // turn under the owner `none` (6.7), why= "event_wakes=615, past the 180 …";
+        // `BACKGROUND_PERIOD` cut to 2 s (9.8), why= "system_vitals fired 31 times, past the 15 …;
+        // frames=30, past the 15 …". The opening edge read from the readiness wait, the reset
+        // before each of its reads, the journal and facts bounds by desk marks and the host note's
+        // own census name came after those takes. Taken with them that day on m111, three takes on
+        // the debug build of 07282ca01ef, each window focused, unattended, on glass and its pet in
+        // deep sleep at both edges, and every take a pass: admitted at one-minute loads of 5.6, 6.0
+        // and 4.5, each measured 13 readings, 12 frames, 15 timer wakes and 29 wakes, no live-edge,
+        // needle, cursor-effect or blink fire, one desk mark in its settle and window, and one
+        // `crash_journal` fire of the 2 that mark owes and one `disk_facts` fire of its 1, none
+        // spilled, at a `cpu_ms_per_s` of 7.6, 7.8 and 7.6. Each census from the reset held 13, 14
+        // and 14 `Vitals` wakes, the host note by its name (`HostNote.ProgramCheckUnstuck:1`) and
+        // the opening read (`TrailStatus:1`). Proven red on that build by a mutant (never
+        // committed) whose `Lane::next_wake` re-armed on its `not_before`'s 2 s grid whenever an
+        // image existed, failed on its first take (load 4.8; 43 timer wakes, 57 wakes), why=
+        // "crash_journal fired 29 times, past the 2 its 1 desk marks in the settle and the window
+        // owe (2 a mark: a capture and its settle): work no mark asked".
         (
             "an_unattended_window_does_no_work_its_readings_do_not_ask",
             SpinRow {

@@ -105,7 +105,10 @@ std::thread_local! {
 #[inline]
 fn wall_now() -> SystemTime {
     RAW_READS.with(|reads| reads.set(reads.get().wrapping_add(1)));
-    SystemTime::now()
+    let now = SystemTime::now();
+    #[cfg(test)]
+    tests::record_wall_read(now);
+    now
 }
 
 /// How many times the calling thread has read the wall clock through

@@ -31,10 +31,16 @@ const MAX_NAME: usize = 256;
 const MAX_KEYS: usize = 256;
 const HEADER: usize = 68;
 
+/// The most bytes the journal of retained frontiers holds. It holds frontiers, not records, so
+/// it is neither class of records byte bound (one reply, [`crate::membership_log::REPLY_CAP`];
+/// what a store holds, [`crate::crossing::capacity`]) and follows neither: its own `64 MiB`,
+/// which every build that wrote this journal holds it to.
+pub(super) const MAX_BYTES: usize = 64 * 1024 * 1024;
+
 fn limits() -> aterm_journal::Limits {
     aterm_journal::Limits {
         records: 2 * super::retained_frontier::MAX_IDS,
-        bytes: crate::membership_log::MAX_RECORDS_STREAM,
+        bytes: MAX_BYTES,
         record_bytes: HEADER + MAX_NAME + 32 * MAX_KEYS + super::retained_frontier::MAX_DELTA,
     }
 }

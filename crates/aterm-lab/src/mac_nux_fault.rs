@@ -10,16 +10,16 @@ use std::time::Instant;
 
 use crate::mac::{POLL, ROW, STEP};
 use crate::mac_nux_guest::{
-    Look, Record, STALL_MS, Stall, Waited, Watch, dialogs, read_census, read_record, read_watch,
-    stage_name, stage_starts,
+    Look, Record, STALL_MS, SetupEnd, Stall, Waited, Watch, dialogs, read_census, read_record,
+    read_watch, stage_name, stage_starts,
 };
 use crate::{Fail, stop};
 
 use super::{
     Around, GUEST_NUX, Guest, LOCAL_VAULT, LOCAL_VAULT_ENTRY, LOCAL_VAULT_PORT, OPENED_WATCH,
     PF_GUARD, Row, SETUP_POLL, Value, WATCH, checked_not_ok, drive_cells, lines_cell,
-    local_vault_setup, millis, or_missing, quit_app, setup_reading, squeeze, ssh_to_itself, vault,
-    wait_setup,
+    local_vault_setup, millis, or_missing, quit_app, setup_end_labels, setup_reading, squeeze,
+    ssh_to_itself, vault, wait_setup,
 };
 
 /// Why `kill-publish` is NOT RUN: a clone's publish needs a repository to clone.
@@ -237,16 +237,16 @@ fn looks(g: &Guest, file: &str) -> Result<Watch, Fail> {
 enum Until {
     /// What the row waited for happened, at this guest epoch ms.
     Hit(u64),
-    Done,
+    SetupEnded(SetupEnd),
     /// Setup said the same for a minute (the one-minute hang detector): what it said.
     Stalled(String),
     /// [`WATCH`] passed with setup still moving.
     Ceiling,
 }
 
-/// Wait until `hit` answers (the guest epoch ms of what the row waits for), setup is done, setup
-/// stood still a minute with nothing new from the person or in the app's processes, or [`WATCH`]
-/// passed.
+/// Wait until `hit` answers (the guest epoch ms of what the row waits for), setup reports an end,
+/// setup stood still a minute with nothing new from the person or in the app's processes, or
+/// [`WATCH`] passed.
 fn wait_for(g: &Guest, mut hit: impl FnMut() -> Result<Option<u64>, Fail>) -> Result<Until, Fail> {
     let mut stall = Stall::new(STALL_MS);
     let started = Instant::now();
@@ -256,7 +256,7 @@ fn wait_for(g: &Guest, mut hit: impl FnMut() -> Result<Option<u64>, Fail>) -> Re
             return Ok(Until::Hit(at));
         }
         match stall.see(millis(started.elapsed()), &setup_reading(g)?) {
-            Waited::Done => return Ok(Until::Done),
+            Waited::Ended(end) => return Ok(Until::SetupEnded(end)),
             Waited::Stalled { stood, .. } => return Ok(Until::Stalled(stood)),
             Waited::Moving => {}
         }
@@ -271,7 +271,7 @@ fn wait_for(g: &Guest, mut hit: impl FnMut() -> Result<Option<u64>, Fail>) -> Re
 fn until_text(until: &Until) -> String {
     match until {
         Until::Hit(_) => "it happened".to_owned(),
-        Until::Done => "setup finished first".to_owned(),
+        Until::SetupEnded(end) => setup_end_labels(*end).2.to_owned(),
         Until::Stalled(stood) => format!("setup stood at {stood} for a minute"),
         Until::Ceiling => format!("setup still moved at {} min", WATCH.as_secs() / 60),
     }

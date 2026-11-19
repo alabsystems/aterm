@@ -3504,16 +3504,18 @@ fn mind_node_checker(
 #[cfg(target_os = "macos")]
 impl NodeUpdater for LiveNodeUpdater {
     fn start_checker(&self, noticed: Box<dyn Fn() + Send>) {
-        crate::network_moved::observe_for_updater();
-        // The job's sleeps end the check's wait; a LaunchAgent is never stopped by job control,
-        // so its listener always acknowledges a will-sleep.
-        let _ = aterm_update::hear_wakes();
         aterm_update::spawn_background_check_with_settings(
             crate::running_build_number(),
             Arc::new(crate::app_config::update_check_settings_setting),
             None,
             Some(Box::new(move |_build, _version| noticed())),
             None,
+            // The job's sleeps and settled network moves end the check's wait; a LaunchAgent is
+            // never stopped by job control, so its listener always acknowledges a will-sleep.
+            aterm_update::Wakes {
+                sleeps: aterm_update::Sleeps::Heard,
+                network: Some(crate::network_moved::observe_for_updater),
+            },
         );
     }
 
@@ -3765,8 +3767,14 @@ pub type NodeMaintenance = Arc<dyn Fn() -> Option<Instant> + Send + Sync>;
 /// ([`apply_node_update_at_boot`]), then `startup` (the job's Commons runtime), then the run. A start that finds the lock held is a second instance and
 /// does none of it, so it neither swaps a stage in nor counts a start against the boot trial of
 /// a build another instance runs, and starts no service beside the one that serves.
+///
+/// It takes what keeping the job's log kept (`aterm_agent::node_service::keep_log`): nothing else
+/// makes one, so `aterm node serve` cannot serve without keeping it.
 #[must_use = "return or inspect the node service's exit status"]
-pub fn run_node_serve_owning(startup: impl FnOnce() -> Option<NodeMaintenance>) -> ExitCode {
+pub fn run_node_serve_owning(
+    startup: impl FnOnce() -> Option<NodeMaintenance>,
+    _kept: aterm_uds::job_log::Kept,
+) -> ExitCode {
     let Some(state_dir) = aterm_types::dirs::state_dir() else {
         eprintln!("aterm node serve: state directory is unavailable");
         return ExitCode::FAILURE;

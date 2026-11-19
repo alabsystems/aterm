@@ -1144,3 +1144,23 @@ replacements, then require the exact success and failure outcomes through the co
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 handoff-program-outcome	contract	installer_handoff::program_finished	For expected exit e, a task is accepted iff state is done when e = 0 or failed otherwise, why is exit-status, and the parsed exit equals e. A missing status, wrong state, or different exit is refused.	src/installer_handoff.rs::tests::program_completion_requires_the_requested_exit_status	field parsing, integer comparison	0,1,3
 ```
+
+## 34. `first-key summarize`, rows pooled from many runs
+
+`first-key summarize F...` reads each named `presses.tsv` (a relative name from the directory the
+lab was started in, which `confine_env` has left for `/` by then) and summarizes the rows of all
+of them together. A press number names a press only within one run's file, so the attended count,
+as every other per-arm figure, is over rows. Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+first-key-attended-rows	contract	first_key::summarize	For each arm a, in the order its first row appears, with M = the rows of a whose `attended` parses as a bool: where M is non-empty the summary holds the line `a: k of |M| rows met an attended window` with k = |{r ∈ M : attended(r) = true}|, and where M is empty it holds no such line for a. A row's `press` enters neither count, so rows of pooled files that share a press number each count.	src/first_key_tests.rs::pooled_files_count_attended_rows_not_press_numbers, src/first_key_tests.rs::the_summary_counts_the_rows_that_met_an_attended_window	BTreeMap<String, String> rows, str::parse::<bool>, Vec<bool> count, String formatting	0,1,5,7,13
+first-key-summarize-paths	contract	first_key::summarize_paths, paths::from_caller, paths::caller_dir	summarize_paths(args) = for each a of args, in order, the path of paths::from_caller(a): a itself where a is empty or starts with `/`, else paths::caller_dir() with its trailing `/` trimmed ++ `/` ++ a (caller_dir() is the physical directory the lab started in, read once, `/` where it cannot be read).	src/first_key_tests.rs::a_relative_summarize_path_is_read_from_the_directory_the_lab_started_in	String concatenation, a once-read working directory	0,1,7,8
+```
+
+```tsv
+file	test	primary	also
+src/first_key_tests.rs	pooled_files_count_attended_rows_not_press_numbers	first-key-attended-rows	
+src/first_key_tests.rs	the_summary_counts_the_rows_that_met_an_attended_window	first-key-attended-rows	
+src/first_key_tests.rs	a_relative_summarize_path_is_read_from_the_directory_the_lab_started_in	first-key-summarize-paths	
+```

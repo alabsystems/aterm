@@ -14,13 +14,16 @@ use std::time::{Duration, Instant};
 use aterm_uds::CtlStream;
 use aterm_uds::exitwatch::ExitWatch;
 
-use crate::core::{CompanionId, ConnId, Holders, KeeperCore, KeeperEnv, MarkerEvidence, Out, Rdev};
+use crate::code::ExeImage;
+use crate::core::{
+    CompanionId, ConnId, Holders, ImageLook, KeeperCore, KeeperEnv, MarkerEvidence, Out, Rdev,
+};
 use crate::frameio::{Incoming, read_frame, write_frame};
 use crate::identity::{CheckError, Identity, PeerCheck};
 use crate::sys::{self, POLLERR, POLLHUP, POLLIN, PollFd};
 use crate::wire::{
-    Birth, CAP_JOURNAL, CAP_KEEPS, CAP_SYNC, COMPANION_JOURNAL, Frame, JournalOffer, MarkerRef,
-    MasterHeader, PROTO, RefuseCode,
+    Birth, CAP_JOURNAL, CAP_KEEPS, CAP_RESTARTS, CAP_SYNC, COMPANION_JOURNAL, Frame, JournalOffer,
+    MarkerRef, MasterHeader, PROTO, RefuseCode,
 };
 
 /// Mechanism used to relaunch the terminal application.
@@ -97,6 +100,12 @@ pub struct Server {
     frames_behind_exit: u64,
     /// Frames the keeper could not write to their peer ([`Server::send`]).
     replies_lost: u64,
+    /// The executable this keeper started as ([`Server::restart_for`]); `None` honours no
+    /// RESTART_WHEN_SAFE.
+    image: Option<std::sync::Arc<ExeImage>>,
+    /// The replaced executable's path once the core decided to exit for it ([`Out::Exit`]),
+    /// until [`Server::exits`] reads every connection a last time.
+    exit_for: Option<String>,
     /// A test seam (unit tests only): the next OFFER's duplicate fails as `EMFILE` would.
     #[cfg(test)]
     test_fail_next_dup: bool,
@@ -122,6 +131,7 @@ const DRAIN_MAX_FRAMES: usize = 1024;
 struct Env<'a> {
     own_pid: u32,
     peer_pids: Vec<u32>,
+    image: Option<std::sync::Arc<ExeImage>>,
     _p: std::marker::PhantomData<&'a ()>,
 }
 
@@ -158,6 +168,11 @@ impl KeeperEnv for Env<'_> {
     }
     fn marker(&mut self, pid: u32, marker: &MarkerRef) -> MarkerEvidence {
         read_marker(pid, marker)
+    }
+    fn image(&mut self) -> ImageLook {
+        self.image
+            .as_deref()
+            .map_or(ImageLook::Unknown, ExeImage::look)
     }
 }
 
@@ -317,6 +332,8 @@ impl Server {
             unchecked_said: None,
             frames_behind_exit: 0,
             replies_lost: 0,
+            image: None,
+            exit_for: None,
             #[cfg(test)]
             test_fail_next_dup: false,
             #[cfg(test)]
@@ -332,12 +349,56 @@ impl Server {
         &self.socket
     }
 
-    /// Runs the server loop until terminated.
+    /// Runs the server loop until terminated, or until a window's wanted restart exits it
+    /// ([`Server::exits`]): `Ok` then, and its caller exits 0 for launchd to start the replaced
+    /// executable.
     /// # Errors
     /// Returns an error if `poll` fails for a reason other than `EINTR`.
     pub fn run(&mut self) -> io::Result<()> {
         loop {
             self.step(TICK_MS)?;
+            if self.exits() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Honour a window's RESTART_WHEN_SAFE: once nothing only this keeper holds would be lost,
+    /// it exits for the file that then stands at `image`'s path, never for the file it started
+    /// as, nor for a build older than this keeper's version ([`ExeImage::look`],
+    /// [`KeeperCore::restart_when_safe`]). Its WELCOME then states [`CAP_RESTARTS`].
+    pub fn restart_for(&mut self, image: ExeImage) {
+        self.image = Some(std::sync::Arc::new(image.serving(&self.version)));
+    }
+
+    /// Whether this keeper exits now for a wanted restart. Only after the turn's end decided it
+    /// ([`Out::Exit`]), and only once a last read of every frame already waiting on each
+    /// connection, and of each exit already delivered, left the core still deciding so
+    /// ([`KeeperCore::restart_check`]). That read is judged as every turn is, by the core's
+    /// `custody_hold`: the frames read there that hold the exit are a BYE's keep set, an EOF or
+    /// a delivered death, a HELLO whose offers follow, and a REGISTER that adds a second
+    /// claimant to a master. A REGISTER of a master its window alone claims holds nothing: that
+    /// window's link tells a restarted keeper again. A frame written after that read is not
+    /// read; see `docs/KNOWN_ISSUES.md`.
+    pub fn exits(&mut self) -> bool {
+        if self.exit_for.take().is_none() {
+            return false;
+        }
+        for id in self.conns.keys().copied().collect::<Vec<_>>() {
+            self.read_waiting(id, DRAIN_MAX_FRAMES);
+        }
+        for pid in self.watches.keys().copied().collect::<Vec<_>>() {
+            self.read_watch(pid);
+        }
+        let mut env = self.env();
+        let outs = self.core.restart_check(&mut env);
+        self.apply(outs);
+        match self.exit_for.take() {
+            Some(replaced) => {
+                eprintln!("keeper: restart: exiting for {replaced} replaced");
+                true
+            }
+            None => false,
         }
     }
 
@@ -349,6 +410,7 @@ impl Server {
         Env {
             own_pid: self.own_pid,
             peer_pids: self.conns.values().map(|c| c.pid).collect(),
+            image: self.image.clone(),
             _p: std::marker::PhantomData,
         }
     }
@@ -667,7 +729,7 @@ impl Server {
                 self.send(id, &Frame::Sync { seq }, None);
                 Vec::new()
             }
-            Frame::RestartWhenSafe => Vec::new(),
+            Frame::RestartWhenSafe => self.core.restart_when_safe(id),
             Frame::Companion { rdev, kind, len } => self.companion(id, rdev, kind, len, fd),
             Frame::CompanionRelease { rdev, kind } => self.core.companion_release(id, rdev, kind),
             Frame::Welcome { .. }
@@ -762,7 +824,16 @@ impl Server {
                         offers,
                         version: self.version.clone(),
                         identity: Some(self.identity.policy()),
-                        caps: Some(CAP_JOURNAL | CAP_SYNC | CAP_KEEPS),
+                        caps: Some(
+                            CAP_JOURNAL
+                                | CAP_SYNC
+                                | CAP_KEEPS
+                                | if self.image.is_some() {
+                                    CAP_RESTARTS
+                                } else {
+                                    0
+                                },
+                        ),
                     };
                     self.send(conn, &frame, None);
                 }
@@ -777,6 +848,8 @@ impl Server {
                 }
                 Out::WatchPid(pid) => self.watch_pid(pid),
                 Out::Relaunch => self.relaunch_now(),
+                Out::Restart(note) => eprintln!("keeper: restart: {note}"),
+                Out::Exit { replaced } => self.exit_for = Some(replaced),
             }
         }
     }
@@ -890,6 +963,19 @@ impl Server {
             format!("refused_dials={}", self.refused_dials),
             format!("frames_behind_exit={}", self.frames_behind_exit),
             format!("replies_lost={}", self.replies_lost),
+            // What a wanted restart would start: the file it started as, another build at least
+            // as new, another not known to be (`older`), or nothing to compare (`none` when it
+            // records no executable and honours no restart).
+            format!(
+                "image={}",
+                match self.image.as_deref().map(ExeImage::look) {
+                    None => "none",
+                    Some(ImageLook::Same) => "same",
+                    Some(ImageLook::Replaced(_)) => "replaced",
+                    Some(ImageLook::Older(_)) => "older",
+                    Some(ImageLook::Unknown) => "unknown",
+                }
+            ),
         ];
         let (journals, bytes) =
             self.companions

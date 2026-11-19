@@ -74,11 +74,13 @@ fn private_realm(paths: &Paths, cfg: &Config) -> crate::Result<bool> {
     }
     let (_, mut store) = records_store_selected(&reads, Some(cfg))?;
     let selected = crate::records_storage::selected(&paths.records_file())?;
-    let records =
-        match fsx::read_private(selected.path(), crate::membership_log::MAX_RECORDS_STREAM)? {
-            Some(bytes) => crate::membership_log::decode_records_before_cut(bytes.as_slice())?,
-            None => Vec::new(),
-        };
+    // Read and decoded as the store that takes them reads: its capacity, and its format.
+    let records = match fsx::read_private(selected.path(), store.capacity())? {
+        Some(bytes) => {
+            crate::membership_log::decode_records_before_cut_in(bytes.as_slice(), store.reading())?
+        }
+        None => Vec::new(),
+    };
     selected.confirm()?;
     let compiled = crate::membership_log::genesis::compiled()?;
     if compiled.is_some_and(|root| {

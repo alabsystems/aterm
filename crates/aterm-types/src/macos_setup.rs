@@ -208,8 +208,9 @@ impl Group {
     }
 }
 
-/// One macOS grant shown in the Access group. All of them ride the
-/// [`Setting::Permissions`] bit: the group is one intent.
+/// One macOS grant or administrator step setup reads with no prompt. Every one but the
+/// Spotlight scope rides the [`Setting::Permissions`] bit, the group's one intent; the scope is
+/// setup's root step, which no switch governs ([`Self::switch_governs`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Access {
     /// Full Disk Access for aterm (System Settings ▸ Privacy & Security).
@@ -224,7 +225,8 @@ pub enum Access {
     LocalNetwork,
     /// The narrow administrator-installed permission to name this Mac.
     NameRule,
-    /// Administrator-installed Spotlight exclusions for home folders.
+    /// Spotlight's scope (FL-127's root step), shown on System State's Mac settings line as
+    /// Spotlight indexing: a reading no switch governs ([`Self::switch_governs`]).
     SpotlightScope,
     /// Authenticated membership of the configured ALab vault.
     NetworkAuth,
@@ -256,7 +258,7 @@ impl Access {
             Self::Accessibility => "Accessibility",
             Self::LocalNetwork => "Local Network access",
             Self::NameRule => "Mac naming permission",
-            Self::SpotlightScope => "Home folders in Spotlight",
+            Self::SpotlightScope => "Spotlight indexing",
             Self::NetworkAuth => "Network authorization",
             Self::NetworkHelper => "Network helper",
         }
@@ -271,9 +273,18 @@ impl Access {
             }
             Self::LocalNetwork => "Allowed",
             Self::NameRule | Self::NetworkHelper => "Installed",
-            Self::SpotlightScope => "Excluded",
+            Self::SpotlightScope => SPOTLIGHT_SCOPED,
             Self::NetworkAuth => "Authorized",
         }
+    }
+
+    /// Whether a plan bit governs this row: [`Setting::Permissions`] for every grant but the
+    /// Spotlight scope, which is setup's root step and asks by itself whatever the plan
+    /// ([`spotlight_scope::automatic_owed`]). The window's rows and `aterm init`'s stage read this
+    /// one rule, so neither mutes the scope while the Permissions line is off.
+    #[must_use]
+    pub const fn switch_governs(self) -> bool {
+        !matches!(self, Self::SpotlightScope)
     }
 
     /// Whether this grant is needed for `selection`. Accessibility is needed only while an
@@ -670,8 +681,90 @@ pub const ADMITTED_NAME_RULE: &str = "/private/etc/sudoers.d/aterm-admitted-name
 /// later launch ask for the password again.
 pub const ADMITTED_NAME_RULE_REFUSED: &str = "/private/etc/sudoers.d/.aterm-admitted-name.refused";
 
+/// Where the rule goes when a person removes it with the elevation's own journaled revert (one
+/// `/bin/mv -f` of [`ADMITTED_NAME_RULE`] onto this dotted name, which sudo never reads): while it
+/// stands and no rule does, the removal is the person's, so no run nobody asked for owes the rule
+/// or puts it back, and only a person's own request (a typed `aterm init` that applies, the name
+/// menu's permission repair) reinstalls it, which removes this.
+pub const ADMITTED_NAME_RULE_REMOVED: &str = "/private/etc/sudoers.d/.aterm-admitted-name.removed";
+
+/// The Spotlight indexing row's value once setup's receipt names every folder the scope keeps
+/// out ([`spotlight_scope::State::Scoped`]): what Spotlight still indexes.
+pub const SPOTLIGHT_SCOPED: &str = "Applications, Documents, Desktop and synced drives only";
+
+/// The Spotlight indexing row's value while setup's automatic ask owes the scope
+/// ([`spotlight_scope::automatic_owed`]): Mac Setup asks for the password.
+pub const SPOTLIGHT_OWED: &str = "Needs your password";
+
+/// The Spotlight indexing row's value where a person took a folder setup kept out back into
+/// Spotlight: setup never adds it again.
+pub const SPOTLIGHT_KEPT_AS_SET: &str = "Kept as you set it";
+
+/// The Spotlight indexing row's value where `mdutil -s` reads the data volume's indexing off,
+/// whoever turned it off: setup leaves it as found.
+pub const SPOTLIGHT_OFF: &str = "Off";
+
+/// The Spotlight indexing row's value where the data volume's indexing is off because the
+/// person paused it from System Resources ▸ Spotlight ([`spotlight_scope::Mark::Paused`]): theirs
+/// until they resume it, and setup leaves it so.
+pub const SPOTLIGHT_PAUSED: &str = "Paused by you";
+
+/// The Spotlight indexing row's value and note where the data volume's indexing reads off
+/// (`disabled`, read now) and the person's pause `record` says they paused it: [`SPOTLIGHT_PAUSED`]
+/// and how they resume it. `None` where indexing reads on, or nothing of theirs turned it off
+/// (the row then reads [`SPOTLIGHT_OFF`], left as found).
+#[must_use]
+pub fn spotlight_paused(
+    record: Option<&spotlight_scope::PauseRecord>,
+    disabled: bool,
+) -> Option<(&'static str, String)> {
+    (disabled && record.is_some_and(|record| record.mark == spotlight_scope::Mark::Paused)).then(
+        || {
+            (
+                SPOTLIGHT_PAUSED,
+                "You paused Spotlight indexing in System Resources ▸ Spotlight; Resume indexing \
+                 there turns it back on. Setup leaves it so."
+                    .to_owned(),
+            )
+        },
+    )
+}
+
+/// The Spotlight indexing row's value where folders made since setup's password scoped the home
+/// are indexed: the scope is in place by setup's rules, since a folder made since asks for no
+/// password by itself (FL-127). A person's request keeps them out: System Resources' Apply, or
+/// their own `aterm init` that applies.
+#[must_use]
+pub fn spotlight_newcomers(n: usize) -> String {
+    if n == 1 {
+        "Scoped; 1 folder made since is indexed".to_owned()
+    } else {
+        format!("Scoped; {n} folders made since are indexed")
+    }
+}
+
+/// The Spotlight indexing row's value where an apply already failed to keep every remaining
+/// folder out ([`spotlight_scope::REFUSED`]): the scope is in place by setup's rules, which ask
+/// for no password again for them; setup's administrator step tries them again whenever it next
+/// runs for another of its steps.
+#[must_use]
+pub fn spotlight_refused(n: usize) -> String {
+    if n == 1 {
+        "Scoped; setup could not keep 1 folder out".to_owned()
+    } else {
+        format!("Scoped; setup could not keep {n} folders out")
+    }
+}
+
+pub mod baseline;
+pub mod debugger_record;
+pub mod fseventsd;
+pub mod power;
+pub mod readout;
 pub mod refused;
+pub mod root_only;
 pub mod spotlight_scope;
+pub mod updates;
 
 /// The environment variable System State's Mac Setup tab runs `aterm init --only
 /// base.clt` under, as the tab's own program (design §3.3). That run does nothing until the

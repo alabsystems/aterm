@@ -919,12 +919,24 @@ Outside any lab (no jail, no stub):
                                  run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
                                  `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (each run's
                                  record goes to $LAB_STATE/results/)
-  tables-page [--out DIR] [--lines N] [--columns N] [ATERM]
+  tables-page [--registry] [--out DIR | --startup-machines N [--select-account]] [--lines N] [--columns N] [ATERM]
                                  the Tables page on a private instance with a scratch registry: frames of
                                  its read, a conflict, staged edits (an agent's Write refused), a value
                                  its Mac reports otherwise, a Mac's facts, the reference tables and
                                  Check, in a window N lines tall (56 by default) and N columns wide
-                                 (200; under 110 the page stands in one column) (debug lab image)
+                                 (200; under 110 the page stands in one column) (debug lab image).
+                                 --registry opens a machine's assignments and signed facts in aRegistry,
+                                 follows it into an existing Tables tab and checks the selection on return.
+                                 It reports the fixture's machine count and time from opening aRegistry
+                                 until the inspector sees the machine row and its selected details.
+                                 With --registry, --out DIR also saves a frame of each app.
+                                 --startup-machines N seeds N synthetic machine rows and times opening
+                                 the tab to its first label, its selection and the Add button (no frames).
+                                 With --registry --startup-machines N, aRegistry opens first. The lane
+                                 times its selectable machine row, selection acknowledgement and observed
+                                 detail, and reports app CPU through that acknowledgement. It then times
+                                 Find through opening the last seeded machine's detail by name.
+                                 --select-account seeds one AI account and chooses its sheet in Tables.
   this-mac-page [--out DIR] [ATERM]
                                  Settings ▸ This Mac on a private instance: frames of its read and a typed
                                  nickname, act's refusal of Save with the scratch name unmoved, and this
@@ -1093,13 +1105,17 @@ Outside any lab (no jail, no stub):
                                  OPENS A WINDOW (with --window): verify predictive editing over a simulated RTT `link` in
                                  single and split panes (defaults: both shells, 100 ms, both modes, 2 rounds)
   codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--expect-rollout bound|partial]
+                   [--signed-original [--lose-settle-ack]]
                    [--policy-only|--terminals-only|--facts-only|--upgrade-only|--raw-upgrade-only|--restart-only|--window-only
                     |--capacity-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake
                                  model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --terminals-only:
                                  the background terminals leg alone, about 1 min; --facts-only: the facts leg alone
                                  (a stalled call's no-progress fact riding one continuation), about 7 min, not yet in
-                                 the default run; --upgrade-only: one live handoff;
+                                 the default run; --upgrade-only: one live handoff; add --signed-original with both
+                                 package paths to select two distinct installed signed builds in one private store
+                                 (use a debug or dev-seams aterm for the private registry);
+                                 --lose-settle-ack: signed handoff with an explicit private debug fault host;
                                  --raw-upgrade-only: started through the produced primary with its managed entry
                                  absent, automatic crash repair, then a live handoff; --restart-only: an explicit restart
                                  after recent person input, preserving its conversation and selected executable;

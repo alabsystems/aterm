@@ -610,6 +610,7 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
 struct ImageOptions {
     want_bytes: bool,
     want_metadata: bool,
+    presentation: bool,
     rest: String,
 }
 
@@ -620,9 +621,15 @@ fn parse_image_options(rest: &str) -> ImageOptions {
             .iter()
             .any(|token| *token == "--bytes" || *token == "bytes"),
         want_metadata: tokens.contains(&"--meta"),
+        presentation: tokens.contains(&"--presentation-lease"),
         rest: tokens
             .into_iter()
-            .filter(|token| *token != "--bytes" && *token != "bytes" && *token != "--meta")
+            .filter(|token| {
+                !matches!(
+                    *token,
+                    "--bytes" | "bytes" | "--meta" | "--presentation-lease"
+                )
+            })
             .collect::<Vec<_>>()
             .join(" "),
     }
@@ -679,6 +686,35 @@ fn recv_capture_reply<T>(
         },
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(format!("{context}: capture worker disconnected"))
+        }
+    }
+}
+
+#[cfg(any(
+    test,
+    target_os = "linux",
+    all(unix, feature = "bench-support", debug_assertions)
+))]
+fn recv_presentation_reply<T>(
+    rx: &std::sync::mpsc::Receiver<Result<crate::control::Retained<T>, String>>,
+    cancel: &mut CancelCaptureRequestOnDrop,
+    peer: &super::CtlStream,
+) -> Result<crate::control::Retained<T>, String> {
+    loop {
+        // The connected controller owns the capture. Its native progress guard bounds
+        // its wait; a disconnected controller never leaves presentation custody behind.
+        if super::subscription_peer_gone(peer) {
+            return Err("presentation capture controller disconnected".into());
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(result) => {
+                cancel.disarm();
+                return result;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("presentation capture worker disconnected".into());
+            }
         }
     }
 }
@@ -741,7 +777,14 @@ pub(crate) fn cmd_image(
     rest: &str,
     sock_dir: &std::path::Path,
     session: Option<u64>,
+    peer: &super::CtlStream,
 ) -> crate::control::ControlReply {
+    #[cfg(not(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    )))]
+    let _ = peer;
     let mut view = None;
     let mut tokens = Vec::new();
     for token in rest.split_whitespace() {
@@ -770,6 +813,37 @@ pub(crate) fn cmd_image(
             None if t == "plain" || t == "clean" => (true, ""),
             _ => (false, t),
         }
+    };
+    if options.presentation
+        && (want_bytes
+            || want_metadata
+            || clean
+            || session.is_some()
+            || view.is_some()
+            || super::serving_principal() != super::Principal::Instance
+            || crate::fabric::serving_driver().is_some())
+    {
+        return "ERR presentation capture requires a local instance and a whole-client file\n"
+            .into();
+    }
+    #[cfg(not(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    )))]
+    if options.presentation {
+        return "ERR presentation capture requires a Linux CPU presentation backend\n".into();
+    }
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    let (presentation, presentation_owner) = if options.presentation {
+        let (lease, owner) = crate::presentation_lease::Lease::new(proxy);
+        (Some(lease), Some(owner))
+    } else {
+        (None, None)
     };
     let budgets = crate::control::ArtifactBudgets::process();
     let permit = if want_bytes {
@@ -812,6 +886,13 @@ pub(crate) fn cmd_image(
             session,
             want_bytes,
             want_metadata,
+            whole_client: options.presentation,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation: presentation.clone(),
             frame_metadata: std::sync::Arc::clone(&frame_metadata),
             cancel,
             reply,
@@ -825,12 +906,33 @@ pub(crate) fn cmd_image(
         Ok(posted) => posted,
         Err(refusal) => return format!("ERR {refusal}\n").into(),
     };
-    match recv_capture_reply(
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    let result = if options.presentation {
+        recv_presentation_reply(&rx, &mut cancel_on_drop, peer)
+    } else {
+        recv_capture_reply(
+            &rx,
+            &mut cancel_on_drop,
+            std::time::Duration::from_secs(120),
+            "image",
+        )
+    };
+    #[cfg(not(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    )))]
+    let result = recv_capture_reply(
         &rx,
         &mut cancel_on_drop,
         std::time::Duration::from_secs(120),
         "image",
-    ) {
+    );
+    match result {
         Ok(retained) if matches!(retained.value, (0, 0, _)) => {
             "ERR image: nothing to capture; retry\n".into()
         }
@@ -838,6 +940,30 @@ pub(crate) fn cmd_image(
             let parts = retained.into_parts();
             let retention = parts.1;
             let (w, h, png) = parts.0;
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            if let Some(lease) = &presentation {
+                let receipt = match lease.receipt() {
+                    Ok(receipt) => receipt,
+                    Err(error) => return format!("ERR presentation capture: {error}\n").into(),
+                };
+                let Some(path) = path.as_deref() else {
+                    return "ERR presentation capture returned no file\n".into();
+                };
+                let body = format!(
+                    "OK presentation-image {} path={}\n",
+                    receipt.wire_fields(),
+                    super::pct_encode(path)
+                );
+                let reply = crate::control::ControlReply::with_handoff(body, retention);
+                return match presentation_owner {
+                    Some(owner) => reply.retaining_presentation(owner),
+                    None => reply,
+                };
+            }
             let body = match png {
                 Some(png) => {
                     match image_bytes_reply(w, h, &png, want_metadata, frame_metadata.get()) {
@@ -2229,7 +2355,7 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
             }
             crate::menu::MenuAction::ToggleStatsLens => "View \u{25b8} Stats Lens",
             crate::menu::MenuAction::ShowSystemResourcesHere => {
-                "View \u{25b8} Show System Resources Here"
+                "View \u{25b8} Expand System Resources Here"
             }
             crate::menu::MenuAction::RecordUnseenKeys => {
                 "View \u{25b8} Record Keys Not Echoed\u{2026}, then aterm's alert"

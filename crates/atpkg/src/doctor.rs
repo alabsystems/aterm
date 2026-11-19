@@ -1379,6 +1379,7 @@ fn said_by_default(row: &ItemReport) -> bool {
         || (row.id == c::TOOLSET && row.outcome != Outcome::Ok)
         || c::is(&row.id, c::DEV_LINK)
         || c::is(&row.id, c::PIN)
+        || c::is(&row.id, c::PIN_SET_ASIDE)
 }
 
 fn remedy_words(remedy: &Remedy) -> Option<String> {
@@ -3676,7 +3677,7 @@ fn toolset_findings_with(
 }
 
 fn pin_findings(layout: &Layout) -> Vec<Finding> {
-    match crate::pin::pinned_set(layout) {
+    let mut f = match crate::pin::pinned_set(layout) {
         Ok(pins) => pins
             .into_iter()
             .map(|program| {
@@ -3696,13 +3697,49 @@ fn pin_findings(layout: &Layout) -> Vec<Finding> {
                 c::PIN,
                 Class::Person,
                 "local package pins",
-                format!("local pins cannot be read: {error}; ordinary upgrades are held"),
+                format!(
+                    "local pins cannot be read: {error}; they hold no update, and unattended \
+                     work sets the file aside beside it as pins.unread-<n> when it next reads it"
+                ),
                 "readable local pins",
                 Remedy::None,
             )
             .essential(),
         ],
-    }
+    };
+    f.extend(set_aside_findings(layout));
+    f
+}
+
+/// A row for each pin-format file unattended work set aside ([`crate::pin::set_aside_files`]):
+/// which file, what it no longer holds, and how a pin is made again.
+fn set_aside_findings(layout: &Layout) -> Vec<Finding> {
+    crate::pin::set_aside_files(layout)
+        .into_iter()
+        .map(|(file, path)| {
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            let words = match file {
+                crate::pin::PinFile::Pins => format!(
+                    "{name}: local pins that did not read, set aside; they hold no update, and \
+                     `aterm pkg pin <program>` makes a pin again ({})",
+                    path.display()
+                ),
+                crate::pin::PinFile::Holds => format!(
+                    "{name}: harness holds that did not read, set aside; their pins read as your \
+                     own, and `aterm pkg unpin <program>` releases one ({})",
+                    path.display()
+                ),
+            };
+            Finding::ok(
+                c::of(c::PIN_SET_ASIDE, &name),
+                Class::Person,
+                format!("{name}, set aside"),
+                words,
+            )
+        })
+        .collect()
 }
 
 /// The toolset row ([`c::TOOLSET`]) as `aterm pkg doctor` reports it, read without the rest of

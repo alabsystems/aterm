@@ -2023,7 +2023,7 @@ pub(crate) struct KeeperConfig {
     pub(crate) enabled: Option<bool>,
 }
 
-/// The `[navigator]` table: `dock`, whether windows are born with the navigator docked beside
+/// The `[navigator]` table: `dock`, whether the main window is born with the navigator docked beside
 /// the terminal (`App::docks_at_birth`).
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[cfg_attr(test, derive(Debug))]
@@ -6588,6 +6588,13 @@ impl App {
     #[track_caller]
     pub(crate) fn on_resize(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
         let _site = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Window);
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.dock.retry_roster_on_resize)
+        {
+            self.local_panel_roster.request_layout();
+        }
         self.on_resize_inner(wid, size);
     }
 
@@ -7247,9 +7254,9 @@ impl App {
             let (cw, ch) = self.win_cell_size(wid);
             if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
                 let ws = &mut **route_guard_ws;
-                if let Some(w) = ws.os_window.as_ref() {
+                if let Some(w) = ws.os_window.clone() {
                     if size.width > 0 && size.height > 0 {
-                        ws.win_px = Some(size);
+                        ws.set_window_pixels(size);
                     }
                     w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
                 }
@@ -8046,6 +8053,9 @@ impl App {
         let audition_voice = self.typing_sound_to_audition_on_swap(&config);
         let claude_footer_changed = self.config.claude_footer != config.claude_footer;
         let ai_changed = self.config.ai != config.ai;
+        if self.config.navigator_dock() != config.navigator_dock() {
+            self.local_panel_roster.request_layout();
+        }
         self.config = config.clone();
         self.reconcile_consent_config();
         let _ = self.reconcile_consent_observer();
@@ -8376,14 +8386,14 @@ impl App {
         // Whether the reload moved the head of a window that carries the System Resources band
         // (`carries`) or of one that does not: each window's own form is the setting in that
         // window ([`crate::stats_deck::StatsBars::in_window`]), so a form or deck-size change
-        // moves the head only of the windows that carry the band.
+        // moves the head in each window whose expanded or compact reservation changed.
         let deck_moved = |carries: bool| {
             let (old, new) = (
                 old_stats_bars.in_window(carries),
                 new_stats_bars.in_window(carries),
             );
-            old.takes_room() != new.takes_room()
-                || (new.takes_room() && old_deck_size != new_deck_size)
+            old != new
+                || (new == crate::stats_deck::StatsBars::Deck && old_deck_size != new_deck_size)
         };
         crate::menu::set_stats_bars_form(new_stats_bars);
         crate::menu::set_deck_size_pref(new_deck_size);

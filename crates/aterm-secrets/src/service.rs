@@ -118,6 +118,28 @@ pub const DAEMON_STORE: &str = "/Library/Application Support/aterm/vault-server/
 /// Where launchd writes the system LaunchDaemon's stdout and stderr on macOS.
 pub const DAEMON_LOG: &str = "/Library/Logs/aterm/systems.alab.aterm-vault-server.log";
 
+/// The files `job`'s definitions name for its output, any of which its verb's process may have as
+/// its standard output and error: [`log_path`] (the plist [`write_plist`] writes for both; its
+/// systemd unit names the journal), and for the server [`DAEMON_LOG`] too (the root vault
+/// server's plist, which `aterm machines apply` writes naming it).
+#[must_use]
+pub fn job_logs(home: &Path, job: Job) -> Vec<PathBuf> {
+    let mut logs = vec![log_path(home, job)];
+    if job == Job::Server {
+        logs.push(PathBuf::from(DAEMON_LOG));
+    }
+    logs
+}
+
+/// Keep `job`'s log bounded where this process's standard output or error is one of its
+/// [`job_logs`] ([`aterm_uds::job_log::keep`]): the first thing `aterm secrets watch` and
+/// `aterm secrets serve` do, the root vault server's run of `serve` included, each handing what
+/// it kept to its serving ([`crate::client::watch`], the verb's `serve`), which takes nothing else
+/// in its place.
+pub fn keep_log(home: &Path, job: Job) -> aterm_uds::job_log::Kept {
+    aterm_uds::job_log::keep(&job_logs(home, job))
+}
+
 /// The arguments (after the `aterm` executable) of the system LaunchDaemon: `secrets serve`
 /// pinned to [`crate::ALAB_SIGNER`], advertising `advertise` (`_alab-vault._tcp` under the host's
 /// own label) or `--no-advertise` when `None` so an unlabelled daemon never contends for
@@ -923,18 +945,19 @@ pub fn print_pid(text: &str) -> Option<u32> {
     })
 }
 
-/// Whether a system LaunchDaemon is running, read without changing it. An unloaded job or a
-/// successful print without a PID is stopped; a failed or timed-out read is unknown. Off macOS
-/// no launchd job is read. This read belongs on a setup worker, never the window thread.
+/// What launchd holds of a system LaunchDaemon (`aterm_uds::launchd::JobState`), read without
+/// changing it: running where its print names a pid, idle where it names none, unloaded where
+/// launchd holds no such job; `None` for a failed or timed-out read, and off macOS, where no
+/// launchd job is read. This read belongs on a setup worker, never the window thread.
 #[must_use]
-pub fn system_job_running(label: &str) -> Option<bool> {
+pub fn system_job_state(label: &str) -> Option<aterm_uds::launchd::JobState> {
     #[cfg(target_os = "macos")]
     {
         let mut command = aterm_uds::spawnfd::command(LAUNCHCTL);
         command.args(system_launchctl_argv(SystemLaunchctl::Print(label)));
         let output =
             aterm_uds::deadline::output_within(&mut command, Duration::from_secs(5)).ok()?;
-        system_job_running_of(
+        system_job_state_of(
             output.status.code(),
             &String::from_utf8(output.stdout).ok()?,
         )
@@ -947,10 +970,12 @@ pub fn system_job_running(label: &str) -> Option<bool> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn system_job_running_of(code: Option<i32>, text: &str) -> Option<bool> {
+fn system_job_state_of(code: Option<i32>, text: &str) -> Option<aterm_uds::launchd::JobState> {
+    use aterm_uds::launchd::JobState;
     match code {
-        Some(0) => Some(print_pid(text).is_some()),
-        Some(113) => Some(false),
+        Some(0) if print_pid(text).is_some() => Some(JobState::Running),
+        Some(0) => Some(JobState::Idle),
+        Some(113) => Some(JobState::Unloaded),
         _ => None,
     }
 }

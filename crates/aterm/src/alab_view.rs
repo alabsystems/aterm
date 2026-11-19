@@ -16,8 +16,11 @@
 //! (`aterm_db::file::materialize`) moves the snapshots after the registry grows. With no
 //! snapshot here the source is absent only on an installation that never configured a Commons,
 //! and pending otherwise, so neither naming nor account discovery reads uncertainty as an
-//! absent registry binding; a file whose last pass says `off` (`[commons]` keeps the registry
-//! from this Mac) is no source either.
+//! absent registry binding: account source choice reads no legacy source while pending (a sync
+//! reads no source and goes on with the roster as it stands), and a first machine name made
+//! while pending is marked so the first read that finds the registry settles it as the row
+//! says; a file whose last pass says `off` (`[commons]` keeps the registry from this Mac) is no
+//! source either.
 //!
 //! A preference orders a pool and never limits it (`link_never_limits`): the harness's sync
 //! keeps every row this Mac holds whatever the lab says (`alab_roster::retain`), so an empty,
@@ -43,8 +46,7 @@
 //! erasing its history.
 //!
 //! The cached lab carries no `place` rows (`Lab::places` stays empty): no sync, pool or outlook
-//! reads them, so no process decodes the journal window for them; the exports read their own
-//! ([`placements`], from `alab_sheet`), once per run of the owner verb.
+//! reads them, so no process decodes the journal window for them.
 //!
 //! Traced by the accounts keeper: what this file reads of the file system itself, it reads
 //! through `aterm_uds::trace::fs` (census `traced-reads`).
@@ -66,9 +68,7 @@ use aterm_agent::{
 #[cfg(test)]
 use aterm_db::alab::Inventory;
 use aterm_db::alab::{
-    ProjectionRead, Registry, SourceRead,
-    journal::place::Places,
-    mail,
+    ProjectionRead, Registry, SourceRead, mail,
     registry::AddressIndex,
     secret::{self, Journal},
     view::{LabView, MachineNickname},
@@ -215,23 +215,6 @@ fn named_mailboxes(
         .iter()
         .filter_map(|(address, mailbox)| Some((address.clone(), logins.get(mailbox)?.clone())))
         .collect()
-}
-
-/// What the journal's live `places` say of `view`'s machines and accounts ([`Lab::places`]): each
-/// account to the machines, by label, that run it without preferring it. A row whose writer binds
-/// no live machine with a label names no Mac.
-pub(crate) fn placements(view: &LabView, places: &Places) -> Placements {
-    let mut by_account: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    for placed in view.placements(places) {
-        let Some(label) = view.machine_label(&placed.machine) else {
-            continue;
-        };
-        by_account
-            .entry(placed.account)
-            .or_default()
-            .push((label.to_owned(), placed.why.word().to_owned()));
-    }
-    Placements { by_account }
 }
 
 /// `view` as the harness reads it, each address the lab places in a mailbox `logins` names

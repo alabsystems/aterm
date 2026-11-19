@@ -311,6 +311,11 @@ pub(super) fn finish(home: &Path, record: &Path, receipt: &Receipt) -> Option<Re
     {
         return None;
     }
+    super::claim_indexed_build_folder(&receipt.root, &target, aterm_uds::backup::Backups::SYSTEM)
+        .ok()?;
+    if !named(&held_parent, root_name, &receipt.identity) {
+        return None;
+    }
     aterm_durable::primitive::fsync(&held_parent).ok()?;
     write(record, &published)?;
     step(Point::Committed)?;

@@ -1124,9 +1124,9 @@ pub fn is_mail_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
-/// A tab's sid: a session aterm minted ([`aterm_types::control_verbs::is_minted_sid`]).
+/// A local tab's sid, including the exact legacy ID a running shell still holds.
 fn sid(value: &str) -> Option<String> {
-    aterm_types::control_verbs::is_minted_sid(value).then(|| value.to_owned())
+    aterm_types::control_request::Sid::parse(value).map(|_| value.to_owned())
 }
 
 /// An actor token ([`is_token`]).
@@ -1134,16 +1134,17 @@ fn token(value: &str) -> Option<String> {
     is_token(value).then(|| value.to_owned())
 }
 
-/// Whether `value` is an actor token as every record of a request names one, whole: a session
-/// aterm minted (a tab ID: `t` and 10 Crockford base32 characters, or the `s-` and 20 hex digits a
-/// tab opened before that form keeps until it closes); a fleet drive's
-/// `fleet:<head>:<sid|->`, its head 1 to 8 bytes of an id; or one of `human`, `ctl`,
-/// `harness`, `bridge` and `-`. Holding each to its whole shape is what refuses a row cut inside
-/// it.
+/// Whether `value` is a whole actor token kept in the request journal: a tab ID (`t` and 10
+/// Crockford base32 characters, or the exact legacy `s-` and 20 hex digits); a fleet drive's
+/// `fleet:<head>:<sid|->`, including either ID form an earlier build recorded, with its head
+/// 1 to 8 bytes of an id; or one of `human`, `ctl`, `harness`, `bridge` and `-`. Holding each
+/// to its whole shape refuses a row cut inside it. Live fleet requester and actor constructors
+/// validate their current IDs independently of this stored journal grammar.
 #[must_use]
 pub fn is_token(value: &str) -> bool {
-    use aterm_types::control_verbs::is_minted_sid;
-    if is_minted_sid(value) || matches!(value, "human" | "ctl" | "harness" | "bridge" | "-") {
+    use aterm_types::control_request::Sid;
+    if Sid::parse(value).is_some() || matches!(value, "human" | "ctl" | "harness" | "bridge" | "-")
+    {
         return true;
     }
     let Some((head, sid)) = value
@@ -1156,7 +1157,7 @@ pub fn is_token(value: &str) -> bool {
         && head
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@' | b'-'))
-        && (sid == "-" || is_minted_sid(sid))
+        && (sid == "-" || Sid::parse(sid).is_some())
         && value.len() <= TOKEN_MAX
 }
 

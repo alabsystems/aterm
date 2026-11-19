@@ -263,8 +263,7 @@ fn stale_shared_dispatch_preserves_a_newer_request_and_unreadable_state() {
 }
 
 /// Settled upkeep passes on `bed`: whether a sign-in started, and how many runs were handed
-/// a browser. Off Unix aterm links no opener for a run's page (`cli::opener_link`), so a run
-/// that starts is handed none ([`RUNS_HANDED`]).
+/// a browser.
 fn progress(bed: &Bed) -> (bool, usize) {
     let store = &bed.store;
     // The other account is one a session here runs on that lost its login, the door an
@@ -281,14 +280,18 @@ fn progress(bed: &Bed) -> (bool, usize) {
             Ok(events)
         })
         .unwrap();
-    let opener = bed.home.join(".local/bin/aterm-open-url");
+    let opener = bed
+        .home
+        .join(".local/bin")
+        .join(super::super::cli::opener_file_name());
     fs::create_dir_all(opener.parent().unwrap()).unwrap();
-    #[cfg(unix)]
     if !opener.try_exists().unwrap() {
+        #[cfg(unix)]
         std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &opener).unwrap();
+        // A second name of this image, as aterm publishes its own opener there.
+        #[cfg(windows)]
+        fs::hard_link(std::env::current_exe().unwrap(), &opener).unwrap();
     }
-    #[cfg(not(unix))]
-    fs::write(opener, b"inert opener").unwrap();
     fs::create_dir_all(super::super::headless_oauth::browser_profile_dir(
         &store.dir,
         Some("other"),
@@ -350,27 +353,14 @@ fn progress(bed: &Bed) -> (bool, usize) {
     (first || second, runs)
 }
 
-/// The runs a started sign-in is handed a browser for: one on Unix, none elsewhere, where aterm
-/// links no opener for its page (`cli::opener_link`; the sign-in ladder's
-/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`).
-#[cfg(unix)]
-const RUNS_HANDED: usize = 1;
-/// The runs a started sign-in is handed a browser for: one on Unix, none elsewhere, where aterm
-/// links no opener for its page (`cli::opener_link`; the sign-in ladder's
-/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`).
-#[cfg(not(unix))]
-const RUNS_HANDED: usize = 0;
-
-/// Upkeep resumes the saved selection before any other sign-in. On Unix its worker retires
-/// it for its shared custody; elsewhere the manual sign-in queue's refusal retires it first,
-/// since that platform can never run it. Either way the selection is gone and the woken
-/// upkeep is free for the other account.
+/// Upkeep resumes the saved selection before any other sign-in, and its worker retires it for
+/// its shared custody: the selection is gone and the woken upkeep is free for the other account.
 #[test]
 fn retiring_a_shared_selection_wakes_a_settled_upkeep_for_another_account() {
     let bed = Bed::new();
     bed.shared(accounts::shared::Outcome::Unknown);
     let before = bed.store.load_logins(NOW).unwrap().0.shared;
-    assert_eq!(progress(&bed), (true, RUNS_HANDED));
+    assert_eq!(progress(&bed), (true, 1));
     assert!(bed.store.load(NOW).unwrap().0.pending_pin.is_none());
     assert_eq!(bed.store.load_logins(NOW).unwrap().0.shared, before);
 }
@@ -400,7 +390,7 @@ fn a_selection_whose_worker_could_not_start_waits_for_a_later_upkeep() {
         Some(bed.request.clone().into()),
         "a worker that could not start keeps its selection"
     );
-    assert_eq!(progress(&bed), (true, RUNS_HANDED));
+    assert_eq!(progress(&bed), (true, 1));
     assert!(bed.store.load(NOW).unwrap().0.pending_pin.is_none());
     assert_eq!(bed.store.load_logins(NOW).unwrap().0.shared, before);
 }
@@ -460,7 +450,7 @@ pub(super) fn selection_transition(
         "Progress" => {
             let (progressed, calls) = progress(&bed);
             next.insert("phase", 4);
-            next.insert("progressed", i64::from(progressed && calls == RUNS_HANDED));
+            next.insert("progressed", i64::from(progressed && calls == 1));
         }
         _ => unreachable!(),
     }

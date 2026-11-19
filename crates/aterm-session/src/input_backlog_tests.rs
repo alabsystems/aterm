@@ -3,6 +3,35 @@
 
 use super::*;
 
+#[test]
+fn terminal_byte_history_counts_kernel_acceptance_and_quiet_full_intervals() {
+    let start = crate::terminal_stream::epoch();
+    let at = |ms| start + Duration::from_millis(ms);
+    let mut ledger = InputLedger::new(at(2_000));
+    ledger.begin(999);
+    ledger.end(999, at(4_999));
+    ledger.begin(10);
+    ledger.end(5, at(5_000));
+    ledger.begin(5);
+    ledger.end(0, at(5_001));
+    ledger.begin(5);
+    ledger.end(5, at(14_999));
+    ledger.begin(7);
+    ledger.end(7, at(15_000));
+    // Even though the backlog ledger coalesces writes two milliseconds apart, their actual
+    // completion times land on opposite sides of this panel boundary.
+    assert_eq!(
+        &ledger.byte_rates(at(25_000), at(25_000))[7..],
+        &[None, Some(1.0), Some(1.0), Some(1.4), Some(0.0)]
+    );
+    assert_eq!(
+        &ledger.byte_rates(at(25_000), at(18_000))[7..],
+        &[None, Some(1.0), Some(1.0), None, None]
+    );
+    let replacement = InputLedger::new(at(23_000));
+    assert_eq!(replacement.byte_rates(at(25_000), at(25_000)), [None; 12]);
+}
+
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }

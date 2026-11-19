@@ -21,6 +21,12 @@ pub const LISTEN_HANG: Duration = Duration::from_secs(60);
 /// never a latency budget.
 const READ_HANG: Duration = Duration::from_secs(60);
 
+/// What the lab's broker writes its output to, beside its socket. Never `broker.out` or
+/// `broker.err`: those are the files a broker job's definition names in its socket's folder, and
+/// a broker whose output is one of them keeps it bounded as that job's log
+/// (`aterm_link::enable::keep_broker_log`), cutting what the lab reads back.
+pub(crate) const BROKER_SAID: &str = "lab-broker.out";
+
 /// A mint: `aterm link mint <grant> --secret-file <secret>`'s argv in, its standard output (one
 /// `<grant> <tag-hex>` line) out, or why it failed ([`lay`]).
 pub type Mint<'a> = dyn FnMut(&[String]) -> Result<Vec<u8>, String> + 'a;
@@ -344,9 +350,10 @@ impl Fabric {
                 Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
             }
         })?;
-        let said = dir.join("broker.out");
-        let log = crate::util::create_stdio_file(&said).map_err(|e| format!("broker.out: {e}"))?;
-        let err = log.try_clone().map_err(|e| format!("broker.out: {e}"))?;
+        let said = dir.join(BROKER_SAID);
+        let log =
+            crate::util::create_stdio_file(&said).map_err(|e| format!("{BROKER_SAID}: {e}"))?;
+        let err = log.try_clone().map_err(|e| format!("{BROKER_SAID}: {e}"))?;
         let argv = laid.broker_argv();
         let mut broker = aterm_uds::spawnfd::command(&argv[0]);
         broker

@@ -1213,6 +1213,17 @@ pub trait System: Sync {
     /// Remove a file or empty directory at `path` (succeeding if already absent).
     fn remove(&self, path: &Path) -> io::Result<()>;
 
+    /// Hold the lock every change of the root step record at `record` is made under
+    /// (`aterm_types::macos_setup::refused::hold`), the one the LAN broker takes to take out its
+    /// own install's lines; let go when the hold drops. The record's folder must exist.
+    ///
+    /// # Errors
+    /// `aterm_types::macos_setup::refused::hold`'s.
+    fn hold_record(&self, record: &Path) -> io::Result<aterm_types::clt_mark::Held> {
+        let _ = record;
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Remove only an empty directory, or succeed if absent. An appearing file or
     /// symbolic link is never unlinked to make room for a publication.
     fn remove_empty_dir(&self, _path: &Path) -> io::Result<()> {
@@ -1488,6 +1499,13 @@ pub trait System: Sync {
         None
     }
 
+    /// Whether this machine runs as a virtual machine's guest (`aterm_sysprobe::vm_guest`):
+    /// `None` where unread, which counts as a real Mac. A development build owns the LAN broker
+    /// only in a guest (`aterm_uds::lan::install::read`).
+    fn vm_guest(&self) -> Option<bool> {
+        None
+    }
+
     /// Whether the file now at `path` is another file than the executable image this process
     /// runs (an update replaced the app at the same path while this process ran, as it does a
     /// Mac Setup tab's program carried across an update): `Some(true)` only on the kernel's
@@ -1498,7 +1516,10 @@ pub trait System: Sync {
     }
 
     /// The installed root LAN broker's checked protocol hello, with no direct
-    /// fallback. This is an effect-boundary read, not the GUI's metadata probe.
+    /// fallback. This is an effect-boundary read, not the GUI's metadata probe. A broker of
+    /// another protocol answers with the hello it sent, its own protocol in it
+    /// (`aterm_uds::lan::broker::any_protocol`): it serves this build nothing, and its build
+    /// still says whether it adopted this one.
     ///
     /// # Errors
     /// The strict exchange failed, or this platform supplies no broker reader.
@@ -1571,6 +1592,14 @@ pub trait System: Sync {
     /// Open the converge journal for the account this system acts as.
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
         Err("this system keeps no converge journal".into())
+    }
+
+    /// The aterm state folder of the account this system acts as
+    /// ([`aterm_types::dirs::account_state_dir`]), where its own small records live (the LAN
+    /// broker's adoption expectation, `aterm_uds::lan::adoption::RECORD`): `None` where it has
+    /// none, as this default, a test double's that keeps none, has.
+    fn account_state_dir(&self) -> Option<PathBuf> {
+        None
     }
 
     /// Own this account's existing alignment lease and repository scheduling record.
@@ -3029,6 +3058,10 @@ impl System for Live {
         }
     }
 
+    fn hold_record(&self, record: &Path) -> io::Result<aterm_types::clt_mark::Held> {
+        aterm_types::macos_setup::refused::hold(record).map(aterm_types::clt_mark::Held::new)
+    }
+
     fn remove_empty_dir(&self, path: &Path) -> io::Result<()> {
         remove_empty_dir::remove(path)
     }
@@ -3440,6 +3473,10 @@ impl System for Live {
         Some(MachineReading::now(home))
     }
 
+    fn vm_guest(&self) -> Option<bool> {
+        aterm_sysprobe::vm_guest()
+    }
+
     fn running_app(&self) -> Option<PathBuf> {
         let exe = self.canonicalize(&self.agent_exe).ok()?;
         exe.ancestors()
@@ -3454,7 +3491,8 @@ impl System for Live {
 
     fn installed_lan_broker(&self) -> Result<aterm_uds::lan::BrokerHello, String> {
         #[cfg(target_os = "macos")]
-        return aterm_uds::lan::broker::installed_hello().map_err(|error| error.to_string());
+        return aterm_uds::lan::broker::any_protocol(aterm_uds::lan::broker::installed_hello())
+            .map_err(|error| error.to_string());
         #[cfg(not(target_os = "macos"))]
         Err("only macOS installs a root LAN broker".into())
     }
@@ -3515,6 +3553,10 @@ impl System for Live {
             .run(&Cmd::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]))
             .ok()?;
         crate::hardware::ioreg_value(&ran.out(), "IOPlatformUUID")
+    }
+
+    fn account_state_dir(&self) -> Option<PathBuf> {
+        aterm_types::dirs::account_state_dir()
     }
 
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
@@ -3751,6 +3793,9 @@ mod fake {
         repository_record: Arc<crate::sync::repository_refresh::Memory>,
         /// An owned on-disk record where a fixture exercises persistence across fresh passes.
         pub repository_record_file: Option<PathBuf>,
+        /// What [`System::account_state_dir`] answers: none by default, so nothing keeps the LAN
+        /// broker's adoption expectation; a folder in this world's files where a test does.
+        pub account_state: Option<PathBuf>,
 
         exclusive_paths: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
         exclusive_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
@@ -3790,6 +3835,9 @@ mod fake {
         /// held the update boundary ([`Fake::guarded_renames`]).
         guarded_renames: Mutex<Vec<PathBuf>>,
         files: Mutex<BTreeMap<PathBuf, (Vec<u8>, u32)>>,
+        /// What a record holds once [`System::hold_record`] has its lock, where another writer's
+        /// change finished just before it ([`Fake::changed_before_hold`]).
+        changed_before_hold: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
         /// The entries each home's secret store holds ([`Fake::vault_set`]), read in place by
         /// [`System::vault_entry`]: a stand-in for the verified store, never a file.
         vault: Mutex<BTreeMap<(PathBuf, String), Vec<u8>>>,
@@ -3850,6 +3898,9 @@ mod fake {
         /// What [`System::image_replaced`] answers for every path: `None`, unread, unless a test
         /// has an update replace this process's image.
         pub image_replaced: Option<bool>,
+        /// What [`System::vm_guest`] answers: `None`, unread (a real Mac), unless a test runs in
+        /// a guest.
+        pub vm_guest: Option<bool>,
         /// What [`System::volume`] answers for every path: `None`, unread, unless a test sets
         /// it.
         pub volume: Option<aterm_capacity::reading::Volume>,
@@ -4556,6 +4607,13 @@ mod fake {
             self
         }
 
+        /// Script every later strict installed-broker exchange to answer `hello`, in place of
+        /// what was scripted before.
+        pub fn lan_broker_now(&self, hello: Result<aterm_uds::lan::BrokerHello, String>) -> &Self {
+            *self.broker_hellos.lock().unwrap() = vec![hello];
+            self
+        }
+
         /// Exact HID service changes requested through [`System::set_keyboard_maps`].
         pub fn keyboard_changes(&self) -> Vec<super::KeyboardMapChange> {
             self.keyboard_changes.lock().unwrap().clone()
@@ -4651,6 +4709,16 @@ mod fake {
                 .entry(format!("github {method} {endpoint}"))
                 .or_default()
                 .push(reply.map_err(GithubError::other));
+            self
+        }
+
+        /// Make the record at `record` hold `bytes` as a [`System::hold_record`] of it takes its
+        /// lock: the LAN broker's change, made under the same lock, finishing just before.
+        pub fn changed_before_hold(&self, record: &str, bytes: &[u8]) -> &Self {
+            self.changed_before_hold
+                .lock()
+                .unwrap()
+                .insert(PathBuf::from(record), bytes.to_vec());
             self
         }
 
@@ -5360,6 +5428,10 @@ mod fake {
             self.running_app.clone()
         }
 
+        fn vm_guest(&self) -> Option<bool> {
+            self.vm_guest
+        }
+
         fn image_replaced(&self, _path: &Path) -> Option<bool> {
             self.image_replaced
         }
@@ -5775,6 +5847,32 @@ mod fake {
             Ok(())
         }
 
+        /// A hold its calls record: `hold <lock>` as it is taken and `release <lock>` as it
+        /// drops (`aterm_types::macos_setup::refused::lock_of`); the record holds what
+        /// [`Fake::changed_before_hold`] made it once the hold is taken.
+        fn hold_record(&self, record: &Path) -> io::Result<aterm_types::clt_mark::Held> {
+            struct Release(Arc<Mutex<Vec<String>>>, String);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    self.0.lock().unwrap().push(format!("release {}", self.1));
+                }
+            }
+            let lock = aterm_types::macos_setup::refused::lock_of(record)
+                .display()
+                .to_string();
+            self.calls.lock().unwrap().push(format!("hold {lock}"));
+            if let Some(bytes) = self.changed_before_hold.lock().unwrap().remove(record) {
+                self.files
+                    .lock()
+                    .unwrap()
+                    .insert(record.to_path_buf(), (bytes, 0o644));
+            }
+            Ok(aterm_types::clt_mark::Held::new(Release(
+                Arc::clone(&self.calls),
+                lock,
+            )))
+        }
+
         fn remove_empty_dir(&self, path: &Path) -> io::Result<()> {
             self.calls
                 .lock()
@@ -6041,6 +6139,10 @@ mod fake {
 
         fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
             Ok(Box::new(Journaled(self)))
+        }
+
+        fn account_state_dir(&self) -> Option<PathBuf> {
+            self.account_state.clone()
         }
 
         fn repository_pass(&self) -> Result<crate::sync::repository_refresh::Access, String> {

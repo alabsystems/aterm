@@ -3,8 +3,10 @@
 
 //! Tests for `aterm harness`.
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+// The tests gated `cfg(unix)` here reach what aterm has only on Unix: a file mode, a symbolic
+// link, a signal, a `/bin/sh` stand-in, or a part built only there (native credential custody,
+// native fleet renewal, the vault-token, Google and agy sign-ins, the Kimi pool's overlay
+// staging home, aterm's own browser window, the test sleep seam).
 
 use aterm_phase::Program;
 use aterm_phase::prompt::fixtures::{composer, rows};
@@ -25,11 +27,11 @@ mod native_preparation;
 #[path = "cli_label_retention_tests.rs"]
 mod label_retention;
 
-// Each of these starts a manual sign-in, whose private FIFO only Unix has
-// (`accounts::manual_signin_capability`).
-#[cfg(unix)]
 #[path = "cli_asked_tests.rs"]
 mod asked;
+
+#[path = "cli_launch_words_tests.rs"]
+mod launch_words;
 
 #[path = "cli_report_read_tests.rs"]
 mod report_read;
@@ -70,22 +72,21 @@ mod upgrade_policy;
 #[path = "cli_renewal_read_tests.rs"]
 mod renewal_read;
 
-// A manual sign-in, which only Unix queues (`accounts::manual_signin_capability`).
-#[cfg(unix)]
 #[path = "cli_renewal_identity_tests.rs"]
 mod renewal_identity;
 
 #[path = "cli_default_identity_tests.rs"]
 mod default_identity;
 
-// A manual sign-in, which only Unix queues (`accounts::manual_signin_capability`).
-#[cfg(unix)]
 #[path = "cli_signin_epoch_tests.rs"]
 mod signin_epoch;
 
 #[cfg(unix)]
 #[path = "cli_pool_kimi_tests.rs"]
 mod kimi_native_profiles;
+
+#[path = "cli_pending_lab_tests.rs"]
+mod pending_lab;
 
 use crate::harness::accounts_overlay::{self, links_here};
 
@@ -566,7 +567,6 @@ fn pending_import_names_the_account_of_the_region_imported() {
 /// reserved slug and with its address: every row it lists is renewable. CONTROL: with no account
 /// and no address there is no account to list, and nothing is written (decision 5: no new row has
 /// no address).
-#[cfg(unix)]
 #[test]
 fn kimi_adopts_its_existing_default_login_as_the_account_named() {
     let tmp = tmp_dir("kimi-adopt-default");
@@ -3525,7 +3525,6 @@ fn idle_now() -> i64 {
 }
 
 /// The real remover the window's tick runs, at `now`, on any device.
-#[cfg(unix)]
 fn real_remover(now: i64) -> impl FnMut(&disk::Row) -> io::Result<disk::Removed> {
     disk::remover(
         disk::Judge {
@@ -3545,6 +3544,7 @@ fn real_remover(now: i64) -> impl FnMut(&disk::Row) -> io::Result<disk::Removed>
 /// report, the intent row
 /// (before the removal) and the outcome row (witness, bytes released, unit)
 /// land in the disk ledger in that order.
+// Unix only, as its fixture is: Unix path text matched in the ledger, `/dev` (ATERM-KI-1117-29417).
 #[cfg(unix)]
 #[test]
 fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
@@ -3874,6 +3874,7 @@ fn the_default_window_reclaims_a_profile_idle_two_days_and_keeps_one_built_today
 /// The intent row is journalled before a removal starts, so a remover that
 /// dies mid-pass leaves the report and the intent on record, naming the build
 /// directory.
+// Unix only, as its fixture is: Unix path text matched in the ledger, `/dev` (ATERM-KI-1117-29417).
 #[cfg(unix)]
 #[test]
 fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
@@ -4022,6 +4023,7 @@ fn the_disk_tick_removes_with_cloud_placeholders_exposed() {
 
 /// The tick frees only the volume it measured: a build directory on another
 /// volume is not looked at when home runs short.
+// Unix only, as its fixture is: Unix path text matched in the ledger, `/dev` (ATERM-KI-1117-29417).
 #[cfg(unix)]
 #[test]
 fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
@@ -4120,7 +4122,6 @@ fn the_verb_applies_cargo_targets_with_the_same_unit() {
 
 /// Nothing is removed without its intent on record: with the state directory unmakeable (a file
 /// sits where it goes), the tick removes nothing and each row is an `unjournalled` denial.
-#[cfg(unix)]
 #[test]
 fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
     let tmp = tmp_dir("disk-unjournalled");
@@ -6893,7 +6894,6 @@ fn acc_quiet(form: AccountsCmd, env: &Env) -> (String, String, String) {
     acc(form, env, &FakeHost::new(&never_asked))
 }
 
-#[cfg(unix)]
 fn on_record(env: &Env, seen: &[(&str, Auth)]) {
     let mut note = None;
     env.accounts_store()
@@ -6907,13 +6907,11 @@ fn on_record(env: &Env, seen: &[(&str, Auth)]) {
 }
 
 /// `accounts add` of the Claude account at `email`, named by its provider word and address.
-#[cfg(unix)]
 fn add(email: &str, class: Class) -> AccountsCmd {
     add_word(&format!("claude {email}"), class)
 }
 
 /// `accounts add <word>`, the word as a person types it.
-#[cfg(unix)]
 fn add_word(word: &str, class: Class) -> AccountsCmd {
     AccountsCmd::Add {
         account: word.to_string(),
@@ -6924,7 +6922,6 @@ fn add_word(word: &str, class: Class) -> AccountsCmd {
 }
 
 /// The label `accounts add` gives the Claude account at `email`: its reserved slug.
-#[cfg(unix)]
 fn added(email: &str) -> String {
     crate::harness::account_names::tests::added_label(Cli::Claude, email)
 }
@@ -7080,7 +7077,6 @@ fn where_no_account_can_take_over_the_report_names_another() {
     assert!(!names_add(&out), "{out}");
 }
 
-#[cfg(unix)]
 #[test]
 fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
     let tmp = tmp_dir("accounts-refused");
@@ -7223,7 +7219,6 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     assert_eq!(read.row(&pool).map(|r| r.class), Some(Class::Pool));
 }
 
-#[cfg(unix)]
 #[test]
 fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     let tmp = tmp_dir("accounts-empty-dir");
@@ -7316,7 +7311,6 @@ fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     assert_eq!(*tty.asked.borrow(), vec![staging]);
 }
 
-#[cfg(unix)]
 #[test]
 fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
     let tmp = tmp_dir("accounts-add-existing");
@@ -7347,7 +7341,6 @@ fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
 /// says its provider) names no account and is refused so; another pool's provider word and address
 /// says which `--cli` takes it; an account already listed is named with its sign-in step; and
 /// nothing is written. CONTROL: the provider word and address of an account no row holds lists it.
-#[cfg(unix)]
 #[test]
 fn add_refuses_a_word_naming_no_account_or_a_listed_account_and_writes_nothing() {
     let tmp = tmp_dir("accounts-add-refused");
@@ -7429,7 +7422,6 @@ fn add_refuses_a_word_naming_no_account_or_a_listed_account_and_writes_nothing()
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn login_runs_only_at_a_terminal_and_fails_elsewhere() {
     let tmp = tmp_dir("accounts-login");
@@ -7487,7 +7479,6 @@ fn login_runs_only_at_a_terminal_and_fails_elsewhere() {
 /// WITH CLAUDE CODE ABSENT THE REPORT AND ITS LOGIN SAY THE INSTALL, AS EVERY OTHER POOL'S DO: the
 /// sign-in starts nothing, the install is named, and no row is next. CONTROL: with its program here
 /// the same login runs.
-#[cfg(unix)]
 #[test]
 fn a_claude_login_with_claude_absent_names_its_install() {
     let tmp = tmp_dir("accounts-login-absent");
@@ -7510,7 +7501,7 @@ fn a_claude_login_with_claude_absent_names_its_install() {
 
     let mut absent = FakeHost::new(&never_asked);
     absent.tty = true;
-    absent.sign_in_program = Some(PathBuf::from("/nowhere/claude"));
+    absent.sign_in_program = Some(tmp.path().join("nowhere").join("claude"));
     let (code, _, err) = acc(login(), &env, &absent);
     assert_eq!(code, exit(1));
     assert!(err.contains(&install), "{err}");
@@ -7529,7 +7520,6 @@ fn a_claude_login_with_claude_absent_names_its_install() {
     assert_eq!(here.logins.borrow().len(), 1, "CONTROL: it ran: {err}");
 }
 
-#[cfg(unix)]
 #[test]
 fn a_failed_flow_preserves_current_accounts_and_unbound_staging_files() {
     let tmp = tmp_dir("accounts-login-failed");
@@ -7689,7 +7679,6 @@ fn a_roster_write_wakes_a_waiting_host_and_a_refused_one_wakes_nobody() {
     assert_eq!(wake_id(&store), woken, "and that refusal wakes nobody");
 }
 
-#[cfg(unix)]
 #[test]
 fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     let tmp = tmp_dir("accounts-login-records");
@@ -7752,7 +7741,6 @@ fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     assert_ne!(wake_id(&store), woken, "a login that works wakes");
 }
 
-#[cfg(unix)]
 #[test]
 fn a_flow_that_ends_signed_out_preserves_the_prior_login_and_exits_1() {
     let tmp = tmp_dir("accounts-login-signed-out");
@@ -7794,7 +7782,6 @@ fn a_flow_that_ends_signed_out_preserves_the_prior_login_and_exits_1() {
     assert_eq!(state.account("work-2").auth_at, Some(env.now));
 }
 
-#[cfg(unix)]
 #[test]
 fn a_login_nobody_could_ask_afterwards_is_not_started() {
     let tmp = tmp_dir("accounts-login-unaskable");
@@ -7836,7 +7823,6 @@ fn a_login_nobody_could_ask_afterwards_is_not_started() {
 /// GIVEN, with the login variable removed; for this machine's own login the
 /// home's variable is removed too — whatever this process's own environment
 /// holds.
-#[cfg(unix)]
 #[test]
 fn the_login_flow_runs_under_the_home_it_is_given() {
     let tmp = tmp_dir("login-command");
@@ -8077,7 +8063,6 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
     assert_eq!(state.account("work-2").auth, Auth::Ok);
 }
 
-#[cfg(unix)]
 #[test]
 fn login_keeps_no_byte_of_the_vendors_output() {
     let tmp = tmp_dir("accounts-secrecy");
@@ -8258,7 +8243,6 @@ fn use_records_the_owners_pin_and_claims_no_move() {
 /// the refusal, never as `` `<label>` is ``; the sign-in step the refusal ends in types the
 /// account's word (`accounts renew <account>`). A refusal changes
 /// nothing, and once the row is signed in the pin is made.
-#[cfg(unix)]
 #[test]
 fn use_refuses_a_label_and_an_unenrolled_or_signed_out_account_naming_it() {
     let tmp = tmp_dir("accounts-use-refused");
@@ -8331,7 +8315,6 @@ fn use_refuses_a_label_and_an_unenrolled_or_signed_out_account_naming_it() {
 /// the records and the ledger stay as they were. CONTROL: the row with its own key is pinned.
 /// NEGATIVE CONTROL: with the lock's check taking any row of that label, the pin exits 0, not 1
 /// (2026-11-16, by hand, then restored).
-#[cfg(unix)]
 #[test]
 fn use_refuses_a_row_that_holds_another_account_by_the_lock() {
     let tmp = tmp_dir("accounts-use-moved");
@@ -8652,7 +8635,6 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
 /// event names one row twice and moved nothing; a rotation struck is an attempt and no move, which
 /// is how a move onto a row with no login reads; a row proved with no rotation, or that a person's
 /// `use` chose, moved nothing. A ledger it cannot read says nothing, which is not "never".
-#[cfg(unix)]
 #[test]
 fn a_survey_reads_a_pools_rotations_off_its_ledger() {
     use accounts::{Event, Kind};
@@ -10614,6 +10596,53 @@ fn the_check_after_a_sign_in_needs_user_or_logname() {
         ]),
         Ok(vec!["USER", "LOGNAME", "ATERM_CHILD"])
     );
+    // Windows names the account USERNAME, and Unix's two are not set there: that one name is
+    // enough, and it is handed through. On Unix it names nobody.
+    #[cfg(windows)]
+    {
+        assert_eq!(AUTH_CHECK_NO_USER, "USERNAME is not set");
+        assert_eq!(names(&[("USERNAME", "u")]), Ok(vec!["USERNAME"]));
+        assert_eq!(names(&[("USERNAME", "")]), refused);
+        assert_eq!(
+            names(&[("USERNAME", "u"), ("USER", "u"), ("ATERM_CHILD", "1")]),
+            Ok(vec!["USER", "USERNAME", "ATERM_CHILD"])
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(AUTH_CHECK_NO_USER, "USER is not set");
+        assert_eq!(names(&[("USERNAME", "u")]), refused);
+    }
+}
+
+/// A WINDOWS LOGON'S OWN ENVIRONMENT CAN ASK A LOGIN WHETHER IT IS SIGNED IN: aterm started from
+/// Explorer, cmd.exe or PowerShell has USERNAME and neither USER nor LOGNAME, and the live host
+/// ([`LiveAccounts`], which reads this process's environment) answers that a check can run there,
+/// so a sign-in, a renewal by hand and the ladder's unattended renewal are not refused before
+/// their provider starts. NEGATIVE CONTROL (run as a temporary mutant, reverted): with Unix's two
+/// names alone on Windows, the live host answers that no name is set ([`AUTH_CHECK_NO_USER`]).
+#[cfg(windows)]
+#[test]
+fn a_windows_logon_names_its_account_for_the_check_after_a_sign_in() {
+    assert!(
+        std::env::var_os("USERNAME").is_some_and(|name| !name.is_empty()),
+        "PRECONDITION: a Windows logon session names its account in USERNAME"
+    );
+    // This process's environment as a logon gives it, with neither of Unix's two names.
+    let logon = |name: &str| {
+        if matches!(name, "USER" | "LOGNAME") {
+            None
+        } else {
+            std::env::var_os(name)
+        }
+    };
+    let pass = auth_check_env(&logon).expect("a logon's own environment names its account");
+    let names: Vec<&str> = pass.iter().map(|(name, _)| *name).collect();
+    assert!(
+        names.contains(&"USERNAME") && !names.contains(&"USER") && !names.contains(&"LOGNAME"),
+        "USERNAME is handed through: {names:?}"
+    );
+    assert_eq!(LiveAccounts::default().unaskable(), None);
 }
 
 #[test]
@@ -10792,7 +10821,6 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     assert!(!env.accounts_store().logins_dir().exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     let tmp = tmp_dir("accounts-add-inline");
@@ -10861,7 +10889,6 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
     let tmp = tmp_dir("accounts-login-clock");
@@ -15071,7 +15098,6 @@ fn harness_agy_login_fails_closed_without_reading_home_quota() {
 /// sign-in lock, which it holds through the flow, and records its start on the Mac's spacing
 /// clock under the account it names. Cancellation at its actual queue observation
 /// starts nothing; after a queued turn the start uses the refreshed policy clock.
-#[cfg(unix)]
 #[test]
 fn a_persons_named_sign_in_starts_under_the_machines_lock() {
     use crate::harness::sign_in_ladder::{Started, last_started};
@@ -15424,16 +15450,12 @@ mod signin;
 #[path = "cli_identity_tests.rs"]
 mod identity;
 
-// A manual sign-in, which only Unix queues (`accounts::manual_signin_capability`).
-#[cfg(unix)]
 #[path = "cli_plain_login_commit_tests.rs"]
 mod plain_login_commit;
 
 #[path = "cli_adopt_identity_tests.rs"]
 mod adopt_identity;
 
-// A manual sign-in, which only Unix queues (`accounts::manual_signin_capability`).
-#[cfg(unix)]
 #[path = "cli_adopt_source_tests.rs"]
 mod adopt_source;
 #[path = "cli_manual_receipt_tests.rs"]
@@ -16416,6 +16438,11 @@ fn an_emergency_pass_with_nothing_to_remove_writes_one_cannot_meet_row() {
     };
     let lock = state.join("s-1-2.lock");
     std::fs::write(&lock, b"").expect("lock");
+    let build = crate::harness::disk::target::Build::holds(&lock);
+    assert!(
+        !disk::Held::Session(lock.clone()).released(),
+        "the fixture's session lock is held"
+    );
     let done = disk::Applied {
         seen: disk::Rebuildable {
             bytes: 3 * GIB,
@@ -16609,7 +16636,6 @@ fn an_emergency_pass_with_nothing_to_remove_writes_one_cannot_meet_row() {
         (due, emergency.unmet.is_some())
     };
     // The wait's lock is held while nothing moves: a lock let go is itself a move ("let go").
-    let build = crate::harness::disk::target::Build::holds(&lock);
     let nothing = look(emergency_level, Some(GIB), NOW + 60, false);
     assert_eq!(
         due(&unmet, &nothing, Some(7)),
@@ -16656,6 +16682,7 @@ fn an_emergency_pass_with_nothing_to_remove_writes_one_cannot_meet_row() {
         "live sessions unread"
     );
     drop(build);
+    assert!(disk::Held::Session(lock.clone()).released(), "let go");
     assert_eq!(due(&unmet, &nothing, Some(7)), (true, false), "let go");
     let free_lock = Unmet {
         held: Vec::new(),

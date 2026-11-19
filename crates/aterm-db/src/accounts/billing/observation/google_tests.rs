@@ -81,11 +81,17 @@ fn fixture() -> (Fixture, Broker, Token) {
     (f, b, token)
 }
 
-fn poll_to_finish(host: &mut Host, call: &thread::JoinHandle<io::Result<transport::Reply>>) {
+/// Poll `host` until it accepts one more connection, `call`'s, or `call` ends without one. The
+/// worker an accept starts serves that call to its reply without another poll, so the caller's
+/// join of the call waits for the reply on the call's own deadline instead of polling while the
+/// provider answers; a call that fails before it connects reaches that join at once, which shows
+/// its own error.
+fn poll_until_accepted(host: &mut Host, call: &thread::JoinHandle<io::Result<transport::Reply>>) {
+    let accepted = |snapshot: broker::host::Snapshot| snapshot.workers as u64 + snapshot.finished;
+    let before = accepted(host.snapshot());
     let until = deadline();
-    while !call.is_finished() {
+    while accepted(host.poll().unwrap()) == before && !call.is_finished() {
         assert!(Instant::now() < until, "Google fixture hang detector");
-        host.poll().unwrap();
         aterm_uds::deadline::poll_yield();
     }
 }
@@ -194,14 +200,14 @@ fn google_provider_success_redirect_and_lost_body_keep_one_charge_and_one_reques
                 ).is_err_and(|e|e.kind()==io::ErrorKind::WouldBlock),"unexpected provider retry");
             });
             let first=call(dir.path(),&token,INPUT);
-            poll_to_finish(&mut host,&first);
+            poll_until_accepted(&mut host,&first);
             let response=first.join().unwrap().unwrap();
             assert_eq!(response.status,expected);
             assert!(response.entered);
             if let Some(http)=http { assert_eq!(google::response(response.body.expose()).unwrap(),(http,b"{}".as_slice())); }
             else { assert!(response.body.is_empty()); }
             let retry=call(dir.path(),&token,INPUT);
-            poll_to_finish(&mut host,&retry);
+            poll_until_accepted(&mut host,&retry);
             let retry=retry.join().unwrap().unwrap();
             assert_eq!(retry.status,expected);
             assert!(!retry.entered);
@@ -232,7 +238,7 @@ fn google_invalid_request_does_not_contact_provider_or_consume_its_id() {
         &token,
         br#"{"model":"gemini-x","prompt":"p","max_output_tokens":1,"tools":[]}"#,
     );
-    poll_to_finish(&mut host, &invalid);
+    poll_until_accepted(&mut host, &invalid);
     let reply = invalid.join().unwrap().unwrap();
     assert_eq!(reply.status, Status::Refused);
     assert!(!reply.entered);

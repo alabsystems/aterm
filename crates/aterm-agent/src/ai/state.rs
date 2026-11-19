@@ -932,6 +932,17 @@ fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
         row.state = State::Idle;
         row.mark = Mark::Ok;
     }
+    // A model's own weekly wall walls that model's sessions alone, which go on with Opus there:
+    // it is said, and it changes neither the row's state nor its mark.
+    for (bucket, until) in f.accounts.iter().flat_map(|a| &a.model_walls) {
+        if *until > now {
+            words.push(format!(
+                "{} walled until {}",
+                crate::harness::accounts::model_week_name(bucket).unwrap_or(bucket.as_str()),
+                when(*until)
+            ));
+        }
+    }
     if let Some(pool) = pool {
         words.push(pool);
     }

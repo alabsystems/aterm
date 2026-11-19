@@ -169,6 +169,7 @@ fn permission_policy_holds_until_admission_and_a_fresh_authoritative_snapshot() 
     let allowed = Some(crate::InitialSetupPermissionPolicy {
         revision: 7,
         allowed: true,
+        person_access: true,
     });
     let mut gate = PermissionGate::default();
     assert!(!gate.allowed());
@@ -195,6 +196,7 @@ fn permission_policy_holds_until_admission_and_a_fresh_authoritative_snapshot() 
     gate.observe(Some(crate::InitialSetupPermissionPolicy {
         revision: 8,
         allowed: false,
+        person_access: false,
     }));
     gate.observe(allowed);
     assert!(!gate.allowed(), "an older run cannot re-enable guidance");
@@ -244,7 +246,11 @@ fn a_pending_setup_offer_with_no_page_holds_no_handoff() {
 }
 
 fn policy(revision: u64, allowed: bool) -> Option<crate::InitialSetupPermissionPolicy> {
-    Some(crate::InitialSetupPermissionPolicy { revision, allowed })
+    Some(crate::InitialSetupPermissionPolicy {
+        revision,
+        allowed,
+        person_access: allowed,
+    })
 }
 
 /// One Apply through the gate as the host runs it: the hold, who it came

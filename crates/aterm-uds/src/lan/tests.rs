@@ -37,6 +37,51 @@ fn answer_hello_at(path: &std::path::Path, protocol: u32) -> std::thread::JoinHa
     })
 }
 
+/// An ask to be considered is heard by a broker of another protocol that admitted this process:
+/// the request goes in the hello's write, and that broker reads it (`aterm-lan`'s server), so the
+/// ask counts as heard and is not tried again at once. NEGATIVE CONTROL (run): with a broker of
+/// another protocol counted as not hearing it, the ask fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_broker_of_another_protocol_hears_an_ask_to_consider() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let path = root.path().join("broker.sock");
+    let listener = crate::CtlListener::bind(&path).unwrap();
+    let served = std::thread::spawn(move || {
+        let (stream, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .unwrap();
+        wire::send(
+            &stream,
+            &Frame::Hello {
+                protocol: PROTOCOL + 1,
+                build: "older-protocol".into(),
+            },
+        )
+        .unwrap();
+        let mut reader = Reader::new(0);
+        let deadline = Some(Instant::now() + MUST_HAPPEN);
+        let hello = reader.frame(&stream, deadline).unwrap();
+        assert!(matches!(hello, Some(Frame::Hello { .. })), "{hello:?}");
+        reader.frame(&stream, deadline).unwrap()
+    });
+    let asked = seam_here(
+        Seam {
+            socket: Some(path),
+            ..Seam::default()
+        },
+        broker::consider,
+    );
+    assert!(asked.is_ok(), "{asked:?}");
+    assert!(matches!(
+        served.join().unwrap(),
+        Some(Frame::Request(Request::Consider))
+    ));
+}
+
 /// A checked level read closes the startup race, and unrelated parent writes
 /// neither redial nor announce an already observed broker generation.
 #[cfg(target_os = "macos")]
@@ -188,6 +233,125 @@ fn broker_arrivals_never_hear_the_direct_path() {
     assert!(!heard, "a stale socket beside a direct path is no broker");
 }
 
+/// A direct path macOS gave no allowance: it serves nothing.
+#[cfg(target_os = "macos")]
+struct NoAllowance;
+
+#[cfg(target_os = "macos")]
+impl direct::Direct for NoAllowance {
+    fn allowed(&self) -> Result<String, String> {
+        Err("macOS has not answered for this code".into())
+    }
+
+    fn record(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn serve(&self, _stream: CtlStream) {
+        panic!("a path with no allowance serves nothing");
+    }
+}
+
+/// The bytes [`answerer`]'s test writes once its client is done, so its stand-in broker, which
+/// answers the first connection, tells a client that dialled it from one that did not.
+#[cfg(target_os = "macos")]
+const SENTINEL: &[u8] = b"no client dialled";
+
+/// A stand-in broker at a fresh socket that answers the first connection with `frame` (a team
+/// broker's refusal of a development build's code, or its `Unchecked` while `trustd` stalls or at
+/// its connection bound); the seam that points this thread's client at it, and, once the client
+/// is done, whether that client dialled it: the test then connects and writes [`SENTINEL`], which
+/// the broker reads first only where nothing connected before it.
+#[cfg(target_os = "macos")]
+fn answerer(frame: Frame) -> (Seam, aterm_tempfile::TempDir, impl FnOnce() -> bool) {
+    use std::io::{Read as _, Write as _};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let path = root.path().join("broker.sock");
+    let listener = crate::CtlListener::bind(&path).unwrap();
+    let served = std::thread::spawn(move || {
+        let (mut stream, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Until(Instant::now() + MUST_HAPPEN),
+            crate::AcceptedMode::Blocking,
+        )
+        .expect("a connection comes");
+        let _ = wire::send(&stream, &frame);
+        stream.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+        let mut first = Vec::new();
+        let _ = (&mut stream)
+            .take(SENTINEL.len() as u64)
+            .read_to_end(&mut first);
+        (listener, first != SENTINEL)
+    });
+    let seam = Seam {
+        socket: Some(path.clone()),
+        ..Seam::default()
+    };
+    let dialled = move || {
+        let mut sentinel = CtlStream::connect(&path).unwrap();
+        sentinel.write_all(SENTINEL).unwrap();
+        sentinel.shutdown(std::net::Shutdown::Write).unwrap();
+        let (_listener, dialled) = served.join().unwrap();
+        dialled
+    };
+    (seam, root, dialled)
+}
+
+/// A development build on a real Mac takes its own direct path first where macOS allowed its
+/// code, so the installed broker, which admits its team alone, never hears it: not even while
+/// that broker would turn it away unchecked. A release keeps the broker's answer (its refusal or
+/// its `Unchecked`), and so does a development build with no allowance, which dials the broker.
+/// NEGATIVE CONTROL (run): without the direct-first path the development build gets the broker's
+/// `Unchecked`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_development_build_takes_its_allowed_direct_path_before_the_broker() {
+    static DIRECT: AnswersHello = AnswersHello(std::sync::atomic::AtomicUsize::new(0));
+    static NONE: NoAllowance = NoAllowance;
+    let unchecked = || Frame::Unchecked {
+        words: "trustd is not answering".into(),
+    };
+    let run = |development: bool, direct: &'static dyn direct::Direct, frame: Frame, dials| {
+        let (seam, _root, dialled) = answerer(frame);
+        let seam = Seam {
+            development: Some(development),
+            ..seam
+        };
+        let answer = seam_here(seam, || direct::seam_here(direct, broker::hello));
+        assert_eq!(dialled(), dials, "{answer:?}");
+        answer
+    };
+    let served = run(true, &DIRECT, unchecked(), false).unwrap();
+    assert_eq!(served.direct.as_deref(), Some("a stand-in allowance"));
+    let refused = Frame::Refused {
+        words: "not aterm's team".into(),
+    };
+    for (why, development, direct, frame) in [
+        (
+            "a release refused",
+            false,
+            &DIRECT as &'static dyn direct::Direct,
+            refused,
+        ),
+        ("a release unchecked", false, &DIRECT, unchecked()),
+        ("no allowance", true, &NONE, unchecked()),
+    ] {
+        let answer = run(development, direct, frame, true).unwrap_err();
+        assert!(
+            matches!(
+                &answer,
+                LanError::Unavailable(Unavailable::Refused(_) | Unavailable::Unchecked(_))
+            ),
+            "{why}: {answer:?}"
+        );
+        assert_eq!(
+            matches!(&answer, LanError::Unavailable(Unavailable::Refused(_))),
+            why == "a release refused",
+            "{why}: {answer:?}"
+        );
+    }
+}
+
 /// A stand-in broker at a fresh socket that answers one connection with `answer`, given the
 /// request it read; the seam that points this thread's client at it.
 fn stand_in(
@@ -334,12 +498,94 @@ fn a_broker_of_another_protocol_is_outdated() {
     assert!(
         matches!(
             outdated,
-            LanError::Unavailable(Unavailable::Outdated { ours, theirs })
-                if ours == PROTOCOL && theirs == PROTOCOL + 1
+            LanError::Unavailable(Unavailable::Outdated { ours, theirs, ref build })
+                if ours == PROTOCOL && theirs == PROTOCOL + 1 && build == "stand-in"
         ),
         "{outdated:?}"
     );
     served.join().unwrap();
+}
+
+/// An update that bumps the protocol, which the running broker did not adopt: this build, under
+/// the protocol seam, dials the installed broker, which speaks the old protocol and refuses it
+/// as outdated, naming its build ([`Unavailable::Outdated`]). [`broker::any_protocol`] reads
+/// that as the broker's hello, so the account judges the adoption as any other
+/// ([`adoption::expect`]): adopting within the bound (an updated broker answers outdated until
+/// its next look; one that wrote no record, as here, gets the long bound), not adopted after it,
+/// naming the build the broker still serves and that it serves this build's protocol nothing.
+/// MUTANT (run): an outdated broker read as no hello leaves the image adopting after the bound.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_broker_of_another_protocol_still_names_its_build_and_its_adoption_lapses() {
+    use install::{Part, Reading};
+    use std::cell::{Cell, RefCell};
+    struct Port {
+        record: RefCell<Vec<u8>>,
+        now: Cell<u64>,
+        hello: Option<BrokerHello>,
+    }
+    impl adoption::Expecting for Port {
+        fn now(&self) -> u64 {
+            self.now.get()
+        }
+        fn record(&self) -> Option<std::io::Result<Vec<u8>>> {
+            Some(Ok(self.record.borrow().clone()))
+        }
+        fn keep(&self, bytes: &[u8]) -> std::io::Result<()> {
+            *self.record.borrow_mut() = bytes.to_vec();
+            Ok(())
+        }
+        fn hello(&self) -> Option<BrokerHello> {
+            self.hello.clone()
+        }
+        fn refusal(&self, _: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            Err(std::io::ErrorKind::NotFound.into())
+        }
+        fn journal(&self, _: &str) {}
+    }
+    let (seam, _root, served) = stand_in(PROTOCOL, |_, _| {});
+    let seam = Seam {
+        protocol: Some(PROTOCOL + 1),
+        ..seam
+    };
+    let heard = seam_here(seam.clone(), broker::installed_hello);
+    served.join().unwrap();
+    assert!(
+        matches!(
+            &heard,
+            Err(LanError::Unavailable(Unavailable::Outdated { ours, theirs, build }))
+                if *ours == PROTOCOL + 1 && *theirs == PROTOCOL && build == "stand-in"
+        ),
+        "{heard:?}"
+    );
+    let port = Port {
+        record: RefCell::default(),
+        now: Cell::new(1_000),
+        hello: broker::any_protocol(heard).ok(),
+    };
+    let adopting = Reading {
+        image: Part::Adopting("ABCDE12345".into()),
+        plist: Part::Current,
+    };
+    // Judged as this build judges it: under the seam's protocol.
+    let read = || {
+        seam_here(seam.clone(), || {
+            adoption::expect(
+                &port,
+                adopting.clone(),
+                std::path::Path::new("/Applications/aterm.app"),
+                "0.207.0+gfeedbee",
+            )
+            .image
+        })
+    };
+    assert_eq!(read(), adopting.image, "within the bound");
+    port.now.set(1_000 + adoption::LONG_LAPSE.as_secs());
+    let lapsed = read();
+    assert!(
+        matches!(&lapsed, Part::NotAdopted { broker, serves: false, .. } if broker == "stand-in"),
+        "{lapsed:?}"
+    );
 }
 
 /// A stand-in broker at `path` that admits nothing on its one connection: it sends `told` instead

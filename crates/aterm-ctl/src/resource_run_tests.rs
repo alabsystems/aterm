@@ -48,7 +48,9 @@ fn registered_exec_fixture() {
         "reading" => "printf 'UNGUARDED-EXEC\\n'; exit 37",
         "signal" => {
             default_dispositions(&GROUP_STOPS);
-            r#"trap 'printf "SIGNAL\n"; while read release && [ "$release" != release ]; do :; done; exit 37' HUP INT TERM; printf 'READY pid=%s\n' "$$"; while :; do read request; done"#
+            // The loop exits at the end of its stdin, the test's pipe: a `read` there fails at
+            // once, so a loop that read on past it would spin a core once the test was gone.
+            r#"trap 'printf "SIGNAL\n"; while read release && [ "$release" != release ]; do :; done; exit 37' HUP INT TERM; printf 'READY pid=%s\n' "$$"; while :; do read request || exit; done"#
         }
         _ => panic!("unknown fixture"),
     };

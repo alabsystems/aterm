@@ -11,6 +11,33 @@ use aterm_capacity::reading::{Proc, Procs};
 use aterm_capacity::{Fixed, Reading};
 
 #[cfg(target_os = "macos")]
+fn actor_output(
+    command: &mut aterm_uds::spawnfd::Command,
+    why: &str,
+) -> Result<std::process::Output, String> {
+    let started = std::time::Instant::now();
+    let mut guard_expired = false;
+    let result = aterm_uds::deadline::output_from_while_process_progressing_unless(
+        command,
+        aterm_uds::spawnfd::Stdio::null(),
+        aterm_spec::wait::MUST_HAPPEN,
+        why,
+        &mut || {
+            guard_expired |= started.elapsed() >= aterm_spec::wait::WORKING_GUARD;
+            guard_expired
+        },
+    );
+    if guard_expired {
+        Err(format!(
+            "{why} did not finish before its {:?} working guard",
+            aterm_spec::wait::WORKING_GUARD
+        ))
+    } else {
+        result.map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[path = "build_admit_release_pilot.rs"]
 mod release_pilot;
 

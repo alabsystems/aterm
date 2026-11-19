@@ -403,7 +403,11 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+#[path = "cargo_cache_win.rs"]
+mod imp;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod imp {
     use std::{convert::Infallible, io, path::Path};
 
@@ -443,4 +447,8 @@ mod imp {
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "cargo_cache_tests.rs"]
+mod tests;
+
+#[cfg(all(test, windows))]
+#[path = "cargo_cache_win_tests.rs"]
 mod tests;

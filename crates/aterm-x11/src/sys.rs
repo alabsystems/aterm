@@ -42,6 +42,8 @@ aterm_dl::table! {
     pub(crate) struct Xcb {
         connect = c"xcb_connect":
             unsafe extern "C" fn(*const c_char, *mut c_int) -> *mut XcbConnection;
+        connect_to_fd = c"xcb_connect_to_fd":
+            unsafe extern "C" fn(c_int, *mut c_void) -> *mut XcbConnection;
         disconnect = c"xcb_disconnect": unsafe extern "C" fn(*mut XcbConnection);
         has_error = c"xcb_connection_has_error": unsafe extern "C" fn(*mut XcbConnection) -> c_int;
         get_setup = c"xcb_get_setup": unsafe extern "C" fn(*mut XcbConnection) -> *const u8;
@@ -67,6 +69,8 @@ aterm_dl::table! {
         ) -> u64;
         wait_for_reply64 = c"xcb_wait_for_reply64":
             unsafe extern "C" fn(*mut XcbConnection, u64, *mut *mut u8) -> *mut u8;
+        poll_for_reply64 = c"xcb_poll_for_reply64":
+            unsafe extern "C" fn(*mut XcbConnection, u64, *mut *mut u8, *mut *mut u8) -> c_int;
         request_check = c"xcb_request_check":
             unsafe extern "C" fn(*mut XcbConnection, VoidCookie) -> *mut u8;
         discard_reply64 = c"xcb_discard_reply64": unsafe extern "C" fn(*mut XcbConnection, u64);

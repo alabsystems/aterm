@@ -5,6 +5,7 @@
 //! stands, and what keeps it from being kept.
 
 use super::*;
+use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
 /// One second, in nanoseconds.
 const SEC_NS: i128 = 1_000_000_000;
@@ -12,22 +13,19 @@ const SEC_NS: i128 = 1_000_000_000;
 /// The value the exit test's run reads.
 static GUARD: Watched<u32> = Watched::new("trace-test-guard", 0);
 
-/// The run the exit test records: it reads `file`, compares a [`Now`] of 1 000 against 900
-/// (passed) and 1 500 (still to come), and reads [`GUARD`], with its reads judged a minute
-/// later than the clock so the fixture's file has settled.
+/// Read the settled fixture file, compare wall-clock bounds on a scripted clock, and read
+/// [`GUARD`].
 fn guarded_run(file: &Path) -> Trace {
-    read_as_if_later(Duration::from_secs(60), || {
-        scope(|| {
-            let text = fs::read_to_string(file).expect("the fixture's roster");
-            assert!(text.starts_with("label"), "{text:?}");
-            let now = Now::at(1_000);
-            assert!(now.passed(900));
-            assert!(!now.passed(1_500));
-            let guard = GUARD.lock().expect("the guard");
-            assert!(*guard < 10, "{}", *guard);
-        })
-        .1
+    scope(|| {
+        let text = fs::read_to_string(file).expect("the fixture's roster");
+        assert!(text.starts_with("label"), "{text:?}");
+        let now = Now::at(1_000);
+        assert!(now.passed(900));
+        assert!(!now.passed(1_500));
+        let guard = GUARD.lock().expect("the guard");
+        assert!(*guard < 10, "{}", *guard);
     })
+    .1
 }
 
 /// A trace stands while nothing it recorded has moved, and each kind of move ends it: a read
@@ -50,6 +48,15 @@ fn a_trace_stands_until_a_read_file_a_crossed_bound_or_a_watched_generation_move
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let file = dir.path().join("accounts.toml");
     std::fs::write(&file, "label = \"a\"\n").expect("the fixture's roster");
+    // Use the real settle rule so the rewrite cannot share the initial ctime tick.
+    until_within(MUST_HAPPEN, "the fixture's roster settles", || {
+        let read_at = SystemTime::now();
+        let stamp = Look::of(&file, Reach::Followed)
+            .stamp()
+            .expect("the fixture's look")
+            .expect("the fixture is there");
+        settled(stamp.changed_ns(), read_at).then_some(())
+    });
     let mono = Instant::now();
 
     let trace = guarded_run(&file);
@@ -87,15 +94,24 @@ fn a_trace_stands_until_a_read_file_a_crossed_bound_or_a_watched_generation_move
     assert_eq!(trace.stands(Now::at(1_000), mono), Ok(()));
     #[cfg(unix)]
     {
-        let modified = std::fs::metadata(&file)
-            .and_then(|meta| meta.modified())
-            .expect("the roster's modification time");
+        let metadata = std::fs::metadata(&file).expect("the roster's metadata");
+        let before = Meta::of(&metadata);
+        let modified = metadata.modified().expect("the roster's modification time");
         std::fs::write(&file, "label = \"b\"\n").expect("the rewrite");
         std::fs::File::options()
             .write(true)
             .open(&file)
             .and_then(|opened| opened.set_modified(modified))
             .expect("the modification time put back");
+        let after = Meta::of(&std::fs::metadata(&file).expect("the rewritten roster's metadata"));
+        assert_ne!(before.ctime_ns, after.ctime_ns);
+        assert_eq!(
+            after,
+            Meta {
+                ctime_ns: after.ctime_ns,
+                ..before
+            }
+        );
     }
     #[cfg(not(unix))]
     std::fs::write(&file, "label = \"bb\"\n").expect("the rewrite");
@@ -1050,7 +1066,7 @@ fn read_primitives() -> Vec<Primitive> {
     #[cfg(any(unix, windows))]
     {
         use crate::private_file::{self as private, JudgedDir};
-        let private_primitives: [Primitive; 6] = [
+        let private_primitives: [Primitive; 10] = [
             ("private_file::read_private", true, |dir, name| {
                 private::read_private(dir, name, PRIMITIVE_MAX).map_err(|e| e.to_string())
             }),
@@ -1087,13 +1103,6 @@ fn read_primitives() -> Vec<Primitive> {
                     .and_then(|judged| judged.read_head(name, PRIMITIVE_MAX))
                     .map_err(|e| e.to_string())
             }),
-        ];
-        primitives.extend(private_primitives);
-    }
-    #[cfg(unix)]
-    {
-        use crate::private_file::{self as private, KeptParse};
-        let unix_primitives: [Primitive; 4] = [
             ("private_file::read_private_into", true, |dir, name| {
                 let mut buf = [0; PRIMITIVE_MAX];
                 private::read_private_into(dir, name, PRIMITIVE_MAX, &mut buf)
@@ -1110,12 +1119,12 @@ fn read_primitives() -> Vec<Primitive> {
                     .map_err(|e| e.to_string())
             }),
             ("private_file::KeptParse::read", true, |dir, name| {
-                KeptParse::new(1)
+                private::KeptParse::new(1)
                     .read(dir, name, PRIMITIVE_MAX, <[u8]>::to_vec)
                     .map_err(|e| e.to_string())
             }),
         ];
-        primitives.extend(unix_primitives);
+        primitives.extend(private_primitives);
     }
     primitives
 }
@@ -1168,7 +1177,9 @@ fn private_fixture(dir: &Path, name: &str, bytes: &[u8]) {
 ///   `[".../state"]`.
 /// - `DirIs::standing` giving an open folder a private one's standing failed with
 ///   "private_file::read_private: its folder opened to others left the trace standing", left
-///   `Ok(())`, right `Err(Standing(".../state"))`.
+///   `Ok(())`, right `Err(Standing(".../state"))`; on Windows (2026-11-18) the Windows
+///   `DirIs::standing` doing the same, the folder's list given a read entry for every user,
+///   failed with the same message and the same right.
 /// - `atomic_file::read_bounded_stream` without its poison failed with "a read of /dev/null, a
 ///   stream, left its scope unpoisoned: Trace { .. }".
 #[test]
@@ -1187,6 +1198,16 @@ fn each_read_primitive_records_its_path_and_a_miss() {
     };
     #[cfg(unix)]
     set_mode(0o700);
+    // The state folder's protected list: the user's and SYSTEM's entries, each passed on to what
+    // is made inside (as `create_private_dir` gives it), and `more` (SDDL access entries).
+    #[cfg(windows)]
+    let set_list = |more: &str| {
+        use crate::acl::{Descriptor, Parts, Sid};
+        let me = Sid::token_user().expect("the token's user").to_string();
+        Descriptor::from_sddl(&format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY){more}"))
+            .and_then(|list| list.apply_to_path(&dir, Parts::DACL | Parts::PROTECTED_DACL))
+            .expect("the state folder's list");
+    };
     private_fixture(&dir, "file", b"contents");
     let file = dir.join("file");
     let gone = dir.join("gone");
@@ -1226,6 +1247,17 @@ fn each_read_primitive_records_its_path_and_a_miss() {
                 "{what}: its folder opened to others left the trace standing"
             );
             set_mode(0o700);
+            assert_eq!(stands(&trace), Ok(()), "{what}: the folder private again");
+        }
+        #[cfg(windows)]
+        if private {
+            set_list("(A;OICI;FR;;;BU)");
+            assert_eq!(
+                stands(&trace),
+                Err(Moved::Standing(dir.clone())),
+                "{what}: its folder opened to others left the trace standing"
+            );
+            set_list("");
             assert_eq!(stands(&trace), Ok(()), "{what}: the folder private again");
         }
 

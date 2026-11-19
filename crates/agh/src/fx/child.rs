@@ -396,6 +396,8 @@ pub(crate) fn run_observing(
                     deadline::ProgressError::Stalled {
                         window: progress.window,
                         waiting_on: progress.waiting_on.clone(),
+                        // The journaled RunError API exposes no captured observations.
+                        partial: deadline::PartialOutput::default(),
                     },
                 )
             } else {

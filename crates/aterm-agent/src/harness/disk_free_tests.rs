@@ -89,7 +89,7 @@ fn nobody(_: &[PathBuf], _: &[u32]) -> std::io::Result<PathScan> {
     Ok(PathScan::default())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn cargo_reader_with_no_open_crate_file_prevents_cleanup_until_its_guard_releases() {
     let home = Home::new();
@@ -783,12 +783,12 @@ fn a_root_reached_through_a_link_or_resolving_outside_home_is_refused() {
     );
     assert!(inside.join("blob").is_file());
     let (outcomes, _) = free(std::slice::from_ref(&inside), false, &w);
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     assert!(
         matches!(outcomes[0].verdict, Verdict::Removed { .. }),
         "the root's real path is the root: {outcomes:?}"
     );
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         assert!(refusal(&outcomes[0]).contains("Cargo source-cache reclamation custody"));
         assert!(inside.join("blob").is_file());

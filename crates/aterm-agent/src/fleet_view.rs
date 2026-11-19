@@ -17,7 +17,12 @@
 //! **Needs update** names a member whose build is below what the lab needs now: below the record
 //! fence ([`RECORD_FENCE`]) once this Mac's log has crossed past what such builds hold; or, while
 //! this Mac's node serves presence, a member its book heard on the old path lately whose node
-//! publishes no presence row, a build below the mesh protocol.
+//! publishes no presence row, a build below the mesh protocol; or, once this Mac's format mark
+//! says its log is in a later records format than 1, a member whose build does not read that
+//! format ([`FormatFloor`]), this Mac's own row where its own build does not: the row the
+//! node's view says is this Mac's, or, in the command, which reads no view, the seat that
+//! bound this Mac's own node key. No Mac holds such a mark yet
+//! (`aterm_secrets::commons::hearing::READS_FORMAT` names no release), so that arm names no one.
 //!
 //! **No Commons machine uuid column yet:** nothing on this Mac maps a node id to its registry
 //! row without reading Commons' tables; `aterm db computers` is the registry's join (§4.12).
@@ -37,6 +42,99 @@ use std::process::ExitCode;
 /// hold at most 4096 records, so once this Mac's log crossed past them a member that runs one
 /// cannot hold the log and needs an update.
 pub const RECORD_FENCE: (u64, u64) = (0, 154);
+
+/// What a member's build must be to read the records format this Mac's membership log is in
+/// (`docs/DESIGN-vault-log-2026-11-14.md` step 3: a Mac below the fence "stays on a consistent
+/// prefix and shows `needs update`"). Read off this Mac's own format mark, which is stored only
+/// on a record a seat signed (`aterm_secrets::membership_log::follow`): a peer's word that the
+/// vault moved names no one here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FormatFloor {
+    /// Format 1, which every build reads: no member needs an update for it.
+    #[default]
+    Every,
+    /// A later format, which a build of this release or a later one reads: a member whose build
+    /// reads as an earlier release needs an update, this Mac's own row included.
+    From((u64, u64)),
+    /// A later format that no release this build knows of reads, so this Mac's own build does
+    /// not (a Mac taken back to an older aterm after it followed its vault): its own row needs
+    /// an update, and it cannot say which other builds do. Its own row is the one the node's
+    /// view says is this Mac's, and the seat that bound this Mac's own node key
+    /// ([`Facts::own`]): `aterm fleet` composes with no view, so the key alone names it there.
+    Unread,
+}
+
+impl FormatFloor {
+    /// The floor of a Mac whose format mark names `marked` (`None`: the mark does not read, so
+    /// nothing is claimed), in a build whose first release that reads format 2 is `reads`
+    /// (`aterm_secrets::commons::hearing::READS_FORMAT`).
+    #[must_use]
+    pub fn of(marked: Option<u32>, reads: Option<(u64, u64)>) -> Self {
+        match (marked, reads) {
+            (None, _) => Self::Every,
+            (Some(format), _) if format <= aterm_secrets::crossing::FORMAT_ONE => Self::Every,
+            (Some(aterm_secrets::crossing::FORMAT_TWO), Some(release)) => Self::From(release),
+            (Some(_), _) => Self::Unread,
+        }
+    }
+}
+
+/// What this Mac's own records say a member's build needs: the two reasons [`compose`] and
+/// [`observe`] judge a build by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Needs {
+    /// Whether this Mac's log crossed the legacy bound ([`RECORD_FENCE`]).
+    crossed: bool,
+    /// What reads the format this Mac's log is in.
+    format: FormatFloor,
+    /// This Mac's own node key ([`Facts::own`]).
+    own: Option<[u8; 32]>,
+}
+
+impl Needs {
+    /// Whether the seat that bound `key` is this Mac's own, by this Mac's node key: what says
+    /// so where no node's view does (`aterm fleet`).
+    fn own(self, key: Option<&[u8; 32]>) -> bool {
+        // MUTANT ([`Mutant::OwnByViewAlone`]): only the node's view names this Mac's row.
+        #[cfg(test)]
+        if mutant(Mutant::OwnByViewAlone) {
+            return false;
+        }
+        key.is_some() && self.own.as_ref() == key
+    }
+
+    /// Whether a member at `build` (`None`: no build is known), this Mac itself where `me`,
+    /// needs an update.
+    fn update(self, build: Option<&str>, me: bool) -> bool {
+        build.is_some_and(|build| self.crossed && below(build, RECORD_FENCE))
+            || match self.format {
+                FormatFloor::Every => false,
+                FormatFloor::From(floor) => build.is_some_and(|build| below(build, floor)),
+                FormatFloor::Unread => me,
+            }
+    }
+}
+
+/// A fault a test injects on its own thread, each the code before a guard here.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mutant {
+    /// This Mac's own row is known by the node's view alone, as before the slice B review: a
+    /// compose with no view ([`main_entry`]'s) marks no row for a format its build cannot read.
+    OwnByViewAlone,
+    /// This Mac's format mark is not read: every build is taken to read its log's format.
+    MarkUnread,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn mutant(which: Mutant) -> bool {
+    MUTANT.get() == Some(which)
+}
 
 /// One seat as `aterm fleet` shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +223,12 @@ pub struct Facts<'a> {
     pub seats: Option<&'a [LogSeat]>,
     /// The records this Mac holds, and whether its log has crossed the legacy bound.
     pub records: Option<(u64, bool)>,
+    /// What reads the records format this Mac's log is in.
+    pub format: FormatFloor,
+    /// This Mac's own node key, where it was read: what names this Mac's row for
+    /// [`FormatFloor::Unread`] in a compose that has no node's view to say which seat is this
+    /// Mac's. It moves no other column: a row is shown as this Mac's by the view alone.
+    pub own: Option<[u8; 32]>,
     /// The node service's view, or why there is none.
     pub view: Result<&'a View, String>,
     /// This Mac's fleet book.
@@ -159,9 +263,13 @@ pub fn compose(facts: &Facts<'_>) -> Fleet {
     let view = facts.view.as_ref().ok();
     let seat_of =
         |principal: &str| view.and_then(|v| v.seats.iter().find(|s| s.principal == principal));
-    let crossed = facts.records.is_some_and(|(_, crossed)| crossed);
-    let needs_update = |build: Option<&str>, has_row: bool, seen_ms: Option<u64>| {
-        build.is_some_and(|b| crossed && below(b, RECORD_FENCE))
+    let needs = Needs {
+        crossed: facts.records.is_some_and(|(_, crossed)| crossed),
+        format: facts.format,
+        own: facts.own,
+    };
+    let needs_update = |build: Option<&str>, me: bool, has_row: bool, seen_ms: Option<u64>| {
+        needs.update(build, me)
             || (view.is_some()
                 && !has_row
                 && seen_ms.is_some_and(|seen| facts.now_ms.saturating_sub(seen) < LIVE_WITHIN_MS))
@@ -179,16 +287,18 @@ pub fn compose(facts: &Facts<'_>) -> Fleet {
             let build = row
                 .map(|(_, row)| row.build.as_str().to_owned())
                 .or_else(|| book.map(|(version, _)| version.to_owned()));
+            let me = held.is_some_and(|s| s.me)
+                || view.is_some_and(|v| node.as_deref() == Some(v.me.as_str()));
             rows.push(SeatRow {
                 label: seat.label.clone(),
                 name: seat.name.clone(),
                 node_key: seat.node_key,
-                me: held.is_some_and(|s| s.me)
-                    || view.is_some_and(|v| node.as_deref() == Some(v.me.as_str())),
+                me,
                 presence: view
                     .map(|_| held.map_or(Presence::Silent { last_seen_ms: None }, |s| s.standing)),
                 needs_update: needs_update(
                     build.as_deref(),
+                    me || needs.own(seat.node_key.as_ref()),
                     row.is_some(),
                     book.and_then(|(_, seen)| seen),
                 ),
@@ -219,7 +329,12 @@ pub fn compose(facts: &Facts<'_>) -> Fleet {
                 node_key: Some(seat.key),
                 me: seat.me,
                 presence: Some(seat.standing),
-                needs_update: needs_update(build.as_deref(), seat.row.is_some(), None),
+                needs_update: needs_update(
+                    build.as_deref(),
+                    seat.me || needs.own(Some(&seat.key)),
+                    seat.row.is_some(),
+                    None,
+                ),
                 behind: Some(seat.behind),
                 build,
             });
@@ -294,7 +409,7 @@ fn observe(
     book: &[Peer],
     read: Result<&aterm_ctl::FleetRead, String>,
     now_ms: u64,
-    crossed: bool,
+    needs: Needs,
 ) -> Fleet {
     fleet.observations.clear();
     fleet.seats.up = None;
@@ -418,7 +533,10 @@ fn observe(
         });
         row.presence = Some(Presence::Up);
         row.build = Some(facts.version.clone());
-        row.needs_update = crossed && below(&facts.version, RECORD_FENCE);
+        row.needs_update = needs.update(
+            Some(&facts.version),
+            row.me || needs.own(row.node_key.as_ref()),
+        );
         fleet.observations.insert(
             row.label.clone(),
             Observation {
@@ -746,7 +864,7 @@ fn gather_here(
     state: &Path,
     paths: Option<&aterm_secrets::client::Paths>,
     view: Result<&View, String>,
-) -> (Fleet, Vec<Peer>, bool) {
+) -> (Fleet, Vec<Peer>, Needs) {
     let book = aterm_net::fleet_member::read_peers(state).unwrap_or_default();
     let read =
         paths.and_then(|paths| aterm_secrets::client::load_acknowledged_and_ahead(paths).ok());
@@ -755,14 +873,55 @@ fn gather_here(
         .as_ref()
         .and_then(|read| read.acknowledged.log())
         .map(log_seats);
+    let format = format_floor(paths);
+    let own = own_node_key(state, format);
     let fleet = compose(&Facts {
         seats: seats.as_deref(),
         records,
+        format,
+        own,
         view,
         book: &book,
         now_ms: aterm_netplace::unix_ms_now(),
     });
-    (fleet, book, records.is_some_and(|(_, crossed)| crossed))
+    let needs = Needs {
+        crossed: records.is_some_and(|(_, crossed)| crossed),
+        format,
+        own,
+    };
+    (fleet, book, needs)
+}
+
+/// This Mac's own node key under the state directory `state` ([`Facts::own`]), never minted,
+/// and read only where `format` names a row by it ([`FormatFloor::Unread`]): a Mac whose
+/// build reads its log's format, which is every Mac that holds no format mark, reads no key
+/// here.
+fn own_node_key(state: &Path, format: FormatFloor) -> Option<[u8; 32]> {
+    if format != FormatFloor::Unread {
+        return None;
+    }
+    aterm_net::fleet_member::read_node_identity(state)
+        .ok()
+        .flatten()
+        .map(|me| *me.key().bytes())
+}
+
+/// What reads the records format this Mac's log is in ([`FormatFloor::of`]), by its format
+/// mark alone: its records file is not opened. A mark that does not read claims nothing.
+fn format_floor(paths: Option<&aterm_secrets::client::Paths>) -> FormatFloor {
+    let Some(paths) = paths else {
+        return FormatFloor::Every;
+    };
+    // MUTANT ([`Mutant::MarkUnread`]): the mark is not read.
+    #[cfg(test)]
+    if mutant(Mutant::MarkUnread) {
+        return FormatFloor::Every;
+    }
+    FormatFloor::of(
+        aterm_secrets::client::records_marked_format(paths).ok(),
+        aterm_secrets::commons::hearing::READS_FORMAT
+            .map(|release| (u64::from(release.0), u64::from(release.1))),
+    )
 }
 
 fn held_records(paths: Option<&aterm_secrets::client::Paths>) -> Option<(u64, bool)> {
@@ -826,7 +985,7 @@ pub fn main_entry(args: &[std::ffi::OsString]) -> ExitCode {
     let paths = aterm_secrets::client::Paths::live().ok();
     let surveyed = crate::fleet_member::survey_all_facts(std::time::Duration::from_secs(3));
     let at_ms = aterm_netplace::unix_ms_now();
-    let (fleet, book, crossed) = gather_here(
+    let (fleet, book, needs) = gather_here(
         &state,
         paths.as_ref(),
         Err("fleet survey not read".to_owned()),
@@ -836,7 +995,7 @@ pub fn main_entry(args: &[std::ffi::OsString]) -> ExitCode {
         &book,
         surveyed.as_ref().map_err(ToString::to_string),
         at_ms,
-        crossed,
+        needs,
     );
     let text = if json {
         let mut text = aterm_json::to_string(&to_json(&fleet)).unwrap_or_default();

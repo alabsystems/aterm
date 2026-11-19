@@ -632,7 +632,7 @@ fn an_exit_handoff_cannot_be_reversed_by_a_late_writer() {
     logged(&logger, 1);
     assert_eq!(bodies(&path), lines(0..=0), "the writer's line queued");
     logger.unattend();
-    assert!(logger.flush_within(aterm_spec::wait::MUST_HAPPEN));
+    assert!(logger.append_within(aterm_spec::wait::MUST_HAPPEN, false));
     logged(&logger, 2);
     assert_eq!(bodies(&path), lines(0..=2), "exit drains and hands back");
 
@@ -676,7 +676,7 @@ fn a_record_returns_while_the_file_is_held_and_lands_in_order() {
         .expect("three records returned with the file held");
     assert_eq!(read(&dir.log()), "", "nothing reached the held file");
     drop(held);
-    assert!(logger.flush_within(aterm_spec::wait::MUST_HAPPEN));
+    assert!(logger.append_within(aterm_spec::wait::MUST_HAPPEN, false));
     assert_eq!(bodies(&dir.log()), lines(1..=3));
 }
 
@@ -704,7 +704,7 @@ fn a_full_queue_is_appended_in_order_by_the_thread_that_overflows_it() {
     );
     logged(logger, 5);
     assert_eq!(bodies(&dir.log()), lines(1..=4), "the queue took the next");
-    assert!(logger.flush_within(aterm_spec::wait::MUST_HAPPEN));
+    assert!(logger.append_within(aterm_spec::wait::MUST_HAPPEN, false));
     assert_eq!(bodies(&dir.log()), lines(1..=5));
 }
 
@@ -715,13 +715,103 @@ fn a_flush_is_bounded_and_lands_the_queue() {
     logged(logger, 1);
     let held = logger.file.lock().unwrap();
     assert!(
-        !logger.flush_within(Duration::from_millis(5)),
+        !logger.append_within(Duration::from_millis(5), false),
         "the file was held"
     );
     drop(held);
     assert_eq!(read(&dir.log()), "", "still queued");
-    assert!(logger.flush_within(aterm_spec::wait::MUST_HAPPEN));
+    assert!(logger.append_within(aterm_spec::wait::MUST_HAPPEN, false));
     assert_eq!(bodies(&dir.log()), lines(1..=1));
+}
+
+/// A sync lands the queue as a flush does, under the same bound, and orders the file to its
+/// device while it holds it: a memory starvation episode's line is on disk before its writer
+/// reads again. NEGATIVE CONTROLS: a held file bounds it and lands and flushes nothing; a plain
+/// flush orders nothing.
+#[test]
+fn a_sync_is_bounded_and_lands_the_queue() {
+    use aterm_durable::{Flush, seam::Recording};
+    let dir = Scratch::new("sync");
+    let logger = queued_logger(&dir.log(), LOG_QUEUE_BYTES);
+    let flushes = Recording::start();
+    logged(logger, 1);
+    let held = logger.file.lock().unwrap();
+    assert!(
+        !logger.append_within(Duration::from_millis(5), true),
+        "the file was held"
+    );
+    drop(held);
+    assert_eq!(read(&dir.log()), "", "still queued");
+    assert_eq!(flushes.take(), []);
+    assert!(logger.append_within(aterm_spec::wait::MUST_HAPPEN, true));
+    assert_eq!(bodies(&dir.log()), lines(1..=1));
+    assert_eq!(flushes.take(), [Flush::Ordered]);
+    logged(logger, 2);
+    assert!(logger.append_within(aterm_spec::wait::MUST_HAPPEN, false));
+    assert_eq!(bodies(&dir.log()), lines(1..=2));
+    assert_eq!(flushes.take(), [], "a plain flush orders nothing");
+}
+
+/// A STARVATION EDGE'S LINE IS IN ATERM.LOG, ORDERED TO ITS DEVICE, WHEN THE JOURNAL RETURNS:
+/// through the file logger the probe thread writes to, a queued line that the logger's writer
+/// thread has not yet appended is appended and ordered by the journal itself; with the file held
+/// past the journal's bound the line stays queued and the order is owed, and the next reading's
+/// journal, with no edge of its own, lands it. NEGATIVE CONTROL: the held file lands and orders
+/// nothing until it is let go.
+#[test]
+fn a_starvation_edges_line_is_on_disk_when_the_journal_returns() {
+    use crate::memory_starving::{ENDED_LINE, Journal, OPENED_LINE};
+    use aterm_durable::{Flush, seam::Recording};
+    use aterm_vitals::events::{Event, EventKind};
+    use aterm_vitals::starving::{Edge, Episode, Look, Why, Worst};
+    let edge = |ended: bool| {
+        let e = Episode {
+            why: Why::Thrash,
+            opened_ns: 1,
+            opened_unix_ms: 1_763_277_369_800,
+            at_open: Look {
+                ram: 128 << 30,
+                ..Look::default()
+            },
+            worst: Worst::default(),
+            holders: Vec::new(),
+            holders_age_ms: None,
+            ended: ended.then(|| (1_763_277_429_800, Look::default())),
+        };
+        aterm_vitals::Snapshot {
+            events: vec![Event {
+                seq: 1,
+                at_ns: 0,
+                at_unix_ms: None,
+                scope: aterm_vitals::events::EventScope::Machine,
+                kind: EventKind::Starving(Box::new(if ended {
+                    Edge::Ended(e)
+                } else {
+                    Edge::Opened(e)
+                })),
+            }],
+            ..aterm_vitals::Snapshot::default()
+        }
+    };
+    let dir = Scratch::new("starving");
+    let logger = queued_logger(&dir.log(), LOG_QUEUE_BYTES);
+    let flushes = Recording::start();
+    let mut journal = Journal::default();
+    assert_eq!(journal.note(&edge(false), logger), 1);
+    let read_back = read(&dir.log());
+    assert!(read_back.contains(OPENED_LINE), "{read_back}");
+    assert_eq!(flushes.take(), [Flush::Ordered]);
+    assert!(!journal.owed());
+    let held = logger.file.lock().unwrap();
+    assert_eq!(journal.note(&edge(true), logger), 1);
+    assert!(journal.owed(), "the file was held");
+    drop(held);
+    assert!(!read(&dir.log()).contains(ENDED_LINE), "still queued");
+    assert_eq!(flushes.take(), []);
+    assert_eq!(journal.note(&aterm_vitals::Snapshot::default(), logger), 0);
+    assert!(read(&dir.log()).contains(ENDED_LINE));
+    assert_eq!(flushes.take(), [Flush::Ordered]);
+    assert!(!journal.owed());
 }
 
 #[cfg(target_os = "macos")]

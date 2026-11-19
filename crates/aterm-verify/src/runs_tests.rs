@@ -1110,6 +1110,7 @@ fn an_unconfirmed_exit_keeps_the_end_result_and_run_record() {
     let runs = Runs {
         log: Mutex::new(
             std::fs::OpenOptions::new()
+                .read(true)
                 .append(true)
                 .open(&path)
                 .unwrap(),
@@ -1157,7 +1158,9 @@ fn an_unconfirmed_exit_keeps_the_end_result_and_run_record() {
         report.survivors[0].payload()["end"]["gone"].as_bool(),
         Some(true)
     );
-    runs.finish(&k);
+    let archives = aterm_tempfile::tempdir().expect("archive scratch");
+    runs.finish(&k, Some(&archives.path().join("native.log.run")))
+        .expect("archive the owning record");
     assert!(path.exists(), "the unconfirmed departure keeps the record");
 }
 
@@ -1470,6 +1473,7 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
     let runs = Runs {
         log: Mutex::new(
             std::fs::OpenOptions::new()
+                .read(true)
                 .append(true)
                 .open(&path)
                 .expect("open"),
@@ -1575,7 +1579,9 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
     std::fs::write(&unknown, partial).expect("partial competing record");
     let before = std::fs::read(&path).expect("own record before unknown sweep");
     let _ = runs.end_of_run(&k);
-    runs.finish(&k);
+    let archives = aterm_tempfile::tempdir().expect("archive scratch");
+    runs.finish(&k, Some(&archives.path().join("native.log.run")))
+        .expect("archive the owning record");
     assert!(k.signals.borrow().is_empty());
     assert!(k.markers_read.borrow().is_empty());
     assert_eq!(
@@ -1754,7 +1760,9 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
     );
     assert!(!k.markers_read.borrow().contains(&75));
     let before = std::fs::read(&path).expect("own record before leftover finish");
-    runs.finish(&k);
+    let archives = aterm_tempfile::tempdir().expect("archive scratch");
+    runs.finish(&k, Some(&archives.path().join("native.log.run")))
+        .expect("archive the owning record");
     assert_eq!(
         std::fs::read(&path).expect("named and unjudged members keep own record"),
         before
@@ -1769,7 +1777,9 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
     let signals_before = k.signals.borrow().clone();
     k.markers_read.borrow_mut().clear();
     let _ = runs.end_of_run(&k);
-    runs.finish(&k);
+    let archives = aterm_tempfile::tempdir().expect("archive scratch");
+    runs.finish(&k, Some(&archives.path().join("native.log.run")))
+        .expect("archive the owning record");
     assert_eq!(*k.signals.borrow(), signals_before);
     assert!(k.markers_read.borrow().is_empty());
     assert_eq!(
@@ -1784,7 +1794,9 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
     );
     std::fs::remove_file(&unknown).expect("retire private unreadable record");
     let _ = runs.end_of_run(&k);
-    runs.finish(&k);
+    let archives = aterm_tempfile::tempdir().expect("archive scratch");
+    runs.finish(&k, Some(&archives.path().join("native.log.run")))
+        .expect("archive the owning record");
     assert!(
         !path.exists(),
         "a fresh clear sweep permits the orderly end"
@@ -3290,3 +3302,6 @@ fn the_default_poster_is_inert() {
     let runs = runs.telling(Box::new(told));
     assert!(format!("{:?}", runs.poster).starts_with("Recording"));
 }
+
+#[path = "runs_archive_tests.rs"]
+mod archive;

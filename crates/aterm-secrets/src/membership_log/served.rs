@@ -83,7 +83,11 @@
 //! - **Bounds.** A frame names at most [`MAX_SERVED_ROOTS`] roots (a log with more serves none)
 //!   and as many stubs as its bytes hold ([`MIN_STUB_WIRE`] each at least): stubs count against a
 //!   log's bytes and no count, so a log that dropped more records than it may hold whole still
-//!   serves them all, within the reply's stream bound ([`super::Store::missing_served`]). A
+//!   serves them all, within one reply's bytes ([`super::REPLY_CAP`],
+//!   [`super::Store::missing_served`]). A frame is its stubs' bytes, which its log counts in
+//!   its own, and a head of [`Served::head_len`] bytes, which no log counts: so a reply, the
+//!   records its peer lacks and the frame, passes what its store holds by that head at most
+//!   ([`MAX_SERVED_HEAD`] for the most roots a frame names). A
 //!   receiver verifies one signature per stub it reads, at most one per [`MIN_STUB_WIRE`] bytes
 //!   of the reply, as it verifies one per record of the records stream.
 //!
@@ -167,6 +171,10 @@ pub const SERVED_MAGIC: &[u8; 4] = b"ALS1";
 /// with more serves none ([`Log::served`]).
 pub const MAX_SERVED_ROOTS: usize = 256;
 
+/// The most bytes of a frame that are not its stubs' ([`Served::head_len`] of
+/// [`MAX_SERVED_ROOTS`] roots, 8,234): how far a served reply can pass what its store holds.
+pub const MAX_SERVED_HEAD: usize = Served::head_len(MAX_SERVED_ROOTS);
+
 /// The fewest bytes a stub's encoding takes ([`Stub::encode`]: a version-1 record's tag, id,
 /// signer, sequence, clock, kind, and every optional field and list empty; a version-2
 /// record's frame alone is longer), by which a frame's length bounds its count.
@@ -211,15 +219,19 @@ impl Served {
         out
     }
 
+    /// The bytes of a frame of `roots` roots that are not its stubs': its magic, its digest,
+    /// its roots and its two counts, 42 bytes and 32 for each root. A rooted log counts its
+    /// stubs' bytes in its own ([`Log::total_bytes`]) and these in none, so they are what a
+    /// served reply holds past what its store does ([`super::Store::missing_served`]).
+    #[must_use]
+    pub const fn head_len(roots: usize) -> usize {
+        SERVED_MAGIC.len() + size_of::<RecordId>() + 2 + roots * size_of::<RecordId>() + 4
+    }
+
     /// The bytes [`Served::encode`] writes.
     #[must_use]
     pub fn wire_len(&self) -> usize {
-        SERVED_MAGIC.len()
-            + size_of::<RecordId>()
-            + 2
-            + self.roots.len() * size_of::<RecordId>()
-            + 4
-            + self.stubs.values().map(Stub::wire_len).sum::<usize>()
+        Self::head_len(self.roots.len()) + self.stubs.values().map(Stub::wire_len).sum::<usize>()
     }
 
     /// The frame [`Served::encode`] wrote, which is the whole of `bytes`, read as `reading` reads

@@ -251,7 +251,15 @@ pub(super) fn left_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut V
     let scope = q.effective_scope().unwrap_or(ScopeArg::Tab);
     let shown = shown(ctx, view, scope);
     let (held, oldest) = held_count(&shown.rows);
-    let num = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| v.to_string());
+    let oldest_words = oldest.map_or_else(
+        || "-".to_owned(),
+        |ms| {
+            ctx.age_ms.map_or_else(
+                || "unavailable(not_sampled:observation_age)".to_owned(),
+                |age| ms.saturating_add(age).to_string(),
+            )
+        },
+    );
     lines.push(Line {
         key: "summary".into(),
         text: summary_words(&shown.rows, view.complete, held),
@@ -263,10 +271,13 @@ pub(super) fn left_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut V
             "left as_of={} age_ms={} complete={} bounded={} program_check={held} \
              program_check_oldest_ms={}",
             clock_ms(ctx.as_of_unix_ms),
-            ctx.age_ms,
+            ctx.age_ms.map_or_else(
+                || "unavailable(not_sampled:observation_age)".to_owned(),
+                |age| age.to_string()
+            ),
             u8::from(view.complete),
             u8::from(view.bounded),
-            num(oldest.map(|ms| ms.saturating_add(ctx.age_ms))),
+            oldest_words,
         ),
         value: true,
     });
@@ -410,7 +421,12 @@ pub(super) fn left_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
                 "program_check_oldest_ms",
                 oldest.map_or_else(
                     || Jv::why("not_sampled"),
-                    |ms| Jv::u(ms.saturating_add(ctx.age_ms)),
+                    |ms| {
+                        ctx.age_ms.map_or_else(
+                            || Jv::why("not_sampled:observation_age"),
+                            |age| Jv::u(ms.saturating_add(age)),
+                        )
+                    },
                 ),
             ),
         ]),

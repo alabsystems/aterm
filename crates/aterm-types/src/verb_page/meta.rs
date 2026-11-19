@@ -56,8 +56,9 @@ pub(crate) const PAGE: Page = Page {
             "OK title= user_title= description= icon= role= attention= cwd= state= …",
             "then attention_owner= attention_owners= attention_kinds= supervisor= \
              supervisor_proven= stream_epoch= stream_acked= stream_in= stream_dropped= \
-             stream_unknown= stream_unapplied= stream_titles= questions= agent_cwd= trusted_cwd= \
-             worker= autopilot= land_at= autopilot_by= autopilot_since=",
+             stream_unknown= stream_unapplied= stream_titles= stream_took= stream_refused= \
+             questions= agent_cwd= trusted_cwd= worker= autopilot= land_at= autopilot_by= \
+             autopilot_since=",
         ),
         para(
             "Values are percent-encoded; `-` is unset, but `title=` (the tab's title as the \
@@ -85,14 +86,15 @@ pub(crate) const PAGE: Page = Page {
                     "`meta` answers `OK title= user_title= description= icon= role= attention= \
                      cwd= state=` then `attention_owner= attention_owners= attention_kinds= \
                      supervisor= supervisor_proven= stream_epoch= stream_acked= stream_in= \
-                     stream_dropped= stream_unknown= stream_unapplied= stream_titles= questions= \
-                     agent_cwd= trusted_cwd= worker= autopilot= land_at= autopilot_by= \
-                     autopilot_since=` (pct-encoded; `-` is \
+                     stream_dropped= stream_unknown= stream_unapplied= stream_titles= \
+                     stream_took= stream_refused= questions= agent_cwd= trusted_cwd= worker= \
+                     autopilot= land_at= autopilot_by= autopilot_since=` (pct-encoded; `-` is \
                      unset, an unset `title=` is empty; `trusted_cwd=` and `worker=` come from \
                      `spawn agent=<word>`; the `stream_*` words count the claimant's record \
                      stream, `stream @<sid> v=1`: the instance that answered it, the last record \
-                     acknowledged, aterm's last record, and the records dropped, of an unknown \
-                     kind, not applied yet, and titles; the window is in `sessions` and `dims`).",
+                     acknowledged, aterm's last record, the records dropped, of an unknown kind, \
+                     not applied yet, and titles, and aterm's records the harness took and \
+                     refused; the window is in `sessions` and `dims`).",
                 ),
                 para(
                     "`meta set <title|description|icon|role|attention|questions|autopilot> \

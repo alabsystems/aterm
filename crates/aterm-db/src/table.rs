@@ -512,6 +512,7 @@ impl Class {
 }
 
 /// A class's verdict in one read batch ([`ReadBatch::class_verdict`]).
+#[derive(Clone)]
 pub(crate) struct Verdict {
     /// The source is discarded on the batch's control head: a witnessed record of it is
     /// quarantined.
@@ -520,6 +521,7 @@ pub(crate) struct Verdict {
 }
 
 /// Whether a historical writer grant and key open the class's payloads, and under which key.
+#[derive(Clone)]
 enum KeyVerdict {
     /// Granted, under the key this comparison token names.
     Granted(crypto::PayloadKeyIdentity),
@@ -579,6 +581,38 @@ impl ReadBatch<'_, '_> {
             Ok(None) | Err(_) => KeyVerdict::Failed,
         };
         Ok(Verdict { discarded, key })
+    }
+
+    /// [`Self::class_verdict`], asked beside the batch's read and leaving its keys as they were:
+    /// a key the verdict read counts as no further use of it, and a key the verdict alone
+    /// acquired is let go, so the batch's closing checks again exactly the keys its own read
+    /// reused ([`Self::revalidate`]), as it does where no verdict is asked. An open that records
+    /// its classes' verdicts for a sighting (`store::sighting`) asks them so: it verifies what
+    /// the open that records none verifies. The verdict is the one [`Self::class_verdict`]
+    /// gives, of a key checked where it was acquired.
+    ///
+    /// # Errors
+    /// As [`Self::class_verdict`].
+    fn class_verdict_aside(&self, class: &Class) -> Result<Verdict> {
+        let held = self
+            .keys
+            .as_ref()
+            .map(|keys| keys.borrow().get(&class.roster).map(|key| key.reused));
+        let verdict = self.class_verdict(class);
+        if let (Some(keys), Some(held)) = (&self.keys, held) {
+            let mut keys = keys.borrow_mut();
+            match held {
+                Some(reused) => {
+                    if let Some(key) = keys.get_mut(&class.roster) {
+                        key.reused = reused;
+                    }
+                }
+                None => {
+                    keys.remove(&class.roster);
+                }
+            }
+        }
+        verdict
     }
 }
 
@@ -807,6 +841,19 @@ impl<'a> Session<'a> {
             .iter()
             .map(|member| member.binding().actor())
             .collect()
+    }
+
+    /// Every current member's binding, as this session's membership names them: the seats a
+    /// table's checkpoint fence is judged over ([`crate::att::checkpoint::fence`]).
+    pub(crate) fn member_bindings(
+        &self,
+    ) -> impl Iterator<Item = &aterm_secrets::commons::binding::Binding> {
+        self.access.members().iter().map(|member| member.binding())
+    }
+
+    /// The custody this session stands on.
+    pub(crate) const fn bootstrap(&self) -> &'a Bootstrap {
+        self.bootstrap
     }
 
     /// Every current member's binding, for an application that names who has answered.

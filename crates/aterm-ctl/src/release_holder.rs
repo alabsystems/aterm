@@ -12,9 +12,14 @@ pub const ARG: &str = "holder=";
 pub const ROW: &str = "release_holder ";
 
 /// The folder, in the harness state folder, of this host's release-line records: one per holder
-/// that took a line here, written before the claim is published and kept after its holder dies,
-/// so a peer can tell a death from a failed read.
+/// that took a line here, written before the claim is published and kept after its holder dies
+/// for as long as its lease may run for a reader ([`MAX_LEASE_S`]), so a peer can tell a death
+/// from a failed read while it may still ask.
 pub const DIRECTORY: &str = "release-lines";
+
+/// The longest any release line's lease runs unrenewed, whatever p95 its holder's step history
+/// claims: a holder Mac's own `steps.tsv` cannot stretch another Mac's wait past four hours.
+pub const MAX_LEASE_S: u64 = 4 * 3600;
 
 /// The harness state folder under the aterm state root, where `ATERM_HARNESS_STATE` names none.
 const HARNESS_STATE: [&str; 2] = ["harness", "claude-harness"];

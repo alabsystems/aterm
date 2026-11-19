@@ -521,10 +521,14 @@ pub(super) fn convergence_inputs(
 /// rung ([`Supervisor::maintain`]).
 type Upkeep = Arc<dyn Fn() -> Option<Instant> + Send + Sync>;
 
-/// Start only inside the node job's owned startup, after its boot and exclusive lease.
-pub(super) fn node_serve(startup: impl FnOnce() -> Option<aterm_gui::NodeMaintenance>) -> ExitCode {
+/// Start only inside the node job's owned startup, after its boot and exclusive lease, on what
+/// keeping the job's log kept (`kept`).
+pub(super) fn node_serve(
+    startup: impl FnOnce() -> Option<aterm_gui::NodeMaintenance>,
+    kept: aterm_uds::job_log::Kept,
+) -> ExitCode {
     node_serve_with(
-        aterm_gui::run_node_serve_owning,
+        |start| aterm_gui::run_node_serve_owning(start, kept),
         node_background,
         |inputs| match (inputs, startup()) {
             (Some(inputs), Some(commons)) => Some(Arc::new(move || {

@@ -138,7 +138,7 @@ fn a_private_temp_is_never_created_wider_than_0600() {
 fn cmd_shim_content_wraps_target_and_forwards_args() {
     let c = cmd_shim_content(Path::new("C:\\store\\ay\\18\\bin\\ay.exe"));
     let mut want = cmd_frame();
-    want.push_str("@\"C:\\store\\ay\\18\\bin\\ay.exe\" %* & @exit /b\r\n");
+    want.push_str("@\"C:\\store\\ay\\18\\bin\\ay.exe\" %* & @call exit /b %%errorlevel%%\r\n");
     assert_eq!(c, want);
 }
 
@@ -190,7 +190,7 @@ fn cmd_shim_with_env_sets_then_forwards_and_round_trips() {
     let mut want = cmd_frame();
     want.push_str(
         "@set \"DISABLE_AUTOUPDATER=1\"\r\n@set \"B=two words\"\r\n\
-         @\"C:\\store\\claude\\2026082701\\bin\\claude.exe\" %* & @exit /b\r\n",
+         @\"C:\\store\\claude\\2026082701\\bin\\claude.exe\" %* & @call exit /b %%errorlevel%%\r\n",
     );
     assert_eq!(c, want);
     assert_eq!(parse_cmd_shim_target(&c), Some(target.clone()));
@@ -250,19 +250,79 @@ fn windows_backend_lays_and_reads_an_env_shim() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
+/// A `.cmd` SHIM KEEPS ITS PROGRAM'S EXIT CODE, EXECUTED: the plain framed shim and the twin, run
+/// by cmd.exe as a `CreateProcess` caller (PowerShell, `std::process::Command`) runs a batch
+/// file, end with the code the program returned, the program's arguments as they were.
+/// CONTROL: the same shim with the tail laid before ([`CMD_EXIT_FORWARD_TAIL`]) ends 0 whatever
+/// the program returned, the defect the tail fixes.
+#[cfg(windows)]
+#[test]
+fn a_cmd_shim_ends_with_its_programs_exit_code() {
+    let root = crate::testdir::dir("atpkg-cmd-exit-");
+    let program = root.join("prog.exe");
+    std::fs::copy(aterm_tempfile::bin_exe("atpkg-status-fixture"), &program).unwrap();
+    let record = root.join("record");
+    std::fs::create_dir_all(&record).unwrap();
+    let run = |body: &str, code: &str| {
+        let shim = root.join("prog.cmd");
+        std::fs::write(&shim, body).unwrap();
+        let _ = std::fs::remove_file(record.join("prog.argv"));
+        let status = aterm_uds::spawnfd::command(&shim)
+            .args(["a b", "100%", "c&d"])
+            .env("ATPKG_ARGV_FIXTURE", &record)
+            .env("ATPKG_ARGV_FIXTURE_EXIT_PROG", code)
+            .output()
+            .unwrap()
+            .status
+            .code();
+        assert_eq!(
+            std::fs::read_to_string(record.join("prog.argv")).unwrap(),
+            "a b\0100%\0c&d\0"
+        );
+        status
+    };
+    let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+    for body in [
+        cmd_shim_content(&program),
+        cmd_shim_content_twin(&program, &env, ""),
+    ] {
+        assert_eq!(run(&body, "37"), Some(37), "{body}");
+        assert_eq!(run(&body, "0"), Some(0), "{body}");
+        assert_eq!(run(&body, "1"), Some(1), "{body}");
+    }
+    let laid_before = cmd_framed(&format!(
+        "@\"{}\"{CMD_EXIT_FORWARD_TAIL}\r\n",
+        program.display()
+    ));
+    assert_eq!(
+        run(&laid_before, "37"),
+        Some(0),
+        "control: the tail laid before ends 0"
+    );
+}
+
 #[test]
 fn parse_cmd_shim_target_keys_on_the_forward_tail_and_reads_the_legacy_one() {
     assert_eq!(parse_cmd_shim_target("not a shim\r\n"), None);
     assert_eq!(parse_cmd_shim_target(""), None);
     let target = PathBuf::from("C:\\a.exe");
     assert_eq!(
-        parse_cmd_shim_target("@\"C:\\a.exe\" %* & @exit /b\r\n"),
+        parse_cmd_shim_target("@\"C:\\a.exe\" %* & @call exit /b %%errorlevel%%\r\n"),
         Some(target.clone())
     );
     assert_eq!(
+        parse_cmd_shim_target("@\"C:\\a.exe\" %* & @exit /b\r\n"),
+        Some(target.clone()),
+        "the forward laid before the exit code was kept still resolves until it is re-laid"
+    );
+    assert_eq!(
         parse_cmd_shim_target("@\"C:\\a.exe\" %*\r\n"),
-        Some(target),
+        Some(target.clone()),
         "a legacy shim still resolves until it is re-laid"
+    );
+    assert_eq!(
+        cmd_forward_target("  @\"C:\\a.exe\" %* & @call exit /b %%errorlevel%%  "),
+        Some(target)
     );
     for not_a_forward in [
         "@\"C:\\a.exe\"\r\n",
@@ -270,6 +330,9 @@ fn parse_cmd_shim_target_keys_on_the_forward_tail_and_reads_the_legacy_one() {
         "@\"C:\\a.exe\" %* & @exit /b 3\r\n",
         "@\"C:\\a.exe\" %* & exit /b\r\n",
         "@\"C:\\a.exe\" %*& @exit /b\r\n",
+        "@\"C:\\a.exe\" %* & @call exit /b %errorlevel%\r\n",
+        "@\"C:\\a.exe\" %* & @call exit /b\r\n",
+        "@\"C:\\a.exe\" --settings %__atpkg_tap% %* & @call exit /b %%errorlevel%%\r\n",
         "@\"C:\\a.exe\" __landing \"claude\" \"C:\\pkg\" -- %* & @exit /b\r\n",
     ] {
         assert_eq!(
@@ -307,7 +370,7 @@ fn a_legacy_cmd_twin_with_the_landing_prelude_still_resolves_to_the_store() {
     want.push_str("@set \"DISABLE_AUTOUPDATER=1\"\r\n");
     want.push_str(
         "@\"C:\\Program Files (x86)\\aterm\\pkg\\store\\claude\\2026091601\\bin\\claude.exe\" \
-         %* & @exit /b\r\n",
+         %* & @call exit /b %%errorlevel%%\r\n",
     );
     assert_eq!(twin, want);
     for line in twin.split("\r\n").filter(|l| !l.is_empty()) {
@@ -321,7 +384,9 @@ fn a_legacy_cmd_twin_with_the_landing_prelude_still_resolves_to_the_store() {
         );
         if line.starts_with("@\"") {
             assert!(
-                line.ends_with(CMD_FORWARD_TAIL),
+                line.ends_with(CMD_FORWARD_TAIL)
+                    || (line.contains(crate::landing::HIDDEN_VERB)
+                        && line.ends_with(CMD_EXIT_FORWARD_TAIL)),
                 "ends the batch on the line that runs the program: {line}"
             );
         } else {
@@ -330,13 +395,20 @@ fn a_legacy_cmd_twin_with_the_landing_prelude_still_resolves_to_the_store() {
                 "no exit line of its own past the frame's: {line}"
             );
         }
-        assert!(!line.starts_with("@call"), "no call: {line}");
+        assert!(!line.starts_with("@call"), "no call of its own: {line}");
     }
-    assert!(!twin.contains("errorlevel"), "{twin}");
     assert_eq!(
-        twin.matches(" & @exit /b").count(),
-        2,
-        "the hand-over and the forward, each ending the batch: {twin}"
+        twin.matches("errorlevel").count(),
+        1,
+        "the forward's exit code alone: {twin}"
+    );
+    assert_eq!(
+        (
+            twin.matches(" & @exit /b").count(),
+            twin.matches(CMD_FORWARD_TAIL).count()
+        ),
+        (1, 1),
+        "the legacy hand-over as it was laid and the forward, each ending the batch: {twin}"
     );
     assert_eq!(
         twin.matches("\r\n@exit /b\r\n").count(),
@@ -373,7 +445,7 @@ fn a_legacy_cmd_twin_with_the_landing_prelude_still_resolves_to_the_store() {
         PathBuf::from("/usr/local/aterm/atpkg")
     );
     assert!(twin.find("__landing").unwrap() < twin.find("@set ").unwrap());
-    assert!(twin.trim_end().ends_with("\" %* & @exit /b"));
+    assert!(twin.trim_end().ends_with(&format!("\"{CMD_FORWARD_TAIL}")));
     assert!(!cmd_shim_content_env(target, &env).contains("__landing"));
     assert_eq!(
         cmd_shim_content_twin(target, &env, ""),
@@ -414,7 +486,8 @@ fn the_cmd_twin_renders_no_prelude_and_is_the_plain_framed_shim() {
         cmd_shim_content_env(target, &env),
         "the plain framed shim"
     );
-    assert_eq!(twin.matches(" & @exit /b").count(), 1, "{twin}");
+    assert_eq!(twin.matches(CMD_FORWARD_TAIL).count(), 1, "{twin}");
+    assert_eq!(twin.matches(" & @exit /b").count(), 0, "{twin}");
     assert_eq!(twin.matches("\r\n@exit /b\r\n").count(), 1, "{twin}");
     assert!(!twin.contains("%~1"), "{twin}");
     assert!(!twin.contains(crate::selfupdate::HIDDEN_VERB), "{twin}");

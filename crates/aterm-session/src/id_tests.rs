@@ -8,8 +8,29 @@ fn a_minted_sid_parses_and_a_chosen_name_does_not() {
     for _ in 0..64 {
         assert!(SessionId::generate().is_minted());
     }
+    for (text, current) in [("tqn5r6e0148", true), ("s-0123456789abcdef0123", false)] {
+        let id = SessionId::parse(text).expect("a current or exact legacy session ID");
+        assert_eq!(id.as_str(), text);
+        assert!(id.is_minted() && is_minted_sid(text));
+        assert_eq!(
+            id.tab().is_some(),
+            current,
+            "only the current form is a TabId"
+        );
+        assert_eq!(
+            aterm_types::control_request::Sid::parse(text).map(|id| id.as_str()),
+            Some(text),
+            "the local request reader recognizes both forms"
+        );
+        assert_eq!(
+            aterm_types::control_verbs::is_minted_sid(text),
+            current,
+            "fleet requester IDs recognize only the current form: {text}"
+        );
+    }
     for chosen in [
         "harness",
+        "worker",
         "ctl",
         "human",
         "s-1",
@@ -17,40 +38,21 @@ fn a_minted_sid_parses_and_a_chosen_name_does_not() {
         "s-0123456789ABCDEF0123",
         "s-0123456789abcdef01234",
         "x-0123456789abcdef0123",
-        "",
-    ] {
-        assert!(!is_minted_sid(chosen), "{chosen}");
-    }
-    assert!(is_minted_sid("s-0123456789abcdef0123"));
-    assert!(is_minted_sid("tqn5r6e0148"), "the `t` form reads too");
-    assert_eq!(
-        SessionId::parse("tqn5r6e0148").map(|id| id.to_string()),
-        Some("tqn5r6e0148".to_owned())
-    );
-    assert_eq!(
-        SessionId::parse("s-0123456789abcdef0123").map(|id| id.to_string()),
-        Some("s-0123456789abcdef0123".to_owned())
-    );
-    for chosen in ["s-1", "s-boss", "tqn5r6e014", "Tqn5r6e0148", "worker"] {
-        assert_eq!(SessionId::parse(chosen), None, "NEGATIVE CONTROL: {chosen}");
-    }
-    // Local sessions and requester metadata share the exact canonical-or-legacy grammar.
-    for s in [
-        "s-0123456789abcdef0123",
-        "tqn5r6e0148",
-        "s-1",
+        "tqn5r6e014",
+        "Tqn5r6e0148",
         "tqn5r6e014u",
         "",
     ] {
+        assert!(!is_minted_sid(chosen), "{chosen}");
+        assert_eq!(SessionId::parse(chosen), None, "{chosen}");
         assert_eq!(
-            is_minted_sid(s),
-            aterm_types::control_request::Sid::parse(s).is_some(),
-            "{s}"
+            aterm_types::control_request::Sid::parse(chosen),
+            None,
+            "{chosen}"
         );
-        assert_eq!(
-            aterm_types::control_verbs::is_minted_sid(s),
-            is_minted_sid(s),
-            "{s}"
+        assert!(
+            !aterm_types::control_verbs::is_minted_sid(chosen),
+            "{chosen}"
         );
     }
     assert!(

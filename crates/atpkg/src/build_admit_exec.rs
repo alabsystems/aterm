@@ -3,12 +3,13 @@
 
 //! A FRONT BECOMES ITS BUILD AS A SHELL'S EXEC WOULD HAVE STARTED IT (BUILD-ADMIT): the front's
 //! exec hands the build this process's pid, descriptors, environment, limits, mask and signal
-//! dispositions, and the front must change none of them. Two of those the front's own runtime
+//! dispositions, applying only its explicit child environment additions. The front otherwise
+//! changes none of them. Two of those the front's own runtime
 //! changed before its `main`: Rust's start ignores SIGPIPE (an exec keeps an ignored signal
 //! ignored), and std's exec then sets SIGPIPE back to its default and empties the signal mask,
 //! whatever the front was started with. So each signal's disposition and the mask are read at
 //! load, before the runtime starts ([`INHERITED`]), and put back just before the exec, which is a
-//! plain `execv` of this process's own environment: an inherited ignored SIGPIPE or SIGINT (a
+//! plain `execv` where no child environment changes: an inherited ignored SIGPIPE or SIGINT (a
 //! background job's) and an inherited blocked signal reach the build as they reached the front.
 //! The front's admission wait catches SIGINT, SIGTERM, SIGHUP and SIGQUIT while it waits
 //! (`aterm_toolchain::interrupt`), so what it puts back must be what it was started with, not
@@ -30,7 +31,8 @@
 //! after the gate's bound, does not exec (`Stayed::Reading`): its caller runs the build as the
 //! front's child, which ends no thread of the front.
 
-use std::ffi::{CString, OsStr};
+use std::collections::BTreeMap;
+use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -110,7 +112,8 @@ fn put_back() -> bool {
 /// BECOME `target` run on `args`, as this process was started: its signal state put back
 /// ([`put_back`]), then `execv` with this process's environment and descriptors (each one this
 /// process opened is close-on-exec), or `execve` with that environment and
-/// [`aterm_capacity::COVER_ENV`] set to `marker` where one is given. Where the load-time read did
+/// the explicit child environment overlaid. [`aterm_capacity::COVER_ENV`] is set to `marker`
+/// where one is given, after the other additions. Where the load-time read did
 /// not run, std's exec does it, which hands the build SIGPIPE at its default and an empty mask.
 /// Returns only when this process is still the front: the exec failed ([`Stayed::Failed`]), or
 /// (macOS) was not made because a thread of this process is still in a process-table read
@@ -119,6 +122,29 @@ pub(crate) fn become_build<A: AsRef<OsStr>>(
     target: &Path,
     args: &[A],
     marker: Option<&str>,
+    environment: &[(OsString, OsString)],
+) -> Stayed {
+    exec_target(target, args, marker, environment, false)
+}
+
+/// The public claim takes a command word. Search PATH for a bare word and preserve the
+/// caller's original argv[0]. A shim's selected tool uses the exact-path entry above.
+#[cfg(target_os = "macos")]
+pub(super) fn become_command(
+    target: &Path,
+    args: &[OsString],
+    marker: &str,
+    environment: &[(OsString, OsString)],
+) -> Stayed {
+    exec_target(target, args, Some(marker), environment, true)
+}
+
+fn exec_target<A: AsRef<OsStr>>(
+    target: &Path,
+    args: &[A],
+    marker: Option<&str>,
+    environment: &[(OsString, OsString)],
+    search: bool,
 ) -> Stayed {
     let words: Option<Vec<CString>> = std::iter::once(target.as_os_str())
         .chain(args.iter().map(AsRef::as_ref))
@@ -130,27 +156,38 @@ pub(crate) fn become_build<A: AsRef<OsStr>>(
             "a word holds a NUL byte",
         ));
     };
-    let env = marker.map(|marker| {
-        let mut set = false;
-        let mut env: Vec<CString> = std::env::vars_os()
-            .filter_map(|(k, v)| {
-                let v = if k == aterm_capacity::COVER_ENV {
-                    set = true;
-                    OsStr::new(marker).to_owned()
-                } else {
-                    v
-                };
-                let mut entry = k.into_vec();
-                entry.push(b'=');
-                entry.extend_from_slice(v.as_bytes());
-                CString::new(entry).ok()
-            })
-            .collect();
-        if !set && let Ok(entry) = CString::new(format!("{}={marker}", aterm_capacity::COVER_ENV)) {
-            env.push(entry);
+    let env = if environment.is_empty() && marker.is_none() {
+        None
+    } else {
+        let mut additions: BTreeMap<OsString, OsString> = environment.iter().cloned().collect();
+        if let Some(marker) = marker {
+            additions.insert(aterm_capacity::COVER_ENV.into(), marker.into());
         }
-        env
-    });
+        let mut entries = Vec::new();
+        for (key, value) in std::env::vars_os() {
+            let value = additions.remove(&key).unwrap_or(value);
+            entries.push((key, value));
+        }
+        entries.extend(additions);
+        let encoded = entries
+            .into_iter()
+            .map(|(key, value)| {
+                let mut entry = key.into_vec();
+                entry.push(b'=');
+                entry.extend_from_slice(value.as_bytes());
+                CString::new(entry)
+            })
+            .collect::<Result<Vec<_>, _>>();
+        match encoded {
+            Ok(env) => Some(env),
+            Err(_) => {
+                return Stayed::Failed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a child environment entry holds a NUL byte",
+                ));
+            }
+        }
+    };
     #[cfg(target_os = "macos")]
     let closed = match aterm_sysprobe::exec_gate::close(aterm_sysprobe::exec_gate::SETTLES_WITHIN) {
         Ok(closed) => closed,
@@ -164,6 +201,9 @@ pub(crate) fn become_build<A: AsRef<OsStr>>(
         let mut command = std::process::Command::new(target);
         aterm_uds::spawn::set_flags(&mut command, 0);
         command.args(args);
+        for (key, value) in environment {
+            command.env(key, value);
+        }
         if let Some(marker) = marker {
             command.env(aterm_capacity::COVER_ENV, marker);
         }
@@ -174,33 +214,61 @@ pub(crate) fn become_build<A: AsRef<OsStr>>(
     }
     let mut argv: Vec<*const libc::c_char> = words.iter().map(|w| w.as_ptr()).collect();
     argv.push(std::ptr::null());
-    match &env {
-        None => {
-            // SAFETY: `words[0]` and `argv` are NUL-terminated and live across the call, `argv`
-            // ending in a null pointer; `execv` returns only on failure.
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the exec gate is closed above on macOS (`closed`), where an exec could wait on a process-table read"
-            )]
-            unsafe {
-                libc::execv(words[0].as_ptr(), argv.as_ptr())
-            };
+    let search = search && !target.as_os_str().as_bytes().contains(&b'/');
+    let candidates = if search {
+        let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
+        std::env::split_paths(&path)
+            .map(|dir| CString::new(dir.join(target).as_os_str().as_bytes()).expect("Unix path"))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let candidates = if search {
+        candidates.as_slice()
+    } else {
+        &words[..1]
+    };
+    let envp = env.as_ref().map(|env| {
+        let mut pointers: Vec<_> = env.iter().map(|e| e.as_ptr()).collect();
+        pointers.push(std::ptr::null());
+        pointers
+    });
+    let mut err = std::io::Error::from_raw_os_error(libc::ENOENT);
+    for candidate in candidates {
+        match &envp {
+            None => {
+                // SAFETY: `candidate` and `argv` are NUL-terminated and live across the call, `argv`
+                // ending in a null pointer; `execv` returns only on failure.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the exec gate is closed above on macOS (`closed`), where an exec could wait on a process-table read"
+                )]
+                unsafe {
+                    libc::execv(candidate.as_ptr(), argv.as_ptr())
+                };
+            }
+            Some(envp) => {
+                // SAFETY: as for `execv`, and `envp` likewise: NUL-terminated entries, live, ending
+                // in a null pointer.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the exec gate is closed above on macOS (`closed`), where an exec could wait on a process-table read"
+                )]
+                unsafe {
+                    libc::execve(candidate.as_ptr(), argv.as_ptr(), envp.as_ptr())
+                };
+            }
         }
-        Some(env) => {
-            let mut envp: Vec<*const libc::c_char> = env.iter().map(|e| e.as_ptr()).collect();
-            envp.push(std::ptr::null());
-            // SAFETY: as for `execv`, and `envp` likewise: NUL-terminated entries, live, ending
-            // in a null pointer.
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the exec gate is closed above on macOS (`closed`), where an exec could wait on a process-table read"
-            )]
-            unsafe {
-                libc::execve(words[0].as_ptr(), argv.as_ptr(), envp.as_ptr())
-            };
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR) if search => {}
+            Some(libc::EACCES) if search => err = error,
+            _ => {
+                err = error;
+                break;
+            }
         }
     }
-    let err = std::io::Error::last_os_error();
     #[cfg(target_os = "macos")]
     drop(closed);
     Stayed::Failed(err)

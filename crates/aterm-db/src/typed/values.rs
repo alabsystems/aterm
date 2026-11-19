@@ -9,7 +9,7 @@
 //! the 1,121 packages of publication 384b3a9f (§7, finding 13). A rule names no part of the
 //! value.
 
-use super::{guard, keys, pk_grammar};
+use super::{Link, Named, guard, keys, pk_grammar};
 use aterm_json::{Map, Value};
 
 /// Longest repository path.
@@ -137,8 +137,28 @@ fn word(text: &str) -> bool {
         && !guard::secret_shaped(text)
 }
 
-/// Whether `text` names a Mac: its `m<N>` label, or its 32-digit Commons machine uuid.
-fn mac(text: &str) -> bool {
+/// Check the text of a link to a row of another table family ([`Link`], design §4.6): the
+/// row's key, in the key grammar and no secret, or for a machine its 32-digit Commons machine
+/// uuid, lower-case hex. Whether the family holds that row is not read here: no table holds
+/// another family's rows, and the link check follows it (TK-07).
+///
+/// # Errors
+/// The rule it breaks.
+pub fn link(link: &Link, text: &str) -> Result<(), &'static str> {
+    match link.named {
+        Named::Key => (pk_grammar(text) && guard::word(text).is_ok())
+            .then_some(())
+            .ok_or("a link names its row by the row's key"),
+        Named::Machine => (text.len() == 32 && keys::parse_uuid32(text).is_some())
+            .then_some(())
+            .ok_or("a link names a machine by its 32-digit machine uuid"),
+    }
+}
+
+/// Whether `text` names a principal's machine: its 32-digit Commons machine uuid, the text of a
+/// link to a registry machine ([`link`], [`Named::Machine`]), or its `m<N>` label, which the
+/// tracker's free-text records name a machine by and the link check refuses (TK-07).
+fn machine(text: &str) -> bool {
     keys::is_label(text) || (text.len() == 32 && keys::parse_uuid32(text).is_some())
 }
 
@@ -146,15 +166,17 @@ fn mac(text: &str) -> bool {
 /// from the process tree, and what the program says of itself (its model, account and
 /// harness), which is the program's own claim and only that. A record imported from a system
 /// that kept a name as free text keeps it as `said` (`s595dac on m18`, `planning session`).
-/// The Mac that signs the record is the record's own; `mac` is the one the principal acted on.
+/// The Mac that signs the record is the record's own; `machine` is the one the principal acted
+/// on.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Principal {
     /// The aterm session: its id (`s-47051b9a207955a92b14`, `15`).
     pub session: Option<String>,
     /// The program that made the change (`claude`, `codex-alab`, `person`, `import`).
     pub program: Option<String>,
-    /// The Mac: its label or its machine uuid.
-    pub mac: Option<String>,
+    /// The machine: its machine uuid, the text of a link to a registry machine
+    /// ([`super::Named::Machine`]), or its label.
+    pub machine: Option<String>,
     /// The program's claim: its account, a registry account key.
     pub account: Option<String>,
     /// The program's claim: its model.
@@ -167,7 +189,7 @@ pub struct Principal {
 
 /// A principal's members, in the order a value spells them.
 const PRINCIPAL_MEMBERS: [&str; 7] = [
-    "session", "program", "mac", "account", "model", "harness", "said",
+    "session", "program", "machine", "account", "model", "harness", "said",
 ];
 
 impl Principal {
@@ -184,7 +206,7 @@ impl Principal {
         [
             ("session", self.session.as_ref()),
             ("program", self.program.as_ref()),
-            ("mac", self.mac.as_ref()),
+            ("machine", self.machine.as_ref()),
             ("account", self.account.as_ref()),
             ("model", self.model.as_ref()),
             ("harness", self.harness.as_ref()),
@@ -214,7 +236,7 @@ impl Principal {
         Ok(Self {
             session: get("session"),
             program: get("program"),
-            mac: get("mac"),
+            machine: get("machine"),
             account: get("account"),
             model: get("model"),
             harness: get("harness"),
@@ -224,8 +246,8 @@ impl Principal {
 }
 
 /// Check a principal's value: an object of [`Principal`]'s members and no other, naming a
-/// session, a program or what an imported record said; each word in its grammar, the Mac a
-/// label or machine uuid, the account a registry key, and `said` the tracker's prose of at most
+/// session, a program or what an imported record said; each word in its grammar, the machine
+/// a label or machine uuid, the account a registry key, and `said` the tracker's prose of at most
 /// [`MAX_SAID`] bytes.
 ///
 /// # Errors
@@ -241,14 +263,14 @@ pub fn principal(x: &Value) -> Result<(), &'static str> {
     for (name, member) in object {
         let text = member.as_str().ok_or("a principal's members are text")?;
         let ok = match name.as_str() {
-            "mac" => mac(text),
+            "machine" => machine(text),
             "account" => pk_grammar(text) && !guard::secret_shaped(text),
             "said" => !text.trim().is_empty() && guard::prose(text, MAX_SAID).is_ok(),
             _ => word(text),
         };
         if !ok {
             return Err(match name.as_str() {
-                "mac" => "a principal's Mac is its label or machine uuid",
+                "machine" => "a principal's machine is its label or machine uuid",
                 "account" => "a principal's account is a registry key",
                 "said" => "what a principal said is prose of at most 256 bytes",
                 _ => "a principal's session, program, model and harness are words",

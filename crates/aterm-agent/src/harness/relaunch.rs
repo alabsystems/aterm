@@ -48,7 +48,7 @@ mod native_gate_tests;
 
 #[cfg(all(test, unix))]
 #[path = "relaunch_native_plan_tests.rs"]
-mod native_plan_tests;
+pub(super) mod native_plan_tests;
 
 /// A relaunch planned from the live process.
 pub(super) struct Plan {
@@ -59,11 +59,19 @@ pub(super) struct Plan {
     /// recorded when the line is typed ([`note_dropped`]).
     pub(super) tap_dropped: Option<String>,
     /// Why [`Self::line`] does not carry the token wrapper its judgment offered it
-    /// ([`token_route::judge`]): it did not fit once the tap went, or the account's selection
-    /// policy refused the move onto the token while the stored login's line keeps the replaced
-    /// process's credential ([`stored_in_place`]). Recorded when the line is typed
-    /// ([`note_dropped`]).
+    /// ([`token_route::judge`]): it did not fit once the tap went, or the line stays on a stored
+    /// login because the account's selection policy refused the move onto the token or a
+    /// coordinated upgrade's physical build carries no wrapper, with the login that line carries
+    /// ([`stored_in_place`]). Recorded when the line is typed ([`note_dropped`]).
     pub(super) token_dropped: Option<String>,
+    /// What [`Self::line`] carries in place of the login its launch names, where that is one its
+    /// account's row left ([`rebind_of`]); `None` where the line keeps the launch's login.
+    /// [`stored_in_place`] names it in [`Self::token_dropped`].
+    pub(super) rebind: Option<super::accounts_pool::Rebind>,
+    /// What a coordinated upgrade's line did with the blocks of the twin it projected to its
+    /// build ([`atpkg::platform::native_claude_restart`]): `None` for a line that projected no
+    /// twin. Recorded when the line is typed ([`note_projected`]).
+    pub(super) twin_projected: Option<String>,
     /// The directory [`Self::line`] runs the agent in when it carries no `cd` of its own: the
     /// agent's, where the shell stood when the line was planned (`None`: the line carries its own
     /// `cd`, or no directory was read). The record keeps it ([`St::line_dir`]), and the line typed
@@ -168,6 +176,8 @@ struct SelectedCommand {
     env: Vec<(String, String)>,
     tap_dropped: Option<String>,
     token_dropped: Option<String>,
+    /// The blocks of the twin a coordinated upgrade's line projected ([`Plan::twin_projected`]).
+    twin_projected: Option<String>,
     /// The token entry the line serves through the wrapper, where it carries it.
     served: Option<accounts::TokenEntry>,
 }
@@ -238,6 +248,9 @@ impl TokenServe {
 pub(super) enum NoPlan {
     /// A fact this pass could not read (one word).
     Wait(&'static str),
+    /// A wait whose word cannot say which check held it: the word, and the reason in full, which
+    /// [`unplanned`] notes in aterm.log and the record's wait log ([`St::note_wait_why`]).
+    Noted { word: &'static str, why: String },
     /// The command's account admission refused ([`command_account`]): the wait its kind names
     /// ([`super::accounts_pool::RefusalKind::word`]), with the reason in full.
     Account(super::accounts_pool::Refusal),
@@ -287,8 +300,11 @@ pub(super) struct Launch<'a> {
     /// The credential the live process this line replaces runs on, read off that process
     /// ([`Running`]); `None` where the line replaces no running process (a relaunch after its
     /// agent exited). A plan whose line keeps it exactly captures a
-    /// [`super::accounts_pool::Purpose::SameLogin`] intent, any other a
-    /// [`super::accounts_pool::Purpose::Select`] one ([`purpose_of`]).
+    /// [`super::accounts_pool::Purpose::SameLogin`] intent, one whose line moves it off a login
+    /// its account's row left onto that row's current one a
+    /// [`super::accounts_pool::Purpose::Rebind`] intent, any other a
+    /// [`super::accounts_pool::Purpose::Select`] one ([`purpose_of`]). A plan rebinds the line,
+    /// never this: it is what the replaced process runs on.
     pub(super) running: Option<Running<'a>>,
     /// The authentication route was positively observed, rather than omitted by a legacy record.
     pub(super) auth_observed: bool,
@@ -447,6 +463,31 @@ fn plan_with_selection(
         launch.cwd.to_string()
     };
     let cd = (!want.is_empty() && !same_dir(cwd_of(shell).as_deref(), &want)).then(|| want.clone());
+    let at = LineAt {
+        dialect,
+        heal: heal.as_deref(),
+        cd: cd.as_deref(),
+        want: &want,
+        native_upgrade,
+    };
+    // A login its account's row left for a newer one is never run again: the line carries the
+    // row's current login, or the pool's pick where that is not signed in here ([`rebind_of`]). A
+    // cold plan's helper rebinds by the same rule when it resolves its account. `asked` keeps the
+    // launch as asked, which [`purpose_of`] and a stored-login plan ([`stored_in_place`]) read.
+    let asked = launch;
+    let rebind = if cold.is_some() {
+        None
+    } else {
+        rebind_of(opts, asked, &at)?
+    };
+    let rebound = Launch {
+        login: rebind
+            .as_ref()
+            .map(|rebind| rebind.login().value.as_deref().unwrap_or(""))
+            .or(asked.login),
+        ..*asked
+    };
+    let launch = &rebound;
     let required = required_env(launch.home, launch.homedir, launch.login);
     // The folder's trust under the Claude home this line names, settled before the line is
     // built: a dry run starts nothing.
@@ -461,49 +502,39 @@ fn plan_with_selection(
             },
         );
     }
-    let tap = opts
-        .usage_tap
-        .as_ref()
-        .and_then(|armed| tap_of(opts, launch, armed, &want));
-    // The one judgment (§5.3): a token decision types the wrapper before the store build. A cold
-    // plan's route is resolved by its own helper, after this.
-    let token = match launch.serve {
-        Serve::Judge | Serve::Must if cold.is_none() => token_serve(opts, launch, &want),
-        Serve::Judge | Serve::Must | Serve::Never => None,
-    };
-    // No inherited token state where the replaced process ran on its vault token: a line on the
-    // stored login carries neither the descriptor nor the marker (§5.4). A line that serves the
-    // token unsets neither (its `served_unset` is `None`), since the wrapper makes both afresh,
-    // and any line after another route keeps the length it had, so its usage tap still fits
-    // Darwin's cap.
-    let unset: Option<Vec<&str>> = match launch.route {
-        accounts::AuthRoute::VaultToken { .. } => Some(token_route::TOKEN_STATE_ENV.to_vec()),
-        accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => None,
-    };
-    // A cold restart execs what its command names and holds the child to that image, and a script
-    // twin's exec maps its build: named the twin, the agent runs and its outcome never matches.
-    let cold_build = cold.as_ref().and_then(|_| managed_twin_build(launch.exe));
-    let selected = line_tap_selected(
-        dialect,
-        heal.as_deref(),
-        cd.as_deref(),
-        cold_build.as_deref().unwrap_or(launch.exe),
-        launch.argv,
-        launch.resume.then_some(launch.session),
-        launch.mode,
-        &required,
-        unset.as_deref(),
-        None,
-        tap.as_deref(),
-        native_upgrade,
-        token.as_ref(),
-    )?;
-    // What the selected line unsets, which the command's capture renders again.
-    let unset = if selected.served.is_some() {
-        None
-    } else {
-        unset
-    };
+    // The one judgment (§5.3) of the line's vault token, read before its line is selected and
+    // the same one the pool's pick reads for each row ([`line_serves_token`]).
+    let judged = line_judged(opts, launch, &at, cold.is_some());
+    // A coordinated upgrade execs the physical build, which no wrapper stands before: a token its
+    // judgment found in use cannot serve that line. Where the agent it replaces runs on its stored
+    // login, the line stays on a stored login, as a move whose selection policy refused the
+    // token does ([`stored_in_place`], planned again from the launch as asked, so its own plan
+    // rebinds a login its row left as this one does, and its reason names the login it carries):
+    // the same route, admitted as any stored line is. An agent on its vault token is never moved
+    // onto its stored login by an upgrade:
+    // that changes its credential, which no move of the build may, so its move waits
+    // `native-token-policy`, as one that must serve the token does.
+    if native_upgrade
+        && launch.serve == Serve::Judge
+        && matches!(judged, TokenJudged::Serve(_) | TokenJudged::Unserved)
+    {
+        if !launch
+            .running
+            .is_some_and(|running| matches!(running.route, accounts::AuthRoute::Stored))
+        {
+            return Err(NoPlan::Wait("native-token-policy"));
+        }
+        return stored_in_place(
+            opts,
+            asked,
+            shell,
+            t,
+            native_upgrade,
+            kernel,
+            NATIVE_TOKEN_DROPPED.to_string(),
+        );
+    }
+    let (selected, unset) = selected_line(opts, launch, &at, cold.is_some(), judged)?;
     if launch.serve == Serve::Must && selected.served.is_none() {
         return Err(NoPlan::Refused {
             why: ROUTE_UNSERVED.to_string(),
@@ -548,11 +579,25 @@ fn plan_with_selection(
         // observed route before Resolve selects and captures its account intent.
         None
     } else {
-        let purpose = purpose_of(launch, &selected_launch);
+        let purpose = purpose_of(asked, &selected_launch, rebind.as_ref());
         let mut intent = match command_account(opts, &selected_launch, purpose) {
             Ok(intent) => intent,
-            Err(refusal) if token_move_refused(launch, &selected, &refusal) => {
-                return stored_in_place(opts, launch, shell, t, native_upgrade, kernel, &refusal);
+            Err(refusal) if token_move_refused(asked, &selected, &refusal) => {
+                return stored_in_place(
+                    opts,
+                    asked,
+                    shell,
+                    t,
+                    native_upgrade,
+                    kernel,
+                    format!(
+                        "the token wrapper left this relaunch line: moving onto the vault token \
+                         selects its account, which waits {} ({}), so the line stays on a stored \
+                         login",
+                        refusal.kind.word(),
+                        refusal.why
+                    ),
+                );
             }
             Err(refusal) => return Err(NoPlan::Account(refusal)),
         };
@@ -566,6 +611,8 @@ fn plan_with_selection(
         line: selected.line,
         tap_dropped: selected.tap_dropped,
         token_dropped: selected.token_dropped,
+        rebind,
+        twin_projected: selected.twin_projected,
         line_dir: (cd.is_none() && !want.is_empty()).then_some(want),
         command: Some(PlannedCommand {
             dialect,
@@ -578,6 +625,101 @@ fn plan_with_selection(
             account_intent,
         }),
     })
+}
+
+/// Where a relaunch line is typed: its shell's `dialect`, the hook file it heals (`heal`), the
+/// folder it starts in (`want`) and the `cd` into it where the shell is elsewhere, and whether it
+/// is a coordinated native upgrade's (`native_upgrade`).
+#[derive(Clone, Copy)]
+struct LineAt<'a> {
+    dialect: Dialect,
+    heal: Option<&'a Path>,
+    cd: Option<&'a str>,
+    want: &'a str,
+    native_upgrade: bool,
+}
+
+/// The one judgment (§5.3, [`token_serve`]) of the vault token of a relaunch line of `launch`
+/// typed `at` its shell: where `launch` may serve the token, the judgment itself; for a line on
+/// the stored login ([`Serve::Never`]), off ([`atpkg::platform::TokenBlock::JudgedOff`]), the
+/// witness under which a twin's token block projects as its as-typed arm; never for a `cold`
+/// plan, whose route its own helper resolves after this ([`TokenJudged::Unjudged`]). The plan
+/// reads it, and the pool's pick in place of a row that left the login reads it for each row
+/// ([`line_serves_token`]), so both select by the same judgment.
+fn line_judged(opts: &Opts, launch: &Launch<'_>, at: &LineAt<'_>, cold: bool) -> TokenJudged {
+    match launch.serve {
+        Serve::Judge | Serve::Must if !cold => token_serve(opts, launch, at.want),
+        Serve::Never if !cold => TokenJudged::Off(atpkg::platform::TokenBlock::JudgedOff),
+        Serve::Judge | Serve::Must | Serve::Never => TokenJudged::Unjudged,
+    }
+}
+
+/// The line a relaunch of `launch` types `at` its shell ([`line_tap_selected`], under Darwin's
+/// line budget: the usage tap leaves first, then the token wrapper, and the line is then the
+/// stored login's), with the token state it unsets. `judged` is the one judgment of its token
+/// ([`line_judged`]): a token it serves offers the wrapper, and a judgment that found it off is
+/// the witness a twin's token block projects under. A `cold` plan types the managed twin's build
+/// ([`managed_twin_build`]): a cold restart execs what its command names and holds the child to
+/// that image, and a script twin's exec maps its build, so a line naming the twin never matches
+/// its outcome. The plan types this line, and the pool's pick in place of a row that left the
+/// login judges each row by the line it would type ([`line_serves_token`]).
+///
+/// # Errors
+/// As [`line_tap_selected`].
+fn selected_line(
+    opts: &Opts,
+    launch: &Launch<'_>,
+    at: &LineAt<'_>,
+    cold: bool,
+    judged: TokenJudged,
+) -> Result<(SelectedCommand, Option<Vec<&'static str>>), NoPlan> {
+    let required = required_env(launch.home, launch.homedir, launch.login);
+    let tap = opts
+        .usage_tap
+        .as_ref()
+        .and_then(|armed| tap_of(opts, launch, armed, at.want));
+    let (token, witness) = match judged {
+        TokenJudged::Serve(serve) => (Some(serve), None),
+        TokenJudged::Off(witness) => (None, Some(witness)),
+        TokenJudged::Unserved | TokenJudged::Unjudged => (None, None),
+    };
+    // No inherited token state where the replaced process ran on its vault token: a line on the
+    // stored login carries neither the descriptor nor the marker (§5.4). A line that serves the
+    // token unsets neither (its `served_unset` is `None`), since the wrapper makes both afresh,
+    // and any line after another route keeps the length it had, so its usage tap still fits
+    // Darwin's cap.
+    let unset: Option<Vec<&'static str>> = match launch.route {
+        accounts::AuthRoute::VaultToken { .. } => Some(token_route::TOKEN_STATE_ENV.to_vec()),
+        accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => None,
+    };
+    let cold_build = if cold {
+        managed_twin_build(launch.exe)
+    } else {
+        None
+    };
+    let selected = line_tap_selected(
+        at.dialect,
+        at.heal,
+        at.cd,
+        cold_build.as_deref().unwrap_or(launch.exe),
+        launch.argv,
+        launch.resume.then_some(launch.session),
+        launch.mode,
+        &required,
+        unset.as_deref(),
+        None,
+        tap.as_deref(),
+        at.native_upgrade,
+        token.as_ref(),
+        witness,
+    )?;
+    // What the selected line unsets, which the command's capture renders again.
+    let unset = if selected.served.is_some() {
+        None
+    } else {
+        unset
+    };
+    Ok((selected, unset))
 }
 
 /// Whether `refusal`, of the account admission of `selected`, the line planned for `launch`, is a
@@ -598,11 +740,15 @@ fn token_move_refused(
         && launch.running.is_some()
 }
 
-/// The plan of `launch` on its stored login ([`Serve::Never`]), for a move onto the vault token
-/// whose selection policy refused it (`refusal`, [`token_move_refused`]): where that line keeps
-/// the replaced process's credential, its intent is the same login's and is admitted on
-/// integrity alone; otherwise it selects, and its own refusal stands. The plan records why the
-/// line dropped the token wrapper ([`Plan::token_dropped`]).
+/// The plan of `launch` on its stored login ([`Serve::Never`]), for a line the vault token its
+/// judgment offered cannot serve: a move onto it whose selection policy refused it
+/// ([`token_move_refused`]), or a coordinated upgrade of an agent on its stored login, whose line
+/// execs the physical build with no wrapper before it ([`NATIVE_TOKEN_DROPPED`]). `launch` is the
+/// launch as asked, before any rebind: this plan rebinds a login its row left by the same rule
+/// ([`rebind_of`], [`purpose_of`]). Where that line keeps the replaced process's credential, its
+/// intent is the same login's and is admitted on integrity alone; otherwise it selects, and its
+/// own refusal stands. The plan records `why` the line dropped the token wrapper, with the login
+/// the line carries ([`stored_login_kept`]), in [`Plan::token_dropped`].
 fn stored_in_place(
     opts: &Opts,
     launch: &Launch<'_>,
@@ -610,22 +756,78 @@ fn stored_in_place(
     t: &[super::upgrade_drive::ProcRow],
     native_upgrade: bool,
     kernel: &dyn Kernel,
-    refusal: &super::accounts_pool::Refusal,
+    why: String,
 ) -> Result<Plan, NoPlan> {
     let stored = Launch {
         serve: Serve::Never,
         ..*launch
     };
     let plan = plan_with_selection(opts, &stored, shell, t, None, native_upgrade, kernel)?;
+    let why = match stored_login_kept(launch, plan.rebind.as_ref()) {
+        Some(kept) => format!("{why}; {kept}"),
+        None => why,
+    };
     Ok(Plan {
-        token_dropped: Some(format!(
-            "the token wrapper left this relaunch line: moving onto the vault token selects its \
-             account, which waits {} ({}); the line keeps the stored login the agent runs on",
-            refusal.kind.word(),
-            refusal.why
-        )),
+        token_dropped: Some(why),
         ..plan
     })
+}
+
+/// Which stored login a line of `launch` (as asked) carries, where it stays on a stored login in
+/// place of the vault token ([`stored_in_place`]): the current login of the row that left the
+/// login `launch` names ([`super::accounts_pool::Rebind::Row`]), the pool's pick in place of it
+/// ([`super::accounts_pool::Rebind::Pick`]), or, with no `rebind`, the stored login the agent it
+/// replaces runs on where `launch` names that one. `None` where the line carries another login
+/// `launch` names (an account move's, or one off the vault token the agent runs on), which its
+/// reason does not restate.
+fn stored_login_kept(
+    launch: &Launch<'_>,
+    rebind: Option<&super::accounts_pool::Rebind>,
+) -> Option<String> {
+    use super::accounts_pool::Rebind;
+    fn set(word: Option<&str>) -> Option<&str> {
+        word.filter(|word| !word.is_empty())
+    }
+    match rebind {
+        Some(Rebind::Row(current)) => Some(format!(
+            "it carries {}'s current login, which that row holds in place of the login it left",
+            current.label
+        )),
+        Some(Rebind::Pick(pick)) => Some(format!(
+            "it carries {}'s login, the pool's pick in place of a login its row left",
+            pick.label
+        )),
+        None => launch
+            .running
+            .filter(|running| {
+                matches!(running.route, accounts::AuthRoute::Stored)
+                    && set(running.login) == set(launch.login)
+            })
+            .map(|_| "it keeps the login the agent runs on".to_string()),
+    }
+}
+
+/// Why a coordinated upgrade's line stays on a stored login where its token judgment found the
+/// vault token in use and the agent it replaces runs on its stored login ([`stored_in_place`],
+/// which adds the login the line carries); an agent on its vault token waits
+/// `native-token-policy` instead.
+pub(super) const NATIVE_TOKEN_DROPPED: &str = "the token wrapper left this relaunch line: a \
+     coordinated upgrade execs the physical build, which carries no wrapper, and the agent it \
+     replaces runs on its stored login, so the line stays on a stored login rather than move onto \
+     the vault token";
+
+/// The plan's own judgment of a line's vault token ([`token_serve`]).
+enum TokenJudged {
+    /// In use here, and the line can serve it through the wrapper.
+    Serve(TokenServe),
+    /// In use here, and no line can serve it (no lasting aterm, key or store build to type).
+    Unserved,
+    /// Off: the judgment found the launch on its stored login or as typed, or the line never
+    /// serves the token. The witness under which a twin's token block projects as its as-typed
+    /// arm ([`atpkg::platform::TokenBlock`]).
+    Off(atpkg::platform::TokenBlock),
+    /// No judgment was made: a cold plan's route is resolved by its own helper.
+    Unjudged,
 }
 
 /// The store build a token line types for `exe`, the launch's program: the managed twin's
@@ -656,7 +858,7 @@ pub(super) fn token_builds() -> Option<PathBuf> {
 /// `cwd` types the wrapper for, where its account's token is in use here. The account is the one
 /// the replaced process's login resolves; the claims ring is admission's, under
 /// `accounts.lock`, before the line is typed.
-fn token_serve(opts: &Opts, launch: &Launch<'_>, cwd: &str) -> Option<TokenServe> {
+fn token_serve(opts: &Opts, launch: &Launch<'_>, cwd: &str) -> TokenJudged {
     let build = token_build(launch.exe);
     let facts = token_route::Facts {
         macos: cfg!(target_os = "macos"),
@@ -666,27 +868,44 @@ fn token_serve(opts: &Opts, launch: &Launch<'_>, cwd: &str) -> Option<TokenServe
     };
     let asked = PlanAsk { opts, launch, cwd };
     match token_route::judge(&facts, &asked) {
-        token_route::Decision::Token { account, entry } => Some(TokenServe {
-            aterm: token_aterm()?,
-            // The canonical key of the account (its row's claims address, else its login's), as
-            // the wrapper's resolver keys every account.
-            key: super::account_names::names_of_login(
-                accounts::Cli::Claude,
-                None,
-                &account.email,
-                None,
-            )?
-            .0,
-            build: build?,
-            entry,
-            stored: super::profile::login_record(
-                &opts.home,
-                launch.login.filter(|login| !login.is_empty()),
-            )
-            .is_some(),
-        }),
-        token_route::Decision::Stored(_) | token_route::Decision::AsTyped(_) => None,
+        token_route::Decision::Token { account, entry } => {
+            token_line(opts, launch, build, &account, entry)
+                .map_or(TokenJudged::Unserved, TokenJudged::Serve)
+        }
+        token_route::Decision::Stored(_) | token_route::Decision::AsTyped(_) => {
+            TokenJudged::Off(atpkg::platform::TokenBlock::JudgedOff)
+        }
     }
+}
+
+/// What a line serving `account`'s token `entry` types ([`TokenServe`]), or `None` where no line
+/// can: no lasting aterm, no key for the account, or no store build.
+fn token_line(
+    opts: &Opts,
+    launch: &Launch<'_>,
+    build: Option<PathBuf>,
+    account: &token_route::Account,
+    entry: accounts::TokenEntry,
+) -> Option<TokenServe> {
+    Some(TokenServe {
+        aterm: token_aterm()?,
+        // The canonical key of the account (its row's claims address, else its login's), as
+        // the wrapper's resolver keys every account.
+        key: super::account_names::names_of_login(
+            accounts::Cli::Claude,
+            None,
+            &account.email,
+            None,
+        )?
+        .0,
+        build: build?,
+        entry,
+        stored: super::profile::login_record(
+            &opts.home,
+            launch.login.filter(|login| !login.is_empty()),
+        )
+        .is_some(),
+    })
 }
 
 /// The aterm a token line runs: this process's lasting one ([`super::tap::stable_exe`]).
@@ -763,12 +982,17 @@ impl token_route::Ask for PlanAsk<'_> {
     }
 }
 
-/// Claude Code's roster a plan reads, where one is there and admits.
+/// Claude Code's roster the plan's token judgment reads, where one is there and reads, as this
+/// Mac's login records bind it ([`super::accounts_pool::bound_roster`]: each row on its current
+/// login, with the logins it left), the view the plan's rebind, its pick and its admission read
+/// and the token wrapper reads at exec ([`super::accounts_token_run::Ctx::from_process`]): a line
+/// typed on the login a renewal bound a row to, which the roster file does not name, resolves to
+/// that row and its token entry, and the row's stored login is the one it is bound to now.
 fn plan_roster(opts: &Opts) -> Option<accounts::Roster> {
     opts.account_roster
         .as_deref()
-        .filter(|path| path.exists())
-        .and_then(|path| accounts::Roster::load_for(accounts::Cli::Claude, path).ok())
+        .filter(|path| path.exists())?;
+    super::accounts_pool::bound_roster(&account_seat(opts).ok()?, accounts::Cli::Claude).ok()
 }
 
 /// The token's standing for a plan, as admission reads it: this Mac's vault under the user's
@@ -825,30 +1049,120 @@ fn account_seat(opts: &Opts) -> Result<super::accounts_pool::Seat<'_>, &'static 
     })
 }
 
-/// What the account admission of `selected`, the line planned for `launch`, checks: integrity
-/// alone ([`super::accounts_pool::Purpose::SameLogin`]) where the line keeps exactly the credential
-/// the live process it replaces runs on (the same route, token entry included, the same home and
-/// login, under the same `HOME`), so it adds no runner and selects nothing; integrity and the
-/// selection policy ([`super::accounts_pool::Purpose::Select`]) where it replaces no live process
-/// or its route, home or login changes (a move onto or off the vault token, an account move).
+/// What the account admission of `selected`, the line planned for `launch` (as asked, before any
+/// rebind), checks: integrity alone ([`super::accounts_pool::Purpose::SameLogin`]) where the line
+/// keeps exactly the credential the live process it replaces runs on (the same route, token entry
+/// included, the same home and login, under the same `HOME`), so it adds no runner and selects
+/// nothing; integrity and the new login's sign-in ([`super::accounts_pool::Purpose::Rebind`])
+/// where the live process runs on the login `launch` names, one its account's row left, and the
+/// line keeps all of that but moves onto the row's current login (`rebind`,
+/// [`super::accounts_pool::Rebind::Row`]); integrity and the selection policy
+/// ([`super::accounts_pool::Purpose::Select`]) where it replaces no live process or its route,
+/// home or login changes otherwise (a move onto or off the vault token, an account move, the
+/// pool's pick in place of a row that left the login, [`super::accounts_pool::Rebind::Pick`]).
 pub(super) fn purpose_of(
     launch: &Launch<'_>,
     selected: &Launch<'_>,
+    rebind: Option<&super::accounts_pool::Rebind>,
 ) -> super::accounts_pool::Purpose {
+    use super::accounts_pool::{Purpose, Rebind};
     fn set(word: Option<&str>) -> Option<&str> {
         word.filter(|word| !word.is_empty())
     }
-    match launch.running {
-        Some(running)
-            if running.route == selected.route
-                && set(running.home) == set(selected.home)
-                && set(running.login) == set(selected.login)
-                && launch.homedir == selected.homedir =>
-        {
-            super::accounts_pool::Purpose::SameLogin
-        }
-        Some(_) | None => super::accounts_pool::Purpose::Select,
+    let Some(running) = launch.running else {
+        return Purpose::Select;
+    };
+    let kept = running.route == selected.route
+        && set(running.home) == set(selected.home)
+        && launch.homedir == selected.homedir;
+    if kept && set(running.login) == set(selected.login) {
+        return Purpose::SameLogin;
     }
+    match rebind {
+        Some(Rebind::Row(current))
+            if kept
+                && set(running.login) == set(launch.login)
+                && set(selected.login) == set(current.value.as_deref()) =>
+        {
+            Purpose::Rebind
+        }
+        Some(Rebind::Row(_) | Rebind::Pick(_)) | None => Purpose::Select,
+    }
+}
+
+/// What a relaunch line of `launch`, typed `at` its shell, carries in place of the login it names,
+/// where that login is one its account's row left for a newer one
+/// ([`super::accounts_pool::relaunch_rebind`]); `None` keeps it. Only a positively attributed route
+/// on the user's own Claude home is rebound: a custom home's or `HOME`'s route is external, and its
+/// admission judges it as one. A plan with no account namespace rebinds nothing, and its admission
+/// says why ([`command_account`]). The pool's pick in place of a row whose new login is not signed
+/// in here judges each row as this line starts it ([`line_serves_token`]).
+///
+/// # Errors
+/// [`NoPlan::Account`] where the row's current login is not signed in here and no other account
+/// serves, or the account records cannot be read.
+fn rebind_of(
+    opts: &Opts,
+    launch: &Launch<'_>,
+    at: &LineAt<'_>,
+) -> Result<Option<super::accounts_pool::Rebind>, NoPlan> {
+    if !launch.auth_observed
+        || launch.home.is_some_and(|home| !home.is_empty())
+        || launch
+            .homedir
+            .is_some_and(|home| !same_dir(Some(home), &opts.home.to_string_lossy()))
+    {
+        return Ok(None);
+    }
+    let Ok(seat) = account_seat(opts) else {
+        return Ok(None);
+    };
+    super::accounts_pool::relaunch_rebind(
+        &seat,
+        &accounts::ProcessLogin {
+            login: launch
+                .login
+                .filter(|login| !login.is_empty())
+                .map(str::to_owned),
+            default_home: true,
+            route: launch.route,
+        },
+        &mut |row| line_serves_token(opts, launch, at, row),
+    )
+    .map_err(NoPlan::Account)
+}
+
+/// Whether a relaunch line of `launch` typed `at` its shell, moved onto `row`'s login, serves that
+/// row's vault token: the line the plan would type ([`selected_line`]) carries the token wrapper,
+/// so the one judgment the plan reads ([`line_judged`]) offers it the token and the wrapper fits
+/// Darwin's line budget, which drops the wrapper, after the usage tap, from a line too long to
+/// carry it. Never for a line on the stored login ([`Serve::Never`]) or a coordinated native
+/// upgrade's ([`LineAt::native_upgrade`]), which execs the physical build and never carries the
+/// wrapper: its plan keeps an agent on a stored login there ([`NATIVE_TOKEN_DROPPED`]) and waits
+/// `native-token-policy` for one on its vault token. The launch-time token guard of the pool's pick
+/// in place of a row that left the login ([`super::accounts_pool::relaunch_rebind`]): a row only
+/// its vault token keeps running here is picked only where this says the line serves it, since a
+/// line without the wrapper starts on the row's lapsed stored login, refused as signed out on
+/// every pass while the records stand, or has no stored login here to start on at all.
+fn line_serves_token(
+    opts: &Opts,
+    launch: &Launch<'_>,
+    at: &LineAt<'_>,
+    row: &accounts::Row,
+) -> bool {
+    match launch.serve {
+        Serve::Never => return false,
+        Serve::Judge | Serve::Must if at.native_upgrade => return false,
+        Serve::Judge | Serve::Must => {}
+    }
+    let (_, login) = accounts::login_env_for(accounts::Cli::Claude, row);
+    let on_row = Launch {
+        login: Some(login.as_deref().unwrap_or("")),
+        ..*launch
+    };
+    let judged = line_judged(opts, &on_row, at, false);
+    selected_line(opts, &on_row, at, false, judged)
+        .is_ok_and(|(selected, _)| selected.served.is_some())
 }
 
 fn command_account(
@@ -1038,43 +1352,41 @@ fn external_from_env(
 
 /// The word a relaunch stops with whose saved account intent can never be admitted again at exec
 /// ([`exec_account`]): its login is filed under another owner row or namespace than its plan
-/// named.
+/// named, or its owner row left it for a newer login since.
 pub(super) const ACCOUNT_MOVED: &str = "account-moved";
 
 /// The relaunch's account admission at exec, once its agent is gone ([`relaunch`]), of `st`'s
 /// saved intent: the guard to hold through the line's dispatch (`None`: no account admission
-/// holds it), or, breaking, the report `r` the relaunch returns instead. Where only the stored login's
-/// credential generation moved since the plan (`accounts_pool::execution_readmission`: a
+/// holds it), or, breaking, the report `r` the relaunch returns instead. Where only the stored
+/// login's credential generation moved since the plan (`accounts_pool::execution_readmission`: a
 /// renewal or a sign-in of its row, or, for a row with no binding of its own, any account's
-/// commit), the intent captured afresh for the same login and purpose is admitted and saved in `st`'s
-/// record before the line is typed, since no next pass plans that intent again. A login now
-/// filed under another owner row or namespace stops the relaunch at once ([`ACCOUNT_MOVED`]),
-/// its ledger saying why, rather than waiting out [`STALE_S`] on a comparison that cannot match
-/// again; any other refusal waits ([`WAIT_ACCOUNT`]) for the next pass. Only the raw relaunch
-/// renews (`renew`): a native binding carries the exact intent its helper admits at Execute, so
-/// it is admitted exactly.
+/// commit), the intent captured afresh for the same login and purpose is admitted, since no next
+/// pass plans that intent again. The raw relaunch saves it in `st`'s record before the line is
+/// typed. A native binding (`native`) leaves the record's intent as its command carries it, the
+/// identity of the native recipe: its helper's Execute readmits that command's intent under the
+/// same rule (`aterm-gui` `native_act`), and the restart's completion names the intent its
+/// Execute admitted, which the record takes then (`native_restart::terminal_reply`). A login now
+/// filed under another owner row or namespace, or one its owner row left for a newer login since
+/// the plan (no pass plans the line onto the row's current login once its agent ended), stops the
+/// relaunch at once ([`ACCOUNT_MOVED`]), its ledger saying why, rather than waiting out
+/// [`STALE_S`] on a comparison that cannot match again; any other refusal waits
+/// ([`WAIT_ACCOUNT`]) for the next pass.
 fn exec_account(
     opts: &Opts,
     r: Report,
     st: &mut St,
     session: &str,
-    renew: bool,
+    native: bool,
 ) -> std::ops::ControlFlow<Report, Option<super::accounts_pool::ExecutionGuard>> {
     use super::accounts_pool::{ExecutionIntent, Unadmitted};
     use std::ops::ControlFlow::{Break, Continue};
     let admitted = match st.account_intent.as_ref() {
-        Some(intent) if renew && !matches!(intent, ExecutionIntent::External { .. }) => {
-            seat_of(opts)
-                .map_err(Unadmitted::Refused)
-                .and_then(|seat| {
-                    super::accounts_pool::execution_readmission(
-                        &seat,
-                        accounts::Cli::Claude,
-                        intent,
-                    )
-                })
-                .map(|(guard, renewed)| (Some(guard), renewed))
-        }
+        Some(intent) if !matches!(intent, ExecutionIntent::External { .. }) => seat_of(opts)
+            .map_err(Unadmitted::Refused)
+            .and_then(|seat| {
+                super::accounts_pool::execution_readmission(&seat, accounts::Cli::Claude, intent)
+            })
+            .map(|(guard, renewed)| (Some(guard), renewed)),
         intent => account_execution(opts, intent)
             .map(|guard| (guard, None))
             .map_err(Unadmitted::Refused),
@@ -1082,13 +1394,21 @@ fn exec_account(
     match admitted {
         Ok((guard, renewed)) => {
             if let Some(intent) = renewed {
-                aterm_log::info!(
-                    "harness @{}: the relaunch's account admission took its login's new credential \
-                     generation",
-                    st.tab
-                );
-                st.account_intent = Some(intent);
-                save(opts, session, st);
+                if native {
+                    aterm_log::info!(
+                        "harness @{}: the native relaunch's account admission takes its login's \
+                         new credential generation; its helper's Execute admits it again",
+                        st.tab
+                    );
+                } else {
+                    aterm_log::info!(
+                        "harness @{}: the relaunch's account admission took its login's new \
+                         credential generation",
+                        st.tab
+                    );
+                    st.account_intent = Some(intent);
+                    save(opts, session, st);
+                }
             }
             Continue(guard)
         }
@@ -1107,7 +1427,7 @@ fn exec_account(
                 &r,
                 &format!(
                     "the agent ended for its relaunch and was not started again: {why}, so the \
-                     account its line was admitted for is no longer the one it would run on"
+                     login its line names can never be admitted again"
                 ),
             );
             save(opts, session, st);
@@ -1266,7 +1586,7 @@ pub(super) fn line_tap_kept(
     tap: Option<&str>,
 ) -> Result<(String, Option<String>), NoPlan> {
     line_tap_selected(
-        dialect, heal, cd, exe, argv, session, mode, required, unset, unset, tap, false, None,
+        dialect, heal, cd, exe, argv, session, mode, required, unset, unset, tap, false, None, None,
     )
     .map(|selected| (selected.line, selected.tap_dropped))
 }
@@ -1307,7 +1627,10 @@ fn line_tap_selected(
     tap: Option<&str>,
     native_upgrade: bool,
     token: Option<&TokenServe>,
+    witness: Option<atpkg::platform::TokenBlock>,
 ) -> Result<SelectedCommand, NoPlan> {
+    // A coordinated upgrade's line execs the physical build, so it never serves the token: its
+    // plan stays on a stored login instead ([`stored_in_place`]) before any line is selected.
     if native_upgrade && token.is_some() {
         return Err(NoPlan::Wait("native-token-policy"));
     }
@@ -1334,8 +1657,12 @@ fn line_tap_selected(
                         prefix: prefix.to_path_buf(),
                     },
                     &flags,
+                    witness,
                 )
-                .map_err(|_| NoPlan::Wait("native-managed-policy"))?,
+                .map_err(|refusal| NoPlan::Noted {
+                    word: refusal.word(),
+                    why: format!("{} ({})", refusal.why(), exe.display()),
+                })?,
             )
         } else {
             // A directly named native image has no wrapper policy to project. An
@@ -1354,11 +1681,17 @@ fn line_tap_selected(
                 target: std::fs::canonicalize(exe)
                     .map_err(|_| NoPlan::Wait("native-target-unread"))?,
                 env: atpkg::shim_env::ShimEnv::NONE,
+                token_block: false,
+                blocks: Vec::new(),
             })
         }
     } else {
         None
     };
+    let twin_projected = native
+        .as_ref()
+        .filter(|native| !native.blocks.is_empty())
+        .map(twin_projected);
     let build = past_unmarked_twin(exe, &flags);
     let exe = native
         .as_ref()
@@ -1397,6 +1730,7 @@ fn line_tap_selected(
                 env: selected.env,
                 tap_dropped: None,
                 token_dropped: None,
+                twin_projected: twin_projected.clone(),
                 served: served.map(|serve| serve.entry),
             },
         )
@@ -1451,6 +1785,60 @@ fn line_tap_selected(
             what: "line".to_string(),
             detail: e,
         })
+}
+
+/// What a coordinated upgrade's line did with each block of the twin it projected
+/// ([`atpkg::platform::projection_rule`]), for [`Plan::twin_projected`].
+fn twin_projected(native: &atpkg::platform::NativeClaudeRestart) -> String {
+    use atpkg::platform::{ProjectionRule, TwinBlock};
+    let blocks = native
+        .blocks
+        .iter()
+        .map(|block| {
+            let rule = match atpkg::platform::projection_rule(*block) {
+                ProjectionRule::Inert => "inert",
+                ProjectionRule::Checked => "checked",
+                ProjectionRule::Plan => "the plan's",
+                ProjectionRule::Dropped => "dropped",
+                ProjectionRule::Frozen => "frozen",
+                ProjectionRule::Witnessed => "as typed, the plan judged the token off",
+                ProjectionRule::Refused(_) => "refused",
+            };
+            let name = match block {
+                TwinBlock::Head => "head",
+                TwinBlock::SelfUpdate => "self-update",
+                TwinBlock::NoHarness => "no-harness",
+                TwinBlock::Posture => "posture",
+                TwinBlock::HarnessHandoff => "harness",
+                TwinBlock::UsageTap => "tap",
+                TwinBlock::Renderer => "renderer",
+                TwinBlock::Exports => "exports",
+                TwinBlock::BuildCache => "build-cache",
+                TwinBlock::Route => "route",
+                TwinBlock::Launch => "launch",
+                TwinBlock::TokenRoute => "token-route",
+                TwinBlock::Exec => "exec",
+            };
+            format!("{name}: {rule}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "the line execs {} past its twin, each block by its rule ({blocks})",
+        native.target.display()
+    )
+}
+
+/// The ledger's step for a coordinated upgrade's line that projected its twin to the build
+/// ([`Plan::twin_projected`]).
+pub(super) const TWIN_PROJECTED: &str = "twin-projected";
+
+/// Record, beside the relaunch `r` whose line is about to be typed, how its line projected the
+/// twin, where it did ([`Plan::twin_projected`]).
+pub(super) fn note_projected(opts: &Opts, r: &Report, projected: Option<&str>) {
+    if let Some(how) = projected {
+        ledger(opts, &said(r.clone(), TWIN_PROJECTED), how);
+    }
 }
 
 /// The ledger's step for a relaunch typed without the usage tap its plan offered it, for want of
@@ -1743,6 +2131,7 @@ pub(crate) fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Ve
 pub(super) fn unplanned(opts: &Opts, r: Report, st: &mut St, no: NoPlan) -> Report {
     match no {
         NoPlan::Wait(why) => said(r, format!("wait:{why}")),
+        NoPlan::Noted { word, why } => noted_wait(r, st, word, &why, now_s()),
         NoPlan::Account(refusal) => account_refused(r, st, &refusal, now_s()),
         NoPlan::Refused { what, .. } if opts.dry_run => said(r, format!("would-refuse:{what}")),
         NoPlan::Refused { why, what, detail } => {
@@ -1772,6 +2161,15 @@ pub(super) fn account_refused(
         refusal.why
     );
     st.note_wait_why(word, &refusal.why, now);
+    said(r, format!("wait:{word}"))
+}
+
+/// A step whose plan waits on `word` for `why`, which the word alone cannot say ([`NoPlan::Noted`]):
+/// the reason goes to aterm.log and to `st`'s wait log ([`St::note_wait_why`]), kept on disk where
+/// the caller saves `st`.
+pub(super) fn noted_wait(r: Report, st: &mut St, word: &str, why: &str, now: u64) -> Report {
+    aterm_log::info!("harness @{}: the relaunch waits {word}: {why}", r.tab);
+    st.note_wait_why(word, why, now);
     said(r, format!("wait:{word}"))
 }
 
@@ -2429,7 +2827,7 @@ fn relaunch_held(
     // Its Execute takes canonical account admission after that point; legacy recipes cannot
     // enter this branch and keep their existing dispatch guard below.
     let account_guard = if checks_account_execution(&st.agent) && !deferred_cold {
-        match exec_account(opts, r.clone(), st, session, native.is_none()) {
+        match exec_account(opts, r.clone(), st, session, native.is_some()) {
             std::ops::ControlFlow::Continue(guard) => guard,
             std::ops::ControlFlow::Break(ended) => return ended,
         }
@@ -6212,7 +6610,31 @@ fn restart_locked(
     let Some(mut hand) = Hand::take(&mut c, &tab) else {
         return said(r, "wait:held");
     };
+    // The record names its tab before the host is asked anything for it.
+    st.tab.clone_from(&tab);
     let aborted: Option<Report> = 'signal: {
+        // A coordinated record's Memory restart is an asked move: the host must admit it as it
+        // stands now (the predecessor its epoch settled, or a re-entry from its own registration
+        // of this very agent) before the agent is let exit, never a prepare it would deny. A wait
+        // whose word cannot say which check held it goes to aterm.log with its reason, and to the
+        // wait log of the record this restart loaded (a coordinated round carries its native
+        // facts from that record alone), which status reads: this round's own record is saved
+        // only once the agent is signalled.
+        if authorizer.is_some()
+            && super::native_restart::coordinated(&st)
+            && let Err(wait) =
+                super::native_restart::asked_upgrade_ready(opts, &mut c, &st, snap.pid, shell)
+        {
+            let noted = match prior.as_mut() {
+                Some(loaded) => {
+                    let noted = unplanned(opts, r.clone(), loaded, wait.into());
+                    save(opts, &session, loaded);
+                    noted
+                }
+                None => unplanned(opts, r.clone(), &mut st, wait.into()),
+            };
+            break 'signal Some(noted);
+        }
         let checked_step = (authorizer.is_some() && super::native_restart::coordinated(&st))
             .then_some(CheckedRelaunchStep::Prepare);
         let checked_human = match restart_source_current(
@@ -6250,7 +6672,6 @@ fn restart_locked(
         (st.model_before, st.mark) = model_and_mark(recent.as_ref());
         st.bind(snap.pid, &snap.start);
         st.shell = shell;
-        st.tab.clone_from(&tab);
         st.line = line;
         st.account_intent = command
             .as_ref()
@@ -6676,13 +7097,11 @@ fn retry_checked_relaunch(
     let (snap, _, file) = source;
     let (r, mut st) = run;
     let request = native_restart::retained_prepare(&st).ok()?;
-    let Some(AskedIntent::Relaunch(intent)) = &request.asked else {
-        return None;
-    };
+    let retained_ask = request.asked.as_ref().and_then(AskedIntent::relaunch_ask)?;
     let NativePlan::Restart { process, shell, .. } = &request.plan else {
         return None;
     };
-    if intent.ask != ask.word()
+    if retained_ask != ask.word()
         || !its_own(why, ask, &st)
         || process.pid != snap.pid
         || squash(&native_restart::vendor_start(process)) != squash(&snap.start)
@@ -8498,6 +8917,12 @@ fn after_exit_as(
             );
         }
     };
+    // This exit's native relaunches are spent ([`native_spent`]): a new plan for it is its
+    // plain typed line, so an admission that would defer its account to a native launcher
+    // takes the line's own account instead.
+    let spent = prior
+        .as_ref()
+        .is_some_and(|st| st.native_spent_on(snap.pid, &snap.start) >= NATIVE_ATTEMPTS);
     // An agent that ended under an earlier aterm process is that host's end whatever stamp its
     // layout carried: a restart that process had in flight is carried below, by identity. A
     // stamped one whose restart already failed keeps that refusal, as it did under its host.
@@ -8582,7 +9007,8 @@ fn after_exit_as(
                 st.shell = snap.shell;
             }
             // Recomputed on every pass: the record keeps the mark, never this exemption.
-            st.host_ended_fresh = host_ended_fresh_now(opts, earlier, false, &st);
+            st.host_ended_fresh =
+                host_ended_fresh_now(opts, earlier, false, &st) || native_spent(false, &st);
             return carry_in_flight(opts, r, st, &session, &snap.tab);
         }
     }
@@ -8602,6 +9028,14 @@ fn after_exit_as(
     let (admitted, cold) = match admit {
         Some(admit) => match admit(snap) {
             Ok(ColdAdmission::Immediate(chosen)) => (chosen, None),
+            Ok(ColdAdmission::Deferred(_)) if spent => {
+                aterm_log::info!(
+                    "harness @{}: its {NATIVE_ATTEMPTS} native relaunches ran nothing; it is \
+                     relaunched on its plain line, on the account that line names",
+                    snap.tab
+                );
+                (None, None)
+            }
             Ok(ColdAdmission::Deferred(intent)) => (None, Some(*intent)),
             Err(why) => {
                 aterm_log::info!("harness @{}: live account admission waits: {why}", snap.tab);
@@ -8843,7 +9277,8 @@ fn launch_after_exit(
         // is another process (pids are reused, as after a reboot), never a guard to wait on.
         st.exited_at = now_s();
     }
-    st.host_ended_fresh = host_ended_fresh_now(opts, earlier, cold.is_some(), &st);
+    st.host_ended_fresh = host_ended_fresh_now(opts, earlier, cold.is_some(), &st)
+        || native_spent(cold.is_some(), &st);
     if !st.host_ended_fresh && (opts.token.is_some() || super::native_restart::coordinated(&st)) {
         match super::native_restart::begin_crash(
             opts,
@@ -9021,12 +9456,39 @@ pub(super) fn host_ended_fresh(earlier: bool, deferred: bool, own: bool, st: &St
         && super::native_restart::coordinated(st)
         && !deferred
         && st.exited_at != 0
-        && st.native.is_none()
+        && native_settled(st)
+        && !own
+}
+
+/// How many native relaunches of one exit may end with the host's proof that nothing ran
+/// under them (`state=unadmitted`, `state=lapsed`: [`St::native_spent`]) before that exit is
+/// relaunched on its plain typed line ([`native_spent`]). A launcher the host refuses each time
+/// (an account it cannot resolve, a guard that keeps moving) is no reason to retype it for
+/// good: three proven-dead attempts are the exit's whole native budget.
+pub(super) const NATIVE_ATTEMPTS: u32 = 3;
+
+/// Whether no native operation, retirement, account successor or rollback of `st` is left
+/// unresolved: one is reconciled or held as it is, never replaced by a typed line.
+fn native_settled(st: &St) -> bool {
+    st.native.is_none()
         && st.native_prepare.is_empty()
         && !st.native_retired_unissued
         && st.native_account_candidate.is_none()
         && !st.native_rollback
-        && !own
+}
+
+/// Whether `st`'s exit is relaunched on its plain typed line because its native relaunches are
+/// spent: [`NATIVE_ATTEMPTS`] of them, for the agent the record names now, ended with the host's
+/// proof that none ran ([`St::native_spent_on`]), its exit is proven ([`St::exited_at`]), its
+/// plan carries no deferred cold intent (`deferred`: the plain line resumes it on the account
+/// its own line names) and nothing native is unresolved ([`native_settled`]). No grant of a
+/// spent attempt can run, so its coordination gates no typed line ([`St::host_ended_fresh`]).
+#[must_use]
+pub(super) fn native_spent(deferred: bool, st: &St) -> bool {
+    !deferred
+        && st.native_spent_on(st.pid, &st.pid_start) >= NATIVE_ATTEMPTS
+        && st.exited_at != 0
+        && native_settled(st)
 }
 
 /// [`host_ended_fresh`] of `st` now, asking its host whether a native act the record holds

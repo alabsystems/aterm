@@ -598,32 +598,7 @@ impl App {
     /// points at the pixels its cells are drawn at.
     pub(crate) fn insert_unattached_window(&mut self, wid: WindowId, mut ws: WindowState) {
         ws.scale = self.unattached_window_scale();
-        // A new window takes the dock record of the window it came from: a caller that installs
-        // the window on the act's own turn makes it front only after this, so the front is
-        // still its parent. A restored window takes its row's record over this
-        // ([`Self::take_dock_record`]); a detach takes its source's, and a window landed off the
-        // loop (Cmd-N, a connected spawn) the origin its booking reserved
-        // ([`Self::inherit_dock_record`]), since the front may have moved while it spawned.
-        (ws.dock.pref, ws.dock.by_default) = self
-            .frontmost_window
-            .and_then(|front| self.windows.get(&front))
-            .map_or((None, false), |parent| {
-                (parent.dock.pref, parent.dock.by_default)
-            });
         self.windows.insert(wid, Box::new(ws));
-    }
-
-    /// Window `child` takes window `parent`'s dock record, and whether the default wrote it: a
-    /// tab torn from a window that need not be the front one.
-    pub(crate) fn inherit_dock_record(&mut self, parent: WindowId, child: WindowId) {
-        let record = self
-            .windows
-            .get(&parent)
-            .map_or((None, false), |ws| (ws.dock.pref, ws.dock.by_default));
-        if let Some(mut route_guard_ws) = self.windows.get_mut(&child) {
-            let ws = &mut **route_guard_ws;
-            (ws.dock.pref, ws.dock.by_default) = record;
-        }
     }
 
     /// `install_window_state` with an explicit registry lineage parent for the window's first session.
@@ -1065,7 +1040,7 @@ impl App {
     /// view behind, whatever rollback follows.
     #[must_use]
     pub(crate) fn attach_os_window(&mut self, el: &ActiveEventLoop, wid: WindowId) -> bool {
-        let seated = self.seat_birth_dock(wid);
+        let seated = self.seat_local_panel_at_birth(wid);
         let attached = self.attach_os_window_sized(el, wid);
         if seated && !attached {
             self.unseat_birth_dock(wid);
@@ -1646,17 +1621,17 @@ impl App {
                             ws.os_window = Some(window);
                             ws.pending_reveal = defer_reveal
                                 .then(|| Instant::now() + std::time::Duration::from_millis(1500));
-                            ws.win_px = Some(raw_px);
+                            ws.set_window_pixels(raw_px);
                             #[cfg(a11y_tree)]
                             {
                                 ws.a11y = a11y_adapter;
                             }
                             ws.capture_acquire_armed = false;
                             ws.gpu_acquire_wait = crate::GpuAcquireWait::default();
-                            ws.present = Some(PresentTarget::Gpu {
+                            ws.replace_present(Some(PresentTarget::Gpu {
                                 gpu_surface: surf,
                                 window_gpu,
-                            });
+                            }));
                             true
                         } else {
                             false
@@ -1751,12 +1726,12 @@ impl App {
             ws.os_window = Some(window);
             ws.pending_reveal =
                 defer_reveal.then(|| Instant::now() + std::time::Duration::from_millis(1500));
-            ws.win_px = Some(raw_px);
+            ws.set_window_pixels(raw_px);
             #[cfg(a11y_tree)]
             {
                 ws.a11y = a11y_adapter;
             }
-            ws.present = Some(PresentTarget::Cpu { surface });
+            ws.replace_present(Some(PresentTarget::Cpu { surface }));
             true
         } else {
             false
@@ -1929,7 +1904,7 @@ impl App {
         if let Some(applied) = granted {
             ws.pending_resize = None;
             ws.next_resize_settle = None;
-            ws.win_px = Some(applied);
+            ws.set_window_pixels(applied);
             drop(route_guard_ws);
             self.sync_surface_to_window(wid);
             self.on_resize(wid, applied);
@@ -2031,6 +2006,7 @@ impl App {
                 taskbar::forget(hwnd);
             }
         }
+        let closed_home = self.tab_home_window() == Some(wid);
         self.windows.remove(&wid);
         self.navigator_mark_structure();
         self.retire_window_document_admissions(wid);
@@ -2068,6 +2044,9 @@ impl App {
         }
         if self.frontmost_window == Some(wid) {
             self.frontmost_window = self.next_frontmost_after_close();
+        }
+        if closed_home && let Some(home) = self.tab_home_window() {
+            self.promote_tab_home_chrome(home);
         }
         if !self.windows.is_empty() {
             debug_assert!(
@@ -3953,19 +3932,26 @@ fn monitors_px(window: &Window) -> Vec<MonitorRectPx> {
         .collect()
 }
 
-/// The window's navigator host. A pending fall is an intent, not another inset: until the
-/// shared chrome floor expires, every program keeps the shown geometry.
+/// The window's navigator host. Programs keep the committed geometry while a fall waits for
+/// a client with area or a person's Hide waits for the chrome regrow floor.
 #[derive(Default)]
 pub(crate) struct Dock {
     pub(crate) cells: u16,
+    /// The process roster has claimed this window's dock as the session list.
+    pub(crate) roster_panel: bool,
+    /// A larger client may now admit the preferred panel width.
+    pub(crate) retry_roster_on_resize: bool,
     pub(crate) view: Option<crate::tab_model::ViewId>,
-    fall: Option<u16>,
+    pub(crate) preview: Option<crate::app_navigator::SessionPreview>,
+    pub(crate) hidden_order: Vec<u64>,
+    pub(crate) session_click: Option<(u64, std::time::Instant, (f64, f64))>,
+    pub(crate) session_drag: Option<(u64, (f64, f64))>,
+    /// Pending width and whether this came from an explicit Show or Hide.
+    fall: Option<(u16, bool)>,
     /// Geometry of the last successful present, fencing hits while a new placement is owed.
     pub(crate) presented: Option<crate::app_native::NativeHostGeometry>,
     /// The window's dock record (`WindowLayout::dock`): `None` never decided, `Some(0)` hidden,
-    /// `Some(k)` shown at `k` cells. A dock act commits it with the cells; a capture writes it
-    /// only where it agrees with the grid and frame written beside it ([`Self::written`]); a
-    /// new window takes it from the window it came from.
+    /// `Some(k)` requests a width of `k` cells. The roster keeps this intent while available space suppresses the panel in this window.
     pub(crate) pref: Option<u16>,
     /// The shown record was written by the default (a birth docked by it, or its docking paid
     /// inside), not by a person's Show (`WindowLayout::dock_by_default`): `[navigator] dock`
@@ -3988,18 +3974,23 @@ pub(crate) struct Dock {
 
 impl Dock {
     pub(crate) fn wanted_cells(&self) -> u16 {
-        self.fall.unwrap_or(self.cells)
+        self.fall.map_or(self.cells, |(cells, _)| cells)
     }
 
-    /// The record a layout capture writes beside the grid and frame the window has now: its
-    /// record where that agrees with them (hidden, or shown at the cells the window stands
-    /// with, a Hide still waiting included, since the cells change only at the commit). A shown
-    /// record the window does not stand with (the setting hid it at birth, its view could not
-    /// be made, a font change set it down) is written undecided, so the next birth decides it
-    /// again, with the screen fit and the slide a default dock gets, and a held window pays it
-    /// as one `site=dock` resize rather than being born wider than its screen.
+    fn preferred_roster_width(&self, default_on: bool) -> u16 {
+        match self.pref {
+            Some(width) if !self.by_default => width,
+            _ if !default_on => 0,
+            width => width.unwrap_or(DOCK_CELLS),
+        }
+    }
+
+    /// A roster capture keeps the saved width across available space changes. A legacy host
+    /// captures a shown width only if its current geometry agrees, so the next birth can fit
+    /// a default dock rather than assuming a previously refused width will fit.
     pub(crate) fn written(&self) -> Option<u16> {
-        self.pref.filter(|&k| k == 0 || k == self.cells)
+        self.pref
+            .filter(|&k| self.roster_panel || k == 0 || k == self.cells)
     }
 
     /// Whether the record a capture writes ([`Self::written`], or the record as it came where
@@ -4080,7 +4071,10 @@ impl std::fmt::Display for DockRefusal {
 impl App {
     /// Commit chrome inside the held window, booking every actual program resize once.
     pub(crate) fn set_dock(&mut self, wid: WindowId, cells: u16) -> Result<(), DockRefusal> {
-        self.set_dock_at(wid, cells, std::time::Instant::now())
+        let now = std::time::Instant::now();
+        self.claim_roster_dock(wid)?;
+        self.refresh_local_panel_roster();
+        self.set_dock_at(wid, cells, now)
     }
 
     /// View > Show Navigator's act on the front window: Show where the navigator is hidden or
@@ -4143,6 +4137,50 @@ impl App {
         cells: u16,
         now: std::time::Instant,
     ) -> Result<(), DockRefusal> {
+        self.apply_dock_at(wid, cells, now, true)
+    }
+
+    /// Reconcile the session panel's effective width without recording a person's Show or Hide.
+    pub(crate) fn set_roster_dock_at(
+        &mut self,
+        wid: WindowId,
+        cells: u16,
+        now: std::time::Instant,
+    ) -> Result<(), DockRefusal> {
+        self.claim_roster_dock(wid)?;
+        self.apply_dock_at(wid, cells, now, false)
+    }
+
+    fn claim_roster_dock(&mut self, wid: WindowId) -> Result<(), DockRefusal> {
+        let reorient = {
+            let Some(mut ws) = self.windows.get_mut(&wid) else {
+                return Err(DockRefusal::NoWindow);
+            };
+            let reorient = !ws.dock.roster_panel && ws.dock.cells != 0;
+            ws.dock.roster_panel = true;
+            if reorient {
+                ws.dock.presented = None;
+                ws.dock_card = None;
+                ws.invalidate_raster_caches();
+                ws.request_redraw();
+            }
+            reorient
+        };
+        if reorient {
+            self.refresh_local_panel_tab_chrome(wid);
+            self.navigator_mark_structure();
+            self.refresh_pointer_after_frame_placement(wid);
+        }
+        Ok(())
+    }
+
+    fn apply_dock_at(
+        &mut self,
+        wid: WindowId,
+        cells: u16,
+        now: std::time::Instant,
+        remember: bool,
+    ) -> Result<(), DockRefusal> {
         let (old, needs_view) = {
             let Some(mut ws) = self.windows.get_mut(&wid) else {
                 return Err(DockRefusal::NoWindow);
@@ -4154,12 +4192,17 @@ impl App {
             ws.dock.set_down = None;
             let old = ws.dock.cells;
             if old == cells {
-                ws.dock.pref = Some(cells);
-                ws.dock.by_default = false;
+                if remember {
+                    ws.dock.pref = Some(cells);
+                    ws.dock.by_default = false;
+                }
                 return Ok(());
             }
-            if cells < old && !aterm_messages::chrome::fall_allowed(ws.regrow_floor.floor(), now) {
-                ws.dock.fall = Some(cells);
+            if remember
+                && cells < old
+                && !aterm_messages::chrome::fall_allowed(ws.regrow_floor.floor(), now)
+            {
+                ws.dock.fall = Some((cells, remember));
                 return Ok(());
             }
             (old, cells != 0 && ws.dock.view.is_none())
@@ -4176,7 +4219,7 @@ impl App {
                 return Err(DockRefusal::NoClient);
             }
             if let Some(mut ws) = self.windows.get_mut(&wid) {
-                ws.dock.fall = Some(cells);
+                ws.dock.fall = Some((cells, remember));
             }
             return Ok(());
         }
@@ -4205,12 +4248,12 @@ impl App {
                 ws.dock.view = Some(view);
             }
             ws.dock.cells = cells;
-            // The record is the committed state: a waiting Hide, a refused Show and a fall
-            // owed to a client with no area leave it as the grid and frame a capture writes
-            // still have it. A commit is a person's act ([`Self::settle_birth_docks`] marks
-            // the default's own pay).
-            ws.dock.pref = Some(cells);
-            ws.dock.by_default = false;
+            // A person's choice commits with the grid. Automatic roster suppression keeps
+            // the width the window will use when it is eligible again.
+            if remember {
+                ws.dock.pref = Some(cells);
+                ws.dock.by_default = false;
+            }
             if cells > old {
                 ws.regrow_floor.rose(now);
             }
@@ -4239,6 +4282,14 @@ impl App {
             self.on_resize(wid, held);
         }
         self.refresh_pointer_after_frame_placement(wid);
+        if (old == 0 || cells == 0)
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.dock.roster_panel)
+        {
+            self.refresh_local_panel_tab_chrome(wid);
+        }
         self.navigator_mark_structure();
         self.push_least_window_size_inside(wid);
         if let Some(ws) = self.windows.get(&wid) {
@@ -4260,16 +4311,27 @@ impl App {
         if held.width == 0 || held.height == 0 {
             return false;
         }
-        let Some((cells, wanted, set_down, has_view)) = self.windows.get(&wid).map(|ws| {
-            (
-                ws.dock.cells,
-                ws.dock.wanted_cells(),
-                ws.dock.set_down,
-                ws.dock.view.is_some(),
-            )
-        }) else {
+        let Some((cells, wanted, remember_hide, set_down, has_view)) =
+            self.windows.get(&wid).map(|ws| {
+                (
+                    ws.dock.cells,
+                    ws.dock.wanted_cells(),
+                    ws.dock.fall == Some((0, true)),
+                    ws.dock.set_down,
+                    ws.dock.view.is_some(),
+                )
+            })
+        else {
             return false;
         };
+        if cells == 0 && set_down.is_some() && self.windows[&wid].dock.roster_panel {
+            if self.windows[&wid].dock.preferred_roster_width(
+                self.tab_home_window() == Some(wid) && self.docks_at_birth(),
+            ) == 0
+            {
+                return false;
+            }
+        }
         let raise = match (cells, set_down) {
             (0, Some(k)) if self.dock_rise_refusal(wid, k, held).is_none() => k,
             (0, _) => return false,
@@ -4304,7 +4366,7 @@ impl App {
         } else {
             None
         };
-        if raise == 0 && wanted == 0 {
+        if raise == 0 && remember_hide {
             ws.dock.pref = Some(0);
             ws.dock.by_default = false;
         }
@@ -4317,8 +4379,22 @@ impl App {
             wid.0,
             if raise == 0 { "set down" } else { "raised" }
         );
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.dock.roster_panel)
+        {
+            self.refresh_local_panel_tab_chrome(wid);
+        }
         self.navigator_mark_structure();
         true
+    }
+
+    /// A native tab strip advertises tab-position shortcuts only while the roster is hidden.
+    fn refresh_local_panel_tab_chrome(&mut self, wid: WindowId) {
+        if self._toolbars.contains_key(&wid) {
+            self.refresh_tab_chrome_windows(vec![wid]);
+        }
     }
 
     /// Pay pending falls from the loop's existing deadline fold; no periodic dock wake exists.
@@ -4348,14 +4424,17 @@ impl App {
             .filter_map(|(&wid, ws)| {
                 ws.dock
                     .fall
-                    .filter(|_| aterm_messages::chrome::fall_allowed(ws.regrow_floor.floor(), now))
+                    .filter(|(_, remember)| {
+                        !remember
+                            || aterm_messages::chrome::fall_allowed(ws.regrow_floor.floor(), now)
+                    })
                     .map(|cells| (wid, cells))
             })
             .filter(|&(wid, _)| self.dock_client_stands(wid))
             .collect();
         let moved = !ready.is_empty();
-        for (wid, cells) in ready {
-            if let Err(refusal) = self.set_dock_at(wid, cells, now) {
+        for (wid, (cells, remember)) in ready {
+            if let Err(refusal) = self.apply_dock_at(wid, cells, now, remember) {
                 aterm_log::info!("navigator dock: waiting hide: {refusal}");
             }
         }
@@ -4379,11 +4458,32 @@ impl App {
             .collect();
         let mut moved = false;
         for (wid, cells) in due {
+            let roster = self.windows[&wid].dock.roster_panel;
+            if roster {
+                if self.windows[&wid].dock.preferred_roster_width(
+                    self.tab_home_window() == Some(wid) && self.docks_at_birth(),
+                ) == 0
+                {
+                    if let Some(mut ws) = self.windows.get_mut(&wid) {
+                        ws.dock.owed = Owed::None;
+                    }
+                    continue;
+                }
+            }
             let keeps = self
                 .windows
                 .get(&wid)
                 .is_some_and(|ws| ws.cols >= DOCK_KEEPS_COLS.saturating_add(cells));
-            if keeps {
+            if roster {
+                let explicit =
+                    self.windows[&wid].dock.pref.is_some() && !self.windows[&wid].dock.by_default;
+                if (keeps || explicit) && self.set_roster_dock_at(wid, cells, now).is_ok() {
+                    moved = true;
+                } else if let Some(mut ws) = self.windows.get_mut(&wid) {
+                    ws.dock.owed = Owed::None;
+                    ws.dock.retry_roster_on_resize = true;
+                }
+            } else if keeps {
                 match self.set_dock_at(wid, cells, now) {
                     Ok(()) => {
                         moved = true;
@@ -4437,6 +4537,74 @@ impl App {
         )
     }
 
+    /// The roster is process-wide, while visibility and preferred width belong to each window.
+    fn seat_local_panel_at_birth(&mut self, wid: WindowId) -> bool {
+        if self.headless {
+            return false;
+        }
+        let Some(mut ws) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        ws.dock.roster_panel = true;
+        drop(ws);
+        self.navigator_mark_structure();
+        self.refresh_local_panel_roster();
+        self.local_panel_roster.request_layout();
+        self.seat_birth_dock(wid)
+    }
+
+    pub(crate) fn reconcile_local_panel_layout(&mut self, now: std::time::Instant) {
+        self.refresh_local_panel_roster();
+        if !self.local_panel_roster.take_layout_request() {
+            return;
+        }
+        let home = self.tab_home_window();
+        let default_on = self.docks_at_birth();
+        let changes: Vec<_> = self
+            .windows
+            .iter()
+            .filter_map(|(&wid, ws)| {
+                let dock = &ws.dock;
+                if !dock.roster_panel {
+                    return None;
+                }
+                // A person's pending Hide keeps its usual debounce.
+                if dock.fall.is_some_and(|(_, remember)| remember) {
+                    return None;
+                }
+                let width = dock.preferred_roster_width(default_on && home == Some(wid));
+                if width == 0 {
+                    return (dock.cells != 0
+                        || dock.owed != Owed::None
+                        || dock.set_down.is_some()
+                        || dock.retry_roster_on_resize)
+                        .then_some((wid, 0));
+                }
+                // A held restore pays its inset after the carried grid settles. A font change
+                // that put the dock down likewise owns reseating it at metrics it can fit.
+                if dock.owed != Owed::None || dock.set_down.is_some() {
+                    return None;
+                }
+                (width != dock.wanted_cells()).then_some((wid, width))
+            })
+            .collect();
+        for (wid, width) in changes {
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
+                ws.dock.retry_roster_on_resize = false;
+            }
+            if let Err(refusal) = self.set_roster_dock_at(wid, width, now) {
+                match refusal {
+                    DockRefusal::TooNarrow { .. } | DockRefusal::NoClient => {
+                        if let Some(mut ws) = self.windows.get_mut(&wid) {
+                            ws.dock.retry_roster_on_resize = true;
+                        }
+                    }
+                    _ => aterm_log::info!("local session panel: {refusal}"),
+                }
+            }
+        }
+    }
+
     /// Seat window `wid`'s dock as its birth rule says ([`birth_dock`]), before its first
     /// attach sizes it: shown, the window is born that much wider at the grid it carries, so no
     /// program sees a resize; owed inside, it is paid once due ([`Self::settle_dock_fall`]).
@@ -4455,12 +4623,29 @@ impl App {
         else {
             return false;
         };
-        let on = self.docks_at_birth();
-        match birth_dock(pref, by_default, on, birth.held, true) {
+        // A restored auxiliary window honors explicit Show and Hide and retires
+        // a default that previously opened its navigator.
+        let home = self.tab_home_window() == Some(wid);
+        if !home && !birth.restored {
+            return false;
+        }
+        let on = home && self.docks_at_birth();
+        let placement = birth_dock(pref, by_default, on, birth.held, true);
+        let placement = match (placement, pref) {
+            // The carried frame already includes a custom width. Judge it inside that
+            // frame, including records from a display with more room than this one.
+            (BirthDock::Shown(_), Some(width))
+                if self.windows[&wid].dock.roster_panel && width != DOCK_CELLS =>
+            {
+                BirthDock::Inside(width)
+            }
+            (placement, _) => placement,
+        };
+        match placement {
             BirthDock::Hidden => {
                 // The setting hid a shown record the default wrote: the window lives undocked,
                 // so its record is undecided again. Kept, a capture would write "shown" beside
-                // an undocked grid and frame, and the windows opened from it would inherit it;
+                // an undocked grid and frame;
                 // a birth after the setting comes back on then decides it as a default one (the
                 // screen fit, the slide, a held window's one `site=dock` pay). The width is
                 // always `DOCK_CELLS`, so nothing is lost.
@@ -4863,14 +5048,11 @@ impl App {
                 .checked_add(self.win_pad(wid))?,
         )
         .ok()?;
+        let (frame_x, frame_y) = self.frame_origin(wid);
+        let x = frame_x.saturating_sub(i64::from(width)).min(0);
         let origin = (
-            self.frame_origin(wid)
-                .0
-                .saturating_sub(i64::from(width))
-                .min(0),
-            self.frame_origin(wid)
-                .1
-                .checked_add(i64::try_from(self.native_content_origin_y(wid)).ok()?)?,
+            x,
+            frame_y.checked_add(i64::try_from(self.native_content_origin_y(wid)).ok()?)?,
         );
         let scale = ws.scale.max(f64::EPSILON) as f32;
         Some(crate::app_native::NativeHostGeometry {

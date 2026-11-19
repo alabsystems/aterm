@@ -150,21 +150,36 @@ impl Retry<'_> {
         retry: &mut RunnerRetry,
         wait: &dyn Wait,
     ) -> Result<(), String> {
-        // New items re-read the current vault hold, swarm choice, signed fleet code and native
-        // membership. Neither the first attempt's cached probe nor a scheduling receipt admits it.
-        let kinds = if self.ports.fabric_needs_node() {
+        let failed = |kind: Kind| {
+            rows.iter()
+                .any(|row| row.id == kind.id() && row.outcome.is_failure())
+        };
+        let fabric_needs_node = self.ports.fabric_needs_node();
+        let fleet = failed(Kind::Fleet);
+        // An upstream attempt can change what a dependent reads even if the attempt fails
+        // after a partial write. Keep those dependents in the same ordered attempt.
+        let node = failed(Kind::Node) || fleet;
+        let fabric = failed(Kind::Fabric) || (fabric_needs_node && node);
+        let kinds = if fabric_needs_node {
             [Kind::Fleet, Kind::Node, Kind::Fabric]
         } else {
             [Kind::Fabric, Kind::Fleet, Kind::Node]
         };
+        // New items re-read the current vault hold, swarm choice, signed fleet code and native
+        // membership. The earlier outcomes only select work. Each item admits its own effects.
         let items: Items<'_> = kinds
             .into_iter()
+            .filter(|kind| match kind {
+                Kind::Fleet => fleet,
+                Kind::Node => node,
+                Kind::Fabric => fabric,
+                _ => false,
+            })
             .map(|kind| Box::new(Synced::new(kind, self.ports, self.trigger, Mode::Apply)) as _)
             .collect();
         retry.started();
         // The initial local rows have finished before the repository helper starts. A joined
-        // fleet can therefore repair its node and fabric immediately, without racing their
-        // first execution. Their own current probes retain every explicit off/refusal.
+        // fleet can therefore repair its dependent services without racing their first execution.
         let latest =
             aterm_converge::run_scoped(&items, Mode::Apply, self.scope, &mut self.journal, on_row)
                 .map_err(|why| why.to_string())?;

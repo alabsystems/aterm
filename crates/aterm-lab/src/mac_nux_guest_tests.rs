@@ -600,7 +600,7 @@ fn an_unanswered_request_finishes_only_for_the_vault_proven_off_its_lan() {
             assert_eq!(
                 Stall::new(STALL_MS).see(0, &reading),
                 if expected {
-                    Waited::Done
+                    Waited::Ended(SetupEnd::VaultOffLan)
                 } else {
                     Waited::Moving
                 },
@@ -635,9 +635,30 @@ fn the_wait_stops_a_minute_after_setup_last_moved_and_never_before() {
         }
     );
     let mut done = Stall::new(STALL_MS);
-    assert_eq!(done.see(5, &at("done")), Waited::Done);
+    assert_eq!(done.see(5, &at("done")), Waited::Ended(SetupEnd::Done));
     let mut offered = Stall::new(60_000);
-    assert_eq!(offered.see(5, &at("done;offered:debugger")), Waited::Done);
+    assert_eq!(
+        offered.see(5, &at("done;offered:debugger")),
+        Waited::Ended(SetupEnd::Done)
+    );
+    assert_eq!(
+        offered.see(5, &at("read-back:dock;offered:debugger")),
+        Waited::Ended(SetupEnd::ReadBack)
+    );
+    assert_eq!(
+        offered.see(
+            5,
+            &Reading {
+                record: Some(Record {
+                    state: "completed".into(),
+                    done: 7,
+                    running: None
+                }),
+                ..Default::default()
+            }
+        ),
+        Waited::Ended(SetupEnd::RecordCompleted)
+    );
     // A stage moving under an unchanged setup= is progress too.
     let mut stages = Stall::new(STALL_MS);
     let running = |bit| Reading {
@@ -688,12 +709,12 @@ fn presses_are_the_rows_that_waited_on_one_and_offers_are_not() {
     assert_eq!(presses.needs, ["debugger", "repos", "lan", "fda"]);
     assert_eq!(presses.offered, ["fda"]);
     assert_eq!(
-        presses.avoidable(false),
+        presses.avoidable(false, false),
         ["debugger", "repos", "lan", "fda"]
     );
     // Someone at the console: a privacy switch is theirs, but the Local Network question is
     // no press at all (the LAN broker), so a `lan` card that waited fails the row.
-    assert_eq!(presses.avoidable(true), ["repos", "lan"]);
+    assert_eq!(presses.avoidable(true, false), ["repos", "lan"]);
     assert!(presses.local_network_step());
     let mut authority = Presses::default();
     authority
@@ -706,17 +727,20 @@ fn presses_are_the_rows_that_waited_on_one_and_offers_are_not() {
     assert!(authority.offered.is_empty());
     assert!(!authority.local_network_step());
     for person in [false, true] {
-        assert!(authority.avoidable(person).is_empty());
+        assert!(authority.avoidable(person, false).is_empty());
     }
     authority.see(
         "pending:name-rule,network-helper,spotlight-scope;needs:name-rule,network-helper,spotlight-scope",
     );
     for person in [false, true] {
         assert_eq!(
-            authority.avoidable(person),
+            authority.avoidable(person, false),
             ["name-rule", "network-helper", "spotlight-scope"]
         );
+        assert!(authority.avoidable(person, true).is_empty());
     }
+    authority.see("pending:fda,repos;needs:fda,repos");
+    assert_eq!(authority.avoidable(false, true), ["fda", "repos"]);
     let mut unread = Presses::default();
     unread.see("pending:repos;unread:dock");
     unread.see("unread:dock,spotlight;offered:fda");
@@ -725,11 +749,11 @@ fn presses_are_the_rows_that_waited_on_one_and_offers_are_not() {
     let mut none = Presses::default();
     none.see("pending:vault");
     none.see("done;asking:vault;offered:debugger");
-    assert!(none.avoidable(false).is_empty(), "CONTROL: {none:?}");
+    assert!(none.avoidable(false, false).is_empty(), "CONTROL: {none:?}");
     assert!(!none.local_network_step(), "CONTROL: {none:?}");
     let mut pending = Presses::default();
     pending.see("pending:vault,lan");
-    assert!(pending.avoidable(false).is_empty());
+    assert!(pending.avoidable(false, false).is_empty());
     assert!(
         pending.local_network_step(),
         "a Local Network row named while pending is a step"

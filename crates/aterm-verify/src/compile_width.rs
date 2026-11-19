@@ -154,10 +154,18 @@ thread_local! {
 #[derive(Debug)]
 pub(crate) struct PoolAdvertisement {
     flags: String,
+    #[cfg_attr(
+        not(any(target_os = "macos", all(test, unix))),
+        expect(
+            dead_code,
+            reason = "held for its descriptor; read only by macOS's sandbox and unix tests"
+        )
+    )]
     fifo: aterm_capacity::HeldJobserverFifo,
 }
 
 impl PoolAdvertisement {
+    #[cfg(any(target_os = "macos", all(test, unix)))]
     pub(crate) fn fifo_path(&self) -> std::io::Result<&Path> {
         self.fifo.path()
     }

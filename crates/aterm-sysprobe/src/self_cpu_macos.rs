@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use super::resources::{Release, ThreadList};
 use super::{
-    Coverage, CpuCounter, Cut, Operation, ProcessIdentity, ReadError, ThreadReading,
-    observe_threads, process_counter, stamp, thread_counter, thread_name,
+    Coverage, CpuCounter, CpuSplit, Cut, Operation, ProcessIdentity, Queue, ReadError,
+    ThreadReading, observe_threads, process_counter, queue_at, stamp, thread_counter, thread_name,
 };
 
 type Port = u32;
@@ -28,6 +28,17 @@ struct IdentifierInfo {
 }
 
 const _: () = assert!(size_of::<IdentifierInfo>() == 24);
+
+/// The head of libdispatch's exported `dispatch_queue_offsets` (`queue_private.h`, which the
+/// SDK does not ship): the table's version, and where in a queue its label's address sits and
+/// how wide that is. The table grows only at its end, so these three words lead every version;
+/// nothing past them is read.
+#[repr(C)]
+struct DispatchQueueOffsets {
+    version: u16,
+    label: u16,
+    label_size: u16,
+}
 const _: () = assert!(size_of::<libc::proc_threadinfo>() == 112);
 
 pub(super) const SDK_ROWS: &[(&str, i64)] = &[
@@ -40,6 +51,10 @@ pub(super) const SDK_ROWS: &[(&str, i64)] = &[
     (
         "offsetof(struct thread_identifier_info, thread_id)",
         std::mem::offset_of!(IdentifierInfo, thread_id) as i64,
+    ),
+    (
+        "offsetof(struct thread_identifier_info, dispatch_qaddr)",
+        std::mem::offset_of!(IdentifierInfo, dispatch_qaddr) as i64,
     ),
     ("THREAD_EXTENDED_INFO", THREAD_EXTENDED_INFO as i64),
     ("THREAD_EXTENDED_INFO_COUNT", EXTENDED_WORDS as i64),
@@ -67,6 +82,9 @@ unsafe extern "C" {
     fn task_threads(task: Port, list: *mut *mut Port, count: *mut u32) -> i32;
     fn thread_info(thread: Port, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
     fn mach_port_deallocate(task: Port, name: Port) -> i32;
+    fn mach_vm_read_overwrite(task: Port, address: u64, size: u64, data: u64, out: *mut u64)
+    -> i32;
+    static dispatch_queue_offsets: DispatchQueueOffsets;
 }
 
 struct MachRelease {
@@ -118,7 +136,8 @@ fn thread_list() -> Result<ThreadList<MachRelease>, ReadError> {
     Ok(unsafe { ThreadList::new(list, count, MachRelease { task }) })
 }
 
-fn identifier(port: Port) -> Result<u64, ReadError> {
+/// The thread's unique id and the address of its dispatch queue slot (`0`: none).
+fn identifier(port: Port) -> Result<(u64, u64), ReadError> {
     let mut info = IdentifierInfo::default();
     let mut words = IDENTIFIER_WORDS;
     // SAFETY: info is the flavor's exact writable layout, words counts its u32-sized words.
@@ -141,10 +160,50 @@ fn identifier(port: Port) -> Result<u64, ReadError> {
             operation: Operation::ThreadIdentity,
         });
     }
-    Ok(info.thread_id)
+    Ok((info.thread_id, info.dispatch_qaddr))
 }
 
-fn extended(port: Port) -> Result<(Option<String>, CpuCounter), ReadError> {
+/// Copy `buf.len()` bytes at `at` of this task's own memory through the kernel: `false` where
+/// it refused (an unmapped or protected page) or copied fewer, never a fault.
+fn copy_own(task: Port, at: u64, buf: &mut [u8]) -> bool {
+    let mut out = 0u64;
+    // SAFETY: `buf` is writable for its length, which the call is given; the kernel writes at
+    // most that many bytes into it and answers how many in `out`.
+    let code = unsafe {
+        mach_vm_read_overwrite(
+            task,
+            at,
+            buf.len() as u64,
+            buf.as_mut_ptr() as u64,
+            &raw mut out,
+        )
+    };
+    code == 0 && out == buf.len() as u64
+}
+
+/// The queue whose slot is at `slot`, read through [`copy_own`] at libdispatch's own offset.
+fn queue_of(task: Port, slot: u64) -> Queue {
+    // SAFETY: libdispatch exports this table, written once before any code runs and never
+    // after; only its first three words, which every version has, are read.
+    let (version, label_at, label_size) = unsafe {
+        (
+            dispatch_queue_offsets.version,
+            dispatch_queue_offsets.label,
+            dispatch_queue_offsets.label_size,
+        )
+    };
+    if version == 0 || usize::from(label_size) != size_of::<u64>() {
+        return Queue::Unread;
+    }
+    let mut word = |at: u64| {
+        let mut b = [0u8; 8];
+        copy_own(task, at, &mut b).then(|| u64::from_ne_bytes(b))
+    };
+    let mut bytes = |at: u64, buf: &mut [u8]| copy_own(task, at, buf);
+    queue_at(slot, u64::from(label_at), &mut word, &mut bytes)
+}
+
+fn extended(port: Port) -> Result<(Option<String>, (CpuCounter, CpuSplit)), ReadError> {
     // SAFETY: the record consists only of integer fields and a byte array.
     let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
     let mut words = EXTENDED_WORDS;
@@ -176,15 +235,26 @@ fn extended(port: Port) -> Result<(Option<String>, CpuCounter), ReadError> {
     ))
 }
 
-fn threads() -> Result<(Vec<ThreadReading>, Coverage), ReadError> {
+fn threads(
+    ask: &mut dyn FnMut(u64, Option<CpuCounter>) -> bool,
+) -> Result<(Vec<ThreadReading>, Coverage), ReadError> {
     let list = thread_list()?;
+    // SAFETY: libSystem keeps this task's send right alive for this process's lifetime.
+    let task = unsafe { mach_task_self_ };
     let (threads, coverage) = observe_threads(list.ports(), |port| {
-        let id = identifier(port).ok()?;
-        let (name, cpu) = match extended(port) {
-            Ok((name, cpu)) => (name, Some(cpu)),
-            Err(_) => (None, None),
+        let (id, slot) = identifier(port).ok()?;
+        let (name, cpu, split) = match extended(port) {
+            Ok((name, (cpu, split))) => (name, Some(cpu), Some(split)),
+            Err(_) => (None, None, None),
         };
-        Some(ThreadReading { id, name, cpu })
+        let queue = ask(id, cpu).then(|| queue_of(task, slot));
+        Some(ThreadReading {
+            id,
+            name,
+            cpu,
+            split,
+            queue,
+        })
     });
     // Return errors only after trying every release, never abandoning the remaining rights.
     list.close()?;
@@ -225,13 +295,16 @@ fn process(pid: u32, timebase: (u32, u32)) -> Result<(u64, CpuCounter), ReadErro
     ))
 }
 
-pub(super) fn read(epoch: Instant) -> Result<Cut, ReadError> {
+pub(super) fn read(
+    epoch: Instant,
+    ask: &mut dyn FnMut(u64, Option<CpuCounter>) -> bool,
+) -> Result<Cut, ReadError> {
     let begin_ns = stamp(epoch, Instant::now())?;
     let timebase = crate::procs::kernel_timebase().ok_or(ReadError::Timebase)?;
     let pid = std::process::id();
     let version = crate::pid_version(pid).ok_or(ReadError::Identity)?;
     let (start, process_before) = process(pid, timebase)?;
-    let (threads, coverage) = threads()?;
+    let (threads, coverage) = threads(ask)?;
     let (end_start, process_after) = process(pid, timebase)?;
     let end_version = crate::pid_version(pid).ok_or(ReadError::Identity)?;
     if start != end_start || version != end_version {

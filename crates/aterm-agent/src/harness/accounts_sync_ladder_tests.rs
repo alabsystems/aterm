@@ -178,6 +178,255 @@ pub(super) fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAtt
         .and_then(|b| b.sign_in_attempt.clone())
 }
 
+/// The account key [`one_pass`]'s `w3` is keyed as: its account's on record, and the lab's key
+/// for its email.
+#[cfg(unix)]
+pub(in crate::harness) const PASS_KEY: &str = "ac-0123456789abcdef";
+
+/// When [`one_pass`] runs (Unix seconds).
+#[cfg(unix)]
+pub(in crate::harness) const PASS_AT: i64 = NOW;
+
+/// What [`one_pass`] did.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(in crate::harness) struct Pass {
+    /// How many browsers a sign-in was handed.
+    pub(in crate::harness) handed: usize,
+    /// `w3`'s sign-in attempt on record after the pass.
+    pub(in crate::harness) attempt: Option<accounts::SignInAttempt>,
+    /// Every line the pass logged.
+    pub(in crate::harness) logged: Vec<String>,
+}
+
+/// The lab's key for `w3`'s email ([`PASS_KEY`]), as a journal keyer.
+#[cfg(unix)]
+fn pass_keyer(_realm: &str, email: &str) -> Option<String> {
+    (email == "w3.m30.3@example.test").then(|| PASS_KEY.to_owned())
+}
+
+/// [`one_pass`]'s desk and bench, before any pass: `w3` of [`hand_roster`], keyed [`PASS_KEY`],
+/// its headless browser profile ready beside a browser (so the profile route is ready), and,
+/// where `token_here`, its vault token in use here for a year past [`PASS_AT`]. Each run of
+/// `claude auth login` it is handed fails, and its guard reads the clock [`scripted`] reads.
+#[cfg(unix)]
+fn pass_desk(token_here: bool) -> (Desk, Bench) {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, false);
+    let store = desk.store();
+    store
+        .transact(NOW - 30, &mut None, |state| {
+            state.accounts.entry("w3".to_owned()).or_default().pk = Some(PASS_KEY.to_owned());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let mut bench = Bench {
+        browser: true,
+        guard: guard_reading(MachineReads {
+            clock: scripted,
+            ..MachineReads::default()
+        }),
+        ..Bench::ending(Renewal::Failed)
+    };
+    if token_here {
+        // A fixed end a year past the pass, so the reading compares no clock.
+        bench.tokens_here = |_, _, _, _| {
+            let year = u64::try_from(PASS_AT).unwrap_or(0) + 365 * 86_400;
+            Some([("w3".to_owned(), year)].into_iter().collect())
+        };
+    }
+    (desk, bench)
+}
+
+/// One upkeep pass of `bench` over `desk` at wall `now` and guard clock `at`, with `fleet` as
+/// what this Mac's shared files say ([`accounts::with_fleet`]). The bench runs on this thread,
+/// so the fleet reaches the ladder's hydrate.
+#[cfg(unix)]
+fn fleet_pass(desk: &Desk, bench: &Bench, fleet: &accounts::Fleet, now: i64, at: Instant) -> bool {
+    SCRIPTED.set(Some(at));
+    accounts::with_fleet(fleet.clone(), || {
+        crate::harness::journal::with_keyer(pass_keyer, || bench.pass(desk, now))
+    })
+}
+
+/// A fleet whose files say `w3`'s account ([`PASS_KEY`]) was blocked at `at`.
+#[cfg(unix)]
+fn blocked_at(at: i64) -> accounts::Fleet {
+    accounts::Fleet {
+        blocked: [(PASS_KEY.to_owned(), at)].into_iter().collect(),
+        ..accounts::Fleet::default()
+    }
+}
+
+/// ONE UPKEEP SIGN-IN PASS AT [`PASS_AT`] over `w3` of [`hand_roster`] ([`pass_desk`]), with
+/// `fleet` as what this Mac's shared files say, through the real ladder: `w3`, keyed
+/// [`PASS_KEY`], is signed out with a session on it here, its headless browser profile is ready
+/// beside a browser, and, where `token_here`, its vault token is in use here for a year. Each
+/// run of `claude auth login` it is handed fails.
+#[cfg(unix)]
+pub(in crate::harness) fn one_pass(fleet: accounts::Fleet, token_here: bool) -> Pass {
+    let (desk, bench) = pass_desk(token_here);
+    fleet_pass(&desk, &bench, &fleet, PASS_AT, Instant::now());
+    Pass {
+        handed: bench.handed().len(),
+        attempt: attempt_of(&desk, "w3"),
+        logged: bench.logged(),
+    }
+}
+
+/// The sign-in events of `label` on `desk`'s ledger.
+#[cfg(unix)]
+fn sign_in_events(desk: &Desk, label: &str) -> usize {
+    desk.store()
+        .tail(accounts::LEDGER_KEEP_ROWS)
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == accounts::Kind::SignIn && event.account == label)
+        .count()
+}
+
+/// A FLEET'S HOLD IS RECORDED ONCE AND ITS LAPSE ENDS THE WAIT IT SET (SF-09). In one process, a
+/// block of `w3`'s account that a Mac of the fleet recorded 23 h 30 min before the first pass
+/// holds the row, whose profile route is ready: no browser is handed out, the attempt is
+/// `no-route` in words that name the hold's end ([`sign_in_ladder::fleet_words`]), one sign-in
+/// event is written, and the log says how long ago and how long more. A second pass the same
+/// hold holds, past the ladder's first wait, records nothing new: the attempt is the same, with
+/// the same `since`, and no event is written. A third pass, once the hold has lapsed and while
+/// the ladder's doubled wait still stands, signs the row in: the hold's end is one of the row's
+/// inputs, so its lapse ends the wait it set.
+///
+/// NEGATIVE CONTROLS (2026-11-17), each in its own run beside mutants that reach other tests,
+/// restored from HEAD after:
+/// - the ladder recording `fleet_said` (words that count the time ago and left) in place of
+///   `fleet_words`: `the same hold records nothing new` failed, the second pass's words saying
+///   `23h50m ago … for 10m more` where the first's said `23h30m ago … for 30m more`;
+/// - `ladder_route_in_context` without its `|fleet=<until>` input: the third pass started no
+///   sign-in, the doubled wait holding it.
+///
+/// [`sign_in_ladder::fleet_words`]: crate::harness::sign_in_ladder::fleet_words
+#[cfg(unix)]
+#[test]
+fn a_fleets_hold_is_recorded_once_and_its_lapse_ends_the_wait_it_set() {
+    use crate::harness::accounts::FLEET_BLOCK_S;
+    let (desk, bench) = pass_desk(false);
+    let fleet = blocked_at(PASS_AT - FLEET_BLOCK_S + 30 * 60);
+    let hold = accounts::FleetHold::of(PASS_AT - FLEET_BLOCK_S + 30 * 60, PASS_AT)
+        .expect("a block 23 h 30 min old holds");
+    assert_eq!(hold.until, PASS_AT + 30 * 60);
+    let start = Instant::now();
+
+    assert!(!fleet_pass(&desk, &bench, &fleet, PASS_AT, start));
+    assert_eq!(bench.handed().len(), 0, "no browser: {:?}", bench.logged());
+    let first = attempt_of(&desk, "w3").expect("the attempt is on record");
+    assert_eq!(
+        first.outcome,
+        accounts::AttemptOutcome::NoRoute,
+        "{first:?}"
+    );
+    assert_eq!(sign_in_events(&desk, "w3"), 1);
+    let said = crate::harness::sign_in_ladder::fleet_said(&hold, PASS_AT);
+    assert!(
+        bench.logged().iter().any(|line| line.contains(&said)),
+        "{:?}",
+        bench.logged()
+    );
+
+    // Past the first wait (15 min), still inside the hold.
+    let later = start + Duration::from_secs(20 * 60);
+    assert!(!fleet_pass(&desk, &bench, &fleet, PASS_AT + 20 * 60, later));
+    assert_eq!(bench.handed().len(), 0, "still held: {:?}", bench.logged());
+    assert_eq!(
+        attempt_of(&desk, "w3").as_ref(),
+        Some(&first),
+        "the same hold records nothing new"
+    );
+    assert_eq!(sign_in_events(&desk, "w3"), 1, "one event for one hold");
+    assert!(
+        first
+            .routes
+            .starts_with(&crate::harness::sign_in_ladder::fleet_words(&hold)),
+        "{first:?}"
+    );
+
+    // The hold lapsed a minute ago; the doubled wait (30 min from the second pass) stands.
+    let lapsed = later + Duration::from_secs(11 * 60);
+    assert!(fleet_pass(&desk, &bench, &fleet, PASS_AT + 31 * 60, lapsed));
+    assert_eq!(
+        bench.handed().len(),
+        1,
+        "the lapse ends the wait it set: {:?}",
+        bench.logged()
+    );
+}
+
+/// A HOLD BUILT FROM THIS MAC'S OWN BLOCK KEEPS THAT BLOCK ON RECORD (SF-09). `w3`'s last sign-in
+/// here stopped at a page no bot protection made (a window a person closed) seven hours ago, so
+/// its own six-hour hold ([`page_holds`]) is over, and this Mac's own `ai/logins` row, which says
+/// `blocked` at that time, is the fleet's only block of its account. The pass that block holds
+/// hands out no browser and leaves the `blocked` attempt as it was: recorded over as `no-route`,
+/// this Mac's row would say `no-route`, ending every Mac's hold of the account, this one's at its
+/// next pass, at about six hours, not 24. CONTROL: the same block 25 hours old holds nothing, and
+/// the browser opens.
+///
+/// NEGATIVE CONTROL (2026-11-17, in a run beside mutants that reach other tests):
+/// `ladder_route_in_context` recording the hold whatever this Mac's last attempt was
+/// (`keeps_its_block` false): the attempt became `no-route` in words that name the hold, left
+/// `NoRoute`, right `Blocked`; restored from HEAD.
+#[cfg(unix)]
+#[test]
+fn a_hold_built_from_this_macs_own_block_keeps_that_block_on_record() {
+    let stop = |desk: &Desk, at: i64| {
+        desk.store()
+            .transact_pool_logins_within(&[], &desk.roster(), at, &mut None, |raw, _, logins| {
+                accounts::admit_workflow(logins, "w3")?;
+                Ok(accounts::note_sign_in_stop(
+                    logins,
+                    raw.row("w3").expect("the row"),
+                    false,
+                    crate::harness::open_url::MetWord::WindowClosed,
+                    "window: a person closed it",
+                    at,
+                ))
+            })
+            .unwrap();
+    };
+    let met = PASS_AT - 7 * 3_600;
+    let (desk, bench) = pass_desk(false);
+    stop(&desk, met);
+    let before = attempt_of(&desk, "w3").expect("the stop is on record");
+    assert_eq!(before.outcome, accounts::AttemptOutcome::Blocked);
+    assert!(!fleet_pass(
+        &desk,
+        &bench,
+        &blocked_at(met),
+        PASS_AT,
+        Instant::now()
+    ));
+    assert_eq!(bench.handed().len(), 0, "held: {:?}", bench.logged());
+    assert_eq!(
+        attempt_of(&desk, "w3").as_ref(),
+        Some(&before),
+        "this Mac's own block stays on record under the hold it set"
+    );
+
+    let met = PASS_AT - 25 * 3_600;
+    let (desk, bench) = pass_desk(false);
+    stop(&desk, met);
+    assert!(fleet_pass(
+        &desk,
+        &bench,
+        &blocked_at(met),
+        PASS_AT,
+        Instant::now()
+    ));
+    assert_eq!(bench.handed().len(), 1, "CONTROL: {:?}", bench.logged());
+}
+
 /// A PAGE'S STOP THAT NO BOT PROTECTION MADE (a sign-in window a person closed) HOLDS ITS ROW FOR
 /// SIX HOURS, counted from its last try and on record: past a restart, which forgets the ladder's
 /// own wait, a changed secret, which ends that wait as a new input, and a move, which is heard at
@@ -686,10 +935,6 @@ fn a_damaged_ledger_suffix_cannot_leave_an_earlier_browser_completion_usable() {
     assert_eq!(fs::read(store.ledger_path()).unwrap(), legacy);
 }
 
-/// Unix only, where aterm links the opener an unattended run's page is handed to
-/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
-/// holds what runs.
-#[cfg(unix)]
 #[test]
 fn an_expired_retry_keeps_its_owner_when_another_sign_in_is_running() {
     let desk = Desk::new("m30");
@@ -1197,11 +1442,6 @@ fn a_replaced_login_stops_the_automatic_retry_and_failure_summary() {
 /// profile, the default browser) is tried in its place. The run that failed is on record with
 /// its route, how it ended and every route read, is one log line, and sets the row's backoff:
 /// the next pass, past the sign-in cooldown, starts nothing and logs nothing.
-///
-/// Unix only, where aterm links the opener an unattended run's page is handed to
-/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
-/// holds what runs.
-#[cfg(unix)]
 #[test]
 fn an_unattended_run_is_never_handed_a_window_and_its_failure_is_on_record_and_held() {
     let desk = Desk::new("m30");
@@ -1260,54 +1500,11 @@ fn an_unattended_run_is_never_handed_a_window_and_its_failure_is_on_record_and_h
     assert_eq!(bench.logged(), lines, "nothing logged while held");
 }
 
-/// Off Unix aterm links no opener for a sign-in's page (`cli::opener_link`), so an unattended
-/// run is handed no browser at all, never a window in its place: the row is not signed in, its
-/// failure is one log line saying why, and the row's backoff holds the next pass.
-#[cfg(not(unix))]
-#[test]
-fn an_unattended_run_is_handed_nothing_where_aterm_links_no_opener() {
-    let desk = Desk::new("m30");
-    hand_roster(&desk, true);
-    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
-        &desk.store().dir,
-        Some("w3"),
-    ))
-    .unwrap();
-    let bench = Bench {
-        browser: true,
-        ..Bench::ending(Renewal::Renewed)
-    };
-    assert!(bench.pass(&desk, NOW), "the profile route started");
-    assert!(bench.handed().is_empty(), "{:?}", bench.handed());
-    assert_ne!(
-        attempt_of(&desk, "w3").map(|a| a.outcome),
-        Some(accounts::AttemptOutcome::SignedIn)
-    );
-    let lines = bench.logged();
-    let cause = crate::harness::cli::opener_link(
-        &desk.store(),
-        &crate::harness::cli::LiveAccounts::default(),
-    )
-    .unwrap_err()
-    .to_string();
-    let failed: Vec<&String> = lines.iter().filter(|l| l.contains(&cause)).collect();
-    assert_eq!(failed.len(), 1, "{lines:?}");
-
-    bench.cool();
-    assert!(!bench.pass(&desk, NOW + 60), "the backoff holds");
-    assert_eq!(bench.logged(), lines, "nothing logged while held");
-}
-
 /// On a vault member whose subscriber rewrites `state.toml` to say when it last heard the vault,
 /// a row whose mailbox route ran and failed stays in its backoff: the rewrite delivered nothing.
 /// The vault's own bookkeeping, a rewrite of when it heard the vault or a new version that wrote
 /// nothing here, neither ends a row's backoff nor resets its step, so the next failure doubles
 /// it; an entry the vault delivers ends the backoff at once.
-///
-/// Unix only, where aterm links the opener an unattended run's page is handed to
-/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
-/// holds what runs.
-#[cfg(unix)]
 #[test]
 fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
     let desk = Desk::new("m30");
@@ -1404,11 +1601,6 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
 /// among them; a row no session needs yet is signed in only where Claude Code's own files show
 /// its account, never for an address only a credential names. CONTROL: the row a Claude Code
 /// backup shows is signed in.
-///
-/// Unix only, where aterm links the opener an unattended run's page is handed to
-/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
-/// holds what runs.
-#[cfg(unix)]
 #[test]
 fn a_row_only_a_credential_names_is_not_signed_in_before_a_session_needs_it() {
     let desk = Desk::new("m27");
@@ -1464,11 +1656,6 @@ fn a_row_only_a_credential_names_is_not_signed_in_before_a_session_needs_it() {
 
 /// `[harness] logins = "off"` stops the ladder: a window's upkeep starts no sign-in and records
 /// none. CONTROL: with the switch as it ships, the same upkeep starts one.
-///
-/// Unix only, where aterm links the opener an unattended run's page is handed to
-/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
-/// holds what runs.
-#[cfg(unix)]
 #[test]
 fn a_person_turning_logins_off_stops_the_ladder() {
     for logins in ["off", "renew"] {

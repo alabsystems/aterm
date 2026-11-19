@@ -59,7 +59,8 @@ impl Reason {
                 | Short::Alone { .. }
                 | Short::WantsAlone { .. } => "memory",
                 Short::Cores => "core",
-                Short::Turn { .. } | Short::Ledger(_) => "ledger",
+                Short::Turn { .. } | Short::ExternalLock | Short::Ledger(_) => "ledger",
+                Short::LegacySlots { .. } => "core",
                 Short::Disk { .. } => "disk",
                 Short::Release => "preemption",
                 Short::Heavy { .. } => "turn",

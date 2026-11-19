@@ -750,12 +750,13 @@ fn reset_soon() -> Vec<(String, String)> {
 }
 
 /// `aterm <args>` run as a program on `inst`'s machine would run it ([`cli_command`]); its exit
-/// code and both outputs, within the hang detector.
+/// code and both outputs, killed as hung after [`DEADLINE`] without progress.
 fn cli(inst: &Inst, args: &[&str]) -> (i32, String, String) {
     let mut cmd = cli_command(harness::aterm_to_launch(), &inst.root, args);
-    let out = aterm_uds::deadline::output_until_complete_stdout(
+    let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
         &mut cmd,
-        std::time::Instant::now() + DEADLINE,
+        DEADLINE,
+        format!("aterm {args:?}"),
     )
     .unwrap_or_else(|e| panic!("aterm {args:?} exits within the hang detector: {e}"));
     (
@@ -979,7 +980,7 @@ fn until_on<T>(
 /// `n` ms, within the hang detector.
 fn paced_mark(inst: &Inst, sid: &str, mark: &str) {
     let line = format!("@{sid} mark - {mark}");
-    let deadline = Instant::now() + DEADLINE;
+    let mut patience = crate::patience::Patience::new(DEADLINE);
     loop {
         let r = inst.verb(&line);
         if r.ok() {
@@ -990,10 +991,9 @@ fn paced_mark(inst: &Inst, sid: &str, mark: &str) {
             .strip_prefix("ERR busy retry_ms=")
             .and_then(|n| n.trim().parse::<u64>().ok())
             .unwrap_or_else(|| panic!("{line}: {}", r.header()));
-        assert!(
-            Instant::now() < deadline,
-            "{line}: still busy after {DEADLINE:?}"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("{line}: still busy ({why})");
+        }
         std::thread::sleep(Duration::from_millis(wait));
     }
 }
@@ -2623,7 +2623,29 @@ fn cold_native_settled() -> ColdNative {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
-    let fixture = cold_native_settled();
+    asked_upgrade_onto_the_second_build(&cold_native_settled(), false);
+}
+
+/// THE ASKED UPGRADE THROUGH THE TWIN ATPKG LAYS, TOKEN ROUTE INCLUDED (`m16`'s Claude Code
+/// sessions held at `wait:native-managed-policy` once their twin carried it, 2026-11-17): the
+/// second build's twin is the body `activate::reconcile_agents` lays where its helper has an aterm
+/// beside it, the helper's tap and the vault-token route ahead of its exec. The session on its
+/// stored login, its token absent here, is moved onto the physical second build with the same
+/// conversation, its twin's token block projected under the plan's own judgment.
+///
+/// NEGATIVE CONTROL: with `projection_rule(TwinBlock::TokenRoute)` refusing the block as before,
+/// the move never comes and the record waits `native-twin-token-unjudged`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn an_asked_upgrade_through_the_token_twin_execs_the_build_and_settles() {
+    asked_upgrade_onto_the_second_build(&cold_native_settled(), true);
+}
+
+/// Lay the second build and its twin (`token_route`: the twin atpkg lays with its helper's tap and
+/// the token route), wake the activation, and see the asked upgrade exec that build with the same
+/// conversation and settle it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn asked_upgrade_onto_the_second_build(fixture: &ColdNative, token_route: bool) {
     let a = &fixture.a;
     let s = &fixture.sid;
     let prefix = &fixture.prefix;
@@ -2652,20 +2674,27 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
             .then_some(())
     });
     let staged_twin = twin.with_file_name(".claude-next");
+    let helper = token_route.then(|| prefix.join("libexec/atpkg"));
     let mut prelude = atpkg::platform::twin_prelude(
         "claude",
         prefix,
-        None,
+        helper.as_deref(),
         atpkg::selfupdate::verbs_of("claude"),
         &atpkg::yolo::policy_of("claude"),
     );
-    prelude.push_str(&atpkg::launch_tap::sh_prelude("claude", None));
+    prelude.push_str(&atpkg::launch_tap::sh_prelude("claude", helper.as_deref()));
     let exports = atpkg::shim_env::ShimEnv::admit(&[
         "DISABLE_AUTOUPDATER=1".into(),
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1".into(),
     ])
     .unwrap();
     atpkg::platform::install_twin_to_env(&staged_twin, next_build, &exports, &prelude).unwrap();
+    if let Some(helper) = &helper {
+        let body = std::fs::read_to_string(&staged_twin).unwrap();
+        let routed = atpkg::launch_tap::with_token_block("claude", body.clone(), Some(helper));
+        assert!(routed.contains("token-run --auto"), "{routed}");
+        std::fs::write(&staged_twin, routed).unwrap();
+    }
     std::fs::rename(&staged_twin, twin).unwrap();
     let notices = prefix.join(atpkg::activation_notice::NOTICE_DIR);
     std::fs::create_dir_all(&notices).unwrap();

@@ -203,7 +203,11 @@ fn a_failed_hello_is_settled_only_where_a_heard_change_ends_it() {
         Answer::of_failure(&not_installed(), true),
         Answer::Transient
     );
-    let outdated = LanError::Unavailable(Unavailable::Outdated { ours: 1, theirs: 2 });
+    let outdated = LanError::Unavailable(Unavailable::Outdated {
+        ours: 1,
+        theirs: 2,
+        build: "fixture".into(),
+    });
     assert_eq!(Answer::of_failure(&outdated, true), Answer::Settled);
     let refused = LanError::Unavailable(Unavailable::Refused("not aterm's code".into()));
     assert_eq!(Answer::of_failure(&refused, true), Answer::Settled);

@@ -2996,7 +2996,8 @@ fn recording_held(said: &str, outlasted: bool) -> Result<String, String> {
 /// What the instance's aterm had spent at one reading (`proc_pid_rusage`): its CPU time, user and
 /// system together, in the kernel's ticks, and the instructions its threads retired; and its main
 /// thread's id, CPU time in ns ([`crate::sys::thread_cpu_ns`], the least thread id) and retired
-/// instructions ([`crate::sys::thread_instructions`]), where it draws a headless frame, apart from
+/// instructions, every performance level together ([`aterm_sysprobe::thread_counts::read`]),
+/// where it draws a headless frame, apart from
 /// the threads a `video` recording converts frames on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Spent {
@@ -3022,7 +3023,10 @@ fn spent(pid: i32) -> Option<Spent> {
         threads.first().map(|t| MainSpent {
             tid: t.tid,
             ns: t.ns,
-            insn: crate::sys::thread_instructions(pid, t.tid),
+            insn: u32::try_from(pid)
+                .ok()
+                .and_then(|pid| aterm_sysprobe::thread_counts::read(pid, t.tid))
+                .map(|c| c.total().instructions),
         })
     });
     crate::sys::rusage(pid).map(|u| Spent {

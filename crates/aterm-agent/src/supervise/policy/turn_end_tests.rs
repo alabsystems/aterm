@@ -14824,7 +14824,7 @@ fn land_lands_nothing_over_repo_work() {
         ..stashed.clone()
     };
     assert!(
-        repo_work_suffix(&unlanded).contains("1 commit not on origin/main"),
+        repo_work_suffix(&unlanded).contains("1 commit not on cached origin/main"),
         "{}",
         repo_work_suffix(&unlanded)
     );

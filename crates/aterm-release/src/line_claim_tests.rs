@@ -862,7 +862,7 @@ fn blocked_publication_cannot_hide_completed_progress_from_the_fleet() {
 
 /// The record of `holder` the fleet survey reads from this host's registry.
 fn recorded(holder: &Holder, directory: &Path) -> Option<State> {
-    aterm_agent::release_progress::survey(directory)
+    aterm_agent::release_progress::survey(directory, now())
         .iter()
         .filter_map(|line| line.split_once(" data=").map(|(_, data)| data))
         .filter_map(|data| {
@@ -1748,6 +1748,60 @@ fn two_cutters_racing_for_an_expired_lease_produce_one_winner() {
     assert_eq!(remote(&b, &name).unwrap().unwrap().1.holder, m73);
 }
 
+/// A take collects this host's release-line registry once its own record is written: a record
+/// whose holder this kernel proves dead and whose last renewal is more than a lease old goes,
+/// while a dead holder's record still inside its lease and the taker's own record stay.
+/// NEGATIVE CONTROL: an attempt that cannot write the taker's record (a folder stands at its
+/// path) removes nothing, so a take collects only once its own identity is observable.
+#[cfg(unix)]
+#[test]
+fn a_take_collects_the_dead_lapsed_records_beside_its_own() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (a, _b, name, _) = orphaned_origin(dir.path());
+    let line = orphan().line;
+    let m73 = state("m73", NOW).holder;
+    let clock = || NOW;
+    let unseen = |_: &State| unreachable();
+    let registry = dir.path().join(aterm_agent::release_progress::DIRECTORY);
+    std::fs::create_dir_all(&registry).unwrap();
+    let pid = std::process::id();
+    let (boot, start) = aterm_agent::release_progress::identity(pid).unwrap();
+    let dead = |path: &Path, start: u64, at: u64| {
+        let holder = aterm_json::json!({"pid": pid, "boot": boot, "start": start});
+        let record = aterm_json::json!({"holder": holder, "at": at});
+        std::fs::write(path, record.to_string()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at))
+            .unwrap();
+    };
+    let lapsed = registry.join("0.198.0-1-1.json");
+    let leased = registry.join("0.198.0-2-2.json");
+    dead(&lapsed, start.wrapping_add(1), NOW - MAX_LEASE_S - 1);
+    dead(&leased, start.wrapping_add(2), NOW - 60);
+    let own = registry.join(identity_of(&m73).record_name(&line.version));
+    std::fs::create_dir(&own).unwrap();
+    let take = || {
+        attempt(
+            &a,
+            &taker(dir.path(), &m73, &clock, &unseen),
+            &name,
+            &line,
+            None,
+            None,
+            None,
+        )
+    };
+    assert!(take().is_err(), "no record, no take");
+    assert!(lapsed.is_file() && leased.is_file());
+    std::fs::remove_dir(&own).unwrap();
+    assert!(matches!(take(), Ok(Attempt::Taken(_))));
+    assert!(!lapsed.exists());
+    assert!(leased.is_file() && own.is_file());
+}
+
 /// The production renewal: a completed row the sampler reads advances the lease, and the
 /// progress monitor writes it to the ref, where another cutter is refused until a whole bound
 /// after it.
@@ -2082,6 +2136,78 @@ fn a_holder_in_one_long_row_renews_by_heartbeat_and_is_not_taken() {
     assert_ne!(taken.state.p95_s, 0);
 }
 
+/// THE PUMP THAT HOLDS A LINE BETWEEN ITS RUNS RENEWS ITS CHILD'S CLAIM (UB-15 round 4 finding
+/// 5). The claim names the pump's release child, which has ended; a contender that cannot ask its
+/// Mac judges the line by the lease alone. For three leases the pump renews the claim as it stands,
+/// a compare-and-swap with `at` now, every quarter hour, and the contender is refused throughout,
+/// told the renewal's evidence; the claim keeps its line, holder and rows. A claim of another
+/// holder (another process, or the same one named from another node), and a version with no
+/// claim, are left as they are.
+/// NEGATIVE CONTROL: once the pump stops renewing (it died), the contender takes the line one
+/// lease after the last renewal, and the dead pump's next renewal finds another holder and writes
+/// nothing.
+#[cfg(unix)]
+#[test]
+fn a_pump_renews_its_childs_claim_between_its_runs() {
+    let lease = lease_s(&orphan());
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (a, b, name, _) = orphaned_origin(dir.path());
+    let child = orphan().holder;
+    let holder = (
+        child.node.as_str(),
+        child.pid,
+        child.boot.as_str(),
+        child.start,
+    );
+    let last = 3 * lease;
+    for t in (900..=last).step_by(900) {
+        assert_eq!(renew_with(&a, &name, holder, orphan().at + t), Ok(true));
+        let Err(refused) = contend(dir.path(), &b, &name, t + lease) else {
+            panic!("the contender took a renewed line at {t}");
+        };
+        assert!(
+            refused.contains("its last evidence of progress: renewed by the release pump"),
+            "{refused}"
+        );
+    }
+    let renewed = remote(&a, &name).unwrap().unwrap().1;
+    assert_eq!(renewed.at, orphan().at + last);
+    assert_eq!(
+        (renewed.line, renewed.holder, renewed.rows),
+        (orphan().line, orphan().holder, orphan().rows)
+    );
+    // Another holder's claim, and a version with no claim, are left as they are.
+    let other = (
+        child.node.as_str(),
+        child.pid + 1,
+        child.boot.as_str(),
+        child.start,
+    );
+    assert_eq!(
+        renew_with(&a, &name, other, orphan().at + last + 60),
+        Ok(false)
+    );
+    let elsewhere = ("m73", child.pid, child.boot.as_str(), child.start);
+    assert_eq!(
+        renew_with(&a, &name, elsewhere, orphan().at + last + 60),
+        Ok(false)
+    );
+    assert_eq!(remote(&a, &name).unwrap().unwrap().1.at, orphan().at + last);
+    let unclaimed = reference("0.300.0").unwrap();
+    assert_eq!(renew_with(&a, &unclaimed, holder, orphan().at), Ok(false));
+    // NEGATIVE CONTROL: the pump stops renewing, and the line is taken one lease later.
+    assert!(contend(dir.path(), &b, &name, last + lease).is_err());
+    let Ok(Attempt::Taken(taken)) = contend(dir.path(), &b, &name, last + lease + 1) else {
+        panic!("a line nobody renews is taken once its lease lapses");
+    };
+    assert_eq!(taken.state.holder.node, "m73");
+    assert_eq!(
+        renew_with(&a, &name, holder, orphan().at + last + lease + 60),
+        Ok(false)
+    );
+    assert_eq!(remote(&a, &name).unwrap().unwrap().1.holder.node, "m73");
+}
+
 /// A hung holder still loses its line. Its heartbeat renews only on a look that found its
 /// processes working, so once they stop, it stops: the last renewal (here the look half a
 /// minute after, which still reads the minute before it) is no later than a minute after the
@@ -2356,6 +2482,61 @@ fn advanced() -> State {
         ..crate::line::Hop::default()
     });
     advanced
+}
+
+/// THE PUMP'S RE-BASE ENDS BESIDE A LIVE HOLDER THAT MOVED THE LINE (UB-15). A session took the
+/// line from the pump's dead child after the pump looked and carried a fix, so the claim stands
+/// for the line with that hop while the session still runs. The re-base's take admits the holder
+/// before it compares the line, so it ends beside the live holder (CUTTING ELSEWHERE, exit 4, its
+/// re-base unspent) with nothing written; from a holder proven dead it is refused as a line that
+/// advanced, since it judged the line before the hop.
+/// NEGATIVE CONTROL: a session's `--supersede` of the same claim, which admits no holder, is
+/// refused as a line that advanced.
+#[cfg(unix)]
+#[test]
+fn the_pumps_rebase_ends_beside_a_live_holder_that_moved_the_line() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (a, _b, name, orphan_sha) = orphaned_origin(dir.path());
+    let line = orphan().line;
+    let moved = advanced();
+    let Write::Written(fresh) = replace(&a, &name, &orphan_sha, &moved) else {
+        panic!("the session carries its hop");
+    };
+    let m73 = state("m73", NOW).holder;
+    let clock = || NOW + 1;
+    let alive = |_: &State| Observation::Unproven("its process runs".into());
+    let dead = |_: &State| Observation::Dead;
+    let take = |take: Take, observe: &dyn Fn(&State) -> Observation| {
+        attempt(
+            &a,
+            &Taker {
+                take,
+                ..taker(dir.path(), &m73, &clock, observe)
+            },
+            &name,
+            &line,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{take:?} takes nothing"))
+    };
+    let beside = take(Take::Rebase, &alive);
+    assert!(beside.starts_with("CUTTING ELSEWHERE"), "{beside}");
+    let advanced = take(Take::Rebase, &dead);
+    assert!(advanced.contains("advanced"), "{advanced}");
+    assert_eq!(
+        remote(&a, &name).unwrap().unwrap().0,
+        fresh,
+        "nothing written"
+    );
+    // NEGATIVE CONTROL: a session's supersession compares the line alone.
+    let session = take(Take::Supersede, &alive);
+    assert!(
+        session.contains("advanced") && !session.starts_with("CUTTING ELSEWHERE"),
+        "{session}"
+    );
 }
 
 /// THE SUPERSESSION CHECKS THE LINE IT REPLACES BEFORE IT TAKES THE CLAIM. A session judged
@@ -2686,5 +2867,263 @@ fn a_wait_the_run_names_renews_the_lease_and_changes_nothing_else() {
     assert_eq!(
         record["holder"]["pid"].as_u64(),
         Some(u64::from(before.holder.pid))
+    );
+}
+
+/// A claim store's git that counts the scans of main's history it is asked for.
+#[cfg(unix)]
+struct Counting<'a> {
+    inner: GitCli,
+    logs: &'a std::cell::Cell<usize>,
+}
+
+#[cfg(unix)]
+impl Counting<'_> {
+    fn count(&self, args: &[&str]) {
+        if args.first() == Some(&"log") {
+            self.logs.set(self.logs.get() + 1);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl GitRunner for Counting<'_> {
+    fn git(&self, args: &[&str]) -> crate::ledger::Result<crate::ledger::RunOut> {
+        self.count(args);
+        self.inner.git(args)
+    }
+    fn git_read(&self, args: &[&str]) -> crate::ledger::Result<crate::ledger::RunOut> {
+        self.count(args);
+        self.inner.git_read(args)
+    }
+}
+
+/// THE LINE AND MAIN'S RECORD OF ITS SUPERSESSION COME FROM ONE SCAN OF MAIN (UB-15). The claim
+/// read a pump makes each cycle applies main's durable retirement to the line and names the base
+/// main's record re-based it onto, both from the same scan of main's whole history, so the pump's
+/// word on a line's one re-base, and on whether it retired this clone's journal, costs no read of
+/// its own.
+/// NEGATIVE CONTROL: a version main records no supersession of keeps the claim's own line and is
+/// not said to be superseded.
+#[cfg(unix)]
+#[test]
+fn one_scan_of_main_reads_the_line_and_whether_it_was_superseded() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    crate::ledger::testing::init(
+        &repo,
+        &[
+            ("user.name", "Fixture"),
+            ("user.email", "fixture@example.invalid"),
+        ],
+    );
+    let git = GitCli::new(&repo);
+    let replacement = crate::line::Line::start("0.199.0", "replacement", 2);
+    let record = crate::line::Supersession {
+        previous: crate::line::Line::start("0.199.0", "base", 1),
+        replacement: replacement.clone(),
+        reason: "the line's one re-base".into(),
+    };
+    let message = format!(
+        "land\n\nAterm-Line-Supersession: {}",
+        aterm_json::to_string(&record).unwrap()
+    );
+    git_ok(&git, &["commit", "-q", "--allow-empty", "-m", &message]).unwrap();
+    git_ok(&git, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+    let logs = std::cell::Cell::new(0);
+    let counting = Counting {
+        inner: git,
+        logs: &logs,
+    };
+    let claimed = crate::line::Line::start("0.199.0", "base", 1);
+    assert_eq!(
+        retirement(&counting, "0.199.0", Some(claimed)),
+        Ok((Some(replacement), Some("replacement".into())))
+    );
+    assert_eq!(logs.get(), 1, "one scan of main for both");
+    let other = crate::line::Line::start("0.200.0", "base", 1);
+    assert_eq!(
+        retirement(&counting, "0.200.0", Some(other.clone())),
+        Ok((Some(other), None))
+    );
+    assert_eq!(logs.get(), 2);
+}
+
+/// A STANDBY READS THE HOLDER'S PUMPS ONLY FROM THE PROVEN NODE (UB-15). The pump rows of the
+/// holder's Mac's survey are read from an answer that proved the claim's node: each row reads
+/// whole, every clone's pump its own, and an empty list says the answer cannot tell whether a pump
+/// runs there.
+/// NEGATIVE CONTROLS: an error row, an unproven answer, one proving another node or none, and
+/// one from an aterm older than the field (no `pumps` key) give no answer, saying why; a row that
+/// does not read spoils the answer.
+#[test]
+fn a_holders_pump_is_read_only_from_its_proven_node() {
+    let pump = r#"{"alive":true,"pid":41,"holder":"m9","line":"v0.6.0@abc","step":"wait","own":true,"at":5,"age_s":30,"decision":"red"}"#;
+    let once = r#"{"alive":false,"pid":52,"holder":"m9","line":"v0.6.0@abc","step":"wait","own":false,"at":20,"age_s":15,"decision":"one cycle"}"#;
+    let answer = |proven: &str, pumps: Option<&str>| {
+        format!(
+            r#"[{{"label":"m9","fleet":true,"proven_node":{proven},"instance":{{}}{}}}]"#,
+            pumps.map_or_else(String::new, |pumps| format!(r#","pumps":[{pumps}]"#))
+        )
+    };
+    let read = pump_answer(&answer(r#""m9""#, Some(&format!("{pump},{once}"))), "m9")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read.iter()
+            .map(|row| (row.pid, row.alive, row.own, row.age_s, row.line.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (41, Some(true), Some(true), 30, "v0.6.0@abc"),
+            (52, Some(false), Some(false), 15, "v0.6.0@abc")
+        ]
+    );
+    assert_eq!(pump_answer(&answer(r#""m9""#, Some("")), "m9"), Ok(None));
+    let refused = |json: &str, why: &str| {
+        let said = pump_answer(json, "m9").unwrap_err();
+        assert!(said.contains(why), "{said}");
+    };
+    refused(&answer(r#""m9""#, None), "predates the pump= fact");
+    refused(&answer(r#""m8""#, Some(pump)), "did not prove");
+    refused(&answer("null", Some(pump)), "did not prove");
+    refused(
+        &answer(r#""m9""#, Some(pump))
+            .replace(r#""fleet":true"#, r#""fleet":true,"unproven":true"#),
+        "did not prove",
+    );
+    refused(
+        r#"[{"label":"m9","fleet":true,"error":"timed out"}]"#,
+        "did not answer: timed out",
+    );
+    refused(
+        &answer(r#""m9""#, Some(&format!(r#"{pump},{{"line":"v1"}}"#))),
+        "does not read",
+    );
+}
+
+/// A CLAIM'S LEASE ENDS FOR ITS READER BY THE CLAIM'S OWN RULE (UB-15 finding 10). A renewal
+/// further ahead of this clock than a whole lease frees the line for a contender (`expired`), and
+/// the claimant a standby reads says so, though its `until` is still that far ahead: the standby
+/// waits on a pump it cannot read only while the lease runs by the same rule a take judges by.
+/// NEGATIVE CONTROLS: a renewal a moment ahead, and one within the lease, have not ended.
+#[test]
+fn a_claimants_lease_ends_by_the_claims_own_rule() {
+    let skewed = state("m73", NOW + 86_400);
+    let read = claimant(&skewed, NOW);
+    assert!(read.ended, "{read:?}");
+    assert!(read.until > NOW + 86_400, "{read:?}");
+    assert!(!claimant(&state("m73", NOW + 60), NOW).ended);
+    assert!(!claimant(&state("m73", NOW - 60), NOW).ended);
+    assert!(claimant(&state("m73", NOW - lease_s(&skewed) - 1), NOW).ended);
+    assert_eq!(
+        (read.node.as_str(), read.host.as_str()),
+        ("m73", skewed.holder.host.as_str())
+    );
+}
+
+/// THE PUMP'S RE-BASE TAKES THE LINE ONLY FROM A HOLDER A CONTENDER COULD (UB-15 finding 7). The
+/// pump judged the line free when it looked; its child takes the claim minutes later, and a
+/// contender that took the line meanwhile (a session's fix, a standby) keeps it: the re-base's
+/// take admits the holder at the compare-and-swap, so it ends beside a live holder with nothing
+/// written (exit 4), and takes the line from a dead one or once the lease has ended. The pump
+/// marks only that child ([`Take::supersession`]).
+/// NEGATIVE CONTROL: a session's `--supersede` of the same claim takes it from the live holder.
+#[cfg(unix)]
+#[test]
+fn the_pumps_rebase_takes_the_line_only_from_a_holder_a_contender_could() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (a, _b, name, orphan_sha) = orphaned_origin(dir.path());
+    let line = orphan().line;
+    let mut renewing = orphan();
+    renewing.at = NOW;
+    let Write::Written(fresh) = replace(&a, &name, &orphan_sha, &renewing) else {
+        panic!("the holder renews");
+    };
+    let m73 = state("m73", NOW).holder;
+    let clock = || NOW + 1;
+    let alive = |_: &State| Observation::Unproven("its process runs".into());
+    let dead = |_: &State| Observation::Dead;
+    let refused = attempt(
+        &a,
+        &Taker {
+            take: Take::Rebase,
+            ..taker(dir.path(), &m73, &clock, &alive)
+        },
+        &name,
+        &line,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        matches!(&refused, Err(why) if why.starts_with("CUTTING ELSEWHERE")),
+        "{:?}",
+        refused.as_ref().err()
+    );
+    assert_eq!(
+        remote(&a, &name).unwrap().unwrap().0,
+        fresh,
+        "nothing written"
+    );
+    let judged = Taker {
+        take: Take::Rebase,
+        ..taker(dir.path(), &m73, &clock, &alive)
+    };
+    assert!(
+        held_of(&renewing, &judged).is_some(),
+        "judged as a take would be"
+    );
+    let late = || NOW + 10 * MAX_LEASE_S;
+    let lapsed = Taker {
+        take: Take::Rebase,
+        ..taker(dir.path(), &m73, &late, &alive)
+    };
+    assert!(held_of(&renewing, &lapsed).is_none());
+    let Ok(Attempt::Taken(taken)) = attempt(
+        &a,
+        &Taker {
+            take: Take::Rebase,
+            ..taker(dir.path(), &m73, &clock, &dead)
+        },
+        &name,
+        &line,
+        None,
+        None,
+        None,
+    ) else {
+        panic!("a re-base takes the line from a holder proven dead");
+    };
+    assert_eq!(taken.state.boundary, SUPERSEDING);
+    assert_eq!(taken.displaced.as_ref().map(|state| state.at), Some(NOW));
+
+    // NEGATIVE CONTROL: a session's supersession takes the same live holder's line.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (a, _b, name, orphan_sha) = orphaned_origin(dir.path());
+    let Write::Written(_) = replace(&a, &name, &orphan_sha, &renewing) else {
+        panic!("the holder renews");
+    };
+    let Ok(Attempt::Taken(_)) = attempt(
+        &a,
+        &Taker {
+            take: Take::Supersede,
+            ..taker(dir.path(), &m73, &clock, &alive)
+        },
+        &name,
+        &line,
+        None,
+        None,
+        None,
+    ) else {
+        panic!("a session's supersession takes the line from any holder");
+    };
+    assert!(
+        held_of(
+            &renewing,
+            &Taker {
+                take: Take::Supersede,
+                ..taker(dir.path(), &m73, &clock, &alive)
+            }
+        )
+        .is_none()
     );
 }

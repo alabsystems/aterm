@@ -392,7 +392,7 @@ pub(crate) struct PostPass<'a> {
 pub(crate) struct DockPass<'a> {
     pub(crate) stage: Option<(&'a SealedTexture, TrayPass<'a>)>,
     pub(crate) blit: PostPass<'a>,
-    pub(crate) rect: [u32; 4],
+    pub(crate) rects: [Option<[u32; 4]>; 2],
 }
 
 /// Encode the same second-source pipeline for window presents and the GPU/CPU twin.
@@ -424,8 +424,7 @@ pub(crate) fn encode_dock_stage(
 
 /// Draw the resident dock in the destination's already open blit pass.
 pub(crate) fn draw_dock(pass: &PassEncoder<'_, '_>, dock: &DockPass<'_>) -> Result<(), String> {
-    let [x0, y0, x1, y1] = dock.rect;
-    if x1 > x0 && y1 > y0 {
+    for [x0, y0, x1, y1] in dock.rects.into_iter().flatten() {
         pass.set_scissor(MtlScissorRect {
             x: x0 as usize,
             y: y0 as usize,
@@ -552,7 +551,7 @@ pub(crate) struct PresentSequence<'a> {
     /// The letterbox blit (row 16) onto the drawable: POST_FS binds; the
     /// clear is the live terminal background.
     pub(crate) blit: PostPass<'a>,
-    pub(crate) dock: Option<DockPass<'a>>,
+    pub(crate) chrome: [Option<DockPass<'a>>; 2],
     pub(crate) clear: ClearColor,
     pub(crate) crown: Option<CrownPass<'a>>,
 }
@@ -783,7 +782,7 @@ pub(crate) fn encode_present_sequence(
         pass.draw_strip_quad()?;
     }
 
-    if let Some(dock) = &seq.dock {
+    for dock in seq.chrome.iter().flatten() {
         encode_dock_stage(cb, dock)?;
     }
 
@@ -820,7 +819,7 @@ pub(crate) fn encode_present_sequence(
             pass.set_instance_stream(crown.stream);
             pass.draw_instanced(PrimitiveType::Triangle, 6, crown.count)?;
         }
-        if let Some(dock) = &seq.dock {
+        for dock in seq.chrome.iter().flatten() {
             draw_dock(&pass, dock)?;
         }
     }

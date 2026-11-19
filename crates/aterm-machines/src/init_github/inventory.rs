@@ -33,27 +33,26 @@ pub struct RepositoryCatalog {
 
 /// How a catalog [`RepositoryCatalog::refresh`] made differs from the saved one it was made
 /// from, as counts of repositories and two flags: what a publication's log line carries. A
-/// repository is in at most one of the counts. One that differs only in a size the saved one
-/// stood for, GitHub's being carried by a catalog published for another reason, is in none
-/// of them. The two catalogs are equal as JSON exactly where every count is `0` and neither
-/// flag is set.
+/// repository is in at most one of the counts, the first of `other_fields`, `size_class` and
+/// `pruned` that holds for it. The two catalogs mean the same ([`Meaning`]) exactly where
+/// `other_fields`, `size_class`, `added` and `removed` are `0` and `account` is unset; a
+/// refresh then answers the saved catalog itself, in which every count is `0` and neither flag
+/// is set. So `pruned` and `order` are counted only in a catalog published for another reason.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryCatalogChanges {
-    /// In both catalogs, with a field the refreshed one holds, other than `size`, that the
-    /// saved one holds at another value or lacks. A key inside `owner` is a field of its own
-    /// here and in `pruned`.
+    /// In both catalogs, with a field of its meaning other than `size` at another value in the
+    /// refreshed one, or held by one of the two alone: a field a refresh writes from GitHub's
+    /// row, the owner's `id`, `login` or `type`, or a [`POLICY`] key.
     pub other_fields: usize,
-    /// In both catalogs, different in `size` alone, where the saved size did not stand: one of
-    /// the two is `0` or no count, or they differ by more than a sixteenth of the saved size
-    /// and by more than 1 MiB.
-    pub size_only: usize,
+    /// In both catalogs, the same in meaning but for the class of its size
+    /// ([`repos::size_class`]).
+    pub size_class: usize,
     /// In the refreshed catalog alone.
     pub added: usize,
     /// In the saved catalog alone.
     pub removed: usize,
-    /// In both catalogs, where every field the refreshed one holds, `size` aside, is the saved
-    /// one's, and the saved one holds keys the refreshed one lacks: the ones a refresh dropped
-    /// because GitHub's row carries them.
+    /// In both catalogs and the same in meaning, but not as JSON: a refresh makes such a row
+    /// only by dropping saved keys GitHub's row carries.
     pub pruned: usize,
     /// The account is spelled otherwise than the saved catalog spells it.
     pub account: bool,
@@ -133,14 +132,20 @@ impl RepositoryCatalog {
     /// refresh run by this build. A repository GitHub did not list, kept under
     /// [`RepositoryCatalogVisibility::TokenVisible`], comes out exactly as saved.
     ///
-    /// A saved `size` stands while GitHub's is near it: neither is `0`, and they differ by at
-    /// most a sixteenth of the saved size, or by at most 1 MiB where that is more. Where the
-    /// account and the repositories with those sizes equal the saved ones, the answer holds
-    /// them and is, as JSON, the saved catalog, which its publisher does not publish again.
-    /// Where anything else differs the catalog is published anyway, so the answer holds
-    /// GitHub's size for every observed repository: an administrator on a build that
-    /// publishes on any difference then reads the same sizes and finds nothing to publish
-    /// in answer.
+    /// A listed repository's `size` is the class of GitHub's ([`repos::size_class`]), except
+    /// that a saved size stands while GitHub's is in its class, or under its class but over half
+    /// of it, and where GitHub gives none: a row with no `size`, a null or other one that is no
+    /// count, or `0`. It stands whether a refresh wrote it as a class or an earlier build wrote
+    /// GitHub's own size. So a size moving back and forth across the edge of a class publishes
+    /// once, and the class of a size the catalog holds is at or above GitHub's size at the last
+    /// look, which setup's clone-room estimate reads ([`repos::need`]).
+    ///
+    /// Where the catalog this makes means what the saved one means ([`Meaning`]), the answer
+    /// is the saved catalog itself, which its publisher does not publish again: a key dropped
+    /// and the order by id wait for a change of meaning and are published with it. An
+    /// administrator on an earlier build, which compares GitHub's size with the saved one by
+    /// its own rule, may publish GitHub's size where this build wrote a class; this build
+    /// reads that size inside its class and finds nothing to publish in answer.
     /// # Errors
     /// Any row is malformed, duplicated, foreign, conflicting, or exceeds the delivery budget.
     pub fn refresh(
@@ -191,18 +196,18 @@ impl RepositoryCatalog {
                     return Err("provider inventory lacks required repository metadata".into());
                 }
             }
-            if repo["size"].as_u64().is_none() {
-                return Err("provider inventory lacks a repository size".into());
-            }
             // The saved object is carried forward without the keys GitHub's row for this
             // repository carries: those are GitHub's. The test is the key, not its value,
             // because GitHub sends several keys as null. What stays is the administrator's:
             // the policy code reads, and any key GitHub does not send, future policy
-            // included. The provider-owned fields are then written from GitHub's row.
-            // `size` is GitHub's here; where the catalog differs from the saved one only in
-            // sizes that stand, the pass below puts those back.
-            let mut merged = old
-                .get(&id)
+            // included. The provider-owned fields are then written from GitHub's row, `size`
+            // as its class unless the saved one stands.
+            let saved = old.get(&id);
+            let size = refreshed_size(
+                saved.and_then(|repo| repo["size"].as_u64()).unwrap_or(0),
+                repo["size"].as_u64().unwrap_or(0),
+            );
+            let mut merged = saved
                 .and_then(|repo| repo.as_object())
                 .cloned()
                 .unwrap_or_default();
@@ -217,26 +222,17 @@ impl RepositoryCatalog {
                 .cloned()
                 .unwrap_or_default();
             owner.retain(|key, _| repo["owner"].get(key).is_none());
-            for field in ["id", "login"] {
-                owner.insert(field.into(), repo["owner"][field].clone());
-            }
-            if let Some(kind) = repo["owner"].get("type") {
-                owner.insert("type".into(), kind.clone());
+            // `id` and `login` were checked above; `type` is written where GitHub sends it.
+            for field in OWNER {
+                if let Some(value) = repo["owner"].get(field) {
+                    owner.insert(field.into(), value.clone());
+                }
             }
             merged.insert("owner".into(), Value::Object(owner));
-            for field in [
-                "id",
-                "name",
-                "full_name",
-                "private",
-                "clone_url",
-                "default_branch",
-                "size",
-                "fork",
-                "archived",
-            ] {
+            for field in PROVIDER {
                 merged.insert(field.into(), repo[field].clone());
             }
+            merged.insert("size".into(), size.into());
             repositories.push(Value::Object(merged));
         }
         if visibility == RepositoryCatalogVisibility::TokenVisible {
@@ -249,26 +245,12 @@ impl RepositoryCatalog {
             );
         }
         repositories.sort_by_key(|repo| repo["id"].as_u64());
-        // GitHub's size for a repository moves as it is pushed to. A catalog that differs
-        // from the saved one only in sizes that still stand is the saved one.
-        let settled: Vec<Value> = repositories
-            .iter()
-            .map(|repo| {
-                let saved = repo["id"]
-                    .as_u64()
-                    .and_then(|id| old.get(&id))
-                    .and_then(|saved| saved.get("size"));
-                let mut repo = repo.clone();
-                if let (Some(saved), Some(fields)) = (saved, repo.as_object_mut())
-                    && stands(Some(saved), fields.get("size"))
-                {
-                    fields.insert("size".into(), saved.clone());
-                }
-                repo
-            })
-            .collect();
-        if account == self.raw.account && settled == self.raw.repositories {
-            repositories = settled;
+        let mut account = account;
+        if Meaning::of(account, &repositories)
+            == Meaning::of(&self.raw.account, &self.raw.repositories)
+        {
+            account = self.raw.account.as_str();
+            repositories.clone_from(&self.raw.repositories);
         }
         let value = aterm_json::json!({
             "schema": 2, "account": account, "repositories": repositories,
@@ -298,13 +280,6 @@ impl RepositoryCatalog {
                 .map(|repo| (repo["id"].as_u64().expect("parsed catalog id"), repo))
                 .collect()
         }
-        fn beside_size(repo: &aterm_json::Value) -> aterm_json::Value {
-            let mut repo = repo.clone();
-            if let Some(fields) = repo.as_object_mut() {
-                fields.remove("size");
-            }
-            repo
-        }
         fn ids<'a>(
             catalog: &'a RepositoryCatalog,
             other: &'a std::collections::BTreeMap<u64, &aterm_json::Value>,
@@ -315,20 +290,6 @@ impl RepositoryCatalog {
                 .iter()
                 .map(|repo| repo["id"].as_u64().expect("parsed catalog id"))
                 .filter(|id| other.contains_key(id))
-        }
-        /// `saved` cut to the keys `repo` holds, at its top and inside its `owner`.
-        fn held_by(saved: &aterm_json::Value, repo: &aterm_json::Value) -> aterm_json::Value {
-            let mut saved = saved.clone();
-            if let Some(fields) = saved.as_object_mut() {
-                fields.retain(|key, _| repo.get(key).is_some());
-                if let Some(owner) = fields
-                    .get_mut("owner")
-                    .and_then(aterm_json::Value::as_object_mut)
-                {
-                    owner.retain(|key, _| repo["owner"].get(key).is_some());
-                }
-            }
-            saved
         }
         let refreshed = Self::parse(refreshed)?;
         let (old, new) = (rows(self), rows(&refreshed));
@@ -343,16 +304,13 @@ impl RepositoryCatalog {
                 changes.added += 1;
                 continue;
             };
-            if repo == saved {
-                continue;
-            }
-            let held = held_by(saved, repo);
-            if beside_size(repo) != beside_size(&held) {
+            let (was, now) = (Row::of(saved), Row::of(repo));
+            if !was.same_beside_size(&now) {
                 changes.other_fields += 1;
-            } else if held != **saved {
+            } else if was.size != now.size {
+                changes.size_class += 1;
+            } else if repo != saved {
                 changes.pruned += 1;
-            } else if !stands(saved.get("size"), repo.get("size")) {
-                changes.size_only += 1;
             }
         }
         Ok(changes)
@@ -365,43 +323,91 @@ impl RepositoryCatalog {
 /// key joins this list in the change that first reads it.
 const POLICY: [&str; 1] = ["required_submodules"];
 
-/// The share of a saved `size` GitHub's may differ from it by while the saved one stands.
-const SIZE_BAND_SHARE: u64 = 16;
+/// The fields of a repository object [`RepositoryCatalog::refresh`] writes as GitHub's row
+/// holds them; it writes `size` as well, as [`refreshed_size`] says.
+const PROVIDER: [&str; 8] = [
+    "id",
+    "name",
+    "full_name",
+    "private",
+    "clone_url",
+    "default_branch",
+    "fork",
+    "archived",
+];
 
-/// The least such difference, in KiB (1 MiB), for a repository under 16 MiB.
-const SIZE_BAND_LEAST_KIB: u64 = 1024;
+/// The keys of a repository's `owner` [`RepositoryCatalog::refresh`] writes from GitHub's.
+const OWNER: [&str; 3] = ["id", "login", "type"];
 
-/// The `size` (KiB) the catalog holds for a repository it saved at `saved` and GitHub now
-/// sizes at `observed`: `saved` while neither is `0` and they differ by at most
-/// `max(saved / 16, 1024)`, else `observed`. The band is measured from the saved size, which
-/// moves only when the catalog is published, so a look that finds nothing to publish leaves
-/// every saved size within its band of the size GitHub gave, however many looks came before.
-/// Setup reads a size only to estimate a clone's room at five times it ([`repos::no_room`]).
-/// Over 16 MiB a kept size is at least 16/17 of GitHub's, and five times that is 4.7 times
-/// GitHub's, the most a measured clone took; up to 16 MiB it is within 1 MiB, 5 MiB of room,
-/// beside a floor counted in GiB.
-const fn settled_size(saved: u64, observed: u64) -> u64 {
-    let band = if saved / SIZE_BAND_SHARE > SIZE_BAND_LEAST_KIB {
-        saved / SIZE_BAND_SHARE
-    } else {
-        SIZE_BAND_LEAST_KIB
+/// The `size` (KiB) a refresh writes for a repository the catalog holds at `saved` that
+/// GitHub sizes at `observed`, each `0` where it gives none (a repository new to the catalog, a
+/// row GitHub has not sized): the class of GitHub's size ([`repos::size_class`]), except that
+/// the saved size stands while GitHub's is in its class, or under its class but over half of
+/// it, and where GitHub gives none. Setup estimates a clone's room at five times the class of
+/// the size it reads ([`repos::need`]), and the class of what this writes is at or above
+/// GitHub's size: under a quarter more where it is GitHub's class or a size in it, under twice
+/// it where GitHub's size fell since by under half. So a growing repository is published about
+/// four times each time its size doubles, and a size moving back and forth across a class's
+/// edge, as pushes and GitHub's maintenance move it, is published once.
+fn refreshed_size(saved: u64, observed: u64) -> u64 {
+    let Some(class) = repos::size_class(observed) else {
+        return saved;
     };
-    if saved != 0 && observed != 0 && saved.abs_diff(observed) <= band {
-        saved
-    } else {
-        observed
+    match repos::size_class(saved) {
+        Some(held) if class == held || (class < held && observed > held / 2) => saved,
+        _ => class,
     }
 }
 
-/// Whether a saved `size` stands for GitHub's `observed` one: both are counts and
-/// [`settled_size`] keeps the saved one (equal sizes included).
-fn stands(saved: Option<&aterm_json::Value>, observed: Option<&aterm_json::Value>) -> bool {
-    match (
-        saved.and_then(aterm_json::Value::as_u64),
-        observed.and_then(aterm_json::Value::as_u64),
-    ) {
-        (Some(saved), Some(observed)) => settled_size(saved, observed) == saved,
-        _ => false,
+/// What a catalog means to the Macs that read it, which a refresh publishes only where it
+/// moved: its account and, per repository id, the [`PROVIDER`] fields, the class of its `size`
+/// ([`repos::size_class`]), the owner's [`OWNER`] keys and the [`POLICY`] keys. The order of
+/// the repositories, any other key and a size inside its class are not in it.
+#[derive(PartialEq)]
+struct Meaning<'a> {
+    account: &'a str,
+    repositories: std::collections::BTreeMap<u64, Row<'a>>,
+}
+
+impl<'a> Meaning<'a> {
+    /// The meaning of a catalog of `account` that holds `repositories`, each with an id.
+    fn of(account: &'a str, repositories: &'a [aterm_json::Value]) -> Self {
+        Self {
+            account,
+            repositories: repositories
+                .iter()
+                .map(|repo| (repo["id"].as_u64().expect("checked id"), Row::of(repo)))
+                .collect(),
+        }
+    }
+}
+
+/// One repository of a [`Meaning`]; a key the object lacks is `None`, one it holds as null is
+/// not.
+#[derive(PartialEq)]
+struct Row<'a> {
+    provider: [Option<&'a aterm_json::Value>; PROVIDER.len()],
+    owner: [Option<&'a aterm_json::Value>; OWNER.len()],
+    policy: [Option<&'a aterm_json::Value>; POLICY.len()],
+    /// The class of its `size`; `None` for `0`, for no count and for no `size`.
+    size: Option<u64>,
+}
+
+impl<'a> Row<'a> {
+    fn of(repo: &'a aterm_json::Value) -> Self {
+        Self {
+            provider: PROVIDER.map(|key| repo.get(key)),
+            owner: OWNER.map(|key| repo.get("owner").and_then(|owner| owner.get(key))),
+            policy: POLICY.map(|key| repo.get(key)),
+            size: repo
+                .get("size")
+                .and_then(aterm_json::Value::as_u64)
+                .and_then(repos::size_class),
+        }
+    }
+
+    fn same_beside_size(&self, other: &Self) -> bool {
+        (self.provider, self.owner, self.policy) == (other.provider, other.owner, other.policy)
     }
 }
 

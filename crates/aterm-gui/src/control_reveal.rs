@@ -117,6 +117,10 @@ pub(crate) struct SessionFacts {
     /// ([`crate::typed_by::TypedStamp::fleet_admitted`]). It decides no verdict: `driven`
     /// already withholds a secret from it.
     pub(crate) fleet: bool,
+    /// The agent in the asking process's own lineage, up to the session's shell
+    /// ([`agent_in_lineage`]): the program that made the request, which `aterm file` states as
+    /// a record's principal (aterm-db's `said`). It decides no verdict.
+    pub(crate) program: Option<&'static str>,
 }
 
 /// What a `reveal` is decided from.
@@ -166,8 +170,13 @@ pub(crate) trait Procs {
     fn session_of(&self, pid: i32) -> Option<i32>;
     /// Every process on the host.
     fn pids(&self) -> Vec<i32>;
-    /// Whether `pid` runs a program the agent table names (`aterm_phase::program_of`).
-    fn agent(&self, pid: i32) -> bool;
+    /// The agent `pid` runs, by the agent table (`aterm_phase::program_of`): its CLI name
+    /// (`claude`, `codex`, …), `None` where it runs none.
+    fn agent_name(&self, pid: i32) -> Option<&'static str>;
+    /// Whether `pid` runs a program the agent table names.
+    fn agent(&self, pid: i32) -> bool {
+        self.agent_name(pid).is_some()
+    }
 }
 
 /// The host's process table.
@@ -200,9 +209,10 @@ impl Procs for Live {
         crate::spare::host_pids()
     }
 
-    fn agent(&self, pid: i32) -> bool {
+    fn agent_name(&self, pid: i32) -> Option<&'static str> {
         crate::session_status::program::program_of(pid)
-            .is_some_and(|program| aterm_phase::program_of(&program).is_some())
+            .and_then(|program| aterm_phase::program_of(&program))
+            .map(aterm_phase::Program::name)
     }
 }
 
@@ -238,8 +248,31 @@ fn agent_in_tree(shell: i32, procs: &dyn Procs) -> bool {
             .any(|pid| in_tree(pid, shell, procs) && procs.agent(pid))
 }
 
+/// The agent that made `peer`'s request: the nearest of `peer` and its ancestors, up to and
+/// including its session's shell `shell` (which is the agent itself in a tab that runs one as
+/// its own program: `aterm -e claude`, `exec codex`), that runs an agent, by its name (`claude`,
+/// `codex`, …). `None` where none of them does: a person typed it at the shell, or a program no
+/// agent started ran it.
+fn agent_in_lineage(peer: i32, shell: i32, procs: &dyn Procs) -> Option<&'static str> {
+    let mut at = peer;
+    for _ in 0..LINEAGE_MAX {
+        if at <= 1 {
+            return None;
+        }
+        if let Some(name) = procs.agent_name(at) {
+            return Some(name);
+        }
+        if at == shell {
+            return None;
+        }
+        at = procs.parent_of(at)?;
+    }
+    None
+}
+
 /// The session of `store` whose shell is `peer` or an ancestor of it (`sid`), with what aterm knows
-/// of it: `None` where no live session's tree holds `peer`.
+/// of it and the agent in `peer`'s own lineage ([`agent_in_lineage`]): `None` where no live
+/// session's tree holds `peer`.
 fn session_facts(store: &Store, peer: i32, procs: &dyn Procs) -> Option<(String, SessionFacts)> {
     // The process table is read with the store's lock released.
     let shells: Vec<(u64, i32)> = store
@@ -273,6 +306,7 @@ fn session_facts(store: &Store, peer: i32, procs: &dyn Procs) -> Option<(String,
         .is_some();
     let facts = SessionFacts {
         agent: fronts_agent || agent_in_tree(shell, procs),
+        program: agent_in_lineage(peer, shell, procs),
         ..marks_of(&ctx)
     };
     Some((sid, facts))
@@ -291,6 +325,7 @@ pub(crate) fn marks_of(ctx: &crate::SessionCtx) -> SessionFacts {
         driven: ctx.typed.driver_admitted(),
         agent: false,
         fleet: ctx.typed.fleet_admitted(),
+        program: None,
     }
 }
 
@@ -306,8 +341,12 @@ fn answer(store: &Store, remote: bool, peer: Option<i32>, procs: &dyn Procs) -> 
     });
     let sid = found.as_ref().map_or("-", |(sid, _)| sid.as_str());
     let fleet = remote || found.as_ref().is_some_and(|(_, facts)| facts.fleet);
+    let program = found
+        .as_ref()
+        .and_then(|(_, facts)| facts.program)
+        .unwrap_or("-");
     format!(
-        "OK 1\nverdict={} session={sid} fleet={}\n",
+        "OK 1\nverdict={} session={sid} fleet={} program={program}\n",
         verdict.word(),
         if fleet { "yes" } else { "no" }
     )

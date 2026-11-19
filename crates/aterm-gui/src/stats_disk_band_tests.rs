@@ -971,7 +971,7 @@ fn each_part_is_a_hit_on_the_disk_lens_and_a_meter() {
 }
 
 /// RESERVATION. Where the Deck takes room its reservation is its rows, this band and Network
-/// State, each a fixed height at any scale; under `sill` and `off` it reserves nothing.
+/// State, each a fixed height at any scale. The compact form takes only its own lane height.
 /// CONTROL: the Deck's rows alone are short of it by exactly the two bands.
 #[test]
 fn the_deck_reserves_the_band_with_its_rows() {
@@ -992,13 +992,14 @@ fn the_deck_reserves_the_band_with_its_rows() {
                 "CONTROL"
             );
         }
-        for off in [StatsBars::Sill, StatsBars::Off] {
-            assert_eq!(
-                reserved_deck_px(off, DeckForm::Folded, scale, 34),
-                0,
-                "{off:?}"
-            );
-        }
+        assert_eq!(
+            reserved_deck_px(StatsBars::Off, DeckForm::Folded, scale, 34),
+            0
+        );
+        assert_eq!(
+            reserved_deck_px(StatsBars::Sill, DeckForm::Folded, scale, 34),
+            crate::stats_sill::compact_height(scale)
+        );
     }
 }
 

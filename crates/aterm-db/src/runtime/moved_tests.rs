@@ -595,3 +595,80 @@ fn an_append_rings_the_doorbell_and_the_look_it_asks_for_tells_the_table() {
         "the look the ring asked for"
     );
 }
+
+/// A look tells when the Commons configuration's policy selects what the one before it did not:
+/// a table excluded no more, or sharing enabled again. A change of the file that leaves what it
+/// selects as it was (another setting) or selects less tells nothing, nor does the first policy
+/// a look reads, nor a file that cannot be read, which keeps the policy read before it.
+/// MUTANT (`WIDENED_UNTOLD`): no widening is told. MUTANT (`WIDENED_BY_STAMP`): every change of
+/// the file that reads, after the first read, tells one.
+#[test]
+fn a_look_tells_a_policy_that_selects_again_and_not_a_stamp_alone() {
+    let table = aterm_codec::hex::encode_lower(&[7; 32]);
+    let excluded = format!("[commons]\nexclude_tables = [\"{table}\"]\n");
+    // Each file a look reads in turn, and whether the look tells a widening.
+    let steps: [(&str, bool); 7] = [
+        // The first policy read: the look began over a file it could not read.
+        (&excluded, false),
+        // The exclusion lifted.
+        ("[commons]\n", true),
+        // Another setting.
+        ("[commons]\n\n[editor]\nfont_size = 13\n", false),
+        // A file that cannot be read keeps the policy before it.
+        ("[commons]\nenabled = 3\n", false),
+        // Sharing disabled: it selects less.
+        ("[commons]\nenabled = false\n", false),
+        // Sharing enabled again.
+        ("[commons]\nenabled = true\n", true),
+        // The same policy written again.
+        ("[commons]\n", false),
+    ];
+    for (untold, by_stamp) in [(false, false), (true, false), (false, true)] {
+        let mutant = if untold {
+            Some(&WIDENED_UNTOLD)
+        } else {
+            by_stamp.then_some(&WIDENED_BY_STAMP)
+        };
+        let lab = Lab::new(&[Role::Writer]);
+        let bootstrap = lab.bootstrap(0);
+        let config = config(&lab.paths[0]);
+        aterm_secrets::fsx::write_atomic(&config, b"[commons]\nenabled = 3\n", 0o600).unwrap();
+        let mut look = Look::new(
+            &lab.paths[0],
+            bootstrap.journal_dir(),
+            &config,
+            bootstrap.trust(),
+        );
+        if let Some(flag) = mutant {
+            flag.with(|flag| flag.set(true));
+        }
+        let told: Vec<bool> = steps
+            .iter()
+            .map(|(text, _)| {
+                aterm_secrets::fsx::write_atomic(&config, text.as_bytes(), 0o600).unwrap();
+                look.moved();
+                std::mem::take(&mut look.widened)
+            })
+            .collect();
+        let unmoved = {
+            look.moved();
+            std::mem::take(&mut look.widened)
+        };
+        if let Some(flag) = mutant {
+            flag.with(|flag| flag.set(false));
+        }
+        assert!(!unmoved, "a look with the file unchanged tells nothing");
+        let expected: Vec<bool> = steps.iter().map(|(_, widened)| *widened).collect();
+        if untold {
+            assert_eq!(told, [false; 7], "MUTANT: nothing told");
+        } else if by_stamp {
+            assert_eq!(
+                told,
+                [false, true, true, false, true, true, true],
+                "MUTANT: every change read told"
+            );
+        } else {
+            assert_eq!(told, expected);
+        }
+    }
+}

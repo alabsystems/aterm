@@ -422,7 +422,7 @@ fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// The two injection refusals every `.cmd` shim renderer makes, fail-closed: a target that
-/// could break out of the `@"<target>" %* & @exit /b` quoting (`"`, `%`, CR, LF, NUL), and an
+/// could break out of the forward line's `@"<target>"` quoting (`"`, `%`, CR, LF, NUL), and an
 /// env entry that could break out of `@set "NAME=VALUE"` (also refused at manifest parse).
 fn refuse_injectable(target: &Path, env: &crate::shim_env::ShimEnv) -> io::Result<()> {
     if !super::cmd_target_is_injection_safe(target) {

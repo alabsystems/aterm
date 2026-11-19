@@ -1245,6 +1245,40 @@ fn an_unknown_app_word_is_kept_for_display() {
     );
 }
 
+/// An unrecognized app can identify itself while an older Claude activity still stands.
+/// Neither writer's report establishes the other writer's identity.
+#[test]
+fn a_new_commands_other_report_names_only_its_own_writer() {
+    let mut state = ProgramStateRecord::default();
+    assert!(state.accept("state=working:app=claude-code"));
+    state.command_started();
+    assert!(!state.named_in_command());
+    assert!(state.accept("state=idle:app=kimi-code"));
+    assert_eq!(state.sign().unwrap().app, ProgramApp::ClaudeCode);
+    assert_eq!(state.other.state.unwrap().app.as_str(), "kimi-code");
+    assert!(state.named_in_command());
+    assert_eq!(state.seq, state.command_known_seq);
+
+    let known = state.carried();
+    let other = state.carried_other();
+    state.restore(known.as_deref(), other.as_deref());
+    assert!(
+        !state.named_in_command(),
+        "a carried other report needs a new reading"
+    );
+    assert!(state.accept("state=idle:app=kimi-code"));
+    assert!(state.named_in_command(), "the same writer reported again");
+    state.prompt_drawn();
+    assert!(state.other.state.is_none());
+    assert_eq!(state.sign().unwrap().app, ProgramApp::ClaudeCode);
+    assert!(
+        !state.named_in_command(),
+        "Claude's earlier activity still stands"
+    );
+    assert!(state.accept("state=working:app=claude-code"));
+    assert!(state.named_in_command());
+}
+
 /// THE SHELL'S PROMPT ENDS ANOTHER PROGRAM'S WORD: a program that names itself (`app=kimi-code`)
 /// and exits without a `clear` leaves its report standing only until its shell draws a prompt (an
 /// OSC 133 or 633 `A`), which takes it away and moves its sequence; that prompt leaves the known

@@ -70,6 +70,8 @@ fn secret_get_scan_export_history_and_unknown_reader() {
         complete: true,
         awaiting: crate::typed::Awaiting::NONE,
         refused: vec![],
+        refusals: vec![],
+        cells_from: None,
     };
     const OLD: Collection = Collection {
         columns: &[Column::new("row", Ty::Enum(&["live"]))],

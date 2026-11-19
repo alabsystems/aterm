@@ -148,6 +148,7 @@ pub(crate) struct Timer {
     id: u64,
     parent_id: Option<u64>,
     log: Option<std::path::PathBuf>,
+    details: Option<aterm_json::Value>,
 }
 
 impl Timer {
@@ -184,6 +185,21 @@ impl Timer {
             parent: parent.map(|frame| frame.children),
             id,
             log: None,
+            details: None,
+        }
+    }
+
+    /// Attach bounded, credential-free request attribution to this gate's existing events.
+    pub(crate) fn with_details(mut self, details: aterm_json::Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    fn add_details(&self, event: &mut aterm_json::Value) {
+        if let Some(details) = &self.details
+            && let Some(fields) = event.as_object_mut()
+        {
+            fields.insert("details".to_owned(), details.clone());
         }
     }
 
@@ -226,13 +242,14 @@ impl Timer {
         };
         self.log = Some(log.to_owned());
         let timer = &self;
-        let event = aterm_json::json!({
+        let mut event = aterm_json::json!({
             "schema": 1, "event": "cut-gate-started", "gate": timer.name,
             "process_id": std::process::id(), "gate_id": timer.id, "parent_gate_id": timer.parent_id,
             "process_image": image_id(),
             "started_at_unix_ms": timer.at,
             "self_cpu_ns": timer.cpu.as_ref().map(|c| c.cpu_ns),
         });
+        timer.add_details(&mut event);
         if let Ok(mut sink) = crate::durable::open_append(log, true) {
             let _ = sink.write_all(format!("release-event: {event}\n").as_bytes());
         }
@@ -287,7 +304,7 @@ impl Drop for Timer {
             "  timing     {}: wall {:.3}s · self CPU {}s · child CPU {}s (inclusive)",
             self.name, wall, own, child
         );
-        let event = aterm_json::json!({
+        let mut event = aterm_json::json!({
             "schema": 1, "event": "cut-gate-finished", "gate": self.name,
             "process_id": std::process::id(), "gate_id": self.id, "parent_gate_id": self.parent_id,
             "process_image": image_id(),
@@ -297,6 +314,7 @@ impl Drop for Timer {
             "inclusive": true,
             "exclusive": {"execution_s": (!exclusive.parallel).then_some(exclusive.wall), "self_cpu_s": exclusive.own, "child_cpu_s": exclusive.child}
         });
+        self.add_details(&mut event);
         println!("release-event: {event}");
         if let Some(path) = &self.log {
             use std::io::Write as _;

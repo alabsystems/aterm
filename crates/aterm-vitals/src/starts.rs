@@ -118,7 +118,7 @@ pub enum StartCount {
 }
 
 /// Starts and exits counted between two reads.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moved {
     /// Processes started (Linux: forks and clones, threads included).
     pub starts: u64,
@@ -129,6 +129,10 @@ pub struct Moved {
     /// The heat counters' change over the same merge ([`crate::heat::change`]), or why there is
     /// none; `None` where neither read carries heat counters (Linux's forks).
     pub heat: Option<Result<crate::heat::HeatMove, &'static str>>,
+    /// Per-id energy from that same transition and its original native midpoint window. A
+    /// per-id reset or mismatched heat rows makes these unread without changing [`Self::heat`].
+    /// The model must also admit its sampling gap and the existing global heat judgment.
+    pub energy: Option<Result<std::sync::Arc<crate::heat::EnergyFacts>, &'static str>>,
 }
 
 /// The starts and exits from read `then` to read `now` (the module's formula), and the heat
@@ -142,24 +146,34 @@ pub fn moved(then: &StartCount, now: &StartCount) -> Option<Moved> {
             exits: None,
             own_starts: None,
             heat: None,
+            energy: None,
         }),
         (StartCount::Coalitions { read: a, own: was }, StartCount::Coalitions { read: b, own }) => {
-            // Allocates only where a coalition went.
+            // The gone-id buffer allocates only where a coalition went.
             let mut gone = Vec::new();
             let (starts, exits) = coalition_moves(a, b, |id| gone.push(id))?;
             let own_starts = own
                 .filter(|id| was == &Some(*id))
                 .and_then(|id| b.get(id)?.started.checked_sub(a.get(id)?.started));
-            let heat = match (a.heat(), b.heat()) {
-                (Some(x), Some(y)) => Some(crate::heat::change(x, y, &gone)),
-                (None, None) => None,
-                _ => Some(Err("heat_unread")),
+            let (heat, energy) = match (a.heat(), b.heat()) {
+                (Some(x), Some(y)) => {
+                    let (heat, mut energy) = crate::heat::change_with_energy(x, y, &gone, a.newest);
+                    if x.by_id.iter().any(|(id, _)| a.get(*id).is_none())
+                        || y.by_id.iter().any(|(id, _)| b.get(*id).is_none())
+                    {
+                        energy = Err("rows");
+                    }
+                    (Some(heat), Some(energy))
+                }
+                (None, None) => (None, None),
+                _ => (Some(Err("heat_unread")), Some(Err("heat_unread"))),
             };
             Some(Moved {
                 starts,
                 exits: Some(exits),
                 own_starts,
                 heat,
+                energy,
             })
         }
         _ => None,

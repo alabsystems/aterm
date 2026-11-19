@@ -12,8 +12,8 @@ pub(crate) fn project(app: &App, wid: WindowId) -> [i64; 4] {
     };
     let (seg_count, selected) = ws.strip_shadow.get();
     [
-        ws.tab_set.shown_len() as i64,
-        ws.tab_set.strip_active().unwrap_or(0) as i64,
+        ws.strip_tab_count() as i64,
+        ws.selected_strip_index().map_or(-1, |i| i as i64),
         seg_count as i64,
         selected as i64,
     ]
@@ -136,4 +136,69 @@ fn run_conformance() {
          close) keep the native strip in lockstep with the tab model AND the stale-strip \
          negative control was rejected."
     );
+}
+
+#[test]
+fn a_solo_session_keeps_its_editable_title_in_both_windows_and_only_the_master_offers_new_tab() {
+    let mut app = App::headless_for_test();
+    app.tab_strip_rows = 1;
+    let master = WindowId(0);
+    let aux = app.insert_logical_window(stub_session(app.next_session_id), 24, 80);
+    for wid in [master, aux] {
+        app.splice_tab_strip(wid);
+        let ws = &app.windows[&wid];
+        let segments = &ws.tab_segments;
+        assert!(
+            segments
+                .iter()
+                .any(|s| s.kind == tab_bar::TabHit::Select(0))
+        );
+        assert_eq!(
+            segments.iter().any(|s| s.kind == tab_bar::TabHit::NewTab),
+            wid == master
+        );
+        let tab = ws.tab_set.active_id().unwrap();
+        assert!(app.begin_session_rename(wid, tab));
+        assert!(!app.inline_rename_edit(wid).unwrap().text.is_empty());
+        app.end_session_rename_editor(wid);
+    }
+    app.close_window_logical(master);
+    app.splice_tab_strip(aux);
+    assert!(
+        app.windows[&aux]
+            .tab_segments
+            .iter()
+            .any(|s| s.kind == tab_bar::TabHit::NewTab)
+    );
+}
+
+#[test]
+fn a_tool_between_sessions_leaves_shortcuts_and_stale_pointer_hits_bound_to_the_sessions() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.tab_strip_rows = 1;
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let tool = app.windows[&wid].tab_set.active_id().unwrap();
+    let session = app.next_session_id;
+    app.push_stub_tab(wid, stub_session(session));
+    app.splice_tab_strip(wid);
+    let ws = &app.windows[&wid];
+    assert_eq!(ws.strip_index_to_tab_index(1), Some(2));
+    let session_tab = ws.tab_set.active_id().unwrap();
+    let second = ws
+        .tab_segments
+        .iter()
+        .find(|seg| seg.kind == tab_bar::TabHit::Select(1))
+        .unwrap()
+        .start_col
+        + 1;
+    app.switch_shown_tab_in(wid, 0);
+    app.switch_shown_tab_in(wid, 1);
+    assert_eq!(app.windows[&wid].tab_set.active_id(), Some(session_tab));
+    app.move_tab(wid, 2, 0);
+    let tool_index = app.tab_index_for_id(wid, tool).unwrap();
+    app.switch_tab_in(wid, tool_index);
+    assert_eq!(app.windows[&wid].selected_strip_index(), None);
+    app.handle_tab_strip_click(wid, second, std::time::Instant::now());
+    assert_eq!(app.windows[&wid].tab_set.active_id(), Some(session_tab));
 }

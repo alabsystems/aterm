@@ -573,7 +573,73 @@ fn private_child(
     ) {
         return None;
     }
+    if name.as_encoded_bytes().ends_with(b".noindex") {
+        claim_indexed_build_folder(path, &child, aterm_uds::backup::Backups::SYSTEM).ok()?;
+        if !creation::named(
+            parent,
+            name,
+            &Identity::unrecorded(captured.st_dev, captured.st_ino),
+        ) {
+            return None;
+        }
+    }
     Some(child)
+}
+
+/// Claim only generated output already protected by a `*.noindex` component. Custody roots
+/// may also name a caller's final output directory; their quiet intermediates are claimed
+/// separately, without treating an arbitrary output name as an indexing exclusion.
+#[cfg(unix)]
+pub(super) fn claim_indexed_build_folder(
+    path: &Path,
+    held: &aterm_dirfd::OwnedFd,
+    backups: aterm_uds::backup::Backups,
+) -> std::io::Result<()> {
+    if !path
+        .components()
+        .any(|part| part.as_os_str().as_encoded_bytes().ends_with(b".noindex"))
+    {
+        return Ok(());
+    }
+    claim_build_folder(path, held, backups)
+}
+
+/// Mark an actual compiler-intermediate directory through its custody-held descriptor.
+#[cfg(unix)]
+fn claim_build_folder(
+    path: &Path,
+    held: &aterm_dirfd::OwnedFd,
+    backups: aterm_uds::backup::Backups,
+) -> std::io::Result<()> {
+    let stop =
+        || std::io::Error::other("the build folder changed while its backup mark was claimed");
+    let before = Identity::held(held).ok_or_else(stop)?;
+    if !creation::pin(path)
+        .and_then(Identity::held)
+        .is_some_and(|now| before.names(&now))
+    {
+        return Err(stop());
+    }
+    // Placement is checked by the one build-folder helper, but the attribute belongs to
+    // the descriptor custody pinned, even if another process replaces the pathname now.
+    aterm_uds::backup::Backups::INERT.build_dir(path)?;
+    use std::os::fd::AsFd as _;
+    let file =
+        aterm_uds::kept_out(|| held.as_fd().try_clone_to_owned()).map(std::fs::File::from)?;
+    let available = backups != aterm_uds::backup::Backups::SYSTEM
+        || aterm_uds::backup::Backups::system_has_a_mark();
+    #[cfg(any(test, debug_assertions))]
+    let available = available && backups != aterm_uds::backup::Backups::NO_MARK;
+    if available {
+        backups.exclude(&file)?;
+    }
+    if !creation::pin(path)
+        .and_then(Identity::held)
+        .is_some_and(|now| before.names(&now))
+    {
+        return Err(stop());
+    }
+    Ok(())
 }
 
 /// WHETHER THIS HOME CAN RECORD NO BUILD'S OWNER: the deepest folder standing on the index's path
@@ -1257,6 +1323,10 @@ fn prepare_private_descendants(
     if !intact(&chain, &held) {
         return Err(stop());
     }
+    claim_indexed_build_folder(&path, &held, aterm_uds::backup::Backups::SYSTEM)?;
+    if !intact(&chain, &held) {
+        return Err(stop());
+    }
     Ok(())
 }
 
@@ -1721,6 +1791,12 @@ fn create_with_policy(
         write(&path, &receipt)
     };
     if attempt().is_some() {
+        let held = creation::pin(root).ok_or_else(|| {
+            std::io::Error::other(
+                "the admitted build folder could not be opened for its backup mark",
+            )
+        })?;
+        claim_indexed_build_folder(root, &held, aterm_uds::backup::Backups::SYSTEM)?;
         Ok((true, created))
     } else if must_record {
         Err(refusal.unwrap_or_else(|| {
@@ -1942,6 +2018,11 @@ fn admit_linked(
         return Err(stop());
     }
     if recorded_while(home, root, workspace, &|| linked.still()) {
+        let held = creation::pin(root).ok_or_else(stop)?;
+        claim_indexed_build_folder(root, &held, aterm_uds::backup::Backups::SYSTEM)?;
+        if !linked.still() {
+            return Ok(Err(LinkRefusal::Changed));
+        }
         witness_soon(home, root);
         return Ok(Ok(()));
     }
@@ -2016,6 +2097,11 @@ fn admit_linked(
     }
     if changed {
         write(&path, &receipt).ok_or_else(stop)?;
+    }
+    let held = creation::pin(root).ok_or_else(stop)?;
+    claim_indexed_build_folder(root, &held, aterm_uds::backup::Backups::SYSTEM)?;
+    if !linked.still() {
+        return Ok(Err(LinkRefusal::Changed));
     }
     Ok(Ok(()))
 }
@@ -2686,6 +2772,60 @@ fn selected_call_outputs(
     })
 }
 
+/// Resolve only the explicit compiler-intermediate exclusion boundary. A workspace resolved
+/// here supplies template meaning, never managed custody; every manifest reading must agree.
+#[cfg(target_os = "macos")]
+fn selected_intermediate_root(
+    args: &[String],
+    tool: super::Tool,
+    home: &Path,
+    machine: &super::Machine<'_>,
+) -> std::io::Result<Option<PathBuf>> {
+    from_targo_cwd(args, tool, home, machine, &|args, moved| {
+        let hint = match super::selected_build_dir_hint(args, tool, moved, &|verb| {
+            user_alias(verb, args, tool, moved)
+        }) {
+            Ok(Some(hint)) => hint,
+            Ok(None) => return None,
+            Err(why) => return Some(Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why))),
+        };
+        Some((|| {
+            // A hash-only hint also needs its source boundary: its known prefix must
+            // never cause the workspace itself to acquire a backup exclusion.
+            let needs_workspace = hint.value.to_str().is_some_and(|value| {
+                value.contains("{workspace-root}") || value.contains("{workspace-path-hash}")
+            });
+            let workspace = if needs_workspace {
+                let mut selected = None;
+                if let Some(manifests) = &hint.manifests {
+                    for manifest in manifests {
+                        let root = super::workspace_root(manifest, tool, moved)
+                            .and_then(|root| root.canonicalize().ok())
+                            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "the build-directory workspace template cannot be resolved"))?;
+                        if selected.as_ref().is_some_and(|prior| prior != &root) {
+                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "the build-directory workspace template has conflicting manifest readings"));
+                        }
+                        selected = Some(root);
+                    }
+                }
+                Some(selected.ok_or_else(|| std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the computed build directory has no established source workspace",
+                ))?)
+            } else {
+                None
+            };
+            let cargo_home = if hint.value.to_str().is_some_and(|value| value.contains("{cargo-cache-home}")) {
+                super::cargo_home_hint_with(moved).map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?
+            } else {
+                None
+            };
+            explicit_build_root(&hint.value, workspace.as_deref(), cargo_home.as_deref())
+        })())
+    })
+    .transpose()
+}
+
 /// The `target` Targo builds `args` into where nothing names another
 /// ([`super::workspace_target`]), read from the directory Targo works in as [`fallback_chosen`]
 /// reads the fallback.
@@ -3294,16 +3434,46 @@ fn non_producing_command(args: &[String], tool: super::Tool, machine: &super::Ma
     false
 }
 
-/// Whether Targo answers `args` with help or its version and builds nothing, as it reads the
-/// line it runs ([`super::targo_reading`]): `-V b` builds, as does `xtask --help` where `xtask
-/// = "run -p xtask --"`. A line whose alias cannot be told is no query.
-fn targo_query(args: &[String], tool: super::Tool, machine: &super::Machine<'_>) -> bool {
+/// The native observer's existing alias- and miri-aware reading of one command.
+/// SDK preparation shares this reader rather than parsing Cargo configuration again.
+pub(crate) fn command_reading(
+    args: &[String],
+    tool: super::Tool,
+    machine: &super::Machine<'_>,
+) -> Option<super::Reading> {
     let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
     let alias = |verb: &str| user_alias(verb, args, tool, machine);
     with_miri(&args[at..], tool, machine, |miri| {
         super::targo_reading(&args[at..], tool, &alias, miri)
     })
-    .is_some_and(|reading| reading.query)
+}
+
+/// Whether all observed platform choices permit adding a macOS SDK to the expanded command.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) fn macos_sdk_platform(
+    typed: &[String],
+    line: &[String],
+    tool: super::Tool,
+    machine: &super::Machine<'_>,
+) -> bool {
+    // Cargo changes directory before alias expansion. An alias's own -C is parsed and
+    // ignored, so only the original words may select the directory whose config is read.
+    let Ok(Some(cwd)) = targo_cwd(typed, machine) else {
+        return false;
+    };
+    super::macos_sdk_platform(
+        line,
+        tool,
+        &super::Machine {
+            cwd: Some(&cwd),
+            ..*machine
+        },
+    )
+}
+
+/// Whether the shared command reading answers with help or a version.
+fn targo_query(args: &[String], tool: super::Tool, machine: &super::Machine<'_>) -> bool {
+    command_reading(args, tool, machine).is_some_and(|reading| reading.query)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3488,6 +3658,10 @@ fn observe_with_placement(
             Observation::Unmanaged
         });
     };
+    #[cfg(target_os = "macos")]
+    if let Some(intermediates) = &chosen.intermediates {
+        aterm_uds::backup::validate_build_dir(intermediates)?;
+    }
     let managed_default = matches!(&chosen.target, super::FinalTarget::WorkspaceDefault)
         && chosen
             .manifests
@@ -4199,8 +4373,244 @@ fn observe_selected_placement(
         still_placed(args, tool, machine, selected)?;
         prepare_unowned_placement(args, tool, home, machine, selected)?;
     }
+    if matches!(selected, super::BuildDir::Cache(_))
+        && !non_producing_command(args, tool, machine)
+        && !targo_query(args, tool, machine)
+    {
+        still_placed(args, tool, machine, selected)?;
+        prepare_cached_placement(args, tool, home, machine)?;
+    }
     still_placed(args, tool, machine, selected)?;
     Ok(observed == Observation::Owned)
+}
+
+/// The shim's shared root is an exclusion boundary even when Cargo has yet to resolve the
+/// workspace of an installed package. A workspace already known to this reader also gets its
+/// exact mirror prepared before the compiler starts, under the same private-parent checks.
+fn prepare_cached_placement(
+    args: &[String],
+    tool: super::Tool,
+    home: &Path,
+    machine: &super::Machine<'_>,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let root = machine
+            .root
+            .map_or_else(|| super::cache_root(home), Path::to_path_buf);
+        let manifests = selected_call_outputs(args, tool, home, machine)
+            .map(|chosen| chosen.manifests)
+            .or_else(|| {
+                workspace_target_chosen(args, tool, home, machine).map(|chosen| chosen.manifests)
+            });
+        let workspace = manifests.and_then(|manifests| {
+            workspace_choices(home, &manifests, args, tool, machine)
+                .ok()
+                .flatten()
+        });
+        prepare_shared_build_dir_at(home, &root, workspace.as_deref())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (args, tool, home, machine);
+        Ok(())
+    }
+}
+
+/// The directory a caller-selected intermediate hint can protect before Cargo expands it.
+/// Known workspace and Cargo-home templates are expanded from captured caller facts. A
+/// computed hash stays Cargo's to expand; only its already-protected static parent is claimed.
+/// This reads paths and creates nothing.
+///
+/// # Errors
+/// A required template base is unavailable, a template is unknown or malformed, the result is
+/// relative or traverses a parent, or no known directory boundary has a `.noindex` name.
+pub fn explicit_build_root(
+    value: &Path,
+    workspace: Option<&Path>,
+    cargo_home: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let invalid = |why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
+    if !value
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .any(|&byte| matches!(byte, b'{' | b'}'))
+    {
+        if !value.is_absolute()
+            || value
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+        {
+            return Err(invalid(
+                "the build-directory hint needs an absolute path without ..",
+            ));
+        }
+        aterm_uds::backup::validate_build_dir(value)?;
+        return Ok(value.to_path_buf());
+    }
+    let text = value
+        .to_str()
+        .ok_or_else(|| invalid("the templated build-directory hint is not UTF-8"))?;
+    let mut expanded = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(['{', '}']) {
+        expanded.push_str(&rest[..at]);
+        let suffix = &rest[at..];
+        let word = suffix
+            .strip_prefix('{')
+            .ok_or_else(|| invalid("the build-directory hint has an unmatched closing brace"))?;
+        let end = word
+            .find('}')
+            .ok_or_else(|| invalid("the build-directory hint has an unmatched opening brace"))?;
+        match &word[..end] {
+            "workspace-root" | "cargo-cache-home" => {
+                let base = if &word[..end] == "workspace-root" {
+                    workspace
+                } else {
+                    cargo_home
+                }
+                .filter(|base| base.is_absolute())
+                .ok_or_else(|| {
+                    invalid("the build-directory hint has no known absolute template base")
+                })?;
+                expanded
+                    .push_str(base.to_str().ok_or_else(|| {
+                        invalid("the build-directory template base is not UTF-8")
+                    })?);
+            }
+            "workspace-path-hash" => expanded.push_str("{workspace-path-hash}"),
+            _ => return Err(invalid("the build-directory hint has an unknown template")),
+        }
+        rest = &word[end + 1..];
+    }
+    expanded.push_str(rest);
+    let expanded = Path::new(&expanded);
+    if !expanded.is_absolute()
+        || expanded
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(invalid(
+            "the build-directory hint needs an absolute path without ..",
+        ));
+    }
+    let mut root = PathBuf::new();
+    for component in expanded.components() {
+        if component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|part| part.contains(['{', '}']))
+        {
+            break;
+        }
+        root.push(component);
+    }
+    if root.as_path() != expanded {
+        let workspace = workspace.ok_or_else(|| {
+            invalid("a computed build directory has no established source workspace")
+        })?;
+        if workspace.starts_with(&root) {
+            return Err(invalid(
+                "a computed build directory has no separate known build-folder boundary",
+            ));
+        }
+    }
+    aterm_uds::backup::validate_build_dir(&root)?;
+    Ok(root)
+}
+
+/// Prepare and mark an exact caller-selected compiler-intermediate directory, without
+/// granting cache custody. Private canonical parents are held while the directory is extended;
+/// ordinary final-artifact containers are prepared separately by their existing rules.
+/// Outside macOS this preserves the existing no-preparation policy.
+///
+/// # Errors
+/// The path has no physical `.noindex` boundary, is relative or linked, a private directory
+/// cannot be extended, its binding changes, or its backup exclusion cannot be written.
+pub fn prepare_explicit_build_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        aterm_uds::backup::validate_build_dir(path)?;
+        let stop =
+            || std::io::Error::other("the explicit build directory could not be prepared safely");
+        if !path.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the explicit build directory must be absolute",
+            ));
+        }
+        let mut anchor = path;
+        loop {
+            match std::fs::symlink_metadata(anchor) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    anchor = anchor.parent().ok_or_else(stop)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let held = creation::pin(anchor).ok_or_else(stop)?;
+        let relative = path.strip_prefix(anchor).map_err(std::io::Error::other)?;
+        prepare_private_descendants(anchor, held, relative, &|| true, &mut |_, _| Ok(()))?;
+        let held = creation::pin(path).ok_or_else(stop)?;
+        claim_build_folder(path, &held, aterm_uds::backup::Backups::SYSTEM)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Prepare the native producer's shared build cache and exact workspace mirror. The same
+/// pinned private-directory walk serves the compiler shim. This adds no cache custody.
+/// Outside macOS no shared compiler placement is selected and this writes nothing.
+///
+/// # Errors
+/// A parent is linked, shared, ambiguous or replaced, the directories cannot be created, or
+/// their backup exclusion cannot be written.
+pub fn prepare_shared_build_dir(home: &Path, workspace: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        lay_shared(home);
+        prepare_shared_build_dir_at(home, &super::cache_root(home), Some(workspace))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (home, workspace);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn prepare_shared_build_dir_at(
+    home: &Path,
+    root: &Path,
+    workspace: Option<&Path>,
+) -> std::io::Result<()> {
+    if let Some(workspace) = workspace
+        && (!workspace.is_absolute()
+            || workspace
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+            || workspace.canonicalize()?.as_path() != workspace)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the shared build's workspace is not a canonical absolute directory",
+        ));
+    }
+    let held = creation::ensure_parent(home, root).ok_or_else(|| {
+        std::io::Error::other("the shared build cache could not be prepared for its backup mark")
+    })?;
+    claim_indexed_build_folder(root, &held, aterm_uds::backup::Backups::SYSTEM)?;
+    if let Some(workspace) = workspace {
+        let build = super::build_dir(root, workspace);
+        let relative = build.strip_prefix(root).map_err(std::io::Error::other)?;
+        prepare_private_descendants(root, held, relative, &|| true, &mut |_, _| Ok(()))?;
+    }
+    Ok(())
 }
 
 fn still_placed(
@@ -4707,6 +5117,12 @@ fn observe_for_producer_with_placement(
             "a relative CARGO_HOME with -C names one package home against the launcher's folder (a rustup proxy's) and another against that directory (Targo's), and atpkg cannot tell which this cargo reads; set CARGO_HOME to an absolute path; no build started",
         ));
     }
+    #[cfg(target_os = "macos")]
+    let intermediate_root = if query {
+        None
+    } else {
+        selected_intermediate_root(args, tool, home, machine)?
+    };
     let explicit = requires_managed_explicit(args, tool, home, machine);
     let refusal = || {
         let at =
@@ -4750,6 +5166,22 @@ fn observe_for_producer_with_placement(
             return Err(std::io::Error::other(refusal.why()));
         }
         return Err(refusal());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(root) = intermediate_root {
+        let still_selected = || {
+            if selected_intermediate_root(args, tool, home, machine)?.as_ref() == Some(&root) {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the explicit build-directory choice changed during admission; no compiler started",
+                ))
+            }
+        };
+        still_selected()?;
+        prepare_explicit_build_dir(&root)?;
+        still_selected()?;
     }
     Ok(observed)
 }

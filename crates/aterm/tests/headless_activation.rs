@@ -9,12 +9,11 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
-use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::{headless_boot, launch_isolation};
+use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::{Instance, log_tail};
 
@@ -23,9 +22,11 @@ fn boot() -> Instance {
     headless_boot::boot("athl", &["--lines", "40", "--columns", "120"])
 }
 
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
-/// A `swift -e` fallback can spend 5-15 s building its module cache cold.
-const PROBE_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a client and what it talks to may make no progress before it is killed as hung.
+const CLIENT_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(90);
+/// As [`CLIENT_NO_PROGRESS_WINDOW`], for the probe (a `swift -e` fallback can spend 5-15 s
+/// building its module cache cold).
+const PROBE_NO_PROGRESS_WINDOW: Duration = Duration::from_secs(60);
 /// `activateIgnoringOtherApps:` lands through the WindowServer asynchronously.
 const PROBE_SAMPLES: usize = 3;
 const PROBE_GAP: Duration = Duration::from_millis(500);
@@ -35,42 +36,11 @@ fn hermetic_env(cmd: &mut Command, tmp: &Path) {
     launch_isolation::apply(cmd, tmp);
 }
 
-/// Drains a child pipe on a dedicated background thread.
-fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    })
-}
-
-/// Wait for `child` with a deadline.
-fn bounded_wait(mut child: Child, what: &str, deadline: Duration) -> Result<Output, String> {
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let until = Instant::now() + deadline;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= until => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{what} did not exit within {}s",
-                    deadline.as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => return Err(format!("poll {what}: {e}")),
-        }
-    };
-    Ok(Output {
-        status,
-        stdout: stdout.join().expect("join the stdout drain"),
-        stderr: stderr.join().expect("join the stderr drain"),
-    })
+/// Wait for `child` to exit ([`child_output::wait_and_read`]), killed as hung after `window`
+/// without progress.
+fn bounded_wait(child: Child, what: &str, window: Duration) -> Result<Output, String> {
+    child_output::wait_and_read(child, window)
+        .map_err(|why| format!("{what} was killed before it exited: {why}"))
 }
 
 /// Runs an isolated `aterm` client command against the instance and returns stdout.
@@ -83,7 +53,7 @@ fn client_ok(inst: &Instance, args: &[&str]) -> String {
             .stderr(Stdio::piped());
         hermetic_env(&mut cmd, &inst.tmp);
         let child = cmd.spawn().expect("spawn the aterm client");
-        bounded_wait(child, &format!("aterm {args:?}"), CLIENT_EXIT_DEADLINE)
+        bounded_wait(child, &format!("aterm {args:?}"), CLIENT_NO_PROGRESS_WINDOW)
             .unwrap_or_else(|e| panic!("{e}"))
     });
     assert!(
@@ -177,7 +147,7 @@ fn probe(tool: &ProbeTool, pid: u32) -> Result<Posture, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = cmd.spawn().map_err(|e| format!("spawn the probe: {e}"))?;
-    let out = bounded_wait(child, "the activation probe", PROBE_DEADLINE)?;
+    let out = bounded_wait(child, "the activation probe", PROBE_NO_PROGRESS_WINDOW)?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {

@@ -361,6 +361,7 @@ fn an_account_leased_elsewhere_is_never_picked_and_turn_end_yields() {
         &state,
         &enrolled,
         None,
+        accounts::ModelWeek::Unread,
         &accounts::Point::TurnEnd,
         NOW,
     );
@@ -384,6 +385,7 @@ fn an_account_leased_elsewhere_is_never_picked_and_turn_end_yields() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     assert_eq!(
         accounts::advise(
@@ -434,6 +436,7 @@ fn an_account_leased_elsewhere_is_never_picked_and_turn_end_yields() {
         &state,
         &enrolled,
         None,
+        accounts::ModelWeek::Unread,
         &accounts::Point::TurnEnd,
         after_expiry,
     );

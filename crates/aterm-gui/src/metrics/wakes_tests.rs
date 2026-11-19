@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::{OTHER, WAKE_SLOTS, WakeCensus, WakeTable, variant_name};
+use crate::harness_host::HostNote;
 use crate::{Wake, WindowId};
 use std::cell::Cell;
 
@@ -69,6 +70,28 @@ fn a_census_counts_each_variant_in_its_own_slot_busiest_first() {
     assert_eq!(
         table.attribution(),
         [("Output", 3), ("ControlPrepared", 1), ("WarmupResult", 1)]
+    );
+}
+
+#[test]
+fn a_host_note_counts_under_its_own_note() {
+    let table = local_table();
+    let mut census = WakeCensus::over(table);
+    census.note(&Wake::HostNote(HostNote::ProgramCheckUnstuck));
+    census.note(&Wake::HostNote(HostNote::DiskLooked));
+    census.note(&Wake::HostNote(HostNote::ProgramCheckUnstuck));
+    census.note(&Wake::HostNote(HostNote::SupervisorSteady {
+        sid: "t-payload".into(),
+    }));
+    census.note(&Wake::WarmupResult);
+    assert_eq!(
+        table.attribution(),
+        [
+            ("HostNote.ProgramCheckUnstuck", 2),
+            ("HostNote.DiskLooked", 1),
+            ("HostNote.SupervisorSteady", 1),
+            ("WarmupResult", 1)
+        ]
     );
 }
 

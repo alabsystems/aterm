@@ -113,8 +113,8 @@ use crate::{
 use astream_wire::sync::{Actor, Digest};
 use aterm_digest::Sha256;
 use aterm_file::{
-    AccountNames, Column, File, Frontier, Kept, Look, Name, Opened, Projected, Recorded, Row,
-    Snapshot, Source, Why, Word, retain,
+    AccountNames, Column, File, Frontier, Kept, Look, Name, Opened, Projected, Recorded, Rendered,
+    Row, Snapshot, Source, Why, Word, retain,
 };
 use aterm_json::{Map, Value};
 use aterm_secrets::{
@@ -404,12 +404,49 @@ fn with_custody<T>(
 
 /// One table family as one pass read it: everything a projection of its files reads from
 /// custody, owned, so the projection runs once custody is closed and reads no session.
+///
+/// A family that keeps its records across a roll (`att::keeps_records`, tracker TK-41) is read
+/// with the generations sealed before the one read: `resolved` holds what each of their logs
+/// holds of its signers' own rows and log entries (`att::kept::Rows`), which no roll restates,
+/// so the view lays them under its own; `frontier` names their stores before its own;
+/// `earlier` holds their operations, for a file's history; and what their own views say of
+/// their logs (`sealed_complete`, `sealed_refused` with `sealed_refusals`, `sealed_inert`) is
+/// in the status of each file, whose rows are theirs too.
 struct Family {
     compiled: &'static Compiled,
     frontier: Frontier,
+    /// How many of `frontier`'s stores are the sealed generations', which come first: the rest
+    /// are the stores the generation read was itself read from.
+    sealed: usize,
     log: Log,
     resolved: att::Resolved,
+    /// Each eligible operation of each sealed generation's log, oldest generation first.
+    earlier: Vec<Earlier>,
+    /// No sealed generation's log holds a record that could still become visible
+    /// ([`View::complete`] of each one's own view).
+    sealed_complete: bool,
+    /// The records the sealed generations' logs hold and never project, with who signed each
+    /// and why ([`View::refused`] and [`View::refusals`] of each one's own view, which run in
+    /// one order), oldest generation first.
+    sealed_refused: Vec<Digest>,
+    sealed_refusals: Vec<crate::typed::Unread>,
+    /// Per collection, the records of the sealed generations' logs that never project and that
+    /// no row or entry count holds ([`inert`]'s first and last kinds, of each one's own view):
+    /// those past their writer's quota there, and those the authority rule holds inert.
+    sealed_inert: BTreeMap<&'static str, u64>,
     view: std::cell::OnceCell<View>,
+}
+
+/// One eligible operation of a sealed generation's log as a file's history lists it
+/// ([`history`]): which, whose, when and which cells, never a value.
+struct Earlier {
+    id: Digest,
+    actor: Actor,
+    /// When it says it was authored, Unix milliseconds.
+    authored_ms: u64,
+    revert: bool,
+    /// Each cell it wrote: the collection's name and the key.
+    cells: Vec<(String, String)>,
 }
 
 impl Family {
@@ -417,6 +454,14 @@ impl Family {
     /// what its view resolves through the session ([`att::Resolved::read`]): a read that
     /// refuses refuses each file of the family, `custody`'s, or busy or membership's as its
     /// error says ([`Refusal::of`]).
+    ///
+    /// In a family that keeps its records, each generation sealed before that one is opened
+    /// and read too (`att::kept::sealed`), under `[commons]` as the generation read is: one the
+    /// policy excludes on this Mac turns the family's files `off`, and one this Mac does not
+    /// hold yet (it joined after the seal and has not repaired it) holds them, since a file
+    /// without a sealed generation's entries would be one that lies. The resolution is laid
+    /// over their rows ([`att::Resolved::over`]), which moves the projection key with them
+    /// ([`att::Resolved::digest`]: a record that reaches a sealed log late projects again).
     fn read(custody: &Custody<'_>, first: &'static Compiled) -> Result<Self, Refusal> {
         let trust = custody.session.trust();
         let compiled = att::current_in(&custody.catalog, trust, &first.chain());
@@ -463,32 +508,153 @@ impl Family {
             .directory
             .observe_table(custody.session, descriptor.scope)
             .map_err(|error| Refusal::of(&error, Why::Custody))?;
-        let log = Log::read_with(custody.session, &store, descriptor.scope, att::decode)
-            .map_err(|error| Refusal::of(&error, Why::Custody))?;
+        let log = Log::read_with(
+            custody.session,
+            &store,
+            descriptor.scope,
+            compiled.decoder(),
+        )
+        .map_err(|error| Refusal::of(&error, Why::Custody))?;
         let resolved = att::Resolved::read(compiled.table, custody.session, &log)
             .map_err(|error| Refusal::of(&error, Why::Custody))?;
+        // The generations sealed before this one, where the family keeps its records: each
+        // holds its signers' own rows and log entries, which only its log does.
+        let sealed = att::kept::earlier(first, compiled);
+        for generation in &sealed {
+            let scope = generation
+                .descriptor(trust)
+                .map_err(|error| Refusal::of(&error, Why::Catalog))?
+                .scope;
+            if !custody
+                .policy
+                .includes(custody.directory.catalog_scope().digest(), scope.digest())
+            {
+                return Err(Refusal::off(
+                    "[commons] excludes a sealed generation of this table on this Mac",
+                ));
+            }
+        }
+        let custody_refused = |error: Error| Refusal::of(&error, Why::Custody);
+        let sealed = att::kept::sealed(custody.session, &sealed).map_err(custody_refused)?;
+        let mut stores = Vec::new();
+        let mut rows = Vec::with_capacity(sealed.len());
+        let mut earlier = Vec::new();
+        let mut sealed_complete = true;
+        let mut sealed_refused = Vec::new();
+        let mut sealed_refusals = Vec::new();
+        let mut sealed_inert: BTreeMap<&'static str, u64> = BTreeMap::new();
+        for generation in &sealed {
+            let sealed_log = generation.log(custody.session).map_err(custody_refused)?;
+            stores.extend(generation.witnesses());
+            let (sealed_resolved, sealed_view) = generation
+                .view(custody.session, &sealed_log)
+                .map_err(custody_refused)?;
+            rows.push(generation.rows_of(&sealed_log, &sealed_resolved, &sealed_view));
+            sealed_complete &= sealed_view.complete;
+            sealed_refused.extend(sealed_view.refused.iter().copied());
+            sealed_refusals.extend(sealed_view.refusals.iter().cloned());
+            for collection in generation.compiled.table.collections {
+                let over = sealed_view
+                    .ops
+                    .iter()
+                    .filter(|op| {
+                        sealed_view.quota.over.contains(&op.id)
+                            && op
+                                .changes
+                                .iter()
+                                .any(|change| change.collection == collection.name)
+                    })
+                    .count();
+                let authority = sealed_view
+                    .inert
+                    .records
+                    .get(collection.name)
+                    .copied()
+                    .unwrap_or(0);
+                let count = u64::try_from(over.saturating_add(authority)).unwrap_or(u64::MAX);
+                if count > 0 {
+                    let held = sealed_inert.entry(collection.name).or_default();
+                    *held = held.saturating_add(count);
+                }
+            }
+            earlier.extend(
+                sealed_log
+                    .eligible_iter()
+                    .filter_map(|(operation, command)| {
+                        Some(Earlier {
+                            id: operation.header.id,
+                            actor: operation.header.actor,
+                            authored_ms: operation.authored_ms,
+                            revert: command.reverts().is_some(),
+                            cells: command
+                                .changes()?
+                                .iter()
+                                .map(|change| (change.collection.clone(), change.key.clone()))
+                                .collect(),
+                        })
+                    }),
+            );
+        }
+        let sealed = stores.len();
+        stores.extend(store.witnesses());
         Ok(Self {
             compiled,
             frontier: Frontier {
                 source: source.finalize(),
                 era: custody.era,
                 generation: compiled.generation,
-                ids: log.retained_ids().copied().collect(),
+                stores,
+                view: [0; 32],
             },
+            sealed,
             log,
-            resolved,
+            resolved: resolved.over(rows),
+            earlier,
+            sealed_complete,
+            sealed_refused,
+            sealed_refusals,
+            sealed_inert,
             view: std::cell::OnceCell::new(),
         })
     }
 
+    /// The frontier of the generation read alone, its family's sealed generations' stores left
+    /// out: where a record this read's own log holds was found (`aterm_file::File::stamp_done`,
+    /// which stamps a read of one store).
+    fn own_frontier(&self) -> Frontier {
+        Frontier {
+            stores: self.frontier.stores[self.sealed..].to_vec(),
+            ..self.frontier.clone()
+        }
+    }
+
     /// The family's table view, made once a pass ([`View::of`]) for every file of the family a
-    /// pass projects.
+    /// pass projects. Where it lies over sealed generations' rows, it is complete only where
+    /// each of their logs is, and names the records each of them holds and does not project
+    /// with its own: a file whose rows are theirs says so of them too. (A handle's view says
+    /// those of its own log alone, which is what its writes wait on.)
     fn view(&self) -> &View {
         self.view.get_or_init(|| {
             #[cfg(test)]
             PROJECTIONS.set(PROJECTIONS.get() + 1);
-            View::of(self.compiled.table, &self.log, &self.resolved)
+            let mut view = View::of(self.compiled.table, &self.log, &self.resolved);
+            view.complete &= self.sealed_complete;
+            view.refused.extend(self.sealed_refused.iter().copied());
+            view.refusals.extend(self.sealed_refusals.iter().cloned());
+            view
         })
+    }
+
+    /// How many records `file`'s status counts inert ([`inert`] of `view`, [`Self::view`]),
+    /// with those of the sealed generations' logs that no row or entry count of the view
+    /// holds (`sealed_inert`).
+    fn inert(&self, file: &Type, view: &View) -> u64 {
+        let sealed = file
+            .collection()
+            .and_then(|collection| self.sealed_inert.get(collection.name))
+            .copied()
+            .unwrap_or(0);
+        inert(file, view).saturating_add(sealed)
     }
 }
 
@@ -528,8 +694,8 @@ thread_local! {
 ///
 /// The ring has no catalog entry: its tables are named by the ring and the week, outside the
 /// catalog (`catalog::ring`), so a pass checks only that `[commons]` includes each one. Its
-/// frontier orders reads of one replica by the window's first week, then by the records the
-/// window's tables retained: a window that moved on to a later week replaces a snapshot
+/// frontier orders reads of one replica by the window's first week, then by each week table's
+/// store witness, in the window's order: a window that moved on to a later week replaces a snapshot
 /// whatever it no longer holds (its rows stay in the snapshot, `aterm_file::retain`), and a
 /// clock set back a week reads as behind.
 ///
@@ -581,7 +747,7 @@ impl Ring {
         source.update(b"\0");
         source.update(catalog);
         source.update(custody.origin.as_bytes());
-        let mut ids = BTreeSet::new();
+        let mut stores = Vec::new();
         let mut ops = Vec::new();
         let mut authored = BTreeMap::new();
         let mut complete = true;
@@ -597,7 +763,7 @@ impl Ring {
             };
             let log = Log::read_with(custody.session, &store, scope, att::decode)
                 .map_err(|error| Refusal::of(&error, Why::Custody))?;
-            ids.extend(log.retained_ids().copied());
+            stores.extend(store.witnesses());
             complete &= log.history_complete();
             judgments.push(log.judgment());
             for (operation, _) in log.eligible_iter() {
@@ -625,7 +791,8 @@ impl Ring {
                 source: source.finalize(),
                 era: custody.era,
                 generation: u32::try_from(*window.start()).unwrap_or(u32::MAX),
-                ids,
+                stores,
+                view: [0; 32],
             },
             ops,
             authored,
@@ -886,31 +1053,19 @@ fn computed(
     out
 }
 
-/// Project `file` from the view `projections` projects: its snapshot (the revision unset), how
-/// many cells were left out for a value the guards refuse, and the baseline a write of this
-/// revision is read against (what each face cell showed and each cell's candidates,
-/// `super::face::Baseline`).
-fn table(
-    file: &Type,
-    compiled: &'static Compiled,
-    projections: &Projections<'_>,
-    me: Option<&str>,
-    now_ms: u64,
-) -> Result<(Snapshot, u64, Option<Vec<u8>>), Refusal> {
-    let custody = |error: Error| Refusal::of(&error, Why::Custody);
-    let view = projections.view();
-    let Some((_, bound)) = file.table() else {
-        return Err(Refusal::held(
-            Why::Catalog,
-            "the file is no catalog table's",
-        ));
-    };
-    let collection = compiled.collection(bound.name).map_err(custody)?;
-    let projection = projections.project(collection);
-    // The face is the grid's own export, addresses shown: one layout, one spelling of each
-    // value, one refusal text.
-    let export = grid::export(compiled.table, collection, &view.cells, &[]).map_err(custody)?;
-    let layout = grid::layout(collection, &projection);
+/// What one row of a table file is, as one projection made it: the row, how many of its cells
+/// were left out for a value the guards refuse, and its line of the baseline
+/// ([`super::face::Baseline::row_line`]).
+#[derive(Clone, Debug)]
+struct MadeRow {
+    row: Row,
+    withheld: u64,
+    baseline: String,
+}
+
+/// The columns of a table file's snapshot over the grid's layout of `collection`: the layout's,
+/// then the file's computed ones, then the key.
+fn table_columns(file: &Type, layout: &[grid::GridColumn]) -> Vec<Column> {
     let mut columns: Vec<Column> = layout
         .iter()
         .filter(|column| column.source != grid::Source::Pk)
@@ -956,14 +1111,25 @@ fn table(
         ty: None,
         null: None,
     });
-    let mut computed = computed(file, compiled, projections, &projection, me);
-    let mut withheld = 0_u64;
+    columns
+}
+
+/// The rows of `export` (the grid's export of `collection` over `cells`), each made from its
+/// row of `projection` and its computed cells: whatever the guards refuse shows the grid's
+/// refusal text and is counted.
+fn table_rows(
+    export: &grid::Export,
+    layout: &[grid::GridColumn],
+    projection: &Projection,
+    mut computed: BTreeMap<String, BTreeMap<&'static str, String>>,
+) -> Vec<MadeRow> {
     let mut rows = Vec::with_capacity(export.base.rows.len());
     for (pk, seen) in &export.base.rows {
         let projected = projection.rows.get(pk);
+        let mut withheld = 0_u64;
         let mut cells = BTreeMap::new();
         let mut values = Map::new();
-        for column in &layout {
+        for column in layout {
             let Some(seen) = seen.get(&column.name).filter(|seen| !seen.shown.is_empty()) else {
                 continue;
             };
@@ -1006,13 +1172,243 @@ fn table(
                 cells.insert(column.to_owned(), value);
             }
         }
-        rows.push(Row {
-            pk: pk.clone(),
-            live: projected.is_none_or(cell::Row::live),
-            cells,
-            values,
+        #[cfg(test)]
+        touch(1);
+        let baseline = super::face::Baseline::row_line(pk, seen, &cells);
+        rows.push(MadeRow {
+            row: Row {
+                pk: pk.clone(),
+                live: projected.is_none_or(cell::Row::live),
+                cells,
+                values,
+            },
+            withheld,
+            baseline,
         });
     }
+    rows
+}
+
+/// The baseline of `rendered`, a table file's snapshot laid out by `grid` (its rows left
+/// out), from its rows' lines `lines`, in key order.
+fn table_baseline<'a>(
+    grid: &grid::Base,
+    rendered: &Rendered,
+    lines: impl Iterator<Item = &'a str>,
+) -> Vec<u8> {
+    let columns = &rendered.snapshot().columns;
+    let face: Vec<&Column> = rendered
+        .face_names()
+        .into_iter()
+        .filter_map(|name| columns.iter().find(|column| column.name == name))
+        .collect();
+    super::face::Baseline::assemble(&super::face::Baseline::header_line(grid, &face), lines)
+}
+
+/// A table file's last projection in this process (package TK-09): the cells it was made from
+/// ([`View::cells_from`]), the content of the snapshot it made, and each row as it made it. A
+/// pass whose view stands later in the same lineage of cells, beside that snapshot, makes again
+/// only the rows whose cells changed since ([`patched`]).
+struct Made {
+    /// Where the file's snapshot is kept, which names its home as well as its name.
+    file: std::path::PathBuf,
+    mark: crate::documents::materialized::Mark,
+    /// [`aterm_file::Snapshot::content`] of the snapshot made.
+    content: [u8; 32],
+    /// Its columns.
+    columns: Vec<Column>,
+    /// The grid's layout of the collection, its rows left out: the baseline's header.
+    grid: grid::Base,
+    rows: BTreeMap<String, MadeRow>,
+}
+
+/// The table files' last projections, most recent first.
+static MADE: std::sync::Mutex<Vec<Made>> = std::sync::Mutex::new(Vec::new());
+
+/// How many table files' projections [`MADE`] keeps: a memory bound on a cache. Past it the one
+/// with the fewest rows goes first: it costs the least to project again.
+const MADE_FILES: usize = 16;
+
+/// Keep `made` for the next pass over its file.
+fn keep_made(made: Made) {
+    if let Ok(mut kept) = MADE.lock() {
+        kept.retain(|held| held.file != made.file);
+        kept.insert(0, made);
+        while kept.len() > MADE_FILES {
+            // The fewest rows, the oldest of those (the last).
+            let Some(least) = kept
+                .iter()
+                .enumerate()
+                .rev()
+                .min_by_key(|(_, held)| held.rows.len())
+                .map(|(at, _)| at)
+            else {
+                break;
+            };
+            kept.remove(least);
+        }
+    }
+}
+
+/// Drop every projection [`MADE`] keeps, as a process that made none.
+#[cfg(test)]
+pub(crate) fn forget_for_test() {
+    if let Ok(mut kept) = MADE.lock() {
+        kept.clear();
+    }
+}
+
+/// The last projection of `file` this process made, taken out.
+fn take_made(file: &std::path::Path) -> Option<Made> {
+    let mut kept = MADE.lock().ok()?;
+    let at = kept.iter().position(|held| held.file == file)?;
+    Some(kept.remove(at))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The rows this thread's passes projected or made (a collection's projection, the grid's
+    /// export, a snapshot row and its baseline line), counted (never timed). With
+    /// `aterm_file::snapshot::test_rows_touched` it is every row a pass touched.
+    pub(crate) static ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn touch(rows: usize) {
+    ROWS.set(ROWS.get() + rows);
+}
+
+/// Whether a projection of `file`'s `collection` from `view` can be kept and patched by a later
+/// pass: its rows read nothing but their own cells (no computed column, no claimed one, whose
+/// rows read other rows and files) and the view's cells are the ones this process keeps of the
+/// table ([`View::cells_from`]).
+fn patchable(file: &Type, collection: &Collection, view: &View) -> bool {
+    file.computed == super::Computed::None
+        && !collection
+            .columns
+            .iter()
+            .any(|column| column.claim.is_some())
+        && view.cells_from.is_some()
+}
+
+/// `file`'s projection from `view` made from its last one ([`Made`]) and the snapshot `held`
+/// holds, where that projection is of the snapshot there and the view's cells stand later in
+/// its lineage: only the rows a changed cell names are projected, laid out and rendered, and
+/// every other row, its line and its baseline line are the ones made before. `None` where it
+/// cannot be: the caller projects every row.
+fn patched(
+    file: &'static Type,
+    compiled: &'static Compiled,
+    collection: &'static Collection,
+    view: &View,
+    held: &File,
+    now_ms: u64,
+) -> Option<(Rendered, u64, Vec<u8>)> {
+    if !patchable(file, collection, view) {
+        return None;
+    }
+    let marked = view.cells_from.as_ref()?;
+    let mut made = take_made(&held.snapshot_path())?;
+    let changed = marked.changed_since(made.mark)?;
+    let old = held.held().ok().flatten()?;
+    if old.content() != made.content || old.snapshot().columns != made.columns {
+        return None;
+    }
+    // The rows a changed cell names, and only their cells.
+    let pks: BTreeSet<String> = changed
+        .iter()
+        .filter(|(name, _)| name == collection.name)
+        .filter_map(|(_, key)| key.split('.').next().map(str::to_owned))
+        .collect();
+    let mut cells = crate::documents::Cells::new();
+    for pk in &pks {
+        let prefix = format!("{pk}.");
+        cells.extend(
+            view.cells
+                .range((collection.name.to_owned(), prefix.clone())..)
+                .take_while(|((name, key), _)| name == collection.name && key.starts_with(&prefix))
+                .map(|(key, cell)| (key.clone(), cell.clone())),
+        );
+    }
+    let projection = cell::project(collection, &cells);
+    let export =
+        grid::export_projected(compiled.table, collection, &cells, &projection, &[]).ok()?;
+    let layout = grid::layout(collection, &projection);
+    #[cfg(test)]
+    touch(projection.rows.len() + export.base.rows.len());
+    // A column a newer build wrote moves the layout every row is laid out by.
+    if layout
+        .iter()
+        .any(|column| column.source == grid::Source::Unknown)
+        || table_columns(file, &layout) != made.columns
+    {
+        return None;
+    }
+    let rows = table_rows(&export, &layout, &projection, BTreeMap::new());
+    let gone: Vec<String> = pks
+        .iter()
+        .filter(|pk| !rows.iter().any(|row| row.row.pk == **pk))
+        .cloned()
+        .collect();
+    for pk in &gone {
+        made.rows.remove(pk);
+    }
+    let mut changed_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        changed_rows.push(row.row.clone());
+        made.rows.insert(row.row.pk.clone(), row);
+    }
+    let rendered = old.patch(changed_rows, &gone, view.complete, now_ms)?;
+    let withheld = made.rows.values().map(|row| row.withheld).sum();
+    let baseline = table_baseline(
+        &made.grid,
+        &rendered,
+        made.rows.values().map(|row| row.baseline.as_str()),
+    );
+    made.mark = marked.mark();
+    made.content = rendered.content();
+    keep_made(made);
+    Some((rendered, withheld, baseline))
+}
+
+/// Project `file` from the view `projections` projects: its snapshot (the revision unset), how
+/// many cells were left out for a value the guards refuse, and the baseline a write of this
+/// revision is read against (what each face cell showed and each cell's candidates,
+/// `super::face::Baseline`). Where the last projection of the file in this process can be
+/// patched ([`patched`]), only the rows whose cells changed since are projected.
+fn table(
+    file: &'static Type,
+    compiled: &'static Compiled,
+    projections: &Projections<'_>,
+    held: &File,
+    me: Option<&str>,
+    now_ms: u64,
+) -> Result<(Rendered, u64, Option<Vec<u8>>), Refusal> {
+    let custody = |error: Error| Refusal::of(&error, Why::Custody);
+    let view = projections.view();
+    let Some((_, bound)) = file.table() else {
+        return Err(Refusal::held(
+            Why::Catalog,
+            "the file is no catalog table's",
+        ));
+    };
+    let collection = compiled.collection(bound.name).map_err(custody)?;
+    if let Some((rendered, withheld, baseline)) =
+        patched(file, compiled, collection, view, held, now_ms)
+    {
+        return Ok((rendered, withheld, Some(baseline)));
+    }
+    let projection = projections.project(collection);
+    // The face is the grid's own export, addresses shown: one layout, one spelling of each
+    // value, one refusal text.
+    let export = grid::export(compiled.table, collection, &view.cells, &[]).map_err(custody)?;
+    let layout = grid::layout(collection, &projection);
+    #[cfg(test)]
+    touch(projection.rows.len() + export.base.rows.len());
+    let columns = table_columns(file, &layout);
+    let computed = computed(file, compiled, projections, &projection, me);
+    let made = table_rows(&export, &layout, &projection, computed);
+    let withheld = made.iter().map(|row| row.withheld).sum();
     let snapshot = Snapshot {
         name: file.file(),
         kind: TABLE.to_owned(),
@@ -1020,14 +1416,39 @@ fn table(
         rev: 0,
         complete: view.complete,
         at_ms: now_ms,
-        columns,
+        columns: columns.clone(),
         handles: file.handles.iter().map(|name| (*name).to_owned()).collect(),
-        rows,
+        rows: made.iter().map(|row| row.row.clone()).collect(),
     };
-    // A baseline that cannot be written leaves the revision without one: a write of it then
-    // asks for a refresh rather than guess what its author saw.
-    let baseline = super::face::Baseline::encode(&export.base, &snapshot);
-    Ok((snapshot, withheld, baseline))
+    let rendered = Rendered::of(snapshot);
+    let grid = grid::Base {
+        rows: Vec::new(),
+        ..export.base
+    };
+    let baseline = table_baseline(
+        &grid,
+        &rendered,
+        made.iter().map(|row| row.baseline.as_str()),
+    );
+    if patchable(file, collection, view)
+        && !layout
+            .iter()
+            .any(|column| column.source == grid::Source::Unknown)
+        && let Some(marked) = &view.cells_from
+    {
+        keep_made(Made {
+            file: held.snapshot_path(),
+            mark: marked.mark(),
+            content: rendered.content(),
+            columns,
+            grid,
+            rows: made
+                .into_iter()
+                .map(|row| (row.row.pk.clone(), row))
+                .collect(),
+        });
+    }
+    Ok((rendered, withheld, Some(baseline)))
 }
 
 /// Which guards the shown text of a stored cell is held to ([`ring_cell`]).
@@ -1200,6 +1621,21 @@ fn stored_row(
     Some(row)
 }
 
+/// One row of the ring's owned collection `collection` at `pk`, projected as a pass projects
+/// it ([`stored_row`]): for the journal's seam that folds a Mac's own rows as a pass would
+/// (`alab::journal::fold_limits_for_test`).
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn ring_row(collection: &Collection, pk: &str, value: &Value) -> Option<Row> {
+    stored_row(
+        collection,
+        pk,
+        value,
+        Held::Ring,
+        &mut BTreeSet::new(),
+        &mut 0,
+    )
+}
+
 /// Each Mac's rows of an owned collection of the ring, `read` already judged by their keys
 /// (`owned::read_owned`: a row at a key that does not name its signer's machine is inert and
 /// never here): one row per key, `<pk>.<uuid32>`, its columns the collection's. Returns the
@@ -1229,7 +1665,9 @@ fn mine(collection: &Collection, read: &OwnedRead) -> (Columns, BTreeSet<String>
 /// signer's machine, or at a key an earlier entry took, is inert and never here), keyed
 /// `<uuid32>.<n>` in (machine, counter) order, its columns the collection's, all read-only, each
 /// cell shown as the table's grid shows a value of its type ([`Held::Table`]). A catalog table
-/// forgets no record, so nothing is carried. Returns the snapshot (the revision
+/// forgets no record, so nothing is carried: in a family that keeps its records the view holds
+/// the entries of every generation's log, each sealed generation's under the one read's
+/// ([`Family::read`], `att::kept::overlay`). Returns the snapshot (the revision
 /// unset) and the cells withheld.
 fn log_table(
     file: &Type,
@@ -1278,14 +1716,16 @@ fn log_table(
 
 /// The columns of `ai/events`: each event field under a readable name, its wire key and its
 /// type. Times are Unix milliseconds, as every other time column of a shared file; an event
-/// states seconds.
-pub(super) const EVENT_COLUMNS: [(&str, &str, Ty); 19] = [
+/// states seconds. A model's bucket (`m`, on a `7d-model` wall or its clearing, FL-269) is the
+/// longest word: `seven_day_overage_included`.
+pub(super) const EVENT_COLUMNS: [(&str, &str, Ty); 20] = [
     ("at", "t", Ty::Time),
     ("kind", "k", Ty::Text(32)),
     ("account", "a", Ty::Ref("account")),
     ("cli", "c", Ty::Text(16)),
     ("sub", "s", Ty::Hex(12)),
     ("window", "w", Ty::Text(16)),
+    ("model", "m", Ty::Text(32)),
     ("pct", "p", Ty::Uint),
     ("reset", "r", Ty::Time),
     ("res", "rr", Ty::Text(16)),
@@ -1298,7 +1738,7 @@ pub(super) const EVENT_COLUMNS: [(&str, &str, Ty); 19] = [
     ("harness", "h", Ty::Text(16)),
     ("op", "op", Ty::Text(16)),
     ("via", "via", Ty::Text(16)),
-    ("program", "pg", Ty::Text(16)),
+    ("program", "pg", Ty::Text(20)),
 ];
 
 /// The wire keys of an event that hold a time in seconds.
@@ -1390,9 +1830,7 @@ fn ring_history(collection: &str, ring: &Ring) -> Vec<Value> {
 /// as `frontier`: what a ring file keeps of rows the window no longer holds. A snapshot of
 /// another replica, or one whose frontier does not read, carries nothing.
 fn previous_rows(held: &File, frontier: &Frontier) -> Vec<Row> {
-    let same = held
-        .frontier()
-        .is_some_and(|old| old.source == frontier.source);
+    let same = held.frontier_source() == Some(frontier.source);
     if !same {
         return Vec::new();
     }
@@ -1464,6 +1902,20 @@ fn ring_file(
     )
 }
 
+/// Hold every computed cell of `row` to the guards once more before it is written: a cell
+/// whose text fails them is shown refused and loses its value. Returns how many it withheld.
+pub(crate) fn guard_computed(row: &mut Row) -> u64 {
+    let mut withheld = 0;
+    for (column, text) in &mut row.cells {
+        if !guarded(text) {
+            withheld += 1;
+            *text = grid::REFUSED.to_owned();
+            row.values.remove(column);
+        }
+    }
+    withheld
+}
+
 /// Project `ai/limits` from the `ai/usage` rows `usage` (this pass's projection, or the
 /// snapshot here), naming each account by the registry's view (`compiled`'s, its collections
 /// projected once a pass, [`Projections`]) as `ai/accounts` names it (`alab::account_names`),
@@ -1504,14 +1956,7 @@ fn limits_file(
         let slug = names.map(|names| names.slug.as_str());
         let name = names.and_then(|names| names.name.as_deref());
         let mut row = limit.row(&pk, slug, name);
-        // Every computed text is held to the guards once more before it is written.
-        for (column, text) in &mut row.cells {
-            if !guarded(text) {
-                withheld += 1;
-                *text = grid::REFUSED.to_owned();
-                row.values.remove(column);
-            }
-        }
+        withheld += guard_computed(&mut row);
         rows.push(row);
     }
     let columns = file
@@ -1559,7 +2004,9 @@ fn limits_file(
 /// took ([`crate::typed::owned::LogRead::inert`]). They stay in history with their authors; the
 /// status counts them. A file of the journal ring counts its own read's (`ring_file`): a row or
 /// an entry at a key that is not its signer's, and an event this build's vocabulary does not
-/// read.
+/// read. A view over the sealed generations of a family that keeps its records holds their
+/// rows' and entries' counts (`att::kept::overlay`) and none of their records past quota or
+/// under the authority rules, which a pass adds from each one's own view ([`Family::inert`]).
 pub(crate) fn inert(file: &Type, view: &View) -> u64 {
     let Some(collection) = file.collection() else {
         return 0;
@@ -1593,7 +2040,10 @@ pub(crate) fn inert(file: &Type, view: &View) -> u64 {
 
 /// The operations that wrote `file`'s collection, oldest claim first (by the time each says it
 /// was authored, then by its id, as `att::Handle::history` orders them): which, whose, when and
-/// which cells, never a value.
+/// which cells, never a value. In a family that keeps its records they are those of every
+/// generation's log: each sealed generation's ([`Family::earlier`]) with the one read's, in
+/// that one order, since an owned row or a log entry of a sealed generation is in no later
+/// log (`att::kept`).
 fn history(file: &Type, family: &Family, view: &View, held: &File) -> Vec<Value> {
     let collection = file.collection().map_or("", |collection| collection.name);
     // Which of this Mac's intents each operation carries, who said they made it and in which
@@ -1633,33 +2083,43 @@ fn history(file: &Type, family: &Family, view: &View, held: &File) -> Vec<Value>
         .eligible_iter()
         .map(|(operation, _)| (operation.header.id, operation.authored_ms))
         .collect();
-    let mut entries: Vec<(u64, _, Value)> = view
-        .ops
-        .iter()
-        .filter_map(|op| {
-            let keys: Vec<Value> = op
-                .changes
-                .iter()
-                .filter(|change| change.collection == collection)
-                .map(|change| Value::from(keys::safe_key(&change.key)))
-                .collect();
-            if keys.is_empty() {
-                return None;
-            }
-            let ms = authored.get(&op.id).copied().unwrap_or(0);
-            let mut entry = Map::new();
-            let id = aterm_codec::hex::encode_lower(&op.id);
-            if let Some(said) = intents.get(&id) {
-                entry.extend(said.clone());
-            }
-            entry.insert("op".to_owned(), Value::from(id));
-            entry.insert("by".to_owned(), Value::from(keys::actor_key(&op.actor)));
-            entry.insert("ms".to_owned(), Value::from(ms));
-            entry.insert("revert".to_owned(), Value::from(op.revert.is_some()));
-            entry.insert("keys".to_owned(), Value::Array(keys));
-            Some((ms, op.id, Value::Object(entry)))
-        })
-        .collect();
+    // One operation's entry, where it wrote a cell of the collection: `keys` are those cells.
+    let listed = |op: Digest, actor: &Actor, ms: u64, revert: bool, keys: Vec<Value>| {
+        if keys.is_empty() {
+            return None;
+        }
+        let mut entry = Map::new();
+        let id = aterm_codec::hex::encode_lower(&op);
+        if let Some(said) = intents.get(&id) {
+            entry.extend(said.clone());
+        }
+        entry.insert("op".to_owned(), Value::from(id));
+        entry.insert("by".to_owned(), Value::from(keys::actor_key(actor)));
+        entry.insert("ms".to_owned(), Value::from(ms));
+        entry.insert("revert".to_owned(), Value::from(revert));
+        entry.insert("keys".to_owned(), Value::Array(keys));
+        Some((ms, op, Value::Object(entry)))
+    };
+    let sealed = family.earlier.iter().filter_map(|op| {
+        let keys = op
+            .cells
+            .iter()
+            .filter(|(name, _)| name == collection)
+            .map(|(_, key)| Value::from(keys::safe_key(key)))
+            .collect();
+        listed(op.id, &op.actor, op.authored_ms, op.revert, keys)
+    });
+    let own = view.ops.iter().filter_map(|op| {
+        let keys = op
+            .changes
+            .iter()
+            .filter(|change| change.collection == collection)
+            .map(|change| Value::from(keys::safe_key(&change.key)))
+            .collect();
+        let ms = authored.get(&op.id).copied().unwrap_or(0);
+        listed(op.id, &op.actor, ms, op.revert.is_some(), keys)
+    });
+    let mut entries: Vec<(u64, Digest, Value)> = sealed.chain(own).collect();
     entries.sort_unstable_by_key(|(ms, id, _)| (*ms, *id));
     entries.into_iter().map(|(_, _, entry)| entry).collect()
 }
@@ -1724,7 +2184,10 @@ fn word(sha: &mut Sha256, word: Option<&str>) {
 }
 
 /// What fixes `family`'s view ([`View::of`]) into `sha`: its frontier, the log's judgment of
-/// each record and what the session resolved.
+/// each record and what the session resolved. Each sealed generation of a family that keeps its
+/// records is fixed by the first and the last: its stores are in the frontier, and its log's
+/// judgment and resolution in what the session resolved (`att::kept::Rows`,
+/// [`att::Resolved::digest`]).
 fn family_into(sha: &mut Sha256, family: &Family) {
     sha.update(family.frontier.fingerprint());
     if !unkeyed(Unkeyed::Judgment) {
@@ -1907,8 +2370,7 @@ pub(crate) enum Unkeyed {
 /// nothing where the status records the snapshot at this key, that snapshot (by its revision,
 /// extension and content) and the history beside it (by its digest) are the ones it recorded,
 /// and its inert count is known; nor where the last pass kept the snapshot for a reason nothing
-/// it rests on has moved since: a read behind the snapshot, a frontier too large to read back,
-/// or a projection at this very key too large to take. `refresh` ([`Pass::again`]) projects
+/// it rests on has moved since: a read behind the snapshot, or a projection at this very key too large to take. `refresh` ([`Pass::again`]) projects
 /// every snapshot it does not keep for one of those reasons, whatever the key says, and so does
 /// a pass whose rules are unknown ([`rules`]). A projection is recorded at the key of what it
 /// made: the snapshot the next pass reads as the one before.
@@ -1916,13 +2378,17 @@ fn opened(
     held: &File,
     pass: &Pass,
     newest: bool,
+    baseline: Option<&str>,
     frontier: &Frontier,
     key: impl Fn(Option<&Snapshot>) -> Option<[u8; 32]>,
     project: impl FnOnce() -> Result<Projected, Refusal>,
 ) -> Result<Opened, Refusal> {
     let state = held.state().unwrap_or_default();
-    let snapshot = held.published().snapshot;
-    let read = key(snapshot.as_ref());
+    // The snapshot here, with its rows' renderings: kept from the last pass in this process
+    // where the file is still the one it wrote, so a pass reads and renders no row it already
+    // holds ([`File::held`]).
+    let snapshot = held.held().ok().flatten();
+    let read = key(snapshot.as_deref().map(Rendered::snapshot));
     let current = |key: &[u8; 32]| Some(aterm_codec::hex::encode_lower(key));
     let behind = snapshot.is_some()
         && held
@@ -1930,9 +2396,8 @@ fn opened(
             .map_or(!newest, |old| !frontier.admits_over(&old));
     let kept = if behind {
         Some(Kept::Behind)
-    } else if frontier.encode().len() as u64 > aterm_file::snapshot::MAX_BYTES
-        || (state.kept == Some(Kept::TooLarge)
-            && read.is_some_and(|key| state.kept_key == current(&key)))
+    } else if state.kept == Some(Kept::TooLarge)
+        && read.is_some_and(|key| state.kept_key == current(&key))
     {
         Some(Kept::TooLarge)
     } else {
@@ -1946,32 +2411,37 @@ fn opened(
     // records (put back from a copy, written by another hand), one whose header states no type
     // for a stored column (an earlier build's put back at that revision: the content leaves the
     // types out, and this build's projection states one for each), and one that does not say its
-    // inert count, which an older build leaves out when it rewrites a status a newer one
-    // wrote: the count is unknown, never 0.
+    // inert count or what it holds and does not read, which an older build leaves out when it
+    // rewrites a status a newer one wrote: either is unknown, never none.
     let unchanged = !pass.again
         && read.is_some_and(|key| state.key == current(&key))
         && state.rev > 0
-        && snapshot.as_ref().is_some_and(|snapshot| {
+        && snapshot.as_ref().is_some_and(|held| {
+            let snapshot = held.snapshot();
             snapshot.rev == state.rev
                 && (snapshot_unkeyed
                     || (snapshot.ext == state.ext
-                        && state.snapshot
-                            == Some(aterm_codec::hex::encode_lower(&snapshot.content()))
+                        && state.snapshot == Some(aterm_codec::hex::encode_lower(&held.content()))
                         && snapshot
                             .columns
                             .iter()
                             .all(|column| column.source != Source::Schema || column.ty.is_some())))
         })
         && state.inert.is_some()
+        && state.refused.is_some()
         && state.history.is_some()
-        && (history_unkeyed || held.history_digest() == state.history);
+        && (history_unkeyed || held.history_digest() == state.history)
+        // A file a face is committed against holds a baseline of its revision this build
+        // reads: one an earlier build wrote in another format is written again, else every
+        // commit of the face would be refused as stale until the table moved.
+        && baseline.is_none_or(|format| held.baseline_names(state.rev, format));
     let (projection, key) = if let Some(kept) = kept {
         (aterm_file::Projection::Kept(kept), read)
     } else if unchanged {
         (aterm_file::Projection::Unchanged, read)
     } else {
         let projected = project()?;
-        let made = key(Some(&projected.snapshot));
+        let made = key(Some(projected.snapshot.snapshot()));
         (aterm_file::Projection::Fresh(Box::new(projected)), made)
     };
     Ok(Opened {
@@ -1990,17 +2460,23 @@ fn opened(
 /// ([`Computed::reads_here`]), and `None` for any other file.
 fn opened_table(
     projector: &Projector<'_>,
-    file: &Type,
+    file: &'static Type,
     held: &File,
     pass: &Pass,
     me: Option<&str>,
     newest: bool,
 ) -> Result<Opened, Refusal> {
     let family = projector.family;
+    // A log is each Mac's entries, with no baseline (`Type::edited`).
+    let baseline = file
+        .collection()
+        .filter(|collection| collection.kind != Kind::Log)
+        .map(|_| super::face::FORMAT);
     opened(
         held,
         pass,
         newest,
+        baseline,
         &family.frontier,
         |_| key(family, me, held),
         || {
@@ -2011,16 +2487,17 @@ fn opened_table(
                 // against a baseline of it (`Type::edited`).
                 Some(collection) if collection.kind == Kind::Log => {
                     let (snapshot, withheld) = log_table(file, collection, view, pass.now_ms);
-                    (snapshot, withheld, None)
+                    (Rendered::of(snapshot), withheld, None)
                 }
-                _ => table(file, family.compiled, projections, me, pass.now_ms)?,
+                _ => table(file, family.compiled, projections, held, me, pass.now_ms)?,
             };
             Ok(Projected {
                 snapshot,
                 history: history(file, family, view, held),
                 baseline,
                 withheld,
-                inert: inert(file, view),
+                inert: family.inert(file, view),
+                refused: view.refused_words(),
             })
         },
     )
@@ -2144,6 +2621,7 @@ fn read_files(
                     held,
                     pass,
                     newest,
+                    None,
                     &ring.frontier,
                     |snapshot| ring_key(ring, snapshot, keep, pass.now_ms),
                     || {
@@ -2151,10 +2629,13 @@ fn read_files(
                             ring_file(file, collection, ring, held, pass.now_ms);
                         Ok(Projected {
                             history: ring_history(collection.name, ring),
-                            snapshot,
+                            snapshot: Rendered::of(snapshot),
                             baseline: None,
                             withheld,
                             inert,
+                            // The ring holds journal records, not a typed table's: an event
+                            // this build does not read is counted inert ([`events`]).
+                            refused: None,
                         })
                     },
                 )
@@ -2176,6 +2657,7 @@ fn read_files(
                     held,
                     pass,
                     newest,
+                    None,
                     &frontier,
                     |_| view_key(&frontier, ring.complete, usage, registry.family, members),
                     || {
@@ -2189,11 +2671,12 @@ fn read_files(
                             pass.now_ms,
                         );
                         Ok(Projected {
-                            snapshot,
+                            snapshot: Rendered::of(snapshot),
                             history: Vec::new(),
                             baseline: None,
                             withheld,
                             inert: 0,
+                            refused: None,
                         })
                     },
                 )
@@ -2205,11 +2688,50 @@ fn read_files(
                 ..
             }) = &read
         {
-            usage = Some(projected.snapshot.clone());
+            usage = Some(projected.snapshot.snapshot().clone());
         }
         out.push(read);
     }
     out
+}
+
+/// Stamp where its record was found on each marker of an edited file that its family's read
+/// holds and that names no store of the read ([`File::stamp_done`]): a marker an earlier build
+/// wrote without saying, or one naming a former home's store. The stamp comes before the
+/// recording, so a snapshot this pass takes is the one that holds it, and the settle after the
+/// recording marks it seen. Only the newest home's read (`newest`) stamps. Why a file's markers could not be stamped, in `files`' order: an
+/// unstamped marker is laid over the snapshot until a later pass stamps it.
+fn stamp(
+    inputs: &Inputs,
+    files: &[(&'static Type, File, std::io::Result<Look>)],
+    newest: bool,
+) -> Vec<Option<String>> {
+    files
+        .iter()
+        .map(|(file, held, _)| {
+            let Store::Table { family, .. } = file.store else {
+                return None;
+            };
+            // A fenced home's read stamps nothing: it would re-stamp a marker the snapshot's
+            // frontier already holds with a store the newest home does not read.
+            if !newest {
+                return None;
+            }
+            file.edited()?;
+            let (_, Ok(read)) = inputs
+                .families
+                .iter()
+                .find(|(role, _)| *role == family.table.role)?
+            else {
+                return None;
+            };
+            // The record is one the log read retains, so it was found in that log's own
+            // stores, never in a sealed generation's.
+            held.stamp_done(&read.own_frontier(), |op| read.log.retains(op))
+                .err()
+                .map(|error| error.to_string())
+        })
+        .collect()
 }
 
 /// Run one pass over `only`, or over every file this build compiles: `paths` is any home of this
@@ -2217,7 +2739,18 @@ fn read_files(
 /// error.
 #[must_use]
 pub fn pass(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pass) -> Vec<Outcome> {
-    materialize_files(paths, config, only, pass)
+    materialize_files(paths, config, super::FILES, only, pass)
+}
+
+/// [`pass`] over `files`, a test's own files (a fixture family's).
+#[cfg(test)]
+pub(crate) fn pass_over(
+    paths: &Paths,
+    config: &Path,
+    files: &'static [Type],
+    pass: &Pass,
+) -> Vec<Outcome> {
+    materialize_files(paths, config, files, None, pass)
 }
 
 /// [`pass`], whole. The `SharedFile` anchor sits here rather than on a function named `pass`:
@@ -2234,12 +2767,13 @@ pub fn pass(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pass) -> V
 fn materialize_files(
     paths: &Paths,
     config: &Path,
+    compiled: &'static [Type],
     only: Option<&Name>,
     pass: &Pass,
 ) -> Vec<Outcome> {
     let home = generation::original(paths);
     let root = super::root(&home);
-    let files: Vec<(&'static Type, File, std::io::Result<Look>)> = super::FILES
+    let files: Vec<(&'static Type, File, std::io::Result<Look>)> = compiled
         .iter()
         .filter(|file| only.is_none_or(|only| *only == file.file()))
         .map(|file| {
@@ -2254,16 +2788,23 @@ fn materialize_files(
         Inputs::read(custody, &files, pass)
     });
     // Custody is closed: each file is projected from what its pass read, and nothing else.
-    let read: Vec<Result<Opened, Refusal>> = match read {
-        Ok((inputs, newest)) => read_files(&inputs, &root, &files, pass, newest),
-        Err(refusal) => files.iter().map(|_| Err(refusal.clone())).collect(),
+    let (read, stamped): (Vec<Result<Opened, Refusal>>, Vec<Option<String>>) = match read {
+        Ok((inputs, newest)) => (
+            read_files(&inputs, &root, &files, pass, newest),
+            stamp(&inputs, &files, newest),
+        ),
+        Err(refusal) => (
+            files.iter().map(|_| Err(refusal.clone())).collect(),
+            files.iter().map(|_| None).collect(),
+        ),
     };
     #[cfg(test)]
     super::seam::between();
     files
         .into_iter()
         .zip(read)
-        .map(|((file, held, look), read)| {
+        .zip(stamped)
+        .map(|(((file, held, look), read), stamped)| {
             let (recording, detail) = match read {
                 Ok(opened) => (aterm_file::Pass::Opened(Box::new(opened)), None),
                 Err(refusal) => (
@@ -2284,6 +2825,7 @@ fn materialize_files(
                 ),
                 Err(error) => (None, Some(error.to_string())),
             };
+            let problem = problem.or(stamped);
             let status = held.status();
             let kept = match recorded {
                 Some(Recorded::Kept(kept)) => Some(kept),
@@ -2300,11 +2842,9 @@ fn materialize_files(
                      snapshot's frontier is not here to compare"
                         .to_owned(),
                 ),
-                Some(Kept::TooLarge) => Some(
-                    "the projection is larger than a snapshot a read takes, or its frontier \
-                     larger than one a pass reads back"
-                        .to_owned(),
-                ),
+                Some(Kept::TooLarge) => {
+                    Some("the projection is larger than a snapshot a read takes".to_owned())
+                }
                 None => None,
             });
             Outcome {
@@ -2318,3 +2858,7 @@ fn materialize_files(
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "materialize_tests.rs"]
+mod tests;

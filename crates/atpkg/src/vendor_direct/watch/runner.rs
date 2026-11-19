@@ -12,26 +12,33 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-use super::{CADENCE, ConcurrentVendorGetFn, HeadWatch, Host};
+use super::{CADENCE, ConcurrentVendorGetFn, HeadWatch, Host, Rest, Ring, Told, woke_between};
 use crate::store::Layout;
 
-/// Sleep duration for one runner park slice.
-pub const SLICE: Duration = Duration::from_secs(5);
+/// The bounded look a package host keeps where nothing it waits for rings it: no wake source
+/// tells it of a sleep while it watches (a terminal session), its file watch did not start, it
+/// follows a detached pass to an exit nothing announces, a sibling's pass holds a published index
+/// it owes a pass, or a window watches and no waiter could be armed. It is the rate every host's
+/// wait ran at before it waited on events, so no host notices a sleep, a release or a due install
+/// later than it did.
+pub const BLIND_LOOK: Duration = Duration::from_secs(5);
 
 const PASS_FOLLOW_LIMIT: Duration =
     Duration::from_secs(aterm_update_core::pkg_check::PASS_OPERATION_LIMIT_SECS);
 
-/// Clocks a runner reads and the park it sleeps in.
+/// Clocks a runner reads and the rest it waits on.
 pub trait Clock: Send {
     /// Current wall-clock time.
     fn wall(&self) -> SystemTime;
     /// Elapsed monotonic time from an arbitrary origin.
     fn mono(&self) -> Duration;
-    /// Park up to `slice` or until a head in flight completes.
-    fn park(&mut self, watch: &mut HeadWatch, slice: Duration);
+    /// Wait on `rest` at most `within` (`None`: until it rings) and take what rang. `watch` is
+    /// the host's head watch, whose round in flight rings `rest` at its news: a virtual clock
+    /// lets that round ring before it passes time, as real time would.
+    fn wait(&mut self, rest: &Rest, watch: &HeadWatch, within: Option<Duration>) -> Option<Told>;
 }
 
-/// Production clock and park implementation.
+/// The production clocks and wait.
 #[derive(Debug)]
 pub struct SystemClock {
     origin: Instant,
@@ -61,8 +68,8 @@ impl Clock for SystemClock {
         self.origin.elapsed()
     }
 
-    fn park(&mut self, watch: &mut HeadWatch, slice: Duration) {
-        watch.park_for_hint(slice);
+    fn wait(&mut self, rest: &Rest, _watch: &HeadWatch, within: Option<Duration>) -> Option<Told> {
+        rest.wait(within)
     }
 }
 
@@ -374,8 +381,9 @@ struct IndexWatch {
     probe: Arc<IndexProbe>,
     eligible: Arc<dyn Fn(&Layout) -> bool + Send + Sync>,
     pending: Option<PendingIndex>,
-    /// A failed local work check is cheap to repeat at the next park slice;
-    /// it is not a completed network probe and must not start its cooldown.
+    /// A failed local work check is cheap to repeat a [`BLIND_LOOK`] later (work can appear in
+    /// the store without a file the rest watches changing); it is not a completed network probe
+    /// and must not start the probe's cooldown.
     last_ineligible: Option<Duration>,
     last_completed: Option<Duration>,
     /// A sibling's fresh shared stamp can expire sooner (or, after an error,
@@ -404,20 +412,29 @@ impl IndexWatch {
     }
 
     fn due(&self, now: Duration) -> bool {
-        self.pending.is_none()
-            && self
-                .last_ineligible
-                .is_none_or(|last| now.saturating_sub(last) >= SLICE)
-            && self.shared_retry_at.map_or_else(
-                || {
-                    self.last_completed
-                        .is_none_or(|last| now.saturating_sub(last) >= crate::index_probe::INTERVAL)
-                },
-                |due| now >= due,
-            )
+        self.next_due().is_some_and(|at| at <= now)
     }
 
-    fn start(&mut self, layout: &Layout, now: Duration) -> io::Result<()> {
+    /// When the next probe is due on the runner's monotonic clock: `None` while one is in
+    /// flight, whose near answer and end ring the rest. Else the later of a [`BLIND_LOOK`] past
+    /// an ineligible look and the probe's own cooldown: a sibling's shared stamp, or one
+    /// interval past the last probe.
+    fn next_due(&self) -> Option<Duration> {
+        if self.pending.is_some() {
+            return None;
+        }
+        let eligible_at = self
+            .last_ineligible
+            .map_or(Duration::ZERO, |last| last.saturating_add(BLIND_LOOK));
+        let cooled_at = self.shared_retry_at.unwrap_or_else(|| {
+            self.last_completed.map_or(Duration::ZERO, |last| {
+                last.saturating_add(crate::index_probe::INTERVAL)
+            })
+        });
+        Some(eligible_at.max(cooled_at))
+    }
+
+    fn start(&mut self, layout: &Layout, now: Duration, ring: Ring) -> io::Result<()> {
         let layout = layout.clone();
         let probe = Arc::clone(&self.probe);
         let near = Arc::new(AtomicU64::new(0));
@@ -426,7 +443,6 @@ impl IndexWatch {
         let worker_done = Arc::clone(&done);
         let completed_at = Arc::new(std::sync::OnceLock::new());
         let worker_completed_at = Arc::clone(&completed_at);
-        let owner = std::thread::current();
         let started_at = Instant::now();
         let worker = std::thread::Builder::new()
             .name("atpkg-index-probe".into())
@@ -434,23 +450,24 @@ impl IndexWatch {
                 struct Wake {
                     done: Arc<AtomicBool>,
                     completed_at: Arc<std::sync::OnceLock<Instant>>,
-                    owner: std::thread::Thread,
+                    ring: Ring,
                 }
                 impl Drop for Wake {
                     fn drop(&mut self) {
                         let _ = self.completed_at.set(Instant::now());
+                        // Published before the ring: a host woken by it finds the probe done.
                         self.done.store(true, Ordering::Release);
-                        self.owner.unpark();
+                        self.ring.ring();
                     }
                 }
                 let wake = Wake {
                     done: worker_done,
                     completed_at: worker_completed_at,
-                    owner,
+                    ring,
                 };
                 let mut on_near = |build| {
                     if worker_near.fetch_max(build, Ordering::Release) < build {
-                        wake.owner.unpark();
+                        wake.ring.ring();
                     }
                 };
                 probe(&layout, &mut on_near)
@@ -538,6 +555,9 @@ pub struct Runner {
     watch: HeadWatch,
     get: Arc<ConcurrentVendorGetFn<'static>>,
     clock: Box<dyn Clock>,
+    /// The one wait each step takes ([`Self::next_wait`]), rung by the head watch's rounds and
+    /// waiters, the index probe, the files the host watches and [`HostHandle::stop`].
+    rest: Rest,
     settings: Box<dyn Settings>,
     launcher: Box<dyn PassLauncher>,
     log: Box<dyn FnMut(&str) + Send>,
@@ -553,9 +573,15 @@ pub struct Runner {
     held_origin: Instant,
     /// Whether a held toolchain move is due at a Unix second ([`crate::quiet::due`]).
     held_due: Box<HeldDue>,
+    /// Whether a held move's record stands, so its re-check is a deadline of the wait: its
+    /// flip record or a view's leave record exists ([`crate::quiet::record_path`],
+    /// [`crate::quiet::view_record_path`]), each a file the rest watches.
+    held_stands: Box<dyn Fn(&Layout) -> bool + Send>,
     index: IndexWatch,
-    /// One deadline for both update looks. A standing second tab waits a
-    /// minute for the seat; a seated session behind a window retries a slice.
+    /// One deadline for every update look while admission is refused and no waiter is armed:
+    /// a standing second tab tries the seat once a minute, a seated session behind a window
+    /// once every [`BLIND_LOOK`]. With a waiter armed it is now, and the waiter's ring ends the
+    /// wait instead.
     admit_after: Duration,
 }
 
@@ -583,12 +609,15 @@ impl Runner {
         launcher: Box<dyn PassLauncher>,
         log: Box<dyn FnMut(&str) + Send>,
     ) -> Self {
-        let (watch, get) = heads;
+        let (mut watch, get) = heads;
+        let rest = Rest::inert();
+        watch.bind_ring(rest.ringer());
         Self {
             layout,
             watch,
             get,
             clock,
+            rest,
             settings,
             launcher,
             log,
@@ -599,18 +628,32 @@ impl Runner {
             held: crate::quiet::Recheck::default(),
             held_origin: Instant::now(),
             held_due: Box::new(crate::quiet::due),
+            held_stands: Box::new(|layout| {
+                crate::quiet::record_path(layout).exists()
+                    || crate::quiet::view_record_path(layout).exists()
+            }),
             index: IndexWatch::new(),
             admit_after: Duration::ZERO,
         }
     }
 
-    /// Override the held-toolchain-move due check.
+    /// Wait on `rest` (its files, wake source and rings) in place of an inert one.
+    #[must_use]
+    pub fn with_rest(mut self, rest: Rest) -> Self {
+        self.watch.bind_ring(rest.ringer());
+        self.rest = rest;
+        self
+    }
+
+    /// Override the held-toolchain-move due check, whose move then stands throughout: its
+    /// re-check stays a deadline of every wait.
     #[must_use]
     pub fn with_held_move_due(
         mut self,
         due: impl FnMut(&Layout, i64) -> Option<crate::quiet::DueFlip> + Send + 'static,
     ) -> Self {
         self.held_due = Box::new(due);
+        self.held_stands = Box::new(|_| true);
         self
     }
 
@@ -647,37 +690,20 @@ impl Runner {
     /// The thread could not be spawned.
     pub fn spawn(self) -> io::Result<HostHandle> {
         let stop = Arc::clone(&self.stop);
+        let ring = self.rest.stopper();
         let thread = std::thread::Builder::new()
             .name("atpkg-head-watch".into())
             .spawn(move || self.run())?;
-        Ok(HostHandle { stop, thread })
+        Ok(HostHandle { stop, ring, thread })
     }
 
-    /// Run one iteration of the head-watch loop.
+    /// Run one iteration of the head-watch loop: one wait ([`Self::next_wait`]), then the
+    /// looks in their order.
     pub fn step(&mut self) {
         let wall_before = self.clock.wall();
         let mono_before = self.clock.mono();
-        let idle = self.following.is_none() && self.queue.is_empty();
-        let admission_wait = self.admit_after.saturating_sub(mono_before);
-        let wait = if self.on
-            && idle
-            && mono_before >= self.admit_after
-            && !self.watch.has_pending()
-            && self.watch.due(wall_before)
-        {
-            Duration::ZERO
-        } else if self.on
-            && idle
-            && !admission_wait.is_zero()
-            && !self.watch.has_pending()
-            && self.index.pending.is_none()
-            && self.index.ready == 0
-        {
-            admission_wait.min(CADENCE)
-        } else {
-            SLICE
-        };
-        self.clock.park(&mut self.watch, wait);
+        let within = self.next_wait(wall_before, mono_before);
+        let _told = self.clock.wait(&self.rest, &self.watch, within);
         if self.stop.load(Ordering::Acquire) {
             return;
         }
@@ -691,6 +717,11 @@ impl Runner {
             (self.log)("vendor head watch: Automatic updates on \u{2014} watching");
             self.on = true;
             self.admit_after = Duration::ZERO;
+        } else if woke_between(
+            wall.duration_since(wall_before).ok(),
+            self.clock.mono().saturating_sub(mono_before),
+        ) {
+            self.watch.woke(wall);
         }
         self.watch.set_exclude(&gate.exclude);
         self.queue.retain(|program| {
@@ -709,23 +740,28 @@ impl Runner {
             self.launch(program, wall);
             return;
         }
+        if self.watch.absorb_handed() {
+            // A waiter took the seat or the rendezvous and handed it over (or failed): the claim
+            // takes it here, whatever the store's folder or the admission clock says, so the
+            // hand-over that made this wait zero is gone before the next one. What it waited for
+            // is free, so admission is asked at once; the seat stays this session's, and the
+            // rendezvous goes again unless a look below takes it for its round.
+            self.admit_after = Duration::ZERO;
+            let _ = self.begin_update_look(wall);
+            self.watch.end_session_update_look();
+        }
         if self.check_held_move(wall) {
             return;
         }
         if self.check_index(wall) {
             return;
         }
-        if self.clock.mono() < self.admit_after && !self.watch.has_pending() {
+        if (self.clock.mono() < self.admit_after || self.watch.admission_waits())
+            && !self.watch.has_pending()
+        {
             return;
         }
-        let moved = self.watch.slice(
-            &self.layout,
-            wall,
-            wall.duration_since(wall_before).ok(),
-            self.clock.mono().saturating_sub(mono_before),
-            &self.get,
-            false,
-        );
+        let moved = self.watch.round(&self.layout, wall, &self.get, false);
         self.flush_notes();
         if let Some(programs) = moved {
             self.queue.extend(programs);
@@ -733,6 +769,108 @@ impl Runner {
                 self.launch(program, wall);
             }
         }
+    }
+
+    /// How long the next wait may last (`None`: until the rest rings), from `wall` and `mono`
+    /// before it: the earliest moment any look has work, so a due look is never hidden behind
+    /// a later deadline, and none that is blocked waits zero twice. Every look that needs
+    /// admission waits on the seat or hosts waiter's ring while one is armed, and on the
+    /// admission retry while none could be; while admitted it is the earliest of the heads'
+    /// deadline, the index probe's, a published index's retry ladder or pass spacing, and a held
+    /// move's re-check while its record stands. Following a pass, or a sibling's pass holding a
+    /// published index, is a [`BLIND_LOOK`]. A host whose files ring nothing, or (while it
+    /// watches) whose sleeps ring nothing, waits at most [`BLIND_LOOK`].
+    fn next_wait(&self, wall: SystemTime, mono: Duration) -> Option<Duration> {
+        let unwatched = |wait: Option<Duration>| {
+            if self.rest.watching() {
+                wait
+            } else {
+                Some(wait.map_or(BLIND_LOOK, |w| w.min(BLIND_LOOK)))
+            }
+        };
+        if self.following.is_some() {
+            return Some(BLIND_LOOK);
+        }
+        if !self.on {
+            // Automatic updates off: aterm.toml's change ends the wait.
+            return unwatched(None);
+        }
+        if !self.queue.is_empty() || self.watch.admission_handed() {
+            return Some(Duration::ZERO);
+        }
+        let session = self.watch.host == Some(Host::Session);
+        if session && !self.watch.has_pending() {
+            if self.watch.admission_waits() {
+                // Every look needs admission: the waiter's ring, aterm.toml's change, or a
+                // stop ends the wait, and no deadline stands in for them.
+                return unwatched(None);
+            }
+            if mono < self.admit_after {
+                return unwatched(Some(self.admit_after - mono));
+            }
+        }
+        let mut next: Option<Duration> = None;
+        let mut at = |deadline: Duration| {
+            let wait = deadline.saturating_sub(mono);
+            next = Some(next.map_or(wait, |n: Duration| n.min(wait)));
+        };
+        if let Some(due) = self.watch.next_due(wall) {
+            at(mono.saturating_add(due.duration_since(wall).unwrap_or_default()));
+        }
+        if session {
+            if let Some(due) = self.index.next_due() {
+                at(due);
+            }
+            if let Some(due) = self.index_ready_due(wall, mono) {
+                at(due);
+            }
+            if (self.held_stands)(&self.layout) {
+                at(self.held.next_look().map_or(mono, |look| {
+                    look.saturating_duration_since(self.held_origin)
+                }));
+            }
+        }
+        let next = if self.rest.hears_sleep() {
+            next
+        } else {
+            Some(next.map_or(BLIND_LOOK, |n| n.min(BLIND_LOOK)))
+        };
+        unwatched(next)
+    }
+
+    /// When a published index this session owes a pass can next be offered one, on the
+    /// monotonic clock: now when it is already verified, recorded or free to launch; its retry
+    /// ladder's next rung while an earlier attempt holds it; a [`BLIND_LOOK`] while a sibling's
+    /// pass installs; else the end of the machine's pass spacing. `None` with no index ready.
+    fn index_ready_due(&self, wall: SystemTime, mono: Duration) -> Option<Duration> {
+        let build = self.index.ready;
+        if build == 0 || crate::index_probe::verified_floor(&self.layout) >= build {
+            return (build != 0).then_some(mono);
+        }
+        if let Some(attempt) = self
+            .index
+            .last_attempt
+            .filter(|attempt| attempt.holds(build, mono))
+        {
+            return Some(attempt.since.saturating_add(attempt.retry_after()));
+        }
+        let unix = unix_seconds(wall);
+        let stamps = crate::status::pass_stamps(&self.layout, unix);
+        if stamps.last_index_build >= build
+            || !stamps.attempted_recently(unix)
+            || stamps.completed_older_index_pass(build)
+        {
+            return Some(mono);
+        }
+        if stamps.in_flight {
+            return Some(mono.saturating_add(BLIND_LOOK));
+        }
+        let spacing =
+            i64::try_from(aterm_update_core::pkg_check::PASS_SPACING_SECS).unwrap_or(i64::MAX);
+        let left = stamps
+            .last_attempt
+            .map_or(0, |then| then.saturating_add(spacing).saturating_sub(unix));
+        Some(mono.saturating_add(Duration::from_secs(u64::try_from(left).unwrap_or(0).max(1))))
     }
 
     fn check_held_move(&mut self, wall: SystemTime) -> bool {
@@ -744,9 +882,7 @@ impl Runner {
         if !owns_watch {
             return false;
         }
-        let unix = wall
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let unix = unix_seconds(wall);
         let layout = &self.layout;
         let due = &mut self.held_due;
         let wake = self.held.wake(now, || due(layout, unix));
@@ -765,15 +901,15 @@ impl Runner {
             return false;
         }
         let now = self.clock.mono();
-        if now < self.admit_after {
+        if now < self.admit_after || self.watch.admission_waits() {
             return false;
         }
         let admitted = self.watch.begin_session_update_look(&self.layout, wall);
         self.flush_notes();
-        self.admit_after = if admitted {
+        self.admit_after = if admitted || self.watch.admission_waits() {
             now
         } else if self.watch.session_behind_window() {
-            now.saturating_add(SLICE)
+            now.saturating_add(BLIND_LOOK)
         } else {
             now.saturating_add(CADENCE)
         };
@@ -794,9 +930,7 @@ impl Runner {
             {
                 let owns_watch = self.begin_update_look(wall);
                 if owns_watch {
-                    let unix = wall
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+                    let unix = unix_seconds(wall);
                     let stamps = crate::status::pass_stamps(&self.layout, unix);
                     if stamps.last_index_build >= build {
                         self.index.offered(build);
@@ -842,7 +976,7 @@ impl Runner {
                     return false;
                 }
                 self.index.last_ineligible = None;
-                if let Err(error) = self.index.start(&self.layout, now) {
+                if let Err(error) = self.index.start(&self.layout, now, self.rest.ringer()) {
                     self.index.last_completed = Some(now);
                     (self.log)(&format!("atpkg index probe could not start: {error}"));
                 }
@@ -985,32 +1119,55 @@ impl Runner {
     }
 }
 
+/// The Unix second of `wall`, `0` before the epoch.
+fn unix_seconds(wall: SystemTime) -> i64 {
+    wall.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 /// Handle to a runner on its own thread ([`Runner::spawn`]).
 #[derive(Debug)]
 pub struct HostHandle {
     stop: Arc<AtomicBool>,
+    /// The runner's rest's stop ring.
+    ring: Ring,
     thread: JoinHandle<()>,
 }
 
 impl HostHandle {
-    /// Stop the runner within one slice and wait for its thread to exit.
+    /// Stop the runner at once, however long its wait, and wait for its thread to exit.
     pub fn stop(self) {
         self.stop.store(true, Ordering::Release);
-        self.thread.thread().unpark();
+        self.ring.ring();
         let _ = self.thread.join();
     }
 }
 
-/// Start the head watch for a terminal session.
+/// Start the head watch for a terminal session. Its rest hears `aterm.toml` and a held move's
+/// two records; a terminal session registers no wake source (an IOKit client in a session that
+/// job control stops would hold up every sleep of the Mac), so while it watches it keeps its
+/// [`BLIND_LOOK`].
 #[must_use]
 pub fn run_host(
     layout: &Layout,
     gate: Gate,
     exe: PathBuf,
     lead: Vec<OsString>,
-    log: impl FnMut(&str) + Send + 'static,
+    mut log: impl FnMut(&str) + Send + 'static,
 ) -> Option<io::Result<HostHandle>> {
     let heads = super::for_host(Host::Session, &gate.exclude)?;
+    let files = crate::config::config_path().into_iter().chain([
+        crate::quiet::record_path(layout),
+        crate::quiet::view_record_path(layout),
+    ]);
+    let rest = Rest::start("atpkg-head-watch-files", files);
+    if !rest.watching() {
+        log(&format!(
+            "vendor head watch: no file watch \u{2014} aterm.toml and a held move's records \
+             are looked at every {} s",
+            BLIND_LOOK.as_secs()
+        ));
+    }
     let runner = Runner::new(
         layout.clone(),
         heads,
@@ -1018,7 +1175,8 @@ pub fn run_host(
         Box::new(LiveSettings::new(gate)),
         Box::new(DetachedPasses::new(exe, lead, layout)),
         Box::new(log),
-    );
+    )
+    .with_rest(rest);
     Some(runner.spawn())
 }
 

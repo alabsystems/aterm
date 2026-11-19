@@ -1633,10 +1633,9 @@ mod unix {
             } => join(&paths, &source, name, agent, wait, password_stdin),
             Command::Sync { diagnostic } => sync(&paths, diagnostic),
             Command::Watch => {
+                let kept = service::keep_log(&paths.home, Job::Subscriber);
                 super::keep_network_place();
-                client::watch(&paths, &|line| {
-                    crate::log_line(&format!("{} {line}", stamp()));
-                })?;
+                client::watch(&paths, &crate::log_line, kept)?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Mirrors { change, urls } => mirrors(&paths, change, &urls),
@@ -1784,7 +1783,10 @@ mod unix {
                 );
                 Ok(ExitCode::SUCCESS)
             }
-            Command::Serve(args) => serve(&paths, &args),
+            Command::Serve(args) => {
+                let kept = service::keep_log(&paths.home, Job::Server);
+                serve(&paths, &args, kept)
+            }
             Command::Agent {
                 action,
                 program,
@@ -1808,10 +1810,6 @@ mod unix {
                 serve_args(serve),
             ),
         }
-    }
-
-    fn stamp() -> String {
-        format!("[{}]", aterm_time::unix_secs().unwrap_or(0))
     }
 
     fn text_error(error: text::TextError) -> Error {
@@ -4223,7 +4221,14 @@ mod unix {
         Ok(code)
     }
 
-    fn serve(paths: &Paths, args: &[String]) -> crate::Result<ExitCode> {
+    /// `aterm secrets serve <args>`, the login's server job and the root vault server, on what
+    /// keeping its log kept ([`service::keep_log`]): nothing else makes one, so the verb cannot
+    /// serve without keeping it.
+    fn serve(
+        paths: &Paths,
+        args: &[String],
+        _kept: aterm_uds::job_log::Kept,
+    ) -> crate::Result<ExitCode> {
         let f = flags(args, SERVE_VALUED, SERVE_SWITCHES).map_err(Error::new)?;
         let mut settings = serve_settings(&f).map_err(Error::new)?;
         let store = settings
@@ -4237,13 +4242,12 @@ mod unix {
         let (advertise, held_back) =
             role.decide(&advertise_mode, &store, paths, &mut settings.pins, alab_key);
         crate::log_line(&format!(
-            "{} serving on {}, store {}",
-            stamp(),
+            "serving on {}, store {}",
             settings.listen,
             store.display()
         ));
         if let Some(line) = held_back {
-            crate::log_line(&format!("{} {line}", stamp()));
+            crate::log_line(&line);
         }
         let role_decide: Option<crate::server::RoleDecider> =
             (!matches!(advertise_mode, super::Advertise::Off)).then(|| {

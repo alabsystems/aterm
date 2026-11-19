@@ -13,7 +13,7 @@ use aterm_secrets::{
     commons::{
         self,
         bootstrap::Bootstrap,
-        hearing::{Ledger, Said},
+        hearing::{self, Ledger, Said},
         journal::Journal,
     },
 };
@@ -39,7 +39,7 @@ mod place;
 mod report;
 mod transport;
 mod vault;
-pub use census::{Cadence, cadence};
+pub use census::{Cadence, SeatCounts, cadence, seats};
 pub(crate) use discovery::MAX_UNVERIFIED_ENDPOINTS;
 #[cfg(test)]
 pub(crate) use discovery::Outcome;
@@ -56,6 +56,12 @@ pub use vault::Passes;
 pub(crate) struct CredentialOwner {
     lease: Arc<owner::Lease>,
     in_flight: Arc<Mutex<std::collections::BTreeSet<astream_wire::sync::Digest>>>,
+    /// The Offers whose take by this owner was refused ([`Self::refused`]): one that came to
+    /// nothing so is no reason to owe its holder another round
+    /// (`crate::credentials::handoff::exchange`), and a take tries it only after each Offer by
+    /// the same holder that no take was refused. At most [`crate::database::MAX_RECORDS`]; the
+    /// least by id goes first.
+    refused: Arc<Mutex<std::collections::BTreeSet<astream_wire::sync::Digest>>>,
 }
 
 /// Excludes concurrent exchanges for one offer, releasing it on every exit path.
@@ -90,6 +96,24 @@ impl CredentialOwner {
         Some(CredentialOffer { owner: self, offer })
     }
 
+    /// Record that a take of `offer` was refused, by its holder or by this side once the holder
+    /// answered ([`Self::was_refused`]). A take that broke off with no answer records nothing.
+    pub(crate) fn refused(&self, offer: astream_wire::sync::Digest) {
+        let mut refused = self.refused.lock().unwrap_or_else(|p| p.into_inner());
+        if !refused.contains(&offer) && refused.len() >= crate::database::MAX_RECORDS {
+            refused.pop_first();
+        }
+        refused.insert(offer);
+    }
+
+    /// Whether a take of `offer` was refused ([`Self::refused`]).
+    pub(crate) fn was_refused(&self, offer: &astream_wire::sync::Digest) -> bool {
+        self.refused
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(offer)
+    }
+
     pub(crate) fn offer_in_flight(&self, offer: &astream_wire::sync::Digest) -> bool {
         self.in_flight
             .lock()
@@ -106,6 +130,7 @@ impl CredentialOwner {
                     .unwrap(),
             ),
             in_flight: Arc::default(),
+            refused: Arc::default(),
         }
     }
 }
@@ -143,13 +168,33 @@ enum Flow {
     /// Serve on: the next tick comes when something the loop waits on happens, or by this
     /// deadline, the next its work keeps by the clock (`None`: none before the next round).
     Serve(Option<Instant>),
-    /// The loop ends with `Ok(())`: what it serves moved under it (a source, a generation, an
-    /// enrollment's witness, Commons control come into view).
-    End,
+    /// The loop ends with `Ok(())`: what it serves moved under it ([`LoopEnd`]).
+    End(LoopEnd),
 }
 
-/// A serving loop: `tick(state, now, round)` until `stopped`, ending at the first tick that ends
-/// it ([`Flow::End`]) or fails. Between ticks it waits (`wait(state, floor, until)`) for what its
+/// What moved under a serving loop that ends it ([`Flow::End`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopEnd {
+    /// The generation it serves wants a refresh.
+    Refresh,
+    /// The vault's observation moved (a source changed), or Commons control came into view.
+    Vault,
+    /// An enrollment's witness came into view.
+    Witnessed,
+}
+
+/// Which loop [`serve_paced`] runs, as the census counts its opening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopKind {
+    /// A repairing loop ([`serve_selected`]): a scheduler that dials.
+    Repair,
+    /// A presence loop ([`serve_presence`]): it dials nothing.
+    Presence,
+}
+
+/// A serving loop of the kind `kind` names: `tick(state, now, round)` until `stopped`, ending
+/// at the first tick that ends it ([`Flow::End`]) or fails. The census counts its opening and why
+/// it ended ([`census::Loop`]). Between ticks it waits (`wait(state, floor, until)`) for what its
 /// state waits on to happen ([`rest`]: a connection, a round's end, a push, a change to this
 /// Mac's Commons state the transport's watch heard), for its stop, or for `until`: the earlier of the deadline the tick returned ([`Flow::Serve`]) and the next round;
 /// never sooner than `floor`, one [`TICK`] after the tick began. An idle loop so wakes once a
@@ -168,11 +213,17 @@ enum Flow {
 /// clock ledgers' keeping (minutes apart), and the lab journal's flush (a minute apart).
 fn serve_paced<S, E>(
     state: &mut S,
+    kind: LoopKind,
     clock: impl Fn() -> Instant,
     stopped: impl Fn() -> bool,
     mut wait: impl FnMut(&S, Instant, Instant),
     mut tick: impl FnMut(&mut S, Instant, bool) -> std::result::Result<Flow, E>,
 ) -> std::result::Result<(), E> {
+    census::count(census::Event::Loop(match kind {
+        LoopKind::Repair => census::Loop::OpenedServing,
+        LoopKind::Presence => census::Loop::OpenedPresence,
+    }));
+    let ended = |end: census::Loop| census::count(census::Event::Loop(end));
     let mut due = clock() + POLL;
     while !stopped() {
         let now = clock();
@@ -182,11 +233,24 @@ fn serve_paced<S, E>(
         if round {
             due = clock() + POLL;
         }
-        let Flow::Serve(next) = flow? else {
-            return Ok(());
+        let next = match flow {
+            Ok(Flow::Serve(next)) => next,
+            Ok(Flow::End(end)) => {
+                ended(match end {
+                    LoopEnd::Refresh => census::Loop::Refresh,
+                    LoopEnd::Vault => census::Loop::Vault,
+                    LoopEnd::Witnessed => census::Loop::Witnessed,
+                });
+                return Ok(());
+            }
+            Err(error) => {
+                ended(census::Loop::Refused);
+                return Err(error);
+            }
         };
         wait(state, now + TICK, next.map_or(due, |next| next.min(due)));
     }
+    ended(census::Loop::Stopped);
     Ok(())
 }
 
@@ -1170,6 +1234,7 @@ impl Runtime {
                         config.clone(),
                         cadence,
                         elsewhere.clone(),
+                        crate::alab::upkeep::journal_spool(),
                     )
                 });
                 let mut window_claim = None;
@@ -1582,12 +1647,19 @@ fn serve_selected(
         .map_err(refusal("secrets custody"))?
         .ok_or(Status::Dormant)?;
     let request = bootstrap.request().map_err(refusal("device request"))?;
+    // The members' time-signed version reports this device keeps: its rounds trade them with
+    // each peer, and the hearing tick gives the store its roster and reads what they brought.
+    let relayed = Arc::new(Mutex::new(hearing::Reports::new(
+        bootstrap.trust(),
+        request.binding(),
+    )));
     let endpoint = match Endpoint::from_bootstrap_until(&bootstrap, deadline)
         .map_err(refusal("control endpoint"))?
     {
         Some(endpoint) => endpoint
             .with_commons_until(paths.clone(), config.to_owned(), deadline)
-            .map_err(refusal("Commons subscriptions"))?,
+            .map_err(refusal("Commons subscriptions"))?
+            .with_reports(relayed.clone()),
         None => Endpoint::pending_from_bootstrap_until(&bootstrap, paths.clone(), deadline)
             .map_err(refusal("enrollment endpoint"))?,
     };
@@ -1597,6 +1669,7 @@ fn serve_selected(
             CredentialOwner {
                 lease: lease.clone(),
                 in_flight: Arc::default(),
+                refused: Arc::default(),
             },
             config.to_owned(),
         );
@@ -1648,7 +1721,7 @@ fn serve_selected(
         vault::Reader::start(paths, config, &lease, &custody, network.vault.clone())
             .map_err(refusal("vault reader"))?
     };
-    let mut hearing = (!pending).then(|| Hearing::open(&bootstrap));
+    let mut hearing = (!pending).then(|| Hearing::open(&bootstrap, request.binding(), relayed));
     let mut clocks = if pending {
         None
     } else {
@@ -1665,6 +1738,7 @@ fn serve_selected(
         let mut wake = Wake::default();
         serve_paced(
             &mut transport,
+            LoopKind::Repair,
             Instant::now,
             || stop.is_set(),
             |transport, floor, until| rest(stop, transport, floor, until),
@@ -1683,7 +1757,7 @@ fn serve_selected(
                         if crate::generation::refresh_required(paths)
                             .map_err(refusal("generation refresh"))?
                         {
-                            return Ok(Flow::End);
+                            return Ok(Flow::End(LoopEnd::Refresh));
                         }
                         refresh = now + Duration::from_secs(30);
                     }
@@ -1702,14 +1776,14 @@ fn serve_selected(
                     {
                         commons::Observation::Visible(snapshot) => {
                             if !snapshot.same_observation(&source_snapshot) {
-                                return Ok(Flow::End);
+                                return Ok(Flow::End(LoopEnd::Vault));
                             }
                         }
                         commons::Observation::Unavailable(commons::Unavailable::Busy) => {}
                         commons::Observation::Unavailable(_) => return Err(Status::Dormant),
                     }
                     if pending && witnessed(&bootstrap)? {
-                        return Ok(Flow::End);
+                        return Ok(Flow::End(LoopEnd::Witnessed));
                     }
                     let candidates = network.addresses()?;
                     network.may_use(&candidates)?;
@@ -1751,12 +1825,12 @@ fn serve_selected(
                 #[cfg(test)]
                 network.observed(transport);
                 let contacts = transport.take_contacts();
-                if let Some(hearing) = &mut hearing {
-                    hearing.tick(paths, &bootstrap, &contacts, now);
-                }
                 // The Commons journal and this custody's access, read once this tick for every
                 // reader of its contacts, and only by the first that needs them.
                 let resolved = std::cell::OnceCell::new();
+                if let Some(hearing) = &mut hearing {
+                    hearing.tick(paths, &bootstrap, &resolved, &contacts, now);
+                }
                 if let Some(clocks) = &mut clocks {
                     clocks.tick(&bootstrap, &resolved, &contacts, now);
                 }
@@ -1798,7 +1872,7 @@ fn serve_selected(
                     }
                 });
                 if witness_due && witnessed(&bootstrap)? {
-                    return Ok(Flow::End);
+                    return Ok(Flow::End(LoopEnd::Witnessed));
                 }
                 let due = transport.next_due(now);
                 Ok(Flow::Serve(Some(
@@ -1846,33 +1920,82 @@ fn witnessed(bootstrap: &Bootstrap) -> std::result::Result<bool, Status> {
 /// new, and every [`KEEP`], when an admin first refreshes the roster from it (silent members
 /// leave, returned ones come back). Failures never stop repair: a ledger not kept holds the
 /// C26 gate.
+///
+/// It also owns the store of time-signed version reports this device's rounds trade
+/// ([`hearing::Reports`], tracker LT-04D): it gives the store the current roster, signs this
+/// device's own report into it when one is due, counts each report a round brought in the ledger
+/// ([`Ledger::relay`], which is no contact) and keeps the store in `<commons>/reports`: at
+/// most once in [`hearing::PERSIST`] while it runs, and once more when it is dropped, so what
+/// rounds brought since the last write outlives the serving loop. The store's lock is held for
+/// one read or one change of it at a time, never while a file is read or written or a
+/// signature is made or checked.
 struct Hearing {
     ledger: Ledger,
     changed: bool,
     kept: Option<Instant>,
+    /// This device's own binding: the member its own report is signed and verified as.
+    local: aterm_secrets::commons::binding::Binding,
+    reports: Arc<Mutex<hearing::Reports>>,
+    /// The stamp of the last kept report the ledger counted ([`hearing::Reports::since`]).
+    relayed: u64,
+    /// The store has its first roster and what `<commons>/reports` held under it.
+    loaded: bool,
+    /// When `<commons>/reports` was last written.
+    saved: Option<Instant>,
+    /// `<commons>/reports`.
+    file: std::path::PathBuf,
+}
+/// What the store took since `<commons>/reports` was last written is written as its owner
+/// ends: a serving loop that ends (the vault changed, a refresh, a refusal, a stop) inside
+/// [`hearing::PERSIST`] of the last write would otherwise lose it, and its peers, whose marks
+/// are past those reports, would not offer them again before their members next sign. In
+/// `serve_selected` that is after the transport stopped, so no round is still filling the store.
+impl Drop for Hearing {
+    fn drop(&mut self) {
+        self.save_reports(Instant::now());
+    }
 }
 impl Hearing {
-    fn open(bootstrap: &Bootstrap) -> Self {
+    fn open(
+        bootstrap: &Bootstrap,
+        local: &aterm_secrets::commons::binding::Binding,
+        reports: Arc<Mutex<hearing::Reports>>,
+    ) -> Self {
         Self {
             ledger: Ledger::read(bootstrap),
             changed: true,
             kept: None,
+            local: local.clone(),
+            reports,
+            relayed: 0,
+            loaded: false,
+            saved: None,
+            file: bootstrap.reports_file(),
         }
     }
     fn tick(
         &mut self,
         paths: &Paths,
         bootstrap: &Bootstrap,
+        resolved: &std::cell::OnceCell<Option<Resolved>>,
         contacts: &[transport::Contact],
         now: Instant,
     ) {
         let Some(now_ms) = aterm_time::unix_millis() else {
             return;
         };
-        self.changed |= record_contacts(&mut self.ledger, contacts, now_ms, now);
         let due = self
             .kept
             .is_none_or(|kept| now.saturating_duration_since(kept) >= KEEP);
+        if due || !contacts.is_empty() {
+            self.enroll_reports(bootstrap, resolved, now_ms);
+        }
+        self.sign_own_report(bootstrap, now_ms);
+        // This tick's rounds first: what a member said in a round stands against a relayed
+        // report of it stamped up to [`hearing::AHEAD`] later, which a fast clock may have
+        // signed before that round.
+        self.changed |= record_contacts(&mut self.ledger, contacts, now_ms, now);
+        self.hear_relayed(now_ms);
         if !self.changed && !due {
             return;
         }
@@ -1883,10 +2006,97 @@ impl Hearing {
             // Table checkpoints (tracker LT-B10B) wait on the same reports: none is signed while
             // a member's build cannot read one, and each table gains at most one per tick.
             crate::att::checkpoint::sign_due(paths, &self.ledger, now_ms);
+            self.keep_reports(now);
         }
         // A write that fails is tried again at the next change or [`KEEP`], not every tick.
         self.changed = false;
         let _ = self.ledger.write(bootstrap);
+    }
+
+    /// `read`, with the store of kept reports locked for that call alone.
+    fn with_reports<T>(&self, read: impl FnOnce(&mut hearing::Reports) -> T) -> T {
+        read(&mut self.reports.lock_or_recover())
+    }
+
+    /// Give the store the current members as its roster, which drops the report of a member
+    /// that left and one no longer signed within its time. The first roster comes with what
+    /// `<commons>/reports` holds: a store of its own takes the roster and reads the file, each
+    /// kept report's signature checked, and then replaces the shared one, which until then had
+    /// no roster and so kept, offered and wanted nothing. A journal that does not read leaves
+    /// the store as it was until the next contact or [`KEEP`].
+    fn enroll_reports(
+        &mut self,
+        bootstrap: &Bootstrap,
+        resolved: &std::cell::OnceCell<Option<Resolved>>,
+        now_ms: u64,
+    ) {
+        let Some(Resolved { access, .. }) =
+            resolved.get_or_init(|| Resolved::read(bootstrap)).as_ref()
+        else {
+            return;
+        };
+        let members = || access.members().iter().map(|member| member.binding());
+        if self.loaded {
+            self.with_reports(|reports| reports.set_roster(members(), now_ms));
+            return;
+        }
+        let mut read = hearing::Reports::new(bootstrap.trust(), &self.local);
+        read.set_roster(members(), now_ms);
+        read.load(bootstrap, now_ms);
+        self.with_reports(|reports| *reports = read);
+        self.relayed = 0;
+        self.loaded = true;
+    }
+
+    /// Sign this device's version with the time into the store where one is due
+    /// ([`hearing::Reports::own_due`]): signed and verified here, then kept by the store.
+    fn sign_own_report(&self, bootstrap: &Bootstrap, now_ms: u64) {
+        let version = hearing::Version::own();
+        if !self.with_reports(|reports| reports.own_due(version, now_ms)) {
+            return;
+        }
+        let actor = self.local.actor();
+        let signed = bootstrap
+            .device()
+            .with_seed(|seed| {
+                hearing::report_at(seed, *self.local.network(), &actor, version, now_ms)
+            })
+            .and_then(|wire| hearing::relayed(&wire, &self.local, now_ms));
+        if let Ok(report) = signed {
+            self.with_reports(|reports| reports.accept_own(report, now_ms));
+        }
+    }
+
+    /// Count in the ledger each report the store took since the last tick, from a round or
+    /// from its file. A relayed report is no contact: it neither starts nor extends the watch.
+    fn hear_relayed(&mut self, now_ms: u64) {
+        let (taken, through) = self.with_reports(|reports| reports.since(self.relayed));
+        self.relayed = through;
+        for report in &taken {
+            self.changed |= self.ledger.relay(report, now_ms);
+        }
+    }
+
+    /// Write `<commons>/reports` where the kept reports changed, at most once in
+    /// [`hearing::PERSIST`].
+    fn keep_reports(&mut self, now: Instant) {
+        if self.saved.is_some_and(|saved| {
+            now.saturating_duration_since(saved) < Duration::from_millis(hearing::PERSIST)
+        }) {
+            return;
+        }
+        self.save_reports(now);
+    }
+
+    /// Write `<commons>/reports` where the kept reports changed since it was last written. A
+    /// write that fails is made again once they next change; until then a restart reads the
+    /// older file, and what it lacks comes from the peers once its members sign again.
+    fn save_reports(&mut self, now: Instant) {
+        let Some(bytes) = self.with_reports(hearing::Reports::file) else {
+            return;
+        };
+        self.saved = Some(now);
+        let _ = aterm_secrets::fsx::write_atomic(&self.file, &bytes, 0o600);
     }
 }
 
@@ -2048,6 +2258,7 @@ fn observe_contacts(
                 .iter()
                 .find(|m| m.binding().actor() == actor)
             {
+                census::name(actor, *member.binding().machine());
                 let (now_ms, now) = clock();
                 history.contact(
                     machine_identity(member.binding()),
@@ -2162,9 +2373,6 @@ fn accounts_exchange_candidate(
         return None;
     }
     let inventory = exchange.inventory();
-    if inventory.count > crate::replica::MAX_RECORDS {
-        return None;
-    }
     Some(crate::network_state::account_exchange::Candidate {
         observation: aterm_types::network_state::AccountsExchangeObservation {
             scope_digest: scope.digest(),
@@ -2320,6 +2528,7 @@ fn serve_presence(
     report(Status::Dormant);
     serve_paced(
         &mut transport,
+        LoopKind::Presence,
         Instant::now,
         || stop.is_set(),
         |transport, floor, until| rest(stop, transport, floor, until),
@@ -2333,7 +2542,7 @@ fn serve_presence(
                     if crate::generation::refresh_required(paths)
                         .map_err(refusal("generation refresh"))?
                     {
-                        return Ok(Flow::End);
+                        return Ok(Flow::End(LoopEnd::Refresh));
                     }
                     refresh = now + Duration::from_secs(30);
                 }
@@ -2347,7 +2556,7 @@ fn serve_presence(
                     commons::observe_until_settled(paths, now + Duration::from_millis(200)),
                     Ok(commons::Observation::Visible(_))
                 ) {
-                    return Ok(Flow::End);
+                    return Ok(Flow::End(LoopEnd::Vault));
                 }
                 let candidates = network.addresses()?;
                 network.may_use(&candidates)?;

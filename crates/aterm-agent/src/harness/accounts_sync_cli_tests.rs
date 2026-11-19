@@ -30,7 +30,7 @@ mod upkeep_counts_tests;
 mod source_presence;
 
 #[path = "accounts_source_pending_tests.rs"]
-mod source_pending;
+mod accounts_source_pending;
 
 const NOW: i64 = 1_792_660_000;
 
@@ -2466,6 +2466,7 @@ fn codex_by_default_writes_nothing_where_the_fleet_lists_no_row_of_this_macs() {
 
 /// One whole syncing pass of the window's upkeep over `bed` (`UpkeepStep::Sync`), keeping what
 /// it remembers between passes in `rediscovery` as a window does: how many pool syncs it ran.
+#[cfg(unix)]
 fn pool_syncs_of_a_pass(bed: &Bed, rediscovery: &Watched<Rediscovery>) -> u64 {
     let before = crate::harness::accounts_upkeep_counts::counts_here().pool_syncs;
     with_logged_effects(

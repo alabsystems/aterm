@@ -1011,7 +1011,7 @@ fn heads_of(body: &Body) -> Vec<RecordId> {
 
 /// What two rooted logs hold, as a merge must make them equal: their records and the order over
 /// them, their dropped ids, their roots and their evaluation.
-fn same_log(left: &Log, right: &Log) -> bool {
+pub(in crate::membership_log) fn same_log(left: &Log, right: &Log) -> bool {
     let stubs = |log: &Log| log.rooting().map(|r| r.stubs.clone());
     let roots = |log: &Log| {
         log.rooting()

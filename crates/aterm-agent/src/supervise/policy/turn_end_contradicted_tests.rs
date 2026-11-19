@@ -127,7 +127,7 @@ fn a_false_defense_over_work_git_found_leads_with_the_contradiction() {
     let close = text.find(NO_REPOSITORY).expect("Land's close");
     assert!(fact < close, "the fact before Land's own words: {text}");
     assert!(
-        !text.contains("Your repository still holds work"),
+        !text.contains("Your repository's local Git state still shows work"),
         "the repository's suffix said again: {text}"
     );
     assert!(is_land_words(text), "{text}");

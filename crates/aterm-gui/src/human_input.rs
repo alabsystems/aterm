@@ -540,8 +540,10 @@ impl crate::App {
     /// without that provenance, a legacy keyed age conservatively counts as a possible key. The
     /// reaper's last sight of someone else's program in a concluded worker's tab crosses too
     /// (`App::worker_job_seen`), so the tab's reading time after that program is not cut short.
-    /// So does the password sheet's spacing of a window still quiet
-    /// (`App::adopt_askpass_spacing`), so an update gives a program that re-asks no fresh start.
+    /// So does the password sheet's spacing of a window or session still quiet
+    /// (`App::adopt_askpass_spacing`), so an update gives a program that re-asks no fresh start;
+    /// and the spacing record is taken up (`App::take_up_askpass_record_at_activation`), which
+    /// the outgoing process owned until the Commit.
     pub(crate) fn take_carried_person_stamps(&mut self) {
         let now_us = crate::metrics::now_us();
         for session in self.pool.iter() {
@@ -549,6 +551,8 @@ impl crate::App {
                 session.ctx.human_input.serve_from(0, now_us);
             }
         }
+        #[cfg(target_os = "macos")]
+        self.take_up_askpass_record_at_activation();
         let Some(path) = self.handoff_person_stamps.take() else {
             return;
         };

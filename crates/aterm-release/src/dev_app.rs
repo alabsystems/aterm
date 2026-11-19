@@ -518,6 +518,11 @@ pub fn run_build(root: &Path, opts: &Options) -> Result<(), String> {
         .out
         .clone()
         .unwrap_or_else(|| root.join("target/.ubd/dev-app.noindex"));
+    if opts.out.is_none() {
+        aterm_uds::backup::Backups::SYSTEM
+            .build_dir(&out)
+            .map_err(|e| format!("prepare {}: {e}", out.display()))?;
+    }
     let app = assemble(root, &out, &stamp, &bin, opts.pin)?;
     sign(&app, &opts.sign, &home, run)?;
     let dest = match &opts.install {
@@ -550,8 +555,8 @@ fn assemble(
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
     let app = out.join(DEV_APP_NAME);
-    note_running(&app);
     if crate::bundle::exists_or_symlink(&app) {
+        note_running(&app);
         crate::bundle::remove_path_any(&app)
             .map_err(|e| format!("rm -rf {}: {e}", app.display()))?;
     }

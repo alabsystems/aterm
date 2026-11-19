@@ -20,17 +20,32 @@
 //! and where the kept order is of that revision the page is cut from it, decoding, projecting
 //! and ordering nothing; at any other revision the store is read again and the order replaced.
 //! The revision is read in the same observation as the page, so a page is never cut from an
-//! order the table has moved past.
+//! order the table has moved past. Beside the order, the reader keeps the sighting of the store
+//! its last open read ([`crate::table::store::Sighting`], tracker LT-25C): where the order is of
+//! that sighting's revision and the store stands as the sighting's open read it, the page's
+//! observation learns the revision unchanged without opening the store, authenticating no
+//! record; anywhere else the store is opened, as every read of it opens it.
+//!
+//! The same kept sighting answers a reader that asks only whether the table moved
+//! ([`Handle::revision_kept`], tracker LT-25D: the Tables page's change check): while the store
+//! stands as the sighting's open read it, the revision is the sighting's and no store is opened;
+//! anywhere else the store is opened, its answer stands and its sighting is the one kept. That
+//! read builds no order, so a reader that asks no page keeps the sighting alone; and since a page
+//! and a revision read keep one sighting between them, each is answered from the other's open
+//! while the store stands still.
 
-use super::{Handle, View, decode};
+use super::{Handle, Usage, View};
+use crate::said::Said;
 use crate::{
     Error, Result,
     alab::registry::{self, MACHINE, MACHINE_FACTS},
+    catalog::Sighted,
     database::{Change, Command, decode_hex},
     documents::{application, log::Log},
     typed::{
         self, Table,
         cell::{CellKey, CellValue, Projection},
+        claim::Settlements,
         keys,
         owned::{self, OwnedRead},
     },
@@ -46,8 +61,9 @@ use crate::documents::log::Hlc;
 /// store's own rule calls it automatic ([`owned::automatic`]: a write to an owned or log
 /// collection, or a cell marked `a`), `import` where a cell carries an import source `s`, else
 /// `explicit`. A revert is explicit whatever value it restores. A record that is several of
-/// these is the first that holds, in that order. The record does not say who typed an explicit
-/// write: a person and a program at the same Mac write the same record.
+/// these is the first that holds, in that order. A version 1 record does not say who typed an
+/// explicit write: a person and a program at the same Mac write the same record. A version 2
+/// record says it ([`Entry::said`]), in a generation that takes version 2 records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EntryKind {
     /// Written by aterm itself: a birth row, a seed, a Mac's own owned or log rows.
@@ -123,6 +139,10 @@ impl Inert {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub operation: Digest,
+    /// Which generation of its family the record is of: the one whose log holds it, under its
+    /// own signer's signature. A family that keeps its records across a roll lists the entries
+    /// of its sealed generations beside its current one's ([`super::kept`]).
+    pub generation: u32,
     pub actor: Actor,
     /// The writer's Commons machine, from the binding in the roster the record names.
     pub machine: Option<[u8; 16]>,
@@ -139,6 +159,9 @@ pub struct Entry {
     /// Why it projects nothing, where it does not.
     pub inert: Option<Inert>,
     pub changes: Vec<Change>,
+    /// What a version 2 record says of who made it, why and on what evidence
+    /// ([`crate::said`]); `None` for a version 1 record, which names only its signing Mac.
+    pub said: Option<Said>,
 }
 
 impl Entry {
@@ -201,6 +224,22 @@ impl Mac {
     }
 }
 
+/// One observation of a table's head and ordered history.
+#[derive(Debug)]
+pub struct HistoryView {
+    /// The current generation's head.
+    pub view: View,
+    /// Storage usage of the current generation.
+    pub usage: Usage,
+    /// The eligible edits in causal order, including sealed generations whose records are kept.
+    pub entries: Vec<Entry>,
+    /// The head's machine bindings and labels used to name every entry's writer.
+    pub macs: Macs,
+    /// The head's machine rows and claim settlements ([`View::project_settled`]), using the
+    /// generation's machine schema. These are the rows that supplied [`Self::macs`].
+    pub machines: (Projection, Settlements),
+}
+
 /// Which machine row each Commons machine's facts bind, and what each such row is called: the
 /// join from a writer to its Mac, read from one projection of the table.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -217,9 +256,13 @@ pub struct Macs {
 impl Macs {
     /// The join `view` holds: its `machine-facts` rows and its `machine` rows.
     pub fn of(view: &View) -> Self {
+        Self::from_projected(view, &view.project(&MACHINE))
+    }
+
+    fn from_projected(view: &View, machines: &Projection) -> Self {
         let empty = OwnedRead::default();
         Self::from_rows(
-            &view.project(&MACHINE),
+            machines,
             view.owned.get(MACHINE_FACTS.name).unwrap_or(&empty),
         )
     }
@@ -512,12 +555,26 @@ pub struct Page {
     pub entries: Vec<Entry>,
     /// Where the next page starts; `None` where no entry the filter keeps follows.
     pub next: Option<Cursor>,
+    /// The records the table holds and does not project, every one whatever the filter keeps:
+    /// what [`crate::typed::refused_words`] says of them.
+    pub refused: Vec<crate::typed::Unread>,
 }
 
 /// The whole of one revision of one table's history, ordered and resolved: what every page at
 /// that revision is cut from ([`Handle::history_page_kept`]). It holds one revision of one
 /// table at a time; a page at any other revision, or of another table or home, replaces it.
 /// Empty until a page fills it, and its order goes when it is dropped.
+///
+/// Beside the order it keeps the sighting of the store the last open made with it read, by a
+/// page or by a revision read ([`Handle::revision_kept`]), with the home and the table that
+/// store is of: what either read asks, of that home and table alone, to learn the store
+/// unchanged without opening it. The home is the one that open read, which a handle whose
+/// writer was succeeded names by its predecessor: the sighting is of the selected home, never
+/// of the path the handle was made at. Where it holds both of one home and table, the order is
+/// of the sighting's revision: a revision read that opens the store at another lets the order
+/// go, and a page that reads another replaces both. A reader that asks no page keeps the sighting
+/// alone, which holds the store's claim, floor and permit files' bytes, its journal prefix's
+/// length and SHA-256 and each record class's verdict, and no record.
 ///
 /// That one revision is every eligible entry of the table's history, those below a final
 /// checkpoint's floor included (the store's quotas bound only the records above it), so its
@@ -526,6 +583,8 @@ pub struct Page {
 /// long as it reads.
 #[derive(Default)]
 pub struct Kept {
+    /// The store as the last open made with this read it, where that open made a sighting.
+    seen: Option<Seen>,
     order: Option<Order>,
     reads: u64,
 }
@@ -534,6 +593,12 @@ impl Kept {
     /// The revision the kept order is of, where one is kept.
     pub fn revision(&self) -> Option<Revision> {
         self.order.as_ref().map(|order| order.revision)
+    }
+
+    /// The revision the kept sighting's open read, where a sighting is kept: what a revision
+    /// read ([`Handle::revision_kept`]) answers while the store stands as that open read it.
+    pub fn sighted(&self) -> Option<Revision> {
+        self.seen.as_ref().map(Seen::revision)
     }
 
     /// How many times a page asked with this read its table and kept the order it read: once a
@@ -548,6 +613,7 @@ impl std::fmt::Debug for Kept {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Kept")
             .field("revision", &self.revision())
+            .field("sighted", &self.sighted())
             .field(
                 "entries",
                 &self.order.as_ref().map(|order| order.entries.len()),
@@ -564,37 +630,87 @@ struct Order {
     revision: Revision,
     /// Every eligible entry, in history's order (oldest first).
     entries: Vec<Entry>,
+    /// The records the read held and does not project ([`Page::refused`]).
+    refused: Vec<crate::typed::Unread>,
 }
 
 impl Order {
     /// Whether this is the order of `table` at `paths` at `revision`. The revision digests the
     /// table's scope and this Mac's access with every record, so it alone names the order; the
-    /// home and the table are compared too, since a [`Kept`] may be handed any handle.
-    ///
-    /// The table is compared by what names its store (application, role and descriptor version)
-    /// and its generation, never by address: a compiled table is a `const` (`att::REGISTRY`),
-    /// and each `&REGISTRY` may be a copy of its own, so a handle made at one place and a
-    /// handle made at another are of the same table at different addresses.
+    /// home and the table are compared too ([`same`]), since a [`Kept`] may be handed any handle.
     fn of(&self, paths: &Paths, table: &super::Compiled, revision: Revision) -> bool {
-        let kept = self.table;
-        self.revision == revision
-            && kept.table.application == table.table.application
-            && kept.table.role == table.table.role
-            && kept.version == table.version
-            && kept.generation == table.generation
-            && self.paths == *paths
+        self.revision == revision && same(self.table, table) && self.paths == *paths
     }
+}
+
+/// [`Kept`]'s sighting: the store of one table at one home as the last open made with the
+/// [`Kept`] read it ([`crate::table::store::Store::sighted_revision`]). A read asks it only of
+/// that home and table ([`Self::is_of`]), and a read that finds the store standing as it read it
+/// learns its revision unchanged without opening the store.
+///
+/// The home is the one whose store was opened: the home the read selected
+/// ([`crate::table::Session::paths`]), which is the handle's own until its writer is succeeded
+/// and the successor's from then (`generation::observed_generation_until`). A handle's path
+/// names two homes across a succession, so it does not say which store a sighting is of.
+struct Seen {
+    home: Paths,
+    table: &'static super::Compiled,
+    sighting: crate::table::store::Sighting,
+}
+
+impl Seen {
+    /// The sighting of the store of `table` at `home`, the home a read selected, that the
+    /// read's open there made.
+    fn of(
+        home: &Paths,
+        table: &'static super::Compiled,
+        sighting: Option<crate::table::store::Sighting>,
+    ) -> Option<Self> {
+        sighting.map(|sighting| Self {
+            home: home.clone(),
+            table,
+            sighting,
+        })
+    }
+
+    /// The revision the sighting's open read: the one the sighting itself holds, never a copy
+    /// kept beside it.
+    fn revision(&self) -> Revision {
+        Revision(self.sighting.revision())
+    }
+
+    /// Whether this is a sighting of the store of `table` at `home`, the home a read selected:
+    /// the one a read of that table there may ask after. A sighting of any other is never
+    /// asked, the store a succeeded handle read before its succession included: its store's
+    /// claim would differ and refuse it ([`crate::table::store::Store::sighting_stands`]), but a
+    /// read does not lean on that.
+    fn is_of(&self, home: &Paths, table: &super::Compiled) -> bool {
+        same(self.table, table) && self.home == *home
+    }
+}
+
+/// Whether `kept` and `table` are one table, compared by what names its store (application,
+/// role and descriptor version) and its generation, never by address: a compiled table is a
+/// `const` (`att::REGISTRY`), and each `&REGISTRY` may be a copy of its own, so a handle made at
+/// one place and a handle made at another are of the same table at different addresses.
+fn same(kept: &super::Compiled, table: &super::Compiled) -> bool {
+    kept.table.application == table.table.application
+        && kept.table.role == table.table.role
+        && kept.version == table.version
+        && kept.generation == table.generation
 }
 
 impl Handle {
     /// One page of this table's eligible history ([`Ask`]), in derived causal-clock order with
     /// concurrent edits ordered by clock then digest (newest first where [`Ask::newest_first`]),
-    /// read in one store read. A reader that asks more than one page keeps their order between
-    /// them ([`Self::history_page_kept`]).
+    /// read in one store read; in a family that keeps its records across a roll, one read of each
+    /// generation's store ([`super::kept`]). A reader that asks more than one page keeps their
+    /// order between them ([`Self::history_page_kept`]).
     ///
     /// # Errors
     /// As [`Self::view`]; also refuses incomplete causal clocks, a logical counter overflow, or
-    /// a page of no entries.
+    /// a page of no entries; and, for a family that keeps its records, where this Mac does not
+    /// hold a sealed generation yet.
     pub fn history_page(&self, ask: &Ask) -> Result<Page> {
         self.read_history_page(ask, None)
     }
@@ -604,11 +720,15 @@ impl Handle {
     /// and orders no record. Else the store is read in the same observation, and `kept` takes
     /// the order of that revision once the observation stands, its earlier order let go first,
     /// so it never holds two. A page is never cut from an order of any revision but the one its
-    /// own observation read.
+    /// own observation read. Where `kept` holds the order of its sighting's revision, the
+    /// observation asks that sighting first and opens no store while it stands; a page that
+    /// opens the store leaves `kept` the sighting of that open, which a revision read
+    /// ([`Self::revision_kept`]) asks in its turn.
     ///
     /// # Errors
     /// As [`Self::history_page`]. On an error `kept` holds no order or the one it held, never a
-    /// part of one.
+    /// part of one, and the sighting it held (none for a family read across a roll, whose page
+    /// asks and keeps no sighting).
     pub fn history_page_kept(&self, ask: &Ask, kept: &mut Kept) -> Result<Page> {
         self.read_history_page(ask, Some(kept))
     }
@@ -622,49 +742,154 @@ impl Handle {
         }
         let compiled = self.compiled;
         let table = compiled.table;
+        // The sealed generations a family that keeps its records lists beside this one
+        // ([`super::kept`]). A sighting is of one store, so a page that reads more than one asks
+        // none and keeps none: it opens each, and its revision covers them all.
+        let earlier = self.earlier();
+        // The kept sighting, taken out while the page reads, and put back where it stood or the
+        // page was refused: the order itself stays in `kept` for a page cut from it.
+        let seen = kept
+            .as_deref_mut()
+            .and_then(|kept| kept.seen.take())
+            .filter(|_| earlier.is_empty());
         let read = super::reopened(crate::admission::deadline(), || {
-            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                let revision = Revision(store.revision(session)?);
-                if let Some(kept) = kept.as_deref_mut() {
-                    if let Some(order) = &kept.order
-                        && order.of(&self.paths, compiled, revision)
-                    {
-                        return Ok((
-                            Cut::of(&order.entries, revision, ask).copied(&order.entries),
-                            None,
-                        ));
-                    }
-                    // Another revision's order goes before this one is read: one is held at
-                    // most.
-                    kept.order = None;
-                }
-                let log = Log::read_with(session, store, scope, decode)?;
-                let resolve = owned::commons::historical(session);
-                // The names come from the same read, so an entry and its writer's name are of
-                // one revision.
-                let macs = Macs::of(&View::read(table, session, &log)?);
-                let entries = ordered(table, &log, &resolve, &macs)?;
-                let cut = Cut::of(&entries, revision, ask);
-                Ok(if kept.is_some() {
-                    (cut.copied(&entries), Some((revision, entries)))
-                } else {
-                    (cut.taken(entries), None)
-                })
-            })
-        });
-        let (page, read) = read?;
-        // Kept only once the observation stands: one refused as busy may have read a table that
-        // moved under it.
-        if let (Some(kept), Some((revision, entries))) = (kept, read) {
-            kept.order = Some(Order {
-                paths: self.paths.clone(),
-                table: compiled,
-                revision,
-                entries,
+            // Asked after only where it is of this table at the home this read selects and the
+            // order of its revision is kept. Any other page reads the store's records, so it
+            // opens the store whatever a sighting says (a revision read kept this one and no
+            // order: one open, never a sighting judged and then the open); and an earlier
+            // attempt that read another revision let the order go before it was refused as
+            // busy, so a sighting that stood then would name an order no longer held.
+            let holds = seen.as_ref().is_some_and(|seen| {
+                kept.as_deref()
+                    .and_then(|kept| kept.order.as_ref())
+                    .is_some_and(|order| order.of(&self.paths, compiled, seen.revision()))
             });
-            kept.reads += 1;
-        }
-        Ok(page)
+            let asked = |home: &Paths| {
+                seen.as_ref()
+                    .filter(|seen| holds && seen.is_of(home, compiled))
+                    .map(|seen| &seen.sighting)
+            };
+            application::observe_store_sighted(
+                &self.paths,
+                self.descriptor(),
+                asked,
+                |session, read, scope| {
+                    let store = match read {
+                        // The store stands as the sighting's open read it: the kept order, of the
+                        // sighting's revision, is the order now.
+                        Sighted::Unchanged => return Ok(Served::Held(session.paths().clone())),
+                        Sighted::Opened(store) => store,
+                    };
+                    let (revision, sighted) = store.sighted_revision(session)?;
+                    let sealed = super::kept::sealed(session, &earlier)?;
+                    let sighted =
+                        Seen::of(session.paths(), compiled, sighted).filter(|_| sealed.is_empty());
+                    let revision = Revision(super::kept::revision(revision, session, &sealed)?);
+                    if let Some(kept) = kept.as_deref_mut() {
+                        if let Some(order) = &kept.order
+                            && order.of(&self.paths, compiled, revision)
+                        {
+                            return Ok(Served::Cut(
+                                Cut::of(&order.entries, revision, ask)
+                                    .copied(&order.entries)
+                                    .refusing(order.refused.clone()),
+                                sighted,
+                            ));
+                        }
+                        // Another revision's order goes before this one is read: one is held at
+                        // most.
+                        kept.order = None;
+                        #[cfg(test)]
+                        if let Some(meanwhile) = ORDER_LET_GO.take() {
+                            meanwhile()?;
+                        }
+                    }
+                    let log = Log::read_with(session, &store, scope, compiled.decoder())?;
+                    let resolve = owned::commons::historical(session);
+                    // The names come from the same read, so an entry and its writer's name are
+                    // of one revision.
+                    let macs = Macs::of(&View::read(table, session, &log)?);
+                    // The records the read holds and does not project, said with every page of
+                    // it.
+                    let mut refused =
+                        log.refusals(&log.refused(&log.awaited(session.actor())), &resolve);
+                    let entries = super::kept::merged(
+                        ordered(compiled, &log, &resolve, &macs)?,
+                        &mut refused,
+                        session,
+                        &sealed,
+                        &resolve,
+                        &macs,
+                    )?;
+                    let cut = Cut::of(&entries, revision, ask);
+                    Ok(if kept.is_some() {
+                        let page = cut.copied(&entries).refusing(refused.clone());
+                        Served::Read(page, revision, entries, refused, sighted)
+                    } else {
+                        Served::Cut(cut.taken(entries).refusing(refused), None)
+                    })
+                },
+            )
+        });
+        let served = match read {
+            Ok(served) => served,
+            Err(error) => {
+                // A refused page leaves the sighting as it was: it is of an open that stood,
+                // whatever this one met, and the next read asks it or opens the store.
+                if let Some(kept) = kept {
+                    kept.seen = seen;
+                }
+                return Err(error);
+            }
+        };
+        Ok(match served {
+            Served::Held(home) => {
+                let unkept = || Error::new("a history sighting stood with no order kept");
+                let kept = kept.ok_or_else(unkept)?;
+                // The sighting that stood is the one asked: of this table at the home the read
+                // selected. The page is cut from the order of that sighting's revision and no
+                // other.
+                let revision = seen
+                    .as_ref()
+                    .filter(|seen| seen.is_of(&home, compiled))
+                    .map(Seen::revision);
+                kept.seen = seen;
+                let order = kept
+                    .order
+                    .as_ref()
+                    .filter(|order| {
+                        revision.is_some_and(|revision| order.of(&self.paths, compiled, revision))
+                    })
+                    .ok_or_else(unkept)?;
+                Cut::of(&order.entries, order.revision, ask)
+                    .copied(&order.entries)
+                    .refusing(order.refused.clone())
+            }
+            // The store was opened: the sighting of that open is the one kept, or none where it
+            // made none.
+            Served::Cut(page, sighted) => {
+                if let Some(kept) = kept {
+                    kept.seen = sighted;
+                }
+                page
+            }
+            // Kept only once the observation stands: one refused as busy may have read a table
+            // that moved under it.
+            Served::Read(page, revision, entries, refused, sighted) => {
+                if let Some(kept) = kept {
+                    kept.order = Some(Order {
+                        paths: self.paths.clone(),
+                        table: compiled,
+                        revision,
+                        entries,
+                        refused,
+                    });
+                    kept.seen = sighted;
+                    kept.reads += 1;
+                }
+                page
+            }
+        })
     }
 
     /// Every eligible edit, as one page of every entry ([`Self::history_page`]).
@@ -676,28 +901,218 @@ impl Handle {
             .map(|page| page.entries)
     }
 
-    /// The revision this Mac holds the table at, read without opening a payload: a reader that
-    /// read a page or a view at this revision has nothing new to read.
+    /// The current view, its storage usage and its eligible edits in causal order, from one
+    /// store observation; in a family that keeps its records across a roll, with the edits of
+    /// its sealed generations as [`Self::history`] lists them ([`super::kept`]).
+    /// Writer names in the history use the machine bindings in the returned view.
     ///
     /// # Errors
-    /// As [`Self::view`].
-    pub fn revision(&self) -> Result<Revision> {
+    /// As [`Self::view`] and [`Self::history`].
+    pub fn view_with_history(&self) -> Result<HistoryView> {
+        self.view_with_history_and(|_, _| ()).map(|(read, ())| read)
+    }
+
+    /// [`Self::view_with_history`], and with it what `of` reads of the same log under the
+    /// session that read it (the checkpoint fence in [`Handle::view_with_history_fenced`]).
+    ///
+    /// # Errors
+    /// As [`Self::view_with_history`].
+    pub(super) fn view_with_history_and<T>(
+        &self,
+        of: impl Fn(&crate::table::Session<'_>, &Log) -> T,
+    ) -> Result<(HistoryView, T)> {
+        let compiled = self.compiled;
+        let earlier = self.earlier();
         super::reopened(crate::admission::deadline(), || {
-            application::observe_store(&self.paths, self.descriptor(), |session, store, _| {
-                store.revision(session).map(Revision)
+            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+                // History requires the custody and file checks of the store's revision.
+                store.revision(session)?;
+                let sealed = super::kept::sealed(session, &earlier)?;
+                let log = Log::read_with(session, store, scope, compiled.decoder())?;
+                // The head a reader is shown: its own log over the owned rows and log entries
+                // of the sealed generations ([`super::kept::Rows`]).
+                let head = View::read_over(
+                    compiled.table,
+                    session,
+                    &log,
+                    super::kept::rows(session, &sealed)?,
+                )?;
+                let resolve = owned::commons::historical(session);
+                let machines = head.project_settled(&MACHINE);
+                let macs = Macs::from_projected(&head, &machines.0);
+                let entries = super::kept::merged(
+                    ordered(compiled, &log, &resolve, &macs)?,
+                    &mut Vec::new(),
+                    session,
+                    &sealed,
+                    &resolve,
+                    &macs,
+                )?;
+                let read = of(session, &log);
+                Ok((
+                    HistoryView {
+                        view: head,
+                        usage: Usage::of(session.actor(), &log),
+                        entries,
+                        macs,
+                        machines,
+                    },
+                    read,
+                ))
             })
         })
     }
+
+    /// The revision this Mac holds the table at, read without opening a payload: a reader that
+    /// read a page or a view at this revision has nothing new to read. Each call opens the
+    /// store; a reader that asks again and again keeps a sighting between its asks
+    /// ([`Self::revision_kept`]). In a family that keeps its records across a roll it covers
+    /// every generation's store ([`super::kept::revision`]).
+    ///
+    /// # Errors
+    /// As [`Self::view`]; for a family that keeps its records, also where this Mac does not hold
+    /// a sealed generation yet.
+    pub fn revision(&self) -> Result<Revision> {
+        let earlier = self.earlier();
+        super::reopened(crate::admission::deadline(), || {
+            application::observe_store(&self.paths, self.descriptor(), |session, store, _| {
+                let sealed = super::kept::sealed(session, &earlier)?;
+                super::kept::revision(store.revision(session)?, session, &sealed).map(Revision)
+            })
+        })
+    }
+
+    /// [`Self::revision`] for a reader that asks it again and again and keeps `kept` between its
+    /// asks (tracker LT-25D: the Tables page's change check). Where `kept` holds a sighting of
+    /// this table's store at the home this read selects (this handle's, or its successor's once
+    /// its writer was succeeded) and the store stands as that sighting's open read it
+    /// ([`crate::table::store::Store::sighting_stands`]), the revision is the sighting's and no
+    /// store is opened, no record authenticated. Anywhere else (nothing kept, a sighting of
+    /// another home or table, which is never asked, or a store that differs from it in anything
+    /// or refuses) the store is opened as [`Self::revision`] opens it: that open's answer, a
+    /// refusal included, is the answer, and `kept` takes the sighting of that open, or none
+    /// where it made none (a combined view, a store holding a conflict certificate). The
+    /// sighting is the one History's pages ask and keep ([`Self::history_page_kept`]), so a page
+    /// and a revision read are each answered from the other's open while the store stands.
+    ///
+    /// It reads no record's payload and builds no order. Where the store is opened at a
+    /// revision the kept order is not of, that order is let go: no page is cut from it again.
+    ///
+    /// At 105,043 records an ask that stands on the kept sighting took 133 ms where
+    /// [`Self::revision`] took 1.84 s, in the `opt-test` profile
+    /// (`att::tests::history_pages_at_100000_records_cost`): on that test's own thread, in a
+    /// process that had opened the store before. The Tables page asks on a thread at background
+    /// priority, where neither was measured.
+    ///
+    /// # Errors
+    /// As [`Self::revision`]. On an error `kept` holds what it held.
+    pub fn revision_kept(&self, kept: &mut Kept) -> Result<Revision> {
+        let compiled = self.compiled;
+        if !self.earlier().is_empty() {
+            // A sighting is of one store; a family read across a roll is of several
+            // ([`super::kept`]), so each is opened and no sighting is kept.
+            let revision = self.revision()?;
+            if kept
+                .order
+                .as_ref()
+                .is_some_and(|order| !order.of(&self.paths, compiled, revision))
+            {
+                kept.order = None;
+            }
+            kept.seen = None;
+            return Ok(revision);
+        }
+        // The kept sighting, asked only where it is of this table at the home this read selects.
+        let seen = kept.seen.as_ref();
+        let asked = |home: &Paths| seen.filter(|seen| seen.is_of(home, compiled));
+        let (home, read) = super::reopened(crate::admission::deadline(), || {
+            application::observe_store_sighted(
+                &self.paths,
+                self.descriptor(),
+                |home| asked(home).map(|seen| &seen.sighting),
+                |session, read, _| {
+                    let read = match read {
+                        Sighted::Unchanged => None,
+                        Sighted::Opened(store) => Some(store.sighted_revision(session)?),
+                    };
+                    Ok((session.paths().clone(), read))
+                },
+            )
+        })?;
+        let Some((revision, sighted)) = read else {
+            // The store stands as the asked sighting's open read it.
+            return asked(&home)
+                .map(Seen::revision)
+                .ok_or_else(|| Error::new("a table sighting stood with none asked"));
+        };
+        let revision = Revision(revision);
+        if kept
+            .order
+            .as_ref()
+            .is_some_and(|order| !order.of(&self.paths, compiled, revision))
+        {
+            kept.order = None;
+        }
+        kept.seen = Seen::of(&home, compiled, sighted);
+        Ok(revision)
+    }
 }
 
-/// Every eligible entry of `log`, in history's order (oldest first); `resolve` finds a record's
-/// writer machine through the roster it names, and `macs` that machine's Mac.
-fn ordered(
-    table: &'static Table,
+/// What one page's observation served ([`Handle::history_page_kept`]).
+enum Served {
+    /// The store stands as the kept sighting read it, and the kept order is of that sighting's
+    /// revision: the page is cut from that order. With the home the read selected, whose store
+    /// stood.
+    Held(Paths),
+    /// The page, cut from the kept order where the store was opened at its revision, or taken
+    /// from an order read with nothing kept; with the sighting of the store it opened.
+    Cut(Page, Option<Seen>),
+    /// The page, and the order of the revision the store was read at, the records that read
+    /// held and does not project, and its sighting: what `kept` keeps once the observation
+    /// stands.
+    Read(
+        Page,
+        Revision,
+        Vec<Entry>,
+        Vec<crate::typed::Unread>,
+        Option<Seen>,
+    ),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once by this thread's next page attempt that lets the kept order go, right after
+    /// ([`with_order_let_go`]); its error is the attempt's.
+    static ORDER_LET_GO: std::cell::Cell<Option<Box<dyn FnOnce() -> Result<()>>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `read`, with `meanwhile` run by this thread's next page attempt that lets the kept order go,
+/// right after it does, its error that attempt's: what happens between a page's attempts.
+#[cfg(test)]
+pub(super) fn with_order_let_go<T>(
+    meanwhile: impl FnOnce() -> Result<()> + 'static,
+    read: impl FnOnce() -> T,
+) -> T {
+    ORDER_LET_GO.set(Some(Box::new(meanwhile)));
+    let read = read();
+    assert!(
+        ORDER_LET_GO.take().is_none(),
+        "no page attempt let the kept order go"
+    );
+    read
+}
+
+/// Every eligible entry of `log`, the log of the generation `compiled`, in history's order
+/// (oldest first); `resolve` finds a record's writer machine through the roster it names, and
+/// `macs` that machine's Mac.
+pub(super) fn ordered(
+    compiled: &'static super::Compiled,
     log: &Log,
     resolve: &dyn Fn(&Digest, &Actor) -> Option<[u8; 16]>,
     macs: &Macs,
 ) -> Result<Vec<Entry>> {
+    let table: &'static Table = compiled.table;
     let order = log.causal_order()?;
     let (records, merges) = log.eligible_and_merges();
     let quota = owned::quota_of(
@@ -737,6 +1152,7 @@ fn ordered(
         };
         entries.push(Entry {
             operation: id,
+            generation: compiled.generation,
             actor,
             machine,
             mac: macs.name(&actor, machine.as_ref()),
@@ -747,9 +1163,18 @@ fn ordered(
             kind: EntryKind::of(table, is_revert(command), changes),
             inert,
             changes: changes.to_vec(),
+            said: command.said().cloned(),
         });
     }
     Ok(entries)
+}
+
+impl Page {
+    /// This page, saying the records the read it was cut from holds and does not project.
+    fn refusing(mut self, refused: Vec<crate::typed::Unread>) -> Self {
+        self.refused = refused;
+        self
+    }
 }
 
 /// Which entries the page an [`Ask`] names holds, as places in the order it was cut from.
@@ -841,6 +1266,7 @@ impl Cut {
             moved: self.moved,
             entries,
             next: self.next,
+            refused: Vec::new(),
         }
     }
 }

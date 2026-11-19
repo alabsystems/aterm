@@ -20,9 +20,9 @@ pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<n>(ms|s|m|h)] [s
                          jobs.running slots <n>, tab.mem aterm.mem avail <size>, \
                          swap <size>[/s], decompress <n>[/s], mem normal|warn|critical, \
                          thermal nominal|fair|serious|critical (the heuristic's \
-                         none|light|heavy|severe rank alike), thrash yes|no, \
-                         spotlight idle|indexing|off (= and != take a comma list; thrash and \
-                         spotlight take no other <op>); \
+                         none|light|heavy|severe rank alike), thrash yes|no, starving yes|no, \
+                         spotlight idle|indexing|off (= and != take a comma list; thrash, \
+                         starving and spotlight take no other <op>); \
                          <volume> := free>=<size|room> | free><size|room> | free<<size> | free<=<size> \
                          | disk=ok|low|short|emergency[,…], never with quiet, a <term>, for= or \
                          scope=; \
@@ -69,6 +69,8 @@ pub enum Metric {
     Decompress,
     /// Thrashing, `yes`/`no`.
     Thrash,
+    /// A memory starvation episode is open, `yes`/`no` ([`crate::starving`]).
+    Starving,
     /// The target tab's footprint, bytes (every tab's under `scope=aterm`).
     TabMem,
     /// aterm's footprint, bytes.
@@ -176,6 +178,7 @@ impl Metric {
             Self::Swap => "swap".into(),
             Self::Decompress => "decompress".into(),
             Self::Thrash => "thrash".into(),
+            Self::Starving => crate::events::STARVING_WORD.into(),
             Self::TabMem => "tab.mem".into(),
             Self::AtermMem => "aterm.mem".into(),
             Self::Thermal => "thermal".into(),
@@ -203,7 +206,7 @@ impl Metric {
             Self::Mem | Self::Thermal => Kind::Ordered,
             Self::Swap => Kind::Bps,
             Self::Decompress => Kind::PerS,
-            Self::Thrash | Self::Spotlight => Kind::YesNo,
+            Self::Thrash | Self::Starving | Self::Spotlight => Kind::YesNo,
             Self::TabMem | Self::AtermMem | Self::Avail => Kind::Bytes,
             Self::Jobs(_) | Self::Slots => Kind::Count,
             Self::Job(_) => Kind::Job,
@@ -215,7 +218,7 @@ impl Metric {
         match self {
             Self::Mem => &["normal", "warn", "critical"],
             Self::Thermal => &["nominal", "fair", "serious", "critical"],
-            Self::Thrash => &["no", "yes"],
+            Self::Thrash | Self::Starving => &["no", "yes"],
             Self::Spotlight => &crate::spotlight::State::WORDS,
             _ => &[],
         }
@@ -719,6 +722,7 @@ fn term(tok: &str) -> Result<Tok, String> {
         "swap" => Metric::Swap,
         "decompress" => Metric::Decompress,
         "thrash" => Metric::Thrash,
+        "starving" => Metric::Starving,
         "tab.mem" => Metric::TabMem,
         "aterm.mem" => Metric::AtermMem,
         "thermal" => Metric::Thermal,
@@ -1051,6 +1055,13 @@ fn read(metric: &Metric, s: &Snapshot, tab_keys: &[u64], cores_want: bool) -> Re
                 Reading::Rank(r.into())
             }),
             None => Reading::Unavailable("unsupported"),
+        },
+        Metric::Starving => match s.mem.as_ref() {
+            None => Reading::Unavailable("unsupported"),
+            Some(_) if s.starving.is_some() => Reading::Rank(1),
+            Some(m) if m.sample.counters.is_none() => Reading::Unavailable("not_sampled"),
+            Some(m) if m.rates.is_none() => Reading::Warming,
+            Some(_) => Reading::Rank(0),
         },
         Metric::Swap | Metric::Decompress | Metric::Thrash => {
             let Some(m) = s.mem.as_ref() else {

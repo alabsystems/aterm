@@ -30,6 +30,7 @@ fn sample_facts() -> SwarmSurveyFacts {
                 usage_7d_pct: Some(61),
                 week_reset: Some(1_793_500_000),
                 walled_until: None,
+                model_walls: BTreeMap::new(),
                 last_used: Some(1_793_159_900),
                 read_at: None,
                 launch: Some(true),
@@ -45,6 +46,7 @@ fn sample_facts() -> SwarmSurveyFacts {
                 usage_7d_pct: Some(88),
                 week_reset: Some(1_793_600_000),
                 walled_until: Some(1_793_170_000),
+                model_walls: BTreeMap::new(),
                 last_used: Some(1_793_158_000),
                 read_at: None,
                 launch: Some(false),
@@ -60,6 +62,7 @@ fn sample_facts() -> SwarmSurveyFacts {
                 usage_7d_pct: None,
                 week_reset: None,
                 walled_until: None,
+                model_walls: BTreeMap::new(),
                 last_used: None,
                 read_at: None,
                 launch: None,
@@ -1406,11 +1409,16 @@ fn facts_round_trip_and_missing_field_negative_controls() {
     assert!(SwarmSurveyFacts::from_survey_reply(&signed_accounts).is_err());
 }
 
+/// Release process rows, the pump's fact (`release_pump`, UB-15) among them, cross the fleet
+/// read whole; a peer that sends none supplies none.
+/// NEGATIVE CONTROL: with the rows removed from the wire, nothing is read.
 #[test]
 fn release_process_observations_cross_the_fleet_read() {
     let mut facts = sample_facts();
     facts.operation_lines = vec![
         "release_line alive=1 data=%7B%7D".into(),
+        "release_pump alive=1 holder=m16 line=v0.6.0 step=wait own=1 at=1 age=2 decision=a%20b"
+            .into(),
         "github_rate hour=123 status=unrecorded".into(),
     ];
     let wire = facts.to_survey_reply(
@@ -1424,7 +1432,11 @@ fn release_process_observations_cross_the_fleet_read() {
     assert_eq!(parsed.operation_lines, facts.operation_lines);
     let removed = wire
         .lines()
-        .filter(|line| !line.starts_with("release_line ") && !line.starts_with("github_rate "))
+        .filter(|line| {
+            !line.starts_with("release_line ")
+                && !line.starts_with(aterm_ctl::release_pump::ROW)
+                && !line.starts_with("github_rate ")
+        })
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
@@ -1433,6 +1445,43 @@ fn release_process_observations_cross_the_fleet_read() {
             .operation_lines
             .is_empty(),
         "an older or unread peer supplies no process evidence"
+    );
+}
+
+/// The survey's GitHub rows read agh's rate book where agh keeps it, under aterm's state root
+/// (`aterm_ctl::github_usage::calls_dir`), not in the harness folder below it, on Unix and
+/// Windows alike.
+/// NEGATIVE CONTROL (2026-11-17, on Windows): with `collect_in` handing the survey the harness
+/// folder (`env.state`) again, as it did before, this failed, the hour read `status=unrecorded`.
+#[cfg(any(unix, windows))]
+#[test]
+fn the_github_rows_read_the_rate_book_under_the_state_root() {
+    const HOUR: u64 = 498_100;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let calls = aterm_ctl::github_usage::calls_dir(&state);
+    std::fs::create_dir_all(calls.parent().unwrap()).unwrap();
+    aterm_uds::private_file::create_private_dir(&calls).unwrap();
+    aterm_uds::private_file::write_private(
+        &calls,
+        &format!("{HOUR}.jsonl"),
+        b"{\"as\":\"dev\",\"caller\":\"cli\",\"path\":\"/rate_limit\",\"status\":200}\n",
+    )
+    .unwrap();
+    let now = i64::try_from(HOUR * 3600).unwrap();
+    let facts = SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, now);
+    let rows: Vec<&String> = facts
+        .operation_lines
+        .iter()
+        .filter(|line| line.starts_with("github_rate "))
+        .collect();
+    assert!(
+        rows.iter().any(|line| line.starts_with(&format!(
+            "github_rate hour={HOUR} status=recorded attempts=1 "
+        ))),
+        "the hour agh recorded: {rows:?}"
     );
 }
 
@@ -1564,6 +1613,7 @@ fn a_pool_that_could_not_be_read_is_named_and_the_others_still_list() {
         plan: None,
         plan_tier: None,
         lifts: Vec::new(),
+        model_walls: BTreeMap::new(),
     };
     let claude = SurveyPool {
         moves: Some(PoolMoves {
@@ -1809,6 +1859,7 @@ fn an_account_rows_launch_crosses_the_wire_and_an_older_member_sends_none() {
         plan: None,
         plan_tier: None,
         lifts: Vec::new(),
+        model_walls: BTreeMap::new(),
     };
     let (rows, _, _, _) = account_facts_of([(
         Cli::Codex,

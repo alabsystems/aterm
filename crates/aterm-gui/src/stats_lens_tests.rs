@@ -610,7 +610,9 @@ fn disk_forms(snap: &Snapshot, lw: f64, lh: f64) -> Vec<Vec<(String, usize, usiz
         two: lw >= TWO_COLUMNS_PT,
         cw: columns(lw).1,
         fresh: true,
+        keys: true,
         disk_span: DiskSpan::Day,
+        cpu_policy_pending: false,
     };
     let doc = disk_doc(c);
     laid.placed
@@ -1456,6 +1458,7 @@ fn the_network_trace_ticks_each_minute_at_its_own_directions_peak() {
             oy: 0.0,
             draw: true,
             line_tab: 0.0,
+            chips: None,
             boxes: Vec::new(),
         };
         // The axis `draw_trace` lays for a plot 56 pt tall.
@@ -2004,6 +2007,7 @@ fn compact_jobs_count_child_activity_only_inside_the_chosen_scope() {
             oy: 0.0,
             draw: true,
             line_tab: 0.0,
+            chips: None,
             boxes: Vec::new(),
         };
         (sec.forms.last().unwrap().draw)(
@@ -2086,6 +2090,7 @@ fn chips_say_whose_a_row_is() {
         oy: 0.0,
         draw: false,
         line_tab: 0.0,
+        chips: None,
         boxes: Vec::new(),
     };
     assert_eq!(chip_ink(&pen, ProcScope::Tab(FRONT), &[FRONT]), inks.tab);
@@ -2479,13 +2484,17 @@ fn the_lens_first_line_says_used_available_and_total() {
             "2.34 terabytes used, 1.66 terabytes free, 4.00 terabytes total, 40 gigabytes \
              reserved",
         ),
-        (
-            Instrument::Gpu,
-            "Apple M5 Max, 40 cores, 6.0 gibibytes in use.",
-        ),
     ] {
         let spoken = lens_sentence(&snap, focus, &[FRONT], &LOC);
         assert!(spoken.contains(said), "{focus:?}: {spoken}");
+    }
+    let spoken = lens_sentence(&snap, Instrument::Gpu, &[FRONT], &LOC);
+    for fact in [
+        "Apple M5 Max",
+        "40 GPU cores",
+        "6.0 gibibytes GPU memory in use",
+    ] {
+        assert!(spoken.contains(fact), "GPU fact {fact:?}: {spoken}");
     }
 
     // CONTROL: 39 GB kept back of 4 TB is under 1 %; an unread in-use figure goes unsaid.
@@ -2544,6 +2553,85 @@ fn how_to_read_draws_the_cause_mark_in_words2() {
     );
 }
 
+/// How to read's drawn Heat legend says which rows the heat ramp holds for (SD-80): wherever it
+/// says a cell's colour is its share of the maximum, it names the work rows or says Memory and
+/// Disk are coloured by state, and its full form draws a held amount's three inks (machine at
+/// rest, warn, critical) beside the Memory and Disk words. Of every lens size.
+#[test]
+fn how_to_read_draws_which_rows_the_heat_ramp_holds_for() {
+    let snap = lens_scene(Scene::Calm);
+    let m = FaceMetrics::helvetica_neue();
+    let (mut full, mut line) = (0_usize, 0_usize);
+    for contrast in [false, true] {
+        let inks = dark_inks();
+        let held = [
+            if contrast {
+                inks.machine_ic
+            } else {
+                inks.machine
+            },
+            inks.warn,
+            inks.critical,
+        ]
+        .map(|ink| rgba(ink, 0xFF));
+        for lw in [1024.0, 760.0, 526.0, 420.0, 340.0] {
+            for lh in [90.0, 120.0, 160.0, 250.0, 400.0] {
+                let mut i = input(&snap, inks);
+                i.contrast = contrast;
+                let laid = lay_lens(
+                    &shell(lw, lh, 2.0),
+                    &i,
+                    &pinned(Instrument::HowToRead),
+                    &m,
+                    true,
+                );
+                let texts: Vec<&str> = laid
+                    .prims
+                    .iter()
+                    .filter_map(|p| match p {
+                        DrawPrim::Text { s, .. } => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let tag = format!("{lw}x{lh} contrast {contrast}");
+                for t in texts.iter().filter(|t| t.contains("share of")) {
+                    assert!(
+                        t.contains("CPU") || t.contains("work") || t.contains("Memory, Disk"),
+                        "{tag}: {t:?} says which rows a share of max holds for"
+                    );
+                    if t.contains("Memory, Disk") {
+                        line += 1;
+                    }
+                }
+                let Some(at) = texts.iter().position(|t| t.starts_with("Memory, Disk:")) else {
+                    continue;
+                };
+                full += 1;
+                assert!(
+                    texts[..at].iter().any(|t| t.contains("share of")),
+                    "{tag}: the full form's heading names the heat ramp's rows: {texts:?}"
+                );
+                let fills: Vec<Rgba> = laid
+                    .prims
+                    .iter()
+                    .filter_map(|p| match p {
+                        DrawPrim::Panel { fill, .. } => Some(*fill),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    fills.windows(3).any(|w| w == held),
+                    "{tag}: machine, warn and critical swatches drawn in a row"
+                );
+            }
+        }
+    }
+    assert!(
+        full >= 4 && line >= 2,
+        "CONTROL: lenses drawing the full Heat form {full}, its one line {line}"
+    );
+}
+
 fn engine_1032() -> Snapshot {
     engine(fixtures::spotlight_1032())
 }
@@ -2598,7 +2686,9 @@ fn two_columns<'d>(snap: &'d Snapshot, m: &'d FaceMetrics) -> Ctx<'d> {
         two: true,
         cw: columns(1024.0).1,
         fresh: true,
+        keys: true,
         disk_span: DiskSpan::Day,
+        cpu_policy_pending: false,
     }
 }
 
@@ -2822,7 +2912,7 @@ fn sections_take_the_largest_form_that_leaves_room() {
 }
 
 #[test]
-fn the_lens_hangs_under_the_deck_and_over_the_sill() {
+fn the_lens_hangs_below_both_resource_forms() {
     let deck = lens_geom(
         StatsBars::Deck,
         80,
@@ -2840,7 +2930,7 @@ fn the_lens_hangs_under_the_deck_and_over_the_sill() {
     assert_eq!(deck.dy as f32 + deck.margin, 80.0 + 124.0 + 8.0);
     let sill = lens_geom(
         StatsBars::Sill,
-        1876,
+        56,
         24.0,
         24.0,
         84.0,
@@ -2850,7 +2940,7 @@ fn the_lens_hangs_under_the_deck_and_over_the_sill() {
         26.0,
     )
     .expect("fits");
-    assert_eq!(sill.dy as f32 + sill.margin + 500.0, 1876.0 - 8.0);
+    assert_eq!(sill.dy as f32 + sill.margin, 56.0 + 24.0 + 8.0);
     assert!(
         lens_geom(
             StatsBars::Deck,
@@ -3487,16 +3577,22 @@ fn how_to_read_and_traces_surface_multiscale_gaps_and_events() {
     ];
     snap.strip_events = vec![
         aterm_vitals::StripEvent {
+            scope: aterm_vitals::events::EventScope::Unknown,
+            span: None,
             at_unix_ms: hour_start + 23 * 60_000,
             kind: aterm_vitals::StripEventKind::Crash,
             label: "unclean exit".into(),
         },
         aterm_vitals::StripEvent {
+            scope: aterm_vitals::events::EventScope::Unknown,
+            span: None,
             at_unix_ms: hour_start + 44 * 60_000,
             kind: aterm_vitals::StripEventKind::PressureSpike,
             label: "memory pressure critical".into(),
         },
         aterm_vitals::StripEvent {
+            scope: aterm_vitals::events::EventScope::Unknown,
+            span: None,
             at_unix_ms: now - 10 * 3_600_000,
             kind: aterm_vitals::StripEventKind::SleepWake,
             label: "woke from sleep".into(),
@@ -3561,6 +3657,7 @@ fn lens_traces_keep_their_axes_and_time_base() {
             max: Some(0.45),
             over: if j == 40 { 0.5 } else { 0.0 },
             gap: None,
+            state: None,
         })
         .collect();
     let trace = Trace {
@@ -3586,6 +3683,7 @@ fn lens_traces_keep_their_axes_and_time_base() {
             oy: 0.0,
             draw: true,
             line_tab: 0.0,
+            chips: None,
             boxes: Vec::new(),
         };
         let p = Place {
@@ -3732,5 +3830,264 @@ fn the_jobs_overflow_names_the_sys_query_for_what_the_lens_lists() {
         let q = SysQuery::parse(rest).unwrap_or_else(|e| panic!("{line}: {e}"));
         assert_eq!(q.view, View::Jobs, "{line}");
         assert_eq!(q.scope.or(q.view.default_scope()), Some(want), "{line}");
+    }
+}
+
+/// Every page document keeps every section at both column choices. The short card is the
+/// control: it must shed part of the same Disk document.
+#[test]
+fn the_resources_page_holds_every_section_of_every_lens_document() {
+    let snap = did_scene();
+    let input = input(&snap, dark_inks());
+    let m = FaceMetrics::helvetica_neue();
+    for width in [396.0, 1152.0] {
+        for instrument in Instrument::page_order() {
+            let page = lay_page(
+                width,
+                &input,
+                PageDoc::Lens(instrument),
+                Bar::Global,
+                2.0,
+                26.0,
+                &m,
+                false,
+            );
+            assert_eq!(page.placed.len(), page.of, "{instrument:?} at {width}");
+            assert!(page.of > 0, "the fixture must exercise {instrument:?}");
+            assert!(
+                page.placed
+                    .windows(2)
+                    .all(|pair| pair[0].place.x <= pair[1].place.x),
+                "{instrument:?} is read column by column"
+            );
+            let mut indices: Vec<_> = page
+                .placed
+                .iter()
+                .map(|p| {
+                    assert_eq!(p.form, 0, "{instrument:?} at {width}");
+                    assert!(p.place.y >= page.head.y + page.head.h);
+                    assert!(p.place.y + p.place.h <= page.height_pt);
+                    p.section
+                })
+                .collect();
+            indices.sort_unstable();
+            assert_eq!(indices, (0..page.of).collect::<Vec<_>>());
+            if instrument == Instrument::Disk {
+                assert!(
+                    page.wells
+                        .iter()
+                        .any(|(name, _)| name == "What the software did")
+                );
+            }
+        }
+    }
+    let card = lay_lens(
+        &shell(1024.0, 250.0, 2.0),
+        &input,
+        &pinned(Instrument::Disk),
+        &m,
+        false,
+    );
+    let page = lay_page(
+        1152.0,
+        &input,
+        PageDoc::Lens(Instrument::Disk),
+        Bar::Global,
+        2.0,
+        26.0,
+        &m,
+        false,
+    );
+    assert!(
+        card.placed
+            .iter()
+            .flatten()
+            .filter(|(_, form)| *form == 0)
+            .count()
+            < page.of,
+        "CONTROL: the 250 pt card compresses or sheds sections"
+    );
+    // head's shortest rule ends 12 pt after line one's baseline. Leave one body line.
+    let short_height = LINE1_BASE + 12.0 + FOOT + LINE_H;
+    let short = lay_lens(
+        &shell(1024.0, short_height, 2.0),
+        &input,
+        &pinned(Instrument::Disk),
+        &m,
+        false,
+    );
+    let short_count = short.placed.iter().map(Vec::len).sum::<usize>();
+    assert!(
+        short_count > 0,
+        "the short card still places a body section"
+    );
+    assert!(
+        short_count < page.of,
+        "CONTROL: a shorter card sheds sections"
+    );
+    assert_eq!(Instrument::Tokens.page(), None);
+    assert_eq!(Instrument::NetworkState.page(), None);
+    use crate::native_app::{NativeAppModel, ViewCx, ViewMotionCx};
+    let mut model = crate::native_resources::ResourcesApp::default();
+    model.publish(std::sync::Arc::new(snap), None);
+    let view = crate::native_resources::ResourcesViewState::default();
+    let cx = ViewCx {
+        viewport: crate::native_ui::LogicalRect::new(0.0, 0.0, 1200.0, 900.0),
+        animation_phase_ms: 0,
+        motion: ViewMotionCx::default(),
+        terminal_font_px: 26.0,
+        terminal_scale: 2.0,
+        semantic_font: None,
+        document: None,
+    };
+    let compiled = model
+        .view(&view, &cx)
+        .compile(cx.viewport)
+        .expect("the page compiles");
+    for excluded in ["resources/doc/tokens", "resources/doc/network-state"] {
+        assert!(
+            compiled
+                .semantics
+                .iter()
+                .all(|node| !node.key.as_str().starts_with(excluded)),
+            "CONTROL: {excluded} is absent from the page"
+        );
+    }
+}
+
+/// A card and page over one reading use the same builders. A later CPU reading is the control.
+#[test]
+fn a_page_section_says_what_the_hover_card_says_of_the_same_reading() {
+    let mut snap = did_scene();
+    snap.hardware = None;
+    snap.authorized_cpu_policy = None;
+    let mut same = input(&snap, dark_inks());
+    same.tab_panes.clear();
+    same.tab_label.clear();
+    let m = FaceMetrics::helvetica_neue();
+    for instrument in Instrument::page_order() {
+        let card = lay_lens(
+            &shell(1024.0, 250.0, 2.0),
+            &same,
+            &Lens {
+                how: Opened::Hover,
+                ..pinned(instrument)
+            },
+            &m,
+            false,
+        );
+        let page = lay_page(
+            1152.0,
+            &same,
+            PageDoc::Lens(instrument),
+            Bar::Global,
+            2.0,
+            26.0,
+            &m,
+            false,
+        );
+        assert!(
+            !card.wells.is_empty(),
+            "the fixture must exercise {instrument:?}"
+        );
+        for well in card.wells {
+            assert!(page.wells.contains(&well), "{instrument:?}: {well:?}");
+        }
+    }
+    let page = lay_page(
+        1152.0,
+        &same,
+        PageDoc::Lens(Instrument::Cpu),
+        Bar::Global,
+        2.0,
+        26.0,
+        &m,
+        false,
+    );
+    let mut later = snap.clone();
+    later.seq += 1;
+    later.resources[Resource::Cpu.index()].now = Some(87.0);
+    let mut later = input(&later, dark_inks());
+    later.tab_panes.clear();
+    later.tab_label.clear();
+    let card = lay_lens(
+        &shell(1024.0, 250.0, 2.0),
+        &later,
+        &Lens {
+            how: Opened::Hover,
+            ..pinned(Instrument::Cpu)
+        },
+        &m,
+        false,
+    );
+    assert!(
+        card.wells.iter().any(|well| !page.wells.contains(well)),
+        "CONTROL: a later CPU reading must disagree with the page"
+    );
+}
+
+/// Only the pinned card takes its CPU commands; the page's visible and semantic words name none.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_pages_cpu_document_names_no_key_the_page_does_not_take() {
+    let mut snap = lens_scene(Scene::Calm);
+    snap.hardware = Some(aterm_vitals::hardware::Sample::unavailable(
+        "refused:ioreport_subscription",
+    ));
+    let input = input(&snap, dark_inks());
+    let m = FaceMetrics::helvetica_neue();
+    let page = lay_page(
+        1152.0,
+        &input,
+        PageDoc::Lens(Instrument::Cpu),
+        Bar::Global,
+        2.0,
+        26.0,
+        &m,
+        true,
+    );
+    let drawn = page
+        .boxes
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let said = page
+        .wells
+        .iter()
+        .map(|(_, words)| words.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        page.wells
+            .iter()
+            .any(|(name, _)| name == "Hardware & limits")
+    );
+    for key in ["⌘⇧C", "⌘⇧P", "⌘⇧X"] {
+        assert!(!drawn.contains(key), "{key}: {drawn}");
+        assert!(!said.contains(key), "{key}: {said}");
+    }
+    let card = lay_lens(
+        &shell(1024.0, 250.0, 2.0),
+        &input,
+        &pinned(Instrument::Cpu),
+        &m,
+        true,
+    );
+    let drawn = card
+        .boxes
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let said = card
+        .wells
+        .iter()
+        .map(|(_, words)| words.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for words in ["⌘⇧C copies the diagnostic report", CPU_POLICY_KEY] {
+        assert!(drawn.contains(words), "CONTROL: {words}: {drawn}");
+        assert!(said.contains(words), "CONTROL: {words}: {said}");
     }
 }

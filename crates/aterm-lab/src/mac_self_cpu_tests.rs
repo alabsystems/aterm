@@ -54,3 +54,58 @@ fn driver_requires_an_explicit_record_and_unambiguous_options() {
     assert_eq!(ask.image, "isolated");
     assert_eq!(ask.record, Path::new("/tmp/.ubd/self-cpu-test.noindex"));
 }
+
+#[test]
+fn qualification_publication_requires_checked_vm_retirement() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let report = json!({"complete":true,"qualification":true,
+        "checked_bound":{"retained_metric":"original"},"fixture_sha256":"exact-fixture"});
+    let unavailable = finish_qualification(scratch.path(), Ok((0, report.clone())), || {
+        assert!(!scratch.path().join("result.json").exists());
+        Err(mac::not_run("checked retirement was unavailable"))
+    });
+    assert_eq!(unavailable.unwrap_err().code, mac::NOT_RUN);
+    assert!(!scratch.path().join("result.json").exists());
+    let observed: Value = aterm_json::from_slice(
+        &std::fs::read(scratch.path().join("fixture-observation.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(observed["complete"].as_bool(), Some(false));
+    assert_eq!(observed["vm_retirement_confirmed"].as_bool(), Some(false));
+    assert_eq!(
+        aterm_json::to_vec(&observed["guest_result"]).unwrap(),
+        aterm_json::to_vec(&report).unwrap()
+    );
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let finished = std::cell::Cell::new(false);
+    assert_eq!(
+        finish_qualification(scratch.path(), Ok((0, report.clone())), || {
+            assert!(!scratch.path().join("result.json").exists());
+            finished.set(true);
+            Ok(())
+        })
+        .unwrap(),
+        0
+    );
+    assert!(finished.get());
+    let saved: Value =
+        aterm_json::from_slice(&std::fs::read(scratch.path().join("result.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        aterm_json::to_vec(&saved).unwrap(),
+        aterm_json::to_vec(&report).unwrap()
+    );
+}
+
+#[test]
+fn failed_qualification_survives_unavailable_retirement_without_publication() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let failed = finish_qualification(
+        scratch.path(),
+        Ok((1, json!({"complete":true,"qualification":false}))),
+        || Err(mac::not_run("checked retirement was unavailable")),
+    );
+    assert_eq!(failed.unwrap_err().code, 1);
+    assert!(!scratch.path().join("result.json").exists());
+}

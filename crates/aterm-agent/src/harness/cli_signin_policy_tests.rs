@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
-#![cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "some helpers serve only the tests gated `cfg(unix)`"
-    )
-)]
+// The tests gated `cfg(unix)` here reach what aterm has only on Unix: a file mode, a symbolic
+// link, a signal, a `/bin/sh` stand-in, or a part built only there (native credential custody,
+// native fleet renewal, the vault-token, Google and agy sign-ins, the Kimi pool's overlay
+// staging home, aterm's own browser window, the test sleep seam).
 
 use super::*;
 use crate::ai::connector::{Flow, Region};
@@ -603,7 +598,6 @@ pub(crate) fn policy_transition(
     next
 }
 
-#[cfg(unix)]
 #[test]
 fn vendor_login_and_renewal_policy_conform_with_independent_edits_allowed() {
     let model = aterm_models_harness::account_signin_policy_model();
@@ -790,7 +784,6 @@ fn run_observation(world: &World, host: &ObservationHost<'_>) -> bool {
     matches!(result, Renewal::WrongAccount | Renewal::NeedsPerson)
 }
 
-#[cfg(unix)]
 #[test]
 fn failed_login_observations_never_publish_without_their_history() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
@@ -1126,7 +1119,6 @@ fn signin_observations_conform_to_durable_publication() {
     assert!(!model.check_invariant("RefusalOrPendingFence", &admitted));
 }
 
-#[cfg(unix)]
 #[test]
 fn secondary_codex_identity_observations_recover_without_another_login() {
     for operation in [6, 7] {

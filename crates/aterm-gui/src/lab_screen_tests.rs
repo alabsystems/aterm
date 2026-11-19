@@ -208,6 +208,7 @@ fn own_claim_blockers_reach_lab_as_typed_retained_evidence() {
         left: None,
         default_home: true,
         route: aterm_agent::harness::accounts::AuthRoute::Stored,
+        model: aterm_agent::harness::accounts::ModelWeek::Unread,
     };
     let unrecorded = State {
         machine: "0a0b".into(),

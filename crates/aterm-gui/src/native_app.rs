@@ -52,10 +52,17 @@ pub(crate) enum AppKind {
     Recovery,
     Workers,
     Tables,
+    Registry,
     Navigator,
+    SystemResources,
 }
 
 impl AppKind {
+    /// Built-in tool views reached from the window organizer.
+    pub(crate) const fn is_organizer_window(self) -> bool {
+        !matches!(self, Self::Editor | Self::Markdown | Self::Recovery)
+    }
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Allocation => "allocation",
@@ -68,7 +75,9 @@ impl AppKind {
             Self::Recovery => "recovery",
             Self::Workers => "workers",
             Self::Tables => "tables",
+            Self::Registry => "registry",
             Self::Navigator => "navigator",
+            Self::SystemResources => "system-resources",
         }
     }
 
@@ -85,7 +94,9 @@ impl AppKind {
             Self::Recovery => "Recovery",
             Self::Workers => "Workers",
             Self::Tables => "Tables",
+            Self::Registry => "aRegistry",
             Self::Navigator => "Navigator",
+            Self::SystemResources => crate::native_resources::RESOURCES_TITLE,
         }
     }
 
@@ -102,7 +113,29 @@ impl AppKind {
             Self::Recovery => AppIcon::Recovery,
             Self::Workers => AppIcon::Workers,
             Self::Tables => AppIcon::Tables,
+            Self::Registry => AppIcon::Registry,
             Self::Navigator => AppIcon::Workers,
+            Self::SystemResources => AppIcon::SystemResources,
+        }
+    }
+
+    /// Whether a view of this kind is left out of the restore manifest, and so out of Reopen
+    /// Closed Tab: the page holds nothing of its own that a relaunch could bring back, and the
+    /// menu item reopens it.
+    pub(crate) const fn left_out_of_restore(self) -> bool {
+        match self {
+            Self::Navigator | Self::SystemResources => true,
+            Self::Allocation
+            | Self::Mail
+            | Self::About
+            | Self::Settings
+            | Self::SystemState
+            | Self::Markdown
+            | Self::Editor
+            | Self::Recovery
+            | Self::Workers
+            | Self::Registry
+            | Self::Tables => false,
         }
     }
 }
@@ -192,8 +225,10 @@ pub(crate) enum AppViewState {
     Editor(Box<EditorViewState>),
     Recovery(RecoveryViewState),
     Workers(Box<crate::native_workers::WorkersViewState>),
+    Registry(Box<crate::native_registry::RegistryViewState>),
     Tables(Box<crate::native_tables::TablesViewState>),
     Navigator(Box<crate::navigator::NavigatorViewState>),
+    SystemResources(Box<crate::native_resources::ResourcesViewState>),
 }
 
 impl AppViewState {
@@ -207,8 +242,10 @@ impl AppViewState {
             Self::Editor(_) => AppKind::Editor,
             Self::Recovery(_) => AppKind::Recovery,
             Self::Workers(_) => AppKind::Workers,
+            Self::Registry(_) => AppKind::Registry,
             Self::Tables(_) => AppKind::Tables,
             Self::Navigator(_) => AppKind::Navigator,
+            Self::SystemResources(_) => AppKind::SystemResources,
         }
     }
 
@@ -228,8 +265,10 @@ impl AppViewState {
             Self::Editor(view) => &view.common,
             Self::Recovery(view) => &view.common,
             Self::Workers(view) => &view.common,
+            Self::Registry(view) => &view.common,
             Self::Tables(view) => &view.common,
             Self::Navigator(view) => &view.common,
+            Self::SystemResources(view) => &view.common,
         }
     }
 
@@ -250,8 +289,10 @@ impl AppViewState {
             Self::Editor(view) => &mut view.common,
             Self::Recovery(view) => &mut view.common,
             Self::Workers(view) => &mut view.common,
+            Self::Registry(view) => &mut view.common,
             Self::Tables(view) => &mut view.common,
             Self::Navigator(view) => &mut view.common,
+            Self::SystemResources(view) => &mut view.common,
         }
     }
 }
@@ -613,8 +654,10 @@ pub(crate) enum NativeApp {
     Editor(Box<EditorApp>),
     Recovery(RecoveryApp),
     Workers(Box<crate::native_workers::WorkersApp>),
+    Registry(Box<crate::native_registry::RegistryApp>),
     Tables(Box<crate::native_tables::TablesApp>),
     Navigator(Box<crate::navigator::NavigatorApp>),
+    SystemResources(Box<crate::native_resources::ResourcesApp>),
 }
 
 type UpdateCallback = for<'a> fn(
@@ -653,8 +696,10 @@ impl NativeApp {
             Self::Editor(_) => &editor_vtable::VTABLE,
             Self::Recovery(_) => &recovery_vtable::VTABLE,
             Self::Workers(_) => &workers_vtable::VTABLE,
+            Self::Registry(_) => &registry_vtable::VTABLE,
             Self::Tables(_) => &tables_vtable::VTABLE,
             Self::Navigator(_) => &navigator_vtable::VTABLE,
+            Self::SystemResources(_) => &system_resources_vtable::VTABLE,
         }
     }
 
@@ -668,8 +713,10 @@ impl NativeApp {
             Self::Editor(app) => Some(app.document),
             Self::Recovery(_)
             | Self::Workers(_)
+            | Self::Registry(_)
             | Self::Tables(_)
             | Self::Navigator(_)
+            | Self::SystemResources(_)
             | Self::Allocation(_) => None,
         }
     }
@@ -866,6 +913,13 @@ define_app_vtable!(
     AppKind::Workers,
     "workers"
 );
+define_app_vtable!(
+    registry_vtable,
+    Registry,
+    Registry,
+    AppKind::Registry,
+    "registry"
+);
 define_app_vtable!(tables_vtable, Tables, Tables, AppKind::Tables, "tables");
 define_app_vtable!(
     navigator_vtable,
@@ -873,6 +927,13 @@ define_app_vtable!(
     Navigator,
     AppKind::Navigator,
     "navigator"
+);
+define_app_vtable!(
+    system_resources_vtable,
+    SystemResources,
+    SystemResources,
+    AppKind::SystemResources,
+    "system-resources"
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1876,6 +1937,36 @@ pub(crate) enum TextInputEvent {
     Cancel,
 }
 
+impl TextInputEvent {
+    /// Apply a native field edit. A form handles submission and dismissal itself.
+    pub(crate) fn edit(self, input: &mut crate::native_text_input::TextInputState) {
+        match self {
+            TextInputEvent::Preedit { text, selection } => input.set_preedit(text, selection),
+            TextInputEvent::Commit(text) => input.commit_preedit(&text),
+            TextInputEvent::Backspace => input.delete_backward(),
+            TextInputEvent::Delete => input.delete_forward(),
+            TextInputEvent::Left { extend } => input.move_left(extend),
+            TextInputEvent::Right { extend } => input.move_right(extend),
+            TextInputEvent::Home { extend } => input.move_to_start(extend),
+            TextInputEvent::End { extend } => input.move_to_end(extend),
+            TextInputEvent::WordLeft { extend } => input.move_word_left(extend),
+            TextInputEvent::WordRight { extend } => input.move_word_right(extend),
+            TextInputEvent::KillToEnd => input.kill_to_end(),
+            TextInputEvent::KillToStart => input.kill_to_start(),
+            TextInputEvent::DeleteWordBackward => input.delete_word_backward(),
+            TextInputEvent::DeleteWordForward => input.delete_word_forward(),
+            TextInputEvent::SelectAll => input.select_all(),
+            TextInputEvent::Undo => {
+                input.undo();
+            }
+            TextInputEvent::Redo => {
+                input.redo();
+            }
+            TextInputEvent::Submit | TextInputEvent::Cancel => input.cancel_preedit(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ActionInvocation {
     pub(crate) id: ActionId,
@@ -2134,6 +2225,16 @@ pub(crate) enum MachineRequest {
     Undo { rev: u64 },
 }
 
+/// The System Resources page's CPU policy buttons (`AppEffect::CpuPolicy`), each a person's own
+/// press (`app_control`'s `PERSON_ONLY_PREFIXES`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CpuPolicyPress {
+    /// Collect CPU Policy: one read-only collection, by password, bound to the pressing view.
+    Collect,
+    /// Cancel: end the pending collection, whatever started it, and its password sheet.
+    Cancel,
+}
+
 /// Settings ▸ Harness's TIMER press (`AppEffect::HarnessTimer`): session `session`'s timed Cruise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessTimerRequest {
@@ -2330,6 +2431,8 @@ pub(crate) enum AppEffect {
         request: RecoveryRequest,
         reply: ReplyToken<RecoveryOutcome>,
     },
+    /// Focus a fleet machine in the requesting window’s Tables inspector.
+    OpenRegistryMachineInTables(String),
     /// Request the host's already-granted canonical document in the native editor.
     OpenDocumentEditor {
         document: DocumentId,
@@ -2349,11 +2452,24 @@ pub(crate) enum AppEffect {
     },
     /// A Settings ▸ Harness request ([`HarnessRequest`]), performed by the host and answered by the republished projection.
     Harness(HarnessRequest),
+    /// Close eligible idle terminal tabs in this instance's windows and report the result to Tab Control.
+    CleanUpIdleTabs,
     /// Settings ▸ Harness's timer press ([`HarnessTimerRequest`]): performed by the host, answered by the republished projection.
     HarnessTimer(HarnessTimerRequest),
     /// A Settings ▸ This Mac request ([`MachineRequest`]): performed on the window's name writer,
     /// answered by the republished projection.
     Machine(MachineRequest),
+    /// A person's press of the System Resources page's CPU policy buttons ([`CpuPolicyPress`]):
+    /// the host binds the operation to the pressing view, answered by the republished page.
+    CpuPolicy(CpuPolicyPress),
+    /// A person's Apply… of the System Resources page's macOS configuration section
+    /// ([`crate::resources_macos::Act`]): the host runs it for the pressing view, answered by the
+    /// republished page.
+    MacosConfiguration(crate::resources_macos::Act),
+    /// A person's press of one of the System Resources page's Spotlight document buttons: the
+    /// host runs its root step for the pressing view (a keep-out's folder chosen in the open
+    /// panel first), answered by the republished page.
+    SpotlightControl(aterm_types::macos_setup::root_only::Step),
     /// Settings' theme picker asks the host for a [`ThemesRequest`]: a theme by catalog id, never a path (the `OpenConfigEditor` rule).
     Themes {
         request: ThemesRequest,
@@ -2589,6 +2705,11 @@ impl UpdateCx<'_> {
         operation
     }
 
+    pub(crate) fn open_registry_machine_in_tables(&mut self, key: String) {
+        self.effects
+            .push(AppEffect::OpenRegistryMachineInTables(key));
+    }
+
     pub(crate) fn open_document_editor(&mut self, document: DocumentId) {
         self.effects
             .push(AppEffect::OpenDocumentEditor { document });
@@ -2614,6 +2735,10 @@ impl UpdateCx<'_> {
         self.effects.push(AppEffect::Harness(request));
     }
 
+    pub(crate) fn clean_up_idle_tabs(&mut self) {
+        self.effects.push(AppEffect::CleanUpIdleTabs);
+    }
+
     /// Ask the host for a Settings ▸ This Mac read or write ([`AppEffect::Machine`]). One read
     /// per update answers every reason for one in it: the route's own action and the view's
     /// arrival at the route both ask.
@@ -2633,6 +2758,24 @@ impl UpdateCx<'_> {
     /// Ask the host for a session's timed Cruise or its cancel ([`AppEffect::HarnessTimer`]).
     pub(crate) fn harness_timer(&mut self, request: HarnessTimerRequest) {
         self.effects.push(AppEffect::HarnessTimer(request));
+    }
+
+    /// Ask the host to collect CPU policy for this view, or cancel its collection
+    /// ([`AppEffect::CpuPolicy`]).
+    pub(crate) fn cpu_policy(&mut self, press: CpuPolicyPress) {
+        self.effects.push(AppEffect::CpuPolicy(press));
+    }
+
+    /// Ask the host to apply a macOS configuration row for this view
+    /// ([`AppEffect::MacosConfiguration`]).
+    pub(crate) fn macos_configuration(&mut self, act: crate::resources_macos::Act) {
+        self.effects.push(AppEffect::MacosConfiguration(act));
+    }
+
+    /// Ask the host to run a Spotlight document button's step for this view
+    /// ([`AppEffect::SpotlightControl`]).
+    pub(crate) fn spotlight_control(&mut self, step: aterm_types::macos_setup::root_only::Step) {
+        self.effects.push(AppEffect::SpotlightControl(step));
     }
 
     pub(crate) fn open_log_folder(&mut self) -> OperationId {
@@ -2760,6 +2903,9 @@ impl NativeRuntime {
         for mut state in self.views.values_mut() {
             if let AppViewState::Tables(view) = &mut *state {
                 let moved = tables.is_some_and(|tables| {
+                    if changed {
+                        view.settle_opening(tables);
+                    }
                     view.settle_columns(tables)
                         | view.settle_filters(tables)
                         | view.settle_history_keys(tables)
@@ -2773,6 +2919,43 @@ impl NativeRuntime {
             }
         }
         changed || settled
+    }
+
+    pub(crate) fn poll_registry(&mut self) -> bool {
+        let changed = self.instances.values_mut().any(|app| match app {
+            NativeApp::Registry(registry) => registry.poll(),
+            _ => false,
+        });
+        if changed {
+            for mut state in self.views.values_mut() {
+                if let AppViewState::Registry(view) = &mut *state {
+                    view.common.presentation_revision =
+                        view.common.presentation_revision.wrapping_add(1);
+                    state.touch();
+                }
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn show_table_record(
+        &mut self,
+        instance: AppInstanceId,
+        id: ViewId,
+        sheet: &'static str,
+        key: &str,
+    ) -> Result<(), String> {
+        let Some(NativeApp::Tables(tables)) = self.instances.get_mut(&instance) else {
+            return Err("The Tables tab closed".into());
+        };
+        let mut state = self.views.get_mut(&id).ok_or("The Tables view closed")?;
+        let AppViewState::Tables(view) = &mut *state else {
+            return Err("The selected view changed".into());
+        };
+        view.open_record(tables, sheet, key)?;
+        view.common.presentation_revision = view.common.presentation_revision.wrapping_add(1);
+        state.touch();
+        Ok(())
     }
 
     /// The Tables page's model, for a test to read.
@@ -2878,8 +3061,10 @@ impl NativeRuntime {
             | AppViewState::Recovery(_)
             | AppViewState::Allocation(_)
             | AppViewState::Workers(_)
+            | AppViewState::Registry(_)
             | AppViewState::Tables(_)
-            | AppViewState::Navigator(_) => {}
+            | AppViewState::Navigator(_)
+            | AppViewState::SystemResources(_) => {}
         }
         let tables = matches!(state, AppViewState::Tables(_));
         self.views.insert(view, state);
@@ -3192,6 +3377,108 @@ impl NativeRuntime {
         }
     }
 
+    /// Remember whether a System Resources view is on screen. Whether it just came into sight.
+    pub(crate) fn resources_seen(&mut self, instance: AppInstanceId, on: bool) -> bool {
+        let Some(NativeApp::SystemResources(app)) = self.instances.get_mut(&instance) else {
+            return false;
+        };
+        app.seen(on)
+    }
+
+    /// Tell the System Resources page its macOS configuration section's state, and move its
+    /// views' revisions when that changed. Whether it did.
+    pub(crate) fn resources_macos(
+        &mut self,
+        instance: AppInstanceId,
+        page: crate::resources_macos::MacosPage,
+    ) -> bool {
+        let Some(NativeApp::SystemResources(app)) = self.instances.get_mut(&instance) else {
+            return false;
+        };
+        if !app.macos(page) {
+            return false;
+        }
+        for mut state in self.views.values_mut() {
+            if matches!(&*state, AppViewState::SystemResources(_)) {
+                let common = state.common_mut();
+                common.presentation_revision = common.presentation_revision.wrapping_add(1);
+                state.touch();
+            }
+        }
+        true
+    }
+
+    /// Hand the System Resources page its Spotlight document buttons' state, and move its views'
+    /// revisions when that changed. Whether it did.
+    pub(crate) fn resources_spotlight(
+        &mut self,
+        instance: AppInstanceId,
+        page: crate::native_resources::SpotlightPage,
+    ) -> bool {
+        let Some(NativeApp::SystemResources(app)) = self.instances.get_mut(&instance) else {
+            return false;
+        };
+        if !app.spotlight(page) {
+            return false;
+        }
+        for mut state in self.views.values_mut() {
+            if matches!(&*state, AppViewState::SystemResources(_)) {
+                let common = state.common_mut();
+                common.presentation_revision = common.presentation_revision.wrapping_add(1);
+                state.touch();
+            }
+        }
+        true
+    }
+
+    /// Tell the System Resources page whether a CPU policy collection is pending, and move its
+    /// views' revisions when that changed. Whether it did.
+    pub(crate) fn resources_policy(&mut self, instance: AppInstanceId, pending: bool) -> bool {
+        let Some(NativeApp::SystemResources(app)) = self.instances.get_mut(&instance) else {
+            return false;
+        };
+        if !app.policy(pending) {
+            return false;
+        }
+        for mut state in self.views.values_mut() {
+            if matches!(&*state, AppViewState::SystemResources(_)) {
+                let common = state.common_mut();
+                common.presentation_revision = common.presentation_revision.wrapping_add(1);
+                state.touch();
+            }
+        }
+        true
+    }
+
+    /// Hand the System Resources page a reading and the Spotlight scope as last probed
+    /// ([`crate::app_resources`]), let each of its views' scopes take the reading
+    /// ([`crate::native_resources::ResourcesViewState::follow_reading`]) and move their content
+    /// revisions. Whether either is another one than the page held.
+    pub(crate) fn publish_resources(
+        &mut self,
+        instance: AppInstanceId,
+        snap: Arc<aterm_vitals::Snapshot>,
+        scope: Option<(Arc<crate::resources_spotlight::ScopeReading>, u64)>,
+    ) -> bool {
+        let Some(NativeApp::SystemResources(app)) = self.instances.get_mut(&instance) else {
+            return false;
+        };
+        let reading = Arc::clone(&snap);
+        if !app.publish(snap, scope) {
+            return false;
+        }
+        for mut state in self.views.values_mut() {
+            if let AppViewState::SystemResources(view) = &mut *state {
+                // A chosen session that ended returns its view to this Mac at this reading.
+                view.follow_reading(&reading);
+                let common = state.common_mut();
+                common.presentation_revision = common.presentation_revision.wrapping_add(1);
+                state.touch();
+            }
+        }
+        true
+    }
+
     /// Give one window's Workers page the rows as they stand ([`crate::app_workers`]). Whether
     /// anything it shows moved.
     pub(crate) fn publish_workers(
@@ -3253,6 +3540,25 @@ impl NativeRuntime {
                 state.touch();
             }
         }
+    }
+
+    pub(crate) fn publish_panel_resources(
+        &mut self,
+        instance: AppInstanceId,
+        resources: crate::navigator::resources::Panel,
+        at_ns: u64,
+    ) -> bool {
+        let Some(NativeApp::Navigator(app)) = self.instances.get_mut(&instance) else {
+            return false;
+        };
+        let changed = app.resources != resources
+            || (app.resources_at_ns != at_ns
+                && resources.values().any(|row| {
+                    row.cpu_read.is_some() || row.process_read.is_some() || row.token_read.is_some()
+                }));
+        app.resources = resources;
+        app.resources_at_ns = at_ns;
+        changed
     }
 
     /// The time the navigator words its rows' ages against.
@@ -3341,8 +3647,10 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
+            | NativeApp::Registry(_)
             | NativeApp::Tables(_)
-            | NativeApp::Navigator(_) => None,
+            | NativeApp::Navigator(_)
+            | NativeApp::SystemResources(_) => None,
         }) else {
             return false;
         };
@@ -3376,8 +3684,10 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
+            | NativeApp::Registry(_)
             | NativeApp::Tables(_)
-            | NativeApp::Navigator(_) => None,
+            | NativeApp::Navigator(_)
+            | NativeApp::SystemResources(_) => None,
         }) else {
             return false;
         };
@@ -3401,8 +3711,10 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
+            | NativeApp::Registry(_)
             | NativeApp::Tables(_)
-            | NativeApp::Navigator(_) => None,
+            | NativeApp::Navigator(_)
+            | NativeApp::SystemResources(_) => None,
         }) else {
             return false;
         };
@@ -3426,8 +3738,10 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
+            | NativeApp::Registry(_)
             | NativeApp::Tables(_)
-            | NativeApp::Navigator(_) => None,
+            | NativeApp::Navigator(_)
+            | NativeApp::SystemResources(_) => None,
         }) else {
             return false;
         };
@@ -3691,8 +4005,10 @@ impl NativeRuntime {
                 | AppViewState::Recovery(_)
                 | AppViewState::Allocation(_)
                 | AppViewState::Workers(_)
+                | AppViewState::Registry(_)
                 | AppViewState::Tables(_)
-                | AppViewState::Navigator(_) => {
+                | AppViewState::Navigator(_)
+                | AppViewState::SystemResources(_) => {
                     continue;
                 }
             };
@@ -3716,8 +4032,10 @@ impl NativeRuntime {
                 | AppViewState::Recovery(_)
                 | AppViewState::Allocation(_)
                 | AppViewState::Workers(_)
+                | AppViewState::Registry(_)
                 | AppViewState::Tables(_)
-                | AppViewState::Navigator(_) => {}
+                | AppViewState::Navigator(_)
+                | AppViewState::SystemResources(_) => {}
             }
         }
     }
@@ -3821,8 +4139,10 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
+            | NativeApp::Registry(_)
             | NativeApp::Tables(_)
-            | NativeApp::Navigator(_) => None,
+            | NativeApp::Navigator(_)
+            | NativeApp::SystemResources(_) => None,
         }
     }
 
@@ -3845,8 +4165,10 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
+            | NativeApp::Registry(_)
             | NativeApp::Tables(_)
-            | NativeApp::Navigator(_) => None,
+            | NativeApp::Navigator(_)
+            | NativeApp::SystemResources(_) => None,
         }
     }
 
@@ -3983,8 +4305,10 @@ impl NativeRuntime {
                 | NativeApp::Recovery(_)
                 | NativeApp::Allocation(_)
                 | NativeApp::Workers(_)
+                | NativeApp::Registry(_)
                 | NativeApp::Tables(_)
-                | NativeApp::Navigator(_) => None,
+                | NativeApp::Navigator(_)
+                | NativeApp::SystemResources(_) => None,
             })
             .collect()
     }
@@ -4005,8 +4329,10 @@ impl NativeRuntime {
                 | NativeApp::Recovery(_)
                 | NativeApp::Allocation(_)
                 | NativeApp::Workers(_)
+                | NativeApp::Registry(_)
                 | NativeApp::Tables(_)
-                | NativeApp::Navigator(_) => None,
+                | NativeApp::Navigator(_)
+                | NativeApp::SystemResources(_) => None,
             })
             .collect::<Vec<_>>();
         let mut by_basename = BTreeMap::<String, Vec<(AppInstanceId, String)>>::new();
@@ -4105,6 +4431,7 @@ impl NativeRuntime {
         };
         let changed = match &mut *state {
             AppViewState::Settings(state) => state.cancel_preedit(field),
+            AppViewState::Registry(state) => state.cancel_preedit(field),
             AppViewState::Editor(state) => {
                 let changed = !state.preedit.is_empty() || state.preedit_caret.is_some();
                 state.preedit.clear();
@@ -4168,6 +4495,14 @@ impl NativeRuntime {
             .ok_or(RuntimeError::UnknownView(view))?;
         if matches!(self.views.get(&view), Some(AppViewState::Tables(_))) {
             self.sync_tables_shown();
+        } else if !suspended
+            && matches!(self.views.get(&view), Some(AppViewState::Registry(_)))
+            && let Some(registry) = self.instances.values_mut().find_map(|app| match app {
+                NativeApp::Registry(registry) => Some(registry),
+                _ => None,
+            })
+        {
+            registry.refresh(crate::qos::Role::Background);
         }
         Ok(())
     }
@@ -4269,7 +4604,10 @@ impl NativeRuntime {
         };
         let event = match event {
             AppEvent::ScrollAt { lines, .. }
-                if !matches!(app.kind(), AppKind::Settings | AppKind::Tables) =>
+                if !matches!(
+                    app.kind(),
+                    AppKind::Settings | AppKind::Tables | AppKind::Registry
+                ) =>
             {
                 AppEvent::ScrollLines(lines)
             }

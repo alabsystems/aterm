@@ -69,7 +69,7 @@ use super::{
 };
 use crate::{
     Error, Result,
-    att::{self, Compiled, View, decode, pack},
+    att::{self, Compiled, View, pack},
     catalog::{
         Directory,
         release::{Released, Retired},
@@ -115,7 +115,7 @@ pub(crate) fn carried_origins<'a>(ops: impl IntoIterator<Item = &'a Command>) ->
 
 /// Bind a batch's request identities to what its plan observed. Reapplying identical contents
 /// after a later write is a new reconciliation, not a retry of an earlier receipt.
-fn request_role(role: &str, log: &Log) -> String {
+pub(crate) fn request_role(role: &str, log: &Log) -> String {
     let mut sha = Sha256::new();
     sha.update(b"aterm/alab/roll/request-basis\0");
     for (operation, _) in log.eligible_iter() {
@@ -197,7 +197,7 @@ pub(crate) fn restate(
 /// A register would hold more candidates than a carried value lists, a key breaks a rule, or a
 /// sealed token does not open, sits in a column that is neither `SecretRef` nor `Phone`, or opens
 /// to a value its column cannot hold. Each names coordinates, never a value.
-fn restate_with_claims(
+pub(crate) fn restate_with_claims(
     (from, table): (&typed::Table, &typed::Table),
     source: &Cells,
     held: &BTreeSet<Digest>,
@@ -653,7 +653,7 @@ pub(crate) fn held_of(log: &Log) -> Vec<Held> {
     held_of_ops(&log.snapshot().operations)
 }
 
-fn held_of_ops(operations: &[crate::documents::log::Operation]) -> Vec<Held> {
+pub(crate) fn held_of_ops(operations: &[crate::documents::log::Operation]) -> Vec<Held> {
     operations
         .iter()
         .map(|op| Held {
@@ -827,7 +827,7 @@ pub(crate) fn within(held: &BTreeMap<String, u64>, covered: &BTreeMap<String, u6
 
 /// The cover row's cells for this Mac (`uuid`) restating generation `from` with `frontier`, or
 /// none where the new generation's row already says it.
-pub(super) fn cover_row(
+pub(crate) fn cover_row(
     target: &Projection,
     from: u32,
     uuid: &str,
@@ -969,7 +969,7 @@ pub(crate) fn covered(
     for region in [directory.primary(), directory.recovery()] {
         match region.observe_store_if_exists(session, scope)? {
             Some(old) => {
-                let log = Log::read_with(session, &old, scope, decode)?;
+                let log = Log::read_with(session, &old, scope, from.decoder())?;
                 for (actor, last) in holdings(&held_of(&log)) {
                     let entry = held.entry(actor).or_default();
                     *entry = (*entry).max(last);
@@ -996,7 +996,7 @@ pub(crate) fn covered(
     let view = View::read(
         to.table,
         session,
-        &Log::read_with(session, &new, next, decode)?,
+        &Log::read_with(session, &new, next, to.decoder())?,
     )?;
     let resolve = owned::commons::historical(session);
     Ok(within(&held, &covers(&view, &resolve, from.generation))
@@ -1058,7 +1058,7 @@ fn judge(
         let Some(store) = directory.observe_store_if_exists(session, scope)? else {
             return Ok(Judged::Unjudged);
         };
-        let log = Log::read_with(session, &store, scope, decode)?;
+        let log = Log::read_with(session, &store, scope, compiled.decoder())?;
         if !log.awaited(session.actor()).is_empty() {
             return Ok(Judged::Unjudged);
         }
@@ -1249,7 +1249,7 @@ impl Registry {
         let old = directory
             .observe_store_if_exists(&session, old_scope)?
             .ok_or_else(|| Error::new("this Mac holds no registry to roll"))?;
-        let old_log = Log::read_with(&session, &old, old_scope, decode)?;
+        let old_log = Log::read_with(&session, &old, old_scope, from.decoder())?;
         if !old_log.awaited(session.actor()).is_empty() {
             return Err(Error::new(
                 "this Mac's history of the registry is incomplete; a roll waits for a complete scan",
@@ -1270,7 +1270,7 @@ impl Registry {
             &session,
             from.table,
             from.generation,
-            Log::read_with(&session, &old, old_scope, decode)?,
+            Log::read_with(&session, &old, old_scope, from.decoder())?,
             &old_view,
         )?;
         let to_descriptor = to.descriptor(trust)?;
@@ -1287,7 +1287,8 @@ impl Registry {
                 let (target, carried, done_archive, rolls, target_claims, target_history, used) =
                     match new {
                         Some(store) => {
-                            let log = Log::read_with(&session, store, to_descriptor.scope, decode)?;
+                            let log =
+                                Log::read_with(&session, store, to_descriptor.scope, to.decoder())?;
                             if !log.awaited(session.actor()).is_empty() {
                                 return Err(Error::new(
                                     "this Mac's history of the new registry generation is incomplete; a \
@@ -1445,7 +1446,7 @@ impl Registry {
         // declared saw no roll, and may have removed an entry the plan carries
         // (`alab::secret::settle_write`): the declared generation stops every later removal, and
         // a roll that read the old generation too early is run again.
-        let reread = Log::read_with(&session, &old, old_scope, decode)?.snapshot();
+        let reread = Log::read_with(&session, &old, old_scope, from.decoder())?.snapshot();
         if reread
             .operations
             .iter()
@@ -1509,12 +1510,16 @@ impl Registry {
             .partition(|row| row.first().is_some_and(|c| c.collection == ROLL.name));
         let mut records = pack(body)?;
         records.extend(pack(cover_rows)?);
-        let mut log = Log::read_with(&session, &store, to_descriptor.scope, decode)?;
+        let mut log = Log::read_with(&session, &store, to_descriptor.scope, to.decoder())?;
         let request_role = request_role(to.table.role, &log);
         let mut appended = BTreeMap::new();
         for changes in records {
             let request = typed::request_id(APPLICATION, &request_role, &changes)?;
-            let command = Command::Write { request, changes };
+            let command = Command::Write {
+                request,
+                changes,
+                said: None,
+            };
             if att::retry_or_appended(&log, session.actor(), &command, &appended)?.is_some() {
                 continue;
             }
@@ -1528,7 +1533,7 @@ impl Registry {
                 .any(|change| change.collection == typed::SCHEMA)
         }) {
             if rolled.records > 0 {
-                log = Log::read_with(&session, &store, to_descriptor.scope, decode)?;
+                log = Log::read_with(&session, &store, to_descriptor.scope, to.decoder())?;
                 appended.clear();
             }
             for changes in pack(att::schema_rows(
@@ -1536,7 +1541,11 @@ impl Registry {
                 &View::read(to.table, &session, &log)?,
             ))? {
                 let request = typed::request_id(APPLICATION, to.table.role, &changes)?;
-                let command = Command::Write { request, changes };
+                let command = Command::Write {
+                    request,
+                    changes,
+                    said: None,
+                };
                 if att::retry_or_appended(&log, session.actor(), &command, &appended)?.is_some() {
                     continue;
                 }

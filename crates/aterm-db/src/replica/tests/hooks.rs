@@ -38,8 +38,8 @@ fn round(
     let report = ours.application().unwrap();
     (
         selected(ours, tables),
-        report.witnesses_asked,
-        report.regular,
+        report.witnesses_asked(),
+        report.regular(),
     )
 }
 
@@ -273,15 +273,19 @@ fn an_audit_takes_the_regular_turn_where_an_ask_keeps_a_follow_up() {
         // The peer answers no ask, as a build from before CR1: the follow-up alone names the
         // table, not the tables whose witnesses differ.
         let endpoints = [
-            endpoint(&lab, &tables, 0).duplex(),
-            endpoint(&lab, &tables, 1).duplex().with_witnesses(false),
+            endpoint(&lab, &tables, 0),
+            endpoint(&lab, &tables, 1).with_witnesses(false),
         ];
         let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
         assert_eq!(
             round(endpoints.each_ref(), &tables, &mut ours, &mut theirs),
             (0, true, true)
         );
-        assert_eq!(held(&lab, &tables, 0, 0), BATCH);
+        assert_eq!(
+            held(&lab, &tables, 0, 0),
+            BATCH + 4,
+            "the round drains the table"
+        );
         assert!(ours.pending(), "a full batch leaves a follow-up");
         hook(&mut ours);
         assert_eq!(
@@ -354,5 +358,59 @@ fn audits_with_one_table_that_always_differs_visit_every_table() {
         ours.audit();
         round(endpoints.each_ref(), &tables, &mut ours, &mut theirs);
         assert!(!ours.cycled(), "a restarted cycle counts from none");
+    }
+}
+
+/// A restart of the scan's cycle ([`PeerRepair::restart_cycle`]) is reported once, by the first
+/// round after it that trades table lists ([`Report::sweep`]), through the endpoint's peer
+/// cache, which keeps a peer's whole state between rounds: a restart of a cycle the scan had
+/// completed reads as discarding it, and the round after reads nothing. A restart whose round
+/// trades no lists (its peer repairs no tables here) leaves it to the next round that does, which
+/// reports it once.
+/// MUTANT (`SWEEP_KEPT`): the report reads the restart without taking it, as a flag kept on the
+/// peer's state would, and the cache brings it back to the round after.
+#[test]
+fn a_restart_that_discards_a_completed_sweep_is_reported_once() {
+    for kept in [false, true] {
+        let lab = Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, 2);
+        // One endpoint each for the pair's life, so the initiator's peer cache keeps its state of
+        // the peer, and the same peer once more with no tables.
+        let endpoints = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
+        let bare = Endpoint::from_bootstrap(&lab.bootstrap(1))
+            .unwrap()
+            .unwrap();
+        let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
+        let swept = |ours: &mut PeerRepair, theirs: &mut PeerRepair| {
+            with_mutant(&SWEEP_KEPT, kept, || {
+                exchange_round(&endpoints[0], &endpoints[1], ours, theirs);
+            });
+            ours.application().unwrap().sweep
+        };
+        let mut before = Vec::new();
+        while !ours.cycled() {
+            before.push(swept(&mut ours, &mut theirs));
+            assert!(before.len() <= 2, "two tables take two turns");
+        }
+        assert_eq!(before, [None, None], "no restart, nothing reported");
+
+        ours.restart_cycle();
+        assert_eq!(swept(&mut ours, &mut theirs), Some(Sweep::Discarded));
+        let after = swept(&mut ours, &mut theirs);
+        if kept {
+            assert_eq!(after, Some(Sweep::Discarded), "MUTANT: reported again");
+            continue;
+        }
+        assert_eq!(after, None, "reported once");
+
+        assert!(ours.cycled(), "the restarted sweep went round again");
+        ours.restart_cycle();
+        exchange_round(&endpoints[0], &bare, &mut ours, &mut PeerRepair::default());
+        assert!(ours.actor().is_some() && ours.application().is_none());
+        assert_eq!(
+            [swept(&mut ours, &mut theirs), swept(&mut ours, &mut theirs)],
+            [Some(Sweep::Discarded), None],
+            "the next round that trades lists reports it, once"
+        );
     }
 }

@@ -5890,10 +5890,7 @@ impl App {
                  not retired it; it is booked exited, so its pane travels as a held pane",
                 PANE_EXITED_BACKSTOP.as_secs()
             );
-            self.store
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .set_state(session, crate::session_store::SessionState::Exited);
+            self.record_session_exited(session);
             self.lane_hold_clocks.hung_up.remove(&session);
         }
     }

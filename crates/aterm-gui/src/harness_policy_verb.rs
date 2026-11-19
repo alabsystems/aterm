@@ -324,7 +324,7 @@ impl crate::App {
     pub(crate) fn announce_harness_policy(&self) {
         let generation = self.harness_policy.generation();
         for pooled in self.pool.iter() {
-            record_policy_move(&pooled.ctx.timeline, generation);
+            record_policy_move(&pooled.ctx, generation);
         }
     }
 }
@@ -332,16 +332,20 @@ impl crate::App {
 /// The timeline kind (and `events` wire word) of the policy cell's move.
 pub(crate) const HARNESS_POLICY_EVENT: &str = "harness-policy";
 
-/// The policy cell's move to `generation`, on one session's timeline: the `harness-policy gen=<n>` row [`crate::App::announce_harness_policy`] writes on every session's (the wire goldens write theirs through it too), and in the same hold the session log's `mark - policy gen=<n>`, on every session as the row is.
-pub(crate) fn record_policy_move(
-    timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
-    generation: u64,
-) {
-    let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+/// The policy cell's move to `generation`, on one session `ctx`: the `harness-policy gen=<n>` row [`crate::App::announce_harness_policy`] writes on every session's timeline (the wire goldens write theirs through it too), and in the same hold (meta, then the timeline) the session log's `mark - policy gen=<n>`, on every session as the row is, and a `policy` record owed to the session's open record stream (HX-15c), which wakes it.
+pub(crate) fn record_policy_move(ctx: &crate::SessionCtx, generation: u64) {
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let owed = meta.owe_stream_policy(crate::metrics::now_us());
+    let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
     let at = tl.slog().now();
     tl.slog_mut().observe_policy(generation, at);
     tl.record(HARNESS_POLICY_EVENT);
     let _ = tl.slog_take_wake();
+    drop(tl);
+    drop(meta);
+    if owed {
+        ctx.watchers.ring_stream();
+    }
 }
 
 #[cfg(test)]

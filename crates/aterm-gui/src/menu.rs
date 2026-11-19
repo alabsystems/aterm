@@ -370,7 +370,7 @@ pub(crate) enum MenuAction {
     ReopenClosedView,
     /// Move Tab to New Window.
     MoveTabToNewWindow,
-    /// Move Tab to Next Window.
+    /// Move Tab to Main Window.
     MoveTabToNextWindow,
     /// Open Session in New Window.
     ViewSessionInNewWindow,
@@ -424,7 +424,7 @@ pub(crate) enum MenuAction {
     DeckSizeFull,
     /// View ▸ Deck Size: Folded.
     DeckSizeFolded,
-    /// View ▸ Show System Resources Here: the front window takes the System Resources band, or
+    /// View ▸ Expand System Resources Here: the front window takes the System Resources band, or
     /// gives it up for the Sill (`App::toggle_window_band`).
     ShowSystemResourcesHere,
     /// View ▸ Stats Lens (⌘I).
@@ -449,11 +449,14 @@ pub(crate) enum MenuAction {
     Messages,
     /// Aterm ▸ System State…: focus or create the System State tab in the front window.
     SystemState,
-    /// Aterm ▸ Registry…: focus or create the Tables tab, the registry's tables, in the front
-    /// window.
+    /// Open the general Tables browser in the front window.
     Tables,
+    /// Open aRegistry for the fleet's machines, AI accounts and identities.
+    Registry,
     /// Open the read-only Allocation pane beside the focused view, or in a tab when space is tight.
     Allocation,
+    /// View ▸ System Resources…: focus or open the System Resources page in the front window.
+    SystemResources,
     /// Open the native email client.
     Mail,
     /// Toggle the command palette overlay (`App::toggle_palette`).
@@ -578,6 +581,7 @@ impl MenuAction {
             MenuAction::NavigatorSplit => 108,
             MenuAction::ToggleNavigator => 109,
             MenuAction::Allocation => 100,
+            MenuAction::SystemResources => 110,
             MenuAction::NextKitty => 57,
             MenuAction::HarnessLog => 60,
             MenuAction::TakeOver => 61,
@@ -614,6 +618,7 @@ impl MenuAction {
             MenuAction::Save => 91,
             MenuAction::SystemState => 92,
             MenuAction::Tables => 105,
+            MenuAction::Registry => 111,
             MenuAction::Mail => 98,
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
@@ -673,6 +678,7 @@ impl MenuAction {
             108 => MenuAction::NavigatorSplit,
             109 => MenuAction::ToggleNavigator,
             100 => MenuAction::Allocation,
+            110 => MenuAction::SystemResources,
             57 => MenuAction::NextKitty,
             60 => MenuAction::HarnessLog,
             61 => MenuAction::TakeOver,
@@ -706,6 +712,7 @@ impl MenuAction {
             91 => MenuAction::Save,
             92 => MenuAction::SystemState,
             105 => MenuAction::Tables,
+            111 => MenuAction::Registry,
             98 => MenuAction::Mail,
             93 => MenuAction::RewindPane,
             94 => MenuAction::ExportPaneHistory,
@@ -726,6 +733,7 @@ pub(crate) fn canonical_invoke_name(name: &str) -> &str {
         "LiftHold" => "HandBack",
         "OpenLedger" | "LedgerForSession" => "HarnessLog",
         "ShowConnectionMap" | "Fleet" | "ShowFleet" => "Overview",
+        "aRegistry" | "aregistry" | "registry" => "Registry",
         other => other,
     }
 }
@@ -1081,7 +1089,7 @@ pub(crate) struct MenuLive {
     pub aos_attached: bool,
     /// The front window's recording carries the person's grant (its checkmark).
     pub aos_unseen: bool,
-    /// The front window carries the System Resources band (Show System Resources Here's
+    /// The front window carries the System Resources band (Expand System Resources Here's
     /// checkmark): the window's bit, kept while the Stats Bars setting is not Deck.
     pub band_here: bool,
 }
@@ -1307,7 +1315,10 @@ impl MenuAction {
             | MenuAction::BrowseThemes
             | MenuAction::Messages
             | MenuAction::ToggleSeriousMode => ConfigWrite,
-            MenuAction::SystemState | MenuAction::Tables | MenuAction::Mail => ConfigWrite,
+            MenuAction::SystemState
+            | MenuAction::Tables
+            | MenuAction::Registry
+            | MenuAction::Mail => ConfigWrite,
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
             }
@@ -1317,6 +1328,7 @@ impl MenuAction {
             | MenuAction::NavigatorSplit
             | MenuAction::ToggleNavigator
             | MenuAction::Allocation
+            | MenuAction::SystemResources
             | MenuAction::HarnessLog
             | MenuAction::ReadThisMac
             | MenuAction::NetworkState
@@ -1393,6 +1405,7 @@ impl MenuAction {
             | MenuAction::DeckSizeFull
             | MenuAction::DeckSizeFolded
             | MenuAction::ShowSystemResourcesHere
+            | MenuAction::SystemResources
             | MenuAction::ToggleStatsLens
             | MenuAction::NetworkState
             | MenuAction::RewindPane
@@ -1438,6 +1451,7 @@ impl MenuAction {
             | MenuAction::Messages
             | MenuAction::SystemState
             | MenuAction::Tables
+            | MenuAction::Registry
             | MenuAction::Allocation
             | MenuAction::Mail
             | MenuAction::OpenPalette
@@ -1500,7 +1514,7 @@ impl MenuAction {
                  spot is gone."
             }
             MenuAction::MoveTabToNewWindow => "Move this tab into a window of its own.",
-            MenuAction::MoveTabToNextWindow => "Move this tab into the next window.",
+            MenuAction::MoveTabToNextWindow => "Return this tab to the main window.",
             MenuAction::ViewSessionInNewWindow => {
                 "Show this session in a second window, the same live grid in both."
             }
@@ -1529,8 +1543,16 @@ impl MenuAction {
             MenuAction::SystemState => {
                 "Open System State: this Mac's setup and secrets vault, and what each step needs."
             }
-            MenuAction::Tables => "Open Tables: the registry's stored tables, to read and edit.",
+            MenuAction::Tables => {
+                "Open Tables to browse stored collections and edit writable rows."
+            }
+            MenuAction::Registry => {
+                "Open aRegistry to see fleet machines, their assigned AI accounts and signed observations."
+            }
             MenuAction::Allocation => "Show this computer's CPU lease and resource observations.",
+            MenuAction::SystemResources => {
+                "Open System Resources: the CPU, GPU, memory, disk, network and processes, live."
+            }
             MenuAction::Mail => "Open Mail: accounts, folders, messages and drafts.",
             MenuAction::HarnessSettings => {
                 "Open Settings at Harness: the coding agent harness and its Autopilot."
@@ -1619,10 +1641,7 @@ impl MenuAction {
                  window that shows System Resources, and as the Sill's light lanes in the others; \
                  saved in aterm.toml."
             }
-            MenuAction::StatsBarsSill => {
-                "Show the Global, aterm and Tab bars as light lanes in every window's bottom \
-                 padding, which takes no terminal row; saved in aterm.toml."
-            }
+            MenuAction::StatsBarsSill => "Show compact resource lanes at the top of every window.",
             MenuAction::StatsBarsOff => "Hide the stats bars; saved in aterm.toml.",
             MenuAction::DeckSizeAuto => {
                 "Show the stats deck Folded, however tall the window is, in each window that \
@@ -1637,13 +1656,7 @@ impl MenuAction {
                  Resources; saved in aterm.toml."
             }
             MenuAction::ShowSystemResourcesHere => {
-                "Show the System Resources band (the stats deck over the Network State band) in \
-                 this window, or take it away: the window keeps its size and its terminals \
-                 re-grid once, except that a window holding Settings grows to its least size \
-                 where the band would leave it under that. A window without it shows the Sill, light lanes in the bottom \
-                 padding: nothing where that padding is under 8 pt, no Tab lane where a large \
-                 window at 1× leaves the padding too thin for it, and no Tab lane or tab meter \
-                 in a one-tab window. Available while Stats Bars is Deck."
+                "Expand or collapse the resource panel at the top of this window. Available while Stats Bars is Deck."
             }
             MenuAction::ToggleStatsLens => {
                 "Open the stats bars' close-up, or close it: arrows move between instruments \
@@ -1688,8 +1701,8 @@ impl MenuAction {
             MenuAction::SystemState | MenuAction::RecordUnseenKeys | MenuAction::RenameMachine => {
                 cfg!(target_os = "macos")
             }
-            // The registry is kept on macOS and Linux (`crate::tables_store`).
-            MenuAction::Tables => cfg!(unix),
+            // Tables are kept on macOS and Linux (`crate::tables_store`).
+            MenuAction::Tables | MenuAction::Registry => cfg!(unix),
             _ => true,
         }
     }
@@ -1736,7 +1749,9 @@ impl MenuAction {
             "Messages" => Some(MenuAction::Messages),
             "SystemState" => Some(MenuAction::SystemState),
             "Tables" => Some(MenuAction::Tables),
+            "Registry" => Some(MenuAction::Registry),
             "Allocation" => Some(MenuAction::Allocation),
+            "SystemResources" => Some(MenuAction::SystemResources),
             "Mail" => Some(MenuAction::Mail),
             "HarnessSettings" => Some(MenuAction::HarnessSettings),
             "RenameSession" => Some(MenuAction::RenameSession),
@@ -1894,8 +1909,14 @@ const APP_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Item {
-        label: "Registry…",
+        label: "Tables…",
         action: MenuAction::Tables,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "aRegistry…",
+        action: MenuAction::Registry,
         key: "",
         mods: MenuMods::None,
     },
@@ -2210,8 +2231,14 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Item {
-        label: "Show System Resources Here",
+        label: "Expand System Resources Here",
         action: MenuAction::ShowSystemResourcesHere,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "System Resources\u{2026}",
+        action: MenuAction::SystemResources,
         key: "",
         mods: MenuMods::None,
     },
@@ -2357,7 +2384,7 @@ const WINDOW_MENU: &[MenuEntry] = &[
         mods: MenuMods::CommandShift,
     },
     Item {
-        label: "Move Tab to Next Window",
+        label: "Move Tab to Main Window",
         action: MenuAction::MoveTabToNextWindow,
         key: "m",
         mods: MenuMods::CommandShift,
@@ -2698,10 +2725,10 @@ fn chrome_lines_for(
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    MenuHandle, choose_local_file, choose_local_image, choose_save_path, confirm, confirm_owner,
-    defer_quit_for_terminate, install, launch_error, open_file_in_workspace, open_help_url,
-    order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
-    update_machine_menu, update_version_menu,
+    MenuHandle, choose_local_file, choose_local_folder, choose_local_image, choose_save_path,
+    confirm, confirm_owner, defer_quit_for_terminate, install, launch_error,
+    open_file_in_workspace, open_help_url, order_front_regardless, reveal_file_in_workspace,
+    show_handoff_target_version, update_machine_menu, update_version_menu,
 };
 
 static PROCESS_HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3409,6 +3436,13 @@ mod macos {
         open_panel(title, prompt, &["public.image"])
     }
 
+    /// The system open panel choosing one folder, no file, and making none: the folder the
+    /// person approved, as the panel gives it (aliases resolved), with nothing of it read here.
+    /// The panel opens where macOS last left it; aterm names no folder to it.
+    pub(crate) fn choose_local_folder(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
+        open_panel_for(title, prompt, &[], true)
+    }
+
     /// A save panel titled `title` offering `name`: the path the person chose, `None` when they cancelled.
     pub(crate) fn choose_save_path(
         title: &str,
@@ -3453,6 +3487,16 @@ mod macos {
     }
 
     fn open_panel(title: &str, prompt: &str, types: &[&str]) -> Option<std::path::PathBuf> {
+        open_panel_for(title, prompt, types, false)
+    }
+
+    /// An open panel choosing one file of `types`, or with `folders` one folder.
+    fn open_panel_for(
+        title: &str,
+        prompt: &str,
+        types: &[&str],
+        folders: bool,
+    ) -> Option<std::path::PathBuf> {
         if super::os_ui_refused(title) {
             return None;
         }
@@ -3476,8 +3520,11 @@ mod macos {
             if panel.is_null() {
                 return None;
             }
-            appkit::send_v_bool(panel, sel!(setCanChooseFiles:), true);
-            appkit::send_v_bool(panel, sel!(setCanChooseDirectories:), false);
+            appkit::send_v_bool(panel, sel!(setCanChooseFiles:), !folders);
+            appkit::send_v_bool(panel, sel!(setCanChooseDirectories:), folders);
+            if folders {
+                appkit::send_v_bool(panel, sel!(setCanCreateDirectories:), false);
+            }
             appkit::send_v_bool(panel, sel!(setAllowsMultipleSelection:), false);
             appkit::send_v_bool(panel, sel!(setResolvesAliases:), true);
             appkit::send_v_id(panel, sel!(setTitle:), title.id());

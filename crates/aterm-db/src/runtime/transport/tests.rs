@@ -226,6 +226,8 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         failure: None,
         doorbell: None,
         moves: Moves::default(),
+        selection: Selection::default(),
+        takes: Takes::default(),
         stand_in: None,
         delivering: None,
         observed: std::collections::BTreeMap::new(),
@@ -718,7 +720,7 @@ fn a_hearing_turn_reads_no_more_than_its_bound_and_leaves_the_rest() {
 /// for both rounds where `right` reads `(true, 1)`).
 #[test]
 fn the_serving_loops_polled_round_is_the_turn_that_hears() {
-    use crate::runtime::{Flow, Status, serve_paced, serve_turn};
+    use crate::runtime::{Flow, LoopKind, Status, serve_paced, serve_turn};
     let start = Instant::now();
     let clock = std::cell::Cell::new(start);
     let mut transport = settled(start);
@@ -726,6 +728,7 @@ fn the_serving_loops_polled_round_is_the_turn_that_hears() {
     let mut read = Vec::new();
     let served: std::result::Result<(), Status> = serve_paced(
         &mut transport,
+        LoopKind::Repair,
         || clock.get(),
         || clock.get() >= start + BEACON,
         |transport, floor, _| {
@@ -847,6 +850,63 @@ fn a_rounds_end_counts_once_by_who_dialled_it() {
     .unwrap();
     dialler.finish(refused, now);
     assert_eq!(since(), [3, 2, 2], "a refused dial is an outbound round");
+}
+
+/// Through real rounds and [`Transport::finish`]: each round this side dialled is counted against
+/// the seat it authenticated (`census::seats`), with what chose it and what its end did to its
+/// endpoint's schedule, and a round that seat dialled in counts as its inbound. A dials B until a
+/// round moves nothing: each dial is the scan's or a follow-up, the first meets B, each round but
+/// the last transferred, and the last rests B's endpoint until its audit.
+///
+/// NEGATIVE CONTROL (2026-11-15, an inverse edit then undone): with the inbound count made only
+/// for a round that had a dial target, B's inbound read 0 (`left: 0, right: 1`).
+#[test]
+fn a_rounds_end_is_counted_against_its_seat() {
+    let lab = Lab::new();
+    let mut a = loopback_mode(None, 0, [71; 32]);
+    let theirs = RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let ours = RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let address = theirs.local_addr().unwrap();
+    let mut now = Instant::now();
+    a.hints
+        .observe(&Hints::new([72; 32]).wire(address.port()), address, now);
+    let (mut dials, mut seat) = (0, None);
+    for _ in 0..3 {
+        let (chosen, repair) = a.hints.next(now).unwrap();
+        assert_eq!(chosen, address);
+        let (dialled, served) = round_at(&lab.endpoints[0], &lab.endpoints[1], &theirs, repair);
+        assert!(served.task.join().unwrap().2);
+        let dialled = ended_at(dialled, now, |repair| seat = repair.authenticated_actor());
+        a.finish(dialled, now);
+        dials += 1;
+        if !a.hints.follow_up_contains(address) {
+            break;
+        }
+        now += Duration::from_millis(500);
+    }
+    let b = seat.expect("B authenticated");
+    let counts = census::seat_here(b).expect("B's seat is counted");
+    assert_eq!(counts["out"], dials);
+    assert_eq!(counts["scan"] + counts["follow-up"], dials, "{counts:?}");
+    assert_eq!(counts["met-again"], 1, "the first dial met B");
+    assert_eq!(
+        (counts["transferred"], counts["rest"]),
+        (dials - 1, 1),
+        "{counts:?}"
+    );
+    assert_eq!(counts["inbound"], 0);
+
+    let (dialled, served) = round_at(
+        &lab.endpoints[1],
+        &lab.endpoints[0],
+        &ours,
+        Repair::default(),
+    );
+    assert!(dialled.task.join().unwrap().2);
+    a.finish(served, now + Duration::from_secs(2));
+    let counts = census::seat_here(b).unwrap();
+    assert_eq!(counts["inbound"], 1, "B dialled in");
+    assert_eq!(counts["out"], dials, "a round dialled in is no dial");
 }
 
 /// A peer whose endpoint here keeps refusing (it came back on another port) dials in and completes
@@ -1624,6 +1684,8 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         failure: None,
         doorbell: None,
         moves: Moves::default(),
+        selection: Selection::default(),
+        takes: Takes::default(),
         stand_in: None,
         delivering: None,
         observed: std::collections::BTreeMap::new(),
@@ -2703,7 +2765,11 @@ fn a_dial_failure_names_a_held_lan_apart_from_an_unreachable_peer() {
     let cause = |error: io::Error| dial_failure(error).repair_cause();
     for why in [
         Unavailable::NotInstalled,
-        Unavailable::Outdated { ours: 1, theirs: 2 },
+        Unavailable::Outdated {
+            ours: 1,
+            theirs: 2,
+            build: "fixture".into(),
+        },
         Unavailable::Refused("fixture".into()),
         Unavailable::Unchecked("fixture".into()),
     ] {
@@ -2928,7 +2994,7 @@ fn a_table_written_here_is_offered_to_a_resting_peer_and_not_back_to_its_source(
             Some(tables[2].0.digest()),
             "the written table"
         );
-        assert!(!report.regular, "led, not the scan's turn");
+        assert!(!report.regular(), "led, not the scan's turn");
         assert_eq!((report.sent, report.caught_up), (1, true));
         assert_eq!(held(&lab, &tables, 2, 1), 1, "the peer holds the record");
 
@@ -3630,6 +3696,525 @@ fn a_round_that_broke_off_names_no_seat_holding_a_write_it_did_not_carry() {
     }
 }
 
+/// A seat whose policy selects again a table it excluded is owed nothing by the Macs that wrote
+/// it, which its lists told it does not take: it owes them a round. Across real rounds over four
+/// tables, Mac 1 excludes the fourth, and Mac 0's own round finds Mac 1 listing three. Mac 0
+/// writes the fourth and passes Mac 1 over for it. Mac 1's exclusion is lifted, with no round:
+/// its look finds its policy selecting more, and its walk dials Mac 0, nothing moved at Mac 1.
+/// That round's lists reach Mac 0, and the record reaches Mac 1 before any audit.
+/// MUTANT (`crate::runtime::moved::WIDENED_UNTOLD`): the look tells nothing, and Mac 1 has no
+/// dial due; the record would wait for the pair's next audit.
+#[test]
+fn a_seat_whose_policy_selects_a_table_again_dials_the_peer_that_wrote_it() {
+    use crate::runtime::moved::WIDENED_UNTOLD;
+    for mutant in [false, true] {
+        let late = 3;
+        let mut pair = Pair::swept(4, 4);
+        pair.rest_mac1();
+        let digest = pair.tables[late].0.digest();
+        let full = pair.full.clone();
+        let excluding = Arc::new(crate::replica::tests::witness::endpoint(
+            &pair.lab,
+            &pair.tables[..late],
+            1,
+        ));
+        let excluded = format!(
+            "[commons]\nexclude_tables = [\"{}\"]\n",
+            aterm_codec::hex::encode_lower(&digest)
+        );
+        aterm_secrets::fsx::write_atomic(&pair.config(1), excluded.as_bytes(), 0o600).unwrap();
+        pair.macs[1].look_soon();
+        pair.macs[1].tick(pair.now).unwrap();
+        assert!(!pair.dial_due(1), "an exclusion owes nothing");
+        let report = pair.round_with(0, &full[0], &excluding, Repair::default(), |_| {});
+        assert!(report.control.is_ok(), "{report:?}");
+        pair.now += crate::runtime::discovery::WALK_GAP;
+
+        pair.write(late, 0);
+        pair.macs[0].look_soon();
+        pair.macs[0].tick(pair.now).unwrap();
+        assert_eq!(
+            pair.macs[0].hints.hot_count(),
+            1,
+            "CONTROL: the look found the write"
+        );
+        assert!(!pair.dial_due(0), "CONTROL: Mac 0 passes Mac 1 over for it");
+
+        aterm_secrets::fsx::write_atomic(&pair.config(1), b"[commons]\n", 0o600).unwrap();
+        WIDENED_UNTOLD.with(|flag| flag.set(mutant));
+        pair.macs[1].look_soon();
+        pair.macs[1].tick(pair.now).unwrap();
+        WIDENED_UNTOLD.with(|flag| flag.set(false));
+        if mutant {
+            assert!(!pair.dial_due(1), "MUTANT: Mac 1 has no dial due");
+            continue;
+        }
+        assert!(pair.dial_due(1), "Mac 1 owes Mac 0 a round");
+        pair.relists_and_takes(late);
+    }
+}
+
+/// A seat whose own round listed short (its selection fell back to the recovery region, so it
+/// left a table out) owes the peer a round once its lists are whole. Across real rounds over four
+/// tables, Mac 0's round finds Mac 1 listing three, and Mac 1's side of the round says it listed
+/// short. Mac 0 writes the fourth and passes Mac 1 over for it. Mac 1's walk dials Mac 0 at the
+/// first rung of its owed rounds (5 s and its jitter), nothing moved at Mac 1, its lists whole;
+/// they reach Mac 0, and the record reaches Mac 1 before any audit.
+/// MUTANT (`crate::runtime::discovery::SHORT_UNOWED`): the short list owes nothing, and Mac 1
+/// dials nothing within ten seconds.
+#[test]
+fn a_seat_whose_round_listed_short_dials_the_peer_once_its_list_is_whole() {
+    use crate::runtime::discovery::{BACKOFF_FIRST, SHORT_UNOWED};
+    for mutant in [false, true] {
+        let late = 3;
+        let mut pair = Pair::swept(4, 4);
+        pair.rest_mac1();
+        let full = pair.full.clone();
+        let short = Arc::new(crate::replica::tests::witness::endpoint(
+            &pair.lab,
+            &pair.tables[..late],
+            1,
+        ));
+        SHORT_UNOWED.with(|flag| flag.set(mutant));
+        let report = pair.round_with(0, &full[0], &short, Repair::default(), |served| {
+            let mut report = served.application().expect("Mac 1's table report");
+            report.primary_unread = true;
+            *served = std::mem::take(served).applied(report);
+        });
+        SHORT_UNOWED.with(|flag| flag.set(false));
+        assert!(report.control.is_ok(), "{report:?}");
+        let short_at = pair.now;
+        pair.now += crate::runtime::discovery::WALK_GAP;
+
+        pair.write(late, 0);
+        pair.macs[0].look_soon();
+        pair.macs[0].tick(pair.now).unwrap();
+        assert_eq!(
+            pair.macs[0].hints.hot_count(),
+            1,
+            "CONTROL: the look found the write"
+        );
+        assert!(!pair.dial_due(0), "CONTROL: Mac 0 passes Mac 1 over for it");
+        assert!(!pair.dial_due(1), "the first rung is not yet");
+
+        let due = pair.macs[1].hints.next_dial_at(pair.now, true).unwrap();
+        if mutant {
+            assert!(
+                due > short_at + Duration::from_secs(10),
+                "MUTANT: nothing within ten seconds: {:?}",
+                due - short_at
+            );
+            continue;
+        }
+        assert!(
+            due >= short_at + BACKOFF_FIRST
+                && due < short_at + BACKOFF_FIRST + Duration::from_secs(2),
+            "the first rung: {:?}",
+            due - short_at
+        );
+        pair.now = due;
+        pair.relists_and_takes(late);
+    }
+}
+
+/// Wait for `transport`'s read of its selection in flight to end, so its next turn takes it.
+fn selection_read_ends(transport: &Transport) {
+    let (task, ended) = transport
+        .selection
+        .check
+        .as_ref()
+        .expect("a read of the selection is in flight");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the selection read's end",
+        || (ended.load(Ordering::Acquire) || task.is_finished()).then_some(()),
+    );
+}
+
+/// A seat whose run of short lists spent its owed rounds reads its own selection, and owes the
+/// peer a round once that reads whole. Across real rounds over four tables: Mac 0's round finds
+/// Mac 1 listing three, and Mac 1's side says it listed short. Mac 0 writes the fourth and
+/// passes Mac 1 over for it. Each round Mac 1 then dials lists short again, until none is owed
+/// and its run is spent. From then Mac 1's turns read its selection: one read at a time, the
+/// next [`SELECTION_GAP`] after the last ended, and while it reads short nothing is owed. Once
+/// it reads whole, with no round between and nothing moved at Mac 1, the turn that takes the
+/// read owes Mac 0 a round: Mac 1's walk dials it, its lists whole; they reach Mac 0, and the
+/// record reaches Mac 1 before any audit. No read begins after that.
+/// MUTANT (`crate::runtime::discovery::WHOLE_UNTOLD`): the whole selection owes nothing, and
+/// Mac 1 has no dial due; the record would wait for the pair's next audit.
+#[test]
+fn a_seat_whose_owed_rounds_are_spent_dials_the_peer_once_its_selection_reads_whole() {
+    use crate::runtime::discovery::{WALK_GAP, WHOLE_UNTOLD};
+    use std::sync::atomic::AtomicUsize;
+    for mutant in [false, true] {
+        let late = 3;
+        let mut pair = Pair::swept(4, 4);
+        pair.rest_mac1();
+        let full = pair.full.clone();
+        let short = Arc::new(crate::replica::tests::witness::endpoint(
+            &pair.lab,
+            &pair.tables[..late],
+            1,
+        ));
+        let seat = pair.lab.bootstrap(0).request().unwrap().binding().actor();
+        // Mac 1's selection as its reads find it: short until the test says it is whole.
+        let (whole, reads) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        pair.macs[1].selection.read = Some(Arc::new({
+            let (whole, reads) = (whole.clone(), reads.clone());
+            move || {
+                reads.fetch_add(1, Ordering::AcqRel);
+                Some(!whole.load(Ordering::Acquire))
+            }
+        }));
+        let listed_short = |round: &mut Repair| {
+            let mut report = round.application().expect("Mac 1's table report");
+            report.primary_unread = true;
+            *round = std::mem::take(round).applied(report);
+        };
+        let report = pair.round_with(0, &full[0], &short, Repair::default(), listed_short);
+        assert!(report.control.is_ok(), "{report:?}");
+        pair.now += WALK_GAP;
+        pair.write(late, 0);
+        pair.macs[0].look_soon();
+        pair.macs[0].tick(pair.now).unwrap();
+        assert_eq!(
+            pair.macs[0].hints.hot_count(),
+            1,
+            "CONTROL: the look found the write"
+        );
+        assert!(!pair.dial_due(0), "CONTROL: Mac 0 passes Mac 1 over for it");
+
+        // Every round Mac 1 dials lists short again, until its run is spent.
+        let mut rounds = 0;
+        while pair.macs[1].hints.owes(seat) {
+            rounds += 1;
+            assert!(rounds <= 16, "the owed rounds end");
+            pair.macs[1].tick(pair.now).unwrap();
+            assert_eq!(
+                reads.load(Ordering::Acquire),
+                0,
+                "no read while a round is owed"
+            );
+            pair.hear(1);
+            pair.now = pair.macs[1].hints.next_dial_at(pair.now, true).unwrap();
+            let (address, repair) = pair.macs[1].hints.next(pair.now).expect("Mac 1's dial");
+            assert_eq!(address, pair.peers[1]);
+            let (dialled, served) = round_at(&short, &full[0], &pair.listeners[0], repair);
+            let served = ended_at(served, pair.now, |_| {});
+            let dialled = ended_at(dialled, pair.now, listed_short);
+            pair.macs[0].finish(served, pair.now);
+            pair.macs[1].finish(dialled, pair.now);
+            pair.macs[0].reports().for_each(drop);
+            let report = pair.macs[1].reports().last().unwrap();
+            assert!(report.control.is_ok(), "{report:?}");
+        }
+        assert!(pair.macs[1].hints.spent(pair.now), "Mac 1's run is spent");
+        assert_eq!(
+            crate::replica::tests::witness::held(&pair.lab, &pair.tables, late, 1),
+            0,
+            "CONTROL: no round brought Mac 1 the record"
+        );
+
+        // Its selection still reads short: one read, which owes nothing, and the next no sooner
+        // than the gap after it ended.
+        pair.now += WALK_GAP;
+        pair.hear(1);
+        pair.macs[1].tick(pair.now).unwrap();
+        selection_read_ends(&pair.macs[1]);
+        pair.macs[1].tick(pair.now).unwrap();
+        assert_eq!(reads.load(Ordering::Acquire), 1);
+        assert!(
+            !pair.macs[1].hints.owes(seat),
+            "a short selection owes nothing"
+        );
+        pair.macs[1]
+            .tick(pair.now + SELECTION_GAP - Duration::from_millis(1))
+            .unwrap();
+        assert!(
+            pair.macs[1].selection.check.is_none() && reads.load(Ordering::Acquire) == 1,
+            "no read inside the gap"
+        );
+
+        // It reads whole, with no round between and nothing moved at Mac 1.
+        whole.store(true, Ordering::Release);
+        pair.now += SELECTION_GAP;
+        pair.hear(1);
+        pair.macs[1].tick(pair.now).unwrap();
+        selection_read_ends(&pair.macs[1]);
+        WHOLE_UNTOLD.with(|flag| flag.set(mutant));
+        pair.macs[1].tick(pair.now).unwrap();
+        WHOLE_UNTOLD.with(|flag| flag.set(false));
+        assert_eq!(reads.load(Ordering::Acquire), 2);
+        if mutant {
+            assert!(!pair.dial_due(1), "MUTANT: Mac 1 has no dial due");
+            continue;
+        }
+        assert!(pair.dial_due(1), "Mac 1 owes Mac 0 a round");
+        pair.relists_and_takes(late);
+        // The run is over: no read begins, however long after.
+        pair.now += SELECTION_GAP * 2;
+        pair.macs[1].tick(pair.now).unwrap();
+        assert!(
+            pair.macs[1].selection.check.is_none() && reads.load(Ordering::Acquire) == 2,
+            "no read once a whole list reached the seat"
+        );
+    }
+}
+
+/// The judgements a transport has in flight end ([`Transport::check_takes`]).
+fn takes_judged(transport: &Transport) {
+    let (task, ended, _) = transport
+        .takes
+        .check
+        .as_ref()
+        .expect("a judgement of the takes is in flight");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the takes' judgement's end",
+        || (ended.load(Ordering::Acquire) || task.is_finished()).then_some(()),
+    );
+}
+
+fn transport_owing_take_judgement(now: Instant) -> (Transport, astream_wire::sync::Actor) {
+    let mut transport = Transport::unopened(None, Scope::Loopback, 0).unwrap();
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
+    let actor = [71; 48];
+    transport
+        .hints
+        .observe(&Hints::new([72; 32]).wire(address.port()), address, now);
+    assert_eq!(transport.hints.next(now).unwrap().0, address);
+    transport.hints.finish(
+        address,
+        Repair::heard_from(actor),
+        Outcome::Repaired { transferred: false },
+        now,
+    );
+    let unknown = Repair::heard_from(actor).handed(Some(0), Owing::Unknown);
+    transport.hints.settle(actor, None, now, &unknown, now);
+    (transport, actor)
+}
+
+/// A background read that already observed its result is paused while incoming handoffs clear
+/// and recreate its request. Neither its old result nor the panic fallback may change the new
+/// debt. A subsequent read of the replacement request still owes the seat a take.
+#[test]
+fn a_paused_take_judgement_cannot_complete_a_replacement_request() {
+    use std::sync::mpsc;
+    for old_result in [
+        Some(Owing::Nothing),
+        Some(Owing::Take([9; 32])),
+        Some(Owing::Unknown),
+        None,
+    ] {
+        let now = Instant::now();
+        let (mut transport, actor) = transport_owing_take_judgement(now);
+        let unknown = Repair::heard_from(actor).handed(Some(0), Owing::Unknown);
+        let old_due = transport.hints.judge_at(actor).unwrap();
+        let (observed, observation) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        transport.takes.judge = Some(Arc::new(move |seat| {
+            observed.send((seat, old_result)).unwrap();
+            released
+                .lock()
+                .unwrap()
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the test releases the observed judgement");
+            old_result.expect("exercise the failed task's Unknown fallback")
+        }));
+        transport.check_takes(old_due);
+        assert_eq!(
+            observation
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap(),
+            (actor, old_result)
+        );
+        let nothing = Repair::heard_from(actor).handed(Some(0), Owing::Nothing);
+        transport
+            .hints
+            .settle(actor, None, old_due, &nothing, old_due);
+        assert_eq!(transport.hints.judge_at(actor), None);
+        transport
+            .hints
+            .settle(actor, None, old_due, &unknown, old_due);
+        let due = transport.hints.judge_at(actor).unwrap();
+        release.send(()).unwrap();
+        takes_judged(&transport);
+        transport.check_takes(old_due);
+        assert_eq!(
+            transport.hints.judge_at(actor),
+            Some(due),
+            "old {old_result:?} leaves the new debt's deadline"
+        );
+        assert!(
+            !transport.hints.owes_take(actor),
+            "old {old_result:?} creates no take"
+        );
+        assert!(
+            transport.takes.check.is_none(),
+            "the new request is not due yet"
+        );
+        transport.takes.judge = Some(Arc::new(|_| Owing::Take([5; 32])));
+        transport.check_takes(due);
+        takes_judged(&transport);
+        transport.check_takes(due);
+        assert_eq!(transport.hints.judge_at(actor), None);
+        assert!(
+            transport.hints.owes_take(actor),
+            "the matching read applies"
+        );
+        assert!(transport.takes.check.is_none());
+    }
+}
+
+/// Unread incoming handoffs reschedule an outstanding debt without establishing that the
+/// background read is stale. Its useful result still applies after those observations.
+#[test]
+fn a_paused_take_judgement_survives_repeated_incoming_unknown() {
+    use std::sync::mpsc;
+    let now = Instant::now();
+    let (mut transport, actor) = transport_owing_take_judgement(now);
+    let due = transport.hints.judge_at(actor).unwrap();
+    let (observed, observation) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let released = Mutex::new(released);
+    transport.takes.judge = Some(Arc::new(move |seat| {
+        let result = Owing::Take([5; 32]);
+        observed.send((seat, result)).unwrap();
+        released
+            .lock()
+            .unwrap()
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the test releases the useful judgement");
+        result
+    }));
+    transport.check_takes(due);
+    assert_eq!(
+        observation
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap(),
+        (actor, Owing::Take([5; 32]))
+    );
+    let mut now = due;
+    let unknown = Repair::heard_from(actor).handed(Some(0), Owing::Unknown);
+    for _ in 0..2 {
+        now += Duration::from_secs(1);
+        transport.hints.settle(actor, None, now, &unknown, now);
+        transport.check_takes(now);
+        assert!(
+            transport.takes.check.is_some(),
+            "the original read stays in flight"
+        );
+        assert!(transport.hints.judge_at(actor).unwrap() > now);
+    }
+    release.send(()).unwrap();
+    takes_judged(&transport);
+    transport.check_takes(now);
+    assert!(transport.hints.owes_take(actor));
+    assert_eq!(transport.hints.judge_at(actor), None);
+    assert!(transport.takes.check.is_none());
+}
+
+/// How many dials to `seat` this thread's census counts as chosen for a round owed it and as a
+/// walk's offer of what moved here (`census::Dial`'s `owed` and `walk`).
+fn owed_and_walked(seat: astream_wire::sync::Actor) -> (u64, u64) {
+    census::seat_here(seat).map_or((0, 0), |counts| (counts["owed"], counts["walk"]))
+}
+
+/// A round this transport stopped after its list trade counts, once, what that trade reported of
+/// a restart of its seat's cycle (`census::own_round`): the stop clears the reports the scheduler
+/// reads of the round, not what its report says, and hands the scheduler what the round did to
+/// its scan's state, the restart it took up included. Mac 0, its sweep of Mac 1 complete, dials
+/// Mac 1 for its audit and restarts the seat's cycle, as a dial of a seat met again or away does
+/// (`Repair::restart_cycle`), which throws the completed sweep away; the round leads a table Mac
+/// 0 wrote. While Mac 1 waits to ingest Mac 0's batch ([`crate::replica::BEFORE_INGEST`]), after
+/// both traded lists, Mac 0's side is stopped. Mac 1's seat then counts one `sweep-discarded` and
+/// no `sweep-restarted`, and Mac 0's next round with it, which completes, counts no sweep mark.
+///
+/// NEGATIVE CONTROL (2026-11-15): with the census reading the sweep from the round's state that
+/// the stop clears, as before that date, and again with it reading the completed report alone,
+/// Mac 1's seat counted no `sweep-discarded` (`left: (0, 1), right: (1, 1)`). NEGATIVE CONTROL
+/// (2026-11-16): with the stopped worker handing its scheduler the state it was dialled with,
+/// nothing its round did, Mac 0's next round took up the restart again and reported it
+/// (`left: (1, 2), right: (1, 1)`).
+#[test]
+fn a_round_stopped_after_its_list_trade_counts_its_sweep_once() {
+    use std::sync::mpsc;
+    let mut pair = Pair::swept(2, 2);
+    let digest = pair.tables[1].0.digest();
+    let full = pair.full.clone();
+    let address = pair.peers[0];
+    let seat = pair.macs[0].take_contacts()[0].actor;
+    let sweeps = |seat| {
+        let counts = census::seat_here(seat).expect("Mac 1's seat is counted");
+        (counts["sweep-discarded"], counts["sweep-restarted"])
+    };
+    let before = sweeps(seat);
+
+    pair.now = pair.macs[0].hints.next_at(address);
+    pair.hear(0);
+    let (chosen, mut repair) = pair.macs[0].hints.next(pair.now).expect("its audit is due");
+    assert_eq!(chosen, address);
+    assert!(repair.cycled(), "Mac 0's sweep of Mac 1 is complete");
+    repair.restart_cycle();
+    pair.write(1, 0);
+    assert!(repair.lead(digest));
+    let (arrived, batch) = mpsc::channel();
+    let (go, released) = mpsc::channel::<()>();
+    let hook: crate::replica::IngestHook = Box::new(move |_| {
+        arrived.send(()).unwrap();
+        released
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the test releases the batch");
+        Ok(())
+    });
+    crate::replica::BEFORE_INGEST
+        .lock()
+        .unwrap()
+        .push((digest, hook));
+    let (dialled, served) = round_at(&full[0], &full[1], &pair.listeners[1], repair);
+    batch
+        .recv_timeout(Duration::from_secs(60))
+        .expect("Mac 1 receives Mac 0's batch");
+    dialled.stop();
+    go.send(()).unwrap();
+    pair.macs[1].finish(served, pair.now);
+    pair.macs[0].finish(dialled, pair.now);
+    pair.macs[1].reports().for_each(drop);
+    let stopped = pair.macs[0].reports().last().unwrap();
+    assert!(stopped.cancelled, "Mac 0 stopped its round");
+    assert_eq!(
+        stopped
+            .application_interrupted
+            .and_then(|report| report.sweep),
+        Some(crate::replica::Sweep::Discarded),
+        "its list trade reported the discarded sweep"
+    );
+    assert_eq!(
+        sweeps(seat),
+        (before.0 + 1, before.1),
+        "the stopped round counts its sweep once"
+    );
+
+    pair.now = pair.macs[0].hints.next_at(address).max(pair.now);
+    pair.hear(0);
+    let (chosen, repair) = pair.macs[0]
+        .hints
+        .next(pair.now)
+        .expect("Mac 0 dials again");
+    assert_eq!(chosen, address);
+    let report = pair.round(0, &full[0], &full[1], repair);
+    assert!(report.application.is_some(), "{report:?}");
+    assert_eq!(
+        sweeps(seat),
+        (before.0 + 1, before.1),
+        "the next round reports no sweep"
+    );
+}
+
 /// Two Macs' transports over loopback on a witness lab's tables (`crate::replica`), each swept
 /// by the other until it rests, Mac 1 last, while Mac 1 lists only some of them; each Mac's look
 /// starts after that ([`Pair::swept`]).
@@ -3775,6 +4360,99 @@ impl Pair {
         self.macs[from].reports().last().unwrap()
     }
 
+    /// [`Self::round`], each side's round taken as begun at `now`, as the schedule reads its
+    /// clock, its peer's state once `serve` changed it.
+    fn round_with(
+        &mut self,
+        from: usize,
+        client: &Arc<Endpoint>,
+        server: &Arc<Endpoint>,
+        repair: Repair,
+        serve: impl FnOnce(&mut Repair),
+    ) -> RepairRound {
+        let to = 1 - from;
+        let (dialled, served) = round_at(client, server, &self.listeners[to], repair);
+        let served = ended_at(served, self.now, serve);
+        let dialled = ended_at(dialled, self.now, |_| {});
+        self.macs[to].finish(served, self.now);
+        self.macs[from].finish(dialled, self.now);
+        self.macs[to].reports().for_each(drop);
+        self.macs[from].reports().last().unwrap()
+    }
+
+    /// Mac 1 dials Mac 0, on the endpoint it swept with, until it rests as Mac 0 rests after its
+    /// sweep: its next dial of its own is then its audit, or a probe of a silence, and no sooner
+    /// than ten seconds on.
+    fn rest_mac1(&mut self) {
+        let address = self.peers[1];
+        let (listed, full) = (self.listed.clone(), self.full.clone());
+        for _ in 0..16 {
+            if self.macs[1].hints.rests(address) {
+                self.now += crate::runtime::discovery::WALK_GAP;
+                self.hear(1);
+                let next = self.macs[1].hints.next_dial_at(self.now, true).unwrap();
+                assert!(
+                    next > self.now + Duration::from_secs(10),
+                    "CONTROL: Mac 1 rests"
+                );
+                return;
+            }
+            self.now = self.now.max(self.macs[1].hints.next_at(address));
+            self.hear(1);
+            let (chosen, repair) = self.macs[1].hints.next(self.now).expect("Mac 1's own dial");
+            assert_eq!(chosen, address);
+            let report = self.round(1, &listed, &full[0], repair);
+            assert!(report.control.is_ok(), "{report:?}");
+        }
+        panic!("Mac 1 did not rest within 16 rounds");
+    }
+
+    /// Mac 0 has written `table`, which Mac 1's lists left out, and Mac 1 owes Mac 0 a round
+    /// whose lists are whole: Mac 1's walk dials Mac 0 for it with nothing moved there, and once
+    /// Mac 0 reads those lists the record reaches Mac 1, in that round or by Mac 0's walk after
+    /// it, before any audit. Mac 1 owes nothing after, and its census counts the dial against
+    /// Mac 0's seat as `owed`, not as a `walk` (`census::Dial`).
+    fn relists_and_takes(&mut self, table: usize) {
+        let digest = self.tables[table].0.digest();
+        let before = crate::replica::tests::witness::held(&self.lab, &self.tables, table, 1);
+        let full = self.full.clone();
+        let seat = self.lab.bootstrap(0).request().unwrap().binding().actor();
+        let chosen = owed_and_walked(seat);
+        let (address, repair) = self.macs[1]
+            .hints
+            .next(self.now)
+            .expect("Mac 1's walk dials Mac 0 for the round it owes");
+        assert_eq!(address, self.peers[1]);
+        assert!(!repair.audited(), "an owed round is no audit");
+        let report = self.round_with(1, &full[1], &full[0], repair, |_| {});
+        assert!(report.control.is_ok(), "{report:?}");
+        assert!(!self.macs[1].hints.owes(seat), "the whole round paid it");
+        assert_eq!(
+            owed_and_walked(seat),
+            (chosen.0 + 1, chosen.1),
+            "Mac 0's seat counts the round as owed, not as a walk's offer"
+        );
+        if crate::replica::tests::witness::held(&self.lab, &self.tables, table, 1) == before {
+            self.now += crate::runtime::discovery::WALK_GAP;
+            let (address, repair) = self.macs[0]
+                .hints
+                .next(self.now)
+                .expect("Mac 0's walk dials Mac 1 for the table it wrote, listed now");
+            assert_eq!(address, self.peers[0]);
+            assert!(repair.leads(&digest), "the dial leads the written table");
+            let report = self.round_with(0, &full[0], &full[1], repair, |_| {});
+            assert_eq!(
+                report.application.map(|app| (app.table, app.sent)),
+                Some((Some(digest), 1))
+            );
+        }
+        assert_eq!(
+            crate::replica::tests::witness::held(&self.lab, &self.tables, table, 1),
+            before + 1,
+            "Mac 1 holds Mac 0's record"
+        );
+    }
+
     /// Mac 1 has written `table` after Mac 0 wrote one record of it: its walk is due, dials Mac 0
     /// with the table led, and the round leaves Mac 0 holding both records.
     fn walks_back(&mut self, table: usize) {
@@ -3873,7 +4551,7 @@ fn a_converged_pair_is_quiet_until_its_audits_and_an_audit_brings_what_nothing_t
                 let audited = repair.audited();
                 let report = round(&mut macs, from, repair, now);
                 assert!(report.control.is_ok(), "{report:?}");
-                let took = report.application.map(|took| (took.table, took.regular));
+                let took = report.application.map(|took| (took.table, took.regular()));
                 own[from].push((since, audited, took));
                 if rested[from].is_none() && macs[from].hints.rests(addresses[to]) {
                     rested[from] = Some(since);
@@ -3937,7 +4615,7 @@ fn a_converged_pair_is_quiet_until_its_audits_and_an_audit_brings_what_nothing_t
             );
             continue;
         }
-        assert!(took.witnesses_asked, "{took:?}");
+        assert!(took.witnesses_asked(), "{took:?}");
         assert_eq!(took.table, Some(last), "the table whose witness differed");
         assert_eq!(
             held(&lab, &tables, written, 0),
@@ -4377,7 +5055,10 @@ fn an_audit_leads_the_catalog_five_minutes_after_a_round_over_it_left_nothing() 
                 "the scheduler heard what the round said of the catalog: {report:?}"
             );
             let settled = report.application.is_some_and(|app| {
-                app.regular && app.table == Some(catalog) && app.received == 0 && app.deferred == 0
+                app.regular()
+                    && app.table == Some(catalog)
+                    && app.received == 0
+                    && app.deferred == 0
             });
             if settled && heard == Some(now) && !a.hints.follow_up_contains(there) {
                 break;
@@ -4423,11 +5104,11 @@ fn an_audit_leads_the_catalog_five_minutes_after_a_round_over_it_left_nothing() 
         let report = round_from(&mut a, &mut b, repair, at);
         let app = report.application.unwrap();
         if unled {
-            assert!(app.regular, "MUTANT: the scan's turn: {report:?}");
+            assert!(app.regular(), "MUTANT: the scan's turn: {report:?}");
             continue;
         }
         assert_eq!(app.table, Some(catalog), "{report:?}");
-        assert!(!app.regular, "led, not the scan's turn");
+        assert!(!app.regular(), "led, not the scan's turn");
         assert_eq!(
             a.hints.catalog_heard(),
             Some(at),

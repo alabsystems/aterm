@@ -103,6 +103,7 @@ pub(super) struct Input {
     pub(super) req: Request,
     pub(super) unix_ms: u64,
     pub(super) thrashing: bool,
+    event_context: Arc<EventContext>,
     evidence: Arc<Evidence>,
     serial: u64,
     coalesced: u64,
@@ -114,6 +115,8 @@ impl Input {
         facts: ProcessFacts,
         req: &Request,
         unix_ms: u64,
+        at_ns: u64,
+        event_wall_ms: Option<i64>,
         thrashing: bool,
     ) -> Self {
         let evidence = Arc::new(Evidence::new(
@@ -131,11 +134,24 @@ impl Input {
             req: req.clone(),
             unix_ms,
             thrashing,
+            event_context: Arc::new(EventContext {
+                at_ns,
+                at_unix_ms: event_wall_ms,
+                sources: super::event_sources(req),
+            }),
             evidence,
             serial: 0,
             coalesced: 0,
         }
     }
+}
+
+/// Original assessment input provenance, retained with exactly the Jobs Arc that read it.
+#[derive(Clone, Default)]
+pub(super) struct EventContext {
+    pub(super) at_ns: u64,
+    pub(super) at_unix_ms: Option<i64>,
+    pub(super) sources: Vec<aterm_vitals::events::SessionScope>,
 }
 
 #[derive(Clone, Default)]
@@ -144,6 +160,7 @@ pub(super) struct Reading {
     pub(super) left: Option<Arc<LeftView>>,
     pub(super) jobs_at: Option<Instant>,
     pub(super) left_at: Option<Instant>,
+    pub(super) event_context: Option<Arc<EventContext>>,
     evidence: Option<Arc<Evidence>>,
 }
 
@@ -195,6 +212,11 @@ impl Core {
             jobs,
             left,
             jobs_at: self.jobs.observed_at(),
+            event_context: if jobs_changed {
+                Some(Arc::clone(&input.event_context))
+            } else {
+                self.reading.event_context.clone()
+            },
             evidence: if jobs_changed {
                 Some(Arc::clone(&input.evidence))
             } else {

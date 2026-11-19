@@ -541,8 +541,10 @@ impl App {
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_)
                     | crate::native_app::AppViewState::Workers(_)
+                    | crate::native_app::AppViewState::Registry(_)
                     | crate::native_app::AppViewState::Tables(_)
                     | crate::native_app::AppViewState::Navigator(_)
+                    | crate::native_app::AppViewState::SystemResources(_)
                     | crate::native_app::AppViewState::Allocation(_) => false,
                 });
             if changed && let Some(mut window) = self.windows.get_mut(&wid) {
@@ -1226,11 +1228,10 @@ impl App {
             .as_ref()
             .filter(|_| native_update.is_none())
             .and_then(|reads| self.grid_a11y_tree_reading(wid, reads));
-        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
+        let Some(ws) = self.windows.get(&wid) else {
             return;
         };
-        let ws = &mut **route_guard_ws;
-        let (update, published) = match ws.overlay.as_ref() {
+        let (mut update, mut published) = match ws.overlay.as_ref() {
             Some(o) => (crate::overlay::OverlayModel::a11y(o.model()), None),
             None => match native_update {
                 Some(Ok((update, published))) => (update, Some(published)),
@@ -1241,6 +1242,16 @@ impl App {
                 ),
             },
         };
+        if let Some(roster) = reads.as_ref().and_then(|reads| reads.roster)
+            && let Err(error) =
+                self.append_roster_accessibility(wid, roster, &mut update, &mut published)
+        {
+            aterm_log::info!("could not present session panel to accessibility: {error}");
+        }
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let ws = &mut **route_guard_ws;
         ws.native_a11y_published = published;
         if ws.native_a11y_published.is_none() {
             ws.native_a11y_staged = None;
@@ -1295,6 +1306,7 @@ impl App {
                 self.terminal_document_in_pass(wid, session, rows, cols, true, &mut pass)
             });
         crate::a11y_tree::ClientReads {
+            roster: self.roster_accessibility(wid),
             views: plan.map_or_else(Vec::new, |plan| {
                 plan.leaves.iter().map(|leaf| leaf.view).collect()
             }),
@@ -1399,10 +1411,10 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return Vec::new();
         };
-        if ws.tab_set.shown_len() < 2 {
+        if ws.strip_tab_count() < 2 {
             return Vec::new();
         }
-        let active = ws.tab_set.strip_active();
+        let active = ws.selected_strip_index();
         ws.tab_segments
             .iter()
             .filter_map(|segment| {
@@ -1412,7 +1424,7 @@ impl App {
                 if segment.solo {
                     return None;
                 }
-                let tab = ws.tab_set.tab_at(index)?;
+                let tab = ws.tab_set.tab_at(ws.painted_tab_index(index)?)?;
                 Some(crate::a11y_tree::GridTab {
                     index,
                     id: tab.id.get(),
@@ -1673,17 +1685,25 @@ impl App {
     #[cfg(a11y_tree)]
     fn grid_a11y_rename(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridRename> {
         let edit = self.inline_rename_edit(wid)?;
-        let (text, caret) = self.field_as_composed(
-            wid,
-            crate::app_input::PreeditOwner::Rename,
-            &edit.text,
-            edit.cursor,
-        );
+        let composing = !self.windows.get(&wid)?.preedit.is_empty()
+            && self.preedit_owner(wid) == crate::app_input::PreeditOwner::Rename;
+        let (base, cursor) = if edit.selected_all && composing {
+            ("", 0)
+        } else {
+            (edit.text.as_str(), edit.cursor)
+        };
+        let (text, caret) =
+            self.field_as_composed(wid, crate::app_input::PreeditOwner::Rename, base, cursor);
         let label = match edit.field {
             crate::session_timeline::MetaField::Role => "Session role",
             _ => "Session name",
         };
-        Some(crate::a11y_tree::GridRename { label, text, caret })
+        Some(crate::a11y_tree::GridRename {
+            label,
+            text,
+            caret,
+            selected_all: edit.selected_all && !composing,
+        })
     }
 
     /// `text` with the composition in progress when `owner` holds it, and the caret as a character
@@ -1835,12 +1855,12 @@ impl App {
             // mean "show me this tab".
             if let Some(index) = crate::a11y_tree::tab_action_index(&req, |index| {
                 let ws = self.windows.get(&wid)?;
-                if self.tab_strip_rows == 0 || ws.tab_set.shown_len() < 2 {
+                if self.tab_strip_rows == 0 || ws.strip_tab_count() < 2 {
                     return None;
                 }
-                ws.tab_set.shown().get(index).map(|tab| tab.id.get())
+                ws.strip_tabs().nth(index).map(|(_, tab)| tab.id.get())
             }) {
-                self.switch_tab_in(wid, index);
+                self.switch_shown_tab_in(wid, index);
                 if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
                     w.request_redraw();
                 }

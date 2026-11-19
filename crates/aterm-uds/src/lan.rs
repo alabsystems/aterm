@@ -21,6 +21,7 @@ use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub mod adoption;
 #[cfg(target_os = "macos")]
 mod arrivals;
 pub mod broker;
@@ -33,7 +34,7 @@ pub mod wire;
 pub use arrivals::Arrivals;
 pub use broker::{BrokerHello, Events, Registration};
 pub use classify::{is_local_name, is_local_network, on_attached_subnet};
-pub use wire::{Advert, Event, Instance, Target};
+pub use wire::{Advert, Event, Instance, SpotlightStores, StoreBound, StoreVolume, Target};
 
 pub mod install;
 
@@ -56,6 +57,27 @@ pub const IMAGE_EXECUTABLE: &str =
 
 /// Where the broker's log goes.
 pub const LOG_PATH: &str = "/Library/Logs/aterm/aterm-lan.log";
+
+/// How often the running broker looks at its source bundle for a signed update to adopt
+/// (`aterm-lan`'s `adopt::watch`): the unit an account counts the broker's looks in when it
+/// bounds an adopting image ([`adoption::LOOKS`]).
+pub const ADOPTION_LOOK: Duration = Duration::from_secs(5);
+
+/// The broker's record of why it did not adopt its source ([`adoption::Refusal`]): root's own
+/// file (`0644 root:wheel`) beside setup's records of refused root steps, which every account
+/// reads with no password. The broker writes it where an adoption round of its source failed and
+/// removes it once its image is the source, and so does an elevation that installs the source.
+pub const ADOPTION_REFUSED: &str = "/Library/Application Support/aterm/lan-adoption.refused";
+
+/// The broker's records of why it did not adopt a bundle whose process asked it to: root's own
+/// folder (`0755`) beside [`ADOPTION_REFUSED`], one file (`0644`) per bundle
+/// ([`adoption::asker_refusal_in`]), so no asker's record ever takes the place of the source's or
+/// of another asker's. The broker keeps at most as many as the askers it keeps, the oldest
+/// removed first, and removes a bundle's own once it adopts that bundle or finds its image is
+/// that bundle; a record a broker left before it moved up names that broker's build, which no
+/// account counts ([`adoption::expect`]).
+pub const ADOPTION_REFUSED_ASKERS: &str =
+    "/Library/Application Support/aterm/lan-adoption.refused.d";
 
 /// The root-owned (0755) folder the broker makes its socket in.
 pub const SOCKET_DIR: &str = "/var/run/systems.alab.aterm-lan";
@@ -100,12 +122,16 @@ pub enum Unavailable {
     /// it ([`absent`]).
     SwitchedOff,
     /// The broker speaks another protocol version (`ours`, `theirs`): it adopts a signed update by
-    /// itself; an ad-hoc build's broker is renewed by that build's elevation.
+    /// itself; an ad-hoc build's broker is renewed by that build's elevation. Its hello still
+    /// named its `build`, which an account judges an adoption by as any broker's
+    /// ([`broker::any_protocol`], [`adoption::expect`]).
     Outdated {
         /// [`PROTOCOL`].
         ours: u32,
         /// The broker's.
         theirs: u32,
+        /// The build the broker's hello named.
+        build: String,
     },
     /// Something at the socket is not the root broker (its peer is not uid 0), or it checked this
     /// process's code and refused it: an answer that stands until the socket is made again.
@@ -135,7 +161,7 @@ impl std::fmt::Display for Unavailable {
                  the person's choice; switching it back on there, or `sudo launchctl enable \
                  system/{LABEL}`, lets setup start it"
             ),
-            Self::Outdated { ours, theirs } => write!(
+            Self::Outdated { ours, theirs, .. } => write!(
                 f,
                 "the LAN broker speaks protocol {theirs} and this aterm {ours}: a signed update \
                  adopts itself within seconds; an ad-hoc build's broker is renewed by that \
@@ -429,6 +455,26 @@ pub fn register(advert: &Advert) -> Result<Registration, LanError> {
     broker::register(advert)
 }
 
+/// Spotlight's store on each mounted local volume, as aterm's root LAN broker last walked it
+/// (SD-94): Spotlight's stores are root's alone, and the broker is the one root process aterm
+/// runs. It walks at most once every ten minutes and keeps that walk's answer between walks, so
+/// asking more often reads the same answer again ([`SpotlightStores::age_ms`]).
+///
+/// # Errors
+/// [`LanError::Unavailable`] on macOS without the root broker (this process's own server is
+/// never asked: it cannot read a root-only store), `Unsupported` off macOS (no Spotlight), or
+/// [`LanError::Io`]: the broker's error, or the exchange's.
+pub fn spotlight_stores() -> Result<SpotlightStores, LanError> {
+    if cfg!(target_os = "macos") {
+        broker::spotlight_stores()
+    } else {
+        Err(LanError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Spotlight's stores exist on macOS only",
+        )))
+    }
+}
+
 /// What a test may change about this thread's LAN classification and its broker.
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -444,6 +490,10 @@ pub struct Seam {
     /// installed and launchd's switch of its job as `switched_off` (`None`: launchd could not
     /// say); `None` reads nothing, so the broker reads not installed, as in a test binary.
     pub installed_job: Option<Option<bool>>,
+    /// Whether this thread's client is a development build on a real Mac
+    /// ([`install::development_here`]), in place of what the code the kernel loaded for this
+    /// process and the machine say.
+    pub development: Option<bool>,
 }
 
 #[cfg(any(test, debug_assertions))]

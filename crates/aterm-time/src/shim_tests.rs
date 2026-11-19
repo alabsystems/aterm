@@ -23,6 +23,27 @@ fn millisecond_conversion_is_total() {
     assert_eq!(duration_from_millis_f64(f64::INFINITY), Duration::ZERO);
     assert_eq!(duration_from_millis_f64(-1.0), Duration::ZERO);
     assert_eq!(duration_from_millis_f64(0.0), Duration::ZERO);
+    assert_eq!(duration_from_millis_f64(f64::from_bits(1)), Duration::ZERO);
+    // Just below 2^52 the last representable half millisecond still has a fraction.
+    let integral_from = 4_503_599_627_370_496.0_f64;
+    assert_eq!(
+        duration_from_millis_f64(integral_from.next_down()),
+        Duration::from_millis((1 << 52) - 1) + Duration::from_micros(500)
+    );
+    assert_eq!(
+        duration_from_millis_f64(integral_from),
+        Duration::from_millis(1 << 52)
+    );
+    // The binary64 predecessor of 2^64 milliseconds is 2^64 - 2048.
+    let cutoff = 18_446_744_073_709_551_616.0_f64;
+    assert_eq!(
+        duration_from_millis_f64(cutoff.next_down()),
+        Duration::from_millis(u64::MAX - 2047)
+    );
+    assert_eq!(
+        duration_from_millis_f64(cutoff),
+        Duration::from_millis(u64::MAX)
+    );
     assert_eq!(
         duration_from_millis_f64(f64::MAX),
         Duration::from_millis(u64::MAX)
@@ -37,6 +58,11 @@ fn millisecond_conversion_keeps_the_fraction() {
         Duration::from_millis(1500)
     );
     assert_eq!(duration_from_millis_f64(0.5), Duration::from_nanos(500_000));
+    // 3/128 ms is exactly 23_437.5 ns. Ties to even or away from zero give 23_438.
+    assert_eq!(
+        duration_from_millis_f64(3.0 / 128.0),
+        Duration::from_nanos(23_437)
+    );
     assert_eq!(
         duration_from_millis_f64(1.25),
         Duration::from_nanos(1_250_000)
@@ -72,6 +98,17 @@ fn instant_differences_saturate_backwards() {
     assert!(b > a);
 }
 
+#[cfg(panic = "unwind")]
+fn assert_assignment_panics_unchanged<T: Copy + Eq + core::fmt::Debug>(
+    before: T,
+    assign: impl FnOnce(&mut T),
+) {
+    let mut value = before;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assign(&mut value)));
+    assert!(panic.is_err());
+    assert_eq!(value, before);
+}
+
 #[test]
 fn instant_arithmetic_round_trips_and_checks() {
     let a = Instant::from_js_millis(1000.0);
@@ -87,6 +124,21 @@ fn instant_arithmetic_round_trips_and_checks() {
     assert_eq!(a.checked_sub(Duration::from_secs(60)), None);
     assert!(a.checked_add(Duration::from_secs(60)).is_some());
     assert_eq!(a.checked_add(Duration::MAX), None);
+
+    let tick = Duration::from_nanos(1);
+    let max = Instant(Duration::MAX);
+    let origin = Instant(Duration::ZERO);
+    assert_eq!(max + Duration::ZERO, max);
+    assert_eq!(origin - Duration::ZERO, origin);
+    assert_eq!(Instant(Duration::MAX - tick) + tick, max);
+    assert_eq!(Instant(tick) - tick, origin);
+    #[cfg(panic = "unwind")]
+    {
+        assert!(std::panic::catch_unwind(|| max + tick).is_err());
+        assert!(std::panic::catch_unwind(|| origin - tick).is_err());
+        assert_assignment_panics_unchanged(max, |t| *t += tick);
+        assert_assignment_panics_unchanged(origin, |t| *t -= tick);
+    }
 }
 
 #[test]
@@ -123,4 +175,18 @@ fn system_time_arithmetic_round_trips() {
     );
     assert_eq!(UNIX_EPOCH.checked_sub(Duration::from_secs(1)), None);
     assert_eq!(t.checked_add(Duration::MAX), None);
+
+    let tick = Duration::from_nanos(1);
+    let max = SystemTime(Duration::MAX);
+    assert_eq!(max + Duration::ZERO, max);
+    assert_eq!(UNIX_EPOCH - Duration::ZERO, UNIX_EPOCH);
+    assert_eq!(SystemTime(Duration::MAX - tick) + tick, max);
+    assert_eq!(SystemTime(tick) - tick, UNIX_EPOCH);
+    #[cfg(panic = "unwind")]
+    {
+        assert!(std::panic::catch_unwind(|| max + tick).is_err());
+        assert!(std::panic::catch_unwind(|| UNIX_EPOCH - tick).is_err());
+        assert_assignment_panics_unchanged(max, |t| *t += tick);
+        assert_assignment_panics_unchanged(UNIX_EPOCH, |t| *t -= tick);
+    }
 }

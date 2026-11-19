@@ -18,7 +18,6 @@ fn read_activity(
     )
 }
 
-#[cfg(unix)]
 #[test]
 fn a_running_shared_login_keeps_its_captured_row_after_roster_replacement() {
     for change_email in [false, true] {

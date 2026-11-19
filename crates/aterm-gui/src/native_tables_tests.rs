@@ -127,6 +127,16 @@ pub(crate) fn settle(app: &mut App) {
         .settle();
 }
 
+/// Ask the page's reader to read the registry again, as its timer does, and take its answer.
+pub(crate) fn read_again(app: &mut App) {
+    let tables = app
+        .native_runtime
+        .tables_mut()
+        .expect("the Tables page is open");
+    tables.work.send(super::Work::Read).unwrap();
+    tables.settle();
+}
+
 pub(crate) fn settle_write(app: &mut App) {
     app.native_runtime
         .tables_mut()
@@ -169,6 +179,291 @@ pub(crate) fn two_macs() -> Lab {
     lab
 }
 
+#[test]
+fn a_collection_chosen_before_the_first_read_opens_when_its_rows_arrive() {
+    let lab = Lab::new(&[Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
+
+    // The headless host takes the reader's reply only when we settle it below.
+    let account = "tables/sheet/account";
+    let title = REGISTRY.table.faced("account").unwrap().title;
+    let ui = render(&app);
+    assert!(
+        said(&ui, account).is_some(),
+        "the rail already offers accounts"
+    );
+    assert!(said(&ui, "tables/reading").is_some());
+    assert!(said(&ui, "tables/grid").is_none());
+
+    let narrow = 760.0;
+    assert!(said(&render_wide(&app, narrow), PICKER).is_some());
+    act(&mut app, PICKER, None);
+    assert!(said(&render_wide(&app, narrow), account).is_some());
+    act(&mut app, account, None);
+    let picker = said(&render_wide(&app, narrow), PICKER).unwrap();
+    assert!(picker.contains(title), "{picker}");
+    let ui = render(&app);
+    assert_eq!(said(&ui, "tables/title").as_deref(), Some(title));
+    assert!(said(&ui, "tables/reading").is_some());
+    assert_ne!(said(&ui, "tables/count").as_deref(), Some("0 rows"));
+
+    settle(&mut app);
+    let ui = render(&app);
+    assert_eq!(said(&ui, "tables/title").as_deref(), Some(title));
+    assert_eq!(said(&ui, "tables/count").as_deref(), Some("0 rows"));
+    assert!(said(&ui, "tables/reading").is_none());
+}
+
+#[test]
+fn the_first_machine_can_be_selected_before_the_complete_read_allows_an_edit() {
+    let lab = Lab::new(&[Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    registry
+        .write(vec![vec![
+            put("label", json!("m9")),
+            put("location", json!("rack a")),
+            put("row", json!("live")),
+        ]])
+        .unwrap();
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
+    let tables = app.native_runtime.tables_mut().unwrap();
+    let first = tables
+        .replies
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap();
+    assert!(matches!(&first, Reply::Opening { sheet, .. } if sheet.name == "machine"));
+    tables.take(first);
+    assert!(tables.snapshot.is_none());
+    assert_eq!(cell_says(&render(&app), MC, "location"), "rack a");
+
+    let cell = format!("tables/cell/{MC}/location");
+    act(&mut app, &cell, None);
+    act(&mut app, &cell, None);
+    assert!(view_of(&app).editing.is_none());
+    assert_eq!(view_of(&app).row.as_deref(), Some(MC));
+    assert_eq!(view_of(&app).column.as_deref(), Some("location"));
+    assert!(app.native_runtime.tables_mut().unwrap().staged.is_empty());
+
+    settle(&mut app);
+    let tables = app.native_runtime.tables_mut().unwrap();
+    let complete = tables.snapshot.as_ref().unwrap();
+    assert!(
+        complete
+            .sheets
+            .iter()
+            .map(|s| s.name)
+            .eq(complete.listed.iter().map(|s| s.name))
+    );
+    assert_eq!(view_of(&app).row.as_deref(), Some(MC));
+    assert_eq!(view_of(&app).column.as_deref(), Some("location"));
+    act(&mut app, &cell, None);
+    assert!(view_of(&app).editing.is_some());
+}
+
+#[test]
+fn a_failed_opening_drops_its_selectable_rows() {
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(None).unwrap();
+    let mut partial = one_sheet(Shown {
+        text: "Spare".into(),
+        ..Shown::default()
+    });
+    app.native_runtime
+        .tables_mut()
+        .unwrap()
+        .take(Reply::Opening {
+            sheet: Box::new(partial.sheets.remove(0)),
+            targets: partial.targets,
+        });
+    assert_eq!(cell_says(&render(&app), MC, "nickname"), "Spare");
+    let key = format!("tables/cell/{MC}/nickname");
+    act(&mut app, &key, None);
+    // This tab's reader was given no test registry. Take its actual refusal after the preview.
+    settle(&mut app);
+    let ui = render(&app);
+    assert!(said(&ui, &key).is_none());
+    assert!(app.native_runtime.tables_mut().unwrap().unread.is_some());
+    assert!(
+        app.native_runtime
+            .tables_mut()
+            .unwrap()
+            .sheet("machine")
+            .is_none()
+    );
+}
+
+#[test]
+fn an_arriving_reference_target_leaves_a_reopened_picker_in_front() {
+    let mut tables = TablesApp::paced(None, crate::tables_store::FAMILIES, || {}, None).unwrap();
+    let mut view = TablesViewState::default();
+    view.narrow.set(true);
+    view.opening_selection = true;
+    // Following a row reference before its target sheet arrives rests focus on the picker.
+    view.show_row(&tables, "machine", MC, None);
+    assert!(view.pending_row.is_some());
+    tables.act(
+        &mut view,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new(PICKER),
+            value: None,
+        }),
+    );
+    assert!(view.picking);
+
+    let mut target = one_sheet(Shown::default());
+    tables.take(Reply::Opening {
+        sheet: Box::new(target.sheets.remove(0)),
+        targets: target.targets,
+    });
+    view.settle_opening(&tables);
+    assert!(view.picking);
+    assert_eq!(
+        view.common.last_focus.as_ref().map(UiKey::as_str),
+        Some(PICKER)
+    );
+}
+
+#[test]
+fn a_record_route_reveals_the_current_row_and_keeps_the_open_edit() {
+    let mut tables = TablesApp::paced(None, crate::tables_store::FAMILIES, || {}, None).unwrap();
+    let mut view = TablesViewState::default();
+    let mut snapshot = one_sheet(Shown::default());
+    let mut added = snapshot.sheets[0].rows[0].clone();
+    added.pk = "another-key".into();
+    snapshot.sheets[0].rows.push(added);
+    tables.show(snapshot);
+    view.sheet = "machine";
+    view.open_edit(&mut tables, MC, "nickname");
+    view.editing.as_mut().unwrap().input = TextInputState::new("Draft".into());
+    view.picking = true;
+    view.columns.open = true;
+    view.history.open = true;
+    view.history.choosing = Some(history::registry::Which::Machine);
+    view.open_record(&mut tables, "machine", "another-key")
+        .unwrap();
+    assert!(view.editing.is_none() && !view.picking && !view.columns.open);
+    assert!(view.history.open && view.history.choosing.is_none());
+    assert_eq!(
+        tables.staged[&("machine".into(), MC.into(), "nickname".into())],
+        "Draft"
+    );
+    assert_eq!(view.row_route().as_deref(), Some("machine/another-key"));
+    assert_eq!(view.column.as_deref(), Some("nickname"));
+    // The product can hold a newer row than the Tables tab. A head refresh preserves its draft.
+    // A field being edited in another view must be able to close while this refresh is out.
+    let mut other = TablesViewState::default();
+    other.sheet = "machine";
+    other.open_edit(&mut tables, "another-key", "nickname");
+    other.editing.as_mut().unwrap().input = TextInputState::new("Other draft".into());
+    view.open_record(&mut tables, "machine", "just-added")
+        .unwrap();
+    view.settle_opening(&tables);
+    assert!(view.row.is_none());
+    assert_eq!(view.row_route().as_deref(), Some("machine/just-added"));
+    other.close_edit(&mut tables, false);
+    assert_eq!(
+        tables.staged[&("machine".into(), "another-key".into(), "nickname".into())],
+        "Other draft"
+    );
+    let mut fresh = tables.snapshot.as_ref().unwrap().clone();
+    let mut added = fresh.sheets[0].rows[0].clone();
+    added.pk = "just-added".into();
+    fresh.sheets[0].rows.push(added);
+    tables.take(Reply::Read {
+        read: Ok(fresh),
+        moved: true,
+        revision: None,
+    });
+    view.settle_opening(&tables);
+    assert_eq!(view.row.as_deref(), Some("just-added"));
+    assert_eq!(
+        tables.staged[&("machine".into(), MC.into(), "nickname".into())],
+        "Draft"
+    );
+    assert_eq!(
+        tables.staged[&("machine".into(), "another-key".into(), "nickname".into())],
+        "Other draft"
+    );
+    // Once a fresh read confirms absence, it removes the pending route and tells the person.
+    view.open_record(&mut tables, "machine", "absent").unwrap();
+    tables.take(Reply::Read {
+        read: Ok(one_sheet(Shown::default())),
+        moved: true,
+        revision: None,
+    });
+    view.settle_opening(&tables);
+    assert!(view.row_route().is_none());
+    assert!(view.missing_record.as_deref().unwrap().contains("absent"));
+}
+
+#[test]
+fn a_cold_or_historical_record_route_waits_for_its_current_table() {
+    let mut tables = TablesApp::paced(None, crate::tables_store::FAMILIES, || {}, None).unwrap();
+    let mut view = TablesViewState::default();
+    // Roll appears from generation two; its record route can arrive before the local generation is known.
+    assert!(!tables.listed_names().contains(&"roll"));
+    assert_eq!(crate::tables_store::routed_collection("roll"), Some("roll"));
+    assert!(crate::tables_store::routed_collection("archived").is_none());
+    assert!(crate::tables_store::routed_collection("missing.table").is_none());
+    view.open_record(&mut tables, "roll", MC).unwrap();
+    let mut head = one_sheet(Shown::default());
+    let mut sheet = head.sheets.remove(0);
+    sheet.name = "roll";
+    tables.take(Reply::Opening {
+        sheet: Box::new(sheet),
+        targets: head.targets,
+    });
+    view.settle_opening(&tables);
+    assert_eq!(tables.current(&view), Some("roll"));
+    assert_eq!(view.row.as_deref(), Some(MC));
+
+    let mut past = one_sheet(Shown::default());
+    past.at = Some(AsOf {
+        operation: [3; 32],
+        by: None,
+    });
+    past.sheets[0].rows.clear();
+    tables.show(past);
+    view.open_record(&mut tables, "machine", MC).unwrap();
+    view.settle_opening(&tables);
+    assert!(view.row.is_none());
+    assert_eq!(view.row_route(), Some(format!("machine/{MC}")));
+    tables.take(Reply::Read {
+        read: Ok(one_sheet(Shown::default())),
+        moved: true,
+        revision: None,
+    });
+    view.settle_opening(&tables);
+    assert_eq!(view.row.as_deref(), Some(MC));
+    assert_eq!(view.sheet, "machine");
+    view.open_record(&mut tables, "machine", "waiting-row")
+        .unwrap();
+    tables.act(
+        &mut view,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new(crate::native_tables_check::OPEN),
+            value: None,
+        }),
+    );
+    let mut fresh = one_sheet(Shown::default());
+    fresh.sheets[0].rows[0].pk = "waiting-row".into();
+    tables.take(Reply::Read {
+        read: Ok(fresh),
+        moved: true,
+        revision: None,
+    });
+    view.settle_opening(&tables);
+    assert!(view.check.open && view.row_route().is_none());
+    assert_eq!(
+        view.common.last_focus.as_ref().map(UiKey::as_str),
+        Some(crate::native_tables_check::OPEN)
+    );
+}
+
 /// The page's reader reads the registry again only where it moved: asked again with nothing
 /// written it answers unchanged, read as of then, and once a record lands it reads; a page hidden
 /// and shown again asks the registry once and reads only where it moved meanwhile.
@@ -177,7 +472,13 @@ pub(crate) fn two_macs() -> Lab {
 #[test]
 fn the_tables_reader_reads_again_only_where_the_registry_moved() {
     let lab = two_macs();
-    let mut tables = TablesApp::paced(Some(lab.paths[0].clone()), || {}, None).unwrap();
+    let mut tables = TablesApp::paced(
+        Some(lab.paths[0].clone()),
+        crate::tables_store::FAMILIES,
+        || {},
+        None,
+    )
+    .unwrap();
     tables.settle();
     let first = tables.snapshot.as_ref().map(|s| s.read_ms).unwrap();
     let reply = |tables: &mut TablesApp, work: Work| {
@@ -218,6 +519,107 @@ fn the_tables_reader_reads_again_only_where_the_registry_moved() {
     tables.set_shown(true);
     tables.settle();
     assert_eq!(cell_text(&tables, MC, "location"), "rack c");
+}
+
+/// The page's reader asks each change check with what it keeps between its reads (tracker
+/// LT-25D): its first check, nothing kept, keeps the sighting of the open it made; every check
+/// after it is asked with the sighting the check or History page before it kept, which is the
+/// ask that opens no store while the registry stands
+/// (`aterm_db::att::tests::a_revision_asked_again_opens_no_store_while_it_stands`). A reader
+/// that has read no History keeps none; once a page of History is read, that page and the
+/// checks keep one sighting and the page's order between them. After a record is written the
+/// check asked with the old revision's sighting reads the new one and keeps its sighting.
+/// NEGATIVE CONTROLS: with the reader's check handed a `Kept` of its own
+/// (`mark(paths, families, &mut Kept::default())`), the reader keeps nothing of it: `the first check
+/// keeps its open's sighting left: [Check { held: None, kept: None, history: None }] right:
+/// [Check { held: None, kept: Some(..), history: None }]`. With the reader's `kept` made anew
+/// for each ask (`let mut kept` moved into its loop), each check is asked with nothing held:
+/// `a check asked again holds the sighting the last one kept left: [Check { held: None, kept:
+/// Some(..), history: None }] right: [Check { held: Some(..), kept: Some(..), history: None
+/// }]`.
+#[test]
+fn the_tables_reader_asks_each_change_check_with_the_sighting_it_keeps() {
+    use crate::tables_store::Kept;
+    let lab = two_macs();
+    let paths = lab.paths[0].clone();
+    // The registry's revision, read by a reader that keeps nothing.
+    let revision = || {
+        crate::tables_store::mark(&paths, crate::tables_store::FAMILIES, &mut Kept::default())
+            .unwrap()
+            .digest()
+    };
+    let mut tables = TablesApp::paced(
+        Some(paths.clone()),
+        crate::tables_store::FAMILIES,
+        || {},
+        None,
+    )
+    .unwrap();
+    tables.settle();
+    let first = revision();
+    let check = |held, kept, history| Check {
+        held,
+        kept,
+        history,
+    };
+    assert_eq!(
+        tables.checks(),
+        [check(None, Some(first), None)],
+        "the first check keeps its open's sighting"
+    );
+    let answer = |tables: &mut TablesApp, work: Work| {
+        tables.work.send(work).unwrap();
+        let reply = tables
+            .replies
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the Tables reader answers within a minute");
+        let unchanged = matches!(reply, Reply::Unchanged(_));
+        tables.take(reply);
+        unchanged
+    };
+    for _ in 0..2 {
+        assert!(answer(&mut tables, Work::Read), "the registry did not move");
+        assert_eq!(
+            tables.checks(),
+            [check(Some(first), Some(first), None)],
+            "a check asked again holds the sighting the last one kept"
+        );
+    }
+    // A page of History, read on the same reader, keeps its order beside the one sighting.
+    let asked = history::registry::Asked {
+        seq: 1,
+        filter: Default::default(),
+        names: BTreeMap::new(),
+        before: None,
+        revision: None,
+        through: None,
+        limit: 2,
+    };
+    assert!(!answer(&mut tables, Work::History(asked)));
+    assert_eq!(tables.checks(), [], "a page of History is no change check");
+    assert!(answer(&mut tables, Work::Read));
+    assert_eq!(
+        tables.checks(),
+        [check(Some(first), Some(first), Some(first))],
+        "the check after a page of History holds the page's sighting and leaves its order"
+    );
+    Registry::at(paths.clone())
+        .write(vec![vec![put("location", json!("rack b"))]])
+        .unwrap();
+    let second = revision();
+    assert_ne!(
+        second, first,
+        "CONTROL: a record written moves the revision"
+    );
+    assert!(!answer(&mut tables, Work::Read), "a record landed");
+    assert_eq!(
+        tables.checks(),
+        [check(Some(first), Some(second), None)],
+        "the check after a write is asked with the old sighting, keeps the new one and lets \
+         the old revision's History go"
+    );
+    assert!(answer(&mut tables, Work::Read));
+    assert_eq!(tables.checks(), [check(Some(second), Some(second), None)]);
 }
 
 /// The page's reader is told whether a view of it is shown as its view is suspended, shown
@@ -564,6 +966,7 @@ pub(crate) fn author(label: &str, at_ms: u64) -> Author {
         id: "c05f416f".into(),
         at_ms,
         hlc: (at_ms, 0),
+        said: None,
     }
 }
 
@@ -596,6 +999,7 @@ pub(crate) fn one_sheet(nickname: Shown) -> Snapshot {
     Snapshot {
         listed: vec![crate::tables_store::Listed {
             name: "machine",
+            family: "",
             title: "Machines",
             singular: "Machine",
             face: aterm_db::typed::Face::Owner,
@@ -630,6 +1034,7 @@ pub(crate) fn one_sheet(nickname: Shown) -> Snapshot {
         at: None,
         read_ms: 0,
         cannot_write: None,
+        refused: None,
         targets: rows::Targets::new(),
     }
 }
@@ -1082,9 +1487,8 @@ fn tables_tab(
     })
 }
 
-/// Registry is one row of the aterm menu, after System State…, and the same command in the
-/// palette; the command opens the one Tables tab, which wears its own icon and not the Editor's;
-/// and a relaunch that reads the layout a quit wrote opens the tab again, in front as it was.
+/// Tables and aRegistry have separate menu and palette entries. The Tables command opens
+/// the one general browser tab. A relaunch restores the tab in front with its own icon.
 /// NEGATIVE CONTROL: with the `"tables"` arm of `App::restore_native_leaf` removed, the relaunch
 /// builds no Tables tab and the test fails at `the relaunch reopens Tables`.
 #[test]
@@ -1106,15 +1510,14 @@ fn tables_opens_from_the_menu_and_palette_and_is_restored() {
     let at = rows
         .iter()
         .position(|(_, row)| row.1 == MenuAction::Tables)
-        .expect("a Registry row");
+        .expect("a Tables row");
     assert_eq!(
         rows[at],
-        (
-            "aterm",
-            ("Registry…", MenuAction::Tables, "", MenuMods::None)
-        )
+        ("aterm", ("Tables…", MenuAction::Tables, "", MenuMods::None))
     );
     assert_eq!(rows[at - 1].1.1, MenuAction::SystemState);
+    assert!(rows.iter().any(|(section, row)| *section == "aterm"
+        && *row == ("aRegistry…", MenuAction::Registry, "", MenuMods::None)));
     assert_eq!(
         rows.iter()
             .filter(|(_, row)| row.1 == MenuAction::Tables)
@@ -1125,7 +1528,7 @@ fn tables_opens_from_the_menu_and_palette_and_is_restored() {
     assert!(MenuAction::Tables.offered_on_this_platform());
     let chrome = crate::menu::menu_chrome_lines(None, false);
     assert!(
-        chrome.iter().any(|line| line.contains("Registry…")),
+        chrome.iter().any(|line| line.contains("Tables…")),
         "{chrome:?}"
     );
     assert_eq!(
@@ -1139,10 +1542,13 @@ fn tables_opens_from_the_menu_and_palette_and_is_restored() {
     let mut palette = crate::palette::PaletteState::new();
     palette.resolve(&app.palette_live());
     assert_eq!(palette.action_by_name("Tables"), Ok(MenuAction::Tables));
+    for alias in ["Registry", "aRegistry", "aregistry"] {
+        assert_eq!(palette.action_by_name(alias), Ok(MenuAction::Registry));
+    }
     let row = palette
         .rows()
         .iter()
-        .find(|row| row.label == "Registry…")
+        .find(|row| row.label == "Tables…")
         .expect("a palette row");
     assert!(row.enabled && row.action == MenuAction::Tables && row.section == "aterm");
     assert_eq!(
@@ -1499,6 +1905,149 @@ fn an_unknown_writer_shows_its_short_id_dimmed() {
         style_of(&tree, "tables/pane/conflict/nickname/1/who"),
         Some(StyleRef::Note)
     );
+}
+
+/// A version 2 record says who made its change, why and on what evidence (TK-03), and the page
+/// prints it: the writer's words name its program beside the Mac (`claude · m73`), the history
+/// entry adds `By:` (the whole principal), `Why:` and `Evidence:` lines under its writer, and the
+/// field's line says `set by claude at m73`. A version 1 record's writer is named by its Mac
+/// alone.
+#[test]
+fn a_history_entry_prints_who_made_it_why_and_on_what_evidence() {
+    use aterm_db::{
+        said::Said,
+        typed::values::{Evidence, Principal},
+    };
+    let statement = Said {
+        principal: Principal {
+            session: Some("s-47051b9a207955a92b14".to_owned()),
+            program: Some("claude".to_owned()),
+            ..Principal::default()
+        },
+        reason: Some("TK-03: the Mac is in rack b".to_owned()),
+        evidence: vec![
+            Evidence::parse("commit:aterm@6159fb1b1e5").unwrap(),
+            Evidence::note("seen on the shelf"),
+        ],
+    };
+    let by = Author {
+        said: Some(statement),
+        ..author("m73", 2_000)
+    };
+    let mut snapshot = one_sheet(Shown {
+        text: "Spare".into(),
+        by: Some(by.clone()),
+        ..Shown::default()
+    });
+    snapshot.sheets[0].written.push(Written {
+        operation: [8; 32],
+        by: author("m22", 1_000),
+        cells: vec![WrittenCell {
+            pk: MC.into(),
+            column: "nickname".into(),
+            now: "Backup".into(),
+        }],
+    });
+    snapshot.sheets[0].written.push(Written {
+        operation: [9; 32],
+        by,
+        cells: vec![WrittenCell {
+            pk: MC.into(),
+            column: "nickname".into(),
+            now: "Spare".into(),
+        }],
+    });
+    let mut app = open_with(snapshot);
+    act(&mut app, &format!("tables/cell/{MC}/nickname"), None);
+    act(&mut app, "tables/pane/history", None);
+    let ui = render(&app);
+    let (newer, older) = (
+        aterm_codec::hex::encode_lower(&[9; 32]),
+        aterm_codec::hex::encode_lower(&[8; 32]),
+    );
+    let line = said(&ui, &format!("tables/history/at/{newer}/0")).unwrap_or_default();
+    assert!(line.starts_with("claude \u{b7} m73 \u{b7} "), "{line}");
+    let statement = |m: usize| said(&ui, &format!("tables/history/said/{newer}/{m}"));
+    assert_eq!(
+        statement(0).as_deref(),
+        Some("By: claude s-47051b9a207955a92b14")
+    );
+    assert_eq!(
+        statement(1).as_deref(),
+        Some("Why: TK-03: the Mac is in rack b"),
+        "the entry says why"
+    );
+    assert_eq!(
+        statement(2).as_deref(),
+        Some("Evidence: commit:aterm@6159fb1b1e5")
+    );
+    assert_eq!(
+        statement(3).as_deref(),
+        Some("Evidence: note:seen on the shelf")
+    );
+    assert_eq!(statement(4), None);
+    // A version 1 record: its Mac alone, and no statement.
+    let line = said(&ui, &format!("tables/history/at/{older}/0")).unwrap_or_default();
+    assert!(line.starts_with("m22 \u{b7} "), "{line}");
+    assert_eq!(said(&ui, &format!("tables/history/said/{older}/0")), None);
+    let words = said(&ui, "tables/said/words").unwrap_or_default();
+    assert!(
+        words.starts_with("Nickname: set by claude at m73 "),
+        "the line names who set the cell: {words}"
+    );
+}
+
+/// A writer in a session aterm read no program of is unknown: the page names it by its Mac,
+/// never by the writer's own word (`person`), which only the entry's `By:` line shows, marked.
+#[test]
+fn an_unknown_writer_in_a_session_is_named_by_its_mac_alone() {
+    use aterm_db::{said::Said, typed::values::Principal};
+    let by = Author {
+        said: Some(Said::by(Principal {
+            session: Some("tqn5r6e0148".to_owned()),
+            said: Some("person".to_owned()),
+            ..Principal::default()
+        })),
+        ..author("m73", 2_000)
+    };
+    assert_eq!(by.who(), "m73");
+    assert_eq!(by.statement(), ["By: tqn5r6e0148 (said: person)"]);
+}
+
+/// Whenever the read holds records it does not project, the page says how many and whose
+/// under its header (`aterm_db::typed::View::refused_words`), and still takes an edit; a read
+/// that holds none says nothing there. The line moves down the lists that open over the page.
+/// NEGATIVE CONTROL, observed: with the Columns list's `under` leaving out the line's height,
+/// it fails at `opens under` (the list at y 98 over its button at y 105).
+#[test]
+fn the_page_says_how_many_records_it_holds_and_does_not_read() {
+    let sentence = "1 record held here is not read: 1 signed by c05f416f (unsupported database \
+                application schema)";
+    let mut snapshot = one_sheet(Shown {
+        text: "Spare".into(),
+        ..Shown::default()
+    });
+    snapshot.refused = Some(sentence.to_owned());
+    let mut app = open_with(snapshot);
+    let ui = render(&app);
+    assert_eq!(said(&ui, "tables/refused").as_deref(), Some(sentence));
+    // The line moves the page under it down, and a list that opens over the page with it: the
+    // list of columns hangs under its button, not over the tools row.
+    let columns = super::native_tables_columns::COLUMNS;
+    act(&mut app, columns, None);
+    let ui = render(&app);
+    let (button, panel) = (rect(&ui, columns), rect(&ui, "tables/columns/panel"));
+    assert!(
+        panel.y >= button.bottom(),
+        "{panel:?} opens under {button:?}"
+    );
+    act(&mut app, columns, None);
+    let cell = format!("tables/cell/{MC}/nickname");
+    act(&mut app, &cell, None);
+    act(&mut app, &cell, None);
+    assert!(said(&render(&app), EDIT).is_some(), "the cell still opens");
+    let app = open_with(one_sheet(Shown::default()));
+    assert_eq!(said(&render(&app), "tables/refused"), None);
 }
 
 /// A sheet of `n` wide columns, `label` its key column, one row.
@@ -3814,6 +4363,7 @@ fn sheets_with_provenance(nickname_by: &str, ago: u64) -> Snapshot {
     .collect();
     snapshot.listed.push(crate::tables_store::Listed {
         name: "machine-facts",
+        family: snapshot.listed.first().map_or("", |listed| listed.family),
         title: "Machine facts",
         singular: "Machine's facts",
         face: aterm_db::typed::Face::Mac,

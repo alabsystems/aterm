@@ -10,7 +10,7 @@ use crate::channel::Log;
 use std::collections::BTreeSet;
 
 /// One durable regular-package publication, through Agh for both owners.
-pub const SYNOPSIS: &str = "publish-package PKG --build YYYYMMDDNN --source-repo DIR --state DIR [--program codex] [--valid-until YYYY-MM-DDTHH:MM:SSZ] (requires --host agh)";
+pub const SYNOPSIS: &str = "publish-package PKG --build YYYYMMDDNN --source-repo DIR --state DIR [--program codex] [--valid-until YYYY-MM-DDTHH:MM:SSZ] [--prepare-codex-protocol | --expect-codex-protocol SHA256] (requires --host agh)";
 
 /// Qualify, retain, stage, read back and publish one package and its exact index.
 /// # Errors
@@ -19,11 +19,17 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut native = Vec::new();
     let mut state = None;
     let mut valid_until = None;
+    let mut prepare_protocol = false;
+    let mut expected_protocol = None;
     let mut source = false;
     let mut seen = BTreeSet::new();
     let mut arguments = args.iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--prepare-codex-protocol" if !prepare_protocol => prepare_protocol = true,
+            "--expect-codex-protocol" if expected_protocol.is_none() => {
+                expected_protocol = Some(arguments.next().ok_or_else(|| Error::usage(SYNOPSIS))?);
+            }
             "--state" => {
                 let value = arguments.next().ok_or_else(|| Error::usage(SYNOPSIS))?;
                 if state.replace(PathBuf::from(value)).is_some() {
@@ -65,6 +71,11 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
         ));
     }
     let request = package::parse_args(&mut ctx.clone(), &native)?;
+    if (prepare_protocol || expected_protocol.is_some()) && request.program != "codex"
+        || prepare_protocol && (expected_protocol.is_some() || valid_until.is_some())
+    {
+        return Err(Error::usage(SYNOPSIS));
+    }
     if ctx.host_choice() != crate::ctx::HostChoice::Agh {
         return Err(Error::refused(
             "publish-package requires --host agh for journal-owned recovery on both owners",
@@ -75,12 +86,19 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let intent = Intent::from_package(ctx, &request.program, request.build, &pkg)?;
     let mut campaign = Campaign::open(&state, &intent)?;
     let inputs = crate::project_toolchain::Inputs::process(ctx, &request.source_repo);
+    let signed_root = |build| atpkg::cli::signed_tree_root("trust", build);
+    if prepare_protocol {
+        return campaign.prepare_protocol(ctx, &request, &HostTools, &inputs, &signed_root);
+    }
+    if let Some(hash) = expected_protocol {
+        campaign.expect_protocol(hash)?;
+    }
     let outcome = campaign.publish_package(
         ctx,
         &request,
         &HostTools,
         &inputs,
-        &|build| atpkg::cli::signed_tree_root("trust", build),
+        &signed_root,
         valid_until,
         &mut Log::echo("atpkg-publish publish-package"),
     )?;

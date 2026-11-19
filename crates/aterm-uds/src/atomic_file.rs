@@ -17,7 +17,7 @@ use std::path::Path;
 #[cfg(any(unix, windows))]
 #[path = "atomic_file_write.rs"]
 mod writer;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use writer::fresh_temp_component;
 #[cfg(any(unix, windows))]
 pub use writer::*;

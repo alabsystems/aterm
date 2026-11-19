@@ -2135,8 +2135,15 @@ read token
     aterm_uds::deadline::prints(&mut child, "ready", Duration::from_secs(60));
     let stage = index.join(format!("cache-receipt-{}_0000000000000000_0", child.id()));
     let live_refused = ordinary_clearance(&world.home, &unrelated).is_err();
-    child.kill().unwrap();
-    child.wait().unwrap();
+    aterm_uds::deadline::kill_within(&mut child, aterm_uds::deadline::ECHO_HANG);
+    let reaped = child.try_wait();
+    if !matches!(&reaped, Ok(Some(_))) {
+        let kept = world._directory.keep();
+        panic!(
+            "receipt writer did not reap after SIGKILL: {reaped:?}; kept {}",
+            kept.display()
+        );
+    }
     assert!(live_refused);
     assert!(
         ordinary_clearance(&world.home, &unrelated)
@@ -2962,8 +2969,22 @@ fn inherited_placement_keeps_known_choices_and_protects_unknown_ones() {
             .unwrap()
             .to_owned();
         let mut args = vec!["--unverified".into(), "build".into()];
+        let other_directory = (choice == "mismatch").then(|| {
+            aterm_tempfile::Builder::new()
+                .prefix("different-build-")
+                .suffix(".noindex")
+                .tempdir_in(world.home.parent().unwrap())
+                .unwrap()
+        });
         match choice {
-            "mismatch" => directory = "/some-other-directory".into(),
+            "mismatch" => {
+                directory = other_directory
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .display()
+                    .to_string()
+            }
             "opaque" => args.extend(["--config".into(), "choice.toml".into()]),
             "override" => args.extend(["--config".into(), "build.build-dir='user'".into()]),
             "file" => {
@@ -5280,9 +5301,9 @@ fn the_front_judges_the_line_targo_runs() {
     let args = words(&["xb"]);
     assert!(!observe_for_producer(&args, Tool::Targo, &world.home, &machine, false).unwrap());
     assert!(roots(&world.home)[0].owners_unknown);
-    // Observed where custody is not required, a line the front cannot tell may choose any
-    // registered root: each one's owners turn unknown. NEGATIVE CONTROL: a line it can tell
-    // that names none leaves them known.
+    // An unresolved included config may select an intermediate root the front cannot mark,
+    // so it refuses before an observer or compiler can mutate anything. A known config with
+    // no explicit intermediate choice remains an observation that grants no custody.
     for (config, unknown) in [("include = [\"aliases.toml\"]\n", true), ("", false)] {
         let (world, _, _) = fresh();
         world.build();
@@ -5299,8 +5320,18 @@ fn the_front_judges_the_line_targo_runs() {
             writable: &|_| Some(true),
         };
         let args = words(&["--unverified", "xd"]);
-        assert!(!observe_for_producer(&args, Tool::Targo, &world.home, &machine, false).unwrap());
-        assert_eq!(roots(&world.home)[0].owners_unknown, unknown, "{config:?}");
+        let before = std::fs::read(world.path()).unwrap();
+        let observed = observe_for_producer(&args, Tool::Targo, &world.home, &machine, false);
+        if unknown {
+            assert_eq!(
+                observed.unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            assert_eq!(std::fs::read(world.path()).unwrap(), before);
+        } else {
+            assert!(!observed.unwrap());
+        }
+        assert!(!roots(&world.home)[0].owners_unknown, "{config:?}");
     }
 }
 
@@ -10126,6 +10157,31 @@ fn through_clean_front_in(
 }
 
 #[cfg(target_os = "macos")]
+fn output_while_working(
+    command: &mut aterm_uds::spawnfd::Command,
+    what: &str,
+) -> std::process::Output {
+    let guard = std::time::Instant::now() + aterm_spec::wait::WORKING_GUARD;
+    let mut guard_expired = false;
+    let result = aterm_uds::deadline::output_from_while_process_progressing_unless(
+        command,
+        aterm_uds::spawnfd::Stdio::null(),
+        aterm_spec::wait::MUST_HAPPEN,
+        what,
+        &mut || {
+            guard_expired |= std::time::Instant::now() >= guard;
+            guard_expired
+        },
+    );
+    assert!(
+        !guard_expired,
+        "{what} did not finish before its {:?} working guard",
+        aterm_spec::wait::WORKING_GUARD
+    );
+    result.unwrap_or_else(|error| panic!("{what}: {error:?}"))
+}
+
+#[cfg(target_os = "macos")]
 fn through_placed_front(
     world: &World,
     cwd: &Path,
@@ -10165,15 +10221,10 @@ fn through_placed_front(
     if let Some(directory) = build_env {
         command.env(super::super::BUILD_DIR_ENV, directory);
     }
-    // The front can run a real build (the compiler and its build scripts), which a loaded Mac
-    // stretches past any wall-clock minute while it keeps working: the run is held to its own
-    // and its descendants' progress, a minute without any being the hang.
-    aterm_uds::deadline::output_while_process_progressing(
+    output_while_working(
         &mut command,
-        aterm_spec::wait::MUST_HAPPEN,
-        "the placed front's run of its tool",
+        "the registered cache front completes its tool",
     )
-    .unwrap_or_else(|why| panic!("{why}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -10357,7 +10408,9 @@ fn quiet_front_prepares_foreign_manifest_targets_without_claiming_custody() {
                 words.push("--config=build.build-dir='caller-layout'".into());
             }
             let out = through_clean_front(&world, Path::new("/bin/echo"), &words);
-            let admitted = matches!(shape, "safe" | "outside-target" | "override");
+            // Trust's separate explicit-config frontend cannot establish a marked root.
+            let admitted =
+                matches!(shape, "safe" | "outside-target") || (shape == "override" && !trust);
             let started = String::from_utf8_lossy(&out.stdout)
                 .lines()
                 .any(|line| line.ends_with(&words.join(" ")));
@@ -11553,13 +11606,10 @@ fn a_real_clean_and_rebuild_publish_fresh_owned_output_over_only_a_missing_root(
     if let Some(path) = std::env::var_os("PATH") {
         foreign.env("PATH", path);
     }
-    // A real build, held to its progress as `through_placed_front`'s is.
-    let out = aterm_uds::deadline::output_while_process_progressing(
+    let out = output_while_working(
         &mut foreign,
-        aterm_spec::wait::MUST_HAPPEN,
-        "the foreign producer's build",
-    )
-    .unwrap_or_else(|why| panic!("{why}"));
+        "the unregistered compiler writes replacement output",
+    );
     assert!(
         out.status.success(),
         "unregistered compiler output: {out:?}"
@@ -14168,8 +14218,15 @@ fn the_front_records_the_target_of_the_config_list_targo_merges() {
             false,
         ),
     ] {
-        let world = World::new();
+        let world = World::in_directory(
+            aterm_tempfile::Builder::new()
+                .prefix("alias-A-")
+                .tempdir()
+                .unwrap(),
+        );
         let named = world.home.join("A");
+        let named_config = format!("build.target-dir='{}'", named.display());
+        let alias = alias.replace("build.target-dir='A'", &named_config);
         std::fs::create_dir_all(world.owner.join(".cargo")).unwrap();
         std::fs::write(
             world.owner.join(".cargo/config.toml"),
@@ -14177,8 +14234,7 @@ fn the_front_records_the_target_of_the_config_list_targo_merges() {
                 "[build]\ntarget-dir = \"{}\"\n[alias]\nxb = [{}]\n",
                 world.target.display(),
                 alias,
-            )
-            .replace('A', &named.display().to_string()),
+            ),
         )
         .unwrap();
         let env = |_: &str| None;
@@ -14192,7 +14248,7 @@ fn the_front_records_the_target_of_the_config_list_targo_merges() {
             writable: &|_| Some(true),
         };
         let args: Vec<String> = typed
-            .replace('A', &named.display().to_string())
+            .replace("build.target-dir='A'", &named_config)
             .split(' ')
             .map(str::to_owned)
             .collect();
@@ -14202,7 +14258,10 @@ fn the_front_records_the_target_of_the_config_list_targo_merges() {
             .map(|made| made.root)
             .collect();
         let expected = if recorded { &named } else { &world.target };
-        assert_eq!(verdict.ok(), Some(true), "{row}: {made:?}");
+        assert!(
+            matches!(&verdict, Ok(true)),
+            "{row}: {verdict:?}; roots={made:?}"
+        );
         assert_eq!(made.as_slice(), std::slice::from_ref(expected), "{row}");
     }
     // A help call through the alias builds nothing, whatever a variable names.
@@ -14357,5 +14416,270 @@ fn a_checkout_whose_alias_names_a_target_builds_unrefused() {
             owes,
             "{text:?}"
         );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn explicit_intermediate_roots_require_noindex_before_creation_and_are_marked_on_reuse() {
+    use aterm_uds::backup::Backups;
+    for source in ["cargo-env", "targo-env", "cli", "config"] {
+        for protected in [false, true] {
+            let world = World::in_directory(
+                aterm_tempfile::Builder::new()
+                    .prefix("explicit-build-")
+                    .heard()
+                    .tempdir_in("/tmp")
+                    .unwrap(),
+            );
+            let target = world.home.join("final-output");
+            let intermediate = world.home.join(if protected {
+                ".ubd/intermediates.noindex"
+            } else {
+                ".ubd/intermediates"
+            });
+            let mut args = vec![
+                "--unverified".into(),
+                "build".into(),
+                "--target-dir".into(),
+                target.display().to_string(),
+            ];
+            if source == "cli" {
+                args.extend([
+                    "--config".into(),
+                    format!("build.build-dir='{}'", intermediate.display()),
+                ]);
+            } else if source == "config" {
+                std::fs::create_dir(world.owner.join(".cargo")).unwrap();
+                std::fs::write(
+                    world.owner.join(".cargo/config.toml"),
+                    format!("[build]\nbuild-dir='{}'\n", intermediate.display()),
+                )
+                .unwrap();
+            }
+            let environment = |name: &str| {
+                ((source == "cargo-env" && name == super::super::BUILD_DIR_ENV)
+                    || (source == "targo-env" && name == super::super::BUILD_DIR_TWIN))
+                    .then(|| intermediate.as_os_str().to_owned())
+            };
+            let machine = super::super::Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&world.owner),
+                env: &environment,
+                read: &super::super::read_config,
+                read_manifest: &super::super::read_manifest,
+                writable: &|_| Some(true),
+            };
+            let verdict = observe_for_producer(
+                &args,
+                super::super::Tool::Targo,
+                &world.home,
+                &machine,
+                true,
+            );
+            if !protected {
+                let error = verdict.unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "{source}: {error}"
+                );
+                assert!(error.to_string().contains(".noindex"), "{source}: {error}");
+                assert!(!intermediate.exists() && !target.exists(), "{source}");
+                assert!(roots(&world.home).is_empty(), "{source}");
+                continue;
+            }
+            assert!(verdict.unwrap(), "{source}");
+            assert!(Backups::SYSTEM.excluded(&std::fs::File::open(&intermediate).unwrap()));
+            assert!(!Backups::SYSTEM.excluded(&std::fs::File::open(&target).unwrap()));
+            std::fs::write(intermediate.join("kept-object"), b"existing output").unwrap();
+            assert!(
+                observe_for_producer(
+                    &args,
+                    super::super::Tool::Targo,
+                    &world.home,
+                    &machine,
+                    true,
+                )
+                .unwrap(),
+                "{source}"
+            );
+            assert!(Backups::SYSTEM.excluded(&std::fs::File::open(&intermediate).unwrap()));
+            assert_eq!(
+                std::fs::read(intermediate.join("kept-object")).unwrap(),
+                b"existing output"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_existing_explicit_build_folder_is_marked_without_changing_its_contents() {
+    use aterm_uds::backup::Backups;
+    let directory = aterm_tempfile::Builder::new()
+        .heard()
+        .tempdir_in("/tmp")
+        .unwrap();
+    let build = directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".ubd/build.noindex");
+    std::fs::create_dir_all(&build).unwrap();
+    std::fs::write(build.join("kept-object"), b"existing output").unwrap();
+    assert!(!Backups::SYSTEM.excluded(&std::fs::File::open(&build).unwrap()));
+    for _ in 0..2 {
+        prepare_explicit_build_dir(&build).unwrap();
+        assert!(Backups::SYSTEM.excluded(&std::fs::File::open(&build).unwrap()));
+        assert_eq!(
+            std::fs::read(build.join("kept-object")).unwrap(),
+            b"existing output"
+        );
+    }
+}
+
+#[test]
+fn explicit_build_templates_need_a_known_unindexed_boundary_without_parent_traversal() {
+    let world = World::in_directory(aterm_tempfile::Builder::new().heard().tempdir().unwrap());
+    let cargo_home = world.home.join("cargo-home");
+    for (value, expected) in [
+        (
+            "{workspace-root}/build.noindex/{workspace-path-hash}",
+            world.owner.join("build.noindex"),
+        ),
+        (
+            "{cargo-cache-home}/build.noindex/{workspace-path-hash}/objects",
+            cargo_home.join("build.noindex"),
+        ),
+    ] {
+        assert_eq!(
+            explicit_build_root(Path::new(value), Some(&world.owner), Some(&cargo_home)).unwrap(),
+            expected,
+        );
+        assert!(!expected.exists(), "validation creates nothing");
+    }
+    for value in [
+        "{workspace-root}/indexed-{workspace-path-hash}.noindex",
+        "{workspace-root}/build.noindex/{workspace-path-hash}/../../escape",
+        "{workspace-root}/build.noindex/{unknown}",
+        "{workspace-root}/build.noindex/}",
+    ] {
+        assert!(
+            explicit_build_root(Path::new(value), Some(&world.owner), Some(&cargo_home)).is_err(),
+            "{value}",
+        );
+    }
+    assert!(explicit_build_root(Path::new("{workspace-root}/build.noindex"), None, None).is_err());
+    let unknown_source = world.home.join("repo.noindex");
+    assert!(
+        explicit_build_root(
+            &unknown_source.join("{workspace-path-hash}"),
+            None,
+            Some(&cargo_home),
+        )
+        .is_err()
+    );
+    assert!(
+        !unknown_source.exists(),
+        "an unknown source boundary is never created or claimed"
+    );
+    use std::os::unix::ffi::OsStrExt as _;
+    let literal = world
+        .home
+        .join(std::ffi::OsStr::from_bytes(b"build-\xff.noindex"));
+    assert_eq!(explicit_build_root(&literal, None, None).unwrap(), literal);
+    assert!(!literal.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn foreign_workspace_template_intermediates_are_protected_or_refused_before_creation() {
+    use aterm_uds::backup::Backups;
+    for (workspace_name, plain, protected_value) in [
+        (
+            "foreign-source",
+            "{workspace-root}/build-{workspace-path-hash}.noindex",
+            "{workspace-root}/build.noindex/{workspace-path-hash}",
+        ),
+        (
+            "repo.noindex",
+            "{workspace-path-hash}",
+            "build.noindex/{workspace-path-hash}",
+        ),
+    ] {
+        for source in ["environment", "cli"] {
+            for protected in [false, true] {
+                let world = World::in_directory(
+                    aterm_tempfile::Builder::new()
+                        .heard()
+                        .tempdir_in("/tmp")
+                        .unwrap(),
+                );
+                let foreign = world.home.parent().unwrap().join(workspace_name);
+                std::fs::create_dir(&foreign).unwrap();
+                std::fs::write(
+                    foreign.join("Cargo.toml"),
+                    "[package]\nname='foreign'\nversion='0.0.0'\n[workspace]\n",
+                )
+                .unwrap();
+                let value = if protected { protected_value } else { plain };
+                let environment = |name: &str| {
+                    (source == "environment" && name == super::super::BUILD_DIR_ENV)
+                        .then(|| std::ffi::OsString::from(value))
+                };
+                let mut args = vec!["--unverified".into(), "build".into()];
+                if source == "cli" {
+                    args.extend(["--config".into(), format!("build.build-dir='{value}'")]);
+                }
+                let machine = super::super::Machine {
+                    home: Some(&world.home),
+                    root: None,
+                    cwd: Some(&foreign),
+                    env: &environment,
+                    read: &super::super::read_config,
+                    read_manifest: &super::super::read_manifest,
+                    writable: &|_| Some(true),
+                };
+                let verdict = observe_for_producer(
+                    &args,
+                    super::super::Tool::Targo,
+                    &world.home,
+                    &machine,
+                    true,
+                );
+                let build = foreign.join("build.noindex");
+                if protected {
+                    assert!(
+                        !verdict.unwrap(),
+                        "no custody is granted outside the managed home"
+                    );
+                    assert!(Backups::SYSTEM.excluded(&std::fs::File::open(&build).unwrap()));
+                    assert_eq!(
+                        std::fs::read_dir(&build).unwrap().count(),
+                        0,
+                        "the hash stays Cargo's to compute"
+                    );
+                } else {
+                    assert_eq!(
+                        verdict.unwrap_err().kind(),
+                        std::io::ErrorKind::InvalidInput
+                    );
+                    assert!(!build.exists());
+                    assert_eq!(
+                        std::fs::read_dir(&foreign).unwrap().count(),
+                        1,
+                        "no output was created"
+                    );
+                }
+                assert!(
+                    !Backups::SYSTEM.excluded(&std::fs::File::open(&foreign).unwrap()),
+                    "source workspace stays in backups: {workspace_name} {source}"
+                );
+                assert!(!foreign.join("target").exists());
+                assert!(roots(&world.home).is_empty());
+            }
+        }
     }
 }

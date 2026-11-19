@@ -330,6 +330,7 @@ const fn mark_worth_a_line(k: Kind) -> bool {
             | Kind::MailGap
             | Kind::Tab
             | Kind::Desc
+            | Kind::Refused
     )
 }
 

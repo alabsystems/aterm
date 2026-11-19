@@ -3,7 +3,7 @@
 
 //! One actual caller drives owned native jobs; private ledgers and native fixtures.
 
-use super::host::{Completion, JobId, Jobs};
+use super::host::{Completion, JobId, Jobs, Ticket};
 use super::*;
 use aterm_capacity::cohort::launch::CohortSignal;
 use aterm_uds::spawnfd::{self, Stdio};
@@ -62,8 +62,30 @@ fn shared_host_wait_services_mixed_interests_and_buffered_work() {
     assert!(wake.deadline && wake.jobs_hint && !wake.control_ready);
 }
 
+struct FixtureJobs(Option<Jobs>);
+
+impl std::ops::Deref for FixtureJobs {
+    type Target = Jobs;
+    fn deref(&self) -> &Jobs {
+        self.0.as_ref().expect("the fixture owns its native table")
+    }
+}
+
+impl std::ops::DerefMut for FixtureJobs {
+    fn deref_mut(&mut self) -> &mut Jobs {
+        self.0.as_mut().expect("the fixture owns its native table")
+    }
+}
+
+struct TrackedJob {
+    ticket: Ticket,
+    path: PathBuf,
+    root: Option<u32>,
+}
+
 struct Driver {
-    jobs: Jobs,
+    jobs: FixtureJobs,
+    roots: Vec<TrackedJob>,
     control: std::io::PipeReader,
     sender: std::io::PipeWriter,
     events: Vec<(JobId, SupervisedEvent)>,
@@ -77,7 +99,8 @@ impl Driver {
     fn new(world: &Path) -> Self {
         let (control, sender) = aterm_uds::pipe().unwrap();
         Self {
-            jobs: Jobs::new(2).unwrap(),
+            jobs: FixtureJobs(Some(Jobs::new(2).unwrap())),
+            roots: Vec::new(),
             control,
             sender,
             events: Vec::new(),
@@ -137,46 +160,179 @@ impl Driver {
             .unwrap(),
         );
     }
-    fn until(&mut self, why: &str, found: impl Fn(&Self) -> bool) {
-        self.phase(why);
-        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        loop {
-            self.tick();
-            if found(self) {
-                return;
-            }
+    fn submit(
+        &mut self,
+        path: &Path,
+        held: Held,
+        command: &mut spawnfd::Command,
+        grace: Duration,
+    ) -> Ticket {
+        let (started, root) = std::sync::mpsc::channel();
+        HEADLESS_ROOT_STARTED.with(|slot| {
             assert!(
-                !self.jobs.is_empty(),
-                "unmet host phase {why}: {:?}; {:?}",
-                self.events,
-                self.done
+                slot.borrow_mut().replace(started).is_none(),
+                "one native root observer"
             );
-            self.phase(why);
-            assert!(Instant::now() < deadline, "native table hang: {why}");
-            self.jobs.wait(self.control.as_fd(), deadline).unwrap();
+        });
+        let submitted = self.jobs.submit(held, command, grace);
+        HEADLESS_ROOT_STARTED.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        let ticket = submitted.expect("the native table accepted its owned job");
+        self.roots.push(TrackedJob {
+            ticket: ticket.clone(),
+            path: path.to_owned(),
+            root: None,
+        });
+        let root = root
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the table publishes its actual owned native root");
+        self.roots.last_mut().unwrap().root = Some(root);
+        ticket
+    }
+    fn root(&self, id: &JobId) -> u32 {
+        self.roots
+            .iter()
+            .find(|job| &job.ticket.id == id)
+            .and_then(|job| job.root)
+            .expect("the job's actual owned root was published")
+    }
+    fn until(&mut self, id: &JobId, why: &str, found: impl Fn(&Self) -> bool) {
+        self.phase(why);
+        let root = self.root(id);
+        match aterm_spec::wait::within_while_working(
+            root,
+            aterm_spec::wait::MUST_HAPPEN,
+            aterm_spec::wait::WORKING_GUARD,
+            Duration::from_millis(10),
+            || {
+                self.tick();
+                if found(self) {
+                    return Some(());
+                }
+                assert!(
+                    !self.jobs.is_empty(),
+                    "unmet host phase {why}: {:?}; {:?}",
+                    self.events,
+                    self.done
+                );
+                self.jobs
+                    .wait(
+                        self.control.as_fd(),
+                        Instant::now() + Duration::from_millis(10),
+                    )
+                    .unwrap();
+                None
+            },
+        ) {
+            Ok(()) => {}
+            Err(aterm_spec::wait::Unanswered::Ended) => {
+                // Root exit is not its owning reap or durable cohort settlement.
+                aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, why, || {
+                    self.tick();
+                    if found(self) {
+                        return Some(());
+                    }
+                    assert!(
+                        !self.jobs.is_empty(),
+                        "unmet host phase {why}: {:?}; {:?}",
+                        self.events,
+                        self.done
+                    );
+                    self.jobs
+                        .wait(
+                            self.control.as_fd(),
+                            Instant::now() + Duration::from_millis(10),
+                        )
+                        .unwrap();
+                    None
+                });
+            }
+            Err(ended) => panic!(
+                "native table hang: {why}: {ended:?}; {:?}; {:?}",
+                self.events, self.done
+            ),
         }
     }
     fn ready(&mut self, paths: &[&Path]) {
         self.phase("waiting for actual fixture readiness");
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "actual fixture readiness",
-            || {
+        for path in paths {
+            let root = self
+                .roots
+                .iter()
+                .find(|job| job.path.as_path() == *path)
+                .and_then(|job| job.root)
+                .expect("readiness belongs to one submitted native root");
+            aterm_spec::wait::until_while_working(root, "actual fixture readiness", || {
                 self.tick();
                 assert!(
                     self.done.is_empty(),
                     "no fixture may end before readiness: {:?}",
                     self.done
                 );
-                paths
-                    .iter()
-                    .all(|path| path.join("ready").exists())
-                    .then_some(())
-            },
-        );
+                path.join("ready").exists().then_some(())
+            });
+        }
+    }
+    fn keep_cleanup(&self, why: &str) {
+        if let Some(world) = self.trace.parent() {
+            let _ = std::fs::write(world.join("owner-cleanup"), why);
+            let _ = writeln!(std::io::stderr(), "KEPT {}: {why}", world.display());
+        }
     }
     fn result(&self, id: &JobId) -> &std::io::Result<JobOutcome> {
         &self.done.iter().find(|done| &done.id == id).unwrap().result
+    }
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        let Some(mut jobs) = self.jobs.0.take() else {
+            return;
+        };
+        if jobs.is_empty() {
+            drop(jobs);
+            return;
+        }
+        let unwinding = std::thread::panicking();
+        self.keep_cleanup("the table fixture was dropped with owned jobs");
+        for job in &self.roots {
+            let _ = std::fs::write(job.path.join("release"), b"fixture cleanup");
+        }
+        for job in &self.roots {
+            let _ = job.ticket.cancel.request(CancelRequest::Terminate);
+        }
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while !jobs.is_empty() && Instant::now() < deadline {
+            match jobs.tick(&mut |_, _| Ok(JobControl::Wait), &mut |_| {}) {
+                Ok(done) => self.done.extend(done),
+                Err(error) => {
+                    self.keep_cleanup(&format!("the owned table cleanup failed: {error}"));
+                    break;
+                }
+            }
+            if !jobs.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if !jobs.is_empty() {
+            self.keep_cleanup("the table did not drain before its cleanup hang detector; native custody remains retained");
+            std::mem::forget(jobs);
+        } else {
+            if !self.done.iter().all(|row| {
+                row.result.as_ref().is_ok_and(|outcome| {
+                    outcome.cohort_settlement() == Some(CohortSettlement::Drained)
+                })
+            }) {
+                self.keep_cleanup(
+                    "a table cleanup completion has no positive drained-cohort outcome",
+                );
+            }
+            drop(jobs);
+        }
+        if !unwinding {
+            panic!("the table fixture was dropped before its owned jobs completed");
+        }
     }
 }
 
@@ -228,21 +384,16 @@ fn native_table_actor_if_requested() {
     driver.phase("submitting first root");
     let peer = world.join("peer");
     let (mut command, _input) = worker(&first, false);
-    let ticket = driver
-        .jobs
-        .submit(
-            held(&first, &seat),
-            &mut command,
-            Duration::from_millis(100),
-        )
-        .unwrap();
+    let ticket = driver.submit(
+        &first,
+        held(&first, &seat),
+        &mut command,
+        Duration::from_millis(100),
+    );
     assert!(!command.starts_suspended());
     let (mut command, mut peer_input) = worker(&peer, true);
     driver.phase("submitting peer");
-    let peer_ticket = driver
-        .jobs
-        .submit(held(&peer, &seat), &mut command, Duration::ZERO)
-        .unwrap();
+    let peer_ticket = driver.submit(&peer, held(&peer, &seat), &mut command, Duration::ZERO);
     assert_eq!(driver.jobs.len(), 2);
     let mut forbidden = spawnfd::command("/usr/bin/touch");
     driver.phase("refusing full table");
@@ -264,7 +415,7 @@ fn native_table_actor_if_requested() {
             .iter()
             .all(|r| r.accounting == aterm_capacity::Accounting::Whole)
     );
-    driver.until("peer actually stops", |d| {
+    driver.until(&peer_ticket.id, "peer actually stops", |d| {
         d.events.iter().any(|(id, event)| {
             id == &peer_ticket.id && matches!(event, SupervisedEvent::Stopped(_))
         })
@@ -297,7 +448,7 @@ fn native_table_actor_if_requested() {
     assert_eq!(byte, *b"c", "host control wake did not consume its message");
     let issued = Instant::now();
     ticket.cancel.request(CancelRequest::Terminate).unwrap();
-    driver.until("first cancelled root completes", |d| {
+    driver.until(&ticket.id, "first cancelled root completes", |d| {
         d.done.iter().any(|done| done.id == ticket.id)
     });
     assert!(Instant::now() >= issued + Duration::from_millis(100));
@@ -323,7 +474,9 @@ fn native_table_actor_if_requested() {
         std::io::ErrorKind::NotFound
     );
     peer_input.write_all(b"done\n").unwrap();
-    driver.until("peer completes independently", |d| d.jobs.is_empty());
+    driver.until(&peer_ticket.id, "peer completes independently", |d| {
+        d.jobs.is_empty()
+    });
     assert!(driver.result(&peer_ticket.id).as_ref().unwrap().succeeded());
     assert!(ledger.list().unwrap().is_empty());
 
@@ -331,10 +484,7 @@ fn native_table_actor_if_requested() {
     driver.done.clear();
     let failed = world.join("failed-observer");
     let (mut command, _input) = worker(&failed, false);
-    let rejected = driver
-        .jobs
-        .submit(held(&failed, &seat), &mut command, Duration::ZERO)
-        .unwrap();
+    let rejected = driver.submit(&failed, held(&failed, &seat), &mut command, Duration::ZERO);
     assert!(rejected.id.sequence() > peer_ticket.id.sequence());
     assert_eq!(
         driver
@@ -347,9 +497,11 @@ fn native_table_actor_if_requested() {
     driver.ready(&[&failed]);
     driver.reject = Some(rejected.id.clone());
     rejected.cancel.request(CancelRequest::Terminate).unwrap();
-    driver.until("failed observer is cleaned without blocking table", |d| {
-        d.jobs.is_empty()
-    });
+    driver.until(
+        &rejected.id,
+        "failed observer is cleaned without blocking table",
+        |d| d.jobs.is_empty(),
+    );
     assert_eq!(
         driver.result(&rejected.id).as_ref().unwrap_err().kind(),
         std::io::ErrorKind::Other
@@ -376,37 +528,49 @@ fn native_table_actor_if_requested() {
         .stdin(Stdio::from(exit_reader))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let clean_ticket = driver
-        .jobs
-        .submit(held(&clean, &seat), &mut command, Duration::from_secs(600))
-        .unwrap();
+    let clean_ticket = driver.submit(
+        &clean,
+        held(&clean, &seat),
+        &mut command,
+        Duration::from_secs(600),
+    );
     driver.ready(&[&clean]);
     clean_ticket
         .cancel
         .request(CancelRequest::Terminate)
         .unwrap();
-    driver.until("cleanup root waits for the accepted CONT", |d| {
-        d.events.iter().any(|(id, event)| {
-            id == &clean_ticket.id
-                && *event == SupervisedEvent::GroupRequestAccepted(CohortSignal::Continue)
-        })
-    });
+    driver.until(
+        &clean_ticket.id,
+        "cleanup root waits for the accepted CONT",
+        |d| {
+            d.events.iter().any(|(id, event)| {
+                id == &clean_ticket.id
+                    && *event == SupervisedEvent::GroupRequestAccepted(CohortSignal::Continue)
+            })
+        },
+    );
     exit_writer.write_all(&[1]).unwrap();
     drop(exit_writer);
-    driver.until("cleanup root exit observed without reaping", |d| {
-        d.events.iter().any(|(id, event)| {
-            id == &clean_ticket.id && *event == SupervisedEvent::RootExitObserved
-        })
-    });
+    driver.until(
+        &clean_ticket.id,
+        "cleanup root exit observed without reaping",
+        |d| {
+            d.events.iter().any(|(id, event)| {
+                id == &clean_ticket.id && *event == SupervisedEvent::RootExitObserved
+            })
+        },
+    );
     assert_eq!(driver.jobs.len(), 1);
     assert_eq!(
         ledger.list().unwrap()[0].accounting,
         aterm_capacity::Accounting::Whole
     );
     clean_ticket.cancel.request(CancelRequest::Kill).unwrap();
-    driver.until("explicit KILL permits accounted reap", |d| {
-        d.jobs.is_empty()
-    });
+    driver.until(
+        &clean_ticket.id,
+        "explicit KILL permits accounted reap",
+        |d| d.jobs.is_empty(),
+    );
     match driver.result(&clean_ticket.id) {
         Ok(outcome) => {
             assert!(outcome.root_status().success());
@@ -457,16 +621,15 @@ fn native_table_actor_if_requested() {
     // Emergency table Drop must reap its exact owned root as well.
     let abort = world.join("abort");
     let (mut command, _input) = worker(&abort, false);
-    let _abort_ticket = driver
-        .jobs
-        .submit(held(&abort, &seat), &mut command, Duration::ZERO)
-        .unwrap();
+    let _abort_ticket = driver.submit(&abort, held(&abort, &seat), &mut command, Duration::ZERO);
     driver.done.clear();
     driver.ready(&[&abort]);
     let pid: u32 = std::fs::read_to_string(abort.join("ready"))
         .unwrap()
         .parse()
         .unwrap();
+    // Exercise the actual production table Drop, independent of fixture failure cleanup.
+    drop(driver.jobs.0.take().expect("the actual native table"));
     drop(driver);
     assert_reaped(pid);
     assert!(ledger.list().unwrap().is_empty());
@@ -503,22 +666,29 @@ fn run_actor() {
             "--nocapture",
         ])
         .env(ACTOR, world.path());
-    let output = aterm_uds::deadline::output_while_process_progressing(
-        &mut command,
-        aterm_spec::wait::MUST_HAPPEN,
-        "host table actor",
-    )
-    .unwrap_or_else(|error| {
+    let output = actor_output(&mut command, "the private native table actor finishes");
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let phase = std::fs::read_to_string(world.path().join("phase")).unwrap_or_default();
+            let world = world.keep();
+            panic!(
+                "actor {error}; last phase: {phase}; KEPT {}",
+                world.display()
+            );
+        }
+    };
+    let cleanup = world.path().join("owner-cleanup").exists();
+    if !output.status.success() || cleanup {
+        let phase = std::fs::read_to_string(world.path().join("phase")).unwrap_or_default();
+        let world = world.keep();
         panic!(
-            "actor {error:?}; last phase: {}",
-            std::fs::read_to_string(world.path().join("phase")).unwrap_or_default()
-        )
-    });
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+            "table actor failed ({}; owner cleanup={cleanup}): {}; last phase: {phase}; KEPT {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            world.display()
+        );
+    }
 }
 
 #[test]

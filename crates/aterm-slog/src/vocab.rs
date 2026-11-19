@@ -237,6 +237,7 @@ kinds! {
     MailGap => "mail-gap",
     Tab => "tab",
     Desc => "desc",
+    Refused => "refused",
 }
 
 impl Kind {
@@ -324,6 +325,7 @@ impl Kind {
                 | Kind::MailGap
                 | Kind::Tab
                 | Kind::Desc
+                | Kind::Refused
         )
     }
 
@@ -611,9 +613,9 @@ impl Actor {
     /// characters (each outside the id alphabet as `-`) and `<sid>` `-` where the drive names no
     /// session aterm minted ([`aterm_types::control_verbs::is_minted_sid`]), so a whole sid always
     /// fits [`ShortId::MAX`]; [`Actor::Nobody`] for a node with nothing to name. The sid is the
-    /// driving Mac's claim, scoped by the node its handshake proved: the sid= of the drive's
-    /// requester line, which names a tab ID or the exact `s-` ID a tab opened before the `t` form
-    /// keeps on its own Mac until it closes, so two such tabs' drives stay two actors.
+    /// driving Mac's claim, scoped by the node its handshake proved, and names only a current
+    /// requester ID. Stored actors from earlier builds are read separately by [`Actor::from_word`],
+    /// which preserves their historical spelling.
     #[must_use]
     pub fn fleet_drive(node: &str, sid: Option<&str>) -> Actor {
         let head: String = node

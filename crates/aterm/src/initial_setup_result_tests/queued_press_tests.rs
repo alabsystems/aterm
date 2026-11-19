@@ -229,7 +229,9 @@ fn a_press_made_as_a_waited_restore_takes_the_records_replaces_it() {
             }
             // It has the records and has written nothing: the person presses a group now.
             let _ = took.send(());
-            let _ = pressed.recv_timeout(HANG);
+            pressed
+                .recv_timeout(HANG)
+                .expect("the later choice is submitted before Restore continues");
             let go = holding();
             ran |= go;
             holding_records(go)

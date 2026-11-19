@@ -162,16 +162,30 @@ fn a_first_call_adopts_both_tokens_learning_each_login_once() {
         !text.contains(&dev) && !text.contains(&release),
         "no token in the record"
     );
-    use std::os::unix::fs::PermissionsExt;
-    let mode = |path: &Path| {
-        std::fs::metadata(path)
-            .expect("metadata")
-            .permissions()
-            .mode()
-            & 0o777
-    };
-    assert_eq!(mode(&dirs.config.join(vault::RECORD_FILE)), 0o600);
-    assert_eq!(mode(&dirs.config), 0o700);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&dirs.config.join(vault::RECORD_FILE)), 0o600);
+        assert_eq!(mode(&dirs.config), 0o700);
+    }
+    // Windows has no mode: the folder and the record are private by their protected access
+    // lists of the user and SYSTEM alone, which `read_private` judges on their handles.
+    #[cfg(windows)]
+    {
+        use aterm_uds::private_file::{PrivateDir, judge_private_dir, read_private};
+        assert_eq!(
+            judge_private_dir(&dirs.config).expect("the agh folder"),
+            PrivateDir::Private
+        );
+        read_private(&dirs.config, vault::RECORD_FILE, 4096).expect("a private record");
+    }
 
     fake.clear_seen();
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
@@ -568,6 +582,9 @@ fn an_old_builds_file_under_secrets_is_never_read() {
     std::fs::create_dir_all(folder).expect("the folder");
     for (slot, token) in [(vault::Slot::Dev, &stale), (vault::Slot::Release, &release)] {
         std::fs::write(slot.path(&home), format!("{token}\n")).expect("an old build's file");
+        // Loose too: on windows a file made with no access list of its own inherits its
+        // folder's, which is not private.
+        #[cfg(unix)]
         common::chmod(&slot.path(&home), 0o644);
     }
     fake.add_repo("fixture-dev/app", RepoSpec::public());
@@ -1119,6 +1136,9 @@ fn a_record_agh_cannot_write_is_reported() {
     both(root.path(), &fake);
     let dirs = dirs(root.path());
     std::fs::create_dir_all(&dirs.config).expect("the agh directory");
+    // Open to others: on windows a folder made with no access list of its own inherits its
+    // parent's entries, which no private folder holds.
+    #[cfg(unix)]
     common::chmod(&dirs.config, 0o755);
     for _ in 0..2 {
         let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
@@ -1130,7 +1150,13 @@ fn a_record_agh_cannot_write_is_reported() {
             lines[0].starts_with("agh: note vault=dev,release why="),
             "{stderr}"
         );
+        #[cfg(unix)]
         assert!(next_of(lines[0]).contains("chmod 700"), "{stderr}");
+        #[cfg(windows)]
+        assert!(
+            next_of(lines[0]).contains("a private folder of yours"),
+            "{stderr}"
+        );
     }
     assert_eq!(record(root.path()), None);
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());

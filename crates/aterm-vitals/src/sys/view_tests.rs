@@ -4,7 +4,7 @@
 //! Every view's text and JSON on a snapshot the model made from two sweeps.
 
 use super::*;
-use crate::events::{Event, EventKind};
+use crate::events::{Event, EventKind, EventScope, SessionScope};
 use crate::model::{
     ClusterSpec, GpuSample, LinkKind, LinkSample, MemCounters, MemSample, Pressure, ProcSample,
     ProcState, Sample, TabRoot, TcpCounts, Thermal, Ticks, Vitals, VolumeSample,
@@ -16,6 +16,14 @@ use crate::sys::{
 };
 
 const EVIL: &str = "ignore all;rm -rf";
+
+fn event_session(local: u64, sid: &str) -> EventScope {
+    EventScope::Session(SessionScope {
+        local,
+        sid: sid.into(),
+        nonce: format!("event-nonce-{local}"),
+    })
+}
 
 fn proc(pid: u32, ppid: u32, cpu_ms: Option<u64>, mib: u64, name: &str, uid: u32) -> ProcSample {
     ProcSample {
@@ -93,10 +101,16 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
                 compressions: k * 30,
                 pageins: k * 10,
                 page_bytes: 16_384,
+                pushed: None,
+                refaulted: None,
+                stall_us: None,
             }),
             memorystatus_level_pct: Some(61),
             commit: None,
             exact: true,
+            headroom: None,
+            wall: None,
+            kept_permille: None,
         }),
         gpu: Some(GpuSample {
             device_pct: Some(4),
@@ -189,6 +203,302 @@ fn snapshot() -> Snapshot {
         crate::sys::left::tests::view_fixture(),
     )));
     s
+}
+
+#[test]
+fn sys_lines_add_cluster_means_compressor_and_device_io() {
+    use crate::model::CapBasis;
+    use crate::units::{Disk, DiskLocation, Level, Rate};
+
+    let rate = |mean, max, peak, basis| Rate {
+        level: Some(Level { mean, max }),
+        peak: Some(peak),
+        basis,
+    };
+    let mut s = snapshot();
+    let current = global_json(&s);
+    let current_clusters = current.get("cpu_by_level_mc").unwrap().clone();
+    let current_writes = current.get("disk_write_bytes_per_s").unwrap().clone();
+    assert_eq!(current_clusters, Jv::Arr(vec![Jv::Int(1900), Jv::Int(500)]));
+    s.mem.as_mut().unwrap().rates.as_mut().unwrap().churn_bps = 900_000_000.0;
+    s.units.clusters = vec![
+        Some(Level {
+            mean: 0.25,
+            max: 0.9,
+        }),
+        Some(Level {
+            mean: 0.0,
+            max: 0.2,
+        }),
+    ];
+    s.units.churn = Some(rate(0.25, 0.5, 1.0, CapBasis::Learning));
+    let home_id = "1111111111111111";
+    let front_id = "2222222222222222";
+    let home = Disk {
+        id: home_id.into(),
+        name: "home-device".into(),
+        location: DiskLocation::External,
+        write: rate(0.25, 0.5, 1.0, CapBasis::Learning),
+        read: rate(8_000_000.0, 12_000_000.0, 16_000_000.0, CapBasis::Peak),
+        queue: None,
+    };
+    s.units.disks = vec![
+        Disk {
+            id: front_id.into(),
+            name: "front-only".into(),
+            location: DiskLocation::Internal,
+            write: rate(
+                800_000_000.0,
+                900_000_000.0,
+                1_000_000_000.0,
+                CapBasis::Peak,
+            ),
+            ..home.clone()
+        },
+        home.clone(),
+    ];
+    s.units.home_device_id = Some(home_id.into());
+    let w = world();
+    let text = all_text(&render_text(
+        &query(View::Global, false),
+        &ctx(&w, Some(&s), true, true),
+    ));
+    assert!(
+        text.contains("Performance 10s mean 0.5 of 2 cores"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Efficiency 10s mean 0.0 of 2 cores"),
+        "{text}"
+    );
+    assert!(
+        text.contains("compressor 10s mean 0.25 B/s max 0.5 B/s"),
+        "{text}"
+    );
+    assert!(text.contains("7d peak 1 B/s (learning)"), "{text}");
+    assert!(
+        text.contains("home device 1111111111111111 home-device"),
+        "{text}"
+    );
+    assert!(!text.contains("front-only"), "{text}");
+    let json = global_json(&s);
+    assert!(contract_violations(&json).is_empty(), "{}", json.to_text());
+    assert_eq!(json.get("cpu_by_level_mc"), Some(&current_clusters));
+    assert_eq!(json.get("disk_write_bytes_per_s"), Some(&current_writes));
+    assert_eq!(
+        json.get("cpu_by_level_mean_10s_mc"),
+        Some(&Jv::Arr(vec![Jv::Int(500), Jv::Int(0)]))
+    );
+    assert_eq!(
+        json.get("cpu_by_level_mean_10s_pm"),
+        Some(&Jv::Arr(vec![Jv::Int(250), Jv::Int(0)]))
+    );
+    assert_eq!(
+        json.get("compressor_bytes_per_s_10s"),
+        Jv::number(0.25).as_ref()
+    );
+    assert_eq!(
+        json.get("compressor_max_bytes_per_s_10s"),
+        Jv::number(0.5).as_ref()
+    );
+    assert_eq!(
+        json.get("compressor_peak_bytes_per_s_7d"),
+        Some(&Jv::Int(1))
+    );
+    assert_eq!(json.get("compressor_rate_basis"), Some(&Jv::s("learning")));
+    let device = json.get("home_device_io").unwrap();
+    assert_eq!(device.get("id"), Some(&Jv::s(home_id)));
+    assert_eq!(
+        device.get("write_bytes_per_s_10s"),
+        Jv::number(0.25).as_ref()
+    );
+    assert_eq!(
+        device.get("write_max_bytes_per_s_10s"),
+        Jv::number(0.5).as_ref()
+    );
+    assert_eq!(device.get("write_peak_bytes_per_s_7d"), Some(&Jv::Int(1)));
+    assert_eq!(device.get("write_rate_basis"), Some(&Jv::s("learning")));
+    assert_eq!(
+        device.get("read_bytes_per_s_10s"),
+        Some(&Jv::Int(8_000_000))
+    );
+    assert_eq!(
+        device.get("read_max_bytes_per_s_10s"),
+        Some(&Jv::Int(12_000_000))
+    );
+    assert_eq!(
+        device.get("read_peak_bytes_per_s_7d"),
+        Some(&Jv::Int(16_000_000))
+    );
+    assert_eq!(device.get("read_rate_basis"), Some(&Jv::s("peak")));
+    let mem = mem_json(&query(View::Mem, true), &ctx(&w, Some(&s), true, true), &s);
+    assert_eq!(
+        mem.get("compressor_bytes_per_s_10s"),
+        Jv::number(0.25).as_ref()
+    );
+    let mem_text = all_text(&render_text(
+        &query(View::Mem, false),
+        &ctx(&w, Some(&s), true, true),
+    ));
+    assert!(
+        mem_text.contains("compressor 10s mean 0.25 B/s"),
+        "{mem_text}"
+    );
+
+    for mean in [0.0, 1.0] {
+        s.units.clusters[0] = Some(Level { mean, max: mean });
+        let json = global_json(&s);
+        assert_eq!(
+            json.get("cpu_by_level_mean_10s_mc"),
+            Some(&Jv::Arr(vec![
+                Jv::number(mean * 2000.0).unwrap(),
+                Jv::Int(0)
+            ]))
+        );
+        assert_eq!(
+            json.get("cpu_by_level_mean_10s_pm"),
+            Some(&Jv::Arr(vec![
+                Jv::number(mean * 1000.0).unwrap(),
+                Jv::Int(0)
+            ]))
+        );
+        let text = all_text(&render_text(
+            &query(View::Global, false),
+            &ctx(&w, Some(&s), true, true),
+        ));
+        assert!(
+            text.contains(&format!(
+                "Performance 10s mean {:.1} of 2 cores",
+                mean * 2.0
+            )),
+            "{text}"
+        );
+    }
+    for mean in [-1.0, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        s.units.clusters[0] = Some(Level { mean, max: mean });
+        let json = global_json(&s);
+        for key in ["cpu_by_level_mean_10s_mc", "cpu_by_level_mean_10s_pm"] {
+            assert_eq!(
+                json.get(key),
+                Some(&Jv::Arr(vec![Jv::why("unread_format"), Jv::Int(0)])),
+                "{key}"
+            );
+        }
+        let text = all_text(&render_text(
+            &query(View::Global, false),
+            &ctx(&w, Some(&s), true, true),
+        ));
+        assert!(
+            text.contains("Performance 10s mean unavailable(unread_format)"),
+            "{text}"
+        );
+    }
+    s.units.clusters[0] = Some(Level {
+        mean: 0.25,
+        max: 0.9,
+    });
+
+    for value in [0.0, f64::from_bits(1)] {
+        s.units.churn = Some(rate(value, value, value, CapBasis::Learning));
+        let json = global_json(&s);
+        assert_eq!(
+            json.get("compressor_bytes_per_s_10s"),
+            Jv::number(value).as_ref()
+        );
+        let text = unit_rate_words("compressor", s.units.churn.as_ref());
+        if value == 0.0 {
+            assert!(text.contains("10s mean 0 B/s"), "{text}");
+        } else {
+            assert!(
+                !text.contains("10s mean 0 B/s"),
+                "a positive fractional rate is not zero: {text}"
+            );
+        }
+    }
+    for value in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        s.units.churn = Some(rate(value, value, value, CapBasis::Peak));
+        let json = global_json(&s);
+        for key in [
+            "compressor_bytes_per_s_10s",
+            "compressor_max_bytes_per_s_10s",
+            "compressor_peak_bytes_per_s_7d",
+        ] {
+            assert_eq!(json.get(key), Some(&Jv::why("unread_format")), "{key}");
+        }
+        assert!(
+            unit_rate_words("compressor", s.units.churn.as_ref())
+                .contains("10s mean unavailable(unread_format)")
+        );
+    }
+    s.units.churn = Some(Rate {
+        basis: CapBasis::Learning,
+        ..Rate::default()
+    });
+    s.units.clusters[0] = None;
+    let warming = global_json(&s);
+    assert_eq!(
+        warming.get("compressor_bytes_per_s_10s"),
+        Some(&Jv::why("warming"))
+    );
+    assert_eq!(
+        warming.get("compressor_rate_basis"),
+        Some(&Jv::s("learning"))
+    );
+    assert_eq!(
+        warming.get("cpu_by_level_mean_10s_mc"),
+        Some(&Jv::Arr(vec![Jv::why("warming"), Jv::Int(0)]))
+    );
+    s.units.churn = None;
+    let missing = global_json(&s);
+    assert_eq!(
+        missing.get("compressor_bytes_per_s_10s"),
+        Some(&Jv::why("not_sampled"))
+    );
+    assert_eq!(
+        missing.get("compressor_rate_basis"),
+        Some(&Jv::why("not_sampled"))
+    );
+    assert!(
+        paging_words(s.mem.as_ref().unwrap(), &s.units)
+            .contains("compressor unavailable(not_sampled)")
+    );
+
+    for home_id in [
+        None,
+        Some("3333333333333333".to_owned()),
+        Some("not-an-id".to_owned()),
+    ] {
+        s.units.home_device_id = home_id;
+        assert_eq!(
+            home_io_json(&s.units),
+            Jv::why("not_sampled:home_device_unread")
+        );
+        let text = home_io_words(&s.units);
+        assert!(text.contains("unavailable(not_sampled:home_device_unread)"));
+        assert!(!text.contains("front-only"));
+    }
+    s.units.home_device_id = Some(home.id.clone());
+    s.units.disks.push(home.clone());
+    assert_eq!(
+        home_io_json(&s.units),
+        Jv::why("not_sampled:home_device_unread"),
+        "duplicate identities cannot bind home"
+    );
+    s.units.disks = vec![home];
+    s.units.disks[0].write = Rate {
+        basis: CapBasis::Learning,
+        ..Rate::default()
+    };
+    let unread = home_io_json(&s.units);
+    assert_eq!(unread.get("id"), Some(&Jv::s("1111111111111111")));
+    assert_eq!(
+        unread.get("write_bytes_per_s_10s"),
+        Some(&Jv::why("warming"))
+    );
+    assert_eq!(
+        unread.get("read_bytes_per_s_10s"),
+        Some(&Jv::Int(8_000_000))
+    );
 }
 
 #[test]
@@ -543,10 +853,16 @@ struct World {
     disk: Option<crate::sys::DiskTotals>,
     stores: Vec<crate::sys::StoreFact>,
     events: Vec<Event>,
+    event_caller: SessionScope,
 }
 
 fn world() -> World {
     World {
+        event_caller: SessionScope {
+            local: 7,
+            sid: "s-ab12".into(),
+            nonce: "event-nonce-7".into(),
+        },
         machine: Machine {
             executable: None,
             cpu: Some("Apple M5".into()),
@@ -592,6 +908,8 @@ fn world() -> World {
         events: vec![Event {
             seq: 2,
             at_ns: 11_000_000_000,
+            at_unix_ms: Some(1_792_185_697_412),
+            scope: EventScope::Machine,
             kind: EventKind::Pressure {
                 from: Pressure::Normal,
                 to: Pressure::Warn,
@@ -605,7 +923,7 @@ fn ctx<'a>(w: &'a World, s: Option<&'a Snapshot>, owner: bool, own_tab: bool) ->
         snap: s,
         epoch: 0x7f3a,
         as_of_unix_ms: 1_792_185_697_412,
-        age_ms: 120,
+        age_ms: Some(120),
         state: if s.is_some() {
             Freshness::Fresh
         } else {
@@ -615,6 +933,7 @@ fn ctx<'a>(w: &'a World, s: Option<&'a Snapshot>, owner: bool, own_tab: bool) ->
         target: &w.target,
         tabs: &w.tabs,
         caller_panes: Some(if own_tab { &w.target.panes } else { &[99] }),
+        event_caller: own_tab.then_some(&w.event_caller),
         owner_class: owner,
         volume: Some(&w.volume),
         roots: &w.roots,
@@ -638,7 +957,7 @@ fn a_stale_view_says_when_its_figures_were_read_in_its_first_line() {
     let s = snapshot();
     let mut stale = ctx(&w, Some(&s), true, true);
     stale.state = Freshness::Stale;
-    stale.age_ms = 2 * 3_600_000 + 5 * 60_000;
+    stale.age_ms = Some(2 * 3_600_000 + 5 * 60_000);
     let read_at = format!("at {} UTC", clock_ms(stale.as_of_unix_ms));
     for view in [View::Overview, View::Global, View::Tab, View::Aterm] {
         let reply = render_text(&query(view, false), &stale);
@@ -670,6 +989,544 @@ fn all_text(r: &Reply) -> String {
         .join("\n")
 }
 
+fn groups_fixture() -> (Snapshot, crate::groups::GroupKey) {
+    use crate::delegated::ProcessKey;
+    use crate::groups::{Frame, GroupBook, GroupKey, Observation, Rate, ReadWindow, Scope, Value};
+    let mut s = snapshot();
+    let key = |pane, pid| GroupKey::Tab {
+        pane,
+        root: ProcessKey {
+            pid,
+            start: 1000 + u64::from(pid),
+        },
+    };
+    let own = key(7, 77);
+    let frame = Frame {
+        seq: s.seq,
+        taken: crate::ring::Taken::at(s.at_unix_ms, 1000),
+        mono_ms: 1000,
+        at_ns: s.at_ns,
+        processes_observed: true,
+        coalitions_observed: true,
+        processes_complete: true,
+        coalitions_complete: true,
+    };
+    let mut rows = Vec::new();
+    for (id, scope, name, cpu) in [
+        (own, Scope::Tab(7), "own-high", 0.5),
+        (key(7, 78), Scope::Tab(7), "own-low", 0.25),
+        (key(99, 79), Scope::Tab(99), "foreign-secret", 10.0),
+        (GroupKey::Coalition(999), Scope::Others, "coal-secret", 20.0),
+        (
+            GroupKey::Shared(ProcessKey {
+                pid: 80,
+                start: 1080,
+            }),
+            Scope::Shared,
+            "shared-secret",
+            30.0,
+        ),
+    ] {
+        let mut row = Observation::new(id, scope, name, 1);
+        row.cpu = Rate {
+            value: Value::Read(cpu),
+            window: ReadWindow::Reported {
+                end_ns: s.at_ns,
+                window_ns: 1_000_000_000,
+            },
+        };
+        row.footprint = Value::Read(4096);
+        row.membership_complete = true;
+        if id == own {
+            row.read_bps = Rate {
+                value: Value::Read(0.25),
+                window: ReadWindow::Reported {
+                    end_ns: s.at_ns - 100_000_000,
+                    window_ns: 200_000_000,
+                },
+            };
+            row.energy.thread_mw = Rate {
+                value: Value::Read(0.25),
+                window: ReadWindow::Reported {
+                    end_ns: s.at_ns - 500_000_000,
+                    window_ns: 250_000_000,
+                },
+            };
+        }
+        rows.push(row);
+    }
+    let mut book = GroupBook::new();
+    book.absorb(frame, rows);
+    s.groups = book.view();
+    (s, own)
+}
+
+fn groups_rows(value: &Jv) -> &[Jv] {
+    let Jv::Arr(rows) = value.get("groups").unwrap().get("rows").unwrap() else {
+        panic!("group rows")
+    };
+    rows
+}
+
+#[test]
+fn sys_groups_withholds_other_tabs_groups_from_a_tab_caller() {
+    let mut w = world();
+    // The selected target can be changed; the authenticated caller remains pane 7.
+    w.target.key = 99;
+    w.target.panes = vec![99];
+    let (s, own) = groups_fixture();
+    let caller = [7];
+    let mut q = query(View::Groups, true);
+    q.top = 1;
+    q.top_set = true;
+    q.caller = Some("s-forged-advisory".into());
+    for owner in [false, true] {
+        let mut c = ctx(&w, Some(&s), owner, false);
+        c.caller_panes = Some(&caller);
+        let json = render_json(&q, &c);
+        let rows = groups_rows(&json);
+        assert_eq!(rows.len(), 1, "filtering must precede top: {json:?}");
+        assert_eq!(rows[0].get("id"), Some(&Jv::s(group_id(own))));
+        assert_eq!(
+            json.get("groups").unwrap().get("withheld"),
+            Some(&Jv::Int(3))
+        );
+        assert_eq!(json.get("groups").unwrap().get("more"), Some(&Jv::Int(1)));
+        assert!(json.get("groups").unwrap().get("omitted").is_none());
+        let text = all_text(&render_text(&q, &c));
+        assert!(
+            text.contains("own-high") && text.contains("withheld=3"),
+            "{text}"
+        );
+        for secret in ["foreign-secret", "coal-secret", "shared-secret"] {
+            assert!(
+                !json.to_text().contains(secret) && !text.contains(secret),
+                "{secret}"
+            );
+        }
+        assert!(super::super::json::contract_violations(&json).is_empty());
+    }
+    let mut c = ctx(&w, Some(&s), true, true);
+    c.caller_panes = None;
+    let unrestricted = render_json(&q, &c);
+    assert_eq!(
+        groups_rows(&unrestricted)[0].get("exe"),
+        Some(&Jv::s("shared-secret")),
+        "the control proves foreign leaders precede the own row"
+    );
+    c.owner_class = false;
+    let withheld = render_json(&q, &c);
+    assert!(groups_rows(&withheld).is_empty());
+    assert_eq!(
+        withheld.get("groups").unwrap().get("withheld"),
+        Some(&Jv::Int(5))
+    );
+}
+
+#[test]
+fn sys_authorized_pane_does_not_inherit_layout_or_requested_scope_authority() {
+    use crate::jobs::{Class, Verdict};
+    let (mut s, own_group) = groups_fixture();
+    s.jobs = snapshot_with_jobs().jobs;
+    let mut jobs = (**s.jobs.as_ref().unwrap()).clone();
+    let mut sibling_job = jobs.rows[0].clone();
+    sibling_job.id = "sibling-job-secret".into();
+    sibling_job.exe = "sibling-job-secret".into();
+    sibling_job.tab = 8;
+    jobs.rows.push(sibling_job);
+    s.jobs = Some(std::sync::Arc::new(jobs));
+    let template = s.procs.iter().find(|row| row.pid == 201).unwrap().clone();
+    for (key, pid, name) in [
+        (8, 777, "sibling-process-secret"),
+        (99, 888, "foreign-process-secret"),
+    ] {
+        let mut row = template.clone();
+        row.pid = pid;
+        row.name = name.into();
+        row.scope = RowScope::Tab(key);
+        row.gpu = Some(0.5);
+        s.procs.push(row);
+        let mut tab = s.tabs[0].clone();
+        tab.key = key;
+        tab.tab = if key == 8 { 7 } else { key };
+        tab.program = name.into();
+        s.tabs.push(tab);
+    }
+    s.procs.iter_mut().find(|row| row.pid == 201).unwrap().gpu = Some(0.25);
+    s.gpu.as_mut().unwrap().split = Some(crate::gpu_clients::GpuSplit::default());
+    let mut w = world();
+    w.target.panes = vec![7, 8];
+    w.tabs[0].sampled_nonce = Some("event-nonce-7".into());
+    w.target.window_sessions = vec![7, 8, 99];
+    w.target.request = Some(crate::sys::RequestFacts {
+        id: "foreign-request-secret".into(),
+        sessions: vec![7, 8, 99],
+        tabs: 2,
+        cpu_s: Some(999),
+        peak_mb: None,
+        written_mb: None,
+        claims: 0,
+        claimed_mb: None,
+    });
+    for (key, sid, tab) in [(8, "s-sibling", 1), (99, "s-foreign", 2)] {
+        w.tabs.push(TabFact {
+            key,
+            sid: sid.into(),
+            window: Some(1),
+            tab: Some(tab),
+            sampled_nonce: Some(format!("event-nonce-{key}")),
+        });
+    }
+    for (key, name) in [
+        (7, "own-event"),
+        (8, "sibling-event-secret"),
+        (99, "foreign-event-secret"),
+    ] {
+        w.events.push(Event {
+            seq: key,
+            at_ns: s.at_ns,
+            at_unix_ms: Some(s.at_unix_ms),
+            scope: event_session(key, &w.tabs.iter().find(|tab| tab.key == key).unwrap().sid),
+            kind: EventKind::Job {
+                tab: key,
+                id: name.into(),
+                from: Some(Verdict::Fine),
+                to: Verdict::Stuck,
+                class: Class::Waiting,
+                task: Some(name.into()),
+                exit: None,
+            },
+        });
+        w.events.push(Event {
+            seq: key + 100,
+            at_ns: s.at_ns,
+            at_unix_ms: Some(s.at_unix_ms),
+            scope: event_session(key, &w.tabs.iter().find(|tab| tab.key == key).unwrap().sid),
+            kind: EventKind::Load {
+                scope: LoadScope::Tab(key),
+                from_mc: 100,
+                to_mc: 200,
+                top: Some(name.into()),
+            },
+        });
+    }
+    s.facts.zombies = Zombies::Read(crate::blockage::ZombiesView {
+        count: 9,
+        whole: true,
+        piles: [7, 8, 99]
+            .into_iter()
+            .map(|key| ZombieParent {
+                ppid: key as u32,
+                name: format!("zombie-secret-{key}"),
+                count: 3,
+                per_min_deci: 10,
+                tab: Some(key),
+            })
+            .collect(),
+        ..crate::blockage::ZombiesView::default()
+    });
+    let caller = [7];
+    let mut c = ctx(&w, Some(&s), false, true);
+    c.caller_panes = Some(&caller);
+    for scope in ["pane", "tab", "window", "request", "aterm", "global"] {
+        for view in ["procs", "jobs", "disk"] {
+            let q = SysQuery::parse(&format!("{view} scope={scope} top=64")).unwrap();
+            let text = all_text(&render_text(&q, &c));
+            let json = render_json(&q, &c);
+            for secret in [
+                "sibling-process-secret",
+                "foreign-process-secret",
+                "sibling-job-secret",
+                "foreign-request-secret",
+            ] {
+                assert!(
+                    !text.contains(secret) && !json.to_text().contains(secret),
+                    "{view} {scope}: {secret}\n{text}\n{json:?}"
+                );
+            }
+            if view == "procs" {
+                assert!(text.contains("proc pid=201 "), "{scope}: {text}");
+                assert!(named_object(&json, "pid", &Jv::u(201)).is_some());
+                assert!(named_object(&json, "pid", &Jv::u(777)).is_none());
+                assert!(named_object(&json, "pid", &Jv::u(888)).is_none());
+            }
+            if view == "jobs" {
+                assert!(text.contains("job id=a40977 "), "{scope}: {text}");
+                assert!(named_object(&json, "id", &Jv::s("a40977")).is_some());
+                assert!(named_object(&json, "id", &Jv::s("a9")).is_none());
+            }
+        }
+    }
+    for view in [
+        View::Overview,
+        View::Tab,
+        View::Aterm,
+        View::Global,
+        View::Mem,
+        View::Gpu,
+        View::Groups,
+    ] {
+        let text = all_text(&render_text(&query(view, false), &c));
+        let json = render_json(&query(view, true), &c);
+        assert!(
+            text.contains("own-event") && json.to_text().contains("own-event"),
+            "{view:?}: {text}"
+        );
+        for secret in [
+            "sibling-process-secret",
+            "foreign-process-secret",
+            "sibling-event-secret",
+            "foreign-event-secret",
+            "zombie-secret-8",
+            "zombie-secret-99",
+            "foreign-secret",
+        ] {
+            assert!(
+                !text.contains(secret) && !json.to_text().contains(secret),
+                "{view:?}: {secret}\n{text}\n{json:?}"
+            );
+        }
+    }
+    assert_eq!(
+        groups_rows(&render_json(&query(View::Groups, true), &c))[0].get("id"),
+        Some(&Jv::s(group_id(own_group)))
+    );
+    let programs = render_json(&SysQuery::parse("procs scope=tab").unwrap(), &c);
+    assert_eq!(at(&programs, "procs.programs"), &Jv::Arr(Vec::new()));
+    assert!(at(&programs, "procs").get("programs_withheld").is_some());
+    let mut all_panes = c.clone();
+    all_panes.caller_panes = Some(&[7, 8, 99]);
+    let programs = render_json(&SysQuery::parse("procs scope=tab").unwrap(), &all_panes);
+    assert!(
+        named_object(at(&programs, "procs.programs"), "exe", &Jv::s("cargo")).is_some(),
+        "all contributors authorized: {programs:?}"
+    );
+    let request = render_json(&SysQuery::parse("procs scope=request").unwrap(), &all_panes);
+    assert!(request.to_text().contains("foreign-request-secret"));
+    let mut owner = c.clone();
+    owner.owner_class = true;
+    owner.caller_panes = None;
+    let q = SysQuery::parse("procs scope=global top=64").unwrap();
+    let wide = render_json(&q, &owner);
+    assert!(named_object(&wide, "pid", &Jv::u(777)).is_some());
+    assert!(named_object(&wide, "pid", &Jv::u(888)).is_some());
+    let wide = render_json(&SysQuery::parse("jobs scope=global").unwrap(), &owner);
+    assert!(named_object(&wide, "id", &Jv::s("sibling-job-secret")).is_some());
+    assert!(named_object(&wide, "id", &Jv::s("a9")).is_some());
+    let request = render_json(&SysQuery::parse("procs scope=request").unwrap(), &owner);
+    assert!(request.to_text().contains("foreign-request-secret"));
+    assert_eq!(
+        render_json(&query(View::Mem, true), &c).get("total_bytes"),
+        Some(&Jv::u(32 << 30))
+    );
+    assert_eq!(
+        render_json(&query(View::Mem, true), &c).get("total_bytes"),
+        render_json(&query(View::Mem, true), &owner).get("total_bytes")
+    );
+    c.caller_panes = None;
+    let closed = render_json(&q, &c);
+    assert!(named_object(&closed, "pid", &Jv::u(201)).is_none());
+    assert!(groups_rows(&render_json(&query(View::Groups, true), &c)).is_empty());
+    assert!(!all_text(&render_text(&query(View::Overview, false), &c)).contains("own-event"));
+}
+
+#[test]
+fn sys_groups_preserves_original_metric_windows_and_grouping_age() {
+    let w = world();
+    let (s, _) = groups_fixture();
+    let c = ctx(&w, Some(&s), true, true);
+    let q = query(View::Groups, true);
+    let json = render_json(&q, &c);
+    let row = groups_rows(&json)
+        .iter()
+        .find(|row| row.get("exe") == Some(&Jv::s("own-high")))
+        .unwrap();
+    assert_eq!(at(row, "cpu_mc.reported_point"), &Jv::Int(500));
+    assert_eq!(
+        at(row, "read_bytes_per_s.reported_point"),
+        &Jv::number(0.25).unwrap()
+    );
+    assert_eq!(
+        at(row, "thread_energy_mw.reported_point"),
+        &Jv::number(0.25).unwrap()
+    );
+    assert_eq!(
+        at(row, "thread_energy_mw.read_window.end_ns"),
+        &Jv::s((s.at_ns - 500_000_000).to_string())
+    );
+    assert_eq!(
+        at(row, "thread_energy_mw.read_window.window_ns"),
+        &Jv::s("250000000")
+    );
+    assert_eq!(
+        at(row, "cpu_mc.read_window.end_ns"),
+        &Jv::s(s.at_ns.to_string())
+    );
+    assert_eq!(
+        at(row, "cpu_energy_mw.reported_point"),
+        &Jv::why("unsupported")
+    );
+    assert_eq!(at(row, "gpu_busy.reported_point"), &Jv::why("unsupported"));
+    for key in ["cpu_history", "footprint_history"] {
+        let Jv::Arr(cells) = row.get(key).unwrap() else {
+            panic!("history")
+        };
+        assert_eq!(cells.len(), 16);
+        assert_eq!(cells[0].get("live"), Some(&Jv::Bool(true)));
+    }
+    let text = all_text(&render_text(&q, &c));
+    assert!(
+        text.contains("thread_energy_mw=0.25")
+            && text.contains("thread_energy_mw_read_span_ns=250000000")
+    );
+    assert!(text.contains(&format!(
+        "thread_energy_mw_read_end_ns={}",
+        s.at_ns - 500_000_000
+    )));
+    assert!(text.contains(&format!("cpu_mc_read_end_ns={}", s.at_ns)));
+    let original = as_of(View::Groups, &c).unwrap();
+    let original_age = original.1.expect("the source has a known observation age");
+    let mut copied = s.clone();
+    copied.at_ns += 500_000_000;
+    copied.seq += 1;
+    let mut later = ctx(&w, Some(&copied), true, true);
+    later.as_of_unix_ms += 500;
+    later.state = Freshness::Stale;
+    let (asof, age, _) = as_of(View::Groups, &later).unwrap();
+    assert_eq!(asof, original.0);
+    assert_eq!(age, Some(original_age + 500));
+    copied.at_ns = s.at_ns - 1;
+    assert_eq!(
+        as_of(View::Groups, &ctx(&w, Some(&copied), true, true)),
+        None,
+        "a future source is not freshly zero-aged"
+    );
+}
+
+#[test]
+fn sys_groups_keeps_partial_zero_distinct_from_known_zero_and_missing() {
+    use crate::groups::{Frame, GroupBook, Observation, Rate, ReadWindow, Scope, Value};
+    let w = world();
+    let (mut s, key) = groups_fixture();
+    let mut frame = s.groups.frame().unwrap();
+    frame.processes_complete = false;
+    let mut contribution = Observation::new(key, Scope::Tab(7), "partial", 1);
+    contribution.cpu = Rate {
+        value: Value::Partial {
+            value: 0.0,
+            unread: 2,
+        },
+        window: ReadWindow::Mixed,
+    };
+    contribution.footprint = Value::Partial {
+        value: 0,
+        unread: 2,
+    };
+    let mut book = GroupBook::new();
+    book.absorb(frame, [contribution]);
+    s.groups = book.view();
+    let q = query(View::Groups, true);
+    let partial = render_json(&q, &ctx(&w, Some(&s), true, true));
+    let row = &groups_rows(&partial)[0];
+    assert_eq!(at(row, "cpu_mc.state"), &Jv::s("partial"));
+    assert_eq!(at(row, "cpu_mc.reported_point"), &Jv::Int(0));
+    assert_eq!(at(row, "cpu_mc.unread"), &Jv::Int(2));
+    assert_eq!(at(row, "footprint_bytes.state"), &Jv::s("partial"));
+    let Jv::Arr(cells) = row.get("cpu_history").unwrap() else {
+        panic!("history")
+    };
+    assert_eq!(
+        cells[0].get("mean"),
+        Some(&Jv::why("not_sampled")),
+        "an unqualified box cannot represent a partial point"
+    );
+    frame = Frame {
+        seq: frame.seq + 1,
+        taken: crate::ring::Taken::at(frame.taken.at_ms + 1000, 1000),
+        mono_ms: frame.mono_ms + 1000,
+        at_ns: frame.at_ns + 1_000_000_000,
+        processes_complete: true,
+        ..frame
+    };
+    contribution.cpu = Rate {
+        value: Value::Read(0.0),
+        window: ReadWindow::Reported {
+            end_ns: frame.at_ns,
+            window_ns: 1_000_000_000,
+        },
+    };
+    contribution.footprint = Value::Read(0);
+    contribution.membership_complete = true;
+    book.absorb(frame, [contribution]);
+    s.at_ns = frame.at_ns;
+    s.seq = frame.seq;
+    s.groups = book.view();
+    let known = render_json(&q, &ctx(&w, Some(&s), true, true));
+    assert_eq!(at(&groups_rows(&known)[0], "cpu_mc.state"), &Jv::s("read"));
+    assert_eq!(
+        at(&groups_rows(&known)[0], "cpu_mc.reported_point"),
+        &Jv::Int(0)
+    );
+    frame.seq += 1;
+    frame.at_ns += 1_000_000_000;
+    frame.processes_observed = false;
+    frame.coalitions_observed = false;
+    frame.processes_complete = false;
+    frame.coalitions_complete = false;
+    book.absorb(frame, std::iter::empty());
+    s.at_ns = frame.at_ns;
+    s.seq = frame.seq;
+    s.groups = book.view();
+    let missing = render_json(&q, &ctx(&w, Some(&s), true, true));
+    assert_eq!(
+        at(&groups_rows(&missing)[0], "cpu_mc.state"),
+        &Jv::s("unread")
+    );
+    assert_eq!(
+        at(&groups_rows(&missing)[0], "cpu_mc.reported_point"),
+        &Jv::why("not_sampled")
+    );
+}
+
+#[test]
+fn sys_procs_names_each_procs_group() {
+    let w = world();
+    let (mut s, key) = groups_fixture();
+    let mut row = s.procs.first().expect("a real model process row").clone();
+    row.pid = 888;
+    row.ppid = 77;
+    row.cpu_accounting.start = Some(1080);
+    row.name = "member".into();
+    row.scope = RowScope::Tab(7);
+    row.group = Some(key);
+    row.energy_mw = Some(0.25);
+    row.energy_read_span_ns = Some(250_000_000);
+    s.procs = vec![row];
+    s.procs_window_ns = Some(1_000_000_000);
+    let c = ctx(&w, Some(&s), true, true);
+    let json = proc_json(&c, &s, &s.procs[0]);
+    assert_eq!(json.get("group"), Some(&Jv::s(group_id(key))));
+    assert_eq!(json.get("energy_mw"), Jv::number(0.25).as_ref());
+    assert_eq!(json.get("energy_read_span_ns"), Some(&Jv::Int(250_000_000)));
+    let text = all_text(&render_text(&query(View::Procs, false), &c));
+    assert!(
+        text.contains(&format!("group={}", group_id(key))) && text.contains("energy_mw=0.25"),
+        "{text}"
+    );
+    let mut other = c;
+    other.caller_panes = Some(&[99]);
+    assert_eq!(
+        proc_json(&other, &s, &s.procs[0]).get("group"),
+        Some(&Jv::why("refused"))
+    );
+    s.procs[0].energy_mw = Some(0.0);
+    s.procs[0].group = None;
+    let c = ctx(&w, Some(&s), true, true);
+    let json = proc_json(&c, &s, &s.procs[0]);
+    assert_eq!(json.get("energy_mw"), Some(&Jv::Int(0)));
+    assert_eq!(json.get("group"), Some(&Jv::why("not_sampled")));
+}
+
 const NAMED_OWN_SID: &str = "t0000000001";
 const NAMED_OTHER_SID: &str = "t0000000002";
 
@@ -677,10 +1534,13 @@ fn named_sessions_world() -> World {
     use crate::jobs::{Class, Verdict};
     let mut w = world();
     w.target.sid = NAMED_OWN_SID.into();
+    w.event_caller.sid = NAMED_OWN_SID.into();
     w.tabs[0].sid = NAMED_OWN_SID.into();
+    w.tabs[0].sampled_nonce = Some("event-nonce-7".into());
     w.tabs.push(TabFact {
         key: 99,
         sid: NAMED_OTHER_SID.into(),
+        sampled_nonce: Some("event-nonce-99".into()),
         window: Some(1),
         tab: Some(2),
         ..TabFact::default()
@@ -689,6 +1549,15 @@ fn named_sessions_world() -> World {
         w.events.push(Event {
             seq,
             at_ns: 11_000_000_000,
+            at_unix_ms: Some(1_792_185_697_412),
+            scope: event_session(
+                tab,
+                if tab == 7 {
+                    NAMED_OWN_SID
+                } else {
+                    NAMED_OTHER_SID
+                },
+            ),
             kind: EventKind::Job {
                 tab,
                 id: id.into(),
@@ -878,8 +1747,18 @@ fn sys_names_refuse_missing_or_ambiguous_bindings_without_dropping_the_reading()
         let disk_text = all_text(&render_text(&query(View::Disk, false), &c));
         assert!(
             disk_text.contains("sid=unavailable(not_sampled)")
-                && !disk_text.contains(NAMED_OWN_SID),
+                && disk_text
+                    .lines()
+                    .filter(|line| !line.starts_with("e "))
+                    .all(|line| !line.contains(NAMED_OWN_SID)),
             "an unproved target SID cannot bypass the roster through the disk heading: {absence}: {disk_text}"
+        );
+        let event_json = render_json(&query(View::Events, true), &c);
+        let captured = named_object(&event_json, "job", &Jv::s("own-event")).unwrap();
+        assert_eq!(
+            captured.get("sid"),
+            Some(&Jv::s(NAMED_OWN_SID)),
+            "events retain their original producer identity, not the later ambiguous roster"
         );
         for (view, field, id) in [
             (View::Jobs, "id", Jv::s("a40977")),
@@ -1015,7 +1894,14 @@ fn every_view_answers_in_both_shapes_and_the_json_keeps_the_contract() {
                     )),
                     "{header}"
                 );
-                let window = if view == View::Boot { "-" } else { "1000" };
+                let window = if matches!(
+                    view,
+                    View::Boot | View::Groups | View::History | View::Events
+                ) {
+                    "-"
+                } else {
+                    "1000"
+                };
                 assert!(header.contains(&format!(
                     " as_of=21:21:37.412 age_ms=120 window_ms={window} next=7f3a."
                 )));
@@ -1772,6 +2658,7 @@ fn a_wide_disk_scope_prints_only_the_callers_own_folders() {
     let read = |caller: Option<&[u64]>| {
         let c = Ctx {
             caller_panes: caller,
+            event_caller: None,
             ..ctx(&w, Some(&s), true, true)
         };
         (
@@ -1875,10 +2762,8 @@ fn a_scoped_caller_sees_aggregates_and_withheld_counts_not_the_machines_rows() {
     assert!(has_writer(disk, 201) && !has_writer(disk, 777));
     assert!(has_writer(owner_disk, 201) && has_writer(owner_disk, 777));
     assert_eq!(disk.get("withheld"), Some(&Jv::u(1)));
-    assert_eq!(
-        disk.get("write_bytes_per_s"),
-        owner_disk.get("write_bytes_per_s")
-    );
+    assert_eq!(disk.get("write_bytes_per_s"), Some(&Jv::u(1_200_000)));
+    assert_eq!(owner_disk.get("write_bytes_per_s"), Some(&Jv::u(3_000_000)));
     assert_eq!(disk.get("roots"), owner_disk.get("roots"));
     assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
     assert!(
@@ -2074,12 +2959,12 @@ fn procs_carry_each_age_and_each_programs_oldest() {
             .unwrap_or_else(|| panic!("{pid}: {text}"))
     };
     assert!(
-        row(201).ends_with(" age_ms=2820000 sid=s-ab12"),
+        row(201).contains(" age_ms=2820000 ") && row(201).ends_with(" sid=s-ab12"),
         "{}",
         row(201)
     );
     assert!(
-        row(202).ends_with(" age_ms=unavailable(not_sampled) sid=s-ab12"),
+        row(202).contains(" age_ms=unavailable(not_sampled) ") && row(202).ends_with(" sid=s-ab12"),
         "{}",
         row(202)
     );
@@ -2135,9 +3020,9 @@ fn procs_carry_each_age_and_each_programs_oldest() {
     let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("proc ")).collect();
     assert!(
         !rows.is_empty()
-            && rows
-                .iter()
-                .all(|l| l.ends_with(" age_ms=unavailable(not_sampled) sid=s-ab12")),
+            && rows.iter().all(|l| {
+                l.contains(" age_ms=unavailable(not_sampled) ") && l.ends_with(" sid=s-ab12")
+            }),
         "{text}"
     );
     let j = render_json(&query(View::Procs, true), &c);
@@ -2651,6 +3536,8 @@ fn a_repeat_reply_folds_to_one_same_line_and_events_stay() {
     .map(|(seq, at_ns)| Event {
         seq,
         at_ns,
+        at_unix_ms: Some(1_792_185_697_412 + i64::try_from(seq).unwrap() * 2_250 - 4_500),
+        scope: EventScope::Machine,
         kind: EventKind::Pressure {
             from: Pressure::Normal,
             to: Pressure::Warn,
@@ -2702,12 +3589,19 @@ fn a_repeat_reply_folds_to_one_same_line_and_events_stay() {
         as_of_unix_ms: 0,
         ..c.clone()
     };
-    assert_eq!(event_unix_ms(&zero, &s, 0), 0);
+    assert_eq!(
+        render_json(&query(View::Overview, true), &zero).get("events"),
+        j.get("events"),
+        "reply wall-clock changes cannot move an event"
+    );
     let end = Ctx {
         as_of_unix_ms: u64::MAX - 1,
         ..c
     };
-    assert_eq!(event_unix_ms(&end, &s, u64::MAX), u64::MAX);
+    assert_eq!(
+        render_json(&query(View::Overview, true), &end).get("events"),
+        j.get("events")
+    );
 }
 
 #[test]
@@ -2717,9 +3611,12 @@ fn another_tabs_events_and_machine_names_print_only_for_the_owner() {
     let s = snapshot();
     let mut w = world();
     let at_ns = 11_000_000_000;
+    w.tabs[0].sampled_nonce = Some("event-nonce-7".into());
     let job = |tab: u64, id: &str| Event {
         seq: 2,
         at_ns,
+        at_unix_ms: Some(s.at_unix_ms),
+        scope: event_session(tab, if tab == 7 { "s-ab12" } else { "s-other" }),
         kind: EventKind::Job {
             tab,
             id: id.into(),
@@ -2733,6 +3630,11 @@ fn another_tabs_events_and_machine_names_print_only_for_the_owner() {
     let load = |scope: LoadScope| Event {
         seq: 2,
         at_ns,
+        at_unix_ms: Some(s.at_unix_ms),
+        scope: match scope {
+            LoadScope::Tab(key) => event_session(key, if key == 7 { "s-ab12" } else { "s-other" }),
+            _ => EventScope::Machine,
+        },
         kind: EventKind::Load {
             scope,
             from_mc: 100,
@@ -2749,6 +3651,8 @@ fn another_tabs_events_and_machine_names_print_only_for_the_owner() {
         Event {
             seq: 2,
             at_ns,
+            at_unix_ms: Some(s.at_unix_ms),
+            scope: event_session(99, "s-other"),
             kind: EventKind::Orphan {
                 key: 99,
                 label: "Tab 2".into(),
@@ -2780,7 +3684,8 @@ fn another_tabs_events_and_machine_names_print_only_for_the_owner() {
         "{scoped}"
     );
     assert!(
-        scoped.contains("scope=tab tab=1 sid=s-ab12 from_mc=100 to_mc=3000 top=cc1plus"),
+        scoped.contains("scope=tab from_mc=100 to_mc=3000 top=cc1plus")
+            && scoped.contains("local=7 sid=s-ab12"),
         "{scoped}"
     );
     assert!(!scoped.contains("node"), "{scoped}");
@@ -2803,6 +3708,295 @@ fn another_tabs_events_and_machine_names_print_only_for_the_owner() {
     assert!(
         owner.contains("scope=global from_mc=100 to_mc=3000 top=cc1plus"),
         "{owner}"
+    );
+}
+
+/// A STARVATION EDGE PRINTS ITS RULE, ITS READING AND ITS LARGEST HOLDERS, every holder's size
+/// and place to anyone and its pid and name only to the owner or where it is one of the target's
+/// tabs; its JSON says the same, and an end's JSON the worst its wall read, as its line does.
+/// NEGATIVE CONTROL: the owner reads every name.
+#[test]
+fn a_starvation_edge_names_only_the_holders_the_reader_may_see() {
+    use crate::starving::{Edge, Episode, Holder, Look, Why, Worst};
+    let s = snapshot();
+    let mut w = world();
+    let holder = |pid: u32, name: &str, gib: u64, scope| Holder {
+        pid,
+        name: name.into(),
+        bytes: gib << 30,
+        scope,
+        label: None,
+    };
+    w.events.push(Event {
+        seq: 2,
+        at_ns: 11_000_000_000,
+        at_unix_ms: None,
+        scope: EventScope::Machine,
+        kind: EventKind::Starving(Box::new(Edge::Opened(Episode {
+            why: Why::Thrash,
+            opened_ns: 11_000_000_000,
+            opened_unix_ms: 1_763_277_369_800,
+            at_open: Look {
+                push_bps: Some(271_581_184.0),
+                refault_bps: Some(93_000_000.0),
+                headroom: Some(6_259_589_120),
+                ram: 128 << 30,
+                ..Look::default()
+            },
+            worst: Worst::default(),
+            holders: vec![
+                holder(77_936, "ty", 133, RowScope::Others),
+                holder(77_700, "cc1plus", 83, RowScope::Tab(7)),
+                holder(77_701, "node", 65, RowScope::Tab(99)),
+            ],
+            holders_age_ms: Some(5_000),
+            ended: None,
+        }))),
+    });
+    let line = |owner: bool| -> String {
+        let c = ctx(&w, Some(&s), owner, true);
+        render_text(&query(View::Overview, false), &c)
+            .lines
+            .into_iter()
+            .find(|l| l.text.contains("kind=starving"))
+            .map(|l| l.text)
+            .expect("the starving event")
+    };
+    let scoped = line(false);
+    assert!(
+        scoped.contains(
+            "kind=starving to=opened why=thrash push_bps=271581184 refault_bps=93000000 \
+             headroom_bytes=6259589120 ram_bytes=137438953472 pressure=unknown \
+             largest=-:-:142807662592:scope=others,77700:cc1plus:89120571392:tab=1,\
+             -:-:69793218560:local=99 largest_age_ms=5000"
+        ),
+        "{scoped}"
+    );
+    assert!(
+        !scoped.contains("ty:") && !scoped.contains("node"),
+        "{scoped}"
+    );
+    let owner = line(true);
+    assert!(
+        owner.contains("largest=77936:ty:142807662592:scope=others,77700:cc1plus:")
+            && owner.contains("77701:node:69793218560:local=99"),
+        "{owner}"
+    );
+    let j = render_json(
+        &query(View::Overview, true),
+        &ctx(&w, Some(&s), false, true),
+    )
+    .to_text();
+    assert!(j.contains("\"to\":\"opened\""), "{j}");
+    assert!(j.contains("\"name\":\"cc1plus\""), "{j}");
+    assert!(
+        !j.contains("\"name\":\"node\"") && !j.contains("\"ty\""),
+        "{j}"
+    );
+    w.events.push(Event {
+        seq: 3,
+        at_ns: 71_000_000_000,
+        at_unix_ms: None,
+        scope: EventScope::Machine,
+        kind: EventKind::Starving(Box::new(Edge::Ended(Episode {
+            why: Why::Thrash,
+            opened_ns: 11_000_000_000,
+            opened_unix_ms: 1_763_277_369_800,
+            at_open: Look::default(),
+            worst: Worst {
+                wall_permille: Some(1000),
+                ..Worst::default()
+            },
+            holders: Vec::new(),
+            holders_age_ms: None,
+            ended: Some((1_763_277_429_800, Look::default())),
+        }))),
+    });
+    let c = ctx(&w, Some(&s), false, true);
+    let ended = render_text(&query(View::Overview, false), &c)
+        .lines
+        .into_iter()
+        .find(|l| l.text.contains("to=ended"))
+        .map(|l| l.text)
+        .expect("the end");
+    assert!(ended.contains("worst_wall_permille=1000"), "{ended}");
+    let j = render_json(&query(View::Overview, true), &c).to_text();
+    assert!(j.contains("\"worst_wall_permille\":1000"), "{j}");
+}
+
+#[test]
+fn sys_events_lists_detector_and_strip_events_since_a_cursor() {
+    use crate::model::{StripEvent, StripEventKind};
+    let mut v = Vitals::new();
+    let mut input = sample(10, &[100, 100, 100, 100], 0);
+    let source = SessionScope {
+        local: 7,
+        sid: "s-ab12".into(),
+        nonce: "event-nonce-7".into(),
+    };
+    input.event_sources = vec![source.clone()];
+    let before = v.absorb(&input);
+    let marker_wall = input.at_unix_ms - 4_000;
+    let own = StripEvent {
+        at_unix_ms: marker_wall,
+        kind: StripEventKind::Crash,
+        label: "accepted-owned-marker".into(),
+        scope: EventScope::Session(source),
+        span: None,
+    };
+    v.record_strip_event(own.clone());
+    v.record_strip_event(own);
+    v.record_strip_event(StripEvent {
+        at_unix_ms: marker_wall + 1,
+        kind: StripEventKind::Restart,
+        label: "accepted-foreign-marker".into(),
+        scope: event_session(99, "s-foreign"),
+        span: None,
+    });
+    input.at_ns += 1_000_000_000;
+    input.mono_ms += 1_000;
+    input.at_unix_ms -= 60_000; // A real backward wall step must not relocate accepted events.
+    input.mem.as_mut().unwrap().pressure = Pressure::Warn;
+    let current = v.absorb(&input);
+    assert_eq!(current.events.iter().filter(|event| matches!(&event.kind, EventKind::Strip { marker, .. } if marker.label == "accepted-owned-marker")).count(), 1);
+    assert!(
+        current
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::Pressure { .. }))
+    );
+    let mut w = world();
+    w.tabs[0].sampled_nonce = Some("event-nonce-7".into());
+    w.events = before.events.clone();
+    w.events.extend(current.events.clone());
+    let mut c = ctx(&w, Some(&current), false, true);
+    c.head_seq = current.seq;
+    let q = SysQuery::parse(&format!("events since={:x}.{} --json", c.epoch, before.seq)).unwrap();
+    let json = render_json(&q, &c);
+    let body = json.to_text();
+    assert!(
+        body.contains("accepted-owned-marker") && !body.contains("accepted-foreign-marker"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("event-nonce"),
+        "nonce is internal proof: {body}"
+    );
+    let own = named_object(&json, "label", &Jv::s("accepted-owned-marker")).unwrap();
+    assert_eq!(own.get("at_unix_ms"), Some(&Jv::Int(marker_wall)));
+    assert_eq!(own.get("sid"), Some(&Jv::s("s-ab12")));
+    assert_eq!(own.get("onset_unix_ms"), Some(&Jv::why("not_sampled")));
+    let pressure = named_object(&json, "kind", &Jv::s("pressure")).unwrap();
+    assert_eq!(pressure.get("at_unix_ms"), Some(&Jv::Int(input.at_unix_ms)));
+    let text = all_text(&render_text(&q, &c));
+    assert!(
+        text.contains("accepted-owned-marker") && text.contains("kind=pressure"),
+        "{text}"
+    );
+    let later_reply = Ctx {
+        as_of_unix_ms: u64::MAX,
+        age_ms: Some(86_400_000),
+        ..c.clone()
+    };
+    assert_eq!(
+        render_json(&q, &later_reply).get("events"),
+        json.get("events")
+    );
+    let unknown_age = Ctx {
+        age_ms: None,
+        state: Freshness::Stale,
+        ..c.clone()
+    };
+    let unread = render_json(&q, &unknown_age);
+    assert_eq!(
+        unread.get("events"),
+        json.get("events"),
+        "unknown frame age never removes original event facts"
+    );
+    assert_eq!(at(&unread, "as_of.unix_ms"), &Jv::u(c.as_of_unix_ms));
+    assert_eq!(
+        at(&unread, "as_of.age_ms"),
+        &Jv::why("not_sampled:observation_age")
+    );
+    let text = render_text(&q, &unknown_age);
+    assert!(text.header(&unknown_age, false).contains("age_ms=-"));
+    assert!(
+        all_text(&text).contains("observation age is unavailable(not_sampled:observation_age)")
+    );
+    assert!(
+        all_text(&text).contains(
+            "onset_unix_ms=unavailable(not_sampled) end_unix_ms=unavailable(not_sampled)"
+        )
+    );
+    let known_zero = Ctx {
+        age_ms: Some(0),
+        ..c.clone()
+    };
+    assert_eq!(at(&render_json(&q, &known_zero), "as_of.age_ms"), &Jv::u(0));
+    let jobs = snapshot_with_jobs();
+    let jobs_context = Ctx {
+        age_ms: None,
+        ..ctx(&w, Some(&jobs), true, true)
+    };
+    let jobs_json = render_json(&query(View::Jobs, true), &jobs_context);
+    assert_eq!(
+        at(&jobs_json, "machine.age_ms"),
+        &Jv::why("not_sampled:observation_age")
+    );
+    let mut owner = c.clone();
+    owner.owner_class = true;
+    let all = render_json(&q, &owner);
+    assert!(all.to_text().contains("accepted-foreign-marker"));
+    let Jv::Arr(events) = all.get("events").unwrap() else {
+        panic!("events");
+    };
+    assert_eq!(
+        events.len(),
+        current.events.len(),
+        "every same-sequence event survives one cut"
+    );
+    let mut relaunched = world();
+    relaunched.events = w.events.clone();
+    relaunched.tabs[0].sampled_nonce = Some("different-launch".into());
+    relaunched.event_caller.nonce = "different-launch".into();
+    let c = ctx(&relaunched, Some(&current), false, true);
+    let hidden = render_json(&q, &c).to_text();
+    assert!(
+        !hidden.contains("accepted-owned-marker") && hidden.contains("pressure"),
+        "{hidden}"
+    );
+    w.events.push(Event {
+        seq: current.seq,
+        at_ns: current.at_ns,
+        at_unix_ms: None,
+        scope: EventScope::Machine,
+        kind: EventKind::Lane {
+            lane: "gpu",
+            available: false,
+        },
+    });
+    w.events.push(Event {
+        seq: current.seq,
+        at_ns: current.at_ns,
+        at_unix_ms: Some(input.at_unix_ms),
+        scope: EventScope::Machine,
+        kind: EventKind::Job {
+            tab: 99,
+            id: "forged-private-job".into(),
+            from: None,
+            to: crate::jobs::Verdict::Fine,
+            class: crate::jobs::Class::Running,
+            task: None,
+            exit: None,
+        },
+    });
+    let c = ctx(&w, Some(&current), false, true);
+    let guarded = render_json(&q, &c);
+    assert!(!guarded.to_text().contains("forged-private-job"));
+    let unknown_wall = named_object(&guarded, "kind", &Jv::s("lane")).unwrap();
+    assert_eq!(
+        unknown_wall.get("at_unix_ms"),
+        Some(&Jv::why("not_sampled"))
     );
 }
 
@@ -3772,7 +4966,7 @@ fn covered_seconds_never_claim_the_minute_a_warming_figure_lacks() {
 }
 
 #[test]
-fn a_tab_scoped_caller_sees_its_own_tabs_programs_and_a_withheld_count() {
+fn a_pane_grant_does_not_authorize_historical_programs_from_a_logical_tab_key() {
     let mut s = hour_snapshot();
     s.facts.hour_writers.insert(
         0,
@@ -3790,13 +4984,13 @@ fn a_tab_scoped_caller_sees_its_own_tabs_programs_and_a_withheld_count() {
     let owner = ctx(&w, Some(&s), true, true);
     let text = all_text(&render_text(&q, &scoped));
     assert!(
-        text.contains("program exe=cargo n=1 scope=tab tab=1 "),
+        !text.lines().any(|line| line.starts_with("program ")),
         "{text}"
     );
     assert!(!text.contains("foreign-writer"), "{text}");
     assert!(!text.contains("exe=Safari"), "outside the window: {text}");
     assert!(
-        text.contains("withheld=1 (program rows outside this tab are the owner's)"),
+        text.contains("withheld=3 (program rows outside this tab are the owner's)"),
         "{text}"
     );
     let owner_text = all_text(&render_text(&q, &owner));
@@ -3809,7 +5003,7 @@ fn a_tab_scoped_caller_sees_its_own_tabs_programs_and_a_withheld_count() {
     jq.json = true;
     let j = render_json(&jq, &scoped);
     let disk = j.get("disk").unwrap();
-    assert_eq!(disk.get("programs_withheld"), Some(&Jv::u(1)));
+    assert_eq!(disk.get("programs_withheld"), Some(&Jv::u(3)));
     let exes = |disk: &Jv| match disk.get("programs") {
         Some(Jv::Arr(rows)) => rows
             .iter()
@@ -3820,7 +5014,7 @@ fn a_tab_scoped_caller_sees_its_own_tabs_programs_and_a_withheld_count() {
             .collect::<Vec<_>>(),
         other => panic!("{other:?}"),
     };
-    assert_eq!(exes(disk), ["cargo", "-"]);
+    assert!(exes(disk).is_empty());
     let owner_j = render_json(&jq, &owner);
     let owner_disk = owner_j.get("disk").unwrap();
     assert_eq!(exes(owner_disk), ["foreign-writer", "cargo", "-"]);
@@ -3828,28 +5022,38 @@ fn a_tab_scoped_caller_sees_its_own_tabs_programs_and_a_withheld_count() {
     assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
 }
 
-/// A PANE READS ITS TAB'S PROGRAMS: the hour is kept per tab, under the tab's least pane's key,
-/// so a caller in the second pane of a split tab asking for its pane gets the tab's programs,
-/// not none, and nothing is withheld from it. NEGATIVE CONTROL: a pane of another tab gets none.
+/// An owner can read the logical tab's hour through any pane. A scoped pane grant cannot
+/// prove the original contributors of that historical account. An owner on another tab
+/// remains outside the selected history.
 #[test]
-fn a_pane_of_a_split_tab_reads_its_tabs_programs() {
+fn an_owner_reads_split_tab_history_while_a_pane_grant_keeps_it_withheld() {
     let s = hour_snapshot();
     let mut w = world();
     w.target.key = 8;
     w.target.panes = vec![7, 8];
     w.target.window_sessions = vec![7, 8];
     let q = SysQuery::parse("disk scope=pane").unwrap();
-    for owner in [true, false] {
-        let text = all_text(&render_text(&q, &ctx(&w, Some(&s), owner, true)));
-        assert!(
-            text.contains("program exe=cargo n=1 scope=tab tab=1 "),
-            "owner={owner}: {text}"
-        );
-        assert!(
-            !text.contains("program rows outside"),
-            "owner={owner}: {text}"
-        );
-    }
+    let owner = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&q, &owner));
+    assert!(
+        text.contains("program exe=cargo n=1 scope=tab tab=1 "),
+        "{text}"
+    );
+    assert!(!text.contains("program rows outside"), "{text}");
+    let mut scoped = ctx(&w, Some(&s), false, true);
+    scoped.caller_panes = Some(&[8]);
+    let text = all_text(&render_text(&q, &scoped));
+    assert!(
+        !text.lines().any(|line| line.starts_with("program ")),
+        "{text}"
+    );
+    assert!(
+        text.contains("withheld=2 (program rows outside this tab are the owner's)"),
+        "{text}"
+    );
+    let json = render_json(&q, &scoped);
+    assert_eq!(at(&json, "disk.programs"), &Jv::Arr(Vec::new()));
+    assert_eq!(at(&json, "disk.programs_withheld"), &Jv::u(2));
     let mut apart = world();
     apart.target.key = 9;
     apart.target.panes = vec![9];
@@ -3924,6 +5128,8 @@ fn sys_prints_the_os_thermal_word_and_reserves_throttled_for_counted_throttling(
     w.events = vec![Event {
         seq: 2,
         at_ns: 11_000_000_000,
+        at_unix_ms: Some(s.at_unix_ms),
+        scope: EventScope::Machine,
         kind: EventKind::Thermal {
             from: Thermal {
                 level: crate::model::Throttle::None,
@@ -4175,10 +5381,11 @@ fn a_stalled_lane_prints_its_read_and_since_in_overview_procs_why_and_jobs() {
     let mut c = ctx(&w, Some(&s), true, true);
     c.state = Freshness::Partial;
     let head = "stalled procs: proc_pid_rusage pid=4321 (aterm-verify) since 21:18:20.000 for \
-                3m12s · figures aterm,tab,procs,wait,writes,split,top,why,jobs,left";
+                3m12s · figures ";
     for view in [
         View::Overview,
         View::Procs,
+        View::Groups,
         View::Why,
         View::Jobs,
         View::Tab,
@@ -4321,7 +5528,7 @@ fn unstalled_unknowns(v: &Jv, path: &str, out: &mut Vec<(String, String)>) {
                 unstalled_unknowns(x, &format!("{path}[{i}]"), out);
             }
         }
-        Jv::Int(_) | Jv::Str(_) | Jv::Bool(_) => {}
+        Jv::Int(_) | Jv::Number(_) | Jv::Str(_) | Jv::Bool(_) => {}
     }
 }
 
@@ -4361,6 +5568,20 @@ fn a_stall_leaves_no_figure_it_feeds_warming_or_unsampled() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!(
+        render_json(&query(View::Groups, true), &c).get("groups"),
+        Some(&Jv::stalled("procs")),
+        "the group reply identifies its stalled process source"
+    );
+    assert!(
+        all_text(&render_text(&query(View::Groups, false), &c))
+            .contains("groups unavailable(stalled)")
+    );
+    assert_eq!(stalled.groups.rows().len(), answered.groups.rows().len());
+    assert!(
+        !stalled.groups.rows().is_empty(),
+        "the source-stall reply retains the bounded group identities"
+    );
     let global = render_json(&query(View::Global, true), &c);
     let g = global.get("global").expect("global");
     for key in ["procs", "wait_mc", "disk_write_bytes_per_s"] {
@@ -4420,7 +5641,7 @@ fn ages(v: &Jv, out: &mut Vec<Jv>) {
             }
         }
         Jv::Arr(xs) => xs.iter().for_each(|x| ages(x, out)),
-        Jv::Int(_) | Jv::Str(_) | Jv::Bool(_) => {}
+        Jv::Int(_) | Jv::Number(_) | Jv::Str(_) | Jv::Bool(_) => {}
     }
 }
 
@@ -4649,7 +5870,7 @@ fn at<'a>(j: &'a Jv, path: &str) -> &'a Jv {
 /// Whether `j` holds a number or a boolean anywhere: a figure something read.
 fn holds_a_figure(j: &Jv) -> bool {
     match j {
-        Jv::Int(_) | Jv::Bool(_) => true,
+        Jv::Int(_) | Jv::Number(_) | Jv::Bool(_) => true,
         Jv::Str(_) => false,
         Jv::Arr(items) => items.iter().any(holds_a_figure),
         Jv::Obj(pairs) => pairs.iter().any(|(_, v)| holds_a_figure(v)),
@@ -4979,27 +6200,33 @@ fn the_overview_json_carries_heat_queue_blockage_situation_and_type() {
     assert!(at(&cores, "threads").get("wait_mc").is_some());
     assert!(at(&cores, "threads").get("tab_wait_mc").is_some());
 
-    // A scoped caller: its own tab's pile, the machine's counts, and how many rows it may not
-    // read. No name of a process outside the tab is in the reply.
-    // The rule is the target's tab, whichever tab the caller sits in (its own, then another).
+    // A scoped caller sees only its authorized panes' piles, the machine's counts, and how
+    // many named rows were withheld. Selecting another target does not extend its authority.
     for own_tab in [true, false] {
         let scoped = ctx(&w, Some(&s), false, own_tab);
         let j = render_json(&query(View::Overview, true), &scoped);
         assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
         assert_eq!(
             at(&j, "procs.zombies"),
-            &Jv::Arr(vec![Jv::obj([
-                ("parent", Jv::u(201)),
-                ("exe", Jv::s("cargo")),
-                ("count", Jv::u(3)),
-                ("per_min_deci", Jv::u(30)),
-                ("local", Jv::u(7)),
-                ("sid", Jv::s("s-ab12")),
-                ("tab", Jv::u(1)),
-            ])]),
+            &Jv::Arr(if own_tab {
+                vec![Jv::obj([
+                    ("parent", Jv::u(201)),
+                    ("exe", Jv::s("cargo")),
+                    ("count", Jv::u(3)),
+                    ("per_min_deci", Jv::u(30)),
+                    ("local", Jv::u(7)),
+                    ("sid", Jv::s("s-ab12")),
+                    ("tab", Jv::u(1)),
+                ])]
+            } else {
+                Vec::new()
+            }),
             "own_tab={own_tab}",
         );
-        assert_eq!(at(&j, "procs.zombies_withheld"), &Jv::u(2));
+        assert_eq!(
+            at(&j, "procs.zombies_withheld"),
+            &Jv::u(if own_tab { 2 } else { 3 })
+        );
         assert_eq!(at(&j, "procs.zombie_count"), &Jv::u(19));
         assert_eq!(at(&j, "procs.dstate"), &Jv::Arr(Vec::new()));
         assert_eq!(at(&j, "procs.dstate_withheld"), &Jv::u(2));
@@ -5447,6 +6674,100 @@ fn an_unread_heat_or_situation_reading_prints_its_word_never_zero() {
     assert_eq!(at(&j, "heat.watts.ane_mw"), &Jv::u(0));
 }
 
+/// EVERY REPLY THAT PRINTS A PROCESS'S SCHEDULING SAYS SO (C4): over a snapshot each of whose
+/// rows carries a read scheduling, every view's text and JSON that shows one (its `darwin_role`)
+/// is one whose query reads [`SysQuery::prints_scheduling`], the host's word for asking the
+/// sweep for it; and `sys procs` shows it in text and in JSON. NEGATIVE CONTROL: with the
+/// JSON of `sys tab` left out of the word, that view's reply shows a scheduling it never asked.
+#[test]
+fn every_reply_that_prints_a_processs_scheduling_asks_for_it() {
+    use crate::scheduling::Scheduling;
+    let mut s = snapshot();
+    for p in &mut s.procs {
+        p.scheduling = Some(Scheduling {
+            nice: Ok(0),
+            application: false,
+            background_internal: false,
+            background_external: false,
+            suppressed: false,
+            role: Ok(4),
+            qos_cpu_ns: Some(Ok([0; 7])),
+        });
+    }
+    let w = world();
+    let c = ctx(&w, Some(&s), true, true);
+    let mut shown = Vec::new();
+    for view in View::ALL {
+        for json in [false, true] {
+            let q = query(view, json);
+            let reply = if json {
+                render_json(&q, &c).to_text()
+            } else {
+                all_text(&render_text(&q, &c))
+            };
+            if reply.contains("darwin_role") {
+                shown.push((view, json));
+                assert!(
+                    q.prints_scheduling(),
+                    "{view:?} json={json} shows it unasked"
+                );
+            }
+        }
+    }
+    assert!(shown.contains(&(View::Procs, false)), "{shown:?}");
+    assert!(shown.contains(&(View::Procs, true)), "{shown:?}");
+}
+
+/// EVERY REPLY THAT PRINTS ATERM'S OWN THREAD CPU SAYS SO: over a snapshot whose reading read it
+/// (`Snapshot::self_cpu` warming), with memory pressed (a bare `sys why` answers of memory) and
+/// with no memory read (it answers of CPU), every view's text and JSON, `why` of each subject
+/// included, that shows it (the `self CPU` line, the `self_cpu` member) is one whose query reads
+/// [`SysQuery::prints_self_cpu`], the host's word for asking the reading for it; a bare `sys why`
+/// and `sys why cpu` show it in text and in JSON. NEGATIVE CONTROL: with only `why cpu` in the
+/// word, the bare `sys why`'s reply shows what it never asked.
+#[test]
+fn every_reply_that_prints_self_cpu_asks_for_it() {
+    let mut pressed = snapshot();
+    pressed.self_cpu = crate::self_cpu::OwnCpuView::Warming;
+    pressed.self_cpu_read = true;
+    let unpressed = Snapshot {
+        mem: None,
+        ..pressed.clone()
+    };
+    let w = world();
+    let mut shown = Vec::new();
+    for s in [&pressed, &unpressed] {
+        let c = ctx(&w, Some(s), true, true);
+        let queries = View::ALL
+            .into_iter()
+            .map(|view| view.word().to_owned())
+            .chain(["why cpu".to_owned(), "why mem".to_owned()]);
+        for text in queries {
+            for json in [false, true] {
+                let mut q = SysQuery::parse(&text).unwrap();
+                q.json = json;
+                let reply = if json {
+                    render_json(&q, &c).to_text()
+                } else {
+                    all_text(&render_text(&q, &c))
+                };
+                if reply.contains("self CPU") || reply.contains("\"self_cpu\"") {
+                    assert!(q.prints_self_cpu(), "{text} json={json} shows it unasked");
+                    shown.push((text.clone(), json));
+                }
+            }
+        }
+    }
+    for text in ["why", "why cpu"] {
+        for json in [false, true] {
+            assert!(
+                shown.contains(&(text.to_owned(), json)),
+                "{text} {json}: {shown:?}"
+            );
+        }
+    }
+}
+
 /// THE SPOTLIGHT LINE (SD-93): `sys` prints the family's state, CPU, reads and footprint with
 /// each volume's indexing, and `sys --json` carries the same in `global.spotlight`, inside the
 /// contract; before the first split by coalition the line says `unread` and the block is an
@@ -5492,6 +6813,8 @@ fn the_spotlight_line_and_block_say_the_family_and_its_volumes() {
             cpu_mc: 2,
             read_bps: 0,
             footprint: Some(551 << 20),
+            live: 1,
+            cpu_total_ns: 0,
         }],
         volumes: Some(vec![
             Volume {
@@ -5504,6 +6827,9 @@ fn the_spotlight_line_and_block_say_the_family_and_its_volumes() {
             },
         ]),
         volumes_age_ms: Some(4200),
+        store: None,
+        store_age_ms: None,
+        store_stale_ms: None,
         state: State::Idle,
     });
     let t = text(&s);
@@ -5573,4 +6899,18 @@ fn the_spotlight_line_and_block_say_the_family_and_its_volumes() {
     assert!(global.contains("spotlight idle · "), "{global}");
     s.coal_lane = crate::explain::CoalLane::Unsupported;
     assert!(!text(&s).contains("spotlight"), "CONTROL");
+}
+
+#[test]
+fn overview_exposes_high_tcp_latency_without_throughput() {
+    let mut s = snapshot();
+    s.net = Some(crate::model::NetView {
+        srtt_ms: Some(1845.0),
+        state: crate::NetState::Degraded,
+        ..Default::default()
+    });
+    let w = world();
+    let c = ctx(&w, Some(&s), true, true);
+    let overview = all_text(&render_text(&query(View::Overview, false), &c));
+    assert!(overview.contains("high TCP latency 1845 ms"), "{overview}");
 }

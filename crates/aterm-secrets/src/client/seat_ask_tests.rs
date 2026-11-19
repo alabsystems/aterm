@@ -840,3 +840,53 @@ fn a_persons_allow_seats_a_seatless_recipient_off_the_lan() {
     assert_eq!(crate::client::stored(s, "shared").unwrap(), b"everyone-v1");
     world.macs.server.stop();
 }
+
+/// A seatless Mac asks nobody again at format 2 (tracker FL-148E2,
+/// `crate::membership_log::follow`): [`later_records_bound`] is `None` for it on a build that
+/// reads format 2, where a Mac with no vault of the same build restates its bound at format 2.
+/// A seatless Mac takes its seat's records at the format its own mark names
+/// (`seat_ask::take_seat`), so a member that handed it format-2 records on a second ask would
+/// have signed for a Mac that takes none of them.
+///
+/// NEGATIVE CONTROL (observed): `later_records_bound` without its `seat(paths) !=
+/// Seat::Seatless` term fails ``a seatless Mac restates nothing``, `left: Some(RecordsBound {
+/// held: 16384, bytes: 67108864, format: 2, crossed: false })` against `right: None`.
+#[cfg(unix)]
+#[test]
+fn vault_checkpoint_a_seatless_mac_asks_nobody_again_at_format_two() {
+    use crate::crossing::{FORMAT_TWO, Faults, RecordsBound, inject};
+    let world = seatless(false);
+    let s = &world.s;
+    assert_eq!(seat(s), Seat::Seatless);
+    let fresh = Paths::for_home(&world.macs.root.path().join("fresh"));
+    let stated = RecordsBound::uncrossed();
+    for paths in [s, &fresh] {
+        assert_eq!(
+            later_records_bound(paths, stated),
+            None,
+            "a build that reads no format 2 restates nothing"
+        );
+        inject(
+            format_mark(paths).path(),
+            Faults {
+                follows: true,
+                ..Faults::default()
+            },
+        );
+    }
+    assert_eq!(
+        later_records_bound(&fresh, stated),
+        Some(stated.at_format(FORMAT_TWO)),
+        "a Mac with no vault restates its bound at format 2"
+    );
+    assert_eq!(
+        later_records_bound(s, stated),
+        None,
+        "a seatless Mac restates nothing"
+    );
+    for paths in [s, &fresh] {
+        assert!(!format_mark(paths).path().exists(), "no mark is stored");
+        inject(format_mark(paths).path(), Faults::default());
+    }
+    world.macs.server.stop();
+}

@@ -296,12 +296,34 @@ pub fn shim_executable_env(
     Ok(file)
 }
 
-/// The tail of every `.cmd` forward line after the target's closing quote.
-#[cfg(any(windows, test))]
-pub(crate) const CMD_FORWARD_TAIL: &str = " %* & @exit /b";
+/// The tail of every `.cmd` forward line after the target's closing quote: the launch's own
+/// arguments, then the batch ends on that same line with the program's exit code. `exit /b`
+/// with no code ends a batch `cmd /c` runs (as PowerShell and every `CreateProcess` caller run
+/// one) with 0 whatever the program returned; `call` expands `%errorlevel%` once the program
+/// has ended, and only in its own command, never in the arguments ahead of it.
+pub(crate) const CMD_FORWARD_TAIL: &str = " %* & @call exit /b %%errorlevel%%";
+
+/// The tail of the forward line atpkg laid before [`CMD_FORWARD_TAIL`], which ended the batch
+/// with 0 whatever the program returned: still read as a forward, and rewritten at the next lay.
+pub(crate) const CMD_EXIT_FORWARD_TAIL: &str = " %* & @exit /b";
 
 /// The tail of a legacy `.cmd` shim's last line: `@"<target>" %*` alone.
 pub(crate) const CMD_LEGACY_FORWARD_TAIL: &str = " %*";
+
+/// The program a `.cmd` forward line runs: `@"<target>"` followed by exactly
+/// [`CMD_FORWARD_TAIL`], [`CMD_EXIT_FORWARD_TAIL`] or [`CMD_LEGACY_FORWARD_TAIL`] (`line`
+/// trimmed of surrounding whitespace). A line that runs a program on other words (a hand-over,
+/// the launch tap's ask, a forward with the tap's words ahead) names none.
+#[must_use]
+pub fn cmd_forward_target(line: &str) -> Option<PathBuf> {
+    let rest = line.trim().strip_prefix("@\"")?;
+    let end = rest.find('"')?;
+    matches!(
+        &rest[end + 1..],
+        CMD_FORWARD_TAIL | CMD_EXIT_FORWARD_TAIL | CMD_LEGACY_FORWARD_TAIL
+    )
+    .then(|| PathBuf::from(&rest[..end]))
+}
 
 /// The first line of every `.cmd` this crate writes.
 pub(crate) const CMD_FRAME_HEAD: &str = "@goto :main\r\n";
@@ -440,7 +462,8 @@ pub(crate) fn parse_cmd_shim_env(content: &str) -> crate::shim_env::ShimEnv {
     crate::shim_env::ShimEnv::admit(&raw).unwrap_or_default()
 }
 
-/// Whether `target` can sit inside `@"<target>" %* & @exit /b` without breaking out.
+/// Whether `target` can sit inside `@"<target>"` ahead of [`CMD_FORWARD_TAIL`] without breaking
+/// out.
 #[cfg(any(windows, test))]
 pub(crate) fn cmd_target_is_injection_safe(target: &Path) -> bool {
     !target
@@ -485,19 +508,10 @@ fn cmd_echo_escape(s: &str) -> String {
     out
 }
 
-/// The forward target of a Windows bin shim (`@"<target>" %* & @exit /b`).
+/// The forward target of a Windows bin shim: its first forward line's ([`cmd_forward_target`]).
 #[cfg(any(windows, test))]
 pub(crate) fn parse_cmd_shim_target(content: &str) -> Option<PathBuf> {
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("@\"")
-            && let Some(end) = rest.find('"')
-            && matches!(&rest[end + 1..], CMD_FORWARD_TAIL | CMD_LEGACY_FORWARD_TAIL)
-        {
-            return Some(PathBuf::from(&rest[..end]));
-        }
-    }
-    None
+    content.lines().find_map(cmd_forward_target)
 }
 
 /// `path` without a Windows verbatim prefix (`\\?\C:\…` → `C:\…`, `\\?\UNC\srv\sh` → `\\srv\sh`).
@@ -574,7 +588,7 @@ pub(crate) fn cmd_landing_prelude(
     s.push_str("\" \"");
     s.push_str(&prefix);
     s.push_str("\" --");
-    s.push_str(CMD_FORWARD_TAIL);
+    s.push_str(CMD_EXIT_FORWARD_TAIL);
     s.push_str("\r\n:");
     s.push_str(CMD_LANDING_LABEL);
     s.push_str("\r\n");
@@ -625,17 +639,43 @@ pub(crate) fn twin_prelude_with_launcher(
     yolo: &crate::yolo::Policy,
     launcher: Option<&crate::native_defaults::Launcher>,
 ) -> String {
+    twin_prelude_blocks(program, prefix, atpkg, verbs, yolo, launcher)
+        .into_iter()
+        .map(|(_, block)| block)
+        .collect()
+}
+
+/// [`twin_prelude_with_launcher`]'s blocks in the order it lays them, each tagged with the block a
+/// native restart's projection rule names ([`TwinBlock`]); a block a program has none of is empty.
+pub(crate) fn twin_prelude_blocks(
+    program: &str,
+    prefix: &Path,
+    atpkg: Option<&Path>,
+    verbs: &[&str],
+    yolo: &crate::yolo::Policy,
+    launcher: Option<&crate::native_defaults::Launcher>,
+) -> Vec<(TwinBlock, String)> {
     if cfg!(windows) {
-        return String::new();
+        return Vec::new();
     }
-    let mut s = sh_selfupdate_prelude(program, prefix, crate::stub::named(atpkg), verbs);
-    s.push_str(&sh_no_harness_prelude(program));
-    s.push_str(&sh_yolo_prelude_with_launcher(
-        program, yolo, verbs, launcher,
-    ));
+    #[allow(unused_mut, reason = "the harness hand-off is Unix's")]
+    let mut blocks = vec![
+        (
+            TwinBlock::SelfUpdate,
+            sh_selfupdate_prelude(program, prefix, crate::stub::named(atpkg), verbs),
+        ),
+        (TwinBlock::NoHarness, sh_no_harness_prelude(program)),
+        (
+            TwinBlock::Posture,
+            sh_yolo_prelude_with_launcher(program, yolo, verbs, launcher),
+        ),
+    ];
     #[cfg(any(unix, test))]
-    s.push_str(&sh_harness_prelude(program, prefix));
-    s
+    blocks.push((
+        TwinBlock::HarnessHandoff,
+        sh_harness_prelude(program, prefix),
+    ));
+    blocks
 }
 
 /// THE HARNESS HAND-OFF of an agent program's twin ([`crate::harness::twin_harness`], the
@@ -647,7 +687,8 @@ pub(crate) fn twin_prelude_with_launcher(
 /// alone, and so does a harness that is not installed.
 ///
 /// Live means what [`resolve_shim`] and the claim's image rule read (`crates/aterm-gui/src/
-/// harness_claim.rs`): `bin/<tool>` is an atpkg shim whose `exec '<target>' "$@"` line names an
+/// harness_claim.rs`), and what [`probe_shim::harness_handoff`] reads in Rust for the probe
+/// snapshot and the native projection: `bin/<tool>` is an atpkg shim whose `exec '<target>' "$@"` line names an
 /// executable file inside a ready store build of the harness (`store/<harness>/<digits>/` with
 /// `<digits>.ready`), or anywhere while the harness is dev-linked (its link marker exists), or it
 /// is a link to an executable file. A tombstone (a yanked or revoked harness: no `exec` line,
@@ -1400,7 +1441,10 @@ mod native_claude_restart;
 mod probe_shim;
 #[cfg(unix)]
 mod shim_producer;
-pub use native_claude_restart::{NativeClaudeRestart, native_claude_restart};
+pub use native_claude_restart::{
+    NativeClaudeRestart, NativeProjectionRefusal, ProjectionRule, TokenBlock, TwinBlock,
+    native_claude_restart, projection_rule,
+};
 #[cfg(unix)]
 pub(crate) use probe_shim::executable as executable_for_current_user;
 #[cfg(unix)]

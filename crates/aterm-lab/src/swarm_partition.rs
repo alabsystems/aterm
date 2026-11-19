@@ -3901,9 +3901,15 @@ pub fn agent_main(args: &[String]) -> i32 {
         }
     };
     let paths = aterm_secrets::client::Paths::for_home(&home);
-    let ended = aterm_secrets::client::watch(&paths, &|line: &str| {
-        eprintln!("{} {line}", crate::util::now_ms());
-    });
+    // As `aterm secrets watch` starts: its log is kept where this agent's output is that file.
+    let kept = aterm_secrets::service::keep_log(&home, aterm_secrets::service::Job::Subscriber);
+    let ended = aterm_secrets::client::watch(
+        &paths,
+        &|line: &str| {
+            eprintln!("{} {line}", crate::util::now_ms());
+        },
+        kept,
+    );
     match ended {
         Ok(()) => 0,
         Err(e) => {

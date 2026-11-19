@@ -69,6 +69,8 @@ pub(crate) struct TerminalDocument {
 /// typed in a field counts as a printed row does.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct ClientReads {
+    /// The session panel a reader can act on, including its last review.
+    pub(crate) roster: Option<crate::app_native_accessibility::RosterAccessibility>,
     /// The leaves on screen, so a tab that reads the same as the last one still counts.
     pub(crate) views: Vec<crate::tab_model::ViewId>,
     /// A split's or mixed tab's terminals, one document each.
@@ -198,6 +200,8 @@ pub(crate) struct GridPane {
 /// The session field open over the tab strip, which holds the keyboard until it is answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GridRename {
+    /// Whether typing replaces the whole title.
+    pub(crate) selected_all: bool,
     /// What the field sets.
     pub(crate) label: &'static str,
     /// Its text, as the field paints it.
@@ -1084,6 +1088,7 @@ fn push_text_field(
     (id, run_id): (NodeId, NodeId),
     mut field: Node,
     text: &str,
+    anchor: usize,
     caret: usize,
 ) {
     let mut run = Node::new(Role::TextRun);
@@ -1094,13 +1099,14 @@ fn push_text_field(
 
     field.set_value(text.to_owned());
     field.set_children(vec![run_id]);
-    let caret = TextPosition {
+    let len = text.chars().count();
+    let position = |index: usize| TextPosition {
         node: run_id,
-        character_index: caret.min(text.chars().count()),
+        character_index: index.min(len),
     };
     field.set_text_selection(TextSelection {
-        anchor: caret,
-        focus: caret,
+        anchor: position(anchor),
+        focus: position(caret),
     });
     field.add_action(Action::Focus);
     nodes.push((id, field));
@@ -1112,7 +1118,14 @@ fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
     if !find.status.is_empty() {
         field.set_description(find.status.clone());
     }
-    push_text_field(nodes, (FIND, FIND_RUN), field, &find.query, find.caret);
+    push_text_field(
+        nodes,
+        (FIND, FIND_RUN),
+        field,
+        &find.query,
+        find.caret,
+        find.caret,
+    );
 }
 
 fn push_rename_field(nodes: &mut Vec<(NodeId, Node)>, rename: &GridRename) {
@@ -1123,6 +1136,7 @@ fn push_rename_field(nodes: &mut Vec<(NodeId, Node)>, rename: &GridRename) {
         (RENAME, RENAME_RUN),
         field,
         &rename.text,
+        if rename.selected_all { 0 } else { rename.caret },
         rename.caret,
     );
 }

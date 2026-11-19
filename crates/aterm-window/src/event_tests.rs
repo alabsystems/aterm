@@ -35,6 +35,10 @@ macro_rules! foreach_event {
             with_window_event(Moved((17, -9).into()));
             with_window_event(Resized((321, 123).into()));
             with_window_event(DroppedFile("x.txt".into()));
+            with_window_event(DroppedLocal {
+                token: [0, 9],
+                target: Some((wid, (3.0, 5.0).into())),
+            });
             with_window_event(HoveredFile("x.txt".into()));
             with_window_event(HoveredFileCancelled);
             with_window_event(Ime(Enabled));

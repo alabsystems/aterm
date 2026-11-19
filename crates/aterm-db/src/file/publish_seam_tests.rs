@@ -9,6 +9,8 @@ pub(crate) enum Stop {
     AfterSign,
     /// The marker is written; the intent is still in the outbox.
     AfterMarker,
+    /// The marker is written and the `decided` noted; the intent is still in the outbox.
+    AfterNote,
 }
 
 thread_local! {
@@ -18,8 +20,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Run `act` once on this thread, in the next pass, after it read the waiting intents and
-/// before it claims the next one: where a person's drop meets a pass already under way.
+/// Run `act` once on this thread, in the next pass, after it read the outbox and before it takes
+/// up the next intent (claims a waiting one, or marks one a killed pass left marked): where a
+/// person's drop, or another pass, meets a pass already under way.
 pub(crate) fn before_next_claim(act: impl FnOnce() + 'static) {
     BEFORE_CLAIM.with(|slot| *slot.borrow_mut() = Some(Box::new(act)));
 }

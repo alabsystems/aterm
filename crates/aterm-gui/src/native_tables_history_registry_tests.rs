@@ -51,6 +51,7 @@ fn logged(n: u8, kind: AuthorKind, label: &str, at_ms: u64, cells: Vec<LoggedCel
             id: format!("{:0>8}", label.trim_start_matches('m')),
             at_ms,
             hlc: (T0 + u64::from(n), 0),
+            said: None,
         },
         machine: None,
         inert: false,

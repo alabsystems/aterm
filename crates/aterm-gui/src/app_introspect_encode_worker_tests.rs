@@ -22,6 +22,8 @@ fn image_renders_the_frame_and_never_photographs_the_window() {
         session: None,
         want_bytes: true,
         want_metadata: false,
+        whole_client: false,
+        presentation: None,
         frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
         cancel: crate::control::CaptureCancellation::new(),
         reply: tx,
@@ -103,7 +105,7 @@ fn visual_capture_pixels(
     );
     if let Some((input, visuals)) = presented {
         let capture = retained_capture(app, input, visuals);
-        app.image_tail(crate::WindowId(0), capture, req);
+        app.image_tail(crate::WindowId(0), capture, req, None);
     } else {
         app.render_image(req);
     }
@@ -262,6 +264,7 @@ fn encode_worker_replies_fifo_and_only_after_write() {
             .expect("confine automatic image target");
         paths.push(target.display_path());
         app.submit_encode_job(EncodeJob::Image {
+            presentation: None,
             pixels: CapturePixels::packed(Frame {
                 width: side,
                 height: side,
@@ -386,6 +389,8 @@ impl CaptureKind {
                     session: None,
                     want_bytes: false,
                     want_metadata: false,
+                    whole_client: false,
+                    presentation: None,
                     frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
                     cancel: crate::control::CaptureCancellation::new(),
                     reply,
@@ -487,6 +492,7 @@ fn image_job(
     reply: &std::sync::mpsc::Sender<crate::control::ImageReply>,
 ) -> EncodeJob {
     EncodeJob::Image {
+        presentation: None,
         pixels,
         metadata: None,
         handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
@@ -778,6 +784,7 @@ fn a_captures_bytes_are_free_before_its_answer() {
         });
         run_encode_job(
             EncodeJob::Image {
+                presentation: None,
                 pixels,
                 metadata,
                 handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
@@ -847,6 +854,7 @@ fn rejected_encode_jobs_publish_nothing() {
     let (reply, rx) = std::sync::mpsc::channel();
     reject_encode_job(
         EncodeJob::Image {
+            presentation: None,
             pixels: CapturePixels::packed(Frame {
                 width: 2,
                 height: 2,
@@ -1913,6 +1921,8 @@ fn image_metadata_now(app: &mut App, dir: &std::path::Path) -> crate::control::I
         session: None,
         want_bytes: true,
         want_metadata: true,
+        whole_client: false,
+        presentation: None,
         frame_metadata: std::sync::Arc::clone(&metadata),
         cancel: crate::control::CaptureCancellation::new(),
         reply: tx,
@@ -2017,6 +2027,8 @@ fn native_image_metadata_binds_dimensions_to_the_same_audit_frame() {
         session: None,
         want_bytes: true,
         want_metadata: true,
+        whole_client: false,
+        presentation: None,
         frame_metadata: std::sync::Arc::clone(&metadata),
         cancel: crate::control::CaptureCancellation::new(),
         reply: tx,
@@ -2573,10 +2585,13 @@ fn mixed_plain_capture_strips_effects_from_an_owned_copy_only() {
                 session: None,
                 want_bytes: true,
                 want_metadata: false,
+                whole_client: false,
+                presentation: None,
                 frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
                 cancel: crate::control::CaptureCancellation::new(),
                 reply: tx,
             },
+            None,
         );
         rx.recv_timeout(WORKER_PATIENCE)
             .expect("mixed plain reply")
@@ -3147,6 +3162,7 @@ fn encode_worker_survives_dropped_reply_receiver() {
     let (dead_tx, dead_rx) = std::sync::mpsc::channel();
     drop(dead_rx);
     app.submit_encode_job(EncodeJob::Image {
+        presentation: None,
         pixels: CapturePixels::packed(Frame {
             width: 1,
             height: 1,
@@ -3162,6 +3178,7 @@ fn encode_worker_survives_dropped_reply_receiver() {
     });
     let (tx, rx) = std::sync::mpsc::channel();
     app.submit_encode_job(EncodeJob::Image {
+        presentation: None,
         pixels: CapturePixels::packed(Frame {
             width: 2,
             height: 2,
@@ -3200,6 +3217,7 @@ fn inline_image_retains_admission_through_the_wire_handoff() {
     let (tx, rx) = std::sync::mpsc::channel();
     run_encode_job(
         EncodeJob::Image {
+            presentation: None,
             pixels: CapturePixels::packed(Frame {
                 width: 2,
                 height: 2,
@@ -3233,6 +3251,7 @@ fn inline_image_retains_admission_through_the_wire_handoff() {
 #[test]
 fn a_dock_capture_reserves_its_own_rectangle_in_a_narrow_window() {
     let mut app = App::headless_for_test();
+    crate::app_workers_tests::person_tab(&mut app);
     let wid = crate::WindowId(0);
     let (cw, ch) = app.win_cell_size(wid);
     let size = aterm_window::dpi::PhysicalSize::new(cw as u32, (512 * ch) as u32);
@@ -3279,6 +3298,7 @@ fn a_dock_capture_reserves_its_own_rectangle_in_a_narrow_window() {
 #[test]
 fn a_covered_docks_old_raster_cannot_outgrow_its_capture_reservation() {
     let mut app = crate::scripted_redraw_fixture::scripted_app();
+    crate::app_workers_tests::person_tab(&mut app);
     let wid = crate::WindowId(0);
     app.redraw_window(wid);
     let frame = app.window_frame_px_for(wid, app.windows[&wid].rows, app.windows[&wid].cols);

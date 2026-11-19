@@ -917,6 +917,120 @@ impl ArtMask {
     }
 }
 
+/// Scale every length of `prims` by `k` about the origin: a painter that lays in device pixels
+/// (the deck, [`crate::stats_deck`]) hands its prims to a tray that lays in logical points and
+/// multiplies by the window's scale itself. A terminal specimen is moved, never scaled: it sizes
+/// itself from its own spec, and the deck never draws one.
+pub(crate) fn scale_prims(prims: &mut [DrawPrim], k: f32) {
+    for p in prims {
+        match p {
+            DrawPrim::Panel {
+                x, y, w, h, radius, ..
+            } => {
+                for v in [x, y, w, h, radius] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::Ring {
+                cx,
+                cy,
+                r_outer,
+                thickness,
+                ..
+            } => {
+                for v in [cx, cy, r_outer, thickness] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::Capsule { x, y, w, h, .. } | DrawPrim::ClipPush { x, y, w, h } => {
+                for v in [x, y, w, h] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::Image { x, y, w, h, .. } => {
+                for v in [x, y, w, h] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::Dot { cx, cy, r, .. } | DrawPrim::HsvDisk { cx, cy, r, .. } => {
+                for v in [cx, cy, r] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::Text {
+                x, baseline, px, ..
+            } => {
+                for v in [x, baseline, px] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::TerminalSpecimen { x, y, .. } => {
+                *x *= k;
+                *y *= k;
+            }
+            DrawPrim::Stroke {
+                x,
+                y,
+                w,
+                h,
+                radius,
+                width,
+                ..
+            } => {
+                for v in [x, y, w, h, radius, width] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                width,
+                ..
+            } => {
+                for v in [x1, y1, x2, y2, width] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::Arc {
+                cx, cy, r, width, ..
+            } => {
+                for v in [cx, cy, r, width] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::Dashed {
+                x,
+                y,
+                w,
+                h,
+                width,
+                on,
+                off,
+                ..
+            } => {
+                for v in [x, y, w, h, width, on, off] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::FadePush { y, h, .. } => {
+                *y *= k;
+                *h *= k;
+            }
+            DrawPrim::BandIcon { x, y, size, .. } => {
+                for v in [x, y, size] {
+                    *v *= k;
+                }
+            }
+            DrawPrim::ClipPop
+            | DrawPrim::FadePop
+            | DrawPrim::SubpixelPush
+            | DrawPrim::SubpixelPop => {}
+        }
+    }
+}
+
 /// Translate every prim by `(dx, dy)` frame px, e.g. to rasterize a floating card into a
 /// buffer cropped to its paint bounds.
 pub(crate) fn translate_prims(prims: &mut [DrawPrim], dx: f32, dy: f32) {

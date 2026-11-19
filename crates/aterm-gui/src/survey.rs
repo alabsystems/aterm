@@ -934,6 +934,21 @@ impl Usage {
     }
 }
 
+impl Usage {
+    /// What a `usage` record the claim's stream applied says: the context left, and the
+    /// windows from the limits it names `session` and `weekly`. It is the kind's one source
+    /// (D29 stands the built-in readers down by kind): a part the record leaves unsaid (no
+    /// `context_left`, no limit of that name, a limit with no `used`) reads `-`, never the
+    /// built-in sources' reading beside the record's.
+    fn streamed(fed: &crate::session_timeline::StreamUsage) -> Usage {
+        Usage {
+            ctx_left: fed.context_left,
+            five_hour: fed.used(crate::session_timeline::LIMIT_SESSION),
+            seven_day: fed.used(crate::session_timeline::LIMIT_WEEKLY),
+        }
+    }
+}
+
 /// The reading Claude Code's usage tap wrote for its process `pgid` (the group's leader) in tab
 /// `sid` since the process started (`started`, Unix seconds) ([`aterm_agent::harness::tap::Reading::read`]).
 fn claude_tap(sid: &str, pgid: i32, started: u64) -> Option<aterm_agent::harness::tap::Reading> {
@@ -1362,8 +1377,22 @@ fn session_row(
         _ => None,
     };
     let (auth, token) = auth_fields(route);
-    let tapped = claude.and_then(|(pgid, started)| claude_tap(h.sid.as_str(), pgid, started?));
-    let usage = Usage::of(gauges.ctx_pct, tapped.as_ref(), codex_facts);
+    // The claim's stream feeds `account`: the row names the record's account, and the footer's
+    // route stands down (an `account` record names none).
+    let (account, auth, token) = match agent.streamed.fed_account() {
+        Some(fed) => (Some(fed.account.clone()), "-", "-".to_owned()),
+        None => (account, auth, token),
+    };
+    // The claim's stream feeds `usage`: the tap, the screen's indicator and the rollout stand
+    // down, whole, and the row says what the record says (`-` for a part it leaves unsaid).
+    let usage = match &agent.streamed.usage {
+        Some(fed) => Usage::streamed(fed),
+        None => {
+            let tapped =
+                claude.and_then(|(pgid, started)| claude_tap(h.sid.as_str(), pgid, started?));
+            Usage::of(gauges.ctx_pct, tapped.as_ref(), codex_facts)
+        }
+    };
     let excerpts = excerpts.or_else(|| codex.as_ref().map(CodexSurvey::excerpts));
     let progress = Progress::of(
         agent.reader,
@@ -1439,18 +1468,26 @@ fn session_row(
         task.as_ref()
             .and_then(crate::task_record::TaskRecord::conclusion)
             .map_or("-", crate::task_record::Conclusion::word),
-        word_token(
-            footer
-                .as_ref()
-                .and_then(|f| f.model.as_deref())
-                .or_else(|| codex_facts.and_then(|c| c.model.as_deref()))
-        ),
-        word_token(
-            footer
-                .as_ref()
-                .and_then(|f| f.effort.as_deref())
-                .or_else(|| codex_facts.and_then(|c| c.effort.as_deref()))
-        ),
+        // While the claim's stream feeds `model`, its record's words, `-` for one it left
+        // unsaid: the footer's and codex's readers stand down for the kind (D29).
+        word_token(agent.streamed.model.as_ref().map_or_else(
+            || {
+                footer
+                    .as_ref()
+                    .and_then(|f| f.model.as_deref())
+                    .or_else(|| codex_facts.and_then(|c| c.model.as_deref()))
+            },
+            |fed| fed.model.as_deref()
+        )),
+        word_token(agent.streamed.model.as_ref().map_or_else(
+            || {
+                footer
+                    .as_ref()
+                    .and_then(|f| f.effort.as_deref())
+                    .or_else(|| codex_facts.and_then(|c| c.effort.as_deref()))
+            },
+            |fed| fed.effort.as_deref()
+        )),
         number_token(usage.ctx_left.map(u64::from)),
         number_token(usage.five_hour.map(u64::from)),
         number_token(usage.seven_day.map(u64::from)),
@@ -1767,10 +1804,15 @@ pub(crate) fn asking_of(h: &SessionHandle) -> Option<Asking> {
         )
     };
     let reader = agent.reader?;
-    let model = footer
-        .as_ref()
-        .and_then(|f| f.model.clone())
-        .or_else(|| codex.as_ref().and_then(|c| c.facts.model.clone()));
+    let model = agent.streamed.model.as_ref().map_or_else(
+        || {
+            footer
+                .as_ref()
+                .and_then(|f| f.model.clone())
+                .or_else(|| codex.as_ref().and_then(|c| c.facts.model.clone()))
+        },
+        |fed| fed.model.clone(),
+    );
     // The account it asks from, by its address where its footer read one, as the survey names it.
     let account = match crate::harness_host::pool_cli(reader) {
         Some(Cli::Claude) => footer

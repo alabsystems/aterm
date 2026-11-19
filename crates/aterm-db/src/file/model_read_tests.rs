@@ -683,7 +683,7 @@ fn the_materializer_conforms_to_the_reading_walk_and_a_live_unsettled_read_or_a_
         let mut earlier = File::at(&root, &name).frontier().unwrap();
         assert_eq!(earlier.era, 1);
         earlier.era = 0;
-        earlier.ids.clear();
+        earlier.stores.clear();
         std::fs::write(root.frontier(&name), earlier.encode()).unwrap();
     }
     walk.stores.apply("Materialize");

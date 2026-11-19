@@ -80,6 +80,8 @@ pub struct CodexFacts {
     pub tok_in: Option<u64>,
     /// Output tokens of the whole rollout so far (`info.total_token_usage.output_tokens`).
     pub tok_out: Option<u64>,
+    /// Unix milliseconds on the rollout row that supplied these whole counters.
+    pub tok_at_ms: Option<i64>,
 }
 
 /// A forward fold of a rollout's rows into [`CodexFacts`].
@@ -102,6 +104,7 @@ pub struct CodexFactsFold {
     cwd: Option<PathBuf>,
     tok_in: Option<u64>,
     tok_out: Option<u64>,
+    tok_at_ms: Option<i64>,
 }
 
 impl CodexFactsFold {
@@ -143,6 +146,7 @@ impl CodexFactsFold {
             cwd: self.cwd.clone(),
             tok_in: self.tok_in,
             tok_out: self.tok_out,
+            tok_at_ms: self.tok_at_ms,
         }
     }
 
@@ -182,6 +186,10 @@ impl CodexFactsFold {
                 }
                 if let Some((tok_in, tok_out)) = super::codex_rollout::whole_tokens_of(payload) {
                     (self.tok_in, self.tok_out) = (tok_in, tok_out);
+                    self.tok_at_ms = row
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .and_then(super::codex_rollout::stamp_ms);
                 }
                 if let Some(windows) = payload
                     .get("rate_limits")

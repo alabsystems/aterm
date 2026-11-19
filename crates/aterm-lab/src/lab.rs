@@ -1220,9 +1220,9 @@ fn jail_written(path: &Path) -> String {
     crate::util::scratch_text(&crate::paths::physical(path))
 }
 
-/// What the lab's broker said (`<sockdir>/fabric/broker.out`).
+/// What the lab's broker said (`<sockdir>/fabric/lab-broker.out`, [`crate::bus::BROKER_SAID`]).
 fn broker_said(run: &Run) -> String {
-    jail_written(&bus_live(run).join("broker.out"))
+    jail_written(&bus_live(run).join(crate::bus::BROKER_SAID))
         .trim()
         .to_string()
 }
@@ -1295,7 +1295,13 @@ fn stand_bus(run: &mut Run, armed: bool) -> Result<String, String> {
     if stdin.is_some() {
         prog.extend(lifeline_flag());
     }
-    let mut cmd = jailed_command(run, &vars, &prog, &live.join("broker.out"), stdin)?;
+    let mut cmd = jailed_command(
+        run,
+        &vars,
+        &prog,
+        &live.join(crate::bus::BROKER_SAID),
+        stdin,
+    )?;
     let child = cmd
         .spawn()
         .map_err(|e| format!("cannot start the lab's broker: {e}"))?;
@@ -2314,7 +2320,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         // The jail writes the bus's live dir: read through no link, before the socket dir goes.
         let live = crate::paths::physical(&bus_live(&r));
         for (f, to) in [
-            ("broker.out", "fabric-broker.out"),
+            (crate::bus::BROKER_SAID, "fabric-broker.out"),
             ("b.log", "fabric-b.log"),
         ] {
             if let Ok(Some(b)) = crate::sys::scratch_read(&live.join(f)) {

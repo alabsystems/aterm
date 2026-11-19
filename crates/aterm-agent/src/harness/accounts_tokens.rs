@@ -8,11 +8,13 @@
 //! address, or its address; never a roster label), and every line of which names it by its
 //! name and slug, or, where a line may reach a log, by its slug or key, never by a label.
 //!
-//! - **The table.** `tokens.json` in Claude Code's accounts store, mode 0600, schema 1, written
+//! - **The table.** `tokens.json` in Claude Code's accounts store, mode 0600, schema 2 (an
+//!   earlier build's schema 1 reads, and is written again at 2: [`EARLIER_SCHEMA`]), written
 //!   atomically under its own `tokens.lock` (never `accounts.lock`, which a relaunch holds
 //!   through dispatch). One row per lab account key, value-free: neither the token nor any digest
-//!   of it. Its own file, since an older build that rewrites `state.json` drops fields it does not
-//!   know.
+//!   of it, nor the account's address, nor which other Macs use it
+//!   (`docs/DESIGN-shared-files-2026-11-11.md` §6). Its own file, since an older build that
+//!   rewrites `state.json` drops fields it does not know.
 //! - **The states** ([`TokenState`]) are computed on each read from the vault's standing
 //!   ([`claude_token::standing`], this Mac's refusal of the token beside it), the table's own
 //!   facts and the clock, in §5.1's order.
@@ -69,8 +71,29 @@ pub const TABLE_LOCK: &str = "tokens.lock";
 /// scratch root (`<ac key>/`).
 pub const TOKENS_DIR: &str = "tokens";
 
-/// The table's schema.
-const SCHEMA: i64 = 1;
+/// The schema this build writes `tokens.json` and [`CHECK_FILE`] at: rows with no address and no
+/// peer list (`docs/DESIGN-shared-files-2026-11-11.md` §6).
+const SCHEMA: i64 = 2;
+
+/// The schema every earlier build wrote both files at, and the one schema such a build reads:
+/// each row with the account's clear address (`email`, which such a build requires of a row) and
+/// the peers a fleet survey named (`used_on`'s `peers` and `peers_read_at`). This build reads a
+/// file of it, those fields ignored, and writes it again at [`SCHEMA`] at the table's next write
+/// or a surface's read ([`TableRead::stale`], [`rewrite_stale`]). An earlier build that took a
+/// row of [`SCHEMA`] would read it as absent, and its next write would drop every row it could
+/// not read with its verdict and kept row (a token whose windows differ would serve again); a
+/// file of a schema it does not know it refuses instead: its read fails, it writes nothing over
+/// the file, and a token it would judge by it is busy.
+const EARLIER_SCHEMA: i64 = 1;
+
+/// Whether the file `value` is of [`EARLIER_SCHEMA`], where it is of a schema this build reads.
+fn earlier_schema(value: &aterm_json::Value) -> Option<bool> {
+    match value.get("schema")?.as_i64()? {
+        SCHEMA => Some(false),
+        EARLIER_SCHEMA => Some(true),
+        _ => None,
+    }
+}
 
 /// The most of `tokens.json` a read takes.
 const MAX_TABLE: usize = 1 << 20;
@@ -165,18 +188,16 @@ pub fn waits_words(why: WaitFor) -> &'static str {
     }
 }
 
-/// Which Macs use a token (§5.1's `used_on`): this Mac's served facts, which the harness's
-/// attribution records, and the peers the last fleet read named. Never written to the vault.
+/// When this Mac used a token (§5.1's `used_on`): its served facts, which the harness's
+/// attribution records. Never written to the vault. Which other Macs run on the token is no fact
+/// of this Mac's: each Mac says it of itself in its `ai/logins` row (`src` `vault-token`;
+/// `docs/DESIGN-shared-files-2026-11-11.md` §10, "Tokens live in the vault").
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UsedOn {
     /// This Mac's first session on the token (unix seconds).
     pub first_served_at: Option<u64>,
     /// This Mac's latest session on it.
     pub last_served_at: Option<u64>,
-    /// The peers whose survey rows named the key at the last fleet read.
-    pub peers: Vec<String>,
-    /// When that read was.
-    pub peers_read_at: Option<u64>,
 }
 
 /// The last offer of a token for an account (§5.9): the state pair it was made for, and when.
@@ -188,16 +209,17 @@ pub struct Offered {
     pub at: u64,
 }
 
-/// One row of the account-to-token table, value-free (§5.1): the owner's fields (the account's
-/// email and id from the session's own login record, the vault entry's name, when the token was
-/// made and when it ends, the Mac that made it, which Macs use it, its signer) and this Mac's
-/// facts about it.
+/// One row of the account-to-token table, value-free (§5.1): this Mac's own facts of an
+/// account's vault token, keyed by the account's key (the login record's key it was made for,
+/// the vault entry's name, when the token was made and when it ends, the Mac that made it, its
+/// signer, when this Mac used it, what the vault says of this Mac's write). It holds no address:
+/// a surface that prints the account's takes it from the registry or a login record, and which
+/// other Macs use the token from their `ai/logins` rows
+/// (`docs/DESIGN-shared-files-2026-11-11.md` §6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenRow {
     /// The lab account key (`ac-<16 hex>`), the table's key.
     pub key: String,
-    /// The account's email.
-    pub email: String,
     /// The `c-<12 hex>` key of the login record the token was made for, where one named it.
     pub account_id: Option<String>,
     /// The roster row's label, where one names the account.
@@ -214,7 +236,7 @@ pub struct TokenRow {
     pub minted_on: Option<String>,
     /// The seat that signed it, read from the vault's log, never from the meta.
     pub signer: Option<String>,
-    /// Which Macs use it.
+    /// When this Mac used it.
     pub used_on: UsedOn,
     /// What the vault says of this Mac's write.
     pub vault: InVault,
@@ -330,9 +352,10 @@ impl Table {
     }
 
     /// The checks `bytes` holds ([`Self::checks_json`]) put on this table: each row's
-    /// verification where its account key and `minted_at` are the row's, and each kept row.
-    /// `None` where `bytes` is not a check file of schema 1, or a check or a kept row in it names
-    /// a verdict this build does not know ([`Verification::of_json`]).
+    /// verification where its account key and `minted_at` are the row's, and each kept row; and
+    /// whether the file is of [`EARLIER_SCHEMA`]. `None` where `bytes` is not a check file of a
+    /// schema this build reads, or a check or a kept row in it names a verdict this build does not
+    /// know ([`Verification::of_json`]).
     ///
     /// An earlier build rewrites `tokens.json` without reading this file, moving an account's row
     /// to another token (the vault's, either way, or one it minted) with no verdict or refusal of
@@ -343,11 +366,9 @@ impl Table {
     /// the row holds none, and goes: it holds this Mac's facts of the very token the row is of
     /// (the row an earlier build moved onto the vault's token, while this build's write of a later
     /// one waited), which a check of the later token never displaces.
-    fn with_checks(mut self, bytes: &[u8]) -> Option<Self> {
+    fn with_checks(mut self, bytes: &[u8]) -> Option<(Self, bool)> {
         let value: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
-        if value.get("schema")?.as_i64()? != SCHEMA {
-            return None;
-        }
+        let earlier = earlier_schema(&value)?;
         let mut apart = Vec::new();
         for check in value.get("checks")?.as_array()? {
             let (Some(key), Some(minted_at), Some(verification)) = (
@@ -410,17 +431,21 @@ impl Table {
             }
             false
         });
-        Some(self)
+        Some((self, earlier))
     }
 
-    /// The table `bytes` holds, where it is one of schema 1, with no check of its tokens
-    /// ([`CHECK_FILE`]). A row that does not read is left out.
+    /// The table `bytes` holds, where it is one of a schema this build reads ([`SCHEMA`],
+    /// [`EARLIER_SCHEMA`]), with no check of its tokens ([`CHECK_FILE`]). A row that does not read
+    /// is left out.
     #[must_use]
     pub fn from_json(bytes: &[u8]) -> Option<Self> {
+        Self::read_json(bytes).map(|(table, _)| table)
+    }
+
+    /// [`Self::from_json`], and whether the file is of [`EARLIER_SCHEMA`].
+    fn read_json(bytes: &[u8]) -> Option<(Self, bool)> {
         let value: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
-        if value.get("schema")?.as_i64()? != SCHEMA {
-            return None;
-        }
+        let earlier = earlier_schema(&value)?;
         let mut table = Self::default();
         for row in value.get("rows")?.as_array()? {
             if let Some(row) = row_of(row) {
@@ -471,7 +496,7 @@ impl Table {
                 table.posts.insert(key.to_owned(), at);
             }
         }
-        Some(table)
+        Some((table, earlier))
     }
 }
 
@@ -495,7 +520,6 @@ const CHECK_KEY: &str = "windows_check";
 fn row_json(row: &TokenRow, with_check: bool) -> aterm_json::Value {
     let mut value = aterm_json::json!({
         "key": row.key,
-        "email": row.email,
         "account_id": row.account_id,
         "label": row.label,
         "entry": row.entry,
@@ -509,8 +533,6 @@ fn row_json(row: &TokenRow, with_check: bool) -> aterm_json::Value {
                 "first_served_at": row.used_on.first_served_at,
                 "last_served_at": row.used_on.last_served_at,
             },
-            "peers": row.used_on.peers,
-            "peers_read_at": row.used_on.peers_read_at,
         },
         "vault": row.vault.word(),
         "vault_detail": row.vault.detail(),
@@ -523,30 +545,20 @@ fn row_json(row: &TokenRow, with_check: bool) -> aterm_json::Value {
     value
 }
 
+/// The row `value` holds, where it is one. A row of [`EARLIER_SCHEMA`] reads as well: its `email`
+/// and its `used_on`'s `peers` and `peers_read_at`, which this build no longer keeps, are not read.
 fn row_of(value: &aterm_json::Value) -> Option<TokenRow> {
     let text = |of: &aterm_json::Value, key: &str| of.get(key)?.as_str().map(str::to_owned);
     let secs = |of: &aterm_json::Value, key: &str| of.get(key)?.as_u64();
-    let used = value.get("used_on");
-    let here = used.and_then(|used| used.get("here"));
+    let here = value.get("used_on").and_then(|used| used.get("here"));
     let used_on = UsedOn {
         first_served_at: here.and_then(|h| secs(h, "first_served_at")),
         last_served_at: here.and_then(|h| secs(h, "last_served_at")),
-        peers: used
-            .and_then(|used| used.get("peers")?.as_array())
-            .map(|peers| {
-                peers
-                    .iter()
-                    .filter_map(|p| p.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        peers_read_at: used.and_then(|used| secs(used, "peers_read_at")),
     };
     let key = text(value, "key")?;
     journal::Key::new(&key)?;
     Some(TokenRow {
         key,
-        email: text(value, "email")?,
         account_id: text(value, "account_id"),
         label: text(value, "label"),
         entry: text(value, "entry")?,
@@ -583,6 +595,10 @@ pub struct TableRead {
     /// file, a later schema), where it does not: no verdict or kept row of it is known, and none
     /// is written over it.
     pub unchecked: Option<String>,
+    /// Whether a file that read is of [`EARLIER_SCHEMA`] (its rows with the account's clear
+    /// address and a fleet survey's peers): the table's next write ([`update_table`],
+    /// [`rewrite_stale`]) writes it at [`SCHEMA`], without them, whatever its change.
+    pub stale: bool,
 }
 
 impl TableRead {
@@ -628,7 +644,8 @@ fn compared_here(standing: &Standing) -> bool {
 /// ([`say_unchecked`]), and the table is `tokens.json`'s rows alone ([`TableRead::unchecked`]).
 ///
 /// # Errors
-/// `tokens.json` is there and does not read, is not private, or is not a table of schema 1.
+/// `tokens.json` is there and does not read, is not private, or is not a table of a schema this
+/// build reads.
 pub fn read_parts(store: &Store) -> io::Result<TableRead> {
     let dir = table_dir(store);
     let read = |file: &str| match aterm_uds::private_file::read_private(&dir, file, MAX_TABLE) {
@@ -636,15 +653,28 @@ pub fn read_parts(store: &Store) -> io::Result<TableRead> {
         Err(aterm_uds::private_file::PrivateFileError::Missing) => Ok(None),
         Err(why) => Err(format!("{file}: {why:?}")),
     };
-    let table = match read(TABLE_FILE).map_err(io::Error::other)? {
-        Some(bytes) => Table::from_json(&bytes)
-            .ok_or_else(|| io::Error::other(format!("{TABLE_FILE} is not a table of schema 1")))?,
-        None => Table::default(),
+    let (table, mut stale) = match read(TABLE_FILE).map_err(io::Error::other)? {
+        Some(bytes) => Table::read_json(&bytes).ok_or_else(|| {
+            io::Error::other(format!(
+                "{TABLE_FILE} is not a table of schema {SCHEMA} or {EARLIER_SCHEMA}"
+            ))
+        })?,
+        None => (Table::default(), false),
     };
     let checked = match read(CHECK_FILE) {
-        Ok(Some(bytes)) => table.clone().with_checks(&bytes).ok_or_else(|| {
-            format!("{CHECK_FILE} is not a check file of schema 1 whose verdicts this build knows")
-        }),
+        Ok(Some(bytes)) => table
+            .clone()
+            .with_checks(&bytes)
+            .map(|(checked, earlier)| {
+                stale |= earlier;
+                checked
+            })
+            .ok_or_else(|| {
+                format!(
+                    "{CHECK_FILE} is not a check file of schema {SCHEMA} or {EARLIER_SCHEMA} \
+                     whose verdicts this build knows"
+                )
+            }),
         Ok(None) => Ok(table.clone()),
         Err(why) => Err(why),
     };
@@ -653,6 +683,7 @@ pub fn read_parts(store: &Store) -> io::Result<TableRead> {
     Ok(TableRead {
         table: checked.unwrap_or(table),
         unchecked,
+        stale,
     })
 }
 
@@ -714,14 +745,31 @@ thread_local! {
 }
 
 /// Changes the table under `tokens.lock` (waiting for it as `accounts.lock`'s takers do) and,
-/// where the change changed it, writes it whole, atomically, mode 0600: its checks
-/// ([`CHECK_FILE`]) first, then `tokens.json`, so a check is never missing for a row that needs
-/// it.
+/// where the change changed it or a file is of [`EARLIER_SCHEMA`] ([`TableRead::stale`]),
+/// writes it whole, atomically, mode 0600, at [`SCHEMA`]: its checks ([`CHECK_FILE`]) first,
+/// then `tokens.json`, so a check is never missing for a row that needs it.
 ///
 /// # Errors
 /// The lock stays held, or the table cannot be read or written.
 pub fn update_table(store: &Store, change: impl FnOnce(&mut Table)) -> io::Result<()> {
-    update_parts(store, None, change)
+    update_parts(store, Scope::Whole, change).map(drop)
+}
+
+/// Writes the table at `store` again at [`SCHEMA`] where a file of it that reads is of
+/// [`EARLIER_SCHEMA`] ([`TableRead::stale`]: each row with the account's clear address and a
+/// fleet survey's peers), so neither stays on disk after a surface read the table: the rows read
+/// as they were, without those fields. It changes no verdict, so where the check file does not
+/// read, `tokens.json` alone is written and the check file is left as it is (nothing is written
+/// over one that does not read, [`update_table_for`]'s rule). Takes `tokens.lock` only where a
+/// file is stale, and writes nothing where none is. Returns whether it wrote.
+///
+/// # Errors
+/// The lock stays held, or the table could not be read or written.
+pub fn rewrite_stale(store: &Store) -> io::Result<bool> {
+    if !read_parts(store)?.stale {
+        return Ok(false);
+    }
+    update_parts(store, Scope::Stale, |_| {})
 }
 
 /// [`update_table`] for a change of this Mac's facts of the vault's token `standing` (its served
@@ -738,35 +786,59 @@ pub fn update_table_for(
     standing: &Standing,
     change: impl FnOnce(&mut Table),
 ) -> io::Result<()> {
-    update_parts(store, Some(standing), change)
+    update_parts(store, Scope::Token(standing), change).map(drop)
 }
 
+/// What a change of the table may touch, so which of its files it writes where the check file
+/// does not read ([`update_parts`]).
+#[derive(Clone, Copy)]
+enum Scope<'a> {
+    /// Any fact, a verdict among them: a check file that does not read refuses it
+    /// ([`update_table`]).
+    Whole,
+    /// This Mac's facts of the vault's token `standing` ([`update_table_for`]).
+    Token(&'a Standing),
+    /// Nothing: the table written again at [`SCHEMA`] ([`rewrite_stale`]). Where the check file
+    /// does not read, `tokens.json` alone.
+    Stale,
+}
+
+/// Changes the table under `tokens.lock` as `scope` lets the change touch it, and writes it
+/// where the change changed it or a file read is stale ([`TableRead::stale`]). Returns whether it
+/// wrote.
 fn update_parts(
     store: &Store,
-    standing: Option<&Standing>,
+    scope: Scope<'_>,
     change: impl FnOnce(&mut Table),
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let dir = table_dir(store);
     store.ensure()?;
     let _lock = accounts::lock_at_within(&dir.join(TABLE_LOCK), &accounts::LOCK_LADDER)?
         .ok_or_else(|| io::Error::other(format!("{TABLE_LOCK} stayed held")))?;
     let read = read_parts(store)?;
     let whole = read.unchecked.is_none();
-    let mut table = match standing {
-        Some(standing) => read.for_token(&Lookup::Found(standing.clone()))?,
-        None => read.whole()?,
+    let stale = read.stale;
+    let mut table = match scope {
+        Scope::Whole => read.whole()?,
+        Scope::Token(standing) => read.for_token(&Lookup::Found(standing.clone()))?,
+        // `tokens.json`'s rows alone where the check file does not read: `tokens.json` holds no
+        // check, so it is written again whole from them.
+        Scope::Stale => read.table,
     };
     let was = table.clone();
     change(&mut table);
     // A change that changed nothing writes nothing: a reading that finds its row already saying
     // what it would record (a final verdict the tap's heartbeat look reaches) rewrites no file.
-    if table == was {
-        return Ok(());
+    // A file of the earlier schema (an address, a survey's peers) is written all the same, at
+    // this one, without them.
+    if table == was && !stale {
+        return Ok(false);
     }
     if whole {
         aterm_uds::private_file::write_private(&dir, CHECK_FILE, table.checks_json().as_bytes())?;
     }
-    aterm_uds::private_file::write_private(&dir, TABLE_FILE, table.to_json().as_bytes())
+    aterm_uds::private_file::write_private(&dir, TABLE_FILE, table.to_json().as_bytes())?;
+    Ok(true)
 }
 
 /// RECORDS THIS MAC'S REFUSAL OF A TOKEN (§5.6): Claude Code drew its anchored lost-login wall
@@ -780,8 +852,8 @@ fn update_parts(
 /// token in the table at `store` ([`row_of_token`]: the account's row, made from the meta where
 /// this Mac kept none, or, for a token older than the one the account's row is of while that row's
 /// write is on its way, its kept row, made where none was kept) is made or followed, as a served
-/// reading's is, so the report shows the refused token's own `verified` and reads its peers. It
-/// writes nothing else: no stored-login state (its `Auth`, its learned lifetime), since the stored
+/// reading's is, so the report shows the refused token's own `verified`. It writes nothing
+/// else: no stored-login state (its `Auth`, its learned lifetime), since the stored
 /// login was not what was refused, and nothing to the vault, since a refusal is this Mac's
 /// observation (each Mac's sessions meet the same refusal at their next request). Returns whether
 /// this call recorded it first; a standing with no meta names no token and writes nothing. The
@@ -827,7 +899,6 @@ enum Held {
 fn fresh_row(standing: &Standing, meta: &Meta) -> TokenRow {
     TokenRow {
         key: standing.key.as_str().to_owned(),
-        email: meta.email.clone(),
         account_id: Some(meta.account_id.clone()).filter(|id| !id.is_empty()),
         label: None,
         entry: standing.key.entry(),
@@ -900,11 +971,6 @@ fn row_of_token<'a>(
             None => {
                 *row = TokenRow {
                     label: row.label.take(),
-                    used_on: UsedOn {
-                        peers: std::mem::take(&mut row.used_on.peers),
-                        peers_read_at: row.used_on.peers_read_at,
-                        ..UsedOn::default()
-                    },
                     ..fresh_row(standing, meta)
                 };
             }
@@ -3274,7 +3340,7 @@ fn step_held(
     let since = token_steps::Since {
         cli,
         aterm: Some(&aterm),
-        route_at: token_steps::route_at(store, env.home.as_deref(), &account.email),
+        route_at: token_steps::route_at(store, env.home.as_deref(), Some(&account.email)),
         token_at,
         mailbox_read: stopped
             .is_some_and(token_steps::Stopped::waits_on_a_mailbox)
@@ -3947,7 +4013,6 @@ fn record(
             key.clone(),
             TokenRow {
                 key: account.key.as_str().to_owned(),
-                email: meta.email.clone(),
                 account_id: account.account_id.clone(),
                 label: account.label.clone(),
                 entry: account.key.entry(),
@@ -4124,7 +4189,6 @@ fn remove(
             .or(row)
             .unwrap_or_else(|| TokenRow {
                 key: account.key.as_str().to_owned(),
-                email: account.email.clone(),
                 account_id: account.account_id.clone(),
                 label: account.label.clone(),
                 entry: account.key.entry(),

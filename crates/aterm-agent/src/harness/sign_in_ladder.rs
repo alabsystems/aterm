@@ -37,7 +37,15 @@
 //! ends `blocked` unless a person at the desk completes the check, and the upkeep then opens no
 //! window for that row again: a person's own renewal does. Off macOS, under SSH, for another
 //! machine's request and in a tab another Mac's fleet drive started or typed into there is no
-//! window, and the headless route ends at Cloudflare's page.
+//! window, and the headless route ends at Cloudflare's page. A block met on another Mac holds
+//! this one too: while any Mac's `ai/logins` row says a sign-in of the row's account was blocked
+//! within a day ([`super::accounts::fleet_blocked`]), the ladder still tries the vault route and
+//! runs no route that opens a browser or a window, recording the attempt `no-route` in words that
+//! name the hold ([`fleet_words`]) where this Mac's own last attempt was not the block, so a hold
+//! never sets off another across the fleet and never wipes out the block this Mac met itself;
+//! [`SignIn::begin`] starts no sign-in of the account but one a person or an agent names
+//! ([`Refused::Fleet`]); and the upkeep's token capture loads no page of the account
+//! (`space_token_capture`, Unix). Nothing is raised for it.
 //!
 //! This module holds the ladder's words and its clocks; `accounts_sync` reads the machine and
 //! runs the routes. The clocks are monotonic instants the caller reads on the guard's clock
@@ -539,6 +547,47 @@ pub(super) fn on_token_words(until: u64, read: &Read) -> String {
         "{}: its year token is in use here until {y:04}-{m:02}-{d:02}; no browser opened; {}",
         Route::Vault.as_str(),
         read.words()
+    )
+}
+
+/// When the blocked sign-in behind `hold` was, against `now` ("1h ago", or ahead of this Mac's
+/// clock where its own Mac's clock runs ahead), and how long the hold has left.
+fn fleet_times(hold: &super::accounts::FleetHold, now: i64) -> (String, String) {
+    let span = |secs: i64| super::upgrade::span(secs.max(0).unsigned_abs());
+    let when = if hold.at > now {
+        format!(
+            "{} ahead of this Mac's clock",
+            span(hold.at.saturating_sub(now))
+        )
+    } else {
+        format!("{} ago", span(now.saturating_sub(hold.at)))
+    };
+    (when, span(hold.until.saturating_sub(now)))
+}
+
+/// What the ladder records where a sign-in of the row's account that a Mac of the fleet recorded
+/// `blocked` holds it ([`super::accounts::fleet_blocked`]): `held: a sign-in of its account was
+/// blocked on a Mac of the fleet, so no route that opens a browser runs for it here until
+/// 2026-11-18T10:00:00Z`. The words name the hold's end and no time relative to the clock, so
+/// each pass the same hold holds records the same words, which the attempt's record keeps once
+/// ([`super::accounts::note_sign_in_attempt`]); its log line says how long ago and how long more
+/// ([`fleet_said`]). Value-free: no Mac, address or page.
+pub(super) fn fleet_words(hold: &super::accounts::FleetHold) -> String {
+    format!(
+        "held: a sign-in of its account was blocked on a Mac of the fleet, so no route that opens \
+         a browser runs for it here until {}",
+        aterm_types::rfc3339::format_rfc3339(u64::try_from(hold.until).unwrap_or(0))
+    )
+}
+
+/// What the ladder's log line says of `hold` at `now`, where its record says [`fleet_words`]:
+/// `held: a sign-in of its account was blocked on a Mac of the fleet 1h ago, so no route that
+/// opens a browser runs for it here for 23h more`.
+pub(super) fn fleet_said(hold: &super::accounts::FleetHold, now: i64) -> String {
+    let (when, left) = fleet_times(hold, now);
+    format!(
+        "held: a sign-in of its account was blocked on a Mac of the fleet {when}, so no route \
+         that opens a browser runs for it here for {left} more"
     )
 }
 
@@ -1079,8 +1128,9 @@ pub(super) fn spaced_until(
 pub(super) enum TokenSpacing {
     /// The capture may start now: its start is this Mac's last sign-in start.
     Started,
-    /// Another account's sign-in started here within [`SPACING_S`]; not before this time (Unix
-    /// seconds).
+    /// Another account's sign-in started here within [`SPACING_S`], or a Mac of the fleet
+    /// recorded a sign-in of this account `blocked` within a day
+    /// ([`super::accounts::fleet_blocked_in`]); not before this time (Unix seconds).
     Until(i64),
     /// The sign-in lock is held (a sign-in runs here), or the record could not be read or
     /// written: nothing starts on this pass.
@@ -1089,9 +1139,11 @@ pub(super) enum TokenSpacing {
 
 /// SPACES A TOKEN CAPTURE THIS MAC'S UPKEEP MAKES WITH NOBODY THERE (plan package FL-138) as an
 /// automatic sign-in of Claude Code's `label` at `now`: its page may sign the account's window
-/// store in, which the provider sees as a sign-in, so another account's start within
+/// store in, which the provider sees as a sign-in, so a block of the account's sign-in that a Mac
+/// of the fleet recorded within a day holds it until that hold lapses, as it holds every
+/// automatic sign-in's start ([`SignIn::fleet_holds`]), another account's start within
 /// [`SPACING_S`] holds it ([`spaced_until`]), and its own start is recorded as this Mac's last.
-/// Both are read and written under the sign-in lock, taken without waiting and let go before
+/// All are read and written under the sign-in lock, taken without waiting and let go before
 /// the capture runs: a token is made under its account's lock, never `signin.lock`.
 #[cfg(unix)] // read by the unix-only token upkeep (`accounts_sync::upkeep_tokens`)
 pub(super) fn space_token_capture(
@@ -1102,6 +1154,11 @@ pub(super) fn space_token_capture(
     let Ok(Some(_turn)) = store.signin_now() else {
         return TokenSpacing::Busy;
     };
+    match super::accounts::fleet_blocked_in(store, label, now) {
+        Ok(None) => {}
+        Ok(Some(hold)) => return TokenSpacing::Until(hold.until),
+        Err(_) => return TokenSpacing::Busy,
+    }
     let Ok(last) = last_started(store) else {
         return TokenSpacing::Busy;
     };
@@ -1419,6 +1476,15 @@ pub(super) enum Refused {
         /// Unix seconds.
         until: i64,
     },
+    /// A Mac of the fleet recorded a sign-in of the account `blocked` within a day
+    /// ([`super::accounts::fleet_blocked_in`]), and this start is not one a person or an agent
+    /// named ([`Why::spaced`]).
+    Fleet {
+        /// When that sign-in was, by its own Mac's clock (Unix seconds).
+        at: i64,
+        /// When the hold lapses (Unix seconds).
+        until: i64,
+    },
     /// The spacing record could not be read or written.
     Record(String),
 }
@@ -1435,6 +1501,20 @@ impl Refused {
                 SPACING_S / 60,
                 until.saturating_sub(now).max(0).saturating_add(59) / 60
             ),
+            Self::Fleet { at, until } => {
+                let (when, left) = fleet_times(
+                    &super::accounts::FleetHold {
+                        at: *at,
+                        until: *until,
+                    },
+                    now,
+                );
+                format!(
+                    "a sign-in of its account was blocked on a Mac of the fleet {when}, so this \
+                     Mac starts none of it by itself for {left} more; a sign-in that names it \
+                     still starts"
+                )
+            }
             Self::Record(why) => format!("the sign-in spacing record could not be kept: {why}"),
         }
     }
@@ -1701,6 +1781,37 @@ impl SignIn {
         Ok(spaced_until(last.as_ref(), self.cli, &self.label, now))
     }
 
+    /// THE FLEET'S BLOCK HOLDS EVERY START BUT A NAMED ONE: where a Mac of the fleet recorded a
+    /// sign-in of this sign-in's account `blocked` within a day, as `store` reads its shared files
+    /// ([`super::accounts::fleet_blocked_in`]), a sign-in for any reason [`Why::spaced`] admits
+    /// starts nothing ([`Refused::Fleet`]). Every door's start takes this ([`Self::begin`],
+    /// [`Self::begin_native`]), and a door checks it before it claims anything else, as it checks
+    /// the spacing; a sign-in a person or an agent names (`Why::Asked`: a command naming the
+    /// account, or a selection a person saved from the window's menu, whenever it is served) is
+    /// not held.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused::Fleet`] under a hold; [`Refused::Record`] where the fleet names a blocked
+    /// sign-in and the store did not load, so which account this is cannot be told.
+    pub(super) fn fleet_holds(
+        &self,
+        store: &super::accounts::Store,
+        now: impl Into<trace::Now>,
+    ) -> Result<(), Refused> {
+        if !self.why.spaced() {
+            return Ok(());
+        }
+        match super::accounts::fleet_blocked_in(store, &self.label, now) {
+            Ok(Some(hold)) => Err(Refused::Fleet {
+                at: hold.at,
+                until: hold.until,
+            }),
+            Ok(None) => Ok(()),
+            Err(why) => Err(Refused::Record(why)),
+        }
+    }
+
     pub(super) fn begin_native(
         self,
         label: &str,
@@ -1717,6 +1828,7 @@ impl SignIn {
             return Err(Refused::Another);
         }
         turn.check_preparation(store).map_err(Refused::Record)?;
+        self.fleet_holds(store, now)?;
         #[cfg(unix)]
         let _spacing = aterm_uds::private_file::PrivateLock::take(
             &store.shared_dir(),
@@ -1745,9 +1857,10 @@ impl SignIn {
 
     /// Starts this sign-in of `cli`'s `label` under the sign-in lock `signin` took from `store`
     /// ([`super::accounts::Store::signin_now`], [`super::accounts::Store::signin_within`]):
-    /// it refuses a token for another account, and an automatic sign-in within [`SPACING_S`] of
-    /// another account's start, then records this start for the next one. The lock moves into
-    /// the [`Begun`] the provider flow holds until it ends.
+    /// it refuses a token for another account, an automatic sign-in of an account a Mac of the
+    /// fleet recorded `blocked` within a day ([`Refused::Fleet`]), and an automatic sign-in within
+    /// [`SPACING_S`] of another account's start, then records this start for the next one. The
+    /// lock moves into the [`Begun`] the provider flow holds until it ends.
     ///
     /// # Errors
     ///
@@ -1772,6 +1885,7 @@ impl SignIn {
         signin
             .check_store(store)
             .map_err(|error| Refused::Record(error.to_string()))?;
+        self.fleet_holds(store, now)?;
         if let Some(until) = self.spaced(store, now)? {
             return Err(Refused::Spaced { until });
         }

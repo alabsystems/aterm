@@ -33,16 +33,12 @@
 //!   to read a sign-in code.
 //! - [`sighted`]: where and when each account was sighted, one fold of every Mac's `account-obs`
 //!   rows and the journal's `seen` events for every reader that says so.
-//! - [`export`]: the files older Macs still read, generated from the registry and the journal's
-//!   place rows by the owner's one admin writer, and `check`'s drift of them.
 
 pub mod account_names;
 pub mod checks;
 #[cfg(unix)]
 pub mod command;
 pub mod discover;
-#[cfg(unix)]
-pub mod export;
 #[cfg(unix)]
 pub mod history;
 #[cfg(unix)]

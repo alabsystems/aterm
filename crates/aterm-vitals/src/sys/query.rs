@@ -4,16 +4,18 @@
 //! Grammar and query parser for the `sys` control verb.
 
 use crate::explain::WhySubject;
+use crate::model::Resource;
 
 /// The usage line a refused `sys` request answers; a stray word after `why` answers [`WHY_USAGE`].
-pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|why|report|boot|left] \
+pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|groups|history|events|why|report|boot|left] \
                          [scope=pane|tab|window|request|aterm|global] [instances=all] \
                          [top=<1-64>] [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]; \
-                         scope= on jobs disk procs (cores gpu mem net take it, rows unchanged), \
+                         scope= on jobs disk procs groups (cores gpu mem net take it, rows unchanged), \
                          scope=pane|tab|aterm on left, depth= on \
                          disk, instances=all on overview aterm global cores gpu mem net and procs \
                          scope=aterm; or sys disk held [fresh=<ms>] [since=<ep>.<seq>] [--json], \
-                         sys name job=<id>|task=<id> [--json], sys policy \
+                         sys history [cpu|gpu|mem|disk|net|tokens|procs ...] [res=1s|10s|1m|10m|1h] [--json], \
+                         sys events [since=<ep>.<seq>] [--json], sys name job=<id>|task=<id> [--json], sys policy \
                          [status|collect|cancel] [--json] (aterm help sys)\n";
 /// The usage line for a word after `why` that is not its one subject or an option.
 pub const WHY_USAGE: &str = "ERR usage: sys why [cpu|mem] [top=<1-64>] [fresh=<ms>] [since=<ep>.<seq>] [--json] \
@@ -51,6 +53,12 @@ pub enum View {
     Net,
     /// Process rows.
     Procs,
+    /// Bounded process groups and independent resource coalitions.
+    Groups,
+    /// The retained machine strip boxes at their original resolutions.
+    History,
+    /// Retained detector and strip events, with original times and cursor coverage.
+    Events,
     /// Who uses the CPU or memory, and why.
     Why,
     /// Bounded CPU hardware, policy and preserved anomaly report.
@@ -64,7 +72,7 @@ pub enum View {
 
 impl View {
     /// Every view, in the help's order.
-    pub const ALL: [View; 15] = [
+    pub const ALL: [View; 18] = [
         Self::Overview,
         Self::Tab,
         Self::Aterm,
@@ -76,6 +84,9 @@ impl View {
         Self::Disk,
         Self::Net,
         Self::Procs,
+        Self::Groups,
+        Self::History,
+        Self::Events,
         Self::Why,
         Self::Report,
         Self::Boot,
@@ -97,6 +108,9 @@ impl View {
             Self::Disk => "disk",
             Self::Net => "net",
             Self::Procs => "procs",
+            Self::Groups => "groups",
+            Self::History => "history",
+            Self::Events => "events",
             Self::Why => "why",
             Self::Report => "report",
             Self::Boot => "boot",
@@ -127,13 +141,96 @@ impl View {
             | Self::Tab
             | Self::Aterm
             | Self::Global
+            | Self::History
+            | Self::Events
             | Self::Why
             | Self::Report
             | Self::Boot => None,
             Self::Jobs | Self::Disk | Self::Procs | Self::Left => Some(ScopeArg::Tab),
-            Self::Cores | Self::Gpu | Self::Mem | Self::Net => Some(ScopeArg::Global),
+            Self::Cores | Self::Gpu | Self::Mem | Self::Net | Self::Groups => {
+                Some(ScopeArg::Global)
+            }
         }
     }
+}
+
+/// An existing resolution band of the six-hour machine strip, never a new resampling grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HistoryResolution {
+    /// One second.
+    Second,
+    /// Ten seconds.
+    TenSeconds,
+    /// One minute.
+    Minute,
+    /// Ten minutes.
+    TenMinutes,
+    /// One hour.
+    Hour,
+}
+
+impl HistoryResolution {
+    /// Its query word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Second => "1s",
+            Self::TenSeconds => "10s",
+            Self::Minute => "1m",
+            Self::TenMinutes => "10m",
+            Self::Hour => "1h",
+        }
+    }
+
+    /// Duration of an existing band, in milliseconds.
+    #[must_use]
+    pub const fn period_ms(self) -> i64 {
+        match self {
+            Self::Second => 1_000,
+            Self::TenSeconds => 10_000,
+            Self::Minute => 60_000,
+            Self::TenMinutes => 600_000,
+            Self::Hour => 3_600_000,
+        }
+    }
+
+    fn from_word(word: &str) -> Option<Self> {
+        Some(match word {
+            "1s" => Self::Second,
+            "10s" => Self::TenSeconds,
+            "1m" => Self::Minute,
+            "10m" => Self::TenMinutes,
+            "1h" => Self::Hour,
+            _ => return None,
+        })
+    }
+}
+
+/// The stable resource token used by the history wire.
+#[must_use]
+pub const fn history_row_word(row: Resource) -> &'static str {
+    match row {
+        Resource::Cpu => "cpu",
+        Resource::Gpu => "gpu",
+        Resource::Memory => "mem",
+        Resource::Disk => "disk",
+        Resource::Network => "net",
+        Resource::Tokens => "tokens",
+        Resource::Processes => "procs",
+    }
+}
+
+fn history_row(word: &str) -> Option<Resource> {
+    Some(match word {
+        "cpu" => Resource::Cpu,
+        "gpu" => Resource::Gpu,
+        "mem" | "memory" => Resource::Memory,
+        "disk" => Resource::Disk,
+        "net" | "network" => Resource::Network,
+        "tokens" => Resource::Tokens,
+        "procs" | "processes" => Resource::Processes,
+        _ => return None,
+    })
 }
 
 /// A form of the disk view: a word after `disk`.
@@ -278,6 +375,10 @@ pub struct SysQuery {
     /// `why`'s subject; `None` for a bare `why` (the reply chooses) and every
     /// other view.
     pub subject: Option<WhySubject>,
+    /// Selected machine history rows, in request order; empty selects every resource.
+    pub history_rows: Vec<Resource>,
+    /// Keep only this existing canonical strip band; absence retains every band.
+    pub history_res: Option<HistoryResolution>,
 }
 
 /// An id `job=`/`task=` takes: `[A-Za-z0-9_-]{1,32}`.
@@ -306,7 +407,8 @@ impl SysQuery {
     /// or `scope=`, `depth=` or `instances=` on a view that does not take it, or read options
     /// other than JSON formatting or the advisory caller label on an explicit `name` action; a
     /// form word anywhere but once after `disk`, and `scope=`, `depth=` or `top=` with
-    /// `disk held`; [`WHY_USAGE`] for any other word after `why`.
+    /// `disk held`, repeated or unsupported history rows/bands, history deltas, or row limits
+    /// on history/events; [`WHY_USAGE`] for any other word after `why`.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         let mut q = Self {
             view: View::Overview,
@@ -322,11 +424,18 @@ impl SysQuery {
             caller: None,
             name: None,
             subject: None,
+            history_rows: Vec::new(),
+            history_res: None,
         };
         let mut view_seen = false;
         let mut naming = false;
         for tok in rest.split_whitespace() {
-            if let Some(v) = tok.strip_prefix("scope=") {
+            if let Some(v) = tok.strip_prefix("res=") {
+                if q.history_res.is_some() {
+                    return Err(USAGE);
+                }
+                q.history_res = Some(HistoryResolution::from_word(v).ok_or(USAGE)?);
+            } else if let Some(v) = tok.strip_prefix("scope=") {
                 q.scope = Some(ScopeArg::from_word(v).ok_or(USAGE)?);
             } else if let Some(v) = tok.strip_prefix("instances=") {
                 if v != "all" {
@@ -374,6 +483,12 @@ impl SysQuery {
                     return Err(USAGE);
                 }
                 q.name = Some(NameTarget::Task(id_word(v).ok_or(USAGE)?));
+            } else if q.view == View::History {
+                let row = history_row(tok).ok_or(USAGE)?;
+                if q.history_rows.contains(&row) || q.history_rows.len() == Resource::ALL.len() {
+                    return Err(USAGE);
+                }
+                q.history_rows.push(row);
             } else if q.view == View::Why {
                 q.subject = match tok {
                     "cpu" | "global.cpu" if q.subject.is_none() => Some(WhySubject::Cpu),
@@ -398,6 +513,17 @@ impl SysQuery {
             }
         }
         if naming && q.name.is_none() {
+            return Err(USAGE);
+        }
+        if q.history_res.is_some() && q.view != View::History {
+            return Err(USAGE);
+        }
+        if q.view == View::History && q.since.is_some() {
+            return Err(USAGE);
+        }
+        if matches!(q.view, View::History | View::Events)
+            && (q.top_set || q.depth.is_some() || q.instances_all)
+        {
             return Err(USAGE);
         }
         if naming
@@ -475,7 +601,9 @@ impl SysQuery {
             | View::Mem
             | View::Net
             | View::Why => true,
-            View::Report | View::Boot => true,
+            // Group rows always intersect the authenticated caller's pane keys before limits
+            // or formatting, even where the requested scope is broader than that caller.
+            View::Report | View::Boot | View::Groups | View::History | View::Events => true,
             View::Aterm => false,
             View::Jobs | View::Procs | View::Left => {
                 matches!(self.effective_scope(), Some(ScopeArg::Tab | ScopeArg::Pane))
@@ -491,6 +619,27 @@ impl SysQuery {
     #[must_use]
     pub fn freshness_default_ms(&self) -> u64 {
         self.view.freshness_default_ms()
+    }
+
+    /// Whether this query's reply prints each process's scheduling, which a sweep reads only
+    /// when asked (`aterm_sysprobe::SweepOpts::scheduling`): `sys procs` and `sys report`, and
+    /// the JSON of `sys tab`, `sys global` and `sys mem`, whose process rows carry it
+    /// (`view::scheduling_json`).
+    #[must_use]
+    pub fn prints_scheduling(&self) -> bool {
+        match self.view {
+            View::Procs | View::Report => true,
+            View::Tab | View::Global | View::Mem => self.json,
+            _ => false,
+        }
+    }
+
+    /// Whether this query's reply prints aterm's own thread CPU (`Snapshot::self_cpu`), which a
+    /// reading reads only when asked: `sys why`, bare or of CPU, in text and JSON
+    /// (`why::why_text`, `why::why_json`). `sys why mem` prints none.
+    #[must_use]
+    pub fn prints_self_cpu(&self) -> bool {
+        self.view == View::Why && self.subject != Some(WhySubject::Mem)
     }
 }
 

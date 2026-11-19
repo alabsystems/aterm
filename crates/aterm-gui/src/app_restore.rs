@@ -3,6 +3,7 @@
 
 //! Session layout capture, sliced cold-launch restoration, and seamless-update handoff adoption.
 
+use crate::app_tabs::{restored_terminal_index, terminal_projection_index, terminal_tab_id_at};
 use crate::spawn::spawn_session;
 use crate::{App, Session, TabIndex, WindowId, WindowState, pane, restore};
 use aterm_window::event_loop::ActiveEventLoop;
@@ -657,9 +658,35 @@ impl App {
                 };
                 // A tab of Mac Setup terminals alone is described only to a handoff, as each such
                 // leaf is ([`App::is_developer_tools_session`]); its terminal index goes with it.
+                // A preview is temporary. Bring its selected strip tab back to the
+                // front after a restart, and keep the hidden session's own record.
+                let saved_active = ws
+                    .active_session_preview()
+                    .and_then(|p| p.anchor)
+                    .or_else(|| ws.tab_set.active_id());
+                let saved_terminal = saved_active
+                    .and_then(|tab| {
+                        crate::app_tabs::terminal_projection_index(
+                            &ws.tab_set,
+                            &self.view_store,
+                            tab,
+                        )
+                    })
+                    .unwrap_or(ws.tabs.active);
+                let borrowed = ws
+                    .dock
+                    .preview
+                    .filter(|p| p.borrowed && self.pool.views(p.session).is_some_and(|v| v > 1))
+                    .map(|p| p.tab);
+                let borrowed_index = borrowed.and_then(|tab| {
+                    crate::app_tabs::terminal_projection_index(&ws.tab_set, &self.view_store, tab)
+                });
                 let terminal_tabs = ws
                     .layouts
                     .iter()
+                    .enumerate()
+                    .filter(|(index, _)| Some(*index) != borrowed_index)
+                    .map(|(_, tree)| tree)
                     .filter(|tree| {
                         let mut plain = false;
                         tree.visit_sessions(&mut |session| {
@@ -675,8 +702,11 @@ impl App {
                 let mut active_item = None;
                 let mut terminal_index = 0usize;
                 for tab in ws.tab_set.tabs() {
+                    if Some(tab.id) == borrowed {
+                        continue;
+                    }
                     if let Some(restored) = self.tab_restore_descriptor_carrying(tab, handoff) {
-                        if ws.tab_set.active_id() == Some(tab.id) {
+                        if saved_active == Some(tab.id) {
                             active_item = Some(restored_tabs.len());
                         }
                         if filling_window == Some(wid) {
@@ -728,7 +758,9 @@ impl App {
                 restore::WindowLayout {
                     rows,
                     cols,
-                    active_tab: ws.tabs.active,
+                    active_tab: (saved_terminal
+                        - usize::from(borrowed_index.is_some_and(|i| i < saved_terminal)))
+                    .min(terminal_tabs.len().saturating_sub(1)),
                     outer_x: pos.map(|p| p.x),
                     outer_y: pos.map(|p| p.y),
                     maximized,
@@ -740,7 +772,7 @@ impl App {
                     tab_order,
                     active_item,
                     workers_in_front: ws.tab_set.home().is_some()
-                        && ws.tab_set.home() == ws.tab_set.active_id(),
+                        && ws.tab_set.home() == saved_active,
                     restored_tabs,
                     // The record that agrees with the grid and frame written beside it; a
                     // headless app seats no dock and keeps its rows' records as they came.
@@ -831,8 +863,10 @@ impl App {
             crate::native_app::AppKind::Markdown
             | crate::native_app::AppKind::Recovery
             | crate::native_app::AppKind::Workers
+            | crate::native_app::AppKind::Registry
             | crate::native_app::AppKind::Tables
-            | crate::native_app::AppKind::Navigator => None,
+            | crate::native_app::AppKind::Navigator
+            | crate::native_app::AppKind::SystemResources => None,
         }
     }
 
@@ -976,7 +1010,7 @@ impl App {
             app: self,
             focus: tab.focus,
             carry_drafts,
-            worker: tab.parked || tab.ephemeral,
+            worker: tab.ephemeral,
             pending: pending.as_ref(),
         };
         let Captured::Kept(root) =
@@ -1028,8 +1062,8 @@ impl App {
     }
 
     /// Whether a tab's capture leaves `view` out, its sibling taking its place: a view no capture
-    /// describes ([`App::view_has_no_capture`]), the navigator ([`App::view_is_unrestored_page`]),
-    /// which lists the machine's sessions and holds nothing of its own to bring back, a Mac Setup
+    /// describes ([`App::view_has_no_capture`]), a page that holds nothing of its own to bring
+    /// back ([`App::view_is_unrestored_page`]: the navigator, System Resources), a Mac Setup
     /// tab's terminal unless `carry_drafts`, and a failed open's Recovery tab no plain open can
     /// try again ([`failed_open_leaf`]).
     fn view_is_left_out(&self, view: crate::tab_model::ViewId, carry_drafts: bool) -> bool {
@@ -1224,8 +1258,12 @@ impl App {
                     ) => restore::NativeLeafRestore::system_state(),
                     (
                         crate::native_app::AppKind::Tables,
-                        crate::native_app::AppViewState::Tables(_),
-                    ) => restore::NativeLeafRestore::tables(),
+                        crate::native_app::AppViewState::Tables(tables),
+                    ) => restore::NativeLeafRestore::tables(tables.row_route()),
+                    (
+                        crate::native_app::AppKind::Registry,
+                        crate::native_app::AppViewState::Registry(registry),
+                    ) => restore::NativeLeafRestore::registry(registry.selected()),
                     (
                         crate::native_app::AppKind::Settings,
                         crate::native_app::AppViewState::Settings(settings),
@@ -1246,8 +1284,10 @@ impl App {
                     | crate::native_app::AppViewState::Mail(_)
                     | crate::native_app::AppViewState::Allocation(_)
                     | crate::native_app::AppViewState::Workers(_)
+                    | crate::native_app::AppViewState::Registry(_)
                     | crate::native_app::AppViewState::Tables(_)
                     | crate::native_app::AppViewState::Navigator(_)
+                    | crate::native_app::AppViewState::SystemResources(_)
                     | crate::native_app::AppViewState::SystemState(_) => {}
                     crate::native_app::AppViewState::Settings(settings) => {
                         if carry_drafts {
@@ -1344,8 +1384,10 @@ impl App {
                 | crate::native_app::AppViewState::Settings(_)
                 | crate::native_app::AppViewState::Allocation(_)
                 | crate::native_app::AppViewState::Workers(_)
+                | crate::native_app::AppViewState::Registry(_)
                 | crate::native_app::AppViewState::Tables(_)
                 | crate::native_app::AppViewState::Navigator(_)
+                | crate::native_app::AppViewState::SystemResources(_)
                 | crate::native_app::AppViewState::SystemState(_) => true,
                 crate::native_app::AppViewState::Editor(editor) => {
                     let (Some(text), Some(buffer)) =
@@ -1753,6 +1795,7 @@ impl App {
         // it every result is held, and would be kept for good.
         let table = self.store.read().unwrap_or_else(|p| p.into_inner()).table();
         if !self.handoff_successor {
+            self.collect_restored_session_tabs();
             let sweep = crate::task_launch::PendingRestoredSweep::new(tasks.clone(), &self.store);
             self.restored_tasks_sweep = Some(sweep.clone());
             table.when_loaded(move || sweep.run());
@@ -1766,6 +1809,36 @@ impl App {
         // reconcile, which waits for it, which sessions live.
         if table.sessions_settled() {
             crate::harness_host::ring();
+        }
+    }
+
+    /// Older layouts could hold several session tabs in every window. Each auxiliary window
+    /// keeps the tab it displayed and the main strip collects the others in saved order.
+    /// A hot update runs this only after replay, while its saved topology is no longer owed.
+    pub(crate) fn collect_restored_session_tabs(&mut self) {
+        let Some(home) = self.tab_home_window() else {
+            return;
+        };
+        let mut moves = Vec::new();
+        for (&wid, ws) in &self.windows {
+            if wid == home {
+                continue;
+            }
+            let keep = ws.tab_set.active_id();
+            for (_, tab) in ws.strip_tabs() {
+                if Some(tab.id) != keep && ws.tab_set.home() != Some(tab.id) {
+                    moves.push((wid, tab.id));
+                }
+            }
+        }
+        for (wid, tab) in moves {
+            if let Err(why) = self.transfer_tab_between(wid, tab, home, false) {
+                aterm_log::warn!(
+                    "restore: tab {} remains in window {}: {why}",
+                    tab.get(),
+                    wid.0
+                );
+            }
         }
     }
 
@@ -2323,14 +2396,6 @@ impl App {
     ) {
         let wid = filling.wid;
         let id = tab.id;
-        let terminal = |view_store: &crate::tab_model::ViewStore, tab: &crate::tab_model::Tab| {
-            !tab.root.any_leaf(&mut |view| {
-                !matches!(
-                    view_store.get(*view),
-                    Some(crate::tab_model::View::Terminal(_))
-                )
-            })
-        };
         let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -2342,11 +2407,12 @@ impl App {
             .filter_map(|(placed, id)| Some((*placed, tabs.iter().position(|tab| tab.id == *id)?)));
         let target = restored_tab_position(present, index, tabs.len());
         let front_before = window.tab_set.active_id();
+        let previous = terminal_tab_id_at(&window.tab_set, &self.view_store, window.tabs.active);
         window
             .tab_set
             .push(tab)
             .expect("fresh restored tab identity");
-        let target = window.tab_set.place(id, target).unwrap_or(target);
+        window.tab_set.place(id, target);
         let bring_front =
             front_before.is_none() || (index == filling.front && front_before == filling.shown);
         let front = if bring_front { Some(id) } else { front_before };
@@ -2357,23 +2423,13 @@ impl App {
         if bring_front {
             filling.shown = Some(id);
         }
-        let projection = |upto: usize| {
-            window.tab_set.tabs()[..upto]
-                .iter()
-                .filter(|tab| terminal(&self.view_store, tab))
-                .count()
-        };
-        let layout_at = projection(target);
-        let front_at = window
-            .tab_set
-            .active()
-            .filter(|tab| terminal(&self.view_store, tab))
-            .and_then(|_| window.tab_set.active_index())
-            .map(projection);
         if let Some(layout) = layout {
+            let layout_at = terminal_projection_index(&window.tab_set, &self.view_store, id)
+                .expect("terminal restore projection");
             window.layouts.insert(layout_at, layout);
         }
-        window.tabs = TabIndex::new(front_at.unwrap_or(0), window.layouts.len());
+        let active = restored_terminal_index(&window.tab_set, &self.view_store, previous);
+        window.tabs = TabIndex::new(active, window.layouts.len());
         filling.placed.push((index, id));
         drop(route_guard_window);
         if front == front_before {
@@ -2425,11 +2481,9 @@ impl App {
         let Some(current) = window.tab_set.get(anchor.tab) else {
             return;
         };
-        let old_projection = crate::app_tabs::terminal_projection_index(
-            &window.tab_set,
-            &self.view_store,
-            anchor.tab,
-        );
+        let previous = terminal_tab_id_at(&window.tab_set, &self.view_store, window.tabs.active);
+        let old_projection =
+            terminal_projection_index(&window.tab_set, &self.view_store, anchor.tab);
         if current.root != anchor.original.root || current.focus != anchor.original.focus {
             filling.shown = None;
         }
@@ -2505,21 +2559,11 @@ impl App {
             window.layouts.remove(at);
         }
         if let Some(projection) = projection {
-            let at = crate::app_tabs::terminal_projection_index(
-                &window.tab_set,
-                &self.view_store,
-                anchor.tab,
-            )
-            .expect("terminal graft projection");
+            let at = terminal_projection_index(&window.tab_set, &self.view_store, anchor.tab)
+                .expect("terminal graft projection");
             window.layouts.insert(at, projection);
         }
-        let active = window
-            .tab_set
-            .active_id()
-            .and_then(|id| {
-                crate::app_tabs::terminal_projection_index(&window.tab_set, &self.view_store, id)
-            })
-            .unwrap_or(0);
+        let active = restored_terminal_index(&window.tab_set, &self.view_store, previous);
         window.tabs = TabIndex::new(active, window.layouts.len());
         filling.placed.push((index, anchor.tab));
         drop(route_guard_window);
@@ -3711,14 +3755,16 @@ impl App {
         };
         let mut tab =
             crate::tab_model::Tab::from_root(tab_id, root, focus, record.zoomed, presentation);
-        // A tab with no terminal left is a Recovery tab, and one no leaf's task record came with
-        // has no row to say what it is and no task to end: each stays where the person sees it,
-        // theirs. A fleet drive's tab is a request's with no task record (a drive's plain shell
-        // has none), so it goes back where the drive put it, parked under the Workers tab
-        // (ATERM-KI-1109-3).
+        // The first parked workers predate the ephemeral flag, but carried a task
+        // record. A hidden person's tab carries no worker record even when its live
+        // session has a task. A lost worker is recovered among the visible tabs.
+        let legacy_worker = record.parked
+            && !record.ephemeral
+            && !record.root.all_terminals(&mut |leaf| leaf.task.is_none());
         let worker = pane_tree.is_some() && (record.fleet || self.tab_has_task(&tab));
-        tab.parked = record.parked && worker;
-        tab.ephemeral = (record.ephemeral || record.parked) && worker;
+        tab.ephemeral =
+            worker && (record.ephemeral || legacy_worker || (record.parked && record.fleet));
+        tab.parked = record.parked && pane_tree.is_some() && (!record.ephemeral || worker);
         tab.fleet = record.fleet && tab.ephemeral;
         Ok((tab, pane_tree))
     }
@@ -4058,10 +4104,7 @@ impl App {
             .map_err(|_| "terminal view identity space exhausted".to_string())?;
         self.next_session_id = self.next_session_id.saturating_add(1);
         Self::register_session(&self.store, &session, None);
-        self.store
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_state(id, crate::session_store::SessionState::Exited);
+        self.record_session_exited(id);
         self.pool_insert(session);
         self.carry_restored_theme(id, leaf);
         self.index_autopilot_timer(id, Some(crate::autopilot_timers::ClosedOver::Aterm));
@@ -4702,7 +4745,25 @@ impl App {
                     .map_err(|why| format!("System State could not be reopened: {why:?}"))?;
             }
             "tables" => {
-                self.stage_tables_tab(target, None)?;
+                let (_, view) =
+                    self.stage_tables_tab(target, None, crate::tables_store::FAMILIES)?;
+                if let Some((sheet, key)) = descriptor
+                    .route
+                    .as_deref()
+                    .and_then(restore::table_row_route)
+                    && let Some(sheet) = crate::tables_store::routed_collection(sheet)
+                {
+                    self.reveal_table_record(view, sheet, key)?;
+                }
+            }
+            "registry" => {
+                let machine = descriptor
+                    .route
+                    .as_deref()
+                    .and_then(restore::table_row_route)
+                    .filter(|(sheet, _)| *sheet == "machine")
+                    .map(|(_, key)| key.to_owned());
+                self.stage_registry_tab(target, None, machine, crate::qos::Role::Background)?;
             }
             "settings" => {
                 let route = descriptor

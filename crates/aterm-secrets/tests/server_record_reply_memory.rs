@@ -12,7 +12,7 @@ use aterm_secrets::{
     commons::binding::Request,
     envelope, fsx,
     membership_log::{
-        Body, Entrant, EpochAudience, Inserted, Log, MAX_RECORDS_STREAM, Record, RecordId, Store,
+        Body, Entrant, EpochAudience, Inserted, Log, REPLY_CAP, Record, RecordId, Store,
         read_records,
     },
     server::{self, Options, Running},
@@ -276,7 +276,7 @@ fn read_response(mut stream: TcpStream, request: String) -> Response {
             break;
         }
         length += read;
-        assert!(length <= MAX_RECORDS_STREAM);
+        assert!(length <= REPLY_CAP);
         hash.update(&buffer[..read]);
     }
     Response {

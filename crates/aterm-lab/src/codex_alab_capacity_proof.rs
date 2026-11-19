@@ -2,14 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! THE CAPACITY LANE (`codex-alab-proof --capacity-only`, and the full proof's last leg):
-//! codex-alab's headless capacity and account-quota recovery (its `alab/CAPACITY_RECOVERY.md`,
-//! and its `alab-core` glue `responses_quota_retry.rs`) on the REAL package's `codex exec`, in
-//! the proof's jail ([`super::policy`]: one loopback port, the owner's homes fenced), against a
-//! loopback model of this lane's own. Every case codex-alab's standalone smoke ran (its
-//! `alab/smoke/capacity_exec.py` as of codex-alab `767a333a16`, which every `capacity_exec.py`
-//! below names: its default run, `--quota`, `--quota-no-reset` and `--quota-terminals`), by its
-//! name ([`CASES`]); that run had `codex exec` reach its model with the Internet open, and this
-//! lane replaces it:
+//! codex-alab's headless capacity and account-quota recovery on the REAL package's
+//! `codex exec`, in the proof's jail ([`super::policy`]: one loopback port, the person's
+//! homes fenced), against a loopback model of this lane's own. The original standalone
+//! `capacity_exec.py` cases are held to the current native exec contract:
+//! `alab-core/src/exec_wall.rs` and `alab-core/glue/responses_quota_retry.rs`.
 //!
 //! - the package's records agree (version, target, an exact source commit, `bin/codex` inside
 //!   the package), `codex exec --help` names the flags this lane passes, and `codex --version`
@@ -26,11 +23,14 @@
 //!   `Retry-After` ([`RESET_PAST_RETRY_S`], rounded up to the second), which the retry may not
 //!   precede; or that `429` with no reset, after which codex-alab polls no sooner than
 //!   [`QUOTA_POLL_S`] later;
-//! - REFUSAL (`permanent-refusal`, `quota-permanent-refusal`, `quota-no-reset-refusal`,
-//!   `quota-terminal-<kind>`): a `403` with the overloaded or the quota body (with or without its
-//!   reset), or a `429` with the quota body, its reset and `x-codex-rate-limit-reached-type` one of
-//!   the four credit-depletion and spending-cap [`TERMINAL_KINDS`], is asked once, fails the
-//!   turn, and exits non-zero (no signal).
+//! - REFUSAL (`permanent-refusal`, `quota-permanent-refusal`, `quota-no-reset-refusal`): a
+//!   `403` with the overloaded or quota body is asked once, fails the turn, and exits
+//!   non-zero without a signal;
+//! - WORKSPACE QUOTA (`quota-workspace-<kind>`): a `429` typed as one of
+//!   [`WORKSPACE_KINDS`] is asked twice with identical input. The subscribed exec runtime
+//!   gives its host [`HOST_GRACE_S`] to answer, even when the refusal names a shorter reset.
+//!   This isolated fixture's host sends no decision: the second refusal fails the same
+//!   native turn and exits non-zero without a signal, with no third request.
 //!
 //! EGRESS, as the lab's other proofs check it: before each case a jailed `nc` reaches the
 //! lane's model port and is refused a loopback canary port the jail does not name (whose
@@ -80,17 +80,19 @@ const HEADER_EMISSION_LIMIT_S: f64 = 0.050;
 const QUOTA_POLL_S: u64 = 30;
 /// The most one `codex` run may take beyond what its case waits by design: a hang bound.
 const RUN_LIMIT: Duration = Duration::from_secs(60);
-/// The `x-codex-rate-limit-reached-type`s codex-alab keeps terminal however the reset reads:
-/// `capacity_exec.py --quota-terminals`' four credit-depletion and spending-cap types.
-pub(super) const TERMINAL_KINDS: [&str; 4] = [
+/// The subscribed exec runtime's initial grace for a workspace wall, even when
+/// the refusal names a shorter reset (`alab-core::exec_wall::UNKNOWN_RESET_WAIT`).
+const HOST_GRACE_S: u64 = 30;
+/// Workspace credit-depletion and spending-cap `x-codex-rate-limit-reached-type`s.
+/// These need a host decision after their initial grace; an account reset cannot clear them.
+pub(super) const WORKSPACE_KINDS: [&str; 4] = [
     "workspace_owner_credits_depleted",
     "workspace_member_credits_depleted",
     "workspace_owner_usage_limit_reached",
     "workspace_member_usage_limit_reached",
 ];
 
-/// One case of the lane, each one of `capacity_exec.py`'s, by its name ([`Case::name`]): the wall
-/// the model answers with, and whether the turn must recover from it or fail at it.
+/// One model wall and the native turn's recovery or refusal contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Case {
     /// `503 server_is_overloaded`, recovered after `Retry-After`.
@@ -105,12 +107,12 @@ pub(super) enum Case {
     QuotaNoResetRecovery,
     /// `403` with the quota body and no reset: terminal.
     QuotaNoResetRefusal,
-    /// `429` with the quota body, its reset and `x-codex-rate-limit-reached-type` this kind (one
-    /// of [`TERMINAL_KINDS`]): terminal.
-    QuotaTerminal(&'static str),
+    /// A workspace `429` with this type (one of [`WORKSPACE_KINDS`]): without a host
+    /// decision, the turn ends at its second refusal after [`HOST_GRACE_S`].
+    WorkspaceQuotaRefusal(&'static str),
 }
 
-/// Every case the lane runs, in `capacity_exec.py`'s order.
+/// Every model wall the lane runs, with current native exec semantics.
 pub(super) const CASES: [Case; 10] = [
     Case::CapacityRecovery,
     Case::PermanentRefusal,
@@ -118,14 +120,14 @@ pub(super) const CASES: [Case; 10] = [
     Case::QuotaPermanentRefusal,
     Case::QuotaNoResetRecovery,
     Case::QuotaNoResetRefusal,
-    Case::QuotaTerminal(TERMINAL_KINDS[0]),
-    Case::QuotaTerminal(TERMINAL_KINDS[1]),
-    Case::QuotaTerminal(TERMINAL_KINDS[2]),
-    Case::QuotaTerminal(TERMINAL_KINDS[3]),
+    Case::WorkspaceQuotaRefusal(WORKSPACE_KINDS[0]),
+    Case::WorkspaceQuotaRefusal(WORKSPACE_KINDS[1]),
+    Case::WorkspaceQuotaRefusal(WORKSPACE_KINDS[2]),
+    Case::WorkspaceQuotaRefusal(WORKSPACE_KINDS[3]),
 ];
 
 impl Case {
-    /// Its name, `capacity_exec.py`'s: its output folder and its verdict's `case`.
+    /// Its output folder and verdict's `case`.
     pub(super) fn name(self) -> String {
         match self {
             Self::CapacityRecovery => "capacity-recovery".into(),
@@ -134,7 +136,7 @@ impl Case {
             Self::QuotaPermanentRefusal => "quota-permanent-refusal".into(),
             Self::QuotaNoResetRecovery => "quota-no-reset-recovery".into(),
             Self::QuotaNoResetRefusal => "quota-no-reset-refusal".into(),
-            Self::QuotaTerminal(kind) => format!("quota-terminal-{kind}"),
+            Self::WorkspaceQuotaRefusal(kind) => format!("quota-workspace-{kind}"),
         }
     }
 
@@ -143,7 +145,7 @@ impl Case {
         matches!(self, Self::QuotaResetRecovery | Self::QuotaNoResetRecovery)
     }
 
-    /// Whether the turn must fail at the wall, asked once (else it must recover from it).
+    /// Whether the turn must end in refusal rather than recover.
     pub(super) fn refused(self) -> bool {
         !matches!(
             self,
@@ -155,7 +157,9 @@ impl Case {
     fn status(self) -> u16 {
         match self {
             Self::CapacityRecovery => 503,
-            Self::QuotaResetRecovery | Self::QuotaNoResetRecovery | Self::QuotaTerminal(_) => 429,
+            Self::QuotaResetRecovery
+            | Self::QuotaNoResetRecovery
+            | Self::WorkspaceQuotaRefusal(_) => 429,
             Self::PermanentRefusal | Self::QuotaPermanentRefusal | Self::QuotaNoResetRefusal => 403,
         }
     }
@@ -169,7 +173,7 @@ impl Case {
     fn names_reset(self) -> bool {
         matches!(
             self,
-            Self::QuotaResetRecovery | Self::QuotaPermanentRefusal | Self::QuotaTerminal(_)
+            Self::QuotaResetRecovery | Self::QuotaPermanentRefusal | Self::WorkspaceQuotaRefusal(_)
         )
     }
 
@@ -177,6 +181,7 @@ impl Case {
     fn waits(self) -> Duration {
         match self {
             Self::QuotaNoResetRecovery => Duration::from_secs(QUOTA_POLL_S),
+            Self::WorkspaceQuotaRefusal(_) => Duration::from_secs(HOST_GRACE_S),
             Self::CapacityRecovery => Duration::from_secs(RETRY_AFTER_S),
             // The reset is [`RESET_PAST_RETRY_S`] past `Retry-After`, and up to a second more:
             // rounded up to the second.
@@ -200,9 +205,9 @@ impl Case {
                 "one turn recovers from a quota answer that names no reset, asked again no sooner \
                  than {QUOTA_POLL_S} s after it, the plan kept"
             ),
-            Self::QuotaTerminal(kind) => format!(
-                "a 429 typed {kind} is asked once, fails the turn and exits non-zero, its reset \
-                 notwithstanding"
+            Self::WorkspaceQuotaRefusal(kind) => format!(
+                "a 429 typed {kind} keeps identical input for the host's {HOST_GRACE_S} s grace, \
+                 then fails the turn at its second refusal and exits non-zero"
             ),
             Self::PermanentRefusal | Self::QuotaPermanentRefusal | Self::QuotaNoResetRefusal => {
                 "a 403 is asked once, fails the turn and exits non-zero".into()
@@ -450,7 +455,7 @@ pub(super) fn answer(case: Case, number: usize, now: f64) -> Answer {
             body: J::obj([("error", error)]).dump(PY),
             retry_after: Some(RETRY_AFTER_S),
             reached_type: match case {
-                Case::QuotaTerminal(kind) => Some(kind),
+                Case::WorkspaceQuotaRefusal(kind) => Some(kind),
                 _ => None,
             },
             resets_at,
@@ -654,19 +659,31 @@ pub(super) fn quota_reset_kept(walled: &Taken, retry: &Taken) -> Result<i64, Str
 /// # Errors
 /// A stamp missing or not finite, or a retry sooner.
 pub(super) fn quota_poll_kept(walled: &Taken, retry: &Taken) -> Result<f64, String> {
+    wall_wait_kept(
+        walled,
+        retry,
+        QUOTA_POLL_S,
+        "unknown account quota reset bypassed its polling backoff",
+    )
+}
+
+fn wall_wait_kept(
+    walled: &Taken,
+    retry: &Taken,
+    seconds: u64,
+    context: &str,
+) -> Result<f64, String> {
     let Some(header) = walled.header_sent.filter(|h| h.is_finite()) else {
-        return Err("missing or invalid quota poll timing".into());
+        return Err("missing or invalid quota wait timing".into());
     };
     if !retry.arrived.is_finite() {
-        return Err("missing or invalid quota poll timing".into());
+        return Err("missing or invalid quota wait timing".into());
     }
-    let poll = retry.arrived - header;
-    if poll < QUOTA_POLL_S as f64 {
-        return Err(format!(
-            "unknown account quota reset bypassed its polling backoff ({poll:.6}s after headers)"
-        ));
+    let delay = retry.arrived - header;
+    if delay < seconds as f64 {
+        return Err(format!("{context} ({delay:.6}s after headers)"));
     }
-    Ok(poll)
+    Ok(delay)
 }
 
 /// JSON equality with objects compared as key sets: a parsed object's keys come back in
@@ -699,7 +716,7 @@ fn user_texts(body: &J) -> Vec<String> {
 /// THE VERDICT ON ONE CASE, from its exit (`None`: a signal), what the model took and the
 /// JSON events `codex exec --json` wrote: the summary `result.json` keeps.
 /// # Errors
-/// The first thing the case did not do, in `capacity_exec.py`'s words.
+/// The first native exec condition the evidence fails to establish.
 pub(super) fn judge(
     case: Case,
     exit: Option<i32>,
@@ -742,13 +759,36 @@ pub(super) fn judge(
         ("events", J::Arr(types.iter().map(|t| J::s(*t)).collect())),
     ]);
     if case.refused() {
-        if !exit.is_some_and(|c| c > 0) || taken.len() != 1 {
+        let requests = if matches!(case, Case::WorkspaceQuotaRefusal(_)) {
+            2
+        } else {
+            1
+        };
+        if !exit.is_some_and(|c| c > 0) || taken.len() != requests {
             return Err(format!(
-                "{name}: the refusal was retried, signaled or reported success"
+                "{name}: expected {requests} refusal request(s) and a non-zero nonsignal exit"
             ));
         }
         if count("turn.failed") != 1 || count("turn.completed") != 0 {
             return Err(format!("{name}: the refusal did not fail the native turn"));
+        }
+        if matches!(case, Case::WorkspaceQuotaRefusal(_)) {
+            let input = |t: &Taken| t.body.as_ref().and_then(|b| b.get("input")).cloned();
+            match (input(&taken[0]), input(&taken[1])) {
+                (Some(first), Some(retry)) if same(&first, &retry) => {}
+                _ => return Err(format!("{name}: workspace retry changed retained input")),
+            }
+            let delay =
+                retry_after_delay(&taken[0], &taken[1]).map_err(|e| format!("{name}: {e}"))?;
+            let grace = wall_wait_kept(
+                &taken[0],
+                &taken[1],
+                HOST_GRACE_S,
+                "workspace quota bypassed its host grace",
+            )
+            .map_err(|e| format!("{name}: {e}"))?;
+            result.set("retryDelaySeconds", J::Float(delay));
+            result.set("hostGraceSeconds", J::Float(grace));
         }
     } else {
         if exit != Some(0) || taken.len() != 3 {

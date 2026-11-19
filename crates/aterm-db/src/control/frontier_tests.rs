@@ -35,7 +35,7 @@ fn stated(endpoint: &Endpoint, wire: Wire) -> usize {
     let metadata = 4 + HELLO_FIXED + 6;
     match wire {
         Wire::Whole => metadata,
-        Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
+        Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges | Wire::Proofs => {
             metadata + 4 + 13 + 32 * View::of(endpoint).unwrap().have().len()
         }
     }
@@ -993,7 +993,7 @@ fn frontier_sender_respects_the_receivers_smaller_held_bound() {
 /// Evidence past its bounds is refused from its header, before a record of it is read: more
 /// records than either side holds, more than the wire's evidence bytes (under `atdb/5`
 /// [`MAX_EVIDENCE`], what an `ACX2` hello carried of a witness before it; under `atdb/4`
-/// `MAX_RECORDS_STREAM`, 64 MiB, as 0.153 takes), a journal node that is not one, or larger than
+/// `REPLY_CAP`, 64 MiB, as 0.153 takes), a journal node that is not one, or larger than
 /// one; and an empty push, which `atdb/4` refuses from its header and which seats nobody in a
 /// log that holds nothing under `atdb/5`.
 ///
@@ -1001,7 +1001,7 @@ fn frontier_sender_respects_the_receivers_smaller_held_bound() {
 /// and its first record is read.
 #[test]
 fn frontier_rejects_oversized_evidence_before_reading_its_records() {
-    use aterm_secrets::membership_log::MAX_RECORDS_STREAM;
+    use aterm_secrets::membership_log::REPLY_CAP;
     let lab = Lab::new();
     let endpoint = lab.endpoint(1);
     let remote = lab.endpoint(0);
@@ -1017,8 +1017,8 @@ fn frontier_rejects_oversized_evidence_before_reading_its_records() {
         (Wire::Delta, false, 1, MAX_NODE as u64 + 1, true),
         (Wire::Whole, true, 0, 0, true),
         (Wire::Whole, true, bound.held + 1, 1, true),
-        (Wire::Whole, true, 1, MAX_RECORDS_STREAM as u64 + 1, true),
-        (Wire::Whole, true, 1, MAX_RECORDS_STREAM as u64, false),
+        (Wire::Whole, true, 1, REPLY_CAP as u64 + 1, true),
+        (Wire::Whole, true, 1, REPLY_CAP as u64, false),
         (Wire::Whole, false, 0, 0, true),
         (Wire::Whole, false, 2, 1, true),
         (Wire::Whole, false, 1, MAX_NODE as u64 + 1, true),
@@ -2704,20 +2704,6 @@ fn a_stage_after_a_look_that_holds_nothing_takes_a_look_of_its_own() {
     );
 }
 
-/// What a test names `protocol` by: its ALPN, or none.
-const fn alpn(protocol: Protocol) -> &'static str {
-    match protocol {
-        Protocol::Legacy => "no ALPN",
-        Protocol::Repair => "atdb/2",
-        Protocol::Credentials => "atdb/3",
-        Protocol::Frontier(Wire::Whole) => "atdb/4",
-        Protocol::Frontier(Wire::Delta) => "atdb/5",
-        Protocol::Frontier(Wire::Duplex) => "atdb/6",
-        Protocol::Frontier(Wire::Reconcile) => "atdb/7",
-        Protocol::Frontier(Wire::Ranges) => "atdb/8",
-    }
-}
-
 /// One session from `initiator` to `responder` over loopback under `protocol`, with `mutant` on
 /// and `hook` observing the peer cache in the responder's thread: what each side returned and its
 /// repair, the responder's first.
@@ -2814,13 +2800,13 @@ fn a_pending_enrollment_is_judged_on_every_record_held() {
         assert!(
             served.is_ok() && enrolled.is_ok(),
             "CONTROL {}: a Mac no record removes enrolls: {served:?} {enrolled:?}",
-            alpn(protocol)
+            protocol.alpn()
         );
         assert_eq!(
             repair.authenticated_actor(),
             Some(actor),
             "CONTROL {}",
-            alpn(protocol)
+            protocol.alpn()
         );
     }
     let seated = client::load_records(&paths).unwrap();
@@ -2888,7 +2874,7 @@ fn a_pending_enrollment_is_judged_on_every_record_held() {
             (served.is_ok() || repair.authenticated_actor().is_some() || authored).then(|| {
                 format!(
                     "{}: served {:?}, authenticated {}, authored {authored}, device {:?}",
-                    alpn(protocol),
+                    protocol.alpn(),
                     served.map(|report| report.sent),
                     repair.authenticated_actor().is_some(),
                     enrolled.map(|report| report.received),
@@ -2913,7 +2899,7 @@ fn a_pending_enrollment_is_judged_on_every_record_held() {
         assert!(
             served.is_ok() && repair.authenticated_actor() == Some(actor),
             "NEGATIVE CONTROL {}: the acknowledged log alone enrolls Mac 2: {served:?}",
-            alpn(protocol)
+            protocol.alpn()
         );
     }
 
@@ -2942,13 +2928,13 @@ fn a_pending_enrollment_is_judged_on_every_record_held() {
         assert!(
             served.is_err(),
             "CONTROL {}: an acknowledged Remove refuses Mac 2: {served:?}",
-            alpn(protocol)
+            protocol.alpn()
         );
         assert_eq!(
             repair.authenticated_actor(),
             None,
             "CONTROL {}",
-            alpn(protocol)
+            protocol.alpn()
         );
     }
 }
@@ -3052,13 +3038,13 @@ fn a_remove_after_the_check_stops_every_later_grant_on_atdb_2_3() {
             written.load(Ordering::SeqCst),
             "{} {durable:?}: the responder passed Mac 2's check and took its lease: \
              {answered:?} {dialed:?}",
-            alpn(protocol)
+            protocol.alpn()
         );
         assert_eq!(
             client::load_records(&paths).unwrap().log().map(Log::heads),
             Some(removed.heads()),
             "{} {durable:?}: the Remove is durable",
-            alpn(protocol)
+            protocol.alpn()
         );
         Later {
             answered: answered.ok().map(|report| report.sent),
@@ -3085,7 +3071,7 @@ fn a_remove_after_the_check_stops_every_later_grant_on_atdb_2_3() {
         for durable in [Durable::Ahead, Durable::Acknowledged] {
             let seen = granted(protocol, durable, None);
             if seen.any() {
-                later.push((alpn(protocol), durable, seen));
+                later.push((protocol.alpn(), durable, seen));
             }
         }
     }
@@ -3106,7 +3092,7 @@ fn a_remove_after_the_check_stops_every_later_grant_on_atdb_2_3() {
                 control.answered.is_some() && control.control != 0 && control.records,
                 "NEGATIVE CONTROL {} {durable:?}: one check for every grant grants the removed Mac \
                  the rest of the session: {control:?}",
-                alpn(protocol)
+                protocol.alpn()
             );
         }
     }

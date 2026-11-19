@@ -1278,7 +1278,8 @@ impl EffectsPipeline {
         self.cursor.glow.set_bloom_spares_letters(on);
     }
 
-    /// A test's negative control: the cursor lights drawn without the letter
+    /// A test's negative control, or a test that judges nothing the guard
+    /// shapes (the companion's): the cursor lights drawn without the letter
     /// guard (`CursorGlow::set_letter_guard`).
     #[cfg(any(test, debug_assertions))]
     #[inline]
@@ -1946,14 +1947,16 @@ impl EffectsPipeline {
         } else {
             Some(over.as_str())
         };
-        let lexicon = match aterm_lexicon::Lexicon::with_languages_and_override(&refs, over_ref) {
+        // Shared with every other pipeline's of the same languages and override while one holds
+        // it (`Lexicon::shared`): a pane opened beside another compiles nothing.
+        let lexicon = match aterm_lexicon::Lexicon::shared(&refs, over_ref) {
             Ok(lex) => lex,
-            Err(_) => aterm_lexicon::Lexicon::with_languages(&refs),
+            Err(_) => std::sync::Arc::new(aterm_lexicon::Lexicon::with_languages(&refs)),
         };
         self.lexicon_conflicts = lexicon.conflicts().to_vec();
         self.sparkle = Some(Resolved {
             cfg: self.deco_cfg.clone(),
-            lexicon: std::sync::Arc::new(lexicon),
+            lexicon,
         });
         self.decos.hard_reset();
     }

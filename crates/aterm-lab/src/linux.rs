@@ -19,6 +19,9 @@ use crate::linux_owned as owned;
 use crate::paths::paths;
 use crate::{Fail, LAB, Res};
 
+#[path = "linux_running.rs"]
+mod running;
+
 /// The VM's lima name.
 pub const VM: &str = "aterm-linux";
 
@@ -134,6 +137,10 @@ reserved guest directory; historical ~/aterm-lane directories are retained.
                            Rust {rust}; x86_64: CARGO_BUILD_TARGET and the cross linker, run under Rosetta), under
                            the display when one is named, with the session bus and at-spi2-core up; the build
                            output is kept for the next `exec` under `up`, else removed when CMD ends
+  exec-running [--] CMD...  run a literal command from / in this checkout's already-running, owned Lima boot;
+                           refuses missing/stale boot receipts or changed mounts; takes the lane but never
+                           initializes, boots, remounts, provisions, resets, stops units or stops the VM.
+                           CMD may change guest state; its output bounds are the caller's responsibility.
   proof [--arch A]... [--display D]... [--weston-renderer gl|pixman] [--keep-build] [--keep-up]
                            the lane's proof: aterm-uds, aterm-pty, aterm-libc and amacs-files's tests,
                            the system readers' (aterm-sysprobe, aterm-vitals, aterm-diskwalk),
@@ -161,7 +168,7 @@ reserved guest directory; historical ~/aterm-lane directories are retained.
   cpu [--arch A]... [--display D]... [--weston-renderer gl|pixman] [--keep-build] [--keep-up]
                            the proof's CPU presenter rows alone (every display unless named): aterm-gui --cpu
                            typed, resized and photographed twice (after the resize, and after one more line typed),
-                           each frame held to the server's own pixels under xvfb, xvfb without MIT-SHM, xwayland
+                           the complete client held to the server's own pixels under xvfb, xvfb without MIT-SHM, xwayland
                            (lane-bus xgrab), weston (weston-screenshooter, weston started with --debug) and mutter
                            (lane-bus cast: a ScreenCast frame of its monitor through PipeWire, the frame found on
                            it); --weston-renderer pixman starts every weston of the run (proof, gone, cpu, deck)
@@ -174,8 +181,8 @@ reserved guest directory; historical ~/aterm-lane directories are retained.
                            the strip band under the Deck pixel-identical to the band without it, its buttons
                            drawn, a click on the strip under the Deck selecting a tab, maximize and restore
                            clicked where aterm draws the frame, and a window not whole cells (maximized, or sized
-                           by xdotool on X11) held to the server's pixels with its remainder bands continuing the
-                           Deck's rows, on the CPU
+                           by xdotool on X11) held to the server's complete client pixels on the CPU,
+                           including the Navigator and remainder padding
   a11y [--arch A]... [--keep-build] [--keep-up]
                            the proof's accessibility runtime rows alone: aterm-dbus, aterm-update-core and
                            aterm-a11y's tests with every ignored one; aterm-a11y's live_atspi bench on at-spi2-core
@@ -310,6 +317,7 @@ pub fn cmd_linux(args: &[String]) -> Res {
         "down" => cmd_down(),
         "status" => cmd_status(),
         "exec" => cmd_exec(rest),
+        "exec-running" => running::cmd(rest),
         "proof" => crate::linux_proof::cmd_proof(rest),
         "baseline" => crate::linux_baseline::cmd_baseline(rest),
         "gone" => crate::linux_proof::cmd_gone(rest),
@@ -642,6 +650,14 @@ impl Lima {
     /// # Errors
     /// No `limactl`: the lane cannot run here.
     pub fn find() -> Result<Lima, Fail> {
+        Self::find_in(false)
+    }
+
+    fn find_existing() -> Result<Lima, Fail> {
+        Self::find_in(true)
+    }
+
+    fn find_in(existing: bool) -> Result<Lima, Fail> {
         let gpu = crate::linux_gpu::on();
         let env = if gpu {
             crate::linux_gpu::lima_env()?
@@ -662,7 +678,7 @@ impl Lima {
         let pinned = aterm_uds::host::tooling_dir()
             .and_then(|t| aterm_uds::host::tool("limactl").placed_in(&t))
             .map(|p| p.to_string_lossy().into_owned());
-        let owned = lima_namespace()?;
+        let owned = lima_namespace_in(existing)?;
         pick_limactl(named.as_deref(), pinned.as_deref(), crate::sys::executable).map(|bin| Lima {
             bin: PathBuf::from(bin),
             vm: crate::linux_gpu::vm(),
@@ -1406,6 +1422,10 @@ pub fn boot_turn_path(lane_lock: &Path) -> PathBuf {
 }
 
 fn lima_namespace() -> Result<owned::Namespace, Fail> {
+    lima_namespace_in(false)
+}
+
+fn lima_namespace_in(existing: bool) -> Result<owned::Namespace, Fail> {
     let named = match std::env::var("LIMA_HOME") {
         Ok(s) => s,
         Err(std::env::VarError::NotPresent) => String::new(),
@@ -1414,17 +1434,24 @@ fn lima_namespace() -> Result<owned::Namespace, Fail> {
     let default = if named.is_empty() {
         let path = aterm_uds::host::host_user_cache("lima")
             .ok_or_else(|| not_run("no HOME for the owned Lima namespace"))?;
-        std::fs::create_dir_all(
-            path.parent()
-                .ok_or_else(|| not_run("Lima cache has no parent"))?,
-        )
-        .map_err(|e| not_run(format!("Lima cache parent: {e}")))?;
+        if !existing {
+            std::fs::create_dir_all(
+                path.parent()
+                    .ok_or_else(|| not_run("Lima cache has no parent"))?,
+            )
+            .map_err(|e| not_run(format!("Lima cache parent: {e}")))?;
+        }
         path
     } else {
         PathBuf::new()
     };
     let path = owned::home(Some(&named), &default).map_err(not_run)?;
-    let namespace = owned::Namespace::open(&path, crate::linux_gpu::vm()).map_err(not_run)?;
+    let namespace = if existing {
+        owned::Namespace::open_existing(&path, crate::linux_gpu::vm())
+    } else {
+        owned::Namespace::open(&path, crate::linux_gpu::vm())
+    }
+    .map_err(not_run)?;
     namespace.existing_vm().map_err(not_run)?;
     Ok(namespace)
 }

@@ -37,7 +37,7 @@ fn authority_is_public_current_bounded_and_read_only() {
     let records = std::fs::read(macs.m22.records_file()).unwrap();
     let witness = member_authority(&macs.m22, &proving).unwrap();
     assert!(!witness.is_empty());
-    assert!(witness.len() <= MAX_RECORDS_STREAM);
+    assert!(witness.len() <= REPLY_CAP);
     assert!(
         !witness
             .windows(b"private-vault-value".len())

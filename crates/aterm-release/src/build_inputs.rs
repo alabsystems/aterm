@@ -636,9 +636,11 @@ fn candidate_roots_with(
 /// libraries of its host and x86_64 targets, and the Apple roots
 /// (`atpkg::input_seal::apple_roots`). They resolve in the release's order: the Trust sysroot,
 /// HOME, the rustup shim, RUSTUP_HOME and PATH, the declared stock sysroot, the Trust and then the
-/// stable host, the SDK, the Trust and then the stock libraries, the Apple tools. So where
+/// stock host, the SDK, the Trust and then the stock libraries, the Apple tools. So where
 /// more than one fails, the first error is the one it was before the protocol moved to atpkg,
-/// and a Trust that cannot name its sysroot fails before the declared stock proxy runs.
+/// and a Trust that cannot name its sysroot fails before the declared stock proxy runs. Where
+/// that stock release, or a std the seal hashes, is not in place, the failure names what puts it
+/// there ([`stock_gap`]).
 #[cfg(target_os = "macos")]
 fn machine_roots(sdk: &AppleSdk) -> Result<Vec<input_seal::Root>, String> {
     let trust = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
@@ -662,7 +664,8 @@ fn machine_roots_from(
     let stock_root = input_seal::output_path(
         stock.command("rustc")?.args(["--print", "sysroot"]),
         &format!("{stock_toolchain} sysroot"),
-    )?;
+    )
+    .map_err(|why| stock_gap(stock_toolchain, &why))?;
     let trust_host = input_seal::trust_host(&trust)?;
     let stock_host = input_seal::output_host(
         command(stock_root.join("bin/rustc")).arg("-vV"),
@@ -673,13 +676,53 @@ fn machine_roots_from(
         ("stock/proxies".into(), shim),
         ("stock/bin".into(), stock_root.join("bin")),
     ]);
-    roots.extend(input_seal::rust_library_roots(
-        "stock",
+    roots.extend(stock_library_roots(
+        stock_toolchain,
         &stock_root,
-        &[&stock_host, "x86_64-apple-darwin"],
+        &stock_host,
     )?);
     roots.extend(input_seal::apple_roots(sdk.root.clone())?);
     Ok(roots)
+}
+
+/// The libraries of the stock release `release`, whose sysroot is `stock_root`, for its host
+/// `host` and the x86_64 slice (`atpkg::input_seal::rust_library_roots`): where either is
+/// missing, as `rustup toolchain install` alone leaves the x86_64 one on an arm64 Mac, the
+/// failure is a [`stock_gap`].
+#[cfg(any(test, target_os = "macos"))]
+fn stock_library_roots(
+    release: &str,
+    stock_root: &Path,
+    host: &str,
+) -> Result<Vec<input_seal::Root>, String> {
+    input_seal::rust_library_roots("stock", stock_root, &[host, "x86_64-apple-darwin"])
+        .map_err(|why| stock_gap(release, &why))
+}
+
+/// What separates a build-inputs seal failure from the remedy [`stock_gap`] gives it.
+const STOCK_GAP: &str = " — the stock release the seal hashes is not in place with its stds: ";
+
+/// The seal failure `why` where `release`, the stock release the seal hashes (for its generic
+/// roots the one the trust.lock of the checkout this process runs in names, for a candidate's
+/// the one its source's pin names), is not in place with the stds the seal hashes (rustup does
+/// not resolve its sysroot, or its host's or the x86_64 slice's library is missing), with what
+/// puts it there ([`crate::buildplan::stock_release_remedy`]: `verify provision rustup` here
+/// where this checkout's lock names `release`, else in a checkout whose lock does, and the
+/// release's own install line), which [`stock_gap_remedy`] reads back. Every reader of the seal
+/// says it so (a freeze of R's cutter, step 1's seal, `ship inputs`, a pre-freeze), never
+/// rustup's own install hint alone, which installs no x86_64 std.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn stock_gap(release: &str, why: &str) -> String {
+    let checkout = crate::trust_lock::checkout_stock_toolchain().ok();
+    format!(
+        "{why}{STOCK_GAP}{}",
+        crate::buildplan::stock_release_remedy(release, checkout.as_deref())
+    )
+}
+
+/// The remedy a seal failure `why` carries where it is a [`stock_gap`]; `None` for any other.
+pub(crate) fn stock_gap_remedy(why: &str) -> Option<&str> {
+    why.split_once(STOCK_GAP).map(|(_, remedy)| remedy)
 }
 
 /// The content digest of labeled `roots` under [`SCHEMA`] (`atpkg::input_seal::content_digest`).

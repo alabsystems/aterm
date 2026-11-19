@@ -123,12 +123,18 @@ pub fn decode_footprint(raw: &[u64; USAGE_WORDS]) -> Option<u64> {
 }
 
 /// Each swept process's resource coalition id, kept by pid under the pid version it was read at,
-/// and its whole name where its short name is at the cut, kept by pid under that version and the
-/// short name ([`Self::name`]; [`crate::procs::processes_keeping`]). So a sweep reads the
-/// coalition only of a process it has not read under its current version, and the longer names
-/// only of one it has not read under its current version and short name: an exec that lands
-/// between a sweep's short-name read and its version read keeps the name under the old short
-/// name and the new version, so the next sweep reads the longer names again under that version.
+/// its whole name where its short name is at the cut, kept by pid under that version and the
+/// short name ([`Self::name`]), and what else the sweep need not read again of that generation
+/// ([`Generation`]): its session id and a refusal of its usage
+/// ([`crate::procs::processes_keeping`]). So a sweep reads the coalition only of a process it has
+/// not read under its current version, and the longer names only of one it has not read under its
+/// current version and short name. The macOS sweep reads each process's version before every
+/// other read of its row and, where that answers, again after them, and keeps nothing read for a
+/// row whose last read answers another version or none ([`Self::forget`]), so what is kept under
+/// a version was all read while the pid held that version. That is not always of the program
+/// the version names: xnu takes an exec's version before it sets the process's names and the
+/// image its path reader reads, so a whole name read in that window can be the program's before
+/// it, and is answered to the sweeps after while the process keeps that version and short name.
 ///
 /// A kept id stays the process's own while its version stays: xnu adopts a task into a coalition
 /// only as it makes the task (`task_create_internal`: a fork, a spawn, or an exec's new task;
@@ -141,8 +147,24 @@ pub struct CoalitionIds {
     kept: HashMap<u32, (i32, u64, u64)>,
     /// Each pid's kept whole name ([`Self::name`]).
     names: HashMap<u32, KeptName>,
+    /// Each pid's kept generation facts ([`Self::generation`]): the version they were read under,
+    /// the facts, and the sweep that kept them.
+    generations: HashMap<u32, (i32, Generation, u64)>,
     /// The sweeps begun.
     sweep: u64,
+}
+
+/// What the macOS sweep keeps of one process's generation (its pid and pid version) for the
+/// sweeps after ([`CoalitionIds::generation`]), each read where the generation's row was kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Generation {
+    /// Its session id (`getsid`, positive), which the sweep answers again only where no `setsid`
+    /// can have moved it since.
+    pub sid: Option<u32>,
+    /// The effective uid its short info named where the kernel refused its usage (`EPERM`) and
+    /// that uid is not the sweep's own: the sweep answers that refusal again while the short info
+    /// names the same uid.
+    pub refused: Option<u32>,
 }
 
 /// One process's whole name, as [`CoalitionIds::name`] keeps it.
@@ -192,32 +214,13 @@ impl CoalitionIds {
         read
     }
 
-    /// `pid`'s coalition and pid version as a sweep reads them: `version`'s read, then
-    /// [`Self::of`] under it, where `coalition`'s read is kept only if `version` reads the same
-    /// again after it (no exec, and no new process at the pid, between). A read the version
-    /// moved across answers `None` and keeps nothing.
-    pub fn read(
-        &mut self,
-        pid: u32,
-        mut version: impl FnMut() -> Option<i32>,
-        coalition: impl FnOnce() -> Option<u64>,
-    ) -> (Option<u64>, Option<i32>) {
-        let before = version();
-        let id = self.of(pid, before, || {
-            let id = coalition()?;
-            (version() == before).then_some(id)
-        });
-        (id, before)
-    }
-
     /// `pid`'s whole name at pid `version` under the short name `comm`: the name kept under both,
     /// else `read`'s, kept under them. The sweep asks this only of a short name at its cut, whose
     /// longer readers name the file the process last exec'd ([`crate::procs::whole_name`]): an
     /// exec gives the process a new pid version, as a reused pid's new process has, so the name
-    /// is read again. The short name is kept too, since the sweep reads it before the version: a
-    /// name read across an exec (the short name before it, the version after) is not answered
-    /// again once the sweep reads the new program's short name. The kept name is the first read
-    /// for its key: an executable renamed after its exec keeps the name it had then.
+    /// is read again. The short name is kept too, so a name is answered only for the short name
+    /// it was read with. The kept name is the first read for its key: an executable renamed after
+    /// its exec keeps the name it had then.
     pub fn name(
         &mut self,
         pid: u32,
@@ -246,12 +249,38 @@ impl CoalitionIds {
         name
     }
 
-    /// Ends a sweep: drops every pid it did not ask about (one that ended, or a zombie), and every
-    /// name it did not ask for (also one whose short name the cut no longer reaches).
+    /// What `pid`'s generation at pid `version` kept ([`Self::keep_generation`]), if it is kept
+    /// under that version.
+    #[must_use]
+    pub fn generation(&self, pid: u32, version: i32) -> Option<Generation> {
+        self.generations
+            .get(&pid)
+            .filter(|kept| kept.0 == version)
+            .map(|kept| kept.1)
+    }
+
+    /// Keeps `facts` of `pid`'s generation at pid `version` for the sweeps after, in place of any
+    /// it kept before.
+    pub fn keep_generation(&mut self, pid: u32, version: i32, facts: Generation) {
+        self.generations.insert(pid, (version, facts, self.sweep));
+    }
+
+    /// Drops everything kept of `pid`: the sweep kept no live row of it (its pid version moved, or
+    /// it ended, across the row's reads), so nothing read for it then is kept.
+    pub fn forget(&mut self, pid: u32) {
+        self.kept.remove(&pid);
+        self.names.remove(&pid);
+        self.generations.remove(&pid);
+    }
+
+    /// Ends a sweep: drops every pid it did not ask about (one that ended, or a zombie), every
+    /// name it did not ask for (also one whose short name the cut no longer reaches), and every
+    /// generation whose row it did not keep.
     pub fn end_sweep(&mut self) {
         let sweep = self.sweep;
         self.kept.retain(|_, k| k.2 == sweep);
         self.names.retain(|_, k| k.sweep == sweep);
+        self.generations.retain(|_, k| k.2 == sweep);
     }
 
     /// `pid`'s kept id and the pid version it was read under.

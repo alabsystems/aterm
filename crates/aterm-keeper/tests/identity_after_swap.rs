@@ -6,6 +6,7 @@
 #![cfg(target_vendor = "apple")]
 
 use std::ffi::OsString;
+use std::io::ErrorKind;
 use std::io::Write as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 use aterm_keeper::client::{KeeperClient, refused_identity};
 use aterm_keeper::identity::{Identity, IdentityPolicy};
 use aterm_keeper::job::{self, JobState};
-use aterm_spec::wait::{MUST_HAPPEN, within};
+use aterm_spec::wait::{MUST_HAPPEN, until_while_working, within};
 use aterm_uds::deadline::{FIRST_EXEC_HANG, KeptUntilRan, output_until};
 
 const ROLE: &str = "ATERM_KEEPER_SWAP_ROLE";
@@ -321,22 +322,36 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     );
 
     let fake = s.dir().join("run").join("f.sock");
-    s.kids.push(
-        Command::new("/usr/bin/nc")
-            .arg("-lU")
-            .arg(&fake)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("nc"),
-    );
-    within(MUST_HAPPEN, Duration::from_millis(10), || {
-        fake.exists().then_some(())
-    })
-    .expect("nc never listened");
+    let nc = Command::new("/usr/bin/nc")
+        .arg("-lU")
+        .arg(&fake)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("nc");
+    let nc_pid = nc.id();
+    s.kids.push(nc);
     let own = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
-    let refused = KeeperClient::connect(&fake, &own, MUST_HAPPEN).expect_err("nc admitted");
+    // bind can publish the path before listen. Wait for the first real dial so
+    // a preliminary probe doesn't consume the one-shot connection.
+    let refused =
+        until_while_working(
+            nc_pid,
+            "nc's listening socket",
+            || match KeeperClient::connect(&fake, &own, MUST_HAPPEN) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    None
+                }
+                outcome => Some(outcome),
+            },
+        )
+        .expect_err("nc admitted");
     if trustd_silent(&refused.to_string()) {
         aterm_spec::host::could_not_run(format_args!("{TRUSTD_SILENT}: {refused}"));
     }

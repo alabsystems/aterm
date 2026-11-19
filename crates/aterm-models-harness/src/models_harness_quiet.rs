@@ -21,9 +21,14 @@ use aterm_spec::derive::*;
 /// (`upgrade::status_lags`). A working session tells 3 as it tells real work. A break with nothing
 /// named is work no row names. `near` is a person's key within their grace,
 /// which holds the tell and not the move; `held` that real work has held the round past
-/// `upgrade::WORK_TELL_S` with nobody seen, which a look that finds a person or a wall breaks
-/// (`HoldBreaks`, strongly fair: a person seen at the breaks the drive looks at, however briefly,
-/// is seen); `tells` the one line that names the deadline standing, `due` that deadline passed
+/// `upgrade::WORK_TELL_S` with nobody seen, counted as one episode (`St::own`): a look that finds a
+/// person or a wall breaks it (`HoldBreaks`, strongly fair: a person seen at the breaks the drive
+/// looks at, however briefly, is seen), and nothing else does: neither the work ending and other
+/// work starting with a gap shorter than the drive's `CLEAR_GAP_S` between them, nor a change of
+/// what holds it, nor a line that was not taken whole (`regap`, set only by the mutant
+/// `HoldRestartsAtAGap` that restarts it there: m16's tabs, held 11 hours by rolling children and
+/// never told, `NoGapRestartsTheHold`); `tells` the one line that names the deadline standing,
+/// `due` that deadline passed
 /// (`upgrade::WORK_DEADLINE_S`); `carried` that the move took the waits' commands with it. A
 /// look that finds a person or a wall, or an idle point with nothing running, voids the deadline
 /// and its line and starts the hold again (`DeadlineVoids`, `upgrade::deadline_voids`): work
@@ -36,12 +41,17 @@ use aterm_spec::derive::*;
 /// stands for its loop's life and holds neither: the autopilot carries a managed worker as it
 /// carries any other (`ManagersNeverHoldTheCarry`).
 ///
-/// `dated` is a wall its transcript dates (a login wall, `upgrade::LoginScan::since`; a usage
-/// limit, `upgrade::StandingScan::since`), and `aged` that it has stood its bound
+/// `dated` is a wall with an age: its transcript dates it (a login wall,
+/// `upgrade::LoginScan::since`; a usage limit, `upgrade::StandingScan::since`), or a look before
+/// this one saw it (`St::login_seen`, `St::limit_seen`: a wall only the screen shows, or one whose
+/// transcript or keys cannot be read); and `aged` that it has stood its bound
 /// (`upgrade::LOGIN_WALL_S`, `upgrade::LIMIT_WALL_S`) with nobody seen: no person's and no work
 /// of the agent's, so the round moves there as at an idle point with nothing of its own running
-/// (`WallsYield`); a person near restarts its clock. A wall only the screen shows (`dated` clear)
-/// is not bounded here.
+/// (`WallsYield`); a person near restarts its clock. A wall at the look that first sees it
+/// (`dated` clear) has no age yet, and the next look that finds it standing dates it from that
+/// sighting (`WallSighted`, weakly fair: the watch looks at least every half hour); `blind` is set
+/// only by the mutant `WallNeverSighted`, the wall only the screen shows that no look dated and so
+/// never aged (ATERM-KI-1112-964, `ScreenWallsAreDated`).
 ///
 /// `silent` is a session whose task finished or landed, into which nothing is typed before a move
 /// (`upgrade::Facts::silent`): no deadline is told there, and `outlasted`, its own follows' hold
@@ -85,6 +95,8 @@ pub fn harness_upgrade_quiet_model() -> Model {
             var outlasted = 0;
             var hush = 0;
             var loud = 0;
+            var regap = 0;
+            var blind = 0;
 
             action TurnRuns when (moved == 0 && posture > 0) {
                 posture = 0;
@@ -110,6 +122,11 @@ pub fn harness_upgrade_quiet_model() -> Model {
                 posture = 3;
                 dated = 1;
                 aged = 0;
+            }
+            action WallSighted when (
+                moved == 0 && posture == 3 && dated == 0 && blind == 0
+            ) {
+                dated = 1;
             }
             action WallAges when (
                 moved == 0 && posture == 3 && dated == 1 && aged == 0 && near == 0
@@ -305,6 +322,19 @@ pub fn harness_upgrade_quiet_model() -> Model {
                 mheld = 1;
                 slipped = 1;
             }
+            action HoldRestartsAtAGap when (
+                Buggy == 1 && slipped == 0 && moved == 0 && held == 1 && near == 0 &&
+                posture <= 2
+            ) {
+                held = 0;
+                outlasted = 0;
+                regap = 1;
+                slipped = 1;
+            }
+            action WallNeverSighted when (Buggy == 1 && slipped == 0 && blind == 0) {
+                blind = 1;
+                slipped = 1;
+            }
 
             invariant NoTellOffAPoint: offpoint == 0;
             invariant NoTellOverAPerson: person == 0;
@@ -322,6 +352,8 @@ pub fn harness_upgrade_quiet_model() -> Model {
             invariant SilentWorkYields: hush == 0;
             invariant NoTellIntoASilentSession: loud == 0;
             invariant WallsYield: wstuck == 0;
+            invariant NoGapRestartsTheHold: regap == 0;
+            invariant ScreenWallsAreDated: blind == 0;
         }
     }
 }
@@ -365,10 +397,11 @@ pub fn harness_upgrade_quiet_liveness() -> Liveness {
     }
 }
 
-/// A wall nobody lifts that its transcript dates (a login wall, a usage limit) never holds an
-/// idle round for good: with nothing of the agent's own running and nobody near, a wall that
-/// stands ages past its bound (`upgrade::LOGIN_WALL_S`, `upgrade::LIMIT_WALL_S`) and the round
-/// moves. A wall only the screen shows, a person near and the agent's own work are outside it.
+/// A wall nobody lifts (a login wall, a usage limit) never holds an idle round for good: with
+/// nothing of the agent's own running and nobody near, a wall that stands is dated (by its
+/// transcript, else from the look that first saw it), ages past its bound
+/// (`upgrade::LOGIN_WALL_S`, `upgrade::LIMIT_WALL_S`) and the round moves, a wall only the screen
+/// shows among them. A person near and the agent's own work are outside it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(harness_upgrade_quiet_model)]
@@ -378,10 +411,10 @@ pub fn harness_upgrade_wall_liveness() -> Liveness {
         name: "AWallNeverHoldsAnIdleRoundForGood",
         goal: or_(
             or_(is("moved", 1), neq(var("posture"), int(3))),
-            or_(or_(is("dated", 0), neq(var("work"), int(0))), is("near", 1)),
+            or_(neq(var("work"), int(0)), is("near", 1)),
         ),
-        weak: vec!["WallAges", "MoveAtIdle"],
+        weak: vec!["WallSighted", "WallAges", "MoveAtIdle"],
         strong: vec![],
-        mutants: vec!["WallHoldsForGood"],
+        mutants: vec!["WallHoldsForGood", "WallNeverSighted"],
     }
 }

@@ -74,11 +74,19 @@
 //! at all. [`RecordsBound::can_exchange`] requires both formats equal and both byte capacities to
 //! hold the other's, so a format-2 node answers `409` to a request that states no version-2
 //! bound, takes nothing from an answer that states none, and posts with [`FORMAT_POST_QUERY`],
-//! which every server before it refuses unread. Nothing in this build stores a format mark: the
-//! first format-2 write (tracker FL-148) waits on the fence's floor
-//! ([`crate::commons::hearing::FENCE`]).
+//! which every server before it refuses unread. No running build stores a format mark: none
+//! writes format 2 first (tracker FL-148, which waits on the fence's floor,
+//! [`crate::commons::hearing::FENCE`]), and a node follows a format-2 vault, storing its mark on
+//! a seat's signed format-2 record (`crate::membership_log::follow`, Unix only as the mark's
+//! writers are), only in a build that reads format 2 (`FormatMark::follows`), which none is
+//! while [`crate::commons::hearing::READS_FORMAT`] names no release. A server that answers a
+//! records pull `409` beside a bound of a later format than the puller stated is the one
+//! refusal such a build asks again stating that format ([`crate::ErrorKind::LaterFormat`]). A
+//! node with a format mark keeps its records off the mesh's members lane, which states no
+//! bound (`client::members_lane_open`, ATERM-KI-1116-1471), and a build that does not read the
+//! format its mark names writes nothing over its records file (`client::reads_marked_format`).
 
-use crate::membership_log::{LEGACY_RECORDS, MAX_RECORDS_STREAM, RecordBudgets};
+use crate::membership_log::{LEGACY_RECORDS, REPLY_CAP, RecordBudgets};
 
 /// What a node states of its records ([`crate::transport::RECORDS_BOUND_HEADER`]): the most
 /// records it holds, the most bytes, the format they are in, and whether its log has crossed
@@ -117,9 +125,35 @@ pub const FORMAT_ONE: u32 = 1;
 /// The format whose `Put`s sign their body's digest (`docs/DESIGN-vault-log-2026-11-14.md` step
 /// 4): nothing in this build writes it.
 pub const FORMAT_TWO: u32 = 2;
-/// The byte capacity of a format-1 log: the stream bound every build since 0.146 shares
-/// ([`MAX_RECORDS_STREAM`]), so a format-1 bound need not state it.
-pub const FORMAT_ONE_BYTES: u64 = MAX_RECORDS_STREAM as u64;
+/// The byte capacity of a format-1 log, `64 MiB`: what every build since 0.146 holds a records
+/// file to, so a format-1 bound need not state it. It is format 1's for good, and one reply's
+/// bytes by value ([`REPLY_CAP`], which every such build holds a stream to as well): a
+/// format-1 store is always one reply.
+pub const FORMAT_ONE_BYTES: u64 = 64 * 1024 * 1024;
+const _: () = assert!(
+    FORMAT_ONE_BYTES == REPLY_CAP as u64,
+    "a format-1 store is one reply: every build since 0.146 holds both to 64 MiB"
+);
+/// The byte capacity of a format-2 log (tracker FL-148D): one reply's bytes ([`REPLY_CAP`]),
+/// so a format-2 store still fits one reply and two format-2 nodes state equal capacities
+/// ([`RecordsBound::can_exchange`]). A store larger than a reply is a later change (tracker
+/// FL-249), made here and nowhere else: every bound on what a store holds reads [`capacity`].
+pub const FORMAT_TWO_BYTES: u64 = REPLY_CAP as u64;
+
+/// The most bytes of records a store of `format` holds: the storage class of byte bound, and
+/// the one place any bound on what a store may hold reads it from (a records file and its
+/// layout, a log's byte bound, a head, a held draft; as a length in memory,
+/// [`crate::membership_log::Reading::capacity`]). The other class is the wire's ([`REPLY_CAP`],
+/// the size of one reply or stream), which no format changes. [`FORMAT_ONE_BYTES`] at format
+/// 1, [`FORMAT_TWO_BYTES`] at any later one.
+#[must_use]
+pub const fn capacity(format: u32) -> u64 {
+    if format <= FORMAT_ONE {
+        FORMAT_ONE_BYTES
+    } else {
+        FORMAT_TWO_BYTES
+    }
+}
 
 /// The query a format-2 node's records POST carries, beside its version-2
 /// [`crate::transport::RECORDS_BOUND_HEADER`]: every server before the format fence answers a
@@ -176,11 +210,16 @@ impl RecordsBound {
         }
     }
 
-    /// This bound at `format`: its byte capacity stays the one this build's log holds
-    /// ([`FORMAT_ONE_BYTES`]) until a later format's store states its own (tracker FL-148).
+    /// This bound at `format`, stating the byte capacity a store of that format holds
+    /// ([`capacity`]): the one accessor, so what a node states is what its store holds wherever
+    /// that is raised. Both formats hold one reply's bytes in this build.
     #[must_use]
     pub const fn at_format(self, format: u32) -> Self {
-        Self { format, ..self }
+        Self {
+            format,
+            bytes: capacity(format),
+            ..self
+        }
     }
 
     /// A format-1 node of this build holding its records within [`RecordBudgets::current`],
@@ -366,6 +405,26 @@ mod mark {
             &self.path
         }
 
+        /// Whether the node whose mark this is follows a vault into a later format than
+        /// [`super::FORMAT_ONE`]: its build reads format 2
+        /// ([`crate::commons::hearing::READS_FORMAT`] names a release, and none does yet). The
+        /// one gate of everything [`crate::membership_log::follow`] does: asking a source again
+        /// stating format 2, storing a mark, and reading records at the format a mark names.
+        /// While it answers no, its records are read at format 1, and a mark this node holds
+        /// (none does) changes the bound it states, keeps its records off the mesh's members
+        /// lane and stops every write of its records file, which holds records this build
+        /// does not read.
+        #[cfg(unix)]
+        pub(crate) fn follows(&self) -> bool {
+            // A test's node reads format 2 where the test says so ([`Faults::follows`]), by its
+            // mark's path, so no other node of the process does.
+            #[cfg(test)]
+            if faults(&self.path).follows {
+                return true;
+            }
+            crate::commons::hearing::READS_FORMAT.is_some()
+        }
+
         /// The format it names: [`super::FORMAT_ONE`] where nothing is there.
         ///
         /// # Errors
@@ -493,7 +552,9 @@ mod mark {
         pub(crate) mark_on_receipt: bool,
         /// MUTANT: the node takes a crossed source's batch that brings it only records waiting
         /// on a parent, storing the mark first, so one record any seat ever held (a removed
-        /// Mac's) signs, naming a parent that never comes, crosses it.
+        /// Mac's) signs, naming a parent that never comes, crosses it. On a node that follows
+        /// a format-2 vault (`crate::membership_log::follow`): a version-2 record its copy
+        /// holds only waiting on a parent is the evidence its format mark is stored on.
         pub(crate) mark_on_waiting: bool,
         /// MUTANT: the node, crossed, serves a records GET that states no bound the first
         /// [`LEGACY_RECORDS`](crate::membership_log::LEGACY_RECORDS) records it would serve (the
@@ -504,6 +565,29 @@ mod mark {
         /// mark ([`super::after_format_mark`]), so [`Faults::dies_between`] leaves it held with
         /// no mark, and the node states format 1 beside it.
         pub(crate) format_after_write: bool,
+        /// Not a fault: the node's build reads format 2 (`FormatMark::follows`), as every
+        /// build does once [`crate::commons::hearing::READS_FORMAT`] names a release.
+        pub(crate) follows: bool,
+        /// MUTANT: the node takes a source's statement of format 2 (its bound's header) as
+        /// the evidence a mark is stored on (`crate::membership_log::follow`), so a source
+        /// that only claims format 2 moves it across the line.
+        pub(crate) mark_on_header: bool,
+        /// MUTANT: the node's records pass follows a source that states a later format before
+        /// it takes what its other sources sent, so a removed seat's version-2 record moves it
+        /// across the line in the very pass whose source answered with that seat's `Remove`.
+        pub(crate) follow_before_take: bool,
+        /// MUTANT: the node's records pass asks again, stating format 2, every source that
+        /// refused its pull, whatever the refusal: one that stated no later format (a reply it
+        /// cannot take for its capacity or its crossing) among them.
+        pub(crate) later_on_any_refusal: bool,
+        /// MUTANT: the node writes its records file though its format mark names a format its
+        /// store does not read, so a build that reads no format 2 replaces a followed file with
+        /// the format-1 records it read of it.
+        pub(crate) writes_unread_format: bool,
+        /// MUTANT: the node's membership records ride the mesh's members lane whatever its
+        /// format mark names, so a format-2 Mac hands a format-1 Mac its records over the
+        /// mesh, and takes that Mac's (ATERM-KI-1116-1471).
+        pub(crate) lane_past_mark: bool,
     }
 
     #[cfg(test)]
@@ -537,14 +621,21 @@ pub(crate) use mark::{Faults, faults, inject};
 
 /// Whether the node whose log `store` holds and whose mark is `mark` has crossed.
 ///
+/// The count is of the records its log knows ([`crate::membership_log::Log::known_count`]):
+/// those it holds and those a root of it dropped (tracker FL-148D). A whole log's is its held
+/// count, as ever. A rooted log tells a set-reconciling peer of the dropped ids too
+/// ([`crate::membership_log::Store::complete_inventory`]), and a build before the fence reads
+/// no more than [`LEGACY_RECORDS`] ids of an inventory, so a rooted log within the legacy
+/// count of held records and past it with its stubs has crossed.
+///
 /// # Errors
 /// The mark's path cannot be read ([`Mark::stored`]).
 #[cfg(any(unix, windows))]
 pub(crate) fn crossed(mark: &Mark, store: &crate::membership_log::Store) -> crate::Result<bool> {
-    let held = store
+    let known = store
         .log()
-        .map_or(0, crate::membership_log::Log::held_count);
-    Ok(past_legacy(held) || mark.stored()?)
+        .map_or(0, crate::membership_log::Log::known_count);
+    Ok(past_legacy(known) || mark.stored()?)
 }
 
 /// What the node whose log `store` holds, whose crossed mark is `mark` and whose format mark is
@@ -565,19 +656,15 @@ pub(crate) fn stated(
 /// Run `write`, which makes the node whose format mark is `mark` hold its first record of
 /// `format`, only once the mark names `format` durably: so no records file, store or reply holds
 /// a record of a format its node does not state, and a node that dies between the two holds the
-/// mark and none of the records. Nothing in this build calls it outside a test: the first
-/// format-2 write (tracker FL-148) waits on [`crate::commons::hearing::FENCE`].
+/// mark and none of the records. Its callers are a node that follows a format-2 vault on a
+/// seat's signed record ([`crate::membership_log::follow::Followed::take`] and
+/// [`crate::membership_log::follow::take_on_evidence`]), which no running build does
+/// ([`FormatMark::follows`]); the first format-2 write (tracker FL-148F) waits on
+/// [`crate::commons::hearing::FENCE`].
 ///
 /// # Errors
 /// The mark cannot be stored (then `write` does not run), or `write` fails.
 #[cfg(unix)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the first format-2 write (tracker FL-148) calls it; nothing writes format 2 yet"
-    )
-)]
 pub(crate) fn after_format_mark<T>(
     mark: &FormatMark,
     format: u32,

@@ -36270,14 +36270,15 @@ fn field_placeholder_lines(placeholder: &str, width: f32, swatch: bool) -> (Stri
 /// The widest value a colour field holds: "#" and six of the widest hex digit, so any colour
 /// written or typed takes no more lines than the field keeps for it.
 fn widest_color_words() -> String {
+    const DIGITS: &str = "0123456789abcdefABCDEF";
     let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
-    let widest = "0123456789abcdefABCDEF"
+    let digits: Vec<&str> = (0..DIGITS.len()).map(|at| &DIGITS[at..=at]).collect();
+    let widths = crate::tray_raster::ui_text_widths_for(crate::widget::TextFace::Ui, &digits, px);
+    let widest = DIGITS
         .chars()
-        .max_by(|one, other| {
-            let width = |digit: &char| crate::tray_raster::ui_text_width(&digit.to_string(), px);
-            width(one).total_cmp(&width(other))
-        })
-        .unwrap_or('D');
+        .zip(widths)
+        .max_by(|(_, one), (_, other)| one.total_cmp(other))
+        .map_or('D', |(digit, _)| digit);
     format!("#{}", widest.to_string().repeat(6))
 }
 
@@ -37555,8 +37556,14 @@ fn pieces_fit(text: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> bool {
         .all(|(_, piece)| measure(piece) <= width + crate::native_ui::TEXT_FIT_SLACK)
 }
 
-fn fact_name_width(text: &str) -> f32 {
+/// The UI face and size a fact's name is set in.
+fn fact_name_face() -> (crate::widget::TextFace, f32) {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+    (face, px)
+}
+
+fn fact_name_width(text: &str) -> f32 {
+    let (face, px) = fact_name_face();
     crate::tray_raster::ui_text_width_for(face, text, px)
 }
 
@@ -37582,14 +37589,12 @@ impl FactColumns {
         let px = 13.0 * crate::native_appearance::text_scale();
         let fits = rows.iter().all(|(name, text)| {
             let code = metadata_value_is_code(name);
-            pieces_fit(about_fact_label(name), label, &fact_name_width)
+            ui_pieces_fit(about_fact_label(name), fact_name_face(), label)
                 && if code {
                     metadata_value_text_width(text, px, true)
                         <= value + crate::native_ui::TEXT_FIT_SLACK
                 } else {
-                    pieces_fit(text, value, &|piece| {
-                        metadata_value_text_width(piece, px, false)
-                    })
+                    ui_pieces_fit(text, (crate::widget::TextFace::Ui, px), value)
                 }
         });
         let beside = Self {
@@ -37626,10 +37631,29 @@ impl FactColumns {
     }
 }
 
+/// A fact's words on the lines they take `value_width` wide: a commit or build in the terminal
+/// face, broken anywhere; any other fact in the UI face, its parts joined on a line where they
+/// fit, kept as [`set_in_ui_face`] keeps a set: they read only the words, the box, the UI face
+/// and its size.
 fn metadata_value_lines(label: &str, value: &str, value_width: f32) -> Vec<String> {
+    thread_local! {
+        /// The lines [`metadata_value_lines`] set a fact's words on in the UI face.
+        static FACT_LINES: RefCell<Box<UiKept<Vec<String>>>> = RefCell::new(Box::default());
+    }
     let budget = value_width.max(0.0);
     let code = metadata_value_is_code(label);
     let px = 13.0 * crate::native_appearance::text_scale();
+    if code {
+        return metadata_value_lines_set(value, budget, px, true);
+    }
+    set_in_ui_face(
+        &FACT_LINES,
+        (value, (crate::widget::TextFace::Ui, px), budget),
+        || metadata_value_lines_set(value, budget, px, false),
+    )
+}
+
+fn metadata_value_lines_set(value: &str, budget: f32, px: f32, code: bool) -> Vec<String> {
     let measure = |line: &str| metadata_value_text_width(line, px, code);
     let fits = |line: &str| measure(line) <= budget + crate::native_ui::TEXT_FIT_SLACK;
     if fits(value) {
@@ -37671,7 +37695,7 @@ fn metadata_value_lines(label: &str, value: &str, value_width: f32) -> Vec<Strin
 
 fn fact_card_lines(label: &str, value: &str, columns: FactColumns) -> (Vec<String>, Vec<String>) {
     (
-        wrap_to_box(about_fact_label(label), columns.label, &fact_name_width),
+        ui_set_lines(about_fact_label(label), fact_name_face(), columns.label),
         metadata_value_lines(label, value, columns.value),
     )
 }
@@ -41024,19 +41048,29 @@ fn messages_title_room(lead: MessagesLead, content_width: f32) -> f32 {
 /// taller than the list's room is held a screen of lines at a time ([`messages_tall_parts`]).
 /// Cut to one line, or to the lines a screen held, titles read "Claude Code is not…" and "Codex
 /// CLI is not…" at 1x in a 318pt window, what each message said lost.
+///
+/// The lines read only the title, its room, the UI face and its size, so they are kept as
+/// [`set_in_ui_face`] keeps a set, apart from other text: a plan lays each head out again at every
+/// seat of every render, and a log holds up to 512.
 fn messages_title_lines(title: &str, lead: MessagesLead, content_width: f32) -> Vec<String> {
+    thread_local! {
+        /// The lines [`messages_title_lines`] set a title on.
+        static TITLE_LINES: RefCell<Box<UiKept<Vec<String>>>> = RefCell::new(Box::default());
+    }
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-    let measure = |line: &str| crate::tray_raster::ui_text_width_for(face, line, px);
     let room = messages_title_room(lead, content_width);
-    if measure(title) <= room + crate::native_ui::TEXT_FIT_SLACK {
-        return vec![title.to_string()];
-    }
-    let lines = wrap_to_box(title, room, &measure);
-    if lines.is_empty() {
-        vec![String::new()]
-    } else {
-        lines
-    }
+    set_in_ui_face(&TITLE_LINES, (title, (face, px), room), || {
+        let measure = |line: &str| crate::tray_raster::ui_text_width_for(face, line, px);
+        if measure(title) <= room + crate::native_ui::TEXT_FIT_SLACK {
+            return vec![title.to_string()];
+        }
+        let lines = wrap_to_box(title, room, &measure);
+        if lines.is_empty() {
+            vec![String::new()]
+        } else {
+            lines
+        }
+    })
 }
 
 /// THE LOG'S TITLES, each distinct one with how wide it is set whole on one line and how many

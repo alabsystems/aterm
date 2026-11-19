@@ -446,7 +446,7 @@ const STAGE_HANG: Duration = Duration::from_secs(10 * crate::deadline::ECHO_HANG
 /// its fork and exec, not this test binary's: a `&` or `nohup` runner starts the binary with some
 /// ignored, which every exec keeps, and a stage's child sent one would never end by it. A
 /// launcher that ignores one itself ([`run_staged_hup_ignored`]) still does so after this.
-fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
+pub(super) fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
     launch.env(STAGE_ENV, stage);
     let strip = InheritStrip::prepare();
     // SAFETY: the closure runs between fork and exec and calls only `InheritStrip::apply` and

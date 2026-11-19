@@ -18,15 +18,15 @@
 
 use super::Allowed;
 use crate::crossing::RecordsBound;
-use crate::membership_log::{MAX_RECORDS_STREAM, RecordId};
+use crate::membership_log::{REPLY_CAP, RecordId};
 use crate::{Error, Result, SecretBytes};
 
 const HEADER: &str = "alab-join-bundle/1";
 const HEADER_LOG: &str = "alab-join-bundle/2";
 const HEADER_BOUNDED_LOG: &str = "alab-join-bundle/3";
 /// The largest bundle either side handles, sealed or opened: a whole record store
-/// ([`MAX_RECORDS_STREAM`]) and its header lines.
-pub const MAX_BUNDLE: usize = MAX_RECORDS_STREAM + (1 << 16);
+/// ([`REPLY_CAP`]) and its header lines.
+pub const MAX_BUNDLE: usize = REPLY_CAP + (1 << 16);
 /// The largest `[everyone]` files payload, F10's bound.
 const MAX_FILES: usize = 1 << 20;
 const MAX_SERVERS: usize = 8;
@@ -53,6 +53,17 @@ impl Reader {
             Self::Files => false,
             Self::LegacyLog => source.held != 0 && !source.fenced(),
             Self::BoundedLog(peer) => peer.can_exchange(source),
+        }
+    }
+
+    /// The format of `source` where it is why this reader takes no log of it
+    /// ([`Self::can_take`]) and a later one than the reader stated: the member's own, which a
+    /// new Mac whose build reads it asks again stating (`wire::later_refusal`). `None` for
+    /// every other refusal, and for a reader that states no bound.
+    pub(crate) const fn later_format(self, source: RecordsBound) -> Option<u32> {
+        match self {
+            Self::BoundedLog(peer) if source.format > peer.format => Some(source.format),
+            _ => None,
         }
     }
 
@@ -251,7 +262,7 @@ impl Bundle {
                 admit,
                 records,
             } => {
-                if records.len() > MAX_RECORDS_STREAM {
+                if records.len() > REPLY_CAP {
                     return Err(Error::new(
                         "this Mac's records exceed a join bundle's bound",
                     ));
@@ -338,7 +349,7 @@ impl Bundle {
                 .strip_prefix("admit ")
                 .and_then(super::wire::unhex::<32>)
                 .ok_or_else(bad)?;
-            if line()? != "records" || rest.len() > MAX_RECORDS_STREAM {
+            if line()? != "records" || rest.len() > REPLY_CAP {
                 return Err(bad());
             }
             Handed::Log {

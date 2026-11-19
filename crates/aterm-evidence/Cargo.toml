@@ -1,0 +1,35 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-evidence"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dated, witnessed evidence of one subject (Obs, Ledger, Fresh) and the bounded hold vocabulary (HoldBound, Episode) the update lanes share: pure, no I/O"
+
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
+[dependencies]
+# CredentialPrint's SHA-256 over a namespace, a row pk and a binding generation (never credential
+# bytes): astream's digest, re-exported; zero dependencies of its own.
+aterm-digest = { workspace = true }
+# The anchor attributes' registry (std-only): `Ledger::observe` and `Ledger::verdict` carry
+# `#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(…))]` bindings to
+# LoginEvidence, which expand in every test and debug build; release strips them.
+aterm-spec-anchor = { workspace = true }
+
+[dev-dependencies]
+# The LoginEvidence conformance (src/ledger_conformance_tests.rs): the model it is held to, and the
+# interpreter and step ledger that judge each real call.
+aterm-spec = { workspace = true }
+aterm-models-harness = { workspace = true }
+
+[lints]
+workspace = true

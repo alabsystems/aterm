@@ -21,10 +21,14 @@ use aterm_spec::derive::Model;
 /// (`fails`). `Finish` sets the next wait: a backoff after a failure, at once after a round that
 /// moved or owes or sweeps or broke off, else a rest until the audit. (A run of broken-off
 /// rounds backs off after the first few; each modelled round starts with none behind it.) A
-/// round the seat dials in (`Vouch`) pulls in only an endpoint whose dial failed, once per
-/// failure streak (`pulled`). A beacon (`Beacon`) ends a silence and moves no wait. `last` names
-/// the last action that could move the wait (1 a beacon, 2 a vouch, 0 a tick, a dial or a
-/// finish) and `before` the wait just before it, where that was a beacon or a vouch (else 0).
+/// round the seat dials in from the endpoint's address (`Vouch`) pulls in only an endpoint whose
+/// dial failed, once per failure streak (`pulled`), and is heard, the endpoint being the port
+/// there its seat beaconed from last: it ends a silence and moves no probe (`vouched`, until the
+/// next silence; a dial that probes a silence heard so is `misprobed`). An old port another has
+/// beaconed from since is not heard, and is not modelled. A beacon (`Beacon`) ends a silence and
+/// moves no wait. `last` names the last action that could move the wait (1 a beacon, 2 a vouch,
+/// 0 a tick, a dial or a finish) and `before` the wait just before it, where that was a beacon or
+/// a vouch (else 0).
 ///
 /// The walk: a table that moved here (`Move`) is offered to `Seats` seats one at a time. A round
 /// over it that sent records (`WalkSends`) starts the count of cold answers again, one that found
@@ -32,16 +36,27 @@ use aterm_spec::derive::Model;
 /// another (`WalkLacks`) settles the seat all the same. The walk ends at `Cold` cold answers in a
 /// row or once every seat was tried. `walked` counts its dials since the move.
 ///
+/// A round this side owes a seat (`Owe`: the lists it last traded with the seat may leave out a
+/// table its selection takes now) is a reason of its own for the walk to dial the seat, with
+/// nothing moved here: the owed round (`WalkOwed`, one whose lists are whole) pays it. `owed` is
+/// whether one is owed, and `owedwalks` counts the walk's dials for it since `Owe` made it,
+/// whatever each did to it. It starts at 1, as after an owe paid: with nothing owed the two read
+/// alike, so they are one state, and a healthy owe has two (`owed` 1 with `owedwalks` 0, and the
+/// reverse). An owe moves no endpoint's own wait.
+///
 /// Laws: `BeaconGrantsNothing` (a beacon leaves the wait as it found it); `HealthyVouchInert` (a
 /// round dialled in leaves a healthy endpoint's wait as it found it); `PendingNeverRests` (no
 /// endpoint rests after a round that owes, sweeps or broke off); `AuditWithin` (this side dials
 /// each endpoint within `Reverify` of its last dial, whatever rounds dialled in and beacons do);
-/// `SilenceProbesOnce`; `WalkEnds` (with no new move, a walk dials at most `Seats` times).
+/// `SilenceProbesOnce`; `WalkEnds` (with no new move, a walk dials at most `Seats` times);
+/// `VouchEndsSilence` (no dial probes a silence a round dialled in has since been heard over);
+/// `OwedWalksOnce` (an owed round is dialled once).
 ///
 /// Mutants: 1, a beacon makes the endpoint due; 2, a silence is probed again after each round;
 /// 3, a round that owes, sweeps or broke off rests; 4, a round dialled in pulls in a healthy
 /// endpoint; 5, an audit's rest is drawn past `Reverify`; 6, a seat whose round took another
-/// table is not settled for the moved one.
+/// table is not settled for the moved one; 7, a round dialled in leaves the silence standing;
+/// 8, the owed round leaves the owe standing.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn dial_cadence_model() -> Model {
@@ -57,7 +72,9 @@ pub fn dial_cadence_model() -> Model {
             var failing = 0; var rest = 0; var pulled = 0;
             var beaconed = 0; var silent = 0; var probed = 0; var probes = 0;
             var last = 0; var before = 0;
+            var vouched = 0; var misprobed = 0;
             var hot = 0; var tried = 0; var cold = 0; var walked = 0;
+            var owed = 0; var owedwalks = 1;
             action Tick when (busy == 0 && wait > 0 && age <= Reverify) {
                 wait = wait - 1; age = age + 1; last = 0; before = 0;
             }
@@ -66,7 +83,9 @@ pub fn dial_cadence_model() -> Model {
                 wait = if Buggy == 1 {0} else {wait};
                 last = 1; before = wait;
             }
-            action Silence when (beaconed == 1 && silent == 0 && busy == 0) { silent = 1; }
+            action Silence when (beaconed == 1 && silent == 0 && busy == 0) {
+                silent = 1; vouched = 0;
+            }
             action Dial when (busy == 0
                 && (wait == 0 || (silent == 1 && failing == 0 && (probed == 0 || Buggy == 2)))) {
                 busy = 1; wait = 0; age = 0; rest = 0; last = 0; before = 0;
@@ -75,6 +94,8 @@ pub fn dial_cadence_model() -> Model {
                     if probes == 2 {2} else {probes + 1}
                 } else {probes};
                 probed = if silent == 1 && failing == 0 {1} else {probed};
+                misprobed = if vouched == 1 && silent == 1 && failing == 0
+                    && (probed == 0 || Buggy == 2) {1} else {misprobed};
             }
             action Owes when (busy == 1 && owes == 0) { owes = 1; }
             action Sweeps when (busy == 1 && sweeps == 0) { sweeps = 1; }
@@ -101,6 +122,8 @@ pub fn dial_cadence_model() -> Model {
                     else if failing == 0 && Buggy == 4 {0}
                     else {wait};
                 pulled = if failing == 1 {1} else {pulled};
+                silent = if Buggy == 7 {silent} else {0};
+                vouched = 1;
                 last = 2; before = wait;
             }
             action Move { hot = 1; tried = 0; cold = 0; walked = 0; }
@@ -122,6 +145,11 @@ pub fn dial_cadence_model() -> Model {
                 tried = if Buggy == 6 {tried} else if Seats <= tried + 1 {0} else {tried + 1};
                 cold = if Buggy == 6 {cold} else if Seats <= tried + 1 {0} else {cold};
             }
+            action Owe { owed = 1; owedwalks = 0; }
+            action WalkOwed when (owed == 1) {
+                owed = if Buggy == 8 {1} else {0};
+                owedwalks = if owedwalks == 2 {2} else {owedwalks + 1};
+            }
             invariant BeaconGrantsNothing: last == 0 || last == 2 || before == wait;
             invariant HealthyVouchInert: last <= 1 || failing == 1 || before == wait;
             invariant PendingNeverRests: busy == 1 || rest == 0
@@ -129,6 +157,8 @@ pub fn dial_cadence_model() -> Model {
             invariant AuditWithin: age <= Reverify;
             invariant SilenceProbesOnce: probes <= 1;
             invariant WalkEnds: walked <= Seats;
+            invariant VouchEndsSilence: misprobed == 0;
+            invariant OwedWalksOnce: owedwalks <= 1;
         }
     }
 }

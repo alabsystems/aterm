@@ -1745,6 +1745,21 @@ pub(crate) struct NativeHostGeometry {
     pub(crate) viewport: crate::native_ui::LogicalRect,
 }
 
+impl NativeHostGeometry {
+    /// Whether any of this host's pixels lie inside a recorded client.
+    pub(crate) fn intersects(self, client: aterm_window::dpi::PhysicalSize<u32>) -> bool {
+        let (x, y) = self.origin;
+        self.size.0 > 0
+            && self.size.1 > 0
+            && client.width > 0
+            && client.height > 0
+            && x < i64::from(client.width)
+            && y < i64::from(client.height)
+            && x.saturating_add(i64::from(self.size.0)) > 0
+            && y.saturating_add(i64::from(self.size.1)) > 0
+    }
+}
+
 struct NativeArtifactHost<'a> {
     geometry: NativeHostGeometry,
     card: &'a crate::SettingsCard,
@@ -2152,9 +2167,13 @@ impl App {
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings)
         {
-            // Harness and Lab expose session navigation under the shared Owner fence (Harness
-            // also writes Autopilot words), and This Mac shows this machine's identity.
-            if self.harness_page_in(view) || self.lab_page_in(view) || self.machine_page_in(view) {
+            // Session controls, including bulk tab closure, and the machine identity are Owner-only.
+            if self.harness_page_in(view)
+                || (crate::native_settings::tabs_page::CAN_CLOSE_IDLE_TABS
+                    && self.tabs_page_in(view))
+                || self.lab_page_in(view)
+                || self.machine_page_in(view)
+            {
                 crate::control::FrontControlSurface::OwnerSettings
             } else {
                 crate::control::FrontControlSurface::NativeSettings
@@ -3488,18 +3507,11 @@ impl App {
             return None;
         }
         let (device_x, device_y) = host.geometry.origin;
-        if let Some(size) = window.win_px {
-            let right = device_x.checked_add(i64::from(raster.width))?;
-            let bottom = device_y.checked_add(i64::from(raster.height))?;
-            if raster.width == 0
-                || raster.height == 0
-                || right <= 0
-                || bottom <= 0
-                || device_x >= i64::from(size.width)
-                || device_y >= i64::from(size.height)
-            {
-                return None;
-            }
+        if window
+            .win_px
+            .is_some_and(|size| !host.geometry.intersects(size))
+        {
+            return None;
         }
         Some(RetainedNativeLeafArtifact {
             instance: native.instance,
@@ -3965,7 +3977,9 @@ impl App {
             AppEvent::ScrollAt { lines, .. }
                 if !matches!(
                     kind,
-                    crate::native_app::AppKind::Settings | crate::native_app::AppKind::Tables
+                    crate::native_app::AppKind::Settings
+                        | crate::native_app::AppKind::Tables
+                        | crate::native_app::AppKind::Registry
                 ) =>
             {
                 AppEvent::ScrollLines(lines)
@@ -4237,15 +4251,7 @@ impl App {
         self.native_pointer_target_stands(wid, expected_view)?;
         let focus_viewport = {
             let compiled = self.current_native_ui_for_view(wid, expected_view)?;
-            let node = compiled
-                .semantic(&key)
-                .ok_or_else(|| "unknown or stale UI key".to_string())?;
-            if node.action.as_ref() != Some(&invocation.id) {
-                return Err("UI key/action pair does not match the live semantic tree".to_string());
-            }
-            if node.state.is_some_and(|state| !state.enabled) {
-                return Err("semantic action is disabled".to_string());
-            }
+            let node = Self::checked_native_action_node(&compiled, &key, &invocation)?;
             if node.role == crate::native_ui::SemanticRole::TextViewport {
                 if !compiled.focus_order.contains(&key) {
                     return Err("text viewport is not focusable".to_string());
@@ -4263,6 +4269,24 @@ impl App {
         } else {
             self.dispatch_native_view_event(wid, expected_view, AppEvent::Action(invocation))
         }
+    }
+
+    /// A live enabled control that still offers the action the client reviewed.
+    pub(crate) fn checked_native_action_node<'a>(
+        compiled: &'a crate::native_ui::CompiledUi,
+        key: &crate::native_ui::UiKey,
+        invocation: &crate::native_app::ActionInvocation,
+    ) -> Result<&'a crate::native_ui::SemanticNode, String> {
+        let node = compiled
+            .semantic(key)
+            .ok_or_else(|| "unknown or stale UI key".to_string())?;
+        if node.action.as_ref() != Some(&invocation.id) {
+            return Err("UI key/action pair does not match the live semantic tree".to_string());
+        }
+        if node.state.is_some_and(|state| !state.enabled) {
+            return Err("semantic action is disabled".to_string());
+        }
+        Ok(node)
     }
 
     /// A pointer's release on control `key`: one the live semantic tree holds
@@ -4498,6 +4522,7 @@ impl App {
                     app.kind(),
                     crate::native_app::AppKind::Workers
                         | crate::native_app::AppKind::Tables
+                        | crate::native_app::AppKind::Registry
                         | crate::native_app::AppKind::Navigator
                 )
             });
@@ -4511,6 +4536,7 @@ impl App {
                     crate::native_app::AppKind::SystemState
                         | crate::native_app::AppKind::Mail
                         | crate::native_app::AppKind::Tables
+                        | crate::native_app::AppKind::Registry
                         | crate::native_app::AppKind::Navigator
                 )
             });
@@ -5523,6 +5549,11 @@ impl App {
             } => {
                 self.open_markdown_link(wid, document, &destination)?;
             }
+            AppEffect::OpenRegistryMachineInTables(key) => {
+                if self.locate_native_view(view) == Ok((wid, instance)) {
+                    self.open_registry_machine_in_tables(wid, instance, &key)?;
+                }
+            }
             AppEffect::OpenDocumentEditor { document } => {
                 if self.locate_native_view(view) != Ok((wid, instance))
                     || self.native_runtime.document_id(instance) != Some(document)
@@ -5660,6 +5691,19 @@ impl App {
                 }
                 None => aterm_log::warn!("the package log has no directory to live in"),
             },
+            AppEffect::CleanUpIdleTabs => {
+                let closed = self.clean_up_idle_tabs();
+                if let Some(crate::native_app::AppViewState::Settings(state)) =
+                    self.native_runtime.view_state_mut(view).as_deref_mut()
+                {
+                    state.feedback = Some(match closed {
+                        0 => "No tabs closed.".to_owned(),
+                        1 => "Closed 1 idle tab.".to_owned(),
+                        n => format!("Closed {n} idle tabs."),
+                    });
+                }
+                self.publish_native_harness_state();
+            }
             AppEffect::Harness(crate::native_app::HarnessRequest::AiSignIn { id }) => {
                 self.ai_sign_in(wid, id);
             }
@@ -5669,6 +5713,13 @@ impl App {
             AppEffect::Harness(request) => self.execute_native_harness(request),
             AppEffect::HarnessTimer(request) => self.execute_harness_timer(request),
             AppEffect::Machine(request) => self.execute_machine_page(request),
+            AppEffect::CpuPolicy(press) => self.press_cpu_policy(wid, view, press),
+            // The dispatch refused a press no person stands behind by its action's prefix; this
+            // holds the effect to the same rule wherever it came from.
+            AppEffect::MacosConfiguration(_) if self.gesture_unvouched().is_some() => {}
+            AppEffect::MacosConfiguration(act) => self.press_macos_configuration(wid, view, act),
+            AppEffect::SpotlightControl(_) if self.gesture_unvouched().is_some() => {}
+            AppEffect::SpotlightControl(step) => self.press_spotlight_control(wid, view, step),
             AppEffect::InvalidateOwnPresentation => {
                 self.refresh_native_presentation(wid, instance, view);
             }

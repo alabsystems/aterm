@@ -44,6 +44,50 @@ fn capacity_never_evicts_a_live_lease_and_idle_eviction_is_oldest_first() {
     assert_eq!(cache.0.lock().unwrap().idle.len(), CAPACITY);
 }
 
+/// A round refused because one with its seat is already active here counts against that seat,
+/// by the side that asked for it (`census::seat_busy`), and process-wide; a refusal for capacity
+/// is no busy seat and counts nothing.
+///
+/// NEGATIVE CONTROL (2026-11-15): with the count made at the capacity refusal instead, the busy
+/// seat's refusal counted nothing (`busy-dialled`, `left: 0, right: 1`).
+#[test]
+fn a_second_round_with_a_busy_seat_is_counted_against_that_seat_and_side() {
+    use crate::runtime::census;
+    let busy = |n, cell| census::seat_here(actor(n)).map_or(0, |seat| seat[cell]);
+    let cache = Cache::default();
+    let mut active = Repair::default();
+    let held = cache.acquire(actor(1), &mut active).unwrap();
+    for (dialled, cell) in [(true, "busy-dialled"), (false, "busy-served")] {
+        let (before, total) = (busy(1, cell), census::cadence_here().seat_busy);
+        let mut repair = Repair::default();
+        assert!(
+            cache
+                .acquire_on(actor(1), &mut repair, dialled, false, Instant::now())
+                .is_err()
+        );
+        assert_eq!(busy(1, cell) - before, 1, "{cell}");
+        assert_eq!(census::cadence_here().seat_busy - total, 1, "{cell}");
+    }
+    drop(held);
+
+    let total = census::cadence_here().seat_busy;
+    let mut repairs = vec![Repair::default(); CAPACITY];
+    let leases: Vec<_> = repairs
+        .iter_mut()
+        .enumerate()
+        .map(|(n, repair)| cache.acquire(actor(n + 2), repair).unwrap())
+        .collect();
+    let mut next = Repair::default();
+    assert!(
+        cache
+            .acquire_on(actor(CAPACITY + 2), &mut next, true, false, Instant::now())
+            .is_err()
+    );
+    assert_eq!(census::cadence_here().seat_busy, total);
+    assert_eq!(census::seat_here(actor(CAPACITY + 2)), None);
+    drop(leases);
+}
+
 /// Every peer a full roster can name keeps its hint between rounds: each of them released with a
 /// hint of its own, the first asked again finds its own, and so does each other on a second turn.
 /// NEGATIVE CONTROL: a capacity of 64, fewer than m111's 85 peers, lets the first peer's hint go
@@ -77,9 +121,14 @@ fn a_lone_channel_in_either_direction_needs_no_preference_or_wait() {
     for preferred in [false, true] {
         drop(
             cache
-                .acquire_on_with(actor(1), &mut repair, preferred, Instant::now(), || {
-                    panic!("a lone authenticated channel must not wait")
-                })
+                .acquire_on_with(
+                    actor(1),
+                    &mut repair,
+                    true,
+                    preferred,
+                    Instant::now(),
+                    || panic!("a lone authenticated channel must not wait"),
+                )
                 .unwrap(),
         );
     }
@@ -92,7 +141,7 @@ fn only_a_preferred_contender_waits_and_it_keeps_released_progress() {
     let cache = Cache::default();
     let mut active = Repair::default();
     let mut held = cache
-        .acquire_on(actor(1), &mut active, false, Instant::now())
+        .acquire_on(actor(1), &mut active, false, false, Instant::now())
         .unwrap();
     held.cursor = Some([7; 32]);
     let (waiting, observed) = mpsc::channel();
@@ -104,6 +153,7 @@ fn only_a_preferred_contender_waits_and_it_keeps_released_progress() {
                 .acquire_on_with(
                     actor(1),
                     &mut repair,
+                    true,
                     true,
                     Instant::now() + Duration::from_secs(60),
                     || {
@@ -134,7 +184,7 @@ fn a_preferred_collision_obeys_the_original_exchange_deadline() {
     let _held = cache.acquire(actor(1), &mut active).unwrap();
     let mut repair = Repair::default();
     let error = cache
-        .acquire_on_with(actor(1), &mut repair, true, Instant::now(), || {
+        .acquire_on_with(actor(1), &mut repair, true, true, Instant::now(), || {
             panic!("an exhausted exchange must not enter a wait")
         })
         .err()

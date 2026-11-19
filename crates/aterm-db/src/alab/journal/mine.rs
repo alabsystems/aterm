@@ -13,9 +13,17 @@
 //!   checks every word again on the way (`crates/aterm/src/alab_journal.rs`). Every row the
 //!   flusher writes passes [`checked`] first: each cell its column's type and the text guard
 //!   (`typed::cell::validate`, which refuses a credential-shaped word), no column the
-//!   collection lacks, none it needs missing. A row that fails is not written. No token, its
-//!   state or any other secret is a row: those are the fleet vault's alone (the owner,
-//!   2026-11-13, `docs/OWNER_RULINGS.md`).
+//!   collection lacks, none it needs missing. A row that fails is not written. No token value
+//!   and no other secret is a row: values stay in the fleet vault, each CLI's own login file and
+//!   the keychain (the owner, 2026-11-13, `docs/OWNER_RULINGS.md`).
+//! - **The credential behind each login, as facts** (SF-34, decision SF-D3: the owner,
+//!   2026-11-15): a login states the one credential its sign-in runs on ([`Credential`]): its
+//!   kind, where this Mac keeps it, when it was issued, when it ends, when it was last refreshed
+//!   and used, and what it is now, each a closed word or a time, so the fleet sees which Mac
+//!   holds which credential and its state. Never its value, a digest or any part of it: the
+//!   type holds no text ([`Credential`]), the guard holds every cell to its column's type, and
+//!   it bounds each of the credential's times to a span a real one falls in ([`checked`]), so no
+//!   number packs a value's bytes either.
 //! - **Local files only.** The harness reports logins through the source the executable installs
 //!   ([`install_logins`]), one report per CLI: `None` where its store did not read now, which
 //!   leaves that CLI's rows as the book holds them, so a passing failure of one store ends no
@@ -183,8 +191,112 @@ closed!(
 );
 
 closed!(
-    /// The window of a usage row's standing wall, `none` with none. A wall of the journal's own
-    /// `day` or `month` window has no word here and is not stated; no build states `auth`.
+    /// What kind of credential a login's sign-in runs on (SF-34): an OAuth grant its CLI keeps
+    /// and refreshes, a Claude Code setup-token, an API key, or a web session. No build states
+    /// `session` yet.
+    CredKind {
+        OAuth = "oauth",
+        SetupToken = "setup-token",
+        ApiKey = "api-key",
+        Session = "session",
+    }
+);
+
+closed!(
+    /// Where this Mac keeps that credential: the login keychain, its CLI's own login file, or the
+    /// fleet vault (aterm secrets). Never a path.
+    Kept {
+        Keychain = "keychain",
+        LoginFile = "login-file",
+        SecretStore = "secret-store",
+    }
+);
+
+closed!(
+    /// What that credential is now, as this Mac knows it without its value: `valid` (its login
+    /// serves by the word on record, and it states no end, as a grant its CLI renews does, or one
+    /// more than 30 days away), `expiring` (it serves, and the end it states is 30 days or fewer
+    /// away), `expired` (its stated end passed, its login file holds no credential any more, or
+    /// its login is signed out here), `refused` (the issuer refused this very credential here: a
+    /// setup-token Claude Code refused, a refresh token the issuer refused), `unknown` (nothing
+    /// on record says).
+    CredState {
+        Valid = "valid",
+        Expiring = "expiring",
+        Expired = "expired",
+        Refused = "refused",
+        Unknown = "unknown",
+    }
+);
+
+/// The `login` row's columns that state its credential's times, each bounded by [`checked`].
+const CRED_TIMES: [&str; 4] = [
+    "cred_issued_at",
+    "cred_expires_at",
+    "cred_refreshed_at",
+    "cred_last_used",
+];
+
+/// The earliest a credential's time may be: 2015-01-01 in Unix milliseconds, before any
+/// credential a pooled CLI holds was issued.
+const CRED_TIME_FLOOR_MS: u64 = 1_420_070_400_000;
+
+/// How far past its row's own time (`at`) a credential's time may be: ten years in milliseconds,
+/// past a setup-token's year and any access token's end.
+const CRED_TIME_SPAN_MS: u64 = 10 * 366 * 86_400 * 1000;
+
+/// Whether `cell`, a credential's time in a row stated at `at` (Unix ms), is one a real
+/// credential's falls in ([`CRED_TIME_FLOOR_MS`], [`CRED_TIME_SPAN_MS`]): a number packed from
+/// five or more bytes of text is far past it, so no time carries a value's bytes.
+fn credible_time(cell: &Value, at: Option<u64>) -> bool {
+    cell.as_u64().is_some_and(|t| {
+        t >= CRED_TIME_FLOOR_MS && t <= at.unwrap_or(0).saturating_add(CRED_TIME_SPAN_MS)
+    })
+}
+
+/// The `login` row's columns that state its credential ([`Credential`]).
+pub(crate) const CRED_COLUMNS: [&str; 7] = [
+    "cred_kind",
+    "cred_kept",
+    "cred_issued_at",
+    "cred_expires_at",
+    "cred_refreshed_at",
+    "cred_last_used",
+    "cred_state",
+];
+
+/// THE CREDENTIAL A LOGIN'S SIGN-IN RUNS ON, AS FACTS (SF-34, decision SF-D3): one per login
+/// row, the one its `src` names (a Claude Code setup-token in the vault for `vault-token`, the
+/// CLI's own stored login otherwise, or, for a row whose stored login does not serve here, the
+/// account's setup-token this Mac refused or saw end). Every field is a closed word or a Unix
+/// second, so it holds no text of a value, digest, address or path; the guard bounds each time
+/// to a span a real credential's falls in ([`checked`]), so no number carries a value's bytes. A
+/// reader of a token builds one from what it says of the token, never from its bytes. Times are
+/// `None` where nothing this Mac reads states them, never a guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Credential {
+    pub kind: CredKind,
+    /// `None` where this Mac cannot tell where the CLI keeps it.
+    pub kept: Option<Kept>,
+    /// When the sign-in that made it, or the mint of a setup-token, issued it.
+    pub issued_at: Option<u64>,
+    /// The end the credential itself states where nothing renews it: a setup-token's, or an
+    /// access token's held with no refresh token. `None` for a grant its CLI refreshes, whose
+    /// access token's end moves at each refresh.
+    pub expires_at: Option<u64>,
+    /// When its CLI last refreshed it.
+    pub refreshed_at: Option<u64>,
+    /// When this Mac last served a session on it.
+    pub last_used: Option<u64>,
+    pub state: CredState,
+}
+
+closed!(
+    /// The window of a usage row's standing account-wide wall, `none` with none. A wall of the
+    /// journal's own `day` or `month` window has no word here and is not stated; no build states
+    /// `auth`. A model's own weekly wall is no wall of the account's (FL-269): a row states it in
+    /// `model_walls` under its model's bucket, and `7d-model` here is only an older build's word
+    /// for one, which names no model and so walls no account ([`Wall::walls_account`]).
     Wall {
         None = "none",
         FiveHour = "5h",
@@ -195,7 +307,17 @@ closed!(
     }
 );
 
-/// One login this Mac holds, as its harness reads it from `logins.json` and `state.json`. Times
+impl Wall {
+    /// Whether a row's `wall` of this word walls the account: every word but `none` and an
+    /// older build's `7d-model`, whose model the row does not name.
+    #[must_use]
+    pub const fn walls_account(self) -> bool {
+        !matches!(self, Self::None | Self::WeekModel)
+    }
+}
+
+/// One login this Mac holds, as its harness reads it from `logins.json` and `state.json`, with
+/// the facts of the credential behind it as its CLI's reader states them ([`Credential`]). Times
 /// are Unix seconds; a row states them as milliseconds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Login {
@@ -219,6 +341,8 @@ pub struct Login {
     pub attempt_route: Option<Route>,
     /// The plan word its renewal's check answered.
     pub plan: Option<Word<16>>,
+    /// The credential its sign-in runs on, where its CLI's reader states one.
+    pub cred: Option<Credential>,
 }
 
 /// Unix seconds as a row's milliseconds.
@@ -262,6 +386,15 @@ impl Login {
             self.attempt_route.map(Route::word),
         );
         put_some(&mut row, "plan", self.plan.as_ref().map(Word::as_str));
+        if let Some(cred) = &self.cred {
+            put(&mut row, "cred_kind", cred.kind.word());
+            put_some(&mut row, "cred_kept", cred.kept.map(Kept::word));
+            put_some(&mut row, "cred_issued_at", cred.issued_at.map(ms));
+            put_some(&mut row, "cred_expires_at", cred.expires_at.map(ms));
+            put_some(&mut row, "cred_refreshed_at", cred.refreshed_at.map(ms));
+            put_some(&mut row, "cred_last_used", cred.last_used.map(ms));
+            put(&mut row, "cred_state", cred.state.word());
+        }
         Value::Object(row)
     }
 }
@@ -288,9 +421,10 @@ pub(crate) fn content(row: &Value) -> Value {
 /// THE GUARD every `login` and `usage` row passes before the flusher writes it: each cell is a
 /// value of its column's type that the text guard admits (`typed::cell::validate`: a closed
 /// word, a key, a count, a time, or text with no address, credential shape or secret's name in
-/// it), its one text column (`plan`) holds a plan word the registry seeds ([`plan_word`]), the
-/// row names no column `collection` lacks (beside its schema version `r`), and none it needs is
-/// missing.
+/// it), its one text column (`plan`) holds a plan word the registry seeds ([`plan_word`]), each
+/// of a credential's times falls between 2015 and ten years past the row's own `at`
+/// ([`credible_time`], so no number packs a value's bytes), the row names no column
+/// `collection` lacks (beside its schema version `r`), and none it needs is missing.
 ///
 /// # Errors
 /// The rule the row breaks, naming its column and never its value.
@@ -314,6 +448,14 @@ pub(crate) fn checked(collection: &Collection, row: &Value) -> Result<()> {
         cell::validate(collection, column, x)?;
         if matches!(column.ty, crate::typed::Ty::Text(_)) && !x.as_str().is_some_and(plan_word) {
             return Err(refuse(&format!("{key}: a plan word the registry seeds")));
+        }
+        if CRED_TIMES.contains(&key.as_str())
+            && !x.is_null()
+            && !credible_time(x, object.get("at").and_then(Value::as_u64))
+        {
+            return Err(refuse(&format!(
+                "{key}: a credential's time from 2015 to ten years past the row's"
+            )));
         }
     }
     match collection.columns.iter().find(|column| {
@@ -343,8 +485,10 @@ pub(crate) fn plan_word(word: &str) -> bool {
 /// Whether a row's content moved from `old` (`Value::Null` for a row never stated) to `new` in a
 /// way the fleet hears at once (docs/DESIGN-shared-files-2026-11-11.md §10, "Publication pace"):
 /// a login that turned signed out, ended or onto the wrong account, a sign-in that was blocked,
-/// or an end, and a change away from any of them (signed back in, unblocked); a usage row's wall
-/// hit or cleared, or its end moved. Any other change is routine.
+/// or an end, a credential that turned expired or refused (SF-34), and a change away from any of
+/// them (signed back in, unblocked, a new credential); a usage row's wall hit or cleared, or its
+/// end moved, and a model's own wall likewise. Any other change is routine: a credential's
+/// refresh, its new end, its last use, its turning `expiring`.
 pub(crate) fn urgent(old: &Value, new: &Value) -> bool {
     urgent_part(old) != urgent_part(new)
 }
@@ -368,11 +512,19 @@ fn urgent_part(content: &Value) -> Map {
     if word("attempt") == Some(Attempt::Blocked.word()) {
         keep("attempt");
     }
+    if word("cred_state").is_some_and(|state| {
+        [CredState::Expired, CredState::Refused]
+            .iter()
+            .any(|urgent| urgent.word() == state)
+    }) {
+        keep("cred_state");
+    }
     keep("ended_at");
     if word("wall").is_some_and(|wall| wall != Wall::None.word()) {
         keep("wall");
         keep("wall_until");
     }
+    keep("model_walls");
     out
 }
 
@@ -426,11 +578,15 @@ pub(crate) fn logins() -> &'static dyn Source {
 /// The content a login's row says once the report of its CLI no longer names it (its roster row
 /// left this Mac, its store holds no word of it any more, or another account's login took its
 /// place): no login of the account is held here, so its last row says `signed-out` since `now`,
-/// with no session on it. Every other column says what its last report did. This is what a
+/// with no session on it and no credential behind it ([`CRED_COLUMNS`]: this Mac holds none of
+/// the account's any more). Every other column says what its last report did. This is what a
 /// reader keeps for the retention span (`aterm_file::retain::MINE`) once its weeks are gone,
 /// never the working login it last stated.
 pub(crate) fn released(content: &Value, now: u64) -> Value {
     let mut row = content.as_object().cloned().unwrap_or_default();
+    for column in CRED_COLUMNS {
+        row.remove(column);
+    }
     put(&mut row, "state", State::SignedOut.word());
     put(&mut row, "use", Use::Idle.word());
     put(&mut row, "tabs", 0_u64);

@@ -102,9 +102,10 @@ fn secs(t: u64) -> i64 {
     i64::try_from(t).unwrap_or(i64::MAX)
 }
 
-/// The closed words one event carries beyond its kind: its window and figure, the reset a
-/// reading or a wall names (`r=<RFC 3339>`), its reason, the other account of a switch by its
-/// lab label. Never free text: every word is the journal's.
+/// The closed words one event carries beyond its kind: its window, the model a `7d-model` wall
+/// or its clearing is of (`m=<bucket>`, FL-271) and its figure, the reset a reading or a wall
+/// names (`r=<RFC 3339>`), its reason, the other account of a switch by its lab label. Never
+/// free text: every word is the journal's.
 fn detail(view: &LabView, event: &aterm_db::alab::journal::Event) -> String {
     use aterm_db::alab::journal::event::Kind;
     use std::fmt::Write as _;
@@ -116,6 +117,11 @@ fn detail(view: &LabView, event: &aterm_db::alab::journal::Event) -> String {
     };
     if let Some(window) = event.window {
         out.push_str(window.word());
+    }
+    if let Some(model) = event.model {
+        sep(&mut out);
+        out.push_str("m=");
+        out.push_str(model.word());
     }
     if let Some(p) = event.pct_x10 {
         sep(&mut out);
@@ -214,6 +220,7 @@ pub(crate) fn harness_seen(names: &Names<'_>, seen: &seen::Seen) -> alab_seen::S
                 WindowSeen {
                     window: q.window.word().to_owned(),
                     sub: (q.pk != pk).then_some(q.pk),
+                    model: q.model.map(|model| model.word().to_owned()),
                     figure,
                     read,
                     reader,

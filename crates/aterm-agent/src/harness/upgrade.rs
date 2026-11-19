@@ -4315,8 +4315,14 @@ pub struct Facts {
     pub rung: Rung,
     pub typing: bool,
     pub still_s: u64,
-    /// How long the agent's own work has held this round's move ([`tell_due`]).
+    /// How long the agent's own work has held this round's move ([`tell_due`]), counted as one
+    /// episode from its first look: changes of word and of the process that holds it, aterm's own
+    /// unsent line and clear gaps shorter than the drive's clear gap never start it again.
     pub own_hold_s: u64,
+    /// Whether a line told to the agent that may not have been taken whole (cut, refused after its
+    /// keys, unanswered) was typed within [`WORK_TELL_S`]: the line rests that long before it is
+    /// typed again ([`tell_due`]), the hold's clock running on.
+    pub tell_rests: bool,
     /// How many times this round's target was told to the agent ([`Step::Tell`]).
     pub tells: u32,
     /// Whether all that runs under the agent is background waits, each proved one and named by
@@ -5157,9 +5163,9 @@ pub fn quiet_move(f: &Facts) -> Gate {
 
 /// Whether a quiet round is owed its line to the agent ([`Step::Tell`]): still pending, its move
 /// held by the agent's real work for [`WORK_TELL_S`], in a session its autopilot carries and
-/// types into ([`Facts::silent`] clear), and no deadline standing for the process
-/// ([`MAX_TELLS`], [`Facts::deadline_set`]). Waits alone are never told: the round moves over
-/// them ([`own_yields`]).
+/// types into ([`Facts::silent`] clear), no deadline standing for the process ([`MAX_TELLS`],
+/// [`Facts::deadline_set`]), and no line it may not have taken resting ([`Facts::tell_rests`]).
+/// Waits alone are never told: the round moves over them ([`own_yields`]).
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -5177,6 +5183,7 @@ pub fn tell_due(phase: &Phase, f: &Facts) -> bool {
         && *phase == Phase::Pending
         && !f.waits_only
         && !f.deadline_set
+        && !f.tell_rests
         && f.own_hold_s >= WORK_TELL_S
         && f.tells < MAX_TELLS
 }

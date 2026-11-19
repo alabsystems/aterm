@@ -8,6 +8,25 @@ use std::os::unix::net::UnixListener;
 const PAYLOAD: &[u8] = b"opaque forest: primary, private child, goal clock, queued input";
 const CHILD_SOCKET: &str = "ATERM_RUNTIME_DATA_FIXTURE_SOCKET";
 
+/// Give the source-operation fixture an actual immutable descriptor with its bound digest.
+#[cfg(target_os = "macos")]
+pub(in super::super) fn seed_retained_checkpoint(
+    slot: &Slot,
+) -> aterm_agent::harness::source_exec_journal::Snapshot {
+    let (reader, writer) = unlinked(PAYLOAD);
+    drop(writer);
+    let snapshot = Snapshot::copy_from(reader).unwrap();
+    let stored = aterm_agent::harness::source_exec_journal::Snapshot {
+        bytes: snapshot.size,
+        digest: aterm_codec::hex::decode_vec(snapshot.digest.as_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    };
+    slot.state.lock().unwrap().outcome = Outcome::Ready(Arc::new(snapshot));
+    stored
+}
+
 #[test]
 fn settled_handover_releases_only_the_exact_sole_retained_snapshot() {
     let owner = Process::observe(std::process::id()).unwrap();

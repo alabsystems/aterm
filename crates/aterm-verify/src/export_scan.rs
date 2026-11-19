@@ -199,7 +199,7 @@ fn astream_pinned(root: &Path, path_env: &OsStr, pin: &str) -> Result<(), String
     let sub = root.join(ASTREAM);
     let out = crate::changed::git(&sub, path_env)
         .args(["rev-parse", "--show-toplevel", "HEAD"])
-        .stderr(std::process::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .output()
         .map_err(|e| format!("could not run git in {ASTREAM}: {e}"))?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -300,7 +300,7 @@ fn astream_crates(root: &Path, path_env: &OsStr) -> Result<Option<Vec<String>>, 
     let at_head = |path: &str| {
         let out = crate::changed::git(&sub, path_env)
             .args(["show", &format!("HEAD:{path}")])
-            .stderr(std::process::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .output()
             .ok()?;
         out.status

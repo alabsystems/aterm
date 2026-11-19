@@ -156,23 +156,14 @@ pub(super) fn exercise(input: &Input) {
         );
         assert!(requests[1].url.contains("affiliation=owner"));
     }
-    // A saved repository listed with its size moved, over the catalog a read of it unmoved
-    // leaves: that read drops any saved key the listed row carries, which `changes` counts
-    // apart. Inside the band (1 MiB for this one) the read answers that catalog and no
-    // count; one KiB past it, that size alone.
+    // A saved repository listed with its size moved. A read of it unmoved answers the saved
+    // catalog itself: the saved keys the listed row carries are no part of the catalog's
+    // meaning. Inside the class of its size (at most 1 MiB for this one, saved at 1 KiB) a
+    // read answers that catalog and no count; one KiB past it, that size's class alone.
     let saved = &old["repositories"][0];
     let size = saved["size"].as_u64().unwrap();
-    let lean = provider(
-        input.token.clone(),
-        input.binding.clone(),
-        &input.catalog,
-        std::slice::from_ref(saved),
-        &AtomicBool::new(false),
-    )
-    .unwrap()
-    .bytes;
-    let leaned: Value = aterm_json::from_slice(&lean).unwrap();
-    for (moved, size_only) in [(1024, 0), (1025, 1)] {
+    assert_eq!(size, 1, "CONTROL: the saved size is in the least class");
+    for (moved, size_class) in [(0, 0), (1_023, 0), (1_024, 1)] {
         let mut listed = saved.clone();
         listed
             .as_object_mut()
@@ -181,7 +172,7 @@ pub(super) fn exercise(input: &Input) {
         let candidate = provider(
             input.token.clone(),
             input.binding.clone(),
-            &lean,
+            &input.catalog,
             &[listed],
             &AtomicBool::new(false),
         )
@@ -189,14 +180,15 @@ pub(super) fn exercise(input: &Input) {
         assert_eq!(
             candidate.changes,
             RepositoryCatalogChanges {
-                size_only,
+                size_class,
                 ..RepositoryCatalogChanges::default()
             },
             "a size moved by {moved} KiB"
         );
         assert_eq!(
-            aterm_json::from_slice::<Value>(&candidate.bytes).unwrap() == leaned,
-            size_only == 0
+            aterm_json::from_slice::<Value>(&candidate.bytes).unwrap() == old,
+            size_class == 0,
+            "a size moved by {moved} KiB"
         );
     }
     // Every bad complete page/read retains the catalog; none can mint even an additive result.
@@ -308,9 +300,11 @@ pub(super) fn exercise(input: &Input) {
                 .all(|request| request.auth_profile.as_deref() == Some(PROFILE))
         );
     }
-    // GitHub lists a saved repository whole. The row here carries every key the saved object
-    // holds but its policy, and the read hands it to the refresh as listed: the candidate's
-    // object for that repository holds what a refresh writes and the policy, nothing else.
+    // GitHub lists a saved repository whole, beside a repository new to the catalog, so that
+    // the catalog is published. The row here carries every key the saved object holds but its
+    // policy, and the read hands it to the refresh as listed: the candidate's object for that
+    // repository holds what a refresh writes and the policy, nothing else.
+    let newcomer = row;
     let rows = old["repositories"].as_array().unwrap();
     let saved = rows
         .iter()
@@ -354,13 +348,20 @@ pub(super) fn exercise(input: &Input) {
         } else {
             Vec::new()
         };
-        transport.answer(200, &headers, &aterm_json::to_vec(&user(complete)).unwrap());
+        // Two private repositories listed, so a whole-account read counts two.
+        let mut both = user(complete);
+        if complete {
+            both.as_object_mut()
+                .unwrap()
+                .insert("owned_private_repos".into(), 2.into());
+        }
+        transport.answer(200, &headers, &aterm_json::to_vec(&both).unwrap());
         transport.answer(
             200,
             &[],
-            &aterm_json::to_vec(&json!([listed.clone()])).unwrap(),
+            &aterm_json::to_vec(&json!([listed.clone(), newcomer.clone()])).unwrap(),
         );
-        transport.answer(200, &headers, &aterm_json::to_vec(&user(complete)).unwrap());
+        transport.answer(200, &headers, &aterm_json::to_vec(&both).unwrap());
         let candidate = observe(
             &gh,
             input.binding.clone(),
@@ -388,12 +389,13 @@ pub(super) fn exercise(input: &Input) {
         assert_eq!(
             candidate.changes,
             RepositoryCatalogChanges {
+                added: 1,
                 pruned: 1,
                 removed: if complete { rows.len() - 1 } else { 0 },
                 ..RepositoryCatalogChanges::default()
             }
         );
-        assert_eq!(after.len(), if complete { 1 } else { rows.len() });
+        assert_eq!(after.len(), if complete { 2 } else { rows.len() + 1 });
         if !complete {
             for previous in rows.iter().filter(|repo| repo["id"] != saved["id"]) {
                 assert!(

@@ -3,13 +3,14 @@
 
 //! THE QUIET MACHINE FOR THE LAB'S TIMED WORK (`docs/DESIGN-adaptive-build-2026-10-24.md`,
 //! QUIET-ADMIT). A windowed instance ([`crate::instance::Instance::start`]) and the Linux lane's
-//! GUI rows each hold a quiet claim in the per-user capacity ledger while they run: alone among
-//! quiet claims, admitted once the 1-minute load is low, saying once a minute what it waits for.
-//! That is admission, not a retry. Requested Timing work also requires an actual sampled CPU
-//! interval; unavailable, forced and `--admit now` admission cannot qualify it and start no
-//! window. This is admission evidence, not continuous quiet or a postcompile performance
-//! qualification. The same flag is the run's for every claim it makes: the
-//! Linux and Windows lanes' boots take it for their disk claims ([`mode`]).
+//! GUI rows each hold a measured claim in the per-user capacity ledger while they run, alone
+//! among quiet claims. They first wait for low CPU/load, saying once a minute what they await.
+//! That is admission, not a retry. Strict Timing work requires a quiet sampled CPU interval;
+//! reported timing work can run loaded at its patience bound and names the actual observation.
+//! Unavailable, forced and `--admit now` admission start neither kind of work. These are admission
+//! observations, not continuous quiet or postcompile performance qualification. The same flag is
+//! the run's for every claim it makes: Linux and Windows boots take it for their disk claims
+//! ([`mode`]).
 //! Functional windows reserve memory without timing evidence. Correctness windows additionally
 //! hold quiet-claim exclusion without requiring low CPU load or sampled timing evidence. All kinds share
 //! one account-level lane for this original lab process; a scratch World never chooses it.
@@ -478,6 +479,67 @@ pub fn quiet(what: &str) -> Result<Claim, Fail> {
     )
 }
 
+/// An admitted diagnostic run and the actual observation at its admission. The original
+/// claim retains quiet-work exclusion; this snapshot never grants continuous quiet or a
+/// qualified performance comparison.
+#[derive(Debug)]
+pub(crate) struct ReportedTiming {
+    _claim: Claim,
+    protection: aterm_capacity::Protection,
+}
+
+impl ReportedTiming {
+    pub(crate) const fn protection(&self) -> aterm_capacity::Protection {
+        self.protection
+    }
+}
+
+/// Wait for a measured admission, then run and report a loaded admission at its patience
+/// bound. Unknown, forced or expired evidence still starts no work.
+/// # Errors
+/// As [`quiet`], except a measured loaded admission is retained and reported rather than refused.
+pub(crate) fn reported_timing(what: &str) -> Result<ReportedTiming, Fail> {
+    let (mode, verb) = RUN
+        .get()
+        .cloned()
+        .unwrap_or_else(|| (Admit::Wait, String::new()));
+    reported_timing_in(
+        Ledger::user().as_ref(),
+        &aterm_capacity::Live,
+        Need::timing(format!("lab {verb}: {what}")),
+        what,
+        mode,
+        Pace::default(),
+        &mut |line| eprintln!("{line}"),
+    )
+}
+
+fn reported_timing_in(
+    ledger: Option<&Ledger>,
+    machine: &dyn Machine,
+    need: Need,
+    what: &str,
+    mode: Admit,
+    pace: Pace,
+    say: &mut dyn FnMut(&str),
+) -> Result<ReportedTiming, Fail> {
+    timing_in(
+        ledger,
+        machine,
+        need.runs_loaded(),
+        (what, mode),
+        pace,
+        say,
+        |claim| {
+            let protection = claim.timing_protection()?;
+            Ok(ReportedTiming {
+                _claim: claim,
+                protection,
+            })
+        },
+    )
+}
+
 // Only a unit serialization lock lives globally. The noncloneable resource Claim
 // stays in its scoped owner; this lock alone supplies no capacity or timing authority.
 static COMPARISON: Mutex<()> = Mutex::new(());
@@ -596,6 +658,25 @@ pub(crate) fn quiet_in(
     pace: Pace,
     say: &mut dyn FnMut(&str),
 ) -> Result<Claim, Fail> {
+    timing_in(ledger, machine, need, (what, mode), pace, say, |claim| {
+        claim.timing_admission()?;
+        Ok(claim)
+    })
+}
+
+/// Admission and error handling shared by strict and reported timing. The validator consumes
+/// the original claim, so refusal drops its exclusion before returning and success retains
+/// exactly that custody with its evidence.
+fn timing_in<T>(
+    ledger: Option<&Ledger>,
+    machine: &dyn Machine,
+    need: Need,
+    request: (&str, Admit),
+    pace: Pace,
+    say: &mut dyn FnMut(&str),
+    validate: impl FnOnce(Claim) -> Result<T, aterm_capacity::TimingIssue>,
+) -> Result<T, Fail> {
+    let (what, mode) = request;
     let stopped = |e: &dyn std::fmt::Display, signal: Option<i32>| Fail {
         stopped: signal
             .inspect(|sig| crate::stop::note(*sig))
@@ -616,12 +697,7 @@ pub(crate) fn quiet_in(
     match aterm_capacity::admit_until(ledger, machine, need, mode, pace, say, &|| {
         crate::stop::check().is_err()
     }) {
-        Ok(claim) => {
-            claim
-                .timing_admission()
-                .map_err(|why| stopped(&why, None))?;
-            Ok(claim)
-        }
+        Ok(claim) => validate(claim).map_err(|why| stopped(&why, None)),
         Err(e @ aterm_capacity::Error::Stopped { signal, .. }) => Err(stopped(&e, signal)),
         Err(e) => Err(stopped(&e, None)),
     }

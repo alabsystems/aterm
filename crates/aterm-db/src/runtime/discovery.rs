@@ -8,18 +8,22 @@
 //! one beacon to the next. A hint grants nothing, a tag included: only an authenticated round
 //! verifies an endpoint.
 
-use super::moved::Subject;
-use crate::control::{Repair, Report};
+use super::{census, moved::Subject};
+use crate::{
+    control::{Repair, Report},
+    credentials::handoff::Owing,
+};
 use astream_wire::sync::{Actor, Digest};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 /// Room for every member of a full Commons roster, so a steward can dial each one and hear
 /// whether it is silent or which aterm it runs (C26).
-const MAX_PEERS: usize = aterm_secrets::commons::roster::MAX_MEMBERS + 1;
+pub(super) const MAX_PEERS: usize = aterm_secrets::commons::roster::MAX_MEMBERS + 1;
 /// Each cache can retain a full roster's worth of unverified hints independently.
 pub(crate) const MAX_UNVERIFIED_ENDPOINTS: usize = 2 * MAX_PEERS;
 const PER_IP: usize = 2;
@@ -168,9 +172,10 @@ const _: () = assert!(PROMISE.as_secs() > REVERIFY.as_secs() + 60);
 // past it would leave every other process on this Mac with no observation to read.
 const _: () = assert!(PROMISE.as_millis() <= crate::network_state::RELAYED_LEASE.as_millis());
 
-/// How long an established endpoint that beaconed may then go unheard, by beacon or by round,
-/// before one dial probes it ([`Hints::probe_at`]): six of its beacons, each sent every five
-/// seconds and none of them acknowledged.
+/// How long an established endpoint that beaconed may then go unheard, by beacon, by a round of
+/// its own or by a round its seat dialled in from its address, before one dial probes it
+/// ([`Hints::probe_at`]): six of its beacons, each sent every five seconds and none of them
+/// acknowledged.
 const SILENCE: Duration = Duration::from_secs(30);
 /// Each endpoint's probe waits up to this much longer than [`SILENCE`], by this node's private
 /// draw ([`Hints::spread`]): the Macs that all stop hearing one peer do not all dial it at once.
@@ -196,7 +201,7 @@ const _: () = assert!(CATALOG_STALE.as_millis() * 3 <= crate::alab::command::FRE
 /// Brief contention keeps this many ordinary retries before failed rounds back off.
 const QUICK_BUSY_RETRIES: u32 = 3;
 /// The first wait in a failed endpoint's exponential backoff.
-const BACKOFF_FIRST: Duration = Duration::from_secs(5);
+pub(super) const BACKOFF_FIRST: Duration = Duration::from_secs(5);
 /// The longest wait between dials of an endpoint that keeps not answering, or whose answer this
 /// side keeps refusing.
 const BACKOFF_MAX: Duration = Duration::from_secs(120);
@@ -208,6 +213,134 @@ fn backoff_delay(own: &[u8; 32], attempt: u64, streak: u32) -> Duration {
     let jitter = u64::from(u16::from_be_bytes([hash[4], hash[5]])) % 2000;
     let doubled = BACKOFF_FIRST.saturating_mul(1 << streak.saturating_sub(1).min(16));
     doubled.min(BACKOFF_MAX) + Duration::from_millis(jitter)
+}
+
+/// How many rounds in a row a seat may find this Mac listing short ([`Hints::settle`]) and still
+/// be owed one more ([`Owed::relist`]): its walk dials the seat after each such round, at the
+/// [`backoff_delay`] of the count, 5 s doubling to two minutes. Past them no round is owed for a
+/// short list: this Mac reads its own selection instead ([`Hints::spent`]), which costs the seat
+/// nothing, and owes the seat one more round once that reads whole ([`Hints::relist_spent`]). A
+/// whole list starts the count again.
+const RELIST_TRIES: u32 = 6;
+// The owed rounds a run of short lists makes all come before the pair's next audit would.
+const _: () = {
+    let mut total = 0;
+    let mut streak = 1;
+    while streak <= RELIST_TRIES {
+        let doubled = BACKOFF_FIRST.as_secs() << (streak - 1);
+        let wait = if doubled < BACKOFF_MAX.as_secs() {
+            doubled
+        } else {
+            BACKOFF_MAX.as_secs()
+        };
+        // Each wait's jitter is under two seconds ([`backoff_delay`]).
+        total += wait + 2;
+        streak += 1;
+    }
+    assert!(total < AUDIT_FLOOR.as_secs());
+};
+
+/// A round this Mac owes one seat ([`Owed`]): only a round with the seat that began at or after
+/// `since` pays it, and the walk dials for it no sooner than `not_before`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Debt {
+    since: Instant,
+    not_before: Instant,
+}
+
+/// One immutable request to judge a seat's take ([`Hints::judging`]). Its allocation stays
+/// alive with the background read, so a cleared or replaced debt cannot accept that read's
+/// result, even when the seat and both instants are identical.
+#[derive(Clone, Debug)]
+pub(super) struct Judgement {
+    seat: Actor,
+    identity: Arc<()>,
+}
+
+impl Judgement {
+    pub(super) const fn seat(&self) -> Actor {
+        self.seat
+    }
+}
+
+/// The current request and its cadence. An incoming handoff that cannot tell changes the
+/// cadence, without establishing that this outstanding request has become needless.
+#[derive(Debug)]
+struct Judge {
+    debt: Debt,
+    identity: Arc<()>,
+}
+
+/// What this Mac owes one seat: rounds that it begins, which its walk dials ([`Hints::walkable`])
+/// with nothing moved here. A seat holds what this Mac's rounds with it told it, and only this
+/// Mac can tell that it has grown stale.
+#[derive(Debug, Default)]
+struct Owed {
+    /// A round whose lists are whole: the last ones this Mac traded with the seat may leave out a
+    /// table its selection takes now (a round that listed short, [`crate::replica::Report::listed_short`],
+    /// a policy that selects more since, [`Hints::relist_all`], or a selection that reads whole
+    /// once such a run's owed rounds are spent, [`Hints::relist_spent`]). The seat reads them as
+    /// this Mac leaving the table out and passes it over for writes to it ([`may_take`]), and a
+    /// selection that takes the table again tells it nothing; the round this Mac begins lists it,
+    /// leads it where the lists newly share it (`crate::replica`'s `take_up`), and its lists reach
+    /// the seat's walk ([`Hints::reoffer`]).
+    relist: Option<Debt>,
+    /// How many rounds in a row with the seat found this Mac listing short: past
+    /// [`RELIST_TRIES`] none is owed for them. A whole list ends the run.
+    short: u32,
+    /// How many rounds in this run a read of this Mac's selection owed the seat, having found
+    /// it whole after the run spent its owed rounds ([`Hints::relist_spent`]).
+    reads: u32,
+    /// No read owes the seat a round before this: the [`backoff_delay`] of [`Self::reads`] after
+    /// the last one a read owed it, so a selection that reads whole here while this Mac's rounds
+    /// with the seat keep listing short, or trade no lists, costs the seat a round at gaps that
+    /// double to two minutes and never one after every read.
+    reread: Option<Instant>,
+    /// A round in which this Mac takes the seat's credential Offer, the one named: the seat's
+    /// own round brought it, over a wire on which only the side that dials takes (atdb/3 to
+    /// atdb/5, `crate::credentials::handoff::exchange`) or in a handoff that broke off, so only
+    /// a round this Mac begins hands the value over, and the seat's next round is no sooner than
+    /// its audit.
+    take: Option<(Debt, Digest)>,
+    /// A judgement of whether this Mac owes the seat [`Self::take`], made again with no round
+    /// (`super::transport::Transport::check_takes`): the seat's round ended with a handoff that
+    /// could not tell (`Owing::Unknown`: this Mac's store busy, its administrator unreadable),
+    /// so no take is owed for it, and nothing but this Mac's own state says when one would be.
+    /// Due at `not_before`, the [`backoff_delay`] of [`Self::untold`] after the last that could
+    /// not tell; a handoff of a round the seat began at or after `since` that tells nothing is
+    /// owed, or one that owes the take, makes it needless ([`Hints::settle`]).
+    judge: Option<Judge>,
+    /// How many judgements in a row could not tell, the seat's round's own included: past
+    /// [`RELIST_TRIES`] none is made again, and the take waits for the pair's next round.
+    untold: u32,
+}
+
+impl Owed {
+    /// When the walk may dial for what is owed, if anything is.
+    fn due(&self) -> Option<Instant> {
+        match (self.relist, self.take.map(|(debt, _)| debt)) {
+            (Some(relist), Some(take)) => Some(relist.not_before.min(take.not_before)),
+            (debt, None) | (None, debt) => debt.map(|debt| debt.not_before),
+        }
+    }
+    /// Nothing is owed and no run of short lists is counted: the entry tells nothing.
+    fn idle(&self) -> bool {
+        self.relist.is_none() && self.take.is_none() && self.judge.is_none() && self.short == 0
+    }
+    /// No judgement of the take is owed: one told, or a round let this Mac take.
+    fn judged(&mut self) {
+        self.judge = None;
+        self.untold = 0;
+    }
+    /// The run of short lists spent its owed rounds ([`RELIST_TRIES`]), none is owed now, and a
+    /// read of the selection may owe the seat one at `now` ([`Self::reread`]): the seat holds
+    /// short lists, and only a read of this Mac's selection can tell when a round would list
+    /// whole again ([`Hints::spent`]).
+    fn spent(&self, now: Instant) -> bool {
+        self.short > RELIST_TRIES
+            && self.relist.is_none()
+            && self.reread.is_none_or(|from| now >= from)
+    }
 }
 
 /// How a dialed round ended, which sets its endpoint's next dial ([`Hints::finish`]).
@@ -325,6 +458,34 @@ fn repair_transferred(repair: &Repair) -> bool {
         })
 }
 
+/// What a round this side dialled did to its endpoint's schedule, as the census counts it
+/// (`census::own_round`): the seat it was dialled as or authenticated, what chose its dial and
+/// what its end did to its endpoint's next dial ([`Hints::finish`]). What the round's own report
+/// says it did is the census's to read from that report, which a round this side stopped keeps
+/// though its state handed back here does not. No schedule reads it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Verdict {
+    pub(super) seat: Option<Actor>,
+    pub(super) marks: Option<Marks>,
+    pub(super) next: census::Next,
+}
+
+/// What chose a dial and what it was besides ([`Hints::next_allowed`]), kept with its endpoint
+/// while the round runs ([`Peer::marks`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Marks {
+    /// The turn that chose it: a follow-up, a lead, an audit due, a walk that offers what moved
+    /// here, a walk for a round this Mac owes the seat, or the scan.
+    pub(super) chose: census::Dial,
+    /// It was the probe of its endpoint's silence ([`Hints::probe_at`]).
+    pub(super) probe: bool,
+    /// Its endpoint was not verified, so it restarts the seat's cycle ([`ABSENT`]).
+    pub(super) met_again: bool,
+    /// Its endpoint was verified and last reached [`ABSENT`] ago, so it restarts the seat's
+    /// cycle.
+    pub(super) away: bool,
+}
+
 /// Why an unverified endpoint is dialled ahead of ordinary discovery (CR1, CR2). No reason is
 /// trust: a lead orders dials, and only an authenticated round verifies an endpoint. It lasts
 /// until a dial of the endpoint shows no peer of this lab is there ([`Repair::disowned`]: nothing
@@ -397,7 +558,7 @@ impl Episode {
     /// exchange as far as it went (`Repair::application_interrupted`), whose ask, if the peer
     /// answered it, is that of a completed round. It completes no audit.
     fn interrupted(&mut self, interrupted: Option<&crate::replica::Report>) {
-        self.asked |= interrupted.is_some_and(|report| report.witnesses_asked);
+        self.asked |= interrupted.is_some_and(crate::replica::Report::witnesses_asked);
     }
     /// Fold in what a completed round's table exchange did; `None` where it had none (a peer
     /// that answers no application exchange, or one this side repairs no tables with), whose
@@ -407,9 +568,9 @@ impl Episode {
         match application {
             None => true,
             Some(report) => {
-                self.asked |= report.witnesses_asked;
+                self.asked |= report.witnesses_asked();
                 // A round that found no table both list took the whole scan.
-                self.regular |= report.regular || report.table.is_none();
+                self.regular |= report.regular() || report.table.is_none();
                 self.asked && self.regular
             }
         }
@@ -496,6 +657,15 @@ struct Peer {
     /// its last round this side dialled completed: what that round's age by the steady clock
     /// misses of its age by the wall clock ([`ABSENT`]).
     slept: Duration,
+    /// What chose its round in flight and what that dial was besides ([`Marks`]), for the
+    /// census. None while it is idle.
+    marks: Option<Marks>,
+    /// When a round its seat dialled in from this endpoint's address last completed while no
+    /// other port there had beaconed from since it last did ([`Hints::vouch`]). It puts off its
+    /// silence's probe ([`Hints::probe_at`]) and nothing else: it sets no [`Self::seen`],
+    /// verifies nothing, moves no wait, makes no contact and re-arms no probe, so an endpoint's
+    /// expiry, absence, audit order and walk read only what this side's own dials found.
+    dialled_in: Option<Instant>,
     /// The newest table lists this seat exchanged in either direction. Kept apart from
     /// `repair`, which an outgoing worker owns while it runs and replaces when it returns.
     /// The actor keeps a rebound endpoint from using its former seat's lists.
@@ -540,6 +710,8 @@ impl Peer {
             episode: Episode::default(),
             auditing: false,
             slept: Duration::ZERO,
+            marks: None,
+            dialled_in: None,
             listed: None,
             own: None,
             repair: Repair::default(),
@@ -653,8 +825,11 @@ pub(super) struct Remembered {
     pub(super) at_ms: u64,
 }
 
-/// The most remembered endpoints: the most recently verified seats' ([`Hints::remember`]).
-pub(super) const MAX_REMEMBERED: usize = 32;
+/// The most remembered endpoints: every other seat of a full roster, so a Mac that answers keeps
+/// its place and the file is not rewritten each time a round reaches a seat a smaller bound
+/// would have forgotten ([`Hints::remember`]). The file spells the count in one byte.
+pub(super) const MAX_REMEMBERED: usize = aterm_secrets::commons::roster::MAX_MEMBERS;
+const _: () = assert!(MAX_REMEMBERED <= u8::MAX as usize);
 /// A remembered endpoint older than this is forgotten: a week away is a new Mac's start.
 const REMEMBER_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// How stale the kept times of remembered endpoints may grow while none changes.
@@ -811,6 +986,29 @@ thread_local! {
     /// MUTANT of the silence probe, on for one test thread: a silence is probed again after
     /// each round, [`SILENCE`] after it, however long no beacon is heard ([`Peer::probed`]).
     pub(super) static PROBE_REPEATS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of the silence probe, on for one test thread: a round its seat dialled in does not
+    /// count as hearing an endpoint ([`Peer::dialled_in`]), so a peer whose beacons this Mac
+    /// misses is probed however often it dials in, as before.
+    pub(super) static INBOUND_UNHEARD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::vouch`], on for one test thread: a round dialled in re-arms the
+    /// silence's probe of its seat's endpoints ([`Peer::probed`]), so a silence is probed again.
+    pub(super) static VOUCH_REARMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::vouch`], on for one test thread: a round dialled in counts as hearing
+    /// every endpoint of its seat, wherever it came from, so the endpoint at an attachment the
+    /// seat left is never probed.
+    pub(super) static INBOUND_HEARS_EVERY_ENDPOINT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::vouch`], on for one test thread: a round dialled in counts as hearing
+    /// each endpoint of its seat at its address, a port another has beaconed from there since
+    /// included, so the seat's old port after a restart is not probed while the seat dials in.
+    pub(super) static INBOUND_HEARS_OLD_PORTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::vouch`], on for one test thread: another seat's port at the address
+    /// counts as one its seat beaconed from, so a seat that shares its address with another
+    /// whose beacons came last is not heard when it dials in.
+    pub(super) static INBOUND_WEIGHS_OTHER_SEATS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// MUTANT of [`Hints::next_dial_at`], on for one test thread: it reads the endpoints' own
     /// waits and not their probes, so a probe's dial waits for a wake by something else.
     pub(super) static PROBE_UNTIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -888,6 +1086,51 @@ thread_local! {
     /// narrows what this Mac's own last round there found both sides listing.
     pub(super) static LATER_LISTS_NARROW: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::settle`], on for one test thread: a round in which this Mac listed
+    /// short owes the seat nothing ([`Owed::relist`]), so a seat that read those lists passes a
+    /// write here over until the pair's next audit.
+    pub(super) static SHORT_UNOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::settle`], on for one test thread: every short list owes the seat
+    /// another round, however many in a row came before ([`RELIST_TRIES`]).
+    pub(super) static RELIST_UNBOUNDED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::settle`], on for one test thread: a whole round pays what is owed
+    /// whenever it began ([`Debt::since`]), a round in flight before the debt included, though
+    /// the seat may hold the short lists as newer than its own.
+    pub(super) static OWED_CLEARED_BY_EARLIER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::settle`], on for one test thread: the round that pays what is owed
+    /// leaves it standing ([`Owed`]), so the walk dials the seat again.
+    pub(super) static OWED_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::walkable`], on for one test thread: what is owed a seat never walks
+    /// ([`Owed`]); the seat waits for its next dial on another turn.
+    pub(super) static OWED_UNWALKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::settle`], on for one test thread: a round the seat began whose handoff
+    /// could not tell what this Mac owes (`Owing::Unknown`) pays the take owed it, as one whose
+    /// handoff owes nothing does.
+    pub(super) static UNTOLD_PAYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::settle`], on for one test thread: a round the seat began that owes again
+    /// the take already owed for the same Offer owes it from its own end, so a round this Mac
+    /// began since, in flight as it ended, pays nothing and the walk dials the seat again.
+    pub(super) static TAKE_REARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::settle`], on for one test thread: a round the seat began whose handoff
+    /// could not tell what this Mac owes (`Owing::Unknown`) owes no judgement of it
+    /// ([`Owed::judge`]), so a take this Mac could make once it can read its state again waits
+    /// for the pair's next round, at rest their audit.
+    pub(super) static UNTOLD_UNJUDGED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::judged`], on for one test thread: a judgement that could not tell is
+    /// made again however many in a row came before ([`RELIST_TRIES`]).
+    pub(super) static JUDGED_UNBOUNDED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::relist_spent`], on for one test thread: a read that finds this Mac's
+    /// selection whole owes no seat a round, so a seat whose run of short lists spent its owed
+    /// rounds is passed over here until the pair's next audit.
+    pub(super) static WHOLE_UNTOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Hints::relist_spent`], on for one test thread: a seat a read owed a round may
+    /// be owed another by the next read ([`Owed::reread`]), so while this Mac's rounds with it
+    /// keep listing short it is dialled after every read that finds the selection whole.
+    pub(super) static REREAD_AT_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether the mutant `cell` is on (tests); never in a build.
@@ -976,6 +1219,9 @@ pub(super) struct Hints {
     /// The seats found gone since [`Self::take_departures`], each with when the dial that found
     /// it so began ([`Standing`]). At most [`MAX_PEERS`].
     departed: BTreeMap<Actor, Instant>,
+    /// What this Mac owes each seat ([`Owed`]), kept while the seat has a verified endpoint
+    /// here and has not been found gone. At most [`MAX_PEERS`].
+    owed: BTreeMap<Actor, Owed>,
     /// The lab catalog's table, where this transport's rounds repair it
     /// ([`Self::keep_catalog`]); none where they take no Commons tables.
     catalog: Option<Digest>,
@@ -1102,6 +1348,7 @@ impl Hints {
             hot: BTreeMap::new(),
             parked: BTreeMap::new(),
             departed: BTreeMap::new(),
+            owed: BTreeMap::new(),
             catalog: None,
             catalog_heard: None,
             slept: Duration::ZERO,
@@ -1321,6 +1568,16 @@ impl Hints {
     /// so an address one seat takes over from another moves nothing of the other's. Nothing is
     /// verified here: an endpoint is, only by a round dialled to it.
     ///
+    /// The round's own port is ephemeral, so it tells the seat's address and not which of its
+    /// ports there listens: the seat's endpoint at `ip` that no other port there has beaconed
+    /// from since it last did has heard it ([`Peer::dialled_in`]), which puts off its silence's
+    /// probe and nothing else. A port bound to another seat is not counted, since its beacons
+    /// tell nothing of this one's. The seat's endpoint at another address (a second attachment,
+    /// one it left) and its old port at this one, which another port has beaconed from since (a
+    /// restart or a link reopen bound its listener anew), keep their own probes: that probe is
+    /// the dial that finds them gone, before which the old port holds one of its address's
+    /// [`PER_IP`] places and stays the endpoint [`Self::keep`] remembers.
+    ///
     /// A healthy endpoint of the seat is left as it is, at rest or due, whatever the round
     /// moved: its audit runs on this side's own clock ([`Peer::audit_due`]), which no round
     /// dialled in moves either way. What moved here is offered by a walk ([`Self::walk`]), which
@@ -1341,8 +1598,37 @@ impl Hints {
         let repulls = mutant(&REPULLS);
         #[cfg(not(test))]
         let repulls = false;
+        #[cfg(test)]
+        let (everywhere, rearms) = (mutant(&INBOUND_HEARS_EVERY_ENDPOINT), mutant(&VOUCH_REARMS));
+        #[cfg(not(test))]
+        let (everywhere, rearms) = (false, false);
+        #[cfg(test)]
+        let (old_ports, other_seats) = (
+            mutant(&INBOUND_HEARS_OLD_PORTS),
+            mutant(&INBOUND_WEIGHS_OTHER_SEATS),
+        );
+        #[cfg(not(test))]
+        let (old_ports, other_seats) = (false, false);
+        // The last beacon heard from a port at `ip` that is the seat's or no seat's yet (a new
+        // port no dial has reached): the seat's endpoint there whose own is older is one it
+        // left. `None` sorts first, so a port that never beaconed is older than any that did.
+        let latest = self
+            .peers
+            .iter()
+            .filter(|(address, peer)| {
+                address.ip() == ip && (other_seats || peer.seat().is_none_or(|seat| seat == actor))
+            })
+            .map(|(_, peer)| peer.beacon)
+            .max()
+            .flatten();
         for (address, peer) in &mut self.peers {
             if peer.repair.actor() == Some(actor) {
+                if (address.ip() == ip && (peer.beacon >= latest || old_ports)) || everywhere {
+                    peer.dialled_in = Some(now);
+                }
+                if rearms {
+                    peer.probed = false;
+                }
                 let failing = peer.failed || peer.failures > 0;
                 if !repulls && (!failing || peer.pulled) {
                     continue;
@@ -1493,6 +1779,22 @@ impl Hints {
     /// anything shows the peer lacked it, and the count of cold answers starts again; one that
     /// caught the peer up and sent nothing is a cold answer, counted once per seat. At [`COLD`]
     /// the table leaves the walk, as a subject does whose seats outgrow [`MAX_PEERS`].
+    ///
+    /// The round, which ended at `now`, also tells what this Mac owes the seat ([`Owed`]). Where
+    /// this side's table report says it listed short ([`crate::replica::Report::listed_short`]),
+    /// whichever side began the round and whether or not its exchange then broke off, the seat
+    /// holds lists that may leave out a table this Mac's selection takes once it reads whole: it
+    /// is owed a round, which the walk dials at the [`backoff_delay`] of the run's length, up to
+    /// [`RELIST_TRIES`] in a row. A whole list ends the run, and one in a round that finished and
+    /// began at or after the debt pays it, whichever side began it: its lists reach the seat. A
+    /// round that began before the debt pays nothing, since the seat may hold the short lists as
+    /// the newer. A round this Mac began after the debt that traded no lists counts as one more
+    /// short list, so the owed rounds stay bounded. A round the seat began in which this Mac
+    /// answered its credential handoff, its own take not run to its end (over a wire on which
+    /// only the dialler takes, or broken off), and found an Offer of the seat's to take
+    /// (`crate::control::Repair::owing`), owes the seat a round this Mac begins, which the walk
+    /// dials at once: the next round this Mac begins pays it, as does a later handoff of the
+    /// seat's that tells nothing is owed. One that could not tell pays nothing and owes nothing.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1523,6 +1825,7 @@ impl Hints {
         dialled: Option<SocketAddr>,
         started: Instant,
         repair: &Repair,
+        now: Instant,
     ) {
         #[cfg(test)]
         let learns = !mutant(&INCOMING_LISTS_LEFT);
@@ -1585,19 +1888,361 @@ impl Hints {
             }
             hot.cold < COLD
         });
+        self.owe(actor, dialled, started, repair, now);
+    }
+    /// What the round with `actor` that began at `started` and left `repair` says of what this
+    /// Mac owes the seat, as it ended at `now` ([`Self::settle`]).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbDialCadence",
+            action = "Owe",
+            project = "aterm_db::runtime::discovery::cadence_tests::dial_cadence_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbDialCadence",
+            action = "WalkOwed",
+            project = "aterm_db::runtime::discovery::cadence_tests::dial_cadence_transition"
+        )
+    )]
+    fn owe(
+        &mut self,
+        actor: Actor,
+        dialled: Option<SocketAddr>,
+        started: Instant,
+        repair: &Repair,
+        now: Instant,
+    ) {
+        #[cfg(test)]
+        let (unowed, unbounded, earlier, kept, untold_pays, rearmed, unjudged) = (
+            mutant(&SHORT_UNOWED),
+            mutant(&RELIST_UNBOUNDED),
+            mutant(&OWED_CLEARED_BY_EARLIER),
+            mutant(&OWED_KEPT),
+            mutant(&UNTOLD_PAYS),
+            mutant(&TAKE_REARMED),
+            mutant(&UNTOLD_UNJUDGED),
+        );
+        #[cfg(not(test))]
+        let (unowed, unbounded, earlier, kept, untold_pays, rearmed, unjudged) =
+            (false, false, false, false, false, false, false);
+        // Only a seat this Mac can dial is owed a round, and the seats owed are bounded.
+        let dialable = self
+            .peers
+            .values()
+            .any(|peer| peer.verified && peer.seat() == Some(actor))
+            && (self.owed.contains_key(&actor) || self.owed.len() < MAX_PEERS);
+        let finished = repair.membership_error().is_none() && repair.application_error().is_none();
+        // The lists this side traded in the round, as its own table report tells of them: a
+        // completed exchange's, or one that broke off after they were traded.
+        let listed = repair.application().or_else(|| {
+            repair.application_interrupted().filter(|_| {
+                repair
+                    .listed()
+                    .is_some_and(|lists| lists.read_since(started))
+            })
+        });
+        let pays = |debt: Option<Debt>| debt.is_some_and(|debt| started >= debt.since || earlier);
+        match listed {
+            Some(report) if report.listed_short() && !unowed => {
+                if dialable {
+                    self.relist(actor, now, unbounded);
+                }
+            }
+            Some(_) => {
+                if let Some(owed) = self.owed.get_mut(&actor) {
+                    owed.short = 0;
+                    owed.reads = 0;
+                    owed.reread = None;
+                    if finished && !kept && pays(owed.relist) {
+                        owed.relist = None;
+                    }
+                }
+            }
+            // A round this Mac began after the debt that traded no lists (its table exchange was
+            // deferred or never reached) is one more try that told the seat nothing, counted as a
+            // short list is: the owed rounds stay bounded whatever the seat's rounds answer.
+            None => {
+                if dialled.is_some()
+                    && !kept
+                    && self.owed.get(&actor).is_some_and(|owed| pays(owed.relist))
+                {
+                    self.relist(actor, now, unbounded);
+                }
+            }
+        }
+        // The credential handoff: a round the seat began that let this Mac take nothing, where an
+        // Offer of the seat's waits for this Mac to take it, owes the seat a round this Mac
+        // begins, in which it takes (`crate::credentials::handoff::exchange`). That round pays
+        // it, whatever it took (an Offer whose take was refused is not owed again), as does a
+        // later handoff of the seat's that tells nothing is owed. One that could not tell keeps
+        // what is owed and owes nothing more; where nothing is owed, it owes the seat a judgement
+        // made again with no round ([`Owed::judge`]), since nothing the seat does tells this Mac
+        // when its own state reads again. A take owed again for the Offer it is owed for keeps
+        // when it was first owed: a round this Mac began since, in flight as this one ended,
+        // tries that Offer and pays it. One owed for another Offer (the first in flight here,
+        // which the seat's round's look passed over) is owed from now.
+        let owing = repair.handoff().map(|_| repair.owing());
+        let pays_take = match (dialled, owing) {
+            (Some(_), _) | (None, Some(Owing::Nothing)) => true,
+            (None, Some(Owing::Unknown)) => untold_pays,
+            (None, Some(Owing::Take(_)) | None) => false,
+        };
+        if let (None, Some(Owing::Take(offer))) = (dialled, owing) {
+            if dialable {
+                let owed = self.owed.entry(actor).or_default();
+                owed.take = Some(
+                    owed.take
+                        .filter(|(_, owed_for)| *owed_for == offer && !rearmed)
+                        .unwrap_or((
+                            Debt {
+                                since: now,
+                                not_before: now,
+                            },
+                            offer,
+                        )),
+                );
+                owed.judged();
+            }
+        } else if pays_take
+            && !kept
+            && let Some(owed) = self.owed.get_mut(&actor)
+        {
+            if pays(owed.take.map(|(debt, _)| debt)) {
+                owed.take = None;
+            }
+            // A round this Mac began says nothing of the judgement: its take may have met the same
+            // state that could not be read (`take` then asks for nothing). Only the seat's own
+            // handoff that tells nothing is owed makes it needless.
+            if dialled.is_none() && pays(owed.judge.as_ref().map(|judge| judge.debt)) {
+                owed.judged();
+            }
+        }
+        if let (None, Some(Owing::Unknown)) = (dialled, owing)
+            && dialable
+            && !unjudged
+            && self.owed.get(&actor).is_none_or(|owed| owed.take.is_none())
+        {
+            self.untold(actor, now);
+        }
+        if self.owed.get(&actor).is_some_and(Owed::idle) {
+            self.owed.remove(&actor);
+        }
+    }
+    /// One more round in a run that told `actor` short lists, at `now`: the seat is owed a round
+    /// at the [`backoff_delay`] of the run's length, up to [`RELIST_TRIES`] in a row (any number
+    /// where `unbounded`, a mutant's).
+    fn relist(&mut self, actor: Actor, now: Instant, unbounded: bool) {
+        self.attempt = self.attempt.wrapping_add(1);
+        let (own, attempt) = (self.own, self.attempt);
+        let owed = self.owed.entry(actor).or_default();
+        owed.short = owed.short.saturating_add(1);
+        owed.relist = (owed.short <= RELIST_TRIES || unbounded).then(|| Debt {
+            since: now,
+            not_before: now + backoff_delay(&own, attempt, owed.short),
+        });
+    }
+    /// One more judgement of the take this Mac may owe `actor` could not tell, at `now`: the next
+    /// is due at the [`backoff_delay`] of how many in a row could not, up to [`RELIST_TRIES`]
+    /// ([`Owed::judge`]), and none past them.
+    fn untold(&mut self, actor: Actor, now: Instant) {
+        #[cfg(test)]
+        let unbounded = mutant(&JUDGED_UNBOUNDED);
+        #[cfg(not(test))]
+        let unbounded = false;
+        self.attempt = self.attempt.wrapping_add(1);
+        let (own, attempt) = (self.own, self.attempt);
+        let owed = self.owed.entry(actor).or_default();
+        owed.untold = owed.untold.saturating_add(1);
+        if owed.untold <= RELIST_TRIES || unbounded {
+            let not_before = now + backoff_delay(&own, attempt, owed.untold);
+            let judge = owed.judge.get_or_insert_with(|| Judge {
+                debt: Debt {
+                    since: now,
+                    not_before,
+                },
+                identity: Arc::new(()),
+            });
+            judge.debt.not_before = not_before;
+        } else {
+            owed.judge = None;
+        }
+        if owed.idle() {
+            self.owed.remove(&actor);
+        }
+    }
+    /// The requests to judge takes this Mac may owe, due at `now` ([`Owed::judge`]):
+    /// `super::transport::Transport::check_takes` judges each off the serving loop and tells
+    /// [`Self::judged`].
+    pub(super) fn judging(&self, now: Instant) -> Vec<Judgement> {
+        self.owed
+            .iter()
+            .filter_map(|(seat, owed)| {
+                let judge = owed.judge.as_ref()?;
+                (judge.debt.not_before <= now).then(|| Judgement {
+                    seat: *seat,
+                    identity: judge.identity.clone(),
+                })
+            })
+            .collect()
+    }
+    /// A judgement of the take this Mac may owe the request's seat, made with no round, told
+    /// `owing` at `now`
+    /// ([`Self::judging`]): an Offer of the seat's that this Mac's take would try owes the seat a
+    /// round this Mac begins, in which it takes ([`Owed::take`]), which its walk dials from now;
+    /// one that tells nothing is owed ends the judgements; one that could not tell is made again
+    /// ([`Self::untold`]). A result for any request cleared or replaced since the read began
+    /// ([`Self::settle`]) tells nothing, whatever it found.
+    pub(super) fn judged(&mut self, judgement: Judgement, owing: Owing, now: Instant) {
+        let seat = judgement.seat;
+        let Some(owed) = self.owed.get_mut(&seat) else {
+            return;
+        };
+        let Some(judge) = owed
+            .judge
+            .as_mut()
+            .filter(|judge| Arc::ptr_eq(&judge.identity, &judgement.identity))
+        else {
+            return;
+        };
+        match owing {
+            Owing::Take(offer) => {
+                if owed.take.is_none_or(|(_, owed_for)| owed_for != offer) {
+                    owed.take = Some((
+                        Debt {
+                            since: now,
+                            not_before: now,
+                        },
+                        offer,
+                    ));
+                }
+                owed.judged();
+            }
+            Owing::Nothing => owed.judged(),
+            Owing::Unknown => {
+                // This read was consumed. The next retry is a new request, while incoming
+                // unread handoffs alone keep a read already in flight valid.
+                judge.identity = Arc::new(());
+                self.untold(seat, now);
+            }
+        }
+        if self.owed.get(&seat).is_some_and(Owed::idle) {
+            self.owed.remove(&seat);
+        }
+    }
+    /// This Mac's selection takes what it did not: its Commons policy enables sharing again or
+    /// excludes a table no more (`super::moved::Look::widened`), as a look at `now` found. Each
+    /// seat a round traded lists with holds lists of this Mac's that may leave such a table out,
+    /// and passes this Mac over for writes to it ([`may_take`]): each verified one is owed a
+    /// round whose lists are whole ([`Owed::relist`]), which its walk dials from now.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbDialCadence",
+            action = "Owe",
+            project = "aterm_db::runtime::discovery::cadence_tests::dial_cadence_transition"
+        )
+    )]
+    pub(super) fn relist_all(&mut self, now: Instant) {
+        let seats: BTreeSet<Actor> = self
+            .peers
+            .values()
+            .filter(|peer| peer.verified && (peer.listed.is_some() || peer.own.is_some()))
+            .filter_map(Peer::seat)
+            .collect();
+        for seat in seats {
+            if !self.owed.contains_key(&seat) && self.owed.len() >= MAX_PEERS {
+                break;
+            }
+            self.owed.entry(seat).or_default().relist = Some(Debt {
+                since: now,
+                not_before: now,
+            });
+        }
+    }
+    /// Whether, at `now`, a seat's run of short lists has spent its owed rounds and a read of
+    /// this Mac's selection may owe it one ([`Owed::spent`]). Such a seat holds lists that may
+    /// leave out a table this Mac's selection takes once it reads whole, and passes this Mac
+    /// over for writes to it ([`may_take`]); no round is owed it, and nothing but this Mac's
+    /// selection says when one would list whole. While this holds the transport reads the
+    /// selection (`super::transport::Transport::check_selection`), which no peer hears of, and
+    /// tells a whole one ([`Self::relist_spent`]).
+    pub(super) fn spent(&self, now: Instant) -> bool {
+        self.owed.values().any(|owed| owed.spent(now))
+    }
+    /// A read of this Mac's selection found it whole, as the turn at `now` took it: each seat
+    /// whose run of short lists spent its owed rounds ([`Self::spent`]) is owed one more
+    /// ([`Owed::relist`]), which its walk dials from now and whose lists reach the seat. Where
+    /// that round lists short again, or trades no lists, the run goes on and a later read may
+    /// owe the seat another, no sooner than the [`backoff_delay`] of how many reads owed it one
+    /// in this run, 5 s doubling to two minutes ([`Owed::reread`]): the rounds a read owes are
+    /// spaced as the run's own were, and each needs a read that found the selection whole.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbDialCadence",
+            action = "Owe",
+            project = "aterm_db::runtime::discovery::cadence_tests::dial_cadence_transition"
+        )
+    )]
+    pub(super) fn relist_spent(&mut self, now: Instant) {
+        #[cfg(test)]
+        let (untold, at_once) = (mutant(&WHOLE_UNTOLD), mutant(&REREAD_AT_ONCE));
+        #[cfg(not(test))]
+        let (untold, at_once) = (false, false);
+        if untold {
+            return;
+        }
+        let own = self.own;
+        for owed in self.owed.values_mut().filter(|owed| owed.spent(now)) {
+            self.attempt = self.attempt.wrapping_add(1);
+            owed.relist = Some(Debt {
+                since: now,
+                not_before: now,
+            });
+            owed.reads = owed.reads.saturating_add(1);
+            owed.reread = (!at_once).then(|| now + backoff_delay(&own, self.attempt, owed.reads));
+        }
+    }
+    /// Whether this Mac owes `seat` a round (tests).
+    #[cfg(test)]
+    pub(super) fn owes(&self, seat: Actor) -> bool {
+        self.owed
+            .get(&seat)
+            .is_some_and(|owed| owed.due().is_some())
+    }
+    /// Whether this Mac owes `seat` a round in which it takes the seat's Offer (tests).
+    #[cfg(test)]
+    pub(super) fn owes_take(&self, seat: Actor) -> bool {
+        self.owed.get(&seat).is_some_and(|owed| owed.take.is_some())
+    }
+    /// When this Mac's next judgement of the take it may owe `seat` is due, if one is (tests).
+    #[cfg(test)]
+    pub(super) fn judge_at(&self, seat: Actor) -> Option<Instant> {
+        self.owed
+            .get(&seat)
+            .and_then(|owed| owed.judge.as_ref().map(|judge| judge.debt.not_before))
     }
     /// When the silence of the endpoint at `address` calls for its probe, if it does: an
     /// established endpoint that beaconed and has since gone [`SILENCE`] (and this node's
-    /// jitter for it, [`SILENCE_JITTER_MS`]) with neither a beacon nor a completed round is
-    /// dialled once, whatever its own wait, and that dial is an audit ([`Repair::audit`]). A
-    /// peer that left this way is found gone by that dial ([`Standing`]) and not at its lease's
-    /// end. One probe a silence: the next waits for a beacon to be heard again
-    /// ([`Peer::probed`]), so a peer whose beacons stop reaching this Mac costs one round, and
-    /// its own wait still dials it.
+    /// jitter for it, [`SILENCE_JITTER_MS`]) with no beacon, no completed round of its own and
+    /// no round its seat dialled in from its address while it was the port there beaconed from
+    /// last ([`Peer::dialled_in`]) is dialled once, whatever its own wait, and that dial is an
+    /// audit ([`Repair::audit`]). A peer that left this way is found gone by that dial
+    /// ([`Standing`]) and not at its lease's end. One probe a silence: the next waits for a
+    /// beacon to be heard again ([`Peer::probed`]), so a peer whose beacons stop reaching this
+    /// Mac costs one round, and its own wait still dials it.
     ///
     /// A beacon grants nothing here. It only puts off this one early dial: an endpoint whose
     /// beacons keep coming, its own or forged, is dialled by its own wait as if none came, and
-    /// forged beacons that stop can cost one round per endpoint per silence.
+    /// forged beacons that stop can cost one round per endpoint per silence. A round dialled in
+    /// puts it off too, and is authenticated, so unlike a beacon it cannot be forged to withhold
+    /// the probe; a forged beacon naming another port at the address can only keep a round
+    /// dialled in from counting, which costs the probe as before. Only an endpoint that beaconed
+    /// is probed, as before.
     fn probe_at(&self, address: &SocketAddr, peer: &Peer) -> Option<Instant> {
         #[cfg(test)]
         let probed = peer.probed && !mutant(&PROBE_REPEATS);
@@ -1606,7 +2251,14 @@ impl Hints {
         if probed || !peer.established() {
             return None;
         }
-        let heard = peer.beacon?.max(peer.seen);
+        #[cfg(test)]
+        let inbound = peer.dialled_in.filter(|_| !mutant(&INBOUND_UNHEARD));
+        #[cfg(not(test))]
+        let inbound = peer.dialled_in;
+        let heard = peer
+            .beacon?
+            .max(peer.seen)
+            .max(inbound.unwrap_or(peer.seen));
         let jitter = Duration::from_millis(self.spread(address) % SILENCE_JITTER_MS);
         Some(heard + SILENCE + jitter)
     }
@@ -1666,6 +2318,8 @@ impl Hints {
         if elsewhere && !alone {
             return;
         }
+        // A seat found gone is owed nothing: a round once it is back lists anew.
+        self.owed.remove(&seat);
         if let Some(told) = self.departed.get_mut(&seat) {
             *told = (*told).max(at);
         } else if self.departed.len() < MAX_PEERS {
@@ -1738,16 +2392,23 @@ impl Hints {
     }
     /// The endpoints a walk may dial ([`Self::moved`]), each with when it may: established,
     /// idle, one this side may dial, with no unfinished round standing ([`Peer::unfinished`]),
-    /// of a seat not tried for something that moved and may take ([`may_take`]) and with no
-    /// round in flight at another of its endpoints (a second round with one seat would only
-    /// contend with the first), from [`WALK_GAP`] after its last completed round. Its own wait
-    /// is not read.
+    /// of a seat not tried for something that moved and may take ([`may_take`]), or one this Mac
+    /// owes a round ([`Owed`]), and with no round in flight at another of its endpoints (a second
+    /// round with one seat would only contend with the first), from [`WALK_GAP`] after its last
+    /// completed round, and for what is owed alone no sooner than the debt says ([`Debt`]). Its
+    /// own wait is not read.
     fn walkable(&self) -> impl Iterator<Item = (SocketAddr, Instant)> + '_ {
         #[cfg(test)]
         let off = mutant(&NO_WALK);
         #[cfg(not(test))]
         let off = false;
-        let flying: BTreeSet<Actor> = if self.hot.is_empty() || off {
+        #[cfg(test)]
+        let unwalked = mutant(&OWED_UNWALKED);
+        #[cfg(not(test))]
+        let unwalked = false;
+        let owing = !unwalked && self.owed.values().any(|owed| owed.due().is_some());
+        let idle = self.hot.is_empty() && !owing;
+        let flying: BTreeSet<Actor> = if idle || off {
             BTreeSet::new()
         } else {
             self.peers
@@ -1770,29 +2431,37 @@ impl Hints {
         };
         #[cfg(not(test))]
         let gap = WALK_GAP;
-        self.peers
+        self.peers.iter().filter_map(move |(address, peer)| {
+            if idle
+                || off
+                || peer.busy
+                || !peer.established()
+                || peer.unfinished != 0
+                || speaks_bus(&self.bus, &self.addresses, address, peer)
+                || self
+                    .addresses
+                    .get(&address.ip())
+                    .copied()
+                    .or_else(|| peer.repair.actor())
+                    .is_some_and(|actor| self.needs_update.contains_key(&actor))
+            {
+                return None;
+            }
+            let seat = peer.repair.actor().filter(|seat| !flying.contains(seat))?;
+            let from = peer.seen + gap;
+            if self.offers(peer, seat) {
+                return Some((*address, from));
+            }
+            let owed = self.owed.get(&seat).and_then(Owed::due).filter(|_| owing)?;
+            Some((*address, from.max(owed)))
+        })
+    }
+    /// Whether something that moved here is offered to `seat`, whose endpoint `peer` is: the
+    /// seat was not tried for it and may take it ([`may_take`]).
+    fn offers(&self, peer: &Peer, seat: Actor) -> bool {
+        self.hot
             .iter()
-            .filter(move |(address, peer)| {
-                !self.hot.is_empty()
-                    && !off
-                    && !peer.busy
-                    && peer.established()
-                    && peer.unfinished == 0
-                    && !speaks_bus(&self.bus, &self.addresses, address, peer)
-                    && self
-                        .addresses
-                        .get(&address.ip())
-                        .copied()
-                        .or_else(|| peer.repair.actor())
-                        .is_none_or(|actor| !self.needs_update.contains_key(&actor))
-                    && peer.repair.actor().is_some_and(|seat| {
-                        !flying.contains(&seat)
-                            && self.hot.iter().any(|(subject, hot)| {
-                                !hot.tried.contains(&seat) && may_take(peer, subject, hot)
-                            })
-                    })
-            })
-            .map(move |(address, peer)| (*address, peer.seen + gap))
+            .any(|(subject, hot)| !hot.tried.contains(&seat) && may_take(peer, subject, hot))
     }
     /// The walk's next endpoint at `now` ([`Self::walkable`]): the first in this node's order
     /// ([`Self::spread`]) whose gap after its last round is over.
@@ -1952,14 +2621,18 @@ impl Hints {
     }
     fn expire(&mut self, now: Instant) {
         self.peers.retain(|_, p| {
-            p.busy
+            let kept = p.busy
                 || (!p.verified && !p.failed)
                 || now.saturating_duration_since(p.seen)
                     < if p.verified {
                         VERIFIED_EXPIRES
                     } else {
                         EXPIRES
-                    }
+                    };
+            if !kept && p.verified {
+                census::expired(p.repair.actor());
+            }
+            kept
         });
     }
     fn replacement(&self, source: Option<IpAddr>) -> Option<SocketAddr> {
@@ -2154,6 +2827,14 @@ impl Hints {
             project = "aterm_db::runtime::discovery::cadence_tests::dial_cadence_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbDialCadence",
+            action = "WalkOwed",
+            project = "aterm_db::runtime::discovery::cadence_tests::dial_cadence_transition"
+        )
+    )]
     pub(super) fn next_allowed(
         &mut self,
         now: Instant,
@@ -2170,6 +2851,13 @@ impl Hints {
         });
         self.follow_up
             .retain(|address| self.peers.contains_key(address));
+        // What is owed a seat with no verified endpoint left goes with it: nothing here dials it.
+        let peers = &self.peers;
+        self.owed.retain(|seat, _| {
+            peers
+                .values()
+                .any(|peer| peer.verified && peer.seat() == Some(*seat))
+        });
         self.cool();
         // A `Bus` speaker is never dialled; it stays known ([`Self::bus_speakers`]).
         let dialable = |a: &SocketAddr, p: &Peer| !speaks_bus(&self.bus, &self.addresses, a, p);
@@ -2266,6 +2954,14 @@ impl Hints {
         // every endpoint that is due, so a run of moves cannot keep those waiting.
         let walked = due.is_none();
         let address = due.or_else(|| self.walk(now))?;
+        // A walk's dial that nothing moved here asked for is a round this Mac owes the seat
+        // ([`Owed`]), as [`Self::walkable`] read it: the census tells it from a walk's offer.
+        let owed = walked && {
+            let peer = &self.peers[&address];
+            peer.repair
+                .actor()
+                .is_some_and(|seat| !self.offers(peer, seat))
+        };
         // Whichever turn chose it, a dial of an endpoint whose silence called for a probe is
         // that probe ([`Self::probe_at`]).
         let probing = self
@@ -2298,6 +2994,26 @@ impl Hints {
         peer.busy = true;
         peer.began = now;
         peer.probed |= probing;
+        // What chose the dial, for the census: the turn that picked the address above.
+        let chose = if follow_up.is_some() {
+            census::Dial::FollowUp
+        } else if led.is_some() {
+            census::Dial::Lead
+        } else if reverify.is_some() {
+            census::Dial::Audit
+        } else if owed {
+            census::Dial::Owed
+        } else if walked {
+            census::Dial::Walk
+        } else {
+            census::Dial::Scan
+        };
+        peer.marks = Some(Marks {
+            chose,
+            probe: probing,
+            met_again: absent && !peer.verified,
+            away: absent && peer.verified,
+        });
         // Change jitter on every attempt: fixed per-owner jitter can keep two
         // peers with nearby deadlines colliding at the runtime's tick cadence.
         self.attempt = self.attempt.wrapping_add(1);
@@ -2455,6 +3171,9 @@ impl Hints {
             peer.quiet_push = false;
         }
     }
+    /// End the round this side dialled to `address`, which `outcome` tells, at `now`: what it
+    /// came to sets its endpoint's next dial. What the census counts of that ([`Verdict`]); none
+    /// where the endpoint is no longer held.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2469,10 +3188,8 @@ impl Hints {
         repair: Repair,
         outcome: Outcome,
         now: Instant,
-    ) {
-        let Some(peer) = self.peers.get_mut(&address) else {
-            return;
-        };
+    ) -> Option<Verdict> {
+        let peer = self.peers.get_mut(&address)?;
         if matches!(
             repair.application_cause(),
             Some(
@@ -2628,10 +3345,60 @@ impl Hints {
             peer.pulled = false;
         }
         let unsettled = std::mem::take(&mut peer.unsettled) && completed;
+        let waited = peer.next;
         if unsettled {
             // What its rest stood on moved while this round ran ([`Self::unsettle`]).
             peer.next = peer.next.min(now + UNSETTLED);
         }
+        // Whether that brought its next dial sooner: an endpoint due within [`UNSETTLED`] keeps
+        // its wait, a rest until an audit that close included.
+        let curtailed = peer.next < waited;
+        let seat = repair.authenticated_actor().or(peer.dialled);
+        // Whether this Mac owes the seat a round due before the endpoint's own next dial ([`Owed`],
+        // which the round's own [`Self::settle`] may have just made): the walk dials it then,
+        // reading no endpoint's own wait ([`Self::walkable`]).
+        let owed_sooner = seat
+            .and_then(|seat| self.owed.get(&seat))
+            .and_then(Owed::due)
+            .is_some_and(|due| due < peer.next);
+        // What the census counts of the round ([`Verdict`]): why its endpoint's next dial comes
+        // when it does, read from the values that set it above, so it never restates the rule.
+        let next = match outcome {
+            Outcome::Repaired { transferred: true } => census::Next::Transferred,
+            Outcome::Repaired { transferred: false } => {
+                if let Some(owed) = repair.owed().filter(|_| owes) {
+                    census::Next::owes(owed)
+                } else if sweeping {
+                    census::Next::Sweeping
+                } else if rest.is_none() {
+                    census::Next::Auditing
+                } else if sooner {
+                    census::Next::Pushed
+                } else if owed_sooner {
+                    census::Next::OwesRound
+                } else if curtailed {
+                    census::Next::Unsettled
+                } else {
+                    census::Next::Rest
+                }
+            }
+            Outcome::Deferred
+                if repair.deferral_cause()
+                    == Some(aterm_types::network_state::RepairCause::Quota) =>
+            {
+                census::Next::DeferredQuota
+            }
+            Outcome::Deferred => census::Next::Deferred,
+            Outcome::Unfinished => census::Next::Unfinished,
+            Outcome::Busy => census::Next::Busy,
+            Outcome::Refused | Outcome::Unreached => census::Next::Failed,
+            Outcome::Unasked => census::Next::Unasked,
+        };
+        let verdict = Verdict {
+            seat,
+            marks: peer.marks.take(),
+            next,
+        };
         let verified = repair.actor().filter(|_| completed);
         if verified.is_some() {
             peer.verified = true;
@@ -2694,6 +3461,7 @@ impl Hints {
         } else {
             self.follow_up.retain(|queued| *queued != address);
         }
+        Some(verdict)
     }
 }
 

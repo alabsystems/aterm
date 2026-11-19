@@ -61,6 +61,7 @@ fn bootstrap_never_replaces_missing_custody_of_a_retained_journal() {
             key: "one".into(),
             value: Some(value.clone()),
         }],
+        said: None,
     })
     .unwrap();
     let actor = db.credentials.capability.actor;

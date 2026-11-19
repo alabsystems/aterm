@@ -107,7 +107,7 @@ fn fed(rig: &Rig, sid: &str) -> Option<StreamedState> {
 /// contract=4 …` on the stream's own connection, so the claim's grant, version and kept child
 /// are the record's, the placement count moves (the restart watch reads it as the harness
 /// having claimed again), and the stream goes on from the same `acked`. A changed grant or
-/// revision owes the harness a `policy` record; a renewal that changes nothing owes none. A
+/// revision sends the harness a `policy` record; a renewal that changes nothing sends none. A
 /// field the record leaves out is the standing claim's.
 /// NEGATIVE HALF: a line aterm refuses (here the proof fails) is acknowledged
 /// `dropped=refused:unproven`, moves no placement, and leaves the claim as it stood.
@@ -127,7 +127,7 @@ fn a_claim_record_renews_the_claim_and_moves_its_placements() {
         ),
         ("state", Some("0.3.0"), None)
     );
-    assert!(!rig.state(ONE).policy_due);
+    assert!(stream.heard.is_empty(), "nothing owed: {:?}", stream.heard);
 
     let holder = format!("claude-code-alab@{}", running().pid);
     let child = ChildProcess {
@@ -181,9 +181,15 @@ fn a_claim_record_renews_the_claim_and_moves_its_placements() {
         state.acked, 2,
         "the stream's state is kept across the claim"
     );
+    let policy = stream.own();
+    assert_eq!(
+        policy.body,
+        Body::Policy,
+        "the grant moved: aterm sends a `policy` record"
+    );
     assert!(
-        state.policy_due,
-        "the grant moved: a `policy` record is owed"
+        policy.seq > stream.opening[1].seq,
+        "numbered after the opening"
     );
     assert_eq!(
         state.applied.iter().copied().collect::<Vec<_>>(),
@@ -192,17 +198,7 @@ fn a_claim_record_renews_the_claim_and_moves_its_placements() {
     );
 
     // A record that names nothing renews the claim as it stands: a placement, the same grant
-    // and revision, and no `policy` owed.
-    rig.service
-        .handle(ONE)
-        .ctx
-        .meta
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .stream
-        .as_mut()
-        .expect("the stream's state")
-        .policy_due = false;
+    // and revision, and no `policy` sent.
     assert_eq!(stream.record(3, claim(None, None, None, None)), (3, None));
     assert_eq!(
         rig.service.lines().last().map(String::as_str),
@@ -225,8 +221,12 @@ fn a_claim_record_renews_the_claim_and_moves_its_placements() {
         renewed,
         "nothing but the placement count moved"
     );
-    assert!(!rig.state(ONE).policy_due, "nothing changed: no `policy`");
     assert_eq!(stream.record(4, Body::Beat), (4, None), "the stream stands");
+    assert!(
+        stream.heard.is_empty(),
+        "nothing changed: no `policy` ({:?})",
+        stream.heard
+    );
 
     // NEGATIVE HALF: the proof fails, so the line is refused and the claim stands as it was.
     *rig.service
@@ -248,8 +248,12 @@ fn a_claim_record_renews_the_claim_and_moves_its_placements() {
     );
     let state = rig.state(ONE);
     assert_eq!((state.acked, state.dropped), (5, dropped + 1));
-    assert!(!state.policy_due);
     assert_eq!(stream.record(6, Body::Beat), (6, None));
+    assert!(
+        stream.heard.is_empty(),
+        "a refused line sends no `policy` ({:?})",
+        stream.heard
+    );
 }
 
 /// A `claim` RECORD'S TEXT NEVER BECOMES A SECOND CONTROL LINE (D7): each field is checked as

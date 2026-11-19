@@ -125,6 +125,7 @@ fn publish_run(app: &mut App, revision: u64, running: Vec<Setting>) {
     let permissions = Some(crate::InitialSetupPermissionPolicy {
         revision,
         allowed: true,
+        person_access: false,
     });
     app.observe_initial_setup_permissions(permissions);
     app.publish_system_state(crate::SetupStatus {
@@ -692,6 +693,7 @@ fn clt_landing_holds_the_dialog_slot_until_the_installer_exits() {
     let permissions = Some(crate::InitialSetupPermissionPolicy {
         revision: 4,
         allowed: true,
+        person_access: false,
     });
     app.observe_initial_setup_permissions(permissions);
     let mut status = app.system_state_host.latest_status().clone();

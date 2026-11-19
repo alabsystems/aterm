@@ -355,8 +355,9 @@ pub fn prepare_staging(dist: &Path, build: u64) -> Result<PathBuf, String> {
     for line in prune_staging_dirs(dist, &staging_dir, processes.as_deref()) {
         println!("==> {line}");
     }
-    std::fs::create_dir_all(&staging_dir)
-        .map_err(|e| format!("create {}: {e}", staging_dir.display()))?;
+    aterm_uds::backup::Backups::SYSTEM
+        .build_dir(&staging_dir)
+        .map_err(|e| format!("prepare {}: {e}", staging_dir.display()))?;
     if exists_or_symlink(&app) {
         remove_path_any(&app).map_err(|e| format!("rm -rf {}: {e}", app.display()))?;
     }

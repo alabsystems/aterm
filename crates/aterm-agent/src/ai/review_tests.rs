@@ -308,6 +308,7 @@ fn claude_account(login: Option<&str>) -> ClaudeAccounts {
         renew_by: None,
         on_token_until: None,
         limited_until: None,
+        model_walls: std::collections::BTreeMap::new(),
         served_at: None,
         renewed_at: None,
         signed_out_at: None,
@@ -2807,7 +2808,7 @@ fn claude_review_results_follow_the_observed_account_and_receipt() {
                                     Auth::SignedOut,
                                     ReviewPool::NOW - 1,
                                 ));
-                                events.extend(accounts::note_signed_back(
+                                events.extend(accounts::note_checked_sign_in(
                                     state,
                                     logins,
                                     label,

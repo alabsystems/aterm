@@ -57,6 +57,9 @@ pub(crate) struct Remote {
     /// Where a write says the one line of a wait or of a write it settled by reading origin
     /// (`write::Remote::journaled`): standard error, which a step's log keeps.
     notice: Box<dyn Fn(&str) + Send + Sync>,
+    /// The signal that interrupted the release, if one did ([`crate::interrupt::caught`]): a
+    /// write's wait or pause behind another writer's intent ends on it, as on its own `stop`.
+    interrupted: Box<dyn Fn() -> Option<i32> + Send + Sync>,
 }
 
 struct TagCatalog {
@@ -187,25 +190,123 @@ pub(crate) fn helper_arguments(
     Err("the cutter's agh entry accepts only auth git-credential OP")
 }
 
-impl Remote {
-    /// The follower's newest status on `commit` (context [`aterm_verify::FOLLOWER_CONTEXT`]):
-    /// its state and description, `None` where it posted none.
-    pub(crate) fn follower(&self, commit: &str) -> Result<Option<(String, String)>, String> {
-        if !agh::path::is_sha(commit) {
-            return Err("a follower status read requires an exact commit ID".into());
+/// Describe the typed request, not its credentials, paths, ref names or object identities.
+/// Cache flags say only what DATA the caller supplied; they prove no local closure or reuse.
+fn native_git_details(run: &GitRun) -> aterm_json::Value {
+    use agh::git::{FetchScope, GitOp};
+    let selection = |reference: Option<&str>| match reference {
+        None => "all",
+        Some("HEAD") => "head",
+        Some(reference) if agh::path::is_sha(reference) => "object",
+        Some(reference) if reference.contains('*') => "pattern",
+        Some(_) => "ref",
+    };
+    let mut request = match &run.op {
+        GitOp::CheckLocal { .. } => aterm_json::json!({"operation": "check-local"}),
+        GitOp::CommitRead {
+            request, anonymous, ..
+        } => aterm_json::json!({
+            "operation": "commit-read", "anonymous": anonymous,
+            "requested_commits": request.commits().len(),
+            "requested_ancestry_queries": request.queries().len(),
+        }),
+        GitOp::Clone { depth, cache, .. } => aterm_json::json!({
+            "operation": "clone", "depth": depth, "cache_supplied": cache.is_some(),
+        }),
+        GitOp::Mirror { .. } => aterm_json::json!({"operation": "mirror"}),
+        GitOp::Fetch { .. } => aterm_json::json!({"operation": "fetch"}),
+        GitOp::FetchMain { blobless, .. } => aterm_json::json!({
+            "operation": "fetch-main", "blobless": blobless,
+        }),
+        GitOp::FetchRef {
+            reference,
+            anonymous,
+            scope,
+            ..
+        } => {
+            let (scope, cache_supplied) = match scope {
+                FetchScope::NativeExact => ("native-exact", None),
+                FetchScope::MetadataOnly => ("metadata-only", None),
+                FetchScope::SelectedCheckout { cache } => {
+                    ("selected-checkout", Some(cache.is_some()))
+                }
+                FetchScope::FullSource { .. } => ("full-source", Some(true)),
+            };
+            aterm_json::json!({
+                "operation": "fetch-ref", "anonymous": anonymous,
+                "selection": selection(Some(reference)), "requested_scope": scope,
+                "cache_supplied": cache_supplied,
+            })
         }
-        let route =
-            agh::policy::RouteRequest::read(agh::policy::RouteTarget::Repo(self.slug.clone()))
-                .with_named(self.named.clone());
-        let path = format!("/repos/{}/commits/{commit}/statuses", self.slug);
-        let answer = self
-            .client
-            .call(&agh::Call::get(path, route))
-            .and_then(|answer| answer.json())
-            .map_err(|error| words(&self.client, &error))?;
-        let statuses = aterm_verify::watch::follower_statuses(&answer)
-            .ok_or("GitHub's answer for a commit's statuses is not a valid status list")?;
-        Ok(statuses.into_iter().next())
+        GitOp::FetchBatch {
+            batch, anonymous, ..
+        } => aterm_json::json!({
+            "operation": "fetch-batch", "anonymous": anonymous,
+            "requested_objects": batch.object_ids().len(), "requested_refs": batch.rows().len(),
+        }),
+        GitOp::LsRemote {
+            reference,
+            anonymous,
+            peeled,
+        } => aterm_json::json!({
+            "operation": "ls-remote", "anonymous": anonymous, "peeled": peeled,
+            "selection": selection(reference.as_deref()),
+        }),
+        GitOp::PushDelete { .. } => aterm_json::json!({
+            "operation": "push-delete", "requested_refs": 1,
+        }),
+        GitOp::PushRefs { batch, dry_run, .. } => aterm_json::json!({
+            "operation": "push-refs", "dry_run": dry_run,
+            "requested_refs": batch.updates().len(),
+            "observing_main": batch.observed_main().is_some(),
+        }),
+        GitOp::PushControl {
+            transaction,
+            dry_run,
+            ..
+        } => aterm_json::json!({
+            "operation": "push-control", "dry_run": dry_run,
+            "requested_refs": transaction.changes().len(),
+        }),
+        _ => aterm_json::json!({"operation": "other"}),
+    };
+    if let Some(fields) = request.as_object_mut() {
+        fields.insert("repository".to_owned(), run.slug.to_string().into());
+    }
+    aterm_json::json!({"native_git": request})
+}
+
+impl Remote {
+    /// The follower's records in the judged journal ([`aterm_verify::judged`]) as GitHub holds
+    /// it now: its claims and its verdicts, each tree's slot before the records beside it;
+    /// none where there is no journal. The journal's head is read as one exact ref and
+    /// imported by its ID; no commit status is read.
+    pub(crate) fn follower_records(&self) -> Result<Vec<aterm_verify::judged::Record>, String> {
+        let Some(head) = self.get(aterm_verify::judged::REF)? else {
+            return Ok(Vec::new());
+        };
+        self.fetch_exact(&head)?;
+        aterm_verify::judged::follower_records(&self.repo, &head)
+    }
+
+    /// What the follower says of `commit`, by its tree ([`aterm_verify::judged::of_tree`]): its
+    /// verdict, else its claim or how its attempt ended; `None` where it filed nothing.
+    pub(crate) fn follower(
+        &self,
+        commit: &str,
+    ) -> Result<Option<aterm_verify::judged::Record>, String> {
+        if !agh::path::is_sha(commit) {
+            return Err("a follower verdict read requires an exact commit ID".into());
+        }
+        let out = self.local(&["rev-parse", "--verify", &format!("{commit}^{{tree}}")])?;
+        if !out.status.success() {
+            return Err(self.local_error("reading the commit's tree", &out));
+        }
+        let tree = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        Ok(aterm_verify::judged::of_tree(
+            self.follower_records()?,
+            &tree,
+        ))
     }
     /// The immutable repository captured when this source was admitted.
     pub(crate) fn repository(&self) -> &Slug {
@@ -237,6 +338,7 @@ impl Remote {
             named,
             catalog: Mutex::new(None),
             notice: Box::new(|line| eprintln!("{line}")),
+            interrupted: Box::new(crate::interrupt::caught),
         };
         // A listing does not otherwise inspect its caller's checkout. Admit its
         // actual source/config first, just as exact fetch does before importing.
@@ -250,7 +352,7 @@ impl Remote {
             agh::git::GitOp::LsRemote { .. } => "native Git ref advertisement",
             _ => "native Git object operation",
         };
-        let _timing = crate::cut_timing::Timer::new(name);
+        let _timing = crate::cut_timing::Timer::new(name).with_details(native_git_details(&run));
         let run = run.with_named(self.named.clone());
         // CommitRead owns both its finite-work and native no-progress bounds.
         // Overriding them refuses the ancestry query needed when a retry's

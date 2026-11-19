@@ -167,7 +167,7 @@ fn a_pinned_known_owner_is_offered_again_when_the_current_store_lost_it() {
         204
     );
     let verified = running.shared.post_verifies.load(Ordering::SeqCst);
-    let staged = from_bytes(&running.shared, "team", records[1].bytes())
+    let staged = from_bytes(&running.shared, "team", records[1].bytes(), Reading::ONE)
         .unwrap_or_else(|_| panic!("known record"));
     assert_eq!(
         running.shared.post_verifies.load(Ordering::SeqCst),
@@ -469,7 +469,7 @@ fn the_body_deadline_includes_later_frames_and_invalid_tail_drain() {
             waits: Vec::new(),
         };
         let mut body = HttpBody::new(&mut stream, Vec::new(), length, &tuning);
-        let reply = stage_with(&mut body, length, |_| None, || {}, || {})
+        let reply = stage_with(&mut body, length, Reading::ONE, |_| None, || {}, || {})
             .err()
             .unwrap();
         assert_eq!(reply.status, 408);
@@ -498,6 +498,7 @@ fn raw_frame_limit_counts_duplicates_and_early_bytes_end_at_content_length() {
     let reply = stage_with(
         &mut Cursor::new(&repeated),
         repeated.len(),
+        Reading::ONE,
         |_| Some(record.clone()),
         || {},
         || {
@@ -519,8 +520,15 @@ fn raw_frame_limit_counts_duplicates_and_early_bytes_end_at_content_length() {
         waits: Vec::new(),
     };
     let mut body = HttpBody::new(&mut stream, bytes, length, &Tuning::default());
-    let staged = stage_with(&mut body, length, |_| Some(record.clone()), || {}, || {})
-        .unwrap_or_else(|_| panic!("early bytes form one exact record"));
+    let staged = stage_with(
+        &mut body,
+        length,
+        Reading::ONE,
+        |_| Some(record.clone()),
+        || {},
+        || {},
+    )
+    .unwrap_or_else(|_| panic!("early bytes form one exact record"));
     assert_eq!(staged.records().len(), 1);
     assert!(
         stream.waits.is_empty(),
@@ -542,7 +550,7 @@ fn an_incomplete_declared_body_overrides_an_earlier_semantic_error() {
         waits: Vec::new(),
     };
     let mut body = HttpBody::new(&mut stream, Vec::new(), length, &Tuning::default());
-    let reply = stage_with(&mut body, length, |_| None, || {}, || {})
+    let reply = stage_with(&mut body, length, Reading::ONE, |_| None, || {}, || {})
         .err()
         .unwrap();
     assert_eq!(reply.status, 400);
@@ -562,6 +570,7 @@ fn known_reuse_hashes_every_signed_byte_before_skipping_verification() {
     let accepted = stage_with(
         &mut Cursor::new(record.bytes()),
         record.bytes().len(),
+        Reading::ONE,
         |id| (id == record.id()).then(|| record.clone()),
         || {},
         || verified += 1,
@@ -574,6 +583,7 @@ fn known_reuse_hashes_every_signed_byte_before_skipping_verification() {
     let refusal = stage_with(
         &mut Cursor::new(&changed),
         changed.len(),
+        Reading::ONE,
         |id| (id == record.id()).then(|| record.clone()),
         || {},
         || verified += 1,
@@ -582,6 +592,78 @@ fn known_reuse_hashes_every_signed_byte_before_skipping_verification() {
     .unwrap();
     assert_eq!(refusal.status, 400);
     assert_eq!(verified, 1, "the altered signature is a new frame");
+}
+
+/// A staged frame is named by its record's id, the one id a version-2 record's whole and shed
+/// forms share (tracker FL-148A's carried defect: the SHA-256 of a frame's bytes is a
+/// version-1 record's id alone). So a whole version-2 record the server holds stands for the
+/// frame a poster sends of it and is not verified again; and the record the server holds
+/// stands for a frame only where it is as long, so a whole record a poster sends is staged
+/// whole where the server holds its shed frame under that id. A server that reads format 1
+/// refuses the stream, as it refuses any version-2 record.
+///
+/// NEGATIVE CONTROLS, each a change to `stage_with` run against this test and seen to fail:
+/// - the frame named by the SHA-256 of its bytes (as before): ``a frame is looked up by its
+///   record's id``.
+/// - the held record taken for the frame whatever its length: ``the whole record the poster
+///   sent is what is staged``.
+#[test]
+fn vault_checkpoint_a_staged_frame_is_named_by_its_records_id() {
+    use super::super::follow_tests::{Seat, shed};
+    let mut seat = Seat::found();
+    seat.sign(false);
+    let whole = seat.sign(true);
+    let frame = shed(&whole);
+    let bytes = whole.wire_bytes().unwrap().into_owned();
+    assert_ne!(aterm_digest::Sha256::digest(&bytes), *whole.id());
+    let two = Reading::Format(crate::crossing::FORMAT_TWO);
+    let stage = |held: &Record| {
+        let mut asked = Vec::new();
+        let mut verified = 0;
+        let staged = stage_with(
+            &mut Cursor::new(&bytes),
+            bytes.len(),
+            two,
+            |id| {
+                asked.push(*id);
+                (id == held.id()).then(|| held.clone())
+            },
+            || {},
+            || verified += 1,
+        )
+        .unwrap_or_else(|_| panic!("a format-2 server stages a version-2 record"));
+        (staged.into_records().remove(0), asked, verified)
+    };
+
+    // The server holds the record whole: it stands for the frame, unverified.
+    let (staged, asked, verified) = stage(&whole);
+    assert_eq!(
+        asked,
+        [*whole.id()],
+        "a frame is looked up by its record's id"
+    );
+    assert_eq!(verified, 0, "a record held as it was sent is not verified");
+    assert!(!staged.is_shed());
+
+    // The server holds its shed frame: the whole record is decoded, and staged whole.
+    let (staged, _, verified) = stage(&frame);
+    assert!(
+        !staged.is_shed(),
+        "the whole record the poster sent is what is staged"
+    );
+    assert_eq!((staged.id(), verified), (whole.id(), 1));
+
+    let refused = stage_with(
+        &mut Cursor::new(&bytes),
+        bytes.len(),
+        Reading::ONE,
+        |_| None,
+        || {},
+        || {},
+    )
+    .err()
+    .unwrap();
+    assert_eq!(refused.status, 400, "a format-1 server reads no such frame");
 }
 
 #[test]

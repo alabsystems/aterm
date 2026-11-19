@@ -47,6 +47,12 @@ pub struct SurveyAccountFact {
     pub week_reset: Option<i64>,
     /// Unix timestamp (seconds) until which a standing wall blocks this account, when walled.
     pub walled_until: Option<i64>,
+    /// Each model's own weekly wall standing on it, by its bucket, with when it ends, Unix
+    /// seconds (`model_walls=<bucket>:<s>,…`,
+    /// [`crate::harness::cli::SurveyAccount::model_walls`]): it walls that model's sessions
+    /// alone, so it is in neither [`Self::condition`] nor [`Self::walled_until`]. Empty where none
+    /// stands, and from an aterm older than the field (no `model_walls=`, or `model_walls=-`).
+    pub model_walls: BTreeMap<String, i64>,
     /// Unix timestamp (seconds) when a session here last ran on this account.
     pub last_used: Option<i64>,
     /// Unix timestamp (seconds) when its usage figures were last read, when known. A row whose
@@ -79,7 +85,8 @@ pub struct ServerHeardFact {
 /// replies (`OK <n>\ninstance …\n…`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwarmSurveyFacts {
-    /// Host-checked release process identities and bounded local GitHub quota summaries.
+    /// Host-checked release process identities, the release pump's fact (`release_pump`) and
+    /// bounded local GitHub quota summaries.
     pub operation_lines: Vec<String>,
     /// Fleet node id (`node=` on `instance`), when enrolled in a fleet.
     pub node: Option<String>,
@@ -503,6 +510,21 @@ fn opt_i64_token(value: Option<i64>) -> String {
     value.map_or_else(|| "-".to_owned(), |n| n.to_string())
 }
 
+/// An account row's `model_walls=` token: each model's own weekly wall as `<bucket>:<unix s>`,
+/// comma-joined in bucket-id (the map's key) order, or `-` where none stands
+/// ([`SurveyAccountFact::model_walls`]; read by [`parse_model_walls`]).
+fn model_walls_token(walls: &BTreeMap<String, i64>) -> String {
+    if walls.is_empty() {
+        return "-".to_owned();
+    }
+    let joined = walls
+        .iter()
+        .map(|(bucket, until)| format!("{bucket}:{until}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    aterm_codec::pct::encode(&joined)
+}
+
 impl SwarmSurveyFacts {
     /// Collect live survey facts from the current process environment.
     #[must_use]
@@ -580,10 +602,13 @@ impl SwarmSurveyFacts {
             crate::harness::disk::volume_of(home, &aterm_sysprobe::volumes::table()).ok()
         });
         Self {
-            operation_lines: crate::release_progress::survey(&env.state)
+            operation_lines: crate::release_progress::survey(&env.state, now_u64)
                 .into_iter()
+                .chain(crate::release_progress::pump_rows(&env.state, now_u64))
+                // agh keeps its rate book under aterm's state root, not in the harness folder
+                // below it that the release lines read.
                 .chain(aterm_ctl::github_usage::survey(
-                    &env.state,
+                    env.aterm_state.as_deref(),
                     u64::try_from(env.now).unwrap_or(0),
                 ))
                 .collect(),
@@ -718,7 +743,8 @@ impl SwarmSurveyFacts {
         for acc in &self.accounts {
             lines.push(format!(
                 "account pool={} id={} email={} condition={} enrolled={} pct5={} pct7={} \
-                 week_reset={} walled_until={} last_used={} read_at={} launch={} token={}",
+                 week_reset={} walled_until={} model_walls={} last_used={} read_at={} launch={} \
+                 token={}",
                 aterm_codec::pct::encode(&acc.pool),
                 aterm_codec::pct::encode(&acc.id),
                 acc.email
@@ -730,6 +756,7 @@ impl SwarmSurveyFacts {
                 opt_u32_token(acc.usage_7d_pct),
                 opt_i64_token(acc.week_reset),
                 opt_i64_token(acc.walled_until),
+                model_walls_token(&acc.model_walls),
                 opt_i64_token(acc.last_used),
                 opt_i64_token(acc.read_at),
                 acc.launch
@@ -840,7 +867,10 @@ impl SwarmSurveyFacts {
                 repos.push(parse_repo_line(&parse_fields(line))?);
             } else if line.starts_with("server_heard ") {
                 server_heard.push(parse_server_heard_line(&parse_fields(line))?);
-            } else if line.starts_with("release_line ") || line.starts_with("github_rate ") {
+            } else if line.starts_with("release_line ")
+                || line.starts_with(aterm_ctl::release_pump::ROW)
+                || line.starts_with("github_rate ")
+            {
                 operation_lines.push(line.to_owned());
             }
         }
@@ -1054,6 +1084,23 @@ fn parse_opt_i64(raw: &str, key: &str) -> Result<Option<i64>, String> {
         .ok_or_else(|| format!("invalid `{key}` field"))
 }
 
+/// An account row's `model_walls=` ([`model_walls_token`]), read leniently: a member older than
+/// the field sends none (no key, or `-`), which reads as no model wall, and an entry that is not
+/// `<bucket>:<unix s>` is dropped while the rest, and the reply, still read. A model's wall walls
+/// no account, so one bad entry must not cost a Mac its whole reply.
+fn parse_model_walls(fields: &[(String, String)]) -> BTreeMap<String, i64> {
+    field_raw(fields, "model_walls")
+        .filter(|raw| *raw != "-")
+        .into_iter()
+        .flat_map(|raw| raw.split(','))
+        .filter_map(|entry| {
+            let (bucket, until) = entry.rsplit_once(':')?;
+            let until = crate::parse_int::<i64>(until)?;
+            (!bucket.is_empty()).then(|| (bucket.to_owned(), until))
+        })
+        .collect()
+}
+
 fn parse_account_line(fields: &[(String, String)]) -> Result<SurveyAccountFact, String> {
     Ok(SurveyAccountFact {
         pool: required_nonempty(fields, "pool")?,
@@ -1068,6 +1115,7 @@ fn parse_account_line(fields: &[(String, String)]) -> Result<SurveyAccountFact, 
         usage_7d_pct: parse_opt_u32(required_raw(fields, "pct7")?, "pct7")?,
         week_reset: parse_opt_i64(required_raw(fields, "week_reset")?, "week_reset")?,
         walled_until: parse_opt_i64(required_raw(fields, "walled_until")?, "walled_until")?,
+        model_walls: parse_model_walls(fields),
         last_used: parse_opt_i64(required_raw(fields, "last_used")?, "last_used")?,
         // A member older than the field sends none.
         read_at: required_raw(fields, "read_at")
@@ -1453,6 +1501,7 @@ fn account_facts_of(
                 accounts::Condition::Limited { until } => Some(until),
                 _ => None,
             },
+            model_walls: row.model_walls,
             id: row.label,
             condition: row.condition.as_str().to_owned(),
             enrolled: row.enrolled,

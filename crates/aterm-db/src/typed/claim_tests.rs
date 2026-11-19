@@ -360,7 +360,8 @@ fn collapsed_initial_activity_matches_the_full_causal_walk() {
             };
             let label = operation(30, pk, "label", "m7", &[10, 20], &mut index);
             let operations = [&first, &second, &label];
-            let collapsed = activity::Activity::read(&MACHINE, &operations, &index);
+            let collapsed =
+                activity::Activity::read(&MACHINE, &operations, &index, &index.project());
             let reference = activity::Activity::read_reference(&MACHINE, &operations, &index);
             assert_eq!(
                 collapsed.reentries, reference.reentries,
@@ -385,6 +386,92 @@ fn collapsed_initial_activity_matches_the_full_causal_walk() {
                 (a.live, &a.epochs),
                 (b.live, &b.epochs),
                 "variant={variant} concurrent={concurrent}"
+            );
+        }
+    }
+}
+
+#[test]
+fn lifecycle_frontiers_match_retained_parent_walks_across_merges() {
+    let rows = ["mc-0000000000000001", "mc-0000000000000002"];
+    let mut index = Index::new(160);
+    let mut ops = vec![operation(1, rows[0], "row", "live", &[], &mut index)];
+    // Each diamond introduces concurrent writes and joins the preceding diamond's history.
+    // With a different actor per operation, later joins outrun the sparse-vector budget.
+    for round in 0..50_u8 {
+        let previous = 1 + round * 3;
+        let left = previous + 1;
+        let right = previous + 2;
+        let pk = rows[usize::from(round) % rows.len()];
+        ops.push(operation(
+            left,
+            pk,
+            "row",
+            "retired",
+            &[previous],
+            &mut index,
+        ));
+        let mut live = operation(right, pk, "row", "live", &[previous], &mut index);
+        if round % 7 == 0 {
+            live.revert = Some([previous; 32]);
+        }
+        ops.push(live);
+        // Including the earlier ancestor exercises removal of a dominated lifecycle write.
+        ops.push(operation(
+            previous + 3,
+            pk,
+            "label",
+            "m7",
+            &[previous, left, right],
+            &mut index,
+        ));
+    }
+    assert_activity_matches(&rows, &ops, &index);
+}
+
+#[test]
+fn lifecycle_frontiers_follow_retained_parents_at_a_checkpoint_floor() {
+    use astream_wire::sync::FloorRecord;
+
+    let pk = "mc-0000000000000001";
+    let mut index = Index::new(4);
+    let retired = operation(1, pk, "row", "retired", &[], &mut index);
+    // The checkpoint attests that it saw the retirement, but its parent chain is absent.
+    index
+        .insert_floor(FloorRecord {
+            header: Header {
+                id: [2; 32],
+                actor: [2; 48],
+                sequence: 1,
+                previous: None,
+                parents: vec![[1; 32]],
+            },
+            past: BTreeMap::from([([1; 48], 1), ([2; 48], 1)]),
+        })
+        .unwrap();
+    let live = operation(3, pk, "row", "live", &[2], &mut index);
+    let merge = operation(4, pk, "label", "m7", &[1, 3], &mut index);
+    assert!(index.project().observes(&index, &live.id, &retired.id));
+    assert!(!index.observes(&live.id, &retired.id));
+    assert_activity_matches(&[pk], &[retired, live, merge], &index);
+}
+
+fn assert_activity_matches(rows: &[&str], ops: &[Op], index: &Index) {
+    let operations: Vec<_> = ops.iter().collect();
+    let actual = activity::Activity::read(&MACHINE, &operations, index, &index.project());
+    let expected = activity::Activity::read_reference(&MACHINE, &operations, index);
+    assert_eq!(actual.reentries, expected.reentries);
+    for pk in rows {
+        let a = actual.current(pk);
+        let b = expected.current(pk);
+        assert_eq!((a.live, &a.epochs), (b.live, &b.epochs));
+        for op in ops {
+            let a = actual.at(pk, &op.id);
+            let b = expected.at(pk, &op.id);
+            assert_eq!((a.live, &a.epochs), (b.live, &b.epochs));
+            assert_eq!(
+                actual.origin_proof(pk, &op.id),
+                expected.origin_proof(pk, &op.id)
             );
         }
     }
@@ -716,6 +803,8 @@ fn the_importer_adopts_the_canonical_node_holder() {
         complete: true,
         awaiting: crate::typed::Awaiting::NONE,
         refused: Vec::new(),
+        refusals: Vec::new(),
+        cells_from: None,
     };
     let macs = [KnownMac {
         label: None,
@@ -796,6 +885,8 @@ fn a_partial_import_keeps_the_order_of_a_claim_the_source_already_renamed() {
         complete: true,
         awaiting: crate::typed::Awaiting::NONE,
         refused: Vec::new(),
+        refusals: Vec::new(),
+        cells_from: None,
     };
     let empty = crate::typed::owned::OwnedRead::default();
     let lab = crate::alab::view::LabView::read_view(&view, &empty, &empty, None);

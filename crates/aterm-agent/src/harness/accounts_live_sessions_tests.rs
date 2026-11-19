@@ -492,10 +492,16 @@ fn a_process_that_ended_does_not_run() {
         .arg("120")
         .spawn()
         .expect("spawns");
-    let owner = Owner::of(child.id()).expect("its start is read");
-    assert_eq!(owner.runs(), Some(true));
-    child.kill().expect("killed");
-    child.wait().expect("reaped");
+    let owner = Owner::of(child.id());
+    let running = owner.map(Owner::runs);
+    aterm_uds::deadline::kill_within(&mut child, aterm_uds::deadline::ECHO_HANG);
+    let reaped = child.try_wait();
+    assert!(
+        matches!(&reaped, Ok(Some(_))),
+        "owned sleep did not reap after SIGKILL: {reaped:?}"
+    );
+    let owner = owner.expect("its start is read");
+    assert_eq!(running, Some(Some(true)));
     assert_eq!(owner.runs(), Some(false));
 }
 

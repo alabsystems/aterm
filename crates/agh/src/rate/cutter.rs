@@ -19,7 +19,8 @@ use std::path::Path;
 #[cfg(unix)]
 const MAX_ANCESTORS: usize = 64;
 
-/// The most registry entries listed. A host keeps one small record per line it ever took.
+/// The most registry entries listed. A host keeps one small record per line taken there while
+/// its holder runs or its lease may still run for a reader; its local writers remove the rest.
 #[cfg(unix)]
 const MAX_ENTRIES: usize = 4096;
 

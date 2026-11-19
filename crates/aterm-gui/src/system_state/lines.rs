@@ -9,7 +9,7 @@
 
 use super::{
     Access, Headline, RowValue, RowView, Selection, Setting, SetupOperation, SetupStatus, Standing,
-    Steps, Subject, SystemStateApp, ToolsWait,
+    Steps, Subject, SystemStateApp, ToolsWait, governed,
 };
 
 /// The initial join observation interval; later retries remain automatic too.
@@ -21,7 +21,8 @@ pub(crate) use aterm_secrets::alab_join::JOINING as JOINING_ALAB;
 /// One line of the page's list (§4.2): presentation only, each governing its settings' bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Line {
-    /// Caps Lock, scrolling, trackpad, Desktop, Widgets and Dock (the ALab profile).
+    /// Caps Lock, scrolling, trackpad, Desktop, Widgets and Dock (the ALab profile), and last
+    /// Spotlight indexing, which no switch governs (FL-188).
     Mac,
     /// aterm's macOS grants.
     Permissions,
@@ -101,9 +102,10 @@ impl Line {
     }
 
     /// The line a row sits on: a grant on Permissions (Accessibility, which the sign-outs need,
-    /// among them), a Sync row on Secrets & identity.
+    /// among them), Spotlight indexing on Mac settings, a Sync row on Secrets & identity.
     pub(crate) const fn of(subject: Subject) -> Self {
         match subject {
+            Subject::Access(Access::SpotlightScope) => Self::Mac,
             Subject::Access(_) => Self::Permissions,
             Subject::Sync(_) => Self::Secrets,
             Subject::Setting(setting) => match setting {
@@ -194,6 +196,9 @@ impl Mark {
 /// which would claim work nobody has found yet.
 pub(crate) const CHECKING_WORD: &str = "checking";
 
+/// The line has unread rows and their current observation has ended.
+const UNREAD_WORD: &str = "unread";
+
 /// One line as the page draws it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LineView {
@@ -266,9 +271,17 @@ fn line_layout_phrases(
     members: &[&RowView],
     state: &LineState,
     partly: bool,
+    held: bool,
 ) -> Vec<String> {
     let mut phrases = vec![phrase_with_state(state.word, &state.phrase)];
-    let problem = matches!(state.mark, Mark::Failed | Mark::NeedsYou | Mark::Waiting);
+    if state.word == UNREAD_WORD {
+        phrases.push(phrase_with_state(CHECKING_WORD, &state.phrase));
+        return phrases;
+    }
+    // A row whose card item a read keeps only as history ([`CardItem::retained`]) needed the
+    // person a moment ago and will again once the read lands: the line keeps the room it took
+    // then, so it does not move while the read runs.
+    let problem = held || matches!(state.mark, Mark::Failed | Mark::NeedsYou | Mark::Waiting);
     if !problem && !matches!(state.word, "done" | "as last read" | "not joined") {
         return phrases;
     }
@@ -313,7 +326,11 @@ fn line_layout_phrases(
 fn change_words(row: &RowView) -> String {
     let name = row.subject.name();
     match &row.value {
-        RowValue::Change { now, wanted } => format!("{name}: {now} → {wanted}"),
+        // Spotlight indexing's wanted value is a sentence (the scope it keeps): its row says the
+        // change, and the line names the row, so the line's phrase keeps its one line.
+        RowValue::Change { now, wanted } if governed(row.subject) => {
+            format!("{name}: {now} → {wanted}")
+        }
         _ => name.to_owned(),
     }
 }
@@ -420,6 +437,16 @@ pub(crate) struct CardItem {
 }
 
 impl CardItem {
+    /// Whether it holds `subject`'s row: the row it stands for, or one of the password steps it
+    /// finishes together.
+    fn holds(&self, subject: Subject) -> bool {
+        self.subject == Some(subject)
+            || self
+                .password_steps
+                .iter()
+                .any(|step| step.subject == subject)
+    }
+
     fn new(id: impl Into<String>, mark: Mark, title: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -860,11 +887,13 @@ pub(crate) fn line_view(
     let bits = line.settings();
     let set = bits.iter().filter(|bit| selection.contains(**bit)).count();
     let on = app.plan_known && set > 0;
-    let members: Vec<&RowView> = rows
+    // A row no switch governs comes last, after those the line's switch sets.
+    let mut members: Vec<&RowView> = rows
         .iter()
         .filter(|row| Line::of(row.subject) == line)
         .collect();
-    let in_card = |row: &RowView| card.iter().any(|item| item.subject == Some(row.subject));
+    members.sort_by_key(|row| !governed(row.subject));
+    let in_card = |row: &RowView| card.iter().any(|item| item.holds(row.subject));
     // A row the card asks about stays in its list with its mark and value, so a list never reads
     // as all done while one of its rows needs the person. The card holds its words and buttons.
     let shown: Vec<RowView> = members
@@ -882,7 +911,11 @@ pub(crate) fn line_view(
     let plan = app.reviewed_plan();
     let steps = Steps::of(status, rows, Some(&plan));
     let state = line_state(app, line, &members, card, on, set < bits.len(), &steps);
-    let layout_phrases = line_layout_phrases(line, &members, &state, set < bits.len());
+    let held = members.iter().any(|row| {
+        card.iter()
+            .any(|item| item.retained && item.holds(row.subject))
+    });
+    let layout_phrases = line_layout_phrases(line, &members, &state, set < bits.len(), held);
     // The state is said once: where the phrase says it already ("Waiting for the vault…"), the
     // label is the line's name and its phrase.
     let said = spoken(&state.phrase);
@@ -904,10 +937,17 @@ pub(crate) fn line_view(
         phrase: state.phrase,
         layout_phrases,
         quiet: state.quiet,
-        // An Off line shows no rows (§4.3); a newer aterm's rows read as they stand.
+        // An Off line shows no rows its switch governs (§4.3), only a reading no switch governs
+        // (Spotlight indexing), once the plan is known; a newer aterm's rows read as they stand.
         rows: if on || status.newer() {
             shown
+        } else if app.plan_known {
+            shown
+                .into_iter()
+                .filter(|row| !governed(row.subject))
+                .collect()
         } else {
+            // Before the plan in force is known every line shows its scope alone, no rows.
             Vec::new()
         },
         other_vault: line == Line::Secrets
@@ -1012,6 +1052,19 @@ fn line_state(
         if out_of_scope(app, line, on) {
             return LineState::new(Mark::Off, LEAVES_ACCOUNTS).quiet();
         }
+        // A row no switch governs that the card holds still needs the person: an Off line
+        // never reads calm over it.
+        if let Some(first) = members.iter().find(|row| {
+            !governed(row.subject)
+                && card
+                    .iter()
+                    .any(|item| !item.retained && item.holds(row.subject))
+        }) {
+            return LineState::new(
+                Mark::NeedsYou,
+                format!("Needs you: {}", first.subject.name()),
+            );
+        }
         return LineState::new(Mark::Off, LEFT_AS_IS).quiet();
     }
     let managed: Vec<&RowView> = members.iter().copied().filter(|row| row.managed).collect();
@@ -1026,18 +1079,19 @@ fn line_state(
         .copied()
         .filter(|row| {
             card.iter()
-                .any(|item| !item.retained && item.subject == Some(row.subject))
+                .any(|item| !item.retained && item.holds(row.subject))
         })
         .collect();
     if let Some(first) = carded.first() {
-        if card.iter().any(|item| {
-            !item.retained && item.subject == Some(first.subject) && item.mark == Mark::Waiting
-        }) {
+        if card
+            .iter()
+            .any(|item| !item.retained && item.holds(first.subject) && item.mark == Mark::Waiting)
+        {
             return with_lead(LineState::new(Mark::Waiting, waiting_for(first)));
         }
-        let failed = card.iter().any(|item| {
-            !item.retained && item.subject == Some(first.subject) && item.mark == Mark::Failed
-        });
+        let failed = card
+            .iter()
+            .any(|item| !item.retained && item.holds(first.subject) && item.mark == Mark::Failed);
         if failed {
             return with_lead(LineState::new(Mark::Failed, "Failed"));
         }
@@ -1053,9 +1107,11 @@ fn line_state(
     let has_history = managed
         .iter()
         .any(|row| matches!(row.value, RowValue::LastKnown(_)));
+    let ended_unread = !has_history && group_read_ended_unread(app, &managed);
     // Nothing of it read yet: its scope, calm, and the headline says Checking once.
     // Past readings instead keep their own explicitly historical group presentation below.
-    if !has_history && !managed.is_empty() && managed.iter().all(|row| unread(row)) {
+    if !has_history && !ended_unread && !managed.is_empty() && managed.iter().all(|row| unread(row))
+    {
         return LineState::checking(line);
     }
     // The Secrets line's own words (§4.3): looking, joining, joined, or no vault here.
@@ -1067,7 +1123,7 @@ fn line_state(
         if app.phrase_asked() {
             return with_lead(LineState::new(Mark::Working, JOINING_ALAB));
         }
-        if unread(vault) && !has_history {
+        if unread(vault) && !has_history && !ended_unread {
             let running = status.running.contains(&Setting::Secrets);
             let state = if running {
                 LineState::new(Mark::Working, "Looking for your other Macs…")
@@ -1148,6 +1204,13 @@ fn line_state(
             waiting_for(first)
         };
         return with_lead(LineState::new(Mark::Waiting, why));
+    }
+    if ended_unread {
+        return with_lead(
+            LineState::new(Mark::Pending, line.scope())
+                .word(UNREAD_WORD)
+                .quiet(),
+        );
     }
     if has_history && !managed.iter().any(|row| blocks_history(row)) {
         let observing = managed
@@ -1243,6 +1306,21 @@ fn line_state(
         return with_lead(LineState::new(Mark::Done, "Nothing to set up here"));
     }
     with_lead(LineState::new(Mark::Done, now_words(line, &managed, false)))
+}
+
+/// Every unresolved row in this line has unread evidence and no new read is under way.
+fn group_read_ended_unread(app: &SystemStateApp, managed: &[&RowView]) -> bool {
+    let status = &app.status;
+    let source = Some(app.url.value().trim());
+    !(status.busy && status.operation == Some(SetupOperation::Check))
+        && managed
+            .iter()
+            .any(|row| row.standing == Some(Standing::Unknown))
+        && managed.iter().all(|row| {
+            (row.settled() || super::unread_reading(status, row, source).is_some())
+                && status.observation_progress(row.subject, source).is_none()
+                && !status.running.contains(&row.subject.setting())
+        })
 }
 
 /// A managed row nothing has read yet.
@@ -1549,6 +1627,11 @@ fn phase_words(app: &SystemStateApp, hero: &Hero, card: &[CardItem]) -> String {
 fn hero_words(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero {
     let status = &app.status;
     let detail: Headline = app.headline();
+    // The hero counts and waits on the rows the headline reads ([`super::plan_rows`]): a reading
+    // no switch governs that the plan leaves (Spotlight indexing with Permissions off, calm) is
+    // neither a step done nor one waited on.
+    let rows = super::plan_rows(rows, app.reviewed_plan().selection);
+    let rows = &*rows;
     let (done, total) = progress(app, rows, card);
     let counts = if total > 0 {
         progress_words(done, total)

@@ -96,6 +96,7 @@ impl Direct {
             Arc::new(Shared::new(
                 Admission::SameUid,
                 crate::bonjour::system(),
+                crate::store::Store::Unserved,
                 self.log,
             ))
         })

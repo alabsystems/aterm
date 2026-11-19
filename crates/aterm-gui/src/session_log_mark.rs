@@ -979,6 +979,48 @@ impl SessionLog {
         self.log.mark(mark, at).ok()
     }
 
+    /// THE RECORD STREAM'S STEP ARM, [`Self::stream_mark`]'s sibling for a kind that is a step
+    /// and no mark: open a step of `kind` under `parent`, stamped with the same four
+    /// (`holder=`, `src=harness`, `conf=claim`, `by=`). A holder that is no ID opens nothing.
+    pub(crate) fn stream_step_open(
+        &mut self,
+        kind: Kind,
+        parent: Option<Node>,
+        fields: Fields,
+        holder: &str,
+        by: Actor,
+        at: Stamp,
+    ) -> Option<Node> {
+        let fields = fields.id(Key::Holder, holder).ok()?;
+        let mut open = aterm_slog::Open::new(kind, Src::Harness, aterm_slog::Conf::Claim)
+            .by(by)
+            .fields(fields);
+        if let Some(parent) = parent.filter(|parent| self.log.is_open(*parent)) {
+            open = open.under(parent);
+        }
+        self.log.open(open, at).ok()
+    }
+
+    /// Close the step [`Self::stream_step_open`] opened, as done, under the same stamp.
+    pub(crate) fn stream_step_close(
+        &mut self,
+        node: Node,
+        fields: Fields,
+        holder: &str,
+        by: Actor,
+        at: Stamp,
+    ) -> Option<u64> {
+        let fields = fields.id(Key::Holder, holder).ok()?;
+        let close = aterm_slog::Close::new(
+            aterm_slog::Out::Step(aterm_slog::StepOut::Ok),
+            Src::Harness,
+            aterm_slog::Conf::Claim,
+        )
+        .by(by)
+        .fields(fields);
+        self.log.close(node, close, at).ok()
+    }
+
     /// WRITE A CLAIM (design §7.4): `req` by `by` (the connection's actor),
     /// `re` already checked. A `desc` is written by [`Self::claim_desc`].
     pub(crate) fn mark_claim(
@@ -1170,6 +1212,82 @@ impl SessionLog {
         at: Stamp,
     ) -> Option<u64> {
         self.consumers.limiter.peek(&by, at.mono_ms).ok()?;
+        let f = Self::self_claim_act_fields(act, Some(holder))?;
+        let mut mark = Mark::new(Kind::Act, Src::Mark, aterm_slog::Conf::Claim)
+            .by(by)
+            .fields(f);
+        if let Some(node) = self.self_claim_act_node() {
+            mark = mark.at(node);
+        }
+        let seq = self.log.mark(mark, at).ok()?;
+        self.consumers.limiter.spend(&by, at.mono_ms);
+        Some(seq)
+    }
+
+    /// THE STREAM'S ARM OF THE SHARED ACT PATH (D10): the act of record `hseq` a claim's stream
+    /// applied, by its rule `act`, written as [`Self::self_claim_act`] writes `meta set
+    /// harness_act <act>` (the same `word=`, `rule=` and `harness_act=`, placed where that act
+    /// would land) but through [`Self::stream_mark`]: `src=harness conf=claim`, `holder=`,
+    /// `by=`, `hseq=<seq>`, and no read or spend of the mark limiter, so a burst within the
+    /// stream's own budget is all written.
+    #[cfg(unix)]
+    pub(crate) fn stream_self_claim_act(
+        &mut self,
+        act: &str,
+        holder: &str,
+        by: Actor,
+        hseq: u64,
+        at: Stamp,
+    ) -> Option<u64> {
+        let f = Self::self_claim_act_fields(act, None)?
+            .u(Key::Hseq, hseq)
+            .ok()?;
+        let node = self.self_claim_act_node();
+        self.stream_mark(Kind::Act, node, f, holder, by, at)
+    }
+
+    /// A `need` (`clear` false) or `clear` RECORD's mark, through [`Self::stream_mark`] on the
+    /// session: `mark - need word=<review|decision|help> text=<its entry> hseq=` raises the
+    /// need, and `mark - clear word=<that need's word> hseq=` lifts the harness's needs of that
+    /// word (the fold's clear rule: a `src=harness` clear lifts only what its stream raised).
+    #[cfg(unix)]
+    pub(crate) fn stream_need(
+        &mut self,
+        clear: bool,
+        word: &str,
+        entry: Option<&str>,
+        stamp: &crate::session_timeline::StreamStamp,
+        at: Stamp,
+    ) -> Option<u64> {
+        let f = Fields::new().word(Key::Word, word).ok()?;
+        let f = match entry.and_then(|text| aterm_slog::BoundedText::new(Key::Text, text)) {
+            Some(text) => f.with(Key::Text, aterm_slog::Val::Text(text)).ok()?,
+            None => f,
+        };
+        let f = f.u(Key::Hseq, stamp.hseq).ok()?;
+        let kind = if clear { Kind::Clear } else { Kind::Need };
+        self.stream_mark(kind, Some(Node::SESSION), f, &stamp.holder, stamp.by, at)
+    }
+
+    /// THE CLEAR A STREAM OWED for the need of `word` it raised, once its claim no longer feeds
+    /// `need` ([`crate::session_timeline::SessionTimeline::settle_stream_claim`]): `mark - clear
+    /// word=<word> holder=<who raised it>` through [`Self::stream_mark`], by the session `by`
+    /// that raised it and with no `hseq=` (no record sent it). The fold's clear rule lets only a
+    /// `src=harness` clear by that session lift a need the stream raised.
+    pub(crate) fn stream_lift_need(
+        &mut self,
+        word: &str,
+        holder: &str,
+        by: Actor,
+        at: Stamp,
+    ) -> Option<u64> {
+        let f = Fields::new().word(Key::Word, word).ok()?;
+        self.stream_mark(Kind::Clear, Some(Node::SESSION), f, holder, by, at)
+    }
+
+    /// A self-claim's act's fields: `word=<w>` ([`aterm_agent::harness::acts::self_claim_act`]),
+    /// `rule=<r>` where that names one, `holder=<h>` where given, and `harness_act=<act>`.
+    fn self_claim_act_fields(act: &str, holder: Option<&str>) -> Option<Fields> {
         let worded = aterm_agent::harness::acts::self_claim_act(act);
         let word = worded.as_ref().map_or("unknown", |(w, _)| *w);
         let f = Fields::new().word(Key::Word, word).ok()?;
@@ -1177,20 +1295,18 @@ impl SessionLog {
             Some((_, rule)) => f.clone().id(Key::Rule, rule).unwrap_or(f),
             None => f,
         };
-        let f = f.clone().id(Key::Holder, holder).unwrap_or(f);
-        let f = f.clone().text(Key::HarnessAct, act).unwrap_or(f);
-        let mut mark = Mark::new(Kind::Act, Src::Mark, aterm_slog::Conf::Claim)
-            .by(by)
-            .fields(f);
-        if let Some(node) = self
-            .codex_claim_step()
+        let f = match holder {
+            Some(holder) => f.clone().id(Key::Holder, holder).unwrap_or(f),
+            None => f,
+        };
+        Some(f.clone().text(Key::HarnessAct, act).unwrap_or(f))
+    }
+
+    /// Where a self-claim's act lands: beside a codex run's claimed box step while one stands
+    /// ([`Self::act_place_beside`]), else wherever the log places a node-less mark (`None`).
+    fn self_claim_act_node(&self) -> Option<Node> {
+        self.codex_claim_step()
             .and_then(|c| self.act_place_beside(c))
-        {
-            mark = mark.at(node);
-        }
-        let seq = self.log.mark(mark, at).ok()?;
-        self.consumers.limiter.spend(&by, at.mono_ms);
-        Some(seq)
     }
 
     /// Where [`aterm_slog::Log::mark`] places a node-less act with the open

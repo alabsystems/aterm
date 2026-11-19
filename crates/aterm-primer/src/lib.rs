@@ -33,6 +33,12 @@ macro_rules! land_check_answer {
 /// [`land_check_answer`]'s words.
 pub const LAND_CHECK_ANSWER: &str = land_check_answer!();
 
+/// Edition written in the private resident context marker and used in a reading's method.
+pub const RESIDENT_BRIEF_VERSION: u32 = 1;
+
+/// Standing instructions installed only in the booked resident's working directory.
+pub const RESIDENT_BRIEF: &str = include_str!("../assets/resident-brief.md");
+
 const PRIMER_BODY: &str = concat!(
     "\
 ## aterm
@@ -180,6 +186,8 @@ const SYSTEM_STATE_SKILL_BODY: &str = include_str!("../assets/system-state-skill
 
 const AMACS_SKILL_BODY: &str = include_str!("../assets/open-in-amacs-skill.md");
 
+const RESIDENT_SKILL_BODY: &str = include_str!("../assets/resident-skill.md");
+
 /// The fabric skill every agent with a skills folder gets, Codex's sandbox note included: one
 /// body, because a skills folder two agents share (`~/.codex/skills` linked to
 /// `~/.claude/skills`) holds one file that each row must read as current.
@@ -237,6 +245,10 @@ fn skills_for(agent: &str) -> &'static [SkillFile] {
             SkillFile {
                 path: ".claude/skills/open-in-amacs/SKILL.md",
                 body: AMACS_SKILL_BODY,
+            },
+            SkillFile {
+                path: ".claude/skills/aterm-resident/SKILL.md",
+                body: RESIDENT_SKILL_BODY,
             },
         ],
         // Codex reads a user's skills as `<root>/<name>/SKILL.md` under `$CODEX_HOME/skills` and
@@ -2324,7 +2336,7 @@ fn status_line_with(home: &Path, roots: &Roots) -> String {
 
 fn usage() -> String {
     let mut s = String::from(
-        "usage: aterm agents [status | install [<agent>…] | remove [<agent>…] | primer [<agent>]]\n\
+        "usage: aterm agents [status | install [<agent>…] | remove [<agent>…] | primer [<agent>] | prepare-resident]\n\
          \n\
          Manage the aterm primer block and bundled skills in coding agents' global\n\
          config directories. An aterm window (not `--headless`, not a dev bundle) also\n\
@@ -2342,6 +2354,8 @@ fn usage() -> String {
          \x20           Codex's custom prompt)\n\
          \x20 primer    print the block (`primer claude` adds Claude Code's wait and rm\n\
          \x20           notes, `primer codex` its sandbox and wait notes)\n\
+         \x20 prepare-resident  prepare the resident's private working directory and\n\
+         \x20                   standing brief, then print the directory (Unix only)\n\
          \n\
          agents:\n",
     );

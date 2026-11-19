@@ -629,6 +629,9 @@ impl SessionLog {
                     self.transcript_event(source, TxEvent::EndWall { kind }, pos, state, now);
                 }
             }
+            // The claim's stream feeds `compact`: its record is the step, and the transcript's
+            // row of the same compaction writes none.
+            StepEvent::Compact if self.stream_down.compact => {}
             StepEvent::Compact => self.transcript_event(source, TxEvent::Compact, pos, state, now),
             StepEvent::Model { model, effort, ver } => {
                 let ev = TxEvent::Model {

@@ -186,6 +186,9 @@ impl System for Spawns<'_> {
     fn remove(&self, path: &Path) -> io::Result<()> {
         self.live.remove(path)
     }
+    fn hold_record(&self, record: &Path) -> io::Result<aterm_types::clt_mark::Held> {
+        self.live.hold_record(record)
+    }
     fn create_dir_all(&self, path: &Path, mode: u32) -> io::Result<()> {
         self.live.create_dir_all(path, mode)
     }

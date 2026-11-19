@@ -7948,8 +7948,10 @@ impl App {
             | AppKind::Recovery
             | AppKind::Allocation
             | AppKind::Workers
+            | AppKind::Registry
             | AppKind::Tables
-            | AppKind::Navigator => Err("requested app is not a document app".to_string()),
+            | AppKind::Navigator
+            | AppKind::SystemResources => Err("requested app is not a document app".to_string()),
         }
     }
 

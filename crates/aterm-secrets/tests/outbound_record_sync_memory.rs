@@ -192,7 +192,7 @@ fn serve(stream: &mut TcpStream, state: &Mutex<HostState>) -> io::Result<()> {
         .ok_or_else(|| invalid("missing upload length"))?
         .parse()
         .map_err(|_| invalid("invalid upload length"))?;
-    if length > aterm_secrets::membership_log::MAX_RECORDS_STREAM {
+    if length > aterm_secrets::membership_log::REPLY_CAP {
         return Err(invalid("upload exceeded the record stream bound"));
     }
     let expected = Arc::clone(&state.lock().unwrap().expected);

@@ -1037,13 +1037,24 @@ fn exchange_stream(
     for unit in units {
         let offer = match unit {
             Unit::Members => {
-                let local = stores.members_inventory()?;
+                // A Mac whose records ride no members lane (they are past format 1,
+                // [`Stores::members_lane`]) sends no snapshot, as of a table it does not take:
+                // neither side then offers the other a membership record. A snapshot of the
+                // empty log it reads would have a format-1 neighbour offer it every record it
+                // holds, at each round, each refused (ATERM-KI-1116-1471).
+                let local = if stores.members_lane()? {
+                    Some(stores.members_inventory()?)
+                } else {
+                    None
+                };
                 let remote = reconcile(
                     stream,
                     initiator,
-                    Some(aterm_db::replica::Snapshot::new(local.clone())),
+                    local
+                        .as_ref()
+                        .map(|local| aterm_db::replica::Snapshot::new(local.clone())),
                 )?;
-                Offer::Members(lacking(Some(&local), remote.as_ref()))
+                Offer::Members(lacking(local.as_ref(), remote.as_ref()))
             }
             Unit::Proofs(table) => {
                 // A proof the neighbour holds the fork proof of is not sent (Commons repair's

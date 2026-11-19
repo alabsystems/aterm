@@ -45,11 +45,15 @@ pub use signin_queue::{
 
 #[path = "accounts_auth_scope.rs"]
 mod auth_scope;
+
+#[path = "accounts_login_ledger.rs"]
+mod login_ledger;
 pub(super) use auth_scope::note_auth_for_observed_row;
 pub(super) use auth_scope::note_served_login_for_observed_row;
 pub use auth_scope::{
     LifetimeScope, ManagedContexts, ManagedScope, note_auth_in_context, note_auth_on_default,
 };
+pub use login_ledger::{Login, LoginLedger, LoginObs, Said, Verdict, WallSighting};
 
 #[path = "accounts_workflow_scope.rs"]
 mod workflow_scope;
@@ -165,7 +169,8 @@ mod live_sessions;
 pub(super) use directory::canonical_directory;
 pub(super) use directory::retained_directory_owner_at;
 pub(super) use directory::{
-    lists_directory, naming_row, retained_directory_owner, shared_staging_retained,
+    left_directory, lists_directory, naming_row, retained_directory_owner, rows_at,
+    shared_staging_retained,
 };
 pub use live_sessions::{
     LiveSessions, Liveness, OverReads, Owner, SESSION_KEEP_S, SESSION_OVER_GRACE_S,
@@ -2200,6 +2205,7 @@ impl ProcessLogin {
                 .map(|row| row.label.as_str()),
             default_home: self.default_home,
             route: self.route.for_account(row.and_then(TokenEntry::of_row)),
+            model: ModelWeek::Unread,
         }
     }
 }
@@ -2336,12 +2342,14 @@ pub fn observed_me<'a>(
             left: None,
             default_home: me.default_home,
             route: who.route.for_account(TokenEntry::of_row(row)),
+            model: me.model,
         },
         Reconciled::Unlisted(_) => Me {
             account: None,
             left: None,
             default_home: me.default_home,
             route: who.route.for_account(None),
+            model: me.model,
         },
         Reconciled::Agrees(_) | Reconciled::Other(_) | Reconciled::Unread(_) => me,
     }
@@ -3268,7 +3276,8 @@ pub struct Binding {
     pub sign_in_task: Option<SignInTask>,
     /// How the row's last sign-in ended and the routes it tried ([`note_sign_in_attempt`],
     /// [`note_hand_sign_in_attempt`]); a failed one is cleared by a new login, a renewal's
-    /// ([`note_renewed`]) or one signed back in where it stands ([`note_signed_back`]).
+    /// ([`note_renewed`]), a checked sign-in ([`note_checked_sign_in`]) or served evidence that
+    /// turns a strike's verdict ([`observe_served`]).
     pub sign_in_attempt: Option<SignInAttempt>,
     /// A bot protection that stopped a sign-in of the row's account on this Mac
     /// ([`note_check_stop`]), kept apart from [`Self::sign_in_attempt`] and from the row's
@@ -4510,6 +4519,22 @@ pub fn login_ended_at(row: &Row, logins: &Logins, state: &State) -> Option<i64> 
     auth_scope::lifetime_ended(row, logins)
 }
 
+/// The end a sign-out of `row`'s login is told by (the journal's `ended`, the account card's
+/// time): its login's end ([`login_ended_at`]) where no evidence the login served is newer
+/// ([`LoginLedger::served_at`]). A login that served after a wall did not end at it, so a later
+/// sign-out a check found is told as a sign-out at its own time, never as an end at that wall,
+/// while the end stays on record as the evidence it was. A strike decides its own second, so an
+/// end in the second the login served stands.
+#[must_use]
+pub fn sign_out_ended_at(row: &Row, logins: &Logins, state: &State) -> Option<i64> {
+    let ended = login_ended_at(row, logins, state)?;
+    let served = state
+        .accounts
+        .get(&row.label)
+        .and_then(|account| account.login.served_at());
+    served.is_none_or(|served| served <= ended).then_some(ended)
+}
+
 /// Whether `row`'s own credential file here shows its login lapsed ([`State::lapsed_logins`],
 /// which `Store::hydrate_auth_contexts` fills from [`crate::ai::connector::stored_login_lapsed`]):
 /// read from that file alone, never from a process, the network, a browser or the keychain. A
@@ -4523,18 +4548,20 @@ pub fn lapsed_here(row: &Row, state: &State) -> bool {
 /// THE ONE RULE for whether `row`'s login is signed out on this machine, which [`condition`]
 /// reads as [`Condition::SignedOut`] (for a row enrolled here) and [`login_state`] as
 /// [`LoginState::Expired`]: its own credential file here shows it lapsed ([`lapsed_here`]), or
-/// its login's last word on record is [`Auth::SignedOut`] (one word for a wall a session or a
-/// read met, [`strike`] and [`note_login_end`], a displacement by the vendor's own sign-in,
-/// [`note_displaced`], and a check that found no login). A keychain-held default login is never
-/// lapsed here (its store names no file for it, [`Store::default_login_home`]), so it reads by
-/// its record alone.
+/// its login verdict is [`Login::Struck`] ([`Account::login_verdict`]): the newest reading of its
+/// login is a strike (a wall a session or a read met, [`note_login_end`], dated by its first
+/// sighting) or a check that found it signed out ([`strike`], a displacement by the vendor's own
+/// sign-in, [`note_displaced`], a check that found no login), and no turn or reading it served is
+/// newer ([`observe_served`]). A keychain-held default login is never lapsed here (its store
+/// names no file for it, [`Store::default_login_home`]), so it reads by its evidence alone.
 #[must_use]
 pub fn signed_out_here(row: &Row, state: &State) -> bool {
     lapsed_here(row, state)
-        || state
-            .accounts
-            .get(&row.label)
-            .is_some_and(|account| account.current_auth(row) == Auth::SignedOut)
+        || state.accounts.get(&row.label).is_some_and(|account| {
+            account
+                .login_verdict(row)
+                .is_some_and(|verdict| verdict.login == Login::Struck)
+        })
 }
 
 /// How long the upkeep's reading of the rows on their vault token here ([`TokensHere`]) stands:
@@ -4639,6 +4666,232 @@ fn keep_tokens_here(dir: &Path, kept: Option<&TokensHere>) -> io::Result<bool> {
 #[cfg(not(unix))]
 fn keep_tokens_here(_dir: &Path, _kept: Option<&TokensHere>) -> io::Result<bool> {
     Ok(false)
+}
+
+/// RUNTIME-ONLY: what this Mac's rotation and sign-in read of the fleet's shared files
+/// (docs/DESIGN-shared-files-2026-11-11.md §10, "How rotation reads them" and "How sign-in reads
+/// them"; tracker package SF-09), by account key (`ac-<16hex>`, [`Account::pk`]), times in Unix
+/// seconds. It is a reading of local snapshots ([`aterm_db::file::Rotation`]), not an
+/// observation: no transaction saves it, no snapshot publishes it, and [`Store::hydrate_lapsed`]
+/// reads it only for this account's live store ([`Store::fleet`]). Every part is advisory and is
+/// judged against this Mac's clock where it is read: a peer's wall demotes an account and never
+/// excludes it ([`peer_wall`], [`Rank::peer_walled`]: a wall of the whole account for every
+/// session, a model's own weekly wall for that model's sessions alone), a link orders a pool and
+/// never limits one ([`link_rank`], [`Rank::link`]), and a blocked sign-in holds only for
+/// [`FLEET_BLOCK_S`] ([`fleet_blocked`]). [`Fleet::default`] is no snapshot: rotation and
+/// sign-in run on this Mac's own facts, as they did before the files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fleet {
+    /// This Mac's own `ai/links` rank of each account it prefers, smaller first.
+    pub rank: BTreeMap<String, u64>,
+    /// Each account's latest end of a wall of its own any Mac read (`ai/limits`'s `wall`), a
+    /// sub-account's for its account. A wall that states no end is not here, nor a model's own
+    /// weekly wall.
+    pub walls: BTreeMap<String, i64>,
+    /// Each account's latest end of each model's own weekly wall any Mac read (`ai/limits`'s
+    /// `model_walls`), by the model's bucket ([`MODEL_BUCKETS`], or `seven_day_other` for a week
+    /// of a model this build names no bucket of, which walls every session, [`peer_wall`]), a
+    /// sub-account's for its account (FL-269). A wall that states no end is not here.
+    pub model_walls: BTreeMap<String, BTreeMap<String, i64>>,
+    /// Each account's newest sign-in that any Mac's `ai/logins` row says was blocked, this Mac's
+    /// included.
+    pub blocked: BTreeMap<String, i64>,
+}
+
+#[cfg(unix)]
+impl Fleet {
+    /// The facts of `read`, its Unix milliseconds as seconds.
+    #[must_use]
+    pub fn of(read: &aterm_db::file::Rotation) -> Fleet {
+        let seconds = |times: &BTreeMap<String, u64>| {
+            times
+                .iter()
+                .map(|(pk, ms)| (pk.clone(), i64::try_from(ms / 1000).unwrap_or(i64::MAX)))
+                .collect()
+        };
+        Fleet {
+            rank: read.rank.clone(),
+            walls: seconds(&read.walls),
+            model_walls: read
+                .model_walls
+                .iter()
+                .map(|(pk, by_bucket)| (pk.clone(), seconds(by_bucket)))
+                .collect(),
+            blocked: seconds(&read.blocked),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The fleet a test's stores read in place of the live one ([`with_fleet`]).
+    static TEST_FLEET: std::cell::RefCell<Option<Fleet>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `fleet` as what every store this thread hydrates reads of the shared files
+/// ([`Store::fleet`]), whatever store it is; restored when `f` returns or unwinds.
+#[cfg(test)]
+pub(in crate::harness) fn with_fleet<T>(fleet: Fleet, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Fleet>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_FLEET.with(|cell| *cell.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(TEST_FLEET.with(|cell| cell.replace(Some(fleet))));
+    f()
+}
+
+/// The shared files `store` reads on Unix: this account's live ones where `store` is a store of
+/// this account's live harness state (`<aterm state>/harness/claude-harness`,
+/// [`super::cli::harness_state_in`]) in a process under no private state root (a test binary, a
+/// lab instance, `ATERM_STATE_HOME`), as `machine_name::registry` reads the registry only for the
+/// live naming state; no snapshot for any other store.
+#[cfg(unix)]
+fn live_fleet(store: &Store) -> Fleet {
+    if aterm_types::dirs::runs_under_private_state_root() {
+        return Fleet::default();
+    }
+    let Some(state) = aterm_types::dirs::state_dir() else {
+        return Fleet::default();
+    };
+    if store.dir.parent() != Some(super::cli::harness_state_in(&state).as_path()) {
+        return Fleet::default();
+    }
+    aterm_secrets::client::Paths::live().map_or_else(
+        |_| Fleet::default(),
+        |paths| Fleet::of(&aterm_db::file::rotation(&paths)),
+    )
+}
+
+/// Off Unix no shared file is read: no snapshot.
+#[cfg(not(unix))]
+fn live_fleet(_store: &Store) -> Fleet {
+    Fleet::default()
+}
+
+/// The account key `state` learned for `label`'s row ([`Account::pk`]); a row with none gets no
+/// fleet facts.
+fn fleet_key<'a>(state: &'a State, label: &str) -> Option<&'a str> {
+    state.accounts.get(label)?.pk.as_deref()
+}
+
+/// THE ONE RULE for a peer's wall: until when a wall another Mac read (or this one, in
+/// `ai/limits`) stands on `label`'s account for a session of `week` ([`State::fleet`]), while
+/// that end is after `now`: the account's own wall ([`Fleet::walls`]) for every session, and a
+/// model's own weekly wall ([`Fleet::model_walls`]) as [`ModelWeek::demotes`] judges this Mac's
+/// own (FL-269): the session's model's for a read model, any model's while its model is unread,
+/// none for a model of no week of its own; and a wall of a week whose model this build names no
+/// bucket of (none of [`MODEL_BUCKETS`]: `seven_day_other`) for every session, as
+/// [`Account::limited_until`] takes this Mac's own such wall as the account's; the latest end of
+/// those standing. It demotes the account in rotation ([`Rank::peer_walled`]) and excludes
+/// nothing: [`condition`] and every wait read this Mac's own walls alone, and this Mac's own
+/// reading of the account moves the session off it. It compares through `now`
+/// ([`trace::Now::before`]), so a traced run that found a wall standing stands until the wall's
+/// end, and one that found it over stands from then on.
+#[must_use]
+pub fn peer_wall(
+    state: &State,
+    week: ModelWeek,
+    label: &str,
+    now: impl Into<trace::Now>,
+) -> Option<i64> {
+    let now: trace::Now = now.into();
+    let key = fleet_key(state, label)?;
+    let own = state.fleet.walls.get(key).copied();
+    let walls_session = |bucket: &str| match week {
+        ModelWeek::Unread => true,
+        _ if model_week(bucket).is_none() => true,
+        ModelWeek::Bucketless => false,
+        ModelWeek::Of(of) | ModelWeek::FallsBack(of) => of.id() == bucket,
+    };
+    let of_model = state
+        .fleet
+        .model_walls
+        .get(key)
+        .into_iter()
+        .flatten()
+        .filter(|(bucket, _)| walls_session(bucket))
+        .map(|(_, until)| *until)
+        // The latest of them: where it has passed, every one has.
+        .max();
+    [own, of_model]
+        .into_iter()
+        .flatten()
+        .filter(|until| now.before(*until))
+        .max()
+}
+
+/// This Mac's own `ai/links` rank of `label`'s account ([`State::fleet`]), smaller first.
+#[must_use]
+pub fn link_rank(state: &State, label: &str) -> Option<u64> {
+    state.fleet.rank.get(fleet_key(state, label)?).copied()
+}
+
+/// How long a sign-in any Mac recorded `blocked` in `ai/logins` holds the account's browser
+/// routes on this Mac: 24 hours, either side of the attempt's time ([`FleetHold::of`]).
+pub const FLEET_BLOCK_S: i64 = 86_400;
+
+/// A blocked sign-in of an account that holds this Mac's browser routes for it: its time and when
+/// the hold lapses (Unix seconds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FleetHold {
+    /// When the blocked attempt was, by its own Mac's clock.
+    pub at: i64,
+    /// When the hold lapses: [`FLEET_BLOCK_S`] after `at`.
+    pub until: i64,
+}
+
+impl FleetHold {
+    /// The hold a sign-in blocked at `at` sets at `now`: one while `now` is less than
+    /// [`FLEET_BLOCK_S`] from `at` either way. `at` is the attempt's own Mac's clock, so a row
+    /// dated more than that ahead of this Mac's clock is a clock fault and holds nothing, and the
+    /// hold stays bounded whichever clock is off. It compares through `now`
+    /// ([`trace::Now::within`]): a traced run that found the hold standing stands until the
+    /// hold's end, and one that found none stands until the first second that would hold.
+    #[must_use]
+    pub fn of(at: i64, now: impl Into<trace::Now>) -> Option<FleetHold> {
+        // `|now - at| < FLEET_BLOCK_S`: `at - FLEET_BLOCK_S < now < at + FLEET_BLOCK_S`.
+        now.into()
+            .within(at.saturating_sub(FLEET_BLOCK_S - 1), 2 * FLEET_BLOCK_S - 1)
+            .then(|| FleetHold {
+                at,
+                until: at.saturating_add(FLEET_BLOCK_S),
+            })
+    }
+}
+
+/// The hold a blocked sign-in of `label`'s account sets on this Mac's browser routes at `now`
+/// ([`State::fleet`], [`FleetHold::of`]).
+#[must_use]
+pub fn fleet_blocked(state: &State, label: &str, now: impl Into<trace::Now>) -> Option<FleetHold> {
+    FleetHold::of(*state.fleet.blocked.get(fleet_key(state, label)?)?, now)
+}
+
+/// [`fleet_blocked`] of `label` in `store`, read with no transaction: the fleet from
+/// [`Store::fleet`] and the account key from [`Store::load`]. Where no account of the fleet's
+/// files has a blocked sign-in (no snapshot among them) nothing is loaded and nothing holds, so
+/// local facts decide as before the files.
+///
+/// # Errors
+///
+/// Some account has one and the store did not load (a sync read that overlapped a publication,
+/// among others): which account `label` is cannot be told, so a caller starts nothing, as an
+/// unreadable spacing record starts nothing.
+pub fn fleet_blocked_in(
+    store: &Store,
+    label: &str,
+    now: impl Into<trace::Now>,
+) -> Result<Option<FleetHold>, String> {
+    let fleet = store.fleet();
+    if fleet.blocked.is_empty() {
+        return Ok(None);
+    }
+    let now: trace::Now = now.into();
+    let (state, _) = store.load(now)?;
+    Ok(fleet_key(&state, label)
+        .and_then(|pk| fleet.blocked.get(pk))
+        .and_then(|at| FleetHold::of(*at, now)))
 }
 
 /// When `row`'s vault token ends, where the upkeep's reading ([`State::tokens_here`]) stands and
@@ -5381,13 +5634,46 @@ pub fn claude_serves(
             .any(|row| row.dir.is_none() && of(row) == Condition::SignedOut))
 }
 
-/// Records a login wall hit at `at` on `label`'s bound login and updates learned lifetime.
+/// RECORDS A STRIKE OF `label`'S BOUND LOGIN: a login wall dated `at`, the evidence's own date
+/// (a screen's first sighting of the wall, [`WallSighting`]; a read's own answer), kept in its
+/// login ledger ([`LoginLedger::struck`]), and its learned lifetime. The same wall read again
+/// carries the same first sighting, so it is the same reading and renews nothing; a strike older
+/// than evidence the login served decides nothing ([`note_said`]), nor one dated before the
+/// login on record started ([`LoginLedger::since`]), and neither ends a login: the login's end
+/// ([`Binding::ended_at`], [`Kind::LoginEnded`]) is recorded only while the evidence reads it
+/// struck ([`Account::evidence_verdict`]), at its first sighting since its renewal or since it
+/// last served.
 pub fn note_login_end(state: &mut State, logins: &mut Logins, label: &str, at: i64) -> Vec<Event> {
+    let served_since = state
+        .accounts
+        .get(label)
+        .and_then(|account| account.login.served_at());
     let mut out = if state.contextual_auth && state.account(label).auth == Auth::SignedOut {
         Vec::new()
     } else {
-        note_auth_in_context(state, logins, label, Auth::SignedOut, at)
+        auth_scope::note_said_in_context(
+            state,
+            logins,
+            label,
+            Said::Struck,
+            LoginObs::new(
+                at,
+                &format!("login-end@{at}"),
+                aterm_evidence::Source::Reading,
+            ),
+            false,
+        )
     };
+    // The login ended only where the evidence reads it struck: one that served after this wall
+    // did not end at it, and a wall older than the login on record is of a login it replaced.
+    if !state
+        .accounts
+        .get(label)
+        .and_then(Account::evidence_verdict)
+        .is_some_and(|verdict| verdict.login == Login::Struck)
+    {
+        return out;
+    }
     auth_scope::prepare_lifetime(logins, label);
     let ended_current = auth_scope::clock_current(logins, label, auth_scope::Clock::Ended);
     let renewal_current = auth_scope::clock_current(logins, label, auth_scope::Clock::Renewal);
@@ -5396,7 +5682,8 @@ pub fn note_login_end(state: &mut State, logins: &mut Logins, label: &str, at: i
     };
     let first = !ended_current
         || binding.ended_at.is_none_or(|ended| {
-            renewal_current && binding.renewed_at.is_some_and(|renewed| ended < renewed)
+            (renewal_current && binding.renewed_at.is_some_and(|renewed| ended < renewed))
+                || served_since.is_some_and(|served| ended < served && served <= at)
         });
     if first {
         binding.ended_at = Some(at);
@@ -5472,79 +5759,70 @@ pub fn note_served_login(logins: &mut Logins, label: &str, at: i64) -> bool {
     changed
 }
 
-/// Records that `label`'s bound login served a turn at `at` after being marked signed out.
-/// Return its events from the enclosing transaction so the success receipt is committed.
-pub fn note_signed_back(
-    state: &mut State,
-    logins: &mut Logins,
-    label: &str,
-    at: i64,
-) -> Vec<Event> {
-    if state.accounts.get(label).is_none_or(|a| {
-        a.auth != Auth::SignedOut && (state.contextual_auth || a.managed_auth_is_current())
-    }) {
-        return Vec::new();
-    }
-    note_checked_sign_in(state, logins, label, at)
-}
-
-/// THE STRIKE THAT RECORDED `label` SIGNED OUT, LIFTED AT `at` ON EVIDENCE ITS OWN BOUND LOGIN
-/// SERVED AFTER IT (a served point, a break's served turn, a usage-tap reading; the caller judges
-/// the evidence): its word reads ok again, and what the strike left is cleared, its login's end
-/// (`ended_at`), the renewal it made due (`sign_in_task`) and a failed or blocked sign-in it led
-/// to, while its service raises `served_at`. No credential changed, so this is no sign-in: the
-/// login's renewal (`renewed_at`), the expiry notice it was given (`notice_end`) and its learned
-/// lifetime stand as they were, and the ledger records the word's return alone (`auth ok`, the
-/// journal's "login observed and serving"), never `signed-in` ([`note_signed_back`], which
-/// stamps a renewal from `at` and drops the notice, so a lift through it pushed the row's expiry
-/// forecast past the real one and taught the next real end a lifetime too short). A word on
-/// record later than `at` stands, and a row not signed out is left as it is (a word of another
-/// login's retired, as [`note_signed_back`] reads it, counts as signed out). Return its events
-/// from the enclosing transaction.
-pub fn note_served_back(
-    state: &mut State,
-    logins: &mut Logins,
-    label: &str,
-    at: i64,
-) -> Vec<Event> {
-    let contextual = state.contextual_auth;
-    if state
-        .accounts
-        .get(label)
-        .is_none_or(|a| a.auth != Auth::SignedOut && (contextual || a.managed_auth_is_current()))
+/// RECORDS EVIDENCE THAT `label`'S BOUND LOGIN SERVED AT `at` (a served point, a break's served
+/// turn dated by its reply, a usage-tap reading, a response a move or a check was answered with;
+/// the caller proves whose login it is): a served reading in its login ledger
+/// ([`LoginLedger::served`]) and its served clock ([`note_served_login`]). Nothing is lifted:
+/// where the reading is newer than a strike on record the verdict reads it as served
+/// ([`LoginLedger::verdict`]), and a strike newer than it stands; the strike stays on record. No
+/// credential changed, so this is no sign-in: the login's renewal, its notice, its end and its
+/// learned lifetime stand. Where the reading turns the verdict from signed out to served, the
+/// sign-in the strike asked for is no longer wanted: its remaining human step and a failed or
+/// blocked attempt go ([`Binding::sign_in_task`], [`Binding::clear_failed_sign_in`]). Return its
+/// events from the enclosing transaction.
+pub fn observe_served(state: &mut State, logins: &mut Logins, label: &str, at: i64) -> Vec<Event> {
+    let out = auth_scope::note_said_in_context(
+        state,
+        logins,
+        label,
+        Said::Served,
+        LoginObs::new(at, &format!("served@{at}"), aterm_evidence::Source::Reading),
+        false,
+    );
+    if out
+        .iter()
+        .any(|event| event.kind == Kind::Auth && event.why == Auth::Ok.as_str())
     {
-        return Vec::new();
-    }
-    auth_scope::retire_changed_context(state, logins, label, false);
-    let mut out = note_auth_in_context(state, logins, label, Auth::Ok, at);
-    let lifted = state.accounts.get(label).is_some_and(|account| {
-        let word = if contextual {
-            account.auth
-        } else {
-            account.managed_auth()
-        };
-        word == Auth::Ok && account.auth_at == Some(at)
-    });
-    if !lifted {
-        return out;
-    }
-    workflow_scope::replace(logins, label);
-    if let Some(binding) = logins.labels.get_mut(label) {
-        binding.ended_at = None;
-        binding.sign_in_task = None;
-        binding.clear_failed_sign_in();
-    }
-    workflow_scope::clear_absent(logins, label);
-    if !contextual {
-        auth_scope::clear_absent_lifetime(logins, label);
+        workflow_scope::replace(logins, label);
+        if let Some(binding) = logins.labels.get_mut(label) {
+            binding.sign_in_task = None;
+            binding.clear_failed_sign_in();
+        }
+        workflow_scope::clear_absent(logins, label);
     }
     if logins.labels.contains_key(label) {
         note_served_login(logins, label, at);
     }
-    if !out.iter().any(|event| event.kind == Kind::Auth) {
-        out.push(Event::new(at, Kind::Auth, label).because(Auth::Ok.as_str()));
-    }
     out
+}
+
+/// Whether evidence that certifies a sign-in of `label`'s login (a pooled tab's served turn, a
+/// review that worked, a Codex review's checked sign-back, a tab's sign-in) is a new login to
+/// record ([`note_checked_sign_in`]): its word reads signed out (the projection of
+/// [`Account::login_verdict`]), or is of a login a later one replaced. Elsewhere that sign-in is
+/// on record already.
+#[must_use]
+pub fn sign_back_due(state: &State, label: &str) -> bool {
+    state.accounts.get(label).is_some_and(|account| {
+        account.auth == Auth::SignedOut
+            || (!state.contextual_auth && !account.managed_auth_is_current())
+    })
+}
+
+/// Whether a served reading of `row`'s login is news to `account`: its verdict reads struck
+/// ([`Account::login_verdict`]), or its word is of a login a later one replaced (no verdict of
+/// this login, a word on record). A login whose verdict reads served is told nothing by another
+/// served reading, and the store is spared a write at every turn; a strike recorded since makes
+/// the next served reading news at once.
+#[must_use]
+pub fn served_is_news(account: Option<&Account>, row: &Row) -> bool {
+    account.is_some_and(|account| {
+        account
+            .login_verdict(row)
+            .map_or(account.auth != Auth::Unseen, |verdict| {
+                verdict.login == Login::Struck
+            })
+    })
 }
 
 /// WHAT SHOWS A LOGIN LIVE HERE AFTER ITS SIGN-OUT WAS RECORDED ([`adopt_login`]), read from files
@@ -5615,9 +5893,9 @@ impl NotAdopted {
 /// The record is a belief and a served turn is a fact, so evidence of service outranks a recorded
 /// sign-out older than it, and nothing else: the word must read signed out for this row's login
 /// ([`Account::current_auth`], the record half of [`signed_out_here`]), carry its time, and be
-/// strictly older than the evidence, which is not dated after `now`. Served evidence lifts the
-/// word alone ([`note_served_back`]: the login's renewal, notice and lifetime stand); a sign-in
-/// is a new login ([`note_signed_back`]). Both clear the pending sign-in task and the failed or
+/// strictly older than the evidence, which is not dated after `now`. Served evidence is a served
+/// reading ([`observe_served`]: the login's renewal, notice and lifetime stand); a sign-in is a
+/// new login ([`note_checked_sign_in`]). Both clear the pending sign-in task and the failed or
 /// blocked attempt the sign-out led to, and both stamp the word at the evidence's own time, so
 /// two processes that fold the same evidence agree: the second finds the word no longer signed
 /// out, and a sign-out recorded after the evidence stands against it.
@@ -5653,8 +5931,8 @@ pub fn adopt_login(
         return Err(NotAdopted::Future);
     }
     let events = match evidence {
-        LoginEvidence::Served(_) => note_served_back(state, logins, label, at),
-        LoginEvidence::SignedIn(_) => note_signed_back(state, logins, label, at),
+        LoginEvidence::Served(_) => observe_served(state, logins, label, at),
+        LoginEvidence::SignedIn(_) => note_checked_sign_in(state, logins, label, at),
     };
     if events.is_empty() {
         return Err(NotAdopted::LaterWord);
@@ -5662,22 +5940,33 @@ pub fn adopt_login(
     Ok(events)
 }
 
+/// A verified sign-in at `at` made a new login of `label`: no reading of the login it replaced
+/// says anything of this one, so its ledger starts empty under the next print, from `at`
+/// ([`LoginLedger::renew`]), as a renewal or a changed login context starts it
+/// ([`Account::retire_login`]).
+fn start_login_ledger(state: &mut State, label: &str, at: i64) {
+    if let Some(record) = state.accounts.get_mut(label) {
+        record.login.renew(at);
+    }
+}
+
 /// Record a verified sign-in, including refreshed metadata on an existing binding.
 /// A future authentication observation keeps its authority until time catches up.
 /// Return these events from the account transaction to advance its success receipt.
-pub(super) fn note_checked_sign_in(
+pub fn note_checked_sign_in(
     state: &mut State,
     logins: &mut Logins,
     label: &str,
     at: i64,
 ) -> Vec<Event> {
-    auth_scope::retire_changed_context(state, logins, label, false);
+    auth_scope::retire_changed_context(state, logins, label, false, at);
     if state.accounts.get(label).is_some_and(|account| {
         (state.contextual_auth || account.managed_auth_is_current())
             && account.auth_at.is_some_and(|held| held > at)
     }) {
         return Vec::new();
     }
+    start_login_ledger(state, label, at);
     let mut out = if state.contextual_auth {
         let out = note_auth(state, label, Auth::Ok, at);
         if state
@@ -5782,11 +6071,14 @@ pub fn note_renewed(
         auth_scope::stamp_lifetime(logins, label, auth_scope::Clock::Renewal, None);
     }
     // A verified replacement is a new credential observation, even at the same
-    // path and timestamp as the previous login.
-    if !state.contextual_auth
-        && let Some(account) = state.accounts.get_mut(label)
-    {
-        account.auth_scope.retire();
+    // path and timestamp as the previous login: its evidence starts at the renewal.
+    let contextual = state.contextual_auth;
+    if let Some(account) = state.accounts.get_mut(label) {
+        if contextual {
+            account.login.renew(at);
+        } else {
+            account.retire_login(at);
+        }
     }
     out.extend(note_auth_in_context(state, logins, label, Auth::Ok, at));
     out.push(Event::new(at, Kind::Renewed, label));
@@ -5934,9 +6226,19 @@ pub fn note_displaced(
         || record.auth_at.is_none_or(|held| held <= at)
     {
         record.clear_auth_context();
-        record.auth = Auth::SignedOut;
-        record.auth_at = Some(at);
-        record.auth_scope.reinstate();
+        let replaced = !contextual && !record.managed_auth_is_current();
+        // A displacement dated before the login on record started is of a login it replaced.
+        if record.ledger_for(replaced).record(
+            Said::Checked(Login::Struck),
+            LoginObs::new(
+                at,
+                &format!("displaced@{at}"),
+                aterm_evidence::Source::Reading,
+            ),
+        ) {
+            record.project_login();
+            record.auth_scope.reinstate();
+        }
         // Metadata loss is not a provider observation on the replacement. Preserve the
         // entry witness, including any actual result already captured in this transaction.
     }
@@ -6297,6 +6599,9 @@ pub fn forget_account(state: &mut State, logins: &mut Logins, label: &str) {
 pub(crate) fn remember_forgotten(state: &mut State, pk: String, mut account: Account) {
     account.auth = Auth::Unseen;
     account.auth_at = None;
+    // What it observed of the login it left behind says nothing of any later one.
+    let left = account.login.newest_at().unwrap_or(0);
+    account.login.renew(left);
     account.auth_scope = ManagedScope::default();
     account.auth_context = None;
     account.renewal_metadata = false;
@@ -6311,13 +6616,14 @@ pub(crate) fn remember_forgotten(state: &mut State, pk: String, mut account: Acc
 }
 
 /// Move every observation [`fill_observations`] carries out of `account` into a row of their own,
-/// leaving `account` its key and its login's machine-local word (`auth`, `auth_at`), which are
-/// the login directory's, not the account's.
+/// leaving `account` its key and its login's machine-local word and evidence (`auth`, `auth_at`,
+/// `login`), which are the login directory's, not the account's.
 pub(crate) fn take_observations(account: &mut Account) -> Account {
     let observed = std::mem::take(account);
     account.pk.clone_from(&observed.pk);
     account.auth = observed.auth;
     account.auth_at = observed.auth_at;
+    account.login.clone_from(&observed.login);
     account.auth_scope.clone_from(&observed.auth_scope);
     account.auth_context.clone_from(&observed.auth_context);
     account.renewal_metadata = observed.renewal_metadata;
@@ -6762,6 +7068,26 @@ const MODEL_WEEKS: [(super::profile::Bucket, &str); 3] = [
     (super::profile::Bucket::SevenDayOpus, "Opus week"),
 ];
 
+/// The buckets of the models' own weeks ([`MODEL_WEEKS`]), in its order: the words the survey's
+/// `model_walls=` and the journal's wall notes name a model's wall by
+/// (`super::journal::MODELS`).
+pub const MODEL_BUCKETS: [&str; MODEL_WEEKS.len()] = {
+    let mut out = [""; MODEL_WEEKS.len()];
+    let mut i = 0;
+    while i < MODEL_WEEKS.len() {
+        out[i] = MODEL_WEEKS[i].0.id();
+        i += 1;
+    }
+    out
+};
+
+/// The bucket `window` is where it is a model's own weekly bucket ([`model_window`]), as a
+/// static word ([`MODEL_BUCKETS`]); `None` for any other window.
+#[must_use]
+pub fn model_week(window: &str) -> Option<&'static str> {
+    MODEL_BUCKETS.into_iter().find(|bucket| *bucket == window)
+}
+
 /// The words a row names `window`'s wall by where `window` is a model's own weekly bucket
 /// (`Fable week`), else `None` ([`model_window`]).
 #[must_use]
@@ -6780,6 +7106,142 @@ pub fn model_week_name(window: &str) -> Option<&'static str> {
 #[must_use]
 pub fn model_window(window: &str) -> bool {
     model_week_name(window).is_some()
+}
+
+/// THE SESSION'S MODEL AS ROTATION READS IT (FL-264): which model's own weekly wall
+/// ([`MODEL_WEEKS`], [`Account::model_limited_until`]) keeps a row from serving the session's
+/// model, and whether the harness's fallback serves it where that wall stands. Read from its
+/// launch ([`ModelWeek::of_launch`]: its `--model`, or Claude Code's default) or, by the host,
+/// from what its process runs (`LaunchModel::week_under`: the model its last turn was served by,
+/// its environment's and its settings' pins). It rides on [`Me`] to every point and launch and
+/// orders the rows there ([`Rank::model_walled`], [`ModelWeek::demotes`]): a row walled on the
+/// session's model goes after every row that can serve it. Only where the fallback serves the
+/// session there ([`ModelWeek::FallsBack`]: Fable's, Opus on the same account, owner,
+/// 2026-11-11: "no, keep the same account and switch from fable to opus.") is such a row still
+/// a candidate; for any other model it is none ([`ModelWeek::excludes`]), as it is for every
+/// session at that model's own wall ([`ModelWeek::at`]): the session would meet the wall at once
+/// with nothing to go on with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelWeek {
+    /// Nobody read the session's model (another CLI's session, a host that read no launch, a
+    /// model whose weeks this build does not know, `opusplan`'s two, a pin it cannot read): any
+    /// model's own wall demotes a row (FL-206), as Fable, Claude Code's default, would meet its
+    /// wall there.
+    #[default]
+    Unread,
+    /// A read model of a family that draws on no model's own week (Haiku): no model's wall
+    /// demotes a row.
+    Bucketless,
+    /// A read model that draws on this model's own week ([`super::profile::model_bucket`]) and
+    /// has nothing to go on with where it is walled (an Opus or Sonnet session, one already on
+    /// the Opus fallback, a Fable launch that admits no fallback): a row walled on it is no
+    /// candidate ([`Self::excludes`]).
+    Of(super::profile::Bucket),
+    /// A read model that draws on this model's own week and goes on with the harness's fallback
+    /// where it is walled (a Fable session whose launch admits it,
+    /// `LaunchModel::admits_fallback`): a row walled on it ranks after every row with that
+    /// week's room and is still a candidate, but at that week's own wall.
+    FallsBack(super::profile::Bucket),
+}
+
+impl ModelWeek {
+    /// Claude Code's default model, a launch that names none: Fable's week, with the fallback
+    /// such a launch admits.
+    pub const CLAUDE_DEFAULT: ModelWeek = ModelWeek::FallsBack(super::profile::Bucket::Fable);
+
+    /// The week of the model `model` names (an alias or an id), with no fallback: `default`
+    /// (Claude Code's alias for its default) and a Fable id draw on Fable's, an Opus or Sonnet
+    /// one on that model's ([`super::profile::model_bucket`]), a Haiku one on none
+    /// ([`Self::Bucketless`]); any other name (`opusplan`, which draws on Opus's week and
+    /// Sonnet's, an id of a family this build does not know, a provider's) is [`Self::Unread`].
+    #[must_use]
+    pub fn of_model(model: &str) -> ModelWeek {
+        if model.trim().eq_ignore_ascii_case("default") {
+            return Self::Of(super::profile::Bucket::Fable);
+        }
+        match super::profile::model_bucket(model) {
+            Some(bucket) => Self::Of(bucket),
+            None if super::profile::model_family(model) == "haiku" => Self::Bucketless,
+            None => Self::Unread,
+        }
+    }
+
+    /// This week where the session's launch admits the fallback (`admits`) or not: Fable's
+    /// week falls back (onto Opus, `turn_end::FABLE_FALLBACK`) only where it is admitted; no
+    /// other model has a fallback.
+    #[must_use]
+    pub const fn falling_back(self, admits: bool) -> ModelWeek {
+        match (self, admits) {
+            (Self::Of(super::profile::Bucket::Fable), true) => {
+                Self::FallsBack(super::profile::Bucket::Fable)
+            }
+            (Self::FallsBack(bucket), false) => Self::Of(bucket),
+            (week, _) => week,
+        }
+    }
+
+    /// THE ONE RULE for a launch's model: `model` its `--model` (an alias or an id), `None` where
+    /// it names none ([`Self::CLAUDE_DEFAULT`]); the week [`Self::of_model`] reads, with the
+    /// fallback where the launch admits it (a Fable alias or id, as
+    /// `LaunchModel::admits_fallback` reads it).
+    #[must_use]
+    pub fn of_launch(model: Option<&str>) -> ModelWeek {
+        match model {
+            None => Self::CLAUDE_DEFAULT,
+            Some(model) => Self::of_model(model)
+                .falling_back(crate::supervise::policy::turn_end::is_fable(model)),
+        }
+    }
+
+    /// The bucket id of the session's model's own week, where one was read.
+    #[must_use]
+    pub const fn bucket(self) -> Option<&'static str> {
+        match self {
+            Self::Of(bucket) | Self::FallsBack(bucket) => Some(bucket.id()),
+            Self::Unread | Self::Bucketless => None,
+        }
+    }
+
+    /// The model at `point`: a model's own weekly wall ([`Point::Wall`] on a [`model_window`])
+    /// names the model the session runs, whatever was read of its launch, and a row walled on it
+    /// is no candidate there ([`Self::Of`]: the fallback, where one serves, is the turn end's
+    /// to answer before any move); any other point keeps this one.
+    #[must_use]
+    pub fn at(self, point: &Point) -> ModelWeek {
+        let Point::Wall { window, .. } = point else {
+            return self;
+        };
+        MODEL_WEEKS
+            .iter()
+            .find(|(bucket, _)| bucket.id() == window)
+            .map_or(self, |(bucket, _)| Self::Of(*bucket))
+    }
+
+    /// Whether a session of this model takes `account`'s row after every row that can serve it
+    /// at `now` ([`Rank::model_walled`]): its model's own week walled; with its model unread, any
+    /// model's; with a model of no week of its own, none.
+    #[must_use]
+    pub fn demotes(self, account: &Account, now: impl Into<trace::Now>) -> bool {
+        let now: trace::Now = now.into();
+        match self {
+            Self::Unread => account.model_walls(now).next().is_some(),
+            Self::Bucketless => false,
+            Self::Of(bucket) | Self::FallsBack(bucket) => {
+                account.model_limited_until(bucket.id(), now).is_some()
+            }
+        }
+    }
+
+    /// Until when `account`'s row is no candidate for a session of this model at `now`: its
+    /// model's own week walled where nothing serves the session there ([`Self::Of`]); `None`
+    /// for every other model, and where no such wall stands.
+    #[must_use]
+    pub fn excludes(self, account: &Account, now: impl Into<trace::Now>) -> Option<i64> {
+        match self {
+            Self::Of(bucket) => account.model_limited_until(bucket.id(), now),
+            Self::Unread | Self::Bucketless | Self::FallsBack(_) => None,
+        }
+    }
 }
 
 /// The clause a row's condition carries for each model's own wall standing on `account` at `now`
@@ -7104,10 +7566,16 @@ pub struct Account {
     pub before: Option<Sample>,
     /// Observation: the reset offer last seen.
     pub offer: Option<Offer>,
-    /// Machine-local: the login's last known word.
+    /// Machine-local: the login's word, the projection of [`Self::login`]'s verdict
+    /// ([`LoginLedger::verdict`]): written for older readers and the survey, never a source. A
+    /// record no ledger kept (an older build's) holds the word it wrote, which the first reading
+    /// recorded seeds the ledger from ([`LoginLedger::of_word`]).
     pub auth: Auth,
-    /// Machine-local: when that word was learned.
+    /// Machine-local: the date of the evidence that decides [`Self::auth`].
     pub auth_at: Option<i64>,
+    /// Machine-local: the login's dated evidence, whose newest reading decides its word (plan
+    /// package UB-04).
+    pub login: LoginLedger,
     /// Machine-local applicability of a legacy harness's auth word to its managed login.
     pub auth_scope: ManagedScope,
     /// Machine-local credential and routing context of the retained auth observation.
@@ -7175,6 +7643,7 @@ impl PartialEq for Account {
             && self.offer == other.offer
             && self.auth == other.auth
             && self.auth_at == other.auth_at
+            && self.login == other.login
             && self.auth_scope == other.auth_scope
             && self.auth_context == other.auth_context
             && self.renewal_metadata == other.renewal_metadata
@@ -7286,6 +7755,61 @@ impl Account {
                 self.auth
             }
             AuthProjection::Unknown | AuthProjection::Current(_) => Auth::Unseen,
+        }
+    }
+
+    /// THE LOGIN VERDICT: what the newest reading of this row's login says
+    /// ([`LoginLedger::verdict`]), where the word on record applies to the login `row` routes to
+    /// now ([`Self::current_auth`]'s scope: a word of a replaced login, or of other credentials,
+    /// is none). A record no ledger ever kept reads by its word ([`LoginLedger::of_word`]).
+    #[must_use]
+    pub fn login_verdict(&self, row: &Row) -> Option<Verdict> {
+        if self.current_auth(row) == Auth::Unseen {
+            return None;
+        }
+        if self.login.kept_nothing() {
+            LoginLedger::of_word(self.auth, self.auth_at).verdict()
+        } else {
+            self.login.verdict()
+        }
+    }
+
+    /// What the evidence on record says of this row's login, whatever login its row routes to
+    /// now: [`Self::login`]'s verdict, or, for a record no ledger ever kept (an older build's),
+    /// its word's ([`LoginLedger::of_word`]). [`Self::login_verdict`] scopes it to the row.
+    #[must_use]
+    pub fn evidence_verdict(&self) -> Option<Verdict> {
+        if self.login.kept_nothing() {
+            LoginLedger::of_word(self.auth, self.auth_at).verdict()
+        } else {
+            self.login.verdict()
+        }
+    }
+
+    /// The ledger a reading is recorded in. A login replaced since its word was written (a
+    /// renewal, a changed login context: [`Self::retire_login`]) started its own ledger then,
+    /// dated, so its readings go there. A record no ledger was ever kept for (an older build's)
+    /// is seeded from its word ([`LoginLedger::of_word`]), unless that word is of a replaced login
+    /// (`replaced`: its scope retired), which says nothing of this one: its ledger starts empty,
+    /// from the word's own time, before which no reading is of the login it now describes.
+    fn ledger_for(&mut self, replaced: bool) -> &mut LoginLedger {
+        if self.login.kept_nothing() {
+            if replaced {
+                self.login.renew(self.auth_at.unwrap_or(0));
+            } else if self.auth != Auth::Unseen {
+                self.login = LoginLedger::of_word(self.auth, self.auth_at);
+            }
+        }
+        &mut self.login
+    }
+
+    /// Write [`Self::auth`] and [`Self::auth_at`] as [`Self::login`]'s projection, where it holds
+    /// a reading: an empty ledger (a replaced login's, which no reading of it has reached yet)
+    /// leaves the word on record, of the login it replaced, which its retired scope says.
+    fn project_login(&mut self) {
+        if let Some(verdict) = self.login.verdict() {
+            self.auth = verdict.login.auth();
+            self.auth_at = Some(verdict.obs.at);
         }
     }
 
@@ -8088,6 +8612,12 @@ pub struct State {
     /// observation, history or policy.
     #[doc(hidden)]
     pub tokens_here: Option<TokensHere>,
+    /// Runtime local read: what this Mac's shared files say of the fleet ([`Fleet`],
+    /// [`Store::hydrate_lapsed`]): this Mac's link ranks, peers' walls and blocked sign-ins,
+    /// which order rotation ([`Rank`]) and hold browser sign-ins ([`fleet_blocked`]); not an
+    /// observation, history or policy.
+    #[doc(hidden)]
+    pub fleet: Fleet,
     /// Machine-local: the one account this home runs on.
     pub active: Option<String>,
     /// Machine-local: the account `active` was before the last rotation or pin ([`strike`]).
@@ -8163,7 +8693,7 @@ pub struct State {
 impl Eq for State {}
 
 /// Every field but the runtime scope (`contextual_auth`, `excluded_accounts`, `lapsed_logins`,
-/// `tokens_here`):
+/// `tokens_here`, `fleet`):
 /// a transaction saves its state only when this says it changed. The pattern names each field,
 /// so a new one is compared or skipped by a decision here, never left out of a save unseen.
 impl PartialEq for State {
@@ -8177,6 +8707,7 @@ impl PartialEq for State {
             excluded_accounts: _,
             lapsed_logins: _,
             tokens_here: _,
+            fleet: _,
             active,
             previous,
             previous_proven,
@@ -8244,6 +8775,7 @@ impl Default for State {
             excluded_accounts: BTreeSet::new(),
             lapsed_logins: BTreeSet::new(),
             tokens_here: None,
+            fleet: Fleet::default(),
             active: None,
             previous: None,
             previous_proven: false,
@@ -8607,6 +9139,9 @@ fn account_json(a: &Account) -> Value {
     );
     o.insert("auth".to_owned(), Value::from(a.auth.as_str()));
     o.insert("auth_at".to_owned(), Value::from(a.auth_at));
+    if !a.login.kept_nothing() {
+        o.insert("login".to_owned(), a.login.to_json());
+    }
     if a.auth_scope.is_retired() {
         o.insert("auth_retired".to_owned(), Value::Bool(true));
     }
@@ -8829,10 +9364,26 @@ fn account_of(v: &Value, now: trace::Now) -> Account {
         && v.get("served_metadata")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let auth = v
-        .get("auth")
-        .and_then(Value::as_str)
-        .map_or(Auth::Unseen, Auth::parse);
+    // The login's evidence is the source of its word, which is its projection; a record no
+    // ledger was ever kept for (an older build's) reads by the word it wrote, which the first
+    // reading recorded seeds the ledger from.
+    let login = v
+        .get("login")
+        .map(|login| LoginLedger::from_json(login, by_now))
+        .unwrap_or_default();
+    // An empty ledger (a replaced login's, which no reading reached yet) leaves the word as
+    // written, of the login it replaced, which its retired scope says.
+    let (auth, auth_at) = login.verdict().map_or_else(
+        || {
+            (
+                v.get("auth")
+                    .and_then(Value::as_str)
+                    .map_or(Auth::Unseen, Auth::parse),
+                stamp(v.get("auth_at"), by_now),
+            )
+        },
+        |verdict| (verdict.login.auth(), Some(verdict.obs.at)),
+    );
     // The reason is of the settled sign-out in `auth_context` alone, and one closed word: under
     // any other word, with no context, or spelled as no reason's own code, none is on record.
     let auth_refusal = v
@@ -8865,7 +9416,8 @@ fn account_of(v: &Value, now: trace::Now) -> Account {
         before: v.get("before").and_then(|s| sample_of(s, cap)),
         offer: v.get("offer").and_then(|o| offer_of(o, cap)),
         auth,
-        auth_at: stamp(v.get("auth_at"), by_now),
+        auth_at,
+        login,
         auth_scope: ManagedScope::from_retired(
             v.get("auth_retired")
                 .is_some_and(|value| value.as_bool() != Some(false)),
@@ -9508,6 +10060,7 @@ impl State {
             excluded_accounts: BTreeSet::new(),
             lapsed_logins: BTreeSet::new(),
             tokens_here: None,
+            fleet: Fleet::default(),
             active: label(doc.get("active")),
             previous: label(doc.get("previous")),
             previous_proven: doc
@@ -10082,6 +10635,11 @@ pub struct Me<'a> {
     /// How its process authenticates, resolved against [`Self::account`]'s row
     /// ([`AuthRoute::for_account`]).
     pub route: AuthRoute,
+    /// The model it runs, as its launch says ([`ModelWeek::of_launch`]) or its host reads it of
+    /// its process: which model's own weekly wall ranks a row after every row that can serve it
+    /// ([`Rank::model_walled`]), and holds it off the row where nothing serves it there
+    /// ([`ModelWeek::excludes`]). [`ModelWeek::Unread`] where nobody read it.
+    pub model: ModelWeek,
 }
 
 impl<'a> Me<'a> {
@@ -10221,26 +10779,53 @@ pub struct Rank {
     /// The row is another Mac's that runs here on its fleet token ([`borrowed`]): it is taken
     /// after every row of this Mac's own (FL-135).
     pub borrowed: bool,
-    /// A model's own weekly wall stands on the row ([`Account::model_walls`]): the row serves every
-    /// other model, but a session moved here knows nothing of its model, and a session of the
-    /// walled one (Fable's, by Claude Code's default) would meet that wall at once, so it is taken
-    /// after every row of its kind with none.
+    /// The session's model's own weekly wall stands on the row ([`ModelWeek::demotes`]; with its
+    /// model unread, any model's, as Fable, Claude Code's default, would meet its wall there;
+    /// with a model of no week of its own, none): the row serves every other model, and a
+    /// session of this one would meet that wall at once and go on with its fallback, so it is
+    /// taken after every row of its kind that can serve the model. It is excluded for it only
+    /// where no fallback serves the session there ([`ModelWeek::excludes`]).
     pub model_walled: bool,
+    /// A wall another Mac read stands on the account for the session's model ([`peer_wall`]: the
+    /// account's own, or its model's own weekly wall as [`Self::model_walled`] judges one read
+    /// here, FL-269): among the rows borrowed and model-walled alike, it is taken after every row
+    /// no peer's wall demotes, and ahead of none of them; it is never excluded for it.
+    pub peer_walled: bool,
     /// `low`: admitted only at a wall.
     pub low: bool,
     /// The row's class.
     pub class: Class,
+    /// This Mac's own `ai/links` rank of the account ([`link_rank`]): within a class, a ranked
+    /// row first, smaller first.
+    pub link: Option<u64>,
     /// The week's reset from the newest sample, while it is still ahead.
     pub week_reset: Option<i64>,
 }
 
+/// [`Rank::key`]: the order of candidate rows, lower first.
+type RankKey<'a> = (bool, bool, bool, bool, Class, bool, u64, bool, i64, &'a str);
+
 impl Rank {
-    fn key<'a>(&self, label: &'a str) -> (bool, bool, bool, Class, bool, i64, &'a str) {
+    /// The order, lower first. A borrowed row goes after every row of this Mac's own (FL-135's
+    /// rule, which outranks the rest), so a borrowed row no peer walled still goes after an own
+    /// row a peer did. Among the rows borrowed alike, a row the session's model's own weekly wall
+    /// stands on (with its model unread, any model's) goes after every row with none (FL-206,
+    /// FL-264): that wall is this Mac's own reading, and it outranks a peer's. Among the rows alike in both, a row a peer's wall demotes goes after
+    /// every row none demotes, `low` ones included: this Mac's own reading of the account's wall
+    /// excludes the row outright, and a peer's is weaker, but a peer read that account as spent
+    /// while a low row still has budget this Mac read itself. Then `low`, the class, the owner's
+    /// `ai/links` order within the class ("by rank, unranked last"), the soonest week reset, and
+    /// the label. With no snapshot ([`Fleet::default`]) `peer_walled` and `link` are the same for
+    /// every row, and the order is the one before the shared files.
+    fn key<'a>(&self, label: &'a str) -> RankKey<'a> {
         (
             self.borrowed,
             self.model_walled,
+            self.peer_walled,
             self.low,
             self.class,
+            self.link.is_none(),
+            self.link.unwrap_or(u64::MAX),
             self.week_reset.is_none(),
             self.week_reset.unwrap_or(i64::MAX),
             label,
@@ -10417,28 +11002,31 @@ pub fn effective_ranking_point<'a>(
     }
 }
 
-/// Until when the wall `point` stands at, where it is a model's own weekly wall ([`Point::Wall`]
-/// on a [`model_window`]: the session runs that model), holds that model's sessions off `label`
-/// at `now` ([`Account::model_limited_until`]); `None` at any other point, or where none stands.
-/// A model's wall leaves its account a candidate for every other session, never for one at
-/// that model's own wall.
-fn point_model_wall(state: &State, point: &Point, label: &str, now: i64) -> Option<i64> {
-    let Point::Wall { window, .. } = point else {
-        return None;
-    };
-    state.accounts.get(label)?.model_limited_until(window, now)
+/// Until when `label`'s row is no candidate for a session of `week` (its model where it stands,
+/// [`ModelWeek::at`]) at `now`: that model's own week walled there where nothing serves the
+/// session on it ([`ModelWeek::excludes`]): a session at a model's own weekly wall
+/// ([`Point::Wall`] on a [`model_window`]), or one of a model with no fallback, at any point.
+/// `None` where none stands. A model's wall leaves its account a candidate for every other
+/// session.
+fn model_wall(state: &State, week: ModelWeek, label: &str, now: i64) -> Option<i64> {
+    week.excludes(state.accounts.get(label)?, now)
 }
 
-/// Ranks all roster rows as rotation candidates.
+/// Ranks all roster rows as rotation candidates for a session on `me` that runs `model` (at
+/// `point`, [`ModelWeek::at`]): a row walled on that model ranks after every row that can serve
+/// it ([`Rank::model_walled`]), and is none where nothing serves the session there
+/// ([`model_wall`]).
 #[must_use]
 pub fn candidates(
     roster: &Roster,
     state: &State,
     enrolled: &BTreeSet<String>,
     me: Option<&str>,
+    model: ModelWeek,
     point: &Point,
     now: i64,
 ) -> Vec<(String, Result<Rank, WhyNot>)> {
+    let week = model.at(point);
     let conditions: Vec<(&Row, Condition)> = roster
         .rows
         .iter()
@@ -10463,9 +11051,11 @@ pub fn candidates(
                 model_walled: state
                     .accounts
                     .get(&row.label)
-                    .is_some_and(|a| a.model_walls(now).next().is_some()),
+                    .is_some_and(|a| week.demotes(a, now)),
+                peer_walled: peer_wall(state, week, &row.label, now).is_some(),
                 low,
                 class: row.class,
+                link: link_rank(state, &row.label),
                 week_reset: state
                     .accounts
                     .get(&row.label)
@@ -10493,9 +11083,10 @@ pub fn candidates(
                     }
                 }
             };
-            // A session at a model's own weekly wall moves onto no row where that model's wall
-            // stands too: its condition is the account's, and the session would meet it at once.
-            let verdict = match (verdict, point_model_wall(state, point, &row.label, now)) {
+            // A session at a model's own weekly wall, or of a model with no fallback, moves onto
+            // no row where that model's wall stands: its condition is the account's, and the
+            // session would meet the wall at once with nothing to go on with.
+            let verdict = match (verdict, model_wall(state, week, &row.label, now)) {
                 (Ok(_), Some(until)) => Err(WhyNot::Limited { until }),
                 (verdict, _) => verdict,
             };
@@ -10551,10 +11142,10 @@ pub fn hold_until(why: StayWhy, state: &State, opening: Option<i64>, now: i64) -
 enum Instants<'a> {
     /// Every account's.
     All,
-    /// Every account's, but only one ahead of `now` for this one, a session at this point's wall
-    /// stands at: at a model's own weekly wall, each row's once that model's wall on it ends too
-    /// ([`point_model_wall`]).
-    WalledOn(&'a str, &'a Point),
+    /// Every account's, but only one ahead of `now` for this one, the row a session of this
+    /// model (where it stands, [`ModelWeek::at`]) is walled on: each row's once that model's
+    /// wall on it ends too, where it holds the session off the row ([`model_wall`]).
+    WalledOn(&'a str, ModelWeek),
     /// Only the ones ahead of `now` ([`next_opening`]).
     Ahead,
 }
@@ -10573,8 +11164,8 @@ fn wait_instant(
             let cond = condition(r, state, is_enrolled(r, enrolled), now);
             let at = effective_usable_at(r, state, cond, now)?;
             let at = match which {
-                Instants::WalledOn(_, point) => {
-                    point_model_wall(state, point, &r.label, now).map_or(at, |end| at.max(end))
+                Instants::WalledOn(_, week) => {
+                    model_wall(state, week, &r.label, now).map_or(at, |end| at.max(end))
                 }
                 Instants::All | Instants::Ahead => at,
             };
@@ -10749,7 +11340,10 @@ pub fn advise_session(
 /// the first candidate a wall would move to, else `active` while it still runs (a low row, every
 /// other one walled); `None` when no row is usable. A launch of a CLI other than Claude Code
 /// passes this through [`super::accounts_pool::launch_now`], which decides that pool's `next:` in
-/// `aterm accounts`.
+/// `aterm accounts`. It reads no model ([`ModelWeek::Unread`]: any model's wall demotes a row):
+/// its callers are pools with no model weeks, `next:`, and a cold resume, which holds the
+/// session's environment and not its launch; a Claude Code worker's launch, which names its
+/// model, goes by [`claude_worker_move`].
 #[must_use]
 pub fn launch_row<'a>(
     roster: &'a Roster,
@@ -10776,7 +11370,7 @@ pub fn launch_row<'a>(
         at: None,
     };
     let me = active.map(|row| row.label.as_str());
-    candidates(roster, state, enrolled, me, &point, now)
+    candidates(roster, state, enrolled, me, ModelWeek::Unread, &point, now)
         .into_iter()
         .find(|(_, verdict)| verdict.is_ok())
         .and_then(|(label, _)| roster.row(&label))
@@ -10883,13 +11477,15 @@ pub fn claude_worker_may_move(mode: Mode, who: &ProcessLogin) -> bool {
 /// judged as that account, and as no row where no row lists it. The rows judged enrolled are
 /// corrected the same way ([`super::observe::Login::enrolled`]). This is the one rule the task
 /// launcher follows and a survey and the report state, so what they say a launch would start on
-/// cannot drift from what the launch does.
+/// cannot drift from what the launch does. `model` is the worker's own model, as its launch names
+/// it ([`ModelWeek::of_launch`]): a row walled on it ranks after every row that can serve it.
 #[must_use]
 pub fn claude_worker_move<'a>(
     roster: &'a Roster,
     state: &State,
     enrolled: &BTreeSet<String>,
     login: &super::observe::Login,
+    model: ModelWeek,
     (mode, now): (Mode, i64),
     serves: &mut dyn FnMut(&Row) -> bool,
 ) -> Option<(&'a Row, &'a Row)> {
@@ -10899,7 +11495,7 @@ pub fn claude_worker_move<'a>(
     let from = login.reconciled(roster).row()?;
     let enrolled = login.enrolled(roster, enrolled);
     token_guarded(roster, state, &enrolled, now, serves, Some(from), |state| {
-        worker_row(roster, state, &enrolled, &from.label, mode, now)
+        worker_row(roster, state, &enrolled, &from.label, mode, model, now)
     })
     .map(|row| (from, row))
 }
@@ -10907,14 +11503,16 @@ pub fn claude_worker_move<'a>(
 /// The row a Claude Code worker spawned from a tab on the row `from` starts under, where that is
 /// another row: the one the host would move that tab to at its next point, by the host's own
 /// rule ([`advise_past_probe`] under `mode`), at a wall where `from` cannot run now (walled,
-/// signed out, not enrolled here) and at a turn end where it can. So the worker follows `active`
+/// signed out, not enrolled here, or walled on the worker's model where nothing serves it there,
+/// [`ModelWeek::excludes`]) and at a turn end where it can. So the worker follows `active`
 /// where it is another row and fresh, or pinned and still running; a canary holds it where the
 /// host would hold the tab; a spent rotation bound keeps it; under [`Mode::Wall`] a row that
 /// still runs keeps it, and under [`Mode::Early`] a low row it should leave early moves it.
 /// `None` keeps the worker on `from`: a stay, a wait, a resume, `from` no row of `roster`, or
 /// a move that takes the canary, which is the host's to take with the worker's own session.
 /// A launch records nothing: the move is the host's to record, as for any launch
-/// ([`launch_row`]).
+/// ([`launch_row`]). The worker runs `model` ([`Me::model`]), so it ranks the rows, and follows
+/// or passes over a fresh `active`, by that model's own wall as its tab would.
 #[must_use]
 pub fn worker_row<'a>(
     roster: &'a Roster,
@@ -10922,10 +11520,16 @@ pub fn worker_row<'a>(
     enrolled: &BTreeSet<String>,
     from: &str,
     mode: Mode,
+    model: ModelWeek,
     now: i64,
 ) -> Option<&'a Row> {
     let mine = roster.row(from)?;
-    let point = if condition(mine, state, is_enrolled(mine, enrolled), now).runs() {
+    // A row walled on a model with no fallback is no row a worker of that model runs on.
+    let serves = state
+        .accounts
+        .get(from)
+        .is_none_or(|account| model.excludes(account, now).is_none());
+    let point = if serves && condition(mine, state, is_enrolled(mine, enrolled), now).runs() {
         Point::TurnEnd
     } else {
         Point::Wall {
@@ -10938,6 +11542,7 @@ pub fn worker_row<'a>(
         left: None,
         default_home: true,
         route: AuthRoute::Stored,
+        model,
     };
     match advise_past_probe(roster, state, enrolled, &me, &point, mode, now) {
         Advice::Move {
@@ -11046,6 +11651,8 @@ fn advise_with(
         .filter(|at| *at > now)
         .fold(retry, i64::min)
     });
+    // The session's model where it stands (a model's own wall names it, [`ModelWeek::at`]).
+    let model = me.model.at(point);
     let admitted = |to: &str| {
         // Use the same wall reducer as the recorder: a new wall retires its pin, but a
         // stale observation of a cleared wall must preserve it.
@@ -11064,8 +11671,8 @@ fn advise_with(
             sid: "advice-admission",
             account: &mine.label,
         };
-        // The commit asks with the window its session leaves, as this does
-        // ([`super::accounts_pool`]): an `active` walled on it holds no move past it.
+        // The commit asks with the window its session leaves and the model it runs, as this
+        // does ([`super::accounts_pool`]): an `active` walled on either holds no move past it.
         let leaves = match point {
             Point::Wall { window, .. } => Some(window.as_str()),
             _ => None,
@@ -11078,9 +11685,56 @@ fn advise_with(
             mover,
             to,
             leaves,
+            model,
             now,
         )
         .is_ok()
+    };
+    let listed = candidates(
+        roster,
+        state,
+        enrolled,
+        Some(&mine.label),
+        me.model,
+        ranked_at.as_ref(),
+        now,
+    );
+    // Whether `label`'s row holds the session's model's own week walled at `now`.
+    let walled_on_model = |label: &str| {
+        model.bucket().is_some_and(|bucket| {
+            state
+                .accounts
+                .get(label)
+                .is_some_and(|account| account.model_limited_until(bucket, now).is_some())
+        })
+    };
+    // Whether the session would stay where it is on a row that serves its model: no wall or
+    // yield moves it, its own row is fresh, this Mac's to run and walled on no week of its
+    // model, and the `active` is answered and no pin of the owner's (an unanswered one's canary,
+    // and the owner's pin, are followed as before).
+    let stays_serving = !at_wall
+        && !yielding
+        && state.proven
+        && !state.pinned
+        && available_here(mine)
+        && cond(mine).fresh()
+        && !walled_on_model(&mine.label);
+    // A SESSION OF A READ MODEL PASSES OVER AN `active` WALLED ON THAT MODEL (FL-264), where it
+    // stays on a row of its own that serves that model (`stays_serving`), or where the first
+    // candidate is another row with that model's room and the commit would take the move there
+    // ([`begin_rotation_for`] with the model): following it, the session would meet its model's
+    // wall at once. Where neither holds (a low target, an unanswered or pinned `active`, a spent
+    // bound, its own row walled or low), it is followed as before, the only usable row
+    // included; with the model unread, or of no week of its own, nothing changes.
+    let passes_over = |active: &Row| {
+        walled_on_model(&active.label)
+            && (stays_serving
+                || listed
+                    .iter()
+                    .find_map(|(label, verdict)| verdict.as_ref().ok().map(|rank| (label, rank)))
+                    .is_some_and(|(label, rank)| {
+                        *label != active.label && !rank.model_walled && admitted(label)
+                    }))
     };
     let onto_active = |active: &Row, takes_canary: bool| Advice::Move {
         to: active.label.clone(),
@@ -11090,12 +11744,15 @@ fn advise_with(
         yields,
     };
     let mut low_active = None;
-    // A session at a model's own weekly wall follows no `active` where that model's wall stands
-    // too ([`point_model_wall`]), as it moves onto no such candidate.
+    // A session at a model's own weekly wall, or of a model with no fallback, follows no `active`
+    // where that model's wall stands ([`model_wall`]), as it moves onto no such candidate; a
+    // session the fallback serves passes over one walled on its model only for a row that serves
+    // it (`passes_over`).
     if let Some(active) = state.active.as_deref().and_then(|l| roster.row(l))
         && active.label != mine.label
         && available_here(active)
-        && point_model_wall(state, point, &active.label, now).is_none()
+        && model_wall(state, model, &active.label, now).is_none()
+        && !passes_over(active)
     {
         let theirs = cond(active);
         if theirs.runs() && !state.proven {
@@ -11162,14 +11819,6 @@ fn advise_with(
     }
 
     let breaker = breaker_until(state, roster, now);
-    let listed = candidates(
-        roster,
-        state,
-        enrolled,
-        Some(&mine.label),
-        ranked_at.as_ref(),
-        now,
-    );
     let low_active =
         low_active.filter(|a| listed.iter().any(|(l, rank)| *l == a.label && rank.is_ok()));
     let next = listed
@@ -11190,7 +11839,7 @@ fn advise_with(
                 yields: None,
             },
             (None, ..) => {
-                let walled = Instants::WalledOn(&mine.label, point);
+                let walled = Instants::WalledOn(&mine.label, model);
                 match wait_instant(roster, state, enrolled, walled, now) {
                     Some(until) if until > now => Advice::Wait { until },
                     _ if unavailable => Advice::Wait { until: retry },
@@ -11327,7 +11976,7 @@ pub enum Kind {
     Warned,
     /// A login was renewed ([`note_renewed`]).
     Renewed,
-    /// An in-place login succeeded ([`note_signed_back`], [`note_default_login_made`]).
+    /// An in-place login succeeded ([`note_checked_sign_in`], [`note_default_login_made`]).
     SignedIn,
     /// A bound login was seen ended, at a login wall in a session on it ([`note_login_end`]).
     LoginEnded,
@@ -12549,6 +13198,7 @@ pub fn note_reading_held(
             offer: _,
             auth,
             auth_at,
+            login,
             auth_scope,
             auth_context,
             renewal_metadata,
@@ -12572,6 +13222,7 @@ pub fn note_reading_held(
         *record = Account {
             auth,
             auth_at,
+            login,
             auth_scope,
             auth_context,
             renewal_metadata,
@@ -12799,31 +13450,59 @@ pub fn note_offer(
     true
 }
 
-/// Records an [`Auth`] observation for `account` at `at`. In a contextual Codex store this
-/// retains history only; a scoped observation must validate current credentials before
-/// affecting a pin or supplying current auth authority.
+/// Records a check's [`Auth`] word for `account` at `at` in its login ledger
+/// ([`LoginLedger::checked`], [`note_said`]). In a contextual Codex store this retains history
+/// only; a scoped observation must validate current credentials before affecting a pin or
+/// supplying current auth authority.
 pub fn note_auth(state: &mut State, account: &str, auth: Auth, at: i64) -> Vec<Event> {
-    let mut out = Vec::new();
-    if auth == Auth::Unseen {
-        return out;
+    match Login::of_auth(auth) {
+        Some(login) => note_said(state, account, Said::Checked(login), check_obs(auth, at)),
+        None => Vec::new(),
     }
+}
+
+/// A check's reading of `auth` at `at`.
+fn check_obs(auth: Auth, at: i64) -> LoginObs {
+    LoginObs::new(
+        at,
+        &format!("check:{}@{at}", auth.as_str()),
+        aterm_evidence::Source::Reading,
+    )
+}
+
+/// RECORDS ONE READING OF `account`'S LOGIN (`said`, `obs`) IN ITS LEDGER and writes the word as
+/// the ledger's projection ([`LoginLedger::record`], [`LoginLedger::verdict`]). A reading that
+/// does not decide (an older one, a witness read before) changes no word, no context and no
+/// pin: the newest evidence decides, whatever arrives later. A word of a replaced login (its
+/// scope retired) says nothing of this one, so the ledger starts empty under the next print. One
+/// that decides writes the word and its time, clears the credential context a Codex word was
+/// bound to, and says [`Kind::Auth`] where the word changed; one that signs the login out ends a
+/// pin on it.
+pub(super) fn note_said(state: &mut State, account: &str, said: Said, obs: LoginObs) -> Vec<Event> {
+    let mut out = Vec::new();
     let contextual = state.contextual_auth;
     let Some(record) = account_mut(state, account) else {
         return out;
     };
-    if (contextual || record.managed_auth_is_current())
-        && record.auth_at.is_some_and(|held| at < held)
-    {
+    let reactivated = !contextual && !record.managed_auth_is_current();
+    let before = record.auth;
+    let at = obs.at;
+    let witness = obs.witness.clone();
+    record.ledger_for(reactivated).record(said, obs);
+    let decides = record
+        .login
+        .verdict()
+        .is_some_and(|newest| newest.said == said && newest.obs.witness == witness);
+    if !decides {
         return out;
     }
     record.clear_auth_context();
-    let changed = record.auth != auth;
-    let reactivated = !contextual && !record.managed_auth_is_current();
-    record.auth = auth;
-    record.auth_at = Some(at);
+    record.project_login();
     if !contextual {
         record.auth_scope.observe_entry();
     }
+    let auth = said.login().auth();
+    let changed = before != auth;
     if changed {
         out.push(Event::new(at, Kind::Auth, account).because(auth.as_str()));
     }
@@ -13972,7 +14651,17 @@ pub fn begin_rotation(
     to: &str,
     now: i64,
 ) -> Result<Event, Lost> {
-    begin_rotation_for(state, roster, enrolled, expect_active, mover, to, None, now)
+    begin_rotation_for(
+        state,
+        roster,
+        enrolled,
+        expect_active,
+        mover,
+        to,
+        None,
+        ModelWeek::Unread,
+        now,
+    )
 }
 
 /// [`begin_rotation`] for a session that leaves a wall of `window`, where one is: a fresh `active`
@@ -13982,15 +14671,21 @@ pub fn begin_rotation(
 /// off that model's sessions ([`model_window`], [`Account::model_limited_until`]); a row so held
 /// still serves every other session, so the wall ends no pin, and the pin and the `active`'s
 /// unanswered canary still hold (the owner's pin is the owner's: a session of that model on the
-/// pinned row with no fallback waits, as a Codex limit's does). Advice asks it with its point's
-/// window ([`advise`]) and the commit with the same window, so both judge the one rule.
+/// pinned row with no fallback waits, as a Codex limit's does). A mover whose model was read
+/// (`model`, [`ModelWeek::bucket`]) rotates past a fresh `active` walled on that model's own week
+/// onto a fresh row with that week's room, at any point (FL-264): following it, the mover would
+/// meet its model's wall at once; onto a row walled on it too, the `active` holds as before.
+/// Where nothing serves the mover's model on a row walled on its week ([`ModelWeek::excludes`]:
+/// a model with no fallback, or any at that model's own wall), such a `to` is no candidate.
+/// Advice asks it with its point's window and its session's model where it stands ([`advise`],
+/// [`ModelWeek::at`]) and the commit with the same, so both judge the one rule.
 ///
 /// # Errors
 ///
 /// A [`Lost`], with nothing changed.
 #[expect(
     clippy::too_many_arguments,
-    reason = "begin_rotation's seven, and the window its mover leaves"
+    reason = "begin_rotation's seven, the window its mover leaves and the model it runs"
 )]
 pub fn begin_rotation_for(
     state: &mut State,
@@ -14000,6 +14695,7 @@ pub fn begin_rotation_for(
     mover: Mover<'_>,
     to: &str,
     window: Option<&str>,
+    model: ModelWeek,
     now: i64,
 ) -> Result<Event, Lost> {
     let sid = one_line(mover.sid, WORD_MAX);
@@ -14020,6 +14716,15 @@ pub fn begin_rotation_for(
     };
     let runs = |label: &str| cond(label).is_some_and(Condition::runs);
     let fresh = |label: &str| cond(label).is_some_and(Condition::fresh);
+    // Whether `label` holds the mover's model's own week walled at `now`.
+    let model_walled = |label: &str| {
+        model.bucket().is_some_and(|bucket| {
+            state
+                .accounts
+                .get(label)
+                .is_some_and(|account| account.model_limited_until(bucket, now).is_some())
+        })
+    };
     let followed = |label: &str| {
         fresh(label)
             && window.is_none_or(|window| {
@@ -14028,6 +14733,7 @@ pub fn begin_rotation_for(
                         && account.model_limited_until(window, now).is_none()
                 })
             })
+            && !(model_walled(label) && !model_walled(to))
     };
     // An `active` this Mac may not use (another Mac's senior claim, one it cannot record) holds
     // nothing, as [`advise`] moves no session onto it; where another Mac holds it, every session
@@ -14063,7 +14769,18 @@ pub fn begin_rotation_for(
             return held;
         }
     }
-    if to == me || expect_active == Some(to) || !runs(to) || state.execution_verdict(to).is_err() {
+    let excluded = |label: &str| {
+        state
+            .accounts
+            .get(label)
+            .is_some_and(|a| model.excludes(a, now).is_some())
+    };
+    if to == me
+        || expect_active == Some(to)
+        || !runs(to)
+        || excluded(to)
+        || state.execution_verdict(to).is_err()
+    {
         return Err(Lost::NotACandidate);
     }
     if rotations_spent(state, roster, now) {
@@ -14137,10 +14854,20 @@ pub fn prove(state: &mut State, account: &str, now: i64) -> Option<Event> {
     let contextual = state.contextual_auth;
     if let Some(record) = account_mut(state, account) {
         record.clear_auth_context();
-        record.auth = Auth::Ok;
-        record.auth_at = Some(now);
-        if !contextual {
-            record.auth_scope.observe_entry();
+        let replaced = !contextual && !record.managed_auth_is_current();
+        // A proof is this program's own check that the account served its turn.
+        if record.ledger_for(replaced).record(
+            Said::Checked(Login::Serves),
+            LoginObs::new(
+                now,
+                &format!("proven@{now}"),
+                aterm_evidence::Source::Reading,
+            ),
+        ) {
+            record.project_login();
+            if !contextual {
+                record.auth_scope.observe_entry();
+            }
         }
     }
     Some(event)
@@ -14784,9 +15511,10 @@ enum Making {
     /// Where none is there.
     IfAbsent,
     /// Always: one already there fails the open.
+    #[cfg(unix)]
     New,
     /// Never: none there fails the open.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg(unix)]
     Never,
 }
 
@@ -14805,13 +15533,13 @@ fn open_retained_file_by(path: &Path, kind: &str, making: Making) -> io::Result<
     }
     let mut open = std::fs::OpenOptions::new();
     open.create(matches!(making, Making::IfAbsent))
-        .create_new(matches!(making, Making::New))
         .truncate(false)
         .write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600)
+        open.create_new(matches!(making, Making::New))
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(windows)]
@@ -15102,13 +15830,15 @@ impl Store {
         self.hydrate_codex_contexts(state, roster);
     }
 
-    /// [`State::lapsed_logins`] and [`State::tokens_here`] alone
+    /// [`State::lapsed_logins`], [`State::tokens_here`] and [`State::fleet`] alone
     /// ([`Store::hydrate_auth_contexts`]): the runtime readings a transaction's edit judges rows
-    /// by, so an edit that picks a row (a restart's advice) skips a lapsed one, and takes one on
-    /// its vault token, as the report and the launch do. The token reading is the upkeep's file
-    /// ([`Store::read_tokens_here`]): no vault is read here.
+    /// by, so an edit that picks a row (a restart's advice) skips a lapsed one, takes one on its
+    /// vault token, and orders them by the fleet's files, as the report and the launch do. The
+    /// token reading is the upkeep's file ([`Store::read_tokens_here`]) and the fleet's is this
+    /// Mac's snapshots ([`Store::fleet`]): no vault, registry or custody is read here.
     pub(crate) fn hydrate_lapsed(&self, state: &mut State, roster: &Roster) {
         state.tokens_here = self.read_tokens_here();
+        state.fleet = self.fleet();
         let default = self.default_login_home();
         state.lapsed_logins = roster
             .rows
@@ -15138,6 +15868,19 @@ impl Store {
             return None;
         }
         kept_tokens_here(&self.dir)
+    }
+
+    /// What this store reads of the fleet's shared files ([`Fleet`]): this account's live
+    /// snapshots for a store of its live harness state, on Unix, in a process under no private
+    /// state root; [`Fleet::default`] (no snapshot) for any other store, so its rotation and
+    /// sign-in run on its own facts. A test sets it with [`with_fleet`].
+    #[must_use]
+    pub(crate) fn fleet(&self) -> Fleet {
+        #[cfg(test)]
+        if let Some(fleet) = TEST_FLEET.with(|cell| cell.borrow().clone()) {
+            return fleet;
+        }
+        live_fleet(self)
     }
 
     /// KEEPS THE UPKEEP'S READING of the rows on their vault token here (`read`, as
@@ -15317,8 +16060,12 @@ impl Store {
                     events.extend(note_login_end(state, logins, label, intent.at));
                     Auth::SignedOut
                 }
+                // A Codex review that worked, checked against its credentials: a sign-back
+                // where the row reads signed out ([`sign_back_due`]), its status otherwise.
                 PendingAuthKind::SignedBack => {
-                    events.extend(note_signed_back(state, logins, label, intent.at));
+                    if sign_back_due(state, label) {
+                        events.extend(note_checked_sign_in(state, logins, label, intent.at));
+                    }
                     events.extend(note_auth(state, label, Auth::Ok, intent.at));
                     note_served_login(logins, label, intent.at);
                     Auth::Ok
@@ -15451,12 +16198,14 @@ impl Store {
     /// Takes the machine-wide sign-in lock ([`SIGNIN_LOCK_FILE`] in [`Store::shared_dir`]) on
     /// this store's ladder: one sign-in at a time on this machine, for every CLI, since a
     /// headless browser's profile admits one process and Codex's login listens on one fixed
-    /// port. On Unix, live manual FIFO owners also hold background admission.
+    /// port. On Unix and Windows, live manual FIFO owners also hold background admission.
     /// `None` when either admission stayed held past the ladder. Other platforms
     /// retain kernel exclusion; the private manual FIFO is separately unavailable.
     /// # Errors
     /// The directory or lock file cannot be made, the opened path is not a regular file,
-    /// the platform refuses a link, or the lock failed.
+    /// the platform refuses a link, or the lock failed; on Windows, an elevated process where
+    /// the queue's private folder is missing and the folder it goes in is not the user's own
+    /// (`aterm_uds::private_file::ELEVATED_PARENT`).
     pub fn signin_within(&self) -> io::Result<Option<SigninTurn>> {
         self.signin_on(self.ladder)
     }
@@ -18444,9 +19193,7 @@ mod renewal_policy_tests;
 #[path = "accounts_renewal_commit_tests.rs"]
 mod renewal_commit_tests;
 
-// Each selects a row that needs a manual sign-in, which only Unix queues
-// (`manual_signin_capability`).
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "accounts_selection_commit_tests.rs"]
 mod selection_commit_tests;
 

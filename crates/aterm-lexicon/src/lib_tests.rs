@@ -339,3 +339,38 @@ fn possessive_variants_count_from_one_in_suffix_order() {
     assert_eq!(strip_possessive("'s"), None, "no stem");
     assert_eq!(strip_possessive("cat"), None);
 }
+
+/// A shared lexicon is the held one of the same inputs alone ([`Lexicon::shared`]): asked again
+/// while it is held it is that lexicon; of another override, or of other languages, another,
+/// which carries that override's word; a refused override is an error; and the slot holds it
+/// weakly, so it is gone once its last holder lets it go.
+#[test]
+fn a_shared_lexicon_is_the_held_one_of_the_same_inputs_alone() {
+    let floof = "[[entry]]\nclass=\"feline\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"floof\"]\n";
+    let en = Lexicon::shared(&["en"], None).expect("no override to refuse");
+    let again = Lexicon::shared(&["en"], None).expect("no override to refuse");
+    assert!(std::sync::Arc::ptr_eq(&en, &again), "held, one compile");
+    let over = Lexicon::shared(&["en"], Some(floof)).expect("the override parses");
+    assert!(!std::sync::Arc::ptr_eq(&en, &over), "another override");
+    assert_eq!(
+        (en.classify_token("floof"), over.classify_token("floof")),
+        (None, Some(Class::Feline)),
+        "the override's word is the overridden lexicon's alone"
+    );
+    let all = Lexicon::shared(&["all"], Some(floof)).expect("the override parses");
+    assert!(!std::sync::Arc::ptr_eq(&over, &all), "other languages");
+    assert!(Lexicon::shared(&["all"], Some("[[entry")).is_err());
+    assert!(
+        std::sync::Arc::ptr_eq(
+            &all,
+            &Lexicon::shared(&["all"], Some(floof)).expect("parses")
+        ),
+        "a refused override leaves the held lexicon in the slot"
+    );
+    let gone = std::sync::Arc::downgrade(&all);
+    drop(all);
+    assert!(
+        gone.upgrade().is_none(),
+        "the slot keeps nothing once no one holds it"
+    );
+}

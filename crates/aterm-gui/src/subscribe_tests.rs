@@ -2920,6 +2920,219 @@ fn a_bye_rides_the_instance_stream_and_moves_no_membership() {
 }
 
 #[test]
+fn a_new_sessions_stream_delivers_the_instance_exit_word_once_even_after_history_wraps() {
+    use aterm_types::fabric_grammar::Bye;
+    for bye in [Bye::Handoff, Bye::Quit] {
+        for evicted in [false, true] {
+            let store = crate::session_store::new_store();
+            let seq = {
+                let mut g = store.write().unwrap();
+                g.say_bye(Bye::Handoff);
+                if bye == Bye::Quit {
+                    g.say_bye(Bye::Quit);
+                }
+                let seq = g.roster_seq();
+                if evicted {
+                    for _ in 0..=crate::session_store::ROSTER_JOURNAL_CAP {
+                        assert!(g.request_retire("t0000000001"));
+                    }
+                    assert!(g.roster_low_seq().unwrap() > seq);
+                }
+                seq
+            };
+            let mut initial_pending = false;
+            let mut sink = Scripted::new(|line: &str| {
+                if line == "OK subscribe 0" {
+                    store.write().unwrap().request_retire("t0000000002");
+                }
+                if line.starts_with("EVENT * bye ") {
+                    assert!(!await_roster_written(&store, seq, Duration::ZERO));
+                    initial_pending = true;
+                }
+                if line == "EVENT * fabric-retire t0000000002" {
+                    assert!(await_roster_written(&store, seq, Duration::ZERO));
+                    return false;
+                }
+                true
+            });
+            let mut hang = hang_detector("the initial exit word and later roster event");
+            push_loop_with_peer_probe(
+                &store,
+                &[],
+                bridge_scopes(),
+                PushOptions::default(),
+                "OK subscribe 0\n",
+                &mut sink,
+                move || hang(),
+            );
+            let wire = sink.wire;
+            assert!(
+                initial_pending,
+                "the initial word reached the real push loop"
+            );
+            assert_eq!(wire.matches("EVENT * bye ").count(), 1, "{wire}");
+            assert!(
+                wire.contains(&format!("EVENT * bye {}\n", bye.word())),
+                "{wire}"
+            );
+            assert!(
+                wire.contains("EVENT * fabric-retire t0000000002\n"),
+                "{wire}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_exit_word_during_the_subscription_handshake_is_not_lost_or_repeated() {
+    use aterm_types::fabric_grammar::Bye;
+    for previous in [None, Some(Bye::Handoff)] {
+        let store = crate::session_store::new_store();
+        if let Some(bye) = previous {
+            store.write().unwrap().say_bye(bye);
+        }
+        let mut sink = Scripted::new(|line: &str| {
+            if line == "OK subscribe 0" {
+                store.write().unwrap().say_bye(Bye::Quit);
+            }
+            line != "EVENT * bye quit"
+        });
+        let mut hang = hang_detector("the exit word written during the handshake");
+        push_loop_with_peer_probe(
+            &store,
+            &[],
+            bridge_scopes(),
+            PushOptions::default(),
+            "OK subscribe 0\n",
+            &mut sink,
+            move || hang(),
+        );
+        let byes: Vec<_> = sink
+            .wire
+            .lines()
+            .filter(|line| line.starts_with("EVENT * bye "))
+            .collect();
+        let expected = if previous.is_some() {
+            vec!["EVENT * bye handoff", "EVENT * bye quit"]
+        } else {
+            vec!["EVENT * bye quit"]
+        };
+        assert_eq!(byes, expected);
+    }
+}
+
+#[test]
+fn an_evicted_exit_word_reaches_an_existing_stream_only_once() {
+    use aterm_types::fabric_grammar::Bye;
+    let store = crate::session_store::new_store();
+    let mut cursor = roster_cursor(&store);
+    {
+        let mut g = store.write().unwrap();
+        g.say_bye(Bye::Handoff);
+        g.say_bye(Bye::Quit);
+        for _ in 0..=crate::session_store::ROSTER_JOURNAL_CAP {
+            g.request_retire("t0000000001");
+        }
+        assert!(g.roster_low_seq().unwrap() > cursor.seq + 1);
+    }
+    assert_eq!(
+        text(&drain_session_events(&store, &mut cursor)),
+        "EVENT * bye quit\n"
+    );
+    assert!(drain_session_events(&store, &mut cursor).is_empty());
+    {
+        let mut g = store.write().unwrap();
+        for _ in 0..=crate::session_store::ROSTER_JOURNAL_CAP {
+            g.request_retire("t0000000001");
+        }
+        assert!(g.roster_low_seq().unwrap() > cursor.seq + 1);
+    }
+    assert!(
+        drain_session_events(&store, &mut cursor).is_empty(),
+        "another history wrap cannot replay an already delivered exit word"
+    );
+    store.write().unwrap().request_retire("t0000000002");
+    assert_eq!(
+        text(&drain_session_events(&store, &mut cursor)),
+        "EVENT * fabric-retire t0000000002\n"
+    );
+}
+
+#[test]
+fn an_initial_exit_word_does_not_cross_the_reader_barrier_until_egress_finishes() {
+    use aterm_types::fabric_grammar::Bye;
+    struct Partial<'a> {
+        store: &'a Store,
+        seq: u64,
+        close: bool,
+        wire: Vec<u8>,
+        writes: usize,
+    }
+    impl Write for Partial<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            assert!(!await_roster_written(self.store, self.seq, Duration::ZERO));
+            self.writes += 1;
+            if self.close && self.wire.ends_with(b"EVENT * bye ") {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let Some(&byte) = bytes.first() else {
+                return Ok(0);
+            };
+            self.wire.push(byte);
+            if self.wire == b"OK subscribe 0\n" {
+                // Keep the first pump wake ready without a sleep or a live process.
+                self.store.write().unwrap().request_retire("t0000000002");
+            }
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            assert!(!await_roster_written(self.store, self.seq, Duration::ZERO));
+            Ok(())
+        }
+    }
+    for close in [false, true] {
+        let store = crate::session_store::new_store();
+        store.write().unwrap().say_bye(Bye::Handoff);
+        let seq = store.read().unwrap().roster_seq();
+        let mut sink = Partial {
+            store: &store,
+            seq,
+            close,
+            wire: Vec::new(),
+            writes: 0,
+        };
+        let mut entered = false;
+        push_loop_with_peer_probe(
+            &store,
+            &[],
+            bridge_scopes(),
+            PushOptions {
+                timestamps: true,
+                ..Default::default()
+            },
+            "OK subscribe 0\n",
+            &mut sink,
+            || {
+                assert!(!close, "failed initial egress cannot enter the pump");
+                assert!(await_roster_written(&store, seq, Duration::ZERO));
+                entered = true;
+                true
+            },
+        );
+        assert_eq!(entered, !close);
+        assert!(sink.writes > 2, "the actual egress needed partial writes");
+        let wire = String::from_utf8(sink.wire).unwrap();
+        assert!(wire.lines().any(|line| line.starts_with("T * ")), "{wire}");
+        assert_eq!(wire.contains("EVENT * bye handoff\n"), !close, "{wire}");
+        assert!(
+            await_roster_written(&store, seq, Duration::ZERO),
+            "the ended stream retired its reader"
+        );
+    }
+}
+
+#[test]
 fn a_quits_bye_is_on_the_wire_before_its_wait_answers() {
     use aterm_types::fabric_grammar::Bye;
     struct Shared(Arc<Mutex<String>>);

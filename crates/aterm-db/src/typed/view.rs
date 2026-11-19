@@ -53,6 +53,48 @@ pub struct View {
     /// records and quarantined payloads. They never hold a grid save or an import back;
     /// `check` lists them.
     pub refused: Vec<Digest>,
+    /// Who signed each of [`Self::refused`] and why it is not projected, in its order: what
+    /// [`Self::refused_words`] says. `complete` does not count them, so no write waits on them.
+    pub refusals: Vec<Unread>,
+    /// Where [`Self::cells`] stand among the cells this process keeps of the table, where they
+    /// are exactly those cells (no write held inert, no claim interpreted): a reader that made
+    /// something of the cells at an earlier mark asks which changed since
+    /// ([`crate::documents::materialized::Marked::changed_since`]). `None` for any other read.
+    /// Only the unix cells cache marks cells, so the field is where that cache is.
+    #[cfg(any(unix, test))]
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "test literals name it on every host; only unix reads it"
+        )
+    )]
+    pub(crate) cells_from: Option<crate::documents::materialized::Marked>,
+}
+
+/// One retained record a read holds and does not project ([`View::refused`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unread {
+    /// The record.
+    pub operation: Digest,
+    /// Its writer.
+    pub actor: astream_wire::sync::Actor,
+    /// Its writer's Commons machine, from the binding in the roster the record names.
+    pub machine: Option<[u8; 16]>,
+    /// Why this build does not project it, in this build's words.
+    pub why: String,
+}
+
+impl Unread {
+    /// Its signer in a word: the start of its machine's uuid, else of its writer's key.
+    #[must_use]
+    pub fn signer(&self) -> String {
+        let whole = match &self.machine {
+            Some(machine) => typed::keys::uuid32(machine),
+            None => aterm_codec::hex::encode_lower(&self.actor),
+        };
+        whole.chars().take(8).collect()
+    }
 }
 
 /// What retained operations still waiting on a causal parent (`Log::awaited`) may add to a
@@ -98,9 +140,59 @@ impl View {
             complete: true,
             awaiting: Awaiting::NONE,
             refused: Vec::new(),
+            refusals: Vec::new(),
+            #[cfg(any(unix, test))]
+            cells_from: None,
         }
     }
 
+    /// What a read says whenever it holds records it does not project ([`Self::refused`]): how
+    /// many, and each one's signer and why, those with the same signer and reason counted
+    /// together in the order first held (`2 records held here are not read: 1 signed by
+    /// c05f416f (unsupported database application schema); 1 signed by 9a0b1c2d (its writer was
+    /// cut off or forked)`). `None` where it holds none. History, diff, the Tables page and a
+    /// shared file's status print it; the read is complete all the same ([`Self::complete`]),
+    /// so no write waits on these records.
+    #[must_use]
+    pub fn refused_words(&self) -> Option<String> {
+        refused_words(&self.refusals)
+    }
+}
+
+/// The sentence a read says of the records `refusals` it holds and does not project
+/// ([`View::refused_words`], which a history page and a diff say of their own).
+#[must_use]
+pub fn refused_words(refusals: &[Unread]) -> Option<String> {
+    {
+        if refusals.is_empty() {
+            return None;
+        }
+        let mut groups: Vec<(String, &str, usize)> = Vec::new();
+        for refused in refusals {
+            let signer = refused.signer();
+            match groups
+                .iter_mut()
+                .find(|(s, why, _)| *s == signer && *why == refused.why)
+            {
+                Some((_, _, n)) => *n += 1,
+                None => groups.push((signer, &refused.why, 1)),
+            }
+        }
+        let n = refusals.len();
+        let each: Vec<String> = groups
+            .iter()
+            .map(|(signer, why, k)| format!("{k} signed by {signer} ({why})"))
+            .collect();
+        Some(format!(
+            "{n} {} held here {} not read: {}",
+            if n == 1 { "record" } else { "records" },
+            if n == 1 { "is" } else { "are" },
+            each.join("; ")
+        ))
+    }
+}
+
+impl View {
     /// Why a write of `rows` must wait for history still arriving on this Mac, or `None` when
     /// nothing it writes can still change under it.
     ///

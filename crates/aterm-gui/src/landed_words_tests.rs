@@ -465,7 +465,7 @@ fn the_hover_asks_no_redraw_past_a_settings_tab_ahead_of_its_own() {
     let _ = crate::work_counts::take_hover_redraws();
     tell(&mut app, &sid, Some(TaskFace::Landed));
     let agent_tip = crate::work_counts::last_tooltips_pushed(wid)
-        .and_then(|tips| tips.get(1).cloned().flatten())
+        .and_then(|tips| tips.first().cloned().flatten())
         .unwrap_or_default();
     assert!(
         agent_tip.contains("driven by aterm (land, landed)"),

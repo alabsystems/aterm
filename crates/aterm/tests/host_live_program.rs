@@ -6,9 +6,10 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::headless_boot;
+use crate::patience::Patience;
 
 use headless_boot::{Instance, boot_session, ctl, ctl_ok, field, status, type_line};
 
@@ -22,23 +23,25 @@ fn boot(tag: &str) -> Instance {
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
 
+/// Poll `status` until `pred` holds, for as long as a [`Patience`] over `window` lasts.
 fn status_until(
     inst: &Instance,
     sid: &str,
-    within: Duration,
+    window: Duration,
     what: &str,
     pred: impl Fn(&str) -> bool,
 ) -> String {
-    let deadline = Instant::now() + within;
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        last = status(inst, sid);
+    let mut patience = Patience::new(window);
+    loop {
+        let last = status(inst, sid);
         if pred(&last) {
             return last;
         }
+        if let Some(why) = patience.spent() {
+            panic!("{what}: not reached ({why}); last status: {last}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("{what}: not within {within:?}; last status: {last}");
 }
 
 fn screen_529() -> String {

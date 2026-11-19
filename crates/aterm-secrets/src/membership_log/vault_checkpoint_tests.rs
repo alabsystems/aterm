@@ -334,6 +334,10 @@ fn vault_checkpoint_a_v2_put_verifies_after_its_ciphertext_is_shed() {
         );
         assert_eq!(whole_id(&whole_bytes), Some(*whole.id()));
         assert_eq!(whole_id(&shed_bytes), Some(*whole.id()));
+        // What another crate reads a record's id by, whole and shed alike.
+        assert_eq!(record_id(&whole_bytes), record_id(&shed_bytes));
+        assert_eq!(record_id(&whole_bytes), Some(*whole.id()));
+        assert_ne!(digest(&whole_bytes), *whole.id());
     }
 
     // NEGATIVE CONTROLS on the bytes.
@@ -540,10 +544,15 @@ fn vault_checkpoint_a_format_one_node_refuses_v2_as_0_204_does() {
         assert_eq!(two.log().unwrap().held_count(), 3);
         #[cfg(unix)]
         {
-            let read = Store::read_records(stream.as_slice(), MAX_HELD_RECORDS)
+            let read = Store::read_records(stream.as_slice(), MAX_HELD_RECORDS, Reading::ONE)
                 .unwrap()
                 .apply(Store::with_compiled(None));
             assert_eq!(read.log().unwrap().held_count(), 2);
+            // A server whose mark names format 2 reads the file at it.
+            let read = Store::read_records(stream.as_slice(), MAX_HELD_RECORDS, FORMAT_TWO)
+                .unwrap()
+                .apply(Store::with_compiled(None).read_at(FORMAT_TWO));
+            assert_eq!(read.log().unwrap().held_count(), 3);
             // The head's reads.
             assert!(Record::vouched(&bytes, Reading::ONE).is_err());
             assert_eq!(

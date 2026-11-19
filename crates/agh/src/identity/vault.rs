@@ -3,7 +3,7 @@
 // Author: Andrew Yates
 
 //! Vault adoption (design §6.10): with no agh.toml, the ALab vault's two GitHub entries, read in
-//! place from this Mac's verified secret store (`aterm_secrets::client::read_in_place`), route as
+//! place from this host's verified secret store (`aterm_secrets::client::read_in_place`), route as
 //! if `agh auth add` had provisioned them, with no command run and no file edited by anyone. No
 //! file under `~/.secrets` is read: those older builds wrote are the owner's backup.
 //!
@@ -27,18 +27,18 @@
 //! judged: the call's client is handed that credential (`Github::pin`), never a later read of
 //! the store.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::client::{Github, Meter};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::config::{self, DefaultRow, OwnerRow, ProfileRow, WriteField};
 use crate::config::{AghConfig, ConfigFault, Dirs, Validated};
 use crate::error::{Error, IdentityRef, Kind, Result, Sub};
 use crate::identity::{Credential, Profile, Source, TokenKind};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::identity::{LoadError, tilde};
 use crate::policy::{RefusalCode, Router, Tier};
 
@@ -46,14 +46,14 @@ use crate::policy::{RefusalCode, Router, Tier};
 pub const RECORD_FILE: &str = "vault.toml";
 /// The lock the record is written under, in `Dirs::config`: adoption's own, so a read that
 /// records a login never holds up an auth edit.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const RECORD_LOCK: &str = ".vault-record.lock";
 /// The longest record read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const RECORD_MAX: usize = 4 * 1024;
 
 /// Why neither vault token routes when both entries hold one token.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const ONE_TOKEN: &str = "L7: the vault's dev and release entries hold one token, so its tier is \
                          unknown and neither routes";
 
@@ -205,7 +205,7 @@ impl Slot {
     }
 
     /// The owner it reads and writes for: the dev token's own login, or the public owner.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn owner(self, login: &str) -> String {
         match self {
             Slot::Dev => login.to_string(),
@@ -536,7 +536,7 @@ impl Adoption {
     }
 
     /// Adoption of `vaulted`, nothing routed, left out or refused yet.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn bare(vaulted: Vec<Vaulted>, joined: bool) -> Adoption {
         Adoption {
             vaulted,
@@ -555,7 +555,7 @@ impl Adoption {
     /// tokens, when neither's tier is known (`one_login`), are both left out first. When the
     /// rest break a rule, the most tokens whose rows do not (dev before release) are kept and
     /// each one left out is `Found::Faulted`, the faults its rows brought reported.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn judge(mut vaulted: Vec<Vaulted>, home: &Path, base: Option<&AghConfig>) -> Adoption {
         let joined = base.is_some();
         if let Some((slot, adopted, now)) = vaulted.iter().find_map(|v| match &v.found {
@@ -672,7 +672,7 @@ impl Vaulted {
 /// The step for a token left out because its rows break a rule beside the others: with no
 /// agh.toml the rows are derived, so the cause is the vault's contents; beside an agh.toml
 /// that says `vault = true`, its rows.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn faulted_next(slot: Slot, joined: bool) -> String {
     if joined {
         format!(
@@ -697,7 +697,7 @@ fn faulted_next(slot: Slot, joined: bool) -> String {
 /// Keeping either would be unsafe: the dev slot's rows make its token every owner's first
 /// reader, and the release slot's make its token alabsystems' writer. Their L7 fault, once for
 /// each reason, or none.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn one_login(vaulted: &mut [Vaulted]) -> Vec<ConfigFault> {
     let shared = match &*vaulted {
         [first, second] => match (&first.found, &second.found) {
@@ -752,7 +752,7 @@ fn note_line(names: &str, why: &str, next: &str) -> String {
 
 /// Each subset of `slots`, the largest first and, of one size, in slot order: the rows tried,
 /// in turn, until one validates. The empty one is last.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn subsets(slots: &[Slot]) -> Vec<Vec<Slot>> {
     let n = slots.len();
     let mut all: Vec<Vec<Slot>> = (0..1u32 << n)
@@ -774,7 +774,7 @@ fn subsets(slots: &[Slot]) -> Vec<Vec<Slot>> {
 /// reads first for every owner but the release floor's writer reads, the public owner's reads
 /// included, then anonymous; the release token reads the public owner only while there is no
 /// dev token.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn rows_of(vaulted: &[Vaulted], keep: &[Slot]) -> AghConfig {
     let mut config = AghConfig::default();
     let dev = keep.contains(&Slot::Dev);
@@ -816,7 +816,7 @@ fn rows_of(vaulted: &[Vaulted], keep: &[Slot]) -> AghConfig {
 /// `base`'s rows (an agh.toml that says `vault = true`) joined by `adopted`'s: a profile, an
 /// owner row or `[default]` `base` has stands, and `vault` is cleared, since the joined rows
 /// name the vault's profiles.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn joined_rows(base: Option<&AghConfig>, adopted: AghConfig) -> AghConfig {
     let mut config = base.cloned().unwrap_or_default();
     config.vault = false;
@@ -839,12 +839,12 @@ fn joined_rows(base: Option<&AghConfig>, adopted: AghConfig) -> AghConfig {
 }
 
 /// Adoption for a call: `None` when an agh.toml that does not say `vault = true` is there (or
-/// could not be judged absent), and off unix, where there is no store. A token whose login
-/// the record does not hold for its fingerprint is learned with one `GET /user` as that token
-/// through `gh` (its effect seam, its transport and its redactor), sent once with no retry, and
-/// what was learned is recorded under adoption's own lock. A failed `GET /user` adopts nothing
-/// for that token, records nothing, and leaves `note`'s line; once one could not reach GitHub,
-/// the other token's is not sent. One token in both entries is not sent at all.
+/// could not be judged absent), and on a host with no store (neither unix nor windows). A token
+/// whose login the record does not hold for its fingerprint is learned with one `GET /user` as
+/// that token through `gh` (its effect seam, its transport and its redactor), sent once with no
+/// retry, and what was learned is recorded under adoption's own lock. A failed `GET /user`
+/// adopts nothing for that token, records nothing, and leaves `note`'s line; once one could
+/// not reach GitHub, the other token's is not sent. One token in both entries is not sent at all.
 #[must_use]
 pub fn adopt(gh: &Github, dirs: &Dirs) -> Option<Adoption> {
     run(dirs, Some(gh))
@@ -863,7 +863,7 @@ pub fn view(dirs: &Dirs) -> Option<Adoption> {
 /// vault entry (usable or not). `None` when it holds neither, and when the new profile is the
 /// vault's own (`dev` or `release`) or its `source` is one of the vault's two entries: that
 /// agh.toml routes alone, as any explicit agh.toml does, so the entry it names is routed once.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[must_use]
 pub fn seed(dirs: &Dirs, name: &str, source: &Source) -> Option<String> {
     if Slot::named(name).is_some() || is_slot_entry(source) {
@@ -877,9 +877,9 @@ pub fn seed(dirs: &Dirs, name: &str, source: &Source) -> Option<String> {
     })
 }
 
-/// Whether this Mac's store holds either vault entry, usable or not: a store that cannot be read
+/// Whether this host's store holds either vault entry, usable or not: a store that cannot be read
 /// holds none.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn any_entry(dirs: &Dirs) -> bool {
     Slot::ALL.into_iter().any(|slot| {
         crate::identity::vault_value(&dirs.home, slot.entry()).is_ok_and(|value| value.is_some())
@@ -894,22 +894,22 @@ pub fn is_slot_entry(source: &Source) -> bool {
         if Slot::ALL.into_iter().any(|slot| slot.entry() == entry.name()))
 }
 
-/// Off unix there is no store, so no vault entry is read (design §6.6).
-#[cfg(not(unix))]
+/// A host that is neither unix nor windows has no store, so no vault entry is read there.
+#[cfg(not(any(unix, windows)))]
 fn run(dirs: &Dirs, gh: Option<&Github>) -> Option<Adoption> {
     let _ = (dirs, gh);
     None
 }
 
-/// `adopt` and `view` on unix.
-#[cfg(unix)]
+/// `adopt` and `view` on unix and windows.
+#[cfg(any(unix, windows))]
 fn run(dirs: &Dirs, gh: Option<&Github>) -> Option<Adoption> {
     let base = base(dirs)?;
     run_with_rows(dirs, gh, base.as_ref())
 }
 
 /// Compose a previously admitted file snapshot; the shared router owns the one file read.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn run_with_rows(
     dirs: &Dirs,
     gh: Option<&Github>,
@@ -920,7 +920,7 @@ pub(crate) fn run_with_rows(
 }
 
 /// Compose vault rows with a file snapshot already admitted by the caller.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn run_with_rows(
     dirs: &Dirs,
     gh: Option<&Github>,
@@ -1069,7 +1069,7 @@ pub(crate) fn run_with_rows(
 }
 
 /// The kind of the token learned for `slot`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn kind_of(learned: &[Learn], slot: Slot) -> TokenKind {
     learned
         .iter()
@@ -1078,7 +1078,7 @@ fn kind_of(learned: &[Learn], slot: Slot) -> TokenKind {
 }
 
 /// The profiles of the tokens whose login is not known, joined with `,`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn unlearned_names(vaulted: &[Vaulted]) -> String {
     vaulted
         .iter()
@@ -1090,7 +1090,7 @@ fn unlearned_names(vaulted: &[Vaulted]) -> String {
 
 /// Why neither token routes when `slot`'s entry holds the token the record keeps for the other
 /// entry: the two entries' contents are crossed, so neither's tier is known.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn misplaced_token(slot: Slot) -> String {
     format!(
         "L7: the vault entry {} holds the token agh recorded for {}, so its tier is unknown and \
@@ -1104,7 +1104,7 @@ fn misplaced_token(slot: Slot) -> String {
 /// keeps for the other entry, whatever that entry holds this call: `None` when none does. The
 /// other entry's token then may be absent, unusable or not learned this call, so the check
 /// `one_login` makes of two adopted tokens would miss it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn misplaced_login(vaulted: &[Vaulted], record: &Record) -> Option<String> {
     vaulted.iter().find_map(|v| {
         let login = match &v.found {
@@ -1130,7 +1130,7 @@ fn misplaced_login(vaulted: &[Vaulted], record: &Record) -> Option<String> {
 /// The rows adoption joins: `Some(None)` with no agh.toml, `Some(Some(rows))` for one that says
 /// `vault = true`, and `None` for any other (which routes alone, or which `config::load`
 /// refuses).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn base(dirs: &Dirs) -> Option<Option<AghConfig>> {
     match config::read_config(&dirs.config, config::CONFIG_FILE, &dirs.home) {
         config::ConfigText::Missing => Some(None),
@@ -1143,7 +1143,7 @@ fn base(dirs: &Dirs) -> Option<Option<AghConfig>> {
 }
 
 /// One token's login learned this call, and the record's row `find` judged it against.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Learn {
     slot: Slot,
     kind: TokenKind,
@@ -1154,7 +1154,7 @@ struct Learn {
 /// One vault token read in place from the store by the token rules: its credential, or what
 /// adoption reports of it (`Absent`, `Unusable`, whose remedy is the slot's `sync_step`: an
 /// entry has no file mode or link to fix).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn load_slot(slot: Slot, dirs: &Dirs) -> std::result::Result<Arc<Credential>, Found> {
     let profile = slot_profile(slot, &dirs.home);
     match super::load(&profile) {
@@ -1169,14 +1169,14 @@ fn load_slot(slot: Slot, dirs: &Dirs) -> std::result::Result<Arc<Credential>, Fo
 }
 
 /// The one-entry profile a vault token loads and learns as.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn slot_profile(slot: Slot, home: &Path) -> Profile {
     Profile::new(slot.profile(), slot.source(home), slot.tier())
 }
 
 /// What one call learns: the client it asks through (`None`: it asks nothing), the logins it
 /// learned, the requests it sent, and why GitHub could not be reached, once it could not.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Learning<'a> {
     gh: Option<&'a Github>,
     home: &'a Path,
@@ -1185,7 +1185,7 @@ struct Learning<'a> {
     unreachable: Option<String>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Learning<'_> {
     /// The profiles learned this call, joined with `,`.
     fn names(&self) -> String {
@@ -1266,7 +1266,7 @@ impl Learning<'_> {
 /// `GET /user` as `profile` alone (the provisioning bind of `agh auth add`), sent once
 /// (`Users::me_once`: the next call asks again) with exactly `cred`, the token adoption judged
 /// (`Github::pin`): the login. What it sent is added to `spent`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn learn(
     gh: &Github,
     profile: &Profile,
@@ -1313,7 +1313,7 @@ fn learn(
 }
 
 /// One token's login, by the fingerprint `GET /user` answered it for.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Learned {
@@ -1322,7 +1322,7 @@ struct Learned {
 }
 
 /// The record's rows.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Record {
@@ -1330,7 +1330,7 @@ struct Record {
     release: Option<Learned>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Record {
     fn get(&self, slot: Slot) -> Option<&Learned> {
         match slot {
@@ -1392,7 +1392,7 @@ impl Record {
 }
 
 /// Why the record cannot be read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug)]
 struct RecordFault {
     /// The refusal.
@@ -1408,9 +1408,8 @@ struct RecordFault {
 /// The record: empty when there is none. A private file that is not agh's record (it does not
 /// parse, or a row is not a fingerprint and an owner name) is `damaged`, since the guard
 /// against a changed login rests on its rows; one `read_private` refuses is refused.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn read_record(dirs: &Dirs) -> std::result::Result<Record, RecordFault> {
-    use crate::identity::{Held, PrivateFix, private_fix};
     use aterm_uds::private_file::{PrivateFileError, read_private};
     match read_private(&dirs.config, RECORD_FILE, RECORD_MAX) {
         Ok(bytes) => {
@@ -1442,16 +1441,7 @@ fn read_record(dirs: &Dirs) -> std::result::Result<Record, RecordFault> {
         Err(error) => {
             let file = dirs.config.join(RECORD_FILE);
             let shown = tilde(&file, &dirs.home);
-            let remedy = match &error {
-                PrivateFileError::NotPrivate(_) => {
-                    match private_fix(&dirs.config, &file, &dirs.home, Held::Config(None)) {
-                        PrivateFix::Fix(fix) => Some(fix),
-                        PrivateFix::NotAFile | PrivateFix::NoChmod | PrivateFix::Unseen => None,
-                    }
-                }
-                _ => None,
-            };
-            let remedy = remedy
+            let remedy = record_remedy(dirs, &file, &error)
                 .unwrap_or_else(|| format!("make {shown} a private file of yours, or remove it"));
             let why = format!("{shown}: {error}");
             let fault = ConfigFault {
@@ -1467,8 +1457,42 @@ fn read_record(dirs: &Dirs) -> std::result::Result<Record, RecordFault> {
     }
 }
 
-/// `record` written whole and atomically, 0600, in the private agh directory.
+/// The chmods that make the record `file` private, where `read_private` refused it as not
+/// private and a chmod of this user's does; else `None`.
 #[cfg(unix)]
+fn record_remedy(
+    dirs: &Dirs,
+    file: &Path,
+    error: &aterm_uds::private_file::PrivateFileError,
+) -> Option<String> {
+    use crate::identity::{Held, PrivateFix, private_fix};
+    use aterm_uds::private_file::PrivateFileError;
+    match error {
+        PrivateFileError::NotPrivate(_) => {
+            match private_fix(&dirs.config, file, &dirs.home, Held::Config(None)) {
+                PrivateFix::Fix(fix) => Some(fix),
+                PrivateFix::NotAFile | PrivateFix::NoChmod | PrivateFix::Unseen => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// On windows there is no mode for a chmod to change: `None`, so the refusal says to make the
+/// record a private file of the user's, or to remove it.
+#[cfg(windows)]
+fn record_remedy(
+    dirs: &Dirs,
+    file: &Path,
+    error: &aterm_uds::private_file::PrivateFileError,
+) -> Option<String> {
+    let _ = (dirs, file, error);
+    None
+}
+
+/// `record` written whole and atomically, 0600 (on windows under the user's protected access
+/// list), in the private agh directory.
+#[cfg(any(unix, windows))]
 fn write_record(dirs: &Dirs, record: &Record) -> std::io::Result<()> {
     if record.dev.is_none() && record.release.is_none() {
         return aterm_uds::private_file::remove_private(&dirs.config, RECORD_FILE).map(|_| ());
@@ -1480,7 +1504,7 @@ fn write_record(dirs: &Dirs, record: &Record) -> std::io::Result<()> {
 /// # Errors
 /// Refused while another agh call writes the record, or when the lock is not private;
 /// could_not_run on I/O.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn record_lock(dirs: &Dirs) -> Result<super::provision::AuthEdit> {
     super::provision::AuthEdit::take_named(dirs, RECORD_LOCK, LOCK_NAME, record_wait(), lock_busy)
 }
@@ -1490,7 +1514,7 @@ fn record_lock(dirs: &Dirs) -> Result<super::provision::AuthEdit> {
 /// writes a record of a few hundred bytes, and lets go when it ends; a call that gave up at
 /// once recorded nothing, and its git run's helper, which reads the record, then answered
 /// nobody. In a test, what [`with_record_wait_for_tests`] says.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn record_wait() -> std::time::Duration {
     #[cfg(any(test, debug_assertions))]
     if let Some(wait) = RECORD_WAIT.get() {
@@ -1499,7 +1523,7 @@ fn record_wait() -> std::time::Duration {
     crate::journal::LOCK_WAIT
 }
 
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 thread_local! {
     static RECORD_WAIT: std::cell::Cell<Option<std::time::Duration>> =
         const { std::cell::Cell::new(None) };
@@ -1507,7 +1531,7 @@ thread_local! {
 
 /// Run `body` with this thread's calls waiting `wait` for the record's lock, as a holder that
 /// keeps it past the one-minute wait would be met.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 pub fn with_record_wait_for_tests<R>(wait: std::time::Duration, body: impl FnOnce() -> R) -> R {
     struct Restore(Option<std::time::Duration>);
     impl Drop for Restore {
@@ -1520,11 +1544,11 @@ pub fn with_record_wait_for_tests<R>(wait: std::time::Duration, body: impl FnOnc
 }
 
 /// What the record's lock is called in a refusal.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const LOCK_NAME: &str = "the vault record lock";
 
 /// The refusal when another agh call held the record's lock through [`record_wait`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn lock_busy() -> Error {
     Error::refused("another agh call held the vault adoption record's lock for a minute")
         .with_next("run the command again; a write of the record takes milliseconds")
@@ -1540,7 +1564,7 @@ fn lock_busy() -> Error {
 /// applies, or the record cannot be read or written: the next call learns it again. Returns
 /// each slot whose record moved to another login meanwhile, with that login (the call refuses
 /// it as `Found::Changed`), and why nothing could be recorded.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn record_learned(dirs: &Dirs, learned: &[Learn]) -> (Vec<(Slot, String)>, Option<Error>) {
     let mut moved = Vec::new();
     let _lock = match record_lock(dirs) {
@@ -1571,32 +1595,39 @@ fn record_learned(dirs: &Dirs, learned: &[Learn]) -> (Vec<(Slot, String)>, Optio
             "{}: {e}",
             tilde(&dirs.config.join(RECORD_FILE), &dirs.home)
         ))
-        .with_next(format!(
-            "make {shown} a private directory of yours that agh can write (chmod 700 {shown})"
-        ))
+        .with_next(private_dir_step(&shown))
     });
     (moved, written)
+}
+
+/// The step for the agh directory `shown` when the record could not be written in it.
+#[cfg(unix)]
+fn private_dir_step(shown: &str) -> String {
+    format!("make {shown} a private directory of yours that agh can write (chmod 700 {shown})")
+}
+
+/// The step for the agh directory `shown` when the record could not be written in it: a folder
+/// of the user's under a protected access list of the user and SYSTEM alone, which agh gives
+/// the folder it makes.
+#[cfg(windows)]
+fn private_dir_step(shown: &str) -> String {
+    format!(
+        "make {shown} a private folder of yours that agh can write (an access list of you and \
+         SYSTEM alone, inheriting nothing), as agh makes it when it is missing"
+    )
 }
 
 /// What would stop the record being written, judged without writing anything (`view`): the
 /// agh directory open to others or not a private directory of this user's, or the lock file
 /// occupied. `None` when nothing would, the directory missing included (agh makes it 0700).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn record_blocked(dirs: &Dirs) -> Option<Error> {
     use aterm_uds::private_file::{PrivateDir, judge_private_dir};
     let shown = tilde(&dirs.config, &dirs.home);
     match judge_private_dir(&dirs.config) {
         Ok(PrivateDir::Missing) => return None,
         Ok(PrivateDir::Private) => {}
-        Ok(PrivateDir::Open(_)) => {
-            let error = Error::refused(format!("{shown}: it is open to other users (want 0700)"));
-            return Some(
-                match super::chmod_remedy(&dirs.config, Path::new(""), &dirs.home) {
-                    Some(remedy) => error.with_next(remedy),
-                    None => error,
-                },
-            );
-        }
+        Ok(PrivateDir::Open(_)) => return Some(open_dir_refusal(dirs, &shown)),
         Err(e) => {
             let text = e
                 .to_string()
@@ -1620,13 +1651,35 @@ fn record_blocked(dirs: &Dirs) -> Option<Error> {
         })
 }
 
+/// The refusal of the agh directory `shown` (`dirs.config`) as open to other users, with the
+/// chmod that makes it private when one of this user's does.
+#[cfg(unix)]
+fn open_dir_refusal(dirs: &Dirs, shown: &str) -> Error {
+    let error = Error::refused(format!("{shown}: it is open to other users (want 0700)"));
+    match super::chmod_remedy(&dirs.config, Path::new(""), &dirs.home) {
+        Some(remedy) => error.with_next(remedy),
+        None => error,
+    }
+}
+
+/// The refusal of the agh folder `shown` as open to other users: its access list admits more
+/// than the user and SYSTEM, or inherits from its parent.
+#[cfg(windows)]
+fn open_dir_refusal(dirs: &Dirs, shown: &str) -> Error {
+    let _ = dirs;
+    Error::refused(format!(
+        "{shown}: it is open to other users (want an access list of you and SYSTEM alone)"
+    ))
+    .with_next(private_dir_step(shown))
+}
+
 /// `agh auth remove NAME` with no agh.toml (or one that says `vault = true`): the record
 /// forgets the login adopted for the vault token NAME names, so the next call learns it again.
 /// `false` when it held none.
 /// # Errors
 /// The record's refusal; refused when another agh call held the record's lock past
 /// [`record_wait`]; could_not_run when it cannot be written.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn forget_locked(dirs: &Dirs, slot: Slot) -> Result<bool> {
     let _lock = record_lock(dirs)?;
     let mut record = read_record(dirs).map_err(|fault| fault.error)?;
@@ -1645,7 +1698,7 @@ pub(crate) fn forget_locked(dirs: &Dirs, slot: Slot) -> Result<bool> {
 /// The record a test starts from: `(slot, fingerprint, login)` rows written as agh writes them.
 /// # Errors
 /// The write's.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 pub fn record_for_tests(dirs: &Dirs, rows: &[(Slot, &str, &str)]) -> std::io::Result<()> {
     if let Some(parent) = dirs.config.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
@@ -1667,7 +1720,7 @@ pub fn record_for_tests(dirs: &Dirs, rows: &[(Slot, &str, &str)]) -> std::io::Re
 /// plaintext file under `home/.secrets`.
 /// # Panics
 /// When the vault cannot be created, opened or published: a test's fixture failed.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 pub fn put_entry_for_tests(home: &Path, name: &str, value: Option<&[u8]>) {
     use aterm_secrets::{client, text::Audience};
     std::fs::create_dir_all(home).expect("the home");
@@ -1704,7 +1757,7 @@ pub fn put_entry_for_tests(home: &Path, name: &str, value: Option<&[u8]>) {
 /// the record.
 /// # Errors
 /// `record_lock`'s.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 pub fn hold_record_lock_for_tests(dirs: &Dirs) -> Result<impl Sized + use<>> {
     if let Some(parent) = dirs.config.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| Error::could_not_run(e.to_string()))?;
@@ -1714,6 +1767,6 @@ pub fn hold_record_lock_for_tests(dirs: &Dirs) -> Result<impl Sized + use<>> {
 
 /// The record's text, the seed agh.toml, and the rows adoption derives, against the rules they
 /// are read by.
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 #[path = "vault_tests.rs"]
 mod tests;

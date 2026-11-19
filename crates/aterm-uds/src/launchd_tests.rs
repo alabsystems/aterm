@@ -65,3 +65,43 @@ fn a_system_job_switch_is_read_from_launchds_disabled_list() {
     );
     assert_eq!(switched_off_of(None, &list(&row("disabled")), label), None);
 }
+
+#[test]
+fn an_ended_job_is_exact_complete_and_not_a_nested_or_ambiguous_state() {
+    let target = "gui/501/systems.alab.aterm.runtime.take-1";
+    let print = |body: &str| format!("{target} = {{\n{body}}}\n");
+    assert_eq!(
+        job_ended_in(target, &print("\tstate = not running\n\truns = 2\n")),
+        Ok(true)
+    );
+    assert_eq!(
+        job_ended_in(
+            target,
+            &print(
+                "\tstate = not running\n\truns = 2\n\tdescription = \"{\"\n\tchild = {\n\t\tvalue = ordinary = {\n\t}\n"
+            )
+        ),
+        Ok(true)
+    );
+    for body in [
+        "\tstate = not running\n\truns = 0\n",
+        "\tstate = running\n\truns = 2\n\tpid = 42\n\tchild = {\n\t\tstate = not running\n\t}\n",
+        "\tstate = not running\n\truns = 2\n\tpid = 42\n",
+    ] {
+        assert_eq!(job_ended_in(target, &print(body)), Ok(false));
+    }
+    for text in [
+        print("\tstate = not running\n"),
+        print("\tstate = not running\n\truns = unread\n"),
+        print("\tstate = not running\n\truns = 2\n\tpid = unread\n"),
+        print("\tstate = not running\n\truns = 2\n\truns = 2\n"),
+        print("\tstate = running\n\tstate = not running\n\truns = 2\n"),
+        format!("{target} = {{\n\tstate = not running\n\truns = 2\n"),
+        format!("{target} = {{\n\tstate = not running\n\truns = 2\n\tchild = {{\n}}\n"),
+        format!("{target} = {{\n\tstate = not running\n\truns = 2\n}}\n\tchild = {{\n}}\n"),
+        format!("{target} = {{\n\tchild = {{\n\tstate = not running\n\truns = 2\n\t}}\n}}\n"),
+        "gui/501/someone-else = {\n\tstate = not running\n\truns = 2\n}\n".into(),
+    ] {
+        assert!(job_ended_in(target, &text).is_err(), "{text}");
+    }
+}

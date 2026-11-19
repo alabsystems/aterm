@@ -130,7 +130,7 @@ fn authorize_scope(
         return Err("native-checked-conversation-changed");
     }
     let now_us = Clock::System.now_us().ok_or("native-checked-clock")?;
-    if !matches!(request.asked, Some(AskedIntent::Relaunch(_)))
+    if !request.checked_relaunch()
         || !asked_upgrade::shape(request)
         || host_epoch() != Some(request.host_epoch.as_str())
         || request.expected_human_seq != Some(ctx.human_input.seq())
@@ -291,7 +291,7 @@ pub(super) fn reclaim_pending(table: &mut Operations, now_us: u64) {
 
 /// Transfer into the queued operation; the producer can still revoke across journal I/O.
 pub(super) fn accept(table: &mut Operations, op: &Operation) -> bool {
-    if !matches!(op.request.asked, Some(AskedIntent::Relaunch(_))) {
+    if !op.request.checked_relaunch() {
         return true;
     }
     let Some(permit) = op
@@ -315,7 +315,7 @@ pub(super) fn accept(table: &mut Operations, op: &Operation) -> bool {
 
 /// The last post-journal admission point, under Meta -> table -> operation.
 pub(super) fn finish_admission(table: &mut Operations, op: &Operation) -> bool {
-    if !matches!(op.request.asked, Some(AskedIntent::Relaunch(_))) {
+    if !op.request.checked_relaunch() {
         return true;
     }
     let Some(permit) = op

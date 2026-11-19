@@ -89,6 +89,14 @@ fn key_binds_the_actual_finalized_cwd_and_whole_environment() {
         &[],
     );
     let baseline = content_key(REDRAW_GROUP, CONTEXT, &executables, Some(&baseline_runtime));
+    let mut program_drift = baseline_runtime.clone();
+    program_drift.commands[0].program =
+        b"/private/tmp/another-image/aterm-redraw-conformance".to_vec();
+    assert_ne!(
+        baseline,
+        content_key(REDRAW_GROUP, CONTEXT, &executables, Some(&program_drift)),
+        "equal bytes at a different executable path cannot borrow the original runtime proof"
+    );
     let cwd_drift = runtime(
         "/private/tmp/.ubd/aterm-verify-appkit-501.noindex/other",
         &[],
@@ -156,4 +164,89 @@ fn event_is_bounded_structured_evidence() {
     );
     assert_eq!(value["reused"].as_bool(), Some(true));
     assert_eq!(value["executables"].as_array().unwrap().len(), 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn appkit_build_receipt_requires_unique_original_bytes_and_matching_native_completion() {
+    let root = std::path::Path::new("/private/owned/build");
+    let manifest = root.join("crates/aterm-gui/Cargo.toml");
+    let binary = root.join(crate::stages::REDRAW_CONFORMANCE_BIN);
+    let paths = [(crate::stages::REDRAW_CONFORMANCE_BIN, binary.clone())];
+    let row = aterm_json::json!({
+        "reason":"compiler-artifact", "manifest_path":manifest,
+        "target":{"name":crate::stages::REDRAW_CONFORMANCE_BIN,"kind":["bin"]},
+        "executable":binary, "trust_compile_mode":"build", "trust_compile_kind":"host",
+        "trust_compile_target":format!("{}-apple-darwin",std::env::consts::ARCH),
+        "trust_unit_identity_sha256":"a".repeat(64), "trust_executable_sha256":"b".repeat(64),
+        "profile":{"test":false,"debug_assertions":true}
+    });
+    let finished = "{\"reason\":\"build-finished\",\"success\":true}";
+    let render = |value: &aterm_json::Value| {
+        format!("{}\n{finished}\n", aterm_json::to_string(value).unwrap())
+    };
+    let good = render(&row);
+    assert_eq!(
+        producer_digests(&paths, &good, &manifest).unwrap()[crate::stages::REDRAW_CONFORMANCE_BIN],
+        "b".repeat(64)
+    );
+    for (field, bad) in [
+        ("trust_executable_sha256", aterm_json::Value::Null),
+        ("trust_executable_sha256", aterm_json::json!("B".repeat(64))),
+        ("manifest_path", aterm_json::json!("/another/Cargo.toml")),
+        ("executable", aterm_json::json!("/another/executable")),
+        ("trust_compile_mode", aterm_json::json!("test")),
+        ("trust_compile_kind", aterm_json::json!("target")),
+        (
+            "trust_compile_target",
+            aterm_json::json!("x86_64-unknown-linux-gnu"),
+        ),
+        (
+            "profile",
+            aterm_json::json!({"test":true,"debug_assertions":true}),
+        ),
+        (
+            "profile",
+            aterm_json::json!({"test":false,"debug_assertions":false}),
+        ),
+        (
+            "target",
+            aterm_json::json!({"name":"another-target","kind":["bin"]}),
+        ),
+        (
+            "target",
+            aterm_json::json!({"name":crate::stages::REDRAW_CONFORMANCE_BIN,"kind":["example"]}),
+        ),
+    ] {
+        let mut value = row.clone();
+        value.as_object_mut().unwrap().insert(field.to_owned(), bad);
+        assert!(
+            producer_digests(&paths, &render(&value), &manifest).is_err(),
+            "{field}"
+        );
+    }
+    let original = aterm_json::to_string(&row).unwrap();
+    let mut conflicting = row.clone();
+    conflicting.as_object_mut().unwrap().insert(
+        "trust_executable_sha256".into(),
+        aterm_json::json!("c".repeat(64)),
+    );
+    for bad in [
+        original.clone(),
+        format!("{original}\n{original}\n{finished}"),
+        format!(
+            "{original}\n{}\n{finished}",
+            aterm_json::to_string(&conflicting).unwrap()
+        ),
+        format!("{good}{finished}\n"),
+        format!("{original}\n{{\"reason\":\"build-finished\",\"success\":false}}"),
+        format!("{original}\n{{\"reason\":\"build-finished\",\"success\":true,\"success\":true}}"),
+        format!("{original}\nnot compiler stdout\n{finished}"),
+        format!(
+            "{}\n{finished}",
+            original.replacen('{', "{\"trust_executable_sha256\":\"different\",", 1)
+        ),
+    ] {
+        assert!(producer_digests(&paths, &bad, &manifest).is_err());
+    }
 }

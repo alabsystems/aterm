@@ -6,6 +6,51 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[test]
+fn strip_event_codec_preserves_original_private_scope_and_withholds_legacy_authority() {
+    use aterm_vitals::events::{EventScope, EventSpan, SessionScope};
+    let marker = StripEvent {
+        at_unix_ms: T0 + 1_000,
+        kind: StripEventKind::SleepWake,
+        label: "original private marker".into(),
+        scope: EventScope::Session(SessionScope {
+            local: 7,
+            sid: "t0000000001".into(),
+            nonce: "11".repeat(16),
+        }),
+        span: Some(EventSpan {
+            onset_unix_ms: T0,
+            end_unix_ms: T0 + 1_000,
+        }),
+    };
+    let saved = SavedStrip {
+        last_wall_ms: T0 + 2_000,
+        strip_events: vec![marker.clone()],
+        ..SavedStrip::default()
+    };
+    let encoded = super::base_json(&saved, 1).unwrap();
+    let (_, restored) = super::base_of(&encoded).unwrap();
+    assert_eq!(restored.strip_events, vec![marker]);
+    let mut old_document: super::BaseDoc = aterm_json::from_str(&encoded).unwrap();
+    old_document.schema = 4;
+    let (_, old) = super::base_of(&aterm_json::to_string(&old_document).unwrap()).unwrap();
+    assert_eq!(old.strip_events[0].scope, EventScope::Unknown);
+    assert_eq!(old.strip_events[0].span, None);
+    let legacy: super::EventDoc =
+        aterm_json::from_str(r#"[1234,"crash","legacy private label"]"#).unwrap();
+    let legacy = super::event_of(legacy).unwrap();
+    assert_eq!(legacy.scope, EventScope::Unknown);
+    assert_eq!(legacy.span, None);
+    assert_eq!(legacy.at_unix_ms, 1234);
+    let malformed: super::EventDoc = aterm_json::from_str(
+        r#"[1234,"crash","unbound label",["session",7,"not-a-session","bad-nonce"],[2000,1000]]"#,
+    )
+    .unwrap();
+    let malformed = super::event_of(malformed).unwrap();
+    assert_eq!(malformed.scope, EventScope::Unknown);
+    assert_eq!(malformed.span, None);
+}
+
 use aterm_vitals::blockage::{Blockage, BlockageBox};
 use aterm_vitals::heat::{
     ClockRange, Counters, HeatBook, PressureBox, ThermalPressure, UsualClocks,
@@ -536,6 +581,17 @@ fn a_full_strip_base_fits_within_85_percent_of_its_cap() {
             .collect(),
         strip_events: (0..STRIP_HISTORY_CAP as i64)
             .map(|j| StripEvent {
+                scope: aterm_vitals::events::EventScope::Session(
+                    aterm_vitals::events::SessionScope {
+                        local: u64::MAX,
+                        sid: "s-00000000000000000000".into(),
+                        nonce: "ff".repeat(16),
+                    },
+                ),
+                span: Some(aterm_vitals::events::EventSpan {
+                    onset_unix_ms: i64::MIN,
+                    end_unix_ms: i64::MAX,
+                }),
                 at_unix_ms: T0 + j * 100_000,
                 kind: StripEventKind::PressureSpike,
                 label: "memory pressure critical".into(),
@@ -1020,6 +1076,8 @@ fn a_restored_strip_keeps_the_gaps_events_and_places_of_its_tail() {
         kind: GapKind::Sleep,
     };
     let event = StripEvent {
+        scope: aterm_vitals::events::EventScope::Machine,
+        span: None,
         at_unix_ms: T0 + 12_400,
         kind: StripEventKind::SleepWake,
         label: "wake".into(),

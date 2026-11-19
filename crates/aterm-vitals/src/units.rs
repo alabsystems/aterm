@@ -240,8 +240,26 @@ pub struct Units {
     pub churn: Option<Rate>,
     /// The swap column, where memory was read.
     pub swap: Option<Swap>,
-    /// The device tiles, home's first, at most [`DISK_UNITS`].
+    /// The readable device tiles in request order, at most [`DISK_UNITS`]. Home may be absent.
     pub disks: Vec<Disk>,
+    /// Home's device resolved in this reading, independently of whether its counters read.
+    /// No older reading supplies this identity.
+    pub home_device_id: Option<String>,
+}
+
+impl Units {
+    /// The unique current device reading bound to home. Missing, invalid, unmatched or
+    /// ambiguous identities never select another device by position, name or attachment.
+    #[must_use]
+    pub fn home_disk(&self) -> Option<&Disk> {
+        let id = self
+            .home_device_id
+            .as_deref()
+            .filter(|id| is_device_id(id))?;
+        let mut matching = self.disks.iter().filter(|disk| disk.id == id);
+        let disk = matching.next()?;
+        matching.next().is_none().then_some(disk)
+    }
 }
 
 /// What one reading gives the units.
@@ -270,8 +288,10 @@ pub(crate) struct UnitReading<'a> {
     pub swap_bps: Option<f64>,
     /// Swap in use, where memory was read.
     pub swap_used: Option<u64>,
-    /// The devices read, home's first.
+    /// The devices whose counters read, in request order.
     pub block: &'a [BlockSample],
+    /// Home's device resolved in this same reading, before counter refusal or deduplication.
+    pub home_device_id: Option<&'a str>,
 }
 
 /// One device's running state.
@@ -391,6 +411,10 @@ impl UnitRings {
             churn,
             swap,
             disks,
+            home_device_id: r
+                .home_device_id
+                .filter(|id| is_device_id(id))
+                .map(str::to_owned),
         }
     }
 

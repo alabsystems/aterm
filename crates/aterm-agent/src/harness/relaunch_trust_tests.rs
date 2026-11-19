@@ -153,6 +153,7 @@ fn stand_in(path: &Path, out: &Path) {
 /// a `[harness]` file that trusts no folder, the store build is not started either.
 #[test]
 fn a_live_plan_starts_only_a_store_build_and_only_in_a_session_nothing_holds() {
+    let _start_wait = crate::harness::launch_trust::start_fixture::while_working();
     const SESSION: &str = "0b5e7a11-f100-4a2b-9c3d-5e6f70819a2b";
     const SHELL: u32 = 999_999;
     let tmp = aterm_tempfile::TempDir::new().expect("tmp");

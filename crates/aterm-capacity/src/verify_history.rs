@@ -202,6 +202,14 @@ pub fn stage_records(path: &Path) -> Records {
     Domain::Stages.load(path)
 }
 
+/// Read the weaker shaping book only for a selection that can have a unit floor.
+pub(super) fn unit_floor(path: &Path, key: &Key) -> u64 {
+    if key.unit_floor_selection().is_none() {
+        return 0;
+    }
+    Domain::Units.load(path).unit_floor(key)
+}
+
 /// Keep a measured stage or planner refusal in the versioned aggregate book. Weak unit keys
 /// are refused; the existing light-run guard and durable, bounded publication are retained.
 pub fn keep_stage(

@@ -14,7 +14,7 @@ use crate::{child_output, ctl_accept, headless_boot, launch_isolation};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Hang-detector ceiling for waiting on a debug binary.
 const CEILING: Duration = Duration::from_secs(90);
@@ -120,8 +120,8 @@ fn ctl(root: &Path, sock: &Path, args: &[&str], stdin: &[u8]) -> Output {
             .expect("ctl stdin")
             .write_all(stdin)
             .expect("write ctl stdin");
-        child_output::wait_and_read(child, Instant::now() + Duration::from_secs(60))
-            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+        child_output::wait_and_read(child, Duration::from_secs(60))
+            .unwrap_or_else(|why| panic!("aterm ctl {args:?} was killed before it exited: {why}"))
     })
 }
 

@@ -518,6 +518,38 @@ fn an_observation_wake_owes_the_journal_nothing_and_a_desk_wake_owes_it_a_captur
     );
 }
 
+/// A desk mark marks both lanes and counts once in the ledger it is given (`desk_activity`, which
+/// `metrics reset` zeroes), so the loop's count is every mark the journal and the walker took.
+#[test]
+fn a_desk_mark_owes_both_lanes_and_counts_once() {
+    let mut app = App::headless_for_test();
+    let _ = app.crash_journal.take_dirty();
+    assert!(
+        app.diskwalk
+            .facts_now(std::time::Instant::now(), false, true),
+        "the first service reads the facts"
+    );
+    let ledger = crate::metrics::Metrics::new();
+    let count = || {
+        let ctx = crate::metrics::wire::ReadCtx::inert(&ledger, 0);
+        let text =
+            crate::metrics::wire::render_text(|s| crate::metrics::emit_summary(&ctx, None, s));
+        text.split_whitespace()
+            .find_map(|field| field.strip_prefix("desk_activity="))
+            .map(str::to_string)
+    };
+    assert_eq!(count().as_deref(), Some("0"), "no mark yet");
+    crate::desk_moved(&mut app.crash_journal, &mut app.diskwalk, &ledger);
+    assert!(app.crash_journal.take_dirty(), "the journal owes a capture");
+    assert!(
+        app.diskwalk.facts_deadline(true).is_some(),
+        "the walker owes a read of the panes' facts"
+    );
+    assert_eq!(count().as_deref(), Some("1"), "the mark is counted once");
+    ledger.reset();
+    assert_eq!(count().as_deref(), Some("0"), "metrics reset zeroes it");
+}
+
 /// What each control read's handler (the function its `Wake` arm calls) leaves of the desk: the
 /// restore image captured after it equals the one captured before it, and each answered.
 #[test]

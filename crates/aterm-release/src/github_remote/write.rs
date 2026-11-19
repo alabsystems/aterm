@@ -9,8 +9,10 @@
 //! push from this Mac, another cutter's, or this process's own lease worker. That refusal
 //! sent nothing, so the path waits for the named intent to close, reading agh's journal
 //! through its library (`Journal::view`, no subprocess), and makes the write again; the
-//! native push then judges the refs as they are. The threads of one process take turns
-//! before they begin, so they never meet each other's intents at all.
+//! native push then judges the refs as they are. Behind an intent whose writer is gone, each
+//! push reads that intent's batch from origin, and a write it still refuses is made again
+//! after a doubling pause, a bounded number of times ([`RECONCILE_PAUSE`]). The threads of
+//! one process take turns before they begin, so they never meet each other's intents at all.
 
 use super::{Remote, STALL_WINDOW, origin_slug};
 use agh::IntentStore as _;
@@ -28,12 +30,31 @@ use std::time::Duration;
 /// ends; intent 1967-fc387e8b41a0 of 2026-11-13: begun 11:13:01, created by 11:13:54), and a
 /// cut, its lease worker and three landings were writing at once. Five minutes is six such
 /// writes in turn, and under the half hour of the shortest lease
-/// (`line_claim::lease_s`). An intent open past it whose writer died, or whose outcome is
-/// unknown, stops writes until agh's window for it ends (`agh::Journal::closable`); the
-/// refusal names it, and a write made after that window begins.
+/// (`line_claim::lease_s`). An intent whose writer, agh and its git child alike, is gone is
+/// `closable` (`agh::Journal::closable`): that closes nothing, and no window passes after which
+/// it does. It lets the next native write read the intent's recorded batch from origin before
+/// it begins, closing it only where every ref reads as before its write (retracted) or every
+/// one as after it (found), so the wait on it ends and the write is made again, paced
+/// ([`RECONCILE_PAUSE`]). No time releases an intent: one whose writer still runs or could not
+/// be judged gone, one that records no writer, and one whose refs origin answers neither way
+/// stay open, and once this wait is spent a write one of them still stops ends refused, naming
+/// it.
 pub(super) const INTENT_WAIT: Duration = Duration::from_secs(300);
-/// How often a waiting write reads the journal for the intent it waits on.
+/// How often a waiting write reads the journal for the intent it waits on, and the slice of
+/// a pause ([`RECONCILE_PAUSE`]) between two looks at whether the write should stop.
 pub(super) const INTENT_POLL: Duration = Duration::from_millis(500);
+/// The first pause before a write is made again behind an intent whose writer is gone, once a
+/// push made after this write found that writer gone was refused again: agh read the intent's
+/// refs on origin neither wholly as before its write nor wholly as after it, or could not read
+/// them, and its refusal is the same for both. The pause doubles each time (2, 4, 8, 16 and
+/// 32 s, 62 s in all, inside [`INTENT_WAIT`]), so a read failure that clears is outlasted and a
+/// mixed origin, which stays mixed until someone retracts the intent, ends the write after
+/// seven pushes, each a read of origin that sent nothing, instead of one read after another
+/// for the whole wait.
+pub(super) const RECONCILE_PAUSE: Duration = Duration::from_secs(2);
+/// How many pauses ([`RECONCILE_PAUSE`]) a write takes in a row behind one intent whose writer
+/// is gone before it ends refused, naming the intent and `agh intent retract`.
+pub(super) const RECONCILE_RETRIES: u32 = 5;
 
 /// What a write asked of each ref: the object it holds afterwards, or `None` for its absence.
 type Wanted = Vec<(String, Option<String>)>;
@@ -69,6 +90,17 @@ pub(crate) fn intent_wait() -> Option<String> {
         .cloned()
 }
 
+/// Every line of a wait that this process's threads are in now: a test asks whether its own
+/// wait's line is held, which [`intent_wait`] (the first line, any thread's) cannot answer
+/// while other tests wait beside it.
+#[cfg(test)]
+pub(super) fn intent_waits() -> Vec<String> {
+    WAITING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 /// One thread's wait, in [`WAITING`] until it is dropped.
 struct Waiting(String);
 
@@ -98,7 +130,7 @@ struct Asked<'a> {
     request: String,
     /// What the write asks of each ref.
     wanted: Wanted,
-    /// Whether a wait behind another writer's intent should end now.
+    /// Whether a wait or a pause behind another writer's intent should end now.
     stop: &'a dyn Fn() -> bool,
 }
 
@@ -133,9 +165,32 @@ pub(super) fn control_request(
     agh::fx::canon::request_digest(&agh::fx::canon::git_request(&run))
 }
 
+/// The pushes made behind one intent whose writer is gone, carried across the passes of one
+/// [`Remote::journaled`] call: agh's next push reads such an intent's batch from origin, and
+/// each refusal after that read is paced ([`RECONCILE_PAUSE`]) and counted
+/// ([`RECONCILE_RETRIES`]).
+#[derive(Default)]
+struct Reconciling {
+    /// The intent, once a pass of this write found its writer gone.
+    intent: Option<agh::IntentId>,
+    /// The pauses this write took behind it so far.
+    repeats: u32,
+}
+
+impl Reconciling {
+    /// A write that found `intent`'s writer gone just now and has paused behind it not yet.
+    fn of(intent: &agh::IntentId) -> Self {
+        Self {
+            intent: Some(intent.clone()),
+            repeats: 0,
+        }
+    }
+}
+
 /// What a refused write does once the intent that refused it was looked at.
 enum After {
-    /// The intent is closed: judge the refs again by making the write.
+    /// Make the write again, where the native push judges the refs as they then are: the
+    /// intent closed, or its writer is gone and that push reads its batch from origin first.
     Again,
     /// The intent was an earlier attempt at this same write, and origin holds every ref it
     /// asked for: the write is made, and nothing is sent again.
@@ -225,8 +280,8 @@ impl Remote {
         self.ref_result(self.write_batch_result(batch, &|| false)?)
     }
 
-    /// A claim's compare-and-swap. `stop` ends a wait behind another writer's intent (the
-    /// lease worker's monitor stopping): the write is then refused, having sent nothing.
+    /// A claim's compare-and-swap. `stop` ends a wait or a pause behind another writer's intent
+    /// (the lease worker's monitor stopping): the write is then refused, having sent nothing.
     pub(crate) fn write_claim_ref(
         &self,
         reference: &str,
@@ -308,13 +363,15 @@ impl Remote {
     /// A refusal that names an open intent and sent nothing (agh's `intent_open`) is not the
     /// end of the write: [`Self::after_intent`] waits for that intent to close, within
     /// [`INTENT_WAIT`] over the whole call, and `push` runs again, where the native push
-    /// reads the refs as they then are. An intent that is an earlier attempt at this same
-    /// write (the same `request`) is never posted again while origin holds what it asked
-    /// for: that is agh's own rule for an uncertain push (`git::run`: only a complete read
-    /// of every requested ref at its new object establishes the write; anything else leaves
-    /// the intent open), recorded as agh records a discovery (`IntentStore::observe`). This
-    /// write's own lost answer is settled the same way before the call returns. Every other
-    /// refusal is returned as it came.
+    /// reads the refs as they then are. Behind an intent whose writer is gone, where that push
+    /// reads the intent's batch from origin first, each refusal after the first is paced and
+    /// counted ([`RECONCILE_PAUSE`], [`RECONCILE_RETRIES`]). An intent that is an earlier
+    /// attempt at this same write (the same `request`) is never posted again while origin
+    /// holds what it asked for: that is agh's own rule for an uncertain push (`git::run`: only
+    /// a complete read of every requested ref at its new object establishes the write;
+    /// anything else leaves the intent open), recorded as agh records a discovery
+    /// (`IntentStore::observe`). This write's own lost answer is settled the same way before
+    /// the call returns. Every other refusal is returned as it came.
     fn journaled(
         &self,
         asked: &Asked<'_>,
@@ -326,6 +383,7 @@ impl Remote {
             .map_err(|error| self.native_write_error(&error))?;
         let turn = turn(intents.path());
         let mut since = None;
+        let mut reconciling = Reconciling::default();
         loop {
             let outcome = {
                 let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
@@ -367,7 +425,7 @@ impl Remote {
                 Some(began) => began,
                 None => *since.insert(self.mono()?),
             };
-            match self.after_intent(&intents, &intent, &error, asked, began)? {
+            match self.after_intent(&intents, &intent, &error, asked, began, &mut reconciling)? {
                 After::Again => {}
                 After::Made => return Ok(Ok(())),
             }
@@ -376,12 +434,16 @@ impl Remote {
 
     /// Look at the open intent that refused a write (`error`, which sent nothing), and wait
     /// for it to close: until `began` + [`INTENT_WAIT`], saying one line, and for as long as
-    /// `stop` allows.
+    /// `stop` allows and no signal interrupted the release. Behind an intent whose writer is
+    /// gone, the first refusal makes the write again at once (the push it came from may have
+    /// found that writer alive, or not read the intent from origin), and each later one after a
+    /// pause ([`Self::pace`]), counted in `reconciling` across the call's passes.
     ///
     /// # Errors
     /// The original refusal, with how long the write waited, once the bound passes with the
     /// intent still open: its words name the intent and `agh intent show`. A journal or
-    /// origin that could not be read, and a stopped wait, refuse the same way.
+    /// origin that could not be read, a stopped or interrupted wait, and a gone writer's intent
+    /// that origin settled neither way through [`RECONCILE_RETRIES`] pauses refuse the same way.
     fn after_intent(
         &self,
         intents: &agh::Journal,
@@ -389,6 +451,7 @@ impl Remote {
         error: &agh::Error,
         asked: &Asked<'_>,
         began: Duration,
+        reconciling: &mut Reconciling,
     ) -> Result<After, String> {
         let refused = |why: &str| format!("{}; {why}", self.native_write_error(error));
         let view = |what: &str| match intents.view(intent) {
@@ -414,13 +477,24 @@ impl Remote {
             Ok(After::Made)
         };
         let holds = || self.holds(&asked.wanted).map_err(|why| refused(&why));
-        // A dead writer lets the next atomic write reconcile its exact batch from origin
-        // (`agh::Journal::closable`), so the wait ends and recovery can proceed.
+        // A dead writer lets the next atomic write read its exact batch from origin
+        // (`agh::Journal::closable`): the wait on it ends, and the write is made again.
         let stops = |seen: &agh::journal::IntentView| {
             intents
                 .closable(seen)
                 .map(|closable| seen.open && !closable)
                 .map_err(|clock| refused(&clock.why))
+        };
+        // A stopped monitor, or a release a signal interrupted, starts no further remote
+        // operation.
+        let halted = || match (self.interrupted)() {
+            Some(signal) => Err(refused(&format!(
+                "stopped by signal {signal} while waiting for intent {intent} to close"
+            ))),
+            None if (asked.stop)() => Err(refused(&format!(
+                "stopped while waiting for intent {intent} to close"
+            ))),
+            None => Ok(()),
         };
         if seen.open && own && holds()? {
             self.found(intents, intent)?;
@@ -447,33 +521,111 @@ impl Remote {
                         waited.as_secs()
                     )));
                 }
-                if (asked.stop)() {
-                    return Err(refused(&format!(
-                        "stopped while waiting for intent {intent} to close"
-                    )));
-                }
+                halted()?;
                 self.client
                     .fx()
                     .sleep(INTENT_POLL)
                     .map_err(|clock| refused(&clock.why))?;
                 seen = view("while waiting")?;
             }
-        } else if self.mono()?.saturating_sub(began) >= INTENT_WAIT {
-            return Err(refused(&format!(
-                "other writers' intents kept this write from beginning for {} s",
-                INTENT_WAIT.as_secs()
-            )));
+            halted()?;
+            if seen.open {
+                // The wait ended on its writer's death: the push made next reads the intent
+                // from origin, so a refusal after it is paced.
+                *reconciling = Reconciling::of(intent);
+            }
+        } else {
+            let waited = self.mono()?.saturating_sub(began);
+            if waited >= INTENT_WAIT {
+                return Err(refused(&format!(
+                    "other writers' intents kept this write from beginning for {} s",
+                    INTENT_WAIT.as_secs()
+                )));
+            }
+            halted()?;
+            // Open and not waited on: closable, so its writer is gone.
+            if seen.open {
+                if reconciling.intent.as_ref() == Some(intent) {
+                    self.pace(
+                        intent,
+                        reconciling,
+                        INTENT_WAIT.saturating_sub(waited),
+                        &refused,
+                        &halted,
+                    )?;
+                    seen = view("after a pause")?;
+                } else {
+                    *reconciling = Reconciling::of(intent);
+                }
+            }
         }
-        // However the intent closed (its writer settled it, a read found it, or another
-        // writer's begin closed it once its writer could send nothing more), what origin holds
-        // decides whether this write landed.
+        // Whether the intent closed (its writer settled it, a read found it, or another write's
+        // origin read retracted or found it once its writer was gone) or its writer is gone and
+        // the next write reads it from origin, what origin holds decides whether this write
+        // landed.
         if own && holds()? {
             if seen.open {
                 self.found(intents, intent)?;
             }
             return made("that its writer finished");
         }
+        // The last look before the write is made again: a stop or a signal that came while the
+        // intent closed, or while origin was read above, starts no further push.
+        halted()?;
         Ok(After::Again)
+    }
+
+    /// Pause before the write is made again behind `intent`, whose writer is gone and which a
+    /// push made since this write found that writer gone refused again: [`RECONCILE_PAUSE`],
+    /// doubled for each pause `reconciling` counts, within `room` (what is left of
+    /// [`INTENT_WAIT`]), in [`INTENT_POLL`] slices with a look at `halted` before each and after
+    /// the last, saying one line that the lease heartbeat reads as this thread's evidence
+    /// ([`intent_wait`]).
+    ///
+    /// # Errors
+    /// `refused`'s words, naming the intent and `agh intent show`, once [`RECONCILE_RETRIES`]
+    /// pauses were taken; `halted`'s; and a clock that could not sleep.
+    fn pace(
+        &self,
+        intent: &agh::IntentId,
+        reconciling: &mut Reconciling,
+        room: Duration,
+        refused: &dyn Fn(&str) -> String,
+        halted: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if reconciling.repeats >= RECONCILE_RETRIES {
+            return Err(refused(&format!(
+                "intent {intent}'s writer is gone, and the {} pushes made since each found its \
+                 refs on origin neither wholly as before nor wholly as after its write, or could \
+                 not read them; nothing was sent; `agh intent show {} {intent}` shows its batch, \
+                 and once origin shows what that write did, `agh intent retract` closes it",
+                RECONCILE_RETRIES + 1,
+                self.slug
+            )));
+        }
+        let pause = RECONCILE_PAUSE
+            .saturating_mul(1 << reconciling.repeats)
+            .min(room);
+        reconciling.repeats += 1;
+        let line = format!(
+            "intent {intent}'s writer is gone and origin did not settle it; this write sent \
+             nothing and is made again in {} s ({} of {RECONCILE_RETRIES})",
+            pause.as_secs_f64(),
+            reconciling.repeats
+        );
+        let _waiting = Waiting::new(&line);
+        (self.notice)(&line);
+        let mut left = pause;
+        while !left.is_zero() {
+            halted()?;
+            let slice = left.min(INTENT_POLL);
+            self.client
+                .fx()
+                .sleep(slice)
+                .map_err(|clock| refused(&clock.why))?;
+            left = left.saturating_sub(slice);
+        }
+        halted()
     }
 
     /// Whether origin now holds every ref as the write asked: one complete read of each.

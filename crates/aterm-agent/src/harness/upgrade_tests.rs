@@ -1007,6 +1007,7 @@ fn idle_facts() -> Facts {
         quiet: false,
         unnoticed: false,
         own_hold_s: 0,
+        tell_rests: false,
         tells: 0,
         waits_only: false,
         follows_only: false,

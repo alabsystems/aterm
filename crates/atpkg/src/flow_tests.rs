@@ -7670,7 +7670,7 @@ fn a_retained_harness_build_is_admitted_as_a_staged_one_is() {
     );
     assert!(crate::pin::is_pinned(&layout, "hx-alab").unwrap());
     assert!(
-        crate::pin::is_held(&layout, "hx-alab").unwrap(),
+        crate::pin::is_held(&layout, "hx-alab"),
         "the hold is this install's"
     );
     // An older atpkg kept no records beside it.
@@ -7708,12 +7708,12 @@ fn a_named_harness_install_never_takes_over_the_persons_pin() {
     let layout = layout(&dir);
     let fake = fixture_with_harness(&dir, None, None);
     install_harness_build(&fake, &layout, &anchor(), fl(0), 0, &HX, named(4, None)).unwrap();
-    assert!(crate::pin::is_held(&layout, "hx-alab").unwrap());
+    assert!(crate::pin::is_held(&layout, "hx-alab"));
     crate::pin::set_held(&layout, "hx-alab", false).unwrap();
     install_harness_build(&fake, &layout, &anchor(), fl(0), 0, &HX, named(4, None)).unwrap();
     assert!(crate::pin::is_pinned(&layout, "hx-alab").unwrap());
     assert!(
-        !crate::pin::is_held(&layout, "hx-alab").unwrap(),
+        !crate::pin::is_held(&layout, "hx-alab"),
         "the person's pin stays theirs"
     );
 }

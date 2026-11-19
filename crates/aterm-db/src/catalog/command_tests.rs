@@ -491,7 +491,7 @@ fn vault_fill_commons_status_meter_equals_a_header_census() {
     assert_eq!(observed["held_bytes"], json!(bytes(&census)));
     assert_eq!(
         observed["byte_bound"],
-        json!(aterm_secrets::membership_log::MAX_RECORDS_STREAM)
+        json!(aterm_secrets::membership_log::Reading::ONE.capacity())
     );
     assert_eq!(
         observed["record_bytes"],

@@ -30,7 +30,12 @@ target-trust.noindex
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
-.claude/
+
+# Claude Code's per-person state (settings.local.json, worktrees) stays local; the
+# project settings and the in-repo plugins under .claude/skills/ are shared.
+**/.claude/*
+!/.claude/settings.json
+!/.claude/skills/
 
 # Release-cut output (`ship cut` / `--dry-run`): dist/cut-<build>.noindex/, the DMG +
 # dSYM + build.txt artifacts, and the resumable cut journal dist/cut-state.toml.

@@ -312,6 +312,9 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
             Some("team acct %"),
         ),
     };
+    assert!(
+        matches!(&asked, RelayHeader::Drive { requester, .. } if requester.sid() == Some("tqn5r6e0148"))
+    );
     assert_eq!(asked.encode().split_ascii_whitespace().count(), 5);
     assert_eq!(
         RelayHeader::parse(&asked.encode()).expect("parse drive naming its requester"),
@@ -413,6 +416,7 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
             usage_7d_pct: Some((idx % 80) as u32),
             week_reset: Some(1_793_500_000),
             walled_until: None,
+            model_walls: BTreeMap::new(),
             last_used: Some(1_793_159_900),
             read_at: None,
             launch: None,
@@ -1167,17 +1171,18 @@ fn serve_node_on(
     state: &Path,
     members: Option<Arc<LocalLog>>,
 ) -> (Arc<Stop>, std::thread::JoinHandle<ExitCode>) {
-    serve_node_reading(prebound, root, relay_dir, state, (members, None))
+    serve_node_reading(prebound, root, relay_dir, state, (members, None), None)
 }
 
 /// [`serve_node_on`], its deny list read from the vault at `vault_paths` (`None`: none, so it
-/// names no one).
+/// names no one), each generation it starts told to `on_generation`.
 fn serve_node_reading(
     prebound: TcpListener,
     root: &Path,
     relay_dir: &Path,
     state: &Path,
     (members, vault_paths): (Option<Arc<LocalLog>>, Option<aterm_secrets::client::Paths>),
+    on_generation: Option<super::OnGeneration>,
 ) -> (Arc<Stop>, std::thread::JoinHandle<ExitCode>) {
     let addr = prebound.local_addr().unwrap();
     let config_path = root.join(format!("node-{}.toml", addr.port()));
@@ -1195,7 +1200,7 @@ fn serve_node_reading(
         members,
         alab_browse: None,
         prebound_listener: Some(prebound),
-        on_generation: None,
+        on_generation,
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
@@ -1532,6 +1537,7 @@ fn custody_move_rejects_an_old_secrets_open_facts_push() {
             relays.path(),
             &state,
             (members, Some(vault.clone())),
+            None,
         );
         let peer = seed_id(&root.path().join("peer"));
         let tcp = TcpStream::connect(addr).unwrap();
@@ -1611,6 +1617,18 @@ fn custody_move_rejects_an_old_secrets_open_facts_push() {
 
 /// Unread local custody withdraws admission even when the deny cache retains a verified list.
 /// Removing the invalid configuration restores this explicitly standalone fleet's custody.
+///
+/// While the custody is unread the job starts no generation: its loop rests on its inputs
+/// (`fleet_inputs::idles` counts each rest as it begins), and nothing it waits for moves until the
+/// test removes the configuration. A generation it started anyway is told as it starts serving,
+/// and must refuse a dial. The join that follows the removal shows the rest was the custody's.
+/// A dial of the resting job's port waited out its whole minute in the backlog of the listener
+/// the test bound, which no one accepts, and showed only that nothing answered.
+///
+/// NEGATIVE CONTROL (2026-11-17): a job that reads no vault (`cfg.vault_paths = None` at the head
+/// of `serve_node_job`: its custody captured and its deny list read with none) starts a
+/// generation under the unread custody, and the dial it must refuse joins ("unread custody must
+/// not start an admitting generation").
 #[test]
 fn a_node_job_with_unread_custody_refuses_even_with_a_retained_deny_list() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1631,6 +1649,8 @@ fn a_node_job_with_unread_custody_refuses_even_with_a_retained_deny_list() {
         );
     };
     unreadable();
+    let generations = Arc::new(AtomicUsize::new(0));
+    let told = Arc::clone(&generations);
     let prebound = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind node job");
     let addr = prebound.local_addr().unwrap();
     let (stop, server) = serve_node_reading(
@@ -1639,6 +1659,9 @@ fn a_node_job_with_unread_custody_refuses_even_with_a_retained_deny_list() {
         relay_scratch.path(),
         &state,
         (None, Some(vault.clone())),
+        Some(Arc::new(move |_: &str| {
+            told.fetch_add(1, Ordering::SeqCst);
+        })),
     );
     let dial_join = |id: &NodeIdentity| {
         let tcp = TcpStream::connect(addr).map_err(aterm_net::fleet::FleetError::Io)?;
@@ -1646,10 +1669,21 @@ fn a_node_job_with_unread_custody_refuses_even_with_a_retained_deny_list() {
     };
 
     let early = seed_id(&root.path().join("early-state"));
-    assert!(
-        dial_join(&early).is_err(),
-        "unread custody must not start an admitting generation"
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the node job's rest, or a generation it started",
+        || {
+            (crate::fleet_listen::fleet_inputs::idles(&state) > 0
+                || generations.load(Ordering::SeqCst) > 0)
+                .then_some(())
+        },
     );
+    if generations.load(Ordering::SeqCst) > 0 {
+        assert!(
+            dial_join(&early).is_err(),
+            "unread custody must not start an admitting generation"
+        );
+    }
     assert!(
         !read_peers(&state)
             .expect("book")
@@ -3229,7 +3263,9 @@ fn the_node_job_raises_launchds_descriptor_limit_to_serve_every_fleet_slot() {
         // The test binary has no root LAN broker: the broker answers, as it does on a Mac
         // with aterm installed.
         let _ = super::NODE_LAN_GATE_FOR_TEST.set(|| None);
-        let server = std::thread::spawn(|| super::run_node_serve_owning(|| None));
+        // As `aterm node serve` starts: a test's output is no job log, so it keeps nothing.
+        let kept = aterm_agent::node_service::keep_log(&state);
+        let server = std::thread::spawn(move || super::run_node_serve_owning(|| None, kept));
         let mut reader = JobsReader::new();
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let port = loop {

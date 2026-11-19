@@ -365,6 +365,8 @@ fn evaluate(input: &State, drop_provenance: bool) -> State {
             crate::typed::Awaiting::NONE
         },
         refused: Vec::new(),
+        refusals: Vec::new(),
+        cells_from: None,
     };
     let accepted = view
         .require_roll_source(&crate::alab::registry::REGISTRY)

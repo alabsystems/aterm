@@ -37,6 +37,10 @@ use super::{profile, token_route};
 use crate::supervise::SupervisorConfig;
 use crate::supervise::policy::approval;
 
+#[cfg(all(test, unix))]
+#[path = "launch_trust_start_fixture.rs"]
+pub(super) mod start_fixture;
+
 /// The `request_id` of the one control request [`settle`] sends, and of the answer it reads.
 pub const REQUEST_ID: &str = "aterm-trust";
 
@@ -733,11 +737,19 @@ fn start(
     let writer = std::cell::RefCell::new(Some(writer));
     let answer = std::cell::RefCell::new(None::<Attested>);
     let mut read = Vec::new();
+    #[cfg(test)]
+    let fixture_wait = start_fixture::Wait::new();
+    let until = Some(std::time::Instant::now() + deadline);
+    #[cfg(test)]
+    let until = fixture_wait.deadline(until);
     let ended = aterm_uds::deadline::stream_with_stdin_until_stopped(
         &mut command,
         aterm_uds::spawnfd::Stdio::from(reader),
-        Some(std::time::Instant::now() + deadline),
-        |_| {},
+        until,
+        |_pid| {
+            #[cfg(test)]
+            fixture_wait.spawned(_pid);
+        },
         |from, chunk| {
             if from != aterm_uds::deadline::ChildOutput::Stdout || answer.borrow().is_some() {
                 return Ok(());
@@ -760,11 +772,22 @@ fn start(
             }
             Ok(())
         },
-        || false,
+        || {
+            #[cfg(test)]
+            {
+                fixture_wait.stopped()
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        },
         None,
     );
     drop(writer.into_inner());
     let answered = answer.into_inner();
+    #[cfg(test)]
+    let answered = fixture_wait.answer(answered);
     match (answered, ended) {
         (Some(said), _) => said,
         (None, Ok(_)) => {
@@ -825,8 +848,8 @@ enum Heard {
     Answer(Attested),
     /// Its output ended; what it printed after the last line break, where it gave no answer.
     Ended(Vec<u8>),
-    /// It exited.
-    Exited,
+    /// Its owning wait returned; an error does not establish an exit.
+    Waited(Result<(), String>),
 }
 
 /// [`start`] ON WINDOWS, through the crate's Windows spawn path: the same warm start, request
@@ -912,11 +935,11 @@ fn start(
         None => Some(Vec::new()),
     };
     std::thread::spawn(move || {
-        let _ = child.wait();
-        let _ = tell.send(Heard::Exited);
+        let waited = child.wait().map(|_| ()).map_err(|error| error.to_string());
+        let _ = tell.send(Heard::Waited(waited));
     });
-    let (mut answer, mut ended, mut exited) = (None, ended, false);
-    while !(exited && ended.is_some()) {
+    let (mut answer, mut ended, mut waited) = (None, ended, None);
+    while !(waited.is_some() && ended.is_some()) {
         match heard.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
             Ok(Heard::Answer(said)) => {
                 answer = Some(said);
@@ -924,8 +947,8 @@ fn start(
                 drop(let_go.take());
             }
             Ok(Heard::Ended(rest)) => ended = Some(rest),
-            Ok(Heard::Exited) => {
-                exited = true;
+            Ok(Heard::Waited(result)) => {
+                waited = Some(result);
                 // Whatever it started goes with it, as its group does on unix.
                 let _ = job.end(JOB_END);
             }
@@ -933,15 +956,30 @@ fn start(
         }
     }
     drop(let_go);
-    if !exited {
+    if waited.is_none() {
         let _ = job.end(JOB_END);
     }
-    match (answer, ended) {
-        (Some(said), _) => said,
-        // It ended without a line break after its answer, or without an answer.
-        (None, Some(rest)) if exited => answer_of(&String::from_utf8_lossy(&rest))
+    answer_after_windows_wait(answer, ended, waited, deadline)
+}
+
+/// The Windows start's answer: an observed answer stands, but unfinished output is an answer
+/// only after a successful owning wait. A wait error is no exit or job-closure receipt.
+#[cfg(any(test, windows))]
+fn answer_after_windows_wait(
+    answer: Option<Attested>,
+    ended: Option<Vec<u8>>,
+    waited: Option<Result<(), String>>,
+    deadline: Duration,
+) -> Attested {
+    match (answer, ended, waited) {
+        (Some(said), _, _) => said,
+        (None, _, Some(Err(why))) => {
+            Attested::Failed(format!("Claude Code's owning wait failed: {why}"))
+        }
+        // A successful wait confirms the exit that makes this final, unterminated line whole.
+        (None, Some(rest), Some(Ok(()))) => answer_of(&String::from_utf8_lossy(&rest))
             .unwrap_or_else(|| Attested::Failed("Claude Code ended without answering".to_string())),
-        (None, _) => Attested::Failed(format!(
+        (None, _, _) => Attested::Failed(format!(
             "Claude Code did not answer within {} ms",
             deadline.as_millis()
         )),
@@ -1141,9 +1179,9 @@ pub(super) fn store_build(exe: &Path) -> Option<PathBuf> {
     token_route::store_build_in(&super::relaunch::token_builds()?, &build)
 }
 
-/// [`store_build`] of atpkg's managed twin of Claude Code: the build a launch through the twin
-/// (the one that asks `aterm harness tap --launch`) runs. Unix's, as the step's caller there is.
-#[cfg(unix)]
+/// [`store_build`] of atpkg's managed twin of Claude Code (`agents/claude`, and
+/// `agents\claude.cmd` on Windows): the build a launch through the twin (the one that asks
+/// `aterm harness tap --launch`) runs.
 #[must_use]
 pub(super) fn twin_store_build() -> Option<PathBuf> {
     store_build(&super::upgrade_drive::managed_agent_twin(

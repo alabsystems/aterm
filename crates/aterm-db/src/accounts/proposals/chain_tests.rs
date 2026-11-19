@@ -65,6 +65,7 @@ fn check(scenario: i64, mutant: u8) -> State {
                 &Command::Write {
                     request: first.request().unwrap(),
                     changes: vec![change("conflicting")],
+                    said: None,
                 }
                 .encode()
                 .unwrap(),
@@ -77,6 +78,7 @@ fn check(scenario: i64, mutant: u8) -> State {
             let command = Command::Write {
                 request: [83; 16],
                 changes: vec![change("one"), account("another-key")],
+                said: None,
             };
             raw(&lab, 0, &command.encode().unwrap());
             next = draft(&db, "second")

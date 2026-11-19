@@ -20,6 +20,9 @@ use aterm_uds::spawnfd::{Command, command};
 
 const FLAG: &str = "--runtime-capture";
 
+#[path = "runtime_capture_driver.rs"]
+mod driver;
+
 struct Phase {
     directory: PathBuf,
     deadline: Instant,
@@ -28,6 +31,7 @@ struct Phase {
 enum Invocation {
     Run(Phase, OsString),
     Wait(Phase, String),
+    Observe(PathBuf, String, String),
 }
 
 impl Invocation {
@@ -38,14 +42,22 @@ impl Invocation {
             );
         };
         let directory = PathBuf::from(directory);
+        if !directory.is_absolute() || !directory.is_dir() {
+            return Err("capture directory must be an existing absolute directory");
+        }
+        if mode == "observe-driver" {
+            return match (seconds.to_str(), argument.to_str()) {
+                (Some(nonce), Some(target)) => {
+                    Ok(Self::Observe(directory, nonce.into(), target.into()))
+                }
+                _ => Err("expected the private driver nonce and exact launchd target"),
+            };
+        }
         let seconds = seconds
             .to_str()
             .and_then(|text| text.parse::<u64>().ok())
             .filter(|seconds| *seconds > 0)
             .ok_or("capture seconds must be positive")?;
-        if !directory.is_absolute() || !directory.is_dir() {
-            return Err("capture directory must be an existing absolute directory");
-        }
         let limit = Duration::from_secs(seconds);
         let deadline = Instant::now()
             .checked_add(limit)
@@ -199,30 +211,7 @@ struct DriverState {
 }
 
 fn driver_ended(target: &str, text: &str) -> bool {
-    if text.lines().next().map(str::trim) != Some(format!("{target} = {{").as_str()) {
-        return false;
-    }
-    let mut state = None;
-    let mut runs = None;
-    let mut has_pid = false;
-    for line in text.lines() {
-        let Some(top) = line
-            .strip_prefix('\t')
-            .filter(|line| !line.starts_with('\t'))
-        else {
-            continue;
-        };
-        let Some((key, value)) = top.split_once(" = ") else {
-            continue;
-        };
-        match key {
-            "state" => state = Some(value.trim()),
-            "runs" => runs = value.trim().parse::<u64>().ok(),
-            "pid" => has_pid = true,
-            _ => {}
-        }
-    }
-    state == Some("not running") && runs.is_some_and(|runs| runs > 0) && !has_pid
+    aterm_uds::launchd::job_ended_in(target, text) == Ok(true)
 }
 
 fn read_receipt(directory: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -366,19 +355,27 @@ pub fn entry(args: &[OsString]) -> Option<ExitCode> {
     let result = Invocation::parse(&args[1..])
         .map_err(str::to_owned)
         .and_then(|invocation| match invocation {
-            Invocation::Run(phase, script) => capture(
-                command("/bin/sh").args([OsString::from("-c"), script]),
-                &phase.directory,
-                phase.deadline,
-                MAX_COMPLETE_STDOUT_BYTES,
-                || false,
-                |_| {},
-            )
-            .map(|receipt| receipt.driver_exit())
-            .map_err(|error| error.to_string()),
+            Invocation::Run(phase, script) => driver::publish_self(&phase.directory)
+                .and_then(|()| {
+                    capture(
+                        command("/bin/sh").args([OsString::from("-c"), script]),
+                        &phase.directory,
+                        phase.deadline,
+                        MAX_COMPLETE_STDOUT_BYTES,
+                        || false,
+                        |_| {},
+                    )
+                })
+                .map(|receipt| receipt.driver_exit())
+                .map_err(|error| error.to_string()),
             Invocation::Wait(phase, target) => wait(phase, &target)
                 .map(|()| 0)
                 .map_err(|error| error.to_string()),
+            Invocation::Observe(directory, nonce, target) => {
+                driver::retirement(&directory, &nonce, &target)
+                    .map(|()| 0)
+                    .map_err(|error| error.to_string())
+            }
         });
     Some(ExitCode::from(match result {
         Ok(code) => code,

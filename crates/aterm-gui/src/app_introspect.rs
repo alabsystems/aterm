@@ -1138,6 +1138,12 @@ fn strip_version_chrome_line(
 
 pub(crate) enum EncodeJob {
     Image {
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        presentation: Option<Box<crate::presentation_lease::Confirmation>>,
         pixels: CapturePixels,
         /// Boxed: an `image --meta`'s model is most of an image job, and unboxed, whether it
         /// clears clippy's `large_enum_variant` margin turns on the variants a platform compiles.
@@ -1293,7 +1299,23 @@ const ENCODE_WORKER_UNAVAILABLE: &str = "encode worker unavailable; retry";
 
 fn reject_encode_job(mut job: EncodeJob, reason: &str) {
     match &mut job {
-        EncodeJob::Image { target, reply, .. } => {
+        EncodeJob::Image {
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation,
+            target,
+            reply,
+            ..
+        } => {
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            drop(presentation.take());
             crate::control_auth::cleanup_failed_automatic_image(target);
             let _ = reply.send(Err(format!("image {reason}")));
         }
@@ -1874,6 +1896,12 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
         .push(std::thread::current().id());
     match job {
         EncodeJob::Image {
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation,
             handoff,
             reply,
             cancel,
@@ -1882,6 +1910,19 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
             pixels,
             metadata,
         } => {
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            if let Some(confirmation) = presentation
+                && let Err(error) = confirmation.wait(&|| cancel.is_cancelled())
+            {
+                drop((pixels, permit));
+                crate::control_auth::cleanup_failed_automatic_image(&target);
+                let _ = reply.send(Err(error));
+                return;
+            }
             if cancel.is_cancelled() {
                 drop((pixels, permit));
                 let _ = reply.send(Err(if want_bytes {
@@ -2325,6 +2366,13 @@ fn image_req_for_test(
         session: None,
         want_bytes,
         want_metadata: frame_metadata.is_some(),
+        whole_client: false,
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        presentation: None,
         frame_metadata: frame_metadata.map_or_else(Default::default, std::sync::Arc::clone),
         cancel: crate::control::CaptureCancellation::new(),
         reply,
@@ -2992,7 +3040,9 @@ impl App {
             surface_h as usize,
             frame_w as usize,
             frame_h as usize,
-            aterm_render::SideInsetPx(selected.map_or(0, |wid| self.win_side_inset_px(wid))),
+            selected.map_or_else(aterm_render::FrameInsets::default, |wid| {
+                self.frame_insets(wid)
+            }),
         );
         let (offset_x, band_left, band_right, crop_left, crop_right) = dims_axis(place.x);
         let (offset_y, band_top, band_bottom, crop_top, crop_bottom) = dims_axis(place.y);
@@ -5752,9 +5802,62 @@ impl App {
             }));
             return;
         };
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        if self.presentation_blocked(front) {
+            let _ = req
+                .reply
+                .send(Err("image: the window has a held presentation".into()));
+            return;
+        }
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        if req.presentation.is_some()
+            && (!req.whole_client
+                || req.clean
+                || req.want_metadata
+                || self.capture_target(front) != CaptureTarget::Windowed)
+        {
+            let _ = req.reply.send(Err(
+                "a presentation lease requires the whole presented window client".into(),
+            ));
+            return;
+        }
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        if req
+            .presentation
+            .as_ref()
+            .is_some_and(|lease| !lease.requested())
+        {
+            let _ = req.reply.send(Err(
+                "the presentation controller no longer owns this capture".into(),
+            ));
+            return;
+        }
+        let destination = DestinationDemand::of_image(req.clean);
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        let destination = if req.presentation.is_some() {
+            DestinationDemand::Required
+        } else {
+            destination
+        };
         let policy = SourcePolicy {
-            destination: DestinationDemand::of_image(req.clean),
-            frame_only: true,
+            destination,
+            frame_only: !req.whole_client,
             model: req.want_metadata,
             metadata: req.want_metadata,
         };
@@ -5785,14 +5888,66 @@ impl App {
                 return;
             }
         };
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        let presentation = if let Some(lease) = req.presentation.as_ref() {
+            let CaptureSource::Destination { pixels, serial } = &capture.source else {
+                let _ = req.reply.send(Err(
+                    "the presentation lease has no destination pixels".into()
+                ));
+                return;
+            };
+            let (width, height) = pixels.dims();
+            match self.install_presentation(front, lease, *serial, width, height) {
+                Ok(confirmation) => Some(Box::new(confirmation)),
+                Err(error) => {
+                    let _ = req.reply.send(Err(error));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        self.image_tail(front, capture, req, presentation);
+        #[cfg(not(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        )))]
         self.image_tail(front, capture, req);
     }
 
-    fn image_tail(&mut self, front: WindowId, capture: ResolvedCapture, req: ImageReq) {
+    fn image_tail(
+        &mut self,
+        front: WindowId,
+        capture: ResolvedCapture,
+        req: ImageReq,
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        presentation: Option<Box<crate::presentation_lease::Confirmation>>,
+    ) {
         let ImageReq {
             handoff,
             target,
             clean,
+            whole_client: _,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+                presentation: _,
             session: _,
             want_bytes,
             want_metadata,
@@ -5880,6 +6035,12 @@ impl App {
             None
         };
         self.submit_encode_job(EncodeJob::Image {
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation,
             pixels,
             metadata,
             handoff,
@@ -5900,10 +6061,11 @@ impl App {
         let tooltips = self.tab_tooltips(wid);
         let ws = self.windows.get(&wid)?;
         let titles: Vec<String> = ws
-            .tab_set
-            .shown()
-            .iter()
-            .map(|tab| {
+            .strip_tabs()
+            .map(|(_, tab)| {
+                if let Some(title) = ws.preview_chip_label(tab.id) {
+                    return title;
+                }
                 ws.tab_chrome_titles_by_tab.get(&tab.id).map_or_else(
                     || {
                         if tab.presentation.title.is_empty() {
@@ -5918,9 +6080,10 @@ impl App {
             .collect();
         let line = crate::toolbar::format_tab_chrome(
             &titles,
-            &self.tab_strip_metadata(wid),
-            &tooltips,
-            ws.tab_set.strip_active().unwrap_or(0),
+            &ws.strip_projection(&self.tab_strip_metadata(wid)),
+            &ws.strip_projection(&tooltips),
+            ws.selected_strip_index()
+                .unwrap_or(crate::tab_bar::NO_SELECTED_TAB),
         )?;
         #[cfg(any(test, debug_assertions))]
         let line = {
@@ -6258,7 +6421,7 @@ impl App {
             height,
             frame_w as usize,
             frame_h as usize,
-            aterm_render::SideInsetPx(self.win_side_inset_px(wid)),
+            self.frame_insets(wid),
         )
         .visible_rect(width, height)
         .ok_or_else(|| "capture: the destination is not the surface of its present".to_string())?;
@@ -7891,6 +8054,19 @@ impl App {
     }
 
     fn native_image_body(&mut self, wid: WindowId, view: crate::tab_model::ViewId, req: ImageReq) {
+        let whole_presentation = req.whole_client;
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        let whole_presentation = whole_presentation || req.presentation.is_some();
+        if whole_presentation {
+            let _ = req
+                .reply
+                .send(Err("a view image cannot hold a window presentation".into()));
+            return;
+        }
         if self.dock_view(wid) != Some(view) {
             let _ = req
                 .reply
@@ -7971,6 +8147,12 @@ impl App {
             })
         });
         self.submit_encode_job(EncodeJob::Image {
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation: None,
             pixels,
             metadata,
             handoff: req.handoff,

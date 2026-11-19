@@ -675,6 +675,7 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
         network_place: None,
         network_target: crate::network_deck::Target::Overview,
         disk_span: crate::stats_lens::DiskSpan::Day,
+        cpu_policy_pending: false,
         lab: None,
         fleet: None,
         snap: Some(snap),
@@ -2332,6 +2333,7 @@ fn a_box_column_is_its_mean_and_its_tick_its_max() {
             .heat
             .iter()
             .chain(&inks.heat_ic)
+            .chain(&[inks.machine, inks.machine_ic, inks.warn, inks.critical])
             .map(|&c| rgba(c, 0xFF))
             .collect();
         for (strip, rows, at) in strips(w, form, &m) {
@@ -2378,10 +2380,18 @@ fn a_box_column_is_its_mean_and_its_tick_its_max() {
                         })
                         .collect();
                     let want = (mean.max(0.0) * h).round().clamp(1.0, h);
+                    // A held amount's box takes its state's ink (SD-80), every other its level's.
+                    let ink_at = |v: f32| {
+                        if holds_amount(res) {
+                            skyline::held_ink(&inks, slot.cell.state, ic)
+                        } else {
+                            inks.cell_at(v, ic)
+                        }
+                    };
                     let column = found.iter().find(|f| f.0 + f.1 == y + h);
                     assert_eq!(
                         column.map(|c| (c.1, c.2)),
-                        Some((want, rgba(inks.cell_at(mean, ic), 0xFF))),
+                        Some((want, rgba(ink_at(mean), 0xFF))),
                         "{tag}: the column at its mean {mean}"
                     );
                     columns += 1;
@@ -2396,7 +2406,7 @@ fn a_box_column_is_its_mean_and_its_tick_its_max() {
                         Some((th, v)) if th >= want + 2.0 => {
                             assert_eq!(
                                 tick.map(|t| (t.0, t.2)),
-                                Some((y + h - th, rgba(inks.cell_at(v, ic), 0xFF))),
+                                Some((y + h - th, rgba(ink_at(v), 0xFF))),
                                 "{tag}: the tick at its max {v}"
                             );
                             ticks += 1;
@@ -2413,6 +2423,352 @@ fn a_box_column_is_its_mean_and_its_tick_its_max() {
     assert!(
         columns > 100 && ticks > 0 && heights.len() >= 3,
         "CONTROL: {columns} columns of {heights:?} px and {ticks} ticks were read"
+    );
+}
+
+/// One strip box as a deck draws it: its row, its slot, and the fills of its column and tick.
+#[derive(Debug)]
+struct BoxDrawn {
+    res: Resource,
+    live: bool,
+    slot: HeatSlot,
+    column: [u8; 4],
+    tick: Option<[u8; 4]>,
+}
+
+/// Every read box of every strip `input` draws at `w` pt and `s`× in `form`, with its column's
+/// and tick's fills, and each row's % figure's fill.
+fn boxes_drawn(
+    input: &DeckInput<'_>,
+    form: DeckForm,
+    w: f64,
+    s: f64,
+    m: &FaceMetrics,
+) -> (Vec<BoxDrawn>, Vec<(Resource, [u8; 4])>) {
+    let words = DeckWords::new(input, m);
+    let laid = lay(&geom(w, s, form), input, &words, m, true);
+    let (track, over) = (rgba(input.inks.track, 0xFF), rgba(input.inks.over, 0xFF));
+    let panels: Vec<(Rect, [u8; 4])> = laid
+        .prims
+        .iter()
+        .filter_map(|p| match *p {
+            DrawPrim::Panel {
+                x, y, w, h, fill, ..
+            } if fill != track && fill != over => Some(((x, y, w, h), fill)),
+            _ => None,
+        })
+        .collect();
+    let (mut out, mut pcts) = (Vec::new(), Vec::new());
+    for (strip, rows, at) in strips(w, form, m) {
+        for (r, res) in at {
+            let row = words
+                .rows
+                .iter()
+                .find(|row| row.res == res)
+                .expect("its row");
+            if row.strip_text.is_some() {
+                continue;
+            }
+            let (y, h) = (px(rows.top(r), s), px(rows.cell, s));
+            let pct = laid.prims.iter().find_map(|p| match p {
+                DrawPrim::Text {
+                    s: text,
+                    baseline,
+                    color,
+                    ..
+                } if *text == row.pct.s && *baseline >= y && *baseline <= y + 2.0 * h => {
+                    Some(*color)
+                }
+                _ => None,
+            });
+            pcts.extend(pct.map(|c| (res, c)));
+            let slots = row.multi_scale_slots(&strip);
+            for (i, x, cw, live) in multi_scale_slot_rects(&strip, s, 0.0) {
+                let Some(slot) = slots.get(i).copied().filter(|sl| sl.cell.gap.is_none()) else {
+                    continue;
+                };
+                let inside = |&&((qx, qy, qw, qh), _): &&(Rect, [u8; 4])| {
+                    qx >= x && qx + qw <= x + cw && qy >= y && qy + qh <= y + h
+                };
+                let mine: Vec<&(Rect, [u8; 4])> = panels.iter().filter(inside).collect();
+                let Some(&(_, column)) = mine.iter().copied().find(|(q, _)| q.1 + q.3 == y + h)
+                else {
+                    continue;
+                };
+                let tick = mine
+                    .iter()
+                    .find(|(q, _)| q.3 == 1.0 && q.1 + 1.0 < y + h)
+                    .map(|(_, f)| *f);
+                out.push(BoxDrawn {
+                    res,
+                    live,
+                    slot,
+                    column,
+                    tick,
+                });
+            }
+        }
+    }
+    (out, pcts)
+}
+
+/// The Calm scene with Memory held at `mem` and Disk at `disk` of their capacity, each strip
+/// box a little apart in height, Memory's pressure `pressure(bucket)` over its hour of 10 s
+/// buckets (the newest last) and its last minute of readings, and each row's `state` now.
+fn held_scene(
+    mem: f64,
+    disk: f64,
+    pressure: impl Fn(usize) -> Option<Pressure>,
+    states: [Option<State>; 2],
+) -> Snapshot {
+    let mut snap = scene(Scene::Calm);
+    for (res, level, state) in [
+        (Resource::Memory, mem, states[0]),
+        (Resource::Disk, disk, states[1]),
+    ] {
+        let view = &mut snap.resources[res.index()];
+        let cap = view.capacity.expect("a capacity");
+        let ring: Vec<Cell> = view
+            .ring
+            .iter()
+            .enumerate()
+            .map(|(j, c)| {
+                let v = (level + 0.02 * ((j % 5) as f64 - 2.0)) * cap;
+                Cell {
+                    mean: Some(v),
+                    max: Some(v + 0.01 * cap * (j % 3) as f64),
+                    ..*c
+                }
+            })
+            .collect();
+        view.now = Some(level * cap);
+        view.heat_now = Some(level as f32);
+        view.recent = readings_of(&ring, AT);
+        view.ring = ring.into();
+        view.state = state;
+        if res == Resource::Memory {
+            let n = view.ring.len();
+            let kept: Vec<Option<Pressure>> = (0..n).map(&pressure).collect();
+            let ranks: Vec<Cell> = kept
+                .iter()
+                .map(|p| {
+                    let v = p.and_then(Pressure::rank).map(f64::from);
+                    Cell {
+                        mean: v,
+                        max: v,
+                        tau_ms: if v.is_some() { 10_000.0 } else { 0.0 },
+                        over_ms: 0.0,
+                    }
+                })
+                .collect();
+            view.pressure = kept.into();
+            view.pressure_recent = readings_of(&ranks, AT);
+            view.pressure_ring = ranks.into();
+        }
+    }
+    snap
+}
+
+/// A Mac at 79 % memory and a disk 75 % full, both calm, draw their strips quiet (SD-80): every
+/// box's column and tick in the machine's ink (`machine_ic` under Increase Contrast), not the
+/// heat ramp's loud steps their level would take, and each % in the words' ink. Of Full and
+/// Folded, at 1× and 2×.
+#[test]
+fn a_full_but_calm_memory_or_disk_strip_draws_in_machine_ink() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = held_scene(0.79, 0.75, |_| Some(Pressure::Normal), [None, None]);
+    let (mut read, mut loud) = (0_usize, 0_usize);
+    for contrast in [false, true] {
+        for (form, w, s) in [
+            (DeckForm::Full, 1119.0, 2.0),
+            (DeckForm::Full, 1119.0, 1.0),
+            (DeckForm::Folded, 1119.0, 2.0),
+        ] {
+            let mut input = scene_input(&snap, form);
+            input.contrast = contrast;
+            let inks = input.inks;
+            let machine = rgba(
+                if contrast {
+                    inks.machine_ic
+                } else {
+                    inks.machine
+                },
+                0xFF,
+            );
+            let tag = format!("{form:?} {w} pt at {s}×, contrast {contrast}");
+            let (boxes, pcts) = boxes_drawn(&input, form, w, s, &m);
+            for b in boxes.iter().filter(|b| holds_amount(b.res)) {
+                assert_eq!(b.column, machine, "{tag}: {b:?}'s column");
+                assert!(b.tick.is_none_or(|t| t == machine), "{tag}: {b:?}'s tick");
+                read += 1;
+                // CONTROL: the heat of the box's level is a loud step, not the machine's ink.
+                let level = if b.live {
+                    snap.resources[b.res.index()].heat_now
+                } else {
+                    b.slot.cell.heat
+                };
+                let heat = rgba(inks.cell_at(level.unwrap_or(0.0), contrast), 0xFF);
+                loud += usize::from(heat != machine && level.is_some_and(|v| v >= 0.6));
+            }
+            for res in [Resource::Memory, Resource::Disk] {
+                assert_eq!(
+                    pcts.iter().find(|p| p.0 == res).map(|p| p.1),
+                    Some(rgba(inks.words, 0xFF)),
+                    "{tag}: {res:?}'s % in the words' ink"
+                );
+            }
+        }
+    }
+    assert!(
+        read > 100 && loud == read,
+        "CONTROL: {read} held boxes read, {loud} of them at a loud heat step"
+    );
+}
+
+/// A Memory box that holds a kernel pressure draws in that pressure's ink, `warn` or `critical`,
+/// and a box at rest beside it in the machine's; the live box and the % follow the row's state
+/// now. Disk in a state draws its live box and % in the state's ink and its past boxes, which
+/// keep no state, in the machine's.
+#[test]
+fn a_memory_box_under_pressure_draws_in_its_pressures_ink() {
+    let m = FaceMetrics::helvetica_neue();
+    let pressure = |j: usize| match j {
+        40..=41 => Some(Pressure::Critical),
+        55..=59 => Some(Pressure::Warn),
+        _ => Some(Pressure::Normal),
+    };
+    let snap = held_scene(
+        0.79,
+        0.75,
+        pressure,
+        [Some(State::Warn), Some(State::Critical)],
+    );
+    let mut seen = std::collections::BTreeMap::<(usize, &str), usize>::new();
+    for (form, w, s) in [
+        (DeckForm::Full, 1119.0, 2.0),
+        (DeckForm::Full, 1119.0, 1.0),
+        (DeckForm::Folded, 1119.0, 2.0),
+    ] {
+        let input = scene_input(&snap, form);
+        let inks = input.inks;
+        let tag = format!("{form:?} {w} pt at {s}×");
+        let named = [
+            (rgba(inks.machine, 0xFF), "machine"),
+            (rgba(inks.warn, 0xFF), "warn"),
+            (rgba(inks.critical, 0xFF), "critical"),
+        ];
+        let (boxes, pcts) = boxes_drawn(&input, form, w, s, &m);
+        for b in boxes.iter().filter(|b| holds_amount(b.res)) {
+            let want = match (b.res, b.live) {
+                (Resource::Disk, true) => Some(State::Critical),
+                (Resource::Disk, false) => None,
+                _ => b.slot.cell.state,
+            };
+            let ink = rgba(skyline::held_ink(&inks, want, false), 0xFF);
+            assert_eq!(b.column, ink, "{tag}: {b:?}'s column");
+            assert!(b.tick.is_none_or(|t| t == ink), "{tag}: {b:?}'s tick");
+            let name = named.iter().find(|n| n.0 == b.column).map_or("?", |n| n.1);
+            *seen.entry((b.res.index(), name)).or_default() += 1;
+            if b.res == Resource::Memory && b.live {
+                assert_eq!(
+                    b.column,
+                    rgba(inks.warn, 0xFF),
+                    "{tag}: the live box is warn"
+                );
+            }
+        }
+        for (res, want) in [
+            (Resource::Memory, inks.warn_text),
+            (Resource::Disk, inks.critical_text),
+        ] {
+            assert_eq!(
+                pcts.iter().find(|p| p.0 == res).map(|p| p.1),
+                Some(rgba(want, 0xFF)),
+                "{tag}: {res:?}'s % follows its live box"
+            );
+        }
+    }
+    use Resource::{Disk, Memory};
+    for key in [
+        (Memory, "machine"),
+        (Memory, "warn"),
+        (Memory, "critical"),
+        (Disk, "machine"),
+        (Disk, "critical"),
+    ] {
+        let key = (key.0.index(), key.1);
+        assert!(
+            seen.get(&key).is_some_and(|&n| n > 0),
+            "CONTROL: no {key:?} box was drawn: {seen:?}"
+        );
+    }
+    assert_eq!(
+        seen.get(&(Disk.index(), "warn")),
+        None,
+        "no past Disk box takes a state"
+    );
+}
+
+/// CPU, GPU, Network and Processes measure a rate of work: each box keeps the heat of its own
+/// level, column and tick, and each % its heat step's ink, in a state as at rest; only Memory
+/// and Disk take their state's ink (SD-80).
+#[test]
+fn every_other_rows_boxes_keep_the_heat_of_their_level() {
+    let m = FaceMetrics::helvetica_neue();
+    let mut snap = scene(Scene::Calm);
+    for res in DECK_RESOURCES.iter().filter(|r| !holds_amount(**r)) {
+        snap.resources[res.index()].state = Some(State::Critical);
+    }
+    let mut read = std::collections::BTreeMap::<usize, usize>::new();
+    let mut apart = 0_usize;
+    for contrast in [false, true] {
+        for (form, w, s) in [
+            (DeckForm::Full, 1119.0, 2.0),
+            (DeckForm::Full, 1119.0, 1.0),
+            (DeckForm::Folded, 1119.0, 2.0),
+        ] {
+            let mut input = scene_input(&snap, form);
+            input.contrast = contrast;
+            let inks = input.inks;
+            let tag = format!("{form:?} {w} pt at {s}×, contrast {contrast}");
+            let words = DeckWords::new(&input, &m);
+            let (boxes, pcts) = boxes_drawn(&input, form, w, s, &m);
+            for b in boxes.iter().filter(|b| !holds_amount(b.res)) {
+                let row = words.rows.iter().find(|r| r.res == b.res).expect("its row");
+                let mean = if b.live {
+                    row.heat_now
+                } else {
+                    b.slot.cell.heat
+                };
+                let mean = mean.expect("a read box");
+                assert_eq!(
+                    b.column,
+                    rgba(inks.cell_at(mean, contrast), 0xFF),
+                    "{tag}: {b:?}'s column in the heat of {mean}"
+                );
+                let held = rgba(skyline::held_ink(&inks, b.slot.cell.state, contrast), 0xFF);
+                apart += usize::from(b.column != held);
+                *read.entry(b.res.index()).or_default() += 1;
+            }
+            for (res, c) in pcts.iter().filter(|p| !holds_amount(p.0)) {
+                let h = words
+                    .rows
+                    .iter()
+                    .find(|r| r.res == *res)
+                    .and_then(|r| r.heat_now)
+                    .expect("a %");
+                assert_eq!(
+                    *c,
+                    rgba(inks.heat_text[usize::from(ink::heat_step(h))], 0xFF),
+                    "{tag}: {res:?}'s % in its heat step's ink"
+                );
+            }
+        }
+    }
+    let total: usize = read.values().sum();
+    assert!(
+        read.len() >= 4 && total > 100 && apart == total,
+        "CONTROL: boxes read per row {read:?}; {apart} of {total} stand apart from the held ink"
     );
 }
 
@@ -2914,11 +3270,15 @@ fn an_events_keyline_never_cuts_another_events_line() {
             let mut snap = scene(Scene::Calm);
             snap.strip_events = vec![
                 aterm_vitals::StripEvent {
+                    scope: aterm_vitals::events::EventScope::Unknown,
+                    span: None,
                     at_unix_ms: AT - crash_age,
                     kind: aterm_vitals::StripEventKind::Crash,
                     label: "aterm crash".into(),
                 },
                 aterm_vitals::StripEvent {
+                    scope: aterm_vitals::events::EventScope::Unknown,
+                    span: None,
                     at_unix_ms: AT - restart_age,
                     kind: aterm_vitals::StripEventKind::Restart,
                     label: "aterm restart".into(),
@@ -3135,6 +3495,8 @@ fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
                             .iter()
                             .zip(kinds)
                             .map(|(&age, kind)| aterm_vitals::StripEvent {
+                                scope: aterm_vitals::events::EventScope::Unknown,
+                                span: None,
                                 at_unix_ms: AT - age,
                                 kind,
                                 label: format!("{kind:?}"),
@@ -3451,6 +3813,8 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                         .iter()
                         .flat_map(|&(from, to, kind)| {
                             let ev = |age: i64, kind| aterm_vitals::StripEvent {
+                                scope: aterm_vitals::events::EventScope::Unknown,
+                                span: None,
                                 at_unix_ms: AT - age,
                                 kind,
                                 label: format!("{kind:?}"),
@@ -3867,11 +4231,15 @@ fn a_sleep_gap_is_hollow_not_stuck() {
     ];
     snap.strip_events = vec![
         aterm_vitals::StripEvent {
+            scope: aterm_vitals::events::EventScope::Unknown,
+            span: None,
             at_unix_ms: AT - 320_000,
             kind: aterm_vitals::StripEventKind::SleepWake,
             label: "wake".into(),
         },
         aterm_vitals::StripEvent {
+            scope: aterm_vitals::events::EventScope::Unknown,
+            span: None,
             at_unix_ms: AT - 150_000,
             kind: aterm_vitals::StripEventKind::Crash,
             label: "aterm crash".into(),
@@ -4840,21 +5208,29 @@ fn time_gaps_and_special_event_lines_render_distinctly_on_the_multi_scale_strip(
     ];
     snap.strip_events = vec![
         aterm_vitals::StripEvent {
+            scope: aterm_vitals::events::EventScope::Unknown,
+            span: None,
             at_unix_ms: AT - 150_000,
             kind: aterm_vitals::StripEventKind::Crash,
             label: "aterm crash".into(),
         },
         aterm_vitals::StripEvent {
+            scope: aterm_vitals::events::EventScope::Unknown,
+            span: None,
             at_unix_ms: AT - 80_000,
             kind: aterm_vitals::StripEventKind::Restart,
             label: "aterm restart".into(),
         },
         aterm_vitals::StripEvent {
+            scope: aterm_vitals::events::EventScope::Unknown,
+            span: None,
             at_unix_ms: AT - 320_000,
             kind: aterm_vitals::StripEventKind::SleepWake,
             label: "wake".into(),
         },
         aterm_vitals::StripEvent {
+            scope: aterm_vitals::events::EventScope::Unknown,
+            span: None,
             at_unix_ms: AT - 25_000,
             kind: aterm_vitals::StripEventKind::PressureSpike,
             label: "memory pressure".into(),

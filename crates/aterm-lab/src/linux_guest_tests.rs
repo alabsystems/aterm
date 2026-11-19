@@ -4,6 +4,93 @@
 use super::*;
 
 #[test]
+fn main_exit_hooks_preserve_execstart_and_escape_the_manager_and_shell_expansion_layers() {
+    let unit = Unit {
+        name: "aterm-lane-exit-control".into(),
+        env: vec![("EXISTING".into(), "unchanged".into())],
+        argv: vec!["/bin/sh".into(), "-c".into(), "exit 37".into()],
+        socket: String::new(),
+    };
+    let record = "/private path/%i/$literal/\"quoted\"/exit";
+    let plain = run_unit(&unit, None);
+    let recorded = run_unit_with_exit_record(&unit, None, record);
+    let command = |argv: &[String]| argv.iter().position(|s| s == "--").unwrap();
+    assert_eq!(&plain[command(&plain)..], &recorded[command(&recorded)..]);
+    assert!(recorded.contains(&format!("--setenv=ATERM_LANE_EXIT_RECORD={record}")));
+    assert!(recorded.contains(&"--setenv=EXISTING=unchanged".into()));
+    assert!(recorded.contains(&"--collect".into()));
+    let property = recorded
+        .iter()
+        .position(|s| s.starts_with("--property=ExecStopPost="))
+        .unwrap();
+    assert!(property < command(&recorded));
+    assert!(recorded[property].contains("$${INVOCATION_ID-}"));
+    assert!(recorded[property].contains("$${EXIT_CODE-}"));
+    assert!(recorded[property].contains("$${EXIT_STATUS-}"));
+    assert!(recorded[property].contains("$${SERVICE_RESULT-}"));
+    assert!(recorded[property].contains("\\\\n"));
+    assert!(
+        !recorded[property].contains(record),
+        "the path stays in the literal environment value"
+    );
+}
+
+#[test]
+fn main_exit_hook_publishes_a_fresh_private_whole_record_and_never_overwrites_one() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let top = aterm_tempfile::tempdir().unwrap();
+    let record = top
+        .path()
+        .join("exit %i $literal 'quote \"double\" \\slash");
+    let part = std::path::PathBuf::from(format!("{}.part", record.display()));
+    let shell = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sh"));
+    let run = |status: &str| {
+        let mut command = aterm_uds::spawnfd::command(&shell);
+        command
+            .args(["-c", MAIN_EXIT_RECORD])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("ATERM_LANE_EXIT_RECORD", &record)
+            .env("INVOCATION_ID", "0123456789abcdef0123456789abcdef")
+            .env("EXIT_CODE", "exited")
+            .env("EXIT_STATUS", status)
+            .env("SERVICE_RESULT", "exit-code");
+        aterm_uds::deadline::output_while_process_progressing(
+            &mut command,
+            std::time::Duration::from_secs(60),
+            "main-exit hook",
+        )
+        .unwrap()
+    };
+    let first = run("37");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let expected = b"schema=1\ninvocation=0123456789abcdef0123456789abcdef\ncode=exited\nstatus=37\nresult=exit-code\n";
+    assert_eq!(std::fs::read(&record).unwrap(), expected);
+    assert_eq!(
+        std::fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!part.exists());
+    assert!(
+        !run("0").status.success(),
+        "an existing final record must refuse publication"
+    );
+    assert_eq!(std::fs::read(&record).unwrap(), expected);
+    std::fs::remove_file(&record).unwrap();
+    std::fs::write(&part, b"partial").unwrap();
+    assert!(
+        !run("0").status.success(),
+        "an existing partial record must refuse publication"
+    );
+    assert!(!record.exists());
+    assert_eq!(std::fs::read(&part).unwrap(), b"partial");
+}
+
+#[test]
 fn arches_name_their_triples_and_targets() {
     assert_eq!(Arch::parse("arm64"), Some(Arch::Aarch64));
     assert_eq!(Arch::parse("amd64"), Some(Arch::X86_64));

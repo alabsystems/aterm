@@ -145,10 +145,12 @@ impl AccountsHost for Native<'_> {
             3 => {
                 self.store
                     .transact_logins(self.now, &mut None, |state, _| {
-                        let account = state.accounts.entry(self.raw.label.clone()).or_default();
-                        account.auth = Auth::SignedOut;
-                        account.auth_at = Some(self.now);
-                        Ok(Vec::new())
+                        Ok(accounts::note_auth(
+                            state,
+                            &self.raw.label,
+                            Auth::SignedOut,
+                            self.now,
+                        ))
                     })
                     .unwrap();
             }

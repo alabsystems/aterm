@@ -105,6 +105,14 @@ pub enum WindowEvent {
     /// A file was dropped into the window.
     DroppedFile(PathBuf),
 
+    /// An outside release from this window, resolved after its implicit pointer grab ended.
+    DroppedLocal {
+        /// The application's opaque drag identity.
+        token: [u64; 2],
+        /// The entered client surface and its physical point, or no client surface.
+        target: Option<(WindowId, PhysicalPosition<f64>)>,
+    },
+
     /// A file is being hovered over the window.
     HoveredFile(PathBuf),
 

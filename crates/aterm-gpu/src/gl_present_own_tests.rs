@@ -8,7 +8,8 @@ fn posted(content_off: [f32; 2], dest: (u32, u32)) -> GlPosted {
     blit.dims = [800.0, 600.0];
     blit.content_off = content_off;
     GlPosted {
-        dock: None,
+        chrome: [[None; 2]; 2],
+        chrome_origins: [(0, 0); 2],
         blit,
         frame: (800, 600),
         dest,
@@ -203,7 +204,7 @@ fn a_post_s_damage_is_what_changed_since_the_last() {
 #[test]
 fn a_dock_change_damages_its_destination_rect_without_dirtying_the_frame() {
     let mut held = posted([40.0, 0.0], (840, 600));
-    held.dock = Some(([0, 24, 40, 600], 7));
+    held.chrome[0][0] = Some(([0, 24, 40, 600], 7));
     let clean = Some([0, 0, 0, 0]);
     assert_eq!(
         post_damage(Some(&held), &held, clean, true),
@@ -211,24 +212,43 @@ fn a_dock_change_damages_its_destination_rect_without_dirtying_the_frame() {
         "an unchanged resident dock adds no damage"
     );
     let mut changed = held;
-    changed.dock = Some(([0, 24, 40, 600], 8));
+    changed.chrome[0][0] = Some(([0, 24, 40, 600], 8));
     assert_eq!(
         post_damage(Some(&held), &changed, clean, true),
         Some([0, 24, 40, 600]),
         "a row change repaints the chrome column outside frame space"
     );
     let mut moved = changed;
-    moved.dock = Some(([2, 30, 38, 580], 8));
+    moved.chrome[0][0] = Some(([2, 30, 38, 580], 8));
     assert_eq!(
         post_damage(Some(&changed), &moved, clean, true),
         Some([0, 24, 40, 600]),
         "both the old and new rectangles are damaged"
     );
     let mut hidden = held;
-    hidden.dock = None;
+    hidden.chrome[0][0] = None;
     assert_eq!(
         post_damage(Some(&held), &hidden, clean, true),
         Some([0, 24, 40, 600]),
         "removing a source repaints its old footprint"
+    );
+}
+
+#[test]
+fn window_resource_strip_damage_includes_both_outboard_spans_and_their_old_placement() {
+    let mut old = posted([40.0, 0.0], (840, 600));
+    let clean = Some([0, 0, 0, 0]);
+    old.chrome[1] = [Some(([0, 2, 40, 10], 8)), Some(([800, 2, 840, 10], 8))];
+    assert_eq!(post_damage(Some(&old), &old, clean, true), clean);
+    let mut moved = old;
+    moved.chrome_origins[1].0 = -2;
+    assert_eq!(
+        post_damage(Some(&old), &moved, clean, true),
+        Some([0, 2, 840, 10])
+    );
+    moved.chrome[1] = [None; 2];
+    assert_eq!(
+        post_damage(Some(&old), &moved, clean, true),
+        Some([0, 2, 840, 10])
     );
 }

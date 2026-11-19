@@ -6,7 +6,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's in-process readers of another process (working directory, executable, process-group footprint; on Windows its command line and environment block), of the machine (per-core CPU ticks and the cluster layout, memory by page class, commit, swap, pressure, throttling, cgroup capacity, the GPU's device-wide use, every network interface's counters, the process table's ceilings and counts, the load average, every resource coalition's CPU, disk and footprint counters, a process's code-signing identity and the boot, sleep and wake times on macOS, and what this OS can report at all), of its volumes (the mount table, one volume's free space, one file's identity) and of its build slots (Trust's `build-slot` flock files, read without a lock), on macOS, Linux and Windows. Every platform cfg of those readers lives here. Ordinary readers hold no timer or thread; a lane (`src/lane.rs`) keeps one worker thread for a reader the kernel may hold (the process table's and one process's record), and the fixed CPU-policy collector role owns its deadline and parent-pipe monitors."
+description = "aterm's in-process readers of another process (working directory, executable, process-group footprint; on Windows its command line and environment block), of the machine (per-core CPU ticks and the cluster layout, memory by page class, commit, swap, pressure, throttling, cgroup capacity, the GPU's device-wide use, every network interface's counters, the process table's ceilings and counts, the load average, every resource coalition's CPU, disk and footprint counters, a process's code-signing identity, a thread's counters by performance level, this process's own VM and graphics ledgers, and the boot, sleep and wake times on macOS, and what this OS can report at all), of its volumes (the mount table, one volume's free space, one file's identity) and of its build slots (Trust's `build-slot` flock files, read without a lock), on macOS, Linux and Windows. Every platform cfg of those readers lives here. Ordinary readers hold no timer or thread; a lane (`src/lane.rs`) keeps one worker thread for a reader the kernel may hold (the process table's and one process's record), and the fixed CPU-policy collector role owns its deadline and parent-pipe monitors."
 
 # The macOS arm: libproc, `sysctlbyname`, Mach host and processor statistics
 # and `statfs` (declared in the first-party `libc`, each with its oracle row),
@@ -21,7 +21,15 @@ description = "aterm's in-process readers of another process (working directory,
 # process's code signature by `csops`'s read operations (xnu-private too:
 # declared in `src/identity.rs`, its answers held by decode tests; the
 # status flags and categories it reads are held to the SDK's
-# `Kernel/kern/cs_blobs.h` by `tests/proc_info_sdk.rs`). The
+# `Kernel/kern/cs_blobs.h` by `tests/proc_info_sdk.rs`), this task's VM
+# ledgers by `task_info(TASK_VM_INFO)` and `TASK_VM_INFO_PURGEABLE` (declared in
+# `src/self_vm.rs`, held to the SDK by `tests/proc_info_sdk.rs`), the dispatch
+# queue a thread of this process drains by `mach_vm_read_overwrite` of this
+# task's own memory at libdispatch's exported `dispatch_queue_offsets`
+# (declared in `src/self_cpu_macos.rs`; the table's head is not in the SDK, so a
+# live test of a labelled queue holds it), and a thread's counters by
+# performance level by `proc_pidinfo(PROC_PIDTHREADCOUNTS)` (xnu-private:
+# declared in `src/thread_counts.rs`, its records held by decode tests). The
 # Linux arm reads `/proc` and `/sys` through std (bounded reads; the page size
 # from `/proc/self/auxv`), a volume's free space by `statvfs`, and
 # `getloadavg` and `getrlimit`.

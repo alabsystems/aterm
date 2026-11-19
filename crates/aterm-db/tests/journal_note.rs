@@ -72,6 +72,7 @@ fn widest(t: u64) -> Event {
         cli: Word::new("codex-alab").unwrap(),
         sub: Word::new("0123456789ab"),
         window: Some(Window::WeekModel),
+        model: None,
         pct_x10: Some(1000),
         reset: Some(9_999_999_999),
         res: Some(aterm_db::alab::journal::Res::Minute),

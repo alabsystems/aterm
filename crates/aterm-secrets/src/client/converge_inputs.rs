@@ -115,7 +115,7 @@ impl Inputs {
     /// Record the digest in `state`, and say whether it differs from the one the last apply
     /// recorded. A state that recorded none differs.
     pub(super) fn record(self, state: &mut State) -> bool {
-        let digest: [u8; 32] = self.0.finalize().into();
+        let digest: [u8; 32] = self.0.finalize();
         let moved = state.converge_inputs != Some(digest);
         state.converge_inputs = Some(digest);
         #[cfg(test)]

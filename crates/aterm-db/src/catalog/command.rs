@@ -167,7 +167,7 @@ pub(crate) fn run_at(
         json!({"table":aterm_codec::hex::encode_lower(id),
             "uuid":aterm_codec::hex::encode_lower(entry.scope.table()),
             "generation":entry.scope.generation(), "state":match entry.state {
-            State::Subscribed=>"subscribed", State::Conflict=>"conflict", State::Excluded=>"excluded",
+            State::Subscribed=>"subscribed", State::Conflict=>"conflict", State::Kept=>"kept", State::Excluded=>"excluded",
             State::CreatorLimit=>"creator-limit", State::Capacity=>"capacity"},
             "declarations":entry.declarations.iter().map(|d| json!({
                 "application":d.descriptor.application, "role":d.descriptor.role,
@@ -254,7 +254,7 @@ fn membership_history(paths: &Paths, deadline: std::time::Instant) -> Value {
                 "held_records": history.budgets.held,
                 "weighed_records": history.budgets.weighed,
                 "keyed_records": history.budgets.keyed,
-                "record_bytes": aterm_secrets::membership_log::MAX_RECORDS_STREAM,
+                "record_bytes": history.capacity,
             },
         }),
         Err(error) if error.kind() == aterm_secrets::ErrorKind::VaultBusy => {
@@ -502,6 +502,7 @@ fn inventory_scope(
             Some(entry) => match entry.state {
                 State::Subscribed => ("subscribed", Some(entry.scope)),
                 State::Conflict => ("conflict", None),
+                State::Kept => ("kept", Some(entry.scope)),
                 State::Excluded => ("excluded", None),
                 State::CreatorLimit => ("creator-limit", None),
                 State::Capacity => ("capacity", None),

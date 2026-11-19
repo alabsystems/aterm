@@ -117,8 +117,13 @@ fn the_owner_materializes_after_a_store_grows_and_each_minute() {
 }
 
 /// The owner's pass publishes what this Mac queued before it materializes: one pass turns a
-/// queued intent into one record and leaves a snapshot that holds it, and the next pass signs
-/// nothing more.
+/// queued intent into one record and leaves a snapshot that holds it, and notes one `decided`
+/// in the journal spool it was given (a scratch one here; this user's in a running aterm,
+/// `super::journal_spool`); the next pass signs and notes nothing more.
+///
+/// NEGATIVE CONTROL, observed: with `files_pass` giving its publisher no spool (`journal:
+/// None`), the pass signs and the spool stays empty: `` left: 0 right: 1 `` at `the pass noted
+/// what it signed`.
 #[test]
 fn the_owners_pass_publishes_a_queued_write_and_then_materializes_it() {
     let lab = Lab::new(&[Role::Writer]);
@@ -134,7 +139,19 @@ fn the_owners_pass_publishes_a_queued_write_and_then_materializes_it() {
         ]])
         .unwrap();
     let hang = || Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    let pass = || super::met_busy(&super::files_pass(paths, &config, hang()));
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = super::Spool::at(scratch.path().join("alab"));
+    let noted = || {
+        std::fs::read_to_string(spool.dir().join(crate::alab::journal::spool::SPOOL)).map_or(
+            0,
+            |text| {
+                text.lines()
+                    .filter(|line| line.contains("\"k\":\"decided\""))
+                    .count()
+            },
+        )
+    };
+    let pass = || super::met_busy(&super::files_pass(paths, &config, hang(), Some(&spool)));
     assert!(!pass());
     let machines = File::at(&crate::file::root(paths), &crate::file::MACHINES.file());
     let draft = crate::file::seam::draft_set(
@@ -157,6 +174,7 @@ fn the_owners_pass_publishes_a_queued_write_and_then_materializes_it() {
     let before = records();
     assert!(!pass());
     assert_eq!(records(), before + 1, "the pass signed the intent");
+    assert_eq!(noted(), 1, "the pass noted what it signed");
     let outbox = machines.outbox();
     assert!(outbox.queued.is_empty());
     assert_eq!(outbox.done[0].intent.id, intent.id);
@@ -166,6 +184,7 @@ fn the_owners_pass_publishes_a_queued_write_and_then_materializes_it() {
     assert_eq!(published.named("m7")[0].cell("note"), "said at the desk");
     assert!(!pass());
     assert_eq!(records(), before + 1, "a later pass signs nothing more");
+    assert_eq!(noted(), 1, "and notes nothing more");
 }
 
 /// Regular passes the idle hour makes after its first: one a minute for an hour.
@@ -177,7 +196,7 @@ type Counter = (&'static str, fn() -> usize);
 /// The thread counters an idle hour is counted by, each read as this thread has it now, named
 /// as the `files-idle` lane's baseline names them: the table views a pass reads to project from
 /// ([`files_materialize::PROJECTIONS`]); MACHINE's claim projections and claim contexts
-/// ([`crate::typed::claim::PROJECTS`], [`crate::typed::claim::CONTEXTS`]); the durable writes a
+/// ([`crate::typed::claim::projection_count`], [`crate::typed::claim::CONTEXTS`]); the durable writes a
 /// recording makes and the folder modes the shared files' writers set
 /// (`aterm_file::file::test_puts`, `test_chmods`); the
 /// carried records handed to authentication ([`crate::table::CARRIED_AUTHENTICATED`]); the store
@@ -186,8 +205,7 @@ type Counter = (&'static str, fn() -> usize);
 const COUNTERS: [Counter; 8] = [
     ("projections", || files_materialize::PROJECTIONS.get()),
     ("machine_claim_projects", || {
-        crate::typed::claim::PROJECTS
-            .with_borrow(|counts| counts.get(MACHINE.name).copied().unwrap_or(0))
+        crate::typed::claim::projection_count(MACHINE.name)
     }),
     ("machine_claim_contexts", || {
         crate::typed::claim::CONTEXTS
@@ -317,7 +335,7 @@ fn idle_hour(lab: &Lab) -> Hour {
             "the regular pass is due at its time"
         );
         let before = counters();
-        let outcomes = super::files_pass(paths, &config, crate::admission::deadline());
+        let outcomes = super::files_pass(paths, &config, crate::admission::deadline(), None);
         tally(
             if pass == 0 {
                 &mut hour.first
@@ -787,8 +805,14 @@ fn the_live_materializer_wakes_on_growth_on_the_owner_back_and_on_its_stop() {
     };
 
     let elsewhere = Arc::new(Elsewhere::default());
-    let files = Materializer::start(paths.clone(), config.clone(), cadence, elsewhere.clone())
-        .expect("its thread");
+    let files = Materializer::start(
+        paths.clone(),
+        config.clone(),
+        cadence,
+        elsewhere.clone(),
+        None,
+    )
+    .expect("its thread");
     write("m7");
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "m7 materialized", || {
         named("m7").then_some(())
@@ -797,8 +821,14 @@ fn the_live_materializer_wakes_on_growth_on_the_owner_back_and_on_its_stop() {
 
     let elsewhere = Arc::new(Elsewhere::default());
     elsewhere.set(true);
-    let files = Materializer::start(paths.clone(), config.clone(), cadence, elsewhere.clone())
-        .expect("its thread");
+    let files = Materializer::start(
+        paths.clone(),
+        config.clone(),
+        cadence,
+        elsewhere.clone(),
+        None,
+    )
+    .expect("its thread");
     write("m8");
     elsewhere.set(false);
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "m8 materialized", || {

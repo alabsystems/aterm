@@ -240,9 +240,7 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
         accessibility,
         no_sign_out_owed,
         opted_out: [None; Access::ALL.len()],
-        acquiring: super::state_root().is_ok_and(|root| {
-            super::permission_steps_at(&root) == Ok(super::PermissionSteps::Allowed)
-        }),
+        acquiring: super::state_root().is_ok_and(|root| super::acquiring_person_access_at(&root)),
     };
     grants.opted_out = opted_out(
         Access::ALL.map(opt_out::get),
@@ -328,11 +326,14 @@ fn devtools_listing() -> DevTools {
 }
 
 /// Whether `selection` manages `access`'s row: the sign-outs' Accessibility while they are
-/// selected, every other required grant while Permissions is. App-level Local Network consent
-/// is a diagnostic, not a requirement of aterm's broker-owned traffic.
+/// selected, the Spotlight scope always (no switch governs it, [`Access::switch_governs`]),
+/// every other required grant while Permissions is. App-level Local Network consent is a
+/// diagnostic, not a requirement of aterm's broker-owned traffic.
 fn managed(access: Access, selection: Selection) -> bool {
     access.needed_for(selection)
-        && (access == Access::Accessibility || selection.contains(Setting::Permissions))
+        && (access == Access::Accessibility
+            || !access.switch_governs()
+            || selection.contains(Setting::Permissions))
 }
 
 /// One Access row as `grants` read it. `selection` decides whether the row is
@@ -590,6 +591,14 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
                         .or(read.detail.as_deref())
                         .unwrap_or("the requirement could not be read")
                 ),
+            ),
+            // Spotlight indexing in place says how, in its own words: off, scoped, or scoped with
+            // folders made since or refused, which no step of this stage waits on.
+            Standing::InPlace if access == Access::SpotlightScope => (
+                "ok",
+                seen.note
+                    .as_deref()
+                    .map_or_else(|| reading.to_owned(), |note| format!("{reading}; {note}")),
             ),
             // An opt-out read as the person's wanted value is in place as they chose.
             Standing::InPlace => match opted(grants, access) {

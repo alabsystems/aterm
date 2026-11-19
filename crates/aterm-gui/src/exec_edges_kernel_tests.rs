@@ -3,6 +3,7 @@
 
 //! Kernel `ProcWatch` tests over an interactive `zsh` pseudo-terminal.
 
+use std::io;
 use std::time::{Duration, Instant};
 
 use aterm_uds::process::child_pids;
@@ -72,8 +73,45 @@ impl Zsh {
         }
     }
 
-    fn type_line(&self, line: &str) {
-        aterm_pty::write_all(self.shell.master, format!("{line}\r").as_bytes());
+    fn output_tail(&self) -> &[u8] {
+        &self.out[self.out.len().saturating_sub(16 * 1024)..]
+    }
+
+    fn type_line(&mut self, line: &str) {
+        let bytes = format!("{line}\r");
+        let master = self.shell.master;
+        let start = Instant::now();
+        let mut written = 0;
+        let result = submit_command_with(
+            bytes.as_bytes(),
+            |pending| {
+                // SAFETY: this rig owns the live master, and `pending` is valid for its length.
+                // One attempt leaves every retry, including EINTR, under the helper's bound.
+                let n = unsafe { libc::write(master, pending.as_ptr().cast(), pending.len()) };
+                if n < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let n = usize::try_from(n).expect("a nonnegative write fits usize");
+                written += n;
+                Ok(n)
+            },
+            || {
+                self.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            },
+            || start.elapsed() >= MUST_HAPPEN,
+        );
+        if let Err(error) = result {
+            self.pump();
+            panic!(
+                "command {line:?} stopped after {written}/{} bytes: {error} (errno {:?}); \
+                 PTY {} bytes, tail {:?}",
+                bytes.len(),
+                error.raw_os_error(),
+                self.out.len(),
+                String::from_utf8_lossy(self.output_tail())
+            );
+        }
     }
 
     fn run_until(&mut self, line: &str, needle: &str) {
@@ -184,25 +222,218 @@ fn mkfifo(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     path
 }
 
+fn submit_command_with(
+    bytes: &[u8],
+    mut write: impl FnMut(&[u8]) -> io::Result<usize>,
+    mut wait: impl FnMut(),
+    mut expired: impl FnMut() -> bool,
+) -> io::Result<()> {
+    let mut pending = bytes;
+    while !pending.is_empty() {
+        if expired() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "command submission made no completion within the hang bound",
+            ));
+        }
+        match write(pending) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "PTY accepted no command bytes",
+                ));
+            }
+            Ok(n) => {
+                pending = pending.get(n..).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "PTY wrote beyond the command")
+                })?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => wait(),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum FifoOpenError {
+    Refused(io::Error),
+    TimedOut(io::Error),
+}
+
+fn fifo_writer_with<T>(
+    mut open: impl FnMut() -> io::Result<T>,
+    mut wait: impl FnMut(),
+    mut expired: impl FnMut() -> bool,
+) -> Result<T, FifoOpenError> {
+    loop {
+        match open() {
+            Ok(writer) => return Ok(writer),
+            Err(error) => {
+                if error.raw_os_error() != Some(libc::ENXIO)
+                    && error.kind() != io::ErrorKind::Interrupted
+                {
+                    return Err(FifoOpenError::Refused(error));
+                }
+                if expired() {
+                    return Err(FifoOpenError::TimedOut(error));
+                }
+                wait();
+            }
+        }
+    }
+}
+
 fn open_writer(zsh: &mut Zsh, fifo: &std::path::Path) -> std::os::fd::OwnedFd {
     use std::os::fd::FromRawFd as _;
     let c_path = std::ffi::CString::new(fifo.display().to_string()).expect("path");
     let start = Instant::now();
-    loop {
-        // SAFETY: as above.
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-        if fd >= 0 {
+    let result = fifo_writer_with(
+        || {
+            // SAFETY: a NUL-terminated path in this test's scratch folder.
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
             // SAFETY: a descriptor this test just opened and now owns.
-            return unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+        },
+        || {
+            zsh.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        },
+        || start.elapsed() >= MUST_HAPPEN,
+    );
+    match result {
+        Ok(writer) => writer,
+        Err(failure) => {
+            zsh.pump();
+            let (what, error) = match failure {
+                FifoOpenError::Refused(error) => ("FIFO open failed", error),
+                FifoOpenError::TimedOut(error) => {
+                    ("hang: no FIFO reader within the hang bound", error)
+                }
+            };
+            panic!(
+                "{what}: {}: {error} (errno {:?}); PTY {} bytes, tail {:?}",
+                fifo.display(),
+                error.raw_os_error(),
+                zsh.out.len(),
+                String::from_utf8_lossy(zsh.output_tail())
+            );
         }
-        assert!(
-            start.elapsed() < MUST_HAPPEN,
-            "hang: nothing ever read {}",
-            fifo.display()
-        );
-        zsh.pump();
-        std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn fixture_command_submission_keeps_the_whole_line_and_real_failures() {
+    use std::cell::Cell;
+
+    let command = b"reroute\r";
+    let mut submitted = Vec::new();
+    let mut calls = 0;
+    let waits = Cell::new(0);
+    submit_command_with(
+        command,
+        |pending| {
+            calls += 1;
+            match calls {
+                1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                2 => {
+                    submitted.extend_from_slice(&pending[..2]);
+                    Ok(2)
+                }
+                3 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                _ => {
+                    submitted.extend_from_slice(pending);
+                    Ok(pending.len())
+                }
+            }
+        },
+        || waits.set(waits.get() + 1),
+        || false,
+    )
+    .expect("every command byte is submitted");
+    assert_eq!(submitted, command);
+    assert_eq!(waits.get(), 1);
+
+    let failed = submit_command_with(
+        command,
+        |_| Err(io::Error::from_raw_os_error(libc::EIO)),
+        || panic!("a real write error is not backpressure"),
+        || false,
+    )
+    .expect_err("a failed write cannot count as a submitted command");
+    assert_eq!(failed.raw_os_error(), Some(libc::EIO));
+    assert_eq!(
+        submit_command_with(command, |_| Ok(0), || {}, || false)
+            .expect_err("a zero write is not completion")
+            .kind(),
+        io::ErrorKind::WriteZero
+    );
+
+    for kind in [io::ErrorKind::Interrupted, io::ErrorKind::WouldBlock] {
+        let looks = Cell::new(0);
+        let attempts = Cell::new(0);
+        let failed = submit_command_with(
+            command,
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from(kind))
+            },
+            || {},
+            || {
+                looks.set(looks.get() + 1);
+                looks.get() > 2
+            },
+        )
+        .expect_err("every retry observes the same hang bound");
+        assert_eq!(failed.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(attempts.get(), 2);
+    }
+}
+
+#[test]
+fn fixture_fifo_opening_waits_only_for_a_reader_and_retains_errors() {
+    use std::cell::Cell;
+
+    let mut attempts = 0;
+    let waits = Cell::new(0);
+    let writer = fifo_writer_with(
+        || {
+            attempts += 1;
+            match attempts {
+                1 => Err(io::Error::from_raw_os_error(libc::ENXIO)),
+                2 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                _ => Ok(17),
+            }
+        },
+        || waits.set(waits.get() + 1),
+        || false,
+    )
+    .expect("a reader eventually opens the FIFO");
+    assert_eq!(writer, 17);
+    assert_eq!(waits.get(), 2);
+
+    let failed = fifo_writer_with::<()>(
+        || Err(io::Error::from_raw_os_error(libc::EACCES)),
+        || panic!("a real open error is not an absent reader"),
+        || true,
+    )
+    .expect_err("permanent errors are returned immediately");
+    assert!(
+        matches!(failed, FifoOpenError::Refused(error) if error.raw_os_error() == Some(libc::EACCES))
+    );
+    let failed = fifo_writer_with::<()>(
+        || Err(io::Error::from_raw_os_error(libc::ENXIO)),
+        || panic!("an expired wait does not wait again"),
+        || true,
+    )
+    .expect_err("the last actual open error accompanies the timeout");
+    assert!(
+        matches!(failed, FifoOpenError::TimedOut(error) if error.raw_os_error() == Some(libc::ENXIO))
+    );
 }
 
 fn release(gate: std::os::fd::OwnedFd) {

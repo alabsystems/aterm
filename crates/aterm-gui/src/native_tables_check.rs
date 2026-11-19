@@ -8,7 +8,10 @@
 //! store's state: whether this machine can write and why not, whether its history is complete
 //! here, its records and bytes against the store's caps, this machine's records against its writer
 //! cap and its automatic-record quota, the refused and inert records by id, the generation, how
-//! many machines have written, and the roll line where check asks for a roll.
+//! many machines have written, the roll line where check asks for a roll, and who holds its
+//! checkpoints back: whether this machine may sign one and, of the enrolled machines and of
+//! those that wrote a record in the last 30 days, how many hold them back for each reason.
+//! Those three sentences wrap, so each is whole at any width.
 //!
 //! Check is a view a person opens from the rail (or, under 900 px, from the table picker): it
 //! raises no alert, badge or banner, the rail shows no count of it, and its findings are counted
@@ -80,7 +83,15 @@ pub(crate) struct Store {
     pub(crate) writers: usize,
     /// What the roll finding says, where check asks for a roll.
     pub(crate) roll: Option<String>,
+    /// Who holds the registry's checkpoints back, a sentence each as `aterm db table check
+    /// --fence` says it (`aterm_db::att::command::fence_lines`): whether this machine may sign
+    /// one, the enrolled machines, and those that wrote a record in the last 30 days.
+    pub(crate) fence: Vec<String>,
 }
+
+/// The keys of the fence's sentences, in their order ([`Store::fence`]). The list wraps the
+/// lines under these keys, which say counts at their ends; every other line is cut to its width.
+pub(crate) const FENCE: [&str; 3] = ["fence", "fence-roster", "fence-recent"];
 
 /// What Check shows: every finding, and the store's state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -234,6 +245,7 @@ impl Store {
                 Some(why) => format!("Check asks for a roll: {why}"),
             },
         ));
+        lines.extend(FENCE.into_iter().zip(self.fence.iter().cloned()));
         lines
     }
 }
@@ -454,15 +466,27 @@ pub(crate) fn list(app: &TablesApp, view: &TablesViewState, width: f32, height: 
                 note + 8.0,
             );
             for (key, words) in checked.store.lines() {
+                let node_key = format!("tables/check/store/{key}");
+                if FENCE.contains(&key) {
+                    let mut said = crate::native_about::wrapped(
+                        &node_key,
+                        &words,
+                        width - 20.0,
+                        SemanticRole::Text,
+                        StyleRef::Plain,
+                    );
+                    let tall = match said.layout.height {
+                        Length::Fixed(tall) => tall.max(note),
+                        _ => note,
+                    };
+                    said.layout = said.layout.padding(Insets::symmetric(10.0, 0.0));
+                    push(&mut children, said, tall);
+                    continue;
+                }
                 push(
                     &mut children,
-                    fitted(
-                        format!("tables/check/store/{key}"),
-                        &words,
-                        StyleRef::Plain,
-                        width - 20.0,
-                    )
-                    .layout(Layout::default().padding(Insets::symmetric(10.0, 0.0))),
+                    fitted(node_key, &words, StyleRef::Plain, width - 20.0)
+                        .layout(Layout::default().padding(Insets::symmetric(10.0, 0.0))),
                     note,
                 );
             }

@@ -409,13 +409,18 @@ impl Files {
         let commit = named(repo, var)
             .and_then(|named| Commit::read(&named, run, import))
             .map_err(|e| e.to_string())?;
+        Ok(Self::at_commit(&commit, run))
+    }
+
+    /// Read the source checks' policy from this already selected Git commit.
+    pub fn at_commit(commit: &Commit, run: RunGit<'_>) -> Self {
         let text = |path: &str| commit.text(path, run).map_err(|e| e.to_string());
-        Ok(Self {
+        Self {
             sha: commit.sha().to_owned(),
             shown: commit.shown().to_owned(),
             baseline: text(aterm_census::export_scan::rows::BASELINE),
             registry: text(crate::export_scan::REGISTRY),
-        })
+        }
     }
 }
 

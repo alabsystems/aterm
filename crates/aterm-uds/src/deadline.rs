@@ -500,6 +500,66 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+/// One bounded stream tail observed after a refused capture, without a complete-EOF claim.
+#[derive(Default)]
+pub struct CapturedTail {
+    tail: Vec<u8>,
+    observed_bytes: u64,
+}
+
+impl CapturedTail {
+    /// The retained suffix of bytes observed from this stream, at most [`OUTPUT_KEEP`].
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.tail
+    }
+
+    /// Bytes observed by this stream's reader when its tail was sampled, not all bytes written.
+    #[must_use]
+    pub const fn observed_bytes(&self) -> u64 {
+        self.observed_bytes
+    }
+
+    /// Whether observed bytes precede the retained tail. More bytes may remain unobserved.
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.observed_bytes > u64::try_from(self.tail.len()).unwrap_or(u64::MAX)
+    }
+}
+
+impl std::fmt::Debug for CapturedTail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedTail")
+            .field("observed_bytes", &self.observed_bytes)
+            .field("retained_tail_bytes", &self.tail.len())
+            .field("truncated", &self.is_truncated())
+            .finish()
+    }
+}
+
+/// Per-stream observations from a refused capture. Neither a natural producer exit status nor
+/// complete output EOF is established. Each stream is sampled independently without waiting
+/// for a reader to finish. Debugging exposes counts only; bytes require explicit access.
+#[derive(Debug, Default)]
+pub struct PartialOutput {
+    stdout: CapturedTail,
+    stderr: CapturedTail,
+}
+
+impl PartialOutput {
+    /// The observed stdout tail and its count.
+    #[must_use]
+    pub const fn stdout(&self) -> &CapturedTail {
+        &self.stdout
+    }
+
+    /// The observed stderr tail and its count.
+    #[must_use]
+    pub const fn stderr(&self) -> &CapturedTail {
+        &self.stderr
+    }
+}
+
 /// Why a process-progress-bounded child did not produce an output.
 #[derive(Debug)]
 pub enum ProgressError {
@@ -511,14 +571,28 @@ pub enum ProgressError {
         window: Duration,
         /// The operation the caller was waiting for, without secret argv or environment values.
         waiting_on: String,
+        /// Bounded observations, never a completed output or a producer exit status.
+        partial: PartialOutput,
     },
+}
+
+impl ProgressError {
+    fn stalled(window: Duration, waiting_on: String, late: Late) -> Self {
+        Self::Stalled {
+            window,
+            waiting_on,
+            partial: late.snapshot(),
+        }
+    }
 }
 
 impl std::fmt::Display for ProgressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Run(error) => std::fmt::Display::fmt(error, f),
-            Self::Stalled { window, waiting_on } => write!(
+            Self::Stalled {
+                window, waiting_on, ..
+            } => write!(
                 f,
                 "produced no stdout/stderr bytes and its descendant tree made no CPU or I/O \
                  progress for {window:?} while waiting on {waiting_on}"
@@ -1256,12 +1330,13 @@ pub fn descendants_work() -> impl FnMut() -> u64 {
     }
 }
 
-/// Evidence window over captured bytes and a complete descendant-tree progress generation.
-/// An unread or incomparable tree disarms the window until another complete baseline exists.
-/// [`ProgressWindow::observe`] reads the tree once a tick, and afresh before it judges the
-/// window closed.
+/// Evidence window over captured bytes and a supplied comparable process-progress generation.
+/// The caller advances the generation only on native CPU or I/O progress and supplies `None`
+/// for an unread or incomparable observation, which disarms the window until a new baseline.
+/// [`Self::observe`] samples once a tick, and afresh before it judges the window closed.
+/// Local child collectors supply their complete descendant-tree progress here.
 #[derive(Clone, Copy, Debug)]
-struct ProgressWindow {
+pub struct ProgressWindow {
     window: Duration,
     last: Instant,
     bytes: u64,
@@ -1272,7 +1347,9 @@ struct ProgressWindow {
 }
 
 impl ProgressWindow {
-    fn new(window: Duration, now: Instant) -> Self {
+    /// Start a window at `now`, awaiting its first comparable progress observation.
+    #[must_use]
+    pub fn new(window: Duration, now: Instant) -> Self {
         Self {
             window,
             last: now,
@@ -1290,14 +1367,14 @@ impl ProgressWindow {
             .max(Duration::from_millis(1))
     }
 
-    /// How long until the collector looks again: what is left of the window at `now`, but at
-    /// most a tick, and between readings no later than the next reading is due. The tree is read
-    /// through `read` only when a tick has passed since its last reading or the window would
-    /// close without one: a collector that wakes more often (one holding a stop) does not sweep
-    /// the process table on each wake, one that waits the whole answer (one without a stop)
-    /// wakes when the next reading is due, and a stall is never named on a stale reading.
-    /// Between readings captured bytes still count.
-    fn observe(
+    /// How long until the next observation is due; zero means a whole window without progress.
+    /// `bytes` is the captured byte count; `read` supplies a comparable native process-progress
+    /// generation, or `None` for unread or incomparable evidence. It runs only when a tick has
+    /// passed or the window would close without a fresh observation. More frequent calls do
+    /// not resample the process source, and a stall is never named on stale evidence. Captured
+    /// bytes still count between samples.
+    #[must_use]
+    pub fn observe(
         &mut self,
         now: Instant,
         bytes: u64,
@@ -1506,7 +1583,7 @@ fn output_from_while_process_progressing_with(
         true,
         stopped,
     )?
-    .map_err(|_| ProgressError::Stalled { window, waiting_on })
+    .map_err(|late| ProgressError::stalled(window, waiting_on, late))
 }
 
 /// `cmd` run with `stdin` in a process group of its own (on Unix), its output drained, until it
@@ -1608,6 +1685,15 @@ struct Late {
 }
 
 impl Late {
+    /// Snapshot each existing bounded tail without waiting for drain completion. No status from
+    /// retirement and no reader-completion signal is promoted to a producer or EOF result.
+    fn snapshot(self) -> PartialOutput {
+        PartialOutput {
+            stdout: self.stdout.map(Drain::snapshot).unwrap_or_default(),
+            stderr: self.stderr.map(Drain::snapshot).unwrap_or_default(),
+        }
+    }
+
     /// What the run wrote, read until its pipes close or [`DRAIN_GRACE`] has passed.
     #[cfg(all(unix, any(test, debug_assertions)))]
     fn wrote(self) -> (Vec<u8>, Vec<u8>) {
@@ -2027,6 +2113,14 @@ struct Drain {
 }
 
 impl Drain {
+    fn snapshot(self) -> CapturedTail {
+        let tail = self.tail.lock().unwrap_or_else(PoisonError::into_inner);
+        CapturedTail {
+            tail: tail.clone(),
+            observed_bytes: self.total.load(Ordering::Relaxed),
+        }
+    }
+
     fn bytes(&self) -> u64 {
         self.total.load(Ordering::Relaxed)
     }
@@ -2128,13 +2222,15 @@ fn drain(
                 if n == 0 {
                     break;
                 }
-                counted.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
                 let mut tail = theirs.lock().unwrap_or_else(PoisonError::into_inner);
                 tail.extend_from_slice(&chunk[..n]);
                 if tail.len() > OUTPUT_KEEP {
                     let cut = tail.len() - OUTPUT_KEEP;
                     tail.drain(..cut);
                 }
+                // Commit the count under the same lock as its tail, so a refused capture can
+                // sample one coherent observation without waiting for this reader to finish.
+                counted.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
             }
             let _ = tx.send(());
         })?;

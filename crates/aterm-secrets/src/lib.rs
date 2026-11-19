@@ -365,6 +365,13 @@ pub enum ErrorKind {
     /// message is [`client::dropped_words`]. Asked again while this Mac still reads dropped, it
     /// is refused again; with its vault folder set aside it joins as a new Mac.
     Dropped,
+    /// A records pull a server refused (its `409`) beside a records bound that states a later
+    /// format than the puller stated ([`crossing::RecordsBound::format`]): nothing was taken,
+    /// and asked again stating the same format it is refused again. The one refusal a Mac whose
+    /// build reads that format asks again stating it (`membership_log::follow`); what the
+    /// server states is no evidence of its records' format. No server states a later format
+    /// than 1 while no node stores a format mark.
+    LaterFormat,
 }
 
 impl Error {
@@ -402,10 +409,18 @@ impl From<std::io::Error> for Error {
 /// This crate's result.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Write one line to stderr, the log a launchd or systemd job keeps. A log that cannot take it
-/// (a full disk, a closed descriptor) loses the line rather than the job: `eprintln!` panics
-/// when its write fails, which would end a server or subscriber over a log line.
-#[cfg(any(unix, windows))]
+/// Write one line, dated, to standard error: the log a launchd job keeps, bounded where the job's
+/// verb kept it (`service::keep_log`, [`aterm_uds::job_log::line`]). A log that cannot take it (a
+/// full disk, a closed descriptor) loses the line rather than the job: `eprintln!` panics when
+/// its write fails, which would end a server or subscriber over a log line.
+#[cfg(unix)]
+pub(crate) fn log_line(line: &str) {
+    aterm_uds::job_log::line(format_args!("{line}"));
+}
+
+/// Write one line to standard error, the log a Windows service keeps. A log that cannot take it
+/// loses the line rather than the job.
+#[cfg(windows)]
 pub(crate) fn log_line(line: &str) {
     use std::io::Write as _;
     let _ = writeln!(std::io::stderr().lock(), "{line}");

@@ -36,10 +36,6 @@ fn fixture_flushes_keep_their_order_and_errors_without_hardware_drains() {
 /// The exact first-exec line B1's frozen release-tool proof expects.
 pub const FROZEN_TOOL_VERSION: &str = "aterm-verify tool 1";
 
-/// The context of the commit statuses the follower (`verify watch`) posts on main's tips: the
-/// one verdict of main it keeps, which the release reads.
-pub const FOLLOWER_CONTEXT: &str = "aterm/follower";
-
 #[cfg(all(test, unix, debug_assertions))]
 mod benchmark_fixture_tests;
 
@@ -58,6 +54,8 @@ pub mod checks;
 pub mod cli;
 pub mod compile_account;
 pub mod compile_width;
+#[cfg(unix)]
+mod compiler_artifact;
 mod compiler_message;
 mod compiler_observation;
 /// The disk a run will write, claimed before it builds (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT).
@@ -81,6 +79,7 @@ pub mod native_verifier;
 pub mod own_tests;
 pub mod perf;
 pub mod plan;
+mod prequeue;
 #[cfg(unix)]
 pub mod provision;
 pub mod release_input;
@@ -108,6 +107,8 @@ pub mod status;
 mod test_env;
 pub mod test_history;
 pub mod test_index;
+#[cfg(unix)]
+mod test_launch;
 pub mod test_plan;
 mod test_progress;
 mod test_shards;
@@ -604,7 +605,7 @@ impl NativeBuildPlan {
         let build_dir = if generated {
             shared_build_dir
                 .clone()
-                .or_else(|| fallback_build_dir(&env, &root, &target))
+                .or_else(|| aterm_toolchain::build_cache::target_build_config(&target))
         } else {
             None
         };
@@ -632,9 +633,17 @@ impl NativeBuildPlan {
     }
 
     fn layout(&self) -> std::io::Result<&CompilerLayout> {
-        self.compiler_layout
+        let layout = self
+            .compiler_layout
             .as_ref()
-            .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why.clone()))
+            .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why.clone()))?;
+        if layout.caller_build_dir.is_none() && self.build_dir.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the captured native build has no safe protected intermediate-directory recipe",
+            ));
+        }
+        Ok(layout)
     }
 
     /// Whether the caller selected intermediates, including valid opaque Cargo templates.
@@ -657,7 +666,8 @@ impl NativeBuildPlan {
     }
 
     /// Set/remove projection for every Cargo layout variable. Values come only from this plan;
-    /// valid Cargo templates remain unexpanded for the command's actual manifest workspace.
+    /// uncaptured Targo twins are removed, and valid Cargo templates remain unexpanded for
+    /// the command's actual manifest workspace.
     ///
     /// # Errors
     /// The captured layout was invalid or unresolved.
@@ -674,6 +684,10 @@ impl NativeBuildPlan {
         [
             ("CARGO_TARGET_DIR", Some(self.target.as_os_str())),
             ("CARGO_BUILD_TARGET_DIR", None),
+            ("TARGO_HOME", None),
+            ("TARGO_TARGET_DIR", None),
+            ("TARGO_BUILD_TARGET_DIR", None),
+            ("TARGO_BUILD_BUILD_DIR", None),
             (
                 "CARGO_BUILD_BUILD_DIR",
                 layout
@@ -726,13 +740,56 @@ impl NativeBuildPlan {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    fn prepare_caller_build_dir(&self) -> std::io::Result<()> {
+        use aterm_toolchain::build_cache::{
+            Machine, Tool, read_config, read_manifest, workspace_root,
+        };
+        let layout = self.layout()?;
+        let Some(choice) = layout.caller_build_dir.as_ref() else {
+            return Ok(());
+        };
+        let lookup = |key: &str| self.env.cargo_var(key);
+        let machine = Machine {
+            home: Some(self.env.home.as_path()).filter(|home| !home.as_os_str().is_empty()),
+            root: None,
+            cwd: Some(&self.root),
+            env: &lookup,
+            read: &read_config,
+            read_manifest: &read_manifest,
+            writable: &writable_dir,
+        };
+        let workspace = workspace_root(&self.root.join("Cargo.toml"), Tool::Targo, &machine);
+        let root = atpkg::build_cache::registered::explicit_build_root(
+            Path::new(choice.value()),
+            workspace.as_deref(),
+            layout.cargo_home.as_deref(),
+        )?;
+        atpkg::build_cache::registered::prepare_explicit_build_dir(&root)
+    }
+
     /// Prepare the captured automatic final path and selected intermediates without reselecting
     /// a target from later configuration or environment. Final target selection alone grants no custody.
     ///
     /// # Errors
-    /// The automatic final path or selected fallback cannot be prepared safely.
+    /// The automatic final path or selected intermediates cannot be prepared safely, or a
+    /// caller-selected intermediate directory has no known `.noindex` exclusion boundary.
     pub fn prepare(&self) -> std::io::Result<()> {
+        #[cfg(target_os = "macos")]
+        self.prepare_caller_build_dir()?;
         self.prepare_target()?;
+        if let Some(selected) = self.shared_build_dir.as_deref() {
+            let cache = aterm_toolchain::build_cache::cache_root(&self.env.home);
+            if self.build_dir() != Some(selected)
+                || aterm_toolchain::build_cache::config_value(&cache).as_deref() != Some(selected)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the captured shared build directory differs from its cache root",
+                ));
+            }
+            atpkg::build_cache::registered::prepare_shared_build_dir(&self.env.home, &self.root)?;
+        }
         prepare_selected_build_dir(
             &self.env,
             &self.root,
@@ -746,7 +803,9 @@ impl NativeBuildPlan {
 /// The `build.build-dir` for main-lane children when [`main_build_dir`] is `None` and `target` is pinned.
 #[must_use]
 pub fn fallback_build_dir(env: &EnvSnapshot, root: &Path, target: &Path) -> Option<String> {
-    use aterm_toolchain::build_cache::{Machine, read_config, target_build_dir};
+    use aterm_toolchain::build_cache::{
+        Machine, cargo_build_dir_hint_with, read_config, target_build_config,
+    };
     let lookup = |key: &str| env.cargo_var(key);
     let target = std::path::absolute(target).ok()?;
     let machine = Machine {
@@ -760,7 +819,10 @@ pub fn fallback_build_dir(env: &EnvSnapshot, root: &Path, target: &Path) -> Opti
         read_manifest: &aterm_toolchain::build_cache::read_manifest,
         writable: &writable_dir,
     };
-    target_build_dir(&target, &machine)
+    match cargo_build_dir_hint_with(&machine) {
+        Ok(None) => target_build_config(&target),
+        Ok(Some(_)) | Err(_) => None,
+    }
 }
 
 /// Native children bypass atpkg's shell shim. Prepare their captured automatic final target
@@ -786,7 +848,23 @@ fn prepare_main_build_dir(ctx: &Ctx) -> std::io::Result<()> {
         ));
     }
     if ctx.checks.iter().copied().any(disk::builds) {
-        plan.prepare()
+        let stages = plan::plan(ctx).map_err(std::io::Error::other)?;
+        plan.prepare()?;
+        let mut prepared = std::collections::BTreeSet::new();
+        for stage in stages {
+            if matches!(
+                stage.lane,
+                plan::Lane::Pure | plan::Lane::MainTarget | plan::Lane::AfterCompile
+            ) {
+                continue;
+            }
+            if let Some(dir) = plan::lane_dir(ctx, stage.lane)
+                && prepared.insert(dir.clone())
+            {
+                aterm_uds::backup::Backups::SYSTEM.build_dir(&dir)?;
+            }
+        }
+        Ok(())
     } else {
         plan.prepare_target()
     }
@@ -1274,6 +1352,8 @@ pub struct Ctx {
     /// Prior successful AppKit groups whose current executable bytes must be re-keyed before
     /// their WindowServer work can be carried.
     pub passed_appkit_groups: Option<appkit_content::Passed>,
+    /// Images captured by this build before window admission, consumed by the corresponding driver.
+    prepared_appkit: Mutex<std::collections::BTreeMap<&'static str, appkit_content::Prepared>>,
     /// The owner-private directory holding each AppKit group's empty working directory and the
     /// `windowed.lock` that serializes them; `None` is the stable per-user one every real run
     /// shares, so a carried group's proof names the same cwd at every hop. A test context names
@@ -1299,6 +1379,8 @@ pub struct Ctx {
     /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
     /// what failed would run under a claim learned when it passed, or none.
     pub test_compile_failed: std::sync::atomic::AtomicBool,
+    #[cfg(unix)]
+    compiled_test_launches: Mutex<Option<test_launch::Prepared>>,
     /// Each run's id and CPU for its admission-log rows, begun afresh by each run of its checks
     /// ([`run_with`], [`admission_rows::Tally`]).
     pub(crate) admission: admission_rows::Tally,
@@ -1500,6 +1582,7 @@ impl Ctx {
             test_history: None,
             passed_lint_packages: None,
             passed_appkit_groups: None,
+            prepared_appkit: Mutex::default(),
             #[cfg(any(test, debug_assertions))]
             appkit_runtime: None,
             input_items: Vec::new(),
@@ -1507,6 +1590,8 @@ impl Ctx {
             events: None,
             hang_samples: None,
             test_compile_failed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(unix)]
+            compiled_test_launches: Mutex::new(None),
             admission: admission_rows::Tally::default(),
             tests_cpu_ms: std::sync::atomic::AtomicU64::new(0),
             halt: sched::Halt::off(),
@@ -2031,7 +2116,7 @@ impl<'ctx> RunPlan<'ctx> {
         })
     }
 
-    pub(crate) fn context(&self) -> &Ctx {
+    pub(crate) fn context(&self) -> &'ctx Ctx {
         self.ctx
     }
 
@@ -2106,7 +2191,7 @@ pub(crate) fn admit_live(
 }
 
 /// Admit `need` in this user's ledger on the live machine ([`admit_in`]), saying through `say`
-/// what it waits for: the judgment turn's admission ([`turn::take`]), which reports its first
+/// what it waits for: the judgment turn's admission ([`turn::Prepared::take`]), which reports its first
 /// wait as an event.
 ///
 /// # Errors
@@ -3424,7 +3509,7 @@ fn run_with(
     show: &Show<'_>,
     seams: Seams,
 ) -> std::io::Result<i32> {
-    run_with_plan(ctx, out, log, show, seams, None)
+    run_with_plan(ctx, out, log, show, seams, None, None)
 }
 
 fn run_with_plan<'ctx>(
@@ -3434,9 +3519,10 @@ fn run_with_plan<'ctx>(
     show: &Show<'_>,
     seams: Seams,
     prepared: Option<RunPlan<'ctx>>,
+    admission: Option<&prequeue::Admission<'_>>,
 ) -> std::io::Result<i32> {
     let started_ms = ctx.admission.begin();
-    let code = run_seamed(ctx, out, log, show, seams, prepared);
+    let code = run_seamed(ctx, out, log, show, seams, prepared, admission);
     let ended = code.as_ref().map_or(exit::COULD_NOT_RUN, |code| *code);
     admission_rows::run(ctx, started_ms, ended);
     code
@@ -3450,6 +3536,7 @@ fn run_seamed<'ctx>(
     show: &Show<'_>,
     seams: Seams,
     prepared: Option<RunPlan<'ctx>>,
+    admission: Option<&prequeue::Admission<'_>>,
 ) -> std::io::Result<i32> {
     ctx.record_event(&format!(
         "verify-event: {}",
@@ -3502,6 +3589,9 @@ fn run_seamed<'ctx>(
             "verify: the prepared work belongs to another invocation; no check was run"
         )?;
         return Ok(exit::COULD_NOT_RUN);
+    }
+    if admission.is_some() {
+        prequeue::Admission::prepare(&mut invocation);
     }
     let stages = invocation.stages.clone();
     // The run's plan, pulls and keys decided (by `run_cli`), said before the first stage
@@ -3592,37 +3682,53 @@ fn run_seamed<'ctx>(
                 .filter_map(|c| ctx.checks.iter().position(|k| k == c))
                 .collect();
             let held = held_note(&stages, i, held, budget);
-            let (report, begun_at, machine, cpu) = staged(
-                ctx,
-                &quiet,
-                spec,
-                held,
-                seams,
-                StageAdmission::Planned {
-                    early: &early,
-                    plan: &invocation,
-                },
-                || {
-                    let event = ctx.record_event(&report::stage_started(i, &spec.title));
-                    if let Ok(mut o) = out.lock() {
-                        let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
-                    }
-                    let prepared = if spec.id == plan::StageId::ForeignCells {
-                        preparation
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                    } else {
-                        None
-                    };
-                    if let Some(prepared) = prepared {
-                        stages::run_stage_prepared(ctx, spec, Some(prepared))
-                    } else {
-                        (seams.stage)(ctx, spec)
-                    }
-                },
-            );
-            let waiting = begun_at.saturating_duration_since(t0);
+            let admitted = admission.map_or(Ok(()), |admission| {
+                let completed = results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                admission.before(&invocation, spec.id, &completed, started.elapsed())
+            });
+            let (report, begun_at, machine, cpu) = match admitted {
+                Err(why) => {
+                    let mut report = Report::new(spec.title.clone());
+                    report.cannot_run(format!("{} — {why}", spec.title));
+                    (report, Instant::now(), held.unwrap_or_default(), None)
+                }
+                Ok(()) => staged(
+                    ctx,
+                    &quiet,
+                    spec,
+                    held,
+                    seams,
+                    StageAdmission::Planned {
+                        early: &early,
+                        plan: &invocation,
+                    },
+                    || {
+                        let event = ctx.record_event(&report::stage_started(i, &spec.title));
+                        if let Ok(mut o) = out.lock() {
+                            let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
+                        }
+                        let prepared = if spec.id == plan::StageId::ForeignCells {
+                            preparation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                        } else {
+                            None
+                        };
+                        if let Some(prepared) = prepared {
+                            stages::run_stage_prepared(ctx, spec, Some(prepared))
+                        } else {
+                            (seams.stage)(ctx, spec)
+                        }
+                    },
+                ),
+            };
+            let waiting = begun_at
+                .saturating_duration_since(t0)
+                .saturating_sub(admission.map_or(Duration::ZERO, prequeue::Admission::waited));
             let execution = begun_at.elapsed();
             // The ordered log and aggregate check result can wait for other stages;
             // the completed stage's decisions must already be visible to the caller.
@@ -3720,7 +3826,10 @@ fn run_seamed<'ctx>(
     if let Some(runs) = &ctx.runs {
         write_survivor_report(ctx, runs.end_of_run(&runs::LiveKernel), out, log)?;
     }
-    let seconds = started.elapsed().as_secs_f64();
+    let seconds = started
+        .elapsed()
+        .saturating_sub(admission.map_or(Duration::ZERO, prequeue::Admission::waited))
+        .as_secs_f64();
     let (line, code) = report::moved_checkout(
         report::verdict(&results, ctx.release, seconds),
         head_at_start.as_deref(),
@@ -3978,7 +4087,7 @@ fn held_dirs(tools: &Toolchain) -> Vec<PathBuf> {
 pub fn checkout_root(cwd: &Path) -> Option<PathBuf> {
     let out = changed::git(cwd, &std::env::var_os("PATH").unwrap_or_default())
         .args(["rev-parse", "--show-toplevel"])
-        .stderr(std::process::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .output()
         .ok()?;
     let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -3990,7 +4099,7 @@ pub fn checkout_root(cwd: &Path) -> Option<PathBuf> {
 pub fn head_commit(root: &Path, path_env: &OsStr) -> Option<String> {
     let out = changed::git(root, path_env)
         .args(["rev-parse", "HEAD"])
-        .stderr(std::process::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .output()
         .ok()?;
     let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -4438,7 +4547,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         land_seal::Tree::read,
     );
     if let Err(error) = prepare_main_build_dir(&ctx) {
-        end_run(&ctx, &scratch);
+        end_run(&ctx, &scratch, None);
         return could_not_run(format!("cannot prepare the captured build plan: {error}"));
     }
     let mut ctx = match runs_dir
@@ -4469,41 +4578,48 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     let invocation = match RunPlan::capture(&ctx, LIVE) {
         Ok(invocation) => invocation,
         Err(why) => {
-            if let Some(record) = &ctx.runs {
-                record.finish(&runs::LiveKernel);
-            }
-            std::fs::remove_dir_all(&scratch).ok();
+            end_run(&ctx, &scratch, log.as_ref().map(|log| log.path.as_path()));
             return graph_unavailable(why);
         }
     };
-    // A heavy run takes the judgment turn before it claims its disk, so a run that waits for the
-    // turn holds nothing another run could use (`docs/DESIGN-landing-economy.md` §2.3).
-    let turn = match turn::take(&invocation, parsed.queued_since, parsed.admit) {
-        Ok(turn) => turn,
-        Err(why) => {
-            if let Some(record) = &ctx.runs {
-                record.finish(&runs::LiveKernel);
-            }
-            std::fs::remove_dir_all(&scratch).ok();
-            let code = could_not_run(why);
+    // Freeze the heavy prediction once. Its tree rows execute on this same plan before a
+    // turn or disk claim; ordinary and release runs keep their existing eager admission.
+    let pending_turn = turn::Prepared::capture(&invocation, parsed.queued_since);
+    let deferred = pending_turn.is_some();
+    let claims = Mutex::new(None);
+    let acquire = |plan: &RunPlan<'_>, preflight: Duration| {
+        let (waited, turn) = pending_turn
+            .as_ref()
+            .map_or((Duration::ZERO, Ok(None)), |prepared| {
+                prepared.take(plan, parsed.admit, preflight)
+            });
+        let result = turn.and_then(|turn| {
             #[cfg(unix)]
-            exec::group::end_interrupted();
-            return code;
-        }
+            let disk = disk::admit_planned(plan, parsed.admit)?;
+            *claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RunClaims {
+                turn,
+                #[cfg(unix)]
+                disk,
+            });
+            Ok(())
+        });
+        (waited, result)
     };
-    #[cfg(unix)]
-    let disk = match disk::admit_planned(&invocation, parsed.admit) {
-        Ok(held) => held,
-        Err(why) => {
-            if let Some(record) = &ctx.runs {
-                record.finish(&runs::LiveKernel);
-            }
-            std::fs::remove_dir_all(&scratch).ok();
-            let code = could_not_run(why);
-            exec::group::end_interrupted();
-            return code;
+    let admission = prequeue::Admission::new(&acquire);
+    if !deferred && let Err(why) = admission.acquire(&invocation, Duration::ZERO) {
+        if let Some(record) = &ctx.runs
+            && let Err(error) = record.finish(&runs::LiveKernel, None)
+        {
+            eprintln!("verify: cannot finish its run record: {error}");
         }
-    };
+        std::fs::remove_dir_all(&scratch).ok();
+        let code = could_not_run(why);
+        #[cfg(unix)]
+        exec::group::end_interrupted();
+        return code;
+    }
     let mut sink = std::io::sink();
     let log_writer: &mut (dyn Write + Send) = match log.as_mut() {
         Some(f) => f,
@@ -4520,55 +4636,81 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         cone: cone.as_deref(),
         log: log_shown.as_deref(),
     };
-    let code = match run_with_plan(&ctx, &mut *out, log_writer, &show, LIVE, Some(invocation)) {
+    let code = match run_with_plan(
+        &ctx,
+        &mut *out,
+        log_writer,
+        &show,
+        LIVE,
+        Some(invocation),
+        deferred.then_some(&admission),
+    ) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("verify: cannot write the result: {e}");
             exit::COULD_NOT_RUN
         }
     };
-    if let Some(turn) = turn {
-        turn.end(
-            ctx.events.as_ref(),
-            ctx.tests_cpu_ms.load(std::sync::atomic::Ordering::Relaxed),
-        );
-    }
-    #[cfg(unix)]
+    drop(admission);
+    let claims = claims
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(RunClaims {
+        turn,
+        #[cfg(unix)]
+        disk,
+    }) = claims
     {
-        // What its compiles built under a second hash is recorded whatever ended the run: the
-        // units were built.
-        let second = aterm_types::dirs::account_state_dir()
-            .map(|state| state.join(aterm_capacity::second_hash::RECORD));
-        for line in disk::record_second_hashes(&ctx, second.as_deref()) {
-            let _ = log.as_mut().map(|f| writeln!(f, "{line}"));
+        if let Some(turn) = turn {
+            turn.end(
+                ctx.events.as_ref(),
+                ctx.tests_cpu_ms.load(std::sync::atomic::Ordering::Relaxed),
+            );
         }
-        // A run an interrupt or its first proven red ended stopped short of its compile calls:
-        // it keeps nothing. The verdict does not decide it otherwise: a run that compiled all
-        // it uses and failed a test used the same units.
-        let kept = if stopping() {
-            Vec::new()
-        } else {
-            disk::keep_used(&ctx)
-        };
-        for one in &kept {
-            let _ = log.as_mut().map(|f| writeln!(f, "{}", one.line));
-        }
-        let_disk_go(disk, code == exit::PASS, log.as_mut(), ctx.events.as_ref());
-        // After the run's last measure, so what it wrote is measured before any of it goes;
-        // and the verdict is decided: a trim that panics is dropped, and says so. The trim is
-        // held to a bound on its time and stops once an interrupt is ending the run
-        // (`disk::trim_used`): an interrupt here ends the run as one during its last measure
-        // does (`end_run`), and what the trim had moved aside the next run finishes.
-        let trimmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            disk::trim_used(&ctx, &kept)
-        }))
-        .unwrap_or_else(|_| vec!["disk: the trim was dropped (it panicked)".to_owned()]);
-        for line in trimmed {
-            let _ = log.as_mut().map(|f| writeln!(f, "{line}"));
+        #[cfg(unix)]
+        {
+            // What its compiles built under a second hash is recorded whatever ended the run: the
+            // units were built.
+            let second = aterm_types::dirs::account_state_dir()
+                .map(|state| state.join(aterm_capacity::second_hash::RECORD));
+            for line in disk::record_second_hashes(&ctx, second.as_deref()) {
+                let _ = log.as_mut().map(|f| writeln!(f, "{line}"));
+            }
+            // A run an interrupt or its first proven red ended stopped short of its compile calls:
+            // it keeps nothing. The verdict does not decide it otherwise: a run that compiled all
+            // it uses and failed a test used the same units.
+            let kept = if stopping() {
+                Vec::new()
+            } else {
+                disk::keep_used(&ctx)
+            };
+            for one in &kept {
+                let _ = log.as_mut().map(|f| writeln!(f, "{}", one.line));
+            }
+            let_disk_go(disk, code == exit::PASS, log.as_mut(), ctx.events.as_ref());
+            // After the run's last measure, so what it wrote is measured before any of it goes;
+            // and the verdict is decided: a trim that panics is dropped, and says so. The trim is
+            // held to a bound on its time and stops once an interrupt is ending the run
+            // (`disk::trim_used`): an interrupt here ends the run as one during its last measure
+            // does (`end_run`), and what the trim had moved aside the next run finishes.
+            let trimmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                disk::trim_used(&ctx, &kept)
+            }))
+            .unwrap_or_else(|_| vec!["disk: the trim was dropped (it panicked)".to_owned()]);
+            for line in trimmed {
+                let _ = log.as_mut().map(|f| writeln!(f, "{line}"));
+            }
         }
     }
-    end_run(&ctx, &scratch);
+    end_run(&ctx, &scratch, log.as_ref().map(|log| log.path.as_path()));
     code
+}
+
+/// Run-wide claims remain owned until the normal post-run accounting and cleanup settles.
+struct RunClaims {
+    turn: Option<turn::Held>,
+    #[cfg(unix)]
+    disk: disk::Disk,
 }
 
 /// Admit paired diagnostics before stages begin, binding only captured context facts.
@@ -4711,9 +4853,22 @@ fn kept_line(passed: bool, done: &atpkg::admit_disk::Finished) -> String {
 /// The end of a run that has reported ([`run_with`]) and let its disk claim go (`let_disk_go`):
 /// its run record finished and its `scratch` removed. Then an interrupt the handler took ends it:
 /// it dies of that signal, as it did before it reported (`exec::group::end_interrupted`).
-fn end_run(ctx: &Ctx, scratch: &Path) {
+fn end_run(ctx: &Ctx, scratch: &Path, log: Option<&Path>) {
     if let Some(record) = &ctx.runs {
-        record.finish(&runs::LiveKernel);
+        let archive = log.map(runs::archive_path);
+        if let Err(error) = record.finish(&runs::LiveKernel, archive.as_deref()) {
+            eprintln!("verify: cannot archive its run record: {error}");
+            event_log::emit(
+                ctx.events.as_ref(),
+                &format!(
+                    "verify-event: {}",
+                    event_log::event_value(
+                        event_log::EventKind::ObservationUnavailable,
+                        aterm_json::json!({"producer_event":"run-record-archive","reason":error.to_string()}),
+                    ),
+                ),
+            );
+        }
     }
     std::fs::remove_dir_all(scratch).ok();
     #[cfg(unix)]

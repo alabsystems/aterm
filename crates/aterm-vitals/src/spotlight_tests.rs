@@ -143,6 +143,33 @@ fn a_stale_volume_reading_is_dropped() {
     assert_eq!((r.volumes, r.volumes_age_ms), (None, None));
 }
 
+/// A store answer older than half an hour is not carried into a reading, but its age is, so
+/// the page says the broker answered long ago rather than that it never answered.
+#[test]
+fn a_stale_store_answer_leaves_only_its_age() {
+    let read = StoreRead {
+        stores: vec![Store {
+            volume: "/System/Volumes/Data".into(),
+            bytes: 1 << 30,
+            entries: 400,
+            cut: None,
+        }],
+        at_ms: 0,
+    };
+    let r = reading(&[], None, STORE_STALE_MS, 0, 5000).with_store(Some(&read), STORE_STALE_MS);
+    assert_eq!(
+        (r.store_age_ms, r.store_stale_ms),
+        (Some(STORE_STALE_MS), None)
+    );
+    let r = r.with_store(Some(&read), STORE_STALE_MS + 1);
+    assert_eq!(
+        (r.store.is_none(), r.store_age_ms, r.store_stale_ms),
+        (true, None, Some(STORE_STALE_MS + 1))
+    );
+    let r = r.with_store(None, STORE_STALE_MS + 1);
+    assert_eq!(r.store_stale_ms, None, "CONTROL: no answer has no age");
+}
+
 /// A family row of coalition `id` led by `signing_id` under `voucher`, at 300 millicores.
 fn row(id: u64, signing_id: &str, voucher: crate::explain::Voucher) -> CoalRow {
     CoalRow {
@@ -229,4 +256,52 @@ fn a_carried_reading_ages_on_the_monotonic_clock() {
             .is_none()
     );
     assert!(!family.busy());
+}
+
+static STORE_ASKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn store_answered() -> StoreAnswer {
+    STORE_ASKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok((
+        vec![Store {
+            volume: "/System/Volumes/Data".into(),
+            bytes: 1 << 30,
+            entries: 400,
+            cut: None,
+        }],
+        2_000,
+    ))
+}
+
+/// SD-94: the host asks the root broker for Spotlight's stores at most once every ten minutes,
+/// one ask at a time, off the reading's thread: the step that asks returns at once, a later one
+/// returns the answer, dated by its age off the time of the ask; inside ten minutes no step asks
+/// again, and the inert arm never asks. A failed ask is no answer.
+#[test]
+fn the_root_brokers_store_answer_is_asked_once_every_ten_minutes_off_the_reading() {
+    let probe = StoreProbe {
+        ask: Some(store_answered),
+    };
+    let mut ask = StoreAsk::default();
+    assert_eq!(ask.step(10_000, &probe), None, "the ask is in flight");
+    let (asked_ms, answer) = ask.pending.take().expect("one ask in flight");
+    assert_eq!(asked_ms, 10_000);
+    let answer = answer
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the ask's thread answers");
+    assert_eq!(STORE_ASKS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let read = StoreAsk::read(answer, asked_ms).expect("an answer");
+    assert_eq!((read.at_ms, read.stores.len()), (8_000, 1));
+
+    for at in [10_001, 400_000, 609_999] {
+        assert_eq!(ask.step(at, &probe), None);
+        assert!(ask.pending.is_none(), "no ask inside ten minutes ({at})");
+    }
+    assert_eq!(ask.step(610_000, &probe), None);
+    assert!(ask.pending.is_some(), "ten minutes on, it asks again");
+
+    let mut inert = StoreAsk::default();
+    assert_eq!(inert.step(0, &StoreProbe::INERT), None);
+    assert!(inert.pending.is_none(), "the inert arm asks nothing");
+    assert_eq!(StoreAsk::read(Err("no broker".into()), 5), None);
 }

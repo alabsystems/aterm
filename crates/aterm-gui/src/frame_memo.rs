@@ -14,42 +14,26 @@ use crate::frame_key::{FrameKey, TextKey};
 /// The live screen's text.
 pub(crate) struct ScreenText {
     key: TextKey,
-    text: String,
-    /// The byte offset of each row's `\n` in `text`.
-    ends: Vec<usize>,
+    rows: LogicalRows,
     fnv: u64,
 }
 
-impl ScreenText {
-    /// `t`'s text now, built fresh; the caller holds its lock.
-    pub(crate) fn of(t: &Terminal) -> ScreenText {
-        Self::build(t, TextKey::read(t))
-    }
+struct LogicalRows {
+    text: String,
+    /// The byte offset of each row's `\n` in `text`.
+    ends: Vec<usize>,
+}
 
-    fn build(t: &Terminal, key: TextKey) -> ScreenText {
-        let text = crate::control::screen_text(t);
-        let ends = text.match_indices('\n').map(|(at, _)| at).collect();
-        ScreenText {
-            key,
-            fnv: aterm_hash::fnv1a_64(text.as_bytes()),
-            text,
-            ends,
+impl LogicalRows {
+    fn read(t: &Terminal, first: usize, end: usize) -> Self {
+        let mut text = String::with_capacity((end - first) * (usize::from(t.cols()) + 1));
+        let mut ends = Vec::with_capacity(end - first);
+        for r in first..end {
+            aterm_control::wire::visible_row_into(t, r, &mut text);
+            ends.push(text.len());
+            text.push('\n');
         }
-    }
-
-    /// The whole screen, `\n` after every row: the untrimmed body `text` serves.
-    pub(crate) fn whole(&self) -> &str {
-        &self.text
-    }
-
-    /// FNV-1a-64 of [`Self::whole`]: the screen's `hash=`.
-    pub(crate) const fn fnv(&self) -> u64 {
-        self.fnv
-    }
-
-    /// The number of rows: the grid's row count when this was built.
-    pub(crate) const fn row_count(&self) -> usize {
-        self.ends.len()
+        Self { text, ends }
     }
 
     fn start(&self, r: usize) -> usize {
@@ -59,9 +43,51 @@ impl ScreenText {
         }
     }
 
+    fn row(&self, r: usize) -> &str {
+        &self.text[self.start(r)..self.ends[r]]
+    }
+
+    fn span(&self, first: usize, end: usize) -> &str {
+        if first >= end {
+            return "";
+        }
+        &self.text[self.start(first)..=self.ends[end - 1]]
+    }
+}
+
+impl ScreenText {
+    /// `t`'s text now, built fresh; the caller holds its lock.
+    pub(crate) fn of(t: &Terminal) -> ScreenText {
+        Self::build(t, TextKey::read(t))
+    }
+
+    fn build(t: &Terminal, key: TextKey) -> ScreenText {
+        let rows = LogicalRows::read(t, 0, usize::from(t.rows()));
+        ScreenText {
+            key,
+            fnv: aterm_hash::fnv1a_64(rows.text.as_bytes()),
+            rows,
+        }
+    }
+
+    /// The whole screen, `\n` after every row: the untrimmed body `text` serves.
+    pub(crate) fn whole(&self) -> &str {
+        &self.rows.text
+    }
+
+    /// FNV-1a-64 of [`Self::whole`]: the screen's `hash=`.
+    pub(crate) const fn fnv(&self) -> u64 {
+        self.fnv
+    }
+
+    /// The number of rows: the grid's row count when this was built.
+    pub(crate) const fn row_count(&self) -> usize {
+        self.rows.ends.len()
+    }
+
     /// Row `r`, without its `\n`.
     pub(crate) fn row(&self, r: usize) -> &str {
-        &self.text[self.start(r)..self.ends[r]]
+        self.rows.row(r)
     }
 
     /// Every row, top to bottom, without its `\n`.
@@ -71,16 +97,70 @@ impl ScreenText {
 
     /// Rows `first..end`, each followed by its `\n`, as one slice of [`Self::whole`].
     pub(crate) fn span(&self, first: usize, end: usize) -> &str {
-        if first >= end {
-            return "";
-        }
-        &self.text[self.start(first)..=self.ends[end - 1]]
+        self.rows.span(first, end)
     }
 
     /// FNV-1a-64 of rows `first..=last`, each followed by `\n`.
     pub(crate) fn rows_hash(&self, first: usize, last: usize) -> Option<u64> {
         (first <= last && last < self.row_count())
             .then(|| aterm_hash::fnv1a_64(self.span(first, last + 1).as_bytes()))
+    }
+}
+
+struct CapturedRows {
+    key: TextKey,
+    first: usize,
+    rows: LogicalRows,
+}
+
+#[derive(Clone)]
+enum TextMemo {
+    Whole(Arc<ScreenText>),
+    Range(Arc<CapturedRows>),
+}
+
+impl TextMemo {
+    fn key(&self) -> TextKey {
+        match self {
+            Self::Whole(text) => text.key,
+            Self::Range(text) => text.key,
+        }
+    }
+
+    fn covers(&self, first: usize, end: usize) -> bool {
+        match self {
+            Self::Whole(_) => true,
+            Self::Range(text) => first >= text.first && end <= text.first + text.rows.ends.len(),
+        }
+    }
+}
+
+/// A selected span whose bytes can be read after the terminal guard is released.
+pub(crate) struct TextSpan {
+    memo: TextMemo,
+    first: usize,
+    end: usize,
+}
+
+impl TextSpan {
+    fn selected(&self) -> (&LogicalRows, usize, usize) {
+        let Self { memo, first, end } = self;
+        match memo {
+            TextMemo::Whole(text) => (&text.rows, *first, *end),
+            TextMemo::Range(text) => (&text.rows, *first - text.first, *end - text.first),
+        }
+    }
+
+    /// The selected logical rows, each followed by its newline.
+    pub(crate) fn body(&self) -> &str {
+        let (rows, first, end) = self.selected();
+        rows.span(first, end)
+    }
+
+    /// The selected logical rows without their newlines.
+    pub(crate) fn rows(&self) -> impl ExactSizeIterator<Item = &str> + DoubleEndedIterator + '_ {
+        let (rows, first, end) = self.selected();
+        (first..end).map(move |r| rows.row(r))
     }
 }
 
@@ -166,7 +246,7 @@ pub(crate) struct FrameSlot {
 
 #[derive(Default)]
 struct Published {
-    text: Option<Arc<ScreenText>>,
+    text: Option<TextMemo>,
     /// Kept only while `cells_watches` is nonzero.
     styled: Option<Arc<StyledFrame>>,
     /// Live [`CellsHold`]s.
@@ -192,7 +272,11 @@ impl FrameSlot {
 
     /// Publish `text`, built by a reader that took no look.
     pub(crate) fn publish_text(&self, text: Arc<ScreenText>) {
-        let old = self.inner.lock_or_recover().text.replace(text);
+        let old = self
+            .inner
+            .lock_or_recover()
+            .text
+            .replace(TextMemo::Whole(text));
         drop(old);
     }
 
@@ -211,28 +295,57 @@ impl FrameSlot {
 /// What a [`FrameSlot`] held when a reader looked.
 pub(crate) struct Look<'a> {
     slot: &'a FrameSlot,
-    text: Option<Arc<ScreenText>>,
+    text: Option<TextMemo>,
     styled: Option<Arc<StyledFrame>>,
     keeps_styled: bool,
     refused: Option<(FrameKey, usize)>,
-    built: Option<Arc<ScreenText>>,
+    built: Option<TextMemo>,
 }
 
 impl Look<'_> {
+    fn matching_text(&self, key: TextKey) -> Option<&TextMemo> {
+        self.built
+            .as_ref()
+            .or(self.text.as_ref())
+            .filter(|text| text.key() == key)
+    }
+
     /// `t`'s screen text.
     pub(crate) fn text(&mut self, t: &Terminal) -> Arc<ScreenText> {
         let key = TextKey::read(t);
-        if let Some(text) = self
-            .built
-            .as_ref()
-            .or(self.text.as_ref())
-            .filter(|text| text.key == key)
-        {
+        if let Some(TextMemo::Whole(text)) = self.matching_text(key) {
             return Arc::clone(text);
         }
         let text = Arc::new(ScreenText::build(t, key));
-        self.built = Some(Arc::clone(&text));
+        self.built = Some(TextMemo::Whole(Arc::clone(&text)));
         text
+    }
+
+    /// The logical rows in an already validated range. A miss visits only those rows.
+    pub(crate) fn text_span(&mut self, t: &Terminal, first: usize, end: usize) -> TextSpan {
+        if first == 0 && end == usize::from(t.rows()) {
+            return TextSpan {
+                memo: TextMemo::Whole(self.text(t)),
+                first,
+                end,
+            };
+        }
+        let key = TextKey::read(t);
+        let memo = if let Some(text) = self
+            .matching_text(key)
+            .filter(|text| text.covers(first, end))
+        {
+            text.clone()
+        } else {
+            let text = TextMemo::Range(Arc::new(CapturedRows {
+                key,
+                first,
+                rows: LogicalRows::read(t, first, end),
+            }));
+            self.built = Some(text.clone());
+            text
+        };
+        TextSpan { memo, first, end }
     }
 
     /// `t`'s styled frame under `key`, which the caller read under this same hold.
@@ -306,7 +419,25 @@ impl Drop for Look<'_> {
         if let Some(built) = self.built.take() {
             let old = {
                 let mut published = self.slot.inner.lock_or_recover();
-                same(&published.text, &self.text).then(|| published.text.replace(built))
+                let same_publication = match (published.text.as_ref(), self.text.as_ref()) {
+                    (Some(TextMemo::Whole(now)), Some(TextMemo::Whole(seen))) => {
+                        Arc::ptr_eq(now, seen)
+                    }
+                    (Some(TextMemo::Range(now)), Some(TextMemo::Range(seen))) => {
+                        Arc::ptr_eq(now, seen)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                let promotes = matches!(
+                    (&published.text, &built),
+                    (Some(TextMemo::Range(now)), TextMemo::Whole(whole)) if now.key == whole.key
+                );
+                if same_publication || promotes {
+                    published.text.replace(built)
+                } else {
+                    Some(built)
+                }
             };
             drop(old);
         }

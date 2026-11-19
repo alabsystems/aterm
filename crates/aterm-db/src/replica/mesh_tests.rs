@@ -200,7 +200,7 @@ fn reused_mesh_access_history(competing: bool) {
                 })
                 .unwrap(),
             std::slice::from_ref(&known.1),
-            "an unavailable selection must restart, not masquerade as a drained legacy batch"
+            "an unavailable selection must restart, not masquerade as a drained batch"
         );
     }
     {

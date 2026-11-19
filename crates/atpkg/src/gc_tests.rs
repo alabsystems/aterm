@@ -125,6 +125,7 @@ fn seed_partial(layout: &Layout, program: &str, build: u64) -> PathBuf {
 /// Keep superseded `build` from reclaim the way a tree's trust.lock does: a resolution within
 /// the keep window. With no rollback build (RL-29), this is how a test holds an older build
 /// on disk to exercise what gc does with one it keeps.
+#[cfg(target_os = "macos")]
 fn keep_by_lock(layout: &Layout, program: &str, build: u64) {
     let mark = layout
         .build_dir(program, build)

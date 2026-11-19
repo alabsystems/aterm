@@ -1221,7 +1221,15 @@ fn pooled_starter_held(
     cli: &aterm_agent::harness::worker::WorkerCli,
 ) -> Result<aterm_agent::harness::worker::Starter, String> {
     pool_launch_attempts(
-        |pick| pooled_starter(starter.clone(), cli, work.local, pick),
+        |pick| {
+            pooled_starter(
+                starter.clone(),
+                cli,
+                work.model.as_deref(),
+                work.local,
+                pick,
+            )
+        },
         || pool_opening(&PoolSeat::here()?.seat(), &starter, cli),
         PoolSeat::unix_now,
         pool_wait_for(work, "no account of its pool can take it now"),
@@ -2937,10 +2945,13 @@ fn agent_of_session(
 /// that login ([`aterm_agent::harness::accounts_pool::launch_env_for`]) and says from that row's
 /// own condition why it cannot serve where it cannot, and a bound row of its own the starter
 /// carried is refused. A Claude Code worker starts on the row of the Claude roster the host would
-/// move its starter's tab to ([`claude_starter_in`]).
+/// move its starter's tab to ([`claude_starter_in`]), ranked by the model it runs: `model`, its
+/// `model=`, or Claude Code's default where it names none
+/// ([`aterm_agent::harness::accounts::ModelWeek::of_launch`]).
 fn pooled_starter(
     starter: aterm_agent::harness::worker::Starter,
     cli: &aterm_agent::harness::worker::WorkerCli,
+    model: Option<&str>,
     local: u64,
     pick: &mut aterm_agent::harness::accounts_pool::LaunchPick,
 ) -> Result<aterm_agent::harness::worker::Starter, String> {
@@ -2953,7 +2964,8 @@ fn pooled_starter(
     };
     let seat = parts.seat();
     if pool == accounts::Cli::Claude {
-        return Ok(claude_starter_in(starter, &seat, local));
+        let week = accounts::ModelWeek::of_launch(model);
+        return Ok(claude_starter_in(starter, &seat, week, local));
     }
     pooled_starter_reading(starter, pool, &seat, &accounts_pool::LiveUsage, local, pick)
 }
@@ -2968,12 +2980,16 @@ fn pooled_starter(
 /// under `"wall"`), its login is no roster row's (a non-default home, an unbound login), the
 /// roster lists one row, rotation is off for Claude Code, or a read fails (logged: a launch
 /// never fails on the accounts' records). The host's own flow moves the worker later, as any tab.
+/// `week` is the worker's model ([`aterm_agent::harness::accounts::ModelWeek::of_launch`]): a row
+/// walled on it ranks after every row that can serve it, and a fresh `active` walled on it is
+/// passed over for such a row, as the host would judge the worker's own tab.
 pub(crate) fn claude_starter_in(
     starter: aterm_agent::harness::worker::Starter,
     seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    week: aterm_agent::harness::accounts::ModelWeek,
     local: u64,
 ) -> aterm_agent::harness::worker::Starter {
-    let pick = match claude_pick(&starter, seat) {
+    let pick = match claude_pick(&starter, seat, week) {
         Ok(Some(pick)) => pick,
         Ok(None) => return starter,
         Err(why) => {
@@ -3005,10 +3021,11 @@ pub(crate) fn claude_starter_in(
 }
 
 /// The name of the account the starter runs on and the login [`claude_starter_in`] moves a
-/// worker to, or `None` where it keeps the starter's.
+/// worker of the model `week` to, or `None` where it keeps the starter's.
 fn claude_pick(
     starter: &aterm_agent::harness::worker::Starter,
     seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    week: aterm_agent::harness::accounts::ModelWeek,
 ) -> Result<Option<(String, aterm_agent::harness::accounts_pool::LoginEnv)>, String> {
     use aterm_agent::harness::{accounts, accounts_pool};
     let cli = accounts::Cli::Claude;
@@ -3041,6 +3058,7 @@ fn claude_pick(
         &state,
         &enrolled,
         &login,
+        week,
         (mode, seat.now),
         &mut serves,
     ) else {
@@ -3073,13 +3091,19 @@ fn starter_login(
 /// where the accounts store reads it
 /// [`Limited`](aterm_agent::harness::accounts::Condition::Limited). A login that is
 /// no roster row's, and accounts that cannot be read, read as no wall: a launch never fails on
-/// the accounts' records, and the wall shows itself in the worker's first reply.
+/// the accounts' records, and the wall shows itself in the worker's first reply. `week` is the
+/// worker's model, which picks the row it would move to ([`claude_pick`]); a wall of that model's
+/// own week is no wall here where the worker goes on with its fallback there (a Fable worker,
+/// owner, 2026-11-11: "no, keep the same account and switch from fable to opus."), and walls
+/// the row for a model with none ([`aterm_agent::harness::accounts::ModelWeek::excludes`]), as
+/// the worker would meet it at once.
 pub(crate) fn claude_worker_wall(
     starter: &aterm_agent::harness::worker::Starter,
     seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    week: aterm_agent::harness::accounts::ModelWeek,
 ) -> Option<i64> {
     use aterm_agent::harness::accounts;
-    if matches!(claude_pick(starter, seat), Ok(Some(_))) {
+    if matches!(claude_pick(starter, seat, week), Ok(Some(_))) {
         return None;
     }
     let cli = accounts::Cli::Claude;
@@ -3088,13 +3112,17 @@ pub(crate) fn claude_worker_wall(
     let row = login.reconciled(&roster).row()?;
     let (state, _) = seat.store(cli).load(seat.now).ok()?;
     let enrolled = login.enrolled(&roster, &accounts::enrolled_for(cli, &roster));
+    let model_wall = state
+        .accounts
+        .get(&row.label)
+        .and_then(|account| week.excludes(account, seat.now));
     match accounts::condition(row, &state, enrolled.contains(&row.label), seat.now) {
-        accounts::Condition::Limited { until } => Some(until),
+        accounts::Condition::Limited { until } => Some(model_wall.map_or(until, |m| until.max(m))),
         accounts::Condition::NotEnrolled
         | accounts::Condition::SignedOut
         | accounts::Condition::Low
         | accounts::Condition::Usable
-        | accounts::Condition::Unseen => None,
+        | accounts::Condition::Unseen => model_wall,
     }
 }
 

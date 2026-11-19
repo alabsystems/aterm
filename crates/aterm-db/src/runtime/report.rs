@@ -139,16 +139,10 @@ impl RepairRound {
         }
         let actor = self.actor?;
         let application = self.application.or(self.application_interrupted);
-        // A local deferral's cause: an unavailable inventory's local refusal, else a batch's.
-        let deferral = self
-            .application_deferral
-            .as_ref()
-            .and_then(|why| why.local_cause)
-            .or_else(|| {
-                self.application_batch_deferral
-                    .as_ref()
-                    .map(|why| why.cause)
-            });
+        let deferral = crate::control::deferral_cause(
+            self.application_deferral.as_ref(),
+            self.application_batch_deferral.as_ref(),
+        );
         let (stage, outcome) = if self.cancelled {
             (self.phase.map(stage), RepairOutcome::Cancelled)
         } else if let Some(failure) = &self.membership_error {

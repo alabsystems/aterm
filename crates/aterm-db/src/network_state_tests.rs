@@ -346,7 +346,6 @@ fn historical_exchange_codec_is_bounded_and_old_history_has_no_witness() {
         ("local_actor", json!("short")),
         ("control_observation", json!("short")),
         ("inventory_fingerprint", json!("short")),
-        ("inventory_count", json!(crate::replica::MAX_RECORDS + 1)),
         ("sampled_at_ms", json!(0)),
     ] {
         let mut invalid: Value = aterm_json::from_slice(&wire).unwrap();
@@ -363,6 +362,21 @@ fn historical_exchange_codec_is_bounded_and_old_history_has_no_witness() {
             "{field}"
         );
     }
+    // No record count bounds the inventory an observation states: one past the 8,192 records a
+    // whole-list inventory once held reads back as written.
+    let large = NetworkObservation {
+        accounts_exchange: Some(AccountsExchangeObservation {
+            inventory_count: 1 << 20,
+            ..exchange()
+        }),
+        ..NetworkObservation::default()
+    };
+    assert_eq!(
+        decode(&encode(&large, None).unwrap())
+            .unwrap()
+            .accounts_exchange,
+        large.accounts_exchange
+    );
 }
 #[test]
 fn journal_reopen_preserves_exchange_without_renewing_contact_or_sample() {

@@ -1142,6 +1142,26 @@ fn a_run_keys_each_stage_by_its_checkout_selection_and_variant() {
     let export = Key::of_run(StageId::Export, &here);
     assert_eq!((export.crates, export.variant), (None, None));
     assert_eq!(Key::of_run(StageId::Test, &here).variant, None);
+    for id in [StageId::RedrawConformance, StageId::ObjcDrives] {
+        let runtime = Key::of_run(id, &here);
+        let legacy = Key {
+            variant: None,
+            ..runtime.clone()
+        };
+        let stage = spec(id, Lane::MainTarget);
+        let plain = Records::default();
+        let mut records = Records::default();
+        records.push(legacy, 9 * GIB, 0);
+        assert_eq!(
+            need(&records, &plain, &stage, &runtime, Some(24 * GIB)).bytes,
+            0
+        );
+        records.push(runtime.clone(), GIB, 1);
+        assert_eq!(
+            need(&records, &plain, &stage, &runtime, Some(24 * GIB)).bytes,
+            aterm_capacity::peak_claim(GIB)
+        );
+    }
     let checker = Key::of_run(StageId::SpecCheckers, &here);
     assert_eq!(checker.variant, None);
     assert_eq!(checker.crates, Some(vec!["aterm-gui".to_owned()]));

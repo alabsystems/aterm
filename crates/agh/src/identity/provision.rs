@@ -3,11 +3,11 @@
 
 //! `agh auth add` and `agh auth remove` (design §6.7).
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::collections::BTreeMap;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Duration;
 
 use aterm_toml::edit::{
@@ -20,13 +20,13 @@ use crate::error::{Error, Result};
 use crate::identity::TokenKind;
 use crate::policy::Tier;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::config::{CONFIG_FILE, ConfigFault, Validated};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::error::IdentityRef;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::identity::{self, Credential, LoadError, Profile, Source, tilde};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::policy::Router;
 
 /// What `auth add` was asked.
@@ -65,10 +65,10 @@ pub struct Added {
     pub owners: Vec<String>,
 }
 
-/// The refusal of provisioning off unix.
-#[cfg(not(unix))]
-const OFF_UNIX: &str =
-    "provisioning needs unix permission checks; agh on Windows is anonymous only";
+/// The refusal of provisioning on a host with no private files (neither unix nor windows).
+#[cfg(not(any(unix, windows)))]
+const NO_PRIVATE_FILES: &str =
+    "provisioning needs private files, which agh has on unix and windows only";
 
 /// Provision `req`. With no agh.toml and either vault GitHub entry in the store, the new agh.toml
 /// starts with `vault = true` (`vault::seed`), so the vault's rows keep joining as adoption
@@ -130,14 +130,14 @@ pub(crate) fn add_with_metered(
     req: &AddRequest,
     options: AddOptions,
 ) -> Result<(Added, Meter)> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        add_unix(gh, dirs, req, options)
+        add_edit(gh, dirs, req, options)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (gh, dirs, req, options);
-        Err(Error::refused(OFF_UNIX))
+        Err(Error::refused(NO_PRIVATE_FILES))
     }
 }
 
@@ -163,14 +163,14 @@ pub struct Removed {
 /// # Errors
 /// Usage for an unknown profile; Refused when the result would fault; could_not_run on I/O.
 pub fn remove(dirs: &Dirs, name: &str) -> Result<Removed> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        remove_unix(dirs, name)
+        remove_edit(dirs, name)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (dirs, name);
-        Err(Error::refused(OFF_UNIX))
+        Err(Error::refused(NO_PRIVATE_FILES))
     }
 }
 
@@ -512,11 +512,11 @@ fn set_owner_tables(doc: &mut DocumentMut, tables: Vec<Table>) {
 }
 
 /// `auth add`'s help, the next of its usage errors.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const ADD_HELP: &str = "agh help auth add";
 
 /// The current agh.toml's text: `None` when there is none.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn read_current(dirs: &Dirs) -> Result<Option<String>> {
     use config::ConfigText;
     match config::read_config(&dirs.config, CONFIG_FILE, &dirs.home) {
@@ -532,7 +532,7 @@ fn read_current(dirs: &Dirs) -> Result<Option<String>> {
 }
 
 /// `config::load`'s refusal of agh.toml: `error`, with `remedy` or the policy check.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn load_refused(error: &str, remedy: Option<String>) -> Error {
     config::invalid(
         format!("agh.toml: {error}"),
@@ -541,7 +541,7 @@ fn load_refused(error: &str, remedy: Option<String>) -> Error {
 }
 
 /// The load's refusal of agh.toml where it refuses one (`read_current`'s), else `None`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn load_refusal_of_dir(dirs: &Dirs) -> Option<Error> {
     match config::read_config(&dirs.config, CONFIG_FILE, &dirs.home) {
         config::ConfigText::Refused { error, remedy } => Some(load_refused(&error, remedy)),
@@ -552,7 +552,7 @@ fn load_refusal_of_dir(dirs: &Dirs) -> Option<Error> {
 /// The refusal of an edit that would break agh.toml's rules. With no agh.toml before it
 /// (`existed` false), there is no file to fix: the rows the command would write are what
 /// to change.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn would_break(faults: &[ConfigFault], verb: &str, existed: bool) -> Error {
     let next = if existed {
         format!("fix agh.toml, then run agh auth {verb} again")
@@ -573,7 +573,7 @@ fn would_break(faults: &[ConfigFault], verb: &str, existed: bool) -> Error {
 /// `add`'s edit judged by L1–L10 before it is written.
 /// # Errors
 /// `would_break`'s refusal.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn judge_edit(new_text: &str, home: &Path, existed: bool) -> Result<()> {
     config::judge(new_text, home)
         .verdict
@@ -583,7 +583,7 @@ fn judge_edit(new_text: &str, home: &Path, existed: bool) -> Result<()> {
 
 /// An error about `dir` (or a file in it) without the absolute path aterm-uds names it by: its
 /// `the directory {dir}: ` lead is dropped.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn io_text(e: &std::io::Error, dir: &Path, home: &Path) -> String {
     let text = e.to_string();
     let absolute = dir.display().to_string();
@@ -595,7 +595,7 @@ fn io_text(e: &std::io::Error, dir: &Path, home: &Path) -> String {
 }
 
 /// `create_private_dir(dir)`: an existing directory that is not private is Refused.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn private_dir(dir: &Path, home: &Path) -> Result<()> {
     let shown = tilde(dir, home);
     aterm_uds::private_file::create_private_dir(dir).map_err(|e| {
@@ -606,7 +606,7 @@ fn private_dir(dir: &Path, home: &Path) -> Result<()> {
         }
         let error = Error::refused(format!("{shown}: {why}"));
         let remedy = match existing {
-            Ok(meta) if meta.is_dir() => identity::chmod_remedy(dir, Path::new(""), home),
+            Ok(meta) if meta.is_dir() => private_dir_remedy(dir, home),
             _ => None,
         };
         match remedy {
@@ -616,18 +616,36 @@ fn private_dir(dir: &Path, home: &Path) -> Result<()> {
     })
 }
 
-/// `create_dir_all(dirs.config.parent())`, then `dirs.config` made private.
+/// The chmod that makes the existing directory `dir` private, where one of this user's does.
 #[cfg(unix)]
+fn private_dir_remedy(dir: &Path, home: &Path) -> Option<String> {
+    identity::chmod_remedy(dir, Path::new(""), home)
+}
+
+/// On windows no chmod changes a folder's access list: the folder made the user's alone, as agh
+/// makes it when it is missing.
+#[cfg(windows)]
+fn private_dir_remedy(dir: &Path, home: &Path) -> Option<String> {
+    Some(format!(
+        "make {} a private folder of yours (an access list of you and SYSTEM alone, inheriting \
+         nothing), as agh makes it when it is missing",
+        tilde(dir, home)
+    ))
+}
+
+/// `create_dir_all(dirs.config.parent())` (`config::make_parents`, which an elevated windows
+/// process makes nothing by), then `dirs.config` made private.
+#[cfg(any(unix, windows))]
 fn config_dir(dirs: &Dirs) -> Result<()> {
     if let Some(parent) = dirs.config.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
+        config::make_parents(parent)
             .map_err(|e| Error::could_not_run(format!("{}: {e}", tilde(parent, &dirs.home))))?;
     }
     private_dir(&dirs.config, &dirs.home)
 }
 
 /// A token's load, as `auth add` answers it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn load_refusal(error: &LoadError, profile: &Profile, home: &Path) -> Error {
     let shown = source_shown(&profile.source, home);
     match (error, &profile.source) {
@@ -661,14 +679,14 @@ fn load_refusal(error: &LoadError, profile: &Profile, home: &Path) -> Error {
 /// One cooperative auth edit (`auth add`, `auth remove`), or, under its own lock file, one
 /// write of vault adoption's record (design §6.10), so that an ordinary read that records a
 /// learned login never holds up an auth edit.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct AuthEdit(std::fs::File);
 
 /// The auth edit lock's file, in `Dirs::config`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const AUTH_EDIT_LOCK: &str = ".auth-edit.lock";
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl AuthEdit {
     /// The auth edit lock taken, its private directory made first.
     /// # Errors
@@ -700,24 +718,41 @@ impl AuthEdit {
         wait: Duration,
         busy: impl FnOnce() -> Error,
     ) -> Result<Self> {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
         let as_load = |refused: Error| load_refusal_of_dir(dirs).unwrap_or(refused);
         config_dir(dirs).map_err(as_load)?;
         let path = dirs.config.join(file);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-            .open(&path)
-        {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(Error::could_not_run(format!("{what}: {e}"))),
-        }
-        let (file, meta) =
+        #[cfg(unix)]
+        let (file, meta) = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+                .open(&path)
+            {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(Error::could_not_run(format!("{what}: {e}"))),
+            }
             aterm_uds::kept_out(|| aterm_uds::private_file::open_private(&dirs.config, file))
-                .map_err(|e| as_load(Error::refused(format!("{what}: {e}"))))?;
+                .map_err(|e| as_load(Error::refused(format!("{what}: {e}"))))?
+        };
+        // On Windows the lock file is made with the user's protected access list where it is
+        // missing, opened as itself (a reparse point is refused) and judged on its handle, in one
+        // step; a handle reaches no child unless it is made inheritable.
+        #[cfg(windows)]
+        let (file, meta) = {
+            use aterm_uds::private_file::{PrivateFileError, open_private_rw};
+            let opened = open_private_rw(&dirs.config, file).map_err(|e| match e {
+                PrivateFileError::Io(e) => Error::could_not_run(format!("{what}: {e}")),
+                refused => as_load(Error::refused(format!("{what}: {refused}"))),
+            })?;
+            let meta = opened
+                .metadata()
+                .map_err(|e| Error::could_not_run(format!("{what}: {e}")))?;
+            (opened, meta)
+        };
         if meta.len() != 0 {
             let shown = tilde(&path, &dirs.home);
             return Err(
@@ -734,9 +769,25 @@ impl AuthEdit {
             Err(e) => return Err(Error::could_not_run(format!("{what}: {e}"))),
         }
         let held = Self(file);
-        let same = std::fs::symlink_metadata(&path).is_ok_and(|named| {
-            named.file_type().is_file() && (named.dev(), named.ino()) == (meta.dev(), meta.ino())
-        });
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::symlink_metadata(&path).is_ok_and(|named| {
+                named.file_type().is_file()
+                    && (named.dev(), named.ino()) == (meta.dev(), meta.ino())
+            })
+        };
+        // The name still the locked file: its volume and file id, read on a look at the name
+        // itself (a reparse point there is not followed, so it reads as another file) and on
+        // the locked handle.
+        #[cfg(windows)]
+        let same = {
+            use aterm_uds::line_log::{identity_at, identity_of};
+            match (identity_at(&path), identity_of(&held.0)) {
+                (Ok(named), Ok(locked)) => (named.dev, named.ino) == (locked.dev, locked.ino),
+                _ => false,
+            }
+        };
         if !same {
             return Err(Error::could_not_run(format!(
                 "{what} changed while it was acquired"
@@ -746,7 +797,7 @@ impl AuthEdit {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for AuthEdit {
     fn drop(&mut self) {
         let _ = self.0.unlock();
@@ -756,7 +807,7 @@ impl Drop for AuthEdit {
 /// The auth edit lock, held until the guard drops, as an `auth add` or `auth remove` holds it.
 /// # Errors
 /// `AuthEdit::take`'s.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 pub fn hold_auth_edit_for_tests(dirs: &Dirs) -> Result<impl Sized> {
     if let Some(parent) = dirs.config.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| Error::could_not_run(e.to_string()))?;
@@ -765,7 +816,7 @@ pub fn hold_auth_edit_for_tests(dirs: &Dirs) -> Result<impl Sized> {
 }
 
 /// How a refusal names `source`: a token file `~/`-relative, a vault entry by its name.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn source_shown(source: &Source, home: &Path) -> String {
     match source {
         Source::File(path) => tilde(path, home),
@@ -775,9 +826,9 @@ fn source_shown(source: &Source, home: &Path) -> String {
 }
 
 /// A staging name this transaction created exclusively.
-/// `add` on unix (plan §11.2).
-#[cfg(unix)]
-fn add_unix(
+/// `add` on unix and windows (plan §11.2).
+#[cfg(any(unix, windows))]
+fn add_edit(
     gh: &Github,
     dirs: &Dirs,
     req: &AddRequest,
@@ -798,11 +849,21 @@ fn add_unix(
         .with_next(ADD_HELP));
     };
     let source = config::token_source(text, &dirs.home).ok_or_else(|| {
-        Error::usage(format!(
-            "{} is inside ~/.secrets, which holds only vault entries: name one as \
-             ~/.secrets/NAME",
-            tilde(path, &dirs.home)
-        ))
+        Error::usage(if cfg!(windows) {
+            format!(
+                "{} is inside ~/.secrets, which holds only vault entries, or is spelled so that \
+                 Windows may read it there (a . or .. part, a trailing dot or space, an 8.3 \
+                 short name): name a vault entry as ~/.secrets/NAME, and a token file by its \
+                 plain path",
+                tilde(path, &dirs.home)
+            )
+        } else {
+            format!(
+                "{} is inside ~/.secrets, which holds only vault entries: name one as \
+                 ~/.secrets/NAME",
+                tilde(path, &dirs.home)
+            )
+        })
         .with_next(ADD_HELP)
     })?;
     let mut profile = Profile::new(req.name.clone(), source.clone(), req.tier);
@@ -852,7 +913,7 @@ fn add_unix(
 /// loaded as (its source and its `legacy_loose`), then the edit made (`judge_edit` judges
 /// it), its row saying `legacy_loose = true` exactly when `--legacy-loose` asked for it
 /// (`loaded.legacy_loose()`), whether or not the file was loose.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn bind_and_edit(
     gh: &Github,
     dirs: &Dirs,
@@ -910,7 +971,7 @@ fn bind_and_edit(
 }
 
 /// agh.toml written whole, 0600, in its private directory (`add`'s step 8, plan §11.2).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn write_config(dirs: &Dirs, text: &str) -> Result<()> {
     config_dir(dirs)?;
     aterm_uds::private_file::write_private(&dirs.config, CONFIG_FILE, text.as_bytes()).map_err(
@@ -924,9 +985,9 @@ fn write_config(dirs: &Dirs, text: &str) -> Result<()> {
     )
 }
 
-/// `remove` on unix (plan §11.2).
-#[cfg(unix)]
-fn remove_unix(dirs: &Dirs, name: &str) -> Result<Removed> {
+/// `remove` on unix and windows (plan §11.2).
+#[cfg(any(unix, windows))]
+fn remove_edit(dirs: &Dirs, name: &str) -> Result<Removed> {
     let _edit = AuthEdit::take(dirs)?;
     let Some(text) = read_current(dirs)? else {
         if let Some(slot) = super::vault::Slot::named(name)
@@ -987,3 +1048,8 @@ fn remove_unix(dirs: &Dirs, name: &str) -> Result<Removed> {
         joins_vault,
     })
 }
+
+/// The windows arm's folder rules: what an elevated process makes.
+#[cfg(all(test, windows))]
+#[path = "provision_tests.rs"]
+mod tests;

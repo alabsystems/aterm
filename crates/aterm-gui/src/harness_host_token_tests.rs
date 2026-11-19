@@ -193,7 +193,6 @@ fn record_mint(w: &TapWorld, minted_at: u64) {
             KEY.to_owned(),
             accounts_tokens::TokenRow {
                 key: KEY.to_owned(),
-                email: EMAIL.to_owned(),
                 account_id: Some("c-0123456789ab".to_owned()),
                 label: Some("main".to_owned()),
                 entry: Key::parse(KEY).unwrap().entry(),

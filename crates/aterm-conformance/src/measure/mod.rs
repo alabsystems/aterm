@@ -4,6 +4,8 @@
 //! The `measure` check's instruments.
 
 pub mod aos;
+#[cfg(target_os = "macos")]
+pub mod capture;
 pub mod decision;
 pub mod frame;
 pub mod instance;

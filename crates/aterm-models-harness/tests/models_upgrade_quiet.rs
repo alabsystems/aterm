@@ -14,7 +14,7 @@ use aterm_spec::interp;
 use aterm_spec::walk::{only, walk};
 
 /// Each mutant and the law it was written to break.
-const MUTANTS: [(&str, &str); 16] = [
+const MUTANTS: [(&str, &str); 18] = [
     ("TellOffAPoint", "NoTellOffAPoint"),
     ("TellOverAPerson", "NoTellOverAPerson"),
     ("TellsEarly", "TellsOnlyPastTheBound"),
@@ -31,6 +31,8 @@ const MUTANTS: [(&str, &str); 16] = [
     ("TellsASilentSession", "NoTellIntoASilentSession"),
     ("MovesAtALiveWall", "NoUnwarnedMoveEndsWork"),
     ("WallHoldsForGood", "WallsYield"),
+    ("HoldRestartsAtAGap", "NoGapRestartsTheHold"),
+    ("WallNeverSighted", "ScreenWallsAreDated"),
 ];
 
 /// `m` with every mutant removed but `keep`.
@@ -298,9 +300,11 @@ fn a_silent_sessions_follows_are_moved_over_once_their_hold_outlasts_a_told_dead
 }
 
 /// A wall its transcript dates (a login wall, a usage limit) moves an idle round once it has stood
-/// its bound with nobody near, and not before; a person near restarts its clock, the agent's own
-/// work holds it, and a wall only the screen shows never ages. NEGATIVE CONTROL:
-/// `WallHoldsForGood` leaves the aged wall unmoved.
+/// its bound with nobody near, and not before; a person near restarts its clock and the agent's
+/// own work holds it. A wall only the screen shows has no age at the look that first sees it, and
+/// the next look that finds it standing dates it, so it ages and moves the round as a dated one
+/// does. NEGATIVE CONTROLS: `WallHoldsForGood` leaves the aged wall unmoved, and
+/// `WallNeverSighted` leaves the wall only the screen shows undated, never aging.
 #[test]
 fn a_dated_wall_moves_an_idle_round_once_it_has_stood_its_bound() {
     let m = harness_upgrade_quiet_model();
@@ -321,6 +325,12 @@ fn a_dated_wall_moves_an_idle_round_once_it_has_stood_its_bound() {
     assert!(!m.action_enabled("MoveAtIdle", &working), "{working:?}");
     let undated = walk(&m, &["WallStands"]);
     assert!(!m.action_enabled("WallAges", &undated), "{undated:?}");
+    let sighted = walk(&m, &["WallStands", "WallSighted", "WallAges"]);
+    assert!(m.action_enabled("MoveAtIdle", &sighted), "{sighted:?}");
+    let blind = interp::with_buggy(&alone(&m, "WallNeverSighted"), 1);
+    let mut never = undated.clone();
+    assert!(blind.fire("WallNeverSighted", &mut never));
+    assert!(!blind.action_enabled("WallSighted", &never), "{never:?}");
     let buggy = interp::with_buggy(&alone(&m, "WallHoldsForGood"), 1);
     let mut stuck = aged.clone();
     assert!(buggy.fire("WallHoldsForGood", &mut stuck));
@@ -334,7 +344,7 @@ fn the_liveness_laws_hold_and_their_mutants_break_them() {
     let m = harness_upgrade_quiet_model();
     for (live, mutants) in [
         (harness_upgrade_quiet_liveness(), 4),
-        (harness_upgrade_wall_liveness(), 1),
+        (harness_upgrade_wall_liveness(), 2),
     ] {
         assert_eq!(
             aterm_spec::verify::audit_liveness(&m, &live),

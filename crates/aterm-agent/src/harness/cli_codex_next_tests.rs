@@ -7,8 +7,10 @@
 //! `accounts login|renew` and `accounts use` judge the program a launch runs; `accounts use` of
 //! every CLI but Claude Code says what a launch does under the pin, or once it ends.
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+// The tests gated `cfg(unix)` here reach what aterm has only on Unix: a file mode, a symbolic
+// link, a signal, a `/bin/sh` stand-in, or a part built only there (native credential custody,
+// native fleet renewal, the vault-token, Google and agy sign-ins, the Kimi pool's overlay
+// staging home, aterm's own browser window, the test sleep seam).
 
 use super::*;
 use crate::harness::alab_roster::test_machine;
@@ -5417,7 +5419,6 @@ fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
 /// session here on it, ever, it waits for its sign-in, a person's; once a session here ran on it,
 /// aterm signs it in by itself for a week, and it waits again after. CONTROL: with a session on
 /// it, it says it.
-#[cfg(unix)]
 #[test]
 fn claudes_report_says_by_itself_only_where_this_mac_uses_the_row() {
     let tmp = tmp_dir("claude-route");
@@ -5533,7 +5534,6 @@ fn a_login_with_no_terminal_says_the_missing_program_first() {
 /// `accounts use` READS A CLAUDE CODE ROW'S LOGIN AS THE REPORT DOES: the default row of a home whose
 /// profile names no account is `not-enrolled` in the report, and a pin on it is refused. CONTROL:
 /// once the profile names one, the pin is recorded.
-#[cfg(unix)]
 #[test]
 fn use_refuses_the_claude_row_the_report_calls_not_signed_in() {
     let tmp = tmp_dir("claude-use");

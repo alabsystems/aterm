@@ -665,7 +665,7 @@ pub fn inputs(now_ms: u64) -> Inputs {
                 tools: (!turn.older && harness != Harness::Agy && harness != Harness::Muse)
                     .then(|| u32::try_from(g * 3 % 400).unwrap_or(u32::MAX)),
                 // Its need where its row says one; no aterm sends the activity word yet.
-                need: (!turn.older).then(|| match state {
+                need: (!turn.older).then_some(match state {
                     State::Stuck => Some(NeedWord::Stalled),
                     State::Waiting => Some(NeedWord::Question),
                     _ => None,

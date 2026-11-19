@@ -28,6 +28,9 @@ mod launch_isolation;
 #[path = "../tests/support/live_ctl.rs"]
 mod live_ctl;
 #[cfg(target_os = "macos")]
+#[path = "../tests/support/patience.rs"]
+mod patience;
+#[cfg(target_os = "macos")]
 #[path = "../tests/fabric_bench/profile.rs"]
 #[expect(
     dead_code,

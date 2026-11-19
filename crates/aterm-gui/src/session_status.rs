@@ -5307,8 +5307,11 @@ impl crate::App {
             if let Some(previous) = previous_group {
                 crate::claude_footer::stop(id, previous);
                 // The front program moved: the journal owes a capture, the walker a read.
-                self.crash_journal.note_activity();
-                self.diskwalk.note_activity();
+                crate::desk_moved(
+                    &mut self.crash_journal,
+                    &mut self.diskwalk,
+                    &crate::metrics::METRICS,
+                );
             }
             let resolve = pgid > 0
                 && self.session_status.program_due(
@@ -5481,7 +5484,10 @@ impl crate::App {
             if (log_moved || backfill_logged) && self.clause_moved(id) {
                 clauses_moved.push(id);
             }
-            if status_changed
+            // A new group clears the old foreground name immediately. Its resolver can
+            // return no name and produce no later wake.
+            if group_changed
+                || status_changed
                 || detail_changed
                 || seen
                 || step.reading_changed
@@ -6151,12 +6157,7 @@ impl crate::App {
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let facts = timeline.claude_footer();
-            crate::token_shown::status_fields(
-                facts.and_then(|f| f.route.as_ref()),
-                crate::token_shown::footer_account(facts),
-                crate::token_shown::shown().as_deref(),
-            )
+            crate::token_shown::status_of(&timeline)
         };
         let Some(status) = self.session_status.status(session) else {
             return Ok(format!(

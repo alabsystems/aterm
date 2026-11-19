@@ -14,6 +14,8 @@ pub(crate) enum Form {
     Summary,
     /// The distributions (`metrics percentiles`).
     Percentiles,
+    /// Commons repair's counts per seat (`metrics commons`).
+    Commons,
 }
 
 /// Which sink spells the reply.
@@ -34,13 +36,14 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    /// `""`, `reset` or `percentiles`.
+    /// `""`, `reset`, `percentiles` or `commons`.
     #[must_use]
     pub(crate) fn parse(rest: &str) -> Option<Self> {
         let (form, reset) = match rest.trim() {
             "" => (Form::Summary, false),
             "reset" => (Form::Summary, true),
             "percentiles" => (Form::Percentiles, false),
+            "commons" => (Form::Commons, false),
             _ => return None,
         };
         Some(Self { form, reset })

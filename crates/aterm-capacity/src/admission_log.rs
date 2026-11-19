@@ -435,12 +435,14 @@ pub const fn short_word(short: &Short) -> &'static str {
         Short::WantsAlone { .. } => "wants-alone",
         Short::Heavy { .. } => "heavy",
         Short::Turn { .. } => "turn",
+        Short::ExternalLock => "external-lock",
+        Short::LegacySlots { .. } => "legacy-slots",
         Short::Ledger(_) => "ledger",
     }
 }
 
 /// Every word [`short_word`] says, each a bit of [`Looks::seen`] by its place here.
-const WORDS: [&str; 15] = [
+const WORDS: [&str; 17] = [
     "release",
     "cores",
     "timing",
@@ -456,10 +458,12 @@ const WORDS: [&str; 15] = [
     "turn",
     "ledger",
     "heavy",
+    "external-lock",
+    "legacy-slots",
 ];
 
 /// `short`'s bit in [`Looks::seen`].
-fn bit(short: &Short) -> u16 {
+fn bit(short: &Short) -> u32 {
     let word = short_word(short);
     WORDS
         .iter()
@@ -484,7 +488,7 @@ pub const fn memory_class(short: &Short) -> bool {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Looks {
     /// Each kind of shortfall a look found, a bit by its place in [`WORDS`].
-    seen: u16,
+    seen: u32,
     /// A forced look (`--admit now`) admitted it.
     forced: bool,
 }

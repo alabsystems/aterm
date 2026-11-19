@@ -167,7 +167,9 @@ fn explicit_signin_case(bound: bool, case: i64) -> [bool; 5] {
             .transact_logins(NOW, &mut None, |state, logins| {
                 let mut events =
                     accounts::note_auth(state, "account", accounts::Auth::SignedOut, NOW);
-                events.extend(accounts::note_signed_back(state, logins, "account", NOW));
+                events.extend(accounts::note_checked_sign_in(
+                    state, logins, "account", NOW,
+                ));
                 Ok(events)
             })
             .unwrap();
@@ -307,7 +309,7 @@ fn sign_back_case(operation: i64, case: i64) -> [bool; 4] {
         if operation == 2 {
             accounts::note_default_login_made(state, logins, "account", None, at)
         } else {
-            accounts::note_signed_back(state, logins, "account", at)
+            accounts::note_checked_sign_in(state, logins, "account", at)
         }
     };
     let publication_files = [
@@ -625,7 +627,9 @@ fn sign_back_receipts_reject_corruption_and_retain_their_clock_after_removal() {
     store
         .transact_logins(NOW, &mut None, |state, logins| {
             accounts::note_auth(state, "account", accounts::Auth::SignedOut, NOW);
-            Ok(accounts::note_signed_back(state, logins, "account", NOW))
+            Ok(accounts::note_checked_sign_in(
+                state, logins, "account", NOW,
+            ))
         })
         .unwrap();
     let original = store.load_logins(NOW).unwrap().0;
@@ -667,7 +671,9 @@ fn sign_back_receipts_reject_corruption_and_retain_their_clock_after_removal() {
     store
         .transact_logins(NOW, &mut None, |state, logins| {
             accounts::note_auth(state, "account", accounts::Auth::SignedOut, NOW);
-            Ok(accounts::note_signed_back(state, logins, "account", NOW))
+            Ok(accounts::note_checked_sign_in(
+                state, logins, "account", NOW,
+            ))
         })
         .unwrap();
     assert_eq!(
@@ -710,7 +716,7 @@ fn sign_back_clears_persisted_bot_hold_only_after_a_committed_success() {
     assert!(
         store
             .transact_logins(NOW + 1, &mut None, |state, logins| {
-                Ok(accounts::note_signed_back(
+                Ok(accounts::note_checked_sign_in(
                     state,
                     logins,
                     "account",
@@ -733,7 +739,7 @@ fn sign_back_clears_persisted_bot_hold_only_after_a_committed_success() {
     assert_eq!(check_standing_at(&store, &raw, &logins), Some(NOW));
     store
         .transact_logins(NOW + 1, &mut None, |state, logins| {
-            Ok(accounts::note_signed_back(
+            Ok(accounts::note_checked_sign_in(
                 state,
                 logins,
                 "account",
@@ -1117,7 +1123,7 @@ fn sign_in_receipts_survive_the_addition_of_more_accounts() {
         store
             .transact_logins(at, &mut None, |state, logins| {
                 accounts::note_auth(state, &label, accounts::Auth::SignedOut, at);
-                Ok(accounts::note_signed_back(state, logins, &label, at))
+                Ok(accounts::note_checked_sign_in(state, logins, &label, at))
             })
             .unwrap();
     }

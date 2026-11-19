@@ -6,9 +6,10 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::headless_boot;
+use crate::patience::Patience;
 
 use headless_boot::{boot_session, boot_with, ctl_ok, standin, type_line};
 
@@ -36,16 +37,16 @@ fn watch_held_build(root: &Path) -> Result<Held, String> {
     let hold = root.join("hold");
     let (held, passed) = (root.join("hold.held"), root.join("hold.passed"));
     let pid_file = root.join("shell.pid");
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     let seen = loop {
         if held.exists()
             && let Ok(text) = std::fs::read_to_string(&pid_file)
         {
             break Ok((text, passed.exists()));
         }
-        if Instant::now() >= give_up {
+        if let Some(why) = patience.spent() {
             break Err(format!(
-                "no pid file from the boot shell (build held: {}, passed: {})",
+                "no pid file from the boot shell ({why}; build held: {}, passed: {})",
                 held.exists(),
                 passed.exists()
             ));
@@ -75,16 +76,15 @@ fn watch_held_build(root: &Path) -> Result<Held, String> {
 
 /// The boot session's screen once it shows `needle`.
 fn screen_with(inst: &headless_boot::Instance, sid: &str, needle: &str) -> String {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         let text = ctl_ok(inst, &[&format!("@{sid}"), "text"]);
         if text.contains(needle) {
             return text;
         }
-        assert!(
-            Instant::now() < give_up,
-            "the boot session never showed {needle:?}: {text}"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("the boot session never showed {needle:?} ({why}): {text}");
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -276,7 +276,7 @@ fn with_the_loop_first_seam_session_zero_forks_only_after_the_event_loop_is_buil
         .unwrap_or_else(|why| panic!("{why}"));
 
     let pid_file = inst.tmp.join("shell.pid");
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     let pid = loop {
         if let Ok(pid) = std::fs::read_to_string(&pid_file)
             .map_err(|e| e.to_string())
@@ -284,7 +284,9 @@ fn with_the_loop_first_seam_session_zero_forks_only_after_the_event_loop_is_buil
         {
             break pid;
         }
-        assert!(Instant::now() < give_up, "no pid file from the boot shell");
+        if let Some(why) = patience.spent() {
+            panic!("no pid file from the boot shell ({why})");
+        }
         std::thread::sleep(Duration::from_millis(5));
     };
     let started = aterm_pty::process_birth(pid).expect("the boot shell is alive");
@@ -303,10 +305,12 @@ fn with_the_loop_first_seam_session_zero_forks_only_after_the_event_loop_is_buil
 /// Release the held build once it is reached (`<root>/hold.held`), waiting for nothing else.
 #[cfg(target_os = "macos")]
 fn release_once_held(root: &Path) -> Result<(), String> {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     while !root.join("hold.held").exists() {
-        if Instant::now() >= give_up {
-            return Err("the boot never reached the held event-loop build".to_string());
+        if let Some(why) = patience.spent() {
+            return Err(format!(
+                "the boot never reached the held event-loop build ({why})"
+            ));
         }
         std::thread::sleep(Duration::from_millis(5));
     }

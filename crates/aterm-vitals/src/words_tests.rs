@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::model::{CpuView, GpuView, MemSample, MemView, ScopeView, TabView};
+use crate::model::{CpuView, GpuView, MemSample, MemView, Sample, ScopeView, TabView, Vitals};
 use crate::trend::TrendView;
 
 fn scenario_a() -> Snapshot {
@@ -354,6 +354,142 @@ fn zombies_light_the_well_machine_wide() {
         assert_eq!(state(Resource::Processes, &s, &MAC), None);
         assert!(job_marks(&s).is_empty());
         assert!(processes_details(&s).is_empty());
+    }
+}
+
+#[test]
+fn processes_room_words_and_job_updates_share_the_current_binding_reading() {
+    let ordinary = TaskRoom {
+        procs: Some(10_000),
+        procs_max: Some(16_000),
+        user_procs: Some(1_000),
+        user_procs_max: Some(8_000),
+        threads: Some(20_000),
+        threads_max: Some(40_000),
+        files: Some(40_000),
+        files_max: Some(80_000),
+    };
+    for (room, phrase) in [
+        (
+            TaskRoom {
+                procs: Some(14_800),
+                ..ordinary
+            },
+            "near the process limit: 14,800 of 16,000",
+        ),
+        (
+            TaskRoom {
+                user_procs: Some(7_400),
+                ..ordinary
+            },
+            "near the per-user process limit: 7,400 of 8,000",
+        ),
+        (
+            TaskRoom {
+                threads: Some(37_000),
+                ..ordinary
+            },
+            "near the thread limit: 37,000 of 40,000",
+        ),
+        (
+            TaskRoom {
+                files: Some(74_000),
+                ..ordinary
+            },
+            "near the open-file limit: 74,000 of 80,000",
+        ),
+    ] {
+        let mut model = Vitals::new();
+        let mut sample = Sample {
+            at_ns: 1_000_000_000,
+            at_unix_ms: NOW,
+            mono_ms: 1_000,
+            cadence_ms: 1_000,
+            room,
+            ..Sample::default()
+        };
+        let mut snapshot = model.absorb(&sample);
+        let reading = snapshot.facts.process_room.expect("binding pair");
+        assert!(reading.near());
+        for verdict in [Some(Verdict::Stuck), Some(Verdict::Fine), None] {
+            snapshot.set_jobs(verdict.map(|verdict| {
+                Arc::new(JobsView {
+                    rows: vec![job("job", verdict)],
+                    ..JobsView::default()
+                })
+            }));
+            assert_eq!(snapshot.facts.process_room, Some(reading));
+            assert_eq!(
+                snapshot.resources[Resource::Processes.index()].state,
+                Some(State::Warn)
+            );
+            assert_eq!(
+                well(
+                    Resource::Processes,
+                    &snapshot.resources[Resource::Processes.index()]
+                ),
+                Some((Mark::Dot, InkKind::Warn))
+            );
+            let words = state(Resource::Processes, &snapshot, &MAC).expect("near-limit state");
+            assert!(
+                (1..=2).contains(&words.word.split_whitespace().count()),
+                "the compact state fallback is a word or two: {:?}",
+                words.word
+            );
+            assert_eq!(
+                (words.state, words.mark, words.ink),
+                (State::Warn, Mark::Dot, InkKind::Warn)
+            );
+            assert_eq!(words.clauses.last().map(String::as_str), Some(phrase));
+            let clauses = details(Resource::Processes, &snapshot, &MAC);
+            assert_eq!(clauses[0].forms, strings(&[phrase]));
+            assert!(clauses[0].keep && clauses[0].mark == Some(Mark::Dot));
+            if verdict == Some(Verdict::Stuck) {
+                assert!(clauses.iter().any(|c| c.mark == Some(Mark::Stuck)));
+            }
+            assert_eq!(snapshot.jobs.as_ref().map(|j| j.rows[0].verdict), verdict);
+        }
+
+        sample.room = ordinary;
+        sample.at_ns += 1_000_000_000;
+        sample.at_unix_ms += 1_000;
+        sample.mono_ms += 1_000;
+        snapshot = model.absorb(&sample);
+        assert!(!snapshot.facts.process_room.unwrap().near());
+        for (verdict, expected) in [
+            (Some(Verdict::Stuck), Some(State::Stuck)),
+            (Some(Verdict::Fine), None),
+            (None, None),
+        ] {
+            snapshot.set_jobs(verdict.map(|verdict| {
+                Arc::new(JobsView {
+                    rows: vec![job("job", verdict)],
+                    ..JobsView::default()
+                })
+            }));
+            assert_eq!(
+                snapshot.resources[Resource::Processes.index()].state,
+                expected
+            );
+            assert_eq!(
+                state(Resource::Processes, &snapshot, &MAC).map(|s| s.state),
+                expected
+            );
+            assert!(
+                details(Resource::Processes, &snapshot, &MAC)
+                    .iter()
+                    .all(|c| c.mark != Some(Mark::Dot))
+            );
+        }
+
+        sample.room = TaskRoom::default();
+        sample.at_ns += 1_000_000_000;
+        sample.at_unix_ms += 1_000;
+        sample.mono_ms += 1_000;
+        snapshot = model.absorb(&sample);
+        assert_eq!(snapshot.facts.process_room, None);
+        assert_eq!(state(Resource::Processes, &snapshot, &MAC), None);
+        assert!(details(Resource::Processes, &snapshot, &MAC).is_empty());
     }
 }
 
@@ -1741,6 +1877,170 @@ fn a_split_tab_speaks_for_all_its_panes() {
 }
 
 #[test]
+fn speech_names_the_mechanism_with_the_numbers_the_deck_draws() {
+    use crate::units::{Disk, DiskLocation, Level, Rate};
+    let rate = |mean, max, peak, basis| Rate {
+        level: Some(Level { mean, max }),
+        peak,
+        basis,
+    };
+    let mut s = disk_trouble();
+    let mut memory = scenario_a().mem.unwrap();
+    memory.sample.swap_used = Some(512 << 20);
+    memory.sample.swap_total = Some(2 << 30);
+    memory.rates = Some(crate::MemRates {
+        swapin_bps: 1e6,
+        swapout_bps: 2e6,
+        decompress_ps: 900_000.0,
+        compress_ps: 800_000.0,
+        pagein_ps: 700_000.0,
+        churn_bps: 999e6,
+        window_ns: 1_000_000_000,
+        ..crate::MemRates::default()
+    });
+    s.mem = Some(memory);
+    set(&mut s, Resource::Memory, row(16.0 * GIB, 32.0 * GIB));
+    set(&mut s, Resource::Gpu, row(25.0, 100.0));
+    s.facts.gpu = Some(GpuSample {
+        cores: Some(16),
+        name: Some("fixture GPU".into()),
+        ..GpuSample::default()
+    });
+    s.global.write_bps = Some(888e6);
+    s.units.churn = Some(rate(64e6, 96e6, Some(128e6), CapBasis::Peak));
+    s.units.home_device_id = Some("0000000000000001".into());
+    s.units.disks = vec![
+        Disk {
+            id: "0000000000000002".into(),
+            location: DiskLocation::Internal,
+            write: rate(999e6, 999e6, Some(999e6), CapBasis::Peak),
+            ..Disk::default()
+        },
+        Disk {
+            id: "0000000000000001".into(),
+            location: DiskLocation::External,
+            write: rate(64e6, 96e6, Some(128e6), CapBasis::Peak),
+            read: rate(32e6, 48e6, Some(256e6), CapBasis::Peak),
+            ..Disk::default()
+        },
+    ];
+    assert!(row_sentence(Resource::Gpu, &s, &[], &MAC).contains("Across 16 GPU cores."));
+    let mut fallback = s.clone();
+    let mut sample = fallback.facts.gpu.take().unwrap();
+    sample.in_use_bytes = Some(2 << 30);
+    fallback.gpu = Some(GpuView {
+        sample,
+        ..GpuView::default()
+    });
+    let said = row_sentence(Resource::Gpu, &fallback, &[], &MAC);
+    assert!(said.contains("Across 16 GPU cores."), "{said}");
+    assert!(said.contains("2.0 gibibytes GPU memory in use"), "{said}");
+    let memory = row_sentence(Resource::Memory, &s, &[], &MAC);
+    assert!(
+        memory.contains("Compressor churn 64 megabytes per second"),
+        "{memory}"
+    );
+    assert!(memory.contains("Compressed 1.0 gibibytes."), "{memory}");
+    assert!(
+        memory.contains("Swap 512 mebibytes."),
+        "the existing swap figures remain: {memory}"
+    );
+    for (bytes, expected) in [
+        (3 << 30, "Compressed 3.0 gibibytes."),
+        (0, "Compressed 0 kibibytes."),
+    ] {
+        s.mem.as_mut().unwrap().sample.compressed = Some(bytes);
+        let said = row_sentence(Resource::Memory, &s, &[], &MAC);
+        assert!(said.contains(expected), "{said}");
+    }
+    s.mem.as_mut().unwrap().sample.compressed = None;
+    assert!(!row_sentence(Resource::Memory, &s, &[], &MAC).contains("Compressed "));
+    let disk = row_sentence(Resource::Disk, &s, &[], &MAC);
+    assert!(
+        disk.contains("Home device writing 64 megabytes per second"),
+        "{disk}"
+    );
+    assert!(
+        disk.contains("Home device reading 32 megabytes per second"),
+        "{disk}"
+    );
+    assert!(disk.contains("128 megabytes per second") && disk.contains("256 megabytes per second"));
+    assert!(!disk.contains("999 megabytes"));
+    assert!(disk.contains("full in") && disk.contains("filling"));
+
+    // Only the canonical unit figures change; instantaneous counters and logical writes do not.
+    s.units.churn.as_mut().unwrap().level.as_mut().unwrap().mean = 8e6;
+    s.units.disks[1].write.level.as_mut().unwrap().mean = 4e6;
+    assert!(
+        row_sentence(Resource::Memory, &s, &[], &MAC)
+            .contains("Compressor churn 8 megabytes per second")
+    );
+    assert!(
+        row_sentence(Resource::Disk, &s, &[], &MAC)
+            .contains("Home device writing 4 megabytes per second")
+    );
+    assert_eq!(s.mem.as_ref().unwrap().rates.unwrap().churn_bps, 999e6);
+    assert_eq!(s.global.write_bps, Some(888e6));
+
+    s.units.churn = Some(rate(0.25, 0.5, None, CapBasis::Learning));
+    let said = row_sentence(Resource::Memory, &s, &[], &MAC);
+    assert!(
+        said.contains("0.25 bytes per second") && said.contains("peak learning"),
+        "{said}"
+    );
+    s.units.churn.as_mut().unwrap().level = None;
+    assert!(row_sentence(Resource::Memory, &s, &[], &MAC).contains("Compressor churn warming"));
+    s.units.churn = Some(rate(0.0, 0.0, Some(0.0), CapBasis::Learning));
+    assert!(
+        row_sentence(Resource::Memory, &s, &[], &MAC)
+            .contains("Compressor churn 0 bytes per second")
+    );
+    s.units.churn = None;
+    assert!(!row_sentence(Resource::Memory, &s, &[], &MAC).contains("Compressor churn"));
+    s.units.home_device_id = None;
+    assert!(!row_sentence(Resource::Disk, &s, &[], &MAC).contains("Home device writing"));
+    for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(unit_rate_bps(invalid), None);
+    }
+    assert_eq!(unit_rate_bps(0.0).as_deref(), Some("0 B/s"));
+    assert_eq!(unit_rate_bps(0.25).as_deref(), Some("0.25 B/s"));
+}
+
+#[test]
+fn no_deck_word_calls_a_box_a_forecast() {
+    // A historical box can affect trend speech only after its observation time. Stored future
+    // cells are not predictions and must have the same projection as unread cells.
+    for res in Resource::ALL {
+        let mut empty = snap();
+        let mut view = row(0.2, 1.0);
+        set(&mut empty, res, view.clone());
+        let baseline = row_sentence(res, &empty, &[], &MAC);
+        let baseline_trends = trend_sentences(&view, NOW, &MAC);
+        view = steady(view, 0);
+        assert_ne!(
+            trend_sentences(&view, NOW, &MAC),
+            baseline_trends,
+            "known history participates: {res:?}"
+        );
+        view.ring_k += 60;
+        assert!(
+            view.heat_columns(10, 60, NOW)
+                .iter()
+                .all(|c| c.heat.is_none()),
+            "future cells remain unread: {res:?}"
+        );
+        assert_eq!(trend_sentences(&view, NOW, &MAC), baseline_trends);
+        let mut future = empty.clone();
+        set(&mut future, res, view);
+        assert_eq!(
+            row_sentence(res, &future, &[], &MAC),
+            baseline,
+            "only observed boxes affect speech: {res:?}"
+        );
+    }
+}
+
+#[test]
 fn row_sentences() {
     let mut s = snap();
     let mut cpu = steady(row(17.7, 18.0), 48);
@@ -2482,4 +2782,28 @@ fn the_legends_totals_say_used_of_total_measured_by_their_widest_figures() {
         small[0].widest,
         "10 cores \u{b7} 32 GiB \u{b7} 888 of 994 GB"
     );
+}
+
+#[test]
+fn high_network_latency_survives_folding_even_without_traffic() {
+    for ms in [250.0, 1845.0] {
+        let mut snap = Snapshot::default();
+        snap.net = Some(crate::model::NetView {
+            state: NetState::Degraded,
+            srtt_ms: Some(ms),
+            ..Default::default()
+        });
+        for clauses in [
+            details(Resource::Network, &snap, &MAC),
+            glance_details(Resource::Network, &snap, &[], &MAC),
+        ] {
+            let retained: Vec<_> = clauses.iter().filter(|c| c.keep).collect();
+            assert_eq!(retained.len(), 1);
+            let clause = retained[0];
+            assert_eq!(clause.ink, InkKind::Warn);
+            assert!(clause.forms.iter().all(|f| f.contains(&rtt_word(ms))));
+        }
+    }
+    let healthy = degraded_network(Some(14.0));
+    assert!(!healthy.forms.iter().any(|f| f.contains("14")));
 }

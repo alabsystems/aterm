@@ -8,8 +8,8 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
 
+use crate::patience::Patience;
 use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field};
@@ -149,7 +149,7 @@ fn spawn_as(
         let mut stdin = child.stdin.take().expect("its stdin");
         stdin.write_all(task).expect("write the task");
         drop(stdin);
-        child_output::wait_and_read(child, Instant::now() + headless_boot::CLIENT_EXIT_DEADLINE)
+        child_output::wait_and_read(child, headless_boot::CLIENT_NO_PROGRESS_WINDOW)
             .expect("aterm ctl exits")
     });
     (
@@ -175,19 +175,19 @@ fn hostile_task() -> String {
     task
 }
 
-/// Poll `probe` until it holds, for at most [`HANG`]; a failure shows the
-/// worker as the instance sees it (its screen, its blocks, its record) and
-/// the instance log's tail.
+/// Poll `probe` until it holds, for as long as a [`Patience`] over [`HANG`] lasts; a failure
+/// shows the worker as the instance sees it (its screen, its blocks, its record) and the
+/// instance log's tail.
 fn until(inst: &Instance, worker: &str, what: &str, mut probe: impl FnMut() -> bool) {
-    let give_up = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     while !probe() {
-        if Instant::now() >= give_up {
+        if let Some(why) = patience.spent() {
             let ask = |args: &[&str]| {
                 let out = ctl(inst, args);
                 String::from_utf8_lossy(&out.stdout).into_owned()
             };
             panic!(
-                "{what}: not within {HANG:?}\nscreen:\n{}\nblocks:\n{}\ntask: {}\nlog:\n{}",
+                "{what}: not reached ({why})\nscreen:\n{}\nblocks:\n{}\ntask: {}\nlog:\n{}",
                 ask(&[&format!("@{worker}"), "text", "trim"]),
                 ask(&[&format!("@{worker}"), "blocks"]),
                 ask(&[&format!("@{worker}"), "task"]),

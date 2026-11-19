@@ -6,7 +6,8 @@
 #![allow(dead_code)]
 
 use std::process::Output;
-use std::time::Instant;
+
+use crate::patience::Patience;
 
 /// Whether `out` is the `aterm ctl` client's refusal when the control socket did not accept in time.
 pub fn was_never_accepted(out: &Output) -> bool {
@@ -35,16 +36,16 @@ pub fn until_served(attempt: impl FnMut() -> Output) -> Output {
     })
 }
 
-/// `attempt` again while `unserved` holds of its answer, up to
-/// [`aterm_spec::wait::MUST_HAPPEN`].
+/// `attempt` again while `unserved` holds of its answer, for as long as a [`Patience`] over
+/// [`aterm_spec::wait::MUST_HAPPEN`] lasts; its last answer once it is spent.
 fn asked_again_while(
     mut attempt: impl FnMut() -> Output,
     unserved: impl Fn(&Output) -> bool,
 ) -> Output {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         let out = attempt();
-        if !unserved(&out) || Instant::now() >= give_up {
+        if !unserved(&out) || patience.spent().is_some() {
             return out;
         }
     }

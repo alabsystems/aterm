@@ -4,14 +4,21 @@
 //! The strip box (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3): the one painter of every box
 //! of every strip, the deck's rows and the lens's traces alike.
 //!
-//! A box is a plate in `track`. A heat column rises from its foot to the box's mean, in the heat
-//! of the mean; a one-pixel peak tick stands at its largest reading, in the heat of that, where it
-//! clears the column by a pixel or more; and an over cap, outside the plate above it, is as long
-//! as the share of the box's read time that was over, each reading weighed by the time it stands
-//! for. A box with no reading is `hollow`. A box's value is its height, so a strip reads without
-//! colour.
+//! A box is a plate in `track`. A column rises from its foot to the box's mean; a one-pixel peak
+//! tick stands at its largest reading, where it clears the column by a pixel or more; and an over
+//! cap, outside the plate above it, is as long as the share of the box's read time that was over,
+//! each reading weighed by the time it stands for. A box with no reading is `hollow`. A box's
+//! value is its height, so a strip reads without colour.
+//!
+//! The column and the tick take their ink by [`BoxHeat`]. A rate of work's box (CPU, GPU,
+//! Network, Tokens, Processes) draws each in the heat of its own height; a lens trace in the heat
+//! of the share its lens names. A held amount's box (Memory, Disk: an amount, not a rate of work)
+//! draws both in its state's ink, `machine` at rest and `warn` or `critical` in a state, so a
+//! full but calm strip is quiet (SD-80; the 2026-11-14 review of the live band, departing from
+//! A1 §3's ruling 3 for those two rows).
 
 use aterm_vitals::ink::{Rgb, VitalsInks};
+use aterm_vitals::model::State;
 
 use crate::stats_paint::{Rect, panel};
 use crate::widget::{DrawPrim, Rgba, rgba};
@@ -27,15 +34,36 @@ pub(crate) struct BoxValue {
     pub(crate) over: f32,
 }
 
-/// The heat a box's column and tick are drawn in, each a share of capacity, where that is not
-/// their height: a lens trace stands on its own axis and keeps the heat of the share its lens names
-/// (`docs/DESIGN-stats-deck-units-2026-11-04.md` §7). `None` takes the height's share.
+/// The ink a box's column and tick are drawn in.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct BoxHeat {
-    /// The column's heat.
-    pub(crate) mean: Option<f32>,
-    /// The tick's heat.
-    pub(crate) max: Option<f32>,
+pub(crate) enum BoxHeat {
+    /// Each in the heat of its own height: a rate of work's box.
+    #[default]
+    Height,
+    /// Each in the heat of a share of capacity where that is not its height: a lens trace stands
+    /// on its own axis and keeps the heat of the share its lens names
+    /// (`docs/DESIGN-stats-deck-units-2026-11-04.md` §7). `None` takes the height's share.
+    Shares {
+        /// The column's heat.
+        mean: Option<f32>,
+        /// The tick's heat.
+        max: Option<f32>,
+    },
+    /// Both in the ink of the box's state ([`held_ink`]): a held amount's box (Memory, Disk),
+    /// whose height is its level and whose ink is its state, not its level.
+    State(Option<State>),
+}
+
+/// A held amount's box ink in `state`: `machine` at rest (`machine_ic` under Increase Contrast,
+/// `ic`), the ink A1 §4.3 and A2 §3.1 give a held amount that is not load; `warn` or `critical`
+/// in those states.
+pub(crate) const fn held_ink(inks: &VitalsInks, state: Option<State>, ic: bool) -> Rgb {
+    match state {
+        Some(State::Critical) => inks.critical,
+        Some(State::Warn) => inks.warn,
+        _ if ic => inks.machine_ic,
+        _ => inks.machine,
+    }
 }
 
 /// An unread box's mark in `hollow`.
@@ -52,9 +80,9 @@ pub(crate) enum Hollow {
 pub(crate) struct Skyline {
     /// The plate, the whole box in `track`; none for an unread box.
     pub(crate) plate: Option<Rect>,
-    /// The column from the foot to the mean, in the heat of the mean.
+    /// The column from the foot to the mean, in its [`BoxHeat`] ink.
     pub(crate) column: Option<(Rect, Rgb)>,
-    /// The peak tick, one device px tall, in the heat of the largest reading.
+    /// The peak tick, one device px tall, at the largest reading, in its [`BoxHeat`] ink.
     pub(crate) tick: Option<(Rect, Rgb)>,
     /// The over cap above the plate, in `over`.
     pub(crate) cap: Option<Rect>,
@@ -88,7 +116,7 @@ pub(crate) fn skyline_box(
     skyline_box_in(at, v, BoxHeat::default(), scale, inks, ic)
 }
 
-/// [`skyline_box`] with the column and tick in `heat` where it names a share.
+/// [`skyline_box`] with the column and tick in the ink `heat` names.
 pub(crate) fn skyline_box_in(
     at: Rect,
     v: BoxValue,
@@ -112,16 +140,23 @@ pub(crate) fn skyline_box_in(
             ..Skyline::default()
         };
     };
+    // The ink of a part `height` tall whose lens share, where it names one, is `share`.
+    let ink = |share: Option<f32>, height: f32| match heat {
+        BoxHeat::Height => inks.cell_at(height, ic),
+        BoxHeat::Shares { .. } => inks.cell_at(share.unwrap_or(height), ic),
+        BoxHeat::State(state) => held_ink(inks, state, ic),
+    };
+    let (mean_share, max_share) = match heat {
+        BoxHeat::Shares { mean, max } => (mean, max),
+        _ => (None, None),
+    };
     let ch = rise(mean, h);
-    let column = Some((
-        (x, y + h - ch, w, ch),
-        inks.cell_at(heat.mean.unwrap_or(mean), ic),
-    ));
+    let column = Some(((x, y + h - ch, w, ch), ink(mean_share, mean)));
     let tick = v.max.filter(|m| m.is_finite()).and_then(|m| {
         let th = rise(m, h);
         (th >= ch + 2.0).then(|| {
             let inset = if w >= 5.0 { 1.0 } else { 0.0 };
-            let ink = inks.cell_at(heat.max.unwrap_or(m), ic);
+            let ink = ink(max_share, m);
             ((x + inset, y + h - th, w - 2.0 * inset, 1.0), ink)
         })
     });

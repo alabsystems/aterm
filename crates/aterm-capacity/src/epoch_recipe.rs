@@ -91,7 +91,9 @@ fn name(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
-fn semver(value: &str) -> bool {
+/// Whether `value` is a complete Cargo semantic version, including any prerelease and build.
+#[must_use]
+pub fn cargo_semver(value: &str) -> bool {
     fn numeric(value: &str) -> bool {
         !value.is_empty()
             && value.bytes().all(|b| b.is_ascii_digit())
@@ -107,9 +109,6 @@ fn semver(value: &str) -> bool {
                     || part.len() == 1
                     || !part.starts_with('0'))
         })
-    }
-    if value.len() > 256 {
-        return false;
     }
     let (core, build) = value
         .split_once('+')
@@ -189,7 +188,8 @@ impl RootRecipe {
         if self.id >= roots
             || !(1..=256).contains(&self.jobs)
             || !name(&self.bin)
-            || !semver(&self.version)
+            || self.version.len() > 256
+            || !cargo_semver(&self.version)
             || self.package.as_deref().is_some_and(|s| !name(s))
             || self.features.len() > 64
             || self.features.iter().any(|s| {

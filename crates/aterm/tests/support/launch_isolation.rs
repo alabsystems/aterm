@@ -218,7 +218,11 @@ pub fn apply(cmd: &mut Command, root: &Path) {
             cmd.env_remove(name);
         }
     }
-    cmd.env_remove("TERM_PROGRAM")
+    // The runner's package home (`verify test` names one) is the login's store, not the scratch
+    // world's: an aterm here serves and fills the store at its own home's `.cargo`.
+    cmd.env_remove("CARGO_HOME")
+        .env_remove("TARGO_HOME")
+        .env_remove("TERM_PROGRAM")
         .env_remove("BASH_ENV")
         .env_remove("ENV")
         .env_remove("ZDOTDIR")

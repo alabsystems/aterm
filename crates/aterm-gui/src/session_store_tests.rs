@@ -91,10 +91,18 @@ fn a_spawn_wakes_instance_watchers() {
     let mut store = SessionStore::default();
     let watcher = crate::session_watch::Subscription::single(&store.instance_watchers());
     let h = test_handle(3);
-    store.register(h.clone());
+    let mut mailbox_starts = 0;
+    store.register(h.clone()).start_mailbox_with(|ctx| {
+        assert!(Arc::ptr_eq(ctx, &h.ctx));
+        mailbox_starts += 1;
+    });
     assert!(watcher.wait(Duration::ZERO), "a spawn rings the instance");
-    store.register(h);
+    assert_eq!(mailbox_starts, 1);
+    store
+        .register(h)
+        .start_mailbox_with(|_| mailbox_starts += 1);
     assert!(!watcher.wait(Duration::ZERO), "a replace rings nobody");
+    assert_eq!(mailbox_starts, 1, "a replace starts no new mailbox owner");
     store.deregister_local_as(3, ExitReason::CtlClose, ExitActor::Unknown);
     assert!(watcher.wait(Duration::ZERO), "a close rings the instance");
 }
@@ -1346,6 +1354,37 @@ fn roster_journal_mirrors_membership_exactly() {
     assert_eq!(store.roster_since(3).count(), 0);
     assert_eq!(store.roster_since(99).count(), 0, "past the high = nothing");
     assert_eq!(store.roster_low_seq(), Some(1));
+}
+
+#[test]
+fn an_instance_exit_word_survives_membership_history_eviction() {
+    use aterm_types::fabric_grammar::Bye;
+    let mut store = SessionStore::default();
+    assert_eq!(store.last_bye(), None);
+    store.say_bye(Bye::Handoff);
+    let handed = store.last_bye().unwrap();
+    for _ in 0..=ROSTER_JOURNAL_CAP {
+        assert!(store.request_retire("t0000000001"));
+    }
+    assert!(store.roster_low_seq().unwrap() > handed.0);
+    assert!(
+        store
+            .roster_since(0)
+            .all(|row| !matches!(row.change, RosterChange::Bye(_)))
+    );
+    assert_eq!(store.last_bye(), Some(handed));
+    store.say_bye(Bye::Quit);
+    let quit = store.last_bye().unwrap();
+    assert!(quit.0 > handed.0);
+    assert_eq!(quit.1, Bye::Quit);
+
+    let mut successor = SessionStore::default();
+    successor.continue_roster_seq(store.roster_seq());
+    assert_eq!(
+        successor.last_bye(),
+        None,
+        "an exit word belongs to its instance"
+    );
 }
 
 /// `bridge_roster` emits each row's local id and nonce, so a replace that changes either moves

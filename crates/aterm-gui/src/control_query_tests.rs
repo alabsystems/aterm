@@ -1639,8 +1639,13 @@ fn each_metrics_form_reaches_the_wire_through_its_own_emitter_and_sink() {
             "percentiles",
             law_tests::body(|s| crate::metrics::emit_percentiles(&ctx, s)).keys,
         ),
+        (
+            "commons",
+            law_tests::body(crate::metrics::emit_commons_seats).keys,
+        ),
     ];
     assert_ne!(forms[0].1, forms[1].1);
+    assert_ne!(forms[0].1, forms[2].1);
     for (form, keys) in &forms {
         let reply = super::cmd_metrics(None, form);
         let line = reply
@@ -1675,7 +1680,8 @@ fn each_metrics_form_reaches_the_wire_through_its_own_emitter_and_sink() {
 }
 
 /// Plain `metrics` carries each of Commons repair's counts for this process
-/// (`aterm_db::runtime::cadence`), a whole number, where Commons repair runs (unix).
+/// (`aterm_db::runtime::cadence`), a whole number, and each of its ledgers, `none` or the words
+/// counted with their counts (`rest:3,transferred:1`), where Commons repair runs (unix).
 ///
 /// NEGATIVE CONTROL (2026-11-12): with the summary leaving its Commons counts out, the reply
 /// named none (`commons_rounds_out: None`).
@@ -1685,6 +1691,7 @@ fn metrics_carries_commons_repairs_counts() {
     use crate::metrics::wire::law_tests;
     let reply = super::cmd_metrics(None, "");
     let tokens = law_tests::tokens(reply.trim_end());
+    let value = |key: &str| tokens.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
     for key in [
         "commons_rounds_out",
         "commons_rounds_in",
@@ -1694,11 +1701,81 @@ fn metrics_carries_commons_repairs_counts() {
         "commons_announces",
         "commons_signature_checks",
         "commons_deadline_spawns",
+        "commons_remembered_writes",
+        "commons_expired",
+        "commons_seat_busy",
+        "commons_unretired",
+        "commons_run_max",
     ] {
-        let value = tokens.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+        let value = value(key);
         assert!(
             value.is_some_and(|value| value.parse::<u64>().is_ok()),
             "{key}: {value:?}"
+        );
+    }
+    for key in [
+        "commons_next",
+        "commons_dials",
+        "commons_turns",
+        "commons_asks",
+        "commons_loops",
+    ] {
+        let value = value(key);
+        assert!(
+            value.is_some_and(|value| value == "none"
+                || value
+                    .split(',')
+                    .all(|pair| pair
+                        .split_once(':')
+                        .is_some_and(|(word, count)| !word.is_empty()
+                            && word.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                            && count.parse::<u64>().is_ok()))),
+            "{key}: {value:?}"
+        );
+    }
+}
+
+/// `metrics commons` carries one field, each seat Commons repair counted in this process with
+/// its counts (`aterm_db::runtime::seats`), `none` before any: in JSON an object of seats, each
+/// an object of its counts by name. A test binary counts no seat unless a test ran a round, so
+/// this holds the form's routing and its one field; each seat's spelling is held by
+/// `metrics::commons_tests`.
+#[test]
+fn metrics_commons_names_each_seat() {
+    use crate::metrics::wire::law_tests;
+    let reply = super::cmd_metrics(None, "commons");
+    let tokens = law_tests::tokens(reply.trim_end());
+    assert!(reply.starts_with("OK "), "{reply:?}");
+    assert_eq!(tokens.len(), 1, "{reply:?}");
+    let (key, seats) = tokens[0];
+    assert_eq!(key, "commons_seats");
+    assert!(
+        seats == "none"
+            || seats
+                .split(',')
+                .all(|seat| seat.split_once(':').is_some_and(|(_, counts)| counts
+                    .split('/')
+                    .all(|count| count.parse::<u64>().is_ok()))),
+        "{seats}"
+    );
+    let reply = super::cmd_metrics_json(None, "commons");
+    let body = reply
+        .strip_prefix("OK 1\n")
+        .expect("status frame")
+        .trim_end();
+    let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
+    let seats = value
+        .get("commons_seats")
+        .and_then(aterm_json::Value::as_object)
+        .unwrap_or_else(|| panic!("commons_seats is an object: {body}"));
+    for (seat, counts) in seats {
+        let counts = counts
+            .as_object()
+            .unwrap_or_else(|| panic!("{seat}: an object of counts"));
+        assert!(counts.iter().any(|(name, _)| name == "out"), "{seat}");
+        assert!(
+            counts.iter().all(|(_, count)| count.as_u64().is_some()),
+            "{seat}"
         );
     }
 }

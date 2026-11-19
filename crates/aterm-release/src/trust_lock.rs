@@ -26,51 +26,19 @@ use crate::ledger::GitRunner;
 /// When git cannot answer for `rev`, or the lock it carries is not UTF-8 or does not parse (a
 /// candidate that names its compiler unreadably is refused, never released on another one).
 pub(crate) fn lock_at(git: &dyn GitRunner, rev: &str) -> Result<Option<TrustLock>, String> {
-    let listed = git
-        .git_original(&["ls-tree", "-z", rev, "--", LOCK_FILE])
-        .map_err(|e| e.to_string())?;
-    if !listed.success() {
-        return Err(format!(
-            "git ls-tree {rev} failed: {}",
-            listed.stderr_utf8().trim()
-        ));
-    }
-    if listed.stdout.is_empty() {
+    let Some(bytes) =
+        crate::ledger::original_blob_at(git, rev, LOCK_FILE, aterm_uds::deadline::OUTPUT_KEEP)
+            .map_err(|e| e.to_string())?
+    else {
         return Ok(None);
-    }
-    let invalid = || format!("{rev}:{LOCK_FILE} is not one original regular Git blob");
-    let row = std::str::from_utf8(&listed.stdout)
-        .ok()
-        .and_then(|row| row.strip_suffix('\0'))
-        .ok_or_else(invalid)?;
-    let (entry, name) = row.split_once('\t').ok_or_else(invalid)?;
-    let fields = entry.split(' ').collect::<Vec<_>>();
-    let [mode, kind, oid] = fields.as_slice() else {
-        return Err(invalid());
     };
-    if !matches!(*mode, "100644" | "100755")
-        || *kind != "blob"
-        || name != LOCK_FILE
-        || !agh::path::is_sha(oid)
-    {
-        return Err(invalid());
-    }
-    let out = git
-        .git_original(&["cat-file", "blob", oid])
-        .map_err(|e| e.to_string())?;
-    if !out.success() {
-        return Err(format!(
-            "original {rev}:{LOCK_FILE} could not be read: {}",
-            out.stderr_utf8().trim()
-        ));
-    }
     let spec = format!("{rev}:{LOCK_FILE}");
-    if out.stdout.len() > aterm_toolchain::discovery::MAX_ATERM_CONFIG_BYTES {
+    if bytes.len() > aterm_toolchain::discovery::MAX_ATERM_CONFIG_BYTES {
         return Err(format!(
             "{spec} exceeds the bounded Trust configuration size"
         ));
     }
-    let text = String::from_utf8(out.stdout).map_err(|_| format!("{spec} is not UTF-8"))?;
+    let text = String::from_utf8(bytes).map_err(|_| format!("{spec} is not UTF-8"))?;
     atpkg::trust_lock::parse(&text)
         .map(Some)
         .map_err(|why| format!("{spec}: {why}"))

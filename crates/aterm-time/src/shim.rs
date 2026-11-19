@@ -34,20 +34,21 @@ fn duration_from_millis_f64(ms: f64) -> Duration {
     if !ms.is_finite() || ms <= 0.0 {
         return Duration::ZERO;
     }
-    let whole = ms.trunc();
-    let frac = ms - whole;
-    let millis = if whole >= u64::MAX as f64 {
-        u64::MAX
-    } else {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "guarded above: finite, > 0, and below u64::MAX"
-        )]
-        {
-            whole as u64
-        }
-    };
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "whole positive milliseconds truncate and saturate at u64::MAX"
+    )]
+    let millis = ms as u64;
+    // At 2^52 milliseconds and above every finite binary64 reading is integral.
+    if ms >= 4_503_599_627_370_496.0 {
+        return Duration::from_millis(millis);
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "every integer below 2^52 is exact in binary64"
+    )]
+    let frac = ms - millis as f64;
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,

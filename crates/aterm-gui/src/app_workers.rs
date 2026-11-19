@@ -38,9 +38,9 @@ pub(crate) fn workers_list_stands_alone(ws: &crate::WindowState) -> bool {
 impl App {
     /// Whether the window's Workers tab is `tab` and workers remain for it to stand for.
     pub(crate) fn workers_tab_holds(&self, wid: WindowId, tab: TabId) -> bool {
-        self.windows
-            .get(&wid)
-            .is_some_and(|ws| ws.tab_set.home() == Some(tab) && !ws.tab_set.parked().is_empty())
+        self.windows.get(&wid).is_some_and(|ws| {
+            ws.tab_set.home() == Some(tab) && ws.tab_set.parked().iter().any(|tab| tab.ephemeral)
+        })
     }
 
     /// Whether a leaf of `tab` has a task record.
@@ -97,7 +97,11 @@ impl App {
     pub(crate) fn settle_workers_tab(&mut self, wid: WindowId) {
         let Some((parked, home, shown)) = self.windows.get(&wid).map(|ws| {
             (
-                ws.tab_set.parked().len(),
+                ws.tab_set
+                    .parked()
+                    .iter()
+                    .filter(|tab| tab.ephemeral)
+                    .count(),
                 ws.tab_set.home(),
                 ws.tab_set.shown_len(),
             )
@@ -191,7 +195,7 @@ impl App {
             return Vec::new();
         };
         let mut sessions = Vec::new();
-        for tab in ws.tab_set.parked() {
+        for tab in ws.tab_set.parked().iter().filter(|tab| tab.ephemeral) {
             tab.root.visit(&mut |&view| {
                 if let Some(session) = self
                     .view_store
@@ -473,9 +477,18 @@ impl App {
         let Some((wid, tab)) = found else {
             return false;
         };
-        // Each session the kept tab holds (a worker's split panes too) is the person's now.
+        self.keep_tab_in(wid, tab, session)
+    }
+
+    pub(crate) fn keep_tab_in(&mut self, wid: WindowId, tab: TabId, session: u64) -> bool {
+        let Some(kept) = self.windows.get(&wid).and_then(|ws| ws.tab_set.get(tab)) else {
+            return false;
+        };
+        // Showing a person's hidden tab changes only its position. Keeping a worker's tab
+        // also transfers its task and any drive request to the person.
+        let worker = kept.ephemeral;
         let mut held = Vec::new();
-        if let Some(kept) = self.windows.get(&wid).and_then(|ws| ws.tab_set.get(tab)) {
+        if worker {
             kept.root.visit(&mut |&view| {
                 if let Some(crate::tab_model::View::Terminal(terminal)) =
                     self.view_store.get(view).copied()
@@ -493,6 +506,10 @@ impl App {
             return false;
         }
         drop(route_guard_ws);
+        if !worker {
+            self.resync_active_or_window(wid);
+            return true;
+        }
         let sid = self.session_id_text(session).unwrap_or_default();
         aterm_log::info!(
             "workers: @{sid} ({}) kept as a person's tab: its task no longer owns the tab",

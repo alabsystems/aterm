@@ -58,6 +58,41 @@ fn a_save_that_adds_records_calls_the_hook_once_with_them_and_one_that_adds_none
     assert!(calls.is_empty(), "{calls:?}");
 }
 
+/// A write of the records file tells its hook which rewrite generation it wrote its store under
+/// ([`crate::membership_log::store::Written::generation`]): the generation the entry is at
+/// when the write returns ([`Paths::records_generation`], read off the entry's pin), which for
+/// this writer is that of an entry never rewritten, the only kind it writes (`WRITTEN_UNDER`).
+/// The mesh egress takes the records a write hands it only under the generation its cursor
+/// counts (`aterm_mesh::egress::MembersCursor`), so a write that named another would have its
+/// records dropped and the file read in their place.
+///
+/// NEGATIVE CONTROL: `WRITTEN_UNDER` naming a rewrite (`number: 1`), seen to fail with
+/// ``assertion `left == right` failed: the generation the entry is at``, `left:
+/// [RecordsGeneration { number: 1, rewrite: None }, …]`, `right: [RecordsGeneration { number:
+/// 0, rewrite: None }, …]`.
+#[cfg(unix)]
+#[test]
+fn a_write_tells_its_hook_the_generation_it_wrote_under() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let paths = Paths::for_home(&root.path().join("mac"));
+    let c = chain();
+    let seen: Rc<RefCell<Vec<RecordsGeneration>>> = Rc::default();
+    let calls = seen.clone();
+    with_written(
+        move |w| calls.borrow_mut().push(w.generation),
+        || {
+            save_records(&paths, &encode_records([&c.genesis, &c.first_by_m1])).expect("save");
+            save_records(&paths, c.admit.bytes()).expect("save");
+        },
+    );
+    let at = paths.records_generation().expect("the entry's generation");
+    assert_eq!(
+        *seen.borrow(),
+        vec![at; 2],
+        "the generation the entry is at"
+    );
+}
+
 #[test]
 fn a_mesh_ingest_writes_and_calls_the_hook_only_when_a_record_enters() {
     let root = aterm_tempfile::tempdir().expect("tempdir");

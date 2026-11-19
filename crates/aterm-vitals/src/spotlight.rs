@@ -4,7 +4,9 @@
 //! Spotlight read whole (SD-93): the family's cost over a split window, summed from its
 //! Apple-signed coalitions ([`reading`]), and each local volume's indexing state from
 //! `mdutil -s -a`, which needs no root ([`volumes`]), run at most once a minute ([`Cadence`])
-//! over a port with an inert test arm ([`MdutilProbe`]).
+//! over a port with an inert test arm ([`MdutilProbe`]). The index's size on disk is root's to
+//! read: aterm's root LAN broker walks each volume's store and the host hands its answer in
+//! ([`StoreRead`], SD-94).
 //!
 //! The family's figures come from the coalition rows of the split, never from the process
 //! sweep: the system-owned `mds` (root) and `mds_stores` (`_mds_stores`) read `refused` there.
@@ -35,6 +37,17 @@ pub const VOLUMES_STALE_MS: u64 = 600_000;
 /// A split reading of the family is carried to later readings for at most this long, ms on the
 /// host's monotonic clock.
 pub const READING_CARRIED_MS: u64 = 60_000;
+
+/// A store answer older than this is not shown, ms: three of the root broker's walks, which it
+/// makes at most once every ten minutes.
+pub const STORE_STALE_MS: u64 = 1_800_000;
+
+/// The cannot lines a store answer meets ([`cannot`]): the store's folder, which only root reads,
+/// read by the root broker for us. `index_progress` is not among them: whether root can read
+/// indexing progress at all is owed a measurement made as root on macOS 27 (`mdutil -s -v`, the
+/// store's item counts over time), which no agent of this lab may make (SD-94), so it stays
+/// `unsupported`.
+pub const STORE_MEETS: &[&str] = &["index_folder"];
 
 /// What the host runs `mdutil` with: every local volume's status, which needs no root.
 pub const MDUTIL_ARGS: [&str; 2] = ["-s", "-a"];
@@ -98,6 +111,64 @@ pub struct Volume {
     pub indexing: Indexing,
 }
 
+/// Where the root broker's walk of a store stopped short: what it counted is a lower bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreCut {
+    /// At its most entries.
+    Entries,
+    /// At its longest time.
+    Time,
+    /// At a folder or entry it could not read (or a folder deeper than it enters).
+    Unreadable,
+}
+
+impl StoreCut {
+    /// Its word: `entries`, `time` or `unreadable`.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Entries => "entries",
+            Self::Time => "time",
+            Self::Unreadable => "unreadable",
+        }
+    }
+
+    /// The reason a cannot line gives where every store was cut by it:
+    /// `unavailable:partial_<word>`, an unavailable word ([`crate::sys::UNAVAILABLE_WORDS`]).
+    #[must_use]
+    pub fn partial_why(self) -> &'static str {
+        match self {
+            Self::Entries => "unavailable:partial_entries",
+            Self::Time => "unavailable:partial_time",
+            Self::Unreadable => "unavailable:partial_unreadable",
+        }
+    }
+}
+
+/// One volume's Spotlight store as the root broker walked it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Store {
+    /// The volume's mount point.
+    pub volume: String,
+    /// The store's size on disk, bytes: its entries' allocated blocks.
+    pub bytes: u64,
+    /// The entries counted.
+    pub entries: u64,
+    /// Where the walk stopped short; `None` for the whole store.
+    pub cut: Option<StoreCut>,
+}
+
+/// The root broker's answer as the host last read it: each volume's store, and when the walk
+/// behind it ended, ms on the host's monotonic clock (the answer's age taken off the time the
+/// host asked).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreRead {
+    /// Each local volume with a store.
+    pub stores: Vec<Store>,
+    /// When the walk ended, ms.
+    pub at_ms: u64,
+}
+
 /// The family's state, the `await sys spotlight=` levels in rank order. [`state`] reads them in
 /// this order of precedence: indexing, then off, then idle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +215,10 @@ pub struct Share {
     pub read_bps: u64,
     /// Its live members' footprint, bytes, where read.
     pub footprint: Option<u64>,
+    /// Its live members in the reading's sweep: how many processes it is now.
+    pub live: u32,
+    /// Its CPU since it began, ns ([`CoalRow::cpu_total_ns`]): exited members' work included.
+    pub cpu_total_ns: u64,
 }
 
 /// The family over one split window, with the volumes as last read.
@@ -168,6 +243,14 @@ pub struct Reading {
     pub volumes: Option<Vec<Volume>>,
     /// How old [`Self::volumes`] is at the reading, ms.
     pub volumes_age_ms: Option<u64>,
+    /// Each volume's store as the root broker last walked it, where read and no older than
+    /// [`STORE_STALE_MS`].
+    pub store: Option<Vec<Store>>,
+    /// How old [`Self::store`] is at the reading, ms.
+    pub store_age_ms: Option<u64>,
+    /// How old the root broker's last answer is at the reading, ms, where it is older than
+    /// [`STORE_STALE_MS`] and so not carried in [`Self::store`]: it answered, long ago.
+    pub store_stale_ms: Option<u64>,
     /// Its state ([`state`]).
     pub state: State,
 }
@@ -306,6 +389,8 @@ pub(crate) fn reading_of(
                 cpu_mc: r.cpu_mc,
                 read_bps: r.read_bps,
                 footprint: r.footprint,
+                live: r.live,
+                cpu_total_ns: r.cpu_total_ns,
             })
         })
         .collect();
@@ -327,9 +412,37 @@ pub(crate) fn reading_of(
         shares,
         volumes: None,
         volumes_age_ms: None,
+        store: None,
+        store_age_ms: None,
+        store_stale_ms: None,
         state: State::Idle,
     }
     .with_volumes(volumes, now_ms)
+}
+
+/// The Spotlight activity's cannot lines (`index_progress`, `index_folder`) for reading `r`. Each
+/// one [`STORE_MEETS`] is dropped where `r` carries the root broker's store answer and that
+/// answer read a store whole (or found none on a mount table read whole); where every store it
+/// lists was cut short, the line stays, its reason the bound that cut the first
+/// (`why=unavailable:partial_time`), as a lower bound alone does not read the folder.
+#[must_use]
+pub fn cannot(r: &Reading) -> Vec<(&'static str, &'static str)> {
+    let met = r.store.as_ref().map(|stores| {
+        if stores.is_empty() || stores.iter().any(|s| s.cut.is_none()) {
+            None
+        } else {
+            stores.iter().find_map(|s| s.cut)
+        }
+    });
+    crate::explain::ActivityId::Spotlight
+        .activity()
+        .cannot
+        .iter()
+        .filter_map(|&(what, why)| match met {
+            Some(cut) if STORE_MEETS.contains(&what) => cut.map(|cut| (what, cut.partial_why())),
+            _ => Some((what, why)),
+        })
+        .collect()
 }
 
 /// The port `mdutil` is run through, with [`MDUTIL_ARGS`]: the host's live arm runs it under a
@@ -410,12 +523,102 @@ impl Cadence {
     }
 }
 
+/// How often the host asks the root broker for Spotlight's stores, ms: the broker's own walk
+/// cadence (`aterm_lan`'s `WALK_EVERY`, ten minutes), so each ask can read a new walk and no ask
+/// makes the broker walk more often.
+pub const STORE_ASK_EVERY_MS: u64 = 600_000;
+
+/// The root broker's store answer as its port reads it: each store and the answer's age, ms; or
+/// one line why there is none.
+pub type StoreAnswer = Result<(Vec<Store>, u64), String>;
+
+/// The port the root broker is asked through ([`StoreAsk`]): the host's live arm asks
+/// `aterm_uds::lan::spotlight_stores`; `None` asks nothing (a unit test's inert arm, and a host
+/// with no Spotlight).
+#[derive(Clone, Copy, Debug)]
+pub struct StoreProbe {
+    /// Ask the broker, blocking until it answers or its client gives up.
+    pub ask: Option<fn() -> StoreAnswer>,
+}
+
+impl StoreProbe {
+    /// Asks nothing.
+    pub const INERT: Self = Self { ask: None };
+}
+
+/// When the host asks aterm's root LAN broker for Spotlight's stores (SD-94): at most once every
+/// [`STORE_ASK_EVERY_MS`], one ask at a time, each on a thread of its own, so a broker slow to
+/// answer (a walk waits at most its bound; a broker gone, its client's own hang bound) never
+/// holds the reading. An ask that fails (no broker installed, one too old to know the request,
+/// or the broker's error) is no answer: nothing is logged, and it is asked again at the next
+/// turn.
+#[derive(Debug, Default)]
+pub struct StoreAsk {
+    asked_ms: Option<u64>,
+    pending: Option<(u64, std::sync::mpsc::Receiver<StoreAnswer>)>,
+}
+
+impl StoreAsk {
+    /// At mono `now_ms`: the answer of the ask in flight, where it arrived; else, where an ask
+    /// is due and `probe` asks, a new ask, whose answer a later step returns.
+    pub fn step(&mut self, now_ms: u64, probe: &StoreProbe) -> Option<StoreRead> {
+        if let Some((asked_ms, answer)) = &self.pending {
+            let asked_ms = *asked_ms;
+            return match answer.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Ok(answer) => {
+                    self.pending = None;
+                    Self::read(answer, asked_ms)
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.pending = None;
+                    None
+                }
+            };
+        }
+        let ask = probe.ask?;
+        if self
+            .asked_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) < STORE_ASK_EVERY_MS)
+        {
+            return None;
+        }
+        self.asked_ms = Some(now_ms);
+        let (answered, answer) = std::sync::mpsc::channel();
+        let started = std::thread::Builder::new()
+            .name("vitals-spotlight-store".into())
+            .spawn(move || {
+                // The step that would read it dropped its end: nothing is waiting.
+                let _ = answered.send(ask());
+            });
+        if started.is_ok() {
+            self.pending = Some((now_ms, answer));
+        }
+        None
+    }
+
+    /// `answer` as read by an ask made at mono `asked_ms`: its walk ended its age before the
+    /// broker answered, which was no earlier than the ask, so the walk is dated no later than it
+    /// ended.
+    #[must_use]
+    pub fn read(answer: StoreAnswer, asked_ms: u64) -> Option<StoreRead> {
+        answer.ok().map(|(stores, age_ms)| StoreRead {
+            stores,
+            at_ms: asked_ms.saturating_sub(age_ms),
+        })
+    }
+}
+
 /// What the model keeps of the family between readings: the last split reading with the mono
 /// ms it was made at, carried for [`READING_CARRIED_MS`], and the day's history.
 #[derive(Clone, Debug, Default)]
 pub struct Family {
     last: Option<(Reading, u64)>,
-    history: crate::history::SpotlightHistory,
+    /// Shared with every snapshot that carries it: a reading takes a reference, and a note
+    /// copies the rings only while a snapshot still holds the previous day.
+    history: std::sync::Arc<crate::history::SpotlightHistory>,
+    /// The root broker's store answer as the host last handed it in ([`Self::note_store`]).
+    store: Option<StoreRead>,
 }
 
 impl Family {
@@ -434,6 +637,7 @@ impl Family {
         volumes: Option<&VolumesRead>,
         now_ms: u64,
     ) -> Option<Reading> {
+        let store = self.store.as_ref();
         if let Some(f) = fresh {
             let r = reading(
                 &f.split.rows,
@@ -441,15 +645,21 @@ impl Family {
                 now_ms,
                 f.at_unix_ms,
                 f.window_ns / 1_000_000,
-            );
-            self.history.note(&r);
+            )
+            .with_store(store, now_ms);
+            std::sync::Arc::make_mut(&mut self.history).note(&r);
             self.last = Some((r, now_ms));
         } else {
             self.last = self
                 .last
                 .take()
                 .filter(|(_, made_ms)| now_ms.saturating_sub(*made_ms) <= READING_CARRIED_MS)
-                .map(|(r, made_ms)| (r.with_volumes(volumes, now_ms), made_ms));
+                .map(|(r, made_ms)| {
+                    (
+                        r.with_volumes(volumes, now_ms).with_store(store, now_ms),
+                        made_ms,
+                    )
+                });
         }
         self.last.as_ref().map(|(r, _)| r.clone())
     }
@@ -464,13 +674,19 @@ impl Family {
 
     /// The day's history.
     #[must_use]
-    pub fn history(&self) -> &crate::history::SpotlightHistory {
+    pub fn history(&self) -> &std::sync::Arc<crate::history::SpotlightHistory> {
         &self.history
     }
 
     /// Take the history the host kept in an earlier run.
     pub fn restore_history(&mut self, history: crate::history::SpotlightHistory) {
-        self.history = history;
+        self.history = std::sync::Arc::new(history);
+    }
+
+    /// Take the root broker's store answer the host read; later readings carry it while it is
+    /// no older than [`STORE_STALE_MS`].
+    pub fn note_store(&mut self, store: StoreRead) {
+        self.store = Some(store);
     }
 }
 
@@ -486,6 +702,28 @@ impl Reading {
     #[must_use]
     pub fn footprint_unread(&self) -> bool {
         self.footprint.members > 0 && self.footprint.unread == self.footprint.members
+    }
+
+    /// The index's size on disk: every store's bytes summed, and whether any walk stopped short
+    /// (the sum is then a lower bound). `None` without the root broker's answer.
+    #[must_use]
+    pub fn index_bytes(&self) -> Option<(u64, Option<StoreCut>)> {
+        let store = self.store.as_ref()?;
+        let bytes = store.iter().fold(0u64, |t, s| t.saturating_add(s.bytes));
+        Some((bytes, store.iter().find_map(|s| s.cut)))
+    }
+
+    /// The same figures with the root broker's `store` answer as read at mono `now_ms`, where it
+    /// is no older than [`STORE_STALE_MS`]; an older one leaves only its age
+    /// ([`Self::store_stale_ms`]).
+    #[must_use]
+    pub fn with_store(mut self, store: Option<&StoreRead>, now_ms: u64) -> Self {
+        let age = |s: &StoreRead| now_ms.saturating_sub(s.at_ms);
+        let fresh = store.filter(|s| age(s) <= STORE_STALE_MS);
+        self.store = fresh.map(|s| s.stores.clone());
+        self.store_age_ms = fresh.map(age);
+        self.store_stale_ms = store.map(age).filter(|ms| *ms > STORE_STALE_MS);
+        self
     }
 
     /// The same figures with `volumes` as read at mono `now_ms`, and the state they give.

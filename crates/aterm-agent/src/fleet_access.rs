@@ -126,6 +126,7 @@ pub struct Change {
 }
 
 /// The level in `line`, where it is a `level=` line naming one.
+#[cfg(unix)]
 fn level_of(line: &str) -> Option<Option<FleetAccess>> {
     line.strip_prefix("level=").map(FleetAccess::from_word)
 }
@@ -135,14 +136,7 @@ fn level_of(line: &str) -> Option<Option<FleetAccess>> {
 /// not UTF-8, an unknown word and two `level=` lines (whichever they name) are all Read Only.
 #[must_use]
 pub fn decode(bytes: Option<&[u8]>) -> FleetAccess {
-    let Some(text) = bytes.and_then(|bytes| std::str::from_utf8(bytes).ok()) else {
-        return FleetAccess::ReadOnly;
-    };
-    let mut levels = text.lines().filter_map(level_of);
-    match (levels.next(), levels.next()) {
-        (Some(Some(level)), None) => level,
-        _ => FleetAccess::ReadOnly,
-    }
+    FleetAccess::of_file(bytes)
 }
 
 /// The level stored under `state`, failing closed ([`decode`]).

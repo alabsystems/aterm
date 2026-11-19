@@ -1036,7 +1036,48 @@ static FILE_LOGGER: OnceLock<&'static FileLogger> = OnceLock::new();
 pub(crate) fn flush_within(within: Duration) -> bool {
     FILE_LOGGER
         .get()
-        .is_none_or(|logger| logger.flush_within(within))
+        .is_none_or(|logger| logger.append_within(within, false))
+}
+
+/// Where a memory starvation edge's line goes ([`crate::memory_starving::Journal`]): aterm.log's
+/// file logger, or, where none is installed, the log facade, which orders nothing.
+pub(crate) fn starving_sink() -> &'static dyn crate::memory_starving::Sink {
+    match FILE_LOGGER.get() {
+        Some(logger) => *logger,
+        None => &Facade,
+    }
+}
+
+/// The log facade as a starvation sink, for a process with no file logger.
+struct Facade;
+
+impl crate::memory_starving::Sink for Facade {
+    fn write(&self, level: aterm_log::Level, line: &str) {
+        match level {
+            aterm_log::Level::Warn => aterm_log::warn!("{line}"),
+            _ => aterm_log::info!("{line}"),
+        }
+    }
+
+    fn sync(&self) -> bool {
+        true
+    }
+}
+
+impl crate::memory_starving::Sink for FileLogger {
+    fn write(&self, level: aterm_log::Level, line: &str) {
+        self.write_record(level, crate::memory_starving::TARGET, line);
+    }
+
+    /// The queue appended, then the file ordered to its device ([`aterm_durable::ordered`],
+    /// `F_BARRIERFSYNC` on a Mac) before the file's lock is let go, so a line written just before
+    /// survives the process stalling and the kernel panicking, which leaves the device powered; a
+    /// power loss may still lose it, which only the full flush ([`aterm_durable::durable_data`])
+    /// would prevent. False where the file was not had within
+    /// [`crate::memory_starving::SYNC_WAIT`] or the order failed.
+    fn sync(&self) -> bool {
+        self.append_within(crate::memory_starving::SYNC_WAIT, true)
+    }
 }
 
 impl FileLogger {
@@ -1126,7 +1167,11 @@ impl FileLogger {
         }
     }
 
-    fn flush_within(&self, within: Duration) -> bool {
+    /// Appends the queue under the file's lock, waiting no longer than `within` for it, then
+    /// flushes, and with `sync` orders the file to its device before the lock is let go (a
+    /// starvation sink's [`crate::memory_starving::Sink::sync`]). Returns whether it appended
+    /// and, with `sync`, ordered.
+    fn append_within(&self, within: Duration, sync: bool) -> bool {
         let now = Instant::now();
         let deadline = now
             .checked_add(within)
@@ -1145,7 +1190,7 @@ impl FileLogger {
             };
             self.append_queued(&mut file, None);
             file.flush();
-            return true;
+            return !sync || aterm_durable::ordered(&file.file).is_ok();
         }
     }
 }
@@ -1174,7 +1219,7 @@ impl Log for FileLogger {
     }
 
     fn flush(&self) {
-        let _ = self.flush_within(LOG_FLUSH_EXIT_WAIT);
+        let _ = self.append_within(LOG_FLUSH_EXIT_WAIT, false);
     }
 }
 

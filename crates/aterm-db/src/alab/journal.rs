@@ -44,7 +44,7 @@ mod heard;
 mod relay;
 
 pub use book::{AccountFacts, BookFacts, PlaceFacts, Presence};
-pub use event::{Event, Kind, Pk, Res, Source, SubKey, Window, Word};
+pub use event::{Event, Kind, ModelBucket, Pk, Res, Source, SubKey, Via, Window, Word};
 pub use spool::{Appended, Spool};
 
 use crate::typed::owned::caps;
@@ -237,10 +237,16 @@ crate::att_collection!(
     /// One login this Mac holds for one account (docs/DESIGN-shared-files-2026-11-11.md §10
     /// file 3, the shared file `ai/logins`): `<account pk>.<uuid32>`, at most 768 B. Every value
     /// is a closed word, a count or a time, so it can carry no address, path, URL or secret. The
-    /// times are Unix milliseconds of the writing Mac's clock, an author's claim.
+    /// times are Unix milliseconds of the writing Mac's clock, an author's claim. Since version 2
+    /// it states the credential its sign-in runs on (SF-34, decision SF-D3, [`mine::Credential`]):
+    /// `cred_kind`, `cred_kept`, `cred_issued_at`, `cred_expires_at`, `cred_refreshed_at`,
+    /// `cred_last_used` and `cred_state`, facts and never a value, each time bounded to a span a
+    /// real credential's falls in (`mine::checked`). An account's key names its
+    /// provider's realm, so one Mac's two pooled CLIs never sign in to one account (codex-alab
+    /// runs on Codex's own login), so each row states one credential.
     pub LOGIN = Collection {
         name: "login",
-        version: 1,
+        version: 2,
         kind: Merge::Owned,
         writers: Writers::SelfSuffix,
         prefix: "",
@@ -267,6 +273,34 @@ crate::att_collection!(
                 .null()
                 .writer(Writer::Mine),
             Column::new("plan", Ty::Text(16)).null().writer(Writer::Mine),
+            Column::new("cred_kind", Ty::Enum(&mine::CredKind::WORDS))
+                .null()
+                .writer(Writer::Mine)
+                .since(2),
+            Column::new("cred_kept", Ty::Enum(&mine::Kept::WORDS))
+                .null()
+                .writer(Writer::Mine)
+                .since(2),
+            Column::new("cred_issued_at", Ty::Time)
+                .null()
+                .writer(Writer::Mine)
+                .since(2),
+            Column::new("cred_expires_at", Ty::Time)
+                .null()
+                .writer(Writer::Mine)
+                .since(2),
+            Column::new("cred_refreshed_at", Ty::Time)
+                .null()
+                .writer(Writer::Mine)
+                .since(2),
+            Column::new("cred_last_used", Ty::Time)
+                .null()
+                .writer(Writer::Mine)
+                .since(2),
+            Column::new("cred_state", Ty::Enum(&mine::CredState::WORDS))
+                .null()
+                .writer(Writer::Mine)
+                .since(2),
         ],
         unique: &[],
         max_row: caps::LOGIN_ROW,
@@ -274,16 +308,30 @@ crate::att_collection!(
     }
 );
 
+/// The most bytes a `usage` row's `model_walls` holds (FL-269): a list of each model's own
+/// standing weekly wall, `{"bucket": <a ModelBucket word>, "until": <Unix ms>}` with `until`
+/// only where the wall states an end. This build writes at most one entry of each of
+/// [`ModelBucket`]'s four words (about 250 B); the room past them is a newer build's, and the
+/// cell is JSON within this size, never a typed list, so a newer build's bucket, member or
+/// entry is read entry by entry (`file::limits::model_walls_of`) and costs no other entry its
+/// wall.
+pub const MODEL_WALLS_MAX: usize = 384;
+
 crate::att_collection!(
     /// This Mac's latest reading of one account's limit windows (docs/DESIGN-shared-files-2026-11-11.md
     /// §10 file 4, the shared file `ai/usage`): `<account or sub-account pk>.<uuid32>`, at most
     /// 1,024 B. A percent is tenths of a percent used. A reset is the provider's stated instant,
     /// Unix milliseconds: the one time two Macs' readings are compared by (`ai/limits`), since it
     /// is the provider's, never a Mac's clock. `read_at` and `at` are the writing Mac's clock, an
-    /// author's claim that orders nothing.
+    /// author's claim that orders nothing. `wall` is the account's own standing wall; since
+    /// version 2 each model's own standing weekly wall is in `model_walls`, by its bucket
+    /// ([`MODEL_WALLS_MAX`], FL-269), and no longer in `wall`, where a version-1 row's
+    /// `7d-model` names no model. Since version 3 each window's reset names how exactly it is
+    /// known (`w5h_res`, `w7d_res`, `w7dm_res`: the reading's [`Res`]), which `ai/limits` judges
+    /// two Macs' resets of one instance by (`file::limits::SAME_RESET_MS`).
     pub USAGE = Collection {
         name: "usage",
-        version: 1,
+        version: 3,
         kind: Merge::Owned,
         writers: Writers::SelfSuffix,
         prefix: "",
@@ -298,8 +346,24 @@ crate::att_collection!(
             Column::new("w5h_reset", Ty::Time).null().writer(Writer::Mine),
             Column::new("w7d_reset", Ty::Time).null().writer(Writer::Mine),
             Column::new("w7dm_reset", Ty::Time).null().writer(Writer::Mine),
+            Column::new("w5h_res", Ty::Enum(Res::WORDS))
+                .null()
+                .writer(Writer::Mine)
+                .since(3),
+            Column::new("w7d_res", Ty::Enum(Res::WORDS))
+                .null()
+                .writer(Writer::Mine)
+                .since(3),
+            Column::new("w7dm_res", Ty::Enum(Res::WORDS))
+                .null()
+                .writer(Writer::Mine)
+                .since(3),
             Column::new("wall", Ty::Enum(&mine::Wall::WORDS)).writer(Writer::Mine),
             Column::new("wall_until", Ty::Time).null().writer(Writer::Mine),
+            Column::new("model_walls", Ty::Json(MODEL_WALLS_MAX))
+                .null()
+                .writer(Writer::Mine)
+                .since(2),
             Column::new(
                 "credits",
                 Ty::Int {
@@ -412,6 +476,89 @@ pub fn fold_signin_for_test(spool: &Spool, account: &Pk, now: u64) -> crate::Res
         peer_events: read(&[]),
         peer: read(&uses),
     })
+}
+
+/// What the fleet's shared files say of the limits each Mac's spool took in
+/// ([`fold_limits_for_test`]).
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FoldedLimits {
+    /// Each `ai/usage` row by its key (`<pk>.<uuid32>`): each Mac's as its flusher states it,
+    /// and each older build's as given.
+    pub usage: std::collections::BTreeMap<String, aterm_json::Value>,
+    /// Each `ai/limits` row the fold makes of them, by its key, as its values.
+    pub limits: std::collections::BTreeMap<String, aterm_json::Value>,
+    /// What rotation reads of those `ai/limits` rows, an older build's row in place of its key's
+    /// ([`fold_limits_for_test`]'s `older_limits`).
+    pub rotation: crate::file::Rotation,
+}
+
+/// Test seam for the harness's side (`aterm-agent`'s accounts, whose rotation reads `ai/limits`
+/// through `aterm_db::file::Rotation`): run the local half of two flusher passes over each Mac's
+/// spool (`macs`, each by its Commons uuid, 32 hex) at `now`, as [`fold_signin_for_test`] does;
+/// state each account's `usage` row as that Mac's book does ([`book::Book::usages_due`]), held
+/// to the guard the flusher writes through ([`mine::checked`]); project each, and each row of
+/// `older` (rows an older build wrote, by key), as a pass projects the ring's rows
+/// (`file::materialize`); fold them into `ai/limits` as a pass does
+/// ([`crate::file::limits::fold`]), each computed cell held to the guards a pass writes them
+/// through (`file::materialize::guard_computed`); and read those rows as rotation does
+/// ([`crate::file::Rotation`]'s walls), each row of `older_limits` (an `ai/limits` row an older
+/// build's materializer wrote, by key, as its values) in place of this build's row of that key,
+/// as rotation reads the file whichever build last wrote it.
+///
+/// # Errors
+/// A spool, outbox or book cannot be read or written, or a Mac's `usage` row breaks the guard.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub fn fold_limits_for_test(
+    macs: &[(&str, &Spool)],
+    older: &[(&str, aterm_json::Value)],
+    older_limits: &[(&str, aterm_json::Value)],
+    now: u64,
+) -> crate::Result<FoldedLimits> {
+    use crate::file::limits;
+    let mut folded = FoldedLimits::default();
+    for (uuid, spool) in macs {
+        flush::take_in(spool, false, now)?;
+        let (book, _) = flush::take_in(spool, false, now)?;
+        for (pk, row) in book.usages_due(1, now / book::WEEK, now) {
+            mine::checked(&USAGE, &row)?;
+            folded.usage.insert(format!("{}.{uuid}", pk.as_str()), row);
+        }
+    }
+    for (key, row) in older {
+        folded.usage.insert((*key).to_owned(), row.clone());
+    }
+    let readings: Vec<limits::Reading> = folded
+        .usage
+        .iter()
+        .filter_map(|(key, row)| crate::file::materialize::ring_row(&USAGE, key, row))
+        .filter_map(|row| limits::Reading::of_row(&row))
+        .collect();
+    let rows: Vec<aterm_file::Row> = limits::fold(&readings, &limits::Seats::default())
+        .iter()
+        .map(|(pk, limit)| {
+            let mut row = limit.row(pk, None, None);
+            crate::file::materialize::guard_computed(&mut row);
+            row
+        })
+        .collect();
+    let read: Vec<aterm_file::Row> = rows
+        .iter()
+        .filter(|row| older_limits.iter().all(|(pk, _)| *pk != row.pk))
+        .cloned()
+        .chain(older_limits.iter().map(|(pk, values)| aterm_file::Row {
+            pk: (*pk).to_owned(),
+            live: true,
+            values: values.as_object().cloned().unwrap_or_default(),
+            ..aterm_file::Row::default()
+        }))
+        .collect();
+    folded.rotation.limits(&read);
+    folded.limits = rows
+        .into_iter()
+        .map(|row| (row.pk, aterm_json::Value::Object(row.values)))
+        .collect();
+    Ok(folded)
 }
 
 /// What this Mac would publish of one account's plan after what `spool` took in

@@ -16,6 +16,7 @@ use aterm_uds::lan::{ConnectOptions, LanError, Seam, UdpOptions, Unavailable, br
 
 use crate::bonjour::{Bonjour, Live};
 use crate::server::{Admission, Failure, MAX_LIVE, Server, not_admitted, prepare};
+use crate::store::Store;
 
 /// A hang detector, never a latency budget.
 const MUST_HAPPEN: Duration = Duration::from_secs(60);
@@ -109,7 +110,9 @@ fn serve(seam: Seam) -> (Seam, aterm_tempfile::TempDir, mpsc::Receiver<Started>)
         Server::bind(
             &socket,
             Admission::SameUid,
+            None,
             Box::new(Fake(Mutex::new(started))),
+            Store::Unserved,
         )
         .unwrap()
     });
@@ -573,6 +576,7 @@ fn an_admitted_native_request_survives_scheduling_delay() {
         let shared = crate::server::Shared::new(
             Admission::SameUid,
             Box::new(Fake(Mutex::new(send))),
+            Store::Unserved,
             |words| eprintln!("native request: {words}"),
         );
         wire::send(
@@ -764,7 +768,9 @@ fn the_broker_counts_each_connection_once_by_how_it_ended() {
                     _ => Ok(()),
                 }),
             }),
+            None,
             Box::new(Fake(Mutex::new(started))),
+            Store::Unserved,
         )
         .unwrap()
     });
@@ -1091,7 +1097,9 @@ fn a_connection_admitted_by_code_is_counted_with_its_check() {
         Server::bind(
             &socket,
             Admission::Code(Arc::new(identity)),
+            None,
             Box::new(Fake(Mutex::new(started))),
+            Store::Unserved,
         )
         .unwrap()
     });
@@ -1150,5 +1158,261 @@ fn a_connection_admitted_by_code_is_counted_with_its_check() {
             std::process::id()
         )),
         "{file}"
+    );
+}
+
+/// A fixture Spotlight store: a volume root holding `.Spotlight-V100` with folders, files of
+/// known lengths and a link to a large file outside it, and every path in it with what `lstat`
+/// reads of it.
+fn spotlight_fixture(
+    root: &std::path::Path,
+) -> (
+    std::path::PathBuf,
+    Vec<(std::path::PathBuf, std::fs::Metadata)>,
+) {
+    let store = root.join(crate::store::STORE_NAME);
+    let shard = store.join("Store-V2").join("0A1B2C3D");
+    std::fs::create_dir_all(&shard).unwrap();
+    std::fs::create_dir_all(store.join("VolumeConfiguration")).unwrap();
+    std::fs::write(shard.join("0.indexHead"), vec![7u8; 10_000]).unwrap();
+    std::fs::write(shard.join("live.0.indexIds"), vec![7u8; 100_000]).unwrap();
+    std::fs::write(store.join("VolumeConfiguration.plist"), b"<plist/>").unwrap();
+    // A link out of the store, to a file far larger than it: counted as the link, never followed.
+    let outside = root.join("outside.bin");
+    std::fs::write(&outside, vec![1u8; 1 << 20]).unwrap();
+    std::os::unix::fs::symlink(&outside, store.join("Store-V2").join("elsewhere")).unwrap();
+    let mut paths = vec![store.clone()];
+    let mut i = 0;
+    while i < paths.len() {
+        if std::fs::symlink_metadata(&paths[i]).unwrap().is_dir() {
+            let mut inside: Vec<_> = std::fs::read_dir(&paths[i])
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            inside.sort();
+            paths.extend(inside);
+        }
+        i += 1;
+    }
+    let read = paths
+        .into_iter()
+        .map(|p| {
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            (p, m)
+        })
+        .collect();
+    (store, read)
+}
+
+/// THE SPOTLIGHT STORE (SD-94): the broker answers each volume's Spotlight store size from its
+/// own list of store folders, by a bounded walk that writes nothing. A fixture store, named by
+/// the walker's injected roots and never by the request, reads its entries' allocated bytes
+/// whole, the link out of it counted as itself; a volume with no store is not listed. Asked
+/// again within ten minutes it answers the kept walk, and once ten minutes pass it walks again.
+/// The walk leaves every entry as it was. A request that carries a path is refused unread and
+/// walks nothing, as is a peer the broker does not admit. A walk that reaches its most entries,
+/// or its longest time, is answered partial with what it counted, never as the whole store.
+///
+/// Negative controls: follow links in the walk (no `AtFlags::SYMLINK_NOFOLLOW` in `walk_one`'s
+/// `fstatat`: the outside file's megabyte is counted); drop the kept answer (`fresh` always
+/// false: two walks where one is kept); shorten the cadence (`every` a millisecond: the ask just
+/// under ten minutes walks again); let the entry bound pass (`Budget::take` never
+/// `Err(Entries)`: the bounded walk reads whole).
+#[test]
+fn the_broker_answers_the_spotlight_stores_size_read_only_and_bounded() {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use aterm_keeper::identity::CheckError;
+    use aterm_uds::lan::wire::{self, Frame, StoreBound, StoreVolume};
+
+    use crate::counts::Count;
+    use crate::store::{Bounds, MAX_WALK, WALK_EVERY};
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let volume = root.path().join("Fixture");
+    let bare = root.path().join("Bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let (store, before) = spotlight_fixture(&volume);
+    let whole_bytes: u64 = before.iter().map(|(_, m)| m.blocks() * 512).sum();
+    let whole_entries = u64::try_from(before.len()).unwrap();
+    assert!(
+        whole_bytes >= 110_000,
+        "CONTROL: the fixture holds its files"
+    );
+    assert!(whole_bytes < 1 << 20, "CONTROL: the outside file is larger");
+
+    let now = Arc::new(Mutex::new(Instant::now()));
+    let clock: Box<dyn Fn() -> Instant + Send + Sync> = {
+        let now = Arc::clone(&now);
+        Box::new(move || *now.lock().unwrap())
+    };
+    let roots = {
+        let (volume, bare) = (volume.clone(), bare.clone());
+        move || {
+            Some(vec![
+                ("/Volumes/Fixture".to_owned(), volume.clone()),
+                ("/Volumes/Bare".to_owned(), bare.clone()),
+            ])
+        }
+    };
+    let served = std::sync::atomic::AtomicUsize::new(0);
+    let serve_store =
+        |admission: Admission, bounds: Bounds, clock: Box<dyn Fn() -> Instant + Send + Sync>| {
+            let n = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let socket = root.path().join(format!("run{n}")).join("broker.sock");
+            let (started, _starts) = mpsc::channel();
+            let server = Server::bind(
+                &socket,
+                admission,
+                None,
+                Box::new(Fake(Mutex::new(started))),
+                Store::walked(Box::new(roots.clone()), bounds, clock),
+            )
+            .unwrap();
+            let shared = Arc::clone(&server.shared);
+            std::thread::spawn(move || {
+                let _ = server.run();
+            });
+            let seam = Seam {
+                socket: Some(socket),
+                ..Seam::default()
+            };
+            (seam, shared)
+        };
+
+    // The fixture's size, whole: the walk's own folder, every entry in it, and the link as
+    // itself.
+    let (seam, shared) = serve_store(Admission::SameUid, Bounds::BROKER, clock);
+    let ask = |seam: &Seam| seam_here(seam.clone(), broker::spotlight_stores);
+    let walks = |shared: &crate::server::Shared| shared.counts.get(Count::StoreWalks);
+    let first = ask(&seam).unwrap();
+    assert_eq!(
+        first.volumes,
+        [StoreVolume {
+            volume: "/Volumes/Fixture".into(),
+            bytes: whole_bytes,
+            entries: whole_entries,
+            partial: None,
+        }]
+    );
+    assert_eq!(walks(&shared), 1);
+    // Kept between walks: asked again, up to the last millisecond of ten minutes, the same walk
+    // answers, its age the time since; at ten minutes it walks again.
+    let again = ask(&seam).unwrap();
+    assert_eq!((again.volumes, walks(&shared)), (first.volumes.clone(), 1));
+    let just_under = WALK_EVERY - std::time::Duration::from_millis(1);
+    *now.lock().unwrap() += just_under;
+    let kept = ask(&seam).unwrap();
+    assert_eq!(
+        (kept.volumes, kept.age_ms, walks(&shared)),
+        (
+            first.volumes.clone(),
+            u64::try_from(just_under.as_millis()).unwrap(),
+            1
+        ),
+        "under ten minutes the kept walk answers"
+    );
+    *now.lock().unwrap() += std::time::Duration::from_millis(1);
+    let walked = ask(&seam).unwrap();
+    assert_eq!(walked.volumes, first.volumes);
+    assert_eq!(walked.age_ms, 0);
+    assert_eq!(walks(&shared), 2, "ten minutes on, it walks again");
+
+    // Read-only: every entry is as it was, and nothing was added.
+    for (path, was) in &before {
+        let is = std::fs::symlink_metadata(path).unwrap();
+        assert_eq!(
+            (was.len(), was.modified().unwrap(), was.ino()),
+            (is.len(), is.modified().unwrap(), is.ino()),
+            "{}",
+            path.display()
+        );
+    }
+    let entries_now = |dir: &std::path::Path| std::fs::read_dir(dir).unwrap().count();
+    assert_eq!(entries_now(&store), 3);
+    assert_eq!(entries_now(&volume), 2);
+
+    // A request that names a path, a write's target or a read's, is no request: refused before
+    // it is read, its connection closed with no answer, nothing walked.
+    let mut asked = wire::encode(&Frame::Request(Request::SpotlightStore)).unwrap();
+    asked.extend_from_slice(b"/etc/sudoers");
+    let body = u32::try_from(asked.len() - 4).unwrap();
+    asked[..4].copy_from_slice(&body.to_be_bytes());
+    assert!(wire::decode(&asked[4..]).is_err());
+    let hello = wire::encode(&Frame::Hello {
+        protocol: aterm_uds::lan::PROTOCOL,
+        build: "law".into(),
+    })
+    .unwrap();
+    let mut raw = aterm_uds::connect::until(
+        seam.socket.as_deref().unwrap(),
+        Instant::now() + MUST_HAPPEN,
+    )
+    .unwrap();
+    raw.write_all(&[hello, asked].concat()).unwrap();
+    raw.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reader = wire::Reader::new(0);
+    let deadline = Some(Instant::now() + MUST_HAPPEN);
+    assert!(matches!(
+        reader.frame(&raw, deadline).unwrap(),
+        Some(Frame::Hello { .. })
+    ));
+    assert_eq!(reader.frame(&raw, deadline).unwrap(), None);
+    assert_eq!(walks(&shared), 2, "a refused request walks nothing");
+    assert_eq!(shared.counts.get(Count::SpotlightStore), 4);
+
+    // A peer the broker does not admit is told so and walks nothing.
+    let (refusing, refused_shared) = serve_store(
+        Admission::Scripted(crate::server::Scripted {
+            token: Box::new(|_| None),
+            full_check: Box::new(|_| Err(CheckError::Refused("not aterm's code".into()))),
+        }),
+        Bounds::BROKER,
+        Box::new(Instant::now),
+    );
+    assert!(matches!(
+        ask(&refusing),
+        Err(LanError::Unavailable(Unavailable::Refused(_)))
+    ));
+    assert_eq!(walks(&refused_shared), 0);
+
+    // At its most entries the walk stops and says so: what it counted, a lower bound.
+    let (bounded, _) = serve_store(
+        Admission::SameUid,
+        Bounds {
+            entries: 2,
+            time: MAX_WALK,
+        },
+        Box::new(Instant::now),
+    );
+    let cut = ask(&bounded).unwrap();
+    assert_eq!(cut.volumes.len(), 1);
+    let cut = &cut.volumes[0];
+    assert_eq!(
+        (cut.entries, cut.partial),
+        (2, Some(StoreBound::Entries)),
+        "{cut:?}"
+    );
+    assert!(cut.bytes < whole_bytes, "{cut:?}");
+    // At its longest time likewise: here none, so nothing is counted, and it says so.
+    let (timed, _) = serve_store(
+        Admission::SameUid,
+        Bounds {
+            entries: u64::MAX,
+            time: std::time::Duration::ZERO,
+        },
+        Box::new(Instant::now),
+    );
+    let timed = ask(&timed).unwrap();
+    assert_eq!(
+        timed.volumes,
+        [StoreVolume {
+            volume: "/Volumes/Fixture".into(),
+            bytes: 0,
+            entries: 0,
+            partial: Some(StoreBound::Time),
+        }]
     );
 }

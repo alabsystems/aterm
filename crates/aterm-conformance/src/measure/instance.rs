@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 use aterm_uds::spawnfd;
 
+#[path = "instance_functional.rs"]
+mod functional;
+
 /// A wait for something that must happen: a hang detector, never a latency budget.
 pub const MUST_HAPPEN: Duration = Duration::from_secs(60);
 
@@ -101,6 +104,13 @@ pub fn unanswered<T>(why: impl Into<String>) -> Result<T, CouldNotRun> {
 pub struct Budget {
     ends: Instant,
     secs: u64,
+}
+
+/// A finite performance take or a functional check held only to native process progress.
+#[derive(Clone, Copy, Debug)]
+enum WaitPolicy {
+    Take(Budget),
+    Functional,
 }
 
 impl Budget {
@@ -216,53 +226,72 @@ impl Budget {
         what: &str,
         gap: Duration,
         seams: Progress<'_>,
-        mut probe: impl FnMut() -> Option<T>,
+        probe: impl FnMut() -> Option<T>,
     ) -> Result<T, CouldNotRun> {
-        let Progress {
-            now,
-            runs,
-            read,
-            pause,
-        } = seams;
-        // The minute's start: the last reading at which the tree had advanced or did not compare.
-        let mut worked_at = now();
-        let mut seen = None;
-        let mut read_at: Option<Instant> = None;
-        loop {
-            if let Some(value) = probe() {
-                return Ok(value);
-            }
-            let at = now();
-            if at >= self.ends {
-                return Err(self.spent(&format!("the wait for {what}")));
-            }
-            if read_at.is_none_or(|last| at.saturating_duration_since(last) >= WORK_TICK) {
-                read_at = Some(at);
-                if !runs() {
-                    // What it did as it ended may be the answer.
-                    return probe().ok_or_else(|| {
-                        CouldNotRun::Refused(format!("the subject ended before {what}"))
-                    });
-                }
-                match read() {
-                    Some(generation) if seen == Some(generation) => {}
-                    reading => {
-                        seen = reading;
-                        worked_at = at;
-                    }
-                }
-                if at.saturating_duration_since(worked_at) >= MUST_HAPPEN {
-                    return Err(CouldNotRun::Refused(format!(
-                        "{what} did not happen, and the subject and its descendants made no CPU \
-                         or I/O progress for {MUST_HAPPEN:?}"
-                    )));
-                }
-            }
-            pause(
-                gap.min(self.ends.saturating_duration_since(at))
-                    .max(Duration::from_millis(1)),
-            );
+        working(Some(*self), what, gap, seams, probe)
+    }
+}
+
+/// The shared progress wait; a functional check supplies no total wall-clock deadline.
+fn working<T>(
+    budget: Option<Budget>,
+    what: &str,
+    gap: Duration,
+    seams: Progress<'_>,
+    mut probe: impl FnMut() -> Option<T>,
+) -> Result<T, CouldNotRun> {
+    let Progress {
+        now,
+        runs,
+        read,
+        pause,
+    } = seams;
+    // The minute's start: the last reading at which the tree had advanced or did not compare.
+    // None cannot qualify a hang: unread and legitimately incomparable native snapshots
+    // share that result, so both disarm it and start a fresh observation baseline.
+    let mut worked_at = now();
+    let mut seen = None;
+    let mut read_at: Option<Instant> = None;
+    loop {
+        if let Some(value) = probe() {
+            return Ok(value);
         }
+        let at = now();
+        if let Some(budget) = budget
+            && at >= budget.ends
+        {
+            return Err(budget.spent(&format!("the wait for {what}")));
+        }
+        if read_at.is_none_or(|last| at.saturating_duration_since(last) >= WORK_TICK) {
+            if !runs() {
+                // What it did as it ended may be the answer.
+                return probe().ok_or_else(|| {
+                    CouldNotRun::Refused(format!("the subject ended before {what}"))
+                });
+            }
+            let reading = read();
+            let at = now();
+            read_at = Some(at);
+            match reading {
+                Some(generation) if seen == Some(generation) => {}
+                reading => {
+                    seen = reading;
+                    worked_at = at;
+                }
+            }
+            if at.saturating_duration_since(worked_at) >= MUST_HAPPEN {
+                return Err(CouldNotRun::Refused(format!(
+                    "{what} did not happen, and the subject and its descendants made no CPU \
+                         or I/O progress for {MUST_HAPPEN:?}"
+                )));
+            }
+        }
+        let at = now();
+        pause(
+            budget
+                .map_or(gap, |b| gap.min(b.ends.saturating_duration_since(at)))
+                .max(Duration::from_millis(1)),
+        );
     }
 }
 
@@ -558,7 +587,7 @@ impl Instance {
     /// # Errors
     /// The launch failed, the instance exited before it listened (its log tail is in the reason), or it never listened.
     pub fn launch(bin: &Path, world: &World, budget: Budget) -> Result<Self, CouldNotRun> {
-        Self::start(bin, world, budget, Face::Headless, false)
+        Self::start(bin, world, WaitPolicy::Take(budget), Face::Headless, false)
     }
 
     /// Canonical headless launch with an explicitly requested read-only recording diagnostic.
@@ -572,7 +601,13 @@ impl Instance {
         budget: Budget,
         cost_probe: bool,
     ) -> Result<Self, CouldNotRun> {
-        Self::start(bin, world, budget, Face::Headless, cost_probe)
+        Self::start(
+            bin,
+            world,
+            WaitPolicy::Take(budget),
+            Face::Headless,
+            cost_probe,
+        )
     }
 
     /// [`Instance::launch`] with a window: AppKit's loop and its proxies, which `--headless`
@@ -584,13 +619,22 @@ impl Instance {
     /// # Errors
     /// As [`Instance::launch`].
     pub fn launch_windowed(bin: &Path, world: &World, budget: Budget) -> Result<Self, CouldNotRun> {
-        Self::start(bin, world, budget, Face::Windowed, false)
+        Self::start(bin, world, WaitPolicy::Take(budget), Face::Windowed, false)
+    }
+
+    /// Launch an ordinary production window for a functional check. The caller must retain
+    /// its resource/window admission through [`Self::finish`]. Startup and control calls have
+    /// no latency budget: they follow the owned subject's native CPU/I/O progress.
+    /// # Errors
+    /// As [`Self::launch`], or the original subject's identity cannot be observed.
+    pub fn launch_windowed_functional(bin: &Path, world: &World) -> Result<Self, CouldNotRun> {
+        Self::start(bin, world, WaitPolicy::Functional, Face::Windowed, false)
     }
 
     fn start(
         bin: &Path,
         world: &World,
-        budget: Budget,
+        policy: WaitPolicy,
         face: Face,
         cost_probe: bool,
     ) -> Result<Self, CouldNotRun> {
@@ -627,6 +671,11 @@ impl Instance {
             }
         };
         cmd.arg("--control-sock").arg(&world.sock);
+        if matches!(policy, WaitPolicy::Functional) {
+            // The checked functional stop retains this unreaped leader while settling its
+            // original group. Performance takes keep their existing process-group policy.
+            cmd.process_group(0);
+        }
         let child = cmd
             .spawn()
             .map_err(|e| CouldNotRun::Refused(format!("cannot launch {}: {e}", bin.display())))?;
@@ -639,20 +688,33 @@ impl Instance {
                 bin: bin.to_path_buf(),
                 sock: world.sock.clone(),
                 home: world.home.clone(),
-                budget,
+                policy,
+                subject: None,
             },
             band,
         };
+        inst.ctl.subject = i32::try_from(inst.pid())
+            .ok()
+            .and_then(aterm_uds::process::read_identity);
+        if matches!(policy, WaitPolicy::Functional) && inst.ctl.subject.is_none() {
+            return could_not_run("the original functional subject's identity is unreadable");
+        }
         let sock = world.sock.clone();
-        let connect_deadline = (Instant::now() + MUST_HAPPEN).min(budget.ends);
-        budget.await_event("the control socket listening", || {
-            if let Ok(Some(status)) = inst.child.try_wait() {
-                return Some(Err(status));
-            }
-            aterm_uds::connect::until(&sock, connect_deadline)
-                .is_ok()
-                .then_some(Ok(()))
-        })?
+        let pid = inst.pid();
+        functional::await_event(
+            policy.budget(),
+            pid,
+            inst.ctl.subject,
+            "the control socket listening",
+            || {
+                if let Ok(Some(status)) = inst.child.try_wait() {
+                    return Some(Err(status));
+                }
+                aterm_uds::connect::until(&sock, Instant::now() + POLL_GAP)
+                    .is_ok()
+                    .then_some(Ok(()))
+            },
+        )?
         .map_err(|status| {
             CouldNotRun::Refused(format!(
                 "the instance exited ({status}) before its control socket listened; log tail:\n{}",
@@ -661,6 +723,17 @@ impl Instance {
         })?;
         inst.ctl.ok(&["ready"])?;
         Ok(inst)
+    }
+
+    /// Positively reap this original instance and retire every helper whose original identity
+    /// a complete pre-stop child inventory returned. This establishes no universal receipt
+    /// for arbitrary later or reparented descendants. Keep caller-owned admission until it
+    /// returns; a cleanup error cannot qualify a successful functional row.
+    /// # Errors
+    /// The original child or its helper inventory is unproven, or any enumerated helper's
+    /// retirement cannot be established. Drop still makes its ordinary best-effort cleanup.
+    pub fn finish(mut self) -> Result<usize, CouldNotRun> {
+        functional::finish(&mut self.child)
     }
 
     /// The instance's process id.
@@ -822,29 +895,47 @@ pub struct Ctl {
     bin: PathBuf,
     sock: PathBuf,
     home: PathBuf,
-    budget: Budget,
+    policy: WaitPolicy,
+    subject: Option<aterm_uds::process::Identity>,
+}
+
+impl WaitPolicy {
+    fn budget(self) -> Option<Budget> {
+        match self {
+            Self::Take(budget) => Some(budget),
+            Self::Functional => None,
+        }
+    }
 }
 
 impl Ctl {
     /// This client's take-wide deadline.
-    pub(super) fn budget(&self) -> Budget {
-        self.budget
+    pub(super) fn take_budget(&self) -> Result<Budget, CouldNotRun> {
+        self.policy.budget().ok_or_else(|| {
+            CouldNotRun::Refused(
+                "a functional control client supplies no performance-take budget".into(),
+            )
+        })
     }
 
-    /// Run `bin ctl --sock <sock> --timeout <secs> <args…>` and collect it within the take's budget.
+    /// Run `bin ctl --sock <sock> --timeout <secs> <args…>`. Performance calls keep their
+    /// take-wide budget; functional calls collect complete bounded output while the owned
+    /// subject and client make native process progress.
     #[must_use]
     pub fn call(&self, args: &[&str]) -> Reply {
-        let Some(left) = self.budget.left() else {
+        let budget = self.policy.budget();
+        if let Some(budget) = budget
+            && budget.left().is_none()
+        {
             return Reply {
                 code: None,
                 stdout: String::new(),
-                stderr: self
-                    .budget
-                    .spent(&format!("ctl {}", args.join(" ")))
-                    .to_string(),
+                stderr: budget.spent(&format!("ctl {}", args.join(" "))).to_string(),
             };
-        };
-        let timeout = left.as_secs().saturating_add(1).min(CTL_TIMEOUT_SECS);
+        }
+        let timeout = budget.and_then(|b| b.left()).map_or(0, |left| {
+            left.as_secs().saturating_add(1).min(CTL_TIMEOUT_SECS)
+        });
         let mut command = spawnfd::command(&self.bin);
         command
             .env_clear()
@@ -858,7 +949,15 @@ impl Ctl {
             .args(args)
             .stdin(spawnfd::Stdio::null());
         static GATE: aterm_uds::deadline::Gate = aterm_uds::deadline::Gate::new("measure-ctl");
-        let out = command_until(command, self.budget.ends, &GATE);
+        let out = match self.policy {
+            WaitPolicy::Take(budget) => command_until(command, budget.ends, &GATE),
+            WaitPolicy::Functional => self
+                .subject
+                .ok_or_else(|| {
+                    CouldNotRun::Refused("the functional subject has no original identity".into())
+                })
+                .and_then(|subject| functional::output(&mut command, subject)),
+        };
         match out {
             Ok(out) => Reply {
                 code: out.status.code(),
@@ -881,8 +980,10 @@ impl Ctl {
         let reply = self.call(args);
         if reply.ok() {
             Ok(reply.line().to_string())
-        } else if self.budget.left().is_none() {
-            Err(self.budget.spent(&format!("ctl {}", args.join(" "))))
+        } else if let Some(budget) = self.policy.budget()
+            && budget.left().is_none()
+        {
+            Err(budget.spent(&format!("ctl {}", args.join(" "))))
         } else if let Some(refusal) = reply.refuses_verb(args.first().copied().unwrap_or_default())
         {
             unanswered(format!(
@@ -908,7 +1009,15 @@ impl Ctl {
         what: &str,
         probe: impl FnMut() -> Option<T>,
     ) -> Result<T, CouldNotRun> {
-        self.budget.await_event(what, probe)
+        match self.policy {
+            WaitPolicy::Take(budget) => budget.await_event(what, probe),
+            WaitPolicy::Functional => {
+                let subject = self.subject.ok_or_else(|| {
+                    CouldNotRun::Refused("the functional subject has no original identity".into())
+                })?;
+                functional::await_event(None, subject.pid as u32, Some(subject), what, probe)
+            }
+        }
     }
 
     /// The `key=value` field `key` of a request's first line.

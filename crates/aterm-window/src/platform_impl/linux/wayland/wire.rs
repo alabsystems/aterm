@@ -148,6 +148,27 @@ impl Inbox {
         self.sink(move |event| Wire::Source { selection, source, event })
     }
 
+    /// A one-shot marker on the same queue as the seat; all focus updates emitted
+    /// before the compositor answers the display sync precede this marker in the inbox.
+    pub(crate) fn outside_release_barrier(
+        &self,
+        queue: &aterm_wayland::proxy::Queue,
+        id: super::outside_release::ReleaseId,
+    ) -> Option<Owned> {
+        use aterm_wayland::protocols::wayland::{wl_callback, wl_display};
+        let wrapper = queue.display_wrapper().ok()?;
+        // SAFETY: the wrapper is a live display proxy assigned to this queue.
+        let proxy = unsafe { wl_display::sync(wrapper.proxy()) }?;
+        // SAFETY: this fresh, owned callback has no listener. wl_callback.done carries
+        // one uint, and callback objects have no destructor request.
+        let callback = unsafe {
+            Owned::listened(proxy, Proxy::destroy, self, move |_, opcode, _| {
+                (opcode == wl_callback::evt::DONE).then_some(Wire::OutsideReleaseDone(id))
+            })
+        };
+        callback.listener.is_some().then_some(callback)
+    }
+
     /// Everything heard since the last take, in order.
     pub(crate) fn take(&self) -> Vec<Wire> {
         std::mem::take(&mut *self.wire_book.lock().unwrap_or_else(PoisonError::into_inner))
@@ -157,6 +178,8 @@ impl Inbox {
 /// One event of an object the backend made.
 #[derive(Debug)]
 pub(crate) enum Wire {
+    /// The compositor processed a sync request following a pointer release.
+    OutsideReleaseDone(super::outside_release::ReleaseId),
     /// The window's `xdg_toplevel`, `xdg_surface` or toplevel decoration.
     Toplevel { window: WindowId, event: ToplevelEvent },
     /// A `wl_surface` of the backend's own: a window's, or a pointer's cursor surface.

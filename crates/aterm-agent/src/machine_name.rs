@@ -164,7 +164,8 @@ pub struct RegistryName {
 pub enum RegistryNameRead {
     /// No live registry machine row binds this Mac; existing fallback sources apply.
     Unbound,
-    /// The registry may name this Mac but its projection is unavailable.
+    /// The registry may name this Mac but its projection is unavailable: the first name is made
+    /// as [`Self::Unbound`]'s is, and the registry's row replaces it once read.
     Pending,
     /// A live row binds this Mac; its name is either valid or unavailable for the stated reason.
     Bound(Result<RegistryName, String>),
@@ -176,7 +177,15 @@ pub enum RegistryNameRead {
 ///
 /// A valid bound registry machine row supplies the name first, as a seeded local mirror with
 /// no pending book migration. Its nickname retains its provenance, or a null nickname draws a
-/// local automatic noun. A pending registry projection or invalid bound name stops creation.
+/// local automatic noun. An invalid bound name stops creation. A registry not read yet names
+/// this Mac as no binding does, with one log line saying so, and marks the name made unread
+/// ([`file::MachineName::registry_unread`]): the first later read that finds the registry
+/// settles it as a first read then would have ([`settled`]), the bound row's number and
+/// nickname replacing it whoever wrote them (an import, a registration or a person), with one
+/// log line (the row's own history keeps who wrote it, [`history`]), and a read that finds no
+/// row binding this Mac keeping it. A change made meanwhile (a rename, a nickname, an undo, a
+/// followed number or nickname) makes the name this Mac's own
+/// ([`file::MachineName::made_own`]), which no registry read replaces as a first name.
 /// Without a binding, the roster's bare NAME wins, then an older `fleet-name`'s bare NAME,
 /// else `unnumbered` and a noun `in_use` does not name, drawn. A word-valued `fleet-name` supplies its
 /// chosen nickname. Legacy numbering is seeded at the implied rank with migration pending.
@@ -223,15 +232,20 @@ fn ensure_from(
     now_ms: u64,
 ) -> io::Result<(MachineName, Origin)> {
     if let Some(name) = file::read(state)? {
-        return Ok((name, Origin::Kept));
+        // Only a name made while the registry was unread asks it again ([`settled`]).
+        if !name.registry_unread {
+            return Ok((name, Origin::Kept));
+        }
+        return settled(state, name, registry(), now_ms);
     }
     // Preparing a first name can read the vault's roster. Do that before taking the name lock:
     // fleet writers acquire vault before book, and edits acquire book before name.
-    let prepared = match registry() {
-        RegistryNameRead::Unbound => first(state, roster, in_use, now_ms),
-        RegistryNameRead::Pending => Err(io::Error::other(
-            "the lab registry's machine name is not available yet",
-        )),
+    let registry = registry();
+    let unread = matches!(registry, RegistryNameRead::Pending);
+    let prepared = match registry {
+        RegistryNameRead::Unbound | RegistryNameRead::Pending => {
+            first(state, roster, in_use, now_ms)
+        }
         RegistryNameRead::Bound(Err(why)) => Err(io::Error::other(format!(
             "the registry machine name is unavailable: {why}"
         ))),
@@ -239,11 +253,95 @@ fn ensure_from(
     };
     let mut origin = Origin::Kept;
     let (name, created) = file::read_or_create(state, || {
-        let (candidate, source) = prepared?;
+        let (mut candidate, source) = prepared?;
         origin = source;
+        candidate.registry_unread = unread;
         Ok(candidate)
     })?;
+    if created && unread {
+        aterm_log::info!(
+            "machine name: {} was made while the lab registry was unread; its row replaces it once \
+             read",
+            name.title()
+        );
+    }
     Ok((name, if created { origin } else { Origin::Kept }))
+}
+
+/// `held`, a name made while the registry was unread ([`file::MachineName::registry_unread`]),
+/// once `read`, this read of the registry, settles it, as the first read would have had it
+/// found the registry: a bound row's number and nickname replace it whoever wrote them, a label
+/// an import or a registration wrote included, which [`follow_number`] and [`follow_registry`]
+/// leave alone ([`Origin::Registry`], logged; who wrote the row is the row's own history,
+/// [`history`]); a row with no nickname leaves the nickname `held` has, which no one need draw
+/// again. A read that finds no row binding this Mac keeps the name, now an unbound Mac's
+/// ([`Origin::Kept`]); one still pending, or a bound row whose name is invalid, leaves it marked
+/// for a later read. The change is made under the name lock, where nothing changed the name
+/// since it was made.
+///
+/// # Errors
+/// The name lock cannot be taken, or the file read or replaced ([`file::replace`]).
+fn settled(
+    state: &Path,
+    held: MachineName,
+    read: RegistryNameRead,
+    now_ms: u64,
+) -> io::Result<(MachineName, Origin)> {
+    let row = match read {
+        RegistryNameRead::Pending | RegistryNameRead::Bound(Err(_)) => {
+            return Ok((held, Origin::Kept));
+        }
+        RegistryNameRead::Unbound => None,
+        RegistryNameRead::Bound(Ok(row)) => Some(row),
+    };
+    let mut origin = Origin::Kept;
+    let name = file::replace(state, |stored| {
+        if !stored.registry_unread {
+            return Ok(());
+        }
+        let Some(row) = &row else {
+            stored.registry_unread = false;
+            return Ok(());
+        };
+        let mut next = stored.clone();
+        next.registry_unread = false;
+        next.num = Some(row.num);
+        next.class = Class::Seeded;
+        next.since = IMPLIED_SINCE;
+        next.migration = None;
+        next.row = file::RowSeen::Saw(match &row.nick {
+            Some((nick, NickClass::Chosen)) => Some(nick.clone()),
+            _ => None,
+        });
+        if let Some((nick, class)) = &row.nick {
+            next.nick = nick.clone();
+            next.nick_class = *class;
+        }
+        // As the first read that found the row would have, `was` keeps no alias of the number made
+        // meanwhile: it may be another Mac's (a stale roster label).
+        if next.num != stored.num {
+            next.prev = stored.num;
+            next.act = now_ms;
+        }
+        if (next.num, &next.nick, next.nick_class) != (stored.num, &stored.nick, stored.nick_class)
+        {
+            next.rev = stored
+                .rev
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("the name revision is exhausted"))?;
+            origin = Origin::Registry;
+        }
+        *stored = next;
+        Ok(())
+    })?;
+    if origin == Origin::Registry {
+        aterm_log::info!(
+            "machine name: {} taken from the lab registry's row, in place of the name made while \
+             it was unread",
+            name.title()
+        );
+    }
+    Ok((name, origin))
 }
 
 /// Take the nickname a person or a program wrote to this Mac's own `lab/machines` row from any
@@ -306,7 +404,7 @@ fn followed(held: &MachineName, row: Option<&Nickname>) -> Option<MachineName> {
     let looked = held.row != file::RowSeen::Never || held.nick_class == NickClass::Auto;
     let mut next = match row {
         Some(row) if looked && held.nick != *row => {
-            renicked(held, row.clone()).unwrap_or_else(|| held.clone())
+            renicked(held, row.clone()).map_or_else(|| held.clone(), MachineName::made_own)
         }
         _ => held.clone(),
     };
@@ -756,8 +854,12 @@ fn edit_name(
             let base = row_followed(state, stored);
             let base = base.as_ref().unwrap_or(stored);
             let mut next = edit(base, &mut locked)?;
-            // What the request changed, not what the follow did.
+            // What the request changed, not what the follow did; a change makes the name this
+            // Mac's own, which no registry read replaces as a first name ([`settled`]).
             changed = next != *base;
+            if changed {
+                next = next.made_own();
+            }
             renumbered = next.num != base.num
                 || next.class != base.class
                 || next.migration != base.migration

@@ -141,3 +141,98 @@ fn a_look_reads_one_files_identity_and_modified_time() {
         io::ErrorKind::NotFound
     );
 }
+
+/// A waiter that took the lock of a log retired while it waited takes the lock at the path
+/// instead, the one the next writer makes, so the two never hold separate locks of one log.
+/// NEGATIVE CONTROL: a lock that keeps the file it first opened returns a lock on the unlinked
+/// file, and nothing stands at the lock's path for the next writer to contend on.
+#[test]
+fn a_waiter_that_took_a_retired_lock_takes_the_one_at_its_path() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("journal");
+    append(&path, "one").unwrap();
+    let lock_path = tmp.path().join("journal.lock");
+    let mut holder = Some(lock(&path).unwrap());
+    // A separate open description pins the inode without retaining the holder's flock.
+    let retired_file = std::fs::File::open(&lock_path).unwrap();
+    let retired = identity_of(&retired_file).unwrap();
+    let (unlinked, observed) = (lock_path.clone(), path.clone());
+    // At the waiter's first contention, the holder retires the log: it unlinks the log and the
+    // lock under the lock, then lets go.
+    let waited = crate::file_lock::with_lock_wait_observer(
+        move |_| {
+            if let Some(held) = holder.take() {
+                std::fs::remove_file(&observed).unwrap();
+                std::fs::remove_file(&unlinked).unwrap();
+                drop(held);
+            }
+        },
+        || lock(&path),
+    )
+    .unwrap();
+    let locked = identity_of(waited.file()).unwrap();
+    let there = identity_at(&lock_path)
+        .ok()
+        .map(|there| (there.dev, there.ino));
+    assert_eq!(there, Some((locked.dev, locked.ino)));
+    assert_ne!((locked.dev, locked.ino), (retired.dev, retired.ino));
+    drop(retired_file);
+    // The next writer waits on that same lock: it is refused at its deadline while it is held.
+    assert_eq!(
+        append(&path, "two").unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(waited);
+    append(&path, "two").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"two\n");
+}
+
+/// `retire` removes a log and then its lock, after which the next append starts a new log; it
+/// removes a lock left without its log, and refuses anything at the log's path that is no
+/// regular file, removing nothing.
+/// NEGATIVE CONTROLS: while another holder has the lock, `retire` is refused at the lock's
+/// deadline and both files stay (a retire that skips the lock unlinks under a writer); a link at
+/// the log's path, and its target, stay.
+#[test]
+fn retire_removes_the_log_then_its_lock_and_nothing_else() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("ledger");
+    let lock_path = tmp.path().join("ledger.lock");
+    append(&path, "one").unwrap();
+    let held = lock(&path).unwrap();
+    assert_eq!(retire(&path).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert!(path.is_file() && lock_path.is_file());
+    drop(held);
+    assert!(retire(&path).unwrap());
+    assert!(!path.exists() && !lock_path.exists());
+    append(&path, "two").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"two\n");
+    assert!(lock_path.is_file());
+    std::fs::remove_file(&path).unwrap();
+    assert!(!retire(&path).unwrap());
+    assert!(!lock_path.exists());
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(
+        retire(&path).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(path.is_dir() && lock_path.is_file());
+    std::fs::remove_dir(&path).unwrap();
+    #[cfg(unix)]
+    {
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"kept\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(
+            retire(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"kept\n");
+    }
+}

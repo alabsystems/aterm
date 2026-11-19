@@ -40,7 +40,10 @@ fn stale_agent_pruners_preserve_new_retirement_debt() {
             upgrade::Agent::Codex,
         ] {
             let dir = aterm_tempfile::tempdir().unwrap();
-            let opts = drive(dir.path());
+            let opts = Opts {
+                aterm_state: Some(dir.path().join("aterm-state")),
+                ..drive(dir.path())
+            };
             let tab = "s-000000000000000000ab";
             let key = match agent {
                 upgrade::Agent::Agy => agy::key(tab),
@@ -1503,7 +1506,7 @@ fn every_phase_survives_the_state_file() {
             hold_seen_s: 1_790_000_120,
             proc_start: "Mon Sep 21 11:59:00 2026".to_string(),
             own_work_at: 1_790_000_030,
-            own_since: 1_789_996_000,
+            own: Episode::from(1_789_996_000),
             tells: 2,
             told_at: 1_790_000_010,
             told_to: "2.1.283".to_string(),
@@ -2493,6 +2496,8 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
             line,
             tap_dropped: None,
             token_dropped: None,
+            rebind: None,
+            twin_projected: None,
             line_dir: None,
             command: None,
         })
@@ -9807,8 +9812,12 @@ fn the_upgrade_owns_turn_ends_only_while_its_step_says_so() {
     }
 }
 
-/// How long the agent's own work has held the round ([`St::own_since`]): from the first look that
-/// finds it so, through every own-work wait and a tell, until a person or a limit holds it.
+/// How long the agent's own work has held the round ([`St::own`]): one episode from the first look
+/// that finds it so, through every own-work wait, aterm's own unsent line, a next point shorter
+/// than [`episode::CLEAR_GAP_S`] and a tell, until a person or a limit holds it or a clear stretch that
+/// long ends it. Over a line aterm left, only its own unsent text is no person's: a box standing on
+/// it, a person's text among aterm's and a composer the look cannot find are a person's, and the
+/// time they hold is not the agent's.
 #[test]
 fn the_own_work_hold_runs_from_its_first_look_until_a_person_or_a_limit() {
     let mut st = St::default();
@@ -9816,25 +9825,38 @@ fn the_own_work_hold_runs_from_its_first_look_until_a_person_or_a_limit() {
         ("background", 100, 100),
         ("not-idle:busy", 200, 100),
         ("status-stale", 250, 100),
+        ("left-typed:unsent", 270, 100),
+        ("next-point", 280, 100),
         ("background", 300, 100),
         ("box", 400, 0),
         ("background", 500, 500),
+        ("left-typed:box", 520, 0),
+        ("background", 540, 540),
+        ("left-typed:mixed", 560, 0),
+        ("background", 570, 570),
+        ("left-typed:no-composer", 580, 0),
+        ("background", 590, 590),
         ("limited", 600, 0),
         ("background-terminal", 700, 700),
         ("attended", 800, 0),
         ("no-shell-integration", 850, 0),
     ] {
         st.note_wait(word, at);
-        assert_eq!(st.own_since, since, "{word} at {at}");
+        assert_eq!(st.own.since, since, "{word} at {at}");
     }
     st.note_step("told:background", "busy", 900);
     assert_eq!(
-        (st.wait.as_str(), st.own_since),
+        (st.wait.as_str(), st.own.since),
         ("background", 900),
         "a tell is a look its work holds"
     );
     st.note_step("told:background", "busy", 950);
     assert_eq!(st.wait_since, 900, "the same wait, unbroken");
+    st.note_wait("next-point", 1_000);
+    st.note_wait("next-point", 1_000 + episode::CLEAR_GAP_S - 1);
+    assert_eq!(st.own.since, 900, "a clear stretch shorter than the gap");
+    st.note_wait("next-point", 1_000 + episode::CLEAR_GAP_S);
+    assert_eq!(st.own, Episode::default(), "one that long ends the hold");
 }
 
 /// Under the quiet flow a wait on the agent's own work owns no turn end and bounds none
@@ -15594,6 +15616,7 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         Ok(p) => Ok(p.line),
         Err(NoPlan::Refused { what, .. }) => Err(what),
         Err(NoPlan::Wait(why)) => Err(format!("wait:{why}")),
+        Err(NoPlan::Noted { word, .. }) => Err(format!("wait:{word}")),
         Err(NoPlan::Account(refusal)) => Err(format!("wait:{}", refusal.kind.word())),
     };
     let restart = restart_with(
@@ -18746,6 +18769,9 @@ fn a_relaunch_into_the_shells_own_directory_spelled_another_way_needs_no_cd() {
         match crate::harness::relaunch::plan(&opts, &launch, pid, &table) {
             Ok(plan) => plan.line,
             Err(crate::harness::relaunch::NoPlan::Wait(what)) => panic!("no plan: wait {what}"),
+            Err(crate::harness::relaunch::NoPlan::Noted { word, why }) => {
+                panic!("no plan: wait {word}: {why}")
+            }
             Err(crate::harness::relaunch::NoPlan::Account(refusal)) => {
                 panic!("no plan: account {refusal:?}")
             }
@@ -20908,6 +20934,100 @@ fn a_notice_the_host_stopped_is_taken_back_and_a_persons_key_among_it_is_never()
         assert_eq!(h.visit().step, "wait:draft", "{name}");
         assert_eq!((keys(&h), h.typed().len()), (0, 0), "{name}");
     }
+}
+
+/// A person over the line aterm typed and could not submit is a person, though the step waits on
+/// that line (`wait:left-typed:…`) and goes no further: their key at the look (`left-attended`)
+/// breaks the own-work hold (`St::own`) and starts the hold's episode afresh, and their text among
+/// aterm's (`cut-mixed`) breaks the own-work hold; the time they hold is not the agent's. aterm's
+/// own unsent line with nobody at the keys (`left-unsent`) breaks neither: it is no person's, and
+/// the agent's work holds the round through it (m16's tabs, each line left unsent).
+#[cfg(unix)]
+#[test]
+fn a_person_over_the_line_aterm_left_breaks_the_own_work_hold() {
+    let rig = |name: &str, prompt: Prompt| {
+        Parked::new(
+            name,
+            Answers {
+                help: PRESS_HELP,
+                turn: vec![
+                    "OK 0 turn skipped reason=person typed=40 pasted=0 submitted=0 seq=78 id=1",
+                ],
+                prompt: Some(prompt),
+                ..Answers::default()
+            },
+            settled(),
+            3600,
+        )
+    };
+    let since = now_s() - 2 * upgrade::WORK_TELL_S;
+    let holding = |h: &Parked, left_typed: &str| {
+        let mut st = load(&h.opts, SESSION).unwrap_or_else(settled);
+        st.left_typed = left_typed.to_string();
+        st.own = Episode::from(since);
+        st.wait_episode = Episode::from(since);
+        save(&h.opts, SESSION, &st);
+    };
+    let ours = "the rest of a line no head of aterm's opens";
+
+    let h = rig(
+        "left-unsent",
+        Prompt {
+            draft: ours.to_string(),
+            ..Prompt::default()
+        },
+    );
+    holding(&h, ours);
+    assert_eq!(h.visit().step, "wait:left-typed:unsent");
+    let st = load(&h.opts, SESSION).expect("the record");
+    assert_eq!(
+        (st.own.since, st.wait_episode.since),
+        (since, since),
+        "aterm's own line with nobody at the keys breaks nothing"
+    );
+    drop(h);
+
+    let h = rig(
+        "left-attended",
+        Prompt {
+            draft: ours.to_string(),
+            human_ms: Some(5_000),
+            ..Prompt::default()
+        },
+    );
+    holding(&h, ours);
+    let before = now_s();
+    assert_eq!(h.visit().step, "wait:left-typed:unsent");
+    let st = load(&h.opts, SESSION).expect("the record");
+    assert_eq!(
+        st.own,
+        Episode::default(),
+        "a person's key breaks the own-work hold"
+    );
+    assert!(
+        st.wait_episode.since >= before,
+        "and is progress: the hold's episode starts at this look: {:?}",
+        st.wait_episode
+    );
+    drop(h);
+
+    let h = rig(
+        "cut-mixed",
+        Prompt {
+            person_key: true,
+            ..Prompt::default()
+        },
+    );
+    let _ = h.visit();
+    let left = load(&h.opts, SESSION).expect("the record").left_typed;
+    assert!(!left.is_empty(), "the cut line is recorded");
+    holding(&h, &left);
+    assert_eq!(h.visit().step, "wait:left-typed:mixed");
+    assert_eq!(
+        load(&h.opts, SESSION).expect("the record").own,
+        Episode::default(),
+        "a person's text among aterm's breaks the own-work hold"
+    );
 }
 
 /// A turn begun since the look takes no notice and no release under the rows fence.
@@ -23519,7 +23639,7 @@ fn an_age_belongs_to_one_process() {
         streak_why: upgrade::GAVE_UP.to_string(),
         stop_streak: 3,
         own_work_at: 80,
-        own_since: 70,
+        own: Episode::from(70),
         tells: 1,
         deadline_at: 4_000,
         deadline_pid: 7,
@@ -23538,7 +23658,7 @@ fn an_age_belongs_to_one_process() {
         "another process starts afresh"
     );
     assert_eq!(
-        (next.own_since, next.tells),
+        (next.own.since, next.tells),
         (0, 0),
         "its hold and tells too"
     );
@@ -23569,7 +23689,7 @@ fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
         streak_why: upgrade::GAVE_UP.to_string(),
         stop_streak: 2,
         own_work_at: 700,
-        own_since: 640,
+        own: Episode::from(640),
         tells: 1,
         told_at: 700,
         told_to: "2.1.284".to_string(),
@@ -23599,7 +23719,7 @@ fn a_newer_build_landing_in_a_rest_keeps_the_process_s_history() {
         "and the rounds it answered not yet"
     );
     assert_eq!(
-        (next.own_since, next.tells, next.told_to.as_str()),
+        (next.own.since, next.tells, next.told_to.as_str()),
         (640, 1, "2.1.284"),
         "and how long its own work has held it, the tell naming the build it told"
     );
@@ -24071,6 +24191,7 @@ fn a_record_of_an_unknown_agent_is_passed_by_and_left_as_it_lies() {
     let dir = scratch("unknown-agent");
     let opts = Opts {
         sock: None,
+        aterm_state: Some(dir.join("aterm-state")),
         ..drive(&dir)
     };
     let in_tab = |tab: &str| Opts {
@@ -24671,7 +24792,7 @@ fn a_quiet_round_held_by_its_own_work_is_told_its_deadline_once() {
     let held = || St {
         tab: TAB.to_string(),
         pending_since: now_s() - upgrade::RUNG_LAND_S - 60,
-        own_since: now_s() - upgrade::WORK_TELL_S - 60,
+        own: Episode::from(now_s() - upgrade::WORK_TELL_S - 60),
         ..unsettled()
     };
     let stamped = |st: &St, pid: u32| {
@@ -24804,7 +24925,7 @@ fn a_quiet_round_held_by_its_own_work_is_told_its_deadline_once() {
             "quiet-tell-early",
             Tell::Verb,
             St {
-                own_since: now_s() - upgrade::WORK_TELL_S + 60,
+                own: Episode::from(now_s() - upgrade::WORK_TELL_S + 60),
                 ..held()
             },
             false,
@@ -24880,9 +25001,10 @@ fn a_quiet_round_held_by_its_own_work_is_told_its_deadline_once() {
 
     // A line the host did not take whole (its keys may have gone: a refusal after them, a cut,
     // a reply that never came) names no deadline, so nothing restarts over the work on a line
-    // the agent may never have read. The own-work hold starts again from that look, so the line
-    // is not typed again at once; once the work has held the round `WORK_TELL_S` more it is, and
-    // that line's deadline is the one that stands.
+    // the agent may never have read. The line rests from that look (`St::tell_tried_at`), so it
+    // is not typed again at once, while the own-work hold keeps its episode: an untaken line is
+    // no progress. `WORK_TELL_S` after it the line is typed again, and that line's deadline is
+    // the one that stands.
     for (name, reply, word) in [
         (
             "quiet-tell-lost",
@@ -24909,8 +25031,12 @@ fn a_quiet_round_held_by_its_own_work_is_told_its_deadline_once() {
             "{name}: no line reached it, so no deadline: {kept:?}"
         );
         assert!(
-            kept.own_since.abs_diff(now_s()) <= 60,
-            "{name}: the hold starts again: {kept:?}"
+            kept.tell_tried_at.abs_diff(now_s()) <= 60,
+            "{name}: the line rests: {kept:?}"
+        );
+        assert!(
+            kept.own.since != 0 && now_s() - kept.own.since >= upgrade::WORK_TELL_S,
+            "{name}: the hold keeps its episode: {kept:?}"
         );
         let typed = h.typed().len();
         assert_eq!(
@@ -24922,7 +25048,7 @@ fn a_quiet_round_held_by_its_own_work_is_told_its_deadline_once() {
         // An hour on, with that work still holding the round: no deadline was named, so
         // nothing moves, and the line is typed again with its own deadline.
         let mut later = load(&h.opts, SESSION).expect("state");
-        later.own_since = now_s() - upgrade::WORK_DEADLINE_S - 60;
+        later.tell_tried_at = now_s() - upgrade::WORK_TELL_S - 60;
         save(&h.opts, SESSION, &later);
         assert_eq!(
             h.visit_with(dead_pid(), &shells).step,
@@ -24949,7 +25075,7 @@ fn a_quiet_round_held_by_its_own_work_is_told_its_deadline_once() {
     assert_eq!(h.visit_with(dead_pid(), &shells).step, "wait:background");
     assert!(h.typed().is_empty(), "{:?}", h.typed());
     assert_eq!(
-        load(&h.opts, SESSION).expect("state").own_since,
+        load(&h.opts, SESSION).expect("state").own.since,
         0,
         "a person seen restarts the hold"
     );
@@ -25329,7 +25455,7 @@ fn a_silent_round_moves_over_its_own_follows_once_their_hold_outlasts_a_told_dea
     use std::os::unix::process::ExitStatusExt as _;
     let held_for = |h: &Parked, held_s: u64| {
         let st = St {
-            own_since: now_s() - held_s,
+            own: Episode::from(now_s() - held_s),
             proc_start: squash(&h.sf.proc_start),
             tab: TAB.to_string(),
             pending_since: now_s() - upgrade::RUNG_LAND_S - 60,
@@ -25581,7 +25707,7 @@ fn a_deadline_is_void_once_a_person_a_wall_or_idleness_breaks_its_hold() {
             told_to: "9.9.9".to_string(),
             deadline_at,
             deadline_pid: h.sf.pid,
-            own_since: now_s() - upgrade::WORK_DEADLINE_S - upgrade::WORK_TELL_S,
+            own: Episode::from(now_s() - upgrade::WORK_DEADLINE_S - upgrade::WORK_TELL_S),
             proc_start: squash(&h.sf.proc_start),
             tab: TAB.to_string(),
             pending_since,
@@ -25637,7 +25763,7 @@ fn a_deadline_is_void_once_a_person_a_wall_or_idleness_breaks_its_hold() {
         assert!(step.starts_with("wait:"), "{name}: {step}");
         voided(&h, name);
         assert_eq!(
-            load(&h.opts, SESSION).expect("state").own_since,
+            load(&h.opts, SESSION).expect("state").own.since,
             0,
             "{name}: the hold starts again"
         );
@@ -25690,11 +25816,11 @@ fn an_unread_process_table_at_the_look_is_work_never_nothing() {
     assert!(!was_signalled(&h));
     let kept = load(&h.opts, SESSION).expect("state");
     assert!(
-        kept.own_since != 0 && kept.own_since.abs_diff(now_s()) <= 60,
+        kept.own.since != 0 && kept.own.since.abs_diff(now_s()) <= 60,
         "the hold is clocked: {kept:?}"
     );
     let mut st = kept;
-    st.own_since = now_s() - upgrade::WORK_TELL_S - 60;
+    st.own = Episode::from(now_s() - upgrade::WORK_TELL_S - 60);
     save(&h.opts, SESSION, &st);
     assert_eq!(unread(&h).step, "wait:background");
     assert!(
@@ -35353,6 +35479,7 @@ fn a_route_move_serves_its_target_and_a_token_session_comes_back_through_the_wra
         match planned(AuthRoute::Stored, Serve::Must, fact) {
             Err(NoPlan::Refused { why, .. }) => assert_eq!(why, relaunch::ROUTE_UNSERVED),
             Err(NoPlan::Wait(word)) => panic!("{fact:?}: waits on {word}"),
+            Err(NoPlan::Noted { word, why }) => panic!("{fact:?}: waits on {word}: {why}"),
             Err(NoPlan::Account(refusal)) => panic!("{fact:?}: waits on {refusal:?}"),
             Ok(plan) => panic!("{fact:?}: {}", plan.line),
         }
@@ -35488,6 +35615,7 @@ fn a_store_shaped_build_outside_atpkgs_store_is_never_served_the_token() {
     match planned(&outside, Serve::Must) {
         Err(NoPlan::Refused { why, .. }) => assert_eq!(why, relaunch::ROUTE_UNSERVED),
         Err(NoPlan::Wait(word)) => panic!("waits on {word}"),
+        Err(NoPlan::Noted { word, why }) => panic!("waits on {word}: {why}"),
         Err(NoPlan::Account(refusal)) => panic!("waits on {refusal:?}"),
         Ok(plan) => panic!("a move onto the token typed: {}", plan.line),
     }
@@ -35723,6 +35851,7 @@ fn a_quiet_upgrade_restarts_an_idle_agent_whose_row_reads_signed_out() {
         ),
         Ok(plan) => panic!("a selection planned: {}", plan.line),
         Err(crate::harness::relaunch::NoPlan::Wait(word)) => panic!("wait {word}"),
+        Err(crate::harness::relaunch::NoPlan::Noted { word, why }) => panic!("wait {word}: {why}"),
         Err(crate::harness::relaunch::NoPlan::Refused { why, .. }) => panic!("refused {why}"),
     }
 }
@@ -36055,5 +36184,144 @@ fn a_restart_asked_closes_another_tabs_restart_whose_agent_and_shell_are_gone() 
             |st| st.tab == TAB || st.phase == Phase::Failed("resumed-elsewhere".to_string())
         ),
         "closed, or the asked restart's own: {r:?} {saved:?}"
+    );
+}
+
+/// A COORDINATED SESSION HELD BY ITS OWN WORK WHOSE MOVE THE TWIN'S PROJECTION REFUSES WAITS THAT
+/// REFUSAL'S OWN WORD, ITS REASON IN THE RECORD'S WAIT LOG (a busy coordinated session whose twin
+/// atpkg changed was reported waiting `background`, its own work, and the status classed the
+/// tab's own work as what held the upgrade: the tell's fallback dropped the native word and its
+/// reason, while the same move at a break waited `native-twin-producer-unknown`): the round tells
+/// nothing, waits `native-twin-producer-unknown`, and its wait log keeps the projection's reason,
+/// naming the twin. The same round over the twin as atpkg lays it tells the agent.
+///
+/// A VIEW OF THE SAME ROUND READS NO HOST GATE (`--dry-run`, and the hands-free watch's look that
+/// saves its word into the record, reported every coordinated session `wait:native-host-succession`,
+/// aterm's own fault: the view's read-only connection refuses the succession verb, which reclaims
+/// the host's table and so is no read): it waits the tell's own word, `background`, as the move
+/// would, and asks the host nothing.
+///
+/// NEGATIVE CONTROLS: with the tell's fallback waiting its own work's word whatever refused the
+/// move, the round waits `background` and the wait log names no twin; with the view reading the
+/// gate, the view waits `native-host-succession`.
+#[cfg(unix)]
+#[test]
+fn a_coordinated_tell_whose_twin_projection_refuses_waits_the_native_word_and_its_reason() {
+    use crate::harness::native_act::{Binding, Prepare, Request};
+    use crate::harness::relaunch::native_plan_tests::{Agents, factory, image_at};
+    let world = aterm_tempfile::tempdir().expect("scratch");
+    let prefix = std::fs::canonicalize(world.path()).expect("canonical scratch");
+    let build = image_at(&prefix, "1000002000001000326");
+    let twin = factory(&prefix, &build);
+    let previous = super::AGENTS_DIR.with(|slot| slot.borrow_mut().replace(prefix.join("agents")));
+    let _agents = Agents(previous);
+    let targets = Targets {
+        managed: Some(Candidate {
+            exe: twin.clone(),
+            version: Version::parse("9.9.9").expect("version"),
+            source: Source::Managed,
+        }),
+        native: None,
+        unanswered: false,
+    };
+    // The record's completed predecessor, which the host's current epoch settled: the asked
+    // upgrade's gate passes on the host's answer, so the round reaches the twin's projection.
+    let predecessor = {
+        let mut bound = St {
+            native: Some(Binding {
+                id: "5e".repeat(16),
+                capability: "cd".repeat(32),
+            }),
+            ..St::default()
+        };
+        retain_bound_preparation(&mut bound);
+        let Some(Request::Prepare(prepare)) = Request::parse(&bound.native_prepare) else {
+            panic!("the fixture keeps a preparation");
+        };
+        Prepare {
+            host_epoch: "34".repeat(16),
+            ..*prepare
+        }
+    };
+    let held = || St {
+        tab: TAB.to_string(),
+        pending_since: now_s() - upgrade::RUNG_LAND_S - 60,
+        own: Episode::from(now_s() - upgrade::WORK_TELL_S - 60),
+        native_coordination: true,
+        native_completed_prepare: Some(Box::new(predecessor.clone())),
+        ..unsettled()
+    };
+    let rig = |name: &str| {
+        let mut h = quietly(|| {
+            Parked::new(
+                name,
+                Answers {
+                    native: "OK native-act state=succession \
+                             epoch=34343434343434343434343434343434 admits=predecessor",
+                    ..Answers::default()
+                },
+                held(),
+                3600,
+            )
+        });
+        set_status(&mut h, "shell");
+        h.opts.background = true;
+        h.opts.tell = Tell::Verb;
+        h
+    };
+    let round = |h: &Parked| {
+        let shell = dead_pid();
+        let mut table = vec![(shell, 1, "zsh".into())];
+        table.extend(shells_under(h));
+        let script = Script::new(shell, usize::MAX, None);
+        visit(&h.opts, &h.sf, &table, &targets, &h.parked(&script))
+    };
+
+    let h = rig("coordinated-told");
+    let r = round(&h);
+    assert_eq!(
+        r.step, "told:background",
+        "the twin as atpkg lays it: {r:?}"
+    );
+    assert_eq!(h.typed().len(), 1, "{:?}", h.typed());
+    drop(h);
+
+    let mut h = rig("coordinated-view");
+    h.opts.dry_run = true;
+    let r = round(&h);
+    assert_eq!(r.step, "wait:background", "a view of the same round: {r:?}");
+    assert!(
+        h.typed().is_empty(),
+        "a view types nothing: {:?}",
+        h.typed()
+    );
+    assert!(
+        !h.asked
+            .lock()
+            .expect("asked")
+            .iter()
+            .any(|line| line.contains(" native-act ")),
+        "a view asks the host nothing"
+    );
+    drop(h);
+
+    let body = std::fs::read_to_string(&twin).expect("the twin");
+    std::fs::write(&twin, body.replacen("#!/bin/sh\n", "#!/bin/sh\n:\n", 1)).expect("changed");
+    let h = rig("coordinated-twin-refused");
+    let r = round(&h);
+    assert_eq!(r.step, "wait:native-twin-producer-unknown", "{r:?}");
+    assert!(h.typed().is_empty(), "nothing is told: {:?}", h.typed());
+    let kept = load(&h.opts, SESSION).expect("state");
+    let noted = kept.waits.last().expect("the wait noted");
+    assert_eq!(noted.word, "native-twin-producer-unknown", "{kept:?}");
+    assert!(noted.note.contains("agents/claude"), "{}", noted.note);
+    assert!(
+        h.asked
+            .lock()
+            .expect("asked")
+            .iter()
+            .filter(|line| line.contains(" native-act "))
+            .all(|line| line.contains(" native-act succession predecessor=")),
+        "the round reads only the host's succession answer"
     );
 }

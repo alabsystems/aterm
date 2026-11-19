@@ -52,7 +52,9 @@ fn escape_cancels_and_types_nothing() {
     assert_eq!(pin(&app, 0), None, "and wrote nothing");
 
     assert!(app.begin_active_session_rename(wid));
-    assert_eq!(field(&app, wid), Some((String::new(), 0)));
+    let title = app.tab_titles(wid).remove(0);
+    assert_eq!(field(&app, wid), Some((title.clone(), title.len())));
+    assert!(app.inline_rename_edit(wid).unwrap().selected_all);
 }
 
 #[test]

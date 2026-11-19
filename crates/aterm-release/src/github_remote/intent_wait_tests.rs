@@ -5,10 +5,12 @@
 //! beside another refresh: each waits or reads again within its bound, on a real journal and
 //! a real local bare repository, and refuses past it.
 
-use super::super::write::{INTENT_POLL, INTENT_WAIT, batch_request, control_request};
+use super::super::write::{
+    INTENT_POLL, INTENT_WAIT, RECONCILE_PAUSE, RECONCILE_RETRIES, batch_request, control_request,
+};
 use super::*;
 use agh::github::refs::{AtomicRefBatch, RefUpdate};
-use agh::journal::{IntentDraft, IntentStore, JournalRecord, Settled};
+use agh::journal::{IntentStore, JournalRecord, Settled};
 use agh::policy::{RouteRequest, RouteTarget};
 use agh::write::WriteOp;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -108,26 +110,10 @@ fn held_lease(w: &World) -> String {
     )
 }
 
-/// Begin an intent in the repository's atomic-ref bucket as another agh write would, and
-/// leave it in flight.
+/// Begin an intent in the repository's atomic-ref bucket as another agh write in this process
+/// would, recording no batch, and leave it in flight.
 fn begin(remote: &Remote, request: &str) -> agh::IntentId {
-    let route = RouteRequest::write(RouteTarget::Repo(remote.slug.clone()));
-    let permit = remote.client.permit(&route).unwrap();
-    let journal = remote.client.journal(&remote.slug).unwrap();
-    let latest = journal
-        .latest(WriteOp::RefUpdateAtomic, "atomic refs")
-        .unwrap()
-        .map(|view| view.intent.id);
-    let draft = IntentDraft::new(
-        WriteOp::RefUpdateAtomic,
-        &remote.slug,
-        &permit,
-        "fixture-fingerprint",
-        "atomic refs",
-    )
-    .with_request(request.into())
-    .with_after(latest);
-    journal.begin(&draft).unwrap()
+    begin_intent(remote, request, None, Vec::new())
 }
 
 fn settle(remote: &Remote, intent: &agh::IntentId, outcome: &Settled) {
@@ -182,10 +168,22 @@ fn said(
     let kept = Arc::clone(&lines);
     remote.notice = Box::new(move |line| {
         kept.lock().unwrap().push(line.to_owned());
+        // This line itself: other tests' waits are held beside it.
+        let held = || {
+            crate::github_remote::write::intent_waits()
+                .iter()
+                .any(|held| held == line)
+        };
+        if line.contains("writer is gone and origin did not settle it") {
+            assert!(
+                held(),
+                "the lease heartbeat reads a pause while it lasts: {line}"
+            );
+        }
         if line.starts_with("waiting for intent ") {
             assert!(
-                crate::github_remote::intent_wait().is_some(),
-                "the lease heartbeat reads a wait while it lasts"
+                held(),
+                "the lease heartbeat reads a wait while it lasts: {line}"
             );
             on_wait();
         }
@@ -414,10 +412,11 @@ fn an_earlier_attempt_at_the_same_write_is_settled_by_reading_origin() {
 }
 
 /// Negative control: an earlier attempt whose outcome is unknown, with origin still at the
-/// old object, is not posted again on the strength of that read inside agh's window for it:
-/// its intent stays open, and past this wait's bound the write refuses.
+/// old object and its writer (this process) still running, is not posted again on the
+/// strength of that read: agh reconciles no live writer's intent from origin, so it stays
+/// open however long the write waits, and past this wait's bound the write refuses naming it.
 #[test]
-fn an_earlier_attempt_origin_does_not_hold_is_not_posted_again_inside_its_window() {
+fn an_earlier_attempt_origin_does_not_hold_is_not_posted_again_while_its_writer_lives() {
     let w = world();
     let (mut remote, _) = w.remote();
     let own = begin(&remote, &w.request(&remote));
@@ -438,6 +437,100 @@ fn an_earlier_attempt_origin_does_not_hold_is_not_posted_again_inside_its_window
             "waiting for intent {own} of an earlier attempt at this write"
         )]
     );
+}
+
+/// RL-21 left an intent whose writer is gone open until a push reads its batch on origin
+/// wholly as before or wholly as after its write; a cut behind one whose ref another writer
+/// moved since then read origin again at once, one push after another, for five minutes (and
+/// without end on a clock that moves only when it sleeps). On agh's own reconciliation, with
+/// origin's main moved on to a third commit, the write is now made seven times, each push a
+/// read of origin that sent nothing, with pauses of 2, 4, 8, 16 and 32 s between the last six,
+/// and then refuses naming the intent and `agh intent retract`; the intent stays open and
+/// origin is not written. Negative control: the git-child fuse panics where the write is made
+/// again without bound.
+#[test]
+fn a_write_behind_a_gone_writers_intent_origin_reads_mixed_refuses_after_its_pauses() {
+    let w = world();
+    let third = git(
+        &w.source,
+        &[
+            "commit-tree",
+            &format!("{}^{{tree}}", w.old),
+            "-p",
+            &w.old,
+            "-m",
+            "another writer's main",
+        ],
+    );
+    let spec = format!("{third}:{MAIN}");
+    git(&w.source, &["push", "-q", w.bare.to_str().unwrap(), &spec]);
+    let children = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&children);
+    let fx = Arc::new(
+        agh::Fx::simulated(1_760_000_000).with_git_child_observer_for_tests(move |_| {
+            assert!(
+                counted.fetch_add(1, Ordering::SeqCst) < 64,
+                "64 git children: the write is made again without bound"
+            );
+        }),
+    );
+    let mut remote = claim_fixture_with_fx(&w.source, &w.bare, Arc::clone(&fx));
+    let gone = begin_intent(
+        &remote,
+        "sha256:a-gone-writers-push 162",
+        Some(writer(None)),
+        vec![RefUpdate {
+            reference: MAIN.into(),
+            before: w.old.clone(),
+            after: w.new.clone(),
+        }],
+    );
+    let said_lines = said(&mut remote, || {});
+    let reads_before = reads(&fx);
+    let error = remote.write_ref(MAIN, Some(&w.old), &w.new).unwrap_err();
+    for words in [
+        format!("agh intent retract fixture/app {gone} --confirm {gone}"),
+        format!(
+            "intent {gone}'s writer is gone, and the {} pushes made since",
+            RECONCILE_RETRIES + 1
+        ),
+    ] {
+        assert!(error.contains(&words), "{error}");
+    }
+    let pauses: Vec<Duration> = (0..RECONCILE_RETRIES)
+        .map(|repeat| RECONCILE_PAUSE * (1 << repeat))
+        .collect();
+    assert_eq!(
+        fx.slept().iter().sum::<Duration>(),
+        pauses.iter().sum::<Duration>()
+    );
+    assert_eq!(
+        reads(&fx) - reads_before,
+        usize::try_from(RECONCILE_RETRIES).unwrap() + 2,
+        "each push read the intent's one ref on origin once"
+    );
+    assert!(
+        fx.children_run()
+            .iter()
+            .all(|child| !child.args.iter().any(|arg| arg == "push")),
+        "no push reached receive"
+    );
+    assert_eq!(
+        lines(&said_lines).len(),
+        pauses.len(),
+        "one line for each pause"
+    );
+    assert_eq!(w.main(), third);
+    assert!(view(&remote, &gone).open);
+    assert_eq!(intents(&remote), 1, "this write never began");
+}
+
+/// The reads of origin's refs (`git ls-remote`) the git door ran so far.
+fn reads(fx: &agh::Fx) -> usize {
+    fx.children_run()
+        .iter()
+        .filter(|child| child.args.iter().any(|arg| arg == "ls-remote"))
+        .count()
 }
 
 /// A write whose own answer is lost (the push ran, and its acknowledgement did not come back)

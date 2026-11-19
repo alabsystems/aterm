@@ -224,6 +224,7 @@ const SERVES: &[FleetOp] = &[
     FleetOp::MailCode,
     FleetOp::Census,
     FleetOp::VaultJoin,
+    FleetOp::Built,
 ];
 
 const SERVES_DRIVE: &[FleetOp] = &[
@@ -235,6 +236,7 @@ const SERVES_DRIVE: &[FleetOp] = &[
     FleetOp::MailCode,
     FleetOp::Census,
     FleetOp::VaultJoin,
+    FleetOp::Built,
 ];
 
 /// [`SERVES`] and the ops only the mesh carries that a node service serves as a connection's
@@ -248,6 +250,7 @@ const SERVES_MESH: &[FleetOp] = &[
     FleetOp::MailCode,
     FleetOp::Census,
     FleetOp::VaultJoin,
+    FleetOp::Built,
     FleetOp::Neighbour,
     FleetOp::Units,
     FleetOp::Desk,
@@ -264,6 +267,7 @@ const SERVES_DRIVE_MESH: &[FleetOp] = &[
     FleetOp::MailCode,
     FleetOp::Census,
     FleetOp::VaultJoin,
+    FleetOp::Built,
     FleetOp::Neighbour,
     FleetOp::Units,
     FleetOp::Desk,
@@ -2012,6 +2016,16 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                         serve_census_request(stream, peer)
                     });
                 }
+                if op == FleetOp::Built {
+                    // DC-24b: a member asks for shared dependency units by key, between its
+                    // build's compiles, for as long as the build keeps the connection.
+                    let member = served.peer_node().map(|proof| proof.node.clone());
+                    return served.answer(|stream| {
+                        stream.set_read_timeout(Some(aterm_agent::unit_source::SERVE_IDLE))?;
+                        stream.set_write_timeout(Some(within))?;
+                        aterm_agent::unit_source::serve_connection(stream, member.as_deref())
+                    });
+                }
                 if op == FleetOp::VaultJoin {
                     // No deny list read: the proof cannot be told from a removed Mac's, so it is
                     // judged by none until one is (the handshake gate refuses before this). The
@@ -3603,6 +3617,10 @@ fn fleet_event(event: FleetEvent) {
 }
 
 fn note_fleet(line: &str, refusal: bool) {
+    // Dated, into the node job's log where it keeps one (`node_service::keep_log`).
+    #[cfg(unix)]
+    aterm_agent::node_service::log_line(&format!("aterm-gui: {line}"));
+    #[cfg(not(unix))]
     crate::logging::stderr_line!("aterm-gui: {line}");
     if refusal {
         aterm_log::warn!("{line}");

@@ -1287,6 +1287,11 @@ pub(crate) enum MacNamePending {
     /// setup the person asks for (`aterm init`) renews it; no automatic pass asks for that
     /// password.
     Renewal(String),
+    /// No naming rule is in place because the person removed it with its own revert
+    /// ([`aterm_machines::root_steps::rule_removed`]): no automatic pass and no password step
+    /// puts it back, only the person's own request (the name menu's permission repair, or
+    /// `aterm init`).
+    Removed(String),
     /// The naming rule could not be read (why, appended): one from before the rule was made
     /// readable, which, as [`Self::Renewal`], only setup the person asks for renews. No
     /// automatic pass asks for that password.
@@ -1305,6 +1310,7 @@ impl MacNamePending {
             Ok(NameRuleReading::Current) => Self::ThroughRule(why),
             Ok(NameRuleReading::Missing) => Self::Elevation(why),
             Ok(NameRuleReading::Other) => Self::Renewal(why),
+            Ok(NameRuleReading::Removed) => Self::Removed(why),
             Err(rule) => Self::Unread(format!("{why}; {rule}")),
         }
     }
@@ -2470,6 +2476,11 @@ impl Ports for Live {
             aterm_secrets::need::peek(&paths).map_err(|why| why.to_string()),
             || aterm_db::runtime::enabled(&config).map_err(|why| why.to_string()),
             || aterm_secrets::commons::bootstrap::writer_here(&paths),
+            || {
+                aterm_db::credentials::full(&paths)
+                    .map(|full| full.standing)
+                    .map_err(|why| why.to_string())
+            },
         )
     }
 
@@ -2952,11 +2963,15 @@ impl Ports for Live {
 /// (Commons on, this machine a Writer), each named in its platform's word
 /// ([`aterm_types::machine_name::OS_NOUN`]). A ledger it cannot read is said, not the read's
 /// failure: the pass still runs, so the custodian's half decides for the lab and the member's half
-/// fails the item naming the ledger.
+/// fails the item naming the ledger. A `full` table's refusal that still stands (neither the table
+/// nor the ledger moved since) is said with the needs, and the pass is due all the same: it takes
+/// in what needs no append (a decision on the table, a value the vault delivered, the custodian's
+/// copies into the vault), which no record of the refusal can stand for.
 fn requests_read(
     needs: Result<Vec<aterm_secrets::need::Need>, String>,
     enabled: impl FnOnce() -> Result<bool, String>,
     writer: impl FnOnce() -> bool,
+    full: impl FnOnce() -> Result<Option<aterm_secrets::need::full::Full>, String>,
 ) -> Result<RequestsRead, String> {
     use aterm_types::machine_name::OS_NOUN;
     let standing = match needs {
@@ -2974,14 +2989,21 @@ fn requests_read(
             "this {OS_NOUN} is not a Commons Writer, so the lab's table is not reached ({standing})"
         )));
     }
-    Ok(RequestsRead::Due(standing))
+    Ok(RequestsRead::Due(match full() {
+        Ok(Some(full)) => format!("{standing}; {}", full.line()),
+        Ok(None) => standing,
+        Err(why) => format!("{standing}; the lab table's last refusal cannot be read ({why})"),
+    }))
 }
 
 /// `sync.requests`'s apply: this Mac's `member` pass over the lab's table, then the
 /// `custodian`'s, which runs whatever the first did: it reads the table and the vault, not this
 /// Mac's ledger, so a member pass that fails on the vault's admin Mac does not hold up the lab's
 /// decisions. The line says both; a failure in either, or a request whose copy or publication
-/// failed, fails the item with it.
+/// failed, fails the item with it. A pass the lab's table refused for its capacity
+/// ([`aterm_db::credentials::Pass::full`]) is no failure: the line says the refusal, and the item
+/// is settled as any pass that ran, so the runner keeps its recheck and the next pass meets the
+/// table afresh.
 fn requests_pass(
     member: impl FnOnce() -> Result<aterm_db::credentials::Pass, String>,
     custodian: impl FnOnce() -> Result<Option<aterm_db::credentials::Custodian>, String>,
@@ -2991,10 +3013,16 @@ fn requests_pass(
     let custodian = custodian();
     let mut failed = member.is_err();
     let mut said = match member {
-        Ok(pass) => format!(
-            "{} posted, {} answered, {} decided here, {} offered, {} swept",
-            pass.posted, pass.answered, pass.decided, pass.offered, pass.swept
-        ),
+        Ok(pass) => {
+            let mut said = format!(
+                "{} posted, {} answered, {} decided here, {} offered, {} swept",
+                pass.posted, pass.answered, pass.decided, pass.offered, pass.swept
+            );
+            if let Some(refused) = pass.full {
+                let _ = write!(said, "; {}", refused.line());
+            }
+            said
+        }
         Err(why) => format!(
             "this {}'s pass failed: {why}",
             aterm_types::machine_name::OS_NOUN

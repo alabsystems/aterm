@@ -2183,3 +2183,123 @@ fn a_windows_build_that_refuses_or_ends_unanswered_is_a_refusal() {
         assert!(waited, "ended before its deadline");
     }
 }
+
+/// THE CLAUDE CODE BUILD ON WINDOWS IS THE `claude.exe` ATPKG LAYS IN ITS STORE, on a scratch
+/// store: atpkg lays a build as `store\claude\<build>\bin\claude.exe` and the twin as
+/// `agents\claude.cmd`, whose last line forwards to it. The build a launch of that `.exe` or of
+/// the twin runs is that build ([`store_build`], [`twin_store_build`]), and its launch into an
+/// untrusted folder starts it once and records the trust. A `.cmd` beside the builds, a build
+/// named without its `.exe` and a `claude.exe` outside the store are no such build: their launch
+/// starts nothing and is booked unread. NEGATIVE CONTROL (run on this host): the store's shape
+/// naming the bare `claude` on Windows too (`token_route::store_build`), the build and the twin
+/// name no build, and a launch of either starts nothing.
+#[cfg(windows)]
+#[test]
+fn a_windows_launch_settles_with_the_claude_exe_atpkg_laid_in_its_store() {
+    let w = World::new("store-exe");
+    let prefix = w.root.join("pkg");
+    let builds = prefix.join("store").join("claude");
+    let build = builds.join("7").join("bin").join("claude.exe");
+    let agents = prefix.join("agents");
+    let twin = agents.join("claude.cmd");
+    let refused = [
+        builds.join("8").join("bin").join("claude.cmd"),
+        builds.join("9").join("bin").join("claude"),
+        w.root.join("bin").join("claude.exe"),
+    ];
+    for file in refused.iter().chain([&build]) {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, b"MZ").unwrap();
+    }
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(&twin, crate::harness::codex_alab::twin_text(&build)).unwrap();
+    crate::harness::relaunch::TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(builds.clone()));
+    crate::harness::upgrade_drive::AGENTS_DIR
+        .with(|seam| *seam.borrow_mut() = Some(agents.clone()));
+    let real = std::fs::canonicalize(&build).unwrap();
+    assert_eq!(store_build(&build), Some(real.clone()), "the build");
+    assert_eq!(store_build(&twin), Some(real.clone()), "the twin");
+    assert_eq!(
+        twin_store_build(),
+        Some(real.clone()),
+        "the twin by its place"
+    );
+    let (argv, env) = (words(&["claude", "--model", "haiku"]), w.env());
+    for file in &refused {
+        let found = store_build(file);
+        assert_eq!(found, None, "{}", file.display());
+        let launch = Launch {
+            build: found.as_deref(),
+            ..w.launch(&argv, &env)
+        };
+        let vendor = Fake::recording(&w.profile());
+        let mut notes = Notes::default();
+        let settled = settle(&launch, &trusts, &vendor, &mut notes, DEADLINE);
+        assert_eq!(
+            settled,
+            Settled::Unread("the launch's build could not be resolved"),
+            "{}",
+            file.display()
+        );
+        assert!(vendor.calls().is_empty(), "{}", file.display());
+        assert!(!w.profile().exists());
+    }
+    let found = twin_store_build();
+    let vendor = Fake::recording(&w.profile());
+    let mut notes = Notes::default();
+    let settled = settle(
+        &Launch {
+            build: found.as_deref(),
+            ..w.launch(&argv, &env)
+        },
+        &trusts,
+        &vendor,
+        &mut notes,
+        DEADLINE,
+    );
+    assert!(matches!(settled, Settled::Recorded { .. }), "{settled:?}");
+    assert_eq!(
+        vendor
+            .calls()
+            .iter()
+            .map(|call| call.build.clone())
+            .collect::<Vec<_>>(),
+        [real]
+    );
+    crate::harness::relaunch::TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+    crate::harness::upgrade_drive::AGENTS_DIR.with(|seam| *seam.borrow_mut() = None);
+}
+
+#[test]
+fn a_failed_windows_wait_does_not_finish_an_answer_but_an_observed_answer_stands() {
+    let recorded = answer_of(RECORDED).expect("the real recorded-answer fixture");
+    let tail = || Some(RECORDED.as_bytes().to_vec());
+    let deadline = Duration::from_millis(1500);
+    assert_eq!(
+        answer_after_windows_wait(None, tail(), Some(Ok(())), deadline),
+        recorded,
+        "a successful wait makes the final unterminated answer whole"
+    );
+    let failed = answer_after_windows_wait(
+        None,
+        tail(),
+        Some(Err("injected wait refusal".to_owned())),
+        deadline,
+    );
+    assert!(
+        matches!(&failed, Attested::Failed(why) if why.contains("injected wait refusal")),
+        "NEGATIVE CONTROL: identical tail bytes cannot turn a failed wait into an exit: {failed:?}"
+    );
+    let unfinished = answer_after_windows_wait(None, tail(), None, deadline);
+    assert!(
+        matches!(unfinished, Attested::Failed(_)),
+        "NEGATIVE CONTROL: unfinished output alone does not confirm an exit: {unfinished:?}"
+    );
+    for waited in [None, Some(Err("injected wait refusal".to_owned()))] {
+        assert_eq!(
+            answer_after_windows_wait(Some(recorded.clone()), tail(), waited, deadline),
+            recorded,
+            "CONTROL: the fully observed answer still stands after a failed or unfinished wait"
+        );
+    }
+}

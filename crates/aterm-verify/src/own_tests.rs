@@ -1121,8 +1121,8 @@ impl Files for Checkout<'_> {
         let object = format!("{}:{path}", self.base);
         let held = crate::changed::git(self.root, self.path_env)
             .args(["cat-file", "-e", &object])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .status()
             .map_err(|e| format!("git cat-file: {e}"))?;
         if !held.success() {
@@ -1130,7 +1130,7 @@ impl Files for Checkout<'_> {
         }
         let out = crate::changed::git(self.root, self.path_env)
             .args(["cat-file", "blob", &object])
-            .stderr(std::process::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .output()
             .map_err(|e| format!("git cat-file: {e}"))?;
         if !out.status.success() {

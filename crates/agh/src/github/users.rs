@@ -20,7 +20,7 @@ use crate::wire::Method;
 use crate::write::{Deleted, Effect, Ensured, WriteOp};
 
 /// Required identity learning uses the same native hang detectors as a JSON call.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn learn_deadlines() -> crate::wire::Deadlines {
     crate::wire::Deadlines::JSON
 }
@@ -51,7 +51,7 @@ impl<'a> Users<'a> {
     ///
     /// # Errors
     /// The call's error.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn me_once(&self, profile: &str) -> Result<UserObject> {
         let route = RouteRequest::read(RouteTarget::Identity).with_as(Some(profile.to_string()));
         let call = Call::get("/user", route)

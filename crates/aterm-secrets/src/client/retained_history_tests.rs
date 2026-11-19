@@ -87,7 +87,7 @@ pub(crate) fn retained_commit_transition(
         }
         _ => panic!("unknown retained commit action {action}"),
     }
-    let bytes = fsx::read_private(&raw_path, crate::membership_log::MAX_RECORDS_STREAM)
+    let bytes = fsx::read_private(&raw_path, retained_history::MAX_BYTES)
         .unwrap()
         .unwrap();
     let held =

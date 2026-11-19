@@ -150,6 +150,19 @@ pub(crate) struct InkLedger {
     row_near: Option<(i32, i32, i32, i32)>,
     row_near_on: bool,
     near_gen: u64,
+    /// While a pass of the letter guard cuts every stream to fixed dims ([`Self::index_dims`]):
+    /// how many dims it indexed, their indices into [`Self::dims`] in order of their left edges
+    /// as [`Self::knots`] reads them (`x0 as i32`), those edges, and how far right of its left
+    /// edge any dim's right edge lies, read so too. A box then reads only the dims whose left
+    /// edges lie within reach of it ([`Self::dims_in`]), not every dim of the frame. `None`: no
+    /// pass holds the dims fixed, and every dim is read.
+    dims_indexed: Option<usize>,
+    dims_order: Vec<u32>,
+    dims_x0: Vec<i32>,
+    dims_reach: i64,
+    /// [`Self::knots`]'s scratch: the indexed dims within reach of the box, in their order in
+    /// [`Self::dims`].
+    in_reach: Vec<u32>,
     /// A cut ramp row's mask per knot, kept for the next row that reads
     /// them alike (`guard_mask_ramps`).
     row_masks: Vec<f32>,
@@ -271,6 +284,11 @@ impl InkLedger {
         row_near: None,
         row_near_on: false,
         near_gen: 0,
+        dims_indexed: None,
+        dims_order: Vec::new(),
+        dims_x0: Vec::new(),
+        dims_reach: 0,
+        in_reach: Vec::new(),
         row_masks: Vec::new(),
         ramp_pieces: GlowRamps::EMPTY,
         run_knots: Vec::new(),
@@ -1705,6 +1723,56 @@ impl InkLedger {
         (min_x, min_y, max_x, max_y)
     }
 
+    /// Index [`Self::dims`] by their left edges for a pass that cuts to them as they stand
+    /// ([`Self::dims_indexed`]), until [`Self::unindex_dims`]. Dims not all of whose edges lie
+    /// within `2^24` px of the origin are left unindexed, every one read.
+    pub(super) fn index_dims(&mut self) {
+        /// The farthest from the origin an indexed dim's edge lies, px: `as i32` reads each such
+        /// edge without saturating, and every sum the index takes of them stays inside `i32`.
+        const EDGE_MOST: f32 = 16_777_216.0;
+        self.dims_indexed = None;
+        let dims = self.dims.as_slice();
+        if !dims
+            .iter()
+            .all(|d| d.x0.abs() <= EDGE_MOST && d.x1.abs() <= EDGE_MOST)
+        {
+            return;
+        }
+        // How far right of its left edge any dim's right edge lies, as `knots` reads both.
+        let reach = dims.iter().fold(0i64, |reach, d| {
+            reach.max(i64::from(d.x1 as i32) - i64::from(d.x0 as i32))
+        });
+        self.dims_order.clear();
+        self.dims_order.extend(0..dims.len() as u32);
+        self.dims_order
+            .sort_unstable_by_key(|&i| (dims[i as usize].x0 as i32, i));
+        self.dims_x0.clear();
+        self.dims_x0
+            .extend(self.dims_order.iter().map(|&i| dims[i as usize].x0 as i32));
+        self.dims_reach = reach;
+        self.dims_indexed = Some(dims.len());
+    }
+
+    /// End the pass [`Self::index_dims`] began: every dim is read again.
+    pub(super) const fn unindex_dims(&mut self) {
+        self.dims_indexed = None;
+    }
+
+    /// With the dims indexed ([`Self::index_dims`]), where in [`Self::dims_order`] lie the dims
+    /// that can meet the columns `(lo, hi)` (open, px, as `x0 as i32` and `x1 as i32` read its
+    /// edges): those whose left edge lies under `hi` and within the dims' reach of `lo`, a
+    /// superset of the dims that meet them. `None`: unindexed.
+    #[inline]
+    pub(super) fn dims_in(&self, lo: i64, hi: i64) -> Option<std::ops::Range<usize>> {
+        if self.dims_indexed != Some(self.dims.len()) {
+            return None;
+        }
+        let x0s = self.dims_x0.as_slice();
+        let from = x0s.partition_point(|&x| i64::from(x) + self.dims_reach <= lo);
+        let to = x0s.partition_point(|&x| i64::from(x) < hi);
+        Some(from..to.max(from))
+    }
+
     #[inline]
     fn knots(&mut self, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> bool {
         #[inline]
@@ -1751,14 +1819,35 @@ impl InkLedger {
             return true;
         }
         self.near_gen += 1;
+        // Only a dim whose left edge lies within reach of the box meets it across: with the
+        // dims indexed, those alone, in their order in `dims`, as every dim is read otherwise.
+        let indexed =
+            match self.dims_in(i64::from(x0) - i64::from(fx), i64::from(x1) + i64::from(fx)) {
+                Some(reach) => {
+                    self.in_reach.clear();
+                    self.in_reach.extend_from_slice(&self.dims_order[reach]);
+                    self.in_reach.sort_unstable();
+                    true
+                }
+                None => false,
+            };
         let dims = self.dims.as_slice();
         self.near.clear();
         self.near_hard = false;
         // The rows about `y0` a one-row box gathers these same dims over.
         let (mut from, mut to) = (i32::MIN, i32::MAX);
+        let count = if indexed {
+            self.in_reach.len()
+        } else {
+            dims.len()
+        };
         let mut di = 0;
-        while di < dims.len() {
-            let d = &dims[di];
+        while di < count {
+            let d = if indexed {
+                &dims[self.in_reach[di] as usize]
+            } else {
+                &dims[di]
+            };
             di += 1;
             let (dx0, dy0, dx1, dy1) = (d.x0 as i32, d.y0 as i32, d.x1 as i32, d.y1 as i32);
             if dx1 + fx <= x0 || dx0 - fx >= x1 {

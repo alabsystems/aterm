@@ -197,3 +197,143 @@ fn relaunch_wire_requires_one_complete_bounded_purpose() {
         assert!(Request::parse(&format!("{memory} {extra}")).is_none());
     }
 }
+
+/// A MEMORY RESTART RE-ENTERS A HOST THAT BINDS NO SUCCESSION AS AN UPGRADE DOES (a coordinated
+/// session's memory restart after a seamless update named the old epoch's predecessor and was
+/// denied for good): its re-entry carries the ask on the relaunch duty alone, so it needs the
+/// asked-relaunch constructor and the host's scoped checked-producer authorization; an upgrade's
+/// re-entry names no ask. Neither crosses to the other duty, names a predecessor beside its
+/// registration, or carries a malformed ask.
+#[test]
+fn a_memory_restart_reenters_on_the_relaunch_duty_with_its_ask_alone() {
+    let observation = super::super::native_observe::ObservationBinding {
+        id: "78".repeat(16),
+        host_epoch: "34".repeat(16),
+        capability: "9a".repeat(32),
+    };
+    let mut memory = prepare();
+    memory.asked = Some(AskedIntent::Reentry(AskedReentryIntent {
+        observation: observation.clone(),
+        ask: Some("memory:fixture".into()),
+    }));
+    assert!(memory.asked_restart_shape());
+    assert!(memory.checked_relaunch());
+    assert_eq!(memory.constructor(), Constructor::AskedRelaunch);
+    let request = Request::prepare(memory.clone());
+    let wire = request.encode().expect("a memory restart's re-entry");
+    assert!(wire.contains(" asked-reentry="), "{wire}");
+    assert!(wire.contains(" asked-relaunch=memory "), "{wire}");
+    assert!(!wire.contains("asked-predecessor="), "{wire}");
+    assert_eq!(Request::parse(&wire), Some(request));
+
+    let mut upgrade = memory.clone();
+    upgrade.duty = Scope::Upgrade;
+    upgrade.asked = Some(AskedIntent::Reentry(AskedReentryIntent {
+        observation,
+        ask: None,
+    }));
+    assert!(upgrade.asked_restart_shape());
+    assert!(!upgrade.checked_relaunch());
+    assert_eq!(upgrade.constructor(), Constructor::AskedUpgrade);
+    let upgrade_request = Request::prepare(upgrade.clone());
+    let upgrade_wire = upgrade_request.encode().expect("an upgrade's re-entry");
+    assert!(!upgrade_wire.contains("asked-relaunch="), "{upgrade_wire}");
+    assert!(!upgrade_wire.contains("asked-ask="), "{upgrade_wire}");
+    assert_eq!(Request::parse(&upgrade_wire), Some(upgrade_request));
+
+    // Neither intent crosses to the other duty.
+    let mut crossed = memory.clone();
+    crossed.duty = Scope::Upgrade;
+    assert!(!crossed.asked_restart_shape());
+    assert!(Request::prepare(crossed).encode().is_none());
+    let mut crossed = upgrade;
+    crossed.duty = Scope::Relaunch;
+    assert!(!crossed.asked_restart_shape());
+    assert!(Request::prepare(crossed).encode().is_none());
+    assert!(Request::parse(&wire.replace("duty=relaunch", "duty=upgrade")).is_none());
+    assert!(Request::parse(&upgrade_wire.replace("duty=upgrade", "duty=relaunch")).is_none());
+    // One complete, bounded purpose, and no predecessor beside the registration.
+    for key in ["asked-relaunch", "asked-ask"] {
+        assert!(Request::parse(&field(&wire, key, None)).is_none(), "{key}");
+    }
+    for ask in ["", "00", "0a", "ff"] {
+        assert!(Request::parse(&field(&wire, "asked-ask", Some(ask))).is_none());
+    }
+    assert!(Request::parse(&format!("{wire} asked-predecessor={}", "56".repeat(16))).is_none());
+    let mut long = memory;
+    let Some(AskedIntent::Reentry(intent)) = &mut long.asked else {
+        unreachable!();
+    };
+    intent.ask = Some("x".repeat(257));
+    assert!(!long.asked_restart_shape());
+    assert!(Request::prepare(long).encode().is_none());
+}
+
+/// THE HOST'S SUCCESSION ANSWER IS DATA FOR ONE PREDECESSOR, OR NONE, IN ONE EPOCH: the read
+/// names exactly one canonical predecessor id, or `-` for a record that completed no native
+/// operation, and the answer one canonical host epoch and one of its three moves, a bound one with
+/// the one stage word that holds it; anything else is refused rather than guessed into a move.
+#[test]
+fn the_succession_read_names_one_predecessor_and_its_answer_one_epoch_and_move() {
+    let predecessor = "56".repeat(16);
+    let request = Request::Succession(Some(predecessor.clone()));
+    let wire = request.encode().expect("a canonical predecessor");
+    assert_eq!(wire, format!("succession predecessor={predecessor}"));
+    assert_eq!(Request::parse(&wire), Some(request));
+    let none = Request::Succession(None);
+    assert_eq!(none.encode().as_deref(), Some("succession predecessor=-"));
+    assert_eq!(Request::parse("succession predecessor=-"), Some(none));
+    for invalid in [
+        "succession".to_string(),
+        "succession predecessor=56".to_string(),
+        "succession predecessor=".to_string(),
+        "succession predecessor=--".to_string(),
+        format!("succession predecessor={}", "AB".repeat(16)),
+        format!("{wire} epoch={}", "34".repeat(16)),
+        format!("succession predecessor=- epoch={}", "34".repeat(16)),
+    ] {
+        assert!(Request::parse(&invalid).is_none(), "{invalid}");
+    }
+    assert!(Request::Succession(Some("56".into())).encode().is_none());
+    let epoch = "34".repeat(16);
+    let bound = Succession::Bound("qualification-foreground".into());
+    for admits in [Succession::Predecessor, Succession::Reentry, bound.clone()] {
+        let line = succession_reply(&epoch, &admits).expect("a canonical epoch");
+        assert_eq!(
+            Reply::parse(&line),
+            Some(Reply::Succession {
+                epoch: epoch.clone(),
+                admits
+            })
+        );
+    }
+    assert_eq!(
+        succession_reply(&epoch, &bound).as_deref(),
+        Some(
+            format!(
+                "OK native-act state=succession epoch={epoch} admits=bound \
+                 why=qualification-foreground\n"
+            )
+            .as_str()
+        )
+    );
+    assert!(succession_reply("34", &bound).is_none());
+    for stage in ["", "Qualification", "two words", &"a".repeat(65)] {
+        assert!(
+            succession_reply(&epoch, &Succession::Bound(stage.into())).is_none(),
+            "{stage:?}"
+        );
+    }
+    for invalid in [
+        format!("OK native-act state=succession epoch={epoch} admits=maybe"),
+        format!("OK native-act state=succession epoch={epoch} admits=bound"),
+        format!("OK native-act state=succession epoch={epoch} admits=bound why="),
+        format!("OK native-act state=succession epoch={epoch} admits=bound why=Upper"),
+        format!("OK native-act state=succession epoch={epoch} admits=bound why=a extra=1"),
+        format!("OK native-act state=succession epoch={epoch} admits=reentry why=a"),
+        format!("OK native-act state=succession epoch={epoch}"),
+        "OK native-act state=succession epoch=34 admits=bound why=a".to_string(),
+    ] {
+        assert!(Reply::parse(&invalid).is_none(), "{invalid}");
+    }
+}

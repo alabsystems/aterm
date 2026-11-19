@@ -180,7 +180,7 @@ fn a_box_on_its_own_axis_keeps_its_lens_heat() {
         max: Some(1.0),
         over: 0.0,
     };
-    let heat = BoxHeat {
+    let heat = BoxHeat::Shares {
         mean: Some(0.1),
         max: Some(0.15),
     };

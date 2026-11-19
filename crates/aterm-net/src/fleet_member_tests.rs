@@ -7489,7 +7489,11 @@ fn an_unavailable_broker_is_not_evidence_of_a_peer_dial() {
     let at = SocketAddr::from(([192, 168, 1, 23], 7100));
     for held in [
         Unavailable::NotInstalled,
-        Unavailable::Outdated { ours: 2, theirs: 1 },
+        Unavailable::Outdated {
+            ours: 2,
+            theirs: 1,
+            build: "0.1.0+gfixture".into(),
+        },
         Unavailable::Refused("code requirement".to_owned()),
         Unavailable::Unchecked("check pending".to_owned()),
     ] {

@@ -107,3 +107,6 @@ pub fn read(facts: &[ProcFacts], now_us: u64) -> Vec<Wait> {
         Vec::new()
     }
 }
+
+#[path = "build_slot_held.rs"]
+pub mod held;

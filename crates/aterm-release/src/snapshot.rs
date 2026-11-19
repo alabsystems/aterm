@@ -81,7 +81,7 @@ impl CacheRoot {
     /// The cache at a caller-selected `root`, created private when absent. Production takes
     /// use [`Self::for_repo`], which places the whole cache beneath a quiet parent.
     pub fn at(root: PathBuf) -> Result<Self, String> {
-        private_dir(&root, "release cache")?;
+        private_build_dir(&root, "release cache")?;
         Ok(Self { root })
     }
 
@@ -229,6 +229,24 @@ pub fn private_dir(path: &Path, what: &str) -> Result<(), String> {
     }
     let uid = crate::buildplan::current_release_uid()?;
     crate::buildplan::open_release_directory(path, uid, true, what).map(drop)
+}
+
+/// Create or claim a private build directory, keeping it out of Spotlight and backups.
+pub(crate) fn private_build_dir(path: &Path, what: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => private_dir(path, what)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("inspect {what} {}: {e}", path.display())),
+    }
+    aterm_uds::backup::Backups::SYSTEM
+        .build_dir(path)
+        .map_err(|e| {
+            format!(
+                "exclude {what} {} from indexing and backups: {e}",
+                path.display()
+            )
+        })?;
+    private_dir(path, what)
 }
 
 /// The source take a release builds, synced and sealed.

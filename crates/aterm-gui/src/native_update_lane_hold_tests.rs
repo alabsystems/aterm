@@ -3,8 +3,18 @@
 
 use super::*;
 
+/// The lane hold a person's state is.
+const fn person_lane_hold(person: PersonHold) -> LaneHold {
+    match person {
+        PersonHold::DeveloperTools => LaneHold::DeveloperTools,
+        PersonHold::SetupDraft => LaneHold::SetupDraft,
+        PersonHold::SetupChoice => LaneHold::SetupChoice,
+    }
+}
+
 /// Every hold has a token of its own and a bound none of which is a person's event; a hold
-/// that holds on a person is that person's own state now, by its own [`PersonHold`].
+/// that holds on a person is that person's own state now, by its own [`PersonHold`]; a hold this
+/// program lifts itself has a backstop within two hours; and none holds on an agent's work.
 #[test]
 fn every_hold_is_bounded_by_time_the_program_or_a_persons_state_now() {
     let mut tokens = std::collections::BTreeSet::new();
@@ -16,12 +26,106 @@ fn every_hold_is_bounded_by_time_the_program_or_a_persons_state_now() {
                 bound > Duration::ZERO && bound <= Duration::from_secs(60 * 60),
                 "{hold:?}: {bound:?}"
             ),
-            HoldBound::Program => {}
+            HoldBound::Program { backstop } => assert!(
+                backstop > Duration::ZERO && backstop <= Duration::from_secs(2 * 60 * 60),
+                "{hold:?}: {backstop:?}"
+            ),
             HoldBound::PersonNow(person) => assert_eq!(
-                person.hold(),
+                person_lane_hold(person),
                 hold,
                 "{hold:?} holds on a person's state that is not its own"
             ),
+            HoldBound::WorkNow(work) => panic!("{hold:?}: the lane holds on no agent's {work:?}"),
+        }
+    }
+}
+
+/// A hold this program lifts itself that stands past its backstop is journaled once per
+/// backstop, never per poll, and stays named from the same start: the act is the record, and
+/// the lane still attempts only when its gates allow. A hold bounded by time or by a person's
+/// state says nothing more however long it is found again.
+#[test]
+fn a_program_hold_past_its_backstop_is_journaled_and_stays_held() {
+    let start = Instant::now();
+    let at = |secs: u64| start + Duration::from_secs(secs);
+    let backstop = PROGRAM_BACKSTOP.as_secs();
+    let mut named = NamedHold::default();
+    assert!(
+        named
+            .hold(7, LaneHold::BoundaryItem, "a sign-out", at(0), 1)
+            .is_some()
+    );
+    for poll in (30..backstop).step_by(30) {
+        assert_eq!(
+            named.hold(7, LaneHold::BoundaryItem, "a sign-out", at(poll), 1),
+            None,
+            "poll {poll}: within the backstop"
+        );
+    }
+    let line = named
+        .hold(7, LaneHold::BoundaryItem, "a sign-out", at(backstop), 1)
+        .expect("the backstop passes");
+    assert_eq!(
+        line,
+        backstop_line(
+            7,
+            LaneHold::BoundaryItem,
+            "a sign-out",
+            PROGRAM_BACKSTOP,
+            PROGRAM_BACKSTOP
+        )
+    );
+    for part in ["(boundary-item)", "attempts only when its gates allow"] {
+        assert!(line.contains(part), "{line:?} says {part:?}");
+    }
+    let held = named.current().expect("still held");
+    assert_eq!((held.hold, held.since), (LaneHold::BoundaryItem, at(0)));
+    assert_eq!(
+        named.hold(
+            7,
+            LaneHold::BoundaryItem,
+            "a sign-out",
+            at(2 * backstop - 1),
+            1
+        ),
+        None,
+        "once per backstop"
+    );
+    assert!(
+        named
+            .hold(7, LaneHold::BoundaryItem, "a sign-out", at(2 * backstop), 1)
+            .is_some_and(|line| line.contains(&format!("after {} s", 2 * backstop))),
+        "the next backstop counts from the last"
+    );
+    assert!(
+        named
+            .hold(
+                7,
+                LaneHold::RosterConfirmation,
+                "the roster",
+                at(3 * backstop),
+                1
+            )
+            .is_none(),
+        "a new hold is said by its own line, here elsewhere"
+    );
+    assert!(
+        named
+            .hold(
+                7,
+                LaneHold::RosterConfirmation,
+                "the roster",
+                at(4 * backstop),
+                1
+            )
+            .is_some(),
+        "a program hold said elsewhere is journaled at its backstop all the same"
+    );
+    for hold in [LaneHold::SetupDraft, LaneHold::Activity] {
+        let mut named = NamedHold::default();
+        named.hold(7, hold, "words", at(0), 1);
+        for poll in [backstop, 10 * backstop] {
+            assert_eq!(named.hold(7, hold, "words", at(poll), 1), None, "{hold:?}");
         }
     }
 }

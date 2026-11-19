@@ -480,11 +480,12 @@ fn a_node_drive_hands_its_window_the_requester_and_refuses_a_drive_without_one()
     let relay = crate::test_scratch::short_dir("dr1-req");
     let window = TestWindow::open(relay.path(), older, Holds::live(&["t000000000d"]), false);
     let asked = Requester::of(
-        Some("s-0123456789abcdef0123"),
+        Some("tqn5r6e0148"),
         Some("claude"),
         Some("Opus 5.5"),
         Some("team acct"),
     );
+    assert_eq!(asked.sid(), Some("tqn5r6e0148"));
     let answer = drive_sending(
         relay.path(),
         Some(older),
@@ -1343,7 +1344,7 @@ fn a_sessions_survey_reaches_each_window_plain_and_is_one_read_in_the_record() {
     let state = aterm_tempfile::tempdir().expect("a state folder");
     let old = TestWindow::open(relay.path(), older, Holds::live(&["t000000000d"]), false);
     let new = TestWindow::open(relay.path(), newer, Holds::live(&["t00000000ae"]), false);
-    let asker = "s-0123456789abcdef0123";
+    let asker = "tqn5r6e0148";
     let reader = crate::fleet_activity::Reader {
         node: "05".repeat(16),
     };

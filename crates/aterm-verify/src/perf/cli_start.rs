@@ -1373,8 +1373,9 @@ mod live {
             use super::super::bench_build::{self, Targo};
             let cache =
                 super::super::workspace_root().join("target/.ubd/cli-start-fixture.noindex");
-            std::fs::create_dir_all(&cache)
-                .map_err(|e| format!("could not create fixture cache: {e}"))?;
+            aterm_uds::backup::Backups::SYSTEM
+                .build_dir(&cache)
+                .map_err(|e| format!("could not prepare fixture cache: {e}"))?;
             let cache = cache.canonicalize().map_err(|e| e.to_string())?;
             let client = client.canonicalize().map_err(|e| e.to_string())?;
             if client.starts_with(&cache) {

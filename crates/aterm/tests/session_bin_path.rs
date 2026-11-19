@@ -8,7 +8,7 @@
 
 use std::io::Write as _;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::launch_isolation;
 
@@ -33,8 +33,8 @@ fn session_path(root: &std::path::Path) -> String {
         .expect("aterm stdin")
         .write_all(b"printf 'PATH_%s=<%s>\\n' $((6*7)) \"$PATH\"\nexit\n")
         .expect("type the line");
-    let out = crate::child_output::wait_and_read(child, Instant::now() + Duration::from_secs(60))
-        .expect("`aterm --session` did not exit within a minute");
+    let out = crate::child_output::wait_and_read(child, Duration::from_secs(60))
+        .unwrap_or_else(|why| panic!("`aterm --session` was killed before it exited: {why}"));
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{:?}: {stdout:?}", out.status);
     let (_, rest) = stdout

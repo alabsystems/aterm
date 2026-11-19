@@ -1180,6 +1180,16 @@ pub(crate) struct NativeLeafRestore {
     pub settings_drafts_unreadable: usize,
 }
 
+/// A durable table row address. The primary key may itself contain a slash.
+pub(crate) fn table_row_route(route: &str) -> Option<(&str, &str)> {
+    let (sheet, key) = route.split_once('/')?;
+    (!sheet.is_empty()
+        && !key.is_empty()
+        && route.len() <= MAX_DOCUMENT_URI_BYTES
+        && !route.chars().any(char::is_control))
+    .then_some((sheet, key))
+}
+
 impl NativeLeafRestore {
     pub(crate) fn mail() -> Self {
         let mut descriptor = Self::about();
@@ -1206,10 +1216,16 @@ impl NativeLeafRestore {
         descriptor
     }
 
-    /// The Tables page: one per app, with no document or route of its own.
-    pub(crate) fn tables() -> Self {
+    pub(crate) fn tables(route: Option<String>) -> Self {
         let mut descriptor = Self::about();
         descriptor.restore_tag = "tables".into();
+        descriptor.route = route.filter(|route| table_row_route(route).is_some());
+        descriptor
+    }
+
+    pub(crate) fn registry(machine: Option<&str>) -> Self {
+        let mut descriptor = Self::tables(machine.map(|key| format!("machine/{key}")));
+        descriptor.restore_tag = "registry".into();
         descriptor
     }
 
@@ -1317,8 +1333,14 @@ impl NativeLeafRestore {
                 .then_some("About has no document or Settings route"),
             "system-state" => (self.route.is_some() || self.uri.is_some())
                 .then_some("System State has no document or Settings route"),
-            "tables" => (self.route.is_some() || self.uri.is_some())
-                .then_some("Tables has no document or Settings route"),
+            "tables" | "registry" => {
+                let invalid = self.route.as_deref().is_some_and(|route| {
+                    table_row_route(route).is_none_or(|(sheet, _)| {
+                        self.restore_tag == "registry" && sheet != "machine"
+                    })
+                });
+                (invalid || self.uri.is_some()).then_some("invalid table row route")
+            }
             "settings" => self
                 .route
                 .as_deref()
@@ -1989,10 +2011,9 @@ pub(crate) struct WindowLayout {
     pub workers_in_front: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restored_tabs: Vec<RestoredTab>,
-    /// The window's navigator dock record (`App`'s `Dock::pref`): absent never decided, `0`
-    /// hidden, `k` shown at `k` cells. The grid and frame above are the window's with it, so a
-    /// window saved with the dock shown is born with it at the frame it had
-    /// (`crate::app_window::birth_dock`).
+    /// The window's preferred session panel width (`App`'s `Dock::pref`). Absent means
+    /// undecided, zero means hidden, and a positive width is kept while fewer than two local
+    /// sessions are addressable. The grid and frame above record the actual layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dock: Option<u16>,
     /// The shown `dock` record was the default's, not a person's Show

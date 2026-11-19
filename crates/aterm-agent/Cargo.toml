@@ -53,6 +53,10 @@ aterm-vitals = { workspace = true }
 # `supervise::prompt` re-export them), shared so the fabric bridge publishes
 # `phase=` from the reader `aterm drive phase` prints.
 aterm-phase = { workspace = true }
+# The roster's login verdict is a fold over dated, witnessed evidence
+# (`harness::accounts::LoginLedger`): `Obs`, `Ledger::verdict` and `CredentialPrint` (pure,
+# std plus its digest).
+aterm-evidence = { workspace = true }
 # The portable control-socket stream (std-only): `RelayClient`'s local-connect
 # constructors talk raw control protocol over a `CtlStream`. No external deps.
 aterm-uds = { workspace = true }

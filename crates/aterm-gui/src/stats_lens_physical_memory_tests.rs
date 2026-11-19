@@ -65,6 +65,7 @@ fn paint_classes(
         oy: 0.0,
         draw: true,
         line_tab: 0.0,
+        chips: None,
         boxes: Vec::new(),
     };
     let height = section.forms[0].h;

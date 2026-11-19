@@ -23,6 +23,10 @@ use aterm_spec::host::could_not_run;
 mod ctl_accept;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
+#[path = "support/patience.rs"]
+mod patience;
+
+use patience::Patience;
 
 const RPC_LANES: usize = 8;
 const WAIT_LANES: usize = 64;
@@ -205,7 +209,7 @@ impl Driver {
     }
 
     fn established(sock: &Path, token: &str) -> Result<Self, String> {
-        let deadline = Instant::now() + HANG;
+        let mut patience = Patience::new(HANG);
         loop {
             let last = match Self::try_open(sock, token) {
                 Ok(mut driver) => {
@@ -217,8 +221,8 @@ impl Driver {
                 }
                 Err(e) => format!("<dial error: {e}>"),
             };
-            if Instant::now() > deadline {
-                return Err(last);
+            if let Some(why) = patience.spent() {
+                return Err(format!("{last} ({why})"));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -348,12 +352,27 @@ fn admitted_wait(sock: &Path, token: &str, wait_ms: u64, reopened: &mut usize) -
 
 fn answered(sock: &Path, token: &str) -> String {
     let mut reply = probe(sock, token);
-    let deadline = Instant::now() + HANG;
-    while reply == BUSY && Instant::now() < deadline {
+    let mut patience = Patience::new(HANG);
+    while reply == BUSY && patience.spent().is_none() {
         std::thread::sleep(Duration::from_millis(50));
         reply = probe(sock, token);
     }
     reply
+}
+
+/// Asserts that each of `waits` still waits, unanswered, once `served` happened. [`answered`]'s
+/// patience can outlast a wait's own timeout, and a lane that a wait's end gives back serves a
+/// client those waits had starved. So a fresh client's `OK` shows that the waits do not starve it
+/// only while every wait still holds its lane.
+fn still_waiting(waits: &mut [Driver], served: &str) {
+    for (index, wait) in waits.iter_mut().enumerate() {
+        let ended = wait.waiting_reply();
+        assert!(
+            ended.is_none(),
+            "wait {index} ended ({ended:?}) before {served}: a lane its end gave back may have \
+             served that client, so the check would be vacuous"
+        );
+    }
 }
 
 #[test]
@@ -372,7 +391,7 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
     for index in 0..IDLE {
         let driver = Driver::established(&sock, &token).unwrap_or_else(|reply| {
             panic!(
-                "idle driver {} of {IDLE} was not served within {HANG:?}: {reply:?}",
+                "idle driver {} of {IDLE} was not served: {reply:?}",
                 index + 1
             )
         });
@@ -382,6 +401,7 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
     let mut waiting = Vec::new();
     for index in 0..WAITING {
         let (wait, reply) = admitted_wait(&sock, &token, WAIT_MS, &mut reopened);
+        waiting.push(wait);
         let reply = if reply == BUSY {
             answered(&sock, &token)
         } else {
@@ -393,7 +413,10 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
              {reply:?}",
             index + 1
         );
-        waiting.push(wait);
+        still_waiting(
+            &mut waiting,
+            &format!("the fresh client beside wait {index} was served"),
+        );
     }
 
     for attempt in 0..20 {
@@ -403,6 +426,7 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
             "fresh client {attempt} was refused with {IDLE} idle and {WAITING} waiting \
              drivers open: {reply:?}"
         );
+        still_waiting(&mut waiting, &format!("fresh client {attempt} was served"));
         std::thread::sleep(Duration::from_millis(50));
     }
     let out = aterm_ctl(&world.0, &sock, &["status"]);
@@ -772,7 +796,7 @@ fn the_request_ledger_counts_each_request_under_its_peer_and_verb() {
     let _instance = boot(&world.0, &sock, LAUNCHD_SOFT_LIMIT);
     let token = token(&sock);
     let mut driver = Driver::established(&sock, &token)
-        .unwrap_or_else(|reply| panic!("the driver was not served within {HANG:?}: {reply:?}"));
+        .unwrap_or_else(|reply| panic!("the driver was not served: {reply:?}"));
 
     let before = request_ledger(&driver.request("metrics"));
     for _ in 0..ASKED {
@@ -1025,7 +1049,14 @@ fn peers_that_stop_mid_exchange_take_no_lane() {
     let mut silent: Vec<Driver> = Vec::new();
     while silent.len() < EACH {
         let mut peer = Driver::silent(&sock);
-        answered(&sock, &token);
+        // Judged here, not only after the loop: a lane a silent peer held would keep each
+        // later round's `answered` busy until its patience ran out, round after round.
+        let reply = answered(&sock, &token);
+        assert!(
+            reply.starts_with("OK"),
+            "a fresh client was refused beside {} silent peers: {reply:?}",
+            silent.len() + 1
+        );
         if peer.waiting_reply().is_none() {
             silent.push(peer);
         }

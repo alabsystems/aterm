@@ -642,6 +642,13 @@ impl Recheck {
             .is_none_or(|at| now.saturating_duration_since(at) >= RECHECK)
     }
 
+    /// When the next look is due (a monotonic instant): `None` while one is due now, before
+    /// any look.
+    #[must_use]
+    pub fn next_look(&self) -> Option<std::time::Instant> {
+        self.last.map(|at| at + RECHECK)
+    }
+
     /// Whether to wake a pass now, `due` asked only when a look is due at `now` (a monotonic instant).
     pub fn wake(&mut self, now: std::time::Instant, due: impl FnOnce() -> Option<DueFlip>) -> bool {
         if !self.look_due(now) {

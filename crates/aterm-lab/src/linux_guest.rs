@@ -1287,6 +1287,61 @@ pub fn run_unit(unit: &Unit, workdir: Option<&str>) -> Vec<String> {
     argv
 }
 
+/// Keep ExecStart and its native MainPID unchanged, recording the manager's main-exit
+/// environment before --collect can forget the unit. The record is diagnostic data,
+/// not a process identity or a successful-cleanup receipt.
+pub(crate) fn run_unit_with_exit_record(
+    unit: &Unit,
+    workdir: Option<&str>,
+    record: &str,
+) -> Vec<String> {
+    let mut unit = unit.clone();
+    unit.env
+        .push(("ATERM_LANE_EXIT_RECORD".into(), record.into()));
+    let mut argv = run_unit(&unit, workdir);
+    let hook = ["/bin/sh", "-c", MAIN_EXIT_RECORD, "main-exit-record"]
+        .into_iter()
+        .map(transient_exec_word)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let separator = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("run_unit's command separator");
+    argv.insert(separator, format!("--property=ExecStopPost={hook}"));
+    argv
+}
+
+// Quote the transient D-Bus command property and protect dollars from the manager's
+// runtime environment expansion. This path does not expand unit-file percent specifiers:
+// doubling printf's percent signs would leave literal %s fields in the actual record.
+const MAIN_EXIT_RECORD: &str = "umask 077; set -C; \
+    printf 'schema=1\\ninvocation=%s\\ncode=%s\\nstatus=%s\\nresult=%s\\n' \
+    \"${INVOCATION_ID-}\" \"${EXIT_CODE-}\" \"${EXIT_STATUS-}\" \"${SERVICE_RESULT-}\" \
+    >\"${ATERM_LANE_EXIT_RECORD}.part\" \
+    && ln -- \"${ATERM_LANE_EXIT_RECORD}.part\" \"$ATERM_LANE_EXIT_RECORD\" \
+    && rm -- \"${ATERM_LANE_EXIT_RECORD}.part\"";
+
+fn transient_exec_word(word: &str) -> String {
+    let mut escaped = String::from("\"");
+    for ch in word.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '$' => escaped.push_str("$$"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => {
+                write!(escaped, "\\u{:04x}", u32::from(ch)).expect("String write")
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
 /// Wait, in the guest, until `socket` exists: `timeout` ends the wait (exit 124) after `secs`, a hang detector.
 #[must_use]
 pub fn wait_socket(socket: &str, secs: u32) -> Vec<String> {

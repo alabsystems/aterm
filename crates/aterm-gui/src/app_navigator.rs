@@ -4,7 +4,7 @@
 //! The navigator's host (tracker ST-04, `docs/DESIGN-streams-2026-11-12.md` §3): where it opens,
 //! what it lists, and when it reads.
 //!
-//! THE LIST IS PUBLISHED ON CHANGE, AND IT KEEPS NO POLLING TIMER. The loop thread marks what may
+//! The list's session facts are published on change. A visible resource panel projects the existing readings when its five-second buckets close. The loop thread marks what may
 //! have moved where it already handles the event ([`App::navigator_mark_structure`],
 //! [`App::navigator_mark_row`], [`App::navigator_mark_words`], [`App::navigator_note_output`]): a
 //! mark is an insert into a set, and one branch while no navigator is open.
@@ -29,6 +29,10 @@
 //! revision with each change, so a reader of its page compiles the list as it stands, and is
 //! drawn whole, with a frame asked for, when it shows.
 
+#[path = "app_local_panel_roster.rs"]
+mod local_panel_roster;
+pub(crate) use local_panel_roster::LocalPanelRoster;
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +46,125 @@ use crate::session_store::{SessionHandle, SessionState};
 use crate::tab_model::{AppInstanceId, SplitAxis, View, ViewId};
 use crate::task_record::TaskState;
 use crate::{App, WindowId};
+
+/// A parked tab shown in place of the current tab. An auxiliary session borrows a live view
+/// for the preview; a locally hidden session already owns its view here.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SessionPreview {
+    pub(crate) tab: crate::tab_model::TabId,
+    pub(crate) anchor: Option<crate::tab_model::TabId>,
+    pub(crate) session: u64,
+    pub(crate) borrowed: bool,
+}
+
+impl crate::WindowState {
+    /// Tabs in the top strip, paired with their canonical indices.
+    pub(crate) fn strip_tabs(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (usize, &crate::tab_model::Tab)> {
+        self.tab_set
+            .shown()
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| !self.organizer_tabs.contains(&tab.id))
+    }
+
+    pub(crate) fn strip_tab_count(&self) -> usize {
+        if self.organizer_tabs.is_empty() {
+            self.tab_set.shown_len()
+        } else {
+            self.strip_tabs().count()
+        }
+    }
+
+    pub(crate) fn strip_index_of(&self, id: crate::tab_model::TabId) -> Option<usize> {
+        self.strip_tabs().position(|(_, tab)| tab.id == id)
+    }
+
+    pub(crate) fn strip_index_to_tab_index(&self, slot: usize) -> Option<usize> {
+        self.strip_tabs().nth(slot).map(|(index, _)| index)
+    }
+
+    pub(crate) fn active_session_preview(&self) -> Option<SessionPreview> {
+        self.dock
+            .preview
+            .filter(|p| self.tab_set.active_id() == Some(p.tab))
+    }
+
+    pub(crate) fn preview_on_chip(&self, chip: crate::tab_model::TabId) -> Option<SessionPreview> {
+        self.active_session_preview()
+            .filter(|p| p.anchor == Some(chip))
+    }
+
+    pub(crate) fn preview_chip_label(&self, chip: crate::tab_model::TabId) -> Option<String> {
+        let preview = self.preview_on_chip(chip)?;
+        let label = self
+            .tab_chrome_titles_by_tab
+            .get(&preview.tab)
+            .map(|(_, title)| title.as_str())
+            .or_else(|| {
+                self.tab_set
+                    .get(preview.tab)
+                    .map(|tab| tab.presentation.title.as_str())
+            })?;
+        Some(format!("Preview · {label}"))
+    }
+
+    /// A preview edits in its anchor's title slot; a full session edits in its own.
+    pub(crate) fn title_chip(
+        &self,
+        tab: crate::tab_model::TabId,
+    ) -> Option<crate::tab_model::TabId> {
+        let chip = self
+            .dock
+            .preview
+            .filter(|preview| preview.tab == tab)
+            .and_then(|preview| preview.anchor)
+            .or_else(|| self.tab_set.chip_of(tab))?;
+        self.strip_index_of(chip).map(|_| chip)
+    }
+
+    /// Resolve a pointer against the identity the tab strip actually drew.
+    pub(crate) fn painted_tab_index(&self, slot: usize) -> Option<usize> {
+        if self.painted_strip_ids.is_empty() {
+            return self.strip_index_to_tab_index(slot);
+        }
+        let id = *self.painted_strip_ids.get(slot)?;
+        self.strip_tabs()
+            .find_map(|(index, tab)| (tab.id == id).then_some(index))
+    }
+
+    pub(crate) fn strip_projection<'a, T: Clone>(
+        &self,
+        items: &'a [T],
+    ) -> std::borrow::Cow<'a, [T]> {
+        if self.organizer_tabs.is_empty() {
+            std::borrow::Cow::Borrowed(&items[..items.len().min(self.tab_set.shown_len())])
+        } else {
+            std::borrow::Cow::Owned(
+                self.strip_tabs()
+                    .filter_map(|(index, _)| items.get(index).cloned())
+                    .collect(),
+            )
+        }
+    }
+
+    pub(crate) fn selected_strip_index(&self) -> Option<usize> {
+        self.dock
+            .preview
+            .filter(|preview| self.tab_set.active_id() == Some(preview.tab))
+            .and_then(|preview| preview.anchor)
+            .and_then(|anchor| self.strip_index_of(anchor))
+            .or_else(|| {
+                let canonical = self.tab_set.strip_active()?;
+                if self.organizer_tabs.is_empty() {
+                    Some(canonical)
+                } else {
+                    self.strip_index_of(self.tab_set.tab_at(canonical)?.id)
+                }
+            })
+    }
+}
 
 /// The least time between two reads of the latest words.
 const NAV_WORDS_STEP: Duration = Duration::from_secs(1);
@@ -69,14 +192,17 @@ enum Seat {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct OwnWord {
     runs: bool,
-    program: Option<&'static str>,
+    word: Option<&'static str>,
+    program: Option<aterm_core::terminal::program_state::ProgramApp>,
 }
 
 impl OwnWord {
     fn of(feed: &crate::vitals_jobs::JobFeed) -> Self {
+        let (state, program) = feed.program();
         Self {
             runs: feed.runs(),
-            program: feed.program().map(crate::program_state::survey_word),
+            word: state.map(crate::program_state::survey_word),
+            program,
         }
     }
 }
@@ -102,6 +228,8 @@ struct NavView {
     keys: bool,
     /// A person's keyboard is on it: `keys`, in the key window.
     at_hand: bool,
+    /// This view belongs to the window's numbered local session organizer.
+    local_panel: bool,
     /// The bits of the width and height it is laid out in while it shows, so a view that was
     /// resized is a view that changed.
     size: (u32, u32),
@@ -145,7 +273,7 @@ pub(crate) struct NavWatch {
     suspended: bool,
     /// The layout, the set of sessions, a focus or the machine's name may have moved.
     structure: bool,
-    /// Sessions whose title, word, agent or creator may have moved.
+    /// Sessions whose title, word, foreground program or creator may have moved.
     rows: BTreeSet<u64>,
     /// Sessions on a view's screen whose latest words may have moved.
     words: BTreeSet<u64>,
@@ -156,6 +284,10 @@ pub(crate) struct NavWatch {
     screen_stale: bool,
     /// The sessions with a row on some view's screen.
     screen: BTreeSet<u64>,
+    /// The union of local sessions painted in a session panel. Mirrored views read each producer once.
+    panel_screen: BTreeSet<u64>,
+    /// Next close of the shared five-second resource bucket, only when a panel has rows.
+    resources_at: Option<Instant>,
     words_read_at: Option<Instant>,
     /// When the ages are next worded; `None` while no view is on screen.
     age_at: Option<Instant>,
@@ -210,6 +342,7 @@ impl NavWatch {
             || self.screen_stale
             || !self.rows.is_empty()
             || self.words_due(now)
+            || self.resources_at.is_some_and(|at| now >= at)
             || self.age_at.is_some_and(|at| now >= at))
     }
 
@@ -244,6 +377,12 @@ fn concluded(state: Option<TaskState>) -> bool {
 impl App {
     /// The layout, the set of sessions or a focus may have moved.
     pub(crate) fn navigator_mark_structure(&mut self) {
+        self.local_panel_roster.invalidate();
+        self.navigator_mark_presentation();
+    }
+
+    /// The visible pages or their ordering changed while the process kept the same sessions.
+    pub(crate) fn navigator_mark_presentation(&mut self) {
         if let Some(nav) = self.nav.as_deref_mut() {
             nav.structure = true;
         }
@@ -333,7 +472,10 @@ impl App {
     /// Whether `view` is a page that stands beside the panes of its tab as a sidebar: its edge
     /// on them is a hairline, not the pane divider.
     pub(crate) fn view_is_sidebar_page(&self, view: ViewId) -> bool {
-        self.nav.is_some() && self.view_is_unrestored_page(view)
+        self.nav.is_some()
+            && self
+                .navigator_instance_id()
+                .is_some_and(|instance| self.is_navigator_view(view, instance))
     }
 
     /// When the latest words marked on a screen are next read: at once, or a step after the
@@ -349,7 +491,7 @@ impl App {
     /// The next deadline the list owes: marked words on a screen, or the ages' minute.
     pub(crate) fn navigator_wake(&self) -> Option<Instant> {
         let nav = self.nav.as_deref()?;
-        [self.navigator_words_wake(), nav.age_at]
+        [self.navigator_words_wake(), nav.age_at, nav.resources_at]
             .into_iter()
             .flatten()
             .min()
@@ -434,11 +576,14 @@ impl App {
         matches!(self.view_store.get(view), Some(View::Native(native)) if native.instance == instance)
     }
 
-    /// Whether `view` is a navigator's: a page the restore manifest and Reopen Closed Tab leave
-    /// out, since what it lists is the machine's sessions and not a document of its own.
+    /// Whether `view` is a page the restore manifest and Reopen Closed Tab leave out
+    /// ([`crate::native_app::AppKind::left_out_of_restore`]): the navigator, whose list is the
+    /// machine's sessions, and System Resources, whose head is the machine's reading; neither is
+    /// a document of its own.
     pub(crate) fn view_is_unrestored_page(&self, view: ViewId) -> bool {
-        self.navigator_instance_id()
-            .is_some_and(|instance| self.is_navigator_view(view, instance))
+        matches!(self.view_store.get(view), Some(View::Native(native))
+            if self.native_runtime.app(native.instance)
+                .is_some_and(|app| app.kind().left_out_of_restore()))
     }
 
     fn ensure_navigator_instance(&mut self) -> Result<AppInstanceId, String> {
@@ -490,6 +635,10 @@ impl App {
     /// a tab of its own. A tab that already holds it gets the keys on it. Whether it is a split.
     pub(crate) fn open_navigator(&mut self, split: bool) -> Result<bool, String> {
         let wid = self.frontmost_window.ok_or("No window for the navigator")?;
+        self.open_navigator_in(wid, split)
+    }
+
+    pub(crate) fn open_navigator_in(&mut self, wid: WindowId, split: bool) -> Result<bool, String> {
         let person_in = self.focused_session_id(wid).or_else(|| {
             self.windows
                 .get(&wid)?
@@ -621,6 +770,7 @@ impl App {
                     visible: viewport.is_some(),
                     keys: false,
                     at_hand: false,
+                    local_panel: ws.dock.roster_panel,
                     size: viewport
                         .map_or((0, 0), |rect| (rect.width.to_bits(), rect.height.to_bits())),
                 });
@@ -641,6 +791,7 @@ impl App {
                             visible: viewport.is_some(),
                             keys,
                             at_hand: keys && ws.focused,
+                            local_panel: false,
                             size: viewport.map_or((0, 0), |viewport| {
                                 (viewport.width.to_bits(), viewport.height.to_bits())
                             }),
@@ -689,23 +840,46 @@ impl App {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .by_local(session)
-            .filter(|handle| handle.state != SessionState::Exited)
+            .filter(|handle| handle.local_id == session && handle.state != SessionState::Exited)
             .cloned()
+    }
+
+    fn navigator_state(&self, view: ViewId) -> Option<&NavigatorViewState> {
+        match self.native_runtime.view_state(view)? {
+            AppViewState::Navigator(state) => Some(state),
+            _ => None,
+        }
     }
 
     /// One session's row as it reads now, with `line` and `moved_ms` as its last read left them;
     /// `said` is what the session says of itself. The store's lock is not held: the row reads it
     /// for its creator.
     fn navigator_row(&self, handle: &SessionHandle, line: Option<String>, said: OwnWord) -> NavRow {
-        let (task, taken_off, from, task_agent, gone, asks, agent_word, program) = {
+        let observed = self.config.tab_status_or_default();
+        let (task, original_topic, taken_off, from, gone, need, agent_word, program) = {
             let timeline = handle
                 .ctx
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let task = timeline.task();
+            let front = timeline.agent();
+            let program = if observed {
+                crate::harness_host::identified_agent(front)
+                    .map(|agent| agent.name())
+                    .or(front.program.as_deref())
+                    .map(str::to_owned)
+            } else {
+                said.program.map(|app| {
+                    let name = app.as_str();
+                    aterm_phase::program_of(name)
+                        .map_or(name, |agent| agent.name())
+                        .to_owned()
+                })
+            };
             (
                 task.map(|task| task.state),
+                task.and_then(|task| task.line.clone()),
                 task.is_some_and(|task| {
                     matches!(
                         task.why,
@@ -714,21 +888,21 @@ impl App {
                 }),
                 task.map(|task| task.from.clone())
                     .filter(|from| from != crate::task_record::FROM_CTL),
-                task.and_then(|task| task.agent),
                 task.filter(|task| crate::native_workers::agent_gone(task))
                     .and_then(crate::app_take_over::worker_label),
-                timeline.need().need.is_some(),
+                timeline.need().need.as_ref().map(|need| need.word),
                 timeline.shown_agent_word().0,
-                crate::harness_host::agent_of(timeline.agent()),
+                program,
             )
         };
         let session = handle.local_id;
         // A worker whose agent has gone is titled by its shell's folder: its row names what it
         // ran, unless a role or a pinned title names the session (as its Workers row does).
-        let title = match gone {
-            Some(name) if self.named_label_of_session(session).is_none() => name,
-            _ => self.tab_label_of_session(session),
-        };
+        let name = self.named_label_of_session(session);
+        let named = name.is_some();
+        let title = name
+            .or(gone)
+            .unwrap_or_else(|| self.unnamed_tab_label_of_session(session));
         let creator = from.and_then(|from| {
             aterm_session::SessionId::parse(&from)
                 .and_then(|from| self.local_session_of(&from))
@@ -739,7 +913,7 @@ impl App {
         // nothing observes the session, and what it says of itself is the fact: its program's
         // own report, and its shell's word on whether a command runs. The shell's word alone
         // would read an agent `working` for as long as its process lives.
-        let (agent_word, running) = if self.config.tab_status_or_default() {
+        let (agent_word, running) = if observed {
             (
                 agent_word,
                 self.session_status
@@ -747,18 +921,19 @@ impl App {
                     .is_some_and(|status| crate::session_status::status_indicators(status).busy),
             )
         } else {
-            (said.program.unwrap_or("-"), said.runs)
+            (said.word.unwrap_or("-"), said.runs)
         };
         NavRow {
             session,
+            shortcut: self.local_panel_roster.number(session),
             title,
-            agent: task_agent
-                .or(program)
-                .map(|program| program.name().to_owned()),
+            original_topic,
+            named,
+            program,
             word: crate::navigator::word_of(&crate::navigator::WordFacts {
                 task,
                 taken_off,
-                asks,
+                need,
                 agent_word,
                 running,
             }),
@@ -766,6 +941,63 @@ impl App {
             moved_ms: handle.ctx.screen_moves.moved_ms(),
             creator,
         }
+    }
+
+    /// Read each visible producer once, even when several windows display the same session.
+    fn local_panel_readings(
+        &self,
+        keys: &BTreeSet<u64>,
+        now: Instant,
+        at_ns: u64,
+    ) -> crate::navigator::resources::Panel {
+        let snapshot = self.vitals.snapshot.as_deref();
+        keys.iter()
+            .filter_map(|&key| {
+                let session = self.navigator_handle(key)?;
+                // The reader may have sampled a previous launch of this session. Its sweep
+                // carries that launch's identity and its own kernel process-generation clock.
+                let resources = snapshot
+                    .and_then(|snapshot| snapshot.pane_resources.get(&key))
+                    .filter(|history| {
+                        history.source.as_ref().is_some_and(|source| {
+                            source.local == key
+                                && source.sid == session.sid.as_str()
+                                && source.nonce == session.nonce.to_hex()
+                        }) && history.root.is_some_and(|root| {
+                            root.pid > 0
+                                && Some(root.pid) == u32::try_from(session.shell_identity.pid).ok()
+                        })
+                    });
+                let cpu = snapshot
+                    .and_then(|snapshot| snapshot.pane_cpu.get(&key))
+                    .filter(|cpu| {
+                        resources.is_some_and(|r| cpu.root == r.root && cpu.source == r.source)
+                    });
+                let tokens = snapshot
+                    .and_then(|snapshot| snapshot.pane_tokens.get(&key))
+                    .filter(|history| {
+                        session
+                            .ctx
+                            .timeline
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .panel_token_owner(session.nonce)
+                            .as_ref()
+                            == Some(&history.owner)
+                    });
+                Some((
+                    key,
+                    crate::navigator::resources::Readings::of(
+                        cpu,
+                        resources,
+                        tokens,
+                        at_ns,
+                        session.ctx.sink.input_byte_rates(now),
+                        session.ctx.job_feed.output_byte_rates(now),
+                    ),
+                ))
+            })
+            .collect()
     }
 
     /// Read `session`'s latest words where what they are read from moved since the last read.
@@ -826,6 +1058,7 @@ impl App {
     /// Publish the list where something marked did move, and repaint what moved: the page whole
     /// where its arrangement changed, the changed rows' band where only their words did.
     pub(crate) fn publish_navigators(&mut self, now: Instant) {
+        self.reconcile_local_panel_layout(now);
         if self.nav.as_deref().is_none_or(|nav| nav.idle(now)) {
             return;
         }
@@ -861,6 +1094,8 @@ impl App {
                 nav.words.clear();
                 nav.trailing.clear();
                 nav.screen.clear();
+                nav.panel_screen.clear();
+                nav.resources_at = None;
                 nav.age_at = None;
                 nav.words_read_at = None;
                 nav.screen_stale = true;
@@ -1001,19 +1236,110 @@ impl App {
         // it, and which session the person is in.
         let mut moved_views: Vec<ViewId> = Vec::new();
         if facts || reshaped {
+            let organizer = if nav
+                .views
+                .iter()
+                .any(|at| self.dock_view(at.window) == Some(at.view))
+            {
+                self.organizer_windows()
+            } else {
+                Vec::new()
+            };
             for at in &nav.views {
                 let person_in = (!at.keys)
                     .then(|| self.focused_session_id(at.window))
                     .flatten();
+                let dock = self
+                    .windows
+                    .get(&at.window)
+                    .filter(|ws| ws.dock.view == Some(at.view))
+                    .map(|ws| {
+                        let mut sessions = crate::navigator::DockSessions {
+                            numbered: ws.dock.roster_panel,
+                            windows: organizer.clone(),
+                            ..Default::default()
+                        };
+                        let mut seen = std::collections::HashSet::new();
+                        for (_, tab) in ws.strip_tabs() {
+                            tab.root.visit(&mut |view| {
+                                if let Some(s) = self
+                                    .view_store
+                                    .get(*view)
+                                    .copied()
+                                    .and_then(View::terminal_session)
+                                    && tree.index_of(s).is_some()
+                                    && seen.insert(s)
+                                {
+                                    sessions.order.push(s);
+                                }
+                            });
+                        }
+                        sessions.shown = sessions.order.len();
+                        sessions.order.extend(
+                            nav.parked
+                                .iter()
+                                .chain(&nav.pinned)
+                                .copied()
+                                .filter(|s| tree.index_of(*s).is_some() && seen.insert(*s)),
+                        );
+                        if !ws.dock.hidden_order.is_empty() {
+                            let sorted = crate::navigator::steady(
+                                &ws.dock.hidden_order,
+                                &sessions.order[sessions.shown..],
+                            );
+                            sessions.order.truncate(sessions.shown);
+                            sessions.order.extend(sorted);
+                        }
+                        sessions.preview = ws
+                            .dock
+                            .preview
+                            .filter(|preview| ws.tab_set.active_id() == Some(preview.tab))
+                            .map(|preview| preview.session);
+                        sessions
+                    });
                 let moved = self.native_runtime.change_view_state(at.view, |state| {
                     let AppViewState::Navigator(state) = state else {
                         return false;
                     };
-                    state.follow(at.keys, at.at_hand, person_in, &tree)
+                    let reordered = dock.is_some_and(|dock| {
+                        if state.sessions == dock {
+                            return false;
+                        }
+                        state.sessions = dock;
+                        true
+                    });
+                    state.follow(at.keys, at.at_hand, person_in, &tree) || reordered
                 });
                 if moved {
                     moved_views.push(at.view);
                     nav.screen_stale = true;
+                }
+            }
+        }
+
+        // A rewrapped identity shifts every card below it, including which sessions supply
+        // the visible telemetry. One changed card's old raster band cannot cover that shift.
+        if !reshaped && !changed.is_empty() {
+            for at in nav.views.iter().filter(|at| at.local_panel) {
+                let Some((width, _)) = at.viewport() else {
+                    continue;
+                };
+                let Some(state) = self.navigator_state(at.view) else {
+                    continue;
+                };
+                if changed.iter().any(|&session| {
+                    let Some(i) = old.index_of(session) else {
+                        return false;
+                    };
+                    let Some(after) = nav.held.get(&session) else {
+                        return false;
+                    };
+                    state.panel_row_resized(&old.entries[i].row, after, width)
+                }) {
+                    nav.screen_stale = true;
+                    if !moved_views.contains(&at.view) {
+                        moved_views.push(at.view);
+                    }
                 }
             }
         }
@@ -1024,10 +1350,12 @@ impl App {
         let mut arrived: Vec<u64> = Vec::new();
         if std::mem::take(&mut nav.screen_stale) || reshaped {
             let mut on_screen = Vec::new();
+            let mut panel_screen = BTreeSet::new();
             for at in &nav.views {
                 let Some((width, height)) = at.viewport() else {
                     continue;
                 };
+                let from = on_screen.len();
                 let moved = self.native_runtime.change_view_state(at.view, |state| {
                     let AppViewState::Navigator(state) = state else {
                         return false;
@@ -1036,15 +1364,34 @@ impl App {
                     state.on_screen(&tree, width, height, &mut on_screen);
                     moved
                 });
+                if at.local_panel {
+                    panel_screen.extend(&on_screen[from..]);
+                }
                 if moved && !moved_views.contains(&at.view) {
                     moved_views.push(at.view);
                 }
+            }
+            if nav.panel_screen != panel_screen {
+                nav.panel_screen = panel_screen;
+                nav.resources_at = (!nav.panel_screen.is_empty()).then_some(now);
             }
             let screen: BTreeSet<u64> = on_screen.into_iter().collect();
             arrived.extend(screen.difference(&nav.screen));
             nav.words.retain(|session| screen.contains(session));
             nav.trailing.retain(|session| screen.contains(session));
             nav.screen = screen;
+        }
+        let mut resources_changed = false;
+        if nav.resources_at.is_some_and(|at| now >= at) {
+            let epoch = aterm_session::terminal_stream::epoch();
+            let age = now.saturating_duration_since(epoch);
+            let at_ns = u64::try_from(age.as_nanos()).unwrap_or(u64::MAX);
+            let readings = self.local_panel_readings(&nav.panel_screen, now, at_ns);
+            resources_changed = self
+                .native_runtime
+                .publish_panel_resources(instance, readings, at_ns);
+            let bucket_ns = aterm_vitals::pane_cpu::BUCKET_NS;
+            nav.resources_at = Some(now + Duration::from_nanos(bucket_ns - at_ns % bucket_ns));
         }
         let due = nav.words_due(now);
         let mut read: Vec<u64> = arrived;
@@ -1111,7 +1458,8 @@ impl App {
         // the rows that changed, at the view's revision, so the page rasters that band alone.
         let (mut was_listed, mut now_listed) = (Vec::new(), Vec::new());
         for at in &nav.views {
-            let moved = reshaped || moved_views.contains(&at.view);
+            let moved =
+                reshaped || moved_views.contains(&at.view) || (at.local_panel && resources_changed);
             let revise = |runtime: &mut crate::native_app::NativeRuntime| {
                 runtime.change_view_state(at.view, |state| {
                     let common = state.common_mut();
@@ -1140,8 +1488,7 @@ impl App {
                 nav.owed.swap_remove(owed);
             }
             let mut whole = moved || owed.is_some();
-            let Some(AppViewState::Navigator(state)) = self.native_runtime.view_state(at.view)
-            else {
+            let Some(state) = self.navigator_state(at.view) else {
                 continue;
             };
             if !whole && !changed.is_empty() && state.filtered() {
@@ -1210,12 +1557,101 @@ impl App {
             .is_some_and(|nav| nav.screen.contains(&session))
     }
 
-    /// Hand off what a press on the navigator asked for: show the session and raise its window.
+    fn organizer_windows(&self) -> Vec<crate::navigator::OrganizerWindow> {
+        let mut rows = Vec::new();
+        let home = self.tab_home_window();
+        for (&wid, window) in &self.windows {
+            let current = window.tab_set.active_id();
+            for tab in window.tab_set.tabs() {
+                let selected = self.frontmost_window == Some(wid) && current == Some(tab.id);
+                let mut has_native_view = false;
+                tab.root.visit(&mut |view| {
+                    let Some(View::Native(native)) = self.view_store.get(*view) else {
+                        return;
+                    };
+                    let Some(app) = self.native_runtime.app(native.instance) else {
+                        return;
+                    };
+                    has_native_view = true;
+                    let label = if app.kind().is_organizer_window()
+                        || self.view_is_private(*view)
+                        || tab.presentation.title.is_empty()
+                    {
+                        app.kind().display_name()
+                    } else {
+                        &tab.presentation.title
+                    };
+                    rows.push(crate::navigator::OrganizerWindow {
+                        view: *view,
+                        label: if Some(wid) == home {
+                            label.to_owned()
+                        } else {
+                            format!("{label} · Window {}", wid.0 + 1)
+                        },
+                        selected: selected && tab.focus == *view,
+                    });
+                });
+                if !has_native_view && Some(wid) != home && current == Some(tab.id) {
+                    let label = self
+                        .focused_session_id(wid)
+                        .map(|s| self.tab_label_of_session(s))
+                        .unwrap_or_else(|| tab.presentation.title.clone());
+                    rows.push(crate::navigator::OrganizerWindow {
+                        view: tab.focus,
+                        label: format!("{label} · Window {}", wid.0 + 1),
+                        selected,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    fn focus_organizer_window(&mut self, view: ViewId) {
+        let target = self.windows.iter().find_map(|(&wid, ws)| {
+            ws.tab_set
+                .tabs()
+                .iter()
+                .position(|tab| tab.root.contains(view))
+                .map(|index| (wid, index))
+        });
+        if let Some((wid, index)) = target {
+            self.frontmost_window = Some(wid);
+            self.switch_tab_in(wid, index);
+            if let Some(session) = self
+                .view_store
+                .get(view)
+                .copied()
+                .and_then(View::terminal_session)
+            {
+                self.focus_session_pane(wid, session, view);
+            } else if let Some(mut ws) = self.windows.get_mut(&wid) {
+                if let Some(active) = ws.tab_set.active_mut() {
+                    active.set_focus(view);
+                }
+                crate::app_tabs::cancel_pending_close(&mut ws);
+            }
+            self.sync_active_session();
+            self.raise_window(wid);
+            self.request_window_redraw(wid);
+        }
+    }
+
+    /// The organizer previews sessions in place; the standalone navigator raises their window.
     pub(crate) fn drain_navigator_actions(&mut self, wid: WindowId, instance: AppInstanceId) {
-        while let Some(NavAction::Go(session)) = self.native_runtime.take_navigator_action(instance)
-        {
-            if !self.focus_session_preferring(Some(wid), session) {
-                aterm_log::info!("navigator: session {session} is gone");
+        while let Some(action) = self.native_runtime.take_navigator_action(instance) {
+            match action {
+                NavAction::Window(view) => self.focus_organizer_window(view),
+                NavAction::Go(session) => {
+                    if self.navigator_handle(session).is_none()
+                        || !self.focus_session_preferring(Some(wid), session)
+                    {
+                        aterm_log::info!("navigator: session {session} is gone");
+                    }
+                }
+                NavAction::Preview(session) => {
+                    self.activate_local_panel_session(wid, session);
+                }
             }
         }
         self.navigator_view_moved();
@@ -1239,13 +1675,6 @@ impl App {
 
     pub(crate) fn navigator_tree(&self) -> Option<Arc<NavTree>> {
         self.nav.as_deref().map(|nav| Arc::clone(&nav.tree))
-    }
-
-    fn navigator_state(&self, view: ViewId) -> Option<&NavigatorViewState> {
-        match self.native_runtime.view_state(view)? {
-            AppViewState::Navigator(state) => Some(state),
-            _ => None,
-        }
     }
 
     pub(crate) fn navigator_listing(&self, view: ViewId) -> Vec<NavListed> {

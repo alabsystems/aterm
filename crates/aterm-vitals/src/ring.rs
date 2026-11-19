@@ -67,6 +67,77 @@ impl Taken {
     }
 }
 
+/// The part of a reading's slot inside one epoch bucket that earlier readings do not cover.
+/// The returned end advances only when that part has positive weight.
+pub(crate) fn slot_weight(t: Taken, k: i64, period_ms: i64, covered_to: i64) -> (u32, i64) {
+    let period = period_ms.max(1);
+    let (lo, hi) = t.slot();
+    let bucket_lo = k.saturating_mul(period);
+    let bucket_hi = bucket_lo.saturating_add(period);
+    let from = lo.max(covered_to).max(bucket_lo);
+    let to = hi.min(bucket_hi);
+    let weight = u32::try_from(to.saturating_sub(from).clamp(0, period)).unwrap_or(u32::MAX);
+    (weight, if weight > 0 { to } else { covered_to })
+}
+
+/// The projected part of an accumulator: enough to preserve its weighted mean, maximum and
+/// read/over time without retaining a minimum and count no consumer asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub(crate) struct CompactAgg {
+    mean: f64,
+    max: f64,
+    tau_ms: u32,
+    over_ms: u32,
+}
+
+impl CompactAgg {
+    /// Reconstitute a retained finite mean/max/read-time projection with no over time. Callers
+    /// keep the same accumulator guards by feeding further readings through [`Self::add`].
+    pub(crate) fn from_projection(mean: f64, max: f64, tau_ms: u32) -> Self {
+        Self {
+            mean,
+            max,
+            tau_ms,
+            over_ms: 0,
+        }
+    }
+
+    fn agg(self) -> Agg {
+        Agg {
+            tau_ms: self.tau_ms,
+            n: u16::from(self.tau_ms > 0),
+            over_ms: self.over_ms,
+            mean: self.mean,
+            min: self.mean,
+            max: self.max,
+        }
+    }
+
+    fn put(&mut self, agg: Agg) {
+        self.mean = agg.mean;
+        self.max = agg.max;
+        self.tau_ms = agg.tau_ms;
+        self.over_ms = agg.over_ms;
+    }
+
+    pub(crate) fn add(&mut self, value: f64, weight_ms: u32, over: bool) {
+        let mut agg = self.agg();
+        agg.add(value, weight_ms, over);
+        self.put(agg);
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        let mut agg = self.agg();
+        agg.merge(&other.agg());
+        self.put(agg);
+    }
+
+    pub(crate) fn cell(self) -> Cell {
+        self.agg().cell()
+    }
+}
+
 /// How a reading lands in a history of wall-clock buckets: A1 §1.4 item 9's one back-step rule,
 /// which [`BucketRing`], its ten-minute buckets, [`crate::history::FreeSeries`] (the disk's 24
 /// hours and 3 weeks) and [`crate::writes::WriteHour`] share.
@@ -658,14 +729,8 @@ impl BucketRing {
         if let Some(v) = v {
             let k = self.open_k().unwrap_or(0);
             let (lo, hi) = t.slot();
-            let b_lo = k.saturating_mul(BUCKET_MS);
-            let b_hi = b_lo.saturating_add(BUCKET_MS);
-            let from = lo.max(self.covered_to).max(b_lo);
-            let to = hi.min(b_hi);
-            let w = u32::try_from(to.saturating_sub(from).clamp(0, BUCKET_MS)).unwrap_or(0);
-            if w > 0 {
-                self.covered_to = to;
-            }
+            let (w, covered_to) = slot_weight(t, k, BUCKET_MS, self.covered_to);
+            self.covered_to = covered_to;
             if let Some(b) = self.b.back_mut() {
                 b.add(v, w, over);
             }
@@ -1353,7 +1418,7 @@ impl MultiScaleSpec {
     }
 }
 
-fn slot_gap_kind(
+pub(crate) fn slot_gap_kind(
     gaps: &[TimeGap],
     lo_ms: i64,
     hi_ms: i64,

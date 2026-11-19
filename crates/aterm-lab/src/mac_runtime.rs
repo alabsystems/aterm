@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use aterm_json::{Value, json};
 use aterm_uds::spawnfd::{Stdio, command};
 
-use crate::mac::{Vm, not_run};
+use crate::mac::after_vm_cleanup as after_cleanup;
+use crate::mac::{Vm, VmScratch, not_run};
 use crate::paths::paths;
 use crate::util::shell_quote as q;
 use crate::{Fail, Res, stop};
@@ -86,8 +87,9 @@ pub(crate) const USAGE: &str = "\
                 Default bounds: 8 vCPUs, 32 GiB RAM, 60 decimal GB disk; --cpus, --memory-gib
                 and --disk-gb name larger or smaller fixed bounds, recorded with every run.
                 The shipped fabric link needs --memory-gib 48 --disk-gb 80. The clone and builds are
-                deleted at the end, including failure. One of the account's two guest slots is
-                held through boot and teardown. DIR keeps JSON rows and raw logs (never a
+                deleted after checked retirement. Unconfirmed cleanup retains the owned VM,
+                reservation, slots and evidence. One of the account's two guest slots is held
+                through boot and teardown. DIR keeps JSON rows and raw logs (never a
                 cached qualification); a missing image is pulled automatically. --lane compare
                 compares the supplied bundle with itself as an instrument/noise control.
                 Window is the default: one owned Tart window under the shared display lock.
@@ -488,6 +490,209 @@ fn reserve_phase(root: &Path, phase: &str) -> String {
     )
 }
 
+fn retain_driver_command(
+    record: &Path,
+    phase: &str,
+    step: &str,
+    script: &str,
+    result: Result<std::process::Output, Fail>,
+) -> Result<std::process::Output, Fail> {
+    match result {
+        Ok(output) => {
+            write(
+                &record.join(format!("{phase}.{step}.stdout")),
+                &output.stdout,
+            )?;
+            write(
+                &record.join(format!("{phase}.{step}.stderr")),
+                &output.stderr,
+            )?;
+            write_json(
+                &record.join(format!("{phase}.{step}.json")),
+                &json!({
+                "command":script, "output_complete":true, "exit":output.status.code(),
+                "signal":output.status.signal(), "success":output.status.success()}),
+            )?;
+            Ok(output)
+        }
+        Err(error) => {
+            write_json(
+                &record.join(format!("{phase}.{step}.json")),
+                &json!({
+                "command":script, "output_complete":false, "exit":null,
+                "signal":null, "success":null, "error":error.msg.as_deref()}),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn created_driver_target(stdout: &[u8], label: &str) -> Result<String, Fail> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|error| not_run(format!("capture driver creation is not UTF-8: {error}")))?;
+    let mut targets = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("aterm-runtime-target="));
+    let target = targets
+        .next()
+        .filter(|target| {
+            target
+                .strip_prefix("gui/")
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(uid, name)| {
+                    uid.parse::<u32>().is_ok_and(|uid| uid > 0) && name == label
+                })
+        })
+        .ok_or_else(|| not_run("capture driver creation did not name its exact target"))?;
+    if targets.next().is_some() {
+        return Err(not_run("capture driver creation repeated its target"));
+    }
+    Ok(target.to_owned())
+}
+
+fn retain_driver_diagnostics(
+    record: &Path,
+    phase: &str,
+    dir: &str,
+    run: &mut impl FnMut(&str) -> Result<std::process::Output, Fail>,
+) -> Result<(), Fail> {
+    let mut result = Ok(());
+    for stream in ["stdout", "stderr"] {
+        let script = format!("cat -- {}", q(&format!("{dir}/driver.{stream}")));
+        let diagnostic = retain_driver_command(
+            record,
+            phase,
+            &format!("driver-read-{stream}"),
+            &script,
+            run(&script),
+        )
+        .and_then(|output| {
+            write(
+                &record.join(format!("{phase}.driver.{stream}")),
+                &output.stdout,
+            )?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(not_run(format!(
+                    "capture driver {stream} read exited {}",
+                    output.status
+                )))
+            }
+        });
+        result = after_cleanup(result, || diagnostic);
+    }
+    result
+}
+
+/// Retire only the exact LaunchAgent this phase successfully bootstrapped. Its direct ended
+/// state and checked bootout do not assert descendant closure: the native run archive and the
+/// checked VM finish carry separate evidence, retained independently.
+fn retire_driver_using(
+    record: &Path,
+    phase: &str,
+    dir: &str,
+    target: &str,
+    nonce: &str,
+    mut run: impl FnMut(&str) -> Result<std::process::Output, Fail>,
+    mut observe: impl FnMut(&str) -> Result<std::process::Output, Fail>,
+) -> Result<(), Fail> {
+    let _grace = stop::grace();
+    let script = format!(
+        "{ROOT}/target.noindex/debug/aterm-verify --runtime-capture observe-driver {} {} {}",
+        q(dir),
+        q(nonce),
+        q(target),
+    );
+    let ended = retain_driver_command(
+        record,
+        phase,
+        "driver-observation",
+        &script,
+        observe(&script),
+    )
+    .and_then(|output| {
+        if !output.status.success() {
+            return Err(not_run(format!(
+                "guest driver observer exited {}",
+                output.status
+            )));
+        }
+        let observation: Value = aterm_json::from_slice(&output.stdout).map_err(|error| {
+            not_run(format!(
+                "guest driver observation is not complete JSON: {error}"
+            ))
+        })?;
+        if observation["schema"].as_str() != Some("aterm-runtime-driver-observation-v1")
+            || observation["nonce"].as_str() != Some(nonce)
+            || observation["directory"].as_str() != Some(dir)
+            || observation["target"].as_str() != Some(target)
+        {
+            return Err(not_run(
+                "guest driver observation does not match its private admitted request",
+            ));
+        }
+        if observation["outcome"].as_str() != Some("ended") {
+            return Err(not_run(format!(
+                "guest driver retirement {}: {}",
+                observation["outcome"], observation["reason"]
+            )));
+        }
+        let description = observation["job"]
+            .as_str()
+            .ok_or_else(|| not_run("guest driver observation omits its final exact job state"))?;
+        let raw: Vec<u8> = aterm_json::from_value(observation["job_stdout"].clone())
+            .map_err(|error| not_run(format!("guest driver final raw state: {error}")))?;
+        if observation["job_output_complete"].as_bool() != Some(true)
+            || raw != description.as_bytes()
+        {
+            return Err(not_run(
+                "guest driver ended state lacks matching complete raw command output",
+            ));
+        }
+        if aterm_uds::launchd::job_ended_in(target, description) != Ok(true)
+            || !description
+                .lines()
+                .filter_map(|line| line.strip_prefix("\truns = "))
+                .map(str::trim)
+                .eq(std::iter::once("1"))
+        {
+            return Err(not_run(
+                "guest driver observation does not establish its exact ended state",
+            ));
+        }
+        Ok(())
+    });
+    let bootout = format!("/bin/launchctl bootout {}", q(target));
+    let removed = retain_driver_command(record, phase, "driver-bootout", &bootout, run(&bootout))
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(not_run(format!(
+                    "owned capture driver bootout exited {}",
+                    output.status
+                )))
+            }
+        });
+    let ended_ok = ended.is_ok();
+    let cancelled = ended.as_ref().err().and_then(|error| error.stopped);
+    let removed_ok = removed.is_ok();
+    let result = after_cleanup(after_cleanup(ended, || removed), || {
+        retain_driver_diagnostics(record, phase, dir, &mut run)
+    });
+    write_json(
+        &record.join(format!("{phase}.driver-closure.json")),
+        &json!({
+        "schema":"aterm-mac-runtime-driver-v1", "target":target,
+        "direct_job_ended":ended_ok, "bootout_succeeded":removed_ok,
+        "retirement":if cancelled.is_some() { "cancelled-forced-cleanup" } else if ended_ok { "normal-ended" } else { "forced-without-ended-evidence" },
+        "observer_cancelled_by_signal":cancelled,
+        "complete":result.is_ok(), "descendant_closure":"not asserted by this receipt"}),
+    )?;
+    result
+}
+
 fn app_exec(
     vm: &Vm,
     ask: &Ask,
@@ -513,75 +718,131 @@ fn app_exec(
     write_json(&ask.record.join(format!("{phase}.driver.json")), &job)?;
     let encoded = aterm_json::to_string(&job).map_err(|e| format!("driver JSON: {e}"))?;
     let label = job["Label"].as_str().expect("job label");
-    let command = format!(
-        "set -eu; {reservation}; printf '%s' {} > {dir}/job.json; \
+    let nonce = aterm_uds::rand::hex_token::<16>()
+        .map_err(|error| not_run(format!("private driver nonce: {error}")))?;
+    let request = json!({"schema":"aterm-runtime-driver-request-v1", "nonce":nonce,
+        "directory":dir, "label":label});
+    write_json(
+        &ask.record.join(format!("{phase}.driver-request.json")),
+        &request,
+    )?;
+    let request = aterm_json::to_string(&request).map_err(|error| not_run(error))?;
+    let bootstrap = format!(
+        "set -eu; umask 077; {reservation}; printf '%s' {} > {dir}/driver-request.json; \
+         printf '%s' {} > {dir}/job.json; \
          /usr/bin/plutil -convert xml1 -o {dir}/job.plist {dir}/job.json; \
          uid=$(id -u); /bin/launchctl bootstrap gui/$uid {dir}/job.plist; \
-         {ROOT}/target.noindex/debug/aterm-verify --runtime-capture wait {dir} {seconds} gui/$uid/{label}",
+         printf '%s\\n' \"aterm-runtime-target=gui/$uid/{label}\"",
+        q(&request),
         q(&encoded),
-        seconds = limit.as_secs()
     );
-    let ready = vm.exec_output(&command, limit).map_err(not_run)?;
-    write(
-        &ask.record.join(format!("{phase}.driver-wait.stdout")),
-        &ready.stdout,
-    )?;
-    write(
-        &ask.record.join(format!("{phase}.driver-wait.stderr")),
-        &ready.stderr,
-    )?;
-    let transfer = format!(
-        "result=0; cat {dir}/stdout || result=$?; cat {dir}/stderr >&2 || result=$?; exit \"$result\""
-    );
-    if !ready.status.success() {
-        let reason = not_run(format!(
-            "guest capture driver wait exited {}; see {phase}.driver-wait.stderr",
-            ready.status
-        ));
-        // A missing receipt supplies no producer verdict. Retain any available prefixes as
-        // incomplete transport evidence before the disposable guest and its files disappear.
-        return match vm.exec_output(&transfer, crate::mac::STEP) {
-            Ok(output) => retain_phase(
-                &ask.record,
-                phase,
-                script,
-                output,
-                Err(reason),
-                |_| -> Result<Value, Fail> {
-                    unreachable!("an unavailable capture cannot start optional collection")
-                },
-            ),
-            Err(_) => Err(reason),
-        };
-    }
-    write(
-        &ask.record.join(format!("{phase}.capture.json")),
-        &ready.stdout,
-    )?;
-    // Hold a parse error until raw bytes are retained. If transport fails first, an authentic
-    // observed producer failure still takes precedence over the later unavailable transfer.
-    let receipt = CaptureReceipt::parse(&ready.stdout);
-    let status = receipt.as_ref().ok().and_then(CaptureReceipt::status);
-    let out = vm
-        .exec_output(
-            &transfer,
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(crate::mac::STEP),
-        )
-        .map_err(|error| preserve_observed(status, not_run(error)))?;
-    let (out, artifacts) = retain_phase(&ask.record, phase, script, out, receipt, |out| {
-        let state = guest_bytes(
-            vm,
-            &format!(
-                "uid=$(id -u); /bin/launchctl print gui/$uid/{label} > {dir}/launchd.txt 2>&1 || true; \
-             /bin/launchctl bootout gui/$uid/{label} >/dev/null 2>&1 || true; cat {dir}/launchd.txt"
-            ),
+    let creation = retain_driver_command(
+        &ask.record,
+        phase,
+        "driver-bootstrap",
+        &bootstrap,
+        vm.exec_output(&bootstrap, limit).map_err(not_run),
+    )
+    .and_then(|created| {
+        if !created.status.success() {
+            return Err(not_run(format!(
+                "capture driver bootstrap exited {}",
+                created.status
+            )));
+        }
+        created_driver_target(&created.stdout, label)
+    });
+    // Only positive creation permits control of the exact phase target. If creation evidence
+    // is unknown, retain the private diagnostic paths but leave control to checked VM finish.
+    let target = match creation {
+        Ok(target) => target,
+        Err(error) => {
+            return after_cleanup(Err(error), || {
+                let diagnostics =
+                    retain_driver_diagnostics(&ask.record, phase, &dir, &mut |command| {
+                        vm.exec_output(command, crate::mac::STEP).map_err(not_run)
+                    });
+                write_json(
+                    &ask.record.join(format!("{phase}.driver-closure.json")),
+                    &json!({
+                "schema":"aterm-mac-runtime-driver-v1", "target":null,
+                "creation_confirmed":false, "complete":false,
+                "descendant_closure":"not asserted by this receipt"}),
+                )?;
+                diagnostics
+            });
+        }
+    };
+    let result = (|| {
+        let command = format!(
+            "{ROOT}/target.noindex/debug/aterm-verify --runtime-capture wait {dir} {seconds} {}",
+            q(&target),
+            seconds = limit.as_secs()
+        );
+        let ready = vm
+            .exec_output(&command, deadline.saturating_duration_since(Instant::now()))
+            .map_err(not_run)?;
+        write(
+            &ask.record.join(format!("{phase}.driver-wait.stdout")),
+            &ready.stdout,
         )?;
-        write(&ask.record.join(format!("{phase}.launchd.txt")), &state)?;
-        collect(vm, ask, phase, &String::from_utf8_lossy(&out.stdout))
-    })?;
-    Ok((out, artifacts))
+        write(
+            &ask.record.join(format!("{phase}.driver-wait.stderr")),
+            &ready.stderr,
+        )?;
+        let transfer = format!(
+            "result=0; cat {dir}/stdout || result=$?; cat {dir}/stderr >&2 || result=$?; exit \"$result\""
+        );
+        if !ready.status.success() {
+            let reason = not_run(format!(
+                "guest capture driver wait exited {}; see {phase}.driver-wait.stderr",
+                ready.status
+            ));
+            return match vm.exec_output(&transfer, crate::mac::STEP) {
+                Ok(output) => retain_phase(
+                    &ask.record,
+                    phase,
+                    script,
+                    output,
+                    Err(reason),
+                    |_| -> Result<Value, Fail> {
+                        unreachable!("an unavailable capture cannot collect artifacts")
+                    },
+                ),
+                Err(_) => Err(reason),
+            };
+        }
+        write(
+            &ask.record.join(format!("{phase}.capture.json")),
+            &ready.stdout,
+        )?;
+        let receipt = CaptureReceipt::parse(&ready.stdout);
+        let status = receipt.as_ref().ok().and_then(CaptureReceipt::status);
+        let out = vm
+            .exec_output(
+                &transfer,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(crate::mac::STEP),
+            )
+            .map_err(|error| preserve_observed(status, not_run(error)))?;
+        retain_phase(&ask.record, phase, script, out, receipt, |out| {
+            collect(vm, ask, phase, &String::from_utf8_lossy(&out.stdout))
+        })
+    })();
+    let observed = result.as_ref().ok().map(|(output, _)| output.status);
+    after_cleanup(result, || {
+        retire_driver_using(
+            &ask.record,
+            phase,
+            &dir,
+            &target,
+            &nonce,
+            |command| vm.exec_output(command, crate::mac::STEP).map_err(not_run),
+            |command| vm.retirement_output(command),
+        )
+    })
+    .map_err(|error| preserve_observed(observed, error))
 }
 
 /// `time -lp`'s own fields, not the program's numbers. Missing resource readings stay null.
@@ -679,24 +940,65 @@ fn relative_member(path: &str) -> bool {
 /// structured records into the guest's verify state ([`perf_ledgers`]). Bring those back before
 /// the disposable disk goes.
 fn collect(vm: &Vm, ask: &Ask, name: &str, stdout: &str) -> Result<Value, Fail> {
+    collect_using(ask, name, stdout, |script| guest_bytes(vm, script))
+}
+
+fn collect_using(
+    ask: &Ask,
+    name: &str,
+    stdout: &str,
+    mut read: impl FnMut(&str) -> Result<Vec<u8>, Fail>,
+) -> Result<Value, Fail> {
     let mut artifacts = aterm_json::Map::new();
     if let Some(path) = verifier_log(stdout) {
-        let log = guest_bytes(vm, &format!("cat -- {}", q(path)))?;
-        let file = format!("{name}.verifier.log");
-        write(&ask.record.join(&file), &log)?;
-        artifacts.insert("verifier_log".into(), json!(file));
+        let mut run = None;
+        let archives = [
+            ("", "verifier_log"),
+            (".events", "verifier_events"),
+            (".run", "verifier_run"),
+        ];
+        let required = if matches!(ask.lane.as_str(), "measure" | "cursor") {
+            archives.len()
+        } else {
+            1
+        };
+        for (suffix, key) in archives.into_iter().take(required) {
+            let bytes = read(&format!("cat -- {}", q(&format!("{path}{suffix}"))))?;
+            let file = format!("{name}.verifier.log{suffix}");
+            write(&ask.record.join(&file), &bytes)?;
+            artifacts.insert(key.into(), json!(file));
+            artifacts.insert(
+                format!("{key}_content"),
+                json!({"bytes":bytes.len(),
+                "sha256":aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&bytes))}),
+            );
+            if suffix == ".run" {
+                run = Some(bytes);
+            }
+        }
+        if let Some(run) = run {
+            let run = String::from_utf8(run).map_err(|error| {
+                not_run(format!("guest verifier run archive is not UTF-8: {error}"))
+            })?;
+            // This is the native writer's closed-generation protocol, not a claim based on the
+            // producer's status or pipe EOF. Retain the exact raw archive before admitting it.
+            let closed = aterm_uds::runs::completed_archive(&run).ok_or_else(|| {
+                not_run("guest verifier did not retain a complete closed run archive")
+            })?;
+            artifacts.insert(
+                "verifier_run_id".into(),
+                json!(closed.id.map(|id| id.text())),
+            );
+        }
     } else if matches!(ask.lane.as_str(), "measure" | "cursor") {
         return Err(not_run("guest measure named no row-level log to retain"));
     }
     if !matches!(ask.lane.as_str(), "measure" | "cursor") {
         let ledgers = perf_ledgers();
-        let listed = guest_bytes(
-            vm,
-            &format!(
-                "if [ -d {l} ]; then find {l} -type f | LC_ALL=C sort; fi",
-                l = q(&ledgers)
-            ),
-        )?;
+        let listed = read(&format!(
+            "if [ -d {l} ]; then find {l} -type f | LC_ALL=C sort; fi",
+            l = q(&ledgers)
+        ))?;
         let listed = String::from_utf8(listed)
             .map_err(|error| not_run(format!("guest perf listing is not UTF-8: {error}")))?;
         let files = listed
@@ -708,7 +1010,7 @@ fn collect(vm: &Vm, ask: &Ask, name: &str, stdout: &str) -> Result<Value, Fail> 
             .collect::<Result<Vec<_>, _>>()?;
         if !files.is_empty() {
             let args = files.iter().map(|f| q(f)).collect::<Vec<_>>().join(" ");
-            let archive = guest_bytes(vm, &format!("tar -C {} -cf - -- {args}", q(&ledgers)))?;
+            let archive = read(&format!("tar -C {} -cf - -- {args}", q(&ledgers)))?;
             let file = format!("{name}.records.tar");
             write(&ask.record.join(&file), &archive)?;
             artifacts.insert("perf_records".into(), json!(file));
@@ -900,6 +1202,34 @@ fn resolve_tools(
     Ok(tools)
 }
 
+fn retain_host_log(path: &Path, record: &Path, retired: bool) -> Result<(), Fail> {
+    match crate::util::read_artifact(path) {
+        Ok(bytes) => {
+            write(&record.join("tart-run.log"), &bytes)?;
+            write_json(
+                &record.join("tart-run-log.json"),
+                &json!({
+                "schema":"aterm-mac-runtime-host-log-v1", "available":true,
+                "path":path, "bytes":bytes.len(), "complete":retired,
+                "sha256":aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&bytes))}),
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_json(
+                &record.join("tart-run-log.json"),
+                &json!({
+                "schema":"aterm-mac-runtime-host-log-v1", "available":false,
+                "path":path, "complete":false, "reason":"launcher log was not created"}),
+            )?;
+            Err(not_run("host Tart log is unavailable"))
+        }
+        Err(error) => Err(not_run(format!(
+            "retain host Tart log {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 fn run_in(ask: &Ask) -> Res {
     let repo = &paths().repo;
     let dirty = snapshot::git(repo, ["status", "--porcelain"])?;
@@ -982,11 +1312,14 @@ fn run_in(ask: &Ask) -> Res {
             ask.disk_gb
         )));
     }
-    let scratch = aterm_tempfile::Builder::new()
-        .prefix("mac-runtime-")
-        .suffix(".noindex")
-        .tempdir()
-        .map_err(|e| format!("runtime scratch: {e}"))?;
+    let mut scratch = VmScratch::new(
+        aterm_tempfile::Builder::new()
+            .prefix("mac-runtime-")
+            .suffix(".noindex")
+            .tempdir()
+            .map_err(|e| format!("runtime scratch: {e}"))?,
+        &ask.record,
+    )?;
     let share = scratch.path().join("share");
     std::fs::create_dir(&share).map_err(|e| format!("share: {e}"))?;
     snapshot::archive(repo, &source, &submodule, &share)?;
@@ -1045,38 +1378,37 @@ fn run_in(ask: &Ask) -> Res {
         cpus: ask.cpus,
     };
     let mut admitted = crate::vm_admit::admit(&guest, true)?;
-    let mut vm = Vm::clone_from(&tart, &base, scratch.path(), &share, false)?;
-    vm.graphics = ask.graphics;
-    checked(
-        &tart,
-        &[
-            "set".into(),
-            vm.name.clone(),
-            "--cpu".into(),
-            ask.cpus.to_string(),
-            "--memory".into(),
-            ask.memory_mib.to_string(),
-            "--disk-size".into(),
-            ask.disk_gb.to_string(),
-        ],
-        repo,
-    )?;
-    vm.boot()?;
-    require_sip_on(
-        &ask.record,
-        &SipProbe {
-            tart: &tart,
-            requested_image: &ask.image,
-            selected_base: &base,
-            guest: &vm.name,
-        },
-        || vm.exec_output(SIP_STATUS_COMMAND, crate::mac::STEP),
-    )?;
-    if let Some(pid) = vm.pid() {
-        admitted.credit("mac-runtime", &[pid]);
-    }
-    let mut setup = format!(
-        "set -eu; test \"$HOME\" = /Users//admin; mkdir -p {ROOT}/source {ROOT}/toolchain {ROOT}/tmp; \
+    let mut vm = Vm::clone_from_recorded(&tart, &base, scratch.path(), &share, false, &ask.record)?;
+    let result = (|| -> Result<(i32, Value), Fail> {
+        vm.hold_admission(&mut admitted)?;
+        vm.graphics = ask.graphics;
+        checked(
+            &tart,
+            &[
+                "set".into(),
+                vm.name.clone(),
+                "--cpu".into(),
+                ask.cpus.to_string(),
+                "--memory".into(),
+                ask.memory_mib.to_string(),
+                "--disk-size".into(),
+                ask.disk_gb.to_string(),
+            ],
+            repo,
+        )?;
+        vm.boot()?;
+        require_sip_on(
+            &ask.record,
+            &SipProbe {
+                tart: &tart,
+                requested_image: &ask.image,
+                selected_base: &base,
+                guest: &vm.name,
+            },
+            || vm.exec_output(SIP_STATUS_COMMAND, crate::mac::STEP),
+        )?;
+        let mut setup = format!(
+            "set -eu; test \"$HOME\" = /Users//admin; mkdir -p {ROOT}/source {ROOT}/toolchain {ROOT}/tmp; \
         tar -xf {share}/source.tar -C {ROOT}/source; \
         tar -xf {share}/toolchain.tar -C {ROOT}/toolchain; \
         ditto -x -k {share}/app.zip {ROOT}/unpack; \
@@ -1087,24 +1419,24 @@ fn run_in(ask: &Ask) -> Res {
         test \"$(shasum -a 256 {ROOT}/aterm.app/Contents/MacOS/aterm | cut -d ' ' -f 1)\" = {app_sha}; \
         {ROOT}/toolchain/bin/trustc -Vv; \
         {ROOT}/toolchain/bin/targo --config {build_dir_config} --unverified build -p aterm-verify; ",
-        share = q(crate::mac::GUEST_SHARE),
-        app_name = q(app
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| Fail::usage("bundle name is not UTF-8"))?),
-        env = environment(admitted.jobs),
-        source = q(&source),
-        submodule = q(&submodule),
-        build_dir_config = q(&format!(
-            "build.build-dir='{}'",
-            aterm_toolchain::build_cache::target_build_path(Path::new(&format!(
-                "{ROOT}/target.noindex"
-            )))
-            .display()
-        ))
-    );
-    if let Some((app, sha)) = &baseline {
-        setup.push_str(&format!(
+            share = q(crate::mac::GUEST_SHARE),
+            app_name = q(app
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| Fail::usage("bundle name is not UTF-8"))?),
+            env = environment(admitted.jobs),
+            source = q(&source),
+            submodule = q(&submodule),
+            build_dir_config = q(&format!(
+                "build.build-dir='{}'",
+                aterm_toolchain::build_cache::target_build_path(Path::new(&format!(
+                    "{ROOT}/target.noindex"
+                )))
+                .display()
+            ))
+        );
+        if let Some((app, sha)) = &baseline {
+            setup.push_str(&format!(
             "ditto -x -k {share}/baseline.zip {ROOT}/baseline-unpack; \
              mv {ROOT}/baseline-unpack/{name} {ROOT}/baseline.app; \
              test \"$(shasum -a 256 {ROOT}/baseline.app/Contents/MacOS/aterm | cut -d ' ' -f 1)\" = {sha}; ",
@@ -1112,141 +1444,141 @@ fn run_in(ask: &Ask) -> Res {
             name=q(app.file_name().and_then(|name| name.to_str()).ok_or_else(|| Fail::usage("baseline bundle name is not UTF-8"))?),
             sha=q(sha),
         ));
-    }
-    let setup_out = vm.exec_output(&setup, BUILD).map_err(not_run)?;
-    write(&ask.record.join("setup.stdout"), &setup_out.stdout)?;
-    write(&ask.record.join("setup.stderr"), &setup_out.stderr)?;
-    if !setup_out.status.success() {
-        return Err(not_run(format!(
-            "guest verifier build failed: {}; see setup.stderr",
-            setup_out.status
-        )));
-    }
-    // Build measurement benches before taking time: the five takes use the same warm cache.
-    let prebuild = format!(
-        "{} export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; {ROOT}/target.noindex/debug/aterm-verify measure --app {ROOT}/aterm.app --compile-only --admit now",
-        environment(admitted.jobs)
-    );
-    if matches!(ask.lane.as_str(), "measure" | "cursor") {
-        let out = vm.exec_output(&prebuild, BUILD).map_err(not_run)?;
-        write(&ask.record.join("prebuild.stdout"), &out.stdout)?;
-        write(&ask.record.join("prebuild.stderr"), &out.stderr)?;
-        if !out.status.success() {
-            return Err(not_run(
-                "guest measurement prebuild failed; see prebuild.stderr",
-            ));
         }
-    }
-    let focused = matches!(ask.lane.as_str(), "rewind" | "rewind-control");
-    let command = if focused {
-        let out = vm.exec_output(&format!("{} {ROOT}/toolchain/bin/targo --unverified bench --profile test -p aterm-conformance --bench rewind --no-run --message-format=json", environment(admitted.jobs)), BUILD).map_err(not_run)?;
-        write(&ask.record.join("prebuild.stdout"), &out.stdout)?;
-        write(&ask.record.join("prebuild.stderr"), &out.stderr)?;
-        if !out.status.success() {
-            return Err(not_run("focused rewind build failed; see prebuild.stderr"));
+        let setup_out = vm.exec_output(&setup, BUILD).map_err(not_run)?;
+        write(&ask.record.join("setup.stdout"), &setup_out.stdout)?;
+        write(&ask.record.join("setup.stderr"), &setup_out.stderr)?;
+        if !setup_out.status.success() {
+            return Err(not_run(format!(
+                "guest verifier build failed: {}; see setup.stderr",
+                setup_out.status
+            )));
         }
-        rewind_command(
-            &String::from_utf8_lossy(&out.stdout),
-            ask.lane == "rewind-control",
-        )?
-    } else {
-        format!(
-            "{ROOT}/target.noindex/debug/aterm-verify {}",
-            lane_args(&ask.lane)
-                .iter()
-                .map(|a| q(a))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    };
-    let untimed = format!(
-        "{} export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; {command}",
-        environment(admitted.jobs)
-    );
-    // Populate every lane's compiler and corpus caches before measuring. This run is retained,
-    // too; a red warm-up is never erased by five later green takes.
-    println!(
-        "mac runtime: {} warm-up (not one of the five takes)",
-        ask.lane
-    );
-    let paired = baseline.is_some();
-    let mut codes = Vec::new();
-    let mut warmups = Vec::new();
-    for arm in if paired {
-        vec!["baseline", "candidate"]
-    } else {
-        vec!["candidate"]
-    } {
-        let name = if paired {
-            format!("warmup-{arm}")
+        // Build measurement benches before taking time: the five takes use the same warm cache.
+        let prebuild = format!(
+            "{} export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; {ROOT}/target.noindex/debug/aterm-verify measure --app {ROOT}/aterm.app --compile-only --admit now",
+            environment(admitted.jobs)
+        );
+        if matches!(ask.lane.as_str(), "measure" | "cursor") {
+            let out = vm.exec_output(&prebuild, BUILD).map_err(not_run)?;
+            write(&ask.record.join("prebuild.stdout"), &out.stdout)?;
+            write(&ask.record.join("prebuild.stderr"), &out.stderr)?;
+            if !out.status.success() {
+                return Err(not_run(
+                    "guest measurement prebuild failed; see prebuild.stderr",
+                ));
+            }
+        }
+        let focused = matches!(ask.lane.as_str(), "rewind" | "rewind-control");
+        let command = if focused {
+            let out = vm.exec_output(&format!("{} {ROOT}/toolchain/bin/targo --unverified bench --profile test -p aterm-conformance --bench rewind --no-run --message-format=json", environment(admitted.jobs)), BUILD).map_err(not_run)?;
+            write(&ask.record.join("prebuild.stdout"), &out.stdout)?;
+            write(&ask.record.join("prebuild.stderr"), &out.stderr)?;
+            if !out.status.success() {
+                return Err(not_run("focused rewind build failed; see prebuild.stderr"));
+            }
+            rewind_command(
+                &String::from_utf8_lossy(&out.stdout),
+                ask.lane == "rewind-control",
+            )?
         } else {
-            "warmup".into()
+            format!(
+                "{ROOT}/target.noindex/debug/aterm-verify {}",
+                lane_args(&ask.lane)
+                    .iter()
+                    .map(|a| q(a))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
         };
-        let (warm, artifacts) = app_exec(&vm, ask, &name, &arm_command(&untimed, arm), BUILD)
-            .map_err(|error| preserve_failure(&codes, error))?;
-        let row = json!({"arm": arm, "exit": warm.status.code(), "success": warm.status.success(), "artifacts": artifacts});
-        write_json(&ask.record.join(format!("{name}.json")), &row)?;
-        warmups.push(row);
-        codes.push(warm.status.code());
-    }
-    let invocation = format!(
-        "{} export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; /usr/bin/time -lp {command}",
-        environment(admitted.jobs)
-    );
-    let mut rows = Vec::new();
-    let mut real = Vec::new();
-    let mut cpu = Vec::new();
-    for (take, arm) in take_order(paired) {
-        stop::check()?;
-        let sha = if arm == "baseline" {
-            &baseline.as_ref().expect("paired baseline").1
-        } else {
-            &app_sha
-        };
-        let name = if paired {
-            format!("take-{take}-{arm}")
-        } else {
-            format!("take-{take}")
-        };
-        let selected = arm_command(&invocation, arm);
+        let untimed = format!(
+            "{} export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; {command}",
+            environment(admitted.jobs)
+        );
+        // Populate every lane's compiler and corpus caches before measuring. This run is retained,
+        // too; a red warm-up is never erased by five later green takes.
         println!(
-            "mac runtime: {} take {take}/{TAKES} {arm}, bundle {sha}",
+            "mac runtime: {} warm-up (not one of the five takes)",
             ask.lane
         );
-        write_json(
-            &ask.record.join(format!("{name}.context.json")),
-            &json!({"take":take, "arm":arm, "bundle_sha256":sha, "command":selected}),
-        )?;
-        let (out, loads) = sampled(|| app_exec(&vm, ask, &name, &selected, TAKE));
-        write_json(
-            &ask.record.join(format!("{name}.host-load.json")),
-            &json!({"host_load_samples":loads, "host_max_load_1m":max_load(&loads)}),
-        )?;
-        let (out, artifacts) = out.map_err(|error| preserve_failure(&codes, error))?;
-        codes.push(out.status.code());
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let resource = usage(&stderr);
-        if let Some(n) = resource["real"].as_f64() {
-            real.push(n);
+        let paired = baseline.is_some();
+        let mut codes = Vec::new();
+        let mut warmups = Vec::new();
+        for arm in if paired {
+            vec!["baseline", "candidate"]
+        } else {
+            vec!["candidate"]
+        } {
+            let name = if paired {
+                format!("warmup-{arm}")
+            } else {
+                "warmup".into()
+            };
+            let (warm, artifacts) = app_exec(&vm, ask, &name, &arm_command(&untimed, arm), BUILD)
+                .map_err(|error| preserve_failure(&codes, error))?;
+            let row = json!({"arm": arm, "exit": warm.status.code(), "success": warm.status.success(), "artifacts": artifacts});
+            write_json(&ask.record.join(format!("{name}.json")), &row)?;
+            warmups.push(row);
+            codes.push(warm.status.code());
         }
-        if let (Some(u), Some(s)) = (resource["user"].as_f64(), resource["sys"].as_f64()) {
-            cpu.push(u + s);
-        }
-        rows.push(
+        let invocation = format!(
+            "{} export CARGO_MANIFEST_DIR={ROOT}/source/crates/aterm-verify; /usr/bin/time -lp {command}",
+            environment(admitted.jobs)
+        );
+        let mut rows = Vec::new();
+        let mut real = Vec::new();
+        let mut cpu = Vec::new();
+        for (take, arm) in take_order(paired) {
+            stop::check()?;
+            let sha = if arm == "baseline" {
+                &baseline.as_ref().expect("paired baseline").1
+            } else {
+                &app_sha
+            };
+            let name = if paired {
+                format!("take-{take}-{arm}")
+            } else {
+                format!("take-{take}")
+            };
+            let selected = arm_command(&invocation, arm);
+            println!(
+                "mac runtime: {} take {take}/{TAKES} {arm}, bundle {sha}",
+                ask.lane
+            );
+            write_json(
+                &ask.record.join(format!("{name}.context.json")),
+                &json!({"take":take, "arm":arm, "bundle_sha256":sha, "command":selected}),
+            )?;
+            let (out, loads) = sampled(|| app_exec(&vm, ask, &name, &selected, TAKE));
+            write_json(
+                &ask.record.join(format!("{name}.host-load.json")),
+                &json!({"host_load_samples":loads, "host_max_load_1m":max_load(&loads)}),
+            )?;
+            let (out, artifacts) = out.map_err(|error| preserve_failure(&codes, error))?;
+            codes.push(out.status.code());
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let resource = usage(&stderr);
+            if let Some(n) = resource["real"].as_f64() {
+                real.push(n);
+            }
+            if let (Some(u), Some(s)) = (resource["user"].as_f64(), resource["sys"].as_f64()) {
+                cpu.push(u + s);
+            }
+            rows.push(
             json!({"take": take, "arm": arm, "bundle_sha256": sha, "command": selected, "exit": out.status.code(), "success": out.status.success(),
             "usage": resource, "artifacts": artifacts, "host_load_samples": loads, "host_max_load_1m": max_load(&loads),
             "stdout": stdout.as_ref(), "stderr": stderr.as_ref()}),
         );
-        write_json(
-            &ask.record.join(format!("{name}.json")),
-            rows.last().expect("just pushed"),
-        )?;
-    }
-    let exit = experiment_exit(&codes, paired);
-    write_json(
-        &ask.record.join("rows.json"),
-        &json!({"schema": if paired { "aterm-mac-runtime-paired-v1" } else { "aterm-mac-runtime-v1" },
+            write_json(
+                &ask.record.join(format!("{name}.json")),
+                rows.last().expect("just pushed"),
+            )?;
+        }
+        let exit = experiment_exit(&codes, paired);
+        Ok((
+            exit,
+            json!({"schema": if paired { "aterm-mac-runtime-paired-v1" } else { "aterm-mac-runtime-v1" },
         "complete": true, "all_exits_zero": exit == 0, "exit": exit,
         "warmup_exit": if paired { None } else { codes[0] },
         "warmup_artifacts": if paired { Value::Null } else { warmups[0]["artifacts"].clone() },
@@ -1256,8 +1588,28 @@ fn run_in(ask: &Ask) -> Res {
         "guest": {"cpus": ask.cpus, "memory_mib": ask.memory_mib, "disk_gb": ask.disk_gb, "graphics": ask.graphics},
         "granted_share": admitted.jobs,
         "command": command, "wall_s": spread(&real), "cpu_s": spread(&cpu), "rows": rows}),
-    )?;
-    drop(vm); // Stop the VM and delete the complete disk, its builds, and scratch identities.
+        ))
+    })();
+    let observed = result.as_ref().ok().map(|(code, _)| *code);
+    let result = after_cleanup(result, || {
+        let finished = vm.finish().map(|_| ());
+        // Archival is attempted even when checked VM retirement failed. The retained original
+        // scratch remains authoritative when the log is still mutable or could not be copied.
+        let retired = finished.is_ok();
+        after_cleanup(finished, || {
+            retain_host_log(vm.log_path(), &ask.record, retired)
+        })
+    })
+    .map_err(|error| match observed {
+        Some(code) => preserve_failure(&[Some(code)], error),
+        None => error,
+    });
+    let (exit, mut rows) = result?;
+    let fields = rows.as_object_mut().expect("runtime rows are an object");
+    fields.insert("vm_receipt".into(), json!(vm.receipt_path()));
+    fields.insert("vm_retirement".into(), vm.receipt());
+    write_json(&ask.record.join("rows.json"), &rows)?;
+    scratch.discard_after_finish();
     Ok(exit)
 }
 

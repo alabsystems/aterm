@@ -195,9 +195,7 @@ enum Observation {
     Unproven(String),
 }
 
-/// The longest any lease runs unrenewed, whatever p95 its holder's step history claims: a holder
-/// Mac's own `steps.tsv` cannot stretch another Mac's wait past four hours.
-pub(crate) const MAX_LEASE_S: u64 = 4 * 3600;
+pub(crate) use aterm_ctl::release_holder::MAX_LEASE_S;
 
 /// How long a claim's lease runs after its last renewal: the ref's `at`, which its holder
 /// advances with each completed row, step boundary and ownership audit, and every
@@ -270,6 +268,31 @@ pub enum Take {
     /// its compare-and-swap is from ([`attempt`]); one that ends with nothing of its own recorded
     /// on main hands the line back ([`Claim::hand_back`]).
     Supersede,
+    /// `--supersede` run by the release pump as a line's one re-base
+    /// ([`aterm_release::pump::REBASE_ENV`]): a supersession that also admits the line's holder as
+    /// a contender does ([`admit`]), at the compare-and-swap itself. The pump judged the line free
+    /// when it looked, minutes before its child takes the claim; a contender that took the line
+    /// meanwhile (a session's fix, a standby) keeps it, and the re-base ends beside it (exit 4,
+    /// its re-base unspent).
+    Rebase,
+}
+
+impl Take {
+    /// A supersession, a session's or the pump's re-base: it takes only the exact line it judged.
+    fn supersedes(self) -> bool {
+        matches!(self, Self::Supersede | Self::Rebase)
+    }
+
+    /// The take of a `--supersede` run: the pump's re-base where the pump marked its child
+    /// ([`aterm_release::pump::REBASE_ENV`] is `1`), else a session's supersession.
+    #[must_use]
+    pub fn supersession() -> Self {
+        if std::env::var_os(aterm_release::pump::REBASE_ENV).is_some_and(|value| value == "1") {
+            Self::Rebase
+        } else {
+            Self::Supersede
+        }
+    }
 }
 
 fn reference(version: &str) -> Result<String, String> {
@@ -527,7 +550,7 @@ fn local_observation(state: &State, directory: &Path) -> Observation {
         judged: identity.read(&aterm_agent::release_progress::holder_row(&identity)),
         ..HostAnswer::default()
     };
-    for line in aterm_agent::release_progress::survey(directory) {
+    for line in aterm_agent::release_progress::survey(directory, now()) {
         let Some((alive, data)) = line
             .strip_prefix("release_line alive=")
             .and_then(|raw| raw.split_once(" data="))
@@ -707,6 +730,83 @@ fn holder_answer(json: &str, holder: &Holder) -> Result<HostAnswer, String> {
     })
 }
 
+/// What the claim's holder's own Mac says of the release pumps it runs (their `release_pump`
+/// rows, `pump=`, one per clone's pump): a standby judges those pumps, not only the claim's
+/// holder, because the holder a claim names is a pump's release child, which is not running
+/// between the pump's runs. This Mac's own records are read here, every one but this process's
+/// own, and that list is whole: none means no other pump runs here. Another Mac's are read
+/// through the installed aterm's survey of it ([`pump_answer`]). `Ok(None)` where the answer
+/// cannot say whether a pump runs there (it carries no pump row).
+/// # Errors
+/// The Mac did not answer, its answer did not prove the claim's node, or it carries no word on a
+/// pump at all (an installed aterm older than the fact).
+pub fn holder_pump(
+    claimant: &Claimant,
+) -> Result<Option<Vec<aterm_ctl::release_pump::Pump>>, String> {
+    let (here, registry) = this_holder()?;
+    if here.node == claimant.node {
+        if here.host != claimant.host {
+            return Err(format!(
+                "the claim names this Mac's fleet node from host {}, not this host {}",
+                claimant.host, here.host
+            ));
+        }
+        return Ok(Some(
+            aterm_agent::release_progress::pump_rows(&registry, now())
+                .iter()
+                .filter_map(|row| aterm_ctl::release_pump::Pump::parse(row))
+                .filter(|pump| pump.pid != std::process::id())
+                .collect(),
+        ));
+    }
+    let args = aterm_ctl::survey_host_ask_args(&claimant.node, HOLDER_ANSWER_SECS, None);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    pump_answer(&installed_ctl(&args)?, &claimant.node)
+}
+
+/// The pump rows of `aterm ctl survey --host … --json`'s answer from `node`, only from a peer that
+/// proved that node, as [`holder_answer`] holds an answer to it. An empty list is `None`: a peer
+/// older than the row sends none, so silence cannot say that no pump runs there.
+/// # Errors
+/// No answer, an unproven one, one that carries no `pumps` field (an aterm older than it), or a
+/// row that does not read.
+fn pump_answer(
+    json: &str,
+    node: &str,
+) -> Result<Option<Vec<aterm_ctl::release_pump::Pump>>, String> {
+    let hosts: aterm_json::Value =
+        aterm_json::from_str(json).map_err(|e| format!("unreadable survey: {e}"))?;
+    let peer = hosts
+        .as_array()
+        .and_then(|hosts| {
+            hosts
+                .iter()
+                .find(|host| host["fleet"].as_bool() == Some(true))
+        })
+        .ok_or("the survey holds no answer from that Mac")?;
+    if let Some(error) = peer["error"].as_str() {
+        return Err(format!("it did not answer: {error}"));
+    }
+    let named = peer
+        .get("proven_node")
+        .map_or_else(|| &peer["instance"]["node"], |proven| proven);
+    if peer["unproven"].as_bool() == Some(true) || named.as_str() != Some(node) {
+        return Err("its answer did not prove that node's identity".into());
+    }
+    let rows = peer
+        .get("pumps")
+        .and_then(aterm_json::Value::as_array)
+        .ok_or(
+            "its answer carries no word on a pump (the aterm that read it predates the pump= fact)",
+        )?;
+    let pumps = rows
+        .iter()
+        .map(aterm_ctl::release_pump::Pump::from_value)
+        .collect::<Option<Vec<_>>>()
+        .ok_or("its pump fact does not read")?;
+    Ok((!pumps.is_empty()).then_some(pumps))
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -723,6 +823,45 @@ pub struct Existing {
     pub holder: Option<(String, String)>,
     /// The claim is held by another Mac ([`another_mac`]); false where there is no claim.
     pub elsewhere: bool,
+    /// The base of the replacement line main's supersession record of the version names
+    /// (`Aterm-Line-Supersession`), where main records one: read by the same scan of main's
+    /// history that applied it to `line` ([`retirement`]).
+    pub replaced: Option<String>,
+    /// The claim's holder as a contender reads it, where there is a claim.
+    pub claimant: Option<Claimant>,
+}
+
+/// A claim's holder, as a reader that is not its holder asks after it: its fleet node and host,
+/// whose Mac answers for it, and when its lease runs out unless it renews it first. The lease's
+/// end is read whether or not the claim still keeps a contender off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Claimant {
+    pub node: String,
+    pub host: String,
+    /// Epoch seconds its lease runs until, unless renewed.
+    pub until: u64,
+    /// Its lease has run out at the read, by the claim's own rule ([`expired`]): its renewal is
+    /// older than a lease, or so far ahead of this clock that no sane clock wrote it, in which
+    /// case `until` is still that far ahead.
+    pub ended: bool,
+    /// Its process on its Mac: pid, boot and start, as the claim records them. A release pump
+    /// tells a child of its own from another's by it (`aterm_release::pump::Seen::foreign`).
+    pub pid: u32,
+    pub boot: String,
+    pub start: u64,
+}
+
+/// `state`'s holder as a reader asks after it at `now` ([`Claimant`]).
+fn claimant(state: &State, now: u64) -> Claimant {
+    Claimant {
+        node: state.holder.node.clone(),
+        host: state.holder.host.clone(),
+        until: state.at.saturating_add(lease_s(state)),
+        ended: expired(state, now),
+        pid: state.holder.pid,
+        boot: state.holder.boot.clone(),
+        start: state.holder.start,
+    }
 }
 
 /// Whether `holder` is on another Mac than this one, by the fleet node a claim records
@@ -761,12 +900,15 @@ pub fn standing(
         .as_ref()
         .map(|s| (s.line.head().to_string(), holder_words(&s.holder)));
     let elsewhere = old.as_ref().is_some_and(|s| another_mac(&s.holder));
-    let line = current(&GitCli::new(repo), version, old.map(|s| s.line))?;
+    let claimant = old.as_ref().map(|s| claimant(s, now()));
+    let (line, replaced) = retirement(&GitCli::new(repo), version, old.map(|s| s.line))?;
     Ok((
         Existing {
             line,
             holder,
             elsewhere,
+            replaced,
+            claimant,
         },
         held,
     ))
@@ -785,13 +927,26 @@ pub(crate) fn current(
     version: &str,
     old: Option<crate::line::Line>,
 ) -> Result<Option<crate::line::Line>, String> {
-    let current = crate::line::supersession(git, version)?;
-    Ok(match current {
-        Some(record) => Some(old.as_ref().map_or_else(
-            || record.replacement.clone(),
-            |old| preferred(old, &record.replacement),
-        )),
-        None => old,
+    retirement(git, version, old).map(|(line, _)| line)
+}
+
+/// [`current`], and the base of the replacement main's supersession record of `version` names,
+/// where main records one: both from one scan of main's whole history
+/// ([`crate::line::supersession`]), so a reader that needs both makes it once.
+fn retirement(
+    git: &dyn GitRunner,
+    version: &str,
+    old: Option<crate::line::Line>,
+) -> Result<(Option<crate::line::Line>, Option<String>), String> {
+    Ok(match crate::line::supersession(git, version)? {
+        Some(record) => (
+            Some(old.as_ref().map_or_else(
+                || record.replacement.clone(),
+                |old| preferred(old, &record.replacement),
+            )),
+            Some(record.replacement.base),
+        ),
+        None => (old, None),
     })
 }
 
@@ -966,9 +1121,11 @@ fn effective(state: &State, current: Option<&crate::line::Supersession>) -> crat
 }
 
 /// One attempt to take `name` for `taker`: read the ref, admit its holder ([`admit`], unless
-/// this process continues it), record this taker on its host, and compare-and-swap from exactly
-/// the ref read, so of several takers of one read at most one is written. A supersession admits
-/// no holder by liveness; it takes only a claim that stands for exactly `line`, the line it
+/// this process continues it), record this taker on its host and collect the host records no
+/// reader needs ([`aterm_agent::release_progress::collect`]), and compare-and-swap from exactly
+/// the ref read, so of several takers of one read at most one is written. A session's supersession
+/// admits no holder by liveness, and the pump's re-base admits it first, as a contender does
+/// ([`Take::Rebase`]); either takes only a claim that stands for exactly `line`, the line it
 /// judged, and since the swap is from this same read, a line that advanced before the swap is
 /// refused with nothing written and its holder running.
 fn attempt(
@@ -982,10 +1139,16 @@ fn attempt(
 ) -> Result<Attempt, String> {
     let old = remote_expected(git, name, expected_ref)?;
     match &old {
-        None if taker.take == Take::Supersede => {
+        None if taker.take.supersedes() => {
             return Err("no fleet claim to supersede; nothing was taken".into());
         }
-        Some((_, state)) if taker.take == Take::Supersede => {
+        Some((_, state)) if taker.take.supersedes() => {
+            // The pump's re-base takes the line only from a holder a contender could take it
+            // from: one that took it after the pump looked keeps it, whether or not it has moved
+            // the line since, and the re-base ends beside it (CUTTING ELSEWHERE, exit 4).
+            if taker.take == Take::Rebase {
+                admit(state, line, (taker.now)(), || (taker.observe)(state))?;
+            }
             let held = effective(state, current);
             if held != *line {
                 return Err(format!(
@@ -1020,7 +1183,7 @@ fn attempt(
         line: selected,
         holder: taker.holder.clone(),
         step: "commit".into(),
-        boundary: if taker.take == Take::Supersede {
+        boundary: if taker.take.supersedes() {
             SUPERSEDING
         } else {
             "claimed"
@@ -1033,7 +1196,7 @@ fn attempt(
     };
     let displaced = old
         .as_ref()
-        .filter(|_| taker.take == Take::Supersede)
+        .filter(|_| taker.take.supersedes())
         .map(|(_, state)| state.clone());
     let previous = old.as_ref().map_or("", |(sha, _)| sha.as_str());
     let local = taker
@@ -1052,6 +1215,10 @@ fn attempt(
     // Make the identity observable before publishing it. A failure here can never strand a
     // remote lease with no host record from which to prove its death.
     claim.keep_local()?;
+    // This taker's record written, the registry's records whose holders are proven dead and
+    // whose leases lapsed for every reader go, so each cut launch leaves this host's registry
+    // only the records a reader may still ask about.
+    aterm_agent::release_progress::collect(taker.registry, (taker.now)());
     Ok(
         match replace_at_main(git, name, previous, &claim.state, main) {
             Write::Race => Attempt::Race,
@@ -1107,8 +1274,8 @@ pub struct Held {
 
 /// Whether a take of the claim `state` by `taker` would be refused now, by the same judgement
 /// as the take ([`attempt`], [`admit`]) and with nothing written: no host record, no ref. `None`
-/// where its lease has run out, its holder's Mac proves its process dead, or `taker` continues
-/// it.
+/// where its lease has run out, its holder's Mac proves its process dead, `taker` continues it,
+/// or `taker` is a session's supersession, which no holder refuses ([`Take::Supersede`]).
 fn held_of(state: &State, taker: &Taker<'_>) -> Option<Held> {
     if taker.take == Take::Supersede
         || continues_holder(taker.take == Take::Continue, &state.holder, taker.holder)
@@ -1296,6 +1463,59 @@ fn hand_back(git: &dyn ClaimStore, lease: &Lease) -> Result<Option<String>, Stri
     Err("the claim kept moving under this run while it was handed back".into())
 }
 
+/// The evidence a renewal by the release pump between its runs rests on ([`renew`]).
+const RENEWED_BY_PUMP: &str = "renewed by the release pump that ran its holder, between its runs: \
+     that pump lives and holds the line, waiting on a fix, a backoff or a gate";
+
+/// Renew the lease of `version`'s fleet claim in `repo` that `holder` (its pid, boot and start, a
+/// process of this Mac's fleet node) holds, for the release pump that ran it, between that pump's
+/// runs (`pump::World::renew`): the claim as it stands with its `at` now, by a compare-and-swap
+/// ([`renew_with`]). The claim names a release process that has ended, whose Mac proves it dead to
+/// a reader that can ask it, so the renewal keeps off only a reader that cannot (aterm not running
+/// there, the LAN cut off), and only while the pump that holds the line lives and reaches origin:
+/// the line then lapses one lease after that pump died, slept or lost origin, never at every pause
+/// of a live one.
+/// # Errors
+/// This Mac's fleet identity does not read, or the claim could not be read or written.
+pub fn renew(repo: &Path, version: &str, holder: (u32, &str, u64)) -> Result<bool, String> {
+    let name = reference(version)?;
+    let (here, _) = this_holder()?;
+    let (pid, boot, start) = holder;
+    let stopped = AtomicBool::new(false);
+    renew_with(
+        &Network::new(repo, &stopped)?,
+        &name,
+        (&here.node, pid, boot, start),
+        now(),
+    )
+}
+
+/// [`renew`] on `git` at `now`, of the claim whose holder is `holder` (its fleet node, pid, boot
+/// and start). `Ok(true)` where it renewed; `Ok(false)` where there is no claim, the claim names
+/// another holder, or another writer moved it between the read and the write, none of which this
+/// renewal may touch.
+fn renew_with(
+    git: &dyn ClaimStore,
+    name: &str,
+    (node, pid, boot, start): (&str, u32, &str, u64),
+    now: u64,
+) -> Result<bool, String> {
+    let Some((sha, mut state)) = remote(git, name)? else {
+        return Ok(false);
+    };
+    let named = &state.holder;
+    if named.node != node || named.pid != pid || named.boot != boot || named.start != start {
+        return Ok(false);
+    }
+    state.at = now;
+    RENEWED_BY_PUMP.clone_into(&mut state.evidence);
+    match replace(git, name, &sha, &state) {
+        Write::Written(_) => Ok(true),
+        Write::Race => Ok(false),
+        Write::Offline(why) | Write::InventoryChanged { why, .. } => Err(why),
+    }
+}
+
 type Reply = std::sync::mpsc::Sender<Result<bool, String>>;
 enum Request {
     Wake,
@@ -1306,7 +1526,10 @@ enum Request {
 fn keep_local(path: &Path, state: &State) -> Result<(), String> {
     // Fleet surveys need identity and the latest boundary, and refuse registry
     // files over 4 MiB before stripping rows. Keep outcome history in State and
-    // its remote Git record; do not copy it into this local observation.
+    // its remote Git record; do not copy it into this local observation. How many
+    // rows completed is kept: `at` is a renewal the heartbeat also advances, so the
+    // count, with the step and boundary, is what tells the release pump a row
+    // completed (`pump::attend`).
     #[derive(Serialize)]
     struct LocalRecord<'a> {
         line: &'a crate::line::Line,
@@ -1316,6 +1539,7 @@ fn keep_local(path: &Path, state: &State) -> Result<(), String> {
         at: u64,
         p95_s: u64,
         evidence: &'a str,
+        completed: usize,
         rows: &'a [String],
     }
     let record = LocalRecord {
@@ -1326,6 +1550,7 @@ fn keep_local(path: &Path, state: &State) -> Result<(), String> {
         at: state.at,
         p95_s: state.p95_s,
         evidence: &state.evidence,
+        completed: state.rows.len(),
         rows: &[],
     };
     let text = aterm_json::to_vec(&record).map_err(|e| e.to_string())?;

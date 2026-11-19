@@ -38,6 +38,7 @@ fn prepare(path: &Path, request: [u8; 16]) -> Result<Prepared> {
             key: source,
             value: Some(value.clone()),
         }],
+        said: None,
     };
     let payload = command.encode()?;
     if decode(&payload)? != command {

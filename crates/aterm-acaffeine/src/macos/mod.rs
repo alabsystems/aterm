@@ -35,6 +35,9 @@ pub(crate) struct ServeContext {
     pub restart_on_update: bool,
     /// This process's hold on the one-mug lock, kept until it returns.
     pub instance: Instance,
+    /// What keeping the job's log kept ([`crate::launchd::keep_log`]): nothing else makes one,
+    /// so `serve` cannot start the mug without keeping it.
+    pub kept: aterm_uds::job_log::Kept,
 }
 
 /// Run the menu-bar mug on this thread, the process main thread, until Quit (or an update restart).

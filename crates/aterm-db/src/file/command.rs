@@ -279,7 +279,10 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             return usage("no configuration folder");
         };
         // Who says they ran it: `--by <word>`, else a person at a terminal, else a program.
+        // Why, and on what evidence: `--reason <line>` and each `--evidence <piece>`.
         let mut by = None;
+        let mut reason = None;
+        let mut evidence = Vec::new();
         let mut json = false;
         let mut rest = Vec::with_capacity(words.len());
         let mut iter = words.into_iter();
@@ -289,6 +292,19 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                     return usage("--by takes one word");
                 };
                 by = Some(said);
+            } else if word == "--reason" {
+                let Some(line) = iter.next() else {
+                    return usage("--reason takes one line");
+                };
+                reason = Some(line);
+            } else if word == "--evidence" {
+                let Some(piece) = iter.next() else {
+                    return usage("--evidence takes one piece");
+                };
+                match crate::typed::values::Evidence::parse(&piece) {
+                    Ok(piece) => evidence.push(piece),
+                    Err(why) => return usage(&format!("--evidence: {why}")),
+                }
             } else if word == "--json" {
                 json = true;
             } else {
@@ -327,13 +343,22 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             }
         });
         let session = std::env::var("ATERM_SESSION_ID").ok();
+        // Who makes the write, read now from this process's lineage, never its environment:
+        // the intent keeps it, whichever process later signs the record.
+        let said = match crate::said::here(&by, reason, evidence) {
+            Ok(said) => said,
+            Err(why) => return usage(why),
+        };
+        let journal = crate::alab::upkeep::journal_spool();
         let env = write::Env {
             by: &by,
             session: session.as_deref().filter(|session| !session.is_empty()),
             now_ms: aterm_time::unix_millis().unwrap_or(0),
             attempt: publish::INLINE,
+            journal: journal.as_ref(),
             json,
             stdin: stdin.as_deref(),
+            said: Some(&said),
             editor: &editor,
             say: &|line: &str| {
                 let _ = writeln!(std::io::stderr(), "{VERB}: {line}");

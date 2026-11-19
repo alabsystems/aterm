@@ -9,6 +9,46 @@ fn a_real_git_dependency_is_measured_from_its_resolved_checkout() {
     use aterm_uds::output::CommandOutput as _;
     use aterm_uds::spawnfd::command;
 
+    const CASE: &str = "loc::tests::a_real_git_dependency_is_measured_from_its_resolved_checkout";
+    const CHILD: &str = "ATERM_FORGE_LOC_GIT_CHILD";
+    const ENTERED: &str = "entered isolated forge Git-dependency fixture";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+        // Scope both caches and Git configuration to the child; the parallel test process's
+        // environment stays unchanged. The entry proof also refuses a stale exact-test filter.
+        let home = aterm_tempfile::tempdir().unwrap();
+        let mut child = command(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", CASE, "--nocapture"])
+            .env(CHILD, CASE)
+            .env("CARGO_HOME", home.path())
+            .env("CARGO_TARGET_DIR", home.path().join("target.noindex"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS");
+        for name in crate::direct_vendor::REPO_ENV {
+            child.env_remove(name);
+        }
+        let output = aterm_uds::deadline::output_while_process_progressing(
+            &mut child,
+            aterm_uds::deadline::ECHO_HANG,
+            "forge local Git-dependency fixture",
+        )
+        .expect("the isolated fixture must keep making progress");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.ends_with(ENTERED)),
+            "isolated fixture did not enter and pass: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    println!("{ENTERED}");
+
     let scratch = aterm_tempfile::tempdir().unwrap();
     let repo = scratch.path().join("source");
     let project = scratch.path().join("consumer");

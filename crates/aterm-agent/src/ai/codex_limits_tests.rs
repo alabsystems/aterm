@@ -655,6 +655,7 @@ fn a_codex_window_near_its_wall_moves_a_two_row_pool_to_its_fresh_row() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let ask = |used: f64| {
         let readings = rollout_rate_limits(&five_hour_reading(now, used));

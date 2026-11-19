@@ -3673,6 +3673,13 @@ pub enum HereBaseline<'a> {
     File(&'a Path),
     /// Setup's compiled plan; no account-writable file is read.
     BuiltIn(crate::init_clt::RootPlan),
+    /// One compiled step a person applies from the System Resources page (`--plain --only
+    /// <step>`): the starter baseline's `[power.ac]` or `[updates]` alone, setup's Spotlight
+    /// scope alone, or one of the person's own Spotlight steps
+    /// ([`crate::init_spotlight::person_items`]), with the folder a keep-out names
+    /// (`--keep-out`). No account-writable file is read, and the run reads the console account
+    /// alone.
+    Only(aterm_types::macos_setup::root_only::Step, Option<&'a Path>),
 }
 
 /// What a plain run of [`here`] (`aterm init`'s root half) takes beside its built-in baseline
@@ -3686,6 +3693,10 @@ pub struct Plain<'a> {
     /// [`crate::init_clt::LEAVE_DEVELOPER_MODE`]): the baseline carries no `[developer]
     /// debugger`.
     pub leave_developer_mode: bool,
+    /// Put back a naming rule the person removed with its own revert (`--restore-name-rule`,
+    /// [`crate::init_clt::RESTORE_NAME_RULE`], [`crate::root_steps::rule_removed`]): without it
+    /// the baseline carries no `[names] admitted_name_rule` while the removal stands.
+    pub restore_name_rule: bool,
 }
 
 /// `aterm machines here plan|apply <baseline.toml>`: run a baseline directly on this Mac; with
@@ -3729,10 +3740,11 @@ pub fn here(
 /// [`here`]'s run: the host and its report to print, `None` when a plain run finished, or the
 /// exit code it ends on (a plain run's class of why it did not finish). A plain run also turns
 /// developer mode on (unless `given` says to leave it) and puts the rule in place that names the
-/// Mac after admission ([`crate::root_steps`]), and with `given`'s name (a
-/// [`crate::init_clt::plain_name`]) gives the Mac that name; whether those rows changed or failed
-/// goes to the journal, and the exit says the tools alone, so a step macOS refused never reads
-/// as tools that did not install.
+/// Mac after admission ([`crate::root_steps`]; one the person removed only where `given` says
+/// to put it back, a rule back in place by other hands being refreshed as any rule is), and
+/// with `given`'s name (a [`crate::init_clt::plain_name`]) gives the Mac that name; whether
+/// those rows changed or failed goes to the journal, and the exit says the tools alone, so a
+/// step macOS refused never reads as tools that did not install.
 /// The explicit naming-permission plan instead has one decisive naming-rule row.
 fn here_report(
     sys: &dyn System,
@@ -3766,6 +3778,22 @@ fn here_report(
         (true, HereBaseline::BuiltIn(plan)) => {
             crate::init_clt::CommandLineTools::baseline_named(plan, name)
         }
+        (true, HereBaseline::Only(step, _)) => {
+            use aterm_types::macos_setup::baseline;
+            use aterm_types::macos_setup::root_only::Step;
+            format!(
+                "schema = 1\n\n{}",
+                match step {
+                    Step::Power => baseline::STARTER_POWER_AC_TOML,
+                    Step::Updates => baseline::STARTER_UPDATES_TOML,
+                    Step::SpotlightScope
+                    | Step::SpotlightPause
+                    | Step::SpotlightResume
+                    | Step::SpotlightRebuild
+                    | Step::SpotlightKeepOut => "",
+                }
+            )
+        }
         (false, HereBaseline::File(path)) => match sys.read_file(path) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) => refuse!(
@@ -3783,7 +3811,11 @@ fn here_report(
         source,
         HereBaseline::BuiltIn(crate::init_clt::RootPlan::NameRuleOnly)
     );
-    let permission_console = if name_rule_only {
+    let only = match source {
+        HereBaseline::Only(step, _) => Some(step),
+        _ => None,
+    };
+    let permission_console = if name_rule_only || only.is_some() {
         match crate::facts::console_account(sys) {
             Ok(user) => Some(user),
             Err(why) => refuse!(ExitCode::FAILURE, "aterm machines here: {why}"),
@@ -3823,6 +3855,16 @@ fn here_report(
     }
     if plain && let Some(lan) = baseline.lan.as_mut() {
         lan.retained_root_run = true;
+    }
+    // A rule the person removed with its own revert stays removed unless their own request says
+    // to put it back. The naming-permission repair is that request whatever it carries.
+    if plain
+        && !name_rule_only
+        && !given.restore_name_rule
+        && crate::root_steps::rule_removed(sys)
+        && let Some(names) = baseline.names.as_mut()
+    {
+        names.admitted_name_rule = None;
     }
     if baseline
         .keyboard
@@ -3880,9 +3922,18 @@ fn here_report(
             Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
         }
     };
-    // The compiled setup transaction stops Spotlight indexing the console account's other
-    // home folders alongside its other root work. Refresh the naming permission too, so matching bytes with an old read
-    // ACL are repaired within that authorization. User baselines keep their policy.
+    // The compiled setup transaction keeps Spotlight to Applications, Documents, Desktop and
+    // the synced drives alongside its other root work. Refresh the naming permission too, so
+    // matching bytes with an old read ACL are repaired within that authorization. User
+    // baselines keep their policy.
+    if let HereBaseline::Only(step, folder) = source
+        && step.spotlight()
+    {
+        match crate::init_spotlight::person_items(step, folder) {
+            Ok(person) => items.extend(person),
+            Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
+        }
+    }
     if matches!(source, HereBaseline::BuiltIn(_)) && !name_rule_only {
         items.push(Box::new(crate::init_spotlight::Scope));
         for item in &mut items {
@@ -3905,6 +3956,15 @@ fn here_report(
         HereBaseline::BuiltIn(crate::init_clt::RootPlan::NameRuleOnly) => {
             "sudo aterm machines here apply --plain --name-rule-only".into()
         }
+        HereBaseline::Only(step, folder) => format!(
+            "sudo aterm machines here apply --plain --only {}{}",
+            step.word(),
+            folder.map_or_else(String::new, |folder| format!(
+                " {} {}",
+                aterm_types::macos_setup::root_only::KEEP_OUT,
+                folder.display()
+            ))
+        ),
         HereBaseline::File(path) => format!("sudo aterm machines here apply {}", path.display()),
     });
     let started = sys.now();
@@ -3921,6 +3981,21 @@ fn here_report(
         Err(refused) => refuse!(ExitCode::FAILURE, "aterm machines here: {refused}"),
     };
     if plain {
+        // A single step finished where every row is its family's and none failed.
+        if let Some(step) = only {
+            let finished = !rows.is_empty()
+                && rows.iter().all(|row| {
+                    items
+                        .iter()
+                        .find(|item| item.id() == row.id)
+                        .is_some_and(|item| item.family() == step.family())
+                        && matches!(
+                            row.outcome,
+                            Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+                        )
+                });
+            return if finished { Ok(None) } else { Err(other()) };
+        }
         if name_rule_only {
             return match rows.as_slice() {
                 [row]

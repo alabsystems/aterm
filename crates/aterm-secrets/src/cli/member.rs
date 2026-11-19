@@ -29,6 +29,9 @@ pub(super) struct StatusHost<'a> {
     pub(super) services: &'a dyn Fn(&Paths, &client::Status),
 }
 
+/// A host's prompt for one line typed at the terminal without echo.
+pub(super) type AskHidden<'a> = &'a dyn Fn(&str) -> Option<SecretBytes>;
+
 /// What `join` asks of the host it runs on: its terminal's prompts, and the subscriber that
 /// follows the vault once a join is asked, where the host runs one.
 pub(super) struct JoinHost<'a> {
@@ -37,7 +40,7 @@ pub(super) struct JoinHost<'a> {
     /// One line typed at the terminal without echo (`None` with no terminal). A host that has
     /// no hidden prompt (`None` here) asks for no join password: one comes from
     /// `--password-stdin` alone.
-    pub(super) ask_hidden: Option<&'a dyn Fn(&str) -> Option<SecretBytes>>,
+    pub(super) ask_hidden: Option<AskHidden<'a>>,
     /// Install the subscriber (`aterm secrets watch`): the line it says, or why not. A host that
     /// runs none (`None`) installs nothing.
     pub(super) subscribe: Option<&'a dyn Fn() -> crate::Result<String>>,
@@ -210,6 +213,11 @@ pub(super) fn status(paths: &Paths, here: &StatusHost<'_>) -> crate::Result<Exit
             }
         }
         Err(error) => println!("needs: unreadable ({error})"),
+    }
+    match crate::need::full::standing(paths) {
+        Ok(Some(full)) => println!("needs: {}", full.line()),
+        Ok(None) => {}
+        Err(error) => println!("needs: the lab table's last refusal is unreadable ({error})"),
     }
     (here.services)(paths, &status);
     Ok(ExitCode::SUCCESS)

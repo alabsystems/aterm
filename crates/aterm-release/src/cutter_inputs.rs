@@ -78,17 +78,18 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
                 if files.is_empty() {
                     return Err("no compiler output directory".into());
                 }
-                for file in files {
+                for file in &files {
                     let dir = file.parent().ok_or("no compiler output directory")?;
                     let has_fingerprint = dir
                         .parent()
                         .is_some_and(|unit| unit.join("fingerprint").is_dir());
-                    if has_fingerprint {
+                    let dep = if has_fingerprint {
                         fingerprint(dir, &fingerprint_name, &mut graph, None, &mut roots)?;
+                        selected_dep_info(&row, file, false)?
                     // Published executables have aggregate dep-info in target/. Their
                     // producer identity authenticates this shape; sources and config
                     // still enter the digest, including every script's control output.
-                    } else if !(row["target"]["kind"]
+                    } else if row["target"]["kind"]
                         .as_array()
                         .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("bin")))
                         && row["executable"]
@@ -96,14 +97,13 @@ pub(crate) fn capture(repo: &Path, output: &[u8], seal: &str) -> Result<Observat
                             .is_some_and(|path| Path::new(path) == file)
                         && row["trust_unit_identity_sha256"]
                             .as_str()
-                            .is_some_and(|id| aterm_codec::hex::is_lower(id, 64)))
+                            .is_some_and(|id| aterm_codec::hex::is_lower(id, 64))
                     {
-                        return Err(format!(
-                            "no compiler fingerprint or producer identity for {}",
-                            dir.display()
-                        ));
-                    }
-                    let dep = selected_dep_info(&row, &file, !has_fingerprint)?;
+                        selected_dep_info(&row, file, true)?
+                    } else {
+                        published_library(&row, &files, file, &mut graph, &mut roots)?;
+                        file.with_extension("d")
+                    };
                     let text = crate::durable::read_text(&dep)
                         .map_err(|e| format!("{}: {e}", dep.display()))?;
                     graph.insert(text.clone());
@@ -334,9 +334,148 @@ fn selected_dep_info(row: &Value, artifact: &Path, aggregate: bool) -> Result<Pa
         .join(format!("{stem}.d")))
 }
 
+/// Cargo uplifts a requested rlib but leaves its metadata private. The same artifact
+/// row must name that metadata; its exact selected receipt must cover both original
+/// outputs, and the published archive must still have those producer bytes.
+fn published_library(
+    row: &Value,
+    files: &BTreeSet<PathBuf>,
+    published: &Path,
+    graph: &mut BTreeSet<String>,
+    roots: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    let name = string(&row["target"], "name")?;
+    let kinds = row["target"]["kind"]
+        .as_array()
+        .ok_or("missing library kind")?;
+    let published_name = format!("lib{}.rlib", name.replace('-', "_"));
+    if !matches!(kinds.as_slice(), [kind] if matches!(kind.as_str(), Some("lib" | "rlib")))
+        || row["trust_compile_mode"].as_str() != Some("build")
+        || row["trust_compile_kind"].as_str() != Some("host")
+        || !row["trust_unit_identity_sha256"]
+            .as_str()
+            .is_some_and(|id| aterm_codec::hex::is_lower(id, 64))
+        || !published.is_absolute()
+        || published.file_name().and_then(|name| name.to_str()) != Some(published_name.as_str())
+    {
+        return Err("no selected private evidence for published library".into());
+    }
+    let mut metadata = files
+        .iter()
+        .filter(|file| file.extension().is_some_and(|ext| ext == "rmeta"));
+    let metadata = match (metadata.next(), metadata.next()) {
+        (Some(metadata), None) if metadata.is_absolute() => metadata,
+        _ => return Err("published library has no unambiguous metadata companion".into()),
+    };
+    let (selected, _) = selected_target(row)?;
+    let dir = metadata.parent().ok_or("no private library directory")?;
+    if dir.file_name().is_none_or(|name| name != "out") {
+        return Err("unknown private library output layout".into());
+    }
+    fingerprint(dir, &selected, graph, None, roots)?;
+    // The same row's ordinary metadata pass still requires its exact selected
+    // dep-info. The published archive also contributes its own aggregate dep-info.
+    let receipt = fingerprint_record(
+        &dir.parent()
+            .ok_or("no library unit")?
+            .join("fingerprint")
+            .join(format!("outputs-{selected}"))
+            .with_extension("json"),
+    )?;
+    let receipt: LibraryOutputs = aterm_json::from_value(receipt).map_err(|e| e.to_string())?;
+    if receipt.schema != 4
+        || receipt.compiler["mode"].as_str() != Some("build")
+        || receipt.compiler["workspace"].as_bool() != Some(true)
+        || receipt.compiler["build_script"].as_bool() != Some(false)
+        || receipt.compiler_outputs.len() != 2
+        || receipt.outputs.len() != 2
+    {
+        return Err("unknown published library output inventory".into());
+    }
+    let original = metadata.with_extension("rlib");
+    let mut archive = None;
+    for (path, emit) in [
+        (original.as_path(), "link"),
+        (metadata.as_path(), "metadata"),
+    ] {
+        let path_sha256 =
+            aterm_codec::hex::encode_lower(&Sha256::digest(path.as_os_str().as_encoded_bytes()));
+        if receipt
+            .compiler_outputs
+            .iter()
+            .filter(|output| output.path_sha256 == path_sha256 && output.emit == emit)
+            .count()
+            != 1
+        {
+            return Err("published library compiler coverage differs".into());
+        }
+        let matches: Vec<_> = receipt
+            .outputs
+            .iter()
+            .filter(|output| output.path_sha256 == path_sha256)
+            .collect();
+        let [recorded] = matches.as_slice() else {
+            return Err("published library producer inventory differs".into());
+        };
+        let actual = output_bytes(path)?;
+        if actual != (recorded.size, recorded.sha256.clone()) {
+            return Err("private library bytes differ from selected producer".into());
+        }
+        if emit == "link" {
+            archive = Some(actual);
+        }
+    }
+    let published_bytes = output_bytes(published)?;
+    if Some(&published_bytes) != archive.as_ref() {
+        return Err("published library bytes differ from selected producer".into());
+    }
+    graph.insert(
+        aterm_json::json!({"published-library/1": {
+            "path":published, "private_archive":original,
+            "size":published_bytes.0, "sha256":published_bytes.1,
+        }})
+        .to_string(),
+    );
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct LibraryOutputs {
+    schema: u32,
+    compiler: Value,
+    compiler_outputs: Vec<CompilerOutput>,
+    outputs: Vec<RecordedOutput>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-enum ScriptInput {
+struct CompilerOutput {
+    path_sha256: String,
+    emit: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordedOutput {
+    path_sha256: String,
+    size: u64,
+    sha256: String,
+}
+
+fn output_bytes(path: &Path) -> Result<(u64, String), String> {
+    use aterm_toolchain::stat_digest::StatKey;
+    let (digest, before) = crate::durable::sha256_file_with_meta(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let after = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !StatKey::of(&before).unchanged(&StatKey::of(&after)) {
+        return Err("library output changed while reading its producer evidence".into());
+    }
+    Ok((before.len(), digest))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum ScriptInput {
     RerunIfChanged {
         output: PathBuf,
         paths: Vec<PathBuf>,
@@ -357,7 +496,7 @@ enum ScriptInput {
 /// not evidence of an empty declared input set.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ContentSnapshot {
+pub(crate) struct ContentSnapshot {
     version: u32,
     entries: u64,
     bytes: u64,
@@ -365,7 +504,7 @@ struct ContentSnapshot {
 }
 
 impl ContentSnapshot {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.version == 1
             && self.entries <= 100_000
             && self.bytes <= 512 * 1024 * 1024

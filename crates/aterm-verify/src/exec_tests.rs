@@ -2911,8 +2911,9 @@ fn a_started_leader_over_a_stranded_member_gets_its_term_grace_first() {
         let cmd = stand_in(
             &pidfile,
             &format!(
-                "trap 'echo term > \"{}\"; exit 0' TERM; while :; do sleep 1; done",
-                marker.display()
+                "trap 'echo term > \"{}\"; exit 0' TERM; {}",
+                marker.display(),
+                aterm_uds::stand_in_loop::while_alive("sleep 1")
             ),
         );
         let cmd = match grace {
@@ -3106,19 +3107,21 @@ fn a_tree_given_no_core_at_all_is_a_hang_its_ceiling_ends() {
 /// runnable time as waiting never ends the busy one; one that counts a window its tree was
 /// runnable for none of as a wait ends the stopped one only at `IDLE_HANG`, and with
 /// that bound gone too never ends it (the arithmetic test fails on the first alone); the hang
-/// detector fails each that never ends.
+/// detector fails each that never ends. Neither outlives this test binary should it die first:
+/// the stopped one's group, orphaned then with a stopped member, is sent `SIGHUP` and `SIGCONT`,
+/// and the busy one's loop ends once the binary is gone ([`aterm_uds::stand_in_loop::while_alive`]).
 #[cfg(unix)]
 #[test]
 fn a_stopped_child_and_a_busy_one_still_end_at_their_ceiling() {
     let tmp = crate::mktemp_dir("atv-stopped-busy").expect("mktemp");
     for (name, then) in [
-        ("stopped", "kill -STOP $$"),
-        ("busy", "while :; do :; done"),
+        ("stopped", "kill -STOP $$".to_owned()),
+        ("busy", aterm_uds::stand_in_loop::while_alive(":")),
     ] {
         let pidfile = tmp.join(format!("{name}.pid"));
         let out = ended(
             running(
-                stand_in(&pidfile, then),
+                stand_in(&pidfile, &then),
                 &tmp,
                 Duration::from_secs(1),
                 &LIVE_HOST,

@@ -4,6 +4,152 @@
 use super::*;
 
 #[test]
+fn transferred_native_exec_claim_is_released_when_its_reply_is_lost() {
+    use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes, Outbox};
+    use crate::session_timeline::SupervisorAuthority;
+    use aterm_spec::wait::{MUST_HAPPEN, until_within};
+    use std::sync::mpsc;
+
+    struct Service {
+        store: Store,
+        session: Arc<crate::SessionCtx>,
+        expected: SupervisorAuthority,
+        dispatched: mpsc::Sender<(u64, bool)>,
+        continue_reply: Mutex<Option<mpsc::Receiver<()>>>,
+        released: mpsc::Sender<u64>,
+    }
+
+    impl LaneService for Service {
+        fn authenticate(
+            &self,
+            _stream: &CtlStream,
+            reader: &mut LaneReader<'_>,
+        ) -> Option<(Scope, Principal, Option<String>)> {
+            (read_request_line(reader)? == "AUTH ok").then_some((
+                Scope::Owner,
+                Principal::Instance,
+                None,
+            ))
+        }
+
+        fn serve_line(
+            &self,
+            request: Request,
+            _scope: Scope,
+            _stream: &CtlStream,
+            _reader: &mut LaneReader<'_>,
+            out: &mut Outbox,
+        ) -> Option<ServeDisposition> {
+            assert_eq!(request.line(), "transfer");
+            let connection = serving_connection().expect("serving lane serial");
+            let accepted = transfer_served_native_exec_claim(
+                &mut self.session.meta.lock().unwrap(),
+                &self.expected,
+                connection,
+                None,
+                crate::metrics::now_us(),
+            )
+            .is_some();
+            self.dispatched.send((connection, accepted)).unwrap();
+            if accepted {
+                let resume = self.continue_reply.lock().unwrap().take().unwrap();
+                resume.recv_timeout(MUST_HAPPEN).unwrap();
+            }
+            out.extend_from_slice(if accepted { b"OK\n" } else { b"ERR stale\n" });
+            None
+        }
+
+        fn is_wait(&self, _request: &Request, _scope: Scope) -> bool {
+            false
+        }
+
+        fn subscribe(&self, _request: Request, _scope: Scope, _stream: CtlStream) {}
+
+        fn has_live_claim(&self, id: u64) -> bool {
+            connection_has_live_claim(&self.store, id, crate::metrics::now_us())
+        }
+
+        fn release(&self, id: u64) {
+            release_connection_claims(&self.store, None, id);
+            self.released.send(id).unwrap();
+        }
+    }
+
+    let store = crate::session_store::new_store();
+    let handle = crate::session_store::test_handle(901);
+    store.write().unwrap().register(handle.clone());
+    let proof = crate::self_claim::stand_in::running();
+    let now = crate::metrics::now_us();
+    crate::session_timeline::claim_supervisor_as(
+        &handle.ctx,
+        &format!("codex-alab@{}", proof.pid),
+        Some(u64::MAX),
+        None,
+        Some(proof),
+        now,
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    let expected = handle.ctx.meta.lock().unwrap().supervisor_authority(now);
+    let (dispatched, dispatch) = mpsc::channel();
+    let (continue_reply, resume_reply) = mpsc::channel();
+    let (released, release) = mpsc::channel();
+    let lanes = Lanes::new(LaneLimits {
+        rpc: 2,
+        wait: 0,
+        inline: 0,
+        open: 2,
+        subscriptions: 0,
+    });
+    let started = lanes.start();
+    assert_eq!(started.rpc, 2);
+    lanes.publish(Arc::new(Service {
+        store: store.clone(),
+        session: Arc::clone(&handle.ctx),
+        expected,
+        dispatched,
+        continue_reply: Mutex::new(Some(resume_reply)),
+        released,
+    }));
+    started.activate();
+    let request_transfer = || {
+        let (client, server) = CtlStream::pair().unwrap();
+        assert!(lanes.admit(server).is_ok());
+        (&client).write_all(b"AUTH ok\ntransfer\n").unwrap();
+        client
+    };
+
+    let successor = request_transfer();
+    let (owner, true) = dispatch.recv_timeout(MUST_HAPPEN).unwrap() else {
+        panic!("the original v2 authority transfers to the successor");
+    };
+    let stale = request_transfer();
+    let (rejected, false) = dispatch.recv_timeout(MUST_HAPPEN).unwrap() else {
+        panic!("the old snapshot cannot take the transferred claim");
+    };
+    assert_ne!(owner, rejected);
+    assert!(connection_has_live_claim(
+        &store,
+        owner,
+        crate::metrics::now_us()
+    ));
+    drop(stale);
+    drop(successor);
+    continue_reply.send(()).unwrap();
+    assert_eq!(release.recv_timeout(MUST_HAPPEN).unwrap(), owner);
+    until_within(MUST_HAPPEN, "both sockets finish their tenure", || {
+        let census = lanes.census();
+        (census.open == 0 && census.placing == 0).then_some(())
+    });
+    assert!(release.try_recv().is_err());
+    assert!(!connection_has_live_claim(
+        &store,
+        owner,
+        crate::metrics::now_us()
+    ));
+}
+
+#[test]
 fn only_live_connection_bound_claims_spare_their_connection() {
     let store = crate::session_store::new_store();
     let supervisor = crate::session_store::test_handle(1);

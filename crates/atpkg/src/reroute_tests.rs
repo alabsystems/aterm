@@ -689,6 +689,7 @@ fn plan_with(
 fn trust_at(name: &str, picked: Picked) -> Resolved {
     Resolved {
         real: PathBuf::from(format!("/t/trust-7d5533b2/bin/{name}")),
+        rustup_proxy: true,
         rustup: Some(Rustup {
             toolchain: "trust".into(),
             picked,
@@ -708,6 +709,7 @@ fn stock_at(name: &str, channel: &str, picked: Picked) -> Resolved {
     let toolchain = format!("{channel}-aarch64-apple-darwin");
     Resolved {
         real: PathBuf::from(format!("/r/toolchains/{toolchain}/bin/{name}")),
+        rustup_proxy: true,
         rustup: Some(Rustup { toolchain, picked }),
         identity: Identity::Known(Vv {
             tool: name.into(),
@@ -1813,6 +1815,7 @@ fn cargo_and_rustc_are_named_by_what_they_resolve_to() {
 
     let unknown = |_: &Path, _: Option<&str>| Resolved {
         real: PathBuf::from(UP),
+        rustup_proxy: false,
         rustup: None,
         identity: Identity::Unknown {
             why: "/usr/bin/up -vV exited 3".into(),
@@ -1889,6 +1892,7 @@ fn inside_a_trust_checkout_only_trust_runs_by_name() {
     assert!(say.contains("trustc main.rs"), "{say}");
     let unknown = |_: &Path, _: Option<&str>| Resolved {
         real: PathBuf::from(UP),
+        rustup_proxy: true,
         rustup: None,
         identity: Identity::Unknown {
             why: "`rustup which cargo`: error: toolchain 'x' is not installed".into(),
@@ -2705,6 +2709,7 @@ fn an_upstream_cargo_gets_the_build_cache_only_where_its_release_reads_it() {
             pin: &|| None,
             resolve: &|_, _| Resolved {
                 real: PathBuf::from(UP),
+                rustup_proxy: false,
                 rustup: None,
                 identity: identity.clone(),
             },
@@ -2810,4 +2815,120 @@ fn trust_cargo_reads_twins_before_any_placement_decision() {
         )),
         args(&["build"])
     );
+}
+
+/// A failed identity probe cannot prove that Cargo ignores Trust's environment twins.
+#[test]
+fn an_unknown_cargo_observes_trust_environment_without_assuming_placement_support() {
+    let identity = Identity::Unknown {
+        why: "the compiler identity probe did not answer".into(),
+    };
+    let env = |name: &str| match name {
+        "TARGO_TARGET_DIR" => Some(std::ffi::OsString::from("unknown-target")),
+        "TARGO_HOME" => Some(std::ffi::OsString::from("unknown-home")),
+        _ => None,
+    };
+    let machine = crate::build_cache::Machine {
+        home: None,
+        root: None,
+        cwd: None,
+        env: &env,
+        read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
+        writable: &|_| None,
+    };
+    let tool = upstream_cargo_tool(&identity);
+    for (name, expected) in [
+        ("CARGO_TARGET_DIR", "unknown-target"),
+        ("CARGO_HOME", "unknown-home"),
+    ] {
+        assert_eq!(
+            crate::build_cache::cargo_var(name, tool, &machine),
+            Some(expected.into())
+        );
+    }
+    assert!(
+        upstream_cargo_placement(&args(&["build"]), &identity, &|_, _| {
+            panic!("an unknown release cannot establish build-dir support")
+        })
+        .is_none()
+    );
+}
+
+#[test]
+fn a_rustup_proxy_observes_its_exported_home_even_without_a_compiler_identity() {
+    use crate::build_cache::{Machine as CacheMachine, package_homes};
+    let root = std::env::temp_dir().join("reroute-home");
+    let home = root.join("account");
+    let cwd = root.join("launcher");
+    let moved = root.join("destination");
+    let twin = root.join("twin");
+    let explicit = root.join("explicit");
+    for cargo_home in [
+        None,
+        Some(PathBuf::new()),
+        Some(PathBuf::from("relative")),
+        Some(explicit),
+    ] {
+        let env = |name: &str| match name {
+            "CARGO_HOME" => cargo_home.as_ref().map(|p| p.as_os_str().to_owned()),
+            "TARGO_HOME" => Some(twin.as_os_str().to_owned()),
+            "TARGO_TARGET_DIR" => Some("target-from-twin".into()),
+            _ => None,
+        };
+        let machine = CacheMachine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &env,
+            read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
+            writable: &|_| None,
+        };
+        let expected = cargo_home
+            .as_ref()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| home.join(".cargo"), |p| cwd.join(p));
+        for identity in [
+            trust_at("cargo", Picked::Unsaid).identity,
+            stock_at("cargo", "stable", Picked::Unsaid).identity,
+            Identity::Unknown {
+                why: "probe failed".into(),
+            },
+        ] {
+            let tool = upstream_cargo_tool(&identity);
+            with_cargo_environment(true, &machine, |observed| {
+                assert_eq!(package_homes(tool, observed), vec![expected.clone()]);
+                // Cargo's later -C cannot change the absolute home rustup already exported.
+                assert_eq!(
+                    package_homes(
+                        tool,
+                        &CacheMachine {
+                            cwd: Some(&moved),
+                            ..*observed
+                        }
+                    ),
+                    vec![expected.clone()]
+                );
+                assert_eq!(
+                    crate::build_cache::cargo_var("CARGO_TARGET_DIR", tool, observed),
+                    crate::build_cache::cargo_var("CARGO_TARGET_DIR", tool, &machine)
+                );
+            });
+            with_cargo_environment(false, &machine, |observed| {
+                assert_eq!((observed.env)("CARGO_HOME"), env("CARGO_HOME"));
+                assert_eq!(package_homes(tool, observed), package_homes(tool, &machine));
+            });
+            with_cargo_environment(
+                true,
+                &CacheMachine {
+                    cwd: None,
+                    ..machine
+                },
+                |observed| {
+                    assert_eq!((observed.env)("CARGO_HOME"), env("CARGO_HOME"));
+                },
+            );
+        }
+    }
 }

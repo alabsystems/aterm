@@ -3,8 +3,8 @@
 
 //! THE LANDING'S RECEIPT (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9, slice 9b): what
 //! aterm itself checked at a landing, apart from what the agent said. The probe's reading at the
-//! point that landed names the repository, its `HEAD` and the remote main it was counted against
-//! ([`RepoRead::Checked`]); the agent's defense line and the lines after it say what it claimed;
+//! point that landed names the repository, its `HEAD` and the cached remote main reference it
+//! was counted against ([`RepoRead::Checked`]); the agent's defense line and the lines after it say what it claimed;
 //! and it says whether the agent answered aterm's land check (`land-check@v1`, §14.17 item 5,
 //! slice 13a) `LANDED`, the fact the words of what the agent said are chosen by
 //! (`crate::supervise::mode_words::said_words`).
@@ -66,10 +66,11 @@ pub const RECEIPT: &str = "RECEIPT";
 /// What the probe's reading at the landing could say of where the work is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ReceiptLeg {
-    /// `HEAD` is on the remote main the probe counted against (`origin/main`): nothing
-    /// uncommitted, untracked, stashed on its branch, unpushed or off that ref.
+    /// Locally observed clean against the selected cached remote default branch, including
+    /// verified Cargo source exclusions. No fresh remote read is implied.
     OnMain,
-    /// Pushed (a remote-tracking ref holds `HEAD`), with no remote main to check it against.
+    /// Publication is covered by a cached remote ref, validated fetched commit or verified
+    /// Cargo source baseline, with no cached remote default branch to compare against.
     Pushed,
     /// Committed in a repository with no remote: nothing was pushed anywhere.
     NoRemote,

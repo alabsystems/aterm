@@ -17,8 +17,8 @@ pub(crate) struct GlPresentBufs {
     bloom: GlBuffer,
     shimmer: GlBuffer,
     tray: GlBuffer,
-    dock_tray: GlBuffer,
-    dock_blit: GlBuffer,
+    dock_tray: [GlBuffer; 2],
+    dock_blit: [GlBuffer; 2],
     crown: GlBuffer,
     /// The bloom extract's instances (`bloom_glow_scratch[extract_first..]`).
     extract: Option<(GlBuffer, usize)>,
@@ -35,8 +35,14 @@ impl GlPresentBufs {
             bloom: u(std::mem::size_of::<BloomUniform>())?,
             shimmer: u(std::mem::size_of::<ShimmerUniform>())?,
             tray: u(std::mem::size_of::<TrayUniform>())?,
-            dock_tray: u(std::mem::size_of::<TrayUniform>())?,
-            dock_blit: u(std::mem::size_of::<BlitUniform>())?,
+            dock_tray: [
+                u(std::mem::size_of::<TrayUniform>())?,
+                u(std::mem::size_of::<TrayUniform>())?,
+            ],
+            dock_blit: [
+                u(std::mem::size_of::<BlitUniform>())?,
+                u(std::mem::size_of::<BlitUniform>())?,
+            ],
             crown: u(std::mem::size_of::<HdrGlowUniform>())?,
             extract: None,
             crown_stream: None,
@@ -48,7 +54,8 @@ impl GlPresentBufs {
 /// the stand-in, the sizes, and what drew over the frame.
 #[derive(Clone, Copy)]
 pub(crate) struct GlPosted {
-    dock: Option<([u32; 4], u64)>,
+    chrome: [[Option<([u32; 4], u64)>; 2]; 2],
+    chrome_origins: [(i64, i64); 2],
     /// The blit's uniform: placement (`content_off`), crop, invert, overlay,
     /// bands.
     blit: BlitUniform,
@@ -109,12 +116,19 @@ fn post_damage(
         Some(now.crown),
         now.dest,
     )?;
-    let dock = if last.dock == now.dock && now.dock.is_none_or(|(_, serial)| serial != 0) {
-        Some([0, 0, 0, 0])
-    } else {
-        union_rect_opt(card(last.dock), card(now.dock), now.dest)
-    };
-    union_rect_opt(Some(frame), dock, now.dest)
+    let mut changed = Some(frame);
+    for (i, clips) in now.chrome.iter().enumerate() {
+        for (&before, &after) in last.chrome[i].iter().zip(clips) {
+            if before != after
+                || (after.is_some() && last.chrome_origins[i] != now.chrome_origins[i])
+                || after.is_some_and(|(_, serial)| serial == 0)
+            {
+                let damage = union_rect_opt(card(before), card(after), now.dest);
+                changed = union_rect_opt(changed, damage, now.dest);
+            }
+        }
+    }
+    changed
 }
 
 /// Where a change to `rect` of the frame (frame pixels, half-open) shows on
@@ -368,7 +382,7 @@ impl GpuRenderer {
         if shimmer_region.is_some() {
             live.ensure_pipeline(Pipeline::Shimmer)?;
         }
-        if tray.is_some() || win.dock_card.is_some() {
+        if tray.is_some() || win.dock_card.is_some() || win.resource_strip.is_some() {
             live.ensure_pipeline(Pipeline::Tray)?;
         }
         if run_hdr_glow {
@@ -639,16 +653,24 @@ impl GpuRenderer {
             live.pipeline(row)
                 .unwrap_or_else(|| panic!("gl present: {row:?} ensured above"))
         };
-        let dock_card = win.dock_card.clone();
-        let dock_rect = win.dock_rect((dw, dh));
-        let mut dock_redraw = false;
-        if let Some(card) = dock_card.as_ref() {
-            let fresh = win.gl_dock_stage.as_ref().is_none_or(|stage| {
+        let chrome = win.chrome_cards();
+        let origins = win.chrome_origins();
+        let clips: [_; 2] = std::array::from_fn(|i| win.chrome_rects(i, (dw, dh), fw));
+        let mut redraw = [false; 2];
+        for (i, card) in chrome.iter().enumerate() {
+            let Some(card) = card
+                .as_ref()
+                .filter(|_| clips[i].iter().any(Option::is_some))
+            else {
+                win.gl_dock_stage[i] = None;
+                continue;
+            };
+            let fresh = win.gl_dock_stage[i].as_ref().is_none_or(|stage| {
                 !stage.input.on(&live.dev) || (stage.input.width, stage.input.height) != card.size
             });
             if fresh {
                 let (format, alias) = offscreen_format(&live.dev);
-                win.gl_dock_stage = Some(ArmDockStage {
+                win.gl_dock_stage[i] = Some(ArmDockStage {
                     input: live.dev.texture_2d(
                         TexelFormat::Rgba8Unorm,
                         card.size.0,
@@ -661,9 +683,9 @@ impl GpuRenderer {
                     serial: None,
                 });
             }
-            let stage = win.gl_dock_stage.as_ref().expect("dock stage ensured");
-            dock_redraw = card.serial == 0 || stage.serial != Some(card.serial);
-            if dock_redraw {
+            let stage = win.gl_dock_stage[i].as_ref().expect("dock stage ensured");
+            redraw[i] = card.serial == 0 || stage.serial != Some(card.serial);
+            if redraw[i] {
                 live.dev.upload_rows(
                     &stage.input,
                     0,
@@ -676,20 +698,17 @@ impl GpuRenderer {
                 self.tray_upload_bytes += card.rgba.len() as u64;
             }
             let mut uniform = want.for_dock(&card.quad());
-            uniform.content_off = [win.dock_origin.0 as f32, win.dock_origin.1 as f32];
+            uniform.content_off = [origins[i].0 as f32, origins[i].1 as f32];
             live.dev
-                .write_buffer(&bufs.dock_blit, aterm_bits::bytes_of(&uniform))?;
+                .write_buffer(&bufs.dock_blit[i], aterm_bits::bytes_of(&uniform))?;
             live.dev.write_buffer(
-                &bufs.dock_tray,
+                &bufs.dock_tray[i],
                 aterm_bits::bytes_of(&TrayUniform {
                     rect: [0.0, 0.0, card.size.0 as f32, card.size.1 as f32],
                     fb: [card.size.0 as f32, card.size.1 as f32],
                     _pad: [0.0; 2],
                 }),
             )?;
-        } else {
-            // A hidden dock keeps no resident stage, as no tray keeps no tray card.
-            win.gl_dock_stage = None;
         }
         let nearest = live.nearest();
         let linear = live.linear();
@@ -811,8 +830,8 @@ impl GpuRenderer {
             pass.bind_texture(&card.tex, linear, binds.fragment_textures[0], false);
             pass.draw(4, 1)?;
         }
-        if let Some(stage) = win.gl_dock_stage.as_ref() {
-            if dock_redraw {
+        for (i, stage) in win.gl_dock_stage.iter().enumerate() {
+            if let Some(stage) = stage.as_ref().filter(|_| redraw[i]) {
                 let binds = Pipeline::Tray.spec().binds;
                 let mut pass = frame.begin_pass(
                     &stage.target,
@@ -825,7 +844,7 @@ impl GpuRenderer {
                     }),
                     None,
                     (
-                        &bufs.dock_tray,
+                        &bufs.dock_tray[i],
                         binds.vertex_uniform.expect("tray vertex uniform"),
                     ),
                 )?;
@@ -876,11 +895,14 @@ impl GpuRenderer {
                 bind_glow_lights(&mut pass, live, crown_row, bufs.crown_stream.as_ref());
                 pass.draw(6, crown_count)?;
             }
-            if let (Some(stage), Some([x0, y0, x1, y1])) = (win.gl_dock_stage.as_ref(), dock_rect) {
-                if x1 > x0 && y1 > y0 {
+            for (i, stage) in win.gl_dock_stage.iter().enumerate() {
+                let Some(stage) = stage else {
+                    continue;
+                };
+                for [x0, y0, x1, y1] in clips[i].into_iter().flatten() {
                     let binds = Pipeline::Blit.spec().binds;
                     pass.set_scissor(Some((x0, y0, x1 - x0, y1 - y0)));
-                    pass.bind_uniform(&bufs.dock_blit, binds.fragment_buffers[0]);
+                    pass.bind_uniform(&bufs.dock_blit[i], binds.fragment_buffers[0]);
                     pass.set_pipeline(pipe(Pipeline::Blit));
                     pass.bind_texture(&stage.target, nearest, binds.fragment_textures[0], raw);
                     pass.draw(3, 1)?;
@@ -888,8 +910,10 @@ impl GpuRenderer {
             }
         }
         frame.submit()?;
-        if let (Some(stage), Some(card)) = (win.gl_dock_stage.as_mut(), dock_card.as_ref()) {
-            stage.serial = Some(card.serial);
+        for (stage, card) in win.gl_dock_stage.iter_mut().zip(&chrome) {
+            if let (Some(stage), Some(card)) = (stage, card) {
+                stage.serial = Some(card.serial);
+            }
         }
         let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
         let bloom = if bloom_state.is_some() {
@@ -920,7 +944,10 @@ impl GpuRenderer {
             (rect, card.serial)
         });
         let posted = GlPosted {
-            dock: dock_rect.zip(dock_card.as_ref().map(|card| card.serial)),
+            chrome: std::array::from_fn(|i| {
+                clips[i].map(|rect| rect.zip(chrome[i].as_ref().map(|c| c.serial)))
+            }),
+            chrome_origins: origins,
             blit: want,
             frame: (fw, fh),
             dest: (dw, dh),

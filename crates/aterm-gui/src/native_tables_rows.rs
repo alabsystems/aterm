@@ -34,7 +34,7 @@
 //! reference may name them ([`Targets`]): by the words each is known by (a machine's label, an
 //! account's provider word and address, `aterm_db::alab::registry::Names`; else the column that
 //! names its row), and where two rows share those words, by each one's key ending, its status
-//! and whether a Mac holds it (a Mac's own row names it). A reference cell shows its row that
+//! and, in the registry, whether a Mac holds it. A reference cell shows its row that
 //! way, never its raw key; it opens on a list of the target's live rows less any a staged change
 //! ends ([`choice`], the list SF-37 opens an enum on) and stages the chosen row's key. Typed
 //! words mark a row only where they are its words whole or its key, never the first row whose
@@ -461,9 +461,12 @@ impl TablesApp {
             return true;
         };
         let mut named = false;
+        // A reference names `to` by its column's link, the page's name for the table's sheet.
+        let links =
+            |column: &SheetColumn, target: &str| column.links.as_deref().unwrap_or(target) == to;
         for column in &sheet.columns {
             match column.compiled.map(|c| c.ty) {
-                Some(Ty::Ref(target)) if target == to => {
+                Some(Ty::Ref(target)) if links(column, target) => {
                     let cell = row.cells.get(&column.name);
                     if cell.is_some_and(|c| !c.values.is_empty()) {
                         return true;
@@ -475,7 +478,9 @@ impl TablesApp {
                         }
                     }
                 }
-                Some(Ty::Set(Ty::Ref(target)) | Ty::List(Ty::Ref(target), _)) if *target == to => {
+                Some(Ty::Set(Ty::Ref(target)) | Ty::List(Ty::Ref(target), _))
+                    if links(column, target) =>
+                {
                     return true;
                 }
                 _ => {}
@@ -593,7 +598,7 @@ impl TablesApp {
 /// (`aterm_db::typed::check::retired_referenced`). Otherwise, and where two tables would each
 /// wait on the other, by the tables' names.
 pub(crate) fn order(app: &TablesApp, staged: &mut Vec<super::Staged>) {
-    let names: Vec<String> = staged.iter().map(|s| s.base.collection.clone()).collect();
+    let names: Vec<String> = staged.iter().map(|s| s.sheet.to_owned()).collect();
     // `(first, then)`: the table `first` is saved before `then`.
     let mut before: BTreeSet<(String, String)> = BTreeSet::new();
     for (sheet, pk, _) in app
@@ -626,7 +631,7 @@ pub(crate) fn order(app: &TablesApp, staged: &mut Vec<super::Staged>) {
     staged.sort_by_key(|s| {
         ordered
             .iter()
-            .position(|n| *n == s.base.collection)
+            .position(|n| *n == s.sheet)
             .unwrap_or(usize::MAX)
     });
 }
@@ -678,6 +683,8 @@ pub(crate) fn act(app: &mut TablesApp, view: &mut TablesViewState, key: &str) ->
                         .and_then(refers_to)?;
                     let row = s.rows.iter().find(|r| r.pk == pk)?;
                     let named = named_key(app, s, row, column)?;
+                    // The sheet by the page's own name for it, as the rail lists it.
+                    let to = app.listed().iter().find(|l| l.name == to)?.name;
                     view.show_row(app, to, &named, None);
                 }
                 _ => {
@@ -993,7 +1000,7 @@ pub(crate) struct Target {
     /// what its sheet names its row by.
     pub(crate) words: String,
     /// How a reference to it reads: its words, and where another row of its table is known by the
-    /// same words, its key's ending, its status and whether a Mac holds it.
+    /// same words, its key's ending, its status and, in the registry, whether a Mac holds it.
     pub(crate) said: String,
     /// How it is named where its status may since have changed (a reference's history, a pane's
     /// title): its words, and where another row shares them, its key's ending.
@@ -1014,7 +1021,7 @@ pub(crate) struct Named {
 }
 
 /// Every cells table's rows a reference may name, by the table's name.
-pub(crate) type Targets = BTreeMap<&'static str, Named>;
+pub(crate) type Targets = BTreeMap<&'static str, std::sync::Arc<Named>>;
 
 /// The shortest ending of `pk`, four characters at least, that none of `others` ends with.
 pub(crate) fn ending<'a>(pk: &'a str, others: &[&str]) -> &'a str {
@@ -1036,8 +1043,8 @@ pub(crate) fn ending<'a>(pk: &'a str, others: &[&str]) -> &'a str {
 /// `written` the label a row was written under, where its table's labels are claimed (two rows
 /// written under one label read as two: the claim's winner by it, the other by its clash label,
 /// `m22-3f9a`), so rows written under one label are told apart whatever they read as; `held`
-/// names each row a Mac holds, by table and key. Every row is listed, a retired one too, since a
-/// reference outlives its row's life; a new row not written is not.
+/// names each row a Mac holds in the registry and is absent for other families. The list includes
+/// retired rows because references outlive them. A new row enters the list when it is written.
 #[cfg_attr(
     not(unix),
     expect(
@@ -1049,14 +1056,13 @@ pub(crate) fn targets(
     sheets: &[Sheet],
     words: impl Fn(&str, &str) -> Option<String>,
     written: impl Fn(&str, &str) -> Option<String>,
-    held: &BTreeSet<(&'static str, String)>,
+    held: Option<&BTreeSet<(&'static str, String)>>,
 ) -> Targets {
     let mut targets = Targets::new();
     for sheet in sheets.iter().filter(|s| !s.owned) {
         let has_status = sheet.columns.iter().any(|c| c.name == "status");
-        // Each row's key, words, status, whether a Mac holds it, whether it is live and its
-        // lifecycle, and the label it was written under.
-        let mut found: Vec<(String, String, String, bool, (bool, String), String)> = Vec::new();
+        // Each row's key, words, status, lifecycle and the label it was written under.
+        let mut found: Vec<(String, String, String, (bool, String), String)> = Vec::new();
         for row in sheet.rows.iter().filter(|r| !is_new(&r.pk)) {
             let text = |column: &str| {
                 row.cells
@@ -1089,29 +1095,28 @@ pub(crate) fn targets(
             } else {
                 word.clone()
             };
-            let holds = held.contains(&(sheet.name, row.pk.clone()));
             let label = written(sheet.name, &row.pk)
                 .unwrap_or_else(|| named.clone())
                 .to_lowercase();
-            found.push((row.pk.clone(), named, status, holds, (live, word), label));
+            found.push((row.pk.clone(), named, status, (live, word), label));
         }
         let mut by_label: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (pk, .., label) in &found {
             by_label.entry(label).or_default().push(pk);
         }
         let mut named = Named::default();
-        for (pk, words, status, holds, (live, word), label) in &found {
+        for (pk, words, status, (live, word), label) in &found {
             let shared = &by_label[label.as_str()];
             let (said, short) = if shared.len() > 1 {
                 let short = format!("{words} \u{b7} \u{2026}{}", ending(pk, shared));
-                let said = format!(
-                    "{short} \u{b7} {status} \u{b7} {}",
-                    if *holds {
-                        "a machine holds it"
+                let mut said = format!("{short} \u{b7} {status}");
+                if let Some(held) = held {
+                    said.push_str(if held.contains(&(sheet.name, pk.clone())) {
+                        " \u{b7} a machine holds it"
                     } else {
-                        "no machine holds it"
-                    }
-                );
+                        " \u{b7} no machine holds it"
+                    });
+                }
                 (said, short)
             } else {
                 (words.clone(), words.clone())
@@ -1135,15 +1140,18 @@ pub(crate) fn targets(
                 .then_with(|| a.cmp(b))
         });
         named.order = order.into_iter().cloned().collect();
-        targets.insert(sheet.name, named);
+        targets.insert(sheet.name, std::sync::Arc::new(named));
     }
     targets
 }
 
-/// The table a one-row reference column names.
-fn refers_to(column: &SheetColumn) -> Option<&'static str> {
+/// The table a one-row reference column names, by the page's name for its sheet: the column's
+/// [`SheetColumn::links`], which the read sets from its `Ty::Ref` and names as it names that
+/// table's sheet (`crate::tables_store::sheet_id`: a family's after the first are named apart),
+/// else the collection its type names.
+fn refers_to(column: &SheetColumn) -> Option<&str> {
     match column.compiled.map(|c| c.ty) {
-        Some(Ty::Ref(to)) => Some(to),
+        Some(Ty::Ref(to)) => Some(column.links.as_deref().unwrap_or(to)),
         _ => None,
     }
 }
@@ -1160,13 +1168,13 @@ fn refers_to(column: &SheetColumn) -> Option<&'static str> {
 )]
 pub(crate) fn name_references(sheets: &mut [Sheet], targets: &Targets) {
     for sheet in sheets.iter_mut() {
-        let columns: Vec<(String, &'static str)> = sheet
+        let columns: Vec<(String, String)> = sheet
             .columns
             .iter()
-            .filter_map(|c| refers_to(c).map(|to| (c.name.clone(), to)))
+            .filter_map(|c| refers_to(c).map(|to| (c.name.clone(), to.to_owned())))
             .collect();
         for (column, to) in columns {
-            let Some(named) = targets.get(to) else {
+            let Some(named) = targets.get(to.as_str()) else {
                 continue;
             };
             let said = |key: &str| {
@@ -1229,7 +1237,7 @@ pub(crate) fn name_references(sheets: &mut [Sheet], targets: &Targets) {
 /// it names reads; else as it is.
 pub(crate) fn reads(app: &TablesApp, column: &SheetColumn, value: &str) -> String {
     refers_to(column)
-        .and_then(|to| app.snapshot.as_ref()?.targets.get(to)?.rows.get(value))
+        .and_then(|to| app.targets().get(to)?.rows.get(value))
         .map_or_else(|| value.to_owned(), |t| t.said.clone())
 }
 
@@ -1237,7 +1245,7 @@ pub(crate) fn reads(app: &TablesApp, column: &SheetColumn, value: &str) -> Strin
 /// rows, each staged by its key and read by its words, the row `held` names whatever its life,
 /// and for a reference that may be empty, empty last. `None` where the read lists no row of `to`.
 pub(crate) fn choice(app: &TablesApp, to: &str, null: bool, held: &str) -> Option<Choice> {
-    let named = app.snapshot.as_ref()?.targets.get(to)?;
+    let named = app.targets().get(to)?;
     let held = held.trim();
     let mut words = Vec::new();
     let mut said = Vec::new();
@@ -1285,9 +1293,9 @@ pub(crate) fn row_name(
         && let Some(key) = named_key(app, sheet, row, &column.name)
     {
         let short = app
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.targets.get(to)?.rows.get(&key))
+            .targets()
+            .get(to)
+            .and_then(|named| named.rows.get(&key))
             .map(|t| t.short.clone());
         return Some(short.unwrap_or(key));
     }
@@ -1316,9 +1324,6 @@ pub(crate) fn reference_lines(
     inner: f32,
     line: f32,
 ) -> Vec<(UiNode, f32, Option<String>)> {
-    let Some(snapshot) = app.snapshot.as_ref() else {
-        return Vec::new();
-    };
     let mut lines = Vec::new();
     for column in super::ordered(sheet) {
         let Some(to) = refers_to(column) else {
@@ -1328,7 +1333,7 @@ pub(crate) fn reference_lines(
             continue;
         };
         let (Some(target), Some(title)) = (
-            snapshot.targets.get(to).and_then(|n| n.rows.get(&key)),
+            app.targets().get(to).and_then(|n| n.rows.get(&key)),
             app.title_of(to),
         ) else {
             continue;

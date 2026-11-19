@@ -4,6 +4,32 @@
 use super::*;
 
 #[test]
+fn finite_numbers_preserve_fractional_rates_and_reject_non_json_values() {
+    for value in [0.25, -0.25, f64::from_bits(1), f64::MAX, i64::MAX as f64] {
+        let number = Jv::number(value).expect("finite number");
+        let text = number.to_text();
+        assert_eq!(text.parse::<f64>().unwrap(), value, "{text}");
+        assert_eq!(
+            number,
+            Jv::number(value).unwrap(),
+            "numeric equality is stable"
+        );
+        assert!(contract_violations(&Jv::obj([("rate", number)])).is_empty());
+    }
+    assert_eq!(Jv::number(0.25).unwrap().to_text(), "0.25");
+    assert_eq!(Jv::number(0.0), Some(Jv::Int(0)));
+    assert_eq!(Jv::number(-0.0), Some(Jv::Int(0)));
+    assert_eq!(Jv::number(17.0), Some(Jv::Int(17)));
+    assert_eq!(Jv::number(i64::MIN as f64), Some(Jv::Int(i64::MIN)));
+    assert_ne!(Jv::number(i64::MAX as f64), Some(Jv::Int(i64::MAX)));
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(Jv::number(value), None, "{value}");
+    }
+    // Existing integer callers retain their original signed/saturating behavior.
+    assert_eq!(Jv::u(u64::MAX), Jv::Int(i64::MAX));
+}
+
+#[test]
 fn the_four_shapes_write_as_the_design_spells_them() {
     assert_eq!(Jv::Int(9760).to_text(), "9760");
     assert_eq!(

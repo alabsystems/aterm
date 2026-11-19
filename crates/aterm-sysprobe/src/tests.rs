@@ -396,7 +396,9 @@ fn a_groups_usage_is_its_own_members_cpu_and_runnable_time() {
         members[0]
     };
     let mut children = Reap(Vec::new());
-    children.0.push(spawn("while :; do :; done"));
+    children
+        .0
+        .push(spawn(&aterm_uds::stand_in_loop::while_alive(":")));
     children.0.push(spawn("kill -STOP $$"));
     let (busy, stopped) = (children.0[0].id(), children.0[1].id());
     let ran_on = |from: crate::MemberUsage| {
@@ -1436,6 +1438,9 @@ fn memory_by_page_class_is_counted_from_one_read() {
         decompressions: 1_234,
         compressions: 2_345,
         pageins: 99,
+        reactivations: 3_000,
+        svp: Some(345),
+        filecache_min: Some(700_000),
     };
     let m = machine::memory_detail_of(
         &p,
@@ -1471,9 +1476,19 @@ fn memory_by_page_class_is_counted_from_one_read() {
             compressions: 2_345,
             pageins: 99,
             page_bytes: page,
+            pushed: Some(2_000),
+            refaulted: Some(4_234),
+            stall_us: None,
         }),
-        "the counters come from the same read, swap in bytes"
+        "the counters come from the same read, swap in bytes, the single-value compressions \
+         out of those pushed and the reactivations among those back"
     );
+    assert_eq!(
+        m.headroom,
+        Some((17_000 + 3_000 + 10_000 + 80_000) * page),
+        "free, speculative, purgeable, and the file cache over its floor"
+    );
+    assert_eq!(m.kept_permille(), Some(896));
     let odd = machine::VmPages {
         free: 1,
         speculative: 5,
@@ -1500,6 +1515,92 @@ fn memory_by_page_class_is_counted_from_one_read() {
         zero.used(),
         m.used(),
         "unread swap does not discard physical memory"
+    );
+}
+
+/// THE HEADROOM AND THE KERNEL'S SHARE REPLAY 2026-11-15's REPORTS: the 128 GiB Mac's first
+/// WindowServer report (23:16:09.8) read 381 324 free pages, 28 580 of them speculative, 731
+/// purgeable and 101 255 file-backed, with 4 213 935 in the compressor: 382 055 pages (5.8 GiB)
+/// of headroom with its file cache under the kernel's floor, and a share of 468 ‰, warn and not
+/// yet critical. Its panic read 914 free, 76 speculative and none purgeable: 914 pages of
+/// headroom, and 403 ‰. The compressor's wall is the nearer of its two limits: the 8 600 800
+/// pages it stored at 23:16:09 are 21 % of a 128 GiB Mac's page limit (40 265 312 on macOS
+/// 27.2), so a segment count near its own limit is the wall (the segment numbers here are
+/// illustrative). NEGATIVE CONTROLS: counted as `vm_stat`'s "available" (the file-backed pages
+/// with no floor) the 23:16 headroom is 72 675 pages larger; and the single-value compressions
+/// are kept out of the pages pushed only where they do not exceed the compressions.
+#[test]
+fn headroom_and_the_kernels_share_replay_the_incident() {
+    let page = 16_384;
+    let at_231609 = machine::VmPages {
+        free: 381_324,
+        speculative: 28_580,
+        purgeable: 731,
+        external: 101_255,
+        active: 1_680_298,
+        inactive: 1_649_823,
+        compressor: 4_213_935,
+        internal: 3_000_000,
+        ..machine::VmPages::default()
+    };
+    let read = |p: &machine::VmPages, floor: Option<u64>| {
+        machine::memory_detail_of(
+            &machine::VmPages {
+                filecache_min: floor,
+                ..*p
+            },
+            page,
+            128 << 30,
+            None,
+            None,
+        )
+    };
+    let floor = Some(80_000);
+    let m = read(&at_231609, floor);
+    assert_eq!(m.headroom, Some(382_055 * page));
+    assert_eq!(m.headroom.map(|h| h * 10 / (1 << 30)), Some(58), "5.8 GiB");
+    assert_eq!(m.kept_permille(), Some(468));
+    assert_eq!(read(&at_231609, None).headroom, Some(382_055 * page));
+    assert_eq!(
+        read(&at_231609, Some(0)).headroom,
+        Some((382_055 + 72_675) * page),
+        "no floor counts every file-backed page outside the speculative queue"
+    );
+    let panic = machine::VmPages {
+        free: 914,
+        speculative: 76,
+        purgeable: 0,
+        external: 19_190,
+        active: 1_598_425,
+        inactive: 1_598_348,
+        compressor: 4_728_343,
+        ..at_231609
+    };
+    let m = read(&panic, Some(19_190));
+    assert_eq!(m.headroom, Some(914 * page));
+    assert_eq!(m.kept_permille(), Some(403));
+    let off_mac = MemoryDetail { exact: false, ..m };
+    assert_eq!(
+        off_mac.kept_permille(),
+        None,
+        "the kernel's test is a Mac's"
+    );
+    let segments = Some((2_465_250, 2_516_582));
+    let pages = Some((8_600_800, 40_265_312));
+    assert_eq!(
+        machine::nearer_wall(segments, pages),
+        segments,
+        "the segments, 98 % of theirs, are nearer than the pages, 21 %"
+    );
+    assert_eq!(machine::nearer_wall(Some((9, 0)), pages), pages, "no limit");
+    assert_eq!(machine::nearer_wall(None, pages), pages);
+    assert_eq!(machine::nearer_wall(Some((1, 0)), None), None);
+    assert_eq!(machine::mac_pushed(2_345, Some(345)), 2_000);
+    assert_eq!(machine::mac_pushed(2_345, None), 2_345);
+    assert_eq!(
+        machine::mac_pushed(2_345, Some(9_999)),
+        2_345,
+        "a single-value count over the compressions is a misread, kept out"
     );
 }
 

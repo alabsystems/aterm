@@ -160,7 +160,10 @@ pub fn linked_package_versions(layout: &atpkg::Layout, program: &str) -> Option<
     package_versions(&exe)
 }
 
-fn package_versions(exe: &Path) -> Option<(String, String)> {
+/// The validated product and rollout-client versions of the package declaring this executable.
+/// A caller observing a process must establish separately that it mapped this file.
+#[must_use]
+pub fn package_versions(exe: &Path) -> Option<(String, String)> {
     let (root, manifest) = package_root(exe)?;
     let marker_path = root.join(ALAB_BUILD_JSON);
     let marker_text = package_text(&marker_path)?;
@@ -1195,9 +1198,14 @@ fn file_holds(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
 /// This observation grants no launch, process, source or credential authority.
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub fn isolated_source_proof_candidate(path: &Path) -> std::io::Result<bool> {
-    Ok(alab_bytes(path)
-        && managed_credential_capable(path, true)?
+    Ok(source_credential_capable(path)?
         && file_holds(path, b"aterm isolated source proof candidate v1")?)
+}
+
+/// Whether this Codex executable carries the compiled Source constructor ABI.
+/// The actual constructor separately validates the image, account and lease.
+pub fn source_credential_capable(path: &Path) -> std::io::Result<bool> {
+    Ok(alab_bytes(path) && managed_credential_capable(path, true)?)
 }
 
 /// Compiled managed-auth ABI support. The caller separately proves the mapped
@@ -1257,12 +1265,12 @@ pub fn lay_package(root: &Path, reads_auth_path: bool) -> PathBuf {
 }
 
 /// atpkg's launcher for `exe` as this platform's twin spells it, for a test: a `sh` twin's
-/// `exec '<exe>' "$@"`, or on Windows a `.cmd` twin's `@"<exe>" %* & @exit /b` after its frame.
+/// `exec '<exe>' "$@"`, or on Windows a `.cmd` twin's forward line after its frame.
 #[cfg(test)]
 pub(crate) fn twin_text(exe: &Path) -> String {
     if cfg!(windows) {
         format!(
-            "@goto :main\r\n:main\r\n@\"{}\" %* & @exit /b\r\n",
+            "@goto :main\r\n:main\r\n@\"{}\" %* & @call exit /b %%errorlevel%%\r\n",
             exe.display()
         )
     } else {

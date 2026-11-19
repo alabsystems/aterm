@@ -6,14 +6,16 @@
 
 use crate::App;
 use crate::native_tables::native_tables_tests::{
-    MC, act, put_in, render, said, settle, two_macs, view_of,
+    MC, act, put_in, read_again, render, render_wide, said, settle, two_macs, view_of,
 };
 use aterm_db::alab::Registry;
 use aterm_db::alab::registry::MACHINE;
 use aterm_db::att::{Handle, REGISTRY};
-use aterm_db::table::fixture::repair_commons;
+use aterm_db::table::fixture::{Lab, repair_commons};
 use aterm_db::typed::cell::{self, CellKey, CellValue};
 use aterm_json::json;
+use aterm_secrets::commons::hearing::{Ledger, Said, Version};
+use aterm_secrets::commons::roster::Role;
 
 /// A second machine row whose aliases name the first's label: `label-ambiguous`.
 const OTHER: &str = "mc-000000000000000b";
@@ -203,6 +205,127 @@ fn check_lists_each_finding_and_the_stores_state() {
     assert!(
         said(&ui, &format!("tables/cell/{}/label", names[1])).is_some(),
         "the row is listed"
+    );
+}
+
+/// Keep in Mac 0's hearing ledger that it heard each of `said`'s Macs so, just now.
+fn hears(lab: &Lab, said: &[(usize, Said)]) {
+    let here = lab.bootstrap(0);
+    let mut ledger = Ledger::read(&here);
+    for (n, said) in said {
+        let seat = lab.bootstrap(*n).access().unwrap().unwrap();
+        ledger.record(
+            seat.local().binding().actor(),
+            aterm_time::unix_millis().unwrap(),
+            *said,
+        );
+    }
+    ledger.write(&here).unwrap();
+}
+
+/// What Check shows under each of the fence's keys, in their order.
+fn fence_shown(ui: &crate::native_ui::CompiledUi) -> Vec<String> {
+    crate::native_tables_check::FENCE
+        .into_iter()
+        .map(|key| {
+            said(ui, &format!("tables/check/store/{key}"))
+                .unwrap_or_else(|| panic!("the fence line {key}"))
+        })
+        .collect()
+}
+
+/// Under the store's state Check says who holds the registry's checkpoints back (tracker LT-C1),
+/// in the sentences `aterm db table check --fence` says (`aterm_db::att::command::fence_lines`):
+/// whether this machine may sign one, then the enrolled machines and those that wrote a record
+/// in the last 30 days, each with how many hold them back for each reason. Each sentence is
+/// whole at every width of the wide layout, wrapped where it is longer than its line: the
+/// counts by reason are its end, which a line cut to its width loses. Here four machines hold
+/// them back for every reason at once: this one runs a test binary's build and another reported
+/// 0.202.0, both older than any that reads checkpoints; one was heard with no version report;
+/// one was never heard.
+/// NEGATIVE CONTROL: with `native_tables_check::list` drawing the fence's sentences as it draws
+/// the store's other lines (`fitted`, one line cut to its width), the sentences are cut: `at
+/// 900 px` with a left side whose sentences end in `…`.
+#[test]
+fn check_says_who_holds_the_checkpoint_fence_whole_at_every_width() {
+    let lab = Lab::new(&[Role::Writer; 4]);
+    let here = Registry::at(lab.paths[0].clone());
+    here.open().unwrap();
+    here.write(vec![vec![
+        put_in(&MACHINE, MC, "label", json!("m9")),
+        put_in(&MACHINE, MC, "status", json!("active")),
+        put_in(&MACHINE, MC, "row", json!("live")),
+    ]])
+    .unwrap();
+    hears(
+        &lab,
+        &[(1, Said::Version(Version(0, 202, 0))), (2, Said::Nothing)],
+    );
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let now_ms = aterm_time::unix_millis().unwrap();
+    let (_, _, fence) = handle.usage_fenced(now_ms).unwrap();
+    let lines = aterm_db::att::command::fence_lines(&fence);
+    let json = aterm_db::att::command::fence_json(&fence);
+    assert_eq!(
+        [
+            &json["roster"]["older"],
+            &json["roster"]["no_report"],
+            &json["roster"]["unheard"]
+        ],
+        [&json!(2), &json!(1), &json!(1)],
+        "CONTROL: machines hold checkpoints back for every reason: {lines:?}"
+    );
+
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
+    settle(&mut app);
+    act(&mut app, crate::native_tables_check::OPEN, None);
+    settle(&mut app);
+    for width in [900.0, 1000.0, 1200.0, 1400.0, 1920.0] {
+        assert_eq!(
+            fence_shown(&render_wide(&app, width)),
+            lines,
+            "at {width} px"
+        );
+    }
+}
+
+/// Check's sentences on the registry's checkpoints follow this Mac's hearing ledger, which no
+/// record of the registry moves (tracker LT-C1): with Check shown and the registry as it was,
+/// the ledger hears the other machine on an older aterm, and the page's next read says so,
+/// where a read that rested on the registry's mark alone would answer unchanged and leave the
+/// sentences as first judged under a fresh read time.
+/// NEGATIVE CONTROL: with the reader's rest leaving the ledger's mark out (`heard` made `None`),
+/// the read answers unchanged and the sentences stand as they were: `the sentences follow the
+/// ledger` with the first read's sentences on the left.
+#[test]
+fn check_reads_the_fence_again_once_the_hearing_ledger_moves() {
+    let lab = two_macs();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let judged = |handle: &Handle| {
+        let now_ms = aterm_time::unix_millis().unwrap();
+        let (_, _, fence) = handle.usage_fenced(now_ms).unwrap();
+        aterm_db::att::command::fence_lines(&fence)
+    };
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
+    settle(&mut app);
+    act(&mut app, crate::native_tables_check::OPEN, None);
+    settle(&mut app);
+    let first = fence_shown(&render(&app));
+    assert_eq!(first, judged(&handle));
+
+    hears(&lab, &[(1, Said::Version(Version(0, 202, 0)))]);
+    let now = judged(&handle);
+    assert_ne!(
+        now, first,
+        "CONTROL: the ledger changes what the fence says"
+    );
+    read_again(&mut app);
+    assert_eq!(
+        fence_shown(&render(&app)),
+        now,
+        "the sentences follow the ledger"
     );
 }
 

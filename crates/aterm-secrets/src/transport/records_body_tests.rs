@@ -170,7 +170,7 @@ fn selected_reader_refuses_a_total_past_the_wire_bound() {
         },
     };
     let record = draft.sign(&[45; 32], [46; 16]).unwrap();
-    let count = MAX_RECORDS_STREAM / record.bytes().len();
+    let count = REPLY_CAP / record.bytes().len();
     let mut selected = vec![record.clone(); count];
     assert!(RecordsReader::new(&selected).is_ok());
     selected.push(record);

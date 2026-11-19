@@ -26,6 +26,11 @@ use crate::redact::Redactor;
 use crate::slug::Slug;
 use crate::write::WriteOp;
 
+#[path = "journal_atomic.rs"]
+mod atomic;
+pub use atomic::AtomicJudgment;
+pub(crate) use atomic::ConflictDomain;
+
 /// The largest journal agh reads or appends to: 64 MiB, which is about 16,000 releases.
 /// Past it `append` refuses with Refused `journal_full`, and the file is moved aside once
 /// no intent in it is open.
@@ -233,15 +238,17 @@ pub struct IntentDraft {
     pub body_digest: Option<String>,
     /// The `[[writers]]` caller, when `Router::grant` made the target (`Permit::grant`).
     pub grant: Option<String>,
-    /// The newest intent of this op and key that the caller judged before it chose to begin
-    /// (`IntentStore::latest`), or `None` when it saw none. `begin` judges again under the
-    /// lock and refuses when the journal has moved past it. It is not recorded: the Intent
-    /// record's body is unchanged.
+    /// The newest intent in the domain the caller judged, or `None` when it saw none.
+    /// The default domain is this op and key; a validated native atomic judgment can
+    /// narrow it to conflicting refs. `begin` rechecks under the append lock. This
+    /// baseline is not recorded: the durable Intent body remains unchanged.
     pub after: Option<IntentId>,
     /// Writer override for an imported intent; otherwise begin records this process.
     pub writer: Option<IntentWriter>,
     /// Exact atomic ref transitions, retained for read-only recovery.
     pub refs: Vec<crate::github::refs::RefUpdate>,
+    /// A live read judgment, never serialized or restored from journal bytes.
+    pub(crate) atomic_admission: Option<atomic::AtomicAdmission>,
 }
 
 impl IntentDraft {
@@ -272,6 +279,7 @@ impl IntentDraft {
             after: None,
             writer: None,
             refs: Vec::new(),
+            atomic_admission: None,
         }
     }
 
@@ -307,6 +315,13 @@ impl IntentDraft {
     #[must_use]
     pub fn with_after(mut self, after: Option<IntentId>) -> IntentDraft {
         self.after = after;
+        self
+    }
+
+    /// Keep the exact scoped read and its baseline through native preparation.
+    pub(crate) fn with_atomic_judgment(mut self, judgment: AtomicJudgment) -> Self {
+        self.after = judgment.admission.after.clone();
+        self.atomic_admission = Some(judgment.admission);
         self
     }
 }
@@ -439,11 +454,13 @@ pub trait IntentStore: Send + Sync {
     /// Under the same lock as the append, `begin` first judges again what its caller judged.
     /// So two agh processes on one journal (a lane, and a person's `agh release create`) never
     /// both begin one write. It refuses, and appends nothing, when either holds:
-    /// - an intent of the draft's op and key is open. A `WriteOp::RefCreate` is the one
+    /// - an intent of the draft's op and key is open. A validated atomic judgment narrows
+    ///   that rule to its conflicting ref domains; absent one, the key remains global.
+    ///   A `WriteOp::RefCreate` is the one
     ///   exception: GitHub itself refuses a second POST of a ref that exists, with 422
     ///   `Reference already exists`, and `Refs::create` resolves that;
-    /// - the newest intent of the draft's op and key is not `draft.after`, so another run
-    ///   began, or closed, one since the caller looked.
+    /// - the newest intent of the judged domain is not `draft.after`, so another relevant
+    ///   run began since the caller looked. A disjoint append cannot rebase this judgment.
     ///
     /// Before either, it refuses a draft whose `key` or `target_commitish` `Redactor::shapes`
     /// would change. The journal passes every string through the Redactor, and `latest`,
@@ -499,6 +516,28 @@ pub trait IntentStore: Send + Sync {
     /// The journal's refusals. A damaged journal is Refused `journal_fault`, as `open`'s,
     /// because a record past the fault may have settled or closed the intent.
     fn latest(&self, op: WriteOp, key: &str) -> Result<Option<IntentView>>;
+
+    /// Judge one exact atomic draft before preparation. Stores without scoped
+    /// admission retain their repository-key baseline and exclusion. The live
+    /// binding is checked again by `begin`; no journal bytes or authority change.
+    /// # Errors
+    /// The store's read failure.
+    fn atomic_judgment(&self, draft: &IntentDraft) -> Result<AtomicJudgment> {
+        Ok(AtomicJudgment::global(
+            draft,
+            self.latest(draft.op, &draft.key)?,
+        ))
+    }
+
+    /// Refresh this same intent's durable child and outcome metadata. A custom
+    /// store unable to find older concurrent records conservatively returns none.
+    /// # Errors
+    /// The store's read failure.
+    fn refresh(&self, intent: &Intent) -> Result<Option<IntentView>> {
+        Ok(self
+            .latest(intent.op, &intent.key)?
+            .filter(|view| view.intent.id == intent.id))
+    }
     /// A dry run cannot close an open intent: only the next real writer's origin
     /// reads can establish BEFORE or AFTER.
     /// # Errors
@@ -1210,6 +1249,13 @@ impl IntentStore for Journal {
                 .with_repo(self.repo()));
             }
         }
+        let domain = draft
+            .atomic_admission
+            .as_ref()
+            .map(|judgment| judgment.domain(draft))
+            .transpose()?
+            .cloned()
+            .unwrap_or(ConflictDomain::Global);
         let at_secs = self.fx.wall_secs()?;
         let writer = match (&draft.writer, &self.taped) {
             (Some(writer), _) => Some(writer.clone()),
@@ -1218,7 +1264,9 @@ impl IntentStore for Journal {
         };
         let mut minted = None;
         self.append_with(|records, step| {
-            let of_key = views_filtered(records, |i| i.op == draft.op && i.key == draft.key);
+            let of_key = views_filtered(records, |i| {
+                i.op == draft.op && i.key == draft.key && domain.contains(i)
+            });
             if draft.op != WriteOp::RefCreate
                 && let Some(open) = of_key.iter().rev().find(|v| v.open)
             {
@@ -1323,6 +1371,32 @@ impl IntentStore for Journal {
             return Ok(None);
         };
         Ok(view_of(&records, id))
+    }
+
+    fn atomic_judgment(&self, draft: &IntentDraft) -> Result<AtomicJudgment> {
+        if draft.slug != self.slug {
+            return Err(
+                Error::usage("an atomic draft belongs to another journal").with_repo(self.repo())
+            );
+        }
+        let (records, end) = self.read()?;
+        if let JournalEnd::Fault { at, why } = &end {
+            return Err(self.fault(*at, why));
+        }
+        let domain = ConflictDomain::draft(draft);
+        let views = views_filtered(&records, |intent| {
+            intent.op == draft.op && intent.key == draft.key && domain.contains(intent)
+        });
+        let blocking = views.iter().rev().find(|view| view.open).cloned();
+        Ok(AtomicJudgment::new(draft, domain, views.last(), blocking))
+    }
+
+    fn refresh(&self, intent: &Intent) -> Result<Option<IntentView>> {
+        Ok(Journal::view(self, &intent.id)?.filter(|view| {
+            view.intent.slug == intent.slug
+                && view.intent.op == intent.op
+                && view.intent.key == intent.key
+        }))
     }
 }
 

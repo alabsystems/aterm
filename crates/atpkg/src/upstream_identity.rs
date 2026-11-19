@@ -119,6 +119,8 @@ pub struct Rustup {
 pub struct Resolved {
     /// The file that runs, canonical — or, when rustup named none, the proxy on PATH.
     pub real: PathBuf,
+    /// The entry point is a rustup proxy, even if its toolchain lookup failed.
+    pub rustup_proxy: bool,
     /// The toolchain rustup picked, when the copy on PATH is a rustup proxy that named one.
     pub rustup: Option<Rustup>,
     /// What that file is.
@@ -187,12 +189,14 @@ pub fn resolve(ask: &Ask<'_>) -> Resolved {
         return Resolved {
             identity: identity_of(ask, ask.target, &canonical, ask.toolchain),
             real: canonical,
+            rustup_proxy: false,
             rustup: None,
         };
     };
     match cached_rustup_which(&rustup, ask) {
         Err(why) => Resolved {
             real: ask.target.to_path_buf(),
+            rustup_proxy: true,
             rustup: None,
             identity: Identity::Unknown { why },
         },
@@ -203,6 +207,7 @@ pub fn resolve(ask: &Ask<'_>) -> Resolved {
             let picked = picked(ask, &toolchain, identity.host());
             Resolved {
                 real,
+                rustup_proxy: true,
                 rustup: Some(Rustup { toolchain, picked }),
                 identity,
             }
@@ -211,10 +216,27 @@ pub fn resolve(ask: &Ask<'_>) -> Resolved {
 }
 
 fn rustup_proxy(target: &Path, canonical: &Path) -> Option<PathBuf> {
+    rustup_proxy_for(target, canonical, cfg!(windows))
+}
+
+fn rustup_proxy_for(target: &Path, canonical: &Path, windows: bool) -> Option<PathBuf> {
+    let (rustup_name, init_name) = if windows {
+        ("rustup.exe", "rustup-init.exe")
+    } else {
+        ("rustup", "rustup-init")
+    };
     let named_rustup = |path: &Path| {
         path.file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| matches!(name, "rustup" | "rustup-init"))
+            .is_some_and(|name| {
+                [rustup_name, init_name].into_iter().any(|candidate| {
+                    if windows {
+                        name.eq_ignore_ascii_case(candidate)
+                    } else {
+                        name == candidate
+                    }
+                })
+            })
     };
     if named_rustup(canonical) {
         return Some(canonical.to_path_buf());
@@ -223,7 +245,7 @@ fn rustup_proxy(target: &Path, canonical: &Path) -> Option<PathBuf> {
     let mut siblings: Vec<PathBuf> = [target.parent(), canonical.parent()]
         .into_iter()
         .flatten()
-        .map(|dir| dir.join("rustup"))
+        .map(|dir| dir.join(rustup_name))
         .collect();
     siblings.dedup();
     siblings.into_iter().find(|sibling| {
@@ -414,19 +436,9 @@ fn default_toolchain(rustup_home: &Path) -> Option<String> {
         MAX_SETTINGS_BYTES,
     )
     .ok()?;
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            return None;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() == "default_toolchain" {
-            let value = value.trim().trim_matches('"');
-            return (!value.is_empty()).then(|| value.to_string());
-        }
-    }
-    None
+    aterm_toolchain::rustup::parse_settings(&text)?
+        .default_toolchain
+        .filter(|toolchain| !toolchain.is_empty())
 }
 
 /// The first answer of a Rust tool's `-vV`: `None` when it is not one (no `release:` line).

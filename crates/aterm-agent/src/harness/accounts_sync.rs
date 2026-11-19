@@ -22,6 +22,7 @@ use super::account_sync_error::{Retry, SyncError};
 use super::accounts::{self, Class, Cli, Roster, Row};
 use super::accounts_step::Step;
 use super::accounts_upkeep_memo::{self as memo, Duty};
+use super::alab_roster::Chosen;
 use super::cli::{ACCOUNTS_OWN_LABEL, Env};
 use super::sign_in_ladder::SignIn;
 use super::upgrade;
@@ -2059,6 +2060,8 @@ fn observe_default_success(
     now: i64,
 ) -> Result<Vec<accounts::Event>, String> {
     let label = &row.label;
+    // Where the word on record signs the row out (or is of a replaced login), what this check
+    // found signs the row back in only once the default login's identity is the row's.
     if state.accounts.get(label).is_some_and(|account| {
         account.auth == accounts::Auth::SignedOut
             || (!state.contextual_auth
@@ -2070,7 +2073,7 @@ fn observe_default_success(
                 "default login identity changed or cannot be verified; nothing recorded".into(),
             );
         }
-        let events = accounts::note_signed_back(state, logins, label, now);
+        let events = accounts::note_checked_sign_in(state, logins, label, now);
         if served {
             accounts::note_served_login(logins, label, now);
         }
@@ -2233,7 +2236,11 @@ pub(crate) fn record_review_login(
                     observe_default_success(cli, row, state, logins, home, true, now)
                 }
                 Outcome::Worked => {
-                    let events = accounts::note_signed_back(state, logins, label, now);
+                    let events = if accounts::sign_back_due(state, label) {
+                        accounts::note_checked_sign_in(state, logins, label, now)
+                    } else {
+                        Vec::new()
+                    };
                     accounts::note_served_login(logins, label, now);
                     Ok(events)
                 }
@@ -3330,9 +3337,9 @@ pub fn fleet_origin(
     roster: &Path,
 ) -> FleetOrigin {
     match super::alab_roster::chosen(Cli::Claude, Some(roster), None, config) {
-        Ok(Some(_)) => return FleetOrigin::Alab,
-        Err(why) => return FleetOrigin::AlabPending(why),
-        Ok(None) => {}
+        Ok(Chosen::Lab(_)) => return FleetOrigin::Alab,
+        Ok(Chosen::Pending(why)) | Err(why) => return FleetOrigin::AlabPending(why),
+        Ok(Chosen::Unnamed) => {}
     }
     source_selection::select_for(store, home, config, Some(roster), SourceScope::Init)
         .map_or_else(FleetOrigin::SourcePending, |selected| selected.origin())
@@ -3510,11 +3517,13 @@ fn sheet_refused(source: &str, cli: Cli) -> String {
     )
 }
 
-/// Whether a sync of `cli` with no source named reads the lab ([`super::alab_roster::chosen`]):
-/// the lab names this Mac, and for Claude Code no `[fleet] accounts_source` in `config` names
-/// another source.
-fn lab_chosen(cli: Cli, roster: &Path, config: &Path) -> Result<bool, String> {
-    super::alab_roster::chosen(cli, Some(roster), None, Some(config)).map(|fleet| fleet.is_some())
+/// What a sync of `cli` with no source named reads ([`super::alab_roster::chosen`]): the lab
+/// where it names this Mac and, for Claude Code, no `[fleet] accounts_source` in `config` names
+/// another source; nothing but this Mac's own default login where the lab is not read yet.
+fn lab_chosen(cli: Cli, roster: &Path, config: &Path) -> Chosen {
+    // With no source named the choice refuses nothing; a refusal could only say the lab is unread.
+    super::alab_roster::chosen(cli, Some(roster), None, Some(config))
+        .unwrap_or_else(Chosen::Pending)
 }
 
 pub(super) fn source_key(config: &Path) -> Option<String> {
@@ -3647,9 +3656,11 @@ pub fn init_accounts_assignment(env: &Env) -> Result<InitAccountsAssignment, Str
     let Some(roster) = env.accounts_roster() else {
         return Ok(InitAccountsAssignment::Required);
     };
-    if super::alab_roster::chosen(Cli::Claude, Some(&roster), None, env.config.as_deref())?
-        .is_some()
-    {
+    // The lab's sync, or one that keeps the roster while the lab is unread, is the sync owed.
+    if !matches!(
+        super::alab_roster::chosen(Cli::Claude, Some(&roster), None, env.config.as_deref())?,
+        Chosen::Unnamed
+    ) {
         return Ok(InitAccountsAssignment::Required);
     }
     let selected = source_selection::select_for(
@@ -3738,12 +3749,17 @@ fn load_fleet_source_for_machine(
 ) -> Result<(FleetRoster, OptIn, Option<PoolSyncCtx>), String> {
     let normalized = source_env(env)?;
     let env = &normalized;
-    let native = super::alab_roster::chosen(
+    let native = match super::alab_roster::chosen(
         Cli::Claude,
         env.accounts_roster().as_deref(),
         source,
         env.config.as_deref(),
-    )?;
+    )? {
+        Chosen::Lab(fleet) => Some(fleet),
+        Chosen::Unnamed => None,
+        // A lab not read yet gives no fleet, and no other source stands in for it.
+        Chosen::Pending(why) => return Err(why),
+    };
     load_selected_fleet_source(env, source, machine_override, fetch, native)
 }
 
@@ -7165,6 +7181,9 @@ struct SyncPublication {
     rows_changed: RowChanges,
     /// Each account the lab prefers here left out for a label clash ([`FleetRoster::clashes`]).
     clashes: Vec<(String, String)>,
+    /// Why the lab was not read, where it was not ([`Chosen::Pending`]): no source was read, and
+    /// the report's one status line says so ([`sync_claude_pending`]).
+    pending: Option<String>,
 }
 
 /// One observation after sync and sign-in recovery. The source metadata describes
@@ -7262,12 +7281,21 @@ fn sync_accounts_with(
     let recovered = store.recover_sync_within(how.ladder, &roster)?;
     let config = env.config.clone().unwrap_or_else(|| config_beside(&roster));
     let admission = AutomaticSource::capture_requested(&config)?;
-    let native = SourceRequest::Automatic {
+    let native = match (SourceRequest::Automatic {
         candidate: None,
         admission: &admission,
-    }
+    })
     .chosen(Cli::Claude, &roster, env.config.as_deref())?
-    .is_some();
+    {
+        Chosen::Lab(_) => true,
+        Chosen::Unnamed => false,
+        // A lab not read yet selects no other source: the roster stands as it is.
+        Chosen::Pending(why) => {
+            let mut report = sync_claude_pending(&env, &store, (&roster, &why))?;
+            report.publication.changed |= recovered;
+            return Ok(report);
+        }
+    };
     let policy = store.source_policy()?;
     let selected = if native {
         SelectedSource::Absent
@@ -7314,7 +7342,15 @@ fn sync_accounts_request(
     let store = env.accounts_store();
     let recovered_commit = store.recover_sync_within(how.ladder, &roster_path)?;
     request.validate()?;
-    let native = request.chosen(Cli::Claude, &roster_path, env.config.as_deref())?;
+    let native = match request.chosen(Cli::Claude, &roster_path, env.config.as_deref())? {
+        Chosen::Lab(fleet) => Some(fleet),
+        Chosen::Unnamed => None,
+        Chosen::Pending(why) => {
+            let mut report = sync_claude_pending(env, &store, (&roster_path, &why))?;
+            report.publication.changed |= recovered_commit;
+            return Ok(report);
+        }
+    };
     let reads = std::sync::Mutex::new(Vec::new());
     let capture = |context: &Env, source: &str| {
         let text = (how.fetch)(context, source)?;
@@ -7446,6 +7482,7 @@ fn sync_accounts_request(
                 lab: false,
                 rows_changed: RowChanges::default(),
                 clashes: Vec::new(),
+                pending: None,
             },
             None,
         )
@@ -7522,6 +7559,7 @@ fn sync_accounts_request(
             lab: fleet.alab.is_some(),
             rows_changed,
             clashes,
+            pending: None,
         },
         note,
     )?;
@@ -7529,6 +7567,53 @@ fn sync_accounts_request(
         report.records.notes.push(line);
     }
     Ok(report)
+}
+
+/// Claude Code's sync while the lab is not read yet (`why`, [`Chosen::Pending`]): it reads no
+/// source (no sheet, fleet file or pool among them) and writes nothing. Every row stands byte for
+/// byte: none is
+/// removed, relabelled or signed out, no login directory moves, and no row is added, the default
+/// login's account included: once the lab is read, its own sync lists that login under the lab's
+/// rules, so an account the lab bars (paused, retired) stays out ([`alab_default_account`]), and
+/// keeps the label of every row it finds ([`super::alab_roster::fleet_for`]). The report's one
+/// status line says why the lab is not read.
+///
+/// # Errors
+/// The roster that stands does not parse, as it fails a sync with a source, or its target or the
+/// report's records cannot be read.
+fn sync_claude_pending(
+    env: &Env,
+    store: &accounts::Store,
+    (roster_path, why): (&Path, &str),
+) -> Result<SyncReport, SyncError> {
+    let (write_to, _) = super::cli::roster_target(roster_path)?;
+    if let Some(text) = accounts::roster_text(&write_to)? {
+        Roster::parse_for(Cli::Claude, &text).map_err(|refused| {
+            format!(
+                "the roster at {} is refused: {refused}; the roster is unchanged",
+                roster_path.display()
+            )
+        })?;
+    }
+    read_sync_report(
+        env,
+        store,
+        SyncPublication {
+            machine: machine_for(env.config.as_deref(), None).unwrap_or_default(),
+            machine_label: None,
+            roster_path: roster_path.to_owned(),
+            fleet_path: fleet_file_beside(roster_path).unwrap_or_default(),
+            fleet_accounts: 0,
+            changed: false,
+            conflicts: Vec::new(),
+            lab: false,
+            rows_changed: RowChanges::default(),
+            clashes: Vec::new(),
+            pending: Some(why.to_owned()),
+        },
+        None,
+    )
+    .map_err(Into::into)
 }
 
 #[cfg_attr(
@@ -7623,6 +7708,7 @@ fn write_sync_report(
                 lab,
                 rows_changed,
                 clashes,
+                pending,
             },
         records,
         enrolled,
@@ -7656,12 +7742,15 @@ fn write_sync_report(
         );
         o.insert(
             "fleet_roster".to_owned(),
-            if *lab {
+            if *lab || pending.is_some() {
                 Value::Null
             } else {
                 Value::from(fleet_path.display().to_string())
             },
         );
+        if let Some(why) = pending {
+            o.insert("lab_pending".to_owned(), Value::from(why.clone()));
+        }
         o.insert(
             "fleet_accounts".to_owned(),
             Value::from(u64::try_from(*fleet_accounts).unwrap_or(0)),
@@ -7700,22 +7789,31 @@ fn write_sync_report(
             aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
         );
     } else {
-        let _ = writeln!(
-            out,
-            "synced machine `{}` ({} accounts on this machine, {} {}){}",
-            machine_label.as_deref().unwrap_or(machine),
-            roster.rows.len(),
-            fleet_accounts,
-            if *lab {
-                "the lab prefers here"
-            } else {
-                "across fleet"
-            },
-            if *changed { "" } else { "; no account changes" }
-        );
+        if let Some(why) = pending {
+            let _ = writeln!(
+                out,
+                "synced this Mac's own roster ({} accounts on this machine{}): {why}",
+                roster.rows.len(),
+                if *changed { "" } else { "; no account changes" }
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "synced machine `{}` ({} accounts on this machine, {} {}){}",
+                machine_label.as_deref().unwrap_or(machine),
+                roster.rows.len(),
+                fleet_accounts,
+                if *lab {
+                    "the lab prefers here"
+                } else {
+                    "across fleet"
+                },
+                if *changed { "" } else { "; no account changes" }
+            );
+        }
         let _ = writeln!(out, "roster: {}", roster_path.display());
-        // The lab's source writes no fleet file beside the roster.
-        if !*lab {
+        // Neither the lab's source nor a lab not read yet writes a fleet file beside the roster.
+        if !*lab && pending.is_none() {
             let _ = writeln!(out, "fleet:  {}", fleet_path.display());
         }
         rows_changed.write_lines(&names, out);
@@ -8321,7 +8419,10 @@ fn default_login_unlisted(
 ) -> bool {
     let now: trace::Now = now.into();
     if configured_source(Some(config), Some(roster_path)).is_none()
-        && !lab_chosen(Cli::Claude, roster_path, config).unwrap_or(false)
+        && matches!(
+            lab_chosen(Cli::Claude, roster_path, config),
+            Chosen::Unnamed
+        )
     {
         return false;
     }
@@ -10078,21 +10179,24 @@ fn sync_called_for_recording(
         return false;
     }
     // Where the lab is the source, its projection and this Mac's own default login are what
-    // move a roster: read in memory, with no sheet, fleet or pool file.
-    let selected = match lab_chosen(Cli::Claude, roster_path, config) {
-        Ok(selected) => selected,
-        Err(_) => return true,
-    };
-    if selected {
-        return lab_sync_due(Cli::Claude, &accounts::Store::at(state_dir), roster_path)
-            || default_login_unlisted(
-                home,
-                state_dir,
-                (roster_path, config),
-                now,
-                rediscovery,
-                Some(claim),
-            );
+    // move a roster: read in memory, with no sheet, fleet or pool file. While the lab is not read
+    // yet nothing moves it.
+    match lab_chosen(Cli::Claude, roster_path, config) {
+        Chosen::Lab(_) => {
+            return lab_sync_due(Cli::Claude, &accounts::Store::at(state_dir), roster_path)
+                || default_login_unlisted(
+                    home,
+                    state_dir,
+                    (roster_path, config),
+                    now,
+                    rediscovery,
+                    Some(claim),
+                );
+        }
+        // A sync while the lab is not read yet writes nothing ([`sync_claude_pending`]), so none
+        // is called for until the lab is read, whose projection moves the inputs.
+        Chosen::Pending(_) => return false,
+        Chosen::Unnamed => {}
     }
     let configured = configured_source(Some(config), Some(roster_path));
     // A mode change invalidates this process's observation. Returning to the same path
@@ -10235,9 +10339,12 @@ fn sync_inputs(
             return hash.finalize();
         }
     };
-    // Where the lab is the source, what it holds stands for the vault's files: no sheet, fleet
-    // or pool file is read.
-    if lab_chosen(Cli::Claude, roster_path, &config).unwrap_or(true) {
+    // Where the lab is the source, or is not read yet, what it holds stands for the vault's files:
+    // no sheet, fleet or pool file is read.
+    if !matches!(
+        lab_chosen(Cli::Claude, roster_path, &config),
+        Chosen::Unnamed
+    ) {
         field(
             super::alab_roster::fleet_digest(Cli::Claude)
                 .as_ref()
@@ -10499,7 +10606,10 @@ pub fn has_init_accounts_source(
         .parent()
         .map(|p| p.join("aterm.toml"))
         .unwrap_or_else(|| PathBuf::from("aterm.toml"));
-    if lab_chosen(Cli::Claude, roster_path, &config_path).unwrap_or(true) {
+    if !matches!(
+        lab_chosen(Cli::Claude, roster_path, &config_path),
+        Chosen::Unnamed
+    ) {
         return true;
     }
     let Ok(selected) = source_selection::select_for(
@@ -10603,12 +10713,13 @@ fn init_sync_needed(
     discover: bool,
 ) -> bool {
     let now: trace::Now = now.into();
-    let selected = match lab_chosen(Cli::Claude, roster_path, &config_beside(roster_path)) {
-        Ok(selected) => selected,
-        Err(_) => return true,
-    };
-    if selected {
-        return lab_sync_due(Cli::Claude, &accounts::Store::at(state_dir), roster_path);
+    match lab_chosen(Cli::Claude, roster_path, &config_beside(roster_path)) {
+        Chosen::Lab(_) => {
+            return lab_sync_due(Cli::Claude, &accounts::Store::at(state_dir), roster_path);
+        }
+        // A sync while the lab is not read yet writes nothing ([`sync_claude_pending`]).
+        Chosen::Pending(_) => return false,
+        Chosen::Unnamed => {}
     }
     let config_path = config_beside(roster_path);
     let Ok(selected) = source_selection::select_for(
@@ -10972,11 +11083,33 @@ fn sync_accounts_for_init_with(
         claude_tmp: None,
         claude_running: None,
     };
-    let native = SourceRequest::Automatic {
+    let chosen = SourceRequest::Automatic {
         candidate: None,
         admission: &automatic,
     }
     .chosen(Cli::Claude, roster_path, env.config.as_deref())?;
+    // A lab not read yet captures and reads no vault entry: its sync keeps the roster as it is.
+    if chosen.pending().is_some() {
+        before_sync();
+        let synced = sync_accounts_request(
+            &env,
+            SourceRequest::Automatic {
+                candidate: None,
+                admission: &automatic,
+            },
+            None,
+            &SyncHow {
+                fetch: fetch_uncaptured,
+                ladder: &sync_lock_ladder(),
+                fleet_snapshots: &[],
+                heal: None,
+                allow_empty_pool: true,
+            },
+        )?
+        .into_init(recovered_commit);
+        return Ok(synced);
+    }
+    let native = chosen.lab();
     let policy = env.accounts_store().source_policy()?;
     let selected = if native.is_none() {
         source_selection::select_observed(
@@ -11194,18 +11327,19 @@ fn has_claude_resync_source(home: &Path, state_dir: &Path, roster_path: &Path, n
 /// intentionally leaves `roster_path` absent in that state).
 fn empty_claude_pool_settled(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> bool {
     let config_path = config_beside(roster_path);
-    if lab_chosen(Cli::Claude, roster_path, &config_path).unwrap_or(true)
-        || !matches!(
-            source_selection::select_for(
-                &accounts::Store::at(state_dir),
-                Some(home),
-                Some(&config_path),
-                Some(roster_path),
-                SourceScope::Init
-            ),
-            Ok(SelectedSource::Pool(_))
-        )
-    {
+    if !matches!(
+        lab_chosen(Cli::Claude, roster_path, &config_path),
+        Chosen::Unnamed
+    ) || !matches!(
+        source_selection::select_for(
+            &accounts::Store::at(state_dir),
+            Some(home),
+            Some(&config_path),
+            Some(roster_path),
+            SourceScope::Init
+        ),
+        Ok(SelectedSource::Pool(_))
+    ) {
         return false;
     }
     let Some(fb) = fleet_file_beside(roster_path) else {
@@ -11294,9 +11428,13 @@ fn resync_with(
                 done.synced = true;
                 done.changed = true;
             }
-            Ok(CliSync::NoSourceDefaultLogin(_)) => {}
             Ok(
-                CliSync::Off | CliSync::Left { .. } | CliSync::NoSource | CliSync::Unlisted { .. },
+                CliSync::NoSourceDefaultLogin(_)
+                | CliSync::LabPending { .. }
+                | CliSync::Off
+                | CliSync::Left { .. }
+                | CliSync::NoSource
+                | CliSync::Unlisted { .. },
             ) => {}
             Err(why) => done.cli_failed.push((cli, why)),
         }
@@ -11629,6 +11767,17 @@ pub enum CliSync {
     /// [`Self::NoSource`], with a default login that names another account than its row: what the
     /// sync came to of that, which takes no source ([`reassign_codex_default`]).
     NoSourceDefaultLogin(Box<DefaultLogin>),
+    /// The lab may name this Mac and is not read yet ([`super::alab_roster::Chosen::Pending`]),
+    /// for the reason `why`: no source was read and the roster stands as it is, no row moved on
+    /// or off the default login among them; `login`, where that login names another account than
+    /// its row, says which row it leaves there ([`sync_without_source`], whose move waits for the
+    /// lab: [`default_move_asked`]).
+    LabPending {
+        /// Why the lab is not read.
+        why: String,
+        /// What following the default login came to.
+        login: Option<Box<DefaultLogin>>,
+    },
     /// Synced by default with no roster kept here, and neither a preferred account nor a
     /// registry-known native default login belongs here, or no machine names this Mac:
     /// nothing was written, not even a lock (but
@@ -11812,20 +11961,37 @@ fn local_cli_source_observed(
     Some(LocalCliSource { entry, csv })
 }
 
+/// `cli`'s lab fleet where the lab names this Mac ([`super::alab_roster::chosen`]), `None` where
+/// it does not, so `cli`'s own sources are read.
+///
+/// # Errors
+/// [`super::alab_roster::SOURCE`] was named and the lab names no machine here; or the lab is not
+/// read yet ([`Chosen::Pending`], its words): no other source stands in for it meanwhile.
 fn cli_lab_source(cli: Cli, env: &Env, named: Option<&str>) -> Result<Option<CliFleet>, String> {
     let roster = env
         .config
         .as_deref()
         .and_then(|config| accounts::roster_beside_for(config, cli));
-    Ok(
-        super::alab_roster::chosen(cli, roster.as_deref(), named, env.config.as_deref())?.map(
-            |roster| CliFleet {
-                cli,
-                roster,
-                held: Vec::new(),
-            },
-        ),
-    )
+    match super::alab_roster::chosen(cli, roster.as_deref(), named, env.config.as_deref())? {
+        Chosen::Lab(roster) => Ok(Some(CliFleet {
+            cli,
+            roster,
+            held: Vec::new(),
+        })),
+        Chosen::Unnamed => Ok(None),
+        Chosen::Pending(why) => Err(why),
+    }
+}
+
+/// Why the lab is not read yet for `cli`'s pool ([`Chosen::Pending`]), where it is not: a sync of
+/// that pool then keeps its roster as it stands, and its table lists that roster alone.
+#[must_use]
+pub fn lab_pending(cli: Cli, env: &Env) -> Option<String> {
+    let roster = env.accounts_roster_for(cli);
+    match super::alab_roster::chosen(cli, roster.as_deref(), None, env.config.as_deref()) {
+        Ok(Chosen::Pending(why)) | Err(why) => Some(why),
+        Ok(Chosen::Lab(_) | Chosen::Unnamed) => None,
+    }
 }
 
 fn parse_cli_source(cli: Cli, chosen: &str, raw: &str) -> Result<CliFleet, String> {
@@ -11875,6 +12041,10 @@ impl<'a> ResyncSources<'a> {
         Option<LoadedFleet<&super::ai_pool::Pool, &super::ai_pool::LocalPoolIdentity>>,
         String,
     > {
+        if lab_pending(cli, self.env).is_some() {
+            // A lab not read yet gives this pool no source: its sync keeps the roster.
+            return Ok(None);
+        }
         if let Some(fleet) = cli_lab_source(cli, self.env, None)? {
             let machine = fleet
                 .roster
@@ -12009,11 +12179,40 @@ pub(super) struct CodexCompletionSource {
     pub(super) guard: Option<super::alab_roster::ReceiptGuard>,
 }
 
-/// Read only native local source files; no network or source publication is permitted.
+/// What the local source says of a Codex row's metadata ([`codex_completion_read`]): the source,
+/// or why the lab, which may name this Mac, is not read yet, so no source vouches for it.
+#[derive(Debug, PartialEq)]
+pub(super) enum CodexCompletion {
+    /// The source as read.
+    Read(CodexCompletionSource),
+    /// The lab is not read yet ([`Chosen::Pending`]), in these words.
+    LabPending(String),
+}
+
+/// [`codex_completion_read`] for the callers that act on an account's custody, metadata or
+/// receipt: a lab not read yet vouches for no account's, so that is a refusal, in its words.
+///
+/// # Errors
+/// As [`codex_completion_read`], and a lab not read yet.
 pub(super) fn codex_completion_source(
     env: &Env,
     row: &Row,
 ) -> Result<CodexCompletionSource, String> {
+    match codex_completion_read(env, row)? {
+        CodexCompletion::Read(source) => Ok(source),
+        CodexCompletion::LabPending(why) => Err(why),
+    }
+}
+
+/// Read only native local source files; no network or source publication is permitted. A lab
+/// not read yet reads no source and answers why ([`CodexCompletion::LabPending`]): an automatic
+/// follow of the default login or completion of its row then has nothing to do, while every
+/// caller that acts on custody refuses ([`codex_completion_source`]).
+///
+/// # Errors
+/// No home or Codex roster directory is known, or the source cannot be captured, read or
+/// validated.
+pub(super) fn codex_completion_read(env: &Env, row: &Row) -> Result<CodexCompletion, String> {
     let home = env.home.as_deref().ok_or("no home directory")?;
     let mut source_env = env.clone();
     let config = source_env
@@ -12035,6 +12234,9 @@ pub(super) fn codex_completion_source(
         &no_network,
     )
     .map_err(SyncError::into_message)?;
+    if let Some(why) = captured.lab_pending() {
+        return Ok(CodexCompletion::LabPending(why.to_owned()));
+    }
     let loaded = captured
         .load(Cli::Codex, &roster)
         .map_err(SyncError::into_message)?;
@@ -12063,7 +12265,7 @@ pub(super) fn codex_completion_source(
     captured
         .validate(Cli::Codex, &source_env)
         .map_err(SyncError::into_message)?;
-    Ok(CodexCompletionSource {
+    Ok(CodexCompletion::Read(CodexCompletionSource {
         fleet: loaded.map(|(fleet, _, _)| fleet),
         held_by,
         pool_text: pool_text.map(str::to_owned),
@@ -12071,7 +12273,7 @@ pub(super) fn codex_completion_source(
             .receipt_guard()
             .map_err(SyncError::into_message)?
             .cloned(),
-    })
+    }))
 }
 
 /// Read one pool's complete source table, including rows held before sign-in.
@@ -12258,6 +12460,18 @@ fn sync_cli_in_env(
         automatic,
         fetch,
     )?;
+    // A lab not read yet reads no source: the roster stands, and this Mac's own default login is
+    // read as a sync with no source reads it, which moves no row while the lab is unread.
+    if let Some(why) = captured.lab_pending() {
+        let login = match sync_without_source(cli, (env, &store), &roster_path, ladder, now)? {
+            CliSync::NoSourceDefaultLogin(login) => Some(login),
+            _ => None,
+        };
+        return Ok(CliSync::LabPending {
+            why: why.to_owned(),
+            login,
+        });
+    }
     // Read-only absence and non-membership need no writer or new store directory.
     // Replacement retirement is a write, including an empty native/pool assignment.
     let Some((observed, _, observed_machine)) = captured.load(cli, &roster_path)? else {
@@ -12965,6 +13179,12 @@ fn default_move_asked<'r>(
     let Some(to) = candidates.next() else {
         return Ok(None);
     };
+    // A lab not read yet asks no move: no login directory moves until it is read, and the row
+    // left on the default login is named in the receipt ([`note_moved_off`]), as no refusal.
+    let read = codex_completion_read(env, to);
+    if matches!(read, Ok(CodexCompletion::LabPending(_))) {
+        return Ok(None);
+    }
     if candidates.next().is_some() {
         return Err("the default Codex login matches multiple declared accounts".into());
     }
@@ -12972,7 +13192,9 @@ fn default_move_asked<'r>(
         return Err("the default Codex reassignment includes a held account".into());
     }
     super::codex_app_login::check_login_identity(&home, Some(&email)).map_err(|e| e.to_string())?;
-    let policy = codex_completion_source(env, to)?;
+    let CodexCompletion::Read(policy) = read? else {
+        return Ok(None);
+    };
     if policy.held_by.is_some() {
         return Err("the source holds the default Codex account".into());
     }
@@ -13561,6 +13783,39 @@ pub(super) fn run_cli_accounts_sync_with(
                 (out, err),
             );
         }
+        Ok(CliSync::LabPending { why, login }) => {
+            let names = accounts::roster_beside_for(config, cli)
+                .map_or_else(|| Naming::of(cli, &[]), |path| Naming::at(cli, &path));
+            if json {
+                let mut o = Map::new();
+                o.insert("schema".to_owned(), Value::from(SYNC_SCHEMA));
+                o.insert("kind".to_owned(), Value::from("accounts-sync".to_owned()));
+                o.insert("cli".to_owned(), Value::from(cli.id().to_owned()));
+                o.insert(
+                    "source".to_owned(),
+                    Value::from(super::alab_roster::SOURCE.to_owned()),
+                );
+                o.insert("lab_pending".to_owned(), Value::from(why.clone()));
+                if let Some(login) = &login {
+                    login.put_json(&names, &mut o);
+                }
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
+                );
+            } else {
+                if let Some(login) = &login {
+                    login.write_lines(&names, program, out);
+                }
+                let _ = writeln!(out, "{product} roster ({file}): {why}");
+            }
+            // A lab not read yet asks no move of the default login, so a refusal here is one any
+            // sync fails on (its records could not be read), as the upkeep's does.
+            return login.as_ref().map_or(ExitCode::SUCCESS, |login| {
+                write_default_refusal(login, &names, program, &flag, err)
+            });
+        }
         Ok(CliSync::Unlisted {
             machine,
             source,
@@ -13974,6 +14229,8 @@ pub fn cli_pools_due(config: &Path, state_dir: &Path, home: &Path, now: i64) -> 
             syncs_by_default(cli)
                 && accounts::roster_beside_for(config, cli)
                     .is_some_and(|roster| !trace::fs::is_file(&roster))
+                // A lab not read yet takes no rows: its sync keeps the roster as it stands.
+                && lab_pending(cli, &env).is_none()
                 && match load_cli_fleet_source(cli, &env, home, None, None, &fetch_source_text) {
                     Ok(None) => false,
                     Ok(Some((fleet, _, machine))) => !matches!(
@@ -14056,7 +14313,10 @@ fn sync_cli_accounts_with(
 fn default_refusal_fails(synced: CliSync) -> Result<CliSync, String> {
     let refused = match &synced {
         CliSync::Synced(synced) => synced.default_login.refused.as_ref(),
-        CliSync::NoSourceDefaultLogin(login) => login.refused.as_ref(),
+        CliSync::NoSourceDefaultLogin(login)
+        | CliSync::LabPending {
+            login: Some(login), ..
+        } => login.refused.as_ref(),
         _ => None,
     }
     .map(|refused| refused.logged.clone());
@@ -15666,7 +15926,7 @@ impl Drop for LoginActivityGuard {
 #[path = "accounts_sync_activity_batch_tests.rs"]
 mod login_activity_batch_tests;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "accounts_manual_queue_tests.rs"]
 mod manual_queue_tests;
 
@@ -16384,7 +16644,12 @@ pub(super) fn resolve_claude_program(home: &Path) -> PathBuf {
     if let Some(twin) = super::upgrade_drive::managed_agent_twin("claude") {
         return twin;
     }
-    let local_bin = home.join(".local/bin/claude");
+    // Claude Code's own installer lays it in `~/.local/bin`: `claude`, and on Windows
+    // `claude.exe`.
+    let local_bin = home
+        .join(".local")
+        .join("bin")
+        .join(format!("claude{}", std::env::consts::EXE_SUFFIX));
     if trace::fs::is_file(&local_bin) {
         return local_bin;
     }
@@ -16395,7 +16660,7 @@ fn resolve_opener_link(
     home: &Path,
     store: &accounts::Store,
 ) -> Result<PathBuf, super::cli::OpenerError> {
-    let custom_opener = home.join(".local/bin").join(super::open_url::OPENER);
+    let custom_opener = home.join(".local/bin").join(super::cli::opener_file_name());
     // An explicitly installed helper that is broken or inaccessible is a setup error,
     // not permission to replace it with this process's executable.
     if !matches!(trace::fs::symlink_metadata(&custom_opener), Err(error) if error.kind() == io::ErrorKind::NotFound)
@@ -16922,9 +17187,10 @@ enum Assigning {
 /// machine goes by in it ([`Assigning`]): the name a sync of `cli` reads this Mac as, a pool's
 /// identity for it (none where the pool refuses this Mac) or [`machine_for`] for any other
 /// source. Under the lab nothing limits who runs an account: its fleet names this Mac for every
-/// account it lists. A lab that could not be read may name this Mac or not, so it is unread, as a
-/// sync refuses to read anything meanwhile. With no home the vault's sources cannot be read, and
-/// they outrank a roster of its own and the file beside it, so that too is unread.
+/// account it lists. A lab not read yet may name this Mac or not, so it is unread, as a sync then
+/// reads no source and goes on with the roster as it stands. With no home the vault's sources
+/// cannot be read, and they outrank a roster of its own and the file beside it, so that too is
+/// unread.
 fn assigning_source(cli: Cli, env: &Env) -> Assigning {
     use accounts::UnreadWhy;
     // Whether the source asked of it is only on the network, which nothing here fetches.
@@ -16942,9 +17208,9 @@ fn assigning_source(cli: Cli, env: &Env) -> Assigning {
             return Assigning::Unread(UnreadWhy::Source);
         };
         match super::alab_roster::chosen(cli, Some(&roster), None, env.config.as_deref()) {
-            Ok(None) => {}
-            Ok(Some(_)) => return Assigning::Free,
-            Err(_) => return Assigning::Unread(UnreadWhy::Source),
+            Ok(Chosen::Unnamed) => {}
+            Ok(Chosen::Lab(_)) => return Assigning::Free,
+            Ok(Chosen::Pending(_)) | Err(_) => return Assigning::Unread(UnreadWhy::Source),
         }
         let Ok(selected) = source_selection::select_for(
             &env.accounts_store(),
@@ -18903,10 +19169,29 @@ fn spacing_admits(
     }
 }
 
+/// Whether the fleet's files hold `sign_in` ([`SignIn::fleet_holds`]): a block of its account's
+/// sign-in that a Mac of the fleet recorded within a day holds an automatic one
+/// ([`RenewalDispatch::Held`], tried again at a later upkeep), and a store that does not tell
+/// which account it is fences it. A door makes this check before it claims its permit or takes
+/// a person's queued admission, as it checks the spacing ([`spacing_admits`]), so a held row
+/// costs nothing and a Next selection goes on to its next row; [`SignIn::begin`] checks it
+/// again, where it decides. A Claude Code row's ladder holds it itself, after its vault route
+/// ([`ladder_route_in_context`]), so the door checks it only past the ladder.
+fn fleet_admits(
+    sign_in: &SignIn,
+    store: &accounts::Store,
+    now: i64,
+) -> Result<(), RenewalDispatch> {
+    sign_in
+        .fleet_holds(store, now)
+        .map_err(|refused| spacing_refusal(&refused))
+}
+
 /// How a background start answers [`SignIn::begin`]'s refusal.
 fn spacing_refusal(refused: &super::sign_in_ladder::Refused) -> RenewalDispatch {
     match refused {
-        super::sign_in_ladder::Refused::Spaced { .. } => RenewalDispatch::Held,
+        super::sign_in_ladder::Refused::Spaced { .. }
+        | super::sign_in_ladder::Refused::Fleet { .. } => RenewalDispatch::Held,
         super::sign_in_ladder::Refused::Record(_) => RenewalDispatch::Fenced,
         super::sign_in_ladder::Refused::Another => RenewalDispatch::Failed,
     }
@@ -20325,6 +20610,10 @@ fn ladder_route_in_context(
     } else {
         VaultInput::Missing
     };
+    // A sign-in of the row's account a Mac of the fleet recorded `blocked` within a day holds
+    // every route that opens a browser, after the vault route ([`accounts::fleet_blocked`]). It
+    // is an input, so its lapse ends the wait it set.
+    let fleet = accounts::fleet_blocked(&records.state, &row.label, now);
     let inputs_of = |read: &super::sign_in_ladder::Read, observed: VaultInput| {
         let mut inputs = row_retry_inputs(
             row,
@@ -20338,6 +20627,9 @@ fn ladder_route_in_context(
         // previously admitted preparation or its attempt timestamp.
         if let Some(grant) = preparation {
             inputs.push_str(&format!("|preparation={grant:?}"));
+        }
+        if let Some(hold) = fleet {
+            inputs.push_str(&format!("|fleet={}", hold.until));
         }
         inputs
     };
@@ -20456,21 +20748,49 @@ fn ladder_route_in_context(
     if only_the_vault {
         return LadderStep::Held;
     }
-    if let Some(route) = read.route() {
+    if let Some(route) = read.route()
+        && fleet.is_none()
+    {
         return LadderStep::Go {
             route,
             read,
             inputs,
         };
     }
-    let words = read.words();
-    if !note_attempt(
-        store,
-        (&ctx.roster_path, row, logins),
-        (accounts::AttemptOutcome::NoRoute, None),
-        &words,
-        now,
-    ) {
+    // A fleet's hold is recorded as no route, never `blocked`, so a hold never sets off another
+    // across the fleet. Its record names the hold's end and no time relative to the clock, so a
+    // pass the same hold holds again records nothing new; the log line says how long ago and
+    // how long more. Where this Mac's own last attempt is the block (a stop no bot protection
+    // made, once its own six hours are over) and no signed-in `accounts browser` window answered
+    // it since ([`standing_stops`]' rule), that block is this Mac's `ai/logins` row's, the
+    // evidence every Mac's hold reads, this one's included: it is kept until the hold lapses,
+    // and nothing new is recorded over it.
+    let routes = read.words();
+    let (words, said) = match &fleet {
+        Some(hold) => (
+            format!("{}; {routes}", super::sign_in_ladder::fleet_words(hold)),
+            format!("{}; {routes}", super::sign_in_ladder::fleet_said(hold, now)),
+        ),
+        None => (routes.clone(), routes),
+    };
+    let keeps_its_block = fleet.is_some()
+        && logins
+            .get(&raw.label)
+            .and_then(|binding| binding.sign_in_attempt.as_ref())
+            .is_some_and(|attempt| {
+                attempt.outcome == accounts::AttemptOutcome::Blocked
+                    && workflow_browser_window_token(store, &raw, logins, attempt.tried_at)
+                        .is_none()
+            });
+    if !keeps_its_block
+        && !note_attempt(
+            store,
+            (&ctx.roster_path, row, logins),
+            (accounts::AttemptOutcome::NoRoute, None),
+            &words,
+            now,
+        )
+    {
         return LadderStep::Held;
     }
     let logged = super::account_names::logged_row(
@@ -20478,7 +20798,8 @@ fn ladder_route_in_context(
         row,
         super::alab_roster::current().as_deref(),
     );
-    if read.wants_mailbox()
+    if fleet.is_none()
+        && read.wants_mailbox()
         && let Some(line) = mailbox_need(home, &row.label, false)
     {
         (ctx.log)(&format!(
@@ -20499,11 +20820,7 @@ fn ladder_route_in_context(
     };
     (ctx.log)(&format!(
         "{} (tried again in {} or when one of them changes)",
-        super::sign_in_ladder::log_line(
-            &logged,
-            accounts::AttemptOutcome::NoRoute.as_str(),
-            &words
-        ),
+        super::sign_in_ladder::log_line(&logged, accounts::AttemptOutcome::NoRoute.as_str(), &said),
         super::upgrade::span(wait.as_secs())
     ));
     LadderStep::NoRoute
@@ -21428,6 +21745,9 @@ fn spawn_row_renewal(
     if let Err(disposition) = spacing_admits(&sign_in, &store, now) {
         return disposition;
     }
+    if let Err(disposition) = fleet_admits(&sign_in, &store, now) {
+        return disposition;
+    }
     reconcile_browser_window_unpark(
         renew_guard,
         &next_label,
@@ -22253,6 +22573,9 @@ fn spawn_vendor_renewal_with(
         return RenewalDispatch::store_refusal(&why);
     }
     if let Err(disposition) = spacing_admits(&sign_in, &store, now) {
+        return disposition;
+    }
+    if let Err(disposition) = fleet_admits(&sign_in, &store, now) {
         return disposition;
     }
     let Some(raw_workflow) = file_roster.row(&next_row.label).cloned() else {
@@ -23609,7 +23932,7 @@ mod source_path_tests;
 
 #[cfg(test)]
 #[path = "accounts_sync_ladder_tests.rs"]
-mod ladder_tests;
+pub(in crate::harness) mod ladder_tests;
 
 #[cfg(test)]
 #[path = "accounts_browser_rehabilitation_tests.rs"]

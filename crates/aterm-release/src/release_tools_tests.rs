@@ -638,11 +638,15 @@ fn first_exec_requires_the_exact_line_and_a_successful_exit() {
 fn a_version_line_without_exit_is_refused_with_no_reader_left() {
     let temp = aterm_tempfile::tempdir().unwrap();
     let path = temp.path().join("line-then-hang");
+    // `prove_exec_until` spawns the stand-in from this test binary, so the loop names the binary
+    // by `$PPID`, and the text, the same in every run, is one cached file on macOS
+    // (`aterm_tempfile::stand_in`).
     aterm_tempfile::stand_in(
         &path,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' '{}'\nwhile :; do sleep 60; done\n",
-            CUTTER_VERSION
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n{}\n",
+            CUTTER_VERSION,
+            aterm_uds::stand_in_loop::while_parent_alive("sleep 60")
         ),
     )
     .unwrap();

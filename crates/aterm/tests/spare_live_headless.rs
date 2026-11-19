@@ -6,9 +6,9 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use crate::headless_boot;
+use crate::patience::Patience;
 
 use aterm_shell_integration::ShellType;
 use aterm_uds::process::{Identity, Lineage, ProcessPresence};
@@ -139,17 +139,18 @@ fn hang_report(inst: &Instance) -> String {
 }
 
 fn await_spare(inst: &Instance, state: &str) {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         let m = ctl_ok(inst, &["metrics"]);
         if field(&m, "spare") == Some(state) {
             return;
         }
-        assert!(
-            Instant::now() < give_up,
-            "spare never reached {state}: {m}\n{}",
-            hang_report(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "spare never reached {state} ({why}): {m}\n{}",
+                hang_report(inst)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -181,7 +182,7 @@ fn fold_failed(log: &str) -> Option<(Vec<String>, &str)> {
 }
 
 fn log_through(inst: &Instance, verdict: &str, n: usize) -> String {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         let log = gate_log(inst);
         let lines: Vec<&str> = log.lines().collect();
@@ -193,11 +194,12 @@ fn log_through(inst: &Instance, verdict: &str, n: usize) -> String {
         {
             return lines[..=at].join("\n");
         }
-        assert!(
-            Instant::now() < give_up,
-            "the instance never logged {verdict:?} {n} times:\n{}",
-            hang_report(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the instance never logged {verdict:?} {n} times ({why}):\n{}",
+                hang_report(inst)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -222,16 +224,15 @@ fn spawn(inst: &Instance, args: &[&str]) -> String {
 }
 
 fn await_text(inst: &Instance, sid: &str, text: &str) {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         let screen = ctl_ok(inst, &[&format!("@{sid}"), "text"]);
         if screen.contains(text) {
             return;
         }
-        assert!(
-            Instant::now() < give_up,
-            "{sid} never showed {text:?}: {screen}"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("{sid} never showed {text:?} ({why}): {screen}");
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -293,7 +294,7 @@ fn gate_snapshot(inst: &Instance) -> Option<GateSnapshot> {
 }
 
 fn await_sample_after(inst: &Instance, before: &GateSnapshot) -> GateSnapshot {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         if let Some(after) = gate_snapshot(inst)
             && after.identity != before.identity
@@ -304,11 +305,12 @@ fn await_sample_after(inst: &Instance, before: &GateSnapshot) -> GateSnapshot {
             );
             return after;
         }
-        assert!(
-            Instant::now() < give_up,
-            "the visible run never published its gate snapshot:\n{}",
-            hang_report(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the visible run never published its gate snapshot ({why}):\n{}",
+                hang_report(inst)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -318,32 +320,34 @@ fn await_gate(inst: &Instance, word: &str) {
 }
 
 fn await_metric(inst: &Instance, key: &str, word: &str) {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         if metric(inst, key) == word {
             return;
         }
-        assert!(
-            Instant::now() < give_up,
-            "{key} never reached {word}: {}\n{}",
-            ctl_ok(inst, &["metrics"]),
-            hang_report(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "{key} never reached {word} ({why}): {}\n{}",
+                ctl_ok(inst, &["metrics"]),
+                hang_report(inst)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
 fn await_first_sample(inst: &Instance) -> GateSnapshot {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         if let Some(first) = gate_snapshot(inst) {
             return first;
         }
-        assert!(
-            Instant::now() < give_up,
-            "the boot run never published its gate snapshot:\n{}",
-            hang_report(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the boot run never published its gate snapshot ({why}):\n{}",
+                hang_report(inst)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -441,7 +445,7 @@ fn expect_streak(inst: &Instance, streak: u32, expected: u32) {
 }
 
 fn await_learned_spare_ready(inst: &Instance) {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         let m = ctl_ok(inst, &["metrics"]);
         if field(&m, "spare") == Some("ready") {
@@ -468,11 +472,12 @@ fn await_learned_spare_ready(inst: &Instance) {
                 gate_log(inst)
             );
         }
-        assert!(
-            Instant::now() < give_up,
-            "spare never reached ready: {m}\n{}",
-            hang_report(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "spare never reached ready ({why}): {m}\n{}",
+                hang_report(inst)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -504,18 +509,19 @@ fn learn_three_visible_runs(inst: &Instance) {
 }
 
 fn await_learned(inst: &Instance) {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         let gate = metric(inst, "spare_gate");
         if gate == "eligible" || gate == "backoff" || gate.starts_with("ineligible") {
             return;
         }
-        assert!(
-            Instant::now() < give_up,
-            "spare_gate never reached eligible: {}\n{}",
-            ctl_ok(inst, &["metrics"]),
-            hang_report(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "spare_gate never reached eligible ({why}): {}\n{}",
+                ctl_ok(inst, &["metrics"]),
+                hang_report(inst)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -530,18 +536,19 @@ fn await_visible_run_tier(inst: &Instance) -> &'static str {
 }
 
 fn await_private_file(inst: &Instance, path: &Path) {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     loop {
         if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
             return;
         }
-        assert!(
-            Instant::now() < give_up,
-            "the owned fixture never wrote {}: {}\n{}",
-            path.display(),
-            ctl_ok(inst, &["metrics"]),
-            gate_log(inst)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the owned fixture never wrote {} ({why}): {}\n{}",
+                path.display(),
+                ctl_ok(inst, &["metrics"]),
+                gate_log(inst)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -836,11 +843,19 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
                     daemon.identity.token()
                 ));
             }
-            drop(daemon_hold.take());
+            // Release the daemon by the line its `read` waits for, and close the hold only once
+            // it has finished. An EOF is no release: a daemon whose redirection opens the FIFO
+            // after the hold closed blocks in that open with no writer, and any other write end
+            // (another test's child between its fork and its exec) holds the EOF off.
+            let (mut hold, _, _) = daemon_hold.take().expect("the daemon's hold");
+            std::io::Write::write_all(&mut hold, b"release\n").expect("release the daemon");
             await_private_file(&inst, &inst.tmp.join("home/daemon-finished"));
-            let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            drop(hold);
+            let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
             while !daemon.ended() {
-                assert!(Instant::now() < give_up, "the owned daemon never ended");
+                if let Some(why) = patience.spent() {
+                    panic!("the owned daemon never ended ({why})");
+                }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
@@ -865,10 +880,11 @@ fn held_daemon_fifo(inst: &Instance) -> std::fs::File {
         0,
         "make daemon FIFO"
     );
-    // The daemon is released by the EOF this end's drop gives, so no other process may hold a
-    // copy: opened through `kept_out`, it is made under the spawn lock and kept out of every
-    // fork, as `aterm_uds::pipe` keeps its ends. A sibling test's child forked while this end
-    // was open would otherwise hold it until its exec, which a loaded Mac can stall past the
+    // The test releases the daemon by a line it writes into this end (`an_unclean_run`), and
+    // drops the end once the daemon has finished. No other process holds a copy: opened through
+    // `kept_out`, it is made under the spawn lock and kept out of every fork, as
+    // `aterm_uds::pipe` keeps its ends. A sibling test's child forked while this end was open
+    // would otherwise hold the FIFO open until its exec, which a loaded Mac can stall past the
     // hang detector.
     aterm_uds::kept_out(|| {
         std::fs::OpenOptions::new()
@@ -882,8 +898,8 @@ fn held_daemon_fifo(inst: &Instance) -> std::fs::File {
 
 fn prove_daemon(inst: &Instance, release_parent: &RcRelease, observed: &RcRelease) -> Leftover {
     use aterm_uds::process::{read_identity, read_lineage, read_process_path};
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    let pid_in = |name: &str| loop {
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
+    let mut pid_in = |name: &str| loop {
         if let Ok(line) = std::fs::read_to_string(inst.tmp.join("home").join(name))
             && line.ends_with('\n')
             && let Ok(pid) = line.trim().parse::<i32>()
@@ -891,7 +907,9 @@ fn prove_daemon(inst: &Instance, release_parent: &RcRelease, observed: &RcReleas
         {
             break pid;
         }
-        assert!(Instant::now() < give_up, "the fixture never wrote {name}");
+        if let Some(why) = patience.spent() {
+            panic!("the fixture never wrote {name} ({why})");
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     let parent_pid = pid_in("daemon-parent-pid");
@@ -938,10 +956,9 @@ fn prove_daemon(inst: &Instance, release_parent: &RcRelease, observed: &RcReleas
         if adopted && parent.ended() {
             break;
         }
-        assert!(
-            Instant::now() < give_up,
-            "the owned daemon was never adopted"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("the owned daemon was never adopted ({why})");
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     observed
@@ -999,9 +1016,11 @@ fn asks_a_spare_cannot_serve_go_cold_and_the_spare_stays() {
 }
 
 fn await_program(inst: &Instance, sid: &str, program: &str) {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     while field(&status(inst, sid), "program") != Some(program) {
-        assert!(Instant::now() < give_up, "{sid}: {}", status(inst, sid));
+        if let Some(why) = patience.spent() {
+            panic!("{sid} never ran {program} ({why}): {}", status(inst, sid));
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -1466,13 +1485,14 @@ fn a_crashed_instances_spare_fifo_is_swept_by_the_next_launch() {
         },
         |_| true,
     );
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     while !spare_entries(&spare_dir).is_empty() {
-        assert!(
-            Instant::now() < give_up,
-            "the next launch never swept the crashed instance's FIFO (left: {:?})",
-            spare_entries(&spare_dir)
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "the next launch never swept the crashed instance's FIFO ({why}; left: {:?})",
+                spare_entries(&spare_dir)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -1507,9 +1527,14 @@ PS1='SPARE%# '
         "the ready one was not held by the barrier"
     );
     // The spare warming now never reaches its prompt: wherever its rc is at 1 s, T_READY ends it.
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     while !metric(&inst, "spare_discard").contains("rc_timeout:1") {
-        assert!(Instant::now() < give_up, "{}", ctl_ok(&inst, &["metrics"]));
+        if let Some(why) = patience.spent() {
+            panic!(
+                "T_READY never ended the slow spare ({why}): {}",
+                ctl_ok(&inst, &["metrics"])
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     await_gate(&inst, "backoff");
@@ -1527,9 +1552,11 @@ fn quitting_with_a_spare_retires_it_before_the_exit() {
     let aterm = inst.child.id();
     // SAFETY: sends SIGTERM to the instance pid launched by this test.
     assert_eq!(unsafe { libc::kill(aterm as i32, libc::SIGTERM) }, 0);
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let mut patience = Patience::new(aterm_spec::wait::MUST_HAPPEN);
     while inst.child.try_wait().expect("wait").is_none() {
-        assert!(Instant::now() < give_up, "the instance never exited");
+        if let Some(why) = patience.spent() {
+            panic!("the instance never exited ({why})");
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert_eq!(
@@ -1538,10 +1565,9 @@ fn quitting_with_a_spare_retires_it_before_the_exit() {
         "the quit retired the spare: its FIFO and link are gone"
     );
     while !spare.ended() {
-        assert!(
-            Instant::now() < give_up,
-            "the spare's shell outlived the quit"
-        );
+        if let Some(why) = patience.spent() {
+            panic!("the spare's shell outlived the quit ({why})");
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }

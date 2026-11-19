@@ -305,6 +305,35 @@ fn a_53_repository_round_observes_each_distinct_component_once() {
         calls.len(),
         scope.paths.len()
     );
+    let edited = home.join("code-17");
+    file(&sys, &user, &edited.join(".git/config"), b"[core]\n");
+    let later = Checkouts::capture(&sys, &user);
+    let changed_parts = later
+        .changed_parts(&scope)
+        .expect("the source is unchanged");
+    let digest_changes: BTreeSet<&Path> = later
+        .roots
+        .iter()
+        .filter(|root| later.part(root) != scope.part(root))
+        .map(PathBuf::as_path)
+        .collect();
+    assert_eq!(changed_parts, BTreeSet::from([edited.as_path()]));
+    assert_eq!(changed_parts, digest_changes);
+    assert_eq!(
+        later.accounted(&scope, &CheckoutWrites::default(), false),
+        Accounted::Not,
+        "one unrecorded change still calls for repair"
+    );
+    eprintln!(
+        "checkout accounting: {} known roots, {} parts to hash",
+        later.roots.len(),
+        changed_parts.len()
+    );
+    let mut shared_shape = later.clone();
+    let (_, shape) = shared_shape.metadata.shapes.first_mut().unwrap();
+    assert!(shape.is_ok());
+    *shape = Err(io::ErrorKind::PermissionDenied);
+    assert!(shared_shape.changed_parts(&later).is_none());
     let blocked = home.join("code-0/.git/modules");
     sys.stat_of(
         blocked.to_str().unwrap(),

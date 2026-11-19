@@ -292,6 +292,11 @@ fn a_manifest_with_no_dock_field_restores_docked() {
             let wid = site(&mut app, &wl);
             app.seat_birth_dock(wid);
             let ws = &app.windows[&wid];
+            let (cells, pref, keeps_default) = if wid != WID && (by_default || dock.is_none()) {
+                (0, None, false)
+            } else {
+                (cells, pref, keeps_default)
+            };
             let case = format!("{name}: dock={dock:?} by_default={by_default} on={on:?}");
             assert_eq!(ws.dock.cells, cells, "{case}");
             assert_eq!(ws.dock.pref, pref, "{case}");
@@ -620,7 +625,7 @@ fn a_window_saved_with_the_dock_shown_restores_at_the_frame_it_had() {
 /// setting says: no dock, at the grid it had, its frame narrowed by the column and no program
 /// resized, its record undecided again. A person's Show writes a plain record and outlives the
 /// setting (`a_window_saved_with_the_dock_shown_restores_at_the_frame_it_had`); a Show over a
-/// default docking makes it the person's, and a new window takes the record with who wrote it.
+/// default docking makes it an explicit choice. A new auxiliary window starts undecided.
 #[test]
 fn a_default_docking_says_so_and_the_setting_still_decides_it() {
     let mut old = App::headless_for_test();
@@ -643,14 +648,9 @@ fn a_default_docking_says_so_and_the_setting_still_decides_it() {
     old.windows.get_mut(&WID).unwrap().win_px = Some(frame);
     assert!(old.windows[&WID].dock.by_default);
 
-    // A new window takes the record with who wrote it.
-    let session = old.next_session_id;
-    let child = old.insert_logical_window(crate::stub_session(session), rows, cols);
-    assert_eq!(old.windows[&child].dock.pref, Some(30));
-    assert!(
-        old.windows[&child].dock.by_default,
-        "the child's is the default's too"
-    );
+    let child = old.insert_logical_window(crate::stub_session(old.next_session_id), rows, cols);
+    assert_eq!(old.windows[&child].dock.pref, None);
+    assert!(!old.seat_birth_dock(child));
     old.close_window_logical(child);
 
     for handoff in [false, true] {

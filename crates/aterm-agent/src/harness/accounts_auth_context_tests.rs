@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
-
 use super::*;
 
 const NOW: i64 = 1_792_660_000;
@@ -329,7 +326,6 @@ fn replacement_credentials_do_not_inherit_renewal_or_served_metadata() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn an_unscoped_codex_failure_keeps_history_without_ending_the_current_pin() {
     let scratch = aterm_tempfile::TempDir::new().unwrap();
@@ -640,7 +636,9 @@ fn a_settled_refusals_reason_is_one_word_in_state_json_and_reads_back() {
             });
             assert_eq!(read.auth_refusal, None, "{reason:?}: {why}");
         }
+        // The word is a source only in a record no login ledger was kept for (an older build's).
         let signed_in = edited(&|record| {
+            record.remove("login");
             record.insert("auth".into(), Value::from("ok"));
         });
         assert_eq!(signed_in.auth, Auth::Ok, "CONTROL: {reason:?}");

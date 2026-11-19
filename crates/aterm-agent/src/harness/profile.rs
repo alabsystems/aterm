@@ -3677,17 +3677,23 @@ fn cached_figure(usage: &UsageCache, bucket: Bucket, now: i64) -> Option<WeeklyF
 /// The weekly bucket a model id's family draws on beside the week of all models: Opus's,
 /// Sonnet's or Fable's, and none for any other id.
 pub(crate) fn model_bucket(model: &str) -> Option<Bucket> {
-    let short = super::usage::model_short(model);
-    let family: String = short
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .collect();
-    match family.to_ascii_lowercase().as_str() {
+    match model_family(model).as_str() {
         "opus" => Some(Bucket::SevenDayOpus),
         "sonnet" => Some(Bucket::SevenDaySonnet),
         "fable" => Some(Bucket::Fable),
         _ => None,
     }
+}
+
+/// The family word of a model id or alias, lower-cased: the leading letters of its short name
+/// ([`super::usage::model_short`]: `opus` of `claude-opus-5-5` and of `opus[1m]`, `opusplan` of
+/// `opusplan`).
+pub(crate) fn model_family(model: &str) -> String {
+    super::usage::model_short(model)
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 /// Read the profile at `path` ([`parse`]).

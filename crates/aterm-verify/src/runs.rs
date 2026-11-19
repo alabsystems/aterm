@@ -6,7 +6,7 @@
 //! kernel seam and the A1–A7 verdict are [`aterm_uds::runs`]'s, re-exported here.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -764,14 +764,89 @@ impl Runs {
         Some(pass(&judge, &pids))
     }
 
-    /// Finish only after an admitted run-end sweep left no named or unjudged processes.
-    pub fn finish(&self, kernel: &impl Kernel) {
-        if !self.may_forget.load(Ordering::Relaxed) {
-            return;
+    /// Archive the exact owning record before any orderly removal. Only an admitted run-end
+    /// sweep with no named or unjudged processes permits a real `end` line and removal; other
+    /// records are archived unchanged and remain available to the native cleanup lifecycle.
+    /// With no admitted human log's archive path, retain the original without adding an end.
+    ///
+    /// # Errors
+    /// Record I/O, archive creation/publication/durability, a changed original path, or removal
+    /// fails. An archive failure retains the original, including any native end already admitted.
+    pub fn finish(&self, kernel: &impl Kernel, archive: Option<&Path>) -> std::io::Result<()> {
+        let Some(archive) = archive else {
+            return Ok(());
+        };
+        let file = self
+            .log
+            .lock()
+            .map_err(|_| std::io::Error::other("run-record writer is poisoned"))?;
+        let may_forget = self.may_forget.load(Ordering::Relaxed);
+        if may_forget {
+            aterm_uds::runs::write_line(&file, &format!("end at={}", kernel.now_ms()))?;
         }
-        self.line(&format!("end at={}", kernel.now_ms()));
-        let _ = std::fs::remove_file(&self.path);
+        archive_record(&file, archive)?;
+        if may_forget {
+            let (current, _) = aterm_uds::regular_file::open(&self.path)?;
+            if crate::run_log::file_key(&current)? != crate::run_log::file_key(&file)? {
+                return Err(std::io::Error::other("original run-record path changed"));
+            }
+            std::fs::remove_file(&self.path)?;
+        }
+        Ok(())
     }
+}
+
+/// Exact raw-record companion of an admitted human log; it is diagnostic data, not custody.
+#[must_use]
+pub fn archive_path(log: &Path) -> PathBuf {
+    let mut path = log.as_os_str().to_os_string();
+    path.push(".run");
+    PathBuf::from(path)
+}
+
+#[cfg(any(unix, windows))]
+fn archive_record(file: &std::fs::File, archive: &Path) -> std::io::Result<()> {
+    struct Staged {
+        path: PathBuf,
+        file: std::fs::File,
+    }
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+    let (path, temporary) = aterm_uds::atomic_file::create_temp_beside(archive, 0o600)?;
+    let mut staged = Staged {
+        path,
+        file: temporary,
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("run record is not a regular file"));
+    }
+    let mut input = file;
+    input.rewind()?;
+    let copied = std::io::copy(&mut input.take(metadata.len()), &mut staged.file)?;
+    if copied != metadata.len() || file.metadata()?.len() != metadata.len() {
+        return Err(std::io::Error::other("run record changed while archiving"));
+    }
+    staged.file.flush()?;
+    aterm_durable::durable(&staged.file)?;
+    // Publish the complete private sibling without replacing a prior or unrelated archive.
+    std::fs::hard_link(&staged.path, archive)?;
+    let parent = archive
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    aterm_durable::Flush::Durable.dir_diagnosed(parent)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn archive_record(_: &std::fs::File, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable run-record archives are unavailable on this platform",
+    ))
 }
 
 impl crate::exec::StageGroupEnd for Runs {

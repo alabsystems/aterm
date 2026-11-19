@@ -61,6 +61,7 @@ pub mod replica;
 pub mod resources;
 #[cfg(unix)]
 pub mod runtime;
+pub mod said;
 pub mod service_derivations;
 #[cfg(unix)]
 pub mod service_state;
@@ -131,14 +132,26 @@ pub fn inspect_writer_recovery(paths: &aterm_secrets::client::Paths) -> Result<a
 /// A refusal that identifies the failed boundary without quoting payloads or keys.
 pub struct Error(pub String, #[cfg(unix)] FailureKind);
 
+/// Which retained-evidence bound refused an append ([`Error::capacity_exhausted`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacityBound {
+    /// The table's own: its operations, or their bytes, every writer's together. No writer's
+    /// append is admitted until the table holds less.
+    Table,
+    /// One writer's: its own records on the table, or their bytes. The table still admits other
+    /// writers' appends.
+    Writer,
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy)]
 enum FailureKind {
     Other,
     Busy,
     SnapshotChanged,
-    /// The table's or writer's retained evidence does not admit another append.
-    Capacity,
+    /// The table's or writer's retained evidence does not admit another append: which bound.
+    Capacity(CapacityBound),
     Repair(aterm_types::network_state::RepairCause),
     #[cfg(unix)]
     EnrollmentPending,
@@ -171,23 +184,35 @@ impl Error {
     #[cfg(unix)]
     #[must_use]
     pub fn is_capacity_exhausted(&self) -> bool {
-        matches!(self.1, FailureKind::Capacity)
+        self.capacity_exhausted().is_some()
+    }
+
+    /// The bound that refused an append for its capacity: the table's or one writer's. `None`
+    /// for every other refusal, as [`Self::is_capacity_exhausted`].
+    #[cfg(unix)]
+    #[must_use]
+    pub const fn capacity_exhausted(&self) -> Option<CapacityBound> {
+        match self.1 {
+            FailureKind::Capacity(bound) => Some(bound),
+            _ => None,
+        }
     }
 
     #[cfg(unix)]
-    pub(crate) fn capacity(reason: &str) -> Self {
-        Self(reason.into(), FailureKind::Capacity)
+    pub(crate) fn capacity(bound: CapacityBound, reason: &str) -> Self {
+        Self(reason.into(), FailureKind::Capacity(bound))
     }
 
     #[cfg(unix)]
     pub(crate) fn repair(reason: &str, cause: aterm_types::network_state::RepairCause) -> Self {
         Self(reason.into(), FailureKind::Repair(cause))
     }
+    /// The broad repair category of this failure, without its local diagnostic details.
     #[cfg(unix)]
-    pub(crate) fn repair_cause(&self) -> aterm_types::network_state::RepairCause {
+    pub fn repair_cause(&self) -> aterm_types::network_state::RepairCause {
         use aterm_types::network_state::RepairCause;
         match self.1 {
-            FailureKind::Capacity => RepairCause::Quota,
+            FailureKind::Capacity(_) => RepairCause::Quota,
             FailureKind::Repair(cause) => cause,
             FailureKind::Busy | FailureKind::SnapshotChanged => RepairCause::NotReady,
             #[cfg(unix)]

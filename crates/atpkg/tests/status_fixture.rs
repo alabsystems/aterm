@@ -3,6 +3,8 @@
 
 //! Development-only process controls.
 
+#[path = "argv_fixture.rs"]
+mod argv;
 #[path = "capture_fixture.rs"]
 mod capture;
 #[path = "facts_fixture.rs"]
@@ -12,7 +14,8 @@ mod facts;
 mod warm;
 
 fn main() -> std::process::ExitCode {
-    let ended = aterm_uds::tether::entry()
+    let ended = argv::entry()
+        .or_else(aterm_uds::tether::entry)
         .or_else(facts::entry)
         .or_else(capture::entry);
     #[cfg(unix)]

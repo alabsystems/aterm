@@ -899,6 +899,7 @@ fn approve(app: &mut App, revision: u64) {
     app.observe_initial_setup_permissions(Some(InitialSetupPermissionPolicy {
         revision,
         allowed: true,
+        person_access: true,
     }));
 }
 
@@ -4798,6 +4799,7 @@ fn a_walking_folder_pass_retires_on_a_revoked_permission_status() {
         app.observe_initial_setup_permissions(Some(InitialSetupPermissionPolicy {
             revision: 1,
             allowed: false,
+            person_access: false,
         }));
         app.settle_access_steps(Instant::now());
     });

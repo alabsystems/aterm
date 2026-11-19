@@ -2771,6 +2771,7 @@ pub(super) fn with_selected_target<R>(
         &records.state,
         &enrolled,
         None,
+        accounts::ModelWeek::Unread,
         &accounts::Point::TurnEnd,
         env.now,
     );

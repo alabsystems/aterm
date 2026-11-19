@@ -1036,7 +1036,8 @@ fn records_are_keyed_by_tab_and_pruned_once_gone() {
     assert_eq!(Agent::Muse.record_tab(&key(TAB)), Some(TAB));
     assert_eq!(Agent::keyed(&key(TAB)), Some(Agent::Muse));
     assert!(!upgrade::is_session_id(&key(TAB)));
-    let rig = Rig::new("prune", 0, true, false, Log::Crash, true);
+    let mut rig = Rig::new("prune", 0, true, false, Log::Crash, true);
+    rig.opts.aterm_state = Some(rig.opts.home.join("aterm-state"));
     let old = |tab: &str, phase: Phase| {
         let st = St {
             agent: Agent::Muse,
@@ -1088,6 +1089,61 @@ fn records_are_keyed_by_tab_and_pruned_once_gone() {
         }
     });
     assert!(!gone.exists() && live.exists() && flying.exists());
+}
+
+/// A settled Muse Code record of a tab this window's graph does not hold stays while another
+/// running window of the same state root publishes that tab (this test process's own record
+/// stands in for that window), however long it went unwritten.
+/// NEGATIVE CONTROL: once that window's record is gone (it quit), the same graph entry speaks for
+/// nothing and the record is removed, as this window's graph alone would have removed it while
+/// the tab ran.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn a_record_another_running_window_holds_is_kept() {
+    let mut rig = Rig::new("prune-across", 0, true, false, Log::Crash, true);
+    let world = aterm_tempfile::tempdir().expect("world");
+    let root = world.path().join("aterm-state");
+    rig.opts.aterm_state = Some(root.clone());
+    let (here, elsewhere) = ("s-00000000000000000005", "s-00000000000000000006");
+    save(
+        &rig.opts,
+        &key(elsewhere),
+        &St {
+            agent: Agent::Muse,
+            tab: elsewhere.to_string(),
+            phase: Phase::Done,
+            ..St::default()
+        },
+    );
+    let path = state_dir(&rig.opts).join(format!("{}.json", key(elsewhere)));
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(when))
+        .expect("aged");
+    let graph = |name: &str, tab: &str| {
+        let graph = world.path().join(name).join("graph");
+        std::fs::create_dir_all(&graph).expect("graph");
+        std::fs::write(graph.join(tab), "sock /x/aterm-1.sock\nnonce 00\npid 1\n").expect("entry");
+        graph
+    };
+    let own = graph("own", here);
+    let other = graph("other", elsewhere);
+    let record = crate::harness::graph_records::record(
+        &crate::harness::graph_records::drive_folder(&root),
+        std::slice::from_ref(&other),
+    )
+    .expect("the other window's record");
+    let known_live = [here.to_string()];
+    prune(&rig.opts, now_s(), registry_life(Some(&own), &known_live));
+    assert!(path.exists(), "a tab another window runs lost its record");
+    crate::harness::graph_records::forget(&record);
+    prune(&rig.opts, now_s(), registry_life(Some(&own), &known_live));
+    assert!(
+        !path.exists(),
+        "a tab no running window holds kept its record"
+    );
 }
 
 /// Build a rig configured with short relaunch timeouts and `knobs`.

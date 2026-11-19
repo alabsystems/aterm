@@ -262,6 +262,12 @@ impl Key {
             && self.variant == other.variant
     }
 
+    fn unit_floor_selection(&self) -> Option<&[String]> {
+        self.crates.as_deref().filter(|crates| {
+            self.stage == TEST_COMPILE && self.variant.is_none() && !crates.is_empty()
+        })
+    }
+
     /// The selection as a person reads it: `the workspace`, or `-p a -p b`.
     #[must_use]
     pub fn selection(&self) -> String {
@@ -527,12 +533,9 @@ impl Records {
     /// held, and the claim falls to the cover or the cold figure, never below what it was.
     #[must_use]
     pub fn unit_floor(&self, key: &Key) -> u64 {
-        let Some(crates) = key.crates.as_deref() else {
+        let Some(crates) = key.unit_floor_selection() else {
             return 0;
         };
-        if key.stage != TEST_COMPILE || key.variant.is_some() {
-            return 0;
-        }
         self.rows
             .iter()
             .filter(|r| {
@@ -777,6 +780,15 @@ pub fn chain(
     key: &Key,
     analogue: Option<(&dyn ShapingSource, &Key)>,
 ) -> Option<Found> {
+    chain_with_unit_floor(own, key, analogue, |records, like| records.unit_floor(like))
+}
+
+fn chain_with_unit_floor(
+    own: &Records,
+    key: &Key,
+    analogue: Option<(&dyn ShapingSource, &Key)>,
+    unit_floor: impl FnOnce(&dyn ShapingSource, &Key) -> u64,
+) -> Option<Found> {
     let found = |peak: u64, runs: usize, via: Via| Found { peak, runs, via };
     let like = analogue.and_then(|(records, like)| {
         records
@@ -809,7 +821,7 @@ pub fn chain(
         let from = wide.wider.unwrap_or_else(|| key.clone());
         return Some(found(wide.peak, wide.runs, Via::Wider(from)));
     }
-    let floor = analogue.map_or(0, |(records, like)| records.unit_floor(like));
+    let floor = analogue.map_or(0, |(records, like)| unit_floor(records, like));
     let like_wide = analogue.and_then(|(records, like)| {
         records
             .wider_elsewhere(like, floor)
@@ -828,6 +840,23 @@ pub fn chain(
         .into_iter()
         .flatten()
         .max_by_key(|f| f.peak)
+}
+
+/// Find the history that sizes a plain build. The analogue names a verify stage, whose
+/// shaping-unit book is read only when comparing with wider selections elsewhere.
+#[must_use]
+pub fn chain_from_verify_path(
+    own: &Records,
+    key: &Key,
+    analogue: Option<(&Path, &Key)>,
+) -> Option<Found> {
+    let Some((path, like)) = analogue else {
+        return chain(own, key, None);
+    };
+    let stages = stage_records(path);
+    chain_with_unit_floor(own, key, Some((&stages, like)), |_, like| {
+        verify_history::unit_floor(path, like)
+    })
 }
 
 /// WHAT A PLAIN BUILD CLAIMS ([`need`]).
@@ -852,22 +881,30 @@ pub fn need(
     analogue: Option<(&dyn ShapingSource, &Key)>,
     physical: Option<u64>,
 ) -> BuildNeed {
-    match chain(own, key, analogue) {
-        Some(found) => BuildNeed {
-            bytes: match found.via {
-                Via::WiderElsewhere(_) | Via::AnalogueWiderElsewhere(_) => {
-                    crate::peak_claim(found.peak).min(crate::cold_claim(physical))
-                }
-                Via::Own | Via::Wider(_) | Via::Elsewhere(_) | Via::Analogue(_) => {
-                    crate::peak_claim(found.peak)
-                }
+    BuildNeed::from_found(chain(own, key, analogue), physical)
+}
+
+impl BuildNeed {
+    /// Size a build from its selected history ([`chain`]) and the machine's physical memory.
+    #[must_use]
+    pub fn from_found(found: Option<Found>, physical: Option<u64>) -> Self {
+        match found {
+            Some(found) => Self {
+                bytes: match found.via {
+                    Via::WiderElsewhere(_) | Via::AnalogueWiderElsewhere(_) => {
+                        crate::peak_claim(found.peak).min(crate::cold_claim(physical))
+                    }
+                    Via::Own | Via::Wider(_) | Via::Elsewhere(_) | Via::Analogue(_) => {
+                        crate::peak_claim(found.peak)
+                    }
+                },
+                found: Some(found),
             },
-            found: Some(found),
-        },
-        None => BuildNeed {
-            bytes: crate::cold_claim(physical),
-            found: None,
-        },
+            None => Self {
+                bytes: crate::cold_claim(physical),
+                found: None,
+            },
+        }
     }
 }
 

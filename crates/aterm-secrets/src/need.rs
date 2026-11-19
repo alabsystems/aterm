@@ -18,6 +18,7 @@
 
 pub mod catalog;
 pub mod custody;
+pub mod full;
 mod ledger;
 pub mod transfer;
 

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -229,10 +230,8 @@ pub(crate) struct Image {
     pub(crate) start: fn(u32) -> Option<String>,
     /// Process start timestamp in wall milliseconds.
     pub(crate) born_ms: fn(u32) -> Option<u64>,
-    /// Client build for rollout binding ([`aterm_agent::harness::codex_alab::alab_build`]).
-    pub(crate) build: fn(u32) -> Option<String>,
-    /// Product version from the running image's package, rechecked after a rollout read.
-    pub(crate) version: fn(u32) -> Option<String>,
+    /// Product and client versions tied to one mapped executable, reread after the rollout.
+    pub(crate) package: fn(u32, &mut PackageLookup) -> Option<RunningPackage>,
     /// Process group of `pid`.
     pub(crate) group: fn(u32) -> Option<i32>,
     /// The worker task `pid` was spawned on ([`crate::survey::task_prompt_of_env`]).
@@ -248,8 +247,7 @@ impl Image {
     pub(crate) const KERNEL: Image = Image {
         start: aterm_agent::harness::restart_stamp::kernel_start,
         born_ms,
-        build: running_build,
-        version: running_version,
+        package: running_package,
         group: live_group,
         task: spawned_task,
         record: aterm_agent::harness::self_claimed::read_seen,
@@ -388,6 +386,7 @@ struct Held {
     tapped: Tapped,
     run: TapRun,
     tap: RolloutTap,
+    package: PackageLookup,
     said: Option<Refusal>,
     /// The survey's reader of the same rollout, once its file is found ([`publish_facts`]).
     facts: Option<CodexFactsTail>,
@@ -468,16 +467,89 @@ fn spawned_task(pid: u32) -> Option<String> {
     crate::survey::task_prompt_of_env(&atpkg::caller_shell::process_args(pid)?.env)
 }
 
-/// The build process `pid`'s image runs, when it is an ALab build's.
-fn running_build(pid: u32) -> Option<String> {
-    let exe = aterm_uds::sudo::exe_path(i32::try_from(pid).ok()?)?;
-    aterm_agent::harness::codex_alab::alab_build(&exe)
+/// The file identity is part of the comparison before and after the rollout: an exec of
+/// different bytes carrying the same product and client versions still changes the writer.
+#[derive(PartialEq, Eq)]
+pub(crate) struct RunningPackage {
+    pub(crate) image: aterm_sysprobe::kproc::ImageFile,
+    pub(crate) product: String,
+    pub(crate) client: String,
 }
 
-/// The product version of the package whose image `pid` runs; never the selected package.
-fn running_version(pid: u32) -> Option<String> {
-    let exe = aterm_uds::sudo::exe_path(i32::try_from(pid).ok()?)?;
-    aterm_agent::harness::codex_alab::product_version(&exe)
+/// One bounded search per loaded image for a retained package after its launch alias moved.
+/// The cache holds paths only. A fresh kernel observation must identify the file every time.
+#[derive(Default)]
+pub(crate) struct PackageLookup {
+    retained: Option<(aterm_sysprobe::kproc::ImageFile, Instant, Option<PathBuf>)>,
+}
+
+impl PackageLookup {
+    fn read(
+        &mut self,
+        image: aterm_sysprobe::kproc::ImageFile,
+        launch: &Path,
+        matches: impl Fn(&Path) -> bool,
+        now: Instant,
+    ) -> Option<RunningPackage> {
+        let direct = launch.canonicalize().ok().filter(|path| matches(path));
+        let physical = match direct.as_deref() {
+            Some(path) => path,
+            None => {
+                let retry = self.retained.as_ref().is_none_or(|(last, at, path)| {
+                    *last != image
+                        || (!path.as_ref().is_some_and(|p| matches(p))
+                            && now.saturating_duration_since(*at) >= REST_FAR)
+                });
+                if retry {
+                    self.retained = Some((image, now, retained_image(launch, &matches)));
+                }
+                self.retained
+                    .as_ref()?
+                    .2
+                    .as_deref()
+                    .filter(|p| matches(p))?
+            }
+        };
+        let (product, client) = aterm_agent::harness::codex_alab::package_versions(physical)?;
+        matches(physical).then_some(RunningPackage {
+            image,
+            product,
+            client,
+        })
+    }
+}
+
+/// A retargeted atpkg alias can still have its original mapped executable in an immutable
+/// numbered install. A missing or ambiguous match has no attributable package.
+fn retained_image(launch: &Path, matches: &impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let layout = atpkg::Layout {
+        prefix: launch.ancestors().nth(4)?.to_owned(),
+    };
+    if launch != atpkg::activate::exec_dir(&layout, "codex").join("codex") {
+        return None;
+    }
+    let mut paths = atpkg::ops::list_installed_for(&layout, "codex")
+        .into_iter()
+        .filter_map(|build| {
+            let root = layout.build_dir("codex", build);
+            let path = root
+                .join(atpkg::alab::validated_entrypoint_of(&root)?)
+                .canonicalize()
+                .ok()?;
+            matches(&path).then_some(path)
+        });
+    let found = paths.next()?;
+    paths.next().is_none().then_some(found)
+}
+
+fn running_package(pid: u32, cache: &mut PackageLookup) -> Option<RunningPackage> {
+    let image = aterm_uds::process::LoadedImage::read(i32::try_from(pid).ok()?)?;
+    cache.read(
+        image.file_identity()?,
+        image.launch_path(),
+        |path| image.matches_file(path) == Some(true),
+        Instant::now(),
+    )
 }
 
 /// ONE ASK: arm, read on, apply, and then, in a hold of its
@@ -561,6 +633,7 @@ fn read_on(
                 tapped: tapped.clone(),
                 run: job.run,
                 tap,
+                package: PackageLookup::default(),
                 said: None,
                 facts: None,
                 task: (job.image.task)(pid),
@@ -570,10 +643,13 @@ fn read_on(
         }
     };
     let floor = arm.floor_ms.max((job.image.born_ms)(pid).unwrap_or(0));
-    let running = (job.image.build)(pid);
-    let version = (job.image.version)(pid);
-    held.tap
-        .arm(floor, arm.adopted_ms, arm.given, running.as_deref());
+    let running = (job.image.package)(pid, &mut held.package);
+    held.tap.arm(
+        floor,
+        arm.adopted_ms,
+        arm.given,
+        running.as_ref().map(|pkg| pkg.client.as_str()),
+    );
     // A read that reached the rollout's end read every row written before it began (`began`, on
     // the log's clock): the harness pairing's watermark (`SessionLog::harness_pair`). A read that
     // failed or stopped short gives none.
@@ -608,8 +684,7 @@ fn read_on(
     let survey = read_facts(held, &tapped, record.goal);
     after_read();
     if (job.image.start)(pid).as_deref() != Some(start)
-        || (job.image.build)(pid) != running
-        || (job.image.version)(pid) != version
+        || (job.image.package)(pid, &mut held.package) != running
     {
         drop_held(taps, job.session, Some(&ctx));
         return (None, RolloutWord::Stale);

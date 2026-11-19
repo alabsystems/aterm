@@ -16,7 +16,9 @@
 //!
 //! Reading a shared file is `aterm_file::File::read`, in a crate that cannot reach this one: it
 //! answers from the snapshot whatever this Mac's custody is doing. Only the materializer here
-//! opens custody, and it turns every refusal into a state word rather than an error.
+//! opens custody, and it turns every refusal into a state word rather than an error. What the
+//! harness's rotation and sign-in read of the files ([`Rotation`], design §10 "How rotation
+//! reads them" and "How sign-in reads them") is such a read too ([`rotation`]).
 
 pub mod command;
 mod face;
@@ -32,9 +34,13 @@ pub use types::{
     NOTES, Store, Type, USAGE, find,
 };
 
+use crate::alab::journal::mine::{Attempt, Wall};
 use crate::typed::keys;
+use aterm_json::Value;
 use aterm_secrets::client::Paths;
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub use write::Env;
 
@@ -401,7 +407,200 @@ pub fn offer(
         (&queued.id, queued.unflushed.as_deref()),
         attempt,
         now_ms,
+        crate::alab::upkeep::journal_spool().as_ref(),
     )
+}
+
+/// What the harness's rotation and sign-in read of the fleet's shared files (design §10, "How
+/// rotation reads them" and "How sign-in reads them"; tracker package SF-09), by account key
+/// (`ac-<16 hex>`), with times in Unix milliseconds. It holds no address, name or other value,
+/// only keys, ranks and times.
+///
+/// Each part comes from its files alone. A file with no snapshot here, or whose last pass says
+/// `off`, contributes nothing, so with no snapshot every map is empty and rotation and sign-in
+/// run on this Mac's own facts. Every part is advisory: the reader judges each time against its
+/// own clock.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rotation {
+    /// The rank each live `ai/links` row of this Mac's own machine (the live row its
+    /// `lab/machines` snapshot marks `=here`) gives an account it prefers, smaller first. An
+    /// account linked twice takes its smaller rank.
+    pub rank: BTreeMap<String, u64>,
+    /// Each account's latest wall end among the `ai/limits` rows that state an account-wide
+    /// wall (any word but `none` and an older build's `7d-model`, which names no model,
+    /// [`Wall::walls_account`]) and its end. A sub-account's row counts for the account its
+    /// `account` column names. A wall that states no end is left out: nothing says when it
+    /// lapses, and a peer's word never demotes an account for good.
+    pub walls: BTreeMap<String, u64>,
+    /// Each account's latest end of each model's own weekly wall among the `ai/limits` rows'
+    /// `model_walls`, by the model's bucket (`seven_day_overage_included` for Fable, FL-269; a
+    /// word this build does not know as `seven_day_other`'s, `limits::model_walls_of`), counted
+    /// and left out as `walls` are. A wall of Fable's, Opus's or Sonnet's week is the account's
+    /// for that model's sessions alone; one of `seven_day_other`, a model's week the harness
+    /// names no bucket of, is every session's, as the harness takes its own.
+    pub model_walls: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Each account's newest `attempt_at` among the live `ai/logins` rows, any Mac's, whose
+    /// `attempt` says `blocked`.
+    pub blocked: BTreeMap<String, u64>,
+}
+
+/// The rows of `read`; none where its word is `off`.
+fn rows_on(read: &aterm_file::Read) -> &[aterm_file::Row] {
+    if read.status.word == aterm_file::Word::Off {
+        &[]
+    } else {
+        read.rows()
+    }
+}
+
+/// The text `row` holds under `column`.
+fn text_of<'a>(row: &'a aterm_file::Row, column: &str) -> Option<&'a str> {
+    row.values.get(column).and_then(Value::as_str)
+}
+
+/// Keep the larger of `value` and what `map` holds for `key`.
+fn keep_max(map: &mut BTreeMap<String, u64>, key: &str, value: u64) {
+    let kept = map.entry(key.to_owned()).or_insert(value);
+    *kept = (*kept).max(value);
+}
+
+impl Rotation {
+    /// The rotation facts of one read of each file: `ai/accounts`, `ai/links` and `lab/machines`
+    /// (read together, as [`crate::alab::view::LabView::of_files`] reads them), `ai/limits` and
+    /// `ai/logins`. A read whose word is `off` reads as one with no snapshot, and the three
+    /// registry files give a rank only while none of them is `off`.
+    #[must_use]
+    pub fn of_reads(
+        accounts: &aterm_file::Read,
+        links: &aterm_file::Read,
+        machines: &aterm_file::Read,
+        limits: &aterm_file::Read,
+        logins: &aterm_file::Read,
+    ) -> Self {
+        let time = |row: &aterm_file::Row, column: &str| row.values.get(column)?.as_u64();
+        let mut rotation = Self::default();
+        let registry_off = [accounts, links, machines]
+            .iter()
+            .any(|read| read.status.word == aterm_file::Word::Off);
+        if !registry_off {
+            let view = crate::alab::view::LabView::of_files(accounts, links, machines);
+            if let Some(me) = &view.me {
+                for preference in view.preferences.iter().filter(|p| &p.machine == me) {
+                    if let Some(rank) = preference.rank {
+                        let kept = rotation
+                            .rank
+                            .entry(preference.account.clone())
+                            .or_insert(rank);
+                        *kept = (*kept).min(rank);
+                    }
+                }
+            }
+        }
+        rotation.limits(rows_on(limits));
+        for row in rows_on(logins).iter().filter(|row| row.live) {
+            if text_of(row, "attempt").and_then(Attempt::parse) != Some(Attempt::Blocked) {
+                continue;
+            }
+            let Some(at) = time(row, "attempt_at") else {
+                continue;
+            };
+            // A login row's key is `<account key>.<uuid32>`; its `account` column names the
+            // same account.
+            let Some(account) = text_of(row, "account")
+                .or_else(|| row.pk.rsplit_once('.').map(|(account, _)| account))
+            else {
+                continue;
+            };
+            keep_max(&mut rotation.blocked, account, at);
+        }
+        rotation
+    }
+
+    /// Take in the walls of the `ai/limits` rows `rows` ([`Self::walls`],
+    /// [`Self::model_walls`]): each live row's account-wide wall with an end, and each model's
+    /// wall in its `model_walls` with one, read entry by entry (`limits::model_walls_of`), for
+    /// the account its `account` column names.
+    pub(crate) fn limits(&mut self, rows: &[aterm_file::Row]) {
+        let time = |row: &aterm_file::Row, column: &str| row.values.get(column)?.as_u64();
+        for row in rows.iter().filter(|row| row.live) {
+            let account = text_of(row, "account").unwrap_or(&row.pk);
+            let walled = text_of(row, "wall")
+                .is_some_and(|wall| Wall::parse(wall).is_none_or(Wall::walls_account));
+            if walled && let Some(until) = time(row, "wall_until") {
+                keep_max(&mut self.walls, account, until);
+            }
+            for (bucket, until) in limits::model_walls_of(row.values.get("model_walls")) {
+                let Some(until) = until else { continue };
+                keep_max(
+                    self.model_walls.entry(account.to_owned()).or_default(),
+                    bucket.word(),
+                    until,
+                );
+            }
+        }
+    }
+}
+
+/// What one shared file's read answers from: its status's mark (the frontier's fingerprint, the
+/// revision and the last pass's word), and the ids of this Mac's own writes a read lays over
+/// the snapshot or marks on it (queued, held, and published ones no pass marked seen). Equal
+/// marks mean one snapshot of one set of records under one set of this Mac's writes, as the
+/// `aterm` executable's lab cache keys its reads.
+type Seen = (Option<(String, u64, Option<aterm_file::Word>)>, Vec<String>);
+
+/// The mark of `file`'s read now.
+fn seen(file: &aterm_file::File) -> Seen {
+    // The outbox first, as a read takes it: a write that moves after is one more read.
+    let outbox = file.outbox();
+    let own = outbox
+        .waiting()
+        .chain(outbox.held.iter().map(|held| &held.intent))
+        .chain(
+            outbox
+                .done
+                .iter()
+                .filter(|done| !done.seen && done.op.is_some())
+                .map(|done| &done.intent),
+        )
+        .map(|intent| intent.id.clone())
+        .collect();
+    let state = file
+        .state()
+        .map(|state| (state.fingerprint, state.rev, state.word));
+    (state, own)
+}
+
+/// The last [`rotation`] this process read: its root, each file's mark, and what it read.
+type LastRotation = (aterm_file::Root, [Seen; 5], Arc<Rotation>);
+
+static ROTATION: Mutex<Option<LastRotation>> = Mutex::new(None);
+
+/// The rotation facts of this Mac's shared files under `paths`' home ([`Rotation`]): read from
+/// its snapshots with `aterm_file::File::read`, with no custody, vault or registry session
+/// opened, so it answers in every custody state and inside an accounts transaction. The process
+/// keeps the last read and reads again only once a file's mark moves (its status, or this Mac's
+/// own writes in its outbox): a look at each file's status and outbox, and no snapshot read,
+/// while nothing moved.
+#[must_use]
+pub fn rotation(paths: &Paths) -> Arc<Rotation> {
+    let root = root(&crate::generation::original(paths));
+    let files = [&ACCOUNTS, &LINKS, &MACHINES, &LIMITS, &LOGINS]
+        .map(|file| aterm_file::File::at(&root, &file.file()));
+    let marks = files.each_ref().map(seen);
+    if let Some((held_root, held_marks, rotation)) =
+        &*ROTATION.lock().unwrap_or_else(PoisonError::into_inner)
+        && *held_root == root
+        && *held_marks == marks
+    {
+        return Arc::clone(rotation);
+    }
+    let [accounts, links, machines, limits, logins] = files.map(|file| file.read());
+    let rotation = Arc::new(Rotation::of_reads(
+        &accounts, &links, &machines, &limits, &logins,
+    ));
+    *ROTATION.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some((root, marks, Arc::clone(&rotation)));
+    rotation
 }
 
 /// Where this Mac's shared files live: `~/.aterm/files` of the home `paths` names. A test's

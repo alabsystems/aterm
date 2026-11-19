@@ -26,13 +26,17 @@ use crate::common;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod abrupt_stop_tests;
+mod atomic_scope_tests;
 mod cache_ancestor_tests;
 mod commit_ancestry_tests;
 mod inventory_retry_tests;
 mod local_tag_residency_tests;
 mod object_view_tests;
 mod partial_have_tests;
+mod push_history_tests;
 mod raw_blob_tests;
+mod retained_checkout_pack_tests;
+mod stalled_transfer_tests;
 
 /// Exercise the real CLI entry and its signal-to-collector handoff. The fake Git waits for
 /// a release file, so even the old orphaning CLI can be cleaned without signalling a guessed
@@ -45,6 +49,147 @@ fn native_cli_stop_retires_its_git_before_returning() {
 #[test]
 fn native_cli_ancestry_stop_retires_its_git_before_returning() {
     native_cli_stop(true);
+}
+
+/// Bounded observations from one owned CLI pipe. EOF is only a read of zero, including
+/// reads after fixture cleanup; it supplies no independent natural-exit claim.
+struct NativeCliCapture {
+    read: std::io::PipeReader,
+    tail: Vec<u8>,
+    observed: u64,
+    eof: bool,
+    read_error: Option<String>,
+}
+
+impl NativeCliCapture {
+    const KEEP: usize = 16 * 1024;
+
+    fn pipe() -> (Self, std::io::PipeWriter) {
+        let (read, write) = aterm_uds::pipe().expect("CLI capture pipe");
+        (
+            Self {
+                read,
+                tail: Vec::new(),
+                observed: 0,
+                eof: false,
+                read_error: None,
+            },
+            write,
+        )
+    }
+
+    fn pump(&mut self) -> std::io::Result<()> {
+        use std::io::Read as _;
+        use std::os::fd::AsFd as _;
+        let Self {
+            read,
+            tail,
+            observed,
+            eof,
+            read_error,
+        } = self;
+        let result = aterm_uds::ready::with_nonblocking(read.as_fd(), || {
+            let mut reader = &*read;
+            let mut bytes = [0_u8; 4096];
+            // A noisy pipe or repeated EINTR cannot hold the readiness probe indefinitely.
+            for _ in 0..4 {
+                match reader.read(&mut bytes) {
+                    Ok(0) => {
+                        *eof = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        *observed = observed.saturating_add(n as u64);
+                        tail.extend_from_slice(&bytes[..n]);
+                        if tail.len() > Self::KEEP {
+                            tail.drain(..tail.len() - Self::KEEP);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = &result {
+            *read_error = Some(error.to_string());
+        }
+        result
+    }
+}
+
+/// Keep only explicit bounded observations and the owned fixture. Diagnostics are fallible
+/// so they cannot replace the original panic. No cleanup exit status is a producer result.
+fn retain_native_cli_failure(
+    root: aterm_tempfile::TempDir,
+    stdout: &mut NativeCliCapture,
+    stderr: &mut NativeCliCapture,
+    observed_status: Option<&str>,
+) -> PathBuf {
+    use std::io::Write as _;
+    let _ = stdout.pump();
+    let _ = stderr.pump();
+    let kept = root.keep();
+    let stdout_write = std::fs::write(kept.join("stdout.tail"), &stdout.tail);
+    let stderr_write = std::fs::write(kept.join("stderr.tail"), &stderr.tail);
+    let metadata = format!(
+        "partial_capture=true\nstdout_observed={}\nstdout_retained={}\nstdout_read_zero={}\nstdout_read_error={:?}\nstderr_observed={}\nstderr_retained={}\nstderr_read_zero={}\nstderr_read_error={:?}\ncli_status_before_cleanup={observed_status:?}\nstdout_write={stdout_write:?}\nstderr_write={stderr_write:?}\n",
+        stdout.observed,
+        stdout.tail.len(),
+        stdout.eof,
+        stdout.read_error,
+        stderr.observed,
+        stderr.tail.len(),
+        stderr.eof,
+        stderr.read_error,
+    );
+    let metadata_write = std::fs::write(kept.join("capture.txt"), metadata);
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "KEPT {}: bounded partial CLI stdout/stderr and fixture; metadata write: {metadata_write:?}",
+        kept.display()
+    );
+    kept
+}
+
+#[test]
+fn native_cli_capture_retains_bounded_observed_bytes() {
+    use std::io::Write as _;
+    let parent = common::scratch("cli-capture-control");
+    let root = aterm_tempfile::Builder::new()
+        .prefix("retained-")
+        .tempdir_in(parent.path())
+        .expect("private capture fixture");
+    let (mut stdout, mut out) = NativeCliCapture::pipe();
+    let (mut stderr, mut err) = NativeCliCapture::pipe();
+    let bytes: Vec<u8> = (0..NativeCliCapture::KEEP + 1024)
+        .map(|n| (n % 251) as u8)
+        .collect();
+    for chunk in bytes.chunks(256) {
+        out.write_all(chunk).expect("known stdout");
+        stdout.pump().expect("drain known stdout");
+    }
+    err.write_all(b"private stderr\0\xff")
+        .expect("known stderr");
+    drop(out);
+    drop(err);
+    stdout.pump().expect("stdout closes");
+    stderr.pump().expect("stderr closes");
+    assert_eq!(stdout.observed, bytes.len() as u64);
+    assert_eq!(stdout.tail, bytes[bytes.len() - NativeCliCapture::KEEP..]);
+    assert_eq!(stderr.tail, b"private stderr\0\xff");
+    assert!(stdout.eof && stderr.eof, "both readers actually saw zero");
+    let kept = retain_native_cli_failure(root, &mut stdout, &mut stderr, None);
+    assert_eq!(
+        std::fs::read(kept.join("stdout.tail")).unwrap(),
+        stdout.tail
+    );
+    assert_eq!(
+        std::fs::read(kept.join("stderr.tail")).unwrap(),
+        stderr.tail
+    );
+    assert!(kept.join("capture.txt").is_file());
 }
 
 fn native_cli_stop(ancestry: bool) {
@@ -64,8 +209,11 @@ fn native_cli_stop(ancestry: bool) {
         }
     }
 
-    {
-        let root = common::scratch("native-cli-stop");
+    let root = common::scratch("native-cli-stop");
+    let (mut stdout, stdout_write) = NativeCliCapture::pipe();
+    let (mut stderr, stderr_write) = NativeCliCapture::pipe();
+    let mut observed_status = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let bin = root.path().join("bin");
         std::fs::create_dir(&bin).expect("bin");
         let git = bin.join("git");
@@ -118,30 +266,42 @@ fn native_cli_stop(ancestry: bool) {
             .env("XDG_CONFIG_HOME", root.path().join("config"))
             .env("XDG_STATE_HOME", root.path().join("state"))
             .env("PATH", path)
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null());
+            .stdout(stdout_write)
+            .stderr(stderr_write);
         let mut fixture = Fixture {
             child: command.spawn().expect("actual CLI"),
             release: bin.join("release"),
         };
         let marker = bin.join("pid");
-        let until = Instant::now() + Duration::from_secs(60);
-        while !std::fs::read_to_string(&marker).is_ok_and(|text| text.ends_with('\n'))
-            && Instant::now() < until
-        {
-            assert!(fixture.child.try_wait().expect("CLI wait").is_none());
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let pid = std::fs::read_to_string(&marker)
-            .expect("actual Git started")
-            .trim()
-            .parse::<i32>()
-            .expect("Git pid");
+        let marker_text = aterm_spec::wait::until_while_working(
+            fixture.child.id(),
+            "the actual CLI starts its Git fixture",
+            || {
+                stdout.pump().expect("CLI stdout capture");
+                stderr.pump().expect("CLI stderr capture");
+                match std::fs::read_to_string(&marker) {
+                    Ok(text) if text.ends_with('\n') => return Some(text),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => panic!("read actual Git start marker: {e}"),
+                }
+                let status = fixture.child.try_wait().expect("CLI wait");
+                if let Some(status) = status {
+                    observed_status = Some(status.to_string());
+                    panic!("CLI exited before its Git start marker: {status}");
+                }
+                None
+            },
+        );
+        let pid = marker_text.trim().parse::<i32>().expect("Git pid");
         let git_identity = aterm_uds::process::read_identity(pid).expect("running Git identity");
         fixture.child.terminate().expect("TERM only the actual CLI");
         let until = Instant::now() + Duration::from_secs(60);
         let status = loop {
+            stdout.pump().expect("CLI stdout capture while stopping");
+            stderr.pump().expect("CLI stderr capture while stopping");
             if let Some(status) = fixture.child.try_wait().expect("CLI wait") {
+                observed_status = Some(status.to_string());
                 break status;
             }
             assert!(Instant::now() < until, "CLI stop hang detector");
@@ -173,6 +333,10 @@ fn native_cli_stop(ancestry: bool) {
             git_reaped_at_return,
             "Git was positively reaped before CLI return: {git_presence_at_return:?} {git_identity_at_return:?}"
         );
+    }));
+    if let Err(panic) = result {
+        retain_native_cli_failure(root, &mut stdout, &mut stderr, observed_status.as_deref());
+        std::panic::resume_unwind(panic);
     }
 }
 
@@ -2486,14 +2650,31 @@ fn native_push_cli_reports_dry_run_and_journaled_success_and_validates_before_ro
         let exit = common::run_cli(&mut ctx, &args);
         (exit, captured, ctx.fx.children_run())
     };
+    // Each child's HTTP transfer stall bound: under a progress window, less than a byte a
+    // second for the window's seconds ends it, a remote that never answers included.
+    let stalls = |children: &[ChildSpec]| -> Vec<(Option<OsString>, Option<OsString>)> {
+        children
+            .iter()
+            .map(|child| {
+                (
+                    env_of(child, "GIT_HTTP_LOW_SPEED_LIMIT").cloned(),
+                    env_of(child, "GIT_HTTP_LOW_SPEED_TIME").cloned(),
+                )
+            })
+            .collect()
+    };
     write_input("refs/heads/main", ABSENT, &sha);
-    let (exit, captured, _) = run(true, None);
+    let (exit, captured, children) = run(true, None);
     assert_eq!(exit, 0, "{}", captured.stderr_text());
     assert_eq!(
         common::stdout_json(&captured)["outcome"],
         aterm_json::Value::from("would_send")
     );
     assert!(!world.dirs.journal().exists());
+    assert!(
+        children.iter().all(|child| child.progress.is_none()),
+        "a dry run keeps the wall bound"
+    );
     let (exit, captured, children) = run(false, None);
     assert_eq!(exit, 0, "{}", captured.stderr_text());
     let report = common::stdout_json(&captured);
@@ -2511,6 +2692,14 @@ fn native_push_cli_reports_dry_run_and_journaled_success_and_validates_before_ro
             .as_ref()
             .is_some_and(|bound| bound.window == aterm_uds::deadline::ECHO_HANG)
     }));
+    assert_eq!(aterm_uds::deadline::ECHO_HANG, Duration::from_secs(60));
+    assert!(
+        stalls(&children)
+            .iter()
+            .all(|stall| *stall == (Some("1".into()), Some("60".into()))),
+        "each child's HTTP transfer ends after the window with no bytes moved: {:?}",
+        stalls(&children)
+    );
     write_input("refs/heads/explicit-timeout", ABSENT, &sha);
     let (exit, captured, children) = run(false, Some("37s"));
     assert_eq!(exit, 0, "{}", captured.stderr_text());
@@ -2528,6 +2717,11 @@ fn native_push_cli_reports_dry_run_and_journaled_success_and_validates_before_ro
         children
             .iter()
             .all(|child| child.progress.is_none() && child.budget == Duration::from_secs(37))
+    );
+    assert!(
+        stalls(&children).iter().all(|stall| *stall == (None, None)),
+        "{:?}",
+        stalls(&children)
     );
     for (before, after) in [(&*sha, &*sha), (&*sha, ABSENT)] {
         write_input("refs/heads/main", before, after);

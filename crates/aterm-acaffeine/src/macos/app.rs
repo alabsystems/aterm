@@ -1124,6 +1124,7 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         version,
         restart_on_update,
         instance,
+        kept: _kept,
     } = ctx;
     let running = std::env::current_exe().unwrap_or_else(|_| origin.clone());
     let watch = restart_on_update.then(|| Watch::start(origin.clone(), &running));

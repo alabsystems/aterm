@@ -856,7 +856,12 @@ impl SessionLog {
     }
 
     /// The context left at each tenth it crosses and the goal as it goes on and off (a first
-    /// reading of no goal says nothing), each with its source and confidence.
+    /// reading of no goal says nothing), each with its source and confidence. Each half stands
+    /// down while the claim's stream feeds its kind: the context left under `usage` (whether or
+    /// not the record states it: the stand-down is by kind), the goal under `goal`. A reading
+    /// taken then is not kept. The goal's edge memory is the log's last `goal` row whoever wrote
+    /// it ([`Self::stream_goal`] moves it), so the first reading after the stream stops is
+    /// compared with what the log last said.
     fn mark_ctx_and_goal(
         &mut self,
         run: Node,
@@ -864,7 +869,8 @@ impl SessionLog {
         goal: Option<(bool, (Src, Conf))>,
         at: Stamp,
     ) {
-        if let Some((pct, (src, conf))) = ctx {
+        let down = self.stream_down;
+        if let Some((pct, (src, conf))) = ctx.filter(|_| !down.usage) {
             let tenth = pct.min(100) / 10;
             if self.observed.ctx != Some(tenth) {
                 self.observed.ctx = Some(tenth);
@@ -872,7 +878,7 @@ impl SessionLog {
                 self.put(Kind::Ctx, src, conf, run, f, at);
             }
         }
-        if let Some((goal, (src, conf))) = goal
+        if let Some((goal, (src, conf))) = goal.filter(|_| !down.goal)
             && self.observed.goal != Some(goal)
         {
             let first = self.observed.goal.is_none();
@@ -1526,8 +1532,197 @@ impl SessionLog {
         );
     }
 
-    /// `mark - usage h5=<pct> d7=<pct>`.
+    /// The timeline's word on which built-in writers the record stream stands down.
+    pub(crate) fn set_stream_down(&mut self, down: super::StreamDown) {
+        self.stream_down = down;
+    }
+
+    /// The agent run a stream row is written on: the open agent run, else none (the deepest
+    /// open node, else the session).
+    fn stream_run(&self) -> Option<Node> {
+        self.agent
+            .as_ref()
+            .map(|a| a.node)
+            .filter(|node| self.log.is_open(*node))
+    }
+
+    /// A `usage` RECORD's row, the stream's sibling of [`Self::observe_usage`]:
+    /// `mark - usage account=<label> h5=<pct> d7=<pct> pct=<context left> hseq=<seq> holder=`,
+    /// `h5=` from the limit the record names `session` and `d7=` from `weekly`, each said only
+    /// where the record says it.
+    pub(crate) fn stream_usage(
+        &mut self,
+        usage: &crate::session_timeline::StreamUsage,
+        holder: &str,
+        by: aterm_slog::Actor,
+        at: Stamp,
+    ) -> Option<u64> {
+        use crate::session_timeline::{LIMIT_SESSION, LIMIT_WEEKLY};
+        let pct = |p: Option<u8>| p.map(|p| Val::U(u64::from(p)));
+        let f = with(
+            Fields::new(),
+            Key::Account,
+            BoundedText::new(Key::Account, &usage.account).map(Val::Text),
+        );
+        let f = with(f, Key::H5, pct(usage.used(LIMIT_SESSION)));
+        let f = with(f, Key::D7, pct(usage.used(LIMIT_WEEKLY)));
+        let f = with(f, Key::Pct, pct(usage.context_left));
+        let f = with(f, Key::Hseq, Some(Val::U(usage.hseq)));
+        self.stream_mark(Kind::Usage, Some(Node::SESSION), f, holder, by, at)
+    }
+
+    /// A `progress` RECORD's row, on the agent run: `mark <run> progress state=<none|working|
+    /// done> n=<items> pct=<share done> hseq= holder=`. `none` is a plan of no item, `done` one
+    /// whose every item is done. The items themselves are the current-state record's.
+    pub(crate) fn stream_progress(
+        &mut self,
+        items: usize,
+        done: usize,
+        hseq: u64,
+        holder: &str,
+        by: aterm_slog::Actor,
+        at: Stamp,
+    ) -> Option<u64> {
+        let state = match (items, done) {
+            (0, _) => "none",
+            (n, d) if d >= n => "done",
+            _ => "working",
+        };
+        let f = with(Fields::new(), Key::State, Some(Val::Word(state)));
+        let f = with(f, Key::N, Some(Val::U(items as u64)));
+        let share = (done.min(items) * 100).checked_div(items);
+        let f = with(f, Key::Pct, share.map(|p| Val::U(p as u64)));
+        let f = with(f, Key::Hseq, Some(Val::U(hseq)));
+        self.stream_mark(Kind::Progress, self.stream_run(), f, holder, by, at)
+    }
+
+    /// A `goal` RECORD's row, on the agent run: `mark <run> goal state=<on|off> text=<the goal>
+    /// hseq= holder=`, `on` where the record names a goal. A row written is the log's latest
+    /// word on the goal, so it is also the built-in goal writer's edge memory: when the stream
+    /// stops feeding `goal`, the footer's reading is compared with this row.
+    pub(crate) fn stream_goal(
+        &mut self,
+        text: Option<&str>,
+        hseq: u64,
+        holder: &str,
+        by: aterm_slog::Actor,
+        at: Stamp,
+    ) -> Option<u64> {
+        let word = if text.is_some() { "on" } else { "off" };
+        let f = with(Fields::new(), Key::State, Some(Val::Word(word)));
+        let f = with(
+            f,
+            Key::Text,
+            text.and_then(|text| BoundedText::new(Key::Text, text))
+                .map(Val::Text),
+        );
+        let f = with(f, Key::Hseq, Some(Val::U(hseq)));
+        let written = self.stream_mark(Kind::Goal, self.stream_run(), f, holder, by, at)?;
+        self.observed.goal = Some(text.is_some());
+        Some(written)
+    }
+
+    /// A `compact` RECORD's step, the stream's sibling of the transcript's compact step: a
+    /// `started` opens a `compact` step under the open turn, else the agent run (one `holder`
+    /// already has open stays the one); a `done` closes the one `holder` has open, or opens and
+    /// closes one at once where it has none. `pct=` is the context left the record names, and
+    /// `hseq=` the record. A step another holder's record opened is never this holder's to
+    /// close: it is ended first ([`Self::end_stream_compact`]). Whether every row was written.
+    pub(crate) fn stream_compact(
+        &mut self,
+        done: bool,
+        context_left: Option<u8>,
+        hseq: u64,
+        holder: &str,
+        by: aterm_slog::Actor,
+        at: Stamp,
+    ) -> bool {
+        let fields = || {
+            let f = with(
+                Fields::new(),
+                Key::Pct,
+                context_left.map(|p| Val::U(u64::from(p))),
+            );
+            with(f, Key::Hseq, Some(Val::U(hseq)))
+        };
+        if self
+            .stream_compact
+            .as_ref()
+            .is_some_and(|(_, opener)| opener != holder)
+        {
+            self.end_stream_compact(at);
+        }
+        let open = self
+            .stream_compact
+            .take()
+            .map(|(node, _)| node)
+            .filter(|node| self.log.is_open(*node));
+        let node = match open {
+            Some(node) => Some(node),
+            None => {
+                let parent = self
+                    .agent
+                    .as_ref()
+                    .and_then(|a| a.tracker.turn())
+                    .or_else(|| self.stream_run());
+                self.stream_step_open(Kind::Compact, parent, fields(), holder, by, at)
+            }
+        };
+        let Some(node) = node else {
+            return false;
+        };
+        if done {
+            self.stream_step_close(node, fields(), holder, by, at)
+                .is_some()
+        } else {
+            self.stream_compact = Some((node, holder.to_string()));
+            true
+        }
+    }
+
+    /// THE STREAM NO LONGER FEEDS `compact` (its claim was released, lapsed, taken by another
+    /// claimant or renewed without `state`; a seamless update's successor closes a carried one
+    /// the same way as it adopts the log): a compact step its `started` opened and no `done`
+    /// closed has no one left to close it, so aterm closes it here, `out=passed src=aterm
+    /// conf=strong by=aterm holder=<who opened it>` (how the compaction went is not known).
+    /// An open step would otherwise take every later mark that names no node, and a later
+    /// claimant's `done` would close it as its own. Whether it closed one.
+    pub(crate) fn end_stream_compact(&mut self, at: Stamp) -> bool {
+        let Some((node, holder)) = self.stream_compact.take() else {
+            return false;
+        };
+        if !self.log.is_open(node) {
+            return false;
+        }
+        let Some(close) = Self::passed_stream_compact(&holder) else {
+            return false;
+        };
+        self.log.close(node, close, at).is_ok()
+    }
+
+    /// aterm's close of a `compact` step the stream opened once no stream feeds `compact`:
+    /// `out=passed src=aterm conf=strong by=aterm holder=<who opened it>`. Both ends of a feed
+    /// close with it: [`Self::end_stream_compact`], and a seamless update's successor adopting
+    /// a log that carries such a step open. None for a holder that is no ID.
+    pub(super) fn passed_stream_compact(holder: &str) -> Option<aterm_slog::Close> {
+        let fields = Fields::new().id(Key::Holder, holder).ok()?;
+        Some(
+            aterm_slog::Close::new(
+                aterm_slog::Out::Step(aterm_slog::StepOut::Passed),
+                Src::Aterm,
+                Conf::Strong,
+            )
+            .by(aterm_slog::Actor::Aterm)
+            .fields(fields),
+        )
+    }
+
+    /// `mark - usage h5=<pct> d7=<pct>`. It stands down, whole, while the claim's stream feeds
+    /// `usage`, whichever windows the record states: the stream's row is then the kind's one.
     pub(crate) fn observe_usage(&mut self, h5: Option<u32>, d7: Option<u32>, at: Stamp) {
+        if self.stream_down.usage {
+            return;
+        }
         let f = with(Fields::new(), Key::H5, h5.map(|p| Val::U(u64::from(p))));
         let f = with(f, Key::D7, d7.map(|p| Val::U(u64::from(p))));
         let _ = self.log.mark(

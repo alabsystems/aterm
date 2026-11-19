@@ -4,7 +4,7 @@
 //! Bounded frame acquisition shared by records transport and local-file recovery.
 //! Callers retain their own count, verification and recovery policies.
 
-use super::{MAX_RECORDS_STREAM, Reading, Record, Store};
+use super::{Reading, Record, Store};
 use crate::membership_log::{FRAME_PREFIX_LEN, RecordId};
 use crate::{Error, Result};
 #[cfg(any(unix, test))]
@@ -32,6 +32,9 @@ pub(crate) struct FrameReader {
     header: Zeroizing<Vec<u8>>,
     /// The layouts it frames ([`Reading`]).
     reading: Reading,
+    /// How many bytes of `header` the last read took before it refused them as no record's
+    /// prefix ([`Self::refused_prefix`]); 0 after any other read.
+    refused: usize,
 }
 
 /// A complete layout frame, with unverified parent identities from its header.
@@ -46,17 +49,22 @@ struct FrameWith<T> {
 }
 
 impl FrameReader {
-    /// A reader of the layouts a format-1 node reads ([`Reading::ONE`]).
-    pub(crate) fn new() -> Self {
-        Self::at(Reading::ONE)
-    }
-
     /// A reader of the layouts `reading` reads.
     pub(crate) fn at(reading: Reading) -> Self {
         Self {
             header: Zeroizing::new(vec![0; FRAME_PREFIX_LEN]),
             reading,
+            refused: 0,
         }
+    }
+
+    /// The bytes the last read took from its reader and refused as no record's prefix: fewer
+    /// than a prefix, or a prefix of no layout this reader frames. They are the first bytes of
+    /// whatever follows the records in the stream, which a reader that takes a served frame
+    /// there reads on from (`untaken::ReceivedFrames::read_at`). Empty after a read that
+    /// returned a frame, reached the end, or refused a frame past its prefix.
+    pub(crate) fn refused_prefix(&self) -> &[u8] {
+        &self.header[..self.refused]
     }
 
     pub(crate) fn read<R: Read + ?Sized>(
@@ -98,16 +106,23 @@ impl FrameReader {
         inspect: impl FnOnce(&[u8]) -> Result<(usize, T)>,
     ) -> std::result::Result<Option<FrameWith<T>>, FrameReadError> {
         let invalid = || FrameReadError::Invalid(Error::new("membership record is truncated"));
+        self.refused = 0;
         self.header.resize(FRAME_PREFIX_LEN, 0);
         let read = fill(reader, &mut self.header).map_err(FrameReadError::Read)?;
         if read == 0 {
             return Ok(None);
         }
         if read != self.header.len() {
+            self.refused = read;
             return Err(invalid());
         }
-        let header_len = Record::frame_header_len(&self.header, self.reading)
-            .map_err(FrameReadError::Invalid)?;
+        let header_len = match Record::frame_header_len(&self.header, self.reading) {
+            Ok(len) => len,
+            Err(refused) => {
+                self.refused = read;
+                return Err(FrameReadError::Invalid(refused));
+            }
+        };
         self.header.resize(header_len, 0);
         if fill(reader, &mut self.header[FRAME_PREFIX_LEN..]).map_err(FrameReadError::Read)?
             != header_len - FRAME_PREFIX_LEN
@@ -170,7 +185,8 @@ impl DecodedRecords {
 }
 
 impl Store {
-    /// Recover from a local-file reader's first [`MAX_RECORDS_STREAM`] bytes. I/O errors refuse the whole read;
+    /// Recover from the first bytes of a local-file reader that a store of this format holds
+    /// ([`Store::capacity`], the storage class of byte bound). I/O errors refuse the whole read;
     /// malformed record tails retain the same prefix as [`Store::recovering`], within this
     /// store's held budget of verified frames. Every byte of the capped prefix is consumed,
     /// including after recovery stops, for its complete digest.
@@ -179,11 +195,16 @@ impl Store {
         Ok(Self::read_records_bounded(reader, self.budgets.held, reading)?.apply(self))
     }
 
-    /// Read capped recovery input at the receiving store's explicit record limit. A server
-    /// finishes its whole-file length and descriptor checks before applying this batch.
+    /// Read capped recovery input at the receiving store's explicit record limit, each frame
+    /// as `reading` reads it (the format the receiving store's node reads its records at). A
+    /// server finishes its whole-file length and descriptor checks before applying this batch.
     #[cfg(any(unix, test))]
-    pub(crate) fn read_records(reader: impl Read, record_limit: usize) -> Result<DecodedRecords> {
-        Self::read_records_bounded(reader, record_limit, Reading::ONE)
+    pub(crate) fn read_records(
+        reader: impl Read,
+        record_limit: usize,
+        reading: Reading,
+    ) -> Result<DecodedRecords> {
+        Self::read_records_bounded(reader, record_limit, reading)
     }
 
     fn read_records_bounded(
@@ -191,7 +212,8 @@ impl Store {
         record_limit: usize,
         reading: Reading,
     ) -> Result<DecodedRecords> {
-        let mut reader = reader.take(MAX_RECORDS_STREAM as u64);
+        let capacity = reading.capacity();
+        let mut reader = reader.take(capacity as u64);
         let mut records = Vec::new();
         let mut strict = true;
         let mut frames = FrameReader::at(reading);
@@ -201,7 +223,7 @@ impl Store {
                     return Ok(DecodedRecords {
                         records,
                         strict,
-                        bytes_read: MAX_RECORDS_STREAM - reader.limit() as usize,
+                        bytes_read: capacity - reader.limit() as usize,
                     });
                 }
                 Ok(Some(frame)) => frame,
@@ -228,7 +250,7 @@ impl Store {
         Ok(DecodedRecords {
             records,
             strict,
-            bytes_read: MAX_RECORDS_STREAM - reader.limit() as usize,
+            bytes_read: capacity - reader.limit() as usize,
         })
     }
 }

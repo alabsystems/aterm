@@ -71,6 +71,13 @@ impl CpuPresenter for LinuxPresenter {
         }
     }
 
+    fn capture_submit_fence(&mut self) -> Result<Box<dyn super::SubmitFence>, String> {
+        match self {
+            Self::X11(p) => p.capture_submit_fence(),
+            Self::Wayland(p) => p.capture_submit_fence(),
+        }
+    }
+
     fn buffer_mut(&mut self) -> Result<Self::Buffer<'_>, Self::Error> {
         match self {
             Self::X11(p) => p
@@ -133,3 +140,154 @@ impl CpuFrameBuffer for LinuxFrame<'_> {
         }
     }
 }
+
+/// A capture's hang detector observes only its native display peer. GUI timers,
+/// this worker's polling and unrelated descendants cannot keep an idle peer alive.
+pub(super) struct SubmitProgress {
+    pid: u32,
+    birth: Option<u64>,
+    previous: Option<PeerWork>,
+    worked: std::time::Instant,
+    sampled: std::time::Instant,
+}
+
+#[derive(Clone, Copy)]
+struct PeerWork {
+    birth: u64,
+    counters: [u64; 9],
+}
+
+enum PeerReading {
+    Ended,
+    Unknown(Option<u64>),
+    Work(PeerWork),
+}
+
+impl SubmitProgress {
+    pub(super) fn new(fd: std::os::fd::RawFd) -> Result<Self, String> {
+        let pid = aterm_uds::fdpass::peer_pid_of_fd(fd)
+            .map_err(|error| format!("the display peer identity is unread: {error}"))?;
+        let now = std::time::Instant::now();
+        let mut progress = Self {
+            pid,
+            birth: None,
+            previous: None,
+            worked: now,
+            sampled: now,
+        };
+        progress.observe(peer_work(pid), now)?;
+        Ok(progress)
+    }
+
+    pub(super) fn check(&mut self) -> Result<(), String> {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.sampled) >= std::time::Duration::from_millis(500) {
+            self.observe(peer_work(self.pid), now)?;
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self, reading: PeerReading, now: std::time::Instant) -> Result<(), String> {
+        self.sampled = now;
+        let (birth, work) = match reading {
+            PeerReading::Ended => return Err("the display peer ended before confirmation".into()),
+            PeerReading::Unknown(birth) => (birth, None),
+            PeerReading::Work(work) => (Some(work.birth), Some(work)),
+        };
+        if let Some(birth) = birth {
+            if self.birth.is_some_and(|original| original != birth) {
+                return Err("the display peer identity changed before confirmation".into());
+            }
+            self.birth = Some(birth);
+        }
+        match (self.previous, work) {
+            (Some(before), Some(after))
+                if after
+                    .counters
+                    .iter()
+                    .zip(before.counters)
+                    .all(|(&new, old)| new >= old) =>
+            {
+                if after.counters != before.counters {
+                    self.worked = now;
+                }
+                if now.duration_since(self.worked) >= std::time::Duration::from_secs(60) {
+                    return Err("the display peer made no CPU or I/O progress for a minute".into());
+                }
+            }
+            // A missing or incomparable observation disarms the detector. The first
+            // later complete reading establishes a new baseline, never past idle time.
+            _ => self.worked = now,
+        }
+        self.previous = work;
+        Ok(())
+    }
+}
+
+fn peer_work(pid: u32) -> PeerReading {
+    fn stat(pid: u32) -> Result<Option<(u64, [u64; 2])>, std::io::Error> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let Some((owner, fields)) = text.rsplit_once(") ") else {
+            return Ok(None);
+        };
+        if !owner.starts_with(&format!("{pid} (")) {
+            return Ok(None);
+        }
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        Ok((|| {
+            Some((
+                fields.get(19)?.parse().ok()?,
+                [fields.get(11)?.parse().ok()?, fields.get(12)?.parse().ok()?],
+            ))
+        })())
+    }
+    fn read_stat(pid: u32) -> Result<(u64, [u64; 2]), PeerReading> {
+        match stat(pid) {
+            Ok(Some(value)) => Ok(value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(PeerReading::Ended),
+            _ => Err(PeerReading::Unknown(None)),
+        }
+    }
+    let (birth, _) = match read_stat(pid) {
+        Ok(stat) => stat,
+        Err(reading) => return reading,
+    };
+    let io = std::fs::read_to_string(format!("/proc/{pid}/io")).ok();
+    let counters = io.and_then(|text| {
+        let mut lines = text.lines();
+        let mut counters = [0; 9];
+        for (at, key) in [
+            "rchar:",
+            "wchar:",
+            "syscr:",
+            "syscw:",
+            "read_bytes:",
+            "write_bytes:",
+            "cancelled_write_bytes:",
+        ]
+        .iter()
+        .enumerate()
+        {
+            counters[at + 2] = lines.next()?.strip_prefix(key)?.trim().parse().ok()?;
+        }
+        lines.next().is_none().then_some(counters)
+    });
+    let (again, cpu) = match read_stat(pid) {
+        Ok(stat) => stat,
+        Err(reading) => return reading,
+    };
+    if birth != again {
+        return PeerReading::Unknown(Some(again));
+    }
+    match counters {
+        Some(mut counters) => {
+            counters[..2].copy_from_slice(&cpu);
+            PeerReading::Work(PeerWork { birth, counters })
+        }
+        None => PeerReading::Unknown(Some(birth)),
+    }
+}
+
+#[cfg(test)]
+#[path = "linux_tests.rs"]
+mod tests;

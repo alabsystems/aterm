@@ -924,7 +924,7 @@ fn a_separate_process_holds_custody_until_its_writer_ends() {
     assert!(!path.exists(), "closed child log is now eligible");
 }
 
-/// WHAT A RUN SAID BEFORE ITS LOG OPENED IS KEPT (`crate::turn::take` waits for the judgment turn
+/// WHAT A RUN SAID BEFORE ITS LOG OPENED IS KEPT (`crate::turn::Prepared::take` waits for the judgment turn
 /// before the log opens): a line written before the companion attached joins it once its first
 /// record, the `invocation-started` its pairing reads, is there, once, in the order written, and
 /// a later line follows it. NEGATIVE CONTROL: before `retain_early` the companion holds only its

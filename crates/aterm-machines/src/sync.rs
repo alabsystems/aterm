@@ -546,7 +546,8 @@ pub enum RequestsRead {
     /// Writer): why, and where its needs stand.
     Idle(String),
     /// A pass posts this Mac's needs, takes in the lab's answers and sweeps the other Macs'
-    /// requests: where its needs stand, in one line.
+    /// requests: where its needs stand, in one line (with the refusal the lab's table last gave
+    /// a pass for its capacity, where it stands: a pass runs all the same).
     Due(String),
 }
 
@@ -875,7 +876,9 @@ pub trait Ports: Sync {
     ///
     /// # Errors
     /// Either pass failed (the table or the ledger cannot be read or written), or a request's
-    /// copy or publication failed: the error says both passes.
+    /// copy or publication failed: the error says both passes. A table that refused an append
+    /// for its capacity is no error: the passes took in what needs no append, and the line says
+    /// the refusal (ATERM-KI-1116-3474).
     fn pass_requests(&self) -> Result<String, String>;
     /// `sync.shared-data`'s apply: the founding of the vault's Commons by its only admin, under
     /// the authority the admin already holds; what it did, naming each Mac it approved, or why it

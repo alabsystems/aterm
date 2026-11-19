@@ -365,6 +365,8 @@ pub(super) fn image_meta(
         session: None,
         want_bytes: true,
         want_metadata: true,
+        whole_client: false,
+        presentation: None,
         frame_metadata: std::sync::Arc::clone(&metadata),
         cancel: crate::control::CaptureCancellation::new(),
         reply,

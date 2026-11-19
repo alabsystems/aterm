@@ -154,6 +154,12 @@ fn spec_xref_closure() {
         aterm_update_core::update_record::UpdateRecord::confirm as *const (),
         aterm_update_core::update_record::update_hold_environment as fn(),
     ));
+    // aterm-evidence's `LoginEvidence` anchors on the ledger, and their waivers' host.
+    std::hint::black_box((
+        aterm_evidence::Ledger::<u8>::observe as *const (),
+        aterm_evidence::Ledger::<u8>::verdict as *const (),
+        aterm_evidence::login_evidence_environment as fn(),
+    ));
     // aterm-capacity's `CapacityCohort` waivers' host, beside its cohort ledger's anchors.
     #[cfg(unix)]
     std::hint::black_box(aterm_capacity::capacity_cohort_environment as fn());
@@ -499,13 +505,15 @@ fn spec_xref_closure() {
         );
     }
 
-    assert!(
-        report
-            .coverage
-            .iter()
-            .any(|coverage| coverage.machine == "NativeUpdateHold" && coverage.active),
-        "NativeUpdateHold must participate in source-to-model closure"
-    );
+    for machine in ["NativeUpdateHold", "LoginEvidence"] {
+        assert!(
+            report
+                .coverage
+                .iter()
+                .any(|coverage| coverage.machine == machine && coverage.active),
+            "{machine} must participate in source-to-model closure"
+        );
+    }
 
     eprintln!("spec_xref_closure: per-machine coverage ledger:");
     for c in &report.coverage {

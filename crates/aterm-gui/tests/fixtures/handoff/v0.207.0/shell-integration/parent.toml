@@ -1,0 +1,66 @@
+# What the v0.207.0 producer committed to for this desk. Written by the
+# release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.
+producer_version = "0.207.0"
+producer_commit = "ef072bbe1cfd"
+outgoing_build = 1795015478
+park_carry_ceiling = "full"
+manifest = "seamless-42424-00000000000000000000000001000005.toml"
+nonce = "00000000000000000000000001000005"
+dir_placeholder = "@HANDOFF_DIR@"
+screen_digest = "8b5c679a547c807d90ff106989686df56c01a6dad1ff9023942a9115c01b320e"
+layout_digest = "db3b8059ae8e124e882fce0180c7eb48bd03b7d0b0bad4789a88797f8b988cf5"
+proof_target_build = 1795101878
+proof_target_commit = "fedcba987654"
+proof_identities = [[0, 200, 40000], [1, 201, 40001]]
+proof_count = 2
+proof_digest = "9397bbe3e27ca3ef82d6cd3eb5e87376e5427d530beb30cf141ca81cefd44056"
+ready_wire = "41535231000000029397bbe3e27ca3ef82d6cd3eb5e87376e5427d530beb30cf141ca81cefd44056"
+commit_wire = "41534331000000029397bbe3e27ca3ef82d6cd3eb5e87376e5427d530beb30cf141ca81cefd44056"
+files = ["seamless-42424-00000000000000000000000001000005.layout.toml", "seamless-42424-00000000000000000000000001000005.s0.ctl", "seamless-42424-00000000000000000000000001000005.s0.grid", "seamless-42424-00000000000000000000000001000005.s1.altgrid", "seamless-42424-00000000000000000000000001000005.s1.ctl", "seamless-42424-00000000000000000000000001000005.s1.grid", "seamless-42424-00000000000000000000000001000005.toml"]
+
+[[session]]
+local_id = 0
+rows = 30
+cols = 100
+history_lines = 25
+alt_grid = false
+control = true
+require_shell_integration_nonce = true
+shell_integration_nonce = "9494949494949494949494949494949494949494949494949494949494949494"
+history_take = 0
+history_lost = 0
+fg_holder = 40000
+absolute_row_counter = 55
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 2
+shell_marks = 27
+shell_completed_seq = 27
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+
+[[session]]
+local_id = 1
+rows = 30
+cols = 99
+history_lines = 0
+alt_grid = true
+control = true
+require_shell_integration_nonce = true
+shell_integration_nonce = "4949494949494949494949494949494949494949494949494949494949494949"
+history_take = 0
+history_lost = 0
+fg_holder = 41001
+absolute_row_counter = 30
+alt_absolute_row_counter = 70
+color = false
+shell_phase = 2
+shell_marks = 34
+shell_completed_seq = 34
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+

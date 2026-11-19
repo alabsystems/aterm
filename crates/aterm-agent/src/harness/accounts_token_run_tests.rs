@@ -593,6 +593,61 @@ fn a_run_starts_nothing_where_its_fallback_is_a_login_this_mac_must_not_run() {
     drop(held);
 }
 
+/// A LINE ON THE LOGIN A RENEWAL BOUND ITS ROW TO IS SERVED THAT ROW'S TOKEN (m21: a relaunch types
+/// the wrapper on `D2`, the login row `work` was signed into on another Mac, which the roster file
+/// does not name, since a renewal binds a row only in this Mac's login records): the wrapper reads
+/// the roster as those records bind it ([`bound_roster_at`]), so `D2`, not made here, resolves to
+/// `work` and its token entry, and the token in use here is served. CONTROL: before the token is
+/// made, the run falls back `absent` and starts nothing, since `work`'s stored login is `D2`, never
+/// made here.
+///
+/// NEGATIVE CONTROL (2026-11-17, `bound_roster_at` reading the roster file unbound, as before;
+/// restored with cp from a backup, confirmed with cmp): `D2` resolves to no row, so the run with
+/// no token falls back as typed onto `D2`, and with the token in use it is not served.
+#[cfg(unix)]
+#[test]
+fn a_line_on_the_login_a_renewal_bound_its_row_to_is_served_that_rows_token() {
+    let lab = Lab::new();
+    let world = World::new();
+    let roster = world.path().join("config/accounts.toml");
+    std::fs::create_dir_all(roster.parent().expect("its folder")).expect("the config folder");
+    std::fs::write(&roster, ROSTER).expect("the roster");
+    let d2 = world.path().join("logins/work-elsewhere");
+    let d2 = d2.to_str().expect("utf-8");
+    world
+        .store()
+        .transact_logins(NOW, &mut None, |state, logins| {
+            Ok(accounts::note_renewed(
+                state, logins, "work", None, d2, None, NOW,
+            ))
+        })
+        .expect("work signed into D2");
+    let ctx = Ctx {
+        roster: bound_roster_at(&roster, &world.store(), NOW),
+        ..world.ctx(&[(accounts::LOGIN_ENV, d2)], Some(&lab))
+    };
+    let unserved = resolved(&world.run(None, &[]), &ctx);
+    assert_eq!(
+        unserved.decision,
+        Decision::Stored(Fallback::Absent),
+        "CONTROL"
+    );
+    let why = unserved
+        .unstored
+        .expect("CONTROL: the run starts nothing on D2");
+    assert!(
+        why.contains("work has no login on this Mac"),
+        "CONTROL: {why}"
+    );
+    crate::harness::journal::with_keyer(keyer, || mint(&lab));
+    let served = resolved(&world.run(None, &[]), &ctx);
+    let Decision::Token { entry: on, account } = &served.decision else {
+        panic!("{:?}", served.decision);
+    };
+    assert_eq!((*on, account.label.as_deref()), (entry(), Some("work")));
+    assert_eq!(refusal(&served, true), None, "its token is served");
+}
+
 /// THE VAULT: the lab's token decides `Token` for the account its record names, for `--auto` and
 /// every word that names the account (its key, its address, its provider word and address)
 /// alike; a roster label names no account, so a line typed with one runs as typed (`outside`)

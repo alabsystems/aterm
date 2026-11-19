@@ -293,7 +293,7 @@ fn end_after_unlinks(
 }
 
 /// `(pid, birth, sid)` of a FIFO's name, its sid an ID aterm minted
-/// ([`aterm_types::control_verbs::is_minted_sid`]: a tab ID, or the `s-` and 20 hex digits a
+/// ([`aterm_types::control_request::Sid`]: a tab ID, or the `s-` and 20 hex digits a
 /// shell opened before the `t` form holds, whose FIFOs an earlier build left).
 fn name_parts(name: &str) -> Option<(u32, u64, &str)> {
     let uint = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
@@ -302,7 +302,7 @@ fn name_parts(name: &str) -> Option<(u32, u64, &str)> {
     let birth = parts.next().filter(|s| uint(s))?.parse().ok()?;
     let sid = parts
         .next()
-        .filter(|sid| aterm_types::control_verbs::is_minted_sid(sid))?;
+        .filter(|sid| aterm_types::control_request::Sid::parse(sid).is_some())?;
     Some((pid, birth, sid))
 }
 

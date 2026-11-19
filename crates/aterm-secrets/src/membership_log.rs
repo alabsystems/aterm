@@ -76,6 +76,8 @@ pub mod entries;
 mod epochs;
 mod eval;
 mod fold;
+#[cfg(unix)]
+pub(crate) mod follow;
 pub mod genesis;
 #[cfg(any(unix, windows))]
 pub(crate) mod head;
@@ -87,6 +89,7 @@ pub mod rekey;
 pub mod rooted;
 pub mod served;
 pub mod store;
+pub(crate) mod stored;
 #[cfg(any(unix, windows))]
 pub(crate) mod untaken;
 
@@ -107,12 +110,15 @@ pub use payload::Payload;
 pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};
 pub use rooted::{Rooting, Stub};
 pub use served::Served;
+/// A vault pruned at a final checkpoint, for the tests of the modules that take its roots.
+#[cfg(test)]
+pub(crate) use served::tests::{PrunedVault, pruned_vault};
 #[cfg(any(unix, windows))]
-pub(crate) use store::decode_records_before_cut;
+pub(crate) use store::decode_records_before_cut_in;
 #[cfg(test)]
 pub(crate) use store::encode_records;
 pub use store::{
-    MAX_RECORDS_STREAM, MemberVerdict, Store, Written, decode_records, decode_records_bounded,
+    MemberVerdict, REPLY_CAP, Store, Written, decode_records, decode_records_bounded,
     decode_records_in, decode_reply, on_written, read_records, read_reply,
 };
 
@@ -301,6 +307,48 @@ impl Default for Reading {
 impl Reading {
     /// What every node of this build reads: no build stores a format mark yet.
     pub const ONE: Self = Self::Format(crate::crossing::FORMAT_ONE);
+
+    /// The most bytes of records the store of a node of this build holds, whichever format
+    /// its mark names: what a site with no store at hand holds its own bound to (the class
+    /// stops a Mac authors within, a held draft's file, the writes that wait for a key, the
+    /// most a store's footprint reaches). It is one number because a store of every format
+    /// this build reads holds one reply's bytes ([`crate::crossing::FORMAT_TWO_BYTES`]), which
+    /// the build checks here: a capacity past a reply (tracker FL-249) stops the build at
+    /// this constant, and each site that names it then takes its own store's reading
+    /// ([`Reading::capacity`]) in place of it.
+    pub const STORE_BYTES: usize = {
+        assert!(
+            Self::ONE.capacity() == Self::Format(crate::crossing::FORMAT_TWO).capacity()
+                && Self::ONE.capacity() == Self::Follow.capacity(),
+            "a site that names Reading::STORE_BYTES has no store at hand: once two formats' \
+             capacities differ it must read its own store's"
+        );
+        Self::ONE.capacity()
+    };
+
+    /// The most bytes of records a store read at this format holds: the storage class of byte
+    /// bound ([`crate::crossing::capacity`], the one accessor a later change, tracker FL-249,
+    /// raises), as a length in memory. A follow copy holds a format-2 peer's records, so its
+    /// capacity is format 2's. The other class is the wire's ([`REPLY_CAP`], one reply), which
+    /// does not change with a format.
+    ///
+    /// A site that has a store, a log or the Mac's format mark at hand reads the capacity of
+    /// that store's own format ([`Store::capacity`], [`Log::capacity`],
+    /// [`crate::crossing::capacity`] of the mark's format). A site with none at hand names
+    /// [`Reading::STORE_BYTES`].
+    #[must_use]
+    pub const fn capacity(self) -> usize {
+        let format = match self {
+            Self::Format(format) => format,
+            Self::Follow => crate::crossing::FORMAT_TWO,
+        };
+        let bytes = crate::crossing::capacity(format);
+        if bytes > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            bytes as usize
+        }
+    }
 
     /// Whether this reader reads record version 2 and the `Checkpoint` kind.
     #[must_use]
@@ -1234,7 +1282,7 @@ impl Record {
     /// Whether `wire` is the start of one record and no more: bytes a record's frame begins with
     /// (its magic and a version `reading` reads, a kind its layout carries, a parent count and the
     /// lengths it frames), stopping short of that frame's end. What an append of whole records
-    /// leaves on the end of a file when it is cut short ([`store::decode_records_before_cut`]);
+    /// leaves on the end of a file when it is cut short ([`store::decode_records_before_cut_in`]);
     /// nothing else is: no bytes at all, a whole frame, or bytes no frame `reading` reads begins
     /// with.
     #[cfg(any(unix, windows, test))]
@@ -1706,9 +1754,9 @@ pub(crate) fn whole_id(wire: &[u8]) -> Option<RecordId> {
     if len != wire.len() {
         return None;
     }
-    match wire.get(MAGIC.len())? {
-        &VERSION => Some(digest(wire)),
-        &VERSION_TWO => {
+    match *wire.get(MAGIC.len())? {
+        VERSION => Some(digest(wire)),
+        VERSION_TWO => {
             let (_, count, _) = Record::frame_prefix_reader(wire, Reading::Follow).ok()?;
             let lens = header_len(count, VERSION_TWO) - 8;
             let clear = usize::try_from(u32::from_be_bytes(
@@ -1728,6 +1776,18 @@ pub(crate) fn whole_id(wire: &[u8]) -> Option<RecordId> {
         }
         _ => None,
     }
+}
+
+/// The id of the record whose every byte `wire` holds ([`Record::id`]), read off the bytes
+/// with no signature checked: the same for a version-2 record whole and shed, so a consumer
+/// that keeps a place in the records by the last one it passed finds that record again after
+/// a rewrite shed its ciphertext (the mesh egress's members cursor). `None` for bytes no
+/// layout frames or whose ciphertext is not the one signed. It verifies nothing else:
+/// [`Record::decode_in`] is what admits a record.
+#[cfg(any(unix, windows))]
+#[must_use]
+pub fn record_id(wire: &[u8]) -> Option<RecordId> {
+    whole_id(wire)
 }
 
 /// A version-2 record's clear fields and ciphertext, as [`VERSION_TWO`] lays them out: for a
@@ -2384,6 +2444,12 @@ pub struct Log {
     waiting_bytes: usize,
     /// The budgets `order` stays within, fixed when the log was made.
     budgets: RecordBudgets,
+    /// The format of the store this log is the log of, whose byte capacity
+    /// ([`Reading::capacity`]) its records, waiting records and stubs stay within
+    /// ([`Log::capacity`]): [`Reading::ONE`] unless a store that reads a later format made it
+    /// ([`Store::read_at`]), and carried by every log made from this one. It bounds bytes
+    /// alone: which records a log takes is decided where their bytes are read, never here.
+    stored_at: Reading,
     /// How many of `order`'s records count against each budget, kept by [`Log::hold`].
     counts: RecordCounts,
     enforce_seats: bool,
@@ -2538,6 +2604,7 @@ impl Log {
             shed: 0,
             waiting_bytes: 0,
             budgets: RecordBudgets::current(),
+            stored_at: Reading::ONE,
             counts,
             enforce_seats: false,
             reach,
@@ -2574,6 +2641,7 @@ impl Log {
             .ok_or_else(|| Error::new("membership projection has no genesis"))?;
         let mut projected = Self::new(first)?;
         projected.budgets = self.budgets;
+        projected.stored_at = self.stored_at;
         projected.enforce_seats = self.enforce_seats;
         projected.head.clone_from(&self.head);
         // A rooted log's projection keeps the stubs in the heads' past, and the dropped heads
@@ -2712,7 +2780,15 @@ impl Log {
             more,
             self.held_bytes.saturating_add(self.stub_bytes),
             more_bytes,
+            budgets::held_bytes_within(self.stored_at),
         )
+    }
+    /// The most bytes its records, waiting records and stubs take in all: the capacity of the
+    /// store it is the log of ([`Reading::capacity`], the storage class of byte bound), which
+    /// a records file of it is read back within. One reply's bytes at format 1, as ever.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.stored_at.capacity()
     }
     /// The records no record follows, sorted: held ones, and in a rooted log each dropped record
     /// nothing held or dropped follows ([`rooted`]), as the whole log's heads are.
@@ -2872,9 +2948,9 @@ impl Log {
     /// seat in the record's causal past, or, for a record whose parents are missing, no seat in
     /// the held log. It also fails, as [`crate::ErrorKind::MembershipCapacity`], when holding the
     /// record would pass one of the log's budgets ([`Log::passed_by`]: its held total, the
-    /// budget of the record's kind, [`Kind::weighed`] or not, or [`MAX_RECORDS_STREAM`] bytes),
-    /// or when keeping it waiting would pass [`MAX_WAITING`] waiting records or make the log's
-    /// wire bytes exceed [`MAX_RECORDS_STREAM`].
+    /// budget of the record's kind, [`Kind::weighed`] or not, or its byte bound), or when
+    /// keeping it waiting would pass [`MAX_WAITING`] waiting records or make the log's wire
+    /// bytes exceed its store's capacity ([`Log::capacity`]).
     #[cfg_attr(
         all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
@@ -2976,7 +3052,7 @@ impl Log {
                 ));
             }
             if self.waiting.len() >= MAX_WAITING
-                || self.total_bytes().saturating_add(record.wire_len()) > MAX_RECORDS_STREAM
+                || self.total_bytes().saturating_add(record.wire_len()) > self.capacity()
             {
                 return Err(Error::of_kind(
                     crate::ErrorKind::MembershipCapacity,
@@ -3449,11 +3525,12 @@ impl Log {
                 seats,
             }
         });
+        let bound = budgets::held_bytes_within(self.stored_at);
         budgets::Fill {
             bytes: self.held_bytes.saturating_add(self.stub_bytes),
-            bound: budgets::held_bytes_bound(),
+            bound,
             by_kind,
-            stops: budgets::Class::ALL.map(budgets::author_stop),
+            stops: budgets::Class::ALL.map(|class| class.stop_within(bound)),
             signed,
         }
     }
@@ -3647,6 +3724,7 @@ impl Log {
             Arc::make_mut(&mut self.order)[at] = whole.clone();
             return true;
         }
+        let capacity = self.capacity();
         let Some(frame) = self.waiting.get_mut(&whole.id) else {
             return false;
         };
@@ -3659,7 +3737,7 @@ impl Log {
             .saturating_add(self.waiting_bytes)
             .saturating_add(self.stub_bytes)
             .saturating_add(more)
-            > MAX_RECORDS_STREAM
+            > capacity
         {
             return false;
         }

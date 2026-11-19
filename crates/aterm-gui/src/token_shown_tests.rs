@@ -212,7 +212,7 @@ fn a_view_becomes_facts_and_records_its_offer_once() {
     let word = named.word();
     let account = AccountToken {
         key: KEY.into(),
-        email: "person@example.com".into(),
+        email: Some("person@example.com".into()),
         label: Some("work".into()),
         named,
         word: word.clone(),
@@ -296,7 +296,7 @@ fn a_held_token_step_is_in_the_accounts_fact() {
     let dir = crate::test_scratch::short_dir("token-step");
     let account = |key: &str, label: &str| AccountToken {
         key: key.into(),
-        email: format!("{label}@example.com"),
+        email: Some(format!("{label}@example.com")),
         label: Some(label.into()),
         named: aterm_agent::harness::account_names::Named {
             pk: key.into(),
@@ -346,8 +346,8 @@ fn a_held_token_step_is_in_the_accounts_fact() {
 }
 
 /// A fact keeps what the view typed of a token this Mac's table holds: its dates, the Mac that
-/// made it, its verification, the peers of the last fleet read, the login half and the vault
-/// column, so a surface words them itself.
+/// made it, its verification, the login half and the vault column, so a surface words them
+/// itself.
 #[cfg(unix)]
 #[test]
 fn a_fact_keeps_the_views_typed_fields() {
@@ -356,7 +356,7 @@ fn a_fact_keeps_the_views_typed_fields() {
     let dir = crate::test_scratch::short_dir("token-typed");
     let account = AccountToken {
         key: KEY.into(),
-        email: "person@example.com".into(),
+        email: Some("person@example.com".into()),
         label: Some("work".into()),
         named: aterm_agent::harness::accounts_token_view::named_by_key(
             &aterm_secrets::claude_token::Key::parse(KEY).expect("a key"),
@@ -369,7 +369,6 @@ fn a_fact_keeps_the_views_typed_fields() {
         standing: None,
         row: Some(TokenRow {
             key: KEY.into(),
-            email: "person@example.com".into(),
             account_id: None,
             label: Some("work".into()),
             entry: String::new(),
@@ -381,11 +380,7 @@ fn a_fact_keeps_the_views_typed_fields() {
             verified: Some(1_500),
             verification: Verification::default(),
             vault: InVault::SignedHere,
-            used_on: UsedOn {
-                peers: vec!["m22".into()],
-                peers_read_at: Some(2_000),
-                ..UsedOn::default()
-            },
+            used_on: UsedOn::default(),
             removed_at: None,
         }),
         pending: Some(false),
@@ -413,8 +408,6 @@ fn a_fact_keeps_the_views_typed_fields() {
     );
     assert!(!shown.logged_in);
     assert_eq!(shown.vault_words, account.vault_words());
-    assert_eq!(shown.peers, ["m22"]);
-    assert_eq!(shown.peers_read_at, Some(2_000));
     assert_eq!(
         shown.verified_on, None,
         "the vault not read: the row's own time, naming no Mac"

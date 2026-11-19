@@ -36,7 +36,7 @@ pub(super) fn read() -> [Option<Observation>; 5] {
     #[cfg(target_os = "macos")]
     let network_helper = network_helper(aterm_uds::lan::broker::installed_hello(), || {
         aterm_uds::lan::install::owed_here(
-            || aterm_secrets::service::system_job_running(aterm_uds::lan::LABEL),
+            || aterm_secrets::service::system_job_state(aterm_uds::lan::LABEL),
             || aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL),
         )
     });
@@ -105,9 +105,70 @@ pub(super) fn network_helper(
     row(Access::NetworkHelper, result)
 }
 
+/// The Spotlight indexing row (FL-188) from FL-127's `state` and the person's pause `record`
+/// (System Resources ▸ Spotlight, SD-96): Paused by you where indexing is off and the record says
+/// they paused it ([`aterm_types::macos_setup::spotlight_paused`]: theirs until they resume it,
+/// the reading just made being after the pause); Off where indexing is off by anyone else's
+/// hand (left as found); the scope where the receipt names every folder; Needs
+/// your password only while setup's automatic ask owes it (`asks`, Mac Setup asks). Folders an
+/// apply already failed to keep out (`refused`) and folders made since read in place, as FL-127's
+/// rule has it (a folder made since is work a person's request does, not a Mac left unfinished):
+/// nothing automatic waits on them, so the row names them and who keeps them out, and setup
+/// neither waits nor asks.
+pub(super) fn spotlight(
+    state: &aterm_types::macos_setup::spotlight_scope::State,
+    asks: bool,
+    refused: &std::collections::BTreeSet<std::path::PathBuf>,
+    record: Option<&aterm_types::macos_setup::spotlight_scope::PauseRecord>,
+) -> (Standing, String, Option<String>) {
+    use aterm_types::macos_setup::spotlight_scope::{State, owed_of};
+    use aterm_types::macos_setup::{
+        SPOTLIGHT_OFF, SPOTLIGHT_OWED, SPOTLIGHT_SCOPED, spotlight_newcomers, spotlight_paused,
+        spotlight_refused,
+    };
+    if let Some((now, note)) = spotlight_paused(record, *state == State::Disabled) {
+        return (Standing::InPlace, now.to_owned(), Some(note));
+    }
+    let names = |paths: &std::collections::BTreeSet<std::path::PathBuf>| {
+        paths
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match state {
+        State::Disabled => (Standing::InPlace, SPOTLIGHT_OFF.into(), None),
+        State::Scoped(_) => (Standing::InPlace, SPOTLIGHT_SCOPED.into(), None),
+        State::Indexed { folders, .. } if !owed_of(folders, refused) => (
+            Standing::InPlace,
+            spotlight_refused(folders.len()),
+            Some(format!(
+                "Setup could not keep these out: {}. It asks no password again for them; its administrator step tries them again whenever it next runs for another step.",
+                names(folders)
+            )),
+        ),
+        State::Indexed { folders, .. } if asks => (
+            Standing::NeedsYou,
+            SPOTLIGHT_OWED.into(),
+            Some(format!(
+                "Your Mac password is required to exclude: {}. Applications, Documents, Desktop and synced drives stay searchable. Completed exclusions are not requested again.",
+                names(folders)
+            )),
+        ),
+        State::Indexed { folders, .. } => (
+            Standing::InPlace,
+            spotlight_newcomers(folders.len()),
+            Some(format!(
+                "Made since setup scoped Spotlight: {}. Setup asks no password for folders made since; Apply in System Resources, or your own `aterm init`, keeps them out.",
+                names(folders)
+            )),
+        ),
+    }
+}
+
 fn read_one(access: Access) -> Result<(Standing, String, Option<String>), String> {
     use aterm_machines::root_steps::{self, NameRuleReading};
-    use aterm_types::macos_setup::spotlight_scope::{self, State};
+    use aterm_types::macos_setup::spotlight_scope;
     let ready = |word: &str| Ok((Standing::InPlace, word.to_owned(), None));
     let needs = |word: &str, why: String| Ok((Standing::NeedsYou, word.to_owned(), Some(why)));
     match access {
@@ -118,6 +179,11 @@ fn read_one(access: Access) -> Result<(Standing, String, Option<String>), String
             let sys = aterm_machines::port::Live::new();
             match root_steps::name_rule_reading(&sys)? {
                 NameRuleReading::Current => ready("Installed"),
+                NameRuleReading::Removed => Ok((
+                    Standing::NotNeeded,
+                    "Removed".into(),
+                    Some("You removed setup's naming permission; the name menu's permission repair or `aterm init` puts it back.".into()),
+                )),
                 _ => needs("Setup incomplete", "Your Mac password is required to install the permission that lets aterm set this Mac's network name.".into()),
             }
         }
@@ -130,21 +196,14 @@ fn read_one(access: Access) -> Result<(Standing, String, Option<String>), String
             let home = live
                 .home()
                 .ok_or("The account's home folder could not be read")?;
-            match spotlight_scope::state(&live, &home)? {
-                State::Disabled => ready("Indexing disabled"),
-                State::Scoped(_) => ready("Excluded"),
-                State::Indexed(paths) => needs(
-                    "Folders still indexed",
-                    format!(
-                        "Your Mac password is required to exclude: {}. Documents, Desktop, Library and Applications stay searchable. Completed exclusions are not requested again.",
-                        paths
-                            .iter()
-                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                ),
-            }
+            let state = spotlight_scope::state(&live, &home)?;
+            let asks = spotlight_scope::console_account(&live)
+                && spotlight_scope::automatic_owed_of(&live, &home, &state);
+            let refused =
+                spotlight_scope::listed(&live, spotlight_scope::REFUSED).unwrap_or_default();
+            let record =
+                aterm_types::dirs::state_dir().and_then(|dir| spotlight_scope::read_pause(&dir));
+            Ok(spotlight(&state, asks, &refused, record.as_ref()))
         }
         Access::NetworkAuth => {
             use aterm_secrets::client::{self, Membership, Paths};

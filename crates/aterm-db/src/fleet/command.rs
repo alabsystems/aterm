@@ -44,7 +44,10 @@ pub const USAGE: &str = "aterm db fleet — machines, AI accounts and agents as 
                  Facts and their provenance: w5h/w7d figures (w5h_at, w5h_by, ...), a\n\
                  standing limit (wall_at, wall_by), last_use (last_use_on), plan_observed\n\
                  (plan_at, plan_by), observed (observed_at, observed_by), last_seen\n\
-                 (last_seen_by). A machine no registry row binds is named by 8 hex digits\n\
+                 (last_seen_by). A machine no registry row binds is named by 8 hex digits.\n\
+                 walled is a limit every session meets; a model's own weekly limit (Fable,\n\
+                 Opus, Sonnet) walls that model's sessions alone and is in model_walls, by\n\
+                 its bucket, with its end and when and by which machine it was hit\n\
   agents   [--where col=val]... [--tsv|--json]\n\
                  every agent session a fleet read sighted, by machine and session\n\
   schema   [machines|accounts|agents] [--tsv|--json]\n\

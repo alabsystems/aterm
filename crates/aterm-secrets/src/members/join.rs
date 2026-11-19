@@ -44,6 +44,7 @@ pub trait Preparation: Send + Sync {
 /// Create a preparation for one address under the caller's captured route policy.
 pub type Prepare<'a> = dyn Fn(&str) -> Result<Box<dyn Preparation + 'a>> + Sync + 'a;
 
+#[derive(Clone, Copy)]
 enum Attempts<'r, 'p> {
     Sequential(&'r Dial<'p>),
     Prepared {
@@ -413,6 +414,12 @@ impl std::fmt::Display for PhraseFailed {
 /// phrase with it again [`BUSY_AGAIN_AFTER`] after each busy answer while the phrase can live
 /// (from a member that names no life, the phrase's whole lifetime from now).
 ///
+/// A member whose membership records are in a later format than this Mac stated answers so
+/// before its run touches the phrase ([`crate::ErrorKind::LaterFormat`]): a Mac whose build
+/// reads that format runs the same phrase with it once more, stating that format
+/// (`client::later_records_bound`), and takes its bundle on the evidence its records hold
+/// (`crate::membership_log::follow`). Every other Mac fails as it did, having asked once.
+///
 /// # Errors
 /// [`PhraseFailed::Unsent`]: no member fits, the member could not be reached or changed since it
 /// was asked, the run could not start, or the member stayed busy until the phrase lapsed.
@@ -437,9 +444,26 @@ pub fn run_phrase(
     };
     let mut until = std::time::Instant::now() + lives;
     let mut said = false;
+    // This Mac as it asks again a member that refused it for its later records format.
+    let mut later: Option<Joining<'_>> = None;
     let (greeting, bundle) = loop {
         let mut left = None;
-        match run_once(paths, dial, joining, chosen, phrase, &mut left) {
+        let asking = later.as_ref().unwrap_or(joining);
+        match run_once(paths, dial, asking, chosen, phrase, &mut left) {
+            Err(PhraseFailed::Sent(error))
+                if error.kind() == crate::ErrorKind::LaterFormat && later.is_none() =>
+            {
+                let Some(bound) = client::later_records_bound(paths, joining.records_bound) else {
+                    return Err(PhraseFailed::Sent(error));
+                };
+                later = Some(Joining {
+                    device: joining.device,
+                    records_bound: bound,
+                    node: joining.node,
+                    name: joining.name.clone(),
+                    model: joining.model.clone(),
+                });
+            }
             Err(PhraseFailed::Unsent(error)) if error.kind() == crate::ErrorKind::MemberBusy => {
                 let now = std::time::Instant::now();
                 if let Some(left) = left {
@@ -467,7 +491,8 @@ pub fn run_phrase(
             ran => break ran?,
         }
     };
-    written(paths, dial, joining, heard, chosen, greeting, bundle).map_err(PhraseFailed::Sent)
+    let asked = later.as_ref().unwrap_or(joining);
+    written(paths, dial, asked, heard, chosen, greeting, bundle).map_err(PhraseFailed::Sent)
 }
 
 /// How long a joining Mac waits after a busy answer before it asks that member again
@@ -641,6 +666,12 @@ impl ProofAdmission<'_> {
 /// Mac back into its own vault, and only a person's phrase moves it to another. Where none let it
 /// in, why each refused, by address: this Mac then asks a person as before.
 ///
+/// A member whose membership records are in a later format than this Mac stated refuses before
+/// its possession challenge and names its format ([`crate::ErrorKind::LaterFormat`]). Where no
+/// member let this Mac in and none may have signed, a Mac whose build reads that format proves
+/// itself to the members once more, stating it (`client::later_records_bound`); every other
+/// Mac has asked each member once.
+///
 /// # Errors
 /// No member let it in ([`Missed`]).
 pub fn prove_first(
@@ -708,6 +739,14 @@ pub fn prove_first_prepared_admitted(
     )
 }
 
+/// [`prove_round`], and once more where a member refused this Mac for its later records format.
+/// A member whose membership records are in a later format than this Mac stated says so before
+/// its possession challenge ([`crate::ErrorKind::LaterFormat`]), while this Mac has sent
+/// nothing a member could sign on. Where no member let it in, none may have signed, and this
+/// Mac's build reads that format (`client::later_records_bound`), it proves itself to the
+/// members once more, stating that format, and takes the bundle on the evidence its records
+/// hold (`crate::membership_log::follow`). Every other Mac fails as it did, having asked each
+/// member once.
 fn prove_first_with(
     paths: &Paths,
     attempts: Attempts<'_, '_>,
@@ -715,6 +754,52 @@ fn prove_first_with(
     sign_node: joiner::SignNode<'_>,
     ats: &[String],
     admission: Option<&ProofAdmission<'_>>,
+) -> std::result::Result<Joined, Missed> {
+    let (ended, later) = prove_round(paths, attempts, joining, sign_node, ats, admission);
+    let missed = match ended {
+        Ok(joined) => return Ok(joined),
+        Err(missed) => missed,
+    };
+    if !later || missed.signed_maybe {
+        return Err(missed);
+    }
+    let Some(bound) = client::later_records_bound(paths, joining.records_bound) else {
+        return Err(missed);
+    };
+    let restated = Joining {
+        device: joining.device,
+        records_bound: bound,
+        node: joining.node,
+        name: joining.name.clone(),
+        model: joining.model.clone(),
+    };
+    prove_round(paths, attempts, &restated, sign_node, ats, admission).0
+}
+
+/// One round of [`prove_first`]: each member of `ats` asked once, in address order. Beside its
+/// end, whether a member refused this Mac for its later records format before the Mac sent its
+/// possession answer.
+fn prove_round(
+    paths: &Paths,
+    attempts: Attempts<'_, '_>,
+    joining: &Joining<'_>,
+    sign_node: joiner::SignNode<'_>,
+    ats: &[String],
+    admission: Option<&ProofAdmission<'_>>,
+) -> (std::result::Result<Joined, Missed>, bool) {
+    let later = std::cell::Cell::new(false);
+    let ended = prove_round_with(paths, attempts, joining, sign_node, ats, admission, &later);
+    (ended, later.get())
+}
+
+fn prove_round_with(
+    paths: &Paths,
+    attempts: Attempts<'_, '_>,
+    joining: &Joining<'_>,
+    sign_node: joiner::SignNode<'_>,
+    ats: &[String],
+    admission: Option<&ProofAdmission<'_>>,
+    later: &std::cell::Cell<bool>,
 ) -> std::result::Result<Joined, Missed> {
     let missed = |why: String, signed_maybe| Missed {
         refused: vec![("automatic admission".into(), why)],
@@ -836,6 +921,9 @@ fn prove_first_with(
                 match tried {
                     Ok(joined) => return Ok(joined),
                     Err(error) => {
+                        if !sent && error.kind() == crate::ErrorKind::LaterFormat {
+                            later.set(true);
+                        }
                         missed.push((at.clone(), error.to_string()));
                         if sent {
                             return Err(Missed {

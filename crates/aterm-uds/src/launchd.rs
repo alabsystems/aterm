@@ -24,6 +24,18 @@ pub enum JobSwitch {
     Unlisted,
 }
 
+/// What launchd holds of a job, as `launchctl print <domain>/<label>` says (a read that failed or
+/// timed out says nothing, and is no state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobState {
+    /// Loaded, with a pid: it runs.
+    Running,
+    /// Loaded with no pid: stopped, or between two of launchd's starts of a `KeepAlive` job.
+    Idle,
+    /// Not loaded at all (`launchctl print`'s exit 113).
+    Unloaded,
+}
+
 /// The switch `launchctl print-disabled <domain>`'s `text` lists for the job `label`: its row of
 /// the `disabled services = {` block. A row of any other block (`login item associations` names
 /// jobs too) is not the job's switch.
@@ -60,6 +72,97 @@ pub fn job_switch_in(text: &str, label: &str) -> Result<JobSwitch, String> {
         };
     }
     Err("launchctl print-disabled's service list ends before its close".to_owned())
+}
+
+/// Whether an exact `launchctl print TARGET` description records a completed direct job.
+/// This is a pure data projection, not custody, signal authority or descendant closure. The
+/// caller must separately establish the command's successful exit and its ownership of TARGET.
+///
+/// # Errors
+/// The description names another target, is incomplete, omits or repeats a required field, or
+/// has an unreadable run count or PID. Nested fields cannot answer for the top-level job.
+pub fn job_ended_in(target: &str, text: &str) -> Result<bool, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if target.is_empty()
+        || target.chars().any(char::is_whitespace)
+        || lines.first().map(|line| line.trim()) != Some(format!("{target} = {{").as_str())
+    {
+        return Err("launchctl print has no description of the exact target".into());
+    }
+    let last = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .ok_or("launchctl print has no target block")?;
+    let mut state = None;
+    let mut runs = None;
+    let mut pid = None;
+    let mut depth = 1_u32;
+    for (index, line) in lines.into_iter().enumerate().skip(1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "}" {
+            depth = depth
+                .checked_sub(1)
+                .ok_or("launchctl print has an extra block close")?;
+            if depth == 0 && index != last {
+                return Err("launchctl print has data after its target block".into());
+            }
+            continue;
+        }
+        if depth == 0 || !line.starts_with('\t') {
+            return Err("launchctl print has data outside its target block".into());
+        }
+        if depth == 1
+            && let Some(top) = line
+                .strip_prefix('\t')
+                .filter(|line| !line.starts_with('\t'))
+            && let Some((key, value)) = top.split_once(" = ")
+        {
+            match key {
+                "state" if state.is_none() => state = Some(value.trim()),
+                "runs" if runs.is_none() => {
+                    runs = Some(
+                        value
+                            .trim()
+                            .parse::<u64>()
+                            .map_err(|_| "launchctl print has an unreadable run count")?,
+                    )
+                }
+                "pid" if pid.is_none() => {
+                    pid = Some(
+                        value
+                            .trim()
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|pid| *pid > 1)
+                            .ok_or("launchctl print has an unreadable PID")?,
+                    )
+                }
+                "state" | "runs" | "pid" => {
+                    return Err("launchctl print repeats a job field".into());
+                }
+                _ => {}
+            }
+        }
+        // launchctl's structural block headers end in ` = {`. Braces in ordinary values
+        // (quoted strings included) are not structure and cannot change field depth.
+        if trimmed
+            .split_once(" = ")
+            .is_some_and(|(key, value)| !key.is_empty() && value == "{")
+        {
+            depth = depth
+                .checked_add(1)
+                .ok_or("launchctl print block depth overflows")?;
+        }
+    }
+    if depth != 0 {
+        return Err("launchctl print ends before its target blocks close".into());
+    }
+    let state = state.ok_or("launchctl print omits job state")?;
+    let runs = runs.ok_or("launchctl print omits run count")?;
+    Ok(state == "not running" && runs > 0 && pid.is_none())
 }
 
 /// Whether launchd lists the system LaunchDaemon `label` switched off (`launchctl print-disabled

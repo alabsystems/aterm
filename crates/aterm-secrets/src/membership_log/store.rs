@@ -27,14 +27,20 @@ mod writer_tests;
 #[path = "store/classified_tests.rs"]
 pub(crate) mod classified_tests;
 
-/// Largest concatenated record stream [`decode_records`] reads (`64 MiB`).
-pub const MAX_RECORDS_STREAM: usize = 64 * 1024 * 1024;
-
-/// The most bytes of records one reply carries ([`Store::missing`]): the wire cap, which every
-/// reader of a records stream holds a stream to. A store of format 1 holds no more than this in
-/// all ([`Store::insert`]), so today every reply is whole; once a store's own byte capacity is
-/// larger (tracker FL-148), a reply is a causally closed prefix and the puller asks again.
-pub const REPLY_CAP: usize = MAX_RECORDS_STREAM;
+/// The most bytes of records one reply or stream carries (`64 MiB`): the wire class of byte
+/// bound, the one name every bound on what crosses between two nodes at once reads (a pull's
+/// answer, a POST's body, a join bundle's records, a member's authority witness, an `atdb/4`
+/// seat witness). Every build since 0.146 holds a records stream to this value, so it does not
+/// change with a format.
+///
+/// The other class is what a store may hold, which is its format's
+/// ([`crate::crossing::capacity`], [`Reading::capacity`]): a records file, a log's byte bound,
+/// everything read from or kept on this Mac's disk. The two are equal by value in this build
+/// ([`crate::crossing::FORMAT_TWO_BYTES`]), and a format-1 store's is this value for good, so
+/// today every reply is whole; once a store's capacity is larger (tracker FL-249), a reply is
+/// a causally closed prefix and the puller asks again. No bound reads `64 MiB` by any other
+/// name.
+pub const REPLY_CAP: usize = 64 * 1024 * 1024;
 
 /// What a peer lacks of a store, as one reply carries it ([`Store::missing`]).
 #[derive(Clone, Debug, Default)]
@@ -94,14 +100,14 @@ pub fn read_reply(missing: &Missing) -> std::io::Result<Vec<u8>> {
 /// read only as its last, and each record as [`decode_records_in`] reads it.
 ///
 /// # Errors
-/// As [`decode_records_in`] over the records, or the served frame fails
-/// [`super::Served::decode`].
+/// `bytes` exceeds one reply's ([`REPLY_CAP`]); as [`decode_records_in`] over the records; or
+/// the served frame fails [`super::Served::decode`].
 pub fn decode_reply(
     bytes: &[u8],
     record_limit: usize,
     reading: Reading,
 ) -> Result<(Vec<Record>, Option<super::Served>)> {
-    if bytes.len() > MAX_RECORDS_STREAM {
+    if bytes.len() > REPLY_CAP {
         return Err(Error::new("membership record stream is too large"));
     }
     let mut at = 0usize;
@@ -128,8 +134,9 @@ pub fn decode_reply(
 /// truncated, malformed, oversized or fails signature verification.
 ///
 /// # Errors
-/// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_HELD_RECORDS`] records, or
-/// contains a malformed or invalidly signed record.
+/// `bytes` exceeds what a format-1 store holds ([`Reading::capacity`] of [`Reading::ONE`], one
+/// reply's bytes), holds more than [`MAX_HELD_RECORDS`] records, or contains a malformed or
+/// invalidly signed record.
 pub fn decode_records(bytes: &[u8]) -> Result<Vec<Record>> {
     decode_records_bounded(bytes, MAX_HELD_RECORDS)
 }
@@ -141,8 +148,8 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<Record>> {
 /// holds at most [`super::LEGACY_RECORDS`] whatever this build holds.
 ///
 /// # Errors
-/// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than `record_limit` records, or contains a
-/// malformed or invalidly signed record.
+/// `bytes` exceeds what a format-1 store holds ([`Reading::capacity`]), holds more than
+/// `record_limit` records, or contains a malformed or invalidly signed record.
 pub fn decode_records_bounded(bytes: &[u8], record_limit: usize) -> Result<Vec<Record>> {
     decode_records_in(bytes, record_limit, Reading::ONE)
 }
@@ -151,14 +158,21 @@ pub fn decode_records_bounded(bytes: &[u8], record_limit: usize) -> Result<Vec<R
 /// that holds one record of a layout `reading` does not read is refused whole, as a format-1 node
 /// refuses a stream holding a version-2 record or a `Checkpoint`, exactly as 0.204 does.
 ///
+/// The stream is held to what a store read at `reading` holds ([`Reading::capacity`], the
+/// storage class): it is the decoder of a records file ([`Store::recovering`]) and of any set
+/// of records such a store takes. What crosses the wire is held to one reply
+/// ([`REPLY_CAP`]) where it is read off the wire, before any decoder sees it
+/// ([`decode_reply`], `transport`'s limits, the server's body bound).
+///
 /// # Errors
-/// As [`decode_records_bounded`], or a record is of a layout `reading` does not read.
+/// As [`decode_records_bounded`] with `reading`'s capacity for the byte bound, or a record is
+/// of a layout `reading` does not read.
 pub fn decode_records_in(
     bytes: &[u8],
     record_limit: usize,
     reading: Reading,
 ) -> Result<Vec<Record>> {
-    if bytes.len() > MAX_RECORDS_STREAM {
+    if bytes.len() > reading.capacity() {
         return Err(Error::new("membership record stream is too large"));
     }
     let mut out = Vec::new();
@@ -179,28 +193,20 @@ pub fn decode_records_in(
 }
 
 /// [`decode_records`] of a member's own records file, whose writer puts whole records on its end
-/// in place (`client::persist_records`): a last record cut short ([`Record::is_cut_frame`]) is
-/// what a writer that died mid-append leaves, or what a read that lands inside one finds, and
-/// the file holds the records before it, as it did before that append began. Every record
-/// before the cut is decoded and verified, and anything else refuses the whole stream as
+/// in place (`client::persist_records`), as `reading` reads each record: a last record cut
+/// short ([`Record::is_cut_frame`], which depends on the layouts `reading` reads) is what a
+/// writer that died mid-append leaves, or what a read that lands inside one finds, and the
+/// file holds the records before it, as it did before that append began. Every record before
+/// the cut is decoded and verified, and anything else refuses the whole stream as
 /// [`decode_records`] does: a whole frame that is malformed or fails its signature, bytes no
-/// frame begins with, a stream past its bounds.
+/// frame begins with, a stream past its bounds. Its caller hands the reading of the store the
+/// records go to ([`Store::reading`]), so the file is decoded as it is bounded.
 ///
 /// # Errors
-/// As [`decode_records`], but for a last record cut short.
-#[cfg(any(unix, windows, test))]
-pub(crate) fn decode_records_before_cut(bytes: &[u8]) -> Result<Vec<Record>> {
-    decode_records_before_cut_in(bytes, Reading::ONE)
-}
-
-/// [`decode_records_before_cut`] as `reading` reads each record: what a cut frame is depends on
-/// the layouts it reads ([`Record::is_cut_frame`]).
-///
-/// # Errors
-/// As [`decode_records_before_cut`], or a whole record is of a layout `reading` does not read.
+/// As [`decode_records_in`], but for a last record cut short.
 #[cfg(any(unix, windows, test))]
 pub(crate) fn decode_records_before_cut_in(bytes: &[u8], reading: Reading) -> Result<Vec<Record>> {
-    if bytes.len() > MAX_RECORDS_STREAM {
+    if bytes.len() > reading.capacity() {
         return Err(Error::new("membership record stream is too large"));
     }
     let mut out = Vec::new();
@@ -218,6 +224,12 @@ pub(crate) fn decode_records_before_cut_in(bytes: &[u8], reading: Reading) -> Re
         at += len;
     }
     Ok(out)
+}
+
+/// [`decode_records_before_cut_in`] as a node of format 1 reads ([`Reading::ONE`]).
+#[cfg(test)]
+pub(crate) fn decode_records_before_cut(bytes: &[u8]) -> Result<Vec<Record>> {
+    decode_records_before_cut_in(bytes, Reading::ONE)
 }
 
 /// One record frame of a stream: its id (the SHA-256 of its bytes, which
@@ -238,11 +250,12 @@ pub(crate) struct Frame {
 /// while this framing pass retains its identity without trusting it.
 ///
 /// # Errors
-/// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_HELD_RECORDS`] frames, or holds
-/// one this layout cannot frame (truncated, oversized, another layout version).
+/// `bytes` exceeds one reply's ([`REPLY_CAP`]: it frames what a server sent), holds more than
+/// [`MAX_HELD_RECORDS`] frames, or holds one this layout cannot frame (truncated, oversized,
+/// another layout version).
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) fn frames(bytes: &[u8]) -> Result<Vec<Frame>> {
-    if bytes.len() > MAX_RECORDS_STREAM {
+    if bytes.len() > REPLY_CAP {
         return Err(Error::new("membership record stream is too large"));
     }
     let mut out = Vec::new();
@@ -595,14 +608,18 @@ pub struct Store {
     /// ([`super::head::Origin`]) without reading the file again.
     #[cfg(any(unix, windows))]
     pub(super) file_order: Option<std::sync::Arc<[(RecordId, usize)]>>,
+    /// The bytes of that stream's file before its first record: the frame a rewritten file of a
+    /// rooted log begins with ([`super::stored`]), `0` for every other file.
+    #[cfg(any(unix, windows))]
+    pub(super) file_lead: u64,
 }
 
 /// Drop records waiting on a missing parent, highest id first, until `log` holds at most its
-/// held total ([`RecordBudgets::held`]) of records and [`MAX_RECORDS_STREAM`] bytes in all, so
-/// its stream stays one [`decode_records`] reads.
-fn make_room(log: &mut Log) {
+/// held total ([`RecordBudgets::held`]) of records and its store's capacity ([`Log::capacity`])
+/// of bytes in all, so its file stays one its reader reads ([`decode_records_in`]).
+pub(super) fn make_room(log: &mut Log) {
     while log.order.len() + log.waiting.len() > log.budgets.held
-        || log.total_bytes() > MAX_RECORDS_STREAM
+        || log.total_bytes() > log.capacity()
     {
         if !log.drop_last_waiting() {
             return;
@@ -652,6 +669,8 @@ impl Store {
             reading: Reading::ONE,
             #[cfg(any(unix, windows))]
             file_order: None,
+            #[cfg(any(unix, windows))]
+            file_lead: 0,
         }
     }
 
@@ -679,6 +698,8 @@ impl Store {
             reading: Reading::ONE,
             #[cfg(any(unix, windows))]
             file_order: None,
+            #[cfg(any(unix, windows))]
+            file_lead: 0,
         }
     }
 
@@ -728,9 +749,21 @@ impl Store {
     /// a head it opens admit. A store is told its format by the node it is the store of; it
     /// decides none.
     #[must_use]
-    pub const fn read_at(mut self, reading: Reading) -> Self {
+    pub fn read_at(mut self, reading: Reading) -> Self {
         self.reading = reading;
+        if let Some(log) = &mut self.log {
+            log.stored_at = reading;
+        }
         self
+    }
+
+    /// The most bytes of records this store holds: its format's capacity
+    /// ([`Reading::capacity`], the storage class), which its log's byte bound
+    /// ([`Log::capacity`]), its recovery of a records file and what it keeps before a genesis
+    /// all read.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.reading.capacity()
     }
 
     /// The keys one of which must have signed the genesis this store takes, when it checks the
@@ -791,12 +824,21 @@ impl Store {
 
     /// [`Store::recover`] into this empty store, as [`Store::for_vault`] and
     /// [`Store::also_under`] made it, acquiring at most this store's held budget of verified
-    /// frames from the first [`MAX_RECORDS_STREAM`] bytes. Duplicate frames count too.
+    /// frames from the first bytes of it a store of its format holds ([`Store::capacity`]).
+    /// Duplicate frames count too.
     #[must_use]
     pub fn recovering(self, bytes: &[u8]) -> Self {
-        let bytes = &bytes[..bytes.len().min(MAX_RECORDS_STREAM)];
+        let bytes = &bytes[..bytes.len().min(self.capacity())];
+        let (records, strict) = self.decoded(bytes);
+        self.recover_decoded(records, strict)
+    }
+
+    /// The records of a records file's stream `bytes`, as [`Store::recovering`] takes them: every
+    /// one where the stream reads whole (`true`), else each frame of it that still verifies, up
+    /// to this store's held budget (`false`).
+    pub(super) fn decoded(&self, bytes: &[u8]) -> (Vec<Record>, bool) {
         if let Ok(records) = decode_records_in(bytes, self.budgets.held, self.reading) {
-            return self.recover_decoded(records, true);
+            return (records, true);
         }
         let mut records = Vec::new();
         let mut at = 0usize;
@@ -815,7 +857,7 @@ impl Store {
             }
             at = end;
         }
-        self.recover_decoded(records, false)
+        (records, false)
     }
 
     fn recover_decoded(mut self, records: Vec<Record>, strict: bool) -> Self {
@@ -951,6 +993,22 @@ impl Store {
         })
     }
 
+    /// The byte length of the log's first `to` records, each in the form the log holds it now
+    /// ([`Store::write_held_from`]'s part before `to`): what a file that holds exactly those
+    /// records is long. A whole version-2 record that took its shed frame's place among them
+    /// ([`Store::insert`]) makes it longer than the file that holds the frame, which is how a
+    /// vault server knows such a file is no longer its log's beginning
+    /// (`server::persist_records`). `None` where the log holds fewer than `to` records.
+    #[cfg(any(unix, test))]
+    #[must_use]
+    pub(crate) fn held_len_to(&self, to: usize) -> Option<usize> {
+        let log = self.log.as_ref()?;
+        log.order
+            .get(..to)?
+            .iter()
+            .try_fold(0usize, |sum, record| sum.checked_add(record.wire_len()))
+    }
+
     /// How many records `on_file` holds, where this store is `on_file` with complete records
     /// held after its own and nothing else: each holds a log and no record waiting on a parent,
     /// and this log begins with every record of `on_file`'s, in `on_file`'s order, each in the
@@ -1068,6 +1126,19 @@ impl Store {
         }
     }
 
+    /// Whether `record` is a whole version-2 record of which this store holds only the shed
+    /// frame ([`Record::is_shed`]), complete, waiting or before its genesis: the one record a
+    /// store that holds its id still takes ([`Store::insert`] puts it in the frame's place). A
+    /// caller that skips the records a store holds by their ids alone
+    /// ([`Store::contains`], [`Store::holds`]) asks this too, or it drops the ciphertext a peer
+    /// sent.
+    #[cfg(any(unix, test))]
+    #[must_use]
+    pub(crate) fn lacks_whole(&self, record: &Record) -> bool {
+        self.record(record.id())
+            .is_some_and(|held| held.is_whole_of(record))
+    }
+
     /// The record `id` when held, complete or waiting: its exact signed bytes are
     /// [`Record::wire_bytes`].
     #[must_use]
@@ -1090,11 +1161,12 @@ impl Store {
         )
     }
 
-    /// The most [`Store::footprint`] reaches: a store keeps at most [`MAX_RECORDS_STREAM`] bytes
-    /// of records, and an index of at most [`MAX_HELD_RECORDS`] records.
+    /// The most [`Store::footprint`] reaches: a store keeps at most its format's capacity of
+    /// bytes of records (one number for every format this build reads,
+    /// [`Reading::STORE_BYTES`]), and an index of at most [`MAX_HELD_RECORDS`] records.
     #[cfg(any(unix, windows))]
     pub(crate) const MAX_FOOTPRINT: usize =
-        MAX_RECORDS_STREAM + super::reach::reserved_for(MAX_HELD_RECORDS);
+        Reading::STORE_BYTES + super::reach::reserved_for(MAX_HELD_RECORDS);
 
     /// Every held record id, sorted, and every id a final checkpoint its log is rooted at
     /// dropped ([`Store::contains`]).
@@ -1239,18 +1311,25 @@ impl Store {
     /// [`Store::missing_within`] for a puller that takes a served frame
     /// ([`Store::ingest_served`]): where this log is rooted at a final checkpoint and `have`
     /// does not show every root's cut ([`Log::named_cuts`]), its roots and their stubs
-    /// ([`Missing::served`]) and every record the peer lacks, past `cap`, within
-    /// [`MAX_RECORDS_STREAM`]; otherwise exactly what [`Store::missing_within`] serves.
+    /// ([`Missing::served`]) and every record the peer lacks, past `cap`, within one reply
+    /// ([`REPLY_CAP`]); otherwise exactly what [`Store::missing_within`] serves.
     ///
     /// Decided here: a served root's reply is not cut at `cap`. The puller takes the root and
     /// the records all or none, and a root is taken only with its settling shares, which follow
     /// the cut and, through the records the cut's prune dropped, may wait on the stubs: a prefix
     /// capped short of them is refused whole, and the next pull, naming the same `have`, is
     /// served the same prefix for ever. So the reply holds them all, as a whole store's would,
-    /// and a store holds no more than [`MAX_RECORDS_STREAM`] in all (its stubs counted in its
-    /// bytes). Where the frame and the records pass that (a store past the stream bound, which
-    /// no store of this build is), it serves records alone, capped, and the puller waits on a
-    /// peer that holds the cut (rooted.rs "Not yet").
+    /// and a store holds no more than its capacity in all, its stubs counted in its bytes
+    /// ([`Log::capacity`]). The reply is the wire's, so it is held to [`REPLY_CAP`]: it is the
+    /// held records the peer lacks and the frame, which is the stubs' bytes and its head
+    /// ([`super::Served::head_len`]: 42 bytes and 32 for each root, at most
+    /// [`super::served::MAX_SERVED_HEAD`]), so it passes what the store holds by that head at
+    /// most. While a store's capacity is one reply's ([`crate::crossing::FORMAT_TWO_BYTES`]),
+    /// it therefore passes [`REPLY_CAP`] only for a store within its frame's head of full
+    /// (8,234 bytes of 64 MiB at the most roots) whose puller lacks nearly every record it
+    /// holds; a store whose capacity is past a reply (tracker FL-249) passes it as a matter of
+    /// course. There it serves records alone, capped, and the puller waits on a peer that
+    /// holds the cut, or on this store's next prune (rooted.rs "Not yet").
     #[must_use]
     pub fn missing_served(&self, have: &[RecordId], cap: usize) -> Missing {
         let Some(log) = &self.log else {
@@ -1284,7 +1363,7 @@ impl Store {
         let mut records = Vec::new();
         for record in lacked_by(log, have) {
             bytes = bytes.saturating_add(record.wire_len());
-            if bytes > MAX_RECORDS_STREAM {
+            if bytes > REPLY_CAP {
                 return self.missing_within(have, cap);
             }
             records.push(record.clone());
@@ -1326,8 +1405,9 @@ impl Store {
     /// keys signed, or fails [`Log::against`] or [`Log::insert`], or it misses a parent and the store
     /// already holds its held total ([`RecordBudgets::held`]) of records, or one short of
     /// [`MAX_WAITING`] before a genesis.
-    /// It also fails when holding or keeping the record waiting would make the store's wire stream
-    /// exceed [`MAX_RECORDS_STREAM`] (reserving [`MAX_RECORD`] bytes before a genesis).
+    /// It also fails when holding or keeping the record waiting would make the store hold more
+    /// bytes than its format's capacity ([`Store::capacity`]; reserving [`MAX_RECORD`] bytes
+    /// before a genesis).
     pub fn insert(&mut self, record: Record) -> Result<bool> {
         if let Some(compiled) = &self.compiled
             && record.network_id() != compiled
@@ -1358,7 +1438,7 @@ impl Store {
             let complete = log.parent_indexes(&record).is_some();
             if !complete
                 && (log.order.len() + log.waiting.len() >= log.budgets.held
-                    || log.total_bytes().saturating_add(record.wire_len()) > MAX_RECORDS_STREAM)
+                    || log.total_bytes().saturating_add(record.wire_len()) > log.capacity())
             {
                 return Err(Error::of_kind(
                     crate::ErrorKind::MembershipCapacity,
@@ -1379,6 +1459,7 @@ impl Store {
             }
             let mut log = Log::against(record, self.compiled.as_ref(), &alab_lineage())?;
             log.budgets = self.budgets;
+            log.stored_at = self.reading;
             log.require_seats();
             self.network = Some(*log.network());
             // Each after its parents among them, so the log meets every seat before the records
@@ -1394,13 +1475,13 @@ impl Store {
             self.log = Some(log);
             return Ok(true);
         }
-        // One short of `MAX_WAITING`, and `MAX_RECORD` bytes short of `MAX_RECORDS_STREAM`: a
+        // One short of `MAX_WAITING`, and `MAX_RECORD` bytes short of the store's capacity: a
         // store with no genesis yet always has room for it, however many records arrived first,
-        // and once it lands the store holds no more than its held total and `MAX_RECORDS_STREAM`
-        // (what `decode_records` reads back).
+        // and once it lands the store holds no more than its held total and its capacity (what
+        // its reader reads back).
         let unrooted_bytes: usize = self.unrooted.values().map(|r| r.wire_len()).sum();
         if self.unrooted.len() >= MAX_WAITING - 1
-            || unrooted_bytes.saturating_add(record.wire_len()) > MAX_RECORDS_STREAM - MAX_RECORD
+            || unrooted_bytes.saturating_add(record.wire_len()) > self.capacity() - MAX_RECORD
         {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipCapacity,
@@ -1427,12 +1508,13 @@ impl Store {
             return false;
         }
         let unrooted_bytes: usize = self.unrooted.values().map(Record::wire_len).sum();
+        let room = self.capacity() - MAX_RECORD;
         match self.unrooted.get_mut(whole.id()) {
             Some(frame)
                 if unrooted_bytes
                     .saturating_sub(frame.wire_len())
                     .saturating_add(whole.wire_len())
-                    <= MAX_RECORDS_STREAM - MAX_RECORD =>
+                    <= room =>
             {
                 *frame = whole.clone();
                 true
@@ -1444,12 +1526,12 @@ impl Store {
     /// Decode and verify every record in `bytes`, then insert each one: if any record in the
     /// stream does not decode or verify, the store is left unchanged. A record [`Store::insert`]
     /// refuses is skipped and the rest are kept: which records a store refuses at its bounds
-    /// (its [`RecordBudgets`], [`MAX_WAITING`], [`MAX_RECORDS_STREAM`]) depends on what reached it
+    /// (its [`RecordBudgets`], [`MAX_WAITING`], its byte capacity) depends on what reached it
     /// first, and a peer's stream that carries a record this store refuses still brings every
     /// other record. It works in place: [`Store::insert`] changes nothing when it refuses a
     /// record, and gives a waiting record's place only to a record it keeps, so a stream that
-    /// adds nothing leaves the store as it was without a copy of a store that can reach
-    /// [`MAX_RECORDS_STREAM`].
+    /// adds nothing leaves the store as it was without a copy of a store that can reach its
+    /// capacity.
     /// Returns how many records entered the store: new ones, and whole version-2 records that
     /// took their shed frames' places ([`Store::insert`]), which change its bytes and none of its
     /// ids.
@@ -1617,12 +1699,22 @@ pub enum MemberVerdict {
 /// The membership log's records made durable: called after every write of a client's records
 /// file ([`crate::client::Paths::records_file`]), with the store as written. Not blocking. A vault
 /// server's records files are not this hook's, and a writer that ends between the durable write
-/// and the call (a crash) calls nothing.
+/// and the call (a crash) calls nothing. Neither does a write by a Mac whose format mark names
+/// a later format than 1: the hook feeds the mesh's members lane, which carries none of its
+/// records (`crate::client::mesh_members`, ATERM-KI-1116-1471).
 pub struct Written<'a> {
     /// The vault folder whose records file was written ([`crate::client::Paths::dir`]).
     pub paths_dir: &'a std::path::Path,
     /// The store the file now holds.
     pub store: &'a Store,
+    /// The rewrite generation of the records entry the store was written under
+    /// (`crate::client::Paths::records_generation`), which names the order `store`'s records
+    /// are in: a consumer that keeps a place in the records (the mesh egress's members cursor)
+    /// takes the records a write hands it only where this is the generation its place counts
+    /// under, since a rewrite drops records and so moves every place. A write is made only
+    /// under the generation its store was read under (`crate::records_storage::rewrite`), so
+    /// this is not the entry's generation as some later read finds it.
+    pub generation: crate::records_storage::RecordsGeneration,
 }
 
 /// The process's [`Written`] hook ([`on_written`]).

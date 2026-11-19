@@ -435,7 +435,8 @@ pub struct VitalsInks {
     pub grid: Rgb,
     /// The Deck's seam above the grid.
     pub seam: Rgb,
-    /// The scope bar's Global segment.
+    /// The scope bar's Global segment, and a held amount's strip box at rest (Memory's and
+    /// Disk's, which take their state's ink, not their level's heat).
     pub machine: Rgb,
     /// The Global segment under Increase Contrast.
     pub machine_ic: Rgb,
@@ -627,10 +628,12 @@ impl VitalsInks {
     }
 
     /// A data cell's ink at `level` (`0..=1`): the heat ramp's step for it ([`heat_step`]), the
-    /// Increase Contrast ramp's under `ic`. A strip's cells, its live now box, the core squares and
-    /// the CPU lens's per-core map all draw it, so the now box is the ink the strip cell holding
-    /// the same value draws, at every level (979d8c3559's scheme; the owner, 2026-10-26, "go back
-    /// to the orignal color scheme"). A level that is not a number reads as 0.
+    /// Increase Contrast ramp's under `ic`. The strips of the rows that measure a rate of work
+    /// (CPU, GPU, Network, Tokens, Processes), their live now boxes, the core squares and the CPU
+    /// lens's per-core map all draw it, so a now box is the ink the strip cell holding the same
+    /// value draws, at every level (979d8c3559's scheme; the owner, 2026-10-26, "go back to the
+    /// orignal color scheme"); Memory's and Disk's strips, which hold an amount, draw their
+    /// state's ink instead ([`Self::machine`] at rest). A level that is not a number reads as 0.
     #[must_use]
     pub fn cell_at(&self, level: f32, ic: bool) -> Rgb {
         let v = if level.is_finite() { level } else { 0.0 };

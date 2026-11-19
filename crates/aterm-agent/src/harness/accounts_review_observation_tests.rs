@@ -199,7 +199,9 @@ fn review_case(provider: i64, location: i64, outcome: i64, case: i64) -> [bool; 
                         }
                         let mut events =
                             accounts::note_auth(state, "account", accounts::Auth::SignedOut, NOW);
-                        events.extend(accounts::note_signed_back(state, logins, "account", NOW));
+                        events.extend(accounts::note_checked_sign_in(
+                            state, logins, "account", NOW,
+                        ));
                         Ok(events)
                     })
                     .unwrap();

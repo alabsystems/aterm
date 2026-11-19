@@ -170,14 +170,10 @@ fn a_kept_store_rejudges_eligibility_at_each_boundary_and_a_quiet_round_replays_
     assert_eq!(eligible(), BTreeSet::from(ids));
     assert_eq!(control(), before);
 
-    // Rounds on `atdb/7`, Mac 1 initiating on this thread: the first may open afresh, the second,
+    // Rounds reconciled by range, Mac 1 initiating on this thread: the first may open afresh, the second,
     // over a table neither side changed, reopens what Mac 1 kept.
     let other = pair.replica(0);
-    let reconciling = || Repair {
-        reconcile: true,
-        ..Repair::default()
-    };
-    let mut repairs = [reconciling(), reconciling()];
+    let mut repairs = [Repair::default(), Repair::default()];
     for report in rbsr_round(&replica, &other, &mut repairs) {
         report.unwrap();
     }
@@ -327,10 +323,7 @@ fn one_session_moves_5000_operations_into_a_table_of_15000_and_reuses_kept_store
             "the cold inventory must exercise a real replay"
         );
     }
-    let mut repairs = std::array::from_fn(|_| Repair {
-        reconcile: true,
-        ..Repair::default()
-    });
+    let mut repairs = std::array::from_fn(|_| Repair::default());
     let transfer_batches = MOVED.div_ceil(BATCH);
     let [sent, received] = rbsr_round_observed(&sender, &receiver, &mut repairs, || {
         (

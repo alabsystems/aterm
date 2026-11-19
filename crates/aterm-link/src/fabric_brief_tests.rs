@@ -245,7 +245,7 @@ fn a_hostile_body_is_printed_safe() {
 #[test]
 fn the_brief_reads_its_words_within_their_bounds() {
     let o = BriefOpts::parse(&[
-        "@ta000000000@n-1".to_string(),
+        "@t0000000064@n-1".to_string(),
         "--window".to_string(),
         "1024".to_string(),
         "--budget".to_string(),
@@ -262,7 +262,7 @@ fn the_brief_reads_its_words_within_their_bounds() {
             o.json
         ),
         (
-            Some("ta000000000"),
+            Some("t0000000064"),
             Some("n-1"),
             Some(1024),
             Some(500),

@@ -26,6 +26,10 @@ use crate::session_store::Store;
 use crate::vitals_host::Msg;
 use crate::vitals_host::memory::{self, ObservedAt};
 
+#[cfg(all(feature = "bench-support", debug_assertions))]
+#[path = "sys_history_probe.rs"]
+pub(crate) mod history_probe;
+
 /// The event ring's size.
 pub(crate) const EVENTS_CAP: usize = 256;
 /// Reply fingerprints kept at least…
@@ -111,9 +115,21 @@ struct Kept {
 
 #[derive(Default)]
 struct State {
+    /// Every original publication, including machine-only resource-ring updates. History and
+    /// event cuts use this without replacing the whole-process or scheduling authorities.
+    latest: Option<Held>,
     /// The newest whole snapshot (machine counters and the process sweep); a machine-only one
     /// only while none is held.
     held: Option<Held>,
+    /// The newest whole snapshot whose sweep read each process's scheduling
+    /// ([`Snapshot::scheduling_read`]), which a later reading without it (a deck reading,
+    /// another view's pull) does not replace: a reply that prints scheduling is judged by it
+    /// ([`State::judged`]).
+    scheduled: Option<Held>,
+    /// The newest whole snapshot whose reading read aterm's own thread CPU
+    /// ([`Snapshot::self_cpu_read`]), which a later reading without it does not replace: a reply
+    /// that prints it is judged by it ([`State::judged`]).
+    own_cpu: Option<Held>,
     /// The newest snapshot seq published, a machine-only one's included: the
     /// cursor's head.
     head_seq: u64,
@@ -123,6 +139,9 @@ struct State {
     events: VecDeque<Event>,
     /// The newest snapshot seq whose events left the ring (0: none did).
     evicted_through: u64,
+    /// A producer tried to append a different event at an already published sequence. The
+    /// old cursor cannot cover that rejected batch; a later canonical sequence can recover.
+    events_invalidated_at: Option<u64>,
     replies: VecDeque<Kept>,
     tx: Option<SyncSender<Msg>>,
     last_pull: Option<Instant>,
@@ -136,20 +155,89 @@ struct State {
     /// The last pull a `sys cores`, `sys report` or forced `sys why` sent, CPU Stats armed:
     /// another view's pull takes no CPU Stats sample, so these keep their own gap too.
     last_hardware_pull: Option<Instant>,
+    /// The last pull a query printing each process's scheduling sent, its sweep asked for it:
+    /// another view's pull reads none, so these keep their own gap too.
+    last_scheduling_pull: Option<Instant>,
+    /// The last pull a query printing aterm's own thread CPU sent, its reading asked for it:
+    /// another view's pull reads none, so these keep their own gap too.
+    last_self_cpu_pull: Option<Instant>,
     /// The explicit naming operation spanning capture, sampling and fresh publication.
     naming: Option<crate::sys_naming::Live>,
     pacing: Pacing,
 }
 
+impl State {
+    fn for_part(&self, part: Part, reads: Reads) -> Option<&Held> {
+        if part == Part::History {
+            self.latest.as_ref()
+        } else {
+            self.judged(reads)
+        }
+    }
+    /// The snapshot a reply is judged by and answered from: for one that prints what only a
+    /// reading asked reads (`reads`), the newest that read it ([`Self::scheduled`],
+    /// [`Self::own_cpu`]), else the newest whole one ([`Self::held`]).
+    fn judged(&self, reads: Reads) -> Option<&Held> {
+        match reads {
+            Reads::Whole => self.held.as_ref(),
+            Reads::Scheduling => self.scheduled.as_ref(),
+            Reads::SelfCpu => self.own_cpu.as_ref(),
+        }
+    }
+}
+
+/// What a reply prints that a whole reading reads only where a pull asked it, which only a
+/// snapshot that read it answers: no reply prints both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reads {
+    /// Nothing such: every whole snapshot answers.
+    Whole,
+    /// Each process's scheduling ([`SysQuery::prints_scheduling`],
+    /// [`Snapshot::scheduling_read`]).
+    Scheduling,
+    /// aterm's own thread CPU ([`SysQuery::prints_self_cpu`], [`Snapshot::self_cpu_read`]),
+    /// where a reader reads it ([`Shared::self_cpu_reads`]).
+    SelfCpu,
+}
+
+impl Reads {
+    /// What `q`'s reply prints of these, with `self_cpu_reads` whether a reader of aterm's own
+    /// threads reads them here: where none does, every reading answers why (`unsupported`), so a
+    /// reply that prints them needs no reading asked for them.
+    fn of(q: &SysQuery, self_cpu_reads: bool) -> Self {
+        if q.prints_scheduling() {
+            Self::Scheduling
+        } else if q.prints_self_cpu() && self_cpu_reads {
+            Self::SelfCpu
+        } else {
+            Self::Whole
+        }
+    }
+
+    /// Whether `snap`'s reading read it.
+    fn read_by(self, snap: &Snapshot) -> bool {
+        match self {
+            Self::Whole => true,
+            Self::Scheduling => snap.scheduling_read,
+            Self::SelfCpu => snap.self_cpu_read,
+        }
+    }
+}
+
 /// Which part of a snapshot a reply's freshness is judged by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Part {
+    /// Current machine resource rings at their original publication, including machine-only reads.
+    History,
     /// The snapshot: when it landed.
     Whole,
     /// Its split set (`sys why`), carried from its last split tick.
     Split,
     /// An aterm reply also needs the matching process census's original age.
     SplitMemory,
+    /// The current GroupBook frame and its paired original process census, independent of
+    /// carried explanations or CPU warm-up.
+    Groups,
     /// Its jobs view (`sys jobs`), carried from the engine's last pass.
     Jobs,
     /// Its independently assessed leftover view.
@@ -183,6 +271,10 @@ pub(crate) struct Shared {
     landed: Condvar,
     instant_clock: fn() -> Instant,
     continuous_ns: fn() -> Option<u64>,
+    /// Whether a reading's reader of aterm's own threads reads them here
+    /// ([`aterm_sysprobe::self_cpu::READS`]: macOS; a test sets it): only then does a reply that
+    /// prints them wait for a reading asked for them ([`Reads::of`]).
+    self_cpu_reads: bool,
 }
 
 /// The process's one copy.
@@ -210,6 +302,7 @@ impl Shared {
             landed: Condvar::new(),
             instant_clock: Instant::now,
             continuous_ns,
+            self_cpu_reads: aterm_sysprobe::self_cpu::READS,
         }
     }
 
@@ -336,7 +429,23 @@ impl Shared {
         if g.machine != *machine {
             g.machine.clone_from(machine);
         }
+        let published_head = g.head_seq;
+        let already_published = g.held.is_some() || published_head > 0;
+        if snap.events_lost > 0 {
+            g.evicted_through = g.evicted_through.max(snap.seq);
+        }
         for e in &snap.events {
+            if already_published && e.seq <= published_head {
+                if !g.events.iter().any(|old| old == e) {
+                    g.events_invalidated_at =
+                        Some(g.events_invalidated_at.unwrap_or(0).max(published_head));
+                }
+                continue;
+            }
+            if e.seq > snap.seq {
+                g.events_invalidated_at = Some(g.events_invalidated_at.unwrap_or(0).max(snap.seq));
+                continue;
+            }
             if g.events.len() == EVENTS_CAP
                 && let Some(old) = g.events.pop_front()
             {
@@ -345,19 +454,26 @@ impl Shared {
             g.events.push_back(e.clone());
         }
         g.head_seq = g.head_seq.max(snap.seq);
-        if !snap.machine_only || g.held.is_none() {
-            let unix_ms = u64::try_from(snap.at_unix_ms).unwrap_or(0);
-            let processes =
-                processes.filter(|receipt| !snap.machine_only && receipt.seq == snap.seq);
-            g.held = Some(Held {
-                snap,
-                unix_ms,
-                at: observed_at.instant,
-                observed_at,
-                jobs_at,
-                left_at,
-                processes,
-            });
+        let unix_ms = u64::try_from(snap.at_unix_ms).unwrap_or(0);
+        let processes = processes.filter(|receipt| !snap.machine_only && receipt.seq == snap.seq);
+        let held = Held {
+            snap,
+            unix_ms,
+            at: observed_at.instant,
+            observed_at,
+            jobs_at,
+            left_at,
+            processes,
+        };
+        g.latest = Some(held.clone());
+        if !held.snap.machine_only || g.held.is_none() {
+            if !held.snap.machine_only && held.snap.scheduling_read {
+                g.scheduled = Some(held.clone());
+            }
+            if !held.snap.machine_only && held.snap.self_cpu_read {
+                g.own_cpu = Some(held.clone());
+            }
+            g.held = Some(held);
         }
         drop(g);
         self.landed.notify_all();
@@ -389,13 +505,14 @@ impl Shared {
             force,
             Part::Whole,
             false,
+            Reads::Whole,
         )
     }
 
     /// Memory consumers require one actual process census, rather than a warm CPU pair.
     pub(crate) fn fresh_memory(&self, fresh: Duration, force: bool) -> Option<Held> {
         let fresh = Self::freshness_limit(fresh, force, View::Mem);
-        let (held, _) = self.fresh_by(fresh, force, Part::Memory, false);
+        let (held, _) = self.fresh_by(fresh, force, Part::Memory, false, Reads::Whole);
         let now = self.now();
         held.filter(|held| {
             held.processes
@@ -406,13 +523,25 @@ impl Shared {
     }
 
     /// [`Self::fresh`] for a `sys why`, judged by its split set's age while the coalition lane
-    /// reads, and when forced by its CPU Stats sample too, which a forced `sys why` prints.
-    pub(crate) fn fresh_why(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
+    /// reads, when forced by its CPU Stats sample too, which a forced `sys why` prints, and
+    /// with `self_cpu` (it prints aterm's own thread CPU, [`SysQuery::prints_self_cpu`]) by a
+    /// reading that read those threads ([`Self::fresh_by`]'s `reads`).
+    pub(crate) fn fresh_why(
+        &self,
+        fresh: Duration,
+        force: bool,
+        self_cpu: bool,
+    ) -> (Option<Held>, Freshness) {
         self.fresh_by(
             Self::freshness_limit(fresh, force, View::Why),
             force,
             Part::Split,
             force,
+            if self_cpu {
+                Reads::SelfCpu
+            } else {
+                Reads::Whole
+            },
         )
     }
 
@@ -424,102 +553,169 @@ impl Shared {
             force,
             Part::Left,
             false,
+            Reads::Whole,
         )
     }
 
     /// The snapshot `q` reads, as fresh as it asks: a `sys why` by its split set, arming `split`
     /// while it waits, a `sys jobs` by its jobs view, arming `jobs` (the stuck engine) while it
-    /// waits, and a `sys cores`, `sys report` or forced `sys why` by its CPU Stats sample too,
-    /// arming `hardware` while it waits ([`Self::fresh_by`]'s `hardware`).
+    /// waits, a `sys cores`, `sys report` or forced `sys why` by its CPU Stats sample too,
+    /// arming `hardware` while it waits ([`Self::fresh_by`]'s `hardware`), one that prints each
+    /// process's scheduling ([`SysQuery::prints_scheduling`]) by a reading whose sweep read it,
+    /// arming `scheduling` while it waits, and one that prints aterm's own thread CPU
+    /// ([`SysQuery::prints_self_cpu`]), where a reader reads it ([`Self::self_cpu_reads`]), by a
+    /// reading that read it, arming `self_cpu` while it waits ([`Self::fresh_by`]'s `reads`).
+    /// Groups arms the same split reader but judges its own current book frame and original
+    /// process receipt.
     pub(crate) fn fresh_for(
         &self,
         q: &SysQuery,
         split: &Arming,
         jobs: &Arming,
         hardware: &Arming,
+        scheduling: &Arming,
+        self_cpu: &Arming,
     ) -> (Option<Held>, Freshness) {
         let fresh_ms = q.fresh_ms.unwrap_or_else(|| q.freshness_default_ms());
         // `fresh=0` requests a new read; its age is still bounded by this view's ordinary
         // threshold, rather than treating a newly published, arbitrarily old input as fresh.
         let fresh = Self::freshness_limit(Duration::from_millis(fresh_ms), fresh_ms == 0, q.view);
+        let reads = Reads::of(q, self.self_cpu_reads);
+        let _reads = match reads {
+            Reads::Whole => None,
+            Reads::Scheduling => Some(scheduling.arm()),
+            Reads::SelfCpu => Some(self_cpu.arm()),
+        };
         match q.view {
             View::Why => {
                 let force = fresh_ms == 0;
                 let _armed = split.arm();
                 let _hardware = force.then(|| hardware.arm());
-                self.fresh_why(fresh, force)
+                // A `sys why` prints no process's scheduling: `reads` is SelfCpu or Whole.
+                self.fresh_why(fresh, force, reads == Reads::SelfCpu)
             }
             View::Aterm => {
                 let _armed = split.arm();
-                self.fresh_by(fresh, fresh_ms == 0, Part::SplitMemory, false)
+                self.fresh_by(fresh, fresh_ms == 0, Part::SplitMemory, false, reads)
+            }
+            View::Groups => {
+                let _armed = split.arm();
+                self.fresh_by(fresh, fresh_ms == 0, Part::Groups, false, reads)
+            }
+            View::History => {
+                self.fresh_by(fresh, fresh_ms == 0, Part::History, false, Reads::Whole)
+            }
+            View::Events => {
+                // Events recuts only the retained producer log, including for `fresh=0`.
+                // Reading it never asks the sampler to manufacture another observation.
+                let latest = self.lock().latest.clone();
+                let now = self.now();
+                let state = latest.as_ref().map_or(Freshness::Warming, |held| {
+                    if held.observed_at.age_at(now).is_some_and(|age| age <= fresh) {
+                        answered(&held.snap)
+                    } else {
+                        Freshness::Stale
+                    }
+                });
+                (latest, state)
             }
             View::Overview | View::Tab | View::Global | View::Mem => {
                 let _armed = split.arm();
-                self.fresh_by(fresh, fresh_ms == 0, Part::Split, false)
+                self.fresh_by(fresh, fresh_ms == 0, Part::Split, false, reads)
             }
             View::Left => {
                 let _armed = jobs.arm();
-                self.fresh_by(fresh, fresh_ms == 0, Part::Left, false)
+                self.fresh_by(fresh, fresh_ms == 0, Part::Left, false, reads)
             }
             View::Jobs => {
                 let _armed = jobs.arm();
-                self.fresh_by(fresh, fresh_ms == 0, Part::Jobs, false)
+                self.fresh_by(fresh, fresh_ms == 0, Part::Jobs, false, reads)
             }
-            View::Boot => self.fresh_by(fresh, fresh_ms == 0, Part::Whole, false),
             View::Cores | View::Report => {
                 let _armed = hardware.arm();
-                self.fresh_by(fresh, fresh_ms == 0, Part::Whole, true)
+                self.fresh_by(fresh, fresh_ms == 0, Part::Whole, true, reads)
             }
-            _ => self.fresh(fresh, fresh_ms == 0),
+            _ => self.fresh_by(fresh, fresh_ms == 0, Part::Whole, false, reads),
         }
     }
 
     /// The snapshot judged by `part`, at most `fresh` old and newly pulled when `force`d. With `hardware`, it
     /// also needs a CPU Stats sample, which only a lens, the recorder or a pull that prints it
     /// takes (A2 §6.4): a snapshot without one is never fresh, and a pull for one waits as a cold
-    /// pull does, since its pull reads a pair where no sample is warm.
+    /// pull does, since its pull reads a pair where no sample is warm. With `reads`
+    /// [`Reads::Scheduling`], it also needs a reading whose sweep read each process's scheduling
+    /// ([`Snapshot::scheduling_read`]), which only a reader of it asks
+    /// (`vitals_host::Reader::sweep_reads_scheduling`), and a pull for it waits as a warm pull
+    /// does, since one reading's sweep reads it; with [`Reads::SelfCpu`], a reading that read
+    /// aterm's own thread CPU ([`Snapshot::self_cpu_read`]), which only a pull a query printing
+    /// it armed asks, and a pull for it waits as a cold pull does, since it reads a pair where
+    /// the thread's last reading read none (`vitals_host::Source::self_cpu_cold`), as a
+    /// machine-only reading the workers never hold may have. Either is judged by, and answered
+    /// from, the newest such reading ([`State::judged`]), so a later one without it does not
+    /// hide that reading inside its pull's gap; a snapshot without it is never fresh. Where
+    /// nothing that answers lands within the wait, the reply is the newest whole snapshot,
+    /// stale; where the reading that lands is older than `fresh` ([`fresh_age`]), that reading,
+    /// stale.
     fn fresh_by(
         &self,
         fresh: Duration,
         force: bool,
         part: Part,
         hardware: bool,
+        reads: Reads,
     ) -> (Option<Held>, Freshness) {
-        let split = matches!(part, Part::Split | Part::SplitMemory);
+        let split = matches!(part, Part::Split | Part::SplitMemory | Part::Groups);
+        let carried_split = matches!(part, Part::Split | Part::SplitMemory);
         let began = Instant::now();
         let now = (self.instant_clock)();
         let mut g = self.lock();
-        let have = g.held.clone();
+        // The probe's newest reading, by which a pull's warmth and the split's arming are judged.
+        let latest = if part == Part::History {
+            g.latest.clone()
+        } else {
+            g.held.clone()
+        };
+        let have = g.for_part(part, reads).cloned();
         if !matches!(part, Part::Jobs | Part::Left) && self.now().continuous_ns.is_none() {
-            return stale(have);
+            return stale_for(latest, part);
         }
-        let sampled = |h: &Held| !hardware || h.snap.hardware.is_some();
+        let has_hardware = |h: &Held| !hardware || h.snap.hardware.is_some();
+        let sampled = |h: &Held| has_hardware(h) && reads.read_by(&h.snap);
         let landed = |h: &Held| landed_for(h, part).filter(|_| sampled(h));
         if let Some(h) = have.as_ref()
             && !force
             && fresh_age(h, part, landed(h), self.now()).is_some_and(|age| age <= fresh)
             && whole_for(h, part)
         {
-            return (have.clone(), answered(&h.snap));
+            return (have.clone(), answered_for(h, part));
         }
         let old_seq = have.as_ref().map(|h| h.snap.seq);
         let old_split = have.as_ref().and_then(|h| split_ns(&h.snap));
-        let cold = have.as_ref().is_none_or(|h| {
-            !whole(&h.snap)
-                || now
-                    .checked_duration_since(h.at)
-                    .is_none_or(|age| age > crate::vitals_host::COLD_AFTER)
-                || (split && split_cold(h, now))
-                || !sampled(h)
-        });
+        // A pull for aterm's own threads reads a pair wherever the thread's last reading read
+        // none, which a machine-only reading the workers never hold may be.
+        let cold = reads == Reads::SelfCpu
+            || latest.as_ref().is_none_or(|h| {
+                (part != Part::History && !whole(&h.snap))
+                    || now
+                        .checked_duration_since(h.at)
+                        .is_none_or(|age| age > crate::vitals_host::COLD_AFTER)
+                    || (carried_split && split_cold(h, now))
+                    || !has_hardware(h)
+            });
         let pacing = g.pacing;
-        let armed = split && have.as_ref().is_none_or(|h| h.snap.coal_lane.on());
+        let armed = split && latest.as_ref().is_none_or(|h| h.snap.coal_lane.on());
         // Each armed need keeps its own gap: the pull that answers must have been sent for every
         // one, so the gap runs from the oldest of their last pulls (none when one never pulled).
+        let reads_pull = match reads {
+            Reads::Whole => None,
+            Reads::Scheduling => Some(g.last_scheduling_pull),
+            Reads::SelfCpu => Some(g.last_self_cpu_pull),
+        };
         let needs = [
             (armed, g.last_split_pull),
             (matches!(part, Part::Jobs | Part::Left), g.last_jobs_pull),
             (hardware, g.last_hardware_pull),
+            (reads_pull.is_some(), reads_pull.flatten()),
         ];
         let last_pull = if needs.iter().any(|(need, _)| *need) {
             needs
@@ -542,7 +738,7 @@ impl Shared {
                     && fresh_age(h, part, landed(h), self.now()).is_some_and(|age| age <= fresh)
                     && whole_for(h, part)
                 {
-                    return (have.clone(), answered(&h.snap));
+                    return (have.clone(), answered_for(h, part));
                 }
             }
             None => {
@@ -571,18 +767,23 @@ impl Shared {
                     if hardware {
                         g.last_hardware_pull = Some(now);
                     }
+                    match reads {
+                        Reads::Whole => {}
+                        Reads::Scheduling => g.last_scheduling_pull = Some(now),
+                        Reads::SelfCpu => g.last_self_cpu_pull = Some(now),
+                    }
                 }
             }
         }
         if g.tx.is_none() {
-            return stale(have);
+            return stale_for(latest, part);
         }
         let deadline = began + if cold { pacing.wait_cold } else { pacing.wait };
         loop {
-            if let Some(h) = g.held.as_ref()
+            if let Some(h) = g.for_part(part, reads)
                 && Some(h.snap.seq) != old_seq
                 && whole_for(h, part)
-                && (!split
+                && (!carried_split
                     || !h.snap.coal_lane.on()
                     || stalled(&h.snap, "why")
                     || split_ns(&h.snap).is_some_and(|ns| Some(ns) != old_split))
@@ -593,9 +794,9 @@ impl Shared {
             {
                 return if fresh_age(h, part, landed(h), self.now()).is_some_and(|age| age <= fresh)
                 {
-                    (Some(h.clone()), answered(&h.snap))
+                    (Some(h.clone()), answered_for(h, part))
                 } else {
-                    stale(Some(h.clone()))
+                    stale_for(Some(h.clone()), part)
                 };
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -608,7 +809,14 @@ impl Shared {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        stale(g.held.clone())
+        stale_for(
+            if part == Part::History {
+                g.latest.clone()
+            } else {
+                g.held.clone()
+            },
+            part,
+        )
     }
 
     fn wait_newer(&self, seq: Option<u64>, until: Instant) {
@@ -667,7 +875,44 @@ impl Shared {
     fn events_since(&self, seq: u64) -> (Vec<Event>, bool) {
         let g = self.lock();
         let events = g.events.iter().filter(|e| e.seq > seq).cloned().collect();
-        (events, g.evicted_through <= seq)
+        (
+            events,
+            g.evicted_through <= seq && g.events_invalidated_at.is_none_or(|bad| seq > bad),
+        )
+    }
+
+    /// One cut of the existing event ring and its publication head. Event cursors describe
+    /// retained producer events, independently of a remembered formatted reply.
+    fn event_cut(&self, since: Option<Cursor>, epoch: u64) -> Result<EventCut, String> {
+        let g = self.lock();
+        let head = Cursor {
+            epoch,
+            seq: g.head_seq,
+        };
+        let (after, gap) = match since {
+            Some(cursor) if cursor.epoch != epoch => (None, Some(Gap::Reset)),
+            Some(cursor) if cursor.seq > head.seq => {
+                return Err(format!("ERR bad since head={head}\n"));
+            }
+            Some(cursor) => (
+                Some(cursor.seq),
+                (cursor.seq < g.evicted_through
+                    || g.events_invalidated_at.is_some_and(|bad| cursor.seq <= bad))
+                .then_some(Gap::Evicted),
+            ),
+            None => (None, g.events_invalidated_at.map(|_| Gap::Evicted)),
+        };
+        Ok(EventCut {
+            held: g.latest.clone(),
+            head,
+            gap,
+            events: g
+                .events
+                .iter()
+                .filter(|event| after.is_none_or(|seq| event.seq > seq))
+                .cloned()
+                .collect(),
+        })
     }
 
     fn recall(&self, key: &ReplyKey) -> Option<Fingerprints> {
@@ -764,19 +1009,21 @@ fn whole_for(held: &Held, part: Part) -> bool {
                 .is_some_and(|receipt| receipt.seq == held.snap.seq)
     };
     match part {
+        Part::History => true,
         Part::Memory => census(),
         Part::SplitMemory => whole(&held.snap) && census(),
+        Part::Groups => census() && groups_current(held),
         _ => whole(&held.snap),
     }
 }
 
 fn landed_for(held: &Held, part: Part) -> Option<Instant> {
     match part {
-        Part::Whole => Some(held.at),
+        Part::Whole | Part::History => Some(held.at),
         Part::Split | Part::SplitMemory => split_landed(held),
         Part::Jobs => jobs_landed(held),
         Part::Left => held.left_at,
-        Part::Memory => held
+        Part::Memory | Part::Groups => held
             .processes
             .as_ref()
             .map(|receipt| receipt.observed_at.instant),
@@ -784,7 +1031,7 @@ fn landed_for(held: &Held, part: Part) -> Option<Instant> {
 }
 
 /// Jobs and leftovers keep their own assessment clock, independent of the machine frame.
-/// For memory, the process receipt may precede this frame when the native lane answered an
+/// For memory and groups, the process receipt may precede this frame when the native lane answered an
 /// older ask. Publication, a machine-only read and a newer split cannot renew that census.
 fn fresh_age(
     held: &Held,
@@ -797,7 +1044,7 @@ fn fresh_age(
             Part::Split | Part::SplitMemory => "why",
             Part::Jobs => "jobs",
             Part::Left => "left",
-            Part::Whole | Part::Memory => return None,
+            Part::Whole | Part::History | Part::Memory | Part::Groups => return None,
         };
         stalled(&held.snap, lane).then_some(held.at)
     })?;
@@ -805,8 +1052,11 @@ fn fresh_age(
     if matches!(part, Part::Jobs | Part::Left) {
         return Some(lane_age);
     }
+    if part == Part::Groups && !groups_current(held) {
+        return None;
+    }
     let mut age = held.observed_at.age_at(now)?.max(lane_age);
-    if matches!(part, Part::Memory | Part::SplitMemory) {
+    if matches!(part, Part::Memory | Part::SplitMemory | Part::Groups) {
         let receipt = held
             .processes
             .as_ref()
@@ -841,6 +1091,54 @@ fn answered(snap: &Snapshot) -> Freshness {
     } else {
         Freshness::Partial
     }
+}
+
+/// The book must describe this source publication, not a view retained from an earlier whole
+/// read. Its process receipt supplies the original capture age independently of publication.
+fn groups_current(held: &Held) -> bool {
+    held.snap.groups.frame().is_some_and(|frame| {
+        frame.seq == held.snap.seq
+            && frame.at_ns == held.snap.at_ns
+            && frame.processes_observed
+            && (!held.snap.coal_lane.on() || frame.coalitions_observed)
+    })
+}
+
+fn answered_for(held: &Held, part: Part) -> Freshness {
+    if part == Part::Groups
+        && held
+            .snap
+            .groups
+            .frame()
+            .is_some_and(|frame| !frame.processes_complete || !frame.coalitions_complete)
+    {
+        Freshness::Partial
+    } else {
+        answered(&held.snap)
+    }
+}
+
+fn stale_for(held: Option<Held>, part: Part) -> (Option<Held>, Freshness) {
+    if part == Part::History {
+        let state = if held.is_some() {
+            Freshness::Stale
+        } else {
+            Freshness::Warming
+        };
+        return (held, state);
+    }
+    if part != Part::Groups {
+        return stale(held);
+    }
+    let state = if held
+        .as_ref()
+        .is_some_and(|h| h.snap.groups.frame().is_some())
+    {
+        Freshness::Stale
+    } else {
+        Freshness::Warming
+    };
+    (held, state)
 }
 
 fn split_landed(h: &Held) -> Option<Instant> {
@@ -935,6 +1233,15 @@ fn fg_pgid(master: i32) -> Option<u32> {
     }
 }
 
+/// The exact session target admitted by control's existing dispatch authorization. The host
+/// revalidates this identity after waiting for a fresh reading, before gathering reply facts.
+pub(crate) struct AuthorizedTarget<'a> {
+    pub(crate) session: u64,
+    pub(crate) term: &'a Arc<Mutex<Terminal>>,
+    pub(crate) master: i32,
+    pub(crate) ctx: &'a crate::SessionCtx,
+}
+
 struct Gathered {
     target: Target,
     tabs: Vec<TabFact>,
@@ -943,9 +1250,11 @@ struct Gathered {
     /// The stores aterm keeps, for `sys disk`'s `store` lines (none for another view).
     stores: Vec<aterm_vitals::sys::StoreFact>,
     volume: Option<VolumeFacts>,
-    /// The sessions of the caller's own tab; `None` with no caller session
-    /// (`Ctx::caller_panes`).
+    /// The single admitted session for a non-owner. An owner's advisory `caller=` may narrow
+    /// to a live tab, with an unresolved filter empty; only an unfiltered owner has `None`.
     caller_panes: Option<Vec<u64>>,
+    /// The already-admitted live generation, independent of the optional process receipt.
+    event_caller: Option<aterm_vitals::events::SessionScope>,
     home: Option<String>,
     /// `disk held`'s rows ([`held_now`]); `None` for every other request.
     held: Option<disk_held::Holdings>,
@@ -955,14 +1264,19 @@ type PaneTerm = (u64, Arc<Mutex<Terminal>>);
 
 fn gather(
     store: &Store,
-    session: u64,
-    term: &Arc<Mutex<Terminal>>,
-    master: i32,
+    target: &AuthorizedTarget<'_>,
     panes: &[PaneFact],
     q: &SysQuery,
     snap: Option<&Snapshot>,
     processes: Option<&crate::vitals_host::memory::Receipt>,
-) -> Gathered {
+    owner_class: bool,
+) -> Result<Gathered, String> {
+    let AuthorizedTarget {
+        session,
+        term,
+        master,
+        ctx,
+    } = *target;
     let (sids, terms, caller_key, sources): (
         Vec<(u64, String)>,
         Vec<PaneTerm>,
@@ -970,6 +1284,11 @@ fn gather(
         Vec<(u64, String)>,
     ) = {
         let g = store.read().unwrap_or_else(PoisonError::into_inner);
+        if !g.by_local(session).is_some_and(|live| {
+            live.sid == ctx.self_id && live.nonce == ctx.nonce && Arc::ptr_eq(&live.term, term)
+        }) {
+            return Err("ERR sys target changed after authorization\n".to_owned());
+        }
         let mut sids = Vec::new();
         let mut terms = Vec::new();
         for p in panes {
@@ -983,11 +1302,14 @@ fn gather(
         {
             sids.push((session, h.sid.as_str().to_owned()));
         }
-        let caller_key = q
-            .caller
-            .as_deref()
-            .and_then(aterm_session::SessionId::parse)
-            .and_then(|c| g.by_sid(&c).map(|h| h.local_id));
+        let caller_key = owner_class
+            .then(|| {
+                q.caller
+                    .as_deref()
+                    .and_then(aterm_session::SessionId::parse)
+                    .and_then(|c| g.by_sid(&c).map(|h| h.local_id))
+            })
+            .flatten();
         let sources = processes.map_or_else(Vec::new, |receipt| {
             receipt
                 .panes
@@ -1080,19 +1402,28 @@ fn gather(
             });
         }
     }
-    let caller_panes = q.caller.as_ref().map(|_| {
-        caller_key.map_or_else(Vec::new, |c| {
-            panes.iter().find(|p| p.key == c).map_or_else(
-                || vec![c],
-                |me| {
-                    panes
-                        .iter()
-                        .filter(|p| p.window == me.window && p.tab == me.tab)
-                        .map(|p| p.key)
-                        .collect()
-                },
-            )
+    let caller_panes = if owner_class {
+        q.caller.as_ref().map(|_| {
+            caller_key.map_or_else(Vec::new, |c| {
+                panes.iter().find(|p| p.key == c).map_or_else(
+                    || vec![c],
+                    |me| {
+                        panes
+                            .iter()
+                            .filter(|p| p.window == me.window && p.tab == me.tab)
+                            .map(|p| p.key)
+                            .collect()
+                    },
+                )
+            })
         })
+    } else {
+        Some(vec![session])
+    };
+    let event_caller = (!owner_class).then(|| aterm_vitals::events::SessionScope {
+        local: session,
+        sid: ctx.self_id.as_str().to_owned(),
+        nonce: ctx.nonce.to_hex(),
     });
     let home = aterm_types::dirs::home_dir().map(|h| h.display().to_string());
     if q.form == Some(DiskForm::Held) {
@@ -1100,7 +1431,7 @@ fn gather(
         // target's scope, and no walk demanded.
         let volume = home.as_deref().and_then(|h| volume_facts(Path::new(h)));
         let held = held_now(store, home.as_deref().map(Path::new));
-        return Gathered {
+        return Ok(Gathered {
             target,
             tabs,
             roots: Vec::new(),
@@ -1108,19 +1439,23 @@ fn gather(
             stores: Vec::new(),
             volume,
             caller_panes,
+            event_caller,
             home,
             held: Some(held),
-        };
+        });
     }
     let (roots, disk, volume) = if q.view == View::Disk || q.view == View::Tab {
         let scope = q.effective_scope().unwrap_or(ScopeArg::Tab);
-        let keys: Vec<u64> = match scope {
+        let mut keys: Vec<u64> = match scope {
             ScopeArg::Pane => vec![session],
             ScopeArg::Tab => panes_of_tab,
             ScopeArg::Window => window_sessions,
             ScopeArg::Request => request.map_or_else(|| vec![session], |r| r.sessions),
             ScopeArg::Aterm | ScopeArg::Global => panes.iter().map(|p| p.key).collect(),
         };
+        if !owner_class {
+            keys.retain(|key| *key == session);
+        }
         let mut cwds: Vec<PaneCwd> = Vec::new();
         for &k in &keys {
             let path = if k == session {
@@ -1174,7 +1509,7 @@ fn gather(
     } else {
         Vec::new()
     };
-    Gathered {
+    Ok(Gathered {
         target,
         tabs,
         roots,
@@ -1182,9 +1517,10 @@ fn gather(
         stores,
         volume,
         caller_panes,
+        event_caller,
         home,
         held: None,
-    }
+    })
 }
 
 /// What aterm's own passes do by themselves on this Mac, as `sys disk held` says them.
@@ -2494,6 +2830,13 @@ struct Since {
     gap: Option<Gap>,
 }
 
+struct EventCut {
+    held: Option<Held>,
+    head: Cursor,
+    events: Vec<Event>,
+    gap: Option<Gap>,
+}
+
 fn plan_since(
     shared: &Shared,
     q: &SysQuery,
@@ -2523,22 +2866,34 @@ fn plan_since(
         seq: c.seq,
         ..key.clone()
     });
-    let gap = base.is_none().then(|| {
-        if shared.kept_at(c.seq) {
-            Gap::OtherRequest
-        } else {
-            Gap::Evicted
-        }
-    });
+    let gap = if !covered {
+        Some(Gap::Evicted)
+    } else {
+        base.is_none().then(|| {
+            if shared.kept_at(c.seq) {
+                Gap::OtherRequest
+            } else {
+                Gap::Evicted
+            }
+        })
+    };
     Ok(Since { base, events, gap })
 }
 
 /// `sys` on the control socket.
 pub(crate) fn cmd_sys(
     store: &Store,
-    session: u64,
-    term: &Arc<Mutex<Terminal>>,
-    master: i32,
+    target: AuthorizedTarget<'_>,
+    owner_class: bool,
+    rest: &str,
+) -> String {
+    cmd_sys_on(&SYS, store, target, owner_class, rest)
+}
+
+fn cmd_sys_on(
+    shared: &Shared,
+    store: &Store,
+    target: AuthorizedTarget<'_>,
     owner_class: bool,
     rest: &str,
 ) -> String {
@@ -2546,14 +2901,22 @@ pub(crate) fn cmd_sys(
         Ok(q) => q,
         Err(usage) => return usage.to_owned(),
     };
-    if let Some(target) = q.name.as_ref() {
-        return crate::sys_naming::command(&SYS, session, target.clone(), owner_class, q.json);
+    if let Some(name) = q.name.as_ref() {
+        return crate::sys_naming::command(
+            shared,
+            target.session,
+            name.clone(),
+            owner_class,
+            q.json,
+        );
     }
-    let (held, state) = SYS.fresh_for(
+    let (held, state) = shared.fresh_for(
         &q,
         &crate::vitals_host::SPLIT_ARMED,
         &crate::vitals_host::JOBS_ARMED,
         &crate::vitals_host::HARDWARE_ARMED,
+        &crate::vitals_host::SCHEDULING_ARMED,
+        &crate::vitals_host::SELF_CPU_ARMED,
     );
     let held = with_services(
         &q,
@@ -2561,24 +2924,26 @@ pub(crate) fn cmd_sys(
         || aterm_uds::services::read(aterm_vitals::services::followed_from),
         crate::services_watch::filed(),
     );
-    let (panes, machine) = SYS.facts();
-    let g = gather(
+    let (panes, machine) = shared.facts();
+    let g = match gather(
         store,
-        session,
-        term,
-        master,
+        &target,
         &panes,
         &q,
         held.as_ref().map(|h| h.snap.as_ref()),
         held.as_ref().and_then(|h| h.processes.as_deref()),
-    );
+        owner_class,
+    ) {
+        Ok(gathered) => gathered,
+        Err(refusal) => return refusal,
+    };
     if q.effective_scope() == Some(ScopeArg::Request) && g.target.request.is_none() {
         return format!(
             "ERR sys scope=request: {} belongs to no request\n",
             g.target.sid
         );
     }
-    answer(&SYS, &q, held.as_ref(), state, &machine, &g, owner_class)
+    answer(shared, &q, held.as_ref(), state, &machine, &g, owner_class)
 }
 
 /// Whether `snap`'s split by coalition read rows: while no Deck is in view it can be cold
@@ -2625,6 +2990,18 @@ fn answer(
     g: &Gathered,
     owner_class: bool,
 ) -> String {
+    let event_cut = if q.view == View::Events {
+        match shared.event_cut(q.since, *EPOCH) {
+            Ok(cut) => Some(cut),
+            Err(refusal) => return refusal,
+        }
+    } else {
+        None
+    };
+    let held = match &event_cut {
+        Some(cut) => cut.held.as_ref(),
+        None => held,
+    };
     let mut state = state;
     let age_ms = if let Some(held) = held {
         let now = shared.now();
@@ -2635,22 +3012,31 @@ fn answer(
         } else {
             held.observed_at.age_at(now)
         };
-        let Some(mut age) = age else {
+        if age.is_none() && q.view != View::Events {
             return "ERR sys observation clock unavailable\n".to_owned();
-        };
+        }
+        if age.is_none() {
+            state = Freshness::Stale;
+        }
+        let mut age = age;
         let part = match q.view {
-            View::Aterm => {
+            View::Aterm | View::Groups => {
                 if let Some(receipt) = held.processes.as_ref().filter(|r| r.seq == held.snap.seq) {
                     let Some(memory_age) = receipt.observed_at.age_at(now) else {
                         return "ERR sys observation clock unavailable\n".to_owned();
                     };
-                    age = age.max(memory_age);
+                    age = age.map(|age| age.max(memory_age));
                 }
-                Part::SplitMemory
+                if q.view == View::Groups {
+                    Part::Groups
+                } else {
+                    Part::SplitMemory
+                }
             }
             View::Why | View::Overview | View::Tab | View::Global | View::Mem => Part::Split,
             View::Jobs => Part::Jobs,
             View::Left => Part::Left,
+            View::History | View::Events => Part::History,
             _ => Part::Whole,
         };
         let ttl = Duration::from_millis(
@@ -2663,18 +3049,27 @@ fn answer(
                 || fresh_age(held, part, landed_for(held, part), now).is_none_or(|age| age > ttl))
         {
             state = Freshness::Stale;
+        } else if state == Freshness::Fresh && part == Part::Groups {
+            state = answered_for(held, part);
         }
-        let Ok(age_ms) = u64::try_from(age.as_millis()) else {
+        let Ok(age_ms) = age.map(|age| u64::try_from(age.as_millis())).transpose() else {
             return "ERR sys observation age out of range\n".to_owned();
         };
         age_ms
     } else {
-        0
+        None
     };
-    let head = Cursor {
-        epoch: *EPOCH,
-        seq: held.map_or(0, |h| h.snap.seq).max(shared.head_seq()),
-    };
+    let head = event_cut.as_ref().map_or_else(
+        || Cursor {
+            epoch: *EPOCH,
+            seq: if q.view == View::History {
+                held.map_or(0, |h| h.snap.seq)
+            } else {
+                held.map_or(0, |h| h.snap.seq).max(shared.head_seq())
+            },
+        },
+        |cut| cut.head,
+    );
     let key = ReplyKey {
         seq: head.seq,
         view: q.view,
@@ -2689,9 +3084,17 @@ fn answer(
         owner_class,
         json: q.json,
     };
-    let since = match plan_since(shared, q, head, &key) {
-        Ok(s) => s,
-        Err(refusal) => return refusal,
+    let since = if let Some(cut) = &event_cut {
+        Since {
+            base: None,
+            events: cut.events.clone(),
+            gap: cut.gap,
+        }
+    } else {
+        match plan_since(shared, q, head, &key) {
+            Ok(s) => s,
+            Err(refusal) => return refusal,
+        }
     };
     let ctx = Ctx {
         snap: held.map(|h| h.snap.as_ref()),
@@ -2703,6 +3106,7 @@ fn answer(
         target: &g.target,
         tabs: &g.tabs,
         caller_panes: g.caller_panes.as_deref(),
+        event_caller: g.event_caller.as_ref(),
         owner_class,
         volume: g.volume.as_ref(),
         roots: &g.roots,
@@ -2714,21 +3118,24 @@ fn answer(
         head_seq: head.seq,
         held: g.held.as_ref(),
     };
+    // History has no delta grammar; Events cursors belong to the retained stream itself.
+    let cache_reply = held.is_some() && !matches!(q.view, View::History | View::Events);
     if q.json {
+        let json = render_json(q, &ctx);
         let mut reply = Reply {
             view: q.view,
             form: q.form,
             scope: q.view.default_scope().and(q.effective_scope()),
             subject: aterm_vitals::sys::why::subject_word(q, ctx.snap),
             lines: Vec::new(),
-            json: Some(render_json(q, &ctx)),
+            json: Some(json),
         };
         if q.instances_all
             && let Some(j) = reply.json.as_mut()
         {
             j.set("instances", aterm_vitals::sys::json::Jv::s("this"));
         }
-        if held.is_some() {
+        if cache_reply {
             shared.remember(key, Fingerprints::default());
         }
         let body = reply
@@ -2750,7 +3157,7 @@ fn answer(
             value: false,
         });
     }
-    if held.is_some() {
+    if cache_reply {
         shared.remember(key, fingerprints(&reply));
     }
     let delta = since.base.as_ref().is_some_and(|base| {

@@ -558,14 +558,15 @@ pub fn put_tried(store: &Store, key: &str, tried: Option<&Tried>) -> io::Result<
 /// account `email`'s window store's record that a sign-in in aterm's window signed it in, the
 /// mailbox configuration files the window reads a login code through (the store's and
 /// `~/.config/aterm`'s, `home` being the owner's), and the account's saved Google mail grant
-/// there, which lets the window read a Gmail row's code with no password
+/// there (an account with no address known, `email` `None`, has neither: the mailbox
+/// configuration files alone), which lets the window read a Gmail row's code with no password
 /// (`MailboxConfig::window_reads`). `None` where none is there. The vault's two mailbox entries
 /// are no files and carry no time of their own (the vault's `state.toml` is rewritten about
 /// once a minute, each time this Mac hears the vault, whatever changed), so they date nothing
 /// here: what they let through is judged by whether the window reads the account's mailbox now
 /// ([`mailbox_read`]).
 #[must_use]
-pub fn route_at(store: &Store, home: Option<&Path>, email: &str) -> Option<u64> {
+pub fn route_at(store: &Store, home: Option<&Path>, email: Option<&str>) -> Option<u64> {
     route_paths(store, home, email)
         .iter()
         .filter_map(|path| {
@@ -582,17 +583,17 @@ pub fn route_at(store: &Store, home: Option<&Path>, email: &str) -> Option<u64> 
 
 /// The files whose last write [`route_at`] reads for the account `email`: the window store's
 /// record of its sign-in (macOS), the mailbox configuration files (the store's and
-/// `~/.config/aterm`'s) and its saved Google mail grant. The vault's two mailbox entries are no
-/// files, and none is named here.
+/// `~/.config/aterm`'s) and its saved Google mail grant; the mailbox configuration files alone
+/// where `email` is `None`. The vault's two mailbox entries are no files, and none is named here.
 #[must_use]
-pub fn route_paths(store: &Store, home: Option<&Path>, email: &str) -> Vec<PathBuf> {
+pub fn route_paths(store: &Store, home: Option<&Path>, email: Option<&str>) -> Vec<PathBuf> {
     use super::headless_oauth::MAILBOX_TOML_FILE;
     let mut paths: Vec<PathBuf> = vec![store.dir.join(MAILBOX_TOML_FILE)];
     #[cfg(target_os = "macos")]
-    paths.push(super::signin_window::store_marker(&store.dir, email));
+    paths.extend(email.map(|email| super::signin_window::store_marker(&store.dir, email)));
     if let Some(home) = home {
         paths.push(home.join(".config/aterm").join(MAILBOX_TOML_FILE));
-        paths.extend(aterm_mail::oauth::session::grant_file(home, email));
+        paths.extend(email.and_then(|email| aterm_mail::oauth::session::grant_file(home, email)));
     }
     paths
 }

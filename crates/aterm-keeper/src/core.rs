@@ -66,6 +66,29 @@ pub trait KeeperEnv {
         let _ = (pid, marker);
         MarkerEvidence::Unknown
     }
+    /// What stands at this keeper's own executable path now, beside the file it started as
+    /// ([`KeeperCore::restart_when_safe`]'s second condition).
+    fn image(&mut self) -> ImageLook {
+        ImageLook::Unknown
+    }
+}
+
+/// What a look at the keeper's executable path finds ([`KeeperEnv::image`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageLook {
+    /// The file this keeper started as (and, run from its own copy, copied) still stands there:
+    /// launchd would start this same build again.
+    Same,
+    /// Nothing to compare: no file was recorded at the start, or the path does not read now (an
+    /// update between its two renames, an app moved away). Never read as replaced.
+    Unknown,
+    /// Another file stands at this path now, a build at least as new as this keeper (its
+    /// bundle's version says so).
+    Replaced(String),
+    /// Another file stands at this path now, but not one known to be at least as new as this
+    /// keeper: its bundle's version is older, or does not read. A restart would start an older
+    /// build, or one nothing can rank.
+    Older(String),
 }
 
 /// What a window's crash marker says (`aterm-gui`'s `crash_signal`: created empty at every start, `flock`ed by its owner for its whole life, unlinked by its exit path, and written only by the fatal-signal handler).
@@ -337,6 +360,139 @@ pub enum Out {
     WatchPid(u32),
     /// Relaunch the app (`/usr/bin/open -a <own bundle>`).
     Relaunch,
+    /// Journal this line about a wanted restart in the keeper's log.
+    Restart(RestartNote),
+    /// A wanted restart may go: exit with status 0, so that launchd's KeepAlive starts the
+    /// replaced executable at this path ([`KeeperCore::restart_when_safe`]). The caller reads
+    /// every frame already waiting first and asks [`KeeperCore::restart_check`] again, since one
+    /// of them may make it unsafe.
+    Exit { replaced: String },
+}
+
+/// What keeps a wanted restart from exiting now: the first the keeper finds, in this order
+/// ([`KeeperCore::restart_ready`]). Each custody state but a master that a connected window
+/// claims alone is something a restarted keeper would not hold, since only a live window's link
+/// tells a new keeper again what it holds (each REGISTER, its COMPANION or COMPANION_RELEASE, its
+/// META, each owed RELEASE).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartHold {
+    /// Masters a quit kept for the next window: orphans its BYE named, and the keep sets of BYEs
+    /// whose window's end is not judged yet ([`KeeperCore::bye_keeping`]).
+    Kept(usize),
+    /// Masters whose last window crashed, waiting for the next one's HELLO.
+    Orphaned(usize),
+    /// Masters offered to a window that has not registered them yet.
+    Offered(usize),
+    /// Masters held for an update's successor.
+    Held(usize),
+    /// An update under way: a PENDING in flight, one whose outgoing window is not judged yet, or
+    /// a master two windows claim.
+    Update,
+    /// Masters a claimant holds that is no connected window: its end is not judged yet.
+    Unjudged(usize),
+    /// Masters whose crash-restore state only the keeper holds: a region an ended claim left
+    /// (offered again if the window that claims it now dies before its own COMPANION), or a
+    /// reader gone during an update.
+    Regions(usize),
+    /// The relaunch lane is not idle: a relaunch due or under way, a relaunched window not yet
+    /// [`HEALTHY_MS`] old, or the brake holding. A streak left in an idle lane does not hold: a
+    /// restarted keeper's fresh brake loses no session, and a restart starts another build.
+    Relaunch,
+    /// The executable at its path is still the file this keeper started as.
+    SameImage,
+    /// The executable at its path cannot be compared ([`ImageLook::Unknown`]).
+    ImageUnknown,
+    /// The executable at its path is another file, but not a build known to be at least as new
+    /// as this keeper ([`ImageLook::Older`]).
+    OlderImage,
+}
+
+impl RestartHold {
+    /// One word for the status line's `held_by=`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Kept(_) => "kept",
+            Self::Orphaned(_) => "orphaned",
+            Self::Offered(_) => "offered",
+            Self::Held(_) => "held",
+            Self::Update => "update",
+            Self::Unjudged(_) => "unjudged",
+            Self::Regions(_) => "regions",
+            Self::Relaunch => "relaunch",
+            Self::SameImage => "same-image",
+            Self::ImageUnknown => "image-unknown",
+            Self::OlderImage => "older-image",
+        }
+    }
+}
+
+impl std::fmt::Display for RestartHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masters = |n: &usize| if *n == 1 { "master" } else { "masters" };
+        match self {
+            Self::Kept(n) => write!(f, "{n} {} a quit kept for the next window", masters(n)),
+            Self::Orphaned(n) => write!(f, "{n} orphaned {} for the next window", masters(n)),
+            Self::Offered(n) => write!(
+                f,
+                "{n} {} offered to a window that has not registered them",
+                masters(n)
+            ),
+            Self::Held(n) => write!(f, "{n} {} held for an update's successor", masters(n)),
+            Self::Update => f.write_str("an update under way"),
+            Self::Unjudged(n) => {
+                write!(f, "{n} {} whose window's end is not judged yet", masters(n))
+            }
+            Self::Regions(n) => write!(
+                f,
+                "the crash-restore state of {n} {} that only the keeper holds",
+                masters(n)
+            ),
+            Self::Relaunch => f.write_str("the relaunch lane, which is not idle"),
+            Self::SameImage => {
+                f.write_str("its executable's path, which still holds the file it started as")
+            }
+            Self::ImageUnknown => f.write_str("its executable's path, which cannot be compared"),
+            Self::OlderImage => f.write_str(
+                "its executable's path, which holds a build older than this keeper, or one whose \
+                 version does not read",
+            ),
+        }
+    }
+}
+
+/// A line the keeper journals about a wanted restart ([`Out::Restart`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartNote {
+    /// The window process `pid` asked.
+    Wanted { pid: u32 },
+    /// It cannot exit yet; this holds it (said again only when what holds it changes).
+    Held(RestartHold),
+    /// No window that asked is connected any more: the restart is not wanted.
+    Lapsed,
+}
+
+impl std::fmt::Display for RestartNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wanted { pid } => write!(f, "wanted by window pid {pid}"),
+            Self::Held(hold) => write!(f, "held by {hold}"),
+            Self::Lapsed => f.write_str("no window that asked is connected; not wanted"),
+        }
+    }
+}
+
+/// Where a window's RESTART_WHEN_SAFE stands ([`KeeperCore::restart_when_safe`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Restart {
+    /// No connected window asks.
+    #[default]
+    Unwanted,
+    /// These connections asked; `held` is what held the exit at the last check.
+    Wanted {
+        askers: std::collections::BTreeSet<ConnId>,
+        held: Option<RestartHold>,
+    },
 }
 
 /// The §5.4 verdict on one dead peer.
@@ -717,6 +873,8 @@ pub struct KeeperCore {
     /// here as a window, or that died before its outgoing window's Commit was judged
     /// ([`Self::peer_died`]), kept until its holds are judged ([`Self::resolve_holds`]).
     quiet_ends: BTreeMap<u32, i32>,
+    /// Whether a window asked this keeper to restart ([`Self::restart_when_safe`]).
+    restart: Restart,
 }
 
 impl KeeperCore {
@@ -823,7 +981,14 @@ impl KeeperCore {
             ends: EndCounts::default(),
             last_verdict: None,
             quiet_ends: BTreeMap::new(),
+            restart: Restart::Unwanted,
         }
+    }
+
+    /// Whether a window asked this keeper to restart, for status and tests.
+    #[must_use]
+    pub const fn restart(&self) -> &Restart {
+        &self.restart
     }
 
     /// How the keeper has judged the ends it saw.
@@ -1562,6 +1727,155 @@ impl KeeperCore {
         }
     }
 
+    /// RESTART_WHEN_SAFE: the window on `conn`, a newer build than this keeper's, asks it to
+    /// exit so that launchd starts the program at its executable's path again. The keeper only
+    /// records the want here. It decides at the end of every turn ([`Self::tick`], which calls
+    /// [`Self::restart_check`]) and exits ([`Out::Exit`]) once two things hold together:
+    /// nothing only it holds would be lost ([`Self::restart_ready`], [`RestartHold`]), and another
+    /// file stands at its executable's path, a build at least as new as this keeper's
+    /// ([`KeeperEnv::image`]). That second condition makes a restart into the same build, or
+    /// into an older one, impossible, so a restart never loops.
+    ///
+    /// A wanted restart has no deadline. A deadline would leave a newer window on an older
+    /// keeper until logout, which is the defect this mends. A late exit loses no more than an
+    /// early one, because it waits for the same two conditions. The want is tied to the
+    /// connections that asked instead: once none of them is a connected window (each quit,
+    /// crashed or lost its link), it lapses ([`RestartNote::Lapsed`]). So a want never outlives
+    /// every window that stood behind it, and a later window that is still newer asks again on
+    /// its own connection. Only a window may ask: from any other peer it is refused.
+    pub fn restart_when_safe(&mut self, conn: ConnId) -> Vec<Out> {
+        let pid = match self.peers.get(&conn) {
+            Some(p) if p.is_app() && p.connected() => p.pid,
+            _ => {
+                return vec![Out::Refused {
+                    conn,
+                    code: RefuseCode::WrongClass,
+                    rdev: 0,
+                }];
+            }
+        };
+        let asked = match &mut self.restart {
+            Restart::Wanted { askers, .. } => askers.insert(conn),
+            Restart::Unwanted => {
+                self.restart = Restart::Wanted {
+                    askers: std::iter::once(conn).collect(),
+                    held: None,
+                };
+                true
+            }
+        };
+        if asked {
+            vec![Out::Restart(RestartNote::Wanted { pid })]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Decide a wanted restart now: [`Out::Exit`] when [`Self::restart_ready`] says it may go, a
+    /// [`RestartNote::Held`] when what holds it changed, a [`RestartNote::Lapsed`] when no window
+    /// that asked is connected; nothing while no restart is wanted.
+    pub fn restart_check(&mut self, env: &mut dyn KeeperEnv) -> Vec<Out> {
+        let Restart::Wanted { mut askers, held } = std::mem::take(&mut self.restart) else {
+            return Vec::new();
+        };
+        askers.retain(|c| {
+            self.peers
+                .get(c)
+                .is_some_and(|p| p.is_app() && p.connected())
+        });
+        if askers.is_empty() {
+            return vec![Out::Restart(RestartNote::Lapsed)];
+        }
+        match self.restart_ready(env) {
+            Ok(replaced) => {
+                self.restart = Restart::Wanted { askers, held: None };
+                vec![Out::Exit { replaced }]
+            }
+            Err(hold) => {
+                self.restart = Restart::Wanted {
+                    askers,
+                    held: Some(hold),
+                };
+                if held == Some(hold) {
+                    Vec::new()
+                } else {
+                    vec![Out::Restart(RestartNote::Held(hold))]
+                }
+            }
+        }
+    }
+
+    /// Whether this keeper may exit for a restart now: the replaced executable's path, or what
+    /// holds it ([`RestartHold`], the first found). Custody comes first, so the executable is
+    /// looked at only once nothing would be lost.
+    ///
+    /// # Errors
+    /// What holds it.
+    pub fn restart_ready(&self, env: &mut dyn KeeperEnv) -> Result<String, RestartHold> {
+        if let Some(hold) = self.custody_hold() {
+            return Err(hold);
+        }
+        match env.image() {
+            ImageLook::Replaced(path) => Ok(path),
+            ImageLook::Same => Err(RestartHold::SameImage),
+            ImageLook::Unknown => Err(RestartHold::ImageUnknown),
+            ImageLook::Older(_) => Err(RestartHold::OlderImage),
+        }
+    }
+
+    /// The first thing a keeper that exited now would lose, if any. A master claimed only by
+    /// connected windows is not lost: each one's link tells a restarted keeper again what it
+    /// holds. Every other state is held, and so is any state this does not know to be safe.
+    fn custody_hold(&self) -> Option<RestartHold> {
+        let window = |c: &ConnId| {
+            self.peers
+                .get(c)
+                .is_some_and(|p| p.is_app() && p.connected())
+        };
+        let mut kept: usize = self.peers.values().map(|p| p.keeps.len()).sum();
+        let (mut orphaned, mut offered, mut held) = (0, 0, 0);
+        let (mut shared, mut unjudged, mut regions) = (0, 0, 0);
+        for rec in self.records.values() {
+            match rec.state {
+                RecordState::Orphaned if rec.kept => kept += 1,
+                RecordState::Orphaned => orphaned += 1,
+                RecordState::Offered { .. } => offered += 1,
+                RecordState::Held { .. } => held += 1,
+                RecordState::Claimed => {
+                    if rec.claimants.len() > 1 {
+                        shared += 1;
+                    } else if rec.claimants.is_empty() || !rec.claimants.iter().all(window) {
+                        unjudged += 1;
+                    }
+                    // A poison count beside no retained region is lost harmlessly: the count
+                    // only ever limits the offers of a retained region.
+                    let j = &rec.journal;
+                    if j.retained.is_some() || j.reader_gone.is_some() {
+                        regions += 1;
+                    }
+                }
+            }
+        }
+        let update = !self.pending.is_empty()
+            || !self.settled.is_empty()
+            || !self.quiet_ends.is_empty()
+            || shared > 0;
+        let relaunch = self.relaunch != RelaunchState::Idle;
+        [
+            (kept > 0).then_some(RestartHold::Kept(kept)),
+            (orphaned > 0).then_some(RestartHold::Orphaned(orphaned)),
+            (offered > 0).then_some(RestartHold::Offered(offered)),
+            (held > 0).then_some(RestartHold::Held(held)),
+            update.then_some(RestartHold::Update),
+            (unjudged > 0).then_some(RestartHold::Unjudged(unjudged)),
+            (regions > 0).then_some(RestartHold::Regions(regions)),
+            relaunch.then_some(RestartHold::Relaunch),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+    }
+
     /// PENDING: the update successor's kernel pid, sent before the grant.
     pub fn pending(&mut self, conn: ConnId, pid: u32, now: u64, birth: Option<Birth>) -> Vec<Out> {
         let (from_pid, from_birth) = match self.peers.get(&conn) {
@@ -1753,6 +2067,9 @@ impl KeeperCore {
             out.extend(self.resolve_holds(now, env));
         }
         out.extend(self.run_relaunch(now));
+        // Every turn ends here, after whatever it read and judged: the one place a wanted
+        // restart is decided, each time anything could have made it safe.
+        out.extend(self.restart_check(env));
         out
     }
 
@@ -2332,6 +2649,14 @@ impl KeeperCore {
                     .filter(|p| p.is_app() && p.connected() && p.marker.is_some())
                     .count()
             ),
+            match &self.restart {
+                Restart::Unwanted => "restart=unwanted".to_string(),
+                Restart::Wanted { askers, held } => format!(
+                    "restart=wanted askers={} held_by={}",
+                    askers.len(),
+                    held.map_or("nothing", RestartHold::word)
+                ),
+            },
         ];
         for (rdev, rec) in &self.records {
             lines.push(format!(
@@ -2364,3 +2689,7 @@ mod late_hello_tests;
 #[cfg(test)]
 #[path = "core_companion_tests.rs"]
 mod companion_tests;
+
+#[cfg(test)]
+#[path = "core_restart_tests.rs"]
+mod restart_tests;

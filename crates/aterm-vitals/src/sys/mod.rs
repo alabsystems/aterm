@@ -106,8 +106,8 @@ pub enum Freshness {
     Stale,
     /// The first sample of a cold instance: rates are not known yet.
     Warming,
-    /// A reading as fresh as asked whose stalled lanes' figures are unknown
-    /// ([`crate::lanes`]): every other figure is fresh.
+    /// A reading as fresh as asked with incomplete source coverage or stalled lanes
+    /// ([`crate::lanes`]): unavailable figures stay unknown and observed figures stay qualified.
     Partial,
 }
 
@@ -365,8 +365,8 @@ pub struct Ctx<'a> {
     pub epoch: u64,
     /// When the snapshot was taken, unix ms.
     pub as_of_unix_ms: u64,
-    /// Its age when the reply was made, ms.
-    pub age_ms: u64,
+    /// Its age when the reply was made, ms, where the original observation clock established it.
+    pub age_ms: Option<u64>,
     /// How fresh it is.
     pub state: Freshness,
     /// The machine's words.
@@ -375,8 +375,13 @@ pub struct Ctx<'a> {
     pub target: &'a Target,
     /// Every session the host shows.
     pub tabs: &'a [TabFact],
-    /// The sessions of the caller's own tab.
+    /// Pane keys authorized by the host, never taken from a query's caller or layout.
+    /// Required for nonowners; absence authorizes no pane. For owners this may restrict
+    /// caller-scoped projections such as groups without expanding their authority.
     pub caller_panes: Option<&'a [u64]>,
+    /// The live session generation admitted by the host, for private historical events.
+    /// This proof is independent of optional process observations; its nonce is never printed.
+    pub event_caller: Option<&'a crate::events::SessionScope>,
     /// Machine-wide rows (top processes outside the caller's scope) may print.
     pub owner_class: bool,
     /// The target's volume, for `disk`.

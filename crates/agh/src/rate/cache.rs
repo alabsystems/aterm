@@ -14,15 +14,15 @@ pub(crate) struct Cached {
     pub body: Vec<u8>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const ENTRY_MAX: usize = 256 * 1024;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const ENTRIES_MAX: usize = 128;
 
 impl RateBook {
     /// Identity, origin, path/query and Accept are hashed together by the caller.
     pub(crate) fn cached(&self, key: &str, limit: u64) -> Option<Cached> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let dir = self.dir.as_ref()?.join("responses");
             let bytes = aterm_uds::private_file::read_private(&dir, key, ENTRY_MAX).ok()?;
@@ -43,7 +43,7 @@ impl RateBook {
                 body,
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (key, limit);
             None
@@ -53,7 +53,7 @@ impl RateBook {
     /// Cache at most 128 small representations in owner-only files (32 MiB total).
     /// Storage failure loses an optimization; it never changes a successful read.
     pub(crate) fn cache(&self, key: &str, answer: &Answered) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _ = (|| -> Option<()> {
             use aterm_uds::private_file::{PrivateLock, create_private_dir, write_private};
             let root = self.dir.as_ref()?;
@@ -109,7 +109,7 @@ impl RateBook {
             write_private(&dir, key, &bytes).ok()?;
             Some(())
         })();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let _ = (key, answer);
     }
 }

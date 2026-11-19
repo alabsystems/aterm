@@ -753,3 +753,27 @@ fn an_account_is_named_by_its_provider_and_address() {
         "only machines and accounts"
     );
 }
+
+#[test]
+fn machine_names_follow_the_resolved_label_even_when_it_is_withheld() {
+    let pk = keys::machine_pk("m7");
+    let mut book = Book::new();
+    book.write(1, &[], vec![put(&MACHINE, &pk, "label", json!("m7"))]);
+    let view = View {
+        cells: book.cells(),
+        ..View::empty_for_test()
+    };
+    let mut machines = cell::project(&MACHINE, &view.cells);
+    for resolved in [Some("m8"), None] {
+        machines
+            .rows
+            .get_mut(&pk)
+            .unwrap()
+            .claims
+            .insert("label".to_owned(), resolved.map(|label| json!(label)));
+        let names = Names::with_projections(&REGISTRY, &view, |name| {
+            (name == MACHINE.name).then_some(&machines)
+        });
+        assert_eq!(names.words("machine", &pk), resolved);
+    }
+}

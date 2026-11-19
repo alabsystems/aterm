@@ -220,20 +220,40 @@ pub(super) fn retire(dir: &Path, claim_name: &str) -> Result<()> {
 /// A pending permit starts at the custody witness: a writing open that finds none of
 /// its group in the log retires it ([`retire`]) before any append moves that witness.
 pub(super) fn read(dir: &Path, claim_name: &str, claim: &[u8]) -> Result<Boundary> {
+    read_with_bytes(dir, claim_name, claim).map(|(boundary, _)| boundary)
+}
+
+/// The permit file's bytes beside the claim `claim_name`, as [`read`] reads them; none without
+/// a file.
+///
+/// # Errors
+/// The file is unreadable.
+pub(super) fn bytes(dir: &Path, claim_name: &str) -> Result<Option<Vec<u8>>> {
+    match private_file::read_private(dir, &name(claim_name), LEN) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(PrivateFileError::Missing) => Ok(None),
+        Err(_) => Err(Error::new("table group permission is unreadable")),
+    }
+}
+
+/// [`read`], with the permit file's bytes it judged, where one stands.
+pub(super) fn read_with_bytes(
+    dir: &Path,
+    claim_name: &str,
+    claim: &[u8],
+) -> Result<(Boundary, Option<Vec<u8>>)> {
     if claim.len() != CLAIM_LEN {
         return Err(Error::new("invalid table custody for group check"));
     }
-    let raw = private_file::read_private(dir, &name(claim_name), LEN);
+    let raw = bytes(dir, claim_name);
     match private_file::read_private(dir, claim_name, CLAIM_LEN) {
         Ok(current) if current == claim => {}
         Ok(_) | Err(PrivateFileError::Missing) => return Err(Error::snapshot_changed()),
         Err(_) => return Err(Error::new("table custody unavailable during group check")),
     }
     let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
-    let bytes = match raw {
-        Ok(bytes) => bytes,
-        Err(PrivateFileError::Missing) => return Ok(acknowledged.into()),
-        Err(_) => return Err(Error::new("table group permission is unreadable")),
+    let Some(bytes) = raw? else {
+        return Ok((acknowledged.into(), None));
     };
     if bytes.len() != LEN || &bytes[..5] != MAGIC || bytes[5..37] != binding(claim)? {
         return Err(Error::new(
@@ -249,15 +269,18 @@ pub(super) fn read(dir: &Path, claim_name: &str, claim: &[u8]) -> Result<Boundar
                 "completed table group differs from custody witness",
             ));
         }
-        return Ok(acknowledged.into());
+        return Ok((acknowledged.into(), Some(bytes)));
     }
     if before != acknowledged {
         return Err(Error::new(
             "pending table group differs from custody witness",
         ));
     }
-    Ok(Boundary {
-        acknowledged,
-        end: Some(end),
-    })
+    Ok((
+        Boundary {
+            acknowledged,
+            end: Some(end),
+        },
+        Some(bytes),
+    ))
 }

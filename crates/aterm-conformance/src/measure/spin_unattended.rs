@@ -5,18 +5,30 @@
 //! and effect defaults, focused and on glass, that nobody touched for the attention window
 //! ([`ATTENTION`]), judged over its row's window by counts, never by time.
 //!
-//! [`decide`] is pure: it reads the take's `ctl metrics` lines and `trail status` replies at the
-//! window's two edges, with the window's length as the bench's clock bounds it, and passes it,
-//! fails it naming each bound it broke, leaves it undecided naming why its counts are no
-//! evidence (a loop behind the readings' cadence, a reading handed over late enough to grey the
-//! deck, frames only a loop late on its timers explains), refuses it (the window took an event or
-//! lost its state) or leaves it unanswered (a reply lacks a field the take reads). The CPU the
-//! window took is reported beside it (`Sampled`), never judged.
+//! [`decide`] is pure: it reads the readiness wait's last `trail status` reply, taken just after
+//! the take's one `metrics reset`, and the `ctl metrics` line read just after it, then the `ctl
+//! metrics` lines at the window's two edges, the first [`SETTLE`] after that one, and its closing
+//! `trail status` reply, with the window's length as the bench's clock bounds it, and passes it,
+//! fails it naming each bound it broke, leaves it undecided naming why its counts are no evidence
+//! (a loop behind the readings' cadence, a reading handed over late enough to grey the deck,
+//! frames only a loop late on its timers explains, journal or facts fires only a loop that ran
+//! late explains), refuses it (the window took an event or lost its state) or leaves it
+//! unanswered (a reply lacks a field the take reads). The CPU the window took is reported beside
+//! it (`Sampled`), never judged.
+//!
+//! The window opens with no `trail status` of its own: that read is a wake that is activity
+//! (`aterm-gui`'s `Wake::only_observes` is false for `Wake::TrailStatus`), a desk mark that owes
+//! the crash journal a capture and the disk walker a read of the panes' facts after it, so a read
+//! at the open would book its own work in the window. The readiness wait's last read stands for
+//! the opening edge instead, and its work ends inside the settle ([`SETTLE`]) on a loop that ran
+//! less late than [`spilled`] reads. Every `metrics` line the decision reads runs from the one
+//! reset, so nothing between two of its reads goes uncounted.
 
 use std::time::Duration;
 
 use super::{BLINK_LANE, LIVE_LANE, SpinRow, fires_between};
 use crate::measure::instance::{CouldNotRun, field, uint_field};
+use crate::measure::rewind::ms_field_us;
 use crate::measure::starvation::Disposition;
 
 /// How long after a person's last touch a window stays attended: `aterm-gui`'s
@@ -40,6 +52,14 @@ pub const READING_PERIOD: Duration = Duration::from_secs(5);
 /// [`READING_PERIOD`] after the last ask. The take reads the window unattended after the lapse,
 /// so from 4 s after that read a loop on its timers asks a reading at every half-slot of the
 /// background grid, which [`UnattendedBounds::readings_min`] counts on.
+///
+/// The settle also outlasts the work the desk marks before it owe, that read's among them
+/// ([`JOURNAL_FIRES_PER_MARK`], [`FACTS_FIRES_PER_MARK`]): the journal's last fire for them comes
+/// at most two [`MIN_WRITE_INTERVAL`]s after the `metrics` read the window's marks count from,
+/// and the facts' read at most [`FACTS_EVERY`] after it, each step later by as much as the loop
+/// ran late, so none books in the window of a loop that ran less late than [`spilled`] reads. A
+/// mark in the settle itself may book its work in the window; the decision counts it
+/// ([`UnattendedCounts::marks`]).
 pub const SETTLE: Duration = READING_PERIOD;
 
 /// The Network State band's poll period while a window draws the deck's band and aterm has no
@@ -68,6 +88,82 @@ pub const WAKES_PER_FRAME_FIRE: u64 = 2;
 /// folds the Network State band's poll (`App::network_state_deadline`) and the Lab page's reads
 /// (`App::lab_state_deadline`) under the same owner, so its count holds them too.
 pub const READING_LANE: &str = "system_vitals";
+
+/// The deadline owner the crash journal's captures fire as (`App::crash_journal_wake`).
+/// `aterm-gui` folds an editor document's journal retry (`App::document_preparation_wake`) under
+/// the same owner; the take's window holds no editor.
+pub const JOURNAL_LANE: &str = "crash_journal";
+
+/// The deadline owner the disk walker's read of the panes' facts fires as
+/// (`App::diskwalk_deadline`).
+pub const FACTS_LANE: &str = "disk_facts";
+
+/// The crash journal's least interval between captures: `aterm-gui`'s
+/// `crash_journal::MIN_WRITE_INTERVAL`, private to that crate.
+pub const MIN_WRITE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long after a read of the panes' facts the next is due while a scope is demanded:
+/// `aterm-gui`'s `diskwalk_host::FACTS_EVERY`, private to that crate.
+pub const FACTS_EVERY: Duration = Duration::from_secs(1);
+
+/// The most [`JOURNAL_LANE`] fires one desk mark can owe, by `aterm-gui`'s `crash_journal::Lane`.
+/// A mark (`desk_activity`, counted wherever the loop marks the journal and the walker: a wake
+/// that is activity, a window event, the restore drain, a pane's front program moving) makes the
+/// journal owe a capture (`note_activity`), and every capture taken after one owes a settle
+/// capture [`MIN_WRITE_INTERVAL`] later (`offer`'s `settle_owed`), a fire. The capture itself runs
+/// in the mark's own turn where the last was taken that interval ago or more, and otherwise waits
+/// for the interval's end, one fire more. Each fire needs a mark since the capture before the one
+/// it follows, so each mark accounts for at most two.
+///
+/// A capture owed at once (`owed_now`: an owner's words, an agent's publication; or a ticket a
+/// word's verb asked, `Durable::ask`) runs in the turn that owed it on a desk the journal may
+/// write (`crash_journal_writable`), so it is no fire. A ticket's turn is the journal's own wake
+/// (`Wake::CrashJournalOwed`), a mark, as is the writer's wake after a failed write, which the
+/// capture again follows: a writer that fails is bounded by its failures, and the row does not
+/// judge the journal's writes. The decision reads the take's scratch world as owing none of the
+/// lane's other fires: a capture deferred because only titles moved (`TITLE_WRITE_INTERVAL`),
+/// which needs a program to retitle a tab; a capture owed at once on a desk the journal may not
+/// write yet (off glass, a restore pass queued, a handoff coming), which the take's window, on
+/// glass long past its launch, is not; and the settle at the end of a reopened journal's
+/// probation, which a scratch world's launch has no journal to reopen for.
+pub const JOURNAL_FIRES_PER_MARK: u64 = 2;
+
+/// The most [`FACTS_LANE`] fires one desk mark can owe: a mark makes a read of the panes' facts
+/// owed (`DiskwalkHost::note_activity`), the deadline is armed only while one is owed
+/// (`facts_deadline`), and a read pays what was owed, so each fire needs a mark since the read
+/// before it.
+pub const FACTS_FIRES_PER_MARK: u64 = 1;
+
+/// How many fires of a lane the desk marks before the settle may book in the window of a loop
+/// that ran up to `late` past a due: of the `steps` fires those marks can owe after the `metrics`
+/// read the window's marks count from ([`JOURNAL_FIRES_PER_MARK`] of [`MIN_WRITE_INTERVAL`],
+/// [`FACTS_FIRES_PER_MARK`] of [`FACTS_EVERY`]), the `k`th comes at most `k` steps of `step` and
+/// `late` after that read, and the window opens at least [`SETTLE`] after it, so each `k` with
+/// `k·(step + late) ≥ SETTLE`. Each fire needs a mark since the capture or read before the one it
+/// follows, so the marks before that read owe the window no more than `steps` together, however
+/// many they were.
+#[must_use]
+pub fn spilled(steps: u64, step: Duration, late: Duration) -> u64 {
+    let step = step.saturating_add(late).as_nanos();
+    if step == 0 {
+        return 0;
+    }
+    // The least such `k`; every `k` from it to `steps` is one.
+    let first = SETTLE.as_nanos().div_ceil(step).max(1);
+    u64::try_from(u128::from(steps).saturating_add(1).saturating_sub(first)).unwrap_or(u64::MAX)
+}
+
+/// The most a step of owed work can have run after its due, by a `ctl metrics` line: the loop's
+/// timer wake furthest past its deadline (`max_wake_late_ms`) and its longest turn
+/// (`max_turn_ms`), each since `metrics reset`, read as whole microseconds rounded up from the
+/// hundredths of a millisecond the line prints. The decision reads a step as waiting at most for
+/// its wake and one turn. `None` where the line lacks either.
+#[must_use]
+pub fn late(line: &str) -> Option<Duration> {
+    let wake = ms_field_us(line, "max_wake_late_ms")?;
+    let turn = ms_field_us(line, "max_turn_ms")?;
+    Some(Duration::from_micros(wake.saturating_add(turn)))
+}
 
 /// The `trail status` fields an unattended take records at each edge: what its readiness reads,
 /// and the motion and shed its effects saw, which load or the Mac's Reduce Motion can move and
@@ -141,9 +237,11 @@ pub fn fields(line: &str) -> String {
         .join(" ")
 }
 
-/// What an unattended take read: the `ctl metrics` lines as its window opened (just after
-/// `metrics reset`) and as it ended, its `trail status` replies at the same two edges, and how
-/// long the window between the two `metrics` reads can have run.
+/// What an unattended take read, every `ctl metrics` line since its one `metrics reset`, made
+/// just before the readiness wait's last `trail status` read: that reply, the `metrics` line read
+/// just after it, the `metrics` lines as its window opened ([`SETTLE`] after that one) and as it
+/// ended, its `trail status` reply as it ended, and how long the window between the opening and
+/// closing `metrics` reads can have run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnattendedReadings<'a> {
     /// The least the window can have run: the row's window, which the take waits out between
@@ -152,13 +250,18 @@ pub struct UnattendedReadings<'a> {
     /// The most: from just before the opening `metrics` read to just after the closing one, by
     /// the bench's clock.
     pub at_most: Duration,
+    /// The `trail status` reply that ended the readiness wait, the window's opening edge.
+    pub ready_trail: &'a str,
+    /// The `metrics` line read just after [`Self::ready_trail`]: the desk marks the settle and
+    /// the window count from.
+    pub ready: &'a str,
     pub opened: &'a str,
     pub ended: &'a str,
-    pub opened_trail: &'a str,
     pub ended_trail: &'a str,
 }
 
-/// The window's counts the decision read, each between the two `metrics` reads but the wakes.
+/// The window's counts the decision read, each between the two `metrics` reads but the marks
+/// and the lateness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnattendedCounts {
     /// The fires of each owner the row bounds ([`SpinRow::max_owner_fires`]), in its order.
@@ -173,15 +276,27 @@ pub struct UnattendedCounts {
     pub timer_wakes: u64,
     /// The frames presented.
     pub frames: u64,
-    /// Every loop wake since `metrics reset` (`event_wakes`).
+    /// Every loop wake (`event_wakes`).
     pub wakes: u64,
     /// The arms past their own deadline.
     pub arms: u64,
+    /// The fires of [`JOURNAL_LANE`].
+    pub journal: u64,
+    /// The fires of [`FACTS_LANE`].
+    pub facts: u64,
+    /// The desk marks in the settle and the window (`desk_activity`), from the line read just
+    /// after the readiness wait's last read to the closing one: each owes work that may book in
+    /// the window.
+    pub marks: u64,
+    /// The most a step of the work the marks before the settle owe can have run past its due:
+    /// [`late`] of the closing line, whose maxima run from the reset, which came before every
+    /// such step.
+    pub late: Duration,
 }
 
 /// What the code lets an unattended window do in a window of `at_least` to `at_most`, with the
-/// blink, live-edge and timer fires it counted. Where a bound is the decision's reading rather
-/// than the code's, its doc says so.
+/// blink, live-edge and timer fires it counted and the desk marks it and its settle counted.
+/// Where a bound is the decision's reading rather than the code's, its doc says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnattendedBounds {
     /// The fewest [`READING_LANE`] fires a window whose loop kept its cadence books. The window
@@ -226,11 +341,24 @@ pub struct UnattendedBounds {
     /// [`Self::flips`] and greys, and one for each flip in [`Self::carried_max`], whose timer wake
     /// is another owner's.
     pub wakes_max: u64,
+    /// The most [`JOURNAL_LANE`] fires the window's and its settle's desk marks owe:
+    /// [`JOURNAL_FIRES_PER_MARK`] each. A window that woke for nothing but its readings, which
+    /// only observe, owes none.
+    pub journal_max: u64,
+    /// The most [`FACTS_LANE`] fires the same marks owe: [`FACTS_FIRES_PER_MARK`] each.
+    pub facts_max: u64,
+    /// The most [`JOURNAL_LANE`] fires the marks before the settle may book in the window, by how
+    /// late the loop ran ([`spilled`]): fires past [`Self::journal_max`] by no more are no
+    /// evidence, and past it by more are work no mark asked.
+    pub journal_spilled: u64,
+    /// The same of [`FACTS_LANE`]'s, past [`Self::facts_max`].
+    pub facts_spilled: u64,
 }
 
 impl UnattendedBounds {
     /// The bounds of `row`'s window that ran at least `at_least` and at most `at_most`, from its
-    /// `counts` of the blink's, the live edge's and every owner's fires.
+    /// `counts` of the blink's, the live edge's and every owner's fires, of the desk marks in it
+    /// and in its settle, and of how late its loop ran.
     #[must_use]
     pub fn of(
         row: &SpinRow,
@@ -268,6 +396,10 @@ impl UnattendedBounds {
                 .max_wakes
                 .saturating_add(WAKES_PER_FRAME_FIRE.saturating_mul(flips.saturating_add(greys)))
                 .saturating_add(carried_max),
+            journal_max: JOURNAL_FIRES_PER_MARK.saturating_mul(counts.marks),
+            facts_max: FACTS_FIRES_PER_MARK.saturating_mul(counts.marks),
+            journal_spilled: spilled(JOURNAL_FIRES_PER_MARK, MIN_WRITE_INTERVAL, counts.late),
+            facts_spilled: spilled(FACTS_FIRES_PER_MARK, FACTS_EVERY, counts.late),
         }
     }
 }
@@ -298,8 +430,9 @@ pub struct UnattendedDecision {
     pub why: String,
     pub counts: UnattendedCounts,
     pub bounds: UnattendedBounds,
-    /// The take's [`FIELDS`] as its window opened, and as it ended.
-    pub opened: String,
+    /// The take's [`FIELDS`] as the readiness wait read it ready, the window's opening edge, and
+    /// as its window ended.
+    pub ready: String,
     pub ended: String,
 }
 
@@ -311,7 +444,9 @@ impl std::fmt::Display for UnattendedDecision {
             f,
             "unattended_verdict={:?} owner_fires={:?} live={} greys_max={} blink={} \
              readings={} readings_cadence={}..={} timer_wakes={} frames={} frames_max={} \
-             frames_late_max={} wakes={} wakes_max={} arms={} opened=[{}] ended=[{}]",
+             frames_late_max={} wakes={} wakes_max={} arms={} marks={} late={:?} \
+             journal={} journal_max={} journal_spilled={} facts={} facts_max={} \
+             facts_spilled={} ready=[{}] ended=[{}]",
             self.verdict,
             c.owner_fires,
             c.live,
@@ -327,7 +462,15 @@ impl std::fmt::Display for UnattendedDecision {
             c.wakes,
             b.wakes_max,
             c.arms,
-            self.opened,
+            c.marks,
+            c.late,
+            c.journal,
+            b.journal_max,
+            b.journal_spilled,
+            c.facts,
+            b.facts_max,
+            b.facts_spilled,
+            self.ready,
             self.ended
         )?;
         if !self.why.is_empty() {
@@ -339,39 +482,53 @@ impl std::fmt::Display for UnattendedDecision {
 
 /// Decide an unattended take from what it read ([`UnattendedReadings`]) against its `row`.
 ///
-/// The take is refused where either `trail status` reply does not read the scene's state
-/// ([`unready`]), or the window took any event other than a redraw since `metrics reset`
-/// (`os_window_events`): a touch attends the window again and a focus or occlusion change moves
-/// what it draws, so the counts would be another window's. Otherwise, with its
-/// [`UnattendedBounds`], it fails, naming each, where an owner the row bounds fired past its
-/// bound, the live edge past [`UnattendedBounds::greys_max`], [`READING_LANE`] past
-/// [`UnattendedBounds::readings_max`] (work under the readings' owner that their asks and the
-/// band's polls do not account for: a loop that falls behind fires fewer), the frames past
-/// [`UnattendedBounds::frames_late_max`], the wakes past [`UnattendedBounds::wakes_max`] or the
-/// past-deadline arms past the row's. Within every bound it is undecided, naming each reason,
-/// where [`READING_LANE`] fired under [`UnattendedBounds::readings_min`] (a loop that fell behind
-/// the readings' cadence, as on a machine that starved it), where the live edge fired at all (a
-/// still deck's grey: a reading handed over [`STALE_AFTER`] or more after its sample, as by a
-/// probe thread a machine starved of its Background lane), or where the frames passed
-/// [`UnattendedBounds::frames_max`] (frames only flips another owner's wake carried or greys
-/// explain). Any of these leaves its quiet counts no evidence. Else it passes.
+/// The take is refused where the readiness wait's last `trail status` reply (the window's
+/// opening edge) or its closing one does not read the scene's state ([`unready`]), or the window
+/// took any event other than a redraw (`os_window_events`) since `metrics reset`, which came just
+/// before that read: a touch attends the window again and a focus or occlusion change moves what
+/// it draws, so the counts would be another window's. Otherwise, with its [`UnattendedBounds`],
+/// it fails, naming each, where an owner the row bounds fired past its bound, the live edge past
+/// [`UnattendedBounds::greys_max`], [`READING_LANE`] past [`UnattendedBounds::readings_max`]
+/// (work under the readings' owner that their asks and the band's polls do not account for: a
+/// loop that falls behind fires fewer), the frames past [`UnattendedBounds::frames_late_max`],
+/// the wakes past [`UnattendedBounds::wakes_max`], the past-deadline arms past the row's, or
+/// [`JOURNAL_LANE`] or [`FACTS_LANE`] past what the window's and its settle's desk marks owe
+/// ([`UnattendedBounds::journal_max`], [`UnattendedBounds::facts_max`]) and the fires the marks
+/// before the settle may book in the window of a loop as late as it ran
+/// ([`UnattendedBounds::journal_spilled`], [`UnattendedBounds::facts_spilled`]): work no mark
+/// asked. Within every bound it is undecided, naming each reason, where [`READING_LANE`] fired
+/// under [`UnattendedBounds::readings_min`] (a loop that fell behind the readings' cadence, as on
+/// a machine that starved it), where the live edge fired at all (a still deck's grey: a reading
+/// handed over [`STALE_AFTER`] or more after its sample, as by a probe thread a machine starved of
+/// its Background lane), where the frames passed [`UnattendedBounds::frames_max`] (frames only
+/// flips another owner's wake carried or greys explain), or where [`JOURNAL_LANE`] or
+/// [`FACTS_LANE`] fired past what the marks in the settle and the window owe, by no more than
+/// the marks before the settle may book there. Any of these leaves its quiet counts no evidence.
+/// Else it passes.
 ///
 /// # Errors
 /// [`CouldNotRun::Refused`] for a take refused as above; [`CouldNotRun::Unanswered`] where a
 /// reply lacks a field the take reads ([`unanswered`], `os_window_events`,
-/// `deadline_fires_by_owner`, `timer_wakes`, `frames`, `past_deadline_arms`, `event_wakes`).
+/// `deadline_fires_by_owner`, `timer_wakes`, `frames`, `past_deadline_arms`, `event_wakes`,
+/// `desk_activity`, `max_wake_late_ms`, `max_turn_ms`).
 pub fn decide(
     row: &SpinRow,
     r: &UnattendedReadings<'_>,
 ) -> Result<UnattendedDecision, CouldNotRun> {
-    for (edge, trail) in [("opened", r.opened_trail), ("ended", r.ended_trail)] {
+    for (edge, trail) in [
+        (
+            "as the readiness wait read it, before its settle",
+            r.ready_trail,
+        ),
+        ("as its window ended", r.ended_trail),
+    ] {
         if let Some(why) = unanswered(trail) {
             return Err(CouldNotRun::Unanswered(why.into()));
         }
         if let Some(off) = unready(trail) {
             return Err(CouldNotRun::Refused(format!(
-                "the unattended window read {off} as its window {edge}, not a focused, \
-                 unattended window on glass whose pet sleeps deep or is not drawn ({})",
+                "the unattended window read {off} {edge}, not a focused, unattended window on \
+                 glass whose pet sleeps deep or is not drawn ({})",
                 fields(trail)
             )));
         }
@@ -381,8 +538,8 @@ pub fn decide(
     })?;
     if events > 0 {
         return Err(CouldNotRun::Refused(format!(
-            "the window took {events} {} other than a redraw ({}) in its window: any can attend \
-             it or move what it draws",
+            "the window took {events} {} other than a redraw ({}) from just before the readiness \
+             wait's last read to its window's end: any can attend it or move what it draws",
             if events == 1 { "event" } else { "events" },
             field(r.ended, "os_window_events_by_kind").unwrap_or("kinds unreported")
         )));
@@ -392,9 +549,9 @@ pub fn decide(
             CouldNotRun::Unanswered("ctl metrics does not report deadline_fires_by_owner".into())
         })
     };
-    let between = |key: &str| {
+    let between = |from: &str, key: &str| {
         uint_field(r.ended, key)
-            .zip(uint_field(r.opened, key))
+            .zip(uint_field(from, key))
             .map(|(end, start)| end.saturating_sub(start))
             .ok_or_else(|| CouldNotRun::Unanswered(format!("ctl metrics does not report {key}")))
     };
@@ -407,15 +564,22 @@ pub fn decide(
         live: fired(LIVE_LANE)?,
         blink: fired(BLINK_LANE)?,
         readings: fired(READING_LANE)?,
-        timer_wakes: between("timer_wakes")?,
-        frames: between("frames")?,
-        wakes: uint_field(r.ended, "event_wakes").ok_or_else(|| {
-            CouldNotRun::Unanswered("ctl metrics does not report event_wakes".into())
+        timer_wakes: between(r.opened, "timer_wakes")?,
+        frames: between(r.opened, "frames")?,
+        wakes: between(r.opened, "event_wakes")?,
+        arms: between(r.opened, "past_deadline_arms")?,
+        journal: fired(JOURNAL_LANE)?,
+        facts: fired(FACTS_LANE)?,
+        marks: between(r.ready, "desk_activity")?,
+        late: late(r.ended).ok_or_else(|| {
+            CouldNotRun::Unanswered(
+                "ctl metrics does not report max_wake_late_ms and max_turn_ms".into(),
+            )
         })?,
-        arms: between("past_deadline_arms")?,
     };
     let bounds = UnattendedBounds::of(row, r.at_least, r.at_most, &counts);
     let mut breaches = Vec::new();
+    let mut late_work = Vec::new();
     for (&(owner, max), &(_, n)) in row.max_owner_fires.iter().zip(&counts.owner_fires) {
         if n > max {
             breaches.push(format!("{owner} fired {n} times, at most {max}"));
@@ -455,6 +619,50 @@ pub fn decide(
             counts.arms, row.max_arms
         ));
     }
+    for (lane, fires, max, spilled, each, what) in [
+        (
+            JOURNAL_LANE,
+            counts.journal,
+            bounds.journal_max,
+            bounds.journal_spilled,
+            JOURNAL_FIRES_PER_MARK,
+            "a capture and its settle",
+        ),
+        (
+            FACTS_LANE,
+            counts.facts,
+            bounds.facts_max,
+            bounds.facts_spilled,
+            FACTS_FIRES_PER_MARK,
+            "a read of the panes' facts",
+        ),
+    ] {
+        if fires <= max {
+            continue;
+        }
+        let owed = format!(
+            "{lane} fired {fires} times, past the {max} its {} desk marks in the settle and the \
+             window owe ({each} a mark: {what})",
+            counts.marks
+        );
+        if fires > max.saturating_add(spilled) {
+            breaches.push(if spilled == 0 {
+                format!("{owed}: work no mark asked")
+            } else {
+                format!(
+                    "{owed} and the {spilled} the marks before the settle may book there on a \
+                     loop that ran up to {:?} late: work no mark asked",
+                    counts.late
+                )
+            });
+        } else {
+            late_work.push(format!(
+                "{owed}, by no more than the {spilled} the marks before the settle may book there \
+                 on a loop that ran up to {:?} late",
+                counts.late
+            ));
+        }
+    }
     let mut unproved = Vec::new();
     if counts.readings < bounds.readings_min {
         unproved.push(format!(
@@ -478,6 +686,7 @@ pub fn decide(
             counts.frames, bounds.frames_max
         ));
     }
+    unproved.extend(late_work);
     let (verdict, why) = if !breaches.is_empty() {
         (Disposition::Fail, breaches.join("; "))
     } else if !unproved.is_empty() {
@@ -493,7 +702,7 @@ pub fn decide(
         why,
         counts,
         bounds,
-        opened: fields(r.opened_trail),
+        ready: fields(r.ready_trail),
         ended: fields(r.ended_trail),
     })
 }

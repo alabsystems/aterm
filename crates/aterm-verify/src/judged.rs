@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The append-only, compare-and-swap Git journal the main lane's controllers filed their verdicts
-//! in (`verdicts/`; `verify watch` is now the follower, which posts a commit status and writes
-//! here no more, though a controller installed before it may), which also files `verify land`'s
-//! records under [`LAND`]: its per-check verdict records ([`crate::land_record`]) and, under
-//! [`RUNS`], its run records ([`crate::land_run`]), one store with a retention per kind. No
-//! verdict is a gate: nothing reads a land record to decide a landing yet, and nothing refuses a
-//! push made without `verify land`.
+//! The append-only, compare-and-swap Git journal `verify watch`, the follower of main, files its
+//! claim and its verdict in (`verdicts/`): a `judging` record with a lease at the tree's slot
+//! ([`claim`], [`renew`]), then the attempt's last record ([`file`]), a pass or a red with its
+//! rows. A controller installed before the follower filed its lane's records there too, in the
+//! same shape, and a record of the follower is marked ([`Record::judge`], [`FOLLOWER`]). It also
+//! files `verify land`'s records under [`LAND`]: its per-check verdict records
+//! ([`crate::land_record`]) and, under [`RUNS`], its run records ([`crate::land_run`]), one
+//! store with a retention per kind. No verdict is a gate: nothing reads a record to decide a
+//! landing yet, and nothing refuses a push made without `verify land`.
 
 use aterm_uds::spawnfd::Command;
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,11 @@ pub const LEASE: u64 = 20 * 60;
 pub const RENEW_EVERY: u64 = 10 * 60;
 // One renewal may fail, and its retries with it, before the lease lapses.
 const _: () = assert!(LEASE >= 2 * RENEW_EVERY);
+/// Seconds a host leaves a tree alone after its own attempt there ended with no verdict
+/// ([`Record::resting`]). Such a record keeps no other claim out, so without this a controller
+/// whose every attempt ends that way claims the same tree again at each turn of its loop, two
+/// journal commits a turn: about 300 an hour from three Macs is what ATERM-KI-1115-7475 measured.
+pub const RETRY_AFTER: u64 = LEASE;
 
 #[cfg(unix)]
 thread_local! {
@@ -82,15 +89,105 @@ pub struct Record {
     pub started: u64,
     pub updated: u64,
     pub lease_until: u64,
+    /// Who judged: [`FOLLOWER`] in a record of the follower, empty in a record of a controller
+    /// installed before it. The four fields from here are written only where they are set, so a
+    /// record of that older shape reads and writes as it always did, and they come before
+    /// `rows`: TOML takes no plain key after an array of tables.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub judge: String,
+    /// The session of the repair worker this verdict carries; empty where it carries none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repair: String,
+    /// What that worker was given, as the follower's hash of the green tip before the reds and
+    /// of the reds; empty where unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repair_assignment: String,
+    /// When that worker was started, Unix seconds; 0 where unknown.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub repair_started: u64,
     pub rows: Vec<Row>,
+}
+
+/// What [`Record::judge`] says in a record of the follower.
+pub const FOLLOWER: &str = "follower";
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde hands skip_serializing_if a reference"
+)]
+const fn unset(seconds: &u64) -> bool {
+    *seconds == 0
 }
 
 impl Record {
     /// An expired lease is reclaimable; cancellation and infrastructure failures are retryable.
     #[must_use]
     pub fn occupied(&self, now: u64) -> bool {
+        self.verdict() || (self.state == "judging" && self.lease_until > now)
+    }
+
+    /// Whether this record is a verdict: a pass or a red. A tree that has one is not judged
+    /// again.
+    #[must_use]
+    pub fn verdict(&self) -> bool {
         matches!(self.state.as_str(), "pass" | "red")
-            || (self.state == "judging" && self.lease_until > now)
+    }
+
+    /// Every red of this record, in row order, each once.
+    #[must_use]
+    pub fn reds(&self) -> Vec<&str> {
+        let mut reds: Vec<&str> = Vec::new();
+        for red in self.rows.iter().flat_map(|row| &row.red_items) {
+            if !reds.contains(&red.as_str()) {
+                reds.push(red);
+            }
+        }
+        reds
+    }
+
+    /// This record in a line: what a verdict found and where, who holds a claim and until when
+    /// (Unix seconds), or how an attempt ended with none.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self.state.as_str() {
+            "pass" => format!(
+                "pass on {}: {}",
+                self.host,
+                self.rows
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            "red" => {
+                let reds = self.reds();
+                format!(
+                    "red on {}: {} red: {}",
+                    self.host,
+                    reds.len(),
+                    reds.join("; ")
+                )
+            }
+            "judging" => format!(
+                "judging on {}, its lease to {}",
+                self.host, self.lease_until
+            ),
+            state => format!(
+                "{state} on {}: {}",
+                self.host,
+                self.cause.lines().next().unwrap_or("")
+            ),
+        }
+    }
+
+    /// Whether this record ended its attempt with no verdict (cancelled, could not run) less
+    /// than [`RETRY_AFTER`] seconds before `now`, on `host`: that host leaves the tree alone
+    /// until then. Any other host may claim it at once.
+    #[must_use]
+    pub fn resting(&self, host: &str, now: u64) -> bool {
+        self.host == host
+            && matches!(self.state.as_str(), "cancelled" | "could-not-run")
+            && self.updated.saturating_add(RETRY_AFTER) > now
     }
 }
 
@@ -136,6 +233,10 @@ pub fn command(root: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+/// The journal's read deadline: the reads and tree work before a call's first push end by it,
+/// and its first push is admitted only before it ([`AppendBudget`]), which starts the append's
+/// publication window for every later read and push; a push agh runs is owned through its
+/// settlement ([`crate::remote::run_mutation`]), never killed at either.
 pub fn deadline() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(60)
 }
@@ -231,6 +332,16 @@ impl<'a> AppendBudget<'a> {
 
     fn deadline(&self) -> std::time::Instant {
         self.publication_until.get().unwrap_or(self.read_until)
+    }
+
+    /// [`Self::admit`] for a push: a refusal is a write that started no child
+    /// ([`crate::remote::Failed::Unstarted`]), so the push sent nothing.
+    fn admit_write(
+        &self,
+        now: std::time::Instant,
+    ) -> Result<MutationBudget, crate::remote::Failed> {
+        self.admit(now)
+            .map_err(|why| crate::remote::Failed::Unstarted(format!("{why}; nothing was sent")))
     }
 
     fn admit(&self, now: std::time::Instant) -> Result<MutationBudget, String> {
@@ -898,6 +1009,220 @@ pub fn append_at(
     )
 }
 
+/// The record that keeps `host`'s new claim out of `tree` at `epoch`: a live claim or a verdict
+/// in its slot, a verdict filed beside it, or that host's own attempt that ended there with no
+/// verdict a short while ago ([`Record::resting`]). A tree with a verdict is not judged again,
+/// wherever the verdict is filed, so no red is run again into a pass.
+/// # Errors
+/// The journal at `head` could not be read.
+pub fn holder(
+    root: &Path,
+    head: Option<&str>,
+    tree: &str,
+    host: &str,
+    epoch: u64,
+    until: std::time::Instant,
+) -> Result<Option<Record>, String> {
+    if let Some(held) = record(root, head, tree, until)?
+        && (held.occupied(epoch) || held.resting(host, epoch))
+    {
+        return Ok(Some(held));
+    }
+    Ok(beside(root, head, tree, until)?
+        .into_iter()
+        .find(|late| late.verdict() || late.resting(host, epoch)))
+}
+
+/// The follower's records at the journal commit `head`, which `root` holds: its claims and its
+/// verdicts, each tree's slot before the records beside it.
+/// # Errors
+/// The journal at `head` could not be read.
+pub fn follower_records(root: &Path, head: &str) -> Result<Vec<Record>, String> {
+    Ok(records(root, Some(head), deadline())?
+        .into_iter()
+        .filter(|record| record.judge == FOLLOWER)
+        .collect())
+}
+
+/// What `records` say of `tree`: a verdict where there is one, at its slot or beside it; else
+/// the slot's record, a claim or how an attempt ended. `None` where nothing is filed for it.
+#[must_use]
+pub fn of_tree(records: Vec<Record>, tree: &str) -> Option<Record> {
+    let mut of: Vec<Record> = records
+        .into_iter()
+        .filter(|record| record.tree == tree)
+        .collect();
+    let at = of.iter().position(Record::verdict).unwrap_or(0);
+    (!of.is_empty()).then(|| of.swap_remove(at))
+}
+
+/// The first commit of `listed` (one a line, newest first, as `git rev-list --topo-order`
+/// lists them) that the follower judged a pass, among `records`. A red, a claim, an attempt
+/// that ended with no verdict and a commit the follower never judged are passed over, and so
+/// is a pass that is not the follower's.
+#[must_use]
+pub fn newest_pass(records: &[Record], listed: &str) -> Option<String> {
+    listed
+        .lines()
+        .find(|commit| {
+            records.iter().any(|record| {
+                record.judge == FOLLOWER && record.state == "pass" && record.commit == *commit
+            })
+        })
+        .map(str::to_owned)
+}
+
+/// The follower's verdict on the first commit of `listed` (as for [`newest_pass`]) that has
+/// one, a pass or a red, among `records`.
+#[must_use]
+pub fn newest_verdict<'a>(records: &'a [Record], listed: &str) -> Option<&'a Record> {
+    listed.lines().find_map(|commit| {
+        records
+            .iter()
+            .find(|record| record.judge == FOLLOWER && record.verdict() && record.commit == commit)
+    })
+}
+
+/// The follower's newest verdict on `tip` or a commit before it, over every parent, as the
+/// journal of `remote` says now; `None` where it has judged none of them.
+/// # Errors
+/// The journal or `tip`'s history could not be read before `until`.
+pub fn newest_verdict_on(
+    root: &Path,
+    remote: &str,
+    tip: &str,
+    until: std::time::Instant,
+) -> Result<Option<Record>, String> {
+    let Some(head) = head(root, remote, until)? else {
+        return Ok(None);
+    };
+    let records = records(root, Some(&head), until)?;
+    let listed = git_until(root, &["rev-list", "--topo-order", tip], until)?;
+    Ok(newest_verdict(&records, &listed).cloned())
+}
+
+/// Why a record did not reach the journal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unfiled {
+    /// Another attempt's live claim or verdict holds the tree's slot; what it is.
+    Displaced(String),
+    /// The journal could not be read or written.
+    Unavailable(String),
+}
+
+impl From<String> for Unfiled {
+    fn from(why: String) -> Self {
+        Self::Unavailable(why)
+    }
+}
+
+impl std::fmt::Display for Unfiled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Displaced(held) => write!(f, "another attempt holds this tree: {held}"),
+            Self::Unavailable(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Whether `held`, the record in a tree's slot, keeps `record` out of it: another attempt's
+/// live claim or verdict. Anything else there is what a new claim may replace
+/// ([`Record::occupied`]), and so may this attempt's own next record.
+fn displaced_by<'a>(held: Option<&'a Record>, record: &Record, epoch: u64) -> Option<&'a Record> {
+    held.filter(|held| held.token != record.token && held.occupied(epoch))
+}
+
+/// Claim `record`'s tree for its attempt at `epoch`: `record`, a `judging` record with its
+/// lease, appended at the tree's slot by the journal's compare-and-swap, over each head a
+/// competing append leaves until `until`. `None` once the journal holds the claim; the record
+/// that keeps it out ([`holder`]) where there is one, and then nothing is written.
+/// # Errors
+/// The journal could not be read or written.
+pub fn claim(
+    root: &Path,
+    remote: &str,
+    record: &Record,
+    epoch: u64,
+    until: std::time::Instant,
+) -> Result<Option<Record>, String> {
+    loop {
+        let head = head(root, remote, until)?;
+        if let Some(held) = holder(
+            root,
+            head.as_deref(),
+            &record.tree,
+            &record.host,
+            epoch,
+            until,
+        )? {
+            return Ok(Some(held));
+        }
+        if append(root, remote, head.as_deref(), record, until)? {
+            return Ok(None);
+        }
+    }
+}
+
+/// Renew `record`'s claim of its tree's slot, where no other attempt holds it.
+/// # Errors
+/// [`Unfiled::Displaced`] where another attempt's live claim or verdict holds the slot, as
+/// after this attempt's lease lapsed; [`Unfiled::Unavailable`] where the journal could not be
+/// read or written.
+pub fn renew(
+    root: &Path,
+    remote: &str,
+    record: &Record,
+    epoch: u64,
+    until: std::time::Instant,
+) -> Result<(), Unfiled> {
+    loop {
+        let head = head(root, remote, until)?;
+        let held = self::record(root, head.as_deref(), &record.tree, until)?;
+        if let Some(held) = displaced_by(held.as_ref(), record, epoch) {
+            return Err(Unfiled::Displaced(format!(
+                "{} by {}",
+                held.state, held.host
+            )));
+        }
+        if append(root, remote, head.as_deref(), record, until)? {
+            return Ok(());
+        }
+    }
+}
+
+/// File `record`, an attempt's last, in the journal, and say where. It goes beside its tree's
+/// slot only where another attempt's live claim, or another attempt's pass or red, holds the
+/// slot; the slot keeps that record. Anywhere else it goes at the slot. Where the slot holds
+/// another attempt's lapsed claim, or the cancelled or could-not-run record another attempt
+/// ended with, this record replaces it at the head, and the replaced record stays only in the
+/// journal's history ([`history`]). Another attempt's pass or red is never replaced. A record
+/// the journal has already held is not appended again (`None`). Every write is the journal's
+/// compare-and-swap append.
+/// # Errors
+/// The journal could not be read or written.
+pub fn file(
+    root: &Path,
+    remote: &str,
+    record: &Record,
+    epoch: u64,
+    until: std::time::Instant,
+) -> Result<Option<Place>, String> {
+    loop {
+        let head = head(root, remote, until)?;
+        if published(root, head.as_deref(), record, until)? {
+            return Ok(None);
+        }
+        let held = self::record(root, head.as_deref(), &record.tree, until)?;
+        let place = match displaced_by(held.as_ref(), record, epoch) {
+            Some(_) => Place::Beside,
+            None => Place::Slot,
+        };
+        if append_at(root, remote, head.as_deref(), record, place, until)? {
+            return Ok(Some(place));
+        }
+    }
+}
+
 /// [`append_at`], its tree objects read and written through `trees`.
 fn append_with(
     root: &Path,
@@ -964,10 +1289,15 @@ fn append_with(
 
 /// Commit `tree` over `parent` (none: the journal's first commit) and push it as the journal's
 /// head, a normal fast-forward that is the compare-and-swap: the commit, or the imported head
-/// observed after a competing append moved the journal first.
+/// observed after a competing append moved the journal first. The commit and every read before
+/// the push end by `budget`'s deadline; the push is admitted only before it
+/// ([`AppendBudget::admit`]) and, once started, runs on [`crate::remote::run_mutation`] within
+/// the publication window, its owner kept through agh's settlement, as a write of main is: a
+/// push a deadline ended mid-exchange would leave agh's intent open and refuse every later write
+/// of the repository from this Mac.
 /// # Errors
-/// A local object or remote step failed, or the push was refused while the journal stayed at
-/// `parent`.
+/// A local object or remote step failed, the push was not admitted (nothing was sent), or the
+/// push was refused while the journal stayed at `parent`.
 fn publish(
     root: &Path,
     remote: &str,
@@ -1001,7 +1331,7 @@ fn publish(
         .map_err(|why| format!("{tool:?} journal transport: {why}"))
     };
     let write = |tool, args: &[std::ffi::OsString]| {
-        let MutationBudget(until) = budget.admit(std::time::Instant::now())?;
+        let MutationBudget(until) = budget.admit_write(std::time::Instant::now())?;
         let scoped = INTERRUPTIBLE.get();
         let watch = scoped.then(aterm_toolchain::interrupt::Watch::enter);
         crate::remote::run_mutation(root, &git, tool, args, until, &mut || {
@@ -1009,7 +1339,7 @@ fn publish(
                 && (crate::exec::group::taken().is_some()
                     || watch.as_ref().is_some_and(|watch| watch.caught().is_some()))
         })
-        .map_err(|why| format!("{tool:?} journal mutation: {why}"))
+        .map_err(|failed| failed.map(|why| format!("{tool:?} journal mutation: {why}")))
     };
     push_journal(
         root,
@@ -1023,9 +1353,19 @@ fn publish(
     .map_err(timed)
 }
 
-/// Push `sha` over `parent` as the journal's head, the compare-and-swap: `Holds` where it took,
-/// `Raced` with the head a rejected push then reads, where another write moved the journal.
-/// `lost` runs once a push is rejected, before that read ([`AppendBudget::lost`]).
+/// Push journal commit `sha` over `parent` as the journal's head through the remote `name`, the
+/// compare-and-swap: its reads through `run`, and the push through `write`, the caller's mutation
+/// owner. [`Appended::Holds`] the commit, or [`Appended::Raced`] the head read after the push was
+/// rejected ([`crate::remote::Pushed::Rejected`]) where another write had moved the journal: a
+/// race, decided again over that head. `lost` runs once a push is rejected, before that read
+/// ([`AppendBudget::lost`]). Any other outcome is an error: an unknown one, which is never pushed
+/// again here; one that sent nothing ([`crate::remote::Pushed::Unsent`]: agh says so, or the
+/// write started no child, its admission refused included); or one refused with no effect
+/// ([`crate::remote::Pushed::Refused`]: by agh, or by GitHub, which rejected the push it
+/// received).
+/// # Errors
+/// A read failed, or the push did not land; each error names the ref, the expected parent and
+/// the commit (`journal_ref`, `journal_before`, `journal_after`).
 fn push_journal(
     root: &Path,
     name: &str,
@@ -1045,7 +1385,9 @@ fn push_journal(
     let why = match remote.push_with(write, REF, parent, sha).map_err(context)? {
         crate::remote::Pushed::Done => return Ok(Appended::Holds(sha.to_owned())),
         crate::remote::Pushed::Rejected(why) => why,
-        crate::remote::Pushed::Blocked { why, .. } | crate::remote::Pushed::Unsent(why) => {
+        crate::remote::Pushed::Blocked { why, .. }
+        | crate::remote::Pushed::Unsent(why)
+        | crate::remote::Pushed::Refused(why) => {
             return Err(context(why));
         }
     };
@@ -1389,8 +1731,8 @@ pub enum Appended {
 /// record filed under a day its kind's retention has expired by `now` is not appended. With
 /// nothing to change, nothing is pushed.
 /// # Errors
-/// A record's path does not parse, a git step failed, or the push was refused while the
-/// journal stayed at `parent`.
+/// A record's path does not parse, a git step failed, the push was not admitted before `until`
+/// (nothing was sent), or the push was refused while the journal stayed at `parent`.
 pub fn land_append(
     root: &Path,
     remote: &str,
@@ -1588,10 +1930,11 @@ fn land_append_with(
 /// Append `records` until an append holds them ([`land_append`]): each race waits out its
 /// [`race_pause`] and carries the head it then reads into the next attempt. Initial reads and
 /// assembly share `until`; the first admitted mutation starts one work window shared by race
-/// pauses, readback and all later attempts. A writer retains its owner through settlement. The
-/// head that holds them (`None`: no records, and no journal).
+/// pauses, readback and all later attempts. No push is admitted once that has passed, and a
+/// writer retains its owner through settlement ([`publish`]). The head that holds them (`None`:
+/// no records, and no journal).
 /// # Errors
-/// As [`land_append`], or the deadline passed.
+/// As [`land_append`], or the deadline passed (before a push, which then sent nothing).
 pub fn append_land(
     root: &Path,
     remote: &str,

@@ -13,6 +13,7 @@ use crate::model::{Mode, Read};
 use crate::port::{Live, System};
 use std::ffi::OsString;
 use std::io::IsTerminal as _;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -123,18 +124,33 @@ ON A HOST
     here plan|apply <baseline.toml> [--json]
                               run a baseline on this Mac directly (apply under sudo)
     here apply --plain [--root-steps-only] [--leave-developer-mode]
-               [--name m<N> [--nickname <word>]]
+               [--restore-name-rule] [--name m<N> [--nickname <word>]]
                               install Apple's Command Line Tools from aterm's own
                               baseline, reading no file, and with --name give the Mac
                               its generated computer and network names;
                               --root-steps-only preserves developer-tool installation
                               and selection while applying independent root steps;
                               --leave-developer-mode leaves developer mode as it reads;
+                              --restore-name-rule puts back a naming permission you
+                              removed, which is otherwise left removed;
                               prints no report and exits with why the tools did not
                               finish (`aterm init`'s root half)
     here apply --plain --name-rule-only
                               refresh only the console account's naming permission;
                               accepts no machine name and changes no OS name
+    here apply --plain --only spotlight-scope|power|updates
+                              apply one compiled step (setup's Spotlight scope, or
+                              the starter baseline's [power.ac] or [updates]) and
+                              nothing else: System Resources' macOS configuration
+    here apply --plain --only spotlight-pause|spotlight-resume|spotlight-rebuild
+    here apply --plain --only spotlight-keep-out --keep-out <folder>
+                              the person's own Spotlight step from System Resources'
+                              Spotlight document: indexing off or on, the index
+                              rebuilt, or one folder inside Documents, Desktop or
+                              a synced drive kept out as theirs
+    macos-reading             as the person, no root: this Mac's pmset and Software
+                              Update reading, in the record text System Resources'
+                              macOS configuration section reads back
     agent <cmd>               the host agent, which the controller runs over SSH
 
 <host> is a host's name, uuid or address. --parallel N (1 to 64) reaches N hosts at once
@@ -315,6 +331,17 @@ fn sweep_retired_dir(sys: &dyn System, home: &Path, below: &Path) {
     let _ = sys.remove(dir);
 }
 
+/// `aterm machines macos-reading`: the pmset and Software Update reading the System Resources
+/// page judges ([`aterm_types::macos_setup::readout`]), read through `sys` as aterm-machines'
+/// own items read them. Only this crate runs `pmset` and `softwareupdate`.
+pub fn macos_reading(sys: &dyn System) -> String {
+    aterm_types::macos_setup::readout::Readout::read(
+        &crate::items::power::Port(sys),
+        &crate::items::updates::Port::new(sys),
+    )
+    .render()
+}
+
 /// `aterm machines <args>`.
 #[must_use = "handle or propagate the command's exit status"]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
@@ -366,6 +393,11 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             retire_lan_agent();
             here(&sys, &args[1..])
         }
+        "macos-reading" if args.len() == 1 => {
+            print!("{}", macos_reading(&sys));
+            ExitCode::SUCCESS
+        }
+        "macos-reading" => refuse("macos-reading takes no arguments"),
         verb if VERBS.contains(&verb) || matches!(verb, "name" | "top" | "watch") => {
             #[cfg(not(test))]
             retire_lan_agent();
@@ -622,7 +654,7 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
     }
 }
 
-fn here(sys: &dyn System, args: &[String]) -> ExitCode {
+pub(crate) fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     let json = args.iter().any(|a| a == "--json");
     let plain = args.iter().any(|a| a == "--plain");
     let steps_only = args.iter().any(|a| a == "--root-steps-only");
@@ -644,18 +676,49 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
         commands::HereOutput::Report
     };
     // Typed number and optional nickname ride the root half alone. Root derives the
-    // targets without reading any account-writable configuration. So does
-    // `--leave-developer-mode`, which only narrows what it does: developer mode is left as it
-    // reads.
+    // targets without reading any account-writable configuration. So do
+    // `--leave-developer-mode`, which only narrows what it does (developer mode is left as it
+    // reads), and `--restore-name-rule`, which puts back only the rule the built-in baseline
+    // already names.
     let mut name = None;
     let mut nickname = None;
+    let mut only = None;
+    let mut keep_out: Option<&String> = None;
     let mut leave_developer_mode = false;
+    let mut restore_name_rule = false;
     let mut rest: Vec<&String> = Vec::new();
     let mut words = args.iter();
     while let Some(arg) = words.next() {
         match arg.as_str() {
             "--json" | "--plain" | "--root-steps-only" | "--name-rule-only" => {}
+            // One compiled step of the System Resources page's macOS configuration section.
+            "--only" => match words
+                .next()
+                .map(String::as_str)
+                .and_then(aterm_types::macos_setup::root_only::Step::parse)
+            {
+                Some(step) if only.is_none() => only = Some(step),
+                Some(_) => return refuse("here: --only is given once"),
+                None => {
+                    let words: Vec<&str> = aterm_types::macos_setup::root_only::Step::ALL
+                        .iter()
+                        .map(|step| step.word())
+                        .collect();
+                    return refuse(&format!("here: --only takes {}", words.join(", ")));
+                }
+            },
+            // The one folder the person's keep-out names, an absolute path.
+            aterm_types::macos_setup::root_only::KEEP_OUT => match words.next() {
+                Some(folder) if keep_out.is_none() && Path::new(folder).is_absolute() => {
+                    keep_out = Some(folder);
+                }
+                Some(_) if keep_out.is_some() => {
+                    return refuse("here: --keep-out is given once");
+                }
+                _ => return refuse("here: --keep-out takes a folder's absolute path"),
+            },
             crate::init_clt::LEAVE_DEVELOPER_MODE => leave_developer_mode = true,
+            crate::init_clt::RESTORE_NAME_RULE => restore_name_rule = true,
             "--name" => match words
                 .next()
                 .map(String::as_str)
@@ -688,11 +751,34 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     if leave_developer_mode && !plain {
         return refuse("here: --leave-developer-mode rides --plain alone");
     }
+    if restore_name_rule && !plain {
+        return refuse("here: --restore-name-rule rides --plain alone");
+    }
+    if restore_name_rule && name_rule_only {
+        return refuse("here: --name-rule-only puts the naming permission back by itself");
+    }
     if name_rule_only && (name.is_some() || nickname.is_some()) {
         return refuse("here: --name-rule-only accepts no name or nickname");
     }
     if nickname.is_some() && name.is_none() {
         return refuse("here: --nickname requires --name");
+    }
+    if only.is_some()
+        && (!plain
+            || steps_only
+            || name_rule_only
+            || name.is_some()
+            || nickname.is_some()
+            || leave_developer_mode)
+    {
+        return refuse(
+            "here: --only rides --plain alone, with no other step, name or developer-mode option",
+        );
+    }
+    if only.is_some_and(aterm_types::macos_setup::root_only::Step::takes_folder)
+        != keep_out.is_some()
+    {
+        return refuse("here: --keep-out rides --only spotlight-keep-out, which needs it");
     }
     let name = name.map(|number| {
         let number = aterm_types::machine_name::Number::parse(&number)
@@ -723,6 +809,24 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
             return ExitCode::from(crate::init_clt::name_rule_tab_entry(sys));
         }
         return match rest.as_slice() {
+            [_] if mode == Mode::Apply
+                && let Some(step) = only =>
+            {
+                // The window that ran this under sudo reads the line as the step itself, past
+                // sudo's password check (`root_only::STARTED`). A closed stdout loses nothing.
+                let _ = writeln!(
+                    std::io::stdout().lock(),
+                    "{}",
+                    aterm_types::macos_setup::root_only::STARTED
+                );
+                commands::here(
+                    sys,
+                    mode,
+                    commands::HereBaseline::Only(step, keep_out.map(Path::new)),
+                    commands::Plain::default(),
+                    output,
+                )
+            }
             [_] if mode == Mode::Apply => commands::here(
                 sys,
                 mode,
@@ -736,6 +840,7 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
                 commands::Plain {
                     name: name.as_ref(),
                     leave_developer_mode,
+                    restore_name_rule,
                 },
                 output,
             ),

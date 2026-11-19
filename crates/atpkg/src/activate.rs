@@ -228,8 +228,12 @@ pub fn reconcile_agents(layout: &Layout) {
         let twin = layout.agent_shim(&tool);
         let twin_read = platform::read_shim(&twin);
         let exec = twin_exec(layout, name, &target, primary_is);
-        let named =
-            |body: Option<&str>| body.and_then(|b| crate::stub::sh_named_atpkg(b, "__atpkg"));
+        let named = |body: Option<&str>| {
+            body.and_then(|b| {
+                crate::stub::sh_named_atpkg(b, "__atpkg")
+                    .or_else(|| crate::launch_tap::cmd_named_atpkg(b))
+            })
+        };
         let standing =
             named(twin_read.body.as_deref()).or_else(|| named(primary_read.body.as_deref()));
         let atpkg = crate::stub::Embedder::this_process().embed(standing.as_deref());
@@ -246,9 +250,15 @@ pub fn reconcile_agents(layout: &Layout) {
             prelude.push_str(&crate::launch_tap::sh_prelude(name, atpkg.as_deref()));
             prelude
         };
-        if (exec.managed.is_some() || (!dev_link && !prelude.is_empty()))
+        // The `.cmd` twin and primary carry the usage tap as a block of their own around the
+        // forward (Windows; `crate::launch_tap::with_cmd_block`), unless the primary is a dev link.
+        let cmd_tap = !dev_link && cfg!(windows) && crate::launch_tap::of(name);
+        let tapped =
+            |file: crate::lay::Executable| with_cmd_tap(file, name, atpkg.as_deref(), cmd_tap);
+        if (exec.managed.is_some() || (!dev_link && !prelude.is_empty()) || cmd_tap)
             && let Err(e) =
                 primary_executable(&primary, &target, exec.managed.as_deref(), &env, &prelude)
+                    .map(tapped)
                     .and_then(|file| {
                         if primary_read
                             .body
@@ -275,6 +285,7 @@ pub fn reconcile_agents(layout: &Layout) {
             } else {
                 platform::twin_executable_to_env(&twin, &exec.path, &env, &prelude)
             }
+            .map(tapped)
             .map(|file| with_token(file, name, atpkg.as_deref(), token))
         };
         if twin_read.target.as_deref() == Some(exec.path.as_path())
@@ -316,6 +327,26 @@ fn with_token(
         Ok(body) => crate::lay::Executable::new(
             file.path,
             crate::launch_tap::with_token_block(program, body, atpkg),
+        ),
+        Err(error) => crate::lay::Executable::new(file.path, error.into_bytes()),
+    }
+}
+
+/// `file`, an agent program's `.cmd` twin or primary, with the usage tap's block
+/// ([`crate::launch_tap::with_cmd_block`]) where `on`.
+fn with_cmd_tap(
+    file: crate::lay::Executable,
+    program: &str,
+    atpkg: Option<&Path>,
+    on: bool,
+) -> crate::lay::Executable {
+    if !on {
+        return file;
+    }
+    match String::from_utf8(file.body) {
+        Ok(body) => crate::lay::Executable::new(
+            file.path,
+            crate::launch_tap::with_cmd_block(program, body, atpkg),
         ),
         Err(error) => crate::lay::Executable::new(file.path, error.into_bytes()),
     }

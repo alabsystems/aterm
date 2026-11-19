@@ -144,6 +144,7 @@ fn peeking_reads_remote_requests_beside_writers_without_posting_or_sweeping() {
                 key: "unknown".into(),
                 value: Some(Value::Null),
             }],
+            said: None,
         };
         store.commit_catalog(session, &invalid.encode()?)
     })
@@ -733,6 +734,7 @@ fn the_schema_is_closed_and_a_retry_identity_is_its_records() {
     let renamed = Command::Write {
         request: [0; 16],
         changes,
+        said: None,
     };
     assert!(decode(&renamed.encode().unwrap()).is_err());
     assert!(
@@ -2372,4 +2374,390 @@ fn a_pass_posts_waiting_tokens_in_their_own_pool() {
         "a 17th token waits in the ledger: {local:?}"
     );
     assert!(local[0].want.producer().is_some(), "{:?}", local[0].want);
+}
+
+/// A FULL TABLE IS A REFUSAL A PASS SAYS, NOT A FAILURE (ATERM-KI-1116-3474): where the lab's
+/// table refuses an append for its capacity, a member's pass makes no more appends, takes in what
+/// needs none, records the refusal and says it ([`Pass::full`]): the raised need stays in the
+/// ledger unposted, `aterm secrets need <want>` says the table is full with its own status
+/// ([`cli::FULL`]), `ls` and `ls --json` say it, and the refusal stands until the table or the
+/// ledger moves. A custodian's decisions the full table could not take wait, named so, and the
+/// admin's member pass, which appends nothing, leaves the custodian's refusal standing, which the
+/// admin's `ls` and `ls --json` say. Once the
+/// table takes records again, the next pass posts the need and forgets the refusal, and the
+/// custodian's publication forgets its own.
+/// NEGATIVE CONTROLS: with `pass_at` returning the capacity refusal as its error, as before, the
+/// full pass is an `Err` and nothing is recorded; with a pass that appended nothing forgetting the
+/// refusal, the custodian's is gone after the admin's member pass; with `ls --json` leaving the
+/// refusal out, its `full` is missing; with `ls` saying only the refusal its own pass met, the
+/// admin's says nothing of the custodian's.
+#[test]
+fn a_full_table_ends_the_passs_writes_and_says_so() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    let m1 = Audience::Hosts(vec!["m1".into()]);
+    doc.set_entry(&m1, "release-notary", b"apple").unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+    let requester = &lab.paths[1];
+    let now = 1_000_000_000;
+    need::raise(requester, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    assert_eq!(pass_at(requester, now).unwrap().posted, 1);
+    repair_commons(&lab, 3);
+    assert_eq!(pass_at(&lab.paths[0], now).unwrap().swept, 1);
+
+    // The custodian's decision meets the full table: it waits, said so.
+    let decided = crate::table::store::with_table_full(|| {
+        custodian_pass_at(&lab.paths[0], now).unwrap().unwrap()
+    });
+    let full = decided.full.expect("the custodian met the full table");
+    assert!(decided.published.is_empty(), "{decided:?}");
+    assert!(
+        decided
+            .waiting
+            .iter()
+            .any(|(_, why)| why.contains("credential-requests table is full")),
+        "{decided:?}"
+    );
+    assert!(
+        decided.summary().contains("is full ("),
+        "{}",
+        decided.summary()
+    );
+    assert!(full.records > 0);
+    let quiet = crate::table::store::with_table_full(|| pass_at(&lab.paths[0], now)).unwrap();
+    assert_eq!(
+        (quiet.full, quiet.posted, quiet.answered, quiet.swept),
+        (None, 0, 0, 0),
+        "the admin's member pass appends nothing: {quiet:?}"
+    );
+    assert_eq!(
+        super::full(&lab.paths[0]).unwrap().standing,
+        Some(full),
+        "the custodian's refusal stands past a member pass that appended nothing"
+    );
+    // The admin's `ls`, whose member pass appends nothing, says the custodian's refusal standing.
+    let listed =
+        crate::table::store::with_table_full(|| cli::run(&lab.paths[0], &["ls".to_owned()]))
+            .unwrap();
+    assert!(
+        listed.contains("lab table: the lab's credential-requests table is full ("),
+        "the custodian's refusal, said by the admin's ls: {listed}"
+    );
+    let listed = crate::table::store::with_table_full(|| {
+        cli::run(&lab.paths[0], &["ls".to_owned(), "--json".to_owned()])
+    })
+    .unwrap();
+    let listed: Value = aterm_json::from_str(listed.trim()).unwrap();
+    assert_eq!(
+        listed["full"]["records"].as_u64(),
+        Some(full.records),
+        "the custodian's refusal, in the admin's ls --json: {listed}"
+    );
+
+    // The member's pass meets it too: the raised need stays unposted, and the refusal stands.
+    let raised = need::raise(
+        requester,
+        Want::Mailbox("m19-2".into()),
+        Purpose::HarnessSignIn,
+    )
+    .unwrap();
+    let refused = crate::table::store::with_table_full(|| pass_at(requester, now))
+        .expect("a full table is said, not failed");
+    let full = refused.full.expect("the pass met the full table");
+    assert_eq!((refused.posted, full.needs_unposted), (0, 1));
+    let unposted = need::peek(requester).unwrap();
+    let unposted = unposted.iter().find(|need| need.id == raised.id).unwrap();
+    assert_eq!(unposted.state, State::Local, "{}", unposted.line);
+    assert_eq!(super::full(requester).unwrap().standing, Some(full));
+    assert!(
+        super::full(requester)
+            .unwrap()
+            .watched
+            .iter()
+            .any(|path| path.extension().is_some_and(|ext| ext == "claim")),
+        "the watch hears the table's claim"
+    );
+
+    // `ls` says the refusal; `ls --json` carries it as `full`.
+    let listed =
+        crate::table::store::with_table_full(|| cli::run(requester, &["ls".to_owned()])).unwrap();
+    assert!(
+        listed.contains("lab table: the lab's credential-requests table is full ("),
+        "{listed}"
+    );
+    let listed = crate::table::store::with_table_full(|| {
+        cli::run(requester, &["ls".to_owned(), "--json".to_owned()])
+    })
+    .unwrap();
+    let listed: Value = aterm_json::from_str(listed.trim()).unwrap();
+    assert_eq!(listed["full"]["bound"].as_str(), Some("table"), "{listed}");
+    assert_eq!(
+        listed["full"]["needs_unposted"].as_u64(),
+        Some(1),
+        "{listed}"
+    );
+    assert!(
+        listed["full"]["line"]
+            .as_str()
+            .is_some_and(|line| line.contains("table is full")),
+        "{listed}"
+    );
+
+    // `aterm secrets need <want>` against the full table: the full words and their status.
+    let words = ["machines-admin".to_owned()];
+    let said = crate::table::store::with_table_full(|| cli::run(requester, &words));
+    let (text, code) = said.expect_err("a need the full table could not take");
+    assert_eq!(code, cli::FULL);
+    assert!(
+        text.contains("credential-requests table is full")
+            && text.contains("machines-admin could not be posted")
+            && text.contains("stays in this"),
+        "{text}"
+    );
+
+    // The table takes records again: the needs post, and the refusal is forgotten.
+    let posted = pass_at(requester, now).unwrap();
+    assert!(posted.full.is_none());
+    assert!(posted.posted >= 1, "{posted:?}");
+    assert_eq!(super::full(requester).unwrap().standing, None);
+    let listed = cli::run(requester, &["ls".to_owned(), "--json".to_owned()]).unwrap();
+    let listed: Value = aterm_json::from_str(listed.trim()).unwrap();
+    assert!(listed["full"].is_null(), "{listed}");
+    let delivered = custodian_pass_at(&lab.paths[0], now).unwrap().unwrap();
+    assert!(delivered.full.is_none());
+    assert_eq!(delivered.published.len(), 1, "{delivered:?}");
+    assert!(
+        !super::full(&lab.paths[0]).unwrap().recorded,
+        "the custodian forgot its refusal once the table took its decision"
+    );
+}
+
+/// A FULL TABLE ENDS A PASS'S APPENDS, NOT ITS NEEDS' MOVES (ATERM-KI-1116-3474): where the table
+/// refuses the first need's append for its capacity (its weekly `still`), each need after it still
+/// takes in what needs no append, here the custodian's publication of the second, already on the
+/// table, so no need waits behind another's refused append.
+/// NEGATIVE CONTROL: with the needs loop ending at the first refusal, as before, the second need
+/// stays open and nothing is decided.
+#[test]
+fn a_full_table_ends_the_appends_and_not_the_needs_moves() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let (custodian, requester) = (&lab.paths[0], &lab.paths[1]);
+    let admin = client::admin_open(custodian).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Hosts(vec!["m1".into()]),
+        "release-notary",
+        b"apple",
+    )
+    .unwrap();
+    client::admin_publish(custodian, &admin, &doc).unwrap();
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+    // The first need is one no custodian answers yet; the second, one it publishes.
+    need::raise(
+        requester,
+        Want::parse("mailbox:m29").unwrap(),
+        Purpose::HarnessSignIn,
+    )
+    .unwrap();
+    let notary = need::raise(requester, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    let now = aterm_time::unix_millis().unwrap();
+    assert_eq!(pass_at(requester, now).unwrap().posted, 2);
+    repair_commons(&lab, 3);
+    let decided = custodian_pass_at(custodian, now).unwrap().unwrap();
+    assert_eq!(decided.published.len(), 1, "{decided:?}");
+    repair_commons(&lab, 3);
+
+    // A week on, the first need's `still` is due, and the table refuses it.
+    let week = now + (need::STILL_SECS + 60) * MS;
+    let refused = crate::table::store::with_table_full(|| pass_at(requester, week))
+        .expect("a full table is said, not failed");
+    assert!(refused.full.is_some(), "{refused:?}");
+    assert_eq!(refused.answered, 0, "the still was refused: {refused:?}");
+    assert_eq!(
+        refused.decided, 1,
+        "the second need's publication: {refused:?}"
+    );
+    let needs = need::peek(requester).unwrap();
+    let taken = needs.iter().find(|need| need.id == notary.id).unwrap();
+    assert_ne!(taken.state, State::Open, "{}", taken.line);
+}
+
+/// A FULL TABLE THAT TOOK SOME OF A CUSTODIAN'S DECISIONS REPORTS THOSE AS MADE
+/// (ATERM-KI-1116-3474): the custodian commits each decision with its parts right before it, so
+/// where the table takes the first (a `not-held` retirement) and refuses the next (a
+/// publication), the retirement is reported retired and its requester takes it in, and only the
+/// publication waits, named so.
+/// NEGATIVE CONTROL: with every decision moved to waiting at the refusal, as before, the
+/// retirement the table holds is reported waiting.
+#[test]
+fn a_full_table_waits_only_the_decisions_it_did_not_take() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let (custodian, requester) = (&lab.paths[0], &lab.paths[1]);
+    let admin = client::admin_open(custodian).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Hosts(vec!["m1".into()]),
+        "release-notary",
+        b"apple",
+    )
+    .unwrap();
+    client::admin_publish(custodian, &admin, &doc).unwrap();
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    need::raise(requester, mailbox.clone(), Purpose::HarnessSignIn).unwrap();
+    need::raise(requester, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    let now = 1_000_000_000;
+    assert_eq!(pass_at(requester, now).unwrap().posted, 2);
+    repair_commons(&lab, 3);
+    let swept = pass_at(custodian, now).unwrap();
+    assert_eq!(swept.swept, 2);
+    let thread = |want: &Want| swept.threads.iter().find(|t| t.want == *want).unwrap().id;
+    let (notary, unheld) = (thread(&Want::Notary), thread(&mailbox));
+
+    let refused = crate::table::store::with_table_refusing_after(
+        crate::table::store::Refusal::Full,
+        1,
+        || custodian_pass_at(custodian, now),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(refused.full.is_some(), "{refused:?}");
+    assert_eq!(refused.retired, [(unheld, Reason::NotHeld)], "{refused:?}");
+    assert!(refused.published.is_empty(), "{refused:?}");
+    assert!(
+        matches!(refused.waiting.as_slice(),
+            [(id, why)] if *id == notary && why.contains("table is full")),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .summary()
+            .contains("0 published, 1 retired, 1 waiting"),
+        "{}",
+        refused.summary()
+    );
+    repair_commons(&lab, 3);
+    assert_eq!(
+        pass_at(requester, now).unwrap().decided,
+        1,
+        "the retirement the table took"
+    );
+}
+
+/// A SPENT WRITER QUOTA IS THIS MAC'S, NOT THE LAB TABLE'S (ATERM-KI-1116-3474): where this Mac's
+/// own records fill its writer quota, the pass says that quota is spent and that the table still
+/// takes other Macs' records, and records the writer's bound, which no table claim stands for;
+/// `aterm secrets need <want>` says the same with the full status, never that the table is full.
+/// NEGATIVE CONTROL: with `Appends::met` reading the writer's bound as the table's, every surface
+/// says the lab's table is full.
+#[test]
+fn a_spent_writer_quota_is_said_as_this_macs_own() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let requester = &lab.paths[1];
+    let now = 1_000_000_000;
+    // The table is published and opened here first, so the refusal meets the pass's own append.
+    assert_eq!(pass_at(requester, now).unwrap().posted, 0);
+    need::raise(requester, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    let writer = crate::table::store::Refusal::WriterFull;
+    let spent = crate::table::store::with_table_refusing(writer, || pass_at(requester, now))
+        .expect("a spent quota is said, not failed");
+    let full = spent.full.expect("the pass met the writer's quota");
+    assert_eq!(full.bound, need::full::Bound::Writer);
+    let line = full.line();
+    assert!(
+        line.contains("writer quota") && line.contains("still takes other"),
+        "{line}"
+    );
+    assert!(!line.contains("table is full"), "{line}");
+    let reading = super::full(requester).unwrap();
+    assert_eq!(reading.standing, Some(full));
+    assert!(
+        !reading
+            .watched
+            .iter()
+            .any(|path| path.extension().is_some_and(|ext| ext == "claim")),
+        "another Mac's record lifts no quota of this Mac's: {:?}",
+        reading.watched
+    );
+    let (text, code) = crate::table::store::with_table_refusing(writer, || {
+        cli::run(requester, &["machines-admin".to_owned()])
+    })
+    .expect_err("a need the spent quota could not post");
+    assert_eq!(code, cli::FULL);
+    assert!(
+        text.contains("writer quota") && !text.contains("table is full"),
+        "{text}"
+    );
+}
+
+/// A FAILURE THAT IS NOT THE TABLE'S CAPACITY STILL FAILS THE PASS: a refusal of another kind
+/// where the table refuses past its quota, and an append whose outcome is uncertain, are each the
+/// pass's error, record no full table and leave the need unposted; `aterm secrets need <want>`
+/// keeps its best-effort line and status.
+/// NEGATIVE CONTROL: with `pass_at` reading every write's refusal as the full table, the refusal
+/// of another kind is an `Ok` pass with a full table recorded.
+#[test]
+fn a_write_that_fails_otherwise_still_fails_the_pass() {
+    struct Fails;
+    impl Fails {
+        fn on() -> Self {
+            crate::table::store::APPEND_FAILS.with(|fails| fails.set(true));
+            Self
+        }
+    }
+    impl Drop for Fails {
+        fn drop(&mut self) {
+            crate::table::store::APPEND_FAILS.with(|fails| fails.set(false));
+        }
+    }
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let requester = &lab.paths[1];
+    let now = 1_000_000_000;
+    // The table is published and opened here first, so the refusal meets the pass's own append.
+    assert_eq!(pass_at(requester, now).unwrap().posted, 0);
+    need::raise(requester, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    let refused =
+        crate::table::store::with_table_refusing(crate::table::store::Refusal::Otherwise, || {
+            pass_at(requester, now)
+        })
+        .expect_err("a refusal that is not the table's capacity fails the pass");
+    assert!(!refused.is_capacity_exhausted(), "{refused}");
+    assert_eq!(super::full(requester).unwrap().standing, None);
+    assert!(!super::full(requester).unwrap().recorded);
+    let failed = {
+        let _fails = Fails::on();
+        pass_at(requester, now).expect_err("an uncertain append fails the pass")
+    };
+    assert!(!failed.is_capacity_exhausted(), "{failed}");
+    assert_eq!(super::full(requester).unwrap().standing, None);
+    assert_eq!(need::peek(requester).unwrap()[0].state, State::Local);
+    let said = {
+        let _fails = Fails::on();
+        cli::run(requester, &["machines-admin".to_owned()])
+    };
+    let text = said.expect("a pass that failed otherwise is the best-effort line");
+    assert!(text.contains("lab table: not reached ("), "{text}");
 }

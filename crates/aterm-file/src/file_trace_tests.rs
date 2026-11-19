@@ -10,7 +10,9 @@
 
 use super::*;
 use crate::Source;
-use aterm_uds::trace::{self, Effect, Moved, Now, Trace, Unkept};
+#[cfg(unix)]
+use aterm_uds::trace::Effect;
+use aterm_uds::trace::{self, Moved, Now, Trace, Unkept};
 use std::time::{Duration, Instant};
 
 /// How far past the clock the traced reads here are judged settled ([`trace::read_as_if_later`]):
@@ -66,7 +68,12 @@ fn frontier() -> Frontier {
         source: [7; 32],
         era: 0,
         generation: 2,
-        ids: [[1; 32]].into_iter().collect(),
+        stores: vec![crate::Witnessed {
+            digest: [5; 32],
+            count: 1,
+            hash: [1; 32],
+        }],
+        view: [0; 32],
     }
 }
 
@@ -82,11 +89,12 @@ fn opened(projected: Option<Snapshot>) -> Pass {
         key,
         projection: projected.map_or(Projection::Unchanged, |snapshot| {
             Projection::Fresh(Box::new(Projected {
-                snapshot,
+                snapshot: crate::Rendered::of(snapshot),
                 history: Vec::new(),
                 baseline: None,
                 withheld: 0,
                 inert: 0,
+                refused: None,
             }))
         }),
     }))

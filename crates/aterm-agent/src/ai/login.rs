@@ -652,7 +652,8 @@ fn revokes_a_stored_login(f: &Facts) -> bool {
 /// machine's own login of a Codex pool whose program keeps no row's login its own
 /// ([`default_home_sign_in`]) signs in by Codex's own login too, which rewrites the default
 /// home's login and leaves the row on it; once Codex's status reads signed in, the pool's
-/// records say that row is signed in again ([`crate::harness::accounts::note_signed_back`]).
+/// records say that row is signed in again: its login's verdict reads that newer evidence
+/// ([`crate::harness::accounts::Account::login_verdict`]).
 #[must_use]
 pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done {
     let c = f.connector;

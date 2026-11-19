@@ -41,6 +41,7 @@ fn write(request: u8, key: &str, value: aterm_json::Value) -> Command {
             key: key.into(),
             value: Some(value),
         }],
+        said: None,
     }
 }
 pub(super) fn wires(dir: &Path) -> Vec<Vec<u8>> {
@@ -96,6 +97,7 @@ fn one_machine_is_durable_atomic_encrypted_and_idempotent_after_restart() {
                 value: Some(json!(42)),
             },
         ],
+        said: None,
     };
     let original = {
         let mut db = Database::open(&path).unwrap();
@@ -151,6 +153,7 @@ fn one_machine_is_durable_atomic_encrypted_and_idempotent_after_restart() {
                     value: Some(Value::Null),
                 },
             ],
+            said: None,
         })
         .is_err()
     );
@@ -180,6 +183,7 @@ fn one_machine_is_durable_atomic_encrypted_and_idempotent_after_restart() {
             key: "left".into(),
             value: None,
         }],
+        said: None,
     })
     .unwrap();
     drop(db);
@@ -242,6 +246,7 @@ fn two_offline_writers_keep_conflicts_resolve_causally_and_respect_concurrent_st
                 key: "same".into(),
                 value: None,
             }],
+            said: None,
         })
         .unwrap();
     Database::open(&b)
@@ -393,6 +398,7 @@ fn aliases_phone_routes_and_machine_name_history_remain_distinct() {
                 key: id.into(),
                 value: Some(json!({"name":name})),
             }],
+            said: None,
         })
         .unwrap();
     }
@@ -917,6 +923,7 @@ fn revert_is_an_atomic_audited_edit_and_refuses_intervening_changes_or_resource_
                 key: "record".into(),
                 value: None,
             }],
+            said: None,
         })
         .unwrap();
     assert!(db.revert([14; 16], stop).is_err());
@@ -955,6 +962,7 @@ fn revert_is_an_atomic_audited_edit_and_refuses_intervening_changes_or_resource_
                 key: "kept".into(),
                 value: None,
             }],
+            said: None,
         }
         .encode()
         .unwrap(),
@@ -997,7 +1005,7 @@ fn machine_name_cli_retries_the_receipt_and_preserves_semistructured_metadata() 
     assert_eq!(first["name"], json!("m1"));
     assert_eq!(run(1, None).unwrap(), first);
     assert!(run(1, Some("m2")).is_err());
-    Database::open(&dir).unwrap().commit(Command::Write{request:[2;16],changes:vec![Change{collection:"machines".into(),key:key.into(),value:Some(json!({"name":"m1","hostnames":["lab.local"],"details":{"role":{"kind":"note","value":"account worker"}}}))}]}).unwrap();
+    Database::open(&dir).unwrap().commit(Command::Write{request:[2;16],changes:vec![Change{collection:"machines".into(),key:key.into(),value:Some(json!({"name":"m1","hostnames":["lab.local"],"details":{"role":{"kind":"note","value":"account worker"}}}))}], said: None}).unwrap();
     let rename = run(3, Some("M100")).unwrap();
     assert_eq!(rename["name"], json!("m100"));
     assert_eq!(run(3, None).unwrap(), rename);

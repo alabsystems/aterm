@@ -101,11 +101,12 @@ pub(crate) trait ReleaseHost: Send + Sync {
 
     /// Post the deployer key's need to the lab's table now, as `aterm secrets need
     /// site-deployer-key --purpose release.site-key` does (the raise, which is idempotent,
-    /// and this Mac's pass), so the request does not wait for the app's own pass. Its output
-    /// is discarded.
+    /// and this Mac's pass), so the request does not wait for the app's own pass: what the run
+    /// did with it ([`Posted`]). Its output is read only for a capacity refusal's line.
     /// # Errors
-    /// No installed aterm ran it: why. The need stays on file for the next pass.
-    fn post_site_key_need(&self) -> Result<(), String>;
+    /// No installed aterm ran it, or the run failed: why. The need stays on file for the next
+    /// pass.
+    fn post_site_key_need(&self) -> Result<Posted, String>;
 }
 
 /// Why a push right is not shown ([`ReleaseHost::can_push`]).
@@ -126,6 +127,45 @@ pub(crate) enum SigningGap {
     Ring(String),
     /// The ring is whole, but the signing tools or a signature failed.
     Unusable(String),
+}
+
+/// What `aterm secrets need site-deployer-key` did with the need it filed
+/// ([`ReleaseHost::post_site_key_need`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Posted {
+    /// This Mac's pass ran: the need is on the lab's table, or waits as its own line says.
+    Ran,
+    /// The lab's credential-requests table refused it for its capacity (the run's
+    /// [`aterm_secrets::converge::STANDING`] exit): it stays in this Mac's ledger, unposted. The
+    /// line the run said it in.
+    Refused(String),
+}
+
+/// What a run of `aterm secrets need` that exited `code`, saying `stderr`, did with the need.
+///
+/// # Errors
+/// A run that ended otherwise (a failure, a signal): its exit.
+fn posted(code: Option<i32>, stderr: &[u8]) -> Result<Posted, String> {
+    match code {
+        Some(0) => Ok(Posted::Ran),
+        Some(code) if code == i32::from(aterm_secrets::converge::STANDING) => {
+            let said = String::from_utf8_lossy(stderr);
+            let line = said
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|line| line.strip_prefix("aterm secrets need: ").unwrap_or(line));
+            Ok(Posted::Refused(line.map_or_else(
+                || {
+                    "the lab's credential-requests table refused it for its capacity, so it \
+                     stays in this Mac's ledger, unposted"
+                        .to_owned()
+                },
+                str::to_owned,
+            )))
+        }
+        code => Err(format!("aterm secrets need exited {code:?}")),
+    }
 }
 
 /// What a provision does to the deployer key's need.
@@ -885,6 +925,8 @@ pub(crate) fn settle_site_key(host: &Arc<dyn ReleaseHost>) -> Option<String> {
 /// accepted marks the need met.
 pub(crate) fn distribution(host: &Arc<dyn ReleaseHost>, dry: bool) -> Vec<(&'static str, Check)> {
     let mut rows = audit_selected(host, Audit::Distribution);
+    // The lab's table refused the filed need for its capacity: no Mac can answer it yet.
+    let mut unposted = false;
     let (filed, line) = match site_key_step(host) {
         Ok(NeedStep::Raise) if dry => {
             let now = match host.site_key_need(NeedStep::Read) {
@@ -904,7 +946,11 @@ pub(crate) fn distribution(host: &Arc<dyn ReleaseHost>, dry: bool) -> Vec<(&'sta
                 Err(why) => format!("could not be filed (the need ledger: {why})"),
             };
             let posted = match host.post_site_key_need() {
-                Ok(()) => String::new(),
+                Ok(Posted::Ran) => String::new(),
+                Ok(Posted::Refused(line)) => {
+                    unposted = true;
+                    format!("; {line}")
+                }
                 Err(why) => format!("; it is posted at this Mac's next pass ({why})"),
             };
             (true, Some(format!("{asked}{posted}")))
@@ -927,7 +973,11 @@ pub(crate) fn distribution(host: &Arc<dyn ReleaseHost>, dry: bool) -> Vec<(&'sta
     {
         what.push_str("; ");
         what.push_str(&line);
-        if filed {
+        if unposted {
+            *fix = "the filed request posts at a pass the lab's table takes it, and a Mac that \
+                    holds the key answers it; `aterm secrets need ls` shows where it stands"
+                .into();
+        } else if filed {
             *fix = "a Mac that holds the key answers the filed request; `aterm secrets need ls` \
                     shows where it stands"
                 .into();
@@ -1198,7 +1248,7 @@ impl ReleaseHost for System {
             .map_err(PushGap::Denied)
     }
 
-    fn post_site_key_need(&self) -> Result<(), String> {
+    fn post_site_key_need(&self) -> Result<Posted, String> {
         use aterm_secrets::need::{Purpose, Want};
         let aterm = self
             .installed_aterm()
@@ -1206,17 +1256,10 @@ impl ReleaseHost for System {
         let mut cmd = aterm_uds::spawnfd::command(&aterm);
         cmd.args(["secrets", "need"])
             .arg(Want::SiteDeployerKey.key())
-            .args(["--purpose", Purpose::ReleaseSiteKey.id()])
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null());
+            .args(["--purpose", Purpose::ReleaseSiteKey.id()]);
         let out = aterm_uds::deadline::output_within(&mut cmd, REACH_WITHIN)
             .map_err(|e| format!("aterm secrets need {e}"))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(format!("aterm secrets need exited {:?}", out.status.code()))
-        }
+        posted(out.status.code(), &out.stderr)
     }
 }
 

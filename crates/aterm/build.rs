@@ -92,11 +92,23 @@ fn chained_fixups() {
     }
 }
 
-/// On macOS `[profile.release]` builds, strip LTO-internalized local symbols (`-x`) so
-/// `dyld` does not fault megabytes of `__LINKEDIT` during `dlsym`, and order section atoms
-/// via `src/macho_order.rs` (structural `(tier, crate, module)` grouping refined by
-/// multi-permutation headless startup `CS_VALIDATED` page-fault intersection) so cold crates
-/// and cold functions inside touched modules do not fragment startup/idle `__TEXT` pages.
+/// The scratch world's words (`aterm_types::world`), which `src/macho_order.rs` mounts by
+/// `#[path]` into the order wrapper: included here so an edit to them recompiles and reruns this
+/// script, and hashed into the wrapper's name, so that edit builds a new wrapper.
+const WORLD_WORDS: &[u8] = include_bytes!("../aterm-types/src/world_words.rs");
+
+/// On macOS `[profile.release]` builds with debug info and debug assertions off at
+/// `opt-level` 3, strip LTO-internalized local symbols (`-x`) so `dyld` does not fault
+/// megabytes of `__LINKEDIT` during `dlsym`, through the `aterm-order-ld` wrapper this builds
+/// from `src/macho_order.rs`. Where its permutation sieve gives an order (headless startup
+/// `CS_VALIDATED` page-fault intersection across permuted probe links of the structural
+/// `(tier, crate, module)` order, each image in a scratch world: `macho_order::probe_world`),
+/// the wrapper orders section atoms by it, so the symbols whose pages every probe's start
+/// faulted sit ahead of the rest; where it gives none (no probe dylib,
+/// `ATERM_SKIP_ORDER_PROBE`, an image that is not aterm, a sieve that could not finish
+/// `macho_order::MIN_PROBE_HIT_SETS` probes) the image links with no order file beyond one its
+/// own arguments name (`macho_order::final_link`). A host that is not
+/// macOS, or a wrapper that does not build, links with `-x` alone.
 fn macos_release_linker(compiler_flavor: &str) {
     let manifest_dir = std::path::PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo always sets CARGO_MANIFEST_DIR"),
@@ -157,39 +169,28 @@ fn main() -> std::process::ExitCode {
     }
     let link_args = &args[1..];
     let expanded = macho_order::expand_linker_args(link_args);
-    let has_order_file = expanded.iter().any(|a| a == "-order_file");
-    let has_strip_locals = expanded.iter().any(|a| a == "-x");
-
-    let mut temp_order: Option<std::path::PathBuf> = None;
-    if !has_order_file {
-        let inputs = macho_order::collect_input_paths(&expanded);
-        let mut ordered = macho_order::build_order_list(&inputs);
-        if should_run_probe(&expanded, &ordered)
-            && let Some(refined) = run_permutation_sieve(&ordered, &expanded)
-        {
-            ordered = refined;
-        }
-        if !ordered.is_empty() {
-            let path = std::path::Path::new(ORDER_DIR)
-                .join(format!("aterm-{}.order", std::process::id()));
-            if macho_order::write_order_file(&path, &ordered).is_ok() {
-                temp_order = Some(path);
-            }
-        }
+    let sieve = if expanded.iter().any(|a| a == "-order_file") {
+        None
+    } else {
+        sieve_order(&expanded)
+    };
+    let order_path =
+        std::path::Path::new(ORDER_DIR).join(format!("aterm-{}.order", std::process::id()));
+    let mut link = macho_order::final_link(link_args, &expanded, sieve, &order_path);
+    let order_tried = link.order.is_some();
+    if link
+        .order
+        .as_ref()
+        .is_some_and(|order| macho_order::write_order_file(&order_path, order).is_err())
+    {
+        link = macho_order::final_link(link_args, &expanded, None, &order_path);
     }
 
-    let mut cmd = std::process::Command::new(REAL_LD);
-    cmd.args(link_args);
-    if let Some(ref order_path) = temp_order {
-        cmd.arg("-order_file").arg(order_path);
-    }
-    if !has_strip_locals {
-        cmd.arg("-x");
-    }
-
-    let status = cmd.status();
-    if let Some(order_path) = temp_order {
-        let _ = std::fs::remove_file(order_path);
+    let status = std::process::Command::new(REAL_LD)
+        .args(&link.args)
+        .status();
+    if order_tried {
+        let _ = std::fs::remove_file(&order_path);
     }
     match status {
         Ok(s) if s.success() => std::process::ExitCode::SUCCESS,
@@ -219,12 +220,24 @@ fn find_output_path(expanded: &[String]) -> Option<std::path::PathBuf> {
     found
 }
 
-fn should_run_probe(expanded: &[String], ordered: &[String]) -> bool {
+/// The permutation sieve's order for this link, or `None` where the sieve gives none: the
+/// probe is not admitted, the structural base holds 5,000 symbols or fewer or no `_main`, or
+/// the sieve could not refine it. The structural base is read only for an admitted probe.
+fn sieve_order(expanded: &[String]) -> Option<Vec<String>> {
+    if !should_run_probe(expanded) {
+        return None;
+    }
+    let base = macho_order::build_order_list(&macho_order::collect_input_paths(expanded));
+    if base.len() <= 5_000 || !base.iter().any(|s| s == "_main") {
+        return None;
+    }
+    run_permutation_sieve(&base, expanded)
+}
+
+fn should_run_probe(expanded: &[String]) -> bool {
     if PROBE_DYLIB.is_empty()
         || !std::path::Path::new(PROBE_DYLIB).is_file()
         || std::env::var_os("ATERM_SKIP_ORDER_PROBE").is_some()
-        || ordered.len() <= 5_000
-        || !ordered.iter().any(|s| s == "_main")
     {
         return false;
     }
@@ -331,7 +344,15 @@ fn run_permutation_sieve(
         .enumerate()
         .filter_map(|(k, b)| b.map(|p| (k, p)))
         .collect();
-    if linked.len() < 3 {
+    // A probe image that linked but never ran holds no assessment in flight: one the sieve
+    // gives up on before running it is removed, so a failed sieve leaves no image behind.
+    let drop_unrun = |linked: &[(usize, std::path::PathBuf)]| {
+        for (_, bin) in linked {
+            let _ = std::fs::remove_file(bin);
+        }
+    };
+    if linked.len() < macho_order::MIN_PROBE_HIT_SETS {
+        drop_unrun(&linked);
         return None;
     }
 
@@ -339,6 +360,7 @@ fn run_permutation_sieve(
     // server probe binary's UBC `vm_object_t`.
     let ctl_bin = order_dir.join(format!("aterm-probe-ctl-{pid}.bin"));
     if std::fs::copy(&linked[0].1, &ctl_bin).is_err() {
+        drop_unrun(&linked);
         return None;
     }
     let _ = std::process::Command::new("/usr/bin/codesign")
@@ -350,6 +372,9 @@ fn run_permutation_sieve(
         .output()
         .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
     if !ctl_proved {
+        // `ctl_bin` ran without proving it: it stays, as a probe image killed before its
+        // proof does; the probe images themselves never ran.
+        drop_unrun(&linked);
         return None;
     }
 
@@ -368,11 +393,7 @@ fn run_permutation_sieve(
 
     let _ = std::fs::remove_file(&ctl_bin);
 
-    if hit_sets.len() < 3 {
-        return None;
-    }
-
-    let refined = macho_order::refine_order_with_probe_hits(base_ordered, &hit_sets);
+    let refined = macho_order::refine_order_with_probe_hits(base_ordered, &hit_sets)?;
     if let Some(log_path) = std::env::var_os("ATERM_ORDER_PROBE_LOG") {
         let lens: Vec<usize> = hit_sets.iter().map(std::collections::HashSet::len).collect();
         let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -404,28 +425,25 @@ fn run_one_probe(
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
+    // A release aterm under a fresh HOME starts only in a scratch world (`aterm_types::world`):
+    // its marker and lanes-off tables, laid out by `macho_order::probe_world`.
     let root = std::path::PathBuf::from(format!("/tmp/.ubd/atord-{pid}-{k}.noindex"));
+    let world = macho_order::probe_world(&root)?;
     let _ = std::fs::remove_dir_all(&root);
-    let home = root.join("home");
-    let cfg_dir = root.join("cfg/aterm");
-    let run_dir = root.join("run");
-    for d in [&home, &cfg_dir, &run_dir] {
+    for d in &world.dirs {
         if std::fs::create_dir_all(d).is_err() {
             let _ = std::fs::remove_dir_all(&root);
             return None;
         }
         let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
     }
-    let shrc = home.join(".shrc");
-    let _ = std::fs::write(home.join(".profile"), "PS1='$ '\n");
-    let _ = std::fs::write(&shrc, "PS1='$ '\n");
-    let _ = std::fs::write(
-        cfg_dir.join("aterm.toml"),
-        "bell_sound = false\ntemporal_recording = true\n\
-         [update]\nenabled = false\nauto_apply = false\n\
-         [packages]\nenabled = false\n\
-         [machine]\nuniversal_control = \"leave\"\n",
-    );
+    // An image whose `aterm.toml` was not written would start with its lanes on: none starts.
+    for (path, text) in &world.files {
+        if std::fs::write(path, text).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return None;
+        }
+    }
 
     let sock = root.join("s.sock");
     let pages_out = root.join("pages.txt");
@@ -433,18 +451,11 @@ fn run_one_probe(
 
     let mut child = match std::process::Command::new(bin_k)
         .env_clear()
-        .env("HOME", &home)
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("SHELL", "/bin/sh")
-        .env("ENV", &shrc)
-        .env("TERM", "xterm-256color")
-        .env("XDG_CONFIG_HOME", root.join("cfg"))
-        .env("XDG_RUNTIME_DIR", &run_dir)
-        .env("HISTFILE", "/dev/null")
+        .envs(world.env.iter().cloned())
         .env("DYLD_INSERT_LIBRARIES", PROBE_DYLIB)
         .env("ATERM_ORDER_PROBE_OUT", &pages_out)
         .env("ATERM_ORDER_PROBE_READY", &ready_file)
-        .current_dir(&home)
+        .current_dir(&world.home)
         .args(["--headless", "--no-reroute", "--control-sock"])
         .arg(&sock)
         .stdin(std::process::Stdio::null())
@@ -476,8 +487,7 @@ fn run_one_probe(
         let run_ctl = |extra: &[&str]| {
             let _ = std::process::Command::new(ctl_bin)
                 .env_clear()
-                .env("HOME", &home)
-                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .envs(world.env.iter().cloned())
                 .arg("ctl")
                 .arg("--sock")
                 .arg(&sock)
@@ -534,7 +544,11 @@ fn run_one_probe(
 
     let wrapper_src = format!("{header}{wrapper_body}");
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in order_mod_bytes.iter().chain(wrapper_src.as_bytes()) {
+    for &b in order_mod_bytes
+        .iter()
+        .chain(WORLD_WORDS)
+        .chain(wrapper_src.as_bytes())
+    {
         hash ^= u64::from(b);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }

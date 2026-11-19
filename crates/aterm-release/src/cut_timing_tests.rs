@@ -162,7 +162,10 @@ fn logged_timing_keeps_the_same_identity_and_exclusive_cost() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let log = dir.path().join("phase.log");
     let root = Timer::new("root");
-    let timer = Timer::start(&log, "logged");
+    let details = aterm_json::json!({"native_git": {"operation": "fetch-ref", "requested_scope": "selected-checkout"}});
+    let timer = Timer::new("logged")
+        .with_details(details.clone())
+        .with_log(Some(&log));
     let id = timer.id;
     drop(timer);
     let events: Vec<aterm_json::Value> = std::fs::read_to_string(&log)
@@ -172,6 +175,7 @@ fn logged_timing_keeps_the_same_identity_and_exclusive_cost() {
         .collect();
     assert_eq!(events.len(), 2);
     for event in &events {
+        assert_eq!(event["details"], details);
         assert_eq!(event["gate_id"].as_u64(), Some(id));
         assert_eq!(event["process_image"].as_str(), Some(image_id()));
         assert_eq!(event["parent_gate_id"].as_u64(), Some(root.id));

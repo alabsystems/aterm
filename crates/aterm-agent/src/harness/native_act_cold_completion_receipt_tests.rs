@@ -53,7 +53,7 @@ fn completed_cold_intent_survives_with_or_without_a_future_observation() {
             };
             assert_eq!(
                 Reply::parse(&wire),
-                Some(Reply::ColdRestartCommitted {
+                Some(Reply::AdmittedRestartCommitted {
                     claim: ClaimOutcome::Builtin,
                     observation: with_watch.then(|| Box::new(saved.clone())),
                     intent: Box::new(intent.clone())

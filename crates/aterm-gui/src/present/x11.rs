@@ -81,7 +81,7 @@ enum Store {
 
 /// One window's X11 presenter.
 pub(crate) struct X11Presenter {
-    conn: Connection,
+    conn: Arc<Connection>,
     window: u32,
     gc: u32,
     depth: u8,
@@ -185,7 +185,7 @@ impl X11Presenter {
         }
         // SAFETY: Winit's live `Display *`, which `owner` keeps open for as long as this
         // presenter (and so this connection) lives.
-        let conn = unsafe { Connection::from_xlib_display(display) }?;
+        let conn = Arc::new(unsafe { Connection::from_xlib_display(display) }?);
         let geometry = conn.send(xproto::get_geometry(xid))?;
         let visual = match (visual != 0).then_some(visual) {
             Some(v) => v,
@@ -291,81 +291,192 @@ impl X11Presenter {
             .map_or(0, |(w, h)| usize::from(w) * usize::from(h))
     }
 
+    /// Confirm this connection's preceding image submission on the capture worker.
+    /// Ordinary presents remain asynchronous; the capture pins its frame before
+    /// asking for this fence, so no later paint can replace it during confirmation.
+    pub(crate) fn capture_submit_fence(&mut self) -> Result<Box<dyn super::SubmitFence>, String> {
+        Ok(submit_fence(
+            Arc::clone(&self.conn),
+            Arc::clone(&self.owner),
+        ))
+    }
+
     fn present(&mut self, damage: &[DamageRect]) -> Result<(), X11PresentError> {
         let Some((w, h)) = self.size else {
             return Ok(());
         };
-        let mut whole = None;
-        match &mut self.store {
-            Store::Wire(buf) => {
-                let row_bytes = usize::from(w) * 4;
-                let limit = self.conn.maximum_request_bytes().saturating_sub(32);
-                let rows = (limit / row_bytes.max(1)).clamp(1, usize::from(h));
-                for (band, chunk) in buf.chunks(rows * usize::from(w)).enumerate() {
-                    let y = band * rows;
-                    let band_rows = chunk.len() / usize::from(w).max(1);
-                    let bytes: Vec<u8> = chunk.iter().flat_map(|p| p.to_ne_bytes()).collect();
-                    let posted = self.conn.send_void(xproto::put_image(
-                        image_format::Z_PIXMAP,
-                        self.window,
-                        self.gc,
-                        w,
-                        u16::try_from(band_rows).unwrap_or(h),
-                        0,
-                        i16::try_from(y).unwrap_or(i16::MAX),
-                        0,
-                        self.depth,
-                        &bytes,
-                    ))?;
-                    // The bands draw the whole frame: an `Expose` sent before the first band's
-                    // request is drawn again by every band.
-                    whole.get_or_insert(posted.sequence());
-                }
-            }
-            Store::Shm {
-                major,
-                seg,
-                pending,
-            } => {
-                let Some(seg) = seg else {
-                    return Ok(());
-                };
-                if let Some(bad) = damage.iter().find(|r| shm_rect(r).is_none()) {
-                    return Err(X11PresentError::Damage(*bad));
-                }
-                for (x, y, rw, rh, dx, dy) in damage.iter().filter_map(shm_rect) {
-                    let posted = self.conn.send_void(shm::put_image(
-                        *major,
-                        self.window,
-                        self.gc,
-                        w,
-                        h,
-                        x,
-                        y,
-                        rw,
-                        rh,
-                        dx,
-                        dy,
-                        self.depth,
-                        image_format::Z_PIXMAP,
-                        false,
-                        seg.id,
-                        0,
-                    ))?;
-                    if (x, y, rw, rh) == (0, 0, w, h) {
-                        whole = Some(posted.sequence());
-                    }
-                }
-                *pending = Some(self.conn.send(xproto::get_input_focus())?.detach());
-            }
+        if matches!(&self.store, Store::Shm { seg: None, .. }) {
+            return Ok(());
         }
-        self.conn.flush()?;
+        let whole = submit_pixels(
+            &self.conn,
+            self.window,
+            self.gc,
+            self.depth,
+            &mut self.store,
+            (w, h),
+            damage,
+        )?;
         self.presented = true;
         if let Some(sequence) = whole {
             self.owner
                 .x11_area_posted(sequence, [0, 0, u32::from(w), u32::from(h)]);
         }
         Ok(())
+    }
+}
+
+/// Submit pixels on the actual presentation connection; capture confirmation is separate.
+fn submit_pixels(
+    conn: &Connection,
+    window: u32,
+    gc: u32,
+    depth: u8,
+    store: &mut Store,
+    (w, h): (u16, u16),
+    damage: &[DamageRect],
+) -> Result<Option<u64>, X11PresentError> {
+    let mut whole = None;
+    match store {
+        Store::Wire(buf) => {
+            let row_bytes = usize::from(w) * 4;
+            let limit = conn.maximum_request_bytes().saturating_sub(32);
+            let rows = (limit / row_bytes.max(1)).clamp(1, usize::from(h));
+            for (band, chunk) in buf.chunks(rows * usize::from(w)).enumerate() {
+                let y = band * rows;
+                let band_rows = chunk.len() / usize::from(w).max(1);
+                let bytes: Vec<u8> = chunk.iter().flat_map(|p| p.to_ne_bytes()).collect();
+                let posted = conn.send_void(xproto::put_image(
+                    image_format::Z_PIXMAP,
+                    window,
+                    gc,
+                    w,
+                    u16::try_from(band_rows).unwrap_or(h),
+                    0,
+                    i16::try_from(y).unwrap_or(i16::MAX),
+                    0,
+                    depth,
+                    &bytes,
+                ))?;
+                // The bands draw the whole frame: an `Expose` sent before the first band's
+                // request is drawn again by every band.
+                whole.get_or_insert(posted.sequence());
+            }
+        }
+        Store::Shm {
+            major,
+            seg,
+            pending,
+        } => {
+            let Some(seg) = seg else {
+                return Ok(None);
+            };
+            if let Some(bad) = damage.iter().find(|r| shm_rect(r).is_none()) {
+                return Err(X11PresentError::Damage(*bad));
+            }
+            for (x, y, rw, rh, dx, dy) in damage.iter().filter_map(shm_rect) {
+                let posted = conn.send_void(shm::put_image(
+                    *major,
+                    window,
+                    gc,
+                    w,
+                    h,
+                    x,
+                    y,
+                    rw,
+                    rh,
+                    dx,
+                    dy,
+                    depth,
+                    image_format::Z_PIXMAP,
+                    false,
+                    seg.id,
+                    0,
+                ))?;
+                if (x, y, rw, rh) == (0, 0, w, h) {
+                    whole = Some(posted.sequence());
+                }
+            }
+            *pending = Some(conn.send(xproto::get_input_focus())?.detach());
+        }
+    }
+    conn.flush()?;
+    Ok(whole)
+}
+
+/// The production keepalive is the real Xlib window whose connection we borrow.
+/// An independently owned test connection needs no synthetic window.
+struct X11SubmitFence<K: Send> {
+    conn: Arc<Connection>,
+    sequence: Option<u64>,
+    _keepalive: K,
+}
+
+fn submit_fence<K: Send + 'static>(
+    conn: Arc<Connection>,
+    keepalive: K,
+) -> Box<dyn super::SubmitFence> {
+    Box::new(X11SubmitFence {
+        conn,
+        sequence: None,
+        _keepalive: keepalive,
+    })
+}
+
+impl<K: Send> super::SubmitFence for X11SubmitFence<K> {
+    fn wait(mut self: Box<Self>, stopped: &(dyn Fn() -> bool + Send + Sync)) -> Result<(), String> {
+        if stopped() {
+            return Err("X11 capture submission cancelled".into());
+        }
+        let mut progress = super::linux::SubmitProgress::new(self.conn.file_descriptor())?;
+        let sequence = self
+            .conn
+            .send(xproto::get_input_focus())
+            .map_err(|e| e.to_string())?
+            .detach();
+        self.sequence = Some(sequence);
+        self.conn.flush().map_err(|e| e.to_string())?;
+        loop {
+            if stopped() {
+                return Err("X11 capture submission cancelled".into());
+            }
+            match self
+                .conn
+                .poll_reply::<GetInputFocusReply>(sequence)
+                .map_err(|e| e.to_string())?
+            {
+                Some(_) => {
+                    self.sequence = None;
+                    return Ok(());
+                }
+                None => {}
+            }
+            let mut fd = libc::pollfd {
+                fd: self.conn.file_descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live descriptor, retained by this fence's connection.
+            // The short readiness interval observes cancellation, not a photo budget.
+            let ready = unsafe { libc::poll(&raw mut fd, 1, 50) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error.to_string());
+                }
+            } else if fd.revents & libc::POLLNVAL != 0 {
+                return Err("X11 capture submission descriptor is invalid".into());
+            }
+            progress.check()?;
+        }
+    }
+}
+
+impl<K: Send> Drop for X11SubmitFence<K> {
+    fn drop(&mut self) {
+        if let Some(sequence) = self.sequence.take() {
+            self.conn.discard(sequence);
+        }
     }
 }
 

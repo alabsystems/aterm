@@ -208,6 +208,43 @@ fn the_first_frame_asks_again_at_once() {
     );
 }
 
+/// A window lets its keeper link ask an older keeper to restart only at its checkpoint with the
+/// updater's boot-health confirmation complete, and only while no Mac Setup tab of its runs; a
+/// gate the updater's Pending answers opened by patience alone is no healthy boot.
+///
+/// NEGATIVE CONTROL (run by hand, restored): with `asks_keeper_restart` answering `true`, every
+/// case but the first fails.
+#[test]
+fn a_window_lets_its_keeper_restart_only_once_booted_healthy_with_no_mac_setup_running() {
+    assert!(crate::asks_keeper_restart(true, true, false));
+    for (checkpoint, confirmed, mac_setup) in [
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+        (false, false, false),
+    ] {
+        assert!(
+            !crate::asks_keeper_restart(checkpoint, confirmed, mac_setup),
+            "checkpoint {checkpoint}, confirmed {confirmed}, Mac Setup {mac_setup}"
+        );
+    }
+    let mut app = App::headless_for_test();
+    app.boot_health_checkpoint_seen = false;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Complete;
+    assert!(!app.keeper_restart_due(), "confirmed before its checkpoint");
+    app.boot_health_checkpoint_seen = true;
+    assert!(app.keeper_restart_due(), "and then at it");
+    app.boot_health_confirmation = crate::BootHealthConfirmation::InFlight(boot_health_ticket(3));
+    assert!(!app.keeper_restart_due(), "at its checkpoint, still asking");
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    app.boot_health_pending_lapsed = true;
+    assert!(
+        app.native_boot_health_complete(),
+        "premise: the gate is open"
+    );
+    assert!(!app.keeper_restart_due(), "opened by patience");
+}
+
 /// A launch that owes no trial is confirmed by the ask it sends before its checkpoint, which
 /// lets the updater only read. The updater releases an ended window's kept predecessor at a
 /// checkpoint ask alone, so the park sends it that one ask once the checkpoint is reached, and

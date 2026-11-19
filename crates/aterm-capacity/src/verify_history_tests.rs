@@ -162,6 +162,60 @@ fn mixed_history_import_preserves_keys_peaks_and_times_even_for_light_runs() {
 }
 
 #[test]
+fn plain_admission_preserves_the_unit_floor_when_reading_split_history() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join(VERIFY_RECORD);
+    let legacy = dir.path().join(LEGACY_VERIFY_RECORD);
+    let units = dir.path().join(VERIFY_SHAPING_RECORD);
+    let like = Key {
+        stage: crate::book::TEST_COMPILE.into(),
+        checkout: "/here".into(),
+        crates: Some(vec!["unit-0".into()]),
+        variant: None,
+    };
+    let wider = Key {
+        checkout: "/elsewhere".into(),
+        crates: Some(vec!["other".into(), "unit-0".into()]),
+        ..like.clone()
+    };
+    let own = Key {
+        stage: "targo test".into(),
+        variant: Some("--lib".into()),
+        ..like.clone()
+    };
+    let records = Records::default();
+    let physical = Some(48 * GIB);
+    let mut old = Records::default();
+    old.push(wider.clone(), 2 * GIB, 10);
+    old.push(unit(0), 5 * GIB, 11);
+    old.save(&legacy).unwrap();
+    keep_stage(&path, wider, 2 * GIB, 12, false).unwrap();
+
+    let read = || {
+        let eager = ShapingHistory::load(&path);
+        let found = crate::book::chain_from_verify_path(&records, &own, Some((&path, &like)));
+        let sized = crate::book::BuildNeed::from_found(found, physical);
+        assert_eq!(
+            sized,
+            crate::book::need(&records, &own, Some((&eager, &like)), physical)
+        );
+        sized
+    };
+    assert_eq!(read().bytes, crate::cold_claim(physical));
+    assert!(
+        !units.exists(),
+        "a missing sibling may read legacy without migrating it"
+    );
+
+    std::fs::write(&units, b"malformed").unwrap();
+    assert_eq!(
+        read().bytes,
+        crate::peak_claim(2 * GIB),
+        "a malformed sibling never reads the legacy floor"
+    );
+}
+
+#[test]
 fn malformed_and_oversized_new_books_stay_closed_without_legacy_fallback_or_overwrite() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let path = dir.path().join(VERIFY_RECORD);

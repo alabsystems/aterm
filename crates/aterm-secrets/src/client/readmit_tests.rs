@@ -1009,10 +1009,10 @@ fn an_admission_whose_batch_would_pass_the_held_total_is_refused_before_signing(
 /// passes the byte bound on the very log that lets the Mac in.
 #[test]
 fn an_admission_whose_batch_could_pass_the_record_bytes_is_refused_before_signing() {
-    use crate::membership_log::{MAX_RECORD, MAX_RECORDS_STREAM, Payload, entries};
+    use crate::membership_log::{MAX_RECORD, Payload, Reading, entries};
 
     let batch = |wraps: usize| Kind::Admit.most_bytes() + wraps * Kind::Wrap.most_bytes();
-    let to = MAX_RECORDS_STREAM - batch(3);
+    let to = Reading::ONE.capacity() - batch(3);
     let mut log = alab();
     let (draft, _) = log
         .draft_epoch(&ME.id(), T0, EpochAudience::Everyone, 1)

@@ -95,10 +95,13 @@ mod app_nudge;
 mod app_overview;
 mod app_palette;
 mod app_presence;
+mod app_registry;
 mod app_rename;
 mod app_render;
 mod app_requests;
+mod app_resources;
 mod app_search;
+mod app_session_cleanup;
 mod app_settings;
 mod app_tables;
 mod app_tabs;
@@ -118,6 +121,8 @@ mod appkit;
 mod artifact_transaction_conformance;
 #[cfg(any(target_os = "macos", test))]
 mod askpass;
+#[cfg(any(target_os = "macos", test))]
+mod askpass_record;
 #[cfg(test)]
 mod atpkg_contention_release_conformance;
 mod auto_naming;
@@ -155,6 +160,11 @@ mod native_allocation;
 mod native_mail;
 mod native_mail_host;
 mod native_observe;
+mod native_registry;
+#[cfg(all(unix, feature = "bench-support"))]
+#[doc(hidden)]
+pub use native_registry::open_measure::measure_local_registry;
+mod native_resources;
 mod native_session_policy;
 mod native_tables;
 mod native_tables_check;
@@ -169,14 +179,18 @@ mod os_appearance;
 mod parked_awaits;
 #[cfg(all(test, unix))]
 mod precommit_input_conformance;
+mod registry_machines;
 mod resolved_colors;
 mod resolved_typography;
 #[cfg(unix)]
 mod resource_admission_attach;
 #[cfg(unix)]
 mod resource_admission_host;
+mod resources_macos;
+mod resources_spotlight;
 #[cfg(all(test, unix))]
 mod restore_pass_conformance;
+mod session_dock;
 mod session_table;
 mod session_theme;
 #[cfg(all(test, unix))]
@@ -692,6 +706,8 @@ mod disk_board;
 mod disk_stores;
 mod disk_where;
 mod elevated_caption;
+#[cfg(target_os = "macos")]
+mod root_step_authorization;
 pub(crate) use aterm_gui_consent::durable;
 mod crash_restore;
 mod keeper_link;
@@ -786,6 +802,13 @@ mod pinned_dir;
 #[cfg(windows)]
 mod platform_win;
 mod present;
+// Native submission leases belong to Linux and the scripted test/benchmark surface.
+#[cfg(any(
+    test,
+    target_os = "linux",
+    all(unix, feature = "bench-support", debug_assertions)
+))]
+mod presentation_lease;
 #[cfg(test)]
 mod press_custody_conformance;
 mod relaunch_notice;
@@ -917,7 +940,6 @@ mod pane;
 mod pane_chrome;
 mod pane_header;
 mod park;
-mod park_bell;
 #[cfg(all(test, unix))]
 mod parked_fork;
 #[cfg(unix)]
@@ -957,6 +979,7 @@ mod machine_rename_sheet;
 mod machine_title;
 #[cfg(target_os = "macos")]
 mod memory_pressure;
+mod memory_starving;
 mod needs;
 mod network_deck;
 mod predict_seen;
@@ -1047,9 +1070,14 @@ mod subscribe;
 mod summarize;
 mod survey;
 mod sys_host;
+/// The cached host `sys history` measurement, isolated from the running application's state.
+#[cfg(all(feature = "bench-support", debug_assertions))]
+#[doc(hidden)]
+pub use sys_host::history_probe::HistoryPullProbe;
 mod sys_naming;
 mod system_quit;
 mod tab_bar;
+mod tab_drop;
 mod tab_ids;
 mod tab_label;
 mod tab_menu;
@@ -3171,6 +3199,13 @@ impl OutageWait {
 
 #[derive(Debug)]
 enum Wake {
+    /// A controller ended the lifetime of its exact presented-client capture.
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    PresentationReleased,
     #[cfg(all(unix, not(target_os = "macos")))]
     NavigatorTitleReady(String),
     /// Acknowledgement of this FIFO position, independent of callback payloads.
@@ -3188,6 +3223,7 @@ enum Wake {
     MailChanged,
     /// The Tables page's reader answered.
     TablesChanged,
+    RegistryChanged,
     #[cfg(all(unix, not(test)))]
     NetworkPlaceChanged,
     #[cfg(target_os = "macos")]
@@ -3810,6 +3846,13 @@ enum Wake {
     Askpass(Box<askpass::AskpassRequest>),
     #[cfg(target_os = "macos")]
     CpuPolicyReport(Box<aterm_json::Value>),
+    /// A root step the System Resources page's macOS configuration section started ended
+    /// ([`root_step_authorization`]).
+    #[cfg(target_os = "macos")]
+    RootStepEnded {
+        step: aterm_types::macos_setup::root_only::Step,
+        ended: root_step_authorization::Ended,
+    },
     #[cfg(target_os = "macos")]
     CpuPolicyPermit {
         operation: std::sync::Arc<cpu_policy_authorization::Operation>,
@@ -5272,26 +5315,7 @@ struct PixelBackendRedemptionLegs {
     chrome_sync_ms: Option<f64>,
     fork_ms: Option<f64>,
     device: Option<(f64, Result<String, String>)>,
-    font_thread_ms: Option<f64>,
-    font_join_ms: Option<f64>,
     install_ms: Option<f64>,
-}
-
-impl PixelBackendRedemptionLegs {
-    fn note_font_legs(&mut self, unset_before: bool) {
-        use aterm_gpu::startup_probe::{Leg, leg_ns};
-        if !unset_before {
-            return;
-        }
-        let ms = |ns: u64| (ns != 0).then_some(ns as f64 / 1e6);
-        self.font_thread_ms = ms(leg_ns(Leg::FontThread));
-        self.font_join_ms = ms(leg_ns(Leg::FontJoin));
-    }
-}
-
-fn font_legs_unset() -> bool {
-    use aterm_gpu::startup_probe::{Leg, leg_ns};
-    leg_ns(Leg::FontThread) == 0 && leg_ns(Leg::FontJoin) == 0
 }
 
 fn elapsed_ms(since: Instant) -> f64 {
@@ -5311,26 +5335,12 @@ fn pixel_backend_redemption_line(legs: &PixelBackendRedemptionLegs, total_ms: f6
     if let Some(ms) = legs.fork_ms {
         parts.push(format!("face fork {ms:.0} ms"));
     }
-    let font_legs = {
-        let mut split: Vec<String> = Vec::new();
-        if let Some(ms) = legs.font_thread_ms {
-            split.push(format!("font thread {ms:.0} ms"));
-        }
-        if let Some(ms) = legs.font_join_ms {
-            split.push(format!("join wait {ms:.0} ms"));
-        }
-        if split.is_empty() {
-            String::new()
-        } else {
-            format!("{}; ", split.join(", "))
-        }
-    };
     match &legs.device {
         Some((ms, Ok(adapter))) => {
-            parts.push(format!("GPU device {ms:.0} ms ({font_legs}{adapter})"));
+            parts.push(format!("GPU device {ms:.0} ms ({adapter})"));
         }
         Some((ms, Err(error))) => parts.push(format!(
-            "GPU device {ms:.0} ms ({font_legs}unavailable: {error}; the CPU renderer keeps \
+            "GPU device {ms:.0} ms (unavailable: {error}; the CPU renderer keeps \
              serving)"
         )),
         None if legs.fork_ms.is_some() => {
@@ -7558,6 +7568,19 @@ struct WindowState {
     last_present_at: Option<Instant>,
     content_pending: bool,
     capture_present_serial: u64,
+    /// Changes on every installed presentation target; a held capture cannot cross one.
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    presentation_surface: u64,
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    presentation_lease: Option<presentation_lease::Held>,
     /// A capture's redraw is under way (`App::redraw_capture_frame`): a hidden window presents
     /// it (`docs/ATERM_DESIGN.md` §7.4).
     capture_redraw: bool,
@@ -7631,6 +7654,10 @@ struct WindowState {
     composed_retain: crate::app_render::ComposedRetain,
     leaf_render_cache: std::collections::BTreeMap<tab_model::ViewId, LeafRenderCache>,
     tab_segments: Vec<tab_bar::TabSegment>,
+    /// Stable identities the last grid strip frame painted.
+    painted_strip_ids: Vec<tab_model::TabId>,
+    /// Pure organizer pages in the canonical tab set, refreshed with the toolbar model.
+    organizer_tabs: std::collections::HashSet<tab_model::TabId>,
     last_strip_fp: Option<StripCacheKey>,
     strip_hover: Option<usize>,
     strip_hover_new_tab: bool,
@@ -7706,6 +7733,7 @@ struct WindowState {
     route_card: Option<SettingsCard>,
     badge_card: Option<SettingsCard>,
     deck_card: Option<SettingsCard>,
+    frame_resource_strip: Option<(stats_deck::StripCrop, SettingsCard)>,
     deck_fold: Option<SettingsCard>,
     /// Whether the window's renderer folds the deck, the lens and the card on top itself, as one
     /// tray stack ([`WindowState::tray_stack`]), in place of [`Self::deck_fold`]: set where the
@@ -7766,6 +7794,75 @@ impl std::ops::Deref for WindowState {
 }
 
 impl WindowState {
+    fn presentation_held(&self) -> bool {
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        {
+            self.presentation_lease
+                .as_ref()
+                .is_some_and(presentation_lease::Held::active)
+        }
+        #[cfg(not(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        )))]
+        {
+            false
+        }
+    }
+
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    ))]
+    fn invalidate_held_presentation(&mut self, reason: &'static str) {
+        if let Some(held) = self.presentation_lease.take() {
+            held.invalidate(reason);
+            // The lease, rather than the frame-cap clock, carried an unpaid
+            // redraw. Transfer that debt before dropping the hold, even while
+            // its controller is still connected.
+            self.redraw_pending = true;
+            self.invalidate_raster_caches();
+            let _ = self.present_retry.on_external_stimulus();
+            self.request_redraw();
+        }
+    }
+
+    #[cfg(not(any(
+        test,
+        target_os = "linux",
+        all(unix, feature = "bench-support", debug_assertions)
+    )))]
+    fn invalidate_held_presentation(&mut self, _reason: &'static str) {}
+
+    fn set_window_pixels(&mut self, size: PhysicalSize<u32>) {
+        if self.win_px != Some(size) {
+            self.invalidate_held_presentation("the captured presentation window was resized");
+        }
+        self.win_px = Some(size);
+    }
+
+    fn replace_present(&mut self, present: Option<PresentTarget>) {
+        self.invalidate_held_presentation("the captured presentation surface was replaced");
+        #[cfg(any(
+            test,
+            target_os = "linux",
+            all(unix, feature = "bench-support", debug_assertions)
+        ))]
+        {
+            self.presentation_surface = self
+                .presentation_surface
+                .checked_add(1)
+                .expect("window presentation surface identity exhausted");
+        }
+        self.present = present;
+    }
+
     fn tracked_held(&self) -> bool {
         app_restore::TRACKS_NORMAL_FRAME
             && self
@@ -7975,7 +8072,7 @@ impl WindowState {
     fn tray_stack(&self) -> Option<[Option<&SettingsCard>; 3]> {
         tray_stack_of(
             self.tray_stacked,
-            self.deck_card.as_ref(),
+            self.frame_deck_card(),
             self.lens_card.as_ref(),
             self.route_card
                 .as_ref()
@@ -7990,7 +8087,7 @@ impl WindowState {
             .or(self.route_card.as_ref())
             .or(self.settings_card.as_ref())
             .or(self.badge_card.as_ref())
-            .or(self.deck_card.as_ref())
+            .or(self.frame_deck_card())
     }
 
     #[cfg_attr(
@@ -8051,6 +8148,10 @@ impl WindowState {
     }
 
     fn service_presentation_clocks(&mut self, pace_floor: Duration, now: Instant) -> bool {
+        if self.presentation_held() {
+            self.redraw_pending = false;
+            return false;
+        }
         service_due_presentation_clocks(
             self.gpu_acquire_pending(),
             &mut self.present_retry,
@@ -8962,6 +9063,18 @@ impl WindowState {
             last_present_at: None,
             content_pending: false,
             capture_present_serial: 0,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation_surface: 0,
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            presentation_lease: None,
             capture_redraw: false,
             off_glass: false,
             covered_frame_at: None,
@@ -9016,6 +9129,8 @@ impl WindowState {
             composed_retain: crate::app_render::ComposedRetain::default(),
             leaf_render_cache: std::collections::BTreeMap::new(),
             tab_segments: Vec::new(),
+            painted_strip_ids: Vec::new(),
+            organizer_tabs: Default::default(),
             last_strip_fp: None,
             strip_hover: None,
             strip_hover_new_tab: false,
@@ -9091,6 +9206,7 @@ impl WindowState {
             route_card: None,
             badge_card: None,
             deck_card: None,
+            frame_resource_strip: None,
             deck_fold: None,
             tray_stacked: false,
             deck_memo: std::cell::Cell::new((0, 0)),
@@ -9655,7 +9771,9 @@ const fn update_handoff_window_event_class(event: &WindowEvent) -> UpdateHandoff
             UpdateHandoffEventClass::Revoking
         }
         WindowEvent::CloseRequested | WindowEvent::Destroyed => UpdateHandoffEventClass::Revoking,
-        WindowEvent::DroppedFile(_) => UpdateHandoffEventClass::Revoking,
+        WindowEvent::DroppedFile(_) | WindowEvent::DroppedLocal { .. } => {
+            UpdateHandoffEventClass::Revoking
+        }
         WindowEvent::Ime(_) => UpdateHandoffEventClass::Revoking,
         WindowEvent::Touch(_) => UpdateHandoffEventClass::Revoking,
     }
@@ -9674,7 +9792,8 @@ const fn os_window_event_kind(event: &WindowEvent) -> Option<crate::metrics::OsW
         | WindowEvent::CursorLeft { .. }
         | WindowEvent::AxisMotion { .. }
         | WindowEvent::MouseInput { .. }
-        | WindowEvent::MouseWheel { .. } => Kind::Pointer,
+        | WindowEvent::MouseWheel { .. }
+        | WindowEvent::DroppedLocal { .. } => Kind::Pointer,
         WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_) => Kind::Key,
         WindowEvent::Ime(_) => Kind::Ime,
         WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => Kind::Resize,
@@ -9802,6 +9921,22 @@ impl Wake {
     }
 }
 
+/// The desk may have moved: the crash journal owes a capture
+/// (`crash_journal::Lane::note_activity`), the disk walker a read of the panes' facts
+/// (`DiskwalkHost::note_activity`), and `metrics` counts the mark (`desk_activity`; the loop's
+/// ledger is `metrics::METRICS`). Outside tests nothing else marks either lane, and the loop calls
+/// this from [`App::note_desk_activity`] and where the status sweep sees a pane's front program
+/// move, so the count is every mark the two lanes took.
+fn desk_moved(
+    journal: &mut crash_journal::Lane,
+    walker: &mut diskwalk_host::DiskwalkHost,
+    metrics: &crate::metrics::Metrics,
+) {
+    journal.note_activity();
+    walker.note_activity();
+    metrics.note_desk_activity();
+}
+
 #[must_use]
 const fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
     match ev {
@@ -9827,9 +9962,14 @@ const fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
         | Wake::CpuPolicyPermit { .. }
         | Wake::CpuPolicyAction { .. }
         | Wake::CpuPolicyReport(_)
-        | Wake::Askpass(_)
-        | Wake::AskpassAnswered { .. }
-        | Wake::AskpassWithdraw { .. } => UpdateHandoffEventClass::Revoking,
+        | Wake::RootStepEnded { .. } => UpdateHandoffEventClass::Revoking,
+        // A password request, its answer and its lane's withdrawal revoke only where a sheet goes
+        // up or comes down (`App::stand_askpass_sheet`, `App::end_askpass_sheet`): a request
+        // refused with no sheet, and the withdrawal that follows it, change nothing on the desk.
+        #[cfg(target_os = "macos")]
+        Wake::Askpass(_) | Wake::AskpassAnswered { .. } | Wake::AskpassWithdraw { .. } => {
+            UpdateHandoffEventClass::Exempt
+        }
         Wake::EditRequest(_)
         | Wake::EditCancel { .. }
         | Wake::EditAwait(_)
@@ -10394,6 +10534,21 @@ const fn should_dispatch_boot_health_confirmation(
     checkpoint && !already_dispatched && retry_due && !incoming_handoff_pending
 }
 
+/// Whether a window lets its keeper link ask an older keeper to restart (`keeper_link::boot_healthy`,
+/// after which the link asks each keeper its judgment names): only once it booted healthy, at its
+/// checkpoint (`checkpoint_seen`) with the updater's boot-health confirmation complete
+/// (`confirmed`: no trial owed, or this build's trial proved or settled), so the keeper that can
+/// reopen a crashed window and holds its shells stays through a new build's first seconds, when an
+/// untested build is likeliest to crash; a gate opened by the updater's silence or by patience is
+/// no healthy boot. And only while none of its Mac Setup tabs runs (`mac_setup`): from the
+/// keeper's exit until the link reaches the next keeper, a quit reads no keeper that carries such
+/// a tab (`keeper_link::carries_at_quit`) and hangs it up, and System Settings' Quit & Reopen asks
+/// nothing first.
+#[must_use]
+const fn asks_keeper_restart(checkpoint_seen: bool, confirmed: bool, mac_setup: bool) -> bool {
+    checkpoint_seen && confirmed && !mac_setup
+}
+
 /// Whether this process reached its health checkpoint: a window's first present, or a headless
 /// instance's service. Only an ask sent with it may run the trial's proof and disarm it. It is
 /// [`should_dispatch_boot_health_confirmation`] with nothing else in the way, so the proved
@@ -10880,6 +11035,8 @@ struct App {
     /// What the navigator's list was published from, and what may have moved since
     /// ([`crate::app_navigator`]); `None` while no navigator is open.
     nav: Option<Box<crate::app_navigator::NavWatch>>,
+    /// The addressable sessions of this process, also while all panel views are hidden.
+    local_panel_roster: app_navigator::LocalPanelRoster,
     /// `ATERM_DEV_WORKERS_FIXTURE` has been read ([`crate::app_workers`]).
     #[cfg(any(test, debug_assertions))]
     workers_fixture_landed: bool,
@@ -10925,6 +11082,11 @@ struct App {
     frame_interval: Duration,
     bell_beep: BellRateLimiter,
     alert_sound: fn(Option<&Window>),
+    /// The open panel a Spotlight keep-out chooses its folder in (titled, prompted): macOS's own
+    /// in a windowed launch, one that chooses nothing in a headless one or a test's App, which a
+    /// test replaces with its chosen folder ([`crate::menu::choose_local_folder`]).
+    #[cfg(target_os = "macos")]
+    pub(crate) folder_picker: fn(&str, &str) -> Option<std::path::PathBuf>,
     trail_audio: trail_audio::TrailAudio,
     typing_sound_auditioned: aterm_effects::trail_sound::SoundVoice,
     lock_modifiers: fn() -> aterm_types::keyboard::Modifiers,
@@ -10997,6 +11159,11 @@ struct App {
     askpass_sheet: Option<askpass_sheet::AskpassSheet>,
     #[cfg(target_os = "macos")]
     askpass_backoff: askpass::Backoff,
+    /// The state dir that holds the password sheet's spacing record (`askpass_record`); `None`
+    /// for a headless test App and for a process running as root, which neither reads nor
+    /// writes it.
+    #[cfg(target_os = "macos")]
+    askpass_record: Option<std::path::PathBuf>,
     paste_banner: Option<paste_banner::PendingPaste>,
     close_banner: Option<close_confirm::PendingClose>,
     close_banner_queue: Vec<close_confirm::PendingClose>,
@@ -11100,6 +11267,9 @@ struct App {
     /// The gate was opened by the answer to an ask from before the checkpoint, so the updater
     /// is owed one more ask at it ([`App::ask_boot_health_at_checkpoint_if_owed`]).
     boot_health_checkpoint_ask_owed: bool,
+    /// The keeper link was told it may ask an older keeper to restart
+    /// ([`App::note_keeper_boot_health`]).
+    keeper_restart_told: bool,
     seamless_position: Option<(i32, i32)>,
     level_up: Option<level_up::LevelUp>,
     update_row_before_install: Option<(aterm_messages::Message, messages_host::UpdateFlow)>,
@@ -11490,6 +11660,16 @@ impl App {
         self.handoff_commit.take();
         if let Some(gate) = self.handoff_reader_gate.take() {
             self.stop_prepared_handoff_readers(&gate);
+        }
+    }
+
+    /// Note an event of `class` against a pending handoff: an Exempt one moves nothing, a
+    /// Tolerated one is buffered through the overlap, a Revoking one stands the handoff down.
+    fn note_update_handoff_class(&mut self, class: UpdateHandoffEventClass) {
+        match class {
+            UpdateHandoffEventClass::Exempt => {}
+            UpdateHandoffEventClass::Tolerated => self.note_update_handoff_tolerated_activity(),
+            UpdateHandoffEventClass::Revoking => self.note_update_handoff_activity(),
         }
     }
 
@@ -12331,7 +12511,7 @@ impl App {
         if !cfg!(target_os = "macos")
             || !self.devtools_helper.windowed()
             || self.devtools_helper.queued() != Some(Origin::Automatic)
-            || self.access_revision().is_none()
+            || !self.privacy_grants_requested()
         {
             return;
         }
@@ -12364,6 +12544,9 @@ impl App {
                 None => self.devtools_helper.queue(origin, now),
             }
             return HandOver::Queued;
+        }
+        if origin.system_state_step() && !self.privacy_grants_requested() {
+            return HandOver::Refused(devtools_helper::Refusal::NotRequested);
         }
         let (facts, fda_pending) = self.devtools_admit_facts(origin);
         let admitted = devtools_helper::admit(origin, moment, &facts);
@@ -12897,6 +13080,9 @@ impl App {
             self.devtools_helper.queue_fda(origin, now);
             return HandOver::Queued;
         }
+        if origin.system_state_step() && !self.privacy_grants_requested() {
+            return HandOver::Refused(devtools_helper::Refusal::NotRequested);
+        }
         let (facts, gap_left) = self.fda_admit_facts(origin, fda);
         let admitted = devtools_helper::admit_fda(origin, moment, &facts);
         let answer = match admitted {
@@ -13419,6 +13605,9 @@ impl App {
             self.devtools_helper
                 .queue_after_listing(origin, now, listed);
             return HandOver::Queued;
+        }
+        if origin.system_state_step() && !self.privacy_grants_requested() {
+            return HandOver::Refused(devtools_helper::Refusal::NotRequested);
         }
         let (facts, fda_pending) = self.devtools_admit_facts(origin);
         let moment = if origin.system_state_step() {
@@ -14736,7 +14925,7 @@ impl App {
             && matches!(route_guard_ws.present, Some(PresentTarget::Virtual { .. }))
         {
             let ws = &mut **route_guard_ws;
-            ws.present = None;
+            ws.replace_present(None);
         }
         if let Some(window) = self
             .windows
@@ -14812,7 +15001,7 @@ impl App {
             && matches!(route_guard_ws.present, Some(PresentTarget::Virtual { .. }))
         {
             let ws = &mut **route_guard_ws;
-            ws.present = None;
+            ws.replace_present(None);
         }
         if let Some(window) = self
             .windows
@@ -14854,7 +15043,7 @@ impl App {
             && matches!(route_guard_ws.present, Some(PresentTarget::Virtual { .. }))
         {
             let ws = &mut **route_guard_ws;
-            ws.present = None;
+            ws.replace_present(None);
         }
         fail_video_request(&rec.reply, rec.dir, reason);
         true
@@ -15328,6 +15517,7 @@ impl App {
     }
 
     fn sync_window(&mut self, wid: WindowId) {
+        self.settle_session_preview(wid);
         self.settle_workers_tab(wid);
         self.navigator_mark_structure();
         self.settle_tab_places(wid);
@@ -15454,6 +15644,8 @@ impl App {
             ws.predictor.reset();
         }
         drop(route_guard_ws);
+        // Observe front-tab and split changes even when no reading arrived between them.
+        self.resources_visibility_changed();
         // Find searches the front terminal, so it closes with it: a tab switch, a pane
         // focus move or the front's own close. A sync that leaves the front as it was (a
         // background tab or split sibling closing) keeps the open field, its query and
@@ -16025,6 +16217,8 @@ impl App {
             askpass_sheet: None,
             #[cfg(target_os = "macos")]
             askpass_backoff: crate::askpass::Backoff::default(),
+            #[cfg(target_os = "macos")]
+            askpass_record: None,
             paste_banner: None,
             close_banner: None,
             close_banner_queue: Vec::new(),
@@ -16073,6 +16267,7 @@ impl App {
             nudge_wake_ms: None,
             workers_read_at: None,
             nav: None,
+            local_panel_roster: Default::default(),
             #[cfg(any(test, debug_assertions))]
             workers_fixture_landed: false,
             nudge_gen_seen: 0,
@@ -16112,6 +16307,8 @@ impl App {
             frame_interval: MIN_FRAME_INTERVAL,
             bell_beep: BellRateLimiter::new(BELL_BEEP_INTERVAL),
             alert_sound: count_alert_sound_for_test,
+            #[cfg(target_os = "macos")]
+            folder_picker: |_, _| None,
             trail_audio: trail_audio::TrailAudio::new(false),
             typing_sound_auditioned: aterm_effects::trail_sound::SoundVoice::default(),
             lock_modifiers: keymap::no_lock_modifiers,
@@ -16218,6 +16415,7 @@ impl App {
             boot_health_checkpoint_seen: true,
             boot_health_asked_at_checkpoint: true,
             boot_health_checkpoint_ask_owed: false,
+            keeper_restart_told: false,
             seamless_position: None,
             level_up: None,
             messages: crate::messages_host::new_center(
@@ -16765,6 +16963,10 @@ impl App {
                 continue;
             };
             ws.content_pending = true;
+            if ws.presentation_held() {
+                ws.redraw_pending = false;
+                continue;
+            }
             if ws.gpu_acquire_pending() {
                 ws.redraw_pending = true;
                 continue;
@@ -16974,6 +17176,12 @@ impl App {
         self.mark_status_dirty();
     }
 
+    fn on_program_resolved(&mut self, session: u64) {
+        self.session_status.note_program_answered(session);
+        self.navigator_mark_row(session);
+        let _ = self.apply_launch_no_harness(session);
+    }
+
     /// The `Wake::MetaChanged` arm.
     pub(crate) fn on_meta_changed(&mut self, session: u64) {
         self.hold_task_to_autopilot(session);
@@ -17153,6 +17361,7 @@ impl App {
         }
         let attends = !occluded && crate::vitals_host::attends_readings(ws, false);
         drop(route_guard_ws);
+        self.resources_visibility_changed();
         if attends {
             self.vitals_ask_for_attention(now, false);
         }
@@ -17160,7 +17369,7 @@ impl App {
             self.note_done_seen(wid);
         }
         // A covered window's navigator reads no words and words no ages; uncovered it does.
-        self.navigator_mark_structure();
+        self.navigator_mark_presentation();
         // Covered or uncovered, a System State view may have left the screen or come back.
         self.sync_native_visibility();
     }
@@ -17252,7 +17461,7 @@ impl App {
         }
         let reorders_pre_commit_queue = !focused && self.pre_commit_focus_loss_reorders_queue(wid);
         // A navigator's selection is the keyboard's only in the key window.
-        self.navigator_mark_structure();
+        self.navigator_mark_presentation();
         if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
             let ws = &mut **route_guard_ws;
             ws.focused = focused;
@@ -17973,6 +18182,29 @@ impl App {
         }
     }
 
+    /// Whether this process may let its keeper link ask an older keeper to restart
+    /// ([`asks_keeper_restart`]), from what it knows now: its checkpoint, its boot-health
+    /// confirmation, and its Mac Setup tabs ([`Self::developer_tools_install_active`]).
+    #[must_use]
+    pub(crate) fn keeper_restart_due(&self) -> bool {
+        asks_keeper_restart(
+            self.boot_health_checkpoint_seen,
+            self.boot_health_confirmation.complete(),
+            self.developer_tools_install_active(),
+        )
+    }
+
+    /// Tell the keeper link, once, that it may ask an older keeper to restart
+    /// ([`keeper_link::boot_healthy`]) at the first park where [`Self::keeper_restart_due`]
+    /// holds: whichever of the checkpoint, the updater's confirmation and the end of the last Mac
+    /// Setup tab comes last.
+    fn note_keeper_boot_health(&mut self) {
+        if !self.keeper_restart_told && self.keeper_restart_due() {
+            self.keeper_restart_told = true;
+            keeper_link::boot_healthy();
+        }
+    }
+
     /// The park's boot-health work: expire an ask whose answer never came, note the
     /// checkpoint, queue the ask that is due, and queue the one ask a gate opened before the
     /// checkpoint still owes the updater at it.
@@ -17999,6 +18231,7 @@ impl App {
         if gate_was_shut && self.native_boot_health_complete() {
             self.run_held_person_apply(now);
         }
+        self.note_keeper_boot_health();
     }
 
     /// Queue the one ask a gate opened before the checkpoint owes the updater at it. An ask
@@ -18177,6 +18410,16 @@ impl App {
 
     /// Initialize the deferred pixel backend on demand before rasterizing a frame.
     pub(crate) fn ensure_pixel_backend(&mut self) {
+        self.ensure_pixel_backend_with(|policy| match policy {
+            aterm_gpu::DevicePolicy::Headless => aterm_gpu::GpuContext::new_headless(),
+            aterm_gpu::DevicePolicy::Windowed => aterm_gpu::GpuContext::new(),
+        });
+    }
+
+    fn ensure_pixel_backend_with(
+        &mut self,
+        acquire_context: impl FnOnce(aterm_gpu::DevicePolicy) -> Result<aterm_gpu::GpuContext, String>,
+    ) {
         // The common call owes nothing and must cost nothing.
         if !self.deferred_font_seal && !self.deferred_gpu {
             return;
@@ -18222,20 +18465,16 @@ impl App {
         };
         legs.fork_ms = Some(elapsed_ms(fork_started));
         let family = self.font_family.clone();
-        let font_legs_were_unset = font_legs_unset();
         let device_started = Instant::now();
-        let mut gpu = match aterm_gpu::GpuRenderer::new_with_family(
-            family.as_deref(),
-            self.font_px,
-            self.theme,
-        ) {
+        let gpu = match acquire_context(aterm_gpu::DevicePolicy::Headless).and_then(|context| {
+            aterm_gpu::GpuRenderer::from_parts(context, prepared, family, self.theme)
+        }) {
             Ok(gpu) => gpu,
             Err(error) => {
                 crate::logging::stderr_line!(
                     "aterm-gui: GPU unavailable ({error}); using CPU renderer"
                 );
                 legs.device = Some((elapsed_ms(device_started), Err(error)));
-                legs.note_font_legs(font_legs_were_unset);
                 self.settle_on_cpu_renderer();
                 aterm_log::info!(
                     "{}",
@@ -18249,10 +18488,8 @@ impl App {
             elapsed_ms(device_started),
             Ok(format!("{name} ({adapter_backend})")),
         ));
-        legs.note_font_legs(font_legs_were_unset);
         crate::logging::stderr_line!("aterm-gui: GPU rendering on {name} ({adapter_backend})");
         let install_started = Instant::now();
-        gpu.install_prepared_font(family, prepared, self.theme);
         self.backend
             .swap_renderer(Backend::Gpu(GpuBackend::new(gpu)));
         self.use_gpu = true;
@@ -19651,8 +19888,9 @@ impl ApplicationHandler<Wake> for App {
             if !serious_policy.allows(crate::motion::SeriousEffect::CursorGlow) {
                 ws.drain_serious_effects();
             }
-            let surface_attempt_allowed =
-                !ws.gpu_acquire_pending() && ws.present_retry.present_attempt_allowed();
+            let surface_attempt_allowed = !ws.presentation_held()
+                && !ws.gpu_acquire_pending()
+                && ws.present_retry.present_attempt_allowed();
             if let Some(candidate) = ws.pending_reveal {
                 fold_owned_deadline(
                     &mut deadline,
@@ -20259,7 +20497,7 @@ impl ApplicationHandler<Wake> for App {
         if status_rebuilt {
             self.refresh_status_item();
             self.overview_refresh_all();
-            self.navigator_mark_structure();
+            self.navigator_mark_presentation();
         }
         // Once a turn, and one branch while nothing is marked (`app_navigator`).
         self.publish_navigators(Instant::now());
@@ -20747,10 +20985,13 @@ impl App {
     }
 
     /// Something that was not a timer woke the loop and may have moved the desk: the crash
-    /// journal owes a capture, and the disk walker a read of the panes' facts.
-    pub(crate) const fn note_desk_activity(&mut self) {
-        self.crash_journal.note_activity();
-        self.diskwalk.note_activity();
+    /// journal owes a capture, and the disk walker a read of the panes' facts ([`desk_moved`]).
+    pub(crate) fn note_desk_activity(&mut self) {
+        desk_moved(
+            &mut self.crash_journal,
+            &mut self.diskwalk,
+            &crate::metrics::METRICS,
+        );
     }
 
     fn on_user_event(&mut self, el: &ActiveEventLoop, ev: Wake) {
@@ -20764,11 +21005,7 @@ impl App {
         let ev = crate::control::control_media::take_hop(ev);
         self.wake_census.note(&ev);
         self.note_wake_activity(&ev);
-        match update_handoff_wake_class(&ev) {
-            UpdateHandoffEventClass::Exempt => {}
-            UpdateHandoffEventClass::Tolerated => self.note_update_handoff_tolerated_activity(),
-            UpdateHandoffEventClass::Revoking => self.note_update_handoff_activity(),
-        }
+        self.note_update_handoff_class(update_handoff_wake_class(&ev));
         let Some(ev) = self.admit_wake_before_commit(ev) else {
             return;
         };
@@ -20784,10 +21021,7 @@ impl App {
                 self.finish_account_drain(el, serial, drained)
             }
             Wake::AccountsOutlived { serial } => self.go_on_past_account_work(el, serial),
-            Wake::ProgramResolved { session } => {
-                self.session_status.note_program_answered(session);
-                let _ = self.apply_launch_no_harness(session);
-            }
+            Wake::ProgramResolved { session } => self.on_program_resolved(session),
             Wake::QueuedKeyDelivered { session, at } => {
                 let now = Instant::now();
                 let frame_interval = self.frame_interval;
@@ -20827,6 +21061,7 @@ impl App {
             Wake::RestoreMeasurementReady => self.request_redraw_all_windows(),
             Wake::MailChanged => self.on_mail_changed(),
             Wake::TablesChanged => self.on_tables_changed(),
+            Wake::RegistryChanged => self.on_registry_changed(),
             #[cfg(all(unix, not(test)))]
             Wake::NetworkPlaceChanged => self.follow_network_place(),
             #[cfg(target_os = "macos")]
@@ -20876,6 +21111,12 @@ impl App {
             }
             #[cfg(unix)]
             Wake::Snapshot => self.snapshot(),
+            #[cfg(any(
+                test,
+                target_os = "linux",
+                all(unix, feature = "bench-support", debug_assertions)
+            ))]
+            Wake::PresentationReleased => self.release_presentations(),
             #[cfg(target_os = "macos")]
             Wake::MemoryPressure { level, applied } => {
                 if let Some(critical) = crate::memory_pressure::scrollback_shed(level) {
@@ -20970,7 +21211,9 @@ impl App {
                                     .and_then(|gpu| gpu.virtual_begin(&mut window_gpu, w, h, opts));
                                 match (began, self.windows.get_mut(&wid)) {
                                     (Ok(()), Some(mut ws)) => {
-                                        ws.present = Some(PresentTarget::Virtual { window_gpu });
+                                        ws.replace_present(Some(PresentTarget::Virtual {
+                                            window_gpu,
+                                        }));
                                         Ok(VideoMode::OffscreenPresentReal)
                                     }
                                     (Err(e), _) => Err(e),
@@ -21521,6 +21764,7 @@ impl App {
                 for ev in std::mem::take(&mut self.handoff_committed_wakes) {
                     self.user_event(el, ev);
                 }
+                self.collect_restored_session_tabs();
             }
             #[cfg(unix)]
             Wake::HandoffHistorySettled(reports) => self.settle_handoff_history(&reports),
@@ -22336,6 +22580,8 @@ impl App {
             #[cfg(target_os = "macos")]
             Wake::CpuPolicyReport(report) => self.accept_cpu_policy_report(*report),
             #[cfg(target_os = "macos")]
+            Wake::RootStepEnded { step, ended } => self.root_step_ended(step, &ended),
+            #[cfg(target_os = "macos")]
             Wake::CpuPolicyPermit { operation, reply } => {
                 let _ = reply.send(self.cpu_policy_permit(&operation));
             }
@@ -22504,11 +22750,7 @@ impl App {
             self.note_desk_activity();
             crate::metrics::note_os_window_event(kind);
         }
-        match update_handoff_window_event_class(&event) {
-            UpdateHandoffEventClass::Exempt => {}
-            UpdateHandoffEventClass::Tolerated => self.note_update_handoff_tolerated_activity(),
-            UpdateHandoffEventClass::Revoking => self.note_update_handoff_activity(),
-        }
+        self.note_update_handoff_class(update_handoff_window_event_class(&event));
         self.note_window_input_arrival(&event, self.input_origin);
         self.note_restore_focus_event(id, &event);
         if self.incoming_handoff_pending
@@ -22625,8 +22867,32 @@ impl App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.on_cursor_moved(wid, position.x, position.y);
             }
+            WindowEvent::DroppedLocal { token, target } => {
+                let target = match target {
+                    Some((native, point)) => {
+                        // A destroyed surface or a decoration is still a client target.
+                        // Only an actual desktop release should detach a tab.
+                        let Some(&target) = self.winit_to_window.get(&native) else {
+                            return;
+                        };
+                        Some((target, point.x, point.y))
+                    }
+                    None => None,
+                };
+                self.finish_surface_drop(wid, token, target);
+            }
             WindowEvent::CursorLeft { .. } => self.on_cursor_left(wid),
             WindowEvent::MouseInput { state, button, .. } => {
+                #[cfg(target_os = "linux")]
+                if state == aterm_window::event::ElementState::Released
+                    && button == aterm_window::event::MouseButton::Left
+                    && self.claim_surface_drop(wid, |token| {
+                        use aterm_window::platform::wayland::ActiveEventLoopExtWayland;
+                        el.resolve_outside_release(id, token)
+                    })
+                {
+                    return;
+                }
                 self.with_origin_mark(self.input_origin, |app| {
                     app.mouse_input_then_fold(wid, state, button);
                 });
@@ -22653,7 +22919,7 @@ impl App {
                 crate::metrics::note_resize_arrival();
                 if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
                     let ws = &mut **route_guard_ws;
-                    ws.win_px = Some(size);
+                    ws.set_window_pixels(size);
                     ws.last_resized_event_at = Some(std::time::Instant::now());
                 }
                 #[cfg(target_os = "linux")]
@@ -23127,8 +23393,11 @@ fn pkg_progress_tick_or_stop(stop: &AtomicBool, tick: Duration, before_park: &im
     }
 }
 
+/// The floor between two bump-triggered passes: a bump made sooner waits out the rest of it.
+const BUMP_FLOOR: Duration = Duration::from_secs(5 * 60);
+
 fn bump_pass_allowed(now: Instant, last_trigger: Option<Instant>) -> bool {
-    last_trigger.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5 * 60))
+    last_trigger.is_none_or(|t| now.duration_since(t) >= BUMP_FLOOR)
 }
 
 fn bump_should_trigger(names: &[String], progress: Option<&atpkg::progress::ProgressFile>) -> bool {
@@ -23155,6 +23424,14 @@ struct BumpWatch {
     pass_generation: u64,
     unlanded: Option<u64>,
     flip_recheck: atpkg::quiet::Recheck,
+    /// Whether the last look at a held move found the window refused the rendezvous (a
+    /// session's round held it): the look is tried again a [`atpkg::vendor_direct::watch::BLIND_LOOK`]
+    /// later rather than at the re-check's minute.
+    flip_sit_refused: bool,
+    /// The ring of the park waiting now ([`LiveSwitch::rest`]), which an index probe's near
+    /// answer and end ring. The probe reads it when it rings, since a probe started by one park
+    /// can answer during the next.
+    probe_ring: Arc<std::sync::Mutex<Option<atpkg::vendor_direct::watch::Ring>>>,
 }
 
 struct PendingIndexProbe {
@@ -23169,14 +23446,29 @@ struct PendingIndexProbe {
 struct IndexProbeCompletionWake {
     done: Arc<AtomicBool>,
     completed_at: Arc<std::sync::OnceLock<Instant>>,
-    owner: std::thread::Thread,
+    ring: Arc<std::sync::Mutex<Option<atpkg::vendor_direct::watch::Ring>>>,
+}
+
+impl IndexProbeCompletionWake {
+    /// Ring the park waiting now, if any; one that starts later looks at the probe first.
+    fn ring(&self) {
+        if let Some(ring) = self
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            ring.ring();
+        }
+    }
 }
 
 impl Drop for IndexProbeCompletionWake {
     fn drop(&mut self) {
         let _ = self.completed_at.set(Instant::now());
+        // Published before the ring: a park woken by it finds the probe done.
         self.done.store(true, Ordering::Release);
-        self.owner.unpark();
+        self.ring();
     }
 }
 
@@ -23188,13 +23480,13 @@ impl BumpWatch {
 }
 
 fn index_probe_due(last: Option<Instant>, shared_retry_at: Option<Instant>, now: Instant) -> bool {
-    if let Some(due) = shared_retry_at {
-        return now >= due;
-    }
-    last.is_none_or(|last| {
-        now.checked_duration_since(last)
-            .is_some_and(|age| age >= atpkg::index_probe::INTERVAL)
-    })
+    index_probe_next(last, shared_retry_at).is_none_or(|due| now >= due)
+}
+
+/// When the next index probe is due: a sibling's shared expiry, else one interval past the last
+/// probe; `None` (due now) before the first.
+fn index_probe_next(last: Option<Instant>, shared_retry_at: Option<Instant>) -> Option<Instant> {
+    shared_retry_at.or_else(|| last.map(|last| last + atpkg::index_probe::INTERVAL))
 }
 
 const fn first_index_probe_wakes_park(
@@ -23279,7 +23571,7 @@ fn start_index_probe_with_near_hint(
     let worker_done = Arc::clone(&done);
     let completed_at = Arc::new(std::sync::OnceLock::new());
     let worker_completed_at = Arc::clone(&completed_at);
-    let owner = std::thread::current();
+    let ring = Arc::clone(&watch.probe_ring);
     match crate::qos::spawn_lane_thread(
         "atpkg-index-probe",
         crate::qos::Role::Background,
@@ -23287,11 +23579,11 @@ fn start_index_probe_with_near_hint(
             let completed = IndexProbeCompletionWake {
                 done: worker_done,
                 completed_at: worker_completed_at,
-                owner,
+                ring,
             };
             let mut on_near = |build| {
                 if worker_near.fetch_max(build, Ordering::Release) < build {
-                    completed.owner.unpark();
+                    completed.ring();
                 }
             };
             probe(&layout, &mut on_near)
@@ -23456,28 +23748,29 @@ type VendorHeads = (
     Arc<atpkg::vendor_direct::watch::ConcurrentVendorGetFn<'static>>,
 );
 
-const PARK_SLICE: Duration = Duration::from_secs(5);
-
-fn park_slice_len() -> Duration {
+/// The package lane's bounded look ([`atpkg::vendor_direct::watch::BLIND_LOOK`]) wherever nothing
+/// rings for what it waits on: a file its rest does not watch, a sleep its wake source does not
+/// hear, a store lock's release, a held move whose rendezvous a session's round holds.
+fn blind_look() -> Duration {
     #[cfg(test)]
     {
-        PARK_SLICE_ON_THIS_THREAD.with(std::cell::Cell::get)
+        BLIND_LOOK_ON_THIS_THREAD.with(std::cell::Cell::get)
     }
     #[cfg(not(test))]
     {
-        PARK_SLICE
+        atpkg::vendor_direct::watch::BLIND_LOOK
     }
 }
 
 #[cfg(test)]
 thread_local! {
-    static PARK_SLICE_ON_THIS_THREAD: std::cell::Cell<Duration> =
-        const { std::cell::Cell::new(PARK_SLICE) };
+    static BLIND_LOOK_ON_THIS_THREAD: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(atpkg::vendor_direct::watch::BLIND_LOOK) };
 }
 
 #[cfg(test)]
-fn set_park_slice_for_this_thread(slice: Duration) {
-    PARK_SLICE_ON_THIS_THREAD.with(|s| s.set(slice));
+fn set_blind_look_for_this_thread(look: Duration) {
+    BLIND_LOOK_ON_THIS_THREAD.with(|s| s.set(look));
 }
 
 #[derive(Clone, Copy)]
@@ -23502,6 +23795,11 @@ impl ParkProbes {
     };
 }
 
+/// Park the package lane until `until` (on the wall clock, `longest` its length) or an event
+/// that ends the park: a bump, a published index, a held move due, a moved vendor head, the
+/// store's writer lock let go, or the switch turned off. Each turn is one wait on the lane's rest
+/// ([`LiveSwitch::rest`], design §1.6) until the earliest look that has work ([`lane_wait`]), or a
+/// ring (a file it watches changed, a sleep's wake, a head round's or index probe's news).
 fn sleep_interval_watching_bump(
     layout: Option<&atpkg::store::Layout>,
     until: &mut std::time::SystemTime,
@@ -23513,9 +23811,18 @@ fn sleep_interval_watching_bump(
 ) -> ParkEnd {
     let probe_index = probes.index;
     let probe_store_release = probes.store_release;
+    // Bound before the first look at the probe or the heads, so news that comes after that look
+    // rings this park's rest and news that came before it is seen by it.
+    *watch
+        .probe_ring
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(switch.rest.ringer());
+    if let Some((head_watch, _)) = heads.as_deref_mut() {
+        head_watch.bind_ring(switch.rest.ringer());
+    }
     loop {
         let wall_before = std::time::SystemTime::now();
-        let Some(slice) = park_slice(*until, wall_before, longest) else {
+        let Some(left) = park_left(*until, wall_before, longest) else {
             return ParkEnd::Elapsed;
         };
         if probe_index && index_probe_answer_ready(watch) {
@@ -23535,36 +23842,35 @@ fn sleep_interval_watching_bump(
             }
         }
         let mono_before = Instant::now();
-        let wait = if first_index_probe_wakes_park(probe_index, layout, watch)
-            || layout.is_some()
-                && heads.as_ref().is_some_and(|(head_watch, _)| {
-                    !head_watch.has_pending() && head_watch.due(wall_before)
-                }) {
-            Duration::ZERO
-        } else {
-            slice
-        };
-        if let Some((head_watch, _)) = heads.as_deref_mut() {
-            head_watch.park_for_hint(wait);
-        } else {
-            std::thread::park_timeout(wait);
-        }
+        let wait = lane_wait(
+            left,
+            layout,
+            watch,
+            probes,
+            heads.as_deref().map(|(head_watch, _)| head_watch),
+            &switch.rest,
+            (wall_before, mono_before),
+        );
+        let _told = switch.rest.wait(Some(wait));
         if switch.poll() != LoopGate::On {
             return ParkEnd::SwitchedOff;
         }
         let slept_to = std::time::SystemTime::now();
-        *until = park_deadline_after_slice(
-            *until,
-            slept_to,
+        let woke = atpkg::vendor_direct::watch::woke_between(
             slept_to.duration_since(wall_before).ok(),
             mono_before.elapsed(),
         );
+        *until = park_deadline_after_wait(*until, slept_to, woke);
+        if woke && let Some((head_watch, _)) = heads.as_deref_mut() {
+            head_watch.woke(slept_to);
+        }
         let Some(l) = layout else {
             continue;
         };
         let window_may_check_flip = heads
             .as_deref_mut()
             .is_none_or(|(head_watch, _)| head_watch.sit(l));
+        watch.flip_sit_refused = !window_may_check_flip;
         if bump_fired(l, watch) {
             return ParkEnd::Bumped;
         }
@@ -23590,18 +23896,16 @@ fn sleep_interval_watching_bump(
             head_watch.set_exclude(switch.exclude());
             let wall = std::time::SystemTime::now();
             let head_due = head_watch.due(wall);
-            let moved = head_watch_slice(
+            let moved = head_watch_round(
                 head_watch,
                 l,
                 wall,
-                wall.duration_since(wall_before).ok(),
-                mono_before.elapsed(),
                 get,
                 watch.pending_index_probe.is_some(),
             );
             let bumped = head_due && bump_fired(l, watch);
             let full_due = probe_index && std::time::SystemTime::now() >= *until;
-            finish_head_watch_slice(l, head_watch, watch, bumped, full_due, probe_index, moved)
+            finish_head_watch_round(l, head_watch, watch, bumped, full_due, probe_index, moved)
         } else {
             None
         };
@@ -23611,27 +23915,91 @@ fn sleep_interval_watching_bump(
     }
 }
 
-fn park_slice(
+/// How long one wait of the package lane's park may last, from the wall and monotonic clocks
+/// `at` before it (design §1.6): the earliest moment any look has work, and never past `left`
+/// (the park's own deadline), so no due look waits behind a later deadline. The looks: the first
+/// index probe (now), the heads' next round, the next index probe while none is in flight, a held
+/// move's re-check while its record stands (a [`blind_look`] while a session's round holds the
+/// rendezvous), a bump the floor holds back, and the store lock's release (a [`blind_look`]). A
+/// round or a probe in flight rings at its news, and a bump, a held move's record and
+/// `aterm.toml` ring when they change. A rest whose files ring nothing, or whose sleeps nobody
+/// rings, waits at most a [`blind_look`].
+fn lane_wait(
+    left: Duration,
+    layout: Option<&atpkg::store::Layout>,
+    watch: &BumpWatch,
+    probes: ParkProbes,
+    heads: Option<&atpkg::vendor_direct::watch::HeadWatch>,
+    rest: &atpkg::vendor_direct::watch::Rest,
+    at: (std::time::SystemTime, Instant),
+) -> Duration {
+    let (wall, mono) = at;
+    let mut wait = left;
+    if !rest.watching() || !(rest.hears_sleep() || crate::watchdog::wall_heard()) {
+        wait = wait.min(blind_look());
+    }
+    let Some(l) = layout else {
+        return wait;
+    };
+    if first_index_probe_wakes_park(probes.index, layout, watch) {
+        return Duration::ZERO;
+    }
+    let mut by = |due: Instant| wait = wait.min(due.saturating_duration_since(mono));
+    if let Some(due) = heads.and_then(|head_watch| head_watch.next_due(wall)) {
+        by(mono + due.duration_since(wall).unwrap_or_default());
+    }
+    if probes.index && watch.pending_index_probe.is_none() {
+        by(index_probe_next(watch.last_index_probe, watch.shared_index_retry_at).unwrap_or(mono));
+    }
+    if atpkg::quiet::record_path(l).exists() || atpkg::quiet::view_record_path(l).exists() {
+        by(if watch.flip_sit_refused {
+            mono + blind_look()
+        } else {
+            watch.flip_recheck.next_look().unwrap_or(mono)
+        });
+    }
+    if let Some(due) = bump_floor_due(l, watch) {
+        by(due);
+    }
+    if probes.store_release {
+        by(mono + blind_look());
+    }
+    wait
+}
+
+/// When a bump the floor holds back may run: one [`BUMP_FLOOR`] past the last bump-triggered pass,
+/// while the bump file has changed since it was last acted on. `None` with no such bump.
+fn bump_floor_due(l: &atpkg::store::Layout, watch: &BumpWatch) -> Option<Instant> {
+    let meta = std::fs::symlink_metadata(l.bump_file()).ok()?;
+    let mtime = meta.modified().ok()?;
+    (meta.file_type().is_file() && watch.acted_mtime != Some(mtime))
+        .then_some(watch.last_trigger?)
+        .map(|last| last + BUMP_FLOOR)
+}
+
+/// How long is left of a park from `wall` to `until`, `longest` its length: `None` once due, or
+/// when the deadline lies more than [`atpkg::vendor_direct::watch::WAKE_GAP`] past the park's
+/// length (the wall clock went back).
+fn park_left(
     until: std::time::SystemTime,
     wall: std::time::SystemTime,
     longest: Duration,
 ) -> Option<Duration> {
     let set_back = longest.saturating_add(atpkg::vendor_direct::watch::WAKE_GAP);
     match until.duration_since(wall) {
-        Ok(left) if !left.is_zero() && left <= set_back => Some(left.min(park_slice_len())),
+        Ok(left) if !left.is_zero() && left <= set_back => Some(left),
         _ => None,
     }
 }
 
-fn park_deadline_after_slice(
+/// The park's deadline after a wait ending at `wall` that spanned a sleep (`woke`,
+/// [`atpkg::vendor_direct::watch::woke_between`]): a deadline the sleep passed moves to
+/// [`atpkg::vendor_direct::watch::AFTER_WAKE`] after the wake, once the network is back.
+fn park_deadline_after_wait(
     until: std::time::SystemTime,
     wall: std::time::SystemTime,
-    wall_elapsed: Option<Duration>,
-    mono_elapsed: Duration,
+    woke: bool,
 ) -> std::time::SystemTime {
-    let woke = wall_elapsed.is_some_and(|slept| {
-        slept > mono_elapsed.saturating_add(atpkg::vendor_direct::watch::WAKE_GAP)
-    });
     if woke && until <= wall {
         aterm_log::info!(
             "atpkg lane: the machine slept through the package loop's deadline \u{2014} the \
@@ -23696,30 +24064,21 @@ fn deferred_flip_due_if_watching(
 #[path = "lib_deferred_flip_park_tests.rs"]
 mod deferred_flip_park_tests;
 
-fn head_watch_slice(
+fn head_watch_round(
     heads: &mut atpkg::vendor_direct::watch::HeadWatch,
     layout: &atpkg::store::Layout,
     wall: std::time::SystemTime,
-    wall_elapsed: Option<Duration>,
-    mono_elapsed: Duration,
     get: &Arc<atpkg::vendor_direct::watch::ConcurrentVendorGetFn<'static>>,
     index_in_flight: bool,
 ) -> Option<Vec<&'static str>> {
-    let moved = heads.slice(
-        layout,
-        wall,
-        wall_elapsed,
-        mono_elapsed,
-        get,
-        index_in_flight,
-    );
+    let moved = heads.round(layout, wall, get, index_in_flight);
     for line in heads.take_notes() {
         aterm_log::info!("{line}");
     }
     moved
 }
 
-fn finish_head_watch_slice(
+fn finish_head_watch_round(
     layout: &atpkg::store::Layout,
     heads: &mut atpkg::vendor_direct::watch::HeadWatch,
     watch: &mut BumpWatch,
@@ -25253,6 +25612,10 @@ fn launch_update_park(
 mod launch_pass_park_tests;
 
 #[cfg(test)]
+#[path = "lib_lane_wait_tests.rs"]
+mod lane_wait_tests;
+
+#[cfg(test)]
 #[path = "lib_head_watch_park_tests.rs"]
 mod head_watch_park_tests;
 
@@ -25273,16 +25636,28 @@ struct LiveSwitch {
     seen: Option<Option<(Option<std::time::SystemTime>, u64)>>,
     gate: LoopGate,
     exclude: Vec<String>,
+    /// The package lane's one wait (design §1.6): rung by a change of `aterm.toml`, the bump file
+    /// or a held move's records, by the watchdog's wall watch at a sleep's wake
+    /// ([`crate::wake_rings::PKG_LANE`]), and by the head rounds and index probes the lane starts.
+    rest: atpkg::vendor_direct::watch::Rest,
 }
 
 impl LiveSwitch {
-    const fn new(path: Option<std::path::PathBuf>, gate: LoopGate) -> Self {
+    /// A switch reading `path`, with a rest nothing rings ([`Self::with_rest`]).
+    fn new(path: Option<std::path::PathBuf>, gate: LoopGate) -> Self {
         Self {
             path,
             seen: None,
             gate,
             exclude: Vec::new(),
+            rest: atpkg::vendor_direct::watch::Rest::inert(),
         }
+    }
+
+    /// Wait on `rest` in place of a rest nothing rings.
+    fn with_rest(mut self, rest: atpkg::vendor_direct::watch::Rest) -> Self {
+        self.rest = rest;
+        self
     }
 
     fn exclude(&self) -> &[String] {
@@ -25327,9 +25702,12 @@ impl LiveSwitch {
     }
 }
 
+/// Wait until `ready` holds of the switch: on its rest with no deadline, since a change of
+/// `aterm.toml` rings it, or a [`blind_look`] at a time where the rest watches no file.
 fn stand_by(switch: &mut LiveSwitch, ready: impl Fn(LoopGate) -> bool) {
     while !ready(switch.poll()) {
-        std::thread::sleep(park_slice_len());
+        let within = (!switch.rest.watching()).then(blind_look);
+        let _ = switch.rest.wait(within);
     }
 }
 
@@ -25432,7 +25810,27 @@ fn spawn_pkg_update_check(config: &Config, proxy: LaneSink) -> bool {
     let launch_gate = LoopGate::of(config.packages_enabled());
     let config_path = atpkg::config::config_path();
     crate::qos::spawn_lane_thread("atpkg-update", crate::qos::Role::Background, move || {
-        let mut switch = LiveSwitch::new(config_path, launch_gate);
+        let store = atpkg::store::resolve_from(&atpkg::config::load());
+        let files = config_path
+            .iter()
+            .cloned()
+            .chain(store.iter().flat_map(|l| {
+                [
+                    l.bump_file(),
+                    atpkg::quiet::record_path(l),
+                    atpkg::quiet::view_record_path(l),
+                ]
+            }));
+        let rest = atpkg::vendor_direct::watch::Rest::start("atpkg-lane-files", files);
+        if !rest.watching() {
+            aterm_log::info!(
+                "atpkg lane: no file watch \u{2014} aterm.toml, the bump file and a held move's \
+                 records are looked at every {} s",
+                atpkg::vendor_direct::watch::BLIND_LOOK.as_secs()
+            );
+        }
+        let _ = crate::wake_rings::PKG_LANE.set(rest.wall_ringer());
+        let mut switch = LiveSwitch::new(config_path, launch_gate).with_rest(rest);
         if switch.poll() == LoopGate::Off {
             aterm_log::info!(
                 "atpkg lane: Automatic updates is off (Settings \u{25b8} Packages) \u{2014} \
@@ -28535,13 +28933,6 @@ pub fn main_entry_with_network(
 
     if !headless && aterm_update::enabled() {
         aterm_update::set_required_team_id(crate::app_config::update_required_team_id(&config));
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            crate::network_moved::observe_for_updater();
-            // The window's own sleeps and wall-clock steps end the check's wait; its watch starts
-            // off this thread.
-            let _ = aterm_update::hear_wakes();
-        }
         let health_proxy = event_loop.create_proxy();
         let staged_proxy = event_loop.create_proxy();
         let checked_proxy = event_loop.create_proxy();
@@ -28570,6 +28961,15 @@ pub fn main_entry_with_network(
             Some(Box::new(move || {
                 let _ = checked_proxy.send_event(Wake::UpdateCheckCompleted);
             })),
+            // The window's own sleeps, wall-clock steps and settled network moves end the
+            // check's wait, heard from where its checker starts.
+            aterm_update::Wakes {
+                sleeps: aterm_update::Sleeps::Heard,
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                network: Some(crate::network_moved::observe_for_updater),
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                network: None,
+            },
         );
         let dev_proxy = event_loop.create_proxy();
         aterm_update::dev_channel::spawn_watch(
@@ -29481,6 +29881,8 @@ pub fn main_entry_with_network(
         askpass_sheet: None,
         #[cfg(target_os = "macos")]
         askpass_backoff: crate::askpass::Backoff::default(),
+        #[cfg(target_os = "macos")]
+        askpass_record: aterm_types::dirs::state_dir().filter(|_| aterm_uds::peer::our_uid() != 0),
         paste_banner: None,
         close_banner: None,
         close_banner_queue: Vec::new(),
@@ -29531,6 +29933,7 @@ pub fn main_entry_with_network(
         nudge_wake_ms: None,
         workers_read_at: None,
         nav: None,
+        local_panel_roster: Default::default(),
         #[cfg(any(test, debug_assertions))]
         workers_fixture_landed: false,
         nudge_gen_seen: 0,
@@ -29570,6 +29973,12 @@ pub fn main_entry_with_network(
         frame_interval: MIN_FRAME_INTERVAL,
         bell_beep: BellRateLimiter::new(BELL_BEEP_INTERVAL),
         alert_sound: system_alert_sound,
+        #[cfg(target_os = "macos")]
+        folder_picker: if headless {
+            |_, _| None
+        } else {
+            menu::choose_local_folder
+        },
         trail_audio: trail_audio::TrailAudio::new(!headless && !config.serious_mode_or_default()),
         typing_sound_auditioned: config.trail_sound_voice(),
         lock_modifiers: keymap::lock_modifier_source(headless),
@@ -29695,6 +30104,7 @@ pub fn main_entry_with_network(
         boot_health_checkpoint_seen: false,
         boot_health_asked_at_checkpoint: false,
         boot_health_checkpoint_ask_owed: false,
+        keeper_restart_told: false,
         level_up: None,
         messages: {
             let now = Instant::now();
@@ -29912,6 +30322,8 @@ pub fn main_entry_with_network(
         .as_ref()
         .is_some_and(|manifest| !manifest.windows.is_empty());
     app.note_launch_tab(restoring);
+    #[cfg(target_os = "macos")]
+    app.take_up_askpass_record_at_launch();
     app.recover_developer_tools_install(0);
     #[cfg(all(target_os = "macos", debug_assertions))]
     app.seed_lab_installer_custody();
@@ -29940,6 +30352,8 @@ pub fn main_entry_with_network(
                 vitals_startup::startup_marks(prior, launch_ms).note(&mut app.vitals);
             } else if handed_over || relaunch_of_running || just_updated {
                 app.vitals.note_strip_event(aterm_vitals::StripEvent {
+                    scope: aterm_vitals::events::EventScope::Machine,
+                    span: None,
                     at_unix_ms: launch_ms,
                     kind: aterm_vitals::StripEventKind::Restart,
                     label: "restarted".into(),
@@ -30284,6 +30698,9 @@ mod session_chrome_expiry_conformance_tests;
 #[cfg(unix)]
 #[path = "lib_overlap_handoff_tests.rs"]
 mod overlap_handoff_tests;
+
+#[cfg(all(test, unix))]
+mod handoff_test_support;
 
 #[cfg(test)]
 #[path = "lib_backend_slot_tests.rs"]

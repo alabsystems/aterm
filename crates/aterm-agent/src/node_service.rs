@@ -271,6 +271,21 @@ pub fn log_path(state_dir: &Path) -> PathBuf {
     state_dir.join(format!("{NODE_LABEL}.log"))
 }
 
+/// Keep the node job's log bounded where this process's standard output or error is it
+/// ([`aterm_uds::job_log::keep`]): [`log_path`], the file [`node_plist_text`] names for both (its
+/// systemd unit names the journal). `aterm node serve` calls it once its threads are held at the
+/// background class (the log's thread is one), before anything else it starts, and hands what it
+/// kept to the serving that takes it (`aterm_gui::run_node_serve_owning`).
+pub fn keep_log(state_dir: &Path) -> aterm_uds::job_log::Kept {
+    aterm_uds::job_log::keep(&[log_path(state_dir)])
+}
+
+/// One line of the node job's log, dated ([`aterm_uds::job_log::line`]): the fleet listener's
+/// notes (`aterm-gui: fleet: … not admitted: …`), bounded where [`keep_log`] kept the log.
+pub fn log_line(line: &str) {
+    aterm_uds::job_log::line(format_args!("{line}"));
+}
+
 /// Off-marker path in `<state_dir>`: `<state_dir>/node-off`.
 #[must_use]
 pub fn off_path(state_dir: &Path) -> PathBuf {

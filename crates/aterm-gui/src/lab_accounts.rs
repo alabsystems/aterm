@@ -92,7 +92,7 @@ fn journal_facts(found: &alab_seen::AccountSeen, now: i64, facts: &mut Vec<(Stri
     }
     for window in &found.windows {
         facts.push((
-            format!("Lab {} quota", window.window),
+            format!("Lab {} quota", window.name()),
             alab_seen::window_line(window, now),
         ));
     }

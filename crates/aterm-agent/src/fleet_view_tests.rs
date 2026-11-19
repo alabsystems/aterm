@@ -12,6 +12,13 @@ use std::time::Duration;
 /// The fixture's clock: the view's time and the compose's now (Unix ms).
 const NOW: u64 = 1_800_000_000_000;
 
+/// What a Mac whose log crossed the legacy bound, in format 1, says a build needs.
+const CROSSED: Needs = Needs {
+    crossed: true,
+    format: FormatFloor::Every,
+    own: None,
+};
+
 /// A node identity whose key is fixed by `n`.
 fn identity(n: u8) -> NodeIdentity {
     NodeIdentity::from_seed(&format!("{n:02x}").repeat(16), &[n; 32]).expect("a node identity")
@@ -133,6 +140,8 @@ fn survey_fixture() -> (Fleet, Vec<Peer>, aterm_ctl::FleetRead) {
     let fleet = compose(&Facts {
         seats: Some(&seats),
         records: Some((4_169, true)),
+        format: FormatFloor::Every,
+        own: None,
         view: Err("no cached presence".to_owned()),
         book: &book,
         now_ms: NOW,
@@ -161,7 +170,7 @@ fn survey_fixture() -> (Fleet, Vec<Peer>, aterm_ctl::FleetRead) {
 #[test]
 fn proved_surveys_supply_current_metrics_without_relabelling_unknown_seats() {
     let (fleet, book, read) = survey_fixture();
-    let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+    let fleet = observe(fleet, &book, Ok(&read), NOW, CROSSED);
     let json = to_json(&fleet);
     assert_eq!(json["up"], Value::from(1_u64));
     assert_eq!(json["unknown"], Value::from(5_u64));
@@ -208,7 +217,7 @@ fn the_fleet_view_prints_each_seats_total_free_and_build_bytes() {
         );
         assert_ne!(with, lines[0], "{tokens}");
         lines[0] = with;
-        observe(fleet, &book, Ok(&read), NOW, true)
+        observe(fleet, &book, Ok(&read), NOW, CROSSED)
     };
     // The cell of `label`'s row under `column`, placed by the head's own columns.
     let cell = |text: &str, label: &str, column: &str| -> String {
@@ -291,7 +300,7 @@ fn the_fleet_view_prints_each_seats_total_free_and_build_bytes() {
 
     // An aterm older than the keys: unknown, never 0.
     let (fleet, book, read) = survey_fixture();
-    let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+    let fleet = observe(fleet, &book, Ok(&read), NOW, CROSSED);
     let text = render(&fleet, Some(NOW));
     assert_eq!(
         ["TOTAL_MB", "FREE_MB", "BUILD_MB"].map(|column| cell(&text, "m5", column)),
@@ -343,7 +352,7 @@ fn the_fleet_view_names_each_seats_fullest_store_and_its_share() {
         );
         assert_ne!(with, lines[0], "{tokens}");
         lines[0] = with;
-        observe(fleet, &book, Ok(&read), NOW, true)
+        observe(fleet, &book, Ok(&read), NOW, CROSSED)
     };
     // The words of `label`'s row between the head's STORE and SESSIONS columns.
     let store_cell = |text: &str, label: &str| -> String {
@@ -400,7 +409,7 @@ fn the_fleet_view_names_each_seats_fullest_store_and_its_share() {
     ] {
         let fleet = if tokens.is_empty() {
             let (fleet, book, read) = survey_fixture();
-            observe(fleet, &book, Ok(&read), NOW, true)
+            observe(fleet, &book, Ok(&read), NOW, CROSSED)
         } else {
             surveyed(tokens)
         };
@@ -450,7 +459,7 @@ fn surveys_require_full_bound_keys_consistent_nodes_and_complete_facts() {
             }
             _ => unreachable!(),
         }
-        let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+        let fleet = observe(fleet, &book, Ok(&read), NOW, CROSSED);
         assert_eq!(fleet.seats.up, Some(0), "{fault}");
         assert!(fleet.observations.is_empty(), "{fault}");
         assert!(
@@ -464,7 +473,7 @@ fn surveys_require_full_bound_keys_consistent_nodes_and_complete_facts() {
 fn a_proved_identity_can_answer_a_peer_requested_by_name_only() {
     let (fleet, book, mut read) = survey_fixture();
     read.peers[0].node = None;
-    let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+    let fleet = observe(fleet, &book, Ok(&read), NOW, CROSSED);
     assert_eq!(fleet.seats.up, Some(1));
     assert_eq!(fleet.rows[4].node.as_deref(), Some(identity(5).node()));
 }
@@ -479,7 +488,7 @@ fn a_local_network_failure_is_unknown_and_a_missed_peer_has_no_current_metrics()
         let (fleet, book, mut read) = survey_fixture();
         read.peers[0].answer = Err("unavailable".to_owned());
         read.peers[0].fault = fault;
-        let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+        let fleet = observe(fleet, &book, Ok(&read), NOW, CROSSED);
         let json = to_json(&fleet);
         let row = &json["seats"][4];
         assert_eq!(row["up"], expected.map_or(Value::Null, Value::from));
@@ -491,7 +500,7 @@ fn a_local_network_failure_is_unknown_and_a_missed_peer_has_no_current_metrics()
     let lines = read.peers[0].answer.as_mut().unwrap();
     lines[0] = lines[0].replace(" accounts=1", "");
     lines.pop();
-    let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+    let fleet = observe(fleet, &book, Ok(&read), NOW, CROSSED);
     assert_eq!(fleet.seats.up, Some(1));
     assert_eq!(to_json(&fleet)["seats"][4]["accounts"], Value::Null);
 }
@@ -508,6 +517,8 @@ fn the_view_names_the_old_builds_and_reads_each_seat_from_presence() {
     let facts = |crossed| Facts {
         seats: Some(&seats),
         records: Some((4_169, crossed)),
+        format: FormatFloor::Every,
+        own: None,
         view: Ok(&view),
         book: &book,
         now_ms: NOW,
@@ -532,6 +543,271 @@ fn the_view_names_the_old_builds_and_reads_each_seat_from_presence() {
     );
 }
 
+/// A MEMBER THAT CANNOT READ THE VAULT'S RECORDS FORMAT SHOWS `needs update` (tracker FL-148E;
+/// `docs/DESIGN-vault-log-2026-11-14.md` step 3): once this Mac's format mark says its log is in
+/// format 2, each member whose build reads as a release before the first that reads format 2
+/// needs an update, by the view's build, the book's or a survey's, and the status line counts
+/// them; a member at that release or later does not. While the mark says format 1, or does not
+/// read, the format names no one. A Mac whose own build names no release that reads its log's
+/// format (it was taken back to an older aterm) shows its own row so and claims nothing of the
+/// others.
+///
+/// NEGATIVE CONTROL: with `Needs::update`'s `From` arm answering `false`, the format-2 compose
+/// names m5 alone (`left: [("m5", "0.147.0")]`); with its `Unread` arm answering `false`, the
+/// taken-back Mac's own row is not named (`this Mac's own row needs an update`); with
+/// `FormatFloor::of` reading a mark that does not read as format 2, the unread mark names a
+/// floor (`left: From((0, 159))`).
+#[test]
+fn a_member_that_cannot_read_the_vaults_records_format_needs_an_update() {
+    let (seats, view, book) = (seats(), view(), book());
+    let facts = |format| Facts {
+        seats: Some(&seats),
+        records: Some((1_200, false)),
+        format,
+        own: None,
+        view: Ok(&view),
+        book: &book,
+        now_ms: NOW,
+    };
+    let named = |fleet: &Fleet| fleet.seats.needs_update.clone();
+    let name = |label: &str, build: &str| (label.to_owned(), build.to_owned());
+
+    // The mark, and the first release this build says reads format 2.
+    let reads = Some((0, 159));
+    assert_eq!(FormatFloor::of(Some(1), reads), FormatFloor::Every);
+    assert_eq!(FormatFloor::of(Some(2), reads), FormatFloor::From((0, 159)));
+    assert_eq!(FormatFloor::of(Some(2), None), FormatFloor::Unread);
+    assert_eq!(FormatFloor::of(Some(3), reads), FormatFloor::Unread);
+    assert_eq!(FormatFloor::of(None, reads), FormatFloor::Every);
+
+    // Format 1: only the member that publishes no presence row, as before.
+    let one = compose(&facts(FormatFloor::Every));
+    assert_eq!(named(&one), vec![name("m5", "0.147.0")]);
+
+    // Format 2, read from 0.159: m3 (up, 0.158) and m4 (silent, 0.150) cannot read it; m1 and
+    // m2, at 0.159, can.
+    let two = compose(&facts(FormatFloor::From((0, 159))));
+    assert_eq!(
+        named(&two),
+        vec![
+            name("m3", "0.158.0"),
+            name("m4", "0.150.0"),
+            name("m5", "0.147.0")
+        ]
+    );
+    assert_eq!(
+        words::status_line(&two.seats),
+        "6 members · 3 up · 3 need update (m3 0.158, m4 0.150, m5 0.147) · tables in step with \
+         1 of 2, slowest 40 s behind · log 1,200 of 16,384"
+    );
+    assert!(render(&two, Some(NOW)).contains("needs update (0.158.0)"));
+
+    // A Mac whose own build reads no such format: its own row, and no claim about the others.
+    let unread = compose(&facts(FormatFloor::Unread));
+    let own = unread.rows.iter().find(|row| row.me).expect("this Mac");
+    assert!(own.needs_update, "this Mac's own row needs an update");
+    assert_eq!(
+        named(&unread),
+        vec![name("m1", "0.159.0+g4ef9cd6144"), name("m5", "0.147.0")]
+    );
+    assert!(own_line(&unread, Some(NOW)).contains(", needs update"));
+
+    // A survey's build is held to the same floor: m5 answers at 0.197.0.
+    let (fleet, book, read) = survey_fixture();
+    let needs = |format| Needs {
+        crossed: false,
+        format,
+        own: None,
+    };
+    let row = |fleet: &Fleet| {
+        fleet
+            .rows
+            .iter()
+            .find(|row| row.label == "m5")
+            .expect("m5")
+            .needs_update
+    };
+    let at = |format| observe(fleet.clone(), &book, Ok(&read), NOW, needs(format));
+    assert!(row(&at(FormatFloor::From((0, 198)))));
+    assert!(!row(&at(FormatFloor::From((0, 197)))));
+    assert!(!row(&at(FormatFloor::Every)));
+    assert!(!row(&at(FormatFloor::Unread)));
+}
+
+/// `aterm fleet` NAMES THIS MAC'S OWN ROW FOR A FORMAT ITS BUILD DOES NOT READ (tracker
+/// FL-148E). The command composes with no node's view (its presence comes from the survey), so
+/// no view says which seat is this Mac's: the seat that bound this Mac's own node key
+/// ([`Facts::own`]) is the row that needs an update, in the text and the JSON, and a survey's
+/// answer for that seat keeps it. The key names a row for that alone: with a format every
+/// build reads it marks no one, it shows no row as this Mac's, and a seat that bound no key is
+/// never the one a missing key names.
+///
+/// NEGATIVE CONTROLS, each run from the test's first line and seen to fail:
+/// - `Mutant::OwnByViewAlone` (a row is this Mac's by the view alone, as before the slice B
+///   review): ``assertion `left == right` failed: this Mac's own row, by its node key``,
+///   `left: []`, `right: [("m1", "-")]`.
+/// - `Needs::own` without its `key.is_some()` (a missing key names the seat that bound none):
+///   ``assertion `left == right` failed: no key names no row``, `left: [("m6", "-")]`,
+///   `right: []`.
+#[test]
+fn aterm_fleet_names_this_macs_own_row_for_a_format_its_build_does_not_read() {
+    let (seats, book) = (seats(), book());
+    // As `main_entry` composes: no view, then the survey.
+    let composed = |format, own| {
+        compose(&Facts {
+            seats: Some(&seats),
+            records: Some((1_200, false)),
+            format,
+            own,
+            view: Err("fleet survey not read".to_owned()),
+            book: &book,
+            now_ms: NOW,
+        })
+    };
+    let name = |label: &str, build: &str| (label.to_owned(), build.to_owned());
+
+    let fleet = composed(FormatFloor::Unread, Some(key(1)));
+    assert_eq!(
+        fleet.seats.needs_update,
+        vec![name("m1", "-")],
+        "this Mac's own row, by its node key"
+    );
+    assert!(
+        fleet.rows.iter().all(|row| !row.me),
+        "the key shows no row as this Mac's: only the view does"
+    );
+    let text = render(&fleet, Some(NOW));
+    let own = text
+        .lines()
+        .find(|line| line.starts_with("m1 "))
+        .expect("m1");
+    assert!(own.contains("needs update"), "{text}");
+    assert_eq!(
+        to_json(&fleet)["seats"][0]["needs_update"],
+        Value::from(true)
+    );
+
+    // The survey answers for m5 alone, at a build that names no floor: m1 stays named.
+    let (_, book, read) = survey_fixture();
+    let needs = Needs {
+        crossed: false,
+        format: FormatFloor::Unread,
+        own: Some(key(1)),
+    };
+    let surveyed = observe(fleet, &book, Ok(&read), NOW, needs);
+    assert_eq!(surveyed.seats.needs_update, vec![name("m1", "-")]);
+    // And where the survey's answer is this Mac's own seat's, its build is named with it.
+    let own = Needs {
+        own: Some(key(5)),
+        ..needs
+    };
+    let surveyed = observe(
+        composed(FormatFloor::Unread, Some(key(5))),
+        &book,
+        Ok(&read),
+        NOW,
+        own,
+    );
+    assert_eq!(surveyed.seats.needs_update, vec![name("m5", "0.197.0")]);
+
+    // No key read: no row, and never the seat that bound no key (m6).
+    assert_eq!(
+        composed(FormatFloor::Unread, None).seats.needs_update,
+        Vec::new(),
+        "no key names no row"
+    );
+    // A format every build reads: the key names no one.
+    assert_eq!(
+        composed(FormatFloor::Every, Some(key(1)))
+            .seats
+            .needs_update,
+        Vec::new()
+    );
+}
+
+/// THE FLOOR IS READ OFF THIS MAC'S OWN FORMAT MARK ([`gather_here`], [`format_floor`]): what
+/// `aterm fleet`, `aterm status` and the glance hand [`compose`]. With no vault, no mark, or a
+/// mark that does not read, every build reads the log's format and this Mac's node key is not
+/// read; with a mark that names format 2 the floor is what this build's `READS_FORMAT` says
+/// reads it ([`FormatFloor::of`]: `Unread` while it names no release), and only for `Unread` is
+/// this Mac's own node key read, never minted, to name its row.
+///
+/// NEGATIVE CONTROL, run from the test's first line and seen to fail: `Mutant::MarkUnread`
+/// (`format_floor` reads no mark) with ``assertion `left == right` failed: a mark of format
+/// 2``, `left: Every`, `right: Unread`.
+#[cfg(unix)]
+#[test]
+fn the_floor_is_read_off_this_macs_own_format_mark() {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    let home = aterm_tempfile::tempdir().expect("a home");
+    let state = home.path().join("state");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&state)
+        .expect("the state directory");
+    let paths = aterm_secrets::client::Paths::locate_for_home(home.path());
+    let needs = |paths: Option<&aterm_secrets::client::Paths>| {
+        gather_here(&state, paths, Err("fleet survey not read".to_owned())).2
+    };
+    let reads = aterm_secrets::commons::hearing::READS_FORMAT
+        .map(|release| (u64::from(release.0), u64::from(release.1)));
+    let none = Needs {
+        crossed: false,
+        format: FormatFloor::Every,
+        own: None,
+    };
+
+    assert_eq!(needs(None), none, "no vault");
+    assert_eq!(needs(Some(&paths)), none, "no mark");
+
+    let mark = paths.records_file().with_file_name("records.format");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(mark.parent().expect("the vault's folder"))
+        .expect("the vault's folder");
+    let write = |text: &str| {
+        let _ = std::fs::remove_file(&mark);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&mark)
+            .expect("the format mark");
+        std::io::Write::write_all(&mut file, text.as_bytes()).expect("its text");
+    };
+    write("aterm-secrets records format 2\n");
+    let floor = FormatFloor::of(Some(2), reads);
+    assert_ne!(floor, FormatFloor::Every);
+    assert_eq!(needs(Some(&paths)).format, floor, "a mark of format 2");
+    // No node key is minted to name a row: none is held, so none is read.
+    assert_eq!(needs(Some(&paths)).own, None);
+    assert!(
+        aterm_net::fleet_member::read_node_identity(&state)
+            .expect("the state directory")
+            .is_none(),
+        "a display mints no node key"
+    );
+
+    let me = aterm_net::fleet_member::node_identity(&state).expect("this Mac's node");
+    let own = (floor == FormatFloor::Unread).then(|| *me.key().bytes());
+    assert_eq!(
+        needs(Some(&paths)),
+        Needs {
+            crossed: false,
+            format: floor,
+            own,
+        }
+    );
+
+    // A mark that does not read claims nothing, and a Mac with no mark reads no key.
+    write("garbage");
+    assert_eq!(needs(Some(&paths)), none, "a mark that does not read");
+    std::fs::remove_file(&mark).expect("the mark removed");
+    assert_eq!(needs(Some(&paths)), none, "no mark, a node key held");
+}
+
 /// With no node serving presence, nothing is read as up or silent and nothing as in step; the
 /// view says why, and a build comes from the book alone.
 #[test]
@@ -541,6 +817,8 @@ fn with_no_node_the_view_says_why_and_reads_no_one_up() {
     let fleet = compose(&Facts {
         seats: Some(&seats),
         records: Some((4_169, true)),
+        format: FormatFloor::Every,
+        own: None,
         view: Err(why.clone()),
         book: &book,
         now_ms: NOW,
@@ -585,6 +863,8 @@ fn a_seat_only_the_view_holds_is_listed_and_the_own_line_is_this_macs_row() {
     let fleet = compose(&Facts {
         seats: Some(&seats),
         records: None,
+        format: FormatFloor::Every,
+        own: None,
         view: Ok(&view),
         book: &[],
         now_ms: NOW,

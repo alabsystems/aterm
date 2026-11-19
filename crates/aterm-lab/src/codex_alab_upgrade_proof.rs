@@ -147,7 +147,18 @@ pub(super) fn legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail
     proof.link(old).map_err(Fail::die)?;
     proof.inst.await_socket(instance::BOOT)?;
     let _ = proof.inst.ctl(&["ready"]);
-    println!("upgrade-only (one real TUI, saved paced continuation, private package link)");
+    if proof
+        .published
+        .as_ref()
+        .and_then(super::published_target::Staged::original)
+        .is_some()
+    {
+        println!(
+            "upgrade-only (one real TUI, saved paced continuation, two signed private builds)"
+        );
+    } else {
+        println!("upgrade-only (one real TUI, saved paced continuation, private package link)");
+    }
     let leg = proof.start_leg_using_auth(
         "continue",
         Some("Write a plan, then stop."),
@@ -216,8 +227,18 @@ fn handoff(
         .get("notBefore")
         .and_then(J::as_i64)
         .expect("observed deadline");
-    println!("  saved record: {}", before.py());
-    proof.upgrade_leg(leg, new)?;
+    if let Some(auth_path) = leg.auth_path.as_deref()
+        && package_supports_auth_and_goal(old)?
+    {
+        proof.check(
+            "upgrade-only: the old image records isolated CODEX_AUTH_PATH outside CODEX_HOME",
+            record_carries_auth_path(&before, auth_path) && !leg.home.join("auth.json").exists(),
+        );
+    }
+    if !proof.upgrade_leg(leg, new)? {
+        proof.unobserved("post-upgrade continuity, auth and goal checks require an observed replacement with a renewed claim");
+        return Ok(());
+    }
     let mut after = None;
     let active = Proof::wait_for(HANG, Duration::from_millis(250), || {
         after = Proof::record(leg, pid);
@@ -235,29 +256,26 @@ fn handoff(
         "upgrade-only: the new image's own record reports its active native claim before its restored deadline is read",
         active,
     );
+    let Some(after) = after.filter(|_| active) else {
+        proof.unobserved(
+            "post-upgrade continuity, auth and goal checks require the replacement’s active record",
+        );
+        return Ok(());
+    };
     proof.check(
         &format!("upgrade-only: the new image reports {new_version} with the same conversation and process custody"),
-        active && after.as_ref().is_some_and(|after| {
-            same_custody(&before, after)
-                && after.get("version").and_then(J::as_str) == Some(new_version.as_str())
-        }),
+        same_custody(&before, &after),
     );
-    if let Some(after) = &after {
-        println!("  resumed record: {}", after.py());
-    }
     proof.check(
         "upgrade-only: the new image retains the exact owed act without shortening its deadline",
-        active
-            && crate::util::now_ms() < original_not_before
+        crate::util::now_ms() < original_not_before
             && after
-                .as_ref()
-                .and_then(|after| after.get("owed"))
+                .get("owed")
                 .is_some_and(|after| same_owed(owed, after))
             && !continued(&proof.tags(leg.name)),
     );
     let mut not_before = after
-        .as_ref()
-        .and_then(|after| after.get("owed"))
+        .get("owed")
         .and_then(|owed| owed.get("notBefore"))
         .and_then(J::as_i64)
         .map_or(original_not_before, |restored| {
@@ -280,19 +298,14 @@ fn handoff(
             && at > not_before
         {
             not_before = at;
-            deadline_record = Some(record);
+            deadline_record = record;
         }
         !carried_requests(proof.requests(leg.name)).is_empty()
     })?;
-    if let Some(record) = &deadline_record {
-        let path = proof.s.join("upgrade-deadline-record.json");
-        crate::util::write_fresh(&path, record.py())
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        println!(
-            "  maximum witnessed deadline {not_before}: {}",
-            path.display()
-        );
-    }
+    let path = proof.s.join("upgrade-deadline-record.json");
+    crate::util::write_fresh(&path, deadline_record.py())
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    println!("  maximum witnessed deadline {not_before}");
     let completed = Proof::wait_for(HANG, Duration::from_millis(250), || {
         Proof::record(leg, pid).is_some_and(|record| {
             record.get("status").and_then(J::as_str) == Some("idle")
@@ -304,30 +317,23 @@ fn handoff(
         })
     })?;
     let rows = carried_requests(proof.requests(leg.name));
-    proof.check(
+    let continued = proof.check(
         &format!("upgrade-only: the carried continuation ran exactly once at or after {not_before}, and its reply completed"),
         acted && completed && one_carried_request(&rows, owed, not_before)
             && proof.proven_pid(&leg.sid) == Some(pid)
             && Proof::record(leg, pid).as_ref().is_some_and(|after| same_custody(&before, after)),
     );
-    if let Some(auth_path) = leg.auth_path.as_deref() {
-        if package_supports_auth_and_goal(old)? {
-            proof.check(
-                "upgrade-only: the old image records isolated CODEX_AUTH_PATH outside CODEX_HOME",
-                record_carries_auth_path(&before, auth_path)
-                    && !leg.home.join("auth.json").exists(),
-            );
-        }
-        if package_supports_auth_and_goal(new)? {
-            proof.check(
-                "upgrade-only: the upgraded image preserves isolated CODEX_AUTH_PATH across live execve",
-                after
-                    .as_ref()
-                    .is_some_and(|after| record_carries_auth_path(after, auth_path))
-                    && !leg.home.join("auth.json").exists(),
-            );
-            verify_native_goal_roundtrip(proof, leg, pid)?;
-        }
+    if continued {
+        proof.verify_final_settle_ack(pid, new)?;
+    }
+    if let Some(auth_path) = leg.auth_path.as_deref()
+        && package_supports_auth_and_goal(new)?
+    {
+        proof.check(
+            "upgrade-only: the upgraded image preserves isolated CODEX_AUTH_PATH across live execve",
+            record_carries_auth_path(&after, auth_path) && !leg.home.join("auth.json").exists(),
+        );
+        verify_native_goal_roundtrip(proof, leg, pid)?;
     }
     if !proof.fails.is_empty() {
         proof.diagnose(&[leg]);

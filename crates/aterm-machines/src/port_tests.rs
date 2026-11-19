@@ -1030,3 +1030,58 @@ fn every_live_of_a_process_counts_into_one_sum() {
         "{after:?} after {before:?}"
     );
 }
+
+/// The live port reads the installed broker's hello whatever protocol the broker speaks: this
+/// build, under the protocol seam, dials a stand-in broker that speaks the older protocol, and
+/// the port answers with the hello it sent (`aterm_uds::lan::broker::any_protocol`), its own
+/// protocol and build in it, so an adoption is judged against that build. MUTANT (run): a port
+/// that passes `installed_hello`'s answer through reads the outdated broker as an error.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_live_port_hears_a_broker_of_another_protocol_by_its_hello() {
+    use aterm_uds::lan::{
+        self,
+        wire::{Frame, Reader, send},
+    };
+    let root = aterm_tempfile::tempdir().unwrap();
+    let socket = root.path().join("b.sock");
+    let listener = aterm_uds::CtlListener::bind(&socket).unwrap();
+    let served = std::thread::spawn(move || {
+        let (stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
+        send(
+            &stream,
+            &Frame::Hello {
+                protocol: lan::PROTOCOL,
+                build: "stand-in".into(),
+            },
+        )
+        .unwrap();
+        // A hang detector, never a latency budget.
+        let _ = Reader::new(0).frame(
+            &stream,
+            Some(std::time::Instant::now() + Duration::from_secs(60)),
+        );
+    });
+    let heard = lan::seam_here(
+        lan::Seam {
+            socket: Some(socket),
+            protocol: Some(lan::PROTOCOL + 1),
+            ..lan::Seam::default()
+        },
+        || Live::new().installed_lan_broker(),
+    );
+    served.join().unwrap();
+    assert_eq!(
+        heard,
+        Ok(lan::BrokerHello {
+            protocol: lan::PROTOCOL,
+            build: "stand-in".into(),
+            direct: None,
+        })
+    );
+}

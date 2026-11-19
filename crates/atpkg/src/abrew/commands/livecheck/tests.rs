@@ -226,11 +226,10 @@ fn debug_matched_dedupes_in_discovery_order() {
 /// agreement gate); tap-loaded records are qualified.
 #[test]
 fn formula_from_api_discriminates() {
-    let mk = |full: &str| {
-        let mut f = crate::abrew::formula::Formula::default();
-        f.name = "immich-cli".to_string();
-        f.full_name = full.to_string();
-        f
+    let mk = |full: &str| crate::abrew::formula::Formula {
+        name: "immich-cli".to_string(),
+        full_name: full.to_string(),
+        ..Default::default()
     };
     assert!(formula_from_api(&mk("immich-cli")));
     assert!(formula_from_api(&mk("homebrew/core/immich-cli")));
@@ -255,6 +254,57 @@ fn lazy_group_split_is_shortest() {
     // Greedy groups are unaffected.
     let greedy = lc_regex(r"v(\d+(?:\.\d+)*)\.tar", "").unwrap();
     assert_eq!(scan_versions(&greedy, "v1.2.3.tar"), ["1.2.3"]);
+    // r459: a lazy prefix with a fixed tail
+    // (`href=.*?v?`) still splits shortest-first
+    // (dosbox-x read group 1 as `0.01` before).
+    let re = lc_regex(
+        r"href=.*?v?(\d+(?:\.\d+)+)/dosbox-x-macosx?-arm64[._-]v?(\d+(?:\.\d+)+)\.zip",
+        "i",
+    )
+    .unwrap();
+    let m = re
+        .whole
+        .find("href=\"https://example.com/dosbox-x-v2026.10.01/dosbox-x-macosx-arm64-2026.10.01.zip\"")
+        .unwrap();
+    assert_eq!(
+        extract_groups(&re, m.as_str()),
+        [
+            Some("2026.10.01".to_string()),
+            Some("2026.10.01".to_string())
+        ]
+    );
+    // r462: a greedy repeated group yields its
+    // LAST iteration (menuwhere/witch `(\.\d+)*`),
+    // nil when it never iterated.
+    let re = lc_regex(r"^v?(\d+\.\d+)(\.\d+)*$", "i").unwrap();
+    let groups = |s: &str| {
+        let m = re.whole.find(s).unwrap();
+        extract_groups(&re, m.as_str())
+    };
+    assert_eq!(groups("1.2"), [Some("1.2".to_string()), None]);
+    assert_eq!(
+        groups("1.2.3"),
+        [Some("1.2".to_string()), Some(".3".to_string())]
+    );
+    assert_eq!(
+        groups("v1.2.3.4"),
+        [Some("1.2".to_string()), Some(".4".to_string())]
+    );
+    // r468: `\h` inside a character class
+    // inlines its ranges (dorico `[\h-]+`).
+    let re = lc_regex(r"/([\h-]+)/Dorico[._-]v?(\d+(?:\.\d+)*)", "i").unwrap();
+    let m = re.whole.find("/27a07da9-fcfa/Dorico_6.2").unwrap();
+    assert_eq!(
+        extract_groups(&re, m.as_str()),
+        [Some("27a07da9-fcfa".to_string()), Some("6.2".to_string())]
+    );
+    // `+` needs only its single iteration.
+    let re = lc_regex(r"^(\d+)(\.\d+)+$", "").unwrap();
+    let m = re.whole.find("1.2").unwrap();
+    assert_eq!(
+        extract_groups(&re, m.as_str()),
+        [Some("1".to_string()), Some(".2".to_string())]
+    );
 }
 
 /// r418: Hackage match/values, pinned against the
@@ -447,7 +497,8 @@ fn npm_package_matches_oracle() {
 /// deliberately do NOT match (brew falls through).
 #[test]
 fn sourceforge_values_match_oracle() {
-    let rows: &[(&str, Option<(Option<&str>, &str)>)] = &[
+    type Row<'a> = (&'a str, Option<(Option<&'a str>, &'a str)>);
+    let rows: &[Row] = &[
         (
             "https://downloads.sourceforge.net/bbmap/BBMap_40.05.tar.gz",
             Some((
@@ -679,7 +730,7 @@ fn pypi_project_and_version_parse() {
         );
     }
     // The plan for a hosted URL is the PyPI JSON API.
-    match plan_url(None, flit, "").unwrap() {
+    match plan_url(None, flit, "", "").unwrap() {
         UrlPlan::Run(rp) => {
             assert_eq!(strat_name(rp.strat), "Pypi");
             assert_eq!(
@@ -705,7 +756,7 @@ fn github_strategy_url_is_the_releases_endpoint_brew_names() {
             "https://api.github.com/repos/owner/pkg/releases",
         ),
     ] {
-        let Ok(UrlPlan::Run(rp)) = github_plan(strat, url, None, Vec::new()) else {
+        let Ok(UrlPlan::Run(rp)) = github_plan(strat, url, None, Vec::new(), "1.0") else {
             panic!("{} plans no run for {url}", strat_name(strat));
         };
         assert_eq!(rp.strategy_url.as_deref(), Some(want));
@@ -1179,11 +1230,15 @@ fn github_releases_block_applies() {
         pre_capture: None,
         then: GhRelThen::Tr("-".into(), ".".into()),
         fallback_tag: None,
+        blank_emit_local: false,
+        limit: None,
+        own_guards: Vec::new(),
     };
     let found = github_releases_versions_with(
         "https://github.com/sample/tool/releases/download/v1/tool.tgz",
         &re,
         Some(&block),
+        "1.0",
         |_| Ok(releases),
     );
     assert!(
@@ -1292,6 +1347,21 @@ fn extract_group_long_match_finds_real_split() {
     );
 }
 
+/// r482: a long section capture needs the larger
+/// exhaustive-split budget (inkscape's table rows).
+#[test]
+fn extract_group_limited_long_section() {
+    let re = lc_regex(r"<tr[^>]*?>(.*?)</tr>", "im").unwrap();
+    let section = " release row".repeat(80);
+    let page = format!("<tr class=\"even\">{section}</tr>");
+    let m = re.whole.find(&page).unwrap();
+    assert!(m.as_str().len() > 512);
+    assert_eq!(
+        extract_group_limited(&re, m.as_str(), 65_536).as_deref(),
+        Some(section.as_str())
+    );
+}
+
 /// r432: URI.join for directory-walk fetches.
 #[test]
 fn uri_join_directory_forms() {
@@ -1392,6 +1462,8 @@ fn github_latest_block_applies() {
         render: LatestRender::Capture,
         two_b: None,
         pre_capture: None,
+        match_pre: false,
+        asset_pick: None,
     };
     // Scan + tr over tag_name (draft/prerelease kept:
     // the block path has no filter).
@@ -1474,6 +1546,7 @@ fn json_none_match_guard() {
         post_json: None,
         headers: Vec::new(),
         major_minor: String::new(),
+        own_version: String::new(),
         plist: None,
         apps: Vec::new(),
         uncompressed: false,
@@ -1486,17 +1559,19 @@ fn json_none_match_guard() {
         &item(
             r#"{"files":[{"filename":"go1.27.4.darwin-arm64.tar.gz"},{"filename":"go1.27.4.src.tar.gz"}]}"#
         ),
-        &rp
+        &rp,
+        None
     ));
     // No src tarball: none match (the item is skipped).
     assert!(eval_json_cond(
         &cond,
         &item(r#"{"files":[{"filename":"go1.27.4.darwin-arm64.tar.gz"}]}"#),
-        &rp
+        &rp,
+        None
     ));
     // Missing/empty file list: none match.
-    assert!(eval_json_cond(&cond, &item(r#"{"files":[]}"#), &rp));
-    assert!(eval_json_cond(&cond, &item(r#"{}"#), &rp));
+    assert!(eval_json_cond(&cond, &item(r#"{"files":[]}"#), &rp, None));
+    assert!(eval_json_cond(&cond, &item(r#"{}"#), &rp, None));
 }
 
 /// r437: `URI.encode_www_form` — alphanumerics and
@@ -1604,9 +1679,13 @@ fn sparkle_block_versions_eval() {
         match_guard: None,
         present: Vec::new(),
         needs_spec_regex: false,
+        own_if: None,
         expr: SpExpr::Field(SpField::Short),
     };
-    assert_eq!(sparkle_block_versions(appcast, &find, None), vec!["2.0"]);
+    assert_eq!(
+        sparkle_block_versions(appcast, &find, None, "1.0"),
+        vec!["2.0"]
+    );
     let tmpl = SparkleBlock {
         all: false,
         find: false,
@@ -1614,6 +1693,7 @@ fn sparkle_block_versions_eval() {
         match_guard: None,
         present: Vec::new(),
         needs_spec_regex: true,
+        own_if: None,
         expr: SpExpr::Template {
             from: Some(SpField::Url),
             local: None,
@@ -1626,7 +1706,7 @@ fn sparkle_block_versions_eval() {
     };
     let re = lc_regex(r"-(\d+)\.dmg", "").unwrap();
     assert_eq!(
-        sparkle_block_versions(appcast, &tmpl, Some(&re)),
+        sparkle_block_versions(appcast, &tmpl, Some(&re), "1.0"),
         vec!["3.0,99"]
     );
 }
@@ -1645,6 +1725,7 @@ fn sparkle_scan_capture_zero_is_first_group() {
         match_guard: None,
         present: Vec::new(),
         needs_spec_regex: true,
+        own_if: None,
         expr: SpExpr::Scan {
             from: SpField::Url,
             parts: vec![SpPart::CapTr(0, "-".into(), ".".into())],
@@ -1652,7 +1733,7 @@ fn sparkle_scan_capture_zero_is_first_group() {
     };
     let re = lc_regex(r"/v?(\d+(?:[.-]\d+)+)/App%207\.zip", "i").unwrap();
     assert_eq!(
-        sparkle_block_versions(appcast, &block, Some(&re)),
+        sparkle_block_versions(appcast, &block, Some(&re), "1.0"),
         vec!["7.2.0"]
     );
 }
@@ -1713,6 +1794,7 @@ fn json_template_eval() {
         post_json: None,
         headers: Vec::new(),
         major_minor: String::new(),
+        own_version: String::new(),
         plist: None,
         apps: Vec::new(),
         uncompressed: false,
@@ -1724,6 +1806,7 @@ fn json_template_eval() {
     let map_tmpl = JsonTemplate {
         path: vec![JsonKey::Key("releases".into())],
         map: true,
+        values: false,
         locals: vec![
             JsonLocal::Dig(vec![JsonKey::Key("version".into())]),
             JsonLocal::Dig(vec![JsonKey::Key("build".into())]),
@@ -1732,6 +1815,8 @@ fn json_template_eval() {
         match_src: None,
         local_match_guard: None,
         guards: Vec::new(),
+        finds: Vec::new(),
+        require_find: Vec::new(),
         render: JsonRender::Template(vec![
             JsonPart::Local(0),
             JsonPart::Lit(",".into()),
@@ -1747,11 +1832,14 @@ fn json_template_eval() {
     let match_tmpl = JsonTemplate {
         path: Vec::new(),
         map: false,
+        values: false,
         locals: Vec::new(),
         require: Vec::new(),
         match_src: Some(vec![JsonKey::Key("url".into())]),
         local_match_guard: None,
         guards: Vec::new(),
+        finds: Vec::new(),
+        require_find: Vec::new(),
         render: JsonRender::Template(vec![
             JsonPart::Cap(2),
             JsonPart::Lit(",".into()),
@@ -1776,6 +1864,7 @@ fn xml_template_eval() {
     let key = |v: &str| XmlLocal {
         path: XmlPathQ {
             absolute: false,
+            relative: false,
             steps: vec![
                 XmlStep {
                     tag: "dict".into(),
@@ -1788,6 +1877,7 @@ fn xml_template_eval() {
             ],
         },
         next: true,
+        from: None,
     };
     let rp = RunPlan {
         strat: Strat::Xml,
@@ -1812,14 +1902,18 @@ fn xml_template_eval() {
         post_json: None,
         headers: Vec::new(),
         major_minor: String::new(),
+        own_version: String::new(),
         plist: None,
         apps: Vec::new(),
         uncompressed: false,
     };
     let tmpl = XmlTemplate {
         locals: vec![key("version"), key("build")],
+        elems: Vec::new(),
         require: vec![0, 1],
+        require_elems: Vec::new(),
         match_local: None,
+        or_pairs: Vec::new(),
         map: None,
         render: XmlRender::Template(vec![
             XmlPart::LocalStrip(0),
@@ -1834,11 +1928,15 @@ fn xml_template_eval() {
     let doc = "<feed><entry v=\"1.0\"/><entry v=\"2.0\"/></feed>";
     let tmpl = XmlTemplate {
         locals: Vec::new(),
+        elems: Vec::new(),
         require: Vec::new(),
+        require_elems: Vec::new(),
         match_local: None,
+        or_pairs: Vec::new(),
         map: Some(XmlMap {
             path: XmlPathQ {
                 absolute: false,
+                relative: false,
                 steps: vec![XmlStep {
                     tag: "entry".into(),
                     pred: None,
@@ -1853,5 +1951,824 @@ fn xml_template_eval() {
     assert_eq!(
         xml_template_versions(&tmpl, doc, &rp).unwrap(),
         vec!["1.0", "2.0"]
+    );
+}
+
+/// r468: an empty prefix/suffix pattern pins the
+/// split boundary (imagej's `(\d)(\d+)` sub read
+/// "154" as groups ("5","54") before).
+#[test]
+fn empty_edge_splits_are_pinned() {
+    let re = lc_regex(r"(\d)(\d+)", "").unwrap();
+    assert_eq!(
+        extract_groups(&re, "154"),
+        [Some("1".to_string()), Some("54".to_string())]
+    );
+    assert_eq!(sub_backref_apply("154", "\\1.\\2", Some(&re)), "1.54");
+    assert_eq!(sub_backref_apply("x154y", "\\1.\\2", Some(&re)), "x1.54y");
+    // A lone group spans the whole match.
+    let re = lc_regex(r"(\d+)", "").unwrap();
+    assert_eq!(extract_group(&re, "154").as_deref(), Some("154"));
+    // Greedy first group still backtracks for the last.
+    let re = lc_regex(r"(\d+)(\d)", "").unwrap();
+    assert_eq!(
+        extract_groups(&re, "154"),
+        [Some("15".to_string()), Some("4".to_string())]
+    );
+}
+
+/// r488 fixtures: canon's contains() header hop
+/// and turbotax's max-by second-XML hop reduce to
+/// data.
+#[test]
+fn r488_xml_header_and_doc_hops() {
+    use crate::abrew::formula::{XmlPred, XmlShape};
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    let spec = parse(
+        "cask \"canon-eos-utility\" do\n  version \"3.21.11.2,0200007754,4\"\n  sha256 \"099f546215d3797cad5928300d061770393a49336ba7278d4e4154e1edf54f12\"\n\n  url \"https://gdlp01.c-wss.com/gds/#{version.csv.third}/#{version.csv.second}/01/EU#{version.csv.first.major}Installer-M#{version.csv.first}.zip\"\n  name \"Canon EOS Utility\"\n  desc \"Communication with Canon EOS cameras\"\n  homepage \"https://app.ssw.imaging-saas.canon/app/en/eu.html\"\n\n  # The upstream data for the in-app updater uses redirecting URLs, so we have\n  # to find and fetch the URL for macOS to be able to match the cask `version`\n  # parts from the file URL in the `location` header of the response.\n  livecheck do\n    url \"https://gdlp01.c-wss.com/rmds/ic/autoupdate/common/tls_eu_updater_url.xml\"\n    regex(%r{/(\\d+)/(\\d+)/\\d+/EU\\d*[._-]?Install(?:er|set)[._-]v?M?(\\d+(?:\\.\\d+)+)\\.zip}i)\n    strategy :xml do |xml, regex|\n      # NOTE: The macOS identifier will need to be manually updated when\n      # releases become available for newer macOS versions.\n      url = xml.elements[\"//Component[contains(@ID,'mac_15')]\"]&.text&.strip\n      next if url.blank?\n\n      merged_headers = Homebrew::Livecheck::Strategy.page_headers(url).reduce(&:merge)\n\n      match = merged_headers[\"location\"]&.match(regex)\n      next if match.blank?\n\n      \"#{match[3]},#{match[2]},#{match[1]}\"\n    end\n  end\n\n  auto_updates true\n  depends_on :macos\n\n  pkg \"EU3Installer-M#{version.csv.first}/EU3Installer-M#{version.csv.first}.pkg\"\n\n  uninstall pkgutil: [\n    \"com.canon.EOS-Lens-Registration-Tool\",\n    \"com.canon.EOS-Network-Setting-Tool\",\n    \"com.canon.EOS-Utility\",\n    \"com.canon.EOS-Utility-3\",\n    \"com.canon.EOS-Web-Service-Registration-Tool\",\n    \"jp.co.canon.ic.CameraSurveyProgram\",\n  ]\n\n  zap trash: [\n    \"~/Library/Caches/com.canon.EOS-Lens-Registration-Tool\",\n    \"~/Library/Caches/com.canon.UpdateChecker\",\n    \"~/Library/Preferences/com.canon.EOS Utility 2.plist\",\n    \"~/Library/Preferences/com.canon.EOS-Utility-3.plist\",\n    \"~/Library/Preferences/com.canon.EOS-Utility.plist\",\n    \"~/Library/Preferences/jp.co.canon.ic.camerasurveyprogram.plist\",\n  ]\nend\n",
+    );
+    let XmlShape::HeaderHop { path, header, .. } = &spec.xml_block.as_ref().unwrap().shape else {
+        panic!("canon shape");
+    };
+    assert_eq!(header, "location");
+    assert_eq!(
+        path.steps[0].pred,
+        Some(XmlPred::AttrContains(
+            "ID".to_string(),
+            "mac_15".to_string()
+        ))
+    );
+    let spec = parse(
+        "cask \"turbotax-2024\" do\n  version \"2024.000.0193,D66513534AF33728FE66809C667F9565\"\n  sha256 \"e8d7ba016efe2e654fc4cdb27d0102b96e3c670ef3c339fbbb5ecb454c9defb3\"\n\n  url \"https://downloadpatch.esd.intuit.com/ESD/Files/CTG/comp/#{version.csv.second}/v1/Content/Mac_TurboTax_Download2024.dmg\"\n  name \"TurboTax 2024\"\n  desc \"Tax declaration for the fiscal year 2024\"\n  homepage \"https://turbotax.intuit.com/personal-taxes/cd-download/\"\n\n  livecheck do\n    url \"https://downloadpatch.esd.intuit.com/requestadapter/ctg/comp/2024/turbotaxpersonal/mcusi0000pp00/mac/deliverytarget_live.xml\"\n    regex(%r{/ESD/Files/CTG/comp/([^/]+)/}i)\n    strategy :xml do |xml, regex|\n      latest_package_info =\n        xml.get_elements(\"//DeliveryPackages/CoreDeliveryPackageInfo\")\n           .max_by { |item| item.elements[\"InternalName\"]&.text }\n      next unless latest_package_info\n\n      version = latest_package_info.elements[\"InternalName\"]&.text&.[](/v?(\\d+(?:\\.\\d+)+)/i, 1)\n      latest_xml_url = latest_package_info.elements[\"BaseUri\"]&.text&.strip\n      next if !version || !latest_xml_url\n\n      latest_xml_page = Homebrew::Livecheck::Strategy.page_content(latest_xml_url)\n      next if (latest_xml_content = latest_xml_page[:content]).blank?\n\n      latest_xml = Homebrew::Livecheck::Strategy::Xml.parse_xml(latest_xml_content)\n      latest_url = latest_xml.elements[\"//DeliveryPackageData/FileContent/ContentNetworkBaseUri\"]&.text&.strip\n      match = latest_url&.match(regex)\n      next if match.blank?\n\n      \"#{version},#{match[1]}\"\n    end\n  end\n\n  auto_updates true\n  depends_on macos: :ventura\n\n  app \"TurboTax 2024.app\"\n\n  uninstall quit: \"com.intuit.turbotax.2024\"\n\n  zap trash: [\n    \"~/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments/com.intuit.turbotax.2024.sfl*\",\n    \"~/Library/Application Support/TurboTax 2024\",\n    \"~/Library/Caches/com.intuit.turbotax.2024\",\n    \"~/Library/Caches/KSCrash/TurboTax\",\n    \"~/Library/Caches/TurboTax 2024\",\n    \"~/Library/HTTPStorages/com.intuit.turbotax.2024\",\n    \"~/Library/HTTPStorages/com.intuit.turbotax.2024.binarycookies\",\n    \"~/Library/Logs/com.intuit.turbotax.2024*.log\",\n    \"~/Library/Preferences/com.intuit.turbotax.2024.plist\",\n    \"~/Library/WebKit/com.intuit.turbotax.2024\",\n  ]\n\n  caveats do\n    requires_rosetta\n  end\nend\n",
+    );
+    let XmlShape::HopMatch {
+        max_child,
+        version_child,
+        url_child,
+        ..
+    } = &spec.xml_block.as_ref().unwrap().shape
+    else {
+        panic!("turbotax shape");
+    };
+    assert_eq!(max_child, "InternalName");
+    assert_eq!(version_child, "InternalName");
+    assert_eq!(url_child, "BaseUri");
+}
+
+/// r487 fixtures: plistedit-pro's find + literal
+/// match, soundsource@test's blank-match own fork,
+/// moom's dotless fork, and commander's patch-bucket
+/// throttle reduce to data.
+#[test]
+fn r487_sparkle_litmatch_blankown_dotless_throttle() {
+    use crate::abrew::formula::SpExpr;
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    let block = parse("cask \"plistedit-pro\" do\n  version \"1.10.0\"\n  sha256 \"0ad2f7a4066945b5a67db0667e946748cc4f33858f786554779c54f1a6608c4e\"\n\n  url \"https://www.fatcatsoftware.com/plisteditpro/downloads/PlistEditPro_#{version.no_dots}.zip\"\n  name \"PlistEdit Pro\"\n  desc \"Property list and JSON editor\"\n  homepage \"https://www.fatcatsoftware.com/plisteditpro/\"\n\n  # The Sparkle feed can contain items on the \"beta\" channel, so we restrict\n  # matching to the default channel.\n  livecheck do\n    url \"https://www.fatcatsoftware.com/plisteditpro/downloads/appcast.xml\"\n    strategy :sparkle do |items|\n      newest_item = items.find { |item| item.channel.nil? }&.short_version\n      match = newest_item&.match(/v?(\\d+\\.\\d+)((?:\\.\\d+)*)/i)\n      next if match.blank?\n\n      # The dotless version in the file name uses major/minor/patch but the\n      # appcast `shortVersionString` may omit patch for new major/minor\n      # versions (e.g. 1100 and 1.10 respectively). This adds `.0` to versions\n      # without a patch to avoid this mismatch.\n      \"#{match[1]}#{match[2].presence || \".0\"}\"\n    end\n  end\n\n  auto_updates true\n  depends_on macos: :sonoma\n\n  app \"PlistEdit Pro.app\"\n  binary \"#{appdir}/PlistEdit Pro.app/Contents/MacOS/pledit\"\n\n  zap trash: [\n    \"~/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments/com.fatcatsoftware.pledpro.sfl*\",\n    \"~/Library/Application Support/com.fatcatsoftware.pledpro\",\n    \"~/Library/Application Support/PlistEdit Pro\",\n    \"~/Library/Caches/com.apple.helpd/Generated/com.fatcatsoftware.pledpro.help*\",\n    \"~/Library/Caches/com.fatcatsoftware.pledpro\",\n    \"~/Library/Preferences/com.fatcatsoftware.pledpro.plist\",\n  ]\nend\n").sparkle_block.unwrap();
+    assert!(matches!(block.expr, SpExpr::LitMatch { .. }));
+    let appcast = r#"<rss><channel><item><enclosure url="https://e/a.dmg" sparkle:shortVersionString="1.10" sparkle:version="1100"/></item></channel></rss>"#;
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, None, "1.9"),
+        vec!["1.10.0"]
+    );
+    let appcast = r#"<rss><channel><item><enclosure url="https://e/a.dmg" sparkle:shortVersionString="1.9.3" sparkle:version="193"/></item></channel></rss>"#;
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, None, "1.9"),
+        vec!["1.9.3"]
+    );
+    let block = parse("cask \"soundsource@test\" do\n  version \"6.2.0,0,20261112,0933,6208000\"\n  sha256 \"e0d63ca156d1606127b2cda84e6a47702830859712b48ccce5395172c00663bf\"\n\n  url \"https://download.rogueamoeba.com/builds/SoundSource/SoundSource_#{version.csv.fifth}_#{version.csv.third}_#{version.csv.fourth}.zip\"\n  name \"SoundSource\"\n  desc \"Sound and audio controller\"\n  homepage \"https://rogueamoeba.com/soundsource/\"\n\n  # The livecheck uses a hard-coded system version number in the url that corresponds to the latest macOS version\n  livecheck do\n    url \"https://rogueamoeba.net/ping/versionCheck.cgi?format=sparkle&bundleid=com.rogueamoeba.soundsource&system=270&platform=osx&arch=arm64&version=#{version.csv.fifth}&wantsTestReleases=true\"\n    regex(/SoundSource[._-]v?(\\h+)[._-](\\d+)[._-](\\d+)\\.zip/i)\n    strategy :sparkle do |item, regex|\n      match = item.url&.match(regex)\n      if match.blank?\n        # Release items link to an unversioned download instead of the build\n        next version if item.version == version.csv.first\n\n        next item.version\n      end\n\n      \"#{item.version.sub(\"fc\", \",\")},#{match[2]},#{match[3]},#{match[1]}\"\n    end\n  end\n\n  auto_updates true\n  conflicts_with cask: \"soundsource\"\n  depends_on macos: :sequoia\n\n  app \"SoundSource.app\"\n\n  uninstall quit: \"com.rogueamoeba.soundsource\"\n\n  zap trash: [\n    \"~/Library/Application Support/SoundSource\",\n    \"~/Library/Caches/com.rogueamoeba.soundsource\",\n    \"~/Library/HTTPStorages/com.rogueamoeba.soundsource\",\n    \"~/Library/Preferences/com.rogueamoeba.soundsource.plist\",\n    \"~/Library/WebKit/com.rogueamoeba.soundsource\",\n  ]\nend\n").sparkle_block.unwrap();
+    assert!(matches!(block.expr, SpExpr::BlankOwnElse { .. }));
+    let re = lc_regex(r"SoundSource[._-]v?(\h+)[._-](\d+)[._-](\d+)\.zip", "i").unwrap();
+    let appcast = r#"<rss><channel><item><enclosure url="https://e/SoundSource.zip" sparkle:version="1.0"/></item></channel></rss>"#;
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, Some(&re), "1.0,9"),
+        vec!["1.0,9"]
+    );
+    let appcast = r#"<rss><channel><item><enclosure url="https://e/SoundSource.zip" sparkle:version="2.0"/></item></channel></rss>"#;
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, Some(&re), "1.0,9"),
+        vec!["2.0"]
+    );
+    let appcast = r#"<rss><channel><item><enclosure url="https://e/SoundSource-abc123-45-67.zip" sparkle:version="2.0fc3"/></item></channel></rss>"#;
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, Some(&re), "1.0,9"),
+        vec!["2.0,3,45,67,abc123"]
+    );
+    let block = parse("cask \"moom\" do\n  version \"4.6.0\"\n  sha256 \"45217254124fce56c48c84687c9abf78507e84e2df4a860ad3801433357b87e9\"\n\n  url \"https://manytricks.com/download/_do_not_hotlink_/moom#{version.no_dots}.dmg\"\n  name \"Moom\"\n  desc \"Utility to move and zoom windows—on one display\"\n  homepage \"https://manytricks.com/moom/\"\n\n  # Upstream has published releases where the version in the filename differs\n  # from the Sparkle shortVersion (e.g. moom400.dmg for 4.0), so we have to\n  # account for this mismatch.\n  livecheck do\n    url \"https://manytricks.com/moom/appcast/\"\n    regex(/moom[._-]?v?(\\d+(?:\\.\\d+)*)\\.dmg/i)\n    strategy :sparkle do |item, regex|\n      dotless_short_version = item.short_version.tr(\".\", \"\")\n      next if dotless_short_version.blank?\n\n      file_version = item.url[regex, 1]&.tr(\".\", \"\")\n      next if file_version.blank?\n\n      if dotless_short_version == file_version\n        item.short_version\n      elsif dotless_short_version.length < file_version.length\n        # Naively add extra digits from the dotless file version to the end of\n        # the shortVersion\n        \"#{item.short_version}.#{file_version.delete_prefix(dotless_short_version)}\"\n      else\n        # TODO: Account for a filename version with fewer digits than the\n        # shortVersion if/when necessary in the future\n        next\n      end\n    end\n  end\n\n  auto_updates true\n  depends_on :macos\n\n  app \"Moom.app\"\n\n  zap trash: [\n    \"~/Library/Application Support/Many Tricks\",\n    \"~/Library/Preferences/com.manytricks.Moom.plist\",\n  ]\nend\n").sparkle_block.unwrap();
+    assert!(matches!(block.expr, SpExpr::DotlessFork { .. }));
+    let re = lc_regex(r"moom[._-]?v?(\d+(?:\.\d+)*)\.dmg", "i").unwrap();
+    let appcast = r#"<rss><channel><item><enclosure url="https://e/moom431.dmg" sparkle:shortVersionString="4.3"/></item></channel></rss>"#;
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, Some(&re), "4.2"),
+        vec!["4.3.1"]
+    );
+    let appcast = r#"<rss><channel><item><enclosure url="https://e/moom431.dmg" sparkle:shortVersionString="4.3.1"/></item></channel></rss>"#;
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, Some(&re), "4.2"),
+        vec!["4.3.1"]
+    );
+    let appcast = r#"<rss><channel><item><enclosure url="https://e/moom43.dmg" sparkle:shortVersionString="4.3.1"/></item></channel></rss>"#;
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, Some(&re), "4.2"),
+        Vec::<String>::new()
+    );
+    let block = parse("cask \"commander\" do\n  version \"0.7.1055\"\n  sha256 \"66ce8aa7fa4b6e82ee6413fe76a32ec121f90396433eb3f71ffa566360f133e7\"\n\n  url \"https://download.thecommander.app/release/Commander-#{version}.zip\"\n  name \"Commander\"\n  desc \"AI agent operator\"\n  homepage \"https://thecommander.app/\"\n\n  # Upstream typically creates several releases per day and there isn't always\n  # a release for every version increase. This manually throttles versions to\n  # one in every five versions (not releases), aiming for roughly one update per\n  # day. This may need to be adjusted if the release cadence changes.\n  livecheck do\n    url \"https://softwareupdate.thecommander.app/appcast/commanderai-appcast.xml\"\n    strategy :sparkle do |items|\n      versions = items.filter_map do |item|\n        short_version = item.short_version\n        next unless short_version\n\n        Version.new(short_version)\n      end.uniq.sort\n\n      throttled_patch = nil\n      versions.map do |short_version|\n        patch = short_version.patch.to_i\n        cur_throttled_patch = patch - (patch % 5)\n        next if cur_throttled_patch == throttled_patch\n\n        throttled_patch = cur_throttled_patch\n        short_version\n      end\n    end\n  end\n\n  auto_updates true\n  depends_on macos: :sequoia\n\n  app \"Commander.app\"\n\n  zap trash: [\n    \"~/Library/Application Support/Commander\",\n    \"~/Library/Caches/Commander\",\n    \"~/Library/Commander\",\n    \"~/Library/Preferences/com.krzyzanowskim.Commander.plist\",\n  ]\nend\n").sparkle_block.unwrap();
+    assert!(matches!(block.expr, SpExpr::ThrottleUniq { .. }));
+    let appcast = r#"<rss><channel><item><enclosure url="https://e/a.dmg" sparkle:shortVersionString="1.0.11"/></item><item><enclosure url="https://e/a.dmg" sparkle:shortVersionString="1.0.3"/></item><item><enclosure url="https://e/a.dmg" sparkle:shortVersionString="1.0.6"/></item><item><enclosure url="https://e/a.dmg" sparkle:shortVersionString="1.0.6"/></item><item><enclosure url="https://e/a.dmg" sparkle:shortVersionString="1.0.1"/></item></channel></rss>"#;
+    assert_eq!(
+        sparkle_block_versions(appcast, &block, None, "1.0.0"),
+        vec!["1.0.1", "1.0.6", "1.0.11"]
+    );
+}
+
+/// r486 fixtures: adobe's JSON-in-XML text,
+/// silentknight's own-major XPath predicate, and
+/// endnote's own-version map fork reduce to data.
+#[test]
+fn r486_xml_embed_predinterp_ownfork() {
+    use crate::abrew::formula::{XmlPred, XmlShape};
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    let spec = parse(
+        "cask \"adobe-creative-cloud\" do\n  arch arm: \"macarm64\", intel: \"osx10\"\n\n  version \"6.11.0.478.6\"\n  sha256 arm:   \"724c1e76ff4886cb135988d1bf46d28bf33e784840e9b160b3c6932cac62c541\",\n         intel: \"addca3ba7819bb0fdbe1394b8d0ff6a2614e599ded91a3ba5839672c996ec750\"\n\n  # If url breaks you can find the latest static urls - https://helpx.adobe.com/download-install/kb/creative-cloud-desktop-app-download.html\n  url \"https://ccmdls.adobe.com/AdobeProducts/StandaloneBuilds/ACCC/ESD/#{version.major_minor_patch}/#{version.split(\".\")[3..4].join(\".\")}/#{arch}/ACCCx#{version.dots_to_underscores}.dmg\"\n  name \"Adobe Creative Cloud\"\n  desc \"Collection of apps and services for photography, design, video, web, and UX\"\n  homepage \"https://www.adobe.com/creativecloud.html\"\n\n  livecheck do\n    url \"https://ffc-static-cdn.oobesaas.adobe.com/features/v3/#{arch}/ccdConfig.xml\"\n    strategy :xml do |xml|\n      item = xml.elements[\"//feature-entry[@id='ccd.fw.update.greenline.latest']/data\"]&.text&.strip\n      next if item.blank?\n\n      json = Homebrew::Livecheck::Strategy::Json.parse_json(item)\n      json[\"version\"]\n    end\n  end\n\n  auto_updates true\n  depends_on :macos\n\n  installer script: {\n    executable:   \"#{staged_path}/Install.app/Contents/MacOS/Install\",\n    args:         [\"--mode=silent\"],\n    sudo:         true,\n    print_stderr: false,\n  }\n\n  uninstall early_script: {\n              executable:   \"/usr/bin/pluginkit\",\n              args:         [\n                \"-r\", \"/Applications/Utilities/Adobe Sync/CoreSync/Core Sync.app/Contents/PlugIns/ACCFinderSync.appex\"\n              ],\n              must_succeed: false,\n              print_stderr: false,\n            },\n            launchctl:    [\n              \"Adobe_Genuine_Software_Integrity_Service\",\n              \"com.adobe.acc.installer\",\n              \"com.adobe.acc.installer.v2\",\n              \"com.adobe.AdobeCreativeCloud\",\n              \"com.adobe.AdobeDesktopService\",\n              \"com.adobe.ccxprocess\",\n              \"com.adobe.CCXProcess.*\",\n            ],\n            quit:         \"com.adobe.acc.AdobeCreativeCloud\",\n            signal:       [\"QUIT\", \"com.adobe.accmac\"],\n            script:       {\n              executable:   \"/usr/bin/pkill\",\n              args:         [\"Adobe Desktop Service\", \"AdobeIPCBroker\", \"AdobeCRDaemon\"],\n              must_succeed: false,\n            },\n            delete:       [\n              \"#{appdir}/Adobe Creative Cloud/*Adobe Creative Cloud\",\n              \"#{appdir}/Adobe Creative Cloud/.Uninstall*\",\n              \"#{appdir}/Adobe Creative Cloud/Icon?\",\n              \"/Applications/Utilities/Adobe Application Manager\",\n              \"/Applications/Utilities/Adobe Creative Cloud*\",\n              \"/Applications/Utilities/Adobe Installers/.Uninstall*\",\n              \"/Applications/Utilities/Adobe Installers/Uninstall Adobe Creative Cloud\",\n              \"/Applications/Utilities/Adobe Sync\",\n              \"/Library/Internet Plug-Ins/AdobeAAMDetect.plugin\",\n              \"/Library/LaunchDaemons/com.adobe.agsservice.plist\",\n            ],\n            rmdir:        [\n              \"#{appdir}/Adobe Creative Cloud\",\n              \"/Applications/Utilities/Adobe Installers\",\n              \"/Library/*/Adobe\",\n              \"/Library/Application Support/Adobe\",\n              \"/Library/Application Support/Adobe{/CEP{/extensions,},}\",\n              \"/Library/Logs/Adobe\",\n            ]\n\n  zap trash: [\n        \"/Library/*/com.adobe.acc*\",\n        \"/Library/Application Support/Adobe/ADCRefs\",\n        \"/Library/Application Support/Adobe/Adobe Desktop Common\",\n        \"/Library/Application Support/Adobe/*[Ii]nstall*\",\n        \"/Library/Application Support/Adobe/Adobe PCD\",\n        \"/Library/Application Support/Adobe/AdobeApplicationManager\",\n        \"/Library/Application Support/Adobe/AdobeGC*\",\n        \"/Library/Application Support/Adobe/caps\",\n        \"/Library/Application Support/Adobe/CEP/extensions/CC_*\",\n        \"/Library/Application Support/Adobe/CEP/extensions/com.adobe.ccx.*\",\n        \"/Library/Application Support/Adobe/Creative Cloud Libraries\",\n        \"/Library/Application Support/Adobe/Extension Manager CC\",\n        \"/Library/Application Support/Adobe/OOBE\",\n        \"/Library/Application Support/Adobe/PCF\",\n        \"/Library/Application Support/Adobe/SL*\",\n        \"/Library/Application Support/Adobe/Vulcan\",\n        \"/Library/Application Support/regid.*.com.adobe\",\n        \"/Library/Logs/CreativeCloud\",\n        \"/Library/Preferences/com.adobe.headlights*.plist\",\n        \"/Users//Shared/Adobe/Installer\",\n        \"/Users//Shared/Adobe/OOBE\",\n        \"~/Creative Cloud Files\",\n        \"~/Creative Cloud Files/Icon?\",\n        \"~/Library/*/Adobe/CoreSync\",\n        \"~/Library/*/com.adobe.acc*\",\n        \"~/Library/Application Scripts/com.adobe.accmac.ACCFinderSync\",\n        \"~/Library/Application Support/Adobe/.adobelicnotification\",\n        \"~/Library/Application Support/Adobe/AAMUpdater\",\n        \"~/Library/Application Support/Adobe/ExtensibilityLibrary\",\n        \"~/Library/Application Support/Adobe/Extension Manager CC\",\n        \"~/Library/Application Support/Adobe/FloodGate\",\n        \"~/Library/Application Support/Adobe/OOBE\",\n        \"~/Library/Application Support/CrashReporter/AdobeCRDaemon_*.plist\",\n        \"~/Library/Group Containers/Adobe-Hub-App\",\n        \"~/Library/LaunchAgents/com.adobe.ccxprocess.plist\",\n        \"~/Library/Logs/ACC*.log\",\n        \"~/Library/Logs/AdobeDownload.log\",\n        \"~/Library/Logs/AdobeIPCBroker*.log\",\n        \"~/Library/Logs/CoreSyncInstall.log\",\n        \"~/Library/Logs/CreativeCloud\",\n        \"~/Library/Logs/PDApp*.log\",\n        \"~/Library/Preferences/Adobe/.[A-Z0-9]???????????\",\n        \"~/Library/Preferences/com.adobe.crashreporter.plist\",\n      ],\n      rmdir: [\n        \"/Users//Shared/Adobe\",\n        \"~/Creative Cloud Files\",\n        \"~/Library/*/Adobe\",\n        \"~/Library/Application Support/Adobe\",\n        \"~/Library/Logs/Adobe\",\n      ]\nend\n",
+    );
+    let XmlShape::TextJsonKey { path, key } = &spec.xml_block.as_ref().unwrap().shape else {
+        panic!("adobe shape");
+    };
+    assert_eq!(key, "version");
+    assert_eq!(
+        xml_text_json_versions(
+            path,
+            key,
+            "<features><feature-entry id=\"ccd.fw.update.greenline.latest\"><data>{\"version\":\"6.9.0\"}</data></feature-entry></features>",
+        )
+        .unwrap(),
+        vec!["6.9.0"]
+    );
+    let mut block = parse("cask \"silentknight\" do\n  version \"3.02,2026.07\"\n  sha256 \"41be69cccdcedb325edbe825b86bdea24b1bcfbbcde8bea9e57e7a82326ea157\"\n\n  # Upstream zero-pads the minor version in the no-dot filename version to two\n  # digits (e.g. 2.9 is 209). We only need this workaround while the minor\n  # version is less than two digits, so we should be able to switch back to\n  # `version.csv.first.no_dots` in the filename with version 2.10+.`\n  no_dot_version = version.csv.first.split(\".\").each_with_index.map do |n, i|\n    (i < 1 || n.length > 1) ? n : n.rjust(2, \"0\")\n  end.join\n\n  url \"https://eclecticlight.co/wp-content/uploads/#{version.csv.second.major}/#{version.csv.second.minor}/sk#{no_dot_version}.zip\"\n  name \"SilentKnight\"\n  desc \"Automatically checks computer's security\"\n  homepage \"https://eclecticlight.co/lockrattler-systhist/\"\n\n  livecheck do\n    url \"https://raw.githubusercontent.com/hoakleyelc/updates/master/eclecticapps.plist\"\n    regex(%r{/(\\d+)/(\\d+)/[^/]+?$}i)\n    strategy :xml do |xml, regex|\n      item = xml.elements[\"//dict[key[text()='AppName']/following-sibling::*[1][text()='SilentKnight#{version.major}']]\"]\n      next unless item\n\n      version = item.elements[\"key[text()='Version']\"]&.next_element&.text\n      url = item.elements[\"key[text()='URL']\"]&.next_element&.text\n      match = url.strip.match(regex) if url\n      next if version.blank? || match.blank?\n\n      \"#{version.strip},#{match[1]}.#{match[2]}\"\n    end\n  end\n\n  depends_on arch: :arm64\n  depends_on macos: :sequoia\n\n  app \"sk#{no_dot_version}/SilentKnight#{version.major}.app\"\n\n  zap trash: [\n    \"~/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments/co.eclecticlight.silentknight.sfl*\",\n    \"~/Library/Caches/co.eclecticlight.SilentKnight\",\n    \"~/Library/Caches/co.eclecticlight.SilentKnight#{version.major}\",\n    \"~/Library/HTTPStorages/co.eclecticlight.SilentKnight\",\n    \"~/Library/HTTPStorages/co.eclecticlight.SilentKnight#{version.major}\",\n    \"~/Library/Preferences/co.eclecticlight.SilentKnight#{version.major}.plist\",\n    \"~/Library/Preferences/co.eclecticlight.SilentKnight.plist\",\n    \"~/Library/Saved Application State/co.eclecticlight.SilentKnight.savedState\",\n  ]\nend\n").xml_block.unwrap();
+    let XmlShape::Template(tmpl) = &block.shape else {
+        panic!("silentknight shape");
+    };
+    let pred_text = |t: &crate::abrew::formula::XmlTemplate| match &t.elems[0].path.steps[0].pred {
+        Some(XmlPred::SiblingAfterChild { text, .. }) => text.clone(),
+        other => panic!("pred {other:?}"),
+    };
+    assert_eq!(pred_text(tmpl), "SilentKnight#{version.major}");
+    xml_block_substitute_versions(&mut block, "3.02,2026.07", true).unwrap();
+    let XmlShape::Template(tmpl) = &block.shape else {
+        unreachable!()
+    };
+    assert_eq!(pred_text(tmpl), "SilentKnight3");
+    let spec = parse(
+        "cask \"endnote\" do\n  # The second part of the `version` is the product version (e.g. X9, 2025).\n  # Until we can identify this using livecheck, we will need to manually find\n  # the new product version on each major version update. See:\n  # https://support.clarivate.com/Endnote/s/article/Download-EndNote\n  version \"22.3.0.22265,2025\"\n  sha256 :no_check # required as upstream package is updated in-place\n\n  url \"https://download.endnote.com/downloads/#{version.csv.second}/EndNote#{version.csv.second}Installer.dmg\"\n  name \"EndNote\"\n  desc \"Reference manager\"\n  homepage \"https://endnote.com/\"\n\n  # The XML file doesn't provide any update information for new major versions\n  # (e.g. 22.0.0.0) until a subsequent version is released. The check will fail\n  # when the cask is updated to a new major version but it should automatically\n  # work again when the next version is released (i.e. livecheck will need to\n  # be skipped on CI for major version updates).\n  livecheck do\n    url \"https://download.endnote.com/updates/#{version.csv.first.major}.0/EN#{version.csv.first.major}MacUpdates.xml\"\n    regex(/^v?(\\d+(?:\\.\\d+)+)$/i)\n    strategy :xml do |xml, regex|\n      current_major = version.csv.first.major\n      current_product_version = version.csv.second\n\n      xml.get_elements(\"//updates/build\").map do |item|\n        update_to = item.elements[\"updateTo\"]&.text&.strip\n        match = update_to.match(regex) if update_to\n        next if match.blank?\n\n        major = match[1][/^(\\d+)/, 1]\n        if major == current_major && current_product_version\n          \"#{match[1]},#{current_product_version}\"\n        else\n          # This does not add the current product version to any versions in\n          # the upstream XML file that don't use the current major. This is\n          # intended to ensure that a major version update won't work until\n          # someone manually identifies the new product version (e.g. X9, 2025)\n          # and adds it as the second part of the cask `version` (e.g.\n          # `22.0.0.0,2025`). This `strategy` block setup can be reworked\n          # if/when upstream provides a way of identifying product versions\n          # that can be reliably checked by livecheck.\n          match[1]\n        end\n      end\n    end\n  end\n\n  depends_on :macos\n  container nested: \"Install EndNote #{version.csv.second}.app/Contents/Resources/EndNote.zip\"\n\n  suite \"EndNote\"\n\n  zap trash: [\n    \"/Library/Application Support/ResearchSoft/EndNote\",\n    \"~/Library/Application Support/EndNote\",\n    \"~/Library/Caches/com.ThomsonResearchSoft.EndNote\",\n    \"~/Library/Cookies/com.ThomsonResearchSoft.EndNote.binarycookies\",\n    \"~/Library/HTTPStorages/com.ThomsonResearchSoft.EndNote\",\n    \"~/Library/HTTPStorages/com.ThomsonResearchSoft.EndNote.binarycookies\",\n    \"~/Library/Preferences/com.ThomsonResearchSoft.EndNote.plist\",\n    \"~/Library/Preferences/com.ThomsonReuters.EndNoteCustomizer.plist\",\n    \"~/Library/Services/ENService.app\",\n    \"~/Library/Spotlight/EndNote.mdimporter\",\n    \"~/Library/WebKit/com.ThomsonResearchSoft.EndNote\",\n  ]\nend\n",
+    );
+    let XmlShape::ChildMatchOwnFork { path, child } = &spec.xml_block.as_ref().unwrap().shape
+    else {
+        panic!("endnote shape");
+    };
+    assert_eq!(child, "updateTo");
+    let rp = RunPlan {
+        strat: Strat::Xml,
+        url: String::new(),
+        re: Some(lc_regex(r"^v?(\d+(?:\.\d+)+)$", "i").unwrap()),
+        candidates: Vec::new(),
+        strategy_url: None,
+        ua: None,
+        ua_option: None,
+        ua_symbol: false,
+        gnome_filter: false,
+        json: None,
+        xml: None,
+        yaml: None,
+        page_block: None,
+        ghrel_block: None,
+        git: None,
+        sparkle_block: None,
+        header_block: None,
+        latest: None,
+        post_form: None,
+        post_json: None,
+        headers: Vec::new(),
+        major_minor: String::new(),
+        own_version: "22.0.0.0,2025".to_string(),
+        plist: None,
+        apps: Vec::new(),
+        uncompressed: false,
+    };
+    assert_eq!(
+        xml_own_fork_versions(
+            path,
+            child,
+            "<updates><build><updateTo>22.1.0</updateTo></build><build><updateTo>23.0.0</updateTo></build></updates>",
+            &rp,
+        )
+        .unwrap(),
+        vec!["22.1.0,2025", "23.0.0"]
+    );
+    // The agreement gate's file URLs: adobe's
+    // split-range join and silentknight's indexed
+    // zero-pad local interpolate natively.
+    assert_eq!(
+        crate::abrew::formula::cask_version_token(
+            "6.11.0.478.6",
+            "version.split(\".\")[3..4].join(\".\")",
+        )
+        .as_deref(),
+        Some("478.6")
+    );
+    let c = crate::abrew::tap::parse_cask_rb_as_data(
+        "cask \"x\" do\n  version \"3.2,2026.07\"\n  no_dot_version = version.csv.first.split(\".\").each_with_index.map do |n, i|\n    (i < 1 || n.length > 1) ? n : n.rjust(2, \"0\")\n  end.join\n  url \"https://e/sk#{no_dot_version}.zip\"\nend\n",
+        "x",
+    );
+    assert_eq!(c.url, "https://e/sk302.zip");
+}
+
+/// r485 fixtures: konica's any-match OS guard and
+/// split-rows dmg MD5 reduce to data.
+#[test]
+fn r485_json_konica_split_rows_md5() {
+    use crate::abrew::formula::JsonShape;
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    assert!(matches!(parse("  livecheck do\n    url \"https://dl.konicaminolta.eu/en?tx_kmdownloadcenter_dlajaxservice[action]=getDocuments&tx_kmdownloadcenter_dlajaxservice[controller]=AjaxService&tx_kmdownloadcenter_dlajaxservice[productId]=102314&tx_kmdownloadcenter_dlajaxservice[system]=KonicaMinolta&cHash=dd72618a38434b6cb3edfc20595d58c5&type=1527583889\"\n    strategy :json do |json|\n      json.map do |item|\n        next if item[\"TypeOfApplicationId_textS\"] != \"1\"\n        next unless item[\"OperatingSystemsNames_textM\"]&.any? { |os| os =~ /macOS/i }\n\n        version = item[\"Version_textS\"]\n        document_id = item[\"AnacondaId_textS\"]\n        next if version.blank? || document_id.blank?\n\n        files = item[\"DownloadFiles_textS\"]&.split(\"\\n\")&.map { |file| file.split(\"|\") }\n        dmg_file = files.find { |file| file.first.end_with?(\".dmg\") } if files\n        next if dmg_file.blank?\n\n        \"#{version},#{Digest::MD5.hexdigest(dmg_file[2])},#{document_id}\"\n      end\n    end\n  end\n").json_block.unwrap().shape, JsonShape::Template(..)));
+    assert!(matches!(parse("  livecheck do\n    url \"https://dl.konicaminolta.eu/en?tx_kmdownloadcenter_dlajaxservice[action]=getDocuments&tx_kmdownloadcenter_dlajaxservice[controller]=AjaxService&tx_kmdownloadcenter_dlajaxservice[productId]=103745&tx_kmdownloadcenter_dlajaxservice[system]=KonicaMinolta&cHash=dd72618a38434b6cb3edfc20595d58c5&type=1527583889\"\n    strategy :json do |json|\n      json.map do |item|\n        next if item[\"TypeOfApplicationId_textS\"] != \"1\"\n        next unless item[\"OperatingSystemsNames_textM\"]&.any? { |os| os =~ /macOS/i }\n\n        version = item[\"Version_textS\"]\n        document_id = item[\"AnacondaId_textS\"]\n        next if version.blank? || document_id.blank?\n\n        files = item[\"DownloadFiles_textS\"]&.split(\"\\n\")&.map { |file| file.split(\"|\") }\n        dmg_file = files.find { |file| file.first.end_with?(\".dmg\") } if files\n        next if dmg_file.blank?\n\n        \"#{version},#{Digest::MD5.hexdigest(dmg_file[2])},#{document_id}\"\n      end\n    end\n  end\n").json_block.unwrap().shape, JsonShape::Template(..)));
+    assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+    assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+    assert_eq!(
+        md5_hex(b"The quick brown fox jumps over the lazy dog"),
+        "9e107d9d372bb6826bd81d3542a419d6"
+    );
+}
+
+/// r484 fixtures: gimp's nested release/build map
+/// with an outer-version fallback reduces to data.
+#[test]
+fn r484_json_nested_template_gimp() {
+    use crate::abrew::formula::JsonShape;
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    assert!(matches!(parse("cask \"gimp\" do\n  arch arm: on_system_conditional(macos: \"arm64\", linux: \"aarch64\"), intel: \"x86_64\"\n  os macos: \"macos\", linux: \"linux\"\n  livecheck_os = on_system_conditional macos: \"macos\", linux: \"appimage\"\n  name_start = on_system_conditional macos: \"gimp\", linux: \"GIMP\"\n  url_end = on_system_conditional macos: \"dmg\", linux: \"AppImage\"\n\n  version \"3.2.8\"\n  sha256 arm:          \"06404a375106b7613ba3a14c7d8d9a7cbe18b9b9e2b2050bb72f3162cbcfc395\",\n         intel:        \"7746487985d7143b190692500b58d5317b6ce916a60f8139a76df5eea1e920db\",\n         arm64_linux:  \"3fd61dbc40b760f7806ffc04c29dc0d93021b799b9d0e6977571c4425d0323b0\",\n         x86_64_linux: \"8b43dc23e58a1b66ace9dd6d4d5f7e8532f3398e6109f95a1ec0b6ad036aa250\"\n\n  on_macos do\n    app \"GIMP.app\"\n    command_wrapper \"gimp\", executable: \"#{appdir}/GIMP.app/Contents/MacOS/gimp\"\n\n    zap trash: [\n      \"~/Library/Application Support/Gimp\",\n      \"~/Library/Caches/GIMP\",\n      \"~/Library/Preferences/org.gimp.gimp-#{version.major_minor}.plist\",\n      \"~/Library/Preferences/org.gimp.gimp.plist\",\n      \"~/Library/Saved Application State/org.gimp.gimp-#{version.major_minor}.savedState\",\n    ]\n  end\n  on_linux do\n    app_image \"GIMP-#{version.csv.first}-#{arch}#{\"-#{version.csv.second}\" if version.csv.second}.AppImage\",\n              target: \"GIMP.AppImage\"\n\n    zap trash: \"~/.config/GIMP/#{version.major_minor}\"\n  end\n\n  url \"https://download.gimp.org/gimp/v#{version.major_minor}/#{os}/#{name_start}-#{version.csv.first}-#{arch}#{\"-#{version.csv.second}\" if version.csv.second}.#{url_end}\"\n  name \"GIMP\"\n  name \"GNU Image Manipulation Program\"\n  desc \"Free and open-source image editor\"\n  homepage \"https://www.gimp.org/\"\n\n  livecheck do\n    url \"https://www.gimp.org/gimp_versions.json\"\n    strategy :json do |json|\n      json[\"STABLE\"]&.map do |release|\n        release[livecheck_os]&.map do |build|\n          next unless build[\"filename\"]&.match?(/#{arch}/i)\n          next release[\"version\"] unless build[\"revision\"]\n\n          \"#{release[\"version\"]},#{build[\"revision\"]}\"\n        end\n      end&.flatten\n    end\n  end\n\n  conflicts_with cask: \"gimp@dev\"\nend\n").json_block.unwrap().shape, JsonShape::NestedTemplate { .. }));
+    assert!(matches!(parse("cask \"gimp@dev\" do\n  arch arm: on_system_conditional(macos: \"arm64\", linux: \"aarch64\"), intel: \"x86_64\"\n  os macos: \"macos\", linux: \"linux\"\n  livecheck_os = on_system_conditional macos: \"macos\", linux: \"appimage\"\n  name_start = on_system_conditional macos: \"gimp\", linux: \"GIMP\"\n  url_end = on_system_conditional macos: \"dmg\", linux: \"AppImage\"\n\n  version \"3.2.0-RC3\"\n  sha256 arm:          \"93baffa8e41517b2cb6902176a851a7a473f2957aa3eadfcc38b9dd361fa6601\",\n         intel:        \"3b69163e475f8aee71565f2df8dbc35fde730f18ff6b9fde98b726ff41f2ab32\",\n         arm64_linux:  \"59a97a7a46df7f77a076d4f2b431949f2667be79bb6094babfb7f8bcd86ff7fc\",\n         x86_64_linux: \"3712a67061474c363e0c2ed8f5d26398e2d708cdf6b0778368a514c9d134d88d\"\n\n  on_macos do\n    app \"GIMP.app\"\n    command_wrapper \"gimp\", executable: \"#{appdir}/GIMP.app/Contents/MacOS/gimp\"\n\n    zap trash: [\n      \"~/Library/Application Support/Gimp\",\n      \"~/Library/Preferences/org.gimp.gimp-#{version.major_minor}.plist\",\n      \"~/Library/Saved Application State/org.gimp.gimp-#{version.major_minor}.savedState\",\n    ]\n  end\n  on_linux do\n    app_image \"GIMP-#{version.csv.first}-#{arch}#{\"-#{version.csv.second}\" if version.csv.second}.AppImage\",\n              target: \"GIMP.AppImage\"\n\n    zap trash: \"~/.config/GIMP/#{version.major_minor}\"\n  end\n\n  url \"https://download.gimp.org/gimp/v#{version.major_minor}/#{os}/#{name_start}-#{version.csv.first}-#{arch}#{\"-#{version.csv.second}\" if version.csv.second}.#{url_end}\"\n  name \"GIMP development version\"\n  desc \"Free and open-source image editor\"\n  homepage \"https://www.gimp.org/\"\n\n  livecheck do\n    url \"https://www.gimp.org/gimp_versions.json\"\n    strategy :json do |json|\n      json[\"DEVELOPMENT\"]&.map do |release|\n        release[livecheck_os]&.map do |build|\n          next unless build[\"filename\"]&.match?(/#{arch}/i)\n          next release[\"version\"] unless build[\"revision\"]\n\n          \"#{release[\"version\"]},#{build[\"revision\"]}\"\n        end\n      end&.flatten\n    end\n  end\n\n  conflicts_with cask: \"gimp\"\nend\n").json_block.unwrap().shape, JsonShape::NestedTemplate { .. }));
+}
+
+#[test]
+fn json_nested_template_keeps_truthiness_distinct_from_blankness() {
+    use crate::abrew::formula::{JsonShape, LivecheckUrl};
+
+    let source = |predicate: &str| {
+        format!(
+            r##"  livecheck do
+    url "https://example.invalid/not-fetched.json"
+    strategy :json do |json|
+      json["releases"].map do |release|
+        release["builds"].map do |build|
+          next release["version"] {predicate}
+          "#{{release["version"]}},#{{build["revision"]}}"
+        end
+      end.flatten
+    end
+  end
+"##
+        )
+    };
+    let permitted = source("unless build[\"revision\"]");
+    let spec = crate::abrew::tap::parse_livecheck_block(&permitted).unwrap();
+    assert!(spec.strategy_block);
+    assert!(matches!(
+        spec.json_block.as_ref().unwrap().shape,
+        JsonShape::NestedTemplate { .. }
+    ));
+    let Some(LivecheckUrl::Literal(url)) = &spec.url else {
+        panic!("fixture URL was not parsed as a literal");
+    };
+    let UrlPlan::Run(mut plan) = plan_url(Some(&spec), url, "", "").unwrap() else {
+        panic!("supported nested template did not produce an execution plan");
+    };
+
+    // Exercise page_fetch and the actual evaluator using private local bytes; this does not
+    // establish HTTP URL admission. Ruby treats empty strings, whitespace and zero as truthy.
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = scratch.path().join("releases.json");
+    std::fs::write(
+        &path,
+        br#"{"releases":[
+          {"version":"1","builds":[{"revision":""}]},
+          {"version":"2","builds":[{"revision":null}]},
+          {"version":"3","builds":[{"revision":false}]},
+          {"version":"4","builds":[{}]},
+          {"version":"5","builds":[{"revision":0}]},
+          {"version":"6","builds":[{"revision":" "}]},
+          {"version":"7","builds":[{"revision":2}]}
+        ]}"#,
+    )
+    .unwrap();
+    plan.url = format!("file://{}", path.display());
+    plan.ua = Some(String::new());
+    plan.uncompressed = true;
+    match json_versions(&plan) {
+        Found::Versions(versions, _) => {
+            assert_eq!(versions, ["1,", "2", "3", "4", "5,0", "6, ", "7,2"]);
+        }
+        Found::Messages(messages) => panic!("local JSON evaluation refused: {messages:?}"),
+        Found::Raised(message) => panic!("local JSON evaluation raised: {message}"),
+    }
+
+    // Both blankness spellings differ on the empty/whitespace values above. Without a
+    // predicate in the native shape, the complete block must remain unsupported.
+    for predicate in [
+        "if build[\"revision\"].blank?",
+        "if build[\"revision\"]&.blank?",
+    ] {
+        let text = source(predicate);
+        let spec = crate::abrew::tap::parse_livecheck_block(&text).unwrap();
+        assert!(
+            spec.strategy_block && spec.json_block.is_none(),
+            "{predicate}"
+        );
+        let Some(LivecheckUrl::Literal(url)) = &spec.url else {
+            panic!("fixture URL was not parsed as a literal");
+        };
+        assert!(
+            plan_url(Some(&spec), url, "", "").is_err(),
+            "unsupported predicate must not fall back to an execution plan: {predicate}"
+        );
+        assert!(spec_outside(&Some(spec)), "{predicate}");
+    }
+}
+
+/// r483 fixtures: insta360's find/select/max_by
+/// pipeline with a capture tr and comma-collapsing
+/// gsub reduces to data.
+#[test]
+fn r483_json_find_select_max_by() {
+    use crate::abrew::formula::JsonShape;
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    assert!(matches!(parse("  livecheck do\n    url \"https://openapi.insta360.com/app/appDownload/getGroupApp?group=insta360-go2&X-Language=en-us\"\n    regex(%r{/(\\h+)/Insta360(?:[._-]|%20)?Studio(?:[._-]|%20)v?(\\d+(?:\\.\\d+)+)[._-](.+)\\.(?:pkg|zip)}i)\n    strategy :json do |json, regex|\n      # Find the Insta360 Studio app\n      app = json.dig(\"data\", \"apps\")&.find { |item| item[\"app_id\"] == 38 }\n      next if app.blank?\n\n      # Find the newest macOS version\n      newest_release = app[\"items\"]&.select { |item| item[\"platform\"] == \"mac\" }\n                                   &.max_by { |item| Version.new(item[\"version\"]) }\n      next if newest_release.blank?\n\n      # Find the channel item (there's likely only one object in the array)\n      channel = newest_release[\"channels\"]&.find { |item| item[\"channel\"] == \"official\" }\n      next if channel.blank?\n\n      match = channel[\"download_url\"]&.match(regex)\n      next if match.blank?\n\n      \"#{match[2]},#{match[3].tr(\"()\", \",\")},#{match[1]}\"\n    end\n  end\n").json_block.unwrap().shape, JsonShape::Template(..)));
+    assert!(matches!(parse("  livecheck do\n    url \"https://openapi.insta360.com/app/appDownload/getGroupApp?group=insta360-link&X-Language=en-us\"\n    regex(%r{/(\\h+)/Insta360(?:[._-]|%20)?LinkController(?:[._-]|%20)v?(\\d+(?:\\.\\d+)+)[._-]?(.+?)\\.(?:pkg|zip)}i)\n    strategy :json do |json, regex|\n      # Find the Insta360 Link Controller app\n      app = json.dig(\"data\", \"apps\")&.find { |item| item[\"app_id\"] == 100 }\n      next if app.blank?\n\n      # Find the newest macOS version\n      newest_release = app[\"items\"]&.select { |item| item[\"platform\"] == \"mac\" }\n                                   &.max_by { |item| Version.new(item[\"version\"]) }\n      next if newest_release.blank?\n\n      # Find the channel item (there's likely only one object in the array)\n      channel = newest_release[\"channels\"]&.find { |item| item[\"channel\"] == \"official\" }\n      next if channel.blank?\n\n      match = channel[\"download_url\"]&.match(regex)\n      next unless match\n\n      \"#{match[2]},#{match[3].tr(\"()\", \",\")},#{match[1]}\".gsub(/,{2,}/, \",\")\n    end\n  end\n").json_block.unwrap().shape, JsonShape::Template(..)));
+}
+
+/// r482 fixtures: dosbox's split-length scan fork,
+/// asix-ax88179's split-section scan, and
+/// inkscape's scanned-section match reduce to data.
+#[test]
+fn r482_page_section_scans() {
+    use crate::abrew::formula::PageShape;
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    assert!(matches!(parse("  livecheck do\n    url \"https://sourceforge.net/projects/dosbox/rss?path=/dosbox\"\n    regex(%r{<link>.*/DOSBox-(\\d+(?:[.-]\\d+)*)\\.dmg}i)\n    strategy :page_match do |page, regex|\n      page.scan(regex).map do |matches|\n        versions = matches[0].split(\"-\")\n        version = \"#{versions[0]}-#{versions[1]},#{versions[2]}\" if versions.length == 3\n        version = \"#{versions[0]}-#{versions[1]}\" if versions.length == 2\n        version\n      end\n    end\n  end\n").page_block.unwrap().shape, PageShape::ScanSplitFork { .. }));
+    assert!(matches!(parse("  livecheck do\n    url \"https://www.asix.com.tw/en/support/download/step2/11/2/3\"\n    regex(%r{data-href=.*?/download/file/(\\d+).*?macOS\\s*12.*?(?:<br>)?\\s*?(\\d+(?:\\.\\d+)+)<}mi)\n    strategy :page_match do |page, regex|\n      page.split(/class=['\"]?list__item['\"]?/).map do |list_item|\n        list_item.scan(regex).map { |match| \"#{match[1]},#{match[0]}\" }\n      end.flatten\n    end\n  end\n").page_block.unwrap().shape, PageShape::SplitScan { .. }));
+    assert!(matches!(parse("cask \"inkscape\" do\n  arch arm: \"_arm64\", intel: on_system_conditional(macos: \"_x86_64\")\n  livecheck_folder = on_system_conditional macos: \"mac-os-x\", linux: \"gnulinux/appimage\"\n  url_end = on_system_conditional macos: \"dmg\", linux: \"AppImage\"\n\n  version \"1.4.4\"\n  sha256 arm:          \"eacca94ab01e59467cdd5452a2867c3734450f9a4cfb3346956cc9b07f34f3f1\",\n         intel:        \"17ff9f49b60115237cad9b60605950e26b11b04600e726a4513224aa373aee11\",\n         x86_64_linux: \"d217fe05c92faaed5c3af46856b6299c98933dc722819cb5bc2ca052c5522166\"\n\n  on_macos do\n    app \"Inkscape.app\"\n    command_wrapper \"inkscape\", executable: \"#{appdir}/Inkscape.app/Contents/MacOS/inkscape\"\n\n    zap trash: [\n      \"~/.config/inkscape\",\n      \"~/Library/Application Support/Inkscape\",\n      \"~/Library/Application Support/org.inkscape.Inkscape\",\n      \"~/Library/Caches/org.inkscape.Inkscape*\",\n      \"~/Library/Preferences/org.inkscape.Inkscape.plist\",\n      \"~/Library/Saved Application State/org.inkscape.Inkscape.savedState\",\n    ]\n  end\n  on_linux do\n    depends_on arch: :x86_64\n\n    app_image \"Inkscape-#{version.csv.first}.AppImage\", target: \"Inkscape.AppImage\"\n\n    zap trash: \"~/.config/inkscape\"\n  end\n\n  url \"https://media.inkscape.org/dl/resources/file/Inkscape-#{version.csv.second || version.csv.first}#{arch}.#{url_end}\"\n  name \"Inkscape\"\n  desc \"Vector graphics editor\"\n  homepage \"https://inkscape.org/\"\n\n  # Inkscape releases use a version format like 1.4, 1.4.1, etc. but the file\n  # name version can sometimes use a longer number (e.g. 1.4.230579 for 1.4.2,\n  # 1.3.0 for 1.3, etc.).\n  livecheck do\n    url \"https://inkscape.org/release/all/#{livecheck_folder}/\"\n    regex(%r{/inkscape[._-]v?(\\d+(?:\\.\\d+)+)/?[\"' >].*?Inkscape[._-]v?(\\d+(?:\\.\\d+)+)#{arch}\\.#{url_end}}im)\n    strategy :page_match do |page, regex|\n      # Match within individual row elements to ensure the regex doesn't capture\n      # a release version and file name version from separate releases\n      page.scan(%r{<tr[^>]*?>(.*?)</tr>}im).filter_map do |row|\n        match = row[0].match(regex)\n        next unless match\n\n        (match[1] == match[2]) ? match[1] : \"#{match[1]},#{match[2]}\"\n      end\n    end\n  end\nend\n").page_block.unwrap().shape, PageShape::SectionMatch { .. }));
+}
+
+/// r481 fixtures: oxygen's two-list extremes,
+/// macgamestore's guarded child-attribute match,
+/// and output-factory's following-sibling step
+/// reduce to data.
+#[test]
+fn r481_xml_two_list_child_attr_following_sibling() {
+    use crate::abrew::formula::XmlShape;
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    assert!(matches!(parse("  livecheck do\n    url \"https://www.oxygenxml.com/rssBuildID.xml\"\n    regex(/Oxygen\\s+XML\\s+Editor\\s+(?:version\\s+)?v?(\\d+(?:\\.\\d+)+)/i)\n    strategy :xml do |xml, regex|\n      versions = xml.get_elements(\"//description\").filter_map do |item|\n        match = item.text&.strip&.match(regex)\n        next if match.blank?\n\n        match[1]\n      end\n      builds = xml.get_elements(\"//guid\").map { |item| item.text&.strip }\n\n      version = versions.max_by { |v| Version.new(v) }\n      build = builds.max\n      next if version.blank? || build.blank?\n\n      \"#{version},#{build}\"\n    end\n  end\n").xml_block.unwrap().shape, XmlShape::TwoListExtreme { .. }));
+    assert!(matches!(parse("  livecheck do\n    url \"https://www.macgamestore.com/api_clientapp/clientupdates/public/update-2021.xml\"\n    regex(/MacGameStore[._-]v?(\\d+(?:\\.\\d+)+)[._-](\\d+)\\.zip/i)\n    strategy :xml do |xml, regex|\n      xml.get_elements(\"//item\").map do |item|\n        next if item.elements[\"sparkle:isBetaBuild\"]&.text&.include?(\"1\")\n\n        url = item.elements[\"enclosure\"]&.attributes&.[](\"url\")\n        match = url.match(regex) if url\n        next if match.blank?\n\n        \"#{match[1]},#{match[2]}\"\n      end\n    end\n  end\n").xml_block.unwrap().shape, XmlShape::Template(..)));
+    assert!(matches!(parse("  livecheck do\n    url \"https://zevrix.com/zsversioncontrol/ZSVersionControl.xml\"\n    strategy :xml do |xml|\n      xml.elements[\n        \"//dict/key[text()='Output Factory']/following-sibling::dict[1]/key[text()='version']\",\n      ]&.next_element&.text\n    end\n  end\n").xml_block.unwrap().shape, XmlShape::Template(..)));
+}
+
+/// r480 fixtures: wetype's fallback dig match,
+/// font-oppo-sans's two named dig matches, mega's
+/// OR-guarded map template, and synology-drive's
+/// nested guarded map reduce to data.
+#[test]
+fn r480_json_multi_match_and_or_guards() {
+    use crate::abrew::formula::JsonShape;
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    assert!(matches!(parse("  livecheck do\n    url \"https://z.weixin.qq.com/web/api/app_info\"\n    regex(/WeTypeInstaller[._-]v?(\\d+(?:\\.\\d+)+)[._-](\\d+)\\.zip/i)\n    strategy :json do |json, regex|\n      match = json.dig(\"data\", \"mac\", \"download_link\")&.match(regex)\n\n      # Try to match the version from the `InstallInfo` file name if the\n      # Mac installer file name doesn't include a version\n      match ||= json.dig(\"data\", \"mac\", \"InstallInfo\")&.match(/v?(\\d+(?:\\.\\d+)+)[_-](\\d+)/i)\n      next unless match\n\n      \"#{match[1]},#{match[2]}\"\n    end\n  end\n").json_block.unwrap().shape, JsonShape::MultiMatch { .. }));
+    assert!(matches!(parse("  livecheck do\n    url \"https://open.oppomobile.com/wiki/new-doc/detail.json?doc_id=13223\"\n    regex(/Oppo\\s+Sans\\s+v?(\\d+(?:\\.\\d+)+)/i)\n    strategy :json do |json, regex|\n      url_regex = %r{oop/(\\d+)/(\\d+)/(\\h+)\\.zip}i\n\n      version_match = json.dig(\"data\", \"title\")&.match(regex)\n      next if version_match.blank?\n\n      url_match = json.dig(\"data\", \"content\")&.match(url_regex)\n      next if url_match.blank?\n\n      \"#{version_match[1]},#{url_match[1]},#{url_match[2]},#{url_match[3]}\"\n    end\n  end\n").json_block.unwrap().shape, JsonShape::MultiMatch { .. }));
+    assert!(matches!(parse("  livecheck do\n    url \"https://www.megasoftware.net/current_release/\",\n        user_agent: :browser\n    strategy :json do |json|\n      json.map do |item|\n        next if item[\"operating_system\"] != \"mac\" ||\n                item[\"release_type\"] != \"stable\" ||\n                !item[\"interface\"].match?(/Graphical|GUI/i)\n\n        major = item[\"major\"]\n        minor = item[\"minor\"]\n        release = item[\"release\"]\n        next if major.blank? || minor.blank? || release.blank?\n\n        \"#{major}.#{minor}.#{release}\"\n      end\n    end\n  end\n").json_block.unwrap().shape, JsonShape::Template { .. }));
+    assert!(matches!(parse("  livecheck do\n    url \"https://www.synology.com/api/support/findDownloadInfo?lang=en-us&product=DS923%2B\"\n    strategy :json do |json|\n      json.dig(\"info\", \"utilities\", \"detail\")&.map do |group|\n        group[\"items\"]&.map do |item|\n          next if item[\"identify\"] != \"SynologyDriveClient\"\n          next if item.dig(\"files\", \"Mac\").blank?\n\n          item[\"version\"]&.tr(\"-\", \",\")\n        end\n      end&.flatten\n    end\n  end\n").json_block.unwrap().shape, JsonShape::NestedMap { .. }));
+}
+
+#[test]
+fn json_match_fallback_must_precede_its_required_match_guard() {
+    use crate::abrew::formula::JsonShape;
+
+    // Keep the parser and the actual JSON evaluator in the same control. A private file
+    // supplies page_fetch's bytes; this makes no claim about HTTP strategy URL admission.
+    fn versions(text: &str, url: &str) -> Option<Vec<String>> {
+        let spec = crate::abrew::tap::parse_livecheck_block(text).unwrap();
+        assert!(spec.strategy_block);
+        let block = spec.json_block?;
+        assert!(matches!(block.shape, JsonShape::MultiMatch { .. }));
+        let plan = RunPlan {
+            strat: Strat::Json,
+            url: url.into(),
+            re: Some(lc_regex(spec.regex.as_deref().unwrap(), &spec.regex_flags).unwrap()),
+            candidates: Vec::new(),
+            strategy_url: None,
+            ua: Some(String::new()),
+            ua_option: None,
+            ua_symbol: false,
+            gnome_filter: false,
+            json: Some(block),
+            xml: None,
+            yaml: None,
+            page_block: None,
+            ghrel_block: None,
+            git: None,
+            sparkle_block: None,
+            header_block: None,
+            latest: None,
+            post_form: None,
+            post_json: None,
+            headers: Vec::new(),
+            major_minor: String::new(),
+            own_version: String::new(),
+            plist: None,
+            apps: Vec::new(),
+            uncompressed: true,
+        };
+        Some(match json_versions(&plan) {
+            Found::Versions(versions, _) => versions,
+            Found::Messages(messages) => panic!("local JSON evaluation refused: {messages:?}"),
+            Found::Raised(message) => panic!("local JSON evaluation raised: {message}"),
+        })
+    }
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = scratch.path().join("matches.json");
+    let url = format!("file://{}", path.display());
+    let source = |statements: &str| {
+        format!(
+            r##"  livecheck do
+    url "https://example.invalid/not-fetched.json"
+    regex(/v(\d+)/)
+    strategy :json do |json, regex|
+      matched = json.dig("stable")&.match(regex)
+{statements}
+      "#{{matched[1]}}"
+    end
+  end
+"##
+        )
+    };
+    for guard in ["next unless matched", "next if matched.blank?"] {
+        let fallback = "matched ||= json.dig(\"fallback\")&.match(regex)";
+        let permitted = source(&format!("      {fallback}\n      {guard}"));
+        let skipped = source(&format!("      {guard}\n      {fallback}"));
+        for (json, expected) in [
+            (r#"{"stable":"none","fallback":"v2"}"#, vec!["2"]),
+            (r#"{"stable":"v1","fallback":"v2"}"#, vec!["1"]),
+            (r#"{"stable":"none","fallback":"none"}"#, Vec::new()),
+        ] {
+            std::fs::write(&path, json).unwrap();
+            assert_eq!(
+                versions(&permitted, &url).unwrap(),
+                expected,
+                "{guard}: {json}"
+            );
+        }
+
+        // Ruby skips before it can reach the fallback. The flat native attempts cannot
+        // express that order, so the top-level parser must leave the block unsupported.
+        // Without that boundary, the real evaluator would read this payload and return 2.
+        std::fs::write(&path, r#"{"stable":"none","fallback":"v2"}"#).unwrap();
+        assert_eq!(versions(&skipped, &url), None, "{guard}");
+        let top = crate::abrew::tap::parse_livecheck_block(&skipped).unwrap();
+        assert!(top.strategy_block && top.json_block.is_none(), "{guard}");
+    }
+}
+
+/// r479: server bytes appended after a zip's end
+/// record trim in scratch, then the strict extractor
+/// validates the archive as usual, including an
+/// in-root app-bundle symlink.
+#[test]
+fn r479_zip_appended_server_bytes_trim() {
+    use crate::extract::fixtures::{ZipMember, zip_bytes};
+    let bytes = zip_bytes(
+        &[
+            ZipMember {
+                name: "Probe.app/Contents/Info.plist",
+                mode: 0o100_644,
+                data: b"probe",
+                deflate: false,
+            },
+            ZipMember {
+                name: "Probe.app/Contents/Current",
+                mode: 0o120_777,
+                data: b"Info.plist",
+                deflate: false,
+            },
+        ],
+        false,
+    );
+    let tmp = aterm_tempfile::TempDir::new().unwrap();
+    let exact = tmp.path().join("exact.zip");
+    std::fs::write(&exact, &bytes).unwrap();
+    assert_eq!(zip_trimmed_end(&exact), None);
+
+    let mut appended = bytes.clone();
+    appended.extend_from_slice(b"\nWarning: generated after the archive\n");
+    let path = tmp.path().join("appended.zip");
+    std::fs::write(&path, appended).unwrap();
+    assert_eq!(zip_trimmed_end(&path), Some(bytes.len() as u64));
+    zip_trim_appended_bytes(&path);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let root = tmp.path().join("extracted");
+    crate::extract::extract_zip_tree(
+        &path,
+        &root,
+        crate::install::UNSIGNED_SIZE_CAP,
+        crate::install::MAX_ENTRIES,
+        plist_zip_options(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(root.join("Probe.app/Contents/Info.plist")).unwrap(),
+        b"probe"
+    );
+    assert_eq!(
+        std::fs::read_link(root.join("Probe.app/Contents/Current")).unwrap(),
+        std::path::Path::new("Info.plist")
+    );
+}
+
+/// r479 fixture: scribus's sourceforge early-next
+/// equality fork parses as a MatchFork.
+#[test]
+fn r479_scribus_early_next_fork() {
+    let text = "  livecheck do\n    url \"https://sourceforge.net/projects/scribus/rss?path=/scribus\"\n    regex %r{url=.*?/v?(\\d+(?:\\.\\d+)+)/scribus[._-]v?(\\d+(?:[._]\\d+)+)(?:-x86_64)?\\.dmg}i\n    strategy :sourceforge do |page, regex|\n      match = page.match(regex)\n      next if match.blank?\n\n      next match[1] if match[1] == match[2]\n\n      \"#{match[1]},#{match[2]}\"\n    end\n  end\n";
+    let spec = crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    assert!(matches!(
+        spec.page_block.unwrap().shape,
+        crate::abrew::formula::PageShape::MatchFork {
+            cond: crate::abrew::formula::PageCond::CapEq(1, 2),
+            ..
+        }
+    ));
+}
+
+/// r478 fixtures: quarkclouddrive's fallback dig
+/// match, expressvpn's entries first match and
+/// rnote's nested collect parse to data shapes.
+#[test]
+fn r478_json_residue_shapes() {
+    use crate::abrew::formula::JsonShape;
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    let quark = "  livecheck do\n    url \"https://pan.quark.cn/api/client_version\"\n    regex(%r{QuarkCloudDriveMac[._-]v?(\\d+(?:\\.\\d+)+)[^/]*\\(Build(\\d+)\\)\\.dmg}i)\n    strategy :json do |json, regex|\n      url = json.dig(\"data\", \"origin_macDmgForArmUrl\") || json.dig(\"data\", \"macDmgForArmUrl\")\n      match = url&.match(regex)\n      next if match.blank?\n\n      \"#{match[1]},#{match[2]}\"\n    end\n  end\n";
+    assert!(matches!(
+        parse(quark).json_block.unwrap().shape,
+        JsonShape::DigMatch { .. }
+    ));
+    let express = "  livecheck do\n    url \"https://example.com/api/v2/installers\"\n    regex(/expressvpn[._-]macos[._-]universal[._-]v?(\\d+(?:\\.\\d+)+)[._-]release\\.zip/i)\n    strategy :json do |json, regex|\n      version = nil\n      json[\"installers\"].filter_map do |_key, item|\n        match = item.dig(\"locations\", \"default\")&.match(regex)\n        next unless match\n\n        version = match[1]\n        break\n      end\n      version\n    end\n  end\n";
+    assert!(matches!(
+        parse(express).json_block.unwrap().shape,
+        JsonShape::EntriesFirstMatch { .. }
+    ));
+    let rnote = "  livecheck do\n    url \"https://example.com/releases.json\"\n    regex(/rnote-v?(\\d+(?:\\.\\d+)+)-/i)\n    strategy :json do |json, regex|\n      json.map do |item|\n        item.dig(\"assets\", \"links\")&.filter_map do |asset|\n          asset[\"direct_asset_url\"]&.[](regex, 1)\n        end\n      end.flatten\n    end\n  end\n";
+    assert!(matches!(
+        parse(rnote).json_block.unwrap().shape,
+        JsonShape::NestedCollect { .. }
+    ));
+}
+
+/// r477 fixtures: the github_latest residue —
+/// ultimaker-cura's match over a transformed tag,
+/// clock-bar's second field capture, creality's
+/// version-component fork and recaf's asset pick.
+#[test]
+fn r477_github_latest_residue_shapes() {
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    let ultimaker = "  livecheck do\n    url :url\n    regex(/^(\\d+(?:\\.\\d+)+)/i)\n    strategy :github_latest do |json, regex|\n      tag = json[\"tag_name\"]&.sub(/^\\D+/, \"\")\n      match = tag&.match(regex)\n      next if match.blank?\n\n      (match[1] == tag) ? match[1] : \"#{match[1]},#{tag}\"\n    end\n  end\n";
+    let blk = parse(ultimaker).latest_block.unwrap();
+    assert!(blk.match_pre);
+    let clock = "  livecheck do\n    url :url\n    regex(/^v?(\\d+(?:\\.\\d+)+)$/i)\n    strategy :github_latest do |json, regex|\n      version_match = json[\"tag_name\"]&.match(regex)\n      next if version_match.blank?\n\n      id_match = json[\"body\"]&.match(%r{/(\\d+)/Clock\\.Bar\\.app\\.zip}i)\n      next if id_match.blank?\n\n      \"#{version_match[1]},#{id_match[1]}\"\n    end\n  end\n";
+    let spec = parse(clock);
+    let blk = spec.latest_block.as_ref().expect("clock-bar latest_block");
+    assert!(blk.pre_capture.is_some());
+    let creality = "  livecheck do\n    url :url\n    regex(%r{/v?(\\d+(?:\\.\\d+)+)/Creality[._-]?Print[._-]v?(\\d+(?:\\.\\d+)+)[._-]macx[._-]demo[._-]Release\\.dmg}i)\n    strategy :github_latest do |json, regex|\n      json[\"assets\"]&.map do |asset|\n        match = asset[\"browser_download_url\"]&.match(regex)\n        next unless match\n\n        if Version.new(match[2]).major_minor_patch.to_s == match[1]\n          match[2]\n        else\n          \"#{match[2]},#{match[1]}\"\n        end\n      end\n    end\n  end\n";
+    let spec = parse(creality);
+    assert!(
+        format!("{:?}", spec.latest_block.unwrap().render).contains("CapMmp"),
+        "creality must reduce to a component fork"
+    );
+    let recaf = "  livecheck do\n    url :url\n    regex(/^v?(\\d+(?:\\.\\d+)+(?:-alpha)?)$/i)\n    strategy :github_latest do |json, regex|\n      match = json[\"tag_name\"]&.match(regex)\n      next if match.blank?\n\n      assets = json[\"assets\"]&.select do |asset|\n        %w[recaf-4x-alpha-mac-aarch.jar recaf-4x-alpha-mac-86-x64.jar].include?(asset[\"name\"])\n      end\n      next if assets.blank? || assets.length != 2\n\n      \"#{match[1]},#{assets.map { |asset| asset[\"updated_at\"] }.max.gsub(/\\D/, \"\")}\"\n    end\n  end\n";
+    let blk = parse(recaf).latest_block.unwrap();
+    assert_eq!(blk.asset_pick.as_ref().map(|(_, n)| *n), Some(2));
+    assert!(
+        format!("{:?}", blk.render).contains("AssetsMaxUpdatedDigits"),
+        "recaf render must read the picked assets' newest update"
+    );
+}
+
+/// r475 fixtures: insomnia's ternary check URL,
+/// mindforger's split-index URL terminal, recut's
+/// reserved `version` local + all-headers first
+/// match, and gzdoom's tr-equal latest fork.
+#[test]
+fn r475_token_and_block_shapes() {
+    use crate::abrew::formula::cask_version_token;
+    let ternary = "version.end_with?(\".0.0\") ? (version.major.to_i - 1) : version.major";
+    assert_eq!(cask_version_token("13.4.0", ternary).as_deref(), Some("13"));
+    assert_eq!(cask_version_token("13.0.0", ternary).as_deref(), Some("12"));
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    let insomnia = "  livecheck do\n    url \"https://updates.insomnia.rest/builds/check/mac?v=#{version.end_with?(\".0.0\") ? (version.major.to_i - 1) : version.major}.0.0&app=com.insomnia.app&channel=stable\"\n    strategy :json do |json|\n      json[\"name\"]\n    end\n  end\n";
+    let spec = parse(insomnia);
+    assert!(spec.json_block.is_some());
+    // insomnia@alpha: `include?` predicate + a
+    // quoted conditional-string token.
+    assert_eq!(
+        cask_version_token(
+            "13.4.0-beta.1",
+            "version.include?(\".0.0\") ? (version.major.to_i - 1) : version.major"
+        )
+        .as_deref(),
+        Some("13")
+    );
+    assert_eq!(
+        cask_version_token("13.4.0-beta.1", "\"-beta.0\" if version.include?(\"-\")").as_deref(),
+        Some("-beta.0")
+    );
+    assert_eq!(
+        cask_version_token("13.4.0", "\"-beta.0\" if version.include?(\"-\")").as_deref(),
+        Some("")
+    );
+    let alpha = "  livecheck do\n    url \"https://updates.insomnia.rest/builds/check/mac?v=#{version.include?(\".0.0\") ? (version.major.to_i - 1) : version.major}.0.0#{\"-beta.0\" if version.include?(\"-\")}&app=com.insomnia.app&channel=beta\"\n    strategy :json do |json|\n      json[\"name\"]\n    end\n  end\n";
+    assert!(parse(alpha).json_block.is_some());
+    assert!(
+        format!("{:?}", spec.url).contains("version.major.to_i - 1"),
+        "the ternary stays verbatim for plan-time substitution"
+    );
+
+    assert_eq!(
+        cask_version_token(
+            "2.0.0-20240217.170738,5152",
+            "version.csv.first.split(\"-\").first"
+        )
+        .as_deref(),
+        Some("2.0.0")
+    );
+    assert_eq!(
+        cask_version_token(
+            "2.0.0-20240217.170738,5152",
+            "version.csv.first.split(\"-\")[1]"
+        )
+        .as_deref(),
+        Some("20240217.170738")
+    );
+
+    // A strategy-block `version = "…"` assignment
+    // must not shadow `#{version.csv.second}` in
+    // the download URL.
+    let recut = "cask \"recut\" do\n  version \"4.5.8,blob123\"\n  url \"https://updates.getrecut.com/redirect/#{version.csv.second}/Recut_#{version.csv.first}_universal.dmg\"\n  livecheck do\n    url \"https://updates.getrecut.com/latest-mac\"\n    regex(%r{/redirect/([^/]+)/Recut[._-]v?(\\d+(?:\\.\\d+)+)}i)\n    strategy :header_match do |all_headers, regex|\n      version = nil\n      all_headers.each do |headers|\n        match = headers[\"location\"]&.match(regex)\n        next unless match\n\n        version = \"#{match[2]},#{match[1]}\"\n        break\n      end\n      version\n    end\n  end\nend\n";
+    let c = crate::abrew::tap::parse_cask_rb_as_data(recut, "recut");
+    assert_eq!(
+        c.url,
+        "https://updates.getrecut.com/redirect/blob123/Recut_4.5.8_universal.dmg"
+    );
+    let spec = parse(recut);
+    assert!(matches!(
+        spec.header_block.unwrap().shape,
+        crate::abrew::formula::HeaderShape::AllTemplate(_)
+    ));
+
+    let gzdoom = "  livecheck do\n    url :url\n    regex(%r{/g?(\\d+(?:\\.\\d+)+)/gzdoom(?:-bin)?[._-]v?(\\d+(?:[.-]\\d+)+[a-z]?)(?:(?:-macOS)?\\.dmg|-macOS\\.zip)}i)\n    strategy :github_latest do |json, regex|\n      json[\"assets\"]&.map do |asset|\n        match = asset[\"browser_download_url\"]&.match(regex)\n        next if match.blank?\n\n        (match[2].tr(\"-\", \".\") == match[1]) ? match[1] : \"#{match[2].tr(\"-\", \".\")},#{match[1]}\"\n      end\n    end\n  end\n";
+    let spec = parse(gzdoom);
+    assert!(
+        format!("{:?}", spec.latest_block.unwrap().render).contains("CapTr"),
+        "gzdoom must reduce to a tr-equal fork"
+    );
+}
+
+/// r474 fixtures: jpki's normalized capture,
+/// fujifilm's bracket-capture two-match,
+/// libreoffice-still's version minimum and
+/// unity's nested first match parse; the scan
+/// minimum and two-match render through the
+/// genuine evaluators.
+#[test]
+fn r474_page_and_json_shapes() {
+    use super::super::super::formula::PageShape;
+    let parse = |text: &str| crate::abrew::tap::parse_livecheck_block(text).unwrap();
+    // jpki
+    let jpki = r##"  livecheck do
+    url "https://www.jpki.go.jp/download/mac.html"
+    regex(/href=.*?JPKIMac[._-]v?(\d+(?:[.-]\d+)+)(?:_(\d+(?:[.-]\d+)+))?\.dmg/i)
+    strategy :page_match do |page, regex|
+      page.scan(regex).map do |match|
+        ver = match[0].tr("-", ".").split(".").map(&:to_i).join(".")
+        match[1].present? ? "#{ver},#{match[1]}" : ver
+      end
+    end
+  end
+"##;
+    let spec = parse(jpki);
+    assert!(
+        format!("{:?}", spec.page_block.unwrap().shape).contains("CapNormInts"),
+        "jpki must reduce to a normalized-int capture part"
+    );
+    // fujifilm
+    let fuji = r##"  livecheck do
+    url "https://www.fujifilm-x.com/global/support/download/software/x-raw-studio/"
+    regex(/Mac\s*Version\s*:\s*v?(\d+(?:\.\d+)+)/i)
+    strategy :page_match do |page, regex|
+      version = page[regex, 1]
+      next if version.blank?
+
+      dir = page[%r{href=.*?x-raw-studio-mac(?:\d+)-([^/]+)/XRawStudio(?:\d+)\.dmg}i, 1]
+      next if dir.blank?
+
+      "#{version},#{dir}"
+    end
+  end
+"##;
+    assert!(matches!(
+        parse(fuji).page_block.unwrap().shape,
+        PageShape::TwoMatch { .. }
+    ));
+    // libreoffice-still
+    let lo = r##"cask "libreoffice-still" do
+  arch arm: "aarch64", intel: "x86-64"
+  folder = on_arch_conditional arm: "aarch64", intel: "x86_64"
+
+  version "26.2.7"
+  sha256 arm:   "58601808ae2b919c82dc7c4d6a26389de0e167f344ca48e5b6c9189218eb95ae",
+         intel: "26a830205c617cc624b2a83783ef46434a4d6c337c3a873f79c43012171f83de"
+
+  url "https://download.documentfoundation.org/libreoffice/stable/#{version}/mac/#{folder}/LibreOffice_#{version}_MacOS_#{arch}.dmg"
+  name "LibreOffice Still"
+  desc "Free cross-platform office suite, stable version recommended for enterprises"
+  homepage "https://www.libreoffice.org/"
+
+  # This checks the same source of version information as the `libreoffice`
+  # cask, so we need to make sure that the former always checks a page that
+  # provides the latest versions for both Fresh and Still.
+  livecheck do
+    url "https://www.libreoffice.org/download/"
+    regex(%r{href=["']?[^"' >]*/stable/[^"' >]*LibreOffice[._-]v?(\d+(?:\.\d+)+)(?:[._-]MacOS)?[._-]#{arch}\.dmg}i)
+    strategy :page_match do |page, regex|
+      # Sort versions from lowest to highest, using the lowest (or only) version
+      page.scan(regex).map(&:first).uniq.min_by { |v| Version.new(v) }
+    end
+  end
+"##;
+    assert!(matches!(
+        parse(lo).page_block.unwrap().shape,
+        PageShape::ScanExtreme(true)
+    ));
+    // unity
+    let unity = r##"cask "unity" do
+  arch arm: "Arm64"
+  livecheck_arch = on_arch_conditional arm: "ARM64", intel: "X86_64"
+
+  version "6000.6.9f1,8c45277fb9c5"
+  sha256 arm:   "7d73299e668f25c21109e93fb3c5329c43ff36297a824e80763c3d520b3af4bc",
+         intel: "0037a8ef93e66e2452aef4cf7430dcad5502d76c4d1eb1397a50d6b6c9d3d476"
+
+  url "https://download.unity3d.com/download_unity/#{version.csv.second}/MacEditorInstaller#{arch}/Unity-#{version.csv.first}.pkg"
+  name "Unity Editor"
+  desc "Platform for 3D content"
+  homepage "https://unity.com/"
+
+  livecheck do
+    url "https://services.api.unity.com/unity/editor/release/v1/releases?platform=MAC_OS&stream=SUPPORTED&architecture=#{livecheck_arch}&limit=1&offset=0"
+    regex(%r{/(\h+)/MacEditorInstaller#{arch}/Unity[._-]v?(\d+(?:\.\d+)+(?:f\d+)?)\.pkg}i)
+    strategy :json do |json, regex|
+      match = nil
+      json["results"]&.each do |item|
+        item["downloads"]&.each do |download|
+          match = download["url"]&.match(regex)
+          break if match
+        end
+        break if match
+      end
+      next unless match
+
+      "#{match[2]},#{match[1]}"
+    end
+  end
+"##;
+    assert!(matches!(
+        parse(unity).json_block.unwrap().shape,
+        crate::abrew::formula::JsonShape::NestedFirstMatch { .. }
+    ));
+
+    // jpki's download URL pipeline zero-pads each
+    // dotted part of the first csv field.
+    assert_eq!(
+        crate::abrew::formula::cask_version_token(
+            "3.9,01-01",
+            "version.csv.first.split(\".\").map { |str| str.rjust(2, \"0\") }.join(\"-\")"
+        )
+        .as_deref(),
+        Some("03-09")
+    );
+
+    let re = lc_regex(r"v([\d.]+)", "").unwrap();
+    let content = "v26.1 v25.8 v26.1";
+    let vals: Vec<String> = re
+        .whole
+        .find_iter(content)
+        .filter_map(|m| extract_groups(&re, m.as_str()).into_iter().next().flatten())
+        .collect();
+    assert_eq!(
+        vals.into_iter()
+            .min_by(|a, b| lc_cmp(false, a, b))
+            .as_deref(),
+        Some("25.8")
     );
 }

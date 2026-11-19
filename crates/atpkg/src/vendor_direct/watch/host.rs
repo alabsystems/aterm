@@ -6,9 +6,10 @@
 use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use super::{BUSY_RETRY, CADENCE};
+use super::{BUSY_RETRY, CADENCE, Ring};
 use crate::index_probe::open_private;
 use crate::lock::{Flock, RecordLock};
 use crate::store::Layout;
@@ -34,6 +35,9 @@ pub(super) enum Admit {
     Yes,
     /// Not now; ask again after this long.
     Later(Duration),
+    /// Not now; a waiter rings the host once the seat or the rendezvous is free, and hands the
+    /// claim the lock it took ([`HostClaim::handed`]).
+    Waits,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +48,92 @@ enum Standing {
     Unavailable,
 }
 
+/// What a waiter handed its claim ([`Hand`]).
+enum Handed {
+    /// Still blocked on the lock.
+    Waiting,
+    /// The seat, taken with this process's pid written in it.
+    Seat(RecordLock),
+    /// The rendezvous, taken exclusive.
+    Hosts(Flock),
+    /// The lock could not be opened or taken; the claim asks again on its own clock.
+    Failed,
+}
+
+/// A claim's end of its waiter: what the waiter handed over, and the ring that tells the claim's
+/// host.
+struct Hand {
+    handed: Mutex<Handed>,
+    ring: Ring,
+}
+
+/// One detached thread that blocks on the seat or the rendezvous a standing session was refused,
+/// takes it the moment its holder lets go, and hands it to the claim through `hand`, then rings
+/// the host. Handing over, rather than letting go and ringing, keeps the seat with the session
+/// whose waiter took it, so two standing sessions cannot pass it back and forth between their
+/// waiters and their own takes; the seat goes first come. A blocking take cannot be interrupted,
+/// so the thread reaches its claim only weakly, through its session's [`Line`] for that lock, and
+/// lets go of what it took at once where no claim is there to take it.
+struct Waiter {
+    /// Why the claim waits: [`Standing::SeatTaken`] or [`Standing::WindowWatches`].
+    standing: Standing,
+    hand: Arc<Hand>,
+}
+
+/// The waiter threads one session runs over its store, one line per lock (the seat and the
+/// rendezvous), which its head watch keeps across the claims it makes. A blocking take cannot be
+/// interrupted, so a waiter outlives a claim let go while it blocks (Automatic updates turned off)
+/// until its lock frees. The session's next claim refused that lock takes the still-blocked waiter
+/// on, which then hands over to it, instead of arming a second beside it: a session holds at most
+/// one waiter, and one open file, per lock however often it is turned off and on. A waiter that
+/// takes its lock with no claim to hand it to lets it go at once.
+#[derive(Clone, Default)]
+pub(super) struct Waiters {
+    seat: Arc<Mutex<Line>>,
+    hosts: Arc<Mutex<Line>>,
+    /// Each waiter thread armed, with what it waits on, so a test sees it end.
+    #[cfg(test)]
+    threads: Arc<Mutex<Vec<WaiterThread>>>,
+}
+
+/// A waiter thread a test follows, with what it waits on ([`Waiters`]).
+#[cfg(test)]
+type WaiterThread = (Standing, std::thread::JoinHandle<()>);
+
+impl std::fmt::Debug for Waiters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let blocked =
+            |line: &Mutex<Line>| line.lock().unwrap_or_else(PoisonError::into_inner).blocked;
+        f.debug_struct("Waiters")
+            .field("seat", &blocked(&self.seat))
+            .field("hosts", &blocked(&self.hosts))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Waiters {
+    /// How many of the waiter threads armed have not ended.
+    #[cfg(test)]
+    pub(super) fn running(&self) -> usize {
+        self.threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, thread)| !thread.is_finished())
+            .count()
+    }
+}
+
+/// One lock's waiter thread, as the session's claims and the thread itself see it.
+#[derive(Default)]
+struct Line {
+    /// A waiter thread blocks on the lock now.
+    blocked: bool,
+    /// The claim that waiter hands the lock to: the last one that armed it or took it on, dead
+    /// once that claim is gone (let go, or its session exited).
+    to: Weak<Hand>,
+}
+
 /// One host's claim on the store's rendezvous ([`Host`]).
 pub(super) struct HostClaim {
     host: Host,
@@ -51,6 +141,14 @@ pub(super) struct HostClaim {
     hosts: Option<Flock>,
     seat: Option<RecordLock>,
     standing: Option<Standing>,
+    /// The host's rest's ring, which a waiter rings; a session claim without one arms no waiter.
+    ring: Option<Ring>,
+    /// The waiter threads of this claim's session ([`Waiters`]).
+    waiters: Waiters,
+    waiter: Option<Waiter>,
+    /// A waiter just failed: the next refusal answers on the clock rather than arming another at
+    /// once, so a lock whose blocking take keeps failing costs one try per fallback, not a spin.
+    waiter_failed: bool,
     #[cfg(test)]
     admit_calls: u64,
 }
@@ -63,18 +161,36 @@ impl std::fmt::Debug for HostClaim {
             .field("hosts", &self.hosts.is_some())
             .field("seat", &self.seat.is_some())
             .field("standing", &self.standing)
-            .finish()
+            .field("waiter", &self.waiter.as_ref().map(|w| w.standing))
+            .finish_non_exhaustive()
     }
 }
 
 impl HostClaim {
-    pub(super) fn new(host: Host, layout: &Layout) -> Self {
+    /// A claim whose session runs no waiter but the ones it arms (a test's: a head watch keeps its
+    /// session's waiters across its claims, [`Self::with_waiters`]).
+    #[cfg(test)]
+    pub(super) fn new(host: Host, layout: &Layout, ring: Option<Ring>) -> Self {
+        Self::with_waiters(host, layout, ring, Waiters::default())
+    }
+
+    /// A claim of the session whose waiter threads are `waiters`, kept across its claims.
+    pub(super) fn with_waiters(
+        host: Host,
+        layout: &Layout,
+        ring: Option<Ring>,
+        waiters: Waiters,
+    ) -> Self {
         Self {
             host,
             prefix: layout.prefix.clone(),
             hosts: None,
             seat: None,
             standing: None,
+            ring,
+            waiters,
+            waiter: None,
+            waiter_failed: false,
             #[cfg(test)]
             admit_calls: 0,
         }
@@ -118,6 +234,12 @@ impl HostClaim {
         if self.hosts.is_some() {
             return (Admit::Yes, Standing::Watching);
         }
+        if let Some(standing) = self.take_handed() {
+            return (Admit::Waits, standing);
+        }
+        if self.hosts.is_some() {
+            return (Admit::Yes, Standing::Watching);
+        }
         if self.seat.is_none() {
             let Some(file) = open_private(&self.prefix.join(SEAT_FILE), true) else {
                 return (Admit::Later(CADENCE), Standing::Unavailable);
@@ -128,7 +250,7 @@ impl HostClaim {
                     self.seat = Some(held);
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    return (Admit::Later(CADENCE), Standing::SeatTaken);
+                    return (self.arm(Standing::SeatTaken), Standing::SeatTaken);
                 }
                 Err(std::fs::TryLockError::Error(_)) => {
                     return (Admit::Later(CADENCE), Standing::Unavailable);
@@ -144,10 +266,121 @@ impl HostClaim {
                 (Admit::Yes, Standing::Watching)
             }
             Err(std::fs::TryLockError::WouldBlock) => {
-                (Admit::Later(CADENCE), Standing::WindowWatches)
+                (self.arm(Standing::WindowWatches), Standing::WindowWatches)
             }
             Err(std::fs::TryLockError::Error(_)) => (Admit::Later(CADENCE), Standing::Unavailable),
         }
+    }
+
+    /// Take what this claim's waiter left, in one read of its slot: the seat or the rendezvous
+    /// it took becomes this claim's, and a waiter that failed is noted so the next refusal
+    /// answers on the clock; either way the waiter is over. `Some` of what the claim waits for
+    /// while its waiter still waits; `None` once it is over, or with no waiter.
+    fn take_handed(&mut self) -> Option<Standing> {
+        let waiter = self.waiter.as_ref()?;
+        let handed = std::mem::replace(
+            &mut *waiter
+                .hand
+                .handed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            Handed::Waiting,
+        );
+        match handed {
+            Handed::Waiting => return Some(waiter.standing),
+            Handed::Seat(held) => self.seat = Some(held),
+            Handed::Hosts(held) => self.hosts = Some(held),
+            Handed::Failed => self.waiter_failed = true,
+        }
+        self.waiter = None;
+        None
+    }
+
+    /// Take what this session's waiter handed over (its lock, or its failure) with no other
+    /// look: whatever the store's folder or the runner's admission clock says, the hand-over is
+    /// this claim's from here. True when a waiter was over and is taken; false with none, or one
+    /// that still waits.
+    pub(super) fn absorb(&mut self) -> bool {
+        self.waiter.is_some() && self.take_handed().is_none()
+    }
+
+    /// Arm a waiter for the lock `standing` was refused, answering [`Admit::Waits`]: the waiter
+    /// an earlier claim of this session armed on that lock, while it still blocks, else a new one.
+    /// Where none can be armed (no ring, a waiter that just failed, a thread refused), the refusal
+    /// answers on the clock as before ([`Admit::Later`] of [`CADENCE`]).
+    fn arm(&mut self, standing: Standing) -> Admit {
+        let just_failed = std::mem::take(&mut self.waiter_failed);
+        let Some(ring) = self.ring.clone().filter(|_| !just_failed) else {
+            return Admit::Later(CADENCE);
+        };
+        let seat = standing == Standing::SeatTaken;
+        let line = Arc::clone(if seat {
+            &self.waiters.seat
+        } else {
+            &self.waiters.hosts
+        });
+        let hand = Arc::new(Hand {
+            handed: Mutex::new(Handed::Waiting),
+            ring,
+        });
+        // Held while the thread spawns: a waiter that takes its lock at once reads its line only
+        // once it names this claim and says it blocks.
+        let mut held = line.lock().unwrap_or_else(PoisonError::into_inner);
+        held.to = Arc::downgrade(&hand);
+        if !held.blocked {
+            let path = self.prefix.join(if seat { SEAT_FILE } else { HOSTS_FILE });
+            let waiting = Arc::clone(&line);
+            let spawned = std::thread::Builder::new()
+                .name(String::from(if seat {
+                    "atpkg-seat-waiter"
+                } else {
+                    "atpkg-hosts-waiter"
+                }))
+                .spawn(move || wait_and_hand(&path, seat, &waiting));
+            match spawned {
+                Ok(thread) => {
+                    held.blocked = true;
+                    // The thread runs detached; a test keeps its handle to see it end.
+                    #[cfg(test)]
+                    self.waiters
+                        .threads
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((standing, thread));
+                    #[cfg(not(test))]
+                    drop(thread);
+                }
+                Err(_) => {
+                    held.to = Weak::new();
+                    return Admit::Later(CADENCE);
+                }
+            }
+        }
+        drop(held);
+        self.waiter = Some(Waiter { standing, hand });
+        Admit::Waits
+    }
+
+    /// Whether this session's claim waits on its waiter's ring: nothing it needs admission for
+    /// is due until then.
+    pub(super) fn waits(&self) -> bool {
+        self.waiter.as_ref().is_some_and(|w| {
+            matches!(
+                *w.hand.handed.lock().unwrap_or_else(PoisonError::into_inner),
+                Handed::Waiting
+            )
+        })
+    }
+
+    /// Whether this session's waiter ended (it handed over its lock, or failed), so the next
+    /// admission takes what it left at once.
+    pub(super) fn handed(&self) -> bool {
+        self.waiter.as_ref().is_some_and(|w| {
+            !matches!(
+                *w.hand.handed.lock().unwrap_or_else(PoisonError::into_inner),
+                Handed::Waiting
+            )
+        })
     }
 
     /// Whether this session holds the rendezvous exclusive right now.
@@ -165,12 +398,46 @@ impl HostClaim {
         self.admit_calls
     }
 
+    #[cfg(test)]
+    pub(super) const fn holds_seat(&self) -> bool {
+        self.seat.is_some()
+    }
+
     /// A round is over: a session lets the rendezvous go, so a window can take it.
     pub(super) fn end_round(&mut self) {
         if self.host == Host::Session {
             self.hosts = None;
         }
     }
+}
+
+/// [`Waiter`]'s thread: block on `path`'s seat (`seat`) or rendezvous lock, then hand what it took
+/// to the claim its `line` names and ring that claim's host, or let go of it at once where that
+/// claim is gone.
+fn wait_and_hand(path: &Path, seat: bool, line: &Mutex<Line>) {
+    let handed = open_private(path, true).map_or(Handed::Failed, |file| {
+        if seat {
+            RecordLock::lock(file, MAX_SEAT_BYTES).map_or(Handed::Failed, |mut held| {
+                let _ = write_pid(&mut held);
+                Handed::Seat(held)
+            })
+        } else {
+            Flock::lock(file).map_or(Handed::Failed, Handed::Hosts)
+        }
+    });
+    let to = {
+        let mut line = line.lock().unwrap_or_else(PoisonError::into_inner);
+        line.blocked = false;
+        std::mem::take(&mut line.to)
+    };
+    let Some(hand) = to.upgrade() else {
+        // No claim takes it: `handed` lets go of its lock here.
+        return;
+    };
+    let ring = hand.ring.clone();
+    *hand.handed.lock().unwrap_or_else(PoisonError::into_inner) = handed;
+    drop(hand);
+    ring.ring();
 }
 
 fn standing_note(standing: Standing) -> String {

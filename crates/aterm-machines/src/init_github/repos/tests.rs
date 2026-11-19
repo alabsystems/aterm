@@ -153,11 +153,9 @@ fn volume(free: u64) -> aterm_capacity::reading::Volume {
     }
 }
 
-/// A clone runs while five times GitHub's size for it leaves the disk watch's floor free, to
-/// the byte; one that would not is named and left; an unread volume runs every clone.
-#[test]
-fn a_clone_runs_only_while_it_leaves_the_disk_watchs_floor_free() {
-    let repo = |size_kib| Repo {
+/// A repository named `big` that GitHub, or the vault's catalog, sizes at `size_kib`.
+fn sized(size_kib: u64) -> Repo {
+    Repo {
         owner: "alice".into(),
         name: "big".into(),
         default_branch: Some("main".into()),
@@ -165,7 +163,15 @@ fn a_clone_runs_only_while_it_leaves_the_disk_watchs_floor_free() {
         fork: false,
         archived: false,
         required_submodules: Vec::new(),
-    };
+    }
+}
+
+/// A clone runs while five times the class of its size ([`size_class`]) leaves the disk
+/// watch's floor free, to the byte; one that would not is named and left; an unread volume runs
+/// every clone.
+#[test]
+fn a_clone_runs_only_while_it_leaves_the_disk_watchs_floor_free() {
+    let repo = sized;
     assert_eq!(no_room(None, &repo(u64::MAX)), None);
     assert_eq!(short_of_room(None, &[], "run aterm init again"), None);
 
@@ -180,10 +186,12 @@ fn a_clone_runs_only_while_it_leaves_the_disk_watchs_floor_free() {
         Some("~/big")
     );
 
-    let volume = volume(8 * GIB + 5 * 1000 * 1024);
-    assert_eq!(no_room(Some(&volume), &repo(1000)), None);
+    // Every size of at most 1 MiB is in the least class.
+    let volume = volume(8 * GIB + 5 * 1024 * 1024);
+    assert_eq!(no_room(Some(&volume), &repo(1)), None);
+    assert_eq!(no_room(Some(&volume), &repo(1024)), None);
     let left = [
-        no_room(Some(&volume), &repo(1001)).unwrap(),
+        no_room(Some(&volume), &repo(1025)).unwrap(),
         no_room(Some(&volume), &repo(2 * 1024 * 1024)).unwrap(),
     ];
     assert_eq!(left, ["~/big", "~/big (about 10 GiB)"]);
@@ -196,6 +204,44 @@ fn a_clone_runs_only_while_it_leaves_the_disk_watchs_floor_free() {
         "2 repositories not cloned, for want of disk space: ~/big, ~/big (about 10 GiB); \
          /System/Volumes/Data has 8 GiB free and keeps 8 GiB free; try again"
     );
+}
+
+/// Setup reads a size as its class ([`size_class`]): every size in a class needs five times the
+/// class. A size an earlier build wrote to the vault's catalog, which a refresh keeps while
+/// GitHub's size is in its class, needs room for five times every GitHub size it is kept for:
+/// a stored 2 GiB and 1 KiB, in the class (2, 2.5] GiB, needs 12.5 GiB, not 10 GiB. A class
+/// the catalog writes needs five times itself, under a quarter more than five times GitHub's
+/// size: the class GitHub's 2 GiB and 1 KiB is written as needs 12.5 GiB, not 20 GiB.
+#[test]
+fn a_size_needs_five_times_its_class() {
+    for (size_kib, need_bytes) in [
+        (0, 5 * 1024),
+        (1, 5 * 1024 * 1024),
+        (1_024, 5 * 1024 * 1024),
+        (1_025, 5 * 1_280 * 1024),
+        (GIB / 1024, 5 * GIB),
+        (2 * GIB / 1024, 10 * GIB),
+        (2 * GIB / 1024 + 1, 25 * GIB / 2),
+        (5 * GIB / 2 / 1024, 25 * GIB / 2),
+        (5 * GIB / 2 / 1024 + 1, 15 * GIB),
+        (u64::MAX, u64::MAX),
+    ] {
+        assert_eq!(
+            need(&sized(size_kib)),
+            need_bytes,
+            "a size of {size_kib} KiB"
+        );
+    }
+    // 15 GiB above the floor clones the class GitHub's 2 GiB and 1 KiB is written as.
+    let roomy = volume(23 * GIB);
+    assert_eq!(no_room(Some(&roomy), &sized(2 * GIB / 1024 + 1)), None);
+    assert_eq!(no_room(Some(&roomy), &sized(5 * GIB / 2 / 1024)), None);
+    assert_eq!(
+        no_room(Some(&roomy), &sized(5 * GIB / 2 / 1024 + 1)),
+        None,
+        "15 GiB fits in 15 GiB, to the byte"
+    );
+    assert!(no_room(Some(&roomy), &sized(3 * GIB / 1024 + 1)).is_some());
 }
 
 /// A pass reads the disk once, and each clone it admits holds its room for the ones after

@@ -342,7 +342,15 @@ impl Harness {
         let done = trust_facts::remeasured(&base, &again).expect("one key, one host, one driver");
         trust_facts::file_record(&self.store(), &done).unwrap();
         let f = self.project_record(&done);
+        let round = done.provenance.as_ref().unwrap().remeasured.last().unwrap();
+        let (date_head, name) = round.rsplit_once(' ').unwrap();
+        assert_eq!(name, "alpha");
+        let (_, measured_head) = date_head.split_once(' ').unwrap();
+        let (f_floor, f_other, f_why) = self.floor_at(measured_head);
         let next = self.cleared(&[
+            ("f_floor", f_floor),
+            ("f_other", f_other),
+            ("f_why", f_why),
             ("f_proved", f.proved),
             ("f_lapsed", f.lapsed),
             ("m_src", f.m_src),
@@ -539,16 +547,20 @@ fn the_real_filing_and_reader_conform_to_the_facts_contract() {
 fn the_real_remeasure_completes_the_record_of_its_key() {
     let mut h = Harness::new("clock");
     h.edit_source();
+    h.edit_source();
     h.raise();
     h.run_under_load();
-    h.assemble();
-    assert_eq!(h.answer(), (1, 2), "0 proved, 1 lapsed, floor 1: undecided");
-    h.lower();
     h.raise();
+    h.assemble();
+    assert_eq!(h.answer(), (1, 2), "1 proved, 1 lapsed, floor 2: undecided");
     h.remeasure();
     h.assemble();
     assert_eq!(h.answer(), (1, 1), "measured again on the same key: PASS");
     assert_eq!(h.state["m_src"], h.state["f_src"]);
+    h.lower();
+    h.refuses_a_pass("a replay against the original run's floor of 1");
+    h.assemble();
+    assert_eq!(h.answer(), (1, 2), "below the remeasurement's floor of 2");
 }
 
 #[test]

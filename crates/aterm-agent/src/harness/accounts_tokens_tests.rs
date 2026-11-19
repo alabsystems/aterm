@@ -1114,7 +1114,6 @@ fn a_minted_token_is_in_the_vault_and_its_row_holds_every_field() {
 
     let row = scratch.table().rows.remove(KEY).expect("the row");
     assert_eq!(row.key, KEY);
-    assert_eq!(row.email, EMAIL);
     assert_eq!(row.account_id.as_deref(), Some("c-0123456789ab"));
     assert_eq!(row.label.as_deref(), Some("work"));
     assert_eq!(row.entry, key().entry());
@@ -2256,13 +2255,13 @@ fn every_offered_step_passes_the_preflight() {
     }
 }
 
-/// THE TABLE ROUND-TRIPS every field, and a row whose key is not a lab key is left out.
+/// THE TABLE ROUND-TRIPS every field at this build's schema, and a row whose key is not a lab key
+/// is left out; a file of a schema this build does not know is refused.
 #[test]
 fn the_table_round_trips() {
     let mut table = Table::default();
     let row = TokenRow {
         key: KEY.to_owned(),
-        email: EMAIL.to_owned(),
         account_id: Some("c-0123456789ab".to_owned()),
         label: Some("work".to_owned()),
         entry: key().entry(),
@@ -2274,8 +2273,6 @@ fn the_table_round_trips() {
         used_on: UsedOn {
             first_served_at: Some(NOW + 1),
             last_served_at: Some(NOW + 2),
-            peers: vec!["m7".to_owned()],
-            peers_read_at: Some(NOW + 3),
         },
         vault: InVault::Overtaken("m7".to_owned()),
         verified: Some(NOW + 4),
@@ -2316,7 +2313,8 @@ fn the_table_round_trips() {
     let checks = table.checks_json();
     assert_eq!(
         Table::from_json(text.as_bytes()).and_then(|read| read.with_checks(checks.as_bytes())),
-        Some(table.clone())
+        Some((table.clone(), false)),
+        "this build's own files are of its schema, not the earlier one"
     );
     let bare = Table::from_json(text.as_bytes()).expect("a table");
     assert_eq!(
@@ -2326,7 +2324,11 @@ fn the_table_round_trips() {
     );
     let foreign = text.replace(KEY, "not-a-key");
     assert_eq!(Table::from_json(foreign.as_bytes()), Some(Table::default()));
-    assert_eq!(Table::from_json(b"{\"schema\":2,\"rows\":[]}"), None);
+    assert_eq!(Table::from_json(b"{\"schema\":3,\"rows\":[]}"), None);
+    assert_eq!(
+        Table::default().with_checks(b"{\"schema\":3,\"checks\":[],\"replaced\":[]}"),
+        None
+    );
     for event in [
         TokenEvent::Minted,
         TokenEvent::Served,
@@ -2340,6 +2342,333 @@ fn the_table_round_trips() {
     ] {
         let note = journal::token_note(event, journal::Key::new(KEY).unwrap(), NOW, None);
         assert!(journal::KINDS.contains(&note.kind), "{}", note.kind);
+    }
+}
+
+/// The account address the record tests below use: a fixture, which no file may hold.
+const ADA: &str = "ada@x.example";
+
+/// Asserts that the table file `bytes` (`tokens.json`'s `rows`, or the check file's kept rows
+/// under `replaced`) is of this build's schema, which every earlier build refuses (it reads
+/// schema 1 alone), and holds `count` rows, none with an address anywhere in it, an
+/// `email` field or a peer list (`used_on.peers`, `used_on.peers_read_at`).
+fn holds_no_address_or_peers(bytes: &[u8], rows: &str, count: usize, why: &str) {
+    let text = String::from_utf8_lossy(bytes);
+    assert!(!text.contains('@'), "{why}: an address in {text}");
+    let value: aterm_json::Value = aterm_json::from_slice(bytes).expect("a JSON file");
+    let schema = value.get("schema").and_then(aterm_json::Value::as_i64);
+    assert_eq!(
+        schema,
+        Some(SCHEMA),
+        "{why}: not of this build's schema: {text}"
+    );
+    // Every earlier build reads schema 1 alone ([`EARLIER_SCHEMA`]) and requires `email` of a
+    // row: a file of schema 1 with none would read to it as a table with no rows.
+    assert_ne!(
+        schema,
+        Some(1),
+        "{why}: of the schema an earlier build reads, which would take its rows as absent: {text}"
+    );
+    let held = value
+        .get(rows)
+        .and_then(aterm_json::Value::as_array)
+        .unwrap_or_else(|| panic!("{why}: no `{rows}` in {text}"));
+    assert_eq!(held.len(), count, "{why}: {text}");
+    for row in held {
+        assert!(row.get("email").is_none(), "{why}: an email field in {row}");
+        let used = row.get("used_on").expect("its use here");
+        for field in ["peers", "peers_read_at"] {
+            assert!(used.get(field).is_none(), "{why}: `{field}` in {row}");
+        }
+    }
+}
+
+/// A TOKEN RECORD HOLDS NO ADDRESS AND NO PEER LIST, AND AN OLD ONE IS REWRITTEN WITHOUT THEM
+/// (`docs/DESIGN-shared-files-2026-11-11.md` §6; tracker package SF-09b). A row this build makes,
+/// a mint's ([`record`]) and one made from the vault's meta ([`row_of_token`], here the kept row
+/// of the older token the vault still holds), is written to `tokens.json` and the check file at
+/// this build's schema, which an earlier build refuses rather than reading its rows as absent,
+/// with neither the account's address nor a peer list, though the account and the meta the rows
+/// are made from name the address. A `tokens.json` and a check file an earlier build wrote
+/// ([`EARLIER_SCHEMA`]), each row with its clear `email` and a fleet survey's `used_on.peers` and
+/// `peers_read_at`, read with every other field as written (the dropped ones ignored) and say
+/// they are stale; the surfaces' read ([`rewrite_stale`]) writes both again at this build's
+/// schema without those fields, the rows unchanged, and a second read writes nothing. A clean
+/// `tokens.json` beside an earlier build's check file (an earlier rewrite wrote `tokens.json`
+/// alone while the check file did not read) is stale by the check file alone, and the read writes
+/// it again, its kept row unchanged.
+/// NEGATIVE CONTROLS (2026-11-17, by hand, committed first, then restored from HEAD): with
+/// `row_json` writing `used_on.peers` again, "a mint's row" fails on `peers`; with
+/// `update_parts` writing only a changed table (its `stale` ignored), "rewritten" fails; with
+/// [`SCHEMA`] back at 1, "a mint's row" fails as of the schema an earlier build reads; with
+/// `read_parts` taking no staleness from the check file, "an old check file beside a clean
+/// table" fails.
+#[test]
+fn a_token_record_holds_no_address_and_no_peer_list_and_an_old_one_is_rewritten_without_them() {
+    let Answer::Found(newer) = standing(Check::Readable, NOW + A_YEAR, true, true, &[]) else {
+        panic!("a standing");
+    };
+    let mut meta = newer.meta.clone().expect("a meta");
+    meta.email = ADA.to_owned();
+    meta.minted_at = NOW;
+    let account = Account {
+        email: ADA.to_owned(),
+        ..work_account()
+    };
+
+    // A new record: a mint's row, then the kept row of the older token the vault still holds.
+    let scratch = Scratch::new("no-address");
+    let store = scratch.store();
+    record(&store, &account, &meta, InVault::InVault, None).expect("a mint's row");
+    let bytes =
+        |store: &Store, file: &str| std::fs::read(store.shared_dir().join(file)).expect("the file");
+    holds_no_address_or_peers(&bytes(&store, TABLE_FILE), "rows", 1, "a mint's row");
+    let mut older = (*newer).clone();
+    if let Some(older) = older.meta.as_mut() {
+        older.email = ADA.to_owned();
+    }
+    let older_meta = older.meta.clone().expect("a meta");
+    update_table(&store, |table| {
+        let (_, held) = row_of_token(table, &older, &older_meta);
+        assert_eq!(
+            held,
+            Held::Replaced,
+            "the vault's older token gets the kept row"
+        );
+    })
+    .expect("the kept row");
+    holds_no_address_or_peers(
+        &bytes(&store, TABLE_FILE),
+        "rows",
+        1,
+        "the table beside a kept row",
+    );
+    holds_no_address_or_peers(&bytes(&store, CHECK_FILE), "replaced", 1, "a kept row");
+    let made = read_table(&store).expect("the table");
+    assert_eq!(made.rows[KEY].minted_at, Some(NOW), "{made:?}");
+    assert_eq!(made.replaced[KEY].minted_at, Some(NOW - 86_400), "{made:?}");
+
+    // An old record: both files as an earlier build wrote them.
+    let scratch = Scratch::new("old-record");
+    let store = scratch.store();
+    store.ensure().expect("the store");
+    let dir = store.shared_dir();
+    let old_row = |minted_at: u64| {
+        format!(
+            r#"{{"key":"{KEY}","email":"{ADA}","account_id":"c-0123456789ab","label":"work","entry":"{entry}","minted_at":{minted_at},"expires_at":{ends},"expiry_from":"printed","minted_on":"m22","signer":"m22","used_on":{{"here":{{"first_served_at":{first},"last_served_at":{last}}},"peers":["m7","m9"],"peers_read_at":{read}}},"vault":"in-vault","vault_detail":null,"verified":{verified},"removed_at":null}}"#,
+            entry = key().entry(),
+            ends = NOW + A_YEAR,
+            first = NOW + 1,
+            last = NOW + 2,
+            read = NOW + 3,
+            verified = NOW + 4,
+        )
+    };
+    let old_table = format!(
+        r#"{{"schema":1,"rows":[{}],"offers":[{{"key":"{KEY}","pair":"none:-/ok:-","at":{NOW}}}],"posts":[]}}"#,
+        old_row(NOW)
+    );
+    let old_checks = format!(
+        r#"{{"schema":1,"checks":[],"replaced":[{}]}}"#,
+        old_row(NOW - 86_400)
+    );
+    aterm_uds::private_file::write_private(&dir, TABLE_FILE, old_table.as_bytes())
+        .expect("the old table");
+    aterm_uds::private_file::write_private(&dir, CHECK_FILE, old_checks.as_bytes())
+        .expect("the old checks");
+    for file in [TABLE_FILE, CHECK_FILE] {
+        let text = String::from_utf8(bytes(&store, file)).expect("text");
+        assert!(
+            text.contains(ADA),
+            "the old {file} holds the address: {text}"
+        );
+    }
+    let read = read_parts(&store).expect("an old table reads");
+    assert!(read.stale, "the old fields are seen");
+    assert_eq!(read.unchecked, None);
+    let row = TokenRow {
+        key: KEY.to_owned(),
+        account_id: Some("c-0123456789ab".to_owned()),
+        label: Some("work".to_owned()),
+        entry: key().entry(),
+        minted_at: Some(NOW),
+        expires_at: Some(NOW + A_YEAR),
+        expiry_from: Some("printed".to_owned()),
+        minted_on: Some("m22".to_owned()),
+        signer: Some("m22".to_owned()),
+        used_on: UsedOn {
+            first_served_at: Some(NOW + 1),
+            last_served_at: Some(NOW + 2),
+        },
+        vault: InVault::InVault,
+        verified: Some(NOW + 4),
+        verification: Verification::default(),
+        removed_at: None,
+    };
+    assert_eq!(
+        read.table.rows.get(KEY),
+        Some(&row),
+        "every other field reads"
+    );
+    assert_eq!(
+        read.table.replaced.get(KEY),
+        Some(&TokenRow {
+            minted_at: Some(NOW - 86_400),
+            ..row.clone()
+        }),
+        "the kept row reads"
+    );
+    assert_eq!(read.table.offers[KEY].at, NOW);
+
+    assert!(rewrite_stale(&store).expect("rewritten"), "rewritten");
+    holds_no_address_or_peers(&bytes(&store, TABLE_FILE), "rows", 1, "rewritten");
+    holds_no_address_or_peers(
+        &bytes(&store, CHECK_FILE),
+        "replaced",
+        1,
+        "rewritten checks",
+    );
+    let again = read_parts(&store).expect("the rewritten table");
+    assert!(!again.stale, "nothing old is left");
+    assert_eq!(again.table, read.table, "the rows are as they were");
+    let (table, checks) = (bytes(&store, TABLE_FILE), bytes(&store, CHECK_FILE));
+    assert!(
+        !rewrite_stale(&store).expect("read"),
+        "a second read writes nothing"
+    );
+    assert_eq!(
+        (bytes(&store, TABLE_FILE), bytes(&store, CHECK_FILE)),
+        (table.clone(), checks)
+    );
+
+    // A clean `tokens.json` beside an earlier build's check file.
+    aterm_uds::private_file::write_private(&dir, CHECK_FILE, old_checks.as_bytes())
+        .expect("the old checks again");
+    let beside = read_parts(&store).expect("reads");
+    assert!(beside.stale, "an old check file beside a clean table");
+    assert_eq!(beside.unchecked, None);
+    assert!(rewrite_stale(&store).expect("rewritten"), "rewritten");
+    holds_no_address_or_peers(
+        &bytes(&store, CHECK_FILE),
+        "replaced",
+        1,
+        "the check file rewritten beside a clean table",
+    );
+    assert_eq!(
+        bytes(&store, TABLE_FILE),
+        table,
+        "the clean table as it was"
+    );
+    let after = read_parts(&store).expect("reads");
+    assert!(!after.stale, "nothing old is left");
+    assert_eq!(after.table, read.table, "the kept row is as it was");
+}
+
+/// AN OLD TABLE BESIDE A CHECK FILE THAT DOES NOT READ LOSES ITS ADDRESS ALL THE SAME, AND THE
+/// CHECK FILE IS LEFT AS IT IS (`docs/DESIGN-shared-files-2026-11-11.md` §6; tracker package
+/// SF-09b): a check file restored with the wrong mode does not read, so none of its verdicts or
+/// kept rows is known and nothing is written over it ([`TableRead::unchecked`]); the surfaces'
+/// read ([`rewrite_stale`]) changes no verdict, so it writes `tokens.json` alone, at this build's
+/// schema and with no address, its rows as they were, and a later read finds nothing stale and
+/// writes nothing.
+/// NEGATIVE CONTROL (2026-11-17, by hand, then restored): with `rewrite_stale` writing through
+/// [`update_table`] (the whole table, refused where the check file does not read), it fails with
+/// the check file's error and the old address stays.
+#[test]
+fn an_old_table_beside_a_check_file_that_does_not_read_loses_its_address_and_the_checks_stay() {
+    let scratch = Scratch::new("old-unchecked");
+    let store = scratch.store();
+    store.ensure().expect("the store");
+    let dir = store.shared_dir();
+    let entry = key().entry();
+    let old_table = format!(
+        r#"{{"schema":1,"rows":[{{"key":"{KEY}","email":"{ADA}","label":"work","entry":"{entry}","minted_at":{NOW},"used_on":{{"here":{{"first_served_at":{NOW},"last_served_at":{NOW}}},"peers":["m7"],"peers_read_at":{NOW}}},"vault":"in-vault"}}],"offers":[],"posts":[]}}"#
+    );
+    aterm_uds::private_file::write_private(&dir, TABLE_FILE, old_table.as_bytes())
+        .expect("the old table");
+    let checks = format!(
+        r#"{{"schema":1,"checks":[],"replaced":[{{"key":"{KEY}","email":"{ADA}","entry":"{entry}","minted_at":{},"vault":"in-vault"}}]}}"#,
+        NOW - 86_400
+    );
+    let check_file = dir.join(CHECK_FILE);
+    std::fs::write(&check_file, &checks).expect("a check file");
+    std::fs::set_permissions(
+        &check_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .expect("the wrong mode");
+    let read = read_parts(&store).expect("the table reads");
+    assert!(read.unchecked.is_some(), "the check file does not read");
+    assert!(read.stale, "the old table is seen");
+    assert!(
+        rewrite_stale(&store).expect("tokens.json is written"),
+        "tokens.json is written"
+    );
+    let table = std::fs::read(dir.join(TABLE_FILE)).expect("the table");
+    holds_no_address_or_peers(&table, "rows", 1, "tokens.json beside unread checks");
+    assert_eq!(
+        std::fs::read(&check_file).expect("the check file"),
+        checks.as_bytes(),
+        "the check file is never written over"
+    );
+    let again = read_parts(&store).expect("the table reads");
+    assert!(!again.stale, "nothing that reads is old");
+    assert_eq!(again.table, read.table, "the rows are as they were");
+    assert!(!rewrite_stale(&store).expect("read"), "nothing is written");
+    assert_eq!(
+        std::fs::read(dir.join(TABLE_FILE)).expect("the table"),
+        table
+    );
+}
+
+/// `tokens.json` as an earlier build wrote it ([`EARLIER_SCHEMA`]): one row of [`KEY`] with the
+/// clear address [`ADA`] and a fleet survey's peers.
+pub(in crate::harness) fn earlier_table() -> String {
+    format!(
+        r#"{{"schema":1,"rows":[{{"key":"{KEY}","email":"{ADA}","label":"work","entry":"{}","minted_at":{NOW},"used_on":{{"here":{{"first_served_at":{NOW},"last_served_at":{NOW}}},"peers":["m7"],"peers_read_at":{NOW}}},"vault":"in-vault"}}],"offers":[],"posts":[]}}"#,
+        key().entry()
+    )
+}
+
+/// AN ACCOUNTS REPORT TAKES AN EARLIER BUILD'S ADDRESS OFF THE DISK, WITH A VAULT OR NONE
+/// (`docs/DESIGN-shared-files-2026-11-11.md` §6; tracker package SF-09b): the report's vault
+/// tokens section ([`crate::harness::cli::token_report`]) writes `tokens.json` an earlier build
+/// left with an address and a survey's peers in it again at this build's schema, without them,
+/// before it asks the host for a vault, so a Mac that has left its vault keeps none on disk
+/// either; with no vault it still reports none.
+/// NEGATIVE CONTROLS (2026-11-17, by hand, then restored): with `token_report`'s
+/// `rewrite_stale` removed, "with a vault" fails on the address; with it after the vault gate,
+/// "with no vault" does.
+#[test]
+fn an_accounts_report_rewrites_an_earlier_builds_table_with_a_vault_or_none() {
+    use crate::harness::accounts_token_view::Report;
+    for (case, vault) in [
+        (
+            "with a vault",
+            Some(VaultOf::Fake(FakeVault::new(Answer::Absent))),
+        ),
+        ("with no vault", None),
+    ] {
+        let scratch = Scratch::new("report-rewrites");
+        let store = scratch.store();
+        store.ensure().expect("the store");
+        let dir = store.shared_dir();
+        aterm_uds::private_file::write_private(&dir, TABLE_FILE, earlier_table().as_bytes())
+            .expect("the old table");
+        let has_vault = vault.is_some();
+        let host = Host {
+            vault,
+            ..Host::new(VaultOf::Fake(FakeVault::new(Answer::Absent)))
+        };
+        let report = crate::harness::cli::token_report(&scratch.env(), &host);
+        assert_eq!(
+            matches!(report, Report::NoVault),
+            !has_vault,
+            "{case}: {}",
+            report.text()
+        );
+        let table = std::fs::read(dir.join(TABLE_FILE)).expect("the table");
+        holds_no_address_or_peers(&table, "rows", 1, case);
     }
 }
 
@@ -2743,12 +3072,17 @@ fn a_refusal_marks_the_token_rejected_here_once() {
     );
     let row = scratch.table().rows.remove(KEY).expect("the row");
     assert_eq!(
-        (row.minted_at, row.verified, row.vault, row.email.as_str()),
+        (
+            row.minted_at,
+            row.verified,
+            row.vault,
+            row.account_id.as_deref()
+        ),
         (
             Some(NOW - 86_400),
             Some(NOW - 3_600),
             InVault::InVault,
-            EMAIL
+            Some("c-0123456789ab")
         )
     );
     assert!(!note_rejected(&paths, &store, &standing, 401, NOW + 60).expect("read"));
@@ -4424,7 +4758,7 @@ fn a_code_pages_step_is_let_through_once_the_vault_delivers_the_accounts_mailbox
         "the vault's entry was written as a file"
     );
     assert_eq!(
-        token_steps::route_at(&store, Some(&home), EMAIL),
+        token_steps::route_at(&store, Some(&home), Some(EMAIL)),
         None,
         "a file dated the vault's entry"
     );

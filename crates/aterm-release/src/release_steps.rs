@@ -1693,6 +1693,9 @@ impl Drop for Real {
     }
 }
 
+#[path = "release_steps_format.rs"]
+mod snapshot_format;
+
 impl Real {
     fn require_compiler(&self, commit: &str, prover: &Prover) -> Result<(), String> {
         if self.compiler_source.as_deref() != Some(commit)
@@ -3502,7 +3505,7 @@ impl Real {
             .current_dir(&self.repo);
         // Keep Cargo's actual dirty-unit reasons beside the artifact counts. A
         // later cut must distinguish a source delta from cache invalidation.
-        command.env("CARGO_LOG", "targo::compiler::fingerprint=info");
+        command.env("CARGO_LOG", crate::buildplan::FINGERPRINT_LOG);
         plan.apply_to_command(&mut command)
             .map_err(|e| format!("configure {} build environment: {e}", bin.what))?;
         plan.prepare()
@@ -9351,19 +9354,116 @@ impl Real {
     }
 }
 
+/// [`Backend::exec_cutter`]'s refusal where R's frozen cutter could not be selected, built or
+/// executed (`why`): its remedy is the same run again from the clone `repo` (`retry`), and where
+/// `why` is the build-inputs seal meeting a stock release that is not in place
+/// ([`crate::build_inputs::stock_gap`]: a dry run installs nothing, so its freeze meets R's
+/// release missing where a real run's acquisition would have put it there), what puts that
+/// release in place first, said of `repo`, the checkout it names, as the same run again would
+/// meet it too.
+fn frozen_cutter_refusal(why: &str, repo: &Path, retry: &str) -> Refusal {
+    let remedy = crate::build_inputs::stock_gap_remedy(why).map_or_else(
+        || retry.to_owned(),
+        |stock| {
+            format!(
+                "{stock} (this checkout: {}); then {retry}",
+                crate::release::shell_word(&repo.to_string_lossy())
+            )
+        },
+    );
+    Refusal::new(format!("cannot exec R's frozen cutter ({why})"), remedy)
+}
+
+/// A real run's refusal where the rustup row's release part did not put the stock release
+/// `release` (trust.lock's `[stock]`) in place with the x86_64 slice's std (`ran`), or a dry
+/// run's read of it met what a real run would meet before it changed anything (`!ran`): `why`
+/// names each step that failed, or the rustup the row could not resolve. COULD NOT RUN: the
+/// machine, not the tree, lacks it.
+fn stock_unavailable(release: &str, why: &str, ran: bool) -> Refusal {
+    Refusal::new(
+        format!(
+            "the rustup row's release part {} the stock release {release} trust.lock's [stock] \
+             names in place with the x86_64 slice's std: {why}",
+            if ran { "did not put" } else { "cannot put" }
+        ),
+        format!("{} and retry the release", crate::gates::X86_SLICE_REMEDIES),
+    )
+    .could_not_run()
+}
+
+/// [`Backend::stock_toolchain`] in the repository `git`, over rustup's homes `homes` (`None`:
+/// this process names no HOME to find them in) and through `rustup`: the stock release commit
+/// `commit`'s `trust.lock` names in `[stock]` ([`crate::trust_lock::stock_toolchain_at`],
+/// whatever lock the working tree holds, so a dry run that never moved the clone reads the
+/// candidate's), then in a dry run (`dry`) only the read of what the rustup row's release part
+/// would run ([`aterm_verify::provision::stock::missing_release`]), and in a real run that
+/// acquisition itself ([`aterm_verify::provision::stock::run_release`]), each step it says
+/// passed to `say`. `None`: the release was in place with its stds. A commit that names no
+/// stock release is a plain refusal, the tree's defect, asked of no rustup; no homes is COULD
+/// NOT RUN asking to set HOME and retry, asked of no rustup; no rustup the row resolves and a
+/// step that failed are COULD NOT RUN naming `verify provision rustup` ([`stock_unavailable`]).
+fn stock_toolchain_of(
+    git: &dyn GitRunner,
+    commit: &str,
+    homes: Option<&aterm_verify::provision::stock::Homes>,
+    rustup: &dyn aterm_verify::provision::stock::Rustup,
+    dry: bool,
+    say: &mut dyn FnMut(&str),
+) -> Result<Option<String>, Refusal> {
+    let release = crate::trust_lock::stock_toolchain_at(git, commit).map_err(|why| {
+        Refusal::new(
+            why,
+            "release a commit whose trust.lock names the stock release in [stock] \
+             (`atpkg-publish adopt` writes it)",
+        )
+    })?;
+    let homes = homes.ok_or_else(|| {
+        Refusal::new(
+            "cannot resolve the rustup row's homes to put the stock release in place",
+            "set HOME and retry",
+        )
+        .could_not_run()
+    })?;
+    if dry {
+        let steps = aterm_verify::provision::stock::missing_release(&release, homes, rustup)
+            .map_err(|why| stock_unavailable(&release, &why, false))?;
+        return Ok((!steps.is_empty()).then(|| {
+            format!(
+                "a real run puts the stock release {release} (trust.lock's [stock]) in place \
+                 with the x86_64 slice's std before anything reads it: {}",
+                steps.join("; ")
+            )
+        }));
+    }
+    let mut lines = Vec::new();
+    let acquired =
+        aterm_verify::provision::stock::run_release(&release, homes, rustup, &mut |line| {
+            say(line);
+            lines.push(line.to_string());
+        });
+    let acquired = acquired.map_err(|why| stock_unavailable(&release, &why, true).detail(lines))?;
+    Ok((!acquired.is_empty()).then(|| {
+        format!(
+            "put the stock release {release} (trust.lock's [stock]) in place with the x86_64 \
+             slice's std: {}",
+            acquired.join("; ")
+        )
+    }))
+}
+
 impl Backend for Real {
     fn follower(&mut self, base: &str) -> Option<String> {
         let read = || -> Result<String, String> {
             let remote = crate::github_remote::Remote::origin(&self.repo)?;
             Ok(match remote.follower(base)? {
-                Some((state, description)) => {
-                    format!("follower: base {base}: {state}: {description} (advisory)")
+                Some(record) => {
+                    format!("follower: base {base}: {} (advisory)", record.summary())
                 }
                 None => format!("follower: base {base}: not judged (advisory)"),
             })
         };
         Some(read().unwrap_or_else(|why| {
-            format!("follower: base {base}: status unavailable: {why} (advisory)")
+            format!("follower: base {base}: verdict unavailable: {why} (advisory)")
         }))
     }
     fn prepare_sign(
@@ -9601,13 +9701,17 @@ impl Backend for Real {
     /// Take the claim of `expected_previous` and record its supersession by `line`. An origin
     /// that cannot be read refuses before anything is taken. The take compares the claim it
     /// swaps from with `expected_previous` ([`Take::Supersede`]), so a line that advanced since
-    /// this run judged it is refused with nothing taken and its holder running. What becomes of
+    /// this run judged it is refused with nothing taken and its holder running. A run the release
+    /// pump started as a line's re-base also admits the holder as a contender does
+    /// ([`Take::Rebase`]): a holder that took the line after the pump looked keeps it, and the
+    /// run ends beside it (`CUTTING ELSEWHERE:`, exit 4). What becomes of
     /// the claim then follows from how the supersession ended ([`Held`]): kept once it is
     /// durable, handed back to the holder it displaced
     /// ([`crate::line_claim::Claim::hand_back`]) where nothing of this run's own is on main,
     /// and let go without a hand-back where this run's own record write has an unknown outcome.
     ///
     /// [`Take::Supersede`]: crate::line_claim::Take::Supersede
+    /// [`Take::Rebase`]: crate::line_claim::Take::Rebase
     fn supersede_line(&mut self, expected_previous: &Line, line: &Line) -> SupersedeResult {
         let requested = supersession_record(expected_previous.clone(), line.clone());
         self.prefetched_origin = None;
@@ -9622,7 +9726,7 @@ impl Backend for Real {
             &self.repo,
             expected_previous,
             &self.logs,
-            crate::line_claim::Take::Supersede,
+            crate::line_claim::Take::supersession(),
         ) {
             Ok(claim) => claim,
             Err(why) => return self.classify_after_claim_stop(&requested, why),
@@ -10084,6 +10188,10 @@ impl Backend for Real {
         prover: &Prover,
     ) -> Result<String, InputFinding> {
         self.input_checks_using(base, tip, prover, Self::input_engine)
+    }
+
+    fn snapshot_format(&mut self, commit: &str, prover: &Prover) -> Result<(), InputFinding> {
+        snapshot_format::check(self, commit, prover)
     }
 
     fn released_shim(&mut self, c: &Candidate) -> Result<String, InputFinding> {
@@ -10614,6 +10722,19 @@ impl Backend for Real {
         Ok("all pinned prerequisites and the source-signing helper are ready".into())
     }
 
+    fn stock_toolchain(&mut self, commit: &str, dry: bool) -> Result<Option<String>, Refusal> {
+        let machine = aterm_verify::provision::this_machine(&self.repo);
+        let system = aterm_verify::provision::System::new(&self.repo);
+        stock_toolchain_of(
+            &self.git(),
+            commit,
+            machine.as_ref().map(|machine| &machine.homes),
+            aterm_verify::provision::Host::rustup(&system),
+            dry,
+            &mut |line| println!("stock toolchain: {line}"),
+        )
+    }
+
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal> {
         self.main_to(commit)?;
         self.submodule_sync(Step::Commit)?;
@@ -10708,12 +10829,8 @@ impl Backend for Real {
 
     fn exec_cutter(&mut self, commit: &str, prover: &Prover) -> Result<(), Refusal> {
         let retry = self.cutter_retry();
-        let cannot = |why: String| {
-            Refusal::new(
-                format!("cannot exec R's frozen cutter ({why})"),
-                retry.clone(),
-            )
-        };
+        let repo = self.repo.clone();
+        let cannot = |why: String| frozen_cutter_refusal(&why, &repo, &retry);
         if interrupt::caught().is_some() {
             return Err(cannot("not started: the release was interrupted".into()));
         }
@@ -13321,7 +13438,8 @@ fn checked_with(
     if opts.compat {
         std::fs::create_dir_all(repo.join("dist")).map_err(|e| e.to_string())?;
         // The commit's own lock names the release its compat slice builds on: one that names
-        // none is the commit's defect, a release missing here is this machine's.
+        // none is the commit's defect, a release missing here is this machine's, and what
+        // installs it is named for that commit, whose release this checkout's lock may not name.
         let outcome = match crate::trust_lock::stock_toolchain_at(&git, &found.commit) {
             Err(why) => Outcome::Refuse(Refusal::new(
                 why,
@@ -13336,9 +13454,17 @@ fn checked_with(
             }) {
                 Ok(Ok(why)) => Outcome::Pass(why),
                 Ok(Err(why)) => Outcome::Refuse(Refusal::new(why, "fix the stock compat slice")),
-                Err(why) => {
-                    Outcome::CouldNotRun(Refusal::new(why, "provide the compat compiler and std"))
-                }
+                Err(why) => Outcome::CouldNotRun(Refusal::new(
+                    why,
+                    format!(
+                        "{}, then this check again",
+                        crate::buildplan::stock_install_remedy(
+                            &stock,
+                            &found.commit,
+                            crate::trust_lock::stock_toolchain_in(repo).ok().as_deref(),
+                        )
+                    ),
+                )),
             },
         };
         add(&mut found, "stock-x86_64", outcome);

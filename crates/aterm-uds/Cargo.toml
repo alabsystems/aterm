@@ -14,8 +14,10 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 # this crate supplies their native reads and keeps process custody. A `trace`
 # reads by aterm-time's raw-read count and aterm-digest's SHA-256.
 [dependencies]
+# Shared with tempfile below this crate, avoiding a cycle through its allocator.
+aterm-backup = { workspace = true }
 # Quiet placement for process-lifetime test roots, including short socket roots. The
-# allocator is dependency-free; its reverse edge to this crate is test-only.
+# allocator depends only on the backup attribute helper; its reverse edge here is test-only.
 aterm-tempfile = { workspace = true }
 # Shared observation values and the count rule, without statistical judgments.
 aterm-process-facts = { workspace = true }

@@ -1375,6 +1375,7 @@ fn a_low_session_of_a_cli_with_no_usage_probe_is_never_told_to_probe() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     assert_eq!(
         accounts::advise_for(

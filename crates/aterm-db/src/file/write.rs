@@ -49,10 +49,18 @@ pub struct Env<'a> {
     /// The publisher's bound; zero queues the write for a later pass and runs no publisher, so
     /// a write made under another lock takes no custody.
     pub attempt: Duration,
+    /// The journal spool the verb's own publisher pass notes what it signed in
+    /// ([`publish::Pass::journal`]): this user's (`crate::alab::upkeep::journal_spool`) for
+    /// `aterm file`.
+    pub journal: Option<&'a crate::alab::journal::Spool>,
     /// Answer as one JSON object (`--json`).
     pub json: bool,
     /// What the verb's standard input held, for `set … --stdin`; `None` where it was not read.
     pub stdin: Option<&'a str>,
+    /// Who makes the write, why and on what evidence, read in the verb's own process
+    /// ([`crate::said::here`]): its intent keeps it, and the record that publishes it carries it
+    /// where the table's generation takes version 2 records, whichever process publishes it.
+    pub said: Option<&'a crate::said::Said>,
     /// Open a face in an Editor tab with the caret on a 1-based line, and when asked to wait,
     /// return once the tab is closed (`edit`).
     pub editor: &'a dyn Fn(&Path, usize, bool) -> Result<(), String>,
@@ -129,6 +137,16 @@ impl Target {
         })
     }
 
+    /// The generation of this file's own family named `table` (`<application>/<role>`): the one a
+    /// baseline was laid out at, whichever family the file is of, registered or not.
+    pub(super) fn generation(&self, table: &str) -> Option<&'static att::Compiled> {
+        let (family, _) = self.file.table()?;
+        family
+            .chain()
+            .into_iter()
+            .find(|compiled| compiled.matches_name(table))
+    }
+
     /// The baseline of the snapshot here, and the collection it was laid out at.
     fn baseline(&self) -> Result<(Base, &'static Collection), Refusal> {
         let rev = self.rev;
@@ -142,9 +160,10 @@ impl Target {
         let base = super::face::Baseline::decode(&bytes)
             .ok_or_else(stale)?
             .grid;
-        let collection = att::find(&base.table)
-            .and_then(|compiled| compiled.collection(&base.collection))
-            .map_err(|_| stale())?;
+        let collection = self
+            .generation(&base.table)
+            .and_then(|compiled| compiled.collection(&base.collection).ok())
+            .ok_or_else(stale)?;
         if collection.name != self.collection.name {
             return Err(stale());
         }
@@ -238,6 +257,32 @@ fn hex(digests: &[astream_wire::sync::Digest]) -> Vec<String> {
         .collect()
 }
 
+/// The guard the outbox holds a cell of a column of type `ty` to, as the table's own type check
+/// does: the lab tracker's prose, command and path types (`guard::prose`, `guard::command`,
+/// `values::path`) refuse of a value's shape only a real secret, and a commit (`values::commit`)
+/// and a digest (`values::digest`) are lower-case hex, so a commit's full hash, a digest or a
+/// long path stands there; every other column keeps the free-text guard. A set or a list is judged by its members' type, and a record, which
+/// an intent carries as one value, as its members of those types are: a package's `exit` names a
+/// command, which holds a test's long path, so the record is held to the secret rule alone and
+/// the table's own check of each member (`cell::change`, when the intent is published) still
+/// holds every other member to its type.
+pub(super) fn judged(ty: &Ty) -> outbox::Judged {
+    match ty {
+        Ty::Prose(_) | Ty::Command(_) | Ty::Path | Ty::Commit | Ty::Digest => {
+            outbox::Judged::Secret
+        }
+        Ty::Set(member) | Ty::List(member, _) => judged(member),
+        Ty::Struct(members)
+            if members
+                .iter()
+                .any(|member| judged(&member.ty) == outbox::Judged::Secret) =>
+        {
+            outbox::Judged::Secret
+        }
+        _ => outbox::Judged::Text,
+    }
+}
+
 /// `edit` as the outbox keeps it.
 pub(super) fn kept(column: &Column, edit: grid::Edit, born: bool) -> Edit {
     let text = match (&column.ty, &edit.elem) {
@@ -253,7 +298,19 @@ pub(super) fn kept(column: &Column, edit: grid::Edit, born: bool) -> Edit {
         value: edit.x,
         text,
         expected: hex(&edit.expected),
+        judged: judged(&column.ty),
     }
+}
+
+/// Whether a new row of `collection` needs a value in `schema`'s column: a live column that may
+/// not be empty, that the owner writes, and that is neither the lifecycle (a new row is born
+/// live) nor a set or a secret.
+pub(super) fn required(collection: &Collection, schema: &Column) -> bool {
+    schema.live_at(collection.version)
+        && !schema.null
+        && !grid::read_only(schema)
+        && schema.name != LIFECYCLE
+        && !matches!(schema.ty, Ty::Set(_) | Ty::Secret)
 }
 
 /// The candidates the baseline at revision `rev` of `held` holds in the row `pk`'s `column`,
@@ -398,12 +455,7 @@ fn add(target: &Target, assigns: &[String]) -> Result<Vec<Edit>, Refusal> {
         edits.extend(planned.into_iter().map(|edit| kept(schema, edit, true)));
     }
     for schema in collection.columns {
-        let required = schema.live_at(collection.version)
-            && !schema.null
-            && !grid::read_only(schema)
-            && schema.name != LIFECYCLE
-            && !matches!(schema.ty, Ty::Set(_) | Ty::Secret);
-        if required && !edits.iter().any(|edit| edit.column == schema.name) {
+        if required(collection, schema) && !edits.iter().any(|edit| edit.column == schema.name) {
             return Err(problem(format!(
                 "{}: a new row needs a value for {}",
                 target.name, schema.name
@@ -435,8 +487,9 @@ fn rm(target: &Target, key: &str) -> Result<Vec<Edit>, Refusal> {
             target.name
         )));
     };
-    let ends =
-        att::find(&base.table).is_ok_and(|compiled| compiled.table.ends.contains(&collection.name));
+    let ends = target
+        .generation(&base.table)
+        .is_some_and(|compiled| compiled.table.ends.contains(&collection.name));
     let word = if ends { "ended" } else { "retired" };
     let seen = base
         .rows
@@ -654,16 +707,23 @@ pub(super) fn attempt_all(
             })
             .collect();
     }
-    let outcomes = offer(paths, config, &target.name, env.attempt, env.now_ms);
+    let outcomes = offer(
+        paths,
+        config,
+        &target.name,
+        env.attempt,
+        env.now_ms,
+        env.journal,
+    );
     ids.iter()
         .map(|id| said_of(&target.held, &outcomes, id.clone()))
         .collect()
 }
 
-/// Offer what this Mac queued for `name` to the publisher for `attempt` ([`offer`]), and say
-/// what became of the intent `id`, whose outbox folder's flush failed as `unflushed` says where
-/// it did, in a write verb's words (`published <op>`, `queued <id>: <why>` or `held <id>:
-/// <why>`, and the flush note).
+/// Offer what this Mac queued for `name` to the publisher for `attempt` ([`offer`]), noting
+/// what it signed in `journal`, and say what became of the intent `id`, whose outbox folder's
+/// flush failed as `unflushed` says where it did, in a write verb's words (`published <op>`,
+/// `queued <id>: <why>` or `held <id>: <why>`, and the flush note).
 pub(super) fn offered(
     paths: &Paths,
     config: &Path,
@@ -671,11 +731,12 @@ pub(super) fn offered(
     (id, unflushed): (&str, Option<&str>),
     attempt: Duration,
     now_ms: u64,
+    journal: Option<&crate::alab::journal::Spool>,
 ) -> String {
     let held = File::at(&super::root(&generation::original(paths)), name);
     let said = said_of(
         &held,
-        &offer(paths, config, name, attempt, now_ms),
+        &offer(paths, config, name, attempt, now_ms, journal),
         id.to_owned(),
     );
     printed(name, &said, unflushed, false).0
@@ -713,15 +774,17 @@ fn said_of(held: &File, outcomes: &[publish::Outcome], id: String) -> Said {
     }
 }
 
-/// Offer what this Mac queued for `name` to the publisher for `attempt`, and where it signed any
-/// of it, project the file again now rather than at the next pass (a pass that cannot leaves a
-/// read laying those writes over the old snapshot). Each intent's answer is in the outcomes.
+/// Offer what this Mac queued for `name` to the publisher for `attempt`, noting what it signed
+/// in `journal` ([`publish::Pass::journal`]), and where it signed any of it, project the file
+/// again now rather than at the next pass (a pass that cannot leaves a read laying those writes
+/// over the old snapshot). Each intent's answer is in the outcomes.
 pub(super) fn offer(
     paths: &Paths,
     config: &Path,
     name: &Name,
     attempt: Duration,
     now_ms: u64,
+    journal: Option<&crate::alab::journal::Spool>,
 ) -> Vec<publish::Outcome> {
     let outcomes = publish::pass(
         paths,
@@ -730,6 +793,7 @@ pub(super) fn offer(
         &publish::Pass {
             by: std::time::Instant::now() + attempt,
             now_ms,
+            journal,
         },
     );
     let signed = outcomes.iter().any(|outcome| {
@@ -805,6 +869,12 @@ pub fn verb(
     )]
     let act = OwnerAct::verb(env.by, env.session)
         .ok_or_else(|| usage("--by takes one word [a-z][a-z0-9-]{0,19}"))?;
+    let act = match env.said {
+        Some(said) => act
+            .saying(said.to_value())
+            .ok_or_else(|| usage("--reason and --evidence take at most 64 KiB together"))?,
+        None => act,
+    };
     let word = |at: usize, what: &str| -> Result<&str, Refusal> {
         words.get(at).map(String::as_str).ok_or_else(|| usage(what))
     };

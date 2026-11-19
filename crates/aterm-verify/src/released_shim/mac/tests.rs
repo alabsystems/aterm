@@ -461,9 +461,14 @@ fn a_pooled_sandbox_opens_only_its_held_fifo_and_cannot_write_the_adjacent_file(
     assert_eq!(available.len(), 2);
 }
 
+/// The helper is atpkg's standalone entry as this package's own binary
+/// (`aterm-verify-candidate-helper`, `atpkg::cli::standalone_entry`): every compile of this
+/// package's integration tests builds it (`targo test`, verify's `--tests`; a `--lib` compile
+/// alone does not), where atpkg's `[[bin]]` stands only where something built atpkg.
+/// The candidate pair names its helper by path, never by file name.
 #[test]
 fn a_real_candidate_first_build_inherits_the_charged_pool_inside_its_sandbox() {
-    let helper = aterm_tempfile::bin_exe("atpkg");
+    let helper = aterm_tempfile::bin_exe("aterm-verify-candidate-helper");
     let outside = aterm_tempfile::tempdir().unwrap();
     let pool = aterm_capacity::Jobserver::new(&outside.path().join("jobs"), 2).unwrap();
     crate::compile_width::run(Some(&pool), Some(2), None, &|| false, || {
@@ -1214,6 +1219,106 @@ fn tracked_package() -> aterm_tempfile::TempDir {
         );
     }
     dir
+}
+
+/// A build may overwrite its inputs or leave build products under the working tree. None of
+/// those writes can reach the source used by the next independent bootstrap judgment.
+#[test]
+fn placement_snapshots_preserve_tracked_edits_and_isolate_writes() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let original = tracked_package();
+    let root = original.path();
+    fs::write(root.join("Cargo.toml"), b"edited manifest").unwrap();
+    fs::set_permissions(root.join("Cargo.toml"), fs::Permissions::from_mode(0o751)).unwrap();
+    fs::remove_file(root.join("Cargo.lock")).unwrap();
+    fs::remove_file(root.join("src/lib.rs")).unwrap();
+    std::os::unix::fs::symlink("../Cargo.toml", root.join("src/lib.rs")).unwrap();
+    fs::write(root.join("untracked"), b"excluded").unwrap();
+    let env = EnvSnapshot::capture();
+    let (store, label) = installed_release(&env);
+    let state = aterm_tempfile::tempdir().unwrap();
+    let context = crate::Ctx::new(
+        root.to_owned(),
+        crate::Scope::workspace(),
+        env.clone(),
+        state.path().to_owned(),
+    );
+    let scratch = aterm_tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    let empty = scratch.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    let supports_cloning =
+        aterm_tempfile::clone_tree(&empty, &scratch.path().join("probe")).is_ok();
+    let mut source = PlacementSource::default();
+    for placement in Placement::ALL {
+        let rig = Rig::new(&env, &store, Pair::Installed, label.clone(), placement).unwrap();
+        source
+            .populate(&rig, root, &env, context.exec_env())
+            .unwrap();
+        let manifest = rig.tree.join("Cargo.toml");
+        assert_eq!(fs::read(&manifest).unwrap(), b"edited manifest");
+        assert_eq!(fs::metadata(&manifest).unwrap().mode() & 0o777, 0o751);
+        assert_ne!(
+            fs::metadata(&manifest).unwrap().ino(),
+            fs::metadata(root.join("Cargo.toml")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::read_link(rig.tree.join("src/lib.rs")).unwrap(),
+            Path::new("../Cargo.toml")
+        );
+        for excluded in ["Cargo.lock", "untracked", "prior-output", ".git"] {
+            assert!(!rig.tree.join(excluded).exists(), "{excluded}");
+        }
+        if placement == Placement::SharedCache && supports_cloning {
+            let saved = source.saved.as_ref().expect("this volume cloned the probe");
+            fs::write(root.join("Cargo.toml"), b"checkout changed after capture").unwrap();
+            let fallback = scratch.path().join("fallback");
+            fs::create_dir(&fallback).unwrap();
+            // A file cannot host a private staging directory. Force the real clone failure.
+            assert_eq!(
+                saved
+                    .install(&root.join("Cargo.toml"), &fallback, false)
+                    .unwrap(),
+                "copied"
+            );
+            assert_eq!(
+                fs::read(fallback.join("Cargo.toml")).unwrap(),
+                b"edited manifest"
+            );
+            let cloned = scratch.path().join("separate");
+            fs::create_dir(&cloned).unwrap();
+            assert_eq!(
+                saved.install(scratch.path(), &cloned, false).unwrap(),
+                "cloned"
+            );
+            assert!(SavedSource::capture(&scratch.path().join("absent"), vec![]).is_err());
+        }
+        fs::write(manifest, b"this placement wrote here").unwrap();
+        fs::write(rig.tree.join("prior-output"), b"isolated").unwrap();
+    }
+    if supports_cloning {
+        let saved = source.saved.unwrap();
+        assert!(
+            !saved.private.path().join("source").exists(),
+            "final placement consumed the image"
+        );
+        let empty_saved = SavedSource {
+            private: saved.private,
+            files: Vec::new(),
+        };
+        let destination = scratch.path().join("missing-image");
+        assert!(
+            empty_saved
+                .install(scratch.path(), &destination, false)
+                .is_err()
+        );
+        std::os::unix::fs::symlink(scratch.path(), empty_saved.private.path().join("source"))
+            .unwrap();
+        assert!(
+            empty_saved
+                .install(scratch.path(), &destination, false)
+                .is_err()
+        );
+    }
 }
 
 /// A stand-in for the helper's front (`<helper> __build_admit --shim <tool> <placed> <program>

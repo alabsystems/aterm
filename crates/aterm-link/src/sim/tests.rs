@@ -176,10 +176,6 @@ fn every_seed_holds_every_law() {
         ),
         ("kills while an inbox commit was held", total.kills_holding),
         (
-            "kills between a drain group's append and its write",
-            total.kills_group_appended,
-        ),
-        (
             "kills between a drain group's write and its acks",
             total.kills_group_unacked,
         ),
@@ -215,6 +211,23 @@ fn every_seed_holds_every_law() {
     ] {
         assert!(n > 0, "the seeds exercised no {what}: {total:?}");
     }
+}
+
+/// A KILL BETWEEN A DRAIN GROUP'S ONE APPEND AND ITS FIRST WRITE (ATERM-KI-1111-5,
+/// `Bridge::killed_inside_a_group`) holds every law. The committed seeds meet one by chance (12 of
+/// the committed world's seeds 1..=1,000 do, 2026-11-18), and since ATERM-KI-1116-7314's told
+/// rows, whose second file's write moved every later fault, none of them does: 135 is the first
+/// of the committed world that does (2026-11-18, 135, 364, 378, 479, 650, 658, 663, 682, 744,
+/// 758, 878 and 995).
+#[test]
+fn a_kill_between_a_drain_groups_append_and_its_write_holds_every_law() {
+    let out = run(&Opts::seed(135));
+    assert!(
+        out.stats.kills_group_appended > 0,
+        "seed 135 kills no bridge between a drain group's append and its write: pin the first \
+         seed of the committed world that does"
+    );
+    assert!(out.violations.is_empty(), "{}", report(&out));
 }
 
 /// THE COMMITTED SEEDS AGAINST A BROKER THAT DOES NOT GAP-FENCE ([`Opts::gap_fences`] off): the
@@ -346,6 +359,55 @@ fn every_seed_holds_every_law_across_a_reminted_log() {
     );
     assert!(remints > 0, "no log was reminted");
     assert!(proved > 0, "no step to another id was proved");
+}
+
+/// A LOG REMINTED KEEPING ITS RECORDS ON AN OPEN THAT TAKES NO ASK FOR ORIGINS
+/// (ATERM-KI-1114-1414, case 6 of `Bridge::unverified_publication`): every committed seed of
+/// [`Opts::lossy_remints_stampless`] holds every law, `dup delivery` among them. Each open that
+/// reminted the log refuses `Request::OriginStamps` ([`Opts::stampless_starts`]), so neither a
+/// read from anywhere nor a delivery there names an origin: `Bridge::found_anywhere` holds a post
+/// whose attempt may stand on that log undecided, and on a lane the bridge's deliveries reach,
+/// the delivery of its newest candidate takes that record for the post's drain
+/// (`Bridge::take_undecided`), which settles there and hands it once; on a lane none reaches, the
+/// post is published at its pin, at least once. Not vacuous: reminted opens took no ask for
+/// origins, case 6 was answered, and deliveries took records for undecided attempts. Before the
+/// delivery gate (2026-11-17, the same seeds) seeds 6, 42 and 46 broke `dup delivery` (a record
+/// the hold kept from no reader, handed, then given up and published again at its pin) and 53
+/// and 126 `liveness` (a hold no read decides, on a person's lane). Its world with fetches
+/// ([`Opts::lossy_remints_stampless_fetching`]) is no sweep yet: its doc names the seeds that
+/// break a law there. The controls are the `KI-1114-1414` rows of
+/// `each_rule_switched_off_is_caught`.
+#[test]
+fn every_seed_holds_every_law_across_a_reminted_stampless_log() {
+    let outs = run_all(&Opts::lossy_remints_stampless, 1..=COMMITTED_SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    let stampless: u64 = outs.iter().map(|out| out.stats.stampless_starts).sum();
+    let undecided: u64 = outs.iter().map(|out| out.stats.unverifiable[5]).sum();
+    let taken: u64 = outs.iter().map(|out| out.stats.undecided_taken).sum();
+    eprintln!(
+        "{stampless} reminted opens took no ask for origins, {undecided} reads from anywhere \
+         answered case 6, {taken} records taken for an undecided attempt"
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {} seeds break a law across a reminted stampless log:\n{}",
+        failures.len(),
+        outs.len(),
+        failures.join("\n")
+    );
+    assert!(
+        stampless > 0,
+        "no reminted open refused the ask for origins"
+    );
+    assert!(undecided > 0, "no read from anywhere answered case 6");
+    assert!(
+        taken > 0,
+        "no delivery took a record for an undecided attempt"
+    );
 }
 
 /// The keyed lossy-log world with remints ([`lossy_keyed`] over [`Opts::lossy_remints`]): notes
@@ -1185,15 +1247,16 @@ fn each_rule_switched_off_is_caught() {
             "an own record is fetched only once its in-flight entry is gone",
             Box::new(|s| fetching(s).testing(Mutant::FetchPastAStandingEntry)),
             "decision on",
-            // 5434 -> 94 when ATERM-KI-1111-5's grouped send moved the schedule, and 8874 with
-            // ATERM-KI-1116-7314's told samples.
-            8874,
+            // 5434 -> 94 when ATERM-KI-1111-5's grouped send moved the schedule, 8874 with
+            // ATERM-KI-1116-7314's told samples, 9068 since a fetch samples what it hands, and
+            // 5930 with its told rows.
+            5930,
         ),
         (
             "a fetch hands nothing a delivery would hold back",
             Box::new(|s| fetching(s).testing(Mutant::FetchPastAStandingEntryBelow)),
             "fetch past",
-            574,
+            328,
         ),
         (
             "a mirror takes only once its open made the pin's fence durable (D06)",
@@ -1220,13 +1283,13 @@ fn each_rule_switched_off_is_caught() {
             2,
         ),
         // ATERM-KI-1111-5's grouped post send composed with critic review F1 and the t-form session
-        // names (LT-19) moved 155 to 7855, and ATERM-KI-1116-7314's told samples to 1323, each the
-        // first within 20,000.
+        // names (LT-19) moved 155 to 7855, ATERM-KI-1116-7314's told samples to 1323, and its told
+        // rows to 699, each the first within 20,000.
         (
             "a mirror floor covers a batch only once this open made it durable",
             Box::new(|s| Opts::seed(s).testing(Mutant::TrustTheFloorThatReads)),
             "mirror total",
-            1323,
+            699,
         ),
         // Explicit discovery on the composed budget scope and per-node hand-over found 1465
         // first within the original 20,000-seed bound; since the self-lane window names its log
@@ -1234,26 +1297,28 @@ fn each_rule_switched_off_is_caught() {
         // the media (critic review F1) composed with the t-form session names (LT-19) 682,
         // composed with ATERM-KI-1111-5's grouped post send 975, and since a held own record a
         // refill read ahead of the live tail is not accounted against the inbox commit
-        // (ATERM-KI-1116-4504) 2410, and with ATERM-KI-1116-7314's told samples 1006.
+        // (ATERM-KI-1116-4504) 2410, with ATERM-KI-1116-7314's told samples 1006, and with its
+        // told rows 2170 (2026-11-18).
         (
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).testing(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            1006,
+            2170,
         ),
         // Critic item E07's grouped landing moved this rule's first seed in the world with write
         // errors and quits past 20,000 (to 27907); where power is lost both ways a recovery is owed
         // more often, and its first seed was 9538, which C3b's per-node inbox hand-over (no
         // state-dir write where no node's is held) moved off it to 1307. Composing G04 moved that
-        // witness to 167, ATERM-KI-1111-5's grouped post send to 16223, and ATERM-KI-1116-7314's
-        // told samples to 6403, which explicit discovery found first in this world.
+        // witness to 167, ATERM-KI-1111-5's grouped post send to 16223, ATERM-KI-1116-7314's told
+        // samples to 6403, and its told rows to 8462, which explicit discovery found first in this
+        // world.
         (
             "a run whose recovery is owed makes no clean stop",
             Box::new(|s| {
                 both_ways_erring_quitting(s).testing(Mutant::CleanStopOverAnOwedRecovery)
             }),
             "mirror",
-            6403,
+            8462,
         ),
         (
             "a recovery tried again moves each file once",
@@ -1343,13 +1408,14 @@ fn each_rule_switched_off_is_caught() {
             "mirror",
             1,
         ),
-        // Critic review F1 composed with the t-form session names (LT-19) moved 602 to 3494, and
-        // ATERM-KI-1116-7314's told samples to 430, each the first within 20,000.
+        // Critic review F1 composed with the t-form session names (LT-19) moved 602 to 3494,
+        // ATERM-KI-1116-7314's told samples to 430, and its told rows back to 602, each the first
+        // within 20,000.
         (
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).testing(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            430,
+            602,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -1361,7 +1427,7 @@ fn each_rule_switched_off_is_caught() {
             "the deadline sweep reads on from a floor retention raised (F4)",
             Box::new(|s| asking(s).testing(Mutant::SweepWithAPlainFetch)),
             "neither answered nor expired",
-            8,
+            30,
         ),
         (
             "a topic replay reads on from a floor retention raised (F4)",
@@ -1379,7 +1445,7 @@ fn each_rule_switched_off_is_caught() {
             "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
             Box::new(|s| asking(s).testing(Mutant::TopicReplayDropsAnUncountedNotice)),
             "silent skip",
-            46,
+            43,
         ),
         (
             "the broadcast face's gap notice hands its cursors to the catch-up (F4)",
@@ -1397,21 +1463,22 @@ fn each_rule_switched_off_is_caught() {
             "a hand-off whose heads the disk refuses keeps the journal (F4)",
             Box::new(|s| asking_erring(s).testing(Mutant::HandOffWithoutTheHeads)),
             "dup post|answered 2 times| expired 2 times",
-            2099,
+            2430,
         ),
         (
             "an answer is delivered only once the deadline it settles is off the disk (F4)",
             Box::new(|s| asking_erring(s).testing(Mutant::DeliverOverAnUnwrittenSettle)),
             "was handed",
-            1368,
+            3951,
         ),
         // ATERM-KI-1115-9210: 26 of 10,000 seeds of the world met it, the first 41; since
-        // ATERM-KI-1111-5's grouped post send the first is 43.
+        // ATERM-KI-1111-5's grouped post send the first was 43, and since a fetch samples the
+        // record it hands as told it is 41 again.
         (
             "an answer is fetched only once the deadline it settles is off the disk (F4)",
             Box::new(|s| asking_fetching(s).testing(Mutant::FetchLeavesTheDeadline)),
             "was handed",
-            43,
+            41,
         ),
         // The committed witness reached the hand-off bug after both scheduling changes;
         // ATERM-KI-1111-5's grouped post send moved it from 244 to 342, and ATERM-KI-1116-7314's
@@ -1476,7 +1543,7 @@ fn each_rule_switched_off_is_caught() {
             "an entry journaled before another log is read back on it (KI-1111-4)",
             Box::new(|s| Opts::lossy_logs(s).testing(Mutant::NoReadBackOnAnotherLog)),
             "dup post",
-            398,
+            7215,
         ),
         (
             "another log keeps a pin's head (KI-1111-4)",
@@ -1488,13 +1555,18 @@ fn each_rule_switched_off_is_caught() {
             "another log takes every pin's offset out (KI-1111-4)",
             Box::new(|s| lossy_keyed_unread(s).testing(Mutant::ForgetPinResetsOnAnotherLog)),
             "key:",
-            490,
+            250,
         ),
+        // ATERM-KI-1114-1414's step S6 (a keyed entry kept on another log re-witnessed onto the
+        // attach's log at its head, `StateDir::rewitnessed_entry`) moved 1210 off it: that
+        // entry's read back now finds its copy before the winner's read; 2876 was the first
+        // within 20,000 that shows it, and 2538 is since ATERM-KI-1116-7314's told rows (explicit
+        // discovery, 2026-11-17).
         (
             "a replay that lands a key's winner tells the key where (KI-1111-4)",
             Box::new(|s| lossy_keyed(s).testing(Mutant::ReplayLeavesTheKeysWinnerUntold)),
             "key:",
-            1210,
+            2538,
         ),
         // A key's own post, its pin rebuilt from its key's after its own write was refused,
         // took the key pin's missing head: its retry read nothing back, and past a cut that
@@ -1503,7 +1575,7 @@ fn each_rule_switched_off_is_caught() {
             "a key's own post rebuilt from its key's pin keeps a head",
             Box::new(|s| lossy_keyed(s).testing(Mutant::OwnersPinFromItsKeyHeadless)),
             "key:",
-            91,
+            590,
         ),
         (
             "another log keeps no offset of the old one (KI-1111-4)",
@@ -1521,7 +1593,8 @@ fn each_rule_switched_off_is_caught() {
         // id that keeps every record. Unproved, the bridge forgets every offset and aterm its
         // dedup, so mail it was shown is offered as new.
         // And a session an attach told a later generation of the log the proof starts from,
-        // its witness never moved off it, forgets across the proved move (keyed seed 90).
+        // its witness never moved off it, forgets across the proved move (keyed seed 90; 26 since
+        // the told rows).
         (
             "a session on a later generation of a proved move's log keeps below its fork (KI-1116-7314)",
             Box::new(|s| {
@@ -1533,15 +1606,34 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "dup delivery",
-            90,
+            26,
+        ),
+        // And a session a proved move took to its log, the attach refused or killed before its
+        // witness left the log before, then that log reminted and the next attach proving the
+        // new one from the log before again, forgets everything it holds (reminted seeds 522,
+        // 580, 701 and 825 of 1,000, in both reminted worlds, before ATERM-KI-1116-7314's told
+        // rows).
+        (
+            "a session a proved move took keeps below both forks when the next is proved from its log (KI-1116-7314)",
+            Box::new(|s| {
+                let mut o = Opts::lossy_remints(s);
+                o.ep = EpRules {
+                    proved_via: false,
+                    ..EpRules::default()
+                };
+                o
+            }),
+            "dup delivery",
+            580,
         ),
         // And samples a lineage move took to its generation, the attach refused before its
-        // witness moved, prove the remint the next attach meets (keyed seeds 42 and 124).
+        // witness moved, prove the remint the next attach meets (keyed seeds 42 and 124; 28 since
+        // the told rows).
         (
             "samples a refused attach's lineage move took prove from the witness's log",
             Box::new(|s| lossy_keyed_remints(s).testing(Mutant::MovedSamplesUnpinned)),
             "dup delivery",
-            124,
+            28,
         ),
         // And a key's winner a proved step took the offset of, read from anywhere by its words
         // and origin (ATERM-KI-1114-1414's step S3, keyed seeds 39 and 60).
@@ -1578,7 +1670,123 @@ fn each_rule_switched_off_is_caught() {
             "order:",
             5,
         ),
+        // ATERM-KI-1114-1414, case 6: a read from anywhere no origin decides, on a log reminted
+        // on an open that takes no ask for origins, publishes nothing and holds the post.
+        // Answered as none landed, the retry lands its words again beside the carried attempt.
+        (
+            "an undecided read from anywhere publishes nothing (KI-1114-1414)",
+            Box::new(|s| Opts::lossy_remints_stampless(s).testing(Mutant::AnywhereUntoldPublishes)),
+            "dup",
+            334,
+        ),
+        // And the record of such an attempt is taken for its drain where a delivery meets it, so
+        // it is handed once its post settles there: handed while the post stood at its pin, a
+        // cut that gave it up left the retry nothing to read back, and it landed again.
+        (
+            "a delivery takes an undecided attempt's record for its drain (KI-1114-1414)",
+            Box::new(|s| Opts::lossy_remints_stampless(s).testing(Mutant::UndecidedHandedUnheld)),
+            "dup",
+            6,
+        ),
+        // On a lane no delivery of this bridge's reaches, on a broker that takes no ask for
+        // origins, no read ever decides: held there, the post waits for good.
+        (
+            "an undecided attempt on a lane no delivery reaches is published (KI-1114-1414)",
+            Box::new(|s| Opts::lossy_remints_stampless(s).testing(Mutant::UnstampedUnreachableHolds)),
+            "liveness",
+            53,
+        ),
+        // A record a fetch hands aterm is sampled as told: unsampled, a later proof's fork falls
+        // below it, aterm forgets it and is offered it again.
+        (
+            "a fetched record is sampled as told (KI-1116-7314)",
+            Box::new(|s| Opts::lossy_remints_stampless_fetching(s).testing(Mutant::FetchUntold)),
+            "dup delivery",
+            2476,
+        ),
+        // ATERM-KI-1116-7314's told rows: a subject's older record told is a row of its own.
+        // Kept the newest of each subject alone, a power loss that cuts the log below a
+        // subject's newest record leaves the proof a fork below the older one aterm holds, and
+        // aterm is offered it again.
+        (
+            "a subject's older record told is a told row (KI-1116-7314)",
+            Box::new(|s| Opts::lossy_remints(s).testing(Mutant::ToldNewestOfEachSubjectOnly)),
+            "dup delivery",
+            184,
+        ),
+        // And a start reads the rows the anchors no longer name beside them, from `told-history`.
+        (
+            "a bridge's start reads the told history beside the anchors (KI-1116-7314)",
+            Box::new(|s| Opts::lossy_remints(s).testing(Mutant::ToldHistoryUnread)),
+            "dup delivery",
+            184,
+        ),
+        // A told row another record took the offset of bounds the fork: the rows below it that
+        // read back still prove the step, and aterm keeps what it holds below them.
+        (
+            "a proof keeps the matches below a told row another record took (KI-1116-7314)",
+            Box::new(|s| Opts::lossy_remints(s).testing(Mutant::ProofRefusedAtAMismatch)),
+            "dup delivery",
+            122,
+        ),
     ];
+    // Six of the delivery gate's rules (ATERM-KI-1114-1414, case 6) have no sim witness: no
+    // seed of their worlds breaks a law with the rule off that holds every law with every rule
+    // on (searched 2026-11-17: the reminted stampless world, with fetches for the fetch's rule,
+    // to 3,000 for `Mutant::UndecidedArmedByTheDrain` and `Mutant::UndecidedFetched`, to 1,000
+    // for the rest, the reminted world stamping for the two that read origins;
+    // `Mutant::UndecidedSeenUncollected` searched again to 1,000 after the review narrowed it;
+    // all six searched again 2026-11-18 on ATERM-KI-1116-7314's told history holding every
+    // row). Every seed that breaks one there breaks a law with every rule on as well: the
+    // stampless world's 424, 654 and 914 to 1,000, and 2179, 2511 and 2956 to 3,000, and the
+    // world with fetches' 21, 410 and 424 to 3,000. Each
+    // is held by a bridge test whose control arm is the rule off: `Mutant::LinkAsksNoOrigins`
+    // by `a_link_with_the_mesh_off_asks_for_origins`;
+    // `Mutant::UndecidedSeenUncollected` by
+    // `an_anywhere_read_whose_origin_the_broker_cannot_say_settles_its_post_at_the_record_it_takes`;
+    // `Mutant::UndecidedTakesTheFirst` by that test,
+    // `the_delivery_gate_takes_an_undecided_attempts_record_by_its_origin_else_by_the_newest_seen`
+    // and `the_delivery_gates_call_site_holds_each_of_its_rules`;
+    // `Mutant::UndecidedTakesPastItsOrigin` by the last two; `Mutant::UndecidedArmedByTheDrain` by
+    // `a_case_six_hold_hands_its_post_once_across_the_cut_that_gives_its_records_up`, beside
+    // `Mutant::UndecidedInHandUnseen`, which masks it there; and
+    // `Mutant::UndecidedFetched` by
+    // `a_fetch_holds_back_a_record_a_delivery_would_take_for_an_undecided_attempt`.
+    // The rules of the reviews of 2026-11-17 have no sim witness either: with each off, no seed
+    // of the reminted worlds (stamping, stampless, stampless with fetches) to 128 breaks a law
+    // that holds with every rule on (the world with fetches breaks one at seed 21 with every rule
+    // on, the same with each off; searched again since ATERM-KI-1116-7314's told rows). Their
+    // bridge tests:
+    // `Mutant::UnreadReceiptPinRefusesTheAttach` by
+    // `an_owed_receipts_reservation_that_does_not_read_arms_nothing_and_the_attach_goes_on`;
+    // `Mutant::UndecidedHeldBehindUntaken` by
+    // `an_undecided_attempts_record_held_behind_another_is_taken_as_it_is_held`;
+    // `Mutant::UndecidedInHandUnseen` by
+    // `an_undecided_attempts_record_this_bridge_holds_untaken_is_taken_before_its_retry_reads`;
+    // `Mutant::RefillHoldsPastTheHand` by
+    // `a_refill_that_takes_a_record_with_more_mail_behind_it_than_the_hand_holds_attaches`;
+    // `Mutant::HeldForItsDrainRefusedAtTheCap` by
+    // `a_record_held_for_its_drain_first_on_its_lane_is_held_past_a_full_hand`;
+    // `Mutant::StalledReceiptWaitsInHand` by
+    // `a_receipt_held_in_hand_behind_its_sessions_stalled_receipt_settles_there`;
+    // `Mutant::UnreadReceiptHandedUnnoted` by
+    // `an_owed_receipt_unread_at_the_attach_settles_at_the_record_handed_meanwhile_once_it_reads`;
+    // `Mutant::UnreadReceiptReadArmsNothing` by
+    // `an_owed_receipt_unread_at_the_attach_takes_its_record_held_behind_another_once_it_reads`;
+    // `Mutant::UndecidedUntakenPastAHold` by the `untaken` and `unverified` arms of
+    // `a_receipt_held_in_hand_behind_its_sessions_stalled_receipt_settles_there`;
+    // `Mutant::UndecidedOverALaterHit` by
+    // `a_read_from_anywhere_settles_at_a_hit_past_a_candidate_it_cannot_decide`;
+    // `Mutant::FetchPastARefusedToldWrite` by
+    // `a_fetch_whose_told_sample_the_disk_refuses_answers_unsettled`;
+    // `Mutant::UnreadReceiptNotedAtARefusedFetch` by the `via`, `told` and `unrequested` arms of
+    // `a_receipt_record_a_fetch_did_not_hand_settles_no_retry_once_its_reservation_reads`; and
+    // `Mutant::UnreadReceiptNotedBeforeItsRowIsTaken` by the `via` and `refused` arms of
+    // `a_receipt_record_a_delivery_did_not_hand_settles_no_retry_once_its_reservation_reads`.
+    // Those last two were searched only in the reminted stampless world, with fetches and
+    // without (not the stamping one), to 128 (2026-11-17, again since ATERM-KI-1116-7314's told
+    // rows): with each off, the world with fetches breaks a law at seed 21 alone, as with every
+    // rule on, and the world without breaks none.
     // Critic item F21's other two rules have no sim witness: in 3,000 seeds of the stray world
     // neither `Mutant::HeldRecordWaitsForTheHold` nor `Mutant::HoldPastTheListing` breaks a law
     // (measured 2026-11-05). Each needs the attach's replay to meet an unverifiable entry, a
@@ -1612,11 +1820,13 @@ fn each_rule_switched_off_is_caught() {
         "the recovery a write error stopped is done before the run record",
         // ATERM-KI-1113-957's: the receipt law reads what an asker fetched since 2026-11-15; of
         // the fetching world none within 64 met it and 5434 was the first of 10,000; since
-        // ATERM-KI-1111-5's grouped send it is 94, and 8874 with ATERM-KI-1116-7314's told samples.
+        // ATERM-KI-1111-5's grouped send it is 94, 8874 with ATERM-KI-1116-7314's told samples,
+        // 9068 since a fetch samples the record it hands as told, and 5930 with the told rows.
         "an own record is fetched only once its in-flight entry is gone",
         // ATERM-KI-1115-41's: of the fetching world none within 64 meets it, and 1006 is the first
         // of 20,000 (13 of them; every rule on, none breaks a law) since ATERM-KI-1111-5's grouped
-        // post send (782 before); 574 with ATERM-KI-1116-7314's told samples.
+        // post send (782 before); 574 with ATERM-KI-1116-7314's told samples, 894 since a fetch
+        // samples the record it hands as told, and 328 with the told rows.
         "a fetch hands nothing a delivery would hold back",
         "a read back that meets its subject's floor reads again told",
         // Met where a blocking call inside a drain reads an answer that holds the sender of a
@@ -1652,7 +1862,7 @@ fn each_rule_switched_off_is_caught() {
         // 682, each the first within 20,000. ATERM-KI-1114-1414's read back from anywhere on
         // another log (a pin's head anywhere, a stamped reader's dial) moved 3503 to 7215, the
         // first within 20,000; ATERM-KI-1116-7314's told samples moved 7215 to 398 and 682 to 490,
-        // each the first within 20,000.
+        // and its told rows 398 back to 7215 and 490 to 250, each the first within 20,000.
         "an entry journaled before another log is read back on it (KI-1111-4)",
         "another log takes every pin's offset out (KI-1111-4)",
         "another log keeps a pin's head (KI-1111-4)",
@@ -1663,15 +1873,42 @@ fn each_rule_switched_off_is_caught() {
         // 20,000 on the tree that composes it with ATERM-KI-1111-4's outcome-unknown rule (590
         // before: either rule alone now holds seed 590's law), 2638 since critic review F1, and 764
         // composed with ATERM-KI-1111-5's grouped post send, 91 with ATERM-KI-1116-7314's told
-        // samples.
+        // samples, and 590 with its told rows.
         "a key's own post rebuilt from its key's pin keeps a head",
-        // ATERM-KI-1116-7314's: of the keyed reminted world none within 64 that holds every law
-        // with every rule on meets it, and 90 is the first.
+        // ATERM-KI-1116-7314's: of the keyed reminted world 90 was the first that holds every law
+        // with every rule on and meets it, and 26 is since its told rows (2026-11-17).
         "a session on a later generation of a proved move's log keeps below its fork (KI-1116-7314)",
-        // Its follow-up's: of the keyed reminted world none within 64 that holds every law with
-        // every rule on meets it, and 124 is the first (14, 42, 56 and 78 break a law with every
-        // rule on, 2026-11-16).
+        // Its second remint's: of the reminted world none within 64 meets it; 522 was the first of
+        // 1,000 that reaches it with its rule off and holds every law with it on (580, 701 and 825
+        // the others), and 580 is the first within 20,000 since ATERM-KI-1116-7314's told rows
+        // (2026-11-18).
+        "a session a proved move took keeps below both forks when the next is proved from its log (KI-1116-7314)",
+        // Its follow-up's: of the keyed reminted world 124 was the first that holds every law with
+        // every rule on and meets it (14, 42, 56 and 78 broke a law with every rule on,
+        // 2026-11-16), and 28 is since its told rows (2026-11-17), the first within 20,000 still on
+        // their history holding every row (2026-11-18).
         "samples a refused attach's lineage move took prove from the witness's log",
+        // ATERM-KI-1114-1414's case 6: of the reminted stampless world none within 64 meets it,
+        // and 138 was the first of 2,000 (32 of them; 184, 412, 522, 580 and others broke a law
+        // with every rule on, as the reminted world did stamps on or off, so a discovery that
+        // reaches one of them before its witness answers stops there). Its step S6 (a keyed entry
+        // kept on another log re-witnessed onto the attach's log at its head, the proved steps
+        // carried onto a later generation), composed with case 6's gate, moved 138 to 677, and
+        // ATERM-KI-1116-7314's told rows to 334, the first within 20,000 still on their history
+        // holding every row (2026-11-18).
+        "an undecided read from anywhere publishes nothing (KI-1114-1414)",
+        // Of the reminted stampless world with fetches none within 64 meets it; 78 was the first
+        // of 2,000, 1144 the first within 20,000 with ATERM-KI-1116-7314's told rows, and 2476 is
+        // since their history holds every row, composed with that issue's second-remint rule
+        // (2026-11-18).
+        "a fetched record is sampled as told (KI-1116-7314)",
+        // ATERM-KI-1116-7314's told rows: of the reminted world none within 64 meets either, and
+        // 184 is the first that reaches each with its rule off (2026-11-17).
+        "a subject's older record told is a told row (KI-1116-7314)",
+        "a bridge's start reads the told history beside the anchors (KI-1116-7314)",
+        // And 122 the proof's stop (of 412: 122, 138, 250 and 412; the fetching world's 112 to 128;
+        // 2026-11-17).
+        "a proof keeps the matches below a told row another record took (KI-1116-7314)",
     ];
     const RAREST: &[&str] = &[
         "the incarnation lease is trusted only in the boot that wrote it",
@@ -1842,11 +2079,15 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
     // session names (LT-19) to 7855.
     // ATERM-KI-1116-7314's told samples moved 7855 to 1323, the first to 60,000 that reaches it
     // with its rule off and holds every law with it on.
-    (1323, 400, "a floor whose flush failed trusted as it read"),
+    // ATERM-KI-1116-7314's told rows moved 1323 to 699, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on.
+    (699, 400, "a floor whose flush failed trusted as it read"),
     // Sim item B05: a cut dropped the dedup key of a record an in-flight entry named.
     // ATERM-KI-1111-5's grouped post send moved 12 to 24.
+    // ATERM-KI-1116-7314's told rows moved 24 to 34, the first to 60,000 that reaches it with its
+    // rule off and holds every law with it on.
     (
-        24,
+        34,
         400,
         "an entry published again at its pin after a cut dropped its key",
     ),
@@ -1873,8 +2114,10 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
     // ATERM-KI-1111-5's grouped post send 4633 to 19144.
     // ATERM-KI-1116-7314's told samples moved 19144 to 17278, the first to 60,000 that reaches it
     // with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told rows moved 17278 to 55978, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on.
     (
-        17278,
+        55978,
         400,
         "a record dropped while the disk refused the drop",
     ),
@@ -1882,8 +2125,10 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
     // 4's drain sent the pass's group, the disk refused its append and held post 3's sender, and
     // post 4 was staged and journaled behind no reservation of post 3's; the next bridge's
     // replay landed it first (`Bridge::held_behind`).
+    // ATERM-KI-1116-7314's told rows moved 8860 to 13, the first to 60,000 that reaches it with its
+    // rule off and holds every law with it on.
     (
-        8860,
+        13,
         400,
         "a post drained past a hold its own drain's group append set",
     ),
@@ -1900,8 +2145,10 @@ const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
     // (ATERM-KI-1116-4504) 2410.
     // ATERM-KI-1116-7314's told samples moved 2410 to 1006, the first to 60,000 that reaches it
     // with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told rows moved 1006 to 2170, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on (2026-11-18).
     (
-        1006,
+        2170,
         400,
         "an attach delivered on a log the state dir's witness does not name",
     ),
@@ -1921,8 +2168,10 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
     // composing C3b moved it to 22763, discovered within the same 60,000-seed bound, and both
     // the receipt heads' writes (ATERM-KI-1111-7) and another log's pin drop written on the media
     // (ATERM-KI-1111-4's seed 355) to 7759, still the first to 60,000 with the two composed.
+    // ATERM-KI-1116-7314's told rows moved 7759 to 6371, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on.
     (
-        7759,
+        6371,
         400,
         "a move an `auto` mirror met before its hello left its pinned batch to recover",
     ),
@@ -1938,8 +2187,10 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
     // review F1) 512; composed with ATERM-KI-1111-5's grouped post send, 409 again.
     // ATERM-KI-1116-7314's told samples moved 409 to 670, the first to 60,000 that reaches it
     // with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told rows moved 670 to 1472, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on.
     (
-        670,
+        1472,
         400,
         "a read back that went on at the floor missed the record a hold rule carried below it",
     ),
@@ -1964,9 +2215,11 @@ const FOUND_RETAINED: &[FoundIn] = &[
     // composing ATERM-KI-1111-5's grouped post send to 59070, each the first within 60,000.
     // ATERM-KI-1116-7314's told samples moved 59070 to 13720, the first to 60,000 that reaches it
     // with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told rows moved 13720 to 40124, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on.
     (
         windowed_keyed,
-        13720,
+        40124,
         400,
         "a key's winner given up at its pin was not read on to its owner's copy past the cut",
     ),
@@ -1974,9 +2227,11 @@ const FOUND_RETAINED: &[FoundIn] = &[
     // #7's drop left #8 to #11 for the replay (@553 to @556), ahead of #7 from the drain (@560).
     // ATERM-KI-1111-5's grouped post send moved seed 56 off it; 8988 is the first within 60,000
     // at the same 1200 steps.
+    // ATERM-KI-1116-7314's told rows moved 8988 to 814, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on (2026-11-18).
     (
         windowed,
-        8988,
+        814,
         1200,
         "a stop between the drops behind a refused post let the replay overtake the drain",
     ),
@@ -1995,9 +2250,11 @@ const FOUND_QUITTING: &[FoundIn] = &[
     // ATERM-KI-1111-5's grouped post send to 16223, each discovered first within the same
     // 60,000-seed bound. ATERM-KI-1116-7314's told samples moved 16223 to 6403, the first to 60,000
     // that reaches it with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told rows moved 6403 to 8462, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on.
     (
         both_ways_erring_quitting,
-        6403,
+        8462,
         400,
         "a clean stop over a recovery owed vouched for what nobody reconciled or set aside",
     ),
@@ -2013,17 +2270,21 @@ const FOUND_QUITTING: &[FoundIn] = &[
     // first's 4847 to 3021 and the second's 2375 to 9046, each the first within 60,000.
     // ATERM-KI-1116-7314's told samples moved 3021 to 2534, the first to 60,000 that reaches it
     // with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told rows moved 2534 to 3362, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on.
     (
         both_ways_erring_quitting,
-        2534,
+        3362,
         400,
         "a clean stop left the heads it kept unflushed",
     ),
     // ATERM-KI-1116-7314's told samples moved 9046 to 620, the first to 60,000 that reaches it
     // with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told rows moved 620 to 10354, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on.
     (
         both_ways_erring_quitting,
-        620,
+        10354,
         400,
         "an entry sent ahead of a post of its sender's with none",
     ),
@@ -2034,9 +2295,9 @@ const FOUND_QUITTING: &[FoundIn] = &[
         // seed of this world to 60,000 reaches it with its rule off; it is pinned where the
         // re-base's witness is written as any other witness is ([`quitting_light_rebase`]), and
         // composed with ATERM-KI-1111-5's grouped post send 876 is the first there within 60,000,
-        // and with ATERM-KI-1116-7314's told samples 5263.
+        // with ATERM-KI-1116-7314's told samples 5263, and with its told rows 2171.
         quitting_light_rebase,
-        5263,
+        2171,
         400,
         "a retired record's copy ended the memory of its torn file's",
     ),
@@ -2070,9 +2331,13 @@ const FOUND_ASKING: &[FoundIn] = &[
     // first seed to 60000 that reaches it with its rule off and holds every law with it on).
     // ATERM-KI-1116-7314's told samples moved 974 to 4652, the first to 60,000 that reaches it
     // with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told rows moved 4652 to 4170, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on, and it stays so since their history holds every
+    // row (2026-11-18): no seed below it breaks `deadline` with every rule on there, 1468, which
+    // did on their first cut, among them (ATERM-KI-1116-7314's Left).
     (
         asking,
-        4652,
+        4170,
         400,
         "the replay published again an expiry whose ask was answered on the bus since",
     ),
@@ -2090,12 +2355,13 @@ const FOUND_ASKING: &[FoundIn] = &[
     // A delivery refused at the told samples' write dropped the link at @50, ta000000002's m15; an
     // own record at @55 the same tail took after it was held for its drain, released after the
     // attach with that tail's mark and accounted, so the commit went through 55 before the new
-    // subscription's tail offered @50 again (`Bridge::subscribe_inbox`). A witness search for
-    // ATERM-KI-1116-4504's control met it at 5631 with every rule on; 5631 is the first to
-    // 60,000 that reaches it with its rule off and holds every law with it on.
+    // subscription's tail offered @50 again (`Bridge::forget_the_tails_marks`). A witness search for
+    // ATERM-KI-1116-4504's control met it at 5631 with every rule on; 5631 was the first to
+    // 60,000 that reaches it with its rule off and holds every law with it on, and since every
+    // connection asks for origins (ATERM-KI-1114-1414's case-6 delivery gate) 7179 is.
     (
         asking_fetching,
-        5631,
+        7179,
         400,
         "a held own record an earlier subscription's tail took was accounted after a resubscribe",
     ),
@@ -2109,11 +2375,16 @@ const FOUND_LOSSY: &[FoundIn] = &[
     // re-base's witness on the media) moved 1498 off it; 36618 was the first to 60,000 that
     // reaches it with its rule off and holds every law with it on, and composed with
     // ATERM-KI-1111-5's grouped post send 28 is.
-    // ATERM-KI-1116-7314's told samples moved 28 to 18011, the first to 60,000 that reaches it
-    // with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told samples moved 28 to 18011, and ATERM-KI-1114-1414's case-6
+    // delivery gate (every connection asking for origins) 18011 to 43052, each the first to
+    // 60,000 that reaches it with its rule off and holds every law with it on.
+    // ATERM-KI-1116-7314's told rows moved 43052 to 2559 on their first cut, and their history
+    // holding every row moved 2559 off it: 18282 is the first to 60,000 that reaches it with its
+    // rule off and holds every law with it on (explicit discovery by `found_again`'s rule,
+    // 2026-11-18: 1..=4,000, then 4,001..=18,282 in split ranges).
     (
         lossy_keyed,
-        18011,
+        18282,
         400,
         "a keyed re-post replayed before an earlier post on another log",
     ),
@@ -2129,11 +2400,15 @@ const FOUND_LOSSY: &[FoundIn] = &[
     // grouped post send moved 1514 to 2814: 1514 now breaks `key:` in that world, whose keyed
     // re-post read is off, and holds every law with every rule on. Composed with critic review F1,
     // 7208 is the first to 60,000 there (4936 with critic review F1 alone). ATERM-KI-1116-7314's
-    // told samples moved 7208 to 986, the first to 60,000 that reaches it with its rule off and
-    // holds every law with it on.
+    // told samples moved 7208 to 986. ATERM-KI-1114-1414's case-6 delivery gate (every connection
+    // asking for origins) and its step S6 (a keyed entry kept on another log re-witnessed onto the
+    // attach's log at its head) each moved 986 to 2955 alone, the first to 60,000 that reaches it
+    // with its rule off and holds every law with it on; composed, 2955 still is (2026-11-17).
+    // ATERM-KI-1116-7314's told rows moved 2955 to 104, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on.
     (
         lossy_keyed_unread,
-        986,
+        104,
         400,
         "an outcome unknown taken as an answer dropped its publish's entry",
     ),
@@ -2144,7 +2419,11 @@ const FOUND_LOSSY: &[FoundIn] = &[
     // lossy-log world to 60,000 reaches it with its rule off; it is pinned where the re-base is
     // written as any other witness is ([`lossy_logs_light_rebase`]).
     // ATERM-KI-1116-7314's told samples moved 355 to 34919, the first to 60,000 that reaches it
-    // with its rule off and holds every law with it on.
+    // with its rule off and holds every law with it on. Its told rows moved 34919 off it, and no
+    // seed of this world to 60,000 reaches it with its rule off since (explicit discovery,
+    // 2026-11-17): 34919 stays a found seed that holds every law, and `bridge::tests::
+    // mirror_conformance` holds the rule
+    // (`another_logs_drop_of_a_pin_holding_a_window_ledger_is_written_on_the_media`).
     (
         lossy_logs_light_rebase,
         34919,
@@ -2173,22 +2452,38 @@ const FOUND_LOSSY: &[FoundIn] = &[
         400,
         "a keyed re-post's attempt no entry or claim names was published again past a cut",
     ),
-    // NOT A BRIDGE BUG: the receipt law's own misreading (ATERM-KI-1114-1487). An answer landed
-    // at @21, two cuts gave it up before its asker's inbox read it, and the replay after a broker
-    // crash, its read back refused below the floor (28), landed it again at @41, the one copy the
-    // asker was handed. Sessions long gone held notes at @21 of logs since retired, and the law
-    // took them for the answer's first copy (`Mutant::AnswerHandedByOffset` reads it so again).
+    // NOT A BRIDGE BUG: the receipt law's own misreading (ATERM-KI-1114-1487). Offset-only matching
+    // mistakes another record for the answer (`Mutant::AnswerHandedByOffset` reads it so again).
+    // The oracle counts a copy as handed only when the asker holds or has fetched
+    // an `ack` at that offset naming the same ask and sender, including retired
+    // sessions. Matching answers from an earlier log still count conservatively
+    // toward a violation.
+    // In the original discovery an answer landed at @21, two cuts gave it up before its asker's
+    // inbox read it, and the replay after a broker crash, its read back refused below the floor
+    // (28), landed it again at @41, the one copy the asker was handed. Sessions long gone held
+    // notes at @21 of logs since retired, and the law took them for the answer's first copy.
     // 921 was the first of 6,000 at 1200 steps; re-pinned 921 -> 2984 when ATERM-KI-1111-5's
     // grouped send moved the schedule, and 2984 -> 3790 when ATERM-KI-1114-1414's read back from
     // anywhere on another log did (each the first seed to 60000 that reaches it with its rule off
     // and holds every law with it on).
+    // A separate pre-grouped canonical-ID world used 2206, explicitly discovered within 60,000
+    // with target-restored and production controls clear.
     // ATERM-KI-1116-7314's told samples moved 3790 to 6938, and the samples a lineage move took
-    // to its generation, with ATERM-KI-1114-1414's step S3, 6938 to 7134 (each the first to
-    // 60,000 that reaches it with its rule off and holds every law with it on).
+    // to its generation, with ATERM-KI-1114-1414's step S3, 6938 to 7134, ATERM-KI-1114-1414's
+    // case-6 delivery gate (every connection asking for origins) 7134 to 4842, and its step S6 (a
+    // keyed entry kept on another log re-witnessed onto the attach's log at its head), composed
+    // with the gate, 4842 to 2730 (each the first to 60,000 that reaches it with its rule off and
+    // holds every law with it on; 2026-11-17).
+    // ATERM-KI-1116-7314's told rows moved 2730 to 2536, the first to 60,000 that reaches it with
+    // its rule off and holds every law with it on. Since their history holds every row no seed of
+    // 1..=7,500 at 1200 steps meets it, and the row moved to 400 steps: 2936 is the first there
+    // that reaches it with its rule off and holds every law with it on (the lossy-log world's 456
+    // at 1200 steps reaches it too; 2026-11-18). The row keeps the 60,000-seed search bound;
+    // strict controls replay the merged world.
     (
         lossy_keyed,
-        7134,
-        1200,
+        2936,
+        400,
         "a receipt's copy given up unread was judged handed by another record at its offset",
     ),
 ];
@@ -2383,11 +2678,12 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         Mutant::OutcomeUnknownIsAnAnswer,
         "dup post",
     ),
-    (
-        "another log's pin drop a power cut undid held the mirror on the old log's window",
-        Mutant::DroppedPinUnderTheFence,
-        "mirror:",
-    ),
+    // "another log's pin drop a power cut undid held the mirror on the old log's window"
+    // (`Mutant::DroppedPinUnderTheFence`, `mirror:`) has no row since ATERM-KI-1116-7314's told
+    // rows moved seed 34919 off it and no seed of its world to 60,000 reached it with its rule
+    // off (explicit discovery, 2026-11-17). Seed 34919 stays a found seed that holds every law,
+    // and `bridge::tests::mirror_conformance` holds the rule by
+    // `another_logs_drop_of_a_pin_holding_a_window_ledger_is_written_on_the_media`.
     // "a window kept on another log let an own record past its unread ack"
     // (`Mutant::UnboundWindow`) has no row since ATERM-KI-1111-5's grouped post send moved seed
     // 3483 off it and no seed of its world to 60,000 reached it with its rule off (explicit
@@ -4335,6 +4631,7 @@ fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
         body: b"v=1 t=6 text=again".to_vec(),
         log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
         at: None,
+        own_log: None,
     })
     .expect("a new in-flight entry");
     st.clear_in_flight(7)
@@ -4407,6 +4704,7 @@ fn the_heads_a_clean_stop_kept_stand_through_a_power_cut() {
             body: b"v=1 t=5 text=hello".to_vec(),
             log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
             at: Some(crate::state::Head::From(50)),
+            own_log: None,
         };
         st.set_post_pin("s-a", 1, &entry.pin).expect("reserved");
         st.set_in_flight(&entry).expect("in flight");
@@ -4665,6 +4963,7 @@ fn write_every_torn_kind(st: &crate::state::StateDir) {
             body: b"v=1 t=5 text=hello".to_vec(),
             log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
             at: None,
+            own_log: None,
         })
         .expect("an in-flight entry");
     }

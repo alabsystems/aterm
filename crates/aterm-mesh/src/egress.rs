@@ -22,6 +22,30 @@
 //! at its length, and what the other Macs lack of it reaches them by `Inventory`, which a relay
 //! with no cursor starts ([`crate::inventory`]).
 //!
+//! **A rewrite of the membership log.** The members cursor is a count of the log's complete
+//! records in held order, and a rewrite of the records file (a prune at a final checkpoint, a
+//! shed of superseded bodies: `aterm_secrets` tracker FL-148) drops records and so moves every
+//! one after them. The cursor is kept under the log's rewrite generation
+//! ([`Stores::members_generation`]: its number and which rewrite made it; the `g` line of
+//! [`CURSORS_FILE`]) with the id of the last record it stepped past
+//! ([`Stores::member_id`]), and each time the egress reads the cursor it reads the generation
+//! first: where it differs the cursor is placed again ([`MembersCursor`]), just past that
+//! record where the rewritten log still holds it, so the egress publishes exactly what it had
+//! not, and from the log's first record where it does not (the record was dropped), which
+//! publishes duplicates the stores answer by digest and loses nothing. Only a Mac past records
+//! format 1 rewrites its records file, and its members lane is shut
+//! (`aterm_secrets::client::members_lane_open`), so every generation this egress feeds under
+//! is 0, no cursor is placed again and nothing more or less is published than before. The cursor file itself gains its `g` line once a record
+//! names the cursor's place (at the first catch-up, or the first record stepped past): a
+//! build that does not know the line skips it and writes a file without it, which this build
+//! reads as a cursor no record names yet.
+//!
+//! Not closed here: a vault left and another joined, neither ever rewritten, are both at
+//! generation 0 with no rewrite to tell them apart, and nothing removes the cursor file when
+//! a vault is left. The cursor then stays at its count of the vault that was left, as it
+//! always has, and what the new log holds below it leaves this Mac only by `Inventory`. Once
+//! either was rewritten their generations differ and the cursor is placed again.
+//!
 //! **Provenance.** Every record the mesh delivers (by the relay or by `Inventory`) is noted in
 //! [`Egress::arrived`] before its store is written, and the note is on disk ([`ARRIVED_FILE`])
 //! before the write. The egress steps past each noted record once: by its append's feed (a table
@@ -38,7 +62,7 @@
 //! presence row reads them ([`Egress::tables_held`]), so the row reads no store.
 
 use crate::logs::{Mesh, MeshLog};
-use crate::stores::{self, Digest, Held, Kind, Stores, TableKey};
+use crate::stores::{self, Digest, Generation, Held, Kind, Stores, TableKey};
 use aterm_net::fleet::link::Bell;
 use aterm_types::MutexExt;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -96,14 +120,114 @@ pub enum Feed {
         /// The record appended, and whether it came by the mesh.
         record: Option<(Held, bool)>,
     },
-    /// The membership log holds `length` complete records; `records` are those from index `from`
-    /// where the write was this process's.
+    /// The membership log holds `length` complete records; `records` are those a write of this
+    /// process's handed over.
     Members {
         /// Its complete records' count now.
         length: usize,
-        /// The records from `from` on, where known.
-        records: Option<(usize, Vec<Vec<u8>>)>,
+        /// The records the write handed over, where it was this process's: taken only where
+        /// the write was made under the generation the cursor counts ([`MembersCursor`]).
+        records: Option<Handed>,
     },
+}
+
+/// The records a write of the membership log handed the egress ([`Feed::Members`]): its
+/// complete records from an index on, in the held order of the log as that write wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Handed {
+    /// The index of the first of them in that order: the cursor as the write's hook read it.
+    pub from: usize,
+    /// The rewrite generation the write was made under
+    /// (`aterm_secrets::membership_log::Written::generation`), which names that order.
+    pub generation: Generation,
+    /// The records.
+    pub records: Vec<Vec<u8>>,
+}
+
+/// The egress's place in the membership log: how many of its complete records, in held order,
+/// the egress has stepped past, and the log's rewrite generation ([`Stores::members_generation`])
+/// that count is of.
+///
+/// A rewrite drops records, so the count holds only under its generation. Decided here:
+/// - **The generation is read before the cursor is.** A feed or a catch-up reads the log's
+///   generation first, and a cursor placed under another is placed again before any record is
+///   published or skipped by it: a write after a rewrite would otherwise read as published (its
+///   log is shorter than the cursor) and never leave this Mac but by `Inventory`. A feed whose
+///   length is no more than the cursor is answered only after that read, so a generation that
+///   cannot be read fails the feed, which is tried again, as a store that cannot be read does.
+/// - **The generation is the rewrite, not only its number** ([`Generation`]). A rewrite whose
+///   commit a power cut took back, after this egress placed its cursor under it, is made again
+///   from what the log holds by then, under the same number and another order; a vault left
+///   and joined again reaches a number a second time. A cursor compared by the number alone
+///   would stay where it was and skip the writes below it.
+/// - **Placed just past the last record stepped past**, found by its id from the log's end
+///   ([`Stores::member_id`]). A rewrite keeps the order of the records it keeps and places
+///   what it newly holds after them (`aterm_secrets::membership_log::rooted`: each record
+///   placed afresh, in the log's order), so the records after that one are exactly those not
+///   yet stepped past. A settled checkpoint's shares follow its cut, so the newest record a
+///   cursor passed is one a prune keeps; where it is not held the cursor starts at the log's
+///   first record. Starting there after every rewrite would have each Mac publish its whole
+///   log again at each prune. By its id, not the digest of its bytes: a shed keeps a
+///   version-2 record's id and drops its ciphertext, so its bytes change under it.
+/// - **A record names the cursor's place before any is stepped past.** A cursor that starts
+///   at the log's length (the first start of all), or that a build before this one wrote, has
+///   stepped past no record this egress saw. The first read of the log under the cursor's own
+///   generation reads the record before the cursor too and keeps its id, so a Mac that
+///   publishes nothing between its start and the log's first rewrite does not publish its
+///   whole log then.
+/// - **Records read between two equal reads of the generation.** The generation and the
+///   records are two reads; while this process runs its number only grows (only a power cut
+///   takes a rewrite back), so records read between two reads that agree are of that
+///   generation, and a read a rewrite crossed is made again.
+/// - **Records a write handed over are taken only under the generation it wrote them.** A
+///   store's hook reads the cursor and hands the records after it with the generation the
+///   store it wrote was written under ([`Handed`]). Records read before a rewrite (its own
+///   write's, and writes queued before the cursor was placed again) index another order even
+///   where their count happens to be the cursor's now: so they are taken only where the
+///   write's generation is the cursor's, which is also the log's as this feed reads it, and
+///   their index is the cursor's count; any other is dropped and the store read, as for a
+///   write another process made. Two equal generations name one order, so records of the
+///   cursor's generation from the cursor's count are exactly those the cursor has not stepped
+///   past, of a log never rewritten (generation 0, every write today) and of a rewritten one
+///   alike. Until FL-148E a write said nothing of its generation and its records were taken
+///   only of a log never rewritten.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MembersCursor {
+    /// The complete records stepped past, counted from the log's first.
+    pub from: usize,
+    /// The log's rewrite generation `from` counts under.
+    pub generation: Generation,
+}
+
+/// How many times a read of the membership log a rewrite crossed is made again before the
+/// feed that asked fails and is tried later.
+const PLACE_TRIES: usize = 4;
+
+/// A broken members cursor, for the tests' negative controls ([`Egress::break_for_test`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mutant {
+    /// The log's generation is not read: the cursor stays where it was under the log before
+    /// its rewrite, as before FL-148D.
+    GenerationUnread,
+    /// A cursor placed again starts at the log's first record, whatever it stepped past.
+    FromFirst,
+    /// Records a write handed over are taken where their count is the cursor's, whatever
+    /// generation the write says it wrote them under.
+    AnyGeneration,
+    /// Records a write handed over are taken only of a log never rewritten, as before FL-148E:
+    /// the generation the write says it wrote them under is not read.
+    UnrewrittenAlone,
+    /// Two generations of one number are one: the rewrite that made each is not compared.
+    NumberAlone,
+    /// The last record stepped past is known by the digest of its bytes, not by its id.
+    PlacedByBytes,
+    /// No record names the place of a cursor that has stepped past none.
+    Unanchored,
+    /// A members feed is published without asking whether this Mac's records ride the lane
+    /// ([`Stores::members_lane`]), as before the slice B review of FL-148E: the records a
+    /// write handed over while the lane was open are published after it shut.
+    LaneUnasked,
 }
 
 /// A wake another process sends.
@@ -214,6 +338,13 @@ pub fn wake(state_dir: &Path, wake: &Wake) {
 struct Cursors {
     tables: BTreeMap<TableKey, u64>,
     members: Option<usize>,
+    /// The membership log's rewrite generation `members` counts under ([`MembersCursor`]):
+    /// that of a log never rewritten in a file with no `g` line, which is every file a build
+    /// before FL-148D wrote, under a log none of them rewrote.
+    members_generation: Generation,
+    /// The id ([`Stores::member_id`]) of the last membership record before the cursor, where
+    /// one names its place: where a rewritten log is read from.
+    members_last: Option<Digest>,
     /// The `tables.log` offset of the last record this Mac published of each table: what a push
     /// waits for a neighbour to ack, across restarts.
     last: BTreeMap<Digest, u64>,
@@ -234,6 +365,21 @@ impl Cursors {
         }
         if let Some(members) = self.members {
             let _ = writeln!(text, "m {members}");
+        }
+        // Its own line, so `m` reads as it always has; a build that does not know it skips it,
+        // and writes a file without it, which this build reads as a log never rewritten with
+        // no record: under a rewritten log, a cursor that starts at the log's first record.
+        // `g <number> <rewrite> <last>`, each of the two ids 64 hex digits or `-` for none.
+        if self.members_generation != Generation::default() || self.members_last.is_some() {
+            let _ = write!(text, "g {}", self.members_generation.number);
+            for id in [&self.members_generation.rewrite, &self.members_last] {
+                text.push(' ');
+                match id {
+                    Some(id) => aterm_codec::hex::push_lower(&mut text, id),
+                    None => text.push('-'),
+                }
+            }
+            text.push('\n');
         }
         for (table, offset) in &self.last {
             text.push_str("l ");
@@ -275,6 +421,36 @@ impl Cursors {
                     if let (Some(published), None) = (words.next(), words.next()) {
                         cursors.members = published.parse().ok();
                     }
+                }
+                Some("g") => {
+                    let (Some(number), Some(rewrite), Some(last), None) =
+                        (words.next(), words.next(), words.next(), words.next())
+                    else {
+                        continue;
+                    };
+                    // An id of the line: `Some(None)` for `-`, `None` for anything else that
+                    // is not 64 lowercase hex digits.
+                    let id = |word: &str| -> Option<Option<Digest>> {
+                        let mut id = [0u8; 32];
+                        if word == "-" {
+                            Some(None)
+                        } else {
+                            (aterm_codec::hex::is_lower(word, 64)
+                                && aterm_codec::hex::decode_into(word.as_bytes(), &mut id))
+                            .then_some(Some(id))
+                        }
+                    };
+                    let (Ok(number), Some(rewrite), Some(last)) =
+                        (number.parse::<u64>(), id(rewrite), id(last))
+                    else {
+                        continue;
+                    };
+                    // A rewrite is named exactly where one was made.
+                    if (number == 0) != rewrite.is_none() {
+                        continue;
+                    }
+                    cursors.members_generation = Generation { number, rewrite };
+                    cursors.members_last = last;
                 }
                 Some("l") => {
                     let (Some(hex), Some(offset), None) =
@@ -318,6 +494,9 @@ pub struct Egress {
     /// published as if it were local ([`Self::republish_for_test`]).
     #[cfg(any(test, debug_assertions))]
     republish: AtomicBool,
+    /// The negative controls of the members cursor's placing ([`Mutant`]).
+    #[cfg(test)]
+    mutant: Mutex<Option<Mutant>>,
 }
 
 /// The records each primary table store holds, as far as the egress has read them
@@ -421,6 +600,8 @@ impl Egress {
             stop: AtomicBool::new(false),
             #[cfg(any(test, debug_assertions))]
             republish: AtomicBool::new(false),
+            #[cfg(test)]
+            mutant: Mutex::new(None),
         })
     }
 
@@ -435,10 +616,11 @@ impl Egress {
             return Ok(());
         }
         let lengths = self.stores.table_lengths()?;
-        let (_, members) = self.stores.members_held(usize::MAX)?;
+        let (generation, members) = self.members_read(usize::MAX)?;
         let mut state = self.state.lock_or_recover();
         state.cursors.tables.extend(lengths);
-        state.cursors.members = Some(members);
+        state.cursors.members = Some(members.1);
+        state.cursors.members_generation = generation;
         state.had_file = true;
         let encoded = state.cursors.encode();
         drop(state);
@@ -459,11 +641,158 @@ impl Egress {
         self.bell.ring();
     }
 
-    /// The membership log's records from the egress's cursor on, out of `store`'s complete
-    /// records in held order: what an in-process write of the records file hands [`Self::feed`].
+    /// The egress's members cursor: an in-process write of the records file hands
+    /// [`Self::feed`] the log's complete records from it on, in held order, with the
+    /// generation it wrote them under ([`Feed::Members`], [`Handed`]).
     #[must_use]
-    pub fn members_cursor(&self) -> Option<usize> {
-        self.state.lock_or_recover().cursors.members
+    pub fn members_cursor(&self) -> MembersCursor {
+        let state = self.state.lock_or_recover();
+        MembersCursor {
+            from: state.cursors.members.unwrap_or(0),
+            generation: state.cursors.members_generation,
+        }
+    }
+
+    /// Break the members cursor's placing as `mutant` says, or mend it: a negative control.
+    #[cfg(test)]
+    pub(crate) fn break_for_test(&self, mutant: Option<Mutant>) {
+        *self.mutant.lock_or_recover() = mutant;
+    }
+
+    #[cfg(test)]
+    fn broken(&self, mutant: Mutant) -> bool {
+        *self.mutant.lock_or_recover() == Some(mutant)
+    }
+
+    /// Whether the membership log at `generation` is the one a cursor placed under `placed`
+    /// counts: the same rewrite, not only the same number ([`MembersCursor`]).
+    fn same(&self, generation: &Generation, placed: &Generation) -> bool {
+        #[cfg(test)]
+        if self.broken(Mutant::NumberAlone) {
+            return generation.number == placed.number;
+        }
+        let _ = self;
+        generation == placed
+    }
+
+    /// The id the membership log knows `record` by ([`Stores::member_id`]): what names the
+    /// cursor's place through a rewrite.
+    fn member_id(&self, record: &[u8]) -> Digest {
+        #[cfg(test)]
+        if self.broken(Mutant::PlacedByBytes) {
+            return stores::digest(record);
+        }
+        self.stores.member_id(record)
+    }
+
+    /// The membership log's generation, and its complete records from index `from` with its
+    /// held count, read under that generation: between two reads of it that agree
+    /// ([`MembersCursor`]).
+    fn members_read(&self, from: usize) -> io::Result<(Generation, (Vec<Vec<u8>>, usize))> {
+        for _ in 0..PLACE_TRIES {
+            let generation = self.stores.members_generation()?;
+            let held = self.stores.members_held(from)?;
+            if self.stores.members_generation()? == generation {
+                return Ok((generation, held));
+            }
+        }
+        Err(io::Error::other(
+            "the membership log was rewritten during each read of it",
+        ))
+    }
+
+    /// The membership log's complete records the egress has not stepped past, the index of the
+    /// first of them and the log's held count, with the cursor placed again first where the
+    /// log was rewritten since it was placed, and the record before the cursor read with them
+    /// where none names its place yet ([`MembersCursor`]).
+    /// # Errors
+    /// Where the log or its generation cannot be read, or each read of it was crossed by a
+    /// rewrite.
+    pub(crate) fn members_unpublished(&self) -> io::Result<(usize, Vec<Vec<u8>>, usize)> {
+        for _ in 0..PLACE_TRIES {
+            let (cursor, last) = {
+                let state = self.state.lock_or_recover();
+                (
+                    MembersCursor {
+                        from: state.cursors.members.unwrap_or(0),
+                        generation: state.cursors.members_generation,
+                    },
+                    state.cursors.members_last,
+                )
+            };
+            let generation = self.stores.members_generation()?;
+            #[cfg(test)]
+            let generation = if self.broken(Mutant::GenerationUnread) {
+                cursor.generation
+            } else {
+                generation
+            };
+            if self.same(&generation, &cursor.generation) {
+                // No record names this cursor's place: the one before it is read too.
+                let naming = last.is_none() && cursor.from > 0;
+                #[cfg(test)]
+                let naming = naming && !self.broken(Mutant::Unanchored);
+                let (read, (mut records, length)) =
+                    self.members_read(cursor.from - usize::from(naming))?;
+                #[cfg(test)]
+                let read = if self.broken(Mutant::GenerationUnread) {
+                    generation
+                } else {
+                    read
+                };
+                if !self.same(&read, &generation) {
+                    continue;
+                }
+                if naming && !records.is_empty() {
+                    let before = self.member_id(&records.remove(0));
+                    self.name_members_place(cursor, before);
+                }
+                return Ok((cursor.from, records, length));
+            }
+            // Rewritten since the cursor was placed: read it whole and place the cursor again.
+            let (read, (mut records, length)) = self.members_read(0)?;
+            let place = last
+                .and_then(|last| {
+                    records
+                        .iter()
+                        .rposition(|record| self.member_id(record) == last)
+                })
+                .map_or(0, |at| at + 1);
+            #[cfg(test)]
+            let place = if self.broken(Mutant::FromFirst) {
+                0
+            } else {
+                place
+            };
+            let mut state = self.state.lock_or_recover();
+            state.cursors.members = Some(place);
+            state.cursors.members_generation = read;
+            let encoded = state.cursors.encode();
+            drop(state);
+            self.write_cursors(&encoded);
+            self.moved.notify_all();
+            records.drain(..place);
+            return Ok((place, records, length));
+        }
+        Err(io::Error::other(
+            "the membership log was rewritten during each read of it",
+        ))
+    }
+
+    /// Keep `before`, the id of the record before `cursor`, as what names the cursor's place,
+    /// where the cursor still stands there with none.
+    fn name_members_place(&self, cursor: MembersCursor, before: Digest) {
+        let mut state = self.state.lock_or_recover();
+        if state.cursors.members_last.is_some()
+            || state.cursors.members != Some(cursor.from)
+            || state.cursors.members_generation != cursor.generation
+        {
+            return;
+        }
+        state.cursors.members_last = Some(before);
+        let encoded = state.cursors.encode();
+        drop(state);
+        self.write_cursors(&encoded);
     }
 
     /// Note the records `ids` the mesh delivered (membership records and table records alike, by
@@ -753,8 +1082,7 @@ impl Egress {
         for (key, length) in lengths {
             self.publish_range(mesh, key, length)?;
         }
-        let from = self.state.lock_or_recover().cursors.members.unwrap_or(0);
-        let (records, length) = self.stores.members_held(from)?;
+        let (from, records, length) = self.members_unpublished()?;
         self.publish_members(mesh, from, &records)?;
         {
             let mut state = self.state.lock_or_recover();
@@ -819,19 +1147,46 @@ impl Egress {
                 }
             }
             Feed::Members { length, records } => {
-                let cursor = self.state.lock_or_recover().cursors.members.unwrap_or(0);
-                if *length <= cursor {
+                // The lane first: a Mac whose records ride no members lane (they are past
+                // format 1, [`Stores::members_lane`]) feeds it nothing. A write asks before it
+                // hands its records over, and this feed may be read after the lane shut (the
+                // format mark stored by another process, or by this one before this thread
+                // read its queue): the records it carries are then dropped unpublished, and no
+                // store is read, which would read an empty log (ATERM-KI-1116-1471).
+                let open = self.stores.members_lane()?;
+                #[cfg(test)]
+                let open = open || self.broken(Mutant::LaneUnasked);
+                if !open {
                     return Ok(());
                 }
-                match records {
-                    Some((from, records)) if *from == cursor => {
-                        self.publish_members(mesh, cursor, records)
+                // The generation next: under another, neither the length nor the records this
+                // feed names are of the order the cursor counts ([`MembersCursor`]).
+                let cursor = self.members_cursor();
+                let generation = self.stores.members_generation()?;
+                #[cfg(test)]
+                let generation = if self.broken(Mutant::GenerationUnread) {
+                    cursor.generation
+                } else {
+                    generation
+                };
+                if self.same(&generation, &cursor.generation) {
+                    if *length <= cursor.from {
+                        return Ok(());
                     }
-                    _ => {
-                        let (records, _) = self.stores.members_held(cursor)?;
-                        self.publish_members(mesh, cursor, &records)
+                    if let Some(handed) = records {
+                        // The write's own generation: records written under another index
+                        // another order, whatever their count ([`MembersCursor`]).
+                        let of_cursor = self.same(&handed.generation, &cursor.generation);
+                        #[cfg(test)]
+                        let of_cursor = (of_cursor || self.broken(Mutant::AnyGeneration))
+                            && !(self.broken(Mutant::UnrewrittenAlone) && generation.number != 0);
+                        if of_cursor && handed.from == cursor.from {
+                            return self.publish_members(mesh, cursor.from, &handed.records);
+                        }
                     }
                 }
+                let (from, records, _) = self.members_unpublished()?;
+                self.publish_members(mesh, from, &records)
             }
         }
     }
@@ -922,11 +1277,14 @@ impl Egress {
             if published {
                 mesh.publish(MeshLog::Tables, &subject, record)?;
             }
+            // What names the cursor's place once it is past this record ([`MembersCursor`]).
+            let named = self.member_id(record);
             let mut state = self.state.lock_or_recover();
             if published {
                 state.published += 1;
             }
             state.cursors.members = Some(index + 1);
+            state.cursors.members_last = Some(named);
             let encoded = state.cursors.encode();
             drop(state);
             self.write_cursors(&encoded);

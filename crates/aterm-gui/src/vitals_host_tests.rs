@@ -20,6 +20,98 @@ fn mock_observed_at() -> memory::ObservedAt {
     memory::ObservedAt::capture(Instant::now, || Some(0))
 }
 
+#[test]
+fn group_book_the_readers_injected_model_publishes_original_members_once() {
+    use aterm_vitals::delegated::ProcessKey;
+    use aterm_vitals::groups::{GroupKey, Value};
+    let mut reader = Reader::new(Arc::default());
+    let reading = |second: u64| Sample {
+        at_ns: second * 1_000_000_000,
+        at_unix_ms: second as i64 * 1000,
+        mono_ms: second * 1000,
+        cadence_ms: 1000,
+        self_pid: 100,
+        self_uid: Some(501),
+        tabs: vec![aterm_vitals::TabRoot {
+            key: 7,
+            tab: 7,
+            shell_pid: 200,
+            tab_id: Some(7),
+            label: "Tab 1".into(),
+            program: "idle-heavy-child".into(),
+            agent_leader: None,
+        }],
+        procs: Some(vec![
+            aterm_vitals::ProcSample {
+                pid: 200,
+                ppid: 100,
+                start: Some(1),
+                name: "shell".into(),
+                cpu_ns: Some(0),
+                footprint: Some(3),
+                state: aterm_vitals::ProcState::Run,
+                uid: Some(501),
+                ..aterm_vitals::ProcSample::default()
+            },
+            aterm_vitals::ProcSample {
+                pid: 201,
+                ppid: 200,
+                start: Some(2),
+                name: "idle-heavy-child".into(),
+                cpu_ns: Some(second * 1_000_000),
+                footprint: Some(8 << 30),
+                state: aterm_vitals::ProcState::Run,
+                energy_nj: Some(second * 1_000_000),
+                uid: Some(501),
+                ..aterm_vitals::ProcSample::default()
+            },
+        ]),
+        ..Sample::default()
+    };
+    reader.vitals.absorb(&reading(10));
+    let snapshot = reader.vitals.absorb(&reading(11));
+    let key = GroupKey::Tab {
+        pane: 7,
+        root: ProcessKey { pid: 201, start: 2 },
+    };
+    let row = snapshot
+        .groups
+        .rows()
+        .iter()
+        .find(|row| row.key() == key)
+        .unwrap();
+    assert_eq!(row.count(), 1);
+    assert_eq!(row.footprint(), Value::Read(8 << 30));
+    assert_eq!(row.energy().thread_mw.value, Value::Read(1.0));
+    assert_eq!(snapshot.groups.frame().unwrap().seq, snapshot.seq);
+    assert_eq!(
+        snapshot.procs.iter().find(|p| p.pid == 201).unwrap().group,
+        Some(key)
+    );
+    let later = reader.vitals.absorb(&Sample {
+        at_ns: 12_000_000_000,
+        at_unix_ms: 12_000,
+        mono_ms: 12_000,
+        machine_only: true,
+        ..Sample::default()
+    });
+    assert!(matches!(
+        later
+            .groups
+            .rows()
+            .iter()
+            .find(|row| row.key() == key)
+            .unwrap()
+            .footprint(),
+        Value::Unread { .. }
+    ));
+    assert_eq!(
+        row.footprint(),
+        Value::Read(8 << 30),
+        "the earlier immutable publication keeps its original facts"
+    );
+}
+
 fn saved_cpu_anomaly() -> Snapshot {
     use aterm_vitals::hardware::{Bundle, Frame};
     let mut hardware = aterm_vitals::hardware::Sample::unavailable("not_sampled");
@@ -1174,7 +1266,12 @@ fn this_macs_memory() -> aterm_sysprobe::MemoryDetail {
             compressions: 512_905_413,
             pageins: 156_709_125,
             page_bytes: PAGE,
+            pushed: Some(512_000_000),
+            refaulted: Some(900_000_000),
+            stall_us: None,
         }),
+        headroom: Some(60_000 * PAGE),
+        wall: Some((420, 1_024)),
         ..aterm_sysprobe::MemoryDetail::default()
     }
 }
@@ -1197,6 +1294,21 @@ fn mem_sample_keeps_every_class_and_its_ram_classes_sum_to_total() {
     );
     assert!(m.exact);
     assert_eq!(m.counters.map(|c| c.page_bytes), Some(PAGE));
+    // The starvation watch's readings ride along: pushed out and back, the headroom, the
+    // compressor's wall, and the kernel's share from the same queues.
+    assert_eq!(
+        m.counters.map(|c| (c.pushed, c.refaulted, c.stall_us)),
+        Some((Some(512_000_000), Some(900_000_000), None))
+    );
+    assert_eq!(
+        (m.headroom, m.wall, m.kept_permille),
+        (
+            Some(60_000 * PAGE),
+            Some((420, 1_024)),
+            this_macs_memory().kept_permille()
+        )
+    );
+    assert!(m.kept_permille.is_some());
     // The RAM classes and not in VM are the whole of it, and not in VM is what no VM queue
     // holds: total less wired, the compressor's, active, inactive, speculative and free pages.
     assert_eq!(m.in_vm() + m.not_in_vm(), m.total);
@@ -1324,6 +1436,7 @@ fn the_block_reader_is_asked_for_homes_mount_and_the_front_tabs_each_once() {
     let home = Path::new("/Users//a");
     let asked = |front: Option<&str>, table: &Table| -> Vec<PathBuf> {
         block_mounts(home, front.map(Path::new), table)
+            .mounts
             .into_iter()
             .map(|m| m.on.clone())
             .collect()
@@ -1352,6 +1465,48 @@ fn the_block_reader_is_asked_for_homes_mount_and_the_front_tabs_each_once() {
             "{front}"
         );
     }
+    let plan = block_mounts(home, Some(Path::new("/Volumes/Work/proj")), &table);
+    assert_eq!(plan.home, Some(0));
+    let home_id = "1111111111111111".to_owned();
+    let front_id = "2222222222222222".to_owned();
+    let mut batch = aterm_sysprobe::blockio::BlockBatch {
+        mounts: vec![Some(home_id.clone()), Some(front_id.clone())],
+        ..aterm_sysprobe::blockio::BlockBatch::default()
+    };
+    assert_eq!(plan.home_device_id(&batch), Some(home_id.clone()));
+    batch.mounts[0] = None;
+    assert_eq!(
+        plan.home_device_id(&batch),
+        None,
+        "front's binding cannot stand for unread home"
+    );
+    batch.mounts = vec![Some(front_id.clone()); 2];
+    assert_eq!(
+        plan.home_device_id(&batch),
+        Some(front_id.clone()),
+        "two mounts sharing one physical device preserve both original bindings"
+    );
+    batch.mounts = vec![Some("invalid-id".into()), Some(front_id.clone())];
+    assert_eq!(plan.home_device_id(&batch), None);
+    batch.mounts = vec![Some(home_id)];
+    assert_eq!(
+        plan.home_device_id(&batch),
+        None,
+        "an incomplete request map cannot prove home"
+    );
+    let missing_home = block_mounts(
+        Path::new("/Volumes/Share/person"),
+        Some(Path::new("/Volumes/Work/proj")),
+        &table,
+    );
+    assert_eq!(missing_home.mounts.len(), 1);
+    assert_eq!(missing_home.home, None);
+    batch.mounts = vec![Some(front_id)];
+    assert_eq!(
+        missing_home.home_device_id(&batch),
+        None,
+        "a front-only request at index zero has no home role"
+    );
     let mut incomplete = table;
     incomplete.complete = false;
     assert!(asked(Some("/Volumes/Work/proj"), &incomplete).is_empty());
@@ -1370,6 +1525,11 @@ fn the_front_tabs_device_reads_beside_homes_only_when_it_is_another() {
             asked = m.iter().map(|m| m.on.clone()).collect();
             reader.read(m)
         });
+        assert_eq!(
+            volumes.home_device_id.as_deref(),
+            volumes.block.first().map(|b| b.id.as_str()),
+            "the positive live home read carries its original device binding"
+        );
         let ids: Vec<String> = volumes.block.iter().map(|b| b.id.clone()).collect();
         (asked, ids, volumes.home.is_some())
     };
@@ -1401,7 +1561,7 @@ fn homes_volume_key_on_windows_is_the_disk_watchs() {
     let manifest = aterm_tempfile::manifest_dir();
     let home = manifest.as_path();
     let no_devices =
-        |_: &[&aterm_sysprobe::volumes::Mount]| -> Vec<aterm_sysprobe::blockio::BlockReading> {
+        |_: &[&aterm_sysprobe::volumes::Mount]| -> aterm_sysprobe::blockio::BlockBatch {
             panic!("Windows has no block reader to ask")
         };
     let watch = aterm_agent::harness::disk::volume_of(&home, &aterm_sysprobe::volumes::table())
@@ -1411,6 +1571,7 @@ fn homes_volume_key_on_windows_is_the_disk_watchs() {
     assert_eq!(keyed.key.as_ref(), Some(&watch.key));
     assert!(keyed.home.is_some());
     assert!(keyed.block.is_empty());
+    assert_eq!(keyed.home_device_id, None);
 
     let unwatched = machine_volumes(&home, false, Some(&home), no_devices);
     assert_eq!(unwatched.key, None);
@@ -3494,6 +3655,117 @@ fn the_request_names_each_sessions_agent_leader() {
 }
 
 #[test]
+fn local_panel_mem_disk_tok_keeps_split_mirrored_and_parked_producers() {
+    let mut app = crate::App::headless_for_test();
+    let window = crate::WindowId(0);
+    let right = app.split_active_stub_tab(window);
+    let parked = 70;
+    let session = crate::stub_session(parked);
+    crate::App::register_session(&app.store, &session, None);
+    app.pool.insert(session);
+    let epoch = aterm_session::terminal_stream::epoch();
+    for pane in [0, right, parked] {
+        let session = app.pool.get(pane).expect("live pane");
+        let mut timeline = session
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let pgid = 4000 + i32::try_from(pane).unwrap();
+        timeline.note_foreground_group(pgid);
+        timeline.set_agent_reader_for_test(true);
+        let usage = UsageFacts {
+            unread: 0,
+            unread_more: false,
+            ..usage(100 + pane, true)
+        };
+        let facts = footer(Some(&format!("conversation-{pane}")), Some(usage));
+        assert!(timeline.set_claude_footer(pgid, Some(17), Some(facts)));
+    }
+    let at = Instant::now() + Duration::from_nanos(1);
+    let at_ns = u64::try_from(at.duration_since(epoch).as_nanos()).unwrap();
+    for pane in [0, right, parked] {
+        app.pool
+            .get(pane)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .note_claude_footer_read(4000 + i32::try_from(pane).unwrap(), at);
+    }
+    let assert_producers = |app: &crate::App| {
+        let request = app.vitals_request(FOCUSED_PERIOD, false);
+        let mut measured = request
+            .pane_token_observations
+            .iter()
+            .map(|r| {
+                let counters = r.counters.expect("whole provider fold");
+                (
+                    r.pane,
+                    r.owner.conversation.clone(),
+                    counters.output,
+                    counters.at_ns,
+                )
+            })
+            .collect::<Vec<_>>();
+        measured.sort_by_key(|r| r.0);
+        assert_eq!(
+            measured,
+            [0, right, parked].map(|key| (
+                key,
+                format!("claude conversation-{key}"),
+                Some(127 + key),
+                at_ns
+            ))
+        );
+        assert_eq!(
+            request
+                .tokens
+                .iter()
+                .map(|r| r.totals.key)
+                .collect::<Vec<_>>(),
+            [0, right, parked]
+        );
+    };
+    assert_producers(&app);
+    assert!(
+        app.focus_pane_in(window, crate::pane::FocusDir::Left)
+            || app.focus_pane_in(window, crate::pane::FocusDir::Up)
+    );
+    app.frontmost_window = Some(window);
+    app.open_active_session_in_new_window_logical()
+        .expect("mirror the left pane");
+    assert_producers(&app);
+    let machine_only = app.vitals_request(FOCUSED_PERIOD, true);
+    assert!(machine_only.pane_token_observations.is_empty());
+    assert_eq!(machine_only.tokens.len(), 3);
+    let session = app.pool.get(right).unwrap();
+    let mut timeline = session
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let before = timeline
+        .panel_token_owner(session.ctx.nonce)
+        .expect("Claude run");
+    let group = 4000 + i32::try_from(right).unwrap();
+    timeline.note_claude_footer_read(group, epoch);
+    timeline.set_agent_reader_for_test(false);
+    timeline.set_agent_reader_for_test(true);
+    assert!(
+        timeline
+            .panel_token_observation(right, session.ctx.nonce)
+            .expect("same shell and provider")
+            .counters
+            .is_none(),
+        "a cached count from before the current stretch cannot seed a new interval"
+    );
+    timeline.note_foreground_group(12121);
+    assert_ne!(timeline.panel_token_owner(session.ctx.nonce), Some(before));
+}
+
+#[test]
 fn every_pane_counts_and_the_plan_is_the_frontmost_windows() {
     let mut app = crate::App::headless_for_test();
     let w0 = crate::WindowId(0);
@@ -3536,8 +3808,8 @@ fn every_pane_counts_and_the_plan_is_the_frontmost_windows() {
         .collect();
     assert_eq!(
         rows,
-        [(0, "s-split", Some(read)), (s1, "s-other", Some(read))],
-        "the split pane's agent is its tab's"
+        [(split, "s-split", Some(read)), (s1, "s-other", Some(read))],
+        "each provider contributes under its producing pane"
     );
     let front = req.plan.as_ref().expect("the first window's plan");
     assert_eq!((front.used_x10, front.account), (340, AccountIx(0)));
@@ -4517,6 +4789,185 @@ fn a_resting_focused_window_reads_every_five_seconds_and_a_stir_asks_at_once() {
     assert_eq!(app.vitals_deadline(), Some(stirred + FOCUSED_PERIOD));
 }
 
+/// The System Resources page is a reader of the stream: in front of a resting, focused window it
+/// keeps the focused cadence, a reading a second; behind a terminal tab of that window it adds
+/// nothing, and the window reads at its own resting cadence; in an occluded window it reads
+/// nothing a window shows. The pair is what tells the page term's predicates apart: the page's
+/// tab is open in both, so a term that counted the open tab, not the page on screen, would ask
+/// 1000 ms behind the terminal tab as in front of it, and the 5000 ms there fails it.
+#[cfg(unix)]
+#[test]
+fn the_resources_page_reads_the_stream_at_the_focused_cadence_only_while_on_screen() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let _bars = crate::stats_deck::tests::attach_stats();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    // Rest is for a window on screen: a headless instance's never rests. It is off unless set.
+    app.headless = false;
+    app.config.idle_rest_secs = Some(30.0);
+    let wid = crate::WindowId(0);
+    app.windows.get_mut(&wid).expect("the window").focused = true;
+    let terminal = app.windows[&wid].tab_set.active_index().expect("a tab");
+    app.open_resources_tab().expect("the page opens");
+    let page = app.windows[&wid].tab_set.active_index().expect("the page");
+    assert_ne!(page, terminal, "PRECONDITION: the page is a tab of its own");
+
+    let rest_at = Instant::now() + Duration::from_secs(31);
+    app.settle_rest(rest_at);
+    assert!(
+        app.windows[&wid].rest.resting(),
+        "PRECONDITION: the window rests"
+    );
+    assert_eq!(app.vitals_audience(), Audience::Shown);
+    let _ = rx.try_iter().count();
+    app.service_vitals(rest_at);
+    assert_eq!(
+        read_req(&rx, "the page in front reads").cadence_ms,
+        1000,
+        "a page in front of a resting window keeps the focused cadence"
+    );
+
+    app.switch_tab_in(wid, terminal);
+    assert!(
+        app.windows[&wid].rest.resting(),
+        "PRECONDITION: still resting"
+    );
+    let audience = app.vitals_audience();
+    assert_eq!(audience, Audience::Background, "behind a terminal tab");
+    assert_eq!(
+        audience.cadence(false).map(|(period, _)| period),
+        Some(BACKGROUND_PERIOD)
+    );
+    let behind = rest_at + Duration::from_secs(2);
+    app.service_vitals(behind);
+    assert_eq!(read_req(&rx, "the window reads").cadence_ms, 5000);
+    assert!(
+        app.windows[&wid].tab_set.tabs().iter().any(|tab| {
+            tab.root
+                .any_leaf(&mut |&view| app.view_is_unrestored_page(view))
+        }),
+        "PRECONDITION: the page's tab is still open behind the terminal tab"
+    );
+
+    app.switch_tab_in(wid, page);
+    assert_eq!(app.vitals_audience(), Audience::Shown, "in front again");
+    app.windows.get_mut(&wid).expect("the window").occluded = true;
+    assert!(!app.resources_page_on_screen());
+    assert_eq!(
+        app.vitals_audience(),
+        Audience::Hidden,
+        "an occluded window"
+    );
+    assert_eq!(
+        Audience::Hidden.cadence(false),
+        Some((HIDDEN_PERIOD, true)),
+        "machine counters alone"
+    );
+}
+
+/// Page visibility asks the six resource lenses without taking the card's faster clock. The
+/// bars-off reading is a split tick too, and a card behind the page is an independent demand.
+#[cfg(unix)]
+#[test]
+fn the_resources_page_on_screen_asks_what_every_open_lens_asks() {
+    use crate::stats_lens::{Lens, Opened};
+    use crate::stats_paint::{Bar, Instrument};
+
+    static BOARD: JobsBoard = JobsBoard::new();
+    let _bars = crate::stats_deck::tests::attach_stats();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let wid = crate::WindowId(0);
+    app.windows.get_mut(&wid).expect("the window").focused = true;
+    let terminal = app.windows[&wid].tab_set.active_index().expect("terminal");
+    assert_eq!(app.vitals.survey.started(), None);
+    app.open_resources_tab().expect("the page opens");
+    let started = app
+        .vitals
+        .survey
+        .started()
+        .expect("opening starts the Disk survey");
+    let mut at = Instant::now();
+    app.service_vitals(at);
+    let request = read_req(&rx, "the page asks a reading");
+    let resources = vec![
+        Resource::Cpu,
+        Resource::Gpu,
+        Resource::Memory,
+        Resource::Disk,
+        Resource::Network,
+        Resource::Processes,
+    ];
+    assert_eq!(request.lenses, resources);
+    assert_eq!(request.cadence_ms, 1000, "the page keeps the focused clock");
+    assert!(!app.any_stats_lens_open(), "page demand opens no card");
+
+    // Adopt twice: each publish checks the visibility edge, and the already-visible page
+    // neither restarts nor replaces the survey. Observe admission, not its racing worker.
+    for seq in [1, 2] {
+        land(&app, seq, Vec::new(), Demand::Idle);
+        at += Duration::from_secs(2);
+        app.service_vitals(at);
+        let _ = read_req(&rx, "the next adopted reading");
+        assert_eq!(app.vitals.survey.started(), Some(started));
+    }
+
+    app.config
+        .sys
+        .get_or_insert_with(Default::default)
+        .stats_bars = Some("off".into());
+    assert!(
+        !app.deck_in_view(),
+        "PRECONDITION: no band asks for split readings"
+    );
+    at += Duration::from_secs(2);
+    app.service_vitals(at);
+    let request = read_req(&rx, "the page reads with the band off");
+    assert!(request.deck, "the page's Full head asks for split readings");
+    assert_eq!(request.lenses, resources);
+    assert_eq!(request.cadence_ms, 1000);
+
+    app.config.sys.as_mut().expect("settings").stats_bars = Some("deck".into());
+    app.switch_tab_in(wid, terminal);
+    land(&app, 3, Vec::new(), Demand::Idle);
+    at += Duration::from_secs(2);
+    app.service_vitals(at);
+    assert!(
+        read_req(&rx, "the terminal reads").lenses.is_empty(),
+        "a page behind another tab asks no lens"
+    );
+
+    // CONTROL: the hidden page stays open, but a pinned CPU card asks only for CPU and uses
+    // its own 500 ms clock. A demand that counted open pages would still ask all six here.
+    app.windows
+        .get_mut(&wid)
+        .expect("the window")
+        .stats_lens
+        .open = Some(Lens {
+        focus: Instrument::Cpu,
+        bar: Bar::Global,
+        how: Opened::Pinned,
+    });
+    at += Duration::from_secs(2);
+    app.service_vitals(at);
+    let request = read_req(&rx, "the pinned CPU card reads");
+    assert_eq!(request.lenses, vec![Resource::Cpu]);
+    assert_eq!(request.cadence_ms, 500);
+    app.close_stats_lens(wid);
+    app.open_resources_tab()
+        .expect("the page comes into sight again");
+    at += Duration::from_secs(2);
+    app.service_vitals(at);
+    let request = read_req(&rx, "the page in front again reads");
+    assert_eq!(request.lenses, resources);
+    assert_eq!(request.cadence_ms, 1000);
+    assert_eq!(
+        app.vitals.survey.started(),
+        Some(started),
+        "the survey's minimum interval also holds across visibility edges"
+    );
+}
+
 /// A woken window asks a reading only where its wake can give the readings a person's audience,
 /// which needs a focused aterm window: with none, the only window, which a key or its tab's
 /// output wakes, asks none, though it is attended and on screen, and one that its focus wakes,
@@ -4994,7 +5445,25 @@ fn an_idle_host_arms_no_system_vitals_deadline_while_a_job_runs_and_reads_its_en
         vec![job(Verdict::Exited, Class::Exited)],
         Demand::Idle,
     );
-    app.vitals.latest.lock().unwrap().job_events.push(Event {
+    let (event_source, stale_nonce) = {
+        let ctx = &app.pool.get(0).expect("tab 0's session").ctx;
+        let stale = if ctx.nonce == aterm_session::LaunchNonce::from_bytes([0; 16]) {
+            [1; 16]
+        } else {
+            [0; 16]
+        };
+        (
+            aterm_vitals::events::SessionScope {
+                local: 0,
+                sid: ctx.self_id.as_str().to_owned(),
+                nonce: ctx.nonce.to_hex(),
+            },
+            aterm_session::LaunchNonce::from_bytes(stale).to_hex(),
+        )
+    };
+    let original_job_event = Event {
+        at_unix_ms: None,
+        scope: aterm_vitals::events::EventScope::Session(event_source.clone()),
         seq: 3,
         at_ns: 0,
         kind: EventKind::Job {
@@ -5006,7 +5475,13 @@ fn an_idle_host_arms_no_system_vitals_deadline_while_a_job_runs_and_reads_its_en
             task: None,
             exit: Some(0),
         },
-    });
+    };
+    app.vitals
+        .latest
+        .lock()
+        .unwrap()
+        .job_events
+        .push(original_job_event.clone());
     app.on_vitals_wake();
     assert_eq!(
         app.status_job_fields(0),
@@ -5023,6 +5498,32 @@ fn an_idle_host_arms_no_system_vitals_deadline_while_a_job_runs_and_reads_its_en
             .collect()
     };
     assert_eq!(recorded, ["exited job=j41 class=exited rev=1 code=0"]);
+    for scope in [
+        aterm_vitals::events::EventScope::Unknown,
+        aterm_vitals::events::EventScope::Session(aterm_vitals::events::SessionScope {
+            nonce: stale_nonce,
+            ..event_source
+        }),
+    ] {
+        app.vitals.latest.lock().unwrap().job_events.push(Event {
+            scope,
+            ..original_job_event.clone()
+        });
+    }
+    app.record_job_events();
+    let timeline = Arc::clone(&app.pool.get(0).unwrap().ctx.timeline);
+    assert_eq!(
+        timeline
+            .lock()
+            .unwrap()
+            .view_since(None)
+            .rows
+            .iter()
+            .filter(|event| event.kind == crate::sys_host::JOB_CHANGE)
+            .count(),
+        1,
+        "an unbound event or the prior launch's event must not attach to the current session"
+    );
     assert_eq!(app.vitals_deadline(), None, "nothing live: nothing due");
 
     app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
@@ -6976,6 +7477,8 @@ fn a_cold_pulls_first_reading_hands_its_events_to_the_published_one() {
     use aterm_vitals::events::{Event, EventKind};
     use aterm_vitals::jobs::{Class, Verdict};
     let job = |seq: u64, to| Event {
+        at_unix_ms: None,
+        scope: aterm_vitals::events::EventScope::Unknown,
         seq,
         at_ns: 0,
         kind: EventKind::Job {
@@ -7020,6 +7523,8 @@ fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
         };
         if job_event {
             s.events.push(Event {
+                at_unix_ms: None,
+                scope: aterm_vitals::events::EventScope::Unknown,
                 seq,
                 at_ns: 0,
                 kind: EventKind::Job {
@@ -7467,12 +7972,14 @@ fn the_test_reader_never_reads_the_thermal_state() {
     }
 }
 
-/// The Neural Engine reader rides every reading, a whole one and a hidden one, beside the GPU,
-/// and its latest answer reaches the snapshot as it is, the self-check that retired it included
-/// (A2 §3.1). A unit test's reader reads no registry. NEGATIVE CONTROL: the reader's source
-/// switched off at the next reading reads off there.
+/// The Neural Engine's one reading, made as the reader starts ([`ane_at_start`]), rides every
+/// reading into the snapshot as it is, a whole one and a hidden one, the self-check that
+/// retired the reader included (A2 §3.1): the engine switched off after the start still reads
+/// on, since no reading reads it again, which
+/// `lanes_tests::a_resting_reading_reads_no_self_cpu_and_no_neural_engine_power` counts. A
+/// unit test's reader reads no registry.
 #[test]
-fn the_neural_engine_reading_rides_every_reading_into_the_snapshot() {
+fn the_neural_engines_start_reading_rides_every_reading_into_the_snapshot() {
     use aterm_sysprobe::neural_engine::{Entry, Power, Reader as AneReader, Source};
     use std::sync::atomic::{AtomicBool, Ordering};
     static ON: AtomicBool = AtomicBool::new(true);
@@ -7483,13 +7990,13 @@ fn the_neural_engine_reading_rides_every_reading_into_the_snapshot() {
     };
     assert!(reader.ane.is_none(), "a test's reader reads no registry");
     assert_eq!(reader.read(&req).ane, None);
-    reader.ane = Some(AneReader::on(Source {
+    reader.ane = ane_at_start(Some(AneReader::on(Source {
         entry: || Some(Entry { cores: Some(16) }),
         power: || Power {
             current: Some(i64::from(ON.load(Ordering::Relaxed))),
             max: Some(1),
         },
-    }));
+    })));
     let on = Some(Ok(AneSample {
         cores: 16,
         powered: true,
@@ -7499,16 +8006,13 @@ fn the_neural_engine_reading_rides_every_reading_into_the_snapshot() {
     ON.store(false, Ordering::Relaxed);
     assert_eq!(
         reader.read_machine(&req).ane,
-        Some(Ok(AneSample {
-            cores: 16,
-            powered: false
-        })),
-        "CONTROL: off at the next reading"
+        on,
+        "off since the start: no reading reads it again"
     );
-    reader.ane = Some(AneReader::on(Source {
+    reader.ane = ane_at_start(Some(AneReader::on(Source {
         entry: || None,
         power: Power::default,
-    }));
+    })));
     assert_eq!(reader.read(&req).ane, Some(Err(AneCheck::Matched)));
 }
 
@@ -8122,6 +8626,303 @@ fn a_held_episode_is_recorded_at_its_edges_and_raises_nothing() {
     }
 }
 
+/// A MEMORY STARVATION EPISODE WRITES ONE RECORD AT EACH EDGE AND RAISES NOTHING: the probe
+/// thread hands its opening and its end over beside the snapshot (the hand-over says the loop must
+/// hear of it), the loop posts each as a `system/starving` record, in order, whether or not a new
+/// snapshot came with it (the end comes with one no newer than the view holds), and nothing
+/// reaches the digest. A snapshot with no edge posts none.
+#[test]
+fn a_starvation_episode_writes_two_records_and_a_reading_without_an_edge_none() {
+    use crate::message_reporters as mr;
+    use aterm_vitals::events::{Event, EventKind};
+    use aterm_vitals::starving::{Edge, Episode, Holder, Look, Why, Worst};
+    let episode = Episode {
+        why: Why::Thrash,
+        opened_ns: 1,
+        opened_unix_ms: 1_763_277_369_800,
+        at_open: Look {
+            push_bps: Some(259.0 * 1_048_576.0),
+            refault_bps: Some(89.0 * 1_048_576.0),
+            headroom: Some(382_055 * 16_384),
+            ram: 128 << 30,
+            ..Look::default()
+        },
+        worst: Worst::default(),
+        holders: vec![Holder {
+            pid: 77_936,
+            name: "ty".into(),
+            bytes: 133 << 30,
+            scope: aterm_vitals::RowScope::Others,
+            label: None,
+        }],
+        holders_age_ms: Some(0),
+        ended: None,
+    };
+    let closed = Episode {
+        ended: Some((1_763_277_669_800, Look::default())),
+        ..episode.clone()
+    };
+    let hand = |app: &mut crate::App, seq: u64, edge: Option<Edge>| {
+        let snap = Snapshot {
+            seq,
+            events: edge
+                .into_iter()
+                .map(|edge| Event {
+                    seq,
+                    at_ns: 0,
+                    at_unix_ms: None,
+                    scope: aterm_vitals::events::EventScope::Machine,
+                    kind: EventKind::Starving(Box::new(edge)),
+                })
+                .collect(),
+            ..Snapshot::default()
+        };
+        let moved = hand_over(
+            &app.vitals.latest,
+            &Arc::new(snap),
+            Vec::new(),
+            Instant::now(),
+        );
+        app.on_vitals_wake();
+        moved
+    };
+    let records = |app: &crate::App| -> Vec<(String, Vec<String>)> {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key.as_deref() == Some(mr::STARVING_KEY))
+            .map(|r| (r.title.clone(), r.detail.clone()))
+            .collect()
+    };
+    let pair = |edge: &Edge| {
+        let m = mr::starving_record(edge);
+        (m.title, m.detail)
+    };
+    let opened = Edge::Opened(episode);
+    let ended = Edge::Ended(closed);
+    let mut app = crate::App::headless_for_test();
+    assert!(!hand(&mut app, 1, None), "no edge: nothing moved");
+    assert!(records(&app).is_empty());
+    assert!(
+        hand(&mut app, 2, Some(opened.clone())),
+        "the loop hears of it"
+    );
+    assert_eq!(records(&app), [pair(&opened)]);
+    assert!(!hand(&mut app, 3, None));
+    assert_eq!(records(&app), [pair(&opened)], "one episode, one opening");
+    assert!(
+        hand(&mut app, 3, Some(ended.clone())),
+        "an edge with no newer snapshot"
+    );
+    assert_eq!(app.vitals.snapshot.as_ref().map(|s| s.seq), Some(3));
+    assert_eq!(records(&app), [pair(&opened), pair(&ended)]);
+    assert!(app.messages.digest().is_empty(), "a record, never a line");
+}
+
+fn starving_event(seq: u64) -> aterm_vitals::events::Event {
+    use aterm_vitals::starving::{Edge, Episode, Look, Why, Worst};
+    aterm_vitals::events::Event {
+        seq,
+        at_ns: 0,
+        at_unix_ms: None,
+        scope: aterm_vitals::events::EventScope::Machine,
+        kind: aterm_vitals::events::EventKind::Starving(Box::new(Edge::Opened(Episode {
+            why: Why::Thrash,
+            opened_ns: 1,
+            opened_unix_ms: 1_763_277_369_800,
+            at_open: Look {
+                ram: 128 << 30,
+                ..Look::default()
+            },
+            worst: Worst::default(),
+            holders: Vec::new(),
+            holders_age_ms: None,
+            ended: None,
+        }))),
+    }
+}
+
+/// A STARVATION EDGE IS JOURNALED BEFORE ITS READING IS HANDED OVER: the probe loop writes the
+/// edge's line and orders it to the disk (the source's sink) while the hand-over still holds no
+/// snapshot of that reading, then hands the reading over with the edge kept for the records and
+/// posts it. NEGATIVE CONTROL: a write after the hand-over would find reading 1 handed over.
+#[test]
+fn a_starvation_edge_is_journaled_before_its_reading_is_handed_over() {
+    struct Journaled<'a> {
+        log: Arc<Mutex<Vec<String>>>,
+        latest: &'a Mutex<Handover>,
+    }
+    impl crate::memory_starving::Sink for Journaled<'_> {
+        fn write(&self, level: aterm_log::Level, line: &str) {
+            let handed = self.latest.lock().unwrap().snap.as_ref().map(|s| s.seq);
+            let opened = line.starts_with(crate::memory_starving::OPENED_LINE);
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("line:{level:?}:{opened}:{handed:?}"));
+        }
+        fn sync(&self) -> bool {
+            self.log.lock().unwrap().push("sync".into());
+            true
+        }
+    }
+    struct Starving<'a> {
+        observed_at: memory::ObservedAt,
+        model: aterm_vitals::Vitals,
+        log: Arc<Mutex<Vec<String>>>,
+        sink: Journaled<'a>,
+    }
+    impl Source for Starving<'_> {
+        fn reading(&mut self, _request: &Request) -> Snapshot {
+            self.observed_at = mock_observed_at();
+            self.log.lock().unwrap().push("read".into());
+            Snapshot {
+                seq: 1,
+                events: vec![starving_event(1)],
+                ..Snapshot::default()
+            }
+        }
+        fn observed_at(&self) -> Option<memory::ObservedAt> {
+            Some(self.observed_at)
+        }
+        fn model(&mut self) -> &mut aterm_vitals::Vitals {
+            &mut self.model
+        }
+        fn starving_sink(&self) -> &dyn crate::memory_starving::Sink {
+            &self.sink
+        }
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let latest = Mutex::new(Handover::default());
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    tx.send(Msg::Read(Box::new(Request::default()))).unwrap();
+    drop(tx);
+    run(
+        &rx,
+        &latest,
+        &|| {
+            log.lock().unwrap().push("post".into());
+            true
+        },
+        Starving {
+            observed_at: mock_observed_at(),
+            model: aterm_vitals::Vitals::new(),
+            log: Arc::clone(&log),
+            sink: Journaled {
+                log: Arc::clone(&log),
+                latest: &latest,
+            },
+        },
+        None,
+        None,
+        &AtomicBool::new(false),
+        PriorRun::default(),
+    );
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["read", "line:Warn:true:None", "sync", "post"]
+    );
+    assert_eq!(latest.lock().unwrap().health_events.len(), 1);
+}
+
+/// THE PROBE THREAD READS MEMORY ON ITS OWN WHILE IT IS TIGHT: after a reading the host asked
+/// whose memory is tight (its headroom at the reserve), with no ask after it, the thread takes
+/// a reading of its own once its watch period passes, of the machine's counters alone, hidden
+/// and at that period's cadence, and goes on while the memory stays tight, so a main thread that
+/// stops asking (a starving machine stalls it) leaves memory judged. Once a reading finds room it
+/// waits for the host again. NEGATIVE CONTROL: the host's next ask, after the reading that found
+/// room, is the next reading, not one of the thread's own.
+#[test]
+fn the_probe_thread_reads_memory_on_its_own_while_it_is_tight() {
+    struct Watched {
+        observed_at: memory::ObservedAt,
+        model: aterm_vitals::Vitals,
+        n: u64,
+        read: std::sync::mpsc::Sender<(bool, bool, u32)>,
+        hidden: Arc<Mutex<Vec<bool>>>,
+    }
+    impl Source for Watched {
+        fn reading(&mut self, request: &Request) -> Snapshot {
+            self.observed_at = mock_observed_at();
+            self.n += 1;
+            let _ = self
+                .read
+                .send((request.machine_only, request.in_view, request.cadence_ms));
+            let headroom = if self.n < 3 { 1 << 30 } else { 78 << 30 };
+            Snapshot {
+                seq: self.n,
+                mem: Some(aterm_vitals::model::MemView {
+                    sample: aterm_vitals::model::MemSample {
+                        total: 128 << 30,
+                        headroom: Some(headroom),
+                        ..aterm_vitals::model::MemSample::default()
+                    },
+                    ..aterm_vitals::model::MemView::default()
+                }),
+                ..Snapshot::default()
+            }
+        }
+        fn observed_at(&self) -> Option<memory::ObservedAt> {
+            Some(self.observed_at)
+        }
+        fn model(&mut self) -> &mut aterm_vitals::Vitals {
+            &mut self.model
+        }
+        fn memory_watch_every(&self) -> Duration {
+            Duration::from_millis(1)
+        }
+        fn after_publish(&mut self, hidden: bool) {
+            self.hidden.lock().unwrap().push(hidden);
+        }
+    }
+    let latest = Mutex::new(Handover::default());
+    let hidden = Arc::new(Mutex::new(Vec::new()));
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let host = || {
+        Msg::Read(Box::new(Request {
+            in_view: true,
+            cadence_ms: 1_000,
+            ..Request::default()
+        }))
+    };
+    let next = || {
+        read_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("a reading")
+    };
+    std::thread::scope(|scope| {
+        let source = Watched {
+            observed_at: mock_observed_at(),
+            model: aterm_vitals::Vitals::new(),
+            n: 0,
+            read: read_tx,
+            hidden: Arc::clone(&hidden),
+        };
+        let latest = &latest;
+        scope.spawn(move || {
+            run(
+                &rx,
+                latest,
+                &|| true,
+                source,
+                None,
+                None,
+                &AtomicBool::new(false),
+                PriorRun::default(),
+            );
+        });
+        tx.send(host()).unwrap();
+        assert_eq!(next(), (false, true, 1_000), "the host's");
+        assert_eq!(next(), (true, false, 1), "the thread's own, memory tight");
+        assert_eq!(next(), (true, false, 1), "again: still tight");
+        tx.send(host()).unwrap();
+        assert_eq!(next(), (false, true, 1_000), "room: the host's ask is next");
+        drop(tx);
+    });
+    assert_eq!(*hidden.lock().unwrap(), [false, true, true, false]);
+}
+
 /// A verdict refresh's prime is a new program and would wait in the same line, so a switch-on read
 /// while the adopted view stands in a backed-up episode starts none; the next view that stands in
 /// none starts it, once (leftover-processes design §13).
@@ -8699,6 +9500,8 @@ fn proc_sample_forwards_disk_read_and_host_keeps_crash_notes_on_backpressure() {
         kind: aterm_vitals::GapKind::Crash,
     };
     let crash = aterm_vitals::StripEvent {
+        scope: aterm_vitals::events::EventScope::Machine,
+        span: None,
         at_unix_ms: now_ms - 25_000,
         kind: aterm_vitals::StripEventKind::Crash,
         label: "aterm crash".into(),
@@ -9638,11 +10441,15 @@ fn cold_pull_feeds_noted_gaps_and_events_once_and_facts_preserves_them() {
         kind: GapKind::Crash,
     };
     let ev_a = aterm_vitals::StripEvent {
+        scope: aterm_vitals::events::EventScope::Machine,
+        span: None,
         at_unix_ms: 1_792_999_980_000,
         kind: StripEventKind::Restart,
         label: "restarted".into(),
     };
     let ev_b = aterm_vitals::StripEvent {
+        scope: aterm_vitals::events::EventScope::Machine,
+        span: None,
         at_unix_ms: 1_792_999_996_000,
         kind: StripEventKind::PressureSpike,
         label: "pressure".into(),
@@ -9885,6 +10692,9 @@ fn the_spotlight_familys_day_round_trips_through_its_kept_file() {
         shares: Vec::new(),
         volumes: None,
         volumes_age_ms: None,
+        store: None,
+        store_age_ms: None,
+        store_stale_ms: None,
         state: State::Indexing,
     };
     let mut day = SpotlightHistory::default();

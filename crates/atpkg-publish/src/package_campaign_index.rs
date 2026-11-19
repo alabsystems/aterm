@@ -79,6 +79,7 @@ struct Recheck<'a> {
 
 impl PublicationObserver for Recheck<'_> {
     fn before_publish(&mut self, prepared: &PreparedPublication<'_>) -> Result<()> {
+        self.campaign.check_protocol(self.ctx, prepared)?;
         let retained = self.campaign.retained_index(self.ctx)?.ok_or_else(|| {
             Error::refused("the retained index attempt disappeared during qualification")
         })?;
@@ -418,6 +419,7 @@ impl Campaign {
 impl PublicationObserver for Retention<'_> {
     fn before_publish(&mut self, prepared: &PreparedPublication<'_>) -> Result<()> {
         self.campaign.check()?;
+        self.campaign.check_protocol(self.ctx, prepared)?;
         destinations(self.ctx, &self.campaign.inputs)?;
         if prepared.public_owner() != self.campaign.inputs.public_owner
             || prepared.staging_owner() != self.campaign.inputs.staging_owner

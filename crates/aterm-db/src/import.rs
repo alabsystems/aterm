@@ -500,15 +500,17 @@ pub fn apply(dir: &Path, path: &Path, request: [u8; 16]) -> Result<Value> {
                 json!({"source_sha256":digest,"state":"importing","changes":total_changes}),
             ),
         }],
+        said: None,
     };
     db.commit(start)?;
     for (index, chunk) in chunks.into_iter().enumerate() {
         db.commit(Command::Write {
             request: chunk_request(request, index as u64),
             changes: chunk,
+            said: None,
         })?;
     }
-    db.commit(Command::Write{request:chunk_request(request,u64::MAX-1),changes:vec![Change{collection:"imports".into(),key:import_key,value:Some(json!({"source_sha256":digest,"state":"complete","changes":total_changes,"proposals":account_count,"unclassified_cells":unresolved_cells}))}]})?;
+    db.commit(Command::Write{request:chunk_request(request,u64::MAX-1),changes:vec![Change{collection:"imports".into(),key:import_key,value:Some(json!({"source_sha256":digest,"state":"complete","changes":total_changes,"proposals":account_count,"unclassified_cells":unresolved_cells}))}], said: None})?;
     Ok(
         json!({"source_sha256":digest,"provider_proposals":account_count,"email_identities":email_identities,"unclassified_source_cells":unresolved_cells,"records_without_an_unambiguous_email":rejected,"raw_source_modified":false,"raw_unclassified_values_replicated":false,"mailbox_aliases_inferred":false,"request":hex::encode_lower(&request)}),
     )

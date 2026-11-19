@@ -4,14 +4,14 @@
 //! Native macOS unified titlebar tab strip and inline tab rename editor.
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::native_strip_container;
-#[cfg(target_os = "macos")]
 pub(crate) use macos::{
     ToolbarHandle, begin_tab_rename, can_present_tab_rename, end_tab_rename,
     install_window_toolbar, native_selected_pill_rgb, read_tab_chrome, read_tab_menus,
     reflow_window_tabs, rename_editor_edit, rename_editor_text, set_active_tab_color,
     set_app_tiles, set_strip_accent, set_strip_dark, set_window_tabs, tab_frame_lines,
 };
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{current_native_drop_point, native_drop_site, native_strip_container};
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) use non_macos::{
@@ -71,7 +71,11 @@ pub(crate) fn format_tab_chrome(
     if count == 0 {
         return None;
     }
-    let selected = active.min(count - 1) as isize;
+    let selected = if active == crate::tab_bar::NO_SELECTED_TAB {
+        -1
+    } else {
+        active.min(count - 1) as isize
+    };
     let states = (0..count)
         .map(|index| {
             let mut state = Vec::with_capacity(6);
@@ -164,19 +168,21 @@ fn tab_help(
         }
         None => {}
     }
-    if index < 9 {
-        parts.push(format!("⌘{}", index + 1));
+    if let Some(number) = metadata.tab_number(index) {
+        parts.push(format!("⌘{number}"));
     }
     parts.join(" · ")
 }
 
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
-fn tab_display_label(title: &str, index: usize, available_width: f64) -> String {
+fn tab_display_label(title: &str, number: Option<usize>, available_width: f64) -> String {
     let title_width = title.chars().count() as f64 * 7.0;
     let shortcut_width = 34.0;
-    if index < 9 && available_width >= title_width + shortcut_width {
-        format!("{title}  \u{2318}{}", index + 1)
+    if let Some(number) = number
+        && available_width >= title_width + shortcut_width
+    {
+        format!("{title}  ⌘{number}")
     } else {
         title.to_string()
     }
@@ -281,13 +287,16 @@ mod non_macos {
     /// Update the non-macOS [`ToolbarHandle`] with the current tab set.
     pub(crate) fn set_window_tabs(
         handle: &ToolbarHandle,
-        titles: &[String],
-        _ids: &[crate::tab_model::TabId],
-        metadata: &[TabStripMetadata],
-        tooltips: &[Option<String>],
-        ext: &[TabChromeExt],
-        active: usize,
+        tabs: crate::platform::ToolbarTabsModel<'_>,
     ) {
+        let crate::platform::ToolbarTabsModel {
+            titles,
+            metadata,
+            tooltips,
+            ext,
+            active,
+            ..
+        } = tabs;
         let mut chrome = handle.chrome.borrow_mut();
         chrome.titles.clear();
         chrome.titles.extend_from_slice(titles);
@@ -394,7 +403,6 @@ mod macos {
     const TAB_PILL_HEIGHT: f64 = 22.0;
     const TAB_PILL_RADIUS: f64 = 7.0;
     const TAB_RULE_HEIGHT: f64 = 14.0;
-    const SOLO_EDITOR_WIDTH: f64 = 280.0;
     const SOLO_GAP: f64 = 10.0;
     const SOLO_EDGE_PAD: f64 = 12.0;
     const SOLO_LABEL_HEIGHT: f64 = 18.0;
@@ -688,7 +696,7 @@ mod macos {
         /// The application tile's inks ([`set_app_tiles`]), which every chip built later takes; until the theme publishes them an application's glyph stands bare.
         app_tiles: Cell<Option<crate::tab_bar::AppTileInks>>,
         /// The live [`TabView`]s in tab order: the source for [`read_tab_chrome`] and
-        /// the set [`set_window_tabs`] replaces on rebuild.
+        /// the views [`set_window_tabs`] reconciles by stable tab ID.
         tabs: RefCell<Vec<aterm_objc::Retained<TabView>>>,
         /// The trailing "+" New Tab [`ChromeButton`], re-pinned to the live width and
         /// measured centre line by every [`set_window_tabs`].
@@ -697,21 +705,17 @@ mod macos {
         /// hands focus back to it; asking the container's window later is wrong in
         /// native fullscreen, where AppKit re-hosts the toolbar in a separate window.
         content_view: Obj,
-        /// The live inline session-rename editor, or `None`. Owned by the handle rather
-        /// than a chip because a rebuild (tab count or width change) destroys every
-        /// chip; the field is repositioned across a rebuild instead.
+        /// The title label currently being edited and its retained delegate.
         rename: RefCell<Option<RenameEditor>>,
     }
 
-    /// Live inline rename editor overlaying one tab chip.
+    /// An edit of the chip’s own title label.
     struct RenameEditor {
-        /// The editable field. Its `stringValue` is the only home of the in-progress
-        /// text; nothing else needs saving across a strip rebuild.
+        /// The chip’s title label. AppKit owns the live text and selection.
         field: Obj,
         /// The delegate/relay. Retained here because AppKit holds a delegate weakly.
         target: aterm_objc::Retained<TabRenameTarget>,
-        /// Stable id of the tab the editor is painted over, for positioning only. When
-        /// it stops resolving the edit is cancelled.
+        /// Removal of this chip cancels the edit.
         tab: TabId,
     }
 
@@ -991,6 +995,104 @@ mod macos {
         }
     }
 
+    fn screen_point(event: Id) -> CGPoint {
+        // SAFETY: AppKit provided the live mouse event on the main thread. These getters return
+        // its NSWindow, its NSPoint in that window, and the corresponding screen NSPoint.
+        unsafe {
+            appkit::send_point_point(
+                appkit::send_id(event, sel!(window)),
+                sel!(convertPointToScreen:),
+                appkit::send_point(event, sel!(locationInWindow)),
+            )
+        }
+    }
+
+    fn native_drop_point(p: CGPoint) -> (isize, (i32, i32)) {
+        // SAFETY: +[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:] has
+        // prototype NSInteger(NSPoint, NSInteger). Zero includes the frontmost window.
+        let number = unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, aterm_objc::Sel, CGPoint, isize) -> isize =
+                appkit::checked_msg();
+            f(
+                class(c"NSWindow").as_id(),
+                sel!(windowNumberAtPoint:belowWindowWithWindowNumber:),
+                p,
+                0,
+            )
+        };
+        (number, (p.x.round() as i32, p.y.round() as i32))
+    }
+
+    pub(crate) fn current_native_drop_point() -> (isize, (i32, i32)) {
+        // SAFETY: +[NSEvent mouseLocation] returns the desktop NSPoint on the main thread.
+        native_drop_point(unsafe {
+            appkit::send_point(class(c"NSEvent").as_id(), sel!(mouseLocation))
+        })
+    }
+
+    /// Resolve the released point against the actual window AppKit hit, including a fullscreen
+    /// toolbar hosted separately from the content. Every conversion stays in this window's scale.
+    pub(crate) fn native_drop_site(
+        handle: &ToolbarHandle,
+        number: isize,
+        screen: (i32, i32),
+    ) -> Option<crate::tab_drop::TabDropSite> {
+        let screen = CGPoint {
+            x: f64::from(screen.0),
+            y: f64::from(screen.1),
+        };
+        // SAFETY: the handle retains both views on the main thread. All sends below are geometry
+        // getters on those views or their live NSWindows and have the AppKit prototypes shown.
+        unsafe {
+            let strip = handle.container.id();
+            let content = handle.content_view.id();
+            let window_of = |view| appkit::send_id(view, sel!(window));
+            let hit = |window: Id| {
+                !window.is_null() && appkit::send_isize(window, sel!(windowNumber)) == number
+            };
+            let local = |view, window| {
+                appkit::send_point_point_id(
+                    view,
+                    sel!(convertPoint:fromView:),
+                    appkit::send_point_point(window, sel!(convertPointFromScreen:), screen),
+                    Id::NIL,
+                )
+            };
+            let strip_window = window_of(strip);
+            if hit(strip_window) {
+                let p = local(strip, strip_window);
+                let bounds = appkit::send_rect(strip, sel!(bounds));
+                if p.y >= bounds.origin.y
+                    && p.y < bounds.origin.y + bounds.size.height
+                    && p.x >= bounds.origin.x
+                    && p.x < bounds.origin.x + bounds.size.width
+                {
+                    let before = handle.tabs.borrow().iter().find_map(|chip| {
+                        let frame = appkit::send_rect(chip.as_id(), sel!(frame));
+                        (p.x < frame.origin.x + frame.size.width * 0.5).then(|| chip.tab_id())
+                    });
+                    return Some(crate::tab_drop::TabDropSite::Strip(before));
+                }
+            }
+            let window = window_of(content);
+            if !hit(window) {
+                return None;
+            }
+            let p = local(content, window);
+            let bounds = appkit::send_rect(content, sel!(bounds));
+            let scale = appkit::send_f64(window, sel!(backingScaleFactor));
+            let y = if appkit::send_bool(content, sel!(isFlipped)) {
+                p.y - bounds.origin.y
+            } else {
+                bounds.origin.y + bounds.size.height - p.y
+            };
+            Some(crate::tab_drop::TabDropSite::Content(
+                (p.x - bounds.origin.x) * scale,
+                y * scale,
+            ))
+        }
+    }
+
     /// Per-tab state for [`TabView`].
     pub(crate) struct TabIvars {
         /// The `Wake` channel clicks and drags relay through.
@@ -1024,6 +1126,8 @@ mod macos {
         /// The mouse-down location in the tab's own coordinates, kept so `mouseDragged:`
         /// can measure horizontal travel and decide a reorder direction.
         press_x: Cell<f64>,
+        /// Screen point of the press, in the same space even if reordering moves this chip.
+        press_screen: Cell<CGPoint>,
         /// Whether the current gesture has already fired a reorder: at most one
         /// `Move` per press, so a long drag does not stutter through swaps.
         dragged: Cell<bool>,
@@ -1192,6 +1296,7 @@ mod macos {
                 // means window coordinates.
                 let p = unsafe { point_in_view(self.as_id(), event) };
                 ivars.press_x.set(p.x);
+                ivars.press_screen.set(screen_point(event));
                 ivars.dragged.set(false);
                 ivars.drag_origin.set(Some(ivars.origin.get()));
                 let _ = ivars.proxy.send_event(Wake::NativeTabCommand {
@@ -1237,10 +1342,23 @@ mod macos {
                 });
             }
 
-            /// Retire the drag origin without forwarding mouse-up up the responder chain.
+            /// Commit the drop at its screen location while the original chip still owns the press.
             @sel(mouseUp:)
-            fn mouseUp(&self, _event: Id) {
-                self.ivars().drag_origin.set(None);
+            fn mouseUp(&self, event: Id) {
+                let ivars = self.ivars();
+                let Some(origin) = ivars.drag_origin.take() else { return };
+                let p = screen_point(event);
+                let start = ivars.press_screen.get();
+                if (p.x - start.x).hypot(p.y - start.y) < crate::client_frame::MOVE_THRESHOLD_LOGICAL_PX {
+                    return;
+                }
+                let (number, screen) = native_drop_point(p);
+                let _ = ivars.proxy.send_event(Wake::NativeTabCommand {
+                    window: ivars.window,
+                    command: NativeTabCommand::Drop {
+                        tab: origin.tab, number, screen,
+                    },
+                });
             }
 
             /// Reveal the close button and repaint the hover highlight on enter.
@@ -1653,6 +1771,7 @@ mod macos {
                 metadata: Cell::new(metadata),
                 hovered: Cell::new(false),
                 press_x: Cell::new(0.0),
+                press_screen: Cell::new(CGPoint { x: 0.0, y: 0.0 }),
                 dragged: Cell::new(false),
                 solo: Cell::new(geometry.solo),
                 center_y: Cell::new(geometry.center_y),
@@ -1804,11 +1923,13 @@ mod macos {
                         sel!(setFont:),
                         system_font(12.0, active || metadata.is_app_tab()),
                     );
-                    if let Some(text) = appkit::nsstring(&tab_display_label(
-                        &title,
-                        ivars.index.get(),
-                        content.label[2],
-                    )) {
+                    if !appkit::send_bool(lbl.id(), sel!(isEditable))
+                        && let Some(text) = appkit::nsstring(&tab_display_label(
+                            &title,
+                            metadata.tab_number(ivars.index.get()),
+                            content.label[2],
+                        ))
+                    {
                         appkit::send_v_id(lbl.id(), sel!(setStringValue:), text.id());
                     }
                     appkit::send_v_rect(lbl.id(), sel!(setFrame:), rect_of(content.label));
@@ -1818,27 +1939,6 @@ mod macos {
             mark_dirty(self.as_id());
         }
 
-        /// Return the rename editor's frame in container coordinates.
-        fn editor_frame(&self) -> CGRect {
-            let ivars = self.ivars();
-            // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter.
-            let frame = unsafe { appkit::send_rect(self.as_id(), sel!(frame)) };
-            let y = frame.origin.y + ivars.center_y.get() - TAB_PILL_HEIGHT * 0.5;
-            if ivars.solo.get() {
-                let width = frame.size.width.min(SOLO_EDITOR_WIDTH);
-                let center = frame.origin.x + ivars.solo_center_x.get();
-                let x = (center - width * 0.5)
-                    .max(frame.origin.x)
-                    .min(frame.origin.x + frame.size.width - width);
-                return rect(x, y, width, TAB_PILL_HEIGHT);
-            }
-            rect(
-                frame.origin.x + TAB_PILL_INSET_X,
-                y,
-                (frame.size.width - 2.0 * TAB_PILL_INSET_X).max(1.0),
-                TAB_PILL_HEIGHT,
-            )
-        }
         /// Lay out solo mode with the title, description, app icon, and status canvas centered.
         fn relayout_solo(&self, title: &str, bounds: CGRect, center_y: f64) {
             let ivars = self.ivars();
@@ -1874,10 +1974,12 @@ mod macos {
                         system_font(13.0, metadata.is_app_tab()),
                     );
                     appkit::send_v_id(lbl.id(), sel!(setTextColor:), ns_color(sel!(labelColor)));
-                    if let Some(text) = appkit::nsstring(title) {
-                        appkit::send_v_id(lbl.id(), sel!(setStringValue:), text.id());
+                    if !appkit::send_bool(lbl.id(), sel!(isEditable)) {
+                        if let Some(text) = appkit::nsstring(title) {
+                            appkit::send_v_id(lbl.id(), sel!(setStringValue:), text.id());
+                        }
+                        appkit::send_v(lbl.id(), sel!(sizeToFit));
                     }
-                    appkit::send_v(lbl.id(), sel!(sizeToFit));
                     title_w = appkit::send_rect(lbl.id(), sel!(frame)).size.width;
                 }
                 if let Some(desc) = ivars.desc_label.borrow().as_ref() {
@@ -2764,16 +2866,22 @@ mod macos {
     /// Synchronize the native tab strip with the window's current tab state.
     pub(crate) fn set_window_tabs(
         handle: &ToolbarHandle,
-        titles: &[String],
-        ids: &[TabId],
-        metadata: &[TabStripMetadata],
-        tooltips: &[Option<String>],
-        ext: &[TabChromeExt],
-        active: usize,
+        tabs: crate::platform::ToolbarTabsModel<'_>,
     ) {
         let Some(mtm) = MainThread::new() else {
             return;
         };
+        let crate::platform::ToolbarTabsModel {
+            titles,
+            ids,
+            metadata,
+            tooltips,
+            ext,
+            active,
+            new_tab,
+        } = tabs;
+        // SAFETY: the toolbar owns this button and all pushes run on the main thread.
+        unsafe { appkit::send_v_bool(handle.plus.as_id(), sel!(setHidden:), !new_tab) };
         let container = handle.container.id();
         let metadata_at = |i: usize| {
             metadata.get(i).copied().unwrap_or(TabStripMetadata {
@@ -2783,6 +2891,7 @@ mod macos {
                 attention: crate::tab_bar::ChipLevel::Off,
                 conn: None,
                 closable: true,
+                panel_numbers: false,
                 team: crate::tab_bar::TabTeam::NONE,
             })
         };
@@ -2796,85 +2905,118 @@ mod macos {
         let ext_at = |i: usize| ext.get(i).unwrap_or(&default_ext);
         let tooltip_at = |i: usize| tooltips.get(i).and_then(Option::as_deref);
 
-        if titles.is_empty() {
-            // SAFETY: `removeFromSuperview` is a main-thread mutator.
-            {
-                let mut tabs = handle.tabs.borrow_mut();
-                for old in tabs.drain(..) {
-                    unsafe { appkit::send_v(old.as_id(), sel!(removeFromSuperview)) };
-                }
-            }
-            sync_rename_overlay(handle, &[]);
-            return;
+        let removed = handle
+            .rename
+            .borrow()
+            .as_ref()
+            .and_then(|edit| (!ids.contains(&edit.tab)).then_some(edit.target.ivars().session));
+        if let Some(session) = removed {
+            end_tab_rename(handle);
+            let _ = handle.proxy.send_event(Wake::CancelSessionRename {
+                window: handle.window,
+                session,
+            });
         }
-
+        let n = titles.len();
+        let active = if active == crate::tab_bar::NO_SELECTED_TAB {
+            active
+        } else {
+            active.min(n.saturating_sub(1))
+        };
         let StripPlan {
             cells,
             metrics,
             strip_h,
-        } = plan_strip(handle, titles.len(), active);
-        let n = titles.len();
-        let active = active.min(n.saturating_sub(1));
-        let geometry_at = |index: usize, cell_x: f64| metrics.geometry(index, n, active, cell_x);
-
-        {
-            let tabs = handle.tabs.borrow();
-            if tabs.len() == n
-                && tabs.iter().zip(&cells).all(|(tab, &(cx, cw))| {
-                    // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter on a live retained chip.
-                    let f = unsafe { appkit::send_rect(tab.as_id(), sel!(frame)) };
-                    f.origin.x == cx && f.size.width == cw
-                })
-            {
-                for (i, (tab, title)) in tabs.iter().zip(titles).enumerate() {
-                    tab.set_geometry(geometry_at(i, cells[i].0));
-                    tab.set_context(title, tooltip_at(i));
-                    tab.set_tab_origin(origin_at(i));
-                    tab.set_metadata(metadata_at(i));
-                    tab.set_chrome_ext(ext_at(i));
-                    tab.set_active(i == active);
+        } = plan_strip(handle, n, active);
+        let mut tabs = handle.tabs.borrow_mut();
+        let mut receivers =
+            if tabs.len() == n && tabs.iter().enumerate().all(|(i, t)| t.tab_id() == id_at(i)) {
+                None
+            } else {
+                let mut old: std::collections::HashMap<_, _> =
+                    tabs.drain(..).map(|tab| (tab.tab_id(), tab)).collect();
+                // A surviving tab keeps its title field even if it moves into another slot.
+                let mut receivers: Vec<_> = (0..n).map(|i| old.remove(&id_at(i))).collect();
+                // A replacement in the same slot keeps the native receiver of any press or
+                // popped menu. The ongoing gesture already captured its original tab.
+                for tab in old.into_values() {
+                    let index = tab.ivars().index.get();
+                    if let Some(slot) = receivers.get_mut(index)
+                        && slot.is_none()
+                    {
+                        *slot = Some(tab);
+                    } else {
+                        // SAFETY: the strip is on the main thread and retains this removed chip.
+                        unsafe { appkit::send_v(tab.as_id(), sel!(removeFromSuperview)) };
+                    }
                 }
-                drop(tabs);
-                sync_rename_overlay(handle, ids);
-                return;
-            }
-        }
-
-        // SAFETY: `removeFromSuperview` is a main-thread mutator.
-        {
-            let mut tabs = handle.tabs.borrow_mut();
-            for old in tabs.drain(..) {
-                unsafe { appkit::send_v(old.as_id(), sel!(removeFromSuperview)) };
-            }
-        }
-        let mut new_tabs: Vec<Retained<TabView>> = Vec::with_capacity(n);
-        for (i, title) in titles.iter().enumerate() {
-            let (cx, cw) = cells[i];
+                Some(receivers)
+            };
+        for (i, (title, &(cx, cw))) in titles.iter().zip(&cells).enumerate() {
             let frame = rect(cx, 0.0, cw, strip_h);
-            let tab = TabView::build(
-                mtm,
-                handle.proxy.clone(),
-                handle.window,
-                origin_at(i),
-                i,
-                title,
-                tooltip_at(i),
-                i == active,
-                metadata_at(i),
-                ext_at(i),
-                frame,
-                geometry_at(i, cx),
-            );
-            let Some(tab) = tab else { continue };
-            if let Some(inks) = handle.app_tiles.get() {
-                tab.set_app_tiles(inks);
+            let geometry = metrics.geometry(i, n, active, cx);
+            let origin = origin_at(i);
+            if let Some(receivers) = receivers.as_mut() {
+                if let Some(existing) = receivers[i].take() {
+                    tabs.push(existing);
+                } else {
+                    let Some(tab) = TabView::build(
+                        mtm,
+                        handle.proxy.clone(),
+                        handle.window,
+                        origin,
+                        i,
+                        title,
+                        tooltip_at(i),
+                        i == active,
+                        metadata_at(i),
+                        ext_at(i),
+                        frame,
+                        geometry,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(inks) = handle.app_tiles.get() {
+                        tab.set_app_tiles(inks);
+                    }
+                    // SAFETY: main-thread insertion of a fresh, retained chip into the strip.
+                    unsafe { appkit::send_v_id(container, sel!(addSubview:), tab.as_id()) };
+                    tabs.push(tab);
+                    continue;
+                }
             }
-            // SAFETY: `addSubview:` on the live container, main thread.
-            unsafe { appkit::send_v_id(container, sel!(addSubview:), tab.as_id()) };
-            new_tabs.push(tab);
+            // During reconciliation the previous build may have failed to create a chip.
+            let tab = if receivers.is_some() {
+                tabs.last().expect("just appended")
+            } else {
+                &tabs[i]
+            };
+            let index_changed = tab.ivars().index.replace(i) != i;
+            tab.set_tab_origin(origin);
+            // SAFETY: main-thread geometry access on a retained chip.
+            let before = unsafe { appkit::send_rect(tab.as_id(), sel!(frame)) };
+            let moved =
+                before.origin.x != cx || before.size.width != cw || before.size.height != strip_h;
+            if moved {
+                // SAFETY: frame is the chip's new bounds in its existing superview.
+                unsafe { appkit::send_v_rect(tab.as_id(), sel!(setFrame:), frame) };
+            }
+            tab.set_geometry(geometry);
+            tab.set_context(title, tooltip_at(i));
+            tab.set_metadata(metadata_at(i));
+            tab.set_chrome_ext(ext_at(i));
+            tab.set_active(i == active);
+            if moved || index_changed {
+                tab.relayout();
+            }
+            if index_changed && let Some(id) = appkit::nsstring(&format!("aterm.tab.{i}")) {
+                // SAFETY: main-thread metadata setter on the retained chip.
+                unsafe {
+                    appkit::send_v_id(tab.as_id(), sel!(setAccessibilityIdentifier:), id.id())
+                };
+                tab.sync_semantics();
+            }
         }
-        *handle.tabs.borrow_mut() = new_tabs;
-        sync_rename_overlay(handle, ids);
     }
 
     /// Plan chip `(x, width)` cells, traffic-light metrics, and strip height for `n` chips.
@@ -2893,7 +3035,12 @@ mod macos {
         };
 
         let left = STRIP_LEADING_PAD.max(metrics.lights_right + LIGHTS_CLEARANCE);
-        let cluster = TAB_GAP + PLUS_WIDTH + TRAILING_PAD;
+        // SAFETY: isHidden is a read-only getter on the retained toolbar button.
+        let cluster = if unsafe { appkit::send_bool(handle.plus.as_id(), sel!(isHidden)) } {
+            TRAILING_PAD
+        } else {
+            TAB_GAP + PLUS_WIDTH + TRAILING_PAD
+        };
         // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter.
         let total_w = unsafe { appkit::send_rect(container, sel!(frame)) }
             .size
@@ -2938,13 +3085,15 @@ mod macos {
         if n == 0 {
             return;
         }
-        let active = tabs.iter().position(|tab| tab.is_active()).unwrap_or(0);
+        let active = tabs
+            .iter()
+            .position(|tab| tab.is_active())
+            .unwrap_or(crate::tab_bar::NO_SELECTED_TAB);
         let StripPlan {
             cells,
             metrics,
             strip_h,
         } = plan_strip(handle, n, active);
-        let mut moved = false;
         for (i, (tab, &(cx, cw))) in tabs.iter().zip(&cells).enumerate() {
             // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter on a live retained chip.
             let f = unsafe { appkit::send_rect(tab.as_id(), sel!(frame)) };
@@ -2954,17 +3103,11 @@ mod macos {
                 unsafe {
                     appkit::send_v_rect(tab.as_id(), sel!(setFrame:), rect(cx, 0.0, cw, strip_h));
                 }
-                moved = true;
             }
             tab.set_geometry(metrics.geometry(i, n, active, cx));
             if reframe {
                 tab.relayout();
             }
-        }
-        if moved {
-            let ids: Vec<TabId> = tabs.iter().map(|tab| tab.tab_id()).collect();
-            drop(tabs);
-            sync_rename_overlay(handle, &ids);
         }
     }
 
@@ -2975,7 +3118,10 @@ mod macos {
         if tabs.is_empty() {
             return None;
         }
-        let active = tabs.iter().position(|t| t.is_active()).unwrap_or(0);
+        let active = tabs
+            .iter()
+            .position(|t| t.is_active())
+            .unwrap_or(crate::tab_bar::NO_SELECTED_TAB);
         let labels = tabs.iter().map(|tab| tab.label_text()).collect::<Vec<_>>();
         let metadata = tabs.iter().map(|tab| tab.metadata()).collect::<Vec<_>>();
         let tooltips = tabs.iter().map(|tab| tab.tooltip()).collect::<Vec<_>>();
@@ -3148,7 +3294,7 @@ mod macos {
             && !unsafe { appkit::send_id(handle.container.id(), sel!(window)) }.is_null()
     }
 
-    /// Open the inline tab-rename text field over `tab`.
+    /// Make the title label of `tab` editable, preserving its frame and typography.
     pub(crate) fn begin_tab_rename(
         handle: &ToolbarHandle,
         tab: TabId,
@@ -3160,12 +3306,21 @@ mod macos {
             return false;
         };
         end_tab_rename(handle);
-        let frame = {
-            let tabs = handle.tabs.borrow();
-            let Some(chip) = tabs.iter().find(|t| t.tab_id() == tab) else {
-                return false;
-            };
-            chip.editor_frame()
+        let tabs = handle.tabs.borrow();
+        let Some(chip) = tabs.iter().find(|t| t.tab_id() == tab) else {
+            return false;
+        };
+        let Some(field) = chip
+            .ivars()
+            .label
+            .borrow()
+            .as_ref()
+            .map(Obj::clone_retained)
+        else {
+            return false;
+        };
+        let Some(seed_ns) = appkit::nsstring(seed) else {
+            return false;
         };
         let Some(target) = TabRenameTarget::build(
             mtm,
@@ -3176,47 +3331,15 @@ mod macos {
         ) else {
             return false;
         };
-        // SAFETY: `textFieldWithString:` is the documented non-raising factory; the
-        // rest are plain setters on the fresh field, all on the main thread.
-        let Some(field) = (unsafe {
-            let Some(seed_ns) = appkit::nsstring(seed) else {
-                return false;
-            };
-            let Some(field) = Obj::retain(appkit::send_id_id(
-                class(c"NSTextField").as_id(),
-                sel!(textFieldWithString:),
-                seed_ns.id(),
-            )) else {
-                return false;
-            };
-            appkit::send_v_rect(field.id(), sel!(setFrame:), frame);
+        // SAFETY: plain main-thread setters on the chip's retained, borderless label.
+        unsafe {
+            appkit::send_v_id(field.id(), sel!(setStringValue:), seed_ns.id());
             appkit::send_v_bool(field.id(), sel!(setEditable:), true);
             appkit::send_v_bool(field.id(), sel!(setSelectable:), true);
-            appkit::send_v_bool(field.id(), sel!(setBezeled:), true);
-            appkit::send_v_bool(field.id(), sel!(setDrawsBackground:), true);
-            appkit::send_v_bool(field.id(), sel!(setUsesSingleLineMode:), true);
-            appkit::send_v_isize(
-                field.id(),
-                sel!(setAlignment:),
-                consts::NS_TEXT_ALIGNMENT_LEFT,
-            );
-            appkit::send_v_id(field.id(), sel!(setFont:), system_font(12.0, false));
-            if !placeholder.is_empty()
-                && let Some(ns) = appkit::nsstring(placeholder)
-            {
+            if let Some(ns) = appkit::nsstring(placeholder) {
                 appkit::send_v_id(field.id(), sel!(setPlaceholderString:), ns.id());
             }
-            appkit::send_v_id_isize_id(
-                handle.container.id(),
-                sel!(addSubview:positioned:relativeTo:),
-                field.id(),
-                consts::NS_WINDOW_ABOVE,
-                Id::NIL,
-            );
-            Some(field)
-        }) else {
-            return false;
-        };
+        }
         // SAFETY: `-window` is `-(id)`; `-makeFirstResponder:` is `-(BOOL)(NSResponder *)` and an
         // `NSTextField` is an `NSResponder`.
         let focused = unsafe {
@@ -3224,8 +3347,8 @@ mod macos {
             !w.is_null() && appkit::send_bool_id(w, sel!(makeFirstResponder:), field.id())
         };
         if !focused {
-            // SAFETY: main-thread teardown of the field we just added.
-            unsafe { appkit::send_v(field.id(), sel!(removeFromSuperview)) };
+            restore_label(&field);
+            chip.relayout();
             return false;
         }
         // SAFETY: `-selectText:` is `-(void)(id)` on the main thread.
@@ -3255,7 +3378,24 @@ mod macos {
                 );
             }
             appkit::send_v_id(editor.field.id(), sel!(setDelegate:), Id::NIL);
-            appkit::send_v(editor.field.id(), sel!(removeFromSuperview));
+        }
+        restore_label(&editor.field);
+        if let Some(chip) = handle
+            .tabs
+            .borrow()
+            .iter()
+            .find(|chip| chip.tab_id() == editor.tab)
+        {
+            chip.relayout();
+        }
+    }
+
+    fn restore_label(field: &Obj) {
+        // SAFETY: the retained title field is restored on its owning AppKit thread.
+        unsafe {
+            appkit::send_v_id(field.id(), sel!(setPlaceholderString:), Id::NIL);
+            appkit::send_v_bool(field.id(), sel!(setEditable:), false);
+            appkit::send_v_bool(field.id(), sel!(setSelectable:), false);
         }
     }
 
@@ -3294,48 +3434,6 @@ mod macos {
             appkit::send_v_id(text, action, Id::NIL);
         }
         true
-    }
-
-    /// Keep a live rename editor aligned with its tab across a strip refresh.
-    fn sync_rename_overlay(handle: &ToolbarHandle, ids: &[TabId]) {
-        let outcome = {
-            let rename = handle.rename.borrow();
-            let Some(editor) = rename.as_ref() else {
-                return;
-            };
-            let tabs = handle.tabs.borrow();
-            ids.iter()
-                .position(|id| *id == editor.tab)
-                .and_then(|i| tabs.get(i))
-                .map(|chip| chip.editor_frame())
-                .ok_or(editor.target.ivars().session)
-        };
-        let frame = match outcome {
-            Ok(frame) => frame,
-            Err(session) => {
-                let window = handle.window;
-                end_tab_rename(handle);
-                let _ = handle
-                    .proxy
-                    .send_event(Wake::CancelSessionRename { window, session });
-                return;
-            }
-        };
-        let rename = handle.rename.borrow();
-        let Some(editor) = rename.as_ref() else {
-            return;
-        };
-        // SAFETY: main-thread geometry setter and re-insert of a view already in this container.
-        unsafe {
-            appkit::send_v_rect(editor.field.id(), sel!(setFrame:), frame);
-            appkit::send_v_id_isize_id(
-                handle.container.id(),
-                sel!(addSubview:positioned:relativeTo:),
-                editor.field.id(),
-                consts::NS_WINDOW_ABOVE,
-                Id::NIL,
-            );
-        }
     }
 
     /// Runtime tests for this module's four declared classes: each asks the

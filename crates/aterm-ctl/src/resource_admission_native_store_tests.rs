@@ -10,7 +10,7 @@ fn request(stream: &CtlStream) -> wire::Submission {
     let peer = local_peer(stream).unwrap();
     wire::Submission {
         binding: wire::Binding {
-            session: "s-0000000000000000acde".into(),
+            session: "tqn5r6e0148".into(),
             attempt: [8; 16],
         },
         peer_pid: peer.pid,

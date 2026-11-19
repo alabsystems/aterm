@@ -597,11 +597,13 @@ fn a_linux_reader_reads_each_volumes_disks_from_diskstats() {
     let mut reader = LinuxReader::new(root);
     // Home on LVM over dm-crypt, the front tab on the md mirror, a third volume on the first's
     // disk again: two devices, home's first.
-    let readings = reader.read(&[
-        ("/dev/mapper/vg-root", Some((253, 1))),
-        ("/dev/md0", Some((9, 0))),
-        ("/dev/nvme0n1p2", Some((259, 2))),
-    ]);
+    let readings = reader
+        .read(&[
+            ("/dev/mapper/vg-root", Some((253, 1))),
+            ("/dev/md0", Some((9, 0))),
+            ("/dev/nvme0n1p2", Some((259, 2))),
+        ])
+        .devices;
     assert_eq!(readings.len(), 2);
     let (home, mirror) = (&readings[0], &readings[1]);
     assert_eq!(home.id, device_id("wwid:eui.0025385b71b0a1c2"));
@@ -631,11 +633,84 @@ fn a_linux_reader_reads_each_volumes_disks_from_diskstats() {
 
     // A loop device is an image; the reader keeps what it found, so a kept volume reads without
     // a walk: with its sysfs link gone, it reads from the kept disks while diskstats lists them.
-    let image = reader.read(&[("/dev/loop0", Some((7, 0)))]);
+    let image = reader.read(&[("/dev/loop0", Some((7, 0)))]).devices;
     assert_eq!(image.len(), 1);
     assert_eq!(image[0].location, BlockLocation::Image);
     std::fs::remove_file(root.join("sys/dev/block/9:0")).expect("unlink");
-    assert_eq!(reader.read(&[("/dev/md0", Some((9, 0)))]).len(), 1);
+    assert_eq!(reader.read(&[("/dev/md0", Some((9, 0)))]).devices.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_block_batch_keeps_original_mount_bindings_before_refusal_deduplication_and_caps() {
+    let dir = aterm_tempfile::tempdir().expect("scratch root");
+    let root = dir.path();
+    sysfs(root);
+    let mut reader = LinuxReader::new(root);
+    let mirror = ("/dev/md0", Some((9, 0)));
+    let nvme = ("/dev/nvme0n1p2", Some((259, 2)));
+    let same_nvme = ("/dev/mapper/vg-root", Some((253, 1)));
+    let unresolved = ("tmpfs", Some((0, 45)));
+    let mirror_id = device_id("name:sda+name:sdb");
+    let nvme_id = device_id("wwid:eui.0025385b71b0a1c2");
+
+    let shared = reader.read(&[mirror, nvme, same_nvme, mirror, unresolved]);
+    assert_eq!(shared.devices.len(), 2);
+    assert_eq!(
+        shared.mounts,
+        [
+            Some(mirror_id.clone()),
+            Some(nvme_id.clone()),
+            Some(nvme_id.clone()),
+            Some(mirror_id.clone()),
+            None,
+        ]
+    );
+    assert_eq!(
+        shared
+            .devices
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect::<Vec<_>>(),
+        [mirror_id.as_str(), nvme_id.as_str()]
+    );
+
+    let capped = reader.read(&[mirror, nvme, ("/dev/loop0", Some((7, 0)))]);
+    assert_eq!(capped.devices.len(), MAX_BLOCK_DEVICES);
+    assert_eq!(capped.mounts.len(), 3);
+    assert!(
+        capped.mounts[2].is_some(),
+        "output capping cannot erase a resolved request slot"
+    );
+
+    let without_sdb: String = SYSFS_DISKSTATS
+        .lines()
+        .filter(|line| !line.contains(" sdb "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(root.join("proc/diskstats"), without_sdb).unwrap();
+    let refused = reader.read(&[mirror, nvme]);
+    assert_eq!(refused.mounts, [Some(mirror_id), Some(nvme_id.clone())]);
+    assert_eq!(refused.devices.len(), 1);
+    assert_eq!(
+        refused.devices[0].id, nvme_id,
+        "the first surviving counter reading does not replace the original request zero"
+    );
+
+    let missing_home = reader.read(&[unresolved, nvme]);
+    assert_eq!(missing_home.mounts, [None, Some(nvme_id.clone())]);
+    assert_eq!(missing_home.devices[0].id, nvme_id);
+    std::fs::remove_file(root.join("proc/diskstats")).unwrap();
+    let no_counters = reader.read(&[nvme]);
+    assert_eq!(no_counters.mounts, [Some(nvme_id)]);
+    assert!(no_counters.devices.is_empty());
+    let unknown = reader.read(&[unresolved]);
+    assert_eq!(
+        unknown.mounts,
+        [None],
+        "an old resolution cannot fill an unrelated request"
+    );
+    assert!(unknown.devices.is_empty());
 }
 
 #[cfg(unix)]
@@ -649,7 +724,7 @@ fn a_disk_that_took_a_kept_disks_name_is_walked_not_read_as_the_kept_one() {
         ("/dev/md0", Some((9, 0))),
         ("/dev/nvme0n1p2", Some((259, 2))),
     );
-    let first = reader.read(&[mirror, nvme]);
+    let first = reader.read(&[mirror, nvme]).devices;
     assert_eq!(first.len(), 2);
     assert_eq!(first[0].name, "WDC WD40EFRX + ST4000VN008");
     let kept_nvme = device_id("wwid:eui.0025385b71b0a1c2");
@@ -665,6 +740,7 @@ fn a_disk_that_took_a_kept_disks_name_is_walked_not_read_as_the_kept_one() {
     std::fs::write(&diskstats, without_sdb).expect("write");
     let ids: Vec<String> = reader
         .read(&[mirror, nvme])
+        .devices
         .into_iter()
         .map(|r| r.id)
         .collect();
@@ -673,7 +749,7 @@ fn a_disk_that_took_a_kept_disks_name_is_walked_not_read_as_the_kept_one() {
     // the mirror is walked again and reads as the new disk, not the kept one.
     std::fs::write(root.join(format!("{SATA}/sdb/device/model")), "NEW DISK\n").expect("write");
     std::fs::write(&diskstats, SYSFS_DISKSTATS).expect("write");
-    let again = reader.read(&[mirror]);
+    let again = reader.read(&[mirror]).devices;
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].name, "WDC WD40EFRX + NEW DISK");
 
@@ -682,14 +758,14 @@ fn a_disk_that_took_a_kept_disks_name_is_walked_not_read_as_the_kept_one() {
     // it is walked again and named by the new disk's wwid.
     std::fs::write(root.join(format!("{NVME}/diskseq")), "2\n").expect("write");
     std::fs::write(root.join(format!("{NVME}/wwid")), "eui.00000000000000ff\n").expect("write");
-    let swapped = reader.read(&[nvme]);
+    let swapped = reader.read(&[nvme]).devices;
     assert_eq!(swapped.len(), 1);
     assert_eq!(swapped[0].id, device_id("wwid:eui.00000000000000ff"));
     // Negative control: a kept disk whose witness held is read without a walk (its sysfs link
     // gone, it still reads under the identity it was walked with).
     std::fs::remove_file(root.join("sys/dev/block/259:2")).expect("unlink");
     std::fs::write(root.join(format!("{NVME}/device/model")), "OTHER MODEL\n").expect("write");
-    let held = reader.read(&[nvme]);
+    let held = reader.read(&[nvme]).devices;
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].id, swapped[0].id);
     assert_eq!(held[0].name, swapped[0].name);
@@ -702,7 +778,9 @@ fn the_live_reader_reads_the_device_under_users() {
     let users = crate::volumes::mount_of(std::path::Path::new("/Users"), &table)
         .expect("/Users is mounted");
     let mut reader = BlockReader::new();
-    let first = reader.read(&[users, users]);
+    let batch = reader.read(&[users, users]);
+    let first = batch.devices;
+    assert_eq!(batch.mounts, vec![Some(first[0].id.clone()); 2]);
     assert_eq!(
         first.len(),
         1,
@@ -716,7 +794,7 @@ fn the_live_reader_reads_the_device_under_users() {
         "{device:?}"
     );
     // The kept drivers read again: the counters only grow.
-    let again = reader.read(&[users]);
+    let again = reader.read(&[users]).devices;
     assert_eq!(again.len(), 1);
     let (a, b) = (device.counters, again[0].counters);
     assert_eq!(again[0].id, device.id);
@@ -734,7 +812,9 @@ fn the_live_reader_reads_the_device_under_users() {
     let system =
         crate::volumes::mount_of(std::path::Path::new("/usr/bin"), &table).expect("/ is mounted");
     assert_ne!(system.on, users.on);
-    let both = reader.read(&[users, system]);
+    let batch = reader.read(&[users, system]);
+    assert_eq!(batch.mounts, vec![Some(device.id.clone()); 2]);
+    let both = batch.devices;
     assert_eq!(both.len(), 1, "{both:?}");
     assert_eq!(both[0].id, device.id);
     // Negative control: a mount with no BSD device (devfs) reads nothing.
@@ -743,7 +823,9 @@ fn the_live_reader_reads_the_device_under_users() {
         .iter()
         .find(|m| m.fstype == "devfs")
         .expect("devfs is mounted");
-    assert!(reader.read(&[dev]).is_empty());
+    let missing = reader.read(&[dev]);
+    assert!(missing.devices.is_empty());
+    assert_eq!(missing.mounts, [None]);
 }
 
 /// The shipped Linux arm on this host: `stat` of the mount point, its major and minor, sysfs and
@@ -759,13 +841,13 @@ fn the_live_linux_reader_reads_the_device_under_root() {
     // overlay root (a container's) is none.
     let on_a_disk = libc::major(dev) != 0 || root.from.starts_with("/dev/");
     let mut reader = BlockReader::new();
-    let first = reader.read(&[root, root]);
+    let first = reader.read(&[root, root]).devices;
     assert_eq!(first.len(), usize::from(on_a_disk), "{root:?}: {first:?}");
     if let Some(device) = first.first() {
         assert_eq!(device.id.len(), 16);
         assert!(device.id.bytes().all(|b| b.is_ascii_hexdigit()));
         // The kept disks read again: the counters only grow.
-        let again = reader.read(&[root]);
+        let again = reader.read(&[root]).devices;
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].id, device.id);
         let (a, b) = (device.counters, again[0].counters);
@@ -784,6 +866,6 @@ fn the_live_linux_reader_reads_the_device_under_root() {
         .filter(|m| m.fstype == "tmpfs" || m.fstype == "overlay")
         .take(4)
     {
-        assert!(reader.read(&[m]).is_empty(), "{m:?}");
+        assert!(reader.read(&[m]).devices.is_empty(), "{m:?}");
     }
 }

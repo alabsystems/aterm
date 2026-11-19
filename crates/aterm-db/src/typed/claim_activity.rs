@@ -4,7 +4,7 @@
 //! Activity periods are separate from lifecycle reassertions and storage carries.
 
 use super::{Collection, cell, owned::Op};
-use astream_wire::sync::{Digest, Index};
+use astream_wire::sync::{Digest, Index, Projection};
 use aterm_json::Value;
 #[cfg(any(unix, test))]
 use aterm_json::json;
@@ -146,8 +146,13 @@ fn readable_live(
 }
 
 impl Activity {
-    pub(super) fn read(collection: &Collection, operations: &[&Op], index: &Index) -> Self {
-        Self::read_inner::<true>(collection, operations, index)
+    pub(super) fn read(
+        collection: &Collection,
+        operations: &[&Op],
+        index: &Index,
+        projection: &Projection,
+    ) -> Self {
+        Self::read_inner::<true>(collection, operations, index, projection)
     }
 
     #[cfg(test)]
@@ -156,13 +161,14 @@ impl Activity {
         operations: &[&Op],
         index: &Index,
     ) -> Self {
-        Self::read_inner::<false>(collection, operations, index)
+        Self::read_inner::<false>(collection, operations, index, &index.project())
     }
 
-    fn read_inner<const COLLAPSE_INITIAL: bool>(
+    fn read_inner<const OPTIMIZED: bool>(
         collection: &Collection,
         operations: &[&Op],
         index: &Index,
+        projection: &Projection,
     ) -> Self {
         let mut out = Self {
             default: State::default(),
@@ -200,13 +206,23 @@ impl Activity {
                     .insert(operation.id, (value, operation.revert.is_some()));
             }
         }
-        let ordered = index.project().ordered;
+        // The projection's sparse vectors answer reachability across every row and merge.
+        // With a checkpoint floor they can also attest ancestry below retained history;
+        // lifecycle frames only follow retained parent links.
+        let use_vectors = OPTIMIZED && index.floor().is_empty();
+        let observes = |later: &Digest, earlier: &Digest| {
+            if use_vectors {
+                projection.observes(index, later, earlier)
+            } else {
+                index.observes(later, earlier)
+            }
+        };
         for (pk, writes) in rows {
             // Equal native assertions cannot conflict on any causal frontier, and no
             // inactive period exists between them. Keep their source identities for
             // lifecycle carries without retaining one frame per unrelated operation.
             let first = &writes.first_key_value().unwrap().1.0;
-            if COLLAPSE_INITIAL
+            if OPTIMIZED
                 && cell::carried_refs(first).is_none()
                 && writes
                     .values()
@@ -234,7 +250,7 @@ impl Activity {
             });
             let mut frames = BTreeMap::<Digest, Arc<Frame>>::new();
             let mut current = BTreeSet::new();
-            for id in &ordered {
+            for id in &projection.ordered {
                 let Some(header) = index.get(id) else {
                     continue;
                 };
@@ -257,9 +273,9 @@ impl Activity {
                         let frontier = union
                             .iter()
                             .filter(|candidate| {
-                                !union.iter().any(|other| {
-                                    other != *candidate && index.observes(other, candidate)
-                                })
+                                !union
+                                    .iter()
+                                    .any(|other| other != *candidate && observes(other, candidate))
                             })
                             .copied()
                             .collect();
@@ -326,7 +342,7 @@ impl Activity {
                         state: State { live, epochs },
                     }),
                 );
-                current.retain(|old| !index.observes(id, old));
+                current.retain(|old| !observes(id, old));
                 current.insert(*id);
             }
             let state =

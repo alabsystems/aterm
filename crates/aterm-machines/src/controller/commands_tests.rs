@@ -2579,10 +2579,11 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
         independent.calls()
     );
 
-    // Spotlight's scope is root work of this transaction: the console account's home folders
-    // join the excluded list. A list that did not take them fails only its own row, however
-    // the editor exited: the transaction still ends finished, with the refusal recorded so
-    // the step is not owed again and no receipt claiming the folders.
+    // Spotlight's scope is root work of this transaction: every folder beside Applications,
+    // Documents, Desktop and the synced drives joins the excluded list. A list that did not
+    // take them fails only its own row, however the editor exited: the transaction still ends
+    // finished, with the refusal recorded so the step is not owed again and no receipt
+    // claiming the folders.
     let scoped = |config| {
         let sys = Fake::root();
         sys.born(std::process::id(), 123).running(&[]);
@@ -2616,7 +2617,10 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
         |sys: &Fake| crate::init_spotlight::tests::config_list(sys).map(|list| list.len());
     let (sys, report) = scoped(crate::init_spotlight::tests::Config::Writes);
     assert!(matches!(report, Ok(None)), "{:?}", sys.calls());
-    assert_eq!(excluded(&sys), Some(3));
+    assert_eq!(
+        excluded(&sys),
+        Some(crate::init_spotlight::tests::full().len())
+    );
     assert!(
         sys.calls()
             .iter()
@@ -2841,12 +2845,15 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
     // its files. Completed tools cannot turn a transient bootstrap failure
     // into a successful root transaction with no helper to reach the LAN.
     let source = Path::new("/Applications/aterm.app");
-    let image = aterm_uds::lan::install::test_image(0x0100_000c, &[b"this build"]);
+    // A release of the broker's team, whose Info.plist states its build.
+    let info = aterm_uds::lan::install::test_info(1_790_120_495);
+    let image = aterm_uds::lan::install::test_release("ABCDE12345", 0, &info);
     let broker_case = || {
         let mut sys = mac();
         with_tools(&sys);
         sys.running_app = Some(source.to_path_buf());
-        sys.file("/Applications/aterm.app/Contents/MacOS/aterm", &image);
+        sys.file("/Applications/aterm.app/Contents/MacOS/aterm", &image)
+            .file("/Applications/aterm.app/Contents/Info.plist", &info);
         sys.stat_of(
             source.to_str().unwrap(),
             crate::port::Stat {
@@ -3158,7 +3165,7 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
     }
 
     let moved_source = broker_case();
-    let successor = aterm_uds::lan::install::test_image(0x0100_000c, &[b"valid successor"]);
+    let successor = aterm_uds::lan::install::test_release("ABCDE12345", 9, &info);
     let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     moved_source.app_check({
         let checks = std::sync::Arc::clone(&checks);
@@ -3351,6 +3358,7 @@ fn here_apply_plain_names_the_mac_and_exits_on_the_tools_alone() {
         let given = Plain {
             name,
             leave_developer_mode: false,
+            restore_name_rule: false,
         };
         here_report(
             sys,
@@ -3483,6 +3491,7 @@ fn here_apply_plain_names_the_mac_and_exits_on_the_tools_alone() {
         let given = Plain {
             name: None,
             leave_developer_mode,
+            restore_name_rule: false,
         };
         assert!(matches!(
             here_report(
@@ -3812,4 +3821,237 @@ fn a_walk_loads_and_seals_through_the_env_s_agent_socket() {
         "{:?}",
         sys.calls()
     );
+}
+
+/// `here apply --plain --only <step>` (the System Resources page's macOS configuration section):
+/// one compiled step runs alone as root, reading the console account and nothing the account
+/// can write, and its exit says whether that step's own rows finished. NEGATIVE CONTROLS: a
+/// refused `pmset` write fails the run, and the CLI refuses `--only` without `--plain`, beside a
+/// name, with an unknown step, and for a non-root caller.
+#[test]
+fn here_apply_only_runs_one_compiled_step() {
+    use crate::init_clt::Unfinished;
+    use aterm_types::macos_setup::root_only::Step;
+    use std::sync::{Arc, Mutex};
+    let class = |why: Unfinished| Some(ExitCode::from(why.code().unwrap()));
+    let console = || {
+        let sys = Fake::root();
+        sys.stat_of(
+            "/dev/console",
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.on("/usr/bin/dscl . -list /Users UniqueID", Ran::ok("alice 501\n"))
+            .on("/usr/bin/dscl . -read /Groups/admin GroupMembership", Ran::ok("GroupMembership: alice\n"))
+            .on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+                Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+        sys
+    };
+    // A desktop at the starter baseline but for system sleep, which `pmset -c sleep 0` sets.
+    let power_mac = |write_ok: bool| {
+        let sys = console();
+        let sleep = Arc::new(Mutex::new(10u64));
+        sys.simulate(move |_, command| {
+            if command.program != Path::new(crate::items::power::PMSET) {
+                return None;
+            }
+            let args: Vec<String> = command
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            match args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["-g", "custom"] => Some(Ran::ok(&format!(
+                    "AC Power:\n sleep                {}\n disksleep            0\n \
+                     displaysleep         15\n powernap             0\n womp                 1\n \
+                     autorestart          1\n",
+                    sleep.lock().unwrap()
+                ))),
+                ["-g", "cap"] => Some(Ran::ok("Capabilities for AC Power:\n autorestart\n")),
+                ["-c", "sleep", value] if write_ok => {
+                    *sleep.lock().unwrap() = value.parse().unwrap();
+                    Some(Ran::ok(""))
+                }
+                ["-c", ..] => Some(Ran::exit(1, "refused")),
+                _ => None,
+            }
+        });
+        sys
+    };
+    let only = |sys: &Fake, step| {
+        here_report(
+            sys,
+            Mode::Apply,
+            HereBaseline::Only(step, None),
+            Plain::default(),
+            HereOutput::Plain,
+        )
+    };
+
+    let power = power_mac(true);
+    assert!(matches!(only(&power, Step::Power), Ok(None)));
+    let calls = power.calls();
+    assert!(
+        calls.contains(&"/usr/bin/pmset -c sleep 0".to_owned()),
+        "{calls:?}"
+    );
+    // No name rule, no tools, no LAN broker, no Spotlight scope, no other domain.
+    assert!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with('/'))
+            .all(|call| call.starts_with("/usr/bin/dscl ") || call.starts_with("/usr/bin/pmset ")),
+        "{calls:?}"
+    );
+    assert!(
+        power
+            .written(crate::root_steps::ADMITTED_NAME_RULE)
+            .is_none()
+    );
+
+    let refused = power_mac(false);
+    assert!(only(&refused, Step::Power).err() == class(Unfinished::Other));
+
+    // The Spotlight scope alone: with indexing off on the data volume it has nothing to do.
+    let scope = console();
+    scope.on(
+        "/usr/bin/mdutil -s /System/Volumes/Data",
+        Ran::ok("/System/Volumes/Data:\n\tIndexing disabled.\n"),
+    );
+    assert!(matches!(only(&scope, Step::SpotlightScope), Ok(None)));
+    assert!(
+        scope
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with('/'))
+            .all(|call| call.starts_with("/usr/bin/dscl ") || call.starts_with("/usr/bin/mdutil ")),
+        "{:?}",
+        scope.calls()
+    );
+
+    // Not root: refused before anything runs.
+    let mut user = Fake::root();
+    user.euid = 501;
+    assert!(only(&user, Step::Power).err() == class(Unfinished::Other));
+    assert!(user.calls().is_empty(), "{:?}", user.calls());
+
+    // The CLI takes `--only` with `--plain` alone.
+    let cli = |args: &[&str]| {
+        crate::cli::here(
+            &Fake::root(),
+            &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+        )
+    };
+    for refused in [
+        &["apply", "--only", "power"][..],
+        &["apply", "--plain", "--only", "bogus"],
+        &["apply", "--plain", "--only"],
+        &["apply", "--plain", "--only", "power", "--name", "m42"],
+        &["apply", "--plain", "--only", "power", "--name-rule-only"],
+        &["apply", "--plain", "--only", "power", "--only", "updates"],
+    ] {
+        assert_eq!(cli(refused), ExitCode::from(2), "{refused:?}");
+    }
+}
+
+/// The root half leaves a naming rule the person removed with its own revert as it stands unless
+/// its caller says to put it back (`--restore-name-rule`); a rule back in place beside the marker
+/// (an older build put it back) is refreshed as any rule is, and every apply that puts the rule
+/// in place removes the marker. NEGATIVE CONTROLS (run): dropping the rule whatever the marker
+/// says leaves a rule back in place unrefreshed; an apply that keeps the marker fails the
+/// restore.
+#[test]
+fn the_root_half_puts_back_a_removed_rule_only_when_asked() {
+    use crate::root_steps::{ADMITTED_NAME_RULE, REMOVED_RULE};
+    let mac = || {
+        let sys = Fake::root();
+        sys.stat_of(
+            "/dev/console",
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.on("/usr/bin/dscl . -list /Users UniqueID", Ran::ok("alice 501\n"))
+            .on(
+                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+                Ran::ok("GroupMembership: alice\n"),
+            )
+            .on(
+                "/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+                Ran::ok(
+                    "UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n",
+                ),
+            )
+            .on(
+                "/usr/bin/mdutil -s /System/Volumes/Data",
+                Ran::ok("/System/Volumes/Data:\n\tIndexing disabled.\n"),
+            );
+        sys.simulate(|_, command| {
+            (command.program == Path::new("/bin/chmod")
+                || command.program == Path::new(crate::root_steps::VISUDO))
+            .then(|| Ran::ok(""))
+        });
+        sys.file(REMOVED_RULE, b"the rule\n");
+        sys
+    };
+    let root = |sys: &Fake, restore_name_rule: bool| {
+        here_report(
+            sys,
+            Mode::Apply,
+            HereBaseline::BuiltIn(crate::init_clt::RootPlan::StepsOnly),
+            Plain {
+                restore_name_rule,
+                ..Plain::default()
+            },
+            HereOutput::Plain,
+        )
+    };
+    let refreshes = |sys: &Fake| {
+        sys.calls()
+            .iter()
+            .filter(|call| call.starts_with("/bin/chmod +a "))
+            .count()
+    };
+
+    let kept = mac();
+    assert!(matches!(root(&kept, false), Ok(None)), "{:?}", kept.calls());
+    assert!(kept.written(ADMITTED_NAME_RULE).is_none());
+    assert!(kept.stat(Path::new(REMOVED_RULE)).is_ok());
+    assert_eq!(refreshes(&kept), 0);
+
+    let restored = mac();
+    assert!(
+        matches!(root(&restored, true), Ok(None)),
+        "{:?}",
+        restored.calls()
+    );
+    assert!(restored.written(ADMITTED_NAME_RULE).is_some());
+    assert!(restored.stat(Path::new(REMOVED_RULE)).is_err());
+
+    // A rule back in place beside the marker: refreshed, and the marker goes.
+    restored.file(REMOVED_RULE, b"the rule\n");
+    let before = refreshes(&restored);
+    assert!(
+        matches!(root(&restored, false), Ok(None)),
+        "{:?}",
+        restored.calls()
+    );
+    assert_eq!(refreshes(&restored), before + 1);
+    assert!(restored.stat(Path::new(REMOVED_RULE)).is_err());
 }

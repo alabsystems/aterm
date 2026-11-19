@@ -210,7 +210,7 @@ fn literal_unix_source_names_keep_colons_and_backslashes() {
             "pub fn twice(a: u16) -> u16 {"
         );
         let json_name = aterm_json::to_string(name).unwrap();
-        let report = probe_report().replace(r#""src/lib.rs""#, &json_name);
+        let report = report(&probe_functions().map(|f| f.replace(r#""src/lib.rs""#, &json_name)));
         let record = reduce_text(&report, repo.path()).unwrap();
         assert!(record.rows.iter().filter(|r| r.file == name).count() == 2);
         assert_eq!(Record::parse(&record.to_text()).unwrap(), record);
@@ -343,20 +343,29 @@ fn report(functions: &[String]) -> String {
         functions.len()
     );
     out.push('\n');
+    let mut digest = Sha256::new();
+    digest.update(b"trust.report.ndjson.function-records.v2");
+    digest.update((functions.len() as u64).to_be_bytes());
     for f in functions {
+        digest.update((f.len() as u64).to_be_bytes());
+        digest.update(f.as_bytes());
         out.push_str(f);
         out.push('\n');
     }
     out.push_str(&format!(
-        r#"{{"record_type":"footer","schema":"{REPORT_SCHEMA}","summary":{{"total_obligations":{total},"total_proved":{proved},"verdict":"x"}},"functions_emitted":{}}}"#,
-        functions.len()
+        r#"{{"record_type":"footer","schema":"{REPORT_SCHEMA}","summary":{{"total_obligations":{total},"total_proved":{proved},"verdict":"x"}},"functions_emitted":{},"function_records_sha256":"sha256:{}"}}"#,
+        functions.len(), hex(&digest.finalize())
     ));
     out.push('\n');
     out
 }
 
 fn probe_report() -> String {
-    report(&[
+    report(&probe_functions())
+}
+
+fn probe_functions() -> [String; 2] {
+    [
         function_line(
             "d27probe::twice",
             &[
@@ -395,7 +404,7 @@ fn probe_report() -> String {
                 "unbounded allocation in `vec::from_elem` (count `_7`)",
             )],
         ),
-    ])
+    ]
 }
 
 fn reduce_text(text: &str, repo: &Path) -> std::result::Result<Record, String> {
@@ -448,20 +457,22 @@ fn large_ignored_evidence_reduces_and_its_tail_is_still_validated() {
             )
         })
         .collect();
-    let good = report(&[function_line("d27probe::twice", &obligations)]).replacen(
-        r#""outcome":{"status":"failed"}"#,
-        r#""outcome":{"status":"failed","nested":{"messages":[{"note":"[stop:unclassified]"},{"reason":"[stop:rss-backstop]"},{"why":"[stop:wall-backstop]"}]}}"#,
+    let good_row = function_line("d27probe::twice", &obligations).replacen(
+        r#""outcome":{"status":"unknown"}"#,
+        r#""outcome":{"status":"unknown","nested":{"messages":[{"note":"[stop:unclassified]"},{"reason":"[stop:rss-backstop]"},{"why":"[stop:wall-backstop]"}]}}"#,
         1,
     );
     let evidence = format!(
         r#""proof_evidence":{{"ignored":"{}"}},"time_ms""#,
         "x".repeat(20 * 1024 * 1024)
     );
-    let text = good.replacen(
+    let row = good_row.replacen(
         r#""proof_evidence":{"artifacts":[{"deep":[[[1]]]}]},"time_ms""#,
         &evidence,
         1,
     );
+    let good = report(&[good_row]);
+    let text = report(&[row]);
     assert!(text.lines().any(|line| line.len() > 16 * 1024 * 1024));
     let expected = reduce_text(&good, d.path()).unwrap();
     let actual = reduce_text(&text, d.path()).unwrap();
@@ -475,8 +486,8 @@ fn large_ignored_evidence_reduces_and_its_tail_is_still_validated() {
             .collect::<Vec<_>>(),
         statuses,
     );
-    assert_eq!(actual.rows[1].stop, "rss-backstop");
-    assert!(actual.rows[1].backstopped());
+    assert_eq!(actual.rows[2].stop, "rss-backstop");
+    assert!(actual.rows[2].backstopped());
     let malformed = text.replacen("xxx\"},\"time_ms\"", "xx\\uD800\"},\"time_ms\"", 1);
     let why = reduce_text(&malformed, d.path()).unwrap_err();
     assert!(why.contains("unpaired high surrogate"), "{why}");
@@ -778,12 +789,13 @@ fn a_report_reduces_to_its_record() {
     );
     assert_eq!(lines.last().copied(), Some("end\t3"));
     assert_eq!(Record::parse(&text), Ok(rec.clone()));
-    let none = probe_report().replacen(
+    let mut functions = probe_functions();
+    functions[0] = functions[0].replacen(
         r#""location":{"file":"src/lib.rs","line_start":3,"col_start":4,"line_end":3,"col_end":9},"#,
         "",
         1,
     );
-    let rec = reduce_text(&none, d.path()).unwrap();
+    let rec = reduce_text(&report(&functions), d.path()).unwrap();
     let o = &rec.rows[1];
     assert_eq!((o.file.as_str(), o.anchor.as_str()), ("@none", "-"));
     assert_eq!(o.span.to_string(), "0:0-0:0");
@@ -792,7 +804,7 @@ fn a_report_reduces_to_its_record() {
 #[test]
 fn a_rows_stop_is_the_reports_own_word() {
     let d = checkout();
-    let five: Vec<Obl<'_>> = (0..5)
+    let obligations: Vec<Obl<'_>> = (0..6)
         .map(|_| {
             (
                 "arithmetic_overflow_add",
@@ -807,7 +819,7 @@ fn a_rows_stop_is_the_reports_own_word() {
         })
         .collect();
     let plain = r#""outcome":{"status":"unknown"}"#;
-    let text = report(&[function_line("d27probe::twice", &five)])
+    let row = function_line("d27probe::twice", &obligations)
         .replacen(
             plain,
             r#""outcome":{"status":"runtime_checked","note":"solver timed out [stop:wall-backstop]"}"#,
@@ -823,8 +835,13 @@ fn a_rows_stop_is_the_reports_own_word() {
             plain,
             r#""outcome":{"status":"unknown","note":"[stop:unclassified]"}"#,
             1,
+        )
+        .replacen(
+            plain,
+            r#""outcome":{"status":"failed","counterexample":{"variables":[{"name":"x","value":"[stop:rss-backstop]","value_type":"term","display":"x"}]}}"#,
+            1,
         );
-    let rec = reduce_text(&text, d.path()).unwrap();
+    let rec = reduce_text(&report(&[row]), d.path()).unwrap();
     let stops: Vec<(&str, bool)> = rec
         .rows
         .iter()
@@ -838,15 +855,22 @@ fn a_rows_stop_is_the_reports_own_word() {
             ("rss-backstop", true),
             ("unclassified", false),
             ("-", false),
+            ("-", false),
         ]
     );
-    assert_eq!(Record::parse(&rec.to_text()), Ok(rec.clone()));
+    let text = rec.to_text();
+    assert_eq!(Record::parse(&text), Ok(rec.clone()));
+    let legacy = text.replace("\tfailed\t-\t", "\tfailed\trss-backstop\t");
+    let old = Record::parse(&legacy).unwrap();
+    assert_eq!(old.rows[4].stop, "rss-backstop");
+    assert!(!old.rows[4].backstopped());
     let key = rec.rows[0].key();
     assert_eq!(key.len(), 16);
     let mut moved = rec.rows[0].clone();
     moved.span.l0 += 40;
     moved.span.l1 += 40;
     moved.status = "proved".into();
+    assert!(!moved.backstopped());
     assert_eq!(
         moved.key(),
         key,
@@ -876,8 +900,8 @@ fn a_rows_stop_is_the_reports_own_word() {
             "its first line",
         ),
         (
-            rec.to_text().replace("total\t5", "total\t6"),
-            "it says 6 obligations",
+            text.replace(&format!("total\t{}", rec.total()), "total\t99"),
+            "it says 99 obligations",
         ),
     ] {
         let why = Record::parse(&bad).expect_err(said);
@@ -893,6 +917,26 @@ fn every_report_it_cannot_vouch_for_is_refused_with_its_reason() {
     let join = |v: &[&str]| v.join("\n") + "\n";
     let cases: Vec<(String, &str)> = vec![
         (String::new(), "the report is empty"),
+        (
+            good.replace("arithmetic overflow (Add)", "arithmetic overflow (Sub)"),
+            "function_records_sha256",
+        ),
+        (
+            join(&[lines[0], lines[2], lines[1], lines[3]]),
+            "function_records_sha256",
+        ),
+        (
+            good.replace("function_records_sha256", "ignored_digest"),
+            "function_records_sha256",
+        ),
+        (
+            good.replace("expected_functions", "ignored_count"),
+            "expected_functions",
+        ),
+        (
+            good.replace(r#""expected_functions":2"#, r#""expected_functions":3"#),
+            "header expects 3",
+        ),
         (join(&lines[..3]), "no footer: it was cut short"),
         (
             join(&[lines[0], "not json", lines[3]]),
@@ -916,6 +960,10 @@ fn every_report_it_cannot_vouch_for_is_refused_with_its_reason() {
                 lines[3],
             ]),
             "a `transport` record",
+        ),
+        (
+            good.replace("package=\\\"d27probe", "subpackage=\\\"d27probe"),
+            "unit is no cargo-target",
         ),
         (
             good.replace("::d27probe::twice", "d27probe::twice"),

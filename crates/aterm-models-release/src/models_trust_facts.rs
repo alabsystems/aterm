@@ -147,6 +147,9 @@ pub fn trust_facts_reuse_model() -> Model {
                 used_proved = 0;
             }
             action Remeasure when (filed == 1 && f_src == src && f_prv == prv) {
+                f_floor = floor;
+                f_other = other;
+                f_why = why;
                 f_proved = src;
                 f_lapsed = 0;
                 m_src = src;

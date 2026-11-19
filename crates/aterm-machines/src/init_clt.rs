@@ -270,6 +270,15 @@ pub const TAB_PROMPT: &str = aterm_types::macos_setup::MAC_SETUP_PASSWORD_PROMPT
 /// It only narrows what the root half does.
 pub const LEAVE_DEVELOPER_MODE: &str = "--leave-developer-mode";
 
+/// The root half's flag (`machines here apply --plain`) that puts back a naming rule the person
+/// removed with its own journaled revert ([`crate::root_steps::rule_removed`]): a person's own
+/// typed run that applies or plans says it ([`CommandLineTools::restores_removed`]), and without
+/// it the root half leaves the removal as it stands. The naming-permission repair
+/// (`--name-rule-only`) reinstalls the rule whatever it reads, so it carries no flag. A caller
+/// that does not know the flag (a tab of an earlier build, a hand-typed remedy) leaves the
+/// person's removal in place.
+pub const RESTORE_NAME_RULE: &str = "--restore-name-rule";
+
 /// The tab's last line once the tools read in place and no root step beside them reads owed, each
 /// read back after the root half ran; the window then closes the tab unless it is its window's
 /// last (`aterm-gui`'s `App::developer_tools_install_ended`).
@@ -509,15 +518,27 @@ impl CommandLineTools {
     /// a run aterm decided) where the account's record says setup's elevation finished once
     /// ([`aterm_types::clt_mark::Record::finished`]: developer mode reading off since was turned
     /// off by someone after setup turned it on), or where the tab's window read it off as the
-    /// person's choice ([`Self::leaving_developer_mode`]). A person's own typed `aterm init` sets
-    /// it up whatever it reads: their run is their yes.
+    /// person's choice ([`Self::leaving_developer_mode`]), or where the account's own record of
+    /// developer mode says its off reading is the person's choice
+    /// ([`aterm_types::macos_setup::debugger_record::off_is_chosen`], as the window judges it), so
+    /// a run aterm decided before the account's first finish leaves it too. A person's own typed
+    /// `aterm init` sets it up whatever it reads: their run is their yes.
     fn leaves_developer_mode(&self, sys: &dyn System) -> bool {
         !self.typed()
             && (self.developer_mode_theirs
-                || self
-                    .unbidden
-                    .as_ref()
-                    .is_some_and(|unbidden| unbidden.finished(sys)))
+                || self.unbidden.as_ref().is_some_and(|unbidden| {
+                    unbidden.finished(sys) || unbidden.developer_mode_off_chosen(sys)
+                }))
+    }
+
+    /// Whether this run puts back a naming rule the person removed
+    /// ([`crate::root_steps::rule_removed`], [`RESTORE_NAME_RULE`]): a person's own typed
+    /// `aterm init` that applies or plans ([`Self::scoping_new_folders`]). No run nobody typed
+    /// does (an automatic run, a package follow-up, the Mac Setup tab, whether its window opened
+    /// it or a person pressed Finish setup), nor a `--check` or a doctor's reading: the removal
+    /// is the person's, as developer mode off after setup is ([`Self::leaves_developer_mode`]).
+    fn restores_removed(&self) -> bool {
+        self.typed() && self.is_explicit() && self.new_folders
     }
 
     /// Whether somebody typed this run: neither the Mac Setup tab's program, nor a reading made
@@ -555,11 +576,18 @@ impl CommandLineTools {
     }
 
     /// [`Self::command_for`] `plan`, telling the root half to leave developer mode where this
-    /// run does ([`Self::leaves_developer_mode`]).
+    /// run does ([`Self::leaves_developer_mode`]) and to put back a naming rule the person removed
+    /// where this run does ([`Self::restores_removed`]; the naming-permission repair always
+    /// does).
     fn root_command(&self, sys: &dyn System, plan: RootPlan) -> Cmd {
         let command = self.command_for(plan);
-        if self.leaves_developer_mode(sys) {
+        let command = if self.leaves_developer_mode(sys) {
             command.arg(LEAVE_DEVELOPER_MODE)
+        } else {
+            command
+        };
+        if plan != RootPlan::NameRuleOnly && self.restores_removed() {
+            command.arg(RESTORE_NAME_RULE)
         } else {
             command
         }
@@ -644,8 +672,8 @@ impl CommandLineTools {
     /// developer mode ([`crate::root_steps::DeveloperMode`]), puts the rule in place that names
     /// the Mac at an admission that comes later ([`crate::root_steps::NameRule`]), and installs
     /// the root LAN broker ([`crate::items::lan::LanBroker`]) before the tools' download, so the
-    /// root transaction also stops Spotlight indexing the console account's home folders
-    /// other than Documents and Desktop ([`crate::init_spotlight`], added in
+    /// root transaction also keeps Spotlight to Applications, Documents, Desktop and the synced
+    /// drives ([`crate::init_spotlight`], added in
     /// `controller::commands`), so
     /// one password does every root step setup has.
     /// [`RootPlan::StepsOnly`] omits CLT
@@ -704,7 +732,8 @@ impl CommandLineTools {
 
     /// What the elevation still owes this Mac beside the tools ([`Self::with_owed`]), less
     /// developer mode where this run leaves it ([`Self::leaves_developer_mode`]). Only the
-    /// person's setup request may renew an old or unread naming permission, and only their
+    /// person's setup request may renew an old or unread naming permission, only their own typed
+    /// run that applies or plans owes one they removed ([`Self::restores_removed`]), and only their
     /// press of Finish setup ([`Self::with_explicit_tab`]) or their run that applies or plans
     /// ([`Self::scoping_new_folders`]) excludes from Spotlight a folder made in a home setup's
     /// password already scoped; every other run owes Spotlight only a home never scoped
@@ -723,16 +752,18 @@ impl CommandLineTools {
 
     /// Whether this run asks the Mac password for `owed` ([`Self::owed_now`]): for any step of
     /// it, except, in a run nobody asked for, a step a root apply already failed at for good
-    /// with the inputs it reads now ([`crate::root_steps::refused`]). Such a step still reads
-    /// owed, so the run does not read finished and its row names it; asked for by itself it
-    /// would bring the password back every time the person answered it. A person's own run
-    /// asks for it and tries it again, and a password asked for anything else carries it too.
+    /// with the inputs it reads now ([`crate::root_steps::refused`]), and an update the running
+    /// broker did not adopt ([`crate::root_steps::Owed::asks_by_itself`]). Such a step still
+    /// reads owed, so the run does not read finished and its row names it; asked for by itself
+    /// a refused one would bring the password back every time the person answered it, and the
+    /// broker's renewal waits for the next root steps. A person's own run asks for either and
+    /// does it, and a password this run asks for another step carries both.
     fn asks(&self, sys: &dyn System, owed: &[crate::root_steps::Owed]) -> bool {
         if self.is_explicit() {
             return !owed.is_empty();
         }
         owed.iter()
-            .any(|step| !crate::root_steps::refused(sys, *step))
+            .any(|step| step.asks_by_itself() && !crate::root_steps::refused(sys, *step))
     }
 
     /// [`Self::owed_now`] by this program's own rules alone.
@@ -757,6 +788,9 @@ impl CommandLineTools {
             if !matches!(crate::root_steps::name_rule_current(sys), Ok(true)) {
                 owed.push(crate::root_steps::Owed::NameRule);
             }
+        }
+        if !self.restores_removed() && crate::root_steps::rule_removed(sys) {
+            owed.retain(|step| *step != crate::root_steps::Owed::NameRule);
         }
         owed
     }
@@ -971,6 +1005,10 @@ pub struct Unbidden {
     explicit: bool,
     /// The person's choices now, as the setup records say ([`crate::init::Records::holds`]).
     holds: Arc<dyn Fn() -> crate::init::Holds + Send + Sync>,
+    /// This Mac's record of developer mode beside the account's `aterm.toml`
+    /// ([`aterm_types::macos_setup::debugger_record::beside_on`]); `None` where it has no place
+    /// or this Mac's UUID could not be read, which says nothing of the person's choice.
+    observed: Option<PathBuf>,
     /// This run's claim of the episode ([`Self::claim`]), which only its end replaces.
     claim: Mutex<Option<aterm_types::clt_mark::Claim>>,
 }
@@ -989,8 +1027,16 @@ impl Unbidden {
             asker,
             explicit: false,
             holds: Arc::new(holds),
+            observed: None,
             claim: Mutex::new(None),
         }
+    }
+
+    /// This record reading this Mac's record of developer mode at `observed`
+    /// ([`Self::developer_mode_off_chosen`]).
+    #[must_use]
+    pub fn observing(self, observed: Option<PathBuf>) -> Self {
+        Self { observed, ..self }
     }
 
     /// This account's record and this process of this build, held as `records` say each time
@@ -1002,6 +1048,33 @@ impl Unbidden {
             aterm_types::clt_mark::Asker::this_process(&aterm_stamp::build_id()),
             move || records.holds(),
         )
+        .observing(aterm_types::dirs::aterm_config_path().and_then(|config| {
+            aterm_types::macos_setup::debugger_record::beside_on(
+                &config,
+                aterm_containment::consent::host_uuid().as_deref(),
+            )
+        }))
+    }
+
+    /// Whether this Mac's record of developer mode says its off reading is the person's choice
+    /// ([`aterm_types::macos_setup::debugger_record::off_is_chosen`]): the window saw it on, or
+    /// knows who turned it off, on this Mac. `false` where the record has no place, is not this
+    /// account's own file or does not read. Only this Mac's own record counts
+    /// ([`aterm_types::macos_setup::debugger_record::beside_on`]): developer mode is this Mac's,
+    /// and the record another Mac's window keeps, which a synced or migrated config folder
+    /// carries, says what that Mac saw. The one from before records named their Mac is not read
+    /// here; the window makes it this Mac's own once, and as it names no Mac, what this Mac's
+    /// record says may then have been seen on another Mac by an earlier build.
+    fn developer_mode_off_chosen(&self, sys: &dyn System) -> bool {
+        use aterm_types::macos_setup::debugger_record::{MAX_BYTES, Observed, off_is_chosen};
+        self.observed.as_deref().is_some_and(|path| {
+            let recorded = sys
+                .read_owned_file(path, sys.euid(), MAX_BYTES, false)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|text| Observed::parse(&text));
+            off_is_chosen(false, recorded.as_ref())
+        })
     }
 
     /// Whether the record says setup's elevation finished on this account once
@@ -1325,12 +1398,33 @@ impl Item for RootSteps<'_> {
             {
                 tab.note(Unfinished::StepsOwed);
             }
-            return Probe::Deferred {
-                why: format!(
-                    "{from}; setup already tried this as root and it failed, so aterm does not ask the \
-                     Mac password for it again by itself; `aterm init` tries it again"
-                ),
-            };
+            // Every step that asks by itself is one root already refused: name those alone as
+            // tried, beside the adoption, which root never tried.
+            let mut why = from;
+            let tried: Vec<_> = owed
+                .iter()
+                .copied()
+                .filter(|step| step.asks_by_itself())
+                .collect();
+            if !tried.is_empty() {
+                why.push_str(&format!(
+                    "; setup already tried as root and failed to do this: {}; so aterm does not \
+                     ask the Mac password for it again by itself; `aterm init` tries it again",
+                    plain_steps(&tried)
+                ));
+            }
+            if owed.contains(&crate::root_steps::Owed::LanBrokerAdoption) {
+                let said = crate::items::lan::adoption_refusal(sys).map_or_else(
+                    || "it recorded no reason".to_owned(),
+                    |why| format!("it says: {why}"),
+                );
+                why.push_str(&format!(
+                    "; the local network helper is still on another build of aterm ({said}); the \
+                     next Mac password setup asks for its root steps, or a person's own `aterm \
+                     init`, renews it, so aterm asks none for it alone"
+                ));
+            }
+            return Probe::Deferred { why };
         }
         let why = match clt.held_back(sys, &from, false) {
             Some((Probe::Deferred { why } | Probe::Blocked { why }, _)) => why,

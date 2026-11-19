@@ -134,6 +134,7 @@ fn progress_stall_names_its_evidence_and_wait() {
     let error = aterm_uds::deadline::ProgressError::Stalled {
         window: Duration::from_secs(60),
         waiting_on: "git fetch-batch fixture/app, step fetch".into(),
+        partial: aterm_uds::deadline::PartialOutput::default(),
     };
     let data = classify_progress_failure(&spec, error).into_data();
     assert_eq!(

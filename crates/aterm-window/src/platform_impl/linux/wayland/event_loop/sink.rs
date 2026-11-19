@@ -14,13 +14,13 @@ use std::vec::Drain;
 use crate::event::{Event, WindowEvent};
 use crate::window::WindowId as RootWindowId;
 
-use crate::platform_impl::wayland::WindowId;
+use crate::platform_impl::wayland::{outside_release::ReleaseId, WindowId};
 
 /// An event loop's sink to deliver events from the Wayland event callbacks
 /// to the winit's user.
 #[derive(Default)]
 pub struct EventSink {
-    pub window_events: Vec<Event<()>>,
+    window_events: Vec<(Event<()>, Option<ReleaseId>)>,
 }
 
 impl EventSink {
@@ -37,7 +37,17 @@ impl EventSink {
     /// Add new window event to a queue.
     #[inline]
     pub fn push_window_event(&mut self, event: WindowEvent, window_id: WindowId) {
-        self.window_events.push(Event::WindowEvent { event, window_id: RootWindowId(window_id) });
+        self.push_tagged(event, window_id, None);
+    }
+
+    pub(crate) fn push_tagged(
+        &mut self,
+        event: WindowEvent,
+        window_id: WindowId,
+        release: Option<ReleaseId>,
+    ) {
+        self.window_events
+            .push((Event::WindowEvent { event, window_id: RootWindowId(window_id) }, release));
     }
 
     #[inline]
@@ -46,7 +56,7 @@ impl EventSink {
     }
 
     #[inline]
-    pub fn drain(&mut self) -> Drain<'_, Event<()>> {
+    pub(crate) fn drain(&mut self) -> Drain<'_, (Event<()>, Option<ReleaseId>)> {
         self.window_events.drain(..)
     }
 }

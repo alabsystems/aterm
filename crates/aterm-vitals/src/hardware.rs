@@ -246,6 +246,12 @@ impl Recorder {
         self.pending.is_some()
     }
 
+    /// Whether a sustained observation's bundle is kept, which every later reading's snapshot
+    /// carries ([`Self::observe`]).
+    pub(crate) const fn kept(&self) -> bool {
+        self.last.is_some()
+    }
+
     pub(crate) fn observe(&mut self, s: &Snapshot, counters: Option<&[Ticks]>) -> Option<Bundle> {
         let Some(anomaly) = all_e_busy_p_idle(s) else {
             self.pending = None;

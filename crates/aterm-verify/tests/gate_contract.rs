@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! End-to-end CLI contract tests over a synthetic repository using `#!/bin/sh` stand-ins.
+//! End-to-end CLI contracts over a synthetic repository: shell tool stand-ins and native
+//! macOS driver fixtures that pass through the production retained-image boundary.
 #![cfg(unix)]
 
 use crate::common;
@@ -74,27 +75,138 @@ impl FakeRepo {
     }
 
     fn driver_stub(&self, rel: &str, code: i32) -> &Self {
-        self.driver_script(
+        self.driver_reply(
             rel,
-            &format!(
-                "echo '{rel}: stub'; echo '{}'; exit {code}",
-                stages::OBJC_VERDICT_HEADER
-            ),
+            code,
+            &format!("{rel}: stub\n{}\n", stages::OBJC_VERDICT_HEADER),
         )
     }
 
-    fn driver_script(&self, rel: &str, body: &str) -> &Self {
-        self.script_body(&format!("{DRIVERS}/debug/{rel}"), body);
+    fn driver_reply(&self, rel: &str, code: i32, output: &str) -> &Self {
+        #[cfg(target_os = "macos")]
+        self.native_driver(rel, &format!("exit:{code}\n{output}"));
+        #[cfg(not(target_os = "macos"))]
+        self.script_body(
+            &format!("{DRIVERS}/debug/{rel}"),
+            &format!("printf '%s' {}; exit {code}", sh_quote(output)),
+        );
         self
     }
 
+    fn killed_driver(&self, rel: &str) -> &Self {
+        #[cfg(target_os = "macos")]
+        self.native_driver(rel, "kill\n");
+        #[cfg(not(target_os = "macos"))]
+        self.script_body(&format!("{DRIVERS}/debug/{rel}"), "kill -KILL $$");
+        self
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_driver(&self, rel: &str, reply: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = self.root.join(DRIVERS).join("debug").join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // These synthetic compiler outputs are never executed in place: the production
+        // image preparation copies them to its persistent namespace first.
+        if path.exists() {
+            fs::remove_file(&path).unwrap();
+        }
+        aterm_tempfile::copy_to_new_file(
+            aterm_tempfile::bin_exe("aterm-verify-artifact-fixture"),
+            &path,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = self.root.parent().unwrap().join("appkit-runtime");
+        aterm_uds::private_file::create_private_dir(&runtime).unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        fs::write(runtime.join(format!(".{name}.fixture")), reply).unwrap();
+        self.driver_receipts();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn driver_receipts(&self) {
+        for (group, rels) in [
+            ("redraw", vec![stages::REDRAW_CONFORMANCE_BIN.to_owned()]),
+            (
+                "objc",
+                stages::OBJC_DRIVES
+                    .iter()
+                    .map(|d| objc_stub(d.example))
+                    .collect(),
+            ),
+        ] {
+            let mut messages = String::new();
+            for rel in rels {
+                let path = self.root.join(DRIVERS).join("debug").join(&rel);
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_str().unwrap();
+                let message = aterm_json::json!({
+                    "reason":"compiler-artifact", "fresh":false, "filenames":[path],
+                    "manifest_path":self.root.join("crates/aterm-gui/Cargo.toml"),
+                    "target":{"name":name,"kind":[if group == "redraw" { "bin" } else { "example" }]},
+                    "executable":path, "trust_compile_mode":"build", "trust_compile_kind":"host",
+                    "trust_compile_target":format!("{}-apple-darwin",std::env::consts::ARCH),
+                    "trust_unit_identity_sha256":"a".repeat(64),
+                    "trust_executable_sha256":aterm_verify::test_index::digest(&path).unwrap(),
+                    "profile":{"test":false,"debug_assertions":true}
+                });
+                messages.push_str(&aterm_json::to_string(&message).unwrap());
+                messages.push('\n');
+            }
+            fs::write(
+                self.scratch.join(format!("{group}-artifacts.jsonl")),
+                messages,
+            )
+            .unwrap();
+        }
+    }
+
+    fn compiler_body(&self, body: &str) -> String {
+        #[cfg(not(target_os = "macos"))]
+        return body.to_owned();
+        #[cfg(target_os = "macos")]
+        {
+            let finish = r#"atv_status=$?; trap - EXIT; if [ "$atv_status" -eq 0 ]; then atv_success=true; else atv_success=false; fi; printf '{"reason":"build-finished","success":%s}\n' "$atv_success"; exit "$atv_status""#;
+            format!(
+                "case \" $* \" in\n\
+                 *' --bin aterm-redraw-conformance '*) atv_receipt={} ;;\n\
+                 *' --example '*) atv_receipt={} ;;\n\
+                 *) atv_receipt='' ;;\nesac\n\
+                 if [ -n \"$atv_receipt\" ]; then\n\
+                   /bin/cat \"$atv_receipt\"\n\
+                   trap {} EXIT\n\
+                 fi\n{body}",
+                sh_quote(
+                    &self
+                        .scratch
+                        .join("redraw-artifacts.jsonl")
+                        .display()
+                        .to_string()
+                ),
+                sh_quote(
+                    &self
+                        .scratch
+                        .join("objc-artifacts.jsonl")
+                        .display()
+                        .to_string()
+                ),
+                sh_quote(finish),
+            )
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn script_body(&self, rel: &str, body: &str) {
         common::standin_body(&self.root.join(rel), body);
     }
 
     fn with_stage2(&self, targo_body: &str) -> &Self {
+        let compiler_body = self.compiler_body(targo_body);
         for (name, body) in [
-            ("targo", targo_body),
+            ("targo", compiler_body.as_str()),
             ("trustdoc", "exit 0"),
             (
                 "trustc",
@@ -108,7 +220,7 @@ impl FakeRepo {
     }
 
     fn with_stage2_body(&self, targo_body: &str) -> &Self {
-        common::standin_body(&self.stage2.join("targo"), targo_body);
+        common::standin_body(&self.stage2.join("targo"), &self.compiler_body(targo_body));
         common::standin(&self.stage2.join("trustdoc"), "exit 0");
         common::standin(
             &self.stage2.join("trustc"),
@@ -464,6 +576,28 @@ fn a_failing_doctest_fails_the_test_check_on_its_own_row() {
     assert_eq!(tags(&ladder).last(), Some(&"FAIL"), "{ladder}");
 }
 
+fn driver_stage(ctx: &Ctx, id: StageId) -> aterm_verify::ladder::Report {
+    let spec = plan::plan(ctx)
+        .expect("plan with driver preparation")
+        .into_iter()
+        .find(|s| s.id == id)
+        .expect("driver stage planned");
+    stages::run_stage(ctx, &spec)
+}
+
+fn assert_driver_build(ctx: &Ctx, id: StageId) {
+    let built = driver_stage(ctx, id);
+    assert_eq!(
+        built
+            .outcomes()
+            .map(|(outcome, _)| outcome)
+            .collect::<Vec<_>>(),
+        [aterm_verify::ladder::Outcome::Ok],
+        "{}",
+        built.render()
+    );
+}
+
 #[test]
 fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     let repo = FakeRepo::new();
@@ -479,6 +613,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     let redraw = spec_of(StageId::RedrawConformance);
     for (code, findings, undecided) in [(0, 0, 0), (1, 1, 0), (2, 0, 1)] {
         repo.driver_stub(stages::REDRAW_CONFORMANCE_BIN, code);
+        assert_driver_build(&ctx, StageId::RedrawBuild);
         let t = tally(&[stages::run_stage(&ctx, &redraw)]);
         assert_eq!(
             (t.gate_failures.len(), t.could_not_run.len(), t.skipped()),
@@ -489,12 +624,83 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     repo.driver_stub(stages::REDRAW_CONFORMANCE_BIN, 0);
     if cfg!(target_os = "macos") {
         let stub = objc_stub("objc_event_drive");
-        repo.driver_script(&stub, "kill -KILL $$");
+        repo.killed_driver(&stub);
+        assert_driver_build(&ctx, StageId::ObjcBuild);
         let t = tally(&[stages::run_stage(&ctx, &spec_of(StageId::ObjcDrives))]);
         assert_eq!(t.gate_failures.len(), 1, "{t:?}");
         assert!(t.could_not_run.is_empty(), "a crash is a finding: {t:?}");
         repo.driver_stub(&stub, 0);
     }
+}
+
+#[test]
+fn appkit_runtime_retains_the_built_image_and_refuses_an_unprepared_driver_without_cargo() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx_with_windows(&land(), Scope::workspace());
+    let driver = stages::REDRAW_CONFORMANCE_BIN;
+    let run = || driver_stage(&ctx, StageId::RedrawConformance);
+    assert!(run().render().contains("no successful driver build"));
+    repo.driver_stub(driver, 0);
+    assert!(
+        driver_stage(&ctx, StageId::RedrawBuild)
+            .render()
+            .contains("built redraw-conformance drivers")
+    );
+    repo.with_stage2_body(r#"touch "$0.unexpected"; exit 101"#);
+    let original = repo.root.join(DRIVERS).join("debug").join(driver);
+    #[cfg(target_os = "macos")]
+    {
+        // Replace only the never-executed synthetic compiler output with DIFFERENT valid
+        // native bytes. The typed reply data stays fixed; it cannot mimic this substitution.
+        let before = aterm_verify::test_index::digest(&original).unwrap();
+        fs::remove_file(&original).unwrap();
+        aterm_tempfile::copy_to_new_file(
+            aterm_tempfile::bin_exe("aterm-verify-candidate-helper"),
+            &original,
+        )
+        .unwrap();
+        assert_ne!(before, aterm_verify::test_index::digest(&original).unwrap());
+        let retained = run();
+        assert_eq!(tags(&retained.render()), ["ok"], "{}", retained.render());
+        let text = retained.render();
+        let executed = text
+            .lines()
+            .find_map(|line| line.strip_prefix("__snapshot_executable="))
+            .expect("the actual native child identifies its retained image");
+        assert_ne!(std::path::Path::new(executed), original);
+        assert!(!std::path::Path::new(executed).starts_with(&repo.root));
+        assert!(!repo.stage2.join("targo.unexpected").exists());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        common::standin(&original, "exit 0 # replaced");
+        let replaced = run();
+        assert!(
+            replaced.render().contains("driver bytes differ"),
+            "{}",
+            replaced.render()
+        );
+        assert!(run().render().contains("no successful driver build"));
+    }
+
+    // A fresh successful build admits its valid native output. The compiler would record and
+    // fail any call during the drive, including a rebuild whose result was ignored.
+    repo.driver_stub(driver, 0);
+    repo.with_stage2_body("exit 0");
+    assert_driver_build(&ctx, StageId::RedrawBuild);
+    repo.with_stage2_body(r#"touch "$0.unexpected"; exit 101"#);
+    let driven = run();
+    assert_eq!(
+        driven
+            .outcomes()
+            .map(|(outcome, _)| outcome)
+            .collect::<Vec<_>>(),
+        [aterm_verify::ladder::Outcome::Ok],
+        "{}",
+        driven.render()
+    );
+    assert!(!repo.stage2.join("targo.unexpected").exists());
 }
 
 /// NEGATIVE CONTROL (KI-1110-3), through the stage's real runner: a driver that exits `0` before
@@ -513,31 +719,33 @@ fn an_objc_drive_that_exits_0_without_its_verdict_or_after_a_finding_is_red() {
         .find(|s| s.id == StageId::ObjcDrives)
         .expect("planned");
     let audit = objc_stub(stages::OBJC_DRIVES[0].example);
-    for body in [
-        "echo '=== C. LIVE SENDS ==='; exit 0".to_owned(),
+    for output in [
+        "=== C. LIVE SENDS ===\n".to_owned(),
         format!(
-            "echo '  FINDING: applicationShouldTerminate: answered 0x0'; echo '{}'; exit 0",
+            "  FINDING: applicationShouldTerminate: answered 0x0\n{}\n",
             stages::OBJC_VERDICT_HEADER
         ),
     ] {
-        repo.driver_script(&audit, &body);
+        repo.driver_reply(&audit, 0, &output);
+        assert_driver_build(&ctx, StageId::ObjcBuild);
         let r = stages::run_stage(&ctx, &spec);
         let t = tally(std::slice::from_ref(&r));
         let ladder = r.render();
-        assert_eq!(t.gate_failures.len(), 1, "{body}: {ladder}");
+        assert_eq!(t.gate_failures.len(), 1, "{output}: {ladder}");
         assert!(
             !labels_with(&ladder, "ok")
                 .iter()
                 .any(|l| l.starts_with(stages::OBJC_DRIVES[0].example)),
-            "{body}: {ladder}"
+            "{output}: {ladder}"
         );
         assert_eq!(
             labels_with(&ladder, "ok").len(),
             stages::OBJC_DRIVES.len() - 1,
-            "{body}: {ladder}"
+            "{output}: {ladder}"
         );
     }
     repo.driver_stub(&audit, 0);
+    assert_driver_build(&ctx, StageId::ObjcBuild);
     let r = stages::run_stage(&ctx, &spec);
     assert!(
         tally(std::slice::from_ref(&r)).gate_failures.is_empty(),
@@ -564,6 +772,7 @@ fn objc_drives_build_once_and_keep_runtime_failures_separate() {
         .into_iter()
         .find(|s| s.id == StageId::ObjcDrives)
         .expect("planned");
+    assert_driver_build(&ctx, StageId::ObjcBuild);
     let r = stages::run_stage(&ctx, &spec);
     let t = tally(std::slice::from_ref(&r));
     let ladder = r.render();
@@ -587,12 +796,14 @@ fn objc_drives_build_once_and_keep_runtime_failures_separate() {
     // A failed shared build must not run any of the executable stubs already on
     // disk. Reverting to per-driver builds also breaks the two-target control above.
     repo.with_stage2_body(COMPILE_RED);
-    let r = stages::run_stage(&ctx, &spec);
+    let r = driver_stage(&ctx, StageId::ObjcBuild);
     let t = tally(std::slice::from_ref(&r));
     let ladder = r.render();
     assert_eq!(t.gate_failures.len(), 1, "{ladder}");
     assert_eq!(t.could_not_run.len(), 1, "{ladder}");
     assert!(labels_with(&ladder, "ok").is_empty(), "{ladder}");
+    let missing = stages::run_stage(&ctx, &spec);
+    assert!(missing.render().contains("no successful driver build"));
 }
 
 const COMPILE_RED: &str = "echo 'error[E0425]: cannot find value `gone` in this scope' >&2; \
@@ -1544,7 +1755,8 @@ fn the_first_failing_test_binary_ends_a_halted_run_and_nothing_else_does() {
 
 /// A JSON BINARY ENDS AT ITS FIRST DECISIVE RED CASE (ATERM-KI-1105-18): binary a, asked in
 /// libtest's JSON format (it exits 3 if its argv lacks `--format json`), says a plainly failed case
-/// and then never ends; a halted run ends it there, under a hang-detector ceiling it never reaches.
+/// and then does not end while this test binary lives; a halted run ends it there, under a
+/// hang-detector ceiling it never reaches.
 /// Only a ran, the row is FAIL with a's NOT RUN for the rest, the itemized `a::broke` keeps its
 /// panic, and nothing was a ceiling kill. Its refusal and full-disk controls say a spared case and
 /// end by themselves: every binary runs, and the row is NOT RUN.
@@ -1566,7 +1778,7 @@ fn a_json_binary_ends_at_its_first_decisive_red_case_and_nothing_else_does() {
         let deps = repo.root.join("target/debug/deps");
         let m = marks.display();
         let tail = if forever {
-            "while :; do sleep 1; done".to_owned()
+            aterm_uds::stand_in_loop::while_alive("sleep 1")
         } else {
             "echo '{ \"type\": \"test\", \"name\": \"a::hangs\", \"event\": \"ok\" }'\n\
              echo '{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 1, \"failed\": 1, \

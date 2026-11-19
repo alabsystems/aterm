@@ -57,6 +57,7 @@ use super::{Line, Scope};
 pub(crate) const PAGE: usize = 100;
 /// How many records one read looks at for the filters this reader applies (machine, Find)
 /// before it answers with what it found: a bounded read, which Read older records goes on from.
+#[cfg(unix)]
 pub(crate) const SCAN: usize = 2048;
 /// A run of this many consecutive records of one machine and kind folds: two lines take no
 /// more room than a fold's line and one of its records, so a fold of two would hide a record
@@ -132,6 +133,7 @@ pub(crate) struct Filter {
     pub(crate) find: String,
 }
 
+#[cfg(unix)]
 impl Filter {
     /// Whether this reader, not the store, decides what is kept: a machine or Find.
     pub(crate) const fn reads(&self) -> bool {
@@ -631,6 +633,7 @@ pub(crate) fn cells_words(n: usize) -> String {
 
 /// Everything a line of `record` says, which Find matches: its writer and kind
 /// ([`Author::who`]), where it wrote, what it changed and its count of cells.
+#[cfg(unix)]
 pub(crate) fn words_of(record: &Logged, place: &str, changed: &str) -> String {
     let mut words = format!(
         "{} {place} {changed} {}",

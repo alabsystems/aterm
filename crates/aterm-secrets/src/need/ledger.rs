@@ -339,6 +339,34 @@ pub fn with_ledger<T>(
     with_ledger_raising(paths, &[], change)
 }
 
+/// `read` in one hold of the ledger's lock: a read of the ledger together with the refusal beside
+/// it that a pass's own moves carry in the same hold ([`super::full::reading`]).
+///
+/// # Errors
+/// The lock cannot be taken, or `read`'s.
+pub(super) fn locked<T>(
+    paths: &Paths,
+    read: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    let _lock = Lock::take(paths)?;
+    read()
+}
+
+/// [`with_ledger`] for a pass's own moves of the ledger: its settling ([`list`]) and what it takes
+/// in off the lab's table ([`absorb`]). A full table's refusal recorded on the ledger as it stood
+/// is carried to the ledger these moves leave, in the same hold of the lock
+/// ([`super::full::carry`]), so a look between them and the pass's end reads it standing still.
+fn with_ledger_carrying<T>(
+    paths: &Paths,
+    change: impl FnOnce(&mut Vec<Need>, &Facts) -> crate::Result<T>,
+) -> crate::Result<T> {
+    let _lock = Lock::take(paths)?;
+    let facts = super::facts(paths, now())?;
+    with_rows_then(paths, facts, &[], change, |before, after| {
+        super::full::carry(paths, before, after)
+    })
+}
+
 /// [`with_ledger`], its facts judging `raising` too ([`super::judged_for`]): the wants `change`
 /// may add to the ledger.
 fn with_ledger_raising<T>(
@@ -359,6 +387,17 @@ fn with_rows<T>(
     raising: &[Want],
     change: impl FnOnce(&mut Vec<Need>, &Facts) -> crate::Result<T>,
 ) -> crate::Result<T> {
+    with_rows_then(paths, facts, raising, change, |_, _| Ok(()))
+}
+
+/// [`with_rows`], then `saved` with the rows as loaded and as saved, where `change` moved any.
+fn with_rows_then<T>(
+    paths: &Paths,
+    facts: Facts,
+    raising: &[Want],
+    change: impl FnOnce(&mut Vec<Need>, &Facts) -> crate::Result<T>,
+    saved: impl FnOnce(&[Need], &[Need]) -> crate::Result<()>,
+) -> crate::Result<T> {
     let mut rows = load(paths)?;
     let open = rows
         .iter()
@@ -369,6 +408,7 @@ fn with_rows<T>(
     let out = change(&mut rows, &facts)?;
     if rows != before {
         save(paths, &mut rows)?;
+        saved(&before, &rows)?;
     }
     Ok(out)
 }
@@ -923,16 +963,18 @@ pub fn retire(paths: &Paths, selector: &str, note: &str) -> crate::Result<Vec<Ne
 /// stands changes nothing. A lab retirement whose reason has already
 /// changed (a lapse: this Mac is taking it in, so it is back) raises the need again at once, as
 /// the line it ends with says, since a need raised by hand has no consumer to raise it (§6.2).
-/// Each need moved comes back with the request id its move named.
+/// Each need moved comes back with the request id its move named. A full table's refusal that
+/// stood on the ledger is carried over these moves ([`super::full::carry`]).
 ///
 /// # Errors
-/// The ledger or the vault state cannot be read or written, or no request id can be drawn.
+/// The ledger or the vault state cannot be read or written, no request id can be drawn, or the
+/// refusal cannot be carried.
 pub fn absorb(
     paths: &Paths,
     moves: &[([u8; 16], super::Absorb)],
 ) -> crate::Result<Vec<([u8; 16], Need)>> {
     use super::Absorb;
-    with_ledger(paths, |rows, facts| {
+    with_ledger_carrying(paths, |rows, facts| {
         let mut moved = Vec::new();
         for (id, step) in moves {
             let Some(need) = rows.iter_mut().find(|need| need.id == *id) else {
@@ -981,12 +1023,13 @@ pub fn peek(paths: &Paths) -> crate::Result<Vec<Need>> {
     load(paths)
 }
 
-/// Every need in the ledger, each moved as this Mac now observes.
+/// Every need in the ledger, each moved as this Mac now observes. A full table's refusal that
+/// stood on the ledger is carried over these moves ([`super::full::carry`]).
 ///
 /// # Errors
-/// The ledger or the vault state cannot be read or written.
+/// The ledger or the vault state cannot be read or written, or the refusal cannot be carried.
 pub fn list(paths: &Paths) -> crate::Result<Vec<Need>> {
-    with_ledger(paths, |rows, facts| {
+    with_ledger_carrying(paths, |rows, facts| {
         for need in rows.iter_mut() {
             *need = settle(need, facts);
         }

@@ -5,6 +5,8 @@
 
 use super::*;
 
+const NATIVE_LINKER: &str = "/usr/bin/cc";
+
 struct Observation {
     name: String,
     command: String,
@@ -76,6 +78,10 @@ fn dispatched(stderr: &[u8]) -> Vec<&'static str> {
     {
         for name in ["build_script_build", "sdk_fresh_subject"] {
             if line.contains(&format!("--crate-name {name} ")) {
+                assert!(
+                    line.contains(&format!(" -C linker={NATIVE_LINKER} ")),
+                    "the fixture must dispatch the real native linker for {name}: {line}"
+                );
                 units.push(name);
             }
         }
@@ -201,6 +207,10 @@ fn captured_sdk_reuses_linked_binary_and_build_script_without_compiler_dispatch(
             units: None,
         };
         let calls = std::cell::Cell::new(0);
+        // Select the same real OS linker in both arms. SDK capture is the input under test;
+        // ambient PATH candidates under the mutable tool store are not fixture inputs.
+        let linker_config =
+            format!("target.'cfg(target_os = \"macos\")'.linker=\"{NATIVE_LINKER}\"");
         let build = || {
             let mut command = release_build_command(
                 &prover.bin.join("targo"),
@@ -214,6 +224,8 @@ fn captured_sdk_reuses_linked_binary_and_build_script_without_compiler_dispatch(
                     "--color=never",
                     "--config",
                     "profile.dev.incremental=false",
+                    "--config",
+                    &linker_config,
                     "--manifest-path",
                 ]
                 .into_iter()
@@ -223,11 +235,14 @@ fn captured_sdk_reuses_linked_binary_and_build_script_without_compiler_dispatch(
                 &env,
             );
             command.env("CARGO_BUILD_JOBS", "2");
-            command.env(
-                "CARGO_LOG",
-                "targo::compiler::fingerprint=info,targo::compiler::fingerprint::build_script_inputs=debug",
-            );
-            if !explicit {
+            if explicit {
+                command.env(
+                    "CARGO_LOG",
+                    format!(
+                        "{FINGERPRINT_LOG},targo::compiler::fingerprint::build_script_inputs=debug"
+                    ),
+                );
+            } else {
                 // The old producer: same declared compiler, source and layout, no SDK input.
                 command.env_remove("SDKROOT");
             }
@@ -269,6 +284,13 @@ fn captured_sdk_reuses_linked_binary_and_build_script_without_compiler_dispatch(
             "each first build must actually dispatch both linked units"
         );
         let second = build();
+        if !explicit {
+            let diagnostics = String::from_utf8_lossy(&second.stderr);
+            assert!(
+                diagnostics.contains("fingerprint dirty for") && diagnostics.contains("dirty: "),
+                "the release build must log why the omitted-SDK units rebuilt: {diagnostics}",
+            );
+        }
         let artifacts: Vec<aterm_json::Value> = second
             .stdout
             .split(|b| *b == b'\n')

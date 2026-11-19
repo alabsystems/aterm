@@ -2500,6 +2500,8 @@ fn rewind_gallery() {
                 session: None,
                 want_bytes: true,
                 want_metadata: false,
+                whole_client: false,
+                presentation: None,
                 frame_metadata: Arc::new(std::sync::OnceLock::new()),
                 cancel: crate::control::CaptureCancellation::new(),
                 reply,

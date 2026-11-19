@@ -68,8 +68,11 @@ impl Procs for Table {
         self.0.keys().copied().collect()
     }
 
-    fn agent(&self, pid: i32) -> bool {
-        self.0.get(&pid).is_some_and(|p| p.agent)
+    fn agent_name(&self, pid: i32) -> Option<&'static str> {
+        self.0
+            .get(&pid)
+            .is_some_and(|p| p.agent)
+            .then_some("claude")
     }
 }
 
@@ -98,12 +101,12 @@ fn lineage() -> Table {
 }
 
 fn line(word: &str, sid: &str) -> String {
-    format!("OK 1\nverdict={word} session={sid} fleet=no\n")
+    format!("OK 1\nverdict={word} session={sid} fleet=no program=-\n")
 }
 
 /// [`line`] where another Mac is behind the question.
 fn fleet_line(word: &str, sid: &str) -> String {
-    format!("OK 1\nverdict={word} session={sid} fleet=yes\n")
+    format!("OK 1\nverdict={word} session={sid} fleet=yes program=-\n")
 }
 
 /// ANOTHER MAC BEHIND THE QUESTION IS SAID BESIDE THE VERDICT, so a sign-in started in the
@@ -176,6 +179,7 @@ fn the_verdict_is_the_first_fact_that_holds_in_order() {
         driven: true,
         agent: true,
         fleet: true,
+        program: Some("claude"),
     };
     let mut facts = RevealFacts {
         remote: true,
@@ -200,6 +204,8 @@ fn the_verdict_is_the_first_fact_that_holds_in_order() {
             agent: clear < 5,
             // Who typed decides no verdict: `driven` already withholds.
             fleet: true,
+            // Nor which agent asked.
+            program: Some("claude"),
         };
         seen.push(reveal_verdict(RevealFacts {
             session: Some(session),
@@ -241,6 +247,7 @@ fn allowed_only_when_no_fact_withholds() {
             driven: bit(6),
             agent: bit(7),
             fleet: false,
+            program: None,
         };
         let facts = RevealFacts {
             remote: bit(0),
@@ -425,6 +432,44 @@ fn an_agent_in_the_session_s_tree_answers_agent() {
         answer(&store, false, Some(510), &lineage()),
         line("agent", &sid),
         "the agent the session's screen reads"
+    );
+}
+
+/// THE AGENT THAT ASKED IS NAMED BESIDE THE VERDICT: the nearest of the asking process and its
+/// ancestors, up to and including the session's shell, that runs an agent (`program=claude`),
+/// which `aterm file` states as a record's principal; never one elsewhere in the session's tree,
+/// nor one above its shell.
+///
+/// NEGATIVE CONTROL, observed: with `agent_in_lineage` reading any agent in the session's tree
+/// (`agent_in_tree`), the sibling agent is named and the first assertion fails with
+/// `program=claude` where `program=-` was expected.
+#[test]
+fn the_agent_in_the_asking_process_s_lineage_is_named() {
+    let (store, sid, _) = store_with(500);
+    let with_program = |word: &str, program: &str| {
+        format!("OK 1\nverdict={word} session={sid} fleet=no program={program}\n")
+    };
+    // An agent the shell started beside the asker, and one above the shell: neither asked.
+    let beside = lineage().with(520, 500, true).with(1, 0, true);
+    assert_eq!(
+        answer(&store, false, Some(510), &beside),
+        with_program("agent", "-")
+    );
+    // The asker's parent runs the agent: the agent's tool shell asked.
+    let asked = Table::default()
+        .with(500, 1, false)
+        .with(505, 500, true)
+        .with(510, 505, false);
+    assert_eq!(
+        answer(&store, false, Some(510), &asked),
+        with_program("agent", "claude")
+    );
+    // The tab runs the agent as its own program (`aterm -e claude`): its shell is the agent.
+    let own = Table::default().with(500, 1, true).with(510, 500, false);
+    let said = answer(&store, false, Some(510), &own);
+    assert!(
+        said.ends_with(" program=claude\n"),
+        "the tab's own agent: {said}"
     );
 }
 

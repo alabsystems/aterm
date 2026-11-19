@@ -331,6 +331,8 @@ window_ledger! {
         pub(crate) event_wakes: Counter,
         /// Window events other than a redraw (focus, occlusion, the pointer, keys, a resize), each counted under its kind as the loop dispatches it, however many redraws it brings.
         pub(crate) os_window_events: Tally<{ OsWindowEvent::COUNT }>,
+        /// The loop's marks that the desk may have moved ([`Metrics::note_desk_activity`]), each owing the crash journal a capture (and the settle after it) and the disk walker a read of the panes' facts.
+        pub(crate) desk_activity: Counter,
         pub(crate) timer_wakes: Counter,
         pub(crate) wait_cancelled_wakes: Counter,
         pub(crate) poll_wakes: Counter,
@@ -2582,6 +2584,14 @@ pub(crate) fn note_os_window_event(kind: OsWindowEvent) {
     METRICS.window.sched.os_window_events.inc(kind.index());
 }
 
+impl Metrics {
+    /// The loop marked the crash journal and the disk walker owed for a desk that may have moved
+    /// (`crate::desk_moved`, the loop's one path to both marks): `desk_activity` counts it.
+    pub(crate) fn note_desk_activity(&self) {
+        self.window.sched.desk_activity.inc();
+    }
+}
+
 /// The stable RepaintKey/predictor/effect gate proved that no pixels changed.
 pub(crate) fn note_redraw_early_out() {
     METRICS.window.redraw.early_outs.inc();
@@ -3394,6 +3404,7 @@ pub(crate) fn emit_summary(
         os_events.iter().map(|(_, count)| count).sum(),
     );
     s.count_pairs("os_window_events_by_kind", &os_events, "none");
+    s.count("desk_activity", w.sched.desk_activity.get());
     s.count("timer_wakes", w.sched.timer_wakes.get());
     s.count("wait_cancelled_wakes", w.sched.wait_cancelled_wakes.get());
     s.count("poll_wakes", w.sched.poll_wakes.get());
@@ -3536,8 +3547,9 @@ fn emit_accounts_upkeep(s: &mut dyn wire::FieldSink) {
 }
 
 /// Commons repair's counts in this process since it started (`aterm_db::runtime::cadence`):
-/// each only rises, so no `reset` clears one and a reader subtracts two readings. Commons
-/// repair runs on unix alone, so a Windows build carries none of them.
+/// each only rises, so no `reset` clears one and a reader subtracts two readings. Each of its
+/// ledgers names the words counted at least once, in their family's order (`none` before any).
+/// Commons repair runs on unix alone, so a Windows build carries none of them.
 #[cfg(unix)]
 fn emit_commons_cadence(s: &mut dyn wire::FieldSink) {
     let counts = aterm_db::runtime::cadence();
@@ -3549,6 +3561,47 @@ fn emit_commons_cadence(s: &mut dyn wire::FieldSink) {
     s.count("commons_announces", counts.announces);
     s.count("commons_signature_checks", counts.signature_checks);
     s.count("commons_deadline_spawns", counts.deadline_spawns);
+    s.count("commons_remembered_writes", counts.remembered_writes);
+    for (key, ledger) in counts.ledgers() {
+        s.count_pairs(key, &ledger, "none");
+    }
+    s.count("commons_expired", counts.expired);
+    s.count("commons_seat_busy", counts.seat_busy);
+    s.count("commons_unretired", counts.unretired);
+    s.count("commons_run_max", counts.run_max);
+}
+
+/// `metrics commons`: Commons repair's counts in this process for each seat it keeps
+/// (`aterm_db::runtime::seats`), as `commons_seats=<seat>:<count>/<count>/…,…` with every seat's
+/// counts in one order (`aterm_db::runtime::SeatCounts::cells`), and in JSON an object of seats,
+/// each an object of its counts by name; `none` (`{}`) before any, and on a build without Commons
+/// repair (Windows). No `reset` clears one.
+pub(crate) fn emit_commons_seats(s: &mut dyn wire::FieldSink) {
+    #[cfg(unix)]
+    emit_seats(&aterm_db::runtime::seats(), s);
+    #[cfg(not(unix))]
+    s.pairs("commons_seats", &[], "none");
+}
+
+/// `seats` as `commons_seats` ([`emit_commons_seats`]): each seat by its label, with a record of
+/// its counts by name.
+#[cfg(unix)]
+fn emit_seats(seats: &[aterm_db::runtime::SeatCounts], s: &mut dyn wire::FieldSink) {
+    let cells: Vec<Vec<(&str, wire::Cell<'_>)>> = seats
+        .iter()
+        .map(|seat| {
+            seat.cells
+                .iter()
+                .map(|&(word, count)| (word, wire::Cell::Count(count)))
+                .collect()
+        })
+        .collect();
+    let pairs: Vec<(&str, wire::Cell<'_>)> = seats
+        .iter()
+        .zip(&cells)
+        .map(|(seat, cells)| (seat.label.as_str(), wire::Cell::Rec(cells)))
+        .collect();
+    s.pairs("commons_seats", &pairs, "none");
 }
 
 pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
@@ -3847,3 +3900,7 @@ mod lateness_attribution_tests;
 #[cfg(test)]
 #[path = "metrics_window_tests.rs"]
 mod window_tests;
+
+#[cfg(all(test, unix))]
+#[path = "metrics_commons_tests.rs"]
+mod commons_tests;

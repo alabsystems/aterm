@@ -257,41 +257,12 @@ impl Capture {
         let Some((harness, tool)) = crate::harness::twin_harness(&layout, program) else {
             return Some(String::new());
         };
-        let (harness, tool) = (harness.as_str(), tool.as_str());
-        let shim = prefix.join("bin").join(tool);
-        if !executable(&shim)? {
-            return Some(String::new());
-        }
-        let forward = if !is_link(&shim)? {
-            let text = crate::metadata_io::read_bounded_regular_utf8(&shim, MAX_SHIM_BYTES).ok()?;
-            // This mirrors the current shell's last matching line and deliberate quote refusal.
-            let raw = text
-                .lines()
-                .filter_map(|line| line.strip_prefix("exec '")?.strip_suffix("' \"$@\""))
-                .next_back()
-                .unwrap_or("");
-            if raw.is_empty() || raw.contains('\'') {
-                return Some(String::new());
-            }
-            let store = layout.program_current(harness).parent()?.to_path_buf();
-            let own_store = format!("{}/", store.to_str()?);
-            let in_store = raw.strip_prefix(own_store.as_str());
-            let live = if let Some(rest) = in_store {
-                let build = rest.split('/').next()?;
-                !build.is_empty()
-                    && build.bytes().all(|byte| byte.is_ascii_digit())
-                    && regular(&store.join(format!("{build}.ready")))?
-            } else {
-                regular(&layout.link_marker(harness))?
-            };
-            if !live || !executable(Path::new(raw))? {
-                return Some(String::new());
-            }
+        let forward = match harness_handoff(&layout, &harness, &tool)? {
+            Handoff::Vendor => return Some(String::new()),
+            Handoff::Link(shim) => self.forward(&shim, helper, depth)?,
             // Select and bind the same captured regular body, never a second read that a
             // normal publication could replace after the live predicate judged it.
-            self.script_forward(&shim, &text, helper, depth)?
-        } else {
-            self.forward(&shim, helper, depth)?
+            Handoff::Script { shim, text } => self.script_forward(&shim, &text, helper, depth)?,
         };
         Some(format!(
             "if [ \"${{ATERM_NO_HARNESS-}}\" != 1 ]; then\n  {}\nfi\n",
@@ -315,6 +286,67 @@ impl Capture {
             forward.exec(&crate::launch_tap::VERB)
         ))
     }
+}
+
+/// What a twin's harness hand-off block ([`super::sh_harness_prelude`]) finds at
+/// `<prefix>/bin/<tool>` when it runs: the one reading of that block's runtime arm, which the
+/// probe snapshot binds and the native projection checks
+/// ([`super::native_claude_restart::projection_rule`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Handoff {
+    /// No live harness: the block falls through and the vendor runs as typed.
+    Vendor,
+    /// `bin/<tool>` is a link to an executable file, which the block execs.
+    Link(PathBuf),
+    /// `bin/<tool>` is a script whose last `exec '<target>' "$@"` line names an executable file
+    /// inside a ready store build of the harness (`store/<harness>/<digits>/` with
+    /// `<digits>.ready`) or, while the harness is dev-linked, anywhere: the block execs it, and
+    /// `text` is the body this one read found.
+    Script { shim: PathBuf, text: String },
+}
+
+/// [`Handoff`] for the harness `harness`, whose tool is `tool`, in `layout`, exactly as the block's
+/// shell reads it: `bin/<tool>` an executable regular file (through a link), then either the link
+/// itself or the target of its last exec line, refused for a quote, outside a ready store build
+/// unless the harness's link marker exists, and unless it is itself an executable file. A
+/// tombstone (no exec line), a removed or unfinished build and a missing target are
+/// [`Handoff::Vendor`]. `None` where a fact it rests on was not read.
+pub(crate) fn harness_handoff(
+    layout: &crate::store::Layout,
+    harness: &str,
+    tool: &str,
+) -> Option<Handoff> {
+    let shim = layout.prefix.join("bin").join(tool);
+    if !executable(&shim)? {
+        return Some(Handoff::Vendor);
+    }
+    if is_link(&shim)? {
+        return Some(Handoff::Link(shim));
+    }
+    let text = crate::metadata_io::read_bounded_regular_utf8(&shim, MAX_SHIM_BYTES).ok()?;
+    // The shell's `read` keeps a carriage return, and its last matching line wins.
+    let raw = text
+        .split('\n')
+        .filter_map(|line| line.strip_prefix("exec '")?.strip_suffix("' \"$@\""))
+        .next_back()
+        .unwrap_or("");
+    if raw.is_empty() || raw.contains('\'') {
+        return Some(Handoff::Vendor);
+    }
+    let store = layout.program_current(harness).parent()?.to_path_buf();
+    let own_store = format!("{}/", store.to_str()?);
+    let live = if let Some(rest) = raw.strip_prefix(own_store.as_str()) {
+        let build = rest.split('/').next()?;
+        !build.is_empty()
+            && build.bytes().all(|byte| byte.is_ascii_digit())
+            && regular(&store.join(format!("{build}.ready")))?
+    } else {
+        regular(&layout.link_marker(harness))?
+    };
+    if !live || !executable(Path::new(raw))? {
+        return Some(Handoff::Vendor);
+    }
+    Some(Handoff::Script { shim, text })
 }
 
 fn quote_path(path: &Path) -> Option<String> {

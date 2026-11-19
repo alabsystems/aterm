@@ -43,7 +43,7 @@ impl NativeRequestStart {
 /// The deadline of a local file lock's bounded wait, `wait` from now (now itself, so one try,
 /// when that overflows). A lock wait is the native filesystem's, like the journal's
 /// [`aterm_uds::private_file::PrivateLock`]: no tape records or replays it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn lock_deadline(wait: Duration) -> std::time::Instant {
     let now = std::time::Instant::now();
     now.checked_add(wait).unwrap_or(now)
@@ -1370,6 +1370,19 @@ impl Fx {
         if self.tape != TapeMode::Credentialed {
             return Ok(answer());
         }
+        self.local_data(question, profile, answer)
+    }
+
+    /// Bounded noncredential local DATA observed by a native operation. Record
+    /// this door in either tape mode; replay never rereads the filesystem. This
+    /// answers no routing, identity, permission or native integrity question.
+    pub(crate) fn local_data(
+        &self,
+        question: &str,
+        binding: &str,
+        answer: &mut dyn FnMut() -> String,
+    ) -> Result<String> {
+        let profile = binding;
         match &self.seam {
             Seam::Live(_) => Ok(answer()),
             #[cfg(any(test, debug_assertions))]

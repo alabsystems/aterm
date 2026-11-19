@@ -495,6 +495,9 @@ fn family(at_ms: i64, cpu_mc: i64, read_bps: u64, footprint: u64) -> crate::spot
         shares: Vec::new(),
         volumes: None,
         volumes_age_ms: None,
+        store: None,
+        store_age_ms: None,
+        store_stale_ms: None,
         state: crate::spotlight::State::Idle,
     }
 }
@@ -528,16 +531,19 @@ fn the_spotlight_familys_cost_is_kept_in_the_history() {
                 cpu_mc: 200.0,
                 read_bps: 2_000_000.0,
                 footprint_max: Some(f64::from(700u32 << 20)),
+                index_bytes_max: None,
             },
             SpotlightBucket {
                 cpu_mc: 250.0,
                 read_bps: 0.0,
                 footprint_max: Some(f64::from(800u32 << 20)),
+                index_bytes_max: None,
             },
             SpotlightBucket {
                 cpu_mc: 25.0,
                 read_bps: 5_000_000.0,
                 footprint_max: Some(f64::from(900u32 << 20)),
+                index_bytes_max: None,
             },
         ]
     );
@@ -555,6 +561,30 @@ fn the_spotlight_familys_cost_is_kept_in_the_history() {
     unread.note(&r);
     let b = unread.day(T0 + 20_000)[FREE_BUCKETS - 1].expect("the CPU is read");
     assert_eq!((b.cpu_mc, b.footprint_max), (100.0, None));
+
+    // The index's size is kept where the root broker's walk read the store whole; a walk cut
+    // short is a lower bound and kept as none.
+    let store = |cut| crate::spotlight::Store {
+        volume: "/System/Volumes/Data".into(),
+        bytes: 3 << 30,
+        entries: 400,
+        cut,
+    };
+    let mut kept = SpotlightHistory::default();
+    let mut r = family(T0 + 10_000, 100, 0, 1 << 20);
+    r.store = Some(vec![store(None)]);
+    kept.note(&r);
+    r.store = Some(vec![store(Some(crate::spotlight::StoreCut::Time))]);
+    r.at_unix_ms += bucket;
+    kept.note(&r);
+    let kept_day = kept.day(T0 + bucket + 20_000);
+    assert_eq!(
+        (
+            kept_day[FREE_BUCKETS - 2].and_then(|b| b.index_bytes_max),
+            kept_day[FREE_BUCKETS - 1].and_then(|b| b.index_bytes_max)
+        ),
+        (Some(f64::from(3u32 << 30)), None)
+    );
 
     let saved = h.saved().expect("read");
     let back = SpotlightHistory::restored(&saved, now);

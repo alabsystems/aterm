@@ -47,6 +47,10 @@ pub enum AliasRoute {
     /// points each Mac's `ssh` login at, through a link it makes in its own scratch
     /// directory: it answers with the password `enroll` feeds `ssh`'s standard input.
     MachinesAskpass,
+    /// `aterm-unit-source`, `aterm pkg unit-source` under the name a Full Access Mac's build
+    /// front names to targo (DC-24b), through a link it makes in this Mac's state: targo starts
+    /// the program it is named with no arguments, so there is no room for a verb.
+    UnitSource,
     /// `amacs …`, aterm's editor (`aterm edit`, docs/DESIGN-amacs-2026-10-19.md §8.1): an alias
     /// because `$EDITOR` names one executable, which `git` and the rest run with the file and no
     /// room for a verb.
@@ -77,6 +81,7 @@ pub fn alias_route(argv0: &str, first: &str) -> AliasRoute {
         "aterm-drive" => AliasRoute::Drive,
         "aterm-askpass" => AliasRoute::Askpass,
         "aterm-machines-askpass" => AliasRoute::MachinesAskpass,
+        "aterm-unit-source" => AliasRoute::UnitSource,
         "aterm-link" => AliasRoute::Link,
         "aterm-open-url" => AliasRoute::OpenUrl,
         "amacs" => AliasRoute::Amacs,

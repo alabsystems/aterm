@@ -1606,14 +1606,133 @@ fn a_path_list_past_the_complete_read_bound_leaves_every_driver_selected() {
 #[cfg(unix)]
 #[test]
 fn an_attribute_field_larger_than_a_read_keeps_leaves_every_driver_selected() {
-    let drivers = |body: &str, at: &str| {
-        let body = format!("/bin/cat > /dev/null\n{body}");
-        read_by_stand_in(at, &body, |probe, top| {
-            probe.drivers_selected(top, b"a.bin\0".to_vec(), aterm_spec::wait::MUST_HAPPEN)
-        })
-    };
-    // NEGATIVE CONTROL: a flood of fields, each within the bound.
-    assert_eq!(drivers(FLOOD, "keep-attributes-many"), Some(Vec::new()));
     let runaway = format!("{FLOOD} | /usr/bin/tr '\\000' x");
-    assert_eq!(drivers(&runaway, "keep-attributes"), None);
+    for (body, tag, oversized) in [
+        (FLOOD, "keep-attributes-many", false),
+        (runaway.as_str(), "keep-attributes", true),
+    ] {
+        let env = isolated();
+        let repo = repo(tag);
+        let bin = Scratch::new(&format!("{tag}-bin"));
+        let probe = Probe {
+            env: &env,
+            program: stand_in_git(bin.0.path(), &format!("/bin/cat > /dev/null\n{body}")),
+        };
+        let read = probe.driver_selection_output(
+            repo.0.path(),
+            b"a.bin\0".to_vec(),
+            aterm_spec::wait::MUST_HAPPEN,
+        );
+        let detail = attribute_read_detail(&read);
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if oversized {
+                assert!(
+                    matches!(&read, Err(DriverSelectionFailure::Read {
+                        output: Err(aterm_uds::deadline::CompleteOutputError::StdoutTooLarge { limit }),
+                        input: Ok(()),
+                    }) if *limit == aterm_uds::deadline::OUTPUT_KEEP),
+                    "an oversized attribute field is refused for its size: {detail}"
+                );
+            } else {
+                // NEGATIVE CONTROL: the same two MiB, with every field within the bound.
+                assert!(
+                    matches!(&read, Ok(output) if output.stdout.is_empty()),
+                    "every empty attribute field is read, selecting no driver: {detail}"
+                );
+            }
+        }));
+        if let Err(panic) = checked {
+            retain_attribute_read_failure(repo, bin, &read);
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn attribute_read_detail(read: &Result<std::process::Output, DriverSelectionFailure>) -> String {
+    match read {
+        Ok(output) => format!(
+            "status={}; stdout_bytes={}; stderr_bytes={}",
+            output.status,
+            output.stdout.len(),
+            output.stderr.len()
+        ),
+        Err(error) => format!("{error:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn retain_attribute_read_failure(
+    repo: Scratch,
+    bin: Scratch,
+    read: &Result<std::process::Output, DriverSelectionFailure>,
+) -> (PathBuf, PathBuf) {
+    use std::io::Write as _;
+    // Keep both owned fixtures before fallible diagnostics; the original assertion unwinds.
+    let repo = repo.0.keep();
+    let bin = bin.0.keep();
+    let _ = std::fs::write(bin.join("attribute-read.txt"), attribute_read_detail(read));
+    let output = match read {
+        Ok(output)
+        | Err(DriverSelectionFailure::Read {
+            output: Ok(output), ..
+        }) => Some(output),
+        _ => None,
+    };
+    if let Some(output) = output {
+        let _ = std::fs::write(bin.join("attribute-stdout.bin"), &output.stdout);
+        let _ = std::fs::write(bin.join("attribute-stderr.bin"), &output.stderr);
+    } else {
+        let _ = std::fs::write(
+            bin.join("attribute-capture-unavailable.txt"),
+            "The collector returned no complete Output. No stdout/stderr EOF or natural exit is inferred.\n",
+        );
+    }
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "KEPT attribute-read repo={} bin={}",
+        repo.display(),
+        bin.display()
+    );
+    (repo, bin)
+}
+
+/// An unexpected read failure keeps its original owned fixture and available capture bytes.
+#[cfg(unix)]
+#[test]
+fn an_attribute_read_failure_keeps_its_fixture_and_capture() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let repo = Scratch::new("attribute-retention-repo");
+    let bin = Scratch::new("attribute-retention-bin");
+    std::fs::write(repo.0.path().join("owned"), b"fixture").unwrap();
+    let stdout = b"private-stdout\0\xff".to_vec();
+    let stderr = b"private-stderr\0\xfe".to_vec();
+    let read = Err(DriverSelectionFailure::Read {
+        output: Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+        }),
+        input: Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+    });
+    let detail = attribute_read_detail(&read);
+    assert!(!detail.contains("private-stdout"));
+    assert!(!detail.contains("private-stderr"));
+    let (repo, bin) = retain_attribute_read_failure(repo, bin, &read);
+    assert_eq!(std::fs::read(repo.join("owned")).unwrap(), b"fixture");
+    assert_eq!(
+        std::fs::read(bin.join("attribute-stdout.bin")).unwrap(),
+        stdout
+    );
+    assert_eq!(
+        std::fs::read(bin.join("attribute-stderr.bin")).unwrap(),
+        stderr
+    );
+    assert_eq!(
+        std::fs::read_to_string(bin.join("attribute-read.txt")).unwrap(),
+        detail
+    );
+    assert!(!bin.join("attribute-capture-unavailable.txt").exists());
+    std::fs::remove_dir_all(repo).unwrap();
+    std::fs::remove_dir_all(bin).unwrap();
 }

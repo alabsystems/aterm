@@ -766,6 +766,32 @@ pub(crate) struct SessionLog {
     /// [`Self::replace_log`].
     desc_own: Option<ShortId>,
     desc_creator: Option<ShortId>,
+    /// The built-in writers a claim's record stream stands down ([`StreamDown`]), as the
+    /// timeline last said them. Never carried: a successor's claim and stream say them again.
+    stream_down: StreamDown,
+    /// The compact step a `compact` record of the stream opened and none has closed yet, with
+    /// the holder whose record opened it ([`Self::stream_compact`]): only that holder's `done`
+    /// closes it, and it ends with the claim's feed ([`Self::end_stream_compact`]). Never
+    /// carried: a seamless update's successor, whose stream feeds nothing yet, closes a carried
+    /// one the same way as it adopts the log (its `reconcile`, reading the opener's `holder=`
+    /// from the step's open record).
+    stream_compact: Option<(Node, String)>,
+}
+
+/// WHICH BUILT-IN WRITERS STAND DOWN for the claim's record stream, per kind: while the stream
+/// feeds a kind its record is that kind's one row, so the built-in source writes none
+/// (`docs/HARNESS-CONTRACT.md`, "The `usage`, `account`, `progress`, `goal` and `compact`
+/// records"). The timeline keeps it in step with its current-state record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamDown {
+    /// `usage`: the usage tap's `mark - usage` and the context-left mark, whole, whatever parts
+    /// the latest record states. The stand-down is by kind (D29): a part the record leaves
+    /// unsaid is not written by the built-in source beside it, so no kind has two writers.
+    pub(crate) usage: bool,
+    /// `goal`: the goal's on and off edges.
+    pub(crate) goal: bool,
+    /// `compact`: the transcript's compact step.
+    pub(crate) compact: bool,
 }
 
 /// A person's gesture as [`SessionLog::person_input`] takes it from the seam (`crate::app_input::note_person_reaching`): the number of the gesture when it opened a burst (`HumanInputStamp::note_reaching`), and whether it reached the program ([`crate::human_input::reaches_program`]).
@@ -863,6 +889,8 @@ impl SessionLog {
             spend: tab::TabSpend::default(),
             desc_own: None,
             desc_creator: None,
+            stream_down: StreamDown::default(),
+            stream_compact: None,
         }
     }
 }

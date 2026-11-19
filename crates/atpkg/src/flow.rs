@@ -1798,7 +1798,7 @@ pub fn install_harness_build(
     install_tools_env(layout, &build_dir, &tools, Aliases::Off, &env)
         .map_err(|e| FlowError::Activate(e.to_string()))?;
     let persons = crate::pin::is_pinned(layout, program).unwrap_or(false)
-        && !crate::pin::is_held(layout, program).unwrap_or(false);
+        && !crate::pin::is_held(layout, program);
     if !persons {
         crate::pin::set_pinned(layout, program, true)
             .and_then(|_| crate::pin::set_held(layout, program, true))

@@ -552,18 +552,22 @@ pub(crate) enum Mutant {
     /// the node waits while it lasts. Its witness is a real broker's
     /// (`bridge::tests::a_fence_whose_told_read_cannot_be_dialled_holds_its_record_for_its_session_alone`).
     DropTheLinkAtAnUnreadFence,
-    /// A record held unjudged (`Bridge::judge_waits`) is tried again at every delivery of held
-    /// records (`Bridge::deliver_held`), not at the held back-off's next try alone, and the pass
-    /// stops at it (with no wait to pass it by, it would be picked again): while the told reader
-    /// is refused at the broker's connection cap, every pass of the loop dials it again. Its
-    /// witness is a real broker's, the dials counted
+    /// A record held unjudged (`Bridge::judge_waits`) is tried again at every release of held
+    /// records (`Bridge::release_held`: the loop's, `Bridge::deliver_held`, and the attach's
+    /// that makes room in hand, `Bridge::make_room_in_hand`), not at the held back-off's next
+    /// try alone, and the release stops at it (with no wait to pass it by, it would be picked
+    /// again): while the told reader is refused at the broker's connection cap, every pass of
+    /// the loop dials it again, and inside the attach the lanes behind it are not released. Its
+    /// witness, a real broker's with the dials counted, drives the loop's release
     /// (`bridge::tests::a_fence_whose_told_read_cannot_be_dialled_holds_its_record_for_its_session_alone`).
     JudgeAtEveryPass,
-    /// A delivery of held records (`Bridge::deliver_held`) stops at a release held again
-    /// unjudged, as at any record held again: another session's record the same try freed (its
-    /// entry ended at that try's drain) waits for a later pass, the next mailbox record or the
-    /// roster's refresh, and every try repeats it while the judging read fails. Its witness is a
-    /// real broker's
+    /// A release of held records (`Bridge::release_held`: the loop's, `Bridge::deliver_held`,
+    /// and the attach's that makes room in hand, `Bridge::make_room_in_hand`) stops at a record
+    /// it held again unjudged, as at any record held again: another session's record the same
+    /// try freed (its entry ended at that try's drain) waits for a later pass, the next mailbox
+    /// record or the roster's refresh, and every try repeats it while the judging read fails;
+    /// inside the attach, no lane past it is released to make room. Its witness, a real
+    /// broker's, drives the loop's release
     /// (`bridge::tests::a_release_held_unjudged_again_lets_another_sessions_held_mail_go`).
     StopAtAnUnjudgedRelease,
     /// A record held unjudged keeps its wait once what it waited on is decided
@@ -698,10 +702,13 @@ pub(crate) enum Mutant {
     /// remint met under the witness an attach refused after the move left on that log proves
     /// nothing from them, and aterm forgets what it holds; the same move met again drops them.
     MovedSamplesUnpinned,
-    /// A record held in hand keeps the mark of the inbox group's tail that took it across a new
-    /// subscription of the group (`Bridge::subscribe_inbox`): released after the attach, it is
-    /// accounted against the inbox commit, which passes a record that tail took and did not
-    /// hand before the new tail offers it again.
+    /// A record held in hand keeps the mark of the inbox group's tail that took it across the
+    /// attach that closes that tail's subscription (`Bridge::forget_the_tails_marks`): released
+    /// inside the attach, where its refill makes room, or after it, it is accounted against the
+    /// inbox commit, which passes a record that tail took and did not hand before the new tail
+    /// offers it again. Witnesses: the asking world with fetches' seed 7179 (after the attach),
+    /// and bridge's
+    /// `a_release_inside_the_attach_owes_no_commit_past_what_the_new_tail_has_yet_to_take`.
     HeldTailKeptAcrossAResubscribe,
     /// A held record released unmarked (`Bridge::deliver_held`) and not taken by aterm (owed, or
     /// its control lost) does not floor the inbox commit, which a commit the earlier tail owed
@@ -903,7 +910,8 @@ pub(crate) enum Mutant {
     /// re-post under the key is published as a further copy of it.
     KeyedWinnerNotReadPastACut,
     /// Replay by dedup sequence instead of journal publication order: a keyed re-post can
-    /// pass an earlier post when both surviving entries are published onto another log.
+    /// pass an earlier post when both surviving entries are published onto another log. Bridge's
+    /// `replay_holds_an_older_sequence_behind_a_refused_publication` holds it on one log too.
     ReplayBySequence,
     /// An in-flight entry journaled on a log before ANOTHER LOG is read back from nowhere on it
     /// (`Bridge::read_back_from`'s `None`), so a copy an earlier replay on this log published,
@@ -938,7 +946,9 @@ pub(crate) enum Mutant {
     /// Another log's drop of the mirror's pin is written under the pin's fence alone, not on the
     /// media (`Bridge::write_dropped_pin`), as every build before ATERM-KI-1111-4's seed 355: a
     /// power cut brings the old log's window ledger back under the new log's witness, and the
-    /// window budget holds the mirror on offsets the new log's oldest stays below.
+    /// window budget holds the mirror on offsets the new log's oldest stays below. Witness:
+    /// bridge's `another_logs_drop_of_a_pin_holding_a_window_ledger_is_written_on_the_media` (no
+    /// seed of `lossy_logs_light_rebase` to 60,000 since ATERM-KI-1116-7314's told rows).
     DroppedPinUnderTheFence,
     /// The log the self-lane window's `acked` file names is unread, as every build before the
     /// lossy-log world's seed 3483: a load whose bus-log witness a power cut tore knows no log
@@ -964,17 +974,22 @@ pub(crate) enum Mutant {
     /// goes
     /// (`a_log_reminted_keeping_its_records_never_settles_a_post_on_an_earlier_one_of_the_same_words`).
     ReadBackAnywhereByWords,
-    /// A read back on a log that continues none starts at the head this node read when it met
-    /// that log (`LogWitness::met`, and a pin's head at the head the attach read in
-    /// `StateDir::publication_offset_resets`), as every build from critic review F1 to
-    /// ATERM-KI-1114-1414 started it, not anywhere: an attempt whose record a carried cut kept
-    /// below that head, its dedup key dropped, on a log astream reminted keeping its records,
-    /// goes unread, and the retry or the replay lands a second copy.
+    /// A read back on a log that continues none starts at the head the attach read when it met
+    /// that log, as every build from critic review F1 to ATERM-KI-1114-1414 started it, not
+    /// anywhere: a pin's head goes there (`StateDir::publication_offset_resets`), and every
+    /// entry in flight but a reply's is re-witnessed onto that log there, as a keyed re-post's
+    /// is (`StateDir::rewitness_in_flight`, `StateDir::heads_at_the_attach`). An attempt
+    /// whose record a carried cut kept below that head, its dedup key dropped, on a log astream
+    /// reminted keeping its records, goes unread, and the retry or the replay lands a second
+    /// copy. Its control is a bridge unit test on a real broker, an entry in flight and a pin
+    /// alone (`a_log_reminted_keeping_a_carried_attempt_settles_it_where_it_landed`).
     ReadBackFromTheAttachHead,
     /// A read back on a log that continues none that cannot say whether a row of the post's
     /// words is its own (no origin the broker stamps, no told read below a floor, a page that
     /// does not advance) answers that none landed, and the post is published again at its pin,
     /// not held (`Bridge::found_anywhere`'s case 6 of `Bridge::unverified_publication`).
+    /// Witness: the reminted stampless world's seed 334 (`dup`), and bridge's
+    /// `an_anywhere_read_whose_origin_the_broker_cannot_say_settles_its_post_at_the_record_it_takes`.
     AnywhereUntoldPublishes,
     /// A read back from anywhere passes a row of the post's words at its sequence under a
     /// producer of no node it knows while the mesh's hand-off, which names the nodes this Mac
@@ -990,13 +1005,14 @@ pub(crate) enum Mutant {
     /// A re-base's witness is written as any other witness is, not on the media
     /// (`Bridge::save_log_witness`, `StateDir::rebase_log_witness`), as every build before critic
     /// review F1: a power cut may bring back the witness of the log before it, and the next attach
-    /// meets the log again at a later head, above the copies the replay published there. No
-    /// seeded world breaks a law by this alone; its control is a bridge unit test whose state dir
-    /// is on a simulated device
-    /// (`a_rebase_onto_another_log_stays_met_below_the_replays_copy_through_a_power_cut`). The
-    /// re-base on the media, written after the attach drops the mirror's pin, puts that drop on
-    /// the media too, so [`Mutant::DroppedPinUnderTheFence`] is pinned in a lossy-log world with
-    /// this on (the sim's `lossy_logs_light_rebase`).
+    /// judges the log replaced again and puts a keyed re-post's pin at a later head, above the
+    /// copy the replay published there. No seeded world breaks a law by this alone; its control
+    /// is a bridge unit test whose state dir is on a simulated device
+    /// (`a_rebase_onto_another_log_keeps_a_keyed_pin_below_the_replays_copy_through_a_power_cut`).
+    /// The re-base on the media, written after the attach drops the mirror's pin, puts that drop on
+    /// the media too, so [`Mutant::DroppedPinUnderTheFence`] was pinned in a lossy-log world with
+    /// this on (the sim's `lossy_logs_light_rebase`) until ATERM-KI-1116-7314's told rows moved
+    /// every trajectory; a bridge unit test is its control since.
     RebaseWitnessUnflushed,
     /// A log astream gave another id keeping its records is never proved to continue the one
     /// before (`Bridge::prove_remint`), as every build before ATERM-KI-1116-7314: the attach
@@ -1006,7 +1022,8 @@ pub(crate) enum Mutant {
     /// The told samples are written once aterm answered the line that offers them, not before it
     /// goes (`Bridge::flush_told`): a bridge killed between aterm's answer and the write leaves
     /// samples below a record aterm was shown, a later proof's fork falls below it, and it is
-    /// shown again.
+    /// shown again. A fetch's sample the same, written once its lines went (`Bridge::answer_fetch`;
+    /// bridge's `a_record_a_fetch_hands_aterm_is_sampled_as_told_before_its_lines_go`).
     ToldAfterTheHand,
     /// The proof takes a record of a sample's subject at its offset without comparing its bytes
     /// (`Bridge::prove_remint`): a log set aside whose new records reach a sample's offset proves
@@ -1017,6 +1034,111 @@ pub(crate) enum Mutant {
     /// goes unread, a lower sample proves a fork below it, and what aterm was shown between is
     /// shown again.
     UndecidedSampleSkipped,
+    /// A note keeps each subject's newest record told alone (`Bridge::note_told`,
+    /// `ToldSamples::note_newest_of_each_subject_only`), as every build before: a power loss cuts
+    /// the log below a subject's newest record, astream reminting it, and the proof skips that
+    /// row above the new head, so it proves a fork below the older record of the subject aterm
+    /// holds, which aterm forgets and is offered again. Witness: the reminted world's seed 184
+    /// (`dup delivery`), and bridge's
+    /// `a_subjects_older_record_told_proves_a_remint_whose_head_fell_below_its_newest`.
+    ToldNewestOfEachSubjectOnly,
+    /// A lineage move drops every row of a subject whose newest row lies at or above its fork
+    /// (`Bridge::forget_log_offsets`, `ToldSamples::drop_subjects_moved_past`), as every build
+    /// before's move dropped that subject: the older record of it aterm holds below the fork is
+    /// no row, a later remint proves a fork below it, and aterm is offered it again. No seed of
+    /// 1..=1,000 of the reminted, stampless, fetching or keyed reminted worlds breaks a law with
+    /// it on that holds every law with every rule on (2026-11-18; each that breaks a law with
+    /// every rule on breaks one with it on too); its witness is bridge's
+    /// `a_lineage_move_keeps_a_subjects_rows_below_its_fork_where_its_newest_lies_above_it`.
+    MovedDropsTheSubject,
+    /// The cap on the told rows evicts the lowest row, a subject's newest among them
+    /// (`ToldSamples::note_evicting_anchors`): a busy subject's rows take a quiet subject's
+    /// only one, which `told-samples` (the file every build before reads) then names no more. No
+    /// seeded world tells enough records; its witness is state's
+    /// `the_told_rows_keep_each_subjects_newest_past_the_row_cap`.
+    ToldRowsEvictASubjectsNewest,
+    /// The proof refuses the step at a row that reads another record or none
+    /// (`Bridge::prove_remint`), as every build before: a told record a power loss took off the
+    /// log's tail, another record (a will) landing at its offset before the attach, leaves aterm
+    /// to forget every offset it holds, below the cut too. Witness: the reminted world's seed
+    /// 122 (`dup delivery`), and the fetching one's 112.
+    ProofRefusedAtAMismatch,
+    /// The proof counts a match above a row that reads another record (`Bridge::prove_remint`):
+    /// a record published since in a told record's own words at that record's offset keeps the
+    /// offsets below it, the replaced one among them, whose new record aterm then never takes.
+    /// No seed of 1..=1,000 of the reminted or stampless worlds breaks a law with it on that
+    /// holds every law with every rule on (2026-11-18); its witness is bridge's
+    /// `a_told_records_copy_above_a_mismatch_proves_nothing_past_it`.
+    ProofPastAMismatch,
+    /// The proof reads every told row on the link (`Bridge::prove_remint`), as every build
+    /// before, not through the grant that reaches it (`Bridge::proof_read`): a row of the lane of
+    /// a node this Mac held before a key rotation, or of the fleet a dir served before the mesh,
+    /// is one the link's ring does not read, so a guarded broker refuses the read, the link drops
+    /// and the attach is refused, at every attach for good. No seed reaches it: the sim's ring is
+    /// empty and its node never renamed, so every row is in reach. Its witness is bridge's
+    /// `a_told_row_of_a_node_before_a_key_rotation_is_read_through_the_grant_that_reaches_it`.
+    ProofReadsEveryRowOnTheLink,
+    /// A told row no grant this bridge holds reads stops the proof (`Bridge::prove_remint`), not
+    /// passed over as a cut one is: after a key rotation the old node's rows are the lowest, so a
+    /// row of the new node's above them proves nothing and aterm forgets what it holds. No seed
+    /// reaches it: the sim's ring is empty and its node never renamed, so every row is in reach.
+    /// Its witness is bridge's
+    /// `a_told_row_of_a_node_before_a_key_rotation_is_read_through_the_grant_that_reaches_it`.
+    UnreachableRowStopsTheProof,
+    /// A told row read under the node service's reader's ring that holds no record of its
+    /// subject at its offset is no evidence (`Bridge::proof_read`), as `Bridge::held_record`
+    /// answers it `None`, not a mismatch that stops the walk: a log set aside whose new records
+    /// hold another subject at an old node's row proves a fork past it from a row above it. No
+    /// seed reaches it: the sim's ring is empty and its node never renamed, so every row is read
+    /// on the link. Its witness is bridge's
+    /// `a_told_row_of_a_node_before_a_key_rotation_is_read_through_the_grant_that_reaches_it`.
+    HeldMismatchIsNoEvidence,
+    /// A told row's read under the node service's reader's ring that the broker refuses for good
+    /// (`ERR_UNAUTHORIZED`, `ERR_BAD_FILTER`: `bridge::read_refused_for_good` answers false) is
+    /// an error that refuses the attach (`Bridge::proof_read`), not no evidence: a reader's ring
+    /// minted under a secret the root no longer holds is refused at its attach, and every attach
+    /// meets the row again, so the attach is refused for good. No seed reaches it: the sim's ring
+    /// is empty and its node never renamed, so every row is read on the link. Its witness is
+    /// bridge's
+    /// `a_told_row_of_a_node_before_a_key_rotation_is_read_through_the_grant_that_reaches_it`.
+    ReaderRefusalRefusesTheAttach,
+    /// A bridge starts from `told-samples` alone (`Bridge::told_at_start`, which `Bridge::new`
+    /// reads its rows through, `StateDir::told_samples_alone`), as every build before read it: a
+    /// row the anchors stopped naming in an earlier run (its subject told again since) proves
+    /// nothing, and a remint whose head fell below the newer record proves a fork below it.
+    /// Witness: the reminted world's seed 184 (`dup delivery`), and bridge's
+    /// `a_subjects_older_record_told_proves_a_remint_whose_head_fell_below_its_newest`.
+    ToldHistoryUnread,
+    /// The told rows' two files are written the anchors first (`StateDir::set_told_samples`):
+    /// a refused or killed second write of a move's flush leaves `told-samples` of the move beside
+    /// `told-history` of the log before it, one move behind them, which no read accepts, so the
+    /// rows below the fork that are no anchor are on no file read. No seed of 1..=1,000 of the
+    /// reminted or stampless worlds breaks a law with it on that holds every law with every rule
+    /// on (2026-11-18); its witness is state's
+    /// `a_refused_second_told_write_keeps_every_row_on_the_disk`.
+    ToldHistoryWrittenLast,
+    /// `told-history` is read beside `told-samples` whatever log and move it names
+    /// (`StateDir::told_samples`): a history a reset or a build before left of another log
+    /// passes its rows for records of this one. Its witness is state's
+    /// `a_told_history_of_another_log_is_never_read_beside_the_samples`.
+    ToldHistoryOfAnotherHeader,
+    /// `told-history` is read beside `told-samples` only under the same log and move
+    /// (`StateDir::told_samples`, `ToldSamples::union_of_the_same_header`), as the first cut of
+    /// ATERM-KI-1116-7314's told rows read it: a move's flush whose samples' write is refused or
+    /// killed after the history's leaves the history one move ahead of the samples, its rows
+    /// below the fork on the disk under a header no read accepts, and the move met again keeps
+    /// the anchors alone. No seed of 1..=1,000 of the reminted or stampless worlds breaks a law
+    /// with it on that holds every law with every rule on (2026-11-18); its witness is state's
+    /// `a_refused_second_told_write_keeps_every_row_on_the_disk`.
+    ToldHistoryOfTheMoveAheadUnread,
+    /// `told-history` holds the rows that are no anchor alone (`StateDir::set_told_samples`,
+    /// `ToldSamples::render_history_without_the_anchors`), as the first cut of
+    /// ATERM-KI-1116-7314's told rows wrote it: a move makes a row below its fork an anchor that
+    /// the samples on the disk do not name, so a refused or killed samples' write after the
+    /// history's leaves it on neither file. No seed of 1..=1,000 of the reminted or stampless
+    /// worlds breaks a law with it on that holds every law with every rule on (2026-11-18); its
+    /// witness is state's `a_refused_second_told_write_keeps_every_row_on_the_disk`.
+    ToldHistoryWithoutTheAnchors,
     /// A proved step is not read where astream's lineage would be (`Bridge::read_back_from`,
     /// `StateDir::forget_log_offsets_proved`): a reply in flight kept on the log before is
     /// dropped as decided there, and a head kept there reads back from anywhere.
@@ -1031,13 +1153,125 @@ pub(crate) enum Mutant {
     ProvedHeadToTheFork,
     /// A keyed re-post's head above a proved fork goes where a head on a log that continues none
     /// goes, as every build before ATERM-KI-1114-1414's own head took it, not to its own head
-    /// (`state::Head::OwnFrom`): an entry's reads from the head the node met the log at
-    /// (`Bridge::read_back_from`'s `keyed_floor`), a pin's from the head the attach read
-    /// (`StateDir::publication_offset_resets`), a keyed reply's in flight from anywhere. Its own
-    /// attempt, which a carried cut kept below that head, its dedup key dropped, goes unread:
-    /// the re-post is retired `dup=1` at its key's winner, or published again, the key's second
-    /// record.
-    ProvedKeyedHeadAtTheMeeting,
+    /// (`state::Head::OwnFrom`): a pin's to the head the attach read
+    /// (`StateDir::publication_offset_resets`), an entry's in flight re-witnessed onto the proved
+    /// log there (`StateDir::rewitness_in_flight`), a keyed reply's in flight anywhere.
+    /// Its own attempt, which a carried cut kept below that head, its dedup key dropped, goes
+    /// unread: the re-post is retired `dup=1` at its key's winner, or published again, the key's
+    /// second record. Its controls are bridge unit tests on a proved remint
+    /// (`a_keyed_reposts_own_attempt_above_its_own_head_settles_there_across_a_proved_step`) and
+    /// a state test of the seam
+    /// (`a_head_above_a_proved_fork_reads_as_on_a_log_that_continues_none`).
+    ProvedOwnHeadAtTheAttach,
+    /// A keyed re-post's head above a proved fork that is not its own (a plain `From`) reads from
+    /// the fork by its words alone (`Bridge::read_back_from`), as every build before
+    /// ATERM-KI-1114-1414's step S6 read it from the node's meeting with the log's line, there
+    /// the fork, not from itself by its words and its origin (`state::Head::Since`): the remint
+    /// kept the records past the fork at their offsets and the proved log's claims start empty,
+    /// so a sender's earlier post of the same words at another sequence, between the fork and
+    /// the head, is taken for the entry's attempt, the post settled there and never published
+    /// (C2 of the step's map). Its controls are bridge unit tests on a proved remint
+    /// (`a_keyed_plain_head_above_a_proved_fork_never_settles_on_another_sequences_record`,
+    /// `a_keyed_plain_head_above_a_proved_fork_settles_at_its_own_attempt_above_another_sequences_record`).
+    KeyedFromHeadToTheFork,
+    /// A keyed re-post's entry in flight on a log the attach's log continues none of stays on
+    /// that log (`StateDir::rewitness_in_flight`), as every build before
+    /// ATERM-KI-1114-1414's step S6 kept it, not re-witnessed onto the attach's log at the head
+    /// the attach read (`StateDir::rewitnessed_entry`): with no meeting to start from, its read
+    /// back reads nothing, and a copy the replay published there, its answer lost and its dedup
+    /// key cut, is published again, the key's second record. Its control is a bridge unit test
+    /// (`a_keyed_entry_kept_on_another_log_is_read_back_where_the_attach_met_this_one`).
+    KeyedEntryKeptOnItsLog,
+    /// The meeting an older build's witness names (`state::LogWitness::older_meeting`) is not
+    /// read at the first attach (`Bridge::rewitness_at_an_older_meeting`): a keyed re-post's
+    /// entry that build kept on another log stays there, the attach's pass puts it at the head
+    /// the attach read (`Bridge::rewitness_in_flight`), above a copy that build's replay
+    /// published above the meeting, and with that copy's dedup key cut it is published again,
+    /// the key's second record. Its control is a bridge unit test on an older build's witness,
+    /// through the attach (`an_older_builds_meeting_re_witnesses_its_keyed_entry_once`).
+    OlderMeetingUnread,
+    /// A keyed re-post's entry kept on another log is re-witnessed onto the log an attach read
+    /// where the attach forgets the log before (`Bridge::forget_log_offsets`), before its
+    /// witness moves, as the first build of ATERM-KI-1114-1414's step S6 made it, not once the
+    /// witness names that log (`Bridge::rewitness_in_flight`): an attach refused after it leaves
+    /// the entry on the media on a log the witness does not name, kept there only by its own log
+    /// (`state::InFlight::own_log`), which the next attach, back on that log, puts it back on;
+    /// with `OwnLogForgotten` too (`Fx::os_without_each`) that attach reads it from that log's
+    /// head, above the attempt a carried cut kept, and publishes the key's second record. Its
+    /// control is a bridge unit test of a refused attach, which reads the journal that attach
+    /// leaves and, with both rules off, the face
+    /// (`a_refused_attach_leaves_a_keyed_entry_on_its_own_log`).
+    RewitnessBeforeTheWitness,
+    /// An attach that judged no log replaced re-witnesses no keyed re-post's entry kept on another
+    /// log (`Bridge::rewitness_in_flight`), as the forget that re-witnesses a reply's runs only at
+    /// a re-base (`StateDir::forget_log_offsets_proved`), not at every attach: an entry kept
+    /// there where no witness named a log, or one a build from before critic review F1 kept, its
+    /// witness naming this log and no meeting (where every build from F1 met the log at its first
+    /// attach), stays, its read back reads nothing, and a copy the replay published, its answer
+    /// lost and its dedup key cut, is published again, the key's second record. Its control is a
+    /// bridge unit test of both
+    /// (`an_attach_re_witnesses_a_keyed_entry_kept_on_another_log_at_its_head`).
+    RewitnessOnlyWhereReplaced,
+    /// A proved step stays on the generation it was proved on (`Bridge::carry_proved_steps`),
+    /// not carried onto each later generation an attach reads (`state::Proved::carried`): once
+    /// astream's lineage window passes that generation no step reaches the log, and a keyed
+    /// re-post's entry kept on the log before the step is re-witnessed at the attach's head,
+    /// above a copy its replay published past the step. Its control is a bridge unit test of
+    /// lineage moves past the window
+    /// (`a_proved_step_follows_its_log_past_the_lineage_window`, and through the attach,
+    /// `an_attach_carries_a_proved_step_onto_a_moved_generation_on_the_media`).
+    ProvedStepLeftOnItsGeneration,
+    /// A proved step carried onto a later generation keeps its fork (`state::Proved::carried`),
+    /// as the second build of ATERM-KI-1114-1414's step S6 carried it, its head brought down
+    /// below the fork where the generation continues the step's log below it, which the media
+    /// holds as the fork (`state::Proved::render_head`): after a restart, or the next proof
+    /// re-reading the steps, the step reaches its log down to the fork again, and a keyed
+    /// re-post's own head between the move's fork and the step's stands above records published
+    /// since the move. Its controls are a state unit test that reopens the state dir
+    /// (`a_proved_step_is_carried_onto_each_later_generation_its_logs_lineage_continues`) and a
+    /// bridge unit test through the attach
+    /// (`an_attach_carries_a_proved_step_onto_a_moved_generation_on_the_media`).
+    CarriedStepKeepsItsFork,
+    /// A keyed re-post's entry an attach moves onto a log that continues none of its own keeps
+    /// no own log (`state::InFlight::own_log`, `StateDir::rewitnessed_entry`, the seam
+    /// `StateDir::own_logs_forgotten`), as the second build of ATERM-KI-1114-1414's step S6
+    /// moved it: an attach refused or killed after the move, or whose replay's answer was lost,
+    /// then an attach back on the entry's own log puts it at that log's head, above the attempt
+    /// a carried cut kept there, its dedup key dropped, and it is published again, the key's
+    /// second record; and an entry an older build's meeting moved
+    /// (`StateDir::rewitness_at_an_older_meeting`), its own head above a stored proved step's
+    /// fork, stays at the meeting's head, below that fork, where its read back by its words alone
+    /// takes an earlier post's record of its words at another sequence for its attempt, the post
+    /// settled there and never published. Its controls are a bridge unit test of each schedule
+    /// (`a_keyed_entry_moved_off_its_own_log_goes_back_to_its_own_head_there`), one on an older
+    /// build's witness across a proved remint
+    /// (`an_older_builds_meeting_leaves_a_keyed_entry_a_proved_step_reaches`), and a state unit
+    /// test (`an_entry_moved_off_its_own_log_goes_back_where_a_log_reaches_it`).
+    OwnLogForgotten,
+    /// A keyed re-post's entry an attach puts back on its own log (`StateDir::rewitnessed_entry`)
+    /// goes back alone: its post's reservation keeps the head the attach's forget put it at
+    /// (`StateDir::publication_offset_resets`), as the third build of ATERM-KI-1114-1414's step
+    /// S6 left it, not the head its entry's pin stands at there (`StateDir::own_pins_back`). After
+    /// an attach killed once its pass moved the entry onto a log that continues none of its own,
+    /// the attach back to its own log, judged replaced, puts the reservation at that log's head,
+    /// above the attempt a carried cut kept there, its dedup key dropped: the replay settles the
+    /// entry at the attempt from its own head, and the drain's retry of the post aterm still lists
+    /// reads from the reservation's head, finds none, and publishes the key's second record. Its
+    /// control is a bridge unit test's `killed` schedule alone, aterm listing the post
+    /// (`a_keyed_entry_moved_off_its_own_log_goes_back_to_its_own_head_there`, its `pin-left`
+    /// arm): on its `lost` and `restart` schedules the retry settles with the rule off too.
+    OwnLogPinLeft,
+    /// An older build's meeting moves only the keyed entries the log the attach reads continues
+    /// by neither astream's lineage nor a stored proved step
+    /// (`StateDir::rewitness_at_an_older_meeting`), as the second build of ATERM-KI-1114-1414's
+    /// step S6 judged them, against a log the attach may yet be refused before its witness names,
+    /// not by the witness alone: the meeting is used up all the same, and an entry the first
+    /// attach left on the log it read, refused before its witness moved, is put at the head the
+    /// next attach read on the witnessed log, above a copy that build's replay published above the
+    /// meeting, its dedup key cut, and published again, the key's second record. Its control is a
+    /// bridge unit test of a refused first attach
+    /// (`an_older_builds_meeting_is_judged_by_its_witness_not_by_a_refused_attachs_log`).
+    OlderMeetingJudgedOnTheAttachsLog,
     /// A keyed re-post on a proved log whose own head is known (`state::Head::OwnFrom`) tells its
     /// own attempt from its key's earlier records by order, as where no own head is known
     /// (`Bridge::keyed_winner_on_a_proved_log`), not by where each stands
@@ -1075,8 +1309,9 @@ pub(crate) enum Mutant {
     OwnHeadReadAnywhereUntold,
     /// A keyed re-post's own head (`state::Head::OwnFrom`) is read from anywhere on a broker
     /// that tells fetches but takes no ask for origins (`Bridge::found_since`,
-    /// `Bridge::read_anywhere`'s `AnywhereRead::NoOrigins`), as `state::Head::Anywhere` is: no
-    /// row of its words names an origin there, so the read answers case 6 of
+    /// `Bridge::read_anywhere`'s `AnywhereRead::Undecided` with `no_origins`), as
+    /// `state::Head::Anywhere` is: no row of its words names an origin there, so the read
+    /// answers case 6 of
     /// `Bridge::unverified_publication` at every retry, and the keyed sender is held for good.
     OwnHeadReadAnywhereUnstamped,
     /// A keyed re-post's own head (`state::Head::OwnFrom`) across a proved step is not brought
@@ -1119,6 +1354,199 @@ pub(crate) enum Mutant {
     /// its tell, its witness still on the log before, proves again from samples that lag what
     /// the first read and tells a fork below the one aterm keeps.
     ProvedStepRecomputed,
+    /// A connection asks for origins only with the mesh on (`Bridge::connect`), as every build
+    /// before ATERM-KI-1114-1414's delivery gate: a delivery names no origin, so where no read
+    /// from anywhere ran whole the gate takes a sender's earlier post of the same words for the
+    /// attempt (`Bridge::take_undecided`). No sim seed (none of the reminted world to 1,000 that
+    /// holds every law with every rule on); its witness is bridge's
+    /// `a_link_with_the_mesh_off_asks_for_origins`.
+    LinkAsksNoOrigins,
+    /// A read from anywhere that cannot decide names none of the candidates it read
+    /// (`Bridge::read_anywhere`'s `seen`), as every build before the delivery gate named none: the
+    /// delivery takes the first record of the words for the attempt, a sender's earlier post of the
+    /// same words among them. No sim seed of the reminted stampless world to 1,000 breaks a law
+    /// with it off that holds with every rule on (2026-11-18: 424, 654 and 914, which break
+    /// `dup post` with every rule on, break a law with it off too); its witness is bridge's
+    /// `an_anywhere_read_whose_origin_the_broker_cannot_say_settles_its_post_at_the_record_it_takes`.
+    UndecidedSeenUncollected,
+    /// No delivery takes a record of an attempt no read from anywhere decided
+    /// (`Bridge::take_undecided`), as every build before the delivery gate: the record is handed
+    /// while its post stands at its pin, and once a cut or a log set aside gave it up the retry
+    /// reads nothing back and publishes it again, which the reader is handed too. Witness: the
+    /// reminted stampless world's seed 6 (`dup`), and bridge's
+    /// `a_case_six_hold_hands_its_post_once_across_the_cut_that_gives_its_records_up` beside
+    /// `Mutant::UndecidedInHandUnseen`, whose take of the live tail's queued copy masks it there.
+    UndecidedHandedUnheld,
+    /// The delivery gate reads no origin (`undecided_takes`): where no read ran whole, a sender's
+    /// earlier post of the same words, of another sequence, is taken for the attempt. No sim
+    /// seed (none of the reminted world to 1,000 that holds every law with every rule on); its
+    /// witnesses are bridge's
+    /// `the_delivery_gate_takes_an_undecided_attempts_record_by_its_origin_else_by_the_newest_seen`
+    /// and `the_delivery_gates_call_site_holds_each_of_its_rules`.
+    UndecidedTakesPastItsOrigin,
+    /// The delivery gate takes the first record of the attempt's words (`undecided_takes`), not
+    /// the newest the read saw: a sender's earlier post of the same words is taken for the
+    /// attempt. No sim seed (none of the reminted stampless world to 1,000 that holds every law
+    /// with every rule on); its witnesses are bridge's
+    /// `the_delivery_gate_takes_an_undecided_attempts_record_by_its_origin_else_by_the_newest_seen`
+    /// and `the_delivery_gates_call_site_holds_each_of_its_rules`.
+    UndecidedTakesTheFirst,
+    /// The attach reads no pin whose head is anywhere before its refill
+    /// (`Bridge::arm_undecided_pins`): only the drain's retry arms it, after the refill handed
+    /// its record, and a cut that then gave it up leaves the retry nothing to read back, so it
+    /// publishes again. No sim seed (none of the reminted stampless world to 3,000 that holds
+    /// every law with every rule on); its witness is bridge's
+    /// `a_case_six_hold_hands_its_post_once_across_the_cut_that_gives_its_records_up`, the arm
+    /// whose post has no in-flight entry, beside `Mutant::UndecidedInHandUnseen`, which masks it
+    /// there.
+    UndecidedArmedByTheDrain,
+    /// A fetch hands a record a delivery would take for an undecided attempt's drain
+    /// (`Bridge::fetch_record`): the session reads it while its post stands at its pin, and past
+    /// a cut the retry publishes it again. No sim seed (none of the reminted stampless world with
+    /// fetches to 3,000 that holds every law with every rule on); its witness is bridge's
+    /// `a_fetch_holds_back_a_record_a_delivery_would_take_for_an_undecided_attempt`.
+    UndecidedFetched,
+    /// A read from anywhere no origin can decide on a broker that takes no ask for origins, of a
+    /// lane no delivery of this bridge's reaches (a person's, a peer node's), holds the post as
+    /// on a broker that stamps (`Bridge::found_anywhere`): no read ever decides, and it waits
+    /// for good. Witness: the reminted stampless world's seed 53 (`liveness`: a post to
+    /// `h-alice` retried at every back-off and never retired).
+    UnstampedUnreachableHolds,
+    /// A fetch notes no told sample of the record it hands aterm (`Bridge::fetch_record`), as
+    /// every build before it: a later proof's fork falls below it, and it is shown again.
+    /// Witness: the reminted stampless world with fetches, seed 2476 (`dup delivery`), and bridge's
+    /// `a_record_a_fetch_hands_aterm_is_sampled_as_told_before_its_lines_go`.
+    FetchUntold,
+    /// One owed receipt's reservation that does not read refuses the attach
+    /// (`Bridge::arm_undecided_pins`), as the first cut of ATERM-KI-1114-1414's case-6 gate did: no
+    /// session of the node is delivered anything until a person moves the file. No sim seed of the
+    /// reminted worlds (stamping, stampless, stampless with fetches) to 128 breaks a law with it
+    /// off that holds with every rule on (2026-11-17: the world with fetches breaks one at seed 21
+    /// with every rule on, the same with it off); its witness is bridge's
+    /// `an_owed_receipts_reservation_that_does_not_read_arms_nothing_and_the_attach_goes_on`.
+    UnreadReceiptPinRefusesTheAttach,
+    /// A record of an undecided attempt held in hand behind another own record of its lane is not
+    /// taken for its drain as it is held (`Bridge::deliver_record`). On one connection the retry
+    /// takes it all the same (`Bridge::take_undecided_in_hand`, which masks this rule there);
+    /// across a link drop the attach empties every arm, its read after a cut that gave the record
+    /// up finds none and arms nothing, and the retry publishes again, the record handed beside the
+    /// new copy at its release. No sim seed of the reminted worlds (stamping, stampless, stampless
+    /// with fetches) to 128 breaks a law with it off that holds with every rule on (2026-11-17: the
+    /// world with fetches breaks one at seed 21 with every rule on, the same with it off); its
+    /// witness is bridge's
+    /// `an_undecided_attempts_record_held_behind_another_is_taken_as_it_is_held`.
+    UndecidedHeldBehindUntaken,
+    /// The retry of an undecided attempt looks for no record of it this bridge holds untaken, in
+    /// hand or queued in the mailbox (`Bridge::take_undecided_in_hand`): past a cut that gave that
+    /// record up its read finds none, and it is published again beside it. No sim seed of the
+    /// reminted worlds (stamping, stampless, stampless with fetches) to 128 breaks a law with it
+    /// off that holds with every rule on (2026-11-17: the world with fetches breaks one at seed 21
+    /// with every rule on, the same with it off); its witness is bridge's
+    /// `an_undecided_attempts_record_this_bridge_holds_untaken_is_taken_before_its_retry_reads`.
+    UndecidedInHandUnseen,
+    /// The attach's refill holds a lane's mail behind a record held in hand to the cap with no room
+    /// made (`Bridge::make_room_in_hand`): the link drops at the cap, nothing releases the lane
+    /// inside the next attach, whose refill drops it at the same record, and the node never
+    /// attaches. No sim seed of the reminted worlds (stamping, stampless, stampless with fetches)
+    /// to 128 breaks a law with it off that holds with every rule on (2026-11-17: the world with
+    /// fetches breaks one at seed 21 with every rule on, the same with it off); its witness is
+    /// bridge's
+    /// `a_refill_that_takes_a_record_with_more_mail_behind_it_than_the_hand_holds_attaches`, at the
+    /// shared read's call site (`Bridge::refill_node`) and a lane's own (`Bridge::refill_lane`).
+    RefillHoldsPastTheHand,
+    /// A fetch's lines go whatever the write of the told samples answered (`Bridge::answer_fetch`):
+    /// a record is shown that no sample on the disk names, so a later proof's fork falls below it
+    /// and it is shown again. No sim seed of the reminted worlds (stamping, stampless, stampless
+    /// with fetches) to 128 breaks a law with it off that holds with every rule on (2026-11-17: the
+    /// world with fetches breaks one at seed 21 with every rule on, the same with it off); its
+    /// witness is bridge's `a_fetch_whose_told_sample_the_disk_refuses_answers_unsettled`.
+    FetchPastARefusedToldWrite,
+    /// A read from anywhere that meets a candidate no origin decides and then a hit answers
+    /// undecided (`Bridge::read_anywhere`): the post is held, or settled through the delivery gate
+    /// at that candidate, not at its own record. No sim seed of the reminted worlds (stamping,
+    /// stampless, stampless with fetches) to 128 breaks a law with it off that holds with every
+    /// rule on (2026-11-17: the world with fetches breaks one at seed 21 with every rule on, the
+    /// same with it off); its witness is bridge's
+    /// `a_read_from_anywhere_settles_at_a_hit_past_a_candidate_it_cannot_decide`.
+    UndecidedOverALaterHit,
+    /// A record held in hand for its own drain is refused at the cap as mail held behind one is
+    /// (`Bridge::hold_record`): with the hand full of other lanes' mail, the link drops at the
+    /// record whose drain would free it, at every attach, and the node never attaches. No sim seed
+    /// of the reminted worlds (stamping, stampless, stampless with fetches) to 128 breaks a law
+    /// with it off that holds with every rule on (2026-11-17: the world with fetches breaks one at
+    /// seed 21 with every rule on, the same with it off); its witness is bridge's
+    /// `a_record_held_for_its_drain_first_on_its_lane_is_held_past_a_full_hand`, through the shared
+    /// refill, a lane's own and the live tail.
+    HeldForItsDrainRefusedAtTheCap,
+    /// An owed receipt of a session one of whose earlier receipts stalled the drain waits, though
+    /// its record is held in hand for its retry (`Bridge::held_receipt_landed`): behind an earlier
+    /// receipt whose reservation stays unread, its record, taken for its drain, holds the asker's
+    /// lane in hand for good. No sim seed of the reminted worlds (stamping, stampless, stampless
+    /// with fetches) to 128 breaks a law with it off that holds with every rule on (2026-11-17: the
+    /// world with fetches breaks one at seed 21 with every rule on, the same with it off); its
+    /// witness is bridge's
+    /// `a_receipt_held_in_hand_behind_its_sessions_stalled_receipt_settles_there`.
+    StalledReceiptWaitsInHand,
+    /// No own receipt record handed while a reservation of its session's is unread is noted
+    /// (`Bridge::note_handed_unread`): once the file reads, the retry, its attempt's record handed
+    /// and then cut, reads nothing back and publishes it again. No sim seed of the reminted worlds
+    /// (stamping, stampless, stampless with fetches) to 128 breaks a law with it off that holds
+    /// with every rule on (2026-11-17: the world with fetches breaks one at seed 21 with every rule
+    /// on, the same with it off); its witness is bridge's
+    /// `an_owed_receipt_unread_at_the_attach_settles_at_the_record_handed_meanwhile_once_it_reads`.
+    UnreadReceiptHandedUnnoted,
+    /// An own receipt record a fetch reads while a reservation of its session's is unread is noted
+    /// as handed before the fetch's refusals (`Bridge::fetch_record`), as the merge of
+    /// ATERM-KI-1114-1414's case 6 with ATERM-KI-1115-7889 left it, not once aterm handed every
+    /// line of the answer to the read that waits for it (`Bridge::answer_fetch`): a fetch refused
+    /// (`via`, or the told write the disk refused), or one no read waits for (`OK unrequested=1`:
+    /// aterm keeps nothing of it, or caches a whole answer for a later read), leaves the
+    /// reservation's first read to settle the retry at a record aterm was never handed, and past a
+    /// cut that gave it up the receipt is lost. No sim seed of the reminted stampless world, with
+    /// fetches or without, to 128 breaks a law with it off that holds with every rule on
+    /// (2026-11-17: with fetches seed 21 breaks one with every rule on, the same with it off;
+    /// without, none breaks one); its witness is bridge's
+    /// `a_receipt_record_a_fetch_did_not_hand_settles_no_retry_once_its_reservation_reads`, its
+    /// `via`, `told` and `unrequested` arms.
+    UnreadReceiptNotedAtARefusedFetch,
+    /// An own receipt record a delivery offers while a reservation of its session's is unread is
+    /// noted as handed before the delivery's refusals and aterm's answer
+    /// (`Bridge::deliver_record`), as the merge of ATERM-KI-1114-1414's case 6 with
+    /// ATERM-KI-1115-7889 left it, not once aterm took its row (`Bridge::deliver_answered`): a
+    /// record refused before its line (`via`, a carried person, a judging read that took the link,
+    /// an unjudged hold the cap refused, the deadline it settles left standing), a row aterm
+    /// refused, or a lane lost under it, leaves the reservation's first read to settle the retry at
+    /// a record aterm was never handed, and past a cut that gave it up the receipt is lost. No sim
+    /// seed of the reminted stampless world, with fetches or without, to 128 breaks a law with it
+    /// off that holds with every rule on (2026-11-17: with fetches seed 21 breaks one with every
+    /// rule on, the same with it off; without, none breaks one); its witness is bridge's
+    /// `a_receipt_record_a_delivery_did_not_hand_settles_no_retry_once_its_reservation_reads`, its
+    /// `via` and `refused` arms, alone and queued.
+    UnreadReceiptNotedBeforeItsRowIsTaken,
+    /// The first read of a reservation an attach could not read arms nothing where no record handed
+    /// meanwhile settles it (`Bridge::arm_unread_receipt`): its attempt's record, held in hand
+    /// behind another own record of its lane or queued while the file did not read, is handed at
+    /// its release, and the retry, the record cut, reads nothing back and publishes it again; at a
+    /// later attach that read takes no copy held over the link drop, so its read of the pin past
+    /// the cut finds none, and the same. No sim seed of the reminted worlds (stamping, stampless,
+    /// stampless with fetches) to 128 breaks a law with it off that holds with every rule on
+    /// (2026-11-17: the world with fetches breaks one at seed 21 with every rule on, the same with
+    /// it off); its witness is bridge's
+    /// `an_owed_receipt_unread_at_the_attach_takes_its_record_held_behind_another_once_it_reads`,
+    /// its `drain` and `attach` arms.
+    UnreadReceiptReadArmsNothing,
+    /// No undecided attempt's record this bridge holds untaken, in hand or queued, is taken for a
+    /// post or receipt behind its lane's unverifiable hold or its session's stalled receipt
+    /// (`Bridge::taken_for_its_retry`): it waits there with its copy in hand, and a link drop
+    /// meanwhile, past a cut that gave the record up, leaves its retry nothing to read back. No sim
+    /// seed of the reminted worlds (stamping, stampless, stampless with fetches) to 128 breaks a
+    /// law with it off that holds with every rule on (2026-11-17: the world with fetches breaks one
+    /// at seed 21 with every rule on, the same with it off); its witness is bridge's
+    /// `a_receipt_held_in_hand_behind_its_sessions_stalled_receipt_settles_there`, its `untaken`
+    /// arm (the stall's branch) and its `unverified` arm (the hold's), which show the drain's wait
+    /// with it off (nothing retired, nothing behind it delivered), not the second copy: their
+    /// record is staged where the drain's own release takes it next.
+    UndecidedUntakenPastAHold,
 }
 
 /// What one run is.
@@ -1269,6 +1697,13 @@ pub(crate) struct Opts {
     /// ([`bus::Broker::lose_identity`]), so astream mints another id, generation 0 with no
     /// lineage, that keeps every record at its offset (`logid::settle`'s `Prior::Unreadable`).
     pub(crate) remints: bool,
+    /// A REMINTED OPEN TAKES NO ASK FOR ORIGINS (ATERM-KI-1114-1414, case 6): each open of
+    /// [`Opts::remints`] that reminted the log refuses `Request::OriginStamps`
+    /// ([`bus::State::stampless`]), so a read from anywhere on it names no origin and
+    /// `Bridge::found_anywhere` cannot decide whose a record of a post's words is. A field of its
+    /// own, not an [`ArmMutant`]: a control's production world (`with_every_rule`) resets `arm`,
+    /// and would judge another world than the one the control ran.
+    pub(crate) stampless_starts: bool,
 }
 
 /// The session the other writer under the node's producer id posts from ([`Opts::strays`]).
@@ -1282,7 +1717,7 @@ pub(crate) const DEADLINES_MS: [u64; 5] = [1_000, 5_000, 20_000, 60_000, 180_000
 pub(crate) const TOPICS: [&str; 2] = ["alpha", "beta"];
 
 /// The peer's session that says on [`TOPICS`].
-pub(crate) const SAYER: &str = "tsayer00000";
+pub(crate) const SAYER: &str = "tzzzzzzzzzy";
 
 /// How long past an ask's deadline (judged from where its post retired) the sweep may take
 /// to say so, the settle's clocks being the bridge's: its roster refresh re-arms it, and a
@@ -1290,7 +1725,19 @@ pub(crate) const SAYER: &str = "tsayer00000";
 const DEADLINE_SLACK_MS: u64 = 30_000;
 
 /// The sibling's one session ([`Opts::sibling`]).
-pub(crate) const SIBLING_SID: &str = "tsbng000000";
+pub(crate) const SIBLING_SID: &str = "tzzzzzzzzzz";
+
+/// A fresh hosted session's deterministic ID, leaving the top two IDs for the peer and sibling.
+fn hosted_sid(local: u64) -> String {
+    let limit = (1u64 << aterm_types::tab_id::BITS) - 2;
+    assert!(
+        (1..limit).contains(&local),
+        "a unique hosted session ID below the two reserved IDs"
+    );
+    aterm_types::tab_id::TabId::from_bits(local)
+        .as_str()
+        .to_owned()
+}
 
 /// A scaled world's rules' bytes ([`Opts::scaled`]): the bulk stream's, the mail lanes' and
 /// every other subject's, a few dozen of the world's records each.
@@ -1412,6 +1859,7 @@ impl Opts {
             retire_logs: false,
             poisons: false,
             remints: false,
+            stampless_starts: false,
         }
     }
 
@@ -1434,6 +1882,36 @@ impl Opts {
         Self {
             remints: true,
             ..Self::lossy_logs(seed)
+        }
+    }
+
+    /// THE REMINTED STAMPLESS WORLD for `seed` (ATERM-KI-1114-1414, case 6): the reminted
+    /// sweep's, each open that reminted the log taking no ask for origins
+    /// ([`Opts::stampless_starts`]), so the bridge's read from anywhere there holds its post
+    /// undecided.
+    pub(crate) fn lossy_remints_stampless(seed: u64) -> Self {
+        Self {
+            stampless_starts: true,
+            ..Self::lossy_remints(seed)
+        }
+    }
+
+    /// [`Opts::lossy_remints_stampless`] with the sessions' fetches by offset
+    /// ([`Opts::fetches`]): a fetch reads a record a case-6 hold keeps undecided. Not yet a
+    /// sweep (read 2026-11-17, seeds 1..=128): 127 hold every law, and one breaks one. Seed 21
+    /// breaks `dup post`, the cost of `Bridge::found_anywhere`'s publish at the pin: a post to a
+    /// person, whose lane no delivery of the bridge's reaches, read undecided past a remint on a
+    /// broker that takes no ask for origins, is published at its pin, beside its carried
+    /// attempt (ATERM-KI-1114-1414's residual). It holds every law with that rule off
+    /// (`Mutant::UnstampedUnreachableHolds`, whose cost is a hold for good: seed 53's
+    /// `liveness` in the stampless world), with every case-6 rule off, and with stamps on. Seed
+    /// 112, where a power loss took a told record off the log's tail and a will landed at its
+    /// offset before the attach, holds since the proof stops at that row and keeps the matches
+    /// below it (ATERM-KI-1116-7314's told rows, `Mutant::ProofRefusedAtAMismatch`).
+    pub(crate) fn lossy_remints_stampless_fetching(seed: u64) -> Self {
+        Self {
+            fetches: true,
+            ..Self::lossy_remints_stampless(seed)
         }
     }
 
@@ -1660,6 +2138,9 @@ pub(crate) struct Stats {
     /// Keyed re-posts' entries the attach's replay settled at their key's winner, read back
     /// (`Bridge::keyed_winner_at`).
     pub(crate) replayed_at_the_winner: u64,
+    /// Records a delivery took for an attempt no read from anywhere decided, held for its drain
+    /// (`Bridge::take_undecided`, ATERM-KI-1114-1414).
+    pub(crate) undecided_taken: u64,
     /// Records the other writer under the node's producer id wrote at a refused publish's
     /// sequence ([`Opts::strays`]), and the weeks the settle let pass for one of them.
     pub(crate) strays: u64,
@@ -1704,6 +2185,8 @@ pub(crate) struct Stats {
     pub(crate) retired_logs: u64,
     /// The opens that reminted the log keeping its records ([`Opts::remints`]).
     pub(crate) remints: u64,
+    /// Of them, the opens that took no ask for origins ([`Opts::stampless_starts`]).
+    pub(crate) stampless_starts: u64,
     /// The steps to another id the endpoint was told a bridge proved (`link log … proved=1`).
     pub(crate) remints_proved: u64,
     /// The remints the endpoint forgot across, unproved ([`super::conform::View::forgot_remints`]).
@@ -1872,7 +2355,6 @@ struct World {
     boot: u8,
     /// The next local id and sid generation aterm mints.
     next_local: u64,
-    epoch: u64,
     marker: u64,
     sent: BTreeMap<String, Sent>,
     /// Every halt row the person published, in order, a press astream answered with an unknown
@@ -2078,6 +2560,7 @@ impl World {
         let broker = bus::Broker::new(tier, table);
         lock(&broker.state).mutant = opts.arm;
         lock(&broker.state).gap_fences = opts.gap_fences;
+        lock(&broker.state).stampless_remints = opts.stampless_starts;
         broker.limit_every_open(opts.rate_limit);
         broker.retain(opts.rules());
         if opts.journal {
@@ -2171,7 +2654,6 @@ impl World {
             next_pid: 1,
             boot: 1,
             next_local: 1,
-            epoch: 1,
             marker: 0,
             sent: BTreeMap::new(),
             halt_rows: Vec::new(),
@@ -2318,12 +2800,12 @@ impl World {
         self.core.note(line);
     }
 
-    /// aterm's sessions of this boot: two, with sids of this epoch.
+    /// aterm's sessions of this boot: two, with distinct IDs from their local allocations.
     fn open_sessions(&mut self) {
-        for name in ["a", "b"] {
+        for _ in 0..2 {
             let local = self.next_local;
             self.next_local += 1;
-            let sid = format!("t{name}{:0>9}", self.epoch);
+            let sid = hosted_sid(local);
             self.ep.create(local, &sid, self.stamp());
             self.note(format!("session {local} {sid}"));
         }
@@ -2347,7 +2829,7 @@ impl World {
     fn open_session(&mut self) -> u64 {
         let local = self.next_local;
         self.next_local += 1;
-        let sid = format!("tn{local:0>4}e{:0>4}", self.epoch);
+        let sid = hosted_sid(local);
         self.ep.create(local, &sid, self.stamp());
         self.note(format!("session {local} {sid} opens"));
         self.push_event(&format!("EVENT * session-created {sid}"));
@@ -3717,7 +4199,6 @@ impl World {
         self.sessions_end();
         self.boot = self.boot.wrapping_add(1).max(1);
         self.mark = boot_mark(std::path::Path::new(&self.cfg.state_dir), self.boot);
-        self.epoch += 1;
         self.core.broker.start();
         self.tick_now();
         self.open_sessions();
@@ -3786,7 +4267,6 @@ impl World {
             self.stats.clean_stops += 1;
         }
         self.sessions_end();
-        self.epoch += 1;
         self.open_sessions();
     }
 
@@ -4983,12 +5463,9 @@ impl World {
         // Every copy but the newest given up by retention before its asker was handed it (sim
         // item B05): the replay of an entry whose record went unread (an own record is never
         // delivered while its entry stands) publishes the one copy a reader is handed, as a
-        // post's does. A copy its asker holds is an answer it was given ([`holds_answer`]): an
-        // `ack` from its sender naming the same ask. Another session's row at the offset, of
-        // another lane, is another record (seed 921 of `lossy_keyed` at 1200 steps: the answer
-        // at @21 went unread with a cut and landed again at @41, and sessions long gone held
-        // notes at @21 of logs since retired; found there, the sim's row pins seed 2984 since
-        // grouped sends moved the schedule).
+        // post's does. A copy its asker holds or has fetched is an answer it was given
+        // ([`holds_answer`]): an `ack` at that offset, from its sender, naming the same ask.
+        // A row at that offset for another session, kind, ask or sender is another record.
         let gone = self.core.broker.gone();
         let by_offset = self.opts.mutants.contains(&Mutant::AnswerHandedByOffset);
         let handed = |off: u64, re: u64, from: &str| {
@@ -5318,6 +5795,7 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
         let b = lock(&w.core.broker.state);
         w.stats.poisoned = b.poisons;
         w.stats.poisoned_refusals = b.poisoned_refusals;
+        w.stats.stampless_starts = b.stampless_opens;
     }
     w.stats.pin_durable_replaces = w.core.device.pin_durable_replaces();
     // THE LAW OF THE LIMIT'S WAIT (critic item E06, `bus::State::rate_laws`): judged at the door,
@@ -5372,6 +5850,7 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
             crate::fx::ReservationTap::Verified => w.stats.reservations_verified += n,
             crate::fx::ReservationTap::Collision => w.stats.reservation_collisions += n,
             crate::fx::ReservationTap::ReplayedAtTheWinner => w.stats.replayed_at_the_winner += n,
+            crate::fx::ReservationTap::UndecidedTaken => w.stats.undecided_taken += n,
             crate::fx::ReservationTap::Unverifiable(case) => {
                 let slot = usize::from(case)
                     .checked_sub(1)

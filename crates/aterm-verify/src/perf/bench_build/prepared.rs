@@ -3,14 +3,14 @@
 
 //! One compiler capture owns both executable artifacts for every runtime arm.
 
-use std::fs::{File, Metadata};
-use std::io;
-use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+#[cfg(test)]
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use aterm_uds::spawnfd::Command;
 
 use super::{Built, Entry, bench_profile, flags, load_average, set_bench_environment, units};
+use crate::compiler_artifact::Artifact;
 use crate::perf::arena::Halt;
 use crate::perf::driver::built_executable;
 
@@ -171,9 +171,7 @@ impl<C: Compiler> PreparedBench<C> {
         }
         let app = Artifact::open(&app_path)?;
         let bench = Artifact::open(&bench_path)?;
-        if app.canonical == bench.canonical
-            || (app.stamp.device, app.stamp.inode) == (bench.stamp.device, bench.stamp.inode)
-        {
+        if app.canonical == bench.canonical || app.same_file(&bench) {
             return Err(Halt::Fail(
                 "compiler app and bench artifacts alias one file".into(),
             ));
@@ -369,124 +367,6 @@ fn completed(messages: &str) -> Result<(), Halt> {
         ));
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stamp {
-    device: u64,
-    inode: u64,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    length: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
-
-impl Stamp {
-    fn of(meta: &Metadata) -> Self {
-        Self {
-            device: meta.dev(),
-            inode: meta.ino(),
-            mode: meta.mode(),
-            uid: meta.uid(),
-            gid: meta.gid(),
-            length: meta.len(),
-            modified: (meta.mtime(), meta.mtime_nsec()),
-            changed: (meta.ctime(), meta.ctime_nsec()),
-        }
-    }
-}
-
-struct Artifact {
-    selected: PathBuf,
-    canonical: PathBuf,
-    held: File,
-    stamp: Stamp,
-    digest: [u8; 32],
-}
-
-impl Artifact {
-    fn open(selected: &Path) -> Result<Self, String> {
-        if !selected.is_absolute()
-            || !std::fs::symlink_metadata(selected)
-                .map_err(|e| e.to_string())?
-                .is_file()
-        {
-            return Err("compiler artifact must name an absolute regular file, not a link".into());
-        }
-        let canonical = selected.canonicalize().map_err(|e| e.to_string())?;
-        let (held, meta) = aterm_uds::regular_file::open(&canonical).map_err(|e| e.to_string())?;
-        if meta.mode() & 0o6022 != 0
-            || meta.mode() & 0o111 == 0
-            || (meta.uid() != aterm_uds::peer::our_uid() && meta.uid() != 0)
-            || meta.len() == 0
-        {
-            return Err("compiler artifact has unsafe ownership, mode or empty content".into());
-        }
-        let stamp = Stamp::of(&meta);
-        let digest = contents(&held, stamp.length).map_err(|e| e.to_string())?;
-        let artifact = Self {
-            selected: selected.to_owned(),
-            canonical,
-            held,
-            stamp,
-            digest,
-        };
-        artifact.validate()?;
-        Ok(artifact)
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        let changed = || format!("prepared artifact changed: {}", self.selected.display());
-        let check = || -> Result<(), String> {
-            let named = std::fs::symlink_metadata(&self.selected).map_err(|e| e.to_string())?;
-            if !named.is_file()
-                || Stamp::of(&named) != self.stamp
-                || self.selected.canonicalize().map_err(|e| e.to_string())? != self.canonical
-            {
-                return Err(changed());
-            }
-            let (now, meta) =
-                aterm_uds::regular_file::open(&self.canonical).map_err(|e| e.to_string())?;
-            if Stamp::of(&meta) != self.stamp
-                || Stamp::of(&self.held.metadata().map_err(|e| e.to_string())?) != self.stamp
-                || contents(&self.held, self.stamp.length).map_err(|e| e.to_string())?
-                    != self.digest
-                || Stamp::of(&now.metadata().map_err(|e| e.to_string())?) != self.stamp
-                || Stamp::of(&self.held.metadata().map_err(|e| e.to_string())?) != self.stamp
-                || Stamp::of(
-                    &std::fs::symlink_metadata(&self.canonical).map_err(|e| e.to_string())?,
-                ) != self.stamp
-                || Stamp::of(&std::fs::symlink_metadata(&self.selected).map_err(|e| e.to_string())?)
-                    != self.stamp
-                || self.selected.canonicalize().map_err(|e| e.to_string())? != self.canonical
-            {
-                return Err(changed());
-            }
-            Ok(())
-        };
-        check().map_err(|why| format!("{} ({why})", changed()))
-    }
-}
-
-fn contents(file: &File, length: u64) -> io::Result<[u8; 32]> {
-    let mut hash = aterm_digest::Sha256::new();
-    let mut buffer = [0_u8; 65536];
-    let mut offset = 0;
-    while offset < length {
-        let wanted = usize::try_from((length - offset).min(buffer.len() as u64)).unwrap();
-        let read = match file.read_at(&mut buffer[..wanted], offset) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            other => other?,
-        };
-        if read == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        hash.update(&buffer[..read]);
-        offset += read as u64;
-    }
-    Ok(hash.finalize())
 }
 
 #[cfg(test)]

@@ -3389,4 +3389,42 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
     for exempt in [Wake::Snapshot, Wake::ConfigReload] {
         assert_eq!(update_handoff_wake_class(&exempt), Class::Exempt);
     }
+    // A password request, its answer and its lane's withdrawal revoke only where a sheet goes up
+    // or comes down (`App::stand_askpass_sheet`, `App::end_askpass_sheet`), so the wakes
+    // themselves are Exempt. The owned CPU collection's wakes still revoke (ATERM-KI-1117-3476).
+    #[cfg(target_os = "macos")]
+    {
+        let (reply, _answer) = std::sync::mpsc::channel();
+        let request = crate::askpass::AskpassRequest {
+            ticket: std::sync::Arc::new(crate::askpass::AskpassTicket::new(
+                1,
+                std::time::Instant::now(),
+            )),
+            attribute_from: 1,
+            owned: None,
+            exact: true,
+            command: "/usr/bin/true".into(),
+            purpose: None,
+            invoker: "a test".into(),
+            reply,
+        };
+        for exempt in [
+            Wake::Askpass(Box::new(request)),
+            Wake::AskpassAnswered {
+                id: 1,
+                proceed: true,
+            },
+            Wake::AskpassWithdraw { id: 1 },
+        ] {
+            assert_eq!(
+                update_handoff_wake_class(&exempt),
+                Class::Exempt,
+                "{exempt:?}"
+            );
+        }
+        assert_eq!(
+            update_handoff_wake_class(&Wake::CpuPolicyReport(Box::new(aterm_json::Value::Null))),
+            Class::Revoking
+        );
+    }
 }

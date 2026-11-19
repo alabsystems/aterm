@@ -75,8 +75,9 @@ impl Finding {
 /// What a finding of `kind` means, in a person's words, for each word `aterm db table check`
 /// reports of any table: [`Finding::kind`]'s, a schema split, and what the table's capacity asks
 /// (`quota-spent`, `roll`, `generation-unopened`). `None` for a word this layer does not report:
-/// a lab rule's sentence is beside its rule ([`crate::alab::checks::sentence`]), and [`said`]
-/// asks both. A sentence names no value, as a finding names none.
+/// a lab rule's sentence is beside its rule ([`crate::alab::checks::sentence`],
+/// [`crate::lab::tracker::checks::sentence`]), and [`said`] asks every layer. A sentence names
+/// no value, as a finding names none.
 pub fn sentence(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "conflict" => "Two or more values were written to this cell at once; keep one to settle it",
@@ -100,12 +101,14 @@ pub fn sentence(kind: &str) -> Option<&'static str> {
 }
 
 /// What a person reads for a finding of `kind`: its sentence ([`sentence`], else the lab's
-/// [`crate::alab::checks::sentence`]), else the word itself, so a kind no sentence is written
+/// [`crate::alab::checks::sentence`], else the tracker's
+/// [`crate::lab::tracker::checks::sentence`]), else the word itself, so a kind no sentence is written
 /// for is still said. The `--tsv` form of `aterm db table check` and `aterm db alab check` and
 /// the Tables page's Check view each say a finding through this one function.
 pub fn said(kind: &str) -> &str {
     sentence(kind)
         .or_else(|| crate::alab::checks::sentence(kind))
+        .or_else(|| crate::lab::tracker::checks::sentence(kind))
         .unwrap_or(kind)
 }
 
@@ -128,11 +131,15 @@ pub fn heading(kind: &str) -> Option<&'static str> {
 }
 
 /// What a page heads a finding of `kind` with: its heading ([`heading`], else the lab's
-/// [`crate::alab::checks::heading`]), else its word with each dash a space and its first letter
+/// [`crate::alab::checks::heading`], else the tracker's
+/// [`crate::lab::tracker::checks::heading`]), else its word with each dash a space and its first letter
 /// a capital (`schema-split` would read `Schema split`), so a kind no heading is written for still
 /// reads as words.
 pub fn headed(kind: &str) -> String {
-    if let Some(heading) = heading(kind).or_else(|| crate::alab::checks::heading(kind)) {
+    if let Some(heading) = heading(kind)
+        .or_else(|| crate::alab::checks::heading(kind))
+        .or_else(|| crate::lab::tracker::checks::heading(kind))
+    {
         return heading.to_owned();
     }
     let words = kind.replace('-', " ");
@@ -250,7 +257,7 @@ fn holds(collection: &Collection, cells: &Cells, rows: &[Vec<Change>], pk: &str)
 /// `collection`'s rows as they read once `rows` land on `cells`: each cell the write changes
 /// holds that write alone, since a write this Mac authors follows every candidate its view
 /// holds and replaces them, and a restored absence reads as empty.
-fn landed(collection: &Collection, cells: &Cells, rows: &[Vec<Change>]) -> Projection {
+pub(crate) fn landed(collection: &Collection, cells: &Cells, rows: &[Vec<Change>]) -> Projection {
     let mut mine: Cells = cells
         .range((collection.name.to_owned(), String::new())..)
         .take_while(|((name, _), _)| name == collection.name)
@@ -548,10 +555,26 @@ pub fn retired_referenced(table: &Table, rows: &[Vec<Change>], cells: &Cells) ->
     if ended.is_empty() {
         return None;
     }
+    // Each collection projected once before the write lands and once after, however many of
+    // its rows the write ends: a projection per row made a bulk write quadratic.
     let mut ending: Vec<(&'static Collection, &str)> = Vec::new();
+    let mut projected: Vec<(&str, Projection, Projection)> = Vec::new();
     for (schema, pk) in ended {
-        let before = super::cell::project(schema, cells);
-        let after = landed(schema, cells, rows);
+        let at = match projected
+            .iter()
+            .position(|(name, _, _)| *name == schema.name)
+        {
+            Some(at) => at,
+            None => {
+                projected.push((
+                    schema.name,
+                    super::cell::project(schema, cells),
+                    landed(schema, cells, rows),
+                ));
+                projected.len() - 1
+            }
+        };
+        let (_, before, after) = &projected[at];
         if before.rows.get(pk).is_some_and(Row::live)
             && after.rows.get(pk).is_some_and(|row| !row.live())
         {

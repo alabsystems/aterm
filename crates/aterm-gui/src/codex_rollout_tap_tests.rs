@@ -780,3 +780,74 @@ fn a_resting_tab_is_read_at_the_first_sweep_after_it_moved() {
         "and the rest starts again from that read"
     );
 }
+
+/// The updater may replace the launch symlink between rollout reads. Both product and
+/// client versions continue to describe the mapped file, even when both builds report
+/// the same upstream client version.
+#[cfg(unix)]
+#[test]
+fn codex_rollout_versions_follow_the_loaded_image_after_the_managed_alias_moves() {
+    use aterm_sysprobe::kproc::ImageFile;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+
+    fn file_id(path: &Path) -> Option<ImageFile> {
+        let meta = fs::metadata(path).ok()?;
+        Some(ImageFile {
+            device: meta.dev(),
+            inode: meta.ino(),
+        })
+    }
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let layout = atpkg::Layout {
+        prefix: scratch.path().to_owned(),
+    };
+    let install = |build, version| {
+        let root = layout.build_dir("codex", build);
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let path = root.join("bin/codex");
+        fs::write(&path, version).unwrap();
+        fs::write(
+            root.join("codex-package.json"),
+            format!(r#"{{"layoutVersion":1,"entrypoint":"bin/codex","version":"{version}"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            root.join("alab-build.json"),
+            format!(r#"{{"version":"{version}","client_version":"0.170.0"}}"#),
+        )
+        .unwrap();
+        atpkg::store::mark_build_ready(&root).unwrap();
+        path
+    };
+    let old = install(2026111601, "0.10.0");
+    let new = install(2026111701, "0.11.0");
+    let alias_dir = atpkg::activate::exec_dir(&layout, "codex");
+    fs::create_dir_all(&alias_dir).unwrap();
+    let launch = alias_dir.join("codex");
+    symlink(&old, &launch).unwrap();
+    let before = file_id(&launch).unwrap();
+    let now = Instant::now();
+    let mut lookup = PackageLookup::default();
+    let observe =
+        |lookup: &mut PackageLookup, id| lookup.read(id, &launch, |p| file_id(p) == Some(id), now);
+    assert_eq!(observe(&mut lookup, before).unwrap().product, "0.10.0");
+
+    let next = alias_dir.join("next");
+    symlink(&new, &next).unwrap();
+    fs::rename(next, &launch).unwrap();
+    let held = observe(&mut lookup, before).unwrap();
+    assert_eq!(
+        (held.product.as_str(), held.client.as_str()),
+        ("0.10.0", "0.170.0")
+    );
+
+    fs::rename(&old, scratch.path().join("retired")).unwrap();
+    assert!(observe(&mut lookup, before).is_none());
+    let fresh = observe(&mut lookup, file_id(&launch).unwrap()).unwrap();
+    assert_eq!(
+        (fresh.product.as_str(), fresh.client.as_str()),
+        ("0.11.0", "0.170.0")
+    );
+}

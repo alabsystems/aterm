@@ -66,6 +66,7 @@ fn full() -> MachineName {
         nick: nick("Heron"),
         nick_class: NickClass::Chosen,
         row: RowSeen::Saw(Some(nick("Otter"))),
+        registry_unread: true,
         migration: Some(Migration::Waiting),
         fleets: vec![FleetClaim {
             digest: [0xab; 8],
@@ -86,6 +87,33 @@ fn the_file_spells_every_field_and_reads_back_whole() {
         let text = name.to_toml().expect("serializes");
         assert_eq!(MachineName::from_toml(&text), Ok(name), "{text}");
     }
+}
+
+/// A change made to a name made while the registry was unread makes it the name's own: no later
+/// registry read replaces it as a first name. A file an older build wrote, with no mark, reads
+/// unmarked.
+/// NEGATIVE CONTROL: with [`MachineName::made_own`] leaving the mark, the changed name stays
+/// marked.
+#[test]
+fn a_change_clears_the_mark_of_a_name_made_unread() {
+    let name = full();
+    assert!(name.registry_unread, "control");
+    let text = name.to_toml().expect("serializes");
+    assert!(text.contains("registry_unread = true"), "{text}");
+    let older = text.replacen("registry_unread = true\n", "", 1);
+    assert!(
+        !MachineName::from_toml(&older)
+            .expect("an older build's file")
+            .registry_unread
+    );
+    let own = name.made_own();
+    assert!(!own.registry_unread);
+    assert!(
+        !own.to_toml()
+            .expect("serializes")
+            .contains("registry_unread"),
+        "an unmarked name writes no mark"
+    );
 }
 
 #[test]

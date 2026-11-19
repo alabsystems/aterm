@@ -1394,7 +1394,8 @@ fn a_usage_limit_nobody_lifts_holds_the_reducer_only_for_its_bound() {
 
 /// The limit's age runs from its first answer since the agent last answered
 /// ([`upgrade::StandingScan::since`]): a retry the vendor or a continuation drew is the same
-/// limit, an answer of the model's ends it, and a limit after that answer is a new one.
+/// limit, an answer of the model's ends it, and a limit after that answer is a new one. A limit no
+/// row dates ages from the first look that saw it.
 #[test]
 fn the_usage_limits_age_runs_from_its_first_row() {
     let now = WALK_NOW;
@@ -1421,12 +1422,17 @@ fn the_usage_limits_age_runs_from_its_first_row() {
         ..idle()
     };
     assert_eq!(
-        wall_age(true, &aged, Some(first), HandAt::Never, now),
+        wall_age(true, &aged, Some(first), now - 100, HandAt::Never, now),
         2_000
     );
     assert_eq!(
-        wall_age(true, &aged, None, HandAt::Never, now),
+        wall_age(true, &aged, None, now - 100, HandAt::Never, now),
+        100,
+        "a limit only the screen shows ages from the first look that saw it"
+    );
+    assert_eq!(
+        wall_age(true, &aged, None, 0, HandAt::Never, now),
         0,
-        "a limit only the screen shows never ages"
+        "and has no age before one"
     );
 }

@@ -240,3 +240,330 @@ fn the_turn_events_are_known_records_with_their_figures() {
     );
     assert!(unread["run_cpu_ms"].is_null());
 }
+
+/// An actual source plan drives the ordinary scheduler and reporting path. Each callback writes
+/// a create-new marker, so a repeated tree row fails rather than hiding behind a set/count.
+#[cfg(unix)]
+fn prequeue_stage(ctx: &crate::Ctx, spec: &crate::plan::StageSpec) -> crate::Report {
+    use crate::plan::StageId;
+    use std::io::Write as _;
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(ctx.root.join(format!("ran-{:?}", spec.id)))
+        .unwrap();
+    marker.write_all(b"completed").unwrap();
+    let mut report = crate::Report::new(&spec.title);
+    if spec.id == StageId::Census && ctx.root.join("red-census").exists() {
+        report.fail("planted source census failure");
+    } else if spec.id == StageId::ExportScan && ctx.root.join("unknown-export").exists() {
+        report.cannot_run("source export unavailable");
+    } else {
+        if !matches!(
+            spec.id,
+            StageId::Census | StageId::ReleasedShim | StageId::Formatting | StageId::ExportScan
+        ) {
+            assert!(
+                ctx.root.join("admitted").exists(),
+                "compiler work preceded run admission"
+            );
+        }
+        report.pass("the selected source row ran once");
+    }
+    report
+}
+
+#[cfg(unix)]
+fn prequeue_context(root: &std::path::Path) -> crate::Ctx {
+    std::fs::create_dir_all(root).unwrap();
+    let history_path = root.join("history.json");
+    let mut history = History::default();
+    history.push(
+        "-p fixture --lib",
+        sample(Some(10 * 180_000 * u64::from(aterm_capacity::cores())), 1),
+    );
+    std::fs::write(&history_path, history.encode()).unwrap();
+    crate::Ctx::new(
+        root.to_owned(),
+        Scope::crate_only("fixture"),
+        crate::EnvSnapshot::default(),
+        root.join("scratch"),
+    )
+    .with_checks(&crate::checks::DEV)
+    .with_test_history(Some(history_path))
+    .with_halt(crate::sched::Halt::after_preflight(|_| {}))
+}
+
+#[cfg(unix)]
+fn prequeue_run(ctx: &crate::Ctx, admission: &crate::prequeue::Admission<'_>) -> (i32, String) {
+    let seams = crate::Seams {
+        stage: prequeue_stage,
+        prepare_build_dir: |_| Ok(()),
+        prepare_cells: None,
+        admit_quiet: |_, _| panic!("no quiet claim in this source fixture"),
+        admit_memory: |_, _| panic!("no stage memory claim in this source fixture"),
+    };
+    let plan = crate::RunPlan::capture(ctx, seams).unwrap();
+    assert!(
+        Prepared::capture(&plan, Some(1)).is_some(),
+        "the actual captured history makes this run heavy"
+    );
+    let mut output = Vec::new();
+    let code = crate::run_with_plan(
+        ctx,
+        &mut output,
+        &mut std::io::sink(),
+        &crate::Show::default(),
+        seams,
+        Some(plan),
+        Some(admission),
+    )
+    .unwrap();
+    (code, String::from_utf8(output).unwrap())
+}
+
+/// Census is genuinely red while another native process holds the stand-in ledger's turn. The
+/// ordinary scheduler ends at that red; it never invokes turn/disk or a compiler callback.
+#[cfg(unix)]
+#[test]
+fn a_red_tree_row_ends_a_heavy_run_before_the_judgment_turn() {
+    use aterm_capacity::{Fixed, Ledger, Need, Polled, Reading, Waiter};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let ctx = prequeue_context(root);
+    std::fs::write(root.join("red-census"), b"red").unwrap();
+    let ledger = Ledger::at(root.join("ledger"));
+    let machine = Fixed::new(Reading::of_gib(48, 40, 18));
+    let (input, keep_alive) = aterm_uds::pipe().unwrap();
+    let mut child = aterm_uds::spawnfd::command("/bin/cat")
+        .stdin(input)
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .unwrap();
+    let holder = Waiter::enter_stand_in(
+        &ledger,
+        &machine,
+        Need::new("another verifier").heavy(1, 180_000),
+        Some(child.id()),
+        1,
+    )
+    .unwrap();
+    let Polled::Admitted(held) = holder.poll(&machine) else {
+        panic!("the private turn is available");
+    };
+    assert!(
+        aterm_capacity::admit::try_admit_with(
+            &ledger,
+            &machine,
+            Need::new("competitor").heavy(2, 180_000)
+        )
+        .unwrap()
+        .is_none(),
+        "the native other process actually holds this turn"
+    );
+    let acquire = |_: &crate::RunPlan<'_>, _: Duration| -> (Duration, Result<(), String>) {
+        panic!("a red source row asked for turn/disk");
+    };
+    let admission = crate::prequeue::Admission::new(&acquire);
+    let (code, output) = prequeue_run(&ctx, &admission);
+    assert_eq!(code, crate::exit::FAILED, "{output}");
+    assert!(output.contains("census"), "{output}");
+    assert!(!root.join("admitted").exists());
+    assert!(
+        !root.join("ran-ReleasedShim").exists(),
+        "census stops bootstrap too"
+    );
+    assert_eq!(
+        ledger
+            .list()
+            .unwrap()
+            .iter()
+            .filter(|row| row.held.is_some())
+            .count(),
+        1
+    );
+    drop(held);
+    drop(keep_alive);
+    assert!(child.wait().unwrap().success());
+}
+
+/// All four real scheduler callbacks complete before a single actual private-ledger turn is
+/// acquired; every compiler callback then observes that admission. No tree row is repeated.
+#[cfg(unix)]
+#[test]
+fn a_heavy_run_takes_the_turn_only_after_its_tree_rows_pass() {
+    use aterm_capacity::{Fixed, Ledger, Need, Reading};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let ctx = prequeue_context(root);
+    let ledger = Ledger::at(root.join("ledger"));
+    let machine = Fixed::new(Reading::of_gib(48, 40, 18));
+    let calls = AtomicUsize::new(0);
+    let held = Mutex::new(None);
+    let acquire = |plan: &crate::RunPlan<'_>, _: Duration| {
+        assert!(std::ptr::eq(plan.context(), &ctx));
+        for id in [
+            crate::plan::StageId::Census,
+            crate::plan::StageId::ReleasedShim,
+            crate::plan::StageId::Formatting,
+            crate::plan::StageId::ExportScan,
+        ] {
+            assert!(
+                root.join(format!("ran-{id:?}")).exists(),
+                "{id:?} did not complete"
+            );
+        }
+        assert_eq!(calls.fetch_add(1, Ordering::SeqCst), 0);
+        *held.lock().unwrap() = Some(
+            aterm_capacity::admit::try_admit_with(
+                &ledger,
+                &machine,
+                Need::new("heavy source fixture").heavy(1, 180_000),
+            )
+            .unwrap()
+            .expect("one actual turn"),
+        );
+        std::fs::write(root.join("admitted"), b"turn and run disk boundary").unwrap();
+        (Duration::ZERO, Ok(()))
+    };
+    let admission = crate::prequeue::Admission::new(&acquire);
+    let (code, output) = prequeue_run(&ctx, &admission);
+    assert_eq!(code, crate::exit::PASS, "{output}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(root.join("ran-Tippy").exists());
+    assert!(root.join("ran-TestCompile").exists());
+    assert!(root.join("ran-Test").exists());
+    assert_eq!(
+        ledger
+            .list()
+            .unwrap()
+            .iter()
+            .filter(|row| row.held.is_some())
+            .count(),
+        1
+    );
+    drop(held.lock().unwrap().take());
+    assert!(ledger.list().unwrap().is_empty());
+}
+
+/// Unanswered tree input is not a passing preflight. A resource refusal is shared once by
+/// concurrent later stages, with no stage callback or admission retry.
+#[cfg(unix)]
+#[test]
+fn unanswered_tree_and_refused_run_resources_start_no_compiler() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for unknown in [true, false] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ctx = prequeue_context(root);
+        if unknown {
+            std::fs::write(root.join("unknown-export"), b"unknown").unwrap();
+        }
+        let calls = AtomicUsize::new(0);
+        let acquire = |_: &crate::RunPlan<'_>, _: Duration| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            (Duration::ZERO, Err("planted disk admission refusal".into()))
+        };
+        let admission = crate::prequeue::Admission::new(&acquire);
+        let (code, output) = prequeue_run(&ctx, &admission);
+        assert_eq!(code, crate::exit::COULD_NOT_RUN, "{unknown}: {output}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            usize::from(!unknown),
+            "{output}"
+        );
+        assert!(!root.join("ran-Tippy").exists());
+        assert!(!root.join("ran-TestCompile").exists());
+        assert!(!root.join("ran-Test").exists());
+    }
+}
+
+/// The history and queue rank are captured once, while the context remains borrowed. Neither a
+/// later history write nor another invocation can substitute a new source for that preparation.
+#[cfg(unix)]
+#[test]
+fn a_prepared_turn_keeps_its_prediction_and_refuses_another_context() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ctx = prequeue_context(dir.path());
+    let plan = crate::RunPlan::capture(
+        &ctx,
+        crate::Seams {
+            prepare_cells: None,
+            ..crate::LIVE
+        },
+    )
+    .unwrap();
+    let prepared = Prepared::capture(&plan, Some(17)).unwrap();
+    let prediction = prepared.prediction;
+    std::fs::write(
+        ctx.test_history.as_ref().unwrap(),
+        History::default().encode(),
+    )
+    .unwrap();
+    assert!(
+        Prepared::capture(&plan, Some(18)).is_none(),
+        "a fresh invocation sees the new light history"
+    );
+    assert_eq!(prepared.prediction, prediction);
+    assert_eq!(prepared.heavy.since_ms, 17);
+    let other = prequeue_context(&dir.path().join("other"));
+    let other_plan = crate::RunPlan::capture(
+        &other,
+        crate::Seams {
+            prepare_cells: None,
+            ..crate::LIVE
+        },
+    )
+    .unwrap();
+    let (waited, refused) = prepared.take(&other_plan, aterm_capacity::Admit::Wait, Duration::ZERO);
+    assert_eq!(waited, Duration::ZERO);
+    assert!(
+        refused.is_err(),
+        "another context cannot ask using this prediction/source"
+    );
+}
+
+/// A callback unwind leaves no returned admission outcome. Another worker must refuse rather
+/// than reacquire resources whose original owner may already have changed before the panic.
+#[cfg(unix)]
+#[test]
+fn a_panicked_run_admission_is_not_retried_by_another_worker() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ctx = prequeue_context(dir.path());
+    let plan = crate::RunPlan::capture(
+        &ctx,
+        crate::Seams {
+            prepare_cells: None,
+            ..crate::LIVE
+        },
+    )
+    .unwrap();
+    let calls = AtomicUsize::new(0);
+    let acquire = |_: &crate::RunPlan<'_>, _: Duration| -> (Duration, Result<(), String>) {
+        calls.fetch_add(1, Ordering::SeqCst);
+        panic!("resource callback stopped before returning an outcome");
+    };
+    let admission = crate::prequeue::Admission::new(&acquire);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || admission.acquire(&plan, Duration::ZERO)
+        ))
+        .is_err()
+    );
+    let next = std::thread::scope(|scope| {
+        scope
+            .spawn(|| admission.acquire(&plan, Duration::ZERO))
+            .join()
+    });
+    assert!(
+        next.is_ok(),
+        "another worker must not execute the panicking callback again"
+    );
+    assert!(next.unwrap().is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

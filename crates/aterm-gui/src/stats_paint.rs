@@ -78,6 +78,45 @@ impl Instrument {
         Self::NetworkState,
     ];
 
+    /// Every instrument, including those without a page document.
+    pub(crate) const EVERY: [Self; 9] = [
+        Self::Cpu,
+        Self::Gpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Network,
+        Self::Tokens,
+        Self::Processes,
+        Self::HowToRead,
+        Self::NetworkState,
+    ];
+
+    /// The page's rank and stable document key. Rank 6 is reserved for Spotlight.
+    pub(crate) const fn page(self) -> Option<(u8, &'static str)> {
+        match self {
+            Self::Cpu => Some((0, "cpu")),
+            Self::Gpu => Some((1, "gpu")),
+            Self::Memory => Some((2, "memory")),
+            Self::Disk => Some((3, "disk")),
+            Self::Network => Some((4, "network")),
+            Self::Processes => Some((5, "processes")),
+            Self::HowToRead => Some((7, "how-to-read")),
+            // No band row opens Tokens; Network State belongs to the fleet page.
+            Self::Tokens => None,
+            Self::NetworkState => None,
+        }
+    }
+
+    /// The complete documents in their reading order on System Resources.
+    pub(crate) fn page_order() -> Vec<Self> {
+        let mut docs: Vec<_> = Self::EVERY
+            .into_iter()
+            .filter(|i| i.page().is_some())
+            .collect();
+        docs.sort_by_key(|i| i.page().map(|(rank, _)| rank));
+        docs
+    }
+
     /// The instrument of a deck row.
     pub(crate) const fn of(res: Resource) -> Self {
         match res {

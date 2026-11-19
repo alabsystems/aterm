@@ -6,9 +6,10 @@
 
 #![cfg(unix)]
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::headless_boot;
+use crate::patience::Patience;
 
 use headless_boot::{Instance, ctl_ok, field};
 
@@ -76,17 +77,18 @@ fn open_masters(pid: u32) -> Option<usize> {
 }
 
 fn settle(what: &str, inst: &Instance, pid: u32, n: usize, witnessed: bool) {
-    let deadline = Instant::now() + HANG;
+    let mut patience = Patience::new(HANG);
     loop {
         let got = reading(inst, pid);
         if got.holds(n, witnessed) {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{what}: still {got:?}, wanted {n} sessions holding {n} masters \
-             (witnessed: {witnessed}) after {HANG:?}"
-        );
+        if let Some(why) = patience.spent() {
+            panic!(
+                "{what}: still {got:?}, wanted {n} sessions holding {n} masters \
+                 (witnessed: {witnessed}): {why}"
+            );
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }

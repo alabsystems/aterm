@@ -8,6 +8,24 @@ use aterm_types::machine_name::{Nickname, Number};
 
 const STATUS: &str = "/usr/sbin/DevToolsSecurity -status";
 
+/// How root and an account read this boot ([`crate::first_exec::boot_session`]).
+const SESSION: &str = "/usr/sbin/sysctl -n kern.bootsessionuuid";
+/// This boot as `sysctl` prints it, and as the records spell it.
+const BOOT: &str = "01234567-89AB-CDEF-0123-456789ABCDEF\n";
+const BOOT_WORD: &str = "0123456789abcdef0123456789abcdef";
+/// A boot after a restart.
+const LATER_BOOT: &str = "11111111-2222-3333-4444-555555555555\n";
+
+/// `sys` reading this boot as the returned cell says each time it is asked, [`BOOT`] at first.
+fn booted(sys: &Fake) -> std::sync::Arc<std::sync::Mutex<&'static str>> {
+    let boot = std::sync::Arc::new(std::sync::Mutex::new(BOOT));
+    let now = boot.clone();
+    sys.simulate(move |_, command| {
+        (command.display() == SESSION).then(|| Ran::ok(*now.lock().unwrap()))
+    });
+    boot
+}
+
 fn console() -> Ctx {
     let mut ctx = ctx(&[]);
     let mut user = user("alice", 501);
@@ -59,7 +77,7 @@ fn owed_reads_each_step_and_an_unreadable_one_owes_nothing() {
     assert_eq!(owed(&account), vec![Owed::Spotlight]);
     account.file(
         crate::init_spotlight::SCOPE_RECEIPT,
-        b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/My Projects\n",
+        crate::init_spotlight::tests::FULL,
     );
     assert_eq!(owed(&account), Vec::<Owed>::new());
     // A folder the home gains once it is scoped is named as work again; whether a password is
@@ -133,9 +151,12 @@ fn owed_reads_each_step_and_an_unreadable_one_owes_nothing() {
 /// owes: `Missing` exactly where [`owed`] holds the rule (no file, or one that is not a
 /// root-owned 0440 file), `Other` for a standing rule of an older build's bytes, `Current` for
 /// this build's rule for this process's account, and an error where the account cannot read the
-/// rule, which `owed` holds nothing for either. `name_rule_current` is `Ok(true)` on `Current`
-/// alone. NEGATIVE CONTROL: reading a standing rule of other bytes as `Missing` promises a step
-/// `owed` does not hold.
+/// rule, which `owed` holds nothing for either; `Removed` where no rule stands and the person's
+/// removal marker does ([`rule_removed`]), which `owed` does not hold. `name_rule_current` is
+/// `Ok(true)` on `Current` alone. NEGATIVE CONTROLS: reading a standing rule of other bytes as
+/// `Missing` promises a step `owed` does not hold; a marker beside a rule that stands again is
+/// no removal. Run: reading a removal as `Missing`, and `owed` holding a removed rule, each fail
+/// it.
 #[test]
 fn the_naming_rule_reading_tells_a_missing_rule_from_an_older_one() {
     let alice = user("alice", 501);
@@ -151,6 +172,12 @@ fn the_naming_rule_reading_tells_a_missing_rule_from_an_older_one() {
         if let Some(stat) = stat {
             sys.stat_of(ADMITTED_NAME_RULE, stat);
         }
+        sys
+    };
+    let removed = |back: Option<&str>| {
+        let sys = stands(back, back.map(|_| rule_stat(0, 0o440)));
+        sys.file(REMOVED_RULE, current.as_bytes())
+            .stat_of(REMOVED_RULE, rule_stat(0, 0o440));
         sys
     };
     for (case, sys, reading) in [
@@ -174,6 +201,12 @@ fn the_naming_rule_reading_tells_a_missing_rule_from_an_older_one() {
             "unreadable",
             stands(None, Some(rule_stat(0, 0o440))),
             Err(()),
+        ),
+        ("removed", removed(None), Ok(NameRuleReading::Removed)),
+        (
+            "back in place beside the marker",
+            removed(Some(current.as_str())),
+            Ok(NameRuleReading::Current),
         ),
     ] {
         let read = name_rule_reading(&sys);
@@ -555,16 +588,29 @@ fn an_authorized_root_apply_never_grants_uncertain_membership() {
     }
 }
 
+/// The `Info.plist` of the bundle a LAN test runs from.
+const SOURCE_INFO: &str = "/Applications/aterm.app/Contents/Info.plist";
+
+/// The build that bundle states.
+const BUILD: u64 = 1_790_120_495;
+
+/// A release executable of team `ABCDE12345` whose code is `page`, sealing the `Info.plist` of
+/// [`BUILD`] (`aterm_uds::lan::install::test_release`).
+fn team_release(page: u8) -> Vec<u8> {
+    use aterm_uds::lan::install;
+    install::test_release("ABCDE12345", page, &install::test_info(BUILD))
+}
+
 /// The broker is owed, as the account reads it, while its clone is missing or another
-/// build's, or its plist is missing or another source's; nothing is owed once both are this
-/// build's and its launchd job is running. NEGATIVE CONTROLS: a clone and a plist the account
+/// build's, or its plist is missing or one no build writes; nothing is owed once both are this
+/// build's (any bundle's plist is) and its launchd job is running. NEGATIVE CONTROLS: a clone and a plist the account
 /// cannot read owe nothing, and neither does a development build outside a bundle, nor any of
 /// it off macOS.
 #[test]
 fn the_broker_is_owed_by_its_image_and_plist_and_an_unreadable_one_owes_nothing() {
     use aterm_uds::lan::{IMAGE_EXECUTABLE, PLIST_PATH, install};
     const SOURCE: &str = "/Applications/aterm.app";
-    let ours = install::test_image(0x0100_000c, &[b"this build"]);
+    let ours = team_release(0);
     let plist = install::plist_text(Path::new(SOURCE));
     let reading = |image: Option<&[u8]>, daemon: Option<&str>, denied: bool, linux: bool| {
         let mut sys = Fake::root();
@@ -576,7 +622,8 @@ fn the_broker_is_owed_by_its_image_and_plist_and_an_unreadable_one_owes_nothing(
                 Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
             )
             .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440))
-            .file("/Applications/aterm.app/Contents/MacOS/aterm", &ours);
+            .file("/Applications/aterm.app/Contents/MacOS/aterm", &ours)
+            .file(SOURCE_INFO, &install::test_info(BUILD));
         if let Some(image) = image {
             sys.file(IMAGE_EXECUTABLE, image);
         }
@@ -590,7 +637,10 @@ fn the_broker_is_owed_by_its_image_and_plist_and_an_unreadable_one_owes_nothing(
         owed(&sys)
     };
     let theirs = install::test_image(0x0100_000c, &[b"another build"]);
+    // Any bundle's plist is one this build writes (its image adopts upward by itself); a plist no
+    // build writes is not.
     let elsewhere = install::plist_text(Path::new("/Users//a/Applications/aterm.app"));
+    let foreign = "<plist version=\"1.0\"><dict><key>Label</key><string>x</string></dict></plist>";
     let broker = vec![Owed::LanBroker];
     assert_eq!(
         reading(None, Some(&plist), false, false),
@@ -604,9 +654,14 @@ fn the_broker_is_owed_by_its_image_and_plist_and_an_unreadable_one_owes_nothing(
     );
     assert_eq!(reading(Some(&ours), None, false, false), broker, "no plist");
     assert_eq!(
-        reading(Some(&ours), Some(&elsewhere), false, false),
+        reading(Some(&ours), Some(foreign), false, false),
         broker,
         "plist differs"
+    );
+    assert_eq!(
+        reading(Some(&ours), Some(&elsewhere), false, false),
+        Vec::<Owed>::new(),
+        "another bundle's plist"
     );
     assert_eq!(
         reading(Some(&ours), Some(&plist), false, false),
@@ -635,19 +690,7 @@ fn the_broker_is_owed_by_its_image_and_plist_and_an_unreadable_one_owes_nothing(
 #[test]
 fn init_owes_a_stopped_broker_even_while_its_signed_update_is_adoptable() {
     use aterm_uds::lan::{IMAGE_EXECUTABLE, PLIST_PATH, install};
-    let release_image = |page: u8| {
-        let identifier = install::BUNDLE_ID;
-        let ident_at = 52_u32;
-        let team_at = ident_at + identifier.len() as u32 + 1;
-        let mut body = Vec::new();
-        for word in [0x20400_u32, 0, 0, ident_at, 0, 0, 0, 0, 0, 0, team_at] {
-            body.extend_from_slice(&word.to_be_bytes());
-        }
-        body.extend_from_slice(identifier.as_bytes());
-        body.extend_from_slice(b"\0ABCDE12345\0");
-        body.push(page);
-        install::test_image(0x0100_000c, &[&body])
-    };
+    let release_image = team_release;
     let source_image = release_image(1);
     for installed_image in [source_image.clone(), release_image(2)] {
         for (job, expected) in [
@@ -671,10 +714,157 @@ fn init_owes_a_stopped_broker_even_while_its_signed_update_is_adoptable() {
                     "/Applications/aterm.app/Contents/MacOS/aterm",
                     &source_image,
                 )
+                .file(SOURCE_INFO, &install::test_info(BUILD))
                 .file(IMAGE_EXECUTABLE, &installed_image)
                 .file(PLIST_PATH, install::plist_text(source).as_bytes())
                 .on("/bin/launchctl print system/systems.alab.aterm-lan", job);
             assert_eq!(owed(&sys).contains(&Owed::LanBroker), expected);
+        }
+    }
+}
+
+/// An update the running broker is to adopt by itself owes nothing while its hello names this
+/// build, or another within its bound; once it still names the other build past the bound
+/// (`adoption::LAPSE` where the broker recorded a definite failure for this source, else
+/// `adoption::LONG_LAPSE`), the image is owed as an adoption the broker did not make
+/// (`Owed::LanBrokerAdoption`, which no run asks for alone), the expectation is kept in the
+/// account's state, and a broker then heard serving this build clears it. A plist this account
+/// cannot read (`EACCES`), which never asks, leaves it that ride-along step; root's own record
+/// that it refused to install this bundle leaves it the refused `Owed::LanBroker`, in that
+/// step's words; and a broker that speaks another protocol, which serves this build nothing,
+/// makes it `Owed::LanBroker`, which asks. NEGATIVE CONTROLS: an account with no state folder,
+/// and root, never read it lapsed. MUTANTS (run): the adoption test that wants the plist current
+/// reads the unreadable plist `LanBroker`, which asks; one that ignores root's refusal reads the
+/// refused install an adoption; one that ignores whether the broker serves this protocol reads
+/// the dead LAN an adoption that asks nothing.
+#[test]
+fn an_update_the_broker_does_not_adopt_rides_the_next_elevation_after_its_looks() {
+    use aterm_uds::lan::{self, IMAGE_EXECUTABLE, PLIST_PATH, adoption, install};
+    const STATE: &str = "/Users//alice/Library/Application Support/aterm";
+    let release_image = team_release;
+    const OLD: &str = "0.206.0+gabc1234";
+    let hello_in = |protocol: u32, build: &str| {
+        Ok(lan::BrokerHello {
+            protocol,
+            build: build.to_owned(),
+            direct: None,
+        })
+    };
+    let hello = |build: &str| hello_in(lan::PROTOCOL, build);
+    let mac = |uid: u32, state: bool| {
+        let mut sys = Fake::root();
+        sys.euid = uid;
+        if state {
+            sys.account_state = Some(STATE.into());
+        }
+        let source = Path::new("/Applications/aterm.app");
+        sys.running_app = Some(source.into());
+        sys.on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
+            .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440))
+            .file(
+                "/Applications/aterm.app/Contents/MacOS/aterm",
+                &release_image(1),
+            )
+            .file(SOURCE_INFO, &install::test_info(BUILD))
+            .file(IMAGE_EXECUTABLE, &release_image(2))
+            .file(PLIST_PATH, install::plist_text(source).as_bytes())
+            .on(
+                "/bin/launchctl print system/systems.alab.aterm-lan",
+                Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
+            )
+            .on_lan_broker(hello(OLD));
+        sys
+    };
+    let lan_steps = |sys: &Fake| {
+        owed(sys)
+            .into_iter()
+            .filter(|step| matches!(step, Owed::LanBroker | Owed::LanBrokerAdoption))
+            .collect::<Vec<_>>()
+    };
+
+    // The broker recorded a definite failure for this source: the short bound.
+    let mut sys = mac(501, true);
+    sys.file(
+        lan::ADOPTION_REFUSED,
+        adoption::Refusal::new(
+            Path::new("/Applications/aterm.app"),
+            OLD,
+            adoption::Kind::Definite,
+            "the bundle is on another volume",
+        )
+        .text()
+        .unwrap()
+        .as_bytes(),
+    );
+    assert_eq!(lan_steps(&sys), [], "within the broker's looks");
+    let record = format!("{STATE}/{}", adoption::RECORD);
+    assert!(sys.written(&record).is_some(), "the expectation is kept");
+    sys.now += adoption::LAPSE.as_secs() - 1;
+    assert_eq!(lan_steps(&sys), []);
+    sys.now += 1;
+    assert_eq!(lan_steps(&sys), [Owed::LanBrokerAdoption]);
+    assert!(!Owed::LanBrokerAdoption.asks_by_itself());
+    assert!(!refused(&sys, Owed::LanBrokerAdoption));
+    // The broker took it up: the image reads current, and its hello clears the record.
+    sys.file(IMAGE_EXECUTABLE, &release_image(1))
+        .lan_broker_now(hello(lan::hello_build()));
+    assert_eq!(lan_steps(&sys), []);
+    assert_eq!(
+        adoption::Record::parse(&sys.written(&record).unwrap()),
+        adoption::Record::default()
+    );
+
+    // With no record from the broker, the long bound; then an unreadable plist, root's refusal
+    // of this bundle and a broker of another protocol, each read before and after it.
+    let lapsed = |sys: &mut Fake| {
+        let before = lan_steps(sys);
+        sys.now += adoption::LONG_LAPSE.as_secs();
+        (before, lan_steps(sys))
+    };
+    let mut sys = mac(501, true);
+    assert_eq!(lan_steps(&sys), []);
+    sys.now += adoption::LAPSE.as_secs();
+    assert_eq!(
+        lan_steps(&sys),
+        [],
+        "no definite failure: past the short bound"
+    );
+    sys.now += (adoption::LONG_LAPSE - adoption::LAPSE).as_secs();
+    assert_eq!(lan_steps(&sys), [Owed::LanBrokerAdoption], "the long bound");
+    let mut sys = mac(501, true);
+    sys.stat_fails(PLIST_PATH, std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        lapsed(&mut sys),
+        (vec![], vec![Owed::LanBrokerAdoption]),
+        "an unreadable plist"
+    );
+    let mut sys = mac(501, true);
+    let key = crate::items::lan::refusal_key(&sys).unwrap();
+    sys.file(
+        aterm_types::macos_setup::refused::LAN_BROKER,
+        format!("{key}\n").as_bytes(),
+    );
+    assert!(refused(&sys, Owed::LanBroker));
+    assert_eq!(
+        lapsed(&mut sys),
+        (vec![], vec![Owed::LanBroker]),
+        "root refused to install this bundle"
+    );
+    let mut sys = mac(501, true);
+    sys.lan_broker_now(hello_in(lan::PROTOCOL + 1, OLD));
+    assert_eq!(
+        lapsed(&mut sys),
+        (vec![], vec![Owed::LanBroker]),
+        "a broker of another protocol"
+    );
+    assert!(Owed::LanBroker.asks_by_itself());
+    assert!(!refused(&sys, Owed::LanBroker));
+
+    for (uid, state) in [(501, false), (0, true)] {
+        let mut sys = mac(uid, state);
+        for _ in 0..2 {
+            assert_eq!(lan_steps(&sys), [], "{uid} {state}");
+            sys.now += adoption::LONG_LAPSE.as_secs();
         }
     }
 }
@@ -687,7 +877,7 @@ fn init_owes_a_stopped_broker_even_while_its_signed_update_is_adoptable() {
 fn a_broker_the_person_switched_off_owes_no_password() {
     use aterm_uds::lan::{IMAGE_EXECUTABLE, PLIST_PATH, install};
     const PRINT_DISABLED: &str = "/bin/launchctl print-disabled system";
-    let ours = install::test_image(0x0100_000c, &[b"this build"]);
+    let ours = team_release(0);
     let list = |state: &str| {
         Ran::ok(&format!(
             "disabled services = {{\n\t\"systems.alab.aterm-lan\" => {state}\n}}\n"
@@ -700,6 +890,7 @@ fn a_broker_the_person_switched_off_owes_no_password() {
         sys.on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
             .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440))
             .file("/Applications/aterm.app/Contents/MacOS/aterm", &ours)
+            .file(SOURCE_INFO, &install::test_info(BUILD))
             .on(
                 "/bin/launchctl print system/systems.alab.aterm-lan",
                 Ran::exit(113, "Could not find service"),
@@ -1082,14 +1273,109 @@ fn the_rule_goes_live_only_once_visudo_passes_it() {
     }
 }
 
+/// The naming rule's revert moves it onto the person's removal marker in one `/bin/mv -f`, which
+/// replaces a link planted there and never follows it; while the marker stands and no rule does,
+/// the rule is not owed and nothing names the Mac by it; the apply that puts it back removes the
+/// marker. NEGATIVE CONTROLS: no marker, or a rule that stands again, is no removal. Run: a
+/// revert that is an `rm` leaves no marker; one that copies the rule with `cat >>` before the
+/// `rm` writes through the planted link; `owed` that holds a removed rule, and an apply that
+/// keeps the marker, each fail it.
+#[test]
+fn a_rule_the_person_removed_stays_removed_until_it_is_put_back() {
+    let revert = NameRule::Current.revert().unwrap();
+
+    // The revert as a person's `sudo <revert>` runs it, on scratch paths: the real `/bin/mv`.
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let rule = tmp.path().join("aterm-admitted-name");
+    let marker = tmp.path().join(".aterm-admitted-name.removed");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::write(&rule, b"the rule\n").unwrap();
+    std::fs::write(&elsewhere, b"not root's to change\n").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &marker).unwrap();
+    let scratch = revert
+        .replace(
+            ADMITTED_NAME_RULE,
+            &crate::port::shell_word(rule.to_str().unwrap()),
+        )
+        .replace(
+            REMOVED_RULE,
+            &crate::port::shell_word(marker.to_str().unwrap()),
+        );
+    assert!(
+        !scratch.contains("/etc/"),
+        "only scratch paths are run: {scratch}"
+    );
+    let mut sh = aterm_uds::spawnfd::command("/bin/sh");
+    sh.args(["-c", &scratch]);
+    let out = aterm_uds::deadline::output_while_process_progressing(
+        &mut sh,
+        aterm_uds::deadline::ECHO_HANG,
+        "the naming rule's revert",
+    )
+    .unwrap();
+    assert!(out.status.success(), "{scratch}: {out:?}");
+    assert!(!rule.exists(), "{scratch}");
+    let kept = std::fs::symlink_metadata(&marker).unwrap();
+    assert!(kept.is_file(), "{scratch}");
+    assert_eq!(std::fs::read(&marker).unwrap(), b"the rule\n");
+    assert_eq!(
+        std::fs::read(&elsewhere).unwrap(),
+        b"not root's to change\n"
+    );
+
+    // What setup reads once the revert ran.
+    let mac = |marker: bool| {
+        let sys = Fake::root();
+        sys.on(STATUS, Ran::ok("Developer mode is currently enabled.\n"));
+        if marker {
+            sys.file(REMOVED_RULE, b"the rule\n")
+                .stat_of(REMOVED_RULE, rule_stat(0, 0o440));
+        }
+        sys
+    };
+    assert_eq!(owed(&mac(false)), vec![Owed::NameRule]);
+    let removed = mac(true);
+    assert!(rule_removed(&removed));
+    assert_eq!(owed(&removed), Vec::<Owed>::new());
+    let named = name_by_rule(
+        &removed,
+        &GeneratedNames::number_only(Number::parse("m42").unwrap()),
+        &|| Ok(()),
+    )
+    .unwrap_err();
+    assert!(
+        named.starts_with("you removed setup's naming permission"),
+        "{named}"
+    );
+    assert!(!removed.calls().iter().any(|call| call.contains("scutil")));
+
+    // The apply that puts it back removes the marker, and the rule then reads in place.
+    removed.simulate(|_, command| {
+        (command.program == Path::new("/bin/chmod") || command.program == Path::new(VISUDO))
+            .then(|| Ran::ok(""))
+    });
+    NameRule::Current.apply(&removed, &console()).unwrap();
+    assert!(removed.stat(Path::new(REMOVED_RULE)).is_err());
+    assert!(!rule_removed(&removed));
+    assert!(removed.written(ADMITTED_NAME_RULE).is_some());
+    let back = mac(true);
+    back.file(ADMITTED_NAME_RULE, b"rule\n")
+        .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440));
+    assert!(!rule_removed(&back), "a rule back in place is no removal");
+}
+
 /// A developer mode root could not set is recorded with the reading it failed for, so a run
 /// nobody asked for does not ask the Mac password for it again ([`refused`]); the apply that
 /// succeeds removes the record. The key names the half that failed: a membership refused once
-/// the mode turned on is recorded as the membership's, not the mode's. NEGATIVE CONTROLS:
-/// nothing is recorded before any apply, for an apply that could not read the mode, for a tool
-/// that gave no answer in its budget or was killed, or for another step; the record of a mode
-/// that would not turn on does not stand for a missing membership, nor one account's missing
-/// membership for another's; a record root does not own stands for nothing.
+/// the mode turned on is recorded as the membership's, not the mode's. A tool that could not
+/// answer in its budget or was killed gave no verdict: its line stands for nothing until one
+/// comes again `APART` later in the same boot, which stalls the step for that boot alone.
+/// NEGATIVE CONTROLS: nothing is recorded before any apply, for an apply that could not read the
+/// mode, for a no-verdict where the boot cannot be read, or for another step; the record of a
+/// mode that would not turn on does not stand for a missing membership, nor one account's
+/// missing membership for another's; a record root does not own stands for nothing; a pending
+/// line stands for nothing, and a stalled one for no later boot. Run: routing a no-verdict to a
+/// definite failure, and dropping the killed tool's no-verdict, each fail it.
 #[test]
 fn a_developer_mode_root_could_not_set_is_recorded_until_an_apply_succeeds() {
     use aterm_types::macos_setup::refused::{DEVELOPER_MODE, LAN_BROKER};
@@ -1234,29 +1520,86 @@ fn a_developer_mode_root_could_not_set_is_recorded_until_an_apply_succeeds() {
     assert!(refused(&account(501, ON, Some(&record)), Owed::Debugger));
     assert!(!refused(&account(501, OFF, Some(&record)), Owed::Debugger));
 
-    // A tool that gave no answer in its budget, or that a signal killed, says nothing of this
-    // Mac: the step is asked for again.
-    let slow = Fake::root();
+    // A tool that gave no answer in its budget, or that a signal killed, may be this Mac's
+    // passing state: the first such end is pending, and asked for again; one `APART` later in
+    // the same boot stalls the step for that boot; after a restart it is the key's own.
+    let apart = aterm_types::macos_setup::refused::APART.as_secs();
+    let reader = |status: &str, record: &[u8], boot: &str| {
+        let sys = account(501, status, Some(record));
+        sys.on(SESSION, Ran::ok(boot));
+        sys
+    };
+    let mut slow = Fake::root();
+    let boot = booted(&slow);
     slow.on(STATUS, Ran::ok(OFF))
         .on(admin, Ran::ok("yes alice is a member of admin\n"))
         .time_out(enable);
     assert!(DeveloperMode.apply(&slow, &ctx).is_err());
-    assert!(slow.written(DEVELOPER_MODE).is_none());
+    let pending = format!("no-verdict {} {BOOT_WORD} off\n", slow.now);
+    assert_eq!(
+        slow.written(DEVELOPER_MODE).as_deref(),
+        Some(pending.as_bytes())
+    );
+    assert!(!refused(
+        &reader(OFF, pending.as_bytes(), BOOT),
+        Owed::Debugger
+    ));
+    slow.now += apart - 1;
+    assert!(DeveloperMode.apply(&slow, &ctx).is_err());
+    assert_eq!(
+        slow.written(DEVELOPER_MODE).as_deref(),
+        Some(pending.as_bytes())
+    );
+    slow.now += 1;
+    assert!(DeveloperMode.apply(&slow, &ctx).is_err());
+    let stalled = format!("stalled {BOOT_WORD} off\n");
+    assert_eq!(
+        slow.written(DEVELOPER_MODE).as_deref(),
+        Some(stalled.as_bytes())
+    );
+    assert!(refused(
+        &reader(OFF, stalled.as_bytes(), BOOT),
+        Owed::Debugger
+    ));
+    assert!(!refused(
+        &reader(OFF, stalled.as_bytes(), LATER_BOOT),
+        Owed::Debugger
+    ));
+    *boot.lock().unwrap() = LATER_BOOT;
+    assert!(DeveloperMode.apply(&slow, &ctx).is_err());
+    assert_eq!(slow.written(DEVELOPER_MODE).as_deref(), Some(&b"off\n"[..]));
+
+    let killed_add = || Ran {
+        status: None,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
     let killed = Fake::root();
     killed
         .on(STATUS, Ran::ok(ON))
         .on(admin, not_member("admin"))
         .on(checkmember, not_member("_developer"))
-        .on(
-            add,
-            Ran {
-                status: None,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            },
-        );
+        .on(SESSION, Ran::ok(BOOT))
+        .on(add, killed_add());
     assert!(DeveloperMode.apply(&killed, &ctx).is_err());
-    assert!(killed.written(DEVELOPER_MODE).is_none());
+    let pending = format!("no-verdict {} {BOOT_WORD} member 501\n", killed.now);
+    assert_eq!(
+        killed.written(DEVELOPER_MODE).as_deref(),
+        Some(pending.as_bytes())
+    );
+    assert!(!refused(
+        &reader(ON, pending.as_bytes(), BOOT),
+        Owed::Debugger
+    ));
+    // Where the boot cannot be read, a no-verdict lists nothing.
+    let unbooted = Fake::root();
+    unbooted
+        .on(STATUS, Ran::ok(ON))
+        .on(admin, not_member("admin"))
+        .on(checkmember, not_member("_developer"))
+        .on(add, killed_add());
+    assert!(DeveloperMode.apply(&unbooted, &ctx).is_err());
+    assert!(unbooted.written(DEVELOPER_MODE).is_none());
 
     // An apply that could not read the mode says nothing of the step.
     let unread = Fake::root();
@@ -1274,7 +1617,12 @@ fn a_developer_mode_root_could_not_set_is_recorded_until_an_apply_succeeds() {
     ));
     let full = Fake::root();
     full.file(DEVELOPER_MODE, keys.as_bytes());
-    record_refusal(&full, DEVELOPER_MODE, "off");
+    record_refusal(
+        &full,
+        DEVELOPER_MODE,
+        "off",
+        aterm_types::macos_setup::refused::Failure::Definite,
+    );
     assert_eq!(full.written(DEVELOPER_MODE).unwrap(), keys.as_bytes());
 }
 
@@ -1492,4 +1840,60 @@ fn an_admission_after_the_elevation_names_the_mac_through_the_rule_alone() {
             .collect();
         assert_eq!(writes.len(), expected.len(), "{computer}: {writes:?}");
     }
+}
+
+/// Root reads and replaces a step's record only while it holds the record's lock
+/// (`refused::lock_of`), the one the LAN broker takes to take out its own install's lines, and a
+/// success removes the record under the same lock, so the broker's change finishes first and is
+/// never written back over the removal: what root writes is built on what the broker left once
+/// root has the lock, never on what root read before. Root reads its boot before it takes the
+/// lock. NEGATIVE CONTROLS (run): a `record_refusal` and a `clear_refusal` that take no lock; a
+/// `record_refusal` that reads the record before it takes the lock; one that reads its boot under
+/// the lock.
+#[test]
+fn root_changes_a_steps_record_only_under_its_lock() {
+    use aterm_types::macos_setup::refused::{Failure, LAN_BROKER, lock_of};
+    let hold = format!("hold {}", lock_of(Path::new(LAN_BROKER)).display());
+    let release = format!("release {}", lock_of(Path::new(LAN_BROKER)).display());
+    let within = |sys: &Fake, change: &str| {
+        let calls = sys.calls();
+        let at = |want: &str| {
+            calls
+                .iter()
+                .position(|call| call == want)
+                .unwrap_or_else(|| panic!("{want:?} not in {calls:?}"))
+        };
+        assert!(
+            at(&hold) < at(change) && at(change) < at(&release),
+            "{calls:?}"
+        );
+    };
+    let failed = Fake::root();
+    record_refusal(&failed, LAN_BROKER, "k", Failure::Definite);
+    assert_eq!(failed.written(LAN_BROKER).unwrap(), b"k\n");
+    within(&failed, &format!("write {LAN_BROKER} 644"));
+    let calls = failed.calls();
+    let at = |want: &str| calls.iter().position(|call| call == want);
+    assert!(
+        at(SESSION).is_some() && at(SESSION) < at(&hold),
+        "the boot is read before the lock: {calls:?}"
+    );
+
+    // The broker took out its own line, `mine`, under the lock just before root got it.
+    let raced = Fake::root();
+    raced
+        .file(LAN_BROKER, b"mine\nother\n")
+        .changed_before_hold(LAN_BROKER, b"other\n");
+    record_refusal(&raced, LAN_BROKER, "k", Failure::Definite);
+    assert_eq!(
+        String::from_utf8(raced.written(LAN_BROKER).unwrap()).unwrap(),
+        "k\nother\n",
+        "built on what the broker left"
+    );
+
+    let succeeded = Fake::root();
+    succeeded.file(LAN_BROKER, b"k\n");
+    clear_refusal(&succeeded, LAN_BROKER);
+    assert!(succeeded.written(LAN_BROKER).is_none());
+    within(&succeeded, &format!("remove {LAN_BROKER}"));
 }

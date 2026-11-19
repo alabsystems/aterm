@@ -100,6 +100,7 @@ const fn plain(ty: &Ty) -> bool {
             | Ty::Url
             | Ty::Key
             | Ty::Ref(_)
+            | Ty::Link(_)
     )
 }
 
@@ -320,6 +321,7 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
         | Ty::Url
         | Ty::Key
         | Ty::Ref(_)
+        | Ty::Link(_)
         | Ty::Digest
         | Ty::Path
         | Ty::Decimal => Ok(Value::String(text.trim().to_owned())),
@@ -649,13 +651,7 @@ impl Export {
         if opened.is_empty() {
             return self;
         }
-        for (pk, seen) in &mut self.base.rows {
-            for (column, cell) in seen.iter_mut() {
-                if let Some(values) = opened.get(&(pk.clone(), column.clone())) {
-                    cell.shown = show_opened(values);
-                }
-            }
-        }
+        self.base.show_opened(opened);
         self.text = render(&self.base);
         self
     }
@@ -692,88 +688,119 @@ pub fn export_projected(
     projection: &Projection,
     filters: &[Where],
 ) -> Result<Export> {
-    if collection.kind != Kind::Cells {
-        return Err(Error::new(&format!(
-            "{}: only a cells collection is edited in the grid",
-            collection.name
-        )));
-    }
-    let mut registers = registers(collection, cells);
-    let columns = layout(collection, projection);
-    let header: Vec<String> = columns.iter().map(GridColumn::header).collect();
-    let collection_name = collection.name.to_owned();
-    let mut raw_lookup = (collection_name.clone(), String::new());
-    let mut rows = Vec::with_capacity(projection.rows.len());
-    'rows: for (pk, row) in &projection.rows {
-        for filter in filters {
-            if !filter.matches(collection, pk, row)? {
-                continue 'rows;
-            }
-        }
-        let mut seen = BTreeMap::new();
-        for column in &columns {
-            let (candidates, elements) = registers
-                .remove(&(pk.as_str(), column.name.as_str()))
-                .unwrap_or_default();
-            let raw = row.raw.contains(&column.name);
-            raw_lookup.1.clear();
-            raw_lookup.1.push_str(pk);
-            raw_lookup.1.push('.');
-            raw_lookup.1.push_str(&column.name);
-            let shown = match column.source {
-                Source::Pk => pk.clone(),
-                Source::Unknown => {
-                    show_raw(None, cells.get(&raw_lookup), row.fields.get(&column.name))
-                }
-                Source::Schema(schema)
-                    if raw && matches!(schema.ty, Ty::SecretRef | Ty::Secret) =>
-                {
-                    super::secret::MASK.to_owned()
-                }
-                Source::Schema(schema) if raw => show_raw(
-                    Some(schema),
-                    cells.get(&raw_lookup),
-                    row.fields.get(&column.name),
-                ),
-                Source::Schema(schema) => match row.claims.get(&column.name) {
-                    Some(Some(value)) => show(&schema.ty, value),
-                    Some(None) => format!(
-                        "{CONFLICT}{}",
-                        show_field(schema, row.fields.get(&column.name))
-                    ),
-                    None => show_field(schema, row.fields.get(&column.name)),
-                },
-            };
-            let raw = raw
-                && match column.source {
-                    Source::Schema(schema) => {
-                        !replaceable(collection, schema, cells.get(&raw_lookup), &shown)
-                    }
-                    Source::Pk | Source::Unknown => true,
-                };
-            seen.insert(
-                column.name.clone(),
-                Seen {
-                    shown,
-                    candidates,
-                    elements,
-                    raw,
-                },
-            );
-        }
-        rows.push((pk.clone(), seen));
-    }
-    let base = Base {
-        table: format!("{}/{}", table.application, table.role),
-        collection: collection_name,
-        version: collection.version,
-        header,
-        rows,
-    };
+    let base = Base::from_projection(table, collection, cells, projection, filters)?;
     Ok(Export {
         text: render(&base),
         base,
     })
+}
+
+impl Base {
+    /// Lay out the projected rows and retain their signed candidates for a later save.
+    /// The projection and cells must come from the same observation of this collection.
+    ///
+    /// # Errors
+    /// As [`export`].
+    pub fn from_projection(
+        table: &Table,
+        collection: &'static Collection,
+        cells: &Cells,
+        projection: &Projection,
+        filters: &[Where],
+    ) -> Result<Self> {
+        if collection.kind != Kind::Cells {
+            return Err(Error::new(&format!(
+                "{}: only a cells collection is edited in the grid",
+                collection.name
+            )));
+        }
+        let mut registers = registers(collection, cells);
+        let columns = layout(collection, projection);
+        let header: Vec<String> = columns.iter().map(GridColumn::header).collect();
+        let collection_name = collection.name.to_owned();
+        let mut raw_lookup = (collection_name.clone(), String::new());
+        let mut rows = Vec::with_capacity(projection.rows.len());
+        'rows: for (pk, row) in &projection.rows {
+            for filter in filters {
+                if !filter.matches(collection, pk, row)? {
+                    continue 'rows;
+                }
+            }
+            let mut seen = BTreeMap::new();
+            for column in &columns {
+                let (candidates, elements) = registers
+                    .remove(&(pk.as_str(), column.name.as_str()))
+                    .unwrap_or_default();
+                let raw = row.raw.contains(&column.name);
+                raw_lookup.1.clear();
+                raw_lookup.1.push_str(pk);
+                raw_lookup.1.push('.');
+                raw_lookup.1.push_str(&column.name);
+                let shown = match column.source {
+                    Source::Pk => pk.clone(),
+                    Source::Unknown => {
+                        show_raw(None, cells.get(&raw_lookup), row.fields.get(&column.name))
+                    }
+                    Source::Schema(schema)
+                        if raw && matches!(schema.ty, Ty::SecretRef | Ty::Secret) =>
+                    {
+                        super::secret::MASK.to_owned()
+                    }
+                    Source::Schema(schema) if raw => show_raw(
+                        Some(schema),
+                        cells.get(&raw_lookup),
+                        row.fields.get(&column.name),
+                    ),
+                    Source::Schema(schema) => match row.claims.get(&column.name) {
+                        Some(Some(value)) => show(&schema.ty, value),
+                        Some(None) => format!(
+                            "{CONFLICT}{}",
+                            show_field(schema, row.fields.get(&column.name))
+                        ),
+                        None => show_field(schema, row.fields.get(&column.name)),
+                    },
+                };
+                let raw = raw
+                    && match column.source {
+                        Source::Schema(schema) => {
+                            !replaceable(collection, schema, cells.get(&raw_lookup), &shown)
+                        }
+                        Source::Pk | Source::Unknown => true,
+                    };
+                seen.insert(
+                    column.name.clone(),
+                    Seen {
+                        shown,
+                        candidates,
+                        elements,
+                        raw,
+                    },
+                );
+            }
+            rows.push((pk.clone(), seen));
+        }
+        Ok(Self {
+            table: format!("{}/{}", table.application, table.role),
+            collection: collection_name,
+            version: collection.version,
+            header,
+            rows,
+        })
+    }
+
+    /// Show opened ordinary values in the baseline while preserving their signed candidates.
+    pub fn show_opened(&mut self, opened: &Opened) {
+        if opened.is_empty() {
+            return;
+        }
+        for (pk, seen) in &mut self.rows {
+            for (column, cell) in seen.iter_mut() {
+                if let Some(values) = opened.get(&(pk.clone(), column.clone())) {
+                    cell.shown = show_opened(values);
+                }
+            }
+        }
+    }
 }
 
 /// Whether a raw cell of `schema`, a column of `collection` that shows as `shown`, is the owner's

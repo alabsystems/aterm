@@ -10,8 +10,9 @@
 //! - A record whose writer is not yet a seat in this Mac's view ([`Verdict::Waiting`]) waits, by
 //!   offset, and is tried again after each membership record this Mac applies and after each
 //!   change of the membership log's standings ([`Ingest::kick`]). The waiting set is bounded by
-//!   the table's record budget ([`WAITING_MAX`]); when it is full the consumer stops taking
-//!   records and an `Inventory` exchange of the membership log starts.
+//!   its records' bytes ([`WAITING_BYTES`]); when it is full the consumer stops taking records,
+//!   which holds the sender back (the reader's queue fills, and the group commits nothing past
+//!   what it took), drops none, and an `Inventory` exchange of the membership log starts.
 //! - The group commits only past records that were applied, refused for good, or set waiting;
 //!   one the store was too busy to take ([`Verdict::Busy`]) holds the commit below it and is tried
 //!   again. The waiting offsets are kept in [`WAITING_FILE`], so a restart reads them again from
@@ -47,8 +48,10 @@ pub const GROUP_PREFIX: &str = "/ingest";
 /// The most records of one table one store call takes (Commons repair's batch).
 pub const BATCH: usize = 16;
 
-/// The most records that wait at once: the table's record budget (`aterm_db::replica::MAX_RECORDS`).
-pub const WAITING_MAX: usize = 8192;
+/// The most bytes of records that wait at once. The worker takes no delivery while the waiting
+/// records hold this many, and takes a pass's deliveries only while their bytes fit what is left,
+/// so the waiting set stays below it by at most one record. No count of records bounds it.
+pub const WAITING_BYTES: usize = 32 << 20;
 
 /// The file beside `tables.log` that keeps the waiting records' offsets.
 pub const WAITING_FILE: &str = "waiting";
@@ -85,8 +88,11 @@ struct Delivered {
 /// What the worker holds.
 #[derive(Default)]
 struct State {
-    /// The records that wait for a membership record, by offset.
+    /// The records that wait for a membership record, by offset. Changed only through
+    /// [`Self::wait`] and [`Self::unwait`], which keep [`Self::waiting_bytes`].
     waiting: BTreeMap<u64, (Carries, Vec<u8>)>,
+    /// The bytes of the [`Self::waiting`] records' payloads.
+    waiting_bytes: usize,
     /// The records a busy store did not take, by offset.
     busy: BTreeMap<u64, (Carries, Vec<u8>)>,
     /// The highest offset the worker settled or set aside.
@@ -102,6 +108,23 @@ struct State {
     asked: bool,
 }
 
+impl State {
+    /// Set the record at `offset` waiting.
+    fn wait(&mut self, offset: u64, record: (Carries, Vec<u8>)) {
+        self.waiting_bytes += record.1.len();
+        if let Some(old) = self.waiting.insert(offset, record) {
+            self.waiting_bytes -= old.1.len();
+        }
+    }
+
+    /// The record at `offset` waits no more.
+    fn unwait(&mut self, offset: u64) {
+        if let Some(old) = self.waiting.remove(&offset) {
+            self.waiting_bytes -= old.1.len();
+        }
+    }
+}
+
 /// The ingest consumer of one mesh.
 pub struct Ingest {
     stores: Arc<dyn Stores>,
@@ -115,6 +138,8 @@ pub struct Ingest {
     /// The reader's bell between tails: stop. Only the reader waits on it.
     retry: Bell,
     state: Mutex<State>,
+    /// The bytes the waiting records may hold ([`WAITING_BYTES`]; a test sets less).
+    waiting_bound: std::sync::atomic::AtomicUsize,
     /// Notified each time the group commits.
     committed: Condvar,
     kicked: AtomicBool,
@@ -177,6 +202,7 @@ impl Ingest {
             bell: Arc::new(Bell::default()),
             retry: Bell::default(),
             state: Mutex::new(State::default()),
+            waiting_bound: std::sync::atomic::AtomicUsize::new(WAITING_BYTES),
             committed: Condvar::new(),
             kicked: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -232,6 +258,19 @@ impl Ingest {
     #[must_use]
     pub fn waiting(&self) -> usize {
         self.state.lock_or_recover().waiting.len()
+    }
+
+    /// The bytes of the records waiting now.
+    #[must_use]
+    pub fn waiting_bytes(&self) -> usize {
+        self.state.lock_or_recover().waiting_bytes
+    }
+
+    /// Bound the waiting records to `bytes` in place of [`WAITING_BYTES`].
+    #[cfg(test)]
+    pub(crate) fn bound_waiting_for_test(&self, bytes: usize) {
+        self.waiting_bound.store(bytes, Ordering::Release);
+        self.bell.ring();
     }
 
     pub(crate) fn stop(&self) {
@@ -368,14 +407,32 @@ impl Ingest {
                 committer = None;
             }
             let mut landed = self.kicked.swap(false, Ordering::AcqRel);
-            let full = self.state.lock_or_recover().waiting.len() >= WAITING_MAX;
+            let bound = self.waiting_bound.load(Ordering::Acquire);
+            let room = bound.saturating_sub(self.state.lock_or_recover().waiting_bytes);
+            let full = room == 0;
             if !full && !self.held() {
                 let mut members: Vec<(u64, Vec<u8>)> = Vec::new();
                 let mut tables: Vec<(u64, [u8; 32], Vec<u8>)> = Vec::new();
                 let mut through = None;
                 {
                     let mut queue = self.queue.lock_or_recover();
-                    let n = queue.len().min(TAKE);
+                    // Each delivery taken may wait: take them while their bytes fit the room the
+                    // waiting set has left, and always one, so a record larger than the room
+                    // still moves.
+                    let mut n = 0;
+                    let mut taken = 0usize;
+                    for delivered in queue.iter().take(TAKE) {
+                        if n > 0 && taken >= room {
+                            break;
+                        }
+                        taken = taken.saturating_add(
+                            delivered
+                                .record
+                                .as_ref()
+                                .map_or(0, |(_, payload)| payload.len()),
+                        );
+                        n += 1;
+                    }
                     for delivered in queue.drain(..n) {
                         through = through.max(Some(delivered.offset));
                         match delivered.record {
@@ -395,8 +452,9 @@ impl Ingest {
                 }
             } else if full && !std::mem::replace(&mut self.state.lock_or_recover().asked, true) {
                 aterm_log::warn!(
-                    "mesh: {WAITING_MAX} table records wait for membership records; an Inventory \
-                     of the membership log starts"
+                    "mesh: {bound} bytes of table records wait for membership records; the \
+                     ingest takes no more until they settle, and an Inventory of the membership \
+                     log starts"
                 );
                 self.inventory.members_due();
             }
@@ -467,7 +525,7 @@ impl Ingest {
         let (mut applied, mut waiting, mut refused) = (0, 0, 0);
         let mut state = self.state.lock_or_recover();
         for ((offset, record), verdict) in offsets.into_iter().zip(wires).zip(verdicts) {
-            state.waiting.remove(&offset);
+            state.unwait(offset);
             state.busy.remove(&offset);
             match verdict {
                 Verdict::Applied => {
@@ -476,7 +534,7 @@ impl Ingest {
                 }
                 Verdict::Waiting(_) => {
                     waiting += 1;
-                    state.waiting.insert(offset, (Carries::Members, record));
+                    state.wait(offset, (Carries::Members, record));
                 }
                 Verdict::Refused(why) => {
                     refused += 1;
@@ -504,7 +562,7 @@ impl Ingest {
         for (offset, table, payload) in records {
             let Some((kind, wire)) = stores::take_table_payload(payload) else {
                 let mut state = self.state.lock_or_recover();
-                state.waiting.remove(&offset);
+                state.unwait(offset);
                 state.busy.remove(&offset);
                 aterm_log::info!("mesh: a table record at {offset} names no kind: refused");
                 continue;
@@ -524,14 +582,14 @@ impl Ingest {
             let (mut applied, mut waiting, mut refused) = (0, 0, 0);
             let mut state = self.state.lock_or_recover();
             for ((offset, mut wire), verdict) in offsets.into_iter().zip(wires).zip(verdicts) {
-                state.waiting.remove(&offset);
+                state.unwait(offset);
                 state.busy.remove(&offset);
                 match verdict {
                     Verdict::Applied => applied += 1,
                     Verdict::Waiting(_) => {
                         waiting += 1;
                         wire.insert(0, kind.byte());
-                        state.waiting.insert(offset, (Carries::Table(table), wire));
+                        state.wait(offset, (Carries::Table(table), wire));
                     }
                     Verdict::Refused(why) => {
                         refused += 1;
@@ -788,7 +846,7 @@ impl Ingest {
             let mut state = self.state.lock_or_recover();
             state.unread.remove(&offset);
             if let Some(record) = record {
-                state.waiting.insert(offset, record);
+                state.wait(offset, record);
                 found += 1;
             }
         }

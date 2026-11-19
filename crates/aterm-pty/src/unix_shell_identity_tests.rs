@@ -733,7 +733,9 @@ fn a_shell_alive_past_the_deadline_is_reaped_when_it_exits() {
     );
 }
 
-/// Set only on the child [`a_quit_leaves_no_shell`] starts.
+/// Set only on the child [`a_quit_leaves_no_shell`] starts, to the script the watching process
+/// passes it: a loop there names the watcher ([`aterm_uds::stand_in_loop::while_alive`]), which
+/// outlives the child.
 #[cfg(target_os = "macos")]
 const QUITTING: &str = "ATERM_PTY_TEST_QUITTING";
 
@@ -748,15 +750,19 @@ fn a_quit_after_wait_for_reaps_leaves_no_hup_ignoring_shell() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_quit_after_wait_for_reaps_leaves_no_shell_that_caught_its_hang_up_and_carried_on() {
-    a_quit_leaves_no_shell("trap : HUP; printf 'UP\\n'; while :; do /bin/sleep 600; done");
+    a_quit_leaves_no_shell(&format!(
+        "trap : HUP; printf 'UP\\n'; {}",
+        aterm_uds::stand_in_loop::while_alive("/bin/sleep 600")
+    ));
 }
 
 /// A process hangs up a shell running `script`, waits for its reap and exits; the shell must not
-/// outlive it. The calling test runs twice, as that process and as the one watching it.
+/// outlive it. The calling test runs twice, as that process and as the one watching it, which
+/// hands that process its `script`.
 #[cfg(target_os = "macos")]
 fn a_quit_leaves_no_shell(script: &str) {
-    if std::env::var_os(QUITTING).is_some() {
-        let sh = parked_session(script);
+    if let Ok(script) = std::env::var(QUITTING) {
+        let sh = parked_session(&script);
         let identity = record_spawned_shell(sh.pid);
         let birth = identity.birth.expect("a live child reads a birth");
         println!("HOLDOUT {} {birth}", sh.pid);
@@ -778,7 +784,7 @@ fn a_quit_leaves_no_shell(script: &str) {
     let out = std::fs::File::create(&log).expect("the child's log");
     let mut child = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
         .args(["--exact", &test, "--nocapture", "--test-threads=1"])
-        .env(QUITTING, "1")
+        .env(QUITTING, script)
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(out.try_clone().expect("the log, twice"))
         .stderr(out)

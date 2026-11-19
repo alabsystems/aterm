@@ -3,8 +3,7 @@
 
 //! The token view and the quiet offer (DESIGN-claude-setup-token §5.9, §5.10, slice S12): the
 //! offer once per change of its pair, none while a write made here waits, the step's
-//! `--replace`, the report's fields, peers from a fleet read, the state line's phrase and the
-//! doctor's counts. The checks are of structure (records, keys, steps), never of wording.
+//! `--replace`, the report's fields, the state line's phrase and the doctor's counts. The checks are of structure (records, keys, steps), never of wording.
 
 use super::*;
 use crate::harness::accounts_tokens::{NOTED, Table, UsedOn, Verification};
@@ -48,7 +47,7 @@ fn covered(login: LoginHalf) -> Covered {
     };
     Covered {
         key: key(),
-        email: EMAIL.to_owned(),
+        email: Some(EMAIL.to_owned()),
         label: Some("work".to_owned()),
         word: named.word(),
         named,
@@ -167,7 +166,6 @@ fn a_write_waiting_here_offers_nothing_and_says_not_yet_in_vault() {
     assert!(waiting.phrase(NOW as i64).is_none());
     let report = Report::Accounts {
         accounts: vec![waiting],
-        peers: PeersShown::NotRead,
         sessions: None,
         steps: Held::default(),
     };
@@ -256,7 +254,6 @@ fn the_step_for_soon_and_exposed_carries_replace() {
 fn row() -> TokenRow {
     TokenRow {
         key: KEY.to_owned(),
-        email: EMAIL.to_owned(),
         account_id: Some("c-0123456789ab".to_owned()),
         label: Some("work".to_owned()),
         entry: key().entry(),
@@ -268,8 +265,6 @@ fn row() -> TokenRow {
         used_on: UsedOn {
             first_served_at: Some(NOW - DAY),
             last_served_at: Some(NOW),
-            peers: vec!["m9".to_owned()],
-            peers_read_at: Some(NOW - DAY),
         },
         vault: InVault::InVault,
         verified: Some(NOW - 3_600),
@@ -297,7 +292,6 @@ fn the_report_carries_the_fields() {
     let entry = shown.entry();
     let report = Report::Accounts {
         accounts: vec![shown],
-        peers: PeersShown::Read,
         sessions: Some(sessions_of(&[
             format!("session local=1 sid=s-1 account=work auth=token token={KEY}"),
             "session local=2 sid=s-2 account=bare auth=stored token=-".to_owned(),
@@ -353,8 +347,10 @@ fn the_report_carries_the_fields() {
     assert_eq!(account["state"], Value::from("active"));
     assert_eq!(account["minted_by"], Value::from("window"));
     assert_eq!(account["entry"], Value::from(entry));
-    assert_eq!(account["used_on"]["peers"][0], Value::from("m9"));
-    assert_eq!(account["used_on"]["peers_read"], Value::from(true));
+    assert_eq!(
+        account["used_on"]["here"]["last_served_at"],
+        Value::from(NOW)
+    );
     assert_eq!(json["sessions"][0]["route"], Value::from("token"));
     assert_eq!(json["sessions"][0]["token"], Value::from(KEY));
     assert_eq!(json["sessions"][0]["account"]["key"], Value::from(KEY));
@@ -395,7 +391,6 @@ fn a_verification_is_shown_from_the_vaults_stamp_with_the_mac_that_wrote_it() {
     };
     let report = |shown: AccountToken| Report::Accounts {
         accounts: vec![shown],
-        peers: PeersShown::Read,
         sessions: None,
         steps: Held::default(),
     };
@@ -429,91 +424,6 @@ fn a_verification_is_shown_from_the_vaults_stamp_with_the_mac_that_wrote_it() {
         "the vault not read: this Mac's row, naming no Mac: {text}"
     );
     assert_eq!(unread.json()["accounts"][0]["verified_on"], Value::Null);
-}
-
-fn peer(label: &str, answer: Result<Vec<String>, String>) -> aterm_ctl::PeerSurvey {
-    aterm_ctl::PeerSurvey {
-        authenticated: None,
-        label: label.to_owned(),
-        answer,
-        fault: aterm_ctl::PeerFault::Other,
-        unproven: false,
-        node: None,
-        addr: None,
-        reason: None,
-    }
-}
-
-/// A FIXTURE FLEET READ FOLDS A PEER ROW'S `token=` KEY INTO `used_on`, AND AN OFFLINE READ SAYS
-/// "PEERS NOT READ": a peer answering with a token session is named for the key, one answering
-/// with a stored session or an older row is not, a peer that did not answer names nothing, and
-/// a read no peer answered is no read.
-#[test]
-fn a_fleet_read_folds_peer_token_keys_and_offline_says_not_read() {
-    let read = aterm_ctl::FleetRead {
-        peers: vec![
-            peer(
-                "m7",
-                Ok(vec![
-                    format!("session local=1 sid=s-1 auth=token token={KEY}"),
-                    format!("session local=2 sid=s-2 auth=token token={KEY}"),
-                ]),
-            ),
-            peer(
-                "m8",
-                Ok(vec![
-                    "session local=1 sid=s-3 auth=stored token=-".to_owned(),
-                    "session local=2 sid=s-4 state=live".to_owned(),
-                ]),
-            ),
-            peer("m9", Err("no route".to_owned())),
-        ],
-        note: None,
-        alone: None,
-    };
-    let peers = peers_of(&read, NOW);
-    let Peers::Read { at, by_key } = &peers else {
-        panic!("a read: {peers:?}");
-    };
-    assert_eq!(*at, NOW);
-    assert_eq!(by_key.get(KEY), Some(&vec!["m7".to_owned()]));
-    assert_eq!(by_key.len(), 1);
-    let (_dir, store) = scratch();
-    tokens::update_table(&store, |table: &mut Table| {
-        table.rows.insert(
-            KEY.to_owned(),
-            TokenRow {
-                used_on: UsedOn::default(),
-                ..row()
-            },
-        );
-    })
-    .expect("a row");
-    note_peers(&store, &peers).expect("noted");
-    let kept = tokens::read_table(&store).expect("the table");
-    let used = &kept.rows[KEY].used_on;
-    assert_eq!(used.peers, vec!["m7".to_owned()]);
-    assert_eq!(used.peers_read_at, Some(NOW));
-
-    let offline = aterm_ctl::FleetRead {
-        peers: vec![peer("m7", Err("timed out".to_owned()))],
-        note: None,
-        alone: None,
-    };
-    assert_eq!(peers_of(&offline, NOW + 1), Peers::NotRead);
-    note_peers(&store, &Peers::NotRead).expect("nothing");
-    assert_eq!(tokens::read_table(&store).expect("the table"), kept);
-    let shown = account(
-        covered(LoginHalf::Ok),
-        &Lookup::Found(standing(NOW + 300 * DAY, &[])),
-        kept.rows.get(KEY).cloned(),
-        Some(false),
-        NOW,
-    );
-    let json = shown.json(&PeersShown::NotRead);
-    assert_eq!(json["used_on"]["peers_read"], Value::from(false));
-    assert_eq!(json["used_on"]["peers_read_at"], Value::from(NOW));
-    assert!(shown.text(&PeersShown::NotRead).contains("peers not read"));
 }
 
 /// THE STATE LINE HOLDS THE PHRASE ONLY WHILE AN OFFER STANDS: an account with no token in use
@@ -654,7 +564,7 @@ fn a_row_with_no_login_here_is_not_said_to_hold_one() {
         };
         let shown = account(covered, &Lookup::Absent, None, Some(false), NOW);
         assert_eq!(shown.login, login);
-        shown.json(&PeersShown::NotRead)["login"].clone()
+        shown.json()["login"].clone()
     };
     assert_eq!(word_of(LoginHere::Absent, false), Value::from("none"));
     assert_eq!(word_of(LoginHere::Unread, false), Value::from("unread"));
@@ -843,6 +753,256 @@ fn the_view_covers_a_rowless_session_login_in_one_read() {
     assert_eq!(elsewhere[0].state, TokenState::None);
     assert!(elsewhere[0].offer.is_none(), "{:?}", elsewhere[0].offer);
     assert!(elsewhere[0].phrase(i64::try_from(NOW).unwrap()).is_none());
+}
+
+/// AN ACCOUNT ONLY THIS MAC'S TABLE NAMES TAKES ITS NAMES AND ADDRESS FROM THE REGISTRY
+/// (`docs/DESIGN-shared-files-2026-11-11.md` §6; tracker package SF-09b): the table holds no
+/// address, so with no roster row and no session login naming the account, the view names it by
+/// the lab's slug, name and address for its key, and with no lab by its key alone, with no
+/// address; the report says no other Mac's use of the token (no peer list, no `peers_read`).
+/// NEGATIVE CONTROL (2026-11-17, by hand, then restored from HEAD): with `view` naming a
+/// table-only account by its key whatever the lab holds, "the lab's names" fails.
+#[test]
+fn an_account_only_the_table_names_takes_its_names_from_the_registry() {
+    use crate::harness::accounts_tokens::tests::{Answer, FakeVault};
+    const ADA: &str = "ada@x.example";
+    let (_dir, store) = scratch();
+    tokens::update_table(&store, |table: &mut Table| {
+        table.rows.insert(KEY.to_owned(), row());
+    })
+    .expect("a row");
+    let vault = FakeVault::new(Answer::Absent);
+    let mut lab = crate::harness::alab_roster::Lab::default();
+    lab.names.insert(
+        KEY.to_owned(),
+        aterm_file::AccountNames {
+            realm: "claude".to_owned(),
+            slug: SLUG.to_owned(),
+            name: Some(format!("claude {ADA}")),
+            email: Some(ADA.to_owned()),
+            login: None,
+            live: true,
+        },
+    );
+    let shown_with = |lab: Option<&crate::harness::alab_roster::Lab>| {
+        view(
+            &Places {
+                store: &store,
+                roster: None,
+                lab,
+                logins: &[],
+                now: i64::try_from(NOW).unwrap(),
+                offers: true,
+                enrolled: &accounts::enrolled,
+            },
+            &vault,
+        )
+    };
+    let named = shown_with(Some(&lab));
+    let [account] = named.as_slice() else {
+        panic!("the table's account: {named:?}");
+    };
+    assert_eq!(account.key, KEY);
+    assert_eq!(account.named.names.slug, SLUG, "the lab's names");
+    assert_eq!(account.email.as_deref(), Some(ADA), "the lab's address");
+    assert_eq!(account.label.as_deref(), Some("work"));
+    let bare = shown_with(None);
+    let [account] = bare.as_slice() else {
+        panic!("the table's account: {bare:?}");
+    };
+    assert_eq!(account.named.pk, KEY);
+    assert_eq!(account.named.names, aterm_file::AccountNames::default());
+    assert_eq!(account.email, None, "no address with no lab");
+    let report = Report::Accounts {
+        accounts: bare,
+        sessions: None,
+        steps: Held::default(),
+    };
+    assert!(!report.text().contains('@'), "{}", report.text());
+    let json = report.json();
+    assert!(json.get("peers_read").is_none(), "{json}");
+    let used = &json["accounts"][0]["used_on"];
+    assert_eq!(used["here"]["last_served_at"], Value::from(NOW), "{json}");
+    assert!(used.get("peers").is_none(), "{json}");
+    assert!(used.get("peers_read_at").is_none(), "{json}");
+}
+
+/// A SURFACE'S READ TAKES AN EARLIER BUILD'S ADDRESS OFF THE DISK WITH NO HOME OR NO VAULT
+/// (`docs/DESIGN-shared-files-2026-11-11.md` §6; tracker package SF-09b): the window's and the
+/// doctor's read ([`view_here`]) writes `tokens.json` an earlier build left with an address and a
+/// survey's peers in it again without them before it asks for a home or a vault, and then says
+/// nothing of tokens, as a Mac with no vault does.
+/// NEGATIVE CONTROL (2026-11-17, by hand, then restored): with `view_here`'s `rewrite_stale`
+/// after its home and vault gates, "no home" fails on the address.
+#[test]
+fn a_surface_read_rewrites_an_earlier_builds_table_with_no_home_or_no_vault() {
+    for (case, with_home) in [("no home", false), ("no vault", true)] {
+        let (dir, store) = scratch();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        store.ensure().expect("the store");
+        let table = store.shared_dir().join(tokens::TABLE_FILE);
+        aterm_uds::private_file::write_private(
+            &store.shared_dir(),
+            tokens::TABLE_FILE,
+            tokens::tests::earlier_table().as_bytes(),
+        )
+        .expect("the old table");
+        assert!(
+            view_here(
+                dir.path(),
+                None,
+                with_home.then_some(home.as_path()),
+                i64::try_from(NOW).unwrap()
+            )
+            .is_none(),
+            "{case}: nothing of tokens"
+        );
+        let text = std::fs::read_to_string(&table).expect("the table");
+        assert!(!text.contains('@'), "{case}: an address in {text}");
+        assert!(!text.contains("peers"), "{case}: a peer list in {text}");
+        let read = tokens::read_parts(&store).expect("the table reads");
+        assert!(!read.stale, "{case}: {text}");
+        assert!(read.table.rows.contains_key(KEY), "{case}: the row stays");
+    }
+}
+
+/// A HELD STEP OF AN ACCOUNT WHOSE ADDRESS NO SURFACE PRINTS IS JUDGED BY ITS VAULT TOKEN'S
+/// (`docs/DESIGN-shared-files-2026-11-11.md` §6; tracker package SF-09b): an account only this
+/// Mac's table names, the registry giving no address, carries none ([`AccountToken::email`] is
+/// `None`, never an empty one), and [`held_steps`] looks its window store up by the address the
+/// vault's token was made for ([`AccountToken::lookup_address`], as the table kept it before it
+/// held none), so a window sign-in written after the stop lets it through. CONTROL: before that
+/// write the stop holds, and with no vault token, so no address at all, the same write dates
+/// nothing of the account's and the stop still holds.
+/// NEGATIVE CONTROL (2026-11-17, by hand, then restored): with `lookup_address` taking the
+/// account's own address alone, "the vault token's address" fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_held_step_of_an_account_with_no_address_is_judged_by_its_vault_tokens() {
+    use crate::harness::open_url::MetWord;
+    let (dir, store) = scratch();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    // A token made long before the stop, which a stop after it is not released by; any file
+    // written now is written after the stop.
+    let mut made = standing(NOW + 300 * DAY, &[]);
+    if let Some(meta) = made.meta.as_mut() {
+        meta.minted_at = 1_000_000_000;
+    }
+    let stop =
+        Stopped::new(MetWord::WindowWrongAccount, 1_500_000_000, "2.1.318", "").expect("a record");
+    token_steps::put(&store, KEY, Some(&stop)).unwrap();
+    let bare = |found: &Lookup<Standing>| {
+        let shown = account(
+            Covered {
+                email: None,
+                label: None,
+                logged_in: false,
+                ..covered(LoginHalf::Ok)
+            },
+            found,
+            None,
+            Some(false),
+            NOW,
+        );
+        assert_eq!(shown.email, None, "no address is printed for it");
+        shown
+    };
+    let held = |found: &Lookup<Standing>| {
+        held_steps(&store, &[bare(found)], (Some(&home), &|_| None), || None)
+            .stopped
+            .contains_key(KEY)
+    };
+    let found = Lookup::Found(made);
+    assert!(held(&found), "CONTROL: nothing written since the stop");
+    let general = token_steps::route_paths(&store, Some(&home), None);
+    let own: Vec<PathBuf> = token_steps::route_paths(&store, Some(&home), Some(EMAIL))
+        .into_iter()
+        .filter(|path| !general.contains(path))
+        .collect();
+    assert!(
+        !own.is_empty(),
+        "PRECONDITION: the account has a window store of its own"
+    );
+    for path in &own {
+        std::fs::create_dir_all(path.parent().expect("a folder")).unwrap();
+        std::fs::write(path, "{}").unwrap();
+    }
+    assert!(
+        held(&Lookup::Absent),
+        "CONTROL: with no address at all, nothing of the account's dates the stop"
+    );
+    assert!(
+        !held(&found),
+        "the vault token's address finds the window sign-in written after the stop"
+    );
+}
+
+/// A READ SET NAMES THE ROUTE FILES OF AN ACCOUNT ONLY THE TABLE NAMES BY THE REGISTRY'S ADDRESS
+/// (`docs/DESIGN-shared-files-2026-11-11.md` §6; tracker package SF-09b): `tokens.json` holds no
+/// address, so [`read_set_here`] names the window store and mail grant of an account only its
+/// table names by the address the registry gives its key ([`lab_address`], as [`view`] names
+/// it), and the mailbox configuration files whatever account names them. CONTROL: with a
+/// registry that names no address for the key, none of that account's own files is named.
+/// NEGATIVE CONTROL (2026-11-17, by hand, then restored): with `read_set_here` naming no table
+/// row's address, "the registry's address names" fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_read_set_names_a_table_only_accounts_route_files_by_the_registrys_address() {
+    const ADA: &str = "ada@x.example";
+    let (dir, store) = scratch();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    tokens::update_table(&store, |table: &mut Table| {
+        table.rows.insert(KEY.to_owned(), row());
+    })
+    .expect("a row");
+    let general = token_steps::route_paths(&store, Some(&home), None);
+    let own: Vec<PathBuf> = token_steps::route_paths(&store, Some(&home), Some(ADA))
+        .into_iter()
+        .filter(|path| !general.contains(path))
+        .collect();
+    assert!(
+        !own.is_empty(),
+        "PRECONDITION: the account has a window store of its own"
+    );
+    let mut lab = crate::harness::alab_roster::Lab::default();
+    lab.names.insert(
+        KEY.to_owned(),
+        aterm_file::AccountNames {
+            realm: "claude".to_owned(),
+            slug: SLUG.to_owned(),
+            name: Some(format!("claude {ADA}")),
+            email: Some(ADA.to_owned()),
+            login: None,
+            live: true,
+        },
+    );
+    let now = i64::try_from(NOW).unwrap();
+    let named = crate::harness::alab_roster::with_lab(lab, || {
+        read_set_here(dir.path(), None, Some(&home), now)
+    })
+    .paths();
+    for path in own.iter().chain(&general) {
+        assert!(
+            named.contains(path),
+            "the registry's address names {} in {named:#?}",
+            path.display()
+        );
+    }
+    let unnamed =
+        crate::harness::alab_roster::with_lab(crate::harness::alab_roster::Lab::default(), || {
+            read_set_here(dir.path(), None, Some(&home), now)
+        })
+        .paths();
+    for path in &own {
+        assert!(
+            !unnamed.contains(path),
+            "CONTROL: no address, yet {} is named",
+            path.display()
+        );
+    }
 }
 
 /// WHILE A REPLACEMENT IS ON ITS WAY, THE VIEW JUDGES THE VAULT'S TOKEN BY ITS OWN FACTS (§5.6):
@@ -1108,7 +1268,6 @@ fn each_session_names_the_account_its_login_record_names() {
     );
     let report = Report::Accounts {
         accounts: vec![shown.clone()],
-        peers: PeersShown::NotRead,
         sessions: Some(named),
         steps: Held::default(),
     };
@@ -1164,7 +1323,6 @@ fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
     assert!(steps.tried.is_empty(), "{steps:?}");
     let report = Report::Accounts {
         accounts: vec![none.clone()],
-        peers: PeersShown::NotRead,
         sessions: None,
         steps,
     };
@@ -1289,7 +1447,6 @@ fn the_upkeeps_record_of_a_run_is_shown_on_demand_while_it_holds_the_gap() {
     );
     let report = Report::Accounts {
         accounts: vec![none.clone()],
-        peers: PeersShown::NotRead,
         sessions: None,
         steps,
     };

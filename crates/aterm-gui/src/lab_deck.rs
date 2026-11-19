@@ -28,7 +28,8 @@ pub(crate) enum Cell {
     Unknown,
     /// The binding window's most used reading, in tenths of a percent.
     Used(u16),
-    /// A wall stands: the over-max cap's ink.
+    /// A wall every session of the account meets stands: the over-max cap's ink. A model's own
+    /// weekly wall alone is never this (FL-271): the account has room for every other model.
     AtLimit,
 }
 
@@ -151,10 +152,19 @@ fn percent(x10: u16) -> String {
     }
 }
 
-/// The binding window of `seen`: a standing wall first, else the most used current account-wide
-/// figure. A workspace's window is its own and binds nothing here.
+/// The binding window of `seen`, of the account's own windows every session meets
+/// ([`alab_seen::WindowSeen::walls_account`]): a standing wall first, else the most used
+/// current figure. The `7d-model` window is the models' own weeks, not the account's
+/// (FL-271): a Fable, Opus or Sonnet week's wall binds nothing, and [`model_walls`] names it
+/// beside, and the window's figure, the most used of those weeks (a reading names no model),
+/// binds nothing either, so an account whose Fable week alone is spent is never drawn used up;
+/// its line in the lens still says it. A workspace's window is its own and binds nothing here.
 fn binding(seen: &AccountSeen) -> Option<&alab_seen::WindowSeen> {
-    let own = || seen.windows.iter().filter(|w| w.sub.is_none());
+    let own = || {
+        seen.windows
+            .iter()
+            .filter(|w| w.sub.is_none() && w.walls_account())
+    };
     own().find(|w| w.wall_until.is_some()).or_else(|| {
         own()
             .filter_map(|w| match w.figure {
@@ -166,25 +176,50 @@ fn binding(seen: &AccountSeen) -> Option<&alab_seen::WindowSeen> {
     })
 }
 
-/// "62% of 5h left, read on m3, about 12 min ago (its clock) (statusline)".
+/// ` until 2026-11-20T12:00:00Z`, or nothing for a wall that states no end.
+fn until_words(until: Option<i64>) -> String {
+    until.map_or_else(String::new, |u| {
+        format!(" until {}", aterm_agent::harness::usage::rfc3339_utc(u))
+    })
+}
+
+/// What the binding window `w` ([`binding`]) leaves: "62% of 5h left, read on m3, about 12 min
+/// ago (its clock) (statusline)", or "5h at its limit until …".
 fn left_line(w: &alab_seen::WindowSeen, now: i64) -> String {
     let read = w.read.as_ref().map_or_else(String::new, |(t, by, src)| {
         format!(", {}", alab_seen::read_words(*t, by, src, now))
     });
     if let Some(until) = w.wall_until {
-        let until = until.map_or_else(String::new, |u| {
-            format!(" until {}", aterm_agent::harness::usage::rfc3339_utc(u))
-        });
-        return format!("{} at its limit{until}{read}", w.window);
+        return format!("{} at its limit{}{read}", w.name(), until_words(until));
     }
     match w.figure {
         Some(Figure::Used { pct_x10, .. }) => format!(
             "{} of {} left{read}",
             percent(1000u16.saturating_sub(pct_x10.min(1000))),
-            w.window
+            w.name()
         ),
-        _ => format!("{} unknown{read}", w.window),
+        _ => format!("{} unknown{read}", w.name()),
     }
+}
+
+/// Each wall of the account's own `7d-model` window standing in `seen` that no session but its
+/// model's meets, as that model's ("Fable week walled until …", FL-271; "7d-model walled
+/// until …" for an older build's, which names no model): said after what the account has
+/// left, never as its limit ([`binding`]).
+fn model_walls(seen: &AccountSeen) -> Vec<String> {
+    seen.windows
+        .iter()
+        .filter(|w| w.sub.is_none() && !w.walls_account())
+        .filter_map(|w| Some(format!("{} walled{}", w.name(), until_words(w.wall_until?))))
+        .collect()
+}
+
+/// `first`, then each of `models` ([`model_walls`]), as one line.
+fn with_model_walls(first: String, models: &[String]) -> String {
+    std::iter::once(first)
+        .chain(models.iter().cloned())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// One account's row. `read`: whether the journal has been read at all, so a row with nothing
@@ -217,6 +252,7 @@ fn row_of(
         .as_ref()
         .map(|last| alab_seen::when(&last.by, last.t, now));
     let left = bind.map(|w| left_line(w, now));
+    let models = model_walls(seen);
     let on = alab_seen::signed_in_words(&seen.signed_in, now);
     let mut facts = vec![(
         "Account".into(),
@@ -238,20 +274,24 @@ fn row_of(
             .into()
         }),
     ));
+    // What the account has left, or that it is unknown, then each model's own week's wall.
     facts.push((
         "Quota left".into(),
-        left.clone().unwrap_or_else(|| {
-            if read {
-                "Unknown; no current reading in the lab journal"
-            } else {
-                "Unknown; the lab journal is not read yet"
-            }
-            .into()
-        }),
+        with_model_walls(
+            left.clone().unwrap_or_else(|| {
+                if read {
+                    "Unknown; no current reading in the lab journal"
+                } else {
+                    "Unknown; the lab journal is not read yet"
+                }
+                .into()
+            }),
+            &models,
+        ),
     ));
     for w in &seen.windows {
         facts.push((
-            format!("{} window", w.window),
+            format!("{} window", w.name()),
             alab_seen::window_line(w, now),
         ));
     }
@@ -283,7 +323,10 @@ fn row_of(
     if here {
         summary.push("preferred here".to_string());
     }
-    summary.push(left.unwrap_or_else(|| "quota unknown".into()));
+    summary.push(with_model_walls(
+        left.unwrap_or_else(|| "quota unknown".into()),
+        &models,
+    ));
     if let Some(last) = last {
         summary.push(format!("last used by {last}"));
     }
@@ -414,6 +457,7 @@ fn fixture(now: i64) -> LabDeck {
     let window = |pct: u16, wall: bool| WindowSeen {
         window: "5h".into(),
         sub: None,
+        model: None,
         figure: Some(Figure::Used {
             pct_x10: pct,
             reset: Some(now + 3_600),

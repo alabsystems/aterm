@@ -1620,3 +1620,57 @@ fn a_witness_renewed_on_the_hosts_timer_proves_a_death_past_its_lifetime_and_one
         assert_eq!(proof.is_some(), renewed, "renewed {renewed}");
     }
 }
+
+/// A RE-ENTRY READS ONLY THIS HOST'S OWN LIVE REGISTRATION, AND CHANGES NOTHING: the binding the
+/// store issued names exactly the vendor under its shell in this epoch, alive and in front, under
+/// the registration's guards. Another epoch's context, another vendor (its pid or its birth),
+/// another shell, a foreground moved off the vendor, a person's input since, a binding the store
+/// never issued and a dead vendor each read as no registration; none of those refusals
+/// invalidates, renews or freezes the witness, which still refreshes and still re-enters after.
+#[test]
+fn a_reentry_reads_only_the_hosts_own_live_registration_and_changes_nothing() {
+    fn live<'a>(vendor: &'a Process, shell: &'a Process) -> Live<'a> {
+        Live { vendor, shell }
+    }
+    let (registration, context, facts) = setup();
+    let mut store = Store::default();
+    let binding = register(&mut store, &registration, &context, &facts, 1);
+    let vendor = &registration.vendor;
+    let shell = &registration.shell;
+    assert!(store.admits_reentry(&binding, live(vendor, shell), &context, 9, 2, &facts));
+
+    let mut other_epoch = context.clone();
+    other_epoch.host_epoch = "9".repeat(32);
+    let mut other_pid = vendor.clone();
+    other_pid.pid += 1;
+    let mut other_birth = vendor.clone();
+    other_birth.birth += 1;
+    let mut other_shell = shell.clone();
+    other_shell.birth += 1;
+    let mut typed = context.clone();
+    typed.human_seq += 1;
+    let forged = ObservationBinding {
+        capability: "6".repeat(64),
+        ..binding.clone()
+    };
+    assert!(!store.admits_reentry(&binding, live(vendor, shell), &other_epoch, 9, 3, &facts));
+    assert!(!store.admits_reentry(&binding, live(&other_pid, shell), &context, 9, 3, &facts));
+    assert!(!store.admits_reentry(&binding, live(&other_birth, shell), &context, 9, 3, &facts));
+    assert!(!store.admits_reentry(&binding, live(vendor, &other_shell), &context, 9, 3, &facts));
+    assert!(!store.admits_reentry(&binding, live(vendor, shell), &typed, 9, 3, &facts));
+    assert!(!store.admits_reentry(&forged, live(vendor, shell), &context, 9, 3, &facts));
+    facts.foreground.store(shell.group, Ordering::Release);
+    assert!(!store.admits_reentry(&binding, live(vendor, shell), &context, 9, 3, &facts));
+    facts.foreground.store(vendor.group, Ordering::Release);
+    facts.death(vendor.pid, 1);
+    assert!(!store.admits_reentry(&binding, live(vendor, shell), &context, 9, 3, &facts));
+    facts.death(vendor.pid, 0);
+
+    // Every refusal above left the witness as it was.
+    assert!(store.admits_reentry(&binding, live(vendor, shell), &context, 9, 4, &facts));
+    assert_eq!(
+        store.refresh_with(&binding, &context, 9, 5, &facts),
+        Reply::Registered(binding.clone())
+    );
+    assert!(store.admits_reentry(&binding, live(vendor, shell), &context, 9, 6, &facts));
+}

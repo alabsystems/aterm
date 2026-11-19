@@ -165,6 +165,7 @@ impl Mac {
             left: None,
             default_home: true,
             route: crate::harness::accounts::AuthRoute::Stored,
+            model: crate::harness::accounts::ModelWeek::Unread,
         };
         match accounts::advise(
             &roster(),
@@ -536,6 +537,7 @@ fn a_junior_with_no_row_to_move_to_yields_its_turn_end_in_every_rotating_mode() 
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let advice = |state: &State, mode: Mode| {
         accounts::advise(
@@ -686,6 +688,7 @@ fn a_junior_yields_while_another_row_waits_on_its_canary() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let advice = |state: &State, point: &Point, mode: Mode, now: i64| {
         accounts::advise(&roster(), state, &enrolled(), &me, point, mode, now)
@@ -850,6 +853,7 @@ fn a_junior_on_its_own_unanswered_active_moves_off_it() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let advice = |state: &State, mode: Mode, now: i64| {
         accounts::advise(
@@ -999,6 +1003,7 @@ fn a_pinned_active_another_mac_holds_keeps_its_pin() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     for mode in [Mode::Early, Mode::Wall] {
         let advice = accounts::advise(
@@ -1137,6 +1142,7 @@ fn a_juniors_move_the_relaunch_defers_is_advised_again_as_its_yield() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let advise = |state: &State| {
         accounts::advise(
@@ -1997,6 +2003,7 @@ impl Mac {
             left: None,
             default_home: true,
             route: crate::harness::accounts::AuthRoute::Stored,
+            model: crate::harness::accounts::ModelWeek::Unread,
         };
         matches!(
             accounts::advise(

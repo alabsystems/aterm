@@ -52,6 +52,39 @@ pub fn write_marker(
     max_bytes: usize,
     flush: Flush,
 ) -> std::io::Result<()> {
+    place_marker(path, text, max_bytes, flush, Place::Replace).map(|_| ())
+}
+
+/// [`write_marker`] only where no marker stands at `path` yet: the whole file appears at once, a
+/// link of the written temporary file, and a marker another writer put there first, however
+/// recently, is left as it stands. `Ok(false)` where one was there.
+pub fn create_marker(
+    path: &Path,
+    text: &str,
+    max_bytes: usize,
+    flush: Flush,
+) -> std::io::Result<bool> {
+    place_marker(path, text, max_bytes, flush, Place::Create)
+}
+
+/// How a written marker takes its name.
+#[derive(Clone, Copy)]
+enum Place {
+    /// Renamed over whatever marker stands there.
+    Replace,
+    /// Linked where nothing stands there; nothing changes where something does.
+    Create,
+}
+
+/// Write `text` to a temporary file beside `path` and give it `path`'s name as `place` says;
+/// `Ok(false)` where [`Place::Create`] found the name taken.
+fn place_marker(
+    path: &Path,
+    text: &str,
+    max_bytes: usize,
+    flush: Flush,
+    place: Place,
+) -> std::io::Result<bool> {
     if text.len() > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -92,11 +125,16 @@ pub fn write_marker(
     let written = written
         .and_then(|()| ensure_real_parent(path))
         .and_then(|()| ensure_marker_target(path))
-        .and_then(|()| std::fs::rename(&tmp, path));
-    if written.is_err() {
+        .and_then(|()| match place {
+            Place::Replace => std::fs::rename(&tmp, path).map(|()| true),
+            Place::Create => take_free_name(&tmp, path, |from, to| std::fs::hard_link(from, to)),
+        });
+    if written.is_err() || matches!(place, Place::Create) {
         let _ = std::fs::remove_file(&tmp);
     }
-    written?;
+    if !written? {
+        return Ok(false);
+    }
     #[cfg(unix)]
     if flush == Flush::Durable
         && let Some(dir) = path.parent()
@@ -115,7 +153,38 @@ pub fn write_marker(
             let _ = crate::durable::sync_all(&dir);
         }
     }
-    Ok(())
+    Ok(true)
+}
+
+/// Give `tmp` the name `path` only where nothing stands there: by `link` where the volume takes
+/// one, so a marker another writer put there first, however recently, is left as it stands.
+/// A volume that takes no hard link (an SMB home) gets the name by a rename after a look finds
+/// it free; there a writer racing this one between the look and the rename is the one case left
+/// open. `Ok(false)` where the name was taken.
+fn take_free_name(
+    tmp: &Path,
+    path: &Path,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    match link(tmp, path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => Ok(false),
+                Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::rename(tmp, path).map(|()| true)
+                }
+                Err(other) => Err(other),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// A marker's flush. [`Flush::Durable`] is kept as asked. [`Flush::Ordered`] is

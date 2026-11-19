@@ -2907,8 +2907,9 @@ pub(crate) fn spawn_background_check_with_settings(
     provider: crate::CheckSettingsProvider,
     notify: Option<crate::HealthNotify>,
     on_checked: Option<crate::CheckedNotify>,
+    wakes: crate::Wakes,
 ) {
-    checker::start(current_build, provider, notify, on_checked);
+    checker::start(current_build, provider, notify, on_checked, wakes);
 }
 
 #[path = "linux/checker.rs"]

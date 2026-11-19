@@ -6,7 +6,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Command;
 
 use crate::scope::Scope;
 use crate::toolchain::Toolchain;
@@ -793,8 +792,8 @@ pub fn default_base(root: &Path, path_env: &OsStr) -> String {
     let resolves = |r: &str| {
         git(root, path_env)
             .args(["rev-parse", "--verify", "--quiet", r])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .status()
             .is_ok_and(|s| s.success())
     };
@@ -1227,7 +1226,7 @@ fn replan_of(
     let read = || {
         let out = git(root, path_env)
             .args(["show", &format!("{merge_base}:{path}")])
-            .stderr(std::process::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .output()
             .ok()?;
         out.status
@@ -1849,14 +1848,15 @@ pub(crate) const GIT_REDIRECTS: [&str; 8] = [
 ];
 
 /// Build a `git --no-optional-locks` command in `dir`: the invocation's pinned provider, run with
-/// `path_env` as its PATH.
+/// `path_env` as its PATH, spawned through `aterm_uds::spawnfd`, which runs a `#!` provider (a
+/// package shim) as its interpreter where the Darwin kernel's own interpretation leaks.
 #[must_use]
-pub fn git(dir: &Path, path_env: &OsStr) -> Command {
-    let mut c = Command::new(crate::git_provider::program());
+pub fn git(dir: &Path, path_env: &OsStr) -> aterm_uds::spawnfd::Command {
+    let mut c = crate::git_provider::command();
     c.current_dir(dir)
         .env("PATH", path_env)
         .arg("--no-optional-locks")
-        .stdin(std::process::Stdio::null());
+        .stdin(aterm_uds::spawnfd::Stdio::null());
     for k in GIT_REDIRECTS {
         c.env_remove(k);
     }
@@ -1884,7 +1884,7 @@ pub(crate) fn changed_paths(
     let git_out = |args: &[&str]| -> Option<Vec<u8>> {
         let out = git(root, path_env)
             .args(args)
-            .stderr(std::process::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .output()
             .ok()?;
         out.status.success().then_some(out.stdout)
@@ -1935,7 +1935,7 @@ pub(crate) fn changed_paths(
 fn flag_hidden_edits(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
     let out = git(root, path_env)
         .args(["ls-files", "-v", "-s", "-z"])
-        .stderr(std::process::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .output()
         .ok()?;
     if !out.status.success() {
@@ -1977,7 +1977,7 @@ fn flag_hidden_edits(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
         let out = git(root, path_env)
             .args(["hash-object", "--"])
             .args(batch.iter().map(|(path, _)| path))
-            .stderr(std::process::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
             .output()
             .ok()?;
         if !out.status.success() {

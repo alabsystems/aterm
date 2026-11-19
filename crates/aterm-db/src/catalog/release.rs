@@ -63,7 +63,8 @@ pub(crate) struct Retired {
 }
 
 /// Every table this build retires in `trust`'s lab: the pre-ring claims generations, which
-/// lapse, and every registry generation but the last, which a roll restates.
+/// lapse, and every generation but the last of each family that declares a secret column (the
+/// registry), which a roll restates.
 pub(crate) fn retired(trust: Trust) -> Vec<Retired> {
     let mut out: Vec<Retired> = crate::accounts::claims::legacy_descriptors(trust)
         .into_iter()
@@ -72,29 +73,70 @@ pub(crate) fn retired(trust: Trust) -> Vec<Retired> {
             carry: Carry::Lapses { grace_s: LAPSE_S },
         })
         .collect();
-    let registry = crate::att::REGISTRY.chain();
-    for compiled in &registry[..registry.len() - 1] {
-        if let Ok(descriptor) = compiled.descriptor(trust) {
-            out.push(Retired {
-                descriptor,
-                carry: Carry::Restated,
-            });
+    // A family that keeps every signed record across a roll (`att::keeps_records`) is never
+    // retired: its sealed generations hold the only copy of those records ([`kept`]).
+    for first in crate::att::families() {
+        if crate::att::keeps_records(first) {
+            continue;
+        }
+        let chain = first.chain();
+        for compiled in &chain[..chain.len() - 1] {
+            if let Ok(descriptor) = compiled.descriptor(trust) {
+                out.push(Retired {
+                    descriptor,
+                    carry: Carry::Restated,
+                });
+            }
         }
     }
     out
 }
 
-/// When `descriptor` was sealed by the latest sealer's claim (Unix ms): `None` unless its catalog
-/// `entry` holds only `descriptor` and its twin, the twin at least once, and is no longer
-/// subscribed.
-pub(crate) fn sealed_at(entry: Option<&Entry>, descriptor: &Descriptor) -> Option<u64> {
-    let entry = entry?;
-    descriptor.version.checked_add(1)?;
-    if entry.state == State::Subscribed {
-        return None;
+/// Every table this build keeps once it is sealed, in `trust`'s lab: each generation but the
+/// last of each family that keeps every signed record across a roll (`att::keeps_records`,
+/// decision TK-D17). No release pass names one ([`retired`] leaves them out), and the catalog
+/// reads one sealed as [`State::Kept`]: held and repaired, never written.
+pub(crate) fn kept(trust: Trust) -> Vec<Descriptor> {
+    let mut out = Vec::new();
+    for first in crate::att::families() {
+        if !crate::att::keeps_records(first) {
+            continue;
+        }
+        let chain = first.chain();
+        for compiled in &chain[..chain.len() - 1] {
+            if let Ok(descriptor) = compiled.descriptor(trust) {
+                out.push(descriptor);
+            }
+        }
     }
+    out
+}
+
+/// Whether `descriptor` is, exactly, a generation of a family that keeps every signed record
+/// across a roll (`att::keeps_records`), its last generation included: what a Mac may declare
+/// in its own name to show it runs a build that compiles it ([`Directory::endorse`]).
+pub(crate) fn compiles_kept(trust: Trust, descriptor: &Descriptor) -> bool {
+    crate::att::families()
+        .into_iter()
+        .filter(|first| crate::att::keeps_records(first))
+        .flat_map(|first| first.chain())
+        .any(|compiled| {
+            compiled
+                .descriptor(trust)
+                .is_ok_and(|compiled| compiled == *descriptor)
+        })
+}
+
+/// When `declarations`, every declaration at one identity, sealed `descriptor` by the latest
+/// sealer's claim (Unix ms): `None` unless they are `descriptor` and its twin alone, the twin at
+/// least once.
+pub(crate) fn sealed_by_twin(
+    declarations: &[super::Declaration],
+    descriptor: &Descriptor,
+) -> Option<u64> {
+    descriptor.version.checked_add(1)?;
     let mut max_twin = None;
-    for d in &entry.declarations {
+    for d in declarations {
         if d.descriptor.is_twin_of(descriptor) {
             max_twin = Some(max_twin.map_or(d.authored_ms, |m: u64| m.max(d.authored_ms)));
         } else if d.descriptor != *descriptor {
@@ -102,6 +144,17 @@ pub(crate) fn sealed_at(entry: Option<&Entry>, descriptor: &Descriptor) -> Optio
         }
     }
     max_twin
+}
+
+/// When `descriptor` was sealed by the latest sealer's claim (Unix ms): `None` unless its catalog
+/// `entry` holds only `descriptor` and its twin, the twin at least once, and is no longer
+/// subscribed.
+pub(crate) fn sealed_at(entry: Option<&Entry>, descriptor: &Descriptor) -> Option<u64> {
+    let entry = entry?;
+    if entry.state == State::Subscribed {
+        return None;
+    }
+    sealed_by_twin(&entry.declarations, descriptor)
 }
 
 /// Why a retired table's storage stays.

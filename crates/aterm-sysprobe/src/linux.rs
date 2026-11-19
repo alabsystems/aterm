@@ -72,22 +72,52 @@ pub const AT_PAGESZ: u64 = 6;
 
 /// The VM's cumulative event counters from a whole `/proc/vmstat` with pages of `page_bytes`, as
 /// macOS's `HOST_VM_INFO64` names them (`pswpin`/`pswpout` in bytes, `zswpin`/`zswpout` as
-/// compressor pages — 0 where the kernel has no zswap — and `pgmajfault` as `pageins`). `None`
-/// without the swap or fault counters, or with `page_bytes == 0`.
+/// compressor pages — 0 where the kernel has no zswap — and `pgmajfault` as `pageins`), with the
+/// anonymous pages pushed out (`pswpout` and `zswpout`) and those that came back
+/// (`workingset_refault_anon`, a 5.9 kernel's; else `pswpin` and `zswpin`). `None` without the
+/// swap or fault counters, or with `page_bytes == 0`.
 #[must_use]
 pub fn vm_counters(vmstat: &str, page_bytes: u64) -> Option<VmCounters> {
     if page_bytes == 0 {
         return None;
     }
     let pages = |key: &str| keyed(vmstat, key).map(|p| p.saturating_mul(page_bytes));
+    let swapins = keyed(vmstat, "pswpin")?;
+    let swapouts = keyed(vmstat, "pswpout")?;
+    let zswpin = keyed(vmstat, "zswpin").unwrap_or(0);
+    let zswpout = keyed(vmstat, "zswpout").unwrap_or(0);
     Some(VmCounters {
         swapin_bytes: pages("pswpin")?,
         swapout_bytes: pages("pswpout")?,
-        decompressions: keyed(vmstat, "zswpin").unwrap_or(0),
-        compressions: keyed(vmstat, "zswpout").unwrap_or(0),
+        decompressions: zswpin,
+        compressions: zswpout,
         pageins: keyed(vmstat, "pgmajfault")?,
         page_bytes,
+        pushed: Some(swapouts.saturating_add(zswpout)),
+        refaulted: Some(
+            keyed(vmstat, "workingset_refault_anon")
+                .unwrap_or_else(|| swapins.saturating_add(zswpin)),
+        ),
+        stall_us: None,
     })
+}
+
+/// A PSI file's `some` and `full` `total=` stall times, µs (`/proc/pressure/memory`): how long at
+/// least one task, and every non-idle task at once, waited on memory since boot. `None` where
+/// either line or its total is missing or not a plain number.
+#[must_use]
+pub fn psi_totals(text: &str) -> Option<(u64, u64)> {
+    let total = |kind: &str| {
+        whole_lines(text).find_map(|l| {
+            let mut it = l.split_whitespace();
+            if it.next()? != kind {
+                return None;
+            }
+            it.find_map(|f| f.strip_prefix("total="))
+                .and_then(crate::parse_uint)
+        })
+    };
+    Some((total("some")?, total("full")?))
 }
 
 /// One value of a binary auxiliary vector (`/proc/self/auxv`), ended by `AT_NULL` (`0`).
@@ -336,6 +366,8 @@ pub fn memory_detail(text: &str) -> Option<MemoryDetail> {
         counters: None,
         memorystatus_level_pct: None,
         exact: false,
+        headroom: Some(available),
+        wall: None,
     })
 }
 
@@ -1878,13 +1910,20 @@ impl Root {
 
     /// Memory by class, swap, commit ([`memory_detail`]), the machine's pressure level
     /// ([`machine_pressure`] over the same read of `/proc/meminfo`; `None` without PSI) and the
-    /// VM's counters ([`Root::vm_counters`]). With zswap off, `compressed` and `stored` are `None`.
+    /// VM's counters ([`Root::vm_counters`]) with PSI's stall totals ([`psi_totals`]) from the same
+    /// read of `/proc/pressure/memory`. With zswap off, `compressed` and `stored` are `None`.
     #[must_use]
     pub fn memory_detail(&self) -> Option<MemoryDetail> {
         let (m, room) = self.read("proc/meminfo", |t| (memory_detail(t), mem_room(t)))?;
         let mut m = m?;
-        m.pressure = self.psi().ok().map(|p| machine_pressure(&p, room));
-        m.counters = self.vm_counters();
+        let psi = self
+            .read("proc/pressure/memory", |t| (psi(t), psi_totals(t)))
+            .unwrap_or((None, None));
+        m.pressure = psi.0.map(|p| machine_pressure(&p, room));
+        m.counters = self.vm_counters().map(|c| VmCounters {
+            stall_us: psi.1,
+            ..c
+        });
         if self.zswap_enabled() != Some(true) {
             m.compressed = None;
             m.stored = None;

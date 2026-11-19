@@ -180,7 +180,10 @@ const fn next(kind: crate::ErrorKind) -> Next {
         | Kind::JoinQueueIncomplete
         | Kind::NotStored
         | Kind::MemberBusy => Next::Passes,
-        Kind::Other => Next::Unsaid,
+        // A records pull's `409` beside a later format, read as that `409` always was: a Mac
+        // whose build reads the format follows it on its next pass, and one that does not is
+        // refused again.
+        Kind::LaterFormat | Kind::Other => Next::Unsaid,
     }
 }
 

@@ -81,7 +81,7 @@ fn paired(fixture: &Fixture) -> HeldTool {
         .unwrap();
     native.check_current().unwrap();
     drop(native);
-    assert!(!kept(fixture));
+    released(fixture);
     acquire(fixture)
 }
 
@@ -130,7 +130,7 @@ fn partial_native_capture_emfile_closes_only_new_descriptors_and_returns_origina
     let (_, original) = refused.into_parts();
     assert_eq!(original.native_attempt, Some(end));
     drop(original);
-    assert!(!kept(&fixture));
+    released(&fixture);
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn concurrent_open_pressure_after_original_hash_cannot_manufacture_native_succes
     original.validate().unwrap();
     assert!(kept(&fixture));
     drop(original);
-    assert!(!kept(&fixture));
+    released(&fixture);
 }
 
 #[test]

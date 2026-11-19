@@ -131,7 +131,7 @@ impl Recovery {
         session.writer()?;
         session.peer_writer(session.actor())?;
         let directory = Directory::new(&paths, bootstrap.trust());
-        let state = directory.retire(&session, &RECOVERIES, now)?;
+        let state = directory.retired(&session, &RECOVERIES, now)?;
         if RECOVERIES.epoch_of(now) < state.floor {
             return Err(Error::new(
                 "recovery publication waits for the retained day floor",
@@ -335,6 +335,7 @@ fn command_key(
             key: aterm_codec::hex::encode_lower(&key),
             value: Some(body),
         }],
+        said: None,
     }
 }
 

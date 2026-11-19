@@ -43,6 +43,99 @@ fn a_pixel_demand_without_a_deferred_intent_builds_nothing() {
     }
 }
 
+fn configured_gpu_intent() -> (super::App, aterm_render::DrawnFaces) {
+    let mut app = super::App::headless_for_test();
+    app.font_family = Some("monospace".to_owned());
+    app.font_px = super::FONT_PX + 3.0;
+    app.theme = super::Theme {
+        bg: 0x0018_2028,
+        cursor: 0x0055_CCAA,
+        ..super::Theme::default()
+    };
+    let mut renderer = super::Renderer::from_system_with_family(
+        app.font_family.as_deref(),
+        app.font_px,
+        app.theme,
+    )
+    .expect("the configured generic monospace font");
+    renderer.set_line_height(super::Config::default().line_height_or_default());
+    renderer.seal_admitted_font_sources();
+    let faces = renderer.drawn_faces().expect("sealed drawn faces").clone();
+    assert!(faces.regular.is_some(), "the prepared face is known");
+    app.backend = super::BackendSlot::Ready(super::Backend::Cpu(renderer));
+    app.set_deferred_gpu(true);
+    (app, faces)
+}
+
+#[test]
+fn a_headless_gpu_redemption_refuses_without_a_window_fallback_or_second_acquisition() {
+    let (mut app, faces) = configured_gpu_intent();
+    let family = app.font_family.clone();
+    let theme = app.theme;
+    let mut acquisitions = 0;
+
+    app.ensure_pixel_backend_with(|policy| match policy {
+        aterm_gpu::DevicePolicy::Headless => {
+            acquisitions += 1;
+            Err("no enumerated headless device".to_owned())
+        }
+        aterm_gpu::DevicePolicy::Windowed => {
+            panic!("headless redemption requested a window device")
+        }
+    });
+
+    assert_eq!(acquisitions, 1, "the actual redemption reached acquisition");
+    assert!(!app.backend_kind_undecided(), "the refused intent is spent");
+    assert!(!app.use_gpu);
+    assert_eq!(app.font_family, family);
+    assert_eq!(app.theme, theme);
+    let super::BackendSlot::Ready(super::Backend::Cpu(renderer)) = &app.backend else {
+        panic!("refusal must retain the original CPU renderer")
+    };
+    assert!(renderer.admitted_font_sources_sealed());
+    assert_eq!(renderer.drawn_faces(), Some(&faces));
+    assert_eq!(renderer.theme(), theme);
+
+    app.ensure_pixel_backend_with(|_| panic!("a spent intent acquired another device"));
+    assert!(!app.backend.is_gpu());
+    assert_eq!(app.backend.drawn_faces(), Some(&faces));
+    assert_eq!(app.font_family, family);
+}
+
+#[test]
+fn a_headless_gpu_redemption_assembles_the_admitted_configured_font() {
+    let context = aterm_gpu::GpuContext::new_headless().unwrap_or_else(|error| {
+        aterm_spec::host::could_not_run(format!("no permitted headless GPU: {error}"))
+    });
+    assert_eq!(context.device_policy(), aterm_gpu::DevicePolicy::Headless);
+    let (mut app, faces) = configured_gpu_intent();
+    let family = app.font_family.clone();
+    let theme = app.theme;
+    let mut acquisitions = 0;
+    app.ensure_pixel_backend_with(|policy| {
+        assert_eq!(policy, aterm_gpu::DevicePolicy::Headless);
+        acquisitions += 1;
+        Ok(context)
+    });
+    assert_eq!(acquisitions, 1);
+    assert!(
+        app.backend.is_gpu(),
+        "the common redemption assembled the GPU"
+    );
+    assert!(app.use_gpu);
+    assert!(!app.backend_kind_undecided());
+    assert!(app.backend.ready().admitted_font_sources_sealed());
+    assert_eq!(app.backend.drawn_faces(), Some(&faces));
+    assert_eq!(app.font_family, family);
+    let prepared = app
+        .backend
+        .cpu_renderer_from_admitted(app.font_px, app.theme)
+        .expect("the installed GPU retains the admitted font sources");
+    assert_eq!(prepared.drawn_faces(), Some(&faces));
+    assert_eq!(prepared.theme(), theme);
+    app.ensure_pixel_backend_with(|_| panic!("a redeemed GPU intent acquired another device"));
+}
+
 #[test]
 fn the_settings_capability_read_follows_the_intent_the_app_holds() {
     let mut app = super::App::headless_for_test();

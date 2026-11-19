@@ -1221,15 +1221,7 @@ impl AppRt for AppRtWindows {
     }
 
     fn set_toolbar_tabs(&self, handle: &toolbar::ToolbarHandle, tabs: ToolbarTabsModel<'_>) {
-        let ToolbarTabsModel {
-            titles,
-            ids,
-            metadata,
-            tooltips,
-            ext,
-            active,
-        } = tabs;
-        toolbar::set_window_tabs(handle, titles, ids, metadata, tooltips, ext, active);
+        toolbar::set_window_tabs(handle, tabs);
     }
 
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {

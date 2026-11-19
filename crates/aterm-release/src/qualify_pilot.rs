@@ -674,7 +674,11 @@ fn sample(
     global: &mut BTreeMap<(u32, u64), u64>,
 ) -> aterm_json::Value {
     let reading_started = Instant::now();
-    let sweep = aterm_sysprobe::procs::processes();
+    // Each row's nice and QoS CPU are recorded, which a sweep reads only when asked.
+    let sweep = aterm_sysprobe::procs::processes_with(aterm_sysprobe::SweepOpts {
+        scheduling: true,
+        ..aterm_sysprobe::SweepOpts::default()
+    });
     let initial = global.is_empty();
     let mut global_delta = 0_u64;
     if let Some(sweep) = &sweep {
@@ -1378,6 +1382,9 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     std::fs::create_dir(&root)
         .map_err(|e| format!("create unique pilot (existing evidence retained): {e}"))?;
+    aterm_uds::backup::Backups::SYSTEM
+        .build_dir(&root)
+        .map_err(|e| format!("exclude pilot root {}: {e}", root.display()))?;
     let requested_cores = opts.requested_cores(aterm_capacity::cores())?;
     let claim = aterm_capacity::admit(
         aterm_capacity::Need::new("qualify-pilot core pool")
@@ -1543,6 +1550,14 @@ fn isolate_side_lanes(
             side.display()
         )
     })?;
+    aterm_uds::backup::Backups::SYSTEM
+        .build_dir(&side)
+        .map_err(|error| {
+            format!(
+                "exclude verification side targets {}: {error}",
+                side.display()
+            )
+        })?;
     environment.side_lanes_dir = Some(side);
     Ok(())
 }

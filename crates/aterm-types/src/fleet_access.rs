@@ -89,6 +89,24 @@ impl FleetAccess {
         })
     }
 
+    /// The level a [`FILE`] of `bytes` (`None`: no file) puts in force. Only a file with exactly
+    /// one `level=` line, naming a level, raises it above Read Only: a missing or empty file, one
+    /// that is not UTF-8, an unknown word and two `level=` lines (whichever they name) are all
+    /// Read Only.
+    #[must_use]
+    pub fn of_file(bytes: Option<&[u8]>) -> Self {
+        let Some(text) = bytes.and_then(|bytes| std::str::from_utf8(bytes).ok()) else {
+            return Self::ReadOnly;
+        };
+        let mut levels = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("level=").map(Self::from_word));
+        match (levels.next(), levels.next()) {
+            (Some(Some(level)), None) => level,
+            _ => Self::ReadOnly,
+        }
+    }
+
     /// The level's name in a menu.
     #[must_use]
     pub const fn label(self) -> &'static str {

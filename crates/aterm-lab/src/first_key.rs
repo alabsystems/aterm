@@ -33,7 +33,7 @@
 //! <presses.tsv>...` reads it again from rows: per arm, nearest-rank percentiles, the cold share
 //! (rows whose `present_idle_ms` is 2000 or more) beside the summed `n_input_cold` and the rows
 //! where the two disagree, the submit and the key's queue, the input and present percentiles of
-//! its cold keys (rows whose `n_input_cold` is above 0), and its presses by memory pressure; then
+//! its cold keys (rows whose `n_input_cold` is above 0), and its rows by memory pressure; then
 //! each arm against its base, the arm of its kind (first keys or burst keys) whose row comes first
 //! (in a run, the first of its kind to press, which without `--fixed-order` is not always the
 //! first `--arm` given: an arm with fewer presses than the most skips the first round; pooled
@@ -48,8 +48,8 @@
 //! the start. So under the default `motion` every press whose quiet is 40 s or longer meets a
 //! window whose attention has lapsed, with the stats deck drawn still, in an arm that rests the
 //! window and in one that does not; and no press is the touch that ends a lapse. Each press's
-//! row says what it met (`attended`, from `trail status`), and the summary counts the presses
-//! per arm.
+//! row says what it met (`attended`, from `trail status`), and the summary counts, per arm, the
+//! rows that met an attended window (a burst press's four rows each).
 //! An arm that keeps the deck moving through its quiet, as every awake arm had it before
 //! windows had an attention (`docs/measured/idle-memory-rest-2026-10-29.md`), says so with
 //! `--arm-toml 'NAME=motion = "full"'`, which also turns the load shed off for that arm.
@@ -478,21 +478,19 @@ pub fn summarize(rows: &[Row]) -> String {
             rows.len() - normal - warn - critical,
         );
     }
-    // What each arm's presses met, a burst press's four rows counted once: rows from before
-    // the column say nothing of it.
+    // What each arm's rows met, counted row by row as every figure above is: a press number
+    // names a press only within one run's file, and pooled files repeat it. A burst press's
+    // four rows each count. Rows from before the column, or with it empty, say nothing of it.
     for name in &names {
-        let met: std::collections::BTreeMap<&str, bool> = of(name)
+        let met: Vec<bool> = of(name)
             .iter()
-            .filter_map(|r| {
-                let attended = r.get("attended")?.parse().ok()?;
-                Some((r.get("press")?.as_str(), attended))
-            })
+            .filter_map(|r| r.get("attended")?.parse().ok())
             .collect();
         if !met.is_empty() {
             let _ = writeln!(
                 out,
-                "{name}: {} of {} presses met an attended window",
-                met.values().filter(|attended| **attended).count(),
+                "{name}: {} of {} rows met an attended window",
+                met.iter().filter(|attended| **attended).count(),
                 met.len()
             );
         }
@@ -656,10 +654,19 @@ fn parse(args: &[String]) -> Result<Opts, Fail> {
     })
 }
 
+/// The `presses.tsv` files `first-key summarize` names, a relative one taken from the directory
+/// the lab was started in ([`crate::paths::from_caller`], as the lab's other verbs take a path):
+/// before `first-key` runs, [`crate::sys::confine_env`] has moved the working directory to `/`.
+fn summarize_paths(args: &[String]) -> Vec<PathBuf> {
+    args.iter()
+        .map(|a| PathBuf::from(crate::paths::from_caller(a)))
+        .collect()
+}
+
 /// Runs `lab first-key`.
 pub fn cmd_first_key(args: &[String]) -> Res {
     if args.first().is_some_and(|a| a == "summarize") {
-        let paths: Vec<PathBuf> = args[1..].iter().map(PathBuf::from).collect();
+        let paths = summarize_paths(&args[1..]);
         if paths.is_empty() {
             return Err(Fail::usage(USAGE));
         }

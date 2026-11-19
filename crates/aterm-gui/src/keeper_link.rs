@@ -295,6 +295,9 @@ struct State {
     /// Every registered session, by this process's session id.
     tracked: BTreeMap<u64, Tracked>,
     pump: bool,
+    /// This process passed its boot-health checkpoint ([`boot_healthy`]): its live link was
+    /// told [`LinkOp::AskRestart`], and one an update's Commit starts is told at once.
+    healthy: bool,
 }
 
 #[cfg(unix)]
@@ -304,6 +307,7 @@ static KEEPER_STATE: Mutex<State> = Mutex::new(State {
     owed: VecDeque::new(),
     tracked: BTreeMap::new(),
     pump: false,
+    healthy: false,
 });
 
 /// Send `op` (session `session_id`'s, for a candidate's buffer) over `st`: behind every
@@ -781,6 +785,47 @@ fn build() -> String {
 #[cfg(unix)]
 const JOURNAL: bool = true;
 
+/// Whether a window of version `own` asks a keeper whose WELCOME stated version `keeper` to
+/// restart when safe (`Frame::RestartWhenSafe`): only a window that runs from the keeper job's
+/// own place (`own_place`: the installed app, so launchd restarts the keeper from the file this
+/// window's update put there), and only when both versions are release versions and the
+/// window's is strictly newer. An equal or older window, or a version that does not parse (a
+/// dev build's, a test's), never asks, so two windows of different builds never take turns
+/// restarting one keeper.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn asks_restart(own: &str, keeper: &str, own_place: bool) -> bool {
+    use aterm_types::release_version::ReleaseVersion;
+    own_place
+        && matches!(
+            (ReleaseVersion::parse(own), ReleaseVersion::parse(keeper)),
+            (Some(own), Some(keeper)) if own > keeper
+        )
+}
+
+/// The link's judgment of each keeper it reaches ([`asks_restart`] for this window); a launch
+/// under the job-label seam runs a test's keeper and never asks.
+#[cfg(unix)]
+fn ask_restart(keeper: &str, honours: bool) -> bool {
+    let own_place = aterm_types::dev_seam!(JOB_LABEL_SEAM).is_none()
+        && aterm_keeper::job::own_place().installed;
+    let own = crate::build_info::version();
+    let asks = asks_restart(own, keeper, own_place);
+    if asks {
+        if honours {
+            aterm_log::info!(
+                "keeper: version {keeper} serves this {own} window; it is asked to restart once \
+                 nothing only it holds would be lost"
+            );
+        } else {
+            aterm_log::info!(
+                "keeper: version {keeper} serves this {own} window and predates restarting on \
+                 request; it is replaced at the next logout"
+            );
+        }
+    }
+    asks
+}
+
 /// Whether the keeper this window booted with takes companions: set from the boot
 /// WELCOME's caps.
 #[cfg(unix)]
@@ -1072,7 +1117,15 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
             recovery.restores.counts.meta
         );
     }
-    match KeeperLink::start_marked(socket, identity, build(), marker(), booted, JOURNAL) {
+    match KeeperLink::start_window(
+        socket,
+        identity,
+        build(),
+        marker(),
+        booted,
+        JOURNAL,
+        ask_restart,
+    ) {
         Ok(link) => {
             keeper_state().phase = Phase::Live(Arc::new(link));
             start_meta_pump();
@@ -1190,12 +1243,17 @@ pub(crate) fn activate() {
     let Some((socket, identity)) = place() else {
         return;
     };
-    match KeeperLink::start_marked(socket, identity, build(), marker(), None, JOURNAL) {
+    match KeeperLink::start_window(
+        socket,
+        identity,
+        build(),
+        marker(),
+        None,
+        JOURNAL,
+        ask_restart,
+    ) {
         Ok(link) => {
-            st.phase = Phase::Live(Arc::new(link));
-            for (id, op) in std::mem::take(&mut st.buffered) {
-                send_in(&mut st, Some(id), op);
-            }
+            go_live_in(&mut st, link);
             drop(st);
             start_meta_pump();
             // The sessions registered while armed have their first META now.
@@ -1203,6 +1261,45 @@ pub(crate) fn activate() {
             aterm_log::info!("keeper: this successor's sessions are registered at its Commit");
         }
         Err(e) => aterm_log::warn!("keeper: the link worker did not start: {e}"),
+    }
+}
+
+/// `link` becomes `st`'s live link at an update's Commit: the registrations the candidate
+/// buffered go first, then, once this process booted healthy, the ask to restart
+/// ([`boot_healthy`]).
+#[cfg(unix)]
+fn go_live_in(st: &mut State, link: KeeperLink) {
+    st.phase = Phase::Live(Arc::new(link));
+    for (id, op) in std::mem::take(&mut st.buffered) {
+        send_in(st, Some(id), op);
+    }
+    if st.healthy {
+        send_in(st, None, LinkOp::AskRestart);
+    }
+}
+
+/// This process booted healthy (`App::note_keeper_boot_health`: it reached its checkpoint, the
+/// updater confirmed its boot, and no Mac Setup tab of its runs, `asks_keeper_restart`): from
+/// now on its link asks the keeper it reaches, and each it reaches later, to restart when its
+/// judgment of that keeper says so ([`ask_restart`], [`LinkOp::AskRestart`]). Until then it asks
+/// none, so an update's new build keeps the keeper that reopens a crashed window, and holds its
+/// shells, through its first seconds, when an untested build is likeliest to crash. Once per
+/// process; a candidate before its Commit is told at it.
+pub(crate) fn boot_healthy() {
+    #[cfg(unix)]
+    if on() {
+        boot_healthy_in(&mut keeper_state());
+    }
+}
+
+/// [`boot_healthy`] over `st`.
+#[cfg(unix)]
+fn boot_healthy_in(st: &mut State) {
+    if std::mem::replace(&mut st.healthy, true) {
+        return;
+    }
+    if matches!(st.phase, Phase::Live(_)) {
+        send_in(st, None, LinkOp::AskRestart);
     }
 }
 
@@ -1775,6 +1872,7 @@ impl TestLink {
                 owed: VecDeque::new(),
                 tracked: BTreeMap::new(),
                 pump: false,
+                healthy: false,
             }),
             far,
         }
@@ -1860,6 +1958,11 @@ impl TestLink {
     /// [`pending_before_grant`] over this link, waiting for nothing.
     pub(crate) fn pending(&self, successor: u32) -> bool {
         pending_over(&self.state, successor, Duration::ZERO)
+    }
+
+    /// [`boot_healthy`] over this link.
+    pub(crate) fn boot_healthy(&self) {
+        boot_healthy_in(&mut self.state.lock().expect("test link"));
     }
 
     /// [`bye`] over this link, carrying `carried`, waiting for nothing, as [`Self::pending`].

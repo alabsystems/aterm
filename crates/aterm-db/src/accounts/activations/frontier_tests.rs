@@ -111,6 +111,7 @@ fn only_canonical_joins_are_structural_in_activation_history() {
             key: "forged".into(),
             value: Some(json!({"stop":true})),
         }],
+        said: None,
     }
     .encode()
     .unwrap();

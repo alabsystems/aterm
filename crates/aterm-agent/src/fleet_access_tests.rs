@@ -267,13 +267,15 @@ fn a_fleet_started_worker_is_one_with_a_record() {
     std::fs::write(dir.join(legacy), "node").unwrap();
     assert!(fleet_started(&state, legacy));
     assert!(!fleet_started(&state, "s-0123456789abcdef00ab"));
-    // A record cannot turn a malformed ID into a minted session identity.
+    // A record cannot turn a malformed ID into a valid local selector.
     for bad in [
         "t00000000a",
         "T00000000AA",
         "s-00000000000000aa",
+        "s-00000000000000ag",
         "s-0123456789ABCDEF00AA",
     ] {
+        assert!(aterm_types::control_request::Sid::parse(bad).is_none());
         std::fs::write(dir.join(bad), "node").unwrap();
         assert!(!fleet_started(&state, bad), "NEGATIVE CONTROL: {bad}");
     }

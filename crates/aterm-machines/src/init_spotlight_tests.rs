@@ -5,7 +5,7 @@ use super::*;
 use crate::engine::{self, NoJournal};
 use crate::items::defaults::tests::{ctx, export, user};
 use crate::model::{Mode, Outcome};
-use crate::port::{Fake, Ran, Stat};
+use crate::port::{Fake, FileId, Ran, Stat};
 
 const ENV: &str = "alice$ CARGO_HOME=/Users//alice/.cargo RUSTUP_HOME=/Users//alice/.rustup /Users//alice/.cargo/bin/rustup";
 const STABLE: &str =
@@ -68,9 +68,32 @@ fn folder() -> Stat {
     }
 }
 
-/// Alice's home as its top level lists: the folders Spotlight keeps, three it should leave
-/// out (one with a space in its name), and what is never a candidate (a dot-folder, a
-/// `.noindex` folder, a file, a link).
+/// The data volume's device number in the fake, and the automounter's.
+const VOLUME: u64 = 16_777_229;
+const AUTOFS: u64 = 889_192_451;
+
+/// A folder on the data volume with inode `ino`.
+fn on_volume(sys: &Fake, path: &str, ino: u64) {
+    sys.stat_of(path, folder()).file_id_of(
+        Path::new(path),
+        FileId {
+            dev: VOLUME,
+            ino,
+            born_ns: None,
+        },
+    );
+}
+
+/// A Mac's folders as the scope lists them.
+/// - Alice's home: the folders Spotlight keeps, three it should leave out (one with a space in
+///   its name), and what is never a candidate (a dot-folder, a `.noindex` folder, a file, a
+///   link).
+/// - Her Library: Caches and Mail, which it should leave out, and the synced drives'
+///   CloudStorage and Mobile Documents, which it keeps.
+/// - The data volume's top level: Applications, Users and Volumes, which it keeps; Library and
+///   opt, firmlinked at the system volume's root; MobileSoftwareUpdate, which the root does not
+///   show; and the automounter's `home` on another device.
+/// - /Users//Shared.
 pub(crate) fn home(sys: &Fake) {
     for name in [
         "Documents",
@@ -82,12 +105,44 @@ pub(crate) fn home(sys: &Fake) {
         "My Projects",
         ".cargo",
         "build.noindex",
+        "Library/Caches",
+        "Library/Mail",
+        "Library/CloudStorage",
+        "Library/Mobile Documents",
     ] {
         let path = format!("{ALICE}/{name}");
         sys.file(&path, b"").stat_of(&path, folder());
     }
     sys.file(&format!("{ALICE}/notes.txt"), b"x")
         .link(&format!("{ALICE}/Linked"), "/Volumes/Work");
+    on_volume(sys, DATA_VOLUME, 2);
+    for (ino, name, firmlink) in [
+        (10, "Applications", true),
+        (11, "Library", true),
+        (12, "Users", true),
+        (13, "Volumes", true),
+        (14, "opt", true),
+        (16, "MobileSoftwareUpdate", false),
+    ] {
+        let path = format!("{DATA_VOLUME}/{name}");
+        sys.file(&path, b"");
+        on_volume(sys, &path, ino);
+        if firmlink {
+            on_volume(sys, &format!("/{name}"), ino);
+        }
+    }
+    let autofs = format!("{DATA_VOLUME}/home");
+    sys.file(&autofs, b"")
+        .stat_of(&autofs, folder())
+        .file_id_of(
+            Path::new(&autofs),
+            FileId {
+                dev: AUTOFS,
+                ino: 2,
+                born_ns: None,
+            },
+        );
+    on_volume(sys, spotlight_scope::SHARED, 20);
 }
 
 /// How the fake `plutil` treats an insert.
@@ -224,17 +279,38 @@ fn sorted(sys: &Fake) -> Vec<String> {
 }
 
 const KILL: &str = "/usr/bin/killall -9 mds";
-const FULL: &[u8] = b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/My Projects\n";
+/// Every folder [`home`]'s Mac should leave out, as the receipt lists them.
+pub(crate) const FULL: &[u8] = b"/Library\n\
+    /System/Volumes/Data/MobileSoftwareUpdate\n\
+    /Users//Shared\n\
+    /Users//alice/Developer\n\
+    /Users//alice/Downloads\n\
+    /Users//alice/Library/Caches\n\
+    /Users//alice/Library/Mail\n\
+    /Users//alice/My Projects\n\
+    /opt\n";
 
-/// Root adds each home folder but Documents, Desktop, Library and Applications to the
-/// excluded folders, keeps the entry a person put there, restarts mds once, and leaves a
-/// receipt naming what it excluded; a second run changes nothing. The live configuration is
-/// only ever replaced by a rename of a checked copy with its owner and mode, never edited
-/// where it stands.
-/// NEGATIVE CONTROLS: a dot-folder, a `.noindex` folder, a file and a link are never added; a
-/// new folder is a change again.
+/// [`FULL`]'s folders, one a line.
+pub(crate) fn full() -> Vec<String> {
+    String::from_utf8(FULL.to_vec())
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Root keeps Spotlight to the owner's list: it adds every folder beside Applications,
+/// Documents, Desktop and the synced drives to the excluded folders (the home's, its
+/// Library's, the data volume's top level, spelled at the root where firmlinked, and
+/// /Users//Shared), keeps the entry a person put there, restarts mds once, and leaves a receipt
+/// naming what it excluded; a second run changes nothing, and a new Library folder is a change
+/// again. The live configuration is only ever replaced by a rename of a checked copy with its
+/// owner and mode, never edited where it stands.
+/// NEGATIVE CONTROLS: no kept folder, dot-folder, `.noindex` folder, file, link, ~/Library
+/// itself or mount point ever reaches the configuration, and no run turns indexing off with
+/// `mdutil -i`.
 #[test]
-fn setup_excludes_the_home_folders_spotlight_need_not_index() {
+fn setup_keeps_spotlight_to_the_owners_list_and_excludes_the_rest() {
     let sys = Fake::root();
     home(&sys);
     spotlight(&sys, Some(&["/Volumes/Backup"]), Config::Writes);
@@ -249,22 +325,60 @@ fn setup_excludes_the_home_folders_spotlight_need_not_index() {
             len: 0,
         },
     );
+    let planned = scope_rows(&sys, Mode::Plan);
+    assert_eq!(
+        planned[0].to.as_deref(),
+        Some("excluded; Applications, Documents, Desktop and synced drives stay indexed"),
+        "{planned:?}"
+    );
     let rows = scope_rows(&sys, Mode::Apply);
     assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
     assert_eq!(
         rows[0].from.as_deref(),
-        Some("indexed: Developer, Downloads, My Projects")
+        Some(
+            "indexed: 3 home folders (Developer, Downloads, My Projects), 2 Library folders, \
+             4 data-volume folders"
+        )
     );
     assert_eq!(
-        sorted(&sys),
-        [
-            "/Users//alice/Developer",
-            "/Users//alice/Downloads",
-            "/Users//alice/My Projects",
-            "/Volumes/Backup",
-        ]
+        rows[0].to.as_deref(),
+        Some(
+            "setup has excluded each of 9 folders beside Applications, Documents, Desktop and \
+             synced drives"
+        )
     );
+    let mut expected = full();
+    expected.push("/Volumes/Backup".to_owned());
+    expected.sort();
+    assert_eq!(sorted(&sys), expected);
     assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(FULL));
+    let home = Path::new(ALICE);
+    let mut never: Vec<PathBuf> = spotlight_scope::kept(home)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    never.extend(
+        [
+            "/Users//alice/Library",
+            "/Users//alice/.cargo",
+            "/Users//alice/build.noindex",
+            "/Users//alice/notes.txt",
+            "/Users//alice/Linked",
+            "/Users",
+            "/Volumes",
+            "/System/Volumes/Data/home",
+            "/System/Volumes/Data/opt",
+            "/System/Volumes/Data/Library",
+        ]
+        .map(PathBuf::from),
+    );
+    for path in &never {
+        assert!(
+            !sorted(&sys).contains(&path.display().to_string()),
+            "{}",
+            path.display()
+        );
+    }
     let calls = sys.calls();
     let at = |start: &str| calls.iter().position(|c| c.starts_with(start)).unwrap();
     let landed = |c: &String| c.starts_with("rename ") && c.ends_with(VOLUME_CONFIG);
@@ -290,15 +404,22 @@ fn setup_excludes_the_home_folders_spotlight_need_not_index() {
     assert_eq!(count(&sys, KILL), 1);
     assert_eq!(count(&sys, RECEIPT_WRITE), 1);
 
-    let new = format!("{ALICE}/Scratch");
+    let new = format!("{ALICE}/Library/Containers");
     sys.file(&new, b"").stat_of(&new, folder());
     let rows = scope_rows(&sys, Mode::Plan);
     assert_eq!(rows[0].outcome, Outcome::Planned, "{rows:?}");
-    assert_eq!(rows[0].from.as_deref(), Some("indexed: Scratch"));
+    assert_eq!(rows[0].from.as_deref(), Some("indexed: 1 Library folder"));
     let rows = scope_rows(&sys, Mode::Apply);
     assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
     assert_eq!(count(&sys, KILL), 2);
-    assert_eq!(config_list(&sys).unwrap().len(), 5);
+    assert_eq!(config_list(&sys).unwrap().len(), expected.len() + 1);
+    assert!(
+        !sys.calls()
+            .iter()
+            .any(|call| call.starts_with("/usr/bin/mdutil -i")),
+        "{:?}",
+        sys.calls()
+    );
 }
 
 /// A folder the person took out of the excluded folders stays out: an ordinary account and
@@ -324,17 +445,56 @@ fn a_folder_the_person_made_searchable_again_is_never_excluded_again() {
     let new = format!("{ALICE}/Scratch");
     sys.file(&new, b"").stat_of(&new, folder());
     assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
-    assert_eq!(
-        sorted(&sys),
-        [
-            "/Users//alice/Developer",
-            "/Users//alice/My Projects",
-            "/Users//alice/Scratch",
-        ]
-    );
+    let mut expected = full();
+    expected.retain(|path| path != "/Users//alice/Downloads");
+    expected.push("/Users//alice/Scratch".to_owned());
+    expected.sort();
+    assert_eq!(sorted(&sys), expected);
     // The receipt keeps naming it, which is the record of the person's choice.
     let receipt = String::from_utf8(sys.written(SCOPE_RECEIPT).unwrap()).unwrap();
     assert!(receipt.contains("/Users//alice/Downloads\n"), "{receipt}");
+}
+
+/// A home on another volume keeps its own folders, which the data volume's configuration does
+/// not govern, while root still leaves out the data volume's folders: the probe plans a change
+/// and the apply excludes the volume's folders alone.
+/// NEGATIVE CONTROL: the same Mac with the home on the volume excludes its folders too
+/// ([`setup_keeps_spotlight_to_the_owners_list_and_excludes_the_rest`]), and nothing of the
+/// home reaches the configuration here.
+#[test]
+fn a_home_off_the_data_volume_keeps_its_folders_and_root_still_scopes_the_volume() {
+    let sys = Fake::root();
+    home(&sys);
+    sys.stat_of(ALICE, folder()).file_id_of(
+        Path::new(ALICE),
+        FileId {
+            dev: AUTOFS,
+            ino: 7,
+            born_ns: None,
+        },
+    );
+    spotlight(&sys, Some(&[]), Config::Writes);
+    let rows = scope_rows(&sys, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+    assert_eq!(
+        rows[0].from.as_deref(),
+        Some("indexed: 4 data-volume folders")
+    );
+    assert_eq!(
+        sorted(&sys),
+        [
+            "/Library",
+            "/System/Volumes/Data/MobileSoftwareUpdate",
+            "/Users//Shared",
+            "/opt"
+        ]
+    );
+    assert!(
+        !sorted(&sys).iter().any(|path| path.starts_with(ALICE)),
+        "{:?}",
+        sorted(&sys)
+    );
+    assert_eq!(count(&sys, KILL), 1);
 }
 
 /// A receipt that is gone while the configuration already holds every folder is written
@@ -374,7 +534,7 @@ fn setup_makes_a_missing_list_and_a_failed_edit_leaves_the_configuration_alone()
     home(&sys);
     spotlight(&sys, None, Config::Writes);
     assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
-    assert_eq!(config_list(&sys).map(|list| list.len()), Some(3));
+    assert_eq!(config_list(&sys).map(|list| list.len()), Some(full().len()));
     assert!(sys.written(SCOPE_REFUSED).is_none());
 
     let failed = |seed: &dyn Fn(&Fake)| {
@@ -445,9 +605,10 @@ fn a_disabled_volume_is_left_as_it_is() {
 
 /// An ordinary account reads only the receipt (the configuration is root's): the automatic ask
 /// owes the step while a folder of its home is indexed and no receipt or refusal names any
-/// folder of that home, and only at the console. Once one does, a folder the home gains later
-/// asks no password by itself; the person's own setup still has it to exclude.
-/// NEGATIVE CONTROLS: a receipt naming any folder owes nothing; one that is not root's own
+/// folder of that home, and only at the console. Once one does, a folder the home or its
+/// Library gains later asks no password by itself; the person's own setup still has it to
+/// exclude.
+/// NEGATIVE CONTROLS: a receipt that scoped the home owes no automatic ask; one that is not root's own
 /// file, an unread indexing state, a disabled volume, another account at the console, root
 /// and Linux owe nothing either, and no reading runs `plutil`; a refusal that is not root's own
 /// file says nothing, so the never-scoped home is still owed.
@@ -484,12 +645,30 @@ fn an_ordinary_account_is_owed_the_scope_by_the_receipt() {
     let sys = account();
     assert!(automatic_scope_owed(&sys));
     assert!(scope_owed(&sys));
-    sys.file(SCOPE_RECEIPT, b"/Users//alice/Developer\n");
+    // Every folder but ~/Developer, made since setup scoped the home.
+    let but_developer: Vec<u8> = full()
+        .iter()
+        .filter(|line| *line != "/Users//alice/Developer")
+        .flat_map(|line| format!("{line}\n").into_bytes())
+        .collect();
+    sys.file(SCOPE_RECEIPT, &but_developer);
     assert!(!automatic_scope_owed(&sys));
     assert!(scope_owed(&sys));
     sys.file(SCOPE_RECEIPT, FULL);
     assert!(!automatic_scope_owed(&sys));
     assert!(!scope_owed(&sys));
+    let library_new = format!("{ALICE}/Library/Containers");
+    sys.file(&library_new, b"").stat_of(&library_new, folder());
+    assert!(
+        scope_owed(&sys) && !automatic_scope_owed(&sys),
+        "a new Library folder is work and asks no password"
+    );
+    let home_new = format!("{ALICE}/Checkout");
+    sys.file(&home_new, b"").stat_of(&home_new, folder());
+    assert!(
+        scope_owed(&sys) && !automatic_scope_owed(&sys),
+        "a new home folder is work and asks no password"
+    );
     assert!(
         !sys.calls().iter().any(|call| call.contains("plutil")),
         "{:?}",
@@ -497,7 +676,7 @@ fn an_ordinary_account_is_owed_the_scope_by_the_receipt() {
     );
 
     let refused = account();
-    refused.file(SCOPE_REFUSED, b"/Users//alice/Developer\n");
+    refused.file(SCOPE_REFUSED, &but_developer);
     assert!(!automatic_scope_owed(&refused));
     assert!(scope_owed(&refused));
     refused.file(SCOPE_REFUSED, FULL);
@@ -1434,5 +1613,183 @@ fn check_again_searches_spotlight_anew() {
             }),
             2
         )
+    );
+}
+
+/// The person's keep-out of `folder`, as `--only spotlight-keep-out --keep-out <folder>` runs it.
+fn keep_out_rows(sys: &Fake, folder: &str) -> Vec<crate::model::ItemReport> {
+    let items = person_items(
+        aterm_types::macos_setup::root_only::Step::SpotlightKeepOut,
+        Some(Path::new(folder)),
+    )
+    .expect("a keep-out's items");
+    engine::run(&items, Mode::Apply, sys, &at_console(), &mut NoJournal)
+}
+
+/// A FOLDER KEPT OUT FROM THE PAGE IS THE PERSON'S AND THE SCOPE STEP NEVER TAKES IT BACK
+/// (SD-96): Keep a folder out… of ~/Documents/Archive adds it to the data volume's excluded
+/// folders by the scope step's own checked edit (one `mds` restart) and records it in
+/// `spotlight-scope.yours`, never on setup's receipt; setup's scope step then applies its own
+/// folders and leaves the person's entry and record as they are; the same keep-out again
+/// changes nothing; and a keep-out never reads the volume's indexing, so one pressed while the
+/// person's pause holds is kept out all the same.
+/// CONTROL: a folder the rule refuses (~/Library, ~/Documents itself, the home, ~/code/x, a path
+/// on another volume, one with `..`) changes nothing: no configuration edit, no record, no
+/// restart.
+#[test]
+fn a_folder_kept_out_from_the_page_is_the_persons_and_the_scope_step_never_takes_it_back() {
+    const ARCHIVE: &str = "/Users//alice/Documents/Archive";
+    const YOURS_WRITE: &str = "write /Library/Application Support/aterm/spotlight-scope.yours 644";
+    let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, Some(&[]), Config::Writes);
+    let rows = keep_out_rows(&sys, ARCHIVE);
+    assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+    assert_eq!(config_list(&sys).unwrap(), [ARCHIVE]);
+    assert_eq!(
+        sys.written(spotlight_scope::YOURS).as_deref(),
+        Some(format!("{ARCHIVE}\n").as_bytes())
+    );
+    assert!(sys.written(SCOPE_RECEIPT).is_none(), "not setup's receipt");
+    assert_eq!(count(&sys, KILL), 1);
+    assert!(
+        !sys.calls()
+            .iter()
+            .any(|call| call.starts_with("/usr/bin/mdutil")),
+        "a keep-out reads no indexing: a pause does not hold it back"
+    );
+
+    let rows = scope_rows(&sys, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+    assert!(
+        config_list(&sys)
+            .unwrap()
+            .iter()
+            .any(|path| path == ARCHIVE),
+        "setup's scope keeps the person's entry"
+    );
+    assert_eq!(
+        sys.written(spotlight_scope::YOURS).as_deref(),
+        Some(format!("{ARCHIVE}\n").as_bytes()),
+        "and their record"
+    );
+    let receipt = String::from_utf8(sys.written(SCOPE_RECEIPT).expect("the receipt")).unwrap();
+    assert!(!receipt.contains(ARCHIVE), "{receipt}");
+
+    let rows = keep_out_rows(&sys, ARCHIVE);
+    assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
+    assert_eq!(count(&sys, KILL), 2, "only the scope's own restart since");
+    assert_eq!(count(&sys, YOURS_WRITE), 1);
+
+    for refused in [
+        "/Users//alice/Library",
+        "/Users//alice/Documents",
+        ALICE,
+        "/Users//alice/code/x",
+        "/Volumes/X/a",
+        "/Users//alice/Documents/../x",
+    ] {
+        let sys = Fake::root();
+        home(&sys);
+        spotlight(&sys, Some(&[]), Config::Writes);
+        let rows = keep_out_rows(&sys, refused);
+        assert_ne!(
+            rows[0].outcome,
+            Outcome::Changed,
+            "CONTROL {refused}: {rows:?}"
+        );
+        assert_eq!(
+            config_list(&sys).unwrap(),
+            Vec::<String>::new(),
+            "CONTROL {refused}"
+        );
+        assert!(
+            sys.written(spotlight_scope::YOURS).is_none(),
+            "CONTROL {refused}"
+        );
+        assert_eq!(count(&sys, KILL), 0, "CONTROL {refused}");
+    }
+}
+
+/// The person's Pause, Resume and Rebuild run Spotlight's own tool on the data volume as root,
+/// read back by `mdutil -s`: Pause turns indexing off (`-i off`), Resume on (`-i on`), Rebuild
+/// erases the index (`-E`) as a journaled refresh of indexing that reads on before and after.
+/// CONTROL: a pause of a volume already off runs no `mdutil -i`, and a rebuild of a volume whose
+/// indexing is off runs no `-E` and does not finish.
+#[test]
+fn the_persons_spotlight_steps_run_mdutil_on_the_data_volume() {
+    use aterm_types::macos_setup::root_only::Step;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mac = |on: bool| {
+        let sys = Fake::root();
+        let state = Arc::new(AtomicBool::new(on));
+        sys.simulate(move |_, cmd| {
+            let args: Vec<String> = cmd
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match (cmd.program.to_str()?, args.as_slice()) {
+                (MDUTIL, ["-s", DATA_VOLUME]) => Some(Ran::ok(if state.load(Ordering::SeqCst) {
+                    "/System/Volumes/Data:\n\tIndexing enabled.\n"
+                } else {
+                    "/System/Volumes/Data:\n\tIndexing disabled.\n"
+                })),
+                (MDUTIL, ["-i", word, DATA_VOLUME]) => {
+                    state.store(*word == "on", Ordering::SeqCst);
+                    Some(Ran::ok(""))
+                }
+                (MDUTIL, ["-E", DATA_VOLUME]) => Some(Ran::ok("")),
+                _ => None,
+            }
+        });
+        sys
+    };
+    let run = |sys: &Fake, step: Step| {
+        let items = person_items(step, None).expect("the step's items");
+        engine::run(&items, Mode::Apply, sys, &at_console(), &mut NoJournal)
+    };
+    for (on, step, call, outcome) in [
+        (
+            true,
+            Step::SpotlightPause,
+            "/usr/bin/mdutil -i off /System/Volumes/Data",
+            Outcome::Changed,
+        ),
+        (
+            false,
+            Step::SpotlightResume,
+            "/usr/bin/mdutil -i on /System/Volumes/Data",
+            Outcome::Changed,
+        ),
+        (
+            true,
+            Step::SpotlightRebuild,
+            "/usr/bin/mdutil -E /System/Volumes/Data",
+            Outcome::Ok,
+        ),
+    ] {
+        let sys = mac(on);
+        let rows = run(&sys, step);
+        assert_eq!(rows[0].outcome, outcome, "{step:?}: {rows:?}");
+        assert_eq!(count(&sys, call), 1, "{step:?}: {:?}", sys.calls());
+    }
+    let off = mac(false);
+    let rows = run(&off, Step::SpotlightPause);
+    assert_eq!(rows[0].outcome, Outcome::Ok, "CONTROL: {rows:?}");
+    assert!(
+        !off.calls().iter().any(|call| call.contains("mdutil -i")),
+        "CONTROL"
+    );
+    let rows = run(&off, Step::SpotlightRebuild);
+    assert!(
+        !matches!(rows[0].outcome, Outcome::Ok | Outcome::Changed),
+        "CONTROL: {rows:?}"
+    );
+    assert!(
+        !off.calls().iter().any(|call| call.contains("mdutil -E")),
+        "CONTROL"
     );
 }

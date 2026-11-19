@@ -29,6 +29,30 @@ fn local(argv: &[String]) -> Result<String, String> {
 }
 
 #[test]
+fn existing_only_open_never_creates_or_repairs_missing_ownership() {
+    let top = aterm_tempfile::tempdir().unwrap();
+    let missing = top.path().join("missing");
+    assert!(Namespace::open_existing(&missing, "aterm-linux").is_err());
+    assert!(!missing.exists());
+    directory(&missing);
+    std::fs::write(missing.join("notes"), b"preserve").unwrap();
+    assert!(Namespace::open_existing(&missing, "aterm-linux").is_err());
+    assert!(!missing.join("owner").exists());
+    assert_eq!(std::fs::read(missing.join("notes")).unwrap(), b"preserve");
+    let known = Namespace::open(&top.path().join("known"), "aterm-linux").unwrap();
+    owned_vm(&known);
+    let receipt = std::fs::read(known.path.join("owner")).unwrap();
+    Namespace::open_existing(&known.path, "aterm-linux")
+        .unwrap()
+        .admit_vm(&known.vm_dir())
+        .unwrap();
+    assert_eq!(std::fs::read(known.path.join("owner")).unwrap(), receipt);
+    std::fs::remove_file(known.path.join("owner")).unwrap();
+    assert!(Namespace::open_existing(&known.path, "aterm-linux").is_err());
+    assert!(!known.path.join("owner").exists());
+}
+
+#[test]
 fn existing_names_and_failed_creations_never_authorize_vm_mutation() {
     let t = aterm_tempfile::tempdir().unwrap();
     let home = t.path().join("lima");

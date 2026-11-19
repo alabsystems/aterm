@@ -702,6 +702,179 @@ fn observe_notes_sessions_readings_and_walls_from_the_diff() {
     assert!(notes.is_empty(), "{notes:?}");
 }
 
+/// A wall of a model's own week names its model's bucket (FL-269), and so does its clearing, so
+/// the fleet walls that model's sessions alone; a wall of the account's own window names none.
+/// A wall of any other `seven_day_*` window (`seven_day_other`, a panel's `seven_day_haiku`),
+/// which the harness takes as the account's, names `seven_day_other`, so the fleet takes it as
+/// every session's as this Mac does.
+/// NEGATIVE CONTROLS: with `observe` noting no model (`note.model = None`), Fable's wall and
+/// Opus's clearing name none, and the assertion fails; run: with `model_word` naming only the
+/// models' own weeks (`model_week(name)`), the other weeks' walls name none (`` left: [("wall",
+/// …, Some("5h"), None), ("wall", …, Some("7d-model"), None), … ``).
+#[test]
+fn a_model_walls_note_names_its_models_bucket() {
+    let before = keyed();
+    let mut after = before.clone();
+    let wall = |cleared: bool| Wall {
+        until: Some(5_000),
+        at: 30,
+        by: HERE.into(),
+        attempts: 0,
+        cleared,
+        seen: None,
+    };
+    let ann = after.accounts.get_mut("ann").unwrap();
+    for window in [
+        "seven_day_overage_included",
+        "seven_day_other",
+        "seven_day_haiku",
+        SESSION_LIMIT,
+    ] {
+        ann.walls.insert(window.into(), wall(false));
+    }
+    let bob = after.accounts.get_mut("bob").unwrap();
+    bob.walls.insert("seven_day_opus".into(), wall(true));
+    let notes = observe(Cli::Claude, &before, &mut after.clone(), &mut [], 40);
+    let walls: Vec<(&str, &str, Option<&str>, Option<&str>)> = notes
+        .iter()
+        .map(|n| {
+            (
+                n.kind,
+                n.account.as_ref().map_or("", Key::as_str),
+                n.window,
+                n.model,
+            )
+        })
+        .collect();
+    assert_eq!(
+        walls,
+        [
+            ("wall", ANN, Some("5h"), None),
+            ("wall", ANN, Some("7d-model"), Some("seven_day_other")),
+            ("wall", ANN, Some("7d-model"), Some("seven_day_other")),
+            (
+                "wall",
+                ANN,
+                Some("7d-model"),
+                Some("seven_day_overage_included")
+            ),
+            (
+                "wall-cleared",
+                BOB,
+                Some("7d-model"),
+                Some("seven_day_opus")
+            ),
+        ]
+    );
+    for note in &notes {
+        assert!(note.model.is_none_or(|m| MODELS.contains(&m)), "{note:?}");
+    }
+}
+
+/// After an older build's backfill (its marker says `1`), the backfill notes again only each
+/// standing wall of a model's week, now with its model (FL-269): that build's notes of them
+/// named none, which no reader takes as any model's wall, and the harness would not note an
+/// unchanged wall again. It replays no ledger row and notes no reading, no account-wide wall,
+/// no lapsed or cleared wall and no login word; once marked, the backfill is done.
+/// NEGATIVE CONTROL, run: with `backfilled` taking any marker as done (`.is_some()`), the older
+/// build's marker reads as done: `` an older build's marker leaves the model walls due ``.
+#[cfg(unix)]
+#[test]
+fn after_an_older_builds_backfill_each_standing_model_wall_is_noted_again_with_its_model() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let harness = scratch.path().join("harness");
+    let home = scratch.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let now = 100 * 86_400;
+    let store = Store::at_for(&harness, Cli::Claude, &home);
+    let mut state = State {
+        machine: HERE.into(),
+        ..keyed()
+    };
+    let wall = |until: i64, cleared: bool| Wall {
+        until: Some(until),
+        at: now - 600,
+        by: HERE.into(),
+        attempts: 0,
+        cleared,
+        seen: None,
+    };
+    let ann = state.accounts.get_mut("ann").unwrap();
+    ann.windows
+        .insert(SESSION_LIMIT.into(), fig(420, now + 3600, now - 60));
+    ann.walls.insert(
+        "seven_day_overage_included".into(),
+        wall(now + 86_400, false),
+    );
+    ann.walls
+        .insert(SESSION_LIMIT.into(), wall(now + 3600, false));
+    ann.walls.insert(
+        "seven_day_opus".into(),
+        Wall {
+            at: now - 3 * 86_400,
+            ..wall(now - 2 * 86_400, false)
+        },
+    );
+    ann.auth = Auth::Ok;
+    ann.auth_at = Some(now - 300);
+    let bob = state.accounts.get_mut("bob").unwrap();
+    bob.walls
+        .insert("seven_day_other".into(), wall(now + 7200, false));
+    bob.walls
+        .insert("seven_day_sonnet".into(), wall(now + 7200, true));
+    store
+        .append(&[Event::new(now - 600, Kind::SignedIn, "ann")])
+        .unwrap();
+    aterm_uds::private_file::write_private(
+        store.state_file().parent().unwrap(),
+        "state.json",
+        (state.to_json() + "\n").as_bytes(),
+    )
+    .unwrap();
+    let mark_dir = harness.join("alab");
+    aterm_uds::private_file::ensure_private_dir(&mark_dir).unwrap();
+    aterm_uds::private_file::write_private(&mark_dir, "backfilled", b"1\n").unwrap();
+    assert!(
+        !backfilled(&harness),
+        "an older build's marker leaves the model walls due"
+    );
+    let notes = backfill(&harness, &home, &|_| None, &keyer, now);
+    let noted: Vec<_> = notes
+        .iter()
+        .map(|n| {
+            (
+                n.kind,
+                n.account.as_ref().map_or("", Key::as_str),
+                n.window,
+                n.model,
+                n.until,
+            )
+        })
+        .collect();
+    let until = |t: i64| Some(u64::try_from(t).unwrap());
+    assert_eq!(
+        noted,
+        [
+            (
+                "wall",
+                ANN,
+                Some("7d-model"),
+                Some("seven_day_overage_included"),
+                until(now + 86_400)
+            ),
+            (
+                "wall",
+                BOB,
+                Some("7d-model"),
+                Some("seven_day_other"),
+                until(now + 7200)
+            ),
+        ]
+    );
+    mark_backfilled(&harness).unwrap();
+    assert!(backfilled(&harness));
+}
+
 /// The backfill notes the local ledger's last 30 days and the state's standing facts once,
 /// keyed by the roster where no key is learned yet; it leaves no marker of its own, which the
 /// caller writes once the notes are durable.
@@ -836,12 +1009,15 @@ fn a_provider_read_is_a_probe_of_its_account_saying_why() {
 }
 
 /// A RESET'S NOTE NAMES THE WINDOWS IT REFILLED: a `reset-used` of the week, of a workspace's
-/// account under its `sub` as its readings are; one note for each window of a full reset (a
-/// model's week under its journal word, once); a refill inside the five-hour window is that
-/// window's; a reset spent with the limit still standing (its row names no window) is one note
-/// of no window, which no fold cuts by.
-/// NEGATIVE CONTROL: with `refills` returning `of_ledger`'s note as it is, no note names a
-/// window or a workspace, and the `shown` assertion fails.
+/// account under its `sub` as its readings are; one note for each window of a full reset, a
+/// model's week under its journal word with its model (FL-271), so a refill of the Sonnet week
+/// ends no Fable wall, and one per model; a refill inside the five-hour window is that window's
+/// and names no model; a reset spent with the limit still standing (its row names no window) is
+/// one note of no window, which no fold cuts by.
+/// NEGATIVE CONTROLS: with `refills` returning `of_ledger`'s note as it is, no note names a
+/// window or a workspace, and the `shown` assertion fails; run: with `refills` naming no model
+/// on its notes (`model: None`), the models' weeks' refills name none (`` left: […, (120,
+/// Some("7d-model"), None, false), (120, Some("7d-model"), None, false), … ``).
 #[test]
 fn a_resets_note_names_the_windows_it_refilled() {
     use crate::harness::profile::AccountKey;
@@ -861,23 +1037,25 @@ fn a_resets_note_names_the_windows_it_refilled() {
     ];
     let notes = observe(Cli::Codex, &state, &mut state.clone(), &mut events, 200);
     assert!(notes.iter().all(|n| n.kind == "reset-used"), "{notes:?}");
-    let shown: Vec<(u64, Option<&str>, bool)> = notes
+    let shown: Vec<(u64, Option<&str>, Option<&str>, bool)> = notes
         .iter()
-        .map(|n| (n.t, n.window, n.sub.is_some()))
+        .map(|n| (n.t, n.window, n.model, n.sub.is_some()))
         .collect();
     assert_eq!(
         shown,
         [
-            (100, Some("7d"), true),
-            (110, None, false),
-            (120, Some("7d-model"), false),
-            (120, Some("5h"), false),
-            (130, Some("5h"), false),
+            (100, Some("7d"), None, true),
+            (110, None, None, false),
+            (120, Some("7d-model"), Some("seven_day_opus"), false),
+            (120, Some("7d-model"), Some("seven_day_sonnet"), false),
+            (120, Some("5h"), None, false),
+            (130, Some("5h"), None, false),
         ]
     );
     assert_eq!(notes[0].sub, workspace, "the workspace's own");
     for note in &notes {
         assert!(note.window.is_none_or(|w| WINDOWS.contains(&w)));
+        assert!(note.model.is_none_or(|m| MODELS.contains(&m)), "{note:?}");
     }
 }
 
@@ -1155,7 +1333,7 @@ fn login_rows_are_value_free_keyed_by_account_and_say_the_stores_words() {
             "fill"
         }
     };
-    let rows = login_rows(Cli::Claude, &records, &keyer, &held, NOW);
+    let rows = login_rows(Cli::Claude, &records, &keyer, &held, &|_, _| None, NOW);
     let keys: Vec<&str> = rows.iter().map(|row| row.account.as_str()).collect();
     assert_eq!(
         keys,
@@ -1282,7 +1460,14 @@ fn a_wrong_renewal_of_a_signed_out_login_is_wrong_account() {
         logins,
         notes: Vec::new(),
     };
-    let rows = login_rows(Cli::Claude, &records, &keyer, &|_| "fill", 300);
+    let rows = login_rows(
+        Cli::Claude,
+        &records,
+        &keyer,
+        &|_| "fill",
+        &|_, _| None,
+        300,
+    );
     let keys: Vec<&str> = rows.iter().map(|row| row.account.as_str()).collect();
     assert_eq!(keys, [ANN, BOB], "keys");
     for row in &rows {

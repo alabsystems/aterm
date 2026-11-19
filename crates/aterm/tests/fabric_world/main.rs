@@ -20,6 +20,8 @@ mod harness_tests;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[path = "../support/native_claude.rs"]
 mod native_claude;
+#[path = "../support/patience.rs"]
+mod patience;
 
 mod at_rest;
 mod bridge_e2e;

@@ -109,7 +109,7 @@ fn the_priority_is_the_declared_one() {
     let mut seen = Vec::new();
     while let Some(item) = mb.take(Duration::from_millis(0), t0()) {
         seen.push(match item {
-            Item::Closed(_) | Item::Lost(..) | Item::Refused(..) => "closed",
+            Item::Closed(_) | Item::CommandLost | Item::Lost(..) | Item::Refused(..) => "closed",
             Item::Fleet(_) => "fleet",
             Item::Halt(_) => "halt",
             Item::Resume(..) => "resume",
@@ -1074,7 +1074,9 @@ fn a_reconnect_forgets_the_old_connections_inputs_but_not_aterms() {
     while let Some(item) = mb.take(Duration::from_millis(0), t0()) {
         seen.push(match item {
             Item::Closed(Source::Aterm) => "closed-aterm",
-            Item::Closed(_) | Item::Lost(..) | Item::Refused(..) => "closed-broker",
+            Item::Closed(_) | Item::CommandLost | Item::Lost(..) | Item::Refused(..) => {
+                "closed-broker"
+            }
             Item::Fleet(_) => "fleet",
             Item::Halt(_) => "halt",
             Item::Resume(..) => "resume",

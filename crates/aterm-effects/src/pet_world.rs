@@ -165,6 +165,7 @@ enum Window {
 
 /// One map-local cell that only the live caret's 3x3 ring protects.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 struct CaretCell {
     row: usize,
     col: usize,
@@ -214,6 +215,7 @@ enum Plane {
 /// clearance readers read them where the caret's window does not read a rectangle whole
 /// ([`PetWorld::clearance_on`]).
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 struct BodyCells {
     /// Whether the window read its cells this observation: not with
     /// [`crate::kitty_pet::OldPath::BodysWindowReadsItsGround`] reverted
@@ -456,6 +458,7 @@ impl PetWorldFacts {
 
 /// A real visible block, with a stable absolute row and its current projection.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 /// Visible block with a stable absolute row and current pane projection.
 pub struct PetAnchor {
     pub surface: PetSurface,
@@ -487,6 +490,7 @@ enum PetGlyph {
 
 /// A fixed-budget occupancy window and small, text-free observation set.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 /// Fixed-budget occupancy window and text-free observation set.
 pub struct PetWorld {
     cells: Vec<PetCell>,

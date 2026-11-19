@@ -8,23 +8,46 @@ fn log(text: &str) -> Measured {
 }
 
 #[test]
-fn a_summary_line_parses_as_the_shell_read_it() {
-    assert_eq!(
-        parse_summary("  Summary: 3 proved, 0 failed, 0 assumed, 0 inconclusive (7 total)"),
-        (Some(3), Some(7))
-    );
-    assert_eq!(
-        parse_summary("Summary: 1 proved (2 total) Summary: 5 proved (9 total)"),
-        (Some(5), Some(9))
-    );
-    assert_eq!(
-        parse_summary("  Summary: three properties proved, nothing outstanding"),
-        (None, None)
-    );
-    assert_eq!(
-        parse_summary("Summary: 4 proved, no total"),
-        (Some(4), None)
-    );
+fn summary_counts_require_a_consistent_outcome_partition() {
+    for (counts, proved, total) in [
+        ("3 proved (7 total)", 3, 7),
+        ("3 proved, 2 failed (7 total); reproducible", 3, 7),
+        (
+            "1 proved, 2 failed, 3 runtime-checked, 4 inconclusive (10 total)",
+            1,
+            10,
+        ),
+        (
+            "1 proved, 2 failed, 3 runtime-checked, 4 assumed, 5 mandated, 6 inconclusive (21 total)",
+            1,
+            21,
+        ),
+        (
+            "1 proved, 2 failed, 3 runtime-checked, 4 assumed, 5 mandated, 6 contract-panic, 7 inconclusive (28 total); measured; profile a; vector b",
+            1,
+            28,
+        ),
+    ] {
+        assert_eq!(
+            parse_summary(&format!("  Summary: {counts}")),
+            (Some(proved), Some(total))
+        );
+    }
+    for counts in [
+        "1 proved (2 total) Summary: 5 proved (9 total)",
+        "4 proved, no total",
+        "4 proved, 4 failed (7 total)",
+        "1 proved, 2 failed, 3 failed, 4 inconclusive (10 total)",
+        "1 proved, 2 failed, 3 runtime-checked, 4 inconclusive (11 total)",
+        "18446744073709551616 proved (18446744073709551616 total)",
+        "18446744073709551615 proved, 1 failed (18446744073709551615 total)",
+    ] {
+        assert_eq!(
+            parse_summary(&format!("Summary: {counts}")),
+            (None, None),
+            "{counts}"
+        );
+    }
 }
 
 #[test]
@@ -66,7 +89,7 @@ fn a_log_is_measured_as_the_shell_measured_it() {
     );
     let fields = m.to_fields();
     assert_eq!(fields.split('\t').nth(6), Some("-"), "{fields}");
-    let back = Measured::from_fields(&fields.split('\t').collect::<Vec<_>>());
+    let back = Measured::from_fields(&fields.split('\t').collect::<Vec<_>>(), true);
     assert_eq!(back.map(|(b, _)| b.skipped), Some(None));
     assert!(log("targo trust: error: verification did not run\n").transport);
 }
@@ -74,6 +97,59 @@ fn a_log_is_measured_as_the_shell_measured_it() {
 const DONE: &str = "Summary: 5 proved, 3 failed, 8 runtime-checked, 0 assumed, 0 mandated, 0 contract-panic, 5 inconclusive (21 total)\n\
                     Coverage: 9/9 eligible function bodies verified (complete)\n\
                     \x20 Gate: FAIL [advisory lane, exit 1] (5 proved / 21 total)\n";
+
+#[test]
+fn inconsistent_summary_or_coverage_cannot_raise_a_floor() {
+    let report = DONE.replace(
+        "Coverage: 9/9 eligible function bodies verified",
+        concat!(
+            "Failed sites: 3 failed row(s) at 2 distinct source site(s); 1 row(s) are hardened ",
+            "panic-boundary twins of a failed overflow/bounds row at the same MIR assert (distinct ",
+            "obligations: panic-freedom vs. L0 safety; both stay failed)\n",
+            "Coverage: 12/12 eligible function bodies accounted for (10 verified, 2 excluded: test-harness)",
+        ),
+    );
+    let replay = |text: &str| {
+        let m = Measured::of_log(text.as_bytes(), "1").unwrap();
+        let f = facts(vec![("alpha", Decision::Gate(m))]);
+        let stored = Facts::parse(&f.to_record()).unwrap();
+        judge(&stored, None, None, "R", "M", Update::RAISE)
+    };
+    let v = replay(&report);
+    assert_eq!((v.word, v.total.as_str()), ("PASS", "5/21"));
+    assert!(v.ratchet.unwrap().contains("alpha\t5\t21\t"));
+
+    let wrong_summary = report.replace("5 proved,", "15 proved,");
+    let wrong_coverage = report.replace("10 verified", "1 verified");
+    for (broken, issue) in [
+        (wrong_summary.clone(), "SUMMARY-UNPARSED"),
+        (wrong_coverage, "NOT-VERIFIED(incomplete)"),
+        (
+            report.replace("2 excluded", "12 excluded"),
+            "NOT-VERIFIED(incomplete)",
+        ),
+        (
+            report.replace("10 verified", "18446744073709551615 verified"),
+            "NOT-VERIFIED(incomplete)",
+        ),
+        (
+            report.replace("test-harness", "unknown"),
+            "NOT-VERIFIED(incomplete)",
+        ),
+    ] {
+        let v = replay(&broken);
+        assert_eq!((v.word, v.total.as_str()), ("FAIL", "0/0"), "{}", v.report);
+        assert_eq!(v.failed, [format!("alpha {issue}")]);
+        assert!(v.ratchet.is_none());
+    }
+    let v = replay(&wrong_summary.replace("10 verified", "1 verified"));
+    assert!(
+        v.report.contains("its Summary does not parse"),
+        "{}",
+        v.report
+    );
+    assert!(!v.report.contains("15 proved of 21"));
+}
 
 /// A complete-looking prefix followed by either a real EOF or an injected read failure.
 struct LogTail<'a> {
@@ -157,21 +233,25 @@ fn a_complete_summary_requires_a_clean_log_eof() {
 #[test]
 fn present_obligation_records_must_parse_before_any_measurement_is_kept() {
     let scratch = crate::test_scratch_dir("obligation-record-errors");
-    for name in ["alpha", "beta"] {
+    for name in ["alpha", "beta+sealed"] {
         testing::write_log(&scratch.path().join(format!("{name}@1.0.0.log")), DONE);
         fs::write(scratch.path().join(format!("{name}@1.0.0.log.rc")), "1\n").unwrap();
     }
     let valid = crate::trust_oblig::Record {
         package: "beta".into(),
-        unit: "beta".into(),
+        unit: r#"cargo-target(package="beta",kind=["lib"],target="beta")"#.into(),
         functions: 0,
         rows: Vec::new(),
     }
     .to_text();
-    let path = scratch.path().join("beta@1.0.0.log.oblig.tsv");
+    let foreign = valid.replace("beta", "gamma");
+    let wrong_unit = valid.replace("package=\"beta\"", "package=\"gamma\"");
+    let path = scratch.path().join("beta+sealed@1.0.0.log.oblig.tsv");
     for record in [
         None,
         Some(valid.as_str()),
+        Some(foreign.as_str()),
+        Some(wrong_unit.as_str()),
         Some(""),
         Some("not a record\n"),
         Some(valid.trim_end_matches("end\t0\n")),
@@ -182,7 +262,7 @@ fn present_obligation_records_must_parse_before_any_measurement_is_kept() {
         } else if path.exists() {
             fs::remove_file(&path).unwrap();
         }
-        let mut plan = Plan::parse(&format!("{PLAN_MAGIC}\nlogdir {}\ncrate alpha\talpha@1.0.0\tgate\ncrate beta\tbeta@1.0.0\tgate\n", scratch.path().display())).unwrap();
+        let mut plan = Plan::parse(&format!("{PLAN_MAGIC}\nlogdir {}\ncrate alpha\talpha@1.0.0\tgate\ncrate beta+sealed\tbeta+sealed@1.0.0\tgate\n", scratch.path().display())).unwrap();
         let before = plan.facts.clone();
         let measured = plan.measure();
         if record.is_none() || record == Some(valid.as_str()) {
@@ -198,8 +278,14 @@ fn present_obligation_records_must_parse_before_any_measurement_is_kept() {
         } else {
             let error = measured.unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            if record == Some(foreign.as_str()) || record == Some(wrong_unit.as_str()) {
+                assert!(error.to_string().contains("gamma"), "{error}");
+                assert!(error.to_string().contains("beta"), "{error}");
+            }
             assert!(
-                error.to_string().contains("beta@1.0.0.log.oblig.tsv"),
+                error
+                    .to_string()
+                    .contains("beta+sealed@1.0.0.log.oblig.tsv"),
                 "{error}"
             );
             assert_eq!(
@@ -230,6 +316,58 @@ fn execution_status_requires_the_receipts_native_integer_format() {
         execution_status(&status).unwrap_err().kind(),
         std::io::ErrorKind::NotFound
     );
+}
+
+#[test]
+fn a_present_pace_receipt_requires_a_complete_measurement() {
+    let scratch = crate::test_scratch_dir("pace-receipts");
+    for name in ["alpha", "beta"] {
+        testing::write_log(&scratch.path().join(format!("{name}.log")), DONE);
+        fs::write(scratch.path().join(format!("{name}.log.rc")), "1\n").unwrap();
+    }
+    let path = scratch.path().join("beta.log.pace");
+    let plan = || {
+        Plan::parse(&format!(
+            "{PLAN_MAGIC}\nlogdir {}\ncrate alpha\talpha\tgate\ncrate beta\tbeta\tgate\n",
+            scratch.path().display()
+        ))
+        .unwrap()
+    };
+    for receipt in [
+        None,
+        Some("20 50 - 8\n"),
+        Some("20 50 400 8 2 7\r\n"),
+        Some("20 50 400 8 2 7 1 10 5\n"),
+    ] {
+        if let Some(text) = receipt {
+            fs::write(&path, text).unwrap();
+        }
+        let mut plan = plan();
+        plan.measure().unwrap();
+        let Decision::Gate(beta) = &plan.facts.crates[1].decision else {
+            panic!("gated")
+        };
+        assert_eq!(
+            beta.pace.map(|p| p.text()),
+            receipt.map(|s| s.trim_end().to_string())
+        );
+    }
+    for malformed in [
+        "",
+        "20 50 - 8",
+        "20 50 400 8 2 7",
+        "20 50 - 8 2\n",
+        "unknown\n",
+        "20 50 - 8\n20 50 - 8\n",
+    ] {
+        fs::write(&path, malformed).unwrap();
+        let mut plan = plan();
+        let before = plan.facts.clone();
+        let error = plan.measure().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("beta.log.pace"), "{error}");
+        assert_eq!(plan.facts, before);
+    }
 }
 
 #[test]
@@ -281,6 +419,33 @@ const KILLED: &str = "error: could not compile `aterm-census` (lib); 216 warning
                       Coverage: unknown (compiler emitted no coverage_summary transport row; older toolchain?)\n\
                       \x20   [assertion] assertion: transport:missing-crate-summary UNKNOWN (targo-trust: missing crate_summary transport prevents proof that this rustc target completed)\n\
                       \x20 Gate: FAIL [advisory lane, exit 101] (207 proved / 2037 total)\n";
+
+#[test]
+fn a_cargo_child_signal_comes_from_its_exit_status() {
+    // Targo prints the program path verbatim, even with spaces, and shell-quotes each argument.
+    let command = "  process didn't exit successfully: `/path/Application Support/probe target/observed '(signal: 15, SIGTERM: termination signal)'`";
+    let measure = |status: &str| {
+        let log = format!("{command} ({status})\n{DONE}");
+        Measured::of_log(log.as_bytes(), "1").unwrap()
+    };
+    let exited = measure("exit status: 37");
+    assert!(exited.ended.is_empty(), "{}", exited.ended);
+    assert_eq!(exited.floor_counts(), Ok((5, 21)));
+    let killed = measure("signal: 9, SIGKILL: kill");
+    assert_eq!(
+        killed.ended,
+        "cargo: child process ended by signal 9 (SIGKILL)"
+    );
+    assert_eq!(
+        measure("signal: 31").ended,
+        "cargo: child process ended by signal 31"
+    );
+    let no_args = "error: process didn't exit successfully: `/tools/trustc` (signal: 15, SIGTERM: termination signal)";
+    assert_eq!(
+        Measured::of_log(no_args.as_bytes(), "101").unwrap().ended,
+        "cargo: trustc ended by signal 15 (SIGTERM)"
+    );
+}
 
 #[test]
 fn a_check_that_did_not_finish_says_so_in_its_own_record() {
@@ -349,6 +514,17 @@ fn a_check_that_did_not_finish_says_so_in_its_own_record() {
     let summary = "Summary: 5 proved (21 total)\n";
     assert!(!ended(summary, "0").is_empty());
     assert!(
+        !ended(&format!("{DONE}{summary}"), "0").is_empty(),
+        "a second summary must supply its own coverage"
+    );
+    assert!(
+        ended(
+            &format!("{DONE}{summary}Coverage: 7/7 eligible function bodies verified (complete)\n"),
+            "0"
+        )
+        .is_empty()
+    );
+    assert!(
         !ended(&format!("{summary}Coverage: 9/12 — coverage shortfall: 3 function(s) were never verified (fail-closed: never a passing gate)\n"), "1")
             .is_empty()
     );
@@ -406,7 +582,8 @@ fn a_check_that_did_not_finish_is_never_scored() {
         "M",
         Update::NONE,
     );
-    assert_eq!((v.word, v.exit, v.total.as_str()), ("PASS", 0, "210/2040"));
+    assert_eq!((v.word, v.exit, v.total.as_str()), ("FAIL", 1, "3/3"));
+    assert_eq!(v.failed, ["alpha GATE-BROKE(rc=101)"]);
     let v = judge(
         &run(check("cargo: trustc ended by signal 15 (SIGTERM)", "")),
         Some(&low),
@@ -432,7 +609,7 @@ fn a_check_that_did_not_finish_is_never_scored() {
     );
     assert_eq!((v.word, v.exit, v.total.as_str()), ("FAIL", 1, "3/3"));
     assert_eq!(v.failed, ["alpha OVER-BUDGET(5400s)"]);
-    let unfinished = [check("x", ""), check("", "60")];
+    let unfinished = [check("", ""), check("x", ""), check("", "60")];
     for d in &unfinished {
         for (ratchet, update) in [
             (format!("beta\t3\t3\t{DRV}\n"), Update::RAISE),
@@ -548,8 +725,7 @@ fn a_check_whose_trustd_went_away_is_could_not_run_and_never_the_codes() {
 /// TP-4: targo-trust's own `COULD NOT RUN` with nothing measured, its exit 3 (a run that is
 /// no measurement and failed for that alone, "no verdict either way"), is undecided, in its
 /// words, and no floor moves. NEGATIVE CONTROL: the same log at targo's exit 2 (a setup
-/// error), and a refused path at exit 3, stay the lane's FAIL; one with counts is judged by
-/// them.
+/// error), and a refused path at exit 3, stay the lane's FAIL.
 #[test]
 fn targo_trusts_own_could_not_run_is_undecided_and_never_the_codes() {
     const DEFECT: &str = "  [UNKNOWN] [transport:missing-json] missing structured Trust JSON transport (targo-trust)\n\
@@ -605,14 +781,102 @@ fn targo_trusts_own_could_not_run_is_undecided_and_never_the_codes() {
     let v = judged(REFUSED_LOG, "3");
     assert_eq!(v.failed, ["alpha NOT-VERIFIED(rc=3)"]);
     assert!(!v.report.contains("NOT-VERIFIED(targo)"), "{}", v.report);
-    // With counts, they decide.
-    let v = judged(
-        "Summary: 3 proved (3 total)\n\
-         Coverage: 9/9 eligible function bodies verified (complete)\n\
-         Stop causes: unclassified=1 — COULD NOT RUN: resource admission refused the solver\n",
-        "3",
+    // A non-measurement can have complete coverage and more proved rows than the floor.
+    let counted = "Summary: 5 proved (7 total); not-reproducible\nCoverage: 9/9 eligible function bodies verified (complete)\n";
+    for (suffix, reason) in [
+        ("", None),
+        (
+            "Stop causes: unclassified=1 — COULD NOT RUN: resource admission refused the solver",
+            Some("COULD NOT RUN: resource admission refused the solver"),
+        ),
+        (
+            "Result: COULD NOT RUN (outcome not-reproducible: not a measurement, so its counts are no verdict; see the Stop causes line; exit 3)",
+            Some("Result: COULD NOT RUN (outcome not-reproducible"),
+        ),
+    ] {
+        let v = judged(&format!("{counted}{suffix}\n"), "3");
+        if let Some(reason) = reason {
+            assert!(
+                note(&v, "NOT VERIFIED: alpha:").contains(reason),
+                "{}",
+                v.report
+            );
+        }
+        assert_eq!(
+            (v.word, v.exit, v.total.as_str()),
+            ("COULD-NOT-RUN", 2, "3/3"),
+            "{}",
+            v.report
+        );
+        assert_eq!(v.unverified, ["alpha"]);
+        assert!(
+            v.ratchet
+                .as_deref()
+                .is_none_or(|r| r.contains("alpha\t3\t3\t"))
+        );
+    }
+    let tally = "not-dispatched=2 solved=2 unclassified=2 unsupported=4";
+    let result =
+        "Result: COULD NOT RUN (outcome not-reproducible: see the Stop causes line; exit 3)";
+    let log = format!(
+        "{counted}Stop causes: {tally}; named: per-function detail — NOT REPRODUCIBLE: a stop\n{result}\n"
     );
-    assert_eq!((v.word, v.exit), ("PASS", 0), "{}", v.report);
+    let v = judged(&log, "3");
+    let cause = note(&v, "NOT VERIFIED: alpha:");
+    assert!(cause.contains(&format!("Stop causes: {tally}")), "{cause}");
+    assert!(!cause.contains("per-function detail"));
+    let earlier = format!("Stop causes: {tally}\n{counted}{result}\n");
+    assert!(
+        !judged(&earlier, "3").report.contains(tally),
+        "an earlier summary's tally does not explain this result"
+    );
+    let first = format!("{counted}Stop causes: unclassified=9\n{result}\n");
+    let two_reports = judged(&format!("{first}{log}"), "3");
+    let cause = note(&two_reports, "NOT VERIFIED: alpha:");
+    assert!(
+        cause.contains(tally) && !cause.contains("unclassified=9"),
+        "{cause}"
+    );
+    let refused = judged(&format!("{first}{NO_COMPILER}{log}"), "3");
+    assert!(note(&refused, "NOT VERIFIED: alpha:").contains("interrupted by SIGTERM"));
+    let v = judged(counted, "2");
+    assert_eq!((v.word, v.total.as_str()), ("FAIL", "3/3"));
+    assert_eq!(v.failed, ["alpha GATE-BROKE(rc=2)"]);
+    assert!(
+        v.report
+            .contains("GATED: 1 of 2 selected; not verified: alpha")
+    );
+
+    let measured = "Summary: 5 proved, 1 failed (7 total); measured; profile a; vector b\nCoverage: 9/9 eligible function bodies verified (complete)\n";
+    assert_eq!(judged(measured, "1").total, "8/10");
+    for outcome in ["not-reproducible", "could-not-run"] {
+        let v = judged(
+            &measured.replace("; measured;", &format!("; {outcome};")),
+            "1",
+        );
+        assert_eq!((v.word, v.total.as_str()), ("FAIL", "3/3"), "{}", v.report);
+        assert_eq!(v.failed, [format!("alpha NOT-MEASURED(rc=1,{outcome})")]);
+        let diagnostic = note(&v, "NOT MEASURED: alpha:");
+        assert!(
+            diagnostic.contains("5 proved, 1 failed (7 total)"),
+            "{diagnostic}"
+        );
+        assert!(!v.report.contains("VERDICT: 100%") && !v.tail.contains("100%"));
+        assert!(
+            v.ratchet
+                .as_deref()
+                .is_none_or(|r| r.contains("alpha\t3\t3\t"))
+        );
+    }
+    for malformed in [
+        measured.replace("5 proved", "8 proved"),
+        measured.replace("; measured;", "; unrecognized;"),
+        measured.replace("; measured;", " not-reproducible;"),
+    ] {
+        let v = judged(&malformed, "0");
+        assert_eq!((v.word, v.total.as_str()), ("FAIL", "3/3"));
+        assert_eq!(v.failed, ["alpha SUMMARY-UNPARSED"]);
+    }
 }
 
 #[test]
@@ -675,13 +939,28 @@ fn facts(crates: Vec<(&str, Decision)>) -> Facts {
 const DRV: &str = "targo 1.99.0-dev (aaaaaaaaa 2026-09-17) (targo 0.1.0)";
 
 #[test]
+fn whole_tree_totals_preserve_an_open_obligation_past_u64_max() {
+    let max = u64::MAX;
+    let f = facts(vec![
+        (
+            "alpha",
+            gate(&format!("Summary: {max} proved ({max} total)")),
+        ),
+        ("beta", gate("Summary: 1 proved (2 total)")),
+    ]);
+    let v = judge(&f, None, None, "R", "M", Update::RAISE);
+    assert_eq!(v.word, "PASS");
+    assert_eq!(v.total, "18446744073709551616/18446744073709551617");
+    assert!(!v.tail.contains("100%"));
+}
+
+#[test]
 fn a_record_round_trips_and_a_cut_short_one_is_none() {
     let mut f = facts(vec![
         ("alpha", gate("  Summary: 3 proved (3 total)")),
         ("beta", Decision::NoLib),
         ("forky", Decision::Queued("queued".into())),
     ]);
-    f.vanished.push("ghost".into());
     f.ambiguous
         .push(("dup".into(), "dup@1".into(), "dup@2".into()));
     f.crates.push(Crate::new("dup", Decision::Ambiguous));
@@ -691,10 +970,12 @@ fn a_record_round_trips_and_a_cut_short_one_is_none() {
     });
     let text = f.to_record();
     assert_eq!(Facts::parse(&text), Some(f.clone()));
+    let historical = text.replacen("\ncrate ", "\nvanished ghost\ncrate ", 1);
+    assert_eq!(Facts::parse(&historical), Some(f.clone()));
     let cut = text.trim_end().strip_suffix(FACTS_END).unwrap();
     assert_eq!(Facts::parse(cut), None, "no `end`, no record");
     assert_eq!(
-        Facts::parse(&text.replace(FACTS_MAGIC, "aterm-trust facts 0")),
+        Facts::parse(&text.replace(FACTS_MAGIC, "aterm-trust facts 14")),
         None
     );
     let schema1 = text
@@ -706,6 +987,77 @@ fn a_record_round_trips_and_a_cut_short_one_is_none() {
         None,
         "nothing after `end`"
     );
+}
+
+#[test]
+fn gate_grade_evidence_survives_replay_and_v17_keeps_its_proof_floor() {
+    // The v17 writer ended a Gate row at its summary. Its counted backstops followed.
+    const OLD_ROW: &str = concat!(
+        "crate alpha\tgate\t-\t-\t-\t-\t-\t-",
+        "\t0\t0\t0\t0\t0\t0\t-",
+        "\t\t\t\t\t\t\t\t\t0\t-\t1\t\t\tSummary: 5 proved (9 total)"
+    );
+    let record = |magic: &str, tail: &str| {
+        format!("{magic}\n{OLD_ROW}{tail}\nbackstop alpha\tkey\trss-backstop\tbody\nend\n")
+    };
+    let legacy = Facts::parse(&record(FACTS_MAGIC_V17, "")).unwrap();
+    assert_eq!(Measured::default().grade, GradeEvidence::Absent);
+    assert_eq!(gated(&legacy).grade, GradeEvidence::Legacy);
+    assert_eq!(
+        judge(&legacy, Some(&floor(5)), None, "R", "M", Update::NONE).total,
+        "5/9"
+    );
+    assert_eq!(Facts::parse(&legacy.to_record()), Some(legacy));
+    let tally = crate::trust_credit::Tally {
+        proved: 5,
+        graded: 3,
+        calculus: 2,
+    };
+    for (field, expected) in [
+        ("uncollected", GradeEvidence::Legacy),
+        ("absent", GradeEvidence::Absent),
+        (
+            "measured 0 0 0",
+            GradeEvidence::Measured(Default::default()),
+        ),
+        ("measured 5 3 2", GradeEvidence::Measured(tally)),
+    ] {
+        let f = Facts::parse(&record(FACTS_MAGIC, &format!("\t{field}"))).unwrap();
+        assert_eq!(gated(&f).grade, expected);
+        assert_eq!(gated(&f).backstops.as_ref().unwrap()[0].key, "key");
+        assert!(f.to_record().contains(&format!("{OLD_ROW}\t{field}\n")));
+        assert_eq!(Facts::parse(&f.to_record()), Some(f));
+    }
+    assert!(Facts::parse(&record(FACTS_MAGIC_V17, "\tabsent")).is_none());
+    let complete = record(FACTS_MAGIC, "\tmeasured 5 3 2");
+    let (_, second_gate) = complete.split_once('\n').unwrap();
+    let repeated = format!("{}{second_gate}", complete.strip_suffix("end\n").unwrap());
+    assert!(Facts::parse(&repeated).is_none());
+    for tail in [
+        "",
+        "\t",
+        "\tunknown",
+        "\tabsent\tabsent",
+        "\tabsent extra",
+        "\tmeasured",
+        "\tmeasured 5 3",
+        "\tmeasured 5 3 2 1",
+        "\tmeasured 5  3 2",
+        "\tmeasured 5 3 +2",
+        "\tmeasured 05 3 2",
+        "\tmeasured 5 03 2",
+        "\tmeasured 5 3 02",
+        "\tmeasured 18446744073709551616 0 0",
+        "\tmeasured 4 5 2",
+        "\tmeasured 5 2 3",
+    ] {
+        assert!(
+            Facts::parse(&record(FACTS_MAGIC, tail)).is_none(),
+            "{tail:?}"
+        );
+    }
+    let no_library = format!("{FACTS_MAGIC}\ncrate app\tno-lib\t-\t-\t-\t-\t-\t-\tabsent\nend\n");
+    assert!(Facts::parse(&no_library).is_none());
 }
 
 use crate::ledger::testing::Git;
@@ -736,6 +1088,23 @@ impl World {
     fn work(&self) -> PathBuf {
         self.root.join("work")
     }
+    fn conclude_without_grade_records(
+        &self,
+        plan: &mut Plan,
+        update: Update<'_>,
+    ) -> Result<Concluded> {
+        let grades = plan
+            .facts
+            .crates
+            .iter()
+            .filter(|c| matches!(c.decision, Decision::Gate(_)))
+            .map(|c| (c.name.clone(), GradeEvidence::Absent))
+            .collect();
+        let floors = FloorInputs::read(&plan.ratchet, &plan.memory, update)
+            .map_err(|e| Error::new(format!("proof floor inputs could not be read: {e}")))?;
+        conclude(&self.cli(), &self.work(), plan, &floors, &grades, None)
+    }
+
     fn git(&self, args: &[&str]) -> String {
         let out = crate::ledger::testing::git()
             .arg("-C")
@@ -800,6 +1169,329 @@ impl World {
 
 fn floor(n: u64) -> String {
     format!("alpha\t{n}\t9\t{DRV}\n")
+}
+
+fn replay_credit(w: &World, prover: &Prover, update: bool) -> i32 {
+    run_cmd(
+        &w.work(),
+        TrustCmd::Judge {
+            commit: "HEAD".into(),
+            prover: Some(prover.bin.clone()),
+            update,
+            reason: None,
+        },
+    )
+}
+
+fn measured_grade(proved: u64, calculus: u64) -> GradeEvidence {
+    GradeEvidence::Measured(crate::trust_credit::Tally {
+        proved,
+        graded: proved,
+        calculus,
+    })
+}
+
+fn credit_epoch(floor: u64) -> String {
+    format!("1\tproved\tunvalidated-encoder\t{floor}\tfixture calculus floor\n")
+}
+
+#[test]
+fn replay_requires_the_positive_calculus_floor_present_when_facts_were_measured() {
+    use crate::trust_credit::EPOCHS;
+    let w = World::new("replay-credit-minimum");
+    let prover = w.prover("a");
+    let floors = floor(3);
+    let first = credit_epoch(0);
+    let measured = format!("{first}2\tunvalidated-encoder\tproven-calculus\t2\tmeasured minimum\n");
+    let head = w.commit(&[(RATCHET, &floors), (EPOCHS, &measured)]);
+    let mut alpha = testing::gated("alpha", "Summary: 6 proved (9 total)");
+    let Decision::Gate(m) = &mut alpha.decision else {
+        unreachable!()
+    };
+    m.grade = measured_grade(6, 3);
+    let receipt = testing::file(&w.cli(), &w.store(), &prover, &head, DRV, vec![alpha]);
+    let original = fs::read(&receipt).unwrap();
+    let path = w.work().join(EPOCHS);
+    // Three calculus proofs meet both numeric floors. The policy change itself must fail.
+    for truncated in [None, Some(first)] {
+        match truncated {
+            None => fs::remove_file(&path).unwrap(),
+            Some(text) => fs::write(&path, text).unwrap(),
+        }
+        assert_eq!(replay_credit(&w, &prover, true), 1);
+        assert_eq!(fs::read_to_string(w.work().join(RATCHET)).unwrap(), floors);
+        assert!(!w.work().join(BACKSTOPS).exists());
+        assert_eq!(fs::read(&receipt).unwrap(), original);
+    }
+    fs::write(
+        path,
+        format!("{measured}3\tproven-calculus\tproven-calculus\t3\tstronger policy\n"),
+    )
+    .unwrap();
+    assert_eq!(replay_credit(&w, &prover, false), 0);
+}
+
+#[test]
+fn a_malformed_historical_credit_ledger_names_its_source_and_blocks_updates() {
+    use crate::trust_credit::EPOCHS;
+    let w = World::new("replay-malformed-credit");
+    let prover = w.prover("a");
+    let before = floor(3);
+    let head = w.commit(&[(RATCHET, &before), (EPOCHS, "bad historical ledger\n")]);
+    let receipt = w.file(&head, &prover, 6, 9);
+    let recorded = fs::read(&receipt).unwrap();
+    fs::write(w.work().join(EPOCHS), credit_epoch(0)).unwrap();
+    let why = working_credit_epoch(&w.cli(), &w.work(), Some(&head)).unwrap_err();
+    assert!(
+        why.contains("CREDIT-UNREADABLE") && why.contains(&head) && why.contains(EPOCHS),
+        "{why}"
+    );
+    assert_eq!(replay_credit(&w, &prover, true), 1);
+    assert_eq!(fs::read_to_string(w.work().join(RATCHET)).unwrap(), before);
+    assert_eq!(fs::read(receipt).unwrap(), recorded);
+}
+
+#[test]
+fn historical_credit_requires_a_regular_utf8_blob() {
+    use crate::trust_credit::EPOCHS;
+    let w = World::new("replay-credit-file");
+    let path = w.work().join(EPOCHS);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // The reason is free text. Lossy decoding would turn this into a valid ledger.
+    fs::write(&path, b"1\tproved\tunvalidated-encoder\t1\twhy \xff\n").unwrap();
+    w.git(&["add", "--", EPOCHS]);
+    let invalid = w.commit(&[]);
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("credit-policy", &path).unwrap();
+    w.git(&["add", "--", EPOCHS]);
+    let linked = w.commit(&[]);
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, credit_epoch(1)).unwrap();
+    for (head, defect) in [(invalid, "not UTF-8"), (linked, "regular Git blob")] {
+        let why = working_credit_epoch(&w.cli(), &w.work(), Some(&head)).unwrap_err();
+        assert!(
+            why.contains("CREDIT-UNREADABLE")
+                && why.contains(&head)
+                && why.contains(EPOCHS)
+                && why.contains(defect),
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn original_policy_reads_a_large_sha256_blob() {
+    let dir = crate::test_scratch_dir("sha256-policy");
+    let repo = dir.path();
+    let git = Git::new(repo);
+    crate::ledger::git_ok(&git, &["init", "--quiet", "--object-format=sha256"]).unwrap();
+    let path = repo.join(BACKSTOPS);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = "#".repeat(aterm_uds::deadline::OUTPUT_KEEP + 1);
+    fs::write(&path, &body).unwrap();
+    crate::ledger::git_ok(&git, &["add", "--", BACKSTOPS]).unwrap();
+    let tree = crate::ledger::git_ok(&git, &["write-tree"])
+        .unwrap()
+        .stdout_utf8();
+    let tree = tree.trim();
+    assert!(aterm_codec::hex::is_lower(tree, 64));
+    assert!(floors_at(&git, tree, BACKSTOPS).unwrap().as_deref() == Some(body.as_str()));
+}
+
+#[test]
+fn replay_credit_judges_the_working_epoch_before_writing_any_floor() {
+    use crate::trust_credit::EPOCHS;
+    let w = World::new("replay-credit");
+    let prover = w.prover("a");
+    let proof_floor = floor(3);
+    let backstops = "alpha\t-\tcancelled\t1\n";
+    let memory = "alpha\t16.0\t-\t-\t-\t-\t-\n";
+    let head = w.commit(&[
+        (RATCHET, &proof_floor),
+        (BACKSTOPS, backstops),
+        (MEMORY, memory),
+        (EPOCHS, &credit_epoch(0)),
+    ]);
+    let mut alpha = testing::gated("alpha", "Summary: 6 proved (9 total)");
+    let Decision::Gate(m) = &mut alpha.decision else {
+        unreachable!()
+    };
+    m.grade = measured_grade(6, 2);
+    m.ceiling = "8.0 GiB".into();
+    let receipt = testing::file(&w.cli(), &w.store(), &prover, &head, DRV, vec![alpha]);
+    let original = fs::read(&receipt).unwrap();
+    let epoch = w.work().join(EPOCHS);
+    for ledger in [credit_epoch(3), "invalid ledger\n".into()] {
+        fs::write(&epoch, &ledger).unwrap();
+        for update in [false, true] {
+            assert_eq!(
+                replay_credit(&w, &prover, update),
+                1,
+                "{ledger}, update={update}"
+            );
+            for (path, before) in [
+                (RATCHET, proof_floor.as_str()),
+                (BACKSTOPS, backstops),
+                (MEMORY, memory),
+            ] {
+                assert_eq!(
+                    fs::read_to_string(w.work().join(path)).unwrap(),
+                    before,
+                    "{path}"
+                );
+            }
+            assert_eq!(fs::read(&receipt).unwrap(), original);
+        }
+    }
+    fs::write(epoch, credit_epoch(2)).unwrap();
+    assert_eq!(replay_credit(&w, &prover, true), 0);
+    assert_eq!(
+        fs::read_to_string(w.work().join(RATCHET)).unwrap(),
+        floor(6)
+    );
+    assert_ne!(
+        fs::read_to_string(w.work().join(BACKSTOPS)).unwrap(),
+        backstops
+    );
+    assert_ne!(fs::read_to_string(w.work().join(MEMORY)).unwrap(), memory);
+    assert_eq!(fs::read(receipt).unwrap(), original);
+}
+
+#[test]
+fn replay_credit_requires_a_remeasurement_when_a_gated_grade_was_uncollected() {
+    use crate::trust_credit::EPOCHS;
+    for v17 in [true, false] {
+        let w = World::new("replay-uncollected-grades");
+        let prover = w.prover("a");
+        let baseline = floor(3) + &format!("beta\t3\t9\t{DRV}\n");
+        let head = w.commit(&[(RATCHET, &baseline), (EPOCHS, &credit_epoch(0))]);
+        let mut alpha = testing::gated("alpha", "Summary: 5 proved (9 total)");
+        let Decision::Gate(m) = &mut alpha.decision else {
+            unreachable!()
+        };
+        m.grade = GradeEvidence::Legacy;
+        let mut beta = testing::gated("beta", "Summary: 5 proved (9 total)");
+        let Decision::Gate(m) = &mut beta.decision else {
+            unreachable!()
+        };
+        m.grade = if v17 {
+            GradeEvidence::Legacy
+        } else {
+            measured_grade(5, 2)
+        };
+        let receipt = testing::file(&w.cli(), &w.store(), &prover, &head, DRV, vec![alpha, beta]);
+        if v17 {
+            let older = fs::read_to_string(&receipt)
+                .unwrap()
+                .replacen(FACTS_MAGIC, FACTS_MAGIC_V17, 1)
+                .replace("\tuncollected\n", "\n");
+            fs::write(&receipt, older).unwrap();
+        }
+        let original = fs::read(&receipt).unwrap();
+        let epoch = w.work().join(EPOCHS);
+        // Even a known subset meeting the positive floor cannot establish the full count.
+        fs::write(&epoch, credit_epoch(1)).unwrap();
+        assert_eq!(replay_credit(&w, &prover, true), 2);
+        assert_eq!(
+            fs::read_to_string(w.work().join(RATCHET)).unwrap(),
+            baseline
+        );
+        assert!(!w.work().join(BACKSTOPS).exists());
+        for ledger in [Some(credit_epoch(0)), None] {
+            if let Some(ledger) = ledger {
+                fs::write(&epoch, ledger).unwrap();
+            } else {
+                fs::remove_file(&epoch).unwrap();
+            }
+            assert_eq!(replay_credit(&w, &prover, false), 0);
+        }
+        fs::write(
+            w.work().join(RATCHET),
+            baseline.replace(&floor(3), &floor(6)),
+        )
+        .unwrap();
+        assert_eq!(replay_credit(&w, &prover, false), 1);
+        assert_eq!(fs::read(receipt).unwrap(), original);
+    }
+}
+
+#[test]
+fn replay_refuses_duplicate_working_and_measured_floors_before_updates() {
+    let duplicate = floor(3) + &floor(5);
+    for (historical, proved) in [(false, 3), (false, 4), (true, 6)] {
+        let w = World::new("replay-duplicate-floors");
+        let prover = w.prover("a");
+        let (original, working) = if historical {
+            (duplicate.clone(), floor(5))
+        } else {
+            (floor(3), duplicate.clone())
+        };
+        let head = w.commit(&[("src/lib.rs", "v1"), (RATCHET, &original)]);
+        w.file(&head, &prover, proved, 9);
+        fs::write(w.work().join(RATCHET), &working).unwrap();
+        let (facts, _) = w.found(&prover, &head).unwrap();
+        let why = lowered_since_measured(&w.cli(), &facts, Some(&working)).unwrap_err();
+        assert!(
+            why.contains(RATCHET) && why.contains("duplicate floor for alpha"),
+            "{why}"
+        );
+        if historical {
+            assert!(why.contains(&head), "{why}");
+        }
+        for update in [false, true] {
+            let cmd = TrustCmd::Judge {
+                commit: head.clone(),
+                prover: Some(prover.bin.clone()),
+                update,
+                reason: None,
+            };
+            assert_eq!(
+                run_cmd(&w.work(), cmd),
+                2,
+                "historical={historical}, update={update}"
+            );
+            assert_eq!(fs::read_to_string(w.work().join(RATCHET)).unwrap(), working);
+            assert!(!w.work().join(BACKSTOPS).exists());
+        }
+    }
+}
+
+#[test]
+fn replay_refuses_invalid_floor_counts_before_updates() {
+    for (historical, total) in [(false, "oops"), (false, "4"), (true, "oops"), (true, "4")] {
+        let w = World::new("replay-invalid-floor-counts");
+        let prover = w.prover("a");
+        let invalid = format!("alpha\t5\t{total}\t{DRV}\n");
+        let valid = floor(5);
+        let (baseline, working) = if historical {
+            (&invalid, &valid)
+        } else {
+            (&valid, &invalid)
+        };
+        let head = w.commit(&[("src/lib.rs", "v1"), (RATCHET, baseline)]);
+        let receipt = w.file(&head, &prover, 6, 9);
+        let recorded = fs::read(&receipt).unwrap();
+        fs::write(w.work().join(RATCHET), working).unwrap();
+        for update in [false, true] {
+            let cmd = TrustCmd::Judge {
+                commit: head.clone(),
+                prover: Some(prover.bin.clone()),
+                update,
+                reason: None,
+            };
+            assert_eq!(
+                run_cmd(&w.work(), cmd),
+                2,
+                "historical={historical}, total={total}, update={update}"
+            );
+            assert_eq!(
+                fs::read_to_string(w.work().join(RATCHET)).unwrap(),
+                *working
+            );
+            assert!(!w.work().join(BACKSTOPS).exists());
+            assert_eq!(fs::read(&receipt).unwrap(), recorded);
+        }
+    }
 }
 
 #[test]
@@ -919,10 +1611,280 @@ fn a_record_under_another_key_is_never_read() {
 }
 
 #[test]
+fn earlier_input_keys_require_a_new_whole_tree_run() {
+    let w = World::new("old-dep-info-key");
+    let prover = w.prover("a");
+    let head = w.commit(&[("src/lib.rs", "v1"), (RATCHET, &floor(5))]);
+    let current_path = w.file(&head, &prover, 5, 9);
+    let (mut historical, _) = w.found(&prover, &head).unwrap();
+    fs::remove_file(&current_path).unwrap();
+    let pending = || pending_for(&w.cli(), &prover, &head, false).unwrap();
+    let mut archived = Vec::new();
+    for epoch in [5, 6, 7] {
+        let p = historical.provenance.as_mut().unwrap();
+        let old_material = format!(
+            "aterm-trust facts key {epoch}\ntree-sans-floors {}\nprover {}\nlane {}\n",
+            p.tree_sans_floors, p.prover, p.lane
+        );
+        p.key = hex(&Sha256::digest(old_material.as_bytes()));
+        let old_path = w.store().join(format!("{FACTS_PREFIX}{}", p.key));
+        for summary in [
+            "Summary: 5 proved (9 total)",
+            "Summary: 0 proved (9 total); not-reproducible",
+        ] {
+            historical.crates[0].decision = gate(summary);
+            file_record(&w.store(), &historical).unwrap();
+            let why = w.found(&prover, &head).unwrap_err();
+            assert!(why.contains("ship trust run --whole-tree"), "{why}");
+            assert!(pending().is_err());
+            assert_eq!(replay_credit(&w, &prover, false), 1);
+            assert_eq!(
+                fs::read_to_string(&old_path).unwrap(),
+                historical.to_record()
+            );
+        }
+        archived.push((old_path, historical.to_record()));
+    }
+    assert_eq!(w.file(&head, &prover, 5, 9), current_path);
+    assert_eq!(replay_credit(&w, &prover, false), 0);
+    assert!(pending().unwrap().is_empty());
+    for (path, original) in archived {
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+}
+
+#[test]
+fn version_15_facts_require_a_new_whole_tree_measurement() {
+    let w = World::new("old-facts");
+    let prover = w.prover("a");
+    let head = w.commit(&[("src/lib.rs", "v1"), (RATCHET, &floor(5))]);
+    let path = w.file(&head, &prover, 5, 9);
+    assert!(w.found(&prover, "HEAD").is_ok());
+    let old_schema = "aterm-trust facts 16";
+    let old = fs::read_to_string(&path)
+        .unwrap()
+        .replacen(FACTS_MAGIC, old_schema, 1);
+    fs::write(&path, old).unwrap();
+    let why = w.found(&prover, "HEAD").unwrap_err();
+    assert!(
+        why.contains(old_schema) && why.contains(FACTS_MAGIC),
+        "{why}"
+    );
+    assert!(
+        why.contains("targo --unverified ship trust run --whole-tree"),
+        "{why}"
+    );
+}
+
+#[test]
+fn replay_compares_each_crate_with_its_latest_measurement_commit() {
+    let w = World::new("remeasured-floor-origins");
+    let prover = w.prover("a");
+    let rows = |alpha, beta| format!("alpha\t{alpha}\t9\t{DRV}\nbeta\t{beta}\t9\t{DRV}\n");
+    let alien = w.commit(&[
+        ("src/lib.rs", "another source tree"),
+        (RATCHET, &rows(2, 2)),
+    ]);
+    // Only beta uses this commit. Both alpha rows, including the bad total, were superseded.
+    let original = w.commit(&[
+        ("src/lib.rs", "v1"),
+        (RATCHET, &(rows(3, 3) + "alpha\t4\tbad\n")),
+    ]);
+    let first = w.commit(&[(RATCHET, &rows(8, 8))]);
+    let last = w.commit(&[(RATCHET, &rows(6, 8))]);
+    let crate_row = |name| testing::gated(name, "Summary: 7 proved (9 total)");
+    testing::file(
+        &w.cli(),
+        &w.store(),
+        &prover,
+        &original,
+        DRV,
+        vec![crate_row("alpha"), crate_row("beta")],
+    );
+    let (mut f, _) = w.found(&prover, "HEAD").unwrap();
+    let missing = "1111111111111111111111111111111111111111";
+    for (head, names) in [
+        (first.as_str(), vec!["alpha"]),
+        (last.as_str(), vec!["alpha"]),
+        (missing, vec![]),
+    ] {
+        let mut again = f.clone();
+        let p = again.provenance.as_mut().unwrap();
+        p.head = head.into();
+        p.date = "2026-11-17T20:30:00Z".into();
+        again.crates = names.into_iter().map(crate_row).collect();
+        f = remeasured(&f, &again).unwrap();
+    }
+    let rounds = &mut f.provenance.as_mut().unwrap().remeasured;
+    assert_eq!(rounds.len(), 2, "a new empty round adds no measurement");
+    rounds.insert(0, format!("2026-11-17T10:10:00Z {missing} alpha"));
+    rounds.push(format!("2026-11-17T21:00:00Z {missing} nothing"));
+    file_record(&w.store(), &f).unwrap();
+    let replay = || {
+        run_cmd(
+            &w.work(),
+            TrustCmd::Judge {
+                commit: "HEAD".into(),
+                prover: Some(prover.bin.clone()),
+                update: false,
+                reason: None,
+            },
+        )
+    };
+    fs::write(w.work().join(RATCHET), rows(6, 3)).unwrap();
+    assert_eq!(
+        replay(),
+        0,
+        "beta kept its original measurement; the no-op commit is irrelevant"
+    );
+    fs::write(w.work().join(RATCHET), rows(4, 3)).unwrap();
+    assert_eq!(replay(), 1, "alpha was last measured with a floor of six");
+    for bad_round in [
+        "2026-11-17T20:30:00Z",
+        "2026-11-17T20:30:00Z HEAD alpha",
+        &format!("2026-11-17T20:30:00Z {last} gamma"),
+        &format!("2026-11-17T20:30:00Z {alien} alpha"),
+        &format!("2026-11-17T20:30:00Z {missing} alpha"),
+    ] {
+        let mut bad = f.clone();
+        bad.provenance
+            .as_mut()
+            .unwrap()
+            .remeasured
+            .push(bad_round.into());
+        file_record(&w.store(), &bad).unwrap();
+        assert_eq!(replay(), 2, "{bad_round}");
+    }
+}
+
+#[test]
+fn remeasurement_history_distinguishes_a_crate_named_nothing_from_no_work() {
+    let original = "1111111111111111111111111111111111111111";
+    let next = "2222222222222222222222222222222222222222";
+    let mut base = facts(vec![
+        ("nothing", gate("Summary: 1 proved (1 total)")),
+        ("twin", Decision::Ambiguous),
+        ("twin", Decision::Ambiguous),
+    ]);
+    base.provenance = Some(Provenance {
+        head: original.into(),
+        date: "2026-11-17T10:00:00Z".into(),
+        ..Provenance::default()
+    });
+    let mut again = base.clone();
+    again.crates.retain(|c| c.name == "nothing");
+    again.provenance.as_mut().unwrap().head = next.into();
+    let merged = remeasured(&base, &again).unwrap();
+    let stored = Facts::parse(&merged.to_record()).unwrap();
+    let p = stored.provenance.as_ref().unwrap();
+    assert_eq!(measurement_heads(&stored, p).unwrap()["nothing"], next);
+    let mut legacy = p.clone();
+    legacy.remeasured = vec![format!("{} {next} nothing", p.date)];
+    assert!(measurement_heads(&stored, &legacy).is_err());
+}
+
+#[test]
+fn remeasurement_retries_stopped_checks_but_keeps_completed_failures() {
+    let w = World::new("retry-incomplete");
+    let prover = w.prover("a");
+    let head = w.commit(&[("src/lib.rs", "pub fn checked() {}"), (RATCHET, &format!(
+        "budget\t1\t1\t{DRV}\nsignalled\t1\t1\t{DRV}\ntransport\t1\t1\t{DRV}\nlegacy\t0\t0\t{DRV}\nregressed\t5\t9\t{DRV}\n"
+    ))]);
+    let stopped = |name, ended: &str, budget: &str, transport| {
+        Crate::new(
+            name,
+            Decision::Gate(Measured {
+                rc: "143".into(),
+                ended: ended.into(),
+                wall_budget: budget.into(),
+                transport,
+                ..Measured::default()
+            }),
+        )
+    };
+    let legacy = Crate::new(
+        "legacy",
+        Decision::Gate(Measured {
+            summary: "Summary: 0 proved (0 total)".into(),
+            grade: GradeEvidence::Legacy,
+            ..Measured::default()
+        }),
+    );
+    let reported = |name, rc, summary| {
+        let log =
+            format!("{summary}\nCoverage: 56/56 eligible function bodies verified (complete)\n");
+        Crate::new(
+            name,
+            Decision::Gate(Measured::of_log(log.as_bytes(), rc).unwrap()),
+        )
+    };
+    let no_measurement = "Summary: 6 proved, 4 failed (63 total); not-reproducible";
+    let rows = vec![
+        legacy,
+        reported("clock", "1", no_measurement),
+        reported("driver", "0", "Summary: 0 proved (0 total); could-not-run"),
+        reported("broken", "2", no_measurement),
+        reported(
+            "malformed",
+            "1",
+            "Summary: 6 proved, 4 failed (3 total); not-reproducible",
+        ),
+        stopped("budget", "", "60", false),
+        stopped("signalled", "trustc ended by signal 15", "", false),
+        stopped("transport", "", "", true),
+        testing::gated("regressed", "Summary: 2 proved (9 total)"),
+    ];
+    testing::file(&w.cli(), &w.store(), &prover, &head, DRV, rows);
+    let verdict = w.judged(&prover);
+    assert_eq!((verdict.exit, verdict.total.as_str()), (1, "2/9"));
+    assert!(
+        verdict
+            .failed
+            .iter()
+            .any(|why| why.starts_with("regressed "))
+    );
+    let mut pending = pending_for(&w.cli(), &prover, "HEAD", false)
+        .unwrap()
+        .unwrap();
+    pending.sort();
+    assert_eq!(
+        pending,
+        [
+            "budget",
+            "clock",
+            "driver",
+            "legacy",
+            "signalled",
+            "transport"
+        ]
+    );
+}
+
+#[test]
 fn the_fences_still_fire_from_stored_facts() {
     let w = World::new("fences");
     let a = w.prover("a");
     let head = w.commit(&[("src/lib.rs", "v1"), (RATCHET, &floor(5))]);
+    w.file(&head, &a, 9, 9);
+    let all_proved = w.judged(&a);
+    assert!(all_proved.tail.starts_with("VERDICT: 100% MACHINE-PROVED"));
+    // The report is printed even if the replay rejects its working floor. Only
+    // the final tail can make the whole-tree claim after that check succeeds.
+    fs::write(w.work().join(RATCHET), floor(4)).unwrap();
+    assert!(!all_proved.report.contains("VERDICT: 100%"));
+    assert_eq!(
+        run_cmd(
+            &w.work(),
+            TrustCmd::Judge {
+                commit: head.clone(),
+                prover: Some(a.bin.clone()),
+                update: false,
+                reason: None,
+            },
+        ),
+        1
+    );
+    fs::write(w.work().join(RATCHET), floor(5)).unwrap();
     let tsr = tree_sans_floors(&w.cli(), &head).unwrap();
     let id = a.identity.clone().unwrap();
     let file_with = |d: Decision| {
@@ -997,7 +1959,7 @@ fn conclude_files_only_what_a_release_may_read() {
     );
     fs::write(logs.join("alpha@1.0.0.log.rc"), "0\n").unwrap();
     fs::write(logs.join(".trustd-grants"), "1\n").unwrap();
-    let dep = slots.join("j0/debug/deps/alpha-1.d");
+    let dep = slots.join("j0/debug/deps/alpha-0123456789abcdef.d");
     let plain = "alpha.rmeta: crates/alpha/src/lib.rs\n";
     fs::write(&dep, plain).unwrap();
     const LANE: &str = "lane-pin SOURCE_DATE_EPOCH=0\nlane-pin ATERM_BUILD_GIT_COMMIT=trust-lane\n\
@@ -1018,7 +1980,8 @@ fn conclude_files_only_what_a_release_may_read() {
     };
     let run = |extra: &str| {
         let mut p = Plan::parse(&plan(extra)).unwrap();
-        conclude(&w.cli(), &w.work(), &mut p, Update::NONE).unwrap()
+        w.conclude_without_grade_records(&mut p, Update::NONE)
+            .unwrap()
     };
     let facts_line = |extra: &str| run(extra).facts_line.unwrap_or_default();
     assert!(facts_line("file the checkout is not clean\n").starts_with("FACTS: none"));
@@ -1027,23 +1990,24 @@ fn conclude_files_only_what_a_release_may_read() {
         "a run that does not file says nothing"
     );
     let mut bare = Plan::parse(&plan("file \n").replace(LANE, "")).unwrap();
-    let l = conclude(&w.cli(), &w.work(), &mut bare, Update::NONE)
+    let l = w
+        .conclude_without_grade_records(&mut bare, Update::NONE)
         .unwrap()
         .facts_line
         .unwrap();
     assert!(l.starts_with("FACTS: none"), "{l}");
-    fs::write(
-        &dep,
-        format!("alpha.rmeta: crates/alpha/src/lib.rs {RATCHET}\n"),
-    )
-    .unwrap();
-    assert!(facts_line("file \n").starts_with("FACTS: none"));
-    fs::write(
-        &dep,
-        format!("alpha.rmeta: crates/alpha/src/lib.rs {MEMORY}\n"),
-    )
-    .unwrap();
-    assert!(facts_line("file \n").starts_with("FACTS: none"));
+    for excluded in [RATCHET, MEMORY, COSTS, BACKSTOPS] {
+        fs::write(
+            &dep,
+            format!("alpha.rmeta: crates/alpha/src/lib.rs {excluded}\n"),
+        )
+        .unwrap();
+        let line = facts_line("file \n");
+        assert!(
+            line.starts_with("FACTS: none") && line.contains(excluded),
+            "{line}"
+        );
+    }
     let reads = |lines: &str| {
         fs::write(&dep, format!("{plain}\n{lines}")).unwrap();
         facts_line("file \n")
@@ -1053,14 +2017,48 @@ fn conclude_files_only_what_a_release_may_read() {
         "# env-dep:HOME\n",
         "# env-dep:LANG=en_US.UTF-8\n# env-dep:HOME=/Users//x\n",
         "# env-dep:SOURCE_DATE_EPOCH=5\n",
+        "# env-dep:SOURCE_DATE_EPOCH\n",
         "# env-dep:ATERM_GIT_COMMIT=trust-lane\n",
+        "# env-dep:CARGO_PKG_BUILD_LABEL=unbound\n",
+        "# env-dep:CARGO_MANIFEST_LABEL=unbound\n",
     ] {
         let l = reads(lines);
         assert!(
-            l.starts_with("FACTS: none") && !l.contains("/Users//x"),
+            l.starts_with("FACTS: none")
+                && !l.contains("/Users//x")
+                && !l.contains("clean checkout"),
             "{lines}: {l}"
         );
     }
+    fs::write(&dep, plain).unwrap();
+    let extra = slots.join("j0/debug/deps/beta-2.d");
+    fs::File::create(&extra)
+        .unwrap()
+        .set_len(crate::durable::MAX_RELEASE_FILE_BYTES + 1)
+        .unwrap();
+    let incomplete = run("file \n");
+    assert_eq!(incomplete.verdict.word, "PASS");
+    let line = incomplete.facts_line.unwrap();
+    assert!(
+        line.starts_with("FACTS: none") && line.contains("beta-2.d"),
+        "{line}"
+    );
+    assert!(w.found(&a, "HEAD").is_err());
+    fs::write(&extra, b"beta.rmeta: beta.rs\n# env-dep:LABEL=\xff\n").unwrap();
+    let line = facts_line("file \n");
+    assert!(
+        line.starts_with("FACTS: none") && line.contains("beta-2.d"),
+        "{line}"
+    );
+    fs::remove_file(&extra).unwrap();
+    let malformed_slot = slots.join("j9");
+    fs::write(&malformed_slot, "").unwrap();
+    let line = facts_line("file \n");
+    assert!(
+        line.starts_with("FACTS: none") && line.contains("j9"),
+        "{line}"
+    );
+    fs::remove_file(malformed_slot).unwrap();
     let build = slots.join("j0/debug/build/aterm-gui-0123/output");
     fs::create_dir_all(build.parent().unwrap()).unwrap();
     fs::write(
@@ -1068,9 +2066,19 @@ fn conclude_files_only_what_a_release_may_read() {
         "cargo:rerun-if-env-changed=ATERM_BUILD_GIT_COMMIT\ncargo:rustc-env=ATERM_GIT_COMMIT=trust-lane\n",
     )
     .unwrap();
+    let unrelated = reads("# env-dep:ATERM_GIT_COMMIT=trust-lane\n");
+    assert!(unrelated.starts_with("FACTS: none"), "{unrelated}");
+    assert!(w.found(&a, "HEAD").is_err());
+    for env in ["CARGO_PKG_VERSION=1.0.0", "SOURCE_DATE_EPOCH=0"] {
+        assert!(reads(&format!("# env-dep:{env}\n")).starts_with("FACTS: none"));
+    }
+    let consumer = slots.join("j0/debug/.fingerprint/alpha-0123456789abcdef");
+    fs::create_dir_all(&consumer).unwrap();
+    fs::write(consumer.join("lib-alpha.json"), r#"{"deps":[]}"#).unwrap();
+    assert!(reads("# env-dep:OUT_DIR=/x/out\n").starts_with("FACTS: none"));
     let l = reads(
-        "# env-dep:ATERM_RELEASE_BUILD\n# env-dep:CARGO_PKG_VERSION=1.0.0\n# env-dep:OUT_DIR=/x/out\n\
-         # env-dep:SOURCE_DATE_EPOCH=0\n# env-dep:ATERM_GIT_COMMIT=trust-lane\n",
+        "# env-dep:ATERM_RELEASE_BUILD\n# env-dep:CARGO_PKG_VERSION=1.0.0\n# env-dep:TARGO_PKG_VERSION=1.0.0\n\
+         # env-dep:SOURCE_DATE_EPOCH=0\n",
     );
     assert!(l.starts_with("FACTS: ") && !l.contains("none"), "{l}");
     fs::remove_file(&build).unwrap();
@@ -1099,7 +2107,9 @@ fn conclude_files_only_what_a_release_may_read() {
     fs::write(&dep, plain).unwrap();
     let mut unlisted =
         Plan::parse(&plan("file \n").replace(&format!("commit {head}"), "commit 0000")).unwrap();
-    let done = conclude(&w.cli(), &w.work(), &mut unlisted, Update::NONE).unwrap();
+    let done = w
+        .conclude_without_grade_records(&mut unlisted, Update::NONE)
+        .unwrap();
     let l = done.facts_line.unwrap();
     assert!(
         l.starts_with("FACTS: none") && l.contains("git could not list"),
@@ -1108,7 +2118,8 @@ fn conclude_files_only_what_a_release_may_read() {
     assert_eq!(done.verdict.word, "PASS");
     let mut moved =
         Plan::parse(&plan("file \n").replace(a.identity.as_ref().unwrap(), "0000")).unwrap();
-    let l = conclude(&w.cli(), &w.work(), &mut moved, Update::NONE)
+    let l = w
+        .conclude_without_grade_records(&mut moved, Update::NONE)
         .unwrap()
         .facts_line
         .unwrap();
@@ -1130,7 +2141,9 @@ fn an_unreadable_log_prevents_conclusion_and_ratchet_changes() {
             "{PLAN_MAGIC}\nlogdir {}\nratchet {}\nstore {}\nfile \ncrate alpha\talpha@1.0.0\tgate\n",
             logs.display(), w.work().join(RATCHET).display(), w.store().display(),
         )).unwrap();
-        let error = conclude(&w.cli(), &w.work(), &mut plan, update).unwrap_err();
+        let error = w
+            .conclude_without_grade_records(&mut plan, update)
+            .unwrap_err();
         assert!(
             error
                 .0
@@ -1147,18 +2160,126 @@ fn an_unreadable_log_prevents_conclusion_and_ratchet_changes() {
 fn floor_inputs_preserve_text_and_true_absence() {
     let scratch = crate::test_scratch_dir("optional-floor-inputs");
     let ratchet = scratch.path().join("floors.tsv");
-    let missing = FloorInputs::read(&ratchet).unwrap();
+    let memory = scratch.path().join("memory.tsv");
+    let missing = FloorInputs::read(&ratchet, &memory, Update::NONE).unwrap();
     assert_eq!((missing.ratchet, missing.backstops), (None, None));
     let floor = "\n# retained formatting\nalpha\t3\t9\told prover\t\n";
     fs::write(&ratchet, floor).unwrap();
-    let inputs = FloorInputs::read(&ratchet).unwrap();
+    let inputs = FloorInputs::read(&ratchet, &memory, Update::NONE).unwrap();
     assert_eq!(inputs.ratchet.as_deref(), Some(floor));
     assert_eq!(inputs.backstops, None);
     let history = "# a legacy floor may have no head row\n";
     fs::write(backstops_beside(&ratchet), history).unwrap();
-    let inputs = FloorInputs::read(&ratchet).unwrap();
+    let inputs = FloorInputs::read(&ratchet, &memory, Update::NONE).unwrap();
     assert_eq!(inputs.backstops.as_deref(), Some(history));
     assert_eq!(floor_run(inputs.backstops.as_deref(), "alpha"), None);
+}
+
+#[test]
+fn a_live_floor_raise_serializes_a_weaker_stored_judgment() {
+    let w = World::new("floor-writers");
+    let prover = w.prover("a");
+    let head = w.commit(&[("src/lib.rs", ""), (RATCHET, &floor(5)), (MEMORY, "")]);
+    w.file(&head, &prover, 6, 9);
+    let replay = |update| {
+        run_cmd(
+            &w.work(),
+            TrustCmd::Judge {
+                commit: head.clone(),
+                prover: Some(prover.bin.clone()),
+                update,
+                reason: None,
+            },
+        )
+    };
+    assert_eq!(
+        replay(false),
+        0,
+        "the weaker receipt met the original floor"
+    );
+
+    let ratchet = w.work().join(RATCHET);
+    let memory = w.work().join(MEMORY);
+    let logs = w.root.join("logs");
+    fs::create_dir(&logs).unwrap();
+    testing::write_log(
+        &logs.join("alpha@1.0.0.log"),
+        "Summary: 9 proved (9 total)\nCoverage: 9/9 eligible function bodies verified (complete)\n",
+    );
+    fs::write(logs.join("alpha@1.0.0.log.rc"), "0\n").unwrap();
+    fs::write(logs.join(".trustd-grants"), "1\n").unwrap();
+    let mut plan = Plan::parse(&format!(
+        "{PLAN_MAGIC}\ndriver-id {DRV}\nlogdir {}\nratchet {}\nmemory-file {}\ncrate alpha\talpha@1.0.0\tgate\n",
+        logs.display(), ratchet.display(), memory.display(),
+    )).unwrap();
+    std::thread::scope(|threads| {
+        let floors = FloorInputs::read(&ratchet, &memory, Update::RAISE).unwrap();
+        let second = threads.spawn(|| replay(true));
+        let probe = fs::File::open(ratchet.parent().unwrap()).unwrap();
+        let attempt = aterm_uds::file_lock::lock_exclusive_until(
+            &probe,
+            std::time::Instant::now(),
+            "another writer holds this checkout",
+        );
+        if attempt.is_ok() {
+            probe.unlock().unwrap();
+        }
+        assert_eq!(attempt.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let grades = BTreeMap::from([("alpha".into(), GradeEvidence::Absent)]);
+        let done = conclude(&w.cli(), &w.work(), &mut plan, &floors, &grades, None).unwrap();
+        assert_eq!(done.verdict.word, "PASS", "{}", done.verdict.report);
+        drop(floors);
+        assert_eq!(
+            second.join().unwrap(),
+            1,
+            "the replay judged the raised floor"
+        );
+    });
+    assert_eq!(fs::read_to_string(&ratchet).unwrap(), floor(9));
+    assert!(
+        floor_run(
+            Some(&fs::read_to_string(w.work().join(BACKSTOPS)).unwrap()),
+            "alpha"
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn an_equal_floor_replay_keeps_the_working_memory_ceiling() {
+    let w = World::new("floor-memory-replay");
+    let prover = w.prover("a");
+    let original = "alpha\t16.0\t-\t-\t-\t-\t-\n";
+    let current = "alpha\t4.0\t-\t-\t-\t-\t-\n";
+    let head = w.commit(&[("src/lib.rs", ""), (RATCHET, &floor(5)), (MEMORY, original)]);
+    let mut alpha = testing::gated("alpha", "Summary: 5 proved (9 total)");
+    alpha.memory.f = "16.0".into();
+    let Decision::Gate(measured) = &mut alpha.decision else {
+        unreachable!()
+    };
+    measured.ceiling = "8.0 GiB".into();
+    let receipt = testing::file(&w.cli(), &w.store(), &prover, &head, DRV, vec![alpha]);
+    let before = fs::read(&receipt).unwrap();
+    let memory = w.work().join(MEMORY);
+    fs::write(&memory, current).unwrap();
+    assert_eq!(
+        run_cmd(
+            &w.work(),
+            TrustCmd::Judge {
+                commit: head,
+                prover: Some(prover.bin),
+                update: true,
+                reason: None
+            }
+        ),
+        0
+    );
+    assert_eq!(fs::read_to_string(memory).unwrap(), current);
+    assert_eq!(
+        fs::read(receipt).unwrap(),
+        before,
+        "admission evidence stays as measured"
+    );
 }
 
 #[test]
@@ -1194,7 +2315,9 @@ fn unreadable_floor_inputs_prevent_measurement_and_publication() {
                     logs.display(), w.work().join(RATCHET).display(), w.store().display(),
                 )).unwrap();
                 let before = plan.facts.clone();
-                let error = conclude(&w.cli(), &w.work(), &mut plan, update).unwrap_err();
+                let error = w
+                    .conclude_without_grade_records(&mut plan, update)
+                    .unwrap_err();
                 assert!(error.0.contains(target), "{error}");
                 assert_eq!(
                     plan.facts, before,
@@ -1268,6 +2391,59 @@ fn the_judge_rejects_present_unreadable_floor_inputs_before_writing() {
             }
         }
     }
+}
+
+#[test]
+fn the_judge_distinguishes_unreadable_stored_facts_from_absence() {
+    let w = World::new("stored-facts-read-errors");
+    let a = w.prover("a");
+    let b = w.prover("b");
+    let ratchet = floor(3);
+    let head = w.commit(&[("src/lib.rs", "v1"), (RATCHET, &ratchet)]);
+    w.file(&head, &b, 5, 9);
+    let path = w.file(&head, &a, 5, 9);
+    let shown = path.display().to_string();
+    let check = |exit| {
+        for update in [false, true] {
+            let cmd = TrustCmd::Judge {
+                commit: head.clone(),
+                prover: Some(a.bin.clone()),
+                update,
+                reason: None,
+            };
+            assert_eq!(run_cmd(&w.work(), cmd), exit);
+            assert_eq!(fs::read_to_string(w.work().join(RATCHET)).unwrap(), ratchet);
+            assert!(!w.work().join(BACKSTOPS).exists());
+        }
+    };
+    for directory in [false, true] {
+        fs::remove_file(&path).unwrap();
+        if directory {
+            fs::create_dir(&path).unwrap();
+        } else {
+            fs::write(&path, [0xff]).unwrap();
+        }
+        check(2);
+        let why = pending_for(&w.cli(), &a, "HEAD", false)
+            .unwrap_err()
+            .to_string();
+        let cause = if directory {
+            "not a regular file"
+        } else {
+            "utf-8"
+        };
+        assert!(why.contains(&shown) && why.contains(cause), "{why}");
+    }
+    fs::remove_dir(&path).unwrap();
+    check(1);
+    let why = pending_for(&w.cli(), &a, "HEAD", false)
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        why.contains("no whole-tree Trust facts")
+            && why.contains("holds facts for this tree from prover"),
+        "{why}"
+    );
 }
 
 #[test]
@@ -1367,7 +2543,7 @@ fn the_judge_holds_floors_as_the_lane_did() {
     assert_eq!((pass.word, pass.exit), ("PASS", 0));
     let fail = judge(
         &f,
-        Some(&format!("alpha\t4\t3\t{DRV}\n")),
+        Some(&format!("alpha\t4\t4\t{DRV}\n")),
         None,
         "R",
         "M",
@@ -1384,7 +2560,7 @@ fn the_judge_holds_floors_as_the_lane_did() {
         Some(format!("alpha\t3\t3\t{DRV}\n").as_str())
     );
     let bad = judge(&f, Some("alpha\tthree\t3\n"), None, "R", "M", Update::NONE);
-    assert_eq!(bad.word, "FAIL");
+    assert_eq!(bad.word, "COULD-NOT-RUN");
     let theirs = "targo 1.99.0-dev (bbbbbbbbb 2026-09-17) (targo 0.1.0)";
     let other = format!("alpha\t9\t9\t{theirs}\n");
     let moved = judge(&f, Some(&other), None, "R", "M", Update::NONE);
@@ -1429,7 +2605,7 @@ fn the_judge_holds_floors_as_the_lane_did() {
         assert_eq!(
             judge(
                 &f,
-                Some(&format!("alpha\t4\t3\t{DRV}\n")),
+                Some(&format!("alpha\t4\t4\t{DRV}\n")),
                 None,
                 "R",
                 "M",
@@ -1499,6 +2675,263 @@ fn the_log_verb_takes_one_library_and_a_target_root() {
         let why = parse(args).unwrap_err();
         assert!(why.contains(said), "{args:?}: {why}");
     }
+}
+
+#[test]
+fn log_lookup_selects_regular_cargo_versions_and_reports_unusable_entries() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let log_path = |spec: &str| dir.path().join(format!("{spec}.log"));
+    let lookup = |selector: &str| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = print_log(dir.path(), selector, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    };
+    let row = "alpha+serde";
+    let annotations = [
+        "alpha+serde@local-notes",
+        "alpha+serde@1.0.0-01",
+        "alpha+serde@notes@4.0.0",
+    ];
+    for spec in annotations {
+        testing::write_log(&log_path(spec), "private annotation\n");
+        let (code, out, _) = lookup(spec);
+        assert_eq!(code, 1, "{spec}");
+        assert!(out.is_empty(), "{spec}: {out}");
+    }
+    let (code, out, _) = lookup(row);
+    assert_eq!(code, 1);
+    assert!(out.is_empty());
+
+    let link = "alpha+serde@2.0.0";
+    let directory = "alpha+serde@3.0.0";
+    std::os::unix::fs::symlink(
+        stored_log(&log_path(annotations[0])),
+        stored_log(&log_path(link)),
+    )
+    .unwrap();
+    for selector in [row, link] {
+        let (code, out, err) = lookup(selector);
+        assert_eq!(code, 2, "{selector}: {err}");
+        assert!(out.is_empty(), "{selector}: {out}");
+    }
+    fs::create_dir(stored_log(&log_path(directory))).unwrap();
+    let (code, out, err) = lookup(directory);
+    assert_eq!(code, 2, "{err}");
+    assert!(out.is_empty());
+
+    let first = "alpha+serde@1.0.0-pre.log.2+build.007";
+    testing::write_log(&log_path(first), "first check\n");
+    for selector in [row, first] {
+        assert_eq!(lookup(selector), (0, "first check\n".into(), String::new()));
+    }
+    let second = "alpha+serde@4.0.0";
+    testing::write_log(&log_path(second), "second check\n");
+    assert_eq!(lookup(second), (0, "second check\n".into(), String::new()));
+    let (code, out, err) = lookup(row);
+    assert_eq!(code, 2, "{err}");
+    assert!(out.is_empty());
+    assert!(err.contains(first) && err.contains(second), "{err}");
+    for excluded in annotations.into_iter().chain([link, directory]) {
+        assert!(!err.contains(excluded), "{err}");
+    }
+}
+
+#[test]
+fn only_live_unmeasured_results_show_matching_bounded_failed_sources() {
+    use std::fmt::Write as _;
+    let w = World::new("trust-failed-obligation-sources");
+    let logs = w.root.join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    let spec = "clock@1.0.0";
+    let mut plan = Plan::parse(&format!(
+        "{PLAN_MAGIC}\nlogdir {}\nratchet {}\ncrate clock\t{spec}\tgate\n",
+        logs.display(),
+        w.work().join(RATCHET).display()
+    ))
+    .unwrap();
+    let log = logs.join(format!("{spec}.log"));
+    let sidecar = logs.join(format!("{spec}.log.oblig.tsv"));
+    fs::write(logs.join(format!("{spec}.log.rc")), "1\n").unwrap();
+    let record = |failed: usize| {
+        let total = failed + 1;
+        let mut text = format!(
+            "{}\npackage\tclock\nunit\tcargo-target(package=\"clock\",kind=[\"lib\"],target=\"clock\")\nfunctions\t{total}\ntotal\t{total}\nproved\t0\n",
+            crate::trust_oblig::RECORD_MAGIC
+        );
+        for i in 0..failed {
+            let location = if i == 1 {
+                "@none\t0\t0\t0\t0"
+            } else {
+                "src/clock.rs\t48\t8\t49\t16"
+            };
+            let function = if i == 2 {
+                "λ".repeat(DIAGNOSTIC_CHARS + 1)
+            } else {
+                format!("clock::shift_{i}")
+            };
+            writeln!(text, "o\t{function}\tassertion\t{location}\tfailed\t-\tPRIVATE ANCHOR\tPRIVATE DESCRIPTION").unwrap();
+        }
+        writeln!(text, "o\tclock::colocated_uncertain\thardened_panic_boundary\tsrc/clock.rs\t48\t8\t49\t16\tunknown\tunclassified\tboundary\tboundary\nend\t{total}").unwrap();
+        text
+    };
+    let write_log = |failed, total, outcome| {
+        testing::write_log(
+            &log,
+            format!(
+                "Summary: 0 proved, {failed} failed ({total} total); {outcome}\nCoverage: {total}/{total} eligible function bodies verified (complete)\n"
+            ),
+        );
+    };
+    let verdict = |p: &mut Plan| {
+        w.conclude_without_grade_records(p, Update::NONE)
+            .unwrap()
+            .verdict
+    };
+
+    fs::write(&sidecar, record(6)).unwrap();
+    write_log(6, 7, "not-reproducible");
+    let live = verdict(&mut plan);
+    assert_eq!((live.exit, live.total.as_str()), (1, "0/0"));
+    let report = &live.report;
+    assert!(
+        report.contains("FAILED OBLIGATIONS: clock\n  clock::shift_0 at src/clock.rs:48:8-49:16"),
+        "{report}"
+    );
+    assert!(report.contains("clock::shift_1 (source location unavailable)"));
+    assert!(report.contains(&format!(
+        "{}… at src/clock.rs:48:8-49:16",
+        "λ".repeat(DIAGNOSTIC_CHARS)
+    )));
+    assert!(report.contains("clock::shift_3") && report.contains("and 2 more"));
+    for absent in ["clock::shift_4", "clock::colocated_uncertain", "PRIVATE"] {
+        assert!(!report.contains(absent), "{report}");
+    }
+    let filed = plan.facts.to_record();
+    assert!(!filed.contains("clock::shift"));
+    let replay = judge(
+        &Facts::parse(&filed).unwrap(),
+        None,
+        None,
+        "R",
+        "M",
+        Update::NONE,
+    );
+    assert_eq!(
+        (replay.exit, replay.total, replay.failed),
+        (live.exit, live.total, live.failed)
+    );
+    assert!(!replay.report.contains("FAILED OBLIGATIONS:"));
+
+    fs::write(&sidecar, record(1)).unwrap();
+    write_log(1, 2, "not-reproducible");
+    let one = verdict(&mut plan);
+    assert!(one.report.contains("clock::shift_0") && !one.report.contains("and 2 more"));
+
+    // Reuse the same live plan. A mismatched, empty or absent current record
+    // withdraws the old locations even though the check still failed.
+    fs::write(&sidecar, record(6)).unwrap();
+    write_log(5, 7, "not-reproducible");
+    assert!(!verdict(&mut plan).report.contains("FAILED OBLIGATIONS:"));
+    write_log(0, 1, "not-reproducible");
+    fs::write(&sidecar, record(0)).unwrap();
+    assert!(!verdict(&mut plan).report.contains("FAILED OBLIGATIONS:"));
+    write_log(6, 7, "not-reproducible");
+    fs::remove_file(sidecar).unwrap();
+    assert!(!verdict(&mut plan).report.contains("FAILED OBLIGATIONS:"));
+}
+
+/// A command copied from the live report selects that version in that run's directory.
+#[test]
+fn live_log_hints_open_the_measured_version_in_its_target_root() {
+    let w = World::new("trust-log-hints");
+    let root = w.root.join("run's evidence");
+    let logs = root.join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    let refused = format!("{TRUSTD_REFUSED}\n{TRUSTD_DIRTY}\n");
+    let checks = [
+        ("alpha@1.0.0", "still verifying\n", "1\n"),
+        ("beta@2.0.0", refused.as_str(), "1\n"),
+        (
+            "unmeasured@3.0.0",
+            "Result: COULD NOT RUN (outcome not-reproducible: not a measurement; exit 3)\n",
+            "3\n",
+        ),
+        (
+            "clock@1.0.0",
+            concat!(
+                "  [FAILED: unproved, no counterexample; failed closed] [assert] assertion: expect @ src/lib.rs:8:1-8:9\n",
+                "  [FAILED] [assert] assertion: add @ src/lib.rs:14:1-14:9\n",
+                "Summary: 0 proved, 2 failed (2 total); not-reproducible\n",
+                "Coverage: 2/2 eligible function bodies verified (complete)\n",
+            ),
+            "1\n",
+        ),
+    ];
+    for (spec, log, rc) in checks {
+        testing::write_log(&logs.join(format!("{spec}.log")), log);
+        fs::write(logs.join(format!("{spec}.log.rc")), rc).unwrap();
+    }
+    testing::write_log(&logs.join("alpha@0.9.0.log"), "an older check\n");
+    testing::write_log(&logs.join("clock@0.9.0.log"), "a different clock version\n");
+    fs::write(logs.join("alpha@1.0.0.log.budget"), "17\n").unwrap();
+    let mut plan = Plan::parse(&format!(
+        "{PLAN_MAGIC}\nlogdir {}\nratchet {}\ncrate alpha\talpha@1.0.0\tgate\ncrate beta\tbeta@2.0.0\tgate\ncrate clock\tclock@1.0.0\tgate\ncrate unmeasured\tunmeasured@3.0.0\tgate\n",
+        logs.display(),
+        w.work().join(RATCHET).display()
+    ))
+    .unwrap();
+    let live = w
+        .conclude_without_grade_records(&mut plan, Update::NONE)
+        .unwrap();
+    for (spec, expected, _) in checks {
+        let hint = live
+            .verdict
+            .report
+            .split('`')
+            .find(|s| s.starts_with(&format!("targo --unverified ship trust log {spec} ")))
+            .unwrap_or_else(|| panic!("{}", live.verdict.report));
+        // Let the shell split the command exactly as it would when pasted into a terminal.
+        let script = format!("targo() {{ printf '%s\\n' \"$@\"; }}\n{hint}");
+        let output = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{hint}");
+        let argv = String::from_utf8(output.stdout).unwrap();
+        let args = argv.strip_prefix("--unverified\nship\ntrust\n").unwrap();
+        let TrustCmd::Log {
+            lib,
+            root: Some(selected),
+        } = parse_cmd(&mut args.lines()).unwrap()
+        else {
+            panic!("{argv:?}")
+        };
+        assert_eq!(selected, root);
+        let mut out = Vec::new();
+        assert_eq!(
+            print_log(&selected.join("logs"), &lib, &mut out, &mut Vec::new()),
+            0
+        );
+        assert_eq!(out, expected.as_bytes());
+    }
+    let replay = judge(&plan.facts, None, None, "R", "M", Update::NONE);
+    assert_eq!(
+        (replay.word, replay.exit),
+        (live.verdict.word, live.verdict.exit)
+    );
+    assert!(replay.report.contains("log saved from the original run"));
+    assert!(!replay.report.contains("ship trust log alpha"));
+    let unmeasured = note(&replay, "CHECK LOG: unmeasured:");
+    assert!(
+        unmeasured.contains("log saved from the original run")
+            && !unmeasured.contains("--target-root")
+    );
+    let clock = note(&replay, "CHECK LOG: clock:");
+    assert!(clock.contains("log saved from the original run") && !clock.contains("--target-root"));
 }
 
 /// DC-08: a check's log is read from its stored form alone (`<name@version>.log.zst`,
@@ -1819,7 +3252,17 @@ fn a_lapsed_shortfall_is_undecided_never_a_pass() {
         "a lapse in a run that was not starved is not the clock's: {}",
         v.report
     );
-    let v = judge(&lapsed(2, 1), Some(&floor3), None, "R", "M", Update::NONE);
+    // The missing checks can still contribute calculus proofs.
+    let v = judge_with_credit(
+        &lapsed(2, 1),
+        Some(&floor3),
+        None,
+        ("R", "M", None),
+        Update::NONE,
+        None,
+        &["CREDIT-REGRESSED".into()],
+    );
+    assert!(v.failed.is_empty());
     assert_eq!((v.word, v.exit), ("COULD-NOT-RUN", 2));
     assert_eq!(v.unverified, ["alpha"]);
     assert_eq!(v.total, "0/0", "in neither total");
@@ -1910,6 +3353,35 @@ fn a_cancelled_proof_check_is_credited_only_in_a_starved_run() {
     assert!(note.contains("31 proof check(s)"), "{note}");
     let v = judged(&run(310, 131), Some(&kept_run("aterm-codec", &[], 58)));
     assert_eq!(row_of(&v, "aterm-codec"), "NOT-VERIFIED(clock,<383,73)");
+
+    // Retry selection reads the committed baseline of the same stored measurement.
+    let w = World::new("ambiguous-backstop-retry");
+    let prover = w.prover("a");
+    let known = kept_run("aterm-codec", &[], 131);
+    let head = w.commit(&[("src/lib.rs", "v1"), (RATCHET, &floor), (BACKSTOPS, &known)]);
+    testing::file(
+        &w.cli(),
+        &w.store(),
+        &prover,
+        &head,
+        DRV,
+        run(310, 131).crates,
+    );
+    let pending = || {
+        pending_for(&w.cli(), &prover, "HEAD", false)
+            .unwrap()
+            .unwrap()
+    };
+    assert!(
+        pending().is_empty(),
+        "the known recurring cancellations leave a regression"
+    );
+    let ambiguous = format!(
+        "{}aterm-codec\t-\tcancelled\t131\n",
+        kept_run("aterm-codec", &[], 0)
+    );
+    w.commit(&[(BACKSTOPS, &ambiguous)]);
+    assert_eq!(pending(), ["aterm-codec"]);
 }
 
 /// A starved run: CPU/wall 0.40 at load 30 on 14 cores.
@@ -1976,6 +3448,26 @@ fn measured_check(
     p.facts
 }
 
+/// Simulates the older counts-only log format for the clock, memory and spread rules.
+fn legacy_check(
+    name: &str,
+    (spec, log, oblig): (&str, &str, &str),
+    pace: Option<Pace>,
+    record: bool,
+) -> Facts {
+    let mut legacy = String::new();
+    for line in log.lines() {
+        let line = if line.starts_with("Summary:") || line.starts_with("Stop causes:") {
+            line.split(';').next().unwrap()
+        } else {
+            line
+        };
+        legacy.push_str(line);
+        legacy.push('\n');
+    }
+    measured_check(name, (spec, &legacy, oblig), pace, record)
+}
+
 fn gated(f: &Facts) -> &Measured {
     match &f.crates[0].decision {
         Decision::Gate(m) => m,
@@ -2032,8 +3524,172 @@ fn a_real_checks_stops_are_read_from_its_log_and_its_record() {
     let rss = stops.iter().filter(|b| b.stop == "rss-backstop").count();
     assert_eq!((rss, stops.len() - rss), (44, 6));
     assert_eq!(m.pace, None);
+    // Trust explicitly disclaims the counts in both original logs. Even a matching
+    // floor and recurring backstops cannot promote them into a measurement.
+    for (name, check, proved, total) in [
+        ("aterm-gpu", GPU, 812, 4685),
+        ("aterm-render", RENDER, 1730, 20856),
+    ] {
+        let f = measured_check(name, check, Some(QUIET), true);
+        let floor = format!("{name}\t{proved}\t{total}\t{DRV}\n");
+        let backstops = kept_run(name, gated(&f).backstops.as_deref().unwrap(), 0);
+        let v = judge(&f, Some(&floor), Some(&backstops), "R", "M", Update::RAISE);
+        let restored = Facts::parse(&f.to_record()).unwrap();
+        let replay = judge(
+            &restored,
+            Some(&floor),
+            Some(&backstops),
+            "R",
+            "M",
+            Update::RAISE,
+        );
+        let heading = format!("NOT MEASURED: {name}:");
+        let diagnostic = note(&v, &heading);
+        assert_eq!(note(&replay, &heading), diagnostic);
+        let tally = check
+            .1
+            .lines()
+            .find(|l| l.starts_with("Stop causes: "))
+            .unwrap()
+            .split_once(';')
+            .unwrap()
+            .0;
+        assert!(diagnostic.contains(tally), "{diagnostic}");
+        assert!(!diagnostic.contains("backstops fired:"));
+        assert_eq!((v.word, v.total.as_str()), ("FAIL", "0/0"));
+        assert_eq!(
+            v.failed,
+            [format!("{name} NOT-MEASURED(rc=1,not-reproducible)")]
+        );
+        assert_eq!((v.ratchet, v.backstops), (None, None));
+    }
     let f = measured_check("aterm-gpu", GPU, Some(QUIET), false);
     assert_eq!(gated(&f).backstops, None, "no record, no names");
+}
+
+#[test]
+fn only_the_final_non_measurement_explains_its_stops() {
+    let note_for = |m| {
+        let f = facts(vec![("alpha", Decision::Gate(m))]);
+        let replay = Facts::parse(&f.to_record()).unwrap();
+        let v = judge(&replay, None, None, "R", "M", Update::RAISE);
+        assert_eq!((v.exit, v.total.as_str()), (1, "0/0"));
+        assert!(v.unverified.is_empty() && v.ratchet.is_none());
+        note(&v, "NOT MEASURED: alpha:").to_string()
+    };
+    let text = format!("{}{}", RENDER.1, GPU.1);
+    let current = note_for(Measured::of_log(text.as_bytes(), "1").unwrap());
+    assert!(current.contains("wall-backstop=89"), "{current}");
+    assert!(!current.contains("rss-backstop=715"));
+    let no_tally = "Summary: 5 proved (7 total); not-reproducible\nCoverage: 9/9 eligible function bodies verified (complete)\n";
+    let m = Measured::of_log(format!("{text}{no_tally}").as_bytes(), "1").unwrap();
+    assert!(!note_for(m.clone()).contains("Stop causes:"));
+    let older = Measured {
+        could_not_run: "COULD NOT RUN: earlier driver refusal".into(),
+        ..m
+    };
+    assert!(!note_for(older).contains("earlier driver refusal"));
+    let long = format!("{no_tally}Stop causes: {}\n", "長".repeat(2_000));
+    let m = Measured::of_log(long.as_bytes(), "1").unwrap();
+    assert_eq!(
+        m.could_not_run
+            .strip_prefix("Stop causes: ")
+            .unwrap()
+            .chars()
+            .count(),
+        DIAGNOSTIC_CHARS
+    );
+    let diagnostic = note_for(m);
+    let cause = diagnostic.split_once(" (Stop causes: ").unwrap().1;
+    assert!(cause.ends_with("…)") && cause.chars().count() <= DIAGNOSTIC_CHARS);
+}
+
+#[test]
+fn unmeasured_failures_keep_the_final_compilers_counterexample_breakdown() {
+    // Trust 27009's aterm-time report. Its four operator panic boundaries all failed closed.
+    const SUMMARY: &str = "Summary: 6 proved, 4 failed, 36 runtime-checked, 12 assumed, 1 mandated, 0 contract-panic, 4 inconclusive (63 total); not-reproducible; profile c870797a6939; vector d3b1acba06fd";
+    const SPLIT: &str = "Failed rows: 4 failed, 4 of them unproved with NO counterexample: nothing refuted them; they fail closed because Trust could not prove an unsafe operation or a Level-0 safety/panic-freedom obligation it may not let pass";
+    const STOPS: &str = "Stop causes: not-dispatched=12 solved=10 unclassified=6 unsupported=35";
+    const COVERAGE: &str = "Coverage: 56/56 eligible function bodies verified (complete)";
+    let report = |split: &str, stops: &str| format!("{SUMMARY}\n{split}\n{stops}\n{COVERAGE}\n");
+    let diagnostic = |log: &str| {
+        let m = Measured::of_log(log.as_bytes(), "1").unwrap();
+        let live = facts(vec![("aterm-time", Decision::Gate(m))]);
+        let replay = Facts::parse(&live.to_record()).unwrap();
+        let judge_note = |f: &Facts| {
+            let verdict = judge(f, None, None, "R", "M", Update::RAISE);
+            assert_eq!((verdict.exit, verdict.total.as_str()), (1, "0/0"));
+            assert_eq!(
+                verdict.failed,
+                ["aterm-time NOT-MEASURED(rc=1,not-reproducible)"]
+            );
+            assert!(verdict.ratchet.is_none() && verdict.backstops.is_none());
+            note(&verdict, "NOT MEASURED: aterm-time:").to_owned()
+        };
+        let said = judge_note(&live);
+        assert_eq!(judge_note(&replay), said);
+        said
+    };
+
+    let clock = report(SPLIT, STOPS);
+    let said = diagnostic(&clock);
+    assert!(
+        said.contains("Failed rows: 4 failed, 4 unproved without a counterexample"),
+        "{said}"
+    );
+    assert!(said.contains(STOPS), "{said}");
+    assert!(!said.contains("because Trust"), "{said}");
+
+    let mixed = report(&SPLIT.replace("4 of them", "2 of them"), "");
+    let said = diagnostic(&format!("{clock}{mixed}"));
+    assert!(
+        said.contains("Failed rows: 4 failed, 2 unproved without a counterexample"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("4 unproved") && !said.contains(STOPS),
+        "{said}"
+    );
+
+    for unusable in [
+        String::new(),
+        SPLIT
+            .replace("4 failed", "3 failed")
+            .replace("4 of them", "2 of them"),
+        SPLIT.replace("4 of them", "5 of them"),
+        SPLIT.replace("4 of them", "0 of them"),
+        SPLIT.replace("4 of them", "18446744073709551616 of them"),
+        "Failed rows: 4 failed, 2 of them unproved".into(),
+    ] {
+        let said = diagnostic(&format!("{clock}{}", report(&unusable, STOPS)));
+        assert!(!said.contains("Failed rows:"), "{unusable}: {said}");
+        assert!(said.contains(STOPS), "{said}");
+    }
+}
+
+#[test]
+fn a_refuted_obligation_cannot_excuse_a_floor_regression_as_a_clock_stop() {
+    let log =
+        "Summary: 0 proved (1 total)\nCoverage: 1/1 eligible function bodies verified (complete)\n";
+    for (status, verdict) in [("failed", "FAIL"), ("timeout", "COULD-NOT-RUN")] {
+        // Old obligation sidecars could attach a marker from a counterexample to a refutation.
+        let record = format!(
+            "{}\npackage\talpha\nunit\tcargo-target(package=\"alpha\",target=\"alpha\",kind=[\"lib\"])\nfunctions\t1\ntotal\t1\nproved\t0\n\
+             o\talpha::check\tassertion\tsrc/lib.rs\t1\t0\t1\t4\t{status}\twall-backstop\tcheck\tassertion\nend\t1\n",
+            crate::trust_oblig::RECORD_MAGIC
+        );
+        let f = measured_check("alpha", ("alpha@0.0.0", log, &record), Some(STARVED), true);
+        let floor = format!("alpha\t1\t1\t{DRV}\n");
+        let v = judge(
+            &f,
+            Some(&floor),
+            Some(&kept_run("alpha", &[], 0)),
+            "R",
+            "M",
+            Update::NONE,
+        );
+        assert_eq!(v.word, verdict, "{}", v.report);
+    }
 }
 
 /// The acceptance of docs/DESIGN-adaptive-build-2026-10-24.md's TRUST-JUDGE on aterm-gpu's
@@ -2051,7 +3707,7 @@ fn a_shortfall_is_the_clocks_only_in_a_starved_run_and_only_for_a_new_stop() {
         .iter()
         .find(|o| o.backstopped() && o.status == "timeout" && alike(o) == 1)
         .unwrap();
-    let all = gated(&measured_check("aterm-gpu", GPU, None, true))
+    let all = gated(&legacy_check("aterm-gpu", GPU, None, true))
         .backstops
         .clone()
         .unwrap();
@@ -2060,7 +3716,7 @@ fn a_shortfall_is_the_clocks_only_in_a_starved_run_and_only_for_a_new_stop() {
     had.remove(at);
     let had = kept_run("aterm-gpu", &had, 0);
     let judged = |pace: Pace, backstops: Option<&str>, update: Update<'_>| {
-        let f = measured_check("aterm-gpu", GPU, Some(pace), true);
+        let f = legacy_check("aterm-gpu", GPU, Some(pace), true);
         judge(&f, Some(&floor), backstops, "R", "M", update)
     };
 
@@ -2111,7 +3767,7 @@ fn a_shortfall_is_the_clocks_only_in_a_starved_run_and_only_for_a_new_stop() {
     // A stop every run has earns nothing, starved or not: beyond the prover's spread the
     // drop is the code's.
     let beyond = format!("aterm-gpu\t830\t4685\t{DRV}\n");
-    let f = measured_check("aterm-gpu", GPU, Some(STARVED), true);
+    let f = legacy_check("aterm-gpu", GPU, Some(STARVED), true);
     let all_kept = kept_run("aterm-gpu", &all, 0);
     let v = judge(&f, Some(&beyond), Some(&all_kept), "R", "M", Update::NONE);
     assert_eq!(v.failed, ["aterm-gpu RATCHET-REGRESSION(<830) 812/4685"]);
@@ -2127,7 +3783,7 @@ fn a_shortfall_is_the_clocks_only_in_a_starved_run_and_only_for_a_new_stop() {
 #[test]
 fn a_shortfall_within_the_provers_spread_is_undecided_and_a_named_loss_is_not() {
     let rec = crate::trust_oblig::Record::parse(GPU.2).unwrap();
-    let all = gated(&measured_check("aterm-gpu", GPU, None, true))
+    let all = gated(&legacy_check("aterm-gpu", GPU, None, true))
         .backstops
         .clone()
         .unwrap();
@@ -2145,7 +3801,7 @@ fn a_shortfall_within_the_provers_spread_is_undecided_and_a_named_loss_is_not() 
         kept_run("aterm-gpu", &had, 0),
     );
     let judged = |floor: u64, driver: &str, pace: Pace, run: &str, update: Update<'_>| {
-        let f = measured_check("aterm-gpu", GPU, Some(pace), true);
+        let f = legacy_check("aterm-gpu", GPU, Some(pace), true);
         let row = format!("aterm-gpu\t{floor}\t4685\t{driver}\n");
         judge(&f, Some(&row), Some(run), "R", "M", update)
     };
@@ -2197,7 +3853,7 @@ fn a_shortfall_within_the_provers_spread_is_undecided_and_a_named_loss_is_not() 
     // and no BEYOND SPREAD note claims a spread of 0 was measured.
     let v = judge(
         &facts(vec![("alpha", gate("Summary: 3 proved (3 total)"))]),
-        Some(&format!("alpha\t4\t3\t{DRV}\n")),
+        Some(&format!("alpha\t4\t4\t{DRV}\n")),
         None,
         "R",
         "M",
@@ -2210,7 +3866,7 @@ fn a_shortfall_within_the_provers_spread_is_undecided_and_a_named_loss_is_not() 
     // aterm-render's among them): no stop can be called new, so the 89 name no loss, and the
     // spread decides as for a run that named none.
     let v = judge(
-        &measured_check("aterm-gpu", GPU, Some(QUIET), true),
+        &legacy_check("aterm-gpu", GPU, Some(QUIET), true),
         Some(&format!("aterm-gpu\t813\t4685\t{DRV}\n")),
         None,
         "R",
@@ -2224,7 +3880,7 @@ fn a_shortfall_within_the_provers_spread_is_undecided_and_a_named_loss_is_not() 
         v.report
     );
     let v = judge(
-        &measured_check("aterm-gpu", GPU, Some(QUIET), true),
+        &legacy_check("aterm-gpu", GPU, Some(QUIET), true),
         Some(&format!("aterm-gpu\t829\t4685\t{DRV}\n")),
         None,
         "R",
@@ -2301,21 +3957,35 @@ fn a_starved_run_sets_no_floor_the_machine_can_be_credited_with() {
         "kept, and it had none"
     );
     for (stops, cancelled) in [(1, 0), (0, 1)] {
-        let v = judge(
-            &alpha(stops, cancelled),
-            Some(""),
-            None,
-            "R",
-            "M",
-            Update::RAISE,
-        );
-        assert_eq!(row_of(&v, "alpha"), "NO-FLOOR", "{}", v.report);
-        assert!(note(&v, "RE-BASE WITHHELD: alpha").contains(&STARVED.said()));
-        assert!(!v.report.contains("NO FLOOR: "), "{}", v.report);
-        assert_eq!((v.ratchet, v.backstops), (None, None));
+        let f = alpha(stops, cancelled);
+        let prior = kept_run("alpha", gated(&f).backstops.as_deref().unwrap(), cancelled);
+        for backstops in [None, Some(prior.as_str())] {
+            let v = judge(&f, Some(""), backstops, "R", "M", Update::RAISE);
+            assert_eq!(row_of(&v, "alpha"), "NO-FLOOR", "{}", v.report);
+            assert_eq!(v.exit, 1);
+            assert!(note(&v, "RE-BASE WITHHELD: alpha").contains(&STARVED.said()));
+            assert!(!v.report.contains("NO FLOOR: "), "{}", v.report);
+            assert_eq!((v.ratchet, v.backstops), (None, None));
+        }
+        // The same stops from a real floor's run recur, so the higher count stands.
+        let v = judge(&f, Some(&floor(2)), Some(&prior), "R", "M", Update::RAISE);
+        assert_eq!(v.exit, 0, "{}", v.report);
+        assert_eq!(v.ratchet, Some(floor(3)));
     }
+    let ambiguous = "alpha\t-\tcancelled\t0\nalpha\t-\tcancelled\t1\n";
+    let v = judge(
+        &alpha(0, 1),
+        Some(&floor(2)),
+        Some(ambiguous),
+        "R",
+        "M",
+        Update::RAISE,
+    );
+    assert_eq!(v.exit, 0, "the existing floor held: {}", v.report);
+    assert!(note(&v, "RE-BASE WITHHELD: alpha").contains(&STARVED.said()));
+    assert_eq!((v.ratchet, v.backstops), (None, None));
 
-    let gpu = |pace: Pace| measured_check("aterm-gpu", GPU, Some(pace), true);
+    let gpu = |pace: Pace| legacy_check("aterm-gpu", GPU, Some(pace), true);
     let all = gated(&gpu(QUIET)).backstops.clone().unwrap();
     let met = format!("aterm-gpu\t812\t4685\t{DRV}\n");
     let v = judge(&gpu(STARVED), Some(&met), None, "R", "M", Update::RAISE);
@@ -2375,7 +4045,7 @@ fn a_starved_run_sets_no_floor_the_machine_can_be_credited_with() {
 /// names.
 #[test]
 fn an_rss_stop_is_credited_as_a_clock_stop_is() {
-    let f = measured_check("aterm-render", RENDER, Some(STARVED), true);
+    let f = legacy_check("aterm-render", RENDER, Some(STARVED), true);
     let stops = gated(&f).backstops.clone().unwrap();
     let wall: Vec<Backstop> = stops
         .iter()
@@ -2406,13 +4076,13 @@ fn an_rss_stop_is_credited_as_a_clock_stop_is() {
         "the control: the floor's run had its RSS stops too"
     );
 
-    let bare = measured_check("aterm-render", RENDER, Some(STARVED), false);
+    let bare = legacy_check("aterm-render", RENDER, Some(STARVED), false);
     assert_eq!(edge(1730 + 747 + 715 - 6), 3252, "3186 and the 65 of 3251");
     let v = judged(&bare, 3251, &wall);
     assert_eq!(row_of(&v, "aterm-render"), "NOT-VERIFIED(clock,<3251,1456)");
     let v = judged(&bare, 3252, &wall);
     assert_eq!(row_of(&v, "aterm-render"), "RATCHET-REGRESSION(<3252)");
-    let quiet = measured_check("aterm-render", RENDER, Some(QUIET), false);
+    let quiet = legacy_check("aterm-render", RENDER, Some(QUIET), false);
     let v = judge(
         &quiet,
         Some(&format!("aterm-render\t1730\t20856\t{DRV}\n")),
@@ -2658,8 +4328,26 @@ fn the_floors_backstops_keep_each_crates_own_rows() {
         None,
         "stops without a head"
     );
-    let unread = text.replace("alpha\t-\tcancelled\t0", "alpha\t-\tcancelled\tsome");
-    assert_eq!(floor_run(Some(&unread), "alpha"), None);
+    let head = "alpha\t-\tcancelled\t0";
+    for replacement in [
+        "alpha\t-\tcancelled\tsome",
+        "alpha\t-\tcancelled\t0\nalpha\t-\tcancelled\t1",
+        "alpha\t-\tcancelled\t1\nalpha\t-\tcancelled\t0",
+        "alpha\t-\tcancelled\t0\nalpha\t-\tcancelled\t0",
+        "alpha\t-\tcancelled\t0\nalpha\tkey\tunknown-stop\tf",
+        "alpha\t-\tcancelled\t0\nalpha",
+    ] {
+        let damaged = text.replace(head, replacement);
+        assert_eq!(floor_run(Some(&damaged), "alpha"), None, "{replacement:?}");
+        assert_eq!(floor_run(Some(&damaged), "beta"), Some(FloorRun::default()));
+    }
+    // Look-alike obligations may share a key, and each occurrence counts.
+    let stop = "alpha\t1\twall-backstop\tf1";
+    let repeated = text.replace(stop, &format!("{stop}\n{stop}"));
+    assert_eq!(
+        floor_run(Some(&repeated), "alpha"),
+        Some(run(&[b("1", "wall-backstop"), b("1", "wall-backstop")], 0))
+    );
 
     let mut f = measured_check("aterm-gpu", GPU, Some(QUIET), true);
     let record = f.to_record();
@@ -2698,17 +4386,17 @@ fn the_floor_files_are_written_together_or_not_at_all() {
     };
     let before = names();
     let blocked = dir.path().join("missing-parent/blocked.tsv");
-    let err = write_floor_files(&[
+    let err = write_staged_text(&[
         (&floors, Some("new floors\n")),
         (&blocked, Some("x\n")),
         (&stops, Some("new stops\n")),
     ])
     .unwrap_err();
-    assert!(err.contains("blocked.tsv"), "{err}");
+    assert!(err.to_string().contains("blocked.tsv"), "{err}");
     assert_eq!(fs::read_to_string(&floors).unwrap(), "old floors\n");
     assert_eq!(fs::read_to_string(&stops).unwrap(), "old stops\n");
     assert_eq!(names(), before, "a failed pass leaves no scratch");
-    write_floor_files(&[(&floors, Some("new floors\n")), (&stops, None)]).unwrap();
+    write_staged_text(&[(&floors, Some("new floors\n")), (&stops, None)]).unwrap();
     assert_eq!(fs::read_to_string(&floors).unwrap(), "new floors\n");
     assert_eq!(fs::read_to_string(&stops).unwrap(), "old stops\n");
     assert_eq!(names(), before, "a successful pass leaves no scratch");
@@ -2723,7 +4411,7 @@ fn floor_updates_preserve_occupied_legacy_scratch() {
 
     let ordinary = aterm_tempfile::tempdir().unwrap();
     let floor = ordinary.path().join("memory.tsv");
-    write_floor_files(&[(&floor, Some("ordinary update\n"))]).unwrap();
+    write_staged_text(&[(&floor, Some("ordinary update\n"))]).unwrap();
     assert_eq!(fs::read_to_string(&floor).unwrap(), "ordinary update\n");
 
     let mut outcomes = Vec::new();
@@ -2749,7 +4437,7 @@ fn floor_updates_preserve_occupied_legacy_scratch() {
         let before = identity(&occupied);
         let bytes = fs::read(&occupied).ok();
         let link = fs::read_link(&occupied).ok();
-        let updated = write_floor_files(&[(&floor, Some("new memory\n"))]);
+        let updated = write_staged_text(&[(&floor, Some("new memory\n"))]);
         outcomes.push((
             kind,
             updated.is_ok(),
@@ -2768,12 +4456,204 @@ fn floor_updates_preserve_occupied_legacy_scratch() {
     );
 }
 
+#[test]
+fn overflowing_stored_credit_preserves_the_original_receipt() {
+    let store = aterm_tempfile::tempdir().unwrap();
+    let graded = |name, proved| {
+        Crate::new(
+            name,
+            Decision::Gate(Measured {
+                grade: GradeEvidence::Measured(crate::trust_credit::Tally {
+                    proved,
+                    graded: proved,
+                    calculus: proved,
+                }),
+                ..Measured::default()
+            }),
+        )
+    };
+    let key = "overflow";
+    let mut round = Facts {
+        crates: vec![graded("alpha", 1), graded("beta", 1)],
+        provenance: Some(Provenance {
+            key: key.into(),
+            head: "a".repeat(40),
+            date: "2026-11-17T20:30:00Z".into(),
+            ..Provenance::default()
+        }),
+        ..Facts::default()
+    };
+    let path = file_record(store.path(), &round).unwrap();
+    let original = fs::read(&path).unwrap();
+    round.crates = vec![graded("alpha", u64::MAX)];
+    let error = complete_record(store.path(), key, &round).unwrap_err();
+    assert!(
+        error.contains("CREDIT-UNREADABLE") && error.contains("overflow"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    round.crates = vec![graded("alpha", u64::MAX - 1)];
+    let (_, _, credit) = complete_record(store.path(), key, &round).unwrap();
+    assert_eq!(credit.total.calculus, u64::MAX);
+}
+
+#[test]
+fn parallel_remeasurements_keep_both_crates_in_one_receipt() {
+    let store = aterm_tempfile::tempdir().unwrap();
+    let key = "fixture";
+    let base_row = |name| testing::gated(name, "Summary: 1 proved (4 total)");
+    let base = Facts {
+        provenance: Some(Provenance {
+            key: key.into(),
+            head: "a".repeat(40),
+            date: "2026-11-17T20:30:00Z".into(),
+            ..Provenance::default()
+        }),
+        crates: vec![base_row("alpha"), base_row("beta")],
+        ..Facts::default()
+    };
+    let path = file_record(store.path(), &base).unwrap();
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for name in ["alpha", "beta"] {
+            let mut again = base.clone();
+            again.crates = vec![testing::gated(name, "Summary: 4 proved (4 total)")];
+            let start = &start;
+            let store = store.path();
+            scope.spawn(move || {
+                start.wait();
+                complete_record(store, key, &again).unwrap();
+            });
+        }
+    });
+    let saved = Facts::parse(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(
+        saved.crates,
+        [
+            testing::gated("alpha", "Summary: 4 proved (4 total)"),
+            testing::gated("beta", "Summary: 4 proved (4 total)"),
+        ]
+    );
+    assert_eq!(saved.provenance.unwrap().remeasured.len(), 2);
+}
+
+#[test]
+fn filed_facts_preserve_other_receipt_files() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let store = dir.path().join("receipts");
+    let mut f = facts(vec![]);
+    f.provenance = Some(Provenance {
+        key: "fixture".into(),
+        ..Provenance::default()
+    });
+    let path = file_record(&store, &f).unwrap();
+    let occupied = store.join(format!(".{FACTS_PREFIX}fixture.{}", std::process::id()));
+    fs::write(&occupied, "retained").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |file: &Path| fs::metadata(file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), mode(&occupied));
+    }
+    f.measured_at = "later".into();
+    file_record(&store, &f).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), f.to_record());
+    assert_eq!(fs::read_to_string(&occupied).unwrap(), "retained");
+
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let retained = path.join("other");
+    fs::write(&retained, "keep").unwrap();
+    let err = file_record(&store, &f).unwrap_err();
+    assert!(err.contains(&path.display().to_string()), "{err}");
+    assert_eq!(fs::read_to_string(retained).unwrap(), "keep");
+    assert_eq!(fs::read_to_string(occupied).unwrap(), "retained");
+}
+
+#[test]
+fn admission_distinguishes_absent_policy_files_from_unreadable_ones() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let obs = dir.path().join("observations.tsv");
+    let mut plan = Plan {
+        facts: facts(vec![("alpha", gate(""))]),
+        ratchet: dir.path().join("floors.tsv"),
+        memory: dir.path().join("memory.tsv"),
+        host_obs: Some(obs.clone()),
+        ..Plan::default()
+    };
+    plan.facts.only = "alpha".into();
+    plan.facts.host.mem = 24 << 30;
+    let admit = || plan.admit(&BTreeMap::new());
+    let memory = "alpha\t4\t24\t3\t3\t>\tnow\n";
+    fs::write(&plan.memory, memory).unwrap();
+    assert!(admit().unwrap().1.is_empty(), "no floor has been measured");
+
+    fs::write(&plan.ratchet, format!("alpha\t3\t5\t{DRV}\n")).unwrap();
+    let (_, refusals) = admit().unwrap();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0].0, "alpha");
+    fs::write(&obs, format!("alpha\theld\t3\t2\t3\t3\t{DRV}\tnow\n")).unwrap();
+    assert!(admit().unwrap().1.is_empty(), "this host held the floor");
+
+    for path in [&obs, &plan.ratchet, &plan.memory] {
+        let old = fs::read(path).unwrap();
+        fs::write(path, [0xff]).unwrap();
+        let cause = crate::durable::read_text(path).unwrap_err().to_string();
+        let error = admit().unwrap_err();
+        let shown = path.display().to_string();
+        assert!(error.contains(&shown) && error.contains(&cause), "{error}");
+        fs::write(path, old).unwrap();
+    }
+}
+
+#[test]
+fn host_observations_preserve_prior_rows_and_other_files() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("state/observations.tsv");
+    let plan = Plan::default();
+    let mut verdict = judge(&plan.facts, None, None, "R", "M", Update::NONE);
+    verdict.host_obs = vec![(
+        "alpha".into(),
+        Some(["held", "-", "-", "3", "3"].map(String::from)),
+    )];
+    write_host_obs(&path, &plan, &verdict).unwrap();
+    let occupied = path.with_extension(format!("tsv.{}", std::process::id()));
+    fs::write(&occupied, "retained").unwrap();
+    fs::write(&path, "beta\tother\nalpha\told\n").unwrap();
+    write_host_obs(&path, &plan, &verdict).unwrap();
+    let rows = fs::read_to_string(&path).unwrap();
+    assert!(rows.contains("beta\tother\n") && rows.contains("alpha\theld\t"));
+    assert!(!rows.contains("alpha\told"));
+    assert_eq!(fs::read_to_string(occupied).unwrap(), "retained");
+}
+
+#[test]
+fn unreadable_host_observations_survive_an_update() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("observations.tsv");
+    let plan = Plan::default();
+    let mut verdict = judge(&plan.facts, None, None, "R", "M", Update::NONE);
+    verdict.host_obs = vec![(
+        "alpha".into(),
+        Some(["held", "-", "-", "3", "3"].map(String::from)),
+    )];
+    let prior = b"beta\t\xff\n";
+    fs::write(&path, prior).unwrap();
+    let err = write_host_obs(&path, &plan, &verdict).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(&path.display().to_string()),
+        "{err}"
+    );
+    assert_eq!(fs::read(path).unwrap(), prior);
+}
+
 /// A failed first stage never acquired a later scratch name; cleanup cannot unlink it.
 #[test]
 fn floor_staging_failure_preserves_an_unvisited_occupied_name() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let ordinary = dir.path().join("ordinary.tsv");
-    write_floor_files(&[(&ordinary, Some("ordinary update\n"))]).unwrap();
+    write_staged_text(&[(&ordinary, Some("ordinary update\n"))]).unwrap();
     assert_eq!(fs::read_to_string(&ordinary).unwrap(), "ordinary update\n");
     let missing = dir.path().join("missing-parent/floors.tsv");
     let later = dir.path().join("backstops.tsv");
@@ -2785,7 +4665,7 @@ fn floor_staging_failure_preserves_an_unvisited_occupied_name() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert!(
-        write_floor_files(&[
+        write_staged_text(&[
             (&missing, Some("new floors\n")),
             (&later, Some("new stops\n"))
         ])
@@ -2988,6 +4868,13 @@ fn a_remeasure_folds_only_its_own_key() {
         date: "d2".into(),
         ..prov("k")
     });
+    base.host = host(32);
+    again.host = base.host;
+    base.host.reach = base.host.mem / 2;
+    let base = Facts::parse(&base.to_record()).unwrap();
+    assert_eq!(base.host.reach, 0);
+    again.host.reach = again.host.mem / 3;
+    assert_ne!(base.host.reach, again.host.reach);
     let done = remeasured(&base, &again).unwrap();
     assert_eq!(done.crates[0].decision, gate("Summary: 3 proved (3 total)"));
     assert_eq!(done.crates[1], base.crates[1]);
@@ -3006,6 +4893,13 @@ fn a_remeasure_folds_only_its_own_key() {
     let mut other_host = again.clone();
     other_host.host.mem = 1;
     assert!(remeasured(&base, &other_host).unwrap_err().contains("host"));
+    let mut other_source = again.clone();
+    other_source.host.memtotal = !again.host.memtotal;
+    assert!(
+        remeasured(&base, &other_source)
+            .unwrap_err()
+            .contains("MemTotal")
+    );
     let mut other_ceiling = again.clone();
     other_ceiling.host.uncapped = !again.host.uncapped;
     assert!(
@@ -3259,14 +5153,16 @@ fn the_facts_carry_each_rows_ram_and_run_ceiling() {
         Facts::parse(&text.replace("driver-ceiling yes", "driver-ceiling maybe")),
         None
     );
-    let v = judge(
+    let v = judge_with_credit(
         &f,
         Some(&format!("aterm-cli\t75\t443\t{DRV}\n")),
         None,
-        "R",
-        "M",
+        ("R", "M", None),
         Update::NONE,
+        None,
+        &["CREDIT-REGRESSED".into()],
     );
+    assert!(v.failed.is_empty());
     assert_eq!(v.word, "NARROWED");
 }
 
@@ -3438,7 +5334,7 @@ fn a_refused_path_is_said_once_with_every_library_it_failed() {
             ("beta", gated(&mine)),
             ("gamma", gated(REFUSED_TMP)),
             ("delta", gated(REFUSED_TRUSTD)),
-            ("eps", gate(DONE)),
+            ("eps", Decision::Gate(log(DONE))),
         ]),
         Some(&ratchet),
         None,
@@ -3503,7 +5399,7 @@ fn a_refused_path_is_said_once_with_every_library_it_failed() {
         v.tail
     );
     let clean = judge(
-        &facts(vec![("eps", gate(DONE))]),
+        &facts(vec![("eps", Decision::Gate(log(DONE)))]),
         Some(&ratchet),
         None,
         "R",
@@ -3619,7 +5515,8 @@ fn a_run_targo_refused_a_path_in_files_nothing() {
         testing::write_log(&logs.join("alpha@1.0.0.log"), log);
         fs::write(logs.join("alpha@1.0.0.log.rc"), rc).unwrap();
         let mut p = Plan::parse(&plan).unwrap();
-        conclude(&w.cli(), &w.work(), &mut p, Update::NONE).unwrap()
+        w.conclude_without_grade_records(&mut p, Update::NONE)
+            .unwrap()
     };
     let done = run(REFUSED_LOG, "2\n");
     let l = done.facts_line.unwrap_or_default();

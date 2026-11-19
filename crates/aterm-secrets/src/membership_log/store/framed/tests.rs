@@ -134,7 +134,7 @@ fn layout_reader_keeps_unknown_large_frames_without_relaxing_known_reader() {
     .unwrap();
     let bytes = crate::membership_log::with_kind_code(&record, 0xee);
     let mut small = Chunks::new(&bytes, 11);
-    let mut layout = FrameReader::new();
+    let mut layout = FrameReader::at(Reading::ONE);
     let frame = match layout.read_layout(&mut small, bytes.len()) {
         Ok(Some(frame)) => frame,
         _ => panic!("a complete unknown-kind layout must be framed"),
@@ -142,7 +142,7 @@ fn layout_reader_keeps_unknown_large_frames_without_relaxing_known_reader() {
     assert_eq!(frame.wire.as_slice(), bytes);
     assert_eq!(frame.parents, known.parents());
     assert_eq!(small.at, bytes.len());
-    let mut known_reader = FrameReader::new();
+    let mut known_reader = FrameReader::at(Reading::ONE);
     assert!(matches!(
         known_reader.read(&mut bytes.as_slice()),
         Err(FrameReadError::Invalid(_))
@@ -155,7 +155,7 @@ fn layout_reader_checks_remaining_budget_before_reading_the_frame_body() {
     let header = Record::frame_header_len(record.bytes(), Reading::ONE).unwrap();
     let mut source = Chunks::new(record.bytes(), 7);
     source.fail_at = Some(header);
-    let mut reader = FrameReader::new();
+    let mut reader = FrameReader::at(Reading::ONE);
     assert!(matches!(
         reader.read_layout(&mut source, record.bytes().len() - 1),
         Err(FrameReadError::Invalid(_))
@@ -178,7 +178,8 @@ fn rooted_file_application_rolls_back_only_new_unrooted_records() {
         let bytes = encode_records(records.iter().enumerate().filter_map(|(i, record)| {
             (i != 1 && (include_rejected_genesis || i != 0)).then_some(record)
         }));
-        let batch = Store::read_records(bytes.as_slice(), original.budgets().held).unwrap();
+        let batch =
+            Store::read_records(bytes.as_slice(), original.budgets().held, Reading::ONE).unwrap();
         assert_eq!(batch.bytes_read(), bytes.len());
         let recovered = batch.apply_rooted(original.clone());
         assert!(recovered.log().is_none());
@@ -195,7 +196,7 @@ fn rooted_file_application_rolls_back_only_new_unrooted_records() {
             .enumerate()
             .filter_map(|(i, record)| (i != 1).then_some(record)),
     );
-    let recovered = Store::read_records(bytes.as_slice(), original.budgets().held)
+    let recovered = Store::read_records(bytes.as_slice(), original.budgets().held, Reading::ONE)
         .unwrap()
         .apply_rooted(original.under(&[*signer]));
     assert!(recovered.log().is_some());

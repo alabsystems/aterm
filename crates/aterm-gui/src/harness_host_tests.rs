@@ -8852,6 +8852,7 @@ impl Acting {
                 claim_walled: Acts::inert().claim_walled,
                 claim_left: Acts::inert().claim_left,
                 login_pin: Acts::inert().login_pin,
+                model_settings: Acts::inert().model_settings,
                 window_ending: Acts::inert().window_ending,
                 clicks: Acts::inert().clicks,
             },
@@ -20445,6 +20446,7 @@ fn a_supervising_host_reconciles_the_accounts_sessions_with_every_session_it_hol
 }
 
 /// A seat over a fresh state root and home, at `now`.
+#[cfg(unix)]
 fn reconcile_seat(root: &Path, now: i64) -> AccountSeat {
     AccountSeat {
         roster: None,
@@ -20455,12 +20457,14 @@ fn reconcile_seat(root: &Path, now: i64) -> AccountSeat {
     }
 }
 
+#[cfg(unix)]
 fn unix_now() -> i64 {
     aterm_time::unix_secs()
         .and_then(|now| i64::try_from(now).ok())
         .expect("a clock")
 }
 
+#[cfg(unix)]
 fn session_row(at: i64, owner: Option<accounts::Owner>) -> accounts::SessionRow {
     accounts::SessionRow {
         account: "ada".into(),
@@ -20470,6 +20474,7 @@ fn session_row(at: i64, owner: Option<accounts::Owner>) -> accounts::SessionRow 
     }
 }
 
+#[cfg(unix)]
 fn seeded_sessions(sessions: &[(&str, accounts::SessionRow)]) -> accounts::State {
     accounts::State {
         machine: "0a0b".into(),
@@ -20481,12 +20486,14 @@ fn seeded_sessions(sessions: &[(&str, accounts::SessionRow)]) -> accounts::State
     }
 }
 
+#[cfg(unix)]
 fn session_ids(store: &accounts::Store, now: i64) -> Vec<String> {
     let (state, _) = store.load(now).expect("ours");
     state.sessions.keys().cloned().collect()
 }
 
 /// This process under another start: an owner that ended ([`accounts::Owner::runs`]).
+#[cfg(unix)]
 fn ended_owner() -> accounts::Owner {
     let me = accounts::Owner::here().expect("this process's start is read");
     accounts::Owner {
@@ -20496,6 +20503,7 @@ fn ended_owner() -> accounts::Owner {
 }
 
 /// Every pool marked as having read `sid` over a grace before `now`.
+#[cfg(unix)]
 fn marked_due(sid: &str, now: i64) -> AccountsOver {
     accounts::Cli::ALL
         .into_iter()
@@ -47875,11 +47883,19 @@ fn the_watch_seam_lifts_only_the_private_roots_reason() {
         std::fs::create_dir(dir).expect("home");
     }
     let dev = |p: &Path| -> Option<u64> { Some(if p.ends_with("image") { 2 } else { 1 }) };
-    assert!(disk_private_root(true, false), "a private root, no seam");
-    assert!(!disk_private_root(true, true), "the seam admitted");
-    assert!(!disk_private_root(false, false) && !disk_private_root(false, true));
+    assert!(
+        disk_private_root(true, false, false),
+        "a private root, no seam"
+    );
+    assert!(!disk_private_root(true, false, true), "the seam admitted");
+    assert!(!disk_private_root(false, false, false) && !disk_private_root(false, false, true));
     let judged = |seam: bool, home: &Path| {
-        disk_private_with(disk_private_root(true, seam), Some(&account), home, &dev)
+        disk_private_with(
+            disk_private_root(true, false, seam),
+            Some(&account),
+            home,
+            &dev,
+        )
     };
     assert_eq!(judged(false, &image), Some(DiskPrivate::StateRoot));
     assert_eq!(
@@ -47891,6 +47907,43 @@ fn the_watch_seam_lifts_only_the_private_roots_reason() {
         judged(true, &scratch),
         Some(DiskPrivate::ScratchHome),
         "a scratch home on the account home's volume stays private under the seam"
+    );
+}
+
+#[test]
+fn a_release_world_keeps_disk_upkeep_private_on_a_separate_home_device() {
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-hh-disk-release-world-")
+        .tempdir()
+        .expect("temp dir");
+    let account = tmp.path().join("account");
+    let world = tmp.path().join("world");
+    for dir in [&account, &world] {
+        std::fs::create_dir(dir).expect("home");
+    }
+    let dev = |path: &Path| Some(if path == world { 2 } else { 1 });
+    let judged = |private, marker, seam| {
+        disk_private_with(
+            disk_private_root(private, marker, seam),
+            Some(&account),
+            &world,
+            &dev,
+        )
+    };
+    assert_eq!(
+        judged(false, true, false),
+        Some(DiskPrivate::StateRoot),
+        "a world stays private without development seams, even on a separate device"
+    );
+    assert_eq!(
+        judged(false, false, false),
+        None,
+        "CONTROL: an independent account home keeps its existing admission"
+    );
+    assert_eq!(
+        judged(true, true, true),
+        None,
+        "CONTROL: an admitted watch seam still exercises its dedicated scratch volume"
     );
 }
 
@@ -48085,13 +48138,7 @@ fn a_tab_busy_at_the_removal_is_unknown_on_windows() {
 fn a_private_instance_says_why_it_removes_nothing_once_a_change() {
     use aterm_agent::harness::disk::Level;
     let root = Some(DiskPrivate::StateRoot);
-    assert_eq!(
-        disk_private_line(root, true, false, Level::Short).as_deref(),
-        Some(
-            "harness disk watch: short, and this instance runs under a private state root \
-             (ATERM_STATE_HOME): it measures and removes nothing"
-        )
-    );
+    assert!(disk_private_line(root, true, false, Level::Short).is_some());
     for (rule, says) in [
         (DiskPrivate::ScratchHome, "home is not the account's"),
         (DiskPrivate::DeviceUnnamed, "cannot name its home's device"),

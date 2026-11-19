@@ -20,16 +20,12 @@
 
 use std::fmt;
 use std::io::{self, Read};
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
-#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
 use crate::secret::Secret;
 
 /// The Windows arm: the directory verdict, the opens and the writes, under a protected access
@@ -135,17 +131,29 @@ pub const FILE_OPEN: &str = "it is open to other users (want 0600)";
 pub const DIR_OPEN: &str = "the directory is open to other users (want 0700)";
 /// Why a file with a second hard link is not private: that link is another copy of it.
 pub const ANOTHER_LINK: &str = "it has another link";
-/// Why a Windows process that runs elevated (an administrator's full token) is refused every
-/// call here that makes, changes or removes a file or folder: a user's private state is their
-/// unelevated processes', kept apart from an elevated aterm's as the window's control folder is.
-/// The folders are the unelevated user's to change, and a file is opened by its name after its
-/// folder was judged, so an administrator's write there could be sent elsewhere by a link put in
-/// between; and what it made by other means (a parent `create_dir_all` makes) comes out owned by
-/// Administrators, which this rule refuses to the user's own processes. An elevated process may
-/// read: owner and access list are judged as for any of the user's. Unix has no such process.
+/// Why [`read_owned`] and [`read_owned_into`] refuse a file on Windows whose access list has an
+/// allow entry that lets an account other than the user, SYSTEM and Administrators write, as
+/// Unix refuses a group or other write bit ([`PrivateFileError::Writable`]).
+pub const OTHERS_WRITE: &str = "its access list lets another account write";
+/// Why a Windows process that runs elevated (an administrator's full token) is refused
+/// [`new_file_descriptor`], whose callers make their files by path: an administrator's create
+/// by a path the user's unelevated processes can change could be sent elsewhere by a link put
+/// on its way. This module's own makers, writers and removals run elevated (each through a held
+/// folder judged the user's own, by names that follow nothing, and what they make is the token
+/// user's from its creation), apart from a missing folder above a private one
+/// ([`ELEVATED_PARENT`]). Other crates' makers by path refuse an elevated process with this
+/// text too. Unix has no such process.
 pub const ELEVATED: &str = "an elevated process (an administrator's full token) makes and \
                             changes no private file: they are the user's unelevated processes'; \
                             run aterm unelevated";
+/// Why a Windows process that runs elevated is refused a missing private folder whose parent is
+/// missing or is not a folder of the token user's own ([`ensure_private_dir`],
+/// [`create_private_dir`]): a folder an administrator makes through a path the user's
+/// unelevated processes can change, or in another account's folder, is the classic way to give
+/// them a folder somewhere they could not make one. Unix has no such process.
+pub const ELEVATED_PARENT: &str = "an elevated process (an administrator's full token) makes a \
+                                   private folder only in a folder of the user's own that is \
+                                   there; run aterm unelevated once to make the folders above it";
 /// What [`PrivateDir::Open`] and [`ensure_private_dir`] report on Windows for a folder that is
 /// the user's but whose access list is not private: there are no mode bits there, so it is said
 /// in their terms as open to group and other alike.
@@ -291,13 +299,13 @@ impl Pin {
     }
 }
 
-/// One file's kept parse: the bytes it was made of, and the file itself where a later read can
-/// tell from its stamp alone that nothing wrote to it.
-#[cfg(unix)]
+/// One file's kept parse: the bytes it was made of, and on Unix the file itself where a later
+/// read can tell from its stamp alone that nothing wrote to it.
 struct Kept<T> {
     path: PathBuf,
     bytes: Secret,
     parse: T,
+    #[cfg(unix)]
     pin: Option<Pin>,
 }
 
@@ -316,17 +324,20 @@ struct Kept<T> {
 ///   kernel does not stamp when it happens; no aterm writer makes one.
 /// - Otherwise the bytes are read, and equal bytes at the same path reuse the parse.
 ///
+/// On Windows no parse is pinned, and the bytes are read at every call: a pin's footing is that
+/// a write into the file moves its times, and Windows documents that a file's last write time
+/// is not fully updated until every handle used to write it has closed (`GetFileTime`), so a
+/// same-length write through a handle still open could leave a pin standing.
+///
 /// At most `bound` files are kept, the first kept forgotten first, each with one open
-/// descriptor at most; a file that cannot be opened or read, or is no longer private, is
-/// forgotten. Input bytes are scrubbed on eviction and drop; parsed values must themselves be
-/// suitable for retention.
-#[cfg(unix)]
+/// descriptor at most (on Windows none); a file that cannot be opened or read, or is no longer
+/// private, is forgotten. Input bytes are scrubbed on eviction and drop; parsed values must
+/// themselves be suitable for retention.
 pub struct KeptParse<T> {
     kept: Mutex<Vec<Kept<T>>>,
     bound: usize,
 }
 
-#[cfg(unix)]
 impl<T: Clone> KeptParse<T> {
     /// No parse kept yet, and none ever of more than `bound` files.
     #[must_use]
@@ -339,8 +350,8 @@ impl<T: Clone> KeptParse<T> {
 
     /// `parse` of `name` in `dir`, opened under [`read_private`]'s rules and held to the byte
     /// cap `max`: what `parse` said before of this very file where nothing wrote to it since
-    /// (no byte read), or of the exact bytes just read at that path. Parsing runs outside the
-    /// cache mutex.
+    /// (no byte read; Unix only), or of the exact bytes just read at that path. Parsing runs
+    /// outside the cache mutex.
     /// # Errors
     /// As [`read_private`]: the file is opened and judged at every call, a parse kept or not.
     pub fn read(
@@ -350,6 +361,7 @@ impl<T: Clone> KeptParse<T> {
         max: usize,
         parse: impl FnOnce(&[u8]) -> T,
     ) -> Result<T, PrivateFileError> {
+        #[cfg(unix)]
         let began = SystemTime::now();
         let path = dir.join(name);
         let (file, meta) = open_private(dir, name).inspect_err(|_| self.forget(&path))?;
@@ -358,7 +370,9 @@ impl<T: Clone> KeptParse<T> {
                 "longer than such a file can be",
             ));
         }
+        #[cfg(unix)]
         let stamp = Stamp::of(&meta);
+        #[cfg(unix)]
         if let Some(kept) = self.lock().iter().find(|kept| kept.path == path)
             && kept
                 .pin
@@ -376,17 +390,21 @@ impl<T: Clone> KeptParse<T> {
             .find(|kept| kept.path == path && kept.bytes.expose() == bytes.expose())
             .map(|kept| kept.parse.clone());
         let parsed = known.unwrap_or_else(|| parse(bytes.expose()));
+        #[cfg(unix)]
         let pin = pins(&file, &meta, stamp, began).then_some(Pin {
             _file: file,
             stamp,
             began,
         });
+        #[cfg(windows)]
+        drop(file);
         let mut kept = self.lock();
         kept.retain(|kept| kept.path != path);
         kept.push(Kept {
             path,
             bytes,
             parse: parsed.clone(),
+            #[cfg(unix)]
             pin,
         });
         let over = kept.len().saturating_sub(self.bound);
@@ -400,7 +418,7 @@ impl<T: Clone> KeptParse<T> {
     }
 
     /// How many kept parses hold their file open.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn pinned(&self) -> usize {
         self.lock().iter().filter(|kept| kept.pin.is_some()).count()
     }
@@ -563,8 +581,8 @@ enum DirIs {
 impl DirIs {
     /// This verdict as a trace's standing of its directory ([`dir_standing`]): a tag for the
     /// verdict, and an open directory's mode bits, which decide [`Opening::Owned`]'s reads.
-    fn standing(self) -> [u8; 32] {
-        let (tag, mode) = match self {
+    fn standing(&self) -> [u8; 32] {
+        let (tag, mode) = match *self {
             Self::Missing => (1, 0),
             Self::Private => (2, 0),
             Self::Open(mode) => (3, mode),
@@ -597,15 +615,16 @@ impl DirIs {
 impl DirIs {
     /// This verdict as a trace's standing of its directory ([`dir_standing`]): a tag for the
     /// verdict, and for a folder of the user's whose access list is not private the clause it
-    /// breaks, which [`check_dir_verdict`]'s refusal names.
-    fn standing(self) -> [u8; 32] {
+    /// breaks, which [`check_dir_verdict`]'s refusal names. The folder the verdict holds is no
+    /// part of it.
+    fn standing(&self) -> [u8; 32] {
         let (tag, why) = match self {
             Self::Missing => (1, ""),
-            Self::Private => (2, ""),
-            Self::Open(why) => (3, why),
+            Self::Private(_) => (2, ""),
+            Self::Open(why, _) => (3, *why),
             Self::Reparse => (4, ""),
             Self::NotDir => (5, ""),
-            Self::Others => (6, ""),
+            Self::Others(_) => (6, ""),
         };
         let mut digest = aterm_digest::Sha256::new();
         digest.update([tag]);
@@ -643,7 +662,7 @@ fn dir_is(dir: &Path) -> io::Result<DirIs> {
 /// A trace's standing of the directory `dir` a read judged ([`DirIs::standing`] of its
 /// [`dir_is`] now): `None` where it could not be judged.
 fn dir_standing(dir: &Path) -> Option<[u8; 32]> {
-    dir_is(dir).ok().map(DirIs::standing)
+    dir_is(dir).ok().as_ref().map(DirIs::standing)
 }
 
 /// [`dir_is`] for a read of a file in `dir`: with a trace scope armed on this thread, the
@@ -652,7 +671,7 @@ fn dir_standing(dir: &Path) -> Option<[u8; 32]> {
 fn dir_is_read(dir: &Path) -> io::Result<DirIs> {
     let judged = dir_is(dir);
     if crate::trace::armed() {
-        let value = judged.as_ref().ok().copied().map(DirIs::standing);
+        let value = judged.as_ref().ok().map(DirIs::standing);
         crate::trace::standing(dir, value, dir_standing);
         if let Err(error) = &judged {
             crate::trace::fs::failed(dir, error);
@@ -691,7 +710,8 @@ fn dir_is_opened(dir: &Path) -> io::Result<DirIs> {
 /// files open and read with one directory check between them instead of one each; each file
 /// is still looked up, opened and judged on its open descriptor as [`open_private`] does.
 /// aterm-journal's per-access `intact` check opens four. The verdict is the directory's when
-/// [`JudgedDir::judge`] took it: use it for opens made at once, never across a wait.
+/// [`JudgedDir::judge`] took it: use it for opens made at once, never across a wait. On Windows
+/// the folder it judged is held open meanwhile, and each file is opened relative to it.
 pub struct JudgedDir<'a> {
     dir: &'a Path,
     judged: DirIs,
@@ -700,7 +720,12 @@ pub struct JudgedDir<'a> {
 #[cfg(unix)]
 #[path = "private_file_dir.rs"]
 mod directory;
-#[cfg(unix)]
+/// The Windows arm of [`PrivateDirectory`] and [`DirectoryView`]: a folder held by a handle of
+/// its own and every file opened relative to it.
+#[cfg(windows)]
+#[path = "private_file_dir_win.rs"]
+mod directory;
+#[cfg(any(unix, windows))]
 pub use directory::{DirectoryView, PrivateDirectory};
 
 impl<'a> JudgedDir<'a> {
@@ -721,7 +746,7 @@ impl<'a> JudgedDir<'a> {
     /// As [`check_private_dir`].
     pub fn private(dir: &'a Path) -> io::Result<Self> {
         let judged = dir_is_read(dir)?;
-        check_dir_verdict(dir, judged)?;
+        check_dir_verdict(dir, &judged)?;
         Ok(Self { dir, judged })
     }
 
@@ -729,7 +754,7 @@ impl<'a> JudgedDir<'a> {
     /// [`Self::judge`] took its verdict.
     #[must_use]
     pub fn is_private(&self) -> bool {
-        matches!(self.judged, DirIs::Private)
+        matches!(self.judged, DirIs::Private { .. })
     }
 
     /// Whether `dir` did not exist when [`Self::judge`] took its verdict.
@@ -745,7 +770,8 @@ impl<'a> JudgedDir<'a> {
         if !one_component(name) {
             return Err(PrivateFileError::Malformed(ONE_COMPONENT));
         }
-        open_in(self.dir, self.judged, name, Opening::Read).map(|(file, meta, _loose)| (file, meta))
+        open_in(self.dir, &self.judged, name, Opening::Read)
+            .map(|(file, meta, _loose)| (file, meta))
     }
 
     /// [`read_private`] of `name` under this verdict.
@@ -818,11 +844,12 @@ pub fn open_private(
 /// `name` directly in `dir`, under `dir`'s verdict (a read-write opening's from [`dir_is`], any
 /// other's from `dir_is_read`, which records it in a trace scope armed on this thread): on Unix
 /// taken from the directory's attributes where they decide it, so the directory is opened only
-/// where they cannot; on Windows from the folder opened as itself. The file is opened as `how`
-/// says and judged on its open descriptor, never by a second `stat` by path (on Unix by
-/// astream-sys's owner-only rule, on Windows by the arm's, `acl::owner_only`), and the answer
-/// says whether a group or other read bit was set on the file or its directory: only Unix's
-/// `Opening::Owned` lets one through, and on Windows, which has no such bit, it is `false`.
+/// where they cannot; on Windows from the folder opened as itself, whose handle the verdict
+/// holds and the file is opened relative to. The file is opened as `how` says and judged on its
+/// open descriptor, never by a second `stat` by path (on Unix by astream-sys's owner-only rule,
+/// on Windows by the arm's, `acl::owner_only`), and the answer says whether another account may
+/// read the file or its directory: only `Opening::Owned` lets that through (on Unix a group or
+/// other read bit, on Windows an allow entry that only reads).
 fn open_judged(
     dir: &Path,
     name: &str,
@@ -837,7 +864,7 @@ fn open_judged(
         dir_is_read(dir)
     }
     .map_err(PrivateFileError::Io)?;
-    open_in(dir, judged, name, how)
+    open_in(dir, &judged, name, how)
 }
 
 /// [`open_judged`] once `name` is known to be one component and `dir` has been judged:
@@ -852,7 +879,7 @@ fn open_judged(
 /// recorded too.
 fn open_in(
     dir: &Path,
-    judged: DirIs,
+    judged: &DirIs,
     name: &str,
     how: Opening,
 ) -> Result<(std::fs::File, std::fs::Metadata, bool), PrivateFileError> {
@@ -872,10 +899,11 @@ fn open_in(
 #[cfg(unix)]
 fn open_at(
     dir: &Path,
-    judged: DirIs,
+    judged: &DirIs,
     name: &str,
     how: Opening,
 ) -> Result<(std::fs::File, std::fs::Metadata, bool), PrivateFileError> {
+    let judged = *judged;
     match judged {
         DirIs::Missing => return Err(PrivateFileError::Missing),
         DirIs::Symlink => return Err(PrivateFileError::Symlink),
@@ -989,48 +1017,73 @@ fn open_rw_created_0600(path: &Path, flags: libc::c_int) -> io::Result<std::fs::
 /// As [`read_private`]; a missing file is created exactly 0600 whatever the umask, not
 /// `Missing` (that only for one removed between the creating open and the plain one, or
 /// replaced or removed after its open). On Windows a missing file is created with the token
-/// user's protected access list (`acl::owner_only_descriptor`), and an elevated process is
-/// refused ([`ELEVATED`]) before anything is opened.
+/// user's protected access list (`acl::owner_only_descriptor`) at its creation, relative to the
+/// folder the judgement held, an elevated process's included.
 pub fn open_private_rw(dir: &Path, name: &str) -> Result<std::fs::File, PrivateFileError> {
     open_judged(dir, name, Opening::ReadWrite).map(|(file, _meta, _loose)| file)
 }
 
-/// Byte count and `(dev, ino)` identity read by [`read_private_into`].
+/// A file's inode number on Unix, and on Windows its file id (`FILE_ID_INFO.FileId`, which ReFS
+/// makes 128 bits wide): what [`PrivateRead::ino`] and [`OwnedRead::ino`] hold.
 #[cfg(unix)]
+pub type Ino = u64;
+/// A file's inode number on Unix, and on Windows its file id (`FILE_ID_INFO.FileId`, which ReFS
+/// makes 128 bits wide): what [`PrivateRead::ino`] and [`OwnedRead::ino`] hold.
+#[cfg(windows)]
+pub type Ino = u128;
+
+/// The identity of the open `file` whose descriptor read `meta`: on Unix its device and inode
+/// from that `fstat`; on Windows its volume's serial number and its file id, read off the
+/// handle ([`aterm_dirfd::file_id`]).
+#[cfg(unix)]
+fn identity(
+    _file: &std::fs::File,
+    meta: &std::fs::Metadata,
+) -> Result<(u64, Ino), PrivateFileError> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// The identity of the open `file` whose descriptor read `meta`: on Unix its device and inode
+/// from that `fstat`; on Windows its volume's serial number and its file id, read off the
+/// handle ([`aterm_dirfd::file_id`]).
+#[cfg(windows)]
+fn identity(
+    file: &std::fs::File,
+    _meta: &std::fs::Metadata,
+) -> Result<(u64, Ino), PrivateFileError> {
+    win::identity(file).map(|id| (id.dev, id.ino))
+}
+
+/// Byte count and `(dev, ino)` identity read by [`read_private_into`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrivateRead {
     /// Number of bytes read into the caller's buffer.
     pub len: usize,
-    /// Device ID from `fstat`.
+    /// Device ID from `fstat`; on Windows the volume's serial number.
     pub dev: u64,
-    /// Inode number from `fstat`.
-    pub ino: u64,
+    /// Inode number from `fstat`; on Windows the file id ([`Ino`]).
+    pub ino: Ino,
 }
 
 /// Reads `name` in `dir` into `buf` (up to `max` bytes) and returns [`PrivateRead`].
 /// # Errors
 /// Returns [`PrivateFileError`] if privacy checks fail or the file exceeds `max`/`buf.len()`.
-#[cfg(unix)]
 pub fn read_private_into(
     dir: &Path,
     name: &str,
     max: usize,
     buf: &mut [u8],
 ) -> Result<PrivateRead, PrivateFileError> {
-    use std::os::unix::fs::MetadataExt as _;
     let (mut file, meta) = open_private(dir, name)?;
+    let (dev, ino) = identity(&file, &meta)?;
     let len = read_capped_into(&mut file, meta.len(), max, buf, name)?;
-    Ok(PrivateRead {
-        len,
-        dev: meta.dev(),
-        ino: meta.ino(),
-    })
+    Ok(PrivateRead { len, dev, ino })
 }
 
 /// Reads `name` in `dir` up to `max` bytes under [`read_owned_into`]'s rules.
 /// # Errors
 /// As [`read_owned_into`].
-#[cfg(unix)]
 pub fn read_owned(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
     let (file, meta, _loose) = open_judged(dir, name, Opening::Owned)?;
     read_capped_with_len(&file, meta.len(), max, name)
@@ -1038,16 +1091,16 @@ pub fn read_owned(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, Private
 
 /// What [`read_owned_into`] read: the length, the file's identity, and whether the file or
 /// its directory had a group or other read bit.
-#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedRead {
     /// Bytes read into the caller's buffer.
     pub len: usize,
-    /// The file's device.
+    /// The file's device; on Windows its volume's serial number.
     pub dev: u64,
-    /// The file's inode.
-    pub ino: u64,
-    /// The file or its directory is group- or world-readable.
+    /// The file's inode; on Windows its file id ([`Ino`]).
+    pub ino: Ino,
+    /// The file or its directory is group- or world-readable; on Windows, an allow entry lets
+    /// another account read it.
     pub loose: bool,
 }
 
@@ -1060,27 +1113,34 @@ pub struct OwnedRead {
 /// - a second link;
 /// - a group or other **write** bit on either.
 ///
+/// On Windows, which has no mode bits, the loosening is in the access lists of the file and
+/// its folder: each may take entries from its folder and hold inherited ones, and may let other
+/// accounts read (`loose` says so), but no entry may let an account other than the user,
+/// SYSTEM and Administrators (the accounts Unix's root stands for) write; and each must be the
+/// user's, as on Unix.
+///
 /// Use this for owned metadata whose read bits may remain open, including legacy
 /// profiles. Credentials still require [`read_private_into`]'s strict read mode.
 ///
 /// # Errors
 ///
 /// As [`read_private_into`], except that a group or other write bit on the file or its
-/// directory is [`PrivateFileError::Writable`].
-#[cfg(unix)]
+/// directory is [`PrivateFileError::Writable`]; on Windows an entry that lets another account
+/// write is [`PrivateFileError::NotPrivate`] with [`OTHERS_WRITE`] (the folder's says so of the
+/// directory).
 pub fn read_owned_into(
     dir: &Path,
     name: &str,
     max: usize,
     buf: &mut [u8],
 ) -> Result<OwnedRead, PrivateFileError> {
-    use std::os::unix::fs::MetadataExt as _;
     let (mut file, meta, loose) = open_judged(dir, name, Opening::Owned)?;
+    let (dev, ino) = identity(&file, &meta)?;
     let len = read_capped_into(&mut file, meta.len(), max, buf, name)?;
     Ok(OwnedRead {
         len,
-        dev: meta.dev(),
-        ino: meta.ino(),
+        dev,
+        ino,
         loose,
     })
 }
@@ -1088,7 +1148,6 @@ pub fn read_owned_into(
 /// The read [`read_private_into`] and [`read_owned_into`] share: at most `min(max,
 /// buf.len())` bytes into `buf`, a file past that cap `Malformed`, and on `Err` none of the
 /// file left in `buf`.
-#[cfg(unix)]
 fn read_capped_into(
     file: &mut std::fs::File,
     file_len: u64,
@@ -1219,9 +1278,36 @@ fn narrow_0700(dir: &Path) -> io::Result<()> {
 /// Change a real directory's mode through an open descriptor, recovering an
 /// unreadable directory with kernel-enforced nofollow chmod on permission denial.
 ///
+/// On Windows, which keeps an access list for a mode, a mode that grants the group and others
+/// nothing (0700, 0600) makes the folder its owner's alone in place, on a handle of the folder
+/// itself (never a link's target): the token user and SYSTEM under a protected list, passed on
+/// to what is made inside, as [`ensure_private_dir`] narrows one. A folder already so is left as
+/// it is.
+///
 /// # Errors
 /// Refuses non-directories and symlinks; returns open or chmod errors. There is
-/// no path-based chmod fallback when the platform cannot honor nofollow.
+/// no path-based chmod fallback when the platform cannot honor nofollow. On Windows, also
+/// `Unsupported` for a mode that grants the group or others anything, a reparse point
+/// (`PermissionDenied`), and another account's folder, which only its owner changes.
+#[cfg(windows)]
+pub fn set_dir_mode_nofollow(dir: &Path, mode: u32) -> io::Result<()> {
+    win::set_dir_mode_nofollow(dir, mode)
+}
+
+/// Change a real directory's mode through an open descriptor, recovering an
+/// unreadable directory with kernel-enforced nofollow chmod on permission denial.
+///
+/// On Windows, which keeps an access list for a mode, a mode that grants the group and others
+/// nothing (0700, 0600) makes the folder its owner's alone in place, on a handle of the folder
+/// itself (never a link's target): the token user and SYSTEM under a protected list, passed on
+/// to what is made inside, as [`ensure_private_dir`] narrows one. A folder already so is left as
+/// it is.
+///
+/// # Errors
+/// Refuses non-directories and symlinks; returns open or chmod errors. There is
+/// no path-based chmod fallback when the platform cannot honor nofollow. On Windows, also
+/// `Unsupported` for a mode that grants the group or others anything, a reparse point
+/// (`PermissionDenied`), and another account's folder, which only its owner changes.
 #[cfg(unix)]
 pub fn set_dir_mode_nofollow(dir: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -1314,11 +1400,11 @@ fn ensure_private_dir_by(
 /// # Errors
 /// Returns an error if `dir` is missing, loose, symlinked, not owned, or has ACL grants.
 pub fn check_private_dir(dir: &Path) -> io::Result<()> {
-    check_dir_verdict(dir, dir_is(dir)?)
+    check_dir_verdict(dir, &dir_is(dir)?)
 }
 
 #[cfg(unix)]
-fn check_dir_verdict(dir: &Path, verdict: DirIs) -> io::Result<()> {
+fn check_dir_verdict(dir: &Path, verdict: &DirIs) -> io::Result<()> {
     let refused = |why: &dyn fmt::Display| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1375,10 +1461,11 @@ pub fn check_owned_dir(dir: &Path) -> io::Result<()> {
 /// The descriptor a new private FILE is made with on Windows, for a writer that makes its own
 /// (aterm-secrets' `fsx`): owned by the token user under a protected list of the user and SYSTEM
 /// alone ([`crate::acl::owner_only_descriptor`]), passed at the file's creation
-/// ([`crate::atomic_file::create_temp_secured`], [`crate::acl::create_file`]).
+/// ([`crate::atomic_file::create_temp_secured`], [`crate::acl::create_file`]). Such a writer
+/// makes its file by path, so an elevated process is refused it ([`ELEVATED`]).
 /// # Errors
-/// [`ELEVATED`] in an elevated process, which makes no private file; the token's user could not
-/// be read or the descriptor built.
+/// [`ELEVATED`] in an elevated process; the token's user could not be read or the descriptor
+/// built.
 #[cfg(windows)]
 pub fn new_file_descriptor() -> io::Result<crate::acl::Descriptor> {
     win::refuse_elevated()?;
@@ -1387,22 +1474,27 @@ pub fn new_file_descriptor() -> io::Result<crate::acl::Descriptor> {
 
 /// Atomically writes `bytes` to `name` in private directory `dir` with mode `0600`; on Windows,
 /// through a temporary made with the token user's protected access list (owner the token user,
-/// full access for the user and SYSTEM alone) at its creation, so the file never has another.
+/// full access for the user and SYSTEM alone) at its creation, so the file never has another,
+/// in the folder `dir`'s judgement held open and renamed relative to it (an elevated process's
+/// write included).
 /// # Errors
-/// Returns an error if `name` spans multiple components, `dir` is not private, or write fails;
-/// on Windows, [`ELEVATED`] in an elevated process.
+/// Returns an error if `name` spans multiple components, `dir` is not private, or write fails.
 pub fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     one_component_io(name)?;
-    #[cfg(windows)]
-    win::refuse_elevated()?;
-    check_private_dir(dir)?;
     #[cfg(unix)]
     {
+        check_private_dir(dir)?;
         crate::atomic_file::write(&dir.join(name), bytes, 0o600)
     }
     #[cfg(windows)]
     {
-        crate::atomic_file::write_secured(&dir.join(name), bytes, win::file_descriptor()?)
+        let folder = win::private_folder(dir)?;
+        let flushing = win::Flushing {
+            flush: aterm_durable::Flush::Durable,
+            diagnose: false,
+        };
+        let landed = win::write_in(&folder, &dir.join(name), name, bytes, flushing, || Ok(()))?;
+        aterm_durable::DirFlushed::classify(landed).map(drop)
     }
 }
 
@@ -1421,22 +1513,21 @@ pub fn write_private_flushed(
     flush: aterm_durable::Flush,
 ) -> io::Result<()> {
     one_component_io(name)?;
-    #[cfg(windows)]
-    win::refuse_elevated()?;
-    check_private_dir(dir)
-        .map_err(|error| crate::atomic_file::write_error("check private directory", dir, error))?;
+    let checked = |error| crate::atomic_file::write_error("check private directory", dir, error);
     #[cfg(unix)]
     {
+        check_private_dir(dir).map_err(checked)?;
         crate::atomic_file::write_entry_flushed(&dir.join(name), bytes, 0o600, flush)
     }
     #[cfg(windows)]
     {
-        crate::atomic_file::write_entry_secured(
-            &dir.join(name),
-            bytes,
-            win::file_descriptor()?,
+        let folder = win::private_folder(dir).map_err(checked)?;
+        let flushing = win::Flushing {
             flush,
-        )
+            diagnose: true,
+        };
+        win::write_in(&folder, &dir.join(name), name, bytes, flushing, || Ok(()))?
+            .map_err(|error| crate::atomic_file::write_error("flush directory", dir, error))
     }
 }
 
@@ -1455,75 +1546,84 @@ pub fn write_private_flushed(
 /// Answers whether it wrote: `false` when `name` already exists, which is left as it was.
 ///
 /// On Windows the temporary is made with the token user's protected access list at its
-/// creation, as [`write_private`]'s is.
+/// creation, as [`write_private`]'s is, in the folder `dir`'s judgement held open, and linked
+/// and removed relative to it.
 /// # Errors
 /// Returns an error if `name` spans multiple components, `dir` is not private, or `prepare`, a
 /// write or a flush fails; `name` then does not exist unless it did before, or the flush of the
-/// directory failed after the name was made. On Windows, [`ELEVATED`] in an elevated process.
+/// directory failed after the name was made.
 pub fn write_private_new(
     dir: &Path,
     name: &str,
     bytes: &[u8],
     prepare: impl FnOnce(&std::fs::File) -> io::Result<()>,
 ) -> io::Result<bool> {
-    use std::io::Write as _;
     one_component_io(name)?;
     #[cfg(windows)]
-    win::refuse_elevated()?;
-    check_private_dir(dir)?;
-    let path = dir.join(name);
-    #[cfg(unix)]
-    let (temp, mut file) = crate::atomic_file::create_temp_beside(&path, 0o600)?;
-    #[cfg(windows)]
-    let (temp, mut file) =
-        crate::atomic_file::create_temp_secured(&path, &win::file_descriptor()?)?;
-    let linked = (|| {
-        prepare(&file)?;
-        file.write_all(bytes)?;
-        aterm_durable::Flush::Durable.file(&file)?;
-        // A hard link fails on a name that exists, where a rename would replace it.
-        std::fs::hard_link(&temp, &path)
-    })();
-    let removed = std::fs::remove_file(&temp);
-    match linked {
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
-        other => other?,
+    {
+        let folder = win::private_folder(dir)?;
+        win::write_new_in(&folder, name, bytes, prepare)
     }
-    removed?;
-    aterm_durable::Flush::Durable.dir(dir)?;
-    Ok(true)
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        check_private_dir(dir)?;
+        let path = dir.join(name);
+        let (temp, mut file) = crate::atomic_file::create_temp_beside(&path, 0o600)?;
+        let linked = (|| {
+            prepare(&file)?;
+            file.write_all(bytes)?;
+            aterm_durable::Flush::Durable.file(&file)?;
+            // A hard link fails on a name that exists, where a rename would replace it.
+            std::fs::hard_link(&temp, &path)
+        })();
+        let removed = std::fs::remove_file(&temp);
+        match linked {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+            other => other?,
+        }
+        removed?;
+        aterm_durable::Flush::Durable.dir(dir)?;
+        Ok(true)
+    }
 }
 
 /// Removes single-component file `name` from `dir`, returning `Ok(true)` if it existed (none does where `dir` is no directory).
+/// On Windows `name` is removed as itself, relative to the folder `dir`'s judgement held open.
 /// # Errors
-/// Returns an error if `name` spans multiple components, `dir` is a symlink or owned by another user, or unlinking fails; on Windows, also in an elevated process ([`ELEVATED`]).
+/// Returns an error if `name` spans multiple components, `dir` is a symlink or owned by another user, or unlinking fails.
 pub fn remove_private(dir: &Path, name: &str) -> io::Result<bool> {
     one_component_io(name)?;
     #[cfg(windows)]
-    win::refuse_elevated()?;
-    match check_owned_dir(dir) {
-        Ok(()) => {}
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(false);
-        }
-        Err(e) => return Err(e),
+    {
+        win::remove_private(dir, name)
     }
-    match std::fs::remove_file(dir.join(name)) {
-        Ok(()) => Ok(true),
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(false)
+    #[cfg(unix)]
+    {
+        match check_owned_dir(dir) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => Err(e),
+        match std::fs::remove_file(dir.join(name)) {
+            Ok(()) => Ok(true),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1542,7 +1642,7 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         },
-        other => return check_dir_verdict(dir, other),
+        other => return check_dir_verdict(dir, &other),
     }
     check_private_dir(dir)
 }
@@ -1560,10 +1660,13 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
 /// - **How it is released.** `LOCK_UN` in `Drop`, before the close. That is `clippy.toml`'s
 ///   flock release rule: a lock let go by dropping its `File` stays held in every child
 ///   forked meanwhile.
-/// - **On Windows** the file is created with the token user's protected access list, opened as
-///   itself (a reparse point is refused, never followed), and locked with `LockFileEx`, which is
-///   mandatory: the lock file holds nothing but the lock. An elevated process is refused
-///   ([`ELEVATED`]).
+/// - **On Windows** the file is opened relative to the folder `dir`'s judgement held open,
+///   created with the token user's protected access list where missing, opened as itself (a
+///   reparse point is refused, never followed), judged on its handle under the private rule
+///   (the user's, a protected list of the user and SYSTEM alone, one name) as
+///   [`take_private`](Self::take_private) judges it on Unix, and locked with `LockFileEx`, which
+///   is mandatory: the lock file holds nothing but the lock, and no lock is taken on a file that
+///   is not private (an elevated process's on another account's file a link put there, say).
 pub struct PrivateLock(std::fs::File);
 
 /// Duplicates share this lock description, including after this process dies.
@@ -1783,22 +1886,21 @@ impl PrivateLock {
     }
 
     /// The lock file `<dir>/<name>`, admitted as [`take`](Self::take) says, not yet locked:
-    /// made with the token user's protected access list where missing, opened as itself, and
-    /// refused where it is anything but a plain file (a folder, a reparse point).
+    /// opened relative to the folder `dir`'s judgement held, made with the token user's
+    /// protected access list where missing, opened as itself, and refused where it is anything
+    /// but a plain file (a folder: `InvalidData`; a reparse point) or is not private.
     #[cfg(windows)]
     fn open(dir: &Path, name: &str) -> io::Result<std::fs::File> {
         one_component_io(name)?;
-        win::refuse_elevated()?;
-        check_private_dir(dir)?;
-        let path = dir.join(name);
-        let file = win::open_rw_created(&path)?;
-        if !win::plain_file(&file)? {
-            return Err(io::Error::new(
+        let folder = win::private_folder(dir)?;
+        match win::open_relative(&folder, name, Opening::ReadWrite) {
+            Ok((file, _meta, _loose)) => Ok(file),
+            Err(PrivateFileError::Malformed(_)) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{} is no regular file", path.display()),
-            ));
+                format!("{} is no regular file", dir.join(name).display()),
+            )),
+            Err(error) => Err(Self::private_error(error)),
         }
-        Ok(file)
     }
 }
 
@@ -1906,6 +2008,39 @@ pub mod tally {
                 }
             }
         });
+    }
+}
+
+/// Whether this thread's calls here take this process as elevated, on Windows, where an
+/// elevated process (an administrator's full token) is judged apart ([`ELEVATED`],
+/// [`ELEVATED_PARENT`]): the seam a test of that case runs under on a host that is not.
+#[cfg(all(windows, any(test, debug_assertions)))]
+pub mod elevated {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HERE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// Whether this thread says this process is elevated (`None`: it says nothing, and the
+    /// token decides).
+    pub(super) fn here() -> Option<bool> {
+        HERE.get()
+    }
+
+    /// Puts the thread's word back as a run ends, a panic's unwinding included.
+    struct Back(Option<bool>);
+
+    impl Drop for Back {
+        fn drop(&mut self) {
+            HERE.set(self.0);
+        }
+    }
+
+    /// `run`'s result, with this thread's calls here taking this process as elevated meanwhile.
+    pub fn as_elevated<R>(run: impl FnOnce() -> R) -> R {
+        let _back = Back(HERE.replace(Some(true)));
+        run()
     }
 }
 

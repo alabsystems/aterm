@@ -27,6 +27,9 @@ pub mod windows;
 pub mod windows_pull;
 
 pub(crate) const ARM64: &str = "aarch64-apple-darwin";
+/// Dirty-unit diagnostics from the pinned native Targo and compatibility Cargo drivers.
+pub(crate) const FINGERPRINT_LOG: &str =
+    "targo_core::compiler::fingerprint=info,cargo::compiler::fingerprint=info";
 pub(crate) const X86_64: &str = "x86_64-apple-darwin";
 const NATIVE_SLICE: &str = "native";
 const COMPAT_CHECK_SLICE: &str = "x86_64-check";
@@ -378,8 +381,9 @@ fn validate_release_rustup_shim_dir(
 }
 
 /// What a STOCK EXCEPTION child runs under: rustup's home, and by name the stock release a
-/// `trust.lock` names ([`crate::trust_lock::stock_toolchain`]), never rustup's `stable`. Every
-/// stock child the release starts takes its rustup environment from here ([`Stock::env`]).
+/// `trust.lock` names ([`crate::trust_lock::stock_toolchain`]), never rustup's `stable`, with
+/// rustup's auto-install off ([`AUTO_INSTALL_OFF`]). Every stock child the release starts takes
+/// its rustup environment from here ([`Stock::env`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Stock {
     home: OsString,
@@ -441,15 +445,26 @@ impl Stock {
         }
     }
 
-    /// `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN`: what selects the stock compiler behind the rustup
-    /// shim.
-    pub(crate) fn env(&self) -> [(&'static str, OsString); 2] {
+    /// `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN`, what selects the stock compiler behind the rustup
+    /// shim, and [`AUTO_INSTALL_OFF`], so a release this home lacks is a refusal rather than an
+    /// install.
+    pub(crate) fn env(&self) -> [(&'static str, OsString); 3] {
         [
             ("RUSTUP_HOME", self.rustup_home.clone()),
             ("RUSTUP_TOOLCHAIN", OsString::from(&self.toolchain)),
+            (AUTO_INSTALL_OFF.0, OsString::from(AUTO_INSTALL_OFF.1)),
         ]
     }
 }
+
+/// `RUSTUP_AUTO_INSTALL=0`, which every rustup child the release starts carries (rustup 1.28 on
+/// reads it): rustup otherwise installs a `RUSTUP_TOOLCHAIN` its home lacks before it answers,
+/// so a read-only probe (`ship provision --check`'s x86 slice, `ship check --compat`, `ship
+/// inputs`, a dry run's audit) would download a whole toolchain into the account's rustup home
+/// and still fail for the std it lacks. What puts the release in place is `verify provision`'s
+/// rustup row ([`aterm_verify::provision::stock::run_release`] alone, in a real cut before
+/// anything reads the release and in a Linux worker before it builds), by name.
+pub(crate) const AUTO_INSTALL_OFF: (&str, &str) = ("RUSTUP_AUTO_INSTALL", "0");
 
 fn release_rustup_home(home: &std::ffi::OsStr) -> Result<OsString, String> {
     let value = atpkg::seam::rustup_home_with(
@@ -665,9 +680,9 @@ impl Take {
         }
         let release_uid = current_release_uid()?;
         let target_root = cache.target();
-        snapshot::private_dir(&target_root, "release target")?;
+        snapshot::private_build_dir(&target_root, "release target")?;
         let temporary_dir = cache.tmp();
-        snapshot::private_dir(&temporary_dir, "release temporary directory")?;
+        snapshot::private_build_dir(&temporary_dir, "release temporary directory")?;
         let cargo_home = cache.build_cargo_home();
         let stage = cache.stage();
         for fresh in [&cargo_home, &stage] {
@@ -676,11 +691,11 @@ impl Take {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(format!("clear {}: {error}", fresh.display())),
             }
-            snapshot::private_dir(fresh, "release build directory")?;
+            snapshot::private_build_dir(fresh, "release build directory")?;
         }
         for slice in [NATIVE_SLICE, X86_64] {
-            snapshot::private_dir(&target_root.join(slice), "release slice target")?;
-            snapshot::private_dir(&cargo_home.join(slice), "release slice CARGO_HOME")?;
+            snapshot::private_build_dir(&target_root.join(slice), "release slice target")?;
+            snapshot::private_build_dir(&cargo_home.join(slice), "release slice CARGO_HOME")?;
         }
         let short_commit =
             snapshot::git_text(repo_root, &["rev-parse", "--short=12", &snapshot.commit])
@@ -740,6 +755,29 @@ impl Take {
             .as_ref()
             .ok_or("a universal take has no selected stock compiler context")?
             .stock()
+    }
+
+    /// That C's stock release, in the namespace captured with C's compiler roles
+    /// ([`Take::stock_context`]), carries `triple`'s std, before a slice builds on it
+    /// ([`require_rustup_target_in`]).
+    ///
+    /// # Errors
+    /// What [`Take::stock_context`] refuses, and the release or its std missing, naming what
+    /// installs C's release ([`stock_install_remedy`], held to the lock of the checkout this
+    /// process runs in).
+    pub(crate) fn require_stock_target(&self, triple: &str) -> Result<(), String> {
+        let stock = self.stock_context()?;
+        require_rustup_target_in(stock, triple).map_err(|why| {
+            let checkout = crate::trust_lock::checkout_stock_toolchain().ok();
+            format!(
+                "{why} — {}",
+                stock_install_remedy(
+                    stock.toolchain(),
+                    &self.snapshot.commit,
+                    checkout.as_deref()
+                )
+            )
+        })
     }
 
     /// What slice `run` of this take builds under ([`release_env`]), its lane's tool `path`
@@ -1055,7 +1093,7 @@ pub(crate) struct SliceMemoryForecast {
 }
 
 enum ParentLook {
-    Admitted(Option<aterm_capacity::Reading>),
+    Admitted(Option<aterm_capacity::Reading>, aterm_capacity::Claim),
     Waiting(Option<aterm_capacity::Reading>, aterm_capacity::Shortfall),
 }
 
@@ -1109,7 +1147,8 @@ fn available_words(reading: Option<&aterm_capacity::Reading>) -> String {
 
 /// Poll one of qualify's actual parent needs once. The temporary queue row is necessary for the
 /// same ledger turn, claim ordering, process credit and passing rules as live admission; every
-/// returned waiter or claim is dropped before another plan is sampled.
+/// returned waiter is dropped. The caller keeps an admitted claim when selecting an actual
+/// parent, or drops it after reading the forecast.
 fn look_at_slice_parent(
     ledger: &aterm_capacity::Ledger,
     machine: &dyn aterm_capacity::Machine,
@@ -1123,16 +1162,40 @@ fn look_at_slice_parent(
         .poll(&sample);
     let reading = sample.reading.into_inner();
     match polled {
-        Polled::Admitted(claim) => {
-            drop(claim);
-            Ok(ParentLook::Admitted(reading))
-        }
+        Polled::Admitted(claim) => Ok(ParentLook::Admitted(reading, claim)),
         Polled::Waiting(waiter, short) => {
             drop(waiter);
             Ok(ParentLook::Waiting(reading, short))
         }
         Polled::Gone(error) => Err(error.to_string()),
         Polled::Unqualified(issue) => Err(format!("slice memory unqualified: {issue:?}")),
+    }
+}
+
+struct ParallelLinkParent {
+    units: Vec<crate::slice_units::Units>,
+    claim: aterm_capacity::Claim,
+    reading: Option<aterm_capacity::Reading>,
+}
+
+/// Try the larger measured envelope once, through the normal ledger under normal pressure.
+/// If it would wait, leave no reservation and let the ordinary shared/serial ladder decide.
+fn try_parallel_link_parent(
+    ledger: &aterm_capacity::Ledger,
+    machine: &dyn aterm_capacity::Machine,
+    units: &[crate::slice_units::Units],
+    at_once: u64,
+) -> Result<Option<ParallelLinkParent>, String> {
+    let Some((units, need)) = crate::slice_units::parallel_links(units, at_once) else {
+        return Ok(None);
+    };
+    match look_at_slice_parent(ledger, machine, need, true)? {
+        ParentLook::Admitted(reading, claim) => Ok(Some(ParallelLinkParent {
+            units,
+            claim,
+            reading,
+        })),
+        ParentLook::Waiting(..) => Ok(None),
     }
 }
 
@@ -1148,7 +1211,7 @@ pub(crate) fn slice_memory_forecast_for_needs_in(
     let shared_bytes = shared.mem;
     let serial_bytes = serial.mem;
     match look_at_slice_parent(ledger, machine, shared, false)? {
-        ParentLook::Admitted(reading) => Ok(SliceMemoryForecast {
+        ParentLook::Admitted(reading, _) => Ok(SliceMemoryForecast {
             outcome: SliceMemoryOutcome::Shared,
             line: format!(
                 "qualify slice memory: shared admits now — {} parent, {}",
@@ -1170,7 +1233,7 @@ pub(crate) fn slice_memory_forecast_for_needs_in(
                 });
             }
             match look_at_slice_parent(ledger, machine, serial, true)? {
-                ParentLook::Admitted(reading) => Ok(SliceMemoryForecast {
+                ParentLook::Admitted(reading, _) => Ok(SliceMemoryForecast {
                     outcome: SliceMemoryOutcome::Serial,
                     line: format!(
                         "qualify slice memory: shared {} parent is short ({shared_short}); after 60s it degrades to serial and admits — {} parent, {}",
@@ -1217,6 +1280,16 @@ pub(crate) fn slice_memory_forecast_in(
     machine: &dyn aterm_capacity::Machine,
     units: &[crate::slice_units::Units],
 ) -> Result<SliceMemoryForecast, String> {
+    if let Some(wide) = try_parallel_link_parent(ledger, machine, units, 2)? {
+        return Ok(SliceMemoryForecast {
+            outcome: SliceMemoryOutcome::Shared,
+            line: format!(
+                "qualify slice memory: both final links fit now — {} parent, {}",
+                aterm_capacity::size(wide.claim.record().need.mem),
+                available_words(wide.reading.as_ref())
+            ),
+        });
+    }
     match (
         crate::slice_units::shared_need(units, 2),
         crate::slice_units::serial_need(units),
@@ -1232,7 +1305,7 @@ pub(crate) fn slice_memory_forecast_in(
             let bytes = need.mem;
             let what = need.what.clone();
             match look_at_slice_parent(ledger, machine, need, false)? {
-                ParentLook::Admitted(reading) => Ok(SliceMemoryForecast {
+                ParentLook::Admitted(reading, _) => Ok(SliceMemoryForecast {
                     outcome: SliceMemoryOutcome::Exclusive,
                     line: format!(
                         "qualify slice memory: the compiler-unit book is unmeasured, so no shared or serial parent is valid; continuous exclusive learning admits {what}'s {} claim alone now — {}, and holds it through both serial slices",
@@ -1394,10 +1467,24 @@ fn admit_slice_parent_in(
 }
 
 fn admit_slice_parent(
+    units: &mut [crate::slice_units::Units],
+    at_once: u64,
     need: aterm_capacity::Need,
-    serial: aterm_capacity::Need,
 ) -> Result<(aterm_capacity::Claim, bool), String> {
     let ledger = aterm_capacity::Ledger::user().ok_or("no account capacity ledger")?;
+    if let Some(wide) = try_parallel_link_parent(&ledger, &aterm_capacity::Live, units, at_once)? {
+        println!(
+            "==> release slices: reserved one {} shared memory budget for both final links",
+            aterm_capacity::size(wide.claim.record().need.mem)
+        );
+        units.clone_from_slice(&wide.units);
+        return Ok((wide.claim, false));
+    }
+    println!(
+        "==> release slices: reserve one {} shared memory budget before either slice",
+        aterm_capacity::size(need.mem)
+    );
+    let serial = crate::slice_units::serial_need(units).ok_or("no serial slice budget")?;
     let started = Instant::now();
     admit_slice_parent_in(
         &ledger,
@@ -1420,7 +1507,7 @@ fn build_slices(
 ) -> Result<(Vec<PathBuf>, Vec<SliceBuild>), String> {
     crate::interrupt::install();
     // The x86_64 compat slice is the STOCK EXCEPTION (see the note at the file's head).
-    require_rustup_target_in(take.stock_context()?, X86_64)?;
+    take.require_stock_target(X86_64)?;
     let slice_pool = slice_pool(aterm_capacity::Jobserver::inherited(), || {
         own_slice_pool(&take.temporary_dir)
     })?;
@@ -1456,7 +1543,7 @@ fn build_slices(
         .suffix(".noindex")
         .tempdir_in(&take.temporary_dir)
         .map_err(|error| format!("release slice budget ledger: {error}"))?;
-    let units = crate::slice_units::Units::live(
+    let mut units = crate::slice_units::Units::live(
         &slices.map(|(triple, _, _)| triple),
         at_once,
         budget_ledger.path(),
@@ -1468,16 +1555,7 @@ fn build_slices(
     let shared_need = crate::slice_units::shared_need(&units, at_once);
     let shared = shared_need.is_some();
     let slice_parent = if let Some(need) = shared_need {
-        let (claim, degraded) = {
-            println!(
-                "==> release slices: reserve one {} shared memory budget before either slice",
-                aterm_capacity::size(need.mem)
-            );
-            admit_slice_parent(
-                need,
-                crate::slice_units::serial_need(&units).ok_or("no serial slice budget")?,
-            )?
-        };
+        let (claim, degraded) = admit_slice_parent(&mut units, at_once, need)?;
         serial |= degraded;
         claim
     } else {
@@ -1970,11 +2048,7 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
         ("TMPDIR", e.tmp.as_os_str().to_os_string()),
         ("CARGO_HOME", e.cargo_home.clone().into_os_string()),
         // Preserve the compiler's own reason for each reused or rebuilt unit in slice logs.
-        (
-            "CARGO_LOG",
-            "cargo::core::compiler::fingerprint=info,targo::core::compiler::fingerprint=info"
-                .into(),
-        ),
+        ("CARGO_LOG", FINGERPRINT_LOG.into()),
         // macOS links a constant placeholder: reservation and index identity are supplied
         // only to the post-link writer. Other platforms still compile their leaf stamp.
         (
@@ -2202,10 +2276,10 @@ pub(crate) fn contention_slices(
     warm: bool,
     ready: Option<std::sync::mpsc::Sender<aterm_json::Value>>,
 ) -> Result<ContentionBuild, String> {
-    require_rustup_target_in(take.stock_context()?, X86_64)?;
+    take.require_stock_target(X86_64)?;
     let budget_ledger = root.join("slice-memory-budget");
     snapshot::private_dir(&budget_ledger, "contention slice memory budget ledger")?;
-    let units = crate::slice_units::Units::live(&[ARM64, X86_64], 2, &budget_ledger);
+    let mut units = crate::slice_units::Units::live(&[ARM64, X86_64], 2, &budget_ledger);
     if units.len() != 2 {
         return Err("no account state directory for release compiler admission".to_owned());
     }
@@ -2214,10 +2288,7 @@ pub(crate) fn contention_slices(
     let shared_need = crate::slice_units::shared_need(&units, 2);
     let shared = shared_need.is_some();
     let (slice_parent, serial, cold) = if let Some(need) = shared_need {
-        let (claim, serial) = admit_slice_parent(
-            need,
-            crate::slice_units::serial_need(&units).ok_or("no serial slice budget")?,
-        )?;
+        let (claim, serial) = admit_slice_parent(&mut units, 2, need)?;
         (claim, serial, false)
     } else {
         let claim = aterm_capacity::admit(
@@ -2355,6 +2426,9 @@ pub(crate) fn pilot_build(
     let target_dir = root.join("build.noindex");
     std::fs::create_dir(&target_dir)
         .map_err(|e| format!("fresh pilot target {}: {e}", target_dir.display()))?;
+    aterm_uds::backup::Backups::SYSTEM
+        .build_dir(&target_dir)
+        .map_err(|e| format!("exclude pilot target {}: {e}", target_dir.display()))?;
     let log = root.join("build.log");
     let waiting = Instant::now();
     let mut previous_grant = None;
@@ -2691,7 +2765,7 @@ fn build_one(
 
 /// One static `cargo build --release --target <triple> -p <pkg>` on the stock release the take's trust.lock names (the STOCK EXCEPTION: the static bootstrap verifier, whose C library is linked in so it runs with no dynamic loader), in that triple's own target directory, and where its `bin` landed.
 /// # Errors
-/// A take whose commit names no stock release ([`Take::stock`]), no std of that release for `triple`, and a build that fails.
+/// A take whose commit names no stock release ([`Take::stock`]), no std of that release for `triple` ([`Take::require_stock_target`]), and a build that fails.
 pub(crate) fn build_static(
     plan: &BuildPlan,
     take: &Take,
@@ -2700,7 +2774,7 @@ pub(crate) fn build_static(
     triple: &str,
     log: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    require_rustup_target_in(take.stock_context()?, triple)?;
+    take.require_stock_target(triple)?;
     let target_dir = take.slice_target(Some(triple));
     let run = SliceRun {
         verb: "build",
@@ -2726,9 +2800,9 @@ pub(crate) fn build_static(
 pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result<String, String> {
     let take = Take::prepare(repo_root, commit)?;
     let stock = take.stock()?;
-    require_rustup_target_in(take.stock_context()?, X86_64)?;
+    take.require_stock_target(X86_64)?;
     let target_dir = take.target_root.join(COMPAT_CHECK_SLICE);
-    snapshot::private_dir(&target_dir, "release compat check target")?;
+    snapshot::private_build_dir(&target_dir, "release compat check target")?;
     let t = Instant::now();
     let run = SliceRun {
         verb: "check",
@@ -2750,7 +2824,8 @@ pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result
 
 /// The read-only compat lane's infrastructure prerequisite, distinct from a source failure: the
 /// stock release `toolchain` (the checked commit's, [`crate::trust_lock::stock_toolchain_at`])
-/// with its x86_64 std.
+/// with its x86_64 std. It names nothing that installs it: the caller does, for that commit
+/// ([`stock_install_remedy`]).
 pub(crate) fn compat_available(toolchain: &str) -> Result<(), String> {
     require_rustup_target(toolchain, X86_64)
 }
@@ -2800,6 +2875,7 @@ fn run_slice_profile(
     } = run;
     take.verify_inputs()?;
     snapshot::refuse_root_cargo_config()?;
+    snapshot::private_build_dir(&run.target_dir, "release slice target")?;
     // The build driver, per lane. Native: `targo` from the Trust stage2 tool dir, never a
     // PATH `cargo`. Compat: the candidate's stock release's `cargo` via the rustup shim (STOCK
     // EXCEPTION, see the note at the file's head).
@@ -3206,18 +3282,25 @@ fn wait_with_peak(
     ))
 }
 
-/// That the stock release `toolchain` carries `triple`'s std, asked of the release's rustup shim
-/// under [`Stock`]'s environment.
+/// [`require_rustup_target_in`] for the stock release `toolchain` under this process's HOME
+/// ([`Stock::under`]), for a caller that holds no captured [`Stock`].
 ///
 /// # Errors
-/// No HOME or rustup shim, a rustup that does not answer (the release not installed among it),
-/// and a release without that std; each names `verify provision`'s rustup row, which puts the
-/// release in place with it.
+/// No HOME, and what [`Stock::under`] and [`require_rustup_target_in`] refuse.
 pub(crate) fn require_rustup_target(toolchain: &str, triple: &str) -> Result<(), String> {
     let home = std::env::var_os("HOME").ok_or("compat target probe requires HOME")?;
     require_rustup_target_in(&Stock::under(&home, toolchain)?, triple)
 }
 
+/// That the stock release `stock` names carries `triple`'s std, asked of the release's rustup
+/// shim under its environment ([`Stock::command`]: auto-install off, so the probe installs
+/// nothing).
+///
+/// # Errors
+/// No rustup shim, a rustup that does not answer (the release not installed among it), and a
+/// release without that std. Each names the release and what failed, and nothing that installs
+/// it: which command does depends on whose lock names the release, so the caller names it
+/// ([`Take::require_stock_target`], [`stock_install_remedy`]).
 pub(crate) fn require_rustup_target_in(stock: &Stock, triple: &str) -> Result<(), String> {
     let toolchain = stock.toolchain();
     let out = stock
@@ -3227,9 +3310,7 @@ pub(crate) fn require_rustup_target_in(stock: &Stock, triple: &str) -> Result<()
         .map_err(|e| format!("rustup not runnable ({e}) — install rustup"))?;
     if !out.status.success() {
         return Err(format!(
-            "rustup target list on the stock toolchain {toolchain} failed: {} — run `targo \
-             --unverified verify provision rustup`, which puts the release trust.lock names in \
-             place",
+            "rustup target list on the stock toolchain {toolchain} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -3238,12 +3319,65 @@ pub(crate) fn require_rustup_target_in(stock: &Stock, triple: &str) -> Result<()
         .any(|l| l.trim() == triple)
     {
         return Err(format!(
-            "rust std for {triple} is not installed on the stock toolchain {toolchain} — run \
-             `targo --unverified verify provision rustup`, which puts the release trust.lock \
-             names in place with it (the release is universal)"
+            "rust std for {triple} is not installed on the stock toolchain {toolchain}"
         ));
     }
     Ok(())
+}
+
+/// What installs the stock release `stock` that commit `commit`'s `trust.lock` names, for a
+/// refusal that found it (or its std) missing: `verify provision rustup` installs the release
+/// the lock of the checkout it runs in names, `checkout` here (`None` where that lock does not
+/// read), so it is named alone only where that is `stock`. Otherwise it is named in a checkout
+/// at `commit` (it also places the rustup row's copy, which outranks any rustup on `PATH`), and
+/// beside it the release's own install line
+/// ([`aterm_verify::provision::stock::release_install`]) for where a rustup the row accepts is
+/// already in place.
+pub(crate) fn stock_install_remedy(stock: &str, commit: &str, checkout: Option<&str>) -> String {
+    install_remedy(
+        stock,
+        &format!("at {}", commit.get(..12).unwrap_or(commit)),
+        checkout,
+    )
+}
+
+/// [`stock_install_remedy`] where no commit is at hand, only the stock release `stock` itself (a
+/// build-inputs seal's stock role, [`crate::build_inputs::stock_gap`], carries the release a
+/// source's lock names, not that source): `verify provision rustup` alone where `checkout`, the
+/// release the lock of the checkout it runs in names, is `stock`; otherwise that command in a
+/// checkout whose trust.lock names `stock`, and the release's own install line.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn stock_release_remedy(stock: &str, checkout: Option<&str>) -> String {
+    install_remedy(stock, &format!("whose trust.lock names {stock}"), checkout)
+}
+
+/// What installs `stock`: [`checkout_stock_remedy`] where `checkout` names it, else `verify
+/// provision rustup` in the checkout `at` names and the release's own install line.
+fn install_remedy(stock: &str, at: &str, checkout: Option<&str>) -> String {
+    if checkout == Some(stock) {
+        return checkout_stock_remedy(stock);
+    }
+    format!(
+        "run `{}` in a checkout {at} (it places the rustup row's copy and installs {stock} with \
+         the stds the release builds; here it would install {}), or, where a rustup the row \
+         accepts is in place, `{}`",
+        crate::gates::X86_SLICE_REMEDIES,
+        checkout.map_or_else(
+            || "nothing, this checkout's trust.lock not reading".to_string(),
+            |other| format!("{other}, the release this checkout's trust.lock names")
+        ),
+        aterm_verify::provision::stock::release_install(stock),
+    )
+}
+
+/// What installs `stock`, the stock release the trust.lock of the checkout it runs in names:
+/// `verify provision rustup` there ([`stock_install_remedy`] where that lock names `stock`).
+pub(crate) fn checkout_stock_remedy(stock: &str) -> String {
+    format!(
+        "run `{}`, which puts {stock}, the release this checkout's trust.lock names, in place \
+         with the stds the release builds",
+        crate::gates::X86_SLICE_REMEDIES
+    )
 }
 
 /// The whole `-vV` answer of the stock release `toolchain`'s `rustc` behind the release's rustup

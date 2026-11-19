@@ -835,35 +835,12 @@ impl VaultServer {
 }
 
 fn ac_sleep_minutes(sys: &dyn System) -> Result<u64, Probe> {
-    let cmd = Cmd::new(super::power::PMSET).args(["-g", "custom"]);
-    let ran = match sys.run(&cmd) {
-        Ok(ran) if ran.success() => ran,
-        Ok(ran) => {
-            return Err(Probe::Unusable {
-                why: format!("{}: {}", cmd.display(), ran.describe()),
-            });
-        }
-        Err(e) => {
-            return Err(Probe::Unusable {
-                why: format!("{}: {e}", cmd.display()),
-            });
-        }
-    };
-    let sections = super::power::parse_custom(&ran.out());
-    let Some((_, rows)) = sections.iter().find(|(name, _)| name == "AC Power") else {
-        return Err(Probe::NotApplicable {
-            why: "this Mac has no AC Power profile (`pmset -g custom` prints no AC Power section)"
-                .to_owned(),
-        });
-    };
-    let Some((_, value)) = rows.iter().find(|(key, _)| key == "sleep") else {
-        return Err(Probe::NotApplicable {
-            why: "this Mac's AC Power profile has no `sleep` setting".to_owned(),
-        });
-    };
-    crate::parse_uint(value).ok_or_else(|| Probe::Unusable {
-        why: format!("`pmset -g custom` gave sleep {value:?}, not a number"),
-    })
+    aterm_types::macos_setup::power::read(
+        &super::power::Port(sys),
+        super::power::Source::Ac,
+        &aterm_types::macos_setup::power::SLEEP,
+    )
+    .map_err(super::power::unread_probe)
 }
 
 fn always_on_desktop(sys: &dyn System, ctx: &Ctx) -> Result<(), Probe> {
@@ -930,8 +907,8 @@ fn enable_system_job(sys: &dyn System, label: &str) -> Result<(), String> {
 }
 
 /// (Re)start the system job `label` that `plist_path` defines: `bootout` where it is loaded (one
-/// not loaded is no error), then `bootstrap` and `kickstart`. It never runs `launchctl enable`: a
-/// job launchd lists switched off stays so, and launchd refuses its `bootstrap` in its own words.
+/// not loaded is no error), then [`load_system_job`]. It never runs `launchctl enable`: a job
+/// launchd lists switched off stays so, and launchd refuses its `bootstrap` in its own words.
 ///
 /// # Errors
 /// The first `launchctl` call that failed, with launchd's reason, in one line.
@@ -955,6 +932,20 @@ pub(crate) fn start_system_job(
             ));
         }
     }
+    load_system_job(sys, plist_path, label)
+}
+
+/// Load the system job `label` that `plist_path` defines and start it: `bootstrap`, then
+/// `kickstart`, and never a `bootout`, so a job loaded since the caller read none is not taken
+/// down (launchd refuses the `bootstrap` instead). It never runs `launchctl enable`.
+///
+/// # Errors
+/// The first `launchctl` call that failed, with launchd's reason, in one line.
+pub(crate) fn load_system_job(
+    sys: &dyn System,
+    plist_path: &Path,
+    label: &str,
+) -> Result<(), String> {
     let bootstrap = run_launchctl(
         sys,
         aterm_secrets::service::system_launchctl_argv(

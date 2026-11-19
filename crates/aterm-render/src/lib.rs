@@ -5660,12 +5660,47 @@ pub fn checked_frame_size_px(
 #[inline]
 #[must_use]
 pub const fn band_offset(dst_px: usize, src_px: usize, inset: SideInsetPx) -> i64 {
-    inset.0 as i64 + (dst_px.saturating_sub(inset.0) as i64 - src_px as i64).div_euclid(2)
+    FrameInsets {
+        left: inset.0,
+        right: 0,
+    }
+    .origin(dst_px, src_px)
 }
 
 /// Leading surface columns reserved beside the frame, in device pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SideInsetPx(pub usize);
+
+/// Device pixels reserved for window chrome on either side of the terminal frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameInsets {
+    /// Reserved surface pixels at the leading edge.
+    pub left: usize,
+    /// Reserved surface pixels at the trailing edge.
+    pub right: usize,
+}
+
+impl FrameInsets {
+    const fn origin(self, dst: usize, src: usize) -> i64 {
+        let available = dst.saturating_sub(self.width());
+        self.left as i64 + (available as i64 - src as i64).div_euclid(2)
+    }
+
+    /// Width occupied by both sides together.
+    #[must_use]
+    pub const fn width(self) -> usize {
+        self.left.saturating_add(self.right)
+    }
+}
+
+impl From<SideInsetPx> for FrameInsets {
+    fn from(inset: SideInsetPx) -> Self {
+        Self {
+            left: inset.0,
+            right: 0,
+        }
+    }
+}
 
 /// The leading frame offset past a side inset.
 #[must_use]
@@ -5739,10 +5774,11 @@ pub fn frame_placement(
     dst_h: usize,
     src_w: usize,
     src_h: usize,
-    inset: SideInsetPx,
+    inset: impl Into<FrameInsets>,
 ) -> FramePlacement {
+    let x = inset.into().origin(dst_w, src_w);
     FramePlacement {
-        x: AxisPlacement::at(band_offset_after(dst_w, src_w, inset), dst_w, src_w),
+        x: AxisPlacement::at(x, dst_w, src_w),
         y: AxisPlacement::at(band_offset_y(dst_h, src_h), dst_h, src_h),
     }
 }
@@ -5794,7 +5830,7 @@ pub fn place_frame_bands(
     src: &[u32],
     src_w: usize,
     src_h: usize,
-    inset: SideInsetPx,
+    inset: impl Into<FrameInsets>,
     invert: bool,
     band_rgb: u32,
     edge_rows: std::ops::Range<usize>,
@@ -5839,7 +5875,7 @@ pub fn continue_chrome_edges(
     dst_h: usize,
     src_w: usize,
     src_h: usize,
-    inset: SideInsetPx,
+    inset: impl Into<FrameInsets>,
     edge_rows: std::ops::Range<usize>,
 ) {
     let place = frame_placement(dst_w, dst_h, src_w, src_h, inset);

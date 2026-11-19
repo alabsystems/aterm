@@ -43,12 +43,19 @@
 //!   birth, the table's own guard (an account's label naming another account's slug), a
 //!   reference to a row the table holds, no unique set two live rows come to share and no
 //!   retired row a live row names. A refused intent is held with the rule.
+//! - **What it published is noted.** Each intent a record carries is noted in this Mac's
+//!   journal spool between its marker and its dequeue, as a value-free `decided` event: the
+//!   operation's first 8 bytes, the intent's verb and its `by` word ([`decided`]). The journal's
+//!   flusher publishes it in `ai/events` (docs/DESIGN-shared-files-2026-11-11.md §5,
+//!   "Provenance"). The word is a claim, never an admission condition.
 //! - **Nothing here reads.** A pass opens no reader of a shared file and runs no materializer
 //!   pass; the verb that asked runs one afterwards.
 
 use super::Type;
+use crate::said::Said;
 use crate::{
     Error, Result,
+    alab::journal::{Event, Kind, Source, Spool, Via, Word as EventWord, event::DECIDED_CLI},
     att::{self, Author, Compiled, View},
     catalog::{Directory, policy::Policy},
     database::{Change, Command},
@@ -87,24 +94,76 @@ pub fn moved(why: &str) -> Option<Vec<&str>> {
     Some(cells.split(", ").collect())
 }
 
-/// What bounds one pass.
+/// What bounds one pass, and where it notes what it published.
 #[derive(Clone, Copy, Debug)]
-pub struct Pass {
+pub struct Pass<'a> {
     /// When the pass stops opening custody and signing.
     pub by: Instant,
     /// This Mac's clock, Unix milliseconds, for display.
     pub now_ms: u64,
+    /// The journal spool each intent a record carries is noted in, as a `decided` event
+    /// ([`decided`]), which this Mac's flusher publishes in `ai/events`: this user's
+    /// ([`crate::alab::upkeep::journal_spool`]); `None` notes nothing.
+    pub journal: Option<&'a Spool>,
 }
 
-impl Pass {
-    /// A pass that ends `within` from now.
-    #[must_use]
-    pub fn within(within: Duration) -> Self {
-        Self {
-            by: Instant::now() + within,
-            now_ms: aterm_time::unix_millis().unwrap_or(0),
-        }
+/// The verb a `decided` event names (`via`): what `intent` does, read off its own shape, since an
+/// intent keeps no verb. A revert and a person's resolve of a held write say so; a row to be born
+/// is an `add`; a Mac's statement of its own row ([`Intent::mine`]) a `state`; a write that ends
+/// a row's lifecycle a `rm`; any other a `set`. A face's commit writes intents of these shapes,
+/// and each is named by what it does.
+#[must_use]
+pub fn via(intent: &Intent) -> Via {
+    if intent.revert.is_some() {
+        Via::Revert
+    } else if intent.resolves.is_some() {
+        Via::Resolve
+    } else if intent.born {
+        Via::Add
+    } else if intent.mine() {
+        Via::State
+    } else if intent.edits.iter().any(|edit| {
+        edit.column == LIFECYCLE
+            && edit.elem.is_none()
+            && edit.value.as_str().is_some_and(|word| word != "live")
+    }) {
+        Via::Rm
+    } else {
+        Via::Set
     }
+}
+
+/// The `decided` event (docs/DESIGN-shared-files-2026-11-11.md §5, "Provenance"; §10 file 5)
+/// that says this Mac published `intent` as the operation `op` (64 lower-case hex) at `at_ms`, its
+/// marker's time: the operation's first 8 bytes, the intent's verb ([`via`]) and its `by` word.
+/// It names no account, value, address, path or session: every field is a word of the closed
+/// vocabulary. `None` where `op` is no digest or `by` no word of the vocabulary's bound (an
+/// older build's line), so nothing is noted.
+#[must_use]
+pub fn decided(intent: &Intent, op: &str, at_ms: u64) -> Option<Event> {
+    outbox::digest(op)?;
+    Some(Event {
+        t: at_ms / 1000,
+        kind: Kind::Decided,
+        account: None,
+        cli: EventWord::new(DECIDED_CLI)?,
+        sub: None,
+        window: None,
+        model: None,
+        pct_x10: None,
+        reset: None,
+        res: None,
+        until: None,
+        plan: None,
+        src: Source::File,
+        why: None,
+        to: None,
+        tab: None,
+        harness: None,
+        op: Some(EventWord::new(op.get(..16)?)?),
+        via: Some(via(intent)),
+        program: Some(EventWord::new(&intent.by).filter(|_| aterm_file::name::part(&intent.by))?),
+    })
 }
 
 /// What a pass did with one intent.
@@ -157,22 +216,36 @@ impl Work {
         self.outcome.problem = Some(error.to_string());
     }
 
-    /// The marker (under the pass's claim, where it holds one), then the dequeue: the order a
-    /// kill between the two is safe in.
-    fn done(&mut self, claim: Option<Claim>, id: &str, mark: &Mark, now_ms: u64) {
+    /// The marker (under the pass's claim, where it holds one), the `decided` note of an intent
+    /// a record carries, then the dequeue: the order a kill between any two is safe in. A pass
+    /// killed before its note leaves the intent queued beside its marker, and the next pass
+    /// notes it as it dequeues it; one killed after the note notes the same event again (its
+    /// time is the marker's, `marked_ms`), which the flusher publishes once: its outbox keeps
+    /// each event once and drops one this Mac's batches in the window already hold. An intent
+    /// another pass dequeued first (the marker finds it no longer queued) was noted by that
+    /// pass, and is not noted again.
+    fn done(
+        &mut self,
+        claim: Option<Claim>,
+        intent: &Intent,
+        mark: &Mark,
+        marked_ms: u64,
+        journal: Option<&Spool>,
+    ) {
+        let id = intent.id.as_str();
         let marked = match claim {
-            Some(claim) => claim.mark_done(mark, now_ms),
+            Some(claim) => claim.mark_done(mark, marked_ms),
             None => {
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "the publisher marks an intent a record carries"
                 )]
-                let marked = self.held.mark_done(id, mark, now_ms);
+                let marked = self.held.mark_done(id, mark, marked_ms);
                 marked
             }
         };
-        match marked {
-            Ok(_) => {}
+        let queued = match marked {
+            Ok(queued) => queued,
             Err(error) => {
                 // The record is signed and no marker says so: the next pass finds the record by
                 // the intent's id and writes the marker then.
@@ -185,13 +258,26 @@ impl Work {
                 );
                 return;
             }
-        }
+        };
         #[cfg(test)]
         if seam::stops(seam::Stop::AfterMarker) {
             self.answer(
                 id,
                 Answer::Queued {
                     why: "the pass was killed after its marker".to_owned(),
+                },
+            );
+            return;
+        }
+        if queued && let (Some(journal), Some(op)) = (journal, &mark.op) {
+            self.note(journal, intent, op, marked_ms);
+        }
+        #[cfg(test)]
+        if seam::stops(seam::Stop::AfterNote) {
+            self.answer(
+                id,
+                Answer::Queued {
+                    why: "the pass was killed after its note".to_owned(),
                 },
             );
             return;
@@ -210,6 +296,19 @@ impl Work {
                 op: mark.op.clone(),
             },
         );
+    }
+
+    /// Note in `journal` that the operation `op` published `intent` ([`decided`]). The note costs
+    /// the publication nothing: the record is signed and marked whatever the spool does, a full
+    /// spool drops the event as it drops every one, and one that cannot be written is this
+    /// outcome's problem.
+    fn note(&mut self, journal: &Spool, intent: &Intent, op: &str, marked_ms: u64) {
+        let Some(event) = decided(intent, op, marked_ms) else {
+            return;
+        };
+        if let Err(error) = journal.append(&event) {
+            self.problem(&error);
+        }
     }
 
     fn hold(&mut self, claim: Claim, id: &str, why: String, now_ms: u64) {
@@ -533,15 +632,34 @@ impl Writer<'_, '_> {
         if let Some(op) = log.carried(request) {
             return Ok(Step::Signed(op, wrote(log.record_changes(&op))));
         }
+        // Who made it is what its author's process stated when it was accepted, signed as it is
+        // wherever the generation takes it: never this pass's own process, which may be another
+        // agent's verb or the owner's minute pass. An intent that states none is signed stating
+        // none, and one whose statement breaks its rules is held. A generation that takes no
+        // statement (version 1 records) signs none, whatever the intent states, so it never
+        // holds a write over a statement it would not carry: a later build's statement this one
+        // cannot judge is no reason to stop.
+        let carried = intent.said.as_ref().filter(|_| self.compiled.records >= 2);
+        let said = match carried.map(Said::from_value).transpose() {
+            Ok(said) => self.compiled.carries(said.as_ref()),
+            Err(why) => {
+                return Ok(Step::Hold(format!(
+                    "its statement of who made it is refused: {why}"
+                )));
+            }
+        };
         let command = if let Some(target) = &intent.revert {
             let Some(target) = outbox::digest(target) else {
                 return Ok(Step::Hold("it names no operation to revert".to_owned()));
             };
-            let command =
+            let mut command =
                 match log.compensate(request, target, &view.quota.over, &view.inert.changes) {
                     Ok(command) => command,
                     Err(error) => return Ok(Step::Hold(error.to_string())),
                 };
+            if let Command::Revert { said: carried, .. } = &mut command {
+                carried.clone_from(&said);
+            }
             // A file reverts only what wrote it: an operation that changed another collection
             // is undone through that one's file, under its own history.
             if command
@@ -615,17 +733,44 @@ impl Writer<'_, '_> {
             if let Some(refused) = self.compiled.rules(&mut rows, view, Author::Owner)? {
                 return Ok(Step::Hold(Error::from(refused).to_string()));
             }
-            // One intent, one record: its rows are never split across two.
+            // One intent, one record: its rows are never split across two. Where the family
+            // gives each row's change a record of its own (`Compiled::rows_apart`), an intent
+            // that writes two rows would give them one record and one reason, so it is held.
+            if self.compiled.rows_apart && rows.iter().filter(|row| !row.is_empty()).count() > 1 {
+                return Ok(Step::Hold(
+                    "it writes more than one row, and this table keeps each row's change in a \
+                     record of its own; write one row at a time"
+                        .to_owned(),
+                ));
+            }
             let changes: Vec<Change> = rows.into_iter().flatten().collect();
-            let mut packed = match att::pack(vec![changes]) {
+            let mut packed = match att::pack_saying(vec![changes], said.as_deref()) {
                 Ok(packed) => packed,
                 Err(error) => return Ok(Step::Hold(error.to_string())),
             };
             let (Some(changes), true) = (packed.pop(), packed.is_empty()) else {
                 return Ok(Step::Hold("it passes one record's limits".to_owned()));
             };
-            Command::Write { request, changes }
+            Command::Write {
+                request,
+                changes,
+                said,
+            }
         };
+        self.compiled.admits(&command)?;
+        // One record's body bounds what it carries: a revert's restored values and its
+        // statement included (a write's packing counted them already).
+        let payload = command.encode()?;
+        if payload.len() > crate::crypto::MAX_BODY {
+            return Ok(Step::Hold(
+                if command.said().is_some() {
+                    "it and its statement of who made it pass one record's limits"
+                } else {
+                    "it passes one record's limits"
+                }
+                .to_owned(),
+            ));
+        }
         // A record still waiting on a causal parent may write a row this one writes: its
         // candidates are not in the cells compared above, so this intent waits for it. A write
         // of any other row goes now.
@@ -634,7 +779,7 @@ impl Writer<'_, '_> {
         }
         let wrote = wrote(command.changes());
         Ok(Step::Signed(
-            application::append(self.session, store, &command.encode()?)?.id,
+            application::append(self.session, store, &payload)?.id,
             wrote,
         ))
     }
@@ -646,7 +791,7 @@ fn family(
     policy: &Policy,
     first: &'static Compiled,
     works: &mut [&mut Work],
-    pass: &Pass,
+    pass: &Pass<'_>,
 ) -> Result<()> {
     let compiled = att::current_within(home, first, pass.by)?;
     let table = compiled.table;
@@ -691,7 +836,7 @@ fn family(
                     let (log, view) = match read.take() {
                         Some(read) => read,
                         None => {
-                            let log = Log::read_with(session, store, scope, att::decode)?;
+                            let log = Log::read_with(session, store, scope, compiled.decoder())?;
                             log.writable(session.actor())?;
                             let view = View::read(table, session, &log)?;
                             (log, view)
@@ -746,9 +891,18 @@ fn family(
                                 );
                                 return Ok(());
                             }
+                            // The store its record was appended to, and that store's witness
+                            // after the append (or after the earlier pass's append a carried
+                            // record was found by): a snapshot read at that count or later
+                            // holds it.
+                            let at = store.witnesses().first().map(|own| aterm_file::At {
+                                store: own.digest,
+                                count: own.count,
+                            });
                             let mark = Mark {
                                 op: Some(aterm_codec::hex::encode_lower(&op)),
                                 generation: compiled.generation,
+                                at,
                                 left: left(
                                     collection,
                                     &intent,
@@ -759,7 +913,7 @@ fn family(
                                 ),
                             };
                             earlier.settled(&intent.id, Some(op), &mark.left);
-                            work.done(Some(claim), &intent.id, &mark, pass.now_ms);
+                            work.done(Some(claim), &intent, &mark, pass.now_ms, pass.journal);
                             if carried.is_some() {
                                 read = Some((log, view));
                             }
@@ -768,6 +922,7 @@ fn family(
                             let mark = Mark {
                                 op: None,
                                 generation: compiled.generation,
+                                at: None,
                                 left: left(
                                     collection,
                                     &intent,
@@ -778,7 +933,7 @@ fn family(
                                 ),
                             };
                             earlier.settled(&intent.id, None, &mark.left);
-                            work.done(Some(claim), &intent.id, &mark, pass.now_ms);
+                            work.done(Some(claim), &intent, &mark, pass.now_ms, pass.journal);
                             read = Some((log, view));
                         }
                         Step::Hold(why) => {
@@ -803,8 +958,19 @@ fn family(
 /// Mac's writer lineage, `config` its `aterm.toml`. Each file gets its outcome; nothing is an
 /// error, and a pass with nothing queued opens no custody.
 #[must_use]
-pub fn pass(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pass) -> Vec<Outcome> {
-    publish_intents(paths, config, only, pass)
+pub fn pass(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pass<'_>) -> Vec<Outcome> {
+    publish_intents(paths, config, super::FILES, only, pass)
+}
+
+/// [`pass`] over `files`, which a test names in place of this build's [`super::FILES`].
+#[cfg(test)]
+pub(crate) fn pass_over(
+    paths: &Paths,
+    config: &Path,
+    files: &'static [super::Type],
+    pass: &Pass<'_>,
+) -> Vec<Outcome> {
+    publish_intents(paths, config, files, None, pass)
 }
 
 /// [`pass`], whole. The `SharedFile` anchors sit here rather than on a function named `pass`:
@@ -834,10 +1000,16 @@ pub fn pass(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pass) -> V
         project = "aterm_db::file::model_tests::write_transition"
     )
 )]
-fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pass) -> Vec<Outcome> {
+fn publish_intents(
+    paths: &Paths,
+    config: &Path,
+    files: &'static [super::Type],
+    only: Option<&Name>,
+    pass: &Pass<'_>,
+) -> Vec<Outcome> {
     let home = generation::original(paths);
     let root = super::root(&home);
-    let mut works: Vec<Work> = super::FILES
+    let mut works: Vec<Work> = files
         .iter()
         .filter(|file| only.is_none_or(|only| *only == file.file()))
         .map(|file| Work {
@@ -850,7 +1022,8 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
             },
         })
         .collect();
-    // What a killed pass left: an intent whose marker is written only leaves the outbox.
+    // What a killed pass left: an intent whose marker is written is noted at the marker's time
+    // and leaves the outbox; nothing is signed again.
     for work in &mut works {
         let outbox = work.held.outbox();
         for intent in &outbox.queued {
@@ -858,9 +1031,12 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
                 let mark = Mark {
                     op: done.op.clone(),
                     generation: done.generation.unwrap_or_default(),
+                    at: done.at,
                     left: done.left.clone(),
                 };
-                work.done(None, &intent.id, &mark, pass.now_ms);
+                #[cfg(test)]
+                seam::before_claim();
+                work.done(None, intent, &mark, done.ms, pass.journal);
             }
         }
     }
@@ -1175,7 +1351,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "SignIn",
-        reason = "The rotation pool, built from ai/links and ai/logins, is SF-09's: no code of this build builds it."
+        reason = "A login this Mac holds is a candidate of its rotation pool whatever ai/links says: the pool is the harness's accounts::candidates over this Mac's roster, which a link only orders (Rank::link) and never limits, and harness::accounts::tests' SF-09 exit test holds an unranked row in it beside ranked ones."
     )
 )]
 #[cfg_attr(
@@ -1183,7 +1359,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "Link",
-        reason = "The rotation pool, built from ai/links and ai/logins, is SF-09's: no code of this build builds it."
+        reason = "This Mac's live ai/links rows rank its accounts (file::rotation, whose file::tests SF-09 test holds the rank to this Mac's own live links), and the harness orders its pool by that rank within a class and limits nothing by it: harness::accounts::tests' SF-09 exit test."
     )
 )]
 #[cfg_attr(
@@ -1191,7 +1367,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "EndLink",
-        reason = "The rotation pool, built from ai/links and ai/logins, is SF-09's: no code of this build builds it."
+        reason = "An ended or other Mac's ai/links row gives no rank (file::rotation, whose file::tests SF-09 test holds a dead link and another Mac's out), so its account stays in the harness's pool, unranked: harness::accounts::tests' SF-09 exit test holds an unranked row in it."
     )
 )]
 #[cfg_attr(
@@ -1199,7 +1375,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "Pool",
-        reason = "The rotation pool, built from ai/links and ai/logins, is SF-09's: no code of this build builds it."
+        reason = "The rotation pool is the harness's accounts::candidates over this Mac's roster, ordered by this Mac's ai/links rank within a class (file::rotation) and never limited by it, a peer's ai/limits wall demoting a row and excluding none: harness::accounts::tests' SF-09 exit test."
     )
 )]
 #[cfg_attr(

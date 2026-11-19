@@ -1521,24 +1521,43 @@ fn x86_slice_check(stock: std::result::Result<&crate::buildplan::Stock, String>)
             };
         }
     };
-    let target = crate::buildplan::require_rustup_target_in(stock, "x86_64-apple-darwin");
-    match target {
-        Ok(()) => match gates::rosetta_runs(&mut |command| command.output()) {
-            Ok(()) => Check::Pass(format!(
-                "stock {} x86_64-apple-darwin target installed and Rosetta runs it \
-                 (universal slice)",
-                stock.toolchain()
-            )),
-            Err(_) => Check::Fail {
-                what: "Rosetta does not run x86_64 programs here — a universal cut runs its \
-                       x86_64 slice under it before it ships"
-                    .into(),
-                fix: "softwareupdate --install-rosetta --agree-to-license".into(),
-            },
+    x86_slice_verdict(
+        stock.toolchain(),
+        crate::buildplan::require_rustup_target_in(stock, "x86_64-apple-darwin")
+            .map_err(Error::new),
+        gates::rosetta_runs(&mut |command| command.output()),
+    )
+}
+
+/// [`x86_slice_check`] on the stock release `stock`'s target probe `target` and Rosetta's
+/// answer `rosetta`, both asked whatever the other says: a missing target's gap carries the
+/// rustup row's fix ([`gates::X86_SLICE_REMEDIES`]) and a Rosetta that does not run is named
+/// with its own fix, alone or beside the target's, so neither gap hides the other.
+#[cfg(unix)]
+fn x86_slice_verdict(
+    stock: &str,
+    target: Result<()>,
+    rosetta: std::result::Result<(), String>,
+) -> Check {
+    const ROSETTA: &str = "Rosetta does not run x86_64 programs here — a universal cut runs its \
+                           x86_64 slice under it before it ships";
+    const ROSETTA_FIX: &str = "softwareupdate --install-rosetta --agree-to-license";
+    match (target, rosetta) {
+        (Ok(()), Ok(())) => Check::Pass(format!(
+            "stock {stock} x86_64-apple-darwin target installed and Rosetta runs it (universal \
+             slice)"
+        )),
+        (Ok(()), Err(_)) => Check::Fail {
+            what: ROSETTA.into(),
+            fix: ROSETTA_FIX.into(),
         },
-        Err(e) => Check::Fail {
+        (Err(e), Ok(())) => Check::Fail {
             what: e.to_string(),
             fix: gates::X86_SLICE_REMEDIES.to_string(),
+        },
+        (Err(e), Err(_)) => Check::Fail {
+            what: format!("{e}; and {ROSETTA}"),
+            fix: format!("{}; then {ROSETTA_FIX}", gates::X86_SLICE_REMEDIES),
         },
     }
 }

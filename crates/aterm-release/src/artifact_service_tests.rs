@@ -45,6 +45,45 @@ fn a_working_directory_does_not_rebase_an_absolute_executable() {
 }
 
 #[test]
+fn scheduled_services_require_an_unambiguous_integer_interval() {
+    let wrap = |body: &str| format!("<plist><dict>{body}</dict></plist>");
+    let selection = "<key>Program</key><string>/artifact/bin/python3.14</string>";
+    let schedule = "<key>StartInterval</key><integer>3600</integer>";
+    assert_eq!(
+        program(&wrap(&format!("{selection}{schedule}"))).unwrap(),
+        PathBuf::from("/artifact/bin/python3.14")
+    );
+    for value in [
+        "<string>3600</string>",
+        "<true/>",
+        "<real>3600</real>",
+        "<array><string>3600</string></array>",
+        "<dict></dict>",
+        "<integer>0</integer>",
+        "<integer>-1</integer>",
+        "<integer>+3600</integer>",
+        "<integer>9223372036854775808</integer>",
+    ] {
+        assert!(
+            program(&wrap(&format!(
+                "{selection}<key>StartInterval</key>{value}"
+            )))
+            .is_err()
+        );
+    }
+    for unsupported in [
+        schedule.to_owned(),
+        selection.to_owned(),
+        "<key>RootDirectory</key><string>/elsewhere</string>".to_owned(),
+        "<key>BundleProgram</key><string>python3.14</string>".to_owned(),
+        "<key>WorkingDirectory</key><string>relative</string>".to_owned(),
+        "<key>StartCalendarInterval</key><dict></dict>".to_owned(),
+    ] {
+        assert!(program(&wrap(&format!("{selection}{schedule}{unsupported}"))).is_err());
+    }
+}
+
+#[test]
 fn ambiguous_or_unsupported_selections_are_unknown() {
     let executable = std::env::temp_dir().join("artifact-image");
     let escaped = aterm_codec::xml::escape(&executable.display().to_string());

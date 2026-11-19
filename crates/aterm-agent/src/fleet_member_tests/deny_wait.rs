@@ -4,7 +4,7 @@
 use super::*;
 use aterm_secrets::client::{self, Paths};
 
-fn vault_beside(member: &World) -> Paths {
+pub(super) fn vault_beside(member: &World) -> Paths {
     let home = member.places.state.parent().unwrap();
     let paths = Paths::for_home(home);
     let source = home.join("fixture.vault");
@@ -23,14 +23,14 @@ fn vault_beside(member: &World) -> Paths {
     paths
 }
 
-struct FleetPair {
+pub(super) struct FleetPair {
     _issuer_serving: Listener,
     member_serving: Listener,
-    issuer: World,
-    member: World,
+    pub(super) issuer: World,
+    pub(super) member: World,
 }
 
-fn fleet_pair(tag: &str) -> FleetPair {
+pub(super) fn fleet_pair(tag: &str) -> FleetPair {
     let (issuer, code, serving) = issuing(&format!("{tag}-issuer"));
     let member = World::new(&format!("{tag}-member"));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

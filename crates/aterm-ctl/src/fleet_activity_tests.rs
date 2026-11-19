@@ -7,7 +7,7 @@ use aterm_types::fleet_activity::{Outcome, Plain, Way};
 
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const SID: &str = "s-0123456789abcdef0123";
+const SID: &str = "tqn5r6e0148";
 
 const BLOCKED: Outcome = Outcome::Blocked {
     level: FleetAccess::ReadOnly,
@@ -299,14 +299,13 @@ fn a_record_that_cannot_be_written_drops_the_row_and_fails_nothing() {
     assert_eq!(record.read(2_000), Kept::default());
 }
 
-/// A WRITE THAT FAILS LOSES NO ROW ALREADY WRITTEN. The record is at its size, so the next
-/// write replaces it whole, and the replacement cannot be made (its folder takes no new file):
-/// the write fails, the record is byte for byte what it was, and once the folder takes files
-/// again the next write keeps every request counted.
+/// A WRITE THAT FAILS LOSES NO ROW ALREADY WRITTEN. The pending batch exceeds the space
+/// left in the record, so its write replaces the file. Refuse publication after the temporary
+/// is written but before rename: the old bytes remain, no temporary is left, and retrying the
+/// same batch with publication restored keeps every request counted.
 #[cfg(unix)]
 #[test]
 fn a_replacement_that_fails_leaves_the_record_as_it_was() {
-    use std::os::unix::fs::PermissionsExt as _;
     let (dir, record) = scratch();
     let minute = 600_000;
     let first = row(minute, Way::In, A, DriveKind::Spawn, BLOCKED);
@@ -316,33 +315,50 @@ fn a_replacement_that_fails_leaves_the_record_as_it_was() {
     let rows = vec![first; fill];
     record.append(&rows).expect("filled, within the size");
     let before = std::fs::read(record.path()).expect("the file");
-    assert!(
-        before.len() as u64 + one > MAX_BYTES,
-        "the next write replaces"
-    );
     let folder = dir.path().join(DIR);
     let turn = row(minute + 5, Way::In, B, DriveKind::Turn, Outcome::Admitted);
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500)).expect("read only");
-    let failed = record.append(std::slice::from_ref(&turn));
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).expect("restored");
-    assert!(failed.is_err(), "the replacement could not be made");
+    let turn_bytes = turn.line().len() as u64 + 1;
+    let spare = MAX_BYTES
+        .checked_sub(before.len() as u64)
+        .expect("the filled record is within its bound");
+    let pending = vec![turn; usize::try_from(spare / turn_bytes + 1).expect("a bounded batch")];
+    let added: u64 = pending.iter().map(|row| row.line().len() as u64 + 1).sum();
+    assert!(
+        before.len() as u64 + added > MAX_BYTES,
+        "the actual pending batch requires replacement"
+    );
+    let temporaries = || {
+        std::fs::read_dir(&folder)
+            .expect("the folder")
+            .map(|entry| entry.expect("a directory entry").file_name())
+            .filter(|name| name != ROWS && name != "rows.lock")
+            .collect::<Vec<_>>()
+    };
+    let failed = {
+        let _failure = aterm_uds::atomic_file::publication_seam::FailBeforeRename::with_kind(
+            std::io::ErrorKind::PermissionDenied,
+        );
+        record.append(&pending)
+    };
+    assert_eq!(
+        failed
+            .expect_err("the replacement could not be made")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
     assert_eq!(
         std::fs::read(record.path()).expect("the file"),
         before,
         "nothing written before it is gone"
     );
-    record.append(std::slice::from_ref(&turn)).expect("written");
+    assert!(temporaries().is_empty(), "no temporary after failure");
+    record.append(&pending).expect("written");
     let read = record.read(minute + 5);
     assert_eq!(read.cut_ms, None);
-    assert_eq!(requests(&read.rows), fill as u64 + 2);
+    assert_eq!(requests(&read.rows), fill as u64 + 1 + pending.len() as u64);
     let len = std::fs::metadata(record.path()).expect("the file").len();
     assert!(len < KEPT_BYTES, "{len} bytes: counted by the minute");
-    let left: Vec<_> = std::fs::read_dir(&folder)
-        .expect("the folder")
-        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-        .filter(|name| name != ROWS && name != "rows.lock")
-        .collect();
-    assert_eq!(left, Vec::<std::ffi::OsString>::new(), "no temporary file");
+    assert!(temporaries().is_empty(), "no temporary after retry");
 }
 
 /// A writer that finds the record's lock held gives the row up within the lock's bound, and the

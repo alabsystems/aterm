@@ -3918,3 +3918,56 @@ fn the_machine_name_fits_its_slot() {
         "CONTROL: {cut:?}"
     );
 }
+
+/// A header with no tab's words (a page no tab owns, the System Resources page's head) lays the
+/// legend's two machine-wide keys and no Tab key at every Full and Folded width, or no legend;
+/// and its legend, needing no Tab key's room, still stands at some width where the legend that
+/// names a tab gives way.
+/// NEGATIVE CONTROL: with the tab's words the same headers lay all three keys, the Tab's last.
+#[test]
+fn a_legend_with_no_tab_lays_no_tab_key() {
+    let m = hn();
+    let bare = HeaderText { tab: "", ..TEXT };
+    let scopes = |head: &HeaderPlan| -> Vec<Bar> {
+        head.labels
+            .iter()
+            .filter_map(|l| match l.label {
+                Label::Scope(bar) => Some(bar),
+                _ => None,
+            })
+            .collect()
+    };
+    let (mut laid, mut only_bare) = (0_u32, 0_u32);
+    for w in (160..=2_560).map(f64::from) {
+        let (full, folded) = (plan_full(w, &m), plan_folded(w, &m));
+        for (form, with_tab, without) in [
+            (
+                "Full",
+                header_full(&full, TEXT, None, &m),
+                header_full(&full, bare, None, &m),
+            ),
+            (
+                "Folded",
+                header_folded(&folded, TEXT, [None, None], &m),
+                header_folded(&folded, bare, [None, None], &m),
+            ),
+        ] {
+            let (named, unnamed) = (scopes(&with_tab), scopes(&without));
+            assert!(
+                unnamed.is_empty() || unnamed == [Bar::Global, Bar::Aterm],
+                "{form} W {w}: no tab, no Tab key: {unnamed:?}"
+            );
+            assert!(
+                named.is_empty() || named == [Bar::Global, Bar::Aterm, Bar::Tab],
+                "NEGATIVE CONTROL: {form} W {w}, a tab's words lay its key: {named:?}"
+            );
+            laid += u32::from(!named.is_empty());
+            only_bare += u32::from(named.is_empty() && !unnamed.is_empty());
+        }
+    }
+    assert!(laid > 0, "PRECONDITION: a legend stands at some width");
+    assert!(
+        only_bare > 0,
+        "the legend with no Tab key needs less room than the one with it"
+    );
+}

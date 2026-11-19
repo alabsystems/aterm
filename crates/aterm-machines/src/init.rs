@@ -81,7 +81,7 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   and Linux (the base layer, the vault and --clone; each Mac row reads \"macOS only\").
   Run it as yourself, without sudo; safe to run again. Every Mac gets what `aterm doctor`
   restores, the ALab toolset, the Command Line Tools if missing (one sudo password), and
-    Stop Spotlight indexing home folders but Documents and Desktop (same password)
+    Keep Spotlight to Applications, Documents, Desktop and synced drives (same password)
     {spotlight}
     {secrets} (authenticated ALab members admit this Mac on its home LAN, over SSH too)
     {permissions} (a row for each grant to switch on)

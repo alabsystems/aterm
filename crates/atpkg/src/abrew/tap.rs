@@ -1386,6 +1386,7 @@ fn cask_interpolate_depth(
                 return if scratch.is_some() { None } else { Some(v) };
             }
             let cond = tail.strip_prefix("if ")?.trim();
+            let cond = cond.strip_suffix(".present?").unwrap_or(cond);
             let present =
                 super::formula::cask_version_token(version, cond).is_some_and(|v| !v.is_empty());
             if !present {
@@ -1398,6 +1399,14 @@ fn cask_interpolate_depth(
             let v = cask_interpolate_depth(&inner, version, locals, &mut scratch, depth + 1);
             return if scratch.is_some() { None } else { Some(v) };
         }
+        // Split pipelines first: a map body may itself
+        // contain `||` (the indexed zero-pad form),
+        // which the fallback split below would sever.
+        if expr.contains(".split(")
+            && let Some(v) = super::formula::cask_version_token(version, expr)
+        {
+            return Some(v);
+        }
         if let Some((a, b)) = expr.split_once(" || ") {
             // Either side may be a csv selector (nil
             // when the part is missing), bare
@@ -1406,6 +1415,11 @@ fn cask_interpolate_depth(
                 let s = s.trim();
                 if s == "version" {
                     return Some(version.to_string());
+                }
+                if let Some((lit, t)) = quoted_token(s)
+                    && t.trim().is_empty()
+                {
+                    return Some(lit);
                 }
                 // A csv selector is nil exactly when its
                 // part is missing (the token evaluator's
@@ -1430,6 +1444,7 @@ fn cask_interpolate_depth(
         // csv part exists (a missing part is nil).
         if let Some((lhs, cond)) = expr.split_once(" if ") {
             let (lhs, cond) = (lhs.trim(), cond.trim());
+            let cond = cond.strip_suffix(".present?").unwrap_or(cond);
             let exists = match cond {
                 "version.csv.first" => true,
                 "version.csv.second" => csv.len() > 1,
@@ -1471,6 +1486,94 @@ fn cask_interpolate_depth(
                     | "version.dots_to_hyphens"
             )
         {
+            return Some(v);
+        }
+        // `<local>.delete_prefix("x")` chains on cask
+        // locals (julia's `arch.delete_prefix("x")`).
+        if let Some((name, tail)) = expr.split_once('.')
+            && let Some(raw0) = locals
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+        {
+            if depth >= 8 {
+                return None;
+            }
+            let mut scratch = None;
+            let mut v = cask_interpolate_depth(&raw0, version, locals, &mut scratch, depth + 1);
+            if scratch.is_some() {
+                return None;
+            }
+            let mut rest = format!(".{tail}");
+            loop {
+                let t = rest.trim().to_string();
+                if t.is_empty() {
+                    break;
+                }
+                let lit_op = |t: &str, op: &str| -> Option<(String, String)> {
+                    let r = t.strip_prefix(op)?;
+                    let (lit, r) = quoted_token(r.trim_start())?;
+                    let r = r.trim().strip_prefix(')')?;
+                    Some((lit, r.to_string()))
+                };
+                if let Some((lit, r)) = lit_op(&t, ".delete_prefix(") {
+                    if let Some(stripped) = v.strip_prefix(&lit) {
+                        v = stripped.to_string();
+                    }
+                    rest = r;
+                } else if let Some((lit, r)) = lit_op(&t, ".delete_suffix(") {
+                    if let Some(stripped) = v.strip_suffix(&lit) {
+                        v = stripped.to_string();
+                    }
+                    rest = r;
+                } else if let Some((lit, r)) = lit_op(&t, ".delete(") {
+                    if lit.contains('\\') || lit.contains('^') {
+                        return None;
+                    }
+                    // A delete set with `a-z` ranges.
+                    let cs: Vec<char> = lit.chars().collect();
+                    let mut set: Vec<char> = Vec::new();
+                    let mut i = 0;
+                    while i < cs.len() {
+                        if i + 2 < cs.len() && cs[i + 1] == '-' {
+                            let (a, b) = (cs[i] as u32, cs[i + 2] as u32);
+                            if a > b {
+                                return None;
+                            }
+                            set.extend((a..=b).filter_map(char::from_u32));
+                            i += 3;
+                        } else {
+                            set.push(cs[i]);
+                            i += 1;
+                        }
+                    }
+                    v = v.chars().filter(|c| !set.contains(c)).collect();
+                    rest = r;
+                } else {
+                    let word_op = |t: &str, op: &str| -> Option<String> {
+                        let r = t.strip_prefix(op)?;
+                        if r.is_empty() || r.starts_with('.') {
+                            Some(r.to_string())
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(r) = word_op(&t, ".strip") {
+                        v = v.trim().to_string();
+                        rest = r;
+                    } else if let Some(r) = word_op(&t, ".downcase") {
+                        v = v.to_lowercase();
+                        rest = r;
+                    } else if let Some(r) = word_op(&t, ".upcase") {
+                        v = v.to_uppercase();
+                        rest = r;
+                    } else if let Some(r) = word_op(&t, ".to_s") {
+                        rest = r;
+                    } else {
+                        return None;
+                    }
+                }
+            }
             return Some(v);
         }
         Some(match expr {
@@ -1587,8 +1690,19 @@ fn macos_symbol_version(symbol: &str) -> Option<String> {
 }
 
 /// Whether a trimmed Ruby line opens a `do … end` block.
+/// A full-line comment never opens or closes one, even
+/// when it quotes a block opener in prose.
 fn line_opens_block(t: &str) -> bool {
-    t.ends_with(" do") || t.contains(" do |")
+    !t.starts_with('#')
+        && (t.ends_with(" do")
+            || t.contains(" do |")
+            || t.starts_with("if ")
+            || t.starts_with("unless ")
+            || t.starts_with("while ")
+            || t.starts_with("until ")
+            || t.starts_with("case ")
+            || t.starts_with("for ")
+            || t == "begin")
 }
 
 /// A line that closes a Ruby block: bare `end`, or
@@ -1603,6 +1717,39 @@ fn line_closes_block(t: &str) -> bool {
 /// One quoted string token at the start of `s` (double quotes,
 /// interpolation already refused by the caller).
 fn quoted_token(s: &str) -> Option<(String, &str)> {
+    // Percent strings: `%Q(...)`, `%Q{...}`, …
+    // (double-quoted semantics).
+    if let Some(rest) = s.strip_prefix("%Q") {
+        let mut chars = rest.char_indices();
+        let (_, open) = chars.next()?;
+        let inner = &rest[open.len_utf8()..];
+        let close = match open {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '<' => '>',
+            _ => open,
+        };
+        let nesting = close != open;
+        let bytes = inner.as_bytes();
+        let mut i = 0usize;
+        let mut depth = 1usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b if b == open as u32 as u8 && nesting && open.is_ascii() => depth += 1,
+                b if b == close as u32 as u8 && close.is_ascii() => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((inner[..i].to_string(), &inner[i + 1..]));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        return None;
+    }
     let inner = s.strip_prefix('"')?;
     // Interpolation-aware: `\"` escapes and
     // `#{...}` spans (which may contain quotes,
@@ -1639,6 +1786,26 @@ fn quoted_token(s: &str) -> Option<(String, &str)> {
         i += 1;
     }
     None
+}
+
+/// A `cookies: { "k" => "v", … }` hash as one
+/// `k=v;k2=v2` header value (the oracle's
+/// `.join(";")`).
+fn parse_cookie_header(
+    value: &str,
+    substitute: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let inner = value.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+    let mut pairs = Vec::new();
+    if !inner.is_empty() {
+        for part in split_top_commas(inner) {
+            let (k, rest) = part.trim().split_once("=>")?;
+            let (k, _) = quoted_token(k.trim())?;
+            let (v, _) = quoted_token(rest.trim())?;
+            pairs.push(format!("{}={}", substitute(&k)?, substitute(&v)?));
+        }
+    }
+    Some(pairs.join(";"))
 }
 
 /// A `:symbol` token at the start of `s`, colon stripped.
@@ -1771,7 +1938,10 @@ fn ruby_unescape_dq(s: &str) -> String {
                         out.push('#');
                         out.push(other);
                     }
-                    None => out.push('#'),
+                    None => {
+                        out.pop();
+                        out.push('#');
+                    }
                 }
             }
             Some(other) => out.push(other),
@@ -1828,9 +1998,8 @@ fn parse_post_json(value: &str, substitute: &impl Fn(&str) -> Option<String>) ->
         } else if s.starts_with('{') {
             let (obj, used) = hash_json(s, substitute)?;
             Some((obj, used))
-        } else if s.starts_with('[') {
+        } else if let Some(mut rest) = s.strip_prefix('[') {
             let mut out = String::from("[");
-            let mut rest = &s[1..];
             let mut used = 1usize;
             let mut first = true;
             loop {
@@ -1877,7 +2046,7 @@ fn parse_post_json(value: &str, substitute: &impl Fn(&str) -> Option<String>) ->
             // for check-time substitution as a JSON
             // string value.
             let len = s
-                .find(|c: char| matches!(c, ',' | '}' | ']' | ' ' | '\t' | '\n' | '\r'))
+                .find([',', '}', ']', ' ', '\t', '\n', '\r'])
                 .unwrap_or(s.len());
             let tok = &s[..len];
             let chain = tok.strip_suffix(".to_s").unwrap_or(tok);
@@ -1972,11 +2141,10 @@ fn parse_post_json(value: &str, substitute: &impl Fn(&str) -> Option<String>) ->
             if let Some(r) = rest.strip_prefix(':') {
                 used += 1;
                 rest = r;
-            } else if let Some(r) = rest.strip_prefix("=>") {
+            } else {
+                let r = rest.strip_prefix("=>")?;
                 used += 2;
                 rest = r;
-            } else {
-                return None;
             }
             let t = rest.trim_start();
             used += rest.len() - t.len();
@@ -2452,13 +2620,20 @@ fn conditional_value(kind: &str, kwargs: &[(String, String)]) -> Option<String> 
 fn cask_livecheck_locals(lines: &[&str]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let set = |name: &str, value: String, out: &mut Vec<(String, String)>| {
+        // `version` is the DSL stanza, never a cask
+        // local: assignments inside strategy blocks
+        // (`version = "#{match[2]}…"`) must not shadow
+        // `#{version.…}` interpolation.
+        if name == "version" {
+            return;
+        }
         if let Some(slot) = out.iter_mut().find(|(n, _)| n == name) {
             slot.1 = value;
         } else {
             out.push((name.to_string(), value));
         }
     };
-    for line in lines {
+    for (line_idx, line) in lines.iter().enumerate() {
         let t = line.trim();
         // `arch arm: "…", intel: "…"` / `os macos: "…", linux: "…"`
         for (stanza, kind) in [
@@ -2484,6 +2659,36 @@ fn cask_livecheck_locals(lines: &[&str]) -> Vec<(String, String)> {
             let name = name.trim();
             if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 set(name, value, &mut out);
+            }
+        }
+        // `<ident> = version….split(…).each_with_index.map
+        // do |n, i|` + body + `end.join…` (silentknight's
+        // no-dot version): keep it as one brace-form
+        // interpolation token, which the split pipeline
+        // in `cask_version_token` evaluates.
+        if let Some((name, rhs)) = t.split_once(" = ") {
+            let name = name.trim();
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && let Some((head, params)) = rhs.trim().split_once(".each_with_index.map do |")
+                && head.starts_with("version")
+                && head.contains(".split(")
+                && let Some(params) = params.strip_suffix('|')
+                && let Some(body) = lines.get(line_idx + 1)
+                && let Some(end) = lines.get(line_idx + 2)
+                && let Some(suffix) = end.trim().strip_prefix("end")
+                && suffix.starts_with(".join")
+            {
+                let mut v = String::from("#{");
+                v.push_str(head);
+                v.push_str(".each_with_index.map { |");
+                v.push_str(params);
+                v.push_str("| ");
+                v.push_str(body.trim());
+                v.push_str(" }");
+                v.push_str(suffix);
+                v.push('}');
+                set(name, v, &mut out);
             }
         }
         // `<ident> = on_arch_conditional …` / `on_system_conditional …`
@@ -2554,6 +2759,8 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
             }
         }
         let version_chain = super::formula::version_chain_syntax(token)
+            || super::formula::version_ternary_syntax(token)
+            || super::formula::version_conditional_string_syntax(token)
             || token == "version[0]"
             || token
                 .strip_prefix("Regexp.escape(")
@@ -2658,13 +2865,14 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                         "sparkle" => spec.sparkle_block = parse_sparkle_shape(params, lines),
                         "header_match" => spec.header_block = parse_header_shape(params, lines),
                         _ => {
-                            spec.json_block = parse_json_shape(params, lines).or_else(|| {
-                                let subst: Vec<String> = lines
-                                    .iter()
-                                    .map(|l| substitute_local_tokens(l, &locals))
-                                    .collect();
-                                parse_json_template_shape(params, &subst, &locals)
-                            })
+                            spec.json_block =
+                                parse_json_shape(params, lines, &locals).or_else(|| {
+                                    let subst: Vec<String> = lines
+                                        .iter()
+                                        .map(|l| substitute_local_tokens(l, &locals))
+                                        .collect();
+                                    parse_json_template_shape(params, &subst, &locals)
+                                })
                         }
                     }
                     json_capture = None;
@@ -2692,7 +2900,10 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
             // substitute now (cask locals, Time): the
             // `version` family is check-time state a
             // stored pattern cannot defer.
-            let is_regex = t.starts_with("regex(");
+            let is_regex = t.starts_with("regex(")
+                || t.strip_prefix("regex ")
+                    .map(str::trim_start)
+                    .is_some_and(|r| r.starts_with('/') || r.starts_with("%r{"));
             let allowed = |line: &str| {
                 let mut rest = line;
                 while let Some(i) = rest.find("#{") {
@@ -2762,8 +2973,8 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                         match key.trim() {
                             "user_agent" => {
                                 if let Some(sym) = value.strip_prefix(':') {
-                                    if sym == "browser" {
-                                        spec.user_agent = Some(":browser".to_string());
+                                    if matches!(sym, "browser" | "fake" | "curl" | "default") {
+                                        spec.user_agent = Some(format!(":{sym}"));
                                     } else {
                                         spec.url_options = true;
                                     }
@@ -2773,11 +2984,33 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                                     spec.url_options = true;
                                 }
                             }
-                            // abrew's fetch never sends
-                            // `--compressed`, which is
-                            // exactly brew's `compressed:
-                            // false` behavior; the explicit
-                            // opt-out is a no-op here.
+                            // The fetch sends headers on
+                            // the wire identically to the
+                            // oracle's `--referer`/`--cookie`
+                            // args.
+                            "referer" => match quoted_token(value) {
+                                Some((lit, _)) => match substitute(&lit) {
+                                    Some(v) => spec
+                                        .header
+                                        .get_or_insert_with(Vec::new)
+                                        .push(format!("Referer: {v}")),
+                                    None => spec.url_options = true,
+                                },
+                                None => spec.url_options = true,
+                            },
+                            "cookies" => match parse_cookie_header(value, &substitute) {
+                                Some(h) => spec
+                                    .header
+                                    .get_or_insert_with(Vec::new)
+                                    .push(format!("Cookie: {h}")),
+                                None => spec.url_options = true,
+                            },
+                            // `compressed: false` omits
+                            // `--compressed` from the
+                            // fetch (brew's default sends
+                            // it, and some servers answer
+                            // with encodings curl cannot
+                            // decode).
                             "compressed" if value == "false" => {
                                 spec.compressed_false = true;
                             }
@@ -2851,6 +3084,33 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                 }
                 spec.regex = Some(pattern);
                 spec.regex_flags = flags;
+            } else if let Some(rest) = t.strip_prefix("regex ") {
+                // The same regex declaration without call
+                // parentheses (scribus): `regex %r{...}i`.
+                let rest = rest.trim_start();
+                if !(rest.starts_with('/') || rest.starts_with("%r{")) {
+                    return None;
+                }
+                let mut joined = rest.to_string();
+                let (pattern, flags, tail) = loop {
+                    if let Some(parsed) = regex_literal(&joined) {
+                        break (parsed.0, parsed.1, parsed.2.to_string());
+                    }
+                    body.get(idx)?;
+                    let next = all[open_idx + 1 + idx];
+                    idx += 1;
+                    joined.push('\n');
+                    joined.push_str(next);
+                };
+                let pattern = substitute(&pattern)?.replace(
+                    "#{Regexp.escape(version.major_minor)}",
+                    super::formula::MAJOR_MINOR_SENTINEL,
+                );
+                if !strip_trailing_comment(&tail).trim().is_empty() {
+                    return None;
+                }
+                spec.regex = Some(pattern);
+                spec.regex_flags = flags;
             } else if let Some(rest) = t.strip_prefix("strategy ") {
                 let (sym, tail) = symbol_token(rest.trim_start())?;
                 let tail = tail.trim();
@@ -2862,6 +3122,23 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                         .next()
                         .unwrap_or_default()
                 }) {
+                    if sym == "json" && field == "to_s" {
+                        spec.json_block = Some(super::formula::JsonBlock {
+                            has_regex: false,
+                            shape: super::formula::JsonShape::RootToS,
+                        });
+                        spec.strategy = Some(sym);
+                        spec.strategy_block = true;
+                        continue;
+                    }
+                    if sym == "page_match" && field == "strip" {
+                        spec.page_block = Some(super::formula::PageBlock {
+                            shape: super::formula::PageShape::PageStrip,
+                        });
+                        spec.strategy = Some(sym);
+                        spec.strategy_block = true;
+                        continue;
+                    }
                     if sym != "sparkle" {
                         return None;
                     }
@@ -2872,6 +3149,7 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                         match_guard: None,
                         present: Vec::new(),
                         needs_spec_regex: false,
+                        own_if: None,
                         expr: super::formula::SpExpr::Field(sp_field(field)?),
                     });
                     spec.strategy = Some(sym);
@@ -3044,15 +3322,15 @@ fn parse_xml_shape(params: &str, lines: &[String]) -> Option<super::formula::Xml
 /// in the enumerable subset.
 fn xml_path_parse(s: &str) -> Option<super::formula::XmlPathQ> {
     use super::formula::{XmlPathQ, XmlPred, XmlStep};
-    if s.contains("following-sibling") || s.contains("..") {
+    if s.contains("..") {
         return None;
     }
-    let (absolute, rest) = if let Some(r) = s.strip_prefix("//") {
-        (false, r)
+    let (absolute, relative, rest) = if let Some(r) = s.strip_prefix("//") {
+        (false, false, r)
     } else if let Some(r) = s.strip_prefix('/') {
-        (true, r)
+        (true, false, r)
     } else {
-        return None;
+        (false, true, s)
     };
     // Split on '/' outside brackets/quotes.
     let mut steps_str: Vec<String> = Vec::new();
@@ -3085,7 +3363,28 @@ fn xml_path_parse(s: &str) -> Option<super::formula::XmlPathQ> {
             None => (part.to_string(), None),
             Some(open) => {
                 let inner = part[open + 1..].strip_suffix(']')?.trim();
-                let pred = if let Some(v) = inner.strip_prefix("text()=") {
+                let pred = if let Some((left, right)) =
+                    inner.split_once("/following-sibling::*[1][text()=")
+                {
+                    let (child, child_text) = left
+                        .strip_suffix(']')
+                        .and_then(|l| l.split_once("[text()="))
+                        .and_then(|(tag, v)| Some((tag.trim().to_string(), xml_pred_value(v)?)))?;
+                    if child.is_empty()
+                        || !child.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.')
+                        })
+                    {
+                        return None;
+                    }
+                    Some(XmlPred::SiblingAfterChild {
+                        child,
+                        child_text,
+                        text: xml_pred_value(right.strip_suffix(']')?)?,
+                    })
+                } else if let Ok(n) = inner.parse::<usize>() {
+                    Some(XmlPred::Index(n))
+                } else if let Some(v) = inner.strip_prefix("text()=") {
                     Some(XmlPred::TextEq(xml_pred_value(v)?))
                 } else if inner.starts_with('@') && inner.contains(" and ") {
                     let mut all = Vec::new();
@@ -3093,19 +3392,42 @@ fn xml_path_parse(s: &str) -> Option<super::formula::XmlPathQ> {
                         let term = term.trim();
                         if let Some(r) = term.strip_prefix("not(@") {
                             all.push((r.strip_suffix(')')?.trim().to_string(), None));
-                        } else if let Some(r) = term.strip_prefix('@') {
+                        } else {
+                            let r = term.strip_prefix('@')?;
                             let (attr, v) = r.split_once('=')?;
                             all.push((attr.trim().to_string(), Some(xml_pred_value(v.trim())?)));
-                        } else {
-                            return None;
                         }
                     }
                     Some(XmlPred::AttrAll(all))
+                } else if let Some(r) = inner
+                    .strip_prefix("contains(@")
+                    .and_then(|r| r.strip_suffix(')'))
+                {
+                    let (attr, v) = r.split_once(',')?;
+                    Some(XmlPred::AttrContains(
+                        attr.trim().to_string(),
+                        xml_pred_value(v.trim())?,
+                    ))
                 } else if let Some(r) = inner.strip_prefix('@') {
                     let (attr, v) = r.split_once('=')?;
                     Some(XmlPred::AttrEq(
                         attr.trim().to_string(),
                         xml_pred_value(v.trim())?,
+                    ))
+                } else if let Some((child, v)) = inner.split_once("[text()=") {
+                    // `[Child[text()='v']]` — a child
+                    // element whose text equals `v`.
+                    let child = child.trim();
+                    if child.is_empty()
+                        || !child.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.')
+                        })
+                    {
+                        return None;
+                    }
+                    Some(XmlPred::ChildTextEq(
+                        child.to_string(),
+                        xml_pred_value(v.trim().strip_suffix(']')?)?,
                     ))
                 } else {
                     let (child, v) = inner.split_once('=')?;
@@ -3137,17 +3459,24 @@ fn xml_path_parse(s: &str) -> Option<super::formula::XmlPathQ> {
     if steps.is_empty() {
         return None;
     }
-    Some(XmlPathQ { absolute, steps })
+    Some(XmlPathQ {
+        absolute,
+        relative,
+        steps,
+    })
 }
 
 fn xml_pred_value(v: &str) -> Option<String> {
+    // `#{version...}` interpolations stay verbatim;
+    // plan_urls substitutes them against the checked
+    // unit's own version (outside tokens delegate).
     let v = v.trim();
     if let Some(inner) = v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
         Some(inner.to_string())
-    } else if let Some(inner) = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
-        Some(inner.to_string())
     } else {
-        None
+        v.strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
+            .map(|inner| inner.to_string())
     }
 }
 
@@ -3157,13 +3486,31 @@ fn xml_query<'a>(s: &'a str, root: &str) -> Option<(bool, super::formula::XmlPat
     let rest = s.trim().strip_prefix(root)?;
     let (all, rest) = if let Some(r) = rest.strip_prefix(".get_elements(") {
         (true, r)
-    } else if let Some(r) = rest.strip_prefix(".elements[") {
-        (false, r)
     } else {
-        return None;
+        let r = rest.strip_prefix(".elements[")?;
+        (false, r)
     };
-    let (path_str, tail) = quoted_token(rest.trim_start())?;
+    let (mut path_str, mut tail) = quoted_token(rest.trim_start())?;
+    // Adjacent string literals concatenate (the
+    // line-continued `"…" \` `"/…"` form).
+    loop {
+        let t = tail
+            .trim_start()
+            .strip_prefix('\\')
+            .unwrap_or(tail)
+            .trim_start();
+        if t.starts_with(['"', '\''])
+            && let Some((more, t2)) = quoted_token(t)
+        {
+            path_str.push_str(&more);
+            tail = t2;
+        } else {
+            tail = t;
+            break;
+        }
+    }
     let tail = tail.trim_start();
+    let tail = tail.strip_prefix(',').unwrap_or(tail).trim_start();
     let tail = if all {
         tail.strip_prefix(')')?
     } else {
@@ -3172,17 +3519,733 @@ fn xml_query<'a>(s: &'a str, root: &str) -> Option<(bool, super::formula::XmlPat
     Some((all, xml_path_parse(&path_str)?, tail))
 }
 
+/// One `x = xml.get_elements("P").map { |item| … }`
+/// list local for the zip form.
+fn xml_zip_local(stmt: &str, root: &str) -> Option<(String, super::formula::XmlMap)> {
+    use super::formula::{XmlMap, XmlProj};
+    let (name, rhs) = stmt.split_once(" = ")?;
+    let name = name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let (all, path, tail) = xml_query(rhs.trim(), root)?;
+    if !all {
+        return None;
+    }
+    let tail = tail.trim();
+    let tail = tail
+        .strip_prefix("&.map")
+        .or_else(|| tail.strip_prefix(".map"))?
+        .trim();
+    let inner = tail.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let inner = inner.strip_prefix('|')?;
+    let var_end = inner.find('|')?;
+    let var = inner[..var_end].trim();
+    let body = inner[var_end + 1..].trim();
+    let after = body.strip_prefix(var)?.trim();
+    let proj = if matches!(after, ".text" | ".text&.strip" | ".text.strip") {
+        XmlProj::Text
+    } else if let Some(t) = after.strip_prefix(".next_element") {
+        if !matches!(
+            t.trim(),
+            "&.text" | "&.text&.strip" | ".text" | ".text&.strip"
+        ) {
+            return None;
+        }
+        XmlProj::NextText
+    } else {
+        let r = after
+            .strip_prefix(".attributes[")
+            .or_else(|| after.strip_prefix("&.attributes["))?;
+        let (attr, t) = quoted_token(r.trim_start())?;
+        if t.trim() != "]" {
+            return None;
+        }
+        XmlProj::Attr(attr)
+    };
+    Some((
+        name.to_string(),
+        XmlMap {
+            path,
+            proj,
+            grep: false,
+            locals: Vec::new(),
+        },
+    ))
+}
+
+/// Two mapped lists reduced to extremes:
+/// `versions = …filter_map…match[1]`,
+/// `builds = …map { text }`, then
+/// `versions.max_by { Version.new }` and
+/// `builds.max` in one CSV template.
+fn parse_xml_two_list_extreme(
+    root: &str,
+    has_regex: bool,
+    stmts: &[String],
+) -> Option<super::formula::XmlShape> {
+    use super::formula::{XmlMap, XmlProj, XmlShape};
+    if !has_regex || stmts.len() != 10 {
+        return None;
+    }
+    let ident = |v: &str| {
+        !v.is_empty()
+            && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !v.chars().next().is_some_and(|c| c.is_ascii_digit())
+    };
+    let (versions_name, rhs) = stmts[0].split_once(" = ")?;
+    let versions_name = versions_name.trim();
+    if !ident(versions_name) {
+        return None;
+    }
+    let (all, versions_path, tail) = xml_query(rhs.trim(), root)?;
+    if !all {
+        return None;
+    }
+    let rest = [
+        "&.filter_map do |",
+        ".filter_map do |",
+        "&.map do |",
+        ".map do |",
+    ]
+    .iter()
+    .find_map(|p| tail.trim().strip_prefix(p))?;
+    let item_var = rest.strip_suffix('|')?.trim();
+    if !ident(item_var) {
+        return None;
+    }
+    let (mv, rhs) = stmts[1].split_once(" = ")?;
+    let mv = mv.trim();
+    if !ident(mv) {
+        return None;
+    }
+    let rest = rhs.trim().strip_prefix(item_var)?.trim();
+    let rest = rest
+        .strip_prefix("&.text")
+        .or_else(|| rest.strip_prefix(".text"))?
+        .trim();
+    let rest = rest
+        .strip_prefix("&.strip")
+        .or_else(|| rest.strip_prefix(".strip"))
+        .unwrap_or(rest)
+        .trim();
+    if rest != "&.match(regex)" && rest != ".match(regex)" {
+        return None;
+    }
+    if stmts[2].trim() != format!("next if {mv}.blank?")
+        && stmts[2].trim() != format!("next unless {mv}")
+    {
+        return None;
+    }
+    if stmts[3].trim() != format!("{mv}[1]") || stmts[4].trim() != "end" {
+        return None;
+    }
+    let (builds_name, builds) = xml_zip_local(&stmts[5], root)?;
+    if builds.proj != XmlProj::Text {
+        return None;
+    }
+    let (version_name, rhs) = stmts[6].split_once(" = ")?;
+    let version_name = version_name.trim();
+    let rest = rhs
+        .trim()
+        .strip_prefix(&format!("{versions_name}.max_by {{ |"))?;
+    let (vvar, rest) = rest.split_once('|')?;
+    let vvar = vvar.trim();
+    if !ident(version_name) || !ident(vvar) || rest.trim() != format!("Version.new({vvar}) }}") {
+        return None;
+    }
+    let (build_name, rhs) = stmts[7].split_once(" = ")?;
+    let build_name = build_name.trim();
+    if !ident(build_name) || rhs.trim() != format!("{builds_name}.max") {
+        return None;
+    }
+    if stmts[8].trim() != format!("next if {version_name}.blank? || {build_name}.blank?") {
+        return None;
+    }
+    let (body, tail) = quoted_token(stmts[9].trim())?;
+    if !tail.trim().is_empty() || body != format!("#{{{version_name}}},#{{{build_name}}}") {
+        return None;
+    }
+    Some(XmlShape::TwoListExtreme {
+        versions: XmlMap {
+            path: versions_path,
+            proj: XmlProj::TextMatch(false),
+            grep: false,
+            locals: Vec::new(),
+        },
+        builds,
+    })
+}
+
+/// `a = …map…; b = …map…; a.zip(b).map { |x, y| "…" }`
+fn parse_xml_zip_shape(
+    root: &str,
+    has_regex: bool,
+    stmts: &[String],
+) -> Option<super::formula::XmlShape> {
+    use super::formula::XmlShape;
+    if has_regex || stmts.len() < 3 {
+        return None;
+    }
+    let (a_name, a) = xml_zip_local(&stmts[0], root)?;
+    let (b_name, b) = xml_zip_local(&stmts[1], root)?;
+    let joined = stmts[2..].join(" ");
+    let rest = joined
+        .trim()
+        .strip_prefix(&format!("{a_name}.zip({b_name})"))?;
+    let rest = rest.trim().strip_prefix(".map")?.trim();
+    let inner = if let Some(r) = rest.strip_prefix('{') {
+        r.strip_suffix('}')?
+    } else {
+        rest.strip_prefix("do ")?.strip_suffix(" end")?
+    };
+    let inner = inner.trim().strip_prefix('|')?;
+    let var_end = inner.find('|')?;
+    let vars: Vec<String> = inner[..var_end]
+        .split(',')
+        .map(|v| v.trim().to_string())
+        .collect();
+    if vars.len() != 2 || vars.iter().any(|v| v.is_empty()) {
+        return None;
+    }
+    let (body_s, t) = quoted_token(inner[var_end + 1..].trim())?;
+    if !t.trim().is_empty() {
+        return None;
+    }
+    let parts = xml_template_parts(&body_s, "", &vars)?;
+    Some(XmlShape::ZipPair { a, b, parts })
+}
+
+/// A map-body template string over item reads
+/// (`#{item.attributes["k"]}`, `#{item.text}`):
+/// parts plus deduplicated per-item locals.
+fn xml_attr_template_parts(
+    body: &str,
+    var: &str,
+) -> Option<(
+    Vec<super::formula::XmlPart>,
+    Vec<super::formula::XmlItemLocal>,
+)> {
+    use super::formula::{XmlItemLocal, XmlPart};
+    let (s, t) = quoted_token(body.trim())?;
+    if !t.trim().is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut locals: Vec<XmlItemLocal> = Vec::new();
+    let mut rest = s.as_str();
+    while let Some(i) = rest.find("#{") {
+        if i > 0 {
+            parts.push(XmlPart::Lit(rest[..i].to_string()));
+        }
+        // The token's closing brace, quote-aware.
+        let inner = &rest[i + 2..];
+        let mut j = 0usize;
+        let mut quote: Option<u8> = None;
+        let bytes = inner.as_bytes();
+        while j < bytes.len() {
+            match (quote, bytes[j]) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), b'\\') => j += 1,
+                (Some(_), _) => {}
+                (None, b'"' | b'\'') => quote = Some(bytes[j]),
+                (None, b'}') => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= bytes.len() {
+            return None;
+        }
+        let token = inner[..j].trim();
+        let after = token.strip_prefix(var)?;
+        let local = if let Some(r) = after
+            .strip_prefix(".attributes[")
+            .or_else(|| after.strip_prefix("&.attributes["))
+        {
+            let (attr, t) = quoted_token(r.trim_start())?;
+            if t.trim() != "]" {
+                return None;
+            }
+            XmlItemLocal::Attr(attr)
+        } else if matches!(after.trim(), ".text" | "&.text") {
+            XmlItemLocal::Text
+        } else if let Some(r) = after
+            .strip_prefix(".text&.")
+            .or_else(|| after.strip_prefix(".text."))
+            && r.trim() == "[](regex, 1)"
+        {
+            XmlItemLocal::TextCapture
+        } else {
+            return None;
+        };
+        let idx = match locals.iter().position(|l| *l == local) {
+            Some(p) => p,
+            None => {
+                locals.push(local);
+                locals.len() - 1
+            }
+        };
+        parts.push(XmlPart::Local(idx));
+        rest = &inner[j + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(XmlPart::Lit(rest.to_string()));
+    }
+    if locals.is_empty() {
+        return None;
+    }
+    Some((parts, locals))
+}
+
+/// The guarded child-attribute match prefix of a
+/// map body: an optional beta-style child-text
+/// skip, a child attribute local, and its match.
+/// Returns (match var, projection, rest).
+fn xml_child_attr_match_prefix(
+    body: &str,
+    var: &str,
+) -> Option<(String, super::formula::XmlProj, String)> {
+    use super::formula::XmlProj;
+    let ident = |v: &str| {
+        !v.is_empty()
+            && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !v.chars().next().is_some_and(|c| c.is_ascii_digit())
+    };
+    fn child_tail<'a>(s: &'a str, var: &str) -> Option<(String, &'a str)> {
+        let r = s
+            .trim()
+            .strip_prefix(var)?
+            .strip_prefix(".elements[")
+            .or_else(|| s.trim().strip_prefix(var)?.strip_prefix("&.elements["))?;
+        let (child, t) = quoted_token(r.trim_start())?;
+        Some((child, t.trim().strip_prefix(']')?))
+    }
+    let mut rest = body.trim();
+    let mut skip_child = None;
+    if let Some(cond) = rest.strip_prefix("next if ") {
+        let (child, t) = child_tail(cond, var)?;
+        let t = t
+            .trim()
+            .strip_prefix("&.text&.include?(")
+            .or_else(|| t.trim().strip_prefix(".text.include?("))
+            .or_else(|| t.trim().strip_prefix("&.text.include?("))
+            .or_else(|| t.trim().strip_prefix(".text&.include?("))?;
+        let (lit, t) = quoted_token(t.trim_start())?;
+        rest = t.trim().strip_prefix(')')?.trim();
+        skip_child = Some((child, lit));
+    }
+    let (local, rhs) = rest.split_once(" = ")?;
+    let local = local.trim();
+    if !ident(local) {
+        return None;
+    }
+    let (child, t) = child_tail(rhs.trim(), var)?;
+    let t = t
+        .trim()
+        .strip_prefix("&.attributes&.[](")
+        .or_else(|| t.trim().strip_prefix(".attributes&.[]("))
+        .or_else(|| t.trim().strip_prefix("&.attributes.[]("))
+        .or_else(|| t.trim().strip_prefix(".attributes.[]("))?;
+    let (attr, t) = quoted_token(t.trim_start())?;
+    let rest = t.trim().strip_prefix(')')?.trim();
+    let (mv, rhs) = rest.split_once(" = ")?;
+    let mv = mv.trim();
+    if !ident(mv) {
+        return None;
+    }
+    let rhs = rhs.trim();
+    let rest = rhs
+        .strip_prefix(&format!("{local}&.match(regex) if {local}"))
+        .or_else(|| rhs.strip_prefix(&format!("{local}.match(regex) if {local}")))
+        .or_else(|| rhs.strip_prefix(&format!("{local}&.match(regex)")))
+        .or_else(|| rhs.strip_prefix(&format!("{local}.match(regex)")))?;
+    Some((
+        mv.to_string(),
+        XmlProj::ChildAttrMatch {
+            child,
+            attr,
+            skip_child,
+        },
+        rest.trim().to_string(),
+    ))
+}
+
 /// A statement-form `:xml` block reduced to data:
 /// first-element locals with blank guards and a
 /// template, or a `get_elements` map projection.
+/// `item = xml.elements["P"]&.text&.strip`, a blank
+/// guard, `j = …::Json.parse_json(item)`, `j["k"]`:
+/// the element text is an embedded JSON document.
+fn parse_xml_json_embed_shape(root: &str, stmts: &[String]) -> Option<super::formula::XmlShape> {
+    use super::formula::XmlShape;
+    if stmts.len() != 4 {
+        return None;
+    }
+    let (name, rhs) = stmts[0].split_once(" = ")?;
+    let name = name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let (all, path, tail) = xml_query(rhs.trim(), root)?;
+    if all
+        || !matches!(
+            tail.trim(),
+            "&.text&.strip" | "&.text" | ".text&.strip" | ".text"
+        )
+    {
+        return None;
+    }
+    if stmts[1].trim() != format!("next if {name}.blank?")
+        && stmts[1].trim() != format!("next unless {name}")
+    {
+        return None;
+    }
+    let (jname, rhs) = stmts[2].split_once(" = ")?;
+    let jname = jname.trim();
+    if rhs.trim() != format!("Homebrew::Livecheck::Strategy::Json.parse_json({name})") {
+        return None;
+    }
+    let rest = stmts[3].trim().strip_prefix(jname)?.strip_prefix('[')?;
+    let (key, t) = quoted_token(rest.trim_start())?;
+    if t.trim() != "]" {
+        return None;
+    }
+    Some(XmlShape::TextJsonKey { path, key })
+}
+
+/// Own-version locals (`version.csv.first.major`,
+/// `version.csv.second`), then a map matching each
+/// item's child text and forking on the capture's
+/// leading digits against the own major (endnote).
+fn parse_xml_own_fork_shape(
+    root: &str,
+    has_regex: bool,
+    stmts: &[String],
+) -> Option<super::formula::XmlShape> {
+    use super::formula::XmlShape;
+    if !has_regex || stmts.len() != 13 {
+        return None;
+    }
+    let own_local = |stmt: &str, want: &str| -> Option<String> {
+        let (name, rhs) = stmt.split_once(" = ")?;
+        let name = name.trim();
+        if rhs.trim() != want
+            || name.is_empty()
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        Some(name.to_string())
+    };
+    let a_name = own_local(&stmts[0], "version.csv.first.major")?;
+    let b_name = own_local(&stmts[1], "version.csv.second")?;
+    let (all, path, tail) = xml_query(stmts[2].trim(), root)?;
+    if !all {
+        return None;
+    }
+    let tail = tail.trim().strip_prefix(".map do |")?;
+    let var = tail.strip_suffix('|')?.trim();
+    if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let (u_name, rhs) = stmts[3].split_once(" = ")?;
+    let u_name = u_name.trim();
+    let rest = rhs.trim().strip_prefix(var)?.strip_prefix(".elements[")?;
+    let (child, t) = quoted_token(rest.trim_start())?;
+    if !matches!(
+        t.trim(),
+        "]&.text&.strip" | "]&.text" | "].text&.strip" | "].text"
+    ) {
+        return None;
+    }
+    let (m_name, rhs) = stmts[4].split_once(" = ")?;
+    let m_name = m_name.trim();
+    if rhs.trim() != format!("{u_name}.match(regex) if {u_name}")
+        && rhs.trim() != format!("{u_name}.match(regex)")
+    {
+        return None;
+    }
+    if stmts[5].trim() != format!("next if {m_name}.blank?") {
+        return None;
+    }
+    let (maj_name, rhs) = stmts[6].split_once(" = ")?;
+    let maj_name = maj_name.trim();
+    if rhs.trim() != format!("{m_name}[1][/^(\\d+)/, 1]") {
+        return None;
+    }
+    if stmts[7].trim() != format!("if {maj_name} == {a_name} && {b_name}") {
+        return None;
+    }
+    let mut want_then = String::from("\"#{");
+    want_then.push_str(m_name);
+    want_then.push_str("[1]},#{");
+    want_then.push_str(&b_name);
+    want_then.push_str("}\"");
+    if stmts[8].trim() != want_then
+        || stmts[9].trim() != "else"
+        || stmts[10].trim() != format!("{m_name}[1]")
+        || stmts[11].trim() != "end"
+        || stmts[12].trim() != "end"
+    {
+        return None;
+    }
+    Some(XmlShape::ChildMatchOwnFork { path, child })
+}
+
+/// `url = xml.elements["P"]&.text&.strip`, a blank
+/// guard, `page_headers(url)` merged, a header match
+/// against the spec regex, and a capture template
+/// (canon-eos-utility).
+fn parse_xml_header_hop_shape(
+    root: &str,
+    has_regex: bool,
+    stmts: &[String],
+) -> Option<super::formula::XmlShape> {
+    use super::formula::XmlShape;
+    if !has_regex || stmts.len() != 6 {
+        return None;
+    }
+    let (u_name, rhs) = stmts[0].split_once(" = ")?;
+    let u_name = u_name.trim();
+    let (all, path, tail) = xml_query(rhs.trim(), root)?;
+    if all
+        || !matches!(
+            tail.trim(),
+            "&.text&.strip" | "&.text" | ".text&.strip" | ".text"
+        )
+    {
+        return None;
+    }
+    if stmts[1].trim() != format!("next if {u_name}.blank?") {
+        return None;
+    }
+    let (h_name, rhs) = stmts[2].split_once(" = ")?;
+    let h_name = h_name.trim();
+    if rhs.trim() != format!("Homebrew::Livecheck::Strategy.page_headers({u_name}).reduce(&:merge)")
+    {
+        return None;
+    }
+    let (mv, rhs) = stmts[3].split_once(" = ")?;
+    let mv = mv.trim();
+    let rest = rhs.trim().strip_prefix(h_name)?.strip_prefix('[')?;
+    let (header, t) = quoted_token(rest.trim_start())?;
+    if !matches!(t.trim(), "]&.match(regex)" | "].match(regex)") {
+        return None;
+    }
+    if stmts[4].trim() != format!("next if {mv}.blank?") {
+        return None;
+    }
+    let (body_str, t) = quoted_token(stmts[5].trim())?;
+    if !t.trim().is_empty() {
+        return None;
+    }
+    let parts = xml_template_parts(&body_str, mv, &[])?;
+    Some(XmlShape::HeaderHop {
+        path,
+        header: header.to_lowercase(),
+        parts,
+    })
+}
+
+/// A `max_by` element pick, version + second-XML URL
+/// child locals, a `page_content` fetch re-parsed as
+/// XML, and a spec-regex match rendered with the
+/// version local (turbotax-2024).
+fn parse_xml_hop_match_shape(
+    root: &str,
+    has_regex: bool,
+    stmts: &[String],
+) -> Option<super::formula::XmlShape> {
+    use super::formula::XmlShape;
+    // The pick assignment may wrap after `=` (the
+    // query chain then opens the next statement).
+    let wrapped;
+    let stmts: &[String] = if stmts.len() == 13 && stmts[0].trim().ends_with('=') {
+        let mut v = vec![format!("{} {}", stmts[0].trim(), stmts[1].trim())];
+        v.extend(stmts[2..].iter().cloned());
+        wrapped = v;
+        &wrapped
+    } else {
+        stmts
+    };
+    if !has_regex || stmts.len() != 12 {
+        return None;
+    }
+    let ident = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    let (e_name, rhs) = stmts[0].split_once(" = ")?;
+    let e_name = ident(e_name)?;
+    let (all, path, tail) = xml_query(rhs.trim(), root)?;
+    if !all {
+        return None;
+    }
+    let tail = tail.trim().strip_prefix(".max_by")?.trim();
+    let tail = tail.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let tail = tail.strip_prefix('|')?;
+    let (ivar, body) = tail.split_once('|')?;
+    let ivar = ident(ivar)?;
+    let rest = body
+        .trim()
+        .strip_prefix(&ivar)?
+        .strip_prefix(".elements[")?;
+    let (max_child, t) = quoted_token(rest.trim_start())?;
+    if !matches!(t.trim(), "]&.text" | "].text") {
+        return None;
+    }
+    if stmts[1].trim() != format!("next unless {e_name}") {
+        return None;
+    }
+    let child_text = |stmt: &str| -> Option<(String, String, String)> {
+        let (name, rhs) = stmt.split_once(" = ")?;
+        let name = ident(name)?;
+        let rest = rhs
+            .trim()
+            .strip_prefix(&e_name)?
+            .strip_prefix(".elements[")?;
+        let (child, t) = quoted_token(rest.trim_start())?;
+        Some((name, child, t.trim().to_string()))
+    };
+    let (v_name, version_child, tail) = child_text(&stmts[2])?;
+    let rest = tail.strip_prefix("]&.text&.[](")?;
+    let (pat, flags, t) = regex_literal(rest.trim())?;
+    if t.trim() != ", 1)" {
+        return None;
+    }
+    let (u_name, url_child, tail) = child_text(&stmts[3])?;
+    if !matches!(
+        tail.as_str(),
+        "]&.text&.strip" | "]&.text" | "].text&.strip"
+    ) {
+        return None;
+    }
+    if stmts[4].trim() != format!("next if !{v_name} || !{u_name}") {
+        return None;
+    }
+    let (p_name, rhs) = stmts[5].split_once(" = ")?;
+    let p_name = ident(p_name)?;
+    if rhs.trim() != format!("Homebrew::Livecheck::Strategy.page_content({u_name})") {
+        return None;
+    }
+    let inner = stmts[6]
+        .trim()
+        .strip_prefix("next if (")?
+        .strip_suffix(").blank?")?;
+    let (c_name, rhs) = inner.split_once(" = ")?;
+    let c_name = ident(c_name)?;
+    if rhs.trim() != format!("{p_name}[:content]") {
+        return None;
+    }
+    let (x_name, rhs) = stmts[7].split_once(" = ")?;
+    let x_name = ident(x_name)?;
+    if rhs.trim() != format!("Homebrew::Livecheck::Strategy::Xml.parse_xml({c_name})") {
+        return None;
+    }
+    let (l_name, rhs) = stmts[8].split_once(" = ")?;
+    let l_name = ident(l_name)?;
+    let (all, path2, tail) = xml_query(rhs.trim(), &x_name)?;
+    if all
+        || !matches!(
+            tail.trim(),
+            "&.text&.strip" | "&.text" | ".text&.strip" | ".text"
+        )
+    {
+        return None;
+    }
+    let (mv, rhs) = stmts[9].split_once(" = ")?;
+    let mv = ident(mv)?;
+    if rhs.trim() != format!("{l_name}&.match(regex)")
+        && rhs.trim() != format!("{l_name}.match(regex)")
+    {
+        return None;
+    }
+    if stmts[10].trim() != format!("next if {mv}.blank?") {
+        return None;
+    }
+    let (body_str, t) = quoted_token(stmts[11].trim())?;
+    if !t.trim().is_empty() {
+        return None;
+    }
+    let parts = xml_template_parts(&body_str, &mv, &[v_name])?;
+    Some(XmlShape::HopMatch {
+        path,
+        max_child,
+        version_child,
+        pat,
+        flags,
+        url_child,
+        path2,
+        parts,
+    })
+}
+
 fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::formula::XmlBlock> {
     use super::formula::{XmlBlock, XmlLocal, XmlMap, XmlProj, XmlRender, XmlShape, XmlTemplate};
     let (root, has_regex) = block_params(params)?;
-    let stmts: Vec<String> = lines
+    let raw_stmts: Vec<String> = lines
         .iter()
         .map(|l| strip_trailing_comment(l.trim()).trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+    // Line-continued chains (`.map { … }` on its own
+    // line) join onto the previous statement, as do
+    // trailing-`\` and open-bracket continuations
+    // (multi-line `xml.elements[ … ]` paths).
+    fn bracket_balance(s: &str) -> i32 {
+        let mut bal = 0i32;
+        let mut quote: Option<char> = None;
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) if c == '\\' => {
+                    chars.next();
+                }
+                Some(_) => {}
+                None if c == '\'' || c == '"' => quote = Some(c),
+                None if c == '[' => bal += 1,
+                None if c == ']' => bal -= 1,
+                _ => {}
+            }
+        }
+        bal
+    }
+    let mut stmts: Vec<String> = Vec::new();
+    for stmt in raw_stmts {
+        let joins = stmt.starts_with('.')
+            || stmts.last().is_some_and(|prev: &String| {
+                prev.trim_end().ends_with('\\') || bracket_balance(prev) > 0
+            });
+        if joins && let Some(prev) = stmts.last_mut() {
+            prev.push(' ');
+            prev.push_str(&stmt);
+        } else {
+            stmts.push(stmt);
+        }
+    }
+    if let Some(shape) = parse_xml_zip_shape(&root, has_regex, &stmts) {
+        return Some(XmlBlock { has_regex, shape });
+    }
+    if let Some(shape) = parse_xml_two_list_extreme(&root, has_regex, &stmts) {
+        return Some(XmlBlock { has_regex, shape });
+    }
+    if let Some(shape) = parse_xml_json_embed_shape(&root, &stmts) {
+        return Some(XmlBlock { has_regex, shape });
+    }
+    if let Some(shape) = parse_xml_own_fork_shape(&root, has_regex, &stmts) {
+        return Some(XmlBlock { has_regex, shape });
+    }
+    if let Some(shape) = parse_xml_header_hop_shape(&root, has_regex, &stmts) {
+        return Some(XmlBlock { has_regex, shape });
+    }
+    if let Some(shape) = parse_xml_hop_match_shape(&root, has_regex, &stmts) {
+        return Some(XmlBlock { has_regex, shape });
+    }
     let first = stmts.first()?;
     // Map form.
     if let Some((true, path, tail)) = xml_query(first, &root) {
@@ -3194,13 +4257,11 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
             .or_else(|| tail.strip_prefix(".filter_map"))
         {
             (true, r)
-        } else if let Some(r) = tail
-            .strip_prefix("&.map")
-            .or_else(|| tail.strip_prefix(".map"))
-        {
-            (false, r)
         } else {
-            return None;
+            let r = tail
+                .strip_prefix("&.map")
+                .or_else(|| tail.strip_prefix(".map"))?;
+            (false, r)
         };
         let _ = is_filter;
         let inner_all = inner_all.trim_start();
@@ -3219,12 +4280,32 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
         } else {
             joined
         };
+        // Symbol block-pass: `.map(&:text)`.
+        if joined.trim() == "(&:text)" && !grep {
+            return Some(XmlBlock {
+                has_regex,
+                shape: XmlShape::Template(Box::new(XmlTemplate {
+                    locals: Vec::new(),
+                    elems: Vec::new(),
+                    require: Vec::new(),
+                    require_elems: Vec::new(),
+                    match_local: None,
+                    or_pairs: Vec::new(),
+                    map: Some(XmlMap {
+                        path,
+                        proj: XmlProj::Text,
+                        grep: false,
+                        locals: Vec::new(),
+                    }),
+                    render: XmlRender::Projection,
+                })),
+            });
+        }
         let inner = if let Some(r) = joined.strip_prefix('{') {
             r.strip_suffix('}')?.trim().to_string()
-        } else if let Some(r) = joined.strip_prefix("do ") {
-            r.strip_suffix(" end")?.trim().to_string()
         } else {
-            return None;
+            let r = joined.strip_prefix("do ")?;
+            r.strip_suffix(" end")?.trim().to_string()
         };
         let inner = inner.strip_prefix('|')?;
         let var_end = inner.find('|')?;
@@ -3237,28 +4318,77 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
         }
         // Match form inside the map.
         if body.contains(".match(regex)") {
-            let (mv, rest) = body.split_once(" = ")?;
-            let mv = mv.trim();
-            let rest = rest.trim().strip_prefix(&format!("{var}"))?;
-            let rest = rest
-                .strip_prefix(".text")
-                .or_else(|| rest.strip_prefix(".next_element&.text"))?;
-            let strip = rest.starts_with("&.strip");
-            let rest = if strip {
-                rest.strip_prefix("&.strip")?.trim()
-            } else {
-                rest.trim()
-            };
             let proj_next = body.contains(".next_element");
-            let rest = rest
-                .strip_prefix("&.match(regex)")
-                .or_else(|| rest.strip_prefix(".match(regex)"))?
-                .trim();
+            let (mv, rest, attr_src, child_proj) =
+                if let Some((mv, proj, rest)) = xml_child_attr_match_prefix(body, var) {
+                    (mv, rest, None, Some(proj))
+                } else {
+                    let (mv, rest) = body.split_once(" = ")?;
+                    let mv = mv.trim().to_string();
+                    let rest = rest.trim().strip_prefix(var)?;
+                    let (attr_src, rest) = if let Some(r) = rest
+                        .strip_prefix(".attributes[")
+                        .or_else(|| rest.strip_prefix("&.attributes["))
+                    {
+                        let (attr, t) = quoted_token(r.trim_start())?;
+                        (Some(attr), t.trim().strip_prefix(']')?)
+                    } else {
+                        (
+                            None,
+                            rest.strip_prefix(".text")
+                                .or_else(|| rest.strip_prefix(".next_element&.text"))?,
+                        )
+                    };
+                    let strip = rest.starts_with("&.strip");
+                    let rest = if strip {
+                        rest.strip_prefix("&.strip")?.trim()
+                    } else {
+                        rest.trim()
+                    };
+                    let rest = rest
+                        .strip_prefix("&.match(regex)")
+                        .or_else(|| rest.strip_prefix(".match(regex)"))?
+                        .trim()
+                        .to_string();
+                    (mv, rest, attr_src, None)
+                };
+            let mv = mv.as_str();
+            let rest = rest.as_str();
             let rest = rest
                 .strip_prefix(&format!("next if {mv}.blank?"))
                 .or_else(|| rest.strip_prefix(&format!("next unless {mv}")))?
                 .trim();
-            let render = if let Some(r) = rest.strip_prefix(&format!("{mv}[")) {
+            let xml_arm = |s: &str| -> Option<Vec<super::formula::XmlPart>> {
+                let s = s.trim();
+                if s.starts_with('"') {
+                    let (body_s, t) = quoted_token(s)?;
+                    if !t.trim().is_empty() {
+                        return None;
+                    }
+                    xml_template_parts(&body_s, mv, &[])
+                } else {
+                    let r = s.strip_prefix(&format!("{mv}["))?;
+                    let close = r.find(']')?;
+                    if !r[close + 1..].trim().is_empty() {
+                        return None;
+                    }
+                    Some(vec![super::formula::XmlPart::Cap(r[..close].parse().ok()?)])
+                }
+            };
+            let render = if let Some(q) = json_outside_quotes(rest, " ? ")
+                && !rest.starts_with('"')
+            {
+                let (cond_s, tail) = rest.split_at(q);
+                let tail = &tail[3..];
+                let c = json_outside_quotes(tail, " : ")?;
+                let cap_s = cond_s.trim().strip_suffix(".present?")?;
+                let cap = page_cap_index(mv, cap_s)?;
+                XmlRender::CapPresentFork {
+                    cap,
+                    then: xml_arm(&tail[..c])?,
+                    els: xml_arm(&tail[c + 3..])?,
+                }
+            } else if let Some(r) = rest.strip_prefix(&format!("{mv}[")) {
                 let close = r.find(']')?;
                 if !r[close + 1..].trim().is_empty() {
                     return None;
@@ -3277,11 +4407,20 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
                 has_regex: true,
                 shape: XmlShape::Template(Box::new(XmlTemplate {
                     locals: Vec::new(),
+                    elems: Vec::new(),
                     require: Vec::new(),
+                    require_elems: Vec::new(),
                     match_local: None,
+                    or_pairs: Vec::new(),
                     map: Some(XmlMap {
                         path,
-                        proj: XmlProj::TextMatch(proj_next),
+                        proj: match child_proj {
+                            Some(proj) => proj,
+                            None => match attr_src {
+                                Some(attr) => XmlProj::AttrMatch(attr),
+                                None => XmlProj::TextMatch(proj_next),
+                            },
+                        },
                         grep: false,
                         locals: Vec::new(),
                     }),
@@ -3289,19 +4428,54 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
                 })),
             });
         }
+        // A bare template over item attributes/text
+        // (`"#{item.attributes["k"]},…"`).
+        if body.starts_with('"')
+            && !grep
+            && let Some((parts, locals)) = xml_attr_template_parts(body, var)
+        {
+            return Some(XmlBlock {
+                has_regex,
+                shape: XmlShape::Template(Box::new(XmlTemplate {
+                    locals: Vec::new(),
+                    elems: Vec::new(),
+                    require: Vec::new(),
+                    require_elems: Vec::new(),
+                    match_local: None,
+                    or_pairs: Vec::new(),
+                    map: Some(XmlMap {
+                        path,
+                        proj: XmlProj::Text,
+                        grep: false,
+                        locals,
+                    }),
+                    render: XmlRender::Template(parts),
+                })),
+            });
+        }
         let after = body.strip_prefix(var)?.trim();
         let proj = if after == ".text" || after == ".text&.strip" || after == ".text.strip" {
             XmlProj::Text
+        } else if let Some(r) = after
+            .strip_prefix(".text&.strip&.delete_suffix(")
+            .or_else(|| after.strip_prefix(".text.strip.delete_suffix("))
+            .or_else(|| after.strip_prefix(".text&.delete_suffix("))
+        {
+            let (suffix, t) = quoted_token(r.trim())?;
+            if t.trim() != ")" {
+                return None;
+            }
+            XmlProj::TextDeleteSuffix(suffix)
         } else if after.starts_with(".next_element") {
             let t = after.strip_prefix(".next_element")?.trim();
             if !matches!(t, "&.text" | "&.text&.strip" | ".text" | ".text&.strip") {
                 return None;
             }
             XmlProj::NextText
-        } else if let Some(r) = after
-            .strip_prefix(".attributes[")
-            .or_else(|| after.strip_prefix("&.attributes["))
-        {
+        } else {
+            let r = after
+                .strip_prefix(".attributes[")
+                .or_else(|| after.strip_prefix("&.attributes["))?;
             let (attr, t) = quoted_token(r.trim_start())?;
             let t = t.trim();
             let t = t.strip_prefix(']')?.trim();
@@ -3312,8 +4486,6 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
             } else {
                 return None;
             }
-        } else {
-            return None;
         };
         if grep && !matches!(proj, XmlProj::Text | XmlProj::NextText | XmlProj::Attr(_)) {
             return None;
@@ -3322,8 +4494,11 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
             has_regex,
             shape: XmlShape::Template(Box::new(XmlTemplate {
                 locals: Vec::new(),
+                elems: Vec::new(),
                 require: Vec::new(),
+                require_elems: Vec::new(),
                 match_local: None,
+                or_pairs: Vec::new(),
                 map: Some(XmlMap {
                     path,
                     proj,
@@ -3337,65 +4512,143 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
     // Single form: locals, guards, match, render.
     let mut locals: Vec<XmlLocal> = Vec::new();
     let mut names: Vec<String> = Vec::new();
+    let mut elems: Vec<XmlLocal> = Vec::new();
+    let mut elem_names: Vec<String> = Vec::new();
     let mut require: Vec<usize> = Vec::new();
+    let mut require_elems: Vec<usize> = Vec::new();
+    let mut or_pairs: Vec<(usize, usize)> = Vec::new();
     let mut match_local: Option<usize> = None;
     let mut match_var = String::new();
     let mut match_guarded = false;
-    let expr_local =
-        |rhs: &str, locals: &mut Vec<XmlLocal>, names: &mut Vec<String>| -> Option<usize> {
-            let (all, path, tail) = xml_query(rhs, &root)?;
-            if all {
+    // A text read `<base>.elements[…]…&.text`: root reads need an
+    // absolute/descendant path, element-local reads a relative one.
+    let text_local = |rhs: &str,
+                      base: &str,
+                      from: Option<usize>,
+                      locals: &mut Vec<XmlLocal>,
+                      names: &mut Vec<String>|
+     -> Option<usize> {
+        let (all, path, tail) = xml_query(rhs, base)?;
+        if all || path.relative != from.is_some() {
+            return None;
+        }
+        let tail = tail.trim();
+        let next = if let Some(t) = tail.strip_prefix("&.next_element") {
+            if !matches!(t.trim(), "&.text" | "&.text&.strip" | ".text") {
                 return None;
             }
-            let tail = tail.trim();
-            let next = if let Some(t) = tail.strip_prefix("&.next_element") {
-                if !matches!(t.trim(), "&.text" | "&.text&.strip" | ".text") {
-                    return None;
-                }
-                true
-            } else if matches!(tail, "&.text" | "&.text&.strip" | ".text" | ".text&.strip") {
-                false
-            } else {
-                return None;
-            };
-            locals.push(XmlLocal { path, next });
-            names.push(String::new());
-            Some(locals.len() - 1)
+            true
+        } else if matches!(tail, "&.text" | "&.text&.strip" | ".text" | ".text&.strip") {
+            false
+        } else {
+            return None;
         };
+        locals.push(XmlLocal { path, next, from });
+        names.push(String::new());
+        Some(locals.len() - 1)
+    };
+    let expr_local = |rhs: &str, locals: &mut Vec<XmlLocal>, names: &mut Vec<String>| {
+        text_local(rhs, &root, None, locals, names)
+    };
     for stmt in &stmts[..stmts.len() - 1] {
         let stmt = stmt.as_str();
         if let Some(cond) = stmt.strip_prefix("next if ") {
-            if cond == format!("{match_var}.blank?") && !match_var.is_empty() {
-                match_guarded = true;
-            } else if cond.contains(".blank?") {
-                for part in cond.split(" || ") {
-                    let name = part.trim().strip_suffix(".blank?")?;
+            if !cond.contains(".blank?") {
+                return None;
+            }
+            for part in cond.split(" || ") {
+                let name = part.trim().strip_suffix(".blank?")?;
+                if !match_var.is_empty() && name == match_var {
+                    match_guarded = true;
+                } else if let Some(pos) = elem_names.iter().position(|n| n == name) {
+                    require_elems.push(pos);
+                } else {
                     require.push(names.iter().position(|n| n == name)?);
                 }
-            } else {
-                return None;
             }
         } else if let Some(cond) = stmt.strip_prefix("next unless ") {
             if cond == match_var && !match_var.is_empty() {
                 match_guarded = true;
             } else {
-                return None;
+                let pos = elem_names.iter().position(|n| n == cond)?;
+                require_elems.push(pos);
             }
+        } else if let Some((name, rhs)) = stmt.split_once(" ||= ") {
+            // `<name> ||= <read>`: a nil fallback.
+            let pos = names.iter().position(|n| n == name.trim())?;
+            let idx = expr_local(rhs.trim(), &mut locals, &mut names)?;
+            names[idx] = name.trim().to_string();
+            or_pairs.push((pos, idx));
         } else if let Some((name, rhs)) = stmt.split_once(" = ") {
             let name = name.trim();
             if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 return None;
             }
             let rhs = rhs.trim();
-            // `<match> = <local>.match(regex) [if <local>]`
+            // A trailing modifier `if <local>` only skips the
+            // match when the local is nil, which the blank
+            // guard then excludes either way.
+            let rhs = match rhs.rsplit_once(" if ") {
+                Some((b, cond))
+                    if names.iter().any(|n| n == cond.trim())
+                        && (b.ends_with(".match(regex)") || b.ends_with("&.match(regex)")) =>
+                {
+                    b.trim()
+                }
+                _ => rhs,
+            };
+            // `<match> = <local>[.strip].match(regex) [if <local>]`
             if let Some(base) = rhs
                 .strip_suffix("&.match(regex)")
                 .or_else(|| rhs.strip_suffix(".match(regex)"))
             {
                 let base = base.trim();
-                let base = base.rsplit_once(" if ").map_or(base, |(b, _)| b.trim());
+                let base = base
+                    .strip_suffix("&.strip")
+                    .or_else(|| base.strip_suffix(".strip"))
+                    .unwrap_or(base)
+                    .trim();
                 match_local = Some(names.iter().position(|n| n == base)?);
                 match_var = name.to_string();
+            } else if let Some(r) = rhs
+                .strip_prefix("REXML::XPath.first(")
+                .and_then(|r| r.strip_prefix(root.as_str()))
+                .and_then(|r| r.trim().strip_prefix(','))
+            {
+                // `REXML::XPath.first(xml, "path")` is the
+                // elements[] first read.
+                let (path_str, t) = quoted_token(r.trim())?;
+                if t.trim() != ")" {
+                    return None;
+                }
+                let path = xml_path_parse(&path_str)?;
+                if path.relative {
+                    return None;
+                }
+                elems.push(XmlLocal {
+                    path,
+                    next: false,
+                    from: None,
+                });
+                elem_names.push(name.to_string());
+            } else if let Some((all, path, tail)) = xml_query(rhs, &root)
+                && !all
+                && !path.relative
+                && matches!(tail.trim(), "" | "&.next_element")
+            {
+                elems.push(XmlLocal {
+                    path,
+                    next: tail.trim() == "&.next_element",
+                    from: None,
+                });
+                elem_names.push(name.to_string());
+            } else if let Some(pos) = elem_names
+                .iter()
+                .position(|n| rhs.starts_with(&format!("{n}.elements[")))
+            {
+                let base = elem_names[pos].clone();
+                let idx = text_local(rhs, &base, Some(pos), &mut locals, &mut names)?;
+                names[idx] = name.to_string();
             } else {
                 let idx = expr_local(rhs, &mut locals, &mut names)?;
                 names[idx] = name.to_string();
@@ -3425,15 +4678,46 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
             || final_stmt == format!("{n}&.strip")
     }) {
         XmlRender::LocalValue(pos, final_stmt.ends_with(".strip"))
+    } else if let Some(pos) = elem_names.iter().position(|n| {
+        final_stmt.starts_with(&format!("{n}.next_element"))
+            || final_stmt.starts_with(&format!("{n}&.next_element"))
+    }) {
+        // `<elem>.next_element.text`
+        let base = elem_names[pos].clone();
+        let after = final_stmt[base.len()..].trim();
+        let t = after
+            .strip_prefix("&.next_element")
+            .or_else(|| after.strip_prefix(".next_element"))?;
+        let strip = matches!(t.trim(), "&.text&.strip" | ".text.strip");
+        if !matches!(
+            t.trim(),
+            "&.text" | ".text" | "&.text&.strip" | ".text.strip"
+        ) {
+            return None;
+        }
+        locals.push(XmlLocal {
+            path: super::formula::XmlPathQ {
+                absolute: false,
+                relative: true,
+                steps: Vec::new(),
+            },
+            next: true,
+            from: Some(pos),
+        });
+        names.push(String::new());
+        XmlRender::LocalValue(locals.len() - 1, strip)
     } else {
         // A bare first-element read.
         let idx = expr_local(final_stmt, &mut locals, &mut names)?;
         XmlRender::LocalValue(idx, false)
     };
     let uses_cap = match &render {
-        XmlRender::Template(parts) => parts
-            .iter()
-            .any(|p| matches!(p, super::formula::XmlPart::Cap(_))),
+        XmlRender::Template(parts) => parts.iter().any(|p| {
+            matches!(
+                p,
+                super::formula::XmlPart::Cap(_) | super::formula::XmlPart::CapTr(..)
+            )
+        }),
         XmlRender::CapValue(_) => true,
         _ => false,
     };
@@ -3444,8 +4728,11 @@ fn parse_xml_template_shape(params: &str, lines: &[String]) -> Option<super::for
         has_regex,
         shape: XmlShape::Template(Box::new(XmlTemplate {
             locals,
+            elems,
             require,
+            require_elems,
             match_local,
+            or_pairs,
             map: None,
             render,
         })),
@@ -3513,8 +4800,11 @@ fn xml_map_locals_shape(
         has_regex,
         shape: XmlShape::Template(Box::new(XmlTemplate {
             locals: Vec::new(),
+            elems: Vec::new(),
             require,
+            require_elems: Vec::new(),
             match_local: None,
+            or_pairs: Vec::new(),
             map: Some(XmlMap {
                 path,
                 proj: XmlProj::Text,
@@ -3546,10 +4836,15 @@ fn xml_template_parts(
             && let Some(r) = token.strip_prefix(&format!("{match_var}["))
         {
             let close = r.find(']')?;
-            if !r[close + 1..].trim().is_empty() {
+            let n: usize = r[..close].parse().ok()?;
+            let tail = r[close + 1..].trim();
+            if tail.is_empty() {
+                XmlPart::Cap(n)
+            } else if let Some((a, b)) = sp_tr_args(tail) {
+                XmlPart::CapTr(n, a, b)
+            } else {
                 return None;
             }
-            XmlPart::Cap(r[..close].parse().ok()?)
         } else if let Some(base) = token.strip_suffix(".strip") {
             XmlPart::LocalStrip(names.iter().position(|n| n == base)?)
         } else {
@@ -3586,11 +4881,609 @@ fn xml_map_parts(s: &str) -> Option<(String, String)> {
 /// or `None` for anything beyond the enumerable forms.
 /// `params` is the block tail (`do`, `do |json|`,
 /// `do |json, regex|`).
-fn parse_json_shape(params: &str, lines: &[String]) -> Option<super::formula::JsonBlock> {
+/// A trailing `.map { |_, item| item["k"] }` over
+/// an object's values: the value key.
+fn json_values_key(cur: &str) -> Option<String> {
+    let rest = cur
+        .strip_prefix("&.map")
+        .or_else(|| cur.strip_prefix(".map"))?
+        .trim();
+    let inner = rest.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let inner = inner.strip_prefix('|')?;
+    let var_end = inner.find('|')?;
+    let vars: Vec<&str> = inner[..var_end].split(',').map(str::trim).collect();
+    if vars.len() != 2 || vars[0] != "_" {
+        return None;
+    }
+    let body = inner[var_end + 1..].trim();
+    let (field, tail) = jt_field_tail(body, vars[1])?;
+    if tail.trim().is_empty() {
+        Some(field)
+    } else {
+        None
+    }
+}
+
+/// One `<dig>&.match(<arg>)` attempt, where the
+/// argument is the block `regex`, a regex local,
+/// or a literal regex.
+fn jt_match_attempt(
+    rhs: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+    regex_locals: &[(String, String, String)],
+) -> Option<super::formula::JsonMatchAttempt> {
+    use super::formula::{JsonMatchAttempt, JsonMatchRegex};
+    let (path, tail) = jt_dig(rhs.trim(), root, cask_locals)?;
+    let arg = tail
+        .trim()
+        .strip_prefix("&.match(")
+        .or_else(|| tail.trim().strip_prefix(".match("))?
+        .trim();
+    let regex = if arg == "regex)" {
+        JsonMatchRegex::Block
+    } else if let Some((_, pat, flags)) = regex_locals
+        .iter()
+        .find(|(name, _, _)| arg == format!("{name})"))
+    {
+        JsonMatchRegex::Literal(pat.clone(), flags.clone())
+    } else {
+        let (pat, flags, rest) = regex_literal(arg)?;
+        if rest.trim() != ")" || pat.contains("#{") {
+            return None;
+        }
+        JsonMatchRegex::Literal(pat, flags)
+    };
+    Some(JsonMatchAttempt { path, regex })
+}
+
+/// Several named dig matches rendered in one final
+/// template (wetype's fallback match,
+/// font-oppo-sans's two matches):
+/// `[<re> = /…/] <m> = <dig>&.match(…) [<m> ||=
+/// <dig>&.match(…)] guards "#{<m>[n]}…"`.
+fn parse_json_multi_match(
+    root: &str,
+    lines: &[String],
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    use super::formula::{JsonMultiMatch, JsonMultiPart, JsonShape};
+    let stmts: Vec<String> = lines
+        .iter()
+        .map(|l| strip_trailing_comment(l.trim()).trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if stmts.len() < 3 {
+        return None;
+    }
+    let ident = |v: &str| {
+        !v.is_empty()
+            && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !v.chars().next().is_some_and(|c| c.is_ascii_digit())
+    };
+    let mut regex_locals: Vec<(String, String, String)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut matches: Vec<JsonMultiMatch> = Vec::new();
+    let mut required: Vec<bool> = Vec::new();
+    for stmt in &stmts[..stmts.len() - 1] {
+        let stmt = stmt.trim();
+        if let Some(cond) = stmt.strip_prefix("next if ") {
+            let name = cond.trim().strip_suffix(".blank?")?;
+            let pos = names.iter().position(|n| n == name)?;
+            required[pos] = true;
+            continue;
+        }
+        if let Some(cond) = stmt.strip_prefix("next unless ") {
+            let pos = names.iter().position(|n| n == cond.trim())?;
+            required[pos] = true;
+            continue;
+        }
+        if let Some((name, rhs)) = stmt.split_once(" ||= ") {
+            let pos = names.iter().position(|n| n == name.trim())?;
+            // This shape evaluates the fallback attempts before its required-match guard.
+            // A Ruby guard that already skipped a missing match cannot be moved after them.
+            if required[pos] {
+                return None;
+            }
+            let attempt = jt_match_attempt(rhs, root, cask_locals, &regex_locals)?;
+            matches[pos].attempts.push(attempt);
+            continue;
+        }
+        let (name, rhs) = jt_assignment(stmt)?;
+        let name = name.trim();
+        if !ident(name) || name == root || name == "regex" {
+            return None;
+        }
+        let rhs = rhs.trim();
+        if let Some((pat, flags, tail)) = regex_literal(rhs)
+            && tail.trim().is_empty()
+        {
+            if pat.contains("#{")
+                || regex_locals.iter().any(|(n, _, _)| n == name)
+                || names.iter().any(|n| n == name)
+            {
+                return None;
+            }
+            regex_locals.push((name.to_string(), pat, flags));
+            continue;
+        }
+        if names.iter().any(|n| n == name) || regex_locals.iter().any(|(n, _, _)| n == name) {
+            return None;
+        }
+        let attempt = jt_match_attempt(rhs, root, cask_locals, &regex_locals)?;
+        names.push(name.to_string());
+        matches.push(JsonMultiMatch {
+            attempts: vec![attempt],
+        });
+        required.push(false);
+    }
+    let multi = matches.len() > 1 || matches.iter().any(|m| m.attempts.len() > 1);
+    if !multi || required.iter().any(|r| !*r) {
+        return None;
+    }
+    let (body, tail) = quoted_token(stmts[stmts.len() - 1].trim())?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    let mut render = Vec::new();
+    let mut used = vec![false; names.len()];
+    let mut rest = body.as_str();
+    while let Some(i) = rest.find("#{") {
+        if i > 0 {
+            render.push(JsonMultiPart::Lit(rest[..i].to_string()));
+        }
+        let j = rest[i + 2..].find('}')?;
+        let token = rest[i + 2..i + 2 + j].trim();
+        let (pos, cap) = names.iter().enumerate().find_map(|(pos, name)| {
+            let r = token.strip_prefix(&format!("{name}["))?;
+            let cap: usize = r.strip_suffix(']')?.parse().ok()?;
+            Some((pos, cap))
+        })?;
+        used[pos] = true;
+        render.push(JsonMultiPart::Cap(pos, cap));
+        rest = &rest[i + 2 + j + 1..];
+    }
+    if !rest.is_empty() {
+        render.push(JsonMultiPart::Lit(rest.to_string()));
+    }
+    if used.iter().any(|u| !*u) {
+        return None;
+    }
+    Some(JsonShape::MultiMatch { matches, render })
+}
+
+/// Nested `each` loops over dug arrays taking
+/// the first inner field matching the block regex
+/// (unity's downloads scan):
+/// `match = nil <dig>&.each do |i| <i-dig>&.each
+/// do |d| match = d["f"]&.match(regex) break if
+/// match end break if match end next unless match
+/// <render>`.
+/// `<v> = <dig> [|| <dig>…] <mv> = <v>&.match(regex)
+/// next if <mv>.blank? <render>` (quarkclouddrive).
+fn parse_json_dig_match(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    let (v, rest) = assign_parts(joined.trim())?;
+    let mut paths = Vec::new();
+    let mut tail: &str = "";
+    for (i, side) in rest.split(" || ").enumerate() {
+        let (path, t) = jt_dig(side.trim(), root, cask_locals)?;
+        if path.is_empty() {
+            return None;
+        }
+        if i + 1 < rest.split(" || ").count() && !t.trim().is_empty() {
+            return None;
+        }
+        paths.push(path);
+        tail = t;
+    }
+    let (mv, rhs) = assign_parts(tail.trim())?;
+    let after = rhs
+        .trim()
+        .strip_prefix(&format!("{v}&.match(regex)"))
+        .or_else(|| rhs.trim().strip_prefix(&format!("{v}.match(regex)")))?;
+    let after = after
+        .trim()
+        .strip_prefix(&format!("next if {mv}.blank?"))
+        .or_else(|| after.trim().strip_prefix(&format!("next unless {mv}")))?;
+    let mut locals: Vec<super::formula::JsonLocal> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let render = jt_render(
+        after.trim(),
+        root,
+        root,
+        &mv,
+        &mut locals,
+        &mut names,
+        cask_locals,
+    )?;
+    if !locals.is_empty() {
+        return None;
+    }
+    Some(super::formula::JsonShape::DigMatch {
+        paths,
+        render: Box::new(render),
+    })
+}
+
+/// `version = nil <dig>.filter_map do |_k, item|
+/// match = item.dig(…)&.match(regex) next unless
+/// match version = <render> break end version`
+/// (expressvpn).
+fn parse_json_entries_first(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    let s = joined.trim();
+    let (vvar, rest) = s.split_once(" = nil ")?;
+    let vvar = vvar.trim();
+    if vvar.is_empty() || !vvar.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let (path, rest) = jt_dig(rest.trim(), root, cask_locals)?;
+    let rest = rest.trim();
+    let rest = [
+        ".filter_map do |",
+        ".map do |",
+        ".each do |",
+        "&.filter_map do |",
+    ]
+    .iter()
+    .find_map(|p| rest.strip_prefix(p))?;
+    let (params, rest) = rest.split_once('|')?;
+    let item = params.rsplit(',').next()?.trim();
+    if item.is_empty() || !item.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let (mv, rhs) = assign_parts(rest.trim())?;
+    let (dig, tail) = jt_dig(rhs.trim(), item, cask_locals)?;
+    let after = tail
+        .trim()
+        .strip_prefix("&.match(regex)")
+        .or_else(|| tail.trim().strip_prefix(".match(regex)"))?;
+    let after = after
+        .trim()
+        .strip_prefix(&format!("next unless {mv}"))
+        .or_else(|| after.trim().strip_prefix(&format!("next if {mv}.blank?")))?;
+    let (assigned, render) = assign_parts(after.trim())?;
+    if assigned != vvar {
+        return None;
+    }
+    let (render, tail) = render.trim().split_once(" break")?;
+    if tail.trim() != format!("end {vvar}") {
+        return None;
+    }
+    let mut locals: Vec<super::formula::JsonLocal> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let render = jt_render(
+        render.trim(),
+        item,
+        root,
+        &mv,
+        &mut locals,
+        &mut names,
+        cask_locals,
+    )?;
+    if !locals.is_empty() {
+        return None;
+    }
+    Some(super::formula::JsonShape::EntriesFirstMatch {
+        path,
+        dig,
+        render: Box::new(render),
+    })
+}
+
+/// `<outer>.map do |item| item<dig>&.filter_map do
+/// |a| a["f"]&.[](regex, 1) end end[.flatten]`
+/// (rnote).
+fn parse_json_nested_collect(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    let (outer, rest) = jt_dig(joined.trim(), root, cask_locals)?;
+    let rest = rest.trim();
+    let rest = [
+        ".map do |",
+        ".filter_map do |",
+        "&.map do |",
+        "&.filter_map do |",
+    ]
+    .iter()
+    .find_map(|p| rest.strip_prefix(p))?;
+    let (ivar, rest) = rest.split_once('|')?;
+    let ivar = ivar.trim();
+    let (inner, rest) = jt_dig(rest.trim(), ivar, cask_locals)?;
+    let rest = rest.trim();
+    let rest = [
+        "&.filter_map do |",
+        ".filter_map do |",
+        "&.map do |",
+        ".map do |",
+    ]
+    .iter()
+    .find_map(|p| rest.strip_prefix(p))?;
+    let (avar, rest) = rest.split_once('|')?;
+    let avar = avar.trim();
+    let (field, tail) = jt_field_tail(rest.trim(), avar)?;
+    let tail = tail.trim();
+    if tail != "&.[](regex, 1) end end.flatten"
+        && tail != "&.[](regex, 1) end end"
+        && tail != "&.[](regex,1) end end.flatten"
+        && tail != "&.[](regex,1) end end"
+    {
+        return None;
+    }
+    Some(super::formula::JsonShape::NestedCollect {
+        outer,
+        inner,
+        field,
+    })
+}
+
+/// `<outer>.map do |g| g<dig>&.map do |item|
+/// <guarded projection> end end[&.flatten]`
+/// (synology-drive's utility groups).
+fn parse_json_nested_map(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+    has_regex: bool,
+) -> Option<super::formula::JsonShape> {
+    let (outer, rest) = jt_dig(joined.trim(), root, cask_locals)?;
+    let rest = [
+        ".map do |",
+        ".filter_map do |",
+        ".flat_map do |",
+        "&.map do |",
+        "&.filter_map do |",
+        "&.flat_map do |",
+    ]
+    .iter()
+    .find_map(|p| rest.trim().strip_prefix(p))?;
+    let (gvar, rest) = rest.split_once('|')?;
+    let (inner, rest) = jt_dig(rest.trim(), gvar.trim(), cask_locals)?;
+    let rest = [
+        "&.filter_map do |",
+        ".filter_map do |",
+        "&.flat_map do |",
+        ".flat_map do |",
+        "&.map do |",
+        ".map do |",
+    ]
+    .iter()
+    .find_map(|p| rest.trim().strip_prefix(p))?;
+    let (avar, rest) = rest.split_once('|')?;
+    let body = [" end end&.flatten", " end end.flatten", " end end"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))?;
+    let guard = json_map_guarded(avar.trim(), body.trim())?;
+    let uses_regex = guard.capture == super::formula::MapCapture::BlockRegex
+        || guard
+            .guards
+            .iter()
+            .any(|g| matches!(g.cond, super::formula::JsonCond::NoneMatch(..)));
+    if uses_regex && !has_regex {
+        return None;
+    }
+    Some(super::formula::JsonShape::NestedMap {
+        outer,
+        inner,
+        guard: Box::new(guard),
+    })
+}
+
+/// Expand simple `#{...}` interpolations in a
+/// regex fragment: a quoted literal (the form
+/// identifier substitution leaves) or a cask
+/// local, inserted raw as Ruby does.
+fn jt_expand_regex_interpolations(s: &str, locals: &[(String, String)]) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("#{") {
+        out.push_str(&rest[..i]);
+        let j = rest[i + 2..].find('}')?;
+        let token = rest[i + 2..i + 2 + j].trim();
+        if token.starts_with(['"', '\'']) {
+            let (value, tail) = quoted_token(token)?;
+            if !tail.trim().is_empty() {
+                return None;
+            }
+            out.push_str(&value);
+        } else {
+            let value = locals.iter().find(|(n, _)| n == token)?.1.as_str();
+            out.push_str(value);
+        }
+        rest = &rest[i + 2 + j + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// `<outer>.map do |o| o<dig>&.map do |i| guards;
+/// next o["f"] unless i["g"]; "#{o["f"]},#{i["g"]}"
+/// end end[&.flatten]` (gimp's release builds).
+fn parse_json_nested_template(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    use super::formula::{JsonGuard, JsonShape};
+    let (outer, rest) = jt_dig(joined.trim(), root, cask_locals)?;
+    let rest = [
+        ".map do |",
+        ".filter_map do |",
+        ".flat_map do |",
+        "&.map do |",
+        "&.filter_map do |",
+        "&.flat_map do |",
+    ]
+    .iter()
+    .find_map(|p| rest.trim().strip_prefix(p))?;
+    let (gvar, rest) = rest.split_once('|')?;
+    let gvar = gvar.trim();
+    let (inner, rest) = jt_dig(rest.trim(), gvar, cask_locals)?;
+    let rest = [
+        "&.filter_map do |",
+        ".filter_map do |",
+        "&.flat_map do |",
+        ".flat_map do |",
+        "&.map do |",
+        ".map do |",
+    ]
+    .iter()
+    .find_map(|p| rest.trim().strip_prefix(p))?;
+    let (avar, rest) = rest.split_once('|')?;
+    let avar = avar.trim();
+    let body = [" end end&.flatten", " end end.flatten", " end end"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))?
+        .trim();
+    let mut rest = body;
+    let mut guards = Vec::new();
+    loop {
+        let (unless, after) = if let Some(r) = rest.strip_prefix("next unless ") {
+            (true, r)
+        } else if let Some(r) = rest.strip_prefix("next if ") {
+            (false, r)
+        } else {
+            break;
+        };
+        let boundary = json_outside_quotes(after, " next ")?;
+        // The following `next <field>` is the early
+        // return, not another guard.
+        if after[boundary + 1..].starts_with(&format!("next {gvar}[")) {
+            let cond_s = jt_expand_regex_interpolations(&after[..boundary], cask_locals)?;
+            let (cond, tail) = parse_json_cond(avar, cond_s.trim())?;
+            if !tail.trim().is_empty() {
+                return None;
+            }
+            guards.push(JsonGuard { unless, cond });
+            rest = after[boundary + 1..].trim();
+            break;
+        }
+        let cond_s = jt_expand_regex_interpolations(&after[..boundary], cask_locals)?;
+        let (cond, tail) = parse_json_cond(avar, cond_s.trim())?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        guards.push(JsonGuard { unless, cond });
+        rest = after[boundary + 1..].trim();
+    }
+    let rest = rest.strip_prefix("next ")?;
+    let (outer_field, tail) = jt_field_tail(rest, gvar)?;
+    // This shape records a truthiness fallback, not Ruby's distinct blankness predicate.
+    // Empty strings remain truthy, so admitting `if field.blank?` would change its result.
+    let tail = tail.trim().strip_prefix("unless ")?;
+    let (inner_field, tail) = jt_field_tail(tail, avar)?;
+    let (template, tail) = quoted_token(tail.trim())?;
+    if !tail.trim().is_empty()
+        || template != format!("#{{{gvar}[\"{outer_field}\"]}},#{{{avar}[\"{inner_field}\"]}}")
+    {
+        return None;
+    }
+    Some(JsonShape::NestedTemplate {
+        outer,
+        inner,
+        guards,
+        outer_field,
+        inner_field,
+    })
+}
+
+fn parse_json_nested_first(
+    joined: &str,
+    root: &str,
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonShape> {
+    let s = joined.trim();
+    let (mv, rest) = s.split_once(" = nil ")?;
+    let mv = mv.trim();
+    if mv.is_empty() || !mv.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let (outer, rest) = jt_dig(rest.trim(), root, cask_locals)?;
+    let rest = rest
+        .trim()
+        .strip_prefix("&.each do |")
+        .or_else(|| rest.trim().strip_prefix(".each do |"))?;
+    let (ivar, rest) = rest.split_once('|')?;
+    let ivar = ivar.trim();
+    let (inner, rest) = jt_dig(rest.trim(), ivar, cask_locals)?;
+    let rest = rest
+        .trim()
+        .strip_prefix("&.each do |")
+        .or_else(|| rest.trim().strip_prefix(".each do |"))?;
+    let (dvar, rest) = rest.split_once('|')?;
+    let dvar = dvar.trim();
+    let rest = rest.trim().strip_prefix(&format!("{mv} = "))?;
+    let (field, rest) = jt_field_tail(rest.trim(), dvar)?;
+    let rest = rest.trim();
+    let rest = rest
+        .strip_prefix("&.match(regex)")
+        .or_else(|| rest.strip_prefix(".match(regex)"))?;
+    let rest = rest.trim().strip_prefix(&format!("break if {mv}"))?;
+    let rest = rest.trim().strip_prefix("end")?;
+    let rest = rest.trim().strip_prefix(&format!("break if {mv}"))?;
+    let rest = rest.trim().strip_prefix("end")?;
+    let rest = rest.trim().strip_prefix(&format!("next unless {mv}"))?;
+    let mut locals: Vec<super::formula::JsonLocal> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let render = jt_render(
+        rest.trim(),
+        dvar,
+        root,
+        mv,
+        &mut locals,
+        &mut names,
+        cask_locals,
+    )?;
+    if !locals.is_empty() {
+        return None;
+    }
+    Some(super::formula::JsonShape::NestedFirstMatch {
+        outer,
+        inner,
+        field,
+        render: Box::new(render),
+    })
+}
+
+fn parse_json_shape(
+    params: &str,
+    lines: &[String],
+    cask_locals: &[(String, String)],
+) -> Option<super::formula::JsonBlock> {
     use super::formula::{JsonBlock, JsonKey, JsonShape};
     let (root, has_regex) = block_params(params)?;
-    let joined = join_block_lines(lines);
+    let joined = jt_substitute_idents(&join_block_lines(lines), cask_locals);
     let body = joined.trim();
+    if let Some(shape) = parse_json_nested_first(body, &root, cask_locals) {
+        return Some(JsonBlock { has_regex, shape });
+    }
+    if let Some(shape) = parse_json_nested_map(body, &root, cask_locals, has_regex) {
+        return Some(JsonBlock { has_regex, shape });
+    }
+    if let Some(shape) = parse_json_nested_template(body, &root, cask_locals) {
+        return Some(JsonBlock { has_regex, shape });
+    }
+    if has_regex {
+        for shape in [
+            parse_json_multi_match(&root, lines, cask_locals),
+            parse_json_dig_match(body, &root, cask_locals),
+            parse_json_entries_first(body, &root, cask_locals),
+            parse_json_nested_collect(body, &root, cask_locals),
+        ] {
+            if let Some(shape) = shape {
+                return Some(JsonBlock { has_regex, shape });
+            }
+        }
+    }
     let mut s = body;
     // The two-statement match form:
     // `m = <path>&.match(regex) m[1]`.
@@ -3616,7 +5509,28 @@ fn parse_json_shape(params: &str, lines: &[String]) -> Option<super::formula::Js
     }
     let mut path: Vec<JsonKey> = Vec::new();
     loop {
-        if let Some(rest) = cur.strip_prefix(".dig(") {
+        if let Some(rest) = cur
+            .strip_prefix(".first")
+            .or_else(|| cur.strip_prefix("&.first"))
+            && (rest.is_empty() || rest.starts_with(['.', '&', '[']))
+        {
+            path.push(JsonKey::Idx(0));
+            cur = rest;
+        } else if let Some(rest) = cur
+            .strip_prefix("&.[](")
+            .or_else(|| cur.strip_prefix(".[]("))
+        {
+            match json_bracket_call_key(rest) {
+                Some((k, tail)) => {
+                    path.push(k);
+                    cur = tail;
+                }
+                None => break,
+            }
+        } else if let Some(rest) = cur
+            .strip_prefix(".dig(")
+            .or_else(|| cur.strip_prefix("&.dig("))
+        {
             let close = rest.find(')')?;
             for arg in rest[..close].split(',') {
                 let arg = arg.trim();
@@ -3649,8 +5563,59 @@ fn parse_json_shape(params: &str, lines: &[String]) -> Option<super::formula::Js
             shape: JsonShape::DigRegex(path),
         });
     }
+    let cur = cur.trim();
     let shape = if cur.is_empty() {
         JsonShape::Dig(path)
+    } else if let Some(rest) = cur
+        .strip_prefix("&.join(")
+        .or_else(|| cur.strip_prefix(".join("))
+    {
+        let (sep, tail) = quoted_token(rest.trim_start())?;
+        if tail.trim() != ")" {
+            return None;
+        }
+        JsonShape::DigJoin(path, sep)
+    } else if let Some(key) = json_values_key(cur) {
+        JsonShape::ValuesKey(path, key)
+    } else if let Some((pat, flags, tmpl)) = cur
+        .strip_prefix(".to_s")
+        .and_then(|r| sub_backref_args(r.trim()))
+        .filter(|(_, _, tmpl)| !tmpl.contains('\\'))
+    {
+        JsonShape::DigSubPlain(path, pat, flags, tmpl)
+    } else if let Some(rest) = cur
+        .strip_prefix("&.match(regex)&.captures")
+        .or_else(|| cur.strip_prefix(".match(regex)&.captures"))
+        .or_else(|| cur.strip_prefix("&.match(regex).captures"))
+        .or_else(|| cur.strip_prefix(".match(regex).captures"))
+    {
+        if !rest.is_empty() || !has_regex {
+            return None;
+        }
+        JsonShape::DigCaptures(path)
+    } else if let Some(rest) = cur
+        .strip_prefix("&.scan(regex)")
+        .or_else(|| cur.strip_prefix(".scan(regex)"))
+    {
+        if !has_regex {
+            return None;
+        }
+        let rest = rest.trim();
+        let rest = rest
+            .strip_prefix("&.map")
+            .or_else(|| rest.strip_prefix(".map"))?
+            .trim();
+        let inner = if let Some(r) = rest.strip_prefix('{') {
+            r.strip_suffix('}')?.trim()
+        } else {
+            let r = rest.strip_prefix("do ")?;
+            r.strip_suffix(" end")?.trim()
+        };
+        let inner = inner.strip_prefix('|')?;
+        let var_end = inner.find('|')?;
+        let var = inner[..var_end].trim();
+        let parts = page_expr_parts(var, inner[var_end + 1..].trim())?;
+        JsonShape::DigScan(path, parts)
     } else if let Some(sep) = split_first_tail(cur) {
         JsonShape::DigSplitFirst(path, sep)
     } else if let Some(rest) = cur
@@ -3670,45 +5635,171 @@ fn parse_json_shape(params: &str, lines: &[String]) -> Option<super::formula::Js
             return None;
         }
         JsonShape::DigRegex(path)
+    } else if let Some(rest) = cur
+        .strip_prefix("&.match(regex) { |")
+        .or_else(|| cur.strip_prefix(".match(regex) { |"))
+    {
+        // `….match(regex) { |m| m[1] }`
+        let inner = rest.strip_suffix('}')?.trim();
+        let (var, expr) = inner.split_once('|')?;
+        if expr.trim() != format!("{}[1]", var.trim()) || !has_regex {
+            return None;
+        }
+        JsonShape::DigRegex(path)
     } else if let Some(shape) = parse_values_map_shape(&path, cur) {
         shape
     } else {
+        // A trailing `&.max` after the map block.
+        let (cur, want_max) = match cur
+            .strip_suffix("&.max")
+            .or_else(|| cur.strip_suffix(".max"))
+        {
+            Some(c) if c.trim_end().ends_with("end") || c.trim_end().ends_with('}') => (c, true),
+            _ => (cur, false),
+        };
         let rest = strip_map_open(cur)?;
-        let (var, inner) = json_map_parts(rest)?;
-        if let Some((item_key, capture, (tr, sub))) = json_map_item(&var, &inner) {
-            if capture == super::formula::MapCapture::BlockRegex && !has_regex {
-                return None;
+        let shaped = if let Some((kvar, vvar, inner)) = json_entries_parts(rest) {
+            // Leading key guards, then the value
+            // projection under the value variable.
+            let mut s = inner.trim();
+            let mut guards: Vec<super::formula::JsonGuard> = Vec::new();
+            loop {
+                let (unless, r) = if let Some(r) = s.strip_prefix("next unless ") {
+                    (true, r)
+                } else if let Some(r) = s.strip_prefix("next if ") {
+                    (false, r)
+                } else {
+                    break;
+                };
+                let Some(r) = r
+                    .trim()
+                    .strip_prefix(kvar.as_str())
+                    .and_then(|r| r.strip_prefix(".match?("))
+                else {
+                    break;
+                };
+                let Some((pat, flags, t)) = regex_literal(r.trim()) else {
+                    break;
+                };
+                let Some(t) = t.trim().strip_prefix(')') else {
+                    break;
+                };
+                guards.push(super::formula::JsonGuard {
+                    unless,
+                    cond: super::formula::JsonCond::KeyMatchRe(pat, flags),
+                });
+                s = t.trim();
             }
-            if tr.is_none() && sub.is_none() && capture == super::formula::MapCapture::None {
-                JsonShape::MapKey(path, item_key)
-            } else if tr.is_none()
-                && sub.is_none()
-                && capture == super::formula::MapCapture::BlockRegex
-            {
-                JsonShape::MapRegex(path, item_key)
+            // A key projection (`|version, item|
+            // <guards> version`): keys passing
+            // value guards, julia-app form.
+            let keys_shape = {
+                let mut trial = guards.clone();
+                let mut rest = s;
+                let mut ok = true;
+                loop {
+                    let (unless, r) = if let Some(r) = rest.strip_prefix("next if ") {
+                        (false, r)
+                    } else if let Some(r) = rest.strip_prefix("next unless ") {
+                        (true, r)
+                    } else {
+                        break;
+                    };
+                    match parse_json_cond(&vvar, r) {
+                        Some((cond, r)) => {
+                            trial.push(super::formula::JsonGuard { unless, cond });
+                            rest = r.trim();
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && rest == kvar.as_str() && !trial.is_empty() {
+                    Some(JsonShape::EntriesKeys(path.clone(), trial))
+                } else {
+                    None
+                }
+            };
+            if let Some(shape) = keys_shape {
+                shape
             } else {
-                JsonShape::MapGuarded(
-                    path,
-                    Box::new(super::formula::MapGuard {
-                        item_key,
-                        capture,
-                        tr,
-                        sub,
-                        guards: Vec::new(),
-                    }),
-                )
+                let mut guard = match json_map_guarded(&vvar, s) {
+                    Some(g) => g,
+                    None => {
+                        let (item_key, capture, (tr, sub)) = json_map_item(&vvar, s)?;
+                        super::formula::MapGuard {
+                            item_key,
+                            capture,
+                            tr,
+                            sub,
+                            guards: Vec::new(),
+                        }
+                    }
+                };
+                if guard.capture == super::formula::MapCapture::BlockRegex && !has_regex {
+                    return None;
+                }
+                guards.append(&mut guard.guards);
+                guard.guards = guards;
+                JsonShape::EntriesMap(path, Box::new(guard))
             }
         } else {
-            let guard = json_map_guarded(&var, &inner)?;
-            let uses_regex = guard.capture == super::formula::MapCapture::BlockRegex
-                || guard
-                    .guards
-                    .iter()
-                    .any(|g| matches!(g.cond, super::formula::JsonCond::NoneMatch(..)));
-            if uses_regex && !has_regex {
-                return None;
+            let (var, inner) = json_map_parts(rest)?;
+            if let Some((item_key, capture, (tr, sub))) = json_map_item(&var, &inner) {
+                if capture == super::formula::MapCapture::BlockRegex && !has_regex {
+                    return None;
+                }
+                if tr.is_none() && sub.is_none() && capture == super::formula::MapCapture::None {
+                    JsonShape::MapKey(path, item_key)
+                } else if tr.is_none()
+                    && sub.is_none()
+                    && capture == super::formula::MapCapture::BlockRegex
+                {
+                    JsonShape::MapRegex(path, item_key)
+                } else {
+                    JsonShape::MapGuarded(
+                        path,
+                        Box::new(super::formula::MapGuard {
+                            item_key,
+                            capture,
+                            tr,
+                            sub,
+                            guards: Vec::new(),
+                        }),
+                    )
+                }
+            } else {
+                let guard = json_map_guarded(&var, &inner)?;
+                let uses_regex = guard.capture == super::formula::MapCapture::BlockRegex
+                    || guard
+                        .guards
+                        .iter()
+                        .any(|g| matches!(g.cond, super::formula::JsonCond::NoneMatch(..)));
+                if uses_regex && !has_regex {
+                    return None;
+                }
+                JsonShape::MapGuarded(path, Box::new(guard))
             }
-            JsonShape::MapGuarded(path, Box::new(guard))
+        };
+        if want_max {
+            match shaped {
+                JsonShape::MapGuarded(p, g) => JsonShape::MapGuardedMax(p, g),
+                JsonShape::MapKey(p, k) => JsonShape::MapGuardedMax(
+                    p,
+                    Box::new(super::formula::MapGuard {
+                        item_key: k,
+                        capture: super::formula::MapCapture::None,
+                        tr: None,
+                        sub: None,
+                        guards: Vec::new(),
+                    }),
+                ),
+                _ => return None,
+            }
+        } else {
+            shaped
         }
     };
     Some(JsonBlock { has_regex, shape })
@@ -3756,6 +5847,24 @@ fn substitute_local_tokens(line: &str, locals: &[(String, String)]) -> String {
     out
 }
 
+/// A single literal argument of a bracket call
+/// (`("k")` / `(0)` after `.[]`): the key and tail.
+/// Non-literal calls (`[](regex, 1)`) are not digs.
+fn json_bracket_call_key(rest: &str) -> Option<(super::formula::JsonKey, &str)> {
+    use super::formula::JsonKey;
+    let rest = rest.trim_start();
+    if let Some((k, t)) = quoted_token(rest) {
+        if k.contains(['"', '\\']) {
+            return None;
+        }
+        let t = t.trim().strip_prefix(')')?;
+        return Some((JsonKey::Key(k), t));
+    }
+    let end = rest.find(')')?;
+    let i: usize = rest[..end].trim().parse().ok()?;
+    Some((JsonKey::Idx(i), &rest[end + 1..]))
+}
+
 /// A dig path from `<root>` at the start of `s`
 /// (`["k"]`, `[0]`, `.dig("a", 0)` segments): the
 /// path and remaining tail.
@@ -3772,6 +5881,13 @@ fn jt_dig<'a>(
     let mut path = Vec::new();
     loop {
         if let Some(rest) = cur
+            .strip_prefix(".first")
+            .or_else(|| cur.strip_prefix("&.first"))
+            && (rest.is_empty() || rest.starts_with(['.', '&', '[']))
+        {
+            path.push(JsonKey::Idx(0));
+            cur = rest;
+        } else if let Some(rest) = cur
             .strip_prefix(".dig(")
             .or_else(|| cur.strip_prefix("&.dig("))
         {
@@ -3792,6 +5908,17 @@ fn jt_dig<'a>(
                 }
             }
             cur = &rest[close + 1..];
+        } else if let Some(rest) = cur
+            .strip_prefix("&.[](")
+            .or_else(|| cur.strip_prefix(".[]("))
+        {
+            match json_bracket_call_key(rest) {
+                Some((k, tail)) => {
+                    path.push(k);
+                    cur = tail;
+                }
+                None => break,
+            }
         } else if cur.starts_with('[') && !cur.starts_with("[regex") && !cur.starts_with("[/") {
             // A bare local as the key (`json[os]`).
             if let Some(close) = cur.find(']')
@@ -3801,20 +5928,19 @@ fn jt_dig<'a>(
                 cur = &cur[close + 1..];
                 continue;
             }
-            if let Some(rest) = cur.strip_prefix('[') {
-                if let Ok(i) = rest
+            if let Some(rest) = cur.strip_prefix('[')
+                && let Ok(i) = rest
                     .trim_start()
                     .split(']')
                     .next()
                     .unwrap_or_default()
                     .trim()
                     .parse::<usize>()
-                {
-                    let close = cur.find(']')?;
-                    path.push(JsonKey::Idx(i));
-                    cur = &cur[close + 1..];
-                    continue;
-                }
+            {
+                let close = cur.find(']')?;
+                path.push(JsonKey::Idx(i));
+                cur = &cur[close + 1..];
+                continue;
             }
             let (key, tail) = json_bracket_key(cur)?;
             path.push(JsonKey::Key(key));
@@ -3826,6 +5952,38 @@ fn jt_dig<'a>(
     Some((path, cur))
 }
 
+/// Prepend a base dig path to a local's own path
+/// (object-local reads: `v = json.dig(…)` then
+/// `v["k"]`).
+fn jt_prepend(src: JtSrc, base: &[super::formula::JsonKey]) -> Option<JtSrc> {
+    use super::formula::JsonLocal;
+    let cat =
+        |p: &Vec<super::formula::JsonKey>| base.iter().cloned().chain(p.iter().cloned()).collect();
+    Some(match src {
+        JtSrc::Match(p) => JtSrc::Match(cat(&p)),
+        JtSrc::Local(local) => JtSrc::Local(match local {
+            JsonLocal::Dig(p) => JsonLocal::Dig(cat(&p)),
+            JsonLocal::DigSplit(p, a, b) => JsonLocal::DigSplit(cat(&p), a, b),
+            JsonLocal::DigCapture(p) => JsonLocal::DigCapture(cat(&p)),
+            JsonLocal::DigCaptureLit(p, a, b) => JsonLocal::DigCaptureLit(cat(&p), a, b),
+            JsonLocal::DigTail(p, t) => JsonLocal::DigTail(cat(&p), t),
+            JsonLocal::DigSubRe(p, a, b, c) => JsonLocal::DigSubRe(cat(&p), a, b, c),
+            JsonLocal::SplitRowsFind {
+                path,
+                line_sep,
+                field_sep,
+                first_suffix,
+            } => JsonLocal::SplitRowsFind {
+                path: cat(&path),
+                line_sep,
+                field_sep,
+                first_suffix,
+            },
+            JsonLocal::DigOr(_) | JsonLocal::DigOrTail(..) => return None,
+        }),
+    })
+}
+
 /// A local's source from an assignment RHS, or the
 /// match marker for `….match(regex)`.
 enum JtSrc {
@@ -3835,6 +5993,38 @@ enum JtSrc {
 
 fn jt_local_src(rhs: &str, root: &str, locals: &[(String, String)]) -> Option<JtSrc> {
     use super::formula::JsonLocal;
+    // `(<dig> || <dig>)&.tail`: a parenthesized
+    // or-chain with a string tail.
+    let rhs_t = rhs.trim();
+    if rhs_t.starts_with('(') {
+        let bytes = rhs_t.as_bytes();
+        let mut close = None;
+        for i in 1..bytes.len() {
+            if bytes[i] == b')' && jt_depth_at(rhs_t, i).2 == 1 {
+                close = Some(i);
+                break;
+            }
+        }
+        if let Some(close) = close {
+            let inner = &rhs_t[1..close];
+            let tail = rhs_t[close + 1..].trim();
+            if inner.contains(" || ") {
+                let mut paths = Vec::new();
+                for part in inner.split(" || ") {
+                    let (path, t) = jt_dig(part.trim(), root, locals)?;
+                    if !t.trim().is_empty() {
+                        return None;
+                    }
+                    paths.push(path);
+                }
+                return Some(JtSrc::Local(JsonLocal::DigOrTail(paths, jt_tail(tail)?)));
+            }
+            if tail.is_empty() {
+                return jt_local_src(inner, root, locals);
+            }
+            return None;
+        }
+    }
     // `<dig> || <dig>` chains: first present wins.
     if rhs.contains(" || ") {
         let mut paths = Vec::new();
@@ -3897,6 +6087,9 @@ fn jt_tail(tail: &str) -> Option<super::formula::JsonTail> {
     if tail.is_empty() {
         return Some(JsonTail::None);
     }
+    if matches!(tail, "&.strip" | ".strip") {
+        return Some(JsonTail::Strip);
+    }
     let (op, rest) = [
         ("to_s", ".to_s"),
         ("tr", ".tr("),
@@ -3947,6 +6140,513 @@ fn jt_tail(tail: &str) -> Option<super::formula::JsonTail> {
     }
 }
 
+/// Depth of unclosed (do, brace, paren) spans at
+/// byte `upto` in `s`, outside quotes. Words count
+/// with identifier boundaries (`/end/` in a regex
+/// does not).
+fn jt_depth_at(s: &str, upto: usize) -> (i32, i32, i32) {
+    let b = s.as_bytes();
+    let end = upto.min(b.len());
+    let (mut do_d, mut brace, mut paren) = (0i32, 0i32, 0i32);
+    let (mut dq, mut sq) = (false, false);
+    let word = |i: usize, w: &str| -> bool {
+        let wb = w.as_bytes();
+        if i + wb.len() > end || &b[i..i + wb.len()] != wb {
+            return false;
+        }
+        let before_ok =
+            i == 0 || matches!(b[i - 1], b' ' | b'\t' | b'&' | b'.' | b'(' | b'|' | b'{');
+        let after = b.get(i + wb.len());
+        let after_ok =
+            after.is_none_or(|c| matches!(c, b' ' | b'\t' | b'|' | b'.' | b')' | b'}' | b','));
+        before_ok && after_ok
+    };
+    let mut i = 0;
+    while i < end {
+        match b[i] {
+            b'\\' if dq || sq => i += 1,
+            b'"' if !sq => dq = !dq,
+            b'\'' if !dq => sq = !sq,
+            b'd' if !dq && !sq && word(i, "do") => {
+                do_d += 1;
+                i += 1;
+            }
+            b'e' if !dq && !sq && word(i, "end") => {
+                do_d -= 1;
+                i += 2;
+            }
+            b'{' if !dq && !sq => brace += 1,
+            b'}' if !dq && !sq => brace -= 1,
+            b'(' if !dq && !sq => paren += 1,
+            b')' if !dq && !sq => paren -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    (do_d, brace, paren)
+}
+
+/// Split a condition on top-level ` && ` (not
+/// inside quotes or do/brace/paren spans).
+fn jt_split_and(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut from = 0usize;
+    while let Some(rel) = s[from..].find(" && ") {
+        let idx = from + rel;
+        if jt_depth_at(s, idx) == (0, 0, 0) {
+            out.push(&s[start..idx]);
+            start = idx + 4;
+        }
+        from = idx + 4;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Join continuation statements: a line ending in
+/// `&&`/`||`/postfix `if`/`unless`, or leaving a
+/// do/brace/paren span open, absorbs the next.
+fn jt_join_stmts(body: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for stmt in body {
+        let continues = out.last().is_some_and(|prev: &String| {
+            let t = prev.trim_end();
+            t.ends_with("&&")
+                || t.ends_with("||")
+                || t.ends_with(" if")
+                || t.ends_with(" unless")
+                || jt_depth_at(t, t.len()) != (0, 0, 0)
+        });
+        if continues && let Some(prev) = out.last_mut() {
+            prev.push(' ');
+            prev.push_str(stmt.trim());
+        } else {
+            out.push(stmt.clone());
+        }
+    }
+    out
+}
+
+/// Replace bare cask-local identifier reads with
+/// their quoted host values, outside string text
+/// (interpolations included, assignment targets
+/// and kwarg keys excluded). Locals carrying
+/// quotes/escapes/interpolation stay verbatim.
+fn jt_substitute_idents(s: &str, locals: &[(String, String)]) -> String {
+    let subs: Vec<(&str, &str)> = locals
+        .iter()
+        .filter(|(n, v)| !n.is_empty() && !v.contains(['"', '\\', '#']))
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    if subs.is_empty() {
+        return s.to_string();
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum M {
+        Code,
+        Dq,
+        Sq,
+    }
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut mode = M::Code;
+    let mut stack: Vec<i32> = Vec::new();
+    let mut brace = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match mode {
+            M::Dq => {
+                match b[i] {
+                    b'\\' => {
+                        out.push('\\');
+                        if let Some(c) = s[i + 1..].chars().next() {
+                            out.push(c);
+                            i += c.len_utf8();
+                        }
+                    }
+                    b'"' => {
+                        mode = M::Code;
+                        out.push('"');
+                    }
+                    b'#' if b.get(i + 1) == Some(&b'{') => {
+                        stack.push(brace);
+                        mode = M::Code;
+                        out.push_str("#{");
+                        i += 1;
+                    }
+                    _ => {
+                        let c = s[i..].chars().next().unwrap_or(' ');
+                        out.push(c);
+                        i += c.len_utf8();
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            M::Sq => {
+                match b[i] {
+                    b'\\' => {
+                        out.push('\\');
+                        if let Some(c) = s[i + 1..].chars().next() {
+                            out.push(c);
+                            i += c.len_utf8();
+                        }
+                    }
+                    b'\'' => {
+                        mode = M::Code;
+                        out.push('\'');
+                    }
+                    _ => {
+                        let c = s[i..].chars().next().unwrap_or(' ');
+                        out.push(c);
+                        i += c.len_utf8();
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            M::Code => match b[i] {
+                b'"' => {
+                    mode = M::Dq;
+                    out.push('"');
+                    i += 1;
+                }
+                b'\'' => {
+                    mode = M::Sq;
+                    out.push('\'');
+                    i += 1;
+                }
+                b'{' => {
+                    brace += 1;
+                    out.push('{');
+                    i += 1;
+                }
+                b'}' => {
+                    if stack.last() == Some(&brace) {
+                        stack.pop();
+                        mode = M::Dq;
+                    } else {
+                        brace -= 1;
+                    }
+                    out.push('}');
+                    i += 1;
+                }
+                c if c.is_ascii_alphabetic() || c == b'_' => {
+                    let start = i;
+                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                        i += 1;
+                    }
+                    let word = &s[start..i];
+                    let prev = out.chars().last();
+                    let after = s[i..].trim_start();
+                    let is_assign = after.starts_with('=') && !after[1..].starts_with(['=', '~']);
+                    let is_kwarg = s[i..].starts_with(':') && !s[i..].starts_with("::");
+                    if !is_assign
+                        && !is_kwarg
+                        && !matches!(prev, Some('.' | ':'))
+                        && let Some((_, v)) = subs.iter().find(|(n, _)| *n == word)
+                    {
+                        out.push('"');
+                        out.push_str(v);
+                        out.push('"');
+                    } else {
+                        out.push_str(word);
+                    }
+                }
+                _ => {
+                    let c = s[i..].chars().next().unwrap_or(' ');
+                    out.push(c);
+                    i += c.len_utf8();
+                }
+            },
+        }
+    }
+    out
+}
+
+/// Replace `<cask-local>.to_s` with its quoted
+/// host value (locals carrying quotes, escapes or
+/// pending interpolation are left verbatim, which
+/// keeps the body delegated).
+fn jt_substitute_to_s(stmt: &str, locals: &[(String, String)]) -> String {
+    let mut out = stmt.to_string();
+    for (name, value) in locals {
+        if value.contains(['"', '\\', '#']) {
+            continue;
+        }
+        let needle = format!("{name}.to_s");
+        let mut rebuilt = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(i) = rest.find(&needle) {
+            let before = rest[..i].chars().last();
+            let after = rest[i + needle.len()..].chars().next();
+            rebuilt.push_str(&rest[..i]);
+            if before.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+                && after.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+            {
+                rebuilt.push('"');
+                rebuilt.push_str(value);
+                rebuilt.push('"');
+            } else {
+                rebuilt.push_str(&needle);
+            }
+            rest = &rest[i + needle.len()..];
+        }
+        rebuilt.push_str(rest);
+        out = rebuilt;
+    }
+    out
+}
+
+/// An assignment split tolerating tabs around `=`
+/// (`timestamp\t= …`): plain ` = ` first, else a
+/// whitespace-flanked bare `=` after an identifier.
+fn jt_assignment(s: &str) -> Option<(&str, &str)> {
+    if let Some(pair) = s.split_once(" = ") {
+        return Some(pair);
+    }
+    let b = s.as_bytes();
+    let (mut dq, mut sq) = (false, false);
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if dq || sq => i += 1,
+            b'"' if !sq => dq = !dq,
+            b'\'' if !dq => sq = !sq,
+            b'=' if !dq && !sq => {
+                let before_ws = i > 0 && b[i - 1].is_ascii_whitespace();
+                let prev = s[..i].trim_end().chars().last();
+                let next = b.get(i + 1).copied();
+                if before_ws
+                    && !matches!(
+                        prev,
+                        Some('=' | '!' | '<' | '>' | '~' | '+' | '-' | '*' | '/')
+                    )
+                    && !matches!(next, Some(b'=' | b'>' | b'~'))
+                    && next.is_some_and(|c| c.is_ascii_whitespace())
+                {
+                    return Some((&s[..i], s[i + 1..].trim_start()));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A one-line brace map as do-form statements
+/// (`….filter_map { |v| body }` → open/body/end).
+fn jt_brace_map_rewrite(stmt: &str) -> Option<Vec<String>> {
+    for pat in [
+        ".flat_map { |",
+        "&.flat_map { |",
+        ".filter_map { |",
+        "&.filter_map { |",
+        ".map { |",
+        "&.map { |",
+    ] {
+        if let Some(idx) = stmt.find(pat) {
+            let head = &stmt[..idx + pat.len() - 4];
+            let rest = &stmt[idx + pat.len()..];
+            let var_end = rest.find('|')?;
+            let var = rest[..var_end].trim();
+            if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            let inner = rest[var_end + 1..].trim().strip_suffix('}')?.trim();
+            if inner.is_empty() {
+                return None;
+            }
+            return Some(vec![
+                format!("{head} do |{var}|"),
+                inner.to_string(),
+                "end".to_string(),
+            ]);
+        }
+    }
+    None
+}
+
+/// A map over a dug local: `<name> = <dig>` (+ an
+/// optional `next if <name>.blank?`) then
+/// `<name>.filter_map do |v| … end` as the last
+/// statements. Returns (path, map, item_var, body).
+fn jt_local_map<'a>(
+    stmts: &'a [String],
+    root: &str,
+    locals: &[(String, String)],
+) -> Option<(Vec<super::formula::JsonKey>, bool, String, &'a [String])> {
+    if stmts.last().map(String::as_str) != Some("end") || stmts.len() < 3 {
+        return None;
+    }
+    let ident = |v: &str| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    for i in 1..stmts.len() - 1 {
+        let stmt = stmts[i].trim();
+        let open = [
+            ".filter_map do |",
+            "&.filter_map do |",
+            ".flat_map do |",
+            "&.flat_map do |",
+            ".map do |",
+            "&.map do |",
+        ]
+        .iter()
+        .find_map(|pat| stmt.find(pat).map(|idx| (idx, idx + pat.len())));
+        let Some((name_end, var_at)) = open else {
+            continue;
+        };
+        let name = stmt[..name_end].trim();
+        let var = stmt[var_at..].strip_suffix('|')?.trim();
+        if !ident(name) || !ident(var) || name == root {
+            continue;
+        }
+        let mut path = None;
+        let mut ok = true;
+        for pre in &stmts[..i] {
+            let pre = pre.trim();
+            if let Some((lhs, rhs)) = jt_assignment(pre)
+                && lhs.trim() == name
+                && path.is_none()
+            {
+                match jt_dig(rhs.trim(), root, locals) {
+                    Some((p, tail)) if tail.trim().is_empty() && !p.is_empty() => path = Some(p),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            } else if pre == format!("next if {name}.blank?") && path.is_some() {
+                // Subsumed by the map over the dig.
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if ok && let Some(p) = path {
+            let body = &stmts[i + 1..stmts.len() - 1];
+            if !body.is_empty() {
+                return Some((p, true, var.to_string(), body));
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// A `<dig>&.split(line)&.map { |v| v.split(col) }`
+/// source: (dig path, line separator, field
+/// separator).
+fn jt_split_rows_src(
+    rhs: &str,
+    base: &str,
+    locals: &[(String, String)],
+) -> Option<(Vec<super::formula::JsonKey>, String, String)> {
+    let (path, tail) = jt_dig(rhs.trim(), base, locals)?;
+    let rest = tail
+        .trim()
+        .strip_prefix("&.split(")
+        .or_else(|| tail.trim().strip_prefix(".split("))?;
+    let line_arg = rest.trim_start();
+    let (line_sep, t) = quoted_token(line_arg)?;
+    let line_sep = if line_arg.starts_with('"') {
+        ruby_unescape_dq(&line_sep)
+    } else {
+        line_sep
+    };
+    let rest = t
+        .trim()
+        .strip_prefix(')')?
+        .trim()
+        .strip_prefix("&.map")
+        .or_else(|| t.trim().strip_prefix(')')?.trim().strip_prefix(".map"))?;
+    let (block, rest) = take_bracketed(rest.trim(), '{', '}')?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let inner = block.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let inner = inner.strip_prefix('|')?;
+    let (var, body) = inner.split_once('|')?;
+    let rest = body
+        .trim()
+        .strip_prefix(var.trim())?
+        .trim()
+        .strip_prefix("&.split(")
+        .or_else(|| {
+            body.trim()
+                .strip_prefix(var.trim())?
+                .trim()
+                .strip_prefix(".split(")
+        })?;
+    let field_arg = rest.trim_start();
+    let (field_sep, t) = quoted_token(field_arg)?;
+    let field_sep = if field_arg.starts_with('"') {
+        ruby_unescape_dq(&field_sep)
+    } else {
+        field_sep
+    };
+    if t.trim() != ")" || line_sep.is_empty() || field_sep.is_empty() {
+        return None;
+    }
+    Some((path, line_sep, field_sep))
+}
+
+/// A `.find { |v| v.first.end_with?(suffix) }`
+/// over a split-rows source local.
+fn jt_split_rows_find(
+    rhs: &str,
+    sources: &[(String, Vec<super::formula::JsonKey>, String, String)],
+) -> Option<super::formula::JsonLocal> {
+    for (name, path, line_sep, field_sep) in sources.iter().rev() {
+        let mut rest = rhs.trim();
+        if let Some(r) = rest.strip_suffix(&format!(" if {name}")) {
+            rest = r.trim();
+        }
+        let Some(r) = rest.strip_prefix(name.as_str()) else {
+            continue;
+        };
+        let Some(r) = r
+            .trim()
+            .strip_prefix("&.find")
+            .or_else(|| r.trim().strip_prefix(".find"))
+        else {
+            continue;
+        };
+        let (block, tail) = take_bracketed(r.trim(), '{', '}')?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        let inner = block.strip_prefix('{')?.strip_suffix('}')?.trim();
+        let inner = inner.strip_prefix('|')?;
+        let (var, body) = inner.split_once('|')?;
+        let var = var.trim();
+        let rest = body.trim().strip_prefix(var)?.trim();
+        let rest = rest
+            .strip_prefix(".first")
+            .or_else(|| rest.strip_prefix("[0]"))?
+            .trim()
+            .strip_prefix("&.end_with?(")
+            .or_else(|| {
+                rest.strip_prefix(".first")
+                    .or_else(|| rest.strip_prefix("[0]"))?
+                    .trim()
+                    .strip_prefix(".end_with?(")
+            })?;
+        let (suffix, t) = quoted_token(rest.trim_start())?;
+        if t.trim() != ")" {
+            return None;
+        }
+        return Some(super::formula::JsonLocal::SplitRowsFind {
+            path: path.clone(),
+            line_sep: line_sep.clone(),
+            field_sep: field_sep.clone(),
+            first_suffix: suffix,
+        });
+    }
+    None
+}
+
 /// Reduce a statement-form `:json` block (the
 /// cask tap's locals/match/template bodies) to a
 /// `JsonTemplate`. `lines` have cask locals
@@ -3957,25 +6657,65 @@ fn parse_json_template_shape(
     cask_locals: &[(String, String)],
 ) -> Option<super::formula::JsonBlock> {
     use super::formula::{
-        JsonBlock, JsonCond, JsonGuard, JsonLit, JsonLocal, JsonPart, JsonRender, JsonShape,
-        JsonTemplate, JsonValue,
+        JsonBlock, JsonCond, JsonGuard, JsonLocal, JsonPart, JsonRender, JsonShape, JsonTemplate,
+        JsonValue,
     };
     let (root, has_regex) = block_params(params)?;
-    let stmts: Vec<String> = lines
+    let raw_stmts: Vec<String> = lines
         .iter()
         .map(|l| strip_trailing_comment(l.trim()).trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+    // Line-continued chains join onto the previous
+    // statement (`json.dig(…)` then `&.tr(…)`).
+    let mut stmts: Vec<String> = Vec::new();
+    for stmt in raw_stmts {
+        if (stmt.starts_with('.') || stmt.starts_with("&."))
+            && let Some(prev) = stmts.last_mut()
+        {
+            prev.push(' ');
+            prev.push_str(&stmt);
+        } else {
+            stmts.push(stmt);
+        }
+    }
+    // `<cask-local>.to_s` resolves on this host like
+    // its `#{...}` form (burp's `arch.to_s`).
+    for stmt in &mut stmts {
+        *stmt = jt_substitute_to_s(stmt, cask_locals);
+    }
+    // A one-line brace map (`….filter_map { |v| … }`)
+    // rewrites to the do form the wrapper reads.
+    if stmts.len() == 1
+        && let Some(rewritten) = jt_brace_map_rewrite(&stmts[0])
+    {
+        stmts = rewritten;
+    }
     // Map wrapper?
-    let (path, map, item_var, body): (Vec<super::formula::JsonKey>, bool, String, &[String]) = {
+    let (path, map, values, item_var, body): (
+        Vec<super::formula::JsonKey>,
+        bool,
+        bool,
+        String,
+        &[String],
+    ) = {
         let first = stmts.first()?;
         if let Some((p, tail)) = jt_dig(first, &root, cask_locals) {
             let tail = tail.trim();
+            let (values, tail) = match tail
+                .strip_prefix("&.values")
+                .or_else(|| tail.strip_prefix(".values"))
+            {
+                Some(r) => (true, r.trim()),
+                None => (false, tail),
+            };
             let inner = [
                 ".map do |",
                 "&.map do |",
                 ".filter_map do |",
                 "&.filter_map do |",
+                ".flat_map do |",
+                "&.flat_map do |",
             ]
             .iter()
             .find_map(|pat| tail.strip_prefix(pat));
@@ -3987,14 +6727,30 @@ fn parse_json_template_shape(
                 {
                     return None;
                 }
-                (p, true, var.to_string(), &stmts[1..stmts.len() - 1])
+                (p, true, values, var.to_string(), &stmts[1..stmts.len() - 1])
             } else {
-                (Vec::new(), false, root.clone(), &stmts[..])
+                (Vec::new(), false, false, root.clone(), &stmts[..])
             }
         } else {
-            (Vec::new(), false, root.clone(), &stmts[..])
+            (Vec::new(), false, false, root.clone(), &stmts[..])
         }
     };
+    // A map over a dug local (`xs = <dig>` then
+    // `xs.filter_map do |item| … end`): the dig
+    // becomes the template path; a `next if
+    // xs.blank?` before it is subsumed (a missing
+    // or empty array yields nothing either way).
+    let (path, map, values, item_var, body) =
+        if !map && let Some(found) = jt_local_map(&stmts, &root, cask_locals) {
+            let (p, m, v, b) = found;
+            (p, m, false, v, b)
+        } else {
+            (path, map, values, item_var, body)
+        };
+    // Continuation lines (trailing `&&`/`||`/`if`,
+    // unclosed do/brace/paren spans) join.
+    let body_owned = jt_join_stmts(body);
+    let body: &[String] = &body_owned;
     if body.is_empty() {
         return None;
     }
@@ -4006,7 +6762,38 @@ fn parse_json_template_shape(
     let mut match_guarded = false;
     let mut local_match_guard: Option<usize> = None;
     let mut guards: Vec<JsonGuard> = Vec::new();
+    let mut finds: Vec<super::formula::JsonFind> = Vec::new();
+    let mut split_rows_sources: Vec<(String, Vec<super::formula::JsonKey>, String, String)> =
+        Vec::new();
+    let mut find_names: Vec<String> = Vec::new();
+    let mut require_find: Vec<(usize, bool)> = Vec::new();
+    let mut item_var = item_var;
     let local_idx = |names: &[String], n: &str| names.iter().position(|x| x == n);
+    // An `if <conds> … end` wrapper over the whole
+    // map body becomes leading guards.
+    let mut body = body;
+    if map
+        && body.len() >= 3
+        && body[0].trim().starts_with("if ")
+        && body[body.len() - 1].trim() == "end"
+    {
+        let cond = body[0].trim()["if ".len()..].trim().to_string();
+        let mut pending = Vec::new();
+        for atom in jt_split_and(&cond) {
+            match parse_json_cond(&item_var, atom.trim()) {
+                Some((c, rest)) if rest.trim().is_empty() => pending.push(JsonGuard {
+                    unless: true,
+                    cond: c,
+                }),
+                _ => return None,
+            }
+        }
+        guards.extend(pending);
+        body = &body[1..body.len() - 1];
+        if body.is_empty() {
+            return None;
+        }
+    }
     for stmt in &body[..body.len() - 1] {
         let stmt = stmt.as_str();
         if let Some(cond) = stmt.strip_prefix("next if ") {
@@ -4017,31 +6804,102 @@ fn parse_json_template_shape(
                     let name = part.trim().strip_suffix(".blank?")?;
                     if name == match_var && !match_var.is_empty() {
                         match_guarded = true;
+                    } else if let Some(pos) = find_names.iter().position(|n| n == name) {
+                        require_find.push((pos, true));
                     } else if name == "version" && local_idx(&names, name).is_none() {
                         // The package's own version
                         // (no local of that name):
                         // always present.
+                    } else if let Some((dig_path, tail)) = jt_dig(name, &item_var, cask_locals)
+                        && tail.trim().is_empty()
+                        && dig_path.len() > 1
+                    {
+                        guards.push(JsonGuard {
+                            unless: false,
+                            cond: JsonCond::DigBlank(dig_path),
+                        });
+                    } else if let Some((field, tail)) = jt_field_tail(name, &item_var)
+                        && tail.is_empty()
+                    {
+                        guards.push(JsonGuard {
+                            unless: false,
+                            cond: JsonCond::FieldBlank(field),
+                        });
                     } else {
                         require.push(local_idx(&names, name)?);
                     }
                 }
+            } else if let Some((field, tail)) = jt_field_tail(cond, &item_var)
+                && (tail.starts_with(".match?(") || tail.starts_with("&.match?("))
+            {
+                let args = tail.split_once(".match?(").map(|(_, r)| r)?;
+                let (pat, flags, t) = regex_literal(args.trim())?;
+                if t.trim() != ")" {
+                    return None;
+                }
+                guards.push(JsonGuard {
+                    unless: false,
+                    cond: JsonCond::MatchRe(field, pat, flags),
+                });
+            } else if cond.split(" || ").all(|p| p.trim().starts_with('!')) {
+                // `next if !item["a"] || !item["b"]`:
+                // keep only items where all are truthy.
+                for part in cond.split(" || ") {
+                    let part = part.trim().strip_prefix('!')?.trim();
+                    let (field, tail) = jt_field_tail(part, &item_var)?;
+                    if !tail.is_empty() {
+                        return None;
+                    }
+                    guards.push(JsonGuard {
+                        unless: true,
+                        cond: JsonCond::Truthy(field),
+                    });
+                }
+            } else if let Some(or_guards) = jt_next_if_or_guards(&item_var, cond) {
+                guards.extend(or_guards);
             } else if let Some((field, ne, lit)) = jt_field_cmp(cond, &item_var) {
                 guards.push(JsonGuard {
                     unless: false,
                     cond: if ne {
-                        JsonCond::Ne(field, JsonLit::Str(lit))
+                        JsonCond::Ne(field, lit)
                     } else {
-                        JsonCond::Eq(field, JsonLit::Str(lit))
+                        JsonCond::Eq(field, lit)
                     },
                 });
             } else {
                 return None;
             }
         } else if let Some(cond) = stmt.strip_prefix("next unless ") {
-            if cond == match_var && !match_var.is_empty() {
+            if let Some(inner) = cond.strip_prefix('(').and_then(|c| c.strip_suffix(')'))
+                && let Some((mv, rhs)) = jt_assignment(inner)
+                && let Some(JtSrc::Match(p)) = jt_local_src(rhs.trim(), &item_var, cask_locals)
+            {
+                // `next unless (match = <dig>&.match(regex))`
+                match_var = mv.trim().to_string();
+                match_src = Some(p);
                 match_guarded = true;
+            } else if cond == match_var && !match_var.is_empty() {
+                match_guarded = true;
+            } else if let Some((p, tail)) = jt_dig(cond, &item_var, cask_locals)
+                && tail.trim().is_empty()
+                && p.len() > 1
+            {
+                guards.push(JsonGuard {
+                    unless: true,
+                    cond: JsonCond::DigTruthy(p),
+                });
+            } else if let Some(pos) = find_names.iter().position(|n| n == cond) {
+                require_find.push((pos, false));
             } else if let Some(pos) = local_idx(&names, cond) {
                 require.push(pos);
+            } else if let Some((c, tail)) = parse_json_cond(&item_var, cond)
+                && tail.trim().is_empty()
+                && !matches!(c, JsonCond::Truthy(_))
+            {
+                guards.push(JsonGuard {
+                    unless: true,
+                    cond: c,
+                });
             } else if let Some((field, tail)) = jt_field_tail(cond, &item_var) {
                 if tail.is_empty() {
                     guards.push(JsonGuard {
@@ -4058,27 +6916,67 @@ fn parse_json_template_shape(
                         cond: JsonCond::MatchLit(field, lit),
                     });
                 } else {
-                    return None;
+                    let rest = tail.strip_prefix("&.include?(")?;
+                    let (lit, t) = quoted_token(rest.trim_start())?;
+                    if t.trim() != ")" {
+                        return None;
+                    }
+                    guards.push(JsonGuard {
+                        unless: true,
+                        cond: JsonCond::Includes(field, lit),
+                    });
                 }
             } else if let Some(pos) = cond
                 .strip_suffix("&.match(regex)")
                 .and_then(|n| local_idx(&names, n.trim()))
             {
                 local_match_guard = Some(pos);
-            } else if let Some(pos) = cond
-                .strip_suffix(".match(regex)")
-                .and_then(|n| local_idx(&names, n.trim()))
-            {
-                local_match_guard = Some(pos);
             } else {
-                return None;
+                let pos = cond
+                    .strip_suffix(".match(regex)")
+                    .and_then(|n| local_idx(&names, n.trim()))?;
+                local_match_guard = Some(pos);
             }
-        } else if let Some((name, rhs)) = stmt.split_once(" = ") {
+        } else if let Some((name, rhs)) = jt_assignment(stmt) {
             let name = name.trim();
             if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 return None;
             }
-            match jt_local_src(rhs, &item_var, cask_locals)? {
+            if !map
+                && locals.is_empty()
+                && match_src.is_none()
+                && let Some(find) = jt_find_src(rhs.trim(), &item_var, cask_locals)
+            {
+                finds.push(find);
+                find_names.push(name.to_string());
+                item_var = name.to_string();
+                continue;
+            }
+            if let Some((path, line_sep, field_sep)) =
+                jt_split_rows_src(rhs, &item_var, cask_locals)
+            {
+                if names.iter().any(|n| n == name)
+                    || split_rows_sources.iter().any(|(n, ..)| n == name)
+                {
+                    return None;
+                }
+                split_rows_sources.push((name.to_string(), path, line_sep, field_sep));
+                continue;
+            }
+            let src = match jt_split_rows_find(rhs, &split_rows_sources) {
+                Some(local) => JtSrc::Local(local),
+                None => jt_local_src(rhs, &item_var, cask_locals).or_else(|| {
+                    // An object local as the dig base.
+                    names.iter().enumerate().find_map(|(i, n)| {
+                        let super::formula::JsonLocal::Dig(base) = &locals[i] else {
+                            return None;
+                        };
+                        jt_local_src(rhs.trim(), n, cask_locals)
+                            .and_then(|src| jt_prepend(src, base))
+                    })
+                })?,
+            };
+            match src {
                 JtSrc::Local(local) => {
                     names.push(name.to_string());
                     locals.push(local);
@@ -4095,6 +6993,48 @@ fn parse_json_template_shape(
     // Final expression, with an optional trailing
     // `if <dig>&.match(regex)`.
     let mut final_stmt = body[body.len() - 1].as_str();
+    // Postfix render guard: `<expr> if <cond>`
+    // (a nil yield for items failing the condition).
+    if let Some(idx) = json_outside_quotes(final_stmt, " if ") {
+        let (expr, cond) = final_stmt.split_at(idx);
+        let cond = cond[4..].trim();
+        let mut ok = true;
+        let mut pending: Vec<JsonGuard> = Vec::new();
+        for atom in jt_split_and(cond) {
+            let atom = atom.trim();
+            if let Some((c, rest)) = parse_json_cond(&item_var, atom)
+                && rest.trim().is_empty()
+            {
+                pending.push(JsonGuard {
+                    unless: true,
+                    cond: c,
+                });
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            guards.extend(pending);
+            final_stmt = expr.trim();
+        }
+    }
+    // `<dig>&.match(regex) { |m| <expr> }`: the block
+    // value when matched, nil otherwise.
+    if let Some((p, tail)) = jt_dig(final_stmt, &item_var, cask_locals)
+        && let Some(inner) = tail
+            .trim()
+            .strip_prefix("&.match(regex) { |")
+            .or_else(|| tail.trim().strip_prefix(".match(regex) { |"))
+        && let Some(inner) = inner.strip_suffix('}')
+        && let Some((var, expr)) = inner.trim().split_once('|')
+        && !var.trim().is_empty()
+    {
+        match_src = Some(p);
+        match_guarded = true;
+        match_var = var.trim().to_string();
+        final_stmt = expr.trim();
+    }
     if !final_stmt.starts_with('"')
         && let Some((expr, cond)) = final_stmt.rsplit_once(" if ")
         && let Some(src) = jt_local_src(cond, &item_var, cask_locals)
@@ -4110,16 +7050,24 @@ fn parse_json_template_shape(
     let render = jt_render(
         final_stmt,
         &item_var,
+        &root,
         &match_var,
         &mut locals,
         &mut names,
         cask_locals,
     )?;
-    let uses_cap = match &render {
-        JsonRender::Template(parts) => parts.iter().any(|p| matches!(p, JsonPart::Cap(_))),
-        JsonRender::Value(JsonValue::Cap(_), _) => true,
-        _ => false,
-    };
+    fn render_uses_cap(render: &JsonRender) -> bool {
+        match render {
+            JsonRender::Template(parts) => parts.iter().any(|p| matches!(p, JsonPart::Cap(_))),
+            JsonRender::Value(JsonValue::Cap(_), _) => true,
+            JsonRender::CapFork { .. } | JsonRender::CapEqFork { .. } => true,
+            JsonRender::LocalEqFork { then, els, .. } => {
+                render_uses_cap(then) || render_uses_cap(els)
+            }
+            _ => false,
+        }
+    }
+    let uses_cap = render_uses_cap(&render);
     if uses_cap && (match_src.is_none() || !match_guarded) {
         return None;
     }
@@ -4136,13 +7084,95 @@ fn parse_json_template_shape(
         shape: JsonShape::Template(Box::new(JsonTemplate {
             path,
             map,
+            values,
             locals,
             require,
             match_src,
             local_match_guard,
             guards,
+            finds,
+            require_find,
             render,
         })),
+    })
+}
+
+/// A `<base><dig>&.find { |v| <cond> }` source.
+fn jt_find_src(
+    rhs: &str,
+    base: &str,
+    locals: &[(String, String)],
+) -> Option<super::formula::JsonFind> {
+    use super::formula::{JsonFind, JsonFindCond};
+    let find_cond = |var: &str, cond_s: &str| -> Option<JsonFindCond> {
+        if let Some((field, ne, lit)) = jt_field_cmp(cond_s, var) {
+            if ne {
+                return None;
+            }
+            return Some(JsonFindCond::FieldEq(field, lit));
+        }
+        let (dpath, dtail) = jt_dig(cond_s, var, locals)?;
+        let rest = dtail.trim().strip_prefix("&.start_with?(")?;
+        let (lit, t) = quoted_token(rest.trim_start())?;
+        if t.trim() != ")" {
+            return None;
+        }
+        Some(JsonFindCond::DigStartsWith(dpath, lit))
+    };
+    let ident = |v: &str| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let (path, tail) = jt_dig(rhs, base, locals)?;
+    let tail = tail.trim();
+    // `.select { |v| <cond> }.max_by { |v|
+    // Version.new(v["f"]) }`
+    if let Some(block) = tail
+        .strip_prefix("&.select")
+        .or_else(|| tail.strip_prefix(".select"))
+    {
+        let (block, rest) = take_bracketed(block.trim(), '{', '}')?;
+        let inner = block.strip_prefix('{')?.strip_suffix('}')?.trim();
+        let inner = inner.strip_prefix('|')?;
+        let (var, cond_s) = inner.split_once('|')?;
+        let var = var.trim();
+        if !ident(var) {
+            return None;
+        }
+        let cond = find_cond(var, cond_s.trim())?;
+        let rest = rest
+            .trim()
+            .strip_prefix("&.max_by")
+            .or_else(|| rest.trim().strip_prefix(".max_by"))?;
+        let (block, rest) = take_bracketed(rest.trim(), '{', '}')?;
+        if !rest.trim().is_empty() {
+            return None;
+        }
+        let inner = block.strip_prefix('{')?.strip_suffix('}')?.trim();
+        let inner = inner.strip_prefix('|')?;
+        let (vvar, body) = inner.split_once('|')?;
+        let body = body.trim().strip_prefix("Version.new(")?;
+        let (field, tail) = jt_field_tail(body, vvar.trim())?;
+        if tail.trim() != ")" {
+            return None;
+        }
+        return Some(JsonFind {
+            path,
+            cond,
+            max_by: Some(field),
+        });
+    }
+    let inner = tail
+        .strip_prefix("&.find { |")
+        .or_else(|| tail.strip_prefix(".find { |"))?;
+    let inner = inner.strip_suffix('}')?.trim();
+    let (var, cond_s) = inner.split_once('|')?;
+    let var = var.trim();
+    if !ident(var) {
+        return None;
+    }
+    let cond = find_cond(var, cond_s.trim())?;
+    Some(JsonFind {
+        path,
+        cond,
+        max_by: None,
     })
 }
 
@@ -4153,27 +7183,65 @@ fn jt_field_tail<'a>(s: &'a str, var: &str) -> Option<(String, &'a str)> {
     Some((key, tail.trim()))
 }
 
-/// `<var>["f"] == "lit"` / `!=`: (field, is_ne, lit).
-fn jt_field_cmp(s: &str, var: &str) -> Option<(String, bool, String)> {
+/// A comparison literal: quoted string, integer,
+/// or boolean, plus the remainder.
+fn jt_lit(s: &str) -> Option<(super::formula::JsonLit, &str)> {
+    use super::formula::JsonLit;
+    let s = s.trim();
+    if let Some(r) = s.strip_prefix("true") {
+        Some((JsonLit::Bool(true), r))
+    } else if let Some(r) = s.strip_prefix("false") {
+        Some((JsonLit::Bool(false), r))
+    } else if s.starts_with(['"', '\'']) {
+        let (lit, r) = quoted_token(s)?;
+        Some((JsonLit::Str(lit), r))
+    } else {
+        let end = s
+            .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+            .unwrap_or(s.len());
+        let n: i64 = s[..end].parse().ok()?;
+        Some((JsonLit::Int(n), &s[end..]))
+    }
+}
+
+/// `<var>["f"] == lit` / `!=`: (field, is_ne, lit).
+fn jt_field_cmp(s: &str, var: &str) -> Option<(String, bool, super::formula::JsonLit)> {
     let (field, tail) = jt_field_tail(s, var)?;
     let (ne, rest) = if let Some(r) = tail.strip_prefix("!=") {
         (true, r)
-    } else if let Some(r) = tail.strip_prefix("==") {
-        (false, r)
     } else {
-        return None;
+        let r = tail.strip_prefix("==")?;
+        (false, r)
     };
-    let (lit, t) = quoted_token(rest.trim())?;
+    let (lit, t) = jt_lit(rest)?;
     if !t.trim().is_empty() {
         return None;
     }
     Some((field, ne, lit))
 }
 
+/// First index of `needle` outside double quotes.
+fn json_outside_quotes(s: &str, needle: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if quoted => i += 1,
+            b'"' => quoted = !quoted,
+            _ if !quoted && s[i..].starts_with(needle) => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The final expression of a json template body.
 fn jt_render(
     stmt: &str,
     item_var: &str,
+    root: &str,
     match_var: &str,
     locals: &mut Vec<super::formula::JsonLocal>,
     names: &mut Vec<String>,
@@ -4181,11 +7249,113 @@ fn jt_render(
 ) -> Option<super::formula::JsonRender> {
     use super::formula::{JsonPart, JsonRender, JsonValue};
     let stmt = stmt.trim();
+    // Local-equality fork: `(a == b) ? A : B` over
+    // two body locals.
+    if !stmt.starts_with('"')
+        && let Some(q) = json_outside_quotes(stmt, " ? ")
+    {
+        let (cond, rest) = stmt.split_at(q);
+        if let Some(inner) = cond
+            .trim()
+            .strip_prefix('(')
+            .and_then(|c| c.strip_suffix(')'))
+            && let Some((a_s, b_s)) = inner.split_once(" == ")
+            && let Some(a) = names.iter().position(|n| n == a_s.trim())
+            && let Some(b) = names.iter().position(|n| n == b_s.trim())
+        {
+            let rest = &rest[3..];
+            let c = json_outside_quotes(rest, " : ")?;
+            return Some(JsonRender::LocalEqFork {
+                a,
+                b,
+                then: Box::new(jt_render(
+                    &rest[..c],
+                    item_var,
+                    root,
+                    match_var,
+                    locals,
+                    names,
+                    cask_locals,
+                )?),
+                els: Box::new(jt_render(
+                    &rest[c + 3..],
+                    item_var,
+                    root,
+                    match_var,
+                    locals,
+                    names,
+                    cask_locals,
+                )?),
+            });
+        }
+    }
+    // Capture forks: `match[N][.present?] ? A : B`,
+    // `(match[A] == match[B]) ? A : B`.
+    if !match_var.is_empty()
+        && !stmt.starts_with('"')
+        && let Some(q) = json_outside_quotes(stmt, " ? ")
+    {
+        let (cond, rest) = stmt.split_at(q);
+        let rest = &rest[3..];
+        let c = json_outside_quotes(rest, " : ")?;
+        let (then_s, els_s) = (&rest[..c], &rest[c + 3..]);
+        let cap_of = |s: &str| -> Option<usize> {
+            let r = s.trim().strip_prefix(&format!("{match_var}["))?;
+            let close = r.find(']')?;
+            if !r[close + 1..].trim().is_empty() {
+                return None;
+            }
+            r[..close].parse().ok()
+        };
+        let cond = cond.trim();
+        let then = jt_render(
+            then_s,
+            item_var,
+            root,
+            match_var,
+            locals,
+            names,
+            cask_locals,
+        )?;
+        let els = jt_render(els_s, item_var, root, match_var, locals, names, cask_locals)?;
+        if let Some(inner) = cond.strip_prefix('(').and_then(|c| c.strip_suffix(')'))
+            && let Some((a_s, b_s)) = inner.split_once(" == ")
+        {
+            return Some(JsonRender::CapEqFork {
+                a: cap_of(a_s)?,
+                b: cap_of(b_s)?,
+                then: Box::new(then),
+                els: Box::new(els),
+            });
+        }
+        let present = cond.ends_with(".present?");
+        let base = cond.strip_suffix(".present?").unwrap_or(cond);
+        return Some(JsonRender::CapFork {
+            cap: cap_of(base)?,
+            present,
+            then: Box::new(then),
+            els: Box::new(els),
+        });
+    }
     if stmt.starts_with('"') {
         let (body_str, tail) = quoted_token(stmt)?;
-        if !tail.trim().is_empty() {
+        let gsub = if tail.trim().is_empty() {
+            None
+        } else if let Some(args) = tail
+            .trim()
+            .strip_prefix("&.gsub(")
+            .or_else(|| tail.trim().strip_prefix(".gsub("))
+        {
+            let (pat, flags, t) = regex_literal(args.trim_start())?;
+            let t = t.trim().strip_prefix(',')?.trim();
+            let (repl, t) = quoted_token(t)?;
+            if t.trim() != ")" || repl.contains('\\') || pat.contains("#{") {
+                return None;
+            }
+            Some((pat, flags, repl))
+        } else {
             return None;
-        }
+        };
         let mut parts = Vec::new();
         let mut rest = body_str.as_str();
         while let Some(i) = rest.find("#{") {
@@ -4194,14 +7364,77 @@ fn jt_render(
             }
             let j = rest[i + 2..].find('}')?;
             let token = rest[i + 2..i + 2 + j].trim();
-            let part = if let Some(pos) = names.iter().position(|n| n == token) {
+            let part = if let Some(md5) = token
+                .strip_prefix("Digest::MD5.hexdigest(")
+                .and_then(|inner| inner.strip_suffix(')'))
+            {
+                let (pos, field) = names.iter().enumerate().find_map(|(i, n)| {
+                    if !matches!(locals[i], super::formula::JsonLocal::SplitRowsFind { .. }) {
+                        return None;
+                    }
+                    let r = md5.trim().strip_prefix(&format!("{n}["))?;
+                    let field: usize = r.strip_suffix(']')?.parse().ok()?;
+                    Some((i, field))
+                })?;
+                JsonPart::LocalMd5Field(pos, field)
+            } else if let Some(pos) = names.iter().position(|n| n == token) {
                 JsonPart::Local(pos)
-            } else if let Some(r) = token.strip_prefix(&format!("{match_var}[")) {
-                let close = r.find(']')?;
-                if !r[close + 1..].trim().is_empty() {
+            } else if let Some(pos) = names.iter().enumerate().find_map(|(i, n)| {
+                // An object local's field: `v["major"]`.
+                let super::formula::JsonLocal::Dig(base) = &locals[i] else {
+                    return None;
+                };
+                let (sub, tail) = jt_dig(token, n, cask_locals)?;
+                if !tail.trim().is_empty() || sub.is_empty() {
                     return None;
                 }
-                JsonPart::Cap(r[..close].parse().ok()?)
+                let full: Vec<super::formula::JsonKey> = base.iter().cloned().chain(sub).collect();
+                Some((i, full))
+            }) {
+                let (_, full) = pos;
+                locals.push(super::formula::JsonLocal::Dig(full));
+                names.push(String::new());
+                JsonPart::Local(locals.len() - 1)
+            } else if let Some(r) = token.strip_prefix(&format!("{match_var}[")) {
+                let close = r.find(']')?;
+                let n: usize = r[..close].parse().ok()?;
+                let tail = r[close + 1..].trim();
+                if tail.is_empty() {
+                    JsonPart::Cap(n)
+                } else if let Some(args) = tail
+                    .strip_prefix("&.tr(")
+                    .or_else(|| tail.strip_prefix(".tr("))
+                {
+                    let (from, t) = quoted_token(args.trim_start())?;
+                    let t = t.trim().strip_prefix(',')?.trim();
+                    let (to, t) = quoted_token(t)?;
+                    if t.trim() != ")"
+                        || from.contains('\\')
+                        || to.contains('\\')
+                        || from.starts_with('^')
+                    {
+                        return None;
+                    }
+                    JsonPart::CapTr(n, from, to)
+                } else {
+                    return None;
+                }
+            } else if root != item_var
+                && let Some((p, tail)) = jt_dig(token, root, cask_locals)
+                && tail.trim().is_empty()
+                && !p.is_empty()
+            {
+                // A root dig inside a map template
+                // (`#{json["shortrev"]}`).
+                JsonPart::RootDig(p)
+            } else if let Some((p, tail)) = jt_dig(token, item_var, cask_locals)
+                && tail.trim().is_empty()
+                && p.len() > 1
+            {
+                // A multi-segment dig localizes.
+                locals.push(super::formula::JsonLocal::Dig(p));
+                names.push(String::new());
+                JsonPart::Local(locals.len() - 1)
             } else if let Some((field, tail)) = jt_field_tail(token, item_var) {
                 if !tail.is_empty() {
                     return None;
@@ -4216,7 +7449,16 @@ fn jt_render(
         if !rest.is_empty() {
             parts.push(JsonPart::Lit(rest.to_string()));
         }
-        return Some(JsonRender::Template(parts));
+        let render = JsonRender::Template(parts);
+        return Some(match gsub {
+            Some((pat, flags, repl)) => JsonRender::GsubRegex {
+                inner: Box::new(render),
+                pat,
+                flags,
+                repl,
+            },
+            None => render,
+        });
     }
     // `match[N]<tail>`
     if !match_var.is_empty()
@@ -4448,35 +7690,34 @@ fn parse_dirwalk_shape(root: &str, lines: &[String]) -> Option<super::formula::P
     }
     let pc = "Homebrew::Livecheck::Strategy.page_content(";
     // The directory template inside a page_content arg.
-    let dir_template =
-        |arg: &str, wname: &str| -> Option<(String, Option<(String, String)>, String)> {
-            let arg = arg.strip_prefix("URI.join(@url, ")?;
-            let arg = arg.trim().strip_suffix(',').unwrap_or(arg).trim();
-            let arg = arg.strip_suffix(").to_s")?;
-            if arg == wname {
-                return Some((String::new(), None, String::new()));
-            }
-            // The whole arg is the string literal; it
-            // may carry inner quotes (a `tr` call), so
-            // take first-to-last quote, not a token.
-            let inner = arg.strip_prefix('"')?.strip_suffix('"')?;
-            let plain = format!("#{{{wname}}}");
-            if let Some(pos) = inner.find(&plain) {
-                return Some((
-                    inner[..pos].to_string(),
-                    None,
-                    inner[pos + plain.len()..].to_string(),
-                ));
-            }
-            let tr_open = format!("#{{{wname}.to_s.tr(");
-            let pos = inner.find(&tr_open)?;
-            let rest = &inner[pos + tr_open.len()..];
-            let (from, t) = quoted_token(rest)?;
-            let t = t.trim().strip_prefix(',')?.trim();
-            let (to, t) = quoted_token(t)?;
-            let t = t.strip_prefix(")}")?;
-            Some((inner[..pos].to_string(), Some((from, to)), t.to_string()))
-        };
+    let dir_template = |arg: &str, wname: &str| -> Option<(String, Option<Pair>, String)> {
+        let arg = arg.strip_prefix("URI.join(@url, ")?;
+        let arg = arg.trim().strip_suffix(',').unwrap_or(arg).trim();
+        let arg = arg.strip_suffix(").to_s")?;
+        if arg == wname {
+            return Some((String::new(), None, String::new()));
+        }
+        // The whole arg is the string literal; it
+        // may carry inner quotes (a `tr` call), so
+        // take first-to-last quote, not a token.
+        let inner = arg.strip_prefix('"')?.strip_suffix('"')?;
+        let plain = format!("#{{{wname}}}");
+        if let Some(pos) = inner.find(&plain) {
+            return Some((
+                inner[..pos].to_string(),
+                None,
+                inner[pos + plain.len()..].to_string(),
+            ));
+        }
+        let tr_open = format!("#{{{wname}.to_s.tr(");
+        let pos = inner.find(&tr_open)?;
+        let rest = &inner[pos + tr_open.len()..];
+        let (from, t) = quoted_token(rest)?;
+        let t = t.trim().strip_prefix(',')?.trim();
+        let (to, t) = quoted_token(t)?;
+        let t = t.strip_prefix(")}")?;
+        Some((inner[..pos].to_string(), Some((from, to)), t.to_string()))
+    };
     let mut walk = DirWalk {
         stage1_regex,
         stage1_tr,
@@ -4562,11 +7803,342 @@ fn parse_dirwalk_shape(root: &str, lines: &[String]) -> Option<super::formula::P
 /// `match.first` / safe navigation). The `tr`
 /// arguments are kept verbatim; negation and escapes
 /// do not reduce.
+/// Two literal `page.match(/…/)` locals, blank
+/// guards, and a template over both.
+fn parse_page_two_match(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    use super::formula::{PageShape, TwoPart};
+    let joined = join_block_lines(lines);
+    let body = joined.trim();
+    // (var, pat, flags, fixed capture for the
+    // `page[regex, N]` bracket form)
+    let mut matches: Vec<(String, String, String, Option<usize>)> = Vec::new();
+    let mut rest = body;
+    for i in 0..2 {
+        let (var, rhs) = rest.split_once(" = ")?;
+        let var = var.trim();
+        if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        // Bracket capture: `page[regex, N]` /
+        // `page[/lit/flags, N]`.
+        if let Some(r) = rhs.trim().strip_prefix(&format!("{root}[")) {
+            let (pat, flags, tail) = if let Some(t) = r.trim().strip_prefix("regex") {
+                (String::new(), String::new(), t)
+            } else {
+                let (p, f, t) = regex_literal(r.trim())?;
+                (p, f, t)
+            };
+            let tail = tail.trim().strip_prefix(',')?.trim();
+            let close = tail.find(']')?;
+            let cap: usize = tail[..close].trim().parse().ok()?;
+            rest = tail[close + 1..].trim();
+            if let Some(r2) = rest
+                .strip_prefix(&format!("next if {var}.blank?"))
+                .or_else(|| rest.strip_prefix(&format!("next unless {var}")))
+            {
+                rest = r2.trim();
+            }
+            matches.push((var.to_string(), pat, flags, Some(cap)));
+            continue;
+        }
+        let rhs = rhs.trim().strip_prefix(&format!("{root}.match("))?;
+        // The first match may be the block regex
+        // (empty pattern marks it).
+        if i == 0
+            && let Some(t) = rhs.trim().strip_prefix("regex)")
+        {
+            matches.push((var.to_string(), String::new(), String::new(), None));
+            rest = t.trim();
+            if let Some(r) = rest
+                .strip_prefix(&format!("next if {var}.blank?"))
+                .or_else(|| rest.strip_prefix(&format!("next unless {var}")))
+            {
+                rest = r.trim();
+            }
+            continue;
+        }
+        let (pat, flags, tail) = regex_literal(rhs.trim())?;
+        rest = tail.trim().strip_prefix(')')?.trim();
+        // This match's own blank guard (or the
+        // combined guard after the second).
+        if let Some(r) = rest
+            .strip_prefix(&format!("next if {var}.blank?"))
+            .or_else(|| rest.strip_prefix(&format!("next unless {var}")))
+        {
+            rest = r.trim();
+        }
+        matches.push((var.to_string(), pat, flags, None));
+    }
+    if let Some(r) = rest.strip_prefix("next if ") {
+        // Combined `<a>.blank? || <b>.blank?`
+        let quote = r.find('"')?;
+        let cond = r[..quote].trim();
+        let want = [
+            format!("{}.blank? || {}.blank?", matches[0].0, matches[1].0),
+            format!("{}.blank? || {}.blank?", matches[1].0, matches[0].0),
+        ];
+        if !want.iter().any(|w| w == cond) {
+            return None;
+        }
+        rest = &r[quote..];
+    }
+    let (body_s, tail) = quoted_token(rest.trim())?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    let mut parts: Vec<TwoPart> = Vec::new();
+    let mut s = body_s.as_str();
+    while let Some(i) = s.find("#{") {
+        if i > 0 {
+            parts.push(TwoPart::Lit(s[..i].to_string()));
+        }
+        let j = s[i + 2..].find('}')?;
+        let token = s[i + 2..i + 2 + j].trim();
+        let (which, cap) = matches
+            .iter()
+            .enumerate()
+            .find_map(|(w, (name, _, _, fixed))| match fixed {
+                Some(cap) if token == name.as_str() => Some((w, *cap)),
+                _ => page_cap_index(name, token).map(|c| (w, c)),
+            })?;
+        parts.push(TwoPart::Cap(which, cap));
+        s = &s[i + 2 + j + 1..];
+    }
+    if !s.is_empty() {
+        parts.push(TwoPart::Lit(s.to_string()));
+    }
+    let [(_, a_pat, a_flags, _), (_, b_pat, b_flags, _)] = matches.try_into().ok()?;
+    Some(PageShape::TwoMatch {
+        a_pat,
+        a_flags,
+        b_pat,
+        b_flags,
+        parts,
+    })
+}
+
+/// `.map(&:first)[.uniq].min_by/max_by { |v|
+/// Version.new(v) }` after a scan: `Some(true)`
+/// for min, `Some(false)` for max.
+fn page_scan_extreme(cur: &str) -> Option<bool> {
+    let t = cur
+        .trim()
+        .strip_prefix(".map(&:first)")
+        .or_else(|| cur.trim().strip_prefix("&.map(&:first)"))?;
+    let t = t
+        .trim()
+        .strip_prefix(".uniq")
+        .or_else(|| t.trim().strip_prefix("&.uniq"))
+        .unwrap_or(t.trim())
+        .trim();
+    let (min, r) = if let Some(r) = t
+        .strip_prefix(".min_by")
+        .or_else(|| t.strip_prefix("&.min_by"))
+    {
+        (true, r)
+    } else if let Some(r) = t
+        .strip_prefix(".max_by")
+        .or_else(|| t.strip_prefix("&.max_by"))
+    {
+        (false, r)
+    } else {
+        return None;
+    };
+    let r = r.trim().strip_prefix('{')?.trim().strip_prefix('|')?;
+    let (var, r) = r.split_once('|')?;
+    let var = var.trim();
+    if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let r = r.trim().strip_suffix('}')?.trim();
+    (r == format!("Version.new({var})")).then_some(min)
+}
+
+/// `).first[a..b].chars.join("j")` after a quoted
+/// split separator: the split-head char window.
+fn page_split_head_chars(sep: String, tail: &str) -> Option<super::formula::PageShape> {
+    let t = tail.strip_prefix(')')?.trim();
+    let t = t
+        .strip_prefix(".first")
+        .or_else(|| t.strip_prefix("&.first"))?
+        .trim();
+    let t = t.strip_prefix('[')?;
+    let close = t.find(']')?;
+    let range = t[..close].trim();
+    let (a, b, inclusive) = if let Some((a, b)) = range.split_once("...") {
+        (a.trim(), b.trim(), false)
+    } else {
+        let (a, b) = range.split_once("..")?;
+        (a.trim(), b.trim(), true)
+    };
+    let start: usize = a.parse().ok()?;
+    let end: usize = b.parse().ok()?;
+    let len = if inclusive {
+        end.checked_sub(start)?.checked_add(1)?
+    } else {
+        end.checked_sub(start)?
+    };
+    let t = t[close + 1..].trim();
+    let t = t
+        .strip_prefix(".chars")
+        .or_else(|| t.strip_prefix("&.chars"))?
+        .trim();
+    let t = t
+        .strip_prefix(".join(")
+        .or_else(|| t.strip_prefix("&.join("))?;
+    let (join, t) = quoted_token(t.trim_start())?;
+    if t.trim() != ")" {
+        return None;
+    }
+    Some(super::formula::PageShape::SplitHeadChars {
+        sep,
+        start,
+        len,
+        join,
+    })
+}
+
+/// `page.scan(/pat/).filter_map { |row| match =
+/// row[0].match(regex); next unless match; <fork> }`
+/// (inkscape's per-row matching).
+fn parse_page_section_match(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    let joined = join_block_lines(lines);
+    let cur = joined.trim().strip_prefix(root)?;
+    let rest = cur
+        .strip_prefix(".scan(")
+        .or_else(|| cur.strip_prefix("&.scan("))?;
+    let (pat, flags, tail) = regex_literal(rest.trim())?;
+    let tail = tail.trim().strip_prefix(')')?.trim();
+    let tail = [
+        ".filter_map",
+        "&.filter_map",
+        ".flat_map",
+        "&.flat_map",
+        ".map",
+        "&.map",
+    ]
+    .iter()
+    .find_map(|p| tail.strip_prefix(p))?;
+    let (row, inner) = json_map_parts(tail.trim())?;
+    let (mv, rhs) = inner.trim().split_once(" = ")?;
+    let mv = mv.trim();
+    let rhs = rhs.trim();
+    let rest = rhs
+        .strip_prefix(&format!("{row}[0].match(regex)"))
+        .or_else(|| rhs.strip_prefix(&format!("{row}[0]&.match(regex)")))?
+        .trim();
+    let rest = rest
+        .strip_prefix(&format!("next if {mv}.blank?"))
+        .or_else(|| rest.strip_prefix(&format!("next unless {mv}")))?
+        .trim();
+    let (cond, then, els) = page_fork_parts(mv, rest)?;
+    Some(super::formula::PageShape::SectionMatch {
+        pat,
+        flags,
+        cond,
+        then,
+        els,
+    })
+}
+
+/// The dosbox scan body: split the first capture
+/// and render by field count through a persistent
+/// output local.
+fn page_scan_split_fork_shape(var: &str, inner: &str) -> Option<super::formula::PageShape> {
+    use super::formula::{PageShape, PageSplitArm, PageSplitPart};
+    let ident = |v: &str| {
+        !v.is_empty()
+            && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !v.chars().next().is_some_and(|c| c.is_ascii_digit())
+    };
+    let (split_var, rhs) = inner.trim().split_once(" = ")?;
+    let split_var = split_var.trim();
+    if !ident(split_var) {
+        return None;
+    }
+    let rest = rhs.trim();
+    let rest = [
+        format!("{var}[0].split("),
+        format!("{var}[0]&.split("),
+        format!("{var}.first.split("),
+        format!("{var}.first&.split("),
+        format!("{var}&.first.split("),
+        format!("{var}&.first&.split("),
+    ]
+    .iter()
+    .find_map(|p| rest.strip_prefix(p.as_str()))?;
+    let (sep, tail) = quoted_token(rest.trim_start())?;
+    if sep.is_empty() || sep == " " || sep.contains('\\') {
+        return None;
+    }
+    let mut rest = tail.trim().strip_prefix(')')?.trim();
+    let mut out_var: Option<&str> = None;
+    let mut arms: Vec<PageSplitArm> = Vec::new();
+    loop {
+        let (lhs, rhs) = rest.split_once(" = ")?;
+        let lhs = lhs.trim();
+        if !ident(lhs) || out_var.is_some_and(|v| v != lhs) {
+            return None;
+        }
+        out_var = Some(lhs);
+        let (template, tail) = quoted_token(rhs.trim())?;
+        let tail = tail
+            .trim()
+            .strip_prefix(&format!("if {split_var}.length =="))
+            .or_else(|| tail.trim().strip_prefix(&format!("if {split_var}.size ==")))?;
+        let digits: String = tail
+            .trim()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let len: usize = digits.parse().ok()?;
+        if arms.iter().any(|a| a.len == len) {
+            return None;
+        }
+        let mut parts = Vec::new();
+        let mut trest = template.as_str();
+        while let Some(i) = trest.find("#{") {
+            if i > 0 {
+                parts.push(PageSplitPart::Lit(trest[..i].to_string()));
+            }
+            let j = trest[i + 2..].find('}')?;
+            let token = trest[i + 2..i + 2 + j].trim();
+            let field = token
+                .strip_prefix(&format!("{split_var}["))
+                .and_then(|r| r.strip_suffix(']'))
+                .and_then(|n| n.parse::<usize>().ok())?;
+            parts.push(PageSplitPart::Field(field));
+            trest = &trest[i + 2 + j + 1..];
+        }
+        if !trest.is_empty() {
+            parts.push(PageSplitPart::Lit(trest.to_string()));
+        }
+        arms.push(PageSplitArm { len, parts });
+        rest = tail.trim().strip_prefix(&digits)?.trim();
+        if rest == out_var? {
+            break;
+        }
+        if rest.is_empty() {
+            return None;
+        }
+    }
+    (arms.len() > 1).then_some(PageShape::ScanSplitFork { sep, arms })
+}
+
 fn parse_page_shape(params: &str, lines: &[String]) -> Option<super::formula::PageBlock> {
     use super::formula::{PageBlock, PageShape};
     let (root, has_regex) = block_params(params)?;
-    if !has_regex {
-        return None;
+    // An undeclared `regex` still resolves to the
+    // livecheck's own regex inside the block
+    // (sleep-aid's `|page|` scan runs under the
+    // oracle); plan requires the spec regex for
+    // shapes that read it.
+    let _ = has_regex;
+    if let Some(shape) = parse_page_two_match(&root, lines) {
+        return Some(PageBlock { shape });
     }
     if let Some(shape) = parse_dirwalk_shape(&root, lines) {
         return Some(PageBlock { shape });
@@ -4577,6 +8149,9 @@ fn parse_page_shape(params: &str, lines: &[String]) -> Option<super::formula::Pa
     if let Some(shape) = parse_hopscan_shape(&root, lines) {
         return Some(PageBlock { shape });
     }
+    if let Some(shape) = parse_page_section_match(&root, lines) {
+        return Some(PageBlock { shape });
+    }
     let joined = join_block_lines(lines);
     // `match = page.match(regex)` + guarded template
     // or single capture (MatchData indexing).
@@ -4584,12 +8159,97 @@ fn parse_page_shape(params: &str, lines: &[String]) -> Option<super::formula::Pa
         return Some(PageBlock { shape });
     }
     let cur = joined.trim().strip_prefix(root.as_str())?;
-    let cur = cur.strip_prefix(".scan(regex)")?;
+    // `page.split(":").first[0..2].chars.join(".")`.
+    if let Some(rest) = cur
+        .strip_prefix(".split(")
+        .or_else(|| cur.strip_prefix("&.split("))
+        && let Some((sep, tail)) = quoted_token(rest.trim_start())
+        && !sep.is_empty()
+        && let Some(shape) = page_split_head_chars(sep, tail.trim())
+    {
+        return Some(PageBlock { shape });
+    }
+    // `page.split(/pat/).filter_map { |section|
+    // [next if section.match?(/skip/)] section[regex, 1] }`
+    if let Some(rest) = cur.strip_prefix(".split(")
+        && let Some((pat, flags, tail)) = regex_literal(rest.trim())
+        && let Some(tail) = tail.trim().strip_prefix(')')
+    {
+        let tail = tail.trim();
+        let tail = tail
+            .strip_suffix("&.flatten")
+            .or_else(|| tail.strip_suffix(".flatten"))
+            .unwrap_or(tail)
+            .trim();
+        let tail = [
+            ".filter_map",
+            "&.filter_map",
+            ".flat_map",
+            "&.flat_map",
+            ".map",
+            "&.map",
+        ]
+        .iter()
+        .find_map(|p| tail.strip_prefix(p))?
+        .trim();
+        let (var, inner) = json_map_parts(tail)?;
+        let inner = inner.trim();
+        // `section.scan(regex).map { |match| "…" }`
+        if let Some(scan) = inner
+            .strip_prefix(&format!("{var}.scan(regex)"))
+            .or_else(|| inner.strip_prefix(&format!("{var}&.scan(regex)")))
+        {
+            let scan = [
+                ".filter_map",
+                "&.filter_map",
+                ".flat_map",
+                "&.flat_map",
+                ".map",
+                "&.map",
+            ]
+            .iter()
+            .find_map(|p| scan.trim().strip_prefix(p))?;
+            let (mvar, minner) = json_map_parts(scan.trim())?;
+            let (quoted, qtail) = quoted_token(minner.trim())?;
+            if !qtail.trim().is_empty() {
+                return None;
+            }
+            let parts = page_template_parts(&quoted, &mvar)?;
+            return Some(PageBlock {
+                shape: PageShape::SplitScan { pat, flags, parts },
+            });
+        }
+        let (skip, inner) = if let Some(r) = inner.strip_prefix(&format!("next if {var}.match?(")) {
+            let (sp, sf, t) = regex_literal(r.trim())?;
+            let after = t.trim().strip_prefix(')')?;
+            (Some((sp, sf)), after.trim())
+        } else {
+            (None, inner)
+        };
+        if inner != format!("{var}[regex, 1]") {
+            return None;
+        }
+        return Some(PageBlock {
+            shape: PageShape::SplitCapture { pat, flags, skip },
+        });
+    }
+    let cur = cur
+        .strip_prefix(".scan(regex)")
+        .or_else(|| cur.strip_prefix("&.scan(regex)"))?;
+    // `.map(&:first)[.uniq].min_by/max_by { |v| Version.new(v) }`
+    if let Some(min) = page_scan_extreme(cur) {
+        return Some(PageBlock {
+            shape: PageShape::ScanExtreme(min),
+        });
+    }
     if let Some(shape) = page_select_shape(cur) {
         return Some(PageBlock { shape });
     }
     let rest = strip_map_open(cur)?;
     let (var, inner) = json_map_parts(rest)?;
+    if let Some(shape) = page_scan_split_fork_shape(&var, &inner) {
+        return Some(PageBlock { shape });
+    }
     if let Some(shape) = page_date_shape(&var, &inner) {
         return Some(PageBlock { shape });
     }
@@ -4666,6 +8326,22 @@ fn parse_page_shape(params: &str, lines: &[String]) -> Option<super::formula::Pa
             } else {
                 PageShape::ScanSub(pat, flags, to)
             },
+        });
+    }
+    // `<capture>.split("", N).join("sep")`.
+    if let Some(args) = after
+        .strip_prefix(".split(\"\", ")
+        .or_else(|| after.strip_prefix("&.split(\"\", "))
+    {
+        let (n_str, tail) = args.split_once(')')?;
+        let n: usize = n_str.trim().parse().ok()?;
+        let tail = tail.trim().strip_prefix(".join(")?;
+        let (sep, tail) = quoted_token(tail.trim())?;
+        if tail.trim() != ")" || n == 0 || sep.contains('\\') {
+            return None;
+        }
+        return Some(PageBlock {
+            shape: PageShape::ScanSplitChars(n, sep),
         });
     }
     // `<capture>.scan(/\d{N}/).map(&:to_i).join(".")`.
@@ -4748,6 +8424,9 @@ fn take_bracketed(s: &str, open: char, close: char) -> Option<(&str, &str)> {
     None
 }
 
+/// Two strings a scan reads as one: a prefix and suffix, or a key and its value.
+type Pair = (String, String);
+
 /// A hop-scan's page-one pick: `page[/lit/, 1]`,
 /// `page.scan(regex)&.flatten&.last`, or a literal
 /// scan mapped to firsts and maxed by version.
@@ -4755,7 +8434,7 @@ fn take_bracketed(s: &str, open: char, close: char) -> Option<(&str, &str)> {
 fn hop_pick<'a>(
     root: &str,
     rhs: &'a str,
-) -> Option<(Option<(String, String)>, super::formula::HopPick, &'a str)> {
+) -> Option<(Option<Pair>, super::formula::HopPick, &'a str)> {
     use super::formula::HopPick;
     let after = rhs.trim().strip_prefix(root)?;
     if let Some(rest) = after.strip_prefix(".scan(regex)&.flatten&.last") {
@@ -5047,23 +8726,35 @@ fn sp_field_tail<'a>(s: &'a str, root: &str) -> Option<(super::formula::SpField,
     Some((sp_field(&rest[..end])?, &rest[end..]))
 }
 
-/// A `[regex, N]` / `[](regex, N)` index tail.
-fn sp_index_tail(tail: &str) -> Option<usize> {
-    let inner = tail
-        .strip_prefix("&.[](regex,")
-        .or_else(|| tail.strip_prefix("[regex,"))?;
+/// A regex field index and the expression following its matching delimiter.
+fn sp_index(tail: &str) -> Option<(usize, &str)> {
+    let (inner, close) = if let Some(inner) = tail.strip_prefix("[regex,") {
+        (inner, ']')
+    } else {
+        (
+            tail.strip_prefix("&.[](regex,")
+                .or_else(|| tail.strip_prefix(".[](regex,"))?,
+            ')',
+        )
+    };
     let inner = inner.trim();
     let digits: usize = inner.find(|c: char| !c.is_ascii_digit())?;
     let (n, rest) = inner.split_at(digits);
-    if !(rest.starts_with(']') || rest.starts_with(')')) {
-        return None;
-    }
-    n.parse().ok()
+    Some((n.parse().ok()?, rest.trim_start().strip_prefix(close)?))
+}
+
+/// A complete `[regex, N]` / `[](regex, N)` index tail.
+fn sp_index_tail(tail: &str) -> Option<usize> {
+    let (n, rest) = sp_index(tail)?;
+    rest.trim().is_empty().then_some(n)
 }
 
 /// `<expr>.tr("a", "b")` arguments.
 fn sp_tr_args(tail: &str) -> Option<(String, String)> {
-    let rest = tail.trim().strip_prefix(".tr(")?;
+    let rest = tail
+        .trim()
+        .strip_prefix(".tr(")
+        .or_else(|| tail.trim().strip_prefix("&.tr("))?;
     let (a, t) = quoted_token(rest.trim_start())?;
     let t = t.trim().strip_prefix(',')?.trim();
     let (b, _) = quoted_token(t)?;
@@ -5103,30 +8794,95 @@ fn sp_field_expr(field: super::formula::SpField, tail: &str) -> Option<super::fo
                 let (p, _) = quoted_token(rest.trim_start())?;
                 return Some(SpExpr::FieldDeleteSuffix(field, p));
             }
-            sp_index_tail(tail).map(|n| SpExpr::FieldIndex(field, n))
+            if let Some((n, rest)) = sp_index(tail) {
+                if rest.trim().is_empty() {
+                    return Some(SpExpr::FieldIndex(field, n));
+                }
+                let (a, b) = sp_tr_args(rest.trim())?;
+                return Some(SpExpr::FieldIndexTr(field, n, a, b));
+            }
+            None
         }
     }
 }
 
+/// `(item.<f>.count("c") >= N) ? item.<f> :
+/// "#{item.<f>}<suffix>"` as a CountPad part.
+fn sp_count_pad(rhs: &str, receiver: &str) -> Option<super::formula::SpPart> {
+    use super::formula::SpPart;
+    let inner = rhs.trim().strip_prefix('(')?;
+    let (cond, rest) = inner.split_once(") ? ")?;
+    let (field, tail) = sp_field_tail(cond.trim(), receiver)?;
+    let r = tail.trim().strip_prefix(".count(")?;
+    let (needle, r) = quoted_token(r.trim_start())?;
+    if needle.is_empty() || needle.contains(['^', '-', '\\']) {
+        return None;
+    }
+    let r = r.trim().strip_prefix(')')?.trim();
+    let min: usize = r.strip_prefix(">=")?.trim().parse().ok()?;
+    let (then_s, els_s) = rest.split_once(" : ")?;
+    let (tf, tt) = sp_field_tail(then_s.trim(), receiver)?;
+    if tf != field || !tt.trim().is_empty() {
+        return None;
+    }
+    let (body_str, t) = quoted_token(els_s.trim())?;
+    if !t.trim().is_empty() {
+        return None;
+    }
+    let parts = sp_template_parts(&body_str, receiver, "match", None, None)?;
+    let [SpPart::Field(f), SpPart::Lit(suffix)] = parts.as_slice() else {
+        return None;
+    };
+    if *f != field {
+        return None;
+    }
+    Some(SpPart::CountPad {
+        field,
+        needle,
+        min,
+        suffix: suffix.clone(),
+    })
+}
+
 /// Parse a `"#{...}"` template body into parts.
 /// `match_var`/`local_name` are the body's capture
-/// and precomputed local names.
+/// and precomputed local names. The item receiver is parsed only inside
+/// expressions; literal text is never renamed.
 fn sp_template_parts(
     body: &str,
+    receiver: &str,
     match_var: &str,
     local_name: Option<&str>,
+    pad: Option<(&str, &super::formula::SpPart)>,
 ) -> Option<Vec<super::formula::SpPart>> {
     use super::formula::SpPart;
+    // This byte belongs only to ruby_unescape_dq's escaped-interpolation sentinel.
+    if body.contains('\u{3}') {
+        return None;
+    }
+    let literal = |text: &str| SpPart::Lit(ruby_unescape_dq(text).replace('\u{3}', "#{"));
     let mut parts = Vec::new();
     let mut rest = body;
-    while let Some(i) = rest.find("#{") {
+    while let Some((i, _)) = rest.match_indices("#{").find(|(i, _)| {
+        rest[..*i]
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'\\')
+            .count()
+            % 2
+            == 0
+    }) {
         if i > 0 {
-            parts.push(SpPart::Lit(rest[..i].to_string()));
+            parts.push(literal(&rest[..i]));
         }
         let j = rest[i + 2..].find('}')?;
         let token = rest[i + 2..i + 2 + j].trim();
         let part = if Some(token) == local_name {
             SpPart::Local
+        } else if let Some((pad_name, pad_part)) = pad
+            && token == pad_name
+        {
+            pad_part.clone()
         } else if let Some(r) = token.strip_prefix(&format!("{match_var}[")) {
             let close = r.find(']')?;
             let n: usize = r[..close].parse().ok()?;
@@ -5136,15 +8892,14 @@ fn sp_template_parts(
                 _ => {
                     if let Some((a, b)) = sp_tr_args(tail) {
                         SpPart::CapTr(n, a, b)
-                    } else if let Some(fb) = tail.strip_prefix(".presence ||") {
+                    } else {
+                        let fb = tail.strip_prefix(".presence ||")?;
                         let (s, _) = quoted_token(fb.trim())?;
                         SpPart::CapOr(n, s)
-                    } else {
-                        return None;
                     }
                 }
             }
-        } else if let Some((field, tail)) = sp_field_tail(token, "item") {
+        } else if let Some((field, tail)) = sp_field_tail(token, receiver) {
             let tail = tail.trim();
             if tail.is_empty() {
                 SpPart::Field(field)
@@ -5163,6 +8918,17 @@ fn sp_template_parts(
                     return None;
                 }
                 SpPart::FieldSplit(field, sep, last)
+            } else if let Some(rest) = tail
+                .strip_prefix(".sub(")
+                .or_else(|| tail.strip_prefix("&.sub("))
+            {
+                let (a, t) = quoted_token(rest.trim_start())?;
+                let t = t.trim().strip_prefix(',')?.trim();
+                let (b, t) = quoted_token(t)?;
+                if t.trim() != ")" {
+                    return None;
+                }
+                SpPart::FieldSub(field, a, b)
             } else {
                 SpPart::FieldIndex(field, sp_index_tail(tail)?)
             }
@@ -5173,7 +8939,7 @@ fn sp_template_parts(
         rest = &rest[i + 2 + j + 1..];
     }
     if !rest.is_empty() {
-        parts.push(SpPart::Lit(rest.to_string()));
+        parts.push(literal(rest));
     }
     Some(parts)
 }
@@ -5181,9 +8947,12 @@ fn sp_template_parts(
 /// A channel condition (`item.channel.nil?`,
 /// `== "x"`, `!= "x"`) as a keep-gate; `negated`
 /// flips it (a `next if` skip vs a keep test).
-fn sp_channel_gate(cond: &str, negated: bool) -> Option<super::formula::SpChannel> {
+fn sp_channel_gate(cond: &str, receiver: &str, negated: bool) -> Option<super::formula::SpChannel> {
     use super::formula::SpChannel;
-    let rest = cond.trim().strip_prefix("item.channel")?.trim();
+    let rest = cond
+        .trim()
+        .strip_prefix(&format!("{receiver}.channel"))?
+        .trim();
     match rest {
         ".nil?" => {
             if negated {
@@ -5195,10 +8964,9 @@ fn sp_channel_gate(cond: &str, negated: bool) -> Option<super::formula::SpChanne
         _ => {
             let (is_eq, val) = if let Some(v) = rest.strip_prefix("==") {
                 (true, v)
-            } else if let Some(v) = rest.strip_prefix("!=") {
-                (false, v)
             } else {
-                return None;
+                let v = rest.strip_prefix("!=")?;
+                (false, v)
             };
             let (s, _) = quoted_token(val.trim())?;
             Some(if is_eq != negated {
@@ -5224,7 +8992,9 @@ fn parse_sparkle_shape(params: &str, lines: &[String]) -> Option<super::formula:
         .filter(|l| !l.is_empty())
         .collect();
     match root.as_str() {
-        "item" => sp_item_body(&stmts, false, None),
+        "item" => sp_blank_own_body(&stmts)
+            .or_else(|| sp_dotless_fork_body(&stmts))
+            .or_else(|| sp_item_body(&stmts, "item", false, None, None)),
         "items" => sp_items_body(&stmts),
         _ => None,
     }
@@ -5234,8 +9004,10 @@ fn parse_sparkle_shape(params: &str, lines: &[String]) -> Option<super::formula:
 /// parts (a capture, a field, or a quoted template).
 fn sp_bare_parts(
     expr: &str,
+    receiver: &str,
     match_var: &str,
     local_name: Option<&str>,
+    pad: Option<(&str, &super::formula::SpPart)>,
 ) -> Option<Vec<super::formula::SpPart>> {
     use super::formula::SpPart;
     let expr = expr.trim();
@@ -5244,7 +9016,7 @@ fn sp_bare_parts(
         if !tail.trim().is_empty() {
             return None;
         }
-        return sp_template_parts(&body_str, match_var, local_name);
+        return sp_template_parts(&body_str, receiver, match_var, local_name, pad);
     }
     if let Some(r) = expr.strip_prefix(&format!("{match_var}[")) {
         let close = r.find(']')?;
@@ -5253,7 +9025,7 @@ fn sp_bare_parts(
         }
         return Some(vec![SpPart::Cap(r[..close].parse().ok()?)]);
     }
-    let (field, tail) = sp_field_tail(expr, "item")?;
+    let (field, tail) = sp_field_tail(expr, receiver)?;
     if !tail.trim().is_empty() {
         return None;
     }
@@ -5261,14 +9033,14 @@ fn sp_bare_parts(
 }
 
 /// One side of a sparkle `(a == b)` condition.
-fn sp_op(tok: &str, match_var: &str) -> Option<super::formula::SpOp> {
+fn sp_op(tok: &str, receiver: &str, match_var: &str) -> Option<super::formula::SpOp> {
     use super::formula::SpOp;
     let tok = tok.trim();
     if let Some(r) = tok.strip_prefix(&format!("{match_var}[")) {
         let inner = r.strip_suffix(']')?;
         return Some(SpOp::Cap(inner.parse().ok()?));
     }
-    let (field, tail) = sp_field_tail(tok, "item")?;
+    let (field, tail) = sp_field_tail(tok, receiver)?;
     if !tail.trim().is_empty() {
         return None;
     }
@@ -5296,15 +9068,17 @@ fn sp_find_gates(
         let is_nil = |side: &str| side.trim().ends_with(".nil?");
         let mentions_channel =
             |side: &str| side.contains("item.channel") || side.contains("_channel");
-        if mentions_channel(lhs) && is_nil(rhs) {
-            if let Some(v) = value_of(lhs) {
-                return Some((Some(SpChannel::EqOrNil(v)), None));
-            }
+        if mentions_channel(lhs)
+            && is_nil(rhs)
+            && let Some(v) = value_of(lhs)
+        {
+            return Some((Some(SpChannel::EqOrNil(v)), None));
         }
-        if mentions_channel(rhs) && is_nil(lhs) {
-            if let Some(v) = value_of(rhs) {
-                return Some((Some(SpChannel::EqOrNil(v)), None));
-            }
+        if mentions_channel(rhs)
+            && is_nil(lhs)
+            && let Some(v) = value_of(rhs)
+        {
+            return Some((Some(SpChannel::EqOrNil(v)), None));
         }
         return None;
     }
@@ -5314,7 +9088,7 @@ fn sp_find_gates(
         return Some((ca.or(cb), ma.or(mb)));
     }
     if cond.contains("item.channel") {
-        return Some((Some(sp_channel_gate(cond, false)?), None));
+        return Some((Some(sp_channel_gate(cond, "item", false)?), None));
     }
     let (field, tail) = sp_field_tail(cond, "item")?;
     if tail.trim() == "&.match(regex)" || tail.trim() == ".match(regex)" {
@@ -5323,10 +9097,274 @@ fn sp_find_gates(
     None
 }
 
+/// `<name> = items.find { |item| cond }&.<field>`,
+/// a literal-regex match over that field value, a
+/// blank guard, and a capture template
+/// (plistedit-pro).
+fn sp_find_litmatch_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
+    use super::formula::{SpExpr, SparkleBlock};
+    if stmts.len() != 4 {
+        return None;
+    }
+    let (name, rhs) = stmts[0].split_once(" = ")?;
+    let name = name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = rhs.trim().strip_prefix("items.find { |item|")?;
+    let (cond, tail) = rest.split_once('}')?;
+    let (channel, guard) = sp_find_gates(cond)?;
+    let field = sp_field(tail.trim().strip_prefix("&.")?.trim())?;
+    let (mv, rhs) = stmts[1].split_once(" = ")?;
+    let mv = mv.trim();
+    let rhs = rhs
+        .trim()
+        .strip_prefix(name)?
+        .trim_start()
+        .strip_prefix("&.match(")
+        .or_else(|| {
+            rhs.trim()
+                .strip_prefix(name)?
+                .trim_start()
+                .strip_prefix(".match(")
+        })?;
+    let (pat, flags, tail) = regex_literal(rhs.trim())?;
+    if tail.trim() != ")" {
+        return None;
+    }
+    if stmts[2].trim() != format!("next if {mv}.blank?") {
+        return None;
+    }
+    let (body_str, tail) = quoted_token(stmts[3].trim())?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    let parts = sp_template_parts(&body_str, "item", mv, None, None)?;
+    Some(SparkleBlock {
+        all: false,
+        find: true,
+        channel,
+        match_guard: guard,
+        present: Vec::new(),
+        needs_spec_regex: guard.is_some(),
+        own_if: None,
+        expr: SpExpr::LitMatch {
+            field,
+            pat,
+            flags,
+            parts,
+        },
+    })
+}
+
+/// `versions = items.filter_map { Version.new(field) }
+/// .uniq.sort` then a stateful patch-bucket throttle
+/// map (commander).
+fn sp_throttle_uniq_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
+    use super::formula::{SpExpr, SparkleBlock};
+    if stmts.len() != 13 {
+        return None;
+    }
+    let ident = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(s.to_string())
+    };
+    let (vlist, rhs) = stmts[0].split_once(" = ")?;
+    let vlist = ident(vlist)?;
+    let item_var = ident(
+        rhs.trim()
+            .strip_prefix("items.filter_map do |")?
+            .strip_suffix('|')?,
+    )?;
+    let (sv, rhs) = stmts[1].split_once(" = ")?;
+    let sv = ident(sv)?;
+    let (field, tail) = sp_field_tail(rhs.trim(), &item_var)?;
+    if !tail.trim().is_empty() || stmts[2].trim() != format!("next unless {sv}") {
+        return None;
+    }
+    if stmts[3].trim() != format!("Version.new({sv})") || stmts[4].trim() != "end.uniq.sort" {
+        return None;
+    }
+    let (tp, rhs) = stmts[5].split_once(" = ")?;
+    let tp = ident(tp)?;
+    if rhs.trim() != "nil" {
+        return None;
+    }
+    let sv2 = ident(
+        stmts[6]
+            .trim()
+            .strip_prefix(&format!("{vlist}.map do |"))?
+            .strip_suffix('|')?,
+    )?;
+    let (pvar, rhs) = stmts[7].split_once(" = ")?;
+    let pvar = ident(pvar)?;
+    if rhs.trim() != format!("{sv2}.patch.to_i") {
+        return None;
+    }
+    let (cur, rhs) = stmts[8].split_once(" = ")?;
+    let cur = ident(cur)?;
+    let bucket_s = rhs
+        .trim()
+        .strip_prefix(&format!("{pvar} - ({pvar} % "))?
+        .strip_suffix(')')?;
+    let bucket: i64 = bucket_s.trim().parse().ok()?;
+    if bucket <= 0
+        || stmts[9].trim() != format!("next if {cur} == {tp}")
+        || stmts[10].trim() != format!("{tp} = {cur}")
+        || stmts[11].trim() != sv2
+        || stmts[12].trim() != "end"
+    {
+        return None;
+    }
+    Some(SparkleBlock {
+        all: true,
+        find: false,
+        channel: None,
+        match_guard: None,
+        present: Vec::new(),
+        needs_spec_regex: false,
+        own_if: None,
+        expr: SpExpr::ThrottleUniq { field, bucket },
+    })
+}
+
+/// A blank match yields the own version when a field
+/// equals its first CSV part, else a bare render
+/// (soundsource@test).
+fn sp_blank_own_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
+    use super::formula::{SpExpr, SparkleBlock};
+    if stmts.len() != 6 {
+        return None;
+    }
+    let (mv, rhs) = stmts[0].split_once(" = ")?;
+    let mv = mv.trim();
+    let (from, tail) = sp_field_tail(rhs.trim(), "item")?;
+    if !matches!(tail.trim(), "&.match(regex)" | ".match(regex)") {
+        return None;
+    }
+    if stmts[1].trim() != format!("if {mv}.blank?") {
+        return None;
+    }
+    let cond = stmts[2].trim().strip_prefix("next version if ")?;
+    let (field, tail) = sp_field_tail(cond.trim(), "item")?;
+    if tail.trim() != "== version.csv.first" {
+        return None;
+    }
+    let blank = sp_bare_parts(
+        stmts[3].trim().strip_prefix("next ")?,
+        "item",
+        mv,
+        None,
+        None,
+    )?;
+    if stmts[4].trim() != "end" {
+        return None;
+    }
+    let (body_str, tail) = quoted_token(stmts[5].trim())?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    let parts = sp_template_parts(&body_str, "item", mv, None, None)?;
+    Some(SparkleBlock {
+        all: false,
+        find: false,
+        channel: None,
+        match_guard: None,
+        present: Vec::new(),
+        needs_spec_regex: true,
+        own_if: None,
+        expr: SpExpr::BlankOwnElse {
+            from,
+            field,
+            blank,
+            parts,
+        },
+    })
+}
+
+/// The dotless short-version vs dotless filename
+/// fork (moom).
+fn sp_dotless_fork_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
+    use super::formula::{SpExpr, SparkleBlock};
+    if stmts.len() != 11 {
+        return None;
+    }
+    let (a_name, rhs) = stmts[0].split_once(" = ")?;
+    let a_name = a_name.trim();
+    let (short, tail) = sp_field_tail(rhs.trim(), "item")?;
+    if sp_tr_args(tail) != Some((".".to_string(), String::new())) {
+        return None;
+    }
+    let short_src = rhs
+        .trim()
+        .strip_prefix("item.")?
+        .split(".tr(")
+        .next()?
+        .trim();
+    if stmts[1].trim() != format!("next if {a_name}.blank?") {
+        return None;
+    }
+    let (b_name, rhs) = stmts[2].split_once(" = ")?;
+    let b_name = b_name.trim();
+    let (url, tail) = sp_field_tail(rhs.trim(), "item")?;
+    let tail = tail.trim();
+    let rest = tail.strip_prefix("[regex,")?;
+    let (cap_s, rest) = rest.split_once(']')?;
+    let cap: usize = cap_s.trim().parse().ok()?;
+    if sp_tr_args(rest) != Some((".".to_string(), String::new())) {
+        return None;
+    }
+    if stmts[3].trim() != format!("next if {b_name}.blank?")
+        || stmts[4].trim() != format!("if {a_name} == {b_name}")
+    {
+        return None;
+    }
+    let (f5, tail) = sp_field_tail(stmts[5].trim(), "item")?;
+    if f5 != short || !tail.trim().is_empty() {
+        return None;
+    }
+    if stmts[6].trim() != format!("elsif {a_name}.length < {b_name}.length") {
+        return None;
+    }
+    let mut want = String::from("\"#{item.");
+    want.push_str(short_src);
+    want.push_str("}.#{");
+    want.push_str(b_name);
+    want.push_str(".delete_prefix(");
+    want.push_str(a_name);
+    want.push_str(")}\"");
+    if stmts[7].trim() != want
+        || stmts[8].trim() != "else"
+        || stmts[9].trim() != "next"
+        || stmts[10].trim() != "end"
+    {
+        return None;
+    }
+    Some(SparkleBlock {
+        all: false,
+        find: false,
+        channel: None,
+        match_guard: None,
+        present: Vec::new(),
+        needs_spec_regex: true,
+        own_if: None,
+        expr: SpExpr::DotlessFork { short, url, cap },
+    })
+}
+
 /// The `|items|` body: whole-array `map`/`find`
 /// wrappers around an item body.
 fn sp_items_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
     use super::formula::{SpExpr, SparkleBlock};
+    if let Some(blk) = sp_find_litmatch_body(stmts) {
+        return Some(blk);
+    }
+    if let Some(blk) = sp_throttle_uniq_body(stmts) {
+        return Some(blk);
+    }
     let first = stmts.first()?;
     if stmts.len() == 1 {
         if let Some(rest) = first.strip_prefix("items.map(&:") {
@@ -5338,12 +9376,13 @@ fn sp_items_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
                 match_guard: None,
                 present: Vec::new(),
                 needs_spec_regex: false,
+                own_if: None,
                 expr: SpExpr::Field(sp_field(name)?),
             });
         }
         if let Some(rest) = first.strip_prefix("items.map { |item|") {
             let inner = rest.trim().strip_suffix('}')?.trim();
-            return sp_item_body(&[inner.to_string()], true, None);
+            return sp_item_body(&[inner.to_string()], "item", true, None, None);
         }
         if let Some(rest) = first.strip_prefix("items.find { |item|") {
             let (cond, tail) = rest.split_once('}')?;
@@ -5363,6 +9402,7 @@ fn sp_items_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
                 match_guard,
                 present: Vec::new(),
                 needs_spec_regex,
+                own_if: None,
                 expr,
             });
         }
@@ -5375,7 +9415,7 @@ fn sp_items_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
             return None;
         }
         let (channel, guard) = sp_find_gates(&stmts[1])?;
-        let mut blk = sp_item_body(&stmts[3..], false, channel)?;
+        let mut blk = sp_item_body(&stmts[3..], "item", false, channel, guard)?;
         blk.find = true;
         if guard.is_some() {
             blk.match_guard = guard;
@@ -5389,7 +9429,29 @@ fn sp_items_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
             return None;
         }
         let (channel, guard) = sp_find_gates(cond)?;
-        let mut blk = sp_item_body(&stmts[1..], false, channel)?;
+        let mut blk = sp_item_body(&stmts[1..], "item", false, channel, guard)?;
+        blk.find = true;
+        if guard.is_some() {
+            blk.match_guard = guard;
+            blk.needs_spec_regex = true;
+        }
+        return Some(blk);
+    }
+    // Parse the selected receiver by name. Its spelling in literal text is data.
+    if let Some((name, rhs)) = first.split_once(" = ")
+        && let Some(rest) = rhs.trim().strip_prefix("items.find { |item|")
+    {
+        let name = name.trim();
+        let (cond, tail) = rest.split_once('}')?;
+        if name.is_empty()
+            || name == "item"
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || !tail.trim().is_empty()
+        {
+            return None;
+        }
+        let (channel, guard) = sp_find_gates(cond)?;
+        let mut blk = sp_item_body(&stmts[1..], name, false, channel, guard)?;
         blk.find = true;
         if guard.is_some() {
             blk.match_guard = guard;
@@ -5400,7 +9462,7 @@ fn sp_items_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
     let opens_map =
         first.starts_with("items.map do |item|") || first.starts_with("items.filter_map do |item|");
     if opens_map && stmts.last().map(String::as_str) == Some("end") {
-        return sp_item_body(&stmts[1..stmts.len() - 1], true, None);
+        return sp_item_body(&stmts[1..stmts.len() - 1], "item", true, None, None);
     }
     None
 }
@@ -5410,15 +9472,21 @@ fn sp_items_body(stmts: &[String]) -> Option<super::formula::SparkleBlock> {
 /// bodies evaluate the newest matching item only.
 fn sp_item_body(
     stmts: &[String],
+    receiver: &str,
     all: bool,
     preset_channel: Option<super::formula::SpChannel>,
+    preset_match_guard: Option<super::formula::SpField>,
 ) -> Option<super::formula::SparkleBlock> {
     use super::formula::{SpExpr, SpPart, SparkleBlock};
     let mut channel = preset_channel;
-    let mut match_guard = None;
+    let mut match_guard = preset_match_guard;
     let mut present: Vec<super::formula::SpField> = Vec::new();
+    let mut own_if: Option<(super::formula::SpField, String)> = None;
+    let mut pad_name: Option<String> = None;
+    let mut pad_part: Option<SpPart> = None;
     // An early `next <expr> if/unless <cond>` render.
     let mut early: Option<(bool, Option<usize>, Vec<SpPart>)> = None;
+    let mut early_cap_blank: Option<(usize, Vec<SpPart>)> = None;
     let mut from: Option<super::formula::SpField> = None;
     let mut local: Option<(super::formula::SpField, usize)> = None;
     let mut local_name: Option<String> = None;
@@ -5432,10 +9500,26 @@ fn sp_item_body(
     while i < expr_end {
         let stmt = stmts[i].as_str();
         i += 1;
-        if let Some(cond) = stmt.strip_prefix("next if item.channel") {
-            channel = Some(sp_channel_gate(&format!("item.channel{cond}"), true)?);
-        } else if let Some(cond) = stmt.strip_prefix("next unless item.channel") {
-            channel = Some(sp_channel_gate(&format!("item.channel{cond}"), false)?);
+        if let Some(cond) = stmt.strip_prefix(&format!("next if {receiver}.channel")) {
+            channel = Some(sp_channel_gate(
+                &format!("{receiver}.channel{cond}"),
+                receiver,
+                true,
+            )?);
+        } else if let Some(cond) = stmt.strip_prefix(&format!("next unless {receiver}.channel")) {
+            channel = Some(sp_channel_gate(
+                &format!("{receiver}.channel{cond}"),
+                receiver,
+                false,
+            )?);
+        } else if stmt == format!("next unless {receiver}")
+            || stmt == format!("next if {receiver}.nil?")
+        {
+            // The assign-find miss: the evaluator's
+            // gated pick is already empty then.
+            if channel.is_none() && match_guard.is_none() {
+                return None;
+            }
         } else if let Some(cond) = stmt.strip_prefix("next if ") {
             // Blank/present guards, possibly several
             // joined by `||`.
@@ -5450,11 +9534,11 @@ fn sp_item_body(
                     guarded = true;
                 } else if let Some(f) = part
                     .strip_prefix('!')
-                    .and_then(|r| sp_field_tail(r.trim(), "item"))
+                    .and_then(|r| sp_field_tail(r.trim(), receiver))
                     .filter(|(_, tail)| tail.trim().is_empty())
                     .map(|(f, _)| f)
                     .or_else(|| {
-                        sp_field_tail(part, "item")
+                        sp_field_tail(part, receiver)
                             .filter(|(_, tail)| {
                                 matches!(tail.trim(), ".blank?" | ".nil?" | "&.blank?")
                             })
@@ -5471,12 +9555,18 @@ fn sp_item_body(
             if !ok {
                 return None;
             }
-        } else if stmt == "next unless item" || stmt == "next if item.nil?" {
-            // The assign-find miss: the evaluator's
-            // gated pick is already empty then.
-            if channel.is_none() && match_guard.is_none() {
+        } else if let Some(cond) = stmt.strip_prefix("next version if ") {
+            // `next version if item.<f> == "lit"`.
+            if own_if.is_some() {
                 return None;
             }
+            let (field, tail) = sp_field_tail(cond.trim(), receiver)?;
+            let r = tail.trim().strip_prefix("== ")?;
+            let (lit, t) = quoted_token(r.trim())?;
+            if !t.trim().is_empty() {
+                return None;
+            }
+            own_if = Some((field, lit));
         } else if let Some(early_stmt) = stmt.strip_prefix("next ")
             && (early_stmt.contains(" if ") || early_stmt.contains(" unless "))
         {
@@ -5493,30 +9583,56 @@ fn sp_item_body(
                 return None;
             };
             let cond = cond.trim();
+            // `next <expr> if <mv>.nil? || <mv>[n].blank?`
+            if !unless
+                && let Some((l, r)) = cond.split_once(" || ")
+                && l.trim() == format!("{match_var}.nil?")
+                && let Some(n) = r
+                    .trim()
+                    .strip_prefix(&format!("{match_var}["))
+                    .and_then(|x| x.strip_suffix("].blank?"))
+                    .and_then(|x| x.parse::<usize>().ok())
+            {
+                if early_cap_blank.is_some() || early.is_some() {
+                    return None;
+                }
+                let pad_ref = match (&pad_name, &pad_part) {
+                    (Some(n), Some(p)) => Some((n.as_str(), p)),
+                    _ => None,
+                };
+                early_cap_blank = Some((
+                    n,
+                    sp_bare_parts(expr, receiver, &match_var, local_name.as_deref(), pad_ref)?,
+                ));
+                guarded = true;
+                continue;
+            }
             let cap = if cond == format!("{match_var}.blank?") {
                 if unless {
                     return None;
                 }
                 None
-            } else if let Some(r) = cond
-                .strip_prefix(&format!("{match_var}["))
-                .and_then(|r| r.strip_suffix(']'))
-            {
-                Some(r.parse().ok()?)
             } else {
-                return None;
+                let r = cond
+                    .strip_prefix(&format!("{match_var}["))
+                    .and_then(|r| r.strip_suffix(']'))?;
+                Some(r.parse().ok()?)
+            };
+            let pad_here = match (&pad_name, &pad_part) {
+                (Some(n), Some(p)) => Some((n.as_str(), p)),
+                _ => None,
             };
             early = Some((
                 unless,
                 cap,
-                sp_bare_parts(expr, &match_var, local_name.as_deref())?,
+                sp_bare_parts(expr, receiver, &match_var, local_name.as_deref(), pad_here)?,
             ));
             guarded = true;
         } else if let Some(cond) = stmt.strip_prefix("next unless ") {
             if cond == match_var {
                 guarded = true;
             } else if let Some((field, tail)) =
-                sp_field_tail(cond, "item").filter(|_| cond.ends_with("match?(regex)"))
+                sp_field_tail(cond, receiver).filter(|_| cond.ends_with("match?(regex)"))
             {
                 if tail != "&.match?(regex)" && tail != ".match?(regex)" {
                     return None;
@@ -5526,60 +9642,93 @@ fn sp_item_body(
                 return None;
             }
         } else if let Some((var, rhs)) = stmt.split_once(" = ") {
-            let (field, tail) = sp_field_tail(rhs.trim(), "item")?;
+            if let Some(pad) = sp_count_pad(rhs.trim(), receiver) {
+                if pad_part.is_some() {
+                    return None;
+                }
+                pad_name = Some(var.trim().to_string());
+                pad_part = Some(pad);
+                continue;
+            }
+            let (field, tail) = sp_field_tail(rhs.trim(), receiver)?;
             let tail = tail.trim();
             if tail == "&.match(regex)" || tail == ".match(regex)" {
                 match_var = var.trim().to_string();
                 from = Some(field);
-            } else if let Some(n) = sp_index_tail(tail) {
+            } else {
+                let n = sp_index_tail(tail)?;
                 local_name = Some(var.trim().to_string());
                 local = Some((field, n));
-            } else {
-                return None;
             }
         } else {
             return None;
         }
     }
+    let pad_ref = match (&pad_name, &pad_part) {
+        (Some(n), Some(p)) => Some((n.as_str(), p)),
+        _ => None,
+    };
     let expr = if let Some(at) = scan_at {
         let stmt = &stmts[at];
-        let (field, tail) = sp_field_tail(stmt, "item")?;
+        let (field, tail) = sp_field_tail(stmt, receiver)?;
         let after = tail
             .trim()
             .strip_prefix(".scan(regex).map")
             .or_else(|| tail.trim().strip_prefix(".scan(regex)&.map"))?
             .trim();
-        let template = if let Some(inner) = after.strip_prefix("{ |match|") {
-            inner.trim().strip_suffix('}')?.trim().to_string()
-        } else if after.starts_with("do |match|") {
-            if stmts.last().map(String::as_str) != Some("end") || at + 2 != stmts.len() - 1 {
-                return None;
-            }
-            stmts[at + 1].clone()
+        // `do |match| if a == b … else … end end`
+        let scan_eq = if after.starts_with("do |match|")
+            && stmts.len() == at + 7
+            && stmts[at + 3].trim() == "else"
+            && stmts[at + 5].trim() == "end"
+            && stmts[at + 6].trim() == "end"
+            && let Some(cond) = stmts[at + 1].trim().strip_prefix("if ")
+            && let Some((a, b)) = cond.split_once(" == ")
+        {
+            Some(SpExpr::ScanEqElse {
+                from: field,
+                a: sp_op(a, receiver, "match")?,
+                b: sp_op(b, receiver, "match")?,
+                then: sp_bare_parts(&stmts[at + 2], receiver, "match", None, None)?,
+                els: sp_bare_parts(&stmts[at + 4], receiver, "match", None, None)?,
+            })
         } else {
-            return None;
+            None
         };
-        let parts = if template.trim().starts_with('"') {
-            let (body_str, tail2) = quoted_token(template.trim())?;
-            if !tail2.trim().is_empty() {
-                return None;
-            }
-            sp_template_parts(&body_str, "match", None)?
-        } else if let Some(r) = template.trim().strip_prefix("match[") {
-            // A bare capture read: `match[0].tr("-", ".")`.
-            let close = r.find(']')?;
-            let n: usize = r[..close].parse().ok()?;
-            let tail = r[close + 1..].trim();
-            if tail.is_empty() {
-                vec![SpPart::Cap(n)]
+        if let Some(eq) = scan_eq {
+            eq
+        } else {
+            let template = if let Some(inner) = after.strip_prefix("{ |match|") {
+                inner.trim().strip_suffix('}')?.trim().to_string()
+            } else if after.starts_with("do |match|") {
+                if stmts.last().map(String::as_str) != Some("end") || at + 2 != stmts.len() - 1 {
+                    return None;
+                }
+                stmts[at + 1].clone()
             } else {
-                let (a, b) = sp_tr_args(tail)?;
-                vec![SpPart::CapTr(n, a, b)]
-            }
-        } else {
-            return None;
-        };
-        SpExpr::Scan { from: field, parts }
+                return None;
+            };
+            let parts = if template.trim().starts_with('"') {
+                let (body_str, tail2) = quoted_token(template.trim())?;
+                if !tail2.trim().is_empty() {
+                    return None;
+                }
+                sp_template_parts(&body_str, receiver, "match", None, None)?
+            } else {
+                let r = template.trim().strip_prefix("match[")?;
+                // A bare capture read: `match[0].tr("-", ".")`.
+                let close = r.find(']')?;
+                let n: usize = r[..close].parse().ok()?;
+                let tail = r[close + 1..].trim();
+                if tail.is_empty() {
+                    vec![SpPart::Cap(n)]
+                } else {
+                    let (a, b) = sp_tr_args(tail)?;
+                    vec![SpPart::CapTr(n, a, b)]
+                }
+            };
+            SpExpr::Scan { from: field, parts }
+        }
     } else {
         let stmt = stmts.get(expr_end)?.as_str();
         if stmt == format!("{match_var}.captures.join(\",\")") {
@@ -5596,20 +9745,35 @@ fn sp_item_body(
                 let (_, tail) = quoted_token(rest)?;
                 let used = rest.len() - tail.len();
                 (
-                    sp_bare_parts(&rest[..used], &match_var, local_name.as_deref())?,
+                    sp_bare_parts(
+                        &rest[..used],
+                        receiver,
+                        &match_var,
+                        local_name.as_deref(),
+                        pad_ref,
+                    )?,
                     tail.trim().strip_prefix(':')?.trim(),
                 )
             } else {
                 let (then, els) = rest.split_once(" : ")?;
-                (sp_bare_parts(then, &match_var, local_name.as_deref())?, els)
+                (
+                    sp_bare_parts(then, receiver, &match_var, local_name.as_deref(), pad_ref)?,
+                    els,
+                )
             };
             SpExpr::EqElse {
                 from,
                 local,
-                a: sp_op(a, &match_var)?,
-                b: sp_op(b, &match_var)?,
+                a: sp_op(a, receiver, &match_var)?,
+                b: sp_op(b, receiver, &match_var)?,
                 then: then_parts,
-                els: sp_bare_parts(els_str, &match_var, local_name.as_deref())?,
+                els: sp_bare_parts(
+                    els_str,
+                    receiver,
+                    &match_var,
+                    local_name.as_deref(),
+                    pad_ref,
+                )?,
             }
         } else if let Some(r) = stmt.strip_prefix(&format!("{match_var}[")) {
             if !guarded {
@@ -5626,7 +9790,13 @@ fn sp_item_body(
             if !tail.trim().is_empty() {
                 return None;
             }
-            let parts = sp_template_parts(&body_str, &match_var, local_name.as_deref())?;
+            let parts = sp_template_parts(
+                &body_str,
+                receiver,
+                &match_var,
+                local_name.as_deref(),
+                pad_ref,
+            )?;
             let uses_cap = parts
                 .iter()
                 .any(|p| matches!(p, SpPart::Cap(_) | SpPart::CapTr(..) | SpPart::CapOr(..)));
@@ -5641,13 +9811,25 @@ fn sp_item_body(
                 local: if uses_local { local } else { None },
                 parts,
             }
-        } else if let Some((field, tail)) = sp_field_tail(stmt, "item") {
+        } else if let Some((field, tail)) = sp_field_tail(stmt, receiver) {
             sp_field_expr(field, tail)?
         } else {
             return None;
         }
     };
     // An early `next` wraps a template final form.
+    let expr = match early_cap_blank {
+        Some((cap, blank)) => match expr {
+            SpExpr::Template { from, parts, .. } => SpExpr::CapBlankElse {
+                from,
+                cap,
+                blank,
+                parts,
+            },
+            _ => return None,
+        },
+        None => expr,
+    };
     let expr = match early {
         None => expr,
         Some((unless, cap, early_parts)) => match expr {
@@ -5703,6 +9885,7 @@ fn sp_item_body(
         match_guard,
         present,
         needs_spec_regex,
+        own_if,
         expr,
     })
 }
@@ -5722,13 +9905,14 @@ fn ghrel_operand(
     mvar: Option<&str>,
     local: Option<&str>,
     rel: &str,
+    tag_alias: Option<&str>,
 ) -> Option<super::formula::GhRelOp> {
     use super::formula::GhRelOp;
     let tok = tok.trim();
     if Some(tok) == local {
         return Some(GhRelOp::Local);
     }
-    if tok == format!("{rel}[\"tag_name\"]") {
+    if tok == format!("{rel}[\"tag_name\"]") || Some(tok) == tag_alias {
         return Some(GhRelOp::Tag);
     }
     let mv = mvar?;
@@ -5743,10 +9927,11 @@ fn ghrel_parts(
     mvar: Option<&str>,
     local: Option<&str>,
     rel: &str,
+    tag_alias: Option<&str>,
 ) -> Option<Vec<super::formula::GhRelPart>> {
     use super::formula::{GhRelOp, GhRelPart};
     let expr = expr.trim();
-    if let Some(op) = ghrel_operand(expr, mvar, local, rel) {
+    if let Some(op) = ghrel_operand(expr, mvar, local, rel, tag_alias) {
         return Some(vec![match op {
             GhRelOp::Cap(n) => GhRelPart::Cap(n),
             GhRelOp::Local => GhRelPart::Local,
@@ -5824,7 +10009,7 @@ fn ghrel_parts(
         }
         let end = end?;
         let tok = body[..end].trim();
-        if let Some(op) = ghrel_operand(tok, mvar, local, rel) {
+        if let Some(op) = ghrel_operand(tok, mvar, local, rel, tag_alias) {
             parts.push(match op {
                 GhRelOp::Cap(n) => GhRelPart::Cap(n),
                 GhRelOp::Local => GhRelPart::Local,
@@ -5842,15 +10027,14 @@ fn ghrel_parts(
                 return None;
             }
             parts.push(GhRelPart::TagTr(from, to));
-        } else if let Some(mut sub) = ghrel_parts(tok, mvar, local, rel) {
+        } else {
+            let mut sub = ghrel_parts(tok, mvar, local, rel, tag_alias)?;
             // A tag capture part (the only other
             // single-part form).
             if sub.len() != 1 || !matches!(sub[0], GhRelPart::TagCapture(..)) {
                 return None;
             }
             parts.append(&mut sub);
-        } else {
-            return None;
         }
         rest = &body[end + 1..];
     }
@@ -5860,6 +10044,53 @@ fn ghrel_parts(
     Some(parts)
 }
 
+/// A ghrel guard-side transform tail: nothing,
+/// `.split("sep").first`, or `&.sub(/pat/flags,
+/// "rep")` with a backref-free replacement. The
+/// whole tail must be consumed.
+fn ghrel_xform_tail(tail: &str) -> Option<super::formula::GhRelXform> {
+    use super::formula::GhRelXform;
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return Some(GhRelXform::Id);
+    }
+    if let Some(args) = tail
+        .strip_prefix("&.split(")
+        .or_else(|| tail.strip_prefix(".split("))
+    {
+        let (sep, rest) = quoted_token(args.trim_start())?;
+        let rest = rest.trim().strip_prefix(')')?.trim();
+        return (rest == ".first" || rest == "&.first").then_some(GhRelXform::SplitFirst(sep));
+    }
+    let args = tail
+        .strip_prefix("&.sub(")
+        .or_else(|| tail.strip_prefix(".sub("))?;
+    let (pat, flags, rest) = regex_literal(args.trim())?;
+    let rest = rest.trim().strip_prefix(',')?.trim();
+    let (rep, rest) = quoted_token(rest)?;
+    if rest.trim() != ")" || rep.contains('\\') {
+        return None;
+    }
+    Some(GhRelXform::SubRe(pat, flags, rep))
+}
+
+/// `version.csv.<part>` (first..fifth) with an
+/// optional guard transform: (index, transform,
+/// whole input consumed).
+fn ghrel_own_csv(tok: &str) -> Option<(usize, super::formula::GhRelXform)> {
+    let rest = tok.trim().strip_prefix("version.csv.")?;
+    let (idx, tail) = [
+        ("first", 0usize),
+        ("second", 1),
+        ("third", 2),
+        ("fourth", 3),
+        ("fifth", 4),
+    ]
+    .iter()
+    .find_map(|(name, idx)| rest.strip_prefix(name).map(|t| (*idx, t)))?;
+    Some((idx, ghrel_xform_tail(tail)?))
+}
+
 /// A ghrel block's result expression as `GhRelThen`
 /// (identity/tr fast paths, `EqElse`, templates).
 fn ghrel_then(
@@ -5867,10 +10098,19 @@ fn ghrel_then(
     mvar: Option<&str>,
     local: Option<&str>,
     rel: &str,
+    tag_alias: Option<&str>,
 ) -> Option<super::formula::GhRelThen> {
     use super::formula::GhRelThen;
     let expr = expr.trim();
     if let Some(mv) = mvar {
+        // `match.to_a.compact.drop(1).join("sep")`
+        if let Some(args) = expr.strip_prefix(&format!("{mv}.to_a.compact.drop(1).join(")) {
+            let (sep, tail) = quoted_token(args.trim_start())?;
+            if tail.trim() != ")" {
+                return None;
+            }
+            return Some(GhRelThen::CompactJoin(sep));
+        }
         if expr == format!("{mv}[1]") {
             return Some(GhRelThen::Identity);
         }
@@ -5894,20 +10134,23 @@ fn ghrel_then(
     if let Some(cond) = expr.strip_prefix('(') {
         let (a, rest) = cond.split_once(" == ")?;
         let (b, rest) = rest.split_once(") ? ")?;
-        let a = ghrel_operand(a, mvar, local, rel)?;
-        let b = ghrel_operand(b, mvar, local, rel)?;
+        let a = ghrel_operand(a, mvar, local, rel, tag_alias)?;
+        let b = ghrel_operand(b, mvar, local, rel, tag_alias)?;
         // Then-branch: a quoted string (extent known)
         // or a bare operand up to ` : `.
         let (then_parts, els) = if rest.starts_with('"') {
             let (_, tail) = quoted_token(rest)?;
             let used = rest.len() - tail.len();
             let els = tail.trim().strip_prefix(':')?.trim();
-            (ghrel_parts(&rest[..used], mvar, local, rel)?, els)
+            (
+                ghrel_parts(&rest[..used], mvar, local, rel, tag_alias)?,
+                els,
+            )
         } else {
             let (then, els) = rest.split_once(" : ")?;
-            (ghrel_parts(then, mvar, local, rel)?, els)
+            (ghrel_parts(then, mvar, local, rel, tag_alias)?, els)
         };
-        let else_parts = ghrel_parts(els, mvar, local, rel)?;
+        let else_parts = ghrel_parts(els, mvar, local, rel, tag_alias)?;
         return Some(GhRelThen::EqElse {
             a,
             b,
@@ -5924,18 +10167,23 @@ fn ghrel_then(
             let (_, tail) = quoted_token(rest)?;
             let used = rest.len() - tail.len();
             let els = tail.trim().strip_prefix(':')?.trim();
-            (ghrel_parts(&rest[..used], mvar, local, rel)?, els)
+            (
+                ghrel_parts(&rest[..used], mvar, local, rel, tag_alias)?,
+                els,
+            )
         } else {
             let (then, els) = rest.split_once(" : ")?;
-            (ghrel_parts(then, mvar, local, rel)?, els)
+            (ghrel_parts(then, mvar, local, rel, tag_alias)?, els)
         };
         return Some(GhRelThen::TruthyElse {
             cap: n.parse().ok()?,
             then: then_parts,
-            els: ghrel_parts(els, mvar, local, rel)?,
+            els: ghrel_parts(els, mvar, local, rel, tag_alias)?,
         });
     }
-    Some(GhRelThen::Template(ghrel_parts(expr, mvar, local, rel)?))
+    Some(GhRelThen::Template(ghrel_parts(
+        expr, mvar, local, rel, tag_alias,
+    )?))
 }
 
 fn parse_ghrel_shape(
@@ -5965,18 +10213,53 @@ fn parse_ghrel_shape(
     // Optional `file_regex = /…/` pre-statement (the
     // asset-existence guard's pattern).
     let mut file_regex: Option<(String, String, String)> = None;
-    if let Some((v, rhs)) = stmts.first().and_then(|s| s.split_once(" = ")) {
-        if !v.is_empty()
-            && v.trim().chars().all(|c| c.is_alphanumeric() || c == '_')
-            && let Ok((pat, flags, tail)) = regex_literal(rhs.trim()).ok_or(())
-            && tail.trim().is_empty()
-        {
-            file_regex = Some((v.trim().to_string(), pat, flags));
-            i = 1;
-        }
+    if let Some((v, rhs)) = stmts.first().and_then(|s| s.split_once(" = "))
+        && !v.is_empty()
+        && v.trim().chars().all(|c| c.is_alphanumeric() || c == '_')
+        && let Ok((pat, flags, tail)) = regex_literal(rhs.trim()).ok_or(())
+        && tail.trim().is_empty()
+    {
+        file_regex = Some((v.trim().to_string(), pat, flags));
+        i = 1;
     }
-    // `<json>.map do |release|` (or filter_map/flat_map)
-    let open = next(&mut i)?;
+    // Own-version locals (`version_suffix =
+    // version.csv.third&.sub(/^[_-]/, "")`): recorded
+    // for the per-asset own guards below.
+    let mut own_locals: Vec<(String, usize, super::formula::GhRelXform)> = Vec::new();
+    while let Some((v, rhs)) = stmts.get(i).and_then(|s| s.split_once(" = ")) {
+        let v = v.trim();
+        if v.is_empty()
+            || !v.chars().all(|c| c.is_alphanumeric() || c == '_')
+            || file_regex.as_ref().is_some_and(|(n, _, _)| n == v)
+        {
+            break;
+        }
+        let Some((csv_idx, xform)) = ghrel_own_csv(rhs) else {
+            break;
+        };
+        own_locals.push((v.to_string(), csv_idx, xform));
+        i += 1;
+    }
+    // `<json>.map do |release|` (or filter_map/flat_map),
+    // optionally sliced (`json[0...9].map`).
+    let open = next(&mut i)?.to_string();
+    let (open, limit) =
+        if let Some(rest) = open.strip_prefix(&root).and_then(|r| r.strip_prefix("[0")) {
+            let (inclusive, rest) = if let Some(r) = rest.strip_prefix("...") {
+                (false, r)
+            } else if let Some(r) = rest.strip_prefix("..") {
+                (true, r)
+            } else {
+                return None;
+            };
+            let (n, rest) = rest.split_once(']')?;
+            let n: usize = n.trim().parse().ok()?;
+            let n = if inclusive { n + 1 } else { n };
+            (format!("{root}{rest}"), Some(n))
+        } else {
+            (open, None)
+        };
+    let open = open.as_str();
     let (rel, outer_flat) = ["map", "filter_map", "flat_map"].iter().find_map(|m| {
         open.strip_prefix(&format!("{root}.{m} do |"))
             .and_then(|r| r.strip_suffix('|'))
@@ -6069,10 +10352,10 @@ fn parse_ghrel_shape(
                     let (_, pat, flags) = file_regex.as_ref().filter(|(n, _, _)| n == name)?;
                     asset_any = Some(GhRelAny::NameMatch(pat.clone(), flags.clone()));
                 }
-            } else if let Some(e) = test
-                .strip_prefix(&format!("{a}[\"name\"]&.end_with?("))
-                .or_else(|| test.strip_prefix(&format!("{a}[\"name\"].end_with?(")))
-            {
+            } else {
+                let e = test
+                    .strip_prefix(&format!("{a}[\"name\"]&.end_with?("))
+                    .or_else(|| test.strip_prefix(&format!("{a}[\"name\"].end_with?(")))?;
                 let e = e.trim();
                 if e.starts_with('"') {
                     let (lit, tail) = quoted_token(e)?;
@@ -6088,34 +10371,84 @@ fn parse_ghrel_shape(
                         .map(|(_, v)| v.clone())?;
                     asset_any = Some(GhRelAny::NameEndsWith(lit));
                 }
-            } else {
-                return None;
             }
             i += 1;
         } else {
             break;
         }
     }
-    // Optional release-level pre-capture local:
-    // `<local> = <rel>["name"|"tag_name"]&.[](<re>, 1)`
-    // and its blank guard.
+    // Release-level locals, in order: an optional
+    // raw-tag alias (`tag = release["tag_name"]`)
+    // and/or one pre-capture local (a bracket
+    // capture off a field or the alias with its
+    // blank guard, or a `delete_prefix` field read).
     let mut pre_capture: Option<GhRelCapture> = None;
     let mut local_var: Option<String> = None;
-    if let Some((v, rhs)) = stmts.get(i).and_then(|s| s.split_once(" = ")) {
-        let parsed = (|| {
-            if v.is_empty() || !v.chars().all(|c| c.is_alphanumeric() || c == '_') {
+    let mut tag_alias: Option<String> = None;
+    for _ in 0..2 {
+        let Some(stmt) = stmts.get(i) else { break };
+        let Some((v, rhs)) = stmt.split_once(" = ") else {
+            break;
+        };
+        let v = v.trim();
+        if v.is_empty() || !v.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            break;
+        }
+        let rhs = rhs.trim();
+        // Raw-tag alias.
+        if rhs == format!("{rel}[\"tag_name\"]") && tag_alias.is_none() {
+            tag_alias = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        // `delete_prefix` field read.
+        let del = (|| {
+            let rest = rhs
+                .strip_prefix(&format!("{rel}[\"tag_name\"]&.delete_prefix("))
+                .or_else(|| rhs.strip_prefix(&format!("{rel}[\"tag_name\"].delete_prefix(")))?;
+            let (lit, tail) = quoted_token(rest.trim_start())?;
+            (tail.trim() == ")").then_some(lit)
+        })();
+        if let Some(lit) = del {
+            if pre_capture.is_some() {
                 return None;
             }
-            let field = ["name", "tag_name"].into_iter().find(|f| {
-                rhs.starts_with(&format!("{rel}[\"{f}\"]&.[]("))
-                    || rhs.starts_with(&format!("{rel}[\"{f}\"].[]("))
-                    || rhs.starts_with(&format!("{rel}[\"{f}\"]["))
-            })?;
-            let arg = rhs
-                .strip_prefix(&format!("{rel}[\"{field}\"]&.[]("))
-                .or_else(|| rhs.strip_prefix(&format!("{rel}[\"{field}\"].[](")))
-                .or_else(|| rhs.strip_prefix(&format!("{rel}[\"{field}\"][")))?
-                .trim_start();
+            let guard =
+                stmts.get(i + 1).map(String::as_str) == Some(&format!("next if {v}.blank?")[..]);
+            local_var = Some(v.to_string());
+            pre_capture = Some(GhRelCapture {
+                field: "tag_name".to_string(),
+                lit: None,
+                op: super::formula::GhRelLocalOp::DeletePrefix(lit),
+                blank_guard: guard,
+            });
+            i += if guard { 2 } else { 1 };
+            continue;
+        }
+        // Bracket capture off a field or the alias.
+        let parsed = (|| {
+            let recv_alias = tag_alias.as_deref().filter(|a| {
+                rhs.starts_with(&format!("{a}[")) || rhs.starts_with(&format!("{a}&.[]("))
+            });
+            let (field, arg) = if let Some(a) = recv_alias {
+                let arg = rhs
+                    .strip_prefix(&format!("{a}&.[]("))
+                    .or_else(|| rhs.strip_prefix(&format!("{a}[")))?
+                    .trim_start();
+                ("tag_name", arg)
+            } else {
+                let field = ["name", "tag_name"].into_iter().find(|f| {
+                    rhs.starts_with(&format!("{rel}[\"{f}\"]&.[]("))
+                        || rhs.starts_with(&format!("{rel}[\"{f}\"].[]("))
+                        || rhs.starts_with(&format!("{rel}[\"{f}\"]["))
+                })?;
+                let arg = rhs
+                    .strip_prefix(&format!("{rel}[\"{field}\"]&.[]("))
+                    .or_else(|| rhs.strip_prefix(&format!("{rel}[\"{field}\"].[](")))
+                    .or_else(|| rhs.strip_prefix(&format!("{rel}[\"{field}\"][")))?
+                    .trim_start();
+                (field, arg)
+            };
             let lit = if let Some(t) = arg.strip_prefix("regex") {
                 let t = t.trim();
                 if !(t == ", 1)" || t == ", 1]" || t == ",1)" || t == ",1]") {
@@ -6130,21 +10463,27 @@ fn parse_ghrel_shape(
                 }
                 Some((pat, flags))
             };
-            Some((
-                v.to_string(),
-                GhRelCapture {
-                    field: field.to_string(),
-                    lit,
-                },
-            ))
+            Some(GhRelCapture {
+                field: field.to_string(),
+                lit,
+                op: super::formula::GhRelLocalOp::Capture,
+                blank_guard: true,
+            })
         })();
-        if let Some((v, cap)) = parsed {
-            if stmts.get(i + 1).map(String::as_str) != Some(&format!("next if {v}.blank?")[..]) {
-                return None;
+        match parsed {
+            Some(cap) => {
+                if pre_capture.is_some() {
+                    return None;
+                }
+                if stmts.get(i + 1).map(String::as_str) != Some(&format!("next if {v}.blank?")[..])
+                {
+                    return None;
+                }
+                local_var = Some(v.to_string());
+                pre_capture = Some(cap);
+                i += 2;
             }
-            local_var = Some(v);
-            pre_capture = Some(cap);
-            i += 2;
+            None => break,
         }
     }
     // Capture statement(s): an assets loop, a tag
@@ -6204,24 +10543,58 @@ fn parse_ghrel_shape(
         (None, Some(_)) => GhRelSource::PreCaptureOnly,
         (None, None) => return None,
     };
+    let mut blank_emit_local = false;
+    let mut own_guards: Vec<super::formula::GhRelMatchGuard> = Vec::new();
     if let Some(mv) = &mvar {
         let guard = squash(next(&mut i)?);
         if guard == format!("next if {mv}.blank?") || guard == format!("next unless {mv}") {
             // Plain blank guard, either spelling.
-        } else if let Some(rest) = guard
-            .strip_prefix(&format!("next if {mv}.blank? || {rel}[\"name\"]&.match?("))
-            .or_else(|| {
-                guard.strip_prefix(&format!("next if {mv}.blank? || {rel}[\"name\"].match?("))
-            })
-        {
+        } else if local_var.as_deref().is_some_and(|lv| {
+            guard == format!("next {lv} if {mv}.blank?")
+                || guard == format!("next {lv} unless {mv}")
+        }) {
+            blank_emit_local = true;
+        } else {
+            let rest = guard
+                .strip_prefix(&format!("next if {mv}.blank? || {rel}[\"name\"]&.match?("))
+                .or_else(|| {
+                    guard.strip_prefix(&format!("next if {mv}.blank? || {rel}[\"name\"].match?("))
+                })?;
             // Blank guard combined with the name skip.
             let (pat, flags, tail) = regex_literal(rest)?;
             if tail.trim() != ")" {
                 return None;
             }
             name_skip = Some((pat, flags));
-        } else {
-            return None;
+        }
+    }
+    // Own-version match guards:
+    // `next if match[n]<xform> != <own form>`.
+    if let Some(mv) = &mvar {
+        while let Some(line) = stmts.get(i).map(|s| squash(s))
+            && let Some(cond) = line.strip_prefix("next if ")
+        {
+            let (lhs, rhs) = cond.split_once(" != ")?;
+            let lhs = lhs.trim();
+            let rest = lhs.strip_prefix(&format!("{mv}["))?;
+            let (n, tail) = rest.split_once(']')?;
+            let cap: usize = n.parse().ok()?;
+            let cap_xform = ghrel_xform_tail(tail)?;
+            let rhs = rhs.trim();
+            let (own_csv, own_xform) = if let Some((idx, xf)) = ghrel_own_csv(rhs) {
+                (idx, xf)
+            } else if let Some((_, idx, xf)) = own_locals.iter().find(|(name, _, _)| name == rhs) {
+                (*idx, xf.clone())
+            } else {
+                return None;
+            };
+            own_guards.push(super::formula::GhRelMatchGuard {
+                cap,
+                cap_xform,
+                own_csv,
+                own_xform,
+            });
+            i += 1;
         }
     }
     // Result expression (an early-`next` equality
@@ -6234,10 +10607,34 @@ fn parse_ghrel_shape(
         let (a, b) = cond.split_once(" == ")?;
         let els_expr = next(&mut i)?;
         GhRelThen::EqElse {
-            a: ghrel_operand(a, mvar.as_deref(), local_var.as_deref(), &rel)?,
-            b: ghrel_operand(b, mvar.as_deref(), local_var.as_deref(), &rel)?,
-            then: ghrel_parts(early_expr, mvar.as_deref(), local_var.as_deref(), &rel)?,
-            els: ghrel_parts(els_expr, mvar.as_deref(), local_var.as_deref(), &rel)?,
+            a: ghrel_operand(
+                a,
+                mvar.as_deref(),
+                local_var.as_deref(),
+                &rel,
+                tag_alias.as_deref(),
+            )?,
+            b: ghrel_operand(
+                b,
+                mvar.as_deref(),
+                local_var.as_deref(),
+                &rel,
+                tag_alias.as_deref(),
+            )?,
+            then: ghrel_parts(
+                early_expr,
+                mvar.as_deref(),
+                local_var.as_deref(),
+                &rel,
+                tag_alias.as_deref(),
+            )?,
+            els: ghrel_parts(
+                els_expr,
+                mvar.as_deref(),
+                local_var.as_deref(),
+                &rel,
+                tag_alias.as_deref(),
+            )?,
         }
     } else if let Some(mv) = &mvar
         && let Some((v, rhs)) = expr.split_once(" = ")
@@ -6258,7 +10655,13 @@ fn parse_ghrel_shape(
         }
         GhRelThen::NonZeroPatch
     } else {
-        ghrel_then(&expr, mvar.as_deref(), local_var.as_deref(), &rel)?
+        ghrel_then(
+            &expr,
+            mvar.as_deref(),
+            local_var.as_deref(),
+            &rel,
+            tag_alias.as_deref(),
+        )?
     };
     // Closers: assets form has an inner `end` (or the
     // `.presence ||` fallback statement) then
@@ -6284,7 +10687,15 @@ fn parse_ghrel_shape(
                 && tail[1] == "end.flatten"
                 && let Some(rest) = tail[0].strip_prefix("end.presence || ")
             {
-                match ghrel_parts(rest, mvar.as_deref(), local_var.as_deref(), &rel).as_deref() {
+                match ghrel_parts(
+                    rest,
+                    mvar.as_deref(),
+                    local_var.as_deref(),
+                    &rel,
+                    tag_alias.as_deref(),
+                )
+                .as_deref()
+                {
                     Some([GhRelPart::TagCapture(pat, flags)]) => {
                         fallback_tag = Some((pat.clone(), flags.clone()));
                         true
@@ -6328,6 +10739,9 @@ fn parse_ghrel_shape(
         source,
         then,
         fallback_tag,
+        blank_emit_local,
+        limit,
+        own_guards,
     })
 }
 
@@ -6463,14 +10877,56 @@ fn parse_git_shape(params: &str, lines: &[String]) -> Option<super::formula::Git
             }
             idx += 1;
         }
-        if rest.len() != idx + 2 || rest[idx + 1] != "end" {
+        if rest.last().map(String::as_str) != Some("end") {
             return None;
         }
-        let op = git_map_expr(&var, &rest[idx])?;
+        let inner = &rest[idx..rest.len() - 1];
+        // Match-assign form:
+        //   match = tag.match(regex)
+        //   next if match.blank? [|| match[1].split(..).include?(..)]
+        //   "#{match[1]},#{match[2]}" | match[1]
+        if inner.len() == 3
+            && let Some((mv, rhs)) = assign_parts(&inner[0])
+            && (rhs == format!("{var}.match(regex)") || rhs == format!("{var}&.match(regex)"))
+        {
+            let g = inner[1].trim();
+            let mut skip_split_contains = None;
+            if g == format!("next if {mv}.blank?") {
+            } else if let Some(r) =
+                g.strip_prefix(&format!("next if {mv}.blank? || {mv}[1].split("))
+            {
+                let (sep, r) = quoted_token(r.trim_start())?;
+                let r = r.trim().strip_prefix(')')?.trim();
+                let r = r
+                    .strip_prefix(".include?(")
+                    .or_else(|| r.strip_prefix("&.include?("))?;
+                let (lit, r) = quoted_token(r.trim_start())?;
+                if r.trim() != ")" {
+                    return None;
+                }
+                skip_split_contains = Some((sep, lit));
+            } else {
+                return None;
+            }
+            let parts = latest_parts(&inner[2], &mv, None, None)?;
+            return Some(GitBlock {
+                needs_spec_regex: !has_regex,
+                skip_tags,
+                op: super::formula::GitOp::Identity,
+                match_template: Some(parts),
+                skip_split_contains,
+            });
+        }
+        if inner.len() != 1 {
+            return None;
+        }
+        let op = git_map_expr(&var, &inner[0])?;
         return Some(GitBlock {
             needs_spec_regex: !has_regex,
             skip_tags,
             op,
+            match_template: None,
+            skip_split_contains: None,
         });
     }
     // The brace map, one statement:
@@ -6486,6 +10942,8 @@ fn parse_git_shape(params: &str, lines: &[String]) -> Option<super::formula::Git
         needs_spec_regex: !has_regex,
         skip_tags,
         op,
+        match_template: None,
+        skip_split_contains: None,
     })
 }
 
@@ -6539,19 +10997,29 @@ fn latest_parts(
     expr: &str,
     var: &str,
     local: Option<&str>,
+    picked: Option<&str>,
 ) -> Option<Vec<super::formula::LatestPart>> {
     use super::formula::LatestPart;
     let expr = expr.trim();
     if Some(expr) == local {
         return Some(vec![LatestPart::Local]);
     }
-    let cap_of = |tok: &str| -> Option<usize> {
-        tok.strip_prefix(&format!("{var}["))
-            .and_then(|r| r.strip_suffix(']'))
-            .and_then(|n| n.parse().ok())
+    // `var[n]` or `var[n].tr("a", "b")` as one part.
+    let part_of = |tok: &str| -> Option<LatestPart> {
+        let rest = tok.strip_prefix(&format!("{var}["))?;
+        let (n, tail) = rest.split_once(']')?;
+        let n: usize = n.parse().ok()?;
+        let tail = tail.trim();
+        if tail.is_empty() {
+            return Some(LatestPart::Cap(n));
+        }
+        match latest_tr(tail)? {
+            Some((from, to)) => Some(LatestPart::CapTr(n, from, to)),
+            None => None,
+        }
     };
-    if let Some(n) = cap_of(expr) {
-        return Some(vec![LatestPart::Cap(n)]);
+    if let Some(part) = part_of(expr) {
+        return Some(vec![part]);
     }
     if !expr.starts_with('"') {
         return None;
@@ -6567,12 +11035,40 @@ fn latest_parts(
             parts.push(LatestPart::Lit(rest[..start].to_string()));
         }
         let body = &rest[start + 2..];
-        let end = body.find('}')?;
+        // Brace-aware token end: a token may carry
+        // its own `{ … }` block (recaf's assets map).
+        let bytes = body.as_bytes();
+        let mut depth = 1i32;
+        let mut quote: Option<u8> = None;
+        let mut end = None;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            match (quote, c) {
+                (Some(_), b'\\') => i += 1,
+                (Some(q), c2) if c2 == q => quote = None,
+                (Some(_), _) => {}
+                (None, b'"' | b'\'') => quote = Some(c),
+                (None, b'{') => depth += 1,
+                (None, b'}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let end = end?;
         let tok = body[..end].trim();
         if Some(tok) == local {
             parts.push(LatestPart::Local);
+        } else if picked.is_some_and(|p| latest_assets_max_digits(tok, p)) {
+            parts.push(LatestPart::AssetsMaxUpdatedDigits);
         } else {
-            parts.push(LatestPart::Cap(cap_of(tok)?));
+            parts.push(part_of(tok)?);
         }
         rest = &body[end + 1..];
     }
@@ -6582,11 +11078,70 @@ fn latest_parts(
     Some(parts)
 }
 
+/// `<picked>.map { |a| a["updated_at"] }.max
+/// .gsub(/\D/, "")` as a whole template token.
+fn latest_assets_max_digits(tok: &str, picked: &str) -> bool {
+    let inner = (|| {
+        let r = tok
+            .strip_prefix(picked)?
+            .trim()
+            .strip_prefix(".map")?
+            .trim();
+        let r = r.strip_prefix('{')?.trim().strip_prefix('|')?;
+        let (a, r) = r.split_once('|')?;
+        let a = a.trim();
+        if a.is_empty() || !a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        let r = r
+            .trim()
+            .strip_prefix(&format!("{a}[\"updated_at\"]"))?
+            .trim();
+        let r = r.strip_prefix('}')?.trim().strip_prefix(".max.gsub(")?;
+        let (pat, flags, t) = regex_literal(r.trim())?;
+        let t = t.trim().strip_prefix(',')?.trim();
+        let (rep, t) = quoted_token(t)?;
+        (pat == "\\D" && flags.is_empty() && rep.is_empty() && t.trim() == ")").then_some(())
+    })();
+    inner.is_some()
+}
+
+/// One side of a latest equality fork: a capture
+/// (optionally `tr`ed or read through
+/// `Version.new(…).major_minor_patch`) or the local.
+fn latest_op(tok: &str, var: &str, local: Option<&str>) -> Option<super::formula::LatestOp> {
+    use super::formula::LatestOp;
+    let tok = tok.trim();
+    if Some(tok) == local {
+        return Some(LatestOp::Local);
+    }
+    if let Some(inner) = tok
+        .strip_prefix("Version.new(")
+        .and_then(|r| r.strip_suffix(").major_minor_patch.to_s"))
+    {
+        let r = inner.trim().strip_prefix(&format!("{var}["))?;
+        let n: usize = r.strip_suffix(']')?.parse().ok()?;
+        return Some(LatestOp::CapMmp(n));
+    }
+    let rest = tok.strip_prefix(&format!("{var}["))?;
+    let (n, tail) = rest.split_once(']')?;
+    let n: usize = n.parse().ok()?;
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return Some(LatestOp::Cap(n));
+    }
+    match latest_tr(tail)? {
+        Some((from, to)) => Some(LatestOp::CapTr(n, from, to)),
+        None => None,
+    }
+}
+
 /// Split a `X ? A : B` render tail (A quoted or bare).
 fn latest_fork(
     rest: &str,
     var: &str,
     local: Option<&str>,
+    picked: Option<&str>,
 ) -> Option<(
     Vec<super::formula::LatestPart>,
     Vec<super::formula::LatestPart>,
@@ -6595,14 +11150,14 @@ fn latest_fork(
         let (_, tail) = quoted_token(rest)?;
         let used = rest.len() - tail.len();
         Some((
-            latest_parts(&rest[..used], var, local)?,
-            latest_parts(tail.trim().strip_prefix(':')?.trim(), var, local)?,
+            latest_parts(&rest[..used], var, local, picked)?,
+            latest_parts(tail.trim().strip_prefix(':')?.trim(), var, local, picked)?,
         ))
     } else {
         let (then, els) = rest.split_once(" : ")?;
         Some((
-            latest_parts(then, var, local)?,
-            latest_parts(els, var, local)?,
+            latest_parts(then, var, local, picked)?,
+            latest_parts(els, var, local, picked)?,
         ))
     }
 }
@@ -6614,41 +11169,26 @@ fn latest_match_render(
     expr: &str,
     var: &str,
     local: Option<&str>,
+    picked: Option<&str>,
 ) -> Option<(super::formula::LatestRender, Option<(String, String)>)> {
-    use super::formula::{LatestOp, LatestRender};
+    use super::formula::LatestRender;
     let expr = expr.trim();
-    if let Some(chain) = expr.strip_prefix(&format!("{var}[1]")) {
-        if let Some(tr) = latest_tr(chain) {
-            return Some((LatestRender::Capture, tr));
-        }
+    if let Some(chain) = expr.strip_prefix(&format!("{var}[1]"))
+        && let Some(tr) = latest_tr(chain)
+    {
+        return Some((LatestRender::Capture, tr));
     }
     if let Some(cond) = expr.strip_prefix('(') {
         let (a, rest) = cond.split_once(" == ")?;
         let (b, rest) = rest.split_once(") ? ")?;
-        let op_of = |tok: &str| -> Option<LatestOp> {
-            let tok = tok.trim();
-            if Some(tok) == local {
-                return Some(LatestOp::Local);
-            }
-            tok.strip_prefix(&format!("{var}["))
-                .and_then(|r| r.strip_suffix(']'))
-                .and_then(|n| n.parse().ok())
-                .map(LatestOp::Cap)
-        };
-        let (then, els) = latest_fork(rest, var, local)?;
-        return Some((
-            LatestRender::EqElse {
-                a: op_of(a)?,
-                b: op_of(b)?,
-                then,
-                els,
-            },
-            None,
-        ));
+        let a = latest_op(a, var, local)?;
+        let b = latest_op(b, var, local)?;
+        let (then, els) = latest_fork(rest, var, local, picked)?;
+        return Some((LatestRender::EqElse { a, b, then, els }, None));
     }
     if let Some(r) = expr.strip_prefix(&format!("{var}[")) {
         if let Some((n, rest)) = r.split_once("].present? ? ") {
-            let (then, els) = latest_fork(rest, var, local)?;
+            let (then, els) = latest_fork(rest, var, local, picked)?;
             return Some((
                 LatestRender::PresentElse {
                     cap: n.parse().ok()?,
@@ -6659,7 +11199,7 @@ fn latest_match_render(
             ));
         }
         if let Some((n, rest)) = r.split_once("] ? ") {
-            let (then, els) = latest_fork(rest, var, local)?;
+            let (then, els) = latest_fork(rest, var, local, picked)?;
             return Some((
                 LatestRender::TruthyElse {
                     cap: n.parse().ok()?,
@@ -6671,7 +11211,7 @@ fn latest_match_render(
         }
     }
     Some((
-        LatestRender::Template(latest_parts(expr, var, local)?),
+        LatestRender::Template(latest_parts(expr, var, local, picked)?),
         None,
     ))
 }
@@ -6693,7 +11233,7 @@ fn latest_scan_render(
     if let Some(r) = inner.strip_prefix(&format!("{var}["))
         && let Some((n, rest)) = r.split_once("].present? ? ")
     {
-        let (then, els) = latest_fork(rest, var, None)?;
+        let (then, els) = latest_fork(rest, var, None, None)?;
         return Some((
             LatestRender::ScanPresentElse {
                 cap: n.parse().ok()?,
@@ -6704,7 +11244,7 @@ fn latest_scan_render(
         ));
     }
     Some((
-        LatestRender::ScanTemplate(latest_parts(inner, var, None)?),
+        LatestRender::ScanTemplate(latest_parts(inner, var, None, None)?),
         None,
     ))
 }
@@ -6727,6 +11267,8 @@ fn parse_latest_shape(params: &str, lines: &[String]) -> Option<super::formula::
         render: LatestRender::Capture,
         two_b: None,
         pre_capture: None,
+        match_pre: false,
+        asset_pick: None,
     };
     // The match blank guard, either spelling.
     let blank_guard = |stmt: &str, var: &str| {
@@ -6807,7 +11349,7 @@ fn parse_latest_shape(params: &str, lines: &[String]) -> Option<super::formula::
         if tail != "&.match(regex)" || !blank_guard(&stmts[1], &var) {
             return None;
         }
-        let (render, tr) = latest_match_render(&stmts[2], &var, None)?;
+        let (render, tr) = latest_match_render(&stmts[2], &var, None, None)?;
         return Some(with_render(
             base(latest_source(&field)?, false, None),
             render,
@@ -6851,6 +11393,33 @@ fn parse_latest_shape(params: &str, lines: &[String]) -> Option<super::formula::
         let (var, rhs) = assign_parts(stmt)?;
         let (field, tail) = latest_field(&root, rhs)?;
         let source = latest_source(&field)?;
+        // `&.match(regex)` / `&.match(/lit/flags)`
+        // (clock-bar's second capture): same first
+        // capture as the bracket form.
+        if let Some(arg) = tail
+            .strip_prefix("&.match(")
+            .or_else(|| tail.strip_prefix(".match("))
+        {
+            let arg = arg.trim_start();
+            let lit = if arg == "regex)" {
+                None
+            } else {
+                let (pat, flags, t) = regex_literal(arg)?;
+                if t.trim() != ")" {
+                    return None;
+                }
+                Some((pat, flags))
+            };
+            return Some((
+                var,
+                LatestPre {
+                    source,
+                    lit,
+                    capture: true,
+                    ops: Vec::new(),
+                },
+            ));
+        }
         if let Some(rest) = tail
             .strip_prefix("&.[](")
             .or_else(|| tail.strip_prefix(".[]("))
@@ -6898,16 +11467,28 @@ fn parse_latest_shape(params: &str, lines: &[String]) -> Option<super::formula::
                 ops.push(LatestPreOp::Tr(a, b));
                 rest = t.trim().strip_prefix(')')?;
             } else if let Some(r) = rest
+                .strip_prefix("&.sub(")
+                .or_else(|| rest.strip_prefix(".sub("))
+            {
+                let (pat, flags, t) = regex_literal(r.trim_start())?;
+                let t = t.trim().strip_prefix(',')?.trim();
+                let (rep, t) = quoted_token(t)?;
+                if rep.contains('\\') {
+                    return None;
+                }
+                ops.push(LatestPreOp::SubRe(pat, flags, rep));
+                rest = t.trim().strip_prefix(')')?;
+            } else if let Some(r) = rest
                 .strip_prefix("&.delete_prefix(")
                 .or_else(|| rest.strip_prefix(".delete_prefix("))
             {
                 let (a, t) = quoted_token(r.trim_start())?;
                 ops.push(LatestPreOp::DeletePrefix(a));
                 rest = t.trim().strip_prefix(')')?;
-            } else if let Some(r) = rest
-                .strip_prefix("&.gsub(")
-                .or_else(|| rest.strip_prefix(".gsub("))
-            {
+            } else {
+                let r = rest
+                    .strip_prefix("&.gsub(")
+                    .or_else(|| rest.strip_prefix(".gsub("))?;
                 // Only an anchored literal deletion
                 // (`gsub(/^v/, "")`) is data.
                 let (pat, _flags, t) = regex_literal(r.trim_start())?;
@@ -6922,8 +11503,6 @@ fn parse_latest_shape(params: &str, lines: &[String]) -> Option<super::formula::
                 }
                 ops.push(LatestPreOp::DeletePrefix(lit.to_string()));
                 rest = t.trim().strip_prefix(')')?;
-            } else {
-                return None;
             }
         }
         if ops.is_empty() {
@@ -6939,6 +11518,94 @@ fn parse_latest_shape(params: &str, lines: &[String]) -> Option<super::formula::
             },
         ))
     };
+    // Match over a transformed field local
+    // (ultimaker-cura):
+    //   tag = <json>["tag_name"]&.sub(/^\D+/, "")
+    //   match = tag&.match(regex)
+    //   next if match.blank?
+    //   <render over match + tag>
+    if stmts.len() == 4
+        && let Some((lv, p)) = parse_pre(stmts[0].trim())
+        && !p.capture
+        && let Some((var, rhs)) = assign_parts(&stmts[1])
+        && (rhs == format!("{lv}&.match(regex)") || rhs == format!("{lv}.match(regex)"))
+        && blank_guard(&stmts[2], &var)
+    {
+        let (render, tr) = latest_match_render(&stmts[3], &var, Some(&lv), None)?;
+        let mut blk = with_render(base(p.source, false, None), render, tr);
+        let source = p.source;
+        blk.source = source;
+        blk.pre_capture = Some(p);
+        blk.match_pre = true;
+        return Some(blk);
+    }
+    // Two field matches, second as a local
+    // (clock-bar):
+    //   a = <json>["tag_name"]&.match(regex); guard
+    //   b = <json>["body"]&.match(/lit/i); guard
+    //   "#{a[1]},#{b}"
+    if stmts.len() == 5
+        && let Some((var, rhs)) = assign_parts(&stmts[0])
+        && let Some((field, tail)) = latest_field(&root, rhs)
+        && tail == "&.match(regex)"
+        && blank_guard(&stmts[1], &var)
+        && let Some((lv, p)) = parse_pre(stmts[2].trim())
+        && p.capture
+        && blank_guard(&stmts[3], &lv)
+    {
+        let source = latest_source(&field)?;
+        // The local is a MatchData; renders read
+        // `<local>[1]`, which is the modeled capture.
+        let lv1 = format!("{lv}[1]");
+        let (render, tr) = latest_match_render(&stmts[4], &var, Some(&lv1), None)?;
+        let mut blk = with_render(base(source, false, None), render, tr);
+        blk.pre_capture = Some(p);
+        return Some(blk);
+    }
+    // Asset-name pick with a count guard (recaf):
+    //   match = <json>["tag_name"]&.match(regex); guard
+    //   assets = <json>["assets"]&.select do |asset|
+    //     %w[…].include?(asset["name"])
+    //   end
+    //   next if assets.blank? || assets.length != N
+    //   "#{match[1]},#{assets.map { … }.max.gsub(/\D/, "")}"
+    if stmts.len() == 7
+        && let Some((var, rhs)) = assign_parts(&stmts[0])
+        && let Some((field, tail)) = latest_field(&root, rhs)
+        && tail == "&.match(regex)"
+        && blank_guard(&stmts[1], &var)
+        && let Some((picked, prhs)) = assign_parts(&stmts[2])
+        && let Some((pfield, ptail)) = latest_field(&root, prhs)
+        && pfield == "assets"
+        && let Some(avar) = ptail
+            .strip_prefix("&.select do |")
+            .or_else(|| ptail.strip_prefix(".select do |"))
+            .and_then(|r| r.strip_suffix('|'))
+        && let Some(names) = (|| {
+            let line = stmts[3].trim();
+            let inner = line.strip_prefix("%w[")?;
+            let (list, rest) = inner.split_once(']')?;
+            if rest.trim() != format!(".include?({avar}[\"name\"])") {
+                return None;
+            }
+            Some(
+                list.split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        })()
+        && !names.is_empty()
+        && stmts[4] == "end"
+        && let Some(count) = stmts[5]
+            .strip_prefix(&format!("next if {picked}.blank? || {picked}.length != "))
+            .and_then(|n| n.trim().parse::<usize>().ok())
+    {
+        let source = latest_source(&field)?;
+        let (render, tr) = latest_match_render(&stmts[6], &var, None, Some(&picked))?;
+        let mut blk = with_render(base(source, false, None), render, tr);
+        blk.asset_pick = Some((names, count));
+        return Some(blk);
+    }
     let (body, pre): (&[String], Option<(String, LatestPre)>) = if stmts.len() >= 7 {
         match parse_pre(stmts[0].trim()) {
             Some((var, p)) if stmts[1] == format!("next if {var}.blank?") => {
@@ -6958,7 +11625,7 @@ fn parse_latest_shape(params: &str, lines: &[String]) -> Option<super::formula::
     //     [next <expr> if match[a] == match[b]]
     //     <render>
     //   end
-    if (body.len() == 5 || body.len() == 6) && body[body.len() - 1] == "end" {
+    if (body.len() == 5 || body.len() == 6 || body.len() == 9) && body[body.len() - 1] == "end" {
         let (field, tail) = latest_field(&root, body[0].trim())?;
         if field != "assets" {
             return None;
@@ -7000,12 +11667,28 @@ fn parse_latest_shape(params: &str, lines: &[String]) -> Option<super::formula::
             let render = LatestRender::EqElse {
                 a: LatestOp::Cap(cap_of(a)?),
                 b: LatestOp::Cap(cap_of(b)?),
-                then: latest_parts(expr, &var, local)?,
-                els: latest_parts(&body[4], &var, local)?,
+                then: latest_parts(expr, &var, local, None)?,
+                els: latest_parts(&body[4], &var, local, None)?,
             };
             return Some(with_render(blk, render, None));
         }
-        let (render, tr) = latest_match_render(&body[3], &var, local)?;
+        if body.len() == 9 {
+            // `if <op> == <op>` / then / `else` / els /
+            // `end` (creality-print).
+            let cond = body[3].trim().strip_prefix("if ")?;
+            let (a, b) = cond.split_once(" == ")?;
+            if body[5] != "else" || body[7] != "end" {
+                return None;
+            }
+            let render = LatestRender::EqElse {
+                a: latest_op(a, &var, local)?,
+                b: latest_op(b, &var, local)?,
+                then: latest_parts(&body[4], &var, local, None)?,
+                els: latest_parts(&body[6], &var, local, None)?,
+            };
+            return Some(with_render(blk, render, None));
+        }
+        let (render, tr) = latest_match_render(&body[3], &var, local, None)?;
         return Some(with_render(blk, render, tr));
     }
     None
@@ -7048,9 +11731,113 @@ fn page_join_shape(var: &str, inner: &str) -> Option<super::formula::PageShape> 
 /// Reduce a `:header_match` strategy block: a
 /// guarded match/scan over one response header
 /// rendered as a template.
+/// Rewrite `(<name> = <var>[N])…` capture aliases
+/// onto `<var>[N]` (identifier-boundary aware).
+fn alias_capture_rewrite(var: &str, tail: &str) -> String {
+    let Some(rest) = tail.strip_prefix('(') else {
+        return tail.to_string();
+    };
+    let Some((name, rhs)) = rest.split_once(" = ") else {
+        return tail.to_string();
+    };
+    let name = name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return tail.to_string();
+    }
+    let Some(close) = rhs.find(')') else {
+        return tail.to_string();
+    };
+    let cap = rhs[..close].trim();
+    if page_cap_index(var, cap).is_none() {
+        return tail.to_string();
+    }
+    let body = format!("{cap}{}", &rhs[close + 1..]);
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
+    let mut out = String::new();
+    let mut rest = body.as_str();
+    while let Some(i) = rest.find(name) {
+        let before = rest[..i].chars().last();
+        let after = rest[i + name.len()..].chars().next();
+        out.push_str(&rest[..i]);
+        if before.is_none_or(|c| !ident(c))
+            && after.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+        {
+            out.push_str(cap);
+        } else {
+            out.push_str(name);
+        }
+        rest = &rest[i + name.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn parse_header_shape(params: &str, lines: &[String]) -> Option<super::formula::HeaderBlock> {
     use super::formula::{HeaderBlock, HeaderShape, PagePart};
     let (root, has_regex) = block_params(params)?;
+    // `all_headers.each` first match (recut):
+    // `version = nil all_headers.each do |headers|
+    // match = headers["location"]&.match(regex)
+    // next unless match version = "…" break end
+    // version`.
+    if root == "all_headers" && has_regex {
+        let joined = join_block_lines(lines);
+        let body = joined.trim();
+        let (vvar, rest) = body.split_once(" = nil ")?;
+        let vvar = vvar.trim();
+        if vvar.is_empty() || !vvar.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        let rest = rest.trim().strip_prefix(&root)?;
+        let rest = rest
+            .trim()
+            .strip_prefix("&.each do |")
+            .or_else(|| rest.trim().strip_prefix(".each do |"))?;
+        let (hvar, rest) = rest.split_once('|')?;
+        let hvar = hvar.trim();
+        let (mvar, rest) = assign_parts(rest.trim())?;
+        let rest = rest.trim().strip_prefix(hvar)?;
+        let (header, tail) = json_bracket_key(rest)?;
+        let tail = tail
+            .trim()
+            .strip_prefix("&.match(regex)")
+            .or_else(|| tail.trim().strip_prefix(".match(regex)"))?;
+        let tail = tail
+            .trim()
+            .strip_prefix(&format!("next unless {mvar}"))
+            .or_else(|| tail.trim().strip_prefix(&format!("next if {mvar}.blank?")))?;
+        let (assigned, render) = assign_parts(tail.trim())?;
+        if assigned != vvar {
+            return None;
+        }
+        let render = render.trim();
+        // The render ends where the loop close
+        // (`break end <vvar>`) begins; a quoted
+        // render ends at its closing quote.
+        let (parts, tail) = if render.starts_with('"') {
+            let (body_str, t) = quoted_token(render)?;
+            (page_template_parts(&body_str, &mvar)?, t.trim())
+        } else {
+            let (head, tail) = render.split_at(render.find(" break ")?);
+            let r = head.trim().strip_prefix(&format!("{mvar}["))?;
+            let close = r.find(']')?;
+            let n: usize = r[..close].parse().ok()?;
+            if !r[close + 1..].trim().is_empty() {
+                return None;
+            }
+            (vec![PagePart::Cap(n)], tail.trim_start())
+        };
+        // Both renders must stop the loop: without a break the final variable
+        // holds the last matching response, which this first-match shape cannot model.
+        let tail = tail.strip_prefix("break ")?.trim();
+        if tail != format!("end {vvar}") {
+            return None;
+        }
+        return Some(HeaderBlock {
+            header,
+            shape: HeaderShape::AllTemplate(parts),
+        });
+    }
     if root != "headers" || !has_regex {
         // The bare form declares only `|headers|`.
         if root != "headers" {
@@ -7087,10 +11874,9 @@ fn parse_header_shape(params: &str, lines: &[String]) -> Option<super::formula::
             .trim();
         let inner = if let Some(r) = rest.strip_prefix('{') {
             r.strip_suffix('}')?.trim()
-        } else if let Some(r) = rest.strip_prefix("do ") {
-            r.strip_suffix(" end")?.trim()
         } else {
-            return None;
+            let r = rest.strip_prefix("do ")?;
+            r.strip_suffix(" end")?.trim()
         };
         let inner = inner.strip_prefix('|')?;
         let var_end = inner.find('|')?;
@@ -7117,18 +11903,27 @@ fn parse_header_shape(params: &str, lines: &[String]) -> Option<super::formula::
         .or_else(|| tail.strip_prefix("&.scan(regex).flatten"))
     {
         (true, t.trim())
-    } else if let Some(t) = tail
-        .strip_prefix("&.match(regex)")
-        .or_else(|| tail.strip_prefix(".match(regex)"))
-    {
-        (false, t.trim())
     } else {
-        return None;
+        let t = tail
+            .strip_prefix("&.match(regex)")
+            .or_else(|| tail.strip_prefix(".match(regex)"))?;
+        (false, t.trim())
     };
     let tail = tail
         .strip_prefix(&format!("next if {var}.blank?"))
         .or_else(|| tail.strip_prefix(&format!("next unless {var}")))?
         .trim();
+    // `(version = match[1]).include?(".") ?
+    // version : version.chars.join(".")`: rewrite
+    // the alias onto the capture, then fork.
+    let tail = &alias_capture_rewrite(var, tail);
+    let tail = tail.as_str();
+    if !flatten && let Some((cond, then, els)) = page_fork_parts(var, tail) {
+        return Some(HeaderBlock {
+            header,
+            shape: HeaderShape::Fork { cond, then, els },
+        });
+    }
     // CSV-optional form.
     let csv_opt = format!("{var}[2] ? \"#{{{var}[1]}},#{{{var}[2]}}\" : {var}[1]");
     let csv_opt2 = format!("{var}[2].present? ? \"#{{{var}[1]}},#{{{var}[2]}}\" : {var}[1]");
@@ -7144,7 +11939,8 @@ fn parse_header_shape(params: &str, lines: &[String]) -> Option<super::formula::
             return None;
         }
         page_template_parts(&body_str, var)?
-    } else if let Some(r) = tail.strip_prefix(&format!("{var}[")) {
+    } else {
+        let r = tail.strip_prefix(&format!("{var}["))?;
         let close = r.find(']')?;
         let n: usize = r[..close].parse().ok()?;
         let t = r[close + 1..].trim();
@@ -7154,8 +11950,6 @@ fn parse_header_shape(params: &str, lines: &[String]) -> Option<super::formula::
             let (a, b) = sp_tr_args(t)?;
             vec![PagePart::CapTr(n, a, b)]
         }
-    } else {
-        return None;
     };
     Some(HeaderBlock {
         header,
@@ -7169,6 +11963,361 @@ fn parse_header_shape(params: &str, lines: &[String]) -> Option<super::formula::
 
 /// Parse a `"#{match[N]}…"` interpolation template
 /// into page parts (`var` is the match variable).
+/// One capture part from its trailing chain:
+/// ``, `.tr(a, b)`, `.delete_prefix("p")`,
+/// `.split("", L).join("s")`, `.chars.join("s")`,
+/// `.sub(/pat/flags, 'tmpl')`.
+fn page_cap_part(n: usize, tail: &str) -> Option<super::formula::PagePart> {
+    use super::formula::PagePart;
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return Some(PagePart::Cap(n));
+    }
+    if let Some(rest) = tail
+        .strip_prefix(".split(\"\", ")
+        .or_else(|| tail.strip_prefix("&.split(\"\", "))
+    {
+        let (l_str, t) = rest.split_once(')')?;
+        let limit: usize = l_str.trim().parse().ok()?;
+        let t = t.trim().strip_prefix(".join(")?;
+        let (sep, t) = quoted_token(t.trim())?;
+        if t.trim() != ")" || limit == 0 {
+            return None;
+        }
+        return Some(PagePart::CapSplitJoin(n, limit, sep));
+    }
+    if let Some(rest) = tail
+        .strip_prefix(".chars.join(")
+        .or_else(|| tail.strip_prefix("&.chars.join("))
+    {
+        let (sep, t) = quoted_token(rest.trim())?;
+        if t.trim() != ")" {
+            return None;
+        }
+        return Some(PagePart::CapSplitJoin(n, 0, sep));
+    }
+    if let Some(rest) = tail
+        .strip_prefix(".delete_prefix(")
+        .or_else(|| tail.strip_prefix("&.delete_prefix("))
+    {
+        let (p, t) = quoted_token(rest.trim())?;
+        if t.trim() != ")" {
+            return None;
+        }
+        return Some(PagePart::CapDeletePrefix(n, p));
+    }
+    if let Some((pat, flags, tmpl)) = sub_backref_args(tail) {
+        return Some(PagePart::CapSubBackref(n, pat, flags, tmpl));
+    }
+    // `[.tr(a, b)].split(sep)[.map(&:to_i)].join(j)`
+    {
+        let mut t = tail;
+        let mut tr = None;
+        if let Some(r) = t.strip_prefix(".tr(").or_else(|| t.strip_prefix("&.tr(")) {
+            if let Some((a, r1)) = quoted_token(r.trim_start())
+                && let Some(r1) = r1.trim().strip_prefix(',')
+                && let Some((b, r2)) = quoted_token(r1.trim())
+                && let Some(r2) = r2.trim().strip_prefix(')')
+            {
+                tr = Some((a, b));
+                t = r2.trim();
+            }
+        }
+        if let Some(r) = t
+            .strip_prefix(".split(")
+            .or_else(|| t.strip_prefix("&.split("))
+            && let Some((sep, r)) = quoted_token(r.trim_start())
+            && let Some(r) = r.trim().strip_prefix(')')
+        {
+            let r = r.trim();
+            let (ints, r) = match r
+                .strip_prefix(".map(&:to_i)")
+                .or_else(|| r.strip_prefix("&.map(&:to_i)"))
+            {
+                Some(r) => (true, r.trim()),
+                None => (false, r),
+            };
+            if (tr.is_some() || ints)
+                && let Some(r) = r
+                    .strip_prefix(".join(")
+                    .or_else(|| r.strip_prefix("&.join("))
+                && let Some((join, r)) = quoted_token(r.trim_start())
+                && r.trim() == ")"
+            {
+                return Some(PagePart::CapNormInts(n, tr, sep, join, ints));
+            }
+        }
+    }
+    let (a, b) = sp_tr_args(tail)?;
+    Some(PagePart::CapTr(n, a, b))
+}
+
+/// A fork arm: a template string, a bare capture,
+/// or a capture with a `tr` chain.
+fn page_expr_parts(var: &str, s: &str) -> Option<Vec<super::formula::PagePart>> {
+    let s = s.trim();
+    if s.starts_with('"') {
+        let (body_str, tail) = quoted_token(s)?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        return page_template_parts(&body_str, var);
+    }
+    let r = s.strip_prefix(&format!("{var}["))?;
+    let close = r.find(']')?;
+    let n: usize = r[..close].parse().ok()?;
+    Some(vec![page_cap_part(n, &r[close + 1..])?])
+}
+
+/// A `<var>[N]` capture index at the whole of `s`.
+fn page_cap_index(var: &str, s: &str) -> Option<usize> {
+    s.trim()
+        .strip_prefix(&format!("{var}["))
+        .and_then(|r| r.strip_suffix(']'))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// An enumerable capture condition.
+fn page_cond_parse(var: &str, s: &str) -> Option<super::formula::PageCond> {
+    use super::formula::PageCond;
+    let s = s.trim();
+    if let Some((a_s, b_s)) = s.split_once(" && ") {
+        return Some(PageCond::And(
+            Box::new(page_cond_parse(var, a_s)?),
+            Box::new(page_cond_parse(var, b_s)?),
+        ));
+    }
+    let s = s
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .map_or(s, str::trim);
+    // `match[N].count("c") >= K`
+    if let Some(idx) = s.find(".count(")
+        && let Some(n) = page_cap_index(var, &s[..idx])
+    {
+        let (lit, t) = quoted_token(s[idx + ".count(".len()..].trim())?;
+        let mut chars = lit.chars();
+        let (Some(c), None) = (chars.next(), chars.next()) else {
+            return None;
+        };
+        let t = t.trim().strip_prefix(')')?.trim().strip_prefix(">=")?;
+        let k: usize = t.trim().parse().ok()?;
+        return Some(PageCond::CapCountGe(n, c, k));
+    }
+    // `match[N].include?("lit")`
+    if let Some(idx) = s.find(".include?(")
+        && let Some(n) = page_cap_index(var, &s[..idx])
+    {
+        let (lit, t) = quoted_token(s[idx + ".include?(".len()..].trim())?;
+        if t.trim() != ")" {
+            return None;
+        }
+        return Some(PageCond::CapIncludes(n, lit));
+    }
+    // `match[A] == match[B][/pat/flags]`
+    if let Some((a_s, b_s)) = s.split_once(" == ")
+        && let Some(a) = page_cap_index(var, a_s)
+        && let Some(r) = b_s.trim().strip_prefix(&format!("{var}["))
+        && let Some(close) = r.find(']')
+        && let Ok(b) = r[..close].parse::<usize>()
+        && let Some(lit_args) = r[close + 1..].trim().strip_prefix('[')
+        && let Some((pat, flags, t)) = regex_literal(lit_args.trim())
+        && t.trim() == "]"
+    {
+        return Some(PageCond::CapEqSub(a, b, pat, flags));
+    }
+    // `match[A] == match[B].tr(from, to)`
+    if let Some((a_s, b_s)) = s.split_once(" == ")
+        && let Some(a) = page_cap_index(var, a_s)
+        && let Some(r) = b_s.trim().strip_prefix(&format!("{var}["))
+        && let Some(close) = r.find(']')
+        && let Ok(b) = r[..close].parse::<usize>()
+        && let Some((from, to)) = sp_tr_args(r[close + 1..].trim())
+    {
+        return Some(PageCond::CapTrEq(a, b, from, to));
+    }
+    for (op, is_ne) in [(" != ", true), (" == ", false)] {
+        if let Some((a_s, b_s)) = s.split_once(op) {
+            let a = page_cap_index(var, a_s)?;
+            if let Some(b) = page_cap_index(var, b_s) {
+                return Some(if is_ne {
+                    PageCond::CapNe(a, b)
+                } else {
+                    PageCond::CapEq(a, b)
+                });
+            }
+            if is_ne {
+                return None;
+            }
+            let (lit, t) = quoted_token(b_s.trim())?;
+            if !t.trim().is_empty() {
+                return None;
+            }
+            return Some(PageCond::CapEqLit(a, lit));
+        }
+    }
+    if let Some(n) = s
+        .strip_suffix(".blank?")
+        .and_then(|r| page_cap_index(var, r))
+    {
+        return Some(PageCond::CapBlank(n));
+    }
+    if let Some(n) = s
+        .strip_suffix(".present?")
+        .and_then(|r| page_cap_index(var, r))
+    {
+        return Some(PageCond::CapPresent(n));
+    }
+    page_cap_index(var, s).map(PageCond::CapTruthy)
+}
+
+/// A ternary/if-else fork over captures, as
+/// parts.
+/// The byte end of one atomic page condition at
+/// the start of `s` (for the early-`next` fork,
+/// whose else arm follows the condition directly).
+/// Verified by re-parsing the prefix.
+fn page_cond_prefix_end(var: &str, s: &str) -> Option<usize> {
+    let cap_end = |from: usize| -> Option<usize> {
+        let rest = s[from..].strip_prefix('[')?;
+        let close = rest.find(']')?;
+        rest[..close].parse::<usize>().ok()?;
+        Some(from + 1 + close + 1)
+    };
+    if !s.starts_with(var) {
+        return None;
+    }
+    let mut end = cap_end(var.len())?;
+    let tail = &s[end..];
+    if let Some(t) = tail
+        .strip_prefix(".present?")
+        .or_else(|| tail.strip_prefix(".blank?"))
+    {
+        end = s.len() - t.len();
+    } else if let Some(t) = tail.strip_prefix(".include?(") {
+        let (lit, t2) = quoted_token(t.trim_start())?;
+        let _ = lit;
+        let t2 = t2.trim().strip_prefix(')')?;
+        end = s.len() - t2.len();
+    } else if let Some(op) = [" == ", " != "].iter().find(|op| tail.starts_with(**op)) {
+        let rhs = &tail[op.len()..];
+        if rhs.starts_with('"') {
+            let (_, t) = quoted_token(rhs)?;
+            end = s.len() - t.len();
+        } else {
+            if !rhs.starts_with(var) {
+                return None;
+            }
+            let rrest = &rhs[var.len()..];
+            let ridx = rrest.strip_prefix('[')?;
+            let close = ridx.find(']')?;
+            ridx[..close].parse::<usize>().ok()?;
+            end = s.len() - (ridx.len() - close - 1);
+            // Optional `.tr(a, b)` on the right capture.
+            let t = &s[end..];
+            if t.starts_with(".tr(") || t.starts_with("&.tr(") {
+                let bytes = t.as_bytes();
+                let mut quote: Option<u8> = None;
+                let mut i = 0usize;
+                let mut closed = None;
+                while i < bytes.len() {
+                    match (quote, bytes[i]) {
+                        (Some(_), b'\\') => i += 1,
+                        (Some(q), c) if c == q => quote = None,
+                        (Some(_), _) => {}
+                        (None, b'"' | b'\'') => quote = Some(bytes[i]),
+                        (None, b')') => {
+                            closed = Some(i + 1);
+                            break;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                end += closed?;
+            }
+        }
+    }
+    page_cond_parse(var, &s[..end])?;
+    Some(end)
+}
+
+fn page_fork_parts(
+    var: &str,
+    inner: &str,
+) -> Option<(
+    super::formula::PageCond,
+    Vec<super::formula::PagePart>,
+    Vec<super::formula::PagePart>,
+)> {
+    let inner_owned = alias_capture_rewrite(var, inner.trim());
+    let inner = inner_owned.trim();
+    // Early-`next` form (scribus):
+    // `next <then> if <cond> <els>`.
+    if let Some(rest) = inner.strip_prefix("next ")
+        && let Some(at) = json_outside_quotes(rest, " if ")
+    {
+        let then_s = &rest[..at];
+        let cond_rest = &rest[at + 4..];
+        if let Some(end) = page_cond_prefix_end(var, cond_rest) {
+            let cond = page_cond_parse(var, &cond_rest[..end])?;
+            let then = page_expr_parts(var, then_s)?;
+            let els = page_expr_parts(var, cond_rest[end..].trim())?;
+            return Some((cond, then, els));
+        }
+    }
+    if let Some(rest) = inner.strip_prefix("if ") {
+        let rest_owned = alias_capture_rewrite(var, rest.trim());
+        let rest = rest_owned.trim();
+        let c = json_outside_quotes(rest, " else ")?;
+        let (left, els_s) = rest.split_at(c);
+        let els_s = els_s[6..]
+            .trim()
+            .strip_suffix(" end")
+            .unwrap_or(els_s[6..].trim());
+        // The condition ends where the then-arm
+        // (a template string or capture) begins; a
+        // `.count("c") >= K` condition carries its
+        // own quotes, so scan past its integer.
+        let start = if let Some(ge) = left.find(">= ") {
+            let after = &left[ge + 3..];
+            let digits = after
+                .find(|ch: char| !ch.is_ascii_digit())
+                .unwrap_or(after.len());
+            Some(ge + 3 + digits)
+        } else {
+            left.find('"')
+                .or_else(|| left.rfind(&format!(") {var}[")).map(|i| i + 2))
+        }?;
+        let (cond_s, then_s) = left.split_at(start);
+        let cond = page_cond_parse(var, cond_s)?;
+        let then = page_expr_parts(var, then_s)?;
+        let els = page_expr_parts(var, els_s)?;
+        return Some((cond, then, els));
+    }
+    let q = json_outside_quotes(inner, " ? ")?;
+    let (cond_s, rest) = inner.split_at(q);
+    let rest = &rest[3..];
+    let c = json_outside_quotes(rest, " : ")?;
+    let cond = page_cond_parse(var, cond_s)?;
+    let then = page_expr_parts(var, &rest[..c])?;
+    let els = page_expr_parts(var, &rest[c + 3..])?;
+    Some((cond, then, els))
+}
+
+fn page_fork(
+    var: &str,
+    inner: &str,
+    wrap: &dyn Fn(
+        super::formula::PageCond,
+        Vec<super::formula::PagePart>,
+        Vec<super::formula::PagePart>,
+    ) -> super::formula::PageShape,
+) -> Option<super::formula::PageShape> {
+    let (cond, then, els) = page_fork_parts(var, inner)?;
+    Some(wrap(cond, then, els))
+}
+
 fn page_template_parts(body: &str, var: &str) -> Option<Vec<super::formula::PagePart>> {
     use super::formula::PagePart;
     let mut parts = Vec::new();
@@ -7177,18 +12326,71 @@ fn page_template_parts(body: &str, var: &str) -> Option<Vec<super::formula::Page
         if i > 0 {
             parts.push(PagePart::Lit(rest[..i].to_string()));
         }
-        let j = rest[i + 2..].find('}')?;
-        let token = rest[i + 2..i + 2 + j].trim();
+        // Brace/quote-aware token span (nested
+        // `#{}` inside a quoted conditional does
+        // not end it).
+        let inner = &rest[i + 2..];
+        let bytes = inner.as_bytes();
+        let mut modes: Vec<Option<u8>> = vec![None];
+        let mut k = 0usize;
+        let mut j: Option<usize> = None;
+        while k < bytes.len() {
+            match modes.last().copied().flatten() {
+                Some(q) => {
+                    if bytes[k] == b'\\' {
+                        k += 1;
+                    } else if bytes[k] == q {
+                        modes.pop();
+                    } else if bytes[k] == b'#' && bytes.get(k + 1) == Some(&b'{') {
+                        modes.push(None);
+                        k += 1;
+                    }
+                }
+                None => match bytes[k] {
+                    b'"' | b'\'' => modes.push(Some(bytes[k])),
+                    b'{' => modes.push(None),
+                    b'}' => {
+                        modes.pop();
+                        if modes.is_empty() {
+                            j = Some(k);
+                            break;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            k += 1;
+        }
+        let j = j?;
+        let token = inner[..j].trim();
+        // `#{"<lit>" + match[N] if match[N]}` and
+        // `#{"<template>" if match[N]}`.
+        if token.starts_with('"')
+            && let Some((lit, t)) = quoted_token(token)
+        {
+            let t = t.trim();
+            let cond = if let Some(cap_s) = t.strip_prefix("+ ") {
+                cap_s.split_once(" if ").and_then(|(a_s, b_s)| {
+                    let n = page_cap_index(var, a_s)?;
+                    (page_cap_index(var, b_s) == Some(n))
+                        .then_some((n, vec![PagePart::Lit(lit.clone()), PagePart::Cap(n)]))
+                })
+            } else if let Some(b_s) = t.strip_prefix("if ") {
+                page_cap_index(var, b_s).and_then(|n| Some((n, page_template_parts(&lit, var)?)))
+            } else {
+                None
+            };
+            if let Some((n, inner_parts)) = cond {
+                parts.push(PagePart::CondCap(n, inner_parts));
+                rest = &rest[i + 2 + j + 1..];
+                continue;
+            }
+        }
         let r = token.strip_prefix(&format!("{var}["))?;
         let close = r.find(']')?;
         let n: usize = r[..close].parse().ok()?;
         let tail = r[close + 1..].trim();
-        parts.push(if tail.is_empty() {
-            PagePart::Cap(n)
-        } else {
-            let (a, b) = sp_tr_args(tail)?;
-            PagePart::CapTr(n, a, b)
-        });
+        parts.push(page_cap_part(n, tail)?);
         rest = &rest[i + 2 + j + 1..];
     }
     if !rest.is_empty() {
@@ -7204,6 +12406,127 @@ fn page_template_parts(body: &str, var: &str) -> Option<Vec<super::formula::Page
 fn page_scan_template_shape(var: &str, inner: &str) -> Option<super::formula::PageShape> {
     use super::formula::PageShape;
     let inner = inner.trim();
+    // A leading capture alias statement
+    // (`version = match[0] version.…`). Only a
+    // plain identifier and a statement boundary
+    // after the capture — the parenthesized
+    // `(version = match[0]).count(…)` form is
+    // rewritten later by `alias_capture_rewrite`.
+    // The capture may carry a transform chain
+    // (`match[0].tr(..).split(..)...`): extend the
+    // capture end over it when it parses as one
+    // capture part, so the substituted text
+    // re-parses in render position.
+    let chain_end = |rhs: &str, cap_end: usize| -> Option<usize> {
+        let rest = &rhs[cap_end..];
+        if !rest.starts_with('.') && !rest.starts_with("&.") {
+            return None;
+        }
+        let bytes = rhs.as_bytes();
+        let mut depth = 0i32;
+        let mut quote: Option<u8> = None;
+        let mut i = cap_end;
+        while i < bytes.len() {
+            match (quote, bytes[i]) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), b'\\') => i += 1,
+                (Some(_), _) => {}
+                (None, b'"' | b'\'') => quote = Some(bytes[i]),
+                (None, b'(') => depth += 1,
+                (None, b')') => depth -= 1,
+                (None, c) if c.is_ascii_whitespace() && depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        page_expr_parts(var, &rhs[..i])?;
+        Some(i)
+    };
+    let inner_owned;
+    let inner = if let Some((name, rhs)) = inner.split_once(" = ")
+        && !name.trim().is_empty()
+        && name
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && let Some(cap_end) = rhs
+            .trim()
+            .strip_prefix(&format!("{var}["))
+            .and_then(|r| r.find(']').map(|c| var.len() + 1 + c + 1))
+        && page_cap_index(var, &rhs.trim()[..cap_end.min(rhs.trim().len())]).is_some()
+        && let Some(cap_end) = rhs
+            .trim()
+            .get(cap_end..)
+            .is_some_and(|t| t.is_empty() || t.starts_with(char::is_whitespace))
+            .then_some(cap_end)
+            .or_else(|| chain_end(rhs.trim(), cap_end))
+    {
+        let rhs = rhs.trim();
+        let cap_text = &rhs[..cap_end];
+        let name = name.trim();
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.';
+        let mut out = String::new();
+        let mut rest = rhs[cap_end..].trim();
+        while let Some(i) = rest.find(name) {
+            let before = rest[..i].chars().last();
+            let after = rest[i + name.len()..].chars().next();
+            out.push_str(&rest[..i]);
+            if before.is_none_or(|c| !ident(c))
+                && after.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+            {
+                out.push_str(cap_text);
+            } else {
+                out.push_str(name);
+            }
+            rest = &rest[i + name.len()..];
+        }
+        out.push_str(rest);
+        inner_owned = out;
+        inner_owned.trim()
+    } else {
+        inner
+    };
+    // `next if match[N]&.match?(/…/) <fork>`
+    if let Some(rest) = inner.strip_prefix(&format!("next if {var}["))
+        && let Some(close) = rest.find(']')
+        && let Ok(skip_cap) = rest[..close].parse::<usize>()
+        && let Some(args) = rest[close + 1..]
+            .trim()
+            .strip_prefix("&.match?(")
+            .or_else(|| rest[close + 1..].trim().strip_prefix(".match?("))
+        && let Some((skip_pat, skip_flags, t)) = regex_literal(args.trim())
+        && let Some(after) = t.trim().strip_prefix(')')
+    {
+        let (cond, then, els) = page_fork_parts(var, after.trim())?;
+        return Some(PageShape::ScanGuardedFork {
+            skip_cap,
+            skip_pat,
+            skip_flags,
+            cond,
+            then,
+            els,
+        });
+    }
+    if let Some(shape) = page_fork(var, inner, &|cond, then, els| PageShape::ScanFork {
+        cond,
+        then,
+        els,
+    }) {
+        return Some(shape);
+    }
+    // `match[0] = match[0].tr(a, b) match.compact.join(sep)`
+    if let Some(rest) = inner.strip_prefix(&format!("{var}[0] = {var}[0]"))
+        && let Some((a, b)) = sp_tr_args(rest.trim())
+    {
+        let tr_text = format!(".tr(\"{a}\", \"{b}\")");
+        let tail = inner.split_once(&tr_text).map(|(_, t)| t.trim())?;
+        let tail = tail.strip_prefix(&format!("{var}.compact.join("))?;
+        let (sep, t) = quoted_token(tail.trim())?;
+        if t.trim() == ")" {
+            return Some(PageShape::ScanTrCompactJoin(a, b, sep));
+        }
+        return None;
+    }
     if inner.starts_with('"') {
         let (body_str, tail) = quoted_token(inner)?;
         if !tail.trim().is_empty() {
@@ -7262,6 +12585,27 @@ fn parse_page_match_template(root: &str, body: &str) -> Option<super::formula::P
         .strip_prefix(&format!("next if {var}.blank?"))
         .or_else(|| rest.strip_prefix(&format!("next unless {var}")))?
         .trim();
+    if let Some(shape) = page_fork(var, rest, &|cond, then, els| PageShape::MatchFork {
+        cond,
+        then,
+        els,
+    }) {
+        return Some(shape);
+    }
+    // `json = …::Json.parse_json(match[N]) json<dig>`
+    if let Some((jname, rhs)) = rest.split_once(" = ")
+        && let Some(after) = rhs
+            .trim()
+            .strip_prefix("Homebrew::Livecheck::Strategy::Json.parse_json(")
+        && let Some(close) = after.find(')')
+        && let Some(cap) = page_cap_index(var, after[..close].trim())
+    {
+        let (path, tail) = jt_dig(after[close + 1..].trim(), jname.trim(), &[])?;
+        if !tail.trim().is_empty() || path.is_empty() {
+            return None;
+        }
+        return Some(PageShape::MatchJsonDig { cap, path });
+    }
     if rest.starts_with('"') {
         let (body_str, tail) = quoted_token(rest)?;
         if !tail.trim().is_empty() {
@@ -7320,15 +12664,14 @@ fn yaml_parts(expr: &str, mvar: &str, root: &str) -> Option<Vec<super::formula::
             .and_then(|r| r.strip_suffix(']'))
         {
             parts.push(YamlPart::Cap(n.parse().ok()?));
-        } else if let Some(r) = tok.strip_prefix(&format!("{root}[")) {
+        } else {
+            let r = tok.strip_prefix(&format!("{root}["))?;
             let bracketed = format!("[{r}");
             let (key, t) = json_bracket_key(&bracketed)?;
             if !t.is_empty() {
                 return None;
             }
             parts.push(YamlPart::Root(key));
-        } else {
-            return None;
         }
         rest = &body[end + 1..];
     }
@@ -7342,22 +12685,22 @@ fn yaml_parts(expr: &str, mvar: &str, root: &str) -> Option<Vec<super::formula::
 fn yaml_render(expr: &str, mvar: &str, root: &str) -> Option<super::formula::YamlRender> {
     use super::formula::YamlRender;
     let expr = expr.trim();
-    if let Some(r) = expr.strip_prefix(&format!("{mvar}[")) {
-        if let Some((n, rest)) = r.split_once("].present? ? ") {
-            let cap: usize = n.parse().ok()?;
-            let (then, els) = if rest.starts_with('"') {
-                let (_, tail) = quoted_token(rest)?;
-                let used = rest.len() - tail.len();
-                (
-                    yaml_parts(&rest[..used], mvar, root)?,
-                    yaml_parts(tail.trim().strip_prefix(':')?.trim(), mvar, root)?,
-                )
-            } else {
-                let (then, els) = rest.split_once(" : ")?;
-                (yaml_parts(then, mvar, root)?, yaml_parts(els, mvar, root)?)
-            };
-            return Some(YamlRender::PresentElse { cap, then, els });
-        }
+    if let Some(r) = expr.strip_prefix(&format!("{mvar}["))
+        && let Some((n, rest)) = r.split_once("].present? ? ")
+    {
+        let cap: usize = n.parse().ok()?;
+        let (then, els) = if rest.starts_with('"') {
+            let (_, tail) = quoted_token(rest)?;
+            let used = rest.len() - tail.len();
+            (
+                yaml_parts(&rest[..used], mvar, root)?,
+                yaml_parts(tail.trim().strip_prefix(':')?.trim(), mvar, root)?,
+            )
+        } else {
+            let (then, els) = rest.split_once(" : ")?;
+            (yaml_parts(then, mvar, root)?, yaml_parts(els, mvar, root)?)
+        };
+        return Some(YamlRender::PresentElse { cap, then, els });
     }
     Some(YamlRender::Template(yaml_parts(expr, mvar, root)?))
 }
@@ -7411,19 +12754,46 @@ fn parse_yaml_stmts(
             shape: YamlShape::FilesMap { key, render },
         });
     }
-    if stmts.len() == 3 {
-        if let Some((mvar, key)) = parse_match(first, root) {
-            if stmts[1] != format!("next if {mvar}.blank?") || !has_regex {
-                return None;
-            }
-            let render = yaml_render(&stmts[2], &mvar, root)?;
-            return Some(YamlBlock {
-                has_regex,
-                shape: YamlShape::RootMatch { key, render },
-            });
+    if stmts.len() == 3
+        && let Some((mvar, key)) = parse_match(first, root)
+    {
+        if stmts[1] != format!("next if {mvar}.blank?") || !has_regex {
+            return None;
         }
+        let render = yaml_render(&stmts[2], &mvar, root)?;
+        return Some(YamlBlock {
+            has_regex,
+            shape: YamlShape::RootMatch { key, render },
+        });
     }
     None
+}
+
+/// `&.map { |item| <next guards> item["k"][&.to_s] }`
+/// after a yaml dig path: the projected key and
+/// item guards.
+fn yaml_map_key(cur: &str) -> Option<(String, Vec<super::formula::JsonGuard>)> {
+    let rest = strip_map_open(cur)?;
+    let (var, inner) = json_map_parts(rest)?;
+    let mut s = inner.trim();
+    let mut guards = Vec::new();
+    loop {
+        let (unless, r) = if let Some(r) = s.strip_prefix("next if ") {
+            (false, r)
+        } else if let Some(r) = s.strip_prefix("next unless ") {
+            (true, r)
+        } else {
+            break;
+        };
+        let (cond, r) = parse_json_cond(&var, r)?;
+        guards.push(super::formula::JsonGuard { unless, cond });
+        s = r.trim();
+    }
+    let (key, tail) = jt_field_tail(s, &var)?;
+    if !matches!(tail.trim(), "" | ".to_s" | "&.to_s") {
+        return None;
+    }
+    Some((key, guards))
 }
 
 fn parse_yaml_shape(params: &str, lines: &[String]) -> Option<super::formula::YamlBlock> {
@@ -7509,6 +12879,8 @@ fn parse_yaml_shape(params: &str, lines: &[String]) -> Option<super::formula::Ya
     };
     let shape = if cur.is_empty() {
         YamlShape::Dig(path)
+    } else if let Some((key, guards)) = yaml_map_key(cur) {
+        YamlShape::MapKey { path, key, guards }
     } else if let Some(sep) = split_first_tail(cur) {
         YamlShape::DigSplitFirst(path, sep)
     } else if let Some(tail) = yaml_tail(cur) {
@@ -7580,12 +12952,39 @@ fn json_bracket_key(s: &str) -> Option<(String, &str)> {
 /// Strip a `.map`/`&.map`/`.filter_map` opener, braced or
 /// `do`-formed, returning what follows.
 fn strip_map_open(s: &str) -> Option<&str> {
+    let s = s.trim_start();
     for pre in ["&.map", "&.filter_map", ".map", ".filter_map"] {
         if let Some(rest) = s.strip_prefix(pre) {
             return Some(rest);
         }
     }
     None
+}
+
+/// Split an object-entries map body (`|key, item|`)
+/// into its key/value variables and inner text.
+fn json_entries_parts(s: &str) -> Option<(String, String, String)> {
+    let s = s.trim();
+    let inner = if let Some(r) = s.strip_prefix('{') {
+        r.strip_suffix('}')?
+    } else {
+        s.strip_prefix("do ")?.strip_suffix(" end")?
+    };
+    let inner = inner.trim().strip_prefix('|')?;
+    let var_end = inner.find('|')?;
+    let vars: Vec<&str> = inner[..var_end].split(',').map(str::trim).collect();
+    if vars.len() != 2
+        || vars
+            .iter()
+            .any(|v| v.is_empty() || !v.chars().all(|c| c.is_alphanumeric() || c == '_'))
+    {
+        return None;
+    }
+    Some((
+        vars[0].to_string(),
+        vars[1].to_string(),
+        inner[var_end + 1..].trim().to_string(),
+    ))
 }
 
 /// Split a map body into its block variable and inner
@@ -7799,11 +13198,69 @@ fn json_map_guarded(var: &str, inner: &str) -> Option<super::formula::MapGuard> 
     })
 }
 
+/// A `next if <atom> || !<atom> || …` guard split
+/// into one skip guard per atom (parsed left to
+/// right, so a `||` inside a regex literal never
+/// splits): at least two atoms, fully consumed.
+fn jt_next_if_or_guards(var: &str, cond: &str) -> Option<Vec<super::formula::JsonGuard>> {
+    use super::formula::JsonGuard;
+    let mut rest = cond.trim();
+    let mut out = Vec::new();
+    loop {
+        let (unless, atom) = match rest.strip_prefix('!') {
+            Some(r) => (true, r.trim_start()),
+            None => (false, rest),
+        };
+        let (cond, tail) = parse_json_cond_atom(var, atom)?;
+        out.push(JsonGuard { unless, cond });
+        rest = tail.trim();
+        if rest.is_empty() {
+            break;
+        }
+        rest = rest.strip_prefix("||")?.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+    }
+    (out.len() > 1).then_some(out)
+}
+
 /// One guard condition at the start of `s`, plus the
 /// remainder: field comparisons, truthiness (with `||`
 /// chains), and the version/downcase forms.
 fn parse_json_cond<'a>(var: &str, s: &'a str) -> Option<(super::formula::JsonCond, &'a str)> {
     use super::formula::JsonCond;
+    // `[lit, …].include?(<var>["f"])` does not start
+    // with the item variable.
+    if let Some(mut rest) = s.trim_start().strip_prefix('[') {
+        let mut lits = Vec::new();
+        loop {
+            let (lit, r) = jt_lit(rest.trim())?;
+            lits.push(lit);
+            rest = r.trim();
+            if let Some(r) = rest.strip_prefix(',') {
+                rest = r;
+            } else if let Some(r) = rest.strip_prefix(']') {
+                rest = r;
+                break;
+            } else {
+                return None;
+            }
+        }
+        let rest = rest.trim().strip_prefix(".include?(")?;
+        let (field, tail) = jt_field_tail(rest.trim(), var)?;
+        let tail = tail.trim().strip_prefix(')')?;
+        return Some((JsonCond::FieldIn(field, lits), tail));
+    }
+    if let Some((path, tail)) = jt_dig(s.trim_start(), var, &[])
+        && path.len() > 1
+        && let Some(rest) = tail
+            .trim()
+            .strip_prefix("&.blank?")
+            .or_else(|| tail.trim().strip_prefix(".blank?"))
+    {
+        return Some((JsonCond::DigBlank(path), rest));
+    }
     let (first, mut rest) = parse_json_cond_atom(var, s)?;
     let mut parts = vec![first];
     while let Some(r) = rest.trim_start().strip_prefix("|| ") {
@@ -7822,8 +13279,54 @@ fn parse_json_cond<'a>(var: &str, s: &'a str) -> Option<(super::formula::JsonCon
     Some((JsonCond::Or(parts), rest))
 }
 
+/// The body of an `any?` element block after the
+/// opening `|`: `<evar>| e["a"] == lit && …` up to
+/// `}` (brace form) or `end` (do form). Returns the
+/// equality pairs and the tail after the terminator.
+fn jt_any_eq_body<'a>(
+    rest: &'a str,
+    do_form: bool,
+) -> Option<(Vec<(String, super::formula::JsonLit)>, &'a str)> {
+    let (evar, rest) = rest.split_once('|')?;
+    let evar = evar.trim();
+    if evar.is_empty() || !evar.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = rest.trim();
+    let (body, tail) = if do_form {
+        // The first standalone `end` closes the
+        // block (the equality grammar contains none).
+        let mut from = 0;
+        loop {
+            let idx = from + rest[from..].find(" end")?;
+            let after = &rest[idx + 4..];
+            if after.is_empty()
+                || !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            {
+                break (&rest[..idx], after);
+            }
+            from = idx + 4;
+        }
+    } else {
+        let idx = rest.find('}')?;
+        (&rest[..idx], &rest[idx + 1..])
+    };
+    let mut pairs = Vec::new();
+    for atom in body.split(" && ") {
+        let (f, ne, lit) = jt_field_cmp(atom.trim(), evar)?;
+        if ne {
+            return None;
+        }
+        pairs.push((f, lit));
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    Some((pairs, tail))
+}
+
 fn parse_json_cond_atom<'a>(var: &str, s: &'a str) -> Option<(super::formula::JsonCond, &'a str)> {
-    use super::formula::{JsonCond, JsonLit};
+    use super::formula::JsonCond;
     let after = s.strip_prefix(var)?;
     let (field, tail) = json_bracket_key(after)?;
     if let Some(rest) = tail.strip_prefix("&.start_with?(version.major_minor)") {
@@ -7834,10 +13337,81 @@ fn parse_json_cond_atom<'a>(var: &str, s: &'a str) -> Option<(super::formula::Js
         let rest = rest.strip_prefix(')')?;
         return Some((JsonCond::Includes(field, lit), rest));
     }
+    if let Some(rest) = tail
+        .strip_prefix("&.end_with?(")
+        .or_else(|| tail.strip_prefix(".end_with?("))
+    {
+        let (lit, rest) = quoted_token(rest)?;
+        let rest = rest.strip_prefix(')')?;
+        return Some((JsonCond::EndsWith(field, lit), rest));
+    }
     if let Some(rest) = tail.strip_prefix("&.downcase&.include?(") {
         let (lit, rest) = quoted_token(rest)?;
         let rest = rest.strip_prefix(')')?;
         return Some((JsonCond::DowncaseIncludes(field, lit), rest));
+    }
+    if let Some(rest) = tail
+        .strip_prefix("&.any?")
+        .or_else(|| tail.strip_prefix(".any?"))
+        && let Some(parsed) = (|| {
+            let (block, rest) = take_bracketed(rest.trim(), '{', '}')?;
+            let inner = block.strip_prefix('{')?.strip_suffix('}')?.trim();
+            let inner = inner.strip_prefix('|')?;
+            let (vvar, body) = inner.split_once('|')?;
+            let vvar = vvar.trim();
+            let body = body.trim().strip_prefix(vvar)?.trim();
+            let arg = body
+                .strip_prefix("=~")
+                .or_else(|| {
+                    body.strip_prefix("&.match?(")
+                        .or_else(|| body.strip_prefix(".match?("))
+                })?
+                .trim();
+            if let Some((pat, flags, t)) = regex_literal(arg) {
+                // A `=~` argument ends at the block; a
+                // `match?` argument at its `)`.
+                if !(t.trim().is_empty() || t.trim() == ")") {
+                    return None;
+                }
+                return Some((JsonCond::AnyMatchRe(field.clone(), pat, flags), rest));
+            }
+            let (pat, t) = quoted_token(arg)?;
+            if !(t.trim().is_empty() || t.trim() == ")") {
+                return None;
+            }
+            return Some((
+                JsonCond::AnyMatchRe(field.clone(), pat, String::new()),
+                rest,
+            ));
+        })()
+    {
+        return Some(parsed);
+    }
+    if let Some(rest) = tail
+        .strip_prefix("&.match?(")
+        .or_else(|| tail.strip_prefix(".match?("))
+    {
+        let rest = rest.trim_start();
+        if let Some((pat, flags, t)) = regex_literal(rest) {
+            let t = t.trim().strip_prefix(')')?;
+            return Some((JsonCond::MatchRe(field, pat, flags), t));
+        }
+        let (lit, rest) = quoted_token(rest)?;
+        let rest = rest.trim().strip_prefix(')')?;
+        return Some((JsonCond::MatchLit(field, lit), rest));
+    }
+    let any_rest = tail
+        .strip_prefix("&.any? { |")
+        .or_else(|| tail.strip_prefix(".any? { |"))
+        .map(|r| (r, false))
+        .or_else(|| {
+            tail.strip_prefix("&.any? do |")
+                .or_else(|| tail.strip_prefix(".any? do |"))
+                .map(|r| (r, true))
+        });
+    if let Some((rest, do_form)) = any_rest {
+        let (pairs, rest) = jt_any_eq_body(rest, do_form)?;
+        return Some((JsonCond::AnyEq(field, pairs), rest));
     }
     if let Some(rest) = tail.strip_prefix(".none? { |") {
         let (evar, rest) = rest.split_once('|')?;
@@ -7850,16 +13424,15 @@ fn parse_json_cond_atom<'a>(var: &str, s: &'a str) -> Option<(super::formula::Js
         let rest = tail2.strip_prefix(".match?(regex) }")?;
         return Some((JsonCond::NoneMatch(field, inner_field), rest));
     }
+    if let Some(rest) = tail
+        .strip_prefix("&.blank?")
+        .or_else(|| tail.strip_prefix(".blank?"))
+    {
+        return Some((JsonCond::FieldBlank(field), rest));
+    }
     for (op, is_ne) in [(" == ", false), (" != ", true)] {
         if let Some(rest) = tail.strip_prefix(op) {
-            let (lit, rest) = if let Some(r) = rest.strip_prefix("true") {
-                (JsonLit::Bool(true), r)
-            } else if let Some(r) = rest.strip_prefix("false") {
-                (JsonLit::Bool(false), r)
-            } else {
-                let (lit, r) = quoted_token(rest)?;
-                (JsonLit::Str(lit), r)
-            };
+            let (lit, rest) = jt_lit(rest)?;
             let cond = if is_ne {
                 JsonCond::Ne(field, lit)
             } else {
@@ -7878,11 +13451,40 @@ fn rest_key(rest: &str, var: &str) -> Option<String> {
     Some(key)
 }
 
-/// Parse a cask `.rb` as data without evaluating Ruby, the
-/// cask sibling of `parse_rb_as_data`: top-level stanzas
-/// line-wise, per-system blocks skipped (and marked
-/// unsupported for install), `#{version}` interpolation
-/// applied to url and artifact names.
+/// Whether an `on_<release>` cask block applies on
+/// this host (`:or_newer`/`:or_older` widen the exact
+/// release the way brew's `on_system` does). Unknown
+/// symbols and non-macOS hosts never match.
+fn macos_release_block_matches(t: &str) -> bool {
+    fn vkey(v: &str) -> Vec<u64> {
+        v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    }
+    let Some(rest) = t.strip_prefix("on_") else {
+        return false;
+    };
+    let sym: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let Some(want) = macos_symbol_version(&sym) else {
+        return false;
+    };
+    let host = super::machine::Machine::this();
+    let Some(have) = host.macos_version() else {
+        return false;
+    };
+    let (mut w, mut h) = (vkey(&want), vkey(have));
+    let len = w.len().max(h.len());
+    w.resize(len, 0);
+    h.resize(len, 0);
+    use std::cmp::Ordering;
+    match h.cmp(&w) {
+        Ordering::Equal => true,
+        Ordering::Greater => t.contains(":or_newer"),
+        Ordering::Less => t.contains(":or_older"),
+    }
+}
+
 /// The `version` a host-matching per-system block
 /// declares (`on_arm`/`on_intel` by arch, `on_macos`/
 /// `on_linux` by OS; any other `on_*` block does not
@@ -7908,7 +13510,7 @@ fn cask_host_version(text: &str) -> Option<String> {
             } else if t.starts_with("on_linux") {
                 cfg!(target_os = "linux")
             } else {
-                false
+                macos_release_block_matches(t)
             };
             stack.push(matched);
             continue;
@@ -7928,6 +13530,11 @@ fn cask_host_version(text: &str) -> Option<String> {
     None
 }
 
+/// Parse a cask `.rb` as data without evaluating Ruby, the
+/// cask sibling of `parse_rb_as_data`: top-level stanzas
+/// line-wise, per-system blocks skipped (and marked
+/// unsupported for install), `#{version}` interpolation
+/// applied to url and artifact names.
 #[must_use]
 pub fn parse_cask_rb_as_data(text: &str, token: &str) -> Cask {
     let mut c = Cask {

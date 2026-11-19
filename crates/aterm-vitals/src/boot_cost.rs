@@ -478,18 +478,17 @@ fn observed_coverage(now: &Observation, before: Option<&Observation>) -> Coverag
         {
             c = c.with(Coverage::PARTIAL).with(Coverage::COUNTER_RESET);
         }
-        if let (Some(a), Some(b)) = (&now.wakes, &old.wakes) {
-            if now.process != old.process
+        if let (Some(a), Some(b)) = (&now.wakes, &old.wakes)
+            && (now.process != old.process
                 || a.epoch != b.epoch
                 || b.variants.iter().any(|old| {
                     a.variants
                         .iter()
                         .find(|n| n.kind == old.kind)
                         .is_none_or(|n| n.count < old.count)
-                })
-            {
-                c = c.with(Coverage::PARTIAL).with(Coverage::WAKE_RESET);
-            }
+                }))
+        {
+            c = c.with(Coverage::PARTIAL).with(Coverage::WAKE_RESET);
         }
     }
     c

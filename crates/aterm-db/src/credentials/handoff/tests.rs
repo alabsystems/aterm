@@ -28,6 +28,21 @@ fn fixture() -> Lab {
     lab
 }
 
+/// `body`, with `flag` (a mutant or seam) on for this thread while it runs.
+fn under<T>(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+    body: impl FnOnce() -> T,
+) -> T {
+    if let Some(flag) = flag {
+        flag.with(|flag| flag.set(true));
+    }
+    let out = body();
+    if let Some(flag) = flag {
+        flag.with(|flag| flag.set(false));
+    }
+    out
+}
+
 fn round(lab: &Lab, permits: bool) -> (Repair, Repair, [crate::control::Report; 2]) {
     round_with_owner(lab, permits, None)
 }
@@ -46,16 +61,31 @@ fn round_on_side(
     custodian_owner: Option<CredentialOwner>,
     custodian_side: Side,
 ) -> (Repair, Repair, [crate::control::Report; 2]) {
+    round_over(lab, permits, custodian_owner, custodian_side, |endpoint| {
+        endpoint
+    })
+}
+
+/// [`round_on_side`], each endpoint built as `wire` makes it (the protocol its dial offers).
+fn round_over(
+    lab: &Lab,
+    permits: bool,
+    custodian_owner: Option<CredentialOwner>,
+    custodian_side: Side,
+    wire: fn(Endpoint) -> Endpoint,
+) -> (Repair, Repair, [crate::control::Report; 2]) {
     let holder_side = match custodian_side {
         Side::Initiator => Side::Responder,
         Side::Responder => Side::Initiator,
     };
     let endpoint = |n| {
-        let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(n))
-            .unwrap()
-            .unwrap()
-            .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config.toml"))
-            .unwrap();
+        let endpoint = wire(
+            Endpoint::from_bootstrap(&lab.bootstrap(n))
+                .unwrap()
+                .unwrap()
+                .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config.toml"))
+                .unwrap(),
+        );
         if permits {
             let owner = if n == 0 {
                 custodian_owner.clone()
@@ -383,7 +413,7 @@ fn custody_and_current_policy_are_checked_before_the_source_is_read() {
         peer: actor(0),
     };
     let admin = client::admin_cached(&lab.paths[0]).unwrap();
-    let (request, offer) = custodian.candidate(&admin).unwrap().unwrap();
+    let (request, offer, _) = custodian.candidate(&admin, true).unwrap().unwrap();
     let admission = holder.admit(request, offer, actor(1)).unwrap();
     let mut exchange = Exchange {
         vault: admission.vault,
@@ -674,4 +704,167 @@ fn an_incoming_connection_can_deliver_a_holders_offer_to_its_custodian() {
             .values()
             .any(|thread| thread.published.is_some())
     );
+}
+
+/// A Mac that administers no vault takes nothing, ever, so it owes its peer no round and no
+/// judgement whatever its round could not run: the holder that answers its custodian's round
+/// tells `Owing::Nothing`, though its cached administrator does not open, and so does a
+/// judgement of it made with no round (`owed_take`). The custodian's own judgement still finds
+/// the holder's Offer, and its own round takes it.
+/// MUTANT (`NO_ADMIN_UNTOLD`): a cached administrator that does not open tells `Owing::Unknown`
+/// on every Mac, so each member but the custodian judges each one-way round's take again.
+#[test]
+fn a_mac_that_administers_no_vault_owes_its_peer_no_take_and_no_judgement() {
+    let lab = fixture();
+    give_from(&lab.paths[1], "mailbox:fixture", || {
+        Ok(SecretBytes::from(SENTINEL))
+    })
+    .unwrap();
+    repair_commons(&lab, 3);
+    assert_eq!(
+        [0, 1].map(|n| client::can_administer(&lab.paths[n]).unwrap()),
+        [true, false],
+        "CONTROL: Mac 0 administers the vault and Mac 1 does not"
+    );
+    let actor = |n| lab.bootstrap(n).request().unwrap().binding().actor();
+    let network = lab.bootstrap(0).trust().network;
+    let judged = |n: usize, peer: usize| {
+        let owner = CredentialOwner::for_test(&lab.paths[n]);
+        owed_take(
+            &lab.paths[n],
+            &lab.paths[n].home.join("config.toml"),
+            &owner,
+            network,
+            actor(n),
+            actor(peer),
+        )
+    };
+    assert!(
+        matches!(judged(0, 1), Owing::Take(_)),
+        "CONTROL: the custodian's judgement finds the holder's Offer"
+    );
+    for mutant in [false, true] {
+        let owing = under(mutant.then_some(&NO_ADMIN_UNTOLD), || judged(1, 0));
+        let expected = if mutant {
+            Owing::Unknown
+        } else {
+            Owing::Nothing
+        };
+        assert_eq!(owing, expected, "the holder's judgement: mutant {mutant}");
+    }
+    let (custodian, holder, _) = round_on_side(&lab, true, None, Side::Initiator);
+    assert_eq!(
+        custodian.handoff(),
+        Some(&Ok(1)),
+        "the custodian's own round takes"
+    );
+    assert_eq!(
+        holder.owing(),
+        Owing::Nothing,
+        "the answering holder, no custodian, owes nothing"
+    );
+}
+
+/// An answering custodian whose handoff broke off before its take could run still tells what it
+/// owes: the holder's round brought an Offer it would take, so it owes the holder a round
+/// (`Owing::Take`), whatever its give met. A take of its own that broke off with no answer from
+/// the holder records nothing refused, so the holder's next round owes the Offer again; a take
+/// the holder refused (AQR1) does record it.
+/// MUTANTS: `OWING_LOST_ON_ERROR` owes nothing for the broken-off round; `REFUSED_AT_TRY` records
+/// the Offer refused once the take holds it, before any answer, and the holder's next round owes
+/// nothing.
+#[test]
+fn a_handoff_that_broke_off_still_tells_what_it_owes_and_refuses_nothing() {
+    /// A connection whose peer went away: what is sent goes, and nothing comes back.
+    struct Gone;
+    impl std::io::Read for Gone {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fixture: the peer went away",
+            ))
+        }
+    }
+    impl std::io::Write for Gone {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let lab = fixture();
+    give_from(&lab.paths[1], "mailbox:fixture", || {
+        Ok(SecretBytes::from(SENTINEL))
+    })
+    .unwrap();
+    repair_commons(&lab, 3);
+    let owner = CredentialOwner::for_test(&lab.paths[0]);
+    let config = lab.paths[0].home.join("config.toml");
+    let actor = |n| lab.bootstrap(n).request().unwrap().binding().actor();
+    let network = lab.bootstrap(0).trust().network;
+    let offer = Round {
+        paths: &lab.paths[0],
+        config: &config,
+        owner: &owner,
+        network,
+        local: actor(0),
+        peer: actor(1),
+    }
+    .candidate(&client::admin_cached(&lab.paths[0]).unwrap(), true)
+    .unwrap()
+    .unwrap()
+    .1;
+    // The holder's one-way round reaches the custodian, and breaks off in its give.
+    let answer = || {
+        exchange(
+            &lab.paths[0],
+            &config,
+            &owner,
+            network,
+            actor(0),
+            actor(1),
+            Side::Responder,
+            false,
+            &mut Gone,
+        )
+    };
+    for mutant in [false, true] {
+        let handed = under(mutant.then_some(&OWING_LOST_ON_ERROR), answer);
+        assert!(handed.count.is_err(), "the give broke off");
+        assert_eq!(
+            handed.owing,
+            if mutant {
+                Owing::Nothing
+            } else {
+                Owing::Take(offer)
+            },
+            "the broken-off round: mutant {mutant}"
+        );
+    }
+    // The custodian's own take sends its hello, and the holder never answers.
+    for mutant in [false, true] {
+        under(mutant.then_some(&REFUSED_AT_TRY), || {
+            let round = Round {
+                paths: &lab.paths[0],
+                config: &config,
+                owner: &owner,
+                network,
+                local: actor(0),
+                peer: actor(1),
+            };
+            let error = take(&round, &mut Gone).unwrap_err();
+            assert!(error.to_string().contains("went away"), "{error}");
+        });
+        assert_eq!(
+            answer().owing,
+            if mutant {
+                Owing::Nothing
+            } else {
+                Owing::Take(offer)
+            },
+            "a take the holder never answered: mutant {mutant}"
+        );
+    }
 }

@@ -828,6 +828,306 @@ fn native_target_selection_captures_workspace_config_and_environment_precedence(
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_builds_claim_the_shared_cache_without_a_shell_shim() {
+    use aterm_uds::backup::Backups;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = physical(scratch.path()).join("home");
+    let root = home.join("Developer/repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = aterm_toolchain::build_cache::cache_root(&home);
+    let build = aterm_toolchain::build_cache::build_dir(&cache, &root);
+    std::fs::create_dir_all(&build).unwrap();
+    std::fs::write(build.join("retained-object"), b"cached output").unwrap();
+    for dir in [&cache, &build] {
+        assert!(!Backups::SYSTEM.excluded(&std::fs::File::open(dir).unwrap()));
+    }
+    let env = EnvSnapshot {
+        home,
+        ..EnvSnapshot::default()
+    };
+    let plan = NativeBuildPlan::capture(&env, &root).unwrap();
+    assert!(plan.shared_build_dir.is_some());
+    plan.prepare().unwrap();
+    for dir in [&cache, &build] {
+        assert!(Backups::SYSTEM.excluded(&std::fs::File::open(dir).unwrap()));
+    }
+    assert_eq!(
+        std::fs::read(build.join("retained-object")).unwrap(),
+        b"cached output"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn explicit_native_intermediates_are_marked_or_refused_without_marking_final_outputs() {
+    use aterm_uds::backup::Backups;
+    let scratch = aterm_tempfile::Builder::new().heard().tempdir().unwrap();
+    let home = physical(scratch.path());
+    assert!(
+        !home
+            .components()
+            .any(|part| part.as_os_str().as_encoded_bytes().ends_with(b".noindex"))
+    );
+    for from_environment in [false, true] {
+        for protected in [false, true] {
+            let root = home.join(format!("source-{from_environment}-{protected}"));
+            std::fs::create_dir_all(root.join(".cargo")).unwrap();
+            std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+            let intermediates = root.join(if protected { "build.noindex" } else { "build" });
+            let finals = root.join("final-output");
+            for dir in [&intermediates, &finals] {
+                std::fs::create_dir(dir).unwrap();
+                std::fs::write(dir.join("retained"), b"kept output").unwrap();
+                assert!(!Backups::SYSTEM.excluded(&std::fs::File::open(dir).unwrap()));
+            }
+            let mut env = EnvSnapshot {
+                home: home.clone(),
+                cargo_layout: vec![("CARGO_TARGET_DIR", finals.clone().into_os_string())],
+                ..EnvSnapshot::default()
+            };
+            if from_environment {
+                env.cargo_layout.push((
+                    "CARGO_BUILD_BUILD_DIR",
+                    intermediates.clone().into_os_string(),
+                ));
+            } else {
+                std::fs::write(
+                    root.join(".cargo/config.toml"),
+                    format!(
+                        "[build]\nbuild-dir='{}'\n",
+                        intermediates.file_name().unwrap().to_str().unwrap()
+                    ),
+                )
+                .unwrap();
+            }
+            let plan = NativeBuildPlan::capture(&env, &root).unwrap();
+            let result = plan.prepare();
+            assert_eq!(
+                result.is_ok(),
+                protected,
+                "{from_environment} {protected}: {result:?}"
+            );
+            if !protected {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            }
+            assert_eq!(
+                Backups::SYSTEM.excluded(&std::fs::File::open(&intermediates).unwrap()),
+                protected
+            );
+            assert!(!Backups::SYSTEM.excluded(&std::fs::File::open(&finals).unwrap()));
+            for dir in [&intermediates, &finals] {
+                assert_eq!(std::fs::read(dir.join("retained")).unwrap(), b"kept output");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_templates_mark_a_known_boundary_in_the_resolved_workspace() {
+    use aterm_uds::backup::Backups;
+    let scratch = aterm_tempfile::Builder::new().heard().tempdir().unwrap();
+    let home = physical(scratch.path());
+    let workspace = home.join("workspace");
+    let member = workspace.join("member");
+    std::fs::create_dir_all(member.join("src")).unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers=['member']\n",
+    )
+    .unwrap();
+    std::fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname='member'\nversion='0.0.0'\n",
+    )
+    .unwrap();
+    std::fs::write(member.join("src/lib.rs"), "").unwrap();
+    let boundary = workspace.join("build.noindex");
+    let env = EnvSnapshot {
+        home,
+        cargo_layout: vec![
+            (
+                "CARGO_TARGET_DIR",
+                workspace.join("final-output").into_os_string(),
+            ),
+            (
+                "CARGO_BUILD_BUILD_DIR",
+                "{workspace-root}/build.noindex/{workspace-path-hash}".into(),
+            ),
+        ],
+        ..EnvSnapshot::default()
+    };
+    let plan = NativeBuildPlan::capture(&env, &member).unwrap();
+    plan.prepare().unwrap();
+    assert!(Backups::SYSTEM.excluded(&std::fs::File::open(&boundary).unwrap()));
+    assert!(!member.join("build.noindex").exists());
+    assert_eq!(
+        std::fs::read_dir(&boundary).unwrap().count(),
+        0,
+        "Cargo expands its own hash"
+    );
+
+    let mut refused = env;
+    refused
+        .cargo_layout
+        .iter_mut()
+        .find(|(name, _)| *name == "CARGO_BUILD_BUILD_DIR")
+        .unwrap()
+        .1 = "{workspace-root}/indexed-{workspace-path-hash}.noindex".into();
+    let plan = NativeBuildPlan::capture(&refused, &member).unwrap();
+    assert_eq!(
+        plan.prepare().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert!(
+        !workspace
+            .join("indexed-{workspace-path-hash}.noindex")
+            .exists()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn harmless_build_dir_text_cannot_suppress_protected_native_intermediates() {
+    use aterm_uds::backup::Backups;
+    let scratch = aterm_tempfile::Builder::new().heard().tempdir().unwrap();
+    let home = physical(scratch.path());
+    assert!(
+        !home
+            .components()
+            .any(|part| part.as_os_str().as_encoded_bytes().ends_with(b".noindex"))
+    );
+    for (index, config) in [
+        "[build]\njobs=4 # build-dir is only a comment\n",
+        "[env]\nBUILD_NOTE='build-dir'\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for explicit_final in [false, true] {
+            let root = home.join(format!("source-{index}-{explicit_final}"));
+            std::fs::create_dir_all(root.join(".cargo")).unwrap();
+            std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+            std::fs::write(root.join(".cargo/config.toml"), config).unwrap();
+            let finals = root.join("final-output");
+            let env = EnvSnapshot {
+                home: home.clone(),
+                cargo_layout: if explicit_final {
+                    vec![("CARGO_TARGET_DIR", finals.clone().into_os_string())]
+                } else {
+                    Vec::new()
+                },
+                ..EnvSnapshot::default()
+            };
+            let plan = NativeBuildPlan::capture(&env, &root).unwrap();
+            assert!(!plan.has_explicit_build_dir());
+            let intermediates = aterm_toolchain::build_cache::target_build_path(plan.target());
+            assert_eq!(
+                plan.build_dir(),
+                aterm_toolchain::build_cache::target_build_config(plan.target()).as_deref()
+            );
+            assert_eq!(
+                fallback_build_dir(&env, &root, plan.target()).as_deref(),
+                plan.build_dir()
+            );
+            plan.prepare().unwrap();
+            assert!(Backups::SYSTEM.excluded(&std::fs::File::open(&intermediates).unwrap()));
+            if explicit_final {
+                assert_eq!(plan.target(), finals);
+                assert!(!Backups::SYSTEM.excluded(&std::fs::File::open(&finals).unwrap()));
+            }
+        }
+    }
+    let root = home.join("unsafe-recipe");
+    std::fs::create_dir(&root).unwrap();
+    let final_target = root.join("can't-quote");
+    let plan = NativeBuildPlan::for_target(&EnvSnapshot::default(), &root, &final_target);
+    assert_eq!(
+        plan.prepare().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert!(!final_target.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn native_compiler_commands_remove_uncaptured_targo_layout_twins() {
+    const PROBE: &str = "ATERM_VERIFY_NATIVE_TWINS_PROBE";
+    const TEST: &str = "tests::native_compiler_commands_remove_uncaptured_targo_layout_twins";
+    const TWINS: [&str; 4] = [
+        "TARGO_HOME",
+        "TARGO_TARGET_DIR",
+        "TARGO_BUILD_TARGET_DIR",
+        "TARGO_BUILD_BUILD_DIR",
+    ];
+    if std::env::var_os(PROBE).is_some() {
+        for name in TWINS {
+            assert_eq!(std::env::var_os(name), None, "{name}");
+        }
+        assert_eq!(std::env::var_os("CARGO_BUILD_TARGET_DIR"), None);
+        for (actual, expected) in [
+            ("CARGO_TARGET_DIR", "ATERM_TEST_EXPECT_NATIVE_TARGET"),
+            ("CARGO_HOME", "ATERM_TEST_EXPECT_NATIVE_HOME"),
+            ("CARGO_BUILD_BUILD_DIR", "ATERM_TEST_EXPECT_NATIVE_BUILD"),
+        ] {
+            assert_eq!(
+                std::env::var_os(actual),
+                std::env::var_os(expected),
+                "{actual}"
+            );
+        }
+        return;
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let root = physical(scratch.path());
+    for explicit in [false, true] {
+        let finals = root.join("final-output");
+        let build = root.join("caller-build.noindex");
+        let env = EnvSnapshot {
+            home: root.clone(),
+            cargo_layout: if explicit {
+                vec![
+                    ("CARGO_TARGET_DIR", finals.clone().into_os_string()),
+                    ("CARGO_BUILD_BUILD_DIR", build.clone().into_os_string()),
+                ]
+            } else {
+                vec![("CARGO_TARGET_DIR", finals.clone().into_os_string())]
+            },
+            ..EnvSnapshot::default()
+        };
+        let plan = NativeBuildPlan::capture(&env, &root).unwrap();
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(PROBE, "1")
+            .env("ATERM_TEST_EXPECT_NATIVE_TARGET", &finals)
+            .env("ATERM_TEST_EXPECT_NATIVE_HOME", root.join(".cargo"))
+            .env_remove("ATERM_TEST_EXPECT_NATIVE_BUILD");
+        if explicit {
+            command.env("ATERM_TEST_EXPECT_NATIVE_BUILD", &build);
+        }
+        for name in TWINS.into_iter().chain([
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_TARGET_DIR",
+            "CARGO_BUILD_BUILD_DIR",
+            "CARGO_HOME",
+        ]) {
+            command.env(name, root.join("ambient-decoy"));
+        }
+        plan.apply_to_command(&mut command).unwrap();
+        let projection = plan.apply_to_cmd(plan.layout().unwrap(), exec::Cmd::new("unused"));
+        for name in TWINS {
+            assert!(projection.remove_envs.iter().any(|removed| removed == name));
+            assert!(!projection.envs.iter().any(|(set, _)| set == name));
+        }
+        let ran = aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+            .unwrap();
+        assert!(ran.status.success(), "{explicit}: {ran:?}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn generated_artifacts_use_their_own_root_and_survive_source_cleanup() {
     use std::os::unix::fs::DirBuilderExt as _;
     for linked in [false, true] {

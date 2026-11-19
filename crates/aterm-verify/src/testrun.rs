@@ -662,6 +662,49 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
         .collect())
 }
 
+/// The recording driver has returned its GNU token. Its launch-only environment must
+/// not hand the same implicit job to a later test or to a probe of that test.
+fn restore_recording_environment(
+    records: &mut [Record],
+    serial: &Cmd,
+    pool: &aterm_capacity::Jobserver,
+    grant: u32,
+) {
+    let flags = OsString::from(pool.flags());
+    let original = |name: &str| {
+        serial
+            .envs
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, value)| value)
+    };
+    let jobs = original("CARGO_BUILD_JOBS")
+        .and_then(|value| crate::parse_build_jobs(Some(value)))
+        .map_or(grant, |asked| grant.min(asked))
+        .to_string();
+    for record in records {
+        for (name, advertised) in [
+            ("MAKEFLAGS", flags.as_os_str()),
+            ("CARGO_MAKEFLAGS", flags.as_os_str()),
+            ("CARGO_BUILD_JOBS", OsStr::new(&jobs)),
+        ] {
+            record.env.retain_mut(|(key, value)| {
+                if key != name || value != advertised {
+                    return true;
+                }
+                match original(name) {
+                    Some(prior) => {
+                        value.clone_from(prior);
+                        true
+                    }
+                    None => false,
+                }
+            });
+        }
+    }
+}
+
 /// The bytes of a recording pass's log before cargo's first `Running` header: its compile's
 /// prelude, where cargo's own messages are, and no test's output.
 fn recording_prelude_len(log: &str) -> usize {
@@ -3010,20 +3053,48 @@ pub fn run_tests(
         ctx.scope.crates(),
         ctx.memory.as_ref().and_then(|book| book.physical),
     );
-    progress.enter(Phase::RecordingAdmission);
-    let claims = match claim_both(
-        ctx,
-        label,
-        None,
-        aterm_capacity::peak_claim(fallback_peak),
-        "for the exact-host recording pass, at the selection's kept or cold peak",
-        asked_cores,
-        crate::admit_live,
-    ) {
-        Ok(claims) => claims,
-        Err(why) => {
-            r.cannot_run(why);
-            return;
+    #[cfg(unix)]
+    let mut prepared = (check == crate::Check::Test)
+        .then(|| {
+            ctx.compiled_test_launches
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        })
+        .flatten()
+        .filter(|p| p.slot_count == subprocess_slots_for_cores(asked_cores));
+    // Outside the pool, retained launches still need the ordinary grant that seeds the live share.
+    #[cfg(unix)]
+    let pooled_compile = ctx.pool.is_some() && prepared.is_some();
+    #[cfg(not(unix))]
+    let pooled_compile = false;
+
+    let reserve_recording = || {
+        claim_both(
+            ctx,
+            label,
+            None,
+            aterm_capacity::peak_claim(fallback_peak),
+            "for the exact-host recording pass, at the selection's kept or cold peak",
+            asked_cores,
+            crate::admit_live,
+        )
+    };
+    let mut claims = if pooled_compile {
+        // This lane is already inside the release pool. The actual tests claim
+        // memory individually; there is no second Targo compiler to reserve for.
+        Claims {
+            resources: None,
+            granted: asked_cores,
+        }
+    } else {
+        progress.enter(Phase::RecordingAdmission);
+        match reserve_recording() {
+            Ok(claims) => claims,
+            Err(why) => {
+                r.cannot_run(why);
+                return;
+            }
         }
     };
     progress.enter(Phase::RecordingSetup);
@@ -3031,7 +3102,6 @@ pub fn run_tests(
         asked: asked_cores,
         granted: claims.granted,
     };
-    let recording_resources = claims.resources.as_ref();
     // The pin of the recording pass, which runs under the recording claim.
     let thread_override = (ctx.env.build_slot_held.is_some()
         || ctx.pool.is_some()
@@ -3039,7 +3109,15 @@ pub fn run_tests(
         || ctx.test_cores.is_some()
         || cores.held_back())
     .then(|| ctx.test_threads_within(cores.granted));
-    let slots = match subprocess_pool(&ctx.scratch, cores.subprocess_slots()) {
+    let fresh_slots = || subprocess_pool(&ctx.scratch, cores.subprocess_slots());
+    #[cfg(unix)]
+    let slots = prepared
+        .as_mut()
+        .and_then(crate::test_launch::Prepared::take_slots)
+        .map_or_else(fresh_slots, Ok);
+    #[cfg(not(unix))]
+    let slots = fresh_slots();
+    let slots = match slots {
         Ok(pool) => pool,
         Err(why) => {
             r.cannot_run(format!(
@@ -3050,7 +3128,7 @@ pub fn run_tests(
     };
     // A run whose binaries claim their cores in the ledger runs them on its live share. A
     // release's pool is its share already, and a person's `--now` asked for no waiting.
-    let share = (recording_resources.is_some()
+    let share = (claims.resources.is_some()
         && ctx.pool.is_none()
         && ctx.quiet != Some(aterm_capacity::Admit::Now))
     .then(|| {
@@ -3064,28 +3142,33 @@ pub fn run_tests(
             )),
         )
     });
-    emit(
-        ctx,
-        &core_grant_event(
-            "recording",
-            None,
-            (cores.asked, cores.granted),
-            match (&ctx.pool, recording_resources) {
-                (Some(_), _) => "release pool",
-                (None, Some(_)) => "capacity ledger",
-                (None, None) => "unclaimed",
-            },
-            Some(if share.is_some() {
-                subprocess_slots_for_cores(cores.granted)
-            } else {
-                cores.subprocess_slots()
-            }),
-            &aterm_capacity::Live.read(None),
-        ),
-    );
+    let recording_event = |claims: &Claims| {
+        emit(
+            ctx,
+            &core_grant_event(
+                "recording",
+                None,
+                (cores.asked, cores.granted),
+                match (&ctx.pool, claims.resources.as_ref()) {
+                    (Some(_), _) => "release pool",
+                    (None, Some(_)) => "capacity ledger",
+                    (None, None) => "unclaimed",
+                },
+                Some(if share.is_some() {
+                    subprocess_slots_for_cores(cores.granted)
+                } else {
+                    cores.subprocess_slots()
+                }),
+                &aterm_capacity::Live.read(None),
+            ),
+        )
+    };
+    if !pooled_compile {
+        recording_event(&claims);
+    }
     if share.is_some() {
         r.raw(format!(
-            "  test cores: the recording pass was granted {} of the {} asked; the binaries are \
+            "  test cores: the run was granted {} of the {} asked; the binaries are \
              planned on {}, and as many run at once as the run's share covers at each start, \
              at most {}",
             cores.granted,
@@ -3131,6 +3214,67 @@ pub fn run_tests(
         Err(error) => r.raw(format!("  test descriptor room unavailable: {error}")),
     }
     let rerun = crate::findings::Rerun::of(serial, thread_override).with_seed(ctx.test_seed);
+    #[cfg(unix)]
+    if let Some(prepared) = prepared {
+        let prepared = Arc::new(prepared);
+        let bins = prepared
+            .check_context(ctx, serial)
+            .and_then(|()| prepared.validate_originals())
+            .and_then(|()| prepared.binaries(serial));
+        match bins {
+            Ok(bins) if !bins.is_empty() => {
+                let planned = RunPlan {
+                    bins,
+                    history,
+                    fallback_peak,
+                    recording: crate::admission_rows::Recording::default(),
+                    claims,
+                    cores,
+                    share,
+                    checkers,
+                    rerun,
+                    preface: "  test launches retained from the closing compile\n".into(),
+                    prepared: Some(Arc::clone(&prepared)),
+                };
+                run_planned_observed(
+                    ctx,
+                    r,
+                    label,
+                    planned,
+                    check,
+                    exec::TEST_BINARY_HANG,
+                    &mut progress,
+                );
+                if let Err(why) = prepared
+                    .validate()
+                    .and_then(|()| prepared.check_context(ctx, serial))
+                {
+                    r.cannot_run(format!(
+                        "test launch evidence changed during execution: {why}"
+                    ));
+                }
+                return;
+            }
+            Err(why) => r.raw(format!(
+                "  test launches: repeating native discovery ({why})"
+            )),
+            Ok(_) => {}
+        }
+    }
+    if pooled_compile {
+        // Native fallback performs the original compile/record operation and
+        // must obtain exactly that operation's ordinary reservation before spawning.
+        progress.enter(Phase::RecordingAdmission);
+        claims = match reserve_recording() {
+            Ok(claims) => claims,
+            Err(why) => {
+                r.cannot_run(why);
+                return;
+            }
+        };
+        recording_event(&claims);
+        progress.enter(Phase::RecordingSetup);
+    }
     let dir = ctx.scratch.join(format!(
         "test-records.{}.{}",
         std::process::id(),
@@ -3155,13 +3299,38 @@ pub fn run_tests(
     };
     progress.enter(Phase::Recording);
     let began = Instant::now();
-    let mut pass = {
-        let _held = holding(recording_resources);
-        exec::run(&recording_cmd(serial, &config, &host), ctx.exec_env())
+    let command = recording_cmd(serial, &config, &host);
+    let record = || {
+        let _held = holding(claims.resources.as_ref());
+        exec::run(&command, ctx.exec_env())
+    };
+    // This Cargo can compile a whole stale test graph. Charge its implicit CPU
+    // before spawning it and give the remaining compiler jobs the same FIFO as
+    // the release's other build stages. Return the token before probing tests.
+    let mut pass = if let Some(pool) = ctx.pool.as_deref() {
+        match crate::compile_width::run(
+            Some(pool),
+            Some(cores.granted),
+            None,
+            &crate::stopping,
+            record,
+        ) {
+            Ok(pass) => pass,
+            Err(why) => {
+                std::fs::remove_dir_all(&dir).ok();
+                r.cannot_run(format!("test recording CPU admission: {why}"));
+                return;
+            }
+        }
+    } else {
+        record()
     };
     let pass_wall = began.elapsed();
     progress.enter(Phase::Planning);
-    let records = read_records(&dir);
+    let mut records = read_records(&dir);
+    if let (Some(pool), Ok(records)) = (ctx.pool.as_deref(), &mut records) {
+        restore_recording_environment(records, serial, pool, cores.granted);
+    }
     std::fs::remove_dir_all(&dir).ok();
 
     if let Err(why) = &records {
@@ -3192,15 +3361,21 @@ pub fn run_tests(
         decide(ctx, r, &pass, label, &rerun);
         return;
     }
+    let call = format!("{label} (recording pass)");
+    let prelude = &pass.output[..recording_prelude_len(&pass.output)];
     let account = crate::compile_account::Account::of(
         crate::stages::step_of(r),
-        &format!("{label} (recording pass)"),
-        Some(&pass.output[..recording_prelude_len(&pass.output)]),
+        &call,
+        Some(prelude),
         pass.usage,
         pass_wall,
     );
     r.raw(format!("  {}", account.line()));
     crate::event_log::emit(ctx.events.as_ref(), &account.event());
+    // Keep producer evidence before executable discovery removes Cargo's artifact messages.
+    for event in crate::report::compile_unit_events(&call, prelude) {
+        crate::event_log::emit(ctx.events.as_ref(), &event);
+    }
     let exes = take_recording_executables(&mut pass.output);
     let bins = if pass.ok {
         records
@@ -3233,6 +3408,8 @@ pub fn run_tests(
         peak: pass.usage.map(|usage| usage.peak_bytes),
     };
     let planned = RunPlan {
+        #[cfg(unix)]
+        prepared: None,
         bins,
         history,
         fallback_peak,
@@ -3257,6 +3434,8 @@ pub fn run_tests(
 
 /// What [`run_tests`] planned for its binaries' runs.
 pub(crate) struct RunPlan {
+    #[cfg(unix)]
+    prepared: Option<std::sync::Arc<crate::test_launch::Prepared>>,
     /// The binaries, in declared order.
     pub(crate) bins: Vec<Binary>,
     /// The history that sizes and orders them.
@@ -3290,6 +3469,8 @@ impl RunPlan {
     pub(crate) fn fixture(bins: Vec<Binary>, share: u32) -> RunPlan {
         let share = share.max(1);
         RunPlan {
+            #[cfg(unix)]
+            prepared: None,
             bins,
             history: crate::test_history::History::default(),
             fallback_peak: aterm_capacity::cold_claim(None),
@@ -3447,6 +3628,7 @@ fn probe_json(
     bins: &[Binary],
     plan: &Plan,
     hang_after: Duration,
+    #[cfg(unix)] prepared: Option<&crate::test_launch::Prepared>,
 ) -> Result<Option<Probe>, ProbeHung> {
     let waiters = BinaryWaiters::default();
     let first_line = |run: &Run| -> String {
@@ -3526,7 +3708,11 @@ fn probe_json(
             hang_after,
         });
         let begun = Instant::now();
-        let run = exec::run(&cmd, ctx.exec_env());
+        let run = || exec::run(&cmd, ctx.exec_env());
+        #[cfg(unix)]
+        let run = crate::test_launch::guard(prepared, b, run);
+        #[cfg(not(unix))]
+        let run = run();
         let elapsed = begun.elapsed();
         if run.hung.is_some() {
             return Err(ProbeHung {
@@ -3658,6 +3844,8 @@ fn run_planned_observed(
 ) {
     progress.enter(Phase::Planning);
     let RunPlan {
+        #[cfg(unix)]
+        prepared,
         mut bins,
         history,
         fallback_peak,
@@ -3701,7 +3889,14 @@ fn run_planned_observed(
     let mut probe_samples = Vec::new();
     progress.enter(Phase::Probing);
     let probe = loop {
-        match probe_json(ctx, &bins, &plan, probe_hang_after) {
+        match probe_json(
+            ctx,
+            &bins,
+            &plan,
+            probe_hang_after,
+            #[cfg(unix)]
+            prepared.as_deref(),
+        ) {
             Ok(probe) => break probe,
             Err(hung) => {
                 let ProbeHung {
@@ -3814,7 +4009,11 @@ fn run_planned_observed(
             }
             // Each admitted binary starts its own work clock inside exec::run_test.
             let cmd = final_binary_cmd(ctx, b, planned.width, planned.charge, checkers, watch);
-            let mut run = exec::run_test(&cmd, ctx.exec_env(), local_halt);
+            let run = || exec::run_test(&cmd, ctx.exec_env(), local_halt);
+            #[cfg(unix)]
+            let mut run = crate::test_launch::guard(prepared.as_deref(), b, run);
+            #[cfg(not(unix))]
+            let mut run = run();
             if cmd.test_cases.as_ref().is_some_and(|w| w.json) {
                 // The raw events were the child's log; every reader takes libtest's report.
                 run.output = crate::libtest_json::render(&run.output, run.stopped_at.as_ref());

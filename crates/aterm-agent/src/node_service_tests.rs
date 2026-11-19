@@ -2204,3 +2204,80 @@ fn a_port_take_is_heard_a_probe_is_not_and_a_waiter_returns_on_release() {
         "a lock file that is not there is held by no one"
     );
 }
+
+/// The node job's plist for `state_dir`, as its installer writes it.
+fn node_plist_in(state_dir: &Path) -> String {
+    node_plist_text(
+        Path::new("/Applications/aterm.app/Contents/MacOS/aterm"),
+        Path::new("/Users//someone"),
+        state_dir,
+        None,
+    )
+}
+
+/// **THE NODE JOB'S START KEEPS THE FILE ITS PLIST NAMES.** `aterm node serve` keeps its log as
+/// it starts (`keep_log`; its serving, `aterm_gui::run_node_serve_owning`, takes the `Kept` it
+/// returns, which nothing else makes), and it hands `aterm_uds::job_log::keep` exactly the file
+/// the node's plist names for both outputs (`log_path`). NEGATIVE CONTROL: this thread asked
+/// nothing before the call; another state folder's plist names a file the call did not ask for;
+/// a test's run keeps nothing (its output is not that file).
+#[test]
+fn the_node_jobs_start_keeps_the_file_its_plist_names() {
+    use aterm_uds::job_log::seam;
+    let state = Path::new("/nonexistent/node-state");
+    assert_eq!(seam::asked(), None);
+    let kept = keep_log(state);
+    assert!(
+        !kept.stdout() && !kept.stderr(),
+        "a test's output is no job log"
+    );
+    let named = seam::plist_outputs(&node_plist_in(state)).files();
+    assert_eq!(seam::asked(), Some(named.clone()));
+    assert_ne!(
+        seam::plist_outputs(&node_plist_in(Path::new("/nonexistent/another"))).files(),
+        named
+    );
+}
+
+/// The full name of [`a_burst_of_the_node_jobs_refusals_stays_under_the_bound_where_its_log_is_kept`].
+const NODE_BURST: &str = "node_service::tests::a_burst_of_the_node_jobs_refusals_stays_under_the_bound_where_its_log_is_kept";
+
+/// **A BURST OF THE NODE JOB'S OWN LINES STAYS UNDER THE BOUND WHERE ITS LOG IS KEPT.** A stand-in
+/// node (this binary run again in a scratch state folder, standard output and error opened on the
+/// one file its plist names, as launchd opens them) keeps its log as `aterm node serve` does and
+/// writes `log_line`'s fleet refusal (what a remote that keeps asking makes the fleet listener
+/// say) about twice the cap's worth: the log stays under `job_log::CAP`, every line dated.
+/// NEGATIVE CONTROL: the same burst with nothing kept grows the log past the cap.
+#[test]
+fn a_burst_of_the_node_jobs_refusals_stays_under_the_bound_where_its_log_is_kept() {
+    use aterm_uds::job_log::{CAP, seam, undated};
+    const REFUSAL: &str =
+        "aterm-gui: fleet: 198.51.100.7:4242 not admitted: no proof of membership";
+    if let Some((stage, state)) = seam::stage() {
+        seam::open_as_service_manager(&seam::plist_outputs(&node_plist_in(&state))).unwrap();
+        if stage == "kept" {
+            let kept = keep_log(&state);
+            assert!(kept.stdout() && kept.stderr());
+        }
+        for _ in 0..seam::BURST {
+            log_line(REFUSAL);
+        }
+        std::process::exit(0);
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let run = |stage: &str| {
+        let state = scratch.path().join(stage);
+        std::fs::create_dir(&state).unwrap();
+        seam::rerun(NODE_BURST, stage, &state).unwrap();
+        std::fs::read_to_string(log_path(&state)).unwrap()
+    };
+    let kept = run("kept");
+    assert!(kept.len() as u64 <= CAP, "{} > {CAP}", kept.len());
+    assert!(
+        kept.lines()
+            .skip(1)
+            .all(|l| l != undated(l) && undated(l) == REFUSAL),
+        "every line dated"
+    );
+    assert!(run("unkept").len() as u64 > CAP, "the control is unbounded");
+}

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use crate::documents::materialized::{Materialized, Read, materialize};
+use crate::documents::materialized::{Marked, Materialized, Read, materialize};
 use crate::{
     Error, Result,
     checkpoint::Tip,
@@ -129,12 +129,25 @@ pub(crate) struct Log {
     eligible: BTreeSet<Digest>,
     /// Each refused revert, with what refuses it.
     revert_refusals: BTreeMap<Digest, &'static str>,
+    /// Where the cells this log last took from [`MATERIALIZED`] stand
+    /// ([`Self::cells_marked`]).
+    marked: Mutex<Option<Marked>>,
 }
 
-/// The last cells each recently read table made in this process, most recent first, so the next
-/// read of a table applies only what arrived since ([`crate::documents::materialized`]). An
-/// entry is taken out while a read extends it, so two reads of one table never share one.
+/// The last cells each recently read table made in this process, so the next read of a table
+/// applies only what arrived since ([`crate::documents::materialized`]). An entry is taken out
+/// while a read extends it, so two reads of one table never share one. Past
+/// [`MATERIALIZED_TABLES`] the table with the fewest cells goes first: it costs the least to
+/// read in full again, and a large table read often stays however many small ones pass.
 static MATERIALIZED: Mutex<Vec<(Scope, Materialized)>> = Mutex::new(Vec::new());
+
+/// Drop the cells [`MATERIALIZED`] keeps, as a process that read no table.
+#[cfg(test)]
+pub(crate) fn forget_for_test() {
+    if let Ok(mut held) = MATERIALIZED.lock() {
+        held.clear();
+    }
+}
 
 /// Tables whose cells [`MATERIALIZED`] keeps. A memory bound on a cache, not on any table: a
 /// table that falls out of it is read in full once, then kept again.
@@ -198,6 +211,7 @@ impl Log {
             ordered: Vec::new(),
             eligible: BTreeSet::new(),
             revert_refusals: BTreeMap::new(),
+            marked: Mutex::new(None),
         };
         for evidence in metadata {
             let control = evidence.is_table_control();
@@ -603,6 +617,8 @@ impl Log {
                 .filter(|(id, _)| cut.contains(*id))
                 .map(|(id, refusal)| (*id, *refusal))
                 .collect(),
+            // A cut's cells are its own, never the ones a read of the whole table kept.
+            marked: Mutex::new(None),
         }
     }
     /// [`Index::observes`] of this log's index, answered from the projection's version vectors
@@ -629,6 +645,59 @@ impl Log {
     /// The retained operation `id`, whatever its eligibility.
     pub(crate) fn operation(&self, id: &Digest) -> Option<&Operation> {
         self.records.get(id).map(|(operation, _)| operation)
+    }
+    /// What the retained record `id` says of who made it, why and on what evidence, where it
+    /// is a version 2 record its generation decoded ([`crate::said`]).
+    pub(crate) fn said(&self, id: &Digest) -> Option<&crate::said::Said> {
+        self.records.get(id)?.1.as_ref()?.said()
+    }
+    /// Who signed the retained record `id` (the roster it names and its writer) and why this
+    /// build does not project it, where [`Self::refused`] counts it refused: its
+    /// payload's refusal in this build's words, a revert this replica refuses, a payload not
+    /// readable here, a writer cut off or forked, or a record above the settled floor that its
+    /// writer's unreadable record there holds back.
+    pub(crate) fn refusal(&self, id: &Digest) -> Option<(Digest, Actor, String)> {
+        let (op, _) = self.records.get(id)?;
+        let why = if let Some(refusal) = &op.refusal {
+            refusal.clone()
+        } else if let Some(why) = self.revert_refusals.get(id) {
+            (*why).to_owned()
+        } else if !op.available {
+            "its payload cannot be read here".to_owned()
+        } else if !op.catalog_eligible {
+            "its writer was cut off or forked".to_owned()
+        } else if self.opaque.contains(id) {
+            "its writer has a record that cannot be read here".to_owned()
+        } else {
+            return None;
+        };
+        Some((op.roster, op.header.actor, why))
+    }
+    /// The roster and writer of each retained record [`Self::refusal`] names.
+    pub(crate) fn refused_writers(&self) -> impl Iterator<Item = (Digest, Actor)> + '_ {
+        self.records
+            .keys()
+            .filter_map(|id| self.refusal(id).map(|(roster, actor, _)| (roster, actor)))
+    }
+
+    /// Each of `ids` [`Self::refusal`] names, with its signer's machine as `resolve` finds it
+    /// through the roster the record names.
+    pub(crate) fn refusals(
+        &self,
+        ids: &[Digest],
+        resolve: &dyn Fn(&Digest, &Actor) -> Option<[u8; 16]>,
+    ) -> Vec<crate::typed::Unread> {
+        ids.iter()
+            .filter_map(|id| {
+                let (roster, actor, why) = self.refusal(id)?;
+                Some(crate::typed::Unread {
+                    operation: *id,
+                    actor,
+                    machine: resolve(&roster, &actor),
+                    why,
+                })
+            })
+            .collect()
     }
     fn project_cells(
         &self,
@@ -677,10 +746,15 @@ impl Log {
         }
         cells
     }
-    /// Every record this log retains, by operation digest, eligible or not: what a projection
-    /// of it was made from. A log only grows, so a later read's set contains an earlier one's.
+    /// Every record this log retains, by operation digest, eligible or not. A log only grows, so
+    /// a later read's set contains an earlier one's.
+    #[cfg(test)]
     pub(crate) fn retained_ids(&self) -> impl Iterator<Item = &Digest> {
         self.records.keys()
+    }
+    /// Whether this log retains the record `id`, eligible or not.
+    pub(crate) fn retains(&self, id: &Digest) -> bool {
+        self.records.contains_key(id)
     }
     /// The refused reverts a writer is answerable for: every one but a revert of an edit a final
     /// checkpoint settled, which a well-formed revert written before its writer found the
@@ -797,20 +871,14 @@ impl Log {
             self.project_cells(before, skip, unwritten)
         }
     }
-    /// The retained operation ids that are unavailable, withheld or refused and not in
-    /// `awaited` (`att::View::refused`), without building a full [`Snapshot`].
+    /// The retained records this build never projects and that cannot become visible, none of
+    /// `awaited` among them (`att::View::refused`): each [`Self::refusal`] names, without
+    /// building a full [`Snapshot`].
     pub(crate) fn refused(&self, awaited: &BTreeSet<Digest>) -> Vec<Digest> {
         self.records
-            .iter()
-            .filter(|&(id, (op, _))| {
-                (!op.available
-                    || !op.catalog_eligible
-                    || op.refusal.is_some()
-                    || self.revert_refusals.contains_key(id)
-                    || self.opaque.contains(id))
-                    && !awaited.contains(id)
-            })
-            .map(|(id, _)| *id)
+            .keys()
+            .filter(|id| !awaited.contains(*id) && self.refusal(id).is_some())
+            .copied()
             .collect()
     }
     /// The cells without `skip`, extended from this table's last read in this process where
@@ -838,14 +906,34 @@ impl Log {
             &|later, earlier| self.observes(later, earlier),
         );
         let cells = made.cells.clone();
+        if let Ok(mut marked) = self.marked.lock() {
+            *marked = Some(made.marked());
+        }
         if let Ok(mut held) = MATERIALIZED.lock() {
             held.insert(0, (self.scope, made));
-            held.truncate(MATERIALIZED_TABLES);
+            while held.len() > MATERIALIZED_TABLES {
+                // The fewest cells, the oldest of those (the last).
+                let Some(least) = held
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .min_by_key(|(_, (_, made))| made.cells.len())
+                    .map(|(at, _)| at)
+                else {
+                    break;
+                };
+                held.remove(least);
+            }
         }
         cells
     }
     pub(crate) const fn retained(&self) -> usize {
         self.retained
+    }
+    /// Where the cells this log last took from the cells this process keeps of its table stand
+    /// ([`crate::documents::materialized::Marked`]); `None` where it took none.
+    pub(crate) fn cells_marked(&self) -> Option<Marked> {
+        self.marked.lock().ok().and_then(|marked| marked.clone())
     }
     /// Authenticated ancestry, including causal-only merges that carry no cell writes.
     pub(crate) const fn causal_index(&self) -> &Index {
@@ -1301,6 +1389,7 @@ impl Log {
             request,
             operation: target,
             changes: restored,
+            said: None,
         })
     }
 }

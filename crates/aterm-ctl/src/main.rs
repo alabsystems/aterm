@@ -8,5 +8,8 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
     aterm_ctl::main_entry(std::env::args_os().skip(1).collect())
 }

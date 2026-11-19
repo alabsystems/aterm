@@ -4,8 +4,8 @@
 //! Tier-1 conformance for the package lane's read-only store-lock release wake.
 
 use crate::{
-    BumpWatch, CONTENTION_WEDGE_PARK, LiveSwitch, LoopGate, PARK_SLICE, ParkEnd, ParkProbes,
-    PassWhy, park_slice, sleep_interval_watching_bump, store_release_park_end,
+    BumpWatch, CONTENTION_WEDGE_PARK, LiveSwitch, LoopGate, ParkEnd, ParkProbes, PassWhy,
+    lane_wait, sleep_interval_watching_bump, store_release_park_end,
 };
 use aterm_models_atpkg::atpkg_contention_release_park_model;
 use aterm_spec::derive::Model;
@@ -97,16 +97,24 @@ fn real_store_release_wakes_contention_without_stealing_priority() {
         !model.successors("Check", &released).contains(&late),
         "negative control: an extra hour after release is rejected"
     );
-    let now = SystemTime::now();
-    assert_eq!(PARK_SLICE, Duration::from_secs(5));
+    let blind_look = atpkg::vendor_direct::watch::BLIND_LOOK;
+    assert_eq!(blind_look, Duration::from_secs(5));
     assert_eq!(
-        park_slice(now + CONTENTION_WEDGE_PARK, now, CONTENTION_WEDGE_PARK),
-        Some(PARK_SLICE),
-        "the real wedge park checks release in five-second slices"
+        lane_wait(
+            CONTENTION_WEDGE_PARK,
+            Some(&layout),
+            &BumpWatch::default(),
+            ParkProbes::STORE_RELEASE,
+            None,
+            &atpkg::vendor_direct::watch::Rest::by_hand(),
+            (SystemTime::now(), std::time::Instant::now()),
+        ),
+        blind_look,
+        "the real wedge park checks release every blind look, even on a rest that hears all"
     );
 
     // The sleep loop reaches the store probe with no vendor watch. A short deadline keeps this
-    // fast; PARK_SLICE above pins the production bound.
+    // fast; the blind look above pins the production bound.
     let short = Duration::from_millis(20);
     let holder = atpkg::lock::try_lock_store(&layout).unwrap();
     let while_held = sleep_interval_watching_bump(

@@ -635,7 +635,7 @@ fn a_login_signed_back_in_is_ok_again_and_due_no_more() {
         ["main"]
     );
     let back = NOW + 3 * HOUR;
-    let events = note_signed_back(&mut state, &mut logins, "main", back);
+    let events = note_checked_sign_in(&mut state, &mut logins, "main", back);
     assert!(
         events.iter().any(|e| e.kind == Kind::Auth && e.wakes()),
         "{events:?}"
@@ -649,27 +649,25 @@ fn a_login_signed_back_in_is_ok_again_and_due_no_more() {
     assert!(renew_due(&r, &logins, &state, &NONE, back).is_empty());
     note_auth(&mut state, "work-2", Auth::SignedOut, back);
     assert_eq!(signed_out(&r, &state, &enrolled, back), ["work-2"]);
-    assert!(!note_signed_back(&mut state, &mut logins, "work-2", back + 60).is_empty());
+    assert!(!note_checked_sign_in(&mut state, &mut logins, "work-2", back + 60).is_empty());
     assert!(signed_out(&r, &state, &enrolled, back + 60).is_empty());
     assert!(logins.get("work-2").is_none(), "no binding made");
-    let before = (state.clone(), logins.clone());
-    assert!(note_signed_back(&mut state, &mut logins, "main", back + HOUR).is_empty());
-    assert_eq!((state.clone(), logins.clone()), before);
     note_auth(&mut state, "work-2", Auth::SignedOut, back + 2 * HOUR);
-    assert!(note_signed_back(&mut state, &mut logins, "work-2", back + HOUR).is_empty());
+    assert!(note_checked_sign_in(&mut state, &mut logins, "work-2", back + HOUR).is_empty());
     assert_eq!(state.account("work-2").auth, Auth::SignedOut);
 }
 
-/// A STRIKE LIFTED ON EVIDENCE ITS OWN LOGIN SERVED IS NO SIGN-IN ([`note_served_back`]): the word
-/// is ok again, the strike's end and the sign-in it led to (stopped at Cloudflare's bot check) are
-/// gone and the service is recorded, while the login's renewal, the expiry notice Claude Code gave
-/// and its learned lifetime stand, so its forecast is still the notice's, and the ledger records
-/// the word's return alone (`auth ok`), never `signed-in`. A row not signed out has nothing to
-/// lift, and a word on record later than the lift stands. CONTROL: a sign-in where it stands
-/// ([`note_signed_back`]) stamps a renewal from its own time and drops the notice, which moves
-/// the forecast past the expiry Claude Code named.
+/// A LOGIN THAT SERVED AFTER ITS STRIKE IS NO SIGN-IN ([`observe_served`]): the served turn is
+/// newer evidence than the strike, so the login's verdict reads it signed in (`auth ok`, never
+/// `signed-in`), the sign-in the strike led to (stopped at Cloudflare's bot check) is no longer
+/// wanted and the service is recorded, while the strike's end stays on record and the login's
+/// renewal, the expiry notice Claude Code gave and its learned lifetime stand, so its forecast is
+/// still the notice's. A served turn on a row that reads signed in changes no word, and a strike
+/// newer than the turn stands. CONTROL: a sign-in ([`note_checked_sign_in`]) stamps a renewal
+/// from its own time and drops the notice, which moves the forecast past the expiry Claude Code
+/// named.
 #[test]
-fn a_strike_lifted_on_served_evidence_keeps_its_logins_renewal_and_notice() {
+fn a_login_served_after_its_strike_keeps_its_renewal_and_notice() {
     let r = roster();
     let row = r.row("main").expect("main");
     let (mut state, mut logins) = renewed(NOW);
@@ -699,10 +697,10 @@ fn a_strike_lifted_on_served_evidence_keeps_its_logins_renewal_and_notice() {
     let back = struck + HOUR;
     let signed = {
         let (mut state, mut logins) = (state.clone(), logins.clone());
-        assert!(!note_signed_back(&mut state, &mut logins, "main", back).is_empty());
+        assert!(!note_checked_sign_in(&mut state, &mut logins, "main", back).is_empty());
         (state, logins)
     };
-    let events = note_served_back(&mut state, &mut logins, "main", back);
+    let events = observe_served(&mut state, &mut logins, "main", back);
     assert_eq!(
         events
             .iter()
@@ -722,19 +720,24 @@ fn a_strike_lifted_on_served_evidence_keeps_its_logins_renewal_and_notice() {
             binding.served_at,
             binding.sign_in_attempt.is_some(),
         ),
-        (Some(NOW), Some(notice), lifetime, None, Some(back), false)
+        (
+            Some(NOW),
+            Some(notice),
+            lifetime,
+            Some(struck),
+            Some(back),
+            false
+        )
     );
-    assert_eq!(login_ended_at(row, &logins, &state), None);
     assert_eq!(login_forecast(row, &logins, &state), Some(notice));
-    let before = (state.clone(), logins.clone());
     assert!(
-        note_served_back(&mut state, &mut logins, "main", back + 60).is_empty(),
-        "not signed out: nothing to lift"
+        observe_served(&mut state, &mut logins, "main", back + 60).is_empty(),
+        "signed in already: no word changes"
     );
-    assert_eq!((state.clone(), logins.clone()), before);
+    assert_eq!(state.account("main").auth, Auth::Ok);
     note_auth(&mut state, "main", Auth::SignedOut, back + 2 * HOUR);
     assert!(
-        note_served_back(&mut state, &mut logins, "main", back + HOUR).is_empty(),
+        observe_served(&mut state, &mut logins, "main", back + HOUR).is_empty(),
         "a later strike stands"
     );
     assert_eq!(state.account("main").auth, Auth::SignedOut);
@@ -1077,6 +1080,7 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let advise_at = |roster: &Roster, state: &State, me: &Me<'_>, point: &Point, mode: Mode| {
         advise(roster, state, &enrolled, me, point, mode, NOW)
@@ -1230,6 +1234,7 @@ fn a_renewal_made_under_a_wall_is_followed_at_once() {
             left: None,
             default_home: true,
             route: crate::harness::accounts::AuthRoute::Stored,
+            model: crate::harness::accounts::ModelWeek::Unread,
         };
         assert_eq!(
             advise(
@@ -1521,7 +1526,7 @@ fn a_login_signed_back_in_ends_its_rows_old_sign_in_failure() {
         [NOW],
         "the control: signed out"
     );
-    assert!(!note_signed_back(&mut state, &mut logins, "main", NOW + HOUR).is_empty());
+    assert!(!note_checked_sign_in(&mut state, &mut logins, "main", NOW + HOUR).is_empty());
     assert_eq!(logins.get("main").unwrap().sign_in_attempt, None);
     let at = NOW + 2 * HOUR;
     logins

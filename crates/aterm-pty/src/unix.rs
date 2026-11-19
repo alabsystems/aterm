@@ -3978,9 +3978,21 @@ pub fn drain_more(master: i32, buf: &mut [u8], filled: usize) -> usize {
 pub fn drain_more_watched(
     master: i32,
     buf: &mut [u8],
+    filled: usize,
+    proc_rd: i32,
+    heard: &mut dyn FnMut(usize) -> bool,
+) -> usize {
+    drain_more_watched_observed(master, buf, filled, proc_rd, heard, |_| {})
+}
+
+/// As [`drain_more_watched`], reporting each additional successful PTY read at completion.
+pub fn drain_more_watched_observed(
+    master: i32,
+    buf: &mut [u8],
     mut filled: usize,
     proc_rd: i32,
     heard: &mut dyn FnMut(usize) -> bool,
+    mut observed: impl FnMut(usize),
 ) -> usize {
     const SATURATED: usize = 1024;
     const DRAIN_SPIN_MAX: u32 = 16;
@@ -4014,6 +4026,7 @@ pub fn drain_more_watched(
             if n <= 0 {
                 break;
             }
+            observed(n as usize);
             filled += n as usize;
             proven = false;
             spins = 0;
@@ -4282,6 +4295,35 @@ pub fn drain_more_nonblocking(
     interactive_pending: fn() -> bool,
     at_gap: &mut dyn FnMut(usize, bool) -> bool,
 ) -> usize {
+    drain_more_nonblocking_observed(
+        master,
+        buf,
+        filled,
+        wake_rd,
+        proc_rd,
+        parse_in_flight,
+        interactive_pending,
+        at_gap,
+        |_| {},
+    )
+}
+
+/// As [`drain_more_nonblocking`], reporting each additional successful PTY read at completion.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the gather keeps process events separate from byte observations"
+)]
+pub fn drain_more_nonblocking_observed(
+    master: i32,
+    buf: &mut [u8],
+    filled: usize,
+    wake_rd: i32,
+    proc_rd: i32,
+    parse_in_flight: Option<&std::sync::atomic::AtomicUsize>,
+    interactive_pending: fn() -> bool,
+    at_gap: &mut dyn FnMut(usize, bool) -> bool,
+    observed: impl FnMut(usize),
+) -> usize {
     drain_more_nonblocking_with_idle_wait_after_gap(
         master,
         buf,
@@ -4292,6 +4334,7 @@ pub fn drain_more_nonblocking(
         interactive_pending,
         idle_poll_us(),
         at_gap,
+        observed,
     )
 }
 
@@ -4310,6 +4353,7 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
     interactive_pending: fn() -> bool,
     idle_wait_us: u32,
     mut at_gap: impl FnMut(usize, bool) -> bool,
+    mut observed: impl FnMut(usize),
 ) -> usize {
     const SATURATED: usize = 1024;
     const NB_SPIN_MAX: u32 = 16;
@@ -4341,6 +4385,7 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
         }
         let n = read(master, &mut buf[filled..]);
         if n > 0 {
+            observed(n as usize);
             filled += n as usize;
             proven = false;
             spins = 0;

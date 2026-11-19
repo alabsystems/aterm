@@ -9,7 +9,7 @@
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Rgb, Terminal};
 
-use super::{OldPath, PetInputKind, ROW_FIT, art_cols};
+use super::{OldPath, PetInputKind, ROW_FIT, SeatShadow, art_cols};
 use crate::cursor_fx::TrailColor;
 use crate::pipeline::EffectsPipeline;
 
@@ -62,7 +62,9 @@ const RIGHT: char = '\u{2192}';
 /// A drawn frame: when, the companion's alpha on glass and its box (`x0, x1, y0, y1` px), the
 /// lettered cells (`row, col`) the box meets by a pixel or more, and how far (rows) the head law
 /// draws the body down its row and the share of its height it fits it to
-/// ([`EffectsPipeline::companion_head_sink_fit`]), and the caret's cell (`row, col`).
+/// ([`EffectsPipeline::companion_head_sink_fit`]), the caret's cell (`row, col`), and the seat
+/// rule's answer read after the frame ([`super::PetBrain::seat_shadow`]), which the seat tests
+/// judge.
 #[derive(Clone, Debug, PartialEq)]
 struct Frame {
     ms: u64,
@@ -71,14 +73,31 @@ struct Frame {
     boxed: Vec<(usize, usize)>,
     sink_fit: (f32, f32),
     caret: (usize, usize),
+    seat: SeatShadow,
 }
 
 /// `events` replayed on `cell` px cells, the pane `grid` rows by columns, a frame every
 /// [`FRAME_MS`] to `tail` ms past the last, the laws in `old` reverted. A key's echo lands 2 ms
 /// after it; typed at the window (`ctl` false) the console sees each key (a Backspace as a
 /// delete, [`LEFT`] and [`RIGHT`] as moves along the line), as the gallery types it
-/// (`aterm ctl key`) none.
+/// (`aterm ctl key`) none. The rainbow is drawn without its letter guard
+/// ([`EffectsPipeline::set_letter_guard`]): it shapes the lights alone, the companion reads
+/// nothing of it ([`the_pet_reads_nothing_of_the_letter_guard`]), and judging every light
+/// against the letters under it was most of each frame's cost here.
 fn replay(
+    scene: ((usize, usize), (u16, u16)),
+    style: &str,
+    events: &[(u64, Ev)],
+    tail: u64,
+    old: &[OldPath],
+    ctl: bool,
+) -> Vec<Frame> {
+    replay_lit(false, scene, style, events, tail, old, ctl)
+}
+
+/// [`replay`], the rainbow's letter guard on where `guard` says.
+fn replay_lit(
+    guard: bool,
     (cell, grid): ((usize, usize), (u16, u16)),
     style: &str,
     events: &[(u64, Ev)],
@@ -110,6 +129,7 @@ fn replay(
         true,
         0x0050_FA7B,
     );
+    fx.set_letter_guard(guard);
     fx.set_cursor_pet(true, 0x5EED);
     fx.set_cursor_pet_species(crate::cursor_pet::species(style).expect("a pet"));
     fx.set_sparkle_enabled(true);
@@ -188,6 +208,7 @@ fn replay(
                     boxed,
                     sink_fit: fx.companion_head_sink_fit(),
                     caret: (input.cursor_row, input.cursor_col),
+                    seat: fx.companion().brain().seat_shadow(),
                 });
             }
             _ => {}
@@ -237,6 +258,12 @@ fn steamed(
     ctl: bool,
     then: &[(u64, &[u8])],
 ) -> Vec<Frame> {
+    let ev = steam_events(rows, then);
+    replay((cell, (ROWS, COLS)), style, &ev, 1_600, old, ctl)
+}
+
+/// [`steamed`]'s events: the page between `rows`, the typing, the Backspaces and `then`.
+fn steam_events(rows: (&str, &str), then: &[(u64, &[u8])]) -> Vec<(u64, Ev)> {
     let mut ev = vec![(0, Ev::Out(steam_page(rows).into_bytes()))];
     ev.extend(typed(TYPING_TEXT, TYPING_FROM, 60));
     let erase_from = TYPING_FROM + 60 * TYPING_TEXT.len() as u64 + 300;
@@ -249,7 +276,7 @@ fn steamed(
     for &(after, bytes) in then {
         ev.push((erase_from + 50 * 11 + after, Ev::Out(bytes.to_vec())));
     }
-    replay((cell, (ROWS, COLS)), style, &ev, 1_600, old, ctl)
+    ev
 }
 
 /// The frames (ms) from [`FROM`] whose box meets a lettered cell of `row`.
@@ -587,11 +614,26 @@ fn last_row(
 fn last_row_after(
     cell: (usize, usize),
     path: usize,
-    (room, then): (i16, Then),
+    scene: (i16, Then),
     style: &str,
     old: &[OldPath],
     ctl: bool,
 ) -> LastRow {
+    let (cols, ev, last_key, enter, then_from) = last_row_events(path, scene);
+    LastRow {
+        frames: replay((cell, (ROWS, cols)), style, &ev, 1_600, old, ctl),
+        last_key,
+        enter,
+        then_from,
+    }
+}
+
+/// [`last_row_after`]'s grid and events: how many columns wide the grid is, the events, and
+/// [`LastRow`]'s last key, Enter and first key past the line.
+fn last_row_events(
+    path: usize,
+    (room, then): (i16, Then),
+) -> (u16, Vec<(u64, Ev)>, u64, u64, Option<u64>) {
     let line = i16::try_from(path + "$ ".len() + BURST_TEXT.len()).expect("a line a grid holds");
     let cols = u16::try_from(line + room).expect("a grid as wide as the line");
     let mut ev = vec![(200, Ev::Out(last_row_page(cols, path).into_bytes()))];
@@ -633,12 +675,7 @@ fn last_row_after(
     ev.push((enter, Ev::Key('\r', b"\r\n".to_vec())));
     ev.push((enter + 6, Ev::Out(b"Below: pqgyj [ok]\r\n$ ".to_vec())));
     ev.sort_by_key(|e| e.0);
-    LastRow {
-        frames: replay((cell, (ROWS, cols)), style, &ev, 1_600, old, ctl),
-        last_key,
-        enter,
-        then_from,
-    }
+    (cols, ev, last_key, enter, then_from)
 }
 
 /// What a `last-row` run shows, from 300 ms past the first key to its end.
@@ -933,7 +970,8 @@ type WallRun = (
 /// Linux arm64, 2026-11-07.
 /// THE DOG'S FRAMES ARE THE CAT'S ([`STYLES`]): one scene of each kind this file replays, on
 /// every face, as the cat and as the dog. Every frame is the same: when, alpha, box, the
-/// lettered cells it meets, the head law's sink and fit, the caret's cell.
+/// lettered cells it meets, the head law's sink and fit, the caret's cell, the seat rule's
+/// answer.
 #[test]
 fn the_dog_s_frames_are_the_cat_s_on_every_face() {
     type Scene = fn((usize, usize), &str) -> Vec<Frame>;
@@ -2212,6 +2250,14 @@ fn walked_through_a_gap(
     old: &[OldPath],
     ctl: bool,
 ) -> (Vec<Frame>, usize, (u64, u64)) {
+    let (cols, ev, held) = walked_events(line, tail);
+    let frames = replay((cell, (ROWS, cols)), style, &ev, 1_600, old, ctl);
+    (frames, line, held)
+}
+
+/// [`walked_through_a_gap`]'s grid and events: how many columns wide the grid is, the events,
+/// and the first arrow's and the Enter's ms.
+fn walked_events(line: usize, tail: usize) -> (u16, Vec<(u64, Ev)>, (u64, u64)) {
     let lead = line - "$ ".len() - "echo ".len() - WALKED_GAP - tail;
     let text = format!(
         "echo {}{}{}",
@@ -2232,8 +2278,7 @@ fn walked_through_a_gap(
     ev.push((enter, Ev::Key('\r', b"\r\n".to_vec())));
     ev.push((enter + 6, Ev::Out(b"Below: pqgyj [ok]\r\n$ ".to_vec())));
     ev.sort_by_key(|e| e.0);
-    let frames = replay((cell, (ROWS, cols)), style, &ev, 1_600, old, ctl);
-    (frames, line, (from, enter))
+    (cols, ev, (from, enter))
 }
 
 /// How many of `frames` from `from` to the Enter (ms) draw the box over the caret's cell at full
@@ -2410,6 +2455,61 @@ fn a_gap_in_the_line_is_the_line_s_on_every_face() {
             "negative control on (14, 26), a line {line} cells long (ctl {ctl}, {:?}): the gap's \
              stand laid its box into the letters in only {letters} frames",
             OldPath::GapIsTheLines
+        );
+    }
+}
+
+/// THE PET READS NOTHING OF THE LETTER GUARD: [`replay`] draws the rainbow without it, and so do
+/// the seat tests (`seat_tests`' `Desk`), since the laws here judge the companion's box, alpha
+/// and fit and the caret's cell, the seat tests the seat rule's answer, and the guard shapes only
+/// the lights over the letters. In each kind of scene the guard has the most to judge in
+/// (the `steam` page's typing and Backspaces between rows of descenders and a sentence,
+/// `last-row`'s line run to the grid's end under a row lettered in every cell and walked back
+/// into by Left arrows, and the caret walked back through a gap of that line and out again), the
+/// cat on the trail gallery's 14 x 26 cells, typed at the window and as the gallery types: every
+/// frame drawn with the guard is the frame drawn without it, the seat rule's answer included.
+/// Negative controls: the companion told of a flow on every frame once the guard has judged a
+/// cell, in `EffectsPipeline::apply`, and the frames part (first on the `steam` page as the
+/// gallery types, at 2.7 s, the box a pixel apart); the seat rule's answer told a millisecond
+/// more quiet while the guard is on, every other field alike, and they part at its first
+/// asking.
+#[test]
+fn the_pet_reads_nothing_of_the_letter_guard() {
+    let (wall_cols, wall, ..) = last_row_events(0, (0, Then::Back));
+    let (gap_cols, gap, _) = walked_events(GAP_LINE, 4);
+    let scenes = [
+        ("steam", COLS, steam_events(STEAM_ROWS[1], &[])),
+        ("last-row", wall_cols, wall),
+        ("the gap", gap_cols, gap),
+    ];
+    let runs: Vec<_> = scenes
+        .iter()
+        .flat_map(|scene| [false, true].map(|ctl| (scene, ctl)))
+        .collect();
+    let seen = aterm_spec::check::each(&runs, |&((_, cols, ev), ctl)| {
+        let lit = |guard| {
+            replay_lit(
+                guard,
+                (CELLS[1], (ROWS, *cols)),
+                STYLES[0],
+                ev,
+                1_600,
+                &[],
+                ctl,
+            )
+        };
+        (lit(true), lit(false))
+    });
+    for (&((name, ..), ctl), (guarded, bare)) in runs.iter().zip(&seen) {
+        assert!(
+            guarded.len() >= 300,
+            "fixture: {name} (ctl {ctl}) draws {} frames",
+            guarded.len()
+        );
+        let parted = guarded.iter().zip(bare).find(|(g, b)| g != b);
+        assert!(
+            parted.is_none() && guarded.len() == bare.len(),
+            "{name} (ctl {ctl}): with the letter guard and without it the frames part: {parted:?}"
         );
     }
 }

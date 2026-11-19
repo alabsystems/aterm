@@ -371,6 +371,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             id: u.id,
             part,
             cpu_mc: mc(cpu_ns),
+            cpu_total_ns: u.cpu_ns,
             measured,
             delegated_mc: mc(delegated),
             ownership_mixed,

@@ -49,6 +49,9 @@ mod converge_end_reread_tests;
 #[path = "keeper_hint_tests.rs"]
 mod keeper_hint_tests;
 
+#[path = "held_wait_tests.rs"]
+mod held_wait_tests;
+
 #[path = "status_observation_tests.rs"]
 mod status_observation_tests;
 
@@ -752,8 +755,22 @@ use std::time::{Duration, Instant};
 /// its readings, the setup slot and [`SETUP_IO`].
 static SETUP_GLOBALS: Mutex<()> = Mutex::new(());
 
+// A failed drain keeps its fixture installed: later cases must not reset state or put live
+// I/O under a surviving worker.
+static SETUP_FIXTURE_UNDRAINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn assert_fixture_drained() {
+    assert!(
+        !SETUP_FIXTURE_UNDRAINED.load(std::sync::atomic::Ordering::Acquire),
+        "an earlier setup fixture still owns a worker; its state and I/O remain held"
+    );
+}
+
 fn globals() -> MutexGuard<'static, ()> {
-    SETUP_GLOBALS.lock().unwrap_or_else(PoisonError::into_inner)
+    let guard = SETUP_GLOBALS.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_fixture_drained();
+    guard
 }
 
 /// A wait for something that must happen: a hang detector, not a budget.
@@ -807,6 +824,8 @@ struct Script {
     hold: bool,
     /// The next held reading unwinds after releasing the script lock.
     panic_read: bool,
+    /// A background worker's held wait expired, even where its panic was caught.
+    held_wait_timed_out: bool,
     /// Stop saves begun: the run each names and the thread it ran on.
     stop_attempts: Vec<(u64, std::thread::ThreadId)>,
     /// Stop saves that landed.
@@ -922,6 +941,7 @@ impl Script {
         not_admitted: Vec::new(),
         hold: false,
         panic_read: false,
+        held_wait_timed_out: false,
         stop_attempts: Vec::new(),
         stops: Vec::new(),
         stop_hold: false,
@@ -986,14 +1006,22 @@ fn change(edit: impl FnOnce(&mut Script)) {
 
 /// Wait while `held` says so (a hang detector bounds it).
 fn wait_while(
-    mut script: MutexGuard<'static, Script>,
+    script: MutexGuard<'static, Script>,
     held: impl Fn(&Script) -> bool,
 ) -> MutexGuard<'static, Script> {
-    let deadline = Instant::now() + HANG;
+    wait_while_until(script, held, Instant::now() + HANG)
+}
+
+fn wait_while_until(
+    mut script: MutexGuard<'static, Script>,
+    held: impl Fn(&Script) -> bool,
+    deadline: Instant,
+) -> MutexGuard<'static, Script> {
     while held(&script) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            break;
+            script.held_wait_timed_out = true;
+            panic!("a held setup fixture made no progress before its hang detector expired");
         }
         script = SCRIPT_MOVED
             .wait_timeout(script, left)
@@ -1018,6 +1046,7 @@ fn stop_worker_idle() -> bool {
 }
 
 fn reset_worker_state() {
+    assert_fixture_drained();
     set_setup_run(None);
     *SETUP_STOP.lock().unwrap_or_else(PoisonError::into_inner) = None;
     // The worker, once started, lives on for the next test.
@@ -1058,7 +1087,7 @@ static CLAIM_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 /// life, so no two run at once and one's drop puts back no [`SETUP_IO`]
 /// another test still scripts.
 struct TestIo {
-    _claims: aterm_tempfile::TempDir,
+    claims: Option<aterm_tempfile::TempDir>,
     _serial: MutexGuard<'static, ()>,
 }
 
@@ -1077,6 +1106,7 @@ fn test_io_idle() -> bool {
 impl TestIo {
     fn install() -> Self {
         let serial = TEST_IO.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_fixture_drained();
         assert!(test_io_idle(), "the prior scripted setup still owns work");
         let claims = aterm_tempfile::tempdir().unwrap();
         *CLAIM_ROOT.lock().unwrap_or_else(PoisonError::into_inner) = Some(claims.path().to_owned());
@@ -1149,7 +1179,7 @@ impl TestIo {
         };
         reset_worker_state();
         Self {
-            _claims: claims,
+            claims: Some(claims),
             _serial: serial,
         }
     }
@@ -1334,17 +1364,28 @@ impl Drop for TestIo {
             script.accounts_hold = false;
         });
         let deadline = Instant::now() + HANG;
-        while !test_io_idle() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        if !test_io_idle() {
-            if std::thread::panicking() {
+        while !test_io_idle() {
+            if Instant::now() >= deadline {
+                SETUP_FIXTURE_UNDRAINED.store(true, std::sync::atomic::Ordering::Release);
+                if let Some(claims) = self.claims.take() {
+                    let _ = claims.keep();
+                }
+                if !std::thread::panicking() {
+                    panic!("setup fixture workers did not drain before the hang detector expired");
+                }
                 return;
             }
-            panic!("the scripted setup workers did not finish their publications");
+            std::thread::sleep(Duration::from_millis(5));
         }
+        let timed_out = script().held_wait_timed_out;
         *SETUP_IO.write().unwrap_or_else(PoisonError::into_inner) = SetupIo::LIVE;
         reset_worker_state();
+        if !std::thread::panicking() {
+            assert!(
+                !timed_out,
+                "a held setup fixture timed out, even if its worker caught the panic"
+            );
+        }
     }
 }
 

@@ -60,11 +60,13 @@ pub mod room;
 pub mod runq;
 pub mod rusage;
 pub mod self_cpu;
+pub mod self_vm;
 pub mod situation;
 #[cfg(target_os = "macos")]
 mod situation_macos;
 pub mod slots;
 pub mod test_binary;
+pub mod thread_counts;
 pub mod timeline;
 pub mod vm_guest;
 pub use vm_guest::vm_guest;

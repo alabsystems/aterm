@@ -79,6 +79,7 @@ fn the_rename_field_paints_the_text_with_a_reverse_video_caret() {
             caption_hovered: None,
             subtitle: None,
             rename: Some(StripRenameField {
+                selected_all: false,
                 tab: 0,
                 text: "bu日ld",
                 cursor: 2,
@@ -102,24 +103,24 @@ fn the_rename_field_paints_the_text_with_a_reverse_video_caret() {
         !painted.contains("one"),
         "the label is replaced while editing, not drawn beside the field"
     );
-    let colors = crate::chrome_band::band_colors(theme);
+    let colors = strip_colors_for_on(theme, StripFloor::Ground);
+    let style = strip_cell(' ', &colors, StripRole::Active);
     let lead_col = row
         .iter()
         .position(|cell| cell.ch == '日')
         .expect("the wide char under the caret is painted as itself");
     let (caret, tail) = (row[lead_col], row[lead_col + 1]);
-    assert_eq!(caret.fg, colors.field_bg, "reverse video: bg becomes ink");
-    assert_eq!(caret.bg, colors.caret);
+    assert_eq!(caret.fg, style.bg, "reverse video: bg becomes ink");
+    assert_eq!(caret.bg, style.fg);
     assert!(tail.wide, "the continuation is flagged for the renderer");
-    assert_eq!(tail.bg, colors.caret, "and the block covers both cells");
+    assert_eq!(tail.bg, style.fg, "and the block covers both cells");
     assert_eq!(
         row[lead_col + 2].bg,
-        colors.field_bg,
-        "the next cell is field"
+        style.bg,
+        "the next cell keeps the title material"
     );
     assert_eq!(
-        caret.underline,
-        UnderlineStyle::Single,
+        caret.underline, style.underline,
         "the edited chip is still the selected one"
     );
     let other: String = row[segments[1].start_col as usize..segments[1].end_col as usize]
@@ -149,6 +150,7 @@ fn the_rename_field_paints_the_text_with_a_reverse_video_caret() {
                 caption_hovered: None,
                 subtitle: None,
                 rename: Some(StripRenameField {
+                    selected_all: false,
                     tab: 0,
                     text: "日",
                     cursor: 0,
@@ -166,7 +168,7 @@ fn the_rename_field_paints_the_text_with_a_reverse_video_caret() {
 }
 
 #[test]
-fn a_busy_narrow_chip_spends_its_whole_interior_on_the_field() {
+fn editing_a_busy_chip_keeps_its_icons_and_title_slot() {
     let theme = Theme::default();
     let mut presentation = crate::tab_model::TabPresentation::terminal("a");
     presentation.icon = Some(TabIconKind::Settings);
@@ -176,9 +178,9 @@ fn a_busy_narrow_chip_spends_its_whole_interior_on_the_field() {
         TabStripMetadata::from_presentation(&presentation),
         TabStripMetadata::from_presentation(&presentation),
     ];
-    let segments = layout_segments_with_metadata(28, 2, &metadata, 0, false);
+    let segments = layout_segments_with_metadata(64, 2, &metadata, 0, false);
     let titles = ["one".to_string(), "two".to_string()];
-    let mut row = vec![blank_cell(theme); 28];
+    let mut row = vec![blank_cell(theme); 64];
     let images = paint_strip_with_metadata(
         &mut row,
         &segments,
@@ -191,6 +193,7 @@ fn a_busy_narrow_chip_spends_its_whole_interior_on_the_field() {
             caption_hovered: None,
             subtitle: None,
             rename: Some(StripRenameField {
+                selected_all: false,
                 tab: 0,
                 text: "abcdef",
                 cursor: 6,
@@ -216,13 +219,13 @@ fn a_busy_narrow_chip_spends_its_whole_interior_on_the_field() {
     assert!(
         images
             .iter()
-            .all(|(col, _)| *col < seg.start_col as usize || *col >= seg.end_col as usize),
-        "the edited chip's icon and status marks yield their cells to the field"
+            .any(|(col, _)| (usize::from(seg.start_col)..usize::from(seg.end_col)).contains(col)),
+        "editing keeps the chip’s ornaments"
     );
 }
 
 #[test]
-fn editing_the_solo_band_drops_the_centred_group_for_a_left_aligned_field() {
+fn editing_the_solo_title_preserves_the_centred_group() {
     let theme = Theme::default();
     let metadata = [TabStripMetadata::from_presentation(
         &crate::tab_model::TabPresentation::terminal("aterm"),
@@ -243,6 +246,7 @@ fn editing_the_solo_band_drops_the_centred_group_for_a_left_aligned_field() {
             caption_hovered: None,
             subtitle: Some("~/aterm"),
             rename: Some(StripRenameField {
+                selected_all: false,
                 tab: 0,
                 text: "agent",
                 cursor: 5,
@@ -255,78 +259,18 @@ fn editing_the_solo_band_drops_the_centred_group_for_a_left_aligned_field() {
     let painted: String = row[..band.end_col as usize].iter().map(|c| c.ch).collect();
     assert!(painted.contains("agent"), "the field is drawn");
     assert!(
-        !painted.contains("~/aterm"),
-        "the description would recompose under the caret: {painted:?}"
+        painted.contains("~/aterm"),
+        "the description stays beside the title: {painted:?}"
     );
-    let first = painted.find(|c: char| c != ' ').expect("some ink");
+    let span = usize::from(band.end_col - band.start_col);
     assert_eq!(
-        first, SOLO_EDGE_COLS,
-        "left-aligned at the band's inset, not centred"
+        painted.find("agent"),
+        Some((span - 5 - SOLO_GAP_COLS - 7) / 2)
     );
 }
 
-/// THE RENAME FIELD SHOWS WHERE IT IS (audit r20 MC1): in the solo band its well is the
-/// terminal's ground, which on macOS is the band's own (1:1, a field with no edge at all) and
-/// elsewhere a step off it (Default 1.4:1, GitHub Light 1.2:1), so the well's cells carry the
-/// edge every faint text field draws, 3:1 on the well and on the band, and the band's cells
-/// beside it none.
 #[test]
-fn the_solo_bands_rename_field_draws_its_edge() {
-    let light = Theme::from(&aterm_types::scheme::builtin("GitHub Light").expect("built-in"));
-    for theme in [Theme::default(), light] {
-        let metadata = [TabStripMetadata::from_presentation(
-            &crate::tab_model::TabPresentation::terminal("aterm"),
-        )];
-        let segments = forced_solo_segments(40, &metadata);
-        let band = segments[0];
-        let mut row = vec![blank_cell(theme); 40];
-        paint_strip_with_metadata(
-            &mut row,
-            &segments,
-            &["aterm".to_string()],
-            &metadata,
-            StripPaint {
-                hovered: None,
-                new_tab_hovered: false,
-                version_hovered: false,
-                caption_hovered: None,
-                subtitle: None,
-                rename: Some(StripRenameField {
-                    tab: 0,
-                    text: "agent",
-                    cursor: 5,
-                }),
-            },
-            0,
-            theme,
-            None,
-        );
-        let colors = crate::chrome_band::band_colors(theme);
-        let field = SOLO_EDGE_COLS..usize::from(band.end_col) - SOLO_EDGE_COLS;
-        let ground = row[SOLO_EDGE_COLS - 1].bg;
-        assert!(
-            crate::chrome_band::contrast(colors.field_bg, ground) < 3.0,
-            "{theme:?}: the fixture is only interesting because the well is faint"
-        );
-        for (col, cell) in row.iter().enumerate() {
-            if field.contains(&col) {
-                let edge = cell.underline_color.expect("the well's edge");
-                assert_eq!(cell.underline, UnderlineStyle::Single, "{theme:?} {col}");
-                for on in [colors.field_bg, ground] {
-                    assert!(
-                        crate::chrome_band::contrast(edge, on) >= 3.0,
-                        "{theme:?} {col}: the edge shows on the well and the band"
-                    );
-                }
-            } else if col < usize::from(band.end_col) {
-                assert_eq!(cell.underline, UnderlineStyle::None, "{theme:?} {col}");
-            }
-        }
-    }
-}
-
-#[test]
-fn an_empty_rename_field_placeholds_with_the_resolved_label() {
+fn clearing_the_title_shows_an_empty_label() {
     let theme = Theme::default();
     let metadata = [
         TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal("a")),
@@ -347,6 +291,7 @@ fn an_empty_rename_field_placeholds_with_the_resolved_label() {
             caption_hovered: None,
             subtitle: None,
             rename: Some(StripRenameField {
+                selected_all: false,
                 tab: 0,
                 text: "",
                 cursor: 0,
@@ -362,15 +307,9 @@ fn an_empty_rename_field_placeholds_with_the_resolved_label() {
         .map(|c| c.ch)
         .collect();
     assert!(
-        painted.contains("vim src"),
-        "the fallback label is the placeholder: {painted:?}"
+        !painted.contains("vim"),
+        "clearing the title leaves just the caret"
     );
-    let colors = crate::chrome_band::band_colors(theme);
-    let hint = row
-        .iter()
-        .find(|cell| cell.ch == 'v')
-        .expect("the placeholder is drawn");
-    assert_eq!(hint.fg, colors.label, "dimmed — it is not content");
 }
 
 #[test]
@@ -546,7 +485,7 @@ fn the_windows_tab_cap_is_counted_in_dips() {
         (13, 1.5, 28, 50),
         (17, 2.0, 28, 51),
     ] {
-        let sizing = TabSizing::at(cell_w, scale, &[]);
+        let sizing = TabSizing::at(cell_w, scale, &[], true);
         assert_eq!((sizing.cap, sizing.grow), (cap, grow), "{scale}x");
         for (cols, dip) in [(sizing.cap, TAB_MAX_DIP), (sizing.grow, TAB_GROW_DIP)] {
             let off = (f32::from(cols) * cell_w as f32 - dip * scale).abs();
@@ -569,7 +508,7 @@ fn a_windows_tab_grows_toward_its_title_while_the_strip_has_room() {
     }
     let widths = |cols: u16, wants: &[u16]| {
         let metadata = vec![PLAIN_TAB; wants.len()];
-        let sizing = TabSizing::at(9, 1.0, wants);
+        let sizing = TabSizing::at(9, 1.0, wants, true);
         let segs = layout_segments_with_version_sized(
             cols,
             wants.len(),
@@ -709,6 +648,7 @@ fn canonical_metadata_preserves_segment_and_hit_geometry() {
             attention: ChipLevel::Wait,
             conn: Some(TabConnRole::Both),
             closable: false,
+            panel_numbers: false,
             team: TabTeam::NONE,
         },
     ];
@@ -961,6 +901,7 @@ fn memoized_strip_glyphs_match_a_fresh_raster_for_every_key() {
                 busy: bits & 0b010 != 0,
                 attention: crate::app_presence::chip_of_attention(bits & 0b100 != 0),
                 conn: None,
+                panel_numbers: false,
                 team: TabTeam::NONE,
                 closable: true,
             };

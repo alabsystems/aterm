@@ -53,6 +53,109 @@ fn unreadable_pins_are_reported_and_preserved() {
     assert_eq!(std::fs::read(l.prefix.join("pins")).unwrap(), before);
 }
 
+/// A PIN FILE SET ASIDE IS A ROW WHILE IT IS KEPT: once unattended work set a damaged pins file
+/// aside, `aterm pkg doctor` prints a row naming the kept file and that `aterm pkg pin
+/// <program>` makes a pin again, and one for set-aside harness holds; neither fails the report,
+/// and both go once the files are gone.
+/// NEGATIVE CONTROL: with `pin_findings` leaving out [`set_aside_findings`] no row names the file.
+#[test]
+fn a_set_aside_pin_file_is_a_doctor_row_while_it_is_kept() {
+    let l = layout("set-aside-pins");
+    std::fs::write(l.prefix.join("pins"), b"codex\n\xff").unwrap();
+    std::fs::write(l.prefix.join("harness-holds"), b"../hx\n").unwrap();
+    assert!(!crate::pin::holds_update(&l, "codex"));
+    assert!(!crate::pin::is_held(&l, "hx-alab"));
+    let kept = crate::pin::set_aside_files(&l);
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    let installed = builds(&["codex"]);
+    let report = || {
+        let (findings, _) = toolset_findings_with(&l, &installed, None, &|_| {
+            Ok(Missing {
+                present: 1,
+                ..Missing::default()
+            })
+        });
+        c::report(findings)
+    };
+    let rows = report();
+    let set_aside: Vec<_> = rows
+        .iter()
+        .filter(|row| c::is(&row.id, c::PIN_SET_ASIDE))
+        .collect();
+    assert_eq!(set_aside.len(), 2, "{rows:?}");
+    assert!(set_aside.iter().all(|row| row.outcome == Outcome::Ok));
+    assert!(c::passes(&rows));
+    let shown = render(&rows, "doctor", Detail::Problems);
+    for (file, path) in &kept {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let row = set_aside
+            .iter()
+            .find(|row| row.id == c::of(c::PIN_SET_ASIDE, name))
+            .unwrap_or_else(|| panic!("{name}: {set_aside:?}"));
+        assert!(
+            row.to
+                .as_deref()
+                .is_some_and(|to| to.contains(&path.display().to_string())),
+            "the row names the whole path: {row:?}"
+        );
+        assert!(shown.rest.contains(name), "{shown:?}");
+        let remedy = match file {
+            crate::pin::PinFile::Pins => "aterm pkg pin <program>",
+            crate::pin::PinFile::Holds => "aterm pkg unpin <program>",
+        };
+        assert!(shown.rest.contains(remedy), "{remedy}: {shown:?}");
+    }
+    for (_, path) in &kept {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert!(!report().iter().any(|row| c::is(&row.id, c::PIN_SET_ASIDE)));
+}
+
+/// THE DOCTOR'S READ OF A DAMAGED PINS FILE CHANGES NOTHING: `aterm pkg doctor` and `aterm
+/// doctor --read-only` read every vendor program's pin to say who follows its vendor head, with
+/// automatic updates on, and that read neither renames the pins file, takes the pin lock nor
+/// writes the packages log; the report keeps the row saying the pins cannot be read. Before, the
+/// follower check set the file aside, so the diagnostic changed the store and its own row was
+/// gone.
+/// NEGATIVE CONTROL: with `follows_vendor` reading pins through `holds_update` the file is
+/// renamed to `pins.unread-<n>`, a set-aside line is written and the cannot-be-read row is gone.
+#[test]
+fn the_doctors_read_of_a_damaged_pins_file_changes_nothing() {
+    let l = layout("doctor-reads-pins");
+    let home = synthetic_home("doctor-reads-pins");
+    let logs = crate::testdir::dir("atpkg-doctor-reads-pins-logs-");
+    let _bound = crate::packages_log::test_bind::bind(logs.to_path_buf(), l.prefix.clone());
+    let before = b"codex\n\xff";
+    std::fs::write(l.prefix.join("pins"), before).unwrap();
+    let probes = Probes::default();
+    assert!(
+        probes.automatic,
+        "the follower check reads only with automatic updates on"
+    );
+    let rows = report_with(&l, Some(&home), None, 0, None, &probes);
+    assert_eq!(std::fs::read(l.prefix.join("pins")).unwrap(), before);
+    let entries: Vec<_> = std::fs::read_dir(&l.prefix)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(entries, ["pins"], "nothing set aside, no lock taken");
+    assert!(crate::pin::set_aside_files(&l).is_empty());
+    let set_aside = crate::packages_log::read_tail(&logs, 100)
+        .into_iter()
+        .filter(|e| e.kind == crate::packages_log::kind::SET_ASIDE)
+        .count();
+    assert_eq!(set_aside, 0, "nothing logged");
+    let pin = rows
+        .iter()
+        .find(|row| row.id == c::PIN)
+        .unwrap_or_else(|| panic!("the pins row: {rows:#?}"));
+    assert!(
+        format!("{pin:?}").contains("local pins cannot be read"),
+        "{pin:?}"
+    );
+}
+
 fn tool(name: &str) -> crate::store::ToolName {
     crate::store::ToolName::new(name).unwrap()
 }

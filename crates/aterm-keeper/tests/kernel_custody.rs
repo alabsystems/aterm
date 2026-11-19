@@ -10,15 +10,17 @@
 )]
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use aterm_keeper::client::{KeeperClient, KeeperLink, LinkOp};
+use aterm_keeper::code::ExeImage;
 use aterm_keeper::identity::Identity;
 use aterm_keeper::server::{Relauncher, ServeConfig, Server};
 use aterm_keeper::wire::{Birth, Frame, MarkerRef, MasterHeader};
-use aterm_spec::wait::{MUST_HAPPEN, within};
+use aterm_spec::wait::{MUST_HAPPEN, until_while_working, within};
+use aterm_uds::deadline::{FIRST_EXEC_HANG, KeptUntilRan};
 use aterm_uds::exitwatch::ExitWatch;
 
 const ROLE: &str = "ATERM_KEEPER_TEST_ROLE";
@@ -27,6 +29,11 @@ const MARK: &str = "ATERM_KEEPER_TEST_MARK";
 const DROP: &str = "ATERM_KEEPER_TEST_DROP_CUSTODY";
 const TALK: &str = "ATERM_KEEPER_TEST_TALK";
 const LOGS: &str = "ATERM_KEEPER_TEST_LOGS";
+/// The `--job` label a `keeper-cli` role passes `aterm keeper serve`, if any.
+const CLI_JOB: &str = "ATERM_KEEPER_TEST_CLI_JOB";
+/// The version a restarting keeper runs as, and its copy's bundle names: a restart goes only for a
+/// build at least as new (`ExeImage::look`).
+const KEEPER_VERSION: &str = "0.1.0";
 const HANG: Duration = MUST_HAPPEN;
 
 unsafe extern "C" {
@@ -70,6 +77,44 @@ fn keeper_role() -> ! {
     report("ready");
     let _ = server.run();
     std::process::exit(1)
+}
+
+/// A keeper that honours RESTART_WHEN_SAFE for the file at its own path (the test runs it from
+/// a copy it then replaces), and exits as `aterm keeper serve` does once it restarts: 0. It
+/// prints `ready` on stdout, the line that proves its exec ran from the copy.
+fn restarting_keeper_role() -> ! {
+    let exe = std::env::current_exe().expect("its path");
+    let image = ExeImage::at(&exe).expect("the file it runs from");
+    let mut server = Server::bind(ServeConfig {
+        version: KEEPER_VERSION.into(),
+        ..keeper_config()
+    })
+    .expect("bind");
+    server.restart_for(image);
+    report("ready");
+    println!("ready");
+    let ran = server.run();
+    eprintln!("keeper role: run returned {ran:?}");
+    std::process::exit(i32::from(ran.is_err()))
+}
+
+/// `aterm keeper serve` itself ([`aterm_keeper::cli::main_entry`]) on the test's socket at
+/// [`KEEPER_VERSION`], passed `--job` with the label [`CLI_JOB`] names, if any: what decides
+/// whether it honours RESTART_WHEN_SAFE. It prints `ready` on stdout first, the line that proves
+/// its exec ran from the copy, and exits as `serve` does.
+fn cli_keeper_role() -> ! {
+    println!("ready");
+    let sock = std::env::var(SOCK).expect("socket");
+    let mut args: Vec<std::ffi::OsString> = ["serve", "--sock", &sock, "--identity", "uid"]
+        .into_iter()
+        .chain(["--no-relaunch"])
+        .map(Into::into)
+        .collect();
+    if let Ok(job) = std::env::var(CLI_JOB) {
+        args.extend(["--job".into(), job.into()]);
+    }
+    let code = aterm_keeper::cli::main_entry(args, KEEPER_VERSION);
+    std::process::exit(i32::from(code != std::process::ExitCode::SUCCESS))
 }
 
 /// A keeper the test parks with a `pause` note and lets go with a `resume` one: between two
@@ -504,6 +549,8 @@ fn await_go() -> String {
 fn dispatch_role() {
     match role().as_deref() {
         Some("keeper") => keeper_role(),
+        Some("keeper-restarting") => restarting_keeper_role(),
+        Some("keeper-cli") => cli_keeper_role(),
         Some("keeper-stepped") => stepped_keeper_role(false),
         Some("keeper-parked-in-turn") => stepped_keeper_role(true),
         Some("window") => window_role(false),
@@ -593,7 +640,22 @@ impl Scratch {
         self.dir.join("relaunches")
     }
     fn spawn(&mut self, test: &str, role: &str, extra: &[(&str, &str)]) -> usize {
-        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+        let exe = std::env::current_exe().expect("test binary");
+        self.spawn_from(&exe, test, role, extra, false)
+    }
+    /// [`Self::spawn`] from the executable at `exe`; with `proof`, its stdout is a pipe for
+    /// [`aterm_uds::deadline::prints`] and its stderr goes to `kid-<n>.log`.
+    fn spawn_from(
+        &mut self,
+        exe: &Path,
+        test: &str,
+        role: &str,
+        extra: &[(&str, &str)],
+        proof: bool,
+    ) -> usize {
+        use aterm_uds::spawnfd::Stdio as Io;
+        let kid = self.kids.len();
+        let mut cmd = aterm_uds::spawnfd::command(exe);
         cmd.arg(test)
             .arg("--exact")
             .arg("--nocapture")
@@ -601,16 +663,23 @@ impl Scratch {
             .env(ROLE, role)
             .env(SOCK, self.sock())
             .env(MARK, self.mark())
-            .env(TALK, self.dir.join(format!("kid-{}", self.kids.len())))
+            .env(TALK, self.dir.join(format!("kid-{kid}")))
             .env(LOGS, self.dir.join("logs"))
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null());
+            .stdin(Io::null());
+        if proof {
+            let log = std::fs::File::create(self.log_of(kid)).expect("a log");
+            cmd.stdout(Io::piped()).stderr(log);
+        } else {
+            cmd.stdout(Io::null()).stderr(Io::null());
+        }
         for (k, v) in extra {
             cmd.env(k, v);
         }
         self.kids.push(cmd.spawn().expect("spawn a role"));
-        self.kids.len() - 1
+        kid
+    }
+    fn log_of(&self, kid: usize) -> PathBuf {
+        self.dir.join(format!("kid-{kid}.log"))
     }
     fn line(&mut self, kid: usize, prefix: &str) -> String {
         let out = self.dir.join(format!("kid-{kid}.out"));
@@ -1317,6 +1386,273 @@ fn a_quit_beside_a_dead_unjudged_peer_hangs_its_shell_up() {
         None,
         "the killed window's shell lives"
     );
+}
+
+/// A restarting keeper (`restarting_keeper_role`) run from a copy of this test binary
+/// ([`copied_keeper`]), once it reported it serves.
+fn restarting_keeper(s: &mut Scratch, test: &str) -> (usize, KeptUntilRan, PathBuf) {
+    let (keeper, bin, copy) = copied_keeper(s, test, "keeper-restarting", &[]);
+    s.line(keeper, "ready");
+    (keeper, bin, copy)
+}
+
+/// A keeper `role` run from a copy of this test binary ([`keeper_copy`]), once its `ready` line
+/// on stdout showed it runs from the copy: from then on the copy may be renamed over. The
+/// directory, and the copy's path.
+fn copied_keeper(
+    s: &mut Scratch,
+    test: &str,
+    role: &str,
+    extra: &[(&str, &str)],
+) -> (usize, KeptUntilRan, PathBuf) {
+    let (mut bin, copy) = keeper_copy();
+    let keeper = run_copied(s, &mut bin, &copy, test, role, extra);
+    (keeper, bin, copy)
+}
+
+/// Spawn `role` from `copy` (in `bin`) and wait for its `ready` line on stdout, which proves its
+/// exec ran from the copy; `bin` may go from then on.
+fn run_copied(
+    s: &mut Scratch,
+    bin: &mut KeptUntilRan,
+    copy: &Path,
+    test: &str,
+    role: &str,
+    extra: &[(&str, &str)],
+) -> usize {
+    let keeper = s.spawn_from(copy, test, role, extra, true);
+    aterm_uds::deadline::prints(&mut s.kids[keeper], "ready", FIRST_EXEC_HANG);
+    bin.ran();
+    keeper
+}
+
+/// A copy of this test binary in a directory of its own laid out as a bundle's `Contents`
+/// (`MacOS/<copy>` beside an `Info.plist` naming [`KEEPER_VERSION`], so a file renamed over the
+/// copy reads as a build as new as the keeper), under the binary's own name (a test binary's
+/// isolation, `aterm_uds::test_binary`). The directory, and the copy's path.
+fn keeper_copy() -> (KeptUntilRan, PathBuf) {
+    let own = std::env::current_exe().expect("test binary");
+    let bin = KeptUntilRan::new(
+        aterm_tempfile::Builder::new()
+            .prefix("akr-")
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
+            .expect("scratch")
+            .keep(),
+    );
+    let macos = bin.path().join("MacOS");
+    std::fs::create_dir(&macos).expect("the copy's directory");
+    std::fs::write(
+        bin.path().join("Info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\t\
+             <key>CFBundleShortVersionString</key>\n\t<string>{KEEPER_VERSION}</string>\n\
+             </dict>\n</plist>\n"
+        ),
+    )
+    .expect("the bundle's Info.plist");
+    let copy = macos.join(own.file_name().expect("its name"));
+    std::fs::copy(&own, &copy).expect("copy the test binary");
+    (bin, copy)
+}
+
+/// What an update does to the keeper's executable: another file renamed over its path.
+fn replace(exe: &Path) {
+    let next = exe.with_extension("next");
+    std::fs::write(&next, b"the build an update put at the keeper's path").expect("write");
+    std::fs::rename(&next, exe).expect("rename over the keeper's executable");
+}
+
+/// The `window` role `window` asks its keeper to restart (`poke` sends RESTART_WHEN_SAFE) and
+/// stays connected, holding its master, until it is killed.
+fn ask_restart(s: &mut Scratch, window: usize) {
+    s.say(window, "poke");
+    s.await_note(window, "poked");
+}
+
+const T_RESTART: &str = "a_keeper_asked_to_restart_beside_live_windows_alone_exits_once_replaced";
+
+/// A newer window's RESTART_WHEN_SAFE (`KeeperCore::restart_when_safe`): with every master held
+/// by a connected window, which tells a restarted keeper again, the keeper exits 0 at once, for
+/// launchd to start the file now at its path, and the window's shell lives on. Before its
+/// executable is replaced, nobody asked; once asked, it went because another file stood there.
+///
+/// NEGATIVE CONTROL: [`a_keeper_asked_to_restart_beside_an_orphan_stays_until_its_shell_ends`],
+/// where an orphan only the keeper holds keeps it running past the same ask.
+#[test]
+fn a_keeper_asked_to_restart_beside_live_windows_alone_exits_once_replaced() {
+    dispatch_role();
+    let mut s = Scratch::new("restart");
+    let (keeper, _bin, copy) = restarting_keeper(&mut s, T_RESTART);
+    let keeper_pid = s.kids[keeper].id();
+    let w = s.spawn(T_RESTART, "window", &[]);
+    let reg = s.line(w, "leader=");
+    let leader = field(&reg, "leader") as u32;
+    s.pids.push(leader);
+    let leader_watch = ExitWatch::watch(leader).expect("watch the leader");
+    s.await_status("registered", |t| {
+        t.contains("claimed=1") && t.contains("image=same")
+    });
+    replace(&copy);
+    let st = s.await_status("replaced", |t| t.contains("image=replaced"));
+    assert!(st.contains("restart=unwanted"), "nobody asked yet:\n{st}");
+    let window_pid = s.kids[w].id();
+    ask_restart(&mut s, w);
+    let ended = until_while_working(
+        keeper_pid,
+        "the keeper exits for its new executable",
+        || s.kids[keeper].try_wait().ok().flatten(),
+    );
+    assert_eq!(ended.code(), Some(0), "a restart exits 0: {ended}");
+    let log = std::fs::read_to_string(s.log_of(keeper)).expect("its log");
+    for want in [
+        format!("keeper: restart: wanted by window pid {window_pid}"),
+        format!("keeper: restart: exiting for {} replaced", copy.display()),
+    ] {
+        assert!(log.contains(&want), "{want:?} in\n{log}");
+    }
+    assert_eq!(leader_watch.exit_status(), None, "the window's shell lives");
+    assert!(aterm_uds::process::pid_alive(leader));
+}
+
+const T_RESTART_HELD: &str =
+    "a_keeper_asked_to_restart_beside_an_orphan_stays_until_its_shell_ends";
+
+/// The negative control of [`a_keeper_asked_to_restart_beside_live_windows_alone_exits_once_replaced`]:
+/// a killed window's orphan only the keeper holds keeps it running past the ask, with its
+/// executable replaced; once the orphan's shell ends and is pruned, it exits 0, the asking
+/// window's shell living on.
+#[test]
+fn a_keeper_asked_to_restart_beside_an_orphan_stays_until_its_shell_ends() {
+    dispatch_role();
+    let mut s = Scratch::new("restart-held");
+    let (keeper, _bin, copy) = restarting_keeper(&mut s, T_RESTART_HELD);
+    let keeper_pid = s.kids[keeper].id();
+    let mut windows = Vec::new();
+    for _ in 0..2 {
+        let w = s.spawn(T_RESTART_HELD, "window", &[]);
+        let reg = s.line(w, "leader=");
+        let leader = field(&reg, "leader") as u32;
+        s.pids.push(leader);
+        windows.push((
+            w,
+            leader,
+            ExitWatch::watch(leader).expect("watch the leader"),
+        ));
+    }
+    s.await_status("registered", |t| t.contains("claimed=2"));
+    let (killed, orphan, orphan_watch) = windows.pop().expect("two");
+    let (asker, _, asker_watch) = windows.pop().expect("two");
+    sigkill(s.kids[killed].id());
+    let _ = s.kids[killed].wait();
+    s.await_status("orphaned", |t| t.contains("orphaned=1"));
+    replace(&copy);
+    s.await_status("replaced", |t| t.contains("image=replaced"));
+    ask_restart(&mut s, asker);
+    let st = s.await_status("held by the orphan", |t| {
+        t.contains("restart=wanted askers=1 held_by=orphaned")
+    });
+    assert!(
+        s.kids[keeper].try_wait().expect("its status").is_none(),
+        "the keeper stays while the orphan lives:\n{st}"
+    );
+    assert_eq!(orphan_watch.exit_status(), None, "the orphan's shell lives");
+
+    sigkill(orphan);
+    assert_eq!(await_exit(&orphan_watch), 9);
+    let ended = until_while_working(
+        keeper_pid,
+        "the keeper exits once the orphan is pruned",
+        || s.kids[keeper].try_wait().ok().flatten(),
+    );
+    assert_eq!(ended.code(), Some(0), "a restart exits 0: {ended}");
+    let log = std::fs::read_to_string(s.log_of(keeper)).expect("its log");
+    assert!(
+        log.contains("keeper: restart: held by 1 orphaned master"),
+        "what held it is said:\n{log}"
+    );
+    assert_eq!(
+        asker_watch.exit_status(),
+        None,
+        "the asking window's shell lives"
+    );
+}
+
+const T_SUPERVISED: &str = "only_a_keeper_launchd_runs_as_its_job_honours_a_restart";
+
+/// The test label a `keeper-cli` keeper's `--job` names.
+const JOB: &str = "com.aterm.aterm.keeper.test.restart";
+
+/// `aterm keeper serve` honours RESTART_WHEN_SAFE only as its launchd job (launchd sets
+/// `XPC_SERVICE_NAME` to the label of each job it runs), since only launchd starts it again: the
+/// label its `--job` names, else its place's (`job::place_for` of its executable, the label
+/// `start` submits with no flag). Run so, a window's ask, with its executable replaced by a
+/// build as new, ends it, 0; under another service name (a keeper run by hand), or with `--job`
+/// naming another job than launchd's, its WELCOME states no CAP_RESTARTS and the same ask leaves
+/// it running, saying why. `None` below is the keeper's place's label.
+///
+/// NEGATIVE CONTROLS (run by hand, each restored): with `serve_as` calling `restart_for`
+/// whatever `supervised` says, the second and fourth keepers state CAP_RESTARTS and exit; with
+/// `supervised` ignoring the place (the flag required again), the first keeper, flagless under
+/// its place's label, states none.
+#[test]
+fn only_a_keeper_launchd_runs_as_its_job_honours_a_restart() {
+    dispatch_role();
+    for (job, xpc, honours) in [
+        (None, None, true),
+        (None, Some("com.aterm.aterm.keeper.test.other"), false),
+        (Some(JOB), Some(JOB), true),
+        (Some(JOB), None, false),
+    ] {
+        let mut s = Scratch::new("supervised");
+        let home = s.dir.join("home");
+        std::fs::create_dir(&home).expect("a scratch HOME");
+        let home = home.to_str().expect("a UTF-8 path").to_owned();
+        let (mut bin, copy) = keeper_copy();
+        let place = aterm_keeper::job::place_for(&copy.canonicalize().expect("its path")).label;
+        let xpc = xpc.unwrap_or(&place);
+        let mut extra = vec![("XPC_SERVICE_NAME", xpc), ("HOME", home.as_str())];
+        extra.extend(job.map(|job| (CLI_JOB, job)));
+        let keeper = run_copied(&mut s, &mut bin, &copy, T_SUPERVISED, "keeper-cli", &extra);
+        let keeper_pid = s.kids[keeper].id();
+        let (st, restarts) = within(HANG, Duration::from_millis(5), || {
+            let c = KeeperClient::connect(&s.sock(), &Identity::same_uid(), HANG).ok()?;
+            let st = c.status("test").ok()?;
+            Some((st, c.keeper_restarts()))
+        })
+        .expect("the keeper never answered");
+        let case = format!("job {job:?} as {xpc}");
+        let image = if honours { "image=same" } else { "image=none" };
+        assert!(st.contains(image), "{case}: {image} in\n{st}");
+        assert_eq!(restarts, honours, "{case}: its WELCOME's CAP_RESTARTS");
+        let w = s.spawn(T_SUPERVISED, "window", &[]);
+        let reg = s.line(w, "leader=");
+        s.pids.push(field(&reg, "leader") as u32);
+        replace(&copy);
+        ask_restart(&mut s, w);
+        if honours {
+            let ended = until_while_working(keeper_pid, "the keeper exits for its job", || {
+                s.kids[keeper].try_wait().ok().flatten()
+            });
+            assert_eq!(ended.code(), Some(0), "{case}: a restart exits 0: {ended}");
+            continue;
+        }
+        let st = s.await_status("the ask held", |t| {
+            t.contains("restart=wanted askers=1 held_by=image-unknown")
+        });
+        assert!(
+            s.kids[keeper].try_wait().expect("its status").is_none(),
+            "{case}: nothing would start it again, so it stays:\n{st}"
+        );
+        let log = std::fs::read_to_string(s.log_of(keeper)).expect("its log");
+        assert!(
+            log.contains(
+                "so nothing would start this keeper again; a window's RESTART_WHEN_SAFE \
+                 is never honoured"
+            ),
+            "{case}: why is said:\n{log}"
+        );
+    }
 }
 
 #[test]

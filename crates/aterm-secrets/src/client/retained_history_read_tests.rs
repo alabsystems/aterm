@@ -30,6 +30,31 @@ impl Receipts {
     }
 
     fn append(&mut self, n: u64) {
+        let receipt = self.receipt(n);
+        self.journal.append(SUBJECT, receipt).unwrap();
+        aterm_journal::write_private_durable(&self.paths.dir, "records.frontiers", READY).unwrap();
+    }
+
+    /// Receipts 1 to `last` in order, each group of up to [`aterm_journal::MAX_APPEND_RECORDS`]
+    /// under one checkpoint and commit, and the ready marker written once after them: a read finds
+    /// in them the history it finds in `last` calls of [`Self::append`].
+    fn append_through(&mut self, last: u64) {
+        let group = aterm_journal::MAX_APPEND_RECORDS as u64;
+        let mut first = 1;
+        while first <= last {
+            let end = last.min(first + group - 1);
+            let receipts = (first..=end).map(|n| (SUBJECT, self.receipt(n))).collect();
+            self.journal
+                .append_many_then(receipts, &self.paths.dir, |_, _| Ok(()))
+                .unwrap();
+            first = end + 1;
+        }
+        aterm_journal::write_private_durable(&self.paths.dir, "records.frontiers", READY).unwrap();
+    }
+
+    /// Receipt `n`: a delta naming one new head over the frontier's heads, which the frontier
+    /// then holds.
+    fn receipt(&mut self, n: u64) -> Vec<u8> {
         let mut id = [3; 32];
         id[..8].copy_from_slice(&n.to_le_bytes());
         let retired = self.frontier.heads();
@@ -54,8 +79,7 @@ impl Receipts {
             receipt.extend_from_slice(&[2; 32]);
         }
         receipt.extend_from_slice(&encoded);
-        self.journal.append(SUBJECT, receipt).unwrap();
-        aterm_journal::write_private_durable(&self.paths.dir, "records.frontiers", READY).unwrap();
+        receipt
     }
 }
 
@@ -424,9 +448,7 @@ fn concurrent_read_counts_conserve_joined_work_without_assuming_cache_order() {
 #[test]
 fn a_journal_nobody_wrote_is_validated_once() {
     let mut fixture = Receipts::new();
-    for n in 1..=2000 {
-        fixture.append(n);
-    }
+    fixture.append_through(2000);
     let cache = ReadCache::new();
     let before = cache.1.snapshot();
     let first = cache.read(&fixture.paths).unwrap();

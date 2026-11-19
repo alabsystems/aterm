@@ -745,7 +745,8 @@ fn idle_trees(
     keep: Duration,
     in_scope: &dyn Fn(&str) -> bool,
 ) -> Vec<(Tree, TreeKey)> {
-    let mut groups: Vec<((&'static str, String), Vec<(Option<SystemTime>, Tree)>)> = Vec::new();
+    type Group = ((&'static str, String), Vec<(Option<SystemTime>, Tree)>);
+    let mut groups: Vec<Group> = Vec::new();
     for tree in list(layout) {
         if !in_scope(tree.program.name) {
             continue;
@@ -760,7 +761,7 @@ fn idle_trees(
     let mut out = Vec::new();
     for (_, mut trees) in groups {
         // The most recently used first; it stays however old.
-        trees.sort_by(|a, b| b.0.cmp(&a.0));
+        trees.sort_by_key(|tree| std::cmp::Reverse(tree.0));
         let Some(newest) = trees.first().map(|(_, t)| t.key.clone()) else {
             continue;
         };

@@ -12,8 +12,9 @@
 //!   CPU time by QoS. The host decodes each record in the coalition read's own copy loop and sums
 //!   them there ([`HeatBook`]); the start counter's merge hands back the coalitions gone since the
 //!   last read ([`crate::starts::coalition_moves`]), whose last counters come off the earlier total
-//!   ([`change`]). No pass after the read runs (M-COAL: a separate pass costs 64.6 / 81.3 µs, the
-//!   folded form 12.5 / 18.2 µs).
+//!   ([`change`]). The aggregate needs no pass after the read (M-COAL: a separate pass costs
+//!   64.6 / 81.3 µs, the folded form 12.5 / 18.2 µs). Per-coalition energy facts retain the
+//!   individual changes over that same transition for group attribution.
 //! - Each change is judged against the chip and the machine ([`judge`]): a layout the self-check
 //!   does not recognise reads unread, never as a shifted value.
 //! - What the deck and `sys` read of it ([`HeatView`]): CPU, GPU and Neural Engine watts; the Super
@@ -238,6 +239,92 @@ pub struct HeatMove {
     pub timebase: (u32, u32),
 }
 
+/// One coalition's reported energy change over its original heat-read window.
+///
+/// The channels are separate kernel accounts. GPU energy supplies no GPU busy time, and none
+/// of these rates bounds when the work executed or partitions the machine's physical power.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoalitionEnergy {
+    id: u64,
+    cpu_nj: u64,
+    gpu_nj: u64,
+    ane_nj: u64,
+    window_ns: u64,
+}
+
+impl CoalitionEnergy {
+    /// The resource coalition whose counters changed.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// CPU energy change divided by the original read separation, milliwatts.
+    #[must_use]
+    pub fn cpu_mw(&self) -> f64 {
+        self.cpu_nj as f64 * 1000.0 / self.window_ns as f64
+    }
+
+    /// GPU energy change divided by the original read separation, milliwatts.
+    #[must_use]
+    pub fn gpu_mw(&self) -> f64 {
+        self.gpu_nj as f64 * 1000.0 / self.window_ns as f64
+    }
+
+    /// Neural Engine energy change divided by the original read separation, milliwatts.
+    #[must_use]
+    pub fn ane_mw(&self) -> f64 {
+        self.ane_nj as f64 * 1000.0 / self.window_ns as f64
+    }
+}
+
+/// Immutable per-coalition energy facts from one accepted starts/heat counter transition.
+///
+/// The model must also admit that transition's sampling gap and existing heat judgment before
+/// publishing these facts. They retain the native read midpoints, independently of the frontend
+/// window used for coalition CPU attribution; looking at them later never advances a baseline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnergyFacts {
+    before_ns: u64,
+    at_ns: u64,
+    rows: Vec<CoalitionEnergy>,
+}
+
+impl EnergyFacts {
+    /// The earlier native coalition read's midpoint, on the host's monotonic epoch.
+    #[must_use]
+    pub const fn before_ns(&self) -> u64 {
+        self.before_ns
+    }
+
+    /// The later native coalition read's midpoint, on the same host epoch.
+    #[must_use]
+    pub const fn at_ns(&self) -> u64 {
+        self.at_ns
+    }
+
+    /// The positive separation of those original midpoints, nanoseconds.
+    #[must_use]
+    pub const fn window_ns(&self) -> u64 {
+        self.at_ns - self.before_ns
+    }
+
+    /// Every current coalition's accepted energy change, ascending by coalition id.
+    #[must_use]
+    pub fn rows(&self) -> &[CoalitionEnergy] {
+        &self.rows
+    }
+
+    /// Coalition `id`'s energy change; a missing coalition is unavailable, never known zero.
+    #[must_use]
+    pub fn get(&self, id: u64) -> Option<&CoalitionEnergy> {
+        self.rows
+            .binary_search_by_key(&id, CoalitionEnergy::id)
+            .ok()
+            .map(|i| &self.rows[i])
+    }
+}
+
 /// The change from `then` to `now`, given the coalitions gone since `then` (`gone`, ascending ids,
 /// as [`crate::starts::coalition_moves`] hands them back): `now`'s total less what `then`'s total
 /// kept, the gone coalitions' last counters taken off it. Equal to the change by id (each matched
@@ -267,6 +354,66 @@ pub fn change(then: &HeatBook, now: &HeatBook, gone: &[u64]) -> Result<HeatMove,
         window_ns,
         timebase: now.timebase,
     })
+}
+
+/// Take the existing aggregate transition once, retaining its per-id energy facts separately.
+/// A per-id refusal does not change the established global heat result. In particular, growth
+/// in another coalition can hide a counter reset in an aggregate, but cannot justify that
+/// coalition's energy rate.
+pub(crate) fn change_with_energy(
+    then: &HeatBook,
+    now: &HeatBook,
+    gone: &[u64],
+    newest: Option<u64>,
+) -> (
+    Result<HeatMove, &'static str>,
+    Result<std::sync::Arc<EnergyFacts>, &'static str>,
+) {
+    let moved = change(then, now, gone);
+    let energy = moved.and_then(|m| energy_facts(then, now, newest, m.window_ns));
+    (moved, energy.map(std::sync::Arc::new))
+}
+
+fn energy_facts(
+    then: &HeatBook,
+    now: &HeatBook,
+    newest: Option<u64>,
+    window_ns: u64,
+) -> Result<EnergyFacts, &'static str> {
+    let earlier = energy_rows(then)?;
+    let current = energy_rows(now)?;
+    let mut rows = Vec::with_capacity(current.len());
+    for &(id, words) in current {
+        let counters = Counters::from_words(words);
+        let delta = match earlier.binary_search_by_key(&id, |r| r.0) {
+            Ok(i) => counters
+                .since(Counters::from_words(earlier[i].1))
+                .ok_or("backwards")?,
+            Err(_) if newest.is_some_and(|before| id > before) => counters,
+            Err(_) => return Err("unbased"),
+        };
+        rows.push(CoalitionEnergy {
+            id,
+            cpu_nj: delta.energy_nj,
+            gpu_nj: delta.gpu_energy_nj,
+            ane_nj: delta.ane_energy_nj,
+            window_ns,
+        });
+    }
+    Ok(EnergyFacts {
+        before_ns: then.at_ns,
+        at_ns: now.at_ns,
+        rows,
+    })
+}
+
+fn energy_rows(book: &HeatBook) -> Result<Vec<&(u64, Words)>, &'static str> {
+    let mut rows: Vec<_> = book.by_id.iter().collect();
+    rows.sort_unstable_by_key(|r| r.0);
+    if rows.windows(2).any(|r| r[0].0 == r[1].0) {
+        return Err("rows");
+    }
+    Ok(rows)
 }
 
 /// `ticks` of a Mach clock at `(numer, denom)` in ns.

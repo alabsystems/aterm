@@ -1805,7 +1805,7 @@ fn a_claude_worker_of_a_walled_tab_starts_on_the_row_a_wall_moves_to() {
     };
     let plain = starter_on(&[]);
     assert_eq!(
-        super::claude_starter_in(plain.clone(), &seat, 1),
+        super::claude_starter_in(plain.clone(), &seat, UNREAD, 1),
         plain,
         "CONTROL: a fresh row keeps the starter's login"
     );
@@ -1824,7 +1824,7 @@ fn a_claude_worker_of_a_walled_tab_starts_on_the_row_a_wall_moves_to() {
         })
         .expect("wall main");
     let var = Cli::Claude.accounts().seam.var();
-    let moved = super::claude_starter_in(plain.clone(), &seat, 2);
+    let moved = super::claude_starter_in(plain.clone(), &seat, UNREAD, 2);
     assert_eq!(
         moved.env,
         vec![(var.to_string(), work.display().to_string())],
@@ -1833,7 +1833,7 @@ fn a_claude_worker_of_a_walled_tab_starts_on_the_row_a_wall_moves_to() {
 
     let custom = starter_on(&[("CLAUDE_CONFIG_DIR", "/elsewhere/.claude")]);
     assert_eq!(
-        super::claude_starter_in(custom.clone(), &seat, 3),
+        super::claude_starter_in(custom.clone(), &seat, UNREAD, 3),
         custom,
         "a home of its own is left alone"
     );
@@ -1854,19 +1854,19 @@ fn a_claude_worker_of_a_walled_tab_starts_on_the_row_a_wall_moves_to() {
         })
         .expect("main low");
     assert_eq!(
-        super::claude_starter_in(plain.clone(), &seat, 5).env,
+        super::claude_starter_in(plain.clone(), &seat, UNREAD, 5).env,
         vec![(var.to_string(), work.display().to_string())],
         "\"early\" leaves a low row ahead of its wall"
     );
     crate::test_scratch::write_config(&cfg.join("aterm.toml"), "[harness]\naccounts = \"wall\"\n");
     assert_eq!(
-        super::claude_starter_in(plain.clone(), &seat, 6),
+        super::claude_starter_in(plain.clone(), &seat, UNREAD, 6),
         plain,
         "under \"wall\" a row that still runs keeps its worker"
     );
     crate::test_scratch::write_config(&cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n");
     assert_eq!(
-        super::claude_starter_in(plain.clone(), &seat, 4),
+        super::claude_starter_in(plain.clone(), &seat, UNREAD, 4),
         plain,
         "`[harness] accounts = \"off\"` keeps it"
     );
@@ -1908,7 +1908,7 @@ fn a_claim_workers_wall_is_the_wall_of_the_row_it_would_start_on() {
         unset: Vec::new(),
     };
     assert_eq!(
-        super::claude_worker_wall(&plain, &seat),
+        super::claude_worker_wall(&plain, &seat, UNREAD),
         None,
         "CONTROL: a fresh login runs"
     );
@@ -1928,7 +1928,7 @@ fn a_claim_workers_wall_is_the_wall_of_the_row_it_would_start_on() {
         })
         .expect("wall main");
     assert_eq!(
-        super::claude_worker_wall(&plain, &seat),
+        super::claude_worker_wall(&plain, &seat, UNREAD),
         Some(until + accounts::RESET_GRACE_S),
         "the one login is walled, to its reset and the grace after it"
     );
@@ -1946,13 +1946,13 @@ fn a_claim_workers_wall_is_the_wall_of_the_row_it_would_start_on() {
     )
     .expect("roster with work");
     assert_eq!(
-        super::claude_worker_wall(&plain, &seat),
+        super::claude_worker_wall(&plain, &seat, UNREAD),
         None,
         "CONTROL: the launch moves the worker to `work`, which runs"
     );
     crate::test_scratch::write_config(&cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n");
     assert_eq!(
-        super::claude_worker_wall(&plain, &seat),
+        super::claude_worker_wall(&plain, &seat, UNREAD),
         Some(until + accounts::RESET_GRACE_S),
         "a launch that moves no worker starts it on the wall"
     );
@@ -2462,6 +2462,10 @@ struct CodexPool {
     home: PathBuf,
     work_auth: String,
 }
+
+/// A worker's model nobody read: the launch rules' rank as before FL-264.
+const UNREAD: aterm_agent::harness::accounts::ModelWeek =
+    aterm_agent::harness::accounts::ModelWeek::Unread;
 
 const POOL_NOW: i64 = 1_792_700_000;
 

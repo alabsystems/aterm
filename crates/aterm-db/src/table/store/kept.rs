@@ -68,6 +68,12 @@ pub(crate) struct Recorded {
     pub(super) classes: Classes,
     /// An observer's read of its journal, where a witness stands for it.
     pub(super) journal: Option<journals::Held>,
+    /// Set by an open that records for a sighting of the store alone (`super::sighting`), which
+    /// must verify what an open that records nothing verifies: each verdict is asked beside the
+    /// replay's read batch, leaving its keys as they were
+    /// (`crate::table::ReadBatch::class_verdict_aside`), and the journal's read is not held, so
+    /// the store takes its wires as any observing open does.
+    pub(super) aside: bool,
 }
 
 /// Of each run of reopens of a kept store, the one after this many opens the store afresh, as an
@@ -368,6 +374,9 @@ impl Kept {
         store.claim = claim;
         store.claim_dir = claim_dir;
         store.claim_name = claim_name;
+        // The reopen reads the floor and the journal's prefix no further: no revision is read of
+        // the files the open read.
+        store.files = None;
         store.witness = witness;
         store.log = log;
         store.observation = session.access_observation();

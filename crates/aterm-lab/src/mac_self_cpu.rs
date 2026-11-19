@@ -134,7 +134,7 @@ fn checked_output(stdout: &[u8], success: bool) -> Result<Bound, String> {
     Ok(bound)
 }
 
-fn qualify(vm: &Vm, ask: &Ask, fixture: &Value) -> Res {
+fn qualify(vm: &Vm, ask: &Ask, fixture: &Value) -> Result<(i32, Value), Fail> {
     let sha = fixture["sha256"]
         .as_str()
         .ok_or_else(|| Fail::die("fixture has no hash"))?;
@@ -185,26 +185,50 @@ fn qualify(vm: &Vm, ask: &Ask, fixture: &Value) -> Res {
     }
     let checked = checked_output(&out.stdout, out.status.success());
     let passed = checked.is_ok();
-    json_file(
-        &ask.record,
-        "result.json",
-        &json!({"complete":true,"exit":out.status.code(),
-        "qualification":passed,"checked_bound":checked.as_ref().ok(),"failure":checked.as_ref().err(),
-        "fixture_sha256":sha,"guest_only_workload":true,"shipping_certified":false,
-        "comparison":"published_worker_vs_saved_exit_accounting"}),
-    )?;
-    println!(
-        "mac self-cpu: {}; evidence={}",
-        if passed { "PASS" } else { "NOT QUALIFIED" },
-        ask.record.display()
-    );
-    Ok(if passed {
+    let code = if passed {
         0
     } else if out.status.code() == Some(mac::NOT_RUN) {
         mac::NOT_RUN
     } else {
         1
-    })
+    };
+    Ok((
+        code,
+        json!({"complete":true,"exit":out.status.code(),
+        "qualification":passed,"checked_bound":checked.as_ref().ok(),"failure":checked.as_ref().err(),
+        "fixture_sha256":sha,"guest_only_workload":true,"shipping_certified":false,
+        "comparison":"published_worker_vs_saved_exit_accounting"}),
+    ))
+}
+
+fn finish_qualification(
+    record: &Path,
+    work: Result<(i32, Value), Fail>,
+    cleanup: impl FnOnce() -> Result<(), Fail>,
+) -> Res {
+    let observed_red = work.as_ref().is_ok_and(|(code, _)| *code == 1);
+    let work = work.and_then(|(code, report)| {
+        json_file(
+            record,
+            "fixture-observation.json",
+            &json!({"complete":false,"scope":"guest fixture before checked VM retirement",
+                "vm_retirement_confirmed":false,"guest_result":&report}),
+        )?;
+        Ok((code, report))
+    });
+    let (code, report) = mac::after_vm_cleanup(work, cleanup).map_err(|mut error| {
+        if observed_red {
+            error.code = 1;
+        }
+        error
+    })?;
+    json_file(record, "result.json", &report)?;
+    println!(
+        "mac self-cpu: {}; evidence={}",
+        if code == 0 { "PASS" } else { "NOT QUALIFIED" },
+        record.display()
+    );
+    Ok(code)
 }
 
 pub(crate) fn cmd(args: &[String]) -> Res {
@@ -222,11 +246,14 @@ pub(crate) fn cmd(args: &[String]) -> Res {
     aterm_uds::private_file::check_private_dir(&ask.record).map_err(fail)?;
     let run = || -> Res {
         let fixture = build_fixture(&ask.record)?;
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("mac-self-cpu-")
-            .suffix(".noindex")
-            .tempdir()
-            .map_err(fail)?;
+        let mut scratch = mac::VmScratch::new(
+            aterm_tempfile::Builder::new()
+                .prefix("mac-self-cpu-")
+                .suffix(".noindex")
+                .tempdir()
+                .map_err(fail)?,
+            &ask.record,
+        )?;
         let share = scratch.path().join("share");
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -248,7 +275,8 @@ pub(crate) fn cmd(args: &[String]) -> Res {
             cpus: CPUS,
         };
         let mut admitted = crate::vm_admit::admit(&need, true)?;
-        let base = mac::prepared_base_with(
+        let reservation = mac::retain_admission(&mut admitted)?;
+        let base = mac::prepared_base_with_admission(
             &tart,
             &ask.image,
             &mac::Prep {
@@ -257,37 +285,39 @@ pub(crate) fn cmd(args: &[String]) -> Res {
             },
             &ask.record,
             &share,
+            &reservation,
             &mut || Ok(()),
         )?;
-        let mut vm = Vm::clone_from(&tart, &base, &ask.record, &share, false)?;
+        let mut vm =
+            Vm::clone_from_recorded(&tart, &base, &ask.record, &share, false, &ask.record)?;
         vm.shape = Some(SHAPE);
         vm.graphics = false;
-        mac::boot_sip_on(&mut vm, &base)?;
-        if let Some(pid) = vm.pid() {
-            admitted.credit("mac-self-cpu", &[pid]);
-        }
-        let config = aterm_uds::deadline::output_with_input_until(
-            aterm_uds::spawnfd::command(&tart).args(["get", &vm.name, "--format", "json"]),
-            aterm_uds::secret::Secret::new(&[]),
-            std::time::Instant::now() + mac::STEP,
-            aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
-        )
-        .map_err(fail)?;
-        save(&ask.record, "vm-config.json", &config.stdout)?;
-        save(&ask.record, "vm-config.stderr", &config.stderr)?;
-        if !config.status.success() {
-            return Err(Fail::die("guest configuration could not be recorded"));
-        }
-        json_file(
-            &ask.record,
-            "vm.json",
-            &json!({"name":vm.name,"prepared_base":base,
-            "resource_claim_held_through_teardown":true,"tart_log":"tart-run.log"}),
-        )?;
-        let result = qualify(&vm, &ask, &input);
-        drop(vm);
-        drop(admitted);
-        result
+        let work = (|| -> Result<(i32, Value), Fail> {
+            vm.hold_reserved_admission(&reservation)?;
+            mac::boot_sip_on(&mut vm, &base)?;
+            let config = aterm_uds::deadline::output_with_input_until(
+                aterm_uds::spawnfd::command(&tart).args(["get", &vm.name, "--format", "json"]),
+                aterm_uds::secret::Secret::new(&[]),
+                std::time::Instant::now() + mac::STEP,
+                aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+            )
+            .map_err(fail)?;
+            save(&ask.record, "vm-config.json", &config.stdout)?;
+            save(&ask.record, "vm-config.stderr", &config.stderr)?;
+            if !config.status.success() {
+                return Err(Fail::die("guest configuration could not be recorded"));
+            }
+            json_file(
+                &ask.record,
+                "vm.json",
+                &json!({"name":vm.name,"prepared_base":base,
+                "resource_claim_held_through_teardown":true,"tart_log":"tart-run.log"}),
+            )?;
+            qualify(&vm, &ask, &input)
+        })();
+        let result = finish_qualification(&ask.record, work, || vm.finish().map(|_| ()))?;
+        scratch.discard_after_finish();
+        Ok(result)
     };
     let result = run();
     if let Err(why) = &result {

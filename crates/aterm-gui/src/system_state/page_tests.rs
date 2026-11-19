@@ -820,7 +820,15 @@ fn an_off_line_reads_left_as_is_quietly_and_opens_to_nothing() {
             (drawn.mark, drawn.phrase.as_str(), drawn.quiet),
             (Mark::Off, phrase, true)
         );
-        assert!(!drawn.on && drawn.rows.is_empty() && !drawn.expandable());
+        assert!(!drawn.on);
+        // An Off line shows none of the rows its switch governs: Mac settings keeps only
+        // Spotlight indexing, which no switch governs (FL-188).
+        let rows: Vec<Subject> = drawn.rows.iter().map(|row| row.subject).collect();
+        if line == Line::Mac {
+            assert_eq!(rows, [Subject::Access(Access::SpotlightScope)]);
+        } else {
+            assert!(rows.is_empty() && !drawn.expandable());
+        }
     }
     // Its switch still says where it stands and turns it on.
     let compiled = compile_in(&app, &SystemStateViewState::default(), 900.0, 644.0);
@@ -831,9 +839,9 @@ fn an_off_line_reads_left_as_is_quietly_and_opens_to_nothing() {
     );
     assert!(
         compiled
-            .semantic(&UiKey::new("system-state/line/mac/disclose"))
+            .semantic(&UiKey::new("system-state/line/accounts/disclose"))
             .is_none(),
-        "an Off line has nothing to open"
+        "an Off line with no row has nothing to open"
     );
     let mut view = SystemStateViewState::default();
     app.act(
@@ -2205,7 +2213,7 @@ fn a_check_keeps_the_last_card_seated_without_keeping_its_authority() {
         .find(|row| row.subject == spotlight)
         .unwrap();
     row.standing = Standing::NeedsYou;
-    row.now = Some("Folders still indexed".into());
+    row.now = Some(aterm_types::macos_setup::SPOTLIGHT_OWED.into());
     row.note = Some("Your Mac password excludes the new home folders from Spotlight.".into());
     let mut app = reading(&status);
     let mut view = SystemStateViewState::default();
@@ -2815,4 +2823,207 @@ fn an_observed_failure_keeps_its_card_until_the_new_read_supplies_a_current_resu
                 .as_deref()
                 .is_some_and(|note| note.contains("failed differently"))
     }));
+}
+
+/// The `set-up` reading with Spotlight indexing read as `standing`, `now`, `note` (FL-188).
+fn with_spotlight(name: &str, standing: Standing, now: &str, note: Option<&str>) -> SetupStatus {
+    let mut status = status_of(name);
+    let row = status
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == Subject::Access(Access::SpotlightScope))
+        .expect("every fixture reads the scope");
+    row.standing = standing;
+    row.now = Some(now.to_owned());
+    row.note = note.map(str::to_owned);
+    status
+}
+
+/// THE MAC LINE ENDS WITH SPOTLIGHT INDEXING READ FROM THE SCOPE (FL-188): each state FL-127's
+/// scope reads in (applied, owed, a person's removal, off, newcomers) is the Mac settings line's
+/// last row, in its words and mark, and on no other line: applied is the scope's words with the
+/// check; owed is Needs your password → the scope, its card item, and the line saying it needs
+/// the person; a folder taken back reads Kept as you set it, changed since aterm set it, and the
+/// line says so; off is left as found. Newcomers read in place: no card, no attention, the
+/// headline and hero as with the scope applied. The page
+/// lays the row under its own key with its words, and an Off Mac line shows it alone and says
+/// Needs you over an owed scope rather than Left as is.
+/// CONTROL: the Mac line as main reads it, which has no such row: main puts the scope on
+/// Permissions (`Line::of`), so the Mac line's last row is the Dock.
+#[test]
+fn the_mac_line_ends_with_spotlight_indexing_read_from_the_scope() {
+    use aterm_types::macos_setup::{
+        SPOTLIGHT_KEPT_AS_SET, SPOTLIGHT_OFF, SPOTLIGHT_OWED, SPOTLIGHT_SCOPED, spotlight_newcomers,
+    };
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let spotlight = Subject::Access(Access::SpotlightScope);
+    let owed_note = "Your Mac password is required to exclude: trust.";
+    let last = |app: &SystemStateApp| {
+        let mac = line_of(app, Line::Mac);
+        let row = mac
+            .rows
+            .last()
+            .expect("CONTROL: the Mac line as main reads it, which has no such row")
+            .clone();
+        assert_eq!(
+            row.subject, spotlight,
+            "CONTROL: the Mac line as main reads it, which has no such row"
+        );
+        assert!(
+            !line_of(app, Line::Permissions)
+                .rows
+                .iter()
+                .any(|row| row.subject == spotlight),
+            "Permissions no longer holds the scope"
+        );
+        (mac, row)
+    };
+    let mark = |row: &RowView| page::row_mark(row);
+
+    // Applied: the scope's words, with the check.
+    let mut app = reading(&with_spotlight(
+        "set-up",
+        Standing::InPlace,
+        SPOTLIGHT_SCOPED,
+        None,
+    ));
+    let (_, row) = last(&app);
+    assert_eq!(row.value, RowValue::One(SPOTLIGHT_SCOPED.into()));
+    assert_eq!(mark(&row), Mark::Done);
+    let view = open(&mut app, Line::Mac);
+    let compiled = compile_in(&app, &view, 900.0, 4000.0);
+    let info = semantic(&compiled, "system-state/row/spotlight-indexing/info");
+    assert!(
+        info.label.contains("Spotlight indexing") && info.label.contains(SPOTLIGHT_SCOPED),
+        "{}",
+        info.label
+    );
+
+    // Owed: Needs your password → the scope, held by the card, named by the line, whose Finish
+    // setup… goes by the row's own slug.
+    let mut app = reading(&with_spotlight(
+        "set-up",
+        Standing::NeedsYou,
+        SPOTLIGHT_OWED,
+        Some(owed_note),
+    ));
+    let (mac, row) = last(&app);
+    assert_eq!(
+        row.value,
+        RowValue::Change {
+            now: SPOTLIGHT_OWED.into(),
+            wanted: SPOTLIGHT_SCOPED.into()
+        }
+    );
+    assert_eq!(mark(&row), Mark::NeedsYou);
+    assert!(
+        drawn(&app)
+            .1
+            .iter()
+            .any(|item| item.subject == Some(spotlight))
+    );
+    assert_eq!(mac.phrase, "Needs you: Spotlight indexing");
+    let mut view = SystemStateViewState::default();
+    app.act(&mut view, "system-state/row/spotlight-indexing/open", None);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::OpenAccess {
+            access: Access::SpotlightScope,
+            ..
+        })
+    ));
+
+    // A person took a folder back: theirs, changed since aterm set it, no check.
+    let mut status = with_spotlight("set-up", Standing::InPlace, SPOTLIGHT_SCOPED, None);
+    status.spotlight_taken_back = vec!["$HOME/trust".into()];
+    let app = reading(&status);
+    let (mac, row) = last(&app);
+    assert_eq!(row.value, RowValue::One(SPOTLIGHT_KEPT_AS_SET.into()));
+    assert!(row.changed_since);
+    assert_eq!(mark(&row), Mark::Off);
+    assert!(
+        row.note
+            .as_deref()
+            .is_some_and(|note| note.contains("$HOME/trust"))
+    );
+    assert_eq!(
+        mac.phrase,
+        format!("Spotlight indexing {}", super::CHANGED_SINCE_WORDS)
+    );
+
+    // Off, whoever turned it off: left as found.
+    let app = reading(&with_spotlight(
+        "set-up",
+        Standing::InPlace,
+        SPOTLIGHT_OFF,
+        None,
+    ));
+    let (_, row) = last(&app);
+    assert_eq!(row.chip, Some(Chip::LeftAsIs));
+    assert_eq!(mark(&row), Mark::Off);
+    assert!(row.label.contains("left as found"), "{}", row.label);
+
+    // Newcomers read in place (FL-127: a folder made since is a person's request, not a Mac left
+    // unfinished): no card, no attention, and the headline and hero read as with the scope applied.
+    let applied = reading(&with_spotlight(
+        "set-up",
+        Standing::InPlace,
+        SPOTLIGHT_SCOPED,
+        None,
+    ));
+    let app = reading(&with_spotlight(
+        "set-up",
+        Standing::InPlace,
+        &spotlight_newcomers(2),
+        Some("Made since setup scoped Spotlight: a, b."),
+    ));
+    let (_, row) = last(&app);
+    assert_eq!(row.value, RowValue::One(spotlight_newcomers(2)));
+    assert_eq!(mark(&row), Mark::Done);
+    let (_, card, hero) = drawn(&app);
+    assert!(!card.iter().any(|item| item.subject == Some(spotlight)));
+    assert!(!app.needs_attention());
+    let (_, _, calm) = drawn(&applied);
+    assert_eq!(app.headline().text, applied.headline().text);
+    assert_eq!(
+        (
+            hero.headline.as_str(),
+            hero.sub.as_str(),
+            hero.done,
+            hero.total
+        ),
+        (
+            calm.headline.as_str(),
+            calm.sub.as_str(),
+            calm.done,
+            calm.total
+        ),
+        "a newcomer leaves the hero as the applied scope does"
+    );
+
+    // An Off Mac line shows the row alone, and never reads calm over an owed scope.
+    let app = reading(&with_spotlight(
+        "non-alab",
+        Standing::InPlace,
+        SPOTLIGHT_SCOPED,
+        None,
+    ));
+    let mac = line_of(&app, Line::Mac);
+    assert!(!mac.on);
+    assert_eq!(
+        mac.rows.iter().map(|row| row.subject).collect::<Vec<_>>(),
+        [spotlight]
+    );
+    assert_eq!(mac.phrase, lines::LEFT_AS_IS);
+    let app = reading(&with_spotlight(
+        "non-alab",
+        Standing::NeedsYou,
+        SPOTLIGHT_OWED,
+        Some(owed_note),
+    ));
+    let mac = line_of(&app, Line::Mac);
+    assert_eq!(
+        (mac.mark, mac.phrase.as_str()),
+        (Mark::NeedsYou, "Needs you: Spotlight indexing")
+    );
 }

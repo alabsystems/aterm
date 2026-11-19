@@ -106,7 +106,9 @@ USAGE
   targo --unverified ship release status [--json | --fleet]
       Read this clone's current or latest release, unfinished verification stages,
       first reported failure, log paths and validation timing without starting,
-      resuming or building it. Older logs leave stage activity unobserved.
+      resuming or building it. Older logs leave stage activity unobserved. Where a
+      pump keeps its memory here: what it does or waits for and since when, its pid
+      and whether that process still runs, its last run and the red line it holds.
 
   targo --unverified ship accept-measure-failure REPORT REASON
       Only on the owner's explicit instruction to ship the known measurement defect:
@@ -143,50 +145,84 @@ USAGE
   targo --unverified ship release --pump [--adopt] [--once] [--dry-run]
                  [--mac-only | --linux-artifacts …]
                  [--release-credentials <profile.toml>] [--engine DIRECTORY] [--verbose]
-      Keep this clone releasing: a loop over the verbs above and below. Each cycle
-      reads origin/main, this clone's release journal and its repair record, then
-      runs one verb or waits. A failing source gate or build opens an independent
-      repair worker that persists after the cutter exits; the unattended pump waits
-      for its FIX/NO-FIX report. This applies inside or outside an aterm session:
-        main declares a cut version whose fixtures its tip holds  → --open-next
+      Keep this clone releasing with no session: a loop over the verbs above and
+      below. Each cycle reads origin/main, this clone's release journal and the
+      pump's memory, then runs one verb or waits. Every verb runs with
+      ATERM_RELEASE_PUMP removed, whatever the pump inherited: a failing source gate
+      or build is caller-owned repair, its briefing in the pump's log, and opens no
+      session or worker. The pump re-bases that red line once where it is due,
+      else holds it until a session moves it:
+        main declares a cut version whose fixtures its tip holds,
+        and PUMP_OPEN_EVERY_DEFAULT seconds in main's
+        publish/config.sh have passed since the commit that
+        opened it                                                  → --open-next
         an open version with no fleet line                         → --prepare --commit
                                                                      <the commit that opened it>
         a fleet line and no journal here                           → waits, naming its holder;
                                                                      with --adopt: waits while
                                                                      its lease is live and its
-                                                                     holder not proven dead,
-                                                                     then --prepare (adopts it)
+                                                                     holder not proven dead, and
+                                                                     while a live pump on that
+                                                                     Mac holds its journal, then
+                                                                     --prepare (adopts it)
         this clone's unfinished line                               → --prepare (resume)
-        a journal here of a version another clone cut              → waits: a session runs
-                                                                     --forget
-        a red whose repair worker ended `FIX <commit>` the line
-        admits                                                     → --prepare --fix <commit>
-        a red whose worker is on it, ended without a fix, or
-        named a commit the line refuses                            → waits, naming the newest
-                                                                     judged pass past the head
-                                                                     as a supersede candidate
+        a journal here of a version another clone cut              → waits, opening nothing: a
+                                                                     session runs --forget (a
+                                                                     proposal with nothing done
+                                                                     on it is dropped instead)
+        another process holds this line live and a fix or a
+        re-base is due                                             → waits, naming the holder
+        this line must re-qualify anyway (a red of its head
+        since its last prepare, or a repair fix accepted), it
+        has not re-based, the fleet line is at its head, and the
+        newest judged pass past its head declares its version,
+        holds the fix and carries newer commits in the app's
+        cone that no hop carries                                   → --prepare --commit <that
+                                                                     pass> --supersede, once
+                                                                     (typed reason requalify)
+        a red of this line's head, no re-base due                  → waits: a session carries a
+                                                                     fix (--fix), supersedes or
+                                                                     forgets the line
+        a red of the version's start, with no line here            → waits: a session starts it
+        a worker an older pump kept in repairs.toml ended
+        `FIX <commit>` the line admits, no re-base due             → --prepare --fix <commit>
         PREPARED, and publish/config.sh on main says
         PUMP_PUBLISH_DEFAULT=\"1\"                                  → the bare run (publish,
                                                                      cut, after-cut, check)
         PREPARED without it                                        → waits: a session publishes
-        a refusal no worker is on                                  → waits until the journal
-                                                                     or main changes
+        a refusal that is no red                                   → waits until the journal
+                                                                     or main changes, then
+                                                                     backs off to six hours
         exit 3 (could not run)                                     → the same verb, with backoff
         exit 4 (another live holder)                               → runs nothing while the
                                                                      line's record says it is
                                                                      held; no second line
       A run that completes no row for max(30 min, twice its step's p95) while its
-      processes do nothing for as long is STALLED: it is said, and a --prepare is
-      interrupted and resumed (a publish is only said).
-      It never runs --forget, --bump, --supersede or --abandon. A line it starts
+      processes do nothing for as long is STALLED, as is one that records no row
+      while they do nothing for 30 min from its start (--open-next, a run before
+      its claim), and one that completes no row for the fleet claim's ceiling (4 h)
+      whatever its processes do: it is said, every run but a publish is
+      interrupted and resumed (a publish is only said), and the pump stops
+      vouching for it. It never runs --forget, --bump or --abandon, and
+      --supersede only as a line's one re-base: main's supersession record spends
+      it, so every later red goes back to hops. Each cycle it writes its line,
+      holder, step, whether it holds the line's journal and its decision for the
+      survey's pump= fact, in the harness state folder's
+      release-pumps/<clone hash>.json, one per clone. A line it starts
       or adopts, and one it resumes whose journal holds none, takes the Linux
       declaration given here, else PUMP_LINUX_DEFAULT in main's
       publish/config.sh. --once runs one cycle; --dry-run prints the decision and
-      runs nothing. One pump per clone; its memory is .git/aterm-release/pump.toml.
+      runs nothing. One pump per clone; its memory is .git/aterm-release/pump.toml,
+      which `ship release status` reads.
         --adopt            also take over a fleet line this clone holds no journal
                            of, through the release's own selection, once its
-                           holder is dead or stalled; without it such a line is
-                           left to its holder
+                           holder is dead or stalled and no live pump on its
+                           Mac holds it (a pump that cannot be read is waited
+                           on until the lease ends); without it such a line is
+                           left to its holder. A standby leaves --open-next and
+                           a start to the primary: it runs one only once it has
+                           wanted it for 10 minutes. Give it to one standby cut
+                           host
         --install          keep it up on this Mac: copy this executable to an
                            immutable folder and load a per-user launchd agent
                            (systems.alab.aterm-release-pump, KeepAlive, ProcessType
@@ -215,11 +251,9 @@ USAGE
       release input, `verify release`, qualify's build, tree or export; never a COULD
       NOT RUN or a dry run) returns a repair briefing with the log and cut's inputs
       to the caller. Handle it through native subagents or directly, using your own
-      shell tools for commands. It opens no worker and prints no spawn recipe.
-      Only --pump opens a persistent Claude Code repair worker under Land, once per
-      failing input hash (the version, R and the prover), its sid kept in
-      .git/aterm-release/repairs.toml. A repair never waives a gate or changes the
-      run's refusal exit.
+      shell tools for commands. It opens no worker and prints no spawn recipe. The
+      pump's runs are caller-owned too: it holds the red line for a session. A
+      repair never waives a gate or changes the run's refusal exit.
       Exit 0 released, prepared, qualified, or a dry run with nothing refused · 1 refused ·
       2 usage, or no checkout, HOME or log directory to run in · 3 a resumable
       stop (run it again) · 130 interrupted.
@@ -302,8 +336,12 @@ USAGE
   targo --unverified ship linux-build --version X.Y.Z --build-number N
                  --commit FULL-CLAIM-SHA --out EXISTING-PRIVATE-DIRECTORY
       On native x86_64 or aarch64 Linux, in a clean checkout at the claim commit:
-      build aterm (and, when it can, its static bootstrap verifier) with the
-      sealed Trust toolchain and write each with its provenance receipt into
+      put the stock release that commit's trust.lock names in place (refusing,
+      naming `verify provision rustup`, where it cannot), then build aterm with
+      the sealed Trust toolchain and its static bootstrap verifier on that stock
+      release (left out only where `cc -print-file-name=libc.a` finds no static
+      C library, and then recorded in --out as a .left-out.toml; any other
+      failure of it refuses) and write each with its provenance receipt into
       --out. Nothing is signed or published. Run it on both architectures and
       hand the directory to the cutter (--linux-artifacts), or let the cutter
       drive the hosts (--linux-worker).
@@ -513,7 +551,9 @@ USAGE
                            non-default feature that turns on a vendored fork),
                            every workspace library and vendored fork
                            (--whole-tree), or what this tree's stored facts
-                           left undecided (--remeasure). Each check runs in its
+                           left undecided, interrupted or over budget (--remeasure).
+                           Remeasurement saves the combined whole-tree facts before
+                           updating floors. Each check runs in its
                            own slot (--jobs; default one per 6 cores) under
                            --target-root (default
                            <repo>/target-trust.noindex, else a per-user cache
@@ -588,9 +628,12 @@ USAGE
                            never RATCHET-REGRESSION, unless the run names an
                            obligation it lost. Every run also prints
                            the D27 gate's proved (calculus) counter from each
-                           check's trust.obligations.v1 record (0, and
-                           `ungraded`, from a prover that states no grade), held
-                           to the current epoch's floor in
+                           check's trust.obligations.v1 record. A retry retains
+                           the grades from checks it skips. A version 17 receipt
+                           needs one new check of each library missing its grades.
+                           The counter reports zero and
+                           `ungraded` when the prover states no grade. The current
+                           epoch's floor is in
                            crates/aterm-release/trust/credit.tsv. Exit 0 pass, 1 fail,
                            2 undecided or could not run, 4 narrowed by memory
   targo --unverified ship trust reduce --report PATH --package NAME --repo PATH --out PATH
@@ -605,7 +648,8 @@ USAGE
                            the lane's full report for the facts a whole-tree run
                            filed for REV (default HEAD) with the prover (--prover
                            names its bin/; default the cutter's Trust toolchain),
-                           judged against the working tree's floors.
+                           judged against the working tree's floors. Each library's
+                           floor is compared with the commit that last measured it.
                            --update-ratchet writes what the facts meet (a first
                            floor, a raise, a corrected total, a re-base onto this
                            prover), never a lowering; with --reason WHY it lowers
@@ -617,19 +661,20 @@ USAGE
                            LOWERED, and fails. Exit 0 pass, 1 fail or no facts,
                            2 undecided or could not judge, 4 narrowed by memory
   targo --unverified ship trust credit <record.ndjson>...
-                           the proved (calculus) counter over those  
+                           the proved (calculus) counter over the supplied
                            trust.obligations.v1 records (<target-dir>/trust/
-                           obligations/<package>.ndjson), against the current
-                           credit epoch. Exit 0 holds, 1 below the epoch's floor
-                           or a record refused, 2 no readable credit epoch
+                           obligations/<package>.ndjson). Multiple paths to one
+                           file count once. Exit 0 holds the current epoch's
+                           floor, 1 below the floor or a record refused,
+                           2 no readable credit epoch
   targo --unverified ship trust log <crate|name@version> [--target-root DIR]
                            prints the log the lane kept of that library's check
                            (logs/<name@version>.log.zst under the target root a
                            run with that --target-root uses), decompressed; a
                            running check's log as far as it is stored. Past its
                            cap a stored log holds only the lines the judge reads
-                           and the output's last 256 KiB, and ends saying how
-                           much it left out. Exit 0 printed, 1 no log, 2 logs of
+                           and whole lines from the output's last 256 KiB. It
+                           reports how much it left out. Exit 0 printed, 1 no log, 2 logs of
                            more than one version (name one), or a logs folder
                            or log that could not be read
   targo --unverified ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped

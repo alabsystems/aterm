@@ -1309,6 +1309,163 @@ fn a_session_publication_is_queued_off_the_caller_and_kept_in_order() {
     );
 }
 
+/// A window records the graph folders it publishes in (its own and the rendezvous mirror's) in
+/// every records folder its roots resolve: beside its aterm state root's drive journals, beside
+/// the agent records of that root's default harness state and beside those of the harness state
+/// it is told (`graph_records::folders_of`), before the first entry it writes, a bind-time one
+/// written directly (`publish_discovery`'s root identity and carried tabs, before any queued
+/// publish) included. It keeps those very records through later publishes to the same folders,
+/// writes one again at the next publish or keep pass once it is gone, moves each standing one's
+/// modification time to the keep pass's (a record a week unwritten is written within the pass,
+/// so no reader that cannot judge this process's pid abandons it while it runs), and removes them
+/// all behind its retirements at quit, after which neither writes any again.
+/// NEGATIVE CONTROLS: before the first entry no record stands; a record written only beside the
+/// aterm state root leaves the harness state's folder empty; a record written only by the queued
+/// publish is missing after the bind-time write; a cache trusted without a look leaves a removed
+/// record gone; a record rewritten at every publish or keep pass changes its inode; a keep pass
+/// that leaves standing records as they are leaves them a week old.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn a_window_records_its_graph_folders_until_it_quits() {
+    use aterm_agent::harness::graph_records;
+    use std::os::unix::fs::MetadataExt as _;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            clear_self_sock();
+            let _ = flush_publications(aterm_spec::wait::MUST_HAPPEN);
+            set_mirror_dir_override(None);
+            set_record_roots_override(None);
+        }
+    }
+    let _guard = self_sock_test_guard();
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let (dir, mirror, state, harness) = (
+        scratch.path().join("own"),
+        scratch.path().join("mirror"),
+        scratch.path().join("state"),
+        scratch.path().join("harness"),
+    );
+    for d in [&dir, &mirror] {
+        std::fs::create_dir_all(d).expect("scratch dir");
+    }
+    set_mirror_dir_override(Some(mirror.clone()));
+    set_record_roots_override(Some((state.clone(), harness.clone())));
+    let _reset = Reset;
+    let sock = dir.join("aterm-88004.sock").to_string_lossy().into_owned();
+    let folders = [
+        graph_records::drive_folder(&state),
+        graph_records::agent_folder(&aterm_agent::harness::cli::harness_state_in(&state)),
+        graph_records::agent_folder(&harness),
+    ];
+    assert_eq!(
+        graph_records::folders_of(Some(&state), Some(&harness)),
+        folders
+    );
+    let listed = || -> Vec<PathBuf> {
+        let mut all = Vec::new();
+        for folder in &folders {
+            match std::fs::read_dir(folder) {
+                Ok(entries) => all.extend(entries.map(|entry| entry.expect("entry").path())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("records: {e}"),
+            }
+        }
+        all
+    };
+    assert!(listed().is_empty(), "a record before any publish");
+    let root_sid = SessionId::generate();
+    publish_graph_entry(&dir, &root_sid, &sock, &LaunchNonce::generate());
+    let records = listed();
+    assert_eq!(
+        records.iter().map(|path| path.parent()).collect::<Vec<_>>(),
+        folders
+            .iter()
+            .map(|folder| Some(folder.as_path()))
+            .collect::<Vec<_>>(),
+        "the bind-time write left one record in each folder"
+    );
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the wall clock")
+        .as_secs();
+    for folder in &folders {
+        let graphs = graph_records::live(folder, wall).expect("the record reads whole");
+        assert_eq!(graphs, [dir.join("graph"), mirror.join("graph")]);
+    }
+    let inode = |path: &Path| std::fs::metadata(path).expect("the record").ino();
+    let written: Vec<u64> = records.iter().map(|path| inode(path)).collect();
+    set_self_sock(&dir, &sock);
+    let tab = SessionId::generate();
+    publish_session(&tab, &LaunchNonce::generate());
+    assert!(
+        flush_publications(aterm_spec::wait::MUST_HAPPEN),
+        "the write lands"
+    );
+    assert_eq!(listed(), records);
+    assert_eq!(
+        records.iter().map(|path| inode(path)).collect::<Vec<_>>(),
+        written,
+        "a standing record was written again"
+    );
+    let shared = records.last().expect("the harness state's record");
+    std::fs::remove_file(shared).expect("remove the record");
+    publish_session(&tab, &LaunchNonce::generate());
+    assert!(
+        flush_publications(aterm_spec::wait::MUST_HAPPEN),
+        "the write lands"
+    );
+    assert!(
+        shared.is_file(),
+        "the next publish left a removed record gone"
+    );
+    std::fs::remove_file(shared).expect("remove the record");
+    keep_graph_record();
+    assert!(shared.is_file(), "the keep pass left a removed record gone");
+    assert_eq!(listed(), records);
+    let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let modified = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .expect("the record's time")
+    };
+    let standing: Vec<u64> = records.iter().map(|path| inode(path)).collect();
+    for path in &records {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(old))
+            .expect("age the record");
+    }
+    keep_graph_record();
+    for path in &records {
+        assert!(
+            modified(path) >= old + week,
+            "the keep pass left a standing record a week old"
+        );
+    }
+    assert_eq!(
+        records.iter().map(|path| inode(path)).collect::<Vec<_>>(),
+        standing,
+        "the keep pass wrote a standing record again"
+    );
+    retire_own_sessions(&dir, &sock, [root_sid, tab]);
+    assert!(
+        flush_publications(aterm_spec::wait::MUST_HAPPEN),
+        "the retirements land"
+    );
+    assert!(listed().is_empty(), "a record outlived the quit");
+    keep_graph_record();
+    publish_graph_entry(
+        &dir,
+        &SessionId::generate(),
+        &sock,
+        &LaunchNonce::generate(),
+    );
+    assert!(listed().is_empty(), "a record written after the quit");
+}
+
 /// A sibling's token file is read the way every control client reads its
 /// own: one planted as a symlink is refused rather than followed, and one
 /// larger than any token is refused rather than read whole.

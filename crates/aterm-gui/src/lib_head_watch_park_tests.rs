@@ -428,7 +428,7 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
     assert_eq!(state["phase"], 1);
     assert_eq!(modeled_index_owner(&watch), 1);
     let park = aterm_spec::wait::MUST_HAPPEN;
-    set_park_slice_for_this_thread(park);
+    set_blind_look_for_this_thread(park);
     let end = sleep_interval_watching_bump(
         Some(&layout),
         &mut (SystemTime::now() + park),
@@ -494,7 +494,7 @@ fn a_suppressed_window_index_probe_uses_the_shared_expiry() {
     }
     let mut watch = BumpWatch::default();
     start_index_probe(&layout, &mut watch, true, Instant::now(), |_| {
-        atpkg::index_probe::Probe::Suppressed(PARK_SLICE)
+        atpkg::index_probe::Probe::Suppressed(atpkg::vendor_direct::watch::BLIND_LOOK)
     });
     wait_for_what_must_happen("the suppressed worker completed", || {
         index_probe_answer_ready(&watch)
@@ -502,7 +502,7 @@ fn a_suppressed_window_index_probe_uses_the_shared_expiry() {
     assert_eq!(take_ready_index_probe(&layout, &mut watch), None);
     assert!(model.fire("Handoff", &mut state));
     let completed = watch.last_index_probe.expect("worker completion");
-    let expiry = completed + PARK_SLICE;
+    let expiry = completed + atpkg::vendor_direct::watch::BLIND_LOOK;
     assert_eq!(watch.shared_index_retry_at, Some(expiry));
     start_index_probe(
         &layout,
@@ -703,7 +703,7 @@ fn near_index_unparks_the_vendor_head_wait_without_a_poll_tick() {
         near_tx.send(()).unwrap();
     });
     let park = aterm_spec::wait::MUST_HAPPEN;
-    set_park_slice_for_this_thread(park);
+    set_blind_look_for_this_thread(park);
     let end = sleep_interval_watching_bump(
         Some(&layout),
         &mut (SystemTime::now() + park),
@@ -751,7 +751,7 @@ fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
         finish_tx.send(()).unwrap();
     });
     let park = aterm_spec::wait::MUST_HAPPEN;
-    set_park_slice_for_this_thread(park);
+    set_blind_look_for_this_thread(park);
     let end = sleep_interval_watching_bump(
         Some(&layout),
         &mut (SystemTime::now() + park),
@@ -1159,7 +1159,7 @@ fn a_vendor_hint_harvested_with_a_higher_priority_event_survives_to_the_next_par
                     .is_some_and(|pending| pending.worker.is_finished())
             });
         }
-        let end = finish_head_watch_slice(
+        let end = finish_head_watch_round(
             &layout,
             &mut heads.0,
             &mut watch,
@@ -1397,29 +1397,21 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
         })
     });
     let mut head_watch = HeadWatch::new(&[]);
+    let rest = atpkg::vendor_direct::watch::Rest::inert();
+    head_watch.bind_ring(rest.ringer());
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
     assert_eq!(
-        head_watch_slice(
-            &mut head_watch,
-            &layout,
-            now,
-            Some(Duration::ZERO),
-            Duration::ZERO,
-            &get,
-            false,
-        ),
+        head_watch_round(&mut head_watch, &layout, now, &get, false),
         None
     );
     assert_eq!(head_watch.pending_count(), 2);
     let deadline = Instant::now() + MUST_HAPPEN;
     let moved = loop {
-        head_watch.park_for_hint(Duration::from_millis(100));
-        let moved = head_watch_slice(
+        let _ = rest.wait(Some(Duration::from_millis(100)));
+        let moved = head_watch_round(
             &mut head_watch,
             &layout,
             now + Duration::from_secs(1),
-            Some(Duration::from_secs(1)),
-            Duration::from_secs(1),
             &get,
             false,
         );
@@ -1460,13 +1452,11 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     ready.notify_all();
     let deadline = Instant::now() + MUST_HAPPEN;
     let moved = loop {
-        head_watch.park_for_hint(deadline.saturating_duration_since(Instant::now()));
-        let moved = head_watch_slice(
+        let _ = rest.wait(Some(deadline.saturating_duration_since(Instant::now())));
+        let moved = head_watch_round(
             &mut head_watch,
             &layout,
             now + Duration::from_secs(2),
-            Some(Duration::from_secs(1)),
-            Duration::from_secs(1),
             &get,
             false,
         );
@@ -2224,23 +2214,34 @@ fn only_the_announcement_carries_the_first_run_tag() {
     assert!(matches!(other, Wake::PkgSeedDone { .. }));
 }
 
+/// THE ROUND ASKS WHEN DUE, AND TWENTY SECONDS AFTER A WAKE: each wait the lane judges a wake
+/// ([`atpkg::vendor_direct::watch::woke_between`]) moves the heads past the network's return
+/// ([`HeadWatch::woke`]), and the round after it asks nothing until then.
 #[test]
-fn the_slice_asks_when_due_and_twenty_seconds_after_a_wake() {
+fn the_round_asks_when_due_and_twenty_seconds_after_a_wake() {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let get: Arc<ConcurrentVendorGetFn<'static>> = Arc::new(vendor("2.1.281", Arc::clone(&asked)));
     let layout = store_with_legacy_claude("slice");
     let mut heads = HeadWatch::new(&[String::from("codex")]);
+    let rest = atpkg::vendor_direct::watch::Rest::inert();
+    heads.bind_ring(rest.ringer());
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
     let five = Duration::from_secs(5);
     let slice = |heads: &mut HeadWatch, at: SystemTime, wall: Duration| {
-        head_watch_slice(heads, &layout, at, Some(wall), five, &get, false)
+        if atpkg::vendor_direct::watch::woke_between(Some(wall), five) {
+            heads.woke(at);
+        }
+        head_watch_round(heads, &layout, at, &get, false)
     };
     assert_eq!(
         slice(&mut heads, t0, five),
         None,
         "launched the head worker"
     );
-    heads.park_for_hint(MUST_HAPPEN);
+    assert!(
+        rest.wait(Some(MUST_HAPPEN)).is_some(),
+        "the round rang its end"
+    );
     assert_eq!(
         slice(&mut heads, t0 + Duration::from_secs(1), five),
         Some(vec!["claude"])
@@ -2257,7 +2258,10 @@ fn the_slice_asks_when_due_and_twenty_seconds_after_a_wake() {
         slice(&mut heads, woke + Duration::from_secs(20), five),
         None
     );
-    heads.park_for_hint(MUST_HAPPEN);
+    assert!(
+        rest.wait(Some(MUST_HAPPEN)).is_some(),
+        "the round rang its end"
+    );
     assert_eq!(
         slice(&mut heads, woke + Duration::from_secs(21), five),
         None,

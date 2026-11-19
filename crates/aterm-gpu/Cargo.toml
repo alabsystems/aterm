@@ -106,17 +106,28 @@ aterm-effects = { workspace = true }
 # The frame records (`frame_record_tests`) hold each frame by its SHA-256.
 aterm-digest = { workspace = true }
 # A test's poll pauses with `aterm_uds::deadline::poll_yield` (clippy.toml: a wait
-# that wakes); the GL arm's windowed X11 test (`gl::glx`) runs its work in a child.
+# that wakes); the GL arm's windowed X11 test (`gl::glx`) runs its work in a child, and
+# `benches/quiet_commit.rs` its keeper child (`spawnfd::command`).
 aterm-uds = { workspace = true }
+# The quiet-commit grid's JSON records are held to a parser (`benches/quiet/plan_tests.rs`,
+# which the library mounts under `cfg(test)`).
+aterm-json = { workspace = true }
 # The fixture fonts' paths, read when a test runs (`aterm_tempfile::manifest_dir`); the
 # GL arm's windowed X11 test (`gl::glx`) runs its work in a child, this test binary
 # run again, with its output in a scratch directory: Xlib's error and IO handlers are
 # process-wide.
 aterm-tempfile = { workspace = true }
 
-# `benches/quiet_commit.rs` reads its own footprint (`proc_pid_rusage`).
+# `benches/quiet_commit.rs` reads its own counters at each mark of a take: every thread's CPU
+# split by mode, its name and, for a thread whose CPU grew, its dispatch queue's label
+# (`self_cpu::read_asking`), each thread's instructions, cycles and energy by performance level
+# (`thread_counts`), its VM and graphics ledgers and the purgeable walk (`self_vm::read`,
+# `read_purgeable`), and the GPU's use and every GPU client's time (`gpu`, `gpu_clients`); and,
+# once per run, the machine, OS build, GPU driver, power source and thermal state. Workspace
+# crate; it reaches aterm-gpu through no edge (it already sits in this dev graph under
+# aterm-uds).
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-libc = { workspace = true }
+aterm-sysprobe = { workspace = true }
 
 [lints]
 workspace = true

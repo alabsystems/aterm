@@ -259,11 +259,13 @@ pub const fn compiles(id: StageId) -> bool {
         | StageId::ForeignCells
         | StageId::WasmGlue
         | StageId::BrowserLane
-        | StageId::RedrawConformance
-        | StageId::ObjcDrives
+        | StageId::RedrawBuild
+        | StageId::ObjcBuild
         | StageId::CodexAlabProof
         | StageId::LinuxLabBuild => true,
         StageId::Test
+        | StageId::RedrawConformance
+        | StageId::ObjcDrives
         | StageId::ReleasedShim
         | StageId::Formatting
         | StageId::Census
@@ -841,6 +843,9 @@ impl StageKey for Key {
         };
         key.checkout = ctx.root.display().to_string();
         key.variant = match id {
+            // Older measurements include the compiler that used to run under the
+            // window reservation. The runtime now learns only the drivers' own peak.
+            StageId::RedrawConformance | StageId::ObjcDrives => Some("driver runtime".to_owned()),
             StageId::ForeignCells | StageId::WasmGlue | StageId::BrowserLane
                 if ctx.cells_pulled =>
             {

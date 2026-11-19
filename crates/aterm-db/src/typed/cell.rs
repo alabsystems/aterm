@@ -343,6 +343,7 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
             }
             guard::word(target).map_err(guard::Refusal::rule)
         }
+        Ty::Link(link) => values::link(link, text()?),
         Ty::Set(_) => Err("a set is written one element at a time"),
         Ty::List(inner, max) => {
             let items = x.as_array().ok_or("this column holds a list")?;

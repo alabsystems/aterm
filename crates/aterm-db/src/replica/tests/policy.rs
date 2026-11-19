@@ -1172,11 +1172,13 @@ fn a_change_without_the_lock_is_refused_by_the_next_groups_first_admission() {
 /// X's state lock is held ([`lock_held`]). X's witness read (its first admission with a table
 /// active) and the admission after it (the authorize before the initiator's table choice, or
 /// before the responder's ID list) find the lock free; the lock is held at exactly X's lent
-/// admissions; and each side's (own, lent, reopened) is as observed, the initiator's (12, 6, 0)
-/// and the responder's (17, 2, 0), whichever Mac initiates.
+/// admissions; and each side's (own, lent, reopened) is as observed, the initiator's (14, 6, 0)
+/// and the responder's (19, 2, 0), whichever Mac initiates: reconciling the proofs and operations
+/// by range takes each side two admissions of its own more than the whole lists did.
 /// CONTROLS: the record moves once; the initiator's report says it asked the witnesses; X's round
 /// lends some admissions.
-/// NEGATIVE CONTROLS (2026-11-12), the `self.end_group()` calls of `Round::table_witnesses`
+/// NEGATIVE CONTROLS (2026-11-12, over the whole-list wire, where the counts were (12, 6, 0) and
+/// (17, 2, 0)), the `self.end_group()` calls of `Round::table_witnesses`
 /// removed: both, `Initiator: X's admission 9 (the one after them) found its state lock held`,
 /// `Responder: X's admission 9 (a witness read) found ..`, `Responder: X's admission 10 (the one
 /// after them) found ..`, the initiator's and the responder's counts (11, 7, 0) and (15, 4, 0);
@@ -1203,12 +1205,12 @@ fn a_witness_read_and_the_admission_after_it_admit_on_looks_of_their_own() {
             .iter()
             .map(|report| report.sent + report.received)
             .sum();
-        let asked = reports[usize::from(side == Side::Responder)].witnesses_asked;
+        let asked = reports[usize::from(side == Side::Responder)].witnesses_asked();
         let hooks = hooks.borrow().clone();
         assert_eq!(hooks.len(), x.hooks);
         (moved, asked, [x.grouped, peer.grouped], hooks)
     });
-    let observed = [[(12, 6, 0), (17, 2, 0)], [(17, 2, 0), (12, 6, 0)]];
+    let observed = [[(14, 6, 0), (19, 2, 0)], [(19, 2, 0), (14, 6, 0)]];
     let mut wrong = Vec::new();
     for ((side, (moved, asked, grouped, hooks)), observed) in sides.iter().zip(&seen).zip(observed)
     {
@@ -1401,7 +1403,12 @@ fn a_rounds_table_reads_take_a_fresh_read_when_overtaken_and_defer_when_it_keeps
         input: Cursor::new(incoming),
         output: Vec::new(),
     };
-    let (mut repair, mut report) = (Repair::default(), Report::default());
+    // Hand-made frames of the `atdb/7` and `atdb/8` proof list.
+    let listed = || Repair {
+        tables: Tables::ProofList,
+        ..Repair::default()
+    };
+    let (mut repair, mut report) = (listed(), Report::default());
     let went_on = with_replay_observer(overtake, || {
         round.conflicts(
             &mut stream,
@@ -1434,7 +1441,7 @@ fn a_rounds_table_reads_take_a_fresh_read_when_overtaken_and_defer_when_it_keeps
         input: Cursor::new(EMPTY_INVENTORY.to_vec()),
         output: Vec::new(),
     };
-    let (mut repair, mut report) = (Repair::default(), Report::default());
+    let (mut repair, mut report) = (listed(), Report::default());
     let went_on = with_each_replay_observed(overtaking_ingest(&p), || {
         round.conflicts(
             &mut stream,
@@ -1457,6 +1464,61 @@ fn a_rounds_table_reads_take_a_fresh_read_when_overtaken_and_defer_when_it_keeps
         [0],
         "the peer hears the inventory is unavailable"
     );
+}
+
+/// What an initiator holding `ids` writes in a range reconciliation with a responder that holds
+/// none, as a real peer's operation inventory exchange sends it.
+fn reconciled_from(ids: &BTreeSet<Digest>) -> Vec<u8> {
+    use astream_wire::sync::rbsr::Snapshot;
+    struct Recorded {
+        inner: std::os::unix::net::UnixStream,
+        written: Vec<u8>,
+    }
+    impl Read for Recorded {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(bytes)
+        }
+    }
+    impl Write for Recorded {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let written = self.inner.write(bytes)?;
+            self.written.extend_from_slice(&bytes[..written]);
+            Ok(written)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    let (left, mut right) = std::os::unix::net::UnixStream::pair().unwrap();
+    for stream in [&left, &right] {
+        stream
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap();
+    }
+    thread::scope(|threads| {
+        let responder = threads.spawn(move || {
+            reconcile_inventory(
+                &mut right,
+                Side::Responder,
+                Some(Snapshot::new(BTreeSet::new())),
+                || Ok(()),
+            )
+            .unwrap()
+        });
+        let mut stream = Recorded {
+            inner: left,
+            written: Vec::new(),
+        };
+        reconcile_inventory(
+            &mut stream,
+            Side::Initiator,
+            Some(Snapshot::new(ids.clone())),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(responder.join().unwrap().as_ref(), Some(ids));
+        stream.written
+    })
 }
 
 /// A table that keeps advancing through every read of an outgoing batch fails the round, with
@@ -1501,11 +1563,11 @@ fn a_batch_its_sender_cannot_read_fails_the_round_since_an_empty_one_says_nothin
     assert!(refused.unwrap_err().is_snapshot_changed());
     assert!(stream.output.is_empty(), "no batch said nothing is left");
 
+    // The peer's side as a sender with that mutant writes it: an empty proof list and batch, the
+    // range reconciliation that says it holds `held`, then an empty operation batch.
     let mut incoming = EMPTY_INVENTORY.to_vec();
     incoming.extend(0u32.to_le_bytes());
-    incoming.push(1);
-    incoming.extend(u32::try_from(held.len()).unwrap().to_le_bytes());
-    incoming.extend(held.concat());
+    incoming.extend(reconciled_from(&held.iter().copied().collect()));
     incoming.extend(0u32.to_le_bytes());
     let mut stream = Stream {
         input: Cursor::new(incoming),
@@ -1523,7 +1585,10 @@ fn a_batch_its_sender_cannot_read_fails_the_round_since_an_empty_one_says_nothin
             sender,
             Side::Responder,
             id,
-            &mut Repair::default(),
+            &mut Repair {
+                tables: Tables::ProofList,
+                ..Repair::default()
+            },
             &mut report,
         )
         .unwrap();
@@ -2031,20 +2096,22 @@ impl Fixture {
 /// A table withdrawn from this Mac's subscriptions while it repairs the table loses nothing more
 /// to the peer from the moment this Mac can see it. The table step is driven for the application
 /// table on both Macs (`Fixture::table_step`), each holding a record the other lacks, so a step
-/// sends and ingests one. A control run counts the first Mac's admissions (11 as initiator and 11
-/// as responder, every one the application table's); then, on a fresh fixture each, an
-/// incompatible declaration is committed into the first Mac's catalog at each of those
-/// admissions in turn, before its session opens: no byte the first Mac writes and no record it
-/// ingests follows, and its step fails with the subscription's refusal (never the observation
-/// pin's). CONTROL: an inert catalog payload committed at the same admission leaves the step
-/// whole, one record sent and one ingested, so the commit itself (a writer session on the first
-/// Mac) refuses nothing. Code that checked the subscription at every admission passes too: this
+/// sends and ingests one. A control run counts the first Mac's admissions (13 as initiator and 13
+/// as responder, every one the application table's, the proofs and operations reconciled by
+/// range); then, on a fresh fixture each, an incompatible declaration is committed into the first
+/// Mac's catalog at each of those admissions in turn, before its session opens: no byte the first
+/// Mac writes and no record it ingests follows, and its step fails with the subscription's refusal
+/// (never the observation pin's), or, at the initiator's last admission (the closing empty
+/// batch's, after which it writes and ingests nothing), completes. CONTROL: an inert catalog
+/// payload committed at the same admission leaves the step whole, one record sent and one
+/// ingested, so the commit itself (a writer session on the first Mac) refuses nothing. Code that checked the subscription at every admission passes too: this
 /// is the guarantee `Gate` keeps.
 /// X's round admits through a round group on its stream (`GroupLook`), its files read as settled,
 /// so some of its admissions are lent the group's look (a CONTROL counts them) and some changes
 /// commit at a lent admission's hook, under the group's hold: a follower checks the subscription
 /// as a first does (`Directory::permits`, reading the catalog under its session).
-/// NEGATIVE CONTROL (2026-11-12): a follower checking only the policy at a `Gate::Subscription`
+/// NEGATIVE CONTROL (2026-11-12, over the whole-list wire's 11 admissions): a follower checking
+/// only the policy at a `Gate::Subscription`
 /// admission (`Round::admit` taking `Gate::Policy` while the group holds a look) lets bytes leave
 /// after the change, as initiator at admissions 1 to 4 (`5 bytes written after the change`) and 6
 /// to 8 (`37 bytes written after the change`).
@@ -2087,7 +2154,7 @@ fn no_table_byte_leaves_after_a_visible_withdrawal() {
     });
     assert_eq!(
         counts,
-        [11, 11],
+        [13, 13],
         "CONTROL: the table step's admissions, as initiator and as responder"
     );
     let runs: Vec<_> = sides
@@ -2121,8 +2188,13 @@ fn no_table_byte_leaves_after_a_visible_withdrawal() {
                 Err(error) => wrong.push(format!("an inert payload refused the step: {error}")),
             },
             Commit::Incompatible => {
+                // The initiator's last admission is the closing empty batch's, which checks the
+                // policy alone (`receive_batch`): nothing is written or ingested after it, so the
+                // step ends as it began, and the checks below still hold it to that.
+                let closing = side == Side::Initiator && at == counts[0];
                 match step.result {
                     Err(error) if error.contains(CHANGE) => {}
+                    Ok(_) if closing => {}
                     Err(error) => wrong.push(format!("refused otherwise: {error}")),
                     Ok(report) => wrong.push(format!("the step completed: {report:?}")),
                 }

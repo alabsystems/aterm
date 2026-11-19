@@ -194,7 +194,14 @@ pub struct GitRun {
     /// after that is refused.
     pub budget: Duration,
     /// An inactivity window for native progress. When set, child execution is bounded by
-    /// output and descendant CPU/I/O progress instead of [`Self::budget`]'s wall clock.
+    /// output and descendant CPU/I/O progress instead of [`Self::budget`]'s wall clock, and each
+    /// child's HTTP transfer by curl's own stall bound over the same window (less than one byte a
+    /// second), which ends a remote that holds the connection open and never answers. A
+    /// journaled push either bound ends after it may have sent its pack is never made again:
+    /// where the transfer's bound ended it, one re-read that finds every requested ref at its
+    /// AFTER proves it landed; otherwise it has an unknown outcome, as one the wall clock ended
+    /// has. A leased delete, which opens no intent, takes its receive-failure recovery after a
+    /// stalled transfer as after any other, converging on absence.
     pub progress_window: Option<Duration>,
 }
 
@@ -441,7 +448,8 @@ impl GitRun {
     }
 
     /// The same run with a native-progress inactivity bound instead of a wall-clock execution
-    /// bound. The ordinary budget remains the lifetime of any short-lived credential grant.
+    /// bound ([`Self::progress_window`]: the child's tree and its HTTP transfer). The ordinary
+    /// budget remains the lifetime of any short-lived credential grant.
     #[must_use]
     pub fn with_progress_window(mut self, window: Duration) -> GitRun {
         self.progress_window = Some(window);
@@ -685,6 +693,7 @@ pub const OBJECT_SOURCE_WORDS: [Overriding; 3] = [
 ];
 
 /// What a repository's config is screened for.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigAccess {
     /// A clone agh pushes from or writes.
@@ -696,6 +705,7 @@ pub(crate) enum ConfigAccess {
     ObjectSource,
 }
 
+#[cfg(unix)]
 impl ConfigAccess {
     /// The word a screen's tape key names it by.
     pub(crate) fn word(self) -> &'static str {
@@ -747,10 +757,12 @@ mod unix {
 
     mod ancestry;
     mod cache_ancestor;
+    mod checkout_cached_pack;
     mod checkout_pack;
     mod commit_config;
     mod local_tags;
     mod object_view;
+    mod push_history;
 
     /// The route door's fact naming where a profile's token lives (`Fx::fact`).
     const SOURCE: &str = "source";
@@ -1301,6 +1313,9 @@ mod unix {
             for (name, value) in &self.env {
                 spec.env.push((name.clone(), value.clone()));
             }
+            if let Some(window) = progress_window {
+                spec.env.extend(transfer_stall(window));
+            }
             if let Some(trace) = curl_trace {
                 spec.env.push((
                     OsString::from("GIT_TRACE_CURL"),
@@ -1557,6 +1572,105 @@ mod unix {
     fn os(text: impl Into<OsString>) -> OsString {
         text.into()
     }
+
+    /// The stall bound on the HTTP transfer of a child under a progress `window`: curl ends a
+    /// transfer that moves less than one byte a second for the window, rounded up to whole
+    /// seconds (`GIT_HTTP_LOW_SPEED_LIMIT` and `GIT_HTTP_LOW_SPEED_TIME`, which git reads over any
+    /// `http.lowSpeed*` config), and git exits a network failure: a journaled push it ended
+    /// after it may have sent its pack ([`transfer_stalled`]) is re-read once and never made
+    /// again, and unless that re-read finds it landed it has an unknown outcome
+    /// ([`stalled_transfer`]), as the wall bound the window replaces gave it. The progress
+    /// collector cannot see that stall: git's HTTP transport polls its socket every 50 ms while
+    /// it waits for an answer, so the child's CPU time keeps rising while a remote that holds the
+    /// connection open sends nothing. A remote that is working keeps bytes moving, a
+    /// receive-pack's keepalives included.
+    fn transfer_stall(window: std::time::Duration) -> [(OsString, OsString); 2] {
+        let seconds = window
+            .as_secs()
+            .saturating_add(u64::from(window.subsec_nanos() > 0))
+            .max(1);
+        [
+            (os("GIT_HTTP_LOW_SPEED_LIMIT"), os("1")),
+            (os("GIT_HTTP_LOW_SPEED_TIME"), os(seconds.to_string())),
+        ]
+    }
+
+    /// The progress `window` a push child's exit says ended its HTTP transfer, where the run has
+    /// one: curl's low-speed abort under [`transfer_stall`]'s bound (curl's `Operation too slow`,
+    /// its exit 28), which git reports as `RPC failed; curl 28 …` for a POST, the one that
+    /// carries the pack or the probe before it, so the pack may have reached the remote. Ref
+    /// discovery's GET, which comes before any pack, fails as `unable to access …` instead, and
+    /// every other receive failure (an HTTP error, a remote that hung up or reset the
+    /// connection, a connection that timed out or was refused) names no low-speed abort; none of
+    /// them is this.
+    fn transfer_stalled(
+        window: Option<std::time::Duration>,
+        out: &ChildOut,
+    ) -> Option<std::time::Duration> {
+        let window = window?;
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .any(|line| line.contains("RPC failed;") && line.contains("Operation too slow"))
+            .then_some(window)
+    }
+
+    /// `error`, the exit of a journaled push whose HTTP transfer the progress `window` ended
+    /// ([`transfer_stalled`]), with the stall's words before the exit's and an unknown side
+    /// effect, as the wall bound the window replaces left such a push. [`push_native_refs`]
+    /// re-reads the guarded refs once: every requested ref at AFTER proves the write landed, and
+    /// anything else (BEFORE, another change, a read that fails) returns this error, which the
+    /// push's receive closure rewraps as `OutcomeUnknown` (its `map_err` once
+    /// `prior_receive_uncertain` is set, as after every uncertain receive), so the write's intent
+    /// is settled Unknown and stays open until it is reconciled. It is never pushed again within
+    /// the receive-failure recovery's patience: the remote still holds the connection and the
+    /// pack it may have taken, and a read of BEFORE cannot exclude that pack's delayed commit.
+    fn stalled_transfer(mut error: Error, window: std::time::Duration) -> Error {
+        error.why = format!(
+            "the push's HTTP transfer moved less than a byte a second for {window:?} after it may \
+             have sent its pack, and no re-read found it landed, so whether the remote took it is \
+             not known: {}",
+            error.why
+        );
+        error.with_side_effect(SideEffect::Unknown)
+    }
+
+    /// The guarded refs `read`, a journaled push's receive-failure re-read, names, each once. A
+    /// read whose output may be truncated, is not UTF-8, or holds a malformed, unguarded or
+    /// repeated row is a protocol fault of unknown side effect that keeps `prior`'s words (the
+    /// failed push's, a stalled transfer's among them) before its own, as a re-read that fails
+    /// does.
+    fn recovered_refs<'a>(
+        read: &'a ChildOut,
+        guards: &[&str],
+        prior: &Error,
+    ) -> Result<std::collections::BTreeMap<&'a str, &'a str>> {
+        let fault = |what: &str| {
+            Error::protocol(format!("{}; {what}", prior.why)).with_side_effect(SideEffect::Unknown)
+        };
+        if read.stdout_may_be_truncated() {
+            return Err(fault(
+                "remote recovery refs exceed the complete output bound",
+            ));
+        }
+        let text =
+            std::str::from_utf8(&read.stdout).map_err(|_| fault("git returned non-UTF-8 refs"))?;
+        let mut observed = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let (oid, reference) = line
+                .split_once('\t')
+                .ok_or_else(|| fault("git returned malformed refs"))?;
+            if !crate::path::is_sha(oid)
+                || !guards.contains(&reference)
+                || observed.insert(reference, oid).is_some()
+            {
+                return Err(fault("git returned unexpected or duplicate refs"));
+            }
+        }
+        Ok(observed)
+    }
+
+    #[cfg(test)]
+    mod transfer_stall_tests;
 
     /// The run's one scratch directory, canonical, with `home/` and `work/` made.
     pub(super) fn scratch() -> Result<(aterm_tempfile::TempDir, PathBuf)> {
@@ -3723,6 +3837,17 @@ mod unix {
         deadline: std::time::Duration,
         mut consume: impl FnMut(usize, &[String]) -> Result<()>,
     ) -> Result<()> {
+        spooled_object_records(path, children, deadline, |index, batch, _| {
+            consume(index, batch)
+        })
+    }
+
+    fn spooled_object_records(
+        path: &Path,
+        children: &Children<'_>,
+        deadline: std::time::Duration,
+        mut consume: impl FnMut(usize, &[String], bool) -> Result<()>,
+    ) -> Result<()> {
         use std::io::BufRead as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let file = std::fs::OpenOptions::new()
@@ -3757,6 +3882,7 @@ mod unix {
         }
         let mut reader = std::io::BufReader::new(file);
         let mut batch = Vec::with_capacity(16_384);
+        let mut batch_missing = false;
         let mut index = 0;
         loop {
             source_copy_check(children, deadline)?;
@@ -3774,6 +3900,12 @@ mod unix {
             }
             record.pop();
             let missing = record.first() == Some(&b'?');
+            if !batch.is_empty() && missing != batch_missing {
+                consume(index, &batch, batch_missing)?;
+                batch.clear();
+                index += 1;
+            }
+            batch_missing = missing;
             let oid = if missing { &record[1..] } else { &record[..] };
             let oid = std::str::from_utf8(oid)
                 .ok()
@@ -3781,13 +3913,13 @@ mod unix {
                 .ok_or_else(|| Error::protocol("malformed object inventory record"))?;
             batch.push(oid.to_owned());
             if batch.len() == 16_384 {
-                consume(index, &batch)?;
+                consume(index, &batch, batch_missing)?;
                 batch.clear();
                 index += 1;
             }
         }
         if !batch.is_empty() {
-            consume(index, &batch)?;
+            consume(index, &batch, batch_missing)?;
         }
         let after = reader
             .get_ref()
@@ -4119,19 +4251,16 @@ mod unix {
         let check_current = || check_object_intake_directories(&pinned);
         check_current()?;
         let quarantine = if checkout.is_some() {
-            Some(
-                aterm_tempfile::Builder::new()
-                    .prefix(".agh-checkout-")
-                    .suffix(".noindex")
-                    .tempdir_in(&pack_directory)
-                    .map_err(|error| Error::local(format!("checkout pack quarantine: {error}")))?,
-            )
+            Some(checkout_cached_pack::Quarantine::create(&pack_directory)?)
         } else {
             None
         };
         let prefix = quarantine
             .as_ref()
-            .map_or(pack_directory.as_path(), aterm_tempfile::TempDir::path)
+            .map_or(
+                pack_directory.as_path(),
+                checkout_cached_pack::Quarantine::path,
+            )
             .join("pack");
         if let Some((_, cache)) = source_cache {
             let copy_deadline = children
@@ -4537,6 +4666,7 @@ mod unix {
         check_current()?;
         let mut verified_packs = vec![hash.to_owned()];
         let mut checkout_cache_store = None;
+        let mut retained_packs = Vec::new();
         if let Some((_, cache)) = checkout {
             let mut checkout_cache_ancestor = None;
             let checkout_cache_common = if let Some(cache) = cache {
@@ -4622,6 +4752,16 @@ mod unix {
                     )?,
                     None => input.clone(),
                 };
+                if missing.is_empty()
+                    && let Some(cache) = &checkout_cache_common
+                    && let Some(reused) =
+                        checkout_cached_pack::reuse(&children, run, cache, batch, &prefix, index)?
+                {
+                    check_current()?;
+                    verified_packs.push(reused.hash.clone());
+                    retained_packs.push(reused);
+                    continue;
+                }
                 if !missing.is_empty() && !body_ready {
                     step(
                         "checkout-body-init",
@@ -4741,8 +4881,12 @@ mod unix {
         }
         let mut installed = Vec::new();
         if let Some(quarantine) = &quarantine {
+            quarantine.check()?;
             for hash in &verified_packs {
                 check_current()?;
+                if let Some(reused) = retained_packs.iter().find(|r| &r.hash == hash) {
+                    reused.check(&children)?;
+                }
                 for extension in ["pack", "idx"] {
                     let name = format!("pack-{hash}.{extension}");
                     let generated = quarantine.path().join(&name);
@@ -4760,6 +4904,9 @@ mod unix {
                     }
                     let (file, before) = hold_intake_file(&destination)?;
                     installed.push((destination, file, before));
+                }
+                if let Some(reused) = retained_packs.iter_mut().find(|r| &r.hash == hash) {
+                    reused.linked(&children, &pack_directory)?;
                 }
                 // A name collision never substitutes for verification of the
                 // actual installed pair, including a concurrent identical copy.
@@ -4780,17 +4927,26 @@ mod unix {
                 for (path, file, before) in &installed {
                     check_intake_file(path, file, before)?;
                 }
+                if let Some(reused) = retained_packs.iter().find(|r| &r.hash == hash) {
+                    reused.check(&children)?;
+                }
             }
         }
         check_current()?;
         if let Some(cache_store) = &checkout_cache_store {
             source_stores_disjoint(&pinned, cache_store)?;
         }
+        for reused in &retained_packs {
+            reused.check(&children)?;
+        }
+        if let Some(quarantine) = &quarantine {
+            quarantine.check()?;
+        }
         let updated = step(
             "update",
             vec![
                 os("-C"),
-                dir.into_os_string(),
+                dir.as_os_str().to_owned(),
                 os("update-ref"),
                 os("--no-deref"),
                 os("--create-reflog"),
@@ -4799,6 +4955,25 @@ mod unix {
             ],
             None,
         )?;
+        // The positively waited update-ref may have published before a final
+        // custody failure. Never report such a failure as a known no-effect.
+        (|| {
+            check_current()?;
+            if let Some(quarantine) = &quarantine {
+                quarantine.check()?;
+            }
+            if let Some(cache_store) = &checkout_cache_store {
+                source_stores_disjoint(&pinned, cache_store)?;
+            }
+            for (path, file, before) in &installed {
+                check_intake_file(path, file, before)?;
+            }
+            for reused in &retained_packs {
+                reused.check(&children)?;
+            }
+            Ok::<_, Error>(())
+        })()
+        .map_err(|error| error.with_side_effect(SideEffect::Applied))?;
         Ok((updated, oid.to_owned()))
     }
 
@@ -5224,6 +5399,32 @@ mod unix {
         },
     }
 
+    /// Minted only from this run's freshly matched remote advertisement. No
+    /// source ref or arbitrary list of object IDs can supply this authority.
+    struct FreshRemoteRoots {
+        request: Vec<u8>,
+        remote_url: String,
+        before: Vec<String>,
+        main: Option<String>,
+        after: Vec<String>,
+        deadline: std::time::Duration,
+    }
+
+    impl FreshRemoteRoots {
+        fn roots<'a>(&'a self, main: Option<&'a str>) -> Result<Vec<&'a str>> {
+            if main.is_some() && main != self.main.as_deref() {
+                return Err(Error::refused(
+                    "historical boundary names an unobserved remote main",
+                ));
+            }
+            let mut roots = self.before.iter().map(String::as_str).collect::<Vec<_>>();
+            roots.extend(main);
+            roots.sort_unstable();
+            roots.dedup();
+            Ok(roots)
+        }
+    }
+
     impl NativeRefBatch<'_> {
         fn updates(&self) -> &[crate::github::refs::RefUpdate] {
             match self {
@@ -5362,6 +5563,12 @@ mod unix {
         use std::collections::{BTreeMap, BTreeSet};
         const ZERO: &str = "0000000000000000000000000000000000000000";
         const NEW_OBJECT_BATCH: usize = 16_384;
+        let preparation_deadline = children
+            .gh
+            .fx()
+            .mono()?
+            .checked_add(children.budget)
+            .ok_or_else(|| Error::refused("push preparation deadline overflow"))?;
         let dir = screened(children, run, dir)?;
         let canonical = crate::fx::canon::git_request(run);
         let step = |name: &str, args: Vec<OsString>, cwd: Option<&Path>| -> Result<ChildOut> {
@@ -5535,6 +5742,24 @@ mod unix {
         // Only freshly observed remote objects can exclude an old object
         // closure. Source refs, grafts, replacement objects and accelerator
         // files are never copied into this private read/write repository.
+        let fresh_roots = FreshRemoteRoots {
+            request: canonical.clone(),
+            remote_url: remote.url().to_owned(),
+            before: batch
+                .updates()
+                .iter()
+                .filter(|row| row.before != ZERO)
+                .map(|row| row.before.clone())
+                .collect(),
+            main: found.get("refs/heads/main").map(|id| (*id).to_owned()),
+            after: batch
+                .source_roots()
+                .into_iter()
+                .filter(|id| *id != ZERO)
+                .map(str::to_owned)
+                .collect(),
+            deadline: preparation_deadline,
+        };
         let alternate = scratch.map(|p| p.join("objects/info/alternates"));
         let mut remote_main = None;
         let mut remote_owned = false;
@@ -5691,6 +5916,11 @@ mod unix {
                     .and_then(|s| s.strip_suffix('\n'))
                     .filter(|s| crate::path::is_sha(s))
                     .ok_or_else(|| Error::protocol("metadata pack ID is malformed"))?;
+                if incremental && !remote_owned {
+                    let history =
+                        push_history::certify(children, run, &fresh_roots, remote_main, hash)?;
+                    history.intake(children, run, remote, &fresh_roots, remote_main, hash)?;
+                }
                 children.gh.fx().native_push_phase(
                     crate::git::NativePushPhase::MetadataVerify,
                     || {
@@ -6105,6 +6335,13 @@ mod unix {
                     return Err(error);
                 }
                 prior_receive_uncertain = true;
+                // A transfer the progress window ended after the pack may have gone is re-read
+                // once below and never made again ([`stalled_transfer`]).
+                let stalled = transfer_stalled(run.progress_window, &out);
+                let error = match stalled {
+                    Some(window) => stalled_transfer(error, window),
+                    None => error,
+                };
                 // A receive failure says nothing about whether the CAS committed.
                 // Read all guarded refs, including the control refs we do not change.
                 let mut list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
@@ -6116,30 +6353,7 @@ mod unix {
                     ))
                     .with_side_effect(SideEffect::Unknown)
                 })?;
-                if read.stdout_may_be_truncated() {
-                    return Err(Error::protocol(
-                        "remote recovery refs exceed the complete output bound",
-                    )
-                    .with_side_effect(SideEffect::Unknown));
-                }
-                let text = std::str::from_utf8(&read.stdout).map_err(|_| {
-                    Error::protocol("git returned non-UTF-8 refs")
-                        .with_side_effect(SideEffect::Unknown)
-                })?;
-                let mut observed = BTreeMap::new();
-                for line in text.lines() {
-                    let (oid, reference) = line.split_once('\t').ok_or_else(|| {
-                        Error::protocol("git returned malformed refs")
-                            .with_side_effect(SideEffect::Unknown)
-                    })?;
-                    if !crate::path::is_sha(oid)
-                        || !guards.contains(&reference)
-                        || observed.insert(reference, oid).is_some()
-                    {
-                        return Err(Error::protocol("git returned unexpected or duplicate refs")
-                            .with_side_effect(SideEffect::Unknown));
-                    }
-                }
+                let observed = recovered_refs(&read, &guards, &error)?;
                 if batch
                     .updates()
                     .iter()
@@ -6150,6 +6364,14 @@ mod unix {
                         stdout: b"remote re-read confirmed all requested refs\n".to_vec(),
                         stderr: Vec::new(),
                     });
+                }
+                // After a stalled transfer the remote may still hold the pack, and anything but a
+                // complete AFTER, BEFORE included, may yet be followed by its delayed commit: never
+                // repeat the push within the patience below. Never-sent is out of reach either way:
+                // `prior_receive_uncertain` is set, so the closure's `map_err` makes every exit
+                // from here, the patience's own included, `OutcomeUnknown`.
+                if stalled.is_some() {
+                    return Err(error);
                 }
                 // A main-bound claim may restart selection only before receive.
                 // A read of BEFORE cannot exclude a delayed commit or an ABA, and
@@ -6546,6 +6768,9 @@ mod unix {
             if error.kind != Kind::CouldNotRun || error.side_effect != SideEffect::Unknown {
                 return Err(error);
             }
+            // A leased delete opens no intent (`run_git`, never the journal), so a stalled
+            // transfer takes this recovery as any other receive failure does: its re-read
+            // converges on absence.
             let read_key = [canonical.as_slice(), b"\nstep delete-recover"].concat();
             let read = children
                 .git(

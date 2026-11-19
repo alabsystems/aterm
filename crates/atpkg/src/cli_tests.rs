@@ -15922,6 +15922,42 @@ fn an_alab_rollback_on_the_vendor_door_sweeps_the_revoked_build_and_refreshes_ho
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
+/// A NAMED UPDATE OVER A HOLDS FILE THAT DOES NOT READ SAYS SO AND TAKES NO HOLD FOR THE
+/// PERSON'S PIN: `install hx-alab --build 5` wrote hx-alab to both pins and harness-holds, and
+/// harness-holds was damaged since; `update hx-alab` answers an error naming the holds file
+/// (`cmd_update_one` prints it and exits non-zero) rather than reading the hold as the person's
+/// own pin and printing `you pinned it`, and neither file is changed or moved.
+/// NEGATIVE CONTROL: with `release_named_hold` reading through `is_held` the holds file is set
+/// aside and the update answers `Ok((true, false))`: hx-alab stays pinned as the person's own.
+#[test]
+fn a_named_update_over_a_holds_file_that_does_not_read_says_so() {
+    use crate::ApplyDecision as D;
+    for decision in [D::UpToDate, D::Install] {
+        let layout = temp_layout("named-update-damaged-holds");
+        crate::pin::set_pinned(&layout, "hx-alab", true).unwrap();
+        let pins = std::fs::read(layout.prefix.join("pins")).unwrap();
+        let holds = layout.prefix.join(crate::pin::PinFile::Holds.name());
+        let damaged = b"hx-alab\n\xff";
+        std::fs::write(&holds, damaged).unwrap();
+        let error = super::named_update_pin(&layout, "hx-alab", decision).unwrap_err();
+        assert!(
+            error.to_string().contains(&holds.display().to_string()),
+            "{decision:?}: {error}"
+        );
+        assert_eq!(std::fs::read(&holds).unwrap(), damaged, "{decision:?}");
+        assert_eq!(
+            std::fs::read(layout.prefix.join("pins")).unwrap(),
+            pins,
+            "{decision:?}"
+        );
+        assert!(
+            crate::pin::set_aside_files(&layout).is_empty(),
+            "{decision:?}"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+}
+
 /// A NAMED UPDATE RELEASES A NAMED INSTALL'S HOLD WHATEVER ITS PLAN DECIDES: `install
 /// hx-alab --build <n>` held it, and `update hx-alab` names it, so the hold goes whether the
 /// held build is the one the index pins (up to date), an older one (install), or one the index
@@ -15941,7 +15977,7 @@ fn a_named_update_releases_a_named_installs_hold_whatever_its_plan_decides() {
             "{decision:?}"
         );
         assert!(!crate::pin::is_pinned(&layout, "hx-alab").unwrap());
-        assert!(!crate::pin::is_held(&layout, "hx-alab").unwrap());
+        assert!(!crate::pin::is_held(&layout, "hx-alab"));
     }
     let layout = temp_layout("named-update-own-pin");
     crate::pin::set_pinned(&layout, "hx-alab", true).unwrap();

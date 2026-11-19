@@ -549,6 +549,50 @@ fn vmstat_gives_the_vm_counters() {
     assert_eq!(r.memory_detail().map(|m| m.counters), Some(None));
 }
 
+/// What Linux pushes out of RAM is its swap-outs, to disk and to zswap, and what comes back its
+/// anonymous refaults, or its swap-ins where the kernel keeps no such counter; its stall is PSI's
+/// totals, and its headroom `MemAvailable`. NEGATIVE CONTROLS: a PSI file with no `full` line,
+/// or a total that is no plain number, reads no stall; with no PSI file the counters keep none.
+#[test]
+fn linux_reads_what_it_pushes_out_what_comes_back_and_its_stall() {
+    let c = linux::vm_counters(VMSTAT_ZSWAP, 4096).expect("counters");
+    assert_eq!(
+        (c.pushed, c.refaulted, c.stall_us),
+        (Some(39), Some(17), None)
+    );
+    let anon = format!("{VMSTAT_ZSWAP}workingset_refault_anon 444\n");
+    let c = linux::vm_counters(&anon, 4096).expect("counters");
+    assert_eq!(c.refaulted, Some(444), "the anonymous refaults where kept");
+    assert_eq!(linux::psi_totals(PSI_QUIET), Some((1_234_567, 345_678)));
+    assert_eq!(
+        linux::psi_totals("some avg10=0.00 avg60=0.00 avg300=0.00 total=9\n"),
+        None
+    );
+    assert_eq!(
+        linux::psi_totals("some total=9\nfull total=-4\n"),
+        None,
+        "not a plain number"
+    );
+    let root = tree(&[
+        ("proc/meminfo", MEMINFO_ZSWAP),
+        ("proc/vmstat", VMSTAT_ZSWAP),
+        ("proc/pressure/memory", PSI_QUIET),
+    ]);
+    let m = Root::new(root.path()).memory_detail().expect("a reading");
+    assert_eq!(
+        m.counters.and_then(|c| c.stall_us),
+        Some((1_234_567, 345_678))
+    );
+    assert_eq!(m.headroom, Some(m.available));
+    assert_eq!(m.wall, None);
+    let bare = tree(&[
+        ("proc/meminfo", MEMINFO_ZSWAP),
+        ("proc/vmstat", VMSTAT_ZSWAP),
+    ]);
+    let m = Root::new(bare.path()).memory_detail().expect("a reading");
+    assert_eq!(m.counters.map(|c| c.stall_us), Some(None));
+}
+
 #[test]
 fn cgroup_files_parse_into_limits() {
     assert_eq!(linux::cpu_max_millicores("max 100000\n"), Some(None));

@@ -7,6 +7,12 @@ use std::path::{Path, PathBuf};
 
 use super::Executable;
 
+#[cfg(target_os = "macos")]
+#[path = "artifact_snapshot_images.rs"]
+mod images;
+#[cfg(target_os = "macos")]
+pub(crate) use images::Images;
+
 #[derive(Debug)]
 pub(crate) struct Snapshot {
     directory: Option<aterm_tempfile::TempDir>,

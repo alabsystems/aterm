@@ -84,9 +84,6 @@ pub(crate) mod consts {
     pub(crate) const NS_WINDOW_MINIATURIZE_BUTTON: usize = 1;
     pub(crate) const NS_WINDOW_ZOOM_BUTTON: usize = 2;
 
-    /// `NSGraphics.h:104` — `NSWindowAbove = 1` (`NSInteger`).
-    pub(crate) const NS_WINDOW_ABOVE: isize = 1;
-
     /// `NSToolbar.h:26` — `NSToolbarDisplayModeIconOnly = 2` (`NSUInteger`).
     pub(crate) const NS_TOOLBAR_DISPLAY_MODE_ICON_ONLY: usize = 2;
 

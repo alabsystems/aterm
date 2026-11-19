@@ -1177,6 +1177,7 @@ mod store {
             self.append(&Command::Write {
                 request: crate::crypto::random().unwrap(),
                 changes,
+                said: None,
             })
         }
 
@@ -1335,6 +1336,7 @@ mod store {
                 key: noted.clone(),
                 value: None,
             }],
+            said: None,
         });
         store.read(|log, view, usage| {
             assert!(view.refused.contains(&partial));

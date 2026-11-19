@@ -26,16 +26,22 @@
 //! holds but the count of passes and the pass's time, which every pass moves.
 
 use crate::{
-    ACCOUNT_HANDLES, Face, Frontier, Kept, Name, Named, Root, Snapshot, State, Status, Why, Word,
-    many_accounts, no_account, resolve,
+    ACCOUNT_HANDLES, Face, Frontier, Kept, Name, Named, Rendered, Root, Snapshot, State, Status,
+    Why, Word, many_accounts, no_account, resolve,
     snapshot::{Column, MAX_BYTES, Row},
 };
 use aterm_digest::Sha256;
 use aterm_json::Value;
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 /// The most operations a file's history keeps.
 pub const HISTORY: usize = 4_096;
+
+/// The most bytes a read takes of a file beside a snapshot that holds none of its rows: the
+/// status, the frontier (256 bytes at any count of records), the history, a face
+/// (which a pass writes no larger than [`crate::MAX_FACE_BYTES`]) and a face kept aside. The
+/// snapshot and the baseline, which hold every row, take [`MAX_BYTES`].
+pub const SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
 
 /// One shared file under one root.
 #[derive(Clone, Debug)]
@@ -146,8 +152,8 @@ impl Read {
     }
 }
 
-fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    match aterm_uds::atomic_file::read_regular(path, MAX_BYTES) {
+fn read_bounded(path: &Path, max: u64) -> Result<Option<Vec<u8>>, String> {
+    match aterm_uds::atomic_file::read_regular(path, max) {
         Ok((bytes, _)) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
@@ -162,10 +168,10 @@ fn sha_hex(bytes: &[u8]) -> String {
 /// bytes are not a status this build reads.
 ///
 /// # Errors
-/// The file is there and could not be read: no regular file, past [`MAX_BYTES`], or the open or
-/// the read failed.
+/// The file is there and could not be read: no regular file, past [`SIDECAR_BYTES`], or the
+/// open or the read failed.
 fn state_at(path: &Path) -> std::io::Result<Option<State>> {
-    match aterm_uds::atomic_file::read_regular(path, MAX_BYTES) {
+    match aterm_uds::atomic_file::read_regular(path, SIDECAR_BYTES) {
         Ok((bytes, _)) => Ok(State::decode(&bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -227,6 +233,111 @@ fn traced_count(path: &Path) -> Option<[u8; 32]> {
     Some(count_of(state_at(path).ok().flatten().as_ref()))
 }
 
+/// The snapshots this process last recorded or rendered whole, each with its file's stamp: a
+/// pass, and a read in the same process, takes one from here while the file is still the one
+/// it was, instead of reading and decoding every row again (package TK-09). A stamp is what
+/// the file system says of the file (its length, its times and, on Unix, its device and inode);
+/// a snapshot is replaced by a rename of a new file, so a file another process wrote has
+/// another stamp. With a trace scope armed on the thread (`aterm_uds::trace`) nothing is taken
+/// from here, so a traced read records the stamp of every file it read.
+mod memo {
+    use crate::Rendered;
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        time::SystemTime,
+    };
+
+    /// How many snapshots are kept: one per shared file a pass projects, with room to spare.
+    /// Past it the one with the fewest rows goes first: it costs the least to read again, and a
+    /// large file stays however many small ones pass.
+    const KEPT: usize = 16;
+
+    /// What the file system says of a file, which a write of other bytes moves.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct Stamp {
+        len: u64,
+        modified: Option<SystemTime>,
+        #[cfg(unix)]
+        inode: (u64, u64, i64, i64),
+    }
+
+    type Held = Vec<(PathBuf, Stamp, Arc<Rendered>)>;
+
+    static HELD: Mutex<Held> = Mutex::new(Vec::new());
+
+    /// The stamp of the file at `path`; `None` where it is not a regular file there.
+    pub(super) fn stamp(path: &Path) -> Option<Stamp> {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        Some(Stamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt as _;
+                (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+            },
+        })
+    }
+
+    /// Drop every snapshot kept, as a process that read none.
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn forget() {
+        if let Ok(mut held) = HELD.lock() {
+            held.clear();
+        }
+    }
+
+    /// The snapshot kept for the file at `path`, where the file is still the one it was kept
+    /// for.
+    pub(super) fn get(path: &Path) -> Option<Arc<Rendered>> {
+        if aterm_uds::trace::armed() {
+            return None;
+        }
+        let now = stamp(path)?;
+        let held = HELD.lock().ok()?;
+        held.iter()
+            .find(|(at, kept, _)| at == path && *kept == now)
+            .map(|(_, _, rendered)| Arc::clone(rendered))
+    }
+
+    /// Keep `rendered` as the snapshot the file at `path` holds while its stamp is `stamp`:
+    /// where the file has moved since, nothing is kept.
+    pub(super) fn keep(path: &Path, stamp: Stamp, rendered: Arc<Rendered>) {
+        if aterm_uds::trace::armed() || self::stamp(path).as_ref() != Some(&stamp) {
+            return;
+        }
+        if let Ok(mut held) = HELD.lock() {
+            held.retain(|(at, _, _)| at != path);
+            held.insert(0, (path.to_owned(), stamp, rendered));
+            while held.len() > KEPT {
+                // The fewest rows, the oldest of those (the last).
+                let Some(least) = held
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .min_by_key(|(_, (_, _, rendered))| rendered.snapshot().rows.len())
+                    .map(|(at, _)| at)
+                else {
+                    break;
+                };
+                held.remove(least);
+            }
+        }
+    }
+}
+
+/// Drop every snapshot this process keeps of a shared file it read or wrote, as a process that
+/// read none: a test's stand-in for another process.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn forget_for_test() {
+    memo::forget();
+}
+
 impl File {
     /// The file `name` under `root`.
     #[must_use]
@@ -275,14 +386,36 @@ impl File {
     /// What the snapshot here was projected from.
     #[must_use]
     pub fn frontier(&self) -> Option<Frontier> {
-        read_bounded(&self.root.frontier(&self.name))
+        read_bounded(&self.root.frontier(&self.name), SIDECAR_BYTES)
             .ok()
             .flatten()
             .and_then(|bytes| Frontier::decode(&bytes))
     }
 
+    /// The replica the snapshot here was read from, as its sidecar names it: this build's
+    /// ([`Self::frontier`]) or an earlier build's id-listing one ([`Frontier::source_of_1`]).
+    #[must_use]
+    pub fn frontier_source(&self) -> Option<[u8; 32]> {
+        let bytes = read_bounded(&self.root.frontier(&self.name), SIDECAR_BYTES)
+            .ok()
+            .flatten()?;
+        Frontier::decode(&bytes)
+            .map(|frontier| frontier.source)
+            .or_else(|| Frontier::source_of_1(&bytes))
+    }
+
+    /// The snapshot here: the one this process last recorded or rendered, where the file is
+    /// still that one ([`memo`]), else read and decoded.
     fn snapshot(&self) -> Result<Option<Snapshot>, String> {
-        let Some(bytes) = read_bounded(&self.root.snapshot(&self.name))? else {
+        if let Some(held) = memo::get(&self.root.snapshot(&self.name)) {
+            return Ok(Some(held.snapshot().clone()));
+        }
+        self.decoded()
+    }
+
+    /// The snapshot file, read and decoded.
+    fn decoded(&self) -> Result<Option<Snapshot>, String> {
+        let Some(bytes) = read_bounded(&self.root.snapshot(&self.name), MAX_BYTES)? else {
             return Ok(None);
         };
         let snapshot = Snapshot::decode(&bytes).map_err(|error| error.to_string())?;
@@ -290,6 +423,38 @@ impl File {
             return Err("it is another file's snapshot".to_owned());
         }
         Ok(Some(snapshot))
+    }
+
+    /// The snapshot here with its rows' renderings ([`Rendered`]): the one this process last
+    /// recorded or rendered, where the file is still that one, else read, decoded, rendered and
+    /// kept for the next ask. A materializer pass starts from it, so a pass after one record
+    /// renders and parses only the rows that record changed.
+    ///
+    /// # Errors
+    /// The snapshot is there and does not read.
+    pub fn held(&self) -> Result<Option<Arc<Rendered>>, String> {
+        let path = self.root.snapshot(&self.name);
+        if let Some(held) = memo::get(&path) {
+            return Ok(Some(held));
+        }
+        let before = memo::stamp(&path);
+        let Some(snapshot) = self.decoded()? else {
+            return Ok(None);
+        };
+        let held = Arc::new(Rendered::of(snapshot));
+        if let Some(before) = before {
+            memo::keep(&path, before, Arc::clone(&held));
+        }
+        Ok(Some(held))
+    }
+
+    /// The revision and content ([`Snapshot::content`]) of the snapshot here.
+    fn held_content(&self) -> Option<(u64, [u8; 32])> {
+        if let Some(held) = memo::get(&self.root.snapshot(&self.name)) {
+            return Some((held.snapshot().rev, held.content()));
+        }
+        let snapshot = self.decoded().ok().flatten()?;
+        Some((snapshot.rev, snapshot.content()))
     }
 
     /// Read the file: its rows and its status, with this Mac's own queued writes laid over
@@ -350,8 +515,8 @@ impl File {
     #[must_use]
     pub fn projected_from(&self) -> Option<Frontier> {
         let state = self.state()?;
-        let snapshot = self.snapshot().ok().flatten()?;
-        self.vouched(&state, &snapshot)
+        let (rev, content) = self.held_content()?;
+        self.vouched(&state, rev, &content)
     }
 
     /// [`Self::projected_from`], where the snapshot here is the one at revision `rev`: what the
@@ -360,12 +525,8 @@ impl File {
     #[must_use]
     pub fn projected_at(&self, rev: u64) -> Option<Frontier> {
         let state = self.state()?;
-        let snapshot = self
-            .snapshot()
-            .ok()
-            .flatten()
-            .filter(|held| held.rev == rev)?;
-        self.vouched(&state, &snapshot)
+        let (held, content) = self.held_content().filter(|(held, _)| *held == rev)?;
+        self.vouched(&state, held, &content)
     }
 
     /// The frontier file, where `state` says `snapshot` is its projection: the status records
@@ -374,9 +535,9 @@ impl File {
     /// files are read at different moments; a snapshot with the revision and content the status
     /// names is the one it names, and a frontier with the fingerprint it names is that one, so
     /// no order of reads pairs a snapshot with a frontier it was not projected from.
-    fn vouched(&self, state: &State, snapshot: &Snapshot) -> Option<Frontier> {
-        let content = aterm_codec::hex::encode_lower(&snapshot.content());
-        if state.rev != snapshot.rev || state.snapshot.as_deref() != Some(content.as_str()) {
+    fn vouched(&self, state: &State, rev: u64, content: &[u8; 32]) -> Option<Frontier> {
+        let content = aterm_codec::hex::encode_lower(content);
+        if state.rev != rev || state.snapshot.as_deref() != Some(content.as_str()) {
             return None;
         }
         self.frontier().filter(|frontier| {
@@ -386,7 +547,12 @@ impl File {
 
     /// [`Self::vouched`] for the status and the snapshot `read` took.
     fn frontier_of(&self, read: &Read) -> Option<Frontier> {
-        self.vouched(read.status.state.as_ref()?, read.snapshot.as_ref()?)
+        let snapshot = read.snapshot.as_ref()?;
+        self.vouched(
+            read.status.state.as_ref()?,
+            snapshot.rev,
+            &snapshot.content(),
+        )
     }
 
     fn read_as(&self, overlay: bool) -> Read {
@@ -459,11 +625,39 @@ impl File {
         self.read_as(false).status
     }
 
+    /// Whether the baseline at revision `rev` is there and its first line names `format` (as
+    /// `"format":"<format>"`): what a pass reads of it, never the rest of the file, to know the
+    /// baseline is one this build reads.
+    #[must_use]
+    pub fn baseline_names(&self, rev: u64, format: &str) -> bool {
+        use std::io::{BufRead as _, Read as _};
+        /// The most of a first line read: a header names a table, a collection and its columns.
+        const HEAD: u64 = 64 * 1024;
+        let Ok(file) = std::fs::File::open(self.root.baseline(&self.name, rev)) else {
+            return false;
+        };
+        let mut head = Vec::new();
+        if std::io::BufReader::new(file.take(HEAD))
+            .read_until(b'\n', &mut head)
+            .is_err()
+        {
+            return false;
+        }
+        let word = format!("\"format\":\"{format}\"");
+        head.windows(word.len()).any(|at| at == word.as_bytes())
+    }
+
+    /// Where the snapshot is kept.
+    #[must_use]
+    pub fn snapshot_path(&self) -> std::path::PathBuf {
+        self.root.snapshot(&self.name)
+    }
+
     /// The baseline a pass wrote beside the snapshot at revision `rev`: what each cell showed
     /// and the operations that were its candidates, in the materializer's own encoding.
     #[must_use]
     pub fn baseline(&self, rev: u64) -> Option<Vec<u8>> {
-        read_bounded(&self.root.baseline(&self.name, rev))
+        read_bounded(&self.root.baseline(&self.name, rev), MAX_BYTES)
             .ok()
             .flatten()
     }
@@ -526,7 +720,7 @@ impl File {
                 }
             }
         };
-        match read_bounded(&self.root.face(&self.name, &ext)) {
+        match read_bounded(&self.root.face(&self.name, &ext), SIDECAR_BYTES) {
             Ok(None) => Face::Missing,
             Ok(Some(bytes)) => {
                 let recorded = state.and_then(|state| state.face);
@@ -547,7 +741,7 @@ impl File {
     /// The file's newest operations, oldest first: one JSON object each, value-free.
     #[must_use]
     pub fn history(&self) -> Vec<Value> {
-        read_bounded(&self.root.history(&self.name))
+        read_bounded(&self.root.history(&self.name), SIDECAR_BYTES)
             .ok()
             .flatten()
             .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -563,7 +757,7 @@ impl File {
     /// a pass wrote ([`State::history`]); `None` where it is missing or does not read.
     #[must_use]
     pub fn history_digest(&self) -> Option<String> {
-        read_bounded(&self.root.history(&self.name))
+        read_bounded(&self.root.history(&self.name), SIDECAR_BYTES)
             .ok()
             .flatten()
             .map(|bytes| sha_hex(&bytes))
@@ -615,8 +809,8 @@ pub enum Projection {
 /// One projection of the replica.
 #[derive(Clone, Debug)]
 pub struct Projected {
-    /// The snapshot, its revision not yet set: recording sets it.
-    pub snapshot: Snapshot,
+    /// The snapshot with its rows' renderings, its revision not yet set: recording sets it.
+    pub snapshot: Rendered,
     /// The file's operations, oldest first, one JSON object each; the newest [`HISTORY`] are
     /// kept.
     pub history: Vec<Value>,
@@ -628,6 +822,9 @@ pub struct Projected {
     /// Records of the file's collection the replica holds inert: refused when the snapshot was
     /// built, kept in history with their authors.
     pub inert: u64,
+    /// What the read held and did not project, in aterm-db's one sentence for it (how many,
+    /// whose and why: `typed::refused_words`); `None` where it held none.
+    pub refused: Option<String>,
 }
 
 /// How many revisions' baselines are kept.
@@ -700,10 +897,11 @@ pub fn test_chmods() -> usize {
 mod write {
     use super::{
         BASELINES, File, HISTORY, MAX_BYTES, Opened, Pass, Projected, Projection, Recorded,
-        Restored, read_bounded, sha_hex,
+        Restored, SIDECAR_BYTES, memo, read_bounded, sha_hex,
     };
-    use crate::{Frontier, Kept, Snapshot, State, Why, Word};
+    use crate::{Frontier, Kept, Rendered, Snapshot, State, Why, Word};
     use aterm_uds::file_lock::LockFile;
+    use std::sync::Arc;
     use std::{
         io,
         path::Path,
@@ -832,7 +1030,8 @@ mod write {
             let dir = self.root.baselines(&self.name);
             private_dir(&dir)?;
             let path = self.root.baseline(&self.name, rev);
-            if !put_new(&path, bytes, read_bounded(&path).ok().flatten().as_deref())? {
+            let there = read_bounded(&path, MAX_BYTES).ok().flatten();
+            if !put_new(&path, bytes, there.as_deref())? {
                 return Ok(false);
             }
             let mut revs: Vec<u64> = std::fs::read_dir(&dir)?
@@ -870,8 +1069,7 @@ mod write {
         /// take records its key, and a pass at that key that projected nothing
         /// ([`Projection::Kept`]) keeps the snapshot for the same reason. The rule fails closed:
         /// a snapshot whose frontier file is missing or does not read is replaced only by the
-        /// newest home's read, never by a fenced home's, and a frontier too large for the next
-        /// pass to read back is not written, nor the snapshot with it. The face is written
+        /// newest home's read, never by a fenced home's. The face is written
         /// beside each snapshot written, and again where it is missing; an edited face is left
         /// alone.
         ///
@@ -920,13 +1118,17 @@ mod write {
             }
             let mut state = before.clone();
             // The snapshot and the frontier file here before this pass writes anything.
-            let held = self.snapshot().ok().flatten();
-            let sidecar_there = read_bounded(&root.frontier(name)).ok().flatten();
+            let held = self.held().ok().flatten();
+            let sidecar_there = read_bounded(&root.frontier(name), SIDECAR_BYTES)
+                .ok()
+                .flatten();
             // Whether this pass wrote or removed a file beside the status.
             let mut wrote = false;
             let mut replaced = false;
             // The snapshot this pass's projection left, where it took one.
             let mut taken = None;
+            // The stamp of the snapshot file this pass wrote, which [`memo`] keeps it under.
+            let mut written_at = None;
             state.kept = None;
             let kept_key = state.kept_key.take();
             match pass {
@@ -956,21 +1158,28 @@ mod write {
                     let mut current = false;
                     if !admitted {
                         state.kept = Some(Kept::Behind);
-                    } else if sidecar.len() as u64 > MAX_BYTES {
-                        // The next pass could not read it back, and would then compare its
-                        // read with nothing.
-                        state.kept = Some(Kept::TooLarge);
                     } else {
                         match projection {
                             Projection::Fresh(mut projected) => {
                                 let snapshot = &mut projected.snapshot;
-                                snapshot.rev = match &held {
-                                    Some(old) if old.content() == snapshot.content() => old.rev,
-                                    Some(old) => old.rev.saturating_add(1),
+                                snapshot.set_rev(match &held {
+                                    Some(old) if old.content() == snapshot.content() => {
+                                        old.snapshot().rev
+                                    }
+                                    Some(old) => old.snapshot().rev.saturating_add(1),
                                     None => state.rev.saturating_add(1),
-                                };
+                                });
                                 let bytes = snapshot.encode();
-                                if bytes.len() as u64 > MAX_BYTES {
+                                // A baseline holds more a row than the snapshot it is of, and
+                                // is read back under the same bound (`File::baseline`): a
+                                // pass that wrote one past it would leave every write against
+                                // the revision refused.
+                                if bytes.len() as u64 > MAX_BYTES
+                                    || projected
+                                        .baseline
+                                        .as_ref()
+                                        .is_some_and(|baseline| baseline.len() as u64 > MAX_BYTES)
+                                {
                                     // A read would refuse it: the last snapshot a read takes
                                     // stays, and a pass at the same key does not project it
                                     // again.
@@ -1002,10 +1211,11 @@ mod write {
                             baseline,
                             withheld,
                             inert,
+                            refused,
                         } = *projected;
                         wrote |= put_new(&root.frontier(name), &sidecar, sidecar_there.as_deref())?;
                         if let Some(baseline) = baseline {
-                            wrote |= self.write_baseline(snapshot.rev, &baseline)?;
+                            wrote |= self.write_baseline(snapshot.snapshot().rev, &baseline)?;
                         }
                         // The content here already, at its revision, its columns stated as
                         // this pass states them: the file and the time it was written stay. A
@@ -1016,13 +1226,16 @@ mod write {
                         // wrote; a build before the keyed pass rewrites every pass, without
                         // the types, and this build states them again at the same revision.
                         let same = held.as_ref().is_some_and(|old| {
-                            old.rev == snapshot.rev
-                                && old.ext == snapshot.ext
+                            let (old_rows, new_rows) = (old.snapshot(), snapshot.snapshot());
+                            old_rows.rev == new_rows.rev
+                                && old_rows.ext == new_rows.ext
                                 && old.content() == snapshot.content()
-                                && old.columns == snapshot.columns
+                                && old_rows.columns == new_rows.columns
                         });
                         if !same {
-                            put(&root.snapshot(name), &bytes)?;
+                            let path = root.snapshot(name);
+                            put(&path, &bytes)?;
+                            written_at = memo::stamp(&path);
                             (wrote, replaced) = (true, true);
                         }
                         let skip = history.len().saturating_sub(HISTORY);
@@ -1032,19 +1245,21 @@ mod write {
                             lines.push('\n');
                         }
                         let path = root.history(name);
-                        let there = read_bounded(&path).ok().flatten();
+                        let there = read_bounded(&path, SIDECAR_BYTES).ok().flatten();
                         wrote |= put_new(&path, lines.as_bytes(), there.as_deref())?;
-                        state.rev = snapshot.rev;
+                        let rows = snapshot.snapshot();
+                        state.rev = rows.rev;
                         state.snapshot = Some(aterm_codec::hex::encode_lower(&snapshot.content()));
-                        state.rows = snapshot.rows.len() as u64;
-                        state.complete = snapshot.complete;
-                        state.kind.clone_from(&snapshot.kind);
-                        state.ext.clone_from(&snapshot.ext);
+                        state.rows = rows.rows.len() as u64;
+                        state.complete = rows.complete;
+                        state.kind.clone_from(&rows.kind);
+                        state.ext.clone_from(&rows.ext);
                         state.withheld = withheld;
                         state.inert = Some(inert);
+                        state.refused = Some(refused);
                         state.key = Some(key);
                         state.history = Some(sha_hex(lines.as_bytes()));
-                        wrote |= self.write_face(&mut state, &snapshot, held.as_ref())?;
+                        wrote |= self.write_face(&mut state, &snapshot, held.as_deref())?;
                         taken = Some(snapshot);
                         current = true;
                     } else if current {
@@ -1054,7 +1269,7 @@ mod write {
                         state.fingerprint = aterm_codec::hex::encode_lower(&frontier.fingerprint());
                         state.era = frontier.era;
                         state.generation = frontier.generation;
-                        state.records = frontier.ids.len() as u64;
+                        state.records = frontier.records();
                     }
                     (state.word, state.why) = match (newest, current) {
                         // A fenced home's records are held whatever became of the projection.
@@ -1067,10 +1282,10 @@ mod write {
             }
             if taken.is_none()
                 && let Some(snapshot) = &held
-                && self.face_missing(&state, snapshot)
+                && self.face_missing(&state, snapshot.snapshot())
             {
-                state.ext.clone_from(&snapshot.ext);
-                wrote |= self.write_face(&mut state, snapshot, held.as_ref())?;
+                state.ext.clone_from(&snapshot.snapshot().ext);
+                wrote |= self.write_face(&mut state, snapshot, held.as_deref())?;
             }
             // The count and the time are all that differ from the status there: the pass
             // changed nothing. It writes nothing where no other pass's look is outstanding.
@@ -1087,6 +1302,11 @@ mod write {
             state.seq = state.seq.saturating_add(1);
             state.pass_ms = now_ms;
             put(&root.state(name), &state.encode())?;
+            // The snapshot this pass wrote is the file's while its stamp holds: the next pass,
+            // and a read in this process, start from it.
+            if let (Some(snapshot), Some(stamp)) = (taken, written_at) {
+                memo::keep(&root.snapshot(name), stamp, Arc::new(snapshot));
+            }
             Ok(if fenced {
                 Recorded::Fenced
             } else if let Some(kept) = state.kept {
@@ -1114,7 +1334,7 @@ mod write {
             };
             let path = root.face(name, &snapshot.ext);
             let text = snapshot.face();
-            let there = match read_bounded(&path) {
+            let there = match read_bounded(&path, SIDECAR_BYTES) {
                 Ok(there) => there,
                 Err(why) => {
                     return Err(io::Error::other(format!(
@@ -1174,7 +1394,7 @@ mod write {
             } else {
                 state.ext.clone()
             };
-            if read_bounded(&root.face(name, &ext))
+            if read_bounded(&root.face(name, &ext), SIDECAR_BYTES)
                 .ok()
                 .flatten()
                 .as_deref()
@@ -1225,7 +1445,7 @@ mod write {
         fn keep_aside(&self, bytes: &[u8], ext: &str) -> io::Result<std::path::PathBuf> {
             for n in 1..=u32::MAX {
                 let path = self.root.rejected_at(&self.name, ext, n);
-                match read_bounded(&path) {
+                match read_bounded(&path, SIDECAR_BYTES) {
                     Ok(Some(there)) if there == bytes => return Ok(path),
                     Ok(None) => {
                         put(&path, bytes)?;
@@ -1288,11 +1508,11 @@ mod write {
         fn write_face(
             &self,
             state: &mut State,
-            snapshot: &Snapshot,
-            held: Option<&Snapshot>,
+            snapshot: &Rendered,
+            held: Option<&Rendered>,
         ) -> io::Result<bool> {
-            let path = self.root.face(&self.name, &snapshot.ext);
-            let Ok(there) = read_bounded(&path) else {
+            let path = self.root.face(&self.name, &snapshot.snapshot().ext);
+            let Ok(there) = read_bounded(&path, SIDECAR_BYTES) else {
                 // A face that cannot be read is no pass's to replace.
                 return Ok(false);
             };
@@ -1303,8 +1523,12 @@ mod write {
             if !ours {
                 return Ok(false);
             }
-            let text = snapshot.face();
-            if text.len() as u64 > crate::MAX_FACE_BYTES {
+            // A face the grid would refuse for its records, its header one of them, is not
+            // rendered at all.
+            let text = (snapshot.snapshot().rows.len() < crate::MAX_FACE_RECORDS)
+                .then(|| snapshot.face())
+                .filter(|text| text.len() as u64 <= crate::MAX_FACE_BYTES);
+            let Some(text) = text else {
                 state.face = None;
                 if there.is_none() {
                     return Ok(false);
@@ -1316,7 +1540,7 @@ mod write {
                     _ => {}
                 }
                 return Ok(true);
-            }
+            };
             let wrote = put_new(&path, text.as_bytes(), there.as_deref())?;
             state.face = Some(sha_hex(text.as_bytes()));
             Ok(wrote)

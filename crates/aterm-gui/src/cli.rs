@@ -203,7 +203,8 @@ const KEYS_HELP: &str = concat!(
     "    Cmd-N / Cmd-T     New window (same process) / new tab (same window).\n",
     "    Cmd-W             Close focused pane -> tab -> window; last window quits aterm.\n",
     "    Cmd-Shift-T       Reopen most recently closed tab.\n",
-    "    Cmd-Shift-] / [   Next / previous tab (wraps).   Cmd-1..9  Nth tab.\n",
+    "    Cmd-Shift-] / [   Next / previous tab (wraps).\n",
+    "    Cmd-1..9          Select a numbered session in the navigator, or a tab when it is hidden.\n",
     "    Cmd-Shift-P       Command Palette (every action, searchable).\n",
     "    Cmd-Opt-Arrow     Focus pane in that direction.   Cmd-Shift-Enter  Zoom pane (toggle).\n",
     "    Cmd-Up / Cmd-Down Scrollback top / live.   (These three have no menu item.)\n",
@@ -237,6 +238,7 @@ fn keys_help() -> String {
     for (chords, action) in rows {
         s.push_str(&format!("    {chords:<width$}  {action}\n"));
     }
+    s.push_str("    ctrl+shift+1..9  Select a numbered session in the visible navigator.\n");
     s.push_str("    ctrl+click  Open hyperlink, URL (http/https/mailto) or file:line citation;\n");
     s.push_str("                ctrl+alt+click where the program tracks the mouse.\n");
     s.push_str("    shift+drag  Select text where the program tracks the mouse.\n");
@@ -615,7 +617,7 @@ const STARTER_CONFIG: &str = concat!(
 
 # --- system awareness: live Global / aterm / Tab stats bars (⌘I: Stats Lens)
 # [sys]
-# stats_bars = \"deck\"              # \"deck\" (default: under titlebar where a window shows System Resources, sill elsewhere) | \"sill\" (bottom padding) | \"off\"
+# stats_bars = \"deck\"              # \"deck\" (default: under titlebar where a window shows System Resources, sill elsewhere) | \"sill\" (compact top band) | \"off\"
 # stats_deck_size = \"auto\"         # \"auto\" (default: Folded at any height) | \"full\" | \"folded\"
 # disk_roots = []                  # ~/Library or protected folders the disk walker may size
 

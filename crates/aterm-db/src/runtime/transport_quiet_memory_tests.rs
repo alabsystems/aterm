@@ -4,6 +4,12 @@
 use super::*;
 use std::os::unix::fs::MetadataExt as _;
 
+/// The remembered endpoints' cache moves into `.ubd` and leaves the custody keys, another
+/// scope's reading and its own entries as they were; each write of it is counted
+/// (`commons_remembered_writes`).
+///
+/// NEGATIVE CONTROL (2026-11-15, an inverse edit then undone): with `Memory::write` counting
+/// nothing, the write read `left: 0, right: 1`.
 #[test]
 fn remembered_cache_moves_without_keys_or_scope_or_age_changes() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -54,7 +60,9 @@ fn remembered_cache_moves_without_keys_or_scope_or_age_changes() {
         at_ms: 5678,
         ..remembered
     };
+    let writes = census::cadence_here().remembered_writes;
     memory.write(&[newer]);
+    assert_eq!(census::cadence_here().remembered_writes - writes, 1);
     assert_eq!(memory.read(), vec![newer]);
     let other = Memory::prepare(root.path(), [8; std::mem::size_of::<MemoryScope>()]).unwrap();
     assert!(

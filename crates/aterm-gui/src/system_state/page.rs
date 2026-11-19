@@ -2322,6 +2322,8 @@ impl<'a, 'b> Page<'a, 'b> {
                     self.span(super::TURN_ON_SYNC.to_owned(), top + height, h);
                 } else if row.install_tools {
                     self.span(super::INSTALL_TOOLS.to_owned(), top + height, h);
+                } else if super::resources_link(row.subject) {
+                    self.span(super::resources_link_key(slug), top + height, h);
                 }
                 children.push(node);
                 height += h;
@@ -2403,17 +2405,23 @@ impl<'a, 'b> Page<'a, 'b> {
                 + 6.0 * pieces.len().saturating_sub(1) as f32
         };
         // Its one quiet button: Turn On Sync for a kind turned off, Install… for the tools a
-        // wait (Low Data Mode) holds back, which a person may start now.
+        // wait (Low Data Mode) holds back, which a person may start now, Open System Resources
+        // where that page holds the controls of what the row reads.
         let button = if row.turn_on_sync {
-            Some((super::TURN_ON_SYNC, "Turn On Sync"))
+            Some((super::TURN_ON_SYNC.to_owned(), "Turn On Sync"))
         } else if row.install_tools {
-            Some((super::INSTALL_TOOLS, super::INSTALL_TOOLS_LABEL))
+            Some((super::INSTALL_TOOLS.to_owned(), super::INSTALL_TOOLS_LABEL))
+        } else if super::resources_link(row.subject) {
+            Some((
+                super::resources_link_key(slug),
+                super::OPEN_SYSTEM_RESOURCES,
+            ))
         } else {
             None
         }
         .map(|(key, words)| {
             Self::fitted_button(
-                key,
+                &key,
                 words.to_owned(),
                 None,
                 StyleRef::Quiet,
@@ -2899,7 +2907,7 @@ impl<'a, 'b> Page<'a, 'b> {
 }
 
 /// A row's small mark (§4.1's 12 pt glyph): its chip, as the row rule decided it.
-fn row_mark(row: &RowView) -> Mark {
+pub(super) fn row_mark(row: &RowView) -> Mark {
     match row.chip {
         Some(Chip::InPlace | Chip::LastKnown) => Mark::Done,
         Some(Chip::WillChange { busy: true }) => Mark::Working,

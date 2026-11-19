@@ -148,22 +148,25 @@ fn a_maximal_open_record_fits_the_log_line_cap() {
     longest.node = "f".repeat(NODE_BYTES);
     assert!(longest.by.len() <= TOKEN_MAX);
     longest.why_src = WhySrc::Asked;
-    // The longest row on disk: an earlier build's, whose requester token names a legacy tab. Only
-    // its length is judged here; `a_tab_and_a_token_name_a_tab_id_in_either_form` reads one.
+    // The longest row on disk: an earlier build's, whose requester token names a legacy tab.
+    // Its exact historical identity still reads back as journal data.
     let mut stored = longest.clone();
     stored.by = LEGACY_BY.to_owned();
+    assert_eq!(stored.by.len(), 37);
     assert!(stored.by.len() <= TOKEN_MAX);
-    let stored = Rec {
+    assert!(is_token(&stored.by), "a maximal stored fleet actor");
+    let stored_rec = Rec {
         t_ms: u64::MAX,
         id: format!("r-20261109-1411-87be5228-{}", u32::MAX),
         body: Body::Open(stored),
-    }
-    .line();
+    };
+    let stored = stored_rec.line();
     assert!(
         stored.len() <= MAX_RECORD_BYTES,
         "{} bytes: {stored}",
         stored.len()
     );
+    assert_eq!(Rec::parse(&stored), Some(stored_rec));
     let rec = Rec {
         t_ms: u64::MAX,
         id: format!("r-20261109-1411-87be5228-{}", u32::MAX),
@@ -454,6 +457,10 @@ fn the_longest_claim_line_fits_the_record_cap() {
     let claim_of = |path: String, sid: &str| {
         let by = format!("fleet:{}:{sid}", "b".repeat(8));
         assert!(by.len() <= TOKEN_MAX);
+        assert!(is_token(&by), "a stored fleet actor");
+        if sid == LEGACY_SID {
+            assert_eq!(by.len(), 37, "a maximal stored fleet actor");
+        }
         Rec {
             t_ms: u64::MAX,
             id: longest_id.clone(),
@@ -472,13 +479,15 @@ fn the_longest_claim_line_fits_the_record_cap() {
     assert!(line.len() <= MAX_RECORD_BYTES, "{} bytes", line.len());
     assert_eq!(Rec::parse(&line), Some(claim(path.clone())));
     // The longest row on disk: an earlier build's, whose tab and requester token both name a
-    // legacy tab, 22 bytes more. Only its length is judged here.
-    let stored = claim_of(path, LEGACY_SID).line();
+    // legacy tab, 22 bytes more. The historical actor and tab both read back unchanged.
+    let stored_rec = claim_of(path, LEGACY_SID);
+    let stored = stored_rec.line();
     assert_eq!(
         stored.len(),
         line.len() + 2 * (LEGACY_SID.len() - SID.len())
     );
     assert!(stored.len() <= MAX_RECORD_BYTES, "{} bytes", stored.len());
+    assert_eq!(Rec::parse(&stored), Some(stored_rec));
     // NEGATIVE: a path one encoded byte over the cap is refused.
     let over = format!("/{}", "a".repeat(CLAIM_PATH_BYTES));
     assert!(Rec::parse(&claim(over).line()).is_none());
@@ -582,12 +591,15 @@ fn the_longest_review_and_reply_lines_fit_the_cap() {
     let review = review_by(token);
     assert!(review.len() <= MAX_RECORD_BYTES, "{}", review.len());
     assert!(Rec::parse(&review).is_some());
-    // The longest rows on disk: an earlier build's, whose token names a legacy tab. Only their
-    // length is judged here.
+    // The longest rows on disk: an earlier build's, whose token names a legacy tab. They fit
+    // the cap and still parse as stored journal records.
+    assert_eq!(LEGACY_BY.len(), 37);
     assert!(LEGACY_BY.len() <= TOKEN_MAX);
+    assert!(is_token(LEGACY_BY), "a maximal stored fleet actor");
     let stored = review_by(LEGACY_BY);
     assert_eq!(stored.len(), review.len() + LEGACY_BY.len() - token.len());
     assert!(stored.len() <= MAX_RECORD_BYTES, "{}", stored.len());
+    assert!(Rec::parse(&stored).is_some());
     let said = Said {
         t_ms: u64::MAX,
         id: "r-20261109-1411-87be5228-4294967295".to_owned(),
@@ -613,9 +625,11 @@ fn the_longest_review_and_reply_lines_fit_the_cap() {
     };
     let reply = reply_by(token);
     assert!(reply.len() <= MAX_RECORD_BYTES, "{}", reply.len());
+    assert!(Rec::parse(&reply).is_some());
     let stored = reply_by(LEGACY_BY);
     assert_eq!(stored.len(), reply.len() + LEGACY_BY.len() - token.len());
     assert!(stored.len() <= MAX_RECORD_BYTES, "{}", stored.len());
+    assert!(Rec::parse(&stored).is_some());
     // NEGATIVE: a key past the cap is no record's.
     let over = Rec {
         t_ms: 1,
@@ -766,10 +780,12 @@ fn the_longest_gone_line_fits_the_record_cap() {
     assert_eq!(Rec::parse(&line), Some(gone));
 }
 
-/// A record names a tab, and an actor token a requester, by its tab ID in either form: `t` and
-/// 10 Crockford base32 characters, or the `s-` and 20 hex digits a tab opened before that form
-/// keeps until aterm restores or closes it. NEGATIVE CONTROL: a malformed ID of each form is refused, whole and
-/// inside a fleet drive's token.
+/// A stored record names a tab, and a stored actor token its source tab, by either ID form:
+/// `t` and 10 Crockford base32 characters, or the exact `s-` and 20 lowercase hex digits a tab
+/// opened before that form keeps until aterm restores or closes it. Stored fleet actor tokens
+/// retain either form; live fleet requester and actor constructors validate current IDs
+/// separately. NEGATIVE CONTROLS: malformed IDs of either form are refused whole and inside
+/// stored fleet drive tokens.
 #[test]
 fn a_tab_and_a_token_name_a_tab_id_in_either_form() {
     for tab in ["tqn5r6e0148", LEGACY_SID] {

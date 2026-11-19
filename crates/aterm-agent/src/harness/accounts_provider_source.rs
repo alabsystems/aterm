@@ -10,6 +10,9 @@ use super::*;
 
 enum Selected {
     Native,
+    /// The lab may name this Mac and is not read yet, in these words: no source is read, and the
+    /// sync keeps the roster as it stands ([`super::super::alab_roster::Chosen::Pending`]).
+    Pending(String),
     /// The vault entry the pool syncs from by default, with the text read when captured.
     Local(Option<LocalCliSource>),
     /// A named source: where it is a local file or a vault entry, where to read it again.
@@ -100,13 +103,14 @@ impl ProviderSource {
         } else {
             None
         };
-        let native = admission
+        let chosen = admission
             .as_ref()
             .map(|captured| captured.chosen(cli, roster, named))
-            .transpose()?
-            .flatten();
-        let (selected, raw) = if native.is_some() {
+            .transpose()?;
+        let (selected, raw) = if let Some(Chosen::Lab(_)) = chosen {
             (Selected::Native, None)
+        } else if let Some(Chosen::Pending(why)) = chosen {
+            (Selected::Pending(why), None)
         } else if let Some(named) = named {
             let at = match fetch_plan(env, named)? {
                 FetchPlan::File(path) => Some(SnapshotAt::File(path)),
@@ -168,9 +172,18 @@ impl ProviderSource {
         local_cli_source_observed(cli, home, policy)
     }
 
+    /// Why the lab is not read yet, where this capture read no source for that reason.
+    pub(super) fn lab_pending(&self) -> Option<&str> {
+        match &self.selected {
+            Selected::Pending(why) => Some(why),
+            Selected::Native | Selected::Local(_) | Selected::Explicit(_) => None,
+        }
+    }
+
     fn source_name(&self) -> Option<String> {
         match &self.selected {
             Selected::Native => Some(super::super::alab_roster::SOURCE.to_owned()),
+            Selected::Pending(_) => None,
             Selected::Local(selected) => selected.as_ref().map(|s| s.entry.source()),
             Selected::Explicit(_) => self.named.clone(),
         }
@@ -281,6 +294,7 @@ impl ProviderSource {
                 .as_ref()
                 .ok_or("native source observation is missing")?
                 .chosen(cli, roster, self.named.as_deref())?
+                .lab()
                 .ok_or_else(|| {
                     SyncError::retry(
                         Retry::Changed,

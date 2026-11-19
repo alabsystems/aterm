@@ -109,6 +109,7 @@ pub const fn failure_reason(kind: ErrorKind) -> &'static str {
         ErrorKind::MemberBusy => "a member's vault pass held its state",
         ErrorKind::LabIdentity => "a lab identity never joins the live ALab",
         ErrorKind::Dropped => "a rotation dropped this Mac from the vault it would join",
+        ErrorKind::LaterFormat => "source's records are in a later format",
         ErrorKind::Other => "unclassified failure",
     }
 }
@@ -129,7 +130,9 @@ const fn failure_code(kind: ErrorKind) -> &'static str {
         ErrorKind::MemberBusy => "member-busy",
         ErrorKind::LabIdentity => "lab-identity",
         ErrorKind::Dropped => "dropped",
-        ErrorKind::Other => "other",
+        // The word a records pull's `409` always had: a build before the kind reads the line
+        // as it did. The `needs update` row (tracker FL-148E) gives it a word of its own.
+        ErrorKind::LaterFormat | ErrorKind::Other => "other",
     }
 }
 

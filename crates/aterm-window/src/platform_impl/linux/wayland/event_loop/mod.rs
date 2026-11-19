@@ -374,7 +374,7 @@ impl<T: 'static> EventLoop<T> {
         self.with_state(|state| {
             buffer_sink.append(&mut state.window_events_sink.lock().unwrap());
         });
-        for event in buffer_sink.drain() {
+        for (event, _) in buffer_sink.drain() {
             let event = event.map_nonuser_event().unwrap();
             callback(event, &self.window_target);
         }
@@ -382,9 +382,15 @@ impl<T: 'static> EventLoop<T> {
         self.with_state(|state| {
             buffer_sink.append(&mut state.events_sink);
         });
-        for event in buffer_sink.drain() {
+        for (event, release) in buffer_sink.drain() {
+            if let Some(id) = release {
+                self.with_state(|s| s.outside_releases.dispatching = Some(id));
+            }
             let event = event.map_nonuser_event().unwrap();
             callback(event, &self.window_target);
+            if let Some(id) = release {
+                self.with_state(|s| s.outside_releases.dispatched(id));
+            }
         }
 
         self.with_state(|state| {

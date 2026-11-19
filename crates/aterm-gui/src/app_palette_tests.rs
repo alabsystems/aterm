@@ -1908,7 +1908,8 @@ fn menu_copy_preserves_a_pinned_stats_sentence_owner_over_native_content() {
                 .sys
                 .get_or_insert_with(Default::default)
                 .stats_bars = Some("sill".into());
-            app.windows.get_mut(&wid).unwrap().metrics.pad = 24;
+            let head = app.deck_head_px(wid, 0.0, app.windows[&wid].scale, 0);
+            app.windows.get_mut(&wid).unwrap().metrics.head = head;
             if native {
                 assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
                 if selected {

@@ -1916,9 +1916,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
 /// A GROK SESSION'S ACCOUNT MENU OFFERS NO AUTOMATIC SIGN-IN: no Grok renewal starts in the
 /// background (`Cli::renews_headlessly`), so a Grok row with an email that is not enrolled here
 /// cannot be chosen, where choosing it would start nothing. CONTROL: the same row in Kimi's pool
-/// can be chosen, its renewal starting by itself. Unix only, as the manual sign-in queue is
-/// (`accounts::manual_signin_capability`): elsewhere no not-enrolled row can be chosen.
-#[cfg(unix)]
+/// can be chosen, its renewal starting by itself.
 #[test]
 fn a_grok_pools_menu_offers_no_automatic_sign_in() {
     use aterm_agent::harness::accounts::Cli;
@@ -2214,9 +2212,6 @@ fn a_muse_sessions_account_menu_is_its_own_login() {
     );
 }
 
-// Unix only, as the manual sign-in queue a not-enrolled row's selection needs is
-// (`accounts::manual_signin_capability`): elsewhere selecting one refuses.
-#[cfg(unix)]
 #[test]
 fn select_menu_account_for_pins_enrolled_rows_and_dispatches_auto_login_per_cli_pool() {
     use aterm_agent::harness::accounts::{self, Cli};

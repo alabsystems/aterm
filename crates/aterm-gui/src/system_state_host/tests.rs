@@ -64,6 +64,7 @@ mod queued_panes {
             permissions: Some(InitialSetupPermissionPolicy {
                 revision: 1,
                 allowed: true,
+                person_access: true,
             }),
             observed: vec![Observation {
                 subject: Subject::Access(Access::Accessibility),
@@ -559,6 +560,7 @@ fn a_stop_of_a_waiting_choice_leaves_the_tools_install_alone_and_stands_until_a_
             permissions: Some(crate::InitialSetupPermissionPolicy {
                 revision: 4,
                 allowed: true,
+                person_access: true,
             }),
             ..SetupStatus::default()
         },
@@ -594,6 +596,7 @@ fn a_stop_of_a_waiting_choice_leaves_the_tools_install_alone_and_stands_until_a_
             permissions: Some(crate::InitialSetupPermissionPolicy {
                 revision: 4,
                 allowed: true,
+                person_access: true,
             }),
             ..SetupStatus::default()
         },
@@ -678,6 +681,7 @@ fn a_stopped_wait_ends_with_a_press_or_a_run_nobody_stopped() {
         permissions: Some(crate::InitialSetupPermissionPolicy {
             revision: 4,
             allowed: true,
+            person_access: true,
         }),
         ..SetupStatus::default()
     };
@@ -914,6 +918,7 @@ fn withdrawn_system_state_request_cannot_open_or_hold_a_page() {
                 permissions: Some(crate::InitialSetupPermissionPolicy {
                     revision: 5,
                     allowed: true,
+                    person_access: true,
                 }),
                 ..SetupStatus::default()
             },
@@ -958,6 +963,7 @@ fn withdrawn_system_state_offer_restores_policy_only_after_a_fresh_read() {
         permissions: Some(crate::InitialSetupPermissionPolicy {
             revision: 5,
             allowed: true,
+            person_access: true,
         }),
         ..SetupStatus::default()
     };
@@ -1007,6 +1013,7 @@ fn an_automatic_offer_withdrawn_after_queueing_restores_only_fresh_policy() {
         permissions: Some(crate::InitialSetupPermissionPolicy {
             revision: 5,
             allowed: true,
+            person_access: true,
         }),
         ..SetupStatus::default()
     };
@@ -1078,6 +1085,7 @@ fn a_rejected_automatic_offer_restores_fresh_policy_unless_stopped() {
             permissions: Some(crate::InitialSetupPermissionPolicy {
                 revision: 5,
                 allowed: true,
+                person_access: true,
             }),
             ..SetupStatus::default()
         };
@@ -1147,6 +1155,7 @@ fn an_automatic_offer_with_a_closed_answer_receiver_restores_fresh_policy() {
         permissions: Some(crate::InitialSetupPermissionPolicy {
             revision: 5,
             allowed: true,
+            person_access: true,
         }),
         ..SetupStatus::default()
     };
@@ -1198,6 +1207,7 @@ fn a_refused_local_decision_keeps_its_permission_hold() {
             permissions: Some(crate::InitialSetupPermissionPolicy {
                 revision: 5,
                 allowed: true,
+                person_access: true,
             }),
             ..SetupStatus::default()
         };
@@ -1239,6 +1249,7 @@ fn withdrawn_system_state_offer_cannot_release_a_newer_local_decision() {
         permissions: Some(crate::InitialSetupPermissionPolicy {
             revision: 6,
             allowed: true,
+            person_access: true,
         }),
         ..SetupStatus::default()
     };
@@ -1281,6 +1292,7 @@ fn a_restore_holds_no_access_step() {
         permissions: Some(crate::InitialSetupPermissionPolicy {
             revision: 6,
             allowed: true,
+            person_access: true,
         }),
         ..SetupStatus::default()
     };
@@ -1603,6 +1615,7 @@ fn a_waiting_launch_offer_keeps_previous_permission_policy_held_and_allows_only_
     status.permissions = Some(crate::InitialSetupPermissionPolicy {
         revision: 5,
         allowed: true,
+        person_access: true,
     });
     for row in &mut status.observed {
         if row.subject == aterm_types::macos_setup::Subject::Access(Access::FullDiskAccess) {
@@ -1684,6 +1697,7 @@ fn the_offer_is_answered_on_the_first_tick_focused_or_not() {
                     permissions: Some(crate::InitialSetupPermissionPolicy {
                         revision: 7,
                         allowed: true,
+                        person_access: true,
                     }),
                     run: Some(crate::InitialSetupRunPolicy {
                         revision: 7,
@@ -1999,6 +2013,7 @@ fn a_stop_during_admission_keeps_permissions_held_after_the_old_ack() {
     let allowed = Some(crate::InitialSetupPermissionPolicy {
         revision: 4,
         allowed: true,
+        person_access: true,
     });
     fresh(
         &mut app,
@@ -2437,6 +2452,7 @@ fn detached_apply_reopen_waits_for_its_receipt(accepted: bool) {
     let allowed = Some(crate::InitialSetupPermissionPolicy {
         revision: 4,
         allowed: true,
+        person_access: true,
     });
     let idle = SetupStatus {
         plan: Some(Plan::default()),
@@ -2977,7 +2993,11 @@ mod observation_start {
 
         SetupStatus {
             plan: Some(plan.clone()),
-            permissions: Some(crate::InitialSetupPermissionPolicy { revision, allowed }),
+            permissions: Some(crate::InitialSetupPermissionPolicy {
+                revision,
+                allowed,
+                person_access: allowed,
+            }),
             observed: Access::ALL
                 .into_iter()
                 .map(|access| Observation {
@@ -5798,6 +5818,7 @@ fn admitted_here(app: &mut App) -> SetupStatus {
         permissions: Some(crate::InitialSetupPermissionPolicy {
             revision: 5,
             allowed: true,
+            person_access: true,
         }),
         ..running()
     };
@@ -5930,6 +5951,7 @@ fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
     newer.permissions = Some(crate::InitialSetupPermissionPolicy {
         revision: 6,
         allowed: true,
+        person_access: true,
     });
     newer.run = Some(crate::InitialSetupRunPolicy {
         revision: 6,
@@ -6094,6 +6116,7 @@ fn a_plan_without_the_repositories_ends_the_shims_word_of_an_install() {
         let permissions = Some(crate::InitialSetupPermissionPolicy {
             revision: 4,
             allowed: true,
+            person_access: true,
         });
         app.observe_initial_setup_permissions(permissions);
         app.publish_system_state(SetupStatus {
@@ -7165,4 +7188,240 @@ fn readings_are_owed_from_the_launch_and_a_dropped_publication_until_the_loop_ta
     drop(window);
     // A stand-in ends with its guard: the thread can hold another.
     drop(crate::SetupLoopForTest::before_its_proxy());
+}
+
+/// THE SPOTLIGHT INDEXING ROW SETS NOTHING AND LINKS TO SYSTEM RESOURCES (FL-188): the row is a
+/// reading no switch governs. Turning the Mac settings line off and on clears and sets that
+/// line's bits alone, Permissions with them unchanged, and the row reads the scope as before;
+/// turning Permissions off leaves the row managed and still reading the scope's owed state, where
+/// Debugger access, which that switch governs, is left as is. The row's Open System Resources,
+/// and Rust in Spotlight's, open the System Resources page at its macOS configuration section,
+/// its heading in the room, and it stays there as readings that land after the press grow the
+/// documents above it, until the person scrolls.
+/// CONTROLS: Debugger access goes left as is with Permissions off; the Dock, which offers no
+/// such link, opens nothing for the same key; the person's scroll takes the section out of the
+/// room.
+#[test]
+fn the_spotlight_indexing_row_sets_nothing_and_links_to_system_resources() {
+    use aterm_types::macos_setup::{SPOTLIGHT_OWED, Standing, Subject};
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let spotlight = Subject::Access(Access::SpotlightScope);
+    let row = |app: &mut App, subject: Subject| {
+        app.native_runtime
+            .system_state_mut()
+            .expect("the page is open")
+            .reviewed_row(subject)
+    };
+    let selection = |app: &mut App| {
+        app.native_runtime
+            .system_state_mut()
+            .expect("the page is open")
+            .reviewed_plan()
+            .selection
+    };
+    let switch = |app: &mut App, wid, view, line: &str, on: bool| {
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("system-state/line/{line}/switch")),
+                value: Some(SemanticInput::Bool(on)),
+            }),
+        )
+        .unwrap();
+    };
+
+    let mut app = App::headless_for_test();
+    app.vitals.snapshot = Some(std::sync::Arc::new(crate::stats_deck::tests::snapshot()));
+    let (wid, _, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    let mut status = fixture_status("set-up").unwrap();
+    for seen in &mut status.observed {
+        if seen.subject == spotlight {
+            seen.standing = Standing::NeedsYou;
+            seen.now = Some(SPOTLIGHT_OWED.into());
+        }
+    }
+    fresh(&mut app, status);
+    let before = row(&mut app, spotlight);
+    assert_eq!(before.standing, Some(Standing::NeedsYou));
+    assert!(before.managed);
+
+    // The Mac line's switch sets its own bits and nothing of the row.
+    let permissions = selection(&mut app).contains(Setting::Permissions);
+    switch(&mut app, wid, view, "mac", false);
+    let off = selection(&mut app);
+    assert!(
+        crate::system_state::lines::Line::Mac
+            .settings()
+            .iter()
+            .all(|bit| !off.contains(*bit)),
+        "the switch clears the Mac line's bits"
+    );
+    assert_eq!(off.contains(Setting::Permissions), permissions);
+    assert_eq!(row(&mut app, spotlight), before, "the row reads as before");
+    switch(&mut app, wid, view, "mac", true);
+    assert_eq!(row(&mut app, spotlight), before);
+
+    // Permissions off: the row is still managed and reads the scope; Debugger access is left.
+    switch(&mut app, wid, view, "permissions", false);
+    assert!(!selection(&mut app).contains(Setting::Permissions));
+    let after = row(&mut app, spotlight);
+    assert!(after.managed && after.standing == Some(Standing::NeedsYou));
+    assert!(
+        !row(&mut app, Subject::Access(Access::Debugger)).managed,
+        "CONTROL: a row Permissions governs is left as is"
+    );
+
+    // The Dock offers no link: its key opens nothing.
+    press(&mut app, wid, view, "system-state/row/dock/open-resources");
+    assert_eq!(
+        app.active_native_view(wid).map(|(_, front)| front),
+        Some(view),
+        "CONTROL: a row with no link opens nothing"
+    );
+    let at_section = |app: &App| {
+        let (instance, _) = app.active_native_view(wid).expect("a page in front");
+        assert_eq!(
+            app.native_runtime.app(instance).map(|page| page.kind()),
+            Some(AppKind::SystemResources)
+        );
+        !app.compiled_native_ui(wid)
+            .expect("the page compiles")
+            .semantic(&UiKey::new(crate::native_resources::MACOS_KEY))
+            .expect("the page lays its macOS configuration section")
+            .offscreen
+    };
+    press(
+        &mut app,
+        wid,
+        view,
+        "system-state/row/spotlight-indexing/open-resources",
+    );
+    assert!(
+        at_section(&app),
+        "Spotlight indexing opens System Resources at its macOS configuration section"
+    );
+
+    // Pressed before any reading, the section stays in the room as the readings land and the
+    // documents above it grow, until the person scrolls.
+    let mut app = App::headless_for_test();
+    let (wid, _, view) = page(&mut app);
+    fresh(&mut app, fixture_status("set-up").unwrap());
+    press(
+        &mut app,
+        wid,
+        view,
+        "system-state/row/rust-docs/open-resources",
+    );
+    assert!(at_section(&app), "so does Rust in Spotlight's");
+    app.vitals.snapshot = Some(std::sync::Arc::new(crate::stats_deck::tests::snapshot()));
+    app.publish_resources();
+    assert!(
+        at_section(&app),
+        "the section stays in the room once the readings land above it"
+    );
+    let (_, resources) = app
+        .active_native_view(wid)
+        .expect("System Resources in front");
+    app.dispatch_native_view_event(wid, resources, AppEvent::ScrollLines(-1000))
+        .unwrap();
+    app.publish_resources();
+    assert!(
+        !at_section(&app),
+        "CONTROL: the person's scroll takes the column from the section"
+    );
+}
+
+/// The folders a probe of `list` reads: a home with one folder setup kept out, `$HOME/trust`, on
+/// its receipt, which `refused` also names where an apply failed to keep it out.
+fn kept_out_trust(refused: bool) -> crate::resources_spotlight::ScopeListing {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    let trust: BTreeSet<PathBuf> = [PathBuf::from("/Users//t/trust")].into();
+    crate::resources_spotlight::ScopeListing {
+        home: Some(PathBuf::from("/Users//t")),
+        receipt: Ok(trust.clone()),
+        refused: if refused {
+            trust.clone()
+        } else {
+            BTreeSet::new()
+        },
+        wanted: Ok(trust),
+        cache: None,
+        yours: BTreeSet::new(),
+        pause: None,
+    }
+}
+
+/// KEPT AS YOU SET IT FOLLOWS SYSTEM RESOURCES' SPOTLIGHT PROBE (FL-188): a probe that finds an
+/// item in a folder setup's receipt names (a person took it back) reaches System State's
+/// Spotlight indexing row through `publish_resources`, the path each vitals sample takes, and the
+/// row reads Kept as you set it, changed since aterm set it, naming the folder.
+/// NEGATIVE CONTROL: the same folder an apply failed to keep out is nobody's choice: the row reads
+/// the scope as setup's receipt names it.
+#[test]
+fn kept_as_you_set_it_follows_the_spotlight_probe_through_publish_resources() {
+    use crate::resources_spotlight::{Found, ScopePort, ScopeSlot};
+    use aterm_types::macos_setup::{SPOTLIGHT_KEPT_AS_SET, SPOTLIGHT_SCOPED, Standing, Subject};
+    let spotlight = Subject::Access(Access::SpotlightScope);
+    let row_after_probe = |list: fn() -> crate::resources_spotlight::ScopeListing| {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let mut app = App::headless_for_test();
+        let (wid, _, view) = page(&mut app);
+        app.set_system_state_handlers_for_test(handlers());
+        let mut status = fixture_status("set-up").unwrap();
+        for seen in &mut status.observed {
+            if seen.subject == spotlight {
+                seen.standing = Standing::InPlace;
+                seen.now = Some(SPOTLIGHT_SCOPED.into());
+            }
+        }
+        fresh(&mut app, status);
+        press(
+            &mut app,
+            wid,
+            view,
+            "system-state/row/spotlight-indexing/open-resources",
+        );
+        let slot = std::sync::Arc::new(ScopeSlot::new(ScopePort {
+            list,
+            found: |path| {
+                if path.ends_with("trust") {
+                    Found::Item
+                } else {
+                    Found::Nothing
+                }
+            },
+        }));
+        assert!(slot.service(true, Instant::now()), "the probe ticked");
+        app.vitals.spotlight_scope = slot;
+        app.publish_resources();
+        app.native_runtime
+            .system_state_mut()
+            .expect("the page is open")
+            .reviewed_row(spotlight)
+    };
+
+    let row = row_after_probe(|| kept_out_trust(false));
+    assert_eq!(
+        row.value,
+        crate::system_state::RowValue::One(SPOTLIGHT_KEPT_AS_SET.into())
+    );
+    assert!(row.changed_since);
+    assert!(
+        row.note
+            .as_deref()
+            .is_some_and(|note| note.contains("$HOME/trust")),
+        "{:?}",
+        row.note
+    );
+
+    let refused = row_after_probe(|| kept_out_trust(true));
+    assert_eq!(
+        refused.value,
+        crate::system_state::RowValue::One(SPOTLIGHT_SCOPED.into()),
+        "NEGATIVE CONTROL: a folder an apply failed to keep out is nobody's choice"
+    );
+    assert!(!refused.changed_since);
 }

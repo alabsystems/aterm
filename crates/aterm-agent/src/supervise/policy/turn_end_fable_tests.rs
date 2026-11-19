@@ -1513,7 +1513,7 @@ fn a_resume_at_a_fable_wall_types_the_resume_unless_typed_since() {
 
 /// AFTER THE FALLBACK, THE SESSION STAYS ON ITS ACCOUNT UNTIL THE SWITCH'S RETURN IS DUE
 /// ([`switch_keeps_its_account`]): Fable's wall on record ranks the account after every account
-/// with no model's wall, so a later turn end gets a move ahead to another account. Made, it would
+/// with Fable's room for a Fable session, so a later turn end gets a move ahead to another account. Made, it would
 /// carry `--model claude-opus-5-5` there, on an account where Fable may serve. That move is not
 /// made, and the turn end's act is the one it gets with no advice. NEGATIVE CONTROLS: a yield
 /// (F19) still moves ahead, a move to the session's own row's renewed login still goes, and past

@@ -31,6 +31,8 @@ fn a_sid_is_an_exact_tab_or_legacy_id() {
         "s-0f1e",
         "s-0123456789abcdef012",
         "s-0123456789abcdef01234",
+        "s-abcdef0123456789abc",
+        "s-abcdef0123456789abcde",
         "S-1",
         "s1",
         "s-g",
@@ -87,10 +89,12 @@ fn selector_parses_the_wire_forms() {
     assert_eq!(Selector::parse("."), Selector::SelfTok);
     assert_eq!(Selector::parse("12"), Selector::Local(12));
     assert_eq!(Selector::parse("007"), Selector::Local(7));
-    assert_eq!(
-        Selector::parse("s-0f1e0000000000000000"),
-        Selector::Sid(Sid::parse("s-0f1e0000000000000000").expect("a sid"))
-    );
+    for good in ["tqn5r6e0148", "t0f1e000000", "s-0f1e0000000000000000"] {
+        assert_eq!(
+            Selector::parse(good),
+            Selector::Sid(Sid::parse(good).expect("a sid"))
+        );
+    }
     let huge = "99999999999999999999";
     assert_eq!(Selector::parse(huge), Selector::Invalid(huge));
     for bad in [
@@ -163,6 +167,17 @@ fn head_reads_separators_once() {
     assert_eq!(spans.head(line), head(line));
     assert_eq!(&line[spans.verb.clone()], "send");
     assert_eq!(&line[spans.rest.clone()], " hi");
+    let sid = Selector::Sid(Sid::parse("t1a00000000").expect("a current sid"));
+    assert_eq!(
+        read("@t1a00000000\tfeed-bin 5"),
+        (Some(sid), "feed-bin", "5")
+    );
+    assert_eq!(read("@t1a00000000 \t screen x"), (Some(sid), "screen", "x"));
+    let line = "  @t1a00000000\tsend  hi\r";
+    let spans = Spans::of(line);
+    assert_eq!(spans.head(line), head(line));
+    assert_eq!(&line[spans.verb.clone()], "send");
+    assert_eq!(&line[spans.rest.clone()], " hi");
 }
 
 #[test]
@@ -195,6 +210,8 @@ fn subscribe_names_one_session_only_by_a_sid() {
     assert_eq!((sid.as_str(), tail), ("t1a00000000", "\tcells"));
     for local in [
         "@* screen",
+        "@s-1a,s-2b screen",
+        "@t1a00000000,t2b00000000 screen",
         "@tqn5r6e0148,t0123456789 screen",
         "@s-1a000000000000000000,s-2b000000000000000000 screen",
         "@s-1a screen",

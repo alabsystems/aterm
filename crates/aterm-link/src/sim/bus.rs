@@ -637,6 +637,22 @@ pub(crate) struct State {
     pub(crate) poisoned_refusals: u64,
     /// A SIBLING RACING AN ATTACH ([`Race`]), in the worlds that have one.
     pub(crate) race: Option<Race>,
+    /// THIS OPEN TAKES NO ASK FOR ORIGINS (ATERM-KI-1114-1414, case 6): `Request::OriginStamps`
+    /// is refused, as an astream from before origin stamps refuses a request it does not know,
+    /// so `Client::origin_stamps` answers `false` and no page and no delivery names an origin.
+    /// Set at every open ([`Broker::start`]), from the world's
+    /// [`super::world::Opts::stampless_starts`] (`stampless_remints`) where the open is one that
+    /// reminted the log ([`Broker::lose_identity`]'s `remint_pending`), so the next open that did
+    /// not remint stamps again; never by an arm mutant, which a control's production world resets.
+    pub(crate) stampless: bool,
+    /// Whether an open that reminted the log takes no ask for origins
+    /// ([`super::world::Opts::stampless_starts`]).
+    pub(crate) stampless_remints: bool,
+    /// The log was reminted while the broker was down ([`Broker::lose_identity`]): the next open
+    /// is one that reminted it.
+    pub(crate) remint_pending: bool,
+    /// The opens that took no ask for origins ([`State::stampless`]).
+    pub(crate) stampless_opens: u64,
     /// THE DOOR'S JOURNAL ([`Event`]), in a world that keeps one.
     pub(crate) journal: Option<Vec<Event>>,
     /// A SESSION REVIVED between a sweep's read and its retire ([`Revive`]), in the world that arms one.
@@ -1078,6 +1094,10 @@ impl Broker {
                 poisons: 0,
                 poisoned_refusals: 0,
                 race: None,
+                stampless: false,
+                stampless_remints: false,
+                remint_pending: false,
+                stampless_opens: 0,
                 journal: None,
                 revive: None,
                 retired: Vec::new(),
@@ -1515,6 +1535,7 @@ impl Broker {
             s.mint();
         }
         let kept = s.log.len() as u64;
+        s.remint_pending = true;
         s.notes.push(format!(
             "broker identity unreadable: {kept} records kept, another log"
         ));
@@ -1683,6 +1704,12 @@ impl Broker {
         s.rebuild();
         s.flushed_in_full();
         s.up = true;
+        // EVERY OPEN SETS WHETHER IT TAKES THE ASK FOR ORIGINS ([`State::stampless`]): an open
+        // that reminted the log in a world of stampless remints takes none, and any other stamps.
+        s.stampless = std::mem::take(&mut s.remint_pending) && s.stampless_remints;
+        if s.stampless {
+            s.stampless_opens += 1;
+        }
         let mut latest: Vec<usize> = s.latest_wills().into_values().collect();
         latest.sort_by_key(|&i| s.wills[i].reg_off);
         for i in latest {
@@ -3190,7 +3217,9 @@ impl State {
             }
             // ORIGIN STAMPS (astream's `Request::OriginStamps`): answered at the head, and each
             // delivery handed to this connection from then on carries its record's origin.
-            Request::OriginStamps if self.mutant != ArmMutant::OriginStampsRefused => {
+            Request::OriginStamps
+                if self.mutant != ArmMutant::OriginStampsRefused && !self.stampless =>
+            {
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.origins = true;
                 }

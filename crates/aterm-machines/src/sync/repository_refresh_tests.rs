@@ -12,6 +12,47 @@ fn pass(memory: &Arc<Memory>, now: u64) -> (RefreshObservation, Arc<RepositoryPa
     (access.observed, access.pass.expect("the lease is free"))
 }
 
+#[cfg(unix)]
+#[test]
+fn repeated_shared_wait_keeps_the_receipt_until_pending_evidence_changes() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = record_path(scratch.path());
+    let access = RepositoryPass::open(scratch.path(), 1_000).unwrap();
+    let pass = access.pass.unwrap();
+    let source = scope(1);
+    let request = RefreshRequest::ensure(Some(source), access.observed.version);
+    let Admission::Refresh(ticket) = pass.admit(request, source, 1_000).unwrap() else {
+        panic!("a new source owes a refresh");
+    };
+    pass.finish(ticket, false, 2_000).unwrap();
+
+    // Hold the old inode open so an atomic replacement cannot reuse it.
+    let before = std::fs::File::open(&path).unwrap();
+    let inode = before.metadata().unwrap().ino();
+    let observation = observe(scratch.path(), 2_001);
+    assert!(matches!(
+        pass.admit(request, source, 2_001).unwrap(),
+        Admission::Waiting
+    ));
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(observe(scratch.path(), 2_001), observation);
+
+    let updated = RefreshRequest::ensure(Some(source), observation.version);
+    assert_ne!(updated, request);
+    assert!(matches!(
+        pass.admit(updated, source, 2_001).unwrap(),
+        Admission::Waiting
+    ));
+    assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+    let after = observe(scratch.path(), 2_001);
+    assert_eq!(after.pending, Some(updated));
+    assert_eq!(after.retry_ms, observation.retry_ms);
+    assert_eq!(after.version, observation.version);
+    drop(before);
+}
+
 /// A request that names inputs which moved before its runner admitted it is admitted for the
 /// inputs the runner validated: it owns a wave of that scope under a later input, and once
 /// that wave is complete the same stale request is fulfilled by it rather than run again.

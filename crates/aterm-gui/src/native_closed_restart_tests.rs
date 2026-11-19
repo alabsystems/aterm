@@ -22,8 +22,21 @@ pub(super) fn fixture_on(
     Prepare,
     SupervisorInputCaller,
 ) {
+    fixture_claiming(handle, &[Scope::Upgrade])
+}
+
+/// [`fixture_on`] with the external claim taking `duties`: the built-in harness keeps the rest.
+pub(super) fn fixture_claiming(
+    handle: crate::session_store::SessionHandle,
+    duties: &[Scope],
+) -> (
+    crate::session_store::SessionHandle,
+    Facts,
+    Prepare,
+    SupervisorInputCaller,
+) {
     let ctx = &handle.ctx;
-    install(ctx, 71, &[Scope::Upgrade]);
+    install(ctx, 71, duties);
     let facts = Facts::new();
     let source = process(4242, 400, 4242, 400, 2);
     let shell = process(400, 1, 400, 400, 4);

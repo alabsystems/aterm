@@ -96,7 +96,7 @@ fn completed_predecessor_and_positive_noexec_survive_target_rotation_and_reload(
     assert_eq!(
         super::super::native_restart::terminal_for_test(
             &mut prior,
-            &Reply::ColdRestartCommitted {
+            &Reply::AdmittedRestartCommitted {
                 claim: ClaimOutcome::Builtin,
                 observation: None,
                 intent: Box::new(super::super::accounts_pool::ExecutionIntent::Stored {

@@ -256,6 +256,19 @@ pub trait GitRunner {
         )))
     }
 
+    /// The same original-object read with room for a larger complete listing or blob.
+    /// A runner with a smaller capture still supplies its complete result or an error.
+    fn git_original_with_limit(&self, args: &[&str], limit: usize) -> Result<RunOut> {
+        let out = self.git_original(args)?;
+        if out.stdout.len() > limit {
+            return Err(Error::new(format!(
+                "git {} exceeded {limit} bytes",
+                args.join(" ")
+            )));
+        }
+        Ok(out)
+    }
+
     /// A complete local history listing, bounded in the production runner, which fetches
     /// nothing a partial clone lacks (`--no-lazy-fetch` where git takes it and
     /// `GIT_NO_LAZY_FETCH=1`, on a git seen to keep a read local, and a refusal on one that does
@@ -484,15 +497,20 @@ impl GitRunner for GitCli {
     }
 
     fn git_original(&self, args: &[&str]) -> Result<RunOut> {
+        self.git_original_with_limit(args, aterm_uds::deadline::OUTPUT_KEEP)
+    }
+
+    fn git_original_with_limit(&self, args: &[&str], limit: usize) -> Result<RunOut> {
         let mut cmd = object_git(&self.repo)?;
         cmd.env("GIT_GRAFT_FILE", "/dev/null")
             .env("GIT_SHALLOW_FILE", "/dev/null")
             .args(["-c", "core.commitGraph=false", "-c", "protocol.allow=never"])
             .args(args);
-        let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
+        let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout_with_limit(
             &mut cmd,
             std::time::Duration::from_secs(60),
             "original Git history",
+            limit,
         )
         .map_err(|e| Error::new(format!("git {}: {e}", args.join(" "))))?;
         Ok(RunOut {
@@ -586,6 +604,48 @@ pub fn git_ok(git: &dyn GitRunner, args: &[&str]) -> Result<RunOut> {
 /// Require a complete successful history read with the production capture and time bounds.
 pub fn git_read_ok(git: &dyn GitRunner, args: &[&str]) -> Result<RunOut> {
     success(args, git.git_read(args)?)
+}
+
+/// Require a complete read from the original local Git object graph.
+pub(crate) fn git_original_ok(git: &dyn GitRunner, args: &[&str], limit: usize) -> Result<RunOut> {
+    success(args, git.git_original_with_limit(args, limit)?)
+}
+
+/// Read the original regular blob named by a tree entry. Only a missing entry is absent.
+pub(crate) fn original_blob_at(
+    git: &dyn GitRunner,
+    rev: &str,
+    path: &str,
+    limit: usize,
+) -> Result<Option<Vec<u8>>> {
+    let listed = git_original_ok(
+        git,
+        &["ls-tree", "-z", rev, "--", path],
+        aterm_uds::deadline::OUTPUT_KEEP,
+    )?;
+    if listed.stdout.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || Error::new(format!("{rev}:{path} is not one original regular Git blob"));
+    let row = std::str::from_utf8(&listed.stdout)
+        .ok()
+        .and_then(|row| row.strip_suffix('\0'))
+        .ok_or_else(invalid)?;
+    let (entry, name) = row.split_once('\t').ok_or_else(invalid)?;
+    let fields = entry.split(' ').collect::<Vec<_>>();
+    let [mode, kind, oid] = fields.as_slice() else {
+        return Err(invalid());
+    };
+    if !matches!(*mode, "100644" | "100755")
+        || *kind != "blob"
+        || name != path
+        || !(aterm_codec::hex::is_lower(oid, 40) || aterm_codec::hex::is_lower(oid, 64))
+    {
+        return Err(invalid());
+    }
+    let blob = git_original_ok(git, &["cat-file", "blob", oid], limit)
+        .map_err(|e| Error::new(format!("{rev}:{path}: {e}")))?;
+    Ok(Some(blob.stdout))
 }
 
 fn success(args: &[&str], out: RunOut) -> Result<RunOut> {

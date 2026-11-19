@@ -729,6 +729,7 @@ pub fn put_row(
             key: skey.clone(),
             value: Some(normalized),
         }],
+        said: None,
     })?;
     Ok(json!({
         "ok": true,
@@ -757,6 +758,7 @@ pub fn delete_row(db: &mut Database, logical_table: &str, key: &str) -> Result<V
             key: skey.clone(),
             value: Some(json!({"_deleted": true})),
         }],
+        said: None,
     })?;
     Ok(json!({
         "ok": true,
@@ -774,7 +776,11 @@ pub fn commit_batch(db: &mut Database, changes: Vec<Change>) -> Result<Vec<Strin
     let mut ops = Vec::new();
     for changes in transactions(changes)? {
         let request = crypto::random::<16>()?;
-        let op = db.commit(Command::Write { request, changes })?;
+        let op = db.commit(Command::Write {
+            request,
+            changes,
+            said: None,
+        })?;
         ops.push(hex::encode_lower(&op));
     }
     Ok(ops)
@@ -822,6 +828,7 @@ fn one_writer_holds(changes: Vec<Change>) -> Result<()> {
         let command = Command::Write {
             request: [0; 16],
             changes,
+            said: None,
         };
         bytes = bytes.saturating_add(command.encode()?.len() + RECORD_OVERHEAD);
     }

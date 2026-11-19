@@ -466,7 +466,7 @@ fn bands(s: &Session<'_>, caption: &Caption) -> Result<String, String> {
         ));
     }
     Ok(format!(
-        "{how} ({}x{} surface): {held}; the Deck's rows {}..{} left out",
+        "{how} ({}x{} surface): {held}; the earlier terminal-frame composition check excludes Deck rows {}..{}",
         at.surface.0,
         at.surface.1,
         at.deck_y,

@@ -65,7 +65,7 @@ impl SessionId {
     }
 
     /// `s` as a session's ID, or `None` unless it is a tab ID or a legacy tab's ID ([`is_minted_sid`]).
-    /// The one way to read an ID back from text that must name a session.
+    /// This checks its text; a local caller still looks up the session it names.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         is_minted_sid(s).then(|| Self(s.to_owned()))

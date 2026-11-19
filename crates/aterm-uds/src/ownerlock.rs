@@ -18,7 +18,7 @@ pub enum Owner {
 }
 
 /// Which lock a probe tries for.
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum Take {
     /// `LOCK_SH`: only an exclusive holder refuses it, so one probe never refuses another.
@@ -69,6 +69,20 @@ fn probe_while_locked(path: &Path, take: Take, while_locked: impl FnOnce()) -> O
     else {
         return Owner::Unknown;
     };
+    probe_open(&file, take, while_locked)
+}
+
+/// Probe a fresh, previously validated regular file description for an exclusive owner.
+/// The caller must open an independent description, never pass the owner's descriptor.
+/// A successful probe explicitly releases its shared lock before returning.
+#[cfg(unix)]
+#[must_use]
+pub fn probe_file(file: &std::fs::File) -> Owner {
+    probe_open(file, Take::Shared, || {})
+}
+
+#[cfg(unix)]
+fn probe_open(file: &std::fs::File, take: Take, while_locked: impl FnOnce()) -> Owner {
     if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
         return Owner::Unknown;
     }
@@ -83,8 +97,11 @@ fn probe_while_locked(path: &Path, take: Take, while_locked: impl FnOnce()) -> O
     match taken {
         Ok(()) => {
             while_locked();
-            let _ = file.unlock();
-            Owner::Dead
+            if file.unlock().is_ok() {
+                Owner::Dead
+            } else {
+                Owner::Unknown
+            }
         }
         Err(std::fs::TryLockError::WouldBlock) => Owner::Live,
         Err(std::fs::TryLockError::Error(_)) => Owner::Unknown,

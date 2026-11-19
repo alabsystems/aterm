@@ -41,7 +41,8 @@ impl LaneStall {
 pub fn figures(lane: &str) -> &'static [&'static str] {
     match lane {
         PROCS => &[
-            "aterm", "tab", "procs", "wait", "writes", "split", "top", "why", "jobs", "left",
+            "aterm", "tab", "procs", "groups", "wait", "writes", "split", "top", "why", "jobs",
+            "left",
         ],
         KPROC_TABLE => &["ages", "reaping"],
         _ => &[],

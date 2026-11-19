@@ -8,6 +8,113 @@ use crate::ledger::{GitCli, GitRunner, object_git};
 mod tag_residency;
 
 #[test]
+fn git_timing_separates_requested_closure_without_disclosing_source_or_ref_data() {
+    use agh::git::FetchScope;
+    let slug = Slug::parse("fixture/app").unwrap();
+    let source = Path::new("/private/fixture-source");
+    let cache = PathBuf::from("/private/fixture-object-cache");
+    let reference = "refs/heads/fixture-private-topic";
+    let into = "refs/agh/fixture-private-destination";
+    let describe = |scope| {
+        native_git_details(&GitRun::fetch_ref(
+            &slug, source, reference, into, false, scope,
+        ))
+    };
+    let selected = describe(FetchScope::SelectedCheckout {
+        cache: Some(cache.clone()),
+    });
+    let full = describe(FetchScope::FullSource { cache });
+    let exact = describe(FetchScope::NativeExact);
+    assert_eq!(
+        selected["native_git"]["repository"].as_str(),
+        Some("fixture/app")
+    );
+    assert_eq!(
+        selected["native_git"]["operation"].as_str(),
+        Some("fetch-ref")
+    );
+    assert_eq!(
+        selected["native_git"]["requested_scope"].as_str(),
+        Some("selected-checkout")
+    );
+    assert_eq!(
+        full["native_git"]["requested_scope"].as_str(),
+        Some("full-source")
+    );
+    assert_eq!(
+        exact["native_git"]["requested_scope"].as_str(),
+        Some("native-exact")
+    );
+    assert_eq!(
+        selected["native_git"]["cache_supplied"].as_bool(),
+        Some(true)
+    );
+    assert!(exact["native_git"]["cache_supplied"].is_null());
+    for details in [selected, full, exact] {
+        let text = details.to_string();
+        for private in [
+            source.to_str().unwrap(),
+            "/private/fixture-object-cache",
+            reference,
+            into,
+        ] {
+            assert!(
+                !text.contains(private),
+                "request contents entered timing metadata"
+            );
+        }
+    }
+}
+
+#[test]
+fn git_timing_counts_admitted_batches_and_distinguishes_advertisement_selection() {
+    let slug = Slug::parse("fixture/app").unwrap();
+    let source = Path::new("/private/fixture-source");
+    let a = "a".repeat(40);
+    let b = "b".repeat(40);
+    let objects = native_git_details(&GitRun::fetch_batch(
+        &slug,
+        source,
+        FetchBatch::objects(vec![a.clone(), b.clone()]).unwrap(),
+        false,
+    ));
+    let refs = native_git_details(&GitRun::fetch_batch(
+        &slug,
+        source,
+        FetchBatch::new(vec![agh::git::FetchRow {
+            source: "refs/heads/fixture-private-topic".into(),
+            into: "refs/agh/fixture-private-destination".into(),
+            expected_oid: a.clone(),
+        }])
+        .unwrap(),
+        false,
+    ));
+    assert_eq!(objects["native_git"]["requested_objects"].as_u64(), Some(2));
+    assert_eq!(objects["native_git"]["requested_refs"].as_u64(), Some(0));
+    assert_eq!(refs["native_git"]["requested_objects"].as_u64(), Some(0));
+    assert_eq!(refs["native_git"]["requested_refs"].as_u64(), Some(1));
+    for details in [objects, refs] {
+        let text = details.to_string();
+        assert!(!text.contains(&a) && !text.contains(&b));
+        assert!(!text.contains("fixture-private"));
+    }
+    for (reference, kind) in [
+        (None, "all"),
+        (Some("HEAD"), "head"),
+        (Some("refs/tags/*"), "pattern"),
+        (Some("refs/heads/fixture-private-topic"), "ref"),
+    ] {
+        let details = native_git_details(&GitRun::advertisement(&slug, reference));
+        assert_eq!(
+            details["native_git"]["operation"].as_str(),
+            Some("ls-remote")
+        );
+        assert_eq!(details["native_git"]["selection"].as_str(), Some(kind));
+        assert_eq!(details["native_git"]["peeled"].as_bool(), Some(true));
+    }
+}
+
+#[test]
 fn publisher_controls_share_one_complete_advertisement() {
     use agh::git::{PUBLISHER_FENCE_REF as FENCE, RELEASE_LEASE_REF as LEASE};
     let root = aterm_tempfile::tempdir().unwrap();
@@ -232,7 +339,7 @@ fn supersession_reads_private_staging_with_its_routed_identity() {
     fake.assert_clean();
 }
 
-fn git(repo: &Path, args: &[&str]) -> String {
+pub(super) fn git(repo: &Path, args: &[&str]) -> String {
     let mut cmd = object_git(repo).unwrap();
     cmd.args(args)
         .env("GIT_AUTHOR_NAME", "fixture")
@@ -267,7 +374,7 @@ pub(crate) fn local_with_fx(repo: &Path, bare: &Path, effects: Arc<agh::Fx>) -> 
     Remote::new(client, slug, repo).unwrap()
 }
 
-fn repo(root: &Path, name: &str, bare: bool) -> PathBuf {
+pub(super) fn repo(root: &Path, name: &str, bare: bool) -> PathBuf {
     let path = root.join(name);
     std::fs::create_dir(&path).unwrap();
     let args = if bare {
@@ -279,11 +386,65 @@ fn repo(root: &Path, name: &str, bare: bool) -> PathBuf {
     path
 }
 
-fn commit(repo: &Path, text: &str) -> String {
+pub(super) fn commit(repo: &Path, text: &str) -> String {
     std::fs::write(repo.join("line.toml"), text).unwrap();
     git(repo, &["add", "line.toml"]);
     git(repo, &["commit", "-q", "-m", "fixture"]);
     git(repo, &["rev-parse", "HEAD"])
+}
+
+/// A writer as agh's journal records one, built through that record's fields (`boot`, `agh`,
+/// `git`, the journal's own format) rather than by field access on agh's Rust type: agh's
+/// writer has been a struct with those fields and, since 38a80920494, an untagged enum whose
+/// `Tracked` variant records the same ones, and this compiles against both. It is this
+/// process's frontend with its kernel start changed, which reads as a frontend that exited
+/// (the same pid, so no bystander is ever judged), and `git`, the native child it released,
+/// where one is named. agh judges it gone once that child is gone too (`IntentWriter::dead`).
+pub(super) fn writer(git: Option<u32>) -> agh::journal::IntentWriter {
+    use agh::journal::{IntentWriter, WriterProcess};
+    let Ok(aterm_json::Value::Object(mut record)) =
+        aterm_json::to_value(IntentWriter::current().unwrap())
+    else {
+        panic!("agh records a writer as an object");
+    };
+    let mut frontend: WriterProcess =
+        aterm_json::from_value(record.remove("agh").expect("a recorded frontend")).unwrap();
+    frontend.start ^= 1;
+    record.insert("agh".into(), aterm_json::to_value(frontend).unwrap());
+    let child = git.map(|pid| WriterProcess::read(pid).expect("a running child's identity"));
+    record.insert("git".into(), aterm_json::to_value(child).unwrap());
+    aterm_json::from_value(aterm_json::Value::Object(record)).unwrap()
+}
+
+/// Begin an intent in the repository's atomic-ref bucket as another agh write would, recording
+/// `writer` (this process where `None`) and the batch `refs`, and leave it in flight.
+pub(super) fn begin_intent(
+    remote: &Remote,
+    request: &str,
+    writer: Option<agh::journal::IntentWriter>,
+    refs: Vec<agh::github::refs::RefUpdate>,
+) -> agh::IntentId {
+    use agh::IntentStore as _;
+    let route =
+        agh::policy::RouteRequest::write(agh::policy::RouteTarget::Repo(remote.slug.clone()));
+    let permit = remote.client.permit(&route).unwrap();
+    let journal = remote.client.journal(&remote.slug).unwrap();
+    let latest = journal
+        .latest(agh::write::WriteOp::RefUpdateAtomic, "atomic refs")
+        .unwrap()
+        .map(|view| view.intent.id);
+    let mut draft = agh::journal::IntentDraft::new(
+        agh::write::WriteOp::RefUpdateAtomic,
+        &remote.slug,
+        &permit,
+        "fixture-fingerprint",
+        "atomic refs",
+    )
+    .with_request(request.into())
+    .with_refs(refs)
+    .with_after(latest);
+    draft.writer = writer;
+    journal.begin(&draft).unwrap()
 }
 
 #[test]

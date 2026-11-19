@@ -100,6 +100,15 @@ pub struct Namespace {
 
 impl Namespace {
     pub fn open(path: &Path, vm: &str) -> Result<Self, String> {
+        Self::open_in(path, vm, true)
+    }
+
+    /// Existing receipts only: observing a running VM must never initialize a namespace.
+    pub fn open_existing(path: &Path, vm: &str) -> Result<Self, String> {
+        Self::open_in(path, vm, false)
+    }
+
+    fn open_in(path: &Path, vm: &str, create: bool) -> Result<Self, String> {
         if !absolute(path)
             || vm.is_empty()
             || !vm
@@ -116,7 +125,7 @@ impl Namespace {
         let path = parent.join(path.file_name().ok_or("Lima namespace has no name")?);
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::DirBuilder::new()
                     .mode(0o700)
                     .create(&path)

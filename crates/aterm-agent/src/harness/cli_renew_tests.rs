@@ -3,8 +3,10 @@
 
 //! Tests for `aterm harness accounts renew` and `adopt-default`.
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
+// The tests gated `cfg(unix)` here reach what aterm has only on Unix: a file mode, a symbolic
+// link, a signal, a `/bin/sh` stand-in, or a part built only there (native credential custody,
+// native fleet renewal, the vault-token, Google and agy sign-ins, the Kimi pool's overlay
+// staging home, aterm's own browser window, the test sleep seam).
 #![cfg_attr(
     not(unix),
     expect(
@@ -20,14 +22,12 @@ use super::*;
 const OWNER: &str = "owner@example.com";
 const WORK: &str = "w2@example.com";
 
-#[cfg(unix)]
 struct NativeRenewal {
     program: PathBuf,
     user_home: OsString,
     within: std::time::Duration,
 }
 
-#[cfg(unix)]
 impl AccountsHost for NativeRenewal {
     fn stdin_is_terminal(&self) -> bool {
         false
@@ -77,7 +77,6 @@ impl AccountsHost for NativeRenewal {
 }
 
 #[test]
-#[cfg(unix)]
 fn a_running_renewal_blocks_readoption_of_its_removed_label() {
     let (_tmp, env) = renew_env("renew-readoption");
     let path = env.accounts_roster().unwrap();
@@ -162,10 +161,6 @@ fn renew_env(tag: &str) -> (Tmp, Env) {
     std::fs::create_dir_all(&work).expect("mkdir");
     std::fs::write(work.join("a-login-file"), "{}").expect("write");
     let roster = roster_text(work.to_str().expect("utf-8"));
-    // Portable renewal semantics use the system browser where no opener is supported.
-    // Explicit named-profile admission is covered separately and must never fall back.
-    #[cfg(not(unix))]
-    let roster = roster.replace("browser = \"Claude main\"\n", "");
     std::fs::write(env.accounts_roster().expect("a config dir"), roster).expect("write");
     (tmp, env)
 }
@@ -589,6 +584,281 @@ fn renewal_opener_failures_refuse_before_provider_or_binding_changes() {
     }
 }
 
+/// Which file `path` is (its volume and file id), a final link not followed.
+#[cfg(windows)]
+fn file_id(path: &Path) -> Option<(u64, u128)> {
+    aterm_uds::line_log::identity_at(path)
+        .ok()
+        .map(|id| (id.dev, id.ino))
+}
+
+/// THE WINDOWS OPENER'S SETUP REFUSES BEFORE ANY PROVIDER RUNS, AND KEEPS THE OLD OPENER: no
+/// executable, a missing one, a folder, a file that is no image (no `MZ`), a `bin` that is a
+/// file, and a folder under the opener's own name each fail `opener_link` at their stage, and a
+/// renewal by hand then starts no provider, writes no record and leaves the opener there (a hard
+/// link of this binary, as the last publication left it) the file it was. CONTROL:
+/// `renewal_ready_opener_runs_the_selected_headless_route` on Windows publishes and runs.
+#[cfg(windows)]
+#[test]
+fn renewal_opener_failures_refuse_before_provider_or_binding_changes() {
+    for fault in [
+        "unavailable",
+        "missing",
+        "directory",
+        "nonexec",
+        "bin",
+        "alias",
+    ] {
+        let (tmp, env) = renew_env(&format!("renew-opener-{fault}"));
+        let store = env.accounts_store();
+        let bin = store.dir.join("bin");
+        let link = bin.join(opener_file_name());
+        let mut host = RenewHost::new();
+        host.tty = false;
+        host.env_mailbox = Some(tmp.path().to_owned());
+        let source = tmp.path().join("private-opener-source");
+        let (stage, kind) = match fault {
+            "unavailable" => {
+                host.exe = None;
+                (OpenerStage::Executable, None)
+            }
+            "missing" => {
+                host.exe = Some(source.clone());
+                (OpenerStage::Executable, Some(io::ErrorKind::NotFound))
+            }
+            "directory" => {
+                std::fs::create_dir(&source).unwrap();
+                host.exe = Some(source.clone());
+                (OpenerStage::Executable, Some(io::ErrorKind::InvalidInput))
+            }
+            "nonexec" => {
+                std::fs::write(&source, b"not executed").unwrap();
+                host.exe = Some(source.clone());
+                (OpenerStage::Executable, Some(io::ErrorKind::InvalidData))
+            }
+            "bin" => (OpenerStage::HelperDirectory, None),
+            "alias" => (OpenerStage::Publication, None),
+            _ => unreachable!(),
+        };
+        std::fs::create_dir_all(&store.dir).unwrap();
+        if fault == "bin" {
+            std::fs::write(&bin, b"retained obstruction").unwrap();
+        } else {
+            std::fs::create_dir(&bin).unwrap();
+            if fault == "alias" {
+                std::fs::create_dir(&link).unwrap();
+                std::fs::write(link.join("retained"), b"untouched").unwrap();
+            } else {
+                std::fs::hard_link(std::env::current_exe().unwrap(), &link).unwrap();
+            }
+        }
+        let before_link = file_id(&link);
+        let paths = [store.state_file(), store.logins_file(), store.ledger_path()];
+        let before = paths.each_ref().map(|path| std::fs::read(path).ok());
+        let error = opener_link(&store, &host).unwrap_err();
+        assert_eq!(error.stage, stage, "{fault}");
+        if kind.is_some() || fault == "unavailable" {
+            assert_eq!(error.kind, kind, "{fault}");
+        }
+        let (code, out, err) = acc(renew(&[WORK], false, None), &env, &host);
+        assert_eq!(code, exit(1), "{fault}: {out}{err}");
+        assert!(err.contains(&error.to_string()), "{fault}: {err}");
+        assert!(!err.contains(source.to_str().unwrap()), "{fault}: {err}");
+        assert!(host.flows.borrow().is_empty(), "{fault}");
+        assert!(host.checked.borrow().is_empty(), "{fault}");
+        assert!(host.remotes.borrow().is_empty(), "{fault}");
+        assert_eq!(
+            paths.each_ref().map(|path| std::fs::read(path).ok()),
+            before,
+            "{fault}"
+        );
+        assert!(!store.logins_dir().exists(), "{fault}");
+        assert_eq!(file_id(&link), before_link, "{fault}");
+        if fault == "bin" {
+            assert_eq!(std::fs::read(&bin).unwrap(), b"retained obstruction");
+        } else if fault == "alias" {
+            assert_eq!(std::fs::read(link.join("retained")).unwrap(), b"untouched");
+        }
+        if fault != "bin" {
+            let left: Vec<_> = std::fs::read_dir(&bin)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name())
+                .filter(|name| name.to_string_lossy().starts_with('.'))
+                .collect();
+            assert!(left.is_empty(), "{fault}: no temporary is left: {left:?}");
+        }
+    }
+}
+
+/// THE WINDOWS OPENER IS A SECOND NAME OF THE EXECUTABLE'S FILE, published and run: a renewal by
+/// hand with no terminal publishes `bin/aterm-open-url.exe` as a hard link of this binary (the
+/// same volume and file id) over an opener an earlier image left there (another file), and hands
+/// it to the selected headless route; publishing again leaves that file in place.
+#[cfg(windows)]
+#[test]
+fn renewal_ready_opener_runs_the_selected_headless_route() {
+    let (tmp, env) = renew_env("renew-opener-ready");
+    let mut host = RenewHost::new();
+    host.tty = false;
+    host.env_mailbox = Some(tmp.path().to_owned());
+    let target = std::fs::canonicalize(host.exe.as_ref().unwrap()).unwrap();
+    let store = env.accounts_store();
+    let opener = store.dir.join("bin").join(opener_file_name());
+    // An opener an earlier image left: a file of other bytes under the opener's name.
+    std::fs::create_dir_all(opener.parent().unwrap()).unwrap();
+    std::fs::write(&opener, b"MZ an earlier image").unwrap();
+    assert_ne!(file_id(&opener), file_id(&target), "CONTROL: another file");
+    let (code, out, err) = acc(renew(&[WORK], false, None), &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(
+        file_id(&opener),
+        file_id(&target),
+        "the opener is the executable's own file"
+    );
+    let calls = host.flows.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, WORK);
+    assert_eq!(
+        calls[0].2,
+        RenewBrowser::Remote {
+            opener: Some(opener.clone()),
+        }
+    );
+    assert_eq!(host.checked.borrow().as_slice(), [calls[0].0.clone()]);
+    assert!(logins_of(&env).get("main").is_none());
+    let published = file_id(&opener);
+    assert_eq!(opener_link(&store, &host).as_ref(), Ok(&opener));
+    assert_eq!(
+        file_id(&opener),
+        published,
+        "an opener already the file stays"
+    );
+}
+
+/// THE WINDOWS OPENER'S FOLDER IS THE USER'S ALONE: a publication makes `bin` with the user's
+/// protected list (the user and SYSTEM, nobody else) at its creation, and narrows a `bin` of the
+/// user's that took its parent's inherited list (CONTROL: judged open before), so no other
+/// account can add a library the opener loads from beside itself or replace the opener before
+/// the provider starts it; and an earlier opener there, a second name of an image elsewhere, is
+/// let go before the narrowing, which would pass the folder's entries on to that image's own
+/// list. NEGATIVE CONTROLS (each run as a temporary mutant, reverted): `bin` made by
+/// `fs_restricted`, a plain `create_dir_all` on Windows, is judged open after the publication;
+/// with the earlier opener kept through the narrowing, the image loses Administrators' entry.
+#[cfg(windows)]
+#[test]
+fn the_windows_openers_folder_is_the_users_alone() {
+    use aterm_uds::private_file::{PrivateDir, judge_private_dir};
+    for made in [false, true] {
+        let (tmp, env) = renew_env(&format!("renew-opener-private-{made}"));
+        let source = tmp.path().join("aterm-image.exe");
+        std::fs::write(&source, b"MZ the running image").unwrap();
+        let mut host = RenewHost::new();
+        host.exe = Some(source);
+        let store = env.accounts_store();
+        let bin = store.dir.join("bin");
+        // An earlier publication's opener there, a second name of an image elsewhere.
+        let image = tmp.path().join("an-earlier-image.exe");
+        let list = |path: &Path| {
+            use aterm_uds::acl::{Descriptor, Parts};
+            Descriptor::of_path(path, Parts::DACL)
+                .and_then(|descriptor| descriptor.to_sddl(Parts::DACL))
+                .unwrap()
+        };
+        let mut image_list = None;
+        if made {
+            std::fs::create_dir_all(&bin).unwrap();
+            assert!(
+                matches!(judge_private_dir(&bin), Ok(PrivateDir::Open(_))),
+                "CONTROL: a folder with its parent's inherited list is open"
+            );
+            std::fs::write(&image, b"MZ an earlier image").unwrap();
+            std::fs::hard_link(&image, bin.join(opener_file_name())).unwrap();
+            let before = list(&image);
+            assert!(
+                before.contains(";BA)"),
+                "PRECONDITION: the image's inherited list names Administrators, which a narrowing \
+                 that reached it would drop: {before}"
+            );
+            image_list = Some(before);
+        }
+        let opener = opener_link(&store, &host).expect("the opener is published");
+        assert_eq!(opener, bin.join(opener_file_name()));
+        assert_eq!(
+            judge_private_dir(&bin).ok(),
+            Some(PrivateDir::Private),
+            "made before: {made}"
+        );
+        assert_eq!(std::fs::read(&opener).unwrap(), b"MZ the running image");
+        if let Some(before) = image_list {
+            assert_eq!(
+                list(&image),
+                before,
+                "the narrowing leaves the earlier opener's image's own list as it was"
+            );
+        }
+    }
+}
+
+/// A WINDOWS OPENER THAT IS A COPY OF THE SAME BYTES STAYS, AND WHAT A PUBLICATION CUT SHORT LEFT
+/// GOES: where a link was refused, the copy an earlier publication made (another file, the same
+/// bytes) is the opener already, so publishing again leaves that file in place and copies
+/// nothing; a temporary named for a process that has ended (`.<opener>.<pid>.exe`) is removed,
+/// one named for a process that runs (the System process, 4) is left for its publication.
+/// CONTROL: a copy of other bytes is replaced. NEGATIVE CONTROLS (each run as a temporary
+/// mutant, reverted): without the byte comparison the copy is replaced by a new file; without
+/// the sweep the ended publication's temporary stays.
+#[cfg(windows)]
+#[test]
+fn a_windows_openers_copy_stays_and_a_cut_publications_temporary_goes() {
+    let (tmp, env) = renew_env("renew-opener-copy");
+    let source = tmp.path().join("aterm-image.exe");
+    std::fs::write(&source, b"MZ the running image").unwrap();
+    let mut host = RenewHost::new();
+    host.exe = Some(source.clone());
+    let store = env.accounts_store();
+    let bin = store.dir.join("bin");
+    let opener = bin.join(opener_file_name());
+    // A first publication makes the folder; its link then stands where a copy was made instead.
+    assert_eq!(opener_link(&store, &host).as_ref(), Ok(&opener));
+    std::fs::remove_file(&opener).unwrap();
+    std::fs::copy(&source, &opener).unwrap();
+    let copied = file_id(&opener);
+    assert_ne!(copied, file_id(&source), "CONTROL: another file");
+    let ended = bin.join(format!(
+        ".{}.{}{}",
+        crate::harness::open_url::OPENER,
+        u32::MAX - 3,
+        std::env::consts::EXE_SUFFIX
+    ));
+    let running = bin.join(format!(
+        ".{}.4{}",
+        crate::harness::open_url::OPENER,
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::write(&ended, b"MZ cut short").unwrap();
+    std::fs::write(&running, b"MZ still publishing").unwrap();
+    assert!(
+        !aterm_uds::process::pid_alive(u32::MAX - 3) && aterm_uds::process::pid_alive(4),
+        "PRECONDITION: no process has the first id, and the System process runs"
+    );
+
+    assert_eq!(opener_link(&store, &host).as_ref(), Ok(&opener));
+    assert_eq!(file_id(&opener), copied, "the copy of the same bytes stays");
+    assert!(!ended.exists(), "the ended publication's temporary goes");
+    assert_eq!(
+        std::fs::read(&running).unwrap(),
+        b"MZ still publishing",
+        "a running publication's temporary is left"
+    );
+
+    std::fs::write(&opener, b"MZ an earlier image").unwrap();
+    let other = file_id(&opener);
+    assert_eq!(opener_link(&store, &host).as_ref(), Ok(&opener));
+    assert_ne!(file_id(&opener), other, "CONTROL: other bytes are replaced");
+    assert_eq!(std::fs::read(&opener).unwrap(), b"MZ the running image");
+}
+
 #[cfg(unix)]
 #[test]
 fn renewal_ready_opener_runs_the_selected_headless_route() {
@@ -637,7 +907,6 @@ fn renewal_ready_opener_runs_the_selected_headless_route() {
     assert!(logins_of(&env).get("main").is_none());
 }
 
-#[cfg(unix)]
 #[test]
 fn renewal_manual_routes_do_not_require_an_unavailable_opener() {
     for ssh in [false, true] {
@@ -749,7 +1018,6 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn a_completed_claude_renewal_refuses_changed_policy_or_binding_without_a_checkpoint() {
     for change in ["identity", "removed", "unreadable", "missing", "binding"] {
@@ -825,7 +1093,6 @@ fn a_completed_claude_renewal_refuses_changed_policy_or_binding_without_a_checkp
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn claude_alias_renewal_uses_the_login_address_and_checks_the_provider_identity() {
     for reported in ["canonical@example.test", "alias@example.test"] {
@@ -1002,7 +1269,6 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
     for (switch, off) in [
@@ -1056,7 +1322,6 @@ fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn a_staging_home_is_never_a_rows_login_directory() {
     let (_tmp, env) = renew_env("renew-names");
@@ -1097,7 +1362,6 @@ fn a_staging_home_is_never_a_rows_login_directory() {
     assert!(err.contains("already held files"), "{err}");
 }
 
-#[cfg(unix)]
 #[test]
 fn a_renewal_that_answers_another_account_changes_nothing_live() {
     let (_tmp, env) = renew_env("renew-wrong");
@@ -1155,14 +1419,7 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
         host.flow_after_first = Some(0);
         let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         assert_eq!(code, exit(1), "{out}{err}");
-        if accounts::manual_signin_capability() == accounts::ManualSigninCapability::Unavailable {
-            // No manual admission on this platform (ATERM-KI-1105-14): a renewal by hand is
-            // refused before its provider runs, and the refusal, too, records nothing.
-            assert!(err.contains("the sign-in lock could not be taken"), "{err}");
-            assert!(host.flows.borrow().is_empty());
-        } else {
-            assert_eq!(host.flows.borrow().len(), 1);
-        }
+        assert_eq!(host.flows.borrow().len(), 1);
         if cached {
             assert!(a_persons_headless_run(&host, &host.flows.borrow()[0].2));
         }
@@ -1177,7 +1434,6 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn a_replacement_login_stops_a_stale_manual_authentication_fallback() {
     let (_tmp, env) = renew_env("renew-stale-fallback");
@@ -1234,7 +1490,6 @@ fn a_replacement_login_stops_a_stale_manual_authentication_fallback() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_cached_profile_authentication_failure_falls_back_once_to_the_interactive_browser() {
     let (_tmp, env) = renew_env("renew-headless-auth-fallback");
@@ -1283,7 +1538,6 @@ fn a_cached_profile_authentication_failure_falls_back_once_to_the_interactive_br
     kept_private(&env, &[&out, &err]);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstructed() {
     let (_tmp, env) = renew_env("renew-checkpoint-obstructed");
@@ -1317,7 +1571,6 @@ fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstr
     kept_private(&env, &[&out, &err]);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
     let (_tmp, env) = renew_env("renew-published-ledger-failure");
@@ -1378,24 +1631,9 @@ fn a_renewal_does_not_start_when_the_ledger_is_unreadable() {
     kept_private(&env, &[&out, &err]);
 }
 
-#[cfg(unix)]
 #[test]
 fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     let (_tmp, env) = renew_env("renew-ssh");
-    #[cfg(not(unix))]
-    {
-        let path = env.accounts_roster().unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(
-            &path,
-            text.replacen(
-                "label = \"main\"",
-                "label = \"main\"\nbrowser = \"Claude main\"",
-                1,
-            ),
-        )
-        .unwrap();
-    }
     let mut host = RenewHost::new();
     host.ssh_session = true;
     let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
@@ -1404,11 +1642,11 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
         .accounts_store()
         .dir
         .join("bin")
-        .join(crate::harness::open_url::OPENER);
+        .join(crate::harness::cli::opener_file_name());
     assert_eq!(
         host.flows.borrow()[0].2,
         RenewBrowser::Remote {
-            opener: cfg!(unix).then_some(opener),
+            opener: Some(opener),
         },
         "nothing opens on the machine the owner is not at"
     );
@@ -1430,7 +1668,6 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
 
 /// `--due` runs what a session here needs now, never a row nobody here runs on: a row with an email
 /// and no login, and nothing walled or due, is not due.
-#[cfg(unix)]
 #[test]
 fn due_leaves_a_row_no_session_needs_to_the_upkeep() {
     let (_tmp, env) = renew_env("renew-due-unneeded");
@@ -1452,7 +1689,6 @@ fn due_leaves_a_row_no_session_needs_to_the_upkeep() {
     assert!(host.flows.borrow().is_empty(), "no sign-in started");
 }
 
-#[cfg(unix)]
 #[test]
 fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     let (_tmp, env) = renew_env("renew-due");
@@ -1605,8 +1841,8 @@ fn uncertain_binding_bytes_refuse_renewal_before_local_or_remote_actions() {
     kept_private(&env, &[&out, &err]);
 }
 
-#[test]
 #[cfg(unix)]
+#[test]
 fn renewal_accepts_a_native_fleet_endpoint_with_a_port() {
     let (_tmp, env) = renew_env("renew-native-endpoint");
     let host = RenewHost::new();
@@ -1615,8 +1851,8 @@ fn renewal_accepts_a_native_fleet_endpoint_with_a_port() {
     assert!(out.contains("renewing on 192.0.2.19:17100:"), "{out}");
 }
 
-#[test]
 #[cfg(unix)]
+#[test]
 fn other_machines_are_renewed_through_native_fleet_in_one_sitting() {
     let (_tmp, env) = renew_env("renew-on");
     let host = RenewHost::new();
@@ -1681,8 +1917,8 @@ fn other_machines_are_renewed_through_native_fleet_in_one_sitting() {
     }
 }
 
-#[test]
 #[cfg(unix)]
+#[test]
 fn local_interactive_rows_do_not_prevent_a_native_remote_pass() {
     let (_tmp, env) = renew_env("renew-remote-without-tty");
     let mut note = None;
@@ -1707,7 +1943,6 @@ fn local_interactive_rows_do_not_prevent_a_native_remote_pass() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn each_line_that_signs_a_row_in_names_its_own_verb() {
     let (_tmp, env) = renew_env("renew-verbs");
@@ -1779,7 +2014,6 @@ fn each_line_that_signs_a_row_in_names_its_own_verb() {
 /// A row's page stopped its sign-in: no later automatic run passes that, so the report names the
 /// person's own sign-in instead of leaving the row to aterm, in the verb such a row takes.
 /// NEGATIVE CONTROL: the same row with `Failed` is left to aterm, naming no step.
-#[cfg(unix)]
 #[test]
 fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
     let (_tmp, env) = renew_env("renew-blocked");
@@ -1863,7 +2097,6 @@ fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
 /// renewal itself inherited. Each stop here is a sign-in window a person closed: one a check
 /// made leaves nothing to run with nobody there
 /// (`a_claude_row_a_check_stopped_waits_for_a_person_at_every_door`).
-#[cfg(unix)]
 #[test]
 fn only_a_sign_in_this_mac_started_for_itself_opens_the_sign_in_window() {
     use accounts::AttemptOutcome::{Blocked, Failed};
@@ -2586,7 +2819,6 @@ fn a_window_renewal_writes_no_login_credential_to_the_vault() {
 /// An agent's terminal opens no browser on this Mac: a row with no headless route is left to a
 /// person, and a headless run that failed gets no second, interactive one. CONTROL: a person at
 /// the same terminal gets both.
-#[cfg(unix)]
 #[test]
 fn an_agents_terminal_opens_no_browser_for_a_row() {
     for (agent, code, flows) in [(false, 0, 1), (true, 1, 0)] {
@@ -2713,7 +2945,6 @@ fn login_and_renew_each_refuse_the_other_ones_rows() {
     no_address(&env, &[&err]);
 }
 
-#[cfg(unix)]
 #[test]
 fn adopt_default_lists_this_machines_own_login_once() {
     let tmp = tmp_dir("adopt");
@@ -3551,16 +3782,6 @@ fn a_failed_renewal_by_hand_is_the_rows_last_sign_in_and_one_ledger_row() {
     );
     let mut host = RenewHost::new();
     host.flow = 1;
-    if accounts::manual_signin_capability() == accounts::ManualSigninCapability::Unavailable {
-        // No manual admission on this platform (ATERM-KI-1105-14): a renewal by hand is refused
-        // before its provider runs, and a refusal is no sign-in of the row's to record.
-        let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
-        assert_eq!(code, exit(1), "{out}{err}");
-        assert!(err.contains("the sign-in lock could not be taken"), "{err}");
-        assert!(host.flows.borrow().is_empty());
-        assert!(!store.logins_file().exists() && store.tail(10).expect("ledger").is_empty());
-        return;
-    }
     for run in 0..2 {
         let (code, out, err) = acc(renew(&[OWNER], false, None), &env, &host);
         assert_eq!(code, exit(1), "{out}{err}");
@@ -3739,7 +3960,7 @@ fn an_unattended_renewal_timeout_releases_the_machine_signin_lock() {
     );
 }
 
-/// An unattended renewal whose provider waits for ever (Claude Code at its paste prompt) runs out
+/// An unattended renewal whose provider never answers (Claude Code at its paste prompt) runs out
 /// at its bound and leaves nothing running: its run is an owned capture, so the provider gets
 /// `SIGTERM` first, by proof, and it and what it left in its group are gone, by pid and birth.
 #[cfg(unix)]
@@ -3762,7 +3983,7 @@ fn an_unattended_renewal_that_runs_out_leaves_no_provider_running() {
         },
         Some(std::time::Duration::from_millis(200)),
     )
-    .expect_err("a provider that waits for ever fails its renewal");
+    .expect_err("a provider that never answers fails its renewal");
     assert!(
         !align::next_owned_pending(),
         "the renewal's provider run is not an owned capture: its settle was never taken"
@@ -3986,7 +4207,6 @@ fn an_unattended_provider_exit_keeps_its_browser_outcome() {
 /// `accounts renew`'s choice of rows reads the machine through its host alone: a row whose
 /// mailbox only the host's environment names renews with no terminal. CONTROL: under a host
 /// whose environment names none, the same row is only reported due and nothing runs.
-#[cfg(unix)]
 #[test]
 fn renews_choice_of_rows_reads_the_environment_through_its_host() {
     let (tmp, env) = renew_env("renew-host-env");
@@ -4020,7 +4240,6 @@ fn renews_choice_of_rows_reads_the_environment_through_its_host() {
     assert_eq!(renewed, [WORK], "{out}{err}");
 }
 
-#[cfg(unix)]
 #[test]
 fn renews_profile_route_uses_only_the_browser_its_host_names() {
     let (tmp, env) = renew_env("renew-host-browser");
@@ -4047,7 +4266,6 @@ fn renews_profile_route_uses_only_the_browser_its_host_names() {
     assert_eq!(named.flows.borrow().len(), 1);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_repaired_browser_reopens_noninteractive_renewal_without_proving_its_identity() {
     for (repaired, reported) in [(false, WORK), (true, WORK), (true, OWNER)] {
@@ -4138,7 +4356,6 @@ fn a_repaired_browser_reopens_noninteractive_renewal_without_proving_its_identit
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn closing_automatic_work_between_provider_and_status_defers_without_adoption() {
     for close_at_status in [false, true] {

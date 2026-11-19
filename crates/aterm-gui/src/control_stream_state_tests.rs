@@ -16,7 +16,7 @@ use super::super::super::control_session::cmd_await;
 use super::*;
 use crate::session_timeline::{AgentStamp, SessionTimeline, StreamedState};
 
-fn state(state: State) -> Body {
+pub(super) fn state(state: State) -> Body {
     Body::State {
         state,
         composer: None,
@@ -31,7 +31,7 @@ fn state_with(state: State, composer: Composer) -> Body {
 }
 
 /// Run `read` on `sid`'s timeline.
-fn timeline<R>(rig: &Rig, sid: &str, read: impl FnOnce(&mut SessionTimeline) -> R) -> R {
+pub(super) fn timeline<R>(rig: &Rig, sid: &str, read: impl FnOnce(&mut SessionTimeline) -> R) -> R {
     let handle = rig.service.handle(sid);
     let mut timeline = handle
         .ctx
@@ -43,7 +43,7 @@ fn timeline<R>(rig: &Rig, sid: &str, read: impl FnOnce(&mut SessionTimeline) -> 
 
 /// The screen reader publishes `word` for `sid`, as its sweep does: its own reading of a
 /// Claude Code screen, or of a screen that shows no agent for `-`.
-fn screen(rig: &Rig, sid: &str, word: &'static str, detail: Option<&str>) -> bool {
+pub(super) fn screen(rig: &Rig, sid: &str, word: &'static str, detail: Option<&str>) -> bool {
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     timeline(rig, sid, |timeline| {
@@ -73,7 +73,7 @@ fn composer(rig: &Rig, sid: &str) -> &'static str {
 }
 
 /// Every live record of `sid`'s log.
-fn records(rig: &Rig, sid: &str) -> Vec<Rec> {
+pub(super) fn records(rig: &Rig, sid: &str) -> Vec<Rec> {
     timeline(rig, sid, |timeline| {
         timeline.slog().log().window().cloned().collect()
     })
@@ -345,7 +345,7 @@ fn a_tab_without_state_is_still_fed_by_the_screen_reader() {
     let id = stream.id();
     stream.open(ONE);
     assert_eq!(stream.record(1, Body::Beat), (1, None));
-    assert_eq!(stream.record(2, goal()), (2, None));
+    assert_eq!(stream.record(2, unapplied()), (2, None));
     assert_eq!(
         rig.state(ONE).applied.iter().copied().collect::<Vec<_>>(),
         ["beat"],
@@ -826,7 +826,7 @@ fn a_stream_tab_opens_its_agent_run_from_the_claims_row() {
         assert!(runs(&rig, sid).is_empty(), "{sid}: {:?}", runs(&rig, sid));
         stream.open(sid);
         // NEGATIVE HALF: a record acknowledged and not applied, and one the grant drops.
-        assert_eq!(stream.record(1, goal()), (1, None));
+        assert_eq!(stream.record(1, unapplied()), (1, None));
         assert_eq!(
             stream.record(2, title()),
             (2, None),

@@ -493,6 +493,43 @@ impl Lexicon {
         Ok(Self::build(raw, raw_exc, &Langs::new(langs)))
     }
 
+    /// [`Self::with_languages_and_override`], shared: the lexicon compiled last, while some
+    /// caller still holds it, where it was compiled of the same `langs` (in their order, which
+    /// orders its conflicts) and the same `extra_toml`, its only inputs beside the embedded data.
+    /// The effects pipeline over each pane asks for its own; this compiles one. Weak, so the slot
+    /// keeps nothing once no caller holds the lexicon; a refused `extra_toml` is not kept.
+    ///
+    /// # Errors
+    /// [`LexError::Toml`] where `extra_toml` does not parse, as
+    /// [`Self::with_languages_and_override`].
+    pub fn shared(
+        langs: &[&str],
+        extra_toml: Option<&str>,
+    ) -> Result<std::sync::Arc<Lexicon>, LexError> {
+        type Slot = Option<(Vec<String>, Option<String>, std::sync::Weak<Lexicon>)>;
+        static LAST: std::sync::Mutex<Slot> = std::sync::Mutex::new(None);
+        let mut last = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((held_langs, held_extra, held)) = last.as_ref()
+            && held_langs
+                .iter()
+                .map(String::as_str)
+                .eq(langs.iter().copied())
+            && held_extra.as_deref() == extra_toml
+            && let Some(lexicon) = held.upgrade()
+        {
+            return Ok(lexicon);
+        }
+        let lexicon = std::sync::Arc::new(Self::with_languages_and_override(langs, extra_toml)?);
+        *last = Some((
+            langs.iter().map(|l| (*l).to_owned()).collect(),
+            extra_toml.map(str::to_owned),
+            std::sync::Arc::downgrade(&lexicon),
+        ));
+        Ok(lexicon)
+    }
+
     /// Build a lexicon from TOML sources.
     pub fn from_sources(
         lexicon_toml: &str,

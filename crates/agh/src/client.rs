@@ -1428,8 +1428,8 @@ impl Github {
         crate::git::run(self, run)
     }
 
-    /// One exact native ref push, using the same repository-wide journal bucket
-    /// as the API batch. Preparation failures create no intent or remote side effect;
+    /// One exact native ref push, retaining the API's durable journal key while
+    /// validating independent ordinary ref domains. Preparation creates no intent;
     /// an ambiguous push keeps the intent open and cannot be retried silently.
     pub(crate) fn push_git_once(
         &self,
@@ -1451,8 +1451,6 @@ impl Github {
                 .fingerprint()
                 .to_string()
         };
-        self.refs(&run.slug)
-            .reconcile_dead_writer(permit, intents, true)?;
         let refs = match &run.op {
             crate::git::GitOp::PushRefs { batch, .. } => batch.updates().to_vec(),
             crate::git::GitOp::PushControl { transaction, .. } => transaction
@@ -1471,8 +1469,20 @@ impl Github {
             }
         };
         let canonical = canon::git_request(run);
-        let latest = intents.latest(WriteOp::RefUpdateAtomic, crate::github::refs::ATOMIC_KEY)?;
-        if let Some(view) = latest.as_ref()
+        let draft = IntentDraft::new(
+            WriteOp::RefUpdateAtomic,
+            &run.slug,
+            permit,
+            &fingerprint,
+            crate::github::refs::ATOMIC_KEY,
+        )
+        .with_request(canon::request_digest(&canonical))
+        .with_refs(refs)
+        .with_body_digest(Some(crate::model::Sha256Digest::of(&canonical).to_string()));
+        self.refs(&run.slug)
+            .reconcile_dead_writer(permit, intents, true, Some(&draft))?;
+        let judgment = intents.atomic_judgment(&draft)?;
+        if let Some(view) = judgment.blocking()
             && intents.stops(view)?
         {
             let id = &view.intent.id;
@@ -1486,17 +1496,7 @@ impl Github {
             .with_repo(run.slug.to_string())
             .with_next(format!("agh intent show {} {id}", run.slug)));
         }
-        let draft = IntentDraft::new(
-            WriteOp::RefUpdateAtomic,
-            &run.slug,
-            permit,
-            &fingerprint,
-            crate::github::refs::ATOMIC_KEY,
-        )
-        .with_request(canon::request_digest(&canonical))
-        .with_refs(refs)
-        .with_body_digest(Some(crate::model::Sha256Digest::of(&canonical).to_string()))
-        .with_after(latest.map(|view| view.intent.id));
+        let draft = draft.with_atomic_judgment(judgment);
         let id = std::cell::RefCell::new(None);
         let mut admit = || {
             *id.borrow_mut() = Some(intents.begin(&draft)?);

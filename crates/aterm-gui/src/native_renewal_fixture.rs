@@ -1159,7 +1159,8 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
     store
         .write()
         .unwrap_or_else(|p| p.into_inner())
-        .register(handle.clone());
+        .register(handle.clone())
+        .start_mailbox();
     let active = Arc::new(Mutex::new(Some(ActiveSession {
         term: Arc::clone(&term),
         master,
@@ -1180,6 +1181,8 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         recovery_count_admission: Arc::new(
             crate::keeper_link::RecoveryCountAdmission::from_retained(Vec::new()),
         ),
+        #[cfg(target_os = "macos")]
+        signed_settle_ack: None,
     });
     let server_stop = Arc::new(AtomicBool::new(false));
     let server_context = Arc::clone(&context);

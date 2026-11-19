@@ -50,10 +50,13 @@
 //!    is seconds of plumbing, so a main that moves again is composed onto again at once
 //!    ([`COMPOSES`] in a row at most since a judgment or round passed). That count is the push's bound: no
 //!    deadline spans the landings of one judgment, and each remote step runs under its own hang
-//!    detector ([`NETWORK`]; a write under [`WRITE`]). A remote step that fails or times out
-//!    having sent nothing (a read of main, a push agh says it did not send) is made again after
-//!    a doubling pause, [`RETRIES`] in a row at most; a push whose outcome is unknown is never
-//!    made again, and a main that holds its landing took it. Where the endpoints share any
+//!    detector ([`NETWORK`]; a write has a [`WRITE`] work window of its own, whose end asks agh
+//!    to stop and keeps its owner through agh's settlement). A remote step that fails or times out
+//!    having sent nothing (a read of main, a push agh says it did not send or whose write
+//!    started no child, a push another writer's intent refused again once its writer was gone)
+//!    is made again after a doubling pause, [`RETRIES`] in a row at most, and
+//!    never once the landing took an interrupt; a push whose outcome is unknown is never made
+//!    again, and a main that holds its landing took it. Where the endpoints share any
 //!    other path and the merge is clean, THE ROUND: merge M2 and judge the merge (L), as L's own
 //!    freshly built verifier, with the dev set since M2 over the crates of the branch's cone
 //!    that main's change reaches (`crate::changed::resolve_round`): of the crates a judgment
@@ -145,6 +148,7 @@
 
 use crate::exit;
 use crate::land_run;
+use crate::remote::WRITE;
 use aterm_land_trailer::{Checked, Interrupted, Rechecked, Row, Stated};
 use aterm_uds::spawnfd::Command;
 use std::collections::{BTreeMap, BTreeSet};
@@ -218,22 +222,17 @@ pub const LOCK_FILE: &str = "aterm-land.lock";
 pub const PANICKED: i32 = 101;
 /// How many remote failures in a row that sent nothing the push of a passed judgment makes
 /// again before the landing stops with its judgment kept: reads of main that failed or timed
-/// out, and, counted apart, pushes agh says it did not send
-/// ([`crate::remote::Pushed::Unsent`]).
+/// out, and, counted apart, pushes that sent nothing, which agh says it did not send or whose
+/// write started no child ([`crate::remote::Pushed::Unsent`]), and, counted apart again, pushes
+/// another writer's intent refused again once its writer was gone
+/// ([`crate::remote::IntentWait::Reconcilable`]).
 pub const RETRIES: usize = 5;
 /// The pause before a failed remote step is made again; each further failure in a row doubles it.
 pub const RETRY_PAUSE: Duration = Duration::from_secs(2);
-/// The work window on one write of main ([`Wire::write`]): the longest credential grant agh
-/// issues ([`agh::git::GRANT_MAX`]). Expiry requests cancellation and retains the native owner
-/// through settlement; neither this window nor agh's per-child bound ([`agh::git::GIT_BUDGET`])
-/// establishes a deadline for the complete operation's cleanup. Killing the owner before it
-/// records its outcome would leave its durable intent open.
-const WRITE: Duration = agh::git::GRANT_MAX;
 /// How long a push waits on another writer's open atomic intent: one credential
 /// lifetime and half a minute for observations. A live writer may outlast this wait;
 /// a dead writer permits origin reconciliation (`agh::Journal::closable`).
 const INTENT_WAIT: Duration = Duration::from_secs(agh::git::GRANT_MAX.as_secs() + 30);
-const _: () = assert!(WRITE.as_secs() > agh::git::GIT_BUDGET.as_secs());
 /// Where a passed judgment is kept until its landing is on main ([`Git::keep`]): a ref of this
 /// worktree alone, which no fetch or push moves.
 pub const KEPT: &str = "refs/worktree/aterm/land-judged";
@@ -281,6 +280,8 @@ type PushObservation = aterm_land::Observation;
 /// refusal that sent nothing permits another attempt of the same landing: an exact pre-send
 /// obstruction, sharing the composition bound with main movement, and a write agh says it did
 /// not send, once `again` allows it ([`unsent_again`]). Main is read before each such attempt.
+/// One refused with no effect, by agh or by GitHub, for a reason another attempt does not cure,
+/// stops the push with nothing to settle.
 fn push_after_intents(
     budget: &mut aterm_land::Budget,
     attempt: &dyn Fn() -> Result<crate::remote::Pushed, String>,
@@ -303,11 +304,13 @@ fn push_after_intents(
 }
 
 /// One attempt of the shared loop ([`aterm_land::push_after_intents`]): `attempt`'s outcome,
-/// where a write agh says it did not send ([`crate::remote::Pushed::Unsent`]) is made again
+/// where a write that sent nothing ([`crate::remote::Pushed::Unsent`]) is made again
 /// once `again` allows it (its pause waited out) and a fresh read of main (`observe`) finds main
 /// where the landing expects it. A main that took the landing is `Done`; one that moved is a
-/// refusal whose tip is left in `moved` for the loop's refusal handler. Any other outcome is
-/// the attempt's own.
+/// refusal whose tip is left in `moved` for the loop's refusal handler. A write refused with no
+/// effect, by agh or by GitHub ([`crate::remote::Pushed::Refused`]), is a plain stop naming the
+/// refusal: not made again, main not read, nothing to settle. Any other outcome is the
+/// attempt's own.
 fn unsent_again(
     attempt: &dyn Fn() -> Result<crate::remote::Pushed, String>,
     again: &dyn Fn(&str) -> Result<(), String>,
@@ -320,6 +323,12 @@ fn unsent_again(
             crate::remote::Pushed::Rejected(why) => aterm_land::Attempt::Rejected(why),
             crate::remote::Pushed::Blocked { intent, why } => {
                 aterm_land::Attempt::Blocked { intent, why }
+            }
+            crate::remote::Pushed::Refused(why) => {
+                return Err(format!(
+                    "{why}; agh reports the push was refused with no effect (by agh or by \
+                     GitHub), so it is not made again and nothing is left to settle"
+                ));
             }
             crate::remote::Pushed::Unsent(why) => {
                 again(&why)?;
@@ -480,9 +489,9 @@ pub enum Ran {
     /// is read.
     Interrupted {
         /// Its wall seconds until it ended, less the time it waited for the judgment turn
-        /// (`crate::turn`): what of it judged, so a cut while it was queued counts only its start.
+        /// (`crate::turn`): what of it judged, so a cut while it was queued counts its completed preflight and startup.
         secs: u64,
-        /// Whether it was still queued for the judgment turn when it was cut: it judged nothing.
+        /// Whether it was still queued for the judgment turn when it was cut: post-preflight stages had not started.
         queued: bool,
     },
     /// A poll's `true` interrupted it, and processes it had started still ran once the wait for
@@ -579,7 +588,9 @@ pub struct Seams<'a> {
     /// Say a line to the person.
     pub say: &'a mut dyn FnMut(&str),
     /// One remote step of the push phase (each push, and each read of main once a judgment
-    /// passed), with an explicit read or mutation lifetime: [`live_remote`] in production.
+    /// passed), with an explicit read or mutation lifetime: [`live_remote`] in production, which
+    /// runs a read through [`crate::remote::run_unless`] and a mutation through
+    /// [`crate::remote::run_mutation`].
     pub(crate) remote: &'a RemoteStep<'a>,
     /// Wait out the pause before a failed remote step is made again ([`RETRY_PAUSE`]), and each
     /// tick of a wait on another writer's open intent.
@@ -587,7 +598,9 @@ pub struct Seams<'a> {
 }
 
 /// How the push phase runs one remote step: a git or agh command for the checkout at the path,
-/// its git made by the maker, with an explicit lifetime policy and work deadline.
+/// its git made by the maker, with an explicit lifetime policy ([`RemoteMode`]) and work
+/// deadline. A step that gave no output says whether its child started
+/// ([`crate::remote::Failed`]): a write that started none sent nothing.
 pub(crate) type RemoteStep<'a> = dyn Fn(
         &Path,
         &dyn Fn(&Path) -> Command,
@@ -595,12 +608,19 @@ pub(crate) type RemoteStep<'a> = dyn Fn(
         &[std::ffi::OsString],
         Instant,
         RemoteMode,
-    ) -> Result<std::process::Output, String>
+    ) -> Result<std::process::Output, crate::remote::Failed>
     + 'a;
 
+/// What a remote step of the push phase is ([`RemoteStep`]), which says how it ends where it
+/// does not end by itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteMode {
+    /// A step that writes nothing to main: ended as hung at its instant
+    /// ([`crate::remote::run_unless`]).
     Read,
+    /// A write of main ([`crate::remote::run_mutation`]): started only while the landing took no
+    /// interrupt and its work window is open; the window's end or an interrupt asks agh to stop,
+    /// and its owner is kept through agh's settlement.
     Mutation,
 }
 
@@ -1387,6 +1407,13 @@ struct Wire<'a> {
     /// What a later run must settle first where the push ended with a write whose outcome is
     /// unknown, or with an intent still open: a run before that waits on the intent.
     unsettled: std::cell::RefCell<Option<String>>,
+    /// The intent whose wait last ended with its writer gone
+    /// ([`crate::remote::IntentWait::Reconcilable`]): the push made after it was to read that
+    /// intent's refs from origin before it began, so one it refuses again is a failure that
+    /// sent nothing ([`Self::await_intent`]).
+    reconciling: std::cell::RefCell<Option<agh::IntentId>>,
+    /// Pushes [`Self::reconciling`]'s intent refused again in a row.
+    reconciles: std::cell::Cell<usize>,
 }
 
 impl<'a> Wire<'a> {
@@ -1406,6 +1433,8 @@ impl<'a> Wire<'a> {
             reads: std::cell::Cell::new(0),
             unsent: std::cell::Cell::new(0),
             unsettled: std::cell::RefCell::new(None),
+            reconciling: std::cell::RefCell::new(None),
+            reconciles: std::cell::Cell::new(0),
         }
     }
 
@@ -1424,17 +1453,22 @@ impl<'a> Wire<'a> {
             Instant::now() + NETWORK,
             RemoteMode::Read,
         )
+        .map_err(crate::remote::Failed::why)
     }
 
-    /// One mutation with its own [`WRITE`] work window. Expiry or interruption requests native
-    /// cancellation; the actual owner runs through settlement before the step returns. Hold
-    /// the landing's interrupt watchdog through that cleanup (`exec::group::hold`).
+    /// One mutation with its own [`WRITE`] work window ([`RemoteMode::Mutation`],
+    /// [`crate::remote::run_mutation`] in production). Expiry or interruption requests native
+    /// cancellation; the actual owner runs through settlement before the step returns. The
+    /// landing's interrupt watchdog is held through that cleanup by the mutation itself
+    /// (`exec::group::hold`, taken before it reads the interrupt), never here, so a seam that ran
+    /// the push outside it would make its command unheld. One refused before it started (the
+    /// landing took an interrupt first) says so ([`crate::remote::Failed::Unstarted`]): it sent
+    /// nothing.
     fn write(
         &self,
         tool: crate::remote::Tool,
         args: &[std::ffi::OsString],
-    ) -> Result<std::process::Output, String> {
-        let _held = crate::exec::group::hold();
+    ) -> Result<std::process::Output, crate::remote::Failed> {
         (self.step)(
             self.git.root,
             self.git.make,
@@ -1505,10 +1539,18 @@ impl<'a> Wire<'a> {
     }
 
     /// Push `landing` to main, expecting main at `onto`: `None` once it landed, or main's new
-    /// tip where it moved ([`Self::settle`]). A push that fails with no typed refusal (one this
-    /// tool's hang detector ended included) has an unknown outcome and is never made again: main
-    /// is read, and one that holds the landing took it; else what a later run must settle first
-    /// is kept ([`Self::unsettled`]).
+    /// tip where it moved ([`Self::settle`]). A push whose write started no child (the landing
+    /// took an interrupt first, or its command could not be made or started:
+    /// [`crate::remote::Failed::Unstarted`]) sent nothing, as one agh says it did not send
+    /// ([`crate::remote::Pushed::Unsent`]): it is made again only as [`Self::again`] allows,
+    /// never after the interrupt, and leaves nothing to settle. A push refused with no effect,
+    /// for a reason another attempt does not cure (by agh: no credential or a 401, no
+    /// permission, input it refuses; or by GitHub, which rejected the push it received: a branch
+    /// rule; [`crate::remote::Pushed::Refused`]), stops the landing naming the refusal, not made
+    /// again and with nothing to settle. A push that fails with no typed refusal that says it sent
+    /// nothing or had no effect (one its work window or an interrupt asked agh to stop included)
+    /// has an unknown outcome and is never made again: main is read, and one that holds the
+    /// landing took it; else what a later run must settle first is kept ([`Self::unsettled`]).
     fn push(
         &self,
         landing: &str,
@@ -1521,9 +1563,12 @@ impl<'a> Wire<'a> {
         let unknown = |why: String| {
             *self.unsettled.borrow_mut() = Some(format!(
                 "the write of {landing} to {MAIN} ended with an unknown outcome; where agh \
-                 journaled it, its intent stops atomic writes from this Mac for agh's window \
-                 (`agh intent show`), after which the next push closes it; a later push of \
-                 this landing is refused where main holds it already, and read as landed"
+                 journaled it, its intent stops atomic writes from this Mac (`agh intent \
+                 show`) until, its agh gone, the next push reads {MAIN} from origin and closes \
+                 it where {MAIN} reads as before or as after this write, and holds it where \
+                 {MAIN} moved elsewhere or could not be read; a later push of this landing is \
+                 refused where main \
+                 holds it already, and read as landed"
             ));
             why
         };
@@ -1553,20 +1598,12 @@ impl<'a> Wire<'a> {
                 if !matches!(pushed, crate::remote::Pushed::Unsent(_)) {
                     self.unsent.set(0);
                 }
+                if !matches!(pushed, crate::remote::Pushed::Blocked { .. }) {
+                    self.reconciles.set(0);
+                }
                 Ok(pushed)
             },
-            &|intent| {
-                (self.say)(&format!(
-                    "verify land: waiting up to {}s for agh atomic intent {} to close; this push \
-                     sent nothing",
-                    INTENT_WAIT.as_secs(),
-                    intent.as_str()
-                ));
-                // agh judges when the intent stops pushes (`agh::Journal::closable`); the wait
-                // ends there and the push is made again, whose begin closes it.
-                let until = Instant::now() + INTENT_WAIT;
-                self.wait_for_intent(intent, until)
-            },
+            &|intent| self.await_intent(intent),
             // The refused attempt sent nothing. Where main is unchanged the same expected-ref
             // push runs again; this is not replay of an unknown write.
             &|| self.observe(landing, onto),
@@ -1575,6 +1612,60 @@ impl<'a> Wire<'a> {
         )
     }
 
+    /// Wait up to [`INTENT_WAIT`] on `intent`, which refused this push before it sent anything,
+    /// for it to close or for its writer to be gone (`agh::Journal::closable`), after which the
+    /// push is made again and agh reads the intent's refs from origin before it begins: it
+    /// closes the intent only where they read wholly as before or wholly as after its write, and
+    /// otherwise refuses the push again naming it. That refusal does not say whether origin's
+    /// refs read mixed, which no attempt changes, or could not be read, or the push's agh did
+    /// not judge the writer gone, which a later attempt may cure
+    /// ([`crate::remote::IntentWait::Reconcilable`]). So the same intent refusing the push again
+    /// after a wait that ended on its writer gone is a failure that sent nothing, made again as
+    /// [`Self::again`] allows ([`Self::reconciles`]); past that the push stops, naming the
+    /// intent for a later run to settle. An intent held for good
+    /// ([`crate::remote::IntentWait::Held`]) stops the push at once ([`Self::wait_for_intent`]).
+    fn await_intent(&self, intent: &agh::IntentId) -> Result<(), String> {
+        if self.reconciling.borrow().as_ref() == Some(intent) {
+            let why = format!(
+                "agh intent {} refused it again once its writer was gone: origin's refs for it \
+                 read neither wholly as before nor wholly as after its write, could not be \
+                 read, or the push's agh did not judge that writer gone",
+                intent.as_str()
+            );
+            if let Err(stopped) = self.again(&self.reconciles, "the push", &why) {
+                if self.reconciles.get() == RETRIES {
+                    *self.unsettled.borrow_mut() = Some(format!(
+                        "agh intent {} stays open: {} pushes made once its writer was gone \
+                         each found its refs on origin neither wholly as before nor wholly as \
+                         after its write, could not read them, or did not judge that writer \
+                         gone (`agh intent show`); a later push reads them again, and once \
+                         origin shows what that write did `agh intent retract` closes it",
+                        intent.as_str(),
+                        RETRIES + 1
+                    ));
+                }
+                return Err(stopped);
+            }
+        } else {
+            self.reconciles.set(0);
+        }
+        (self.say)(&format!(
+            "verify land: waiting up to {}s for agh atomic intent {} to close; this push sent \
+             nothing",
+            INTENT_WAIT.as_secs(),
+            intent.as_str()
+        ));
+        self.wait_for_intent(intent, Instant::now() + INTENT_WAIT)
+    }
+
+    /// [`Self::await_intent`]'s wait, until `until`, noting whether it ended on the intent's
+    /// writer gone ([`Self::reconciling`]).
+    ///
+    /// # Errors
+    /// The landing took an interrupt or a read failed; or the wait's budget ran out with the
+    /// intent still open, or the wait found it held for good
+    /// ([`crate::remote::IntentWait::Held`]), each of which leaves the intent to settle
+    /// ([`Self::unsettled`]).
     fn wait_for_intent(&self, intent: &agh::IntentId, until: Instant) -> Result<(), String> {
         let remaining = || {
             if let Some(signal) = (self.interrupt)() {
@@ -1586,9 +1677,11 @@ impl<'a> Wire<'a> {
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 *self.unsettled.borrow_mut() = Some(format!(
-                    "agh intent {} stayed open for this wait's {}s budget, its writer or \
-                     unresolved origin state still stopping it (`agh intent show`); the next run \
-                     waits on it again",
+                    "agh intent {} stayed open for this wait's {}s budget, its writer still \
+                     running or not known to be gone (`agh intent show`); the next run waits on \
+                     it again, though where it records no writer (`writer` is null) and that \
+                     write's agh is gone, no wait closes it: once origin shows what that write \
+                     did, `agh intent retract` does",
                     intent.as_str(),
                     INTENT_WAIT.as_secs()
                 ));
@@ -1609,12 +1702,29 @@ impl<'a> Wire<'a> {
                 until.min(Instant::now() + NETWORK),
                 RemoteMode::Read,
             )
+            .map_err(crate::remote::Failed::why)
         };
         let remote = crate::remote::Remote::open(self.git.root, REMOTE, &run)?;
-        remote.wait_for_intent(intent, &|| {
+        let ended = remote.wait_for_intent(intent, &|| {
             (self.pause)(remaining()?.min(Duration::from_millis(100)));
             Ok(())
-        })
+        })?;
+        if ended == crate::remote::IntentWait::Held {
+            *self.unsettled.borrow_mut() = Some(format!(
+                "agh intent {} stays open: it records no writer and its outcome is unknown, so \
+                 no wait or later push closes it (`agh intent show`); once origin shows what \
+                 that write did, `agh intent retract` closes it",
+                intent.as_str()
+            ));
+            return Err(format!(
+                "another writer's atomic intent {} records no writer and settled with an \
+                 unknown outcome: agh reconciles no such intent from origin",
+                intent.as_str()
+            ));
+        }
+        *self.reconciling.borrow_mut() =
+            (ended == crate::remote::IntentWait::Reconcilable).then(|| intent.clone());
+        Ok(())
     }
 
     /// Where a push of `landing` onto `onto` git reported failed (`why`) left main, fetched: a
@@ -2047,7 +2157,7 @@ fn judge(
         (Ran::Ended(judged), _) => Err(judged),
         (Ran::Interrupted { secs, queued }, Some((tip, why))) => {
             let queued = if queued {
-                " (it was still queued for the judgment turn, and had judged nothing)"
+                " (post-preflight stages were still queued for the judgment turn)"
             } else {
                 ""
             };
@@ -4221,10 +4331,12 @@ pub fn usage() -> String {
          admission may grant less. The full dev set and change cone are unchanged.\n\n\
          A judgment that passed is never lost to the push. The count above is the push's\n\
          only bound: no deadline spans its landings, and each remote step runs under its own\n\
-         hang detector ({network}s; {write}s for a write, which agh's own bounds come before).\n\
+         hang detector ({network}s; {write}s for a write, at whose end agh is asked to stop and\n\
+         settles it, its own bounds coming before).\n\
          A remote step that failed or timed out having sent nothing (a read of {MAIN}, a push\n\
-         agh says it did not send) is made again after a pause that doubles from {pause}s, at\n\
-         most {RETRIES} times in a row; a push whose outcome is unknown is never made again,\n\
+         that never started or that agh says it did not send) is made again after a pause\n\
+         that doubles from {pause}s, at most {RETRIES} times in a row and never once the\n\
+         landing took an interrupt; a push whose outcome is unknown is never made again,\n\
          and a {MAIN} that holds its landing took it. The judgment is kept in this worktree\n\
          ({KEPT}) until its landing is on {MAIN}: a run that\n\
          ends before then (stopped at a bound, a remote that stayed down, a kill) is run again,\n\
@@ -4376,6 +4488,41 @@ fn options(args: &[String]) -> Option<LandResources> {
 /// [--help]`, from `cwd`'s checkout.
 /// `verify land --resume <file>` is the landing's own handoff to another build of itself.
 pub fn run(args: &[String], cwd: &Path) -> i32 {
+    let code = run_landing(args, cwd);
+    if code == exit::FAILED
+        && let Some(root) = crate::checkout_root(cwd)
+    {
+        // After the verdict and its records: one read of the journal, so a red that main
+        // already has reads as main's.
+        let tip = format!("refs/remotes/{REMOTE}/{MAIN}");
+        let read = crate::judged::interruptible(|| {
+            crate::judged::newest_verdict_on(&root, REMOTE, &tip, crate::judged::deadline())
+        });
+        eprintln!("{}", mains_verdict(read));
+    }
+    code
+}
+
+/// What a red landing says of main, from the follower's newest verdict there (`read`): the
+/// landing's own red may be main's.
+fn mains_verdict(read: Result<Option<crate::judged::Record>, String>) -> String {
+    match read {
+        Ok(Some(record)) => format!(
+            "verify land: the follower's newest verdict on main ({}): {} {}",
+            crate::judged::REF,
+            record.commit,
+            record.summary()
+        ),
+        Ok(None) => format!(
+            "verify land: the follower has filed no verdict on main ({})",
+            crate::judged::REF
+        ),
+        Err(why) => format!("verify land: the follower's verdict on main was not read: {why}"),
+    }
+}
+
+/// [`run`], before what a red adds to it.
+fn run_landing(args: &[String], cwd: &Path) -> i32 {
     match args {
         [help] if help == "--help" || help == "-h" => {
             print!("{}", usage());
@@ -4750,8 +4897,10 @@ fn with_live_seams<R>(
 
 /// One remote step of the push phase ([`Seams::remote`]): [`crate::remote::run`], ended at the
 /// interrupt the landing took ([`interrupted`]), so a read of main or a wait on another writer
-/// ends at it. An explicitly tagged mutation requests cancellation from the raw signal and
-/// retains its native owner through settlement while the watchdog is held ([`Wire::write`]).
+/// ends at it. An explicitly tagged mutation ([`crate::remote::run_mutation`]) starts no child
+/// once the landing took an interrupt, requests cancellation from the raw signal and retains its
+/// native owner through settlement while it holds the watchdog itself ([`Wire::write`] holds
+/// nothing).
 fn live_remote(
     root: &Path,
     git: &dyn Fn(&Path) -> Command,
@@ -4759,10 +4908,11 @@ fn live_remote(
     args: &[std::ffi::OsString],
     until: Instant,
     mode: RemoteMode,
-) -> Result<std::process::Output, String> {
+) -> Result<std::process::Output, crate::remote::Failed> {
     match mode {
         RemoteMode::Read => {
             crate::remote::run_unless(root, git, tool, args, until, &mut interrupted)
+                .map_err(crate::remote::Failed::Ended)
         }
         RemoteMode::Mutation => {
             crate::remote::run_mutation(root, git, tool, args, until, &mut taken)
@@ -4930,7 +5080,7 @@ fn nested(
     };
     let code = match supervise_judgment(&mut child, &events, poll) {
         Ok(Ending::Exited(code)) => code,
-        // No verdict: nothing it wrote is read. Its wait for the judgment turn judged nothing.
+        // No verdict: nothing it wrote is reused. Queue time is apart from its completed tree preflight.
         Ok(Ending::Interrupted { waited, queued }) => {
             return Ran::Interrupted {
                 secs: began.elapsed().saturating_sub(waited).as_secs(),
@@ -4958,7 +5108,25 @@ fn nested(
         }
     };
     let text = std::fs::read_to_string(&events).unwrap_or_default();
-    Ran::Ended(Judged::from_events(&text, code, began.elapsed().as_secs()))
+    Ran::Ended(Judged::from_events(
+        &text,
+        code,
+        judging_seconds(&text, began.elapsed()),
+    ))
+}
+
+/// Queue time buys no judgment. Completed tree work and startup remain in the elapsed time.
+fn judging_seconds(events: &str, elapsed: Duration) -> u64 {
+    let mut report = Report::default();
+    for line in events
+        .split_inclusive('\n')
+        .filter_map(|line| line.strip_suffix('\n'))
+    {
+        record(line.as_bytes(), &mut report);
+    }
+    elapsed
+        .saturating_sub(Duration::from_millis(report.waited_ms.unwrap_or(0)))
+        .as_secs()
 }
 
 /// What [`supervise`] reads of a running judgment and does to it: production's is [`LiveRun`].
@@ -5165,11 +5333,11 @@ impl Running for LiveRun<'_> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Report {
     /// Its stage boundaries: each complete `stage-finished` record
-    /// ([`crate::event_log::observation`]), once, and its `judgment-turn`, which starts its work:
+    /// ([`crate::event_log::observation`]), once, and its `judgment-turn`, which admits its post-preflight work:
     /// main is read at once when a queued run's turn comes.
     boundaries: usize,
     /// Whether it is queued for the judgment turn (`crate::turn`): it said `judgment-queued` and
-    /// no `judgment-turn` yet, so it holds no judging work.
+    /// no `judgment-turn` yet, so it holds no post-preflight admission (its tree rows may be complete).
     queued: bool,
     /// How long it waited for the turn, ms, as its `judgment-turn` said.
     waited_ms: Option<u64>,

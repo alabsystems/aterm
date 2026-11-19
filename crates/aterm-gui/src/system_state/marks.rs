@@ -5,8 +5,9 @@
 //! (`docs/DESIGN-init-on-by-default-2026-10-25.md` §4.4): each state's mark and ink, the list's
 //! and the card's grounds (a grouped form's, [`crate::settings::Roles::grouped`]), and a card's
 //! rim. Every state has its own shape, so colour is never the only signal; the accent macOS
-//! paints controls in marks only work under way, success only work done, macOS's systemOrange
-//! what needs the person and its systemRed what failed. A card is a rim and a mark, never a wash.
+//! paints controls in marks only work under way, success only work done, the native
+//! needs-person role what needs the person and danger what failed. A card is a rim and a mark,
+//! never a wash.
 
 use super::lines::Mark;
 use crate::native_appearance::{contrast_ratio, ensure_contrast_ratio, hue_distance, mix_srgb};
@@ -28,36 +29,6 @@ pub(crate) const GREEN_ACCENT_DEGREES: f32 = 40.0;
 
 /// How strong a card's state colour is in its rim, over the card.
 const RIM_STRENGTH: f32 = 0.35;
-
-/// A colour macOS defines for each appearance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SystemColor {
-    pub(crate) dark: [u8; 3],
-    pub(crate) light: [u8; 3],
-}
-
-impl SystemColor {
-    /// The shade for a ground: its dark one on a dark ground.
-    pub(crate) fn on(self, ground: [u8; 3]) -> [u8; 3] {
-        if crate::native_appearance::surface_is_dark(ground) {
-            self.dark
-        } else {
-            self.light
-        }
-    }
-}
-
-/// macOS's systemOrange: what needs the person.
-pub(crate) const SYSTEM_ORANGE: SystemColor = SystemColor {
-    dark: [0xFF, 0x9F, 0x0A],
-    light: [0xFF, 0x95, 0x00],
-};
-
-/// macOS's systemRed: what failed.
-pub(crate) const SYSTEM_RED: SystemColor = SystemColor {
-    dark: [0xFF, 0x45, 0x3A],
-    light: [0xFF, 0x3B, 0x30],
-};
 
 /// What a mark's ink is held to against its ground: [`MARK_CONTRAST`] with a little to spare,
 /// so the pixels it paints, rounded to the screen's, still clear it.
@@ -148,14 +119,14 @@ pub(crate) fn ground_fill(ground: Ground, roles: &Roles, looks: Looks) -> [u8; 3
     }
 }
 
-/// A ground's rim: the card's separator, systemOrange (Needs you) or systemRed (failed) at .35
+/// A ground's rim: the card's separator, needs-person or danger role at .35
 /// over the card, at least 3:1 against the page under High Contrast.
 fn ground_rim(ground: Ground, roles: &Roles, looks: Looks) -> [u8; 3] {
     let card = card_ground(roles);
     let rim = match ground {
         Ground::List | Ground::Working => roles.separator,
-        Ground::Needs => mix_srgb(card, SYSTEM_ORANGE.on(card), RIM_STRENGTH),
-        Ground::Failed => mix_srgb(card, SYSTEM_RED.on(card), RIM_STRENGTH),
+        Ground::Needs => mix_srgb(card, roles.needs_person, RIM_STRENGTH),
+        Ground::Failed => mix_srgb(card, roles.danger, RIM_STRENGTH),
     };
     if looks.high_contrast {
         ensure_contrast_ratio(rim, page_ground(roles), MARK_CONTRAST)
@@ -181,9 +152,9 @@ pub(crate) fn mark_ink(mark: Mark, roles: &Roles, ground: [u8; 3]) -> [u8; 3] {
     let ink = match mark {
         Mark::Pending | Mark::Waiting | Mark::Off => roles.text_tertiary,
         Mark::Working => working_hue(roles),
-        Mark::NeedsYou => SYSTEM_ORANGE.on(ground),
+        Mark::NeedsYou => roles.needs_person,
         Mark::Done => crate::native_appearance::ensure_text_contrast(roles.success, ground),
-        Mark::Failed => SYSTEM_RED.on(ground),
+        Mark::Failed => roles.danger,
     };
     let wash = crate::native_ui::DISCLOSURE_HOVER_WASH;
     let hovered = [

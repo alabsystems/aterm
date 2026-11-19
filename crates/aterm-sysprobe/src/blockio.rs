@@ -109,6 +109,17 @@ pub struct BlockReading {
     pub counters: BlockCounters,
 }
 
+/// One block-device read and the device resolved for each original mount request. Resolution
+/// survives an unread counter or device-output deduplication; it never supplies counters.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockBatch {
+    /// Distinct devices whose counters read, in request order, at most [`MAX_BLOCK_DEVICES`].
+    pub devices: Vec<BlockReading>,
+    /// One slot per original request, in that order: its resolved device identity, or `None`
+    /// where resolution failed or this platform has no reader.
+    pub mounts: Vec<Option<String>>,
+}
+
 /// What a reader knows of a device once it walked to it.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -543,11 +554,16 @@ impl LinuxReader {
     /// `/proc/diskstats` no longer lists reads nothing and is walked again next time (as a macOS
     /// driver that stopped answering is), so a disk that took another's name is never read
     /// under the other's identity.
-    pub(crate) fn read(&mut self, volumes: &[(&str, Option<(u32, u32)>)]) -> Vec<BlockReading> {
+    pub(crate) fn read(&mut self, volumes: &[(&str, Option<(u32, u32)>)]) -> BlockBatch {
+        let mut batch = BlockBatch {
+            mounts: vec![None; volumes.len()],
+            ..BlockBatch::default()
+        };
         let mut asked: Vec<KeptVolume> = Vec::new();
-        for &(source, dev) in volumes {
+        for (index, &(source, dev)) in volumes.iter().enumerate() {
             let same = |k: &KeptVolume| k.source == source && k.dev == dev;
-            if asked.iter().any(same) {
+            if let Some(known) = asked.iter().find(|k| same(k)) {
+                batch.mounts[index] = Some(known.device.id.clone());
                 continue;
             }
             let kept = self
@@ -572,10 +588,11 @@ impl LinuxReader {
                     }
                 }
             };
+            batch.mounts[index] = Some(kept.device.id.clone());
             asked.push(kept);
         }
         if asked.is_empty() {
-            return Vec::new();
+            return batch;
         }
         let stats = crate::volumes::read_capped(&self.root.join("proc/diskstats"), DISKSTATS_CAP)
             .map(|(text, _)| diskstats(&text));
@@ -591,7 +608,8 @@ impl LinuxReader {
             self.kept.insert(0, k);
         }
         self.kept.truncate(KEPT_VOLUMES);
-        distinct(out)
+        batch.devices = distinct(out);
+        batch
     }
 }
 
@@ -625,13 +643,16 @@ impl BlockReader {
         }
     }
 
-    /// One reading per distinct device the `mounts` are stored on, in their order, at most
-    /// [`MAX_BLOCK_DEVICES`]; a mount whose device cannot be found or read gives none (the tile
-    /// is absent, never wrong). Empty off macOS and Linux.
-    pub fn read(&mut self, mounts: &[&Mount]) -> Vec<BlockReading> {
+    /// Resolve each original mount request and read its device, with distinct readable devices
+    /// in request order, at most [`MAX_BLOCK_DEVICES`]. An unread counter supplies no device
+    /// reading, while its resolved identity remains in the mount's slot. Off macOS and Linux
+    /// every slot is unresolved and there are no device readings.
+    pub fn read(&mut self, mounts: &[&Mount]) -> BlockBatch {
         #[cfg(target_os = "macos")]
         {
-            distinct(self.mac.read(mounts))
+            let mut batch = self.mac.read(mounts);
+            batch.devices = distinct(batch.devices);
+            batch
         }
         #[cfg(target_os = "linux")]
         {
@@ -649,8 +670,10 @@ impl BlockReader {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            let _ = mounts;
-            Vec::new()
+            BlockBatch {
+                mounts: vec![None; mounts.len()],
+                ..BlockBatch::default()
+            }
         }
     }
 }

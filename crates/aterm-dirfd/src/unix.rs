@@ -282,6 +282,8 @@ pub struct Stat {
     pub st_uid: u32,
     /// The 512-byte blocks allocated to it: what its removal gives back once its last name goes.
     pub st_blocks: u64,
+    /// Its length in bytes: what a reader of every byte reads, however few blocks it holds.
+    pub st_size: u64,
 }
 
 impl Stat {
@@ -306,6 +308,7 @@ impl Stat {
             st_nlink: raw.st_nlink as u64,
             st_uid: raw.st_uid,
             st_blocks: u64::try_from(raw.st_blocks).unwrap_or(0),
+            st_size: u64::try_from(raw.st_size).unwrap_or(0),
         }
     }
 }

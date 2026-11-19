@@ -22,12 +22,27 @@ pub use crate::platform_impl::wayland::{WaylandClipboard, WaylandSelection};
 pub trait ActiveEventLoopExtWayland {
     /// True if the [`ActiveEventLoop`] uses Wayland.
     fn is_wayland(&self) -> bool;
+
+    /// While handling a left release outside its originating surface, ask for the
+    /// destination after the compositor releases its pointer grab. A successful request
+    /// delivers [`crate::event::WindowEvent::DroppedLocal`] to the source window.
+    fn resolve_outside_release(&self, source: crate::window::WindowId, token: [u64; 2]) -> bool;
 }
 
 impl ActiveEventLoopExtWayland for ActiveEventLoop {
     #[inline]
     fn is_wayland(&self) -> bool {
         self.p.is_wayland()
+    }
+
+    fn resolve_outside_release(&self, source: crate::window::WindowId, token: [u64; 2]) -> bool {
+        match &self.p {
+            #[cfg(wayland_platform)]
+            crate::platform_impl::ActiveEventLoop::Wayland(event_loop) => {
+                event_loop.state.borrow_mut().resolve_outside_release(source.0, token)
+            },
+            _ => false,
+        }
     }
 }
 

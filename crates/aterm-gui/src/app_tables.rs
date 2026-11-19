@@ -14,67 +14,32 @@ impl crate::App {
         self.open_tables_tab_at(None)
     }
 
-    /// aterm ▸ Registry… and its palette row (`MenuAction::Tables`).
+    /// aterm ▸ Tables… and its palette row (`MenuAction::Tables`).
     pub(crate) fn open_tables_from_menu(&mut self) {
         if let Err(why) = self.open_app(crate::app_control::OpenRequest::Tables) {
             self.pending_action_refusal = Some(why);
         }
     }
 
-    /// [`Self::open_tables_tab`], reading the registry at `paths` (this Mac's where `None`).
+    /// [`Self::open_tables_tab`], reading the registered table families at `paths` (this Mac's
+    /// where `None`).
     pub(crate) fn open_tables_tab_at(
         &mut self,
         paths: Option<crate::tables_store::Paths>,
     ) -> Result<(), String> {
-        let wid = self
-            .frontmost_window
-            .ok_or_else(|| "no window to open Tables in".to_string())?;
-        let existing = self.windows.get(&wid).and_then(|window| {
-            window.tab_set.tabs().iter().find_map(|tab| {
-                let mut found = None;
-                tab.root.any_leaf(&mut |&view| {
-                    let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view)
-                    else {
-                        return false;
-                    };
-                    if self
-                        .native_runtime
-                        .app(native.instance)
-                        .is_some_and(|app| app.kind() == AppKind::Tables)
-                    {
-                        found = Some((tab.id, view));
-                        true
-                    } else {
-                        false
-                    }
-                });
-                found
-            })
-        });
-        let (tab, view) = match existing {
-            Some(placed) => placed,
-            None => self.stage_tables_tab(wid, paths)?,
-        };
-        let mut route_guard_window = self
-            .windows
-            .get_mut(&wid)
-            .ok_or_else(|| "the window closed".to_string())?;
-        let window = &mut **route_guard_window;
-        if !window.tab_set.switch_to(tab)
-            || !window
-                .tab_set
-                .active_mut()
-                .is_some_and(|tab| tab.set_focus(view))
-        {
-            return Err("Tables could not be shown in the requesting window".into());
-        }
-        crate::app_tabs::cancel_pending_close(window);
-        window.last_present = None;
-        drop(route_guard_window);
-        self.resync_active_or_window(wid);
-        self.sync_active_session();
-        self.request_redraw_all_windows();
-        Ok(())
+        self.open_tables_tab_over(paths, crate::tables_store::FAMILIES)
+    }
+
+    /// [`Self::open_tables_tab_at`], the page listing `families` (each by its first
+    /// generation, the first the one History reads) where it opens a new page.
+    pub(crate) fn open_tables_tab_over(
+        &mut self,
+        paths: Option<crate::tables_store::Paths>,
+        families: &'static [&'static crate::tables_store::Compiled],
+    ) -> Result<(), String> {
+        self.open_singleton_native_tab(AppKind::Tables, |app, window| {
+            app.stage_tables_tab(window, paths, families)
+        })
     }
 
     /// Mint a view of the Tables page at `target`: a tab of a window, or the leaf a restore is
@@ -83,6 +48,7 @@ impl crate::App {
         &mut self,
         target: impl Into<crate::app_tabs::NativeInstallTarget>,
         paths: Option<crate::tables_store::Paths>,
+        families: &'static [&'static crate::tables_store::Compiled],
     ) -> Result<(crate::tab_model::TabId, crate::tab_model::ViewId), String> {
         let target = target.into();
         let proxy = self.proxy.clone();
@@ -99,7 +65,7 @@ impl crate::App {
             if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::Tables) {
                 self.install_native_tab(target, instance, state, presentation)
             } else {
-                let model = TablesApp::new(paths, move || {
+                let model = TablesApp::new(paths, families, move || {
                     if let Some(proxy) = &proxy {
                         let _ = proxy.send_event(crate::Wake::TablesChanged);
                     }
@@ -113,6 +79,19 @@ impl crate::App {
                 .map(|(_, tab, view)| (tab, view))
             };
         installed.map_err(|error| format!("Tables could not be opened: {error:?}"))
+    }
+
+    pub(crate) fn reveal_table_record(
+        &mut self,
+        view: crate::tab_model::ViewId,
+        sheet: &'static str,
+        key: &str,
+    ) -> Result<(), String> {
+        let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view) else {
+            return Err("The Tables view closed".into());
+        };
+        self.native_runtime
+            .show_table_record(native.instance, view, sheet, key)
     }
 
     pub(crate) fn on_tables_changed(&mut self) {

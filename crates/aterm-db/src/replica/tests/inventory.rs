@@ -65,7 +65,7 @@ fn peer_summaries_reuse_only_exact_retained_sets() {
 }
 
 /// The previous materialized offered set is the oracle for the lazy view: exclusions may name
-/// records this store never held, and a wrap pivot need not be offered or even known.
+/// records this store never held, and an ID asked about need not be offered or even known.
 /// NEGATIVE CONTROL: offering an excluded ID or hashing the retained count fails the comparison.
 #[test]
 fn offered_views_match_materialized_sets_and_canonical_summaries() {
@@ -88,17 +88,17 @@ fn offered_views_match_materialized_sets_and_canonical_summaries() {
                 .collect();
             let candidate = inventory(known.clone(), excluded, template);
             assert_eq!(candidate.offered_summary(), InventorySummary::of(&offered));
-            for after in std::iter::once(None).chain((0..=21).map(|value| Some(id(value)))) {
+            for value in 0..=21 {
                 assert_eq!(
-                    candidate.offered_cycle(after).copied().collect::<Vec<_>>(),
-                    cycle(&offered, after).copied().collect::<Vec<_>>(),
-                    "known={known_mask:x} excluded={excluded_mask:x} after={after:?}"
+                    candidate.offers(&id(value)),
+                    offered.contains(&id(value)),
+                    "known={known_mask:x} excluded={excluded_mask:x} id={value}"
                 );
                 cases += 1;
             }
         }
     }
-    assert_eq!(cases, 164_864);
+    assert_eq!(cases, 157_696);
 }
 
 /// The actual round must offer exactly the checked store API's eligible records, including
@@ -163,11 +163,8 @@ fn real_forks(independent: usize) {
         assert_eq!(offered.len(), expected);
         assert_eq!(inventory.known, known);
         assert_eq!(inventory.offered_summary(), InventorySummary::of(&offered));
-        for after in std::iter::once(None).chain(known.iter().copied().map(Some)) {
-            assert_eq!(
-                inventory.offered_cycle(after).copied().collect::<Vec<_>>(),
-                cycle(&offered, after).copied().collect::<Vec<_>>()
-            );
+        for id in &known {
+            assert_eq!(inventory.offers(id), offered.contains(id), "{id:?}");
         }
     };
     check(independent + 1);
@@ -219,7 +216,10 @@ fn candidate_work(
     (
         candidate.observation.inventory,
         candidate.offered_summary(),
-        candidate.offered_cycle(Some(id(13))).take(BATCH).count(),
+        cycle(&candidate.known, Some(id(13)))
+            .filter(|key| candidate.offers(key))
+            .take(BATCH)
+            .count(),
     )
 }
 

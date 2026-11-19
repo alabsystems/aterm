@@ -681,13 +681,9 @@ fn a_fleet_setter_is_named_by_its_mac() {
             "the session is named by its shown ID: {said:?}"
         );
     };
-    let words = |actor: Actor, name: Option<&str>| {
+    let stored_words = |set_by: AutopilotSetBy, name: Option<&str>| {
         SetByWords::of(
-            Some(AutopilotSetBy {
-                actor,
-                surface: None,
-                since_ms: FRI_19Z * 1000,
-            }),
+            Some(set_by),
             true,
             |_| None,
             |head| {
@@ -697,6 +693,16 @@ fn a_fleet_setter_is_named_by_its_mac() {
         )
         .expect("a setter")
         .by
+    };
+    let words = |actor: Actor, name: Option<&str>| {
+        stored_words(
+            AutopilotSetBy {
+                actor,
+                surface: None,
+                since_ms: FRI_19Z * 1000,
+            },
+            name,
+        )
     };
     session(
         &words(Actor::fleet_drive(node, Some(sid)), Some("m9")),
@@ -711,17 +717,38 @@ fn a_fleet_setter_is_named_by_its_mac() {
         &words(Actor::fleet_drive(node, Some(sid)), None),
         "over the fleet from node 87be5228",
     );
+    let legacy = "s-0123456789abcdef0123";
     assert_eq!(
-        words(
-            Actor::fleet_drive(node, Some("s-0123456789abcdef0123")),
-            Some("m9")
-        ),
-        "over the fleet from m9 (session s-0123)",
-        "a drive from a tab opened before the t form names it as its requester line does"
+        aterm_types::control_verbs::Requester::of(Some(legacy), None, None, None).sid(),
+        None,
+        "a live requester omits a historical local session ID"
+    );
+    let live_legacy = Actor::fleet_drive(node, Some(legacy));
+    assert_eq!(live_legacy.word(), "fleet:87be5228:-");
+    assert_eq!(
+        words(live_legacy, Some("m9")),
+        "over the fleet from m9",
+        "a live fleet setter names only the node when its requester is omitted"
     );
     assert_eq!(
         words(Actor::fleet_drive(node, Some("s-7725")), Some("m9")),
         "over the fleet from m9",
         "CONTROL: a loose s- word names no session"
+    );
+    let stored = format!("fleet:87be5228:{legacy} {}", FRI_19Z * 1000);
+    let carried = AutopilotSetBy::parse_carried(&stored).expect("an earlier build's stored setter");
+    assert_eq!(
+        carried.carried(),
+        stored,
+        "the stored identity and time survive"
+    );
+    assert_eq!(
+        carried.actor.word(),
+        "fleet:87be5228:s-0123456789abcdef0123"
+    );
+    assert_eq!(
+        stored_words(carried, Some("m9")),
+        "over the fleet from m9 (session s-0123)",
+        "historical attribution keeps the local session an earlier build recorded"
     );
 }

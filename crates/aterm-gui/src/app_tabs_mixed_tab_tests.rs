@@ -1926,8 +1926,13 @@ fn canonical_mixed_switch_cycle_close_and_status_ignore_terminal_projection_indi
     assert_eq!(app.windows_displaying(0).count(), 1);
 
     app.cycle_tab(true);
-    assert_eq!(app.windows[&wid].tab_set.active_index(), Some(1));
-    assert!(app.active_handle.lock().unwrap().is_none());
+    assert_eq!(
+        app.windows[&wid].tab_set.active_index(),
+        Some(0),
+        "the sole session remains selected when cycling the strip"
+    );
+    assert!(app.active_handle.lock().unwrap().is_some());
+    assert_eq!(app.apply_tab_cmd(TabAction::Select(1)), Ok((1, 2)));
     app.cycle_tab(false);
     assert_eq!(app.windows[&wid].tab_set.active_index(), Some(0));
 

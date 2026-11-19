@@ -588,10 +588,17 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
         )
     );
     assert!(target.join(".ubd/build.noindex").is_dir());
-    assert_eq!(
-        run("1.97.1", &["build"], &[("CARGO_BUILD_BUILD_DIR", "/b")]),
-        "build\n"
-    );
+    let explicit = root.join("stock-intermediates.noindex");
+    let refused = command(
+        "1.97.1",
+        &["build"],
+        &[("CARGO_BUILD_BUILD_DIR", explicit.to_str().unwrap())],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+    assert!(refused.stdout.is_empty());
+    assert!(!explicit.exists());
     assert_eq!(run("1.85.0", &["build"], &[]), "build\n");
     assert_eq!(
         run("trust", &["check"], &[]),
@@ -1214,8 +1221,10 @@ fn actual_cargo_reroutes_prepare_only_the_generated_placement_they_execute() {
                 "--target-dir".into(),
                 target.display().to_string(),
             ]);
+            let explicit = source.join("caller-layout.noindex");
+            let explicit_config = format!("--config=build.build-dir='{}'", explicit.display());
             if shape == "override" {
-                args.push("--config=build.build-dir='caller-layout'".into());
+                args.push(explicit_config.clone());
             }
             let pid_to = root.join("compiler-pid");
             let mut command = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"));
@@ -1237,7 +1246,9 @@ fn actual_cargo_reroutes_prepare_only_the_generated_placement_they_execute() {
             let child = command.spawn().unwrap();
             let pid = child.id();
             let output = child.wait_with_output().unwrap();
-            let admitted = !matches!(shape, "parent-link" | "parent-writable");
+            let upstream_override = !branded && shape == "override";
+            let admitted =
+                !matches!(shape, "parent-link" | "parent-writable") && !upstream_override;
             assert_eq!(
                 output.status.success(),
                 admitted,
@@ -1250,9 +1261,23 @@ fn actual_cargo_reroutes_prepare_only_the_generated_placement_they_execute() {
                 );
             } else {
                 assert_eq!(output.status.code(), Some(75));
+                assert!(output.stdout.is_empty());
                 assert!(
                     !pid_to.exists(),
-                    "unsafe automatic placement reached the tool"
+                    "refused build-folder preparation reached the tool"
+                );
+            }
+            let explicit_prepared = branded && shape == "override";
+            assert_eq!(explicit.is_dir(), explicit_prepared, "{branded} {shape}");
+            if explicit_prepared {
+                assert!(
+                    aterm_uds::backup::Backups::SYSTEM
+                        .excluded(&std::fs::File::open(&explicit).unwrap())
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line == explicit_config.as_str())
                 );
             }
             assert!(!root.join("memory-ledger").exists());

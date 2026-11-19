@@ -10,10 +10,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aterm_agent::RelayClient;
-use aterm_types::macos_setup::{COMMAND_LINE_TOOLS_ARGS, MAC_SETUP_PASSWORD_PROMPT};
+use aterm_types::macos_setup::COMMAND_LINE_TOOLS_ARGS;
 use aterm_uds::process::{Identity, read_identity, read_process_path};
 
 use super::{Credentials, Out, app_pids};
+
+#[path = "mac_setup_prompt.rs"]
+mod mac_setup_prompt;
 
 // clt_install::receipt's whole v3 record or the live v2 custody it still adopts.
 const RECEIPT_BYTES: usize = 256;
@@ -90,7 +93,7 @@ impl Binding {
         let mut lines = value.split('\n');
         let version = lines.next()?;
         let sid = lines.next()?;
-        if !aterm_types::control_verbs::is_minted_sid(sid) {
+        if aterm_types::control_request::Sid::parse(sid).is_none() {
             return None;
         }
         let pid: i32 = lines.next()?.parse().ok()?;
@@ -234,23 +237,9 @@ fn answer<S: Read + Write>(
         return Ok(None);
     };
     let (header, text) = client.request_counted(&format!("@{} text", target.sid))?;
-    // Only the stable beginning is compared: the real saved frame soft-wraps the word
-    // "Mac" inside the introduction. The dedicated child/receipt remains the authority.
-    let warning = text
-        .lines()
-        .find(|line| !line.is_empty())
-        .is_some_and(|line| {
-            line.starts_with("aterm is installing Apple's Command Line Tools")
-                || line.starts_with("aterm is finishing the part of this Mac's setup")
-        });
     if !header.starts_with("OK ")
         || header.split_whitespace().any(|word| word == "frame=open")
-        || !warning
-        || !text
-            .lines()
-            .rev()
-            .find(|line| !line.is_empty())
-            .is_some_and(|line| line == MAC_SETUP_PASSWORD_PROMPT.trim_end())
+        || !mac_setup_prompt::shown(&text)
     {
         return Ok(None);
     }

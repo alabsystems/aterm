@@ -472,6 +472,7 @@ fn asked_at(
         left: None,
         default_home: true,
         route: aterm_agent::harness::accounts::AuthRoute::Stored,
+        model: aterm_agent::harness::accounts::ModelWeek::Unread,
     };
     asker(&w.roster, real, &w.enrolled, &me, &point, mode, now)
 }
@@ -1344,6 +1345,7 @@ fn the_owners_clearing(
         left: None,
         default_home: true,
         route: aterm_agent::harness::accounts::AuthRoute::Stored,
+        model: aterm_agent::harness::accounts::ModelWeek::Unread,
     };
     let asked_at = |written: Option<i64>| {
         let point = Point::Wall {

@@ -33,15 +33,12 @@ fn entry(seq: u64) -> InFlight {
         body: b"v=1 t=5 text=hello".to_vec(),
         log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
         at: Some(Head::From(50 + seq)),
+        own_log: None,
     }
 }
 
 fn journal(frames: &[Frame]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for (step, frame) in frames.iter().enumerate() {
-        bytes.extend(encode(step as u64, frame).expect("frames"));
-    }
-    bytes
+    encode_frames(0, frames).expect("frames").0
 }
 
 fn every_kind() -> Vec<Frame> {
@@ -324,6 +321,320 @@ fn a_keyed_own_head_reads_back_as_own() {
         super::number("own90"),
         None,
         "a number of digits, the only head a build before `any` reads"
+    );
+}
+
+/// The tail grammar of every build of the heads before ATERM-KI-1114-1414's step S6, copied from
+/// main at 928adfca967 (its `Frame::with_tail`): `at` and `pin-at`, each once, each a head
+/// `Head::of_word` reads (`any`, `own<n>`, digits: unchanged since), and any other pair names no
+/// head at all.
+fn with_main_tail(mut frame: Frame, tail: &[u8]) -> Frame {
+    let mut at = None;
+    let mut pin_at = None;
+    let words: Option<Vec<&str>> = std::str::from_utf8(tail)
+        .ok()
+        .map(|text| text.split_ascii_whitespace().collect());
+    for pair in words.as_deref().unwrap_or_default().chunks(2) {
+        let (slot, value) = match pair {
+            ["at", n] if at.is_none() => (&mut at, n),
+            ["pin-at", n] if pin_at.is_none() => (&mut pin_at, n),
+            _ => return frame,
+        };
+        let Some(value) = Head::of_word(value) else {
+            return frame;
+        };
+        *slot = Some(value);
+    }
+    match &mut frame {
+        Frame::Reserve { pin, .. } if pin_at.is_none() => pin.at = at,
+        Frame::InFlight(entry) => {
+            entry.at = at;
+            entry.pin.at = pin_at;
+        }
+        _ => {}
+    }
+    frame
+}
+
+/// A record as main at 928adfca967 reads it: its body by the strict parse (`Frame::parse`, which
+/// main shares but for this build's refusal of a reservation under [`OWN_LOG`]), its tail by
+/// [`with_main_tail`].
+#[derive(Debug, PartialEq)]
+struct MainRecord(Frame);
+
+impl Record for MainRecord {
+    const JOURNAL: &'static str = "post journal";
+
+    fn body(&self) -> String {
+        self.0.body()
+    }
+
+    fn tail(&self) -> String {
+        self.0.tail()
+    }
+
+    fn of_record(body: &[u8], tail: &[u8]) -> Option<Self> {
+        Some(Self(with_main_tail(Frame::parse(body)?, tail)))
+    }
+}
+
+/// What main at 928adfca967 reads a post journal as: its records ([`MainRecord`]) applied in
+/// order by its index, this build's but for the own log's record, which no frame main parses is,
+/// and with no fact begun across two records (`Replay::begun`, which main's read lacks).
+#[derive(Debug, Default)]
+struct MainIndex(Index);
+
+impl Replay for MainIndex {
+    type Record = MainRecord;
+
+    fn apply(&mut self, record: MainRecord) {
+        self.0.apply(record.0);
+    }
+}
+
+/// A keyed re-post's entry moved off its own log `77…77.2`, at its heads there.
+fn moved(seq: u64) -> (InFlight, OwnLog) {
+    let log = astream_broker::LogIdentity::parse(&format!("{}.2", "77".repeat(16))).expect("a log");
+    let own = OwnLog {
+        log,
+        at: Head::OwnFrom(60),
+        pin_at: Some(Head::OwnFrom(61)),
+    };
+    let entry = InFlight {
+        own_log: Some(own),
+        ..entry(seq)
+    };
+    (entry, own)
+}
+
+/// **AN ENTRY'S OWN LOG IS A RECORD OF ITS OWN, WHICH MAIN READS BESIDE EVERY HEAD OF THE ENTRY**
+/// (ATERM-KI-1114-1414's step S6, `InFlight::own_log`, `Frame::OwnLog`; the step's third review,
+/// confirmed): an entry that keeps an own log is written as `retire own-log <seq>`, its tail
+/// `log <id> at <n>` and `pin-at <n>` where its pin had a head there, and then the entry's own
+/// record with its heads alone. This build reads both back as the entry with its own log, and so
+/// does a rewrite from its index. Main (928adfca967, steps S1 to S5), which reads a tail by its
+/// own grammar ([`with_main_tail`], copied), reads the first as a retirement of no post, which
+/// changes nothing, and the entry with every head it reads today; a rewrite from main's index
+/// drops the own log, never a head, and this build then reads the entry where main left it. A
+/// build before the heads (B19) reads it record for record without heads, as every record.
+/// CONTROL: the third build of the step wrote the own log in the entry's own tail, which main's
+/// grammar reads as no head at all.
+#[test]
+fn an_entrys_own_log_is_a_record_main_reads_beside_every_head_of_the_entry() {
+    let (moved, own) = moved(7);
+    let id = own.log.to_string();
+    let heads = InFlight {
+        own_log: None,
+        ..moved.clone()
+    };
+    let reserve = Frame::Reserve {
+        sid: "s-a".to_string(),
+        id: 2,
+        pin: pin(7),
+    };
+    let frames = vec![
+        Frame::Attached(3),
+        reserve.clone(),
+        Frame::InFlight(moved.clone()),
+    ];
+    let (bytes, steps) = encode_frames(0, &frames).expect("frames");
+    let mut on_main = Index::default();
+    for frame in [Frame::Attached(3), reserve, Frame::InFlight(heads.clone())] {
+        on_main.apply(frame);
+    }
+    let main = read_as::<MainIndex>(&bytes);
+    assert_eq!(main.end, End::Clean);
+    assert_eq!(
+        main.index.0, on_main,
+        "main reads the reservation's head and the entry's heads, and the own log changes nothing"
+    );
+    let mut index = Index::default();
+    for frame in &frames {
+        index.apply(frame.clone());
+    }
+    let read = read(&bytes);
+    assert_eq!(
+        (read.end.clone(), read.valid_len, read.next_step),
+        (End::Clean, bytes.len() as u64, steps)
+    );
+    assert_eq!(read.index, index, "this build reads the own log back");
+    assert_eq!(read.index.in_flight.get(&7), Some(&moved));
+    let (rewritten, _) = read.index.encode().expect("rewrite");
+    assert_eq!(super::read(&rewritten).index, index, "this build's rewrite");
+    assert_eq!(read_as::<MainIndex>(&rewritten).index.0, on_main);
+    let (mains, _) = main.index.0.encode().expect("main's rewrite");
+    assert_eq!(
+        super::read(&mains).index,
+        on_main,
+        "main's rewrite drops the own log, never a head"
+    );
+    let mut headless = Index::default();
+    for frame in &frames {
+        headless.apply(match frame {
+            Frame::InFlight(entry) => Frame::InFlight(entry.without_head()),
+            Frame::Reserve { sid, id, pin } => Frame::Reserve {
+                sid: sid.clone(),
+                id: *id,
+                pin: pin.without_head(),
+            },
+            other => other.clone(),
+        });
+    }
+    assert_eq!(
+        read_as_before_the_heads(&bytes),
+        Some(headless),
+        "a build before the heads reads it record for record"
+    );
+    let records = Frame::InFlight(moved.clone()).records();
+    assert_eq!(
+        records,
+        vec![
+            Frame::OwnLog { seq: 7, own },
+            Frame::InFlight(heads.clone())
+        ],
+        "the own log's record, then the entry's"
+    );
+    assert_eq!(
+        steps, 4,
+        "the attach, the reservation, the own log, the entry"
+    );
+    assert_eq!(records[0].body(), "retire own-log 7");
+    assert_eq!(records[0].tail(), format!("log {id} at own60 pin-at own61"));
+    assert_eq!(
+        records[1].tail(),
+        "at 57 pin-at 47",
+        "the entry's heads alone"
+    );
+    let bare = Frame::OwnLog {
+        seq: 7,
+        own: OwnLog {
+            at: Head::From(9),
+            pin_at: None,
+            ..own
+        },
+    };
+    assert_eq!(bare.tail(), format!("log {id} at 9"));
+    for record in records.iter().chain([&bare]) {
+        assert_eq!(
+            Frame::of_record(record.body().as_bytes(), record.tail().as_bytes()).as_ref(),
+            Some(record),
+            "{record:?}"
+        );
+        encode(0, record).expect("the journal encodes it");
+    }
+    assert_eq!(
+        encode(0, &Frame::InFlight(moved.clone()))
+            .expect_err("an own log in the entry's record")
+            .kind(),
+        io::ErrorKind::InvalidInput,
+        "an entry's record never carries its own log"
+    );
+    let third = format!("at 57 pin-at 47 own-log {id} own-at own60 own-pin-at own61");
+    let body = records[1].body();
+    assert_eq!(
+        MainRecord::of_record(body.as_bytes(), third.as_bytes()).map(|record| record.0),
+        Some(Frame::InFlight(heads.without_head())),
+        "CONTROL: the third build's own log in the entry's tail, which main reads with no head"
+    );
+}
+
+/// **AN OWN LOG'S RECORD NAMES THE OWN LOG OF THE ENTRY RIGHT AFTER IT, OR NONE**
+/// (`Frame::OwnLog`, `Index::apply`, `read_as`): written in one append with its entry's record
+/// after it, a journal that ends at it ends in that append cut short (`End::Cut`, the run ending
+/// where it starts, so the next write rewrites the journal without it), and so does one cut inside
+/// the entry's record; one followed by another record (main appending after an append cut short
+/// there), or by the entry on the own log itself, names none. A retirement of `own-log` whose tail
+/// names no own log is that retirement, of no post; a reservation under `own-log` is refused.
+/// CONTROL: the whole pair names the own log.
+#[test]
+fn an_own_logs_record_names_the_own_log_of_the_entry_right_after_it_or_none() {
+    let (moved, own) = moved(7);
+    let id = own.log.to_string();
+    let (before, at) = encode_frames(0, &[Frame::InFlight(entry(7))]).expect("an entry");
+    let (pair, _) = encode_frames(at, &[Frame::InFlight(moved.clone())]).expect("its move");
+    let own_record = encode(at, &Frame::OwnLog { seq: 7, own })
+        .expect("the own log's record")
+        .len();
+    let mut standing = Index::default();
+    standing.apply(Frame::InFlight(entry(7)));
+    for (cut, what) in [
+        (own_record, "at the own log's record's end"),
+        (pair.len() - 1, "inside the entry's record"),
+    ] {
+        let mut bytes = before.clone();
+        bytes.extend_from_slice(&pair[..cut]);
+        let read = read(&bytes);
+        assert_eq!(
+            (read.end, read.valid_len, read.next_step),
+            (End::Cut, before.len() as u64, at),
+            "{what}: the append cut short"
+        );
+        assert_eq!(read.index, standing, "{what}: the entry as it stood");
+    }
+    let mut whole = before.clone();
+    whole.extend_from_slice(&pair);
+    assert_eq!(
+        read(&whole).index.in_flight.get(&7),
+        Some(&moved),
+        "CONTROL: the whole pair"
+    );
+    let on_its_own_log = InFlight {
+        log: Some(own.log),
+        own_log: None,
+        ..entry(7)
+    };
+    for (next, seq) in [
+        (Frame::InFlight(entry(8)), 8),
+        (Frame::Landed(9), 7),
+        (Frame::InFlight(on_its_own_log), 7),
+    ] {
+        let mut bytes = before.clone();
+        bytes.extend(encode(at, &Frame::OwnLog { seq: 7, own }).expect("the own log"));
+        bytes.extend(encode(at + 1, &next).expect("the record after it"));
+        let read = read(&bytes);
+        assert_eq!(read.end, End::Clean, "{next:?}");
+        assert!(
+            read.index.in_flight.values().all(|e| e.own_log.is_none()),
+            "{next:?}: no own log"
+        );
+        assert!(read.index.in_flight.contains_key(&seq), "{next:?}");
+    }
+    let retire = |tail: &str| Frame::of_record(b"retire own-log 7", tail.as_bytes());
+    for tail in [
+        String::new(),
+        format!("log {id}"),
+        "at own60".to_string(),
+        format!("log {id} at own60 at 9"),
+        format!("log {id} log {id} at own60"),
+        format!("log {id} at met60"),
+        "log x at own60".to_string(),
+        format!("log {id} at own60 later 4"),
+    ] {
+        assert_eq!(
+            retire(&tail),
+            Some(Frame::Retire {
+                sid: OWN_LOG.to_string(),
+                id: 7
+            }),
+            "{tail:?}"
+        );
+    }
+    assert_eq!(
+        retire(&format!("log {id} at own60 pin-at own61")),
+        Some(Frame::OwnLog { seq: 7, own }),
+        "CONTROL"
+    );
+    assert!(
+        encode(
+            0,
+            &Frame::Reserve {
+                sid: OWN_LOG.to_string(),
+                id: 1,
+                pin: pin(7),
+            }
+        )
+        .is_err(),
+        "no post is reserved under own-log"
     );
 }
 

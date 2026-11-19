@@ -34,6 +34,7 @@ aterm-core.workspace = true
 aterm-db.workspace = true
 aterm-db-core.workspace = true
 aterm-effects.workspace = true
+aterm-evidence.workspace = true
 aterm-gpu.workspace = true
 aterm-grid.workspace = true
 aterm-gui = { path = "../aterm-gui" }

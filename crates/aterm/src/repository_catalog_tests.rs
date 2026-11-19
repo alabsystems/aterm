@@ -218,7 +218,7 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
     let (counted, answer) = (Arc::clone(&fetches), Arc::clone(&answered));
     // This upkeep's provider lists the first saved repository whole, as GitHub does, beside
     // one new repository, and never the second saved one. The first one's size moves at each
-    // look (2, 102, 202, ... KiB) and is always inside the 1 MiB band of the saved one.
+    // look (2, 102, 202, ... KiB) and is always in the class of the saved one, at most 1 MiB.
     upkeep.fetch = Arc::new(move |input, stopped| {
         let look = counted.fetch_add(1, Ordering::SeqCst) as u64;
         assert!(!stopped.load(Ordering::Acquire));
@@ -308,7 +308,11 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
         retained["owner"].get("avatar_url").is_none(),
         "the published owner still holds GitHub's avatar_url"
     );
-    assert_eq!(retained["size"].as_u64(), Some(2));
+    assert_eq!(
+        retained["size"].as_u64(),
+        Some(1),
+        "the saved size, in the class of GitHub's, stands"
+    );
     assert!(
         catalog.value.as_slice().len() < initial.len(),
         "two lean repositories beside the unlisted one ({} bytes) are no smaller than one saved \
@@ -319,7 +323,7 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
     assert_eq!(
         refreshed_line(answered.lock().unwrap().as_ref().unwrap()),
         "private repository catalog refreshed: mode=TokenVisible, observed_owned=2, \
-         other_fields=0, size_only=0, added=1, removed=0, pruned=1, \
+         other_fields=0, size_class=0, added=1, removed=0, pruned=1, \
          account=false, order=false"
     );
     assert!(rows.iter().any(|row| row["id"].as_u64() == Some(2)));
@@ -413,7 +417,7 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
         );
     }
     assert_eq!(fetches.load(Ordering::SeqCst), 2);
-    // One look, as in the size-band law: the wait for it is spent, so the next step reads the
+    // One look, as in the size-class law: the wait for it is spent, so the next step reads the
     // provider once, and a second step drains that read into `publish`.
     let mut look = || -> usize {
         spend_the_wait(&mut upkeep);
@@ -423,17 +427,18 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
         wait_for_result(&upkeep.mailbox);
         upkeep.step(&paths, &admin, far).unwrap()
     };
-    // Three more looks over the lean catalog, GitHub's row whole and its size moved inside
-    // the band each time.
+    // Three more looks over the lean catalog, GitHub's row whole and its size moved inside its
+    // class each time.
     let signed = look() + look() + look();
     assert_eq!(
         signed, 0,
         "{signed} of 3 further looks at a lean catalog published it again"
     );
     assert_eq!(fetches.load(Ordering::SeqCst), 5);
-    // A person saves the whole rows again. The next look finds the same two repositories and
-    // a size inside the band, so the dropped keys are all there is to publish: it publishes
-    // once, and the look after it nothing.
+    // A person saves the whole rows again. The looks after it find the same two repositories
+    // and a size inside its class: the keys of GitHub's row the saved one holds are no part of
+    // the catalog's meaning, so they publish nothing, and the person's save stands until a
+    // change of meaning publishes it lean.
     let resaved = aterm_json::to_vec(&json!({"schema": 2, "account": "fixture-user",
         "repositories": [kept.clone(), repository(2, "new-code"), unlisted.clone()]}))
     .unwrap();
@@ -448,41 +453,21 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
         Author::Person,
     )
     .unwrap();
+    let signed = look() + look();
     assert_eq!(
-        look(),
-        1,
-        "a look whose only finding is a repository saved whole publishes the lean catalog"
-    );
-    assert_eq!(
-        refreshed_line(answered.lock().unwrap().as_ref().unwrap()),
-        "private repository catalog refreshed: mode=TokenVisible, observed_owned=2, \
-         other_fields=0, size_only=0, added=0, removed=0, pruned=1, \
-         account=false, order=false"
-    );
-    let published = client::admin_open(&paths).unwrap();
-    let catalog = published
-        .published_entry(&Audience::Everyone, NAME)
-        .unwrap();
-    let value: Value = aterm_json::from_slice(catalog.value.as_slice()).unwrap();
-    let retained = &value["repositories"][0];
-    assert!(
-        PROVIDER_SHAPED
-            .iter()
-            .all(|key| retained.get(key).is_none())
-            && retained["owner"].get("avatar_url").is_none(),
-        "the catalog published over a second whole save holds GitHub's keys: {retained:?}"
+        signed, 0,
+        "{signed} of 2 looks whose only finding is a repository saved whole published it"
     );
     assert_eq!(
-        retained["required_submodules"][0].as_str(),
-        Some("vendor/required")
+        client::admin_open(&paths)
+            .unwrap()
+            .published_entry(&Audience::Everyone, NAME)
+            .unwrap()
+            .value
+            .as_slice(),
+        resaved.as_slice(),
+        "the person's whole save stands"
     );
-    assert_eq!(retained["size"].as_u64(), Some(502));
-    assert_eq!(
-        value["repositories"][2], unlisted,
-        "a saved repository GitHub did not list is not published as it was saved again"
-    );
-    assert!(catalog.value.as_slice().len() < resaved.len());
-    assert_eq!(look(), 0, "a lean catalog was published a second time");
     assert_eq!(fetches.load(Ordering::SeqCst), 7);
     drop(upkeep); // The actual owned idle worker is joined here.
 
@@ -706,12 +691,15 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
 }
 
 /// Called by the same automatic-upkeep owner as [`exercise_owned_upkeep`]. Looks that find
-/// GitHub's sizes moved inside the band sign nothing and log nothing; a size outside it, and
-/// another field, each sign the entry once, with GitHub's size for every repository observed,
-/// and log one line that says which. Each look is the production read ([`observe`]) of a
-/// scripted provider, and each line is what [`publish`] wrote to the log.
-pub(in crate::shared_login) fn exercise_size_band() {
+/// GitHub's sizes moved inside their size classes sign nothing and log nothing; a size
+/// past its class, and another field, each sign the entry once, with GitHub's class for a size
+/// that left its class and the saved size of each that stayed in its own, and log one line that
+/// says which. Each look is the production read ([`observe`]) of a scripted provider, and each
+/// line is what [`publish`] wrote to the log.
+pub(in crate::shared_login) fn exercise_size_class() {
+    /// In the class 1,572,865 to 1,835,008 KiB.
     const LARGE: u64 = 1_600_000;
+    /// In the class 1,793 to 2,048 KiB.
     const SMALL: u64 = 2_000;
     let scratch = aterm_tempfile::tempdir().unwrap();
     let source = scratch.path().join("private.vault");
@@ -777,20 +765,20 @@ pub(in crate::shared_login) fn exercise_size_band() {
         [rows[0]["size"].as_u64(), rows[1]["size"].as_u64()]
     };
 
-    // Eight looks, each with both sizes moved from the look before and inside the band of the
-    // published ones (a sixteenth of 1,600,000 KiB; 1 MiB for 2,000 KiB), edges included.
+    // Eight looks, each with both sizes moved from the look before and inside the classes of
+    // the published ones, edges included.
     let before = std::fs::read(&source).unwrap();
-    let near: [(u64, u64); 8] = [
-        (LARGE + 100_000, SMALL + 1024),
-        (LARGE - 100_000, SMALL - 1024),
+    let inside: [(u64, u64); 8] = [
+        (1_572_865, 1_793),
+        (1_835_008, 2_048),
         (LARGE + 1, SMALL + 1),
-        (LARGE - 50_000, SMALL + 500),
-        (LARGE + 99_999, SMALL - 1),
-        (LARGE + 1025, SMALL + 1000),
-        (LARGE - 1, SMALL - 1000),
+        (1_700_000, 1_900),
+        (1_800_000, 2_047),
+        (LARGE - 27_000, 1_800),
+        (LARGE + 200_000, 1_850),
         (LARGE + 7, SMALL + 7),
     ];
-    let looks: Vec<_> = near
+    let looks: Vec<_> = inside
         .iter()
         .map(|(large, small)| look(*large, *small, "main"))
         .collect();
@@ -798,8 +786,8 @@ pub(in crate::shared_login) fn exercise_size_band() {
     assert_eq!(
         signed,
         0,
-        "{signed} of {} looks that found only sizes inside the band published the catalog",
-        near.len()
+        "{signed} of {} looks that found only sizes inside their classes published the catalog",
+        inside.len()
     );
     assert!(
         looks.iter().all(|(_, lines)| lines.is_empty()),
@@ -815,42 +803,42 @@ pub(in crate::shared_login) fn exercise_size_band() {
         aterm_json::from_slice::<Value>(&initial).unwrap()
     );
 
-    // One KiB past the small repository's band: one publication, which holds GitHub's size
-    // for it and for the large one, whose own move alone published nothing.
+    // One KiB past the small repository's class: one publication, which holds its new class
+    // (2,048, 2,560] KiB as 2,560 KiB, and the saved size of the large one, whose move stayed in
+    // its class.
     assert_eq!(
-        look(LARGE + 9, SMALL + 1025, "main"),
+        look(LARGE + 9, 2_049, "main"),
         (
             1,
             vec![
                 "INFO private repository catalog refreshed: mode=AccountComplete, \
-                 observed_owned=2, other_fields=0, size_only=1, added=0, removed=0, \
+                 observed_owned=2, other_fields=0, size_class=1, added=0, removed=0, \
                  pruned=0, account=false, order=false"
                     .to_owned()
             ]
         )
     );
     let catalog = published();
-    assert_eq!(sizes(&catalog), [Some(LARGE + 9), Some(SMALL + 1025)]);
+    assert_eq!(sizes(&catalog), [Some(LARGE), Some(2_560)]);
     assert_eq!(
         catalog["repositories"][0]["required_submodules"][0].as_str(),
         Some("vendor/required")
     );
-    // The band is now measured from the sizes that publication holds.
+    // The classes are now those of the sizes that publication holds.
     let before = std::fs::read(&source).unwrap();
-    assert_eq!(
-        look(LARGE + 9 + 100_000, SMALL + 1025 - 1024, "main"),
-        NOTHING
-    );
+    assert_eq!(look(LARGE + 200_000, 2_560, "main"), NOTHING);
+    assert_eq!(look(1_572_865, 2_049, "main"), NOTHING);
     assert_eq!(std::fs::read(&source).unwrap(), before);
 
-    // Another field, with both sizes inside the band: one publication, GitHub's sizes in it.
+    // Another field, with both sizes inside their classes: one publication, holding the saved
+    // sizes.
     assert_eq!(
-        look(LARGE + 100, SMALL + 1000, "trunk"),
+        look(LARGE + 100, 2_300, "trunk"),
         (
             1,
             vec![
                 "INFO private repository catalog refreshed: mode=AccountComplete, \
-                 observed_owned=2, other_fields=1, size_only=0, added=0, removed=0, \
+                 observed_owned=2, other_fields=1, size_class=0, added=0, removed=0, \
                  pruned=0, account=false, order=false"
                     .to_owned()
             ]
@@ -862,12 +850,12 @@ pub(in crate::shared_login) fn exercise_size_band() {
         catalog["repositories"][1]["default_branch"].as_str(),
         Some("trunk")
     );
-    assert_eq!(sizes(&catalog), [Some(LARGE + 100), Some(SMALL + 1000)]);
+    assert_eq!(sizes(&catalog), [Some(LARGE), Some(2_560)]);
     let before = std::fs::read(&source).unwrap();
-    assert_eq!(look(LARGE + 100, SMALL + 1000, "trunk"), NOTHING);
-    assert_eq!(look(LARGE + 1100, SMALL + 2, "trunk"), NOTHING);
+    assert_eq!(look(LARGE + 100, 2_300, "trunk"), NOTHING);
+    assert_eq!(look(LARGE + 1100, 2_100, "trunk"), NOTHING);
     assert_eq!(std::fs::read(&source).unwrap(), before);
-    assert_eq!(fetches.load(Ordering::SeqCst), 13);
+    assert_eq!(fetches.load(Ordering::SeqCst), 14);
 }
 
 /// Called by the same automatic-upkeep owner as [`exercise_owned_upkeep`]. A pause, the
@@ -1370,6 +1358,170 @@ fn vault_fill_upkeep_says_a_refusal_again_once_it_has_ended() {
     assert!(
         !said(look(&mut upkeep, paths)),
         "CONTROL: while it stands it is not said again"
+    );
+}
+
+/// The sizes (KiB) of the repositories, ids 1 to 6, that a person saved for a day of looks
+/// ([`a_day_of_looks_at_an_unchanged_account_publishes_nothing`]), each GitHub's own as an
+/// earlier build wrote it.
+const DAY_SAVED: [u64; 6] = [1_500, 3_000, 1_600_000, 300, 6_000_000, 40_000];
+
+/// The size class of each of [`DAY_SAVED`], from its least size to its greatest (the class
+/// itself), in KiB: the least number at or above a size with at most three significant bits, at
+/// least 1 MiB.
+const DAY_CLASSES: [(u64, u64); 6] = [
+    (1_281, 1_536),
+    (2_561, 3_072),
+    (1_572_865, 1_835_008),
+    (1, 1_024),
+    (5_242_881, 6_291_456),
+    (32_769, 40_960),
+];
+
+/// The size GitHub gives repository `index` of [`DAY_SAVED`] at look `look`: in the class of its
+/// saved size ([`DAY_CLASSES`]), the least of the class at every fourth look, the greatest at
+/// the look after and between them at the others, except that the last repository's is `0`
+/// (GitHub has not sized it again) at every third look.
+fn day_size(index: usize, look: u64) -> u64 {
+    if index == 5 && look % 3 == 2 {
+        return 0;
+    }
+    let (least, class) = DAY_CLASSES[index];
+    let width = class - least + 1;
+    match look % 4 {
+        0 => least,
+        1 => class,
+        _ => least + (look * 7_919 + index as u64 * 104_729) % width,
+    }
+}
+
+/// GitHub's rows for the account at look `look`, whole, with repository 2 renamed where
+/// `renamed`.
+fn day_rows(look: u64, renamed: bool) -> Vec<Value> {
+    (0..DAY_SAVED.len())
+        .map(|index| {
+            let id = index as u64 + 1;
+            let name = if renamed && id == 2 {
+                "renamed-code".to_owned()
+            } else {
+                format!("code-{id}")
+            };
+            whole(sized(id, &name, day_size(index, look)), "github")
+        })
+        .collect()
+}
+
+/// A day of looks, 96 of them 15 minutes apart, at an account GitHub lists unchanged but for
+/// each repository's size, which moves at every look and stays inside its size class,
+/// signs nothing: the vault's membership log holds the bytes it held, and the entry the bytes
+/// the person saved. The saved catalog is one a person saved by hand: its rows in another order
+/// than a refresh writes, one of them holding keys of GitHub's whole row, and each size GitHub's
+/// own, as an earlier build wrote sizes. Each look is the production read ([`observe`]) of a
+/// scripted provider that lists GitHub's whole rows.
+///
+/// CONTROL, in the test: the next look, at which GitHub lists one of them renamed, publishes
+/// once, and its line says the rename drove it and what was published beside it.
+#[test]
+fn a_day_of_looks_at_an_unchanged_account_publishes_nothing() {
+    const LOOKS: u64 = 96;
+    let lab = published_lab();
+    let paths = &lab.paths[0];
+    let mut rows: Vec<Value> = DAY_SAVED
+        .iter()
+        .zip(1..)
+        .map(|(size, id)| sized(id, &format!("code-{id}"), *size))
+        .collect();
+    rows[0] = whole(rows[0].clone(), "saved");
+    rows[0]
+        .as_object_mut()
+        .unwrap()
+        .insert("required_submodules".into(), json!(["vendor/required"]));
+    rows.reverse();
+    let saved = aterm_json::to_vec(&json!({"schema": 2, "account": "fixture-user",
+        "repositories": rows}))
+    .unwrap();
+    let admin = client::admin_open(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, NAME, &saved).unwrap();
+    client::admin_publish(paths, &admin, &doc).expect("a person's save");
+
+    let mut upkeep = Upkeep::default();
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let renamed = Arc::new(AtomicBool::new(false));
+    let (counted, rename) = (Arc::clone(&fetches), Arc::clone(&renamed));
+    upkeep.fetch = Arc::new(move |input, stopped| {
+        let look = counted.fetch_add(1, Ordering::SeqCst) as u64;
+        let rows = day_rows(look, rename.load(Ordering::SeqCst));
+        super::protocol_tests::provider(input.token, input.binding, &input.catalog, &rows, &stopped)
+    });
+    let entry = || {
+        client::admin_open(paths)
+            .unwrap()
+            .published_entry(&Audience::Everyone, NAME)
+            .unwrap()
+            .value
+            .as_slice()
+            .to_vec()
+    };
+    let (seq, bytes) = (client::admin_open(paths).unwrap().seq(), held(paths));
+    let looks: Vec<_> = (0..LOOKS).map(|_| look(&mut upkeep, paths)).collect();
+    let signed = looks.iter().filter(|look| **look != Ok(0)).count();
+    assert_eq!(
+        signed, 0,
+        "{signed} of {LOOKS} looks at an account whose sizes moved inside their classes signed \
+         or failed: {looks:?}"
+    );
+    assert_eq!(held(paths), bytes, "nothing is signed in a day");
+    assert_eq!(
+        client::admin_open(paths).unwrap().seq(),
+        seq,
+        "and no version published"
+    );
+    assert_eq!(entry(), saved, "the entry is the person's save");
+    assert_eq!(fetches.load(Ordering::SeqCst), LOOKS as usize);
+
+    // CONTROL: a rename publishes, once.
+    renamed.store(true, Ordering::SeqCst);
+    let (published, logged) = logged_on_this_thread(|| look(&mut upkeep, paths));
+    assert_eq!(
+        published,
+        Ok(1),
+        "CONTROL: a renamed repository is published"
+    );
+    let lines: Vec<_> = logged
+        .into_iter()
+        .filter(|line| line.starts_with("INFO private repository catalog"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "INFO private repository catalog refreshed: mode=TokenVisible, observed_owned=6, \
+          other_fields=1, size_class=0, added=0, removed=0, pruned=1, account=false, order=true"
+        ]
+    );
+    assert!(held(paths) > bytes, "CONTROL: it is signed");
+    let value: Value = aterm_json::from_slice(&entry()).unwrap();
+    let rows = value["repositories"].as_array().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row["id"].as_u64().unwrap(), row["size"].as_u64().unwrap()))
+            .collect::<Vec<_>>(),
+        DAY_SAVED
+            .iter()
+            .zip(1..)
+            .map(|(size, id)| (id, *size))
+            .collect::<Vec<_>>(),
+        "published by id, each saved size inside its class standing"
+    );
+    assert_eq!(rows[1]["name"].as_str(), Some("renamed-code"));
+    assert!(
+        PROVIDER_SHAPED.iter().all(|key| rows[0].get(key).is_none()),
+        "the row saved whole is published lean beside the rename: {:?}",
+        rows[0]
+    );
+    assert_eq!(
+        rows[0]["required_submodules"][0].as_str(),
+        Some("vendor/required")
     );
 }
 

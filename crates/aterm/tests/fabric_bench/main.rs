@@ -8,6 +8,8 @@
 
 #[path = "../fabric_world/harness.rs"]
 mod harness;
+#[path = "../support/patience.rs"]
+mod patience;
 
 mod census;
 mod census_tests;

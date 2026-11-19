@@ -635,10 +635,14 @@ pub fn auto_line(exe: &Path, flags: &[String]) -> Option<(PathBuf, Vec<String>)>
 }
 
 /// The build `program` is where it has a Claude Code build's shape in a store: its real path (an
-/// exec entry resolved) reads `…/store/claude/<build>/bin/claude` and is a file. The wrapper and
-/// the plan hand the token only to such a build in atpkg's own store ([`store_build_in`]).
+/// exec entry resolved) reads `…/store/claude/<build>/bin/<exe>` and is a file, `<exe>` the
+/// name atpkg gives the program's executable in a build (`atpkg::store::ToolName::exe_file`:
+/// `claude`, and `claude.exe` on Windows). The wrapper, the plan and the folder-trust settle
+/// hand a build a login or a headless start only where it is such a build in atpkg's own store
+/// ([`store_build_in`]).
 #[must_use]
 pub fn store_build(program: &Path) -> Option<PathBuf> {
+    let exe = atpkg::store::ToolName::new(PROGRAM)?.exe_file();
     let real = std::fs::canonicalize(program).ok()?;
     let names: Vec<&str> = real
         .components()
@@ -651,8 +655,9 @@ pub fn store_build(program: &Path) -> Option<PathBuf> {
         .collect();
     let shaped = matches!(
         names.as_slice(),
-        [PROGRAM, "bin", build, PROGRAM, "store"]
-            if !build.is_empty() && build.bytes().all(|b| b.is_ascii_digit())
+        [file, "bin", build, PROGRAM, "store"]
+            if *file == exe
+                && !build.is_empty() && build.bytes().all(|b| b.is_ascii_digit())
                 && !(build.len() > 1 && build.starts_with('0'))
     );
     (shaped && real.is_file()).then_some(real)
@@ -667,9 +672,9 @@ pub fn configured_builds() -> Option<PathBuf> {
 }
 
 /// The build `program` is ([`store_build`]) where it lies in `builds`, atpkg's own store of
-/// Claude Code builds (`<prefix>/store/claude`): its real path is `<builds>/<build>/bin/claude`,
-/// with `builds` resolved too. The wrapper execs this real path, never the spelling it was handed,
-/// so the file it judged is the file it runs. A same-user process can still change a build in a
+/// Claude Code builds (`<prefix>/store/claude`): its real path is `<builds>/<build>/bin/<exe>`
+/// ([`store_build`]), with `builds` resolved too. The wrapper execs this real path, never the
+/// spelling it was handed, so the file it judged is the file it runs. A same-user process can still change a build in a
 /// store it owns: this is a gate against a program of another's choosing, not a boundary between
 /// processes of one user (§5.3).
 #[must_use]

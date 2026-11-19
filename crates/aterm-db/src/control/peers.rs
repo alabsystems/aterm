@@ -33,14 +33,18 @@ struct Pool {
 pub(super) struct Cache(Mutex<Pool>, Condvar);
 
 impl Cache {
+    /// The lease on a channel this endpoint serves (an enrollment it answers), with no
+    /// preference ([`Self::acquire_on`]).
     pub(super) fn acquire<'a>(&'a self, actor: Actor, repair: &'a mut Repair) -> Result<Lease<'a>> {
-        self.acquire_on(actor, repair, false, Instant::now())
+        self.acquire_on(actor, repair, false, false, Instant::now())
     }
 
     /// Only competing authenticated channels use the preference. A lone
     /// channel in either direction always proceeds. Both endpoints derive the
     /// same preferred physical channel from their authenticated actor ordering.
     /// Waiting releases the cache mutex and holds no journal or network guard.
+    /// A round refused because one with `actor` is already active here is counted against its
+    /// seat, by whether this side `dialled` it (`crate::runtime::census::seat_busy`).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -69,10 +73,11 @@ impl Cache {
         &'a self,
         actor: Actor,
         repair: &'a mut Repair,
+        dialled: bool,
         preferred: bool,
         deadline: Instant,
     ) -> Result<Lease<'a>> {
-        self.acquire_on_with(actor, repair, preferred, deadline, || {
+        self.acquire_on_with(actor, repair, dialled, preferred, deadline, || {
             #[cfg(test)]
             super::tests::peer_cache_stage(super::tests::PeerCacheStage::Waiting);
         })
@@ -82,6 +87,7 @@ impl Cache {
         &'a self,
         actor: Actor,
         repair: &'a mut Repair,
+        dialled: bool,
         preferred: bool,
         deadline: Instant,
         mut waiting: impl FnMut(),
@@ -89,6 +95,8 @@ impl Cache {
         let mut pool = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         while let Some(active_preferred) = pool.active.get(&actor) {
             if !preferred || *active_preferred {
+                drop(pool);
+                crate::runtime::census::seat_busy(actor, dialled);
                 return Err(Error::new(
                     "Commons peer already has an active repair round",
                 ));

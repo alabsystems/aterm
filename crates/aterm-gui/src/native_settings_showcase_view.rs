@@ -2515,9 +2515,7 @@ const NAME_LINES_MOST: usize = 3;
 /// words, inside one only where that word alone is wider than `width`.
 fn strip_name_lines(name: &str, width: f32) -> Vec<String> {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Plain);
-    wrap_to_box(name, width, &|line| {
-        crate::tray_raster::ui_text_width_for(face, line, px)
-    })
+    ui_set_lines(name, (face, px), width)
 }
 
 /// The most lines the strip's names take beside its buttons, and whether a word outgrows its room.

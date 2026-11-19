@@ -517,7 +517,7 @@ fn historical_native_receipts_survive_their_custodian_and_missing_time_does_not_
         host_pid: 100,
         host_start: 1,
         seq: 1,
-        session: "t00acde1122".into(),
+        session: "s-000000000000acde1122".into(),
         pid: 200,
         start: 2,
         uid: Some(0),
@@ -1533,6 +1533,15 @@ fn handoff_keeps_live_detached_members_and_refuses_other_boots_and_reused_pids()
 #[test]
 fn handoff_bounds_and_invalid_sessions_never_create_job_ownership() {
     let root = ProcessKey { pid: 20, start: 2 };
+    let mut baseline = Ledger::default();
+    restore_into(&mut baseline, carried(root, root), Some([7; 16]), &|_| {
+        Some(root)
+    });
+    assert_eq!(
+        baseline.jobs().len(),
+        1,
+        "the unmodified carry establishes ownership"
+    );
     let mut ledger = Ledger::default();
     // No loose `s-` form names a tab: only the `t` form and a legacy tab's exact ID do.
     for refused in [

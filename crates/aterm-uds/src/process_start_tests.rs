@@ -307,8 +307,8 @@ fn a_linux_exec_since_the_fork_is_read_off_the_stat_flags() {
 }
 
 /// The kernel's own record: a forked child parked before any exec reads `Some(false)`, and a
-/// spawned child (an exec) and this test process read `Some(true)`, on macOS (the BSD info's
-/// `PROC_FLAG_EXEC`) and Linux (`/proc/<pid>/stat`). NEGATIVE CONTROL (scratch): a reader
+/// spawned child that has echoed a line and this test process read `Some(true)`, on macOS (the
+/// BSD info's `PROC_FLAG_EXEC`) and Linux (`/proc/<pid>/stat`). NEGATIVE CONTROL (scratch): a reader
 /// that answers `Some(true)` for every live process fails "a fork that has not exec'd".
 #[cfg(unix)]
 #[test]
@@ -321,14 +321,19 @@ fn a_forked_child_reads_as_not_execd_until_it_execs() {
         return;
     }
     assert_eq!(super::read_process_execd(own), Some(true), "this process");
-    let mut spawned = crate::spawnfd::command("/bin/sleep")
-        .arg("30")
+    let cat = crate::deadline::stand_in(std::path::Path::new("/bin/cat"));
+    let mut spawned = crate::spawnfd::command(cat)
+        .stdin(crate::spawnfd::Stdio::piped())
+        .stdout(crate::spawnfd::Stdio::piped())
         .spawn()
-        .expect("spawn /bin/sleep");
+        .expect("spawn cat");
+    // On Linux the spawn can return when the child releases the shared address space,
+    // before the kernel clears PF_FORKNOEXEC. The echo proves the target ran.
+    let input = crate::deadline::cat_echoes(&mut spawned);
     let spawned_pid = i32::try_from(spawned.id()).unwrap();
     let spawned_execd = super::read_process_execd(spawned_pid);
-    let _ = spawned.kill();
-    let _ = spawned.wait();
+    crate::deadline::kill_within(&mut spawned, std::time::Duration::from_secs(60));
+    drop(input);
     assert_eq!(spawned_execd, Some(true), "a spawned child");
     let (go_r, go_w) = crate::pipe().expect("pipe");
     let (go_fd, go_w_fd) = (go_r.as_raw_fd(), go_w.as_raw_fd());

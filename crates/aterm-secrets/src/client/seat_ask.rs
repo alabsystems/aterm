@@ -381,7 +381,9 @@ fn seat_records(
         return Err(Error::new("the member's bundle allows another Mac"));
     }
     let mut store = load_records(paths)?;
-    store.ingest(records)?;
+    // Read as this Mac's store reads: at its mark's format, with the roots a rooted member
+    // hands after its records.
+    ingest_as_read(&mut store, records)?;
     let seated = store
         .log()
         .is_some_and(|log| judge(log, &identity.recipient()) == Seat::Seated);

@@ -578,8 +578,8 @@ fn sh(
     let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
-        "{shell:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "{shell:?} {tool:?} {args:?} in {}: {out:?}",
+        cwd.display()
     );
     assert!(
         out.stderr.is_empty(),
@@ -3120,11 +3120,7 @@ fn the_rendered_shim_hands_targo_the_config() {
             .current_dir(&ws)
             .output()
             .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "{out:?}");
         String::from_utf8(out.stdout).unwrap()
     };
     assert_eq!(
@@ -3138,6 +3134,36 @@ fn the_rendered_shim_hands_targo_the_config() {
             "--config build.build-dir='{}/t/.ubd/build.noindex' --unverified build --target-dir t\n",
             ws.display()
         )
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn retain_generated_shim_failure(f: &Fixture, error: &aterm_uds::deadline::ProgressError) {
+    use std::io::Write as _;
+    f._dir.retain_on_drop();
+    let evidence = (|| -> std::io::Result<()> {
+        let mut metadata =
+            format!("error={error}\ncapture_complete=false\nproducer_status=unproven\n");
+        if let aterm_uds::deadline::ProgressError::Stalled { partial, .. } = error {
+            for (name, stream) in [("stdout", partial.stdout()), ("stderr", partial.stderr())] {
+                std::fs::write(
+                    f.root.join(format!("failed-route.{name}.tail")),
+                    stream.as_bytes(),
+                )?;
+                metadata.push_str(&format!(
+                    "{name}_observed_bytes={}\n{name}_retained_tail_bytes={}\n{name}_truncated={}\n",
+                    stream.observed_bytes(), stream.as_bytes().len(), stream.is_truncated()
+                ));
+            }
+        } else {
+            metadata.push_str("partial_capture=unavailable\n");
+        }
+        std::fs::write(f.root.join("failed-route.metadata"), metadata)
+    })();
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "KEPT failed generated-shim fixture {} (partial evidence write: {evidence:?})",
+        f.root.display()
     );
 }
 
@@ -3196,6 +3222,7 @@ fn generated_placement_survives_external_dispatch_and_nested_shims() {
             &mut || std::time::Instant::now() >= guard,
         )
         .unwrap_or_else(|error| {
+            retain_generated_shim_failure(&f, &error);
             panic!(
                 "shim route target={} cwd={} words={words:?} settings={env:?}: {error:?}",
                 target.display(),

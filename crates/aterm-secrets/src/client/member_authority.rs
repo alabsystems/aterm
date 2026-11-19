@@ -6,7 +6,7 @@
 use super::{Error, Paths, StateLock, log_entries};
 use crate::commons::bootstrap::Device;
 use crate::members::desk::Proving;
-use crate::membership_log::{Body, EpochAudience, MAX_RECORDS_STREAM, read_records};
+use crate::membership_log::{Body, EpochAudience, REPLY_CAP, read_records};
 
 /// The complete acknowledged public membership records this member may serve before
 /// a new Mac proves possession. Secret entries and epoch keys remain sealed in those
@@ -79,7 +79,7 @@ pub fn member_authority(paths: &Paths, proving: &Proving<'_>) -> crate::Result<V
     let bytes = log.records().try_fold(0usize, |total, record| {
         total
             .checked_add(record.wire_len())
-            .filter(|total| *total <= MAX_RECORDS_STREAM)
+            .filter(|total| *total <= REPLY_CAP)
             .ok_or_else(|| Error::new("member authority exceeds the public record stream bound"))
     })?;
     // A record an open through the vault's head shelved is read back for the witness, and one

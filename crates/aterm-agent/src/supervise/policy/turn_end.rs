@@ -1615,6 +1615,148 @@ impl LaunchModel {
             Self::Unread | Self::Unnamed => None,
         }
     }
+
+    /// The model's own week the roster ranks the rows of a session so launched by, where nothing
+    /// pins its model beside its `--model` ([`Self::week_under`] with no pins): a launch that
+    /// names no model runs Claude Code's default (Fable's week, with the fallback
+    /// [`Self::admits_fallback`] reads), one that names a model runs that model's; nothing where
+    /// nobody read the launch.
+    #[must_use]
+    pub fn week(&self) -> crate::harness::accounts::ModelWeek {
+        self.week_under(&ModelPins::default())
+    }
+
+    /// THE MODEL'S OWN WEEK THE ROSTER RANKS THE SESSION'S ROWS BY (FL-264), as Claude Code
+    /// chooses its model: the model its last turn was served by where one was (`pins.served`:
+    /// what the API served, a `/model` switch, an environment pin and a setting included), else
+    /// the launch's `--model`, which every pin yields to, else `ANTHROPIC_MODEL` or the settings'
+    /// `model` (`pins.named`), else Claude Code's default
+    /// ([`crate::harness::accounts::ModelWeek::of_launch`]). Where what names the model cannot be
+    /// read (`pins.unread`, or an alias a `ANTHROPIC_DEFAULT_*_MODEL` remaps), it is unread, as
+    /// it is where nobody read the launch: FL-206's order, never the default's. The week falls
+    /// back where the launch admits the fallback ([`Self::admits_fallback`],
+    /// [`crate::harness::accounts::ModelWeek::falling_back`]). While the switch onto
+    /// [`FABLE_FALLBACK`] stands, the relaunched line names it, so Opus's week is read.
+    #[must_use]
+    pub fn week_under(&self, pins: &ModelPins) -> crate::harness::accounts::ModelWeek {
+        use crate::harness::accounts::ModelWeek;
+        let admits = self.admits_fallback();
+        let of = |model: &str| ModelWeek::of_model(model).falling_back(admits);
+        if *self == Self::Unread {
+            return ModelWeek::Unread;
+        }
+        if let Some(served) = &pins.served {
+            return of(served);
+        }
+        let named = match self {
+            Self::Named(model) => Some(model.as_str()),
+            Self::Unnamed if pins.unread => return ModelWeek::Unread,
+            Self::Unnamed | Self::Unread => pins.named.as_deref(),
+        };
+        let full_id = |model: &str| {
+            crate::harness::upgrade::is_model_id(model)
+                && crate::harness::claude_model::family_version(model).is_some()
+        };
+        match named {
+            Some(model) if pins.remapped && !full_id(model) => ModelWeek::Unread,
+            Some(model) => of(model),
+            None if pins.remapped => ModelWeek::Unread,
+            None => ModelWeek::of_launch(None),
+        }
+    }
+}
+
+/// WHAT PINS A CLAUDE CODE PROCESS'S MODEL BESIDE ITS `--model` ([`LaunchModel::week_under`]):
+/// what its host read of its environment, its settings and its served turns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelPins {
+    /// The model the process's last served turn named (`IdleHost::answered_by`).
+    pub served: Option<String>,
+    /// The model `ANTHROPIC_MODEL` names (in its environment, or a settings document's `env`),
+    /// else the first settings document's `model`, in the chain's order, highest first.
+    pub named: Option<String>,
+    /// An `ANTHROPIC_DEFAULT_*_MODEL` is set: an alias, the default's included, may name another
+    /// model than its own.
+    pub remapped: bool,
+    /// What names the model cannot be read: two `ANTHROPIC_MODEL` values that differ, a settings
+    /// document that is there and cannot be read or parsed, or a `model` that is no string.
+    pub unread: bool,
+}
+
+impl ModelPins {
+    /// The pins of a process whose exec environment is `env` (`KEY=value`) and whose settings
+    /// chain is `settings`, highest precedence first (`claude_settings::sources_under`'s order);
+    /// no served turn.
+    #[must_use]
+    pub fn of(env: &[String], settings: &[(String, crate::harness::netwatch::Source)]) -> Self {
+        use crate::harness::netwatch::Source;
+        use aterm_json::Value;
+        let mut pins = Self::default();
+        let mut env_model: Option<String> = None;
+        let mut note = |key: &str, value: &str, pins: &mut Self| {
+            let value = value.trim();
+            if value.is_empty() {
+                return;
+            }
+            if key == "ANTHROPIC_MODEL" {
+                match &env_model {
+                    Some(model) if model != value => pins.unread = true,
+                    Some(_) => {}
+                    None => env_model = Some(value.to_owned()),
+                }
+            } else if key
+                .strip_prefix("ANTHROPIC_DEFAULT_")
+                .is_some_and(|rest| rest.ends_with("_MODEL"))
+            {
+                pins.remapped = true;
+            }
+        };
+        for (key, value) in env.iter().filter_map(|kv| kv.split_once('=')) {
+            note(key, value, &mut pins);
+        }
+        let mut setting: Option<String> = None;
+        for (_, source) in settings {
+            let text = match source {
+                Source::Missing => continue,
+                Source::Unreadable => {
+                    pins.unread = true;
+                    continue;
+                }
+                Source::Text(text) => text,
+            };
+            let Some(doc) = super::claude_settings::parse(text)
+                .ok()
+                .and_then(|doc| doc.as_object().cloned())
+            else {
+                pins.unread = true;
+                continue;
+            };
+            match doc.get("model") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(model)) if model.trim().is_empty() => {}
+                Some(Value::String(model)) => {
+                    setting.get_or_insert_with(|| model.trim().to_owned());
+                }
+                Some(_) => pins.unread = true,
+            }
+            match doc.get("env") {
+                None | Some(Value::Null) => {}
+                Some(Value::Object(vars)) => {
+                    for (key, value) in vars {
+                        match value {
+                            Value::String(value) => note(key, value, &mut pins),
+                            Value::Null => {}
+                            _ if key == "ANTHROPIC_MODEL" => pins.unread = true,
+                            other => note(key, &other.to_string(), &mut pins),
+                        }
+                    }
+                }
+                Some(_) => pins.unread = true,
+            }
+        }
+        pins.named = env_model.or(setting);
+        pins
+    }
 }
 
 /// Whether `model` (an alias or an id, as a `--model` names it) is Fable.
@@ -12033,7 +12175,7 @@ fn repo_said_to(summary: &str, ask: RepoAsk) -> String {
     format!("{REPO_HEAD} ({summary}): {ask}")
 }
 
-const REPO_HEAD: &str = "Your repository still holds work no remote main has";
+const REPO_HEAD: &str = "Your repository's local Git state still shows work";
 const REPO_ALL: &str = "commit, merge and push it to the remote main first.";
 const REPO_OWN: &str = "land what of it you made first, and leave what you did not make exactly \
                         as it is.";
@@ -13585,8 +13727,9 @@ fn move_ahead<'a>(
 /// [`ModelSwitch::back_at`], or one ahead of `now`), an advised move `to` another account is not
 /// made ahead of the turn end's own act. The account relaunch keeps the line's `--model`, so that move would leave the
 /// session running Opus on another account until its own account's Fable reset. Fable's bucket
-/// on record ranks the account after every account with no model's wall (the roster's
-/// `Rank::model_walled`), so the advice past the fallback is often that move. A move to the session's own row's renewed login
+/// on record ranks the account after every account with Fable's room for a Fable session (the
+/// roster's `Rank::model_walled`, by `accounts::ModelWeek`), so the advice past the fallback is
+/// often that move (onto an `active` other sessions rotated to). A move to the session's own row's renewed login
 /// (`login_label`) is not another account and still goes. A move by which the session yields an
 /// account that is another Mac's to use (F19, `yields`) still goes too, as does a move at a
 /// wall the fallback cannot answer ([`account_first`]: Opus's own limit, the account's session

@@ -640,7 +640,7 @@ fn chrome_reads_the_close_row_live_not_as_last_stamped() {
     set_menu_live(before);
 }
 
-/// View ▸ Show System Resources Here is checked from the front window's bit, idle unless the
+/// View ▸ Expand System Resources Here is checked from the front window's bit, idle unless the
 /// Stats Bars setting is Deck (the bit is inert under Sill and Off), and the person's own act.
 #[test]
 fn the_band_row_is_checked_from_the_front_windows_bit_and_idle_unless_the_setting_is_deck() {
@@ -686,11 +686,10 @@ fn the_band_row_is_checked_from_the_front_windows_bit_and_idle_unless_the_settin
     assert!(!row.writes_pty_input());
     assert!(!super::requires_terminal_tab(row), "any window has a head");
     assert!(
-        model_items().iter().any(
-            |(label, action, key, _)| *label == "Show System Resources Here"
-                && *action == row
-                && key.is_empty()
-        ),
+        model_items().iter().any(|(label, action, key, _)| *label
+            == "Expand System Resources Here"
+            && *action == row
+            && key.is_empty()),
         "the menu bar carries the row, with no key"
     );
     set_menu_live(before.0);
@@ -903,8 +902,7 @@ fn update_rows_are_not_offered_where_no_updater_exists() {
     assert!(!offered("Install"), "{:?}", menu_chrome_lines(None, false));
     for section in MENU_MODEL {
         for (_, action, _, _) in section.entries.iter().flat_map(MenuEntry::items) {
-            // The updater's rows follow the updater; the macOS-only rows and Tables are
-            // checked where they are offered.
+            // The updater's rows follow the updater. Platform-specific tools follow their host.
             let macos_only = matches!(
                 action,
                 MenuAction::SystemState | MenuAction::RecordUnseenKeys | MenuAction::RenameMachine
@@ -915,25 +913,28 @@ fn update_rows_are_not_offered_where_no_updater_exists() {
                     cfg!(target_os = "macos"),
                     "{action:?}"
                 );
-            } else if action == MenuAction::Tables {
-                // The registry is kept on macOS and Linux.
+            } else if matches!(action, MenuAction::Tables | MenuAction::Registry) {
                 assert_eq!(action.offered_on_this_platform(), cfg!(unix), "{action:?}");
             } else if !matches!(action, MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate) {
                 assert!(action.offered_on_this_platform(), "{action:?}");
             }
         }
     }
-    // What the gate answers is what `chrome` prints and the palette lists: the Registry row is in
-    // both where the registry is kept and in neither on Windows.
-    assert_eq!(
-        offered("Registry…"),
-        cfg!(unix),
-        "{:?}",
-        menu_chrome_lines(None, false)
-    );
+    for title in ["Tables…", "aRegistry…"] {
+        assert_eq!(
+            offered(title),
+            cfg!(unix),
+            "{:?}",
+            menu_chrome_lines(None, false)
+        );
+    }
     let mut palette = crate::palette::PaletteState::new();
     palette.resolve(&crate::palette::PaletteLive::default());
     assert_eq!(palette.action_by_name("Tables").is_ok(), cfg!(unix));
+    assert_eq!(
+        palette.action_by_name("aRegistry").ok(),
+        cfg!(unix).then_some(MenuAction::Registry)
+    );
 }
 
 /// Windows offers "Install … now" exactly while a newer build is staged on the machine: the

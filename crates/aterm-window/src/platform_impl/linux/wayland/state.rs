@@ -131,6 +131,9 @@ pub struct WinitState {
     /// In-flight drag-and-drop `text/uri-list` reads streamed through the event loop.
     pub dnd_pipes: Vec<DndPipe>,
 
+    /// Outside left releases awaiting application dispatch or a compositor focus barrier.
+    pub(crate) outside_releases: super::outside_release::OutsideReleases,
+
     /// Window currently hovered by a file drag.
     pub dnd_hover_window: Option<WindowId>,
 
@@ -245,6 +248,7 @@ impl WinitState {
             clipboard: ClipboardState::default(),
             dnd_pipes: Vec::new(),
             dnd_hover_window: None,
+            outside_releases: Default::default(),
             dispatched_events: true,
             inbox,
             data_device_manager,
@@ -354,6 +358,7 @@ impl WinitState {
             Wire::ActivationDone { window, token } => self.activation_done(window, &token),
             Wire::OutputDone(info) => self.output_done(info),
             Wire::Seat(input) => self.seat_input(input),
+            Wire::OutsideReleaseDone(id) => self.complete_outside_release(id),
             Wire::Drag { seat, event } => self.drag_event(seat, event),
             Wire::Source { selection, source, event } => {
                 self.source_event(selection, source, event)

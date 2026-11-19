@@ -98,10 +98,10 @@ fn two_versions_of_one_name_are_named_by_their_specs() {
         ]
     );
     assert_eq!(package_identity("alpha@2.0.0"), "alpha");
-    let both = select(&libs, Some(&["alpha".to_string()])).unwrap();
+    let both = select(&libs, Selection::Packages(&["alpha".to_string()])).unwrap();
     assert_eq!(both.len(), 2);
     assert!(both.iter().all(|s| matches!(s.decision, Decision::Gate(_))));
-    let one = select(&libs, Some(&["alpha@2.0.0".to_string()])).unwrap();
+    let one = select(&libs, Selection::Packages(&["alpha@2.0.0".to_string()])).unwrap();
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].lib.spec, "alpha@2.0.0");
 }
@@ -206,7 +206,7 @@ fn a_member_feature_that_turns_on_fork_code_is_gated_as_a_row_of_its_own() {
     let row = libs.iter().find(|l| l.name == "link+sealed").unwrap();
     assert_eq!(row.argv, sealed);
     let picked = |want: &str| -> Vec<String> {
-        select(&libs, Some(&[want.to_string()]))
+        select(&libs, Selection::Packages(&[want.to_string()]))
             .unwrap()
             .into_iter()
             .map(|s| {
@@ -223,9 +223,32 @@ fn a_member_feature_that_turns_on_fork_code_is_gated_as_a_row_of_its_own() {
         .cloned()
         .collect();
     let floors = "link\t5\t9\tp\nlink+sealed\t5\t9\tp\n";
-    let gone = |libs: &[Lib]| vanished(libs, floors).contains(&"link+sealed".to_string());
+    let gone = |libs: &[Lib]| {
+        vanished(libs.iter().map(|l| l.name.as_str()), floors).contains(&"link+sealed".to_string())
+    };
     assert!(!gone(&libs));
     assert!(gone(&without));
+}
+
+#[test]
+fn a_remeasurement_selects_only_its_pending_feature_rows() {
+    let libs = [
+        lib("link", "link@1.0.0", Kind::Member),
+        lib("link+sealed", "link+sealed@1.0.0", Kind::Member),
+    ];
+    let names = |selection| {
+        select(&libs, selection)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.lib.name)
+            .collect::<Vec<_>>()
+    };
+    let base = ["link".to_string()];
+    let feature = ["link+sealed".to_string()];
+    assert_eq!(names(Selection::Packages(&base)), ["link", "link+sealed"]);
+    assert_eq!(names(Selection::Pending(&base)), ["link"]);
+    assert_eq!(names(Selection::Pending(&feature)), ["link+sealed"]);
+    assert!(select(&libs[1..], Selection::Pending(&base)).is_err());
 }
 
 #[test]
@@ -255,7 +278,7 @@ fn the_selection_decides_each_library_before_anything_runs() {
         lib("tool", "tool@1.0.0", Kind::MemberBin),
         lib("smol_str", "smol_str@0.3.2", Kind::Fork),
     ];
-    let all = select(&libs, None).unwrap();
+    let all = select(&libs, Selection::All).unwrap();
     let decided: Vec<(&str, &Decision)> = all
         .iter()
         .map(|s| (s.lib.name.as_str(), &s.decision))
@@ -271,27 +294,24 @@ fn the_selection_decides_each_library_before_anything_runs() {
             ),
         ]
     );
-    let one = select(&libs, Some(&["smol_str".to_string()])).unwrap();
+    let one = select(&libs, Selection::Packages(&["smol_str".to_string()])).unwrap();
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].lib.spec, "smol_str@0.3.2");
     assert!(
-        select(&libs, Some(&["nope".to_string()])).is_err(),
+        select(&libs, Selection::Packages(&["nope".to_string()])).is_err(),
         "a name that matches nothing is no run over zero libraries"
     );
 }
 
 #[test]
 fn a_floor_the_graph_no_longer_carries_is_vanished() {
-    let libs = vec![
-        lib("alpha", "alpha@1.0.0", Kind::Member),
-        lib("smol_str", "smol_str@0.3.2", Kind::Fork),
-    ];
+    let libs = ["alpha", "smol_str"];
     let floors = "# <crate>\t<proved>\nalpha\t1\t2\tp\nsmol_str\t3\t4\tp\n";
-    assert_eq!(vanished(&libs, floors), Vec::<String>::new());
+    assert_eq!(vanished(libs, floors), Vec::<String>::new());
     let floors = format!("{floors}pkg-config\t5\t6\tp\n");
-    assert_eq!(vanished(&libs, &floors), ["pkg-config"]);
+    assert_eq!(vanished(libs, &floors), ["pkg-config"]);
     assert_eq!(
-        vanished(&libs[..1], &floors),
+        vanished(["alpha"], &floors),
         ["pkg-config", "smol_str"],
         "a fork that left is named with its floor"
     );
@@ -304,7 +324,7 @@ fn two_selected_packages_of_one_name_are_both_ambiguous() {
         lib("arrayvec", "arrayvec@0.7.7", Kind::Fork),
         lib("beta", "beta@1.0.0", Kind::Member),
     ];
-    let all = select(&libs, None).unwrap();
+    let all = select(&libs, Selection::All).unwrap();
     assert_eq!(all[0].decision, Decision::Ambiguous);
     assert_eq!(all[1].decision, Decision::Ambiguous);
     assert!(matches!(all[2].decision, Decision::Gate(_)));
@@ -334,6 +354,8 @@ fn the_cost_history_keeps_every_row_and_adds_the_new() {
         &BTreeMap::from([("a".to_string(), one(1))]),
         &mut out,
     );
+    let sibling = path.with_extension(format!("tsv.{}", std::process::id()));
+    fs::write(&sibling, b"another writer's history").unwrap();
     write_costs(
         Some(&path),
         &BTreeMap::from([("b".to_string(), one(2))]),
@@ -349,6 +371,7 @@ fn the_cost_history_keeps_every_row_and_adds_the_new() {
         got,
         BTreeMap::from([("a".into(), vec![one(3)]), ("b".into(), vec![one(2)])])
     );
+    assert_eq!(fs::read(&sibling).unwrap(), b"another writer's history");
     assert!(out.is_empty());
 
     let seed = d.path().join("costs.tsv");
@@ -404,6 +427,15 @@ fn the_cost_history_keeps_every_row_and_adds_the_new() {
         !read_costs(None, &committed, P).rows.is_empty(),
         "{}",
         committed.display()
+    );
+    let blocked = d.path().join("blocked.tsv");
+    fs::create_dir(&blocked).unwrap();
+    write_cost_file(&blocked, COSTS_HEADER, &CostRows::new(), &mut out);
+    assert!(blocked.is_dir());
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("the cost history was not written")
     );
 }
 
@@ -1065,44 +1097,23 @@ fn job(name: &str) -> Job {
 #[test]
 fn a_feature_rows_obligations_keep_the_cargo_package_and_the_row_filename() {
     let dir = tmp("trust-feature-report");
-    for (case, (row, reported, accepted)) in [
-        ("alpha", "alpha", true),
-        ("alpha+sealed", "alpha", true),
-        ("alpha+sealed", "foreign", false),
+    for (case, (row, accepted)) in [
+        ("alpha", true),
+        ("alpha+sealed", true),
+        ("foreign+sealed", false),
     ]
     .into_iter()
     .enumerate()
     {
         let slot = dir.path().join(case.to_string());
         let report = slot.join("report");
-        fs::create_dir_all(&report).unwrap();
-        let unit = format!(r#"cargo-target(package="{reported}",target="alpha",kind=["lib"])"#);
-        let unit_json = aterm_json::to_string(&unit).unwrap();
-        let function = aterm_json::to_string(&format!("{unit}::alpha::work")).unwrap();
-        let schema = crate::trust_oblig::REPORT_SCHEMA;
-        fs::write(
-            report.join("report.ndjson"),
-            format!(
-                concat!(
-                    r#"{{"record_type":"header","schema":"{schema}","crate_name":{unit_json},"expected_functions":1}}"#,
-                    "\n",
-                    r#"{{"record_type":"function","function":{function},"summary":{{"total_obligations":1,"proved":1}},"obligations":[{{"kind":"assertion","description":"checked assertion","outcome":{{"status":"proved"}}}}]}}"#,
-                    "\n",
-                    r#"{{"record_type":"footer","schema":"{schema}","summary":{{"total_obligations":1,"total_proved":1}},"functions_emitted":1}}"#,
-                    "\n"
-                ),
-                schema = schema,
-                unit_json = unit_json,
-                function = function,
-            ),
-        )
-        .unwrap();
+        obligation_report(&report);
         let mut check = job(row);
         check.log = slot.join(format!("{row}@1.0.0.log"));
         check.report = Some(report.clone());
         let raw_path = report.join("report.ndjson");
         let raw = fs::read(&raw_path).unwrap();
-        assert_eq!(reduce_report(&check, dir.path()).is_ok(), accepted);
+        assert_eq!(reduce_report(&check, dir.path(), 0).is_ok(), accepted);
 
         let record = PathBuf::from(format!(
             "{}{}",
@@ -1118,7 +1129,7 @@ fn a_feature_rows_obligations_keep_the_cargo_package_and_the_row_filename() {
                 )
             });
             let head: Vec<&str> = text.lines().take(6).collect();
-            let unit_line = format!("unit\t{unit}");
+            let unit_line = format!("unit\t{ALPHA_UNIT}");
             assert_eq!(
                 head,
                 [
@@ -1140,27 +1151,85 @@ fn a_feature_rows_obligations_keep_the_cargo_package_and_the_row_filename() {
             assert!(
                 fs::read_to_string(&error)
                     .unwrap()
-                    .contains("package foreign, not alpha")
+                    .contains("package alpha, not foreign")
             );
             assert_eq!(fs::read(&raw_path).unwrap(), raw);
         }
     }
 }
 
+const ALPHA_UNIT: &str = r#"cargo-target(package="alpha",target="alpha",kind=["lib"])"#;
+
 fn obligation_report(report: &Path) {
     fs::create_dir_all(report).unwrap();
-    let unit = r#"cargo-target(package="alpha",target="alpha",kind=["lib"])"#;
+    let unit = ALPHA_UNIT;
     let unit_json = aterm_json::to_string(unit).unwrap();
     let function = aterm_json::to_string(&format!("{unit}::alpha::work")).unwrap();
     let schema = crate::trust_oblig::REPORT_SCHEMA;
+    // Pinned Trust v2 digest of the exact single function row below.
     fs::write(report.join("report.ndjson"), format!(concat!(
         r#"{{"record_type":"header","schema":"{schema}","crate_name":{unit_json},"expected_functions":1}}"#,
         "\n",
         r#"{{"record_type":"function","function":{function},"summary":{{"total_obligations":1,"proved":1}},"obligations":[{{"kind":"assertion","description":"checked assertion","outcome":{{"status":"proved"}}}}]}}"#,
         "\n",
-        r#"{{"record_type":"footer","schema":"{schema}","summary":{{"total_obligations":1,"total_proved":1}},"functions_emitted":1}}"#,
+        r#"{{"record_type":"footer","schema":"{schema}","summary":{{"total_obligations":1,"total_proved":1}},"functions_emitted":1,"function_records_sha256":"sha256:eeaf8d3f9140c79dc8658ab87497a68530aa88dbeef7ac15505b9129a302a482"}}"#,
         "\n"
     ), schema=schema, unit_json=unit_json, function=function)).unwrap();
+}
+
+#[test]
+fn a_missing_report_preserves_the_failed_proof_commands_diagnostic() {
+    let dir = tmp("trust-missing-report");
+    let mut check = job("alpha");
+    check.log = dir.path().join("alpha.log");
+    check.report = Some(dir.path().join("absent.report"));
+    trust_facts::testing::write_log(
+        &check.log,
+        "targo trust: configured\nerror: Broken pipe\ntargo trust: invalid canonical Cargo evidence channel: recursion limit exceeded\n  targo trust: quoted source text\n",
+    );
+    for code in [2, 0] {
+        let why = reduce_report(&check, dir.path(), code)
+            .unwrap_err()
+            .to_string();
+        let saved = fs::read_to_string(dir.path().join("alpha.log.oblig.err")).unwrap();
+        for message in [&why, &saved] {
+            assert!(message.contains("report.ndjson"), "{message}");
+            assert_eq!(
+                message.contains("proof command exited 2"),
+                code == 2,
+                "{message}"
+            );
+            assert_eq!(
+                message.contains("recursion limit exceeded"),
+                code == 2,
+                "{message}"
+            );
+            assert!(!message.contains("configured") && !message.contains("quoted source text"));
+        }
+        assert!(!dir.path().join("alpha.log.oblig.tsv").exists());
+    }
+}
+
+#[test]
+fn a_targo_log_excerpt_is_bounded_and_requires_a_completed_frame() {
+    let dir = tmp("trust-driver-message");
+    let log = dir.path().join("alpha.log");
+    let output = format!("targo trust: prefix\x1b{}\n", "é".repeat(600));
+    trust_facts::testing::write_log(&log, &output);
+    let line = trust_facts::last_targo_message(&log).unwrap().unwrap();
+    assert!(line.starts_with("prefix") && line.ends_with('…'));
+    assert!(!line.chars().any(char::is_control));
+    assert!(line.chars().count() <= 513);
+    let mut partial = Vec::new();
+    let stored = store_log(
+        FailingOutput(output.as_bytes()),
+        &mut partial,
+        LOG_STORED,
+        LOG_TAIL,
+    );
+    assert!(stored.read_failed);
+    fs::write(trust_facts::stored_log(&log), partial).unwrap();
+    assert!(trust_facts::last_targo_message(&log).is_err());
 }
 
 #[test]
@@ -1181,7 +1250,7 @@ fn every_queued_reduction_is_attempted_and_each_failure_keeps_its_raw_report() {
         if i == 1 {
             fs::create_dir(dir.path().join("1.log.oblig.err")).unwrap();
         }
-        reducer.send(&check).unwrap();
+        reducer.send(&check, 0).unwrap();
     }
     let errors = reducer.finish(false);
     assert_eq!(errors.len(), 2, "{errors:?}");
@@ -1228,7 +1297,7 @@ fn cancelled_reductions_keep_unstarted_raw_reports() {
     let raw = fs::read(report.join("report.ndjson")).unwrap();
     check.report = Some(report.clone());
     let (tx, rx) = std::sync::mpsc::channel();
-    tx.send(check).unwrap();
+    tx.send((check, 0)).unwrap();
     drop(tx);
     let errors = reduce_reports(rx, dir.path(), &std::sync::atomic::AtomicBool::new(true));
     assert!(errors.is_empty());
@@ -1248,7 +1317,7 @@ fn a_closed_reduction_queue_and_panicked_worker_are_receipt_failures() {
         })),
     };
     assert!(matches!(
-        reducer.send(&job("alpha")),
+        reducer.send(&job("alpha"), 0),
         Err(ReductionError::Queue(_))
     ));
     assert!(matches!(
@@ -2414,6 +2483,22 @@ fn a_check_cut_short_keeps_what_it_measured() {
         cut(&finished(d.path(), DONE, 137, true)),
         Some(Some(Cut::OverBudget))
     );
+    for rc in [2, 3, 101] {
+        assert_eq!(
+            cut(&finished(d.path(), DONE, rc, false)),
+            Some(Some(Cut::Failed))
+        );
+    }
+    assert_eq!(cut(&finished(d.path(), DONE, 1, false)), Some(None));
+    for log in [
+        DONE.replace("; reproducible", "; not-reproducible; profile a; vector b"),
+        DONE.replace("5 proved", "21 proved"),
+    ] {
+        assert_eq!(
+            cut(&finished(d.path(), &log, 1, false)),
+            Some(Some(Cut::Failed))
+        );
+    }
     let mut stopped = finished(d.path(), "", 137, false);
     stopped.interrupted = true;
     assert_eq!(cut(&stopped), Some(Some(Cut::Interrupted)));
@@ -3103,6 +3188,8 @@ struct Site {
     meanwhile: Option<fn(&Path)>,
     /// A fault injected after output cleanup, before checks finish and write receipts.
     before_checks: Option<fn(&Prepared)>,
+    /// Compiler result and output at completion, before the lane reads the slot.
+    completed: Option<fn(&mut Finished)>,
     /// The stamp each check's dep-info gets ([`Quick`]).
     stamp: Option<SystemTime>,
     /// The host's load while the checks run ([`Checks::load`]).
@@ -3132,22 +3219,22 @@ impl Bench for Site {
         })
     }
     fn metadata(&mut self, _: &Driver, repo: &Path) -> Result<Vec<u8>, String> {
-        let pkg = |name: &str, dir: &str, member: bool| {
-            let id = format!("{name} 1.0.0 (path+file://{}/{dir})", repo.display());
+        let pkg = |spec: &str| {
+            let (name, version, dir, member) = match spec.split_once('@') {
+                Some((name, version)) => (name, version, format!("vendor/{spec}"), false),
+                None => (spec, "1.0.0", format!("crates/{spec}"), true),
+            };
+            let id = format!("{name} {version} (path+file://{}/{dir})", repo.display());
             (
                 format!(
-                    r#"{{"id": "{id}", "name": "{name}", "version": "1.0.0", "source": null,
+                    r#"{{"id": "{id}", "name": "{name}", "version": "{version}", "source": null,
                           "manifest_path": "{}/{dir}/Cargo.toml", "targets": [{{"kind": ["lib"]}}]}}"#,
                     repo.display()
                 ),
                 member.then_some(id),
             )
         };
-        let all: Vec<_> = self
-            .libraries
-            .iter()
-            .map(|name| pkg(name, &format!("crates/{name}"), true))
-            .collect();
+        let all: Vec<_> = self.libraries.iter().map(|spec| pkg(spec)).collect();
         let packages: Vec<&str> = all.iter().map(|(p, _)| p.as_str()).collect();
         let members: Vec<String> = all
             .iter()
@@ -3221,7 +3308,13 @@ impl Bench for Site {
             gate,
             said: Vec::new(),
         };
-        let ran = run_slots(jobs, slots, cfg.budget, &mut quick, done);
+        let mut completed = |mut f: Finished, checks: &mut dyn Checks| {
+            if let Some(emit) = self.completed {
+                emit(&mut f);
+            }
+            done(f, checks);
+        };
+        let ran = run_slots(jobs, slots, cfg.budget, &mut quick, &mut completed);
         for line in std::mem::take(&mut quick.said) {
             let _ = writeln!(out, "trust: {line}");
         }
@@ -3341,6 +3434,7 @@ fn site(scope: Scope) -> Site {
         stop_at: None,
         meanwhile: None,
         before_checks: None,
+        completed: None,
         stamp: None,
         load: None,
         updated: None,
@@ -3700,6 +3794,62 @@ fn requested_reduction_failures_cannot_conclude_file_facts_or_raise_floors() {
     }
 }
 
+fn assert_compiler_statuses(site: &Site, output: &str, checks: &[(&str, i32)]) {
+    let logs = root_of(site).join("logs");
+    let mut expected: Vec<_> = checks
+        .iter()
+        .map(|(name, code)| {
+            let log = logs.join(format!("{name}@1.0.0.log.zst"));
+            assert!(log.is_file());
+            format!(
+                "trust: {name} compiler status {code}, log {}",
+                log.display()
+            )
+        })
+        .collect();
+    let mut observed: Vec<_> = output
+        .lines()
+        .filter(|line| line.contains(" compiler status "))
+        .collect();
+    expected.sort_unstable();
+    observed.sort_unstable();
+    assert_eq!(observed, expected, "{output}");
+}
+
+/// A missing sibling report makes the run undecidable in either completion order.
+/// Preserve each observed child's status and exact log alongside the receipt error.
+#[test]
+fn a_missing_report_shows_each_checked_library_and_preserves_the_policy() {
+    for missing in ["aardvark", "beta"] {
+        let mut s = site(Scope::WholeTree);
+        s.cfg.obligations = true;
+        s.cfg.update_ratchet = true;
+        s.libraries = vec!["alpha", missing];
+        s.completed = Some(|f| {
+            f.ended.code = if f.job.name == "alpha" { 3 } else { 2 };
+        });
+        s.before_checks =
+            Some(|prep| obligation_report(&prep.logdir.join("alpha@1.0.0.log.report")));
+        let policy = s.repo.join(trust_facts::RATCHET);
+        let original = fs::read(&policy).unwrap();
+        let (outcome, said, filed) = run_site(&mut s);
+        let mut order = ["alpha", missing];
+        order.sort_unstable();
+        assert_eq!(s.started, order);
+        assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{said}");
+        assert!(filed.is_empty(), "{filed:?}");
+        assert_eq!(fs::read(policy).unwrap(), original);
+
+        let logs = root_of(&s).join("logs");
+        assert_compiler_statuses(&s, &said, &[("alpha", 3), (missing, 2)]);
+        assert!(logs.join("alpha@1.0.0.log.oblig.tsv").is_file());
+        assert!(
+            logs.join(format!("{missing}@1.0.0.log.oblig.err"))
+                .is_file()
+        );
+    }
+}
+
 #[test]
 fn a_clean_requested_reduction_and_an_absent_optional_record_both_conclude() {
     for requested in [false, true] {
@@ -3711,6 +3861,7 @@ fn a_clean_requested_reduction_and_an_absent_optional_record_both_conclude() {
         }
         let (outcome, said, filed) = run_site(&mut s);
         assert_eq!(outcome, Outcome::Pass, "{said}");
+        assert_compiler_statuses(&s, &said, &[]);
         assert_eq!(filed.len(), 1, "{said}");
         let record = root_of(&s).join("logs/alpha@1.0.0.log.oblig.tsv");
         assert_eq!(record.is_file(), requested);
@@ -3727,33 +3878,276 @@ fn a_clean_requested_reduction_and_an_absent_optional_record_both_conclude() {
 
 #[test]
 fn a_malformed_present_obligation_record_cannot_file_facts_or_raise_floors() {
-    for update in [false, true] {
+    fn write_record(repo: &Path, record: &str) {
+        let path = repo
+            .parent()
+            .unwrap()
+            .join("target-trust.noindex/logs/alpha@1.0.0.log.oblig.tsv");
+        fs::write(path, record).unwrap();
+    }
+    let faults: [fn(&Path); 2] = [
+        |repo| {
+            write_record(
+                repo,
+                &format!("{}\npackage\talpha\n", crate::trust_oblig::RECORD_MAGIC),
+            )
+        },
+        |repo| {
+            let record = crate::trust_oblig::Record {
+                package: "beta".into(),
+                unit: r#"cargo-target(package="beta",target="beta",kind=["lib"])"#.into(),
+                ..Default::default()
+            };
+            write_record(repo, &record.to_text());
+        },
+    ];
+    for fault in faults {
+        for update in [false, true] {
+            let mut s = site(Scope::WholeTree);
+            s.cfg.update_ratchet = update;
+            s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+            s.meanwhile = Some(fault);
+            let ratchet = fs::read(s.repo.join(trust_facts::RATCHET)).unwrap();
+            let (outcome, said, filed) = run_site(&mut s);
+            assert!(
+                matches!(&outcome, Outcome::CouldNotRun(why)
+            if why.contains("could not be measured") && why.contains("alpha@1.0.0.log.oblig.tsv")),
+                "{outcome:?}: {said}"
+            );
+            assert_eq!(s.started, ["alpha"]);
+            assert!(filed.is_empty(), "{filed:?}: {said}");
+            assert!(!said.contains("\nFACTS: "), "{said}");
+            assert_eq!(
+                fs::read(s.repo.join(trust_facts::RATCHET)).unwrap(),
+                ratchet
+            );
+        }
+    }
+}
+
+fn write_grade(job: &Job, record: &str) {
+    let path = crate::trust_credit::record_path(&job.target, &job.name);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, record).unwrap();
+}
+
+fn single_proved_record(package: &str, calculus: bool) -> String {
+    let axes = if calculus {
+        r#","encoding":"proven-calculus","discharge":"kernel-reference-checked","premises":["semr-translation","target-kappa","closed-world-entry"]"#
+    } else {
+        ""
+    };
+    let row = format!(
+        r#"{{"key":"alpha::f#0000000000000001","kind":"assert","status":"proved","stop":"solved"{axes}}}"#
+    );
+    [
+        crate::trust_credit::tests::HEADER,
+        r#"{"fn":"alpha::f","source":null}"#,
+        &row,
+        "",
+    ]
+    .join("\n")
+    .replace("alpha", package)
+}
+
+#[test]
+fn unreadable_grade_evidence_cannot_file_facts_or_raise_floors() {
+    fn foreign(f: &mut Finished) {
+        write_grade(
+            &f.job,
+            &crate::trust_credit::tests::HEADER.replace(r#""alpha""#, r#""beta""#),
+        );
+    }
+    fn damaged(f: &mut Finished) {
+        let record = format!("{}\n{{}}\n", crate::trust_credit::tests::HEADER);
+        write_grade(&f.job, &record);
+    }
+    for (ledger, complete, reason) in [
+        (true, foreign as fn(&mut Finished), "beta"),
+        (false, foreign, "beta"),
+        (true, damaged, "line 2"),
+    ] {
         let mut s = site(Scope::WholeTree);
-        s.cfg.update_ratchet = update;
+        s.cfg.update_ratchet = true;
         s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
-        s.meanwhile = Some(|repo| {
+        if ledger {
             fs::write(
-                repo.parent()
-                    .unwrap()
-                    .join("target-trust.noindex/logs/alpha@1.0.0.log.oblig.tsv"),
-                format!("{}\npackage\talpha\n", crate::trust_oblig::RECORD_MAGIC),
+                s.repo.join(crate::trust_credit::EPOCHS),
+                include_str!("../trust/credit.tsv"),
             )
             .unwrap();
-        });
-        let ratchet = fs::read(s.repo.join(trust_facts::RATCHET)).unwrap();
+            git_in(&s.repo, &["add", "."]);
+            git_in(&s.repo, &["commit", "-q", "-m", "credit ledger"]);
+        }
+        s.completed = Some(complete);
+        let ratchet = s.repo.join(trust_facts::RATCHET);
+        let before = fs::read(&ratchet).unwrap();
         let (outcome, said, filed) = run_site(&mut s);
+        assert!(filed.is_empty(), "{filed:?}: {said}");
+        assert_eq!(fs::read(ratchet).unwrap(), before, "{said}");
         assert!(
-            matches!(&outcome, Outcome::CouldNotRun(why)
-            if why.contains("could not be measured") && why.contains("alpha@1.0.0.log.oblig.tsv")),
+            matches!(&outcome, Outcome::Fail(failed) if failed.iter().any(|f|
+                f.contains("alpha CREDIT-UNREADABLE") && f.contains(reason))),
             "{outcome:?}: {said}"
         );
-        assert_eq!(s.started, ["alpha"]);
-        assert!(filed.is_empty(), "{filed:?}: {said}");
-        assert!(!said.contains("\nFACTS: "), "{said}");
-        assert_eq!(
-            fs::read(s.repo.join(trust_facts::RATCHET)).unwrap(),
-            ratchet
+        assert!(said.contains("alpha CREDIT-UNREADABLE"), "{said}");
+        let epoch = if ledger {
+            "credit epoch 1"
+        } else {
+            "no credit epoch"
+        };
+        a_line_names(
+            &said,
+            "trust: proved (calculus)",
+            &[epoch, "incomplete count"],
         );
+        assert_compiler_statuses(&s, &said, &[("alpha", 0)]);
+    }
+}
+
+#[test]
+fn duplicate_floors_are_refused_in_the_scope_using_them() {
+    let mut s = site(Scope::Packages(vec!["alpha".into()]));
+    let path = s.repo.join(trust_facts::RATCHET);
+    let others = "beta\t3\t20\n# beta test floor\nbeta\t5\t20\n";
+    fs::write(&path, format!("alpha\t3\t20\ttargo 0.0.0-test\n{others}")).unwrap();
+    s.cfg.update_ratchet = true;
+    let (verdict, said, _) = run_site(&mut s);
+    assert_eq!(verdict, Outcome::Pass, "{said}");
+    let raised = fs::read_to_string(&path).unwrap();
+    assert!(raised.contains("alpha\t5\t20"), "{raised}");
+    assert!(
+        raised.contains("beta\t3\t20") && raised.contains("beta\t5\t20"),
+        "{raised}"
+    );
+
+    for (whole, name) in [(true, "beta"), (false, "alpha")] {
+        if whole {
+            s.cfg.scope = Scope::WholeTree;
+        } else {
+            s.cfg.scope = Scope::Packages(vec!["alpha".into()]);
+            fs::write(&path, format!("{raised}alpha\t7\t20\n")).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        s.started.clear();
+        let (outcome, said, _) = run_site(&mut s);
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why)
+                if why.contains(&format!("duplicate floor for {name}")) && why.contains(trust_facts::RATCHET)),
+            "{outcome:?}: {said}"
+        );
+        assert!(s.started.is_empty(), "{said}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn invalid_floor_counts_cannot_start_or_update_the_scoped_lane() {
+    const DAMAGED: &str = "alpha\t6\toops\n";
+    let mut s = site(Scope::Packages(vec!["alpha".into()]));
+    s.cfg.update_ratchet = true;
+    let path = s.repo.join(trust_facts::RATCHET);
+    let unrelated = "beta\t5\tinvalid\tother prover\n";
+    fs::write(
+        &path,
+        format!("alpha\t3\t20\ttargo 0.0.0-test\n{unrelated}"),
+    )
+    .unwrap();
+    let (outcome, said, _) = run_site(&mut s);
+    assert_eq!(outcome, Outcome::Pass, "{said}");
+    let raised = fs::read_to_string(&path).unwrap();
+    assert!(
+        raised.contains("alpha\t5\t20") && raised.contains(unrelated),
+        "{raised}"
+    );
+
+    for (proved, total, why) in [
+        ("5", "oops", "total `oops` is not a count"),
+        ("5", "4", "floor 5 exceeds total 4"),
+        ("", "20", "floor `` is not a count"),
+        (
+            "5",
+            "18446744073709551616",
+            "total `18446744073709551616` is not a count",
+        ),
+    ] {
+        let text = format!("# proof floors\nalpha\t{proved}\t{total}\ttargo 0.0.0-test\n");
+        fs::write(&path, &text).unwrap();
+        s.started.clear();
+        let (outcome, said, _) = run_site(&mut s);
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(diag)
+            if diag.contains(trust_facts::RATCHET) && diag.contains("line 2") && diag.contains("alpha") && diag.contains(why)),
+            "{outcome:?}: {said}"
+        );
+        assert!(s.started.is_empty(), "{said}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    // A floor can also become invalid after the upfront check has admitted the compiler.
+    fs::write(&path, &raised).unwrap();
+    s.meanwhile = Some(|repo| fs::write(repo.join(trust_facts::RATCHET), DAMAGED).unwrap());
+    let (outcome, said, filed) = run_site(&mut s);
+    assert!(
+        matches!(outcome, Outcome::CouldNotRun(why) if why.contains("total `oops`")),
+        "{said}"
+    );
+    assert!(filed.is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), DAMAGED);
+    assert_compiler_statuses(&s, &said, &[("alpha", 0)]);
+}
+
+#[test]
+fn an_unreadable_credit_epoch_cannot_publish_a_proof_verdict() {
+    fn damage_ledger(repo: &Path) {
+        fs::write(repo.join(crate::trust_credit::EPOCHS), "1\tproved\n").unwrap();
+    }
+    for during_checks in [false, true] {
+        for update in [true, false] {
+            let mut s = site(Scope::WholeTree);
+            s.libraries = vec!["alpha", "beta"];
+            s.completed = Some(|f| {
+                f.ended.code = if f.job.name == "alpha" { 3 } else { 0 };
+            });
+            s.cfg.update_ratchet = update;
+            if during_checks {
+                fs::write(
+                    s.repo.join(crate::trust_credit::EPOCHS),
+                    include_str!("../trust/credit.tsv"),
+                )
+                .unwrap();
+                s.meanwhile = Some(damage_ledger);
+                // A clean ledger at the start must not let a later failure claim every obligation.
+                s.log = "Summary: 20 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+            } else {
+                damage_ledger(&s.repo);
+                s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+            }
+            git_in(&s.repo, &["add", crate::trust_credit::EPOCHS]);
+            git_in(&s.repo, &["commit", "-q", "-m", "credit ledger"]);
+            let ratchet = s.repo.join(trust_facts::RATCHET);
+            let before = fs::read(&ratchet).unwrap();
+            let (outcome, said, filed) = run_site(&mut s);
+            assert!(
+                matches!(&outcome, Outcome::Fail(failed) if failed.iter().any(|f|
+                    f.contains("credit epoch CREDIT-UNREADABLE") && f.contains(crate::trust_credit::EPOCHS))),
+                "{outcome:?}: {said}"
+            );
+            assert!(said.contains("credit epoch CREDIT-UNREADABLE"), "{said}");
+            a_line_names(
+                &said,
+                "trust: proved (calculus)",
+                &["credit epoch unavailable"],
+            );
+            assert_compiler_statuses(
+                &s,
+                said.split_once("VERDICT: FAIL").unwrap().0,
+                &[("alpha", 3), ("beta", 0)],
+            );
+            assert!(filed.is_empty(), "{filed:?}: {said}");
+            assert_eq!(fs::read(ratchet).unwrap(), before, "{said}");
+            assert!(!said.contains("VERDICT: 100% MACHINE-PROVED"), "{said}");
+        }
     }
 }
 
@@ -4121,6 +4515,7 @@ fn a_ratcheting_run_lowers_another_provers_floor_only_with_its_reason() {
             Outcome::Fail(vec!["alpha RATCHET-REGRESSION(<9) 5/20".into()]),
             "judged against the floor as it stood: {said}"
         );
+        assert_compiler_statuses(&s, &said, &[]);
         let text = fs::read_to_string(&floors).unwrap();
         text.lines()
             .find(|l| l.starts_with("alpha\t"))
@@ -4210,6 +4605,103 @@ fn filed_facts(s: &Site, name: &str) -> trust_facts::Facts {
 }
 
 #[test]
+fn a_remeasurement_replaces_only_the_credit_of_crates_it_checked() {
+    fn calculus(f: &mut Finished) {
+        write_grade(&f.job, &single_proved_record(&f.job.name, true));
+    }
+    fn ungraded(f: &mut Finished) {
+        write_grade(&f.job, &single_proved_record(&f.job.name, false));
+    }
+    let mut s = undecided_site();
+    fs::write(
+        s.repo.join(crate::trust_credit::EPOCHS),
+        "1\tproved\tunvalidated-encoder\t2\tone proof from each library\n",
+    )
+    .unwrap();
+    git_in(&s.repo, &["add", crate::trust_credit::EPOCHS]);
+    git_in(
+        &s.repo,
+        &["commit", "-q", "-m", "require two calculus proofs"],
+    );
+    s.completed = Some(calculus);
+    let (outcome, said, filed) = run_site(&mut s);
+    assert_eq!(outcome, Outcome::Undecided(vec!["alpha".into()]), "{said}");
+    a_line_names(
+        &said,
+        "trust: proved (calculus): 2 of 2 proved",
+        &["credit epoch 1, floor 2"],
+    );
+    let [name] = filed.as_slice() else {
+        panic!("{filed:?}: {said}")
+    };
+    let receipt = s.repo.join(".git/aterm-verify/receipts").join(name);
+    let original = fs::read(&receipt).unwrap();
+    s.cfg.scope = Scope::Remeasure;
+    s.log = DONE;
+
+    let ledger = s.repo.join(crate::trust_credit::EPOCHS);
+    let original_epoch = fs::read(&ledger).unwrap();
+    s.meanwhile = Some(|repo| fs::remove_file(repo.join(crate::trust_credit::EPOCHS)).unwrap());
+    s.cfg.update_ratchet = true;
+    let (outcome, said, _) = run_site(&mut s);
+    assert!(
+        matches!(outcome, Outcome::Fail(ref reasons) if reasons.iter().any(|r| r.contains("CREDIT-FLOOR-LOWERED"))),
+        "{outcome:?}: {said}"
+    );
+    assert_eq!(fs::read(&receipt).unwrap(), original);
+    assert!(!s.repo.join(trust_facts::COSTS).exists());
+    fs::write(ledger, original_epoch).unwrap();
+    s.cfg.update_ratchet = false;
+
+    s.completed = Some(|f| write_grade(&f.job, "damaged"));
+    let (outcome, said, _) = run_site(&mut s);
+    assert!(
+        matches!(outcome, Outcome::Fail(ref f) if f.iter().any(|r| r.contains("alpha CREDIT-UNREADABLE"))),
+        "{outcome:?}: {said}"
+    );
+    assert_eq!(fs::read(&receipt).unwrap(), original);
+
+    for (emit, count, grading, pass) in [
+        (
+            Some(calculus as fn(&mut Finished)),
+            "2 of 2 proved",
+            "graded",
+            true,
+        ),
+        (
+            Some(ungraded),
+            "1 of 2 proved",
+            "partly graded: 1 of 2",
+            false,
+        ),
+        (None, "1 of 1 proved", "no record: alpha", false),
+    ] {
+        // Each replacement starts from the same filed whole-tree measurement.
+        fs::write(&receipt, &original).unwrap();
+        s.completed = emit;
+        for expected_checks in [&["alpha"][..], &[]] {
+            s.started.clear();
+            let (outcome, said, files) = run_site(&mut s);
+            assert_eq!(s.started, expected_checks, "{said}");
+            assert_eq!(files, filed, "{said}");
+            a_line_names(
+                &said,
+                &format!("trust: proved (calculus): {count}"),
+                &["credit epoch 1, floor 2", grading],
+            );
+            if pass {
+                assert_eq!(outcome, Outcome::Pass, "{said}");
+            } else {
+                assert!(
+                    matches!(outcome, Outcome::Fail(ref f) if f.len() == 1 && f[0].contains("CREDIT-REGRESSED 1 below")),
+                    "{outcome:?}: {said}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_remeasure_completes_its_record_and_then_runs_nothing() {
     let mut s = undecided_site();
     let (outcome, said, filed) = run_site(&mut s);
@@ -4221,13 +4713,32 @@ fn a_remeasure_completes_its_record_and_then_runs_nothing() {
     let prover = trust_facts::Prover::at(&s.driver.bin);
     let git = crate::ledger::testing::Git::new(&s.repo);
     assert_eq!(
-        trust_facts::pending_for(&git, &prover, "HEAD")
+        trust_facts::pending_for(&git, &prover, "HEAD", false)
             .unwrap()
             .unwrap(),
         ["alpha"]
     );
 
     s.cfg.scope = Scope::Remeasure;
+    s.log = "Summary: 6 proved, 4 failed (63 total); not-reproducible; profile a; vector b\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+    s.completed = Some(|f| f.ended.code = 1);
+    for _ in 0..2 {
+        s.started.clear();
+        let (outcome, said, files) = run_site(&mut s);
+        assert_eq!(
+            outcome,
+            Outcome::Fail(vec!["alpha NOT-MEASURED(rc=1,not-reproducible)".into()]),
+            "{said}"
+        );
+        assert_eq!(s.started, ["alpha"], "{said}");
+        assert_eq!(files, filed);
+        let retried = filed_facts(&s, &filed[0]);
+        assert_eq!(
+            retried.crates.iter().find(|c| c.name == "beta"),
+            original.crates.iter().find(|c| c.name == "beta")
+        );
+    }
+    s.completed = None;
     s.log = DONE;
     s.started.clear();
     let (outcome, said, completed_files) = run_site(&mut s);
@@ -4245,7 +4756,7 @@ fn a_remeasure_completes_its_record_and_then_runs_nothing() {
         original.provenance.as_ref().unwrap().key
     );
     assert!(
-        trust_facts::pending_for(&git, &prover, "HEAD")
+        trust_facts::pending_for(&git, &prover, "HEAD", false)
             .unwrap()
             .unwrap()
             .is_empty()
@@ -4258,6 +4769,235 @@ fn a_remeasure_completes_its_record_and_then_runs_nothing() {
     assert!(s.started.is_empty(), "a completed record starts no check");
     assert_eq!(noop_files, filed);
     assert_eq!(filed_facts(&s, &filed[0]).crates, completed.crates);
+}
+
+#[test]
+fn remeasurement_retries_memory_limited_libraries_only_when_asked() {
+    const CAPPED: &str = concat!(
+        "note: trust: memory census: 1 bodies skipped at the memory ceiling; peak 6.2 GiB, ceiling 6.0 GiB\n",
+        "Summary: 4 proved, 0 failed (20 total); reproducible\n",
+        "Coverage: 3/3 eligible function bodies verified (complete)\n",
+    );
+    let mut s = undecided_site();
+    s.ceiling = Ok(true);
+    s.load = None;
+    fs::write(
+        s.repo.join(trust_facts::MEMORY),
+        "alpha\t16.0\t48\t6.0\t12.0\t>\t2026-10-20\n",
+    )
+    .unwrap();
+    git_in(
+        &s.repo,
+        &["commit", "-q", "-am", "record alpha's floor ceiling"],
+    );
+    let (initial, said, files) = run_site(&mut s);
+    assert!(
+        matches!(initial, Outcome::Narrowed(_)),
+        "{initial:?}: {said}"
+    );
+    assert_eq!(s.started, ["beta"], "{said}");
+    let [file] = files.as_slice() else {
+        panic!("{files:?}: {said}")
+    };
+    let original = filed_facts(&s, file);
+    let beta = original.crates.iter().find(|c| c.name == "beta").unwrap();
+
+    s.cfg.scope = Scope::Remeasure;
+    for (stored_status, next_log, expected_exit) in
+        [("REFUSED(memory)", CAPPED, 4), ("CAP-BOUND(<5)", DONE, 0)]
+    {
+        let prior = filed_facts(&s, file);
+        s.cfg.try_refused = false;
+        s.started.clear();
+        let (ordinary, said, _) = run_site(&mut s);
+        assert!(
+            matches!(ordinary, Outcome::Narrowed(_)),
+            "{ordinary:?}: {said}"
+        );
+        a_line_names(&said, "alpha ", &[stored_status]);
+        assert!(s.started.is_empty(), "{said}");
+        assert_eq!(filed_facts(&s, file).crates, prior.crates);
+
+        s.cfg.try_refused = true;
+        s.log = next_log;
+        let (retried, said, replaced) = run_site(&mut s);
+        assert_eq!(s.started, ["alpha"], "{said}");
+        assert_eq!(retried.exit(), expected_exit, "{said}");
+        assert_eq!(replaced, files);
+        let completed = filed_facts(&s, file);
+        assert_eq!(
+            completed.crates.iter().find(|c| c.name == "beta"),
+            Some(beta)
+        );
+    }
+    s.started.clear();
+    let (settled, said, _) = run_site(&mut s);
+    assert_eq!(settled, Outcome::Pass, "{said}");
+    assert!(s.started.is_empty(), "{said}");
+}
+
+#[test]
+fn a_live_remeasurement_enforces_each_crates_measured_floor() {
+    let mut s = undecided_site();
+    let floor = s.repo.join(trust_facts::RATCHET);
+    let rows = |alpha, beta| {
+        format!("alpha\t{alpha}\t20\ttargo 0.0.0-test\nbeta\t{beta}\t20\ttargo 0.0.0-test\n")
+    };
+    let repo = s.repo.clone();
+    let commit = |alpha, beta| {
+        fs::write(&floor, rows(alpha, beta)).unwrap();
+        git_in(&repo, &["commit", "-q", "-am", "adjust floors"]);
+    };
+    commit(6, 4);
+    s.log = "timed_out=2\nSummary: 4 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+    let (first, said, _) = run_site(&mut s);
+    assert_eq!(first, Outcome::Undecided(vec!["alpha".into()]), "{said}");
+
+    // Alpha now measures on its floor of five. Beta still answers to its original four.
+    commit(5, 3);
+    let judged = |site: &Site, update| {
+        trust_facts::run_cmd(
+            &site.repo,
+            trust_facts::TrustCmd::Judge {
+                commit: "HEAD".into(),
+                prover: Some(site.driver.bin.clone()),
+                update,
+                reason: None,
+            },
+        )
+    };
+    let backstops = trust_facts::backstops_beside(&floor);
+    let seed = s.repo.join(trust_facts::COSTS);
+    let outputs = || {
+        [
+            fs::read(&floor).ok(),
+            fs::read(&backstops).ok(),
+            fs::read(&seed).ok(),
+        ]
+    };
+    let before = outputs();
+    s.cfg.scope = Scope::Remeasure;
+    s.cfg.update_ratchet = true;
+    s.log = DONE;
+    for expected_checks in [vec!["alpha"], vec![]] {
+        s.started.clear();
+        let (outcome, said, _) = run_site(&mut s);
+        assert_eq!(s.started, expected_checks, "{said}");
+        assert!(
+            matches!(&outcome, Outcome::Fail(failed) if failed.iter().any(|l| l.contains("beta: floor 4 -> 3"))),
+            "{outcome:?}: {said}"
+        );
+        assert!(!said.contains("alpha: floor 6 -> 5"), "{said}");
+        assert_eq!(outputs(), before);
+        assert_eq!(judged(&s, true), 1);
+        assert_eq!(outputs(), before);
+    }
+    commit(5, 4);
+    s.started.clear();
+    s.cfg.update_ratchet = false;
+    let (repaired, said, _) = run_site(&mut s);
+    assert_eq!(repaired, Outcome::Pass, "{said}");
+    assert!(s.started.is_empty());
+    assert_eq!(judged(&s, false), 0);
+}
+
+#[test]
+fn a_remeasure_that_cannot_complete_its_record_publishes_no_updates() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn receipts(repo: &Path) -> PathBuf {
+        repo.join(".git/aterm-verify/receipts")
+    }
+    fn record(repo: &Path) -> PathBuf {
+        fs::read_dir(receipts(repo))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(trust_facts::FACTS_PREFIX) && !n.contains('.'))
+            })
+            .unwrap()
+    }
+    type DuringCheck = fn(&Path);
+    let cases: &[(&str, Option<DuringCheck>)] = &[
+        (
+            "missing",
+            Some(|repo| fs::remove_file(record(repo)).unwrap()),
+        ),
+        (
+            "not a complete facts record",
+            Some(|repo| fs::write(record(repo), "partial").unwrap()),
+        ),
+        (
+            "could not read original whole-tree record",
+            Some(|repo| fs::write(record(repo), [0xff]).unwrap()),
+        ),
+        (
+            "checkout failed the clean-tree check",
+            Some(|repo| {
+                fs::write(repo.join("crates/alpha/src/lib.rs"), "pub fn changed() {}").unwrap();
+            }),
+        ),
+        ("host", None),
+        (
+            "could not stage",
+            Some(|repo| {
+                fs::set_permissions(receipts(repo), fs::Permissions::from_mode(0o555)).unwrap();
+            }),
+        ),
+    ];
+    for &(cause, during) in cases {
+        if cause == "could not stage" && aterm_uds::peer::our_uid() == 0 {
+            continue; // Root can create the staging file in a read-only directory.
+        }
+        let mut s = undecided_site();
+        let (first, said, _) = run_site(&mut s);
+        assert_eq!(first, Outcome::Undecided(vec!["alpha".into()]), "{said}");
+        let record_path = record(&s.repo);
+        let old_record = fs::read(&record_path).unwrap();
+        let floor = s.repo.join(trust_facts::RATCHET);
+        let backstops = trust_facts::backstops_beside(&floor);
+        let seed = s.repo.join(trust_facts::COSTS);
+        let outputs = || {
+            [
+                fs::read(&floor).ok(),
+                fs::read(&backstops).ok(),
+                fs::read(&seed).ok(),
+            ]
+        };
+        let before = outputs();
+        s.cfg.scope = Scope::Remeasure;
+        s.cfg.update_ratchet = true;
+        s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+        s.started.clear();
+        s.meanwhile = during;
+        if during.is_none() {
+            s.mem.0 += GIB;
+        }
+        let (outcome, said, _) = run_site(&mut s);
+        if cause == "could not stage" {
+            fs::set_permissions(receipts(&s.repo), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(s.started, ["alpha"], "{said}");
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why) if why.contains(cause))
+                && outputs() == before,
+            "{cause}: {outcome:?}, changed floor/backstop/cost seed: {}\n{said}",
+            outputs() != before
+        );
+        match cause {
+            "missing" => assert_eq!(
+                fs::read(record_path).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            ),
+            "not a complete facts record" => assert_eq!(fs::read(record_path).unwrap(), b"partial"),
+            "could not read original whole-tree record" => {
+                assert_eq!(fs::read(record_path).unwrap(), [0xff])
+            }
+            _ => assert_eq!(fs::read(record_path).unwrap(), old_record),
+        }
+    }
 }
 
 #[test]
@@ -4289,12 +5029,12 @@ fn a_remeasure_never_reuses_facts_after_a_source_commit() {
     assert_eq!(filed_facts(&s, &filed[0]), original);
     let prover = trust_facts::Prover::at(&s.driver.bin);
     assert!(
-        trust_facts::pending_for(&git, &prover, "HEAD")
+        trust_facts::pending_for(&git, &prover, "HEAD", false)
             .unwrap()
             .is_err()
     );
     assert_eq!(
-        trust_facts::pending_for(&git, &prover, &measured)
+        trust_facts::pending_for(&git, &prover, &measured, false)
             .unwrap()
             .unwrap(),
         ["alpha"],
@@ -4312,18 +5052,49 @@ fn a_run_files_nothing_for_a_tree_it_did_not_verify() {
     .unwrap();
     let (outcome, said, filed) = run_site(&mut dirty);
     assert_eq!((outcome, filed.len()), (Outcome::Pass, 0), "{said}");
-    assert!(said.contains("FACTS: none"), "{said}");
+    assert!(
+        said.contains("FACTS: none — the checkout failed the clean-tree check"),
+        "{said}"
+    );
 
-    let edits: [fn(&Path); 2] = [
-        |repo| fs::write(repo.join("crates/alpha/src/lib.rs"), "pub fn h() {}\n").unwrap(),
-        |repo| git_in(repo, &["commit", "-q", "--allow-empty", "-m", "meanwhile"]),
+    let mut hidden = site(Scope::WholeTree);
+    git_in(
+        &hidden.repo,
+        &[
+            "update-index",
+            "--assume-unchanged",
+            "crates/alpha/src/lib.rs",
+        ],
+    );
+    let (outcome, said, filed) = run_site(&mut hidden);
+    assert_eq!((outcome, filed.len()), (Outcome::Pass, 0), "{said}");
+    assert!(said.contains("hidden index entries"), "{said}");
+    assert_eq!(
+        tree_state(tmp("no-checkout").path()).unwrap_err(),
+        "Git could not inspect the checkout and its index"
+    );
+
+    type DuringCheck = fn(&Path);
+    let edits: [(DuringCheck, &str); 2] = [
+        (
+            |repo| fs::write(repo.join("crates/alpha/src/lib.rs"), "pub fn h() {}\n").unwrap(),
+            "checkout failed the clean-tree check",
+        ),
+        (
+            |repo| git_in(repo, &["commit", "-q", "--allow-empty", "-m", "meanwhile"]),
+            "HEAD changed during the run",
+        ),
     ];
-    for edit in edits {
+    for (edit, why) in edits {
         let mut s = site(Scope::WholeTree);
         s.meanwhile = Some(edit);
         let (outcome, said, filed) = run_site(&mut s);
         assert_eq!((outcome, filed.len()), (Outcome::Pass, 0), "{said}");
-        assert!(said.contains("FACTS: none"), "{said}");
+        assert!(
+            said.lines()
+                .any(|line| line.starts_with("FACTS: none") && line.contains(why)),
+            "{said}"
+        );
     }
 
     let mut narrow = site(Scope::Packages(vec!["alpha".into()]));
@@ -4905,19 +5676,34 @@ fn the_ceiling_probe_is_kept_per_prover_build() {
     let mut s = site(Scope::Packages(vec!["alpha".into()]));
     s.ceiling = Ok(true);
     run_site(&mut s);
+    let cache = s.cfg.state.as_ref().unwrap().join(CEILING_CACHE);
+    let sibling = cache.with_extension(format!("tsv.{}", std::process::id()));
+    fs::write(&sibling, b"another writer's cache").unwrap();
     run_site(&mut s);
     assert_eq!(s.ceiling_probes, 1);
     fs::write(s.driver.bin.join("trustc"), "trustc, rebuilt").unwrap();
     s.ceiling = Ok(false);
     let (outcome, said, _) = run_site(&mut s);
     assert_eq!((s.ceiling_probes, outcome), (2, Outcome::Pass), "{said}");
-    let kept = fs::read_to_string(s.cfg.state.as_ref().unwrap().join(CEILING_CACHE)).unwrap();
+    let kept = fs::read_to_string(&cache).unwrap();
+    assert_eq!(fs::read(sibling).unwrap(), b"another writer's cache");
     assert_eq!(
         kept.lines().filter(|l| !l.starts_with('#')).count(),
         1,
         "{kept}"
     );
     assert!(kept.ends_with("\tno\n"), "{kept}");
+    fs::remove_file(&cache).unwrap();
+    fs::create_dir(&cache).unwrap();
+    s.ceiling = Ok(true);
+    let driver = s.driver.clone();
+    assert!(driver_ceiling(
+        &mut s,
+        &driver,
+        cache.parent(),
+        &mut Vec::new()
+    ));
+    assert!(cache.is_dir());
 
     let mut unread = site(Scope::Packages(vec!["alpha".into()]));
     unread.ceiling = Err("trustc -Z help exited 1".into());
@@ -4979,6 +5765,67 @@ fn a_vanished_fork_fails_the_whole_tree_run() {
             assert_eq!(outcome, Outcome::Pass, "{said}");
         }
     }
+}
+
+#[test]
+fn reused_whole_tree_facts_check_vanished_libraries_against_current_floors() {
+    let mut s = undecided_site();
+    let (first, said, filed) = run_site(&mut s);
+    assert_eq!(first, Outcome::Undecided(vec!["alpha".into()]), "{said}");
+    let floor = s.repo.join(trust_facts::RATCHET);
+    let original = fs::read_to_string(&floor).unwrap();
+    fs::write(&floor, format!("{original}ghost\t1\t1\ttargo 0.0.0-test\n")).unwrap();
+    git_in(
+        &s.repo,
+        &["commit", "-q", "-am", "add a floor outside the graph"],
+    );
+    let replay = |site: &Site| {
+        trust_facts::run_cmd(
+            &site.repo,
+            trust_facts::TrustCmd::Judge {
+                commit: "HEAD".into(),
+                prover: Some(site.driver.bin.clone()),
+                update: false,
+                reason: None,
+            },
+        )
+    };
+    let vanished = Outcome::Fail(vec!["ghost FORK-VANISHED".into()]);
+    s.cfg.scope = Scope::Remeasure;
+    s.log = DONE;
+    for expected_checks in [&["alpha"][..], &[]] {
+        s.started.clear();
+        let (outcome, said, kept) = run_site(&mut s);
+        assert_eq!(s.started, expected_checks, "{said}");
+        assert_eq!(kept, filed);
+        assert_eq!(outcome, vanished, "{said}");
+        assert_eq!(replay(&s), 1);
+    }
+
+    // An old writer stored a vanished result even though the floors can move independently.
+    s.cfg.scope = Scope::WholeTree;
+    let (fresh, said, kept) = run_site(&mut s);
+    assert_eq!(fresh, vanished, "{said}");
+    assert_eq!(kept, filed);
+    let receipt = s.repo.join(".git/aterm-verify/receipts").join(&filed[0]);
+    let record = fs::read_to_string(&receipt).unwrap();
+    assert!(!record.contains("\nvanished "));
+    let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
+    assert!(!plan.contains("\nvanished "));
+    fs::write(
+        &receipt,
+        record.replacen("\ncrate ", "\nvanished ghost\ncrate ", 1),
+    )
+    .unwrap();
+    fs::write(&floor, original).unwrap();
+    git_in(&s.repo, &["commit", "-q", "-am", "remove the stale floor"]);
+    assert_eq!(replay(&s), 0);
+    s.cfg.scope = Scope::Remeasure;
+    s.started.clear();
+    let (outcome, said, _) = run_site(&mut s);
+    assert!(s.started.is_empty(), "{said}");
+    assert_eq!(outcome, Outcome::Pass, "{said}");
+    assert!(!fs::read_to_string(receipt).unwrap().contains("\nvanished "));
 }
 
 #[test]
@@ -5185,30 +6032,12 @@ fn a_default_run_names_the_root_left_from_before_the_noindex_name() {
     fs::remove_dir_all(&legacy).unwrap();
     std::os::unix::fs::symlink(dir.path(), &legacy).unwrap();
     assert_eq!(legacy_root_note(&cfg), None, "a link is never followed");
-
-    let mine = Path::new("/w/target/trust-gui1");
-    assert_eq!(
-        indexed_root_note(&cfg, &repo.join(OWN_ROOT)),
-        None,
-        "the default"
-    );
-    let note = indexed_root_note(&named, mine);
-    if cfg!(target_os = "macos") {
-        let note = note.expect("an indexed root is named");
-        assert!(note.contains("/w/target/trust-gui1.noindex"), "{note}");
-    } else {
-        assert_eq!(note, None, "Spotlight is macOS's");
-    }
-    assert_eq!(
-        indexed_root_note(&named, Path::new("/w/target/mine.noindex/trust")),
-        None
-    );
 }
 
 #[test]
 fn the_default_target_root_falls_back_only_when_targo_refuses_it() {
     let repo = Path::new("/w/aterm");
-    let cache = Path::new("/h/.cache/aterm-trust-lane");
+    let cache = Path::new("/h/.cache/aterm-trust-lane.noindex");
     let in_repo = |p: &Path| p.starts_with(repo).then(|| refusal("/w/aterm", GO_W));
     let mine = cache.join("aterm-0123");
 
@@ -5235,7 +6064,7 @@ fn the_default_target_root_falls_back_only_when_targo_refuses_it() {
         says_in_order(
             &note,
             &[
-                "/h/.cache/aterm-trust-lane/aterm-0123",
+                "/h/.cache/aterm-trust-lane.noindex/aterm-0123",
                 "/w/aterm/target-trust.noindex",
                 "/w/aterm",
                 "775",
@@ -5256,7 +6085,7 @@ fn the_default_target_root_falls_back_only_when_targo_refuses_it() {
                 "/w/aterm/target-trust.noindex",
                 "/w/aterm",
                 "run: chmod go-w /w/aterm",
-                "/h/.cache/aterm-trust-lane/aterm-0123",
+                "/h/.cache/aterm-trust-lane.noindex/aterm-0123",
                 "/h,",
                 ELSEWHERE_ROOT,
             ]
@@ -5275,19 +6104,22 @@ fn the_default_target_root_falls_back_only_when_targo_refuses_it() {
 fn the_fallback_root_is_the_users_cache_keyed_by_checkout() {
     let home = Some(Path::new("/h"));
     let linux = |xdg: Option<&str>| cache_base(home, xdg.map(Path::new), false);
-    assert_eq!(linux(None), Some("/h/.cache/aterm-trust-lane".into()));
+    assert_eq!(
+        linux(None),
+        Some("/h/.cache/aterm-trust-lane.noindex".into())
+    );
     assert_eq!(
         linux(Some("/x/cache")),
-        Some("/x/cache/aterm-trust-lane".into())
+        Some("/x/cache/aterm-trust-lane.noindex".into())
     );
     assert_eq!(
         linux(Some("x/cache")),
-        Some("/h/.cache/aterm-trust-lane".into()),
+        Some("/h/.cache/aterm-trust-lane.noindex".into()),
         "a relative XDG_CACHE_HOME is ignored"
     );
     assert_eq!(
         cache_base(None, Some(Path::new("/x")), false),
-        Some("/x/aterm-trust-lane".into())
+        Some("/x/aterm-trust-lane.noindex".into())
     );
     assert_eq!(cache_base(Some(Path::new("h")), None, false), None);
     assert_eq!(
@@ -7078,6 +7910,35 @@ fn a_process_that_reads_as_a_trustd_at_the_send_is_never_killed() {
     assert_eq!(status.code(), Some(0), "the trustd ended by a signal");
 }
 
+#[test]
+fn a_sweep_updates_only_its_marked_record() {
+    let d = tmp("trust-lane-kept-record");
+    let parent = d.path().join("slots");
+    let record = parent.join(".check.0");
+    let reached = [(4242, 77)];
+    assert!(!keep_in_record(&record, &reached));
+    assert!(!parent.exists());
+    fs::create_dir(&parent).unwrap();
+    let sibling = parent.join(".new.check.0");
+    fs::write(&sibling, b"another writer's record").unwrap();
+    fs::write(&record, "unmarked\n").unwrap();
+    assert!(!keep_in_record(&record, &reached));
+    assert_eq!(fs::read(&record).unwrap(), b"unmarked\n");
+
+    let mut expected = CheckRecord {
+        nonce: Some(nonce()),
+        ..CheckRecord::default()
+    };
+    fs::write(&record, expected.text()).unwrap();
+    assert!(keep_in_record(&record, &reached));
+    expected.kept.extend(reached);
+    assert_eq!(
+        CheckRecord::parse(&fs::read_to_string(record).unwrap()),
+        expected
+    );
+    assert_eq!(fs::read(sibling).unwrap(), b"another writer's record");
+}
+
 /// A record reads back as written, its lane and root directory with it, the root's words
 /// once it is spawned; an earlier build's (`<pid> <ps start>`), or one with a nonce of
 /// another shape, names no mark, and a lane or directory of another shape is none.
@@ -7675,10 +8536,10 @@ fn a_live_check_and_what_it_left_outside_its_tree_are_ended_by_the_reap() {
     let nonce = nonce();
     let mut cmd = command("/bin/sh");
     cmd.arg("-c")
-        .arg(
-            "(\"$2\" 600 & echo $! > \"$1\"; /bin/sleep 600 & echo $! > \"$3\"); \
-             while :; do /bin/sleep 1; done",
-        )
+        .arg(format!(
+            "(\"$2\" 600 & echo $! > \"$1\"; /bin/sleep 600 & echo $! > \"$3\"); {}",
+            aterm_uds::stand_in_loop::while_alive("/bin/sleep 1")
+        ))
         .arg("sh")
         .arg(&pidfile)
         .arg(readable("/bin/sleep"))
@@ -7867,7 +8728,10 @@ fn an_earlier_builds_record_never_signals_the_process_at_its_pid() {
     let pidfile = d.path().join("orphan.pid");
     let mut cmd = command("/bin/sh");
     cmd.arg("-c")
-        .arg("(/bin/sleep 600 & echo $! > \"$1\"); while :; do /bin/sleep 1; done")
+        .arg(format!(
+            "(/bin/sleep 600 & echo $! > \"$1\"); {}",
+            aterm_uds::stand_in_loop::while_alive("/bin/sleep 1")
+        ))
         .arg("sh")
         .arg(&pidfile)
         .stdin(Stdio::null())
@@ -8725,6 +9589,97 @@ fn a_check_clears_the_spent_stamp_of_its_slot() {
     );
 }
 
+#[test]
+fn a_reused_slot_credits_only_the_grade_written_by_its_current_check() {
+    let d = tmp("trust-slot-grade");
+    let root = d.path().join("root");
+    let grade = single_proved_record("alpha", true);
+    fs::write(d.path().join("alpha.ndjson"), grade).unwrap();
+    let driver = script_driver(
+        d.path(),
+        r#"case " $* " in *' --features sealed '*) exit 0 ;; esac
+/bin/mkdir -p "$CARGO_TARGET_DIR/trust/obligations" &&
+exec /bin/cp alpha.ndjson "$CARGO_TARGET_DIR/trust/obligations/alpha.ndjson""#,
+    );
+    let (sock, keeper) = quiet_keeper(d.path());
+    let mut real = real_checks(
+        d.path(),
+        &root,
+        &driver,
+        &keeper,
+        &sock,
+        aterm_uds::process::process_serial,
+    );
+    let mut credit = crate::trust_credit::Credit::default();
+    for row in ["alpha", "alpha+sealed"] {
+        let mut j = job(row);
+        j.log = d.path().join(format!("{row}.log"));
+        j.argv = vec!["-p".into(), "alpha".into(), "--lib".into()];
+        if row == "alpha+sealed" {
+            j.argv.extend(["--features".into(), "sealed".into()]);
+        }
+        let (_, ended) = run_to_end(&mut real, &mut j);
+        assert_eq!(ended.code, 0);
+        credit.add(
+            row,
+            crate::trust_credit::read_record(&j.target, package_identity(row)),
+        );
+        reap_until_gone(
+            &root,
+            &root.join(".check.0"),
+            "the completed check held its slot",
+            || {},
+        );
+    }
+    assert_eq!(credit.total.calculus, 1);
+    assert_eq!(credit.absent, ["alpha+sealed"]);
+    assert!(credit.refused.is_empty());
+}
+
+#[test]
+fn a_check_preserves_unexpected_grade_entries_and_refuses_to_start() {
+    let d = tmp("trust-slot-grade-entries");
+    let root = d.path().join("root");
+    let slot = root.join("j0");
+    let external = d.path().join("external");
+    let outside_grade = crate::trust_credit::record_path(&external, "alpha");
+    fs::create_dir_all(outside_grade.parent().unwrap()).unwrap();
+    fs::write(&outside_grade, "keep").unwrap();
+    let driver = script_driver(d.path(), "echo started > started");
+    let (sock, keeper) = quiet_keeper(d.path());
+    let mut real = real_checks(
+        d.path(),
+        &root,
+        &driver,
+        &keeper,
+        &sock,
+        aterm_uds::process::process_serial,
+    );
+    for (i, relative) in [
+        "trust",
+        "trust/obligations",
+        "trust/obligations/alpha.ndjson",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let entry = slot.join(relative);
+        fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(external.join(relative), &entry).unwrap();
+        let mut j = job("alpha+sealed");
+        j.log = d.path().join(format!("check-{i}.log"));
+        let Err(error) = real.start(&mut j) else {
+            panic!("started through {relative}")
+        };
+        assert!(error.to_string().contains("alpha.ndjson"), "{error}");
+        assert!(entry.is_symlink());
+        assert_eq!(fs::read_to_string(&outside_grade).unwrap(), "keep");
+        assert!(!root.join(".check.0").exists());
+        fs::remove_file(entry).unwrap();
+    }
+    assert!(!d.path().join("started").exists());
+}
+
 /// A check whose root cannot be identified is ended at its gate ([`GATE`]), never started,
 /// and its record goes.
 #[test]
@@ -9134,6 +10089,9 @@ fn a_check_never_starts_over_another_runs_record() {
     owner_dirs(&root.join("j0")).unwrap();
     let foreign = marked_record(&nonce(), None, &root);
     fs::write(root.join(".check.0"), &foreign).unwrap();
+    let grade = crate::trust_credit::record_path(&root.join("j0"), "alpha");
+    fs::create_dir_all(grade.parent().unwrap()).unwrap();
+    fs::write(&grade, "held grade").unwrap();
     let driver = script_driver(d.path(), "exit 0");
     let (sock, keeper) = quiet_keeper(d.path());
     let mut real = real_checks(
@@ -9152,6 +10110,7 @@ fn a_check_never_starts_over_another_runs_record() {
     };
     assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
     assert_eq!(fs::read_to_string(root.join(".check.0")).unwrap(), foreign);
+    assert_eq!(fs::read_to_string(grade).unwrap(), "held grade");
 }
 
 /// What a gone root left running a program from the slot carries its mark: the reap ends
@@ -9827,6 +10786,7 @@ fn judged_lines() -> [(&'static str, &'static str); trust_facts::JUDGED.len() + 
             "targo trust: COULD NOT RUN: resource admission refused the solver",
             "",
         ),
+        ("Result: COULD NOT RUN (outcome not-reproducible)", ""),
         (REFUSED, ""),
         ("trustd: crash epoch is not CLEAN", REFUSED),
         ("trustd: another trustd owns /tmp/t.sock", REFUSED),
@@ -9835,6 +10795,10 @@ fn judged_lines() -> [(&'static str, &'static str); trust_facts::JUDGED.len() + 
             REFUSED,
         ),
         (SUMMARY, ""),
+        (
+            "Failed rows: 4 failed, 2 of them unproved with NO counterexample: nothing refuted them",
+            "Summary: 0 proved, 4 failed (4 total); not-reproducible",
+        ),
         (
             "Coverage: 3/3 eligible function bodies verified (complete)",
             SUMMARY,
@@ -10026,6 +10990,103 @@ fn a_log_past_its_cap_keeps_every_line_the_judge_reads() {
     let stored = store_log_with(&mut from, Full(10), 1, last, &trust_facts::judged_line);
     assert!(from.is_empty(), "the output was read to its end");
     assert_eq!((stored.left_out, stored.refused), (0, true), "{stored:?}");
+}
+
+#[test]
+fn storage_notes_preserve_an_unterminated_lines_original_byte_limit() {
+    struct Output<'a> {
+        bytes: &'a [u8],
+        stopped: bool,
+    }
+
+    impl std::io::Read for Output<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.bytes.read(buf)
+        }
+    }
+
+    impl CheckOutput for Output<'_> {
+        fn more_before(&mut self, _: Instant) -> bool {
+            true
+        }
+
+        fn cut_short(&self) -> bool {
+            self.stopped
+        }
+    }
+
+    let limit = usize::try_from(trust_facts::LINE_MAX).unwrap();
+    let tally = "Stop causes: rss-backstop=1;";
+    let boundary = format!("{tally}{}", "x".repeat(limit - tally.len()));
+    for suffix in ["", "x", "\n"] {
+        let final_line = format!("{boundary}{suffix}");
+        let raw = format!("{DONE}noise\n{final_line}");
+        let facts = measured(&raw);
+        assert_eq!(facts.rss, u64::from(suffix.is_empty()));
+        for (cap, tail, stopped) in [
+            (u64::MAX, 0, false),
+            (u64::MAX, 0, true),
+            (0, 0, false),
+            (0, trust_facts::LINE_MAX, true),
+        ] {
+            let input = Output {
+                bytes: raw.as_bytes(),
+                stopped,
+            };
+            let mut compressed = Vec::new();
+            let stored = store_log(input, &mut compressed, cap, tail);
+            let kept = unzstd(&compressed);
+            assert_eq!(measured(&kept), facts, "{cap} {tail} {stopped} {suffix:?}");
+            assert_eq!(stored.stopped, stopped);
+            assert_eq!(kept.contains(&stopped_note()), stopped);
+            if cap == 0 {
+                assert!(kept.contains(&left_out_note(
+                    stored.left_out,
+                    stored.lines_left_out,
+                    cap,
+                    tail
+                )));
+            } else if !stopped {
+                assert!(kept == raw);
+            }
+            if suffix.is_empty() {
+                assert!(kept.ends_with(&final_line));
+            }
+        }
+    }
+}
+
+#[test]
+fn an_omitted_long_line_counts_toward_the_stored_logs_tail() {
+    let long = format!(
+        "{}\n",
+        "x".repeat(usize::try_from(trust_facts::LINE_MAX).unwrap())
+    );
+    let judged = "Stop causes: rss-backstop=1\n";
+    let raw = format!("old\n{judged}near\n{long}end\n");
+    // A small tail excludes both text lines. At exactly the distance from "near", it stays.
+    let distance = len64(long.as_bytes()) + len64(b"near\nend\n");
+    for (tail, near) in [(8, false), (distance - 1, false), (distance, true)] {
+        let mut compressed = Vec::new();
+        let stored = store_log(raw.as_bytes(), &mut compressed, 0, tail);
+        let kept = unzstd(&compressed);
+        let body = kept
+            .strip_suffix(&left_out_note(
+                stored.left_out,
+                stored.lines_left_out,
+                0,
+                tail,
+            ))
+            .unwrap();
+        let near_line = if near { "near\n" } else { "" };
+        assert_eq!(body, format!("{judged}{near_line}end\n"));
+        assert_eq!(stored.lines_left_out, if near { 2 } else { 3 });
+        assert_eq!(
+            len64(body.as_bytes()) + stored.left_out,
+            len64(raw.as_bytes())
+        );
+        assert_eq!(measured(&kept), measured(&raw));
+    }
 }
 
 /// Output read from `text`, whose read fails once it is all read.
@@ -10506,6 +11567,73 @@ fn a_run_removes_the_stored_log_a_run_before_it_left() {
     assert_eq!((outcome, filed.len()), (Outcome::Pass, 1), "{said}");
 }
 
+#[test]
+fn a_check_of_a_versioned_row_retires_only_superseded_receipts() {
+    let mut s = site(Scope::Packages(vec!["alpha@1.0.0".into()]));
+    s.libraries.push("alpha@2.0.0-pre");
+    let logs = root_of(&s).join("logs");
+    owner_dirs(&logs).unwrap();
+    let retired = "alpha@0.9.0-pre.log.2+build.007";
+    for spec in [
+        retired,
+        "alpha@2.0.0-pre",
+        "alpha+serde@0.9.0",
+        "other@0.9.0",
+    ] {
+        trust_facts::testing::write_log(&logs.join(format!("{spec}.log")), spec);
+    }
+    let report = logs.join(format!("{retired}.log.report"));
+    fs::create_dir(&report).unwrap();
+    let custom = logs.join(format!("{retired}.log.notes"));
+    fs::write(&custom, "annotation").unwrap();
+    let notes = logs.join("alpha@1.0.0.log.notes.log.report/nested");
+    fs::create_dir_all(&notes).unwrap();
+    let sibling_notes = logs.join("alpha@2.0.0-pre.log.notes.log.report/nested");
+    fs::create_dir_all(&sibling_notes).unwrap();
+    let lookalikes = [
+        notes.join("annotation"),
+        sibling_notes.join("annotation"),
+        logs.join("alpha@local-notes.log.zst"),
+        logs.join("alpha@1.0.0-01.log.rc"),
+    ];
+    for path in &lookalikes {
+        fs::write(path, "keep").unwrap();
+    }
+    let log = |spec: &str| {
+        let mut out = Vec::new();
+        let code = trust_facts::print_log(&logs, spec, &mut out, &mut Vec::new());
+        (code, String::from_utf8(out).unwrap())
+    };
+    assert_eq!(log(retired), (0, retired.to_string()));
+    let (_, said, _) = run_site(&mut s);
+    assert_eq!(s.started, ["alpha@1.0.0"], "{said}");
+    assert_eq!(log(retired), (1, String::new()), "{said}");
+    assert!(!report.exists(), "{said}");
+    assert_eq!(fs::read_to_string(&custom).unwrap(), "annotation");
+    for path in &lookalikes {
+        assert_eq!(
+            fs::read_to_string(path).ok().as_deref(),
+            Some("keep"),
+            "{}",
+            path.display()
+        );
+    }
+    assert!(log("alpha@1.0.0").1.contains("Summary:"), "{said}");
+    for spec in ["alpha@2.0.0-pre", "alpha+serde@0.9.0", "other@0.9.0"] {
+        assert_eq!(log(spec), (0, spec.to_string()), "{said}");
+    }
+    s.libraries.push("alpha@local-notes");
+    s.cfg.scope = Scope::Packages(vec!["alpha@local-notes".into()]);
+    let (outcome, said, _) = run_site(&mut s);
+    assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{said}");
+    assert!(said.contains("invalid Cargo version"), "{said}");
+    assert_eq!(s.started, ["alpha@1.0.0"], "{said}");
+    assert_eq!(
+        fs::read_to_string(logs.join("alpha@local-notes.log.zst")).unwrap(),
+        "keep"
+    );
+}
+
 /// DC-08: `trust log` reads the `logs` folder of the target root a run with the same
 /// `--target-root` uses: one named absolute, or relative to the checkout, and refuses one
 /// `targo trust` would refuse. NEGATIVE CONTROL: a root under a folder anyone may write is
@@ -10530,4 +11658,55 @@ fn the_log_verb_reads_the_runs_own_log_folder() {
     }
     let refused = log_dir(base.path(), Some(open.join("root").as_path()));
     assert!(refused.is_err(), "{refused:?}");
+}
+
+#[test]
+fn a_calculus_regression_is_part_of_the_final_live_verdict() {
+    const ALL_PROVED: &str = "Summary: 20 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+    const BELOW_CRATE_FLOOR: &str = "Summary: 0 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+    for (log, expected_failures) in [(ALL_PROVED, 1), (BELOW_CRATE_FLOOR, 2)] {
+        let mut s = site(Scope::WholeTree);
+        // The ordinary proof floor would rise from 5 to 20 on this branch.
+        s.cfg.update_ratchet = log == ALL_PROVED;
+        let floor = fs::read(s.repo.join(trust_facts::RATCHET)).unwrap();
+        fs::write(
+            s.repo.join(crate::trust_credit::EPOCHS),
+            "1\tproved\tunvalidated-encoder\t1\trequire one calculus proof\n",
+        )
+        .unwrap();
+        git_in(&s.repo, &["add", "."]);
+        git_in(&s.repo, &["commit", "-q", "-m", "positive calculus floor"]);
+        s.log = log;
+        let (outcome, said, filed) = run_site(&mut s);
+        let Outcome::Fail(failed) = outcome else {
+            panic!("{outcome:?}: {said}")
+        };
+        assert_eq!(failed.len(), expected_failures, "{said}");
+        assert!(
+            failed.iter().any(|f| f.contains("CREDIT-REGRESSED")),
+            "{said}"
+        );
+        assert_eq!(
+            filed.len(),
+            1,
+            "readable measurements are still filed: {said}"
+        );
+        assert_eq!(
+            fs::read(s.repo.join(trust_facts::RATCHET)).unwrap(),
+            floor,
+            "{said}"
+        );
+        assert!(!s.repo.join(trust_facts::BACKSTOPS).exists(), "{said}");
+        assert!(!s.repo.join(trust_facts::COSTS).exists(), "{said}");
+        let verdicts: Vec<_> = said
+            .lines()
+            .filter(|line| line.starts_with("VERDICT:"))
+            .collect();
+        assert_eq!(verdicts.len(), 1, "{said}");
+        assert!(verdicts[0].starts_with("VERDICT: FAIL"), "{said}");
+        assert!(
+            failed.iter().all(|failure| verdicts[0].contains(failure)),
+            "{said}"
+        );
+    }
 }

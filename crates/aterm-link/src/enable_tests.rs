@@ -4303,6 +4303,102 @@ fn the_launchd_failure_hint_names_what_was_written() {
         written.split(" (written ").next(),
         "a unit that writes broker.err is read the same way"
     );
+    // A dated line (`aterm_uds::job_log::line`) is quoted without its date, and one that is only
+    // a date is as blank as an empty one: the line before it is the last word.
+    std::fs::write(
+        dir.join("broker.err"),
+        "2026-11-17T09:41:07Z aterm link broker: open bus.log: refused\n\
+         2026-11-17T09:41:08Z\n2026-11-17T09:41:09Z \n",
+    )
+    .expect("dated");
+    assert!(
+        supervisor_last_word(dir)
+            .is_some_and(|last| last.ends_with("ago: aterm link broker: open bus.log: refused")),
+        "{:?}",
+        supervisor_last_word(dir)
+    );
+    std::fs::write(dir.join("broker.err"), "2026-11-17T09:41:08Z\n").expect("a date alone");
+    assert_eq!(
+        supervisor_last_word(dir),
+        None,
+        "a date alone is not a word"
+    );
+}
+
+/// A broker job's definition and its stand-in in `root`.
+fn job_paths(root: &Path) -> Paths {
+    Paths {
+        home: PathBuf::from("/Users//example"),
+        login_home: Some(PathBuf::from("/Users//example")),
+        root: root.to_path_buf(),
+        aterm: "/Users//example/.local/bin/aterm".to_string(),
+        fleet: "local".to_string(),
+        config: None,
+        rendezvous: None,
+        durability: None,
+    }
+}
+
+/// The full name of [`the_fabric_jobs_log_stays_under_the_bound_through_a_burst_of_refused_attaches`].
+const FABRIC_BURST: &str =
+    "enable::tests::the_fabric_jobs_log_stays_under_the_bound_through_a_burst_of_refused_attaches";
+
+/// The line astream's broker writes to its standard error for each refused attach.
+const REFUSED_ATTACH: &str =
+    "astream-broker: warn: refused Attach for grant 7: the grant was revoked";
+
+/// **THE FABRIC JOB'S LOG STAYS UNDER THE BOUND THROUGH A BURST OF REFUSED ATTACHES.** A
+/// stand-in broker (this binary run again in a scratch root, its standard output and error opened
+/// as the plist names them, or as the `systemd --user` unit does, standard output then the
+/// journal) keeps its job's files (`keep_broker_log` of its socket, the broker verb's first step)
+/// and writes astream's `refused Attach for grant` line straight to standard error about twice
+/// the cap's worth: the kept log's thread cuts `broker.err` back under `job_log::CAP`, saying so.
+/// NEGATIVE CONTROL: the same burst with nothing kept grows `broker.err` past the cap.
+#[test]
+fn the_fabric_jobs_log_stays_under_the_bound_through_a_burst_of_refused_attaches() {
+    use aterm_uds::job_log::{seam, CAP};
+    if let Some((stage, dir)) = seam::stage() {
+        let p = job_paths(&dir);
+        let outputs = if stage.ends_with("unit") {
+            seam::unit_outputs(&p.unit_text())
+        } else {
+            seam::plist_outputs(&p.plist_text())
+        };
+        seam::bound_every(std::time::Duration::from_millis(100));
+        seam::open_as_service_manager(&outputs).unwrap();
+        if stage.starts_with("kept") {
+            let kept = keep_broker_log(&p.sock());
+            assert_eq!(kept.stdout(), outputs.stdout.is_some());
+            assert!(kept.stderr());
+        }
+        for _ in 0..seam::BURST {
+            eprintln!("{REFUSED_ATTACH}");
+        }
+        if stage.starts_with("kept") {
+            assert!(
+                seam::until_bounded(&outputs.files()),
+                "the kept log stayed past the cap for a minute"
+            );
+        }
+        std::process::exit(0);
+    }
+    let scratch = crate::test_scratch_dir("job-log");
+    for (stage, control) in [("kept", "unkept"), ("kept-unit", "unkept-unit")] {
+        let run = |stage: &str| {
+            let dir = scratch.path().join(stage);
+            std::fs::create_dir(&dir).unwrap();
+            aterm_uds::job_log::seam::rerun(FABRIC_BURST, stage, &dir).unwrap();
+            std::fs::read_to_string(dir.join("broker.err")).unwrap()
+        };
+        let kept = run(stage);
+        assert!(kept.len() as u64 <= CAP, "{stage}: {} > {CAP}", kept.len());
+        // A refusal written while the thread cuts can land before the cut's own line.
+        assert!(
+            kept.contains("was cut here"),
+            "{stage}: the thread's cut says so"
+        );
+        assert!(run(control).len() as u64 > CAP, "{control} is unbounded");
+    }
 }
 
 #[test]
@@ -5676,15 +5772,23 @@ fn an_instance_replaced_after_the_listing_is_asked_with_its_own_token() {
         std::thread::spawn(move || {
             let (conn, _) = aterm_uds::accept(
                 &listener,
-                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptWait::Until(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
                 aterm_uds::AcceptedMode::Blocking,
             )
-            .expect("accept");
+            .expect("accept within its one-minute hang detector");
+            conn.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                .expect("bound the required requests");
+            conn.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                .expect("bound the scripted reply");
             let mut lines = BufReader::new(conn.try_clone().expect("clone"));
             let mut seen = Vec::new();
             for _ in 0..2 {
                 let mut line = String::new();
-                lines.read_line(&mut line).expect("a request line");
+                assert_ne!(
+                    lines.read_line(&mut line).expect("a request line"),
+                    0,
+                    "the instance connection ended before both requests"
+                );
                 seen.push(line);
             }
             (&conn).write_all(reply.as_bytes()).expect("reply");
@@ -5720,6 +5824,7 @@ fn an_instance_replaced_after_the_listing_is_asked_with_its_own_token() {
 /// requests.
 fn prove_against(name: &str, replies: &[&str]) -> (Result<u64, String>, Vec<String>) {
     use std::io::{BufRead, BufReader, Write};
+    assert!(crate::subject::is_session_id("t0000000001"));
     let scratch = crate::test_scratch_dir(name);
     let dir = scratch.path();
     let sock = dir.join("a.sock");
@@ -5729,27 +5834,45 @@ fn prove_against(name: &str, replies: &[&str]) -> (Result<u64, String>, Vec<Stri
     let server = std::thread::spawn(move || {
         let (listing, _) = aterm_uds::accept(
             &listener,
-            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptWait::Until(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
             aterm_uds::AcceptedMode::Blocking,
         )
-        .expect("accept the listing");
+        .expect("accept the listing within its one-minute hang detector");
+        listing
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .expect("bound the required listing requests");
+        listing
+            .set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .expect("bound the listing reply");
         let mut lines = BufReader::new(listing.try_clone().expect("clone"));
         for _ in 0..2 {
-            lines
-                .read_line(&mut String::new())
-                .expect("AUTH, then sessions");
+            assert_ne!(
+                lines
+                    .read_line(&mut String::new())
+                    .expect("AUTH, then sessions"),
+                0,
+                "the listing connection ended before AUTH and sessions"
+            );
         }
         (&listing)
             .write_all(b"OK 1\n0 t0000000001 - alive zsh\n")
             .expect("list");
         let (conn, _) = aterm_uds::accept(
             &listener,
-            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptWait::Until(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
             aterm_uds::AcceptedMode::Blocking,
         )
-        .expect("accept the proof");
+        .expect("accept the proof within its one-minute hang detector");
+        conn.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .expect("bound the required proof requests");
+        conn.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .expect("bound the proof replies");
         let mut lines = BufReader::new(conn.try_clone().expect("clone"));
-        lines.read_line(&mut String::new()).expect("AUTH");
+        assert_ne!(
+            lines.read_line(&mut String::new()).expect("AUTH"),
+            0,
+            "the proof connection ended before AUTH"
+        );
         let mut seen = Vec::new();
         for reply in replies {
             let mut line = String::new();

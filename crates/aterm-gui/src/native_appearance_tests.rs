@@ -418,6 +418,10 @@ fn assert_role_contract(what: &str, r: NativeRoles) {
             "{what}: danger on the {on}"
         );
         assert!(
+            contrast_ratio(r.needs_person, backdrop) >= ACCENT_INK_FLOOR,
+            "{what}: needs-person mark on the {on}"
+        );
+        assert!(
             contrast_ratio(r.success, backdrop) >= 4.5,
             "{what}: success on the {on}"
         );

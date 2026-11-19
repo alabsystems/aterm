@@ -21,6 +21,16 @@ fn scratch(label: &str) -> Scratch {
     }
 }
 
+/// A program that ignores `SIGTERM` and runs until it is killed, or until this test binary is
+/// gone ([`aterm_uds::stand_in_loop::while_alive`]): the warm runs it in a session of its own.
+#[cfg(unix)]
+fn ignoring_term() -> String {
+    format!(
+        "#!/bin/sh\ntrap '' TERM\n{}\n",
+        aterm_uds::stand_in_loop::while_alive("sleep 1")
+    )
+}
+
 fn install(layout: &Layout, program: &str, build: u64, script: &str) {
     let dir = layout.build_dir(program, build);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -839,8 +849,9 @@ fn the_warm_closes_stdin_at_the_hold_and_kills_the_group_at_the_deadline() {
         2_001_281,
         &format!(
             "#!/bin/sh\ntrap '' TERM\nsleep 120 &\necho $! > '{}/grandchild.tmp'\n\
-             mv '{0}/grandchild.tmp' '{0}/grandchild'\nwhile :; do sleep 1; done\n",
-            marks.display()
+             mv '{0}/grandchild.tmp' '{0}/grandchild'\n{1}\n",
+            marks.display(),
+            aterm_uds::stand_in_loop::while_alive("sleep 1")
         ),
     );
     let child = spawn();
@@ -970,12 +981,7 @@ fn each_warm_is_one_log_line_and_a_stale_build_is_none() {
         run(2_001_280, &no_env, &home, Duration::from_secs(120)),
         Some(Ended::Exit(3))
     );
-    install(
-        layout,
-        "claude",
-        2_001_281,
-        "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n",
-    );
+    install(layout, "claude", 2_001_281, &ignoring_term());
     assert_eq!(
         run(2_001_281, &no_env, &home, Duration::from_millis(300)),
         Some(Ended::Killed)
@@ -1094,12 +1100,7 @@ fn a_warm_holds_its_build_until_the_program_ended_on_its_own() {
         &layout.build_dir("claude", 2_001_290)
     ));
 
-    install(
-        layout,
-        "claude",
-        2_001_291,
-        "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n",
-    );
+    install(layout, "claude", 2_001_291, &ignoring_term());
     assert_eq!(
         run(2_001_291, Duration::from_millis(300)),
         Some(Ended::Killed)

@@ -405,6 +405,63 @@ impl Mac {
         }
     }
 
+    /// This Mac with its `bus.log` opened again as astream opens a log whose identity sidecar does
+    /// not read (`logid::settle`'s `Prior::Unreadable`): every record at its offset, under another
+    /// id at generation 0 with no lineage, guarded under the same secret, aterm's rules set again.
+    /// Every other holder of its broker (a clone of this Mac, a socket serving it) goes first.
+    pub(crate) fn reminted(self) -> Self {
+        self.reopened("bus.log", true)
+    }
+
+    /// This Mac serving a log set aside: a `bus.log` of its own beside the one it served, empty,
+    /// under another id, guarded under the same secret with aterm's rules; its state dir is the
+    /// one it kept ([`Mac::link_state`]). Every other holder of its broker goes first.
+    pub(crate) fn set_aside(self) -> Self {
+        self.reopened("aside.log", false)
+    }
+
+    fn reopened(self, log: &str, rot: bool) -> Self {
+        let Self {
+            key,
+            node,
+            secret,
+            broker,
+            carry_down,
+            dir,
+        } = self;
+        drop(broker);
+        let path = dir.path().join(log);
+        if rot {
+            std::fs::write(astream_broker::identity_path(&path), b"not an identity")
+                .expect("the identity sidecar rotted");
+        }
+        let give_up = Instant::now() + MUST;
+        let broker = loop {
+            match Broker::open_guarded_with(
+                path.clone(),
+                secret.clone(),
+                astream_broker::Durability::Relaxed,
+            ) {
+                Ok(broker) => break broker,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && Instant::now() < give_up => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("{log} did not open again: {e}"),
+            }
+        };
+        broker
+            .set_retention(crate::broker_rules::default_rules())
+            .expect("aterm's rules");
+        Self {
+            key,
+            node,
+            secret,
+            broker: Arc::new(broker),
+            carry_down,
+            dir,
+        }
+    }
+
     /// Where this Mac's fabric bridge keeps its state, beside its `bus.log`, as aterm launches it
     /// ([`BRIDGE_STATE_DIR`]): what its node service's own-inbox move reads.
     pub(crate) fn link_state(&self) -> std::path::PathBuf {

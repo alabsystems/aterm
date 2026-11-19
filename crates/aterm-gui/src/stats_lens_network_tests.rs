@@ -141,6 +141,7 @@ fn render_presence(
         oy: 0.0,
         draw: true,
         line_tab: 0.0,
+        chips: None,
         boxes: Vec::new(),
     };
     (section.forms[0].draw)(

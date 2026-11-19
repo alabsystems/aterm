@@ -719,10 +719,12 @@ impl RepositoryPass {
             },
         );
         if waiting {
-            let mut candidate = record.clone();
-            candidate.repositories = Some(state);
-            self.persist(&mut candidate)?;
-            *record = candidate;
+            if record.repositories.as_ref() != Some(&state) {
+                let mut candidate = record.clone();
+                candidate.repositories = Some(state);
+                self.persist(&mut candidate)?;
+                *record = candidate;
+            }
             return Ok(Admission::Waiting);
         }
         state.version.attempt = state

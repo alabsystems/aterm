@@ -389,7 +389,9 @@ fn here_takes_plain_anywhere_and_never_with_a_baseline_file() {
 
 /// `--name` takes a bare swarm label beside `--plain` alone (it reaches the plain run, which
 /// without root ends on the other class); free text, a second `--name`, or `--name` on a
-/// baseline file's run is the usage refusal, before anything runs.
+/// baseline file's run is the usage refusal, before anything runs. So is
+/// `--restore-name-rule` without `--plain` or beside `--name-rule-only`, which puts the rule
+/// back by itself.
 #[test]
 fn here_takes_name_with_plain_alone_and_only_a_bare_swarm_label() {
     let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
@@ -400,6 +402,13 @@ fn here_takes_name_with_plain_alone_and_only_a_bare_swarm_label() {
         &["apply", "--plain", "--name", "m42"][..],
         &["--name", "m7", "apply", "--plain"],
         &["apply", "--plain", "--leave-developer-mode"],
+        &["apply", "--plain", "--restore-name-rule"],
+        &[
+            "--restore-name-rule",
+            "apply",
+            "--plain",
+            "--root-steps-only",
+        ],
         &[
             "apply",
             "--plain",
@@ -428,6 +437,14 @@ fn here_takes_name_with_plain_alone_and_only_a_bare_swarm_label() {
         &["apply", "--plain", "--name", "m4", "--name", "m5"],
         &["apply", "/b/clt.toml", "--name", "m42"],
         &["apply", "/b/clt.toml", "--leave-developer-mode"],
+        &["apply", "--restore-name-rule"],
+        &["apply", "/b/clt.toml", "--restore-name-rule"],
+        &[
+            "apply",
+            "--plain",
+            "--name-rule-only",
+            "--restore-name-rule",
+        ],
         &["apply", "--plain", "--nickname", "Dog"],
         &["apply", "--plain", "--name", "m85", "--nickname"],
         &["apply", "--plain", "--name", "m85", "--nickname", "--bad"],

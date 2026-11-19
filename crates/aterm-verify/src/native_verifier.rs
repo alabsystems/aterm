@@ -87,13 +87,13 @@ pub fn build_command(root: &Path, targo: &Path, plan: &NativeBuildPlan) -> Resul
 }
 
 /// Build the checkout's verifier without running it and return Cargo's exact reported image.
-/// The build stops once `stopped` reads true (read at least every
-/// [`aterm_uds::deadline::STOP_TICK`]): its process group is asked to end (`SIGTERM`), it is
-/// not awaited, and nothing it wrote is read.
+/// While the compiler child is running, `stopped` is polled every
+/// [`aterm_uds::deadline::STOP_TICK`]. An observed stop asks its unreaped process group to end
+/// (`SIGTERM`, on Unix), returns without waiting, and does not inspect its output.
 ///
 /// # Errors
-/// Preparation, launch, compilation or unambiguous executable identification fails, or the
-/// build was stopped.
+/// Preparation, launch, complete output capture, compilation or unambiguous executable
+/// identification fails, or the build was stopped.
 pub fn build(
     root: &Path,
     targo: &Path,
@@ -101,14 +101,10 @@ pub fn build(
     stopped: &mut dyn FnMut() -> bool,
 ) -> Result<PathBuf, String> {
     let mut command = build_command(root, targo, plan)?;
-    let started = |error: std::io::Error| {
-        format!(
-            "{} verifier bootstrap did not start: {error}",
-            targo.display()
-        )
-    };
+    let failed =
+        |error: std::io::Error| format!("{} verifier bootstrap failed: {error}", targo.display());
     let output = output_unless(&mut command, stopped)
-        .map_err(started)?
+        .map_err(failed)?
         .ok_or("the landing was interrupted while it built the checkout's verifier")?;
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
     if !output.status.success() {
@@ -119,37 +115,28 @@ pub fn build(
 }
 
 /// Run `command`, which leads a process group of its own, to its end, its stdout and stderr
-/// captured whole; `None` where `stopped` read true first (read at least every
-/// [`aterm_uds::deadline::STOP_TICK`]): the group was then asked to end (`SIGTERM`) and nothing
-/// was awaited.
+/// captured whole. While the child is running, `stopped` is polled every
+/// [`aterm_uds::deadline::STOP_TICK`]. An observed stop returns `None` without waiting or
+/// inspecting output, after asking the unreaped process group to end (`SIGTERM`, on Unix).
 ///
 /// # Errors
-/// It did not start, or could not be waited on.
+/// It did not start, could not be waited on, or either output stream could not be captured
+/// completely (including a failed reader thread).
 pub(crate) fn output_unless(
     command: &mut Command,
     stopped: &mut dyn FnMut() -> bool,
 ) -> std::io::Result<Option<std::process::Output>> {
-    use std::io::Read as _;
     command
         .stdout(aterm_uds::spawnfd::Stdio::piped())
         .stderr(aterm_uds::spawnfd::Stdio::piped());
     let mut child = command.spawn()?;
-    let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut stream) = stream {
-                let _ = stream.read_to_end(&mut bytes);
-            }
-            bytes
-        })
-    };
-    let stdout = drain(
+    let stdout = drain_capture(
         child
             .stdout
             .take()
             .map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
     );
-    let stderr = drain(
+    let stderr = drain_capture(
         child
             .stderr
             .take()
@@ -177,12 +164,46 @@ pub(crate) fn output_unless(
         }
         exit.wait(aterm_uds::deadline::STOP_TICK);
     };
-    let joined = |reader: std::thread::JoinHandle<Vec<u8>>| reader.join().unwrap_or_default();
+    let (stdout, stderr) = collect_captures(stdout, stderr)?;
     Ok(Some(std::process::Output {
         status,
-        stdout: joined(stdout),
-        stderr: joined(stderr),
+        stdout,
+        stderr,
     }))
+}
+
+type Capture = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
+
+fn drain_capture(stream: Option<Box<dyn std::io::Read + Send>>) -> Capture {
+    use std::io::Read as _;
+    std::thread::spawn(move || {
+        let mut stream = stream.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "capture pipe is unavailable",
+            )
+        })?;
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn join_capture(reader: Capture, name: &str) -> std::io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| std::io::Error::other(format!("{name} capture reader panicked")))?
+        .map_err(|error| {
+            std::io::Error::new(error.kind(), format!("{name} capture failed: {error}"))
+        })
+}
+
+fn collect_captures(stdout: Capture, stderr: Capture) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    // Join both readers before returning either error: neither stream's prefix is complete
+    // evidence, and a failed stdout reader does not leave the stderr reader detached.
+    let stdout = join_capture(stdout, "stdout");
+    let stderr = join_capture(stderr, "stderr");
+    Ok((stdout?, stderr?))
 }
 
 /// Read the exact verifier executable from a successful bootstrap's Cargo JSON stdout.
@@ -276,3 +297,7 @@ pub fn configure_runtime(command: &mut Command, root: &Path, env: &EnvSnapshot) 
     env.apply_cargo_selectors(command);
     command.env("CARGO_MANIFEST_DIR", root.join("crates/aterm-verify"));
 }
+
+#[cfg(test)]
+#[path = "native_verifier_tests.rs"]
+mod tests;

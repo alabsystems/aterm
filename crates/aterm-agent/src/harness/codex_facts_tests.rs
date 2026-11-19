@@ -207,7 +207,9 @@ fn codex_facts_keep_the_rollouts_cumulative_tokens() {
     assert_eq!((none.tok_in, none.tok_out), (None, None), "nothing counted");
 
     let first = counts((40_000, 1_200), (40_000, 1_200));
-    let second = counts((95_000, 3_100), (55_000, 1_900));
+    let second = counts((95_000, 3_100), (55_000, 1_900)).replace("12:00:00.000Z", "12:00:05.000Z");
+    let second_at =
+        super::super::codex_rollout::stamp_ms("2026-10-24T12:00:05.000Z").expect("valid time");
     let facts = facts_of(&[first.clone(), second.clone()]);
     assert_eq!(
         (facts.tok_in, facts.tok_out),
@@ -226,6 +228,11 @@ fn codex_facts_keep_the_rollouts_cumulative_tokens() {
         "{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{\"primary\":{\"used_percent\":4.0}}}",
     );
     let facts = facts_of(&[second.clone(), limits_only, tokens(135_200, 258_400)]);
+    assert_eq!(
+        facts.tok_at_ms,
+        Some(second_at),
+        "unrelated rows cannot date cumulative token counts"
+    );
     assert_eq!(
         (facts.tok_in, facts.tok_out),
         (Some(95_000), Some(3_100)),

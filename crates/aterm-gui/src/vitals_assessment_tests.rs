@@ -60,8 +60,96 @@ fn input(epoch: Instant, observed: Instant, generation: u64) -> Input {
         ),
         &req,
         generation,
+        generation.saturating_mul(1_000_000),
+        i64::try_from(generation).ok().filter(|at| *at != 0),
         false,
     )
+}
+
+#[test]
+fn job_event_context_stays_with_the_original_assessment_arc_across_a_new_roster() {
+    let epoch = Instant::now();
+    let mut req = Request {
+        jobs_now: true,
+        tabs: vec![aterm_vitals::TabRoot {
+            key: 7,
+            tab: 7,
+            tab_id: None,
+            shell_pid: 4242,
+            label: "session".into(),
+            program: "shell".into(),
+            agent_leader: None,
+        }],
+        pane_sources: vec![super::super::memory::PaneSource {
+            local: 7,
+            sid: aterm_session::SessionId::parse("t0000000001").unwrap(),
+            nonce: aterm_session::LaunchNonce::from_bytes([1; 16]),
+        }],
+        ..Request::default()
+    };
+    let first = Input::new(
+        req.tab_reads(epoch, || epoch),
+        ProcessFacts::new(
+            Some(vec![ProcessReading {
+                pid: 4242,
+                start: Some(42),
+                ..ProcessReading::default()
+            }]),
+            true,
+            None,
+            None,
+        ),
+        &req,
+        10_000,
+        1_000,
+        Some(10_000),
+        false,
+    );
+    let mut core = Core::new();
+    let original = core.read(&first);
+    let jobs = original.jobs.as_ref().expect("a real initial jobs pass");
+    let context = original
+        .event_context
+        .as_ref()
+        .expect("original input provenance");
+    req.pane_sources[0].nonce = aterm_session::LaunchNonce::from_bytes([2; 16]);
+    let newer = Input::new(
+        req.tab_reads(epoch, || epoch),
+        ProcessFacts::new(None, false, None, None),
+        &req,
+        90_000,
+        9_000,
+        Some(90_000),
+        false,
+    );
+    let carried = core.read(&newer);
+    assert!(Arc::ptr_eq(jobs, carried.jobs.as_ref().unwrap()));
+    assert!(Arc::ptr_eq(
+        context,
+        carried.event_context.as_ref().unwrap()
+    ));
+    assert_eq!(context.at_ns, 1_000);
+    assert_eq!(context.at_unix_ms, Some(10_000));
+    assert_eq!(context.sources[0].nonce, "01".repeat(16));
+    assert_eq!(newer.event_context.sources[0].nonce, "02".repeat(16));
+    let negative = Input::new(
+        req.tab_reads(epoch, || epoch),
+        ProcessFacts::new(None, false, None, None),
+        &req,
+        0,
+        10_000,
+        Some(-500),
+        false,
+    );
+    assert_eq!(
+        negative.unix_ms, 0,
+        "the pre-existing unsigned assessment clock keeps its semantics"
+    );
+    assert_eq!(
+        negative.event_context.at_unix_ms,
+        Some(-500),
+        "event provenance must not clamp an original signed wall clock to epoch zero"
+    );
 }
 
 fn zombie_input(
@@ -102,7 +190,15 @@ fn zombie_input(
         Some(Arc::clone(&receipt)),
     );
     (
-        Input::new(req.tab_reads(epoch, || observed), facts, &req, at_ms, false),
+        Input::new(
+            req.tab_reads(epoch, || observed),
+            facts,
+            &req,
+            at_ms,
+            sample.at_ns,
+            i64::try_from(at_ms).ok().filter(|at| *at != 0),
+            false,
+        ),
         receipt,
     )
 }

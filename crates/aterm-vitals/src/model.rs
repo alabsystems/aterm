@@ -274,8 +274,8 @@ impl Thermal {
 pub struct AneSample {
     /// Its cores, read once.
     pub cores: u16,
-    /// Whether macOS keeps it powered now. Powered is not busy: it stays on for a while after
-    /// its work ends.
+    /// Whether macOS kept it powered at the reading. Powered is not busy: it stays on for a
+    /// while after its work ends.
     pub powered: bool,
 }
 
@@ -342,6 +342,16 @@ impl Pressure {
         })
     }
 
+    /// The row state it raises: warn and critical theirs, none while normal or unknown.
+    #[must_use]
+    pub fn state(self) -> Option<State> {
+        match self {
+            Self::Warn => Some(State::Warn),
+            Self::Critical => Some(State::Critical),
+            Self::Normal | Self::Unknown => None,
+        }
+    }
+
     /// The level a kept [`Self::rank`] stands for: the worst whose rank it reaches.
     fn of_rank(rank: f64) -> Self {
         [Self::Critical, Self::Warn]
@@ -366,6 +376,15 @@ pub struct MemCounters {
     pub pageins: u64,
     /// The VM page size the page counts are in, bytes.
     pub page_bytes: u64,
+    /// Anonymous pages pushed out of RAM (`aterm_sysprobe::VmCounters::pushed`: a Mac's
+    /// compressions less its single-value ones, Linux's swap-outs); `None` where unread.
+    pub pushed: Option<u64>,
+    /// Pages that came back after the kernel pushed them out or queued them to go
+    /// (`aterm_sysprobe::VmCounters::refaulted`: a Mac's decompressions and reactivations,
+    /// Linux's anonymous refaults); `None` where unread.
+    pub refaulted: Option<u64>,
+    /// Linux's PSI memory stall totals, `some` and `full`, µs; `None` elsewhere.
+    pub stall_us: Option<(u64, u64)>,
 }
 
 /// Paging per second over the memory reading's window.
@@ -384,6 +403,19 @@ pub struct MemRates {
     /// Compressor churn: bytes compressed plus bytes decompressed per second (the pages × the
     /// page size), the waffle's compressed tile's heat (A1 §4.3).
     pub churn_bps: f64,
+    /// Anonymous memory pushed out of RAM, bytes per second ([`MemCounters::pushed`]); `None`
+    /// where either reading lacks it or it went back.
+    pub push_bps: Option<f64>,
+    /// Memory that came back after it was pushed out or queued to go, bytes per second
+    /// ([`MemCounters::refaulted`]); `None` as [`Self::push_bps`].
+    pub refault_bps: Option<f64>,
+    /// Anonymous memory read back into RAM, bytes per second: the pages decompressed (a Mac's
+    /// compressor, Linux's zswap) times the page size, and the bytes swapped in. A page swapped
+    /// in and decompressed after may count in both; no file-backed page counts.
+    pub anon_back_bps: f64,
+    /// The share of the window some task, and every non-idle task, stalled on memory (Linux's
+    /// PSI, [`MemCounters::stall_us`]), 0 to 1; `None` elsewhere.
+    pub stall: Option<(f64, f64)>,
     /// The window, ns.
     pub window_ns: u64,
 }
@@ -441,6 +473,17 @@ pub struct MemSample {
     /// The classes partition the memory the VM manages (macOS), so [`Self::not_in_vm`] is the
     /// memory the OS keeps outside it rather than what the classes leave unnamed.
     pub exact: bool,
+    /// What the kernel can hand out without pushing anyone's anonymous pages out of RAM, bytes
+    /// (`aterm_sysprobe::MemoryDetail::headroom`): a Mac's free, speculative and purgeable
+    /// pages and its file cache above the kernel's floor; Linux's `MemAvailable`. `None` where
+    /// unread.
+    pub headroom: Option<u64>,
+    /// The compressor's nearer wall, what it holds and its limit: its segments or its compressed
+    /// pages (`aterm_sysprobe::MemoryDetail::wall`, macOS 27.2); `None` where unread.
+    pub wall: Option<(u64, u64)>,
+    /// The share of the pages the kernel's pressure test weighs that are not the compressor's,
+    /// per mille (`aterm_sysprobe::MemoryDetail::kept_permille`, macOS); `None` where unread.
+    pub kept_permille: Option<u16>,
 }
 
 /// One physical-memory page class, or the capacity the reported classes leave over.
@@ -1145,6 +1188,10 @@ pub struct StripEvent {
     pub kind: StripEventKind,
     /// Short human-readable label (e.g. `"SIGSEGV"`, `"GPU reset"`, `"woke from sleep"`).
     pub label: String,
+    /// Immutable original producer authority; a local key alone grants no access.
+    pub scope: crate::events::EventScope,
+    /// An interval captured by the original producer, or none for a point marker.
+    pub span: Option<crate::events::EventSpan>,
 }
 
 /// What the machine's task tables hold and the most each may hold, as the host read them
@@ -1342,9 +1389,15 @@ pub struct PlanFact {
 /// One sample of everything, from the host's probe thread.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
-    /// This process's bracketed thread CPU observations; a missing or failed read clears
-    /// continuity rather than carrying an earlier attribution.
+    /// This process's bracketed thread CPU observations, read only where a reader of them asked
+    /// ([`Self::self_cpu_read`]), or the host's reader of them reads nothing and says why at once
+    /// (off macOS, `unsupported`); a missing or failed read clears continuity rather than carrying
+    /// an earlier attribution.
     pub self_cpu: Option<Result<crate::self_cpu::OwnCpuCut, &'static str>>,
+    /// Whether a reader of this process's thread CPU asked the reading for it
+    /// ([`Self::self_cpu`]); a reading nothing asks leaves that `None`, unless the host's reader
+    /// reads nothing and says why at once (off macOS).
+    pub self_cpu_read: bool,
     /// End of the frontend sweep on the two native, cross-process CPU clocks.
     pub native_cpu_cut: NativeCpuCut,
     /// Authenticated final process counters collected by their original native owning wait.
@@ -1359,6 +1412,9 @@ pub struct Sample {
     pub ownership_incomplete: bool,
     /// Independent native hardware and power-policy observations.
     pub hardware: Option<crate::hardware::Sample>,
+    /// Whether the reading asked its sweep for each process's scheduling
+    /// ([`ProcSample::scheduling`]), which a reading no reader of it asks leaves `None`.
+    pub scheduling_read: bool,
     /// The host's monotonic clock, ns.
     pub at_ns: u64,
     /// Every logical core's cumulative ticks; `None` where unreadable.
@@ -1440,6 +1496,8 @@ pub struct Sample {
     pub disk: Option<DiskFacts>,
     /// Every agent session's token totals, one row per session.
     pub tokens: Vec<TabTokens>,
+    /// Provider observations from the individual terminal sessions on this machine.
+    pub pane_token_observations: Vec<crate::pane_tokens::Observation>,
     /// The front tab's account's plan usage, while current.
     pub plan: Option<PlanFact>,
     /// The thermal state, where read.
@@ -1455,7 +1513,8 @@ pub struct Sample {
     /// coalition chain reads ([`crate::heat::HostWatts`]).
     pub host_watts: crate::heat::HostWatts,
     /// The Neural Engine reader's latest reading, or the self-check that retired it; `None`
-    /// where no reader runs (every OS but macOS).
+    /// where no reader runs (every OS but macOS). The reading may be older than this sample:
+    /// aterm's host reads the engine once, as its reader starts.
     pub ane: Option<Result<AneSample, AneCheck>>,
     /// The 1, 5 and 15 minute load averages, where read.
     pub load: Option<[f64; 3]>,
@@ -1482,11 +1541,16 @@ pub struct Sample {
     pub tab_sockets: Vec<(u64, u32)>,
     /// Explicit time-series vertical event markers recorded by the host on this sample.
     pub note_events: Vec<StripEvent>,
+    /// Session generations captured with these original sample roots, for event privacy.
+    pub event_sources: Vec<crate::events::SessionScope>,
     /// Explicit wall-clock discontinuities recorded by the host on this sample.
     pub note_gaps: Vec<TimeGap>,
-    /// The physical devices home's volume and the front tab's are stored on, home's first, and
-    /// their I/O counters ([`crate::units::BlockSample`]).
+    /// The readable physical devices under home's volume and the front tab's, in request order,
+    /// and their I/O counters ([`crate::units::BlockSample`]). An unread device has no entry.
     pub block: Vec<crate::units::BlockSample>,
+    /// Home's device resolved in the same block read, before unread devices were omitted;
+    /// `None` where home's mount or device could not be resolved. This supplies no counters.
+    pub home_device_id: Option<String>,
     /// The machine's situation and type as the host's readers last heard them
     /// ([`crate::situation`]); unread throughout where the host read none.
     pub situation: crate::situation::Situation,
@@ -1828,6 +1892,12 @@ impl From<&ProcSample> for CpuAccounting {
 /// One process as `sys procs` and the top rows show it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcView {
+    /// The same census's generation-bound group, before display rows are bounded.
+    pub group: Option<crate::groups::GroupKey>,
+    /// Reported process-thread ledger energy growth, milliwatts; not a CPU-only channel.
+    pub energy_mw: Option<f64>,
+    /// Original counter-read separation behind [`Self::energy_mw`], not an execution window.
+    pub energy_read_span_ns: Option<u64>,
     /// Darwin scheduling observations; lifetime QoS counters, not core placement.
     pub scheduling: Option<crate::scheduling::Scheduling>,
     /// Original counters and identity for interpreting this process's own rate.
@@ -2108,7 +2178,7 @@ pub enum State {
     Zombies,
     /// A stuck job (⊘).
     Stuck,
-    /// Warn (◢ disk, ● memory, GPU or CPU).
+    /// Warn (◢ disk, ● memory, GPU, CPU or Processes Room).
     Warn,
     /// Critical (◢ disk, ● memory or CPU).
     Critical,
@@ -2134,6 +2204,15 @@ impl State {
             .then_some(Self::Zombies);
         rows.chain(zombies).max()
     }
+}
+
+fn processes_state(
+    room: Option<crate::room::Reading>,
+    jobs: Option<&crate::jobs::JobsView>,
+) -> Option<State> {
+    room.filter(|room| room.near())
+        .map(|_| State::Warn)
+        .max(jobs.and_then(State::of_jobs))
 }
 
 /// Capacity basis for normalizing a resource row's heat.
@@ -2319,6 +2398,18 @@ pub struct ResourceView {
     /// Memory's pressure, cell for cell with `ring`: the worst level read in each bucket, `None`
     /// (hollow) where none was read; empty on every other row ([`crate::strain`]'s hour).
     pub pressure: Arc<[Option<Pressure>]>,
+    /// Memory's pressure ring's own 10 s cells, cell for cell with `ring`, each reading its
+    /// level's [`Pressure::rank`] (`max` the worst read in it, `None` where none was read); empty
+    /// on every other row. `pressure` is these cells' worst level.
+    pub pressure_ring: Arc<[Cell]>,
+    /// Memory's pressure ring's ten-minute cells, cell for cell with `long` by key, in ranks as
+    /// `pressure_ring` is; an empty cell where the pressure ring holds none; empty on every
+    /// other row.
+    pub pressure_long: Arc<[Cell]>,
+    /// Memory's last minute of pressure readings, oldest first, each its level's
+    /// [`Pressure::rank`]; empty on every other row. With `pressure_ring` and `pressure_long` they
+    /// are the tiers each strip box's state is cut from ([`Self::heat_multi_scale`]).
+    pub pressure_recent: Arc<[Reading]>,
     /// aterm's figure.
     pub aterm: ScopeFig,
     /// Scope figure for the requested tab (or an empty tab in [`Snapshot::resources`]).
@@ -2346,6 +2437,11 @@ pub struct HeatCell {
     pub over: f32,
     /// Discontinuity kind when this cell spans a sleep, crash, or pause gap.
     pub gap: Option<GapKind>,
+    /// The worst state read in it: on Memory the worst kernel pressure read in the box
+    /// ([`ResourceView::pressure`]), and on the live box of every row at least the row's state
+    /// now ([`ResourceView::state`]); `None` at rest, or where no state was kept
+    /// ([`ResourceView::heat_multi_scale`]).
+    pub state: Option<State>,
 }
 
 /// One progressive box on a multi-scale heat strip, pairing [`HeatCell`] with [`ProgSlot`].
@@ -2355,6 +2451,35 @@ pub struct HeatSlot {
     pub cell: HeatCell,
     /// The box's age window, weight and band.
     pub slot: ProgSlot,
+}
+
+/// How far a strip's last-minute projection may carry a neighboring reading through an
+/// otherwise unread interval. The deck and `sys history` use this same bounded cover.
+pub const STRIP_COVER_MS: i64 = 15_000;
+
+/// One canonical strip box with its raw source series beside the cell the deck paints.
+/// Source weights in [`Cell::tau_ms`] are resampling weights, not measured execution coverage.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResourceHistoryCell {
+    /// The first series, including the canonical slot geometry and discontinuity marker.
+    pub primary: ScaleCell,
+    /// The independent second series on a two-series row, with its own raw mean and maximum.
+    pub secondary: Option<ScaleCell>,
+    /// The deck's final heat, peak and over cap, against capacity now.
+    pub painted: HeatSlot,
+}
+
+/// An immutable row projected into the same boxes as its strip, newest first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResourceHistorySlots {
+    /// Canonical boxes; a resolution filter selects these boxes without reconstructing them.
+    pub cells: Vec<ResourceHistoryCell>,
+    /// Capacity applied to the first series now, not an inferred historical capacity.
+    pub capacity: Option<f64>,
+    /// Capacity applied to the independent second series now, where that series exists.
+    pub secondary_capacity: Option<f64>,
+    /// What the capacities mean when normalizing the painted boxes.
+    pub basis: CapBasis,
 }
 
 impl ResourceView {
@@ -2386,7 +2511,11 @@ impl ResourceView {
 
     /// Resample this row's hour ring, six hours of ten-minute cells and last-minute per-sample
     /// readings into progressive multi-scale [`HeatSlot`]s for `spec` at `now_unix_ms`, preserving
-    /// `gaps` without smearing.
+    /// `gaps` without smearing. Each box's state ([`HeatCell::state`]) is the worst pressure read
+    /// in it, Memory's three pressure tiers ([`Self::pressure`], [`Self::pressure_long`],
+    /// [`Self::pressure_recent`]) laid through the same slots as the row's own cells; the live
+    /// box's is at least the row's state now. A row that keeps no state per bucket (Disk) has
+    /// none on its past boxes.
     #[must_use]
     pub fn heat_multi_scale(
         &self,
@@ -2402,6 +2531,7 @@ impl ResourceView {
                 max: heat_of(sc.cell.max, cap).map(|h| h.min(ceiling)),
                 over: sc.cell.over_share() as f32,
                 gap: sc.gap,
+                state: None,
             },
             slot: sc.slot,
         };
@@ -2430,7 +2560,50 @@ impl ResourceView {
                 }
             }
         }
+        let pressed = self.pressure_states(spec, now_unix_ms, cover_ms, gaps);
+        for (i, a) in out.iter_mut().enumerate() {
+            let read = pressed.get(i).copied().flatten();
+            a.cell.state = if a.slot.is_live_now {
+                read.max(self.state)
+            } else {
+                read
+            };
+        }
         out
+    }
+
+    /// The worst pressure read in each of `spec`'s boxes, as a state, from Memory's three
+    /// pressure tiers through the same slots as [`Self::heat_multi_scale`]'s; empty where the
+    /// row keeps no pressure.
+    fn pressure_states(
+        &self,
+        spec: MultiScaleSpec,
+        now_unix_ms: i64,
+        cover_ms: i64,
+        gaps: &[TimeGap],
+    ) -> Vec<Option<State>> {
+        if self.pressure_ring.is_empty()
+            && self.pressure_long.is_empty()
+            && self.pressure_recent.is_empty()
+        {
+            return Vec::new();
+        }
+        let tiers = Tiers {
+            ring: &self.pressure_ring,
+            ring_k: self.ring_k,
+            long: &self.pressure_long,
+            long_k: self.long_k,
+            recent: &self.pressure_recent,
+        };
+        multi_scale_cells(tiers, now_unix_ms, spec, cover_ms, gaps)
+            .into_iter()
+            .map(|sc| {
+                sc.cell
+                    .max
+                    .filter(|r| r.is_finite())
+                    .and_then(|r| Pressure::of_rank(r).state())
+            })
+            .collect()
     }
 
     fn heat_of_columns(&self, cols: Vec<Cell>, capacity: Option<f64>) -> Vec<HeatCell> {
@@ -2441,6 +2614,7 @@ impl ResourceView {
                 max: heat_of(c.max, capacity).map(|h| h.min(ceiling)),
                 over: c.over_share() as f32,
                 gap: None,
+                state: None,
             })
             .collect()
     }
@@ -2515,6 +2689,7 @@ impl ResourceView {
                     max: share(own.max, cap),
                     over: counts.over_share() as f32,
                     gap: None,
+                    state: None,
                 };
                 (cell, heat)
             })
@@ -2573,6 +2748,55 @@ impl ResourceView {
             long: Arc::clone(&self.long),
             recent: Arc::clone(&self.recent),
             binds: self.second.as_ref().is_none_or(|s| !s.binds),
+        }
+    }
+
+    /// Project raw series and painted heat through the existing canonical strip resamplers.
+    /// `at_unix_ms` is the source snapshot's original wall timestamp; this method reads no
+    /// clock and changes no ring. Binned source weights do not establish physical coverage.
+    #[must_use]
+    pub fn history_slots(
+        &self,
+        spec: MultiScaleSpec,
+        at_unix_ms: i64,
+        gaps: &[TimeGap],
+    ) -> ResourceHistorySlots {
+        let raw = |series: &Series| {
+            multi_scale_cells(
+                Tiers {
+                    ring: &series.ring,
+                    ring_k: self.ring_k,
+                    long: &series.long,
+                    long_k: self.long_k,
+                    recent: &series.recent,
+                },
+                at_unix_ms,
+                spec,
+                STRIP_COVER_MS,
+                gaps,
+            )
+        };
+        let primary = raw(&self.first());
+        let secondary = self.second.as_ref().map(raw);
+        let painted = self.heat_multi_scale(spec, at_unix_ms, STRIP_COVER_MS, gaps);
+        let cells = primary
+            .into_iter()
+            .zip(painted)
+            .enumerate()
+            .map(|(index, (primary, painted))| ResourceHistoryCell {
+                primary,
+                secondary: secondary
+                    .as_ref()
+                    .and_then(|cells| cells.get(index))
+                    .copied(),
+                painted,
+            })
+            .collect();
+        ResourceHistorySlots {
+            cells,
+            capacity: self.capacity,
+            secondary_capacity: self.second.as_ref().and_then(|series| series.capacity),
+            basis: self.basis,
         }
     }
 
@@ -2707,6 +2931,9 @@ pub struct RowFacts {
     pub plan: Option<PlanFact>,
     /// Processes: the task tables, their counts and limits.
     pub room: TaskRoom,
+    /// Processes: this reading's fullest readable bounded task-table pair and the model's
+    /// Room warning judgment; `None` where no pair is readable and bounded.
+    pub process_room: Option<crate::room::Reading>,
     /// Processes: starts and exits a second over this reading's interval
     /// ([`crate::starts::TaskFlow`]); `None` where no start counter read at both ends, or no
     /// rate spans the interval.
@@ -2800,10 +3027,17 @@ impl Unread {
 /// Everything at one moment. Immutable once made; the host shares it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    /// Bounded immutable groups from the original uncapped observation.
+    pub groups: crate::groups::View,
     /// Bounded boot observations and separate persistence status, supplied by the host.
     pub boot_cost: Option<Arc<crate::sys::boot::BootReport>>,
     /// This process's CPU bounds by observed thread name, separate from app and tab charges.
     pub self_cpu: crate::self_cpu::OwnCpuView,
+    /// Whether a reader of this process's thread CPU asked the reading for it
+    /// ([`Self::self_cpu`]); a reading nothing asks leaves that `not_sampled` (`unsupported` off
+    /// macOS, whose reader reads nothing), which clears its continuity, so the next reading asked
+    /// warms again.
+    pub self_cpu_read: bool,
     /// Original native waits observed on this sample, including known aggregate CPU where a
     /// final own/child split was unavailable.
     pub native_terminals: Vec<NativeTerminal>,
@@ -2811,6 +3045,9 @@ pub struct Snapshot {
     pub cpu_counter_sample: Option<Vec<Ticks>>,
     /// Latest native hardware sample, with its own time window.
     pub hardware: Option<crate::hardware::Sample>,
+    /// Whether the reading asked its sweep for each process's scheduling
+    /// ([`ProcView::scheduling`]), which a reading no reader of it asks leaves `None`.
+    pub scheduling_read: bool,
     /// Bounded raw evidence from a sustained E-busy/P-underused episode.
     pub cpu_diagnostics: Option<crate::hardware::Bundle>,
     /// A prior process's saved report, displayed only as historical evidence.
@@ -2882,6 +3119,12 @@ pub struct Snapshot {
     /// Current common-window CPU account, including observed final own CPU and separate
     /// ambiguous kernel charges. Process-live rates remain in the scope and process views.
     pub scoped_cpu: Option<crate::explain::ScopeCpu>,
+    /// Published pane CPU readings collected on the host's common monotonic clock.
+    pub pane_cpu: Arc<crate::pane_cpu::Panes>,
+    /// Process-footprint and directional storage observations of each local session.
+    pub pane_resources: Arc<crate::pane_resources::Panes>,
+    /// Counters and dated intervals owned by current agent runs, indexed by terminal session.
+    pub pane_tokens: Arc<crate::pane_tokens::Panes>,
     /// Process rows: aterm's (up to [`ATERM_ROWS`]), the top [`TOP_ROWS`] by CPU and by
     /// footprint, and every other process with a GPU share.
     pub procs: Vec<ProcView>,
@@ -2902,7 +3145,8 @@ pub struct Snapshot {
     /// value with its absence ([`crate::heat::NoHeat`]).
     pub heat: crate::heat::HeatView,
     /// The Neural Engine reader's latest reading, or the self-check that retired it; `None`
-    /// where no reader runs (every OS but macOS).
+    /// where no reader runs (every OS but macOS). The reading may be older than this snapshot:
+    /// aterm's host reads the engine once, as its reader starts.
     pub ane: Option<Result<AneSample, AneCheck>>,
     /// The 1, 5 and 15 minute load averages, where read.
     pub load: Option<[f64; 3]>,
@@ -2916,6 +3160,11 @@ pub struct Snapshot {
     pub self_pid: u32,
     /// The events this sample raised ([`crate::events`]).
     pub events: Vec<crate::events::Event>,
+    /// The memory starvation episode open at this reading ([`crate::starving`]), as the
+    /// detector holds it after this reading; `None` while none is open.
+    pub starving: Option<Box<crate::starving::Episode>>,
+    /// Accepted marker changes lost before publication at their bounded staging limit.
+    pub events_lost: u64,
     /// Most recent split-tick attribution facts ([`crate::explain`]).
     pub why: Option<Arc<crate::explain::WhyFacts>>,
     /// Whether the coalition lane reads (`Off` once a read misread the layout).
@@ -2942,6 +3191,9 @@ pub struct Snapshot {
     /// The Spotlight family over the last split by coalition, carried for
     /// [`crate::spotlight::READING_CARRIED_MS`]; `None` unread ([`crate::spotlight`]).
     pub spotlight: Option<crate::spotlight::Reading>,
+    /// The Spotlight family's day ([`crate::spotlight::Family::history`]), shared with the model
+    /// (a reading takes a reference, not a copy), so a page can draw it.
+    pub spotlight_day: std::sync::Arc<crate::history::SpotlightHistory>,
 }
 
 /// A sum of process memory charges with its independent read coverage. Charges can include
@@ -3226,29 +3478,46 @@ impl Snapshot {
         self.left = left;
     }
 
-    /// Take the stuck engine's view, and with it the Processes row's state and any fatal job crash
-    /// markers on the strip.
+    /// Take the stuck engine's view, compose its state with this reading's Processes Room, and
+    /// record any fatal job crash markers on the strip.
     pub fn set_jobs(&mut self, jobs: Option<std::sync::Arc<crate::jobs::JobsView>>) {
+        self.set_jobs_observed(jobs, (self.at_unix_ms != 0).then_some(self.at_unix_ms), &[]);
+    }
+
+    /// Attach a jobs view with its original observation time and session-generation proof.
+    /// Missing provenance stays unknown; it is never borrowed from a newer roster.
+    pub fn set_jobs_observed(
+        &mut self,
+        jobs: Option<std::sync::Arc<crate::jobs::JobsView>>,
+        at_unix_ms: Option<i64>,
+        sources: &[crate::events::SessionScope],
+    ) {
         self.resources[Resource::Processes.index()].state =
-            jobs.as_deref().and_then(State::of_jobs);
+            processes_state(self.facts.process_room, jobs.as_deref());
         if let Some(view) = jobs.as_deref() {
             for row in &view.rows {
                 if row.verdict != crate::jobs::Verdict::Exited {
                     continue;
                 }
-                if let Some(sig_word) = row.exit.and_then(fatal_crash_signal_word) {
+                if let (Some(sig_word), Some(at_unix_ms)) =
+                    (row.exit.and_then(fatal_crash_signal_word), at_unix_ms)
+                {
                     let label = format!("{} ({sig_word})", row.exe);
+                    let scope = crate::events::EventScope::session(row.tab, sources);
                     let dup = self.strip_events.iter().any(|e| {
                         e.kind == StripEventKind::Crash
                             && e.label == label
-                            && awake_wall_span_ms(e.at_unix_ms, self.at_unix_ms, &self.time_gaps)
+                            && e.scope == scope
+                            && awake_wall_span_ms(e.at_unix_ms, at_unix_ms, &self.time_gaps)
                                 <= crate::jobs::EXITED_KEEP_MS
                     });
                     if !dup {
                         self.strip_events.push(StripEvent {
-                            at_unix_ms: self.at_unix_ms,
+                            at_unix_ms,
                             kind: StripEventKind::Crash,
                             label,
+                            scope,
+                            span: None,
                         });
                     }
                 }
@@ -3425,12 +3694,16 @@ impl ScopeAcc {
 /// Per-process CPU, wait, and storage I/O rates over the sample interval.
 #[derive(Clone, Copy, Debug, Default)]
 struct ProcRates {
+    read_at_ns: u64,
+    io_read_span_ns: Option<u64>,
     cores: Option<f32>,
     cpu_read_span_ns: Option<u64>,
     wait: Option<f32>,
     read_bps: Option<f64>,
     write_bps: Option<f64>,
     gpu: Option<f32>,
+    energy_mw: Option<f64>,
+    energy_read_span_ns: Option<u64>,
 }
 
 /// One reported own counter, bound to a known process generation and observed exec version.
@@ -3442,14 +3715,16 @@ struct ProcessCpuCounter {
 }
 
 impl ProcessCpuCounter {
-    fn growth(self, p: &ProcSample) -> Option<u64> {
+    fn matches(self, p: &ProcSample) -> bool {
         let start_matches = self.start.zip(p.start).is_some_and(|(a, b)| a == b);
         let version_matches = self.version.zip(p.version).is_some_and(|(a, b)| a == b);
         let start_changed = self.start.zip(p.start).is_some_and(|(a, b)| a != b);
         let version_changed = self.version.zip(p.version).is_some_and(|(a, b)| a != b);
-        if !(start_matches || version_matches) || start_changed || version_changed {
-            return None;
-        }
+        (start_matches || version_matches) && !start_changed && !version_changed
+    }
+
+    fn growth(self, p: &ProcSample) -> Option<u64> {
+        self.matches(p).then_some(())?;
         p.cpu_ns?.checked_sub(self.ns)
     }
 }
@@ -3589,6 +3864,9 @@ struct SweepFigs {
 /// [`Vitals::absorb_procs`]'s result.
 #[derive(Debug, Default)]
 struct ProcPass {
+    /// Canonical group keys and rates in the original full process order.
+    group_keys: Vec<Option<crate::groups::GroupKey>>,
+    rates: Vec<ProcRates>,
     aterm: Option<ScopeView>,
     shared: Option<ScopeView>,
     tabs: Vec<TabView>,
@@ -3613,6 +3891,8 @@ struct ProcPass {
 /// Running state for the deck's resource rows.
 #[derive(Debug, Default)]
 struct Rows {
+    /// The exact history reading handed to this observation's resource rings.
+    taken: Taken,
     /// Each row's hour ring, in [`Resource::ALL`] order: the first series.
     rings: [BucketRing; 7],
     /// Network's send direction.
@@ -3625,6 +3905,8 @@ struct Rows {
     proc_starts: Option<bool>,
     /// Whether a reading of this run carried a start counter.
     starts_read: bool,
+    /// The task-table Room warning's sole hysteresis latch; no count or limit is cached.
+    room: crate::room::Tracker,
     /// Memory pressure's rank ([`Pressure::rank`]), pushed beside Memory's ring: a bucket's
     /// largest reading is the worst level read in it.
     pressure: BucketRing,
@@ -3683,6 +3965,9 @@ struct Rows {
     /// The heat counters' change the start counter's merge gave this reading, or why it gave none
     /// ([`crate::starts::Moved::heat`]); `None` where the reading's start counter carries no heat.
     heat_moved: Option<Result<crate::heat::HeatMove, &'static str>>,
+    /// Per-id facts carried by that same accepted transition; consumed by the group feed.
+    group_energy: Option<Result<Arc<crate::heat::EnergyFacts>, &'static str>>,
+    group_starts: Vec<(u64, f64, u64)>,
     sessions: HashMap<String, Session>,
     /// Monotonic timestamp (ms) since which `rate60` disk filling has been positive.
     filling_since: Option<u64>,
@@ -3720,8 +4005,10 @@ impl ScopeRings {
 }
 
 /// The model's running state. One per host instance.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Vitals {
+    /// The sole in-memory group history; the GUI supplies this instance at construction.
+    groups: crate::groups::GroupBook,
     self_cpu: crate::self_cpu::OwnCpuState,
     hardware_recorder: crate::hardware::Recorder,
     historical_cpu_report: Option<std::sync::Arc<crate::sys::json::Jv>>,
@@ -3743,6 +4030,7 @@ pub struct Vitals {
     last_counters: Option<(u64, MemCounters)>,
     last_sweep_at: Option<u64>,
     last_cpu: HashMap<u32, ProcessCpuCounter>,
+    last_energy: HashMap<u32, ProcessCpuCounter>,
     last_runnable: HashMap<u32, u64>,
     last_read_at: HashMap<u32, u64>,
     global_foot: Trend,
@@ -3756,6 +4044,9 @@ pub struct Vitals {
     tabs: HashMap<u64, ScopeState>,
     detector: crate::events::Detector,
     why: crate::explain::WhyState,
+    pane_tokens: Arc<crate::pane_tokens::Panes>,
+    pane_cpu: Arc<crate::pane_cpu::Panes>,
+    pane_resources: crate::pane_resources::State,
     last_stamp: Option<Stamp>,
     restored_wall_ms: i64,
     last_pressure: Pressure,
@@ -3763,6 +4054,9 @@ pub struct Vitals {
     last_gpu_resets: u64,
     time_gaps: VecDeque<TimeGap>,
     strip_events: VecDeque<StripEvent>,
+    /// Accepted insertions/corrections awaiting the existing event publication path.
+    strip_changes: VecDeque<(crate::events::StripChangeKind, StripEvent)>,
+    strip_changes_lost: u64,
     /// The situation's stays of the last six hours, oldest first ([`crate::situation::Span`]).
     situation_spans: Vec<crate::situation::Span>,
     /// How many times the strip's held buckets changed other than by a bucket closing
@@ -3772,6 +4066,12 @@ pub struct Vitals {
     heat: crate::heat::Engine,
     /// The Spotlight family's last split reading and its day ([`crate::spotlight`]).
     spotlight: crate::spotlight::Family,
+}
+
+impl Default for Vitals {
+    fn default() -> Self {
+        Self::with_group_book(crate::groups::GroupBook::default())
+    }
 }
 
 /// The most gaps, the most events and the most situation spans a strip keeps.
@@ -4053,6 +4353,64 @@ impl Vitals {
         Self::default()
     }
 
+    /// Construct the model around the supplied sole group book.
+    #[must_use]
+    pub fn with_group_book(groups: crate::groups::GroupBook) -> Self {
+        Self {
+            groups,
+            self_cpu: Default::default(),
+            hardware_recorder: Default::default(),
+            historical_cpu_report: None,
+            authorized_cpu_policy: None,
+            rows: Default::default(),
+            seq: 0,
+            last_cores_at: None,
+            last_gpu_at: None,
+            last_mem_at: None,
+            last_cores: Vec::new(),
+            core_trends: Vec::new(),
+            core_histories: Vec::new(),
+            busy: Default::default(),
+            busy_history: Default::default(),
+            gpu: Default::default(),
+            gpu_history: Default::default(),
+            mem: Default::default(),
+            mem_history: Default::default(),
+            last_counters: None,
+            last_sweep_at: None,
+            last_cpu: HashMap::new(),
+            last_energy: HashMap::new(),
+            last_runnable: HashMap::new(),
+            last_read_at: HashMap::new(),
+            global_foot: Default::default(),
+            app_footprint: Default::default(),
+            last_app_footprint_at: None,
+            aterm: Default::default(),
+            shared: Default::default(),
+            origins: HashMap::new(),
+            origins_incomplete: false,
+            tabs: HashMap::new(),
+            detector: Default::default(),
+            why: Default::default(),
+            pane_tokens: Arc::default(),
+            pane_cpu: Arc::default(),
+            pane_resources: crate::pane_resources::State::default(),
+            last_stamp: None,
+            restored_wall_ms: 0,
+            last_pressure: Default::default(),
+            last_throttle: Default::default(),
+            last_gpu_resets: 0,
+            time_gaps: VecDeque::new(),
+            strip_events: VecDeque::new(),
+            strip_changes: VecDeque::new(),
+            strip_changes_lost: 0,
+            situation_spans: Vec::new(),
+            strip_rewrites: 0,
+            heat: Default::default(),
+            spotlight: Default::default(),
+        }
+    }
+
     /// Record a wall-clock discontinuity (`Sleep`, `Crash`, or `Paused`) on the time-series strip,
     /// merging overlapping spans of the same kind (or upgrading overlapping spans) without bleeding
     /// a crash/sleep label into a merely touching earlier span of another kind.
@@ -4105,6 +4463,7 @@ impl Vitals {
                 |s: &str| !s.is_empty() && s != "aterm crash" && !s.contains(" (SIG");
             let coalesces_checkpoint = |existing: &StripEvent| {
                 if existing.kind != StripEventKind::Crash
+                    || existing.scope != event.scope
                     || !((existing.label == "aterm crash" && is_host_crash_detail(&event.label))
                         || (is_host_crash_detail(&existing.label) && event.label == "aterm crash"))
                 {
@@ -4130,13 +4489,20 @@ impl Vitals {
             };
             if let Some(idx) = self.strip_events.iter().position(coalesces_checkpoint) {
                 let existing = &mut self.strip_events[idx];
-                if existing.label == "aterm crash" {
+                let accepted = if existing.label == "aterm crash" {
                     existing.at_unix_ms = event.at_unix_ms;
                     existing.label = event.label;
-                }
+                    existing.span = event.span;
+                    Some(existing.clone())
+                } else {
+                    None
+                };
                 self.strip_events
                     .make_contiguous()
                     .sort_by_key(|e| e.at_unix_ms);
+                if let Some(accepted) = accepted {
+                    self.note_strip_change(accepted, crate::events::StripChangeKind::Update);
+                }
                 return;
             }
         }
@@ -4153,14 +4519,22 @@ impl Vitals {
             };
             if let Some(existing) = self.strip_events.iter_mut().find(|e| {
                 e.kind == StripEventKind::SleepWake
+                    && e.scope == event.scope
                     && same_wake_span(e.at_unix_ms, event.at_unix_ms)
             }) {
-                if event.at_unix_ms < existing.at_unix_ms {
+                let accepted = if event.at_unix_ms < existing.at_unix_ms {
                     existing.at_unix_ms = event.at_unix_ms;
-                }
+                    existing.span = event.span.or(existing.span);
+                    Some(existing.clone())
+                } else {
+                    None
+                };
                 self.strip_events
                     .make_contiguous()
                     .sort_by_key(|e| e.at_unix_ms);
+                if let Some(accepted) = accepted {
+                    self.note_strip_change(accepted, crate::events::StripChangeKind::Update);
+                }
                 return;
             }
         }
@@ -4171,6 +4545,7 @@ impl Vitals {
         };
         let dup = self.strip_events.iter().any(|e| {
             e.kind == event.kind
+                && e.scope == event.scope
                 && e.at_unix_ms.abs_diff(event.at_unix_ms) <= tol_ms
                 && e.label == event.label
         });
@@ -4180,10 +4555,42 @@ impl Vitals {
         let pos = self
             .strip_events
             .partition_point(|e| e.at_unix_ms <= event.at_unix_ms);
-        self.strip_events.insert(pos, event);
+        self.strip_events.insert(pos, event.clone());
+        self.note_strip_change(event, crate::events::StripChangeKind::Insert);
         while self.strip_events.len() > STRIP_HISTORY_CAP {
             self.strip_events.pop_front();
         }
+    }
+
+    fn note_strip_change(&mut self, marker: StripEvent, change: crate::events::StripChangeKind) {
+        if self.strip_changes.len() == STRIP_HISTORY_CAP {
+            self.strip_changes.pop_front();
+            self.strip_changes_lost = self.strip_changes_lost.saturating_add(1);
+        }
+        self.strip_changes.push_back((change, marker));
+    }
+
+    /// Publish each accepted marker change once, under this newly absorbed snapshot's sequence.
+    /// Original marker wall times and authorities survive delayed correction and restoration.
+    pub fn drain_strip_events(&mut self, snapshot: &mut Snapshot) {
+        snapshot.events_lost = snapshot
+            .events_lost
+            .saturating_add(std::mem::take(&mut self.strip_changes_lost));
+        let seq = snapshot.seq;
+        let at_ns = snapshot.at_ns;
+        snapshot
+            .events
+            .extend(
+                self.strip_changes
+                    .drain(..)
+                    .map(|(change, marker)| crate::events::Event {
+                        seq,
+                        at_ns,
+                        at_unix_ms: (marker.at_unix_ms != 0).then_some(marker.at_unix_ms),
+                        scope: marker.scope.clone(),
+                        kind: crate::events::EventKind::Strip { marker, change },
+                    }),
+            );
     }
 
     fn trim_strip_history(&mut self, now_unix_ms: i64) {
@@ -4316,11 +4723,15 @@ impl Vitals {
                     at_unix_ms: saved.last_wall_ms,
                     kind: StripEventKind::Crash,
                     label: "aterm crash".into(),
+                    scope: crate::events::EventScope::Machine,
+                    span: None,
                 });
                 self.record_strip_event(StripEvent {
                     at_unix_ms: now_unix_ms,
                     kind: StripEventKind::Restart,
                     label: "restarted".into(),
+                    scope: crate::events::EventScope::Machine,
+                    span: None,
                 });
                 self.restored_wall_ms = now_unix_ms;
             } else if now_unix_ms - saved.last_wall_ms >= BUCKET_MS {
@@ -4469,6 +4880,12 @@ impl Vitals {
         self.spotlight.restore_history(history);
     }
 
+    /// Take the Spotlight stores aterm's root LAN broker answered (SD-94): later readings carry
+    /// the index's size while the answer is no older than [`crate::spotlight::STORE_STALE_MS`].
+    pub fn note_spotlight_store(&mut self, store: crate::spotlight::StoreRead) {
+        self.spotlight.note_store(store);
+    }
+
     /// Whether the Spotlight family's last reading is at or over a bar: what the host's
     /// `mdutil` cadence reads ([`crate::spotlight::Cadence::step`]).
     #[must_use]
@@ -4497,6 +4914,17 @@ impl Vitals {
     #[must_use]
     pub const fn cpu_recorder_pending(&self) -> bool {
         self.hardware_recorder.pending()
+    }
+
+    /// Whether a CPU report copies each worker's scheduling from the next reading: the recorder's
+    /// frames while it is pending, and the report the host saves at each reading while a bundle
+    /// is kept ([`Snapshot::cpu_diagnostics`]) or a CPU policy was recorded
+    /// ([`Self::record_cpu_policy`]). While it holds, the host asks each reading's sweep for it.
+    #[must_use]
+    pub const fn cpu_reports_copy_scheduling(&self) -> bool {
+        self.hardware_recorder.pending()
+            || self.hardware_recorder.kept()
+            || self.authorized_cpu_policy.is_some()
     }
 
     /// How many samples it has absorbed.
@@ -4587,6 +5015,8 @@ impl Vitals {
                         at_unix_ms: stamp.wall_ms,
                         kind: StripEventKind::SleepWake,
                         label: "woke from sleep".into(),
+                        scope: crate::events::EventScope::Machine,
+                        span: None,
                     });
                 } else if mono_dt > pause_limit && wall_dt >= BUCKET_MS {
                     self.record_time_gap(TimeGap {
@@ -4622,6 +5052,11 @@ impl Vitals {
                 at_unix_ms: wake_ms,
                 kind: StripEventKind::SleepWake,
                 label: "woke from sleep".into(),
+                scope: crate::events::EventScope::Machine,
+                span: Some(crate::events::EventSpan {
+                    onset_unix_ms: sleep_ms,
+                    end_unix_ms: wake_ms,
+                }),
             });
         }
         let cur_pressure = s.mem.map_or(Pressure::Unknown, |m| m.pressure);
@@ -4630,6 +5065,8 @@ impl Vitals {
                 at_unix_ms: s.at_unix_ms,
                 kind: StripEventKind::PressureSpike,
                 label: "memory pressure critical".into(),
+                scope: crate::events::EventScope::Machine,
+                span: None,
             });
         }
         if cur_pressure != Pressure::Unknown {
@@ -4641,6 +5078,8 @@ impl Vitals {
                     at_unix_ms: s.at_unix_ms,
                     kind: StripEventKind::PressureSpike,
                     label: t.phrase(),
+                    scope: crate::events::EventScope::Machine,
+                    span: None,
                 });
             }
             self.last_throttle = t.level;
@@ -4732,6 +5171,7 @@ impl Vitals {
         let mut pass = match s.procs.as_deref() {
             Some(procs) => self.absorb_procs(procs, s, &mut global, sweep_dt),
             None => {
+                self.pane_resources.missing(s);
                 self.aterm.history.push_at(None, s.at_ns);
                 for state in self.tabs.values_mut() {
                     state.history.push_at(None, s.at_ns);
@@ -4744,6 +5184,21 @@ impl Vitals {
             .as_ref()
             .map(|(m, o)| (m.as_slice(), o.as_slice()));
         let mut scoped_cpu = self.why.scope_cpu(s, attribution);
+        if let Some(cpu) = &mut scoped_cpu
+            && (sweep_dt.is_none() || pass.window_ns != Some(cpu.window_ns))
+        {
+            for pane in &mut cpu.panes {
+                pane.complete = false;
+            }
+        }
+
+        crate::pane_tokens::absorb(&mut self.pane_tokens, s);
+        crate::pane_cpu::absorb(
+            &mut self.pane_cpu,
+            s,
+            scoped_cpu.as_ref(),
+            &self.pane_resources.panes,
+        );
         let prepared_why = self.why.prepare(s, attribution);
         if let Some(cpu) = scoped_cpu.as_mut() {
             prepared_why.apply_app(s, cpu);
@@ -4863,6 +5318,7 @@ impl Vitals {
             p_cores: cpu.as_ref().and_then(|c| super_cores(&c.clusters)),
             host: s.host_watts,
         });
+        let groups = self.absorb_groups(s, &pass, &prepared_why, &heat);
         // The instruments' rings take the reading here, before the re-key is judged, so a step
         // back that re-keys one of them writes a whole base as the rows' does.
         self.rows.note_instruments(s, facts.blocked, &heat);
@@ -4889,6 +5345,7 @@ impl Vitals {
                 swap_bps: facts.swap_rate,
                 swap_used: mem.as_ref().and_then(|m| m.sample.swap_used),
                 block: &s.block,
+                home_device_id: s.home_device_id.as_deref(),
             },
             &mut self.rows.peaks,
         );
@@ -4900,6 +5357,8 @@ impl Vitals {
                 at_unix_ms: s.at_unix_ms,
                 kind: StripEventKind::PressureSpike,
                 label: "GPU reset".into(),
+                scope: crate::events::EventScope::Machine,
+                span: None,
             });
         }
         self.trim_strip_history(s.at_unix_ms);
@@ -4933,11 +5392,14 @@ impl Vitals {
         };
 
         let mut snap = Snapshot {
+            groups,
             boot_cost: None,
             self_cpu,
+            self_cpu_read: s.self_cpu_read,
             native_terminals: s.native_terminals.clone(),
             cpu_counter_sample: s.cores.clone(),
             hardware: s.hardware.clone(),
+            scheduling_read: s.scheduling_read,
             cpu_diagnostics: None,
             historical_cpu_report: self.historical_cpu_report.clone(),
             authorized_cpu_policy: self.authorized_cpu_policy.clone(),
@@ -4970,6 +5432,9 @@ impl Vitals {
             cores_window_ns,
             split,
             scoped_cpu,
+            pane_tokens: Arc::clone(&self.pane_tokens),
+            pane_cpu: Arc::clone(&self.pane_cpu),
+            pane_resources: Arc::clone(&self.pane_resources.panes),
             procs: pass.rows,
             programs: pass.programs,
             memory_owners: pass.memory_owners,
@@ -4984,6 +5449,8 @@ impl Vitals {
             slot_tabs: None,
             self_pid: s.self_pid,
             events: Vec::new(),
+            starving: None,
+            events_lost: 0,
             why: None,
             coal_lane: s.coal_lane,
             services: None,
@@ -4993,6 +5460,7 @@ impl Vitals {
             units,
             situation: s.situation.clone(),
             spotlight: None,
+            spotlight_day: std::sync::Arc::default(),
         };
         snap.why = self.why.finish(s, &snap, prepared_why);
         snap.coal_lane = self.why.lane(s);
@@ -5002,7 +5470,10 @@ impl Vitals {
         snap.spotlight = self
             .spotlight
             .absorb(fresh, s.spotlight_volumes.as_ref(), s.mono_ms);
-        snap.events = self.detector.detect(&snap);
+        snap.spotlight_day = std::sync::Arc::clone(self.spotlight.history());
+        snap.events = self.detector.detect(&snap, &s.event_sources);
+        snap.starving = self.detector.starving().cloned().map(Box::new);
+        self.drain_strip_events(&mut snap);
         snap.cpu_diagnostics = self.hardware_recorder.observe(&snap, s.cores.as_deref());
         snap
     }
@@ -5063,6 +5534,191 @@ impl Vitals {
         })
     }
 
+    fn absorb_groups(
+        &mut self,
+        s: &Sample,
+        pass: &ProcPass,
+        prepared: &crate::explain::PreparedWhy,
+        heat: &crate::heat::HeatView,
+    ) -> crate::groups::View {
+        use crate::groups::{
+            CpuBasis, Energy, Frame, GroupKey, Observation, Rate, ReadWindow, Scope, Value,
+        };
+        let processes_complete = s.procs.is_some()
+            && !s.machine_only
+            && !s.procs_truncated
+            && !s.ownership_incomplete
+            && !s.native_incomplete
+            && !s.native_source_lost
+            && s.unproved_tabs.is_empty()
+            && pass.attribution.as_ref().is_some_and(|(members, _)| {
+                s.procs
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .zip(members)
+                    .zip(&pass.group_keys)
+                    .all(|((p, m), key)| {
+                        !m.aterm || (key.is_some() && p.state != ProcState::Unknown)
+                    })
+            });
+        let fresh = prepared
+            .group_facts()
+            .filter(|facts| facts.at_ns == s.at_ns);
+        let coalitions_complete = processes_complete
+            && fresh.is_some_and(|facts| {
+                !facts.split.list_truncated && facts.split.rows.len() == facts.split.listed as usize
+            });
+        let energy = self
+            .rows
+            .group_energy
+            .take()
+            .and_then(Result::ok)
+            .filter(|_| s.coal_lane.on() && heat.chain.is_ok());
+        let starts = std::mem::take(&mut self.rows.group_starts);
+        let rate = |value: Option<f64>, end_ns, window: Option<u64>| Rate {
+            value: value.map_or_else(|| Value::not_sampled(1), Value::Read),
+            window: window
+                .filter(|&ns| ns > 0)
+                .map_or(ReadWindow::Unread, |window_ns| ReadWindow::Reported {
+                    end_ns,
+                    window_ns,
+                }),
+        };
+        let unsupported = || Rate {
+            value: Value::Unread {
+                why: Unread::Unsupported,
+                unread: 1,
+            },
+            window: ReadWindow::Unread,
+        };
+        let procs = s.procs.as_deref().unwrap_or(&[]);
+        // This index provides names only; it cannot establish group membership or custody.
+        let mut names = HashMap::with_capacity(procs.len());
+        for p in procs {
+            if let Some(start) = p.start {
+                names
+                    .entry(crate::delegated::ProcessKey { pid: p.pid, start })
+                    .and_modify(|name| *name = None)
+                    .or_insert(Some(p.name.as_str()));
+            }
+        }
+        let members = procs
+            .iter()
+            .zip(&pass.group_keys)
+            .zip(&pass.rates)
+            .filter_map(|((p, &key), r)| {
+                let key = key?;
+                let (scope, root) = match key {
+                    GroupKey::Tab { pane, root } => (Scope::Tab(pane), root),
+                    GroupKey::Aterm(root) => (Scope::Aterm, root),
+                    GroupKey::Shared(root) => (Scope::Shared, root),
+                    GroupKey::Coalition(_) => return None,
+                };
+                let name = names.get(&root).copied().flatten().unwrap_or("");
+                let mut observation = Observation::new(key, scope, name, 1);
+                observation.cpu = rate(r.cores.map(f64::from), r.read_at_ns, r.cpu_read_span_ns);
+                observation.cpu_basis = CpuBasis::ProcessOwnCounters;
+                observation.footprint = p
+                    .footprint
+                    .map_or_else(|| Value::not_sampled(1), Value::Read);
+                observation.read_bps = rate(r.read_bps, s.at_ns, r.io_read_span_ns);
+                observation.write_bps = rate(r.write_bps, s.at_ns, r.io_read_span_ns);
+                observation.energy = Energy {
+                    thread_mw: rate(r.energy_mw, r.read_at_ns, r.energy_read_span_ns),
+                    cpu_mw: unsupported(),
+                    gpu_mw: unsupported(),
+                    ane_mw: unsupported(),
+                };
+                observation.starts_ps = unsupported();
+                observation.membership_complete = processes_complete;
+                Some(observation)
+            });
+        let coalitions = fresh.into_iter().flat_map(|facts| {
+            facts.split.rows.iter().filter_map(|row| {
+                if row.part == crate::explain::Part::Aterm
+                    && !row.ownership_mixed
+                    && row.footprint_aterm
+                {
+                    return None;
+                }
+                // `part` may retain an earlier owner or default to Services without a name.
+                // Only the current complete foreign-member census proves this classification.
+                let scope = if row.ownership_mixed || row.footprint_ownership_incomplete {
+                    Scope::Unknown
+                } else {
+                    match row.footprint_outside {
+                        Some(crate::explain::Part::Others) => Scope::Others,
+                        Some(crate::explain::Part::Services) => Scope::Services,
+                        _ => Scope::Unknown,
+                    }
+                };
+                let name = row
+                    .lead
+                    .as_ref()
+                    .and_then(|lead| lead.exe.as_deref())
+                    .unwrap_or("");
+                let mut observation =
+                    Observation::new(GroupKey::Coalition(row.id), scope, name, row.live);
+                observation.cpu_basis = CpuBasis::CoalitionCounters;
+                observation.cpu = rate(
+                    (row.measured && row.cpu_mc >= 0).then_some(row.cpu_mc as f64 / 1000.0),
+                    facts.at_ns,
+                    Some(facts.window_ns),
+                );
+                observation.footprint = row
+                    .footprint
+                    .map_or_else(|| Value::not_sampled(1), Value::Read);
+                observation.read_bps = rate(
+                    row.measured.then_some(row.read_bps as f64),
+                    facts.at_ns,
+                    Some(facts.window_ns),
+                );
+                observation.write_bps = unsupported();
+                observation.energy = match energy
+                    .as_ref()
+                    .and_then(|energy| energy.get(row.id).map(|row| (energy, row)))
+                {
+                    Some((energy, row)) => Energy {
+                        thread_mw: unsupported(),
+                        cpu_mw: rate(Some(row.cpu_mw()), energy.at_ns(), Some(energy.window_ns())),
+                        gpu_mw: rate(Some(row.gpu_mw()), energy.at_ns(), Some(energy.window_ns())),
+                        ane_mw: rate(Some(row.ane_mw()), energy.at_ns(), Some(energy.window_ns())),
+                    },
+                    None => Energy {
+                        thread_mw: unsupported(),
+                        cpu_mw: Rate::default(),
+                        gpu_mw: Rate::default(),
+                        ane_mw: Rate::default(),
+                    },
+                };
+                observation.starts_ps = starts
+                    .binary_search_by_key(&row.id, |&(id, _, _)| id)
+                    .ok()
+                    .map_or_else(Rate::default, |i| {
+                        rate(Some(starts[i].1), s.at_ns, Some(starts[i].2))
+                    });
+                observation.membership_complete =
+                    coalitions_complete && row.memory_members.complete && scope != Scope::Unknown;
+                Some(observation)
+            })
+        });
+        self.groups.absorb(
+            Frame {
+                seq: self.seq,
+                taken: self.rows.taken,
+                mono_ms: s.mono_ms,
+                at_ns: s.at_ns,
+                processes_observed: s.procs.is_some() && !s.machine_only,
+                coalitions_observed: s.coalitions.is_some() && s.coal_lane.on(),
+                processes_complete,
+                coalitions_complete,
+            },
+            members.chain(coalitions),
+        );
+        self.groups.view()
+    }
+
     fn absorb_procs(
         &mut self,
         procs: &[ProcSample],
@@ -5095,10 +5751,15 @@ impl Vitals {
             .map(|t| s.at_ns - t);
         self.last_sweep_at = Some(s.at_ns);
         let mut next_cpu = HashMap::with_capacity(procs.len());
+        let mut next_energy = HashMap::with_capacity(procs.len());
         let mut next_runnable = HashMap::with_capacity(procs.len());
         let mut next_read_at = HashMap::with_capacity(procs.len());
         let mut rates: Vec<ProcRates> = Vec::with_capacity(procs.len());
         let mut common_cores = Vec::with_capacity(procs.len());
+        let mut pid_counts = HashMap::<u32, usize>::with_capacity(procs.len());
+        for p in procs {
+            *pid_counts.entry(p.pid).or_default() += 1;
+        }
         for p in procs {
             common_cores.push(
                 p.cpu_ns
@@ -5110,6 +5771,8 @@ impl Vitals {
                     }),
             );
             let mut r = ProcRates {
+                read_at_ns: s.at_ns,
+                io_read_span_ns: sweep_dt.map(|dt| (dt * 1e9) as u64),
                 read_bps: sweep_dt
                     .zip(reads.get(&p.pid))
                     .map(|(dt, &bytes)| bytes as f64 / dt),
@@ -5120,11 +5783,35 @@ impl Vitals {
                 ..ProcRates::default()
             };
             let wall_ns = match (p.at_ns, self.last_read_at.get(&p.pid)) {
-                (Some(now), Some(&then)) if now > then => Some(now - then),
+                (Some(now), Some(&then)) if now > then => {
+                    r.read_at_ns = now;
+                    Some(now - then)
+                }
                 _ => wall_ns,
             };
             if let Some(at) = p.at_ns {
                 next_read_at.insert(p.pid, at);
+            }
+            if let Some(nj) = p.energy_nj.filter(|_| pid_counts[&p.pid] == 1) {
+                next_energy.insert(
+                    p.pid,
+                    ProcessCpuCounter {
+                        start: p.start,
+                        version: p.version,
+                        ns: nj,
+                    },
+                );
+                if let Some((window, delta)) = sweep_dt
+                    .and(wall_ns.filter(|&window| window > 0))
+                    .zip(self.last_energy.get(&p.pid))
+                    .and_then(|(window, before)| {
+                        before.matches(p).then_some(())?;
+                        Some((window, nj.checked_sub(before.ns)?))
+                    })
+                {
+                    r.energy_mw = Some(delta as f64 * 1000.0 / window as f64);
+                    r.energy_read_span_ns = Some(window);
+                }
             }
             if let Some(ns) = p.cpu_ns {
                 next_cpu.insert(
@@ -5161,13 +5848,19 @@ impl Vitals {
             rates.push(r);
         }
         self.last_cpu = next_cpu;
+        self.last_energy = next_energy;
         self.last_runnable = next_runnable;
         self.last_read_at = next_read_at;
         global.procs = u32::try_from(procs.len()).unwrap_or(u32::MAX);
         let (membership, delegated_members) = self.attribute_owned(s, procs);
+        self.pane_resources
+            .observe(s, procs, &membership, &pid_counts, sweep_dt.is_some());
+        let group_keys = self.process_groups(s, procs, &membership, &delegated_members);
         let Some(wall_ns) = wall_ns else {
             // No window yet, but the explanations' reap credit takes its first members here.
             return ProcPass {
+                group_keys,
+                rates,
                 attribution: Some((membership, delegated_members)),
                 ..ProcPass::default()
             };
@@ -5337,6 +6030,9 @@ impl Vitals {
                 _ => {}
             }
             rows.push(ProcView {
+                group: group_keys[index],
+                energy_mw: r.energy_mw,
+                energy_read_span_ns: r.energy_read_span_ns,
                 scheduling: p.scheduling,
                 cpu_accounting: CpuAccounting::from(p),
                 pid: p.pid,
@@ -5418,6 +6114,8 @@ impl Vitals {
             })
             .collect();
         ProcPass {
+            group_keys,
+            rates,
             aterm: Some(aterm),
             shared: Some(shared),
             tabs,
@@ -5503,13 +6201,28 @@ fn mem_rates(then: MemCounters, now: MemCounters, window_ns: u64) -> Option<MemR
     let per_s = |v: u64| v as f64 * 1e9 / window_ns as f64;
     let decompress_ps = per_s(d(then.decompressions, now.decompressions)?);
     let compress_ps = per_s(d(then.compressions, now.compressions)?);
+    let page_bps = |a: Option<u64>, b: Option<u64>| {
+        a.zip(b)
+            .and_then(|(a, b)| d(a, b))
+            .map(|pages| per_s(pages) * now.page_bytes as f64)
+    };
+    let window_us = window_ns as f64 / 1e3;
+    let stall = then.stall_us.zip(now.stall_us).and_then(|(a, b)| {
+        let share = |us: u64| (us as f64 / window_us).min(1.0);
+        Some((share(d(a.0, b.0)?), share(d(a.1, b.1)?)))
+    });
+    let swapin_bps = per_s(d(then.swapin_bytes, now.swapin_bytes)?);
     Some(MemRates {
-        swapin_bps: per_s(d(then.swapin_bytes, now.swapin_bytes)?),
+        anon_back_bps: decompress_ps * now.page_bytes as f64 + swapin_bps,
+        swapin_bps,
         swapout_bps: per_s(d(then.swapout_bytes, now.swapout_bytes)?),
         decompress_ps,
         compress_ps,
         pagein_ps: per_s(d(then.pageins, now.pageins)?),
         churn_bps: (decompress_ps + compress_ps) * now.page_bytes as f64,
+        push_bps: page_bps(then.pushed, now.pushed),
+        refault_bps: page_bps(then.refaulted, now.refaulted),
+        stall,
         window_ns,
     })
 }
@@ -5588,6 +6301,7 @@ impl Rows {
         use Resource::{Cpu, Disk, Gpu, Memory, Network, Processes, Tokens};
         let now = s.at_unix_ms;
         let t = Taken::at(now, s.period_ms());
+        self.taken = t;
         if let Some(cpu) = scoped_cpu
             .filter(|cpu| sweep_dt.is_some_and(|dt| (dt * 1e9 - cpu.window_ns as f64).abs() < 1.0))
         {
@@ -5624,6 +6338,7 @@ impl Rows {
             disk: s.disk.clone(),
             plan: s.plan.clone(),
             room: s.room,
+            process_room: self.room.absorb(s.room),
             ..RowFacts::default()
         };
 
@@ -5737,10 +6452,34 @@ impl Rows {
                     count,
                     crate::starts::StartCount::Coalitions { read, .. } if read.heat().is_some()
                 );
-                self.heat_moved = match moved {
+                self.heat_moved = match &moved {
                     Ok((m, _)) => m.heat,
-                    Err(why) => carries_heat.then_some(Err(why)),
+                    Err(why) => carries_heat.then_some(Err(*why)),
                 };
+                self.group_energy = moved.as_ref().ok().and_then(|(m, _)| m.energy.clone());
+                self.group_starts.clear();
+                if let (
+                    Ok((_, dt)),
+                    Some((then, crate::starts::StartCount::Coalitions { read: before, .. })),
+                    crate::starts::StartCount::Coalitions { read: now, .. },
+                ) = (&moved, self.starts.as_ref(), count)
+                    && let Some(window) = stamp
+                        .mono_ms
+                        .checked_sub(then.mono_ms)
+                        .and_then(|ms| ms.checked_mul(1_000_000))
+                        .filter(|&ns| ns > 0)
+                {
+                    // `moved` has already admitted this exact merge, including new ids,
+                    // missing bases, resets and list coverage. Do not run it a second time.
+                    self.group_starts
+                        .extend(now.rows().iter().filter_map(|row| {
+                            let starts = match before.get(row.id) {
+                                Some(old) => row.started.checked_sub(old.started)?,
+                                None => row.started,
+                            };
+                            Some((row.id, starts as f64 / dt, window))
+                        }));
+                }
                 self.starts = Some((stamp, count.clone()));
                 moved
                     .ok()
@@ -5749,6 +6488,8 @@ impl Rows {
             None => {
                 self.starts = None;
                 self.heat_moved = Some(Err("coalitions_unread"));
+                self.group_energy = None;
+                self.group_starts.clear();
                 None
             }
         };
@@ -5939,11 +6680,7 @@ impl Rows {
         };
 
         let disk_state = disk_state(s.disk.as_ref(), facts.filling.as_ref());
-        let mem_state = match mem.map(|m| m.pressure) {
-            Some(Pressure::Warn) => Some(State::Warn),
-            Some(Pressure::Critical) => Some(State::Critical),
-            _ => None,
-        };
+        let mem_state = mem.and_then(|m| m.pressure.state());
         let gpu_state = facts.gpu_resets.map(|_| State::Warn);
         let cpu_state = s.thermal.and_then(Thermal::state);
         let resources = Resource::ALL.map(|res| {
@@ -5972,16 +6709,28 @@ impl Rows {
                 Gpu => gpu_state,
                 Memory => mem_state,
                 Disk => disk_state,
+                Processes => processes_state(facts.process_room, None),
                 _ => None,
             };
             if res == Memory {
-                view.pressure = ring
+                let hour: Vec<Cell> = ring
                     .iter()
-                    .map(|(k, _)| {
-                        let worst = self.pressure.bucket(k).and_then(|b| b.cell().max);
-                        worst.map(Pressure::of_rank)
-                    })
+                    .map(|(k, _)| self.pressure.bucket(k).map(Agg::cell).unwrap_or_default())
                     .collect();
+                view.pressure = hour.iter().map(|c| c.max.map(Pressure::of_rank)).collect();
+                view.pressure_ring = hour.into();
+                // The pressure ring's ten-minute cells, by key with Memory's own: the pressure
+                // ring's long ring may have started later (no pressure read at first).
+                let (cells, open) = (self.pressure.long_cells(), self.pressure.long_k());
+                let first = view.long_k + 1 - view.long.len() as i64;
+                view.pressure_long = (first..first + view.long.len() as i64)
+                    .map(|k| {
+                        let back = usize::try_from(open? - k).ok()?;
+                        cells.get(cells.len().checked_sub(1 + back)?).copied()
+                    })
+                    .map(Option::unwrap_or_default)
+                    .collect();
+                view.pressure_recent = self.pressure.readings().into();
             }
             view.aterm = fig(Some(&self.aterm), res, tokens.agents > 0);
             view.tab = fig(None, res, false);
@@ -6083,7 +6832,9 @@ impl Rows {
         let srtt = s.tcp_srtt_ms.filter(|x| x.is_finite() && *x > 0.0);
         let Some(links) = links else {
             let any_net = tcp.is_some() || srtt.is_some() || aterm_sockets.is_some();
-            let state = if tcp.is_some_and(|t| t.established > 0) {
+            let state = if srtt.is_some_and(|ms| ms >= 250.0) {
+                NetState::Degraded
+            } else if tcp.is_some_and(|t| t.established > 0) {
                 NetState::Online
             } else {
                 NetState::Idle
@@ -6450,6 +7201,15 @@ pub struct Membership {
 struct Origin {
     tab: Option<u64>,
     shared: bool,
+    // Additional in-memory metadata on the existing custody inventory, not part of the
+    // bounded GroupBook budget or the public handoff. It never authorizes ownership.
+    group: Option<crate::groups::GroupKey>,
+}
+
+impl Origin {
+    fn same_custody(self, other: Self) -> bool {
+        self.tab == other.tab && self.shared == other.shared
+    }
 }
 
 /// The largest natural-origin inventory transferred through one private GUI handoff.
@@ -6502,17 +7262,18 @@ impl Vitals {
                 let claim = Origin {
                     tab: origin.tab,
                     shared: origin.shared,
+                    group: None,
                 };
                 if self
                     .origins
                     .get(&origin.process)
-                    .is_some_and(|previous| *previous != claim)
+                    .is_some_and(|previous| !previous.same_custody(claim))
                 {
                     self.origins.remove(&origin.process);
                     rejected.insert(origin.process);
                     self.origins_incomplete = true;
                 } else {
-                    self.origins.insert(origin.process, claim);
+                    self.origins.entry(origin.process).or_insert(claim);
                 }
             } else {
                 self.origins_incomplete = true;
@@ -6583,6 +7344,7 @@ impl Vitals {
                         .then_some(Origin {
                             tab: None,
                             shared: true,
+                            group: None,
                         })
                 });
             if let Some(origin) = origin {
@@ -6615,19 +7377,160 @@ impl Vitals {
             if member.aterm
                 && let Some(start) = process.start
             {
-                self.origins.insert(
-                    crate::delegated::ProcessKey {
-                        pid: process.pid,
-                        start,
-                    },
-                    Origin {
-                        tab: member.tab.map(|index| s.tabs[index].key),
-                        shared: member.shared,
-                    },
-                );
+                let key = crate::delegated::ProcessKey {
+                    pid: process.pid,
+                    start,
+                };
+                let mut origin = Origin {
+                    tab: member.tab.map(|index| s.tabs[index].key),
+                    shared: member.shared,
+                    group: None,
+                };
+                if let Some(before) = self
+                    .origins
+                    .get(&key)
+                    .filter(|before| before.same_custody(origin))
+                {
+                    origin.group = before.group;
+                }
+                self.origins.insert(key, origin);
             }
         }
         (membership, owners)
+    }
+
+    /// Resolve shell-child anchors over this exact attributed census. The existing
+    /// birth-bound Origin retains an established anchor across exec and reparenting.
+    fn process_groups(
+        &mut self,
+        s: &Sample,
+        procs: &[ProcSample],
+        membership: &[Membership],
+        owners: &[Option<usize>],
+    ) -> Vec<Option<crate::groups::GroupKey>> {
+        use crate::delegated::ProcessKey;
+        use crate::groups::GroupKey;
+        let key = |p: &ProcSample| {
+            Some(ProcessKey {
+                pid: p.pid,
+                start: p.start?,
+            })
+        };
+        let mut by_pid = HashMap::with_capacity(procs.len());
+        for (index, p) in procs.iter().enumerate() {
+            by_pid
+                .entry(p.pid)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(index));
+        }
+        let mut resolved = vec![false; procs.len()];
+        let mut groups = vec![None; procs.len()];
+        let coalitions: HashSet<_> = s
+            .coalitions
+            .as_ref()
+            .into_iter()
+            .flat_map(|read| read.rows.iter().map(|row| row.id))
+            .collect();
+        for (index, (p, m)) in procs.iter().zip(membership).enumerate() {
+            if !m.aterm || by_pid.get(&p.pid) != Some(&Some(index)) {
+                if !m.aterm && by_pid.get(&p.pid) == Some(&Some(index)) {
+                    groups[index] = p
+                        .coalition
+                        .filter(|id| coalitions.contains(id))
+                        .map(GroupKey::Coalition);
+                }
+                resolved[index] = true;
+                continue;
+            }
+            if let Some(job) = owners[index] {
+                let root = s.delegated[job].root;
+                groups[index] = Some(m.tab.map_or(GroupKey::Aterm(root), |tab| GroupKey::Tab {
+                    pane: s.tabs[tab].key,
+                    root,
+                }));
+                resolved[index] = true;
+                continue;
+            }
+            if let Some(origin) = key(p)
+                .and_then(|key| self.origins.get(&key))
+                .filter(|origin| {
+                    origin.tab == m.tab.map(|i| s.tabs[i].key) && origin.shared == m.shared
+                })
+                && origin.group.is_some()
+            {
+                groups[index] = origin.group;
+                resolved[index] = true;
+            }
+        }
+        for index in 0..procs.len() {
+            if resolved[index] {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut visiting = HashSet::new();
+            let mut current = index;
+            let group = loop {
+                if resolved[current] {
+                    break groups[current];
+                }
+                if !visiting.insert(current) {
+                    break None;
+                }
+                path.push(current);
+                let p = &procs[current];
+                let m = membership[current];
+                let Some(own) = key(p) else {
+                    break None;
+                };
+                if let Some(tab) = m.tab {
+                    let root = &s.tabs[tab];
+                    if p.pid == root.shell_pid || p.ppid == root.shell_pid {
+                        break Some(GroupKey::Tab {
+                            pane: root.key,
+                            root: own,
+                        });
+                    }
+                } else if p.pid == s.self_pid {
+                    break Some(GroupKey::Aterm(own));
+                }
+                let parent = by_pid.get(&p.ppid).copied().flatten().filter(|&parent| {
+                    membership[parent] == m
+                        && procs[parent].start.is_some_and(|start| start <= own.start)
+                });
+                if let Some(parent) = parent {
+                    current = parent;
+                } else {
+                    break if m.tab.is_some() {
+                        None
+                    } else if m.shared {
+                        Some(GroupKey::Shared(own))
+                    } else {
+                        Some(GroupKey::Aterm(own))
+                    };
+                }
+            };
+            for index in path {
+                groups[index] = group;
+                resolved[index] = true;
+            }
+        }
+        for (index, ((p, m), &group)) in procs.iter().zip(membership).zip(&groups).enumerate() {
+            // Explicit jobs supply a current group through their own existing ledger. Do not
+            // remember that claim as a natural origin after the job releases it.
+            if owners[index].is_some() {
+                continue;
+            }
+            if let Some(origin) =
+                key(p)
+                    .and_then(|key| self.origins.get_mut(&key))
+                    .filter(|origin| {
+                        origin.tab == m.tab.map(|i| s.tabs[i].key) && origin.shared == m.shared
+                    })
+            {
+                origin.group = group;
+            }
+        }
+        groups
     }
 }
 

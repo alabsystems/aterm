@@ -998,7 +998,7 @@ fn login_record(scratch: &Scratch, email: &str) {
 fn an_unreadable_check_file_holds_only_the_tokens_this_mac_compares() {
     let roster_of =
         |scratch: &Scratch| Roster::load_for(Cli::Claude, &scratch.path().join("accounts.toml"));
-    let later = br#"{"schema":2,"windows_check":{}}"#;
+    let later = br#"{"schema":3,"windows_check":{}}"#;
     let unreadable = |store: &Store| {
         store.ensure().expect("the store");
         aterm_uds::private_file::write_private(&store.shared_dir(), CHECK_FILE, later)
@@ -1054,7 +1054,7 @@ fn an_unreadable_check_file_holds_only_the_tokens_this_mac_compares() {
     let said = UNCHECKED_SAID.with(|said| said.borrow().clone());
     assert_eq!(said.len(), 1, "said once for every read: {said:?}");
     assert!(
-        said[0].contains(CHECK_FILE) && said[0].contains("schema 1"),
+        said[0].contains(CHECK_FILE) && said[0].contains(&format!("schema {SCHEMA}")),
         "{said:?}"
     );
 

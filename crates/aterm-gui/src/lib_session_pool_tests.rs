@@ -123,14 +123,19 @@ fn quit_then_drop_hangs_up_a_session_only_once() {
     let gate = unsafe { OwnedFd::from_raw_fd(gate) };
     let quote =
         |path: &std::path::Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+    // The shell opens the FIFO as it starts, while the test's gate is a writer, so its handler's
+    // read ends at the gate's close should the test be gone: a handler that opened the FIFO only
+    // after the gate closed would block in that open for good.
     let handler = format!(
-        "printf H >> {}; read go < {}; printf done > {}; exit 0",
+        "printf H >> {}; read go <&3; printf done > {}; exit 0",
         quote(&count),
-        quote(&fifo),
         quote(&done)
     );
     let handler = format!("'{}'", handler.replace('\'', "'\\''"));
-    let script = format!("trap {handler} HUP; printf READY; while :; do read line; done");
+    let script = format!(
+        "exec 3< {}; trap {handler} HUP; printf READY; while :; do read line; done",
+        quote(&fifo)
+    );
     // SAFETY: the test owns its synthetic shell and trusted spawn capabilities.
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     let cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);

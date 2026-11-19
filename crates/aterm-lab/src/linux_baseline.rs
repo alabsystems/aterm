@@ -81,6 +81,166 @@ pub const DND_STEM: &str = "aterm-lane-dnd";
 
 type Px = (i32, i32);
 
+/// Native window pixels and the terminal frame's placement inside them. A dock or the
+/// compositor's size can make the frame smaller than, or offset inside, the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeGeometry {
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) frame_width: i32,
+    pub(crate) frame_height: i32,
+    pub(crate) scale: f64,
+    origin: Px,
+}
+
+fn geometry_field<'a>(reply: &'a str, key: &str) -> Result<&'a str, String> {
+    let prefix = format!("{key}=");
+    let mut values = reply
+        .split_whitespace()
+        .filter_map(|s| s.strip_prefix(&prefix));
+    let value = values
+        .next()
+        .ok_or_else(|| format!("dims has no valid {key}: {reply}"))?;
+    if values.next().is_some() {
+        return Err(format!("dims repeats {key}: {reply}"));
+    }
+    Ok(value)
+}
+
+pub(crate) fn dimension(reply: &str, key: &str) -> Result<i32, String> {
+    geometry_field(reply, key)?
+        .parse::<i32>()
+        .map_err(|_| format!("dims has no valid {key}: {reply}"))
+}
+
+impl NativeGeometry {
+    pub(crate) fn parse(reply: &str) -> Result<Self, String> {
+        if reply.split_whitespace().next() != Some("OK") {
+            return Err(format!("dims refused: {reply}"));
+        }
+        let scale = geometry_field(reply, "scale")?
+            .parse::<f64>()
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .ok_or_else(|| format!("dims has no positive finite scale: {reply}"))?;
+        let geometry = Self {
+            width: dimension(reply, "surface_w")?,
+            height: dimension(reply, "surface_h")?,
+            frame_width: dimension(reply, "frame_w")?,
+            frame_height: dimension(reply, "frame_h")?,
+            origin: (dimension(reply, "offset_x")?, dimension(reply, "offset_y")?),
+            scale,
+        };
+        if [
+            geometry.width,
+            geometry.height,
+            geometry.frame_width,
+            geometry.frame_height,
+        ]
+        .iter()
+        .any(|n| *n <= 0)
+        {
+            return Err(format!("dims has an empty window or frame: {reply}"));
+        }
+        Ok(geometry)
+    }
+
+    pub(crate) fn frame_point(self, x: i64, y: i64) -> Result<Px, String> {
+        if !(0..i64::from(self.frame_width)).contains(&x)
+            || !(0..i64::from(self.frame_height)).contains(&y)
+        {
+            return Err(format!("frame point {x},{y} is outside {self:?}"));
+        }
+        let (x, y) = (x + i64::from(self.origin.0), y + i64::from(self.origin.1));
+        if !(0..i64::from(self.width)).contains(&x) || !(0..i64::from(self.height)).contains(&y) {
+            return Err(format!(
+                "frame point is cropped from the window at {x},{y}: {self:?}"
+            ));
+        }
+        Ok((
+            i32::try_from(x).map_err(|e| e.to_string())?,
+            i32::try_from(y).map_err(|e| e.to_string())?,
+        ))
+    }
+
+    /// The window's right edge at half height, with a signed distance past it. Negative
+    /// distances are inside the window; positive ones are in its shadow margin.
+    pub(crate) fn right_midpoint(self, distance: i32) -> Result<Px, String> {
+        let x = self
+            .width
+            .checked_add(distance)
+            .filter(|x| *x >= 0)
+            .ok_or_else(|| format!("right-edge distance {distance} is outside {self:?}"))?;
+        Ok((x, self.height / 2))
+    }
+
+    pub(crate) fn grid_midpoint(self, reply: &str) -> Result<Px, String> {
+        let (pad, bottom, width, height) = (
+            dimension(reply, "pad")?,
+            dimension(reply, "pad_bottom")?,
+            dimension(reply, "grid_w")?,
+            dimension(reply, "grid_h")?,
+        );
+        if pad < 0
+            || bottom < 0
+            || width <= 0
+            || height <= 0
+            || i64::from(pad) + i64::from(width) > i64::from(self.frame_width)
+            || i64::from(bottom) + i64::from(height) > i64::from(self.frame_height)
+        {
+            return Err(format!("dims has no positive grid: {reply}"));
+        }
+        let x = i64::from(pad) + i64::from(width) / 2;
+        let y = i64::from(self.frame_height) - i64::from(bottom) - i64::from(height) / 2;
+        self.frame_point(x, y)
+    }
+
+    fn row_span(self, reply: &str, row: usize, len: usize) -> Result<(Px, Px), String> {
+        let (cw, ch) = (dimension(reply, "cell_w")?, dimension(reply, "cell_h")?);
+        let (pad, bottom, grid_w, grid_h) = (
+            dimension(reply, "pad")?,
+            dimension(reply, "pad_bottom")?,
+            dimension(reply, "grid_w")?,
+            dimension(reply, "grid_h")?,
+        );
+        if cw <= 0
+            || ch <= 0
+            || grid_w <= 0
+            || grid_h <= 0
+            || pad < 0
+            || bottom < 0
+            || i64::from(pad) + i64::from(grid_w) > i64::from(self.frame_width)
+            || i64::from(bottom) + i64::from(grid_h) > i64::from(self.frame_height)
+        {
+            return Err(format!("dims has no positive grid: {reply}"));
+        }
+        let (row, len) = (
+            i64::try_from(row).map_err(|e| e.to_string())?,
+            i64::try_from(len).map_err(|e| e.to_string())?,
+        );
+        if row >= i64::from(grid_h / ch) || len <= 0 || len > i64::from(grid_w / cw) {
+            return Err(format!(
+                "row {row} or span {len} is outside the grid: {reply}"
+            ));
+        }
+        let y = i64::from(self.frame_height) - i64::from(bottom) - i64::from(grid_h)
+            + row.checked_mul(i64::from(ch)).ok_or("row pixel overflow")?
+            + i64::from(ch) / 2;
+        let end = i64::from(pad)
+            + len
+                .checked_mul(i64::from(cw))
+                .ok_or("span pixel overflow")?
+            - 2;
+        if end <= i64::from(pad) + 2 {
+            return Err(format!("the span has no drag distance: {reply}"));
+        }
+        Ok((
+            self.frame_point(i64::from(pad) + 2, y)?,
+            self.frame_point(end, y)?,
+        ))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Typist<'a> {
     X { display: &'a str, server: bool },
@@ -1635,30 +1795,6 @@ impl Session<'_> {
         }
     }
 
-    fn x_echo_cell(
-        &self,
-        display: &str,
-        win: &str,
-        row: usize,
-        len: usize,
-    ) -> Option<(i64, i64, i64)> {
-        let d = self.ctl(&["dims"]).ok()?;
-        let num = |k: &str| proof::field(&d, k).and_then(|v| v.parse::<i64>().ok());
-        let geometry = self.x(display, &["xdotool", "getwindowgeometry", "--shell", win]);
-        let height = geometry
-            .text
-            .lines()
-            .find_map(|l| l.strip_prefix("HEIGHT="))
-            .and_then(|v| v.trim().parse::<i64>().ok())?;
-        let (cell_w, cell_h) = (num("cell_w")?, num("cell_h")?);
-        let (grid_h, pad, pad_bottom) = (num("grid_h")?, num("pad")?, num("pad_bottom")?);
-        let top = height - pad_bottom - grid_h;
-        let row = i64::try_from(row).ok()?;
-        let len = i64::try_from(len).ok()?;
-        let y = top + row * cell_h + cell_h / 2;
-        Some((pad + 2, y, pad + len * cell_w - 2))
-    }
-
     fn x11_selections(&mut self, display: &str) {
         let Some(win) = self.x_window(display) else {
             self.rec.behaviour(
@@ -1687,11 +1823,7 @@ impl Session<'_> {
         });
         self.rec.behaviour("clipboard.in", r);
         let out = (|| -> Result<String, String> {
-            let screen = self.ctl(&["text"])?;
-            let row = proof::echo_row(&screen).ok_or("no echo row on screen")?;
-            let (x0, y, x1) = self
-                .x_echo_cell(display, &win, row, proof::ECHO.len())
-                .ok_or("no geometry for the echo row")?;
+            let ((x0, y), (x1, _)) = self.echo_span()?;
             let (x0, y, x1) = (x0.to_string(), y.to_string(), x1.to_string());
             let drag = self.x(
                 display,
@@ -1733,6 +1865,8 @@ impl Session<'_> {
             out.unwrap_or_else(|e| format!("failed: {e}")),
         );
         let r = self.paste_from_x(display, Selection::Primary, "XPRIMARY-42", &|s| {
+            let d = s.ctl(&["dims"])?;
+            let (x, y) = NativeGeometry::parse(&d)?.grid_midpoint(&d)?;
             let click = s.x(
                 display,
                 &[
@@ -1740,8 +1874,8 @@ impl Session<'_> {
                     "mousemove",
                     "--window",
                     &win,
-                    "200",
-                    "200",
+                    &x.to_string(),
+                    &y.to_string(),
                     "click",
                     "2",
                 ],
@@ -1948,17 +2082,7 @@ impl Session<'_> {
         let screen = self.ctl(&["text"])?;
         let row = proof::echo_row(&screen).ok_or("no echo row on screen")?;
         let d = self.ctl(&["dims"])?;
-        let num = |k: &str| {
-            proof::field(&d, k)
-                .and_then(|v| v.parse::<i32>().ok())
-                .ok_or_else(|| format!("dims has no {k}"))
-        };
-        let (cell_w, cell_h, pad) = (num("cell_w")?, num("cell_h")?, num("pad")?);
-        let top = num("frame_h")? - num("pad_bottom")? - num("grid_h")?;
-        let row = i32::try_from(row).map_err(|_| "a row past i32")?;
-        let len = i32::try_from(proof::ECHO.len()).map_err(|_| "a length past i32")?;
-        let y = top + row * cell_h + cell_h / 2;
-        Ok(((pad + 2, y), (pad + len * cell_w - 2, y)))
+        NativeGeometry::parse(&d)?.row_span(&d, row, proof::ECHO.len())
     }
 
     fn dims_scale(&self) -> f64 {
@@ -2066,15 +2190,7 @@ impl Session<'_> {
         let scale = self.dims_scale();
         let logical = |px: i32| (f64::from(px) / scale).round() as i32;
         let d = self.ctl(&["dims"])?;
-        let num = |k: &str| {
-            proof::field(&d, k)
-                .and_then(|v| v.parse::<i32>().ok())
-                .unwrap_or(0)
-        };
-        let grid_mid = (
-            num("pad") + num("grid_w") / 2,
-            num("frame_h") - num("pad_bottom") - num("grid_h") / 2,
-        );
+        let grid_mid = NativeGeometry::parse(&d)?.grid_midpoint(&d)?;
         let steps = [
             "move:640,400".to_string(),
             format!("touch:{}", mark("centred")),
@@ -3799,19 +3915,18 @@ impl Session<'_> {
             return Err(format!("`ready` answered {r}"));
         }
         let d = self.settled_dims()?;
-        let num = |k: &str| proof::field(&d, k).and_then(|v| v.parse::<i32>().ok());
-        let scale = proof::field(&d, "scale")
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|s| *s > 0.0)
-            .unwrap_or(1.0);
-        let (w, h) = (num("frame_w").unwrap_or(0), num("frame_h").unwrap_or(0));
+        let geometry = NativeGeometry::parse(&d)?;
+        let (w, scale) = (geometry.width, geometry.scale);
         let band_y =
-            num("pad_top").unwrap_or(0) + num("head").unwrap_or(0) + num("cell_h").unwrap_or(0) / 2;
+            dimension(&d, "pad_top")? + dimension(&d, "head")? + dimension(&d, "cell_h")? / 2;
         let caption = self.caption()?;
-        let (cw, pad) = (num("cell_w").unwrap_or(0), num("pad").unwrap_or(0));
-        let cols = u16::try_from(num("window_cols").unwrap_or(0)).unwrap_or(0);
+        let (cw, pad) = (dimension(&d, "cell_w")?, dimension(&d, "pad")?);
+        let cols = u16::try_from(dimension(&d, "window_cols")?).map_err(|e| e.to_string())?;
         let first = i32::from(caption.right_end(cols));
-        let band_x = pad + (first - 4).max(0) * cw;
+        let (band_x, band_y) = geometry.frame_point(
+            i64::from(pad) + i64::from((first - 4).max(0)) * i64::from(cw),
+            i64::from(band_y),
+        )?;
         let logical = |px: i32| (f64::from(px) / scale).round() as i32;
         let device = |lp: i32| (f64::from(lp) * scale).round() as i32;
         let slack = scale.ceil() as i32;
@@ -3898,7 +4013,7 @@ impl Session<'_> {
                 "header.gesture.moved".into(),
                 format!("px={mx},{my}"),
             ));
-            let edge = aim("to-edge", (mx, my), (w - 2, h / 2))?;
+            let edge = aim("to-edge", (mx, my), geometry.right_midpoint(-2)?)?;
             go("aim-edge");
             self.seat_reached(&seat, &marks, "at-edge")?;
             self.px_at(edge, slack)
@@ -3909,9 +4024,7 @@ impl Session<'_> {
             go("resize-grabbed");
             self.seat_reached(&seat, &marks, "resized")?;
             let d = self.settled_dims()?;
-            let wider = proof::field(&d, "frame_w")
-                .and_then(|v| v.parse::<i32>().ok())
-                .is_some_and(|fw| fw > w);
+            let wider = NativeGeometry::parse(&d)?.width > w;
             lines.push((
                 true,
                 "header.resize".into(),

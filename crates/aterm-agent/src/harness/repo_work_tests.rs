@@ -115,11 +115,11 @@ fn the_reads_output_is_counted_and_a_clean_repository_is_no_finding() {
     assert_eq!(w.summary(), "/r: 1 unpushed commit");
     let w = RepoWork::of_git("/r", "", "", 0, 2, "origin/main").expect("found");
     assert_eq!((w.unpushed, w.unlanded), (0, 2));
-    assert_eq!(w.summary(), "/r: 2 commits not on origin/main");
+    assert_eq!(w.summary(), "/r: 2 commits not on cached origin/main");
     let w = RepoWork::of_git("/r", "", "", 1, 1, "origin/master").expect("found");
     assert_eq!(
         w.summary(),
-        "/r: 1 unpushed commit, 1 commit not on origin/master"
+        "/r: 1 unpushed commit, 1 commit not on cached origin/master"
     );
     assert_eq!(RepoWork::of_git("/r", "", "", 0, 0, ""), None);
     assert_eq!(RepoWork::of_git("/r", "", "", 0, 0, "origin/main"), None);
@@ -1186,6 +1186,455 @@ fn fetch_head_display_url_matches_git_store_updated_refs() {
     assert_eq!(fetch_head_display_url("/tmp/src/.git/"), "/tmp/src/");
 }
 
+/// Real fetched publication is shared by the two readers, but is not a Main observation.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn standalone_fetched_roots_count_publication_without_claiming_main() {
+    use crate::harness::land_receipt::{LandReceipt, ReceiptLeg};
+    use std::io::{Seek as _, Write as _};
+
+    let git = |dir: &Path, args: &[&str]| {
+        let mut cmd = crate::test_program::kept_git_command();
+        cmd.current_dir(dir)
+            .args([
+                "-c",
+                "user.name=Andrew Yates",
+                "-c",
+                "user.email=a@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "protocol.file.allow=always",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        let out = aterm_uds::deadline::output_while_process_progressing(
+            &mut cmd,
+            PROBE_LIMIT,
+            "preparing a fetched publication observation",
+        )
+        .expect("Git within its progress hang detector");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("fixture Git output")
+    };
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let reader = repo(&tmp.path().join("reader"), true);
+    let bare = tmp.path().join("reader/remote.git");
+    let url = bare.display().to_string();
+    let writer = tmp.path().join("writer");
+    git(
+        tmp.path(),
+        &["clone", "-q", &url, &writer.display().to_string()],
+    );
+    let a = git(&reader, &["rev-parse", "refs/remotes/origin/main"])
+        .trim()
+        .to_owned();
+    std::fs::write(writer.join("published.txt"), "published Main\n").unwrap();
+    git(&writer, &["add", "published.txt"]);
+    git(&writer, &["commit", "-q", "-m", "published Main"]);
+    git(&writer, &["push", "-q", "origin", "HEAD:main"]);
+    let b = git(&writer, &["rev-parse", "HEAD"]).trim().to_owned();
+    assert_eq!(git(&bare, &["rev-parse", "main"]).trim(), b);
+    git(
+        &reader,
+        &["fetch", "-q", "--no-tags", "--refmap=", "origin", &b],
+    );
+    git(&reader, &["checkout", "-q", "--detach", &b]);
+    assert_eq!(
+        git(&reader, &["rev-parse", "refs/remotes/origin/main"]).trim(),
+        a
+    );
+    assert_eq!(
+        git(
+            &reader,
+            &["rev-list", "--count", "HEAD", "--not", "--remotes"]
+        )
+        .trim(),
+        "1"
+    );
+
+    let fetched = reader.join(".git/FETCH_HEAD");
+    let hygiene_count = || probe_hygiene(&reader, Some(&reader), PROBE_LIMIT).map(|h| h.unpushed);
+    let raw = std::fs::read(&fetched).unwrap();
+    let config = std::fs::read(reader.join(".git/config")).unwrap();
+    let refs = git(
+        &reader,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+    let read = probe(&reader, Some(&reader), PROBE_LIMIT);
+    let hygiene = hygiene_count().expect("hygiene");
+    assert_eq!(std::fs::read(&fetched).unwrap(), raw);
+    assert_eq!(std::fs::read(reader.join(".git/config")).unwrap(), config);
+    assert_eq!(
+        git(
+            &reader,
+            &["for-each-ref", "--format=%(refname) %(objectname)"]
+        ),
+        refs
+    );
+    let work = read.found().expect("B is beyond the cached Main A");
+    assert_eq!(
+        (work.unpushed, hygiene),
+        (0, 0),
+        "both readers must count the configured-remote fetched root"
+    );
+    assert_eq!((work.unlanded, work.main_ref.as_str()), (1, "origin/main"));
+    assert!(
+        LandReceipt::of(&read, None, 0).is_none(),
+        "an exact-SHA fetch cannot make an OnMain receipt"
+    );
+
+    // This feature forks from A, so the actual remote Main B does not contain it.
+    git(&writer, &["checkout", "-q", "-b", "feature", &a]);
+    std::fs::write(writer.join("published.txt"), "only on the remote feature\n").unwrap();
+    git(&writer, &["add", "published.txt"]);
+    git(&writer, &["commit", "-q", "-m", "published feature"]);
+    git(&writer, &["push", "-q", "origin", "HEAD:feature"]);
+    let feature_tip = git(&writer, &["rev-parse", "HEAD"]).trim().to_owned();
+    assert_eq!(git(&bare, &["rev-parse", "main"]).trim(), b);
+    assert_eq!(
+        git(&bare, &["rev-list", "--count", "main..feature"]).trim(),
+        "1"
+    );
+    // A real named feature fetch is also publication only; it updates no tracking ref.
+    git(
+        &reader,
+        &["fetch", "-q", "--no-tags", "--refmap=", "origin", "feature"],
+    );
+    git(&reader, &["checkout", "-q", "--detach", &feature_tip]);
+    let b = feature_tip;
+    let valid = std::fs::read(&fetched).unwrap();
+    assert_ne!(
+        valid, raw,
+        "the native branch record differs from the exact-SHA record"
+    );
+    assert_eq!(
+        git(
+            &reader,
+            &["for-each-ref", "--format=%(refname) %(objectname)"]
+        ),
+        refs
+    );
+    let read = probe(&reader, Some(&reader), PROBE_LIMIT);
+    let work = read
+        .found()
+        .expect("the feature tip is still not on cached Main A");
+    assert_eq!((work.unpushed, work.unlanded), (0, 1));
+    assert_eq!(hygiene_count().unwrap(), 0);
+    assert!(LandReceipt::of(&read, None, 0).is_none());
+    std::fs::write(reader.join("local.txt"), "not published\n").unwrap();
+    git(&reader, &["add", "local.txt"]);
+    git(
+        &reader,
+        &["commit", "-q", "-m", "local child of the fetched root"],
+    );
+    let local_child = git(&reader, &["rev-parse", "HEAD"]).trim().to_owned();
+    let read = probe(&reader, Some(&reader), PROBE_LIMIT);
+    assert_eq!(read.found().expect("local child").unpushed, 1);
+    assert_eq!(hygiene_count().unwrap(), 1);
+    assert!(LandReceipt::of(&read, None, 0).is_none());
+
+    // With no selected remote Main, a valid publication observation yields Pushed only.
+    git(&reader, &["checkout", "-q", "--detach", &b]);
+    git(&reader, &["remote", "rename", "origin", "upstream"]);
+    let read = probe(&reader, Some(&reader), PROBE_LIMIT);
+    let checked = read.checked().expect("fully read fetched publication");
+    assert!(checked.remote && checked.main_ref.is_empty());
+    assert_eq!(
+        LandReceipt::of(&read, None, 0).unwrap().leg,
+        ReceiptLeg::Pushed
+    );
+    assert_eq!(hygiene_count().unwrap(), 0);
+
+    // Configured remotes still count local work when they have no tracking refs at all.
+    git(&reader, &["update-ref", "-d", "refs/remotes/upstream/main"]);
+    assert!(
+        git(
+            &reader,
+            &["for-each-ref", "--format=%(refname)", "refs/remotes"]
+        )
+        .trim()
+        .is_empty()
+    );
+    assert_eq!(git(&reader, &["remote", "get-url", "upstream"]).trim(), url);
+    let read = probe(&reader, Some(&reader), PROBE_LIMIT);
+    assert_eq!(
+        LandReceipt::of(&read, None, 0).unwrap().leg,
+        ReceiptLeg::Pushed
+    );
+    assert_eq!(hygiene_count().unwrap(), 0);
+    git(&reader, &["checkout", "-q", "--detach", &local_child]);
+    let read = probe(&reader, Some(&reader), PROBE_LIMIT);
+    assert_eq!(
+        read.found()
+            .expect("local child without tracking refs")
+            .unpushed,
+        1
+    );
+    assert_eq!(hygiene_count().unwrap(), 1);
+    assert!(LandReceipt::of(&read, None, 0).is_none());
+    git(&reader, &["checkout", "-q", "--detach", &b]);
+    git(&reader, &["update-ref", "refs/remotes/upstream/main", &a]);
+
+    let other = tmp.path().join("unconfigured.git");
+    git(
+        tmp.path(),
+        &["clone", "--bare", "-q", &url, &other.display().to_string()],
+    );
+    git(
+        &reader,
+        &[
+            "fetch",
+            "-q",
+            "--no-tags",
+            "--refmap=",
+            &other.display().to_string(),
+            &b,
+        ],
+    );
+    let unknown_url = std::fs::read(&fetched).unwrap();
+    assert_ne!(unknown_url, valid);
+    let text = std::str::from_utf8(&valid).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    let (_, rest) = text.split_once('\t').unwrap();
+    let (_, note) = rest.split_once('\t').unwrap();
+    let blob = git(&reader, &["rev-parse", &format!("{b}:published.txt")])
+        .trim()
+        .to_owned();
+    for (why, bytes) in [
+        ("unconfigured source", unknown_url),
+        (
+            "missing object",
+            format!("0123456789abcdef0123456789abcdef01234567\t{rest}").into_bytes(),
+        ),
+        ("noncommit object", format!("{blob}\t{rest}").into_bytes()),
+        (
+            "malformed object id",
+            format!("not-a-sha\t{rest}").into_bytes(),
+        ),
+        (
+            "malformed merge flag",
+            format!("{b}\tinvalid\t{note}").into_bytes(),
+        ),
+    ] {
+        std::fs::write(&fetched, bytes).unwrap();
+        let read = probe(&reader, Some(&reader), PROBE_LIMIT);
+        assert!(
+            read.is_unread() || read.found().is_some_and(|w| w.unpushed == 1),
+            "{why}: {read:?}"
+        );
+        assert!(LandReceipt::of(&read, None, 0).is_none(), "{why}");
+        let hygiene = hygiene_count();
+        assert!(hygiene.is_none_or(|n| n == 1), "{why}: no invented zero");
+    }
+
+    // The first remote URLs still match, but a capped enumeration is not complete.
+    std::fs::write(&fetched, &valid).unwrap();
+    let config = std::fs::read_to_string(reader.join(".git/config")).unwrap();
+    let url_line = config
+        .lines()
+        .find(|line| {
+            line.split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "url")
+        })
+        .unwrap();
+    let mut too_many_remotes = config.clone();
+    for n in 0..FETCH_REMOTES {
+        too_many_remotes.push_str(&format!("\n[remote \"fetch-cap-{n}\"]\n{url_line}\n"));
+    }
+    std::fs::write(reader.join(".git/config"), too_many_remotes).unwrap();
+    assert_eq!(git(&reader, &["remote"]).lines().count(), FETCH_REMOTES + 1);
+    assert_eq!(
+        git(&reader, &["remote", "get-url", "fetch-cap-0"]).trim(),
+        url
+    );
+    assert_eq!(probe(&reader, Some(&reader), PROBE_LIMIT), RepoRead::Unread);
+    assert!(hygiene_count().is_none());
+    std::fs::write(reader.join(".git/config"), config).unwrap();
+
+    // One import and one native fetch produce more distinct present tips than the tip cap.
+    let mut stream = String::new();
+    for n in 1..=FETCH_HEAD_COMMITS {
+        let parent = if n == 1 {
+            b.clone()
+        } else {
+            format!(":{}", n - 1)
+        };
+        stream.push_str(&format!(
+            "commit refs/heads/fetch-cap\nmark :{n}\ncommitter Andrew Yates <a@example.invalid> {} +0000\ndata 4\ncap\nfrom {parent}\n\n", 1700000000 + n,
+        ));
+    }
+    stream.push_str("done\n");
+    let mut input = aterm_tempfile::tempfile().unwrap();
+    input.write_all(stream.as_bytes()).unwrap();
+    input.rewind().unwrap();
+    let mut import = crate::test_program::kept_git_command();
+    import
+        .current_dir(&writer)
+        .args(["fast-import", "--quiet", "--done"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let imported = aterm_uds::deadline::output_from_while_process_progressing(
+        &mut import,
+        aterm_uds::spawnfd::Stdio::from(input),
+        PROBE_LIMIT,
+        "preparing distinct fetched commit tips",
+    )
+    .unwrap();
+    assert!(imported.status.success(), "{imported:?}");
+    git(
+        &writer,
+        &[
+            "push",
+            "-q",
+            "origin",
+            "refs/heads/fetch-cap:refs/heads/fetch-cap",
+        ],
+    );
+    let mut tips = vec![b.clone()];
+    tips.extend(
+        git(
+            &writer,
+            &[
+                "rev-list",
+                &format!("--max-count={FETCH_HEAD_COMMITS}"),
+                "refs/heads/fetch-cap",
+            ],
+        )
+        .lines()
+        .map(str::to_owned),
+    );
+    assert_eq!(tips.len(), FETCH_HEAD_COMMITS + 1);
+    assert_eq!(
+        tips.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        tips.len()
+    );
+    let mut args = vec!["fetch", "-q", "--no-tags", "--refmap=", "upstream"];
+    args.extend(tips.iter().map(String::as_str));
+    git(
+        &bare,
+        &["config", "uploadpack.allowReachableSHA1InWant", "true"],
+    );
+    git(&reader, &args);
+    let fetched_many = std::fs::read_to_string(&fetched).unwrap();
+    assert_eq!(fetched_many.lines().count(), FETCH_HEAD_COMMITS + 1);
+    assert!(u64::try_from(fetched_many.len()).unwrap() < FETCH_HEAD_BYTES);
+    let first_tip = fetched_many
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .next()
+        .unwrap();
+    git(&reader, &["merge-base", "--is-ancestor", &b, first_tip]);
+    assert_eq!(
+        git(
+            &reader,
+            &["rev-list", "--count", "HEAD", "--not", "--remotes"]
+        )
+        .trim(),
+        "1"
+    );
+    assert_eq!(probe(&reader, Some(&reader), PROBE_LIMIT), RepoRead::Unread);
+    assert!(hygiene_count().is_none());
+
+    // Each oversized record is complete and valid: the cap, not malformed padding, refuses it.
+    assert!(valid.ends_with(b"\n"));
+    let cap = usize::try_from(FETCH_HEAD_BYTES).unwrap();
+    let oversized = valid.repeat(cap / valid.len() + 1);
+    assert!(oversized.len() > cap && oversized.ends_with(b"\n"));
+    let mut invalid_utf8 = valid.clone();
+    invalid_utf8.extend([0xff, b'\n']);
+    for (why, bytes) in [
+        ("complete file beyond the byte cap", oversized),
+        ("valid prefix followed by invalid UTF-8", invalid_utf8),
+        (
+            "unterminated final record",
+            valid[..valid.len() - 1].to_vec(),
+        ),
+    ] {
+        std::fs::write(&fetched, bytes).unwrap();
+        assert_eq!(
+            probe(&reader, Some(&reader), PROBE_LIMIT),
+            RepoRead::Unread,
+            "{why}"
+        );
+        assert!(hygiene_count().is_none(), "{why}");
+    }
+    std::fs::remove_file(&fetched).unwrap();
+    std::fs::create_dir(&fetched).unwrap();
+    assert_eq!(
+        probe(&reader, Some(&reader), PROBE_LIMIT),
+        RepoRead::Unread,
+        "a refused non-file read is not an absent optional file"
+    );
+    assert!(hygiene_count().is_none());
+    std::fs::remove_dir(&fetched).unwrap();
+    let read = probe(&reader, Some(&reader), PROBE_LIMIT);
+    assert_eq!(read.found().expect("no optional fetch witness").unpushed, 1);
+    assert_eq!(hygiene_count().unwrap(), 1);
+    std::fs::write(&fetched, &valid).unwrap();
+
+    let refused = Cell::new(false);
+    let deny_commit_read = |args: &[&str]| {
+        let deny = args.first() == Some(&"cat-file");
+        if deny {
+            refused.set(true);
+        }
+        deny
+    };
+    let reads = Reads {
+        deadline: Cell::new(Instant::now() + PROBE_LIMIT),
+        each: Some(PROBE_LIMIT),
+        home: &reader,
+        xdg: None,
+        cut: Cell::new(false),
+        starts: Cell::new(0),
+        held: None,
+        refused: Some(&deny_commit_read),
+    };
+    assert_eq!(
+        probe_reading(&reader, &Used::default(), &reads),
+        RepoRead::Unread
+    );
+    assert!(
+        refused.get(),
+        "the required fetched-object validation was actually refused"
+    );
+
+    // A real failed count must reach the public hygiene API as unavailable, never zero.
+    let broken = reader.join(".git/refs/remotes/upstream/broken");
+    std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+    std::fs::write(broken, "0123456789abcdef0123456789abcdef01234567\n").unwrap();
+    assert_eq!(probe(&reader, Some(&reader), PROBE_LIMIT), RepoRead::Unread);
+    assert!(hygiene_count().is_none());
+
+    let unborn = tmp.path().join("unborn");
+    std::fs::create_dir(&unborn).unwrap();
+    git(&unborn, &["init", "-q"]);
+    git(&unborn, &["remote", "add", "origin", &url]);
+    let read = probe(&unborn, Some(&unborn), PROBE_LIMIT);
+    assert_eq!(
+        read,
+        RepoRead::Clean,
+        "independent unborn proof remains known"
+    );
+    assert_eq!(
+        probe_hygiene(&unborn, Some(&unborn), PROBE_LIMIT)
+            .unwrap()
+            .unpushed,
+        0
+    );
+    assert!(LandReceipt::of(&read, None, 0).is_none_or(|r| r.leg != ReceiptLeg::OnMain));
+}
+
 /// A NESTED SUBMODULE'S COMMIT ON NO REMOTE IS WORK (R-6): `app` holds `vendor/mid`, which holds
 /// `vendor/lib`; a commit made in the innermost, recorded by bumps pushed at both levels above it,
 /// is counted and named by its path from `app`. NEGATIVE CONTROL: everything pushed, and that
@@ -1467,7 +1916,7 @@ fn work_this_session_parked_on_another_branch_holds_the_landing() {
     assert_eq!((w.changed, w.stashes, w.unpushed, w.unlanded), (0, 0, 0, 0));
     assert!(
         w.summary()
-            .ends_with(": 1 commit on feat not on origin/main"),
+            .ends_with(": 1 commit on feat not on cached origin/main"),
         "{}",
         w.summary()
     );
@@ -1506,7 +1955,7 @@ fn work_this_session_parked_on_another_branch_holds_the_landing() {
     let w = read(&named).expect("the removed worktree's branch");
     assert!(
         w.summary()
-            .contains("2 commits on feat, wt-feat not on origin/main"),
+            .contains("2 commits on feat, wt-feat not on cached origin/main"),
         "{}",
         w.summary()
     );
@@ -1556,7 +2005,7 @@ fn a_branch_pushed_to_origin_and_deleted_here_is_still_parked() {
     let w = read(&used).expect("the branch pushed to origin, deleted here");
     assert!(
         w.summary()
-            .ends_with(": 1 commit on feat/x not on origin/main"),
+            .ends_with(": 1 commit on feat/x not on cached origin/main"),
         "{}",
         w.summary()
     );
@@ -2658,7 +3107,8 @@ fn a_commit_pushed_only_to_a_feature_branch_is_unlanded_until_merged() {
     );
     assert_eq!(w.main_ref, "origin/main");
     assert!(
-        w.summary().ends_with(": 1 commit not on origin/main"),
+        w.summary()
+            .ends_with(": 1 commit not on cached origin/main"),
         "{}",
         w.summary()
     );
@@ -2687,7 +3137,7 @@ fn the_default_branch_is_origin_head_then_main_then_master_else_unknown() {
     scratch_git(&work, &["remote", "set-head", "origin", "develop"]);
     commit(&work, "b.txt");
     scratch_git(&work, &["push", "-q", "origin", "HEAD:main"]);
-    let w = found(&work).expect("not on origin/develop");
+    let w = found(&work).expect("not on cached origin/develop");
     assert_eq!((w.unpushed, w.unlanded), (0, 1), "{w:?}");
     assert_eq!(w.main_ref, "origin/develop");
     scratch_git(&work, &["remote", "set-head", "origin", "--delete"]);
@@ -2704,7 +3154,7 @@ fn the_default_branch_is_origin_head_then_main_then_master_else_unknown() {
     scratch_git(&work, &["push", "-q", "origin", "HEAD:master"]);
     commit(&work, "b.txt");
     scratch_git(&work, &["push", "-q", "origin", "HEAD:feature"]);
-    let w = found(&work).expect("not on origin/master");
+    let w = found(&work).expect("not on cached origin/master");
     assert_eq!((w.unpushed, w.unlanded), (0, 1), "{w:?}");
     assert_eq!(w.main_ref, "origin/master");
     let tmp = aterm_tempfile::tempdir().expect("tmp");

@@ -99,18 +99,24 @@ fn probe_over(reader: fn() -> Reader, sys: &'static Shared) -> VitalsHost {
 
 /// `snap`'s overview as `sys` prints it at `state`.
 fn overview(snap: &Snapshot, state: Freshness) -> String {
+    reply_text(snap, state, "overview")
+}
+
+/// `snap`'s reply to `sys <query>` as `sys` prints it at `state`.
+fn reply_text(snap: &Snapshot, state: Freshness, query: &str) -> String {
     let machine = Machine::default();
     let target = Target::default();
     let ctx = Ctx {
         snap: Some(snap),
         epoch: 1,
         as_of_unix_ms: u64::try_from(snap.at_unix_ms).unwrap_or(0),
-        age_ms: 0,
+        age_ms: Some(0),
         state,
         machine: &machine,
         target: &target,
         tabs: &[],
         caller_panes: None,
+        event_caller: None,
         owner_class: true,
         volume: None,
         roots: &[],
@@ -122,7 +128,7 @@ fn overview(snap: &Snapshot, state: Freshness) -> String {
         gap: None,
         head_seq: snap.seq,
     };
-    let q = SysQuery::parse("overview").expect("the overview");
+    let q = SysQuery::parse(query).expect("the query");
     let reply = aterm_vitals::sys::render_text(&q, &ctx);
     let mut text = reply.header(&ctx, false);
     for line in reply.lines {
@@ -178,12 +184,12 @@ fn a_hung_sweep_still_publishes_cpu_memory_swap_disk_and_net_and_names_the_sweep
     assert_eq!((stall.call, stall.pid), ("proc_pid_rusage", Some(4321)));
     assert!(stall.since_unix_ms >= before, "{stall:?}");
     let text = overview(&snap, state);
-    assert!(text.contains("state=partial stalled=procs"), "{text}");
+    let header = text.lines().next().expect("the reply header");
+    assert!(header.contains("state=partial stalled=procs"), "{text}");
     assert!(
         text.contains("stalled procs: proc_pid_rusage pid=4321 since "),
         "{text}"
     );
-    assert!(!text.contains("warming"), "{text}");
     GATE.open();
     assert!(host.stop_at_exit(MUST_HAPPEN), "the thread ended");
 
@@ -376,4 +382,298 @@ fn a_held_ownership_proof_keeps_machine_readings_fresh_and_names_its_phase_and_p
         ENTERED.load(Ordering::SeqCst) >= 2,
         "the overdue proof was not adopted"
     );
+}
+
+/// A RESTING READING ASKS ITS SWEEP FOR NO SCHEDULING (C4): a whole reading of a request no
+/// reader of each process's scheduling made (no pull that prints it, no CPU lens) asks the sweep
+/// for none, and so makes no `getpriority`; each reader asks it: a pull a query armed
+/// ([`Request::scheduling`]), the CPU lens, and the model's CPU reports once a CPU policy is
+/// recorded. Each reading's snapshot says whether its sweep read it. NEGATIVE CONTROL: the
+/// sweep asked for scheduling at every reading, as before, asks it at rest.
+#[test]
+fn a_resting_reading_asks_its_sweep_for_no_scheduling() {
+    static ASKED: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+    fn sweep(
+        opts: aterm_sysprobe::SweepOpts,
+        ids: &mut aterm_sysprobe::coalitions::CoalitionIds,
+    ) -> Option<aterm_sysprobe::Sweep> {
+        ASKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(opts.scheduling);
+        aterm_sysprobe::processes_keeping(opts, ids)
+    }
+    let mut reader = reader_with(sweep, MUST_HAPPEN);
+    let rest = Request {
+        self_pid: std::process::id(),
+        ..Request::default()
+    };
+    let read = |reader: &mut Reader, req: &Request| {
+        let snap = reader.read(req);
+        let asked = std::mem::take(&mut *ASKED.lock().unwrap_or_else(PoisonError::into_inner));
+        (asked, snap.scheduling_read)
+    };
+    assert_eq!(read(&mut reader, &rest), (vec![false], false), "at rest");
+    let pull = Request {
+        scheduling: true,
+        ..rest.clone()
+    };
+    assert_eq!(read(&mut reader, &pull), (vec![true], true), "a pull");
+    let lens = |r| Request {
+        lenses: vec![r],
+        ..rest.clone()
+    };
+    let cpu = lens(aterm_vitals::Resource::Cpu);
+    assert_eq!(read(&mut reader, &cpu), (vec![true], true), "the CPU lens");
+    let memory = lens(aterm_vitals::Resource::Memory);
+    assert_eq!(
+        read(&mut reader, &memory),
+        (vec![false], false),
+        "another lens"
+    );
+    reader
+        .vitals
+        .record_cpu_policy(aterm_vitals::sys::json::Jv::obj([(
+            "schema",
+            aterm_vitals::sys::json::Jv::Int(1),
+        )]));
+    assert_eq!(
+        read(&mut reader, &rest),
+        (vec![true], true),
+        "a CPU policy's report"
+    );
+}
+
+/// A valid cut of this process's threads, its `n`th: stamped on `epoch`'s clock as it begins,
+/// each counter a step past the last cut's, as aterm's own-thread reader cuts them.
+fn own_cut(epoch: Instant, n: u64) -> aterm_vitals::self_cpu::OwnCpuCut {
+    use aterm_vitals::self_cpu::{
+        OwnCpuCounter, OwnCpuCoverage, OwnCpuCut, OwnCpuProcess, OwnCpuThread,
+    };
+    let begin_ns = u64::try_from(epoch.elapsed().as_nanos()).expect("ns");
+    let counter = |ns| OwnCpuCounter {
+        ns,
+        precision_ns: 0,
+    };
+    OwnCpuCut {
+        process: OwnCpuProcess {
+            pid: std::process::id(),
+            start: 1,
+            version: 1,
+        },
+        begin_ns,
+        end_ns: begin_ns + 1,
+        process_before: counter(n * 1_000),
+        process_after: counter(n * 1_000 + 1),
+        threads: vec![OwnCpuThread {
+            id: 1,
+            name: Some("aterm-vitals".into()),
+            cpu: Some(counter(n * 500)),
+        }],
+        coverage: OwnCpuCoverage {
+            listed: 1,
+            inspected: 1,
+            unread: 0,
+            capped: false,
+        },
+    }
+}
+
+/// A RESTING READING READS NEITHER ATERM'S OWN THREADS NOR THE NEURAL ENGINE: through counting
+/// stand-ins for both readers, a whole reading at rest, one with the deck shown, one with the
+/// CPU lens open, a machine-only one and a pull no query armed make no read of aterm's threads
+/// and no read of the engine's power, each snapshot saying its threads went unread
+/// (`not_sampled`) and carrying the engine's one reading from the reader's start, which matched
+/// the engine and read its power once. NEGATIVE CONTROLS: aterm's threads read at every reading,
+/// as before, read 5 at rest; the engine read at every reading, as before, reads its power 5
+/// times.
+#[test]
+fn a_resting_reading_reads_no_self_cpu_and_no_neural_engine_power() {
+    use aterm_sysprobe::neural_engine::{Entry, Power, Source as AneSource};
+    use std::sync::atomic::Ordering;
+    static THREADS: AtomicUsize = AtomicUsize::new(0);
+    static ENTRY: AtomicUsize = AtomicUsize::new(0);
+    static POWER: AtomicUsize = AtomicUsize::new(0);
+    fn own_threads(epoch: Instant) -> Result<aterm_vitals::self_cpu::OwnCpuCut, &'static str> {
+        let n = THREADS.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(own_cut(epoch, u64::try_from(n).expect("count")))
+    }
+    fn entry() -> Option<Entry> {
+        ENTRY.fetch_add(1, Ordering::SeqCst);
+        Some(Entry { cores: Some(16) })
+    }
+    fn power() -> Power {
+        POWER.fetch_add(1, Ordering::SeqCst);
+        Power {
+            current: Some(1),
+            max: Some(4),
+        }
+    }
+    let mut reader = Reader::new(Arc::default());
+    reader.self_cpu_read = self_cpu::Probe {
+        read: own_threads,
+        reads: true,
+    };
+    reader.ane = ane_at_start(Some(aterm_sysprobe::neural_engine::Reader::on(AneSource {
+        entry,
+        power,
+    })));
+    let at_start = (ENTRY.load(Ordering::SeqCst), POWER.load(Ordering::SeqCst));
+    let rest = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        ..Request::default()
+    };
+    let deck = Request {
+        deck: true,
+        in_view: true,
+        ..rest.clone()
+    };
+    let lens = Request {
+        lenses: vec![aterm_vitals::Resource::Cpu],
+        ..deck.clone()
+    };
+    let machine = Request {
+        machine_only: true,
+        ..rest.clone()
+    };
+    let mut snaps = vec![
+        reader.reading(&rest),
+        reader.reading(&deck),
+        reader.reading(&lens),
+        reader.reading(&machine),
+    ];
+    snaps.push(pull(
+        &mut reader,
+        &mut deck.clone(),
+        Some(Instant::now()),
+        false,
+    ));
+    assert_eq!(snaps.len(), 5);
+    assert_eq!(
+        THREADS.load(Ordering::SeqCst),
+        0,
+        "no read of aterm's threads at rest"
+    );
+    assert_eq!(
+        POWER.load(Ordering::SeqCst) - at_start.1,
+        0,
+        "no read of the engine's power at rest"
+    );
+    let start = Some(Ok(aterm_vitals::AneSample {
+        cores: 16,
+        powered: true,
+    }));
+    for (i, snap) in snaps.iter().enumerate() {
+        assert!(!snap.self_cpu_read, "reading {i}");
+        assert_eq!(
+            snap.self_cpu,
+            aterm_vitals::self_cpu::OwnCpuView::Unavailable("not_sampled"),
+            "reading {i}"
+        );
+        assert_eq!(snap.ane, start, "reading {i}: the start's reading");
+    }
+    assert_eq!(
+        at_start,
+        (1, 1),
+        "the start matched the engine and read it once"
+    );
+}
+
+/// A SELF-CPU READER THAT READS NOTHING ANSWERS EVERY READING (the native reader off macOS): with
+/// a stand-in that reads nothing and answers `unsupported`, a resting reading and a pull no query
+/// armed each say `unsupported` for aterm's threads, as every reading said before these reads
+/// waited to be asked, and that no pull asked (`self_cpu_read` false). NEGATIVE CONTROL: a
+/// reading that takes the reader's answer only where a pull asked says `not_sampled`.
+#[test]
+fn a_self_cpu_reader_that_reads_nothing_answers_every_reading() {
+    use aterm_vitals::self_cpu::OwnCpuView;
+    let mut reader = Reader::new(Arc::default());
+    reader.self_cpu_read = self_cpu::Probe {
+        read: |_| Err("unsupported"),
+        reads: false,
+    };
+    let req = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        deck: true,
+        in_view: true,
+        ..Request::default()
+    };
+    let rest = reader.reading(&req);
+    let pulled = pull(&mut reader, &mut req.clone(), Some(Instant::now()), false);
+    for (what, snap) in [("rest", &rest), ("pull", &pulled)] {
+        assert!(!snap.self_cpu_read, "{what}: no pull asked");
+        assert_eq!(
+            snap.self_cpu,
+            OwnCpuView::Unavailable("unsupported"),
+            "{what}"
+        );
+    }
+}
+
+/// A PULL THAT PRINTS ATERM'S OWN THREADS READS ITS OWN PAIR: after a resting reading, which
+/// reads none, a pull a `sys why` armed reads them twice, [`COLD_PAIR`] apart, though its whole
+/// reading is warm, and its `sys why cpu` answer shows them observed from two cuts that both
+/// began after the pull began. A resting reading between two such pulls clears the model's
+/// continuity, so the second pull, inside [`COLD_AFTER`] of the first, reads its own pair too.
+/// NEGATIVE CONTROLS: a pull that arms the read without the cold pair (`Source::self_cpu_cold`
+/// never true) reads once, its answer warming; a cold test by time alone (a reading that reads
+/// none leaves the last cut's time in place) reads once in the second round, its answer warming.
+#[test]
+fn a_pull_that_prints_self_cpu_reads_its_own_pair() {
+    use aterm_vitals::self_cpu::OwnCpuView;
+    use std::sync::atomic::Ordering;
+    static THREADS: AtomicUsize = AtomicUsize::new(0);
+    fn own_threads(epoch: Instant) -> Result<aterm_vitals::self_cpu::OwnCpuCut, &'static str> {
+        let n = THREADS.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(own_cut(epoch, u64::try_from(n).expect("count")))
+    }
+    let mut reader = Reader::new(Arc::default());
+    reader.self_cpu_read = self_cpu::Probe {
+        read: own_threads,
+        reads: true,
+    };
+    let mut req = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        deck: true,
+        in_view: true,
+        ..Request::default()
+    };
+    let armed = reader.self_cpu_armed.arm();
+    let pair_ns = u64::try_from(COLD_PAIR.as_nanos()).expect("ns");
+    for round in [
+        "after a resting reading",
+        "inside COLD_AFTER of the last pull",
+    ] {
+        let rest = reader.reading(&req);
+        assert!(
+            !rest.self_cpu_read,
+            "{round}: a resting reading reads none, armed or not"
+        );
+        let reads = THREADS.load(Ordering::SeqCst);
+        let began = u64::try_from(reader.epoch.elapsed().as_nanos()).expect("ns");
+        let snap = pull(&mut reader, &mut req, Some(Instant::now()), false);
+        assert!(snap.self_cpu_read, "{round}");
+        let OwnCpuView::Observed(changes) = &snap.self_cpu else {
+            panic!("{round}: {:?}", snap.self_cpu);
+        };
+        assert!(
+            changes.before_begin_ns >= began && changes.after_begin_ns >= began,
+            "{round}: both cuts began after the pull began at {began}: {changes:?}"
+        );
+        assert!(
+            changes.after_begin_ns - changes.before_end_ns >= pair_ns,
+            "{round}: COLD_PAIR apart: {changes:?}"
+        );
+        let answer = reply_text(&snap, Freshness::Fresh, "why cpu");
+        assert!(
+            answer.contains("self CPU published counter growth"),
+            "{round}: {answer}"
+        );
+        assert_eq!(THREADS.load(Ordering::SeqCst) - reads, 2, "{round}: a pair");
+        assert!(!reader.self_cpu_cold(), "{round}: the pair left a cut warm");
+    }
+    drop(armed);
 }

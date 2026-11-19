@@ -1228,6 +1228,26 @@ fn apply_cmd_environment_edits(command: &mut Cmd, edits: &[EnvironmentEdit]) {
     }
 }
 
+/// Compiler-only values needed to compare the frontend's base after its unit pool has
+/// returned. The metadata-only query receives no prior GNU or release-slot capability.
+#[cfg(unix)]
+pub(crate) fn compiler_metadata_environment(
+    command: &Cmd,
+    env: ExecEnv<'_>,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let mut materialized = command.clone();
+    apply_cmd_environment_edits(&mut materialized, &runtime_environment_edits(command, env)?);
+    Ok(materialized
+        .envs
+        .into_iter()
+        .filter(|(name, _)| {
+            let name = name.to_str().unwrap_or("");
+            matches!(name, "RUSTC_WRAPPER" | "RUSTDOC" | "CARGO_BUILD_JOBS")
+                || name.starts_with("ATERM_VERIFY_UNIT_")
+        })
+        .collect())
+}
+
 /// Materialize the exact cwd and environment a command will have after this thread's held
 /// resource claim, memory cover, compiler-width policy and wait accounting are applied.
 ///
@@ -3349,6 +3369,11 @@ pub mod group {
     pub(crate) trait WaitChild {
         fn id(&self) -> u32;
         fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+        /// Called only after the actual leader's owning reap and stage sweep.
+        /// A std child has no routed native watcher owned by this handle.
+        fn finish_tether(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
     }
@@ -3372,6 +3397,18 @@ pub mod group {
         }
         fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
             Self::wait(self)
+        }
+        fn finish_tether(&mut self) -> std::io::Result<()> {
+            self.finish_tether_while(std::time::Duration::from_secs(60), || {
+                if stopping() {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "tether retirement interrupted",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -3580,6 +3617,10 @@ pub mod group {
                 }
                 self.release_for_reap(child.id())?;
                 let status = child.wait()?;
+                // Darwin's watcher may have seen the still-unreaped leader
+                // during the sweep. Its conservative group-empty census can
+                // finish only after this owning reap, before closing custody.
+                child.finish_tether()?;
                 if let Some(pgid) = swept {
                     reaped(pgid);
                 }
@@ -3621,7 +3662,9 @@ pub mod group {
             }
             exited(self.held()?, true)?;
             self.release_for_reap(child.id())?;
-            child.wait()
+            let status = child.wait()?;
+            child.finish_tether()?;
+            Ok(status)
         }
     }
     impl Drop for Live {
@@ -3888,8 +3931,10 @@ pub mod group {
     /// A step of the run that runs to its end whatever interrupt comes (a write whose outcome
     /// an interrupt would leave unknown), from this call until the answer is dropped: while any
     /// lives, [`kill_on_interrupt`]'s watchdog does not re-raise an interrupt the run took, and
-    /// once the last is dropped the run has [`REPORT_GRACE`] again to report before it does. Each
-    /// step held is bounded by its own deadline; a second interrupt still ends the run at once.
+    /// once the last is dropped the run has [`REPORT_GRACE`] again to report before it does. The
+    /// step held is a remote write, a push (`remote::run_mutation`): its work window's end, or
+    /// an interrupt its caller reads, asks agh to stop, and it keeps its owner through agh's
+    /// settlement; a second interrupt still ends the run at once.
     #[must_use = "the step is held only while the answer lives"]
     pub fn hold() -> Held {
         HOLDS.fetch_add(1, Ordering::SeqCst);
@@ -4137,6 +4182,10 @@ mod tests;
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "exec_custody_tests.rs"]
 mod custody_tests;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "exec_tether_tests.rs"]
+mod tether_tests;
 
 #[cfg(test)]
 #[path = "exec_memory_tests.rs"]

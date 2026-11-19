@@ -26,6 +26,14 @@ type NativeAccessibilitySource<'a> = (
     aterm_a11y::model::Affine,
 );
 
+/// The roster contents and placement a window's client last read, including when paint is parked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RosterAccessibility {
+    owner: AccessibilityOwner,
+    content_epoch: u64,
+    geometry: crate::app_native::NativeHostGeometry,
+}
+
 impl App {
     /// Stage accessibility from the same compiled semantic snapshot paint is about to lower.
     pub(crate) fn stage_native_accessibility(
@@ -383,6 +391,67 @@ impl App {
             .map_err(|error| format!("native accessibility composition failed: {error:?}"))
     }
 
+    pub(crate) fn roster_accessibility(&self, wid: WindowId) -> Option<RosterAccessibility> {
+        let ws = self.windows.get(&wid)?;
+        if self.backend.is_pending() {
+            return None;
+        }
+        let view = self.visible_session_organizer(wid)?;
+        let geometry = self.dock_geometry(wid)?;
+        if ws.win_px.is_some_and(|size| !geometry.intersects(size)) {
+            return None;
+        }
+        let common = self.native_runtime.view_state(view)?.common();
+        Some(RosterAccessibility {
+            owner: AccessibilityOwner {
+                view,
+                generation: self.native_runtime.view_generation(view)?,
+                review_revision: common.review_revision,
+            },
+            content_epoch: common.content_epoch,
+            geometry,
+        })
+    }
+
+    /// Attach the roster to the existing window tree, so the grid keeps its own document, focus
+    /// and chrome. A newly opened or dirty panel compiles at the exact viewport its rows use.
+    pub(crate) fn append_roster_accessibility(
+        &self,
+        wid: WindowId,
+        roster: RosterAccessibility,
+        window: &mut aterm_a11y::model::TreeUpdate,
+        published: &mut Option<PublishedNativeAccessibility>,
+    ) -> Result<(), String> {
+        let RosterAccessibility {
+            owner, geometry, ..
+        } = roster;
+        let compiled = self.reviewed_roster_ui(wid, owner.view, geometry.viewport)?;
+        let (x, y) = geometry.origin;
+        let scale = self.windows[&wid].scale.max(f64::EPSILON);
+        let transform =
+            aterm_a11y::model::Affine::translate(aterm_a11y::model::Vec2::new(x as f64, y as f64))
+                * aterm_a11y::model::Affine::scale(scale);
+        project_native_accessibility_for_view_in_container(&compiled, None, transform, owner)
+            .and_then(|panel| panel.append_to_window(window, published, owner))
+            .map_err(|error| format!("session panel accessibility: {error:?}"))
+    }
+
+    fn reviewed_roster_ui(
+        &self,
+        wid: WindowId,
+        view: ViewId,
+        viewport: crate::native_ui::LogicalRect,
+    ) -> Result<std::borrow::Cow<'_, crate::native_ui::CompiledUi>, String> {
+        if let Some(artifact) = self.native_dock_artifact(wid, true, false) {
+            return Ok(std::borrow::Cow::Borrowed(artifact.compiled));
+        }
+        let Some(View::Native(native)) = self.view_store.get(view).copied() else {
+            return Err("session panel is gone".to_owned());
+        };
+        self.compiled_native_ui_for(wid, native.instance, view, viewport)
+            .map(std::borrow::Cow::Owned)
+    }
+
     fn visible_native_accessibility_owners(
         &self,
         wid: WindowId,
@@ -427,6 +496,7 @@ impl App {
         if let Some(error) = error {
             return Err(error);
         }
+        owners.extend(self.roster_accessibility(wid).map(|roster| roster.owner));
         Ok((owners, focused_native))
     }
 
@@ -618,7 +688,8 @@ impl App {
             .get(&wid)
             .and_then(|window| window.tab_set.active())
             .is_some_and(|tab| tab.focus == owner.view);
-        if !focused {
+        let panel = self.visible_session_organizer(wid) == Some(owner.view);
+        if !focused && !panel {
             let moved = self
                 .windows
                 .get_mut(&wid)
@@ -631,40 +702,56 @@ impl App {
             }
             self.sync_window(wid);
         }
-        let result = match routed {
-            RoutedAccessibilityAction::Activate { key, action, value } => self
-                .dispatch_native_control_action(
+        let result =
+            match routed {
+                RoutedAccessibilityAction::Activate { key, action, value } if panel => {
+                    let Some(geometry) = self.dock_geometry(wid) else {
+                        return;
+                    };
+                    let Ok(compiled) = self.reviewed_roster_ui(wid, owner.view, geometry.viewport)
+                    else {
+                        return;
+                    };
+                    let invoke = ActionInvocation { id: action, value };
+                    if Self::checked_native_action_node(&compiled, &key, &invoke).is_err() {
+                        return;
+                    }
+                    self.dispatch_native_view_event(wid, owner.view, AppEvent::Action(invoke))
+                }
+                RoutedAccessibilityAction::Activate { key, action, value } => self
+                    .dispatch_native_control_action(
+                        wid,
+                        owner.view,
+                        key,
+                        ActionInvocation { id: action, value },
+                        true,
+                    ),
+                RoutedAccessibilityAction::Focus { key } if panel => self
+                    .dispatch_native_view_event(wid, owner.view, AppEvent::FocusChanged(Some(key))),
+                RoutedAccessibilityAction::Focus { key } => {
+                    self.focus_native_control(wid, owner.view, key, true)
+                }
+                RoutedAccessibilityAction::Scroll { key, lines } => self
+                    .dispatch_native_view_event(wid, owner.view, AppEvent::ScrollAt { lines, key }),
+                RoutedAccessibilityAction::ScrollIntoView { key } => {
+                    self.dispatch_native_view_event(wid, owner.view, AppEvent::RevealControl(key))
+                }
+                RoutedAccessibilityAction::ReplaceSelectedText { text, .. } => {
+                    self.dispatch_native_view_event(wid, owner.view, AppEvent::InsertText(text))
+                }
+                RoutedAccessibilityAction::SetTextSelection {
+                    anchor_byte,
+                    focus_byte,
+                    ..
+                } => self.dispatch_native_view_event(
                     wid,
                     owner.view,
-                    key,
-                    ActionInvocation { id: action, value },
-                    true,
+                    AppEvent::EditorSetSelection {
+                        anchor: anchor_byte,
+                        head: focus_byte,
+                    },
                 ),
-            RoutedAccessibilityAction::Focus { key } => {
-                self.focus_native_control(wid, owner.view, key, true)
-            }
-            RoutedAccessibilityAction::Scroll { key, lines } => {
-                self.dispatch_native_view_event(wid, owner.view, AppEvent::ScrollAt { lines, key })
-            }
-            RoutedAccessibilityAction::ScrollIntoView { key } => {
-                self.dispatch_native_view_event(wid, owner.view, AppEvent::RevealControl(key))
-            }
-            RoutedAccessibilityAction::ReplaceSelectedText { text, .. } => {
-                self.dispatch_native_view_event(wid, owner.view, AppEvent::InsertText(text))
-            }
-            RoutedAccessibilityAction::SetTextSelection {
-                anchor_byte,
-                focus_byte,
-                ..
-            } => self.dispatch_native_view_event(
-                wid,
-                owner.view,
-                AppEvent::EditorSetSelection {
-                    anchor: anchor_byte,
-                    head: focus_byte,
-                },
-            ),
-        };
+            };
         if result.is_err() {
             return;
         }

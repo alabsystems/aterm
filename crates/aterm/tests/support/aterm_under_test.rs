@@ -136,6 +136,8 @@ pub(crate) fn snapshot(built: &Path) -> Snapshot {
         .join("aterm-under-test.noindex");
     std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("{root:?}: {error}"));
     let name = built.file_name().expect("the binary's file name");
+    // A wall bound: what moves `built` is a Cargo command of another suite, no process this one
+    // started, so no reading of this binary's tree measures it.
     let deadline = Instant::now() + Duration::from_secs(60);
     // A copy taken while Cargo writes `built` again is refused by the stamp check: the same
     // file, unchanged, before and after, and the copy as long as it.
@@ -193,6 +195,8 @@ pub(crate) fn snapshot(built: &Path) -> Snapshot {
 fn mark(root: &Path, folder: &Path, copy: &Path, len: u64) -> bool {
     let lock = root.join(LOCK);
     let busy = "a sweep held the lock on the copies of aterm for a minute";
+    // A wall bound handed to the lock: its holder is another process's sweep, not one this
+    // process started.
     let held = LockFile::take(&lock, Instant::now() + MARK_HANG, busy);
     let _held = held.unwrap_or_else(|error| panic!("lock {lock:?}: {error}"));
     if !published(copy, len) {
@@ -327,12 +331,12 @@ fn whole(scan: aterm_uds::holders::PathScan) -> Option<aterm_uds::holders::PathS
 }
 
 /// Whether the program at `copy`, run once with `--version` in a scratch environment (as
-/// `aterm_spec::wait::first_exec` runs it) and waited for to its end within
-/// [`FIRST_EXEC_HANG`](aterm_uds::deadline::FIRST_EXEC_HANG), wrote a line on its stdout or its
-/// stderr (its version, a panic's or the loader's words): proof that it ran from its file, so
+/// `aterm_spec::wait::first_exec` runs it) and waited for to its end until it made no progress
+/// for [`FIRST_EXEC_HANG`](aterm_uds::deadline::FIRST_EXEC_HANG), wrote a line on its stdout or
+/// its stderr (its version, a panic's or the loader's words): proof that it ran from its file, so
 /// macOS has finished assessing its first exec, since a process its program check holds runs
 /// nothing and only it and what it started hold those pipes. A run that could not start, wrote
-/// nothing or was ended at the deadline proves nothing.
+/// nothing or was ended as stalled proves nothing.
 pub(crate) fn prove(copy: &Path) -> bool {
     let Ok(scratch) = aterm_tempfile::tempdir() else {
         return false;
@@ -344,8 +348,11 @@ pub(crate) fn prove(copy: &Path) -> bool {
     }
     cmd.env("HOME", scratch.path())
         .env("TMPDIR", scratch.path());
-    let deadline = Instant::now() + aterm_uds::deadline::FIRST_EXEC_HANG;
-    let Ok(ran) = aterm_uds::deadline::output_until_complete_stdout(&mut cmd, deadline) else {
+    let Ok(ran) = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
+        &mut cmd,
+        aterm_uds::deadline::FIRST_EXEC_HANG,
+        "a copy's first run",
+    ) else {
         return false;
     };
     wrote_a_line(&ran.stdout) || wrote_a_line(&ran.stderr)

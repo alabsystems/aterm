@@ -491,7 +491,7 @@ fn a_slot_still_being_written_or_holding_another_text_is_passed_over() {
     let me = euid();
     let tmp = tempdir().expect("scratch");
     let text = "#!/bin/sh\nexit 5\n";
-    let cache = quiet_in(tmp.path()).join(format!("{STAND_IN_CACHE}{me}"));
+    let cache = quiet_in(tmp.path()).join(format!("{STAND_IN_CACHE}{me}.noindex"));
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&cache)
@@ -536,7 +536,7 @@ fn a_slot_handed_out_is_marked_used_and_one_passed_over_is_not() {
     let me = euid();
     let tmp = tempdir().expect("scratch");
     let text = "#!/bin/sh\nexit 8\n";
-    let cache = quiet_in(tmp.path()).join(format!("{STAND_IN_CACHE}{me}"));
+    let cache = quiet_in(tmp.path()).join(format!("{STAND_IN_CACHE}{me}.noindex"));
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&cache)
@@ -593,7 +593,7 @@ fn a_cache_folder_not_the_users_alone_is_refused() {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     let me = euid();
     let text = "#!/bin/sh\nexit 6\n";
-    let cache = |tmp: &Path, uid: u32| quiet_in(tmp).join(format!("{STAND_IN_CACHE}{uid}"));
+    let cache = |tmp: &Path, uid: u32| quiet_in(tmp).join(format!("{STAND_IN_CACHE}{uid}.noindex"));
     let held = |dir: &Path| fs::read_dir(dir).map(Iterator::count).ok();
     let private = |dir: &Path| {
         fs::DirBuilder::new()
@@ -770,6 +770,14 @@ fn a_shared_roots_directories_go_in_its_quiet_folder() {
 fn tempdirs_in_shared_roots_land_where_fseventsd_drops_their_events() {
     let dir = tempdir().expect("tempdir");
     assert!(is_quiet(dir.path()), "{:?}", dir.path());
+    assert!(
+        dir.path()
+            .file_name()
+            .unwrap()
+            .as_encoded_bytes()
+            .ends_with(b".noindex")
+    );
+    assert!(aterm_backup::Backups::SYSTEM.excluded(&fs::File::open(dir.path()).unwrap()));
     assert!(dir.path().starts_with(call0(std::env::temp_dir)));
     let short = Builder::new()
         .prefix("atq-")
@@ -948,4 +956,17 @@ fn a_scratch_root_holding_a_sealed_directory_is_removed_whole() {
         "the sealed store kept {} alive",
         path.display()
     );
+}
+
+#[test]
+fn quiet_names_leave_room_for_noindex_without_losing_random_bits_or_counter_identity() {
+    let mut names = std::collections::BTreeSet::new();
+    for count in [0, 1, 9, 10, u64::MAX] {
+        for random in [0, 1, 63, 64, u64::MAX] {
+            let name = compact_name("p_", count, random);
+            assert!(names.insert(name.clone()));
+            let shortest_old = format!("p_1_{random:016x}_{count}");
+            assert!(name.len() + ".noindex".len() <= shortest_old.len());
+        }
+    }
 }

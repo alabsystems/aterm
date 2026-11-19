@@ -22,6 +22,9 @@ macro_rules! words {
             /// Every word, in declaration order.
             pub const ALL: &'static [Self] = &[$(Self::$variant),+];
 
+            /// Every word as written, in declaration order: a column's `Ty::Enum`.
+            pub const WORDS: &'static [&'static str] = &[$($word),+];
+
             /// The word it is written as.
             pub const fn word(self) -> &'static str {
                 match self { $(Self::$variant => $word),+ }
@@ -174,6 +177,25 @@ words!(
 );
 
 words!(
+    /// What a published shared-file write does, a `decided`'s verb (`via`), as the publisher
+    /// reads it off the intent (`file::publish::via`): a cell written, a row born, a row's
+    /// lifecycle ended, a revert, a person's resolve of a held write, or a Mac's statement of its
+    /// own row. A face's commit is named by what each of its writes does. A word this build does
+    /// not know drops the event whole, as an unknown kind does.
+    Via {
+        Set = "set",
+        Add = "add",
+        Rm = "rm",
+        Revert = "revert",
+        Resolve = "resolve",
+        State = "state",
+    }
+);
+
+/// The CLI word of a `decided`: its write went through `aterm file`, whatever program asked.
+pub const DECIDED_CLI: &str = "aterm";
+
+words!(
     /// How exactly a reset time is known (design §7: window identity tolerance).
     Res {
         Exact = "exact",
@@ -195,6 +217,35 @@ words!(
         Credits = "credits",
     }
 );
+
+words!(
+    /// The model whose own weekly bucket a `7d-model` wall is of (FL-269): the bucket's id as the
+    /// harness names it (`harness::profile::Bucket::id`) and the survey's `model_walls=` writes
+    /// it. A wall of Fable's, Opus's or Sonnet's week walls that model's sessions alone, never
+    /// the account (`docs/OWNER_RULINGS.md`, 2026-11-11: "no, keep the same account and switch
+    /// from fable to opus."). [`Self::Other`] is the week of a model the harness names no bucket
+    /// of (`seven_day_other`, a `/usage` panel's `seven_day_<name>`): the harness takes its wall
+    /// as the whole account's (`harness::accounts::Account::limited_until`), so every reader
+    /// takes it as a wall for every session, and reads a bucket word it does not know as this
+    /// one. A `7d-model` wall that names no model (an older build's) cannot say whose week it
+    /// is, so no reader takes it as any model's wall or as the account's.
+    ModelBucket {
+        Fable = "seven_day_overage_included",
+        Opus = "seven_day_opus",
+        Sonnet = "seven_day_sonnet",
+        Other = "seven_day_other",
+    }
+);
+
+impl ModelBucket {
+    /// The bucket a row's `model_walls` entry names by `word`: its own where this build has the
+    /// word, else [`Self::Other`], a week of a model this build names no bucket of (a newer
+    /// build's), whose wall this build takes as every session's, as it takes its own.
+    #[must_use]
+    pub fn read(word: &str) -> Self {
+        Self::parse(word).unwrap_or(Self::Other)
+    }
+}
 
 /// A bounded word of `N` bytes or fewer, held inline.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -267,10 +318,11 @@ impl std::fmt::Debug for Pk {
 /// A sub-account's observed `AccountKey`: 12 lower-case hex digits.
 pub type SubKey = Word<12>;
 
-/// One event (design §4.17 `ev`): `{t, k, a, c, s?, w?, p?, r?, rr?, u?, plan?, src, why?, to?,
-/// x?, h?, op?, via?, pg?}`, `a` absent only on a `probe` of an unpooled CLI's unseen login and on
-/// a `decided`, `x` and `h` only on a kind that [names a tab](Kind::names_tab), and `op`, `via`
-/// and `pg` on a `decided` and on nothing else.
+/// One event (design §4.17 `ev`): `{t, k, a, c, s?, w?, m?, p?, r?, rr?, u?, plan?, src, why?,
+/// to?, x?, h?, op?, via?, pg?}`, `a` absent only on a `probe` of an unpooled CLI's unseen login
+/// and on a `decided`, `m` only on a `wall`, `wall-cleared` or `reset-used` of the `7d-model`
+/// window, `x` and `h` only on a kind that [names a tab](Kind::names_tab), and `op`, `via` and
+/// `pg` on a `decided` and on nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Event {
     /// When, Unix seconds.
@@ -286,6 +338,9 @@ pub struct Event {
     /// The sub-account's `AccountKey`, where the account has workspaces.
     pub sub: Option<SubKey>,
     pub window: Option<Window>,
+    /// The model a `7d-model` wall, its clearing or a refill of that window is of
+    /// ([`ModelBucket`]).
+    pub model: Option<ModelBucket>,
     /// Tenths of a percent used.
     pub pct_x10: Option<u16>,
     /// The window's reset, Unix seconds.
@@ -307,11 +362,14 @@ pub struct Event {
     pub harness: Option<Word<16>>,
     /// A `decided`'s operation: the first 8 bytes of its digest, 16 lower-case hex.
     pub op: Option<Word<16>>,
-    /// A `decided`'s verb (`set`, `add`, `rm`, `revert`, `resolve`, `commit`).
-    pub via: Option<Word<16>>,
-    /// A `decided`'s author, as the intent says it (`person`, `program`, `harness`, an agent's
-    /// word): a claim, never an admission condition (docs/DESIGN-shared-files-2026-11-11.md §5).
-    pub program: Option<Word<16>>,
+    /// A `decided`'s verb: what the published intent does ([`Via`]).
+    pub via: Option<Via>,
+    /// A `decided`'s author, as the intent says it (its `by`: `person`, `program`, `editor`,
+    /// `harness`, an agent's word): a claim, never an admission condition
+    /// (docs/DESIGN-shared-files-2026-11-11.md §5). A word of `aterm file --by`'s grammar,
+    /// `[a-z][a-z0-9-]{0,19}` ([`aterm_file::name::part`]); a build that held it to sixteen
+    /// bytes refuses a longer one.
+    pub program: Option<Word<20>>,
 }
 
 impl Event {
@@ -338,6 +396,14 @@ impl Event {
             },
             _ => None,
         }
+    }
+
+    /// Whether this event may name a model ([`ModelBucket`]): a wall, its clearing or a refill
+    /// (`reset-used`) of the `7d-model` window, the one window whose walls and refills are a
+    /// model's own week's (FL-271: a refill of the Sonnet week refills no Fable week).
+    pub fn names_model(&self) -> bool {
+        matches!(self.kind, Kind::Wall | Kind::WallCleared | Kind::ResetUsed)
+            && self.window == Some(Window::WeekModel)
     }
 
     /// Whether the flusher sends this event out on its next pass (design §3.9): a sharp kind, a
@@ -423,6 +489,9 @@ impl Event {
             line.text(f, "h", h.as_str())?;
         }
         line.text(f, "k", self.kind.word())?;
+        if let Some(m) = self.model {
+            line.text(f, "m", m.word())?;
+        }
         if let Some(op) = &self.op {
             line.text(f, "op", op.as_str())?;
         }
@@ -452,8 +521,8 @@ impl Event {
         if let Some(u) = self.until {
             line.uint(f, "u", u)?;
         }
-        if let Some(via) = &self.via {
-            line.text(f, "via", via.as_str())?;
+        if let Some(via) = self.via {
+            line.text(f, "via", via.word())?;
         }
         if let Some(w) = self.window {
             line.text(f, "w", w.word())?;
@@ -495,6 +564,9 @@ impl Event {
         if let Some(w) = self.window {
             text("w", w.word());
         }
+        if let Some(m) = self.model {
+            text("m", m.word());
+        }
         if let Some(why) = &self.why {
             text("why", why.as_str());
         }
@@ -507,8 +579,8 @@ impl Event {
         if let Some(op) = &self.op {
             text("op", op.as_str());
         }
-        if let Some(via) = &self.via {
-            text("via", via.as_str());
+        if let Some(via) = self.via {
+            text("via", via.word());
         }
         if let Some(pg) = &self.program {
             text("pg", pg.as_str());
@@ -530,9 +602,9 @@ impl Event {
     /// peer's modified build cannot slip text past the vocabulary.
     pub fn from_value(value: &Value) -> Option<Self> {
         let o = value.as_object()?;
-        const KEYS: [&str; 19] = [
-            "a", "c", "h", "k", "op", "p", "pg", "plan", "r", "rr", "s", "src", "t", "to", "u",
-            "via", "w", "why", "x",
+        const KEYS: [&str; 20] = [
+            "a", "c", "h", "k", "m", "op", "p", "pg", "plan", "r", "rr", "s", "src", "t", "to",
+            "u", "via", "w", "why", "x",
         ];
         if o.keys().any(|k| !KEYS.contains(&k.as_str())) {
             return None;
@@ -564,6 +636,10 @@ impl Event {
             window: match word("w")? {
                 None => None,
                 Some(w) => Some(Window::parse(w)?),
+            },
+            model: match word("m")? {
+                None => None,
+                Some(m) => Some(ModelBucket::parse(m)?),
             },
             pct_x10: match opt(uint("p"))? {
                 None => None,
@@ -606,21 +682,47 @@ impl Event {
             },
             via: match word("via")? {
                 None => None,
-                Some(w) => Some(Word::new(w)?),
+                Some(w) => Some(Via::parse(w)?),
             },
             program: match word("pg")? {
                 None => None,
-                Some(w) => Some(Word::new(w)?),
+                Some(w) => Some(Word::new(w).filter(|_| aterm_file::name::part(w))?),
             },
         };
         // Only a kind about one tab's run names the tab and its harness.
         if (event.tab.is_some() || event.harness.is_some()) && !event.kind.names_tab() {
             return None;
         }
-        // A `decided` names its operation, verb and author, and nothing else does.
+        if event.model.is_some() && !event.names_model() {
+            return None;
+        }
+        // A `decided` names its operation, verb and author, and nothing else does. It is about a
+        // write to a shared file through `aterm file` (`c` `aterm`, `src` `file`, the one source
+        // no other kind has) and names nothing else: no account, window, figure, reason or tab.
         let decided = event.op.is_some() && event.via.is_some() && event.program.is_some();
         let any = event.op.is_some() || event.via.is_some() || event.program.is_some();
         if (event.kind == Kind::Decided) != decided || (event.kind != Kind::Decided && any) {
+            return None;
+        }
+        if (event.kind == Kind::Decided) != (event.src == Source::File) {
+            return None;
+        }
+        if event.kind == Kind::Decided
+            && (event.cli.as_str() != DECIDED_CLI
+                || event.account.is_some()
+                || event.sub.is_some()
+                || event.window.is_some()
+                || event.model.is_some()
+                || event.pct_x10.is_some()
+                || event.reset.is_some()
+                || event.res.is_some()
+                || event.until.is_some()
+                || event.plan.is_some()
+                || event.why.is_some()
+                || event.to.is_some()
+                || event.tab.is_some()
+                || event.harness.is_some())
+        {
             return None;
         }
         // An event names its account; a probe may name only its realm, and then no workspace;

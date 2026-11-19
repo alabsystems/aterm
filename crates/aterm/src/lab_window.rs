@@ -83,8 +83,30 @@ fn window_context(argv: &[OsString]) -> Result<(), String> {
     Ok(())
 }
 
+fn take_window_offer(
+    argv: &mut Vec<OsString>,
+) -> Result<Option<aterm_types::lab_window_guard::GuardBundle>, String> {
+    // A command verb owns its operands, including flag-shaped values. The
+    // private window grammar requires an option first (window_context below).
+    // Do not scan `pkg claim`/the atpkg alias as window options or adopt a
+    // descriptor named by an opaque label, key or command payload.
+    let package_alias = argv
+        .first()
+        .and_then(|word| std::path::Path::new(word).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| aterm_cli::alias_route(name, "") == aterm_cli::AliasRoute::Pkg);
+    if package_alias
+        || argv
+            .get(1)
+            .is_some_and(|word| !word.as_encoded_bytes().starts_with(b"-"))
+    {
+        return Ok(None);
+    }
+    aterm_types::lab_window_guard::take(argv)
+}
+
 pub(super) fn enter(argv: &mut Vec<OsString>) -> Result<Guard, String> {
-    let offered = aterm_types::lab_window_guard::take(argv)?;
+    let offered = take_window_offer(argv)?;
     if let Some(offered) = offered {
         window_context(argv)?;
         #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]

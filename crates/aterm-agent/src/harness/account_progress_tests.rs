@@ -58,6 +58,7 @@ fn known_signed_out_account_is_explained_without_a_sign_in_attempt() {
             left: None,
             default_home: true,
             route: crate::harness::accounts::AuthRoute::Stored,
+            model: crate::harness::accounts::ModelWeek::Unread,
         },
         Some(&Point::Wall {
             window: "seven_day".into(),
@@ -102,6 +103,7 @@ fn current_blocker_leads_only_when_recovery_has_no_eligible_alternate() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let generic = "synthetic supervisor reason";
     for (phase, judged, alternate_ready, prefer) in [
@@ -232,6 +234,7 @@ fn current_login_failure_is_visible_without_becoming_a_rotation_candidate() {
                 left: None,
                 default_home: true,
                 route: crate::harness::accounts::AuthRoute::Stored,
+                model: crate::harness::accounts::ModelWeek::Unread,
             },
             Some(&Point::Wall {
                 window: "seven_day".into(),
@@ -282,6 +285,7 @@ fn pending_human_steps_are_visible_only_while_sign_in_is_needed() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let point = Point::Wall {
         window: "seven_day".into(),
@@ -391,6 +395,7 @@ fn inventory_keeps_the_real_session_and_does_not_invent_capacity_or_a_decision()
             left: None,
             default_home: true,
             route: crate::harness::accounts::AuthRoute::Stored,
+            model: crate::harness::accounts::ModelWeek::Unread,
         },
         Some(&Point::Wall {
             window: "seven_day".into(),
@@ -423,6 +428,7 @@ fn inventory_keeps_the_real_session_and_does_not_invent_capacity_or_a_decision()
             left: None,
             default_home: true,
             route: crate::harness::accounts::AuthRoute::Stored,
+            model: crate::harness::accounts::ModelWeek::Unread,
         },
         None,
     );
@@ -468,6 +474,7 @@ fn a_wait_on_an_account_this_mac_may_not_keep_says_why_first() {
         left: None,
         default_home: true,
         route: crate::harness::accounts::AuthRoute::Stored,
+        model: crate::harness::accounts::ModelWeek::Unread,
     };
     let mut unclaimed = State {
         machine: "0a0b".into(),

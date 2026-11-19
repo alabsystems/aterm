@@ -5001,10 +5001,31 @@ impl ReadySignal {
     /// stop first, so the proof is the last thing the channel carries.
     #[must_use]
     pub(crate) fn signal_proof(self, proof: AdoptionProof) -> bool {
+        self.signal_proof_with(proof, write_wire)
+    }
+
+    fn signal_proof_with(
+        self,
+        proof: AdoptionProof,
+        write: impl FnOnce(&std::os::fd::OwnedFd, &[u8; READY_WIRE_LEN]) -> bool,
+    ) -> bool {
         if self.reports {
             crate::handoff_progress::disarm(self.raw_fd());
         }
-        write_wire(&self.fd, &proof.to_wire())
+        write(&self.fd, &proof.to_wire())
+    }
+
+    /// Observe the real proof-write boundary after the same disarm used by production.
+    #[cfg(test)]
+    pub(crate) fn signal_proof_observing(
+        self,
+        proof: AdoptionProof,
+        before_write: impl FnOnce(),
+    ) -> bool {
+        self.signal_proof_with(proof, |fd, wire| {
+            before_write();
+            write_wire(fd, wire)
+        })
     }
 }
 

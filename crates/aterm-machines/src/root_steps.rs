@@ -17,11 +17,12 @@
 //! - the root LAN broker ([`crate::items::lan::LanBroker`]), a resident root LaunchDaemon through
 //!   which all of aterm's own outbound LAN traffic goes, so macOS never asks its Local Network
 //!   question about aterm (`docs/DESIGN-lan-broker-2026-11-05.md`);
-//! - Spotlight no longer indexing the console account's home folders other than Documents and
-//!   Desktop (Library and Applications stay too): they join the data volume's excluded
-//!   folders, so checkouts, downloads and generated files there cannot start an indexing
-//!   storm ([`crate::init_spotlight::Scope`]). Its failure is journaled and never fails the
-//!   transaction.
+//! - Spotlight indexing Applications, Documents, Desktop and the synced drives only: every
+//!   folder beside them on the data volume (the console account's other home folders, its
+//!   Library's other folders, the volume's other top-level folders, /Users//Shared) joins the
+//!   data volume's excluded folders, so checkouts, downloads, caches and generated files cannot
+//!   start an indexing storm ([`crate::init_spotlight::Scope`]). Its failure is journaled and
+//!   never fails the transaction.
 //!
 //! Why a sudoers rule for the name, and not a privileged helper or a second password: a second
 //! password is a second prompt, which the ruling rules out, and a helper would put root code of
@@ -50,18 +51,32 @@
 //! independent root work is owed, including when the compiler refuses or cannot be read:
 //! an unreadable root step is not owed, so no password is asked for want of a reading.
 //!
-//! A step whose apply fails for good leaves root's record of it, so a run nobody asked for does
-//! not ask the password for that step again by itself: the naming rule its own ([`REFUSED_RULE`])
-//! and Spotlight's scope its own (`spotlight_scope::REFUSED`), which [`owed`] reads, and developer
+//! A step whose apply fails leaves root's record of it, so a run nobody asked for does not ask
+//! the password for that step again by itself: the naming rule its own ([`REFUSED_RULE`]) and
+//! Spotlight's scope its own (`spotlight_scope::REFUSED`), which [`owed`] reads, and developer
 //! mode and the broker the keyed records of `aterm_types::macos_setup::refused`, which
-//! [`refused`] reads where the password is decided. A step so recorded still reads owed.
+//! [`refused`] reads where the password is decided. Those two record a failure that is the
+//! step's own at once, and one that got no verdict (a check or a tool that did not answer) once
+//! it comes again [`aterm_types::macos_setup::refused::APART`] later in the same boot, for that
+//! boot alone ([`record_refusal`]). A step so recorded still reads owed. So does an update the
+//! running broker did not adopt by itself ([`Owed::LanBrokerAdoption`]), which no run nobody
+//! asked for asks the password for alone: the next Mac password setup asks for its root steps,
+//! or a person's own `aterm init`, renews it.
+//!
+//! A naming rule the person removed with its own journaled revert ([`NameRule`]'s, which moves
+//! it onto [`REMOVED_RULE`]) is theirs: [`owed`] does not hold it, the root half leaves it out
+//! unless a person's own request says to put it back
+//! (`crate::init_clt::RESTORE_NAME_RULE`), and putting it back removes the marker
+//! ([`rule_removed`]). Developer mode turned off after aterm saw it on is the person's too, by
+//! the account's own record (`aterm_types::macos_setup::debugger_record`), which
+//! `crate::init_clt` reads.
 
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, Read};
 use crate::port::{Cmd, Ran, System};
 use aterm_containment::consent::{ADMIN_GROUP, DebuggerMember, classify_membership};
 use aterm_types::machine_name::{GeneratedNames, OsSlot};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub use aterm_types::macos_setup::ADMITTED_NAME_RULE;
 
@@ -84,6 +99,10 @@ pub const SUDO: &str = "/usr/bin/sudo";
 /// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`]): the next elevation that runs for
 /// another step tries the rule once more and removes it once the rule goes live.
 pub const REFUSED_RULE: &str = aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED;
+
+/// Where the rule's journaled revert leaves it
+/// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REMOVED`], [`rule_removed`]).
+pub const REMOVED_RULE: &str = aterm_types::macos_setup::ADMITTED_NAME_RULE_REMOVED;
 
 /// The names the rule lets the account set, as `scutil` spells them.
 pub const NAME_PREFS: [&str; 3] = ["ComputerName", "LocalHostName", "HostName"];
@@ -128,16 +147,31 @@ pub enum Owed {
     /// The rule that names the Mac after admission is not in place.
     NameRule,
     /// The root LAN broker's image or plist is missing or not this build's, save an image of the
-    /// source's own signing team, which the running broker adopts by itself
-    /// ([`crate::items::lan::reading`], [`aterm_uds::lan::install::Part::Adopting`]), or its job
-    /// is known stopped; never a job launchd lists switched off, which stays the person's
-    /// ([`aterm_uds::lan::install::Reading::owed_with_job`]).
+    /// source's own signing team: an older build's, which the running broker adopts by itself
+    /// ([`crate::items::lan::reading`], [`aterm_uds::lan::install::Part::Adopting`]), or a newer
+    /// one's, which this build keeps ([`aterm_uds::lan::install::Part::Kept`]) whatever launchd
+    /// holds of its job; or its job is known stopped; never a job launchd lists switched off,
+    /// which stays the person's
+    /// ([`aterm_uds::lan::install::Reading::owed_with_job`]), and never for a development build
+    /// outside a VM guest, which owns no broker ([`aterm_uds::lan::install::Part::Development`]).
     LanBroker,
-    /// Spotlight still indexes a folder of this account's home that setup has neither excluded
-    /// nor failed to ([`crate::init_spotlight::scope_owed`]). Only a home setup's password never
-    /// scoped is asked for by itself ([`crate::init_spotlight::automatic_scope_owed`]); a folder
-    /// made since is the person's explicit request to exclude
-    /// ([`crate::init_clt::CommandLineTools::scoping_new_folders`]).
+    /// The running broker did not adopt this build: its image of the source's own team still
+    /// served another build [`aterm_uds::lan::adoption::LOOKS`] of its looks after this account
+    /// first expected it to adopt ([`crate::items::lan::expected_reading`],
+    /// [`aterm_uds::lan::install::Part::NotAdopted`]), its plist owing nothing, the broker still
+    /// speaking this build's protocol (one that does not serves this build nothing, so it is
+    /// [`Self::LanBroker`], which asks), and root not having refused to install this bundle
+    /// (that stays [`Self::LanBroker`], [`refused`]). The
+    /// next Mac password setup asks for its root steps, or a person's own `aterm init`, renews
+    /// the image, and none is asked for it alone ([`Self::asks_by_itself`]): it rides along, as
+    /// a step root's record refused does.
+    LanBrokerAdoption,
+    /// Spotlight still indexes a folder beside Applications, Documents, Desktop and the synced
+    /// drives that setup has neither excluded nor failed to
+    /// ([`crate::init_spotlight::scope_owed`]). Only a home setup's password never scoped, or
+    /// whose rest of the volume it never scoped, is asked for by itself
+    /// ([`crate::init_spotlight::automatic_scope_owed`]); a folder made since is the person's
+    /// explicit request to exclude ([`crate::init_clt::CommandLineTools::scoping_new_folders`]).
     Spotlight,
 }
 
@@ -152,8 +186,21 @@ impl Owed {
                 "installs the helper that lets aterm reach this network's Macs without macOS \
                  asking"
             }
-            Self::Spotlight => "stops Spotlight indexing your other home folders",
+            Self::LanBrokerAdoption => {
+                "renews the local network helper, which did not take up this aterm by itself"
+            }
+            Self::Spotlight => {
+                "keeps Spotlight to your Applications, Documents, Desktop and synced drives"
+            }
         }
+    }
+
+    /// Whether a run nobody asked for asks the Mac password for this step alone: every step but
+    /// [`Self::LanBrokerAdoption`], which waits for the next Mac password setup asks for its root
+    /// steps, or a person's own `aterm init`.
+    #[must_use]
+    pub const fn asks_by_itself(self) -> bool {
+        !matches!(self, Self::LanBrokerAdoption)
     }
 }
 
@@ -271,6 +318,19 @@ fn rule_in_place(sys: &dyn System) -> Option<bool> {
     }
 }
 
+/// Whether a person removed the naming rule with its own journaled revert ([`NameRule`]'s, a
+/// `/bin/mv -f` onto [`REMOVED_RULE`]): no file stands at [`ADMITTED_NAME_RULE`] and the marker
+/// does. Both are stats that need no root (the include directory is world-searchable), which an
+/// account and root read alike. A rule back in place, by an older build that never reads the
+/// marker or by hand, is not removed; the next root run that refreshes it removes the marker.
+#[must_use]
+pub fn rule_removed(sys: &dyn System) -> bool {
+    matches!(
+        sys.stat(Path::new(ADMITTED_NAME_RULE)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) && sys.stat(Path::new(REMOVED_RULE)).is_ok()
+}
+
 /// The naming permission as this process's ordinary account reads it ([`name_rule_reading`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameRuleReading {
@@ -278,6 +338,9 @@ pub enum NameRuleReading {
     /// nonzero length. Setup's password step owes it ([`owed`]) unless this Mac's `visudo`
     /// refused it before ([`REFUSED_RULE`]).
     Missing,
+    /// No rule, and the person removed it with the elevation's own revert ([`rule_removed`]):
+    /// nothing owes it or puts it back but a person's own request.
+    Removed,
     /// A rule stands as setup leaves one, but its bytes are not this build's [`name_rule`] for
     /// this account (an older build's text, or another account's rule). Setup's password step
     /// never owes it ([`owed`] counts a missing rule only), so only setup the person asks for
@@ -306,6 +369,7 @@ pub fn name_rule_reading(sys: &dyn System) -> Result<NameRuleReading, String> {
     let wanted =
         name_rule(&identity.user.name).ok_or("the current account cannot own a naming rule")?;
     match rule_in_place(sys) {
+        Some(false) if rule_removed(sys) => return Ok(NameRuleReading::Removed),
         Some(false) => return Ok(NameRuleReading::Missing),
         None => return Err("the existing naming permission could not be inspected".into()),
         Some(true) => {}
@@ -343,22 +407,33 @@ pub fn owed(sys: &dyn System) -> Vec<Owed> {
     }
     if rule_in_place(sys) == Some(false)
         && matches!(sys.stat(Path::new(REFUSED_RULE)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && !rule_removed(sys)
     {
         owed.push(Owed::NameRule);
     }
-    if crate::items::lan::reading(sys).is_some_and(|reading| {
-        reading.is_ok_and(|r| {
-            r.owed_with_job(
-                || {
-                    crate::items::aterm::system_job_pid(sys, aterm_uds::lan::LABEL)
-                        .ok()
-                        .map(|job| matches!(job, Some(Some(_))))
-                },
-                || crate::items::lan::switched_off(sys).ok(),
-            )
-        })
-    }) {
-        owed.push(Owed::LanBroker);
+    if let Some(Ok(reading)) = crate::items::lan::expected_reading(sys)
+        && reading.owed_with_job(
+            || crate::items::lan::job_state(sys),
+            || crate::items::lan::switched_off(sys).ok(),
+        )
+    {
+        // An image the broker did not adopt is all that is owed where the plist owes nothing
+        // (current, or unreadable, which never asks), the broker still serves this build's
+        // protocol (it answered for it, so it runs and serves this build), and root did not
+        // already refuse to install this bundle: the next root steps renew the image. A broker
+        // of another protocol serves this build nothing, so its renewal asks (as
+        // `Owed::LanBroker`, which `refused` keeps from asking again after root failed at it);
+        // root's own refusal stays that refused step, in its own words.
+        let adoption = matches!(
+            reading.image,
+            aterm_uds::lan::install::Part::NotAdopted { serves: true, .. }
+        ) && !reading.plist.owed()
+            && !refused(sys, Owed::LanBroker);
+        owed.push(if adoption {
+            Owed::LanBrokerAdoption
+        } else {
+            Owed::LanBroker
+        });
     }
     if crate::init_spotlight::scope_owed(sys) {
         owed.push(Owed::Spotlight);
@@ -434,18 +509,22 @@ fn run_ok(sys: &dyn System, cmd: &Cmd) -> Result<Ran, String> {
 /// automatic caller first holds [`name_rule_current`] to `Ok(true)`.
 ///
 /// # Errors
-/// No rule is in place (the next elevation names the Mac), or a
-/// name `sudo` or `scutil` refused, or `current` no longer admits this intent, in one line.
+/// No rule is in place (the next elevation names the Mac, or, where the person removed it, their
+/// own request puts it back), or a name `sudo` or `scutil` refused, or `current` no longer admits
+/// this intent, in one line.
 pub fn name_by_rule(
     sys: &dyn System,
     names: &GeneratedNames,
     current: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<&'static str>, String> {
     if rule_in_place(sys) != Some(true) {
-        return Err(
+        return Err(if rule_removed(sys) {
+            "you removed setup's naming permission, so aterm leaves this Mac's names as they are; \
+             the name menu's permission repair or `aterm init` puts it back"
+        } else {
             "the rule that names this Mac is not in place, so setup's next Mac password names it"
-                .to_owned(),
-        );
+        }
+        .to_owned());
     }
     let scutil = crate::items::names::SCUTIL;
     let mut set = Vec::new();
@@ -472,62 +551,123 @@ pub fn name_by_rule(
     Ok(set)
 }
 
-/// Root's note that a step's apply failed for good with the inputs `key` names
-/// (`aterm_types::macos_setup::refused`): the key joins the step's record at `file`, which a run
-/// nobody asked for reads before it asks the Mac password for the step ([`refused`]). Best
-/// effort, as root: a record that cannot be written leaves the step asked for again, as it was
-/// before any record.
-pub(crate) fn record_refusal(sys: &dyn System, file: &str, key: &str) {
-    use aterm_types::macos_setup::refused::KEYS;
-    let mut keys = crate::init_spotlight::listed(sys, file).unwrap_or_default();
-    if keys.len() >= KEYS || !keys.insert(PathBuf::from(key)) {
+/// Root's note that a step's apply with the inputs `key` names ended with `failure`
+/// (`aterm_types::macos_setup::refused::noted`) at root's clock, in this boot
+/// ([`crate::first_exec::boot_session`]): the step's record at `file`, which a run nobody asked
+/// for reads before it asks the Mac password for the step ([`refused`]). The record is read and
+/// replaced only while root holds its lock ([`System::hold_record`]), which the LAN broker takes
+/// to take out its own install's lines, so neither writes over a reading the other has since
+/// replaced; the boot is read before the lock is taken, so no other process waits on it. Best
+/// effort, as root: a record that cannot be written or whose lock cannot be held, and a
+/// no-verdict in a boot root cannot read, leave the step asked for again, as it was before any
+/// record.
+pub(crate) fn record_refusal(
+    sys: &dyn System,
+    file: &str,
+    key: &str,
+    failure: aterm_types::macos_setup::refused::Failure,
+) {
+    let path = Path::new(file);
+    if let Some(dir) = path.parent()
+        && let Err(error) = sys.create_dir_all(dir, 0o755)
+    {
+        aterm_log::warn!(
+            "setup: a refused root step was not recorded: {}: {error}",
+            dir.display()
+        );
         return;
     }
-    if let Err(why) = crate::init_spotlight::list(sys, file, &keys) {
+    let boot = crate::first_exec::boot_session(sys);
+    let _held = match sys.hold_record(path) {
+        Ok(held) => held,
+        Err(error) => {
+            aterm_log::warn!("setup: a refused root step was not recorded: {file}: {error}");
+            return;
+        }
+    };
+    let lines = crate::init_spotlight::listed(sys, file).unwrap_or_default();
+    let Some(lines) =
+        aterm_types::macos_setup::refused::noted(&lines, key, failure, sys.now(), boot.as_deref())
+    else {
+        return;
+    };
+    if let Err(why) = crate::init_spotlight::list(sys, file, &lines) {
         aterm_log::warn!("setup: a refused root step was not recorded: {why}");
     }
 }
 
-/// Remove a step's record at `file`: its apply succeeded.
+/// Remove a step's record at `file`: its apply succeeded. The removal is made while root holds
+/// the record's lock ([`System::hold_record`]), so a LAN broker taking out its own install's
+/// lines finishes first and never writes the record back after it; a record already gone is
+/// removed. Where the lock cannot be held the record is removed all the same, and that is
+/// logged: a success's word stands.
 pub(crate) fn clear_refusal(sys: &dyn System, file: &str) {
     let file = Path::new(file);
-    if sys.stat(file).is_ok()
-        && let Err(error) = sys.remove(file)
-    {
-        aterm_log::warn!("setup: {} was not removed: {error}", file.display());
+    if sys.stat(file).is_err() {
+        return;
     }
+    let held = sys.hold_record(file);
+    if let Err(error) = &held {
+        aterm_log::warn!(
+            "setup: {} is removed without its lock: {error}",
+            file.display()
+        );
+    }
+    match sys.remove(file) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            aterm_log::warn!("setup: {} was not removed: {error}", file.display());
+        }
+        _ => {}
+    }
+    drop(held);
 }
 
-/// Whether a root apply already failed for good at `step` with the inputs it reads now, so a
-/// run nobody asked for does not ask the Mac password for it again
-/// (`aterm_types::macos_setup::refused`). The step still reads owed ([`owed`]): a person's own
-/// run asks for it, and every root run that carries it tries it. `false` for the naming rule
-/// and Spotlight's scope, whose own records [`owed`] already reads, and wherever the step's
-/// inputs or record cannot be read.
+/// Whether a root apply already failed at `step` with the inputs it reads now, for good or, in
+/// this boot ([`crate::first_exec::boot_session`]), stalled, so a run nobody asked for does not
+/// ask the Mac password for it again (`aterm_types::macos_setup::refused::stands`). The step
+/// still reads owed ([`owed`]): a person's own run asks for it, and every root run that carries
+/// it tries it. `false` for the naming rule and Spotlight's scope, whose own records [`owed`]
+/// already reads, for an adoption the broker did not make, which no root apply refused
+/// ([`Owed::asks_by_itself`]), and wherever the step's inputs or record cannot be read.
 #[must_use]
 pub fn refused(sys: &dyn System, step: Owed) -> bool {
     use aterm_types::macos_setup::refused::{
         DEVELOPER_MODE, LAN_BROKER, developer_mode_key, stands,
     };
     let reads = crate::init_spotlight::Port(sys);
+    let boot = || crate::first_exec::boot_session(sys);
     match step {
-        Owed::Debugger => stands(&reads, DEVELOPER_MODE, || match developer_mode_now(sys)? {
-            false => Some(developer_mode_key(false, 0)),
-            true => sys
-                .identity()
-                .ok()
-                .map(|identity| developer_mode_key(true, identity.user.uid)),
-        }),
-        Owed::LanBroker => stands(&reads, LAN_BROKER, || crate::items::lan::refusal_key(sys)),
-        Owed::NameRule | Owed::Spotlight => false,
+        Owed::Debugger => stands(
+            &reads,
+            DEVELOPER_MODE,
+            || match developer_mode_now(sys)? {
+                false => Some(developer_mode_key(false, 0)),
+                true => sys
+                    .identity()
+                    .ok()
+                    .map(|identity| developer_mode_key(true, identity.user.uid)),
+            },
+            boot,
+        ),
+        Owed::LanBroker => stands(
+            &reads,
+            LAN_BROKER,
+            || crate::items::lan::refusal_key(sys),
+            boot,
+        ),
+        Owed::NameRule | Owed::Spotlight | Owed::LanBrokerAdoption => false,
     }
 }
 
 /// `[developer] debugger = true`: developer mode on, and the console account authorized as an
 /// admin or in [`DEVELOPER_GROUP`]. Applied as root, by the elevation's root half. An apply
 /// one of Apple's tools answered with a failure, or that left the mode off, leaves the reading
-/// that failure leaves in root's record, and one that succeeds removes the record
-/// (`aterm_types::macos_setup::refused::DEVELOPER_MODE`).
+/// that failure leaves in root's record as a definite failure; one whose tool could not start,
+/// gave no answer in its budget or was killed leaves it as a no-verdict
+/// ([`record_refusal`]); one that succeeds removes the record
+/// (`aterm_types::macos_setup::refused::DEVELOPER_MODE`). Its journaled revert turns the mode
+/// off; the person's choice of that is the account's record's to say
+/// (`aterm_types::macos_setup::debugger_record`).
 pub struct DeveloperMode;
 
 impl DeveloperMode {
@@ -596,24 +736,37 @@ impl Item for DeveloperMode {
     }
 
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
-        use aterm_types::macos_setup::refused::{DEVELOPER_MODE, developer_mode_key};
+        use aterm_types::macos_setup::refused::{DEVELOPER_MODE, Failure, developer_mode_key};
         let (mode, user) = Self::read(sys, ctx);
         let mode = mode.ok_or_else(|| format!("{} did not say", status_cmd().display()))?;
         let missing = user
             .filter(|(_, member)| *member == DebuggerMember::NotMember)
             .map(|(name, _)| name);
         // A half that failed, with the key of the reading it leaves (the one a later ask reads)
-        // where the tool itself answered. One that could not be started, gave no answer in
-        // its budget or was killed says nothing of this Mac, and is asked for again.
-        type Failed = (String, Option<String>);
+        // and how: definite where the tool itself answered with a failure, no verdict where it
+        // could not be started, gave no answer in its budget or was killed, which may be this
+        // Mac's passing state.
+        type Failed = (String, Option<(String, Failure)>);
         let run = |cmd: &Cmd, key: Option<String>| -> Result<(), Failed> {
             match sys.run(cmd) {
                 Ok(ran) if ran.success() => Ok(()),
                 Ok(ran) => Err((
                     format!("{}: {}", cmd.display(), ran.describe()),
-                    key.filter(|_| ran.status.is_some()),
+                    key.map(|key| {
+                        (
+                            key,
+                            if ran.status.is_some() {
+                                Failure::Definite
+                            } else {
+                                Failure::NoVerdict
+                            },
+                        )
+                    }),
                 )),
-                Err(error) => Err((format!("{}: {error}", cmd.display()), None)),
+                Err(error) => Err((
+                    format!("{}: {error}", cmd.display()),
+                    key.map(|key| (key, Failure::NoVerdict)),
+                )),
             }
         };
         let set = || -> Result<(), Failed> {
@@ -629,7 +782,7 @@ impl Item for DeveloperMode {
                         format!(
                             "{DEVTOOLS_SECURITY} -enable ran and developer mode still reads off"
                         ),
-                        Some(off),
+                        Some((off, Failure::Definite)),
                     ));
                 }
             }
@@ -656,9 +809,9 @@ impl Item for DeveloperMode {
                 clear_refusal(sys, DEVELOPER_MODE);
                 Ok(())
             }
-            Err((why, key)) => {
-                if let Some(key) = key {
-                    record_refusal(sys, DEVELOPER_MODE, &key);
+            Err((why, failed)) => {
+                if let Some((key, failure)) = failed {
+                    record_refusal(sys, DEVELOPER_MODE, &key, failure);
                 }
                 Err(why)
             }
@@ -671,7 +824,12 @@ impl Item for DeveloperMode {
 }
 
 /// `[names] admitted_name_rule = true`: the rule ([`name_rule`]) for the console account, in
-/// place as root wrote it. Applied as root, by the elevation's root half.
+/// place as root wrote it. Applied as root, by the elevation's root half; an apply that puts it
+/// in place removes the person's removal marker ([`REMOVED_RULE`]). Its journaled revert moves
+/// the rule onto that marker in one `/bin/mv -f`: a person's `sudo <revert>` runs all of it as
+/// root, `rename(2)` removes the rule and leaves the marker in one step and replaces, never
+/// follows, a link there, and sudo never reads the dotted name in its root-owned folder
+/// ([`rule_removed`]).
 pub enum NameRule {
     /// Ordinary root setup leaves an already matching rule alone.
     Current,
@@ -773,6 +931,8 @@ impl Item for NameRule {
         sys.rename(&staged, Path::new(ADMITTED_NAME_RULE))
             .map_err(|e| format!("{ADMITTED_NAME_RULE}: {e}"))?;
         let _ = sys.remove(Path::new(REFUSED_RULE));
+        // The rule is back: the person's removal of it is over.
+        let _ = sys.remove(Path::new(REMOVED_RULE));
         if let Self::Refresh(done) = self {
             done.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -780,7 +940,11 @@ impl Item for NameRule {
     }
 
     fn revert(&self) -> Option<String> {
-        Some(format!("rm {ADMITTED_NAME_RULE}"))
+        Some(format!(
+            "/bin/mv -f {} {}",
+            crate::port::shell_word(ADMITTED_NAME_RULE),
+            crate::port::shell_word(REMOVED_RULE),
+        ))
     }
 }
 

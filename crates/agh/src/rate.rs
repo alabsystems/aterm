@@ -36,7 +36,7 @@ pub struct RateSnapshot {
 const RESOURCE_MAX_LEN: usize = 64;
 
 /// Maximum distinct resources retained per identity in [`RateBook`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_RESOURCES: usize = 64;
 
 /// Normalizes a rate-limit resource name to lowercase `[a-z0-9_-]{1,64}`.
@@ -155,22 +155,22 @@ pub struct RateBook {
 /// lock files when credentials rotate. A client built as the cutter (no reserve) takes none of
 /// these locks; a process in a cut's tree ([`in_cut_tree`]) takes them as any other does.
 pub(crate) struct BackgroundGuard {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     _held: Option<aterm_uds::private_file::PrivateLock>,
 }
 
 /// The longest rate-book file read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const BOOK_MAX: usize = 64 * 1024;
 
 /// The book file's name for `key`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn file_name(key: &str) -> String {
     format!("{key}.json")
 }
 
 /// A key that names one file directly in the book's directory: a fingerprint or `anonymous`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn usable_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 64
@@ -183,7 +183,7 @@ impl RateBook {
     /// Reserve admission and the previous attempt's returned headers share one
     /// cross-process lock, so a local burst cannot spend a stale snapshot in parallel.
     pub(crate) fn background_guard(&self, key: &str) -> crate::error::Result<BackgroundGuard> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use aterm_uds::private_file::{PrivateLock, create_private_dir};
             let Some(dir) = &self.dir else {
@@ -192,7 +192,7 @@ impl RateBook {
             let local = |error| Error::local(format!("background quota admission: {error}"));
             if let Some(parent) = dir.parent() {
                 if let Some(grand) = parent.parent() {
-                    std::fs::create_dir_all(grand).map_err(local)?;
+                    crate::config::make_parents(grand).map_err(local)?;
                 }
                 create_private_dir(parent).map_err(local)?;
             }
@@ -207,7 +207,7 @@ impl RateBook {
             .map_err(local)?;
             Ok(BackgroundGuard { _held: Some(held) })
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = key;
             Ok(BackgroundGuard {})
@@ -227,11 +227,12 @@ impl RateBook {
         RateBook { dir: None }
     }
 
-    /// Whether the rate book is active on this platform (`unix` with a configured directory).
+    /// Whether the rate book is active on this platform (unix or windows, with a configured
+    /// directory).
     #[inline]
     #[must_use]
     pub(crate) const fn enabled(&self) -> bool {
-        cfg!(unix) && self.dir.is_some()
+        cfg!(any(unix, windows)) && self.dir.is_some()
     }
 
     /// Returns a `PreRefused` rate-limit error when `resource` is exhausted until after `now_unix`.
@@ -277,18 +278,18 @@ impl RateBook {
 
     /// Merges `snapshot` into `key`'s advisory rate-book file, ignoring I/O errors.
     pub fn record(&self, key: &str, snapshot: &RateSnapshot) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let _ = self.try_record(key, snapshot);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (&self.dir, key, snapshot);
         }
     }
 
     /// `record`'s steps, stopping at the first failure.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn try_record(&self, key: &str, snapshot: &RateSnapshot) -> Option<()> {
         use aterm_uds::private_file::{create_private_dir, write_private};
         let dir = self.dir.as_deref()?;
@@ -302,7 +303,7 @@ impl RateBook {
         };
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
             if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(grand).ok()?;
+                crate::config::make_parents(grand).ok()?;
             }
             create_private_dir(parent).ok()?;
         }
@@ -358,11 +359,11 @@ impl RateBook {
     /// Reads `key`'s snapshots sorted by resource, or an empty list if unreadable.
     #[must_use]
     pub fn read(&self, key: &str) -> Vec<RateSnapshot> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.try_read(key).unwrap_or_default()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (&self.dir, key);
             Vec::new()
@@ -370,7 +371,7 @@ impl RateBook {
     }
 
     /// `read`, or `None` at the first failure.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn try_read(&self, key: &str) -> Option<Vec<RateSnapshot>> {
         let dir = self.dir.as_deref()?;
         if !usable_key(key) {

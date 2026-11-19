@@ -49,7 +49,7 @@ fn actual_keeper_start_survives_scheduling_delay() {
 #[test]
 fn only_a_job_told_to_relaunch_may_reopen_the_app() {
     assert_eq!(
-        serve_argv("/s", "designated", true),
+        serve_argv("/s", "designated", true, "p", "p"),
         [
             "keeper",
             "serve",
@@ -60,7 +60,7 @@ fn only_a_job_told_to_relaunch_may_reopen_the_app() {
         ]
     );
     assert_eq!(
-        serve_argv("/s", "uid", false),
+        serve_argv("/s", "uid", false, "p", "p"),
         [
             "keeper",
             "serve",
@@ -72,13 +72,87 @@ fn only_a_job_told_to_relaunch_may_reopen_the_app() {
         ]
     );
     let parsed = parse(
-        &serve_argv("/s", "uid", false)[1..]
+        &serve_argv("/s", "uid", false, "p", "p")[1..]
             .iter()
             .map(OsString::from)
             .collect::<Vec<_>>(),
     )
     .expect("the verb reads its own argv");
     assert!(parsed.no_relaunch);
+}
+
+/// The job a build submits for its own place, the installed app's included, names its job by
+/// nothing but launchd's label: its argv holds only the options every build since the keeper's
+/// first parses, so a build from before `--job` that launchd starts from it (a downgrade, the
+/// updater's rollback) serves. Only a job under another label (a test's, `start --label`) names
+/// it with `--job`, which only builds that read it run.
+#[cfg(unix)]
+#[test]
+fn only_a_job_under_another_label_than_its_places_names_it() {
+    let installed =
+        crate::job::place_in(std::path::Path::new(crate::job::INSTALLED_EXECUTABLE), None);
+    assert!(installed.installed, "premise: the installed place");
+    let argv = serve_argv("/s", "designated", true, &installed.label, &installed.label);
+    for option in argv[2..].iter().filter(|a| a.starts_with("--")) {
+        assert!(
+            ["--sock", "--identity", "--no-relaunch"].contains(option),
+            "{option} in the installed job's argv {argv:?}"
+        );
+    }
+    const TEST: &str = "com.aterm.aterm.keeper.test.restart";
+    let argv = serve_argv("/s", "uid", false, TEST, &installed.label);
+    assert_eq!(argv[argv.len() - 2..], ["--job", TEST]);
+    let parsed = parse(&argv[1..].iter().map(OsString::from).collect::<Vec<_>>())
+        .expect("the verb reads its own argv");
+    assert_eq!(parsed.job.as_deref(), Some(TEST), "the job names itself");
+}
+
+/// A keeper honours a restart only where launchd runs it as its job: the label its `--job`
+/// names, else its place's (what `start` submits by default), equal to `XPC_SERVICE_NAME`, which
+/// launchd sets to the label of each job it runs; only its `KeepAlive` starts the keeper again.
+/// The installed keeper with no flag under its own label is; a hand run (no service name, or
+/// another one), a flag naming another job than launchd's, and a keeper with no place and no
+/// flag each refuse, saying why. The end-to-end run of `serve` is `kernel_custody`'s
+/// `only_a_keeper_launchd_runs_as_its_job_honours_a_restart`.
+///
+/// NEGATIVE CONTROL (run by hand, restored): with `supervised` ignoring `place` (the flag
+/// required again), the installed keeper with no flag is refused.
+#[cfg(unix)]
+#[test]
+fn only_a_keeper_launchd_runs_as_its_job_is_supervised() {
+    const PLACE: &str = crate::job::INSTALLED_LABEL;
+    const TEST: &str = "com.aterm.aterm.keeper.test.restart";
+    assert_eq!(supervised(None, Some(PLACE), Some(PLACE)), Ok(()));
+    assert_eq!(supervised(Some(TEST), Some(PLACE), Some(TEST)), Ok(()));
+    for (job, place, xpc, why) in [
+        (None, Some(PLACE), None, "XPC_SERVICE_NAME is unset"),
+        (
+            None,
+            Some(PLACE),
+            Some("application.com.aterm.aterm.1234.5678"),
+            "XPC_SERVICE_NAME is \"application.com.aterm.aterm.1234.5678\"",
+        ),
+        (None, Some(PLACE), Some(""), "XPC_SERVICE_NAME is \"\""),
+        (
+            Some(TEST),
+            Some(PLACE),
+            Some(PLACE),
+            "as job com.aterm.aterm.keeper.test",
+        ),
+        (None, None, Some(PLACE), "no launchd job is known"),
+    ] {
+        let said = supervised(job, place, xpc).expect_err("not launchd's job");
+        assert!(said.contains(why), "{job:?} {place:?} {xpc:?}: {said}");
+    }
+    assert!(parse(&[OsString::from("serve"), OsString::from("--job")]).is_err());
+    assert!(
+        parse(&[
+            OsString::from("serve"),
+            OsString::from("--job"),
+            OsString::new()
+        ])
+        .is_err()
+    );
 }
 
 #[cfg(unix)]

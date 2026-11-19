@@ -283,6 +283,8 @@ pub(super) fn self_claimed_plan(
         line,
         tap_dropped: None,
         token_dropped: None,
+        rebind: None,
+        twin_projected: None,
         line_dir: None,
     })
 }
@@ -512,6 +514,7 @@ fn relaunch_held(
     let (line, dialect) = match self_claimed_plan(opts, st, shell, k) {
         Ok(p) => (p.line, p.dialect),
         Err(NoPlan::Wait(why)) => return said(r, format!("wait:{why}")),
+        Err(NoPlan::Noted { word, .. }) => return said(r, format!("wait:{word}")),
         Err(NoPlan::Account(refusal)) => return said(r, format!("wait:{}", refusal.kind.word())),
         Err(NoPlan::Refused { why, detail, .. }) => return fail(opts, r, st, &why, &detail),
     };
@@ -1092,11 +1095,14 @@ pub(super) fn snapshot(
     snapshot_with_claim(opts, tab, pid, start, shell, args, None, k)
 }
 
-/// Remove Codex records nothing will visit again.
+/// Remove Codex records nothing will visit again: settled, a week unwritten, and of a tab `life`
+/// (this window's graph) proves gone and no other running window recorded beside them or under
+/// the aterm state root holds ([`super::across_records`]).
 pub(super) fn prune(opts: &Opts, now: u64, life: impl Fn(&str) -> TabLife) {
     if opts.dry_run || opts.background {
         return;
     }
+    let life = super::across_records(life, &opts.state, opts.aterm_state.as_deref(), now);
     let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return;
     };

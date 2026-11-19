@@ -25,7 +25,7 @@ fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value(
             "f1",
             7,
             "/f/f1/in/p/h-andrew/n-a/ask",
-            b"v=1 t=1 from=tb000000000 text=hi"
+            b"v=1 t=1 from=tzzzzzzzzzb text=hi"
         )
         .is_some());
     for bad in [
@@ -46,11 +46,11 @@ fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value(
     let att = Sel::Attention;
     let body = b"v=1 t=1 state=live attention=needs%20a%20key";
     assert!(att
-        .hit("f1", 3, "/f/f1/pub/n-a/tb000000000/presence", body)
+        .hit("f1", 3, "/f/f1/pub/n-a/tzzzzzzzzzb/presence", body)
         .is_some());
     for bad in [
         format!("/f/f1/pub/n-a/{huge}/presence"),
-        format!("/f/f1/pub/{huge}/tb000000000/presence"),
+        format!("/f/f1/pub/{huge}/tzzzzzzzzzb/presence"),
         format!("/f/f1/pub/n-a/{bidi}/presence"),
     ] {
         assert_eq!(att.hit("f1", 3, &bad, body), None, "{}", &bad[..40]);
@@ -69,7 +69,7 @@ fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value(
             "f1",
             7,
             "/f/f1/in/p/h-andrew/n-a/ask",
-            b"v=1 t=1 from=tb000000000 text=hi",
+            b"v=1 t=1 from=tzzzzzzzzzb text=hi",
         )
         .expect("the honest ask");
     for v in [&hit.subject, &hit.node, &hit.who, &hit.sid, &hit.text] {
@@ -142,6 +142,7 @@ fn cfg(dir: &str) -> Config {
         since: Since::Head,
         once: true,
         exec_timeout: aterm_spec::wait::MUST_HAPPEN,
+        bridge_state: None,
     }
 }
 
@@ -154,16 +155,16 @@ fn a_selector_matches_by_position_and_an_overlong_subject_never_matches() {
             "f1",
             7,
             honest,
-            b"v=1 t=1 from=tb000000000 text=is%20this%20ok%3F",
+            b"v=1 t=1 from=tzzzzzzzzzb text=is%20this%20ok%3F",
         )
         .expect("the honest ask to h-andrew matches");
     assert_eq!(
         (hit.who.as_str(), hit.node.as_str(), hit.sid.as_str()),
-        ("h-andrew", "n-a", "tb000000000")
+        ("h-andrew", "n-a", "tzzzzzzzzzb")
     );
     assert_eq!(hit.text, "is this ok?");
     for bad in [
-        "/f/f1/in/n-a/tb000000000/h-andrew/ask",
+        "/f/f1/in/n-a/tzzzzzzzzzb/h-andrew/ask",
         "/f/f1/in/p/h-andrew/n-a/t0000000001/ask",
         "/f/f1/in/p/h-other/n-a/ask",
         "/f/f1/in/p/h-andrew/n-a/note",
@@ -178,7 +179,7 @@ fn a_selector_matches_by_position_and_an_overlong_subject_never_matches() {
 #[test]
 fn attention_fires_only_on_a_presence_row_that_carries_one() {
     let sel = Sel::Attention;
-    let subject = "/f/f1/pub/n-a/tb000000000/presence";
+    let subject = "/f/f1/pub/n-a/tzzzzzzzzzb/presence";
     let hit = sel
         .hit(
             "f1",
@@ -190,7 +191,7 @@ fn attention_fires_only_on_a_presence_row_that_carries_one() {
     assert_eq!(hit.text, "needs a key");
     assert_eq!(
         (hit.node.as_str(), hit.who.as_str()),
-        ("n-a", "tb000000000")
+        ("n-a", "tzzzzzzzzzb")
     );
     for body in [
         &b"v=1 t=1 state=live"[..],
@@ -295,7 +296,9 @@ fn a_notifier_whose_store_is_renamed_stops_and_keeps_its_loss() {
             generation: 0,
         }),
         lineage: None,
+        proved: Steps::default(),
         ordered: false,
+        carried: 0,
     };
     assert_eq!(
         reader_store(&first.hold, &log)
@@ -405,6 +408,16 @@ fn fired_offsets(fired: &Path) -> Vec<u64> {
         .collect()
 }
 
+fn generated_sid(index: u64) -> String {
+    assert!(
+        index < (1u64 << aterm_types::tab_id::BITS),
+        "a distinct bounded fixture index"
+    );
+    aterm_types::tab_id::TabId::from_bits(index)
+        .as_str()
+        .to_owned()
+}
+
 fn feed(n: &mut Notifier, off: u64, sid: &str, body: &str) {
     let subject = format!("/f/f1/pub/n-a/{sid}/presence");
     n.on_record(&Sel::Attention, off, &subject, body.as_bytes())
@@ -419,31 +432,31 @@ fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
     feed(
         &mut n,
         1,
-        "t0ne0000000",
+        "tzzzzzzzzz1",
         &format!("v=1 t=1 state=live inc=1 {key}"),
     );
     feed(
         &mut n,
         2,
-        "t0ne0000000",
+        "tzzzzzzzzz1",
         &format!("v=1 t=2 state=live inc=2 {key}"),
     );
     feed(
         &mut n,
         3,
-        "t0ne0000000",
+        "tzzzzzzzzz1",
         &format!("v=1 t=3 inc=2 phase=busy {key}"),
     );
     feed(
         &mut n,
         4,
-        "t0ne0000000",
+        "tzzzzzzzzz1",
         &format!("v=1 t=4 state=exited inc=2 {key}"),
     );
     feed(
         &mut n,
         5,
-        "ttw00000000",
+        "tzzzzzzzzz2",
         &format!("v=1 t=5 state=live inc=1 {key}"),
     );
     assert_eq!(fired_offsets(&fired), [1, 5]);
@@ -456,13 +469,13 @@ fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
     feed(
         &mut n,
         6,
-        "t0ne0000000",
+        "tzzzzzzzzz1",
         "v=1 t=6 state=live inc=3 attention=-",
     );
     feed(
         &mut n,
         7,
-        "t0ne0000000",
+        "tzzzzzzzzz1",
         &format!("v=1 t=7 state=live inc=3 {key}"),
     );
     assert_eq!(fired_offsets(&fired), [1, 5, 7], "a clear re-arms it");
@@ -472,31 +485,31 @@ fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
     feed(
         &mut back,
         8,
-        "t0ne0000000",
+        "tzzzzzzzzz1",
         &format!("v=1 t=8 state=live inc=4 {key}"),
     );
     assert_eq!(fired_offsets(&fired), [1, 5, 7], "a restart remembers");
     feed(
         &mut back,
         9,
-        "t0ne0000000",
+        "tzzzzzzzzz1",
         "v=1 t=9 attention=a%20new%20question",
     );
-    feed(&mut back, 10, "t0ne0000000", &format!("v=1 t=10 {key}"));
+    feed(&mut back, 10, "tzzzzzzzzz1", &format!("v=1 t=10 {key}"));
     assert_eq!(
         fired_offsets(&fired),
         [1, 5, 7, 9, 10],
         "a value that moved is a new escalation, and so is moving back"
     );
 
-    feed(&mut back, 11, "ttw00000000", "v=1 t=11 attention=-");
-    feed(&mut back, 12, "ttw00000000", &format!("v=1 t=12 {key}"));
-    feed(&mut back, 11, "ttw00000000", "v=1 t=11 attention=-");
-    feed(&mut back, 12, "ttw00000000", &format!("v=1 t=12 {key}"));
+    feed(&mut back, 11, "tzzzzzzzzz2", "v=1 t=11 attention=-");
+    feed(&mut back, 12, "tzzzzzzzzz2", &format!("v=1 t=12 {key}"));
+    feed(&mut back, 11, "tzzzzzzzzz2", "v=1 t=11 attention=-");
+    feed(&mut back, 12, "tzzzzzzzzz2", &format!("v=1 t=12 {key}"));
     feed(
         &mut back,
         13,
-        "ttw00000000",
+        "tzzzzzzzzz2",
         &format!("v=1 t=13 inc=2 {key}"),
     );
     assert_eq!(fired_offsets(&fired), [1, 5, 7, 9, 10, 12]);
@@ -507,15 +520,15 @@ fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
 fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
     let dir = scratch("untold");
     let (mut n, fired) = appending(&dir, 1, "");
-    feed(&mut n, 1, "t0ne0000000", "v=1 t=1 attention=first");
-    feed(&mut n, 2, "ttw00000000", "v=1 t=2 attention=second");
+    feed(&mut n, 1, "tzzzzzzzzz1", "v=1 t=1 attention=first");
+    feed(&mut n, 2, "tzzzzzzzzz2", "v=1 t=2 attention=second");
     assert_eq!(n.verdict(2), Some("dropped"));
     drop(n);
     let (mut room, _) = appending(&dir, 10, "");
     feed(
         &mut room,
         3,
-        "ttw00000000",
+        "tzzzzzzzzz2",
         "v=1 t=3 inc=2 attention=second",
     );
     assert_eq!(
@@ -526,7 +539,7 @@ fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
     feed(
         &mut room,
         4,
-        "ttw00000000",
+        "tzzzzzzzzz2",
         "v=1 t=4 inc=3 attention=second",
     );
     assert_eq!(fired_offsets(&fired), [1, 3], "and, told, stands");
@@ -537,11 +550,11 @@ fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
         10,
         &format!("if [ ! -e {dir}/fixed ]; then exit 3; fi; "),
     );
-    feed(&mut broken, 5, "tthree00000", "v=1 t=5 attention=third");
+    feed(&mut broken, 5, "tzzzzzzzzz3", "v=1 t=5 attention=third");
     feed(
         &mut broken,
         6,
-        "tthree00000",
+        "tzzzzzzzzz3",
         "v=1 t=6 inc=2 attention=third",
     );
     assert!(
@@ -556,13 +569,13 @@ fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
     feed(
         &mut broken,
         7,
-        "tthree00000",
+        "tzzzzzzzzz3",
         "v=1 t=7 inc=3 attention=third",
     );
     feed(
         &mut broken,
         8,
-        "tthree00000",
+        "tzzzzzzzzz3",
         "v=1 t=8 inc=4 attention=third",
     );
     assert_eq!(fired_offsets(&fired), [1, 3, 7]);
@@ -623,7 +636,7 @@ fn an_uncertain_notify_log_identity_never_claims_another_logs_cursors() {
             _ => unreachable!(),
         }
         assert!(
-            store.for_log(Some(b), None).is_err(),
+            store.for_log(Some(b), None, &Steps::default()).is_err(),
             "{bad}: uncertainty is not permission to adopt A's offsets as B's"
         );
         assert_eq!(store.cursor("attention"), Some(900));
@@ -639,10 +652,10 @@ fn an_uncertain_notify_log_identity_never_claims_another_logs_cursors() {
         }
         std::fs::remove_file(&path).unwrap();
         store.write("log", &a.to_string(), Flush::Ordered).unwrap();
-        let resumed = store.for_log(Some(a), None).unwrap();
+        let resumed = store.for_log(Some(a), None, &Steps::default()).unwrap();
         assert_eq!(resumed.cursor("attention"), Some(900));
         assert_eq!(resumed.journal(), ["7 fired"]);
-        let fresh = store.for_log(Some(b), None).unwrap();
+        let fresh = store.for_log(Some(b), None, &Steps::default()).unwrap();
         assert_eq!(fresh.cursor("attention"), None);
         assert!(fresh.journal().is_empty());
     }
@@ -661,7 +674,7 @@ fn only_the_newest_other_logs_stores_are_kept() {
         .unwrap();
     let store = Store::open(dir.path().to_str().unwrap()).unwrap();
     store
-        .for_log(Some(id(0)), None)
+        .for_log(Some(id(0)), None, &Steps::default())
         .unwrap()
         .set_cursor("attention", 900)
         .unwrap();
@@ -680,7 +693,7 @@ fn only_the_newest_other_logs_stores_are_kept() {
     let named = |ns: &[u8]| ns.iter().map(|n| id(*n).to_string()).collect::<Vec<_>>();
     for n in 1..=6 {
         store
-            .for_log(Some(id(n)), None)
+            .for_log(Some(id(n)), None, &Steps::default())
             .unwrap()
             .set_cursor("attention", u64::from(n))
             .unwrap();
@@ -688,17 +701,17 @@ fn only_the_newest_other_logs_stores_are_kept() {
     assert_eq!(kept(), named(&[3, 4, 5, 6]), "the newest {LOGS_KEEP}");
     assert_eq!(
         store
-            .for_log(Some(id(3)), None)
+            .for_log(Some(id(3)), None, &Steps::default())
             .unwrap()
             .cursor("attention"),
         Some(3),
         "a kept log resumes"
     );
-    store.for_log(Some(id(7)), None).unwrap();
+    store.for_log(Some(id(7)), None, &Steps::default()).unwrap();
     assert_eq!(kept(), named(&[3, 5, 6, 7]), "3 was read again, 4 was not");
     assert_eq!(
         store
-            .for_log(Some(id(1)), None)
+            .for_log(Some(id(1)), None, &Steps::default())
             .unwrap()
             .cursor("attention"),
         None,
@@ -706,7 +719,7 @@ fn only_the_newest_other_logs_stores_are_kept() {
     );
     assert_eq!(
         store
-            .for_log(Some(id(0)), None)
+            .for_log(Some(id(0)), None, &Steps::default())
             .unwrap()
             .cursor("attention"),
         Some(900),
@@ -730,7 +743,7 @@ fn a_notifier_files_its_cursor_and_journal_under_the_log_it_read() {
             .publish(
                 7,
                 1,
-                "/f/f1/pub/n-a/tx000000000/presence",
+                "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
                 b"v=1 t=1 attention=help",
             )
             .unwrap();
@@ -794,7 +807,7 @@ fn a_catch_up_below_the_retained_floor_reads_on_from_it() {
     let sock = base.join("b.sock");
     let mut server = broker.serve(&sock).unwrap();
     let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
-    for (seq, sid) in [(1, "ta000000000"), (2, "tb000000000"), (3, "tc000000000")] {
+    for (seq, sid) in [(1, "tzzzzzzzzza"), (2, "tzzzzzzzzzb"), (3, "tzzzzzzzzzc")] {
         let subject = format!("/f/f1/pub/n-a/{sid}/presence");
         let (off, _) = conn
             .publish(7, seq, &subject, b"v=1 t=1 attention=help")
@@ -863,7 +876,7 @@ fn after_a_relaxed_stop(
         conn.publish(
             7,
             seq,
-            "/f/f1/pub/n-a/tx000000000/presence",
+            "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
             body.as_bytes(),
         )
         .unwrap()
@@ -993,11 +1006,11 @@ fn a_moved_generation_carries_the_newest_store_it_continues() {
         id: [7; 16],
         generation,
     };
-    let root = store.for_log(Some(g(0)), None).unwrap();
+    let root = store.for_log(Some(g(0)), None, &Steps::default()).unwrap();
     root.set_cursor("attention", 4).unwrap();
     root.set_journal(&["1 fired rc=0".to_string()], Flush::Ordered)
         .unwrap();
-    let one = store.for_log(Some(g(1)), None).unwrap();
+    let one = store.for_log(Some(g(1)), None, &Steps::default()).unwrap();
     assert_ne!(one.root, root.root);
     assert_eq!(one.cursor("attention"), None, "no lineage: a first run");
     one.set_cursor("attention", 9).unwrap();
@@ -1010,11 +1023,13 @@ fn a_moved_generation_carries_the_newest_store_it_continues() {
         Flush::Ordered,
     )
     .unwrap();
-    one.set_standing(&[("/f/f1/pub/n-a/tx000000000/presence".into(), "help".into())])
+    one.set_standing(&[("/f/f1/pub/n-a/s-x/presence".into(), "help".into())])
         .unwrap();
 
     let lineage = lineage_of(&[(1, 3), (2, 5)]);
-    let two = store.for_log(Some(g(2)), Some(&lineage)).unwrap();
+    let two = store
+        .for_log(Some(g(2)), Some(&lineage), &Steps::default())
+        .unwrap();
     assert_eq!(
         two.cursor("attention"),
         Some(5),
@@ -1027,7 +1042,9 @@ fn a_moved_generation_carries_the_newest_store_it_continues() {
     );
     assert_eq!(two.standing(), one.standing());
     two.set_cursor("attention", 7).unwrap();
-    let again = store.for_log(Some(g(2)), Some(&lineage)).unwrap();
+    let again = store
+        .for_log(Some(g(2)), Some(&lineage), &Steps::default())
+        .unwrap();
     assert_eq!(
         again.cursor("attention"),
         Some(7),
@@ -1041,7 +1058,9 @@ fn a_moved_generation_carries_the_newest_store_it_continues() {
     assert!(leftovers.is_empty(), "no scratch left behind");
 
     let gap = lineage_of(&[(3, 4)]);
-    let three = store.for_log(Some(g(4)), Some(&gap)).unwrap();
+    let three = store
+        .for_log(Some(g(4)), Some(&gap), &Steps::default())
+        .unwrap();
     assert_eq!(
         three.cursor("attention"),
         None,
@@ -1052,9 +1071,1669 @@ fn a_moved_generation_carries_the_newest_store_it_continues() {
         generation: 1,
     };
     let foreign = store
-        .for_log(Some(other), Some(&lineage_of(&[(1, 9)])))
+        .for_log(Some(other), Some(&lineage_of(&[(1, 9)])), &Steps::default())
         .unwrap();
     assert_eq!(foreign.cursor("attention"), None, "another id: a first run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Where [`after_a_proved_remint`]'s bridge stores the step it proved, below the fork named.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Stored {
+    /// It stores none.
+    Nowhere,
+    /// In the notifier's own state dir, which the bridge shares.
+    Shared(u64),
+    /// In this Mac's fabric bridge's state dir, beside the notifier's ([`Config::bridge_state`]).
+    Fabric(u64),
+    /// As [`Stored::Fabric`], once a run on the new log failed while a directory stood in the
+    /// steps file's place there, from before the first run on A: a steps read that fails fails
+    /// only what the steps decide ([`Steps::get`]).
+    Unread(u64),
+}
+
+/// A `--once` notifier (`--since since`) pages four escalations on a real broker's log A
+/// (`help-0`..`help-3` at 0..=3, one presence subject); the broker stops, the log's identity
+/// sidecar rots, and the log opens again under another id at generation 0 keeping every record
+/// (astream's `logid::settle`, `Prior::Unreadable`): B. A fifth escalation, `help-9`, lands at
+/// 4, and a bridge stores the step A→B it proved where `step` says ([`Stored`], as
+/// `StateDir::add_proved_step` writes it, `proved-logs`); the notifier runs again, with the
+/// carry's NEGATIVE CONTROL on where `forget` says so ([`FORGET_PROVED`]). Returns the pages of
+/// that second run, `<offset> <text>` each, in order.
+#[cfg(unix)]
+fn after_a_proved_remint(tag: &str, since: Since, step: Stored, forget: bool) -> Vec<String> {
+    let dir = scratch(tag);
+    let base = PathBuf::from(&dir);
+    std::fs::create_dir_all(&base).expect("scratch");
+    let log = base.join("r.log");
+    let sock = base.join("r.sock");
+    let fired = base.join("fired");
+    let fabric = base.with_file_name("fabric");
+    let mut c = cfg(&dir);
+    c.bridge_state = Some(fabric.to_string_lossy().into_owned());
+    c.broker = sock.to_string_lossy().into_owned();
+    c.since = since;
+    c.limit = 10;
+    c.exec = format!(
+        "printf '%s %s\\n' \"$ATERM_NOTIFY_OFFSET\" \"$ATERM_NOTIFY_TEXT\" >> {}",
+        fired.display()
+    );
+    let escalate = |text: &str| {
+        let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
+        let seq = u64::from(text.as_bytes()[text.len() - 1] - b'0') + 1;
+        let body = format!("v=1 t=1 attention={text}");
+        conn.publish(
+            7,
+            seq,
+            "/f/f1/pub/n-a/tx000000000/presence",
+            body.as_bytes(),
+        )
+        .unwrap()
+        .0
+    };
+    let run = || {
+        Notifier::new(c.clone())
+            .expect("open")
+            .catch_up()
+            .expect("catch up");
+        std::fs::read_to_string(&fired).unwrap_or_default()
+    };
+    let unread = fabric.join("proved-logs");
+    if matches!(step, Stored::Unread(_)) {
+        std::fs::create_dir_all(&unread).unwrap();
+    }
+    let before = {
+        let broker = crate::test_broker(&log).unwrap();
+        let mut server = broker.serve(&sock).unwrap();
+        assert_eq!(run(), "", "{tag}: an empty log: the cursor is claimed at 0");
+        for text in ["help-0", "help-1", "help-2", "help-3"] {
+            escalate(text);
+        }
+        assert_eq!(run().lines().count(), 4, "{tag}: all four fire on A");
+        server.shutdown();
+        broker.log_identity()
+    };
+    std::fs::write(astream_broker::identity_path(&log), b"not an identity").unwrap();
+    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let broker = loop {
+        match crate::test_broker(&log) {
+            Ok(broker) => break broker,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && Instant::now() < give_up => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{tag}: the log did not open again: {e}"),
+        }
+    };
+    let now = broker.log_identity();
+    assert!(
+        now.id != before.id && now.generation == 0,
+        "{tag}: PRECONDITION: the broker gave the log another id at generation 0: {before:?} -> \
+         {now:?}"
+    );
+    let _ = std::fs::remove_file(&sock);
+    let mut server = broker.serve(&sock).unwrap();
+    assert_eq!(
+        escalate("help-9"),
+        4,
+        "{tag}: PRECONDITION: B kept A's four records"
+    );
+    if matches!(step, Stored::Unread(_)) {
+        let failed = Notifier::new(c.clone()).expect("open").catch_up();
+        assert!(
+            failed.is_err(),
+            "{tag}: a run on a log no store is held for fails while the steps do not read"
+        );
+        assert!(
+            !base.join("notify/logs").join(now.to_string()).exists(),
+            "{tag}: and builds no store for it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fired).unwrap().lines().count(),
+            4,
+            "{tag}: and pages nothing"
+        );
+        std::fs::remove_dir(&unread).unwrap();
+    }
+    let stored = match step {
+        Stored::Nowhere => None,
+        Stored::Shared(fork) => Some((base.clone(), fork)),
+        Stored::Fabric(fork) | Stored::Unread(fork) => Some((fabric, fork)),
+    };
+    if let Some((bridge, fork)) = stored {
+        crate::state::StateDir::open(bridge)
+            .unwrap()
+            .add_proved_step(crate::state::Proved {
+                was: before,
+                now,
+                fork,
+                head: 4,
+            })
+            .unwrap();
+    }
+    FORGET_PROVED.with(|f| f.set(forget));
+    let after = run().lines().skip(4).map(str::to_string).collect();
+    FORGET_PROVED.with(|f| f.set(false));
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+    after
+}
+
+/// **A PROVED REMINT CARRIES THE NOTIFIER'S STORE BELOW ITS FORK** (ATERM-KI-1116-7314,
+/// [`after_a_proved_remint`]): astream gave the log another id keeping every record, and a
+/// bridge sharing the notifier's state dir, or this Mac's fabric bridge, proved and stored the
+/// step. The notifier carries the store of the log before onto the new one as across a moved
+/// generation, every cursor at most the fork and the verdicts below it: a step at its cursor
+/// pages the new escalation alone, under `--since head` and `--since start` alike; a step below
+/// it judges again the records from the fork (their verdicts dropped, the standing value kept,
+/// which each of them changes), pages none below it and misses none. With no step stored the
+/// new log is a first run: `--since head` never pages the escalation that landed before the run
+/// (a page missed), `--since start` pages all five again. A steps file that does not read
+/// ([`Stored::Unread`]) fails no run on A, whose store is the root's, and fails the run that
+/// reached B with no store held for it, building none and paging nothing, so once it reads the
+/// run carries as with the step there from the start (a read taken for no step would have built
+/// B as a first run under `--since start`, all five paged again). NEGATIVE CONTROL
+/// ([`FORGET_PROVED`], every build before): the step stored, the same first run.
+#[cfg(unix)]
+#[test]
+fn a_proved_remint_carries_the_notifiers_store_below_its_fork() {
+    for (since, step) in [
+        (Since::Head, Stored::Shared(4)),
+        (Since::Start, Stored::Shared(4)),
+        (Since::Head, Stored::Fabric(4)),
+        (Since::Start, Stored::Unread(4)),
+    ] {
+        let tag = format!("pr-{since:?}-{step:?}");
+        assert_eq!(
+            after_a_proved_remint(&tag, since, step, false),
+            ["4 help-9"],
+            "{tag}: carried at the fork, the cursor's own place"
+        );
+    }
+    assert_eq!(
+        after_a_proved_remint("pr-below", Since::Head, Stored::Shared(2), false),
+        ["2 help-2", "3 help-3", "4 help-9"],
+        "a fork below the cursor: the records from it are judged again"
+    );
+    for (tag, step, forget) in [
+        ("pr-none", Stored::Nowhere, false),
+        ("pr-ctl", Stored::Shared(4), true),
+    ] {
+        assert!(
+            after_a_proved_remint(tag, Since::Head, step, forget).is_empty(),
+            "{tag}: a first run starts past the escalation, a page missed"
+        );
+        assert_eq!(
+            after_a_proved_remint(&format!("{tag}-0"), Since::Start, step, forget),
+            ["0 help-0", "1 help-1", "2 help-2", "3 help-3", "4 help-9"],
+            "{tag}: a first run from the start pages all five again"
+        );
+    }
+}
+
+/// The fabric root `aterm fabric on` makes at `root`, and the bridge command it writes there
+/// ([`crate::enable::Paths::bridge_command`]), with that bridge's `--broker`.
+fn fabric_on(root: &str) -> (crate::enable::Paths, Vec<String>, String) {
+    let paths = crate::enable::Paths {
+        home: PathBuf::from("/nonexistent/home"),
+        login_home: None,
+        root: PathBuf::from(root),
+        aterm: "/nonexistent/bin/aterm".to_string(),
+        fleet: "f1".to_string(),
+        config: None,
+        rendezvous: None,
+        durability: None,
+    };
+    let argv = paths.bridge_command("n-0123456789abcdef");
+    let broker = argv
+        .iter()
+        .skip_while(|w| *w != "--broker")
+        .nth(1)
+        .expect("the bridge names its broker")
+        .clone();
+    (paths, argv, broker)
+}
+
+/// The rendezvous file `aterm fabric on` writes for `paths` ([`crate::enable::Rendezvous`]).
+fn rendezvous_of(
+    paths: &crate::enable::Paths,
+    argv: &[String],
+    broker: &str,
+) -> crate::enable::Rendezvous {
+    crate::enable::Rendezvous {
+        fleet: "f1".to_string(),
+        broker: broker.to_string(),
+        node: "n-0123456789abcdef".to_string(),
+        cap_file: paths.cap().to_string_lossy().into_owned(),
+        state: paths.state().to_string_lossy().into_owned(),
+        command: argv.to_vec(),
+    }
+}
+
+/// A real broker's log `base/r.log`, served on `base/r.sock` while `on_a` runs on it, then given
+/// another id at generation 0 keeping every record (its identity sidecar rots: astream's
+/// `logid::settle`, `Prior::Unreadable`, as in [`after_a_proved_remint`]) and served again: the
+/// log before, the log now, the broker and its server.
+#[cfg(unix)]
+fn reminted_keeping_its_records(
+    tag: &str,
+    base: &Path,
+    on_a: impl FnOnce(),
+) -> (
+    astream_broker::LogIdentity,
+    astream_broker::LogIdentity,
+    astream_broker::Broker,
+    astream_broker::BrokerHandle,
+) {
+    let log = base.join("r.log");
+    let sock = base.join("r.sock");
+    let before = {
+        let broker = crate::test_broker(&log).unwrap();
+        let mut server = broker.serve(&sock).unwrap();
+        on_a();
+        server.shutdown();
+        broker.log_identity()
+    };
+    std::fs::write(astream_broker::identity_path(&log), b"not an identity").unwrap();
+    let (broker, server) = served_again(tag, base);
+    let now = broker.log_identity();
+    assert!(
+        now.id != before.id && now.generation == 0,
+        "{tag}: PRECONDITION: another id at generation 0: {before:?} -> {now:?}"
+    );
+    (before, now, broker, server)
+}
+
+/// The log `base/r.log` opened again once the broker that served it let it go, and served on
+/// `base/r.sock`.
+#[cfg(unix)]
+fn served_again(tag: &str, base: &Path) -> (astream_broker::Broker, astream_broker::BrokerHandle) {
+    let sock = base.join("r.sock");
+    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let broker = loop {
+        match crate::test_broker(base.join("r.log")) {
+            Ok(broker) => break broker,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && Instant::now() < give_up => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{tag}: the log did not open again: {e}"),
+        }
+    };
+    let _ = std::fs::remove_file(&sock);
+    let server = broker.serve(&sock).unwrap();
+    (broker, server)
+}
+
+/// How [`after_a_late_step`]'s notifier reads the reminted log.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Reads {
+    /// A `--once` run at each step.
+    Once,
+    /// One follower ([`reader`], driven by [`pump`]) across them; before the step is stored,
+    /// three of its polls of the steps by its clock alone, as [`Notifier::serve`] ticks it at
+    /// [`Notifier::next_due`] when no notice arrives, each double the wait, and polls made at
+    /// their own due take it to [`PROVED_POLL_MAX`], where it stays (its first wait 10 ms); once
+    /// the step is stored, with its next poll brought due, by its clock alone and taking no
+    /// notice: its own poll carries ([`Notifier::poll_proved`]).
+    Clock,
+    /// One follower whose poll is out of reach (its first wait an hour); once the step is
+    /// stored, the broker's server restarts, and the reader's connect after it carries
+    /// ([`Notice::Log`]).
+    Reconnect,
+}
+
+/// A notifier (`--since head`) pages `help-0`..`help-3` (0..=3) on a real broker's log A, which
+/// astream then gives another id at generation 0 keeping every record
+/// ([`reminted_keeping_its_records`]): B, where `help-4` lands at 4 and is cleared at 5 before the
+/// notifier reaches it. It reaches B BEFORE any bridge stored the step A→B: a first run,
+/// starting at B's head, 6 ([`UNPROVED`]); `help-4` is raised again at 6 and pages there, so it
+/// stands in B's own store. Only then does the bridge sharing its state dir store the step (fork
+/// 4), and the notifier reads the steps again ([`Reads`]); a follower's reader then reads again
+/// from the carried place ([`Hold::carried`]), and `help-6` lands at 7. With [`SKIP_RECARRY`]
+/// where `skip` says so. Returns the pages after A's four, `<offset> <text>` each, in order, once
+/// the selector's cursor passed every record.
+#[cfg(unix)]
+fn after_a_late_step(tag: &str, reads: Reads, skip: bool) -> Vec<String> {
+    let dir = scratch(tag);
+    let base = PathBuf::from(&dir);
+    std::fs::create_dir_all(&base).expect("scratch");
+    let sock = base.join("r.sock");
+    let fired = base.join("fired");
+    let mut c = cfg(&dir);
+    c.broker = sock.to_string_lossy().into_owned();
+    c.since = Since::Head;
+    c.limit = 10;
+    c.exec = format!(
+        "printf '%s %s\\n' \"$ATERM_NOTIFY_OFFSET\" \"$ATERM_NOTIFY_TEXT\" >> {}",
+        fired.display()
+    );
+    let seq = std::cell::Cell::new(0);
+    let publish = |body: &str| {
+        let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
+        seq.set(seq.get() + 1);
+        conn.publish(
+            7,
+            seq.get(),
+            "/f/f1/pub/n-a/tx000000000/presence",
+            body.as_bytes(),
+        )
+        .unwrap()
+        .0
+    };
+    let escalate = |text: &str| publish(&format!("v=1 t=1 attention={text}"));
+    let pages = || -> Vec<String> {
+        std::fs::read_to_string(&fired)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let run = || {
+        Notifier::new(c.clone())
+            .expect("open")
+            .catch_up()
+            .expect("catch up");
+    };
+    let (before, now, broker, server) = reminted_keeping_its_records(tag, &base, || {
+        run();
+        for text in ["help-0", "help-1", "help-2", "help-3"] {
+            escalate(text);
+        }
+        run();
+        assert_eq!(pages().len(), 4, "{tag}: all four fire on A");
+    });
+    assert_eq!(
+        escalate("help-4"),
+        4,
+        "{tag}: PRECONDITION: B kept A's four"
+    );
+    assert_eq!(publish("v=1 t=1"), 5, "{tag}: help-4 cleared in the gap");
+    let store_step = || {
+        crate::state::StateDir::open(base.clone())
+            .unwrap()
+            .add_proved_step(crate::state::Proved {
+                was: before,
+                now,
+                fork: 4,
+                head: 6,
+            })
+            .unwrap();
+    };
+    let marker = base
+        .join("notify/logs")
+        .join(now.to_string())
+        .join(UNPROVED);
+    let key = Sel::Attention.key();
+    let mut served = Some((broker, server));
+    SKIP_RECARRY.with(|s| s.set(skip));
+    match reads {
+        Reads::Once => {
+            run();
+            assert!(marker.exists(), "{tag}: B began as a first run, marked");
+            assert_eq!(escalate("help-4"), 6, "{tag}: help-4 raised again on B");
+            run();
+            store_step();
+            run();
+        }
+        Reads::Clock | Reads::Reconnect => {
+            let mut follow = c.clone();
+            follow.once = false;
+            let mut n = Notifier::new(follow.clone()).expect("open");
+            n.proved_every = match reads {
+                Reads::Clock => Duration::from_millis(10),
+                _ => Duration::from_secs(3600),
+            };
+            let (tx, rx) = notice_handoff();
+            let follower = {
+                let hold = std::sync::Arc::clone(&n.hold);
+                std::thread::spawn(move || reader(0, &Sel::Attention, &follow, &hold, &tx))
+            };
+            pump(&mut n, &rx, "the reader's subscription on B", |n| {
+                n.log_now == Some(now)
+                    && served
+                        .as_ref()
+                        .is_some_and(|(broker, _)| broker.stats().parked_tails == 1)
+            });
+            assert!(marker.exists(), "{tag}: B began as a first run, marked");
+            assert_eq!(
+                n.proved_poll.is_some(),
+                !skip,
+                "{tag}: the follower reads the steps again (CONTROL: owed nothing, it does not)"
+            );
+            assert_eq!(escalate("help-4"), 6, "{tag}: help-4 raised again on B");
+            pump(&mut n, &rx, "help-4's page on B", |_| pages().len() == 5);
+            if matches!(reads, Reads::Clock) && !skip {
+                let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+                let wait_of = |n: &Notifier| {
+                    n.proved_poll.unwrap_or_else(|| {
+                        panic!("{tag}: no step stored: the marker stands and the follower polls")
+                    })
+                };
+                let mut polled = wait_of(&n);
+                let mut waits = vec![polled.1];
+                while waits.len() < 4 {
+                    assert!(
+                        Instant::now() < give_up,
+                        "{tag}: the follower's poll never came due"
+                    );
+                    let due = n.next_due().unwrap_or_else(|| {
+                        panic!("{tag}: nothing is due by the follower's clock, its poll none")
+                    });
+                    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                    let _ = n.tick(n.now());
+                    let now = wait_of(&n);
+                    if now.0 != polled.0 {
+                        waits.push(now.1);
+                    }
+                    polled = now;
+                }
+                for _ in 0..16 {
+                    if polled.1 == PROVED_POLL_MAX && waits.ends_with(&[PROVED_POLL_MAX; 2]) {
+                        break;
+                    }
+                    n.poll_proved(polled.0);
+                    polled = wait_of(&n);
+                    waits.push(polled.1);
+                }
+                assert!(
+                    waits
+                        .windows(2)
+                        .all(|w| w[1] == (w[0] * 2).min(PROVED_POLL_MAX))
+                        && waits.ends_with(&[PROVED_POLL_MAX; 2]),
+                    "{tag}: each read that carries nothing doubles the wait, three by the \
+                     follower's clock and on by the poll's own due to {PROVED_POLL_MAX:?}, where \
+                     it stays: {waits:?}"
+                );
+                n.proved_poll = Some((Instant::now(), polled.1));
+            }
+            store_step();
+            match reads {
+                Reads::Clock if !skip => {
+                    let carried = n.hold.carried();
+                    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+                    while n.hold.carried() == carried {
+                        assert!(
+                            Instant::now() < give_up,
+                            "{tag}: the follower's poll never carried"
+                        );
+                        let due = n.next_due().unwrap_or_else(|| {
+                            panic!("{tag}: nothing is due by the follower's clock, its poll none")
+                        });
+                        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                        let _ = n.tick(n.now());
+                    }
+                }
+                Reads::Reconnect => {
+                    if let Some((broker, mut server)) = served.take() {
+                        server.shutdown();
+                        drop(server);
+                        drop(broker);
+                    }
+                    let (broker, server) = served_again(tag, &base);
+                    assert_eq!(broker.log_identity(), now, "{tag}: PRECONDITION: B again");
+                    served = Some((broker, server));
+                    if !skip {
+                        assert_eq!(
+                            pump(&mut n, &rx, "the carry at the reader's connect", |_| {
+                                !marker.exists()
+                            }),
+                            "log",
+                            "{tag}: the reader's connect carries, its poll out of reach"
+                        );
+                    }
+                }
+                _ => {}
+            }
+            assert_eq!(escalate("help-6"), 7);
+            pump(&mut n, &rx, "every record judged", |n| {
+                n.cursor(&key) == Some(8) && pages().iter().any(|p| p.starts_with("7 "))
+            });
+            drop(rx);
+            escalate("help-7");
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the reader ends",
+                || follower.is_finished().then_some(()),
+            );
+            follower.join().expect("the reader");
+        }
+    }
+    SKIP_RECARRY.with(|s| s.set(false));
+    let carried = !marker.exists();
+    let after = pages().into_iter().skip(4).collect();
+    if let Some((broker, mut server)) = served {
+        server.shutdown();
+        drop(broker);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(carried, !skip, "{tag}: the marker goes with the carry");
+    after
+}
+
+/// A `--once` notifier on `need` (`--since head`) reads a real broker's log A, where a session
+/// opens and starts a shell command; astream then gives the log another id keeping every record
+/// ([`reminted_keeping_its_records`]): B, where the command's close, a failure, lands at A's head
+/// before the notifier reaches it, so the need rises in the gap, the session's first record past
+/// A's cursor. The notifier reaches B BEFORE any bridge stored the step A→B: a first run at B's
+/// head, whose warm-up finds the failure standing and seeds it in B's own store
+/// ([`Notifier::seed_standing`]), so it pages nothing. Then the bridge sharing its state dir
+/// stores the step (fork: A's head), and the next run carries A's store into B's. With
+/// [`SKIP_RECARRY`] where `skip` says so. Returns the offsets paged, and the failure's.
+#[cfg(unix)]
+fn after_a_late_need(tag: &str, skip: bool) -> (Vec<u64>, u64) {
+    let dir = scratch(tag);
+    let base = PathBuf::from(&dir);
+    std::fs::create_dir_all(&base).expect("scratch");
+    let sock = base.join("r.sock");
+    let fired = base.join("fired");
+    let mut c = cfg(&dir);
+    c.broker = sock.to_string_lossy().into_owned();
+    c.since = Since::Head;
+    c.limit = 10;
+    c.on = vec![Sel::Need(None)];
+    c.exec = format!(
+        "printf '%s\\n' \"$ATERM_NOTIFY_OFFSET\" >> {}",
+        fired.display()
+    );
+    let seq = std::cell::Cell::new(0);
+    let publish = |bodies: Vec<String>| -> Vec<(u64, String)> {
+        let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
+        bodies
+            .into_iter()
+            .map(|b| {
+                seq.set(seq.get() + 1);
+                let off = conn
+                    .publish(7, seq.get(), NEED_FACE, b.as_bytes())
+                    .unwrap()
+                    .0;
+                (off, b)
+            })
+            .collect()
+    };
+    let run = || {
+        Notifier::new(c.clone())
+            .expect("open")
+            .catch_up()
+            .expect("catch up");
+    };
+    let mut s = Needs::open();
+    let cmd = s.cmd_open();
+    let mut a_head = 0;
+    let (before, now, broker, mut server) = reminted_keeping_its_records(tag, &base, || {
+        a_head = publish(s.bodies()).last().map_or(0, |(off, _)| off + 1);
+        run();
+    });
+    s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+    let gap = publish(s.bodies());
+    let rose = gap
+        .iter()
+        .find(|(_, b)| b.contains(" op=close ") && b.contains("out=fail"))
+        .map(|(off, _)| *off)
+        .expect("the failed run's close");
+    assert_eq!(
+        (gap.first().map(|(off, _)| *off), rose),
+        (Some(a_head), a_head),
+        "{tag}: PRECONDITION: the failure is the session's first record past A's head"
+    );
+    let marker = base
+        .join("notify/logs")
+        .join(now.to_string())
+        .join(UNPROVED);
+    let offsets = || fired_offsets(&fired);
+    SKIP_RECARRY.with(|s| s.set(skip));
+    run();
+    assert!(marker.exists(), "{tag}: B began as a first run, marked");
+    assert!(
+        offsets().is_empty(),
+        "{tag}: its warm-up seeded the standing failure"
+    );
+    crate::state::StateDir::open(base.clone())
+        .unwrap()
+        .add_proved_step(crate::state::Proved {
+            was: before,
+            now,
+            fork: a_head,
+            head: a_head + 1,
+        })
+        .unwrap();
+    run();
+    SKIP_RECARRY.with(|s| s.set(false));
+    let paged = offsets();
+    server.shutdown();
+    drop(broker);
+    let _ = std::fs::remove_dir_all(&dir);
+    (paged, rose)
+}
+
+/// **A STEP STORED AFTER THE NOTIFIER REACHED THE NEW LOG CARRIES ITS STORE STILL**
+/// (ATERM-KI-1116-7314, the round's race: a reader usually reaches a reminted log before the
+/// bridge's attach stores its step, [`after_a_late_step`]): the notifier began B as a first run
+/// and paged `help-4` raised again there; once the step is stored, the next connect (`--once`),
+/// the follower's own poll of the steps by its clock alone, or its reader's connect with the
+/// poll out of reach, carries A's store below the fork into B's: `help-4`, raised and cleared
+/// between A's cursor and B's first-run start, pages once, judged under A's standing values, not
+/// under B's own (where the `help-4` B paged stands), and the `help-4` paged on B does not page
+/// again. NEGATIVE CONTROL ([`SKIP_RECARRY`], the rule before): B stays a first run, and the
+/// gap's `help-4` never pages.
+#[cfg(unix)]
+#[test]
+fn a_step_stored_after_the_notifier_reached_the_new_log_carries_its_store_still() {
+    for reads in [Reads::Once, Reads::Clock, Reads::Reconnect] {
+        let tag = format!("late-{reads:?}");
+        let mut want = vec!["6 help-4", "4 help-4"];
+        if !matches!(reads, Reads::Once) {
+            want.push("7 help-6");
+        }
+        assert_eq!(
+            after_a_late_step(&tag, reads, false),
+            want,
+            "{tag}: the gap pages once, and nothing paged on B pages again"
+        );
+        want.retain(|p| !p.starts_with("4 "));
+        assert_eq!(
+            after_a_late_step(&format!("{tag}-ctl"), reads, true),
+            want,
+            "{tag}: CONTROL: a first run for good misses the gap's help-4"
+        );
+    }
+}
+
+/// **A NEED THAT ROSE BEFORE A LATE STEP PAGES ONCE THE STEP IS STORED** (ATERM-KI-1116-7314,
+/// [`after_a_late_need`]): a failure that rose between A's cursor and B's first-run start, which
+/// B's warm-up found standing and seeded in B's own store, pages once the step carries A's store
+/// into B's, judged under A's standing values, not B's own. NEGATIVE CONTROL ([`SKIP_RECARRY`],
+/// the rule before): B stays a first run, and it never pages.
+#[cfg(unix)]
+#[test]
+fn a_need_that_rose_before_a_late_step_pages_once_the_step_is_stored() {
+    let (paged, rose) = after_a_late_need("late-need", false);
+    assert_eq!(paged, [rose], "a need that rose in the gap pages once");
+    let (paged, _) = after_a_late_need("late-need-ctl", true);
+    assert!(paged.is_empty(), "CONTROL: a first run for good misses it");
+}
+
+/// **A NOTIFIER READS THE STEPS OF THE FABRIC BRIDGE THAT DIALS ITS BROKER** ([`fabric_bridge_of`],
+/// ATERM-KI-1116-7314): from the bridge command `aterm fabric on` writes (`aterm link serve …
+/// --broker <root>/bus.sock --state <root>/link-state`), the bridge's `--state` where its
+/// `--broker` is the notifier's; else from the rendezvous file's `broker` and `state`; none where
+/// neither dials it, where the one that does is the notifier's own state dir (read already), or
+/// where the words are no bridge's.
+#[test]
+fn a_notifier_reads_the_steps_of_the_fabric_bridge_that_dials_its_broker() {
+    let (ours, argv, sock) = fabric_on("/r/aterm-fabric");
+    let state = ours.state().to_string_lossy().into_owned();
+    assert_eq!(
+        state, "/r/aterm-fabric/link-state",
+        "PRECONDITION: the layout `on` makes"
+    );
+    let (theirs, other, other_sock) = fabric_on("/o/aterm-fabric");
+    let own = "/n/aterm-link";
+    let ours_met = rendezvous_of(&ours, &argv, &sock);
+    let theirs_met = rendezvous_of(&theirs, &other, &other_sock);
+    let read = std::cell::Cell::new(0);
+    for (tag, configured, rendezvous, state_dir, want) in [
+        (
+            "the configured",
+            Some(argv.clone()),
+            Some(theirs_met.clone()),
+            own,
+            Some(&state),
+        ),
+        (
+            "the rendezvous's",
+            None,
+            Some(ours_met.clone()),
+            own,
+            Some(&state),
+        ),
+        (
+            "the rendezvous's, the configured dials another",
+            Some(other.clone()),
+            Some(ours_met.clone()),
+            own,
+            Some(&state),
+        ),
+        (
+            "none dials it",
+            Some(other.clone()),
+            Some(theirs_met.clone()),
+            own,
+            None,
+        ),
+        (
+            "its own",
+            Some(argv.clone()),
+            Some(ours_met.clone()),
+            state.as_str(),
+            None,
+        ),
+        (
+            "no bridge's words",
+            Some(vec!["/bin/sleep".to_string(), "1".to_string()]),
+            None,
+            own,
+            None,
+        ),
+    ] {
+        assert_eq!(
+            fabric_bridge_of(&sock, state_dir, configured, || {
+                read.set(read.get() + 1);
+                rendezvous
+            }),
+            want.cloned(),
+            "{tag}"
+        );
+    }
+    assert_eq!(
+        read.get(),
+        5,
+        "the rendezvous is read only where the configured fails"
+    );
+}
+
+const PARSE_PROBE: &str = "ATERM_NOTIFY_PARSE_PROBE";
+
+/// [`parse_finds_the_fabric_bridge_aterm_launches`]'s child: `parse` of a notifier's flags on
+/// the broker [`PARSE_PROBE`] names (before a tab) with `[fabric] command` set by its seam
+/// (`ATERM_FABRIC_COMMAND`, in this child's environment alone), and the bridge state it must
+/// find after the tab (`-` for none). Nothing where the probe is not set.
+#[test]
+fn parse_probe() {
+    let Some(probe) = std::env::var_os(PARSE_PROBE) else {
+        return;
+    };
+    let probe = probe.into_string().unwrap();
+    let (broker, want) = probe.split_once('\t').unwrap();
+    let words = [
+        "--fleet",
+        "f1",
+        "--broker",
+        broker,
+        "--on",
+        "attention",
+        "--exec",
+        "true",
+        "--state",
+        "/n/aterm-link",
+    ];
+    let args: Vec<String> = words.iter().map(|w| (*w).to_string()).collect();
+    let cfg = parse(&args).expect("the flags parse");
+    assert_eq!(
+        cfg.bridge_state.as_deref(),
+        (want != "-").then_some(want),
+        "Config::bridge_state"
+    );
+    println!("\nnotify-parse-probe-complete");
+}
+
+/// **PARSE FINDS THE FABRIC BRIDGE ATERM LAUNCHES** (ATERM-KI-1116-7314, [`fabric_bridge_state`]):
+/// with `[fabric] command` the bridge `aterm fabric on` writes, a notifier on that bridge's
+/// `--broker` reads the steps of its `--state` (`Config::bridge_state`); on another broker, none.
+/// Each runs in a child ([`parse_probe`]), so the seam's variable is in no other test's
+/// environment, waited on while it makes progress (a loaded Mac stretches the wall, not it).
+#[test]
+fn parse_finds_the_fabric_bridge_aterm_launches() {
+    let (ours, argv, sock) = fabric_on("/r/aterm-fabric");
+    let state = ours.state().to_string_lossy().into_owned();
+    let module = module_path!().split_once("::").unwrap().1;
+    for (broker, want) in [(sock.as_str(), state.as_str()), ("/o/bus.sock", "-")] {
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &format!("{module}::parse_probe"), "--nocapture"])
+            .env("ATERM_FABRIC_COMMAND", argv.join(" "))
+            .env(PARSE_PROBE, format!("{broker}\t{want}"));
+        let output = aterm_uds::deadline::output_while_process_progressing(
+            &mut command,
+            aterm_spec::wait::MUST_HAPPEN,
+            "the notify parse probe",
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{broker}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "notify-parse-probe-complete"),
+            "{broker}: the probe ran: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+/// **A PROVED STEP CARRIES A HELD STORE AS A MOVED GENERATION DOES** (ATERM-KI-1116-7314): a
+/// log of another id that a stored step says continues a held log ([`crate::state::Proved`]) is
+/// built from that log's store, every cursor at most the step's fork, the verdicts below it and
+/// the standing values as they are; a later generation of the step's log, which astream's
+/// lineage says continues it, below the lower of the step's fork and that move's; a step from a
+/// log not held, or one to another log, carries nothing; and where a held store of the new log's
+/// own id continues by the lineage too, that store, taken up after the step, is the one carried.
+/// NEGATIVE CONTROL ([`FORGET_PROVED`], the rule before): each a first run, the lineage's
+/// carry as it was.
+#[test]
+fn a_proved_step_carries_the_store_it_continues_below_its_fork() {
+    use crate::state::Proved;
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let step = |was, now, fork| Proved {
+        was,
+        now,
+        fork,
+        head: 7,
+    };
+    let presence = "/f/f1/pub/n-a/tx000000000/presence";
+    for control in [false, true] {
+        let dir = scratch(if control { "proved-ctl" } else { "proved" });
+        let store = Store::open(&dir).expect("open");
+        let a = log(7, 0);
+        let root = store.for_log(Some(a), None, &Steps::default()).unwrap();
+        root.set_cursor("attention", 9).unwrap();
+        root.set_journal(
+            &["2 fired rc=0".to_string(), "6 fired rc=0".to_string()],
+            Flush::Ordered,
+        )
+        .unwrap();
+        root.set_standing(&[(presence.into(), "help".into())])
+            .unwrap();
+        FORGET_PROVED.with(|f| f.set(control));
+        let carried = |s: &Store| (s.cursor("attention"), s.journal(), s.standing());
+        let first_run = (None, Vec::new(), Vec::new());
+        let below = |fork| {
+            (
+                Some(fork),
+                vec!["2 fired rc=0".to_string()],
+                vec![(presence.to_string(), "help".to_string())],
+            )
+        };
+
+        let b = store
+            .for_log(Some(log(8, 0)), None, &[step(a, log(8, 0), 5)].into())
+            .unwrap();
+        assert_eq!(
+            carried(&b),
+            if control { first_run.clone() } else { below(5) },
+            "control={control}: the step's log, at its fork"
+        );
+        let lineage = lineage_of(&[(1, 4), (2, 6)]);
+        let c = store
+            .for_log(
+                Some(log(9, 2)),
+                Some(&lineage),
+                &[step(a, log(9, 0), 5)].into(),
+            )
+            .unwrap();
+        assert_eq!(
+            carried(&c),
+            if control { first_run.clone() } else { below(4) },
+            "control={control}: a later generation of it, at the lower fork"
+        );
+        for (tag, now, steps) in [
+            (
+                "from a log not held",
+                log(10, 0),
+                [step(log(1, 0), log(10, 0), 5)],
+            ),
+            ("to another log", log(11, 0), [step(a, log(12, 0), 5)]),
+        ] {
+            let other = store.for_log(Some(now), None, &steps.into()).unwrap();
+            assert_eq!(
+                carried(&other),
+                first_run,
+                "control={control}: a step {tag}"
+            );
+        }
+
+        b.set_cursor("attention", 8).unwrap();
+        let newer = store
+            .for_log(
+                Some(log(8, 1)),
+                Some(&lineage_of(&[(1, 6)])),
+                &[step(a, log(8, 0), 5)].into(),
+            )
+            .unwrap();
+        assert_eq!(
+            newer.cursor("attention"),
+            Some(6),
+            "control={control}: the store of the new log's own id, by its lineage"
+        );
+        FORGET_PROVED.with(|f| f.set(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// **A STORE BEGUN AS A FIRST RUN WAITS FOR A STEP AND IS CARRIED INTO ONCE ONE REACHES IT**
+/// (ATERM-KI-1116-7314): a log no held store continues is built as a first run with an
+/// [`UNPROVED`] marker naming the logs held then, in one publish (a write killed before it
+/// leaves no store and no scratch); [`Store::unproved`] waits while no step reaches it, and once
+/// one does from a log the marker names, [`Store::recarry`] carries that log's store below the
+/// fork into it: each cursor the lower of its own and the held one at most the fork (a key only
+/// its own has as it is, one only the held store has, here above the fork, at the fork), the
+/// held verdicts below the fork joined with its own (none it paged pages again), the held
+/// store's standing values, never its own; carried again from the same store while its marker
+/// stands, the same journal. A marker whose words name no log is read as naming the root's. A
+/// store built from a marked one, by its lineage or by a step from it, is not marked
+/// ([`Store::carry`]): a first run for good, owed nothing though a step from the root's log
+/// reaches it through the lineage (the residual: the records below the marked one's first-run
+/// start are never judged there), while the marked one is owed the root's store still. A store
+/// whose own journal holds [`JOURNAL_KEEP`] verdicts is
+/// [`Unproved::Spent`]: no carry. A store whose own journal is damaged before an intact step,
+/// the load's rewrite refused so the damage stays on the media, is read as the load salvaged it
+/// ([`Store::load`]) and carried into; one whose held store's journal does not read, or one of
+/// whose held stores does not open, is carried nothing and waits, its marker kept
+/// ([`Unproved::unread`]). NEGATIVE CONTROL
+/// ([`SKIP_RECARRY`], the rule before): never owed a carry, a first run for good.
+#[test]
+fn a_store_begun_as_a_first_run_waits_for_a_step_and_is_carried_into_once_one_reaches_it() {
+    use crate::state::Proved;
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let step = |was, now, fork| Proved {
+        was,
+        now,
+        fork,
+        head: 9,
+    };
+    let presence = "/f/f1/pub/n-a/tx000000000/presence";
+    let own_value = ("/f/f1/pub/n-a/ty000000000/presence", "disk");
+    let (a, b) = (log(7, 0), log(8, 0));
+    for control in [false, true] {
+        let dir = scratch(if control { "unproved-ctl" } else { "unproved" });
+        let store = Store::open(&dir).expect("open");
+        let root = store.for_log(Some(a), None, &Steps::default()).unwrap();
+        root.set_cursor("attention", 9).unwrap();
+        root.set_cursor("ask-to.h-a", 7).unwrap();
+        root.set_journal(
+            &["2 fired rc=0".to_string(), "6 fired rc=0".to_string()],
+            Flush::Ordered,
+        )
+        .unwrap();
+        root.set_standing(&[(presence.into(), "help".into())])
+            .unwrap();
+        let logs = PathBuf::from(&dir).join("notify/logs");
+        let marker = |of: astream_broker::LogIdentity| logs.join(of.to_string()).join(UNPROVED);
+
+        PUT_FAULT.with(|left| left.set(Some(0)));
+        let killed = store.for_log(Some(b), None, &Steps::default());
+        PUT_FAULT.with(|left| left.set(None));
+        assert!(killed.is_err(), "the marker's write is killed");
+        assert!(
+            !logs.join(b.to_string()).exists(),
+            "no store is published without its marker"
+        );
+        let scratch_left = std::fs::read_dir(&logs)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with('.'));
+        assert!(!scratch_left, "no scratch left behind");
+
+        let first = store.for_log(Some(b), None, &Steps::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(marker(b)).unwrap().trim(),
+            a.to_string(),
+            "a first run beside A's store names A"
+        );
+        assert_eq!(first.cursor("attention"), None, "a first run");
+        first.set_cursor("attention", 12).unwrap();
+        first.set_cursor("halt", 20).unwrap();
+        first
+            .set_journal(&["13 fired rc=0".to_string()], Flush::Ordered)
+            .unwrap();
+        first
+            .set_standing(&[(own_value.0.into(), own_value.1.into())])
+            .unwrap();
+        SKIP_RECARRY.with(|s| s.set(control));
+        let owed = |of: &Store,
+                    id: astream_broker::LogIdentity,
+                    lineage: Option<&astream_broker::Lineage>,
+                    proved: &[Proved]| {
+            match store
+                .unproved(
+                    id,
+                    lineage,
+                    &proved.to_vec().into(),
+                    &of.read_verdicts().unwrap(),
+                )
+                .unwrap()
+            {
+                None => "none",
+                Some(Unproved::Wait) => "wait",
+                Some(Unproved::Spent) => "spent",
+                Some(Unproved::Carry(..)) => "carry",
+            }
+        };
+        let carry = |into: &Store,
+                     id: astream_broker::LogIdentity,
+                     lineage: Option<&astream_broker::Lineage>,
+                     proved: &[Proved]| {
+            let mut file = into.load().unwrap();
+            store
+                .recarry(&mut file, id, lineage, &proved.to_vec().into())
+                .unwrap()
+        };
+        let waits = if control { "none" } else { "wait" };
+        assert_eq!(owed(&first, b, None, &[]), waits, "no step yet");
+        assert_eq!(
+            owed(&first, b, None, &[step(log(1, 0), b, 5)]),
+            waits,
+            "a step from a log not held"
+        );
+        assert_eq!(
+            owed(&first, b, None, &[step(a, log(9, 0), 5)]),
+            waits,
+            "a step to another log"
+        );
+        let proved = [step(a, b, 5)];
+        match carry(&first, b, None, &proved) {
+            Some(Unproved::Carry(from, fork)) => {
+                assert!(!control, "CONTROL: never owed a carry");
+                assert_eq!((from.root.clone(), fork), (store.root.clone(), 5));
+            }
+            None => assert!(control, "a step from A reaches B: carry"),
+            other => panic!("control={control}: {other:?}"),
+        }
+        let read = |key: &str| first.cursor(key);
+        if control {
+            assert_eq!(
+                (read("attention"), read("ask-to.h-a"), first.journal()),
+                (Some(12), None, vec!["13 fired rc=0".to_string()]),
+                "CONTROL: B as its first run left it"
+            );
+        } else {
+            assert_eq!(
+                (read("attention"), read("halt"), read("ask-to.h-a")),
+                (Some(5), Some(20), Some(5)),
+                "the lower of its own and A's at most the fork; one only B has as it is; one only \
+                 A has, above the fork, at the fork"
+            );
+            assert_eq!(
+                first.journal(),
+                ["2 fired rc=0", "13 fired rc=0"],
+                "A's verdicts below the fork, then B's own"
+            );
+            assert_eq!(
+                first.standing(),
+                [(presence.to_string(), "help".to_string())],
+                "A's standing values, never B's own"
+            );
+            let once = first.read_verdicts().unwrap();
+            assert!(
+                matches!(carry(&first, b, None, &proved), Some(Unproved::Carry(..))),
+                "the marker stands: owed again"
+            );
+            assert_eq!(
+                first.read_verdicts().unwrap(),
+                once,
+                "carried again from the same store: the same journal"
+            );
+            first.drop_unproved().unwrap();
+            assert!(!marker(b).exists(), "the marker is removed");
+            assert_eq!(owed(&first, b, None, &proved), "none", "carried once");
+        }
+
+        let c = log(10, 0);
+        let damaged = store.for_log(Some(c), None, &Steps::default()).unwrap();
+        std::fs::write(marker(c), "not a log\n").unwrap();
+        assert_eq!(
+            owed(&damaged, c, None, &[step(a, c, 5)]),
+            if control { "none" } else { "carry" },
+            "control={control}: a marker naming no log reads as naming the root's"
+        );
+
+        let d = log(11, 0);
+        let marked = store.for_log(Some(d), None, &Steps::default()).unwrap();
+        marked.set_cursor("attention", 30).unwrap();
+        let moved = lineage_of(&[(1, 25)]);
+        let d1 = store
+            .for_log(Some(log(11, 1)), Some(&moved), &Steps::default())
+            .unwrap();
+        assert_eq!(
+            d1.cursor("attention"),
+            Some(25),
+            "control={control}: carried by its lineage from D's first run"
+        );
+        let e = log(12, 0);
+        let by_step = store
+            .for_log(Some(e), None, &[step(log(11, 1), e, 20)].into())
+            .unwrap();
+        assert!(
+            by_step.cursor("attention").is_some(),
+            "control={control}: carried by a step from D's next generation, not begun as a first \
+             run"
+        );
+        for (of, why) in [(log(11, 1), "by its lineage"), (e, "by a step")] {
+            assert!(
+                !marker(of).exists(),
+                "control={control}: a store built {why} from a marked one is not marked, a first \
+                 run for good"
+            );
+        }
+        let a_to_d = [step(a, d, 5)];
+        assert_eq!(
+            owed(&marked, d, None, &a_to_d),
+            if control { "none" } else { "carry" },
+            "control={control}: D itself, still marked, is owed A's store by a step from A"
+        );
+        assert_eq!(
+            owed(&d1, log(11, 1), Some(&moved), &a_to_d),
+            "none",
+            "control={control}: D's next generation, though the step reaches it by the lineage, \
+             is owed nothing: the records below D's first-run start are never judged there"
+        );
+        assert!(
+            carry(&d1, log(11, 1), Some(&moved), &a_to_d).is_none(),
+            "control={control}: nothing carried into it"
+        );
+        assert_eq!(
+            d1.cursor("attention"),
+            Some(25),
+            "control={control}: D's next generation keeps the place it was carried to"
+        );
+
+        let f = log(13, 0);
+        let full = store.for_log(Some(f), None, &Steps::default()).unwrap();
+        for (lines, want) in [(JOURNAL_KEEP - 1, "carry"), (JOURNAL_KEEP, "spent")] {
+            let verdicts: Vec<String> = (0..lines)
+                .map(|i| format!("{} fired rc=0", 100 + i))
+                .collect();
+            full.set_journal(&verdicts, Flush::Ordered).unwrap();
+            assert_eq!(
+                owed(&full, f, None, &[step(a, f, 5)]),
+                if control { "none" } else { want },
+                "control={control}: its own journal holding {lines} verdicts"
+            );
+        }
+
+        let g = log(14, 0);
+        let faulted = store.for_log(Some(g), None, &Steps::default()).unwrap();
+        let verdicts: Vec<journal::Step> = (20..=22)
+            .map(|off| journal::Step {
+                verdict: Some(format!("{off} fired rc=0")),
+                ..journal::Step::default()
+            })
+            .collect();
+        let (mut damaged, _) = journal::encode_from(0, &verdicts).unwrap();
+        let (first_step, _) = journal::encode_from(0, &verdicts[..1]).unwrap();
+        damaged[first_step.len() + 20] ^= 0x55;
+        std::fs::write(faulted.root.join(JOURNAL_FILE), &damaged).unwrap();
+        assert!(
+            faulted.read_verdicts().is_err(),
+            "PRECONDITION: damage before an intact step, which a strict read refuses"
+        );
+        REFUSE.with(|r| *r.borrow_mut() = vec![(JOURNAL_FILE, 1, libc::ENOSPC)]);
+        let owed_faulted = carry(&faulted, g, None, &[step(a, g, 5)]);
+        assert!(
+            REFUSE.with(|r| r.borrow().is_empty()),
+            "PRECONDITION: the load's rewrite refused, the damage left on the media"
+        );
+        assert_eq!(
+            matches!(owed_faulted, Some(Unproved::Carry(..))),
+            !control,
+            "control={control}: its own journal read as the load salvaged it"
+        );
+        if !control {
+            assert_eq!(faulted.cursor("attention"), Some(5), "carried at the fork");
+        }
+
+        let h = log(15, 0);
+        let waiting = store.for_log(Some(h), None, &Steps::default()).unwrap();
+        std::fs::write(store.root.join(JOURNAL_FILE), &damaged).unwrap();
+        assert!(
+            store.read_verdicts().is_err(),
+            "PRECONDITION: the root's journal, the store a step from A carries, does not read"
+        );
+        let owed_unread = carry(&waiting, h, None, &[step(a, h, 5)]);
+        assert_eq!(
+            matches!(owed_unread, Some(Unproved::Wait)),
+            !control,
+            "control={control}: a held store that does not read carries nothing, waiting: \
+             {owed_unread:?}"
+        );
+        assert!(
+            marker(h).exists() && waiting.cursor("attention").is_none(),
+            "control={control}: its marker kept, the first run as it began"
+        );
+        std::fs::write(logs.join(log(16, 0).to_string()), b"not a store").unwrap();
+        assert_eq!(
+            owed(&waiting, h, None, &[step(a, h, 5)]),
+            if control { "none" } else { "wait" },
+            "control={control}: a held store that does not open: waiting, nothing decided"
+        );
+        SKIP_RECARRY.with(|s| s.set(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// **A CARRY IS COUNTED ONCE ITS JOURNAL IS WRITTEN, AND A MARKER WHOSE REMOVAL IS REFUSED IS
+/// REMOVED AGAIN** (ATERM-KI-1116-7314, [`Notifier::drop_marker`]): a notifier takes up B,
+/// begun as a first run, once a step from the root's A reaches it, and the marker's removal is
+/// refused: the take-up stands (the refusal is said, not propagated), the carry is on the media
+/// and counted ([`Hold::carried`]), and the follower's poll removes the marker, carrying
+/// nothing again. A next run (`--once`) that finds the marker standing once records were judged
+/// past the fork (as the run before's catch-up judges them: its cursor at 40, a verdict at 30, a
+/// standing value they set) carries the same store into the merged journal again: the cursor
+/// falls to the fork again, every verdict kept and A's standing values back, so what was judged
+/// since is judged again and pages nothing again. NEGATIVE CONTROLS (forced once by hand): the
+/// removal's error propagated fails the take-up; the carry counted after the removal, or the
+/// removal not owed again, leaves the marker standing for good; the claim before, that the
+/// merge made again leaves the journal as the first left it, fails on the next run's.
+#[test]
+fn a_carry_is_counted_once_written_and_a_marker_whose_removal_is_refused_is_removed_again() {
+    let log = |id: u8| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation: 0,
+    };
+    let (a, b) = (log(7), log(8));
+    let presence = "/f/f1/pub/n-a/tx000000000/presence";
+    let standing_of_a = vec![(presence.to_string(), "help".to_string())];
+    let dir = scratch("drop-refused");
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir).expect("open");
+    let root = store.for_log(Some(a), None, &Steps::default()).unwrap();
+    root.set_cursor("attention", 9).unwrap();
+    root.set_journal(&["2 fired rc=0".to_string()], Flush::Ordered)
+        .unwrap();
+    root.set_standing(&standing_of_a).unwrap();
+    let first = store.for_log(Some(b), None, &Steps::default()).unwrap();
+    first.set_cursor("attention", 12).unwrap();
+    first
+        .set_journal(&["13 fired rc=0".to_string()], Flush::Ordered)
+        .unwrap();
+    drop((root, first, store));
+    let marker = PathBuf::from(&dir)
+        .join("notify/logs")
+        .join(b.to_string())
+        .join(UNPROVED);
+    let read = ReadLog {
+        id: Some(b),
+        lineage: None,
+        proved: [crate::state::Proved {
+            was: a,
+            now: b,
+            fork: 5,
+            head: 9,
+        }]
+        .into(),
+        ordered: false,
+        carried: 0,
+    };
+    let mut lines = vec!["2 fired rc=0", "13 fired rc=0"];
+    for run in ["follower", "next run"] {
+        let (mut n, _fired) = appending(&dir, 3, "");
+        REFUSE.with(|r| *r.borrow_mut() = vec![(UNPROVED, 0, libc::EACCES)]);
+        n.scope_to(&read)
+            .unwrap_or_else(|e| panic!("{run}: the take-up stands, the refusal said: {e}"));
+        assert!(
+            REFUSE.with(|r| r.borrow().is_empty()),
+            "{run}: PRECONDITION: the removal was refused"
+        );
+        assert_eq!(n.hold.carried(), 1, "{run}: the carry is counted");
+        assert!(marker.exists(), "{run}: the marker stands");
+        let journal = n.log_store.read_verdicts().unwrap();
+        assert_eq!(
+            (
+                journal.cursors.get("attention"),
+                journal.lines.iter().map(String::as_str).collect::<Vec<_>>(),
+                &journal.standing
+            ),
+            (Some(&5), lines.clone(), &standing_of_a),
+            "{run}: the carry is on the media: the cursor at the fork, every verdict kept, A's \
+             standing values (merged again, what was judged since falls below the cursor again, \
+             its verdicts kept, so it pages nothing again)"
+        );
+        if run == "follower" {
+            drop(n);
+            let store = Store::open(&dir).expect("open");
+            let judged = store.for_log(Some(b), None, &Steps::default()).unwrap();
+            lines.push("30 fired rc=0");
+            judged
+                .set_journal(
+                    &lines.iter().map(|l| (*l).to_string()).collect::<Vec<_>>(),
+                    Flush::Ordered,
+                )
+                .unwrap();
+            judged.set_cursor("attention", 40).unwrap();
+            judged
+                .set_standing(&[(presence.to_string(), "disk".to_string())])
+                .unwrap();
+            assert_eq!(
+                judged.cursor("attention"),
+                Some(40),
+                "PRECONDITION: run N judged past the fork with the marker standing"
+            );
+            continue;
+        }
+        let (due, _) = n
+            .proved_poll
+            .unwrap_or_else(|| panic!("{run}: the removal is owed again"));
+        n.poll_proved(due);
+        assert!(!marker.exists(), "{run}: the follower's poll removed it");
+        assert_eq!(
+            (n.hold.carried(), n.proved_poll),
+            (1, None),
+            "{run}: carrying nothing again, its poll ends"
+        );
+        assert_eq!(
+            n.log_store.read_verdicts().unwrap(),
+            journal,
+            "{run}: its journal as the carry left it"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A STEP CARRIES THE STORE THIS NOTIFIER USED LAST, AT THE HIGHEST FORK ITS STEPS PROVE**
+/// (ATERM-KI-1116-7314, [`Store::carried_from`]): where steps from two held logs both reach the
+/// new log, the store taken up last (`logs/used`, the root's take-up noted there too) is
+/// carried, whatever the steps' order (a rank by a step's place in the joined list would carry
+/// the other in one of the two orders: the control); every step from a held log is a proof of
+/// its own, so one that reaches the new log carries its store though a later step from that log
+/// went to another; and of a store's steps that reach it, the highest fork, in either order.
+#[test]
+fn a_step_carries_the_store_this_notifier_used_last_at_the_highest_fork_its_steps_prove() {
+    use crate::state::Proved;
+    let log = |id: u8| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation: 0,
+    };
+    let step = |was, now, fork| Proved {
+        was,
+        now,
+        fork,
+        head: 50,
+    };
+    let dir = scratch("proved-rank");
+    let store = Store::open(&dir).expect("open");
+    let (a, c, d) = (log(7), log(8), log(9));
+    store
+        .for_log(Some(a), None, &Steps::default())
+        .unwrap()
+        .set_cursor("attention", 30)
+        .unwrap();
+    for (held, at) in [(c, 10), (d, 20)] {
+        store
+            .for_log(Some(held), None, &Steps::default())
+            .unwrap()
+            .set_cursor("attention", at)
+            .unwrap();
+    }
+    let carried = |x: u8, steps: &[Proved]| {
+        store
+            .for_log(Some(log(x)), None, &steps.to_vec().into())
+            .unwrap()
+            .cursor("attention")
+    };
+    let take_up = |logs: &[astream_broker::LogIdentity]| {
+        for held in logs {
+            store.for_log(Some(*held), None, &Steps::default()).unwrap();
+        }
+    };
+    let mut x = 20;
+    for (first, last, want) in [(d, c, 10), (c, d, 20)] {
+        for order in [[c, d], [d, c]] {
+            take_up(&[first, last]);
+            x += 1;
+            let steps = [step(order[0], log(x), 40), step(order[1], log(x), 40)];
+            assert_eq!(
+                carried(x, &steps),
+                Some(want),
+                "{:?} taken up last, steps from {:?} first: its store",
+                last.id[0],
+                order[0].id[0]
+            );
+        }
+    }
+    take_up(&[c, d, a]);
+    x += 1;
+    assert_eq!(
+        carried(x, &[step(a, log(x), 40), step(d, log(x), 40)]),
+        Some(30),
+        "the root's store, taken up again last"
+    );
+    take_up(&[c]);
+    x += 1;
+    assert_eq!(
+        carried(x, &[step(c, log(x), 4), step(c, log(60), 50)]),
+        Some(4),
+        "a step from C that reaches it carries C's store, though C's newest went elsewhere"
+    );
+    for forks in [[4, 8], [8, 4]] {
+        take_up(&[c]);
+        x += 1;
+        assert_eq!(
+            carried(x, &[step(c, log(x), forks[0]), step(c, log(x), forks[1])]),
+            Some(8),
+            "of C's steps that reach it, the highest fork, the steps in the order {forks:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A STEPS FILE THAT DOES NOT READ IS AN ERROR, NOT NO STEP** ([`proved_steps`], [`Steps`]): one
+/// missing is none, one there reads as its steps, and one there that does not read (here a
+/// directory in its place, in the notifier's state dir or the fabric bridge's) fails the read;
+/// and that fails only the build of a store for a log not the root's ([`Store::for_log`]: none
+/// is built), never the root's own log nor a store that stands, so a connect to either goes on;
+/// a store still marked [`UNPROVED`] is taken up waiting, its marker kept, carried nothing by a
+/// read that may have missed a step though one is stored, and the next read that reads decides
+/// ([`Store::unproved`]). NEGATIVE CONTROL: the lenient read (`StateDir::proved_steps`) takes it
+/// for none.
+#[test]
+fn a_steps_file_that_does_not_read_is_an_error_not_no_step() {
+    let dir = scratch("proved-read");
+    let base = PathBuf::from(&dir);
+    let fabric = base.join("fabric");
+    std::fs::create_dir_all(&fabric).unwrap();
+    let mut c = cfg(&dir);
+    c.bridge_state = Some(fabric.to_string_lossy().into_owned());
+    std::fs::create_dir_all(&base).unwrap();
+    assert!(proved_steps(&c).unwrap().is_empty(), "none stored");
+    let log = |id: u8| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation: 0,
+    };
+    let (a, b) = (log(7), log(8));
+    std::fs::write(fabric.join("proved-logs"), format!("{a}~{b}@4\n")).unwrap();
+    assert_eq!(proved_steps(&c).unwrap().len(), 1, "the fabric bridge's");
+    for unread in [base.join("proved-logs"), fabric.join("proved-logs")] {
+        let _ = std::fs::remove_file(&unread);
+        std::fs::create_dir_all(&unread).unwrap();
+        assert!(
+            proved_steps(&c).is_err(),
+            "{}: one there that does not read",
+            unread.display()
+        );
+        assert!(
+            crate::state::StateDir::peek(unread.parent().unwrap())
+                .proved_steps()
+                .is_empty(),
+            "CONTROL: the lenient read takes it for none"
+        );
+        std::fs::remove_dir(&unread).unwrap();
+    }
+
+    let store = Store::open(&dir).expect("open");
+    let unread = fabric.join("proved-logs");
+    let _ = std::fs::remove_file(&unread);
+    std::fs::create_dir_all(&unread).unwrap();
+    let failed = Steps::read(&c);
+    assert!(failed.0.is_err(), "PRECONDITION: the read fails");
+    store
+        .for_log(Some(a), None, &failed)
+        .expect("the first log read: the root's, no step decides");
+    store
+        .for_log(Some(a), None, &failed)
+        .expect("the root's own log again");
+    assert!(
+        store.for_log(Some(b), None, &failed).is_err(),
+        "a log not the root's, no store held for it"
+    );
+    assert!(
+        !base.join("notify/logs").join(b.to_string()).exists(),
+        "none is built"
+    );
+    let a1 = astream_broker::LogIdentity {
+        id: [7; 16],
+        generation: 1,
+    };
+    store
+        .for_log(Some(a1), Some(&lineage_of(&[(1, 3)])), &failed)
+        .expect("a moved generation of a held log: its lineage decides, no step");
+    assert!(
+        base.join("notify/logs").join(a1.to_string()).exists()
+            && !base
+                .join("notify/logs")
+                .join(a1.to_string())
+                .join(UNPROVED)
+                .exists(),
+        "carried by its lineage, not begun as a first run"
+    );
+    let marked = store.for_log(Some(b), None, &Steps::default()).unwrap();
+    store
+        .for_log(Some(b), None, &failed)
+        .expect("a store that stands is returned as it is");
+    let own = marked.read_verdicts().unwrap();
+    std::fs::write(base.join("proved-logs"), format!("{a}~{b}@4\n")).unwrap();
+    assert!(
+        Steps::read(&c).0.is_err(),
+        "PRECONDITION: the fabric bridge's file still does not read"
+    );
+    assert!(
+        matches!(
+            store.unproved(b, None, &failed, &own),
+            Ok(Some(Unproved::Wait))
+        ),
+        "a marker that stands: taken up waiting, no carry decided by a read that failed"
+    );
+    assert!(
+        base.join("notify/logs")
+            .join(b.to_string())
+            .join(UNPROVED)
+            .exists(),
+        "and its marker kept"
+    );
+    std::fs::remove_dir(&unread).unwrap();
+    assert!(
+        matches!(
+            store.unproved(b, None, &Steps::read(&c), &own),
+            Ok(Some(Unproved::Carry(_, 4)))
+        ),
+        "the next read that reads decides: the step stored carries"
+    );
+    marked.drop_unproved().unwrap();
+    assert!(
+        store.unproved(b, None, &failed, &own).unwrap().is_none(),
+        "no marker: nothing decided"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A MARKED STORE WHOSE STEPS DO NOT READ IS TAKEN UP WAITING, AND CARRIED ONCE THEY READ**
+/// (ATERM-KI-1116-7314, [`Store::unproved`], [`Unproved::unread`]): a follower whose reader
+/// reached B, begun as a first run marked [`UNPROVED`] beside A's store, while the steps file
+/// does not read (a directory in its place; the reader's connect-time read failed too), takes B
+/// up as the first run it began as at its first record and pages it and the next; once the file
+/// reads and holds the step A→B, its own poll reads the steps afresh
+/// ([`Notifier::poll_proved`]), not the reader's failed read, and carries A's store below the
+/// fork into B's, every verdict kept. NEGATIVE CONTROL (forced once by hand): the take-up failing
+/// on the steps read, as before, stalls the record unpaged, and every retry reads the same
+/// failed steps.
+#[test]
+fn a_marked_store_whose_steps_do_not_read_is_taken_up_waiting_and_carried_once_they_read() {
+    let log = |id: u8| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation: 0,
+    };
+    let (a, b) = (log(7), log(8));
+    let presence = |sid: &str| format!("/f/f1/pub/n-a/{sid}/presence");
+    let raise = |text: &str| format!("v=1 t=1 attention={text}").into_bytes();
+    let dir = scratch("unread-marked");
+    let base = PathBuf::from(&dir);
+    std::fs::create_dir_all(&base).unwrap();
+    let store = Store::open(&dir).expect("open");
+    let root = store.for_log(Some(a), None, &Steps::default()).unwrap();
+    root.set_cursor("attention", 9).unwrap();
+    let marked = store.for_log(Some(b), None, &Steps::default()).unwrap();
+    drop((root, marked, store));
+    let marker = base.join("notify/logs").join(b.to_string()).join(UNPROVED);
+    assert!(
+        marker.exists(),
+        "PRECONDITION: B began as a first run, marked"
+    );
+    let steps = base.join("proved-logs");
+    std::fs::create_dir_all(&steps).unwrap();
+    let (mut n, fired) = appending(&dir, 10, "");
+    let read = ReadLog {
+        id: Some(b),
+        lineage: None,
+        proved: Steps::read(&n.cfg),
+        ordered: false,
+        carried: 0,
+    };
+    assert!(
+        read.proved.0.is_err(),
+        "PRECONDITION: the reader's read of the steps failed"
+    );
+    n.take(Notice::Log(0, read)).expect("its log");
+    for (off, sid, token) in [(13, "ta000000000", "help"), (15, "tb000000000", "disk")] {
+        let taken = n.take(Notice::Record(0, off, presence(sid), raise(token)));
+        assert!(
+            taken.is_ok(),
+            "the record at {off} is taken while the steps do not read: {taken:?}"
+        );
+    }
+    assert_eq!(
+        (n.log_now, fired_offsets(&fired)),
+        (Some(b), vec![13, 15]),
+        "B taken up as its first run, and its records paged"
+    );
+    assert!(marker.exists(), "its marker kept");
+    let (due, _) = n
+        .proved_poll
+        .unwrap_or_else(|| panic!("the follower reads the steps again"));
+    n.poll_proved(due);
+    assert_eq!(
+        (n.hold.carried(), marker.exists()),
+        (0, true),
+        "a poll while the file does not read carries nothing and keeps the marker"
+    );
+    std::fs::remove_dir(&steps).unwrap();
+    crate::state::StateDir::open(base.clone())
+        .unwrap()
+        .add_proved_step(crate::state::Proved {
+            was: a,
+            now: b,
+            fork: 5,
+            head: 16,
+        })
+        .unwrap();
+    let (due, _) = n
+        .proved_poll
+        .unwrap_or_else(|| panic!("the follower reads the steps again"));
+    n.poll_proved(due);
+    assert_eq!(
+        (n.hold.carried(), marker.exists(), n.proved_poll),
+        (1, false, None),
+        "once the file reads, the poll carries and removes the marker"
+    );
+    let held = n.log_store.read_verdicts().unwrap();
+    assert_eq!(
+        (
+            held.cursors.get("attention"),
+            held.lines
+                .iter()
+                .filter_map(|line| journal::offset_of(line))
+                .collect::<Vec<_>>()
+        ),
+        (Some(&5), vec![13, 15]),
+        "A's store carried below the fork, B's verdicts kept"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1115,7 +2794,9 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
             generation,
         }),
         lineage: None,
+        proved: Steps::default(),
         ordered,
+        carried: 0,
     };
     let feed = |n: &mut Notifier, notices: Vec<Notice>| {
         for notice in notices {
@@ -1130,8 +2811,8 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
         &mut n,
         vec![
             Notice::Log(0, log(true, 0)),
-            Notice::Record(0, 5, presence("ta000000000"), raise("key")),
-            Notice::Record(0, 7, presence("tb000000000"), raise("disk")),
+            Notice::Record(0, 5, presence("tzzzzzzzzza"), raise("key")),
+            Notice::Record(0, 7, presence("tzzzzzzzzzb"), raise("disk")),
             Notice::Checkpoint(0, 9),
         ],
     );
@@ -1153,7 +2834,7 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
     feed(
         &mut n,
         vec![
-            Notice::Record(0, 10, presence("tc000000000"), raise("lost")),
+            Notice::Record(0, 10, presence("tzzzzzzzzzc"), raise("lost")),
             Notice::Log(0, log(true, 1)),
             Notice::Durable(0, 99),
         ],
@@ -1169,9 +2850,9 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
         &mut n,
         vec![
             Notice::Log(0, log(true, 1)),
-            Notice::Record(0, 20, presence("tf000000000"), raise("held")),
+            Notice::Record(0, 20, presence("tzzzzzzzzzf"), raise("held")),
             Notice::Log(0, log(false, 1)),
-            Notice::Record(0, 21, presence("tg000000000"), raise("strict")),
+            Notice::Record(0, 21, presence("tzzzzzzzzzg"), raise("strict")),
         ],
     );
     assert_eq!(fired_offsets(&fired), [5, 7, 20, 21], "in read order");
@@ -1181,8 +2862,8 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
     feed(
         &mut n,
         vec![
-            Notice::Record(0, 30, presence("td000000000"), raise("first")),
-            Notice::Record(0, 31, presence("te000000000"), {
+            Notice::Record(0, 30, presence("tzzzzzzzzzd"), raise("first")),
+            Notice::Record(0, 31, presence("tzzzzzzzzze"), {
                 let mut body = raise("big");
                 body.resize(HOLD_MAX, b' ');
                 body
@@ -1201,7 +2882,7 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
             &mut n,
             vec![
                 Notice::Log(0, log(ordered, 0)),
-                Notice::Record(0, 5, presence("ta000000000"), raise("key")),
+                Notice::Record(0, 5, presence("tzzzzzzzzza"), raise("key")),
                 Notice::Checkpoint(0, 9),
             ],
         );
@@ -1228,7 +2909,9 @@ fn a_durable_wait_is_said_once_per_log_and_a_hold_past_its_cap_once_per_streak()
             generation,
         }),
         lineage: None,
+        proved: Steps::default(),
         ordered: true,
+        carried: 0,
     };
     let live = || b"v=1 t=1 state=live".to_vec();
     let said = |what: fn(&Warned) -> bool| {
@@ -1244,30 +2927,30 @@ fn a_durable_wait_is_said_once_per_log_and_a_hold_past_its_cap_once_per_streak()
     WARNED.with(|warned| warned.borrow_mut().clear());
     n.take(Notice::Log(0, log(0))).expect("log");
     for off in 0..50 {
-        n.take(Notice::Record(0, off, presence_of("ta000000000"), live()))
+        n.take(Notice::Record(0, off, presence_of("tzzzzzzzzza"), live()))
             .expect("held");
         assert_eq!(
             n.held_bytes,
-            presence_of("ta000000000").len() + live().len()
+            presence_of("tzzzzzzzzza").len() + live().len()
         );
         n.take(Notice::Durable(0, off + 1)).expect("released");
         assert_eq!(n.held_bytes, 0, "{off}: released");
     }
     assert_eq!(waits(), 1, "fifty held records say the wait once");
     n.take(Notice::Log(0, log(0))).expect("the same log again");
-    n.take(Notice::Record(0, 50, presence_of("ta000000000"), live()))
+    n.take(Notice::Record(0, 50, presence_of("tzzzzzzzzza"), live()))
         .expect("held");
     n.take(Notice::Durable(0, 51)).expect("released");
     assert_eq!(waits(), 1, "a reconnect to the same log says nothing new");
     n.take(Notice::Log(0, log(1))).expect("another log");
-    n.take(Notice::Record(0, 60, presence_of("ta000000000"), live()))
+    n.take(Notice::Record(0, 60, presence_of("tzzzzzzzzza"), live()))
         .expect("held");
     n.take(Notice::Durable(0, 61)).expect("released");
     assert_eq!(waits(), 2, "another log's wait is said once more");
     for off in 70..73 {
         let mut big = live();
         big.resize(HOLD_MAX, b' ');
-        n.take(Notice::Record(0, off, presence_of("ta000000000"), big))
+        n.take(Notice::Record(0, off, presence_of("tzzzzzzzzza"), big))
             .expect("paged past the cap");
         assert_eq!(n.held_bytes, 0, "{off}: released at once");
     }
@@ -1276,7 +2959,7 @@ fn a_durable_wait_is_said_once_per_log_and_a_hold_past_its_cap_once_per_streak()
     let past_cap = |n: &mut Notifier, off: u64| {
         let mut big = live();
         big.resize(HOLD_MAX, b' ');
-        n.take(Notice::Record(0, off, presence_of("ta000000000"), big))
+        n.take(Notice::Record(0, off, presence_of("tzzzzzzzzza"), big))
             .expect("paged past the cap");
         assert_eq!(n.held_bytes, 0, "{off}: released at once");
     };
@@ -1310,7 +2993,9 @@ fn strict_log() -> ReadLog {
             generation: 0,
         }),
         lineage: None,
+        proved: Steps::default(),
         ordered: false,
+        carried: 0,
     }
 }
 
@@ -1365,8 +3050,8 @@ fn a_page_flushes_in_full_once_and_before_its_command_runs() {
             D,
             Vec::new(),
             vec![
-                row(1, "ta000000000", "help-a"),
-                row(2, "tb000000000", "help-b"),
+                row(1, "tzzzzzzzzza", "help-a"),
+                row(2, "tzzzzzzzzzb", "help-b"),
             ],
             &[D],
         ),
@@ -1375,16 +3060,16 @@ fn a_page_flushes_in_full_once_and_before_its_command_runs() {
             O,
             Vec::new(),
             vec![
-                row(1, "ta000000000", "help-a"),
-                row(2, "tb000000000", "help-b"),
+                row(1, "tzzzzzzzzza", "help-a"),
+                row(2, "tzzzzzzzzzb", "help-b"),
             ],
             &[O],
         ),
         (
             "a raise that replaces another token, its cursor owed",
             D,
-            vec![row(1, "ta000000000", "help-1"), row(2, "tq000000000", "-")],
-            vec![row(3, "ta000000000", "help-2")],
+            vec![row(1, "tzzzzzzzzza", "help-1"), row(2, "tzzzzzzzzzq", "-")],
+            vec![row(3, "tzzzzzzzzza", "help-2")],
             &[O, D],
         ),
         (
@@ -1392,8 +3077,8 @@ fn a_page_flushes_in_full_once_and_before_its_command_runs() {
             D,
             Vec::new(),
             vec![
-                row(1, "ta000000000", "help-a"),
-                row(2, "tb000000000", "help-b"),
+                row(1, "tzzzzzzzzza", "help-a"),
+                row(2, "tzzzzzzzzzb", "help-b"),
             ],
             &[O, D],
         ),
@@ -1409,6 +3094,7 @@ fn a_page_flushes_in_full_once_and_before_its_command_runs() {
                         generation: 0,
                     }),
                     None,
+                    &Steps::default(),
                 )
                 .expect("the root's store claimed by another log");
         }
@@ -1483,7 +3169,7 @@ fn a_record_that_pages_nothing_flushes_nothing_and_the_cursor_trails_it_by_at_mo
         records.push((NEED_FACE.to_string(), body.into_bytes()));
         if i % 3 == 2 {
             records.push((
-                presence_of("tx000000000"),
+                presence_of("tzzzzzzzzzx"),
                 b"v=1 t=1 inc=1 state=live".to_vec(),
             ));
         }
@@ -1567,10 +3253,10 @@ fn a_standing_value_never_reaches_the_media_ahead_of_its_selectors_cursor() {
     n.cursor_every = Duration::MAX;
     n.take(Notice::Log(0, strict_log())).expect("log");
     let records = [
-        (1, "ta000000000", raise.clone()),
-        (2, "ta000000000", raise.clone()),
-        (3, "ta000000000", b"v=1 t=1 attention=-".to_vec()),
-        (4, "tb000000000", b"v=1 t=1 state=live".to_vec()),
+        (1, "tzzzzzzzzza", raise.clone()),
+        (2, "tzzzzzzzzza", raise.clone()),
+        (3, "tzzzzzzzzza", b"v=1 t=1 attention=-".to_vec()),
+        (4, "tzzzzzzzzzb", b"v=1 t=1 state=live".to_vec()),
     ];
     for (off, sid, body) in &records {
         n.take(Notice::Record(0, *off, presence_of(sid), body.clone()))
@@ -1628,7 +3314,7 @@ fn the_notifiers_standing_change_and_its_cursor_reach_the_media_together() {
         n.standing_split = mutant;
         n.take(Notice::Log(0, strict_log())).expect("log");
         for (off, body) in [(1, raise.clone()), (2, raise.clone())] {
-            n.take(Notice::Record(0, off, presence_of("ta000000000"), body))
+            n.take(Notice::Record(0, off, presence_of("tzzzzzzzzza"), body))
                 .expect("a record");
         }
         let path = n.log_store.root.join(journal::FILE);
@@ -1636,7 +3322,7 @@ fn the_notifiers_standing_change_and_its_cursor_reach_the_media_together() {
         n.take(Notice::Record(
             0,
             3,
-            presence_of("ta000000000"),
+            presence_of("tzzzzzzzzza"),
             b"v=1 t=1 attention=-".to_vec(),
         ))
         .expect("the clear");
@@ -1647,7 +3333,7 @@ fn the_notifiers_standing_change_and_its_cursor_reach_the_media_together() {
             let cleared = !held
                 .standing
                 .iter()
-                .any(|(s, _)| *s == presence_of("ta000000000"));
+                .any(|(s, _)| *s == presence_of("tzzzzzzzzza"));
             cleared_seen |= cleared;
             apart += usize::from(cleared && held.cursors.get(&key).is_none_or(|&c| c < 3));
         }
@@ -1695,7 +3381,7 @@ fn a_followers_cursor_is_written_per_page_and_per_second_never_per_record() {
         records.push((NEED_FACE.to_string(), body.into_bytes()));
         if i % 2 == 1 {
             records.push((
-                presence_of("ty000000000"),
+                presence_of("tzzzzzzzzzy"),
                 b"v=1 t=1 inc=1 state=live".to_vec(),
             ));
         }
@@ -2011,10 +3697,10 @@ fn refuse(name: &'static str, times: usize) {
 fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_nor_repeats() {
     let retry = Duration::from_secs(60);
     let miss: [Row; 4] = [
-        (1, "ta000000000", "help"),
-        (2, "ta000000000", "-"),
-        (3, "tb000000000", "other"),
-        (4, "ta000000000", "help"),
+        (1, "tzzzzzzzzza", "help"),
+        (2, "tzzzzzzzzza", "-"),
+        (3, "tzzzzzzzzzb", "other"),
+        (4, "tzzzzzzzzza", "help"),
     ];
     for crash in [false, true] {
         let dir = scratch(&format!("standing-miss-{crash}"));
@@ -2024,12 +3710,12 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
         n.take(raised(&miss[0])).expect("1 pages");
         refuse("standing", 2);
         n.take(raised(&miss[1]))
-            .expect("2 clears ta000000000, its standing value refused");
+            .expect("2 clears tzzzzzzzzza, its standing value refused");
         let waits = n.take(raised(&miss[2]));
         assert_eq!(
             (waits.map_err(|e| e.raw_os_error()), fired_offsets(&fired)),
             (Err(Some(libc::ENOSPC)), vec![1]),
-            "crash={crash}: tb000000000's raise at 3 waits behind the clear at 2"
+            "crash={crash}: tzzzzzzzzzb's raise at 3 waits behind the clear at 2"
         );
         n.clock = Some(base + retry);
         let _ = n.tick(n.now());
@@ -2055,17 +3741,17 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
         assert_eq!(
             paged,
             [1, 3, 4],
-            "crash={crash}: tb000000000's raise at 3 pages once, and ta000000000's help, cleared at 2, \
+            "crash={crash}: tzzzzzzzzzb's raise at 3 pages once, and tzzzzzzzzza's help, cleared at 2, \
              pages again at 4"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     let repeat: [Row; 4] = [
-        (1, "ta000000000", "help"),
-        (2, "tb000000000", "help"),
-        (3, "ta000000000", "help"),
-        (4, "ta000000000", "-"),
+        (1, "tzzzzzzzzza", "help"),
+        (2, "tzzzzzzzzzb", "help"),
+        (3, "tzzzzzzzzza", "help"),
+        (4, "tzzzzzzzzza", "-"),
     ];
     let dir = scratch("standing-repeat");
     let (mut n, fired) = attending(&dir, 100, retry);
@@ -2076,7 +3762,7 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
         *r.borrow_mut() = vec![("standing", 0, libc::ENOSPC), ("cur/", 0, libc::ENOSPC)];
     });
     n.take(raised(&repeat[1]))
-        .expect("2 pages tb000000000, its standing value refused");
+        .expect("2 pages tzzzzzzzzzb, its standing value refused");
     for row in &repeat[2..] {
         let _ = n.take(raised(row));
     }
@@ -2088,14 +3774,14 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
             REFUSE.with(std::cell::RefCell::take).len()
         ),
         (vec![1, 2], 0),
-        "PRECONDITION: 1 and 2 paged, 3 stood, tb000000000's standing value was refused, and at \
+        "PRECONDITION: 1 and 2 paged, 3 stood, tzzzzzzzzzb's standing value was refused, and at \
          its retry a cursor"
     );
     drop(n);
     assert_eq!(
         restart(&dir, &repeat, 100).1,
         [1, 2],
-        "a crash re-reads ta000000000's republish at 3 under the value it stood under, and pages \
+        "a crash re-reads tzzzzzzzzza's republish at 3 under the value it stood under, and pages \
          nothing again"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -2107,10 +3793,10 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
 #[test]
 fn no_cursor_passes_a_record_whose_standing_change_is_unwritten() {
     let rows: [Row; 4] = [
-        (1, "ta000000000", "help"),
-        (2, "ta000000000", "-"),
-        (3, "tc000000000", "-"),
-        (4, "ta000000000", "help"),
+        (1, "tzzzzzzzzza", "help"),
+        (2, "tzzzzzzzzza", "-"),
+        (3, "tzzzzzzzzzc", "-"),
+        (4, "tzzzzzzzzza", "help"),
     ];
     let dir = scratch("standing-hold");
     let (mut n, _) = attending(&dir, 100, Duration::ZERO);
@@ -2119,7 +3805,7 @@ fn no_cursor_passes_a_record_whose_standing_change_is_unwritten() {
     n.take(raised(&rows[0])).expect("1 pages");
     refuse("standing", 2);
     n.take(raised(&rows[1]))
-        .expect("2 clears ta000000000, refused, and its retry refused");
+        .expect("2 clears tzzzzzzzzza, refused, and its retry refused");
     assert!(
         REFUSE.with(std::cell::RefCell::take).is_empty(),
         "PRECONDITION: the clear and its retry, due at once, were refused"
@@ -2128,7 +3814,7 @@ fn no_cursor_passes_a_record_whose_standing_change_is_unwritten() {
     assert_eq!(
         restart(&dir, &rows, 100).1,
         [1, 4],
-        "the restart re-read the clear at 2, so ta000000000's help at 4 paged"
+        "the restart re-read the clear at 2, so tzzzzzzzzza's help at 4 paged"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2140,7 +3826,7 @@ fn no_cursor_passes_a_record_whose_standing_change_is_unwritten() {
 fn a_drops_count_never_reaches_the_store_ahead_of_its_line_and_no_cursor_passes_it() {
     let key = Sel::Attention.key();
     let retry = Duration::from_secs(60);
-    let rows: [Row; 2] = [(1, "ta000000000", "help"), (2, "tb000000000", "other")];
+    let rows: [Row; 2] = [(1, "tzzzzzzzzza", "help"), (2, "tzzzzzzzzzb", "other")];
     let on_store = |n: &Notifier| {
         (
             n.log_store
@@ -2222,15 +3908,15 @@ fn kill_sweep(own_store: bool) {
             format!("v=1 t=1 attention=help-{sid}").into_bytes(),
         )
     };
-    let quiet = || (presence_of("tq000000000"), b"v=1 t=1 state=live".to_vec());
+    let quiet = || (presence_of("tzzzzzzzzzq"), b"v=1 t=1 state=live".to_vec());
     let records: Vec<(u64, String, Vec<u8>)> = [
         quiet(),
-        raise("ta000000000"),
+        raise("tzzzzzzzzza"),
         quiet(),
-        raise("tb000000000"),
-        raise("tc000000000"),
-        raise("td000000000"),
-        raise("te000000000"),
+        raise("tzzzzzzzzzb"),
+        raise("tzzzzzzzzzc"),
+        raise("tzzzzzzzzzd"),
+        raise("tzzzzzzzzze"),
         quiet(),
     ]
     .into_iter()
@@ -2247,6 +3933,7 @@ fn kill_sweep(own_store: bool) {
                         generation: 0,
                     }),
                     None,
+                    &Steps::default(),
                 )
                 .expect("the root's store claimed by another log");
         }
@@ -2363,18 +4050,22 @@ fn the_flush_tally_tells_every_flush_a_carried_generation_asks_for() {
         id: [7; 16],
         generation,
     };
-    store.for_log(Some(g(0)), None).unwrap();
-    let one = store.for_log(Some(g(1)), None).unwrap();
+    store.for_log(Some(g(0)), None, &Steps::default()).unwrap();
+    let one = store.for_log(Some(g(1)), None, &Steps::default()).unwrap();
     one.set_cursor("attention", 9).unwrap();
     one.set_journal(&["2 fired rc=0".to_string()], Flush::Ordered)
         .unwrap();
-    one.set_standing(&[("/f/f1/pub/n-a/tx000000000/presence".into(), "help".into())])
+    one.set_standing(&[("/f/f1/pub/n-a/s-x/presence".into(), "help".into())])
         .unwrap();
 
     let recording = aterm_durable::seam::Recording::start();
     NOTED.with(|noted| noted.borrow_mut().clear());
     let two = store
-        .for_log(Some(g(2)), Some(&lineage_of(&[(1, 3), (2, 5)])))
+        .for_log(
+            Some(g(2)),
+            Some(&lineage_of(&[(1, 3), (2, 5)])),
+            &Steps::default(),
+        )
         .unwrap();
     let noted = NOTED.with(|noted| noted.take());
     assert_eq!(two.cursor("attention"), Some(5), "PRECONDITION: carried");
@@ -2406,12 +4097,7 @@ fn the_exec_stamps_tell_each_fresh_page_once_in_the_order_it_ran() {
         untold: None,
     });
     for off in [1, 2] {
-        feed(
-            &mut n,
-            off,
-            &format!("t{off:010}"),
-            "v=1 t=1 attention=help",
-        );
+        feed(&mut n, off, &generated_sid(off), "v=1 t=1 attention=help");
         n.tell();
         assert_eq!(
             fired_offsets(&fired).last(),
@@ -2445,7 +4131,7 @@ fn exec_of(dir: &str, command: &str, timeout: Duration) -> String {
             "f1",
             7,
             "/f/f1/in/p/h-andrew/n-a/ask",
-            b"v=1 t=1 from=tb000000000 text=x",
+            b"v=1 t=1 from=tzzzzzzzzzb text=x",
         )
         .expect("an ask to h-andrew");
     let mut c = cfg(dir);
@@ -2623,7 +4309,7 @@ fn an_ordered_broker_pages_a_record_only_once_it_is_durable() {
             .publish(
                 7,
                 1,
-                "/f/f1/pub/n-a/tx000000000/presence",
+                "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
                 b"v=1 t=1 attention=needs%20a%20key",
             )
             .unwrap()
@@ -2642,7 +4328,7 @@ fn an_ordered_broker_pages_a_record_only_once_it_is_durable() {
             .publish(
                 7,
                 2,
-                "/f/f1/pub/n-b/ty000000000/presence",
+                "/f/f1/pub/n-b/tzzzzzzzzzy/presence",
                 b"v=1 t=1 attention=disk",
             )
             .unwrap()
@@ -2756,7 +4442,7 @@ fn in_follow_mode_the_horizon_alone_pages_an_attention_row() {
             .publish(
                 7,
                 1,
-                "/f/f1/pub/n-a/tx000000000/presence",
+                "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
                 b"v=1 t=1 attention=needs%20a%20key",
             )
             .unwrap()
@@ -2782,7 +4468,7 @@ fn in_follow_mode_the_horizon_alone_pages_an_attention_row() {
         conn.publish(
             7,
             2,
-            "/f/f1/pub/n-a/ty000000000/presence",
+            "/f/f1/pub/n-a/tzzzzzzzzzy/presence",
             b"v=1 t=1 attention=disk",
         )
         .unwrap();
@@ -3049,7 +4735,7 @@ impl Needs {
     }
 }
 
-const NEED_FACE: &str = "/f/f1/pub/n-a/tx000000000/ev";
+const NEED_FACE: &str = "/f/f1/pub/n-a/tzzzzzzzzzx/ev";
 
 #[cfg(unix)]
 #[test]
@@ -3125,7 +4811,7 @@ fn a_need_pages_once_per_rise_and_a_restart_pages_nothing_again() {
             .map(str::to_string)
             .collect()
     };
-    let line = |off: u64, word: &str| format!("{off} need {word} tx000000000 n-a");
+    let line = |off: u64, word: &str| format!("{off} need {word} tzzzzzzzzzx n-a");
     let failure = Sel::Need(Some(vec!["failure"]));
     assert_eq!(
         run("failure", failure.clone()),
@@ -3227,7 +4913,7 @@ fn a_following_need_reader_folds_below_its_cursor_before_it_judges() {
     publish(&mut conn, NEED_FACE, quiet);
     let mut y = Needs::open();
     let other =
-        publish(&mut conn, "/f/f1/pub/n-a/ty000000000/ev", failing(&mut y)).expect("a rise");
+        publish(&mut conn, "/f/f1/pub/n-a/tzzzzzzzzzy/ev", failing(&mut y)).expect("a rise");
     pump(&mut n, &rx, "the other session's page", |_| {
         fired_offsets(&fired).contains(&other)
     });
@@ -3268,7 +4954,7 @@ fn an_exited_session_clears_its_standing_needs_and_a_will_or_a_relaunch_does_not
             n.on_record(&sel, off, subject, body).expect("on_record");
             off
         };
-        let faces = ["tx000000000", "ty000000000"].map(|sid| format!("/f/f1/pub/n-a/{sid}/ev"));
+        let faces = ["tzzzzzzzzzx", "tzzzzzzzzzy"].map(|sid| format!("/f/f1/pub/n-a/{sid}/ev"));
         let mut rises = Vec::new();
         for face in &faces {
             let mut s = Needs::open();
@@ -3293,7 +4979,7 @@ fn an_exited_session_clears_its_standing_needs_and_a_will_or_a_relaunch_does_not
         );
         feed(
             &mut n,
-            "/f/f1/pub/n-a/tx000000000/presence",
+            "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
             b"v=1 t=1 inc=1 state=live",
         );
         assert_eq!(
@@ -3303,7 +4989,7 @@ fn an_exited_session_clears_its_standing_needs_and_a_will_or_a_relaunch_does_not
         );
         feed(
             &mut n,
-            "/f/f1/pub/n-a/tx000000000/presence",
+            "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
             b"v=1 t=2 inc=2 state=exited",
         );
         assert_eq!(
@@ -3357,7 +5043,7 @@ fn a_need_standing_since_before_the_warm_window_pages_nothing_again_after_a_rest
     }
     let rose = rose.expect("the failed run's close");
     for _ in 0..crate::notify_need::WARM_WINDOW + 10 {
-        publish(&mut conn, "/f/f1/pub/n-a/tz000000000/filler", b"v=1 t=1");
+        publish(&mut conn, "/f/f1/pub/n-a/s-z/filler", b"v=1 t=1");
     }
     let state = base.join("state");
     let fired = base.join("fired");
@@ -3429,7 +5115,7 @@ fn a_need_standing_since_before_the_warm_window_pages_nothing_again_after_a_rest
 
 #[test]
 fn a_sessions_exit_pages_once_whichever_of_its_close_and_its_row_comes_first() {
-    let presence = "/f/f1/pub/n-a/tx000000000/presence";
+    let presence = "/f/f1/pub/n-a/tzzzzzzzzzx/presence";
     let exited: &[u8] = b"v=1 t=2 inc=1 state=exited";
     let mut s = Needs::open();
     let cmd = s.cmd_open();
@@ -3533,22 +5219,22 @@ fn failed_then_waiting() -> Vec<String> {
 /// A DEAD SESSION'S EXIT PAGES ONCE, AND ONLY AT A SUCCESSOR'S RESTORE (fix unit E9, finding
 /// E2E-5; the orchestrator's 2026-10-27 ruling). Two sessions each page a failure and then
 /// wait in an agent turn; their node's bridge dies (its will) and the node relaunches. A
-/// successor's restore names tx000000000: the watch derives tx000000000's close and pages `exited`, detail
-/// `gone`, for tx000000000, once, at the restore, under bare `--on need` and under `need:exited`.
-/// Nothing else pages: tx000000000's own `exited` row after it, the restore delivered again, a
-/// record of tx000000000 delivered again, and ty000000000, whose row a later incarnation retired with no
+/// successor's restore names tzzzzzzzzzx: the watch derives tzzzzzzzzzx's close and pages `exited`, detail
+/// `gone`, for tzzzzzzzzzx, once, at the restore, under bare `--on need` and under `need:exited`.
+/// Nothing else pages: tzzzzzzzzzx's own `exited` row after it, the restore delivered again, a
+/// record of tzzzzzzzzzx delivered again, and tzzzzzzzzzy, whose row a later incarnation retired with no
 /// successor naming it (the brief derives its close; its row alone pages nothing, and its
-/// pairs clear, as G2's rule says), nor a record of ty000000000 delivered after that row. NEGATIVE
+/// pairs clear, as G2's rule says), nor a record of tzzzzzzzzzy delivered after that row. NEGATIVE
 /// CONTROLS, run: a watch that derives nothing (the restore pages nothing), one that judges
-/// the restore as the successor's record only (the exit pages late, at tx000000000's next record),
-/// one that derives on a retired row too (ty000000000 pages at its next record), and one that pages
+/// the restore as the successor's record only (the exit pages late, at tzzzzzzzzzx's next record),
+/// one that derives on a retired row too (tzzzzzzzzzy pages at its next record), and one that pages
 /// the derived exit without its `gone`.
 #[test]
 fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_nothing() {
     let face = |sid: &str| format!("/f/f1/pub/n-a/{sid}/ev");
     let row = |sid: &str| format!("/f/f1/pub/n-a/{sid}/presence");
     let waiting = failed_then_waiting();
-    let restore = restore_of("tx000000000");
+    let restore = restore_of("tzzzzzzzzzx");
     for (tag, sel) in [
         ("exited", Sel::Need(Some(vec!["exited"]))),
         ("any", Sel::Need(None)),
@@ -3572,7 +5258,7 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
             off
         };
         let mut want = Vec::new();
-        for sid in ["tx000000000", "ty000000000"] {
+        for sid in ["tzzzzzzzzzx", "tzzzzzzzzzy"] {
             feed(&mut n, &row(sid), b"v=1 t=1 inc=1 state=live");
             for b in &waiting {
                 let at = feed(&mut n, &face(sid), b.as_bytes());
@@ -3588,7 +5274,7 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
         );
         feed(&mut n, &row("node"), b"v=1 t=3 state=live inc=2");
         for b in &restore {
-            let at = feed(&mut n, &face("tz000000000"), b.as_bytes());
+            let at = feed(&mut n, &face("tzzzzzzzzzz"), b.as_bytes());
             if b.contains(" k=restore ") {
                 want.push(at);
             }
@@ -3598,12 +5284,12 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
             want,
             "{tag}: the dead session's exit pages at its successor's restore"
         );
-        feed(&mut n, &row("tx000000000"), b"v=1 t=4 inc=2 state=exited");
-        feed(&mut n, &row("ty000000000"), b"v=1 t=4 inc=2 state=exited");
+        feed(&mut n, &row("tzzzzzzzzzx"), b"v=1 t=4 inc=2 state=exited");
+        feed(&mut n, &row("tzzzzzzzzzy"), b"v=1 t=4 inc=2 state=exited");
         for b in &restore {
-            feed(&mut n, &face("tz000000000"), b.as_bytes());
+            feed(&mut n, &face("tzzzzzzzzzz"), b.as_bytes());
         }
-        for sid in ["tx000000000", "ty000000000"] {
+        for sid in ["tzzzzzzzzzx", "tzzzzzzzzzy"] {
             feed(&mut n, &face(sid), waiting[0].as_bytes());
         }
         assert_eq!(fired_offsets(&fired), want, "{tag}: and nothing else pages");
@@ -3612,16 +5298,16 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
             said.lines()
                 .filter(|l| l.starts_with("exited "))
                 .collect::<Vec<_>>(),
-            ["exited gone tx000000000"],
+            ["exited gone tzzzzzzzzzx"],
             "{tag}: {said}"
         );
         assert_eq!(
-            standing_words(&n, &face("tx000000000")),
+            standing_words(&n, &face("tzzzzzzzzzx")),
             ["exited"],
             "{tag}"
         );
         assert_eq!(
-            standing_words(&n, &face("ty000000000")),
+            standing_words(&n, &face("tzzzzzzzzzy")),
             Vec::<&str>::new(),
             "{tag}: a retired row alone clears its session's pairs"
         );
@@ -3631,17 +5317,17 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
 
 /// A QUIT'S RELAUNCH AND A REOPENED TAB PAGE NO EXIT FOR THE SESSION THEIR RESTORE NAMES (fix
 /// unit E9, the lander's review). aterm writes `restore prev=<sid>` whenever a new shell fills
-/// a pane: after a clean quit's relaunch too, and when a closed tab is reopened. On n-a, tq000000000
+/// a pane: after a clean quit's relaunch too, and when a closed tab is reopened. On n-a, tzzzzzzzzzq
 /// pages a failure and waits in a turn; its aterm quits (the bridge withdraws it, `exited`
 /// under `inc=1`, the incarnation that hosted it; its close stays in the journal), its node's
-/// will fires as the bridge goes, the node relaunches under `inc=2`, and tz000000000's restore names
-/// tq000000000: nothing pages for tq000000000's exit (its row alone says it exited, G2's rule), and its pairs
-/// clear. On n-b, tt000000000 waits in a turn, its tab closes and is reopened under the same
-/// incarnation (`inc=1`): tv000000000's restore names tt000000000 before tt000000000's own close reaches the bus,
-/// and tt000000000's `exited` pages once, at that close. Under bare `--on need` and `need:exited`.
+/// will fires as the bridge goes, the node relaunches under `inc=2`, and tzzzzzzzzzz's restore names
+/// tzzzzzzzzzq: nothing pages for tzzzzzzzzzq's exit (its row alone says it exited, G2's rule), and its pairs
+/// clear. On n-b, tzzzzzzzzzt waits in a turn, its tab closes and is reopened under the same
+/// incarnation (`inc=1`): tzzzzzzzzz0's restore names tzzzzzzzzzt before tzzzzzzzzzt's own close reaches the bus,
+/// and tzzzzzzzzzt's `exited` pages once, at that close. Under bare `--on need` and `need:exited`.
 /// NEGATIVE CONTROLS, run: a restore that counts whatever withdrew the session pages
-/// `exited gone tq000000000` at tz000000000's restore; one that counts while the session's own incarnation
-/// lives pages tt000000000's exit twice, at tv000000000's restore and at tt000000000's close.
+/// `exited gone tzzzzzzzzzq` at tzzzzzzzzzz's restore; one that counts while the session's own incarnation
+/// lives pages tzzzzzzzzzt's exit twice, at tzzzzzzzzz0's restore and at tzzzzzzzzzt's close.
 #[test]
 fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restore_names() {
     let face = |node: &str, sid: &str| format!("/f/f1/pub/{node}/{sid}/ev");
@@ -3678,18 +5364,18 @@ fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restor
         feed(&mut n, &row("n-a", "node"), b"v=1 t=1 state=live inc=1");
         feed(
             &mut n,
-            &row("n-a", "tq000000000"),
+            &row("n-a", "tzzzzzzzzzq"),
             b"v=1 t=1 inc=1 state=live",
         );
         for b in &waiting {
-            let at = feed(&mut n, &face("n-a", "tq000000000"), b.as_bytes());
+            let at = feed(&mut n, &face("n-a", "tzzzzzzzzzq"), b.as_bytes());
             if b.contains("out=fail") && tag == "any" {
                 want.push(at);
             }
         }
         feed(
             &mut n,
-            &row("n-a", "tq000000000"),
+            &row("n-a", "tzzzzzzzzzq"),
             b"v=1 t=2 inc=1 state=exited",
         );
         feed(
@@ -3698,11 +5384,11 @@ fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restor
             b"v=1 t=2 state=away inc=1 fabric=disconnected",
         );
         feed(&mut n, &row("n-a", "node"), b"v=1 t=3 state=live inc=2");
-        for b in restore_of("tq000000000") {
-            feed(&mut n, &face("n-a", "tz000000000"), b.as_bytes());
+        for b in restore_of("tzzzzzzzzzq") {
+            feed(&mut n, &face("n-a", "tzzzzzzzzzz"), b.as_bytes());
         }
         for b in &waiting {
-            feed(&mut n, &face("n-a", "tq000000000"), b.as_bytes());
+            feed(&mut n, &face("n-a", "tzzzzzzzzzq"), b.as_bytes());
         }
         assert_eq!(
             fired_offsets(&fired),
@@ -3710,7 +5396,7 @@ fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restor
             "{tag}: a quit's relaunch pages no exit for the session it withdrew"
         );
         assert_eq!(
-            standing_words(&n, &face("n-a", "tq000000000")),
+            standing_words(&n, &face("n-a", "tzzzzzzzzzq")),
             Vec::<&str>::new(),
             "{tag}: its row alone clears its pairs"
         );
@@ -3718,24 +5404,24 @@ fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restor
         feed(&mut n, &row("n-b", "node"), b"v=1 t=1 state=live inc=1");
         feed(
             &mut n,
-            &row("n-b", "tt000000000"),
+            &row("n-b", "tzzzzzzzzzt"),
             b"v=1 t=1 inc=1 state=live",
         );
         for b in &tab_open {
-            feed(&mut n, &face("n-b", "tt000000000"), b.as_bytes());
+            feed(&mut n, &face("n-b", "tzzzzzzzzzt"), b.as_bytes());
         }
-        for b in restore_of("tt000000000") {
-            feed(&mut n, &face("n-b", "tv000000000"), b.as_bytes());
+        for b in restore_of("tzzzzzzzzzt") {
+            feed(&mut n, &face("n-b", "tzzzzzzzzz0"), b.as_bytes());
         }
         for b in &tab_close {
-            let at = feed(&mut n, &face("n-b", "tt000000000"), b.as_bytes());
+            let at = feed(&mut n, &face("n-b", "tzzzzzzzzzt"), b.as_bytes());
             if b.contains(" op=close node=- ") {
                 want.push(at);
             }
         }
         feed(
             &mut n,
-            &row("n-b", "tt000000000"),
+            &row("n-b", "tzzzzzzzzzt"),
             b"v=1 t=2 inc=1 state=exited",
         );
         assert_eq!(
@@ -3748,7 +5434,7 @@ fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restor
             said.lines()
                 .filter(|l| l.starts_with("exited "))
                 .collect::<Vec<_>>(),
-            ["exited  tt000000000"],
+            ["exited  tzzzzzzzzzt"],
             "{tag}: {said}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3765,7 +5451,7 @@ fn a_restore_naming_a_session_whose_close_reached_the_bus_pages_nothing_more() {
     s.turn();
     s.exit();
     let closing = s.bodies();
-    let restore = restore_of("tx000000000");
+    let restore = restore_of("tzzzzzzzzzx");
     for (tag, sel) in [
         ("exited", Sel::Need(Some(vec!["exited"]))),
         ("any", Sel::Need(None)),
@@ -3792,7 +5478,7 @@ fn a_restore_naming_a_session_whose_close_reached_the_bus_pages_nothing_more() {
             "PRECONDITION: one session close: {closing:?}"
         );
         for b in &restore {
-            feed(&mut n, "/f/f1/pub/n-a/tz000000000/ev", b.as_bytes());
+            feed(&mut n, "/f/f1/pub/n-a/tzzzzzzzzzz/ev", b.as_bytes());
         }
         assert_eq!(
             fired_offsets(&fired),
@@ -3805,16 +5491,16 @@ fn a_restore_naming_a_session_whose_close_reached_the_bus_pages_nothing_more() {
 }
 
 /// A CLEAN QUIT'S CLOSE AND ITS RELAUNCH PAGE NOTHING; A CRASH PAGES ITS EXIT ONCE (fix unit
-/// Q1). On n-a, tq000000000 pages a failure and waits in a turn, and its aterm quits cleanly: its
+/// Q1). On n-a, tzzzzzzzzzq pages a failure and waits in a turn, and its aterm quits cleanly: its
 /// close `out=app-quit` reaches the bus before the bridge's `bye quit`, with the bridge's
 /// withdrawal after it (`exited` under `inc=1`) or with none (a withdrawal that never
 /// landed); the node's will fires as the bridge goes, the node relaunches under `inc=2`, and
-/// tz000000000's restore names tq000000000: nothing pages for tq000000000 but its failure, and none of its pairs
-/// stands. On n-c, tc000000000 pages the same failure and waits, and its aterm crashes (no close, no
-/// withdrawal); the node relaunches, and tw000000000's restore names tc000000000: `exited gone tc000000000` pages
+/// tzzzzzzzzzz's restore names tzzzzzzzzzq: nothing pages for tzzzzzzzzzq but its failure, and none of its pairs
+/// stands. On n-c, tzzzzzzzzzc pages the same failure and waits, and its aterm crashes (no close, no
+/// withdrawal); the node relaunches, and tzzzzzzzzzw's restore names tzzzzzzzzzc: `exited gone tzzzzzzzzzc` pages
 /// once. Under bare `--on need` and `need:exited`. NEGATIVE CONTROLS, run: a watch that pages
-/// a quit's close as any other close pages `exited` at tq000000000's close; one that pages no
-/// `exited` at all pages nothing for tc000000000.
+/// a quit's close as any other close pages `exited` at tzzzzzzzzzq's close; one that pages no
+/// `exited` at all pages nothing for tzzzzzzzzzc.
 #[test]
 fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_once() {
     let face = |node: &str, sid: &str| format!("/f/f1/pub/{node}/{sid}/ev");
@@ -3855,7 +5541,7 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                 off
             };
             let mut want = Vec::new();
-            for (node, sid) in [("n-a", "tq000000000"), ("n-c", "tc000000000")] {
+            for (node, sid) in [("n-a", "tzzzzzzzzzq"), ("n-c", "tzzzzzzzzzc")] {
                 feed(&mut n, &row(node, "node"), b"v=1 t=1 state=live inc=1");
                 feed(&mut n, &row(node, sid), b"v=1 t=1 inc=1 state=live");
                 for b in &waiting {
@@ -3866,12 +5552,12 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                 }
             }
             for b in &quit {
-                feed(&mut n, &face("n-a", "tq000000000"), b.as_bytes());
+                feed(&mut n, &face("n-a", "tzzzzzzzzzq"), b.as_bytes());
             }
             if withdrawn {
                 feed(
                     &mut n,
-                    &row("n-a", "tq000000000"),
+                    &row("n-a", "tzzzzzzzzzq"),
                     b"v=1 t=2 inc=1 state=exited",
                 );
             }
@@ -3883,8 +5569,8 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                 );
                 feed(&mut n, &row(node, "node"), b"v=1 t=3 state=live inc=2");
             }
-            for b in restore_of("tq000000000") {
-                feed(&mut n, &face("n-a", "tz000000000"), b.as_bytes());
+            for b in restore_of("tzzzzzzzzzq") {
+                feed(&mut n, &face("n-a", "tzzzzzzzzzz"), b.as_bytes());
             }
             assert_eq!(
                 fired_offsets(&fired),
@@ -3893,12 +5579,12 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                  nothing"
             );
             assert_eq!(
-                standing_words(&n, &face("n-a", "tq000000000")),
+                standing_words(&n, &face("n-a", "tzzzzzzzzzq")),
                 Vec::<&str>::new(),
                 "{tag}, withdrawn {withdrawn}: the quit's close leaves no pair standing"
             );
-            for b in restore_of("tc000000000") {
-                let at = feed(&mut n, &face("n-c", "tw000000000"), b.as_bytes());
+            for b in restore_of("tzzzzzzzzzc") {
+                let at = feed(&mut n, &face("n-c", "tzzzzzzzzzw"), b.as_bytes());
                 if b.contains(" k=restore ") {
                     want.push(at);
                 }
@@ -3913,7 +5599,7 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                 said.lines()
                     .filter(|l| l.starts_with("exited "))
                     .collect::<Vec<_>>(),
-                ["exited gone tc000000000"],
+                ["exited gone tzzzzzzzzzc"],
                 "{tag}, withdrawn {withdrawn}: {said}"
             );
             let _ = std::fs::remove_dir_all(&dir);
@@ -3950,7 +5636,7 @@ fn a_derived_exit_stands_through_later_foreign_records_and_its_real_close() {
             .expect("a mirror head");
         bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=1 state=live inc=1");
         bus.row(
-            "/f/f1/pub/n-a/tx000000000/presence",
+            "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
             "v=1 t=1 inc=1 state=live",
         );
         bus.publish(NEED_FACE, waiting);
@@ -3960,7 +5646,7 @@ fn a_derived_exit_stands_through_later_foreign_records_and_its_real_close() {
         );
         bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=3 state=live inc=2");
         let restored = offset_of(
-            &bus.publish("/f/f1/pub/n-a/tz000000000/ev", restore_of("tx000000000")),
+            &bus.publish("/f/f1/pub/n-a/tzzzzzzzzzz/ev", restore_of("tzzzzzzzzzx")),
             &[" k=restore "],
         );
         let state = base.join("follow");
@@ -4116,7 +5802,7 @@ fn a_dead_sessions_derived_exit_pages_nothing_again_after_a_restart_or_a_late_st
     let waiting = failed_then_waiting();
     bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=1 state=live inc=1");
     bus.row(
-        "/f/f1/pub/n-a/tx000000000/presence",
+        "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
         "v=1 t=1 inc=1 state=live",
     );
     let failed = offset_of(&bus.publish(NEED_FACE, waiting.clone()), &["out=fail"]);
@@ -4126,7 +5812,7 @@ fn a_dead_sessions_derived_exit_pages_nothing_again_after_a_restart_or_a_late_st
     );
     bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=3 state=live inc=2");
     let restored = offset_of(
-        &bus.publish("/f/f1/pub/n-a/tz000000000/ev", restore_of("tx000000000")),
+        &bus.publish("/f/f1/pub/n-a/tzzzzzzzzzz/ev", restore_of("tzzzzzzzzzx")),
         &[" k=restore "],
     );
     let (follow, late) = (base.join("follow"), base.join("late"));
@@ -4149,7 +5835,7 @@ fn a_dead_sessions_derived_exit_pages_nothing_again_after_a_restart_or_a_late_st
     );
     bus.publish(NEED_FACE, vec![waiting[0].clone()]);
     bus.publish(
-        "/f/f1/pub/n-a/tx000000000/presence",
+        "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
         vec!["v=1 t=4 inc=2 state=exited".to_string()],
     );
     assert_eq!(
@@ -4175,7 +5861,9 @@ fn a_record_held_for_durability_is_judged_before_a_reconnects_warm_up_folds_it()
             generation: 0,
         }),
         lineage: None,
+        proved: Steps::default(),
         ordered: true,
+        carried: 0,
     };
     let mut s = Needs::open();
     let cmd = s.cmd_open();
@@ -4410,7 +6098,7 @@ fn a_rise_in_a_session_older_than_the_warm_window_pages_once() {
         "PRECONDITION: the session's start and its first snapshot"
     );
     for _ in 0..crate::notify_need::WARM_WINDOW + 10 {
-        bus.row("/f/f1/pub/n-a/tz000000000/filler", "v=1 t=1");
+        bus.row("/f/f1/pub/n-a/s-z/filler", "v=1 t=1");
     }
     let state = base.join("state");
     let run = || need_once(&sock, &state, Sel::Need(None), Since::Start);
@@ -4512,7 +6200,7 @@ fn a_nodes_will_keeps_its_sessions_needs_and_a_reattach_pages_nothing_again() {
         let run = || need_once(&sock, &state, Sel::Need(None), Since::Start);
         let (node, session) = (
             "/f/f1/pub/n-a/node/presence",
-            "/f/f1/pub/n-a/tx000000000/presence",
+            "/f/f1/pub/n-a/tzzzzzzzzzx/presence",
         );
         bus.row(node, "v=1 t=1 state=live inc=1");
         bus.row(session, "v=1 t=1 inc=1 state=live");
@@ -4714,7 +6402,12 @@ fn the_standing_stores_bound_drops_no_face_the_watch_holds() {
         [NEED_FACE],
         "PRECONDITION: the face is the oldest subject written"
     );
-    let other = |i: usize| format!("/f/f1/pub/n-b/t{i:010}/presence");
+    let other = |i: usize| {
+        format!(
+            "/f/f1/pub/n-b/{}/presence",
+            generated_sid(u64::try_from(i).expect("bounded fixture index"))
+        )
+    };
     n.standing
         .extend((1..STANDING_KEEP).map(|i| (other(i), "x".to_string())));
     n.set_standing(&sel.key(), off, &other(STANDING_KEEP), Some("x"));
@@ -4779,7 +6472,7 @@ fn a_need_whose_page_failed_or_was_dropped_pages_at_its_next_record_after_a_rest
     );
     assert_eq!(run(&failing), once, "once: it stands now");
 
-    let y_face = "/f/f1/pub/n-a/ty000000000/ev";
+    let y_face = "/f/f1/pub/n-a/tzzzzzzzzzy/ev";
     let mut y = Needs::open();
     let cmd = y.cmd_open();
     y.cmd_close(cmd, aterm_slog::RunOut::Fail);
@@ -4796,7 +6489,7 @@ fn a_need_whose_page_failed_or_was_dropped_pages_at_its_next_record_after_a_rest
     assert_eq!(
         fired_lines(&fired),
         budget,
-        "PRECONDITION: tx000000000's failure spends the budget and --rate drops ty000000000's"
+        "PRECONDITION: tzzzzzzzzzx's failure spends the budget and --rate drops tzzzzzzzzzy's"
     );
     y.quiet();
     let quiet = bus.publish(y_face, y.bodies());
@@ -5300,7 +6993,7 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
         Flush::Ordered,
     )
     .unwrap();
-    from.set_standing(&[("/f/f/pub/n-a/ta000000000/presence".into(), "help".into())])
+    from.set_standing(&[("/f/f/pub/n-a/s-a/presence".into(), "help".into())])
         .unwrap();
     let logs_store = Store::at(dir.path().join("target"))
         .unwrap()
@@ -5469,10 +7162,7 @@ fn an_unreadable_standing_file_keeps_the_journals_standing_values() {
     let from = Store::at(dir.path().join("from")).unwrap();
     std::fs::create_dir_all(from.root.join("cur")).unwrap();
     from.set_cursor("attention", 9).unwrap();
-    let rows = vec![(
-        "/f/f1/pub/n-a/t0ne0000000/presence".to_owned(),
-        "key".to_owned(),
-    )];
+    let rows = vec![("/f/f1/pub/n-a/s-one/presence".to_owned(), "key".to_owned())];
     from.set_standing(&rows).unwrap();
     std::fs::create_dir(from.root.join(journal::STANDING)).unwrap();
     assert_eq!(from.standing(), rows);
@@ -5513,7 +7203,7 @@ fn an_unreadable_standing_file_keeps_the_journals_standing_values() {
     );
     std::fs::write(
         from.root.join(journal::STANDING),
-        "/f/f1/pub/n-a/ttw00000000/presence other\n",
+        "/f/f1/pub/n-a/s-two/presence other\n",
     )
     .unwrap();
     assert_ne!(
@@ -5632,6 +7322,7 @@ fn a_pages_journal_and_stamp_writes_cost_one_full_flush_and_at_most_two_barriers
                             generation: 0,
                         }),
                         None,
+                        &Steps::default(),
                     )
                     .expect("the root's store claimed by another log");
             }
@@ -5708,11 +7399,18 @@ fn a_drop_flood_writes_bytes_in_proportion_to_its_drops() {
             feed(&mut n, 1, "t0000000000", "v=1 t=1 attention=paged");
             if full {
                 let mut off = 2;
+                let fill_until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
                 while n.root_file.steps + 100 < n.root_file.bound.steps {
+                    assert!(
+                        Instant::now() < fill_until,
+                        "the journal did not fill within the one-minute hang detector: {} steps of {}",
+                        n.root_file.steps,
+                        n.root_file.bound.steps
+                    );
                     feed(
                         &mut n,
                         off,
-                        &format!("t{off:010}"),
+                        &generated_sid(off),
                         "v=1 t=1 attention=filling",
                     );
                     off += 1;
@@ -5727,12 +7425,7 @@ fn a_drop_flood_writes_bytes_in_proportion_to_its_drops() {
             let (dropped, steps) = (n.counts.dropped, n.root_file.steps);
             let wrote = bytes_of(|| {
                 for off in 100_000..100_000 + DROPS {
-                    feed(
-                        &mut n,
-                        off,
-                        &format!("t{off:010}"),
-                        "v=1 t=1 attention=flood",
-                    );
+                    feed(&mut n, off, &generated_sid(off), "v=1 t=1 attention=flood");
                 }
             });
             assert_eq!(
@@ -5808,7 +7501,7 @@ fn a_flood_of_distinct_need_drops_writes_bytes_in_proportion_to_its_drops() {
         let sel = Sel::Need(None);
         n.cfg.on = vec![sel.clone()];
         n.standing_whole = mutant;
-        let face = |i: u64| format!("/f/f1/pub/n-a/t{i:010}/ev");
+        let face = |i: u64| format!("/f/f1/pub/n-a/{}/ev", generated_sid(i));
         let mut off = 0;
         let mut first = Needs::open();
         let cmd = first.cmd_open();
@@ -5887,8 +7580,8 @@ fn a_frozen_line_format_journal_migrates_and_its_pending_page_runs_again() {
         ),
         "the stamps and the count migrated"
     );
-    feed(&mut n, 1, "ta000000000", "v=1 t=9 inc=2 attention=again");
-    feed(&mut n, 5, "te000000000", "v=1 t=9 attention=pending");
+    feed(&mut n, 1, "tzzzzzzzzza", "v=1 t=9 inc=2 attention=again");
+    feed(&mut n, 5, "tzzzzzzzzze", "v=1 t=9 attention=pending");
     assert_eq!(
         fired_offsets(&fired),
         [5],
@@ -5929,7 +7622,7 @@ fn a_distinct_need_drops_cursor_is_a_step_of_the_change_it_orders() {
         n.cursor_every = Duration::MAX;
         n.cursor_file = mutant;
         n.take(Notice::Log(0, strict_log())).expect("log");
-        let face = |i: u64| format!("/f/f1/pub/n-a/t{i:010}/ev");
+        let face = |i: u64| format!("/f/f1/pub/n-a/{}/ev", generated_sid(i));
         let mut off = 0;
         let mut feed = |n: &mut Notifier, i: u64| {
             let mut s = Needs::open();

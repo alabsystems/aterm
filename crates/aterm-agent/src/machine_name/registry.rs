@@ -100,8 +100,12 @@ fn here(state: &Path) -> Option<aterm_db::file::HereRow> {
             session: None,
             now_ms: aterm_time::unix_millis().unwrap_or(0),
             attempt: Duration::ZERO,
+            // No publisher runs, so nothing is noted.
+            journal: None,
             json: false,
             stdin: None,
+            // Dropping a held write signs nothing.
+            said: None,
             editor: &|_, _, _| Err("a held name write giving way opens no editor".to_owned()),
             say: &|_| {},
         };
@@ -488,8 +492,13 @@ pub fn queue_rename(
             session,
             now_ms: aterm_time::unix_millis().unwrap_or(0),
             attempt: Duration::ZERO,
+            // No publisher runs, so nothing is noted.
+            journal: None,
             json: false,
             stdin: None,
+            // The registry's generations take no statement of who made a write (version 1
+            // records), and a window's rename runs in the instance a statement would ask.
+            said: None,
             editor: &|_, _, _| Err("a rename opens no editor".to_owned()),
             say: &|_| {},
         };

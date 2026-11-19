@@ -7,7 +7,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — the root LAN broker (`aterm lan serve`, docs/DESIGN-lan-broker-2026-11-05.md): a root LaunchDaemon that makes aterm's own outbound LAN sockets and DNS-SD calls, which macOS's Local Network privacy exempts, and passes the sockets and streams the results to aterm processes it admits by code signature; it adopts a signed update of its source bundle by itself."
+description = "aterm — the root LAN broker (`aterm lan serve`, docs/DESIGN-lan-broker-2026-11-05.md): a root LaunchDaemon that makes aterm's own outbound LAN sockets and DNS-SD calls, which macOS's Local Network privacy exempts, and passes the sockets and streams the results to aterm processes it admits by code signature; it adopts by itself a strictly newer signed build of its source bundle, or of an admitted aterm process that asked it to."
 
 [dependencies]
 # The broker's wire, the client's types, the classifier and the in-process socket acts it makes
@@ -19,13 +19,27 @@ aterm-uds = { workspace = true }
 aterm-keeper = { workspace = true }
 # Exclusive private staging before copied source ACLs can be inspected or stripped.
 aterm-tempfile = { workspace = true }
+# Root's record of the installs setup could not finish (`macos_setup::refused`): the broker that
+# serves takes out its own install's lines.
+aterm-types = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # chmod/chown of the socket and its folder, poll, clonefile and renamex_np's swap.
 libc = { workspace = true }
+# The Spotlight store walk's descriptor-relative reads (src/store.rs: `openat` with
+# `O_NOFOLLOW`, `fstatat`, `fdopendir`), so root never resolves a path again, and on macOS the
+# walk of an adoption candidate's tree (`adopt::tree_within`) the same way: each folder opened by
+# its name in its parent's descriptor, no link followed, each entry's length read from that
+# descriptor. aterm-uds already depends on it.
+aterm-dirfd = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-dl = { workspace = true }
+# The mount table (`getfsstat`), read without touching any volume: the Spotlight store walk
+# takes its volumes from it (src/store.rs), the broker's own list of store folders, never a
+# client's; an asker's executable must be on the image's volume, and nothing may be mounted in a
+# tree the broker walks (src/adopt.rs). aterm-uds already depends on it.
+aterm-sysprobe = { workspace = true }
 # The allowed direct path (src/direct.rs): the app macOS holds responsible for this process,
 # whose Local Network answer it applies.
 aterm-containment = { workspace = true }

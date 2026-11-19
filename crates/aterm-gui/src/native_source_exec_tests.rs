@@ -19,6 +19,7 @@ fn native_channel_routes_source_actions_without_a_read_only_prepare() {
         ("seal-input source-exec", false),
         ("cancel-prepare source-exec", false),
         ("settle source-exec", false),
+        ("settled source-exec", true),
         ("adopt source-exec", false),
     ] {
         assert_eq!(
@@ -36,6 +37,7 @@ fn native_channel_routes_source_actions_without_a_read_only_prepare() {
         "info source-exec prepare operation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "execute source-exec operation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "settle source-exec operation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "settled source-exec operation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "adopt source-exec operation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ] {
         assert_eq!(super::super::serve(ctx, -1, line, &mut resume), REFUSED);
@@ -71,6 +73,284 @@ fn a_kernel_peer_without_the_real_foreground_claim_allocates_nothing() {
     let table = ctx.fenced_writes.native.lock().unwrap();
     assert!(table.source_exec.is_none());
     assert!(table.runtime_data.is_none());
+}
+
+#[test]
+fn native_prepare_uses_the_effective_duty_of_its_live_codex_claim() {
+    use aterm_agent::harness::contract::{Words, read};
+
+    let source = crate::session_store::test_handle_on(918044, -1);
+    let proof = crate::self_claim::Proven {
+        pid: std::process::id(),
+        start: "source-prepare-fixture".into(),
+    };
+    let connection = 51;
+    let now = crate::metrics::now_us();
+    let expires = now + 1_000_000;
+    crate::session_timeline::claim_supervisor_as(
+        &source.ctx,
+        &format!("codex-alab@{}", proof.pid),
+        Some(connection),
+        Some(expires),
+        Some(proof.clone()),
+        now,
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    let meta = source.ctx.meta.lock().unwrap();
+    let authority = meta.supervisor_authority(now);
+    assert!(authority.scopes().is_none());
+    assert!(source_claim_allows_prepare(&authority, &proof, connection));
+    assert!(!source_claim_allows_prepare(
+        &authority,
+        &proof,
+        connection + 1
+    ));
+    let mut replacement = proof.clone();
+    replacement.start = "replacement-process".into();
+    assert!(!source_claim_allows_prepare(
+        &authority,
+        &replacement,
+        connection
+    ));
+    assert!(!source_claim_allows_prepare(
+        &meta.supervisor_authority(expires),
+        &proof,
+        connection
+    ));
+    drop(meta);
+
+    let scoped = crate::session_store::test_handle_on(918045, -1);
+    let holder = format!("grok-alab@{}", proof.pid);
+    let Words::Scoped(claim) = read(&holder, &["contract=3", "scope=upgrade"]) else {
+        panic!("the roster must admit the scoped upgrade fixture");
+    };
+    crate::session_timeline::claim_supervisor_scoped(
+        &scoped.ctx,
+        &holder,
+        Some(connection),
+        crate::harness_claim::Scoped {
+            proven: proof.clone(),
+            claim,
+            child: None,
+        },
+        now,
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    let authority = scoped.ctx.meta.lock().unwrap().supervisor_authority(now);
+    assert!(authority.external_takes(&crate::harness_host::holder(), Scope::Upgrade));
+    assert!(!source_claim_allows_prepare(&authority, &proof, connection));
+}
+
+#[test]
+fn execute_retries_can_queue_before_go_but_never_redo_a_grant() {
+    let mut execution = Execution::Idle;
+    assert!(execution.request());
+    assert!(!execution.request(), "a queued request needs only one wake");
+    assert!(execution.take_request());
+    assert!(
+        execution.request(),
+        "a retry can queue during the first attempt"
+    );
+    assert!(
+        execution.take_request(),
+        "service the queued retry if the first attempt fails"
+    );
+    assert!(
+        execution.request(),
+        "allow a new retry while the worker is granting"
+    );
+    execution = Execution::Granted;
+    assert!(
+        !execution.take_request(),
+        "a grant supersedes a queued retry"
+    );
+    assert!(
+        !execution.request(),
+        "a retry after Go only reads the grant"
+    );
+    assert_eq!(execution, Execution::Granted);
+}
+
+#[test]
+fn adopted_eof_preserves_renewal_but_refuses_a_released_and_retaken_claim() {
+    use crate::session_timeline::{
+        claim_supervisor_as, release_closed_connection, release_supervisor,
+    };
+
+    let handle = crate::session_store::test_handle_on(918049, -1);
+    let ctx = &handle.ctx;
+    let connection = 51;
+    let proof = crate::self_claim::Proven {
+        pid: std::process::id(),
+        start: "source-adopted-eof-fixture".into(),
+    };
+    let holder = format!("codex-alab@{}", proof.pid);
+    let claim = |now| {
+        claim_supervisor_as(
+            ctx,
+            &holder,
+            Some(connection),
+            None,
+            Some(proof.clone()),
+            now,
+            aterm_slog::Actor::Ctl,
+        )
+        .unwrap();
+        ctx.meta.lock().unwrap().supervisor_authority(now)
+    };
+
+    let adopted = claim(1);
+    let renewed = claim(2);
+    assert_eq!(renewed, adopted);
+    let mut uninterrupted_eof = false;
+    assert!(record_adopted_eof(
+        &adopted,
+        &renewed,
+        &mut uninterrupted_eof,
+        || true
+    ));
+    assert!(uninterrupted_eof);
+
+    assert!(release_supervisor(ctx, None, 3, aterm_slog::Actor::Ctl));
+    let retaken = claim(4);
+    assert_eq!(retaken.holder(), adopted.holder());
+    assert_eq!(retaken.connection(), adopted.connection());
+    assert_eq!(retaken.contract(), adopted.contract());
+    assert_eq!(retaken.identity(), adopted.identity());
+    assert_ne!(retaken.revision(), adopted.revision());
+    let mut retaken_eof = false;
+    assert!(!record_adopted_eof(
+        &adopted,
+        &retaken,
+        &mut retaken_eof,
+        || { panic!("a stale tenure cannot reach the constructor check") }
+    ));
+    assert!(!retaken_eof);
+    assert!(release_closed_connection(ctx, connection, 5, None));
+    assert!(ctx.meta.lock().unwrap().live_claim(5).is_none());
+}
+
+#[test]
+fn settled_sdk_eof_keeps_one_exact_expiry_until_the_first_independent_adoption() {
+    use crate::session_timeline::release_closed_connection;
+
+    let handle = crate::session_store::test_handle_on(918068, -1);
+    let ctx = &handle.ctx;
+    let original = sdk_adoption_claim(ctx, 81);
+    let mut pending = PendingAdoption::default();
+    let mut meta = ctx.meta.lock().unwrap();
+    assert!(pending.closed_until.is_none());
+    assert_eq!(pending.released_after_eof(9), Some(false));
+    assert!(meta.supervisor_expiry().is_none());
+    assert!(meta.claimant_conn.iter().any(|(conn, _)| *conn == 81));
+    assert!(pending.retain_at_eof(&mut meta, &original, 10, Some(50), || true));
+    assert!(pending.retain_at_eof(&mut meta, &original, 11, Some(90), || true));
+    assert_eq!(pending.closed_until, Some(50));
+    assert_eq!(pending.released_after_eof(11), Some(true));
+    assert_eq!(pending.released_after_eof(50), None);
+    assert_eq!(meta.supervisor_expiry(), Some(50));
+    assert_eq!(meta.supervisor_authority(11), original);
+    assert!(!meta.claimant_conn.iter().any(|(conn, _)| *conn == 81));
+    assert!(
+        meta.transfer_native_exec_claim(&original, 82, None, 20)
+            .is_none()
+    );
+    let adopted = meta
+        .transfer_native_exec_claim(&original, 82, pending.closed_until, 20)
+        .expect("the same settled actor transfers the still-live SDK claim");
+    assert_eq!(adopted.connection(), Some(82));
+    assert!(meta.supervisor_expiry().is_none());
+    assert!(
+        meta.transfer_native_exec_claim(&original, 83, Some(50), 20)
+            .is_none()
+    );
+    drop(meta);
+
+    assert!(!release_closed_connection(ctx, 81, 51, None));
+    assert_eq!(ctx.meta.lock().unwrap().supervisor_authority(51), adopted);
+}
+
+#[test]
+fn closed_sdk_adoption_cannot_outlive_expiry_or_a_foreign_retake() {
+    use crate::session_timeline::{
+        claim_supervisor_as, publish_lapse_supervisor, release_supervisor,
+    };
+
+    for foreign in [false, true] {
+        let handle = crate::session_store::test_handle_on(918069 + u64::from(foreign), -1);
+        let ctx = &handle.ctx;
+        let original = sdk_adoption_claim(ctx, 81);
+        let mut pending = PendingAdoption::default();
+        assert!(pending.retain_at_eof(
+            &mut ctx.meta.lock().unwrap(),
+            &original,
+            10,
+            Some(50),
+            || true
+        ));
+
+        if foreign {
+            assert!(release_supervisor(ctx, None, 30, aterm_slog::Actor::Ctl));
+            assert!(
+                claim_supervisor_as(
+                    ctx,
+                    "other-owner",
+                    Some(92),
+                    None,
+                    None,
+                    31,
+                    aterm_slog::Actor::Ctl
+                )
+                .is_ok()
+            );
+            assert!(
+                ctx.meta
+                    .lock()
+                    .unwrap()
+                    .transfer_native_exec_claim(&original, 82, pending.closed_until, 31)
+                    .is_none()
+            );
+            assert!(!publish_lapse_supervisor(ctx, 50).published());
+            assert_eq!(
+                ctx.meta
+                    .lock()
+                    .unwrap()
+                    .supervisor_authority(50)
+                    .connection(),
+                Some(92)
+            );
+        } else {
+            assert!(
+                ctx.meta
+                    .lock()
+                    .unwrap()
+                    .transfer_native_exec_claim(&original, 82, pending.closed_until, 50)
+                    .is_none()
+            );
+            assert!(publish_lapse_supervisor(ctx, 50).published());
+            assert!(ctx.meta.lock().unwrap().live_claim(50).is_none());
+        }
+    }
+}
+
+fn sdk_adoption_claim(ctx: &crate::SessionCtx, connection: u64) -> SupervisorAuthority {
+    let proof = crate::self_claim::Proven {
+        pid: std::process::id(),
+        start: "source-sdk-adoption-fixture".into(),
+    };
+    crate::session_timeline::claim_supervisor_as(
+        ctx,
+        &format!("codex-alab@{}", proof.pid),
+        Some(connection),
+        None,
+        Some(proof),
+        1,
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    ctx.meta.lock().unwrap().supervisor_authority(1)
 }
 
 #[test]
@@ -116,8 +396,11 @@ fn resource_root_of(
     source: Process,
     deadline: u64,
 ) -> (Arc<Operation>, crate::session_timeline::NativeDrain) {
-    let data = runtime_data::Slot::reserved(operation.into(), source.clone());
-    let pin = data.pin(operation, &source).unwrap();
+    let pin = {
+        let mut table = ctx.fenced_writes.native.lock().unwrap();
+        runtime_data::Slot::reserve_pinned(&mut table.runtime_data, operation, &source)
+            .expect("the source can reserve and pin its operation's DATA")
+    };
     let meta = ctx.meta.lock().unwrap();
     let authority = meta.supervisor_authority(crate::metrics::now_us());
     static BOUNDARY: aterm_types::update_boundary::Boundary =
@@ -149,9 +432,8 @@ fn resource_root_of(
             phase: Phase::Preparing,
             custody: Some(Arc::new(custody)),
             data: Some(pin),
-            requested: false,
+            execution: Execution::Idle,
             possible: false,
-            granted: false,
             snapshot: None,
             successor: None,
             kept_claim: None,
@@ -160,10 +442,223 @@ fn resource_root_of(
     });
     {
         let mut table = ctx.fenced_writes.native.lock().unwrap();
-        table.runtime_data = Some(data);
         table.source_exec = Some(op.clone());
     }
     (op, drain)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn refused_preparation_preserves_data_and_operation_slots() {
+    use aterm_types::update_boundary::{Boundary, GuardedItem};
+
+    static BOUNDARY: Boundary = Boundary::new();
+    let handle = crate::session_store::test_handle_on(918087, -1);
+    let ctx = &handle.ctx;
+    let (server, _client) = aterm_uds::CtlStream::pair().unwrap();
+    let _direct = crate::control::DirectPeer::enter();
+    let _serving = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+    let source = Process::observe(std::process::id()).unwrap();
+    let generation = generation(source.pid).unwrap();
+    let publish = |operation: &str| {
+        let seen = Seen::of(ctx);
+        let mut table = ctx.fenced_writes.native.lock().unwrap();
+        publish_preparation(
+            ctx,
+            &mut table,
+            Recipe {
+                operation: operation.into(),
+                build: 2,
+                source_build: 1,
+                primary: "00000000-0000-4000-8000-000000000001".into(),
+            },
+            source.clone(),
+            generation,
+            seen.authority.clone(),
+            &BOUNDARY,
+        )
+    };
+    let occupy_native_position = || {
+        let seen = Seen::of(ctx);
+        let boundary = BOUNDARY
+            .try_hold(GuardedItem::HarnessNativeMutation)
+            .unwrap();
+        ctx.fenced_writes
+            .reserve_native(seen.authority.revision(), "occupied", boundary)
+            .unwrap()
+    };
+
+    let occupied = occupy_native_position();
+    assert!(publish(&"a".repeat(32)).is_none());
+    assert_eq!(
+        runtime_data::serve(ctx, -1, "discover"),
+        "OK native runtime-data state=absent\n"
+    );
+    assert!(
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .source_exec
+            .is_none()
+    );
+    drop(occupied);
+
+    let original = "b".repeat(32);
+    let (op, previous) = publish(&original).unwrap();
+    assert!(previous.is_none());
+    op.close();
+    assert_eq!(
+        runtime_data::serve(ctx, -1, &format!("release operation={original}")),
+        "OK native runtime-data state=released\n"
+    );
+    let slot = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap()
+        .runtime_data
+        .clone()
+        .unwrap();
+
+    let occupied = occupy_native_position();
+    assert!(publish(&"c".repeat(32)).is_none());
+    {
+        let table = ctx.fenced_writes.native.lock().unwrap();
+        assert!(Arc::ptr_eq(table.runtime_data.as_ref().unwrap(), &slot));
+        assert!(Arc::ptr_eq(table.source_exec.as_ref().unwrap(), &op));
+    }
+    drop(occupied);
+
+    let (next, previous) = publish(&"d".repeat(32)).unwrap();
+    assert!(Arc::ptr_eq(previous.as_ref().unwrap(), &op));
+    next.close();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_authenticated_prepare_replay_needs_no_new_worker() {
+    let handle = crate::session_store::test_handle_on(918066, -1);
+    let ctx = &handle.ctx;
+    let proof = crate::self_claim::Proven {
+        pid: std::process::id(),
+        start: "prepare-replay-fixture".into(),
+    };
+    let connection = 66;
+    crate::session_timeline::claim_supervisor_as(
+        ctx,
+        &format!("codex-alab@{}", proof.pid),
+        Some(connection),
+        None,
+        Some(proof.clone()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    let (op, drain) = resource_root(ctx, &"e".repeat(32));
+    let workers = Arc::new(crate::budget::Slots::new(0));
+    let request = |recipe, connection| {
+        prepare_source(
+            ctx,
+            recipe,
+            PrepareSource {
+                proof: &proof,
+                connection,
+                process: op.source.clone(),
+                generation: op.generation,
+            },
+            &workers,
+        )
+    };
+
+    assert_eq!(request(op.recipe.clone(), connection), op.status());
+    assert_eq!(request(op.recipe.clone(), connection + 1), REFUSED);
+    let mut changed = op.recipe.clone();
+    changed.build += 1;
+    assert_eq!(request(changed, connection), REFUSED);
+    let mut different_operation = op.recipe.clone();
+    different_operation.operation = "f".repeat(32);
+    assert_eq!(request(different_operation, connection), REFUSED);
+    assert!(pending(ctx));
+    op.close();
+    assert!(drain.is_drained());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn fresh_prepare_uses_the_registry_lent_by_its_dispatch() {
+    use crate::session_timeline::FencedWrite;
+
+    let handle = crate::session_store::test_handle_on(918067, -1);
+    let ctx = &handle.ctx;
+    let process = Process::observe(std::process::id()).unwrap();
+    let proof = crate::self_claim::Proven {
+        pid: process.pid,
+        start: "source-prepare-dispatch-fixture".into(),
+    };
+    let holder = format!("codex-alab@{}", proof.pid);
+    let connection = 67;
+    let now = crate::metrics::now_us();
+    // Supply the admitted claim at the prepare boundary. The predecessor
+    // keeps the worker behind the real input fence, before any package read.
+    crate::session_timeline::claim_supervisor_as(
+        ctx,
+        &holder,
+        Some(connection),
+        None,
+        Some(proof.clone()),
+        now,
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    let predecessor = FencedWrite::enter(ctx, &holder, now).unwrap();
+    let workers = Arc::new(crate::budget::Slots::new(1));
+    let request = || {
+        prepare_source(
+            ctx,
+            Recipe {
+                operation: "c".repeat(32),
+                build: 2,
+                source_build: 1,
+                primary: "00000000-0000-4000-8000-000000000001".into(),
+            },
+            PrepareSource {
+                proof: &proof,
+                connection,
+                process: process.clone(),
+                generation: generation(process.pid).unwrap(),
+            },
+            &workers,
+        )
+    };
+
+    assert_eq!(request(), REFUSED);
+    assert!(
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .source_exec
+            .is_none()
+    );
+    let reply = crate::control::native_host_fixture::serve_as_fixture_dispatch(request);
+    let operation = ctx.fenced_writes.native.lock().unwrap().source_exec.clone();
+    if let Some(operation) = &operation {
+        operation.close();
+    }
+    drop(predecessor);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the source preparation worker to return its slot",
+        || (workers.used() == 0).then_some(()),
+    );
+
+    assert!(
+        operation.is_some(),
+        "the host dispatch must supply its registry"
+    );
+    assert!(reply.contains("state=preparing"));
+    assert!(!pending(ctx));
 }
 
 #[cfg(target_os = "macos")]
@@ -284,7 +779,7 @@ fn source_input_seal_preserves_later_typing_without_granting_execution() {
         assert_eq!(op.current(ctx, &Seen::of(ctx)), seal_first);
         assert_eq!(op.seal_input(ctx, &Seen::of(ctx)), seal_first);
         let state = op.state.lock().unwrap();
-        assert!(!state.possible && !state.granted && state.snapshot.is_none());
+        assert!(!state.possible && state.execution == Execution::Idle && state.snapshot.is_none());
         assert!(matches!(state.phase, Phase::Preparing));
         drop(state);
         op.close();
@@ -431,7 +926,7 @@ fn worker_holds_to_end(
 ) -> std::thread::JoinHandle<()> {
     let session = Arc::downgrade(ctx);
     let op = Arc::clone(op);
-    std::thread::spawn(move || hold_to_end(&op, &session))
+    std::thread::spawn(move || hold_to_end(&op, &session, &Clock::System))
 }
 
 /// A possible execution whose constructor was never granted sent no Go and can admit no
@@ -490,6 +985,17 @@ fn an_ungranted_possible_execution_ends_its_custody_and_the_claim_kept_for_it() 
     );
 }
 
+#[cfg(target_os = "macos")]
+fn source_child() -> (aterm_uds::spawnfd::Child, std::process::ChildStdin) {
+    let mut child = aterm_uds::spawnfd::command("/bin/cat")
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = aterm_uds::deadline::cat_echoes(&mut child);
+    (child, input)
+}
+
 /// A granted possible execution that can start nothing more (cancelled, or past its deadline
 /// before activation) stops holding the app handoff at once; its input position and DATA stay
 /// while its source process may still run a granted successor, and end once that process is gone,
@@ -501,12 +1007,7 @@ fn a_granted_possible_execution_frees_the_handoff_then_ends_when_its_source_is_g
     for (local, ending) in [(918063, "cancelled"), (918064, "expired")] {
         let handle = crate::session_store::test_handle_on(local, -1);
         let ctx = &handle.ctx;
-        let mut child = aterm_uds::spawnfd::command("/bin/cat")
-            .stdin(aterm_uds::spawnfd::Stdio::piped())
-            .stdout(aterm_uds::spawnfd::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let input = aterm_uds::deadline::cat_echoes(&mut child);
+        let (mut child, input) = source_child();
         let source = Process::observe(child.id()).unwrap();
         let now = aterm_agent::harness::native_act::monotonic_us().unwrap();
         let deadline = if ending == "expired" {
@@ -518,7 +1019,7 @@ fn a_granted_possible_execution_frees_the_handoff_then_ends_when_its_source_is_g
         {
             let mut state = op.state.lock().unwrap();
             state.possible = true;
-            state.granted = true;
+            state.execution = Execution::Granted;
         }
         if ending == "cancelled" {
             op.close();
@@ -549,6 +1050,154 @@ fn a_granted_possible_execution_frees_the_handoff_then_ends_when_its_source_is_g
         assert!(!pending(ctx), "{ending}");
         assert!(drain.is_drained(), "{ending}");
         assert!(op.state.lock().unwrap().data.is_none(), "{ending}");
+    }
+}
+
+/// A real dead producer with an immutable checkpoint leaves its passive evidence until the
+/// transaction clock closes. The receipt flags stand in for Go; no native constructor runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dead_granted_sources_checkpoint_expires_without_holding_input_or_removing_a_new_slot() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    for replacement in [false, true] {
+        let local = 918069 + u64::from(replacement);
+        let handle = crate::session_store::test_handle_on(local, -1);
+        let ctx = &handle.ctx;
+        let (mut child, input) = source_child();
+        let source = Process::observe(child.id()).unwrap();
+        let operation = "e".repeat(32);
+        let (op, drain) = resource_root_of(ctx, &operation, source, 60_000_000);
+        let original = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .runtime_data
+            .clone()
+            .unwrap();
+        let saved = runtime_data::seed_retained_checkpoint(&original);
+        {
+            let mut state = op.state.lock().unwrap();
+            state.possible = true;
+            state.execution = Execution::Granted;
+            state.snapshot = Some(saved);
+        }
+        let original_weak = Arc::downgrade(&original);
+        assert!(
+            original
+                .pin(&operation, &Process::observe(std::process::id()).unwrap())
+                .is_none()
+        );
+        drop(original);
+        drop(input);
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "producer exited", || {
+            child.try_wait().unwrap().map(|_| ())
+        });
+        let clock = Arc::new(AtomicU64::new(1));
+        let worker = {
+            let op = op.clone();
+            let session = Arc::downgrade(ctx);
+            let clock = Clock::Facts(clock.clone());
+            std::thread::spawn(move || hold_to_end(&op, &session, &clock))
+        };
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "dead source released its input",
+            || {
+                (drain.is_drained()
+                    && !pending(ctx)
+                    && ctx
+                        .fenced_writes
+                        .native
+                        .lock()
+                        .unwrap()
+                        .runtime_data
+                        .is_none())
+                .then_some(())
+            },
+        );
+        assert!(op.status().contains("state=closed"));
+        assert!(op.cancelled.load(Ordering::Acquire));
+        assert!(!worker.is_finished());
+        let next = replacement.then(|| {
+            let (next_op, next_drain) = resource_root(ctx, &"a".repeat(32));
+            assert!(pending(ctx));
+            assert!(!next_drain.is_drained());
+            let slot = ctx
+                .fenced_writes
+                .native
+                .lock()
+                .unwrap()
+                .runtime_data
+                .clone()
+                .unwrap();
+            (next_op, slot)
+        });
+        assert!(
+            original_weak.upgrade().is_some(),
+            "the original pinned checkpoint survives"
+        );
+        clock.store(op.close_us(), Ordering::Release);
+        op.wake.notify_all();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "evidence expired at the original close",
+            || worker.is_finished().then_some(()),
+        );
+        worker.join().unwrap();
+        assert!(original_weak.upgrade().is_none());
+        let slot = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .runtime_data
+            .clone();
+        match next {
+            Some((next_op, next_slot)) => {
+                assert!(Arc::ptr_eq(slot.as_ref().unwrap(), &next_slot));
+                assert!(pending(ctx));
+                next_op.close();
+            }
+            None => assert!(slot.is_none()),
+        }
+    }
+}
+
+/// A queued Execute can have journaled a possible run before its constructor grants Go.
+/// Settlement consumes the matching checkpoint even though its Go receipt survives.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dead_sources_recorded_snapshot_cannot_replace_a_grant_or_settled_data() {
+    for (local, execution, settled) in [
+        (918071, Execution::Idle, false),
+        (918072, Execution::Requested, false),
+        (918073, Execution::Granted, true),
+    ] {
+        let handle = crate::session_store::test_handle_on(local, -1);
+        let ctx = &handle.ctx;
+        let (op, drain) = resource_root(ctx, &"d".repeat(32));
+        let slot = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .runtime_data
+            .clone()
+            .unwrap();
+        let saved = runtime_data::seed_retained_checkpoint(&slot);
+        let mut state = op.state.lock().unwrap();
+        state.possible = true;
+        state.execution = execution;
+        state.snapshot = Some(saved);
+        if settled {
+            let pin = state.data.as_ref().unwrap();
+            let digest = aterm_codec::hex::encode_lower(&saved.digest);
+            drop(pin.release_retained(saved.bytes, &digest).unwrap());
+        }
+        let (_, evidence) = op.end(state, true);
+        assert!(evidence.is_none(), "{execution:?} settled={settled}");
+        assert!(drain.is_drained());
     }
 }
 
@@ -654,7 +1303,7 @@ fn a_granted_possible_execution_ends_at_its_close_while_its_source_runs() {
     {
         let mut state = op.state.lock().unwrap();
         state.possible = true;
-        state.granted = true;
+        state.execution = Execution::Granted;
     }
     assert!(
         super::super::retain_exec_claim(ctx, local, 65),
@@ -664,7 +1313,7 @@ fn a_granted_possible_execution_ends_at_its_close_while_its_source_runs() {
         let session = Arc::downgrade(ctx);
         let op = Arc::clone(&op);
         std::thread::spawn(move || {
-            hold_to_end(&op, &session);
+            hold_to_end(&op, &session, &Clock::System);
             crate::presence::take_meta_wakes()
         })
     };

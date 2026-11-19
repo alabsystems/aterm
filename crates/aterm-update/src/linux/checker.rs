@@ -16,11 +16,15 @@ struct Args {
 
 static ARGS: OnceLock<Arc<Args>> = OnceLock::new();
 
+/// Start the enrolled install's checker, once a process; the start that does starts the host's
+/// `wakes` before its first wait ([`crate::Wakes`]), and one that runs no checker (checks off, an
+/// install not enrolled, a repeated start) starts none.
 pub(super) fn start(
     current_build: u64,
     provider: crate::CheckSettingsProvider,
     notify: Option<crate::HealthNotify>,
     on_checked: Option<crate::CheckedNotify>,
+    wakes: crate::Wakes,
 ) {
     if !crate::automatic() || !context().is_ok_and(enrolled_in) {
         return;
@@ -34,6 +38,7 @@ pub(super) fn start(
     if ARGS.set(Arc::clone(&args)).is_err() {
         return;
     }
+    wakes.start();
     // Each worker waits on the process's wake, which the watchdog's retirements nudge.
     WATCH.wake_on_retire(&crate::check_wake::SYSTEM_WOKE);
     let generation = WATCH.register(crate::linux_notice::PASS_SECS);

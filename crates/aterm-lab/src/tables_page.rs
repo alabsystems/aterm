@@ -53,7 +53,14 @@
 //! `--lines N` sets the window's height (56 lines by default), so a short one shows the rail
 //! scrolled; `--columns N` its width (200 by default), so a narrow one (under 900 px) shows the
 //! table picker and the pane below the grid. No live vault, fleet or Commons is reached, and every
-//! value is synthetic (`example.invalid`).
+//! value is synthetic (`example.invalid`). With `--startup-machines N` the private registry
+//! holds N machine rows and the reference rows. `--select-account` adds a synthetic account
+//! and chooses its sheet while the registry opens. Both drives observe selection and editing.
+//! `--registry` follows a machine from aRegistry to its record in an existing Tables tab,
+//! then returns to its assignments and signed observation. `--out DIR` also saves those frames.
+//! With `--registry --startup-machines N`, aRegistry opens first and the inspector measures
+//! the first seeded machine's row, its selection and its details. Find then locates the last
+//! seeded machine by name and Enter opens its stable-key detail.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -66,10 +73,11 @@ use aterm_db::typed::cell::{self, CellKey, CellValue};
 use aterm_json::{Value, json};
 use aterm_secrets::commons::roster::Role;
 
-use crate::instance::{CONFIG_OFF, Instance, Launch, World, resolve_aterm, take_value};
+use crate::instance::{CONFIG_OFF, Instance, Launch, World, resolve_aterm, take_flag, take_value};
 use crate::{Fail, Res};
 
 const HANG: Duration = Duration::from_secs(60);
+const ADD: &str = "tables/rows/add";
 
 /// Fewer columns than this lay the page out under 900 px across: the picker stands for the
 /// rail, so a table is chosen through it.
@@ -99,6 +107,35 @@ const SPLIT: &str = "mc-000000000000000d";
 /// The synthetic account and the link that names the third Mac and it.
 const ACCOUNT: &str = "ac-0000000000000001";
 const MACHINE: &str = "mc-000000000000000c";
+
+fn address(pk: &str, addr: &str, kind: &str) -> Result<Vec<Change>, Fail> {
+    Ok(vec![
+        put("address", pk, "addr", json!(addr))?,
+        put("address", pk, "domain", json!("example.invalid"))?,
+        put("address", pk, "kind", json!(kind))?,
+        put("address", pk, "row", json!("live"))?,
+    ])
+}
+
+fn account() -> Result<Vec<Change>, Fail> {
+    Ok(vec![
+        put("account", ACCOUNT, "provider", json!("openai"))?,
+        put("account", ACCOUNT, "realm", json!("codex"))?,
+        put("account", ACCOUNT, "login", json!("ad-0000000000000001"))?,
+        put("account", ACCOUNT, "status", json!("active"))?,
+        put("account", ACCOUNT, "row", json!("live"))?,
+    ])
+}
+
+fn assignment(machine: &str) -> Result<Vec<Change>, Fail> {
+    let link = aterm_db::typed::keys::preference_pk(machine, ACCOUNT).map_err(fail)?;
+    Ok(vec![
+        put("preference", &link, "machine", json!(machine))?,
+        put("preference", &link, "account", json!(ACCOUNT))?,
+        put("preference", &link, "why", json!("owner"))?,
+        put("preference", &link, "row", json!("live"))?,
+    ])
+}
 
 /// The synthetic rows: four Macs (two under one label), two addresses, a phone, an account and a
 /// link.
@@ -137,12 +174,7 @@ fn rows() -> Result<Vec<Vec<Change>>, Fail> {
         ("ad-0000000000000001", "owner@example.invalid", "standalone"),
         ("ad-0000000000000002", "agents@example.invalid", "alias"),
     ] {
-        records.push(vec![
-            put("address", pk, "addr", json!(addr))?,
-            put("address", pk, "domain", json!("example.invalid"))?,
-            put("address", pk, "kind", json!(kind))?,
-            put("address", pk, "row", json!("live"))?,
-        ]);
+        records.push(address(pk, addr, kind)?);
     }
     records.push(vec![
         put("phone", "ph-0000000000000001", "label", json!("work phone"))?,
@@ -154,20 +186,8 @@ fn rows() -> Result<Vec<Vec<Change>>, Fail> {
         )?,
         put("phone", "ph-0000000000000001", "row", json!("live"))?,
     ]);
-    records.push(vec![
-        put("account", ACCOUNT, "provider", json!("openai"))?,
-        put("account", ACCOUNT, "realm", json!("global"))?,
-        put("account", ACCOUNT, "login", json!("ad-0000000000000001"))?,
-        put("account", ACCOUNT, "status", json!("active"))?,
-        put("account", ACCOUNT, "row", json!("live"))?,
-    ]);
-    let link = aterm_db::typed::keys::preference_pk(MACHINE, ACCOUNT).map_err(fail)?;
-    records.push(vec![
-        put("preference", &link, "machine", json!(MACHINE))?,
-        put("preference", &link, "account", json!(ACCOUNT))?,
-        put("preference", &link, "why", json!("owner"))?,
-        put("preference", &link, "row", json!("live"))?,
-    ]);
+    records.push(account()?);
+    records.push(assignment(MACHINE)?);
     Ok(records)
 }
 
@@ -178,6 +198,32 @@ fn rows() -> Result<Vec<Vec<Change>>, Fail> {
 pub fn cmd(args: &[String]) -> Res {
     let mut args = args.to_vec();
     let out = take_value(&mut args, "--out")?.map(|p| PathBuf::from(crate::paths::from_caller(&p)));
+    let startup_machines = take_value(&mut args, "--startup-machines")?
+        .map(|value| {
+            let limit = aterm_db::att::CAPS.writer_records;
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|count| (1..=limit).contains(count))
+                .ok_or_else(|| {
+                    Fail::usage(format!(
+                        "--startup-machines takes a count from 1 to {limit}"
+                    ))
+                })
+        })
+        .transpose()?;
+    let select_account = take_flag(&mut args, "--select-account");
+    let registry = take_flag(&mut args, "--registry");
+    if select_account && (registry || startup_machines.is_none()) {
+        return Err(Fail::usage(
+            "--select-account requires the Tables --startup-machines N measurement",
+        ));
+    }
+    if startup_machines.is_some() && out.is_some() {
+        return Err(Fail::usage(
+            "--startup-machines writes timings to stdout; --out is for frames",
+        ));
+    }
     // A short window shows the rail scrolled to a table off its foot.
     let lines = take_value(&mut args, "--lines")?.unwrap_or_else(|| "56".to_owned());
     if lines.parse::<u16>().is_err() {
@@ -192,7 +238,7 @@ pub fn cmd(args: &[String]) -> Res {
     };
     if args.len() > 1 {
         return Err(Fail::usage(
-            "tables-page takes --out DIR, --lines N, --columns N and an aterm at most",
+            "tables-page takes [--registry] [--out DIR | --startup-machines N], --lines N, --columns N and an aterm at most",
         ));
     }
     let aterm = resolve_aterm(args.pop()).map_err(|e| Fail::exit(3, e))?;
@@ -212,6 +258,46 @@ pub fn cmd(args: &[String]) -> Res {
     let here = Registry::at(lab.paths[0].clone());
     here.open().map_err(fail)?;
     here.seed().map_err(fail)?;
+    let start = || {
+        Instance::start(
+            &world,
+            Launch {
+                aterm,
+                headless: true,
+                args: vec!["--columns".into(), columns, "--lines".into(), lines],
+                env: world.env(),
+                cwd: world.home.clone(),
+                sandbox: None,
+                reroute: false,
+            },
+        )
+        .map_err(fail)
+    };
+    if let Some(count) = startup_machines {
+        if select_account {
+            here.write(vec![
+                address("ad-0000000000000001", "owner@example.invalid", "standalone")?,
+                account()?,
+            ])
+            .map_err(fail)?;
+        }
+        seed_startup(&here, &lab.paths[0], count)?;
+        let mut inst = start()?;
+        let read = inst.await_socket(HANG).and_then(|_| {
+            if registry {
+                let view = measure_registry_open(&inst, count, FIRST_MACHINE, false, |text| {
+                    shows(text, "registry/detail/identity", FIRST_MACHINE)
+                        && text.contains("registry/detail/no-accounts")
+                        && text.contains("registry/detail/no-observations")
+                })?;
+                find_last_machine(&inst, &view, count)
+            } else {
+                startup(&inst, count, select_account, across < NARROW_COLUMNS)
+            }
+        });
+        crate::instance::after_stop(read, inst.stop())?;
+        return Ok(0);
+    }
     here.write(rows()?).map_err(fail)?;
     // The second Mac learns the table, then both name one cell apart: a conflict to show.
     let there = Registry::at(lab.paths[1].clone());
@@ -279,25 +365,125 @@ pub fn cmd(args: &[String]) -> Res {
     .map_err(fail)?;
     repair_commons(&lab, 4);
 
+    if registry {
+        if stated != MACHINE {
+            here.write(vec![assignment(&stated)?]).map_err(fail)?;
+        }
+        if let Some(dir) = &out {
+            std::fs::create_dir_all(dir).map_err(fail)?;
+        }
+        let count = view.project(&aterm_db::alab::registry::MACHINE).rows.len();
+        let mut inst = start()?;
+        let result = registry_round_trip(
+            &mut inst,
+            &stated,
+            &facts,
+            count,
+            out.as_deref(),
+            across < NARROW_COLUMNS,
+        );
+        crate::instance::after_stop(result, inst.stop())?;
+        return Ok(0);
+    }
     let out = out.unwrap_or_else(|| world.dir.clone());
     std::fs::create_dir_all(&out).map_err(fail)?;
-    let mut inst = Instance::start(
-        &world,
-        Launch {
-            aterm: aterm.clone(),
-            headless: true,
-            args: vec!["--columns".into(), columns, "--lines".into(), lines],
-            env: world.env(),
-            cwd: world.home.clone(),
-            sandbox: None,
-            reroute: false,
-        },
-    )
-    .map_err(fail)?;
+    let mut inst = start()?;
     let shots = drive(&mut inst, &out, &stated, &facts, across < NARROW_COLUMNS);
     crate::instance::after_stop(shots.map(|_| ()), inst.stop())?;
     drop(lab);
     Ok(0)
+}
+
+/// One explicit write per machine. Compiled reference records already occupy part of the
+/// writer's quota. Read back the projected row count before starting the headless instance.
+fn seed_startup(
+    here: &Registry,
+    paths: &aterm_secrets::client::Paths,
+    count: usize,
+) -> Result<(), Fail> {
+    let handle = aterm_db::att::Handle::at(paths.clone(), &REGISTRY);
+    let (_, usage) = handle.usage().map_err(fail)?;
+    let caps = aterm_db::att::CAPS;
+    let room = caps
+        .writer_records
+        .saturating_sub(usage.mine_records)
+        .min(caps.records.saturating_sub(usage.records));
+    if count > room {
+        return Err(Fail::usage(format!(
+            "the seeded registry has room for {room} machine records"
+        )));
+    }
+    let mut records = Vec::with_capacity(count);
+    for number in 1..=count {
+        let pk = format!("mc-{number:016x}");
+        records.push(vec![
+            put("machine", &pk, "label", json!(format!("m{number}")))?,
+            put("machine", &pk, "status", json!("active"))?,
+            put("machine", &pk, "row", json!("live"))?,
+        ]);
+    }
+    here.write(records).map_err(fail)?;
+    let actual = handle
+        .view()
+        .map_err(fail)?
+        .project(handle.compiled().collection("machine").map_err(fail)?)
+        .rows
+        .len();
+    if actual != count {
+        return Err(fail(format!(
+            "seeded {count} machines, but the registry projected {actual}"
+        )));
+    }
+    Ok(())
+}
+
+const FIRST_MACHINE: &str = "mc-0000000000000001";
+
+fn startup(inst: &Instance, count: usize, select_account: bool, narrow: bool) -> Result<(), Fail> {
+    let cpu_before = crate::sys::process_cpu_ns(inst.pid);
+    let opening = Instant::now();
+    ok(inst, &["open", "app", "tables"])?;
+    let view = active_view(inst, "tables")?;
+    let (sheet, cell) = if select_account {
+        choose(inst, &view, "tables/sheet/account", narrow)?;
+        ("account", format!("tables/cell/{ACCOUNT}/label"))
+    } else {
+        ("machine", format!("tables/cell/{FIRST_MACHINE}/label"))
+    };
+    // The label stays pinned at both widths. The Add button requires a writable read. It can
+    // already be present in the first observation of the label.
+    let mut ready_on_first_read = false;
+    until(inst, &view, "the selected sheet's first label", |text| {
+        ready_on_first_read = text.contains(ADD);
+        text.contains(&cell)
+    })?;
+    let row = opening.elapsed();
+    act(inst, &view, &cell, None)?;
+    let selected = opening.elapsed();
+    let app_cpu_ms = process_cpu_ms_since(inst, cpu_before);
+    let ready = if ready_on_first_read {
+        row
+    } else {
+        until(inst, &view, "the selected sheet's Add button", |text| {
+            text.contains(ADD)
+        })?;
+        opening.elapsed()
+    };
+    println!(
+        "tables-page: seeded_machines={count} selected_sheet={sheet} open_to_observed_cell_ms={} open_to_selection_ack_ms={} open_to_observed_add_ms={} app_cpu_to_selection_ack_ms={app_cpu_ms}",
+        row.as_millis(),
+        selected.as_millis(),
+        ready.as_millis()
+    );
+    Ok(())
+}
+
+fn process_cpu_ms_since(inst: &Instance, before: Option<u64>) -> String {
+    before
+        .zip(crate::sys::process_cpu_ns(inst.pid))
+        .and_then(|(before, after)| after.checked_sub(before))
+        .map(|ns| Duration::from_nanos(ns).as_millis().to_string())
+        .unwrap_or_else(|| "unavailable".to_owned())
 }
 
 fn ok(inst: &Instance, args: &[&str]) -> Result<String, Fail> {
@@ -308,18 +494,157 @@ fn ok(inst: &Instance, args: &[&str]) -> Result<String, Fail> {
     Ok(reply.stdout)
 }
 
-/// The Tables page's view id, from `inspect app/v1 tabs`.
-fn tables_view(inst: &Instance) -> Result<String, Fail> {
+fn shows(text: &str, key: &str, value: &str) -> bool {
+    text.lines()
+        .any(|line| line.contains(key) && line.contains(value))
+}
+
+/// Measure the product from issuing its open command through observing the selected detail.
+/// Acknowledging the row action also gives the CPU endpoint used by the Tables measurement.
+fn measure_registry_open(
+    inst: &Instance,
+    count: usize,
+    machine: &str,
+    tables_preopened: bool,
+    detail: impl FnMut(&str) -> bool,
+) -> Result<String, Fail> {
+    let cpu_before = crate::sys::process_cpu_ns(inst.pid);
+    let opening = Instant::now();
+    ok(inst, &["open", "app", "registry"])?;
+    let opened = opening.elapsed();
+    let view = active_view(inst, "registry")?;
+    let choice = format!("registry/machine/{machine}");
+    until(inst, &view, "the registered machine", |text| {
+        text.contains(&choice)
+    })?;
+    let observed = opening.elapsed();
+    act(inst, &view, &choice, None)?;
+    let acknowledged = opening.elapsed();
+    let cpu_ms = process_cpu_ms_since(inst, cpu_before);
+    until(inst, &view, "the selected machine's details", detail)?;
+    let selected = opening.elapsed();
+    println!(
+        "tables-page: app=registry fixture_machines={count} tables_preopened={tables_preopened} view={view} machine={machine} open_command_ack_ms={} open_to_observed_machine_ms={} open_to_selection_ack_ms={} open_to_observed_detail_ms={} app_cpu_to_selection_ack_ms={cpu_ms}",
+        opened.as_millis(),
+        observed.as_millis(),
+        acknowledged.as_millis(),
+        selected.as_millis()
+    );
+    Ok(view)
+}
+
+fn find_last_machine(inst: &Instance, view: &str, count: usize) -> Result<(), Fail> {
+    let name = format!("m{count}");
+    let key = format!("mc-{count:016x}");
+    let choice = format!("registry/machine/{key}");
+    let searching = Instant::now();
+    ok(inst, &["invoke", "Find"])?;
+    ok(inst, &["paste", &name])?;
+    until(
+        inst,
+        view,
+        "the last seeded machine as the only Find result",
+        |text| {
+            shows(text, "registry/search", &name)
+                && shows(text, &choice, &name)
+                && text.matches("text key=\"registry/machine/").count() == 1
+        },
+    )?;
+    ok(inst, &["key", "enter"])?;
+    until(
+        inst,
+        view,
+        "the found machine's stable key in its details",
+        |text| {
+            shows(text, "registry/detail/name", &name)
+                && shows(text, "registry/detail/identity", &key)
+        },
+    )?;
+    println!(
+        "tables-page: app=registry fixture_machines={count} search={name} selected_machine={key} find_to_observed_detail_ms={}",
+        searching.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+fn registry_round_trip(
+    inst: &mut Instance,
+    machine: &str,
+    writer: &str,
+    count: usize,
+    out: Option<&Path>,
+    narrow: bool,
+) -> Result<(), Fail> {
+    inst.await_socket(HANG)?;
+    ok(inst, &["open", "app", "tables"])?;
+    let tables = active_view(inst, "tables")?;
+    choose(inst, &tables, "tables/sheet/account", narrow)?;
+    let previous = format!("tables/cell/{ACCOUNT}/label");
+    until(inst, &tables, "the account in Tables", |text| {
+        text.contains(&previous)
+    })?;
+    act(inst, &tables, &previous, None)?;
+
+    let account = format!("registry/detail/account/{ACCOUNT}");
+    let detail = |text: &str| {
+        shows(text, "registry/detail/identity", machine)
+            && shows(text, &account, "owner@example.invalid")
+            && shows(text, "registry/detail/observation/", "Apple M4 Pro")
+            && shows(text, "registry/detail/writer/", writer)
+    };
+    let registry = measure_registry_open(inst, count, machine, true, detail)?;
+    if let Some(dir) = out {
+        frame(inst, dir, "aregistry-machine.png")?;
+    }
+
+    act(inst, &registry, "registry/open-in-tables", None)?;
+    if active_view(inst, "tables")? != tables {
+        return Err(fail("Open in Tables created another Tables view"));
+    }
+    until(
+        inst,
+        &tables,
+        "the selected machine in the existing Tables tab",
+        |text| shows(text, "tables/pane/id", machine),
+    )?;
+    if let Some(dir) = out {
+        frame(inst, dir, "aregistry-machine-in-tables.png")?;
+    }
+    ok(inst, &["open", "app", "aRegistry"])?;
+    if active_view(inst, "registry")? != registry {
+        return Err(fail("returning to aRegistry created another view"));
+    }
+    until(
+        inst,
+        &registry,
+        "the same machine on return to aRegistry",
+        detail,
+    )?;
+    println!(
+        "tables-page: registry_view={registry} tables_view={tables} machine={machine} selection_preserved=true"
+    );
+    Ok(())
+}
+
+/// The focused leaf of the private window's active tab, checked against the expected app.
+fn active_view(inst: &Instance, kind: &str) -> Result<String, Fail> {
     let tabs = ok(inst, &["inspect", "app/v1", "tabs"])?;
-    tabs.lines()
-        .map(str::trim_start)
-        .filter(|line| line.starts_with("leaf ") && line.contains(" app=tables"))
-        .find_map(|line| {
-            line.split_whitespace()
-                .find_map(|field| field.strip_prefix("view="))
-                .map(str::to_owned)
-        })
-        .ok_or_else(|| fail("no Tables tab"))
+    let mut active = false;
+    for line in tabs.lines() {
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("tab") => active = fields.any(|f| f == "active=true"),
+            Some("leaf") if active && fields.clone().any(|f| f == "focused=true") => {
+                if fields.clone().find_map(|f| f.strip_prefix("app=")) == Some(kind)
+                    && let Some(id) = fields.find_map(|f| f.strip_prefix("view="))
+                {
+                    return Ok(id.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(fail(format!("expected {kind} in front: {tabs}")))
 }
 
 /// Until `what` holds of the page's text, within the hang detector.
@@ -327,7 +652,7 @@ fn until(
     inst: &Instance,
     view: &str,
     what: &str,
-    holds: impl Fn(&str) -> bool,
+    mut holds: impl FnMut(&str) -> bool,
 ) -> Result<(), Fail> {
     let start = Instant::now();
     loop {
@@ -411,13 +736,23 @@ fn drive(
     narrow: bool,
 ) -> Result<Vec<PathBuf>, Fail> {
     inst.await_socket(HANG)?;
+    let opening = Instant::now();
     ok(inst, &["open", "app", "tables"])?;
-    let view = tables_view(inst)?;
-    // The rail names each table with its rows; under 900 px the picker names the one shown.
-    until(inst, &view, "its machines", |text| {
-        text.contains("Machines: ") || text.contains("Table: Machines")
+    let view = active_view(inst, "tables")?;
+    // The compiled catalog can be visible before any rows have arrived. Wait for the cell
+    // this drive selects below, so the first frame and its timing both reflect usable rows.
+    until(inst, &view, "a selectable machine status", |text| {
+        text.contains("tables/cell/mc-000000000000000c/status")
     })?;
+    println!(
+        "tables-page: open to first observed selectable machine status: {} ms",
+        opening.elapsed().as_millis()
+    );
     let mut shots = vec![frame(inst, out, "tables-1-read.png")?];
+    // The rest of the walkthrough opens editors and stages changes on this scratch registry.
+    until(inst, &view, "the machine sheet's Add button", |text| {
+        text.contains(ADD)
+    })?;
     // The Columns list: each column under its group, with how many rows fill it.
     act(inst, &view, "tables/columns", None)?;
     until(inst, &view, "the list of columns", |text| {

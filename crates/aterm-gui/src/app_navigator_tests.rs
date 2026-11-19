@@ -128,6 +128,8 @@ fn paint(app: &mut App) {
         session: None,
         want_bytes: true,
         want_metadata: false,
+        whole_client: false,
+        presentation: None,
         frame_metadata: Arc::new(std::sync::OnceLock::new()),
         cancel: crate::control::CaptureCancellation::new(),
         reply,
@@ -766,6 +768,44 @@ fn a_row_off_screen_is_not_read() {
 fn row_of(app: &App, session: u64) -> Option<Arc<crate::navigator::NavRow>> {
     let tree = app.navigator_tree()?;
     Some(Arc::clone(&tree.entries[tree.index_of(session)?].row))
+}
+
+/// The launcher recorded Claude. A later foreground program, including the shell after exit,
+/// owns its row.
+#[test]
+fn a_navigator_row_follows_the_foreground_program_across_a_worker_exit() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut app = App::headless_for_test();
+    let worker = land_worker(&mut app);
+    mark(&mut app, worker, TaskState::Working, None);
+    let timeline = Arc::clone(&app.pool.get(worker).expect("worker").ctx.timeline);
+    timeline
+        .lock()
+        .unwrap()
+        .set_task_worker(aterm_phase::Program::Claude, None);
+    assert_eq!(app.open_navigator(false), Ok(false));
+    let now = Instant::now();
+    app.publish_navigators(now);
+    for (pgid, observed, expected) in [
+        (10, Some("codex-alab"), Some("codex-alab")),
+        (20, Some("rustc"), Some("rustc")),
+        (30, Some("zsh"), Some("zsh")),
+    ] {
+        {
+            let mut timeline = timeline.lock().unwrap();
+            timeline.note_foreground_group(pgid);
+            timeline.set_program(pgid, observed.map(str::to_owned));
+        }
+        if observed == Some("zsh") {
+            mark(&mut app, worker, TaskState::Exited, None);
+        }
+        app.on_program_resolved(worker);
+        app.publish_navigators(now);
+        assert_eq!(
+            row_of(&app, worker).expect("listed").program.as_deref(),
+            expected
+        );
+    }
 }
 
 fn presentation_revision(app: &App, view: ViewId) -> u64 {
@@ -2131,6 +2171,10 @@ fn with_tab_status_off_an_agent_waiting_reads_quiet_by_its_own_word() {
     );
     app.publish_navigators(at(2));
     assert_eq!(
+        row_of(&app, shell).expect("listed").program.as_deref(),
+        Some("claude")
+    );
+    assert_eq!(
         word(&app),
         Word::Working,
         "PRECONDITION: a turn in progress"
@@ -2168,10 +2212,23 @@ fn with_tab_status_off_an_agent_waiting_reads_quiet_by_its_own_word() {
     feed(
         &mut app,
         shell,
-        b"\x1b]7501;state=clear\x1b\\\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\",
+        b"\x1b]7501;state=clear\x1b\\\x1b]7501;state=working:app=codex\x1b\\",
         at(5),
     );
     app.publish_navigators(at(5));
+    assert_eq!(
+        row_of(&app, shell).expect("listed").program.as_deref(),
+        Some("codex"),
+        "a different program reported the same activity"
+    );
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=clear\x1b\\\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\",
+        at(6),
+    );
+    app.publish_navigators(at(6));
+    assert!(row_of(&app, shell).expect("listed").program.is_none());
     assert_eq!(
         word(&app),
         Word::Idle,
@@ -2337,12 +2394,37 @@ fn with_tab_status_off_a_report_left_standing_is_no_word_at_the_shells_prompt() 
         "the shell at its prompt: no program in front of it"
     );
 
-    feed(&mut app, shell, b"fg\r\n\x1b]133;C\x1b\\", at(4));
+    assert!(row_of(&app, shell).expect("listed").program.is_none());
+
+    feed(&mut app, shell, b"make\r\n\x1b]133;C\x1b\\", at(4));
     app.publish_navigators(at(4));
+    assert_eq!(word(&app), Word::Working);
+    assert!(row_of(&app, shell).expect("listed").program.is_none());
+
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\fg\r\n\x1b]133;C\x1b\\",
+        at(5),
+    );
+    app.publish_navigators(at(5));
     assert_eq!(
         word(&app),
         Word::Working,
         "NEGATIVE CONTROL: its shell runs a program again, whose report stands"
+    );
+    assert!(row_of(&app, shell).expect("listed").program.is_none());
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=working:app=claude-code\x1b\\",
+        at(6),
+    );
+    app.publish_navigators(at(6));
+    assert_eq!(
+        row_of(&app, shell).expect("listed").program.as_deref(),
+        Some("claude"),
+        "a fresh report identifies the resumed program"
     );
 }
 

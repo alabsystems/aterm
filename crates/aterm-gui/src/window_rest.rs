@@ -172,6 +172,7 @@ pub(crate) const fn stirs(event: &WindowEvent) -> bool {
         | WindowEvent::Resized(_)
         | WindowEvent::ScaleFactorChanged { .. }
         | WindowEvent::Moved(_)
+        | WindowEvent::DroppedLocal { .. }
         | WindowEvent::DroppedFile(_)
         | WindowEvent::HoveredFile(_)
         | WindowEvent::HoveredFileCancelled => true,

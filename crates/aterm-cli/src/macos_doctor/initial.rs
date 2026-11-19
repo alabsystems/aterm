@@ -3653,6 +3653,8 @@ pub struct InitialSetupSnapshot {
     /// change to another group hands nothing to macOS again (design §6).
     pub access_revision: u64,
     pub permissions_allowed: bool,
+    /// Whether the admitted Permissions group carries a person's request for macOS's grants.
+    pub person_access: bool,
     /// Whether System State's access steps run, wait for an admission still to come, or are held
     /// by a person's choice ([`PermissionSteps`]); `permissions_allowed` is its `Allowed`.
     pub access_steps: PermissionSteps,
@@ -4339,8 +4341,7 @@ struct Records {
     /// decision ([`save_older_cancel`]): every reader presents every group at Leave as is while
     /// it stands ([`Self::present`]).
     cancelled: Option<Plan>,
-    /// Historical explicit permission request on this Mac. Kept to read older setup records;
-    /// current acquisition follows the admitted Permissions selection automatically.
+    /// A person's request for macOS's grants on this Mac, including a verified older approval.
     person_access: bool,
 }
 
@@ -4608,16 +4609,12 @@ fn snapshot_with(
 /// in force (design §6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionSteps {
-    /// They run: a person pressed for them on this Mac ([`note_person_asked_for_access`]), with an
-    /// admitted run whose plan selects Permissions, the run a Restore ended (a Restore never
-    /// withdraws aterm's own permissions), or an older aterm's verified setup.
+    /// The Permissions lanes run for an admitted plan that selects them, the run a Restore ended,
+    /// or an older aterm's verified setup.
     Allowed,
     /// Not yet: no plan or no admitted run yet. They may still come with nobody's choice.
     NotYet,
-    /// Held until a person chooses again: their Cancel or Stop holds them (a Restore's record a
-    /// Cancel holds among them), the admitted run's plan leaves Permissions out, or no person
-    /// pressed for them: the grants only a person can give are offered, and an automatic setup
-    /// decision opens none of their pages (setup's one early elevation is its own lane).
+    /// A person's Cancel, Stop or plan without Permissions holds the lanes.
     Off,
 }
 
@@ -4867,14 +4864,14 @@ fn permission_steps(records: &Records, progress: Option<Progress>, plan: &Plan) 
     }
 }
 
-fn permission_steps_at(root: &Path) -> Result<PermissionSteps, String> {
-    let records = observation_at(root)
-        .map_err(|error| error.to_string())?
-        .records;
-    Ok(steps_of(&records))
+/// Whether a person asked for macOS's grants and the Permissions lanes still admit the request.
+fn acquiring_person_access_at(root: &Path) -> bool {
+    observation_at(root).is_ok_and(|seen| {
+        seen.records.person_access && steps_of(&seen.records) == PermissionSteps::Allowed
+    })
 }
 
-/// [`PermissionSteps`] of `records` alone ([`permission_steps_at`]).
+/// [`PermissionSteps`] of `records` alone.
 fn steps_of(records: &Records) -> PermissionSteps {
     // With no saved plan the fallback never decides the answer: the progress branch needs a
     // saved plan, and the legacy branch reads only the decision.
@@ -4989,6 +4986,7 @@ fn snapshot_from_observation(
         run_allowed,
         access_revision: progress.map_or(0, Progress::access_revision),
         permissions_allowed,
+        person_access: permissions_allowed && records.person_access,
         access_steps,
         provisional: records.plan.is_some() && records.provisional && records.cancelled.is_none(),
         cancelled: records.cancelled.is_some(),

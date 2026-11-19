@@ -6,7 +6,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use aterm_control::wire::{FRAME_OPEN_WORD, VisibleTrim, frame_open_tail, push_visible};
+use aterm_control::wire::{
+    FRAME_OPEN_WORD, VisibleTrim, frame_open_tail, is_blank_row, push_visible,
+};
 use aterm_core::grid::extra::ImageData;
 use aterm_core::grid::{Cell, CellFlags};
 use aterm_core::search::{
@@ -27,7 +29,7 @@ use super::{
     visible_char,
 };
 use crate::frame_key::FrameKey;
-use crate::frame_memo::{FrameSlot, ScreenText, Styled, styled_body_within};
+use crate::frame_memo::{FrameSlot, ScreenText, Styled, TextSpan, styled_body_within};
 use crate::image_payload_memo::{ImagePayload, image_payloads};
 use crate::metrics::wire::{
     FieldSink, FlagWords, Form, JsonSink, ReadCtx, Request, Syntax, TextSink,
@@ -315,12 +317,16 @@ pub(crate) fn cmd_text_opt(
             }
             (first, end, None, body, open)
         } else {
-            (first, end, Some(look.text(&t)), String::new(), open)
+            (
+                first,
+                end,
+                Some(look.text_span(&t, first, end)),
+                String::new(),
+                open,
+            )
         }
     };
-    let body = text
-        .as_deref()
-        .map_or(display.as_str(), |text| text.span(first, end));
+    let body = text.as_ref().map_or(display.as_str(), TextSpan::body);
     let word = if open { FRAME_OPEN_WORD } else { "" };
     frame_rows_reply(body, end - first, word, args.trim, first)
 }
@@ -642,7 +648,7 @@ pub(crate) fn cmd_window_dims(proxy: &EventLoopProxy<Wake>, json: bool) -> Strin
     }
 }
 
-const METRICS_USAGE: &str = "ERR usage: metrics [reset|percentiles|cadence] [--json]\n";
+const METRICS_USAGE: &str = "ERR usage: metrics [reset|percentiles|commons|cadence] [--json]\n";
 
 /// Observe the current output-cadence index on its UI owner, with no service or reset.
 pub(crate) fn cmd_metrics_cadence(
@@ -693,7 +699,8 @@ fn emit_cadence(snapshot: &crate::output_cadence::Snapshot, sink: &mut dyn Field
     }
 }
 
-/// `metrics [reset|percentiles] [--json]` -> one `OK k=v ...\n` line of live render/latency counters.
+/// `metrics [reset|percentiles|commons] [--json]` -> one `OK k=v ...\n` line of live
+/// render/latency counters, or of Commons repair's counts per seat (`commons`).
 pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> String {
     metrics_reply(term, rest, Syntax::Text)
 }
@@ -715,6 +722,7 @@ fn metrics_reply(term: Option<&Arc<Mutex<Terminal>>>, rest: &str, syntax: Syntax
     let emit = |s: &mut dyn FieldSink| match request.form {
         Form::Summary => crate::metrics::emit_summary(&ctx, try_metrics_dims(term), s),
         Form::Percentiles => crate::metrics::emit_percentiles(&ctx, s),
+        Form::Commons => crate::metrics::emit_commons_seats(s),
     };
     match syntax {
         Syntax::Text => {
@@ -2074,7 +2082,6 @@ pub(crate) fn cmd_text_json_read<P: Into<PersonStamps>>(
         title,
         program_report,
         first,
-        end,
         launch,
         frame_open,
     ) = {
@@ -2098,7 +2105,10 @@ pub(crate) fn cmd_text_json_read<P: Into<PersonStamps>>(
                 (first..end).map(|r| row_in_order(&t, r, true)).unzip();
             (None, rows)
         } else {
-            (Some(look.text(&t)), (Vec::new(), Vec::new()))
+            (
+                Some(look.text_span(&t, first, end)),
+                (Vec::new(), Vec::new()),
+            )
         };
         (
             text,
@@ -2114,7 +2124,6 @@ pub(crate) fn cmd_text_json_read<P: Into<PersonStamps>>(
             t.title().to_owned(),
             t.program_state().run_sign(),
             first,
-            end,
             launch.map_or_else(|| "null".to_string(), |w| w.json(human_seq)),
             t.frame_unfinished_at(std::time::Instant::now()),
         )
@@ -2127,20 +2136,27 @@ pub(crate) fn cmd_text_json_read<P: Into<PersonStamps>>(
     } = person_stamps;
     let inputs_after = input.map(|(tracker, _)| tracker.input_sent());
     let submits = input.map(|(tracker, _)| tracker.submits());
-    let rows_text: Vec<&str> = match &text {
-        Some(text) => (first..end).map(|r| text.row(r)).collect(),
-        None => display_rows.iter().map(String::as_str).collect(),
+    let rows_text = || {
+        text.iter()
+            .flat_map(TextSpan::rows)
+            .chain(display_rows.iter().map(String::as_str))
     };
-    let selected = rows_text.len();
+    let selected = text
+        .as_ref()
+        .map_or(display_rows.len(), |text| text.rows().len());
     let sent = if args.trim {
-        trimmed_len(rows_text.iter().copied())
+        selected
+            - rows_text()
+                .rev()
+                .take_while(|row| is_blank_row(row))
+                .count()
     } else {
         selected
     };
-    let mut out = String::with_capacity(selected * (cols as usize + 8) + 128);
+    let mut out = String::with_capacity(sent * (cols as usize + 8) + 128);
     out.push_str("OK 1\n");
     out.push_str("{\"rows\":[");
-    for (i, row) in rows_text.iter().take(sent).enumerate() {
+    for (i, row) in rows_text().take(sent).enumerate() {
         if i > 0 {
             out.push(',');
         }

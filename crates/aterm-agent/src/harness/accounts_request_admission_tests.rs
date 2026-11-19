@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The tests gated `cfg(unix)` here start a manual sign-in or select a row that needs one,
-// which only Unix queues (its private FIFO, `accounts::manual_signin_capability`).
-#![cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "some helpers serve only the tests gated `cfg(unix)`"
-    )
-)]
+// The tests gated `cfg(unix)` here reach what aterm has only on Unix: a file mode, a symbolic
+// link, a signal, a `/bin/sh` stand-in, or a part built only there (native credential custody,
+// native fleet renewal, the vault-token, Google and agy sign-ins, the Kimi pool's overlay
+// staging home, aterm's own browser window, the test sleep seam).
 
 use super::*;
 use std::sync::{Arc, Mutex};
@@ -307,7 +302,6 @@ pub(crate) fn admission_transition(
     next
 }
 
-#[cfg(unix)]
 #[test]
 fn queued_selection_conforms_through_local_refusal_and_repair() {
     let model = aterm_models_harness::account_queued_selection_model();
@@ -352,7 +346,6 @@ fn queued_selection_conforms_through_local_refusal_and_repair() {
 /// background, keeping it and dispatching nothing. A Grok row's starts none, whatever the lock
 /// (`Cli::renews_headlessly`, pinned in `accounts_sync_cli_tests.rs`).
 #[test]
-#[cfg(unix)]
 fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
     let mut failures = Vec::new();
     for cli in Cli::ALL.into_iter().filter(|cli| cli.renews_headlessly()) {
@@ -413,7 +406,6 @@ fn unreadable_signin_lock_preserves_saved_selection_without_dispatch() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-#[cfg(unix)]
 #[test]
 fn a_replaced_queued_selection_starts_no_authentication() {
     for superseded in [false, true] {
@@ -531,7 +523,6 @@ fn a_person_started_sign_in_a_sleep_spans_is_counted_and_its_request_retired() {
 
 // Its Claude sign-in runs from a headless profile, which needs the opener only Unix links
 // (`cli::opener_link`): off Unix the attempt ends before its renewal is called.
-#[cfg(unix)]
 #[test]
 fn fallback_admission_failure_keeps_the_current_request() {
     for case in 0..5 {
@@ -655,7 +646,6 @@ fn vendor_worker_keeps_selection_when_its_second_lock_take_is_unavailable() {
 }
 
 #[test]
-#[cfg(unix)]
 fn a_permit_holding_background_worker_yields_to_the_same_manual_head_without_a_cooldown() {
     assert!(
         super::super::cli::AccountsHost::automatic_sign_in(
@@ -751,7 +741,6 @@ fn a_permit_holding_background_worker_yields_to_the_same_manual_head_without_a_c
 }
 
 #[test]
-#[cfg(unix)]
 fn a_manual_turn_survives_preflight_refusal_and_moves_only_to_the_actual_attempt() {
     let mut fixture = Fixture::new(Cli::Codex);
     fixture.raw.rows[0].email = None;
@@ -831,4 +820,108 @@ fn a_manual_turn_survives_preflight_refusal_and_moves_only_to_the_actual_attempt
     assert!(!guard.lock().unwrap().in_flight);
     assert!(guard.lock().unwrap().manual_selections.is_empty());
     assert_eq!(behind.position().unwrap().ahead, 0);
+}
+
+/// A FLEET'S HOLD LEAVES A MANUAL TURN FOR THE NEXT ROW (SF-09). A Next selection's turn walks
+/// its candidates in order, and each row's start is an automatic one (a due login here). The
+/// first, `work`, is an account a Mac of the fleet recorded a blocked sign-in of an hour ago: the
+/// door's preflight holds it (`fleet_admits`) before it claims the row's permit or takes the
+/// turn, so the same turn moves on and starts `other`, which no block holds, and that start
+/// alone owns work. Claude Code's door checks it past its ladder, another CLI's before anything.
+///
+/// NEGATIVE CONTROLS (2026-11-17), each in its own run beside mutants that reach other tests,
+/// restored from HEAD after: `spawn_row_renewal` without its `fleet_admits` call past the
+/// ladder: `begin` refused Claude Code's `work` after its turn was taken (the turn gone at the
+/// first row, left `false`, right `true`); `spacing_refusal` answering `Refused::Fleet` as
+/// `Failed`: the first row's dispatch was `Failed`, not `Held`.
+#[test]
+fn a_fleet_hold_leaves_a_manual_turn_for_the_next_row() {
+    for cli in [Cli::Claude, Cli::Codex] {
+        a_fleet_hold_leaves_a_manual_turn_for_the_next_row_of(cli);
+    }
+}
+
+/// [`a_fleet_hold_leaves_a_manual_turn_for_the_next_row`] for `cli`'s pool.
+fn a_fleet_hold_leaves_a_manual_turn_for_the_next_row_of(cli: Cli) {
+    use crate::harness::sign_in_ladder::{SignIn, Why};
+    const PK: &str = "ac-0123456789abcdef";
+    let fixture = Fixture::new(cli);
+    fixture
+        .store
+        .transact(NOW, &mut None, |state| {
+            state.accounts.entry("work".to_owned()).or_default().pk = Some(PK.to_owned());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let held = accounts::Fleet {
+        blocked: [(PK.to_owned(), NOW - 3_600)].into_iter().collect(),
+        ..accounts::Fleet::default()
+    };
+    let request = fixture.store.request_next(NOW + 1).unwrap();
+    let guard = AutoRenewGuard::default().shared();
+    let owner = ManualSelectionOwner::claim(
+        &guard,
+        &fixture.store,
+        cli,
+        accounts::PendingSelection::Next(request),
+        None,
+        NOW + 1,
+    )
+    .unwrap();
+    let mut head = fixture.store.queue_manual_signin().unwrap();
+    let turn = match head.try_enter().unwrap() {
+        accounts::SigninAttempt::Acquired(turn) => turn,
+        other => panic!("free manual head was not admitted: {other:?}"),
+    };
+    let mut admission = Some((turn, owner));
+    let lifetime = super::super::account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    type Work = Box<dyn FnOnce() + Send>;
+    let queued: Mutex<Vec<Work>> = Mutex::default();
+    let spawn = |work: Work| {
+        queued
+            .lock()
+            .unwrap()
+            .push(Box::new(scope.clone().wrap(work)));
+        Ok(())
+    };
+    for (index, expected) in [(0, RenewalDispatch::Held), (1, RenewalDispatch::Started)] {
+        let row = fixture.raw.rows[index].clone();
+        let result = accounts::with_fleet(held.clone(), || {
+            spawn_row_renewal(
+                cli,
+                &fixture.home,
+                &fixture.state,
+                &fixture.path,
+                fixture.raw.clone(),
+                &accounts::Logins::default(),
+                (row.clone(), SignIn::fixture(cli, &row.label, Why::Due)),
+                (None, true),
+                NOW + 1,
+                &guard,
+                &spawn,
+                None,
+                Some(&scope),
+                &mut admission,
+            )
+        });
+        assert_eq!(result, expected, "{cli:?} {}", row.label);
+        assert_eq!(
+            admission.is_some(),
+            index == 0,
+            "the held row leaves the turn; the started one takes it ({cli:?} {})",
+            row.label
+        );
+    }
+    assert_eq!(
+        queued.lock().unwrap().len(),
+        1,
+        "only the started row owns work"
+    );
+    let paused = lifetime.pause().unwrap();
+    drop(scope);
+    queued.lock().unwrap().clear();
+    assert!(paused.try_wait().is_ok());
+    assert!(!guard.lock().unwrap().in_flight);
+    drop(head);
 }

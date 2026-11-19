@@ -584,6 +584,8 @@ fn event_batch(batch: u8, now: i64, horizon: i64) -> Vec<StripEvent> {
     use StripEventKind::{Crash, PressureSpike, Restart, SleepWake};
     let kinds = [Crash, Restart, PressureSpike, SleepWake];
     let event = |age, kind| StripEvent {
+        scope: aterm_vitals::events::EventScope::Unknown,
+        span: None,
         at_unix_ms: now - age,
         kind,
         label: "event".to_owned(),

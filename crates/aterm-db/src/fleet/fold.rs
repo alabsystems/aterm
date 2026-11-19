@@ -27,7 +27,9 @@
 //!   `last_seen` and `seen_on` are the sightings of its login (`crate::alab::sighted`). Each
 //!   fact's provenance has one shape, `<fact>_at` and `<fact>_by`: a time never after the read
 //!   of the input that carried it, and the Mac by its label, else its machine key, else the
-//!   first 8 digits of its Commons uuid.
+//!   first 8 digits of its Commons uuid. `walled` is a wall every session of the account
+//!   meets ([`WindowQuota::walls_account`]); each model's own weekly wall stands beside it in
+//!   `model_walls`, as `ai/limits` states the two, so neither hides the other (FL-271).
 //! - **Agents**: every agent session a machine listed in an answer no older than
 //!   [`AGENTS_KEEP_MS`]. Its account is the registry row its word resolves to; a word that
 //!   resolves to none is dropped and counted ([`Counts::unresolved_accounts`]).
@@ -35,14 +37,15 @@
 use super::read::{AccountWord, Harness, Latest, OWN_ID, Sighted};
 use super::rows::{
     ACCOUNT_STATUS, AccountRef, AccountRow, AgentRow, Evidence, EvidenceHow, Fact, MACHINE_STATUS,
-    MachineRef, MachineRow, ObservedState, PlanSource, RETIRED, Reach, SEEN_ON_MAX, SeenOn, Stamp,
-    UNREGISTERED, Via, WindowRow, WindowState,
+    MachineRef, MachineRow, ModelWall, ObservedState, PlanSource, RETIRED, Reach, SEEN_ON_MAX,
+    SeenOn, Stamp, UNREGISTERED, Via, WindowRow, WindowState,
 };
 use crate::alab::sighted as sightings;
 use crate::alab::{
     journal::{
+        ModelBucket,
         event::{SIGNIN_IN, Window},
-        seen::{Seen, Usage, WindowQuota},
+        seen::{Seen, Usage, Wall, WindowQuota},
     },
     view::LabView,
 };
@@ -1013,14 +1016,37 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
         };
         let (w5h, read5) = window_row(&of(Window::FiveHour), now_s);
         let (w7d, read7) = window_row(&of(Window::Week), now_s);
-        // The wall that stands longest, with when it was hit and the Mac that hit it.
+        // The wall that stands longest, with when it was hit and the Mac that hit it: of the
+        // walls every session meets, the account's own; each model's own week's apart, by its
+        // bucket, as `ai/limits` states them (FL-271).
+        let standing = |q: &&WindowQuota| {
+            q.wall
+                .as_ref()
+                .is_some_and(|wall| wall.until.is_none_or(|until| until > now_s))
+        };
+        let longest = |wall: &&Wall| (wall.until.unwrap_or(u64::MAX), wall.t, wall.uuid.clone());
         let wall = quotas
             .iter()
+            .filter(standing)
+            .filter(|q| q.walls_account())
             .filter_map(|q| q.wall.as_ref())
-            .filter(|wall| wall.until.is_none_or(|until| until > now_s))
-            .max_by_key(|wall| (wall.until.unwrap_or(u64::MAX), wall.t, &wall.uuid));
+            .max_by_key(longest);
         let walled = known_to_journal.contains(pk).then_some(wall.is_some());
         let wall_until_ms = wall.and_then(|wall| wall.until).map(ms);
+        let mut by_model: BTreeMap<Option<ModelBucket>, &Wall> = BTreeMap::new();
+        for q in quotas
+            .iter()
+            .filter(standing)
+            .filter(|q| q.window == Window::WeekModel)
+        {
+            let Some(wall) = q.wall.as_ref() else {
+                continue;
+            };
+            let held = by_model.entry(q.model).or_insert(wall);
+            if longest(held) < longest(&wall) {
+                *held = wall;
+            }
+        }
         // Each fact's provenance: when it was read, never after the journal that carried it,
         // and the Mac that read it.
         let read_of = |uuid: &str, t: u64| Stamp {
@@ -1028,6 +1054,16 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             by: mac_word(uuid),
         };
         let wall_read = wall.map(|wall| read_of(&wall.uuid, wall.t));
+        let model_walls = known_to_journal.contains(pk).then(|| {
+            by_model
+                .iter()
+                .map(|(bucket, wall)| ModelWall {
+                    bucket: *bucket,
+                    until_ms: wall.until.map(ms),
+                    read: read_of(&wall.uuid, wall.t),
+                })
+                .collect::<Vec<_>>()
+        });
         let [w5h_read, w7d_read] =
             [&read5, &read7].map(|read| read.as_ref().map(|(t, uuid)| read_of(uuid, *t)));
         let read_by = [read5, read7]
@@ -1040,12 +1076,14 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             .flatten()
             .filter(|at| *at > now_ms)
             .min();
-        // A window's figure goes, and a wall ends, at the instant its time comes.
+        // A window's figure goes, and a wall ends, at the instant its time comes: a model's
+        // wall's too.
         for at in [w5h, w7d]
             .iter()
             .filter(|w| w.state == WindowState::Current)
             .filter_map(|w| w.reset_ms)
             .chain(wall_until_ms)
+            .chain(by_model.values().filter_map(|wall| wall.until).map(ms))
         {
             next.at(at);
         }
@@ -1280,6 +1318,7 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             wall_read,
             last_seen,
             seen_on: sightings_read.then_some(seen_on),
+            model_walls,
         });
     }
     accounts.sort_by(|a, b| {

@@ -16,10 +16,13 @@ use crate::{
 use astream_wire::{Offset, sync::Digest};
 use aterm_digest::Sha256;
 use aterm_journal::Log;
-use std::borrow::Cow;
+use std::sync::Arc;
+
+mod entries;
+pub(super) use entries::{Entries, Links};
 
 pub(super) struct Replay {
-    pub entries: Vec<Entry>,
+    pub entries: Entries,
     pub witness: Witness,
 }
 
@@ -300,26 +303,18 @@ impl Claim {
 /// prefix and final endpoint answers as admitting every link in order, then the identification
 /// refusal, then requiring the chain to have reached the claim. It preserves a replay's first
 /// refusal while holding only the first `acknowledged.count` records under `acknowledged`.
-/// Links a reader keeps are copied into the replay; links nothing else holds are moved.
+/// The fresh records' witnessed prefix is moved into its replay.
 pub(super) fn witnessed(
-    links: Cow<'_, [Linked]>,
+    links: Vec<Linked>,
     refused: Option<Error>,
     acknowledged: impl Into<Boundary>,
 ) -> Result<Replay> {
     let boundary = acknowledged.into();
     let acknowledged = boundary.acknowledged();
     let count = witnessed_count(&links, refused, boundary)?;
-    let entries = match links {
-        Cow::Owned(links) => links.into_iter().take(count).map(Linked::entry).collect(),
-        Cow::Borrowed(links) => links
-            .iter()
-            .take(count)
-            .cloned()
-            .map(Linked::entry)
-            .collect(),
-    };
+    let entries: Vec<Entry> = links.into_iter().take(count).map(Linked::entry).collect();
     Ok(Replay {
-        entries,
+        entries: entries.into(),
         witness: acknowledged,
     })
 }
@@ -329,13 +324,13 @@ pub(super) fn witnessed(
 /// the prefix's last link must be `held`, so these links continue the kept records. `None` where
 /// it is not: the caller replays the journal in full.
 pub(super) fn witnessed_after(
-    links: &[Linked],
+    links: Arc<Links>,
     refused: Option<Error>,
     acknowledged: impl Into<Boundary>,
     held: Witness,
 ) -> Result<Option<Replay>> {
     let boundary = acknowledged.into();
-    let count = witnessed_count(links, refused, boundary)?;
+    let count = cached_count(&links, refused, boundary)?;
     let start = usize::try_from(held.count)
         .map_err(|_| Error::new("table witness count exceeds this reader"))?;
     if start > count {
@@ -343,54 +338,85 @@ pub(super) fn witnessed_after(
     }
     let through = start
         .checked_sub(1)
-        .map_or(Some(Witness::default()), |last| {
-            links.get(last).map(|link| link.through)
-        });
+        .map_or(Some(Witness::default()), |last| links.witness(last));
     if through != Some(held) {
         return Ok(None);
     }
     Ok(Some(Replay {
-        entries: links[start..count]
-            .iter()
-            .cloned()
-            .map(Linked::entry)
-            .collect(),
+        entries: links.entries(start..count),
         witness: boundary.acknowledged(),
     }))
+}
+
+/// Check the complete custody boundary before handing out any lazy entries.
+/// The replay owns only its selected compact records, never the custody chain.
+pub(super) fn witnessed_cached(
+    links: Arc<Links>,
+    refused: Option<Error>,
+    acknowledged: impl Into<Boundary>,
+) -> Result<Replay> {
+    let boundary = acknowledged.into();
+    let count = cached_count(&links, refused, boundary)?;
+    Ok(Replay {
+        entries: links.entries(0..count),
+        witness: boundary.acknowledged(),
+    })
 }
 
 /// Custody-verified operation IDs for repair ordering alone. No envelope is authenticated or
 /// classified here; these IDs cannot establish an inventory or convergence evidence.
 pub(super) fn repair_ids(
-    links: &[Linked],
+    links: &Links,
     refused: Option<Error>,
     acknowledged: impl Into<Boundary>,
 ) -> Result<std::collections::BTreeSet<astream_wire::sync::Digest>> {
-    let count = witnessed_count(links, refused, acknowledged.into())?;
-    Ok(links[..count]
-        .iter()
-        .filter(|link| !link.conflict)
-        .map(|link| link.wire.id())
-        .collect())
+    let count = cached_count(links, refused, acknowledged.into())?;
+    Ok(links.operation_ids(count).collect())
 }
 
 fn witnessed_count(links: &[Linked], refused: Option<Error>, boundary: Boundary) -> Result<usize> {
-    let mut claim = Claim::new(boundary);
-    // identify_onto already established the contiguous custody chain. Only its
-    // acknowledged endpoint can disagree with the claim's hash; only its last
-    // endpoint can exceed the allowed tail. Check the prefix first, preserving
-    // its refusal ahead of a later tail or identification failure.
-    if let Some(link) = boundary
+    let acknowledged = boundary
         .acknowledged()
         .count
         .checked_sub(1)
-        .and_then(|index| usize::try_from(index).ok())
-        .and_then(|index| links.get(index))
-    {
-        claim.admit(link.through)?;
+        .and_then(|at| usize::try_from(at).ok())
+        .and_then(|at| links.get(at))
+        .map(|link| link.through);
+    checked_endpoints(
+        acknowledged,
+        links.last().map(|link| link.through),
+        refused,
+        boundary,
+    )
+}
+
+fn cached_count(links: &Links, refused: Option<Error>, boundary: Boundary) -> Result<usize> {
+    let acknowledged = boundary
+        .acknowledged()
+        .count
+        .checked_sub(1)
+        .and_then(|at| usize::try_from(at).ok())
+        .and_then(|at| links.witness(at));
+    let last = links.len().checked_sub(1).and_then(|at| links.witness(at));
+    checked_endpoints(acknowledged, last, refused, boundary)
+}
+
+fn checked_endpoints(
+    acknowledged: Option<Witness>,
+    last: Option<Witness>,
+    refused: Option<Error>,
+    boundary: Boundary,
+) -> Result<usize> {
+    let mut claim = Claim::new(boundary);
+    // Identification already established the contiguous custody chain. Only its
+    // acknowledged endpoint can disagree with the claim's hash; only its last
+    // endpoint can exceed the allowed tail. Check the prefix first, preserving
+    // its refusal ahead of a later tail or identification failure.
+    if let Some(through) = acknowledged {
+        claim.admit(through)?;
     }
-    if let Some(last) = links.last() {
-        claim.admit(last.through)?;
+    if let Some(through) = last {
+        claim.admit(through)?;
     }
     if let Some(refused) = refused {
         return Err(refused);
@@ -407,7 +433,7 @@ pub(super) fn read_observed(
 ) -> Result<Replay> {
     let mut links = Vec::with_capacity(records.len());
     let refused = identify_onto(&mut links, records).err();
-    witnessed(Cow::Owned(links), refused, acknowledged)
+    witnessed(links, refused, acknowledged)
 }
 
 /// A writer's replay: each record identified ([`identify`]) and admitted against the claim
@@ -460,7 +486,7 @@ impl Builder {
     fn finish(self) -> Result<Replay> {
         self.claim.finish()?;
         Ok(Replay {
-            entries: self.entries,
+            entries: self.entries.into(),
             witness: self.witness,
         })
     }

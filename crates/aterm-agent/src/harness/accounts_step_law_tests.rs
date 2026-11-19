@@ -877,10 +877,6 @@ mod every_step_a_surface_names_can_be_taken {
     use super::moved_step_law;
     use super::{LawBuild, step_law};
 
-    // A floor of `accounts login` is a manual sign-in, which only Unix queues
-    // (`accounts::manual_signin_capability`): off Unix each step that names one refuses.
-
-    #[cfg(unix)]
     #[test]
     fn on_codex_new() {
         step_law(
@@ -920,7 +916,6 @@ mod every_step_a_surface_names_can_be_taken {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn on_grok() {
         step_law(

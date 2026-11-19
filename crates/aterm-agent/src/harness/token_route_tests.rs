@@ -547,9 +547,12 @@ fn the_account_is_the_one_the_launchs_login_resolves() {
     });
 }
 
-/// THE PROGRAM (§5.3, step 3): a Claude Code build in atpkg's store, an exec entry resolved;
-/// nothing else.
-#[cfg(unix)]
+/// THE PROGRAM (§5.3, step 3): a Claude Code build in atpkg's store (`…/store/claude/<build>/
+/// bin/` and the executable atpkg names there, `claude`, or `claude.exe` on Windows), an exec entry
+/// resolved; nothing else: another program's store, a folder that is no build, a build with no
+/// such file, and a file in the build's `bin` under another name (the other host's spelling, a
+/// `.cmd`). NEGATIVE CONTROL (run on Windows): the shape naming the bare `claude` on every host,
+/// the Windows build is refused.
 #[test]
 fn only_a_claude_build_in_the_store_is_a_program_the_token_serves() {
     let root = aterm_tempfile::Builder::new()
@@ -557,25 +560,50 @@ fn only_a_claude_build_in_the_store_is_a_program_the_token_serves() {
         .suffix(".noindex")
         .tempdir()
         .unwrap();
-    let build = root.path().join("store/claude/7/bin/claude");
-    std::fs::create_dir_all(build.parent().unwrap()).unwrap();
-    std::fs::write(&build, "#!/bin/sh\n").unwrap();
-    assert!(store_build(&build).is_some());
-    let entry = root.path().join("store/claude/exec/claude");
-    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(&build, &entry).unwrap();
-    assert!(
-        store_build(&entry).is_some(),
-        "an exec entry resolves to the build"
+    let (exe, other_spelling) = if cfg!(windows) {
+        ("claude.exe", "claude")
+    } else {
+        ("claude", "claude.exe")
+    };
+    let at = |parts: &[&str]| {
+        parts
+            .iter()
+            .fold(root.path().to_path_buf(), |p, s| p.join(s))
+    };
+    let lay = |path: &Path| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+    };
+    let build = at(&["store", "claude", "7", "bin", exe]);
+    lay(&build);
+    assert_eq!(
+        store_build(&build),
+        Some(std::fs::canonicalize(&build).unwrap())
     );
-    let other = root.path().join("store/codex/7/bin/claude");
-    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
-    std::fs::write(&other, "").unwrap();
+    #[cfg(unix)]
+    {
+        // An exec entry is a symbolic link atpkg lays on Unix alone.
+        let entry = at(&["store", "claude", "exec", "claude"]);
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&build, &entry).unwrap();
+        assert!(
+            store_build(&entry).is_some(),
+            "an exec entry resolves to the build"
+        );
+    }
+    let other = at(&["store", "codex", "7", "bin", exe]);
+    let misspelled = at(&["store", "claude", "7", "bin", other_spelling]);
+    let cmd = at(&["store", "claude", "7", "bin", "claude.cmd"]);
+    for file in [&other, &misspelled, &cmd] {
+        lay(file);
+    }
     for refused in [
         other,
-        root.path().join("bin/claude"),
-        root.path().join("store/claude/07/bin/claude"),
-        root.path().join("store/claude/8/bin/claude"),
+        misspelled,
+        cmd,
+        at(&["bin", exe]),
+        at(&["store", "claude", "07", "bin", exe]),
+        at(&["store", "claude", "8", "bin", exe]),
     ] {
         assert_eq!(store_build(&refused), None, "{}", refused.display());
     }

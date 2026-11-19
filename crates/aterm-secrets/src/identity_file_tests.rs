@@ -268,6 +268,47 @@ fn no_dpapi_failure_leaves_the_machine_without_the_key_it_held() {
     assert!(placed.is_some(), "no count of calls let the making through");
 }
 
+/// A read of the Windows identity file whose DPAPI call failed records a retry in a trace scope
+/// armed around it (`aterm_uds::trace`): no stamp of the file decides that failure, so a run that
+/// read it is never kept; the same file read while DPAPI answers is kept, the file's stamp
+/// recorded.
+/// NEGATIVE CONTROL (2026-11-18, on Windows): with `unsealed`'s `trace::retry` removed, the failed
+/// read was kept (`a DPAPI failure records a retry`: `None`).
+#[cfg(windows)]
+#[test]
+fn a_dpapi_failure_records_a_retry_and_a_key_that_opens_none() {
+    use aterm_uds::dpapi::seam::answer_then_fail;
+    use aterm_uds::trace::{self, Unkept};
+    let traced = |path: &std::path::Path| {
+        trace::read_as_if_later(std::time::Duration::from_secs(10), || {
+            trace::scope(|| read_marked(path).map(|read| read.map(|(i, _)| i.recipient())))
+        })
+    };
+    let _answering = Answering;
+    let (_home, dir, path) = vault();
+    let made = machine_identity(&dir, &path, None, 5).expect("made");
+
+    let (read, opened) = traced(&path);
+    assert_eq!(read.expect("read"), Some(made.recipient()));
+    assert_eq!(opened.unkept(), None, "a key that opens is kept");
+    assert!(
+        opened
+            .files()
+            .any(|(at, stamp)| at == path && stamp.is_some()),
+        "the read records the file's stamp"
+    );
+
+    answer_then_fail(Some(0));
+    let (read, failed) = traced(&path);
+    answer_then_fail(None);
+    assert!(read.is_err(), "a key that opens, DPAPI failing: {read:?}");
+    assert!(
+        matches!(failed.unkept(), Some(Unkept::Retry(_))),
+        "a DPAPI failure records a retry: {:?}",
+        failed.unkept()
+    );
+}
+
 /// On Unix the identity file is the key's text as it always was: comment lines, the mark's line
 /// for a lab identity, and the secret key on the last line, which any build reads.
 #[cfg(unix)]
